@@ -1,5 +1,6 @@
-// Package store is momentum's local SQLite store: normalized events from every source, cases, and the
-// cursors that make ingestion incremental. Bulky material stays where it is; an event keeps a reference.
+// Package store is momentum's local SQLite store: normalized events from every source, and the state that
+// makes ingestion incremental. The store is derived: any source can be dropped and read again (Rebuild).
+// Bulky material stays where it is; an event keeps a reference to it.
 package store
 
 import (
@@ -17,34 +18,37 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Actor says who produced an event. The owner's own words, generated text and tool outcomes are never mixed.
+// Actor says who produced an event. The owner's own words, generated text and tool outcomes never mix:
+// an owner event's Summary holds only text the owner typed, or nothing.
 type Actor string
 
 const (
-	ActorOwner      Actor = "owner"      // the owner's own typed words
-	ActorAgent      Actor = "agent"      // an agent's text or action
-	ActorTool       Actor = "tool"       // a tool's outcome (an error, a result)
-	ActorHarness    Actor = "harness"    // the harness or a guard in it (a deny, a hold)
-	ActorDetector   Actor = "detector"   // a scout or detector's finding
-	ActorExperiment Actor = "experiment" // anything an experiment produced; never evidence of the owner's preferences
+	ActorOwner    Actor = "owner"    // the owner: his typed words, or an action only he takes
+	ActorAgent    Actor = "agent"    // an agent's text or action, including tools and scripts agents run
+	ActorTool     Actor = "tool"     // a tool's outcome (an error, a result)
+	ActorHarness  Actor = "harness"  // the harness or a guard in it, or an outcome nobody can be credited with
+	ActorDetector Actor = "detector" // a scout's or detector's own finding
+	ActorUnknown  Actor = "unknown"  // a record kind the adapter does not know; counted and reported
 )
 
 // Event is the normalized envelope. Unknown values stay empty; nothing is invented.
 type Event struct {
-	Source    string // the source adapter, e.g. "mistakes"
-	SourceKey string // the source's own stable identity for this event
-	TS        time.Time
-	Session   string
-	Agent     string // a subagent's id inside Session, when there is one
-	Harness   string
-	Model     string
-	Cwd       string
-	Actor     Actor
-	Kind      string // tool-error, deny, finding, incident, ...
-	Tool      string
-	Summary   string // short text for listing; the full material stays behind Ref
-	Ref       string // where the full material is: path#line, db:table:id
-	Heuristic bool   // the source flagged it as a guess (e.g. a correction found by pattern)
+	Source     string // the source adapter, e.g. "mistakes"
+	SourceKey  string // the source's own stable identity for this event
+	TS         time.Time
+	Session    string
+	Agent      string // a subagent's id inside Session, when there is one
+	Harness    string
+	Model      string
+	Cwd        string
+	Actor      Actor
+	Kind       string // tool-error, deny, finding, incident, feedback:dismiss, ...
+	Tool       string
+	Summary    string // short text for listing; for owner events only the owner's own words
+	Meta       string // a JSON object with structured extras (a duration, a cause, a device), or ""
+	Ref        string // where the full material is: path@offset, path:table:id
+	Heuristic  bool   // the source flagged it as a guess (e.g. a correction found by pattern)
+	Experiment string // "" for production; otherwise what tagged it (an experiment id, a test device)
 }
 
 // ID is stable across re-ingestion: the same source event always maps to the same row.
@@ -59,32 +63,90 @@ const schema = `
 CREATE TABLE IF NOT EXISTS events (
   id TEXT PRIMARY KEY, source TEXT NOT NULL, source_key TEXT NOT NULL, ts INTEGER NOT NULL,
   session TEXT, agent TEXT, harness TEXT, model TEXT, cwd TEXT, actor TEXT NOT NULL, kind TEXT NOT NULL,
-  tool TEXT, summary TEXT, ref TEXT, heuristic INTEGER NOT NULL DEFAULT 0, ingested INTEGER NOT NULL);
+  tool TEXT, summary TEXT, meta TEXT, ref TEXT, heuristic INTEGER NOT NULL DEFAULT 0,
+  experiment TEXT NOT NULL DEFAULT '', ingested INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS events_kind ON events(kind, ts);
+CREATE INDEX IF NOT EXISTS events_source ON events(source);
 CREATE TABLE IF NOT EXISTS cursors (source TEXT PRIMARY KEY, position TEXT NOT NULL, updated INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS seen_files (source TEXT NOT NULL, path TEXT NOT NULL, mtime INTEGER NOT NULL,
+  size INTEGER NOT NULL, PRIMARY KEY (source, path));
+CREATE TABLE IF NOT EXISTS skipped (source TEXT NOT NULL, ref TEXT NOT NULL, reason TEXT NOT NULL, at INTEGER NOT NULL,
+  PRIMARY KEY (source, ref));
 `
 
-// Open creates the store and its directory when missing.
+// Open creates the store when missing. The store holds owner text, so the database is 0600 and its
+// directory 0700, also when they already existed. SQLite gives the -wal and -shm files the database's mode.
+// Write transactions take the lock up front (_txlock=immediate), so a concurrent writer waits for
+// busy_timeout instead of failing at the read-to-write upgrade.
 func Open(path string) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := db.Exec(schema); err != nil {
+	f.Close()
+	if err := os.Chmod(path, 0o600); err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_txlock=immediate")
+	if err != nil {
+		return nil, err
+	}
+	if err := migrate(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store schema: %w", err)
 	}
 	return &Store{db: db}, nil
 }
 
+// schemaVersion is bumped on every change to the schema. Everything in the store today is derived from
+// the sources, so a store at another version is dropped and the next ingest reads every source again.
+// State that cannot be derived (case decisions, once they exist) will need real migrations instead.
+const schemaVersion = 2
+
+func migrate(db *sql.DB) error {
+	var v int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		return err
+	}
+	if v == schemaVersion {
+		_, err := db.Exec(schema)
+		return err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, t := range []string{"events", "cursors", "seen_files", "skipped"} {
+		if _, err := tx.Exec(`DROP TABLE IF EXISTS ` + t); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(schema); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) Close() error { return s.db.Close() }
 
-// Put inserts or refreshes events in one transaction and returns how many were new.
+// Put inserts events, or refreshes every derived column of an event already stored, in one transaction.
+// It returns how many were new.
 func (s *Store) Put(ctx context.Context, evs []Event) (int, error) {
+	if len(evs) == 0 {
+		return 0, nil
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -100,12 +162,15 @@ func (s *Store) Put(ctx context.Context, evs []Event) (int, error) {
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE id=?`, e.ID()).Scan(&seen); err != nil {
 			return 0, err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO events
-		  (id, source, source_key, ts, session, agent, harness, model, cwd, actor, kind, tool, summary, ref, heuristic, ingested)
-		  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-		  ON CONFLICT(id) DO UPDATE SET summary=excluded.summary, ref=excluded.ref, kind=excluded.kind`,
+		if _, err := tx.ExecContext(ctx, `INSERT INTO events (id, source, source_key, ts, session, agent, harness, model,
+		  cwd, actor, kind, tool, summary, meta, ref, heuristic, experiment, ingested)
+		  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		  ON CONFLICT(id) DO UPDATE SET ts=excluded.ts, session=excluded.session, agent=excluded.agent,
+		    harness=excluded.harness, model=excluded.model, cwd=excluded.cwd, actor=excluded.actor, kind=excluded.kind,
+		    tool=excluded.tool, summary=excluded.summary, meta=excluded.meta, ref=excluded.ref,
+		    heuristic=excluded.heuristic, experiment=excluded.experiment`,
 			e.ID(), e.Source, e.SourceKey, e.TS.UnixMilli(), e.Session, e.Agent, e.Harness, e.Model, e.Cwd,
-			string(e.Actor), e.Kind, e.Tool, e.Summary, e.Ref, e.Heuristic, now); err != nil {
+			string(e.Actor), e.Kind, e.Tool, e.Summary, e.Meta, e.Ref, e.Heuristic, e.Experiment, now); err != nil {
 			return 0, err
 		}
 		if seen == 0 {
@@ -133,6 +198,58 @@ func (s *Store) SetCursor(ctx context.Context, source, position string) error {
 	return err
 }
 
+// FileSeen returns the modification time (ns) and size a source recorded for a file it parsed.
+func (s *Store) FileSeen(ctx context.Context, source, path string) (mtime, size int64, ok bool, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT mtime, size FROM seen_files WHERE source=? AND path=?`, source, path).Scan(&mtime, &size)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, false, nil
+	}
+	return mtime, size, err == nil, err
+}
+
+// MarkFile records that a source parsed a file at this modification time and size.
+func (s *Store) MarkFile(ctx context.Context, source, path string, mtime, size int64) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO seen_files (source, path, mtime, size) VALUES (?,?,?,?)
+	  ON CONFLICT(source, path) DO UPDATE SET mtime=excluded.mtime, size=excluded.size`, source, path, mtime, size)
+	return err
+}
+
+// Skip records input a source could not parse, so a format change is visible and a rebuild can retry it.
+func (s *Store) Skip(ctx context.Context, source, ref, reason string) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO skipped (source, ref, reason, at) VALUES (?,?,?,?)
+	  ON CONFLICT(source, ref) DO UPDATE SET reason=excluded.reason, at=excluded.at`, source, ref, reason, time.Now().UnixMilli())
+	return err
+}
+
+// Skipped counts the unparsed records a source has.
+func (s *Store) Skipped(ctx context.Context, source string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM skipped WHERE source=?`, source).Scan(&n)
+	return n, err
+}
+
+// Rebuild drops everything a source contributed, so the next ingest reads it again from the start.
+// Sources share one state space by name prefix: "radar" also drops "radar-feedback".
+func (s *Store) Rebuild(ctx context.Context, source string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	like := source + "-%"
+	for _, q := range []string{
+		`DELETE FROM events WHERE source=? OR source LIKE ?`,
+		`DELETE FROM cursors WHERE source=? OR source LIKE ?`,
+		`DELETE FROM seen_files WHERE source=? OR source LIKE ?`,
+		`DELETE FROM skipped WHERE source=? OR source LIKE ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, source, like); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // Query selects events newest first.
 type Query struct {
 	Since  time.Time
@@ -157,7 +274,7 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 		limit = 200
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
-	  tool, summary, ref, heuristic FROM events WHERE `+strings.Join(where, " AND ")+` ORDER BY ts DESC LIMIT ?`,
+	  tool, summary, meta, ref, heuristic, experiment FROM events WHERE `+strings.Join(where, " AND ")+` ORDER BY ts DESC LIMIT ?`,
 		append(args, limit)...)
 	if err != nil {
 		return nil, err
@@ -169,7 +286,7 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 		var ts int64
 		var actor string
 		if err := rows.Scan(&e.Source, &e.SourceKey, &ts, &e.Session, &e.Agent, &e.Harness, &e.Model, &e.Cwd, &actor,
-			&e.Kind, &e.Tool, &e.Summary, &e.Ref, &e.Heuristic); err != nil {
+			&e.Kind, &e.Tool, &e.Summary, &e.Meta, &e.Ref, &e.Heuristic, &e.Experiment); err != nil {
 			return nil, err
 		}
 		e.TS, e.Actor = time.UnixMilli(ts), Actor(actor)

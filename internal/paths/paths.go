@@ -34,6 +34,15 @@ func Data() string {
 // DB is the event and case store.
 func DB() string { return filepath.Join(Data(), "momentum.db") }
 
+// Config is momentum's configuration directory: $XDG_CONFIG_HOME/momentum, default ~/.config/momentum.
+// MOMENTUM_CONFIG overrides it, which tests use.
+func Config() string {
+	if v := os.Getenv("MOMENTUM_CONFIG"); v != "" {
+		return v
+	}
+	return filepath.Join(xdg("XDG_CONFIG_HOME", ".config"), "momentum")
+}
+
 // Expand turns a leading ~/ into the home directory.
 func Expand(p string) string {
 	if len(p) >= 2 && p[:2] == "~/" {

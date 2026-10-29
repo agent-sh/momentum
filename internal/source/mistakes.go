@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -18,10 +19,14 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// Mistakes reads the Claude Code mistakes mod's log: one JSON row per tool error, deny, hold, interrupt,
-// rejection or correction. The log is append-only; the cursor is the file's inode and the byte offset of
-// the last complete line, so a rotated or truncated log is read again from the start.
-type Mistakes struct{ Path string }
+// Mistakes reads a Claude Code mistakes log: one JSON row per tool error, deny, hold, interrupt, rejection
+// or correction. The cursor is the file's inode, the byte offset of the last complete line and a fingerprint
+// of the first line. A rotated, truncated or recreated log (even one that reuses the inode and grows past
+// the old offset) fails the fingerprint and is read again from the start; the content key makes that safe.
+type Mistakes struct {
+	Path string
+	Loc  *time.Location // zone of timestamps written without an offset; nil means time.Local
+}
 
 func (m Mistakes) Name() string { return "mistakes" }
 
@@ -36,59 +41,67 @@ type mistakeRow struct {
 	Detail    string `json:"detail"`
 	AgentID   string `json:"agentId"`
 	Cause     string `json:"cause"`
+	Probe     string `json:"probe"`
+	Repeat    int    `json:"repeat"`
 	Heuristic bool   `json:"heuristic"`
 }
 
-// actorOf says who produced each kind of row: a tool's outcome, a guard in the harness, or the owner.
-func actorOf(kind string) store.Actor {
-	switch kind {
-	case "deny", "held":
-		return store.ActorHarness
-	case "user-rejected", "interrupt", "correction":
-		return store.ActorOwner
-	case "refusal":
-		return store.ActorAgent
-	default: // tool-error, wait-timeout, probe, verdict, turn-error
-		return store.ActorTool
-	}
-}
+// fingerprintLen bounds the bytes read for the first-line fingerprint.
+const fingerprintLen = 1024
 
-func (m Mistakes) Ingest(ctx context.Context, st *store.Store) (int, error) {
+func (m Mistakes) Ingest(ctx context.Context, st *store.Store) (Result, error) {
+	var res Result
 	f, err := os.Open(m.Path)
 	if errors.Is(err, os.ErrNotExist) {
-		return 0, nil
+		return res, nil
 	}
 	if err != nil {
-		return 0, err
+		return res, err
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return 0, err
+		return res, err
 	}
 	inode := uint64(0)
 	if sys, ok := info.Sys().(*syscall.Stat_t); ok {
 		inode = sys.Ino
 	}
+	fp, err := fingerprint(f)
+	if err != nil {
+		return res, err
+	}
 	cur, err := st.Cursor(ctx, m.Name())
 	if err != nil {
-		return 0, err
+		return res, err
 	}
 	offset := int64(0)
-	if ino, off, ok := parseCursor(cur); ok && ino == inode && off <= info.Size() {
-		offset = off
+	if c, ok := parseLogCursor(cur); ok && c.inode == inode && c.fp == fp && c.offset <= info.Size() {
+		offset = c.offset
 	}
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return 0, err
+		return res, err
 	}
 
 	r := bufio.NewReaderSize(f, 1<<20)
 	var evs []store.Event
+	unknown := map[string]int{}
 	pos := offset
 	for {
 		line, err := r.ReadBytes('\n')
 		if len(line) > 0 && line[len(line)-1] == '\n' {
-			if ev, ok := m.event(line, pos); ok {
+			res.Read++
+			ref := fmt.Sprintf("%s@%d", m.Path, pos)
+			ev, reason := m.event(line, ref)
+			if reason != "" {
+				res.Skipped++
+				if err := st.Skip(ctx, m.Name(), ref, reason); err != nil {
+					return res, err
+				}
+			} else {
+				if ev.Actor == store.ActorUnknown {
+					unknown[ev.Kind]++
+				}
 				evs = append(evs, ev)
 			}
 			pos += int64(len(line))
@@ -97,36 +110,30 @@ func (m Mistakes) Ingest(ctx context.Context, st *store.Store) (int, error) {
 			break
 		}
 	}
-	added, err := st.Put(ctx, evs)
-	if err != nil {
-		return 0, err
+	if res.New, err = st.Put(ctx, evs); err != nil {
+		return res, err
 	}
-	return added, st.SetCursor(ctx, m.Name(), fmt.Sprintf("%d:%d", inode, pos))
+	res.Notes = countNote(unknown, "unknown kind")
+	sort.Strings(res.Notes)
+	return res, st.SetCursor(ctx, m.Name(), logCursor{inode, pos, fp}.String())
 }
 
-func (m Mistakes) event(line []byte, pos int64) (store.Event, bool) {
+// event maps one row. A non-empty reason means the row could not be parsed.
+func (m Mistakes) event(line []byte, ref string) (store.Event, string) {
 	var row mistakeRow
-	if json.Unmarshal(line, &row) != nil || row.Kind == "" {
-		return store.Event{}, false
+	if err := json.Unmarshal(line, &row); err != nil {
+		return store.Event{}, "not json: " + err.Error()
 	}
-	ts, err := time.ParseInLocation("2006-01-02T15:04:05", row.TS, time.Local)
+	if row.Kind == "" {
+		return store.Event{}, "no kind"
+	}
+	ts, err := m.parseTS(row.TS)
 	if err != nil {
-		return store.Event{}, false
+		return store.Event{}, "bad ts: " + row.TS
 	}
 	h := sha256.Sum256(line)
-	// the kind is its own column; the summary says what and why
-	summary := row.Tool
-	if row.Cause != "" {
-		summary += " (" + row.Cause + ")"
-	}
-	if d := firstLine(row.Detail); d != "" {
-		if summary != "" {
-			summary += ": "
-		}
-		summary += d
-	} else if summary == "" {
-		summary = firstLine(row.Input)
-	}
+	actor, summary, extra := m.attribute(row)
+	extra["cause"], extra["probe"], extra["repeat"] = row.Cause, row.Probe, row.Repeat
 	return store.Event{
 		Source:    m.Name(),
 		SourceKey: hex.EncodeToString(h[:16]),
@@ -136,13 +143,74 @@ func (m Mistakes) event(line []byte, pos int64) (store.Event, bool) {
 		Harness:   "claude-code",
 		Model:     row.Model,
 		Cwd:       row.Cwd,
-		Actor:     actorOf(row.Kind),
+		Actor:     actor,
 		Kind:      row.Kind,
 		Tool:      row.Tool,
 		Summary:   clip(summary, 240),
-		Ref:       fmt.Sprintf("%s@%d", m.Path, pos),
+		Meta:      meta(extra),
+		Ref:       ref,
 		Heuristic: row.Heuristic,
-	}, true
+	}, ""
+}
+
+// attribute decides who produced a row, from its kind, its subagent id and its cause, and keeps owner
+// summaries to the owner's own words. What the agent said before a correction stays in the source (Ref).
+func (m Mistakes) attribute(row mistakeRow) (store.Actor, string, map[string]any) {
+	extra := map[string]any{}
+	detail := firstLine(row.Detail)
+	toolText := func() string {
+		s := row.Tool
+		if detail != "" {
+			if s != "" {
+				s += ": "
+			}
+			s += detail
+		}
+		return s
+	}
+	switch row.Kind {
+	case "correction":
+		// input is what the owner typed; detail is the agent's previous answer, which is not his
+		return store.ActorOwner, row.Input, extra
+	case "interrupt":
+		extra["after"] = detail
+		if row.AgentID != "" {
+			// a subagent's abort can come from its parent, the harness or the owner: credit nobody
+			return store.ActorHarness, "", extra
+		}
+		return store.ActorOwner, "", extra
+	case "user-rejected":
+		// the detail is harness boilerplate; the owner typed nothing that the log keeps
+		return store.ActorOwner, "", extra
+	case "deny", "held":
+		return store.ActorHarness, toolText(), extra
+	case "turn-error":
+		return store.ActorHarness, toolText(), extra
+	case "refusal":
+		return store.ActorAgent, toolText(), extra
+	case "tool-error":
+		if row.Cause == "classifier" { // the auto-mode classifier refused the call: a deny, not a tool outcome
+			return store.ActorHarness, toolText(), extra
+		}
+		return store.ActorTool, toolText(), extra
+	case "wait-timeout", "probe", "verdict":
+		return store.ActorTool, toolText(), extra
+	default:
+		return store.ActorUnknown, toolText(), extra
+	}
+}
+
+// parseTS accepts RFC 3339 with an offset, and the older naive local layout in Loc. A naive time in the
+// repeated hour of a DST fall-back is ambiguous; Go picks one of the two instants.
+func (m Mistakes) parseTS(s string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t, nil
+	}
+	loc := m.Loc
+	if loc == nil {
+		loc = time.Local
+	}
+	return time.ParseInLocation("2006-01-02T15:04:05", s, loc)
 }
 
 func firstLine(s string) string {
@@ -153,12 +221,38 @@ func firstLine(s string) string {
 	return s
 }
 
-func parseCursor(c string) (uint64, int64, bool) {
-	a, b, ok := strings.Cut(c, ":")
-	if !ok {
-		return 0, 0, false
+// fingerprint hashes the file's first line (at most fingerprintLen bytes). An empty file has fingerprint "".
+func fingerprint(f *os.File) (string, error) {
+	buf := make([]byte, fingerprintLen)
+	n, err := f.ReadAt(buf, 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
 	}
-	ino, err1 := strconv.ParseUint(a, 10, 64)
-	off, err2 := strconv.ParseInt(b, 10, 64)
-	return ino, off, err1 == nil && err2 == nil
+	buf = buf[:n]
+	if i := strings.IndexByte(string(buf), '\n'); i >= 0 {
+		buf = buf[:i+1]
+	}
+	if len(buf) == 0 {
+		return "", nil
+	}
+	h := sha256.Sum256(buf)
+	return hex.EncodeToString(h[:8]), nil
+}
+
+type logCursor struct {
+	inode  uint64
+	offset int64
+	fp     string
+}
+
+func (c logCursor) String() string { return fmt.Sprintf("%d:%d:%s", c.inode, c.offset, c.fp) }
+
+func parseLogCursor(s string) (logCursor, bool) {
+	parts := strings.SplitN(s, ":", 3)
+	if len(parts) != 3 {
+		return logCursor{}, false
+	}
+	ino, err1 := strconv.ParseUint(parts[0], 10, 64)
+	off, err2 := strconv.ParseInt(parts[1], 10, 64)
+	return logCursor{ino, off, parts[2]}, err1 == nil && err2 == nil
 }

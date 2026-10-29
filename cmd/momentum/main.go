@@ -5,14 +5,17 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/config"
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/source"
 	"github.com/agent-sh/momentum/internal/store"
@@ -21,85 +24,124 @@ import (
 var version = "0.0.0-dev"
 
 const usage = `usage:
-  momentum ingest [--mistakes FILE] [--radar DB] [--incidents DIR]   read what is new in each source into the store
-  momentum events [--since DUR] [--kind K,K] [--source S] [--limit N] [--json]   events, newest first
-  momentum status [--since DUR]   events per source and kind
+  momentum evidence ingest              read what is new in every configured source into the store
+  momentum evidence events [--since DUR] [--kind K,K] [--source S] [--limit N] [--json]   events, newest first
+  momentum evidence status [--since DUR]   events per source and kind, and unparsed records
+  momentum evidence rebuild SOURCE      drop what SOURCE contributed; the next ingest reads it from the start
   momentum version
-DUR is a Go duration or a number of days, e.g. 36h or 7d. The store is ` + "`$MOMENTUM_HOME/momentum.db`" + `,
-default ~/.local/share/momentum. Exit: 0 done, 2 usage error, 3 error.`
-
-func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, usage)
-		os.Exit(2)
-	}
-	ctx := context.Background()
-	var err error
-	switch os.Args[1] {
-	case "ingest":
-		err = ingest(ctx, os.Args[2:])
-	case "events":
-		err = events(ctx, os.Args[2:])
-	case "status":
-		err = status(ctx, os.Args[2:])
-	case "version":
-		fmt.Println("momentum", version)
-	case "-h", "--help", "help":
-		fmt.Println(usage)
-	default:
-		fmt.Fprintf(os.Stderr, "momentum: unknown command %q\n%s\n", os.Args[1], usage)
-		os.Exit(2)
-	}
-	if err != nil {
-		if _, ok := err.(usageError); ok {
-			fmt.Fprintln(os.Stderr, "momentum:", err)
-			os.Exit(2)
-		}
-		fmt.Fprintln(os.Stderr, "[ERROR] momentum:", err)
-		os.Exit(3)
-	}
-}
+Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json).
+The store is $MOMENTUM_HOME/momentum.db (default ~/.local/share/momentum).
+DUR is a Go duration or a number of days, e.g. 36h or 7d. Exit: 0 done, 2 usage or configuration error,
+3 error (for ingest: at least one source failed; the others still ran).`
 
 type usageError struct{ msg string }
 
 func (u usageError) Error() string { return u.msg }
 
-func ingest(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("ingest", flag.ContinueOnError)
-	mistakes := fs.String("mistakes", "~/.local/state/claude-mistakes/events.jsonl", "Claude Code mistakes log")
-	radar := fs.String("radar", radarDefault(), "findings scout store")
-	incidents := fs.String("incidents", "~/.hermes/avi-debugger/incidents", "incident detector directory")
-	if err := fs.Parse(args); err != nil {
-		return usageError{err.Error()}
+func main() {
+	os.Exit(run(context.Background(), os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, usage)
+		return 2
+	}
+	var err error
+	switch args[0] {
+	case "evidence":
+		err = evidence(ctx, args[1:], stdout, stderr)
+	case "version":
+		fmt.Fprintln(stdout, "momentum", version)
+	case "-h", "--help", "help":
+		fmt.Fprintln(stdout, usage)
+	default:
+		err = usageError{fmt.Sprintf("unknown command %q", args[0])}
+	}
+	var ue usageError
+	switch {
+	case err == nil:
+		return 0
+	case errors.As(err, &ue), errors.Is(err, config.ErrNoSources):
+		fmt.Fprintln(stderr, "momentum:", err)
+		return 2
+	default:
+		fmt.Fprintln(stderr, "[ERROR] momentum:", err)
+		return 3
+	}
+}
+
+func evidence(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		return usageError{"evidence needs ingest, events, status or rebuild"}
+	}
+	switch args[0] {
+	case "ingest":
+		return ingest(ctx, stdout, stderr)
+	case "events":
+		return events(ctx, args[1:], stdout)
+	case "status":
+		return status(ctx, args[1:], stdout)
+	case "rebuild":
+		if len(args) != 2 {
+			return usageError{"rebuild needs one source name"}
+		}
+		return rebuild(ctx, args[1], stdout)
+	}
+	return usageError{fmt.Sprintf("unknown evidence command %q", args[0])}
+}
+
+// configured builds the sources this machine has. An empty location is left out.
+func configured() ([]source.Source, error) {
+	c, err := config.Load()
+	if err != nil {
+		return nil, err
+	}
+	var out []source.Source
+	if c.Mistakes.Path != "" {
+		out = append(out, source.Mistakes{Path: c.Mistakes.Path})
+	}
+	if c.Radar.Path != "" {
+		out = append(out, source.Radar{Path: c.Radar.Path, TestDevice: c.Radar.TestDevice})
+	}
+	if c.Incidents.Dir != "" {
+		out = append(out, source.Incidents{Dir: c.Incidents.Dir})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%w: %s lists none", config.ErrNoSources, config.SourcesPath())
+	}
+	return out, nil
+}
+
+func ingest(ctx context.Context, stdout, stderr io.Writer) error {
+	sources, err := configured()
+	if err != nil {
+		return err
 	}
 	st, err := store.Open(paths.DB())
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	sources := []source.Source{
-		source.Mistakes{Path: paths.Expand(*mistakes)},
-		source.Radar{Path: paths.Expand(*radar)},
-		source.Incidents{Dir: paths.Expand(*incidents)},
-	}
-	for _, s := range sources {
-		n, err := s.Ingest(ctx, st)
-		if err != nil {
-			return fmt.Errorf("%s: %w", s.Name(), err)
+	failed := 0
+	for _, o := range source.RunAll(ctx, st, sources) {
+		if o.Err != nil {
+			failed++
+			fmt.Fprintf(stderr, "[ERROR] %s: %v\n", o.Name, o.Err)
+			continue
 		}
-		fmt.Printf("%s: %d new\n", s.Name(), n)
+		fmt.Fprintf(stdout, "%s: %d new, %d read, %d unparsed\n", o.Name, o.New, o.Read, o.Skipped)
+		for _, n := range o.Notes {
+			fmt.Fprintf(stdout, "  %s\n", n)
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d of %d sources failed", failed, len(sources))
 	}
 	return nil
 }
 
-func radarDefault() string {
-	if h := os.Getenv("RADAR_HOME"); h != "" {
-		return h + "/radar.db"
-	}
-	return "~/.hermes/radar/radar.db"
-}
-
-func events(ctx context.Context, args []string) error {
+func events(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("events", flag.ContinueOnError)
 	since := fs.String("since", "1d", "how far back")
 	kinds := fs.String("kind", "", "comma-separated kinds")
@@ -126,7 +168,7 @@ func events(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	enc := json.NewEncoder(os.Stdout)
+	enc := json.NewEncoder(stdout)
 	for _, e := range evs {
 		if *asJSON {
 			if err := enc.Encode(e); err != nil {
@@ -134,12 +176,16 @@ func events(ctx context.Context, args []string) error {
 			}
 			continue
 		}
-		fmt.Printf("%s  %-9s %-8s %-10s %s\n", e.TS.Format("01-02 15:04"), e.Source, e.Actor, e.Kind, e.Summary)
+		tag := ""
+		if e.Experiment != "" {
+			tag = " [experiment " + e.Experiment + "]"
+		}
+		fmt.Fprintf(stdout, "%s  %-15s %-8s %-16s %s%s\n", e.TS.Format("01-02 15:04"), e.Source, e.Actor, e.Kind, e.Summary, tag)
 	}
 	return nil
 }
 
-func status(ctx context.Context, args []string) error {
+func status(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	since := fs.String("since", "7d", "how far back")
 	if err := fs.Parse(args); err != nil {
@@ -169,8 +215,29 @@ func status(ctx context.Context, args []string) error {
 			parts = append(parts, fmt.Sprintf("%s %d", k, n))
 		}
 		sort.Strings(parts)
-		fmt.Printf("%-10s %s\n", s, strings.Join(parts, ", "))
+		skipped, err := st.Skipped(ctx, s)
+		if err != nil {
+			return err
+		}
+		line := fmt.Sprintf("%-15s %s", s, strings.Join(parts, ", "))
+		if skipped > 0 {
+			line += fmt.Sprintf("  (%d unparsed)", skipped)
+		}
+		fmt.Fprintln(stdout, line)
 	}
+	return nil
+}
+
+func rebuild(ctx context.Context, name string, stdout io.Writer) error {
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	if err := st.Rebuild(ctx, name); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "%s: dropped; the next ingest reads it from the start\n", name)
 	return nil
 }
 
