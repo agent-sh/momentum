@@ -24,6 +24,13 @@ type Sources struct {
 	Incidents struct {
 		Dir string `json:"dir"`
 	} `json:"incidents"`
+	// Transcripts are the agents' session histories, read with tacit's reader under each home: Claude Code,
+	// Codex, pi and Hermes, where tacit finds them (the harnesses' own variables apply). Workers is how many
+	// files an ingest reads at once; 0 is the default.
+	Transcripts struct {
+		Homes   []string `json:"homes"`
+		Workers int      `json:"workers"`
+	} `json:"transcripts"`
 	// Sessions configures the live session board. Harness locations come from the harnesses' own variables
 	// (CLAUDE_CONFIG_DIR, CODEX_HOME, XDG_DATA_HOME, HERMES_HOME, PI_CODING_AGENT_DIR), not from here.
 	Sessions struct {
@@ -53,6 +60,9 @@ func Load() (Sources, error) {
 	s.Mistakes.Path = paths.Expand(s.Mistakes.Path)
 	s.Radar.Path = paths.Expand(s.Radar.Path)
 	s.Incidents.Dir = paths.Expand(s.Incidents.Dir)
+	for i, p := range s.Transcripts.Homes {
+		s.Transcripts.Homes[i] = paths.Expand(p)
+	}
 	for i, p := range s.Sessions.Projects {
 		s.Sessions.Projects[i] = paths.Expand(p)
 	}

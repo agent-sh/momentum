@@ -10,7 +10,8 @@ Status: milestone 1 (the evidence layer) in progress. See [SPEC.md](SPEC.md).
 
 ```
 momentum evidence ingest              read what is new in every configured source
-momentum evidence events --since 1d   events, newest first (--kind, --source, --json)
+momentum evidence events --since 1d   events, newest first (--kind, --source, --until, --json)
+momentum evidence events --session ID one session's events, its subagents' among them, oldest first
 momentum evidence status              events per source and kind, and unparsed records
 momentum evidence rebuild SOURCE      drop a source's events; the next ingest reads it again (not sessions)
 ```
@@ -21,11 +22,14 @@ Source locations are machine-specific, so momentum ships none. List them in `~/.
 
 ```json
 {
-  "mistakes":  {"path": "~/path/to/claude-mistakes/events.jsonl"},
-  "radar":     {"path": "~/path/to/radar.db", "test_device": "name-of-its-verification-device"},
-  "incidents": {"dir": "~/path/to/incidents"}
+  "mistakes":    {"path": "~/path/to/claude-mistakes/events.jsonl"},
+  "radar":       {"path": "~/path/to/radar.db", "test_device": "name-of-its-verification-device"},
+  "incidents":   {"dir": "~/path/to/incidents"},
+  "transcripts": {"homes": ["~"]}
 }
 ```
+
+`transcripts` reads the agents' session history with [tacit](https://github.com/agent-sh/tacit)'s reader: Claude Code with its subagents, Codex with its compressed rollouts, pi with its tasks, and the Hermes store, where tacit finds them under each home (pi's variables and `TACIT_HERMES_DB` apply). Each item is one event, credited by tacit's attribution. Only redacted text is stored, so [scrump](https://github.com/avifenesh/scrump) with its text profile must be on `PATH`; without it the source stores nothing and fails. `"workers"` sets how many files an ingest reads at once (default: a third of the cores).
 
 ## Sessions
 

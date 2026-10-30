@@ -68,6 +68,30 @@ The `sessions` packages are exported, so the session board imports them instead 
 
 `momentum sessions` prints the live sessions and their phases from this layer.
 
+## Session history
+
+`momentum evidence ingest` reads the agents' session history with tacit's reader (`pkg/evidence`): Claude Code with its subagents, Codex with its compressed rollouts, pi with its tasks, and the Hermes store, where tacit finds them under each home that `sources.json` lists (`"transcripts": {"homes": ["~"]}`). Who wrote an item is tacit's decision, never a copy of its rules.
+
+- **One event per item.** The actor follows the kind: the owner's text is the owner's; an agent's text and its tool calls are the agent's; a tool's result is the tool's; harness text and compactions are the harness's. A call the owner made himself (a command he ran from pi's prompt) is his, and an item tacit credits to no one is `unknown`.
+  - Each event carries the session, the subagent, the harness, the model and the working directory. Its kind is tacit's (`owner_text`, `agent_text`, `harness_text`, `tool_call`, `tool_result`, `compaction`), and its tool is the tool's name.
+  - Its meta holds the tool call's id, the error flag, how the owner's turn was put in (`input_kind`), the harness's record before it (`prior`), tacit's reason (`why`) and a subagent's parent session.
+  - Its reference is `path@offset#index`, the item's place in the transcript (a Hermes row's id). Its key is the file's own name with that place, so it holds when a harness moves or compresses the file.
+- **What is stored.** Every item except Codex's "[Recorded tool history]" messages, which replay calls and results that are already events. Tool calls and results are what a failure is reconstructed from; the owner's words are what the families start from.
+  - A summary is clipped. An owner's turn keeps 2,000 characters: his words are what the families quote, and a typed turn is seldom longer. An error's output keeps 1,000, because it holds the failure. Other results, calls, harness text and compactions keep 240. An agent's text keeps its first 160 and last 80: what it set out to do, and what it asks or claims.
+  - The full text stays in the transcript, at the reference.
+- **Redaction.** Only text that tacit's redaction masked (`RedactEvents`, scrump) is stored. Each text is cut with a 512-byte spare before it is masked, so a secret across the cut is whole when scrump sees it, and cut to its length after.
+  - When redaction cannot run, nothing is read and the source fails.
+  - When it fails on a file, that file stores nothing past its cursor this run and is named, and the next run takes it up there.
+- **Cursors.** Each transcript has a cursor: the offset after the last line stored, and the reader's saved state, so following a growing session reads only what was added.
+  - A file is told from a new one by its inode and a fingerprint of its first line, as the mistakes log is. A file the harness compressed in place keeps its cursor, since tacit names offsets in the decompressed bytes. A compressed copy is final and keeps no state.
+  - A transcript is read, redacted and stored 64 MiB at a time, with each part's events and its cursor in one transaction. A Hermes session's cursor is its last row's id.
+  - The cursors are derived, like the events they go with: a schema change drops both, and the next ingest reads every transcript again from its start. A transcript its harness deleted since is not read again.
+- **Prior art.** OpenTelemetry's filelog receiver gave the cursor rule. Two event formats were not followed:
+  - OpenTelemetry's GenAI conventions (in development) record messages with the model API's role. A role says which side of the API a message is on, not who wrote it: a prompt that another agent or a wake loop typed is `user` too.
+  - Claude Code's own OpenTelemetry events (`user_prompt`, `tool_result`, `api_error`) leave prompt text and tool input out by default. They begin when telemetry is turned on and cover one harness. The transcripts already hold every harness's history.
+
+`momentum evidence events --session ID` prints one session's events, with its subagents' among them, oldest first; `--since` and `--until` take a duration or a local time.
+
 ## Evidence it keeps
 
 Phase 0 showed that each family needs history the machine does not keep today. The collectors are cheap and keep running when the rest of the tool is down.
