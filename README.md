@@ -95,6 +95,37 @@ Four sections are notes: needs you (each title is the question), decided (the de
 
 `running` is computed live, by the scan `momentum sessions` makes: the sessions that are working, and the workflows, agents, background jobs and monitors in any session. The report resumes that scan from the checkpoints the last `momentum sessions` run saved, so with the sessions timer running it costs about what that run costs. It opens the store read-only and writes nothing; with no store, or one that is not this build's schema (the next `momentum sessions` of this build migrates it), it prints nothing and exits 3. Its scan has 3 seconds and reads the harnesses at once: a harness that fails is named on stderr and running keeps what it read, one not done by then is named and left out, and the report still prints.
 
+## Capacity
+
+```
+momentum capacity [--dry-run] [--now] [--rule R,R] [--json] [--all]
+```
+
+It keeps the disks from filling. Each run samples which paths processes use (open files, memory maps, working directories, programs, command lines), since a noatime mount never records a read, and records each disk's use. Then each rule that is due scans:
+
+- **models:** a top-level item of a models, datasets or model-cache root with no write and no use seen for 30 days goes. Nothing goes before the sampler has watched for 30 days. A Hugging Face cache's shared Xet blobs go with the last repository that links them.
+- **targets:** a Cargo target directory with no write for 48 hours, that no process uses, that git does not track, and whose project is known and not excluded.
+- **worktrees:** a linked worktree whose branch is merged, landed or gone from its remote, clean, with every commit on a remote or merged: `git worktree remove`, then its branch. One with uncommitted or unpushed work is reported.
+- **uv:** `uv cache prune --ci --force` over 30 GiB or weekly, never while uv installs.
+- **docker:** the build cache older than 168 hours and dangling images; unused volumes are reported.
+- **disk:** a fill faster than 20 GiB an hour, or one that reaches 94% within 6 hours, names its writers in a problem note.
+
+Only the rules listed in `live` delete; the others list what they would delete. Whatever an enabled systemd unit, timer, crontab line, Hermes job or installed command's symlink names stays, and so does what a process uses. Excluded projects are report-only for every rule but models. Each deletion is an event and a decided note in the report; what a rule can only report is a problem note. Every path is configuration, under `capacity` in `sources.json`:
+
+```json
+{"capacity": {
+  "disks": ["/", "/data"],
+  "live": ["targets", "worktrees"],
+  "exclude": {"paths": ["~/code/other-team"], "names": ["*other-team*"], "remotes": ["org/other-team"]},
+  "names": {"hermes_jobs": "~/.hermes/cron/jobs.json", "hermes_scripts": "~/.hermes/scripts", "links": ["~/.local/bin"]},
+  "models": {"roots": ["/srv/models", "~/.cache/huggingface", "~/.cache/huggingface/hub"], "keep": ["/srv/models/token"]},
+  "targets": {"roots": ["~/code", "~/.cache"]},
+  "worktrees": {"roots": ["~/.cache", "~/code/*-worktrees"]}
+}}
+```
+
+Thresholds have defaults (`idle_days`, `idle_hours`, `max_gib`, `every_days`, `until`, `fill`, `min_mib`, `every_hours`). A dry run deletes and records nothing and runs every rule now.
+
 Knowledge stays in [tacit](https://github.com/agent-sh/tacit). Cases, evidence and state stay on the machine, never in this repository.
 
 MIT licensed.

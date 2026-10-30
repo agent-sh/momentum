@@ -1,0 +1,346 @@
+package capacity
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// The uv and docker rules prune with each tool's own command, never by deleting its files: the tool knows what in
+// its cache is in use.
+
+// Tools runs uv and docker.
+type Tools interface {
+	UV(ctx context.Context, timeout time.Duration, args ...string) (string, error)
+	Docker(ctx context.Context, timeout time.Duration, args ...string) (string, error)
+}
+
+// errNoTool means the tool is not installed.
+var errNoTool = errors.New("not installed")
+
+type execTools struct{ uv, docker string }
+
+func (t execTools) UV(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
+	return runTool(ctx, timeout, t.uv, "uv", args...)
+}
+
+func (t execTools) Docker(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
+	return runTool(ctx, timeout, t.docker, "docker", args...)
+}
+
+func runTool(ctx context.Context, timeout time.Duration, path, name string, args ...string) (string, error) {
+	if path == "" {
+		p, err := exec.LookPath(name)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", name, errNoTool)
+		}
+		path = p
+	}
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, path, args...)
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	err := cmd.Run()
+	if cctx.Err() != nil {
+		return out.String(), fmt.Errorf("%s %s: %w after %s", name, strings.Join(args[:min(len(args), 2)], " "), errTimeout, timeout)
+	}
+	if err != nil {
+		msg := strings.TrimSpace(errb.String())
+		if len(msg) > 300 {
+			msg = msg[len(msg)-300:]
+		}
+		return out.String(), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args[:min(len(args), 2)], " "), err, msg)
+	}
+	return out.String(), nil
+}
+
+// uv prunes the uv cache with `uv cache prune --ci --force` when it is over its size, or when the last prune is
+// older than the cadence (or there was none). --ci keeps the wheels uv built and drops the ones it can download
+// again; --force prunes past the cache's lock, which long-lived `uv tool run` processes hold, so the rule waits
+// itself while anything installs: an install, a sync, a lock, a venv being made.
+func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error) {
+	out, err := r.tools.UV(ctx, 30*time.Second, "cache", "dir")
+	if errors.Is(err, errNoTool) {
+		return nil, []string{"uv is not installed"}, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	dir := strings.TrimSpace(lastLine(out))
+	size := r.uvSize(ctx, dir)
+	last, err := r.mark(ctx, "prune:uv")
+	if err != nil {
+		return nil, nil, err
+	}
+	max := int64(r.cfg.UV.MaxGiB * (1 << 30))
+	every := time.Duration(r.cfg.UV.EveryDays * 24 * float64(time.Hour))
+	notes := []string{fmt.Sprintf("cache %s at %s", gib(size), short(dir))}
+	f := Finding{Rule: RuleUV, Path: dir, canon: r.m.Canon(dir), Bytes: size}
+	switch {
+	case size > max:
+		f.Detail = fmt.Sprintf("over %s", gib(max))
+	case last.IsZero():
+		f.Detail = "no prune on record"
+	case r.now.Sub(last) >= every:
+		f.Detail = "last pruned " + last.Format("2006-01-02")
+	default:
+		notes = append(notes, "last pruned "+last.Format("2006-01-02 15:04")+", under "+gib(max))
+		return nil, notes, nil
+	}
+	if busy := uvBusy(r.sample); busy != "" {
+		f.Action, f.Why = ActKeep, "waits: "+busy
+		return []Finding{f}, notes, nil
+	}
+	f.Action = ActDelete
+	if !live {
+		return []Finding{f}, notes, nil
+	}
+	_, err = r.tools.UV(ctx, 20*time.Minute, "cache", "prune", "--ci", "--force")
+	after := r.uvSize(ctx, dir)
+	if size >= 0 && after >= 0 {
+		f.Freed = max64(0, size-after)
+	}
+	if err != nil {
+		f.Err = err.Error()
+		return []Finding{f}, notes, nil
+	}
+	f.Done = true
+	f.Detail += fmt.Sprintf("; %s to %s", gib(size), gib(after))
+	return []Finding{f}, notes, r.st.SetMark(ctx, "prune:uv", r.now)
+}
+
+// uvSize is the cache's size: uv's own count, else a walk.
+func (r *runner) uvSize(ctx context.Context, dir string) int64 {
+	if out, err := r.tools.UV(ctx, 2*time.Minute, "cache", "size", "--preview-features", "cache-size"); err == nil {
+		for _, l := range strings.Split(out, "\n") {
+			if n, err := strconv.ParseInt(strings.TrimSpace(l), 10, 64); err == nil {
+				return n
+			}
+		}
+	}
+	if dir == "" {
+		return -1
+	}
+	return Measure(dir, nil).Bytes
+}
+
+// uvBusy names a uv process that installs into the cache now, or "". An install, a sync, an add or remove, a lock,
+// a venv, a tool or python install. A `uv run` or `uv tool run` (uvx) that has started its command (it has a child)
+// is past its sync and only reads the cache; one without a child may still be installing.
+func uvBusy(s *Sample) string {
+	if s == nil {
+		return ""
+	}
+	for _, p := range s.Table {
+		if len(p.Argv) == 0 {
+			continue
+		}
+		exe := filepath.Base(p.Argv[0])
+		var args []string
+		for _, a := range p.Argv[1:] {
+			if !strings.HasPrefix(a, "-") {
+				args = append(args, a)
+			}
+		}
+		sub := func(i int) string {
+			if i < len(args) {
+				return args[i]
+			}
+			return ""
+		}
+		busy := false
+		switch exe {
+		case "uvx":
+			busy = !s.Children(p.PID)
+		case "uv":
+			switch sub(0) {
+			case "sync", "add", "remove", "lock", "venv", "build", "export", "init":
+				busy = true
+			case "pip":
+				busy = !contains([]string{"list", "show", "freeze", "check", "tree"}, sub(1))
+			case "tool":
+				switch sub(1) {
+				case "install", "upgrade":
+					busy = true
+				case "run":
+					busy = !s.Children(p.PID)
+				}
+			case "python":
+				busy = sub(1) == "install"
+			case "run":
+				busy = !s.Children(p.PID)
+			}
+		}
+		if busy {
+			return fmt.Sprintf("%s (pid %d)", strings.Join(p.Argv[:min(len(p.Argv), 4)], " "), p.PID)
+		}
+	}
+	return ""
+}
+
+// docker prunes Docker's build cache older than the configured age and its dangling images, once per cadence.
+// Volumes are only reported: one may hold a database.
+func (r *runner) docker(ctx context.Context, live bool) ([]Finding, []string, error) {
+	if _, err := r.tools.Docker(ctx, 15*time.Second, "info", "--format", "{{.ServerVersion}}"); err != nil {
+		if errors.Is(err, errNoTool) {
+			return nil, []string{"docker is not installed"}, nil
+		}
+		return nil, []string{"docker is not reachable: " + firstLine(err.Error())}, nil
+	}
+	until := r.cfg.Docker.Until
+	var out []Finding
+	var notes []string
+	cache := Finding{Rule: RuleDocker, Path: "docker build cache", Action: ActDelete, Detail: "builder prune --filter until=" + until}
+	if du, err := r.tools.Docker(ctx, 2*time.Minute, "buildx", "du", "--filter", "until="+until); err == nil {
+		cache.Bytes = reclaimable(du)
+		cache.Detail += " (up to its reclaimable records' size)"
+	}
+	images := Finding{Rule: RuleDocker, Path: "docker dangling images", Action: ActDelete, Detail: "image prune"}
+	if ls, err := r.tools.Docker(ctx, time.Minute, "image", "ls", "--filter", "dangling=true", "--format", "{{.ID}}\t{{.Size}}"); err == nil {
+		n := 0
+		for _, l := range strings.Split(strings.TrimSpace(ls), "\n") {
+			if f := strings.Split(l, "\t"); len(f) == 2 {
+				n++
+				images.Bytes += parseSize(f[1])
+			}
+		}
+		images.Detail = fmt.Sprintf("image prune: %d dangling", n)
+		if n == 0 {
+			images.Action = ""
+		}
+	}
+	if v, err := r.tools.Docker(ctx, time.Minute, "system", "df", "-v", "--format", "{{json .Volumes}}"); err == nil {
+		if f, ok := unusedVolumes(v); ok {
+			out = append(out, f)
+		}
+	}
+	for _, f := range []*Finding{&cache, &images} {
+		if f.Action == "" || f.Bytes == 0 {
+			continue
+		}
+		if live {
+			args := []string{"builder", "prune", "--force", "--filter", "until=" + until}
+			if f == &images {
+				args = []string{"image", "prune", "--force"}
+			}
+			res, err := r.tools.Docker(ctx, 30*time.Minute, args...)
+			if err != nil {
+				f.Err = err.Error()
+			} else {
+				f.Done = true
+				f.Freed = parseSizeAfter(res, "Total:")
+				if f.Freed == 0 {
+					f.Freed = parseSizeAfter(res, "Total reclaimed space:")
+				}
+			}
+		}
+		out = append(out, *f)
+	}
+	if live {
+		return out, notes, r.st.SetMark(ctx, "prune:docker", r.now)
+	}
+	return out, notes, nil
+}
+
+// reclaimable sums the sizes of the reclaimable records `docker buildx du` lists, or reads its Reclaimable total
+// when it prints one. Shared records count in full, so the sum is at most what a prune frees.
+func reclaimable(du string) int64 {
+	if n := parseSizeAfter(du, "Reclaimable:"); n > 0 {
+		return n
+	}
+	var n int64
+	for _, l := range strings.Split(du, "\n") {
+		f := strings.Fields(l)
+		if len(f) >= 3 && f[1] == "true" {
+			n += parseSize(strings.TrimSuffix(f[2], "*"))
+		}
+	}
+	return n
+}
+
+// unusedVolumes is a report-only finding for the volumes no container uses, from `docker system df -v`'s JSON: a
+// list of objects whose Links and Size are text.
+func unusedVolumes(js string) (Finding, bool) {
+	f := Finding{Rule: RuleDocker, Path: "docker volumes", Action: ActReport, class: "volumes"}
+	var vols []map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(js)), &vols); err != nil {
+		return f, false
+	}
+	n := 0
+	for _, v := range vols {
+		if fmt.Sprint(v["Links"]) == "0" {
+			n++
+			f.Bytes += parseSize(fmt.Sprint(v["Size"]))
+		}
+	}
+	if n == 0 {
+		return f, false
+	}
+	f.Why = fmt.Sprintf("%d volumes no container uses; a volume may hold data, so they are only reported", n)
+	return f, true
+}
+
+var sizeRe = regexp.MustCompile(`(?i)([0-9.]+)\s*([kmgtp]?i?b)\b`)
+
+// parseSize reads a size as Docker prints it (1.785GB, 4.096kB, 512B), in bytes.
+func parseSize(s string) int64 {
+	m := sizeRe.FindStringSubmatch(s)
+	if m == nil {
+		return 0
+	}
+	v, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return 0
+	}
+	unit := strings.ToLower(m[2])
+	mult := map[string]float64{"b": 1, "kb": 1e3, "mb": 1e6, "gb": 1e9, "tb": 1e12, "pb": 1e15,
+		"kib": 1 << 10, "mib": 1 << 20, "gib": 1 << 30, "tib": 1 << 40}[unit]
+	return int64(v * mult)
+}
+
+// parseSizeAfter reads the size on the line that starts with a label.
+func parseSizeAfter(out, label string) int64 {
+	for _, l := range strings.Split(out, "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(l), label); ok {
+			return parseSize(rest)
+		}
+	}
+	return 0
+}
+
+func lastLine(s string) string {
+	ls := strings.Split(strings.TrimSpace(s), "\n")
+	return ls[len(ls)-1]
+}
+
+func firstLine(s string) string {
+	l, _, _ := strings.Cut(s, "\n")
+	return l
+}
+
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// gib is a size in GiB, or MiB below one GiB.
+func gib(n int64) string {
+	if n < 0 {
+		return "?"
+	}
+	if n < 1<<30 {
+		return fmt.Sprintf("%.0f MiB", float64(n)/(1<<20))
+	}
+	return fmt.Sprintf("%.1f GiB", float64(n)/(1<<30))
+}
