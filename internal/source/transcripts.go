@@ -152,6 +152,7 @@ func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error
 	t := &tally{failed: map[string]bool{}}
 	var jobs []*job
 	seen := map[string]bool{}
+	listed := true // every source was listed, so a cursor not seen is a file gone
 	var dbs []*evidence.HermesDB
 	defer func() {
 		for _, db := range dbs {
@@ -167,6 +168,7 @@ func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error
 				}
 				if err != nil {
 					t.note("hermes store %s: %v", src.DB, err)
+					listed = false
 				}
 				jobs = append(jobs, js...)
 				continue
@@ -174,6 +176,7 @@ func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error
 			files, err := evidence.Files(src)
 			if err != nil {
 				t.note("%s: %v", src.Glob, err)
+				listed = false
 				continue
 			}
 			for _, f := range files {
@@ -225,10 +228,11 @@ func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error
 	close(ch)
 	wg.Wait()
 
-	// Cursors of files no longer found are dropped; their events stay.
+	// Cursors of files no longer found are dropped; their events stay. A run that could not list a source
+	// drops none: what it did not see may still be there.
 	var gone []string
 	for p := range cursors {
-		if !seen[p] {
+		if listed && !seen[p] {
 			gone = append(gone, p)
 		}
 	}

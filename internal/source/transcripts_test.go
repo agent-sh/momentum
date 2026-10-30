@@ -557,6 +557,21 @@ func TestTranscriptsReadHermesSessionsByTheirLastRow(t *testing.T) {
 	if r := ingest(t, src, st); r.Read != 0 {
 		t.Fatalf("a session with no new row was read: %+v", r)
 	}
+	if os.Geteuid() != 0 {
+		// A store that cannot be opened keeps its sessions' cursors: they are not read again once it can.
+		if err := os.Chmod(path, 0); err != nil {
+			t.Fatal(err)
+		}
+		if r := ingest(t, src, st); len(r.Notes) != 1 || !strings.Contains(r.Notes[0], "hermes store") {
+			t.Fatalf("an unreadable store must be named: %+v", r)
+		}
+		if err := os.Chmod(path, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if r := ingest(t, src, st); r.Read != 0 {
+			t.Fatalf("after the store could not be opened, its sessions were read again: %+v", r)
+		}
+	}
 	if _, err := db.Exec(`insert into messages (session_id, role, content, timestamp) values ('phone', 'user', 'use sudo then', 110)`); err != nil {
 		t.Fatal(err)
 	}
