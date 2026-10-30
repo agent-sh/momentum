@@ -467,8 +467,10 @@ func put(ctx context.Context, tx querier, evs []Event) (int, error) {
 
 // FileCursor is where a source stopped in one file of many, and what it needs to tell the same file from a
 // new one: its inode and a fingerprint of its first line (OpenTelemetry's filelog rule), whether a compressed
-// copy held it, and the size and modification time (ns) it had when it was read. State is what the file's
-// reader kept at Offset, or nil; Path names the file, or another record the source reads in parts.
+// copy held it, and the size and modification time (ns) it had when it was read to the end (0 while a read
+// is under way). State is what the file's reader kept at Offset, or nil: for transcripts, tacit's saved
+// reader state, which holds transcript lines unredacted and is never printed or sent. Path names the file,
+// or another record the source reads in parts.
 type FileCursor struct {
 	Source, Path string
 	Inode        uint64

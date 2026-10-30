@@ -275,3 +275,23 @@ func TestAVersionChangeDropsFileCursorsWithTheirEvents(t *testing.T) {
 		t.Fatalf("events kept across a schema change: %d", len(evs))
 	}
 }
+
+// A cursor never runs ahead of its events: when a part's events cannot be stored, neither can any cursor of
+// the same write.
+func TestPutFilesStoresNoCursorWithoutItsEvents(t *testing.T) {
+	ctx := context.Background()
+	st, _ := open(t)
+	good := FileWrite{Events: []Event{{Source: "transcripts", SourceKey: "a@1", TS: time.Now(), Actor: ActorAgent, Kind: "agent_text"}},
+		Cursor: FileCursor{Source: "transcripts", Path: "/s/a.jsonl", Offset: 10}}
+	bad := FileWrite{Events: []Event{{Source: "transcripts", TS: time.Now(), Actor: ActorAgent, Kind: "agent_text"}}, // no key
+		Cursor: FileCursor{Source: "transcripts", Path: "/s/b.jsonl", Offset: 20}}
+	if _, err := st.PutFiles(ctx, []FileWrite{good, bad}); err == nil {
+		t.Fatal("an event without a key was stored")
+	}
+	if cs, _ := st.FileCursors(ctx, "transcripts"); len(cs) != 0 {
+		t.Fatalf("cursors stored without their events: %+v", cs)
+	}
+	if evs, _ := st.Events(ctx, Query{Since: time.Unix(0, 0), Source: "transcripts"}); len(evs) != 0 {
+		t.Fatalf("events of a failed write: %d", len(evs))
+	}
+}

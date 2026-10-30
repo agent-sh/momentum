@@ -104,6 +104,29 @@ func TestTranscriptsFromTheConfigAndASessionInOrder(t *testing.T) {
 		!strings.Contains(lines[1], "tool_call Bash") || !strings.Contains(lines[2], "tool_result Bash (error)") {
 		t.Fatalf("the session, oldest first:\n%s", out.String())
 	}
+	// Without --since a session is read from its start, however old; a listing the limit cut says so.
+	out.Reset()
+	errOut.Reset()
+	if code := run(context.Background(), []string{"evidence", "events", "--session", "5d1c2b3a", "--limit", "2"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	if lines := strings.Split(strings.TrimSpace(out.String()), "\n"); len(lines) != 2 || !strings.Contains(lines[0], "keep the cache warm") ||
+		!strings.Contains(errOut.String(), "more events than --limit 2") {
+		t.Fatalf("an old session with --limit 2:\n%s%s", out.String(), errOut.String())
+	}
+
+	// A transcript that cannot be read is named, with what the source did store.
+	if os.Geteuid() != 0 {
+		bad := filepath.Join(user, ".claude", "projects", "-home-u-shop", "6e2d3c4b-0000-4000-8000-00000000c1a2.jsonl")
+		if err := os.WriteFile(bad, []byte(line("2026-10-20T11:00:00.000Z", `"type":"user","uuid":"u9","promptSource":"typed","origin":{"kind":"human"},"message":{"role":"user","content":"the docs too"}`)+"\n"), 0); err != nil {
+			t.Fatal(err)
+		}
+		out.Reset()
+		errOut.Reset()
+		if code := run(context.Background(), []string{"evidence", "ingest"}, &out, &errOut); code != 3 || !strings.Contains(out.String(), bad) || !strings.Contains(out.String(), "transcripts: 0 new") {
+			t.Fatalf("exit %d, an unreadable transcript:\n%s%s", code, out.String(), errOut.String())
+		}
+	}
 }
 
 func TestWhenIsADurationOrALocalTime(t *testing.T) {

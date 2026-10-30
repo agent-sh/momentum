@@ -29,9 +29,11 @@ import (
 // place keeps its cursor: tacit names offsets in the decompressed bytes. A compressed copy is final, so its
 // cursor keeps no State. A Hermes session's cursor is its last message id.
 //
-// Only redacted text is stored: every text goes through tacit's redaction (scrump), which fails closed. When
-// redaction cannot run, nothing is read; when it fails on a file, that file stores nothing past its cursor
-// this run and is reported, and the next run takes it up from there.
+// Events hold only redacted text: every text goes through tacit's redaction (scrump), which fails closed.
+// When redaction cannot run, nothing is read; when it fails on a file, that file stores nothing past its
+// cursor this run and is reported, and the next run takes it up from there. The reader's saved State, kept
+// with the cursor, holds transcript lines unredacted (tacit's rules need them whole): it is as private as the
+// transcript, and is never printed or sent.
 type Transcripts struct {
 	Homes   []string // home directories to find sessions under
 	Workers int      // files read at once; 0 is DefaultWorkers()
@@ -48,17 +50,17 @@ func (Transcripts) Name() string { return "transcripts" }
 // session is a batch job that leaves the rest of the machine to everything else.
 func DefaultWorkers() int { return max(1, runtime.NumCPU()/3) }
 
-const (
-	// chunkBytes is how much of a transcript is read before its part is queued for storing: what a kill
-	// makes the next run read again.
-	chunkBytes = 64 << 20
-	// redactBytes is how much text a worker gathers, across its files, for one scrump call. A call costs a
-	// process start whatever its size, and tacit gives it 60 s.
-	redactBytes = 4 << 20
-	// spare is kept past every cut until redaction is done, so a secret that straddles a cut is whole when
-	// scrump sees it and the cut is made after masking (tacit's digest keeps the same 512).
-	spare = 512
+// chunkBytes is how much of a transcript is read before its part is queued for storing: what a kill makes
+// the next run read again. redactBytes is how much text a worker gathers, across its files, for one scrump
+// call: a call costs a process start whatever its size, and tacit gives it 60 s. Tests make both small.
+var (
+	chunkBytes  int64 = 64 << 20
+	redactBytes       = 4 << 20
 )
+
+// spare is kept past every cut until redaction is done, so a secret that straddles a cut is whole when scrump
+// sees it and the cut is made after masking (tacit's digest keeps the same 512).
+const spare = 512
 
 // How much of each text a summary keeps. An owner's turn is what the families quote, and a typed turn is
 // seldom longer than ownerChars. An error's output holds the failure, so it keeps more than other results.
@@ -102,11 +104,13 @@ type part struct {
 	cur   store.FileCursor
 }
 
-// pending is an item to store, its summary's text cut to what is kept plus spare, not yet redacted.
+// pending is an item to store: its event with the texts taken out (a batch holds only what it stores), the
+// texts its summary is made of cut to what is kept plus spare, not yet redacted (one, or an agent text's
+// head and tail), and how the summary is made of them once they are.
 type pending struct {
-	e    evidence.Event
-	text string
-	keep func(redacted string) string // the summary from the redacted text
+	e     evidence.Event
+	texts []string
+	keep  func(redacted []string) string
 }
 
 // tally is a run's counts, shared by the workers.
@@ -232,7 +236,7 @@ func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error
 	// drops none: what it did not see may still be there.
 	var gone []string
 	for p := range cursors {
-		if listed && !seen[p] {
+		if listed && !seen[p] && missing(p) {
 			gone = append(gone, p)
 		}
 	}
@@ -253,6 +257,20 @@ func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error
 		return t.res, fmt.Errorf("%d of %d files not stored past their cursor", len(t.failed), len(jobs))
 	}
 	return t.res, nil
+}
+
+// missing reports a cursor's file gone: a transcript whose plain file and compressed copy both do not exist
+// (a folder that cannot be listed lists as empty), or a Hermes session not in its store.
+func missing(path string) bool {
+	if strings.HasPrefix(path, "hermes:") {
+		return true
+	}
+	for _, p := range []string{path, path + ".zst"} {
+		if _, err := os.Lstat(p); !errors.Is(err, os.ErrNotExist) {
+			return false
+		}
+	}
+	return true
 }
 
 func (t *tally) isFailed(path string) bool {
@@ -344,6 +362,9 @@ func hermesJobs(ctx context.Context, src evidence.Source, cursors map[string]sto
 	var out []*job
 	for _, s := range ss {
 		key := "hermes:" + db.Path + "#" + s.ID
+		if seen[key] {
+			continue // the same store through another home
+		}
 		seen[key] = true
 		c, ok := cursors[key]
 		if ok && c.Offset == last[s.ID] || !ok && last[s.ID] == 0 {
@@ -393,8 +414,13 @@ func (s Transcripts) readJob(ctx context.Context, j *job, t *tally, add func(par
 			t.fail(j.path, err)
 			return
 		}
+		// A Hermes session is read whole; a transcript until the size it had when it was listed (what was
+		// added since is the next run's).
+		final := j.format == evidence.Hermes || next.Offset == from.Offset || next.Offset >= j.contentSize()
 		p.cur = store.FileCursor{Source: s.Name(), Path: j.path, Inode: j.inode, FP: j.fp, Compressed: j.packed, Offset: next.Offset}
-		if j.info != nil {
+		if j.info != nil && final {
+			// Only the part that ends the read marks the file read as it was listed: when a later part is
+			// not stored, the next run finds the file unmarked and reads on from the cursor.
 			p.cur.Size, p.cur.MTime = j.info.Size(), j.info.ModTime().UnixNano()
 		}
 		if !j.packed && next.Kept() {
@@ -404,12 +430,7 @@ func (s Transcripts) readJob(ctx context.Context, j *job, t *tally, add func(par
 				return
 			}
 		}
-		if !add(p) {
-			return
-		}
-		// A Hermes session is read whole; a transcript until the size it had when it was listed (what was
-		// added since is the next run's).
-		if j.format == evidence.Hermes || next.Offset == from.Offset || next.Offset >= j.contentSize() {
+		if !add(p) || final {
 			return
 		}
 		from = next
@@ -436,7 +457,9 @@ type batch struct {
 func (b *batch) add(p part) {
 	b.parts = append(b.parts, p)
 	for _, it := range p.items {
-		b.size += len(it.text)
+		for _, t := range it.texts {
+			b.size += len(t)
+		}
 	}
 }
 
@@ -504,51 +527,31 @@ func (w *writer) flush(ctx context.Context, b *batch) {
 	w.t.Unlock()
 }
 
-// events redacts the parts' texts, at most redactBytes per scrump call, and maps their items to store
-// events, part by part. Each call gets its texts joined by newlines as one text, and the redacted text is
-// cut back at the same places: masks keep the length. A mask that runs from one text into the next (a quoted
-// value a cut left open masks up to the next quote) masks the start of the next text too, which hides more,
-// never less; as separate records, such a mask makes tacit's redaction split the batch and mask it again,
-// half by half. Redaction fails closed: on any failure no event is returned.
+// events redacts the parts' texts and maps their items to store events, part by part. Redaction fails
+// closed: on any failure no event is returned.
 func (w *writer) events(ctx context.Context, parts []part) ([][]store.Event, int, error) {
 	var items []pending
+	var texts []string
 	for _, p := range parts {
-		items = append(items, p.items...)
+		for _, it := range p.items {
+			items = append(items, it)
+			texts = append(texts, it.texts...)
+		}
+	}
+	red, err := w.mask(ctx, texts)
+	if err != nil {
+		return nil, 0, err
 	}
 	out := make([]store.Event, 0, len(items))
 	unknown := 0
-	var joined strings.Builder
-	for start := 0; start < len(items); {
-		end, size := start, 0
-		for end < len(items) && (end == start || size+len(items[end].text)+1 <= redactBytes) {
-			size += len(items[end].text) + 1
-			end++
+	for _, it := range items {
+		n := len(it.texts)
+		e, unk := toEvent(w.source, it.e, it.keep(red[:n]))
+		red = red[n:]
+		if unk {
+			unknown++
 		}
-		joined.Reset()
-		for i := start; i < end; i++ {
-			if i > start {
-				joined.WriteByte('\n')
-			}
-			joined.WriteString(items[i].text)
-		}
-		red, err := w.redact(ctx, []evidence.Event{{Text: joined.String()}})
-		if err != nil {
-			return nil, 0, fmt.Errorf("redaction failed: %w", err)
-		}
-		if len(red) != 1 || len(red[0].Text) != joined.Len() {
-			return nil, 0, errors.New("redaction changed the text's length")
-		}
-		masked, at := red[0].Text, 0
-		for i := start; i < end; i++ {
-			n := len(items[i].text)
-			e, unk := toEvent(w.source, items[i].e, items[i].keep(masked[at:at+n]))
-			if unk {
-				unknown++
-			}
-			out = append(out, e)
-			at += n + 1
-		}
-		start = end
+		out = append(out, e)
 	}
 	byPart := make([][]store.Event, len(parts))
 	for i, p := range parts {
@@ -557,47 +560,134 @@ func (w *writer) events(ctx context.Context, parts []part) ([][]store.Event, int
 	return byPart, unknown, nil
 }
 
+// mask redacts texts, at most redactBytes per scrump call: each call gets its texts joined by newlines as
+// one text, and the redacted text is cut back at the same places, since masks keep the length.
+//
+// A hit can run from one text into the next: a quoted value a cut left open is masked up to the next quote.
+// It masks the start of the next text too, which hides more, but it also ends where scrump resumes, which
+// can be inside a secret of the next text, past the key that marks it. So every text the joined call masked
+// from its first byte is redacted again on its own (in one more call, as records), and a byte stays masked
+// when either call masked it. Records alone are no answer: a hit that runs across tacit's record separator
+// makes it split the batch and mask it again, half by half.
+func (w *writer) mask(ctx context.Context, texts []string) ([]string, error) {
+	out := make([]string, len(texts))
+	var joined strings.Builder
+	for start := 0; start < len(texts); {
+		end, size := start, 0
+		for end < len(texts) && (end == start || size+len(texts[end])+1 <= redactBytes) {
+			size += len(texts[end]) + 1
+			end++
+		}
+		joined.Reset()
+		for i := start; i < end; i++ {
+			if i > start {
+				joined.WriteByte('\n')
+			}
+			joined.WriteString(texts[i])
+		}
+		red, err := w.redact(ctx, []evidence.Event{{Text: joined.String()}})
+		if err != nil {
+			return nil, fmt.Errorf("redaction failed: %w", err)
+		}
+		if len(red) != 1 || len(red[0].Text) != joined.Len() {
+			return nil, errors.New("redaction changed the text's length")
+		}
+		masked, at := red[0].Text, 0
+		var again []int
+		for i := start; i < end; i++ {
+			n := len(texts[i])
+			out[i] = masked[at : at+n]
+			if i > start && n > 0 && out[i][0] == '*' {
+				again = append(again, i)
+			}
+			at += n + 1
+		}
+		if len(again) > 0 {
+			carriers := make([]evidence.Event, len(again))
+			for k, i := range again {
+				carriers[k].Text = texts[i]
+			}
+			alone, err := w.redact(ctx, carriers)
+			if err != nil {
+				return nil, fmt.Errorf("redaction failed: %w", err)
+			}
+			if len(alone) != len(again) {
+				return nil, errors.New("redaction returned a different number of texts")
+			}
+			for k, i := range again {
+				if len(alone[k].Text) != len(out[i]) {
+					return nil, errors.New("redaction changed a text's length")
+				}
+				out[i] = union(out[i], alone[k].Text)
+			}
+		}
+		start = end
+	}
+	return out, nil
+}
+
+// union is a text masked where either of two maskings of it masked it.
+func union(a, b string) string {
+	if a == b {
+		return a
+	}
+	u := []byte(a)
+	for i := range u {
+		if b[i] == '*' {
+			u[i] = '*'
+		}
+	}
+	return string(u)
+}
+
 // toPending is the item to store for an event, or false for one not stored (skipWhy).
 func toPending(e evidence.Event) (pending, bool) {
 	if skipWhy[e.Why] {
 		return pending{}, false
 	}
-	p := pending{e: e}
+	var p pending
 	switch e.Kind {
 	case evidence.KindOwnerText:
-		p.text, p.keep = cutHead(e.Text, ownerChars)
+		p.texts, p.keep = cutHead(e.Text, ownerChars)
 	case evidence.KindAgentText:
-		p.text, p.keep = cutEnds(e.Text, headChars, tailChars)
+		p.texts, p.keep = cutEnds(e.Text, headChars, tailChars)
 	case evidence.KindToolCall:
-		p.text, p.keep = cutHead(e.ToolInput, textChars)
+		p.texts, p.keep = cutHead(e.ToolInput, textChars)
 	case evidence.KindToolResult:
 		n := textChars
 		if e.IsError {
 			n = errorChars
 		}
-		p.text, p.keep = cutHead(e.ToolOutput, n)
+		p.texts, p.keep = cutHead(e.ToolOutput, n)
 	default: // harness text, a compaction's summary, and kinds tacit adds later
-		p.text, p.keep = cutHead(e.Text, textChars)
+		p.texts, p.keep = cutHead(e.Text, textChars)
 	}
+	e.Text, e.ToolInput, e.ToolOutput = "", "", ""
+	p.e = e
 	return p, true
 }
 
-// cutHead keeps n bytes of s, plus spare until redaction.
-func cutHead(s string, n int) (string, func(string) string) {
-	return prefix(s, n+spare), func(r string) string { return oneLine(prefix(r, n), len(s) > n) }
+// cutHead keeps n bytes of s, plus spare until redaction. The cut text is a copy, so the batch does not hold
+// the whole of s.
+func cutHead(s string, n int) ([]string, func([]string) string) {
+	cut := len(s) > n
+	return []string{strings.Clone(prefix(s, n+spare))}, func(r []string) string { return oneLine(prefix(r[0], n), cut) }
 }
 
-// cutEnds keeps the first head and the last tail bytes of s, each with spare until redaction. Masks keep
-// the length, so the redacted text's own ends are the ends kept.
-func cutEnds(s string, head, tail int) (string, func(string) string) {
+// cutEnds keeps the first head and the last tail bytes of s, each with spare until redaction, as two texts
+// (so a quote the head leaves open is not paired with one of the tail's), or one when they meet.
+func cutEnds(s string, head, tail int) ([]string, func([]string) string) {
 	if len(s) <= head+tail {
-		return s, func(r string) string { return oneLine(r, false) }
+		return []string{strings.Clone(s)}, func(r []string) string { return oneLine(r[0], false) }
 	}
-	keep := func(r string) string { return oneLine(prefix(r, head), true) + " " + oneLine(suffix(r, tail), false) }
 	if len(s) <= head+tail+2*spare {
-		return s, keep
+		return []string{strings.Clone(s)}, func(r []string) string {
+			return oneLine(prefix(r[0], head), true) + " " + oneLine(suffix(r[0], tail), false)
+		}
 	}
-	return prefix(s, head+spare) + "\n" + suffix(s, tail+spare), keep
+	return []string{strings.Clone(prefix(s, head+spare)), strings.Clone(suffix(s, tail+spare))}, func(r []string) string {
+		return oneLine(prefix(r[0], head), true) + " " + oneLine(suffix(r[1], tail), false)
+	}
 }
 
 // prefix is s cut to at most n bytes at a character boundary.
@@ -666,11 +756,17 @@ func toEvent(source string, e evidence.Event, summary string) (store.Event, bool
 	if why == plainWhy[e.Kind] {
 		why = ""
 	}
+	// A Codex subagent's thread, a pi task and a Hermes delegation are sessions of their own in tacit's
+	// events, their parent named; here they are a subagent inside the parent's session, as Claude Code's are.
+	session := e.Session
+	if e.Subagent != "" && e.Subagent == e.Session && e.Parent != "" {
+		session = e.Parent
+	}
 	return store.Event{
 		Source:    source,
 		SourceKey: fmt.Sprintf("%s@%012d#%03d", name, e.Offset, e.Index),
 		TS:        e.At,
-		Session:   e.Session,
+		Session:   session,
 		Agent:     e.Subagent,
 		Harness:   e.Harness,
 		Model:     e.Model,

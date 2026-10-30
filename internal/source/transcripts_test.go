@@ -470,9 +470,11 @@ func TestTranscriptsRedactWithScrump(t *testing.T) {
 }
 
 // A batch's texts reach scrump as one text, in one call. A cut that leaves a quoted value open (scrump masks
-// it up to the next quote, in a later text) masks the start of that text too, and costs no more calls: as
-// separate records it made tacit's redaction split the batch and mask it again, half by half.
-func TestTranscriptsRedactABatchInOneCall(t *testing.T) {
+// it up to the next quote, in a later text) masks the start of that text too, and that text is masked again
+// on its own, in one more call: a secret it holds past where the first hit ended is masked as well. The same
+// holds for an agent text's head and tail. As separate records the batch was split and masked again, half by
+// half (9 calls here).
+func TestTranscriptsRedactABatchInOneCallAndAgainWhereAHitRanIn(t *testing.T) {
 	if err := evidence.RedactionReady(); err != nil {
 		t.Skip("needs scrump with its text profile:", err)
 	}
@@ -488,30 +490,38 @@ func TestTranscriptsRedactABatchInOneCall(t *testing.T) {
 	}
 	home := testHome(t)
 	t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
-	// The call's input is cut inside its quoted token; a result after it holds a quote.
-	input, _ := json.Marshal(map[string]string{"command": "deploy " + strings.Repeat("x", textChars+spare-40) + " clientToken: 'pub_live_" + strings.Repeat("a1b2", 20) + "'"})
+	secret := "Zq7Vx9" + "Lm2Kp4"
+	open := " clientToken: 'pub_live_" + strings.Repeat("a1b2", 20) + "'"
+	// The call's input is cut inside its quoted token; the result after it holds a quoted password.
+	input, _ := json.Marshal(map[string]string{"command": "deploy " + strings.Repeat("x", textChars+spare-40) + open})
+	out, _ := json.Marshal("pass" + "word: '" + secret + "' and the rest")
+	// An agent text whose head is cut inside a quoted token and whose tail holds a quoted password.
+	reply, _ := json.Marshal("Deploying " + strings.Repeat("y", headChars+spare-40) + open + strings.Repeat(" z", 2*spare) + " pass" + "word: '" + secret + "' then done.")
 	lines := []string{claudeSession()[0],
-		claudeLine(1, `"type":"assistant","uuid":"a1","message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":`+string(input)+`}]}`)}
-	for i := range 8 {
-		lines = append(lines, claudeLine(2, fmt.Sprintf(`"type":"user","uuid":"u%d","message":{"role":"user","content":[{"tool_use_id":"toolu_01","type":"tool_result","content":"step %d done, it's fine"}]}`, i+2, i)))
+		claudeLine(1, `"type":"assistant","uuid":"a1","message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":`+string(input)+`}]}`),
+		claudeLine(2, `"type":"user","uuid":"u2","message":{"role":"user","content":[{"tool_use_id":"toolu_01","type":"tool_result","content":`+string(out)+`}]}`),
+		claudeLine(3, `"type":"assistant","uuid":"a3","message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":`+string(reply)+`}]}`),
 	}
 	writeLines(t, claudePath(home), lines...)
 	st := openStore(t)
-	if r := ingest(t, Transcripts{Homes: []string{home}}, st); r.New != 11 {
-		t.Fatalf("stored %+v, want 11", r)
+	if r := ingest(t, Transcripts{Homes: []string{home}}, st); r.New != 5 {
+		t.Fatalf("stored %+v, want 5", r)
 	}
 	b, err := os.ReadFile(calls)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// One call proves redaction can run, one masks the batch.
-	if n := strings.Count(string(b), "call"); n != 2 {
-		t.Fatalf("%d scrump calls, want 2", n)
+	// One call proves redaction can run, one masks the batch, one masks again the texts a hit ran into.
+	if n := strings.Count(string(b), "call"); n != 3 {
+		t.Fatalf("%d scrump calls, want 3", n)
 	}
 	for _, e := range all(t, st, "transcripts") {
-		if strings.Contains(e.Summary, "a1b2") {
-			t.Fatalf("the token was stored: %+v", e)
+		if strings.Contains(e.Summary, secret) || strings.Contains(e.Summary, "a1b2") {
+			t.Fatalf("a secret was stored: %+v", e)
 		}
+	}
+	if r := find(t, all(t, st, "transcripts"), "tool_result", "and the rest"); !strings.Contains(r.Summary, "****") {
+		t.Fatalf("the result's password is not masked: %q", r.Summary)
 	}
 }
 
@@ -557,6 +567,13 @@ func TestTranscriptsReadHermesSessionsByTheirLastRow(t *testing.T) {
 	if r := ingest(t, src, st); r.Read != 0 {
 		t.Fatalf("a session with no new row was read: %+v", r)
 	}
+	// Two homes find the same store (the store's own variable): its sessions are read once.
+	if _, err := db.Exec(`insert into messages (session_id, role, content, timestamp) values ('phone', 'user', 'and the logs', 105)`); err != nil {
+		t.Fatal(err)
+	}
+	if r := ingest(t, Transcripts{Homes: []string{home, t.TempDir()}, redact: masked, ready: ready}, st); r.Read != 1 {
+		t.Fatalf("a store found through two homes: %+v, want the one new row read once", r)
+	}
 	if os.Geteuid() != 0 {
 		// A store that cannot be opened keeps its sessions' cursors: they are not read again once it can.
 		if err := os.Chmod(path, 0); err != nil {
@@ -577,5 +594,109 @@ func TestTranscriptsReadHermesSessionsByTheirLastRow(t *testing.T) {
 	}
 	if r := ingest(t, src, st); r.Read != 1 || r.New != 1 {
 		t.Fatalf("after a new row %+v, want only it read", r)
+	}
+}
+
+// A transcript read in parts, whose last part is not stored, is read on from its cursor by the next run:
+// only the part that ends a read marks the file read.
+func TestTranscriptsReadOnWhenALaterPartWasNotStored(t *testing.T) {
+	oldChunk, oldRedact := chunkBytes, redactBytes
+	chunkBytes, redactBytes = 1, 1 // a part a line, each part its own scrump call
+	t.Cleanup(func() { chunkBytes, redactBytes = oldChunk, oldRedact })
+	home := testHome(t)
+	lines := claudeSession()
+	lines = append(lines, claudeLine(6, `"type":"assistant","uuid":"a9","message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"LAST-LINE"}]}`))
+	writeLines(t, claudePath(home), lines...)
+	st := openStore(t)
+	failLast := func(ctx context.Context, evs []evidence.Event) ([]evidence.Event, error) {
+		for _, e := range evs {
+			if strings.Contains(e.Text, "LAST-LINE") {
+				return nil, errors.New("scrump: exit status 1")
+			}
+		}
+		return masked(ctx, evs)
+	}
+	r, err := (Transcripts{Homes: []string{home}, Workers: 1, redact: failLast, ready: ready}).Ingest(context.Background(), st)
+	if err == nil || r.New != 6 {
+		t.Fatalf("first run %+v %v, want the 6 items before the last stored and a failure", r, err)
+	}
+	if r := ingest(t, transcripts(home), st); r.Read != 1 || r.New != 1 {
+		t.Fatalf("the next run %+v, want the last item read on from the cursor", r)
+	}
+}
+
+// A file replaced by one that opens with the same line is still another file (its inode): it is read again
+// from its start.
+func TestTranscriptsReadAgainAFileReplacedWithTheSameFirstLine(t *testing.T) {
+	home := testHome(t)
+	path := writeLines(t, claudePath(home), claudeSession()...)
+	st := openStore(t)
+	src := transcripts(home)
+	ingest(t, src, st)
+	if err := os.Rename(path, path+".old"); err != nil {
+		t.Fatal(err)
+	}
+	lines := claudeSession()
+	lines = append(lines, claudeLine(7, `"type":"user","uuid":"u7","promptId":"p7",`+typed+`,"message":{"role":"user","content":"and tag it"}`))
+	writeLines(t, path, lines...)
+	if r := ingest(t, src, st); r.Read != 7 || !strings.Contains(strings.Join(r.Notes, "\n"), "read again from the start") {
+		t.Fatalf("a replaced file with the same first line %+v, want all 7 items read from the start", r)
+	}
+}
+
+// An agent text's summary is made from its masked ends: a token across the head's cut or the tail's is
+// whole when it is masked.
+func TestTranscriptsMaskAgentTextAtBothCuts(t *testing.T) {
+	home := testHome(t)
+	tok := func(c string) string { return "tok_" + strings.Repeat(c, 30) }
+	text := strings.Repeat("h", headChars-10) + " " + tok("A") + " " + strings.Repeat("m", 3*spare) + " " + tok("B") + strings.Repeat("t", tailChars-12)
+	reply, _ := json.Marshal(text)
+	lines := []string{claudeSession()[0], claudeLine(1, `"type":"assistant","uuid":"a1","message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":`+string(reply)+`}]}`)}
+	writeLines(t, claudePath(home), lines...)
+	st := openStore(t)
+	ingest(t, transcripts(home), st)
+	e := find(t, all(t, st, "transcripts"), "agent_text", "hhhh")
+	if strings.Contains(e.Summary, "tok_") || strings.Contains(e.Summary, "AAAA") || strings.Contains(e.Summary, "BBBB") || !strings.Contains(e.Summary, "*****…") {
+		t.Fatalf("a token across a cut of the agent's text: %q", e.Summary)
+	}
+}
+
+// A Codex subagent's thread is a subagent inside its parent's session, as Claude Code's are.
+func TestTranscriptsPutASubagentThreadInItsParentsSession(t *testing.T) {
+	home := testHome(t)
+	user, _ := json.Marshal(map[string]any{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "review the key change"}}})
+	lines := []string{
+		codexLine(0, "session_meta", `{"id":"019a-sub","timestamp":"2026-10-21T09:00:00.000Z","cwd":"/home/u/projects/shop","originator":"codex-tui","cli_version":"0.162.1","source":{"subagent":"review"},"thread_source":"subagent","parent_thread_id":"019a-own","model_provider":"p"}`),
+		codexLine(1, "response_item", string(user)),
+	}
+	writeLines(t, filepath.Join(home, ".codex", "sessions", "2026", "10", "21", "rollout-2026-10-21T09-10-00-019a-sub.jsonl"), lines...)
+	st := openStore(t)
+	ingest(t, transcripts(home), st)
+	e := find(t, all(t, st, "transcripts"), "agent_text", "review the key change")
+	if e.Session != "019a-own" || e.Agent != "019a-sub" || metaOf(t, e)["parent"] != "019a-own" {
+		t.Fatalf("a subagent thread: session %q agent %q meta %s", e.Session, e.Agent, e.Meta)
+	}
+}
+
+// A folder that cannot be listed keeps the cursors of the files in it: they are not read again once it can.
+func TestTranscriptsKeepCursorsOfAFolderThatCannotBeListed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root lists any folder")
+	}
+	home := testHome(t)
+	path := writeLines(t, claudePath(home), claudeSession()...)
+	st := openStore(t)
+	src := transcripts(home)
+	ingest(t, src, st)
+	dir := filepath.Dir(path)
+	if err := os.Chmod(dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	ingest(t, src, st)
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if r := ingest(t, src, st); r.Read != 0 {
+		t.Fatalf("after its folder could not be listed, a transcript was read again: %+v", r)
 	}
 }

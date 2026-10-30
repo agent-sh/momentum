@@ -85,7 +85,7 @@ func evidence(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	case "ingest":
 		return ingest(ctx, stdout, stderr)
 	case "events":
-		return events(ctx, args[1:], stdout)
+		return events(ctx, args[1:], stdout, stderr)
 	case "status":
 		return status(ctx, args[1:], stdout)
 	case "rebuild":
@@ -137,8 +137,8 @@ func ingest(ctx context.Context, stdout, stderr io.Writer) error {
 		if o.Err != nil {
 			failed++
 			fmt.Fprintf(stderr, "[ERROR] %s: %v\n", o.Name, o.Err)
-			continue
 		}
+		// What a failing source stored, and what failed, by name.
 		fmt.Fprintf(stdout, "%s: %d new, %d read, %d unparsed\n", o.Name, o.New, o.Read, o.Skipped)
 		for _, n := range o.Notes {
 			fmt.Fprintf(stdout, "  %s\n", n)
@@ -150,9 +150,9 @@ func ingest(ctx context.Context, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func events(ctx context.Context, args []string, stdout io.Writer) error {
+func events(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("events", flag.ContinueOnError)
-	since := fs.String("since", "1d", "how far back, or from when")
+	since := fs.String("since", "1d", "how far back, or from when (one session: its start)")
 	until := fs.String("until", "", "until when")
 	kinds := fs.String("kind", "", "comma-separated kinds")
 	src := fs.String("source", "", "one source")
@@ -162,11 +162,20 @@ func events(ctx context.Context, args []string, stdout io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
 	}
-	from, err := parseWhen(*since)
-	if err != nil {
-		return usageError{err.Error()}
+	if *limit <= 0 {
+		*limit = 200
 	}
-	q := store.Query{Since: from, Source: *src, Session: *session, Limit: *limit}
+	sinceSet := false
+	fs.Visit(func(f *flag.Flag) { sinceSet = sinceSet || f.Name == "since" })
+	var from time.Time // one session reads from its start, unless --since says otherwise
+	if *session == "" || sinceSet {
+		var err error
+		if from, err = parseWhen(*since); err != nil {
+			return usageError{err.Error()}
+		}
+	}
+	var err error
+	q := store.Query{Since: from, Source: *src, Session: *session, Limit: *limit + 1}
 	if *until != "" {
 		if q.Until, err = parseWhen(*until); err != nil {
 			return usageError{err.Error()}
@@ -183,6 +192,10 @@ func events(ctx context.Context, args []string, stdout io.Writer) error {
 	evs, err := st.Events(ctx, q)
 	if err != nil {
 		return err
+	}
+	if len(evs) > *limit {
+		evs = evs[:*limit]
+		defer fmt.Fprintf(stderr, "momentum: more events than --limit %d; raise it, or narrow with --since and --until\n", *limit)
 	}
 	enc := json.NewEncoder(stdout)
 	for _, e := range evs {
