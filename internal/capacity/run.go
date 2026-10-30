@@ -44,7 +44,7 @@ type Finding struct {
 	none         bool      // a prune that removed nothing, as the tool lists it or uv counts it: no decided note
 	unsaid       bool      // a prune whose tool did not say what it freed
 	unsized      bool      // a prune whose size could not be read before it ran
-	ownDirs      []string  // the directories its deletion changed that a later look takes as capacity's (explainable)
+	ownDirs      []ownDir  // the directories its deletion changed, each with its last change before (ownBefore)
 }
 
 // The actions a finding can have.
@@ -173,7 +173,7 @@ type runner struct {
 	dockerAsked   bool                 // whether this run asked Docker (only when a rule scans)
 	heads         *remoteHeads         // the remotes' branches, asked once per run
 	changed       map[changeKey]bool   // whether a work tree changed in the last quietTime, per look
-	own           map[string]time.Time // the directories this run's and recent runs' deletions changed, and when
+	own           map[string]ownChange // the directories this run's and recent runs' deletions changed
 	res           *Result
 }
 

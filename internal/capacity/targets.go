@@ -61,7 +61,7 @@ func (r *runner) targets(ctx context.Context, paths []string) ([]Finding, error)
 
 // targetOwner decides on an idle target dir by its project.
 func (r *runner) targetOwner(ctx context.Context, t, canon string) (action, class, why string) {
-	if w, ok := r.ex.byPath(canon); ok {
+	if w, ok := r.excluded(canon); ok {
 		return ActReport, "excluded", "an excluded project's: " + w
 	}
 	known := false
@@ -83,7 +83,11 @@ func (r *runner) targetOwner(ctx context.Context, t, canon string) (action, clas
 		return ActReport, "unknown", "it holds more dep-info files than were read, so its projects are not all known"
 	}
 	for _, s := range sources {
-		if w, ok := r.ex.byPath(r.m.resolve(s)); ok {
+		w, ok := r.ex.byPath(r.m.resolve(s))
+		if !ok { // as Cargo wrote it: a build through an alias names the alias
+			w, ok = r.ex.byPath(r.m.Canon(filepath.Clean(s)))
+		}
+		if ok {
 			return ActReport, "excluded", "built from an excluded project's sources (" + short(s) + ", " + w + ")"
 		}
 		if rp := r.git.repoOf(ctx, s); rp != nil {

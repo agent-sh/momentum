@@ -395,8 +395,8 @@ func (r *runner) event(kind string, f Finding, key string, actor store.Actor) st
 	if !f.Seen.IsZero() {
 		meta["seen"] = f.Seen.Format(time.RFC3339)
 	}
-	if len(f.ownDirs) > 0 {
-		meta["own"] = f.ownDirs // the directories a later run may take as changed by this deletion (explainable)
+	if kind == KindDelete && len(f.ownDirs) > 0 {
+		meta["own"] = f.ownDirs // the directories it changed: a later run tells capacity's change from someone's
 	}
 	for k, v := range map[string]string{"why": f.Why, "detail": f.Detail, "error": f.Err, "class": f.class, "branch": f.branch} {
 		if v != "" {

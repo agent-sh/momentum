@@ -100,15 +100,61 @@ func TestTargetsGoWhenIdleIgnoredAndOfAKnownProject(t *testing.T) {
 	}
 }
 
-func TestATargetsRootThatIsASymlinkIsWalkedWhereItLeads(t *testing.T) {
-	base := t.TempDir()
-	real, link := filepath.Join(base, "disk", "code"), filepath.Join(base, "code")
+func TestATargetsRootThatIsASymlinkOrUnderOneIsWalkedWhereItLeads(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	must(t, err)
+	real := filepath.Join(base, "disk", "code")
 	target := filepath.Join(real, "app", "target")
-	write(t, filepath.Join(target, "CACHEDIR.TAG"), cargoTag+"\n# This file is a cache directory tag created by cargo.\n")
-	write(t, filepath.Join(target, ".rustc_info.json"), "{}")
-	must(t, os.Symlink(real, link))
-	f := Discover([]string{link}, func(string) bool { return true }, func(string) bool { return false }, nil)
-	if len(f.Targets) != 1 || f.Targets[0] != target {
-		t.Errorf("a root moved to another disk and linked back is walked: %v", f.Targets)
+	cargoTarget(t, target)
+	must(t, os.Symlink(real, filepath.Join(base, "code")))                     // a root moved to another disk and linked back
+	must(t, os.Symlink(filepath.Join(base, "disk"), filepath.Join(base, "d"))) // a root under a link
+	for _, root := range []string{filepath.Join(base, "code"), filepath.Join(base, "d", "code")} {
+		f := Discover([]string{root}, func(string) bool { return true }, func(string) bool { return false }, nil)
+		if len(f.Targets) != 1 || f.Targets[0] != target {
+			t.Errorf("%s: walked where it leads: %v", root, f.Targets)
+		}
+	}
+	// through the rule, which compares what it finds with its canonical roots
+	cfg := Config{Targets: TargetsConfig{Roots: []string{filepath.Join(base, "d", "code")}}}.Normal()
+	res, err := Run(context.Background(), cfg, openStore(t), options(t, procRoot(t), time.Now().Add(72*time.Hour), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := findings(res, RuleTargets)[target]; !ok {
+		t.Error("a root under a link finds its targets")
+	}
+}
+
+func TestANameThatOnlyAnAliasCarriesStillExcludes(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	must(t, err)
+	now := time.Now().Add(72 * time.Hour)
+	// a targets root that is a link the excluded name reaches, to a place it does not
+	real := filepath.Join(base, "disk", "code")
+	inRoot := filepath.Join(real, "app", "target")
+	cargoTarget(t, inRoot)
+	must(t, os.Symlink(real, filepath.Join(base, "secret-code")))
+	// a build outside any repository whose sources Cargo read through such an alias
+	src := filepath.Join(base, "disk", "src2")
+	write(t, filepath.Join(src, "src", "main.rs"), "fn main() {}\n")
+	must(t, os.Symlink(src, filepath.Join(base, "secret-src")))
+	cache := filepath.Join(base, "cache")
+	built := filepath.Join(cache, "alias-target")
+	cargoTarget(t, built, filepath.Join(base, "secret-src", "src", "main.rs"))
+	cfg := Config{Targets: TargetsConfig{Roots: []string{filepath.Join(base, "secret-code"), cache}},
+		Exclude: Exclude{Names: []string{"*secret*"}}}.Normal()
+	cfg.Live = []string{RuleTargets}
+	res, err := Run(context.Background(), cfg, openStore(t), options(t, procRoot(t), now, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := findings(res, RuleTargets)
+	for _, p := range []string{inRoot, built} {
+		if f := got[p]; f.Action != ActReport || f.class != "excluded" {
+			t.Errorf("%s: an excluded project's, by the alias's name: %+v", p, f)
+		}
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("%s was deleted", p)
+		}
 	}
 }
