@@ -66,7 +66,7 @@ func (r *runner) targetOwner(ctx context.Context, t, canon string) (action, clas
 	}
 	known := false
 	if rp := r.git.repoOf(ctx, t); rp != nil {
-		if w, ok := r.ex.repo(rp); ok {
+		if w, ok := r.excludedRepo(rp); ok {
 			return ActReport, "excluded", "an excluded project's: " + w
 		}
 		ignored, err := gitOK(ctx, rp.top, "check-ignore", "-q", t)
@@ -83,7 +83,7 @@ func (r *runner) targetOwner(ctx context.Context, t, canon string) (action, clas
 		return ActReport, "unknown", "it holds more dep-info files than were read, so its projects are not all known"
 	}
 	for _, s := range sources {
-		w, ok := r.ex.byPath(r.m.resolve(s))
+		w, ok := r.excluded(r.m.resolve(s))
 		if !ok { // as Cargo wrote it: a build through an alias names the alias
 			w, ok = r.ex.byPath(r.m.Canon(filepath.Clean(s)))
 		}
@@ -91,7 +91,7 @@ func (r *runner) targetOwner(ctx context.Context, t, canon string) (action, clas
 			return ActReport, "excluded", "built from an excluded project's sources (" + short(s) + ", " + w + ")"
 		}
 		if rp := r.git.repoOf(ctx, s); rp != nil {
-			if w, ok := r.ex.repo(rp); ok {
+			if w, ok := r.excludedRepo(rp); ok {
 				return ActReport, "excluded", "built from an excluded project's sources (" + short(s) + ", " + w + ")"
 			}
 			known = true

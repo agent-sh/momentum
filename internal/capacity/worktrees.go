@@ -129,7 +129,7 @@ func (r *runner) worktree(ctx context.Context, w, canon string, heads *remoteHea
 		return f, true
 	}
 	if rp := r.git.repoOf(ctx, w); rp != nil {
-		if why, ok := r.ex.repo(rp); ok {
+		if why, ok := r.excludedRepo(rp); ok {
 			f.Action, f.class, f.Why = ActReport, "excluded", "an excluded project's: "+why
 			return f, true
 		}

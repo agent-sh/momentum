@@ -65,17 +65,18 @@ func (r *runner) excluded(canon string) (string, bool) {
 	return "", false
 }
 
-// of reports whether a path belongs to an excluded project: by its place, or by the repository it is in (the
-// repository's remote, or the place of its main checkout, for a worktree).
-func (e *excluder) of(ctx context.Context, p string) (string, bool) {
-	if why, ok := e.byPath(p); ok {
+// excludedRepo reports whether a repository is an excluded project's: by its remotes, or by the place of its main
+// checkout, which may also be under a root that is a link.
+func (r *runner) excludedRepo(rp *repo) (string, bool) {
+	if why, ok := r.ex.repo(rp); ok {
 		return why, true
 	}
-	r := e.git.repoOf(ctx, p)
-	if r == nil {
-		return "", false
+	if rp.common != "" {
+		if why, ok := r.excluded(r.m.Canon(filepath.Dir(rp.common))); ok {
+			return "a worktree of a repository " + why, true
+		}
 	}
-	return e.repo(r)
+	return "", false
 }
 
 // repo reports whether a repository is an excluded project's.
