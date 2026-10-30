@@ -10,11 +10,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/agent-sh/momentum/sessions"
+	"github.com/agent-sh/momentum/sessions/internal/fileid"
 	"github.com/agent-sh/momentum/sessions/internal/text"
 
 	_ "modernc.org/sqlite"
@@ -32,15 +34,27 @@ const Retain = 15 * time.Minute
 
 // Source reads Hermes conversations from $HERMES_HOME/state.db.
 type Source struct {
-	Env  sessions.Env
-	db   *sql.DB
-	logs map[string]*dbLog
-	seen map[string]time.Time
+	Env   sessions.Env
+	db    *sql.DB
+	saved sessions.Saved
+	logs  map[string]*dbLog
+	seen  map[string]time.Time
+	now   time.Time // the last scan's
 }
 
+// dbLog is a conversation's activity log and how far into its messages it has read.
 type dbLog struct {
 	log    sessions.Log
-	cursor int64
+	cursor int64 // the id of the last message read
+	read   int   // messages read into the log
+}
+
+// logState is a log's checkpoint: how far into the conversation's messages it read, in which database file.
+type logState struct {
+	Cursor int64  `json:"cursor"`
+	Read   int    `json:"read"`
+	Dev    uint64 `json:"dev,omitempty"`
+	Ino    uint64 `json:"ino,omitempty"`
 }
 
 // New reads Hermes conversations.
@@ -55,10 +69,32 @@ func (src *Source) Close() error {
 	return nil
 }
 
+// Resume makes later scans start a conversation's log from its checkpoint in saved the first time they read it.
+func (src *Source) Resume(saved sessions.Saved) { src.saved = saved }
+
+// Checkpoints returns the checkpoint of every conversation log the last Scan read.
+func (src *Source) Checkpoints() []sessions.Checkpoint {
+	dev, ino := fileid.OfPath(src.path())
+	var out []sessions.Checkpoint
+	for key, at := range src.seen {
+		if !at.Equal(src.now) {
+			continue
+		}
+		l := src.logs[key]
+		if state, err := json.Marshal(logState{Cursor: l.cursor, Read: l.read, Dev: dev, Ino: ino}); err == nil {
+			out = append(out, sessions.Checkpoint{Tool: src.Tool(), Key: key, State: state, Log: &l.log})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
+func (src *Source) path() string { return filepath.Join(src.Env.HermesHome, "state.db") }
+
 // open opens the state database read-only once it exists; nil while Hermes is not installed here.
 func (src *Source) open() *sql.DB {
 	if src.db == nil {
-		path := filepath.Join(src.Env.HermesHome, "state.db")
+		path := src.path()
 		if _, err := os.Stat(path); err == nil {
 			src.db, _ = sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(500)")
 		}
@@ -77,6 +113,7 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 	if src.logs == nil {
 		src.logs, src.seen = map[string]*dbLog{}, map[string]time.Time{}
 	}
+	src.now = w.Now
 	db := src.open()
 	if db == nil {
 		return nil, nil
@@ -136,8 +173,8 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 		}
 		open, err := src.facts(ctx, h.id, s)
 		s.TurnOpen = open || l.live
-		lg := src.logOf(s.Key)
-		errs = append(errs, err, src.readLog(ctx, h.id, lg))
+		lg, lerr := src.logOf(ctx, s.Key, h.id)
+		errs = append(errs, err, lerr, src.readLog(ctx, h.id, lg))
 		s.Log = &lg.log
 		if s.TurnOpen && s.Now == "" && h.act != "" {
 			s.Now, s.NowSince = text.OneLine(h.act, 140), s.LastActive
@@ -158,13 +195,49 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 	return out, errors.Join(errs...)
 }
 
-func (src *Source) logOf(key string) *dbLog {
-	l := src.logs[key]
-	if l == nil {
-		l = &dbLog{}
-		src.logs[key] = l
+// logOf returns a conversation's log: the one kept from an earlier scan, else one resumed from its checkpoint,
+// else an empty one that reads every message. A checkpoint resumes only while the database is the same file and
+// still holds exactly the messages the log read up to its cursor; otherwise the log is read again from the start.
+func (src *Source) logOf(ctx context.Context, key, id string) (*dbLog, error) {
+	if l := src.logs[key]; l != nil {
+		return l, nil
 	}
-	return l
+	l := &dbLog{}
+	src.logs[key] = l
+	if src.saved == nil {
+		return l, nil
+	}
+	cp, err := src.saved.Checkpoint(ctx, src.Tool(), key)
+	if err != nil || cp == nil {
+		return l, wrapCheckpoint(key, err)
+	}
+	var st logState
+	if err := json.Unmarshal(cp.State, &st); err != nil {
+		return l, wrapCheckpoint(key, err)
+	}
+	if dev, ino := fileid.OfPath(src.path()); dev != st.Dev || ino != st.Ino {
+		return l, nil
+	}
+	var n int
+	if err := src.db.QueryRowContext(ctx, `select count(*) from messages where session_id = ? and id <= ?
+		and role in ('user', 'assistant', 'tool')`, id, st.Cursor).Scan(&n); err != nil {
+		return l, wrapCheckpoint(key, err)
+	}
+	if n != st.Read {
+		return l, nil
+	}
+	l.cursor, l.read = st.Cursor, st.Read
+	if cp.Log != nil {
+		l.log = *cp.Log
+	}
+	return l, nil
+}
+
+func wrapCheckpoint(key string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("checkpoint of %s: %w", key, err)
 }
 
 // facts reads the latest messages; it reports whether a turn is open.
@@ -259,6 +332,7 @@ func (src *Source) readPage(ctx context.Context, id string, l *dbLog) (int, erro
 			l.log.Add(sessions.Entry{Role: sessions.RoleOut, Text: text.OneLine(content, 160)})
 		}
 		l.cursor = mid
+		l.read++
 	}
 	return n, rows.Err()
 }

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -44,48 +45,73 @@ const (
 
 type task struct {
 	sessions.Task
-	until  time.Time // a monitor's expiry
-	output string    // a background command's output file
+	Until  time.Time `json:"until,omitzero"`   // a monitor's expiry
+	Output string    `json:"output,omitempty"` // a background command's output file
 }
 
 type cron struct {
-	label   string
-	at      time.Time
-	oneShot bool
+	Label   string    `json:"label"`
+	At      time.Time `json:"at"`
+	OneShot bool      `json:"one_shot,omitempty"`
 }
 
 type call struct {
-	name  string
-	desc  string
-	input map[string]any
-	at    time.Time
+	Name  string    `json:"name"`
+	Desc  string    `json:"desc"`
+	Label string    `json:"label,omitempty"` // an Agent call's description
+	Type  string    `json:"type,omitempty"`  // an Agent call's subagent type
+	At    time.Time `json:"at"`
 }
 
-// Tracker follows one transcript. It reads the file once from the start and then only what was appended.
+// Tracker follows one transcript. It reads the file once from the start and then only what was appended, or
+// resumes from a checkpoint and reads only what came after it.
 type Tracker struct {
 	rd jsonl.Reader
 	st track
+
+	// The subagents' meta files map a foreground Agent call to its subagent. They are other files, so they are
+	// read when a scan needs them and never saved.
+	metaSeen time.Time
+	byUse    map[string]string
 }
 
-// track is what the tracker knows; a rewritten transcript resets it.
+// track is what the transcript's lines decided, and nothing else: no scan's clock and no other file, so a
+// checkpoint of it fed the rest of the transcript ends where a full re-read ends. A rewritten transcript resets
+// it. A checkpoint saves every exported field; the log is saved apart, entry by entry.
 type track struct {
-	tasks    map[string]*task
-	closed   map[string]*task // finished subagents a SendMessage can wake again
-	calls    map[string]*call // tool_use id -> call, until its result arrives
-	group    []string         // tool_use ids of the latest assistant message
-	lastMain string           // "user", "assistant" or "ended"
-	lastText string
-	errText  string
-	wakeAt   time.Time
-	crons    map[string]cron
+	Tasks    map[string]*task `json:"tasks"`
+	Closed   map[string]*task `json:"closed"` // finished subagents a SendMessage can wake again
+	Calls    map[string]*call `json:"calls"`  // tool_use id -> call, until its result arrives
+	Group    []string         `json:"group"`  // tool_use ids of the latest assistant message
+	LastMain string           `json:"last_main"`
+	LastText string           `json:"last_text"`
+	ErrText  string           `json:"err_text"`
+	WakeAt   time.Time        `json:"wake_at"`
+	Crons    map[string]cron  `json:"crons"`
+	Model    string           `json:"model"`
 	log      sessions.Log
-	metaSeen time.Time
-	byUse    map[string]string // subagent tool_use id -> agent id, from the subagents' meta files
-	model    string
 }
 
 func newTrack() track {
-	return track{tasks: map[string]*task{}, closed: map[string]*task{}, calls: map[string]*call{}, crons: map[string]cron{}, byUse: map[string]string{}}
+	var st track
+	st.fill()
+	return st
+}
+
+// fill makes the maps a decoded checkpoint left out.
+func (st *track) fill() {
+	if st.Tasks == nil {
+		st.Tasks = map[string]*task{}
+	}
+	if st.Closed == nil {
+		st.Closed = map[string]*task{}
+	}
+	if st.Calls == nil {
+		st.Calls = map[string]*call{}
+	}
+	if st.Crons == nil {
+		st.Crons = map[string]cron{}
+	}
 }
 
 // NewTracker follows the transcript at path.
@@ -98,6 +124,33 @@ func (t *Tracker) Path() string { return t.rd.Path }
 
 // Log is the session's activity log.
 func (t *Tracker) Log() *sessions.Log { return &t.st.log }
+
+// checkpointState is a Tracker's checkpoint: where it stands in the transcript and what the lines so far decided.
+type checkpointState struct {
+	Pos   jsonl.Position `json:"pos"`
+	Track track          `json:"track"`
+}
+
+// State encodes where the tracker stands and what it derived, without its log, for a Checkpoint.
+func (t *Tracker) State() ([]byte, error) {
+	return json.Marshal(checkpointState{Pos: t.rd.Position(), Track: t.st})
+}
+
+// Resume continues from a checkpoint of this transcript. The next Update reads what came after it, or starts
+// over when the transcript is no longer the one the checkpoint read.
+func (t *Tracker) Resume(cp *sessions.Checkpoint) error {
+	var s checkpointState
+	if err := json.Unmarshal(cp.State, &s); err != nil {
+		return err
+	}
+	s.Track.fill()
+	if cp.Log != nil {
+		s.Track.log = *cp.Log
+	}
+	t.rd.Resume(s.Pos)
+	t.st = s.Track
+	return nil
+}
 
 type block struct {
 	Type      string          `json:"type"`
@@ -177,13 +230,13 @@ func (t *Tracker) assistant(e line, at time.Time) {
 		return
 	}
 	st := &t.st
-	if st.lastMain != "assistant" {
-		st.group = st.group[:0]
+	if st.LastMain != "assistant" {
+		st.Group = st.Group[:0]
 	}
-	st.lastMain = "assistant"
-	st.errText = ""
+	st.LastMain = "assistant"
+	st.ErrText = ""
 	if m := e.Message.Model; m != "" && !strings.HasPrefix(m, "<") {
-		st.model = m
+		st.Model = m
 	}
 	for _, b := range bs {
 		switch b.Type {
@@ -191,28 +244,31 @@ func (t *Tracker) assistant(e line, at time.Time) {
 			if strings.TrimSpace(b.Text) == "" {
 				continue
 			}
-			st.lastText = b.Text
+			st.LastText = b.Text
 			if e.APIError {
-				st.errText = text.OneLine(b.Text, 200)
+				st.ErrText = text.OneLine(b.Text, 200)
 			}
 			st.log.Add(sessions.Entry{Role: sessions.RoleAssistant, Text: text.OneLine(b.Text, 900)})
 		case "tool_use":
 			in := map[string]any{}
 			json.Unmarshal(b.Input, &in)
-			c := &call{name: b.Name, input: in, at: at, desc: text.Describe(b.Name, in)}
-			st.calls[b.ID] = c
-			st.group = append(st.group, b.ID)
-			st.log.Add(sessions.Entry{Role: sessions.RoleTool, Name: b.Name, Text: text.OneLine(c.desc, 200)})
+			c := &call{Name: b.Name, At: at, Desc: text.Describe(b.Name, in)}
+			if b.Name == "Agent" || b.Name == "Task" {
+				c.Label, c.Type = text.Str(in["description"]), text.Str(in["subagent_type"])
+			}
+			st.Calls[b.ID] = c
+			st.Group = append(st.Group, b.ID)
+			st.log.Add(sessions.Entry{Role: sessions.RoleTool, Name: b.Name, Text: text.OneLine(c.Desc, 200)})
 			switch b.Name {
 			case "CronDelete":
-				delete(st.crons, text.Str(in["id"]))
+				delete(st.Crons, text.Str(in["id"]))
 			case "TaskStop":
 				t.close(text.Str(in["task_id"]))
 			case "SendMessage": // a message to a finished subagent wakes it again
-				if k, ok := st.closed[text.Str(in["to"])]; ok {
+				if k, ok := st.Closed[text.Str(in["to"])]; ok {
 					k.LastActive = at
-					st.tasks[k.ID] = k
-					delete(st.closed, k.ID)
+					st.Tasks[k.ID] = k
+					delete(st.Closed, k.ID)
 				}
 			}
 		}
@@ -261,7 +317,7 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 	st := &t.st
 	if strings.Contains(s, "<task-notification>") {
 		t.notified(s, at)
-		st.lastMain = "user"
+		st.LastMain = "user"
 		return
 	}
 	// Another session's message is logged as such, never as user text. Claude Code marks it meta, which does not
@@ -269,7 +325,7 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 	if kind == "peer" || strings.HasPrefix(s, "Another Claude session sent a message") {
 		st.log.Add(sessions.Entry{Role: sessions.RolePeer, Text: text.OneLine(reSystemTag.ReplaceAllString(s, ""), 400)})
 		if !meta {
-			st.lastMain = "user"
+			st.LastMain = "user"
 		}
 		return
 	}
@@ -278,15 +334,15 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 	}
 	clean := strings.TrimSpace(reSystemTag.ReplaceAllString(s, ""))
 	if strings.HasPrefix(clean, "[Request interrupted") {
-		st.lastMain = "ended"
-		st.group = st.group[:0]
+		st.LastMain = "ended"
+		st.Group = st.Group[:0]
 		return
 	}
 	if clean == "" {
 		return
 	}
-	st.lastMain = "user"
-	st.wakeAt = time.Time{} // a new prompt: any planned wakeup belongs to its turn now
+	st.LastMain = "user"
+	st.WakeAt = time.Time{} // a new prompt: any planned wakeup belongs to its turn now
 	st.log.Add(sessions.Entry{Role: sessions.RoleUser, Origin: origin, Text: text.OneLine(clean, 1200)})
 }
 
@@ -296,7 +352,7 @@ func (t *Tracker) notified(s string, at time.Time) {
 		status = m[1]
 	}
 	for _, m := range reTaskID.FindAllStringSubmatch(s, -1) {
-		if k, ok := t.st.tasks[m[1]]; ok {
+		if k, ok := t.st.Tasks[m[1]]; ok {
 			k.LastActive = at
 			if terminal[status] {
 				t.close(m[1])
@@ -307,68 +363,68 @@ func (t *Tracker) notified(s string, at time.Time) {
 
 func (t *Tracker) result(b block, at time.Time) {
 	st := &t.st
-	st.lastMain = "user"
-	c := st.calls[b.ToolUseID]
-	delete(st.calls, b.ToolUseID)
+	st.LastMain = "user"
+	c := st.Calls[b.ToolUseID]
+	delete(st.Calls, b.ToolUseID)
 	out := text.BlocksText(b.Content)
 	if c == nil {
 		return
 	}
 	add := func(id, kind string) *task {
-		k := &task{Task: sessions.Task{ID: id, Kind: kind, Label: c.desc, Started: at, LastActive: at}}
+		k := &task{Task: sessions.Task{ID: id, Kind: kind, Label: c.Desc, Started: at, LastActive: at}}
 		if kind == "agent" {
-			k.Label, k.Type = text.Str(c.input["description"]), text.Str(c.input["subagent_type"])
+			k.Label, k.Type = c.Label, c.Type
 		}
-		st.tasks[id] = k
+		st.Tasks[id] = k
 		return k
 	}
 	switch {
 	case b.IsError:
-	case c.name == "Bash" && strings.HasPrefix(out, "Command running in background") && reBgBash.MatchString(out):
+	case c.Name == "Bash" && strings.HasPrefix(out, "Command running in background") && reBgBash.MatchString(out):
 		k := add(reBgBash.FindStringSubmatch(out)[1], "bash")
 		if m := reOutFile.FindStringSubmatch(out); m != nil {
-			k.output = m[1] + ".output"
+			k.Output = m[1] + ".output"
 		}
-	case c.name == "Agent" || c.name == "Task":
+	case c.Name == "Agent" || c.Name == "Task":
 		if m := reAgentID.FindStringSubmatch(out); m != nil && strings.HasPrefix(out, "Async agent launched") {
 			add(m[1], "agent")
 		}
-	case c.name == "Workflow" && reWorkflow.MatchString(out):
+	case c.Name == "Workflow" && reWorkflow.MatchString(out):
 		k := add(reWorkflow.FindStringSubmatch(out)[1], "workflow")
 		if i := strings.Index(out, "Summary: "); i >= 0 {
 			k.Label = text.OneLine(strings.SplitN(out[i+9:], "\n", 2)[0], 120)
 		}
-	case c.name == "Monitor" && reMonitor.MatchString(out):
+	case c.Name == "Monitor" && reMonitor.MatchString(out):
 		m := reMonitor.FindStringSubmatch(out)
 		k := add(m[1], "monitor")
 		n, _ := strconv.Atoi(m[2])
 		unit := map[string]time.Duration{"s": time.Second, "m": time.Minute, "h": time.Hour}[m[3]]
-		k.until = at.Add(time.Duration(n) * unit)
-	case c.name == "ScheduleWakeup" && reWake.MatchString(out):
+		k.Until = at.Add(time.Duration(n) * unit)
+	case c.Name == "ScheduleWakeup" && reWake.MatchString(out):
 		n, _ := strconv.Atoi(reWake.FindStringSubmatch(out)[1])
-		st.wakeAt = at.Add(time.Duration(n) * time.Second)
-	case c.name == "CronCreate" && reCron.MatchString(out):
+		st.WakeAt = at.Add(time.Duration(n) * time.Second)
+	case c.Name == "CronCreate" && reCron.MatchString(out):
 		m := reCron.FindStringSubmatch(out)
-		st.crons[m[1]] = cron{label: m[2], at: at, oneShot: strings.Contains(out, "one-shot")}
+		st.Crons[m[1]] = cron{Label: m[2], At: at, OneShot: strings.Contains(out, "one-shot")}
 	}
 	st.log.Add(sessions.Entry{Role: sessions.RoleOut, Text: text.OneLine(out, 160)})
 }
 
 func (t *Tracker) close(id string) {
-	if k, ok := t.st.tasks[id]; ok && k.Kind == "agent" {
-		t.st.closed[id] = k
+	if k, ok := t.st.Tasks[id]; ok && k.Kind == "agent" {
+		t.st.Closed[id] = k
 	}
-	delete(t.st.tasks, id)
+	delete(t.st.Tasks, id)
 }
 
 // TurnOpen reports whether the model owes a response, or a tool it called has not returned.
 func (t *Tracker) TurnOpen() bool {
-	switch t.st.lastMain {
+	switch t.st.LastMain {
 	case "user":
 		return true
 	case "assistant":
-		for _, id := range t.st.group {
-			if _, ok := t.st.calls[id]; ok {
+		for _, id := range t.st.Group {
+			if _, ok := t.st.Calls[id]; ok {
 				return true
 			}
 		}
@@ -378,50 +434,56 @@ func (t *Tracker) TurnOpen() bool {
 
 // pending returns the unresolved tool call of the current turn, if any.
 func (t *Tracker) pending() (string, *call) {
-	if t.st.lastMain != "assistant" {
+	if t.st.LastMain != "assistant" {
 		return "", nil
 	}
-	for i := len(t.st.group) - 1; i >= 0; i-- {
-		if c, ok := t.st.calls[t.st.group[i]]; ok {
-			return t.st.group[i], c
+	for i := len(t.st.Group) - 1; i >= 0; i-- {
+		if c, ok := t.st.Calls[t.st.Group[i]]; ok {
+			return t.st.Group[i], c
 		}
 	}
 	return "", nil
 }
 
-// live returns the tasks still running, refreshing subagent activity from their own transcripts. Tasks from a
-// process older than started died with it; a zero started keeps them (background jobs restart their process).
+// live returns the tasks still running, oldest first, with subagent activity from their own transcripts. Tasks
+// from a process older than started died with it; a zero started keeps them (background jobs restart their
+// process). It changes nothing the transcript decided: what the clock and the other files say is read again
+// each time.
 func (t *Tracker) live(started, now time.Time) []sessions.Task {
 	dir := strings.TrimSuffix(t.rd.Path, ".jsonl")
-	t.loadMeta(dir)
 	out := []sessions.Task{}
-	for id, k := range t.st.tasks {
+	for _, k := range t.st.Tasks {
 		if !started.IsZero() && k.Started.Before(started.Add(-2*time.Second)) {
-			delete(t.st.tasks, id)
 			continue
 		}
-		if k.Kind == "monitor" && !k.until.IsZero() && now.After(k.until) {
-			delete(t.st.tasks, id)
+		if k.Kind == "monitor" && !k.Until.IsZero() && now.After(k.Until) {
 			continue
 		}
+		v := k.Task
 		switch k.Kind {
 		case "bash":
-			if fi, err := os.Stat(k.output); err == nil && fi.ModTime().After(k.LastActive) {
-				k.LastActive = fi.ModTime()
+			if fi, err := os.Stat(k.Output); err == nil && fi.ModTime().After(v.LastActive) {
+				v.LastActive = fi.ModTime()
 			}
 		case "agent":
-			subagentActivity(filepath.Join(dir, "subagents", "agent-"+id+".jsonl"), &k.Task)
+			subagentActivity(filepath.Join(dir, "subagents", "agent-"+k.ID+".jsonl"), &v)
 		case "workflow":
-			if fi, err := os.Stat(filepath.Join(dir, "subagents", "workflow")); err == nil && fi.ModTime().After(k.LastActive) {
-				k.LastActive = fi.ModTime()
+			if fi, err := os.Stat(filepath.Join(dir, "subagents", "workflow")); err == nil && fi.ModTime().After(v.LastActive) {
+				v.LastActive = fi.ModTime()
 			}
 		}
-		out = append(out, k.Task)
+		out = append(out, v)
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].Started.Equal(out[j].Started) {
+			return out[i].Started.Before(out[j].Started)
+		}
+		return out[i].ID < out[j].ID
+	})
 	// A foreground Agent call is a subagent too, running inside the turn.
-	if id, c := t.pending(); c != nil && (c.name == "Agent" || c.name == "Task") {
-		k := sessions.Task{ID: id, Kind: "agent", Label: text.Str(c.input["description"]), Type: text.Str(c.input["subagent_type"]), Started: c.at, Sync: true}
-		if aid := t.st.byUse[id]; aid != "" {
+	if id, c := t.pending(); c != nil && (c.Name == "Agent" || c.Name == "Task") {
+		k := sessions.Task{ID: id, Kind: "agent", Label: c.Label, Type: c.Type, Started: c.At, Sync: true}
+		if aid := t.agentOf(dir, id); aid != "" {
 			subagentActivity(filepath.Join(dir, "subagents", "agent-"+aid+".jsonl"), &k)
 		}
 		out = append(out, k)
@@ -429,22 +491,26 @@ func (t *Tracker) live(started, now time.Time) []sessions.Task {
 	return out
 }
 
-func (t *Tracker) loadMeta(dir string) {
+// agentOf returns the subagent Claude Code started for a foreground Agent call, from the subagents' meta files.
+// They are read again only when their directory changed.
+func (t *Tracker) agentOf(dir, useID string) string {
 	sub := filepath.Join(dir, "subagents")
-	fi, err := os.Stat(sub)
-	if err != nil || !fi.ModTime().After(t.st.metaSeen) {
-		return
-	}
-	t.st.metaSeen = fi.ModTime()
-	metas, _ := filepath.Glob(filepath.Join(sub, "agent-*.meta.json"))
-	for _, m := range metas {
-		var meta struct {
-			ToolUseID string `json:"toolUseId"`
+	if fi, err := os.Stat(sub); err == nil && fi.ModTime().After(t.metaSeen) {
+		t.metaSeen = fi.ModTime()
+		if t.byUse == nil {
+			t.byUse = map[string]string{}
 		}
-		if raw, err := os.ReadFile(m); err == nil && json.Unmarshal(raw, &meta) == nil && meta.ToolUseID != "" {
-			t.st.byUse[meta.ToolUseID] = strings.TrimSuffix(strings.TrimPrefix(filepath.Base(m), "agent-"), ".meta.json")
+		metas, _ := filepath.Glob(filepath.Join(sub, "agent-*.meta.json"))
+		for _, m := range metas {
+			var meta struct {
+				ToolUseID string `json:"toolUseId"`
+			}
+			if raw, err := os.ReadFile(m); err == nil && json.Unmarshal(raw, &meta) == nil && meta.ToolUseID != "" {
+				t.byUse[meta.ToolUseID] = strings.TrimSuffix(strings.TrimPrefix(filepath.Base(m), "agent-"), ".meta.json")
+			}
 		}
 	}
+	return t.byUse[useID]
 }
 
 // subagentActivity sets a subagent's last activity and latest action from the tail of its transcript.
@@ -481,33 +547,33 @@ func (t *Tracker) Facts(s *sessions.Session, now time.Time) {
 	s.Size = t.Update()
 	s.Log = &t.st.log
 	s.Tasks = t.live(s.Started, now)
-	s.LastText = strings.TrimSpace(t.st.lastText)
+	s.LastText = strings.TrimSpace(t.st.LastText)
 	if s.Model == "" {
-		s.Model = t.st.model
+		s.Model = t.st.Model
 	}
-	if !t.st.wakeAt.IsZero() && t.st.wakeAt.After(now.Add(-sessions.WakeGrace)) {
-		s.WakeAt = t.st.wakeAt
+	if !t.st.WakeAt.IsZero() && t.st.WakeAt.After(now.Add(-sessions.WakeGrace)) {
+		s.WakeAt = t.st.WakeAt
 	}
 	var newest time.Time
-	for id, c := range t.st.crons {
-		if (!s.Started.IsZero() && c.at.Before(s.Started)) || now.Sub(c.at) > cronExpiry || (c.oneShot && now.Sub(c.at) > oneShotExpiry) {
-			delete(t.st.crons, id)
-			continue
+	newestID := ""
+	for id, c := range t.st.Crons {
+		if (!s.Started.IsZero() && c.At.Before(s.Started)) || now.Sub(c.At) > cronExpiry || (c.OneShot && now.Sub(c.At) > oneShotExpiry) {
+			continue // a session-only job of an earlier process, or one that expired
 		}
-		if c.at.After(newest) {
-			newest, s.Loop = c.at, c.label
+		if c.At.After(newest) || c.At.Equal(newest) && id > newestID {
+			newest, newestID, s.Loop = c.At, id, c.Label
 		}
 	}
 	if _, c := t.pending(); c != nil {
-		s.Now, s.NowSince = text.OneLine(c.name+": "+c.desc, 140), c.at
-		switch c.name {
+		s.Now, s.NowSince = text.OneLine(c.Name+": "+c.Desc, 140), c.At
+		switch c.Name {
 		case "AskUserQuestion":
-			s.Ask, s.AskKind = text.OneLine(c.desc, 300), sessions.AskQuestion
+			s.Ask, s.AskKind = text.OneLine(c.Desc, 300), sessions.AskQuestion
 		case "ExitPlanMode":
-			s.Ask, s.AskKind = text.OneLine(c.desc, 300), sessions.AskPlan
+			s.Ask, s.AskKind = text.OneLine(c.Desc, 300), sessions.AskPlan
 		}
 	}
-	if t.st.errText != "" && !t.TurnOpen() {
-		s.Ask, s.AskKind = "stopped on an error: "+t.st.errText, sessions.AskError
+	if t.st.ErrText != "" && !t.TurnOpen() {
+		s.Ask, s.AskKind = "stopped on an error: "+t.st.ErrText, sessions.AskError
 	}
 }

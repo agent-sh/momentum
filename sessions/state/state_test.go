@@ -92,3 +92,49 @@ func TestDismissalsHoldUntilTheSessionMoves(t *testing.T) {
 		t.Fatal("covers")
 	}
 }
+
+func TestApplyReportsEveryChangeOfStretch(t *testing.T) {
+	st := Stamps{}
+	asks := &sessions.Session{Key: "b", Tool: "claude", Name: "cleanup", Phase: sessions.NeedsYou, Seq: 4, LastActive: t0.Add(-5 * time.Minute),
+		Ask: "permission prompt: Bash: rm -rf build", AskKind: sessions.AskPermission}
+	got := st.Apply([]*sessions.Session{sess("a", sessions.Idle, 3, t0.Add(-time.Hour)), asks}, t0)
+	if len(got) != 2 || got[0].Key != "a" || got[0].From != "" || got[0].To != sessions.Idle || !got[0].At.Equal(t0.Add(-time.Hour)) ||
+		got[1].To != sessions.NeedsYou || got[1].ToAskKind != sessions.AskPermission || got[1].ToAsk != asks.Ask || got[1].Tool != "claude" {
+		t.Fatalf("first sightings: %+v", got)
+	}
+	// both start working; the wait on the permission prompt lasted from its start until now
+	got = st.Apply([]*sessions.Session{sess("a", sessions.Working, 5, t0), sess("b", sessions.Working, 6, t0)}, t0.Add(3*time.Minute))
+	if len(got) != 2 || got[0].From != sessions.Idle || got[0].For != time.Hour+3*time.Minute ||
+		got[1].From != sessions.NeedsYou || got[1].To != sessions.Working || got[1].For != 8*time.Minute ||
+		got[1].FromAskKind != sessions.AskPermission || got[1].FromAsk != asks.Ask || got[1].Name != "cleanup" || !got[1].Seen.Equal(t0) {
+		t.Fatalf("into working: %+v", got)
+	}
+	// a's turn ended at +5m; b keeps working, which is no change
+	got = st.Apply([]*sessions.Session{sess("a", sessions.Idle, 9, t0.Add(5*time.Minute)), sess("b", sessions.Working, 8, t0)}, t0.Add(6*time.Minute))
+	if len(got) != 1 || got[0].Key != "a" || got[0].From != sessions.Working || got[0].To != sessions.Idle || got[0].For != 2*time.Minute {
+		t.Fatalf("a turn ends: %+v", got)
+	}
+	// a ran a whole turn between two runs: a new idle stretch
+	got = st.Apply([]*sessions.Session{sess("a", sessions.Idle, 12, t0.Add(8*time.Minute))}, t0.Add(9*time.Minute))
+	if len(got) != 1 || got[0].From != sessions.Idle || got[0].To != sessions.Idle || got[0].For != 3*time.Minute {
+		t.Fatalf("idle again: %+v", got)
+	}
+	// b is gone for longer than Keep: it left working, last seen at +6m
+	got = st.Apply([]*sessions.Session{sess("a", sessions.Idle, 12, t0.Add(8*time.Minute))}, t0.Add(9*time.Minute+Keep+time.Minute))
+	if len(got) != 1 || got[0].Key != "b" || got[0].From != sessions.Working || got[0].To != "" || !got[0].At.Equal(t0.Add(6*time.Minute)) ||
+		got[0].For != 3*time.Minute {
+		t.Fatalf("gone: %+v", got)
+	}
+}
+
+func TestAnOlderObservationChangesNothing(t *testing.T) {
+	st := Stamps{}
+	st.Apply([]*sessions.Session{sess("a", sessions.Working, 3, t0)}, t0.Add(5*time.Minute))
+	late := sess("a", sessions.Idle, 2, t0) // a run that scanned at +4m and saves after the one at +5m
+	if got := st.Apply([]*sessions.Session{late}, t0.Add(4*time.Minute)); len(got) != 0 {
+		t.Fatalf("changes %+v", got)
+	}
+	if r := st["a"]; r.Phase != sessions.Working || !r.Seen.Equal(t0.Add(5*time.Minute)) || !late.Since.Equal(t0.Add(5*time.Minute)) {
+		t.Fatalf("stamp %+v, since %v", r, late.Since)
+	}
+}

@@ -30,7 +30,7 @@ func TestTrackerFollowsRolesAndStopReasons(t *testing.T) {
 	)
 	tr := NewTracker(path)
 	tr.Update()
-	if !tr.st.open || tr.st.model != "local-model" || tr.st.calls["c1"] == nil {
+	if !tr.st.Open || tr.st.Model != "local-model" || tr.st.Calls["c1"] == nil {
 		t.Fatalf("mid-turn: %+v", tr.st)
 	}
 	fake.Append(t, path,
@@ -38,13 +38,13 @@ func TestTrackerFollowsRolesAndStopReasons(t *testing.T) {
 		msg(at.Add(2*time.Second), "assistant", "stop", txt("Two files.")),
 	)
 	tr.Update()
-	if tr.st.open || tr.st.lastText != "Two files." || len(tr.st.calls) != 0 {
+	if tr.st.Open || tr.st.LastText != "Two files." || len(tr.st.Calls) != 0 {
 		t.Fatalf("after the turn: %+v", tr.st)
 	}
 	fake.Append(t, path, msg(at.Add(3*time.Second), "user", "", txt("again")),
 		map[string]any{"type": "message", "message": map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "rate limited"}})
 	tr.Update()
-	if tr.st.open || tr.st.errText != "rate limited" {
+	if tr.st.Open || tr.st.ErrText != "rate limited" {
 		t.Fatalf("error: %+v", tr.st)
 	}
 }
@@ -60,7 +60,7 @@ func TestTrackerStartsOverWhenTheFileShrinks(t *testing.T) {
 	}
 	fake.Append(t, path, msg(at, "user", "", txt("two")))
 	tr.Update()
-	if !tr.st.open || tr.st.lastText != "" || tr.Log().Seq() != 1 {
+	if !tr.st.Open || tr.st.LastText != "" || tr.Log().Seq() != 1 {
 		t.Fatalf("the shrunk file is read again from its start: %+v seq %d", tr.st, tr.Log().Seq())
 	}
 }

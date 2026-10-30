@@ -5,9 +5,12 @@
 // A Source per harness turns what it finds into Sessions; Scan runs every source over one snapshot of the
 // machine (a World) and applies the phase rule. Sources keep incremental trackers, so a caller that scans
 // repeatedly (a board refreshing every few seconds) reads only what each transcript gained since the last scan.
+// A caller that runs once and exits keeps them as checkpoints (Resumable): the next run resumes each tracker and
+// reads only what was appended.
 //
-// What persists between runs (when each session entered its phase, dismissed asks) is in package state; the
-// caller stores it. Judging a finished turn with a model is in package verdict; the caller makes the call.
+// What else persists between runs (when each session entered its phase, what changed, dismissed asks) is in
+// package state; the caller stores it. Judging a finished turn with a model is in package verdict; the caller
+// makes the call.
 //
 // User-role text in a session's Log is what the harness recorded in the user role. Typed words, a queued or
 // pasted message, a program typing into the terminal and a scheduled prompt can all land there, so it is not

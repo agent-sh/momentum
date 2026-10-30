@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/agent-sh/momentum/sessions"
+	"github.com/agent-sh/momentum/sessions/internal/fileid"
 	"github.com/agent-sh/momentum/sessions/internal/text"
 	"github.com/agent-sh/momentum/sessions/proc"
 
@@ -28,10 +30,12 @@ const childWindow = 6 * time.Hour
 
 // Source finds opencode terminal processes and reads their sessions from the database.
 type Source struct {
-	Env  sessions.Env
-	db   *sql.DB
-	logs map[string]*dbLog
-	seen map[string]time.Time
+	Env   sessions.Env
+	db    *sql.DB
+	saved sessions.Saved
+	logs  map[string]*dbLog
+	seen  map[string]time.Time
+	now   time.Time // the last scan's
 }
 
 // dbLog is a session's activity log and how far into its messages it has read.
@@ -39,6 +43,16 @@ type dbLog struct {
 	log    sessions.Log
 	cursor int64
 	atCur  map[string]bool // messages read whose time equals cursor: times are milliseconds and can tie
+	read   int             // messages read into the log
+}
+
+// logState is a log's checkpoint: how far into the session's messages it read, in which database file.
+type logState struct {
+	Cursor int64    `json:"cursor"`
+	AtCur  []string `json:"at_cursor,omitempty"`
+	Read   int      `json:"read"`
+	Dev    uint64   `json:"dev,omitempty"`
+	Ino    uint64   `json:"ino,omitempty"`
 }
 
 // New reads opencode sessions from $XDG_DATA_HOME/opencode/opencode.db.
@@ -53,10 +67,37 @@ func (src *Source) Close() error {
 	return nil
 }
 
+// Resume makes later scans start a session's log from its checkpoint in saved the first time they read it.
+func (src *Source) Resume(saved sessions.Saved) { src.saved = saved }
+
+// Checkpoints returns the checkpoint of every session log the last Scan read.
+func (src *Source) Checkpoints() []sessions.Checkpoint {
+	dev, ino := fileid.OfPath(src.path())
+	var out []sessions.Checkpoint
+	for key, at := range src.seen {
+		if !at.Equal(src.now) {
+			continue
+		}
+		l := src.logs[key]
+		st := logState{Cursor: l.cursor, Read: l.read, Dev: dev, Ino: ino}
+		for id := range l.atCur {
+			st.AtCur = append(st.AtCur, id)
+		}
+		sort.Strings(st.AtCur)
+		if state, err := json.Marshal(st); err == nil {
+			out = append(out, sessions.Checkpoint{Tool: src.Tool(), Key: key, State: state, Log: &l.log})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
+func (src *Source) path() string { return filepath.Join(src.Env.DataHome, "opencode", "opencode.db") }
+
 // open opens the database read-only once it exists; nil while opencode is not installed here.
 func (src *Source) open() *sql.DB {
 	if src.db == nil {
-		path := filepath.Join(src.Env.DataHome, "opencode", "opencode.db")
+		path := src.path()
 		if _, err := os.Stat(path); err == nil {
 			src.db, _ = sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(500)")
 		}
@@ -99,6 +140,7 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 	if src.logs == nil {
 		src.logs, src.seen = map[string]*dbLog{}, map[string]time.Time{}
 	}
+	src.now = w.Now
 	var ps []*proc.Proc
 	for _, p := range w.Procs.ByPID {
 		if p.Has("-p", "--print") || !p.Is("opencode") || p.Has("serve", "run", "mcp", "--port") {
@@ -173,8 +215,8 @@ func (src *Source) session(ctx context.Context, slot proc.Slot, used map[string]
 	open, err := src.facts(ctx, id, s)
 	s.TurnOpen = open
 	errs = append(errs, err)
-	l := src.logOf(s.Key)
-	errs = append(errs, src.readLog(ctx, id, l))
+	l, err := src.logOf(ctx, s.Key, id)
+	errs = append(errs, err, src.readLog(ctx, id, l))
 	s.Log = &l.log
 	s.Size = updated
 	// subagents are child sessions with a turn still open
@@ -208,13 +250,58 @@ func (src *Source) session(ctx context.Context, slot proc.Slot, used map[string]
 	return s, errors.Join(errs...)
 }
 
-func (src *Source) logOf(key string) *dbLog {
-	l := src.logs[key]
-	if l == nil {
-		l = &dbLog{}
-		src.logs[key] = l
+// logOf returns a session's log: the one kept from an earlier scan, else one resumed from its checkpoint, else an
+// empty one that reads every message. A checkpoint resumes only while the database is the same file and still
+// holds exactly the messages the log read up to its cursor; otherwise the log is read again from the start.
+func (src *Source) logOf(ctx context.Context, key, id string) (*dbLog, error) {
+	if l := src.logs[key]; l != nil {
+		return l, nil
 	}
-	return l
+	l := &dbLog{}
+	src.logs[key] = l
+	if src.saved == nil {
+		return l, nil
+	}
+	cp, err := src.saved.Checkpoint(ctx, src.Tool(), key)
+	if err != nil || cp == nil {
+		return l, wrapCheckpoint(key, err)
+	}
+	var st logState
+	if err := json.Unmarshal(cp.State, &st); err != nil {
+		return l, wrapCheckpoint(key, err)
+	}
+	if dev, ino := fileid.OfPath(src.path()); dev != st.Dev || ino != st.Ino {
+		return l, nil
+	}
+	q, args := `select count(*) from message where session_id = ? and time_created < ?`, []any{id, st.Cursor}
+	if len(st.AtCur) > 0 {
+		q = `select count(*) from message where session_id = ? and (time_created < ? or id in (?` + strings.Repeat(",?", len(st.AtCur)-1) + `))`
+		for _, m := range st.AtCur {
+			args = append(args, m)
+		}
+	}
+	var n int
+	if err := src.db.QueryRowContext(ctx, q, args...).Scan(&n); err != nil {
+		return l, wrapCheckpoint(key, err)
+	}
+	if n != st.Read {
+		return l, nil
+	}
+	l.cursor, l.read, l.atCur = st.Cursor, st.Read, map[string]bool{}
+	for _, m := range st.AtCur {
+		l.atCur[m] = true
+	}
+	if cp.Log != nil {
+		l.log = *cp.Log
+	}
+	return l, nil
+}
+
+func wrapCheckpoint(key string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("checkpoint of %s: %w", key, err)
 }
 
 // facts reads a session's last messages; it reports whether a turn is open. A session without messages has none.
@@ -334,6 +421,7 @@ func (src *Source) readPage(ctx context.Context, id string, l *dbLog) (n int, mo
 			l.cursor, l.atCur = x.at, map[string]bool{}
 		}
 		l.atCur[x.id] = true
+		l.read++
 		read++
 	}
 	return len(ms), read > 0, nil

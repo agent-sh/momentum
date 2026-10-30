@@ -1,6 +1,8 @@
 // Package store is momentum's local SQLite store: normalized events from every source, and the state that
-// makes ingestion incremental. The store is derived: any source can be dropped and read again (Rebuild).
-// Bulky material stays where it is; an event keeps a reference to it.
+// makes ingestion incremental. Most of it is derived: any source that reads a signal store can be dropped and
+// read again (Rebuild). The events of `momentum sessions` are observations instead (Sessions): nothing can read
+// them again, so they survive a schema change and Rebuild refuses them. Bulky material stays where it is; an
+// event keeps a reference to it.
 package store
 
 import (
@@ -59,6 +61,20 @@ func (e Event) ID() string {
 
 type Store struct{ db *sql.DB }
 
+// Sessions is the source of the events `momentum sessions` writes: each phase change of a live session, as the
+// runs saw it. They are observations, not read from a signal store.
+const Sessions = "sessions"
+
+// ErrObserved means a source's events are observations, which cannot be read again.
+var ErrObserved = errors.New("its events are observations, not read from a source, so they cannot be read again")
+
+// querier is what a statement runs on: the database, or one transaction.
+type querier interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 const schema = `
 CREATE TABLE IF NOT EXISTS events (
   id TEXT PRIMARY KEY, source TEXT NOT NULL, source_key TEXT NOT NULL, ts INTEGER NOT NULL,
@@ -73,6 +89,10 @@ CREATE TABLE IF NOT EXISTS seen_files (source TEXT NOT NULL, path TEXT NOT NULL,
   size INTEGER NOT NULL, PRIMARY KEY (source, path));
 CREATE TABLE IF NOT EXISTS skipped (source TEXT NOT NULL, ref TEXT NOT NULL, reason TEXT NOT NULL, at INTEGER NOT NULL,
   PRIMARY KEY (source, ref));
+CREATE TABLE IF NOT EXISTS trackers (tool TEXT NOT NULL, key TEXT NOT NULL, build TEXT NOT NULL, state BLOB NOT NULL,
+  log_base INTEGER NOT NULL, seen INTEGER NOT NULL, PRIMARY KEY (tool, key));
+CREATE TABLE IF NOT EXISTS tracker_log (tool TEXT NOT NULL, key TEXT NOT NULL, seq INTEGER NOT NULL, role TEXT NOT NULL,
+  name TEXT NOT NULL, origin TEXT NOT NULL, text TEXT NOT NULL, PRIMARY KEY (tool, key, seq)) WITHOUT ROWID;
 `
 
 // Open creates the store when missing. The store holds owner text, so the database is 0600 and its
@@ -108,19 +128,31 @@ func Open(path string) (*Store, error) {
 
 // stateSchema holds what cannot be derived from the sources: it is created when missing and never dropped,
 // so a change to one of these tables needs a real migration, not a version bump.
-//   - session_stamps: when each live session entered its phase (sessions/state), kept between runs.
+//   - session_stamps: when each live session entered its phase (sessions/state), kept between runs, with what a
+//     later run needs to report the session once it is gone.
 const stateSchema = `
 CREATE TABLE IF NOT EXISTS session_stamps (key TEXT PRIMARY KEY, phase TEXT NOT NULL, since INTEGER NOT NULL,
-  seq INTEGER NOT NULL, seen INTEGER NOT NULL);
+  seq INTEGER NOT NULL, seen INTEGER NOT NULL, tool TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '',
+  auto INTEGER NOT NULL DEFAULT 0, ask TEXT NOT NULL DEFAULT '', ask_kind TEXT NOT NULL DEFAULT '');
 `
 
-// schemaVersion is bumped on every change to the derived schema. Everything in it is derived from the
-// sources, so a store at another version drops those tables and the next ingest reads every source again.
-// The state tables (stateSchema) are not touched by that.
+// stampColumns are the columns session_stamps gained after it was first made. A store from before gets them,
+// and keeps its stamps.
+var stampColumns = [][2]string{{"tool", "TEXT NOT NULL DEFAULT ''"}, {"name", "TEXT NOT NULL DEFAULT ''"},
+	{"auto", "INTEGER NOT NULL DEFAULT 0"}, {"ask", "TEXT NOT NULL DEFAULT ''"}, {"ask_kind", "TEXT NOT NULL DEFAULT ''"}}
+
+// schemaVersion is bumped on every change to the derived schema (adding a table is not one: it is created when
+// missing). Everything in it is derived from the sources, so a store at another version drops those tables and
+// the next ingest reads every source again, and the next sessions run reads every transcript. Two things are not
+// touched by that: the state tables (stateSchema), and the observed events (Sessions), which move to the new
+// events table column by column (keepObserved).
 const schemaVersion = 2
 
 func migrate(db *sql.DB) error {
 	if _, err := db.Exec(stateSchema); err != nil {
+		return err
+	}
+	if err := addColumns(db, "session_stamps", stampColumns); err != nil {
 		return err
 	}
 	var v int
@@ -136,7 +168,16 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, t := range []string{"events", "cursors", "seen_files", "skipped"} {
+	var hadEvents int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'events'`).Scan(&hadEvents); err != nil {
+		return err
+	}
+	if hadEvents > 0 {
+		if _, err := tx.Exec(`CREATE TEMP TABLE observed AS SELECT * FROM events WHERE source = ?`, Sessions); err != nil {
+			return err
+		}
+	}
+	for _, t := range []string{"events", "cursors", "seen_files", "skipped", "trackers", "tracker_log"} {
 		if _, err := tx.Exec(`DROP TABLE IF EXISTS ` + t); err != nil {
 			return err
 		}
@@ -144,10 +185,102 @@ func migrate(db *sql.DB) error {
 	if _, err := tx.Exec(schema); err != nil {
 		return err
 	}
+	if hadEvents > 0 {
+		if err := keepObserved(tx); err != nil {
+			return fmt.Errorf("keeping the %s events: %w", Sessions, err)
+		}
+	}
 	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// keepObserved moves the observed events from the old events table (copied to temp.observed) into the new one,
+// column by column: a column the old table lacked gets its default, else an empty value as Put writes, and
+// ingested gets the time of the move.
+func keepObserved(tx *sql.Tx) error {
+	old, err := columns(tx, "temp", "observed")
+	if err != nil {
+		return err
+	}
+	cur, err := columns(tx, "main", "events")
+	if err != nil {
+		return err
+	}
+	var names, values []string
+	for _, c := range cur {
+		empty := "''"
+		if strings.Contains(strings.ToUpper(c.typ), "INT") {
+			empty = "0"
+		}
+		switch {
+		case old.has(c.name):
+			names, values = append(names, c.name), append(values, "COALESCE("+c.name+", "+empty+")")
+		case c.name == "ingested":
+			names, values = append(names, c.name), append(values, fmt.Sprint(time.Now().UnixMilli()))
+		case !c.defaulted:
+			names, values = append(names, c.name), append(values, empty)
+		}
+	}
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO events (` + strings.Join(names, ", ") + `) SELECT ` +
+		strings.Join(values, ", ") + ` FROM temp.observed`); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`DROP TABLE temp.observed`)
+	return err
+}
+
+type column struct {
+	name, typ string
+	defaulted bool
+}
+
+type columnList []column
+
+// columns lists a table's columns in order.
+func columns(q querier, schema, table string) (columnList, error) {
+	rows, err := q.QueryContext(context.Background(), `SELECT name, type, dflt_value FROM pragma_table_info(?, ?)`, table, schema)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out columnList
+	for rows.Next() {
+		var c column
+		var dflt sql.NullString
+		if err := rows.Scan(&c.name, &c.typ, &dflt); err != nil {
+			return nil, err
+		}
+		c.defaulted = dflt.Valid
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (cs columnList) has(name string) bool {
+	for _, c := range cs {
+		if c.name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// addColumns adds to a state table the columns it lacks.
+func addColumns(db *sql.DB, table string, want [][2]string) error {
+	have, err := columns(db, "main", table)
+	if err != nil {
+		return err
+	}
+	for _, c := range want {
+		if !have.has(c[0]) {
+			if _, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + c[0] + ` ` + c[1]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -163,6 +296,14 @@ func (s *Store) Put(ctx context.Context, evs []Event) (int, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
+	added, err := put(ctx, tx, evs)
+	if err != nil {
+		return 0, err
+	}
+	return added, tx.Commit()
+}
+
+func put(ctx context.Context, tx querier, evs []Event) (int, error) {
 	now := time.Now().UnixMilli()
 	added := 0
 	for _, e := range evs {
@@ -188,7 +329,7 @@ func (s *Store) Put(ctx context.Context, evs []Event) (int, error) {
 			added++
 		}
 	}
-	return added, tx.Commit()
+	return added, nil
 }
 
 // Cursor returns a source's saved position, "" when it has none.
@@ -240,8 +381,12 @@ func (s *Store) Skipped(ctx context.Context, source string) (int, error) {
 }
 
 // Rebuild drops everything a source contributed, so the next ingest reads it again from the start.
-// Sources share one state space by name prefix: "radar" also drops "radar-feedback".
+// Sources share one state space by name prefix: "radar" also drops "radar-feedback". The observed events
+// (Sessions) cannot be read again, so Rebuild refuses them with ErrObserved.
 func (s *Store) Rebuild(ctx context.Context, source string) error {
+	if source == Sessions {
+		return fmt.Errorf("%s: %w", source, ErrObserved)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
