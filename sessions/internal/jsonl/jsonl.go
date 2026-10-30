@@ -13,8 +13,7 @@ import (
 	"bytes"
 	"io"
 	"os"
-
-	"github.com/agent-sh/momentum/sessions/internal/fileid"
+	"syscall"
 )
 
 // fingerprint is how many leading bytes identify a file's content, and how many bytes before the position mark
@@ -68,7 +67,10 @@ func (r *Reader) Read(reset func(), line func([]byte)) int64 {
 	if err != nil {
 		return -1
 	}
-	dev, ino := fileid.Of(st)
+	var dev, ino uint64
+	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
+		dev, ino = uint64(sys.Dev), sys.Ino
+	}
 	restart := st.Size() < r.off || (r.ino != 0 && (dev != r.dev || ino != r.ino)) ||
 		!holds(f, 0, r.head) || !holds(f, r.off-int64(len(r.mark)), r.mark)
 	if restart {

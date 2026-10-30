@@ -52,6 +52,11 @@ func sessionsCmd(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		return err
 	}
 	defer st.Close()
+	unlock, err := st.LockSessions() // runs take turns: each observes after the previous one saved
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	now := time.Now()
 	w, snapErr := sessions.Snapshot(ctx, env, now)
 	if w == nil {
@@ -63,28 +68,38 @@ func sessionsCmd(ctx context.Context, args []string, stdout, stderr io.Writer) e
 			s.Close()
 		}
 	}()
-	ss, scanErr, err := board(ctx, w, st, buildID(), srcs)
+	ss, scanErr, err := board(ctx, w, snapErr, st, buildID(), srcs)
 	if err != nil {
 		return err
 	}
 	if err := printBoard(stdout, ss, now, *asJSON, *all); err != nil {
 		return err
 	}
-	return errors.Join(snapErr, scanErr)
+	return scanErr
 }
 
 // board scans every source over one snapshot, resuming each tracker from the checkpoint the last run of this
 // build saved, and stamps each session with when it entered its phase. It saves the run in one transaction: the
 // stamps, one event per change of stretch, and the checkpoints of the trackers it used; it drops checkpoints no
-// run used for state.Keep. scanErr names the sources that failed; the others still count. err is a store failure.
-func board(ctx context.Context, w *sessions.World, st *store.Store, build string, srcs []sessions.Source) (ss []*sessions.Session, scanErr, err error) {
+// run used for state.Keep. A source that failed, or every source when the snapshot is incomplete (snapErr), keeps
+// its stamps: its sessions are unknown on this run, not gone. scanErr names what failed; the rest still counts.
+// err is a store failure.
+func board(ctx context.Context, w *sessions.World, snapErr error, st *store.Store, build string, srcs []sessions.Source) (ss []*sessions.Session, scanErr, err error) {
 	trackers := st.Trackers(build)
+	errs := []error{snapErr}
+	var failed []string
 	for _, src := range srcs {
 		if r, ok := src.(sessions.Resumable); ok {
 			r.Resume(trackers)
 		}
+		found, err := sessions.Scan(ctx, w, src)
+		ss = append(ss, found...)
+		if err != nil || snapErr != nil {
+			failed = append(failed, src.Tool())
+		}
+		errs = append(errs, err)
 	}
-	ss, scanErr = sessions.Scan(ctx, w, srcs...)
+	scanErr = errors.Join(errs...)
 	var cps []sessions.Checkpoint
 	for _, src := range srcs {
 		if r, ok := src.(sessions.Resumable); ok {
@@ -96,7 +111,7 @@ func board(ctx context.Context, w *sessions.World, st *store.Store, build string
 		if err != nil {
 			return err
 		}
-		if _, err := r.Put(phaseEvents(stamps.Apply(ss, w.Now), ss, w.Now)); err != nil {
+		if _, err := r.Put(phaseEvents(stamps.Apply(ss, w.Now, failed...), ss, w.Now)); err != nil {
 			return err
 		}
 		if err := r.SaveStamps(stamps); err != nil {

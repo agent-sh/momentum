@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"syscall"
 	"time"
 
 	"github.com/agent-sh/momentum/sessions"
@@ -64,6 +66,21 @@ func saveStamps(ctx context.Context, q querier, st state.Stamps) error {
 	return nil
 }
 
+// LockSessions takes the lock that makes sessions runs on this store happen one after another: a run holds it
+// from before its scan until its transaction committed, so each run reads the stamps and checkpoints the
+// previous run saved, and observes the sessions after it. Another run waits for it. unlock releases it.
+func (s *Store) LockSessions() (unlock func(), err error) {
+	f, err := os.OpenFile(s.path+".sessions-lock", os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("sessions lock: %w", err)
+	}
+	return func() { f.Close() }, nil
+}
+
 // Run is one sessions run's write transaction: what it reads in it is what the previous run saved, and what it
 // saves lands at once or not at all.
 type Run struct {
@@ -117,40 +134,50 @@ func (s *Store) Trackers(build string) *Trackers {
 	return &Trackers{s: s, build: build, held: map[string][]byte{}}
 }
 
-// Checkpoint returns the checkpoint a run of this build saved for a tracker, or nil.
+// Checkpoint returns the checkpoint a run of this build saved for a tracker, or nil. The state and its log come
+// from one statement, so from one snapshot: a run saving meanwhile cannot pair this state with its newer log. The
+// statement returns the state once, ahead of the log, and every entry the snapshot holds: a save drops the entries
+// below the base in the transaction that moves it.
 func (t *Trackers) Checkpoint(ctx context.Context, tool, key string) (*sessions.Checkpoint, error) {
-	var build string
-	var st []byte
-	var base int
-	err := t.s.db.QueryRowContext(ctx, `SELECT build, state, log_base FROM trackers WHERE tool = ? AND key = ?`, tool, key).Scan(&build, &st, &base)
-	if errors.Is(err, sql.ErrNoRows) || err == nil && build != t.build {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	rows, err := t.s.db.QueryContext(ctx, `SELECT seq, role, name, origin, text FROM tracker_log WHERE tool = ? AND key = ? AND seq >= ?
-	  ORDER BY seq`, tool, key, base)
+	rows, err := t.s.db.QueryContext(ctx, `SELECT 0, build, state, log_base, log_seq, 0, '', '', '', '' FROM trackers WHERE tool = ? AND key = ?
+	  UNION ALL SELECT 1, '', NULL, 0, 0, seq, role, name, origin, text FROM tracker_log WHERE tool = ? AND key = ?
+	  ORDER BY 1, 6`, tool, key, tool, key)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	var build string
+	var st []byte
+	var base, end int
 	var items []sessions.Entry
+	found := false
 	for rows.Next() {
-		var seq int
-		var e sessions.Entry
-		var role string
-		if err := rows.Scan(&seq, &role, &e.Name, &e.Origin, &e.Text); err != nil {
+		var part, seq, b, e int
+		var bd, role, name, origin, text string
+		var blob []byte
+		if err := rows.Scan(&part, &bd, &blob, &b, &e, &seq, &role, &name, &origin, &text); err != nil {
 			return nil, err
+		}
+		if part == 0 {
+			found, build, st, base, end = true, bd, blob, b, e
+			continue
+		}
+		if !found {
+			continue // entries without their checkpoint: there is none
 		}
 		if seq != base+len(items) {
 			return nil, fmt.Errorf("its log lacks entry %d", base+len(items))
 		}
-		e.Role = sessions.Role(role)
-		items = append(items, e)
+		items = append(items, sessions.Entry{Role: sessions.Role(role), Name: name, Origin: origin, Text: text})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	if !found || build != t.build {
+		return nil, nil
+	}
+	if base+len(items) != end {
+		return nil, fmt.Errorf("its log holds %d entries, not %d", len(items), end-base)
 	}
 	t.held[tool+"\x00"+key] = st
 	l := sessions.Kept(base, items)
@@ -189,9 +216,9 @@ func (r *Run) SaveCheckpoints(t *Trackers, cps []sessions.Checkpoint, now time.T
 			from = base
 			items, _ = cp.Log.Since(base)
 		}
-		if _, err := r.tx.ExecContext(r.ctx, `INSERT INTO trackers (tool, key, build, state, log_base, seen) VALUES (?,?,?,?,?,?)
+		if _, err := r.tx.ExecContext(r.ctx, `INSERT INTO trackers (tool, key, build, state, log_base, log_seq, seen) VALUES (?,?,?,?,?,?,?)
 		  ON CONFLICT(tool, key) DO UPDATE SET build = excluded.build, state = excluded.state, log_base = excluded.log_base,
-		  seen = excluded.seen`, cp.Tool, cp.Key, t.build, cp.State, base, now.UnixMilli()); err != nil {
+		  log_seq = excluded.log_seq, seen = excluded.seen`, cp.Tool, cp.Key, t.build, cp.State, base, cp.Log.Seq(), now.UnixMilli()); err != nil {
 			return err
 		}
 		if _, err := r.tx.ExecContext(r.ctx, `DELETE FROM tracker_log WHERE tool = ? AND key = ? AND (seq < ? OR seq >= ?)`,

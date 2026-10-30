@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/store"
 	"github.com/agent-sh/momentum/sessions"
+	"github.com/agent-sh/momentum/sessions/state"
 )
 
 // fixed is a source that reports the same sessions on every scan, as a harness would between two runs.
@@ -39,7 +41,7 @@ func TestPhaseTimesSurviveBetweenRuns(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer st.Close()
-		ss, scanErr, err := board(ctx, &sessions.World{Now: now}, st, "test", []sessions.Source{src})
+		ss, scanErr, err := board(ctx, &sessions.World{Now: now}, nil, st, "test", []sessions.Source{src})
 		if err != nil || scanErr != nil {
 			t.Fatal(err, scanErr)
 		}
@@ -113,7 +115,7 @@ func TestPhaseChangesAreKeptAsEvents(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer st.Close()
-		if _, scanErr, err := board(ctx, &sessions.World{Now: at}, st, "test", []sessions.Source{src}); err != nil || scanErr != nil {
+		if _, scanErr, err := board(ctx, &sessions.World{Now: at}, nil, st, "test", []sessions.Source{src}); err != nil || scanErr != nil {
 			t.Fatal(err, scanErr)
 		}
 	}
@@ -207,5 +209,56 @@ func TestObservedEventsCannotBeRebuilt(t *testing.T) {
 	var out, errOut bytes.Buffer
 	if code := run(context.Background(), []string{"evidence", "rebuild", "sessions"}, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "observations") {
 		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+}
+
+// flaky is a harness's source whose scan fails while fail is set, as a locked database or a failing lister does.
+type flaky struct {
+	tool string
+	ss   []sessions.Session
+	fail bool
+}
+
+func (f *flaky) Tool() string { return f.tool }
+func (f *flaky) Close() error { return nil }
+func (f *flaky) Scan(context.Context, *sessions.World) ([]*sessions.Session, error) {
+	if f.fail {
+		return nil, errors.New("database is locked")
+	}
+	var out []*sessions.Session
+	for _, s := range f.ss {
+		s := s
+		out = append(out, &s)
+	}
+	return out, nil
+}
+
+func TestASourceThatFailsDoesNotMakeItsSessionsVanish(t *testing.T) {
+	ctx, path := context.Background(), filepath.Join(t.TempDir(), "m.db")
+	t0 := time.Now().Add(-time.Hour).Truncate(time.Minute)
+	src := &flaky{tool: "codex", ss: []sessions.Session{{Key: "thread-b", Tool: "codex", Name: "port the cli", Phase: sessions.Idle, Log: logOf(4), LastActive: t0}}}
+	runAt := func(at time.Time, fail bool) {
+		t.Helper()
+		src.fail = fail
+		st, err := store.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+		if _, _, err := board(ctx, &sessions.World{Now: at}, nil, st, "test", []sessions.Source{src}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runAt(t0, false)
+	runAt(t0.Add(state.Keep+time.Minute), true) // the scan fails for longer than state.Keep
+	runAt(t0.Add(state.Keep+2*time.Minute), false)
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	evs, err := st.Events(ctx, store.Query{Since: t0.Add(-time.Hour), Source: store.Sessions})
+	if err != nil || len(evs) != 1 || evs[0].Kind != "appeared" {
+		t.Fatalf("one appearance and no departure: %+v %v", evs, err)
 	}
 }

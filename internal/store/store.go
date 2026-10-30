@@ -59,7 +59,10 @@ func (e Event) ID() string {
 	return hex.EncodeToString(h[:12])
 }
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db   *sql.DB
+	path string
+}
 
 // Sessions is the source of the events `momentum sessions` writes: each phase change of a live session, as the
 // runs saw it. They are observations, not read from a signal store.
@@ -90,7 +93,7 @@ CREATE TABLE IF NOT EXISTS seen_files (source TEXT NOT NULL, path TEXT NOT NULL,
 CREATE TABLE IF NOT EXISTS skipped (source TEXT NOT NULL, ref TEXT NOT NULL, reason TEXT NOT NULL, at INTEGER NOT NULL,
   PRIMARY KEY (source, ref));
 CREATE TABLE IF NOT EXISTS trackers (tool TEXT NOT NULL, key TEXT NOT NULL, build TEXT NOT NULL, state BLOB NOT NULL,
-  log_base INTEGER NOT NULL, seen INTEGER NOT NULL, PRIMARY KEY (tool, key));
+  log_base INTEGER NOT NULL, log_seq INTEGER NOT NULL, seen INTEGER NOT NULL, PRIMARY KEY (tool, key));
 CREATE TABLE IF NOT EXISTS tracker_log (tool TEXT NOT NULL, key TEXT NOT NULL, seq INTEGER NOT NULL, role TEXT NOT NULL,
   name TEXT NOT NULL, origin TEXT NOT NULL, text TEXT NOT NULL, PRIMARY KEY (tool, key, seq)) WITHOUT ROWID;
 `
@@ -123,7 +126,7 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store schema: %w", err)
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, path: path}, nil
 }
 
 // stateSchema holds what cannot be derived from the sources: it is created when missing and never dropped,
@@ -148,26 +151,30 @@ var stampColumns = [][2]string{{"tool", "TEXT NOT NULL DEFAULT ''"}, {"name", "T
 // events table column by column (keepObserved).
 const schemaVersion = 2
 
+// migrate brings the store to this schema in one write transaction, which takes the lock up front: two first
+// opens after an upgrade (a timer run and a query) take turns instead of both altering the same table.
 func migrate(db *sql.DB) error {
-	if _, err := db.Exec(stateSchema); err != nil {
-		return err
-	}
-	if err := addColumns(db, "session_stamps", stampColumns); err != nil {
-		return err
-	}
-	var v int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
-		return err
-	}
-	if v == schemaVersion {
-		_, err := db.Exec(schema)
-		return err
-	}
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if _, err := tx.Exec(stateSchema); err != nil {
+		return err
+	}
+	if err := addColumns(tx, "session_stamps", stampColumns); err != nil {
+		return err
+	}
+	var v int
+	if err := tx.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		return err
+	}
+	if v == schemaVersion {
+		if _, err := tx.Exec(schema); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
 	var hadEvents int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'events'`).Scan(&hadEvents); err != nil {
 		return err
@@ -268,14 +275,14 @@ func (cs columnList) has(name string) bool {
 }
 
 // addColumns adds to a state table the columns it lacks.
-func addColumns(db *sql.DB, table string, want [][2]string) error {
-	have, err := columns(db, "main", table)
+func addColumns(tx *sql.Tx, table string, want [][2]string) error {
+	have, err := columns(tx, "main", table)
 	if err != nil {
 		return err
 	}
 	for _, c := range want {
 		if !have.has(c[0]) {
-			if _, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + c[0] + ` ` + c[1]); err != nil {
+			if _, err := tx.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + c[0] + ` ` + c[1]); err != nil {
 				return err
 			}
 		}

@@ -127,14 +127,21 @@ func TestApplyReportsEveryChangeOfStretch(t *testing.T) {
 	}
 }
 
-func TestAnOlderObservationChangesNothing(t *testing.T) {
+func TestAFailedScanKeepsItsSessionsStamps(t *testing.T) {
 	st := Stamps{}
-	st.Apply([]*sessions.Session{sess("a", sessions.Working, 3, t0)}, t0.Add(5*time.Minute))
-	late := sess("a", sessions.Idle, 2, t0) // a run that scanned at +4m and saves after the one at +5m
-	if got := st.Apply([]*sessions.Session{late}, t0.Add(4*time.Minute)); len(got) != 0 {
-		t.Fatalf("changes %+v", got)
+	hermes := func() *sessions.Session {
+		return &sessions.Session{Key: "h", Tool: "hermes", Phase: sessions.Idle, Seq: 2, LastActive: t0.Add(-time.Hour)}
 	}
-	if r := st["a"]; r.Phase != sessions.Working || !r.Seen.Equal(t0.Add(5*time.Minute)) || !late.Since.Equal(t0.Add(5*time.Minute)) {
-		t.Fatalf("stamp %+v, since %v", r, late.Since)
+	st.Apply([]*sessions.Session{sess("a", sessions.Idle, 1, t0), hermes()}, t0)
+	// Hermes's scan fails for longer than Keep: its conversation is unknown, not gone
+	if got := st.Apply([]*sessions.Session{sess("a", sessions.Idle, 1, t0)}, t0.Add(Keep+time.Minute), "hermes"); len(got) != 0 {
+		t.Fatalf("changes while the scan failed: %+v", got)
+	}
+	if got := st.Apply([]*sessions.Session{sess("a", sessions.Idle, 1, t0), hermes()}, t0.Add(Keep+2*time.Minute)); len(got) != 0 {
+		t.Fatalf("the same stretch goes on once the scan works: %+v", got)
+	}
+	got := st.Apply([]*sessions.Session{sess("a", sessions.Idle, 1, t0)}, t0.Add(2*Keep+3*time.Minute))
+	if len(got) != 1 || got[0].Key != "h" || got[0].To != "" || !got[0].At.Equal(t0.Add(Keep+2*time.Minute)) {
+		t.Fatalf("gone once a working scan misses it: %+v", got)
 	}
 }

@@ -4,6 +4,7 @@
 package state
 
 import (
+	"slices"
 	"sort"
 	"time"
 
@@ -64,16 +65,13 @@ type Change struct {
 // began when the session last moved, if that was after the previous sighting, since a turn ends with its last
 // write and the scan that notices comes later; otherwise it began now.
 //
-// A stamp that a scan later than now already updated (a run that started earlier and saved later) is left as it
-// is: an older observation changes nothing.
-func (st Stamps) Apply(ss []*sessions.Session, now time.Time) []Change {
+// Runs must apply their scans in the order they made them: momentum's runs take turns on a lock from scan to
+// save. failed names the tools whose scan failed on this run. Their sessions may still live, so their stamps do
+// not expire on it; one that is gone is reported once a scan of its tool works again, as of its last sighting.
+func (st Stamps) Apply(ss []*sessions.Session, now time.Time, failed ...string) []Change {
 	var out []Change
 	for _, s := range ss {
 		prev, ok := st[s.Key]
-		if ok && prev.Seen.After(now) {
-			s.Since = prev.Since
-			continue
-		}
 		tool, name := s.Tool, s.Name // a scan that lost them does not erase them
 		if tool == "" {
 			tool = prev.Tool
@@ -105,7 +103,7 @@ func (st Stamps) Apply(ss []*sessions.Session, now time.Time) []Change {
 		s.Since = prev.Since
 	}
 	for k, r := range st {
-		if now.Sub(r.Seen) > Keep {
+		if now.Sub(r.Seen) > Keep && !slices.Contains(failed, r.Tool) {
 			out = append(out, Change{Key: k, Tool: r.Tool, Name: r.Name, Auto: r.Auto, From: r.Phase, At: r.Seen, Since: r.Since,
 				Seen: r.Seen, For: max(0, r.Seen.Sub(r.Since)), FromAsk: r.Ask, FromAskKind: r.AskKind})
 			delete(st, k)

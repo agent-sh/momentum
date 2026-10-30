@@ -84,7 +84,7 @@ func sessionsRun(t *testing.T, path string, now time.Time, srcs ...sessions.Sour
 		t.Fatal(err)
 	}
 	defer st.Close()
-	ss, scanErr, err := board(context.Background(), &sessions.World{Now: now, Procs: &proc.Table{ByPID: map[int]*proc.Proc{}}}, st, "test", srcs)
+	ss, scanErr, err := board(context.Background(), &sessions.World{Now: now, Procs: &proc.Table{ByPID: map[int]*proc.Proc{}}}, nil, st, "test", srcs)
 	if err != nil || scanErr != nil {
 		t.Fatal(err, scanErr)
 	}

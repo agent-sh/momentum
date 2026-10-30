@@ -250,3 +250,136 @@ func TestARunThatLoadedBeforeAnotherSavedWritesItsLogWhole(t *testing.T) {
 	}
 	sameLog(t, "the later save", cp, &logB, "sB")
 }
+
+func TestALoadNeverMixesTwoSaves(t *testing.T) {
+	ctx, path := context.Background(), filepath.Join(t.TempDir(), "m.db")
+	writer, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	reader, err := Open(path) // another run, with its own handle
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	tr := writer.Trackers("b")
+	var live sessions.Log
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 400; i++ { // each save adds an entry; its state says how long the log is
+			live.Add(sessions.Entry{Role: sessions.RoleOut, Text: fmt.Sprint(i)})
+			err := writer.SessionRun(ctx, func(r *Run) error {
+				return r.SaveCheckpoints(tr, []sessions.Checkpoint{{Tool: "claude", Key: "k", State: []byte(fmt.Sprint(live.Seq())), Log: &live}}, time.Now())
+			})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+	loads, torn := 0, 0
+	for running := true; running; {
+		select {
+		case <-done:
+			running = false
+		default:
+		}
+		cp, err := reader.Trackers("b").Checkpoint(ctx, "claude", "k")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cp == nil {
+			continue
+		}
+		loads++
+		if string(cp.State) != fmt.Sprint(cp.Log.Seq()) {
+			torn++
+		}
+	}
+	if torn > 0 {
+		t.Fatalf("%d of %d loads mixed a state and a log from two saves", torn, loads)
+	}
+}
+
+func TestALogShorterThanItsCheckpointIsRefused(t *testing.T) {
+	ctx := context.Background()
+	st, _ := open(t)
+	var l sessions.Log
+	for i := 0; i < 3; i++ {
+		l.Add(sessions.Entry{Role: sessions.RoleOut, Text: fmt.Sprint(i)})
+	}
+	saveRun(t, st, st.Trackers("b"), time.UnixMilli(1_700_000_000_000), sessions.Checkpoint{Tool: "pi", Key: "k", State: []byte("s"), Log: &l})
+	if _, err := st.db.Exec(`DELETE FROM tracker_log WHERE seq = 2`); err != nil { // the newest entry is lost
+		t.Fatal(err)
+	}
+	if cp, err := st.Trackers("b").Checkpoint(ctx, "pi", "k"); err == nil {
+		t.Fatalf("a short log was handed out: %d entries", cp.Log.Seq())
+	}
+}
+
+func TestFirstOpensOfAnOlderStoreAtOnceAllSucceed(t *testing.T) {
+	for round := 0; round < 10; round++ {
+		path := filepath.Join(t.TempDir(), "m.db")
+		old, err := sql.Open("sqlite", "file:"+path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// a store as the first sessions release left it, in WAL mode as momentum opens every store
+		if _, err := old.Exec(`PRAGMA journal_mode = WAL; CREATE TABLE session_stamps (key TEXT PRIMARY KEY, phase TEXT NOT NULL,
+		  since INTEGER NOT NULL, seq INTEGER NOT NULL, seen INTEGER NOT NULL); PRAGMA user_version = 2;`); err != nil {
+			t.Fatal(err)
+		}
+		old.Close()
+		errs := make(chan error, 4)
+		for i := 0; i < 4; i++ { // a timer run and an evidence query starting together after an upgrade
+			go func() {
+				st, err := Open(path)
+				if err == nil {
+					st.Close()
+				}
+				errs <- err
+			}()
+		}
+		for i := 0; i < 4; i++ {
+			if err := <-errs; err != nil {
+				t.Fatalf("round %d: %v", round, err)
+			}
+		}
+	}
+}
+
+func TestSessionsRunsTakeTurns(t *testing.T) {
+	st, path := open(t)
+	other, err := Open(path) // another run, with its own handle
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	unlock, err := st.LockSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan func())
+	go func() {
+		u, err := other.LockSessions()
+		if err != nil {
+			t.Error(err)
+			u = func() {}
+		}
+		got <- u
+	}()
+	select {
+	case <-got:
+		t.Fatal("a second run took the lock while the first held it")
+	case <-time.After(200 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case u := <-got:
+		u()
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second run never got the lock")
+	}
+}
