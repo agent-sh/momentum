@@ -121,6 +121,10 @@ func (r *runner) worktree(ctx context.Context, w, canon string, heads *remoteHea
 		f.Action, f.Why = ActKeep, "locked: "+strings.TrimSpace(string(b))
 		return f, true
 	}
+	if busy := r.repoBusy(ctx, w, canon); busy != "" {
+		f.Action, f.Why = ActKeep, "its repository is in use: "+busy
+		return f, true
+	}
 	status, err := gitOut(ctx, w, "status", "--porcelain=v1", "--untracked-files=normal")
 	if err != nil {
 		f.Action, f.class, f.Why = ActReport, "unreadable", "git status failed: "+err.Error()
@@ -141,6 +145,51 @@ func (r *runner) worktree(ctx context.Context, w, canon string, heads *remoteHea
 	}
 	f.Action = ActDelete
 	return f, true
+}
+
+// repoBusy names what works in a worktree's repository now, or "": a process (other than this one) whose working
+// directory is in any of the repository's work trees, or a live agent session that works in one. The scheduled-AI
+// policy leaves a repository someone works on alone; a branch of it is not deleted under them.
+func (r *runner) repoBusy(ctx context.Context, w, canon string) string {
+	out, err := gitOut(ctx, w, "worktree", "list", "--porcelain")
+	if err != nil {
+		return "git worktree list failed: " + err.Error()
+	}
+	var trees []string
+	for _, l := range strings.Split(out, "\n") {
+		if p, ok := strings.CutPrefix(l, "worktree "); ok {
+			if c := r.m.Canon(p); c != canon {
+				trees = append(trees, c)
+			}
+		}
+	}
+	self := os.Getpid()
+	for _, t := range trees {
+		for _, p := range r.sample.Table {
+			if p.PID != self && p.Cwd != "" && under(p.Cwd, t) {
+				return fmt.Sprintf("%s (pid %d) in %s", p.Comm, p.PID, short(t))
+			}
+		}
+		for _, s := range r.liveSessions(ctx) {
+			if s.Cwd != "" && under(r.m.Canon(s.Cwd), t) {
+				return fmt.Sprintf("session %s (%s) in %s", firstNonEmpty(s.Name, s.Key), s.Tool, short(t))
+			}
+		}
+	}
+	return ""
+}
+
+// liveSessions are the agent sessions on the machine, read once per run.
+func (r *runner) liveSessions(ctx context.Context) map[int]Session {
+	if r.sessions == nil {
+		r.sessions = map[int]Session{}
+		if r.opt.Sessions != nil {
+			if ss := r.opt.Sessions(ctx); ss != nil {
+				r.sessions = ss
+			}
+		}
+	}
+	return r.sessions
 }
 
 // upstream is a branch's remote and its name there: its upstream, else a remote-tracking branch of the same name.

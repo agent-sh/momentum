@@ -38,11 +38,12 @@ type Sample struct {
 	byPath     map[string]Use
 }
 
-// Proc is one process the sampler read.
+// Proc is one process the sampler read, and its working directory (canonical), wherever it is.
 type Proc struct {
 	PID, PPID int
 	Comm      string
 	Argv      []string
+	Cwd       string
 }
 
 // Children reports whether any process has pid as its parent.
@@ -117,10 +118,14 @@ func TakeSample(procRoot string, m *Mounts, keep func(string) bool) *Sample {
 		if st, err := os.ReadFile(filepath.Join(dir, "stat")); err == nil {
 			ppid = parentOf(string(st))
 		}
-		s.Table[pid] = Proc{PID: pid, PPID: ppid, Comm: comm, Argv: argv}
+		pr := Proc{PID: pid, PPID: ppid, Comm: comm, Argv: argv}
 		if l, err := os.Readlink(filepath.Join(dir, "cwd")); err == nil {
 			add(l, "cwd", pid, comm)
+			if filepath.IsAbs(l) {
+				pr.Cwd = m.Canon(strings.TrimSuffix(l, " (deleted)"))
+			}
 		}
+		s.Table[pid] = pr
 		if l, err := os.Readlink(filepath.Join(dir, "exe")); err == nil {
 			add(l, "exe", pid, comm)
 		}
