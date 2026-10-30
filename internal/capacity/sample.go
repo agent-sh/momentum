@@ -56,7 +56,8 @@ func (s *Sample) Children(pid int) bool {
 	return false
 }
 
-// InUse reports whether the sample saw a process use p or anything under it, and the first such use.
+// InUse reports whether the sample saw a process use p or anything under it, and the first such use. A container's
+// mount of a directory holding p uses p too.
 func (s *Sample) InUse(p string) (Use, bool) {
 	if s == nil {
 		return Use{}, false
@@ -65,7 +66,7 @@ func (s *Sample) InUse(p string) (Use, bool) {
 		return u, true
 	}
 	for _, u := range s.Uses {
-		if under(u.Path, p) {
+		if under(u.Path, p) || (u.How == "mount" && under(p, u.Path)) {
 			return u, true
 		}
 	}

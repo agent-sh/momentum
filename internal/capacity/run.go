@@ -199,14 +199,45 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 	r.res.SampleTook, r.res.Procs, r.res.Unreadable = r.sample.Took, r.sample.Procs, r.sample.Unreadable
 	r.res.SampleMS = r.sample.Took.Milliseconds()
 	disks := r.diskSamples()
+	if !opt.DryRun && st == nil {
+		return nil, errors.New("a run that records needs the store")
+	}
 	var err error
 	if r.seen, err = r.seenPaths(ctx); err != nil {
 		return nil, err
 	}
-	seen := r.sampleSeen()
-	if !opt.DryRun && st == nil {
-		return nil, errors.New("a run that records needs the store")
+	if st != nil {
+		if r.samplerStart, err = st.SamplerStart(ctx); err != nil {
+			return nil, err
+		}
 	}
+	if r.samplerStart.IsZero() {
+		r.samplerStart = r.now // the first run: the record starts now
+	}
+	r.res.Since = r.samplerStart
+
+	fast := r.disk(ctx, disks)
+	due := map[string]bool{}
+	for _, rule := range Rules {
+		if len(opt.Rules) > 0 && !contains(opt.Rules, rule) {
+			continue
+		}
+		rr := RuleResult{Rule: rule, Live: cfg.IsLive(rule) && !opt.DryRun}
+		switch ok, why := r.due(ctx, rule, fast); {
+		case !cfg.configured(rule):
+			rr.Why = "not configured"
+		case !ok:
+			rr.Why = why
+		default:
+			due[rule] = true
+			rr.Ran = true
+		}
+		r.res.Rules = append(r.res.Rules, rr)
+	}
+	if len(due) > 0 { // a container's bind mounts are its use: the sampler cannot read root's processes
+		r.addContainerUses(ctx, r.sample)
+	}
+	seen := r.sampleSeen()
 	if !opt.DryRun {
 		samples := make([]store.DiskSample, 0, len(disks))
 		for _, d := range disks {
@@ -228,34 +259,6 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 			}
 			r.seen[v.Path] = old
 		}
-	}
-	if st != nil {
-		if r.samplerStart, err = st.SamplerStart(ctx); err != nil {
-			return nil, err
-		}
-	}
-	if r.samplerStart.IsZero() {
-		r.samplerStart = r.now // a dry run before any run: the record would start now
-	}
-	r.res.Since = r.samplerStart
-
-	fast := r.disk(ctx, disks)
-	due := map[string]bool{}
-	for _, rule := range Rules {
-		if len(opt.Rules) > 0 && !contains(opt.Rules, rule) {
-			continue
-		}
-		rr := RuleResult{Rule: rule, Live: cfg.IsLive(rule) && !opt.DryRun}
-		switch ok, why := r.due(ctx, rule, fast); {
-		case !cfg.configured(rule):
-			rr.Why = "not configured"
-		case !ok:
-			rr.Why = why
-		default:
-			due[rule] = true
-			rr.Ran = true
-		}
-		r.res.Rules = append(r.res.Rules, rr)
 	}
 	if len(due) > 0 {
 		r.named, r.namedErr = LoadNamed(ctx, opt.Jobs, cfg.Names, r.m)
@@ -442,6 +445,7 @@ func (r *runner) act(ctx context.Context) {
 		return
 	}
 	r.fresh = TakeSample(r.opt.ProcRoot, r.m, r.watched)
+	r.addContainerUses(ctx, r.fresh)
 	for _, f := range todo {
 		if u, ok := r.fresh.InUse(f.canon); ok {
 			f.Action, f.Why = ActKeep, "in use now: "+useText(u)
@@ -482,6 +486,47 @@ func (r *runner) act(ctx context.Context) {
 		}
 		f.Done = true
 	}
+}
+
+// addContainerUses adds to a sample the host paths running Docker containers bind-mount: a server in a container
+// runs as root, whose open files the sampler cannot read. Without Docker it adds nothing.
+func (r *runner) addContainerUses(ctx context.Context, s *Sample) {
+	ids, err := r.tools.Docker(ctx, 15*time.Second, "ps", "-q")
+	if err != nil || strings.TrimSpace(ids) == "" {
+		return
+	}
+	out, err := r.tools.Docker(ctx, 30*time.Second, append([]string{"inspect", "--format",
+		"{{.Name}}{{range .Mounts}}\t{{.Source}}{{end}}"}, strings.Fields(ids)...)...)
+	if err != nil {
+		return
+	}
+	for _, l := range strings.Split(out, "\n") {
+		f := strings.Split(strings.TrimSpace(l), "\t")
+		for _, src := range f[1:] {
+			if !filepath.IsAbs(src) {
+				continue
+			}
+			p := r.m.Canon(src)
+			if !r.watched(p) && !r.holdsRoot(p) {
+				continue
+			}
+			if _, ok := s.byPath[p]; !ok {
+				u := Use{Path: p, How: "mount", Comm: "container " + strings.TrimPrefix(f[0], "/")}
+				s.byPath[p] = u
+				s.Uses = append(s.Uses, u)
+			}
+		}
+	}
+}
+
+// holdsRoot reports whether a path holds one of the rules' roots: a mount of it gives a container every item.
+func (r *runner) holdsRoot(p string) bool {
+	for _, x := range append(append(append([]root{}, r.modelRoots...), r.targetRoot...), r.wtRoots...) {
+		if under(x.canon, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // free is the free space of the disk a path is on, or -1.
