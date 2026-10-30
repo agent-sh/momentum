@@ -27,6 +27,10 @@ const Retain = 15 * time.Minute
 const childWindow = 6 * time.Hour
 
 // Source finds opencode terminal processes and reads their sessions from the database.
+//
+// opencode updates messages and parts in place (each row carries the time it was last updated), so a log resumed
+// from a cursor in another process would not be what the database holds. The Source keeps no checkpoints: each
+// process reads every message once.
 type Source struct {
 	Env  sessions.Env
 	db   *sql.DB
@@ -181,6 +185,7 @@ func (src *Source) session(ctx context.Context, slot proc.Slot, used map[string]
 	crs, err := db.QueryContext(ctx, `select id, title, time_created, time_updated from session where parent_id = ? and time_updated > ?`,
 		id, w.Now.Add(-childWindow).UnixMilli())
 	if err != nil {
+		s.Partial = true
 		return s, errors.Join(append(errs, fmt.Errorf("subagents: %w", err))...)
 	}
 	type child struct {
@@ -205,7 +210,9 @@ func (src *Source) session(ctx context.Context, slot proc.Slot, used map[string]
 				Started: time.UnixMilli(k.c), LastActive: time.UnixMilli(k.u), Now: cs.Now})
 		}
 	}
-	return s, errors.Join(errs...)
+	err = errors.Join(errs...)
+	s.Partial = err != nil // a query of its own failed: its facts may be short
+	return s, err
 }
 
 func (src *Source) logOf(key string) *dbLog {

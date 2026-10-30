@@ -92,3 +92,77 @@ func TestDismissalsHoldUntilTheSessionMoves(t *testing.T) {
 		t.Fatal("covers")
 	}
 }
+
+func TestApplyReportsEveryChangeOfStretch(t *testing.T) {
+	st := Stamps{}
+	asks := &sessions.Session{Key: "b", Tool: "claude", Name: "cleanup", Phase: sessions.NeedsYou, Seq: 4, LastActive: t0.Add(-5 * time.Minute),
+		Ask: "permission prompt: Bash: rm -rf build", AskKind: sessions.AskPermission}
+	got := st.Apply([]*sessions.Session{sess("a", sessions.Idle, 3, t0.Add(-time.Hour)), asks}, t0)
+	if len(got) != 2 || got[0].Key != "a" || got[0].From != "" || got[0].To != sessions.Idle || !got[0].At.Equal(t0.Add(-time.Hour)) ||
+		got[1].To != sessions.NeedsYou || got[1].ToAskKind != sessions.AskPermission || got[1].ToAsk != asks.Ask || got[1].Tool != "claude" {
+		t.Fatalf("first sightings: %+v", got)
+	}
+	// both start working; the wait on the permission prompt lasted from its start until now
+	got = st.Apply([]*sessions.Session{sess("a", sessions.Working, 5, t0), sess("b", sessions.Working, 6, t0)}, t0.Add(3*time.Minute))
+	if len(got) != 2 || got[0].From != sessions.Idle || got[0].For != time.Hour+3*time.Minute ||
+		got[1].From != sessions.NeedsYou || got[1].To != sessions.Working || got[1].For != 8*time.Minute ||
+		got[1].FromAskKind != sessions.AskPermission || got[1].FromAsk != asks.Ask || got[1].Name != "cleanup" || !got[1].Seen.Equal(t0) {
+		t.Fatalf("into working: %+v", got)
+	}
+	// a's turn ended at +5m; b keeps working, which is no change
+	got = st.Apply([]*sessions.Session{sess("a", sessions.Idle, 9, t0.Add(5*time.Minute)), sess("b", sessions.Working, 8, t0)}, t0.Add(6*time.Minute))
+	if len(got) != 1 || got[0].Key != "a" || got[0].From != sessions.Working || got[0].To != sessions.Idle || got[0].For != 2*time.Minute {
+		t.Fatalf("a turn ends: %+v", got)
+	}
+	// a ran a whole turn between two runs: a new idle stretch
+	got = st.Apply([]*sessions.Session{sess("a", sessions.Idle, 12, t0.Add(8*time.Minute))}, t0.Add(9*time.Minute))
+	if len(got) != 1 || got[0].From != sessions.Idle || got[0].To != sessions.Idle || got[0].For != 3*time.Minute {
+		t.Fatalf("idle again: %+v", got)
+	}
+	// b is gone for longer than Keep: it left working, last seen at +6m
+	got = st.Apply([]*sessions.Session{sess("a", sessions.Idle, 12, t0.Add(8*time.Minute))}, t0.Add(9*time.Minute+Keep+time.Minute))
+	if len(got) != 1 || got[0].Key != "b" || got[0].From != sessions.Working || got[0].To != "" || !got[0].At.Equal(t0.Add(6*time.Minute)) ||
+		got[0].For != 3*time.Minute {
+		t.Fatalf("gone: %+v", got)
+	}
+}
+
+func TestAFailedScanKeepsItsSessionsStamps(t *testing.T) {
+	st := Stamps{}
+	hermes := func() *sessions.Session {
+		return &sessions.Session{Key: "h", Tool: "hermes", Phase: sessions.Idle, Seq: 2, LastActive: t0.Add(-time.Hour)}
+	}
+	st.Apply([]*sessions.Session{sess("a", sessions.Idle, 1, t0), hermes()}, t0)
+	// Hermes's scan fails for longer than Keep: its conversation is unknown, not gone
+	if got := st.Apply([]*sessions.Session{sess("a", sessions.Idle, 1, t0)}, t0.Add(Keep+time.Minute), "hermes"); len(got) != 0 {
+		t.Fatalf("changes while the scan failed: %+v", got)
+	}
+	if got := st.Apply([]*sessions.Session{sess("a", sessions.Idle, 1, t0), hermes()}, t0.Add(Keep+2*time.Minute)); len(got) != 0 {
+		t.Fatalf("the same stretch goes on once the scan works: %+v", got)
+	}
+	got := st.Apply([]*sessions.Session{sess("a", sessions.Idle, 1, t0)}, t0.Add(2*Keep+3*time.Minute))
+	if len(got) != 1 || got[0].Key != "h" || got[0].To != "" || !got[0].At.Equal(t0.Add(Keep+2*time.Minute)) {
+		t.Fatalf("gone once a working scan misses it: %+v", got)
+	}
+}
+
+func TestAPartialReadChangesNothing(t *testing.T) {
+	st := Stamps{}
+	st.Apply([]*sessions.Session{sess("a", sessions.Idle, 5, t0.Add(-time.Hour))}, t0)
+	short := sess("a", sessions.Idle, 2, t0.Add(-time.Hour)) // a failed page: the log came back short
+	short.Partial = true
+	if got := st.Apply([]*sessions.Session{short}, t0.Add(10*time.Minute)); len(got) != 0 || !short.Since.Equal(t0.Add(-time.Hour)) {
+		t.Fatalf("changes %+v since %v", got, short.Since)
+	}
+	if r := st["a"]; r.Seq != 5 || !r.Seen.Equal(t0.Add(10*time.Minute)) {
+		t.Fatalf("the stamp keeps its stretch and records the sighting: %+v", r)
+	}
+	if got := st.Apply([]*sessions.Session{sess("a", sessions.Idle, 5, t0.Add(-time.Hour))}, t0.Add(20*time.Minute)); len(got) != 0 {
+		t.Fatalf("a whole read of the same stretch: %+v", got)
+	}
+	unknown := sess("codex:proc:11:1100", sessions.Idle, 0, time.Time{}) // a process whose thread lookup failed
+	unknown.Partial = true
+	if got := st.Apply([]*sessions.Session{unknown}, t0.Add(21*time.Minute)); len(got) != 0 || len(st) != 1 {
+		t.Fatalf("a first sighting read in part gets no stamp: %+v %v", got, st)
+	}
+}

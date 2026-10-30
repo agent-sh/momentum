@@ -29,8 +29,10 @@ type Source struct {
 	Lister sessions.Lister
 	db     *stateDB
 
+	saved    sessions.Saved
 	trackers map[string]*Tracker
 	seen     map[string]time.Time
+	now      time.Time // the last scan's
 }
 
 // New reads Codex sessions with native discovery, which shares the Source's database handle.
@@ -44,6 +46,25 @@ func (src *Source) Tool() string { return "codex" }
 // Close closes the state database, if it was opened.
 func (src *Source) Close() error { return src.db.close() }
 
+// Resume makes later scans start a rollout they meet for the first time from its checkpoint in saved.
+func (src *Source) Resume(saved sessions.Saved) { src.saved = saved }
+
+// Checkpoints returns the checkpoint of every rollout the last Scan read, its sessions' and their subagents'.
+func (src *Source) Checkpoints() []sessions.Checkpoint {
+	var out []sessions.Checkpoint
+	for path, at := range src.seen {
+		if !at.Equal(src.now) {
+			continue
+		}
+		t := src.trackers[path]
+		if state, err := t.State(); err == nil {
+			out = append(out, sessions.Checkpoint{Tool: src.Tool(), Key: path, State: state, Log: t.Log()})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
 func (src *Source) state() *stateDB {
 	if src.db == nil {
 		src.db = &stateDB{home: src.Env.CodexHome}
@@ -56,6 +77,7 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 	if src.trackers == nil {
 		src.trackers, src.seen = map[string]*Tracker{}, map[string]time.Time{}
 	}
+	src.now = w.Now
 	found, err := src.Lister.List(ctx, w)
 	var out []*sessions.Session
 	keys := map[string]bool{}
@@ -75,7 +97,7 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 		keys[key] = true
 		s := &sessions.Session{Key: key, Tool: "codex", Name: f.Name, Named: f.Named, Cwd: f.Cwd, Project: src.Env.Project(f.Cwd),
 			Where: f.Where, Pane: f.Pane, PID: f.PID, Model: f.Model, Started: f.Started, LastActive: f.LastActive,
-			Transcript: f.Transcript, Tasks: []sessions.Task{}}
+			Transcript: f.Transcript, Tasks: []sessions.Task{}, Partial: f.Partial}
 		if f.Transcript == "" {
 			s.TurnOpen = f.Status == "busy" // no rollout yet: only Codex's own state says anything
 			out = append(out, s)
@@ -84,11 +106,13 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 		if fi, err := os.Stat(f.Transcript); err == nil && fi.ModTime().After(s.LastActive) {
 			s.LastActive = fi.ModTime()
 		}
-		t := src.tracker(f.Transcript, w.Now)
+		t, terr := src.tracker(ctx, f.Transcript, w.Now)
+		err = errors.Join(err, terr)
 		t.Facts(s, w.Now)
 		s.TurnOpen = t.Open()
 		kids, kerr := src.children(ctx, f.Thread, w.Now)
 		s.Tasks = append(s.Tasks, kids...)
+		s.Partial = s.Partial || kerr != nil
 		err = errors.Join(err, kerr)
 		out = append(out, s)
 	}
@@ -101,14 +125,29 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 	return out, err
 }
 
-func (src *Source) tracker(path string, now time.Time) *Tracker {
-	t := src.trackers[path]
-	if t == nil {
-		t = NewTracker(path)
-		src.trackers[path] = t
-	}
+// tracker returns the rollout's tracker: the one kept from an earlier scan, else one resumed from its checkpoint,
+// else a new one that reads from the start. A checkpoint that cannot be read is reported, and the rollout is read
+// from the start.
+func (src *Source) tracker(ctx context.Context, path string, now time.Time) (*Tracker, error) {
 	src.seen[path] = now
-	return t
+	if t := src.trackers[path]; t != nil {
+		return t, nil
+	}
+	t := NewTracker(path)
+	src.trackers[path] = t
+	if src.saved == nil {
+		return t, nil
+	}
+	cp, err := src.saved.Checkpoint(ctx, src.Tool(), path)
+	if err == nil && cp != nil {
+		if err = t.Resume(cp); err != nil {
+			*t = *NewTracker(path)
+		}
+	}
+	if err != nil {
+		return t, fmt.Errorf("checkpoint of %s: %w", path, err)
+	}
+	return t, nil
 }
 
 // children returns the subagent threads of a thread whose turn is running. A spawn edge stays open after its
@@ -142,7 +181,8 @@ func (src *Source) children(ctx context.Context, thread string, now time.Time) (
 	rows.Close()
 	var out []sessions.Task
 	for _, c := range kids {
-		ct := src.tracker(c.path, now)
+		ct, err := src.tracker(ctx, c.path, now)
+		rerr = errors.Join(rerr, err)
 		ct.Update()
 		if !ct.Open() {
 			continue
@@ -152,7 +192,7 @@ func (src *Source) children(ctx context.Context, thread string, now time.Time) (
 			k.LastActive = fi.ModTime()
 		}
 		if p := ct.pending(); p != nil {
-			k.Now = text.OneLine(p.name+": "+p.desc, 110)
+			k.Now = text.OneLine(p.Name+": "+p.Desc, 110)
 		}
 		out = append(out, k)
 	}
@@ -191,6 +231,7 @@ func (n *Native) List(ctx context.Context, w *sessions.World) ([]sessions.Found,
 		}
 		f, err := n.agent(ctx, w, pa.PID)
 		errs = append(errs, err)
+		f.Partial = err != nil // its thread is not known: it shows by its process until a lookup works
 		f.Cwd, f.Where, f.Pane = text.FirstNonEmpty(f.Cwd, pa.Pane.Path), pa.Pane.Target(), pa.Pane.ID
 		if f.Name == "codex" {
 			f.Name = text.FirstNonEmpty(pa.Pane.WindowName, f.Name)

@@ -296,3 +296,25 @@ func TestASourceWithAnotherListerReadsRolloutsAndSubagents(t *testing.T) {
 		t.Fatal("closing a Source that never opened its database is fine")
 	}
 }
+
+func TestAProcessWhoseThreadCannotBeLookedUpIsReadInPart(t *testing.T) {
+	home := t.TempDir()
+	main := newRollout(t, home, mainID).start()
+	ms := t0.UnixMilli()
+	state(t, home, [][]any{{mainID, main.path, ms / 1000, ms / 1000, "cli", "/w", "work", nil, nil, nil, ms, ms, "user", nil}}, nil)
+	fake.File(t, filepath.Join(home, "state_6.sqlite"), "") // Codex just made a newer database, still without tables
+	tb, err := proc.Read(fake.ProcRoot(t,
+		fake.Proc{PID: 10, PPID: 1, Argv: []string{"bash"}},
+		fake.Proc{PID: 11, PPID: 10, Argv: []string{"/opt/codex/codex"}, Start: 1100, Files: []string{main.path}},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &sessions.World{Now: t0, Procs: tb, Panes: []term.Pane{{ID: "%1", PID: 10}}}
+	src := New(sessions.Env{CodexHome: home})
+	defer src.Close()
+	ss, err := sessions.Scan(context.Background(), w, src)
+	if err == nil || len(ss) != 1 || ss[0].Key != "codex:proc:11:1100" || !ss[0].Partial {
+		t.Fatalf("got %v %+v", err, ss)
+	}
+}

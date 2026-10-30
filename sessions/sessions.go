@@ -5,9 +5,12 @@
 // A Source per harness turns what it finds into Sessions; Scan runs every source over one snapshot of the
 // machine (a World) and applies the phase rule. Sources keep incremental trackers, so a caller that scans
 // repeatedly (a board refreshing every few seconds) reads only what each transcript gained since the last scan.
+// A caller that runs once and exits keeps them as checkpoints (Resumable): the next run resumes each tracker and
+// reads only what was appended.
 //
-// What persists between runs (when each session entered its phase, dismissed asks) is in package state; the
-// caller stores it. Judging a finished turn with a model is in package verdict; the caller makes the call.
+// What else persists between runs (when each session entered its phase, what changed, dismissed asks) is in
+// package state; the caller stores it. Judging a finished turn with a model is in package verdict; the caller
+// makes the call.
 //
 // User-role text in a session's Log is what the harness recorded in the user role. Typed words, a queued or
 // pasted message, a program typing into the terminal and a scheduled prompt can all land there, so it is not
@@ -94,7 +97,10 @@ type Session struct {
 	Size       int64     `json:"-"` // how much of the transcript or database has been read; -1 when unreadable
 	Seq        int       `json:"seq"`
 	Auto       bool      `json:"auto,omitempty"` // an automated run (cron, one-shot): counted, not listed
-	Log        *Log      `json:"-"`              // the tracker's live activity log; copy what you need before the next scan
+	// Partial says the source could not read all of the session on this scan: a query failed, or its identity is
+	// not known yet. Its facts may be short, so a caller that keeps history does not count it as a change.
+	Partial bool `json:"partial,omitempty"`
+	Log     *Log `json:"-"` // the tracker's live activity log; copy what you need before the next scan
 }
 
 // Found is one session a Lister discovered, before its transcript is read.
@@ -120,6 +126,7 @@ type Found struct {
 	JobState   string // a background job's state in its harness's own words
 	Detail     string // a background job's own detail line
 	Host       string // set for a session on another machine; sources drop those, their files are not here
+	Partial    bool   // the lister could not read all of it: its identity or its facts may be missing
 }
 
 // Key is the session's identity across scans: its job, thread or session id, else its process (pid and start
