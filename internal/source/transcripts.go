@@ -38,9 +38,12 @@ type Transcripts struct {
 	Homes   []string // home directories to find sessions under
 	Workers int      // files read at once; 0 is DefaultWorkers()
 
-	// redact and ready are tacit's redaction (evidence.RedactEvents, evidence.RedactionReady); tests replace them.
-	redact func(context.Context, []evidence.Event) ([]evidence.Event, error)
-	ready  func() error
+	// records, redact and ready are tacit's redaction (evidence.RedactRecordsContext, evidence.RedactEvents,
+	// evidence.RedactionReady); tests replace them. A source given redact and no records has no records mode:
+	// its texts go joined by the boundary through redact.
+	records func(context.Context, []string) ([]string, error)
+	redact  func(context.Context, []evidence.Event) ([]evidence.Event, error)
+	ready   func() error
 }
 
 func (Transcripts) Name() string { return store.Transcripts }
@@ -141,9 +144,12 @@ func (t *tally) fail(path string, err error) {
 }
 
 func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error) {
-	ready, redact := s.ready, s.redact
+	ready, records, redact := s.ready, s.records, s.redact
 	if ready == nil {
 		ready = evidence.RedactionReady
+	}
+	if records == nil && redact == nil {
+		records = evidence.RedactRecordsContext
 	}
 	if redact == nil {
 		redact = evidence.RedactEvents
@@ -204,7 +210,7 @@ func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error
 	if workers <= 0 {
 		workers = DefaultWorkers()
 	}
-	w := writer{st: st, redact: redact, t: t, source: s.Name()}
+	w := writer{st: st, records: records, redact: redact, t: t, source: s.Name()}
 	ch := make(chan *job)
 	var wg sync.WaitGroup
 	for range workers {
@@ -482,11 +488,13 @@ func (b *batch) add(p part) {
 // writer redacts batches and stores them: one writer at a time, each batch's events and the cursors after
 // them in one transaction.
 type writer struct {
-	mu     sync.Mutex
-	st     *store.Store
-	redact func(context.Context, []evidence.Event) ([]evidence.Event, error)
-	t      *tally
-	source string
+	mu      sync.Mutex
+	st      *store.Store
+	records func(context.Context, []string) ([]string, error) // nil: no records mode, the boundary
+	redact  func(context.Context, []evidence.Event) ([]evidence.Event, error)
+	t       *tally
+	source  string
+	joining sync.Once // the run's note that texts went joined by the boundary
 }
 
 // flush redacts a batch in as few scrump calls as its size allows and stores it. When redaction fails, each
@@ -577,76 +585,122 @@ func (w *writer) events(ctx context.Context, parts []part) ([][]store.Event, int
 	return byPart, unknown, nil
 }
 
-// boundary separates the texts of one scrump call, so each is masked as it would be alone. scrump scans its
-// input as one stream, and a hit that starts in one text can run into the next: a quoted value a cut left open
-// runs to the next quote, and a rule like `keyword(?:.|[\n\r]){0,1000}?secret` reaches across lines. Where it
-// runs in, it masks the start of the next text but ends where scrump resumes its scan, which can be inside a
-// secret of that text, past the key that marks it; a hit the rule's filter rejects masks nothing and still
-// moves the scan on. The boundary closes an open quoted value (its quotes), then is longer than the text
-// profile's longest reach across lines (1,000 bytes), and ends with a mark no secret's value starts with, so
-// no hit that starts in one text reaches the next.
+// boundary separates the texts of one scrump call when the installed scrump has no records mode, so each is
+// masked as it would be alone. scrump scans its input as one stream, and a hit that starts in one text can run
+// into the next: a quoted value a cut left open runs to the next quote, and a rule like
+// `keyword(?:.|[\n\r]){0,40}?secret` reaches across lines. Where it runs in, it masks the start of the next text
+// but ends where scrump resumes its scan, which can be inside a secret of that text, past the key that marks
+// it; a hit the rule's filter rejects masks nothing and still moves the scan on. The boundary closes an open
+// quoted value (its quotes), then is longer than the text profile's longest reach across lines (1,000 bytes),
+// and ends with a mark no secret's value starts with, so no hit that starts in one text reaches the next.
 var boundary = "\n#'\"\n" + strings.Repeat("\n", 1024) + "#\n"
 
-// mask redacts texts, at most redactBytes per scrump call: each call gets its texts joined by the boundary as
-// one text, and the redacted text is cut back at the same places, since masks keep the length.
-//
-// A text the call masked from its first byte, past any newlines (a hit ran in from the boundary's side,
-// which a rule longer than the boundary could do), is masked again on its own in one more call, as records,
-// and a byte stays masked when either call masked it.
+// mask redacts texts, at most redactBytes per scrump call. scrump's records mode (scrump 0.2.0 and later)
+// scans each text on its own, as a record (tacit's RedactRecordsContext): no hit can cross from one text into
+// the next, and scrump reads one separator per text, not a boundary (tacit adds its probe to its first call
+// of the process, and masks a text holding a separator in a call of its own). A scrump without records mode,
+// or one whose records tacit's probe shows are not kept apart, gets the texts joined by the boundary
+// (joined), and the run's result says so once.
 func (w *writer) mask(ctx context.Context, texts []string) ([]string, error) {
-	out := make([]string, len(texts))
-	var joined strings.Builder
+	out := make([]string, 0, len(texts))
 	for start := 0; start < len(texts); {
 		end, size := start, 0
-		// The texts' own bytes fill a call: the boundaries' newlines cost scrump little.
 		for end < len(texts) && (end == start || size+len(texts[end]) <= redactBytes) {
 			size += len(texts[end])
 			end++
 		}
-		joined.Reset()
-		for i := start; i < end; i++ {
-			if i > start {
-				joined.WriteString(boundary)
+		red, err := w.asRecords(ctx, texts[start:end])
+		if errors.Is(err, evidence.ErrNoRecords) {
+			if w.t != nil {
+				w.joining.Do(func() {
+					w.t.note("scrump has no records mode that keeps texts apart: texts went joined by the boundary, which is slower; install scrump 0.2.0 or later")
+				})
 			}
-			joined.WriteString(texts[i])
+			red, err = w.joined(ctx, texts[start:end])
 		}
-		red, err := w.redact(ctx, []evidence.Event{{Text: joined.String()}})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, red...)
+		start = end
+	}
+	return out, nil
+}
+
+// asRecords redacts texts in one call in scrump's records mode, or gives evidence.ErrNoRecords when the
+// installed scrump has none.
+func (w *writer) asRecords(ctx context.Context, texts []string) ([]string, error) {
+	if w.records == nil {
+		return nil, evidence.ErrNoRecords
+	}
+	red, err := w.records(ctx, texts)
+	if errors.Is(err, evidence.ErrNoRecords) {
+		return nil, err
+	}
+	if err != nil {
+		return nil, fmt.Errorf("redaction failed: %w", err)
+	}
+	if len(red) != len(texts) {
+		return nil, errors.New("redaction returned a different number of texts")
+	}
+	for i := range red {
+		if len(red[i]) != len(texts[i]) {
+			return nil, errors.New("redaction changed a text's length")
+		}
+	}
+	return red, nil
+}
+
+// joined redacts texts in one call that gets them joined by the boundary as one text, and cuts the redacted
+// text back at the same places, since masks keep the length.
+//
+// A text the call masked from its first byte, past any newlines (a hit ran in from the boundary's side,
+// which a rule longer than the boundary could do), is masked again on its own in one more call, as records,
+// and a byte stays masked when either call masked it.
+func (w *writer) joined(ctx context.Context, texts []string) ([]string, error) {
+	out := make([]string, len(texts))
+	var joined strings.Builder
+	for i, t := range texts {
+		if i > 0 {
+			joined.WriteString(boundary)
+		}
+		joined.WriteString(t)
+	}
+	red, err := w.redact(ctx, []evidence.Event{{Text: joined.String()}})
+	if err != nil {
+		return nil, fmt.Errorf("redaction failed: %w", err)
+	}
+	if len(red) != 1 || len(red[0].Text) != joined.Len() {
+		return nil, errors.New("redaction changed the text's length")
+	}
+	masked, at := red[0].Text, 0
+	var again []int
+	for i, t := range texts {
+		n := len(t)
+		out[i] = masked[at : at+n]
+		if first := strings.TrimLeft(out[i], "\n"); i > 0 && first != "" && first[0] == '*' {
+			again = append(again, i)
+		}
+		at += n + len(boundary)
+	}
+	if len(again) > 0 {
+		carriers := make([]evidence.Event, len(again))
+		for k, i := range again {
+			carriers[k].Text = texts[i]
+		}
+		alone, err := w.redact(ctx, carriers)
 		if err != nil {
 			return nil, fmt.Errorf("redaction failed: %w", err)
 		}
-		if len(red) != 1 || len(red[0].Text) != joined.Len() {
-			return nil, errors.New("redaction changed the text's length")
+		if len(alone) != len(again) {
+			return nil, errors.New("redaction returned a different number of texts")
 		}
-		masked, at := red[0].Text, 0
-		var again []int
-		for i := start; i < end; i++ {
-			n := len(texts[i])
-			out[i] = masked[at : at+n]
-			if first := strings.TrimLeft(out[i], "\n"); i > start && first != "" && first[0] == '*' {
-				again = append(again, i)
+		for k, i := range again {
+			if len(alone[k].Text) != len(out[i]) {
+				return nil, errors.New("redaction changed a text's length")
 			}
-			at += n + len(boundary)
+			out[i] = union(out[i], alone[k].Text)
 		}
-		if len(again) > 0 {
-			carriers := make([]evidence.Event, len(again))
-			for k, i := range again {
-				carriers[k].Text = texts[i]
-			}
-			alone, err := w.redact(ctx, carriers)
-			if err != nil {
-				return nil, fmt.Errorf("redaction failed: %w", err)
-			}
-			if len(alone) != len(again) {
-				return nil, errors.New("redaction returned a different number of texts")
-			}
-			for k, i := range again {
-				if len(alone[k].Text) != len(out[i]) {
-					return nil, errors.New("redaction changed a text's length")
-				}
-				out[i] = union(out[i], alone[k].Text)
-			}
-		}
-		start = end
 	}
 	return out, nil
 }

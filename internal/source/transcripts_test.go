@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -151,7 +152,26 @@ func masked(_ context.Context, evs []evidence.Event) ([]evidence.Event, error) {
 func ready() error { return nil }
 
 func transcripts(home string) Transcripts {
-	return Transcripts{Homes: []string{home}, redact: masked, ready: ready}
+	return Transcripts{Homes: []string{home}, records: recordsVia(masked), redact: masked, ready: ready}
+}
+
+// recordsVia is a records redactor made of an events redactor: each text an event of its own.
+func recordsVia(redact func(context.Context, []evidence.Event) ([]evidence.Event, error)) func(context.Context, []string) ([]string, error) {
+	return func(ctx context.Context, texts []string) ([]string, error) {
+		evs := make([]evidence.Event, len(texts))
+		for i, t := range texts {
+			evs[i].Text = t
+		}
+		red, err := redact(ctx, evs)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]string, len(red))
+		for i, e := range red {
+			out[i] = e.Text
+		}
+		return out, nil
+	}
 }
 
 // bySummary finds the one stored event of a kind whose summary contains s.
@@ -413,7 +433,7 @@ func TestTranscriptsStoreNothingTheyCouldNotRedact(t *testing.T) {
 		return masked(ctx, evs)
 	}
 	// One worker: both files go to scrump in one call, which fails, and then each on its own.
-	src := Transcripts{Homes: []string{home}, Workers: 1, redact: failCodex, ready: ready}
+	src := Transcripts{Homes: []string{home}, Workers: 1, records: recordsVia(failCodex), redact: failCodex, ready: ready}
 	r, err := src.Ingest(context.Background(), st)
 	if err == nil || !strings.Contains(strings.Join(r.Notes, "\n"), xpath) {
 		t.Fatalf("a redaction failure must be named: %v %+v", err, r.Notes)
@@ -469,12 +489,13 @@ func TestTranscriptsRedactWithScrump(t *testing.T) {
 	}
 }
 
-// A batch's texts reach scrump as one text, in one call, each masked as it would be alone. A cut that leaves
-// a quoted value open (scrump masks it up to the next quote) or a rule that reaches across lines does not run
-// into the next text and hide a secret there: past a quote that closes it, past the start of a text that
-// opens with a newline, past a hit the rule's filter rejects (a setting, a reference to a vault). The same
-// holds between an agent text's head and tail. As separate records the batch was split and masked again, half
-// by half (9 calls here).
+// A batch's texts reach scrump in one call, each masked as it would be alone: as records with a scrump that
+// has records mode, joined by the boundary with one that has not. A cut that leaves a quoted value open
+// (scrump masks it up to the next quote) or a rule that reaches across lines does not run into the next text
+// and hide a secret there: past a quote that closes it, past the start of a text that opens with a newline,
+// past a hit the rule's filter rejects (a setting, a reference to a vault). The same holds between an agent
+// text's head and tail. As separate records in one stream the batch was split and masked again, half by half
+// (9 calls here).
 func TestTranscriptsRedactABatchInOneCallEachTextAsAlone(t *testing.T) {
 	if err := evidence.RedactionReady(); err != nil {
 		t.Skip("needs scrump with its text profile:", err)
@@ -485,10 +506,14 @@ func TestTranscriptsRedactABatchInOneCallEachTextAsAlone(t *testing.T) {
 	}
 	shim := t.TempDir()
 	calls := filepath.Join(shim, "calls")
-	script := "#!/bin/sh\necho call >> '" + calls + "'\nexec '" + real + "' \"$@\"\n"
+	// Each call's arguments, and its input in in.<n>.
+	script := "#!/bin/sh\nn=$(wc -l < '" + calls + "' 2>/dev/null || echo 0)\necho \"$*\" >> '" + calls + "'\n" +
+		"tee '" + shim + "/in.'$((n+0)) | '" + real + "' \"$@\"\n"
 	if err := os.WriteFile(filepath.Join(shim, "scrump"), []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	help, _ := exec.Command(real, "--help").Output()
+	hasRecords := strings.Contains(string(help), "--records")
 	home := testHome(t)
 	t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
 	pw := "pass" + "word"
@@ -536,9 +561,77 @@ func TestTranscriptsRedactABatchInOneCallEachTextAsAlone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// One call proves redaction can run, one masks the batch.
-	if n := strings.Count(string(b), "call"); n != 2 {
-		t.Fatalf("%d scrump calls, want 2", n)
+	// One call proves redaction can run, one masks the batch as records. A scrump without records mode
+	// refuses the flag (a usage error, before any scan; tacit asks once a process) and one call masks the
+	// batch joined.
+	got := strings.Split(strings.TrimSpace(string(b)), "\n")
+	plain, records := "--profile text scrub - -o -", "--profile text --records scrub - -o -"
+	if !hasRecords {
+		got = slices.DeleteFunc(got, func(c string) bool { return c == records })
+		if want := []string{plain, plain}; strings.Join(got, "|") != strings.Join(want, "|") {
+			t.Fatalf("scrump calls %q, want %q", got, want)
+		}
+		return
+	}
+	if want := []string{plain, records}; strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("scrump calls %q, want %q", got, want)
+	}
+	// The texts went as records: separated, with no boundary between them.
+	in, err := os.ReadFile(filepath.Join(shim, "in.1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(in), boundary) || strings.Count(string(in), "\x1e") < 11 {
+		t.Fatalf("the records call got %d separators and the boundary %v", strings.Count(string(in), "\x1e"), strings.Contains(string(in), boundary))
+	}
+}
+
+// With records mode a batch is masked as records in one call and nothing is joined; a scrump without it gives
+// ErrNoRecords, and the batch goes joined by the boundary. Any other failure fails the batch.
+func TestTranscriptsMaskAsRecordsWhenScrumpHasThem(t *testing.T) {
+	texts := []string{"a value OPEN here", "abc then tok_" + strings.Repeat("Ab3", 10) + " end"}
+	var joined []string
+	redact := func(ctx context.Context, evs []evidence.Event) ([]evidence.Event, error) {
+		for _, e := range evs {
+			joined = append(joined, e.Text)
+		}
+		return masked(ctx, evs)
+	}
+	var asRecords [][]string
+	records := func(_ context.Context, ts []string) ([]string, error) {
+		asRecords = append(asRecords, ts)
+		return recordsVia(masked)(context.Background(), ts)
+	}
+	w := writer{records: records, redact: redact}
+	got, err := w.mask(context.Background(), texts)
+	if err != nil || len(asRecords) != 1 || len(asRecords[0]) != 2 || len(joined) != 0 {
+		t.Fatalf("records mode: %v, records calls %q, joined %q", err, asRecords, joined)
+	}
+	if got[0] != texts[0] || strings.Contains(got[1], "tok_") || !strings.HasSuffix(got[1], " end") {
+		t.Fatalf("records mode masked %q", got)
+	}
+
+	w.records = func(context.Context, []string) ([]string, error) { return nil, evidence.ErrNoRecords }
+	w.t = &tally{failed: map[string]bool{}}
+	got, err = w.mask(context.Background(), texts)
+	if err != nil || len(joined) != 1 || !strings.Contains(joined[0], boundary) || strings.Contains(got[1], "tok_") {
+		t.Fatalf("without records mode: %v, joined %d, %q", err, len(joined), got)
+	}
+	if notes := strings.Join(w.t.res.Notes, "\n"); !strings.Contains(notes, "joined by the boundary") {
+		t.Fatalf("the fallback left no note: %q", notes)
+	}
+
+	// Records that do not line up with the texts fail the batch.
+	for name, bad := range map[string][]string{"one record short": {texts[0]}, "a record cut": {texts[0], "abc"}} {
+		w.records = func(context.Context, []string) ([]string, error) { return bad, nil }
+		if got, err := w.mask(context.Background(), texts); err == nil || len(joined) != 1 {
+			t.Fatalf("%s: %q %v, joined %d", name, got, err, len(joined))
+		}
+	}
+
+	w.records = func(context.Context, []string) ([]string, error) { return nil, errors.New("scrump: exit status 1") }
+	if got, err := w.mask(context.Background(), texts); err == nil || len(joined) != 1 {
+		t.Fatalf("a failed records call: %q %v, joined %d", got, err, len(joined))
 	}
 }
 
@@ -625,7 +718,7 @@ func TestTranscriptsReadHermesSessionsByTheirLastRow(t *testing.T) {
 	if _, err := db.Exec(`insert into messages (session_id, role, content, timestamp) values ('phone', 'user', 'and the logs', 105)`); err != nil {
 		t.Fatal(err)
 	}
-	if r := ingest(t, Transcripts{Homes: []string{home, t.TempDir()}, redact: masked, ready: ready}, st); r.Read != 1 {
+	if r := ingest(t, Transcripts{Homes: []string{home, t.TempDir()}, records: recordsVia(masked), redact: masked, ready: ready}, st); r.Read != 1 {
 		t.Fatalf("a store found through two homes: %+v, want the one new row read once", r)
 	}
 	if os.Geteuid() != 0 {
@@ -670,7 +763,7 @@ func TestTranscriptsReadOnWhenALaterPartWasNotStored(t *testing.T) {
 		}
 		return masked(ctx, evs)
 	}
-	r, err := (Transcripts{Homes: []string{home}, Workers: 1, redact: failLast, ready: ready}).Ingest(context.Background(), st)
+	r, err := (Transcripts{Homes: []string{home}, Workers: 1, records: recordsVia(failLast), redact: failLast, ready: ready}).Ingest(context.Background(), st)
 	if err == nil || r.New != 6 {
 		t.Fatalf("first run %+v %v, want the 6 items before the last stored and a failure", r, err)
 	}
