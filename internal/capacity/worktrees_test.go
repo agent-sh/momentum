@@ -162,9 +162,14 @@ func TestAWorktreeOfARepositorySomeoneWorksInStays(t *testing.T) {
 		name     string
 		proc     []fakeProc
 		sessions map[int]Session
+		touch    string // a path under the fixture changed 10 minutes ago
 	}{
-		{"a shell in the main checkout", []fakeProc{{pid: 3, ppid: 1, argv: []string{"bash"}}}, nil},
-		{"an agent session in another worktree", nil, map[int]Session{-1: {Key: "s9", Name: "fixing", Tool: "codex"}}},
+		{"a shell in the main checkout", []fakeProc{{pid: 3, ppid: 1, argv: []string{"bash"}}}, nil, ""},
+		{"an agent session in another worktree", nil, map[int]Session{-1: {Key: "s9", Name: "fixing", Tool: "codex"}}, ""},
+		// an agent between two commands runs nothing there, but its last command changed something
+		{"a file made in another worktree 10 minutes ago", nil, nil, "cache/ahead"},
+		{"a commit in the main checkout 10 minutes ago", nil, nil, "clone/.git/logs/HEAD"},
+		{"an add in another worktree 10 minutes ago", nil, nil, "clone/.git/worktrees/gone/index"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			clone, wts := worktreesFixture(t)
@@ -176,6 +181,9 @@ func TestAWorktreeOfARepositorySomeoneWorksInStays(t *testing.T) {
 				c.sessions[k] = s
 			}
 			now := time.Now().Add(2 * time.Hour)
+			if c.touch != "" {
+				must(t, os.Chtimes(filepath.Join(filepath.Dir(clone), c.touch), now, now.Add(-10*time.Minute)))
+			}
 			cfg := Config{Worktrees: WorktreesConfig{Roots: []string{wts}}}.Normal()
 			cfg.Live = []string{RuleWorktrees}
 			o := options(t, procRoot(t, c.proc...), now, nil)
@@ -192,5 +200,48 @@ func TestAWorktreeOfARepositorySomeoneWorksInStays(t *testing.T) {
 				t.Error("it was removed")
 			}
 		})
+	}
+}
+
+func TestAFetchInTheRepositoryIsNoOneAtWork(t *testing.T) {
+	for _, bare := range []bool{false, true} {
+		clone, wts := worktreesFixture(t)
+		hub := clone
+		if bare { // a bare clone that holds the worktrees, as some lanes keep one
+			hub = filepath.Join(filepath.Dir(clone), "hub.git")
+			gitT(t, clone, "clone", "-q", "--bare", filepath.Join(filepath.Dir(clone), "remote.git"), hub)
+			gitT(t, hub, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+			gitT(t, hub, "fetch", "-q", "origin")
+			gitT(t, hub, "remote", "set-head", "origin", "main")
+			m := filepath.Join(wts, "hubbed")
+			gitT(t, hub, "worktree", "add", "-q", "-b", "feat/hubbed", m, "origin/main")
+			write(t, filepath.Join(m, "h"), "h\n")
+			gitT(t, m, "add", ".")
+			gitT(t, m, "commit", "-qm", "h")
+			gitT(t, m, "push", "-q", "-u", "origin", "feat/hubbed")
+			gitT(t, m, "push", "-q", "origin", "feat/hubbed:main")
+			gitT(t, hub, "fetch", "-q", "origin")
+		}
+		now := time.Now().Add(2 * time.Hour)
+		store := filepath.Join(hub, ".git")
+		if bare {
+			store = hub
+		}
+		for _, p := range []string{store, filepath.Join(store, "objects"), filepath.Join(store, "refs", "remotes", "origin")} {
+			must(t, os.Chtimes(p, now, now.Add(-10*time.Minute)))
+		}
+		cfg := Config{Worktrees: WorktreesConfig{Roots: []string{wts}}}.Normal()
+		cfg.Live = []string{RuleWorktrees}
+		res, err := Run(context.Background(), cfg, openStore(t), options(t, procRoot(t), now, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := "merged"
+		if bare {
+			name = "hubbed"
+		}
+		if f := findings(res, RuleWorktrees)[filepath.Join(wts, name)]; f.Action != ActDelete || !f.Done {
+			t.Errorf("bare %v: a fetch 10 minutes ago is no one at work: %+v", bare, f)
+		}
 	}
 }
