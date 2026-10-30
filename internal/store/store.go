@@ -1,6 +1,7 @@
-// Package store is momentum's local SQLite store: normalized events from every source, and the state that
-// makes ingestion incremental. The events are kept: a schema change migrates them and never drops them, since a
-// harness deletes its transcripts after a while and the observations of `momentum sessions` are nowhere else.
+// Package store is momentum's local SQLite store: normalized events from every source, the notes its report
+// shows, and the state that makes ingestion incremental. The events are kept: a schema change migrates them and
+// never drops them, since a harness deletes its transcripts after a while and the observations of `momentum
+// sessions` are nowhere else. The notes are kept too: nothing derives them.
 // What the sources and the session trackers derive from what they read (where each stopped, their checkpoints)
 // is a cache: a schema change drops it, and the next run reads again. A source that reads a signal store can be
 // dropped and read again (Rebuild); the transcripts only when forced, the observations never. Bulky material
@@ -95,23 +96,29 @@ type querier interface {
 
 // The store's tables are of two kinds.
 //
-// Kept tables hold what cannot be read again: every event, and when each live session entered its phase. A
-// schema change migrates them and never drops them. A kept table that is missing is made with the columns it was
-// first made with (keptTables), it gains each later column it lacks (keptColumns), and its rows change only in a
-// step or by its triggers (keptTriggers).
+// Kept tables hold what cannot be read again: every event, when each live session entered its phase, and the notes
+// (notes.go). A schema change migrates them and never drops them. A kept table that is missing is made with the
+// columns it was first made with (keptTables), it gains each later column it lacks (keptColumns), and its rows
+// change only in a step or by its triggers (keptTriggers).
 //
 // Derived tables hold what the sources and the session trackers derived from what they read: where each source
 // stopped (with tacit's saved reader state), the files it parsed, what it could not parse, and the trackers'
 // checkpoints. A step that reads again drops them, so the next ingest reads every source again from its start, and
 // the next sessions run reads every transcript once (PutFiles says what reading again keeps).
 
-// keptTables makes the kept tables as they were first made, and schema_steps, the steps a store has taken.
+// keptTables makes the kept tables as they were first made, and schema_steps, the steps a store has taken. A new
+// kept table changes no row, so it takes no step: a store from before it gains it at the next open, and a build
+// from before it, which never reads it, keeps working on the store (parallel change).
 const keptTables = `
 CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, source TEXT NOT NULL, source_key TEXT NOT NULL,
   ts INTEGER NOT NULL, actor TEXT NOT NULL, kind TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_stamps (key TEXT PRIMARY KEY, phase TEXT NOT NULL, since INTEGER NOT NULL,
   seq INTEGER NOT NULL, seen INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS schema_steps (version INTEGER PRIMARY KEY, at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT '', effect TEXT NOT NULL DEFAULT '', links TEXT NOT NULL DEFAULT '[]',
+  source TEXT NOT NULL DEFAULT '', importance INTEGER NOT NULL DEFAULT 0, at INTEGER NOT NULL,
+  done INTEGER NOT NULL DEFAULT 0);
 `
 
 // keptColumns are the columns each kept table gained after it was first made, in order. A table that lacks one
@@ -255,6 +262,40 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db, path: path}, nil
 }
 
+// ErrNotCurrent means a store is not this build's schema. The next open of a build that writes migrates it (a
+// sessions run, an ingest, a note); a store a newer build migrated is refused by every open of this build.
+var ErrNotCurrent = errors.New("the store is not this build's schema")
+
+// OpenReadOnly opens a store to read it as it is: it makes no store, migrates nothing, writes no row and takes no
+// lock. SQLite may make the -wal and -shm files a reader of a WAL store needs, with the store's mode; the next writer
+// removes them. A missing store is an error, and so is one that is not this build's schema (ErrNotCurrent), which
+// this build would misread.
+func OpenReadOnly(path string) (*Store, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("no store to read: %w; a sessions run, an ingest or a note makes it", err)
+	}
+	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(%d)", path, BusyTimeout.Milliseconds()))
+	if err != nil {
+		return nil, err
+	}
+	ok, err := current(db)
+	if err == nil && !ok {
+		switch v, verr := version(db); {
+		case verr != nil:
+			err = verr
+		case v > latest():
+			err = fmt.Errorf("%w: its schema is version %d, newer than this build's %d", ErrNotCurrent, v, latest())
+		default:
+			err = fmt.Errorf("%w yet: the next sessions run, ingest or note of this build migrates it", ErrNotCurrent)
+		}
+	}
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store %s: %w", path, err)
+	}
+	return &Store{db: db, path: path}, nil
+}
+
 // busy reports SQLITE_BUSY, or one of its extended codes.
 func busy(err error) bool {
 	var c interface{ Code() int }
@@ -262,7 +303,7 @@ func busy(err error) bool {
 }
 
 // keptTableNames are the tables keptTables makes.
-var keptTableNames = []string{"events", "session_stamps", "schema_steps"}
+var keptTableNames = []string{"events", "session_stamps", "schema_steps", "notes"}
 
 // checkpointColumns are the columns the schema gives the checkpoint tables. They are a cache of what transcripts
 // hold, so tables with other columns (a build before this one made them) are dropped and made again, and the next

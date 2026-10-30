@@ -5,6 +5,7 @@ package term
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,11 +42,15 @@ func command(ctx context.Context, name string, args ...string) *exec.Cmd {
 	return cmd
 }
 
-// ListPanes returns every pane of the default tmux server. No tmux, or no server, is no panes.
+// ListPanes returns every pane of the default tmux server. No tmux, or no server, is no panes. A tmux that does
+// not answer in time, or by the caller's deadline, is an error: its panes are unknown, not gone.
 func ListPanes(ctx context.Context) ([]Pane, error) {
 	ctx, cancel := context.WithTimeout(ctx, Timeout)
 	defer cancel()
 	out, err := command(ctx, "tmux", "list-panes", "-a", "-F", paneFormat).Output()
+	if err != nil && ctx.Err() != nil { // killed on its context, which also exits with an error
+		return nil, fmt.Errorf("tmux list-panes: %w", ctx.Err())
+	}
 	var exit *exec.ExitError
 	if errors.Is(err, exec.ErrNotFound) || errors.As(err, &exit) {
 		return nil, nil

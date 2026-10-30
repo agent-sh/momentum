@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -141,10 +142,11 @@ func (r *Run) Put(evs []Event) (int, error) { return put(r.ctx, r.tx, evs) }
 // Trackers is the store's side of the session trackers' checkpoints for one build of momentum. It hands a
 // source the checkpoint an earlier run of the same build saved; a checkpoint of another build is not handed out,
 // since its state may mean something else to this code. It remembers what it handed out, so a run rewrites only
-// the checkpoints that moved.
+// the checkpoints that moved. Sources scanned at once may ask it at once.
 type Trackers struct {
 	s     *Store
 	build string
+	mu    sync.Mutex
 	held  map[string][]byte // tool and key -> the state the store holds
 }
 
@@ -203,7 +205,9 @@ func (t *Trackers) Checkpoint(ctx context.Context, tool, key string) (*sessions.
 	if base+len(items) != end {
 		return nil, fmt.Errorf("its log holds %d entries, not %d", len(items), end-base)
 	}
+	t.mu.Lock()
 	t.held[tool+"\x00"+key] = st
+	t.mu.Unlock()
 	l := sessions.Kept(base, items)
 	return &sessions.Checkpoint{Tool: tool, Key: key, State: st, Log: &l}, nil
 }
@@ -216,7 +220,9 @@ func (r *Run) SaveCheckpoints(t *Trackers, cps []sessions.Checkpoint, now time.T
 	for _, cp := range cps {
 		id := cp.Tool + "\x00" + cp.Key
 		from, items := cp.Log.Unsaved()
+		t.mu.Lock()
 		held, ok := t.held[id]
+		t.mu.Unlock()
 		if ok {
 			var cur []byte
 			err := r.tx.QueryRowContext(r.ctx, `SELECT state FROM trackers WHERE tool = ? AND key = ? AND build = ?`, cp.Tool, cp.Key, t.build).Scan(&cur)
@@ -256,7 +262,12 @@ func (r *Run) SaveCheckpoints(t *Trackers, cps []sessions.Checkpoint, now time.T
 			}
 		}
 		cp := cp
-		r.after = append(r.after, func() { cp.Log.Saved(); t.held[id] = cp.State })
+		r.after = append(r.after, func() {
+			cp.Log.Saved()
+			t.mu.Lock()
+			t.held[id] = cp.State
+			t.mu.Unlock()
+		})
 	}
 	return nil
 }

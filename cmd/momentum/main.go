@@ -18,6 +18,7 @@ import (
 
 	"github.com/agent-sh/momentum/internal/config"
 	"github.com/agent-sh/momentum/internal/paths"
+	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/source"
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -37,12 +38,22 @@ const usage = `usage:
                                         their events have no source left)
   momentum sessions [--json] [--all]    the live agent sessions and their phases, read without a model;
                                         each phase change is kept as an event of source sessions
+  momentum report [--json]              what needs the owner, what was decided and shipped in the last 7 days,
+                                        what runs now and what momentum could not fix; changes nothing.
+                                        --json prints the one object the owner's views read
+  momentum note add --kind needs|decided|shipped|problem --title T [--detail D] [--effect E]
+                    [--link LABEL=URL]... [--id ID] [--source S] [--importance high|normal|low]
+                                        a note for the report; prints its id, and an id stored already is replaced
+  momentum note done ID                 take a note out of the report: resolve a needs or problem note,
+                                        withdraw a decided or shipped one
+  momentum note list [--json]           every note, newest first, and whether the report shows it
   momentum version
 Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json).
 The store is $MOMENTUM_HOME/momentum.db (default ~/.local/share/momentum).
 DUR is a Go duration or a number of days, e.g. 36h or 7d; WHEN is a DUR ago or a local time, e.g. 2026-01-02T15:04.
 Exit: 0 done, 2 usage or configuration error,
-3 error (for ingest and sessions: at least one source failed; the others still ran).`
+3 error (for ingest and sessions: at least one source failed; the others still ran; a report whose scan of a
+harness failed or was not done within 3 s still prints, exits 0 and names it on stderr).`
 
 type usageError struct{ msg string }
 
@@ -63,6 +74,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		err = evidence(ctx, args[1:], stdout, stderr)
 	case "sessions":
 		err = sessionsCmd(ctx, args[1:], stdout, stderr)
+	case "report":
+		err = reportCmd(ctx, args[1:], stdout, stderr)
+	case "note":
+		err = noteCmd(ctx, args[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintln(stdout, "momentum", version)
 	case "-h", "--help", "help":
@@ -226,7 +241,9 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		if e.Agent != "" {
 			tag += " [subagent " + e.Agent + "]"
 		}
-		fmt.Fprintf(stdout, "%s  %-15s %-8s %-16s %s%s\n", e.TS.Local().Format("01-02 15:04:05"), e.Source, e.Actor, what, e.Summary, tag)
+		// Plain text: a summary holds what agents and tools wrote, which must not act on the terminal.
+		fmt.Fprintf(stdout, "%s  %-15s %-8s %-16s %s%s\n", e.TS.Local().Format("01-02 15:04:05"), e.Source, e.Actor, plain.Line(what),
+			plain.Line(e.Summary), plain.Line(tag))
 	}
 	return nil
 }
