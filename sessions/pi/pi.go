@@ -5,9 +5,12 @@ package pi
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -21,33 +24,65 @@ import (
 const Retain = 15 * time.Minute
 
 type call struct {
-	name string
-	desc string
-	at   time.Time
+	Name string    `json:"name"`
+	Desc string    `json:"desc"`
+	At   time.Time `json:"at"`
 }
 
-// Tracker follows one pi session file.
+// Tracker follows one pi session file. It reads the file once from the start and then only what was appended, or
+// resumes from a checkpoint and reads only what came after it.
 type Tracker struct {
 	rd jsonl.Reader
 	st track
 }
 
+// track is what the session file's lines decided, and nothing else, so a checkpoint of it fed the rest of the file
+// ends where a full re-read ends. A checkpoint saves every exported field; the log is saved apart.
 type track struct {
-	open     bool
-	lastText string
-	errText  string
-	calls    map[string]*call
+	Open     bool             `json:"open"`
+	LastText string           `json:"last_text"`
+	ErrText  string           `json:"err_text"`
+	Calls    map[string]*call `json:"calls"`
+	Model    string           `json:"model"`
 	log      sessions.Log
-	model    string
 }
 
 // NewTracker follows the session file at path.
 func NewTracker(path string) *Tracker {
-	return &Tracker{rd: jsonl.Reader{Path: path}, st: track{calls: map[string]*call{}}}
+	return &Tracker{rd: jsonl.Reader{Path: path}, st: track{Calls: map[string]*call{}}}
 }
 
 // Log is the session's activity log.
 func (t *Tracker) Log() *sessions.Log { return &t.st.log }
+
+// checkpointState is a Tracker's checkpoint: where it stands in the file and what the lines so far decided.
+type checkpointState struct {
+	Pos   jsonl.Position `json:"pos"`
+	Track track          `json:"track"`
+}
+
+// State encodes where the tracker stands and what it derived, without its log, for a Checkpoint.
+func (t *Tracker) State() ([]byte, error) {
+	return json.Marshal(checkpointState{Pos: t.rd.Position(), Track: t.st})
+}
+
+// Resume continues from a checkpoint of this file. The next Update reads what came after it, or starts over when
+// the file is no longer the one the checkpoint read.
+func (t *Tracker) Resume(cp *sessions.Checkpoint) error {
+	var s checkpointState
+	if err := json.Unmarshal(cp.State, &s); err != nil {
+		return err
+	}
+	if s.Track.Calls == nil {
+		s.Track.Calls = map[string]*call{}
+	}
+	if cp.Log != nil {
+		s.Track.log = *cp.Log
+	}
+	t.rd.Resume(s.Pos)
+	t.st = s.Track
+	return nil
+}
 
 type piLine struct {
 	Type      string `json:"type"`
@@ -70,7 +105,7 @@ type piLine struct {
 
 // Update reads what was appended; a file that shrank or was replaced is read again from the start.
 func (t *Tracker) Update() int64 {
-	return t.rd.Read(func() { t.st = track{calls: map[string]*call{}} }, t.line)
+	return t.rd.Read(func() { t.st = track{Calls: map[string]*call{}} }, t.line)
 }
 
 func (t *Tracker) line(raw []byte) {
@@ -81,7 +116,7 @@ func (t *Tracker) line(raw []byte) {
 	st := &t.st
 	at, _ := time.Parse(time.RFC3339Nano, e.Timestamp)
 	if e.Type == "model_change" {
-		st.model = e.ModelID
+		st.Model = e.ModelID
 	}
 	if e.Type != "message" || e.Message == nil {
 		return
@@ -89,38 +124,38 @@ func (t *Tracker) line(raw []byte) {
 	m := e.Message
 	switch m.Role {
 	case "user":
-		st.open, st.errText = true, ""
+		st.Open, st.ErrText = true, ""
 		for _, c := range m.Content {
 			if c.Type == "text" {
 				st.log.Add(sessions.Entry{Role: sessions.RoleUser, Text: text.OneLine(c.Text, 1200)})
 			}
 		}
 	case "toolResult":
-		delete(st.calls, m.ToolCallID)
-		st.open = true
+		delete(st.Calls, m.ToolCallID)
+		st.Open = true
 		for _, c := range m.Content {
 			if c.Type == "text" {
 				st.log.Add(sessions.Entry{Role: sessions.RoleOut, Text: text.OneLine(c.Text, 160)})
 			}
 		}
 	case "assistant":
-		st.calls = map[string]*call{}
+		st.Calls = map[string]*call{}
 		for _, c := range m.Content {
 			switch c.Type {
 			case "text":
 				if strings.TrimSpace(c.Text) != "" {
-					st.lastText = c.Text
+					st.LastText = c.Text
 					st.log.Add(sessions.Entry{Role: sessions.RoleAssistant, Text: text.OneLine(c.Text, 900)})
 				}
 			case "toolCall":
 				d := text.Describe(c.Name, c.Arguments)
-				st.calls[c.ID] = &call{name: c.Name, desc: d, at: at}
+				st.Calls[c.ID] = &call{Name: c.Name, Desc: d, At: at}
 				st.log.Add(sessions.Entry{Role: sessions.RoleTool, Name: c.Name, Text: text.OneLine(d, 200)})
 			}
 		}
-		st.open = m.StopReason == "toolUse"
+		st.Open = m.StopReason == "toolUse"
 		if m.StopReason == "error" {
-			st.errText = text.OneLine(m.Error, 200)
+			st.ErrText = text.OneLine(m.Error, 200)
 		}
 	}
 }
@@ -151,8 +186,10 @@ func SessionDir(agentDir, cwd string) string {
 // Source finds pi processes and reads the session file each one writes.
 type Source struct {
 	Env      sessions.Env
+	saved    sessions.Saved
 	trackers map[string]*Tracker
 	seen     map[string]time.Time
+	now      time.Time // the last scan's
 }
 
 // New reads pi sessions.
@@ -162,6 +199,49 @@ func (src *Source) Tool() string { return "pi" }
 
 func (src *Source) Close() error { return nil }
 
+// Resume makes later scans start a session file they meet for the first time from its checkpoint in saved.
+func (src *Source) Resume(saved sessions.Saved) { src.saved = saved }
+
+// Checkpoints returns the checkpoint of every session file the last Scan read.
+func (src *Source) Checkpoints() []sessions.Checkpoint {
+	var out []sessions.Checkpoint
+	for path, at := range src.seen {
+		if !at.Equal(src.now) {
+			continue
+		}
+		t := src.trackers[path]
+		if state, err := t.State(); err == nil {
+			out = append(out, sessions.Checkpoint{Tool: src.Tool(), Key: path, State: state, Log: t.Log()})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
+// tracker returns the session file's tracker: the one kept from an earlier scan, else one resumed from its
+// checkpoint, else a new one that reads from the start. A checkpoint that cannot be read is reported, and the file
+// is read from the start.
+func (src *Source) tracker(ctx context.Context, path string) (*Tracker, error) {
+	if t := src.trackers[path]; t != nil {
+		return t, nil
+	}
+	t := NewTracker(path)
+	src.trackers[path] = t
+	if src.saved == nil {
+		return t, nil
+	}
+	cp, err := src.saved.Checkpoint(ctx, src.Tool(), path)
+	if err == nil && cp != nil {
+		if err = t.Resume(cp); err != nil {
+			*t = *NewTracker(path)
+		}
+	}
+	if err != nil {
+		return t, fmt.Errorf("checkpoint of %s: %w", path, err)
+	}
+	return t, nil
+}
+
 // Scan returns the session of every pi process. A pi process's session is the file created in its window
 // (after it started, before the next pi in the same directory started); a resumed session was created earlier,
 // so it falls back to the newest file it has written to since it started.
@@ -169,6 +249,7 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 	if src.trackers == nil {
 		src.trackers, src.seen = map[string]*Tracker{}, map[string]time.Time{}
 	}
+	src.now = w.Now
 	var ps []*proc.Proc
 	for _, p := range w.Procs.ByPID {
 		if p.Has("-p", "--print") {
@@ -180,10 +261,13 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 	}
 	used := map[string]bool{}
 	var out []*sessions.Session
+	var errs []error
 	for _, slot := range w.Procs.Slots(ps) {
-		if s := src.session(slot, used, w); s != nil {
+		s, err := src.session(ctx, slot, used, w)
+		if s != nil {
 			out = append(out, s)
 		}
+		errs = append(errs, err)
 	}
 	for path, at := range src.seen {
 		if w.Now.Sub(at) > Retain {
@@ -191,10 +275,12 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 			delete(src.seen, path)
 		}
 	}
-	return out, nil
+	return out, errors.Join(errs...)
 }
 
-func (src *Source) session(slot proc.Slot, used map[string]bool, w *sessions.World) *sessions.Session {
+// session finds and reads the session of one pi process. The error is a checkpoint that could not be read; the
+// session is read all the same.
+func (src *Source) session(ctx context.Context, slot proc.Slot, used map[string]bool, w *sessions.World) (*sessions.Session, error) {
 	p := slot.Proc
 	files, _ := filepath.Glob(filepath.Join(SessionDir(src.Env.PiDir, slot.Cwd), "*.jsonl"))
 	best, bestT, fallback, fallbackT := "", time.Time{}, "", time.Time{}
@@ -216,14 +302,10 @@ func (src *Source) session(slot proc.Slot, used map[string]bool, w *sessions.Wor
 		best, bestT = fallback, fallbackT
 	}
 	if best == "" {
-		return nil
+		return nil, nil
 	}
 	used[best] = true
-	t := src.trackers[best]
-	if t == nil {
-		t = NewTracker(best)
-		src.trackers[best] = t
-	}
+	t, err := src.tracker(ctx, best)
 	src.seen[best] = w.Now
 	project := src.Env.Project(slot.Cwd)
 	s := &sessions.Session{Key: "pi:" + strings.TrimSuffix(filepath.Base(best), ".jsonl"), Tool: "pi", Name: "pi in " + project,
@@ -231,16 +313,17 @@ func (src *Source) session(slot proc.Slot, used map[string]bool, w *sessions.Wor
 		Transcript: best}
 	s.Size = t.Update()
 	s.Log = &t.st.log
-	s.Model = t.st.model
-	s.LastText = strings.TrimSpace(t.st.lastText)
-	s.TurnOpen = t.st.open
-	for _, c := range t.st.calls {
-		if c.at.After(s.NowSince) {
-			s.Now, s.NowSince = text.OneLine(c.name+": "+c.desc, 140), c.at
+	s.Model = t.st.Model
+	s.LastText = strings.TrimSpace(t.st.LastText)
+	s.TurnOpen = t.st.Open
+	nowID := ""
+	for id, c := range t.st.Calls { // the latest call; of two at once, the first by id
+		if c.At.After(s.NowSince) || c.At.Equal(s.NowSince) && id < nowID {
+			s.Now, s.NowSince, nowID = text.OneLine(c.Name+": "+c.Desc, 140), c.At, id
 		}
 	}
-	if t.st.errText != "" && !t.st.open {
-		s.Ask, s.AskKind = "stopped on an error: "+t.st.errText, sessions.AskError
+	if t.st.ErrText != "" && !t.st.Open {
+		s.Ask, s.AskKind = "stopped on an error: "+t.st.ErrText, sessions.AskError
 	}
-	return s
+	return s, err
 }

@@ -28,7 +28,8 @@ const usage = `usage:
   momentum evidence events [--since DUR] [--kind K,K] [--source S] [--limit N] [--json]   events, newest first
   momentum evidence status [--since DUR]   events per source and kind, and unparsed records
   momentum evidence rebuild SOURCE      drop what SOURCE contributed; the next ingest reads it from the start
-  momentum sessions [--json] [--all]    the live agent sessions and their phases, read without a model
+  momentum sessions [--json] [--all]    the live agent sessions and their phases, read without a model;
+                                        each phase change is kept as an event of source sessions
   momentum version
 Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json).
 The store is $MOMENTUM_HOME/momentum.db (default ~/.local/share/momentum).
@@ -237,7 +238,9 @@ func rebuild(ctx context.Context, name string, stdout io.Writer) error {
 		return err
 	}
 	defer st.Close()
-	if err := st.Rebuild(ctx, name); err != nil {
+	if err := st.Rebuild(ctx, name); errors.Is(err, store.ErrObserved) {
+		return usageError{err.Error()}
+	} else if err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "%s: dropped; the next ingest reads it from the start\n", name)

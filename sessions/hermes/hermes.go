@@ -31,11 +31,16 @@ const Keep = 24 * time.Hour
 const Retain = 15 * time.Minute
 
 // Source reads Hermes conversations from $HERMES_HOME/state.db.
+//
+// Hermes rewrites messages in place (a turn's prologue rewrites the prompt it stored, a prune rewrites old rows)
+// and takes turns back by marking them inactive, so a log resumed from a cursor in another process would not be
+// what the database holds. The Source keeps no checkpoints: each process reads every message once.
 type Source struct {
-	Env  sessions.Env
-	db   *sql.DB
-	logs map[string]*dbLog
-	seen map[string]time.Time
+	Env    sessions.Env
+	db     *sql.DB
+	active string // " and active = 1" when the database marks taken-back and archived messages, else ""
+	logs   map[string]*dbLog
+	seen   map[string]time.Time
 }
 
 type dbLog struct {
@@ -55,15 +60,30 @@ func (src *Source) Close() error {
 	return nil
 }
 
-// open opens the state database read-only once it exists; nil while Hermes is not installed here.
-func (src *Source) open() *sql.DB {
+// open opens the state database read-only once it exists; nil while Hermes is not installed here. A database
+// whose messages carry an active flag gets only the messages still active: the ones Hermes took back or archived
+// are not the conversation any more. When that cannot be told, open fails, and the next scan tries again.
+func (src *Source) open() (*sql.DB, error) {
 	if src.db == nil {
 		path := filepath.Join(src.Env.HermesHome, "state.db")
-		if _, err := os.Stat(path); err == nil {
-			src.db, _ = sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(500)")
+		if _, err := os.Stat(path); err != nil {
+			return nil, nil
+		}
+		db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(500)")
+		if err != nil {
+			return nil, err
+		}
+		var n int
+		if err := db.QueryRow(`select count(*) from pragma_table_info('messages') where name = 'active'`).Scan(&n); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("messages: %w", err)
+		}
+		src.db, src.active = db, ""
+		if n > 0 {
+			src.active = " and active = 1"
 		}
 	}
-	return src.db
+	return src.db, nil
 }
 
 type lease struct {
@@ -77,9 +97,9 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 	if src.logs == nil {
 		src.logs, src.seen = map[string]*dbLog{}, map[string]time.Time{}
 	}
-	db := src.open()
+	db, err := src.open()
 	if db == nil {
-		return nil, nil
+		return nil, err
 	}
 	// A turn lease names the process that runs a turn ("pid=N:...:platform=cli"). A live lease means a turn is
 	// running; the last lease of a cli or tui chat also names the terminal process between turns.
@@ -137,7 +157,9 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 		open, err := src.facts(ctx, h.id, s)
 		s.TurnOpen = open || l.live
 		lg := src.logOf(s.Key)
-		errs = append(errs, err, src.readLog(ctx, h.id, lg))
+		lerr := src.readLog(ctx, h.id, lg)
+		s.Partial = err != nil || lerr != nil
+		errs = append(errs, err, lerr)
 		s.Log = &lg.log
 		if s.TurnOpen && s.Now == "" && h.act != "" {
 			s.Now, s.NowSince = text.OneLine(h.act, 140), s.LastActive
@@ -170,7 +192,7 @@ func (src *Source) logOf(key string) *dbLog {
 // facts reads the latest messages; it reports whether a turn is open.
 func (src *Source) facts(ctx context.Context, id string, s *sessions.Session) (bool, error) {
 	rows, err := src.db.QueryContext(ctx, `select role, coalesce(content, ''), coalesce(tool_calls, ''), timestamp
-		from messages where session_id = ? and role in ('user', 'assistant', 'tool') order by id desc limit 12`, id)
+		from messages where session_id = ? and role in ('user', 'assistant', 'tool')`+src.active+` order by id desc limit 12`, id)
 	if err != nil {
 		return false, fmt.Errorf("messages: %w", err)
 	}
@@ -232,7 +254,7 @@ func (src *Source) readLog(ctx context.Context, id string, l *dbLog) error {
 
 func (src *Source) readPage(ctx context.Context, id string, l *dbLog) (int, error) {
 	rows, err := src.db.QueryContext(ctx, `select id, role, coalesce(content, ''), coalesce(tool_calls, '') from messages
-		where session_id = ? and id > ? and role in ('user', 'assistant', 'tool') order by id limit ?`, id, l.cursor, pageRows)
+		where session_id = ? and id > ? and role in ('user', 'assistant', 'tool')`+src.active+` order by id limit ?`, id, l.cursor, pageRows)
 	if err != nil {
 		return 0, fmt.Errorf("log: %w", err)
 	}

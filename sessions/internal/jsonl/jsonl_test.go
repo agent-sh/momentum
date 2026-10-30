@@ -100,6 +100,81 @@ func TestReadStartsOverWhenTheFileIsRewrittenInPlace(t *testing.T) {
 	}
 }
 
+func TestReadStartsOverWhenTheFileIsRewrittenPastItsFirstBytes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	head := `{"a":"` + strings.Repeat("x", 600) + `"}` + "\n" // the first bytes stay the same
+	write(t, path, head+"{\"b\":1}\n")
+	r, s := &Reader{Path: path}, &sink{}
+	s.read(r)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600) // same inode, same start, new content, longer
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString(head + "{\"c\":1}\n{\"c\":2}\n")
+	f.Close()
+	s.read(r)
+	if s.resets != 1 || len(s.lines) != 3 || s.lines[1] != `{"c":1}` || s.lines[2] != `{"c":2}` {
+		t.Fatalf("resets %d lines %d %v", s.resets, len(s.lines), s.lines[1:])
+	}
+}
+
+func TestAResumedReaderReadsOnlyWhatWasAppended(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	write(t, path, `{"a":"`+strings.Repeat("x", 700)+`"}`+"\n{\"a\":2}\n")
+	first := &Reader{Path: path}
+	(&sink{}).read(first)
+	appendTo(t, path, "{\"a\":3}\n{\"a\":")
+	next, s := &Reader{Path: path}, &sink{} // another process, resuming
+	next.Resume(first.Position())
+	s.read(next)
+	if s.resets != 0 || strings.Join(s.lines, " ") != `{"a":3}` {
+		t.Fatalf("resets %d lines %v", s.resets, s.lines)
+	}
+	appendTo(t, path, "4}\n")
+	again, s2 := &Reader{Path: path}, &sink{}
+	again.Resume(next.Position())
+	s2.read(again)
+	if s2.resets != 0 || strings.Join(s2.lines, " ") != `{"a":4}` {
+		t.Fatalf("a partial line waits for the next reader: resets %d lines %v", s2.resets, s2.lines)
+	}
+}
+
+func TestAResumedReaderStartsOverOnAnotherFile(t *testing.T) {
+	long := `{"a":"` + strings.Repeat("x", 700) + `"}` + "\n"
+	for name, tc := range map[string]struct {
+		change func(t *testing.T, path string)
+		want   string // every line the resumed reader hands over, from the start
+	}{
+		"shrunk": {func(t *testing.T, path string) { write(t, path, "{\"b\":1}\n") }, `{"b":1}`},
+		"replaced": {func(t *testing.T, path string) {
+			next := path + ".next"
+			write(t, next, long+"{\"a\":2}\n{\"b\":2}\n") // the same content, then more: only the inode tells
+			if err := os.Rename(next, path); err != nil {
+				t.Fatal(err)
+			}
+		}, strings.TrimSpace(long) + ` {"a":2} {"b":2}`},
+		"rewritten": {func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte(long+"{\"b\":3}\n{\"b\":4}\n"), 0o600); err != nil { // same inode and start
+				t.Fatal(err)
+			}
+		}, strings.TrimSpace(long) + ` {"b":3} {"b":4}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "s.jsonl")
+			write(t, path, long+"{\"a\":2}\n")
+			first := &Reader{Path: path}
+			(&sink{}).read(first)
+			tc.change(t, path)
+			next, s := &Reader{Path: path}, &sink{}
+			next.Resume(first.Position())
+			s.read(next)
+			if s.resets != 1 || strings.Join(s.lines, " ") != tc.want {
+				t.Fatalf("resets %d lines %v", s.resets, s.lines)
+			}
+		})
+	}
+}
+
 func TestReadOfAMissingFileIsMinusOne(t *testing.T) {
 	r, s := &Reader{Path: filepath.Join(t.TempDir(), "none")}, &sink{}
 	if size := s.read(r); size != -1 {

@@ -216,7 +216,7 @@ func TestOpencodeReportsAQueryThatFails(t *testing.T) {
 	env := sessions.Env{DataHome: data}
 	w := &sessions.World{Now: time.Unix(fake.Boot, 0).Add(2 * time.Minute), Procs: tb}
 	ss, err := sessions.Scan(context.Background(), w, New(env))
-	if err == nil || len(ss) != 1 {
-		t.Fatalf("the session still shows, and the error says what failed: %v %+v", err, ss)
+	if err == nil || len(ss) != 1 || !ss[0].Partial {
+		t.Fatalf("the session still shows, read in part, and the error says what failed: %v %+v", err, ss)
 	}
 }

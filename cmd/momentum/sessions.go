@@ -7,7 +7,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
+	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,10 +23,12 @@ import (
 	"github.com/agent-sh/momentum/sessions/hermes"
 	"github.com/agent-sh/momentum/sessions/opencode"
 	"github.com/agent-sh/momentum/sessions/pi"
+	"github.com/agent-sh/momentum/sessions/state"
 )
 
 // sessionsCmd prints the live sessions and their phases. It reads only processes, terminals, transcripts and
-// the harnesses' own state; no model takes part. Phase-entry times persist in the store between runs.
+// the harnesses' own state; no model takes part. Phase-entry times, the trackers' places in their transcripts and
+// one event per phase change persist in the store between runs.
 func sessionsCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("sessions", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -47,38 +52,87 @@ func sessionsCmd(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		return err
 	}
 	defer st.Close()
-	now := time.Now()
-	w, snapErr := sessions.Snapshot(ctx, env, now)
-	if w == nil {
-		return snapErr
-	}
 	srcs := []sessions.Source{claude.New(env), codex.New(env), pi.New(env), opencode.New(env), hermes.New(env)}
 	defer func() {
 		for _, s := range srcs {
 			s.Close()
 		}
 	}()
-	ss, scanErr, err := board(ctx, w, st, srcs)
+	snapshot := func(now time.Time) (*sessions.World, error) { return sessions.Snapshot(ctx, env, now) }
+	ss, now, scanErr, err := observe(ctx, st, store.BusyTimeout, snapshot, buildID(), srcs)
 	if err != nil {
 		return err
 	}
 	if err := printBoard(stdout, ss, now, *asJSON, *all); err != nil {
 		return err
 	}
-	return errors.Join(snapErr, scanErr)
+	return scanErr
 }
 
-// board scans every source over one snapshot and stamps each session with when it entered its phase, keeping
-// the stamps in the store for the next run. scanErr names the sources that failed; the others still count. err is
-// a store failure.
-func board(ctx context.Context, w *sessions.World, st *store.Store, srcs []sessions.Source) (ss []*sessions.Session, scanErr, err error) {
-	ss, scanErr = sessions.Scan(ctx, w, srcs...)
-	stamps, err := st.SessionStamps(ctx)
+// observe is one run's look at the sessions, from the lock to the save: runs on one store take turns (waiting at
+// most wait for the one before), so each reads the time and the machine after the previous one saved. The lock
+// is released before anything is printed. scanErr names what failed; err is a store or snapshot failure.
+func observe(ctx context.Context, st *store.Store, wait time.Duration, snapshot func(time.Time) (*sessions.World, error), build string,
+	srcs []sessions.Source) (ss []*sessions.Session, now time.Time, scanErr, err error) {
+	unlock, err := st.LockSessions(wait)
 	if err != nil {
-		return nil, nil, err
+		return nil, now, nil, err
 	}
-	stamps.Apply(ss, w.Now)
-	if err := st.SaveSessionStamps(ctx, stamps); err != nil {
+	defer unlock()
+	now = time.Now()
+	w, snapErr := snapshot(now)
+	if w == nil {
+		return nil, now, nil, snapErr
+	}
+	ss, scanErr, err = board(ctx, w, snapErr, st, build, srcs)
+	return ss, now, scanErr, err
+}
+
+// board scans every source over one snapshot, resuming each tracker from the checkpoint the last run of this
+// build saved, and stamps each session with when it entered its phase. It saves the run in one transaction: the
+// stamps, one event per change of stretch, and the checkpoints of the trackers it used; it drops checkpoints no
+// run used for state.Keep. A source that failed, or every source when the snapshot is incomplete (snapErr), keeps
+// its stamps: its sessions are unknown on this run, not gone. scanErr names what failed; the rest still counts.
+// err is a store failure.
+func board(ctx context.Context, w *sessions.World, snapErr error, st *store.Store, build string, srcs []sessions.Source) (ss []*sessions.Session, scanErr, err error) {
+	trackers := st.Trackers(build)
+	errs := []error{snapErr}
+	var failed []string
+	for _, src := range srcs {
+		if r, ok := src.(sessions.Resumable); ok {
+			r.Resume(trackers)
+		}
+		found, err := sessions.Scan(ctx, w, src)
+		ss = append(ss, found...)
+		if err != nil || snapErr != nil {
+			failed = append(failed, src.Tool())
+		}
+		errs = append(errs, err)
+	}
+	scanErr = errors.Join(errs...)
+	var cps []sessions.Checkpoint
+	for _, src := range srcs {
+		if r, ok := src.(sessions.Resumable); ok {
+			cps = append(cps, r.Checkpoints()...)
+		}
+	}
+	err = st.SessionRun(ctx, func(r *store.Run) error {
+		stamps, err := r.Stamps()
+		if err != nil {
+			return err
+		}
+		if _, err := r.Put(phaseEvents(stamps.Apply(ss, w.Now, failed...), ss, w.Now)); err != nil {
+			return err
+		}
+		if err := r.SaveStamps(stamps); err != nil {
+			return err
+		}
+		if err := r.SaveCheckpoints(trackers, cps, w.Now); err != nil {
+			return err
+		}
+		return r.DropCheckpoints(w.Now.Add(-state.Keep))
+	})
+	if err != nil {
 		return nil, nil, err
 	}
 	sort.SliceStable(ss, func(i, j int) bool {
@@ -88,6 +142,127 @@ func board(ctx context.Context, w *sessions.World, st *store.Store, srcs []sessi
 		return ss[i].Since.Before(ss[j].Since)
 	})
 	return ss, scanErr, nil
+}
+
+// buildID names this build of momentum for its trackers' checkpoints, which are only valid for the code that
+// wrote them: the module version and revision Go stamped, and the executable's size and time, so any rebuild is
+// another build and starts with one full read.
+func buildID() string {
+	var parts []string
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		parts = append(parts, bi.Main.Version)
+		for _, s := range bi.Settings {
+			if s.Key == "vcs.revision" || s.Key == "vcs.modified" {
+				parts = append(parts, s.Value)
+			}
+		}
+	}
+	if exe, err := os.Executable(); err == nil {
+		if fi, err := os.Stat(exe); err == nil {
+			parts = append(parts, strconv.FormatInt(fi.Size(), 10), strconv.FormatInt(fi.ModTime().UnixNano(), 10))
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// Kinds of the events a sessions run writes.
+const (
+	kindAppeared = "appeared" // seen for the first time
+	kindPhase    = "phase"    // a new stretch: another phase, or the same phase after the session moved between runs
+	kindVanished = "vanished" // not seen for longer than state.Keep
+)
+
+// phaseMeta is the structure of a sessions event, its Meta.
+type phaseMeta struct {
+	From        sessions.Phase   `json:"from,omitempty"`    // the phase it left; none when it appeared
+	To          sessions.Phase   `json:"to,omitempty"`      // the phase it entered; none when it vanished
+	ForMS       int64            `json:"for_ms,omitempty"`  // time in the old phase, until the event's time
+	SeenMS      int64            `json:"seen_ms,omitempty"` // time in the old phase until the last run that saw it: a lower bound
+	Name        string           `json:"name,omitempty"`
+	Auto        bool             `json:"auto,omitempty"` // an automated run (cron, one-shot)
+	FromAskKind sessions.AskKind `json:"from_ask_kind,omitempty"`
+	FromAsk     string           `json:"from_ask,omitempty"` // what it waited on, when it left needs_you
+	AskKind     sessions.AskKind `json:"ask_kind,omitempty"`
+	Ask         string           `json:"ask,omitempty"` // what it asks, when it entered needs_you
+}
+
+// harnessNames are the store's names for the harnesses whose tool name differs.
+var harnessNames = map[string]string{"claude": "claude-code"}
+
+// phaseEvents turns a run's changes into events of source sessions: one per change, at the time the new stretch
+// began (for a session gone, when a run last saw it), keyed by the session and the run.
+func phaseEvents(changes []state.Change, ss []*sessions.Session, now time.Time) []store.Event {
+	byKey := map[string]*sessions.Session{}
+	for _, s := range ss {
+		byKey[s.Key] = s
+	}
+	var out []store.Event
+	for _, c := range changes {
+		kind := kindPhase
+		switch {
+		case c.From == "":
+			kind = kindAppeared
+		case c.To == "":
+			kind = kindVanished
+		}
+		m := phaseMeta{From: c.From, To: c.To, Name: c.Name, Auto: c.Auto, AskKind: c.ToAskKind, Ask: c.ToAsk}
+		if c.From != "" {
+			m.ForMS, m.SeenMS, m.FromAskKind, m.FromAsk = c.For.Milliseconds(), max(0, c.Seen.Sub(c.Since).Milliseconds()), c.FromAskKind, c.FromAsk
+		}
+		meta, _ := json.Marshal(m)
+		harness := c.Tool
+		if n, ok := harnessNames[c.Tool]; ok {
+			harness = n
+		}
+		e := store.Event{Source: store.Sessions, SourceKey: c.Key + "@" + strconv.FormatInt(now.UnixMilli(), 10), TS: c.At,
+			Session: c.Key, Harness: harness, Actor: store.ActorHarness, Kind: kind, Summary: oneLine(changeSummary(c), 240), Meta: string(meta)}
+		if s := byKey[c.Key]; s != nil {
+			e.Model, e.Cwd = s.Model, s.Cwd
+			if s.Transcript != "" && s.Size >= 0 {
+				e.Ref = s.Transcript + "@" + strconv.FormatInt(s.Size, 10)
+			}
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// changeSummary is one line for the event list: the session, its move and how long it was in the phase it left,
+// and for needs_you what it asks or what it waited on.
+func changeSummary(c state.Change) string {
+	name := c.Name
+	if name == "" {
+		name = c.Key
+	}
+	var s string
+	switch {
+	case c.From == "":
+		s = fmt.Sprintf("%s: appeared, %s", name, c.To)
+	case c.To == "":
+		s = fmt.Sprintf("%s: vanished after %s %s", name, span(c.For), c.From)
+	default:
+		s = fmt.Sprintf("%s: %s -> %s after %s", name, c.From, c.To, span(c.For))
+	}
+	switch {
+	case c.To == sessions.NeedsYou:
+		s += fmt.Sprintf("; asks (%s) %s", c.ToAskKind, c.ToAsk)
+	case c.From == sessions.NeedsYou:
+		s += fmt.Sprintf("; waited on (%s) %s", c.FromAskKind, c.FromAsk)
+	}
+	return s
+}
+
+// span is a short duration: 45s, 12m, 3h05m, 4d.
+func span(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", max(0, int(d.Seconds())))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 48*time.Hour:
+		return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+	return fmt.Sprintf("%dd", int(d.Hours()/24))
 }
 
 func printBoard(out io.Writer, ss []*sessions.Session, now time.Time, asJSON, all bool) error {
@@ -147,14 +322,5 @@ func ago(t, now time.Time) string {
 	if t.IsZero() {
 		return "?"
 	}
-	d := now.Sub(t)
-	switch {
-	case d < time.Minute:
-		return fmt.Sprintf("%ds", max(0, int(d.Seconds())))
-	case d < time.Hour:
-		return fmt.Sprintf("%dm", int(d.Minutes()))
-	case d < 48*time.Hour:
-		return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
-	}
-	return fmt.Sprintf("%dd", int(d.Hours()/24))
+	return span(now.Sub(t))
 }

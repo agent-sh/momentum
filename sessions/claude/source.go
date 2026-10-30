@@ -2,8 +2,11 @@ package claude
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,8 +23,10 @@ type Source struct {
 	// does not report its own status. nil reads the tmux pane, else the kitty window.
 	Screen func(ctx context.Context, w *sessions.World, s *sessions.Session) string
 
+	saved    sessions.Saved
 	trackers map[string]*Tracker
 	seen     map[string]time.Time
+	now      time.Time // the last scan's
 }
 
 // Retain is how long the tracker of a session that left keeps its place: one back within it is not read again.
@@ -37,6 +42,49 @@ func (src *Source) Tool() string { return "claude" }
 
 func (src *Source) Close() error { return nil }
 
+// Resume makes later scans start a transcript they meet for the first time from its checkpoint in saved.
+func (src *Source) Resume(saved sessions.Saved) { src.saved = saved }
+
+// Checkpoints returns the checkpoint of every transcript the last Scan read.
+func (src *Source) Checkpoints() []sessions.Checkpoint {
+	var out []sessions.Checkpoint
+	for path, at := range src.seen {
+		if !at.Equal(src.now) {
+			continue
+		}
+		t := src.trackers[path]
+		if state, err := t.State(); err == nil {
+			out = append(out, sessions.Checkpoint{Tool: src.Tool(), Key: path, State: state, Log: t.Log()})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
+// tracker returns the transcript's tracker: the one kept from an earlier scan, else one resumed from its
+// checkpoint, else a new one that reads from the start. A checkpoint that cannot be read is reported, and the
+// transcript is read from the start.
+func (src *Source) tracker(ctx context.Context, path string) (*Tracker, error) {
+	if t := src.trackers[path]; t != nil {
+		return t, nil
+	}
+	t := NewTracker(path)
+	src.trackers[path] = t
+	if src.saved == nil {
+		return t, nil
+	}
+	cp, err := src.saved.Checkpoint(ctx, src.Tool(), path)
+	if err == nil && cp != nil {
+		if err = t.Resume(cp); err != nil {
+			*t = *NewTracker(path)
+		}
+	}
+	if err != nil {
+		return t, fmt.Errorf("checkpoint of %s: %w", path, err)
+	}
+	return t, nil
+}
+
 // Claude Code names an unnamed session after its directory plus two hex digits ("projects-ce").
 var reAutoName = regexp.MustCompile(`^[\w.-]+-[0-9a-f]{2}$`)
 
@@ -45,7 +93,9 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 	if src.trackers == nil {
 		src.trackers, src.seen = map[string]*Tracker{}, map[string]time.Time{}
 	}
+	src.now = w.Now
 	found, err := src.Lister.List(ctx, w)
+	errs := []error{err}
 	var out []*sessions.Session
 	keys := map[string]bool{}
 	for _, f := range found {
@@ -68,7 +118,7 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 		if f.JobState == "failed" {
 			s.Failed = text.FirstNonEmpty(text.OneLine(f.Detail, 200), "the job failed")
 		}
-		src.facts(ctx, w, s, f)
+		errs = append(errs, src.facts(ctx, w, s, f))
 		out = append(out, s)
 	}
 	for path, at := range src.seen {
@@ -77,11 +127,12 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 			delete(src.seen, path)
 		}
 	}
-	return out, err
+	return out, errors.Join(errs...)
 }
 
-// facts fills what the transcript and the harness's own status say.
-func (src *Source) facts(ctx context.Context, w *sessions.World, s *sessions.Session, f sessions.Found) {
+// facts fills what the transcript and the harness's own status say. The error is a checkpoint that could not be
+// read; the facts are filled all the same.
+func (src *Source) facts(ctx context.Context, w *sessions.World, s *sessions.Session, f sessions.Found) error {
 	path := f.Transcript
 	if path == "" && f.Session != "" {
 		path = TranscriptPath(src.Env.ClaudeDir, f.Session, f.Cwd)
@@ -97,17 +148,13 @@ func (src *Source) facts(ctx context.Context, w *sessions.World, s *sessions.Ses
 		case "waiting":
 			s.Ask, s.AskKind = waiting(f.WaitingFor, "")
 		}
-		return
+		return nil
 	}
 	src.seen[path] = w.Now
 	if fi, err := os.Stat(path); err == nil && fi.ModTime().After(s.LastActive) {
 		s.LastActive = fi.ModTime()
 	}
-	t := src.trackers[path]
-	if t == nil {
-		t = NewTracker(path)
-		src.trackers[path] = t
-	}
+	t, err := src.tracker(ctx, path)
 	if f.Where == "bg" {
 		s.Started = time.Time{} // a background job restarts its process on respawn; its tasks outlive that
 	}
@@ -130,6 +177,7 @@ func (src *Source) facts(ctx context.Context, w *sessions.World, s *sessions.Ses
 			}
 		}
 	}
+	return err
 }
 
 func (src *Source) screen(ctx context.Context, w *sessions.World, s *sessions.Session) string {
