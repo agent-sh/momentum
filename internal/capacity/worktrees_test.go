@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -285,18 +286,23 @@ func TestCapacitysOwnDeletionsAreNoOneAtWork(t *testing.T) {
 	st := openStore(t)
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	must(t, err)
-	someone, ours, earlier := filepath.Join(base, "someone"), filepath.Join(base, "ours"), filepath.Join(base, "earlier")
-	for _, d := range []string{someone, ours, earlier} {
+	someone, ours, earlier, older := filepath.Join(base, "someone"), filepath.Join(base, "ours"), filepath.Join(base, "earlier"),
+		filepath.Join(base, "older")
+	for _, d := range []string{someone, ours, earlier, older} {
 		must(t, os.MkdirAll(d, 0o755))
 		must(t, os.Chtimes(d, now, now.Add(-10*time.Minute)))
 	}
-	// an earlier run deleted earlier/target 10 minutes ago, and recorded it
-	_, err = st.Put(ctx, []store.Event{{Source: store.Capacity, SourceKey: "d1", TS: now.Add(-10 * time.Minute),
-		Actor: store.ActorAgent, Kind: KindDelete, Summary: "x", Ref: filepath.Join(earlier, "target")}})
+	// an earlier run deleted earlier/target 10 minutes ago, and recorded which directories that changed; an older
+	// build recorded its deletion in older without them
+	_, err = st.Put(ctx, []store.Event{
+		{Source: store.Capacity, SourceKey: "d1", TS: now.Add(-10 * time.Minute), Actor: store.ActorAgent, Kind: KindDelete,
+			Summary: "x", Ref: filepath.Join(earlier, "target"), Meta: `{"own":["` + earlier + `"]}`},
+		{Source: store.Capacity, SourceKey: "d2", TS: now.Add(-10 * time.Minute), Actor: store.ActorAgent, Kind: KindDelete,
+			Summary: "x", Ref: filepath.Join(older, "target"), Meta: `{}`}})
 	must(t, err)
 	r := &runner{now: now, st: st, m: ReadMounts("")}
 	r.ownDeletions(ctx)
-	r.addOwn(filepath.Join(ours, "target"), now.Add(-10*time.Minute)) // this run deleted ours/target
+	r.addOwnDir(ours, now.Add(-10*time.Minute)) // this run deleted ours/target
 	look, since := &Sample{}, now.Add(-quietTime)
 	if !r.changedIn(ctx, someone, since, look) {
 		t.Error("someone's change 10 minutes ago is a change")
@@ -306,6 +312,9 @@ func TestCapacitysOwnDeletionsAreNoOneAtWork(t *testing.T) {
 	}
 	if r.changedIn(ctx, earlier, since, look) {
 		t.Error("an earlier run's recorded deletion is no one at work")
+	}
+	if !r.changedIn(ctx, older, since, look) {
+		t.Error("a deletion recorded without its directories explains nothing")
 	}
 	must(t, os.Chtimes(ours, now, now.Add(-5*time.Minute)))
 	if !(&runner{now: now, own: r.own, m: r.m}).changedIn(ctx, ours, since, look) {
@@ -328,12 +337,7 @@ func TestAMainCheckoutWithItsGitDirApartIsReadThere(t *testing.T) {
 
 func TestCapacitysOwnDeletionInAWorktreeDoesNotHoldTheRepositorysLeftovers(t *testing.T) {
 	_, wts := worktreesFixture(t)
-	local := filepath.Join(wts, "local") // work in progress, with a build of its own
-	target := filepath.Join(local, "target")
-	write(t, filepath.Join(local, ".gitignore"), "target/\n")
-	write(t, filepath.Join(target, "CACHEDIR.TAG"), cargoTag+"\n# This file is a cache directory tag created by cargo.\n")
-	write(t, filepath.Join(target, ".rustc_info.json"), "{}")
-	blob(t, filepath.Join(target, "debug", "app"), 2<<20)
+	_, target := ownTarget(t, wts)
 	now := time.Now().Add(49 * time.Hour)
 	cfg := Config{Worktrees: WorktreesConfig{Roots: []string{wts}}, Targets: TargetsConfig{Roots: []string{wts}}}.Normal()
 	cfg.Live = []string{RuleTargets, RuleWorktrees}
@@ -352,5 +356,126 @@ func TestCapacitysOwnDeletionInAWorktreeDoesNotHoldTheRepositorysLeftovers(t *te
 	}
 	if f := findings(res, RuleWorktrees)[filepath.Join(wts, "merged")]; !f.Done {
 		t.Errorf("capacity's own deletion in another worktree is no one at work there: %+v", f)
+	}
+}
+
+// ownTarget is a fixture's work-in-progress worktree with an idle build of its own, which the targets rule deletes.
+func ownTarget(t *testing.T, wts string) (local, target string) {
+	t.Helper()
+	local = filepath.Join(wts, "local")
+	target = filepath.Join(local, "target")
+	write(t, filepath.Join(local, ".gitignore"), "target/\n")
+	write(t, filepath.Join(target, "CACHEDIR.TAG"), cargoTag+"\n# This file is a cache directory tag created by cargo.\n")
+	write(t, filepath.Join(target, ".rustc_info.json"), "{}")
+	blob(t, filepath.Join(target, "debug", "app"), 2<<20)
+	return local, target
+}
+
+func TestSomeonesChangeBeforeCapacitysDeletionInTheSameDirectoryStaysTheirs(t *testing.T) {
+	_, wts := worktreesFixture(t)
+	local, target := ownTarget(t, wts)
+	now := time.Now().Add(49 * time.Hour)
+	cfg := Config{Worktrees: WorktreesConfig{Roots: []string{wts}}, Targets: TargetsConfig{Roots: []string{wts}}}.Normal()
+	cfg.Live = []string{RuleTargets, RuleWorktrees}
+	o := options(t, procRoot(t), now, nil)
+	// after the judgment, someone makes a file in local; then capacity deletes local/target, which hides that time
+	o.beforeAct = func() { must(t, os.Chtimes(local, now, now.Add(-time.Minute))) }
+	o.afterDelete = func(f Finding) {
+		if f.Rule == RuleTargets {
+			must(t, os.Chtimes(filepath.Dir(f.Path), now, now))
+		}
+	}
+	res, err := Run(context.Background(), cfg, openStore(t), o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f := findings(res, RuleTargets)[target]; !f.Done {
+		t.Fatalf("the idle build goes: %+v", f)
+	}
+	if f := findings(res, RuleWorktrees)[filepath.Join(wts, "merged")]; f.Done || !strings.Contains(f.Why, "a change in") {
+		t.Errorf("someone at work in the repository a minute before keeps its leftovers: %+v", f)
+	}
+}
+
+func TestALaterRunTakesAnEarlierRunsDeletionAsItsOwn(t *testing.T) {
+	_, wts := worktreesFixture(t)
+	_, target := ownTarget(t, wts)
+	tick := time.Now().Add(49 * time.Hour)
+	clock := func() time.Time { tick = tick.Add(10 * time.Second); return tick } // each look at the clock is later
+	st := openStore(t)
+	cfg := Config{Worktrees: WorktreesConfig{Roots: []string{wts}}, Targets: TargetsConfig{Roots: []string{wts}}}.Normal()
+	cfg.Live = []string{RuleTargets, RuleWorktrees}
+	o := options(t, procRoot(t), tick, nil)
+	o.Clock, o.Rules = clock, []string{RuleTargets}
+	o.afterDelete = func(f Finding) { // the deletion changes its directory when it happens, after the run began
+		at := clock()
+		must(t, os.Chtimes(filepath.Dir(f.Path), at, at))
+	}
+	res, err := Run(context.Background(), cfg, st, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f := findings(res, RuleTargets)[target]; !f.Done {
+		t.Fatalf("the first run deletes the build: %+v", f)
+	}
+	o2 := options(t, procRoot(t), tick, nil)
+	o2.Clock, o2.Rules = clock, []string{RuleWorktrees}
+	res, err = Run(context.Background(), cfg, st, o2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f := findings(res, RuleWorktrees)[filepath.Join(wts, "merged")]; !f.Done {
+		t.Errorf("a run minutes later takes the first run's deletion as capacity's own: %+v", f)
+	}
+}
+
+func TestAReflogsTimeIsItsLastEntrysWhenItCanBeRead(t *testing.T) {
+	dir := t.TempDir()
+	at := time.Unix(1700000000, 0)
+	for _, c := range []struct {
+		name, last string
+		want       time.Time
+	}{
+		{"an entry as git writes it", "0 1 A U Thor <a@example.com> 1700000000 +0200\tcommit: x", at},
+		{"a zone git does not write", "0 1 A U Thor <a@example.com> 1700000000 X\tcommit: x", time.Time{}},
+		{"no email before the time", "0 1 A U Thor a@example.com 1700000000 +0200\tcommit: x", time.Time{}},
+		// a message whose tail reads like a header: only the entry's start says where its header is
+		{"an entry longer than the tail read", "0 1 A <a@example.com> 1600000000 +0000\tcommit: " + strings.Repeat("y", 70<<10) +
+			" from me <b@example.com> 12 +0000", time.Time{}},
+	} {
+		p := filepath.Join(dir, strings.ReplaceAll(c.name, " ", "-"))
+		write(t, p, "0 0 A <a@example.com> 1500000000 +0000\tclone\n"+c.last+"\n")
+		st, err := os.Lstat(p)
+		must(t, err)
+		want := c.want
+		if want.IsZero() {
+			want = newest(st.Sys().(*syscall.Stat_t)) // not readable as an entry: the file's own time
+		}
+		if got, ok := reflogTime(p); !ok || !got.Equal(want) {
+			t.Errorf("%s: %v %v, want %v", c.name, got, ok, want)
+		}
+	}
+}
+
+func TestEveryDeletionOfTheLastHourIsRead(t *testing.T) {
+	now := time.Now().Add(2 * time.Hour)
+	ctx := context.Background()
+	st := openStore(t)
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	must(t, err)
+	first := filepath.Join(base, "first")
+	must(t, os.MkdirAll(first, 0o755))
+	must(t, os.Chtimes(first, now, now.Add(-50*time.Minute)))
+	evs := []store.Event{{Source: store.Capacity, SourceKey: "d0", TS: now.Add(-50 * time.Minute), Actor: store.ActorAgent,
+		Kind: KindDelete, Summary: "x", Meta: `{"own":["` + first + `"]}`}}
+	for i := 1; i <= 300; i++ { // a run that deleted many builds after it
+		evs = append(evs, store.Event{Source: store.Capacity, SourceKey: fmt.Sprintf("d%d", i), TS: now.Add(-40 * time.Minute),
+			Actor: store.ActorAgent, Kind: KindDelete, Summary: "x", Meta: fmt.Sprintf(`{"own":["%s/n%d"]}`, base, i)})
+	}
+	_, err = st.Put(ctx, evs)
+	must(t, err)
+	r := &runner{now: now, st: st, m: ReadMounts("")}
+	if r.changedIn(ctx, first, now.Add(-quietTime), &Sample{}) {
+		t.Error("the first of 301 deletions in the hour is read too")
 	}
 }

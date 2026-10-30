@@ -43,6 +43,8 @@ type Finding struct {
 	class        string    // why a report-only finding is reported, as a word: its note's group
 	none         bool      // a prune that removed nothing, as the tool lists it or uv counts it: no decided note
 	unsaid       bool      // a prune whose tool did not say what it freed
+	unsized      bool      // a prune whose size could not be read before it ran
+	ownDirs      []string  // the directories its deletion changed that a later look takes as capacity's (explainable)
 }
 
 // The actions a finding can have.

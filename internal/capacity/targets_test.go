@@ -99,3 +99,16 @@ func TestTargetsGoWhenIdleIgnoredAndOfAKnownProject(t *testing.T) {
 		t.Error("each report-only target says why, as its note's group")
 	}
 }
+
+func TestATargetsRootThatIsASymlinkIsWalkedWhereItLeads(t *testing.T) {
+	base := t.TempDir()
+	real, link := filepath.Join(base, "disk", "code"), filepath.Join(base, "code")
+	target := filepath.Join(real, "app", "target")
+	write(t, filepath.Join(target, "CACHEDIR.TAG"), cargoTag+"\n# This file is a cache directory tag created by cargo.\n")
+	write(t, filepath.Join(target, ".rustc_info.json"), "{}")
+	must(t, os.Symlink(real, link))
+	f := Discover([]string{link}, func(string) bool { return true }, func(string) bool { return false }, nil)
+	if len(f.Targets) != 1 || f.Targets[0] != target {
+		t.Errorf("a root moved to another disk and linked back is walked: %v", f.Targets)
+	}
+}

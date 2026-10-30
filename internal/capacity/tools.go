@@ -314,6 +314,7 @@ func (r *runner) docker(ctx context.Context, live bool) ([]Finding, []string, er
 			out = append(out, f)
 		}
 	}
+	cache.unsized = !sized
 	for _, f := range []*Finding{&cache, &images} {
 		if f.Action == "" || (f.Bytes == 0 && (f != &cache || sized)) {
 			continue
@@ -345,7 +346,7 @@ func (r *runner) docker(ctx context.Context, live bool) ([]Finding, []string, er
 }
 
 // prunable counts the build cache records a prune limited by age removes, from `docker builder du --format json`
-// (one record per line), and whether it read any. A record goes when no build uses it, no image shares it, it is
+// (one record per line), and whether it could read every line. A record goes when no build uses it, no image shares it, it is
 // not BuildKit's own (internal and frontend records, which a prune without --all keeps), and it was last used
 // longer ago than keep (a record never used goes), and when every record above it goes too: a child holds its
 // parent, whose own last use stays old while the child is used. Docker prints the last use as a rough age.
@@ -358,13 +359,14 @@ func prunable(du string, keep time.Duration) (n int, size int64, ok bool) {
 	}
 	var recs []record
 	for _, l := range strings.Split(du, "\n") {
-		var rec record
-		if json.Unmarshal([]byte(l), &rec) == nil && rec.ID != "" {
-			recs = append(recs, rec)
+		if strings.TrimSpace(l) == "" {
+			continue
 		}
-	}
-	if len(recs) == 0 {
-		return 0, 0, strings.TrimSpace(du) == "" // an empty cache, or output this build cannot read
+		var rec record
+		if json.Unmarshal([]byte(l), &rec) != nil || rec.ID == "" {
+			return 0, 0, false // a record this build cannot read may be the child that holds a parent
+		}
+		recs = append(recs, rec)
 	}
 	byID := map[string]*record{}
 	for i := range recs {
