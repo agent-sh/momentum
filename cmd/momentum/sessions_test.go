@@ -153,12 +153,12 @@ func TestPhaseChangesAreKeptAsEvents(t *testing.T) {
 	}
 	want := []string{
 		"-1h0m0s thread-b codex >idle 0 / /",
-		"0s sess-a claude-code >working 0 / /",
-		"1m0s sess-a claude-code working>needs_you 1 / permission/permission prompt: Bash: rm -rf build",
+		"0s sess-a claude >working 0 / /",
+		"1m0s sess-a claude working>needs_you 1 / permission/permission prompt: Bash: rm -rf build",
 		"9m0s thread-b codex idle>needs_you 69 / question/Which branch?",
-		"10m0s sess-a claude-code needs_you>working 9 permission/permission prompt: Bash: rm -rf build /",
-		"19m0s sess-a claude-code working>idle 9 / /",
-		"20m0s sess-a claude-code idle> 1 / /",
+		"10m0s sess-a claude needs_you>working 9 permission/permission prompt: Bash: rm -rf build /",
+		"19m0s sess-a claude working>idle 9 / /",
+		"20m0s sess-a claude idle> 1 / /",
 		"20m0s thread-b codex needs_you>working 11 question/Which branch? /",
 		"39m0s thread-b codex working>idle 19 / /",
 	}

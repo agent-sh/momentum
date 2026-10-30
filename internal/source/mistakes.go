@@ -140,7 +140,7 @@ func (m Mistakes) event(line []byte, ref string) (store.Event, string) {
 		TS:        ts,
 		Session:   row.Session,
 		Agent:     row.AgentID,
-		Harness:   "claude-code",
+		Harness:   "claude", // the log is Claude Code's, by its name in store.Harnesses
 		Model:     row.Model,
 		Cwd:       row.Cwd,
 		Actor:     actor,

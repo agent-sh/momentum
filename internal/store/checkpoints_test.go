@@ -153,7 +153,7 @@ func TestAnUnchangedCheckpointIsOnlyMarkedSeen(t *testing.T) {
 	}
 }
 
-func TestObservedEventsSurviveASchemaChange(t *testing.T) {
+func TestEveryEventSurvivesASchemaChange(t *testing.T) {
 	ctx, path := context.Background(), filepath.Join(t.TempDir(), "m.db")
 	st, err := Open(path)
 	if err != nil {
@@ -171,7 +171,7 @@ func TestObservedEventsSurviveASchemaChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil { // a store from another derived schema
+	if _, err := db.Exec(`PRAGMA user_version = 1; DROP TABLE schema_steps`); err != nil { // a store from an older schema
 		t.Fatal(err)
 	}
 	db.Close()
@@ -181,12 +181,17 @@ func TestObservedEventsSurviveASchemaChange(t *testing.T) {
 	}
 	defer st.Close()
 	evs, err := st.Events(ctx, Query{Since: at.Add(-time.Hour)})
-	if err != nil || len(evs) != 1 || evs[0].Source != Sessions || evs[0].Meta != `{"from":"needs_you"}` || evs[0].Harness != "codex" {
-		t.Fatalf("the derived events go, the observed ones stay: %+v %v", evs, err)
+	if err != nil || len(evs) != 2 {
+		t.Fatalf("the events stay: %+v %v", evs, err)
+	}
+	for _, e := range evs {
+		if e.Source == Sessions && (e.Meta != `{"from":"needs_you"}` || e.Harness != "codex") {
+			t.Fatalf("an observed event changed: %+v", e)
+		}
 	}
 }
 
-func TestObservedEventsMoveIntoANewEventsTable(t *testing.T) {
+func TestAnEventsTableFromBeforeGainsItsColumnsAndKeepsItsRows(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "m.db")
 	old, err := sql.Open("sqlite", "file:"+path)
 	if err != nil {
@@ -205,8 +210,13 @@ func TestObservedEventsMoveIntoANewEventsTable(t *testing.T) {
 	}
 	defer st.Close()
 	evs, err := st.Events(context.Background(), Query{Since: time.UnixMilli(0)})
-	if err != nil || len(evs) != 1 || evs[0].Kind != "vanished" || evs[0].SourceKey != "k@1" {
+	if err != nil || len(evs) != 2 {
 		t.Fatalf("got %+v %v", evs, err)
+	}
+	for _, e := range evs {
+		if e.Session != "" || e.Meta != "" || e.Heuristic || e.Experiment != "" {
+			t.Fatalf("a column it gained does not hold its default: %+v", e)
+		}
 	}
 }
 
@@ -216,7 +226,7 @@ func TestRebuildRefusesObservedEvents(t *testing.T) {
 	if _, err := st.Put(ctx, []Event{{Source: Sessions, SourceKey: "s@1", TS: time.Now(), Actor: ActorHarness, Kind: "phase"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.Rebuild(ctx, Sessions); !errors.Is(err, ErrObserved) {
+	if _, err := st.Rebuild(ctx, Sessions, true); !errors.Is(err, ErrObserved) {
 		t.Fatalf("err %v", err)
 	}
 	if evs, _ := st.Events(ctx, Query{Since: time.Unix(0, 0), Source: Sessions}); len(evs) != 1 {

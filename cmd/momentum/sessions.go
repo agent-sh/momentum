@@ -52,7 +52,7 @@ func sessionsCmd(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		return err
 	}
 	defer st.Close()
-	srcs := []sessions.Source{claude.New(env), codex.New(env), pi.New(env), opencode.New(env), hermes.New(env)}
+	srcs := sessionSources(env)
 	defer func() {
 		for _, s := range srcs {
 			s.Close()
@@ -67,6 +67,11 @@ func sessionsCmd(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		return err
 	}
 	return scanErr
+}
+
+// sessionSources are the harnesses the board reads, each named by its tool as in store.Harnesses.
+func sessionSources(env sessions.Env) []sessions.Source {
+	return []sessions.Source{claude.New(env), codex.New(env), pi.New(env), opencode.New(env), hermes.New(env)}
 }
 
 // observe is one run's look at the sessions, from the lock to the save: runs on one store take turns (waiting at
@@ -186,9 +191,6 @@ type phaseMeta struct {
 	Ask         string           `json:"ask,omitempty"` // what it asks, when it entered needs_you
 }
 
-// harnessNames are the store's names for the harnesses whose tool name differs.
-var harnessNames = map[string]string{"claude": "claude-code"}
-
 // phaseEvents turns a run's changes into events of source sessions: one per change, at the time the new stretch
 // began (for a session gone, when a run last saw it), keyed by the session and the run.
 func phaseEvents(changes []state.Change, ss []*sessions.Session, now time.Time) []store.Event {
@@ -210,12 +212,9 @@ func phaseEvents(changes []state.Change, ss []*sessions.Session, now time.Time) 
 			m.ForMS, m.SeenMS, m.FromAskKind, m.FromAsk = c.For.Milliseconds(), max(0, c.Seen.Sub(c.Since).Milliseconds()), c.FromAskKind, c.FromAsk
 		}
 		meta, _ := json.Marshal(m)
-		harness := c.Tool
-		if n, ok := harnessNames[c.Tool]; ok {
-			harness = n
-		}
+		// A session's tool is its harness, by the name every source gives it (store.Harnesses).
 		e := store.Event{Source: store.Sessions, SourceKey: c.Key + "@" + strconv.FormatInt(now.UnixMilli(), 10), TS: c.At,
-			Session: c.Key, Harness: harness, Actor: store.ActorHarness, Kind: kind, Summary: oneLine(changeSummary(c), 240), Meta: string(meta)}
+			Session: c.Key, Harness: c.Tool, Actor: store.ActorHarness, Kind: kind, Summary: oneLine(changeSummary(c), 240), Meta: string(meta)}
 		if s := byKey[c.Key]; s != nil {
 			e.Model, e.Cwd = s.Model, s.Cwd
 			if s.Transcript != "" && s.Size >= 0 {
