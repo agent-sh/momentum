@@ -25,6 +25,12 @@ type Proc struct {
 	Cwd   string   // working directory; "" for none
 	Files []string // what its file descriptors point at
 	Env   []string // KEY=VALUE
+	// Its state (default S), process group (default 1), controlling terminal (tty_nr, default 0: none) and its
+	// terminal's foreground group (default -1, none).
+	State byte
+	PGRP  int
+	TTY   int
+	TPGID int
 }
 
 // ProcRoot writes a proc filesystem holding ps and returns its root.
@@ -40,8 +46,18 @@ func ProcRoot(t testing.TB, ps ...Proc) string {
 		}
 		write(t, filepath.Join(dir, "cmdline"), strings.Join(p.Argv, "\x00")+"\x00")
 		// a command name with spaces and parentheses, which stat parsing must survive
-		write(t, filepath.Join(dir, "stat"), fmt.Sprintf("%d (%s) x) S %d 1 1 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 %d 1000 100 18446744073709551615\n",
-			p.PID, comm, p.PPID, p.Start))
+		state, pgrp, tpgid := p.State, p.PGRP, p.TPGID
+		if state == 0 {
+			state = 'S'
+		}
+		if pgrp == 0 {
+			pgrp = 1
+		}
+		if tpgid == 0 {
+			tpgid = -1
+		}
+		write(t, filepath.Join(dir, "stat"), fmt.Sprintf("%d (%s) x) %c %d %d 1 %d %d 4194560 1 0 0 0 0 0 0 0 20 0 1 0 %d 1000 100 18446744073709551615\n",
+			p.PID, comm, state, p.PPID, pgrp, p.TTY, tpgid, p.Start))
 		if p.Cwd != "" {
 			link(t, p.Cwd, filepath.Join(dir, "cwd"))
 		}
