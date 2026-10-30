@@ -43,7 +43,7 @@ type Transcripts struct {
 	ready  func() error
 }
 
-func (Transcripts) Name() string { return "transcripts" }
+func (Transcripts) Name() string { return store.Transcripts }
 
 // DefaultWorkers is how many files an ingest reads at once: a third of the machine's cores. A worker parses
 // and, while it redacts, runs a scrump process, so it keeps about one core busy; a first ingest of every
@@ -96,12 +96,14 @@ type job struct {
 	session evidence.HermesSession
 }
 
-// part is a piece of a job read and not yet stored: its items, and the cursor after them.
+// part is a piece of a job read and not yet stored: its items, the cursor after them, and the places of the
+// records it read (place), those of items not stored among them.
 type part struct {
-	j     *job
-	items []pending
-	read  int
-	cur   store.FileCursor
+	j      *job
+	items  []pending
+	read   int
+	cur    store.FileCursor
+	places []string
 }
 
 // pending is an item to store: its event with the texts taken out (a batch holds only what it stores), the
@@ -120,6 +122,7 @@ type tally struct {
 	unknown  int
 	failed   map[string]bool
 	restarts int
+	dropped  int
 }
 
 func (t *tally) note(format string, a ...any) {
@@ -248,6 +251,9 @@ func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error
 	}
 	if t.restarts > 0 {
 		t.res.Notes = append(t.res.Notes, fmt.Sprintf("files read again from the start (replaced, cut or rewritten): %d", t.restarts))
+	}
+	if t.dropped > 0 {
+		t.res.Notes = append(t.res.Notes, fmt.Sprintf("events of records read again that this reading does not give, dropped: %d", t.dropped))
 	}
 	sort.Strings(t.res.Notes)
 	if err := ctx.Err(); err != nil {
@@ -393,6 +399,9 @@ func (s Transcripts) readJob(ctx context.Context, j *job, t *tally, add func(par
 				return err
 			}
 			p.read++
+			if pl := place(e); len(p.places) == 0 || p.places[len(p.places)-1] != pl {
+				p.places = append(p.places, pl)
+			}
 			if it, ok := toPending(e); ok {
 				p.items = append(p.items, it)
 			}
@@ -515,11 +524,11 @@ func (w *writer) flush(ctx context.Context, b *batch) {
 		if w.t.isFailed(p.j.path) {
 			continue // a part after one that failed would move the cursor past it
 		}
-		ws = append(ws, store.FileWrite{Events: evs[i], Cursor: p.cur})
+		ws = append(ws, store.FileWrite{Events: evs[i], Cursor: p.cur, Places: p.places})
 		read += p.read
 	}
 	w.mu.Lock()
-	n, err := w.st.PutFiles(ctx, ws)
+	n, dropped, err := w.st.PutFiles(ctx, ws)
 	w.mu.Unlock()
 	if err != nil {
 		for _, x := range ws {
@@ -531,6 +540,7 @@ func (w *writer) flush(ctx context.Context, b *batch) {
 	w.t.res.New += n
 	w.t.res.Read += read
 	w.t.unknown += unknown
+	w.t.dropped += dropped
 	w.t.Unlock()
 }
 
@@ -737,6 +747,17 @@ func oneLine(s string, cut bool) string {
 	return s
 }
 
+// place is the prefix of the keys of an item's record (a transcript's line, a Hermes row): the record's offset,
+// after the transcript's file name, which is its session's own, so its events keep their keys when the harness
+// moves or compresses the file, or after the Hermes store. An item's key is its place and its index in the record.
+func place(e evidence.Event) string {
+	name := e.Path
+	if e.Harness != "hermes" {
+		name = evidence.Name(e.Path)
+	}
+	return fmt.Sprintf("%s@%012d#", name, e.Offset)
+}
+
 // toEvent maps one item. The actor follows the kind: the owner's text is his; agent text and tool calls an
 // agent's; a tool's result the tool's; harness text and compactions the harness's. A call the owner made
 // himself (a !command he ran in pi) is his, and an item tacit credits to no one is unknown.
@@ -761,12 +782,6 @@ func toEvent(source string, e evidence.Event, summary string) (store.Event, bool
 	if unknown {
 		actor = store.ActorUnknown
 	}
-	// A transcript's file name is its session's own, so its events keep their keys when the harness moves
-	// or compresses the file; a Hermes row is named by its store.
-	name := e.Path
-	if e.Harness != "hermes" {
-		name = evidence.Name(e.Path)
-	}
 	why := e.Why
 	if why == plainWhy[e.Kind] {
 		why = ""
@@ -779,7 +794,7 @@ func toEvent(source string, e evidence.Event, summary string) (store.Event, bool
 	}
 	return store.Event{
 		Source:    source,
-		SourceKey: fmt.Sprintf("%s@%012d#%03d", name, e.Offset, e.Index),
+		SourceKey: fmt.Sprintf("%s%03d", place(e), e.Index),
 		TS:        e.At,
 		Session:   session,
 		Agent:     e.Subagent,

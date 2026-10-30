@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -136,8 +137,8 @@ func TestRebuildDropsOneSourceAndItsSubstreamsOnly(t *testing.T) {
 	if err := st.Skip(ctx, "radar", "/y", "bad"); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.Rebuild(ctx, "radar"); err != nil {
-		t.Fatal(err)
+	if n, err := st.Rebuild(ctx, "radar", false); err != nil || n != 2 {
+		t.Fatalf("dropped %d, %v; want radar's event and radar-feedback's", n, err)
 	}
 	for src, want := range map[string]int{"radar": 0, "radar-feedback": 0, "mistakes": 1} {
 		evs, _ := st.Events(ctx, Query{Since: time.Unix(0, 0), Source: src})
@@ -159,7 +160,7 @@ func TestRebuildDropsOneSourceAndItsSubstreamsOnly(t *testing.T) {
 	}
 }
 
-func TestAStoreFromAnotherSchemaIsDroppedAndRebuilt(t *testing.T) {
+func TestAStoreFromAnotherSchemaKeepsItsEventsAndDropsItsCursors(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "m.db")
 	old, err := sql.Open("sqlite", "file:"+path)
 	if err != nil {
@@ -181,6 +182,9 @@ func TestAStoreFromAnotherSchemaIsDroppedAndRebuilt(t *testing.T) {
 	ctx := context.Background()
 	if c, _ := st.Cursor(ctx, "mistakes"); c != "" {
 		t.Fatalf("an old cursor survived the schema change: %q", c)
+	}
+	if evs, err := st.Events(ctx, Query{Since: time.UnixMilli(0), Source: "mistakes"}); err != nil || len(evs) != 1 || evs[0].Kind != "correction" {
+		t.Fatalf("the old event: %+v %v", evs, err)
 	}
 	if _, err := st.Put(ctx, []Event{{Source: "s", SourceKey: "k", TS: time.Now(), Actor: ActorOwner, Kind: "x", Meta: `{"a":1}`}}); err != nil {
 		t.Fatalf("the new schema is not in place: %v", err)
@@ -217,13 +221,14 @@ func TestASessionReadsOldestFirst(t *testing.T) {
 	}
 }
 
-// A file cursor is stored with the events before it, read back, dropped by name, and dropped with its source.
+// A file cursor is stored with the events before it, read back, dropped by name, and dropped with its source,
+// which a rebuild drops only when forced.
 func TestFileCursorsGoWithTheirEvents(t *testing.T) {
 	ctx := context.Background()
 	st, _ := open(t)
 	c := FileCursor{Source: "transcripts", Path: "/s/a.jsonl", Inode: 7, FP: "ab", Offset: 42, State: []byte(`{"v":1}`), Size: 50, MTime: 9}
 	ev := Event{Source: "transcripts", SourceKey: "a@1", TS: time.Now(), Actor: ActorAgent, Kind: "agent_text"}
-	if n, err := st.PutFiles(ctx, []FileWrite{{Events: []Event{ev}, Cursor: c}, {Cursor: FileCursor{Source: "transcripts", Path: "/s/b.jsonl"}}}); err != nil || n != 1 {
+	if n, _, err := st.PutFiles(ctx, []FileWrite{{Events: []Event{ev}, Cursor: c}, {Cursor: FileCursor{Source: "transcripts", Path: "/s/b.jsonl"}}}); err != nil || n != 1 {
 		t.Fatalf("put %d, %v", n, err)
 	}
 	cs, err := st.FileCursors(ctx, "transcripts")
@@ -236,34 +241,33 @@ func TestFileCursorsGoWithTheirEvents(t *testing.T) {
 	if cs, _ := st.FileCursors(ctx, "transcripts"); len(cs) != 1 {
 		t.Fatalf("after dropping one: %+v", cs)
 	}
-	if err := st.Rebuild(ctx, "transcripts"); err != nil {
-		t.Fatal(err)
+	if _, err := st.Rebuild(ctx, "transcripts", false); !errors.Is(err, ErrKept) {
+		t.Fatalf("a rebuild of the transcripts without force: %v", err)
+	}
+	if cs, _ := st.FileCursors(ctx, "transcripts"); len(cs) != 1 {
+		t.Fatalf("a refused rebuild dropped the cursors: %+v", cs)
+	}
+	if n, err := st.Rebuild(ctx, "transcripts", true); err != nil || n != 1 {
+		t.Fatalf("a forced rebuild dropped %d, %v", n, err)
 	}
 	if cs, _ := st.FileCursors(ctx, "transcripts"); len(cs) != 0 {
 		t.Fatalf("a rebuilt source kept its file cursors: %+v", cs)
 	}
 }
 
-// A schema change drops the file cursors with the events they go with: a cursor kept alone would make the
-// next ingest pass over what it no longer holds.
-func TestAVersionChangeDropsFileCursorsWithTheirEvents(t *testing.T) {
+// A schema change keeps the events and drops the file cursors: the next ingest reads every transcript still there
+// again, and the events of one deleted since stay.
+func TestASchemaChangeKeepsTheEventsAndDropsTheFileCursors(t *testing.T) {
 	ctx := context.Background()
 	st, path := open(t)
 	c := FileCursor{Source: "transcripts", Path: "/s/a.jsonl", Inode: 7, FP: "ab", Offset: 42, Size: 50, MTime: 9}
 	ev := Event{Source: "transcripts", SourceKey: "a@1", TS: time.Now(), Actor: ActorAgent, Kind: "agent_text"}
-	if _, err := st.PutFiles(ctx, []FileWrite{{Events: []Event{ev}, Cursor: c}}); err != nil {
+	if _, _, err := st.PutFiles(ctx, []FileWrite{{Events: []Event{ev}, Cursor: c}}); err != nil {
 		t.Fatal(err)
 	}
 	st.Close()
-	raw, err := sql.Open("sqlite", "file:"+path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := raw.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion-1)); err != nil {
-		t.Fatal(err)
-	}
-	raw.Close()
-	st, err = Open(path)
+	rollBack(t, path)
+	st, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,8 +275,21 @@ func TestAVersionChangeDropsFileCursorsWithTheirEvents(t *testing.T) {
 	if cs, _ := st.FileCursors(ctx, "transcripts"); len(cs) != 0 {
 		t.Fatalf("file cursors kept across a schema change: %+v", cs)
 	}
-	if evs, _ := st.Events(ctx, Query{Since: time.Unix(0, 0), Source: "transcripts"}); len(evs) != 0 {
-		t.Fatalf("events kept across a schema change: %d", len(evs))
+	if evs, _ := st.Events(ctx, Query{Since: time.Unix(0, 0), Source: "transcripts"}); len(evs) != 1 {
+		t.Fatalf("events after a schema change: %d, want 1", len(evs))
+	}
+}
+
+// rollBack puts a store back at the version before its last step, as the build before it left it.
+func rollBack(t *testing.T, path string) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`DELETE FROM schema_steps WHERE version = (SELECT MAX(version) FROM schema_steps)`); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -285,7 +302,7 @@ func TestPutFilesStoresNoCursorWithoutItsEvents(t *testing.T) {
 		Cursor: FileCursor{Source: "transcripts", Path: "/s/a.jsonl", Offset: 10}}
 	bad := FileWrite{Events: []Event{{Source: "transcripts", TS: time.Now(), Actor: ActorAgent, Kind: "agent_text"}}, // no key
 		Cursor: FileCursor{Source: "transcripts", Path: "/s/b.jsonl", Offset: 20}}
-	if _, err := st.PutFiles(ctx, []FileWrite{good, bad}); err == nil {
+	if _, _, err := st.PutFiles(ctx, []FileWrite{good, bad}); err == nil {
 		t.Fatal("an event without a key was stored")
 	}
 	if cs, _ := st.FileCursors(ctx, "transcripts"); len(cs) != 0 {

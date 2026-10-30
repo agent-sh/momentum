@@ -1,8 +1,10 @@
 // Package store is momentum's local SQLite store: normalized events from every source, and the state that
-// makes ingestion incremental. Most of it is derived: any source that reads a signal store can be dropped and
-// read again (Rebuild). The events of `momentum sessions` are observations instead (Sessions): nothing can read
-// them again, so they survive a schema change and Rebuild refuses them. Bulky material stays where it is; an
-// event keeps a reference to it.
+// makes ingestion incremental. The events are kept: a schema change migrates them and never drops them, since a
+// harness deletes its transcripts after a while and the observations of `momentum sessions` are nowhere else.
+// What the sources and the session trackers derive from what they read (where each stopped, their checkpoints)
+// is a cache: a schema change drops it, and the next run reads again. A source that reads a signal store can be
+// dropped and read again (Rebuild); the transcripts only when forced, the observations never. Bulky material
+// stays where it is; an event keeps a reference to it.
 package store
 
 import (
@@ -72,6 +74,17 @@ const Sessions = "sessions"
 // ErrObserved means a source's events are observations, which cannot be read again.
 var ErrObserved = errors.New("its events are observations, not read from a source, so they cannot be read again")
 
+// Transcripts is the source of the agents' session history. A harness deletes its transcripts after a while
+// (Claude Code after about 30 days), so its events can be all that is left of them.
+const Transcripts = "transcripts"
+
+// ErrKept means a source's events may be all that is left of what it read: Rebuild drops them only when forced.
+var ErrKept = errors.New("its events are kept: a transcript its harness deleted since cannot be read again")
+
+// Harnesses are the names events give the harnesses, one spelling in every source and in the sessions layer:
+// tacit's reader's (claude, codex, pi, hermes), and opencode, which only the sessions layer reads.
+var Harnesses = []string{"claude", "codex", "pi", "opencode", "hermes"}
+
 // querier is what a statement runs on: the database, or one transaction.
 type querier interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
@@ -80,15 +93,57 @@ type querier interface {
 	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
 }
 
-const schema = `
-CREATE TABLE IF NOT EXISTS events (
-  id TEXT PRIMARY KEY, source TEXT NOT NULL, source_key TEXT NOT NULL, ts INTEGER NOT NULL,
-  session TEXT, agent TEXT, harness TEXT, model TEXT, cwd TEXT, actor TEXT NOT NULL, kind TEXT NOT NULL,
-  tool TEXT, summary TEXT, meta TEXT, ref TEXT, heuristic INTEGER NOT NULL DEFAULT 0,
-  experiment TEXT NOT NULL DEFAULT '', ingested INTEGER NOT NULL);
+// The store's tables are of two kinds.
+//
+// Kept tables hold what cannot be read again: every event, and when each live session entered its phase. A
+// schema change migrates them and never drops them. A kept table missing is made with the columns it was first
+// made with (keptTables), it gains each later column it lacks (keptColumns), and its rows change only in a step.
+//
+// Derived tables hold what the sources and the session trackers derived from what they read: where each source
+// stopped (with tacit's saved reader state), the files it parsed, what it could not parse, and the trackers'
+// checkpoints. Each step drops them, so the next ingest reads every source again from its start, and the next
+// sessions run reads every transcript once. Reading again cannot store an event twice (PutFiles).
+
+// keptTables makes the kept tables as they were first made, and schema_steps, the steps a store has taken.
+const keptTables = `
+CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, source TEXT NOT NULL, source_key TEXT NOT NULL,
+  ts INTEGER NOT NULL, actor TEXT NOT NULL, kind TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_stamps (key TEXT PRIMARY KEY, phase TEXT NOT NULL, since INTEGER NOT NULL,
+  seq INTEGER NOT NULL, seen INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS schema_steps (version INTEGER PRIMARY KEY, at INTEGER NOT NULL);
+`
+
+// keptColumns are the columns each kept table gained after it was first made, in order. A table that lacks one
+// gains it and keeps its rows: SQLite's ADD COLUMN writes no row, so it costs the same on any table. The next
+// column is one more entry here. A NOT NULL column needs a default other than NULL, and an added column cannot be
+// a key. The events from before it hold its default; for the sources to fill it in the events whose transcripts
+// are still there, add a step as well.
+var keptColumns = []struct {
+	table   string
+	columns [][2]string
+}{
+	{"events", [][2]string{{"session", "TEXT NOT NULL DEFAULT ''"}, {"agent", "TEXT NOT NULL DEFAULT ''"},
+		{"harness", "TEXT NOT NULL DEFAULT ''"}, {"model", "TEXT NOT NULL DEFAULT ''"}, {"cwd", "TEXT NOT NULL DEFAULT ''"},
+		{"tool", "TEXT NOT NULL DEFAULT ''"}, {"summary", "TEXT NOT NULL DEFAULT ''"}, {"meta", "TEXT NOT NULL DEFAULT ''"},
+		{"ref", "TEXT NOT NULL DEFAULT ''"}, {"heuristic", "INTEGER NOT NULL DEFAULT 0"},
+		{"experiment", "TEXT NOT NULL DEFAULT ''"}, {"ingested", "INTEGER NOT NULL DEFAULT 0"}}},
+	{"session_stamps", [][2]string{{"tool", "TEXT NOT NULL DEFAULT ''"}, {"name", "TEXT NOT NULL DEFAULT ''"},
+		{"auto", "INTEGER NOT NULL DEFAULT 0"}, {"ask", "TEXT NOT NULL DEFAULT ''"}, {"ask_kind", "TEXT NOT NULL DEFAULT ''"}}},
+}
+
+// keptIndexes are the events' indexes. events_key finds a record's events by the prefix of their keys (PutFiles)
+// and a source's events, as events_source did.
+const keptIndexes = `
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS events_kind ON events(kind, ts);
-CREATE INDEX IF NOT EXISTS events_source ON events(source);
+CREATE INDEX IF NOT EXISTS events_session ON events(session, ts);
+CREATE INDEX IF NOT EXISTS events_key ON events(source, source_key);
+`
+
+var keptIndexNames = []string{"events_ts", "events_kind", "events_session", "events_key"}
+
+// derivedSchema makes the derived tables that are missing.
+const derivedSchema = `
 CREATE TABLE IF NOT EXISTS cursors (source TEXT PRIMARY KEY, position TEXT NOT NULL, updated INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS seen_files (source TEXT NOT NULL, path TEXT NOT NULL, mtime INTEGER NOT NULL,
   size INTEGER NOT NULL, PRIMARY KEY (source, path));
@@ -98,11 +153,38 @@ CREATE TABLE IF NOT EXISTS trackers (tool TEXT NOT NULL, key TEXT NOT NULL, buil
   log_base INTEGER NOT NULL, log_seq INTEGER NOT NULL, seen INTEGER NOT NULL, PRIMARY KEY (tool, key));
 CREATE TABLE IF NOT EXISTS tracker_log (tool TEXT NOT NULL, key TEXT NOT NULL, seq INTEGER NOT NULL, role TEXT NOT NULL,
   name TEXT NOT NULL, origin TEXT NOT NULL, text TEXT NOT NULL, PRIMARY KEY (tool, key, seq)) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS events_session ON events(session, ts);
 CREATE TABLE IF NOT EXISTS file_cursors (source TEXT NOT NULL, path TEXT NOT NULL, inode INTEGER NOT NULL, fp TEXT NOT NULL,
   compressed INTEGER NOT NULL, offset INTEGER NOT NULL, state BLOB, size INTEGER NOT NULL, mtime INTEGER NOT NULL,
   updated INTEGER NOT NULL, PRIMARY KEY (source, path));
 `
+
+// derivedTables are the derived tables. The file cursors say how far a source's events of one file go, with the
+// reader's saved state there: dropped, the next ingest reads every transcript again from its start, a few
+// minutes of CPU once, and a transcript its harness deleted since is not read again: its events stay as they are.
+var derivedTables = []string{"cursors", "seen_files", "skipped", "trackers", "tracker_log", "file_cursors"}
+
+// step is a change to the kept tables' rows or indexes, run once, in order, in the transaction that opens a store
+// from before it, and recorded in schema_steps. A step also drops the derived tables, so the next ingest reads
+// every source again: what changed in how the sources read applies wherever they still hold what they read, and
+// the events of what they no longer hold stay as they were. A step runs on a store at the version before it.
+type step struct {
+	version int
+	sql     string
+}
+
+// steps are the schema's changes since the events are kept; their versions go on from legacyVersion. The next
+// change to a kept table's rows is one more step here.
+var steps = []step{
+	// The events are kept, and a record's events are found by their keys (events_key, which serves what
+	// events_source served). Every harness has one name, tacit's reader's: Claude Code is claude.
+	{4, `DROP INDEX IF EXISTS events_source; UPDATE events SET harness = 'claude' WHERE harness = 'claude-code'`},
+}
+
+// legacyVersion is the last version user_version counted. A build up to it drops every derived table, the events
+// among them, when user_version is another number, so user_version stays at it: a build from before the events
+// were kept, opening a store migrated since, finds its own version and drops nothing. The versions since are the
+// steps in schema_steps.
+const legacyVersion = 3
 
 // BusyTimeout is how long a statement waits for another connection's write transaction before it fails, and how
 // long a sessions run waits for the one before it.
@@ -153,38 +235,8 @@ func busy(err error) bool {
 	return errors.As(err, &c) && c.Code()&0xff == 5
 }
 
-// stateSchema holds what cannot be derived from the sources: it is created when missing and never dropped,
-// so a change to one of these tables needs a real migration, not a version bump.
-//   - session_stamps: when each live session entered its phase (sessions/state), kept between runs, with what a
-//     later run needs to report the session once it is gone.
-const stateSchema = `
-CREATE TABLE IF NOT EXISTS session_stamps (key TEXT PRIMARY KEY, phase TEXT NOT NULL, since INTEGER NOT NULL,
-  seq INTEGER NOT NULL, seen INTEGER NOT NULL, tool TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '',
-  auto INTEGER NOT NULL DEFAULT 0, ask TEXT NOT NULL DEFAULT '', ask_kind TEXT NOT NULL DEFAULT '');
-`
-
-// stampColumns are the columns session_stamps gained after it was first made. A store from before gets them,
-// and keeps its stamps.
-var stampColumns = [][2]string{{"tool", "TEXT NOT NULL DEFAULT ''"}, {"name", "TEXT NOT NULL DEFAULT ''"},
-	{"auto", "INTEGER NOT NULL DEFAULT 0"}, {"ask", "TEXT NOT NULL DEFAULT ''"}, {"ask_kind", "TEXT NOT NULL DEFAULT ''"}}
-
-// schemaVersion is bumped on every change to the derived schema (adding a table is not one: it is created when
-// missing). Everything in it is derived from the sources, so a store at another version drops those tables and
-// the next ingest reads every source again, and the next sessions run reads every transcript. Two things are not
-// touched by that: the state tables (stateSchema), and the observed events (Sessions), which move to the new
-// events table column by column (keepObserved).
-//   - 3: the transcripts source's file cursors (file_cursors) and the index a session is read by
-//     (events_session).
-const schemaVersion = 3
-
-// derivedTables are the tables of the derived schema, and derivedIndexes its indexes. The file cursors are
-// derived: each says how far a source's events of one file go, with the reader's saved state there, so they go
-// with those events. Dropped, the next ingest reads every transcript again from its start, a few minutes of CPU
-// once; a transcript its harness deleted since is not read again, and its events are not stored again.
-var (
-	derivedTables  = []string{"events", "cursors", "seen_files", "skipped", "trackers", "tracker_log", "file_cursors"}
-	derivedIndexes = []string{"events_ts", "events_kind", "events_source", "events_session"}
-)
+// keptTableNames are the tables keptTables makes.
+var keptTableNames = []string{"events", "session_stamps", "schema_steps"}
 
 // checkpointColumns are the columns the schema gives the checkpoint tables. They are a cache of what transcripts
 // hold, so tables with other columns (a build before this one made them) are dropped and made again, and the next
@@ -194,9 +246,31 @@ var checkpointColumns = map[string][]string{
 	"tracker_log": {"tool", "key", "seq", "role", "name", "origin", "text"},
 }
 
+// latest is this build's schema version: its last step's.
+func latest() int { return steps[len(steps)-1].version }
+
+// version is a store's schema version: the last step it took, or before any, its user_version.
+func version(q querier) (int, error) {
+	ctx := context.Background()
+	var v, n int
+	if err := q.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&v); err != nil {
+		return 0, err
+	}
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_steps'`).Scan(&n); err != nil || n == 0 {
+		return v, err
+	}
+	var last sql.NullInt64
+	if err := q.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_steps`).Scan(&last); err != nil {
+		return 0, err
+	}
+	return max(v, int(last.Int64)), nil
+}
+
 // migrate brings the store to this schema. It checks with reads first, so opening a store that is up to date
 // never waits for a writer. Otherwise it changes the store in one write transaction, which takes the lock up front
-// (two first opens after an upgrade take turns), and checks again inside it.
+// (two first opens after an upgrade take turns), and reads the version again inside it: the kept tables gain what
+// they lack, the steps the store has not taken run after the derived tables are dropped, and what is missing is
+// made. A store at a version newer than this build's is refused, unchanged: this build does not know its steps.
 func migrate(db *sql.DB) error {
 	if ok, err := current(db); err != nil || ok {
 		return err
@@ -206,68 +280,73 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(stateSchema); err != nil {
+	v, err := version(tx)
+	if err != nil {
 		return err
 	}
-	if err := addColumns(tx, "session_stamps", stampColumns); err != nil {
+	if v > latest() {
+		return fmt.Errorf("its schema is version %d, newer than this build's %d: open it with a newer build", v, latest())
+	}
+	if _, err := tx.Exec(keptTables); err != nil {
 		return err
 	}
-	var v int
-	if err := tx.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+	for _, k := range keptColumns {
+		if err := addColumns(tx, k.table, k.columns); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(keptIndexes); err != nil {
 		return err
 	}
-	if v == schemaVersion {
-		for t, want := range checkpointColumns {
-			have, err := columns(tx, "main", t)
-			if err != nil {
+	var pending []step
+	for _, s := range steps {
+		if s.version > v {
+			pending = append(pending, s)
+		}
+	}
+	if len(pending) > 0 {
+		for _, t := range derivedTables {
+			if _, err := tx.Exec(`DROP TABLE IF EXISTS ` + t); err != nil {
 				return err
 			}
-			if len(have) > 0 && !slices.Equal(have.names(), want) {
-				if _, err := tx.Exec(`DROP TABLE IF EXISTS trackers; DROP TABLE IF EXISTS tracker_log`); err != nil {
-					return err
-				}
-				break
+		}
+	}
+	now := time.Now().UnixMilli()
+	for _, s := range pending {
+		if _, err := tx.Exec(s.sql); err != nil {
+			return fmt.Errorf("step %d: %w", s.version, err)
+		}
+		if _, err := tx.Exec(`INSERT INTO schema_steps (version, at) VALUES (?, ?)`, s.version, now); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, legacyVersion)); err != nil {
+		return err
+	}
+	for t, want := range checkpointColumns {
+		have, err := columns(tx, t)
+		if err != nil {
+			return err
+		}
+		if len(have) > 0 && !slices.Equal(have, want) {
+			if _, err := tx.Exec(`DROP TABLE IF EXISTS trackers; DROP TABLE IF EXISTS tracker_log`); err != nil {
+				return err
 			}
-		}
-		if _, err := tx.Exec(schema); err != nil {
-			return err
-		}
-		return tx.Commit()
-	}
-	var hadEvents int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'events'`).Scan(&hadEvents); err != nil {
-		return err
-	}
-	if hadEvents > 0 {
-		if _, err := tx.Exec(`CREATE TEMP TABLE observed AS SELECT * FROM events WHERE source = ?`, Sessions); err != nil {
-			return err
+			break
 		}
 	}
-	for _, t := range derivedTables {
-		if _, err := tx.Exec(`DROP TABLE IF EXISTS ` + t); err != nil {
-			return err
-		}
-	}
-	if _, err := tx.Exec(schema); err != nil {
-		return err
-	}
-	if hadEvents > 0 {
-		if err := keepObserved(tx); err != nil {
-			return fmt.Errorf("keeping the %s events: %w", Sessions, err)
-		}
-	}
-	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
+	if _, err := tx.Exec(derivedSchema); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-// current reports, with reads alone, whether the store already has this schema: its version, every table and
-// index, the stamps' columns and the checkpoint tables' columns.
+// current reports, with reads alone, whether the store already has this schema: user_version, the version of
+// its steps, every table and index, and the columns of the kept tables and the checkpoint tables.
 func current(q querier) (bool, error) {
 	ctx := context.Background()
-	var v int
-	if err := q.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&v); err != nil || v != schemaVersion {
+	var uv int
+	if err := q.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&uv); err != nil || uv != legacyVersion {
 		return false, err
 	}
 	rows, err := q.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type IN ('table', 'index')`)
@@ -287,116 +366,60 @@ func current(q querier) (bool, error) {
 	if err := rows.Err(); err != nil {
 		return false, err
 	}
-	for _, n := range append(append([]string{"session_stamps"}, derivedTables...), derivedIndexes...) {
+	for _, n := range slices.Concat(keptTableNames, derivedTables, keptIndexNames) {
 		if !have[n] {
 			return false, nil
 		}
 	}
-	stamps, err := columns(q, "main", "session_stamps")
-	if err != nil {
+	if v, err := version(q); err != nil || v != latest() {
 		return false, err
 	}
-	for _, c := range stampColumns {
-		if !stamps.has(c[0]) {
-			return false, nil
+	for _, k := range keptColumns {
+		cols, err := columns(q, k.table)
+		if err != nil {
+			return false, err
+		}
+		for _, c := range k.columns {
+			if !slices.Contains(cols, c[0]) {
+				return false, nil
+			}
 		}
 	}
 	for t, want := range checkpointColumns {
-		cols, err := columns(q, "main", t)
-		if err != nil || !slices.Equal(cols.names(), want) {
+		cols, err := columns(q, t)
+		if err != nil || !slices.Equal(cols, want) {
 			return false, err
 		}
 	}
 	return true, nil
 }
 
-// keepObserved moves the observed events from the old events table (copied to temp.observed) into the new one,
-// column by column: a column the old table lacked gets its default, else an empty value as Put writes, and
-// ingested gets the time of the move.
-func keepObserved(tx *sql.Tx) error {
-	old, err := columns(tx, "temp", "observed")
-	if err != nil {
-		return err
-	}
-	cur, err := columns(tx, "main", "events")
-	if err != nil {
-		return err
-	}
-	var names, values []string
-	for _, c := range cur {
-		empty := "''"
-		if strings.Contains(strings.ToUpper(c.typ), "INT") {
-			empty = "0"
-		}
-		switch {
-		case old.has(c.name):
-			names, values = append(names, c.name), append(values, "COALESCE("+c.name+", "+empty+")")
-		case c.name == "ingested":
-			names, values = append(names, c.name), append(values, fmt.Sprint(time.Now().UnixMilli()))
-		case !c.defaulted:
-			names, values = append(names, c.name), append(values, empty)
-		}
-	}
-	if _, err := tx.Exec(`INSERT OR IGNORE INTO events (` + strings.Join(names, ", ") + `) SELECT ` +
-		strings.Join(values, ", ") + ` FROM temp.observed`); err != nil {
-		return err
-	}
-	_, err = tx.Exec(`DROP TABLE temp.observed`)
-	return err
-}
-
-type column struct {
-	name, typ string
-	defaulted bool
-}
-
-type columnList []column
-
 // columns lists a table's columns in order.
-func columns(q querier, schema, table string) (columnList, error) {
-	rows, err := q.QueryContext(context.Background(), `SELECT name, type, dflt_value FROM pragma_table_info(?, ?)`, table, schema)
+func columns(q querier, table string) ([]string, error) {
+	rows, err := q.QueryContext(context.Background(), `SELECT name FROM pragma_table_info(?)`, table)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out columnList
+	var out []string
 	for rows.Next() {
-		var c column
-		var dflt sql.NullString
-		if err := rows.Scan(&c.name, &c.typ, &dflt); err != nil {
+		var n string
+		if err := rows.Scan(&n); err != nil {
 			return nil, err
 		}
-		c.defaulted = dflt.Valid
-		out = append(out, c)
+		out = append(out, n)
 	}
 	return out, rows.Err()
 }
 
-func (cs columnList) names() []string {
-	out := make([]string, len(cs))
-	for i, c := range cs {
-		out[i] = c.name
-	}
-	return out
-}
-
-func (cs columnList) has(name string) bool {
-	for _, c := range cs {
-		if c.name == name {
-			return true
-		}
-	}
-	return false
-}
-
-// addColumns adds to a state table the columns it lacks.
+// addColumns adds to a kept table the columns it lacks.
 func addColumns(tx *sql.Tx, table string, want [][2]string) error {
-	have, err := columns(tx, "main", table)
+	have, err := columns(tx, table)
 	if err != nil {
 		return err
 	}
 	for _, c := range want {
-		if !have.has(c[0]) {
+		if !slices.Contains(have, c[0]) {
 			if _, err := tx.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + c[0] + ` ` + c[1]); err != nil {
 				return err
 			}
@@ -502,37 +525,85 @@ func (s *Store) FileCursors(ctx context.Context, source string) (map[string]File
 	return out, rows.Err()
 }
 
-// FileWrite is a part of a file read: its events and the file's cursor after them.
+// FileWrite is a part of a file read: its events, the file's cursor after them, and the records it read. Places
+// are the prefixes of their keys, one per record (a transcript's line, a Hermes row): what a record's events'
+// keys start with, and no other record's do.
 type FileWrite struct {
 	Events []Event
 	Cursor FileCursor
+	Places []string
 }
 
 // PutFiles stores parts of files in one transaction, each part's events with the cursor after them, so a
-// cursor never runs ahead of what was stored. It returns how many events were new.
-func (s *Store) PutFiles(ctx context.Context, ws []FileWrite) (int, error) {
+// cursor never runs ahead of what was stored. A record read again holds what this reading of it stores, and
+// nothing of an earlier one: an event stored under one of a part's places that the part does not hold is dropped
+// (a reader that now splits a turn otherwise numbers its events otherwise). It returns how many events were new,
+// and how many were dropped so.
+func (s *Store) PutFiles(ctx context.Context, ws []FileWrite) (added, dropped int, err error) {
 	if len(ws) == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer tx.Rollback()
+	held, err := tx.PrepareContext(ctx, `SELECT id FROM events WHERE source = ? AND source_key >= ? AND source_key < ?`)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer held.Close()
+	drop, err := tx.PrepareContext(ctx, `DELETE FROM events WHERE id = ?`)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer drop.Close()
 	var evs []Event
 	for _, w := range ws {
+		stale := map[string]bool{}
+		for _, p := range w.Places {
+			if p == "" {
+				continue
+			}
+			// The keys that start with p, by the index on them: from p up to p with its last byte one higher
+			// (keys are text: no byte of theirs is 0xff).
+			rows, err := held.QueryContext(ctx, w.Cursor.Source, p, p[:len(p)-1]+string([]byte{p[len(p)-1] + 1}))
+			if err != nil {
+				return 0, 0, err
+			}
+			for rows.Next() {
+				var id string
+				if err := rows.Scan(&id); err != nil {
+					rows.Close()
+					return 0, 0, err
+				}
+				stale[id] = true
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return 0, 0, err
+			}
+		}
+		for _, e := range w.Events {
+			delete(stale, e.ID())
+		}
+		for id := range stale {
+			if _, err := drop.ExecContext(ctx, id); err != nil {
+				return 0, 0, err
+			}
+			dropped++
+		}
 		evs = append(evs, w.Events...)
 	}
-	added, err := put(ctx, tx, evs)
-	if err != nil {
-		return 0, err
+	if added, err = put(ctx, tx, evs); err != nil {
+		return 0, 0, err
 	}
 	cur, err := tx.PrepareContext(ctx, `INSERT INTO file_cursors (source, path, inode, fp, compressed, offset, state,
 	  size, mtime, updated) VALUES (?,?,?,?,?,?,?,?,?,?)
 	  ON CONFLICT(source, path) DO UPDATE SET inode=excluded.inode, fp=excluded.fp, compressed=excluded.compressed,
 	    offset=excluded.offset, state=excluded.state, size=excluded.size, mtime=excluded.mtime, updated=excluded.updated`)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer cur.Close()
 	now := time.Now().UnixMilli()
@@ -540,10 +611,10 @@ func (s *Store) PutFiles(ctx context.Context, ws []FileWrite) (int, error) {
 		c := w.Cursor
 		if _, err := cur.ExecContext(ctx, c.Source, c.Path, int64(c.Inode), c.FP, c.Compressed, c.Offset, c.State, c.Size,
 			c.MTime, now); err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 	}
-	return added, tx.Commit()
+	return added, dropped, tx.Commit()
 }
 
 // DropFileCursors forgets the cursors of files a source no longer finds. Their events stay.
@@ -612,36 +683,76 @@ func (s *Store) Skipped(ctx context.Context, source string) (int, error) {
 	return n, err
 }
 
-// Rebuild drops everything a source contributed, so the next ingest reads it again from the start.
-// Sources share one state space by name prefix: "radar" also drops "radar-feedback". The observed events
-// (Sessions) cannot be read again, so Rebuild refuses them with ErrObserved.
-func (s *Store) Rebuild(ctx context.Context, source string) error {
-	if source == Sessions {
-		return fmt.Errorf("%s: %w", source, ErrObserved)
+// Rebuild drops everything a source contributed, so the next ingest reads it again from the start, and returns
+// how many events it dropped. Sources share one state space by name prefix: "radar" also drops "radar-feedback".
+// The observed events (Sessions) cannot be read again, so Rebuild refuses them with ErrObserved. The transcripts'
+// events can be all that is left of transcripts their harness deleted, so without force Rebuild refuses them with
+// ErrKept.
+func (s *Store) Rebuild(ctx context.Context, source string, force bool) (int, error) {
+	switch {
+	case source == Sessions:
+		return 0, fmt.Errorf("%s: %w", source, ErrObserved)
+	case source == Transcripts && !force:
+		return 0, fmt.Errorf("%s: %w", source, ErrKept)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback()
 	like := source + "-%"
+	res, err := tx.ExecContext(ctx, `DELETE FROM events WHERE source=? OR source LIKE ?`, source, like)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
 	for _, q := range []string{
-		`DELETE FROM events WHERE source=? OR source LIKE ?`,
 		`DELETE FROM cursors WHERE source=? OR source LIKE ?`,
 		`DELETE FROM seen_files WHERE source=? OR source LIKE ?`,
 		`DELETE FROM skipped WHERE source=? OR source LIKE ?`,
 		`DELETE FROM file_cursors WHERE source=? OR source LIKE ?`,
 	} {
 		if _, err := tx.ExecContext(ctx, q, source, like); err != nil {
-			return err
+			return 0, err
 		}
 	}
-	return tx.Commit()
+	return int(n), tx.Commit()
+}
+
+// Origin is where events were read from: the file or store their Ref names (all of it before its last '@'),
+// with their harness, session and subagent.
+type Origin struct{ Harness, Path, Session, Agent string }
+
+// Origins counts a source's events by where they were read from.
+func (s *Store) Origins(ctx context.Context, source string) (map[Origin]int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT harness, ref, session, agent FROM events WHERE source = ?`, source)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[Origin]int{}
+	for rows.Next() {
+		var o Origin
+		var ref string
+		if err := rows.Scan(&o.Harness, &ref, &o.Session, &o.Agent); err != nil {
+			return nil, err
+		}
+		o.Path = ref
+		if i := strings.LastIndexByte(ref, '@'); i >= 0 {
+			o.Path = ref[:i]
+		}
+		out[o]++
+	}
+	return out, rows.Err()
 }
 
 // Query selects events newest first, or, with Session (an id or its first characters), one session's events
 // with its subagents' at any depth, oldest first: a session reads as what happened, in order. Events of one
-// moment keep their order in the source (SourceKey). Until, when set, is the end of the window.
+// moment keep their order in the source (SourceKey). Until, when set, is the end of the window. Harness, when
+// set, is one of Harnesses: its events from every source.
 type Query struct {
 	Since   time.Time
 	Kinds   []string
@@ -649,6 +760,7 @@ type Query struct {
 	Session string
 	Until   time.Time
 	Limit   int
+	Harness string
 }
 
 func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
@@ -661,6 +773,9 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 	}
 	if q.Source != "" {
 		where, args = append(where, "source = ?"), append(args, q.Source)
+	}
+	if q.Harness != "" {
+		where, args = append(where, "harness = ?"), append(args, q.Harness)
 	}
 	if !q.Until.IsZero() {
 		where, args = append(where, "ts < ?"), append(args, q.Until.UnixMilli())

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,10 +26,15 @@ var version = "0.0.0-dev"
 
 const usage = `usage:
   momentum evidence ingest              read what is new in every configured source into the store
-  momentum evidence events [--since WHEN] [--until WHEN] [--kind K,K] [--source S] [--session ID] [--limit N] [--json]
-                                        events, newest first; one session's (an id or its start) oldest first
+  momentum evidence events [--since WHEN] [--until WHEN] [--kind K,K] [--source S] [--harness H] [--session ID]
+                           [--limit N] [--json]
+                                        events, newest first; one session's (an id or its start) oldest first;
+                                        H is claude, codex, pi, opencode or hermes
   momentum evidence status [--since DUR]   events per source and kind, and unparsed records
-  momentum evidence rebuild SOURCE      drop what SOURCE contributed; the next ingest reads it from the start
+  momentum evidence rebuild SOURCE [--force]
+                                        drop what SOURCE contributed; the next ingest reads it from the start
+                                        (not sessions; transcripts only with --force, which says how many of
+                                        their events have no source left)
   momentum sessions [--json] [--all]    the live agent sessions and their phases, read without a model;
                                         each phase change is kept as an event of source sessions
   momentum version
@@ -89,10 +95,7 @@ func evidence(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	case "status":
 		return status(ctx, args[1:], stdout)
 	case "rebuild":
-		if len(args) != 2 {
-			return usageError{"rebuild needs one source name"}
-		}
-		return rebuild(ctx, args[1], stdout)
+		return rebuild(ctx, args[1:], stdout)
 	}
 	return usageError{fmt.Sprintf("unknown evidence command %q", args[0])}
 }
@@ -156,6 +159,7 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	until := fs.String("until", "", "until when")
 	kinds := fs.String("kind", "", "comma-separated kinds")
 	src := fs.String("source", "", "one source")
+	harness := fs.String("harness", "", "one harness's events, from every source: "+strings.Join(store.Harnesses, ", "))
 	session := fs.String("session", "", "one session, by its id or its start; oldest first")
 	limit := fs.Int("limit", 50, "most events to print (0: 200)")
 	asJSON := fs.Bool("json", false, "one JSON object per line")
@@ -174,8 +178,11 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 			return usageError{err.Error()}
 		}
 	}
+	if *harness != "" && !slices.Contains(store.Harnesses, *harness) {
+		return usageError{fmt.Sprintf("unknown harness %q: one of %s", *harness, strings.Join(store.Harnesses, ", "))}
+	}
 	var err error
-	q := store.Query{Since: from, Source: *src, Session: *session, Limit: *limit + 1}
+	q := store.Query{Since: from, Source: *src, Harness: *harness, Session: *session, Limit: *limit + 1}
 	if *until != "" {
 		if q.Until, err = parseWhen(*until); err != nil {
 			return usageError{err.Error()}
@@ -267,18 +274,53 @@ func status(ctx context.Context, args []string, stdout io.Writer) error {
 	return nil
 }
 
-func rebuild(ctx context.Context, name string, stdout io.Writer) error {
+// rebuild drops what a source contributed. The transcripts' events can be all that is left of transcripts their
+// harness deleted, so they go only with --force, which counts first how many of them have no source left. The
+// flag may come before or after the source's name.
+func rebuild(ctx context.Context, args []string, stdout io.Writer) error {
+	var name string
+	force := false
+	for _, a := range args {
+		switch {
+		case a == "--force" || a == "-force":
+			force = true
+		case strings.HasPrefix(a, "-"):
+			return usageError{fmt.Sprintf("rebuild: unknown flag %q", a)}
+		case name != "":
+			return usageError{"rebuild needs one source name"}
+		default:
+			name = a
+		}
+	}
+	if name == "" {
+		return usageError{"rebuild needs one source name"}
+	}
 	st, err := store.Open(paths.DB())
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	if err := st.Rebuild(ctx, name); errors.Is(err, store.ErrObserved) {
+	gone := 0
+	if name == store.Transcripts && force {
+		if gone, err = (source.Transcripts{}).Gone(ctx, st); err != nil {
+			return err
+		}
+	}
+	n, err := st.Rebuild(ctx, name, force)
+	switch {
+	case errors.Is(err, store.ErrObserved):
 		return usageError{err.Error()}
-	} else if err != nil {
+	case errors.Is(err, store.ErrKept):
+		return usageError{err.Error() + "; --force drops them all the same"}
+	case err != nil:
 		return err
 	}
-	fmt.Fprintf(stdout, "%s: dropped; the next ingest reads it from the start\n", name)
+	if name != store.Transcripts {
+		fmt.Fprintf(stdout, "%s: dropped %d events; the next ingest reads it from the start\n", name, n)
+		return nil
+	}
+	fmt.Fprintf(stdout, "%s: dropped %d events; %d of them have no source left and are gone for good; the next ingest reads the rest from the start\n",
+		name, n, gone)
 	return nil
 }
 

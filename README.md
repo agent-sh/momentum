@@ -10,13 +10,14 @@ Status: milestone 1 (the evidence layer) in progress. See [SPEC.md](SPEC.md).
 
 ```
 momentum evidence ingest              read what is new in every configured source
-momentum evidence events --since 1d   events, newest first (--kind, --source, --until, --json)
+momentum evidence events --since 1d   events, newest first (--kind, --source, --harness, --until, --json)
 momentum evidence events --session ID one session's events, its subagents' among them, oldest first
 momentum evidence status              events per source and kind, and unparsed records
-momentum evidence rebuild SOURCE      drop a source's events; the next ingest reads it again (not sessions)
+momentum evidence rebuild SOURCE      drop a source's events; the next ingest reads it again
+                                      (not sessions; transcripts only with --force)
 ```
 
-Each event records who produced it (owner, agent, tool, harness, detector), and whether an experiment or a test produced it. The store lives in `~/.local/share/momentum`, mode 0600.
+Each event records who produced it (owner, agent, tool, harness, detector), and whether an experiment or a test produced it. Every source names a harness the same way: claude, codex, pi, opencode, hermes. The store lives in `~/.local/share/momentum`, mode 0600. A schema change keeps every event; it drops only what the sources derive (their cursors), and the next ingest reads them again.
 
 Source locations are machine-specific, so momentum ships none. List them in `~/.config/momentum/sources.json`; leave out any you do not have:
 
@@ -29,7 +30,7 @@ Source locations are machine-specific, so momentum ships none. List them in `~/.
 }
 ```
 
-`transcripts` reads the agents' session history with [tacit](https://github.com/agent-sh/tacit)'s reader: Claude Code with its subagents, Codex with its compressed rollouts, pi with its tasks, and the Hermes store, where tacit finds them under each home (pi's variables and `TACIT_HERMES_DB` apply). Each item is one event, credited by tacit's attribution. Events hold only redacted text, so [scrump](https://github.com/avifenesh/scrump) with its text profile must be on `PATH`; without it the source stores nothing and fails. The reader's saved position in each transcript keeps some of its lines unredacted, in the same private store. `"workers"` sets how many files an ingest reads at once (default: a third of the cores).
+`transcripts` reads the agents' session history with [tacit](https://github.com/agent-sh/tacit)'s reader: Claude Code with its subagents, Codex with its compressed rollouts, pi with its tasks, and the Hermes store, where tacit finds them under each home (pi's variables and `TACIT_HERMES_DB` apply). Each item is one event, credited by tacit's attribution. Events hold only redacted text, so [scrump](https://github.com/avifenesh/scrump) with its text profile must be on `PATH`; without it the source stores nothing and fails. The reader's saved position in each transcript keeps some of its lines unredacted, in the same private store. `"workers"` sets how many files an ingest reads at once (default: a third of the cores). Claude Code deletes a transcript after about 30 days, so its events can be all that is left of it: `evidence rebuild transcripts` needs `--force`, and then says how many events have no source left.
 
 ## Sessions
 
