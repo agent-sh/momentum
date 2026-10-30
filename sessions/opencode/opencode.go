@@ -185,6 +185,7 @@ func (src *Source) session(ctx context.Context, slot proc.Slot, used map[string]
 	crs, err := db.QueryContext(ctx, `select id, title, time_created, time_updated from session where parent_id = ? and time_updated > ?`,
 		id, w.Now.Add(-childWindow).UnixMilli())
 	if err != nil {
+		s.Partial = true
 		return s, errors.Join(append(errs, fmt.Errorf("subagents: %w", err))...)
 	}
 	type child struct {
@@ -209,7 +210,9 @@ func (src *Source) session(ctx context.Context, slot proc.Slot, used map[string]
 				Started: time.UnixMilli(k.c), LastActive: time.UnixMilli(k.u), Now: cs.Now})
 		}
 	}
-	return s, errors.Join(errs...)
+	err = errors.Join(errs...)
+	s.Partial = err != nil // a query of its own failed: its facts may be short
+	return s, err
 }
 
 func (src *Source) logOf(key string) *dbLog {

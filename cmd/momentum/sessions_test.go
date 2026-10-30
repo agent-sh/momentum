@@ -262,3 +262,108 @@ func TestASourceThatFailsDoesNotMakeItsSessionsVanish(t *testing.T) {
 		t.Fatalf("one appearance and no departure: %+v %v", evs, err)
 	}
 }
+
+func TestAPartialReadWritesNoEvent(t *testing.T) {
+	ctx, path := context.Background(), filepath.Join(t.TempDir(), "m.db")
+	t0 := time.Now().Add(-time.Hour).Truncate(time.Minute)
+	src := &timeline{}
+	runAt := func(at time.Time, s sessions.Session) {
+		t.Helper()
+		src.ss = []sessions.Session{s}
+		st, err := store.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+		if _, _, err := board(ctx, &sessions.World{Now: at}, nil, st, "test", []sessions.Source{src}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	whole := sessions.Session{Key: "hermes:c", Tool: "hermes", Name: "notes", Phase: sessions.Idle, Log: logOf(6), LastActive: t0.Add(-time.Hour)}
+	short := whole
+	short.Log, short.Partial = logOf(2), true // a page of its log failed
+	runAt(t0, whole)
+	runAt(t0.Add(time.Minute), short)
+	runAt(t0.Add(2*time.Minute), whole)
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if evs, err := st.Events(ctx, store.Query{Since: t0.Add(-2 * time.Hour), Source: store.Sessions}); err != nil || len(evs) != 1 || evs[0].Kind != "appeared" {
+		t.Fatalf("only the first sighting: %+v %v", evs, err)
+	}
+}
+
+// counted is a source that counts its scans.
+type counted struct {
+	timeline
+	scans int
+}
+
+func (c *counted) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Session, error) {
+	c.scans++
+	return c.timeline.Scan(ctx, w)
+}
+
+func TestASessionsRunTakesItsTurn(t *testing.T) {
+	ctx, path := context.Background(), filepath.Join(t.TempDir(), "m.db")
+	open := func() *store.Store {
+		st, err := store.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { st.Close() })
+		return st
+	}
+	holder, st := open(), open() // another run holds the store
+	unlock, err := holder.LockSessions(store.BusyTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := &counted{timeline: timeline{ss: []sessions.Session{{Key: "a", Tool: "test", Phase: sessions.Idle, Log: logOf(1)}}}}
+	snapshot := func(now time.Time) (*sessions.World, error) { return &sessions.World{Now: now}, nil }
+	if _, _, _, err := observe(ctx, st, 200*time.Millisecond, snapshot, "test", []sessions.Source{src}); err == nil || src.scans != 0 {
+		t.Fatalf("a run scanned while another held the store: %v, %d scans", err, src.scans)
+	}
+	unlock()
+	ss, _, scanErr, err := observe(ctx, st, 200*time.Millisecond, snapshot, "test", []sessions.Source{src})
+	if err != nil || scanErr != nil || len(ss) != 1 || src.scans != 1 {
+		t.Fatalf("got %v %v %d sessions, %d scans", err, scanErr, len(ss), src.scans)
+	}
+	again, err := holder.LockSessions(0) // free once the run returned, before it prints
+	if err != nil {
+		t.Fatalf("the run kept the lock: %v", err)
+	}
+	again()
+}
+
+func TestAnIncompleteSnapshotMakesNoSessionVanish(t *testing.T) {
+	ctx, path := context.Background(), filepath.Join(t.TempDir(), "m.db")
+	t0 := time.Now().Add(-time.Hour).Truncate(time.Minute)
+	src := &timeline{}
+	runAt := func(at time.Time, snapErr error, ss ...sessions.Session) {
+		t.Helper()
+		src.ss = ss
+		st, err := store.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+		if _, _, err := board(ctx, &sessions.World{Now: at}, snapErr, st, "test", []sessions.Source{src}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := sessions.Session{Key: "a", Tool: "test", Name: "in a pane", Phase: sessions.Idle, Log: logOf(3), LastActive: t0}
+	runAt(t0, nil, a)
+	runAt(t0.Add(state.Keep+time.Minute), errors.New("tmux panes: timed out")) // the pane's session is not found
+	runAt(t0.Add(state.Keep+2*time.Minute), nil, a)
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if evs, err := st.Events(ctx, store.Query{Since: t0.Add(-time.Hour), Source: store.Sessions}); err != nil || len(evs) != 1 || evs[0].Kind != "appeared" {
+		t.Fatalf("one appearance and no departure: %+v %v", evs, err)
+	}
+}

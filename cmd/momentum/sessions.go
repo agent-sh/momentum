@@ -52,23 +52,14 @@ func sessionsCmd(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		return err
 	}
 	defer st.Close()
-	unlock, err := st.LockSessions() // runs take turns: each observes after the previous one saved
-	if err != nil {
-		return err
-	}
-	defer unlock()
-	now := time.Now()
-	w, snapErr := sessions.Snapshot(ctx, env, now)
-	if w == nil {
-		return snapErr
-	}
 	srcs := []sessions.Source{claude.New(env), codex.New(env), pi.New(env), opencode.New(env), hermes.New(env)}
 	defer func() {
 		for _, s := range srcs {
 			s.Close()
 		}
 	}()
-	ss, scanErr, err := board(ctx, w, snapErr, st, buildID(), srcs)
+	snapshot := func(now time.Time) (*sessions.World, error) { return sessions.Snapshot(ctx, env, now) }
+	ss, now, scanErr, err := observe(ctx, st, store.BusyTimeout, snapshot, buildID(), srcs)
 	if err != nil {
 		return err
 	}
@@ -76,6 +67,25 @@ func sessionsCmd(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		return err
 	}
 	return scanErr
+}
+
+// observe is one run's look at the sessions, from the lock to the save: runs on one store take turns (waiting at
+// most wait for the one before), so each reads the time and the machine after the previous one saved. The lock
+// is released before anything is printed. scanErr names what failed; err is a store or snapshot failure.
+func observe(ctx context.Context, st *store.Store, wait time.Duration, snapshot func(time.Time) (*sessions.World, error), build string,
+	srcs []sessions.Source) (ss []*sessions.Session, now time.Time, scanErr, err error) {
+	unlock, err := st.LockSessions(wait)
+	if err != nil {
+		return nil, now, nil, err
+	}
+	defer unlock()
+	now = time.Now()
+	w, snapErr := snapshot(now)
+	if w == nil {
+		return nil, now, nil, snapErr
+	}
+	ss, scanErr, err = board(ctx, w, snapErr, st, build, srcs)
+	return ss, now, scanErr, err
 }
 
 // board scans every source over one snapshot, resuming each tracker from the checkpoint the last run of this

@@ -62,19 +62,28 @@ func (src *Source) Close() error {
 
 // open opens the state database read-only once it exists; nil while Hermes is not installed here. A database
 // whose messages carry an active flag gets only the messages still active: the ones Hermes took back or archived
-// are not the conversation any more.
-func (src *Source) open() *sql.DB {
+// are not the conversation any more. When that cannot be told, open fails, and the next scan tries again.
+func (src *Source) open() (*sql.DB, error) {
 	if src.db == nil {
 		path := filepath.Join(src.Env.HermesHome, "state.db")
-		if _, err := os.Stat(path); err == nil {
-			src.db, _ = sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(500)")
-			var n int
-			if src.db.QueryRow(`select count(*) from pragma_table_info('messages') where name = 'active'`).Scan(&n) == nil && n > 0 {
-				src.active = " and active = 1"
-			}
+		if _, err := os.Stat(path); err != nil {
+			return nil, nil
+		}
+		db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(500)")
+		if err != nil {
+			return nil, err
+		}
+		var n int
+		if err := db.QueryRow(`select count(*) from pragma_table_info('messages') where name = 'active'`).Scan(&n); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("messages: %w", err)
+		}
+		src.db, src.active = db, ""
+		if n > 0 {
+			src.active = " and active = 1"
 		}
 	}
-	return src.db
+	return src.db, nil
 }
 
 type lease struct {
@@ -88,9 +97,9 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 	if src.logs == nil {
 		src.logs, src.seen = map[string]*dbLog{}, map[string]time.Time{}
 	}
-	db := src.open()
+	db, err := src.open()
 	if db == nil {
-		return nil, nil
+		return nil, err
 	}
 	// A turn lease names the process that runs a turn ("pid=N:...:platform=cli"). A live lease means a turn is
 	// running; the last lease of a cli or tui chat also names the terminal process between turns.
@@ -148,7 +157,9 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 		open, err := src.facts(ctx, h.id, s)
 		s.TurnOpen = open || l.live
 		lg := src.logOf(s.Key)
-		errs = append(errs, err, src.readLog(ctx, h.id, lg))
+		lerr := src.readLog(ctx, h.id, lg)
+		s.Partial = err != nil || lerr != nil
+		errs = append(errs, err, lerr)
 		s.Log = &lg.log
 		if s.TurnOpen && s.Now == "" && h.act != "" {
 			s.Now, s.NowSince = text.OneLine(h.act, 140), s.LastActive

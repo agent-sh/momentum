@@ -145,3 +145,24 @@ func TestAFailedScanKeepsItsSessionsStamps(t *testing.T) {
 		t.Fatalf("gone once a working scan misses it: %+v", got)
 	}
 }
+
+func TestAPartialReadChangesNothing(t *testing.T) {
+	st := Stamps{}
+	st.Apply([]*sessions.Session{sess("a", sessions.Idle, 5, t0.Add(-time.Hour))}, t0)
+	short := sess("a", sessions.Idle, 2, t0.Add(-time.Hour)) // a failed page: the log came back short
+	short.Partial = true
+	if got := st.Apply([]*sessions.Session{short}, t0.Add(10*time.Minute)); len(got) != 0 || !short.Since.Equal(t0.Add(-time.Hour)) {
+		t.Fatalf("changes %+v since %v", got, short.Since)
+	}
+	if r := st["a"]; r.Seq != 5 || !r.Seen.Equal(t0.Add(10*time.Minute)) {
+		t.Fatalf("the stamp keeps its stretch and records the sighting: %+v", r)
+	}
+	if got := st.Apply([]*sessions.Session{sess("a", sessions.Idle, 5, t0.Add(-time.Hour))}, t0.Add(20*time.Minute)); len(got) != 0 {
+		t.Fatalf("a whole read of the same stretch: %+v", got)
+	}
+	unknown := sess("codex:proc:11:1100", sessions.Idle, 0, time.Time{}) // a process whose thread lookup failed
+	unknown.Partial = true
+	if got := st.Apply([]*sessions.Session{unknown}, t0.Add(21*time.Minute)); len(got) != 0 || len(st) != 1 {
+		t.Fatalf("a first sighting read in part gets no stamp: %+v %v", got, st)
+	}
+}

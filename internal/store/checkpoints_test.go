@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -357,13 +359,13 @@ func TestSessionsRunsTakeTurns(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer other.Close()
-	unlock, err := st.LockSessions()
+	unlock, err := st.LockSessions(BusyTimeout)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := make(chan func())
 	go func() {
-		u, err := other.LockSessions()
+		u, err := other.LockSessions(BusyTimeout)
 		if err != nil {
 			t.Error(err)
 			u = func() {}
@@ -381,5 +383,105 @@ func TestSessionsRunsTakeTurns(t *testing.T) {
 		u()
 	case <-time.After(5 * time.Second):
 		t.Fatal("the second run never got the lock")
+	}
+}
+
+func TestCheckpointTablesFromAnEarlierBuildAreMadeAgain(t *testing.T) {
+	ctx, path := context.Background(), filepath.Join(t.TempDir(), "m.db")
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.UnixMilli(1_700_000_000_000)
+	if _, err := st.Put(ctx, []Event{{Source: Sessions, SourceKey: "s@1", TS: at, Actor: ActorHarness, Kind: "phase"},
+		{Source: "mistakes", SourceKey: "m1", TS: at, Actor: ActorTool, Kind: "tool-error"}}); err != nil {
+		t.Fatal(err)
+	}
+	// the checkpoint table as the first build of the checkpoints made it: no log_seq
+	if _, err := st.db.Exec(`DROP TABLE trackers; CREATE TABLE trackers (tool TEXT NOT NULL, key TEXT NOT NULL, build TEXT NOT NULL,
+	  state BLOB NOT NULL, log_base INTEGER NOT NULL, seen INTEGER NOT NULL, PRIMARY KEY (tool, key));
+	  INSERT INTO trackers VALUES ('pi', 'k', 'b', 's', 0, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	st, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	var l sessions.Log
+	l.Add(sessions.Entry{Role: sessions.RoleOut, Text: "ok"})
+	saveRun(t, st, st.Trackers("b"), at, sessions.Checkpoint{Tool: "pi", Key: "k", State: []byte("s2"), Log: &l})
+	if cp, err := st.Trackers("b").Checkpoint(ctx, "pi", "k"); err != nil || cp == nil || string(cp.State) != "s2" {
+		t.Fatalf("checkpoint %+v %v", cp, err)
+	}
+	if evs, _ := st.Events(ctx, Query{Since: at.Add(-time.Hour)}); len(evs) != 2 {
+		t.Fatalf("only the checkpoint tables are made again; events %+v", evs)
+	}
+}
+
+func TestOpeningAStoreThatIsUpToDateDoesNotWaitForAWriter(t *testing.T) {
+	_, path := open(t)
+	writer, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	tx, err := writer.db.Begin() // a long ingest holds the write lock
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT INTO cursors VALUES ('x', '1', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("opening waited %v for the writer", took)
+	}
+}
+
+func TestFirstOpensOfABrandNewStoreAtOnceAllSucceed(t *testing.T) {
+	for round := 0; round < 100; round++ {
+		path := filepath.Join(t.TempDir(), "m.db")
+		errs := make(chan error, 6)
+		for i := 0; i < 6; i++ { // the first runs on a machine, started together
+			go func() {
+				st, err := Open(path)
+				if err == nil {
+					st.Close()
+				}
+				errs <- err
+			}()
+		}
+		for i := 0; i < 6; i++ {
+			if err := <-errs; err != nil {
+				t.Fatalf("round %d: %v", round, err)
+			}
+		}
+	}
+}
+
+func TestARunThatWaitsTooLongNamesTheHolder(t *testing.T) {
+	st, path := open(t)
+	other, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	unlock, err := st.LockSessions(BusyTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	start := time.Now()
+	_, err = other.LockSessions(200 * time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("pid %d", os.Getpid())) || time.Since(start) < 200*time.Millisecond {
+		t.Fatalf("after %v: %v", time.Since(start), err)
 	}
 }

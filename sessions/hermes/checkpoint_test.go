@@ -69,3 +69,19 @@ func TestMessagesTakenBackAreNotTheConversation(t *testing.T) {
 		t.Fatalf("a turn taken back opened the session or entered its log: %s open %v log %v", s.Phase, s.TurnOpen, items)
 	}
 }
+
+func TestAConversationReadInPartIsMarked(t *testing.T) {
+	home := t.TempDir()
+	now := time.Unix(fake.Boot+86400, 0)
+	sec := float64(now.Unix())
+	db := stateDB(t, home, true)
+	exec(t, db, `INSERT INTO sessions VALUES ('c', 'cli', 'notes', '', '/w', 'model-a', ?, NULL, ?, '', 0, 0)`, sec-3600, sec-60)
+	exec(t, db, `ALTER TABLE messages DROP COLUMN timestamp`) // its latest messages cannot be read
+	tb, _ := proc.Read(fake.ProcRoot(t))
+	src := New(sessions.Env{HermesHome: home})
+	defer src.Close()
+	ss, err := sessions.Scan(context.Background(), &sessions.World{Now: now, Procs: tb}, src)
+	if err == nil || len(ss) != 1 || !ss[0].Partial {
+		t.Fatalf("got %v %+v", err, ss)
+	}
+}

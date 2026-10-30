@@ -97,7 +97,10 @@ type Session struct {
 	Size       int64     `json:"-"` // how much of the transcript or database has been read; -1 when unreadable
 	Seq        int       `json:"seq"`
 	Auto       bool      `json:"auto,omitempty"` // an automated run (cron, one-shot): counted, not listed
-	Log        *Log      `json:"-"`              // the tracker's live activity log; copy what you need before the next scan
+	// Partial says the source could not read all of the session on this scan: a query failed, or its identity is
+	// not known yet. Its facts may be short, so a caller that keeps history does not count it as a change.
+	Partial bool `json:"partial,omitempty"`
+	Log     *Log `json:"-"` // the tracker's live activity log; copy what you need before the next scan
 }
 
 // Found is one session a Lister discovered, before its transcript is read.
@@ -123,6 +126,7 @@ type Found struct {
 	JobState   string // a background job's state in its harness's own words
 	Detail     string // a background job's own detail line
 	Host       string // set for a session on another machine; sources drop those, their files are not here
+	Partial    bool   // the lister could not read all of it: its identity or its facts may be missing
 }
 
 // Key is the session's identity across scans: its job, thread or session id, else its process (pid and start

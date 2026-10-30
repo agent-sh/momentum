@@ -97,7 +97,7 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 		keys[key] = true
 		s := &sessions.Session{Key: key, Tool: "codex", Name: f.Name, Named: f.Named, Cwd: f.Cwd, Project: src.Env.Project(f.Cwd),
 			Where: f.Where, Pane: f.Pane, PID: f.PID, Model: f.Model, Started: f.Started, LastActive: f.LastActive,
-			Transcript: f.Transcript, Tasks: []sessions.Task{}}
+			Transcript: f.Transcript, Tasks: []sessions.Task{}, Partial: f.Partial}
 		if f.Transcript == "" {
 			s.TurnOpen = f.Status == "busy" // no rollout yet: only Codex's own state says anything
 			out = append(out, s)
@@ -112,6 +112,7 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 		s.TurnOpen = t.Open()
 		kids, kerr := src.children(ctx, f.Thread, w.Now)
 		s.Tasks = append(s.Tasks, kids...)
+		s.Partial = s.Partial || kerr != nil
 		err = errors.Join(err, kerr)
 		out = append(out, s)
 	}
@@ -230,6 +231,7 @@ func (n *Native) List(ctx context.Context, w *sessions.World) ([]sessions.Found,
 		}
 		f, err := n.agent(ctx, w, pa.PID)
 		errs = append(errs, err)
+		f.Partial = err != nil // its thread is not known: it shows by its process until a lookup works
 		f.Cwd, f.Where, f.Pane = text.FirstNonEmpty(f.Cwd, pa.Pane.Path), pa.Pane.Target(), pa.Pane.ID
 		if f.Name == "codex" {
 			f.Name = text.FirstNonEmpty(pa.Pane.WindowName, f.Name)

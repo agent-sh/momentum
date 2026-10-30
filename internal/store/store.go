@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -98,6 +99,10 @@ CREATE TABLE IF NOT EXISTS tracker_log (tool TEXT NOT NULL, key TEXT NOT NULL, s
   name TEXT NOT NULL, origin TEXT NOT NULL, text TEXT NOT NULL, PRIMARY KEY (tool, key, seq)) WITHOUT ROWID;
 `
 
+// BusyTimeout is how long a statement waits for another connection's write transaction before it fails, and how
+// long a sessions run waits for the one before it.
+const BusyTimeout = 10 * time.Second
+
 // Open creates the store when missing. The store holds owner text, so the database is 0600 and its
 // directory 0700, also when they already existed. SQLite gives the -wal and -shm files the database's mode.
 // Write transactions take the lock up front (_txlock=immediate), so a concurrent writer waits for
@@ -118,15 +123,29 @@ func Open(path string) (*Store, error) {
 	if err := os.Chmod(path, 0o600); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_txlock=immediate")
+	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=journal_mode(WAL)&_txlock=immediate",
+		path, BusyTimeout.Milliseconds()))
 	if err != nil {
 		return nil, err
 	}
-	if err := migrate(db); err != nil {
+	// A new file turns to WAL as its first connection opens, and that step does not wait: a second process
+	// opening the same new file at that moment is told the database is busy. It tries again.
+	for start := time.Now(); ; time.Sleep(50 * time.Millisecond) {
+		if err = migrate(db); err == nil || !busy(err) || time.Since(start) > BusyTimeout {
+			break
+		}
+	}
+	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store schema: %w", err)
 	}
 	return &Store{db: db, path: path}, nil
+}
+
+// busy reports SQLITE_BUSY, or one of its extended codes.
+func busy(err error) bool {
+	var c interface{ Code() int }
+	return errors.As(err, &c) && c.Code()&0xff == 5
 }
 
 // stateSchema holds what cannot be derived from the sources: it is created when missing and never dropped,
@@ -151,9 +170,27 @@ var stampColumns = [][2]string{{"tool", "TEXT NOT NULL DEFAULT ''"}, {"name", "T
 // events table column by column (keepObserved).
 const schemaVersion = 2
 
-// migrate brings the store to this schema in one write transaction, which takes the lock up front: two first
-// opens after an upgrade (a timer run and a query) take turns instead of both altering the same table.
+// derivedTables are the tables of the derived schema, and derivedIndexes its indexes.
+var (
+	derivedTables  = []string{"events", "cursors", "seen_files", "skipped", "trackers", "tracker_log"}
+	derivedIndexes = []string{"events_ts", "events_kind", "events_source"}
+)
+
+// checkpointColumns are the columns the schema gives the checkpoint tables. They are a cache of what transcripts
+// hold, so tables with other columns (a build before this one made them) are dropped and made again, and the next
+// sessions run reads every transcript once; nothing else is dropped.
+var checkpointColumns = map[string][]string{
+	"trackers":    {"tool", "key", "build", "state", "log_base", "log_seq", "seen"},
+	"tracker_log": {"tool", "key", "seq", "role", "name", "origin", "text"},
+}
+
+// migrate brings the store to this schema. It checks with reads first, so opening a store that is up to date
+// never waits for a writer. Otherwise it changes the store in one write transaction, which takes the lock up front
+// (two first opens after an upgrade take turns), and checks again inside it.
 func migrate(db *sql.DB) error {
+	if ok, err := current(db); err != nil || ok {
+		return err
+	}
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -170,6 +207,18 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	if v == schemaVersion {
+		for t, want := range checkpointColumns {
+			have, err := columns(tx, "main", t)
+			if err != nil {
+				return err
+			}
+			if len(have) > 0 && !slices.Equal(have.names(), want) {
+				if _, err := tx.Exec(`DROP TABLE IF EXISTS trackers; DROP TABLE IF EXISTS tracker_log`); err != nil {
+					return err
+				}
+				break
+			}
+		}
 		if _, err := tx.Exec(schema); err != nil {
 			return err
 		}
@@ -184,7 +233,7 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
-	for _, t := range []string{"events", "cursors", "seen_files", "skipped", "trackers", "tracker_log"} {
+	for _, t := range derivedTables {
 		if _, err := tx.Exec(`DROP TABLE IF EXISTS ` + t); err != nil {
 			return err
 		}
@@ -201,6 +250,54 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// current reports, with reads alone, whether the store already has this schema: its version, every table and
+// index, the stamps' columns and the checkpoint tables' columns.
+func current(q querier) (bool, error) {
+	ctx := context.Background()
+	var v int
+	if err := q.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&v); err != nil || v != schemaVersion {
+		return false, err
+	}
+	rows, err := q.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type IN ('table', 'index')`)
+	if err != nil {
+		return false, err
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return false, err
+		}
+		have[n] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	for _, n := range append(append([]string{"session_stamps"}, derivedTables...), derivedIndexes...) {
+		if !have[n] {
+			return false, nil
+		}
+	}
+	stamps, err := columns(q, "main", "session_stamps")
+	if err != nil {
+		return false, err
+	}
+	for _, c := range stampColumns {
+		if !stamps.has(c[0]) {
+			return false, nil
+		}
+	}
+	for t, want := range checkpointColumns {
+		cols, err := columns(q, "main", t)
+		if err != nil || !slices.Equal(cols.names(), want) {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 // keepObserved moves the observed events from the old events table (copied to temp.observed) into the new one,
@@ -263,6 +360,14 @@ func columns(q querier, schema, table string) (columnList, error) {
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+func (cs columnList) names() []string {
+	out := make([]string, len(cs))
+	for i, c := range cs {
+		out[i] = c.name
+	}
+	return out
 }
 
 func (cs columnList) has(name string) bool {

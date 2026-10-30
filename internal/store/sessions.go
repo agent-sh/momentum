@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -69,15 +71,31 @@ func saveStamps(ctx context.Context, q querier, st state.Stamps) error {
 
 // LockSessions takes the lock that makes sessions runs on this store happen one after another: a run holds it
 // from before its scan until its transaction committed, so each run reads the stamps and checkpoints the
-// previous run saved, and observes the sessions after it. Another run waits for it. unlock releases it.
-func (s *Store) LockSessions() (unlock func(), err error) {
-	f, err := os.OpenFile(s.path+".sessions-lock", os.O_RDWR|os.O_CREATE, 0o600)
+// previous run saved, and observes the sessions after it. It waits for another run at most wait, then fails and
+// names the process that holds it. unlock releases it; so does the end of the process.
+func (s *Store) LockSessions(wait time.Duration) (unlock func(), err error) {
+	path := s.path + ".sessions-lock"
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	for start := time.Now(); ; time.Sleep(50 * time.Millisecond) {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if !errors.Is(err, syscall.EWOULDBLOCK) || time.Since(start) >= wait {
+			break
+		}
+	}
+	if errors.Is(err, syscall.EWOULDBLOCK) {
+		f.Close()
+		holder, _ := os.ReadFile(path)
+		return nil, fmt.Errorf("another sessions run (pid %s) holds the store; waited %v", strings.TrimSpace(string(holder)), wait)
+	}
+	if err != nil {
 		f.Close()
 		return nil, fmt.Errorf("sessions lock: %w", err)
+	}
+	if err := f.Truncate(0); err == nil { // who holds it, for the next run that waits
+		f.WriteAt([]byte(strconv.Itoa(os.Getpid())+"\n"), 0)
 	}
 	return func() { f.Close() }, nil
 }

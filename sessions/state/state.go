@@ -65,6 +65,9 @@ type Change struct {
 // began when the session last moved, if that was after the previous sighting, since a turn ends with its last
 // write and the scan that notices comes later; otherwise it began now.
 //
+// A session a source read only in part (Partial) changes nothing: its stamp only records the sighting, and one
+// seen for the first time gets no stamp until a scan reads it whole.
+//
 // Runs must apply their scans in the order they made them: momentum's runs take turns on a lock from scan to
 // save. failed names the tools whose scan failed on this run. Their sessions may still live, so their stamps do
 // not expire on it; one that is gone is reported once a scan of its tool works again, as of its last sighting.
@@ -72,6 +75,14 @@ func (st Stamps) Apply(ss []*sessions.Session, now time.Time, failed ...string) 
 	var out []Change
 	for _, s := range ss {
 		prev, ok := st[s.Key]
+		if s.Partial { // read short on this scan: alive, but its facts say nothing new
+			if ok {
+				prev.Seen = now
+				st[s.Key] = prev
+				s.Since = prev.Since
+			}
+			continue
+		}
 		tool, name := s.Tool, s.Name // a scan that lost them does not erase them
 		if tool == "" {
 			tool = prev.Tool
