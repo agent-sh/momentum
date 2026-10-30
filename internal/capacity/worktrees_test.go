@@ -548,3 +548,54 @@ func TestANameThatOnlyTheLinkToAWorktreesRootCarriesStillExcludes(t *testing.T) 
 		}
 	}
 }
+
+func TestALeftoverOfARepositoryWhoseCheckoutIsUnderAnAliasRootIsTheAliasProjects(t *testing.T) {
+	clone, wts := worktreesFixture(t)
+	alias := filepath.Join(filepath.Dir(clone), "secret-clone")
+	must(t, os.Symlink(clone, alias))
+	cfg := Config{Worktrees: WorktreesConfig{Roots: []string{wts}}, Targets: TargetsConfig{Roots: []string{alias}},
+		Exclude: Exclude{Names: []string{"*secret*"}}}.Normal()
+	cfg.Live = []string{RuleWorktrees}
+	res, err := Run(context.Background(), cfg, openStore(t), options(t, procRoot(t), time.Now().Add(2*time.Hour), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f := findings(res, RuleWorktrees)[filepath.Join(wts, "merged")]; f.Action != ActReport || f.class != "excluded" {
+		t.Errorf("a worktree of a repository whose checkout is under the excluded alias root: %+v", f)
+	}
+	if _, err := os.Stat(filepath.Join(wts, "merged")); err != nil {
+		t.Error("it was removed")
+	}
+}
+
+func TestTheLaterOfTwoOwnDeletionsInADirectoryIsKept(t *testing.T) {
+	now := time.Now().Add(2 * time.Hour)
+	d := filepath.Join(t.TempDir(), "dir")
+	must(t, os.MkdirAll(d, 0o755))
+	must(t, os.Chtimes(d, now, now.Add(-10*time.Minute))) // the later deletion's change
+	r := &runner{now: now, m: ReadMounts(""), own: map[string]ownChange{}}
+	old := now.Add(-3 * time.Hour)
+	r.addOwn(ownDir{Dir: d, Prev: old}, now.Add(-10*time.Minute)) // the later run's deletion, read first (newest first)
+	r.addOwn(ownDir{Dir: d, Prev: old}, now.Add(-40*time.Minute)) // the earlier run's
+	if r.changedIn(context.Background(), d, now.Add(-quietTime), &Sample{}) {
+		t.Error("the later of two deletions explains the directory")
+	}
+}
+
+func TestADirectoryChangedInTheMillisecondOfCapacitysDeletionIsItsOwn(t *testing.T) {
+	now := time.Now().Add(2 * time.Hour)
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	must(t, err)
+	d := filepath.Join(base, "dir")
+	write(t, filepath.Join(d, "target", "x"), "x")
+	at := now.Add(-10 * time.Minute).Truncate(time.Millisecond) // an event's time, as the store keeps it
+	changed := at.Add(400 * time.Microsecond)                   // the deletion's change, within the same millisecond
+	must(t, os.Chtimes(d, changed, changed))
+	old := now.Add(-3 * time.Hour)
+	r := &runner{now: now, m: ReadMounts(""), own: map[string]ownChange{d: {at: at, prev: old}}}
+	for _, o := range r.ownBefore(context.Background(), filepath.Join(d, "target")) {
+		if o.Dir == d && !o.Prev.Equal(old) {
+			t.Errorf("capacity's earlier deletion is not someone's change: prev %v, want %v", o.Prev, old)
+		}
+	}
+}

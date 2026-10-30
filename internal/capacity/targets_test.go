@@ -158,3 +158,45 @@ func TestANameThatOnlyAnAliasCarriesStillExcludes(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildsReachedThroughAnAliasRootAreTheAliasProjects(t *testing.T) {
+	gitEnv(t)
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	must(t, err)
+	code := filepath.Join(base, "disk", "code")
+	must(t, os.MkdirAll(code, 0o755))
+	must(t, os.Symlink(code, filepath.Join(base, "secret-code"))) // a targets root the excluded name reaches as a link
+	// a repository under the alias, with a linked worktree elsewhere; and loose sources under the alias
+	app := filepath.Join(code, "app")
+	write(t, filepath.Join(app, "src", "main.rs"), "fn main() {}\n")
+	write(t, filepath.Join(app, ".gitignore"), "target/\n")
+	gitT(t, app, "init", "-q")
+	gitT(t, app, "add", ".")
+	gitT(t, app, "commit", "-qm", "init")
+	wt := filepath.Join(base, "elsewhere", "wt")
+	gitT(t, app, "worktree", "add", "-q", "-b", "x", wt)
+	write(t, filepath.Join(code, "loose", "src", "main.rs"), "fn main() {}\n")
+	// Cargo writes physical paths (it reads its working directory with getcwd)
+	cache := filepath.Join(base, "cache")
+	fromLoose, fromWorktree, inWorktree := filepath.Join(cache, "loose-target"), filepath.Join(cache, "wt-target"), filepath.Join(wt, "target")
+	cargoTarget(t, fromLoose, filepath.Join(code, "loose", "src", "main.rs"))
+	cargoTarget(t, fromWorktree, filepath.Join(wt, "src", "main.rs"))
+	cargoTarget(t, inWorktree)
+	cfg := Config{Targets: TargetsConfig{Roots: []string{filepath.Join(base, "secret-code"), cache, filepath.Join(base, "elsewhere")}},
+		Exclude: Exclude{Names: []string{"*secret*"}}}.Normal()
+	cfg.Live = []string{RuleTargets}
+	res, err := Run(context.Background(), cfg, openStore(t), options(t, procRoot(t), time.Now().Add(72*time.Hour), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := findings(res, RuleTargets)
+	for name, p := range map[string]string{"built from sources under the alias": fromLoose,
+		"built from a worktree of a repository under the alias": fromWorktree, "in that worktree": inWorktree} {
+		if f := got[p]; f.Action != ActReport || f.class != "excluded" {
+			t.Errorf("%s: %+v", name, f)
+		}
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("%s: deleted", name)
+		}
+	}
+}
