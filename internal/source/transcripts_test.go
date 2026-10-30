@@ -469,12 +469,13 @@ func TestTranscriptsRedactWithScrump(t *testing.T) {
 	}
 }
 
-// A batch's texts reach scrump as one text, in one call. A cut that leaves a quoted value open (scrump masks
-// it up to the next quote, in a later text) masks the start of that text too, and that text is masked again
-// on its own, in one more call: a secret it holds past where the first hit ended is masked as well. The same
-// holds for an agent text's head and tail. As separate records the batch was split and masked again, half by
-// half (9 calls here).
-func TestTranscriptsRedactABatchInOneCallAndAgainWhereAHitRanIn(t *testing.T) {
+// A batch's texts reach scrump as one text, in one call, each masked as it would be alone. A cut that leaves
+// a quoted value open (scrump masks it up to the next quote) or a rule that reaches across lines does not run
+// into the next text and hide a secret there: past a quote that closes it, past the start of a text that
+// opens with a newline, past a hit the rule's filter rejects (a setting, a reference to a vault). The same
+// holds between an agent text's head and tail. As separate records the batch was split and masked again, half
+// by half (9 calls here).
+func TestTranscriptsRedactABatchInOneCallEachTextAsAlone(t *testing.T) {
 	if err := evidence.RedactionReady(); err != nil {
 		t.Skip("needs scrump with its text profile:", err)
 	}
@@ -490,38 +491,91 @@ func TestTranscriptsRedactABatchInOneCallAndAgainWhereAHitRanIn(t *testing.T) {
 	}
 	home := testHome(t)
 	t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
-	secret := "Zq7Vx9" + "Lm2Kp4"
-	open := " clientToken: 'pub_live_" + strings.Repeat("a1b2", 20) + "'"
-	// The call's input is cut inside its quoted token; the result after it holds a quoted password.
-	input, _ := json.Marshal(map[string]string{"command": "deploy " + strings.Repeat("x", textChars+spare-40) + open})
-	out, _ := json.Marshal("pass" + "word: '" + secret + "' and the rest")
-	// An agent text whose head is cut inside a quoted token and whose tail holds a quoted password.
-	reply, _ := json.Marshal("Deploying " + strings.Repeat("y", headChars+spare-40) + open + strings.Repeat(" z", 2*spare) + " pass" + "word: '" + secret + "' then done.")
-	lines := []string{claudeSession()[0],
-		claudeLine(1, `"type":"assistant","uuid":"a1","message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":`+string(input)+`}]}`),
-		claudeLine(2, `"type":"user","uuid":"u2","message":{"role":"user","content":[{"tool_use_id":"toolu_01","type":"tool_result","content":`+string(out)+`}]}`),
-		claudeLine(3, `"type":"assistant","uuid":"a3","message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":`+string(reply)+`}]}`),
+	pw := "pass" + "word"
+	secrets := []string{"Zq7Vx9" + "Lm2Kp4", "Wq8Ux0" + "Kn3Jp5", "Yr6Tw1" + "Mm4Hq7", "Xs5Sv2" + "Ll5Gr8", "Xt4Rw3" + "Nn6Fs9"}
+	// A call's input cut inside an open quoted value, then a result after it.
+	pair := func(m int, id, open, result string) []string {
+		input, _ := json.Marshal(map[string]string{"command": "deploy " + strings.Repeat("x", textChars+spare-40) + open})
+		out, _ := json.Marshal(result)
+		return []string{
+			claudeLine(m, `"type":"assistant","uuid":"a`+id+`","message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"tool_use","id":"toolu_`+id+`","name":"Bash","input":`+string(input)+`}]}`),
+			claudeLine(m, `"type":"user","uuid":"u`+id+`","message":{"role":"user","content":[{"tool_use_id":"toolu_`+id+`","type":"tool_result","content":`+string(out)+`}]}`),
+		}
 	}
+	token := " clientToken: 'pub_live_" + strings.Repeat("a1b2", 20) + "'"
+	lines := []string{claudeSession()[0]}
+	lines = append(lines, pair(1, "1", token, pw+": '"+secrets[0]+"' and the rest")...)
+	lines = append(lines, pair(2, "2", token, "\n"+pw+": '"+secrets[1]+"' and the rest")...)
+	lines = append(lines, pair(3, "3", " token_url: 'https://auth.example.invalid/oauth/"+strings.Repeat("p", 80)+"'", pw+": '"+secrets[2]+"' and the rest")...)
+	lines = append(lines, pair(4, "4", " DB_PASSWORD='$(vault read -field=value secret/db/"+strings.Repeat("q", 80)+")'", pw+": '"+secrets[4]+"' and the rest")...)
+	// An agent text: its head is cut inside a quoted token, its tail opens with a newline and holds a password.
+	tail := "\n" + strings.Repeat("z ", (tailChars+spare-60)/2) + pw + ": '" + secrets[3] + "' done."
+	reply, _ := json.Marshal("Deploying " + strings.Repeat("y", headChars+spare-40) + token + strings.Repeat(" w", 2*spare) + tail)
+	lines = append(lines, claudeLine(5, `"type":"assistant","uuid":"a9","message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":`+string(reply)+`}]}`))
 	writeLines(t, claudePath(home), lines...)
 	st := openStore(t)
-	if r := ingest(t, Transcripts{Homes: []string{home}}, st); r.New != 5 {
-		t.Fatalf("stored %+v, want 5", r)
+	if r := ingest(t, Transcripts{Homes: []string{home}}, st); r.New != 11 {
+		t.Fatalf("stored %+v, want 11", r)
+	}
+	evs := all(t, st, "transcripts")
+	for _, e := range evs {
+		for _, sec := range secrets {
+			if strings.Contains(e.Summary, sec) || strings.Contains(e.Summary, "a1b2a1b2") {
+				t.Fatalf("a secret was stored: %+v", e)
+			}
+		}
+	}
+	for _, rest := range []string{"and the rest", "done."} {
+		for _, e := range evs {
+			if strings.Contains(e.Summary, rest) && !strings.Contains(e.Summary, "****") {
+				t.Fatalf("a password is not masked: %q", e.Summary)
+			}
+		}
 	}
 	b, err := os.ReadFile(calls)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// One call proves redaction can run, one masks the batch, one masks again the texts a hit ran into.
-	if n := strings.Count(string(b), "call"); n != 3 {
-		t.Fatalf("%d scrump calls, want 3", n)
+	// One call proves redaction can run, one masks the batch.
+	if n := strings.Count(string(b), "call"); n != 2 {
+		t.Fatalf("%d scrump calls, want 2", n)
 	}
-	for _, e := range all(t, st, "transcripts") {
-		if strings.Contains(e.Summary, secret) || strings.Contains(e.Summary, "a1b2") {
-			t.Fatalf("a secret was stored: %+v", e)
+}
+
+// The joined call and the second call each mask what the other may not: a text the joined call masked from
+// its first byte is masked again on its own, and the two maskings are merged.
+func TestTranscriptsMergeTheTwoMaskings(t *testing.T) {
+	// A redactor that, joined, runs a hit from "OPEN" into the next text's start and keeps its token; alone,
+	// it masks the token.
+	run := regexp.MustCompile(`OPEN[^*]*?#\n[a-z]{3}`)
+	split := func(_ context.Context, evs []evidence.Event) ([]evidence.Event, error) {
+		out := make([]evidence.Event, len(evs))
+		for i, e := range evs {
+			t := e.Text
+			if strings.Contains(t, boundary) {
+				t = run.ReplaceAllStringFunc(t, func(m string) string {
+					return strings.Map(func(r rune) rune {
+						if r == '\n' {
+							return r
+						}
+						return '*'
+					}, m)
+				})
+			} else {
+				t = maskRx.ReplaceAllStringFunc(t, func(m string) string { return strings.Repeat("*", len(m)) })
+			}
+			out[i] = evidence.Event{Text: t}
 		}
+		return out, nil
 	}
-	if r := find(t, all(t, st, "transcripts"), "tool_result", "and the rest"); !strings.Contains(r.Summary, "****") {
-		t.Fatalf("the result's password is not masked: %q", r.Summary)
+	w := writer{redact: split}
+	tok := "tok_" + strings.Repeat("Ab3", 10)
+	got, err := w.mask(context.Background(), []string{"a value OPEN here", "abc then " + tok + " end"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(got[1], "***") || strings.Contains(got[1], tok) || !strings.Contains(got[0], "****") {
+		t.Fatalf("merged maskings: %q", got)
 	}
 }
 

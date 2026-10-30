@@ -416,7 +416,10 @@ func (s Transcripts) readJob(ctx context.Context, j *job, t *tally, add func(par
 		}
 		// A Hermes session is read whole; a transcript until the size it had when it was listed (what was
 		// added since is the next run's).
-		final := j.format == evidence.Hermes || next.Offset == from.Offset || next.Offset >= j.contentSize()
+		final := j.format == evidence.Hermes || next.Offset == from.Offset
+		if size, ok := j.contentSize(); !final && ok && next.Offset >= size {
+			final = true
+		}
 		p.cur = store.FileCursor{Source: s.Name(), Path: j.path, Inode: j.inode, FP: j.fp, Compressed: j.packed, Offset: next.Offset}
 		if j.info != nil && final {
 			// Only the part that ends the read marks the file read as it was listed: when a later part is
@@ -437,15 +440,19 @@ func (s Transcripts) readJob(ctx context.Context, j *job, t *tally, add func(par
 	}
 }
 
-// contentSize is the transcript's size in JSONL bytes as it was listed.
-func (j *job) contentSize() int64 {
+// contentSize is the transcript's size in JSONL bytes as it was listed, and false when it cannot be read
+// (a compressed copy whose frame headers do not parse): the read then goes on until a part makes no progress.
+func (j *job) contentSize() (int64, bool) {
+	if j.info == nil {
+		return 0, false
+	}
 	if !j.packed {
-		return j.info.Size()
+		return j.info.Size(), true
 	}
 	if _, n, err := evidence.Stat(j.path); err == nil {
-		return n
+		return n, true
 	}
-	return 0
+	return 0, false
 }
 
 // batch is a worker's parts waiting for redaction.
@@ -560,28 +567,36 @@ func (w *writer) events(ctx context.Context, parts []part) ([][]store.Event, int
 	return byPart, unknown, nil
 }
 
-// mask redacts texts, at most redactBytes per scrump call: each call gets its texts joined by newlines as
+// boundary separates the texts of one scrump call, so each is masked as it would be alone. scrump scans its
+// input as one stream, and a hit that starts in one text can run into the next: a quoted value a cut left open
+// runs to the next quote, and a rule like `keyword(?:.|[\n\r]){0,1000}?secret` reaches across lines. Where it
+// runs in, it masks the start of the next text but ends where scrump resumes its scan, which can be inside a
+// secret of that text, past the key that marks it; a hit the rule's filter rejects masks nothing and still
+// moves the scan on. The boundary closes an open quoted value (its quotes), then is longer than the text
+// profile's longest reach across lines (1,000 bytes), and ends with a mark no secret's value starts with, so
+// no hit that starts in one text reaches the next.
+var boundary = "\n#'\"\n" + strings.Repeat("\n", 1024) + "#\n"
+
+// mask redacts texts, at most redactBytes per scrump call: each call gets its texts joined by the boundary as
 // one text, and the redacted text is cut back at the same places, since masks keep the length.
 //
-// A hit can run from one text into the next: a quoted value a cut left open is masked up to the next quote.
-// It masks the start of the next text too, which hides more, but it also ends where scrump resumes, which
-// can be inside a secret of the next text, past the key that marks it. So every text the joined call masked
-// from its first byte is redacted again on its own (in one more call, as records), and a byte stays masked
-// when either call masked it. Records alone are no answer: a hit that runs across tacit's record separator
-// makes it split the batch and mask it again, half by half.
+// A text the call masked from its first byte, past any newlines (a hit ran in from the boundary's side,
+// which a rule longer than the boundary could do), is masked again on its own in one more call, as records,
+// and a byte stays masked when either call masked it.
 func (w *writer) mask(ctx context.Context, texts []string) ([]string, error) {
 	out := make([]string, len(texts))
 	var joined strings.Builder
 	for start := 0; start < len(texts); {
 		end, size := start, 0
-		for end < len(texts) && (end == start || size+len(texts[end])+1 <= redactBytes) {
-			size += len(texts[end]) + 1
+		// The texts' own bytes fill a call: the boundaries' newlines cost scrump little.
+		for end < len(texts) && (end == start || size+len(texts[end]) <= redactBytes) {
+			size += len(texts[end])
 			end++
 		}
 		joined.Reset()
 		for i := start; i < end; i++ {
 			if i > start {
-				joined.WriteByte('\n')
+				joined.WriteString(boundary)
 			}
 			joined.WriteString(texts[i])
 		}
@@ -597,10 +612,10 @@ func (w *writer) mask(ctx context.Context, texts []string) ([]string, error) {
 		for i := start; i < end; i++ {
 			n := len(texts[i])
 			out[i] = masked[at : at+n]
-			if i > start && n > 0 && out[i][0] == '*' {
+			if first := strings.TrimLeft(out[i], "\n"); i > start && first != "" && first[0] == '*' {
 				again = append(again, i)
 			}
-			at += n + 1
+			at += n + len(boundary)
 		}
 		if len(again) > 0 {
 			carriers := make([]evidence.Event, len(again))

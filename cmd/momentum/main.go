@@ -157,7 +157,7 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	kinds := fs.String("kind", "", "comma-separated kinds")
 	src := fs.String("source", "", "one source")
 	session := fs.String("session", "", "one session, by its id or its start; oldest first")
-	limit := fs.Int("limit", 50, "most events to print")
+	limit := fs.Int("limit", 50, "most events to print (0: 200)")
 	asJSON := fs.Bool("json", false, "one JSON object per line")
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}

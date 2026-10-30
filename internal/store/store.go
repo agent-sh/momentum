@@ -640,8 +640,8 @@ func (s *Store) Rebuild(ctx context.Context, source string) error {
 }
 
 // Query selects events newest first, or, with Session (an id or its first characters), one session's events
-// oldest first: a session reads as what happened, in order. Events of one moment keep their order in the
-// source (SourceKey). Until, when set, is the end of the window.
+// with its subagents' at any depth, oldest first: a session reads as what happened, in order. Events of one
+// moment keep their order in the source (SourceKey). Until, when set, is the end of the window.
 type Query struct {
 	Since   time.Time
 	Kinds   []string
@@ -667,8 +667,14 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 	}
 	order := "ts DESC, source_key DESC"
 	if q.Session != "" {
-		// An id or its first characters, as a range the session index serves.
-		where, args = append(where, "session >= ? AND session < ?"), append(args, q.Session, q.Session+"\uffff")
+		// An id or its first characters (a range the session index serves), and the threads under it at any
+		// depth: a subagent's thread is an Agent inside its parent's session, and its own subagents' events
+		// are in a session of its id.
+		where = append(where, `session IN (WITH RECURSIVE tree(id) AS (
+		    SELECT DISTINCT session FROM events WHERE session >= ? AND session < ?
+		    UNION SELECT DISTINCT e.agent FROM events e JOIN tree ON e.session = tree.id WHERE e.agent != '' AND e.agent != e.session)
+		  SELECT id FROM tree)`)
+		args = append(args, q.Session, q.Session+"\uffff")
 		order = "ts, source_key"
 	}
 	limit := q.Limit

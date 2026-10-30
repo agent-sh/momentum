@@ -295,3 +295,29 @@ func TestPutFilesStoresNoCursorWithoutItsEvents(t *testing.T) {
 		t.Fatalf("events of a failed write: %d", len(evs))
 	}
 }
+
+// A session's listing holds its subagents' threads at any depth: a thread is an Agent inside its parent's
+// session, and its own subagents' events are in the session of its id.
+func TestASessionHoldsItsThreadsAtAnyDepth(t *testing.T) {
+	ctx := context.Background()
+	st, _ := open(t)
+	at := time.Unix(1_700_000_000, 0)
+	ev := func(key, session, agent string, min int) Event {
+		return Event{Source: "transcripts", SourceKey: key, TS: at.Add(time.Duration(min) * time.Minute), Session: session, Agent: agent, Actor: ActorAgent, Kind: "agent_text"}
+	}
+	if _, err := st.Put(ctx, []Event{ev("r@1", "root", "", 0), ev("c@1", "root", "child", 1), ev("g@1", "child", "grand", 2),
+		ev("x@1", "other", "", 3)}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.Events(ctx, Query{Since: time.Unix(0, 0), Session: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	for _, e := range got {
+		keys = append(keys, e.SourceKey)
+	}
+	if fmt.Sprint(keys) != "[r@1 c@1 g@1]" {
+		t.Fatalf("the root session lists %v", keys)
+	}
+}
