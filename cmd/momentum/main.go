@@ -47,6 +47,11 @@ const usage = `usage:
   momentum note done ID                 take a note out of the report: resolve a needs or problem note,
                                         withdraw a decided or shipped one
   momentum note list [--json]           every note, newest first, and whether the report shows it
+  momentum supervise [--dry] [--json]   scan the sessions, then continue the ones that stopped where a rule says
+                                        it may: every decision is an event of source supervise
+  momentum supervise replay [--since WHEN] [--until WHEN] [--labels FILE] [--anchor] [--points FILE]
+                                        run the rules over the store's history and measure them against the
+                                        owner's own steps
   momentum version
 Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json).
 The store is $MOMENTUM_HOME/momentum.db (default ~/.local/share/momentum).
@@ -78,6 +83,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		err = reportCmd(ctx, args[1:], stdout, stderr)
 	case "note":
 		err = noteCmd(ctx, args[1:], stdout, stderr)
+	case "supervise":
+		err = superviseCmd(ctx, args[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintln(stdout, "momentum", version)
 	case "-h", "--help", "help":

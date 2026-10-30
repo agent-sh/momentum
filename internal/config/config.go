@@ -36,6 +36,15 @@ type Sources struct {
 	Sessions struct {
 		Projects []string `json:"projects"` // directories whose subpaths name a session's project
 	} `json:"sessions"`
+	// Supervise configures `momentum supervise`. Live, when set, names the rules that send (empty: none), in
+	// place of the ones momentum ships live; the others record what they would have sent. Notice is a command
+	// run once for each case opened, with a line about the session as its last argument: a passive notice for
+	// the owner, never one that wakes him. None by default. Off stops supervision.
+	Supervise struct {
+		Live   []string `json:"live"`
+		Notice []string `json:"notice"`
+		Off    bool     `json:"off"`
+	} `json:"supervise"`
 }
 
 // ErrNoSources means no sources file exists yet.
@@ -65,6 +74,9 @@ func Load() (Sources, error) {
 	}
 	for i, p := range s.Sessions.Projects {
 		s.Sessions.Projects[i] = paths.Expand(p)
+	}
+	if len(s.Supervise.Notice) > 0 {
+		s.Supervise.Notice[0] = paths.Expand(s.Supervise.Notice[0])
 	}
 	return s, nil
 }

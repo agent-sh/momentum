@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-sh/tacit/client/pkg/evidence"
 	"github.com/klauspost/compress/zstd"
@@ -845,5 +846,84 @@ func TestTranscriptsKeepCursorsOfAFolderThatCannotBeListed(t *testing.T) {
 	}
 	if r := ingest(t, src, st); r.Read != 0 {
 		t.Fatalf("after its folder could not be listed, a transcript was read again: %+v", r)
+	}
+}
+
+// A message momentum typed into a session lands in the user role as if the owner typed it; it opens with
+// momentum's marker, and is stored as the harness's.
+func TestTranscriptsDoNotCreditMomentumsOwnMessagesToTheOwner(t *testing.T) {
+	home := testHome(t)
+	sent := "[momentum] Your last turn stopped on an API error. Continue where you left off."
+	writeLines(t, claudePath(home),
+		claudeLine(0, `"type":"user","uuid":"u0","promptId":"p0",`+typed+`,"message":{"role":"user","content":"ship the release"}`),
+		claudeLine(1, `"type":"assistant","uuid":"a1","message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"Shipping it."}]}`),
+		claudeLine(9, `"type":"user","uuid":"u2","promptId":"p2",`+typed+`,"message":{"role":"user","content":"`+sent+`"}`),
+		// his words after a paste of momentum's that stayed on the input line are his
+		claudeLine(12, `"type":"user","uuid":"u3","promptId":"p3",`+typed+`,"message":{"role":"user","content":"`+sent+` and tag it"}`),
+		// a message that opens with the marker but that momentum never sent is his too
+		claudeLine(14, `"type":"user","uuid":"u4","promptId":"p4",`+typed+`,"message":{"role":"user","content":"[momentum] what did you send?"}`),
+	)
+	st := openStore(t)
+	if _, err := st.Put(context.Background(), []store.Event{{Source: store.Supervise, SourceKey: "s@1#transient#act#1@2", TS: time.Now(),
+		Session: "s", Actor: store.ActorAgent, Kind: "act", Meta: `{"rule":"transient","text":"` + sent + `","sent":true}`}}); err != nil {
+		t.Fatal(err)
+	}
+	ingest(t, transcripts(home), st)
+	evs := all(t, st, "transcripts")
+	if e := find(t, evs, "owner_text", "ship the release"); e.Actor != store.ActorOwner {
+		t.Fatalf("the owner's turn: %+v", e)
+	}
+	e := find(t, evs, "harness_text", "[momentum] Your last turn")
+	if e.Actor != store.ActorHarness || metaOf(t, e)["why"] != "momentum supervise" || metaOf(t, e)["input_kind"] != "typed" {
+		t.Fatalf("momentum's message: %+v", e)
+	}
+	owner := 0
+	for _, x := range evs {
+		if x.Kind == "owner_text" && strings.HasPrefix(x.Summary, "[momentum]") {
+			if x.Actor != store.ActorOwner || x.Summary == sent {
+				t.Fatalf("an owner event: %+v", x)
+			}
+			owner++
+		}
+	}
+	if owner != 2 {
+		t.Fatalf("his own turns that open with the marker: %d", owner)
+	}
+}
+
+// A message momentum typed is its own even when redaction masks part of it, and even when it was typed while the
+// ingest that reads it ran.
+func TestTranscriptsKnowMomentumsMessagesBeforeRedactionAndWhileTheyRun(t *testing.T) {
+	home := testHome(t)
+	masked1 := "[momentum] Retry with key tok_" + strings.Repeat("a", 30) + " now."
+	late := "[momentum] Your last turn stopped on a transient API error. Continue where you left off."
+	writeLines(t, claudePath(home),
+		claudeLine(0, `"type":"user","uuid":"u0","promptId":"p0",`+typed+`,"message":{"role":"user","content":"`+masked1+`"}`),
+		claudeLine(3, `"type":"user","uuid":"u1","promptId":"p1",`+typed+`,"message":{"role":"user","content":"`+late+`"}`),
+	)
+	st := openStore(t)
+	act := func(key, text string) store.Event {
+		return store.Event{Source: store.Supervise, SourceKey: key, TS: time.Now(), Session: "s", Actor: store.ActorAgent, Kind: "act",
+			Meta: `{"rule":"transient","text":"` + text + `","sent":true}`}
+	}
+	if _, err := st.Put(context.Background(), []store.Event{act("s@1#transient#act#1@1", masked1)}); err != nil {
+		t.Fatal(err)
+	}
+	src := transcripts(home)
+	once := false
+	src.records = func(ctx context.Context, texts []string) ([]string, error) {
+		if !once { // momentum types its next message while this ingest runs
+			once = true
+			if _, err := st.Put(ctx, []store.Event{act("s@2#transient#act#2@2", late)}); err != nil {
+				return nil, err
+			}
+		}
+		return recordsVia(masked)(ctx, texts)
+	}
+	ingest(t, src, st)
+	for _, x := range all(t, st, "transcripts") {
+		if x.Kind == "owner_text" {
+			t.Fatalf("momentum's message stored as the owner's: %+v", x)
+		}
 	}
 }

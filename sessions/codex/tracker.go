@@ -37,6 +37,7 @@ type track struct {
 	Ask      string           `json:"ask"`
 	AskCall  string           `json:"ask_call"`
 	AskAsync bool             `json:"ask_async"`
+	UserAt   time.Time        `json:"user_at,omitzero"` // when a user message last arrived
 	log      sessions.Log
 }
 
@@ -132,6 +133,7 @@ func (t *Tracker) line(e xLine, at time.Time) {
 			st.log.Add(sessions.Entry{Role: sessions.RoleAssistant, Text: text.OneLine(msg, 900)})
 		} else if p.Role == "user" && !strings.HasPrefix(strings.TrimSpace(msg), "<") && !strings.HasPrefix(msg, "# AGENTS.md") {
 			st.log.Add(sessions.Entry{Role: sessions.RoleUser, Text: text.OneLine(msg, 1200)})
+			st.UserAt = at
 		}
 	case "response_item/function_call", "response_item/custom_tool_call":
 		desc := describe(p.Name, p.Arguments+p.Input)
@@ -207,6 +209,7 @@ func (t *Tracker) Facts(s *sessions.Session, now time.Time) {
 	s.Size = t.Update()
 	s.Log = &t.st.log
 	s.LastText = strings.TrimSpace(t.st.LastText)
+	s.UserAt = t.st.UserAt
 	if c := t.pending(); c != nil {
 		s.Now, s.NowSince = text.OneLine(c.Name+": "+c.Desc, 140), c.At
 	}

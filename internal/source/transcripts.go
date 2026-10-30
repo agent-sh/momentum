@@ -76,6 +76,10 @@ const (
 	tailChars  = 80
 )
 
+// Marker opens every message `momentum supervise` types into a session (supervise.Marker): on top of tacit's
+// attribution, a turn that is such a message, as momentum recorded sending it, is not the owner's.
+const Marker = "[momentum]"
+
 // skipWhy are the items not stored, by tacit's reason, with why: Codex's "[Recorded tool history]" message
 // replays calls and results that are already events of their own.
 var skipWhy = map[string]bool{"recorded tool history": true}
@@ -210,7 +214,11 @@ func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error
 	if workers <= 0 {
 		workers = DefaultWorkers()
 	}
-	w := writer{st: st, records: records, redact: redact, t: t, source: s.Name()}
+	sent, err := st.SentTexts(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	w := writer{st: st, sent: sent, records: records, redact: redact, t: t, source: s.Name()}
 	ch := make(chan *job)
 	var wg sync.WaitGroup
 	for range workers {
@@ -490,6 +498,8 @@ func (b *batch) add(p part) {
 type writer struct {
 	mu      sync.Mutex
 	st      *store.Store
+	sentMu  sync.Mutex
+	sent    map[string]bool                                   // texts momentum supervise typed into sessions, folded
 	records func(context.Context, []string) ([]string, error) // nil: no records mode, the boundary
 	redact  func(context.Context, []evidence.Event) ([]evidence.Event, error)
 	t       *tally
@@ -571,7 +581,7 @@ func (w *writer) events(ctx context.Context, parts []part) ([][]store.Event, int
 	unknown := 0
 	for _, it := range items {
 		n := len(it.texts)
-		e, unk := toEvent(w.source, it.e, it.keep(red[:n]))
+		e, unk := toEvent(w.source, it.e, it.keep(red[:n]), w.ours(ctx, it.e, it.keep(it.texts)))
 		red = red[n:]
 		if unk {
 			unknown++
@@ -583,6 +593,25 @@ func (w *writer) events(ctx context.Context, parts []part) ([][]store.Event, int
 		byPart[i], out = out[:len(p.items)], out[len(p.items):]
 	}
 	return byPart, unknown, nil
+}
+
+// ours reports whether an owner turn is one of momentum's own messages, word for word as momentum recorded typing
+// it, compared before redaction masks anything in it. A turn that opens with the marker but is not among the
+// texts this ingest read at its start is looked up again: a message typed while it runs.
+func (w *writer) ours(ctx context.Context, e evidence.Event, raw string) bool {
+	raw = strings.Join(strings.Fields(raw), " ")
+	if e.Kind != evidence.KindOwnerText || !strings.HasPrefix(raw, Marker) {
+		return false
+	}
+	w.sentMu.Lock()
+	defer w.sentMu.Unlock()
+	if w.sent[raw] {
+		return true
+	}
+	if sent, err := w.st.SentTexts(ctx); err == nil {
+		w.sent = sent
+	}
+	return w.sent[raw]
 }
 
 // boundary separates the texts of one scrump call when the installed scrump has no records mode, so each is
@@ -815,7 +844,7 @@ func place(e evidence.Event) string {
 // toEvent maps one item. The actor follows the kind: the owner's text is his; agent text and tool calls an
 // agent's; a tool's result the tool's; harness text and compactions the harness's. A call the owner made
 // himself (a !command he ran in pi) is his, and an item tacit credits to no one is unknown.
-func toEvent(source string, e evidence.Event, summary string) (store.Event, bool) {
+func toEvent(source string, e evidence.Event, summary string, ours bool) (store.Event, bool) {
 	var actor store.Actor
 	switch e.Kind {
 	case evidence.KindOwnerText:
@@ -840,6 +869,12 @@ func toEvent(source string, e evidence.Event, summary string) (store.Event, bool
 	if why == plainWhy[e.Kind] {
 		why = ""
 	}
+	kind := string(e.Kind)
+	// momentum's own messages land in the user role as if typed. A turn that is one of them, word for word, is not
+	// his; one that opens with the marker and holds more (his words typed after a paste that stayed) is.
+	if ours {
+		actor, kind, why = store.ActorHarness, string(evidence.KindHarnessText), "momentum supervise"
+	}
 	// A Codex subagent's thread, a pi task and a Hermes delegation are sessions of their own in tacit's
 	// events, their parent named; here they are a subagent inside the parent's session, as Claude Code's are.
 	session := e.Session
@@ -856,7 +891,7 @@ func toEvent(source string, e evidence.Event, summary string) (store.Event, bool
 		Model:     e.Model,
 		Cwd:       e.Cwd,
 		Actor:     actor,
-		Kind:      string(e.Kind),
+		Kind:      kind,
 		Tool:      e.ToolName,
 		Summary:   summary,
 		Meta: meta(map[string]any{"tool_id": e.ToolID, "is_error": e.IsError, "input_kind": string(e.InputKind),

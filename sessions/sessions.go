@@ -92,6 +92,15 @@ type Session struct {
 	Loop       string    `json:"loop,omitempty"`
 	LastText   string    `json:"last_text,omitempty"` // the last assistant message in full
 	LastActive time.Time `json:"last_active"`
+	// UserAt is when user-role text last opened a turn, by the harness's record. Whoever typed it: a program
+	// that types into the terminal counts too.
+	UserAt time.Time `json:"user_at,omitzero"`
+	// ControlAt is when its user last steered the session without a prompt, by the harness's record: a local
+	// command such as /login, an interruption, or an answer to its question or plan.
+	ControlAt time.Time `json:"control_at,omitzero"`
+	// ResumedAt is when the harness reopened the session after it ended mid-task (Claude Code's resume records:
+	// a call or a background task the end cut off), when nothing has happened in it since. Zero otherwise.
+	ResumedAt  time.Time `json:"resumed_at,omitzero"`
 	Started    time.Time `json:"started"`
 	Transcript string    `json:"transcript,omitempty"`
 	Size       int64     `json:"-"` // how much of the transcript or database has been read; -1 when unreadable

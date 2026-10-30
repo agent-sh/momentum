@@ -33,6 +33,17 @@ var (
 	reSystemTag = regexp.MustCompile(`(?s)<(system-reminder|local-command-stdout|local-command-caveat|command-name|command-message|command-args)>.*?</(system-reminder|local-command-stdout|local-command-caveat|command-name|command-message|command-args)>`)
 )
 
+// What Claude Code writes as it reopens a session that ended mid-task: a background task's notice that it did not
+// finish before the previous session ended, and the result of a call that the end cut off.
+var (
+	reOrphan   = regexp.MustCompile(`didn't finish before the previous session ended|<task-id>__orphan_summary__`)
+	reCutCall  = regexp.MustCompile(`^\[Tool call interrupted: the session ended before`)
+	synthetic  = "<synthetic>"
+	noResponse = "No response requested."
+	// RateLimit is the error a turn ended on when Claude Code reported a rate limit with no text of its own.
+	RateLimit = "rate_limit: " + noResponse
+)
+
 // terminal are the task statuses after which a task is over.
 var terminal = map[string]bool{"completed": true, "failed": true, "killed": true, "stopped": true, "error": true, "timeout": true, "cancelled": true}
 
@@ -89,6 +100,9 @@ type track struct {
 	WakeAt   time.Time        `json:"wake_at"`
 	Crons    map[string]cron  `json:"crons"`
 	Model    string           `json:"model"`
+	UserAt   time.Time        `json:"user_at,omitzero"`    // when user-role text last opened a turn
+	Control  time.Time        `json:"control_at,omitzero"` // when its user last ran a local command, interrupted or answered
+	Resumed  time.Time        `json:"resumed,omitzero"`    // a resume record since which nothing else happened
 	log      sessions.Log
 }
 
@@ -170,6 +184,7 @@ type line struct {
 	Compact      bool   `json:"isCompactSummary"`
 	Timestamp    string `json:"timestamp"`
 	APIError     bool   `json:"isApiErrorMessage"`
+	Error        string `json:"error"` // an API error's kind, as Claude Code names it
 	PromptSource string `json:"promptSource"`
 	Origin       *struct {
 		Kind string `json:"kind"`
@@ -230,6 +245,16 @@ func (t *Tracker) assistant(e line, at time.Time) {
 		return
 	}
 	st := &t.st
+	// Reopening a session whose turn was open (the model owed a reply), Claude Code closes the turn with a
+	// synthetic "No response requested." and calls no model. After an interruption or its own retry it writes the
+	// same, but the turn was not open then. An API error can carry the same text: a rate limit it has no words for.
+	if !e.APIError && e.Message.Model == synthetic && bytes.Contains(e.Message.Content, []byte(noResponse)) {
+		if st.LastMain == "user" {
+			st.Resumed = at
+		}
+	} else if !e.APIError {
+		st.Resumed = time.Time{}
+	}
 	if st.LastMain != "assistant" {
 		st.Group = st.Group[:0]
 	}
@@ -247,6 +272,9 @@ func (t *Tracker) assistant(e line, at time.Time) {
 			st.LastText = b.Text
 			if e.APIError {
 				st.ErrText = text.OneLine(b.Text, 200)
+				if e.Error == "rate_limit" && strings.TrimSpace(b.Text) == noResponse {
+					st.ErrText = RateLimit // the text says nothing; the kind says what stopped it
+				}
 			}
 			st.log.Add(sessions.Entry{Role: sessions.RoleAssistant, Text: text.OneLine(b.Text, 900)})
 		case "tool_use":
@@ -318,6 +346,9 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 	if strings.Contains(s, "<task-notification>") {
 		t.notified(s, at)
 		st.LastMain = "user"
+		if reOrphan.MatchString(s) {
+			st.Resumed = at
+		}
 		return
 	}
 	// Another session's message is logged as such, never as user text. Claude Code marks it meta, which does not
@@ -336,12 +367,17 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 	if strings.HasPrefix(clean, "[Request interrupted") {
 		st.LastMain = "ended"
 		st.Group = st.Group[:0]
+		st.Control = at // its user pressed Esc, or turned a tool call down
 		return
 	}
 	if clean == "" {
+		if strings.Contains(s, "<command-name>") {
+			st.Control = at // the echo of a local command its user ran: /login, /model
+		}
 		return
 	}
 	st.LastMain = "user"
+	st.UserAt, st.Resumed = at, time.Time{}
 	st.WakeAt = time.Time{} // a new prompt: any planned wakeup belongs to its turn now
 	st.log.Add(sessions.Entry{Role: sessions.RoleUser, Origin: origin, Text: text.OneLine(clean, 1200)})
 }
@@ -370,6 +406,9 @@ func (t *Tracker) result(b block, at time.Time) {
 	if c == nil {
 		return
 	}
+	if (c.Name == "AskUserQuestion" || c.Name == "ExitPlanMode") && !reCutCall.MatchString(out) && !strings.Contains(out, "<tool_use_error>") {
+		st.Control = at // its user answered the question, or the plan: whenever the scans ran
+	}
 	add := func(id, kind string) *task {
 		k := &task{Task: sessions.Task{ID: id, Kind: kind, Label: c.Desc, Started: at, LastActive: at}}
 		if kind == "agent" {
@@ -377,6 +416,9 @@ func (t *Tracker) result(b block, at time.Time) {
 		}
 		st.Tasks[id] = k
 		return k
+	}
+	if b.IsError && reCutCall.MatchString(out) {
+		st.Resumed = at
 	}
 	switch {
 	case b.IsError:
@@ -548,6 +590,7 @@ func (t *Tracker) Facts(s *sessions.Session, now time.Time) {
 	s.Log = &t.st.log
 	s.Tasks = t.live(s.Started, now)
 	s.LastText = strings.TrimSpace(t.st.LastText)
+	s.UserAt, s.ControlAt, s.ResumedAt = t.st.UserAt, t.st.Control, t.st.Resumed
 	if s.Model == "" {
 		s.Model = t.st.Model
 	}
