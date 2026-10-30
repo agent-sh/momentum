@@ -391,6 +391,8 @@ var groupTitles = map[string]string{
 	"uncommitted": "with uncommitted work, left",
 	"unpushed":    "with commits on no remote, left",
 	"unreadable":  "git could not read, left",
+	"ignored":     "with ignored files that are not a cache, left",
+	"mount":       "holding a mount point, left",
 	"volumes":     "only reported",
 	"failed":      "that could not be deleted",
 }
@@ -404,8 +406,11 @@ func groupNote(id, rule, class string, items []Finding, now time.Time) store.Not
 	}
 	what := ruleText[rule]
 	title := fmt.Sprintf("%d %s %s (%s)", len(items), plural(what, len(items)), groupTitles[class], gib(total))
-	if rule == RuleDocker && class == "volumes" {
+	switch {
+	case rule == RuleDocker && class == "volumes":
 		title = fmt.Sprintf("Docker volumes no container uses hold %s, only reported", gib(total))
+	case rule == RuleUV && class == "busy":
+		title = fmt.Sprintf("The uv cache is %s and waits to be pruned: uv processes read it", gib(total))
 	}
 	var parts []string
 	for _, f := range items[:min(len(items), 3)] {
