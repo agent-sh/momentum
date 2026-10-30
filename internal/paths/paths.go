@@ -43,8 +43,11 @@ func Config() string {
 	return filepath.Join(xdg("XDG_CONFIG_HOME", ".config"), "momentum")
 }
 
-// Expand turns a leading ~/ into the home directory.
+// Expand turns a leading ~/, or ~ alone, into the home directory.
 func Expand(p string) string {
+	if p == "~" {
+		return Home()
+	}
 	if len(p) >= 2 && p[:2] == "~/" {
 		return filepath.Join(Home(), p[2:])
 	}

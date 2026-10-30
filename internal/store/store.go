@@ -77,6 +77,7 @@ type querier interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
 }
 
 const schema = `
@@ -97,6 +98,10 @@ CREATE TABLE IF NOT EXISTS trackers (tool TEXT NOT NULL, key TEXT NOT NULL, buil
   log_base INTEGER NOT NULL, log_seq INTEGER NOT NULL, seen INTEGER NOT NULL, PRIMARY KEY (tool, key));
 CREATE TABLE IF NOT EXISTS tracker_log (tool TEXT NOT NULL, key TEXT NOT NULL, seq INTEGER NOT NULL, role TEXT NOT NULL,
   name TEXT NOT NULL, origin TEXT NOT NULL, text TEXT NOT NULL, PRIMARY KEY (tool, key, seq)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS events_session ON events(session, ts);
+CREATE TABLE IF NOT EXISTS file_cursors (source TEXT NOT NULL, path TEXT NOT NULL, inode INTEGER NOT NULL, fp TEXT NOT NULL,
+  compressed INTEGER NOT NULL, offset INTEGER NOT NULL, state BLOB, size INTEGER NOT NULL, mtime INTEGER NOT NULL,
+  updated INTEGER NOT NULL, PRIMARY KEY (source, path));
 `
 
 // BusyTimeout is how long a statement waits for another connection's write transaction before it fails, and how
@@ -168,12 +173,17 @@ var stampColumns = [][2]string{{"tool", "TEXT NOT NULL DEFAULT ''"}, {"name", "T
 // the next ingest reads every source again, and the next sessions run reads every transcript. Two things are not
 // touched by that: the state tables (stateSchema), and the observed events (Sessions), which move to the new
 // events table column by column (keepObserved).
-const schemaVersion = 2
+//   - 3: the transcripts source's file cursors (file_cursors) and the index a session is read by
+//     (events_session).
+const schemaVersion = 3
 
-// derivedTables are the tables of the derived schema, and derivedIndexes its indexes.
+// derivedTables are the tables of the derived schema, and derivedIndexes its indexes. The file cursors are
+// derived: each says how far a source's events of one file go, with the reader's saved state there, so they go
+// with those events. Dropped, the next ingest reads every transcript again from its start, a few minutes of CPU
+// once; a transcript its harness deleted since is not read again, and its events are not stored again.
 var (
-	derivedTables  = []string{"events", "cursors", "seen_files", "skipped", "trackers", "tracker_log"}
-	derivedIndexes = []string{"events_ts", "events_kind", "events_source"}
+	derivedTables  = []string{"events", "cursors", "seen_files", "skipped", "trackers", "tracker_log", "file_cursors"}
+	derivedIndexes = []string{"events_ts", "events_kind", "events_source", "events_session"}
 )
 
 // checkpointColumns are the columns the schema gives the checkpoint tables. They are a cache of what transcripts
@@ -415,26 +425,37 @@ func (s *Store) Put(ctx context.Context, evs []Event) (int, error) {
 	return added, tx.Commit()
 }
 
+// put stores events on q with statements prepared once: a transcript adds thousands per transaction.
 func put(ctx context.Context, tx querier, evs []Event) (int, error) {
+	seenStmt, err := tx.PrepareContext(ctx, `SELECT COUNT(*) FROM events WHERE id=?`)
+	if err != nil {
+		return 0, err
+	}
+	defer seenStmt.Close()
+	putStmt, err := tx.PrepareContext(ctx, `INSERT INTO events (id, source, source_key, ts, session, agent, harness, model,
+	  cwd, actor, kind, tool, summary, meta, ref, heuristic, experiment, ingested)
+	  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	  ON CONFLICT(id) DO UPDATE SET ts=excluded.ts, session=excluded.session, agent=excluded.agent,
+	    harness=excluded.harness, model=excluded.model, cwd=excluded.cwd, actor=excluded.actor, kind=excluded.kind,
+	    tool=excluded.tool, summary=excluded.summary, meta=excluded.meta, ref=excluded.ref,
+	    heuristic=excluded.heuristic, experiment=excluded.experiment`)
+	if err != nil {
+		return 0, err
+	}
+	defer putStmt.Close()
 	now := time.Now().UnixMilli()
 	added := 0
 	for _, e := range evs {
 		if e.Source == "" || e.SourceKey == "" || e.Kind == "" || e.Actor == "" {
 			return 0, fmt.Errorf("event from %q lacks source, key, kind or actor", e.Source)
 		}
+		id := e.ID()
 		var seen int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE id=?`, e.ID()).Scan(&seen); err != nil {
+		if err := seenStmt.QueryRowContext(ctx, id).Scan(&seen); err != nil {
 			return 0, err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO events (id, source, source_key, ts, session, agent, harness, model,
-		  cwd, actor, kind, tool, summary, meta, ref, heuristic, experiment, ingested)
-		  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-		  ON CONFLICT(id) DO UPDATE SET ts=excluded.ts, session=excluded.session, agent=excluded.agent,
-		    harness=excluded.harness, model=excluded.model, cwd=excluded.cwd, actor=excluded.actor, kind=excluded.kind,
-		    tool=excluded.tool, summary=excluded.summary, meta=excluded.meta, ref=excluded.ref,
-		    heuristic=excluded.heuristic, experiment=excluded.experiment`,
-			e.ID(), e.Source, e.SourceKey, e.TS.UnixMilli(), e.Session, e.Agent, e.Harness, e.Model, e.Cwd,
-			string(e.Actor), e.Kind, e.Tool, e.Summary, e.Meta, e.Ref, e.Heuristic, e.Experiment, now); err != nil {
+		if _, err := putStmt.ExecContext(ctx, id, e.Source, e.SourceKey, e.TS.UnixMilli(), e.Session, e.Agent, e.Harness,
+			e.Model, e.Cwd, string(e.Actor), e.Kind, e.Tool, e.Summary, e.Meta, e.Ref, e.Heuristic, e.Experiment, now); err != nil {
 			return 0, err
 		}
 		if seen == 0 {
@@ -442,6 +463,105 @@ func put(ctx context.Context, tx querier, evs []Event) (int, error) {
 		}
 	}
 	return added, nil
+}
+
+// FileCursor is where a source stopped in one file of many, and what it needs to tell the same file from a
+// new one: its inode and a fingerprint of its first line (OpenTelemetry's filelog rule), whether a compressed
+// copy held it, and the size and modification time (ns) it had when it was read to the end (0 while a read
+// is under way). State is what the file's reader kept at Offset, or nil: for transcripts, tacit's saved
+// reader state, which holds transcript lines unredacted and is never printed or sent. Path names the file,
+// or another record the source reads in parts.
+type FileCursor struct {
+	Source, Path string
+	Inode        uint64
+	FP           string
+	Compressed   bool
+	Offset       int64
+	State        []byte
+	Size, MTime  int64
+}
+
+// FileCursors are a source's saved file cursors, by path.
+func (s *Store) FileCursors(ctx context.Context, source string) (map[string]FileCursor, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT path, inode, fp, compressed, offset, state, size, mtime FROM file_cursors
+	  WHERE source=?`, source)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]FileCursor{}
+	for rows.Next() {
+		c := FileCursor{Source: source}
+		var ino int64
+		if err := rows.Scan(&c.Path, &ino, &c.FP, &c.Compressed, &c.Offset, &c.State, &c.Size, &c.MTime); err != nil {
+			return nil, err
+		}
+		c.Inode = uint64(ino)
+		out[c.Path] = c
+	}
+	return out, rows.Err()
+}
+
+// FileWrite is a part of a file read: its events and the file's cursor after them.
+type FileWrite struct {
+	Events []Event
+	Cursor FileCursor
+}
+
+// PutFiles stores parts of files in one transaction, each part's events with the cursor after them, so a
+// cursor never runs ahead of what was stored. It returns how many events were new.
+func (s *Store) PutFiles(ctx context.Context, ws []FileWrite) (int, error) {
+	if len(ws) == 0 {
+		return 0, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var evs []Event
+	for _, w := range ws {
+		evs = append(evs, w.Events...)
+	}
+	added, err := put(ctx, tx, evs)
+	if err != nil {
+		return 0, err
+	}
+	cur, err := tx.PrepareContext(ctx, `INSERT INTO file_cursors (source, path, inode, fp, compressed, offset, state,
+	  size, mtime, updated) VALUES (?,?,?,?,?,?,?,?,?,?)
+	  ON CONFLICT(source, path) DO UPDATE SET inode=excluded.inode, fp=excluded.fp, compressed=excluded.compressed,
+	    offset=excluded.offset, state=excluded.state, size=excluded.size, mtime=excluded.mtime, updated=excluded.updated`)
+	if err != nil {
+		return 0, err
+	}
+	defer cur.Close()
+	now := time.Now().UnixMilli()
+	for _, w := range ws {
+		c := w.Cursor
+		if _, err := cur.ExecContext(ctx, c.Source, c.Path, int64(c.Inode), c.FP, c.Compressed, c.Offset, c.State, c.Size,
+			c.MTime, now); err != nil {
+			return 0, err
+		}
+	}
+	return added, tx.Commit()
+}
+
+// DropFileCursors forgets the cursors of files a source no longer finds. Their events stay.
+func (s *Store) DropFileCursors(ctx context.Context, source string, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, p := range paths {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM file_cursors WHERE source=? AND path=?`, source, p); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // Cursor returns a source's saved position, "" when it has none.
@@ -510,6 +630,7 @@ func (s *Store) Rebuild(ctx context.Context, source string) error {
 		`DELETE FROM cursors WHERE source=? OR source LIKE ?`,
 		`DELETE FROM seen_files WHERE source=? OR source LIKE ?`,
 		`DELETE FROM skipped WHERE source=? OR source LIKE ?`,
+		`DELETE FROM file_cursors WHERE source=? OR source LIKE ?`,
 	} {
 		if _, err := tx.ExecContext(ctx, q, source, like); err != nil {
 			return err
@@ -518,12 +639,16 @@ func (s *Store) Rebuild(ctx context.Context, source string) error {
 	return tx.Commit()
 }
 
-// Query selects events newest first.
+// Query selects events newest first, or, with Session (an id or its first characters), one session's events
+// with its subagents' at any depth, oldest first: a session reads as what happened, in order. Events of one
+// moment keep their order in the source (SourceKey). Until, when set, is the end of the window.
 type Query struct {
-	Since  time.Time
-	Kinds  []string
-	Source string
-	Limit  int
+	Since   time.Time
+	Kinds   []string
+	Source  string
+	Session string
+	Until   time.Time
+	Limit   int
 }
 
 func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
@@ -537,12 +662,27 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 	if q.Source != "" {
 		where, args = append(where, "source = ?"), append(args, q.Source)
 	}
+	if !q.Until.IsZero() {
+		where, args = append(where, "ts < ?"), append(args, q.Until.UnixMilli())
+	}
+	order := "ts DESC, source_key DESC"
+	if q.Session != "" {
+		// An id or its first characters (a range the session index serves), and the threads under it at any
+		// depth: a subagent's thread is an Agent inside its parent's session, and its own subagents' events
+		// are in a session of its id.
+		where = append(where, `session IN (WITH RECURSIVE tree(id) AS (
+		    SELECT DISTINCT session FROM events WHERE session >= ? AND session < ?
+		    UNION SELECT DISTINCT e.agent FROM events e JOIN tree ON e.session = tree.id WHERE e.agent != '' AND e.agent != e.session)
+		  SELECT id FROM tree)`)
+		args = append(args, q.Session, q.Session+"\uffff")
+		order = "ts, source_key"
+	}
 	limit := q.Limit
 	if limit <= 0 {
 		limit = 200
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
-	  tool, summary, meta, ref, heuristic, experiment FROM events WHERE `+strings.Join(where, " AND ")+` ORDER BY ts DESC LIMIT ?`,
+	  tool, summary, meta, ref, heuristic, experiment FROM events WHERE `+strings.Join(where, " AND ")+` ORDER BY `+order+` LIMIT ?`,
 		append(args, limit)...)
 	if err != nil {
 		return nil, err

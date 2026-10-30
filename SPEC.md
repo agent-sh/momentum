@@ -68,6 +68,37 @@ The `sessions` packages are exported, so the session board imports them instead 
 
 `momentum sessions` prints the live sessions and their phases from this layer.
 
+## Session history
+
+`momentum evidence ingest` reads the agents' session history with tacit's reader (`pkg/evidence`): Claude Code with its subagents, Codex with its compressed rollouts, pi with its tasks, and the Hermes store, where tacit finds them under each home that `sources.json` lists (`"transcripts": {"homes": ["~"]}`). Who wrote an item is tacit's decision, never a copy of its rules. tacit cuts the owner's pastes by the prompt history of `$HOME`, also in another home's sessions.
+
+- **One event per item.** The actor follows the kind: the owner's text is the owner's; an agent's text and its tool calls are the agent's; a tool's result is the tool's; harness text and compactions are the harness's. A call the owner made himself (a command he ran from pi's prompt) is his, and an item tacit credits to no one is `unknown`.
+  - Each event carries the session, the subagent, the harness, the model and the working directory. A Codex subagent's thread, a pi task and a Hermes delegation are a subagent inside their parent's session, as Claude Code's subagents are; a thread's own subagents are in the session of its id, and a session's listing walks them at any depth.
+  - Its kind is tacit's (`owner_text`, `agent_text`, `harness_text`, `tool_call`, `tool_result`, `compaction`), and its tool is the tool's name.
+  - Its meta holds the tool call's id, the error flag, how the owner's turn was put in (`input_kind`), the harness's record before it (`prior`), tacit's reason (`why`, when it says more than the kind) and the parent session.
+  - Its reference is `path@offset#index`, the item's place in the transcript (a Hermes row's id). Its key is the file's own name with that place, so it holds when a harness moves or compresses the file.
+- **What is stored.** Every item except Codex's "[Recorded tool history]" messages, which replay calls and results that are already events. tacit's reader passes over a line it cannot parse, so this source counts no unparsed records. Tool calls and results are what a failure is reconstructed from; the owner's words are what the families start from.
+  - A summary is clipped, in bytes. An owner's turn keeps 2,000: his words are what the families quote, and a typed turn is seldom longer. An error's output keeps 1,000, because it holds the failure. Other results, calls, harness text and compactions keep 240. An agent's text keeps its first 160 and last 80: what it set out to do, and what it asks or claims.
+  - The full text stays in the transcript, at the reference.
+- **Redaction.** Events hold only text that tacit's redaction masked (`RedactEvents`, scrump).
+  - Each text is cut with a 512-byte spare before it is masked, so a secret across the cut is whole when scrump sees it, and cut to its length after. An agent text's start and end are two texts.
+  - A worker gathers up to 4 MiB of texts for one scrump call (a call costs a process start), joined into one text and cut back at the same offsets: masks keep the length.
+  - scrump scans its input as one stream, so a hit that starts in one text could run into the next: a quoted value a cut left open runs to the next quote, and some rules reach up to 1,000 bytes across lines. Where it ran in, it would end where scrump resumes its scan, maybe inside a secret, past the key that marks it; a hit the rule's filter rejects masks nothing and moves the scan on all the same. So the texts are joined by a boundary that closes an open quoted value, is longer than the text profile's longest reach across lines, and ends with a mark no secret's value starts with: each text is masked as it would be alone. A text masked from its first byte all the same (a rule longer than the boundary) is masked again on its own, and a byte stays masked when either call masked it.
+  - When redaction cannot run, nothing is read and the source fails. When it fails on a batch, each file in it is masked on its own; the file it fails on stores nothing past its cursor this run and is named, and the next run takes it up there.
+  - The reader's saved state (`file_cursors.state`) holds transcript lines as they are, unredacted: a Codex question's options, a local command's caveat, the cwd. tacit's rules need them whole. It is as private as the transcript, in the same 0600 store, and is never printed, exported or sent.
+- **Cursors.** Each transcript has a cursor: the offset after the last line stored, and the reader's saved state, so following a growing session reads only what was added.
+  - A file is told from a new one by its inode and a fingerprint of its first line, as the mistakes log is. A file the harness compressed in place keeps its cursor, since tacit names offsets in the decompressed bytes. A compressed copy is final and keeps no state.
+  - A transcript is read, redacted and stored 64 MiB at a time, with each batch's events and cursors in one transaction. Only the part that ends a read marks the file as read: a run that stores a part but not the rest reads on from the cursor next time. An unchanged file is not opened.
+  - A file cut or replaced is read again from its start. Its events at places the new content does not reach stay. A file rewritten in place, with the same first line and grown past its cursor, is read on from the cursor: tacit's saved state sees the change and makes the read pass over the lines before it, but the lines it changed there are not stored again. Harnesses append, so both are rare.
+  - A file whose plain and compressed copies are both gone loses its cursor and keeps its events. A run that could not list a source keeps every cursor.
+  - A Hermes session's cursor is its last row's id. Hermes writes new rows on /retry, /undo and /compress; a row it rewrites in place keeps the version first read.
+  - The cursors are derived, like the events they go with: a schema change drops both, and the next ingest reads every transcript again from its start. A transcript its harness deleted since is not read again.
+- **Prior art.** OpenTelemetry's filelog receiver gave the cursor rule. Two event formats were not followed:
+  - OpenTelemetry's GenAI conventions (in development) record messages with the model API's role. A role says which side of the API a message is on, not who wrote it: a prompt that another agent or a wake loop typed is `user` too.
+  - Claude Code's own OpenTelemetry events (`user_prompt`, `tool_result`, `api_error`) leave prompt text and tool input out by default. They begin when telemetry is turned on and cover one harness. The transcripts already hold every harness's history.
+
+`momentum evidence events --session ID` prints one session's events, with its subagents' among them, oldest first, from its start; `--since` and `--until` take a duration or a local time, and a listing the limit cut says so.
+
 ## Evidence it keeps
 
 Phase 0 showed that each family needs history the machine does not keep today. The collectors are cheap and keep running when the rest of the tool is down.
