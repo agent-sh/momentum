@@ -35,7 +35,7 @@ const (
 var overrides = map[string]string{
 	RuleModels:    "Download it again when work on it resumes; to keep an item, list it in capacity.models.keep in sources.json.",
 	RuleTargets:   "Cargo builds it again on the next build; to keep a project's build output, list the project in capacity.exclude.paths.",
-	RuleWorktrees: "Every commit is on its remote; git worktree add brings the branch back.",
+	RuleWorktrees: "Its commits are on its remote, or its changes are in the default branch; git worktree add brings a branch back.",
 	RuleUV:        "uv downloads the wheels it dropped again on the next install.",
 	RuleDocker:    "Docker builds the cache again on the next build.",
 }

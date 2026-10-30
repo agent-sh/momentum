@@ -106,7 +106,7 @@ It keeps the disks from filling. Each run samples which paths processes use (ope
 - **models:** a top-level item of a models, datasets or model-cache root with no write and no use seen for 30 days goes. Nothing goes before the sampler has watched for 30 days. A Hugging Face cache's shared Xet blobs go with the last repository that links them.
 - **targets:** a Cargo target directory with no write for 48 hours, that no process uses, that git does not track, and whose project is known and not excluded.
 - **worktrees:** a linked worktree whose branch is merged, landed or gone from its remote, clean, with every commit on a remote or merged: `git worktree remove`, then its branch. One with uncommitted or unpushed work is reported.
-- **uv:** `uv cache prune --ci --force` over 30 GiB or weekly, never while uv installs.
+- **uv:** `uv cache prune --ci --force` over 30 GiB or weekly, only when no uv process runs (one that imports from the cache is reported).
 - **docker:** the build cache older than 168 hours and dangling images; unused volumes are reported.
 - **disk:** a fill faster than 20 GiB an hour, or one that reaches 94% within 6 hours, names its writers in a problem note.
 

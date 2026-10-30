@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -65,8 +66,11 @@ func runTool(ctx context.Context, timeout time.Duration, path, name string, args
 
 // uv prunes the uv cache with `uv cache prune --ci --force` when it is over its size, or when the last prune is
 // older than the cadence (or there was none). --ci keeps the wheels uv built and drops the ones it can download
-// again; --force prunes past the cache's lock, which long-lived `uv tool run` processes hold, so the rule waits
-// itself while anything installs: an install, a sync, a lock, a venv being made.
+// again, and the unpacked wheels environments import from. --force prunes past the cache's lock, which uv's own
+// documentation allows only when no other uv process reads or writes the cache. So the rule prunes only when no
+// uv process runs and no process uses a file in the cache. An install, a sync or a venv being made ends soon: it
+// waits for it. A long-lived one (a tool server run with uvx, a script run with uv run) may import from the cache
+// at any time, and a prune under it could break it: the rule reports it, and prunes when it is gone.
 func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error) {
 	out, err := r.tools.UV(ctx, 30*time.Second, "cache", "dir")
 	if errors.Is(err, errNoTool) {
@@ -96,8 +100,15 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 		notes = append(notes, "last pruned "+last.Format("2006-01-02 15:04")+", under "+gib(max))
 		return nil, notes, nil
 	}
-	if busy := uvBusy(r.sample); busy != "" {
-		f.Action, f.Why = ActKeep, "waits: "+busy
+	// a look at the processes now, for the uv processes and the uses of the cache, which may be under no other root
+	now := TakeSample(r.opt.ProcRoot, r.m, func(p string) bool { return under(p, f.canon) })
+	if busy := uvBusy(now); busy != "" {
+		f.Action, f.Why = ActKeep, "waits for an install: "+busy
+		return []Finding{f}, notes, nil
+	}
+	if readers := uvReaders(now, f.canon); readers != "" {
+		f.Action, f.class = ActReport, "busy"
+		f.Why = "it waits: uv processes read the cache, and a prune past its lock could delete files they import (" + readers + ")"
 		return []Finding{f}, notes, nil
 	}
 	f.Action = ActDelete
@@ -185,6 +196,41 @@ func uvBusy(s *Sample) string {
 		}
 	}
 	return ""
+}
+
+// uvReaders names, at most three, the uv processes running and the processes using a file in the cache, or "".
+func uvReaders(s *Sample, cache string) string {
+	if s == nil {
+		return ""
+	}
+	seen := map[int]bool{}
+	var names []string
+	add := func(pid int, what string) {
+		if !seen[pid] && len(names) < 3 {
+			names = append(names, fmt.Sprintf("%s (pid %d)", what, pid))
+		}
+		seen[pid] = true
+	}
+	pids := make([]int, 0, len(s.Table))
+	for pid := range s.Table {
+		pids = append(pids, pid)
+	}
+	sort.Ints(pids)
+	for _, pid := range pids {
+		p := s.Table[pid]
+		if len(p.Argv) > 0 && (filepath.Base(p.Argv[0]) == "uv" || filepath.Base(p.Argv[0]) == "uvx") {
+			add(pid, strings.Join(p.Argv[:min(len(p.Argv), 4)], " "))
+		}
+	}
+	for _, u := range s.Uses {
+		if cache != "" && under(u.Path, cache) {
+			add(u.PID, u.Comm)
+		}
+	}
+	if len(seen) > len(names) {
+		names = append(names, fmt.Sprintf("%d more", len(seen)-len(names)))
+	}
+	return strings.Join(names, ", ")
 }
 
 // docker prunes Docker's build cache older than the configured age and its dangling images, once per cadence.
