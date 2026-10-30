@@ -60,10 +60,10 @@ func (r *runner) recordDone(ctx context.Context, f *Finding) error {
 	return err
 }
 
-// recordPrunes records the prunes this run made.
-func (r *runner) recordPrunes(ctx context.Context) error {
+// recordPrunes records the prunes one rule made on this run, as soon as it made them.
+func (r *runner) recordPrunes(ctx context.Context, rule string) error {
 	for _, rr := range r.res.Rules {
-		if rr.Rule != RuleUV && rr.Rule != RuleDocker {
+		if rr.Rule != rule {
 			continue
 		}
 		for i := range rr.Findings {

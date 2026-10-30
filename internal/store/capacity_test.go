@@ -149,8 +149,17 @@ func TestASightingKeepsTheFirstAndTheLatest(t *testing.T) {
 	if start, _ := st.SamplerStart(ctx); !start.Equal(t0) {
 		t.Fatalf("the record starts at the first run: %v", start)
 	}
-	if gap, at, _ := st.SamplerGap(ctx, t0); gap != time.Hour || !at.Equal(t0.Add(time.Hour)) {
-		t.Fatalf("gap %v at %v", gap, at)
+	if ts, _ := st.RunTimes(ctx); len(ts) != 3 || !ts[0].Equal(t0) {
+		t.Fatalf("run times %v", ts)
+	}
+	if err := st.PutRuns(ctx, []CapacityRun{{At: t0.Add(3 * time.Hour), Procs: 2, Blind: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if ts, _ := st.RunTimes(ctx); len(ts) != 3 {
+		t.Fatalf("a blind run watched nothing: %v", ts)
+	}
+	if ps, _ := st.RecentProcs(ctx, 10); len(ps) != 3 {
+		t.Fatalf("a blind run's count is no measure of the machine: %v", ps)
 	}
 }
 

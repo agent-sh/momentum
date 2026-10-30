@@ -42,6 +42,8 @@ func (r *runner) act(ctx context.Context) error {
 		hold = "the scheduled jobs could not all be read"
 	case r.blind != "":
 		hold = r.blind
+	case r.dockerErr != "":
+		hold = "Docker could not be asked which containers run"
 	}
 	if hold != "" {
 		for _, f := range todo {
@@ -50,7 +52,13 @@ func (r *runner) act(ctx context.Context) error {
 		return nil
 	}
 	r.fresh = TakeSample(r.opt.ProcRoot, r.m, r.watched)
-	r.addContainerUses(ctx, r.fresh)
+	if err := r.addContainerUses(ctx, r.fresh); err != nil {
+		for _, f := range todo {
+			f.Action, f.Why = ActKeep, "Docker could not be asked which containers run"
+		}
+		return nil
+	}
+	r.sessions = nil // the sessions read again, for the worktrees' second look
 	for _, f := range todo {
 		if why := r.recheck(ctx, f); why != "" {
 			f.Action, f.Why = ActKeep, why
@@ -119,7 +127,7 @@ func (r *runner) recheck(ctx context.Context, f *Finding) string {
 			return "built since it was judged"
 		}
 	case RuleWorktrees:
-		g, ok := r.worktree(ctx, f.Path, f.canon, r.heads)
+		g, ok := r.worktree(ctx, f.Path, f.canon, r.heads, r.fresh)
 		switch {
 		case !ok:
 			return "no longer a leftover"

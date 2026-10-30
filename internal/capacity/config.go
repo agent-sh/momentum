@@ -96,8 +96,8 @@ type WorktreesConfig struct {
 	EveryHours float64  `json:"every_hours"`
 }
 
-// UVConfig is the uv rule: `uv cache prune --ci --force` when the cache is over MaxGiB, or EveryDays after the
-// last prune. Path is the uv binary; empty finds it on PATH.
+// UVConfig is the uv rule: `uv cache prune --ci` when the cache is over MaxGiB, or EveryDays after the last
+// prune. Path is the uv binary; empty finds it on PATH.
 type UVConfig struct {
 	Path       string  `json:"path"`
 	MaxGiB     float64 `json:"max_gib"`
@@ -113,12 +113,13 @@ type DockerConfig struct {
 }
 
 // FillConfig is when a disk fills fast: more than GiBPerHour over the last Window, or Full percent due within
-// WithinHours at that rate.
+// WithinHours at that rate when it is at least MinGiBPerHour (a creep that slow is the full note's, at the line).
 type FillConfig struct {
-	GiBPerHour  float64 `json:"gib_per_hour"`
-	Full        float64 `json:"full_pct"`
-	WithinHours float64 `json:"within_hours"`
-	WindowMin   float64 `json:"window_min"`
+	GiBPerHour    float64 `json:"gib_per_hour"`
+	MinGiBPerHour float64 `json:"min_gib_per_hour"`
+	Full          float64 `json:"full_pct"`
+	WithinHours   float64 `json:"within_hours"`
+	WindowMin     float64 `json:"window_min"`
 }
 
 // ErrNoCapacity means sources.json has no capacity section, and ErrBadConfig one this build cannot use.
@@ -210,6 +211,7 @@ func (c Config) Normal() Config {
 	set(&c.UV.EveryHours, defaultScanHours)
 	set(&c.Docker.EveryHours, defaultDockerHours)
 	set(&c.Fill.GiBPerHour, defaultFillGiBHour)
+	set(&c.Fill.MinGiBPerHour, c.Fill.GiBPerHour/20)
 	set(&c.Fill.Full, defaultFillFull)
 	set(&c.Fill.WithinHours, defaultFillWithin)
 	set(&c.Fill.WindowMin, defaultFillWindow)

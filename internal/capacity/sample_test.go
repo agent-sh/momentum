@@ -43,8 +43,8 @@ func TestTheSamplerSeesOpenMappedAndWorkingPathsAndRepoIDs(t *testing.T) {
 		fakeProc{pid: 11, ppid: 10, argv: []string{"bash"}, cwd: "/home"},
 	)
 	s := TakeSample(proc, nil, func(p string) bool { return strings.HasPrefix(p, data+"/") })
-	if s.Procs != 2 {
-		t.Fatalf("read %d processes, want 2", s.Procs)
+	if s.Procs != 3 { // and the test's own
+		t.Fatalf("read %d processes, want 3", s.Procs)
 	}
 	got := map[string]string{}
 	for _, u := range s.Uses {

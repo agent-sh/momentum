@@ -249,6 +249,16 @@ func (r *runner) decideModel(f Finding, x root, idle time.Duration) (Finding, bo
 		f.Action, f.Why = ActKeep, "named by "+j
 		return f, true
 	}
+	for _, b := range f.linked { // a named or kept file of a shared-store repository resolves to its blob
+		if j, ok := r.named.Protects(b); ok {
+			f.Action, f.Why = ActKeep, "named by "+j
+			return f, true
+		}
+		if r.kept(b) {
+			f.Action, f.Why = ActKeep, "a file of it is in keep"
+			return f, true
+		}
+	}
 	if name := filepath.Base(f.canon); isRepoDir(name) {
 		if id := repoIDOf(name); id != "" {
 			if j, ok := r.named.RepoIDs[id]; ok {

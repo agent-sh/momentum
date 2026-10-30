@@ -50,7 +50,7 @@ func (r *runner) disk(ctx context.Context, disks []DiskState) bool {
 		}
 		// A disk already above its full percent is full, not filling fast: it has a note of its own (recordFull).
 		d.Fast = d.Rate >= r.cfg.Fill.GiBPerHour ||
-			(d.FullIn > 0 && d.FullIn <= time.Duration(r.cfg.Fill.WithinHours*float64(time.Hour)))
+			(d.Rate >= r.cfg.Fill.MinGiBPerHour && d.FullIn > 0 && d.FullIn <= time.Duration(r.cfg.Fill.WithinHours*float64(time.Hour)))
 		if d.Fast {
 			fast = true
 			d.Writers = r.writers(ctx, d.mountPath)

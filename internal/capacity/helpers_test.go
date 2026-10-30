@@ -24,10 +24,11 @@ type fakeProc struct {
 	written   int64
 }
 
-// procRoot builds a synthetic /proc with these processes.
+// procRoot builds a synthetic /proc with these processes, and the test's own (a look without it is blind).
 func procRoot(t *testing.T, ps ...fakeProc) string {
 	t.Helper()
 	root := filepath.Join(t.TempDir(), "proc")
+	ps = append(ps, fakeProc{pid: os.Getpid(), ppid: 1, argv: []string{"capacity.test"}, cwd: "/"})
 	for _, p := range ps {
 		dir := filepath.Join(root, strconv.Itoa(p.pid))
 		must(t, os.MkdirAll(filepath.Join(dir, "fd"), 0o755))
@@ -125,13 +126,23 @@ func (f fakeTools) answer(tool string, args []string) (string, error) {
 	if f.ran != nil {
 		*f.ran = append(*f.ran, cmd)
 	}
+	best := ""
+	for k := range f.answers { // the longest prefix that matches: "docker ps" before "docker"
+		if strings.HasPrefix(cmd, k) && len(k) > len(best) {
+			best = k
+		}
+	}
 	for k, v := range f.answers {
-		if strings.HasPrefix(cmd, k) {
+		if k == best && best != "" {
 			switch v {
 			case "ERR":
 				return "", errNoTool
 			case "ERR-INUSE":
 				return "", fmt.Errorf("uv cache prune: exit status 2: error: Cache is currently in-use, waiting for other uv processes to finish")
+			case "ERR-DENIED":
+				return "", fmt.Errorf("docker ps: exit status 1: permission denied while trying to connect to the Docker daemon socket")
+			case "ERR-DOWN":
+				return "", fmt.Errorf("docker ps: exit status 1: Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?")
 			}
 			return v, nil
 		}
