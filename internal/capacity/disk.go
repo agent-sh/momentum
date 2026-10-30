@@ -71,10 +71,7 @@ func (r *runner) writers(ctx context.Context, mountPath string) []Writer {
 	if st, err := os.Stat(mountPath); err == nil {
 		diskDev = uint64(st.Sys().(*syscall.Stat_t).Dev)
 	}
-	var sessions map[int]Session
-	if r.opt.Sessions != nil {
-		sessions = r.opt.Sessions(ctx)
-	}
+	sessions := r.liveSessions(ctx)
 	var out []Writer
 	for pid, n := range b {
 		rate := float64(n-a[pid]) / (1 << 20) / secs

@@ -156,3 +156,41 @@ func TestAWorktreeChangedWithinTheHourOrInUseStays(t *testing.T) {
 		}
 	}
 }
+
+func TestAWorktreeOfARepositorySomeoneWorksInStays(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		proc     []fakeProc
+		sessions map[int]Session
+	}{
+		{"a shell in the main checkout", []fakeProc{{pid: 3, ppid: 1, argv: []string{"bash"}}}, nil},
+		{"an agent session in another worktree", nil, map[int]Session{-1: {Key: "s9", Name: "fixing", Tool: "codex"}}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			clone, wts := worktreesFixture(t)
+			for i := range c.proc {
+				c.proc[i].cwd = clone
+			}
+			for k, s := range c.sessions {
+				s.Cwd = filepath.Join(wts, "ahead")
+				c.sessions[k] = s
+			}
+			now := time.Now().Add(2 * time.Hour)
+			cfg := Config{Worktrees: WorktreesConfig{Roots: []string{wts}}}.Normal()
+			cfg.Live = []string{RuleWorktrees}
+			o := options(t, procRoot(t, c.proc...), now, nil)
+			o.Sessions = func(context.Context) map[int]Session { return c.sessions }
+			res, err := Run(context.Background(), cfg, openStore(t), o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f := findings(res, RuleWorktrees)[filepath.Join(wts, "merged")]
+			if f.Action != ActKeep || !strings.Contains(f.Why, "in use") {
+				t.Errorf("a merged worktree of a repository someone works in stays: %+v", f)
+			}
+			if _, err := os.Stat(filepath.Join(wts, "merged")); err != nil {
+				t.Error("it was removed")
+			}
+		})
+	}
+}

@@ -105,6 +105,7 @@ type Result struct {
 // Session names the agent session behind a process, for the writers of a fast fill.
 type Session struct {
 	Key, Name, Tool string
+	Cwd             string // where it works
 }
 
 // Options are how a run runs.
@@ -140,6 +141,7 @@ type runner struct {
 	fresh        *Sample // taken just before the deletions
 	named        *Named
 	namedErr     error
+	sessions     map[int]Session // the live agent sessions, read when first needed
 	seen         map[string]store.Seen
 	samplerStart time.Time
 

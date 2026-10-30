@@ -120,7 +120,8 @@ func capacityLock(wait time.Duration) (func(), error) {
 	}
 }
 
-// sessionsByPID is each live agent session by its process, from the scan the report makes (it saves nothing).
+// sessionsByPID is each live agent session but the done ones, by its process (a session without one by a negative
+// key), from the scan the report makes: it saves nothing.
 func sessionsByPID(ctx context.Context, st *store.Store) map[int]capacity.Session {
 	env := sessions.EnvFromOS()
 	if c, err := config.Load(); err == nil {
@@ -141,10 +142,15 @@ func sessionsByPID(ctx context.Context, st *store.Store) map[int]capacity.Sessio
 		return nil
 	}
 	out := map[int]capacity.Session{}
-	for _, s := range ss {
-		if s.PID > 0 {
-			out[s.PID] = capacity.Session{Key: s.Key, Name: s.Name, Tool: s.Tool}
+	for i, s := range ss {
+		if s.Phase == sessions.Done {
+			continue
 		}
+		key := s.PID
+		if key <= 0 { // a session without a process of its own still works somewhere
+			key = -(i + 1)
+		}
+		out[key] = capacity.Session{Key: s.Key, Name: s.Name, Tool: s.Tool, Cwd: s.Cwd}
 	}
 	return out
 }
