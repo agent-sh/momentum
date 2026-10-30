@@ -107,7 +107,7 @@ It keeps the disks from filling. Each run samples which paths processes use (ope
 - **targets:** a Cargo target directory with no write for 48 hours, that no process uses, that git does not track, and whose project is known and not excluded. What Cargo does not build again (saved benchmark baselines) stays.
 - **worktrees:** a linked worktree whose branch is merged, landed or gone from its remote, clean (ignored files only in rebuildable caches), with every commit merged or on a branch its remote still has: `git worktree remove`, then its branch if it has not moved. One with uncommitted, ignored or unpushed work is reported; one whose repository someone works in waits.
 - **uv:** `uv cache prune --ci` over 30 GiB or weekly, never past uv's lock: a long-lived uv process that reads the cache is reported, and the prune waits for it.
-- **docker:** the build cache older than 168 hours and dangling images; unused volumes are reported.
+- **docker:** the build cache older than 168 hours and dangling images; unused volumes are reported. Its size counts only what the prune removes: a record an image shares stays, and frees nothing.
 - **disk:** a fill faster than 20 GiB an hour, or one that reaches 94% within 6 hours, names its writers in a problem note; a disk above 94% has a note of its own.
 
 Only the rules listed in `live` delete; the others list what they would delete. Whatever a systemd unit, timer, crontab line, Hermes job or installed command's symlink names stays, and so does what a process uses: each item is judged again just before it goes. Excluded projects are report-only for every rule but models. A run that cannot read the user's jobs, or that sees another PID namespace's processes, deletes nothing. Each deletion is an event and a decided note in the report, recorded as it happens; what a rule can only report is a problem note. Every path is configuration, under `capacity` in `sources.json`, and an unknown key is refused:
@@ -125,6 +125,8 @@ Only the rules listed in `live` delete; the others list what they would delete. 
 ```
 
 Thresholds have defaults (`idle_days`, `idle_hours`, `max_gib`, `every_days`, `until`, `fill`, `min_mib`, `every_hours`). A dry run deletes and records nothing and runs every rule now.
+
+Run it with `momentum evidence ingest`'s timer: a oneshot unit of its own that the ingest unit `Wants=`, ordered `After=` it, so a failed ingest does not skip it and an hourly scan has its own timeout.
 
 Knowledge stays in [tacit](https://github.com/agent-sh/tacit). Cases, evidence and state stay on the machine, never in this repository.
 
