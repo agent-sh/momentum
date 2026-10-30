@@ -81,6 +81,11 @@ func TestHermesListsConversationsAndRunningAutomation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	for _, s := range ss { // a session is named by its source's tool, as every source of momentum names it
+		if s.Tool != src.Tool() {
+			t.Fatalf("session %s is named %q, not %q", s.Key, s.Tool, src.Tool())
+		}
+	}
 	got := map[string]*sessions.Session{}
 	for _, s := range ss {
 		got[s.Key] = s

@@ -170,7 +170,7 @@ func (src *Source) session(ctx context.Context, slot proc.Slot, used map[string]
 		return nil, err
 	}
 	used[id] = true
-	s := &sessions.Session{Key: "opencode:" + id, Tool: "opencode", Name: text.FirstNonEmpty(text.OneLine(title, 60), "opencode"),
+	s := &sessions.Session{Key: "opencode:" + id, Tool: src.Tool(), Name: text.FirstNonEmpty(text.OneLine(title, 60), "opencode"),
 		Cwd: slot.Cwd, Project: src.Env.Project(slot.Cwd), Where: "tty", PID: p.PID, Started: p.Start,
 		LastActive: time.UnixMilli(updated), Tasks: []sessions.Task{}}
 	errs := []error{err}

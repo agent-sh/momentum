@@ -308,7 +308,7 @@ func (src *Source) session(ctx context.Context, slot proc.Slot, used map[string]
 	t, err := src.tracker(ctx, best)
 	src.seen[best] = w.Now
 	project := src.Env.Project(slot.Cwd)
-	s := &sessions.Session{Key: "pi:" + strings.TrimSuffix(filepath.Base(best), ".jsonl"), Tool: "pi", Name: "pi in " + project,
+	s := &sessions.Session{Key: "pi:" + strings.TrimSuffix(filepath.Base(best), ".jsonl"), Tool: src.Tool(), Name: "pi in " + project,
 		Cwd: slot.Cwd, Project: project, Where: "tty", PID: p.PID, Started: p.Start, LastActive: bestT, Tasks: []sessions.Task{},
 		Transcript: best}
 	s.Size = t.Update()
