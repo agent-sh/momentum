@@ -1,8 +1,9 @@
 package capacity
 
 import (
-	"bufio"
 	"context"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -141,13 +142,14 @@ func (r *runner) models(ctx context.Context) ([]Finding, error) {
 		users := map[string][]string{} // shared blob -> the items that link it
 		for _, e := range ents {
 			canon := filepath.Join(x.canon, e.Name())
-			if r.modelSet[canon] || r.keep[canon] || (r.stores[x.canon] && e.Name() == "blobs") {
+			if r.modelSet[canon] || r.kept(canon) || ((r.stores[x.canon] || r.unknownStores[x.canon]) && e.Name() == "blobs") {
 				continue
 			}
 			shown := filepath.Join(x.shown, e.Name())
 			t := Measure(shown, nil)
-			f := Finding{Rule: RuleModels, Path: shown, canon: canon, Bytes: t.Bytes, Newest: t.Newest}
-			if r.stores[x.canon] && isRepoDir(e.Name()) {
+			f := Finding{Rule: RuleModels, Path: shown, canon: canon, Bytes: t.Bytes, Newest: t.Newest, root: x.shown}
+			f.ino, _ = inodeOf(shown)
+			if (r.stores[x.canon] || r.unknownStores[x.canon]) && isRepoDir(e.Name()) {
 				ls := storeLinks(shown, x)
 				links[canon] = ls
 				for _, b := range ls {
@@ -178,7 +180,7 @@ func (r *runner) models(ctx context.Context) ([]Finding, error) {
 			if logical < minBytes {
 				continue
 			}
-			if d, ok := r.decideModel(f, idle); ok {
+			if d, ok := r.decideModel(f, x, idle); ok {
 				out = append(out, d)
 			}
 		}
@@ -187,22 +189,48 @@ func (r *runner) models(ctx context.Context) ([]Finding, error) {
 	return out, nil
 }
 
-// decideModel decides on one item; false leaves it out of the run's list (it has had a write within the idle
-// time).
-func (r *runner) decideModel(f Finding, idle time.Duration) (Finding, bool) {
-	writeIdle := r.now.Sub(f.Newest) >= idle
-	if !writeIdle {
-		return f, false
-	}
-	seen, by := r.seen[f.canon].Last, r.seen[f.canon].Proc
-	for _, b := range f.linked {
-		if s := r.seen[b]; s.Last.After(seen) {
-			seen, by = s.Last, s.Proc
+// kept reports whether an item is in keep, holds a path in keep, or is inside one.
+func (r *runner) kept(item string) bool {
+	for k := range r.keep {
+		if under(k, item) || under(item, k) {
+			return true
 		}
 	}
+	return false
+}
+
+// lastSeen is the last sighting of an item: of a path in it, of a path above it (a key from before a root was
+// added inside another), or of a shared blob it links.
+func (r *runner) lastSeen(item string, linked []string) (time.Time, string) {
+	var at time.Time
+	by := ""
+	for k, v := range r.seen {
+		if (under(k, item) || under(item, k)) && v.Last.After(at) {
+			at, by = v.Last, v.Proc
+		}
+	}
+	for _, b := range linked {
+		if v, ok := r.seen[b]; ok && v.Last.After(at) {
+			at, by = v.Last, v.Proc
+		}
+	}
+	return at, by
+}
+
+// decideModel decides on one item of root x; false leaves it out of the run's list (it has had a write within the
+// idle time). An item goes once the sampler has watched it, in use by nothing, for the idle time: watched time
+// counts from the latest of its newest write, its last sighting and when the sampler began to watch its root, and
+// a gap between two runs counts for at most maxGap.
+func (r *runner) decideModel(f Finding, x root, idle time.Duration) (Finding, bool) {
+	if r.now.Sub(f.Newest) < idle {
+		return f, false
+	}
+	seen, by := r.lastSeen(f.canon, f.linked)
 	f.Seen = seen
-	f.Idle = latest(f.Newest, seen, r.samplerStart)
-	f.Eligible = f.Idle.Add(idle)
+	watchedFrom := r.watchStart[x.canon]
+	f.Idle = latest(f.Newest, seen, watchedFrom)
+	watched := r.watchedFor(f.Idle)
+	f.Eligible = r.now.Add(idle - watched)
 	if u, ok := r.sample.InUse(f.canon); ok {
 		f.Action, f.Why = ActKeep, "in use now: "+useText(u)
 		return f, true
@@ -229,18 +257,49 @@ func (r *runner) decideModel(f Finding, idle time.Duration) (Finding, bool) {
 			}
 		}
 	}
-	if r.now.Before(f.Eligible) {
+	if r.unknownStores[x.canon] && len(f.linked) > 0 {
+		f.Action, f.Why = ActKeep, "it links into a Hugging Face blob store whose layout this build does not know"
+		return f, true
+	}
+	if watched < idle {
 		f.Action = ActPending
 		switch {
-		case !seen.IsZero() && !seen.Before(f.Newest) && !seen.Before(r.samplerStart):
+		case !seen.IsZero() && f.Idle.Equal(seen):
 			f.Why = "seen in use " + seen.Format("2006-01-02") + " (" + by + ")"
-		case !r.samplerStart.Before(f.Newest):
-			f.Why = "the sampler's record starts " + r.samplerStart.Format("2006-01-02")
+		case f.Idle.Equal(watchedFrom):
+			f.Why = "the sampler has watched " + short(x.shown) + " since " + watchedFrom.Format("2006-01-02")
+		}
+		if gap := r.now.Sub(f.Idle) - watched; gap > time.Hour {
+			f.Why = strings.TrimPrefix(f.Why+"; ", "; ") + "the sampler missed " + gap.Round(time.Hour).String() + " of it"
 		}
 		return f, true
 	}
 	f.Action = ActDelete
 	return f, true
+}
+
+// maxGap is the most a gap between two runs counts as watched: the timer runs every few minutes, so a longer gap is
+// the machine asleep or the sampler down, and use in it went unseen.
+const maxGap = 30 * time.Minute
+
+// watchedFor is how long the sampler has watched since a time: the runs since then, each gap counting for at most
+// maxGap.
+func (r *runner) watchedFor(since time.Time) time.Duration {
+	rt := r.runTimes
+	i := sort.Search(len(rt), func(i int) bool { return !rt[i].Before(since) })
+	if i == len(rt) {
+		return 0
+	}
+	d := min(rt[i].Sub(since), maxGap)
+	return d + r.covered[len(rt)-1] - r.covered[i]
+}
+
+// cover sums the run times' gaps, each capped at maxGap: covered[i] is the watched time from the first run to run i.
+func (r *runner) cover() {
+	r.covered = make([]time.Duration, len(r.runTimes))
+	for i := 1; i < len(r.runTimes); i++ {
+		r.covered[i] = r.covered[i-1] + min(r.runTimes[i].Sub(r.runTimes[i-1]), maxGap)
+	}
 }
 
 // repoIDOf is a repository folder's org/name (models--org--name); a name without an org gives "".
@@ -290,10 +349,11 @@ func (r *runner) shownBlob(x root, canon string) string {
 }
 
 // removeModel deletes an item, and then each shared blob it linked whose manifest names no repository blob that
-// still links it: the last of its repositories to go takes it. A blob whose manifest cannot be read stays: Hugging
-// Face's own rule.
+// still links it: the last of its repositories to go takes it. As Hugging Face does, it holds the blob's lock
+// (<blob>.lock) while it reads the manifest and unlinks the blob and its manifest, never deletes the lock, and
+// keeps a blob on any error but a missing file.
 func (r *runner) removeModel(f *Finding) error {
-	if err := removeLocked(f.Path); err != nil {
+	if err := r.removeItem(f); err != nil {
 		return err
 	}
 	for _, b := range f.linked {
@@ -307,43 +367,61 @@ func (r *runner) removeModel(f *Finding) error {
 		if x.shown == "" {
 			continue
 		}
-		blob := r.shownBlob(x, b)
-		if stillLinked(blob, x.shown) {
-			continue
+		if err := sweepBlob(r.shownBlob(x, b), x.shown); err != nil {
+			return err
 		}
-		for _, p := range []string{blob, blob + ".refs", blob + ".lock"} {
-			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-				return err
-			}
+	}
+	return nil
+}
+
+// sweepBlob unlinks a shared blob and its manifest under the blob's lock, when no live link names it.
+func sweepBlob(blob, cache string) error {
+	lock, err := os.OpenFile(blob+".lock", os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o644)
+	if err != nil {
+		return nil // no lock to hold: the blob stays
+	}
+	defer lock.Close()
+	if !waitLock(lock, 10*time.Second) {
+		return nil // another holder: it may be linking the blob now
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	if stillLinked(blob, cache) {
+		return nil
+	}
+	for _, p := range []string{blob, blob + ".refs"} {
+		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
 		}
 	}
 	return nil
 }
 
 // stillLinked reports whether a shared blob's manifest (<blob>.refs: one repository blob per line, relative to the
-// cache) names a link that still resolves to it, or cannot be read.
+// cache) names a link that still resolves to it. A manifest that cannot be read, a blob that cannot be resolved,
+// and any error but a missing file count as linked.
 func stillLinked(blob, cache string) bool {
-	f, err := os.Open(blob + ".refs")
+	b, err := os.ReadFile(blob + ".refs")
 	if err != nil {
 		return true
 	}
-	defer f.Close()
 	want, err := filepath.EvalSymlinks(blob)
 	if err != nil {
 		return true
 	}
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		l := strings.TrimSpace(sc.Text())
+	for _, l := range strings.Split(string(b), "\n") {
+		l = strings.TrimSpace(l)
 		if l == "" {
 			continue
 		}
 		got, err := filepath.EvalSymlinks(filepath.Join(cache, l))
-		if err == nil && got == want {
+		switch {
+		case err == nil && got == want:
+			return true
+		case err != nil && !errors.Is(err, fs.ErrNotExist):
 			return true
 		}
 	}
-	return sc.Err() != nil
+	return false
 }
 
 // latest is the latest of some times.

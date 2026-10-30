@@ -101,16 +101,16 @@ Four sections are notes: needs you (each title is the question), decided (the de
 momentum capacity [--dry-run] [--now] [--rule R,R] [--json] [--all]
 ```
 
-It keeps the disks from filling. Each run samples which paths processes use (open files, memory maps, working directories, programs, command lines), since a noatime mount never records a read, and records each disk's use. Then each rule that is due scans:
+It keeps the disks from filling. Each run samples which paths processes use (open files, memory maps, working directories, programs, command lines, Docker containers' bind mounts), since a noatime mount records no read, and records each disk's use. Then each rule that is due scans:
 
-- **models:** a top-level item of a models, datasets or model-cache root with no write and no use seen for 30 days goes. Nothing goes before the sampler has watched for 30 days. A Hugging Face cache's shared Xet blobs go with the last repository that links them.
-- **targets:** a Cargo target directory with no write for 48 hours, that no process uses, that git does not track, and whose project is known and not excluded.
-- **worktrees:** a linked worktree whose branch is merged, landed or gone from its remote, clean, with every commit on a remote or merged: `git worktree remove`, then its branch. One with uncommitted or unpushed work is reported.
-- **uv:** `uv cache prune --ci --force` over 30 GiB or weekly, only when no uv process runs (one that imports from the cache is reported).
+- **models:** a top-level item of a models, datasets or model-cache root with no write and no use seen for 30 days of watching. A root's items wait until the sampler has watched it for 30 days, and time it did not run does not count. A Hugging Face cache's shared Xet blobs go with the last repository that links them, under Hugging Face's own locks.
+- **targets:** a Cargo target directory with no write for 48 hours, that no process uses, that git does not track, and whose project is known and not excluded. What Cargo does not build again (saved benchmark baselines) stays.
+- **worktrees:** a linked worktree whose branch is merged, landed or gone from its remote, clean (ignored files only in rebuildable caches), with every commit merged or on a branch its remote still has: `git worktree remove`, then its branch if it has not moved. One with uncommitted, ignored or unpushed work is reported; one whose repository someone works in waits.
+- **uv:** `uv cache prune --ci` over 30 GiB or weekly, never past uv's lock: a long-lived uv process that reads the cache is reported, and the prune waits for it.
 - **docker:** the build cache older than 168 hours and dangling images; unused volumes are reported.
-- **disk:** a fill faster than 20 GiB an hour, or one that reaches 94% within 6 hours, names its writers in a problem note.
+- **disk:** a fill faster than 20 GiB an hour, or one that reaches 94% within 6 hours, names its writers in a problem note; a disk above 94% has a note of its own.
 
-Only the rules listed in `live` delete; the others list what they would delete. Whatever an enabled systemd unit, timer, crontab line, Hermes job or installed command's symlink names stays, and so does what a process uses. Excluded projects are report-only for every rule but models. Each deletion is an event and a decided note in the report; what a rule can only report is a problem note. Every path is configuration, under `capacity` in `sources.json`:
+Only the rules listed in `live` delete; the others list what they would delete. Whatever a systemd unit, timer, crontab line, Hermes job or installed command's symlink names stays, and so does what a process uses: each item is judged again just before it goes. Excluded projects are report-only for every rule but models. A run that cannot read the user's jobs, or that sees another PID namespace's processes, deletes nothing. Each deletion is an event and a decided note in the report, recorded as it happens; what a rule can only report is a problem note. Every path is configuration, under `capacity` in `sources.json`, and an unknown key is refused:
 
 ```json
 {"capacity": {

@@ -46,8 +46,40 @@ var ruleText = map[string]string{
 	RuleUV: "uv cache", RuleDocker: "Docker",
 }
 
+// recordDone records one deletion or prune at once: its event and its decided note.
+func (r *runner) recordDone(ctx context.Context, f *Finding) error {
+	kind := KindDelete
+	if f.Rule == RuleUV || f.Rule == RuleDocker {
+		kind = KindPrune
+	}
+	e := r.event(kind, *f, fmt.Sprintf("%s/%s/%s/%d", kind, f.Rule, keyPath(*f), r.now.UnixMilli()), store.ActorAgent)
+	if _, err := r.st.Put(ctx, []store.Event{e}); err != nil {
+		return err
+	}
+	_, err := r.st.PutNote(ctx, decidedNote(e, *f, r.now))
+	return err
+}
+
+// recordPrunes records the prunes this run made.
+func (r *runner) recordPrunes(ctx context.Context) error {
+	for _, rr := range r.res.Rules {
+		if rr.Rule != RuleUV && rr.Rule != RuleDocker {
+			continue
+		}
+		for i := range rr.Findings {
+			if rr.Findings[i].Done {
+				if err := r.recordDone(ctx, &rr.Findings[i]); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// record records what the run could only report, and resolves what it no longer finds. Deletions and prunes were
+// recorded as they happened.
 func (r *runner) record(ctx context.Context) error {
-	var evs []store.Event
 	groups := map[string]*group{}
 	ran := map[string]bool{}
 	for _, rr := range r.res.Rules {
@@ -58,15 +90,6 @@ func (r *runner) record(ctx context.Context) error {
 		for _, f := range rr.Findings {
 			switch {
 			case f.Done:
-				kind := KindDelete
-				if f.Rule == RuleUV || f.Rule == RuleDocker {
-					kind = KindPrune
-				}
-				e := r.event(kind, f, fmt.Sprintf("%s/%s/%s/%d", kind, f.Rule, keyPath(f), r.now.UnixMilli()), store.ActorAgent)
-				evs = append(evs, e)
-				if _, err := r.st.PutNote(ctx, decidedNote(e, f, r.now)); err != nil {
-					return err
-				}
 			case f.Err != "":
 				g := groupOf(groups, f.Rule, "failed")
 				g.items = append(g.items, f)
@@ -78,20 +101,10 @@ func (r *runner) record(ctx context.Context) error {
 			}
 		}
 	}
-	if _, err := r.st.Put(ctx, evs); err != nil {
-		return err
-	}
 	for _, key := range sortedKeys(groups) {
 		g := groups[key]
-		stored, err := r.st.Stored(ctx, g.events)
+		fresh, err := r.putNew(ctx, g.events)
 		if err != nil {
-			return err
-		}
-		fresh := false
-		for _, e := range g.events {
-			fresh = fresh || !stored[e.ID()]
-		}
-		if _, err := r.st.Put(ctx, g.events); err != nil {
 			return err
 		}
 		id := "capacity:" + g.rule + ":" + g.class
@@ -99,13 +112,20 @@ func (r *runner) record(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if fresh || (had && old.Done.IsZero()) {
+		auto, err := r.st.Mark(ctx, "auto:"+id)
+		if err != nil {
+			return err
+		}
+		standing := had && old.Done.IsZero()
+		resolvedByUs := had && !old.Done.IsZero() && !auto.IsZero() && !old.Done.After(auto)
+		if fresh || standing || resolvedByUs {
 			if _, err := r.st.PutNote(ctx, groupNote(id, g.rule, g.class, g.items, r.now)); err != nil {
 				return err
 			}
 		}
 	}
-	// A problem note whose rule ran and found none of its items any more is resolved.
+	// A problem note whose rule ran and found none of its items any more is resolved, by the rule: it stands again
+	// when its items come back, unlike one the owner resolved.
 	ns, err := r.st.Notes(ctx)
 	if err != nil {
 		return err
@@ -120,12 +140,35 @@ func (r *runner) record(ctx context.Context) error {
 			if _, _, err := r.st.DoneNote(ctx, n.ID, r.now); err != nil {
 				return err
 			}
+			if err := r.st.SetMark(ctx, "auto:"+n.ID, r.now); err != nil {
+				return err
+			}
 		}
 	}
 	if err := r.recordJobs(ctx); err != nil {
 		return err
 	}
 	return r.recordDisks(ctx)
+}
+
+// putNew stores the events the store does not hold yet, so an item's event keeps its first sighting, and reports
+// whether there was one.
+func (r *runner) putNew(ctx context.Context, evs []store.Event) (bool, error) {
+	stored, err := r.st.Stored(ctx, evs)
+	if err != nil {
+		return false, err
+	}
+	var add []store.Event
+	for _, e := range evs {
+		if !stored[e.ID()] {
+			add = append(add, e)
+		}
+	}
+	if len(add) == 0 {
+		return false, nil
+	}
+	_, err = r.st.Put(ctx, add)
+	return true, err
 }
 
 // recordJobs records a run that could not read the scheduled jobs, and so deleted nothing: a problem note, put when
@@ -148,59 +191,106 @@ func (r *runner) recordJobs(ctx context.Context) error {
 	h := sha256.Sum256([]byte(r.namedErr.Error()))
 	e := r.event(KindFailed, Finding{Rule: "jobs", Path: "scheduled jobs", Err: r.namedErr.Error()},
 		"jobs/"+hex.EncodeToString(h[:8]), store.ActorDetector)
-	stored, err := r.st.Stored(ctx, []store.Event{e})
+	fresh, err := r.putNew(ctx, []store.Event{e})
 	if err != nil {
 		return err
 	}
-	if _, err := r.st.Put(ctx, []store.Event{e}); err != nil {
-		return err
-	}
-	if !stored[e.ID()] || (had && old.Done.IsZero()) {
+	if fresh || (had && old.Done.IsZero()) {
 		_, err = r.st.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Source: store.Capacity, At: r.now,
-			Title:  "Capacity deleted nothing: the scheduled jobs could not all be read",
+			Title:  "Capacity deleted and pruned nothing: the scheduled jobs could not all be read",
 			Detail: "A job may name a path it would delete, so it waits until they can be read: " + r.namedErr.Error()})
 	}
 	return err
 }
 
-// recordDisks records each fast fill, and puts the disk's note once per fill: again only after a run without one.
+// recordDisks records each fast fill: an event at every run that sees it, and the disk's note, put once per fill and
+// rewritten to say it ended at the first run without it. A disk above its full percent has a note of its own, put
+// once and resolved when it drops below.
 func (r *runner) recordDisks(ctx context.Context) error {
 	for _, d := range r.res.Disks {
-		id := "capacity:fill:" + d.Disk
-		if !d.Fast {
+		if d.Err != "" {
 			continue
 		}
-		f := Finding{Rule: RuleDisk, Path: d.Disk, Detail: fillDetail(d)}
-		e := r.event(KindFill, f, fmt.Sprintf("fill/%s/%d", d.Disk, r.now.UnixMilli()), store.ActorDetector)
-		meta, _ := json.Marshal(d)
-		e.Meta = string(meta)
-		e.Summary = fillTitle(d)
-		last, err := r.st.Mark(ctx, "fill:"+d.Disk)
-		if err != nil {
+		if err := r.recordFill(ctx, d); err != nil {
 			return err
 		}
-		if _, err := r.st.Put(ctx, []store.Event{e}); err != nil {
+		if err := r.recordFull(ctx, d); err != nil {
 			return err
 		}
-		if err := r.st.SetMark(ctx, "fill:"+d.Disk, r.now); err != nil {
+	}
+	return nil
+}
+
+func (r *runner) recordFill(ctx context.Context, d DiskState) error {
+	id := "capacity:fill:" + d.Disk
+	open, err := r.st.Mark(ctx, "fill-open:"+d.Disk)
+	if err != nil {
+		return err
+	}
+	old, had, err := r.st.Note(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !d.Fast {
+		if open.IsZero() {
+			return nil
+		}
+		if had && old.Done.IsZero() { // the fill ended: the note says so, and stands until the owner reads it
+			old.Title = fmt.Sprintf("%s filled fast from %s to %s; %.0f%% used now", d.Disk, old.At.Format("Jan 2 15:04"),
+				r.now.Format("15:04"), d.pctFull)
+			if _, err := r.st.PutNote(ctx, old); err != nil {
+				return err
+			}
+		}
+		return r.st.ClearMark(ctx, "fill-open:"+d.Disk)
+	}
+	f := Finding{Rule: RuleDisk, Path: d.Disk, Detail: fillDetail(d)}
+	e := r.event(KindFill, f, fmt.Sprintf("fill/%s/%d", d.Disk, r.now.UnixMilli()), store.ActorDetector)
+	meta, _ := json.Marshal(d)
+	e.Meta, e.Summary = string(meta), fillTitle(d)
+	if _, err := r.st.Put(ctx, []store.Event{e}); err != nil {
+		return err
+	}
+	if !open.IsZero() && had && !old.Done.IsZero() {
+		return nil // resolved during this fill: it stays resolved
+	}
+	n := store.Note{ID: id, Kind: store.NoteProblem, Title: fillTitle(d), Detail: fillDetail(d), Source: store.Capacity,
+		Importance: store.ImportanceHigh, At: r.now}
+	if !open.IsZero() && had {
+		n.At = old.At // the same fill: it keeps its start
+	} else if err := r.st.SetMark(ctx, "fill-open:"+d.Disk, r.now); err != nil {
+		return err
+	}
+	_, err = r.st.PutNote(ctx, n)
+	return err
+}
+
+func (r *runner) recordFull(ctx context.Context, d DiskState) error {
+	id := "capacity:full:" + d.Disk
+	open, err := r.st.Mark(ctx, "full-open:"+d.Disk)
+	if err != nil {
+		return err
+	}
+	full := d.pctFull >= r.cfg.Fill.Full
+	switch {
+	case full && open.IsZero():
+		if err := r.st.SetMark(ctx, "full-open:"+d.Disk, r.now); err != nil {
 			return err
 		}
-		old, had, err := r.st.Note(ctx, id)
-		if err != nil {
+		_, err := r.st.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Source: store.Capacity, Importance: store.ImportanceHigh,
+			At:     r.now,
+			Title:  fmt.Sprintf("%s is %.0f%% used, above %.0f%%: %s free", d.Disk, d.pctFull, r.cfg.Fill.Full, gib(d.Avail)),
+			Detail: "Capacity deletes only what its rules find idle; what it can only report is among the problems."})
+		return err
+	case !full && !open.IsZero():
+		if n, had, err := r.st.Note(ctx, id); err != nil {
 			return err
+		} else if had && n.Done.IsZero() {
+			if _, _, err := r.st.DoneNote(ctx, id, r.now); err != nil {
+				return err
+			}
 		}
-		ongoing := !last.IsZero() && r.now.Sub(last) <= 2*time.Hour // the runs since have all seen it fill
-		if had && !old.Done.IsZero() && ongoing {
-			continue // resolved during this fill: it stays resolved
-		}
-		n := store.Note{ID: id, Kind: store.NoteProblem, Title: fillTitle(d), Detail: fillDetail(d), Source: store.Capacity,
-			Importance: store.ImportanceHigh, At: r.now}
-		if had && ongoing {
-			n.At = old.At
-		}
-		if _, err := r.st.PutNote(ctx, n); err != nil {
-			return err
-		}
+		return r.st.ClearMark(ctx, "full-open:"+d.Disk)
 	}
 	return nil
 }

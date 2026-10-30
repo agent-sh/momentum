@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -29,8 +30,10 @@ var errNoTool = errors.New("not installed")
 
 type execTools struct{ uv, docker string }
 
+// UV runs uv with a short wait on its cache lock: a prune that another uv process blocks fails at once instead of
+// waiting its default 5 minutes.
 func (t execTools) UV(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
-	return runTool(ctx, timeout, t.uv, "uv", args...)
+	return runTool(ctx, timeout, t.uv, "uv", append([]string{"UV_LOCK_TIMEOUT=10"}, args...)...)
 }
 
 func (t execTools) Docker(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
@@ -45,9 +48,16 @@ func runTool(ctx context.Context, timeout time.Duration, path, name string, args
 		}
 		path = p
 	}
+	var env []string
+	for len(args) > 0 && strings.Contains(args[0], "=") && !strings.HasPrefix(args[0], "-") {
+		env, args = append(env, args[0]), args[1:] // NAME=value before the arguments: the command's environment
+	}
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, path, args...)
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err := cmd.Run()
@@ -64,13 +74,12 @@ func runTool(ctx context.Context, timeout time.Duration, path, name string, args
 	return out.String(), nil
 }
 
-// uv prunes the uv cache with `uv cache prune --ci --force` when it is over its size, or when the last prune is
+// uv prunes the uv cache with `uv cache prune --ci` when it is over its size, or when the last prune is
 // older than the cadence (or there was none). --ci keeps the wheels uv built and drops the ones it can download
-// again, and the unpacked wheels environments import from. --force prunes past the cache's lock, which uv's own
-// documentation allows only when no other uv process reads or writes the cache. So the rule prunes only when no
-// uv process runs and no process uses a file in the cache. An install, a sync or a venv being made ends soon: it
-// waits for it. A long-lived one (a tool server run with uvx, a script run with uv run) may import from the cache
-// at any time, and a prune under it could break it: the rule reports it, and prunes when it is gone.
+// again, and the unpacked wheels environments import from. A prune under a running uv process deletes files it
+// may still import, so the rule never passes --force: uv's own lock, which every uv process holds while it runs,
+// decides, and the rule looks first, to wait quietly for an install (a sync, a venv being made), which ends soon,
+// and to report a long-lived one (a tool server run with uvx, a script run with uv run) by name.
 func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error) {
 	out, err := r.tools.UV(ctx, 30*time.Second, "cache", "dir")
 	if errors.Is(err, errNoTool) {
@@ -106,16 +115,29 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 		f.Action, f.Why = ActKeep, "waits for an install: "+busy
 		return []Finding{f}, notes, nil
 	}
+	busyWhy := func(readers string) string {
+		w := "it waits: uv processes read the cache, and a prune under them would delete files they import"
+		if readers != "" {
+			w += " (" + readers + ")"
+		}
+		return w
+	}
 	if readers := uvReaders(now, f.canon); readers != "" {
-		f.Action, f.class = ActReport, "busy"
-		f.Why = "it waits: uv processes read the cache, and a prune past its lock could delete files they import (" + readers + ")"
+		f.Action, f.class, f.Why = ActReport, "busy", busyWhy(readers)
 		return []Finding{f}, notes, nil
 	}
 	f.Action = ActDelete
 	if !live {
 		return []Finding{f}, notes, nil
 	}
-	_, err = r.tools.UV(ctx, 20*time.Minute, "cache", "prune", "--ci", "--force")
+	// No --force: uv's own lock, which every uv process holds shared while it runs, decides; one that started since
+	// the look keeps the cache, and the prune waits for the next run.
+	_, err = r.tools.UV(ctx, 20*time.Minute, "cache", "prune", "--ci")
+	if err != nil && uvInUse(err) {
+		f.Action, f.class, f.Why = ActReport, "busy", busyWhy(uvReaders(TakeSample(r.opt.ProcRoot, r.m,
+			func(p string) bool { return under(p, f.canon) }), f.canon))
+		return []Finding{f}, notes, nil
+	}
 	after := r.uvSize(ctx, dir)
 	if size >= 0 && after >= 0 {
 		f.Freed = max64(0, size-after)
@@ -127,6 +149,12 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 	f.Done = true
 	f.Detail += fmt.Sprintf("; %s to %s", gib(size), gib(after))
 	return []Finding{f}, notes, r.st.SetMark(ctx, "prune:uv", r.now)
+}
+
+// uvInUse reports whether uv refused a prune because another uv process holds its cache.
+func uvInUse(err error) bool {
+	m := strings.ToLower(err.Error())
+	return strings.Contains(m, "in-use") || strings.Contains(m, "in use") || strings.Contains(m, "timed out waiting")
 }
 
 // uvSize is the cache's size: uv's own count, else a walk.

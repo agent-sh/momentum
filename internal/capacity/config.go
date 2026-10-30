@@ -5,6 +5,7 @@
 package capacity
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -136,15 +137,21 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	var f struct {
-		Capacity *Config `json:"capacity"`
+		Capacity json.RawMessage `json:"capacity"`
 	}
 	if err := json.Unmarshal(raw, &f); err != nil {
 		return Config{}, fmt.Errorf("%w: %s: %v", ErrBadConfig, config.SourcesPath(), err)
 	}
-	if f.Capacity == nil {
+	if len(f.Capacity) == 0 || string(f.Capacity) == "null" {
 		return Config{}, fmt.Errorf("%w (%s)", ErrNoCapacity, config.SourcesPath())
 	}
-	c := *f.Capacity
+	// A key this build does not know is refused: a typo in "exclude" or "keep" would drop a protection silently.
+	var c Config
+	dec := json.NewDecoder(bytes.NewReader(f.Capacity))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&c); err != nil {
+		return Config{}, fmt.Errorf("%w: %s: capacity: %v", ErrBadConfig, config.SourcesPath(), err)
+	}
 	if err := c.check(); err != nil {
 		return Config{}, fmt.Errorf("%w: %s: capacity: %v", ErrBadConfig, config.SourcesPath(), err)
 	}

@@ -80,8 +80,9 @@ func TestModelsDeleteWhatNoWriteAndNoUseTouchedFor30Days(t *testing.T) {
 	f := newModels(t)
 	st := openStore(t)
 	ctx := context.Background()
-	// the sampler's record starts 35 days ago, and it saw the "used" item 10 days ago
-	must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: f.now.Add(-35 * 24 * time.Hour)}, nil, []store.Seen{
+	// the sampler has watched for 35 days, and it saw the "used" item 10 days ago
+	watchedSince(t, st, f.cfg, f.now.Add(-35*24*time.Hour), f.now)
+	must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: f.now.Add(-10*24*time.Hour - time.Minute)}, nil, []store.Seen{
 		{Path: filepath.Join(f.root, "used"), Last: f.now.Add(-10 * 24 * time.Hour), How: "map", Proc: "vllm 7"}}))
 	proc := procRoot(t, fakeProc{pid: 7, ppid: 1, argv: []string{"server", "--model", "org/two"},
 		fds: []string{filepath.Join(f.root, "single.gguf")}})
@@ -123,7 +124,7 @@ func TestALiveModelsRunDeletesAnItemWithTheBlobsOnlyItLinked(t *testing.T) {
 	f := newModels(t)
 	st := openStore(t)
 	ctx := context.Background()
-	must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: f.now.Add(-35 * 24 * time.Hour)}, nil, nil))
+	watchedSince(t, st, f.cfg, f.now.Add(-35*24*time.Hour), f.now)
 	cfg := f.cfg
 	cfg.Live = []string{RuleModels}
 	res, err := Run(ctx, cfg, st, options(t, procRoot(t), f.now, nil))
@@ -179,7 +180,7 @@ func TestASharedBlobAnotherRepositoryStillLinksStays(t *testing.T) {
 	f := newModels(t)
 	st := openStore(t)
 	ctx := context.Background()
-	must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: f.now.Add(-35 * 24 * time.Hour)}, nil, nil))
+	watchedSince(t, st, f.cfg, f.now.Add(-35*24*time.Hour), f.now)
 	cfg := f.cfg
 	cfg.Live = []string{RuleModels}
 	// models--org--two is in use, so only models--org--one goes
@@ -199,7 +200,7 @@ func TestAScheduledJobsFailureDeletesNothing(t *testing.T) {
 	f := newModels(t)
 	st := openStore(t)
 	ctx := context.Background()
-	must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: f.now.Add(-35 * 24 * time.Hour)}, nil, nil))
+	watchedSince(t, st, f.cfg, f.now.Add(-35*24*time.Hour), f.now)
 	cfg := f.cfg
 	cfg.Live = []string{RuleModels}
 	res, err := Run(ctx, cfg, st, options(t, procRoot(t), f.now, fakeJobs{err: os.ErrPermission}))
@@ -234,7 +235,7 @@ func TestAContainersMountKeepsWhatItHolds(t *testing.T) {
 			f := newModels(t)
 			st := openStore(t)
 			ctx := context.Background()
-			must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: f.now.Add(-35 * 24 * time.Hour)}, nil, nil))
+			watchedSince(t, st, f.cfg, f.now.Add(-35*24*time.Hour), f.now)
 			cfg := f.cfg
 			cfg.Live = []string{RuleModels}
 			o := options(t, procRoot(t), f.now, nil)

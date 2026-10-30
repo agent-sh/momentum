@@ -95,6 +95,27 @@ func (s *Store) PutCapacityRun(ctx context.Context, run CapacityRun, disks []Dis
 	return tx.Commit()
 }
 
+// PutRuns records runs without disk samples or sightings, in one transaction: a record brought from elsewhere, or a
+// test's.
+func (s *Store) PutRuns(ctx context.Context, runs []CapacityRun) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO capacity_runs (at, sample_ms, procs, unreadable) VALUES (?,?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, r := range runs {
+		if _, err := stmt.ExecContext(ctx, r.At.UnixMilli(), r.Sample.Milliseconds(), r.Procs, r.Unreadable); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // DiskSamples are one disk's samples from since on, oldest first.
 func (s *Store) DiskSamples(ctx context.Context, disk string, since time.Time) ([]DiskSample, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT at, size, used, avail FROM disk_samples WHERE disk = ? AND at >= ? ORDER BY at`,
@@ -145,6 +166,42 @@ func (s *Store) SamplerStart(ctx context.Context) (time.Time, error) {
 	return time.UnixMilli(at.Int64), nil
 }
 
+// RecentProcs are how many processes the last n runs read, newest first.
+func (s *Store) RecentProcs(ctx context.Context, n int) ([]int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT procs FROM capacity_runs ORDER BY at DESC LIMIT ?`, n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int
+	for rows.Next() {
+		var p int
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// RunTimes are the times of every capacity run, oldest first: when the sampler looked.
+func (s *Store) RunTimes(ctx context.Context) ([]time.Time, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT at FROM capacity_runs ORDER BY at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []time.Time
+	for rows.Next() {
+		var at int64
+		if err := rows.Scan(&at); err != nil {
+			return nil, err
+		}
+		out = append(out, time.UnixMilli(at))
+	}
+	return out, rows.Err()
+}
+
 // SamplerGap is the longest time between two runs from since on, and the run it ended at: while no run looked, a
 // path in use went unseen.
 func (s *Store) SamplerGap(ctx context.Context, since time.Time) (gap time.Duration, at time.Time, err error) {
@@ -184,6 +241,12 @@ func (s *Store) Mark(ctx context.Context, mark string) (time.Time, error) {
 func (s *Store) SetMark(ctx context.Context, mark string, at time.Time) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO capacity_marks (mark, at) VALUES (?, ?)
 	  ON CONFLICT(mark) DO UPDATE SET at = excluded.at`, mark, at.UnixMilli())
+	return err
+}
+
+// ClearMark forgets a mark.
+func (s *Store) ClearMark(ctx context.Context, mark string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM capacity_marks WHERE mark = ?`, mark)
 	return err
 }
 

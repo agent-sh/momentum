@@ -43,9 +43,12 @@ func TestTheUVCacheIsPrunedOverItsSizeButNeverDuringAnInstall(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			pruned := strings.Contains(strings.Join(ran, "\n"), "uv cache prune --ci --force")
+			pruned := strings.Contains(strings.Join(ran, "\n"), "uv cache prune --ci")
 			if pruned != c.prunes {
 				t.Fatalf("pruned %v, want %v: %v %+v", pruned, c.prunes, ran, res.Rules)
+			}
+			if strings.Contains(strings.Join(ran, "\n"), "--force") {
+				t.Fatalf("a prune never passes uv's lock: %v", ran)
 			}
 			if f := findings(res, RuleUV)["/home/u/.cache/uv"]; f.Action != c.action {
 				t.Errorf("action %q (%s), want %q", f.Action, f.Why, c.action)
@@ -54,6 +57,27 @@ func TestTheUVCacheIsPrunedOverItsSizeButNeverDuringAnInstall(t *testing.T) {
 				t.Errorf("a prune is marked, a wait is not: %v", mark)
 			}
 		})
+	}
+}
+
+func TestAPruneUVRefusesForItsLockIsReportedNotRetriedPastIt(t *testing.T) {
+	var ran []string
+	tools := fakeTools{ran: &ran, answers: map[string]string{"uv cache dir": "/home/u/.cache/uv\n", "uv cache size": "40000000000\n",
+		"uv cache prune": "ERR-INUSE", "docker": "ERR"}}
+	cfg := Config{Live: []string{RuleUV}}.Normal()
+	o := options(t, procRoot(t), time.Now(), nil)
+	o.Tools, o.Rules = tools, []string{RuleUV}
+	st := openStore(t)
+	res, err := Run(context.Background(), cfg, st, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := findings(res, RuleUV)["/home/u/.cache/uv"]
+	if f.Action != ActReport || f.class != "busy" || f.Done {
+		t.Fatalf("a uv process that holds the cache's lock keeps it, and the cache is reported: %+v", f)
+	}
+	if mark, _ := st.Mark(context.Background(), "prune:uv"); !mark.IsZero() {
+		t.Error("a refused prune is no prune")
 	}
 }
 

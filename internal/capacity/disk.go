@@ -14,8 +14,8 @@ import (
 // The disk rule. Every run records each disk's use. When a disk fills faster than the threshold over the window, or
 // would reach the full percent within the configured hours at that rate, the run measures which processes write
 // (their write_bytes over a few seconds), names each one's working directory and the agent session it runs under,
-// and leaves a problem note: never a notification. Every deleting rule then scans on that run, whatever its
-// cadence.
+// and leaves a problem note: never a notification. Every judging rule then scans on that run, whatever its
+// cadence. A disk above its full percent has its own note.
 
 // minWindow is the shortest span of samples a rate is taken over: two runs a minute apart say little.
 const minWindow = 10 * time.Minute
@@ -44,12 +44,13 @@ func (r *runner) disk(ctx context.Context, disks []DiskState) bool {
 				break
 			}
 		}
-		if d.Rate > 0 {
-			left := r.cfg.Fill.Full/100*float64(d.Used+d.Avail) - float64(d.Used)
-			d.FullIn = time.Duration(max(0, left) / (1 << 30) / d.Rate * float64(time.Hour))
+		left := r.cfg.Fill.Full/100*float64(d.Used+d.Avail) - float64(d.Used)
+		if d.Rate > 0 && left > 0 {
+			d.FullIn = time.Duration(left / (1 << 30) / d.Rate * float64(time.Hour))
 		}
+		// A disk already above its full percent is full, not filling fast: it has a note of its own (recordFull).
 		d.Fast = d.Rate >= r.cfg.Fill.GiBPerHour ||
-			(d.Rate > 0 && d.FullIn <= time.Duration(r.cfg.Fill.WithinHours*float64(time.Hour)))
+			(d.FullIn > 0 && d.FullIn <= time.Duration(r.cfg.Fill.WithinHours*float64(time.Hour)))
 		if d.Fast {
 			fast = true
 			d.Writers = r.writers(ctx, d.mountPath)
