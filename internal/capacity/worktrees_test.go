@@ -294,15 +294,16 @@ func TestCapacitysOwnDeletionsAreNoOneAtWork(t *testing.T) {
 	}
 	// an earlier run deleted earlier/target 10 minutes ago, and recorded which directories that changed; an older
 	// build recorded its deletion in older without them
+	long := now.Add(-3 * time.Hour).Format(time.RFC3339Nano) // the directory's last change before capacity's
 	_, err = st.Put(ctx, []store.Event{
 		{Source: store.Capacity, SourceKey: "d1", TS: now.Add(-10 * time.Minute), Actor: store.ActorAgent, Kind: KindDelete,
-			Summary: "x", Ref: filepath.Join(earlier, "target"), Meta: `{"own":["` + earlier + `"]}`},
+			Summary: "x", Ref: filepath.Join(earlier, "target"), Meta: `{"own":[{"dir":"` + earlier + `","prev":"` + long + `"}]}`},
 		{Source: store.Capacity, SourceKey: "d2", TS: now.Add(-10 * time.Minute), Actor: store.ActorAgent, Kind: KindDelete,
 			Summary: "x", Ref: filepath.Join(older, "target"), Meta: `{}`}})
 	must(t, err)
 	r := &runner{now: now, st: st, m: ReadMounts("")}
 	r.ownDeletions(ctx)
-	r.addOwnDir(ours, now.Add(-10*time.Minute)) // this run deleted ours/target
+	r.addOwn(ownDir{Dir: ours, Prev: now.Add(-3 * time.Hour)}, now.Add(-10*time.Minute)) // this run deleted ours/target
 	look, since := &Sample{}, now.Add(-quietTime)
 	if !r.changedIn(ctx, someone, since, look) {
 		t.Error("someone's change 10 minutes ago is a change")
@@ -319,6 +320,19 @@ func TestCapacitysOwnDeletionsAreNoOneAtWork(t *testing.T) {
 	must(t, os.Chtimes(ours, now, now.Add(-5*time.Minute)))
 	if !(&runner{now: now, own: r.own, m: r.m}).changedIn(ctx, ours, since, look) {
 		t.Error("a change after capacity's own is someone's")
+	}
+	// someone changed the directory 20 minutes before capacity's deletion in it, 10 minutes ago
+	hid := filepath.Join(base, "hid")
+	must(t, os.MkdirAll(hid, 0o755))
+	must(t, os.Chtimes(hid, now, now.Add(-10*time.Minute)))
+	r2 := &runner{now: now, own: map[string]ownChange{hid: {at: now.Add(-10 * time.Minute), prev: now.Add(-30 * time.Minute)}}, m: r.m}
+	if !r2.changedIn(ctx, hid, since, look) {
+		t.Error("a change someone made in the hour stays theirs, though capacity's deletion came after it")
+	}
+	// and a run 35 minutes later sees that change as over an hour old: only capacity's deletion is in its window
+	r3 := &runner{now: now.Add(35 * time.Minute), own: r2.own, m: r.m}
+	if r3.changedIn(ctx, hid, now.Add(35*time.Minute-quietTime), look) {
+		t.Error("a run judges the change before capacity's against its own window")
 	}
 }
 
@@ -466,16 +480,71 @@ func TestEveryDeletionOfTheLastHourIsRead(t *testing.T) {
 	first := filepath.Join(base, "first")
 	must(t, os.MkdirAll(first, 0o755))
 	must(t, os.Chtimes(first, now, now.Add(-50*time.Minute)))
+	long := now.Add(-3 * time.Hour).Format(time.RFC3339Nano)
 	evs := []store.Event{{Source: store.Capacity, SourceKey: "d0", TS: now.Add(-50 * time.Minute), Actor: store.ActorAgent,
-		Kind: KindDelete, Summary: "x", Meta: `{"own":["` + first + `"]}`}}
+		Kind: KindDelete, Summary: "x", Meta: `{"own":[{"dir":"` + first + `","prev":"` + long + `"}]}`}}
 	for i := 1; i <= 300; i++ { // a run that deleted many builds after it
 		evs = append(evs, store.Event{Source: store.Capacity, SourceKey: fmt.Sprintf("d%d", i), TS: now.Add(-40 * time.Minute),
-			Actor: store.ActorAgent, Kind: KindDelete, Summary: "x", Meta: fmt.Sprintf(`{"own":["%s/n%d"]}`, base, i)})
+			Actor: store.ActorAgent, Kind: KindDelete, Summary: "x", Meta: fmt.Sprintf(`{"own":[{"dir":"%s/n%d","prev":"%s"}]}`, base, i, long)})
 	}
 	_, err = st.Put(ctx, evs)
 	must(t, err)
 	r := &runner{now: now, st: st, m: ReadMounts("")}
 	if r.changedIn(ctx, first, now.Add(-quietTime), &Sample{}) {
 		t.Error("the first of 301 deletions in the hour is read too")
+	}
+}
+
+func TestTwoOfCapacitysDeletionsInOneDirectoryAreBothItsOwn(t *testing.T) {
+	_, wts := worktreesFixture(t)
+	local, target := ownTarget(t, wts)
+	second := filepath.Join(local, "target-check") // a second build of the same worktree, beside the first
+	write(t, filepath.Join(local, ".gitignore"), "target/\ntarget-check/\n")
+	cargoTarget(t, second)
+	tick := time.Now().Add(49 * time.Hour)
+	clock := func() time.Time { tick = tick.Add(10 * time.Second); return tick } // each deletion later than the last
+	cfg := Config{Worktrees: WorktreesConfig{Roots: []string{wts}}, Targets: TargetsConfig{Roots: []string{wts}}}.Normal()
+	cfg.Live = []string{RuleTargets, RuleWorktrees}
+	o := options(t, procRoot(t), tick, nil)
+	o.Clock = clock
+	o.afterDelete = func(f Finding) {
+		if f.Rule == RuleTargets {
+			at := clock()
+			must(t, os.Chtimes(filepath.Dir(f.Path), at, at))
+		}
+	}
+	res, err := Run(context.Background(), cfg, openStore(t), o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := findings(res, RuleTargets)
+	if !got[target].Done || !got[second].Done {
+		t.Fatalf("both idle builds go: %+v %+v", got[target], got[second])
+	}
+	if f := findings(res, RuleWorktrees)[filepath.Join(wts, "merged")]; !f.Done {
+		t.Errorf("the second deletion in local is capacity's too, so the repository's leftover goes: %+v", f)
+	}
+}
+
+func TestANameThatOnlyTheLinkToAWorktreesRootCarriesStillExcludes(t *testing.T) {
+	clone, wts := worktreesFixture(t)
+	link := filepath.Join(filepath.Dir(clone), "secret-wts")
+	must(t, os.Symlink(wts, link))
+	now := time.Now().Add(2 * time.Hour)
+	cfg := Config{Worktrees: WorktreesConfig{Roots: []string{filepath.Join(filepath.Dir(clone), "secret-*")}},
+		Exclude: Exclude{Names: []string{"*secret*"}}}.Normal()
+	cfg.Live = []string{RuleWorktrees}
+	res, err := Run(context.Background(), cfg, openStore(t), options(t, procRoot(t), now, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := findings(res, RuleWorktrees)
+	for _, name := range []string{"merged", "squashed"} {
+		if f := got[filepath.Join(wts, name)]; f.Action != ActReport || f.class != "excluded" {
+			t.Errorf("%s, under a root the excluded name reaches only as a link: %+v", name, f)
+		}
+		if _, err := os.Stat(filepath.Join(wts, name)); err != nil {
+			t.Errorf("%s was removed", name)
+		}
 	}
 }

@@ -177,10 +177,8 @@ func Discover(roots []string, wantTargets, wantWorktrees func(string) bool, skip
 	var f Found
 	seen := map[string]bool{}
 	for _, r := range roots {
-		if st, err := os.Lstat(r); err == nil && st.Mode()&os.ModeSymlink != 0 {
-			if rr, err := filepath.EvalSymlinks(r); err == nil {
-				r = rr // a root that is a symlink is walked where it leads; nothing under it is followed
-			}
+		if rr, err := filepath.EvalSymlinks(r); err == nil {
+			r = rr // a root that is a symlink, or under one, is walked where it leads; nothing under it is followed
 		}
 		st, err := os.Lstat(r)
 		if err != nil || !st.IsDir() {

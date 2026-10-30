@@ -70,7 +70,7 @@ func (r *runner) act(ctx context.Context) error {
 			continue
 		}
 		before := r.free(f.Path)
-		f.ownDirs = r.explainable(ctx, f.canon)
+		dirs := r.ownBefore(ctx, f.canon)
 		var err error
 		switch f.Rule {
 		case RuleWorktrees:
@@ -97,9 +97,10 @@ func (r *runner) act(ctx context.Context) error {
 		if r.opt.afterDelete != nil {
 			r.opt.afterDelete(*f)
 		}
+		f.ownDirs = dirs
 		at := r.opt.Clock()
-		for _, d := range f.ownDirs {
-			r.addOwnDir(d, at)
+		for _, d := range dirs {
+			r.addOwn(d, at)
 		}
 		if !r.opt.DryRun {
 			if err := r.recordDone(ctx, f); err != nil {

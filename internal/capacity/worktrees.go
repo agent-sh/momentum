@@ -120,7 +120,7 @@ func (r *runner) worktree(ctx context.Context, w, canon string, heads *remoteHea
 	}
 	t := Measure(w, nil)
 	f.Bytes, f.Newest, f.Idle = t.Bytes, t.Newest, t.Newest
-	if why, ok := r.ex.byPath(canon); ok {
+	if why, ok := r.excluded(canon); ok {
 		f.Action, f.class, f.Why = ActReport, "excluded", "an excluded project's: "+why
 		return f, true
 	}
@@ -314,7 +314,8 @@ func (r *runner) repoBusy(ctx context.Context, w, canon string, look *Sample) st
 // its directories, or git's own record of it (its index and HEAD, and the last entry of HEAD's log: an add, a
 // commit, a checkout). An agent between two commands runs no process there, but leaves these. A fetch writes only
 // under .git's objects and remote refs, and a gc rewrites HEAD's log with its entries kept, so neither is a change.
-// Nor is a change capacity's own deletions made (own). Each tree is looked at once per look.
+// A change capacity's own deletion made is no change, unless someone changed the directory in the window before it
+// (own). Each tree is looked at once per look.
 func (r *runner) changedIn(ctx context.Context, tree string, since time.Time, look *Sample) bool {
 	key := changeKey{look, tree}
 	if v, ok := r.changed[key]; ok {
@@ -338,8 +339,9 @@ func (r *runner) changedIn(ctx context.Context, tree string, since time.Time, lo
 	if !v {
 		own := r.ownDeletions(ctx)
 		v = newerThanBut(tree, since, func(d string, at time.Time) bool {
-			t, ok := own[d]
-			return ok && !at.After(t.Add(time.Second))
+			// its last change is capacity's: someone's is the one before, which may still be in the window
+			o, ok := own[d]
+			return ok && !at.After(o.at.Add(time.Second)) && !o.prev.After(since)
 		})
 	}
 	if r.changed == nil {
@@ -384,14 +386,24 @@ func reflogTime(p string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// ownDeletions are the directories capacity's deletions changed, with when: this run's, as it makes them, and the
-// last hour's, from their events (an event without the list, from an older build, explains nothing). A deletion
-// changes its directory as anyone's would; one that changed nothing since was capacity's.
-func (r *runner) ownDeletions(ctx context.Context) map[string]time.Time {
+// ownChange is capacity's change to a directory: when it deleted something in it, and the directory's last change
+// before that which was not capacity's. After the deletion the directory's time is capacity's; whether someone
+// changed it lately is what prev says, judged by each run against its own window.
+type ownChange struct{ at, prev time.Time }
+
+// ownDir is a directory a deletion changes, with its last change before the deletion that was not capacity's.
+type ownDir struct {
+	Dir  string    `json:"dir"`
+	Prev time.Time `json:"prev"`
+}
+
+// ownDeletions are the directories capacity's deletions changed: this run's, as it makes them, and the last hour's,
+// from their events (an event without the list, from an older build, explains nothing).
+func (r *runner) ownDeletions(ctx context.Context) map[string]ownChange {
 	if r.own != nil {
 		return r.own
 	}
-	r.own = map[string]time.Time{}
+	r.own = map[string]ownChange{}
 	if r.st == nil {
 		return r.own
 	}
@@ -402,29 +414,28 @@ func (r *runner) ownDeletions(ctx context.Context) map[string]time.Time {
 	}
 	for _, e := range evs {
 		var m struct {
-			Own []string `json:"own"`
+			Own []ownDir `json:"own"`
 		}
 		if json.Unmarshal([]byte(e.Meta), &m) == nil {
 			for _, d := range m.Own {
-				r.addOwnDir(d, e.TS)
+				r.addOwn(d, e.TS)
 			}
 		}
 	}
 	return r.own
 }
 
-func (r *runner) addOwnDir(d string, at time.Time) {
-	if at.After(r.own[d]) {
-		r.own[d] = at
+func (r *runner) addOwn(d ownDir, at time.Time) {
+	if at.After(r.own[d.Dir].at) {
+		r.own[d.Dir] = ownChange{at: at, prev: d.Prev}
 	}
 }
 
-// explainable are the directories a deletion of p will change (p, and the directory it is in) that may then be
-// taken as capacity's own: those whose last change is older than quietTime, or capacity's already. A directory
-// someone changed within the hour stays someone's change after the deletion, which hides its time.
-func (r *runner) explainable(ctx context.Context, p string) []string {
-	own, since := r.ownDeletions(ctx), r.now.Add(-quietTime)
-	var out []string
+// ownBefore are the directories a deletion of p will change (p, and the directory it is in), each with its last
+// change that was not capacity's: its time now, or, when that is capacity's own deletion, what that one recorded.
+func (r *runner) ownBefore(ctx context.Context, p string) []ownDir {
+	own := r.ownDeletions(ctx)
+	var out []ownDir
 	for _, d := range []string{p, filepath.Dir(p)} {
 		st, err := os.Lstat(d)
 		if err != nil {
@@ -434,10 +445,11 @@ func (r *runner) explainable(ctx context.Context, p string) []string {
 		if !ok {
 			continue
 		}
-		at := newest(s)
-		if t, ok := own[d]; !at.After(since) || (ok && !at.After(t.Add(time.Second))) {
-			out = append(out, d)
+		prev := newest(s)
+		if o, ok := own[d]; ok && !prev.After(o.at.Add(time.Second)) {
+			prev = o.prev
 		}
+		out = append(out, ownDir{Dir: d, Prev: prev})
 	}
 	return out
 }
