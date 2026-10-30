@@ -3,7 +3,7 @@ module github.com/agent-sh/momentum
 go 1.27
 
 require (
-	github.com/agent-sh/tacit/client v0.0.0-20261030060112-360d34c7c081
+	github.com/agent-sh/tacit/client v0.0.0-20261030120025-1def6c67c2da
 	github.com/klauspost/compress v1.20.3
 	modernc.org/sqlite v1.61.0
 )
