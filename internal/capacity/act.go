@@ -53,6 +53,7 @@ func (r *runner) act(ctx context.Context) error {
 	}
 	r.fresh = TakeSample(r.opt.ProcRoot, r.m, r.watched)
 	if err := r.addContainerUses(ctx, r.fresh); err != nil {
+		r.dockerErr, r.dockerAsked = err.Error(), true
 		for _, f := range todo {
 			f.Action, f.Why = ActKeep, "Docker could not be asked which containers run"
 		}

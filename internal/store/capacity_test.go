@@ -169,3 +169,34 @@ func TestRebuildRefusesTheCapacityRecord(t *testing.T) {
 		t.Fatalf("capacity's events are observations: %v", err)
 	}
 }
+
+// A capacity_runs table from before it had the blind column gains it and keeps its rows: the column is the table's
+// next one in keptColumns, not in the CREATE TABLE.
+func TestARunsTableFromBeforeTheBlindColumnGainsIt(t *testing.T) {
+	ctx := context.Background()
+	st, path := open(t)
+	t0 := time.UnixMilli(1_700_000_000_000)
+	if err := st.PutCapacityRun(ctx, CapacityRun{At: t0, Procs: 5}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`ALTER TABLE capacity_runs DROP COLUMN blind`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	st, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.PutCapacityRun(ctx, CapacityRun{At: t0.Add(time.Minute), Procs: 5, Blind: true}, nil, nil); err != nil {
+		t.Fatalf("a run on the older table: %v", err)
+	}
+	if ts, err := st.RunTimes(ctx); err != nil || len(ts) != 1 || !ts[0].Equal(t0) {
+		t.Fatalf("the old run stays, the blind one is no watched time: %v %v", ts, err)
+	}
+}

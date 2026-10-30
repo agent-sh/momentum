@@ -148,7 +148,52 @@ func (r *runner) record(ctx context.Context) error {
 	if err := r.recordJobs(ctx); err != nil {
 		return err
 	}
+	if err := r.recordHolds(ctx); err != nil {
+		return err
+	}
 	return r.recordDisks(ctx)
+}
+
+// recordHolds records a run that could not trust its look at the processes, or could not ask Docker which
+// containers run, and so deleted nothing: a problem note for each reason, put when its reason is new to it, and
+// resolved by the next run that has no such reason. Docker is asked only when a rule scans.
+func (r *runner) recordHolds(ctx context.Context) error {
+	for _, h := range []struct {
+		id, why, title string
+		checked        bool
+	}{
+		{"capacity:hold:look", r.blind, "Capacity deleted nothing: it cannot trust its look at the processes", true},
+		{"capacity:hold:docker", r.dockerErr, "Capacity deleted nothing: Docker could not be asked which containers run", r.dockerAsked},
+	} {
+		if !h.checked {
+			continue
+		}
+		old, had, err := r.st.Note(ctx, h.id)
+		if err != nil {
+			return err
+		}
+		if h.why == "" {
+			if had && old.Done.IsZero() {
+				if _, _, err := r.st.DoneNote(ctx, h.id, r.now); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		sum := sha256.Sum256([]byte(h.why))
+		e := r.event(KindFailed, Finding{Rule: "hold", Path: h.id, Err: h.why}, "hold/"+hex.EncodeToString(sum[:8]), store.ActorDetector)
+		fresh, err := r.putNew(ctx, []store.Event{e})
+		if err != nil {
+			return err
+		}
+		if fresh || (had && old.Done.IsZero()) {
+			if _, err := r.st.PutNote(ctx, store.Note{ID: h.id, Kind: store.NoteProblem, Source: store.Capacity, At: r.now,
+				Title: h.title, Detail: upper(h.why) + "."}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // putNew stores the events the store does not hold yet, so an item's event keeps its first sighting, and reports

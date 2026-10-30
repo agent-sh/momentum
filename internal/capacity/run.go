@@ -164,6 +164,7 @@ type runner struct {
 	covered       []time.Duration      // the watched time up to each run (cover)
 	blind         string               // why this run cannot trust its look at the processes, so deletes nothing
 	dockerErr     string               // why Docker could not say which containers run: the run deletes nothing
+	dockerAsked   bool                 // whether this run asked Docker (only when a rule scans)
 	heads         *remoteHeads         // the remotes' branches, asked once per run
 	res           *Result
 }
@@ -251,6 +252,7 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 		r.res.Rules = append(r.res.Rules, rr)
 	}
 	if len(due) > 0 { // a container's bind mounts are its use: the sampler cannot read root's processes
+		r.dockerAsked = true
 		if err := r.addContainerUses(ctx, r.sample); err != nil {
 			r.dockerErr = err.Error()
 			r.res.Problems = append(r.res.Problems, "Docker could not be asked which containers run, so nothing is deleted this run: "+r.dockerErr)

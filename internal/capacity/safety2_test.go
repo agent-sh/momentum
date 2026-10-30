@@ -284,6 +284,21 @@ func TestADockerThatCannotBeAskedHoldsTheDeletions(t *testing.T) {
 			if kept := statErr == nil; kept != c.holds {
 				t.Fatalf("kept %v, want %v: %v", kept, c.holds, res.Problems)
 			}
+			n, had, _ := st.Note(context.Background(), "capacity:hold:docker")
+			if c.holds != (had && n.Done.IsZero()) {
+				t.Fatalf("a held run leaves a problem note, and only then: %+v", n)
+			}
+			if c.holds { // Docker answers again: the next run resolves it
+				o.Tools = fakeTools{answers: map[string]string{"uv": "ERR", "docker": "ERR"}}
+				o.Clock = func() time.Time { return f.now.Add(time.Hour) }
+				o.Now = true
+				if _, err := Run(context.Background(), cfg, st, o); err != nil {
+					t.Fatal(err)
+				}
+				if n, _, _ := st.Note(context.Background(), "capacity:hold:docker"); n.Done.IsZero() {
+					t.Error("the next run that asks Docker resolves the note")
+				}
+			}
 		})
 	}
 }
