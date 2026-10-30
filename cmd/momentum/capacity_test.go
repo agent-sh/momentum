@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/agent-sh/momentum/internal/capacity"
 )
 
 func TestCapacityWithoutItsSectionOrWithABadRuleIsAUsageError(t *testing.T) {
@@ -36,10 +38,18 @@ func TestCapacityWithoutItsSectionOrWithABadRuleIsAUsageError(t *testing.T) {
 	}
 }
 
+// noJobs is a machine with no scheduled jobs, for a test that must not read this machine's.
+type noJobs struct{}
+
+func (noJobs) Units(context.Context) ([]capacity.JobText, []string, error) { return nil, nil, nil }
+func (noJobs) Crontab(context.Context) (string, error)                     { return "", nil }
+
 func TestACapacityDryRunRecordsNothing(t *testing.T) {
 	home, cfg, data := t.TempDir(), t.TempDir(), t.TempDir()
 	t.Setenv("MOMENTUM_HOME", home)
 	t.Setenv("MOMENTUM_CONFIG", cfg)
+	capacityJobs, capacityProc = noJobs{}, t.TempDir() // no jobs and no processes: nothing of this machine's
+	t.Cleanup(func() { capacityJobs, capacityProc = nil, "" })
 	conf := `{"capacity": {"disks": ["` + data + `"], "live": ["models"], "models": {"roots": ["` + data + `"]}}}`
 	if err := os.WriteFile(filepath.Join(cfg, "sources.json"), []byte(conf), 0o600); err != nil {
 		t.Fatal(err)

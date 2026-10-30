@@ -33,7 +33,11 @@ type Finding struct {
 	Err          string    `json:"error,omitempty"`
 	Detail       string    `json:"detail,omitempty"`
 	canon        string    // the canonical path, which every comparison uses (Mounts)
+	root         string    // the directory it is deleted under (os.Root): no symlink leads the deletion out of it
+	ino          inode     // its inode when the rule judged it: one put in its place since is not deleted
+	parts        []string  // a target dir's own entries, when it holds others that Cargo does not build
 	repo, branch string    // a worktree's common git directory and its branch
+	head         string    // a worktree's commit when the rule judged it
 	blobs        []string  // a model's shared-store blobs that go with it, canonical
 	linked       []string  // every shared-store blob a model links, canonical
 	class        string    // why a report-only finding is reported, as a word: its note's group
@@ -100,6 +104,7 @@ type Result struct {
 	Disks      []DiskState   `json:"disks"`
 	Rules      []RuleResult  `json:"rules"`
 	Problems   []string      `json:"problems,omitempty"`
+	Warnings   []string      `json:"warnings,omitempty"`
 }
 
 // Session names the agent session behind a process, for the writers of a fast fill.
@@ -125,6 +130,8 @@ type Options struct {
 	// Clock is the time; default time.Now. Writes reads each process's written bytes; default Writes.
 	Clock  func() time.Time
 	Writes func() map[int]int64
+	// beforeAct runs between the judgments and the deletions: a test's way into that gap.
+	beforeAct func()
 }
 
 type runner struct {
@@ -145,13 +152,19 @@ type runner struct {
 	seen         map[string]store.Seen
 	samplerStart time.Time
 
-	modelRoots []root          // deepest first
-	modelSet   map[string]bool // canonical
-	stores     map[string]bool // canonical model roots with a Hugging Face shared blob store
-	keep       map[string]bool // canonical
-	targetRoot []root
-	wtRoots    []root
-	res        *Result
+	modelRoots    []root          // deepest first
+	modelSet      map[string]bool // canonical
+	stores        map[string]bool // canonical model roots with a Hugging Face shared blob store
+	unknownStores map[string]bool // ones whose marker names a layout this build does not know
+	keep          map[string]bool // canonical
+	targetRoot    []root
+	wtRoots       []root
+	watchStart    map[string]time.Time // per canonical model root, the first run that watched it
+	runTimes      []time.Time          // every run, oldest first, this one among them
+	covered       []time.Duration      // the watched time up to each run (cover)
+	blind         string               // why this run cannot trust its look at the processes, so deletes nothing
+	heads         *remoteHeads         // the remotes' branches, asked once per run
+	res           *Result
 }
 
 // root is a configured root: as configured, and canonical.
@@ -186,7 +199,7 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 		root := opt.ProcRoot
 		opt.Writes = func() map[int]int64 { w, _ := Writes(root); return w }
 	}
-	r := &runner{cfg: cfg, opt: opt, st: st, now: opt.Clock(), git: newGitInfo(), tools: opt.Tools}
+	r := &runner{cfg: cfg, opt: opt, st: st, now: opt.Clock(), git: newGitInfo(), tools: opt.Tools, heads: newRemoteHeads()}
 	if r.tools == nil {
 		r.tools = execTools{uv: cfg.UV.Path, docker: cfg.Docker.Path}
 	}
@@ -223,9 +236,11 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 			continue
 		}
 		rr := RuleResult{Rule: rule, Live: cfg.IsLive(rule) && !opt.DryRun}
-		switch ok, why := r.due(ctx, rule, fast); {
+		switch ok, why, err := r.due(ctx, rule, fast); {
 		case !cfg.configured(rule):
 			rr.Why = "not configured"
+		case err != nil:
+			rr.Err = err.Error()
 		case !ok:
 			rr.Why = why
 		default:
@@ -260,10 +275,20 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 			r.seen[v.Path] = old
 		}
 	}
+	if err := r.watchRecord(ctx); err != nil {
+		return nil, err
+	}
+	if err := r.trustSample(ctx); err != nil {
+		return nil, err
+	}
 	if len(due) > 0 {
 		r.named, r.namedErr = LoadNamed(ctx, opt.Jobs, cfg.Names, r.m)
 		if r.namedErr != nil {
 			r.res.Problems = append(r.res.Problems, "the scheduled jobs could not all be read, so nothing is deleted this run: "+r.namedErr.Error())
+		}
+		if r.named != nil && len(r.named.Warnings) > 0 {
+			r.res.Warnings = append(r.res.Warnings, fmt.Sprintf("%d files of system units this user cannot read, so what they name is not known: %s",
+				len(r.named.Warnings), strings.Join(r.named.Warnings[:min(len(r.named.Warnings), 3)], "; ")))
 		}
 	}
 	var found Found
@@ -271,34 +296,49 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 		found = Discover(append(shownOf(r.targetRoot), shownOf(r.wtRoots)...),
 			func(p string) bool { return r.inTargetRoots(r.m.Canon(p)) }, func(p string) bool { return r.inWorktreeRoots(r.m.Canon(p)) }, nil)
 	}
-	for i := range r.res.Rules {
-		rr := &r.res.Rules[i]
-		if !rr.Ran {
-			continue
+	// The rules that judge items run first, and their deletions follow at once, each checked again first; the
+	// prunes come after, so a prune's minutes never stand between a judgment and its deletion.
+	scan := func(rule string) {
+		for i := range r.res.Rules {
+			rr := &r.res.Rules[i]
+			if rr.Rule != rule || !rr.Ran {
+				continue
+			}
+			start := time.Now()
+			var err error
+			switch rr.Rule {
+			case RuleModels:
+				rr.Findings, err = r.models(ctx)
+			case RuleTargets:
+				rr.Findings, err = r.targets(ctx, found.Targets)
+				rr.Notes = append(rr.Notes, fmt.Sprintf("walked %d directories in %s", found.Dirs, found.Took.Round(time.Millisecond)))
+			case RuleWorktrees:
+				rr.Findings, err = r.worktrees(ctx, found.Worktrees)
+			case RuleUV:
+				rr.Findings, rr.Notes, err = r.uv(ctx, rr.Live && r.mayPrune(rr))
+			case RuleDocker:
+				rr.Findings, rr.Notes, err = r.docker(ctx, rr.Live && r.mayPrune(rr))
+			}
+			if err != nil {
+				rr.Err = err.Error()
+			}
+			rr.Took = time.Since(start)
+			rr.TookMS = rr.Took.Milliseconds()
 		}
-		start := time.Now()
-		var err error
-		switch rr.Rule {
-		case RuleModels:
-			rr.Findings, err = r.models(ctx)
-		case RuleTargets:
-			rr.Findings, err = r.targets(ctx, found.Targets)
-			rr.Notes = append(rr.Notes, fmt.Sprintf("walked %d directories in %s", found.Dirs, found.Took.Round(time.Millisecond)))
-		case RuleWorktrees:
-			rr.Findings, err = r.worktrees(ctx, found.Worktrees)
-		case RuleUV:
-			rr.Findings, rr.Notes, err = r.uv(ctx, rr.Live)
-		case RuleDocker:
-			rr.Findings, rr.Notes, err = r.docker(ctx, rr.Live)
-		}
-		if err != nil {
-			rr.Err = err.Error()
-		}
-		rr.Took = time.Since(start)
-		rr.TookMS = rr.Took.Milliseconds()
 	}
-	r.act(ctx)
+	for _, rule := range []string{RuleModels, RuleTargets, RuleWorktrees} {
+		scan(rule)
+	}
+	if err := r.act(ctx); err != nil {
+		return r.res, err
+	}
+	for _, rule := range []string{RuleUV, RuleDocker} {
+		scan(rule)
+	}
 	if !opt.DryRun {
+		if err := r.recordPrunes(ctx); err != nil {
+			return r.res, err
+		}
 		for _, rr := range r.res.Rules {
 			if rr.Ran && rr.Err == "" {
 				if err := st.SetMark(ctx, "scan:"+rr.Rule, r.now); err != nil {
@@ -313,17 +353,92 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 	return r.res, nil
 }
 
+// mayPrune reports whether a prune may run on this run: not when the scheduled jobs could not all be read (the run
+// says it deleted nothing), and it notes why in the rule's result.
+func (r *runner) mayPrune(rr *RuleResult) bool {
+	if r.namedErr != nil {
+		rr.Notes = append(rr.Notes, "no prune: the scheduled jobs could not all be read")
+		return false
+	}
+	return true
+}
+
+// watchRecord loads every run's time and when the sampler began to watch each model root, and marks the roots this
+// run watches for the first time. A dry run adds itself as a run and marks nothing.
+func (r *runner) watchRecord(ctx context.Context) error {
+	r.watchStart = map[string]time.Time{}
+	if r.st != nil {
+		ts, err := r.st.RunTimes(ctx)
+		if err != nil {
+			return err
+		}
+		r.runTimes = ts
+	}
+	if r.opt.DryRun || len(r.runTimes) == 0 || r.runTimes[len(r.runTimes)-1].Before(r.now) {
+		r.runTimes = append(r.runTimes, r.now)
+	}
+	r.cover()
+	for _, x := range r.modelRoots {
+		at, err := r.mark(ctx, "watch:"+x.canon)
+		if err != nil {
+			return err
+		}
+		if at.IsZero() {
+			at = r.now
+			if !r.opt.DryRun {
+				if err := r.st.SetMark(ctx, "watch:"+x.canon, at); err != nil {
+					return err
+				}
+			}
+		}
+		r.watchStart[x.canon] = at
+	}
+	return nil
+}
+
+// trustSample decides whether this run's look at the processes can be trusted to say what is in use. A process table
+// of another PID namespace (a sandbox, a container) holds only its own processes, and a table far smaller than the
+// recent runs' is not the machine's: either way every item would read as unused, so the run deletes nothing.
+func (r *runner) trustSample(ctx context.Context) error {
+	if l, err := os.Readlink(filepath.Join(r.opt.ProcRoot, "self", "ns", "pid")); err == nil && l != initPIDNS {
+		r.blind = "it runs in a PID namespace of its own (" + l + "), where it cannot see the machine's processes"
+	} else if r.st != nil {
+		recent, err := r.st.RecentProcs(ctx, 25)
+		if err != nil {
+			return err
+		}
+		if len(recent) > 1 { // the newest is this run's
+			prior := append([]int(nil), recent[1:]...)
+			sort.Ints(prior)
+			if med := prior[len(prior)/2]; len(prior) >= 12 && r.sample.Procs < med/2 {
+				r.blind = fmt.Sprintf("it read %d processes, against %d at the recent runs: its process table is not the machine's",
+					r.sample.Procs, med)
+			}
+		}
+	}
+	if r.blind != "" {
+		r.res.Problems = append(r.res.Problems, "nothing is deleted this run: "+r.blind)
+	}
+	return nil
+}
+
+// initPIDNS is the initial PID namespace, which the kernel numbers the same on every machine.
+const initPIDNS = "pid:[4026531836]"
+
 // roots makes the configured roots canonical.
 func (r *runner) roots() {
-	r.modelSet, r.stores, r.keep = map[string]bool{}, map[string]bool{}, map[string]bool{}
+	r.modelSet, r.stores, r.unknownStores, r.keep = map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for _, p := range r.cfg.Models.Roots {
 		c := r.m.resolve(p)
 		if !r.modelSet[c] {
 			r.modelSet[c] = true
 			r.modelRoots = append(r.modelRoots, root{shown: filepath.Clean(p), canon: c})
 		}
-		if _, err := os.Stat(filepath.Join(p, "blobs", hfStoreMarker)); err == nil {
+		switch b, err := os.ReadFile(filepath.Join(p, "blobs", hfStoreMarker)); {
+		case err == nil && strings.TrimSpace(string(b)) == "1":
 			r.stores[c] = true
+		case err == nil || !errors.Is(err, os.ErrNotExist):
+			r.unknownStores[c] = true // a layout this build does not know, or a marker it cannot read
 		}
 	}
 	sort.SliceStable(r.modelRoots, func(i, j int) bool { return len(r.modelRoots[i].canon) > len(r.modelRoots[j].canon) })
@@ -364,18 +479,18 @@ func (r *runner) watched(p string) bool {
 
 // due reports whether a rule scans on this run: always on a dry run, with --now or while a disk fills fast;
 // otherwise once its cadence has passed since its last scan.
-func (r *runner) due(ctx context.Context, rule string, fast bool) (bool, string) {
-	if r.opt.DryRun || r.opt.Now || fast {
-		return true, ""
+func (r *runner) due(ctx context.Context, rule string, fast bool) (bool, string, error) {
+	if r.opt.DryRun || r.opt.Now || (fast && rule != RuleDocker) {
+		return true, "", nil
 	}
 	last, err := r.mark(ctx, "scan:"+rule)
 	if err != nil {
-		return false, err.Error()
+		return false, "", err
 	}
 	if every := r.cfg.every(rule); !last.IsZero() && r.now.Sub(last) < every {
-		return false, fmt.Sprintf("scanned %s ago; scans every %s", r.now.Sub(last).Round(time.Minute), every)
+		return false, fmt.Sprintf("scanned %s ago; scans every %s", r.now.Sub(last).Round(time.Minute), every), nil
 	}
-	return true, ""
+	return true, "", nil
 }
 
 // The run's reads of the store. A dry run may have no store (none yet, or one this build has not migrated): it
@@ -418,74 +533,6 @@ func (r *runner) diskSamples() []DiskState {
 		out = append(out, ds)
 	}
 	return out
-}
-
-// act deletes what the live rules found, after one fresh look at the processes: a build or a load that began
-// since the walk keeps its item. Nothing is deleted when the scheduled jobs could not all be read.
-func (r *runner) act(ctx context.Context) {
-	var todo []*Finding
-	for i := range r.res.Rules {
-		rr := &r.res.Rules[i]
-		if !rr.Live || rr.Rule == RuleUV || rr.Rule == RuleDocker {
-			continue
-		}
-		for j := range rr.Findings {
-			if rr.Findings[j].Action == ActDelete {
-				todo = append(todo, &rr.Findings[j])
-			}
-		}
-	}
-	if len(todo) == 0 {
-		return
-	}
-	if r.namedErr != nil {
-		for _, f := range todo {
-			f.Action, f.Why = ActKeep, "the scheduled jobs could not all be read"
-		}
-		return
-	}
-	r.fresh = TakeSample(r.opt.ProcRoot, r.m, r.watched)
-	r.addContainerUses(ctx, r.fresh)
-	for _, f := range todo {
-		if u, ok := r.fresh.InUse(f.canon); ok {
-			f.Action, f.Why = ActKeep, "in use now: "+useText(u)
-			continue
-		}
-		if f.Rule == RuleModels {
-			if u, ok := r.repoInUse(r.fresh, f.canon); ok {
-				f.Action, f.Why = ActKeep, "in use now: "+useText(u)
-				continue
-			}
-			for _, b := range f.linked {
-				if u, ok := r.fresh.InUse(b); ok {
-					f.Action, f.Why = ActKeep, "in use now: "+useText(u)
-				}
-			}
-			if f.Action != ActDelete {
-				continue
-			}
-		}
-		before := r.free(f.Path)
-		var err error
-		switch f.Rule {
-		case RuleWorktrees:
-			err = r.removeWorktree(ctx, f)
-		case RuleModels:
-			err = r.removeModel(f)
-		default:
-			err = removeLocked(f.Path)
-		}
-		if after := r.free(f.Path); before >= 0 && after >= 0 {
-			f.Freed = max(0, after-before)
-		}
-		if err != nil {
-			f.Err = err.Error()
-			if _, statErr := os.Lstat(f.Path); statErr == nil {
-				continue // still there: a failure, reported
-			}
-		}
-		f.Done = true
-	}
 }
 
 // addContainerUses adds to a sample the host paths running Docker containers bind-mount: a server in a container
@@ -540,30 +587,6 @@ func (r *runner) free(p string) int64 {
 			return -1
 		}
 	}
-}
-
-// errLocked means another process holds a lock on the directory: systemd-tmpfiles's convention for "do not age
-// this tree".
-var errLocked = errors.New("another process holds a lock on it")
-
-// removeLocked deletes a directory or file while holding an exclusive BSD lock on it, which another holder of a
-// lock refuses. A file is removed as it is.
-func removeLocked(p string) error {
-	st, err := os.Lstat(p)
-	if err != nil {
-		return err
-	}
-	if st.IsDir() {
-		f, err := os.Open(p)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-			return errLocked
-		}
-	}
-	return os.RemoveAll(p)
 }
 
 // useText is a use in words: what process used it and how.

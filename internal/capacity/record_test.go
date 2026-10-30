@@ -136,13 +136,15 @@ func TestJobsNameWhatTheyRun(t *testing.T) {
 	links := filepath.Join(dir, "bin")
 	must(t, os.MkdirAll(links, 0o755))
 	must(t, os.Symlink(viaLink, filepath.Join(links, "tool")))
-	jobs := fakeJobs{units: map[string]string{"user:a.service": "[Service]\nEnvironmentFile=-" + env + "\nExecStart=/usr/bin/srv -m " + model + "\n"},
-		crontab: "# a comment naming /nowhere\n*/5 * * * * " + script + "\n"}
+	envText, _ := os.ReadFile(env) // a unit's environment files are part of its text, as SystemJobs reads it
+	jobs := fakeJobs{units: map[string]string{"user:a.service": "[Service]\nEnvironmentFile=-" + env + "\nExecStart=/usr/bin/srv -m " + model + "\n" + string(envText)},
+		crontab: "# a comment naming /nowhere\n*/5 * * * * " + script + "\n0 * * * * cd " + dir + " && ./run.sh --out results/x\n"}
 	n, err := LoadNamed(context.Background(), jobs, NamesConfig{HermesJobs: jobsFile, HermesScripts: scripts, Links: []string{links}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []string{filepath.Join(dir, "models", "m1"), viaEnv, viaScript, viaHermes, filepath.Join(dir, "models", "m5")} {
+	for _, p := range []string{filepath.Join(dir, "models", "m1"), viaEnv, viaScript, viaHermes, filepath.Join(dir, "models", "m5"),
+		filepath.Join(dir, "run.sh"), filepath.Join(dir, "results")} {
 		if _, ok := n.Protects(p); !ok {
 			t.Errorf("%s is named, through a unit, its environment file, a cron script, a Hermes script or a link", p)
 		}

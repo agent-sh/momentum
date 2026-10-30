@@ -206,6 +206,15 @@ func words(s string) []string {
 		}
 		return false
 	})
+	// a quoted string is a word too, spaces and all: a path may hold a space
+	for _, q := range []string{`"`, `'`} {
+		parts := strings.Split(s, q)
+		for i := 1; i < len(parts); i += 2 {
+			if w := strings.TrimSpace(parts[i]); w != "" && !strings.ContainsAny(w, "\n") {
+				f = append(f, w)
+			}
+		}
+	}
 	home := homeDir()
 	for i, w := range f {
 		w = strings.TrimLeft(w, "-@+!") // systemd's command prefixes (ExecStart=-/x, EnvironmentFile=-/y)

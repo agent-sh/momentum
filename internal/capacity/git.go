@@ -40,6 +40,24 @@ func gitRun(ctx context.Context, timeout time.Duration, dir string, args ...stri
 	return out.String(), nil
 }
 
+// gitIn runs git in dir with the given standard input.
+func gitIn(ctx context.Context, dir, in string, args ...string) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "LC_ALL=C")
+	cmd.Stdin = strings.NewReader(in)
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	if err := cmd.Run(); err != nil {
+		if cctx.Err() != nil {
+			return "", fmt.Errorf("git %s: %w", strings.Join(args[:min(len(args), 2)], " "), errTimeout)
+		}
+		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args[:min(len(args), 2)], " "), err, strings.TrimSpace(errb.String()))
+	}
+	return out.String(), nil
+}
+
 // gitOK runs git in dir and reports whether it exited 0. An error is a git that could not run or did not finish.
 func gitOK(ctx context.Context, dir string, args ...string) (bool, error) {
 	_, err := gitRun(ctx, 30*time.Second, dir, args...)

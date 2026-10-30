@@ -31,7 +31,17 @@ func (r *runner) targets(ctx context.Context, paths []string) ([]Finding, error)
 		}
 		canon := r.m.Canon(t)
 		f := Finding{Rule: RuleTargets, Path: t, canon: canon, Bytes: tree.Bytes, Newest: tree.Newest, Idle: tree.Newest,
-			Eligible: tree.Newest.Add(idle)}
+			Eligible: tree.Newest.Add(idle), root: filepath.Dir(t)}
+		f.ino, _ = inodeOf(t)
+		if own, foreign := cargoEntries(t); len(foreign) > 0 {
+			// Cargo builds its own entries again, not the others (Criterion's saved baselines, a build script's
+			// downloads): those stay
+			f.parts, f.Bytes = own, 0
+			for _, e := range own {
+				f.Bytes += Measure(filepath.Join(t, e), nil).Bytes
+			}
+			f.Detail = "keeps what Cargo does not build: " + strings.Join(foreign[:min(len(foreign), 4)], ", ")
+		}
 		switch u, inUse := r.sample.InUse(canon); {
 		case inUse:
 			f.Action, f.Why = ActKeep, "in use now: "+useText(u)
@@ -67,7 +77,11 @@ func (r *runner) targetOwner(ctx context.Context, t, canon string) (action, clas
 		}
 		known = true
 	}
-	for _, s := range depSources(t) {
+	sources, complete := depSources(t)
+	if !complete {
+		return ActReport, "unknown", "it holds more dep-info files than were read, so its projects are not all known"
+	}
+	for _, s := range sources {
 		if w, ok := r.ex.byPath(r.m.resolve(s)); ok {
 			return ActReport, "excluded", "built from an excluded project's sources (" + short(s) + ", " + w + ")"
 		}
@@ -85,10 +99,9 @@ func (r *runner) targetOwner(ctx context.Context, t, canon string) (action, clas
 }
 
 // depSources are the source directories a target dir was built from, outside it and outside Cargo's registry and
-// the toolchain, as its dep-info files (<profile>/*.d and <profile>/deps/*.d) name them: the crate's directory
-// (the path before /src/), at most 20, and at most maxDepFiles files read.
-func depSources(t string) []string {
-	const maxDepFiles, maxSources = 4000, 20
+// the toolchain, as its dep-info files (<profile>/*.d and <profile>/deps/*.d) name them: the crate's directory (the
+// path before its last /src/). complete is false when it holds more than maxDepFiles of them, which are not all read.
+func depSources(t string) (out []string, complete bool) {
 	var dirs []string
 	for _, a := range listDirs(t) {
 		dirs = append(dirs, a, filepath.Join(a, "deps"))
@@ -99,7 +112,6 @@ func depSources(t string) []string {
 		}
 	}
 	seen := map[string]bool{}
-	var out []string
 	read := 0
 	for _, d := range dirs {
 		ents, err := os.ReadDir(d)
@@ -110,8 +122,8 @@ func depSources(t string) []string {
 			if !strings.HasSuffix(e.Name(), ".d") || !e.Type().IsRegular() {
 				continue
 			}
-			if read++; read > maxDepFiles || len(out) >= maxSources {
-				return out
+			if read++; read > maxDepFiles {
+				return out, false
 			}
 			b := readHead(filepath.Join(d, e.Name()), 64<<10)
 			for _, w := range bytes.Fields(b) {
@@ -130,7 +142,52 @@ func depSources(t string) []string {
 			}
 		}
 	}
-	return out
+	return out, true
+}
+
+// maxDepFiles is the most dep-info files a target dir's ownership is read from.
+var maxDepFiles = 20000
+
+// cargoOwn are the entries of a target directory that Cargo (and rust-analyzer's flycheck) makes and makes again.
+var cargoOwn = map[string]bool{"CACHEDIR.TAG": true, ".rustc_info.json": true, ".future-incompat-report.json": true,
+	".rustdoc_fingerprint.json": true, "debug": true, "release": true, "doc": true, "package": true, "tmp": true}
+
+// cargoEntries splits a target directory's entries into Cargo's own (cargoOwn, flycheck dirs, a custom profile's
+// dir, a target triple's) and the others.
+func cargoEntries(t string) (own, foreign []string) {
+	ents, err := os.ReadDir(t)
+	if err != nil {
+		return nil, nil
+	}
+	profile := func(d string) bool {
+		for _, s := range []string{".fingerprint", "deps", "build", "incremental"} {
+			if st, err := os.Lstat(filepath.Join(d, s)); err == nil && st.IsDir() {
+				return true
+			}
+		}
+		return false
+	}
+	for _, e := range ents {
+		n, p := e.Name(), filepath.Join(t, e.Name())
+		switch {
+		case cargoOwn[n], strings.HasPrefix(n, "flycheck"):
+			own = append(own, n)
+		case e.IsDir() && profile(p):
+			own = append(own, n)
+		case e.IsDir() && func() bool { // a target triple: its profiles inside
+			for _, d := range listDirs(p) {
+				if profile(d) {
+					return true
+				}
+			}
+			return false
+		}():
+			own = append(own, n)
+		default:
+			foreign = append(foreign, n)
+		}
+	}
+	return own, foreign
 }
 
 // toolchainPath reports whether a source path is Cargo's registry or git cache, or the toolchain's own library.

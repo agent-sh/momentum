@@ -2,6 +2,7 @@ package capacity
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -89,15 +90,21 @@ func openStore(t *testing.T) *store.Store {
 	return st
 }
 
-// fakeJobs are scheduled jobs a test sets.
+// fakeJobs are scheduled jobs a test sets: each unit's text by its name.
 type fakeJobs struct {
 	units   map[string]string
 	crontab string
 	err     error
 }
 
-func (j fakeJobs) Units(context.Context) (map[string]string, error) { return j.units, j.err }
-func (j fakeJobs) Crontab(context.Context) (string, error)          { return j.crontab, nil }
+func (j fakeJobs) Units(context.Context) ([]JobText, []string, error) {
+	var out []JobText
+	for n, t := range j.units {
+		out = append(out, JobText{Name: n, Text: t})
+	}
+	return out, nil, j.err
+}
+func (j fakeJobs) Crontab(context.Context) (string, error) { return j.crontab, nil }
 
 // fakeTools answers uv and docker from a table and records what ran.
 type fakeTools struct {
@@ -120,8 +127,11 @@ func (f fakeTools) answer(tool string, args []string) (string, error) {
 	}
 	for k, v := range f.answers {
 		if strings.HasPrefix(cmd, k) {
-			if v == "ERR" {
+			switch v {
+			case "ERR":
 				return "", errNoTool
+			case "ERR-INUSE":
+				return "", fmt.Errorf("uv cache prune: exit status 2: error: Cache is currently in-use, waiting for other uv processes to finish")
 			}
 			return v, nil
 		}
@@ -159,6 +169,21 @@ func gitT(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// watchedSince gives a store a sampler record from from to now: a run every 20 minutes, and each model root of cfg
+// watched from from.
+func watchedSince(t *testing.T, st *store.Store, cfg Config, from, now time.Time) {
+	t.Helper()
+	var runs []store.CapacityRun
+	for at := from; at.Before(now.Add(-time.Minute)); at = at.Add(20 * time.Minute) {
+		runs = append(runs, store.CapacityRun{At: at, Procs: 1})
+	}
+	ctx := context.Background()
+	must(t, st.PutRuns(ctx, runs))
+	for _, r := range cfg.Models.Roots {
+		must(t, st.SetMark(ctx, "watch:"+filepath.Clean(r), from))
+	}
 }
 
 // findings are a rule's findings by path.

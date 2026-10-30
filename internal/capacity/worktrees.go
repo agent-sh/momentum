@@ -6,18 +6,21 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 // The worktrees rule. A linked worktree is left over when its branch, pushed under its own name, is merged into its
-// remote's default branch or is gone from its remote. One that is clean (no change, no untracked file) and fully
-// pushed (every commit on it is on a remote) is removed with `git worktree remove`, and its branch with it. One
-// with uncommitted or unpushed work is only reported. A worktree a process is in, one changed in the last
-// quietTime (an agent finishing after its merge), a locked one and an excluded project's are left; the excluded
-// project's leftovers are reported. A branch never pushed under its own name (a new branch that still tracks the
-// default branch) is work in progress, and a detached worktree has no branch: neither is a leftover.
+// remote's default branch, its changes are all there already, or it is gone from its remote. One that is clean
+// (no change, no untracked file, no ignored file that is not a rebuildable cache, no file whose edits git hides)
+// and whose commits are on a branch its remote still has, or merged, is removed with `git worktree remove`, and its
+// branch with it, if the branch is still where it was judged. One with uncommitted or unpushed work is only
+// reported. A worktree a process is in, one changed in the last quietTime (an agent finishing after its merge), a
+// locked one and an excluded project's are left; the excluded project's leftovers are reported. A branch never
+// pushed under its own name (a new branch that still tracks the default branch), one never committed to, and a
+// detached worktree are work in progress, not leftovers.
 
 // quietTime is how long a leftover worktree must be unchanged before it goes: an agent often runs its last steps in
 // the worktree right after its branch merged.
@@ -30,15 +33,18 @@ type remoteHeads struct {
 	errs map[string]error
 }
 
+func newRemoteHeads() *remoteHeads {
+	return &remoteHeads{byID: map[string]map[string]bool{}, errs: map[string]error{}}
+}
+
 func (r *runner) worktrees(ctx context.Context, paths []string) ([]Finding, error) {
-	heads := &remoteHeads{byID: map[string]map[string]bool{}, errs: map[string]error{}}
 	var out []Finding
 	for _, w := range paths {
 		canon := r.m.Canon(w)
 		if _, inUse := r.sample.InUse(canon); inUse {
 			continue
 		}
-		f, ok := r.worktree(ctx, w, canon, heads)
+		f, ok := r.worktree(ctx, w, canon, r.heads)
 		if ok {
 			out = append(out, f)
 		}
@@ -59,10 +65,16 @@ func (r *runner) worktree(ctx context.Context, w, canon string, heads *remoteHea
 		return f, false // git cannot read it: not ours to judge
 	}
 	f.repo = strings.TrimSpace(common)
+	f.ino, _ = inodeOf(w)
 	branch, _ := gitOut(ctx, w, "symbolic-ref", "--quiet", "--short", "HEAD")
 	if f.branch = strings.TrimSpace(branch); f.branch == "" {
 		return f, false // detached: no branch to be merged
 	}
+	head, err := gitOut(ctx, w, "rev-parse", "HEAD")
+	if err != nil {
+		return f, false
+	}
+	f.head = strings.TrimSpace(head)
 	remote, rbranch := r.upstream(ctx, w, f.branch)
 	if remote == "" {
 		return f, false // never pushed: work in progress
@@ -72,10 +84,11 @@ func (r *runner) worktree(ctx context.Context, w, canon string, heads *remoteHea
 		return f, false // it tracks the default branch itself: not pushed under its own name
 	}
 	landed := !merged && r.landed(ctx, w, into)
+	var hs map[string]bool
 	gone := false
 	if !merged && !landed {
-		hs, err := heads.of(ctx, w, f.repo, remote)
-		if err != nil {
+		var err error
+		if hs, err = heads.of(ctx, w, f.repo, remote); err != nil {
 			return f, false // the remote cannot be asked: nothing is known
 		}
 		gone = !hs[rbranch]
@@ -88,8 +101,9 @@ func (r *runner) worktree(ctx context.Context, w, canon string, heads *remoteHea
 	case gone:
 		f.Detail = "its branch is gone from " + remote
 	default:
-		return f, false
+		return f, false // its branch is still on its remote
 	}
+	f.Detail += fmt.Sprintf("; its branch %s was at %s", f.branch, shortSHA(f.head))
 	if newBranch(ctx, w, f.branch) {
 		return f, false // made and never committed to: work about to begin
 	}
@@ -125,26 +139,120 @@ func (r *runner) worktree(ctx context.Context, w, canon string, heads *remoteHea
 		f.Action, f.Why = ActKeep, "its repository is in use: "+busy
 		return f, true
 	}
-	status, err := gitOut(ctx, w, "status", "--porcelain=v1", "--untracked-files=normal")
-	if err != nil {
-		f.Action, f.class, f.Why = ActReport, "unreadable", "git status failed: "+err.Error()
+	if class, why := r.unsaved(ctx, w); class != "" {
+		f.Action, f.class, f.Why = ActReport, class, why
 		return f, true
 	}
-	if n := countLines(status); n > 0 {
-		f.Action, f.class, f.Why = ActReport, "uncommitted", fmt.Sprintf("%d uncommitted or untracked files", n)
-		return f, true
-	}
-	ahead, err := gitOut(ctx, w, "rev-list", "--count", "HEAD", "--not", "--remotes")
-	if err != nil {
-		f.Action, f.class, f.Why = ActReport, "unreadable", "git rev-list failed: "+err.Error()
-		return f, true
-	}
-	if n := strings.TrimSpace(ahead); n != "0" && !merged && !landed {
-		f.Action, f.class, f.Why = ActReport, "unpushed", n+" commits on no remote, and their changes are not in "+into
-		return f, true
+	if !merged && !landed {
+		// gone: its commits must be on a branch the remote still has; a remote-tracking branch this clone kept
+		// after the remote deleted it proves nothing
+		n, err := aheadOfLive(ctx, w, remote, hs)
+		if err != nil {
+			f.Action, f.class, f.Why = ActReport, "unreadable", "git rev-list failed: "+err.Error()
+			return f, true
+		}
+		if n > 0 {
+			f.Action, f.class = ActReport, "unpushed"
+			f.Why = fmt.Sprintf("%d commits on no branch %s still has, and their changes are not in %s", n, remote, into)
+			return f, true
+		}
 	}
 	f.Action = ActDelete
 	return f, true
+}
+
+// unsaved names work in a worktree that git status does not count and git worktree remove would delete: a change,
+// an untracked file, an ignored file or directory that is not a rebuildable cache, or a file marked skip-worktree
+// or assume-unchanged, whose edits status hides. It returns the report class and why, or "".
+func (r *runner) unsaved(ctx context.Context, w string) (string, string) {
+	status, err := gitOut(ctx, w, "status", "--porcelain=v1", "--untracked-files=normal", "--ignored=matching")
+	if err != nil {
+		return "unreadable", "git status failed: " + err.Error()
+	}
+	var changed int
+	var ignored []string
+	for _, l := range strings.Split(status, "\n") {
+		switch {
+		case strings.TrimSpace(l) == "":
+		case strings.HasPrefix(l, "!! "):
+			p := strings.Trim(strings.TrimPrefix(l, "!! "), "\"")
+			if !rebuildable(filepath.Join(w, p)) {
+				ignored = append(ignored, strings.TrimSuffix(p, "/"))
+			}
+		default:
+			changed++
+		}
+	}
+	if changed > 0 {
+		return "uncommitted", fmt.Sprintf("%d uncommitted or untracked files", changed)
+	}
+	if len(ignored) > 0 {
+		sort.Strings(ignored)
+		names := strings.Join(ignored[:min(len(ignored), 3)], ", ")
+		if len(ignored) > 3 {
+			names += fmt.Sprintf(" and %d more", len(ignored)-3)
+		}
+		return "ignored", fmt.Sprintf("ignored files that are not a rebuildable cache, which removing it would delete: %s", names)
+	}
+	files, err := gitOut(ctx, w, "ls-files", "-v")
+	if err != nil {
+		return "unreadable", "git ls-files failed: " + err.Error()
+	}
+	hidden := 0
+	for _, l := range strings.Split(files, "\n") {
+		if l != "" && (l[0] == 'S' || (l[0] >= 'a' && l[0] <= 'z')) {
+			hidden++
+		}
+	}
+	if hidden > 0 {
+		return "uncommitted", fmt.Sprintf("%d files marked skip-worktree or assume-unchanged, whose edits git status hides", hidden)
+	}
+	return "", ""
+}
+
+// rebuildableNames are ignored directories that hold only what a tool makes again.
+var rebuildableNames = map[string]bool{"node_modules": true, "__pycache__": true, ".pytest_cache": true, ".mypy_cache": true,
+	".ruff_cache": true, ".venv": true, ".tox": true, ".nox": true, ".gradle": true, ".next": true, ".turbo": true,
+	".parcel-cache": true, ".svelte-kit": true}
+
+// rebuildable reports whether an ignored path holds only what a tool makes again: a directory tagged as a cache
+// (CACHEDIR.TAG, as Cargo's target is), one of rebuildableNames, or a compiled Python file.
+func rebuildable(p string) bool {
+	if strings.HasSuffix(p, ".pyc") {
+		return true
+	}
+	if rebuildableNames[filepath.Base(strings.TrimSuffix(p, "/"))] {
+		return true
+	}
+	b := readHead(filepath.Join(p, "CACHEDIR.TAG"), 64)
+	return strings.HasPrefix(string(b), cargoTag) // the tag's signature, the same for every tool
+}
+
+// aheadOfLive counts HEAD's commits that are on no branch the remote still has (its remote-tracking branches whose
+// names are in heads).
+func aheadOfLive(ctx context.Context, w, remote string, heads map[string]bool) (int, error) {
+	out, err := gitOut(ctx, w, "for-each-ref", "--format=%(refname)", "refs/remotes/"+remote+"/")
+	if err != nil {
+		return 0, err
+	}
+	in := "HEAD\n"
+	for _, ref := range strings.Split(strings.TrimSpace(out), "\n") {
+		if name, ok := strings.CutPrefix(ref, "refs/remotes/"+remote+"/"); ok && heads[name] {
+			in += "^" + ref + "\n"
+		}
+	}
+	n, err := gitIn(ctx, w, in, "rev-list", "--count", "--stdin")
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(n))
+}
+
+func shortSHA(s string) string {
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
 }
 
 // repoBusy names what works in a worktree's repository now, or "": a process (other than this one) whose working
@@ -293,7 +401,8 @@ func (h *remoteHeads) of(ctx context.Context, w, common, remote string) (map[str
 	return hs, nil
 }
 
-// removeWorktree removes a worktree with git, which refuses one that is not clean, and then its branch.
+// removeWorktree removes a worktree with git, which refuses one that is not clean, and then its branch, only if
+// the branch is still at the commit it was judged at.
 func (r *runner) removeWorktree(ctx context.Context, f *Finding) error {
 	main := f.repo
 	if filepath.Base(main) == ".git" {
@@ -303,8 +412,8 @@ func (r *runner) removeWorktree(ctx context.Context, f *Finding) error {
 		return err
 	}
 	if f.branch != "" {
-		if _, err := gitRun(ctx, 30*time.Second, main, "branch", "-D", f.branch); err != nil {
-			return fmt.Errorf("the worktree is removed, its branch %s is not: %w", f.branch, err)
+		if _, err := gitRun(ctx, 30*time.Second, main, "update-ref", "-d", "refs/heads/"+f.branch, f.head); err != nil {
+			return fmt.Errorf("the worktree is removed; its branch %s stays (it moved since it was judged, or git refused): %w", f.branch, err)
 		}
 	}
 	return nil
