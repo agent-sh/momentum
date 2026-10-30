@@ -20,11 +20,12 @@ import (
 	"github.com/agent-sh/momentum/sessions"
 )
 
-// capacityJobs and capacityProc stand in for the machine's scheduled jobs and its /proc; nil and "" are the
-// machine's own. Tests set them.
+// capacityJobs, capacityProc and capacityTools stand in for the machine's scheduled jobs, its /proc, and its uv
+// and Docker; nil and "" are the machine's own. Tests set them.
 var (
-	capacityJobs capacity.Jobs
-	capacityProc string
+	capacityJobs  capacity.Jobs
+	capacityProc  string
+	capacityTools capacity.Tools
 )
 
 // capacityCmd runs the capacity loop: the process sampler, each disk's use, and the rules that are due. A dry run
@@ -50,7 +51,7 @@ func capacityCmd(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	if err != nil {
 		return err
 	}
-	opt := capacity.Options{DryRun: *dry, Now: *now, Jobs: capacityJobs, ProcRoot: capacityProc}
+	opt := capacity.Options{DryRun: *dry, Now: *now, Jobs: capacityJobs, ProcRoot: capacityProc, Tools: capacityTools}
 	for _, r := range strings.Split(*only, ",") {
 		if r = strings.TrimSpace(r); r == "" {
 			continue

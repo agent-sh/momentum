@@ -17,7 +17,7 @@ const Capacity = "capacity"
 //   - capacity_seen: when the process sampler last saw a path in use (open, mapped, a working directory, a
 //     program, or named on a command line), and first.
 //   - capacity_runs: each run, the time its sample of the processes took, how many it read and how many it could
-//     not. The first run is where the sampler's record starts.
+//     not, and whether its look could not be trusted (blind): such a run watched nothing.
 //   - capacity_marks: when each rule last ran its scan, or last pruned.
 const capacityTables = `
 CREATE TABLE IF NOT EXISTS disk_samples (disk TEXT NOT NULL, at INTEGER NOT NULL, size INTEGER NOT NULL,
@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS disk_samples (disk TEXT NOT NULL, at INTEGER NOT NULL
 CREATE TABLE IF NOT EXISTS capacity_seen (path TEXT PRIMARY KEY, first INTEGER NOT NULL, last INTEGER NOT NULL,
   how TEXT NOT NULL DEFAULT '', proc TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS capacity_runs (at INTEGER PRIMARY KEY, sample_ms INTEGER NOT NULL, procs INTEGER NOT NULL,
-  unreadable INTEGER NOT NULL);
+  unreadable INTEGER NOT NULL, blind INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS capacity_marks (mark TEXT PRIMARY KEY, at INTEGER NOT NULL);
 `
 
@@ -48,12 +48,13 @@ type Seen struct {
 }
 
 // CapacityRun is one run's look at the processes: when, how long the sample took, how many processes it read and
-// how many it could not (another user's).
+// how many it could not (another user's), and whether the look could not be trusted.
 type CapacityRun struct {
 	At         time.Time
 	Sample     time.Duration
 	Procs      int
 	Unreadable int
+	Blind      bool
 }
 
 // PutCapacityRun records a run in one transaction: the run, each disk's sample, and what the sampler saw. A path
@@ -64,8 +65,8 @@ func (s *Store) PutCapacityRun(ctx context.Context, run CapacityRun, disks []Dis
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO capacity_runs (at, sample_ms, procs, unreadable) VALUES (?,?,?,?)`,
-		run.At.UnixMilli(), run.Sample.Milliseconds(), run.Procs, run.Unreadable); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO capacity_runs (at, sample_ms, procs, unreadable, blind) VALUES (?,?,?,?,?)`,
+		run.At.UnixMilli(), run.Sample.Milliseconds(), run.Procs, run.Unreadable, run.Blind); err != nil {
 		return err
 	}
 	for _, d := range disks {
@@ -103,13 +104,13 @@ func (s *Store) PutRuns(ctx context.Context, runs []CapacityRun) error {
 		return err
 	}
 	defer tx.Rollback()
-	stmt, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO capacity_runs (at, sample_ms, procs, unreadable) VALUES (?,?,?,?)`)
+	stmt, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO capacity_runs (at, sample_ms, procs, unreadable, blind) VALUES (?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 	for _, r := range runs {
-		if _, err := stmt.ExecContext(ctx, r.At.UnixMilli(), r.Sample.Milliseconds(), r.Procs, r.Unreadable); err != nil {
+		if _, err := stmt.ExecContext(ctx, r.At.UnixMilli(), r.Sample.Milliseconds(), r.Procs, r.Unreadable, r.Blind); err != nil {
 			return err
 		}
 	}
@@ -166,9 +167,9 @@ func (s *Store) SamplerStart(ctx context.Context) (time.Time, error) {
 	return time.UnixMilli(at.Int64), nil
 }
 
-// RecentProcs are how many processes the last n runs read, newest first.
+// RecentProcs are how many processes the last n runs that could trust their look read, newest first.
 func (s *Store) RecentProcs(ctx context.Context, n int) ([]int, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT procs FROM capacity_runs ORDER BY at DESC LIMIT ?`, n)
+	rows, err := s.db.QueryContext(ctx, `SELECT procs FROM capacity_runs WHERE blind = 0 ORDER BY at DESC LIMIT ?`, n)
 	if err != nil {
 		return nil, err
 	}
@@ -184,9 +185,9 @@ func (s *Store) RecentProcs(ctx context.Context, n int) ([]int, error) {
 	return out, rows.Err()
 }
 
-// RunTimes are the times of every capacity run, oldest first: when the sampler looked.
+// RunTimes are the times of every capacity run that could trust its look, oldest first: when the sampler watched.
 func (s *Store) RunTimes(ctx context.Context) ([]time.Time, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT at FROM capacity_runs ORDER BY at`)
+	rows, err := s.db.QueryContext(ctx, `SELECT at FROM capacity_runs WHERE blind = 0 ORDER BY at`)
 	if err != nil {
 		return nil, err
 	}
@@ -200,28 +201,6 @@ func (s *Store) RunTimes(ctx context.Context) ([]time.Time, error) {
 		out = append(out, time.UnixMilli(at))
 	}
 	return out, rows.Err()
-}
-
-// SamplerGap is the longest time between two runs from since on, and the run it ended at: while no run looked, a
-// path in use went unseen.
-func (s *Store) SamplerGap(ctx context.Context, since time.Time) (gap time.Duration, at time.Time, err error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT at FROM capacity_runs WHERE at >= ? ORDER BY at`, since.UnixMilli())
-	if err != nil {
-		return 0, at, err
-	}
-	defer rows.Close()
-	var prev int64
-	for rows.Next() {
-		var t int64
-		if err := rows.Scan(&t); err != nil {
-			return 0, at, err
-		}
-		if prev != 0 && time.Duration(t-prev)*time.Millisecond > gap {
-			gap, at = time.Duration(t-prev)*time.Millisecond, time.UnixMilli(t)
-		}
-		prev = t
-	}
-	return gap, at, rows.Err()
 }
 
 // Mark is when a mark was last set (a rule's scan, a prune), or zero.
@@ -242,6 +221,25 @@ func (s *Store) SetMark(ctx context.Context, mark string, at time.Time) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO capacity_marks (mark, at) VALUES (?, ?)
 	  ON CONFLICT(mark) DO UPDATE SET at = excluded.at`, mark, at.UnixMilli())
 	return err
+}
+
+// Marks are the marks whose names start with prefix, by name.
+func (s *Store) Marks(ctx context.Context, prefix string) (map[string]time.Time, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT mark, at FROM capacity_marks WHERE mark >= ? AND mark < ?`, prefix, prefix+"\uffff")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]time.Time{}
+	for rows.Next() {
+		var m string
+		var at int64
+		if err := rows.Scan(&m, &at); err != nil {
+			return nil, err
+		}
+		out[m] = time.UnixMilli(at)
+	}
+	return out, rows.Err()
 }
 
 // ClearMark forgets a mark.

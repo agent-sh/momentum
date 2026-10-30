@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-sh/momentum/internal/capacity"
 )
@@ -44,12 +46,22 @@ type noJobs struct{}
 func (noJobs) Units(context.Context) ([]capacity.JobText, []string, error) { return nil, nil, nil }
 func (noJobs) Crontab(context.Context) (string, error)                     { return "", nil }
 
+// noTools is a machine without uv or Docker.
+type noTools struct{}
+
+func (noTools) UV(context.Context, time.Duration, ...string) (string, error) {
+	return "", errors.New("uv: not installed")
+}
+func (noTools) Docker(context.Context, time.Duration, ...string) (string, error) {
+	return "", errors.New("docker: not installed")
+}
+
 func TestACapacityDryRunRecordsNothing(t *testing.T) {
 	home, cfg, data := t.TempDir(), t.TempDir(), t.TempDir()
 	t.Setenv("MOMENTUM_HOME", home)
 	t.Setenv("MOMENTUM_CONFIG", cfg)
-	capacityJobs, capacityProc = noJobs{}, t.TempDir() // no jobs and no processes: nothing of this machine's
-	t.Cleanup(func() { capacityJobs, capacityProc = nil, "" })
+	capacityJobs, capacityProc, capacityTools = noJobs{}, t.TempDir(), noTools{} // nothing of this machine's
+	t.Cleanup(func() { capacityJobs, capacityProc, capacityTools = nil, "", nil })
 	conf := `{"capacity": {"disks": ["` + data + `"], "live": ["models"], "models": {"roots": ["` + data + `"]}}}`
 	if err := os.WriteFile(filepath.Join(cfg, "sources.json"), []byte(conf), 0o600); err != nil {
 		t.Fatal(err)

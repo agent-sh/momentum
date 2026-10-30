@@ -26,15 +26,15 @@ import (
 // the worktree right after its branch merged.
 const quietTime = time.Hour
 
-// remoteHeads caches each remote's branches for a run: one ls-remote per repository and remote.
+// remoteHeads caches each remote's branches and their commits for a run: one ls-remote per repository and remote.
 type remoteHeads struct {
 	mu   sync.Mutex
-	byID map[string]map[string]bool
+	byID map[string]map[string]string
 	errs map[string]error
 }
 
 func newRemoteHeads() *remoteHeads {
-	return &remoteHeads{byID: map[string]map[string]bool{}, errs: map[string]error{}}
+	return &remoteHeads{byID: map[string]map[string]string{}, errs: map[string]error{}}
 }
 
 func (r *runner) worktrees(ctx context.Context, paths []string) ([]Finding, error) {
@@ -44,7 +44,7 @@ func (r *runner) worktrees(ctx context.Context, paths []string) ([]Finding, erro
 		if _, inUse := r.sample.InUse(canon); inUse {
 			continue
 		}
-		f, ok := r.worktree(ctx, w, canon, r.heads)
+		f, ok := r.worktree(ctx, w, canon, r.heads, r.sample)
 		if ok {
 			out = append(out, f)
 		}
@@ -53,8 +53,8 @@ func (r *runner) worktrees(ctx context.Context, paths []string) ([]Finding, erro
 	return out, nil
 }
 
-// worktree decides on one linked worktree; false leaves it out (not a leftover).
-func (r *runner) worktree(ctx context.Context, w, canon string, heads *remoteHeads) (Finding, bool) {
+// worktree decides on one linked worktree, by a look at the processes; false leaves it out (not a leftover).
+func (r *runner) worktree(ctx context.Context, w, canon string, heads *remoteHeads, look *Sample) (Finding, bool) {
 	f := Finding{Rule: RuleWorktrees, Path: w, canon: canon}
 	gitdir, ok := isLinkedWorktree(w)
 	if !ok {
@@ -84,14 +84,15 @@ func (r *runner) worktree(ctx context.Context, w, canon string, heads *remoteHea
 		return f, false // it tracks the default branch itself: not pushed under its own name
 	}
 	landed := !merged && r.landed(ctx, w, into)
-	var hs map[string]bool
+	var hs map[string]string
 	gone := false
 	if !merged && !landed {
 		var err error
 		if hs, err = heads.of(ctx, w, f.repo, remote); err != nil {
 			return f, false // the remote cannot be asked: nothing is known
 		}
-		gone = !hs[rbranch]
+		_, live := hs[rbranch]
+		gone = !live
 	}
 	switch {
 	case merged:
@@ -135,7 +136,7 @@ func (r *runner) worktree(ctx context.Context, w, canon string, heads *remoteHea
 		f.Action, f.Why = ActKeep, "locked: "+strings.TrimSpace(string(b))
 		return f, true
 	}
-	if busy := r.repoBusy(ctx, w, canon); busy != "" {
+	if busy := r.repoBusy(ctx, w, canon, look); busy != "" {
 		f.Action, f.Why = ActKeep, "its repository is in use: "+busy
 		return f, true
 	}
@@ -144,9 +145,9 @@ func (r *runner) worktree(ctx context.Context, w, canon string, heads *remoteHea
 		return f, true
 	}
 	if !merged && !landed {
-		// gone: its commits must be on a branch the remote still has; a remote-tracking branch this clone kept
-		// after the remote deleted it proves nothing
-		n, err := aheadOfLive(ctx, w, remote, hs)
+		// gone: its commits must be on a branch the remote still has, at the commit the remote has it at; a
+		// remote-tracking branch this clone kept after the remote deleted or rewrote the branch proves nothing
+		n, err := aheadOfLive(ctx, w, hs)
 		if err != nil {
 			f.Action, f.class, f.Why = ActReport, "unreadable", "git rev-list failed: "+err.Error()
 			return f, true
@@ -216,32 +217,36 @@ var rebuildableNames = map[string]bool{"node_modules": true, "__pycache__": true
 	".parcel-cache": true, ".svelte-kit": true}
 
 // rebuildable reports whether an ignored path holds only what a tool makes again: a directory tagged as a cache
-// (CACHEDIR.TAG, as Cargo's target is), one of rebuildableNames, or a compiled Python file.
+// (CACHEDIR.TAG), one of rebuildableNames, or a compiled Python file. A Cargo target directory is rebuildable only
+// when it holds nothing but what Cargo makes (Criterion's saved baselines are not).
 func rebuildable(p string) bool {
+	p = strings.TrimSuffix(p, "/")
 	if strings.HasSuffix(p, ".pyc") {
 		return true
 	}
-	if rebuildableNames[filepath.Base(strings.TrimSuffix(p, "/"))] {
+	if rebuildableNames[filepath.Base(p)] {
 		return true
 	}
 	b := readHead(filepath.Join(p, "CACHEDIR.TAG"), 64)
-	return strings.HasPrefix(string(b), cargoTag) // the tag's signature, the same for every tool
+	if !strings.HasPrefix(string(b), cargoTag) { // the tag's signature, the same for every tool
+		return false
+	}
+	if isTarget(p) {
+		_, foreign := cargoEntries(p)
+		return len(foreign) == 0
+	}
+	return true
 }
 
-// aheadOfLive counts HEAD's commits that are on no branch the remote still has (its remote-tracking branches whose
-// names are in heads).
-func aheadOfLive(ctx context.Context, w, remote string, heads map[string]bool) (int, error) {
-	out, err := gitOut(ctx, w, "for-each-ref", "--format=%(refname)", "refs/remotes/"+remote+"/")
-	if err != nil {
-		return 0, err
-	}
+// aheadOfLive counts HEAD's commits that are on no branch the remote has now, by the commits ls-remote gave: not
+// by this clone's remote-tracking branches, which may hold what the remote since deleted or rewrote. A remote
+// commit this clone does not have is passed over, so what only it would hold counts as unpushed.
+func aheadOfLive(ctx context.Context, w string, heads map[string]string) (int, error) {
 	in := "HEAD\n"
-	for _, ref := range strings.Split(strings.TrimSpace(out), "\n") {
-		if name, ok := strings.CutPrefix(ref, "refs/remotes/"+remote+"/"); ok && heads[name] {
-			in += "^" + ref + "\n"
-		}
+	for _, sha := range heads {
+		in += "^" + sha + "\n"
 	}
-	n, err := gitIn(ctx, w, in, "rev-list", "--count", "--stdin")
+	n, err := gitIn(ctx, w, in, "rev-list", "--count", "--ignore-missing", "--stdin")
 	if err != nil {
 		return 0, err
 	}
@@ -258,7 +263,7 @@ func shortSHA(s string) string {
 // repoBusy names what works in a worktree's repository now, or "": a process (other than this one) whose working
 // directory is in any of the repository's work trees, or a live agent session that works in one. The scheduled-AI
 // policy leaves a repository someone works on alone; a branch of it is not deleted under them.
-func (r *runner) repoBusy(ctx context.Context, w, canon string) string {
+func (r *runner) repoBusy(ctx context.Context, w, canon string, look *Sample) string {
 	out, err := gitOut(ctx, w, "worktree", "list", "--porcelain")
 	if err != nil {
 		return "git worktree list failed: " + err.Error()
@@ -273,7 +278,7 @@ func (r *runner) repoBusy(ctx context.Context, w, canon string) string {
 	}
 	self := os.Getpid()
 	for _, t := range trees {
-		for _, p := range r.sample.Table {
+		for _, p := range look.Table {
 			if p.PID != self && p.Cwd != "" && under(p.Cwd, t) {
 				return fmt.Sprintf("%s (pid %d) in %s", p.Comm, p.PID, short(t))
 			}
@@ -372,7 +377,7 @@ func newBranch(ctx context.Context, w, branch string) bool {
 }
 
 // of is a remote's branches, asked once per repository and remote.
-func (h *remoteHeads) of(ctx context.Context, w, common, remote string) (map[string]bool, error) {
+func (h *remoteHeads) of(ctx context.Context, w, common, remote string) (map[string]string, error) {
 	id := common + "\x00" + remote
 	h.mu.Lock()
 	if hs, ok := h.byID[id]; ok {
@@ -391,10 +396,10 @@ func (h *remoteHeads) of(ctx context.Context, w, common, remote string) (map[str
 		h.errs[id] = err
 		return nil, err
 	}
-	hs := map[string]bool{}
+	hs := map[string]string{}
 	for _, l := range strings.Split(out, "\n") {
 		if f := strings.Fields(l); len(f) == 2 {
-			hs[strings.TrimPrefix(f[1], "refs/heads/")] = true
+			hs[strings.TrimPrefix(f[1], "refs/heads/")] = f[0]
 		}
 	}
 	h.byID[id] = hs
@@ -417,14 +422,4 @@ func (r *runner) removeWorktree(ctx context.Context, f *Finding) error {
 		}
 	}
 	return nil
-}
-
-func countLines(s string) int {
-	n := 0
-	for _, l := range strings.Split(s, "\n") {
-		if strings.TrimSpace(l) != "" {
-			n++
-		}
-	}
-	return n
 }

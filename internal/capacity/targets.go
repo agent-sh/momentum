@@ -3,6 +3,7 @@ package capacity
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -125,7 +126,10 @@ func depSources(t string) (out []string, complete bool) {
 			if read++; read > maxDepFiles {
 				return out, false
 			}
-			b := readHead(filepath.Join(d, e.Name()), 64<<10)
+			b := readHead(filepath.Join(d, e.Name()), maxDepFile+1)
+			if len(b) > maxDepFile {
+				return out, false // a dep-info file this long is not read whole: its sources are not all known
+			}
 			for _, w := range bytes.Fields(b) {
 				p := strings.TrimSuffix(string(w), ":")
 				if !filepath.IsAbs(p) || !strings.HasSuffix(p, ".rs") || under(p, t) || toolchainPath(p) {
@@ -145,8 +149,10 @@ func depSources(t string) (out []string, complete bool) {
 	return out, true
 }
 
-// maxDepFiles is the most dep-info files a target dir's ownership is read from.
+// maxDepFiles is the most dep-info files a target dir's ownership is read from, and maxDepFile the longest one.
 var maxDepFiles = 20000
+
+const maxDepFile = 4 << 20
 
 // cargoOwn are the entries of a target directory that Cargo (and rust-analyzer's flycheck) makes and makes again.
 var cargoOwn = map[string]bool{"CACHEDIR.TAG": true, ".rustc_info.json": true, ".future-incompat-report.json": true,
@@ -214,14 +220,13 @@ func listDirs(d string) []string {
 	return out
 }
 
-// readHead is a file's first n bytes.
+// readHead is a file's first n bytes, or all of it when it is shorter.
 func readHead(p string, n int) []byte {
 	f, err := os.Open(p)
 	if err != nil {
 		return nil
 	}
 	defer f.Close()
-	b := make([]byte, n)
-	k, _ := f.Read(b)
-	return b[:k]
+	b, _ := io.ReadAll(io.LimitReader(f, int64(n)))
+	return b
 }

@@ -253,6 +253,13 @@ func TestALookThatIsNotTheMachinesDeletesNothing(t *testing.T) {
 			if len(res.Problems) == 0 {
 				t.Error("and says why")
 			}
+			ts, err := st.RunTimes(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if last := ts[len(ts)-1]; !last.Before(f.now.Truncate(time.Millisecond)) {
+				t.Error("a blind run watched nothing: its time is no watched time")
+			}
 		})
 	}
 }

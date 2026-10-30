@@ -66,8 +66,8 @@ func runTool(ctx context.Context, timeout time.Duration, path, name string, args
 	}
 	if err != nil {
 		msg := strings.TrimSpace(errb.String())
-		if len(msg) > 300 {
-			msg = msg[len(msg)-300:]
+		if len(msg) > 600 { // its head says what failed, its tail where
+			msg = msg[:300] + " ... " + msg[len(msg)-300:]
 		}
 		return out.String(), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args[:min(len(args), 2)], " "), err, msg)
 	}
@@ -154,7 +154,8 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 // uvInUse reports whether uv refused a prune because another uv process holds its cache.
 func uvInUse(err error) bool {
 	m := strings.ToLower(err.Error())
-	return strings.Contains(m, "in-use") || strings.Contains(m, "in use") || strings.Contains(m, "timed out waiting")
+	return strings.Contains(m, "in-use") || strings.Contains(m, "in use") || strings.Contains(m, "timed out waiting") ||
+		strings.Contains(m, "when waiting for lock")
 }
 
 // uvSize is the cache's size: uv's own count, else a walk.

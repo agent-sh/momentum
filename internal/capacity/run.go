@@ -163,6 +163,7 @@ type runner struct {
 	runTimes      []time.Time          // every run, oldest first, this one among them
 	covered       []time.Duration      // the watched time up to each run (cover)
 	blind         string               // why this run cannot trust its look at the processes, so deletes nothing
+	dockerErr     string               // why Docker could not say which containers run: the run deletes nothing
 	heads         *remoteHeads         // the remotes' branches, asked once per run
 	res           *Result
 }
@@ -250,7 +251,13 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 		r.res.Rules = append(r.res.Rules, rr)
 	}
 	if len(due) > 0 { // a container's bind mounts are its use: the sampler cannot read root's processes
-		r.addContainerUses(ctx, r.sample)
+		if err := r.addContainerUses(ctx, r.sample); err != nil {
+			r.dockerErr = err.Error()
+			r.res.Problems = append(r.res.Problems, "Docker could not be asked which containers run, so nothing is deleted this run: "+r.dockerErr)
+		}
+	}
+	if err := r.trustSample(ctx); err != nil {
+		return nil, err
 	}
 	seen := r.sampleSeen()
 	if !opt.DryRun {
@@ -261,7 +268,7 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 			}
 		}
 		if err := st.PutCapacityRun(ctx, store.CapacityRun{At: r.now, Sample: r.sample.Took, Procs: r.sample.Procs,
-			Unreadable: r.sample.Unreadable}, samples, seen); err != nil {
+			Unreadable: r.sample.Unreadable, Blind: r.blind != ""}, samples, seen); err != nil {
 			return nil, err
 		}
 	}
@@ -276,9 +283,6 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 		}
 	}
 	if err := r.watchRecord(ctx); err != nil {
-		return nil, err
-	}
-	if err := r.trustSample(ctx); err != nil {
 		return nil, err
 	}
 	if len(due) > 0 {
@@ -329,16 +333,19 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 	for _, rule := range []string{RuleModels, RuleTargets, RuleWorktrees} {
 		scan(rule)
 	}
+	r.mountCheck()
 	if err := r.act(ctx); err != nil {
 		return r.res, err
 	}
 	for _, rule := range []string{RuleUV, RuleDocker} {
 		scan(rule)
+		if !opt.DryRun {
+			if err := r.recordPrunes(ctx, rule); err != nil {
+				return r.res, err
+			}
+		}
 	}
 	if !opt.DryRun {
-		if err := r.recordPrunes(ctx); err != nil {
-			return r.res, err
-		}
 		for _, rr := range r.res.Rules {
 			if rr.Ran && rr.Err == "" {
 				if err := st.SetMark(ctx, "scan:"+rr.Rule, r.now); err != nil {
@@ -353,14 +360,39 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 	return r.res, nil
 }
 
-// mayPrune reports whether a prune may run on this run: not when the scheduled jobs could not all be read (the run
-// says it deleted nothing), and it notes why in the rule's result.
+// mayPrune reports whether a prune may run on this run: not when the scheduled jobs could not all be read, nor when
+// the run cannot trust its look at the processes (the run says it deleted and pruned nothing), and it notes why in
+// the rule's result.
 func (r *runner) mayPrune(rr *RuleResult) bool {
-	if r.namedErr != nil {
+	switch {
+	case r.namedErr != nil:
 		rr.Notes = append(rr.Notes, "no prune: the scheduled jobs could not all be read")
+		return false
+	case r.blind != "":
+		rr.Notes = append(rr.Notes, "no prune: "+r.blind)
 		return false
 	}
 	return true
+}
+
+// mountCheck reports, at judgment, every item a judging rule would delete that holds a mount point: a dry run lists
+// it as act would leave it.
+func (r *runner) mountCheck() {
+	for i := range r.res.Rules {
+		rr := &r.res.Rules[i]
+		if rr.Rule != RuleModels && rr.Rule != RuleTargets && rr.Rule != RuleWorktrees {
+			continue
+		}
+		for j := range rr.Findings {
+			f := &rr.Findings[j]
+			if f.Action != ActDelete {
+				continue
+			}
+			if mp, ok := r.m.mountWithin(f.Path, f.canon); ok {
+				f.Action, f.class, f.Why = ActReport, "mount", "it holds a mount point ("+mp+"): a deletion would reach past it"
+			}
+		}
+	}
 }
 
 // watchRecord loads every run's time and when the sampler began to watch each model root, and marks the roots this
@@ -378,6 +410,19 @@ func (r *runner) watchRecord(ctx context.Context) error {
 		r.runTimes = append(r.runTimes, r.now)
 	}
 	r.cover()
+	if !r.opt.DryRun { // a root no longer configured is watched no more: added back, it starts again
+		marks, err := r.st.Marks(ctx, "watch:")
+		if err != nil {
+			return err
+		}
+		for m := range marks {
+			if !r.modelSet[strings.TrimPrefix(m, "watch:")] {
+				if err := r.st.ClearMark(ctx, m); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	for _, x := range r.modelRoots {
 		at, err := r.mark(ctx, "watch:"+x.canon)
 		if err != nil {
@@ -400,17 +445,22 @@ func (r *runner) watchRecord(ctx context.Context) error {
 // of another PID namespace (a sandbox, a container) holds only its own processes, and a table far smaller than the
 // recent runs' is not the machine's: either way every item would read as unused, so the run deletes nothing.
 func (r *runner) trustSample(ctx context.Context) error {
+	_, self := r.sample.Table[os.Getpid()]
+	_, procfs := os.Lstat(filepath.Join(r.opt.ProcRoot, "self"))
 	if l, err := os.Readlink(filepath.Join(r.opt.ProcRoot, "self", "ns", "pid")); err == nil && l != initPIDNS {
 		r.blind = "it runs in a PID namespace of its own (" + l + "), where it cannot see the machine's processes"
+	} else if r.sample.Procs == 0 {
+		r.blind = "it read no process at all"
+	} else if procfs == nil && !self {
+		r.blind = "its own process is not among the processes it read: its process table is not the machine's"
 	} else if r.st != nil {
-		recent, err := r.st.RecentProcs(ctx, 25)
+		prior, err := r.st.RecentProcs(ctx, 24) // the runs before this one, which is not recorded yet
 		if err != nil {
 			return err
 		}
-		if len(recent) > 1 { // the newest is this run's
-			prior := append([]int(nil), recent[1:]...)
-			sort.Ints(prior)
-			if med := prior[len(prior)/2]; len(prior) >= 12 && r.sample.Procs < med/2 {
+		sort.Ints(prior)
+		if len(prior) >= 12 {
+			if med := prior[len(prior)/2]; r.sample.Procs < med/2 {
 				r.blind = fmt.Sprintf("it read %d processes, against %d at the recent runs: its process table is not the machine's",
 					r.sample.Procs, med)
 			}
@@ -442,7 +492,8 @@ func (r *runner) roots() {
 		}
 	}
 	sort.SliceStable(r.modelRoots, func(i, j int) bool { return len(r.modelRoots[i].canon) > len(r.modelRoots[j].canon) })
-	for _, p := range r.cfg.Models.Keep {
+	for _, p := range r.cfg.Models.Keep { // as written and through its symlinks, as a job's path is
+		r.keep[r.m.Canon(filepath.Clean(p))] = true
 		r.keep[r.m.resolve(p)] = true
 	}
 	for _, p := range r.cfg.Targets.Roots {
@@ -536,16 +587,24 @@ func (r *runner) diskSamples() []DiskState {
 }
 
 // addContainerUses adds to a sample the host paths running Docker containers bind-mount: a server in a container
-// runs as root, whose open files the sampler cannot read. Without Docker it adds nothing.
-func (r *runner) addContainerUses(ctx context.Context, s *Sample) {
+// runs as root, whose open files the sampler cannot read. Without Docker, or with a daemon that is not running, it
+// adds nothing. A Docker that cannot be asked (its socket's permission, a timeout) is an error: a container may
+// serve what the run would delete.
+func (r *runner) addContainerUses(ctx context.Context, s *Sample) error {
 	ids, err := r.tools.Docker(ctx, 15*time.Second, "ps", "-q")
-	if err != nil || strings.TrimSpace(ids) == "" {
-		return
+	if errors.Is(err, errNoTool) || (err != nil && dockerDown(err)) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(ids) == "" {
+		return nil
 	}
 	out, err := r.tools.Docker(ctx, 30*time.Second, append([]string{"inspect", "--format",
 		"{{.Name}}{{range .Mounts}}\t{{.Source}}{{end}}"}, strings.Fields(ids)...)...)
 	if err != nil {
-		return
+		return err
 	}
 	for _, l := range strings.Split(out, "\n") {
 		f := strings.Split(strings.TrimSpace(l), "\t")
@@ -564,6 +623,13 @@ func (r *runner) addContainerUses(ctx context.Context, s *Sample) {
 			}
 		}
 	}
+	return nil
+}
+
+// dockerDown reports a Docker daemon that is not running: then no container runs.
+func dockerDown(err error) bool {
+	m := err.Error()
+	return strings.Contains(m, "Is the docker daemon running") || strings.Contains(m, "no such file or directory")
 }
 
 // holdsRoot reports whether a path holds one of the rules' roots: a mount of it gives a container every item.

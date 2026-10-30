@@ -75,16 +75,20 @@ func LoadNamed(ctx context.Context, jobs Jobs, cfg NamesConfig, m *Mounts) (*Nam
 	n := &Named{Paths: map[string]string{}, RepoIDs: map[string]string{}}
 	var errs []string
 	addPath := func(job, p string) {
-		if c := m.resolve(p); n.Paths[c] == "" {
-			n.Paths[c] = job
+		// both as written and through its symlinks: a Hugging Face snapshot's file resolves into the shared blob
+		// store, under no item, while its written path is under the repository that holds it
+		for _, c := range []string{m.Canon(filepath.Clean(p)), m.resolve(p)} {
+			if n.Paths[c] == "" {
+				n.Paths[c] = job
+			}
 		}
 	}
 	addText := func(job, text, dir string, follow bool) {
 		for _, w := range words(text) {
 			switch {
 			case filepath.IsAbs(w):
-			case dir != "" && (strings.HasPrefix(w, "./") || strings.HasPrefix(w, "../") ||
-				(strings.Contains(w, "/") && !strings.Contains(w, "://"))):
+			case dir != "" && !strings.Contains(w, "://") && (strings.Contains(w, "/") || exists(filepath.Join(dir, w))):
+				// relative to the job's directory: a path with a slash, or a bare name that is there
 				if isRepoID(w) && n.RepoIDs[w] == "" {
 					n.RepoIDs[w] = job
 				}
@@ -133,7 +137,11 @@ func LoadNamed(ctx context.Context, jobs Jobs, cfg NamesConfig, m *Mounts) (*Nam
 		}
 		for _, l := range strings.Split(tab, "\n") {
 			if l = strings.TrimSpace(l); l != "" && !strings.HasPrefix(l, "#") {
-				addText("crontab", l, cdOf(l), true)
+				dir := cdOf(l)
+				if dir == "" {
+					dir = homeDir() // cron runs a line in the home directory
+				}
+				addText("crontab", l, dir, true)
 			}
 		}
 	}
@@ -151,10 +159,11 @@ func LoadNamed(ctx context.Context, jobs Jobs, cfg NamesConfig, m *Mounts) (*Nam
 				continue
 			}
 			l := filepath.Join(dir, e.Name())
-			if t, err := filepath.EvalSymlinks(l); err == nil {
-				if p := m.Canon(t); n.Paths[p] == "" {
-					n.Paths[p] = "link " + l
+			if t, err := os.Readlink(l); err == nil {
+				if !filepath.IsAbs(t) {
+					t = filepath.Join(dir, t)
 				}
+				addPath("link "+l, t)
 			}
 		}
 	}
@@ -172,6 +181,12 @@ func LoadNamed(ctx context.Context, jobs Jobs, cfg NamesConfig, m *Mounts) (*Nam
 		return n, fmt.Errorf("%s", strings.Join(errs[:min(len(errs), 5)], "; "))
 	}
 	return n, nil
+}
+
+// exists reports whether a path is there.
+func exists(p string) bool {
+	_, err := os.Lstat(p)
+	return err == nil
 }
 
 // cdOf is the directory a shell line changes to before its command (`cd /x && ...`), or "".

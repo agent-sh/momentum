@@ -206,12 +206,15 @@ func words(s string) []string {
 		}
 		return false
 	})
-	// a quoted string is a word too, spaces and all: a path may hold a space
+	// a quoted string is a word too, spaces and all: a path may hold a space; so is its value, in an assignment
 	for _, q := range []string{`"`, `'`} {
 		parts := strings.Split(s, q)
 		for i := 1; i < len(parts); i += 2 {
 			if w := strings.TrimSpace(parts[i]); w != "" && !strings.ContainsAny(w, "\n") {
 				f = append(f, w)
+				if _, v, ok := strings.Cut(w, "="); ok && v != "" {
+					f = append(f, v)
+				}
 			}
 		}
 	}
