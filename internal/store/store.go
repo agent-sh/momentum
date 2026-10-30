@@ -208,8 +208,8 @@ const repairs = `DROP INDEX IF EXISTS events_source`
 
 // legacyVersion is the last version user_version counted. A build of that version drops every derived table, the
 // events among them, when user_version is another number, so user_version stays at it: such a build, opening a
-// store migrated since, finds its own version and drops nothing. A build from before it (user_version 2) drops the
-// events on any other number, so it must not open a store again. The versions since are the steps in schema_steps.
+// store migrated since, finds its own version and drops nothing. A build from before it (user_version 2) drops every
+// event but the sessions' on any other number, so it must not open a store again. The versions since are the steps in schema_steps.
 const legacyVersion = 3
 
 // BusyTimeout is how long a statement waits for another connection's write transaction before it fails, and how
@@ -277,7 +277,7 @@ func latest() int { return steps[len(steps)-1].version }
 
 // version is a store's schema version: the last step it took, or before any, its user_version. A user_version
 // below legacyVersion is the version, whatever schema_steps holds: a build from before version 3 set it, and that
-// build drops every event of a source it reads and keeps the tables it does not know, so the steps since run again.
+// build drops every event but the sessions' and keeps the tables it does not know, so the steps since run again.
 func version(q querier) (int, error) {
 	ctx := context.Background()
 	var v, n int

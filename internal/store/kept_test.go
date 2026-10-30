@@ -178,7 +178,7 @@ func TestClaudeCodeIsNamedClaudeWhoeverWritesIt(t *testing.T) {
 	}
 }
 
-// A build from before version 3, run on a store migrated since, drops the events of the sources it reads and
+// A build from before version 3, run on a store migrated since, drops every event but the sessions' and
 // keeps the tables it does not know: the file cursors, which still say every transcript was read, and the steps.
 // The next open takes its user_version, so the step that reads again runs again and the transcripts come back.
 func TestAStoreABuildFromBeforeVersion3OpenedIsReadAgain(t *testing.T) {
