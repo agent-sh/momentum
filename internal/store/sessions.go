@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"syscall"
 	"time"
 
@@ -136,12 +137,11 @@ func (s *Store) Trackers(build string) *Trackers {
 
 // Checkpoint returns the checkpoint a run of this build saved for a tracker, or nil. The state and its log come
 // from one statement, so from one snapshot: a run saving meanwhile cannot pair this state with its newer log. The
-// statement returns the state once, ahead of the log, and every entry the snapshot holds: a save drops the entries
-// below the base in the transaction that moves it.
+// statement returns the state once, and every entry the snapshot holds: a save drops the entries below the base in
+// the transaction that moves it.
 func (t *Trackers) Checkpoint(ctx context.Context, tool, key string) (*sessions.Checkpoint, error) {
 	rows, err := t.s.db.QueryContext(ctx, `SELECT 0, build, state, log_base, log_seq, 0, '', '', '', '' FROM trackers WHERE tool = ? AND key = ?
-	  UNION ALL SELECT 1, '', NULL, 0, 0, seq, role, name, origin, text FROM tracker_log WHERE tool = ? AND key = ?
-	  ORDER BY 1, 6`, tool, key, tool, key)
+	  UNION ALL SELECT 1, '', NULL, 0, 0, seq, role, name, origin, text FROM tracker_log WHERE tool = ? AND key = ?`, tool, key, tool, key)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +149,11 @@ func (t *Trackers) Checkpoint(ctx context.Context, tool, key string) (*sessions.
 	var build string
 	var st []byte
 	var base, end int
-	var items []sessions.Entry
+	type entry struct {
+		seq int
+		e   sessions.Entry
+	}
+	var log []entry
 	found := false
 	for rows.Next() {
 		var part, seq, b, e int
@@ -162,19 +166,21 @@ func (t *Trackers) Checkpoint(ctx context.Context, tool, key string) (*sessions.
 			found, build, st, base, end = true, bd, blob, b, e
 			continue
 		}
-		if !found {
-			continue // entries without their checkpoint: there is none
-		}
-		if seq != base+len(items) {
-			return nil, fmt.Errorf("its log lacks entry %d", base+len(items))
-		}
-		items = append(items, sessions.Entry{Role: sessions.Role(role), Name: name, Origin: origin, Text: text})
+		log = append(log, entry{seq, sessions.Entry{Role: sessions.Role(role), Name: name, Origin: origin, Text: text}})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	if !found || build != t.build {
 		return nil, nil
+	}
+	sort.Slice(log, func(i, j int) bool { return log[i].seq < log[j].seq }) // the rows come in key order; SQL does not promise it
+	items := make([]sessions.Entry, len(log))
+	for i, x := range log {
+		if x.seq != base+i {
+			return nil, fmt.Errorf("its log lacks entry %d", base+i)
+		}
+		items[i] = x.e
 	}
 	if base+len(items) != end {
 		return nil, fmt.Errorf("its log holds %d entries, not %d", len(items), end-base)
