@@ -97,6 +97,9 @@ func TestHermesListsConversationsAndRunningAutomation(t *testing.T) {
 	if chat.Phase != sessions.Working || chat.PID != 42 || chat.Now != "terminal: restic backup" || chat.Name != "Fix the backup" || chat.Auto {
 		t.Fatalf("chat %+v", chat)
 	}
+	if want := time.UnixMilli(int64(sec(-2*time.Minute) * 1000)); !chat.UserAt.Equal(want) {
+		t.Fatalf("user at %v, want %v", chat.UserAt, want)
+	}
 	if cron := got["hermes:cron1"]; !cron.Auto || cron.Phase != sessions.Working {
 		t.Fatalf("a leased automation run %+v", cron)
 	}
@@ -106,6 +109,34 @@ func TestHermesListsConversationsAndRunningAutomation(t *testing.T) {
 	}
 	if phone.LastText != "Here is the summary." || phone.Name != "Phone chat" {
 		t.Fatalf("phone %+v", phone)
+	}
+}
+
+func TestHermesUserAtIsTheLastUserMessageHoweverLongTheTurn(t *testing.T) {
+	home := t.TempDir()
+	now := time.Unix(fake.Boot+86400, 0)
+	sec := func(d time.Duration) float64 { return float64(now.Add(d).UnixMilli()) / 1000 }
+	db := stateDB(t, home, true)
+	exec(t, db, `INSERT INTO sessions VALUES ('long', 'cli', 'Long turn', '', '/w', 'model-a', ?, NULL, ?, '', 0, 0)`, sec(-time.Hour), sec(-time.Minute))
+	exec(t, db, `INSERT INTO session_turn_leases VALUES ('long', 'pid=42:abc:platform=cli', ?, ?)`, sec(-time.Hour), sec(time.Minute))
+	exec(t, db, `INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('long', 'user', 'sort the inbox', '', ?)`, sec(-30*time.Minute))
+	for i := 0; i < 20; i++ { // more calls and results than the latest messages the facts read
+		exec(t, db, `INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('long', 'assistant', '', ?, ?)`,
+			`[{"function":{"name":"terminal","arguments":"{\"command\":\"ls\"}"}}]`, sec(time.Duration(i-29)*time.Minute))
+		exec(t, db, `INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('long', 'tool', 'ok', '', ?)`, sec(time.Duration(i-29)*time.Minute))
+	}
+	tb, err := proc.Read(fake.ProcRoot(t, fake.Proc{PID: 42, Argv: []string{"hermes"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := New(sessions.Env{HermesHome: home})
+	defer src.Close()
+	ss, err := sessions.Scan(context.Background(), &sessions.World{Now: now, Procs: tb}, src)
+	if err != nil || len(ss) != 1 {
+		t.Fatalf("sessions %v %v", ss, err)
+	}
+	if want := time.UnixMilli(int64(sec(-30*time.Minute) * 1000)); !ss[0].UserAt.Equal(want) {
+		t.Fatalf("user at %v, want %v", ss[0].UserAt, want)
 	}
 }
 

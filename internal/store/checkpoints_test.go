@@ -223,14 +223,17 @@ func TestAnEventsTableFromBeforeGainsItsColumnsAndKeepsItsRows(t *testing.T) {
 func TestRebuildRefusesObservedEvents(t *testing.T) {
 	ctx := context.Background()
 	st, _ := open(t)
-	if _, err := st.Put(ctx, []Event{{Source: Sessions, SourceKey: "s@1", TS: time.Now(), Actor: ActorHarness, Kind: "phase"}}); err != nil {
+	if _, err := st.Put(ctx, []Event{{Source: Sessions, SourceKey: "s@1", TS: time.Now(), Actor: ActorHarness, Kind: "phase"},
+		{Source: Supervise, SourceKey: "s@1#transient#act#1@2", TS: time.Now(), Actor: ActorAgent, Kind: "act"}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.Rebuild(ctx, Sessions, true); !errors.Is(err, ErrObserved) {
-		t.Fatalf("err %v", err)
-	}
-	if evs, _ := st.Events(ctx, Query{Since: time.Unix(0, 0), Source: Sessions}); len(evs) != 1 {
-		t.Fatal("the observed events were dropped")
+	for _, source := range []string{Sessions, Supervise} {
+		if _, err := st.Rebuild(ctx, source, true); !errors.Is(err, ErrObserved) {
+			t.Fatalf("%s: err %v", source, err)
+		}
+		if evs, _ := st.Events(ctx, Query{Since: time.Unix(0, 0), Source: source}); len(evs) != 1 {
+			t.Fatalf("%s: the observed events were dropped", source)
+		}
 	}
 }
 

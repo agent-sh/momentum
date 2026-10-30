@@ -217,8 +217,22 @@ func (src *Source) facts(ctx context.Context, id string, s *sessions.Session) (b
 		if role == "assistant" && strings.TrimSpace(content) != "" && s.LastText == "" {
 			s.LastText = strings.TrimSpace(content)
 		}
+		if role == "user" && s.UserAt.IsZero() {
+			s.UserAt = epoch(at)
+		}
 	}
-	return open, rows.Err()
+	if err := rows.Err(); err != nil || !s.UserAt.IsZero() {
+		return open, err
+	}
+	// A turn longer than the messages read: its user message is further back.
+	var at sql.NullFloat64
+	if err := src.db.QueryRowContext(ctx, `select max(timestamp) from messages where session_id = ? and role = 'user'`+src.active, id).Scan(&at); err != nil {
+		return open, fmt.Errorf("messages: %w", err)
+	}
+	if at.Valid {
+		s.UserAt = epoch(at.Float64)
+	}
+	return open, nil
 }
 
 func toolCalls(raw string) [][2]string {
@@ -327,4 +341,31 @@ func epoch(f float64) time.Time {
 		return time.Time{}
 	}
 	return time.UnixMilli(int64(f * 1000))
+}
+
+// Platforms maps every Hermes conversation in the state database under home to the platform it runs on (its
+// source: cli, tui, mobile, telegram, cron, ...). No database is no conversations.
+func Platforms(ctx context.Context, home string) (map[string]string, error) {
+	path := filepath.Join(home, "state.db")
+	if _, err := os.Stat(path); err != nil {
+		return map[string]string{}, nil
+	}
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(500)")
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, `select id, source from sessions`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var id, source string
+		if rows.Scan(&id, &source) == nil {
+			out[id] = source
+		}
+	}
+	return out, rows.Err()
 }

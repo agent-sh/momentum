@@ -131,6 +131,9 @@ func TestUserMessagesAreLoggedAsUserRoleText(t *testing.T) {
 	if len(items) != 1 || items[0].String() != "USER: ship it" {
 		t.Fatalf("log %+v", items)
 	}
+	if s := facts(tr, r.at); !s.UserAt.Equal(t0.Add(4 * time.Second)) {
+		t.Fatalf("user at %v: the user's message, not the harness's", s.UserAt)
+	}
 }
 
 // state writes a synthetic Codex state database.

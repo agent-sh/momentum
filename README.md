@@ -53,7 +53,21 @@ momentum evidence events --source sessions --since 7d --limit 100000 --json | jq
          minutes: (map(.Meta.for_ms // 0) | add / 60000 | floor), at_least: (map(.Meta.seen_ms // 0) | add / 60000 | floor)})'
 ```
 
-The packages under `sessions/` are exported for boards that show the same sessions.
+The packages under `sessions/` are exported for boards that show the same sessions. One of them, `sessions/act`, types a message into a session's tmux pane or kitty window, or queues it for a Codex thread, and only when the session's process owns the terminal, no dialog or menu shows, and its input line holds nothing typed.
+
+## Supervise
+
+```
+momentum supervise [--dry] [--json]   scan the sessions, then continue the ones that stopped where a rule says it may
+momentum supervise replay [--since WHEN] [--until WHEN] [--labels FILE] [--anchor] [--points FILE]
+                                      run the rules over the store's history, against the owner's own steps
+```
+
+Run after each `momentum sessions` scan (a second `ExecStart` of the sessions unit, the first marked `-` so a failed scan does not skip it), with `momentum evidence ingest` on its own timer every few minutes, it continues sessions that stopped without their owner: a turn that ended on a transient API error (tried again with a backoff, then a case), on an expired login, a usage limit or an organization block (resumed once access works again, or at the reset time the error states), a Hermes reply cut at the model's output limit, a session reopened after it ended mid-task, and a turn that ended on a promise nothing will wake it for. Deterministic rules decide; no model takes part. It never answers a question, a plan or a permission, never acts on an automated run, a session on another machine or a Hermes conversation on a messaging platform, holds while the owner was at the session recently, and sends nothing that reaches his phone. What it leaves to him shows in the report: a needs note for a session that waits on his answer, a problem note for one it could not continue, each marked done when the session moves on. Every message opens with `[momentum]`, and every decision, message and outcome is an event of source `supervise`. Rules that are not live record what they would have sent, tagged experiment `supervise-dry`. `transient` and `access` ship live; to choose otherwise, or to turn it off:
+
+```json
+{"supervise": {"live": ["transient", "access"], "off": false}}
+```
 
 ## Report
 

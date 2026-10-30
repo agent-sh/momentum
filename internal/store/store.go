@@ -773,7 +773,7 @@ func (s *Store) Skipped(ctx context.Context, source string) (int, error) {
 // ErrKept.
 func (s *Store) Rebuild(ctx context.Context, source string, force bool) (int, error) {
 	switch {
-	case source == Sessions:
+	case source == Sessions, source == Supervise:
 		return 0, fmt.Errorf("%s: %w", source, ErrObserved)
 	case source == Transcripts && !force:
 		return 0, fmt.Errorf("%s: %w", source, ErrKept)
