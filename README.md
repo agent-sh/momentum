@@ -27,6 +27,20 @@ Source locations are machine-specific, so momentum ships none. List them in `~/.
 }
 ```
 
+## Sessions
+
+```
+momentum sessions          the live agent sessions and their phases (--json, --all)
+```
+
+It finds Claude Code, Codex, pi, opencode and Hermes sessions from processes, tmux panes, transcripts and the harnesses' own state, with no model call, and keeps when each session entered its phase in the store. Harness locations follow their own variables (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`, `HERMES_HOME`, `PI_CODING_AGENT_DIR`). To name projects by their path under a directory, add it to `sources.json`:
+
+```json
+{"sessions": {"projects": ["~/path/to/code"]}}
+```
+
+The packages under `sessions/` are exported for boards that show the same sessions.
+
 Knowledge stays in [tacit](https://github.com/agent-sh/tacit). Cases, evidence and state stay on the machine, never in this repository.
 
 MIT licensed.

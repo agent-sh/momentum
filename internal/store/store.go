@@ -106,12 +106,23 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
-// schemaVersion is bumped on every change to the schema. Everything in the store today is derived from
-// the sources, so a store at another version is dropped and the next ingest reads every source again.
-// State that cannot be derived (case decisions, once they exist) will need real migrations instead.
+// stateSchema holds what cannot be derived from the sources: it is created when missing and never dropped,
+// so a change to one of these tables needs a real migration, not a version bump.
+//   - session_stamps: when each live session entered its phase (sessions/state), kept between runs.
+const stateSchema = `
+CREATE TABLE IF NOT EXISTS session_stamps (key TEXT PRIMARY KEY, phase TEXT NOT NULL, since INTEGER NOT NULL,
+  seq INTEGER NOT NULL, seen INTEGER NOT NULL);
+`
+
+// schemaVersion is bumped on every change to the derived schema. Everything in it is derived from the
+// sources, so a store at another version drops those tables and the next ingest reads every source again.
+// The state tables (stateSchema) are not touched by that.
 const schemaVersion = 2
 
 func migrate(db *sql.DB) error {
+	if _, err := db.Exec(stateSchema); err != nil {
+		return err
+	}
 	var v int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		return err

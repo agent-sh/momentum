@@ -24,6 +24,11 @@ type Sources struct {
 	Incidents struct {
 		Dir string `json:"dir"`
 	} `json:"incidents"`
+	// Sessions configures the live session board. Harness locations come from the harnesses' own variables
+	// (CLAUDE_CONFIG_DIR, CODEX_HOME, XDG_DATA_HOME, HERMES_HOME, PI_CODING_AGENT_DIR), not from here.
+	Sessions struct {
+		Projects []string `json:"projects"` // directories whose subpaths name a session's project
+	} `json:"sessions"`
 }
 
 // ErrNoSources means no sources file exists yet.
@@ -48,5 +53,8 @@ func Load() (Sources, error) {
 	s.Mistakes.Path = paths.Expand(s.Mistakes.Path)
 	s.Radar.Path = paths.Expand(s.Radar.Path)
 	s.Incidents.Dir = paths.Expand(s.Incidents.Dir)
+	for i, p := range s.Sessions.Projects {
+		s.Sessions.Projects[i] = paths.Expand(p)
+	}
 	return s, nil
 }
