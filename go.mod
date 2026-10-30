@@ -3,7 +3,7 @@ module github.com/agent-sh/momentum
 go 1.27
 
 require (
-	github.com/agent-sh/tacit/client v0.0.0-00010101000000-000000000000
+	github.com/agent-sh/tacit/client v0.0.0-20261030060112-360d34c7c081
 	github.com/klauspost/compress v1.20.3
 	modernc.org/sqlite v1.61.0
 )
@@ -20,5 +20,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
 )
-
-replace github.com/agent-sh/tacit/client => /home/avifenesh/.cache/momentum-m1-transcripts/tacit/client
