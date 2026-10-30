@@ -11,6 +11,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/agent-sh/momentum/internal/store"
 )
 
 // The worktrees rule. A linked worktree is left over when its branch, pushed under its own name, is merged into its
@@ -109,7 +111,7 @@ func (r *runner) worktree(ctx context.Context, w, canon string, heads *remoteHea
 	if newBranch(ctx, w, f.branch) {
 		return f, false // made and never committed to: work about to begin
 	}
-	if newerThan(w, r.now.Add(-quietTime)) {
+	if r.changedIn(ctx, canon, r.now.Add(-quietTime), look) {
 		f.Action, f.Why = ActKeep, "changed in the last "+quietTime.String()
 		return f, true
 	}
@@ -298,7 +300,7 @@ func (r *runner) repoBusy(ctx context.Context, w, canon string, look *Sample) st
 		}
 	}
 	for _, t := range trees {
-		if !bare[t] && r.changedIn(t, r.now.Add(-quietTime), look) {
+		if !bare[t] && r.changedIn(ctx, t, r.now.Add(-quietTime), look) {
 			return fmt.Sprintf("a change in %s in the last %s", short(t), quietTime)
 		}
 	}
@@ -306,35 +308,100 @@ func (r *runner) repoBusy(ctx context.Context, w, canon string, look *Sample) st
 }
 
 // changedIn reports whether someone changed a work tree since a time: an entry made, removed or renamed in one of
-// its directories, or git's own record of it (its index, HEAD and HEAD's log: an add, a commit, a checkout). An
-// agent between two commands runs no process there, but leaves these. A fetch, which writes only under .git's
-// objects and remote refs, is no change. Each tree is looked at once per look.
-func (r *runner) changedIn(tree string, since time.Time, look *Sample) bool {
+// its directories, or git's own record of it (its index and HEAD, and the last entry of HEAD's log: an add, a
+// commit, a checkout). An agent between two commands runs no process there, but leaves these. A fetch writes only
+// under .git's objects and remote refs, and a gc rewrites HEAD's log with its entries kept, so neither is a change.
+// Nor is a change capacity's own deletions made (own). Each tree is looked at once per look.
+func (r *runner) changedIn(ctx context.Context, tree string, since time.Time, look *Sample) bool {
 	key := changeKey{look, tree}
 	if v, ok := r.changed[key]; ok {
 		return v
 	}
 	gitdir := filepath.Join(tree, ".git")
-	if g, ok := isLinkedWorktree(tree); ok {
-		gitdir = g
+	if g, _ := isLinkedWorktree(tree); g != "" {
+		gitdir = g // a linked worktree's, or a main checkout's kept apart (clone --separate-git-dir)
 	}
 	v := false
-	for _, f := range []string{"index", "HEAD", filepath.Join("logs", "HEAD")} {
+	for _, f := range []string{"index", "HEAD"} {
 		if st, err := os.Lstat(filepath.Join(gitdir, f)); err == nil {
 			if s, ok := st.Sys().(*syscall.Stat_t); ok && newest(s).After(since) {
 				v = true
-				break
 			}
 		}
 	}
+	if t, ok := reflogTime(filepath.Join(gitdir, "logs", "HEAD")); !v && ok && t.After(since) {
+		v = true
+	}
 	if !v {
-		v = newerThan(tree, since)
+		own := r.ownDeletions(ctx)
+		v = newerThanBut(tree, since, func(d string, at time.Time) bool {
+			t, ok := own[d]
+			return ok && !at.After(t.Add(time.Second))
+		})
 	}
 	if r.changed == nil {
 		r.changed = map[changeKey]bool{}
 	}
 	r.changed[key] = v
 	return v
+}
+
+// reflogTime is the time of a reflog's last entry ("<old> <new> <name> <<email>> <unix time> <zone>\t<message>"),
+// or the file's own time when its tail cannot be read as one.
+func reflogTime(p string) (time.Time, bool) {
+	f, err := os.Open(p)
+	if err != nil {
+		return time.Time{}, false
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return time.Time{}, false
+	}
+	off := max(0, st.Size()-4096)
+	b := make([]byte, st.Size()-off)
+	if _, err := f.ReadAt(b, off); err == nil {
+		lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+		head, _, _ := strings.Cut(lines[len(lines)-1], "\t")
+		if fs := strings.Fields(head); len(fs) >= 6 {
+			if sec, err := strconv.ParseInt(fs[len(fs)-2], 10, 64); err == nil {
+				return time.Unix(sec, 0), true
+			}
+		}
+	}
+	if s, ok := st.Sys().(*syscall.Stat_t); ok {
+		return newest(s), true
+	}
+	return time.Time{}, false
+}
+
+// ownDeletions are the directories capacity's deletions changed (each deleted path and the directory it was in),
+// with when: this run's, as it makes them, and the recent runs', from their events. A deletion changes its
+// directory as anyone's would; one that changed nothing since was capacity's.
+func (r *runner) ownDeletions(ctx context.Context) map[string]time.Time {
+	if r.own != nil {
+		return r.own
+	}
+	r.own = map[string]time.Time{}
+	if r.st == nil {
+		return r.own
+	}
+	evs, err := r.st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindDelete}, Since: r.now.Add(-quietTime)})
+	if err != nil {
+		return r.own // none known: a repository looks busier, never idler
+	}
+	for _, e := range evs {
+		r.addOwn(r.m.resolve(e.Ref), e.TS)
+	}
+	return r.own
+}
+
+func (r *runner) addOwn(canon string, at time.Time) {
+	for _, d := range []string{canon, filepath.Dir(canon)} {
+		if at.After(r.own[d]) {
+			r.own[d] = at
+		}
+	}
 }
 
 // changeKey is a work tree, as one look judged it.

@@ -93,7 +93,11 @@ func newest(s *syscall.Stat_t) time.Time {
 // newerThan reports whether any directory under p (p among them) changed after t: creating, removing or renaming
 // an entry changes its directory. It reads directories only, so it is the cheap first look before Measure. A .git
 // directory is git's store, not the tree: a fetch writes there.
-func newerThan(p string, t time.Time) bool {
+func newerThan(p string, t time.Time) bool { return newerThanBut(p, t, nil) }
+
+// newerThanBut is newerThan, but a directory whose change explained accounts for, by the directory and the time it
+// changed, does not count; what is under it still does.
+func newerThanBut(p string, t time.Time, explained func(dir string, at time.Time) bool) bool {
 	stack := []string{p}
 	for len(stack) > 0 {
 		d := stack[len(stack)-1]
@@ -102,8 +106,10 @@ func newerThan(p string, t time.Time) bool {
 		if err != nil {
 			continue
 		}
-		if s, ok := st.Sys().(*syscall.Stat_t); ok && newest(s).After(t) {
-			return true
+		if s, ok := st.Sys().(*syscall.Stat_t); ok {
+			if at := newest(s); at.After(t) && (explained == nil || !explained(d, at)) {
+				return true
+			}
 		}
 		ents, err := os.ReadDir(d)
 		if err != nil {

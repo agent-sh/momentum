@@ -15,7 +15,8 @@ import (
 
 // What a run did goes into the store, and into the report through notes (no notification):
 //   - each deletion and prune is an event (kind capacity-delete, capacity-prune) and a decided note that says what
-//     went, its size, since when it was idle, the rule, and how to have it back or keep it;
+//     went, its size, since when it was idle, the rule, and how to have it back or keep it; a prune that removed
+//     nothing is an event only;
 //   - each item only reported is an event (capacity-report), once, and its rule's problem note for that reason
 //     lists them; the note is put again only when an item new to it appears, so a note the owner resolved stays
 //     resolved until the evidence changes, and it is resolved by itself when the rule finds none;
@@ -53,13 +54,14 @@ func (r *runner) recordDone(ctx context.Context, f *Finding) error {
 		kind = KindPrune
 	}
 	e := r.event(kind, *f, fmt.Sprintf("%s/%s/%s/%d", kind, f.Rule, keyPath(*f), r.now.UnixMilli()), store.ActorAgent)
+	e.TS = r.opt.Clock() // when it went: a later run tells its own change to a directory from someone's by it
 	if _, err := r.st.Put(ctx, []store.Event{e}); err != nil {
 		return err
 	}
 	if f.none { // the event keeps that it ran; a note of nothing deleted would only crowd the decided list
 		return nil
 	}
-	_, err := r.st.PutNote(ctx, decidedNote(e, *f, r.now))
+	_, err := r.st.PutNote(ctx, decidedNote(e, *f, e.TS))
 	return err
 }
 
@@ -416,8 +418,12 @@ func summary(kind string, f Finding) string {
 // decidedNote is a deletion's or a prune's note.
 func decidedNote(e store.Event, f Finding, now time.Time) store.Note {
 	title := fmt.Sprintf("Deleted %s %s (%s)", ruleText[f.Rule], short(f.Path), gib(f.Bytes))
+	effect := "Freed " + gib(f.Freed)
 	if f.Rule == RuleUV || f.Rule == RuleDocker {
 		title = fmt.Sprintf("Pruned %s: %s", f.Path, gib(f.Freed))
+	}
+	if f.unsaid {
+		title, effect = "Pruned "+f.Path, "Freed an amount the tool did not print"
 	}
 	var detail []string
 	if f.Detail != "" {
@@ -428,7 +434,7 @@ func decidedNote(e store.Event, f Finding, now time.Time) store.Note {
 	}
 	detail = append(detail, "Rule "+f.Rule+".", overrides[f.Rule])
 	return store.Note{ID: "capacity:deleted:" + e.ID(), Kind: store.NoteDecided, Title: title, Detail: strings.Join(detail, " "),
-		Effect: "Freed " + gib(f.Freed), Source: store.Capacity, Importance: store.ImportanceNormal, At: now}
+		Effect: effect, Source: store.Capacity, Importance: store.ImportanceNormal, At: now}
 }
 
 // groupTitles say what a rule's report-only items of one reason are.

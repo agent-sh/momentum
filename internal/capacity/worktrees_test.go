@@ -2,11 +2,14 @@ package capacity
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/agent-sh/momentum/internal/store"
 )
 
 // worktreesFixture is a remote, a clone of it, and linked worktrees of the clone in every state.
@@ -139,6 +142,8 @@ func TestAWorktreeChangedWithinTheHourOrInUseStays(t *testing.T) {
 	_, wts := worktreesFixture(t)
 	now := time.Now().Add(2 * time.Hour)
 	must(t, os.Chtimes(filepath.Join(wts, "merged"), now, now.Add(-10*time.Minute)))
+	// an add in squashed itself: git's index changed, no directory did
+	must(t, os.Chtimes(filepath.Join(filepath.Dir(wts), "clone/.git/worktrees/squashed/index"), now, now.Add(-10*time.Minute)))
 	proc := procRoot(t, fakeProc{pid: 3, ppid: 1, argv: []string{"bash"}, cwd: filepath.Join(wts, "gone")})
 	cfg := Config{Worktrees: WorktreesConfig{Roots: []string{wts}}}.Normal()
 	cfg.Live = []string{RuleWorktrees}
@@ -150,7 +155,10 @@ func TestAWorktreeChangedWithinTheHourOrInUseStays(t *testing.T) {
 	if f := got[filepath.Join(wts, "merged")]; f.Action != ActKeep {
 		t.Errorf("a worktree changed 10 minutes ago stays: %+v", f)
 	}
-	for _, name := range []string{"merged", "gone"} {
+	if f := got[filepath.Join(wts, "squashed")]; f.Action != ActKeep || f.Why != "changed in the last 1h0m0s" {
+		t.Errorf("a worktree whose own index changed 10 minutes ago stays, for that: %+v", f)
+	}
+	for _, name := range []string{"merged", "gone", "squashed"} {
 		if _, err := os.Stat(filepath.Join(wts, name)); err != nil {
 			t.Errorf("%s was removed", name)
 		}
@@ -162,14 +170,16 @@ func TestAWorktreeOfARepositorySomeoneWorksInStays(t *testing.T) {
 		name     string
 		proc     []fakeProc
 		sessions map[int]Session
-		touch    string // a path under the fixture changed 10 minutes ago
+		change   func(t *testing.T, base string, now time.Time) // what someone did 10 minutes ago
 	}{
-		{"a shell in the main checkout", []fakeProc{{pid: 3, ppid: 1, argv: []string{"bash"}}}, nil, ""},
-		{"an agent session in another worktree", nil, map[int]Session{-1: {Key: "s9", Name: "fixing", Tool: "codex"}}, ""},
+		{"a shell in the main checkout", []fakeProc{{pid: 3, ppid: 1, argv: []string{"bash"}}}, nil, nil},
+		{"an agent session in another worktree", nil, map[int]Session{-1: {Key: "s9", Name: "fixing", Tool: "codex"}}, nil},
 		// an agent between two commands runs nothing there, but its last command changed something
-		{"a file made in another worktree 10 minutes ago", nil, nil, "cache/ahead"},
-		{"a commit in the main checkout 10 minutes ago", nil, nil, "clone/.git/logs/HEAD"},
-		{"an add in another worktree 10 minutes ago", nil, nil, "clone/.git/worktrees/gone/index"},
+		{"a file made in another worktree 10 minutes ago", nil, nil, touched("cache/ahead")},
+		{"a commit in the main checkout 10 minutes ago", nil, nil, func(t *testing.T, base string, now time.Time) {
+			logged(t, filepath.Join(base, "clone/.git/logs/HEAD"), now.Add(-10*time.Minute))
+		}},
+		{"an add in another worktree 10 minutes ago", nil, nil, touched("clone/.git/worktrees/gone/index")},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			clone, wts := worktreesFixture(t)
@@ -181,8 +191,8 @@ func TestAWorktreeOfARepositorySomeoneWorksInStays(t *testing.T) {
 				c.sessions[k] = s
 			}
 			now := time.Now().Add(2 * time.Hour)
-			if c.touch != "" {
-				must(t, os.Chtimes(filepath.Join(filepath.Dir(clone), c.touch), now, now.Add(-10*time.Minute)))
+			if c.change != nil {
+				c.change(t, filepath.Dir(clone), now)
 			}
 			cfg := Config{Worktrees: WorktreesConfig{Roots: []string{wts}}}.Normal()
 			cfg.Live = []string{RuleWorktrees}
@@ -203,7 +213,25 @@ func TestAWorktreeOfARepositorySomeoneWorksInStays(t *testing.T) {
 	}
 }
 
-func TestAFetchInTheRepositoryIsNoOneAtWork(t *testing.T) {
+// touched is a change to a path under the fixture 10 minutes before the run.
+func touched(rel string) func(*testing.T, string, time.Time) {
+	return func(t *testing.T, base string, now time.Time) {
+		must(t, os.Chtimes(filepath.Join(base, rel), now, now.Add(-10*time.Minute)))
+	}
+}
+
+// logged appends an entry made at a time to a reflog, as a commit or a checkout does.
+func logged(t *testing.T, reflog string, at time.Time) {
+	t.Helper()
+	f, err := os.OpenFile(reflog, os.O_APPEND|os.O_WRONLY, 0o644)
+	must(t, err)
+	zero := strings.Repeat("0", 40)
+	_, err = fmt.Fprintf(f, "%s %s T <t@example.com> %d +0000\tcommit: x\n", zero, zero, at.Unix())
+	must(t, err)
+	must(t, f.Close())
+}
+
+func TestAFetchOrAGcInTheRepositoryIsNoOneAtWork(t *testing.T) {
 	for _, bare := range []bool{false, true} {
 		clone, wts := worktreesFixture(t)
 		hub := clone
@@ -227,8 +255,13 @@ func TestAFetchInTheRepositoryIsNoOneAtWork(t *testing.T) {
 		if bare {
 			store = hub
 		}
-		for _, p := range []string{store, filepath.Join(store, "objects"), filepath.Join(store, "refs", "remotes", "origin")} {
-			must(t, os.Chtimes(p, now, now.Add(-10*time.Minute)))
+		// a fetch writes the objects and the remote refs; a gc rewrites every HEAD log with its entries kept
+		logs, _ := filepath.Glob(filepath.Join(store, "worktrees", "*", "logs", "HEAD"))
+		logs = append(logs, filepath.Join(store, "logs", "HEAD"))
+		for _, p := range append(logs, store, filepath.Join(store, "objects"), filepath.Join(store, "refs", "remotes", "origin")) {
+			if _, err := os.Stat(p); err == nil {
+				must(t, os.Chtimes(p, now, now.Add(-10*time.Minute)))
+			}
 		}
 		cfg := Config{Worktrees: WorktreesConfig{Roots: []string{wts}}}.Normal()
 		cfg.Live = []string{RuleWorktrees}
@@ -241,7 +274,83 @@ func TestAFetchInTheRepositoryIsNoOneAtWork(t *testing.T) {
 			name = "hubbed"
 		}
 		if f := findings(res, RuleWorktrees)[filepath.Join(wts, name)]; f.Action != ActDelete || !f.Done {
-			t.Errorf("bare %v: a fetch 10 minutes ago is no one at work: %+v", bare, f)
+			t.Errorf("bare %v: a fetch and a gc 10 minutes ago are no one at work: %+v", bare, f)
 		}
+	}
+}
+
+func TestCapacitysOwnDeletionsAreNoOneAtWork(t *testing.T) {
+	now := time.Now().Add(2 * time.Hour)
+	ctx := context.Background()
+	st := openStore(t)
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	must(t, err)
+	someone, ours, earlier := filepath.Join(base, "someone"), filepath.Join(base, "ours"), filepath.Join(base, "earlier")
+	for _, d := range []string{someone, ours, earlier} {
+		must(t, os.MkdirAll(d, 0o755))
+		must(t, os.Chtimes(d, now, now.Add(-10*time.Minute)))
+	}
+	// an earlier run deleted earlier/target 10 minutes ago, and recorded it
+	_, err = st.Put(ctx, []store.Event{{Source: store.Capacity, SourceKey: "d1", TS: now.Add(-10 * time.Minute),
+		Actor: store.ActorAgent, Kind: KindDelete, Summary: "x", Ref: filepath.Join(earlier, "target")}})
+	must(t, err)
+	r := &runner{now: now, st: st, m: ReadMounts("")}
+	r.ownDeletions(ctx)
+	r.addOwn(filepath.Join(ours, "target"), now.Add(-10*time.Minute)) // this run deleted ours/target
+	look, since := &Sample{}, now.Add(-quietTime)
+	if !r.changedIn(ctx, someone, since, look) {
+		t.Error("someone's change 10 minutes ago is a change")
+	}
+	if r.changedIn(ctx, ours, since, look) {
+		t.Error("this run's own deletion is no one at work")
+	}
+	if r.changedIn(ctx, earlier, since, look) {
+		t.Error("an earlier run's recorded deletion is no one at work")
+	}
+	must(t, os.Chtimes(ours, now, now.Add(-5*time.Minute)))
+	if !(&runner{now: now, own: r.own, m: r.m}).changedIn(ctx, ours, since, look) {
+		t.Error("a change after capacity's own is someone's")
+	}
+}
+
+func TestAMainCheckoutWithItsGitDirApartIsReadThere(t *testing.T) {
+	now := time.Now().Add(2 * time.Hour)
+	base := t.TempDir()
+	tree, apart := filepath.Join(base, "tree"), filepath.Join(base, "apart.git")
+	write(t, filepath.Join(tree, ".git"), "gitdir: "+apart+"\n")
+	write(t, filepath.Join(apart, "index"), "x")
+	must(t, os.Chtimes(filepath.Join(apart, "index"), now, now.Add(-10*time.Minute)))
+	r := &runner{now: now, m: ReadMounts("")}
+	if !r.changedIn(context.Background(), tree, now.Add(-quietTime), &Sample{}) {
+		t.Error("an add 10 minutes ago in a checkout cloned with --separate-git-dir is a change")
+	}
+}
+
+func TestCapacitysOwnDeletionInAWorktreeDoesNotHoldTheRepositorysLeftovers(t *testing.T) {
+	_, wts := worktreesFixture(t)
+	local := filepath.Join(wts, "local") // work in progress, with a build of its own
+	target := filepath.Join(local, "target")
+	write(t, filepath.Join(local, ".gitignore"), "target/\n")
+	write(t, filepath.Join(target, "CACHEDIR.TAG"), cargoTag+"\n# This file is a cache directory tag created by cargo.\n")
+	write(t, filepath.Join(target, ".rustc_info.json"), "{}")
+	blob(t, filepath.Join(target, "debug", "app"), 2<<20)
+	now := time.Now().Add(49 * time.Hour)
+	cfg := Config{Worktrees: WorktreesConfig{Roots: []string{wts}}, Targets: TargetsConfig{Roots: []string{wts}}}.Normal()
+	cfg.Live = []string{RuleTargets, RuleWorktrees}
+	o := options(t, procRoot(t), now, nil)
+	o.afterDelete = func(f Finding) {
+		if f.Rule == RuleTargets { // the deletion changes the directory it was in, at the run's time
+			must(t, os.Chtimes(filepath.Dir(f.Path), now, now))
+		}
+	}
+	res, err := Run(context.Background(), cfg, openStore(t), o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f := findings(res, RuleTargets)[target]; !f.Done {
+		t.Fatalf("the idle build goes first: %+v", f)
+	}
+	if f := findings(res, RuleWorktrees)[filepath.Join(wts, "merged")]; !f.Done {
+		t.Errorf("capacity's own deletion in another worktree is no one at work there: %+v", f)
 	}
 }

@@ -41,7 +41,8 @@ type Finding struct {
 	blobs        []string  // a model's shared-store blobs that go with it, canonical
 	linked       []string  // every shared-store blob a model links, canonical
 	class        string    // why a report-only finding is reported, as a word: its note's group
-	none         bool      // a prune that freed nothing, as measured or as the tool says: no decided note
+	none         bool      // a prune that removed nothing, as the tool lists it or uv counts it: no decided note
+	unsaid       bool      // a prune whose tool did not say what it freed
 }
 
 // The actions a finding can have.
@@ -133,6 +134,8 @@ type Options struct {
 	Writes func() map[int]int64
 	// beforeAct runs between the judgments and the deletions: a test's way into that gap.
 	beforeAct func()
+	// afterDelete runs after each deletion: a test's way to have the deletion's own change happen on its clock.
+	afterDelete func(Finding)
 }
 
 type runner struct {
@@ -168,6 +171,7 @@ type runner struct {
 	dockerAsked   bool                 // whether this run asked Docker (only when a rule scans)
 	heads         *remoteHeads         // the remotes' branches, asked once per run
 	changed       map[changeKey]bool   // whether a work tree changed in the last quietTime, per look
+	own           map[string]time.Time // the directories this run's and recent runs' deletions changed, and when
 	res           *Result
 }
 
