@@ -1,7 +1,12 @@
 package term_test
 
 import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/agent-sh/momentum/sessions/internal/fake"
 	"github.com/agent-sh/momentum/sessions/term"
@@ -39,5 +44,30 @@ func TestKittyEnvReadsTheInheritedWindow(t *testing.T) {
 	}
 	if l, w, p := term.KittyEnv(root, 8); l != "" || w != "" || p != 0 {
 		t.Fatal("a missing process has no kitty window")
+	}
+}
+
+// fakeTmux puts a tmux on PATH that runs script.
+func fakeTmux(t *testing.T, script string) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "tmux"), []byte("#!/bin/sh\n"+script+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// No tmux server is no panes; a tmux that does not answer by the caller's deadline is an error, not an empty list.
+func TestATmuxThatDoesNotAnswerIsAnError(t *testing.T) {
+	fakeTmux(t, `echo "no server running on /x" >&2; exit 1`)
+	if ps, err := term.ListPanes(context.Background()); err != nil || ps != nil {
+		t.Fatalf("no server: %v %v", ps, err)
+	}
+	fakeTmux(t, `exec sleep 30`)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := term.ListPanes(ctx); !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 5*time.Second {
+		t.Fatalf("a tmux that hangs: %v after %v", err, time.Since(start))
 	}
 }

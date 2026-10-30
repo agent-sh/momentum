@@ -16,6 +16,7 @@ import (
 
 	"github.com/agent-sh/momentum/internal/config"
 	"github.com/agent-sh/momentum/internal/paths"
+	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
 	"github.com/agent-sh/momentum/sessions"
 	"github.com/agent-sh/momentum/sessions/claude"
@@ -101,20 +102,7 @@ func observe(ctx context.Context, st *store.Store, wait time.Duration, snapshot 
 // err is a store failure.
 func board(ctx context.Context, w *sessions.World, snapErr error, st *store.Store, build string, srcs []sessions.Source) (ss []*sessions.Session, scanErr, err error) {
 	trackers := st.Trackers(build)
-	errs := []error{snapErr}
-	var failed []string
-	for _, src := range srcs {
-		if r, ok := src.(sessions.Resumable); ok {
-			r.Resume(trackers)
-		}
-		found, err := sessions.Scan(ctx, w, src)
-		ss = append(ss, found...)
-		if err != nil || snapErr != nil {
-			failed = append(failed, src.Tool())
-		}
-		errs = append(errs, err)
-	}
-	scanErr = errors.Join(errs...)
+	ss, failed, scanErr, _ := scanAll(ctx, w, snapErr, trackers, srcs, time.Time{})
 	var cps []sessions.Checkpoint
 	for _, src := range srcs {
 		if r, ok := src.(sessions.Resumable); ok {
@@ -147,6 +135,74 @@ func board(ctx context.Context, w *sessions.World, snapErr error, st *store.Stor
 		return ss[i].Since.Before(ss[j].Since)
 	})
 	return ss, scanErr, nil
+}
+
+// scanAll is the scan every look at the sessions makes, a sessions run's and a report's: each source over one
+// snapshot, its trackers resuming from the checkpoints saved hands out. A source that fails, or every source when the
+// snapshot is incomplete (snapErr), is named in failed, and what it read still counts. Without a deadline the sources
+// run in turn. With one they run at once, each in its own goroutine, so one that hangs holds up no other; a source not
+// done by the deadline counts as failed, its sessions are left out, and the scan's context is cancelled, which stops
+// the harnesses' commands. cut holds the indexes of the sources the deadline left reading, which the caller must not
+// close while the process lives. scanErr names what failed.
+func scanAll(ctx context.Context, w *sessions.World, snapErr error, saved sessions.Saved, srcs []sessions.Source, deadline time.Time) (ss []*sessions.Session, failed []string, scanErr error, cut []int) {
+	type result struct {
+		found []*sessions.Session
+		err   error
+	}
+	scan := func(ctx context.Context, src sessions.Source) result {
+		if r, ok := src.(sessions.Resumable); ok {
+			r.Resume(saved)
+		}
+		found, err := sessions.Scan(ctx, w, src)
+		return result{found, err}
+	}
+	errs := []error{snapErr}
+	take := func(src sessions.Source, r result) {
+		ss = append(ss, r.found...)
+		if r.err != nil || snapErr != nil {
+			failed = append(failed, src.Tool())
+		}
+		errs = append(errs, r.err)
+	}
+	late := func(src sessions.Source, why string) {
+		failed = append(failed, src.Tool())
+		errs = append(errs, fmt.Errorf("%s: %s", src.Tool(), why))
+	}
+	if deadline.IsZero() {
+		for _, src := range srcs {
+			take(src, scan(ctx, src))
+		}
+		return ss, failed, errors.Join(errs...), nil
+	}
+	if !time.Now().Before(deadline) { // the snapshot took the scan's time
+		for _, src := range srcs {
+			late(src, "not scanned: the snapshot ran past the scan's deadline")
+		}
+		return ss, failed, errors.Join(errs...), nil
+	}
+	sctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	results := make([]chan result, len(srcs))
+	for i, src := range srcs {
+		results[i] = make(chan result, 1)
+		go func() { results[i] <- scan(sctx, src) }()
+	}
+	for i, src := range srcs { // in the sources' order, whichever finishes first
+		select {
+		case r := <-results[i]:
+			take(src, r)
+			continue
+		case <-sctx.Done():
+		}
+		select {
+		case r := <-results[i]: // done by the deadline all the same
+			take(src, r)
+		default:
+			late(src, "not done by the scan's deadline")
+			cut = append(cut, i)
+		}
+	}
+	return ss, failed, errors.Join(errs...), cut
 }
 
 // buildID names this build of momentum for its trackers' checkpoints, which are only valid for the code that
@@ -307,14 +363,9 @@ func printBoard(out io.Writer, ss []*sessions.Session, now time.Time, asJSON, al
 	return nil
 }
 
-// oneLine folds whitespace and clips to n runes.
-func oneLine(s string, n int) string {
-	s = strings.Join(strings.Fields(s), " ")
-	if r := []rune(s); len(r) > n {
-		return string(r[:n-1]) + "…"
-	}
-	return s
-}
+// oneLine is text as momentum shows it: plain (package plain), so what agents write cannot act on a terminal or
+// reorder what a view shows, and clipped to n characters.
+func oneLine(s string, n int) string { return plain.Clip(plain.Line(s), n) }
 
 // ago is a short age: 45s, 12m, 3h05m, 4d; "?" for an unknown time.
 func ago(t, now time.Time) string {
