@@ -395,6 +395,9 @@ func (r *runner) event(kind string, f Finding, key string, actor store.Actor) st
 	if !f.Seen.IsZero() {
 		meta["seen"] = f.Seen.Format(time.RFC3339)
 	}
+	if len(f.ownDirs) > 0 {
+		meta["own"] = f.ownDirs // the directories a later run may take as changed by this deletion (explainable)
+	}
 	for k, v := range map[string]string{"why": f.Why, "detail": f.Detail, "error": f.Err, "class": f.class, "branch": f.branch} {
 		if v != "" {
 			meta[k] = v
@@ -408,7 +411,14 @@ func (r *runner) event(kind string, f Finding, key string, actor store.Actor) st
 func summary(kind string, f Finding) string {
 	switch kind {
 	case KindDelete, KindPrune:
-		return fmt.Sprintf("%s %s: %s, freed %s", ruleText[f.Rule], short(f.Path), gib(f.Bytes), gib(f.Freed))
+		size, freed := gib(f.Bytes), gib(f.Freed)
+		if f.unsized {
+			size = "size unknown"
+		}
+		if f.unsaid {
+			freed = "an amount the tool did not print"
+		}
+		return fmt.Sprintf("%s %s: %s, freed %s", ruleText[f.Rule], short(f.Path), size, freed)
 	case KindFailed:
 		return fmt.Sprintf("could not delete %s %s: %s", ruleText[f.Rule], short(f.Path), f.Err)
 	}

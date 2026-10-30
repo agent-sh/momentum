@@ -239,6 +239,9 @@ func TestAPruneThatCanFreeNothingDoesNotRunAndOneThatRemovedNothingIsNoNote(t *t
 		// a size that cannot be read is no reason to stop Docker's own prune
 		{"du fails", "ERR", "Total:\t1GB\n", true, 1, "Freed 954 MiB"},
 		{"du prints nothing this build reads", "ID  RECLAIMABLE  SIZE\nx  true  1GB\n", "Total:\t1GB\n", true, 1, "Freed 954 MiB"},
+		// the line it cannot read may be the child that holds the old base
+		{"du prints a line this build cannot read", `{"ID":"base","LastUsedAt":"30 days ago","Reclaimable":true,"Shared":false,"Size":"1GB","Type":"regular"}
+{"ID":"child","Parents":["base"],"LastUsedAt":2}`, "Total:\t0B\n", true, 0, ""},
 	} {
 		var ran []string
 		tools := fakeTools{ran: &ran, answers: map[string]string{"uv": "ERR", "docker info": "29.0.0\n", "docker builder du": c.du,
@@ -255,12 +258,18 @@ func TestAPruneThatCanFreeNothingDoesNotRunAndOneThatRemovedNothingIsNoNote(t *t
 		if got := strings.Contains(strings.Join(ran, "\n"), "builder prune"); got != c.runs {
 			t.Errorf("%s: pruned %v", c.name, got)
 		}
-		if f := findings(res, RuleDocker)["docker build cache"]; c.runs && c.du == "ERR" && !strings.Contains(f.Detail, "size unknown") {
+		unknown := c.du == "ERR" || strings.Contains(c.name, "this build")
+		if f := findings(res, RuleDocker)["docker build cache"]; unknown && !strings.Contains(f.Detail, "size unknown") {
 			t.Errorf("%s: says its size is unknown: %+v", c.name, f)
 		}
 		evs, err := st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindPrune}})
 		if err != nil || len(evs) != map[bool]int{true: 1}[c.runs] {
 			t.Errorf("%s: a prune that ran is an event: %d %v", c.name, len(evs), err)
+		}
+		for _, e := range evs {
+			if unknown != strings.Contains(e.Summary, "size unknown") || (c.said == "") != strings.Contains(e.Summary, "did not print") {
+				t.Errorf("%s: the event says what is not known: %s", c.name, e.Summary)
+			}
 		}
 		ns, err := st.Notes(ctx)
 		if err != nil {

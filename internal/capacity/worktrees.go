@@ -2,9 +2,12 @@ package capacity
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -346,6 +349,8 @@ func (r *runner) changedIn(ctx context.Context, tree string, since time.Time, lo
 	return v
 }
 
+var zoneRe = regexp.MustCompile(`^[+-][0-9]{4}$`)
+
 // reflogTime is the time of a reflog's last entry ("<old> <new> <name> <<email>> <unix time> <zone>\t<message>"),
 // or the file's own time when its tail cannot be read as one.
 func reflogTime(p string) (time.Time, bool) {
@@ -358,14 +363,18 @@ func reflogTime(p string) (time.Time, bool) {
 	if err != nil {
 		return time.Time{}, false
 	}
-	off := max(0, st.Size()-4096)
+	off := max(0, st.Size()-64<<10)
 	b := make([]byte, st.Size()-off)
 	if _, err := f.ReadAt(b, off); err == nil {
 		lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
-		head, _, _ := strings.Cut(lines[len(lines)-1], "\t")
-		if fs := strings.Fields(head); len(fs) >= 6 {
-			if sec, err := strconv.ParseInt(fs[len(fs)-2], 10, 64); err == nil {
-				return time.Unix(sec, 0), true
+		// the last entry whole (its start in the window), and its header as git writes it
+		if len(lines) > 1 || off == 0 {
+			head, _, _ := strings.Cut(lines[len(lines)-1], "\t")
+			fs := strings.Fields(head)
+			if n := len(fs); n >= 6 && strings.HasSuffix(fs[n-3], ">") && zoneRe.MatchString(fs[n-1]) {
+				if sec, err := strconv.ParseInt(fs[n-2], 10, 64); err == nil {
+					return time.Unix(sec, 0), true
+				}
 			}
 		}
 	}
@@ -375,9 +384,9 @@ func reflogTime(p string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// ownDeletions are the directories capacity's deletions changed (each deleted path and the directory it was in),
-// with when: this run's, as it makes them, and the recent runs', from their events. A deletion changes its
-// directory as anyone's would; one that changed nothing since was capacity's.
+// ownDeletions are the directories capacity's deletions changed, with when: this run's, as it makes them, and the
+// last hour's, from their events (an event without the list, from an older build, explains nothing). A deletion
+// changes its directory as anyone's would; one that changed nothing since was capacity's.
 func (r *runner) ownDeletions(ctx context.Context) map[string]time.Time {
 	if r.own != nil {
 		return r.own
@@ -386,22 +395,51 @@ func (r *runner) ownDeletions(ctx context.Context) map[string]time.Time {
 	if r.st == nil {
 		return r.own
 	}
-	evs, err := r.st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindDelete}, Since: r.now.Add(-quietTime)})
+	evs, err := r.st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindDelete}, Since: r.now.Add(-quietTime),
+		Limit: math.MaxInt32})
 	if err != nil {
 		return r.own // none known: a repository looks busier, never idler
 	}
 	for _, e := range evs {
-		r.addOwn(r.m.resolve(e.Ref), e.TS)
+		var m struct {
+			Own []string `json:"own"`
+		}
+		if json.Unmarshal([]byte(e.Meta), &m) == nil {
+			for _, d := range m.Own {
+				r.addOwnDir(d, e.TS)
+			}
+		}
 	}
 	return r.own
 }
 
-func (r *runner) addOwn(canon string, at time.Time) {
-	for _, d := range []string{canon, filepath.Dir(canon)} {
-		if at.After(r.own[d]) {
-			r.own[d] = at
+func (r *runner) addOwnDir(d string, at time.Time) {
+	if at.After(r.own[d]) {
+		r.own[d] = at
+	}
+}
+
+// explainable are the directories a deletion of p will change (p, and the directory it is in) that may then be
+// taken as capacity's own: those whose last change is older than quietTime, or capacity's already. A directory
+// someone changed within the hour stays someone's change after the deletion, which hides its time.
+func (r *runner) explainable(ctx context.Context, p string) []string {
+	own, since := r.ownDeletions(ctx), r.now.Add(-quietTime)
+	var out []string
+	for _, d := range []string{p, filepath.Dir(p)} {
+		st, err := os.Lstat(d)
+		if err != nil {
+			continue
+		}
+		s, ok := st.Sys().(*syscall.Stat_t)
+		if !ok {
+			continue
+		}
+		at := newest(s)
+		if t, ok := own[d]; !at.After(since) || (ok && !at.After(t.Add(time.Second))) {
+			out = append(out, d)
 		}
 	}
+	return out
 }
 
 // changeKey is a work tree, as one look judged it.
