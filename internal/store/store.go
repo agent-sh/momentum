@@ -98,7 +98,7 @@ type querier interface {
 // Kept tables hold what cannot be read again: every event, and when each live session entered its phase. A
 // schema change migrates them and never drops them. A kept table that is missing is made with the columns it was
 // first made with (keptTables), it gains each later column it lacks (keptColumns), and its rows change only in a
-// step or a repair.
+// step or by its triggers (keptTriggers).
 //
 // Derived tables hold what the sources and the session trackers derived from what they read: where each source
 // stopped (with tacit's saved reader state), the files it parsed, what it could not parse, and the trackers'
@@ -143,6 +143,17 @@ CREATE INDEX IF NOT EXISTS events_key ON events(source, source_key);
 
 var keptIndexNames = []string{"events_ts", "events_kind", "events_session", "events_key"}
 
+// keptTriggers give Claude Code its one name as an event is written, by whatever build writes it: a build from
+// before the events were kept writes claude-code, also while this build has the store open.
+const keptTriggers = `
+CREATE TRIGGER IF NOT EXISTS events_harness_insert AFTER INSERT ON events WHEN NEW.harness = 'claude-code'
+BEGIN UPDATE events SET harness = 'claude' WHERE rowid = NEW.rowid; END;
+CREATE TRIGGER IF NOT EXISTS events_harness_update AFTER UPDATE OF harness ON events WHEN NEW.harness = 'claude-code'
+BEGIN UPDATE events SET harness = 'claude' WHERE rowid = NEW.rowid; END;
+`
+
+var keptTriggerNames = []string{"events_harness_insert", "events_harness_update"}
+
 // derivedSchema makes the derived tables that are missing.
 const derivedSchema = `
 CREATE TABLE IF NOT EXISTS cursors (source TEXT PRIMARY KEY, position TEXT NOT NULL, updated INTEGER NOT NULL);
@@ -185,15 +196,15 @@ var steps = []step{
 	{version: 3, reread: true},
 	// The events are kept (keptTables, keptColumns), and a record's events are found by their keys (events_key,
 	// which serves what events_source served). Nothing is read again. Every harness has one name, tacit's
-	// reader's: the repairs rename Claude Code's events to claude, and drop events_source.
-	{version: 4},
+	// reader's: Claude Code's events are renamed claude, and keptTriggers name those written later.
+	{version: 4, sql: `UPDATE events SET harness = 'claude' WHERE harness = 'claude-code'`},
 }
 
 // repairs run in every migration, after the steps. They put right what a build from before the events were kept
 // does to a store migrated since: it makes events_source again, an index no build since reads, which costs every
-// write, and it writes Claude Code by its old name. current reports a store that holds events_source as not
-// current, so the next open after such a build runs them: one pass over the events.
-const repairs = `DROP INDEX IF EXISTS events_source; UPDATE events SET harness = 'claude' WHERE harness = 'claude-code'`
+// write. current reports a store that holds events_source as not current, so the next open after such a build
+// runs them. What that build writes, keptTriggers name.
+const repairs = `DROP INDEX IF EXISTS events_source`
 
 // legacyVersion is the last version user_version counted. A build of that version drops every derived table, the
 // events among them, when user_version is another number, so user_version stays at it: such a build, opening a
@@ -264,12 +275,14 @@ var checkpointColumns = map[string][]string{
 // latest is this build's schema version: its last step's.
 func latest() int { return steps[len(steps)-1].version }
 
-// version is a store's schema version: the last step it took, or before any, its user_version.
+// version is a store's schema version: the last step it took, or before any, its user_version. A user_version
+// below legacyVersion is the version, whatever schema_steps holds: a build from before version 3 set it, and that
+// build drops every event of a source it reads and keeps the tables it does not know, so the steps since run again.
 func version(q querier) (int, error) {
 	ctx := context.Background()
 	var v, n int
-	if err := q.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&v); err != nil {
-		return 0, err
+	if err := q.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&v); err != nil || v < legacyVersion {
+		return v, err
 	}
 	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_steps'`).Scan(&n); err != nil || n == 0 {
 		return v, err
@@ -311,7 +324,7 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
-	if _, err := tx.Exec(keptIndexes); err != nil {
+	if _, err := tx.Exec(keptIndexes + keptTriggers); err != nil {
 		return err
 	}
 	var pending []step
@@ -335,7 +348,7 @@ func migrate(db *sql.DB) error {
 				return fmt.Errorf("step %d: %w", s.version, err)
 			}
 		}
-		if _, err := tx.Exec(`INSERT INTO schema_steps (version, at) VALUES (?, ?)`, s.version, now); err != nil {
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO schema_steps (version, at) VALUES (?, ?)`, s.version, now); err != nil {
 			return err
 		}
 	}
@@ -373,7 +386,7 @@ func current(q querier) (bool, error) {
 	if err := q.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&uv); err != nil || uv != legacyVersion {
 		return false, err
 	}
-	rows, err := q.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type IN ('table', 'index')`)
+	rows, err := q.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type IN ('table', 'index', 'trigger')`)
 	if err != nil {
 		return false, err
 	}
@@ -390,7 +403,7 @@ func current(q querier) (bool, error) {
 	if err := rows.Err(); err != nil {
 		return false, err
 	}
-	for _, n := range slices.Concat(keptTableNames, derivedTables, keptIndexNames) {
+	for _, n := range slices.Concat(keptTableNames, derivedTables, keptIndexNames, keptTriggerNames) {
 		if !have[n] {
 			return false, nil
 		}

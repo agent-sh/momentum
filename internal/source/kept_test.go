@@ -194,6 +194,10 @@ func TestGoneCountsTheEventsWhoseSourceIsGone(t *testing.T) {
 	if n, err := transcripts(home).Gone(ctx, st); err != nil || n != want {
 		t.Fatalf("gone %d, %v; want %d", n, err, want)
 	}
+	// With no homes, nothing reads the transcripts again: every event is gone.
+	if n, err := (Transcripts{}).Gone(ctx, st); err != nil || n != len(all(t, st, "transcripts")) {
+		t.Fatalf("gone with no homes %d, %v; want every event", n, err)
+	}
 }
 
 // A harness has one name in every source, so a query by it finds the events of each: here Claude Code's in the

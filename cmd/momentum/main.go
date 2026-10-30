@@ -328,8 +328,11 @@ func rebuild(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		fmt.Fprintf(stdout, "%s: dropped %d events; the next ingest reads it from the start\n", name, n)
 		return nil
 	}
-	fmt.Fprintf(stdout, "%s: dropped %d events; %d of them have no source left and are gone for good; the next ingest reads the rest from the start\n",
-		name, n, gone)
+	msg := fmt.Sprintf("%s: dropped %d events; %d of them have no source left and are gone for good", name, n, gone)
+	if gone < n {
+		msg += "; the next ingest reads the rest from the start"
+	}
+	fmt.Fprintln(stdout, msg)
 	return nil
 }
 

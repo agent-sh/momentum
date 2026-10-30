@@ -109,6 +109,11 @@ func TestEachPiProcessGetsTheSessionItCreated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	for _, s := range ss { // a session is named by its source's tool, as every source of momentum names it
+		if s.Tool != New(env).Tool() {
+			t.Fatalf("session %s is named %q, not %q", s.Key, s.Tool, New(env).Tool())
+		}
+	}
 	got := map[int]string{}
 	for _, s := range ss {
 		got[s.PID] = s.Transcript

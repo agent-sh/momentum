@@ -44,20 +44,32 @@ func countEvents(t *testing.T, source string) int {
 }
 
 // The transcripts' events are kept: a rebuild of them is refused without --force, and with it says how many of
-// them have no source left. A transcript whose compressed copy is still there is not among them.
+// them have no source left, as the ingest of the configured homes finds them. A transcript whose compressed copy
+// is still there is not among them; one deleted, or kept outside every home, is.
 func TestARebuildOfTheTranscriptsNeedsForceAndCountsWhatIsGone(t *testing.T) {
 	ctx := context.Background()
+	cfg, user := t.TempDir(), t.TempDir()
 	t.Setenv("MOMENTUM_HOME", t.TempDir())
-	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
-	files := t.TempDir()
+	t.Setenv("MOMENTUM_CONFIG", cfg)
+	t.Setenv("TACIT_HERMES_DB", "off")
+	t.Setenv("PI_CODING_AGENT_DIR", "")
+	t.Setenv("PI_CODING_AGENT_SESSION_DIR", "")
+	if err := os.WriteFile(filepath.Join(cfg, "sources.json"), []byte(`{"transcripts": {"homes": ["`+user+`"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files := filepath.Join(user, ".claude", "projects", "-home-u-shop")
+	if err := os.MkdirAll(files, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	there, packed, gone := filepath.Join(files, "there.jsonl"), filepath.Join(files, "packed.jsonl"), filepath.Join(files, "gone.jsonl")
-	for _, p := range []string{there, packed + ".zst"} {
+	outside := filepath.Join(t.TempDir(), "outside.jsonl")
+	for _, p := range []string{there, packed + ".zst", outside} {
 		if err := os.WriteFile(p, []byte("{}\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 	var evs []store.Event
-	for i, p := range []string{there, packed, gone, gone} {
+	for i, p := range []string{there, packed, gone, outside} {
 		evs = append(evs, store.Event{Source: "transcripts", SourceKey: fmt.Sprintf("%s@%012d#000", filepath.Base(p), i),
 			TS: time.UnixMilli(1_700_000_000_000), Harness: "claude", Actor: store.ActorAgent, Kind: "agent_text", Ref: fmt.Sprintf("%s@%d#0", p, i)})
 	}

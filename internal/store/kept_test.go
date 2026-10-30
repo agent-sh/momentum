@@ -150,6 +150,68 @@ func TestAnOlderBuildsVisitIsPutRight(t *testing.T) {
 	}
 }
 
+// Claude Code has one name as an event is written, by whichever build writes it: a build from before the events
+// were kept writes claude-code, also while this build has the store open, and its upsert writes it again over a
+// row this build stored.
+func TestClaudeCodeIsNamedClaudeWhoeverWritesIt(t *testing.T) {
+	ctx := context.Background()
+	st, path := open(t)
+	mine := Event{Source: "mistakes", SourceKey: "k1", TS: time.UnixMilli(1), Harness: "claude", Actor: ActorTool, Kind: "x"}
+	if _, err := st.Put(ctx, []Event{mine}); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+path) // the other build, on its own connection
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO events (id, source, source_key, ts, harness, actor, kind, ingested)
+	  VALUES ('n', 'mistakes', 'k2', 1, 'claude-code', 'tool', 'x', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO events (id, source, source_key, ts, harness, actor, kind, ingested)
+	  VALUES (?, 'mistakes', 'k1', 1, 'claude-code', 'tool', 'x', 1) ON CONFLICT(id) DO UPDATE SET harness = excluded.harness`, mine.ID()); err != nil {
+		t.Fatal(err)
+	}
+	if evs, err := st.Events(ctx, Query{Since: time.UnixMilli(0), Harness: "claude"}); err != nil || len(evs) != 2 {
+		t.Fatalf("Claude Code's events: %d, %v; want both", len(evs), err)
+	}
+}
+
+// A build from before version 3, run on a store migrated since, drops the events of the sources it reads and
+// keeps the tables it does not know: the file cursors, which still say every transcript was read, and the steps.
+// The next open takes its user_version, so the step that reads again runs again and the transcripts come back.
+func TestAStoreABuildFromBeforeVersion3OpenedIsReadAgain(t *testing.T) {
+	ctx := context.Background()
+	st, path := open(t)
+	if _, _, err := st.PutFiles(ctx, []FileWrite{{Events: []Event{{Source: Transcripts, SourceKey: "a@000000000000#000", TS: time.Now(), Actor: ActorAgent, Kind: "agent_text"}},
+		Cursor: FileCursor{Source: Transcripts, Path: "/s/a.jsonl", Offset: 10}}}); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM events WHERE source != 'sessions'; PRAGMA user_version = 2`); err != nil { // its visit
+		t.Fatal(err)
+	}
+	db.Close()
+	st, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if cs, _ := st.FileCursors(ctx, Transcripts); len(cs) != 0 {
+		t.Fatalf("the cursors of a build from before version 3 were kept: %+v", cs)
+	}
+	var last int
+	rawQuery(t, path, `SELECT MAX(version) FROM schema_steps`, &last)
+	if last != latest() {
+		t.Fatalf("the last step %d, want %d", last, latest())
+	}
+}
+
 // A store a newer build migrated is refused, and nothing in it changes: this build does not know its steps.
 func TestAStoreFromANewerBuildIsRefusedUnchanged(t *testing.T) {
 	st, path := open(t)
