@@ -55,6 +55,18 @@ Session supervision is core, not a later extra. In Phase 0, most of the owner's 
 - **SQLite** for events, cases and experiments; artifacts (patches, reports, rollback manifests) as files next to it.
 - **Thin harness adapters:** a Claude Code mod, a Hermes general plugin (next to tacit's memory provider, not in its place), Codex hooks. Observation reads transcripts as the source of truth. Hooks add live signals but miss things: a call to a tool that does not exist never reaches Claude Code's tool hook.
 
+## Live session layer
+
+The `sessions` packages are exported, so the session board imports them instead of keeping its own copy. They read processes, tmux panes, transcripts and the harnesses' own state, never a model:
+- **Discovery:** Claude Code from the agent process under each tmux pane, Claude Code's per-process probe files and `claude agents --json`; Codex from its processes, the rollout files they hold open and its state database; pi, opencode and Hermes from their processes, session files and databases. Harness locations follow the harnesses' own variables (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`, `HERMES_HOME`, `PI_CODING_AGENT_DIR`). A `Lister` interface lets another tool's list stand in for native discovery.
+- **Identity:** a session is keyed by its job, thread or session id, else by its process (pid and start time), never by a tmux pane id, which a restarted tmux server hands out again. Rows from another machine are dropped: their files are not here.
+- **Phases:** needs_you, working, background, scheduled, idle, done. The rule, in order: a blocking ask gives needs_you (an async ask blocks only once its turn is over); an open turn gives working; tasks in flight give background; an error gives needs_you; a failed background job gives needs_you; a wakeup or loop gives scheduled; otherwise idle. Without a transcript, only the harness's own status counts, never a value a board wrote back.
+- **Reviews:** only a model's review moves idle to needs_you or done, and only when it covered the same idle stretch and quotes the request word for word from the last message. The `verdict` package holds the prompt, the reply parser and that gate; the caller makes the model call.
+- **Between runs:** when each session entered its phase is kept in the store's state tables, which a schema change of the derived tables does not drop.
+- **Attribution:** user-role text in the activity log is what the harness recorded in the user role, labelled with the harness's own origin when it gives one. It is not attribution to the owner; evidence about the owner comes from tacit's attribution.
+
+`momentum sessions` prints the live sessions and their phases from this layer.
+
 ## Evidence it keeps
 
 Phase 0 showed that each family needs history the machine does not keep today. The collectors are cheap and keep running when the rest of the tool is down.

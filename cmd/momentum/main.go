@@ -28,11 +28,12 @@ const usage = `usage:
   momentum evidence events [--since DUR] [--kind K,K] [--source S] [--limit N] [--json]   events, newest first
   momentum evidence status [--since DUR]   events per source and kind, and unparsed records
   momentum evidence rebuild SOURCE      drop what SOURCE contributed; the next ingest reads it from the start
+  momentum sessions [--json] [--all]    the live agent sessions and their phases, read without a model
   momentum version
 Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json).
 The store is $MOMENTUM_HOME/momentum.db (default ~/.local/share/momentum).
 DUR is a Go duration or a number of days, e.g. 36h or 7d. Exit: 0 done, 2 usage or configuration error,
-3 error (for ingest: at least one source failed; the others still ran).`
+3 error (for ingest and sessions: at least one source failed; the others still ran).`
 
 type usageError struct{ msg string }
 
@@ -51,6 +52,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "evidence":
 		err = evidence(ctx, args[1:], stdout, stderr)
+	case "sessions":
+		err = sessionsCmd(ctx, args[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintln(stdout, "momentum", version)
 	case "-h", "--help", "help":
