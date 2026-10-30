@@ -17,7 +17,7 @@ momentum evidence rebuild SOURCE      drop a source's events; the next ingest re
                                       (not sessions; transcripts only with --force)
 ```
 
-Each event records who produced it (owner, agent, tool, harness, detector), and whether an experiment or a test produced it. Every source names a harness the same way: claude, codex, pi, opencode, hermes. The store lives in `~/.local/share/momentum`, mode 0600. A schema change keeps every event; it drops only what the sources derive (their cursors), and the next ingest reads them again.
+Each event records who produced it (owner, agent, tool, harness, detector), and whether an experiment or a test produced it. Every source names a harness the same way: claude, codex, pi, opencode, hermes. The store lives in `~/.local/share/momentum`, mode 0600. A schema change keeps every event. Only a change in how the sources read drops what they derive (their cursors), and then the next ingest reads them again.
 
 Source locations are machine-specific, so momentum ships none. List them in `~/.config/momentum/sources.json`; leave out any you do not have:
 

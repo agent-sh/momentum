@@ -58,8 +58,8 @@ func rawQuery(t *testing.T, path, q string, dest any) {
 }
 
 // A store as the build before the events were kept left it migrates in place: every event stays, Claude Code's
-// gets the name the transcripts give it, the derived tables are made again empty, and user_version stays at 3, so
-// that build, run on it again, drops nothing.
+// gets the name the transcripts give it, nothing is read again (the cursors stay), and user_version stays at 3,
+// the version that build checks before it drops anything.
 func TestAStoreFromBeforeKeptEventsMigratesInPlace(t *testing.T) {
 	ctx, path := context.Background(), filepath.Join(t.TempDir(), "m.db")
 	old, err := sql.Open("sqlite", "file:"+path)
@@ -100,17 +100,53 @@ func TestAStoreFromBeforeKeptEventsMigratesInPlace(t *testing.T) {
 	if strings.Join(claude, " ") != "mistakes sessions transcripts" {
 		t.Fatalf("Claude Code's events: %v", claude)
 	}
-	if cs, _ := st.FileCursors(ctx, "transcripts"); len(cs) != 0 {
-		t.Fatalf("the cursors were kept: %+v", cs)
+	if cs, _ := st.FileCursors(ctx, "transcripts"); len(cs) != 1 {
+		t.Fatalf("the cursors were not kept: %+v", cs)
 	}
 	if got, err := st.SessionStamps(ctx); err != nil || len(got) != 1 {
 		t.Fatalf("the stamps: %+v %v", got, err)
 	}
-	var uv, indexes int
+	var uv, key, bySource int
 	rawQuery(t, path, `PRAGMA user_version`, &uv)
-	rawQuery(t, path, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'events_key'`, &indexes)
-	if uv != 3 || indexes != 1 {
-		t.Fatalf("user_version %d, events_key %d", uv, indexes)
+	rawQuery(t, path, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'events_key'`, &key)
+	rawQuery(t, path, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'events_source'`, &bySource)
+	if uv != 3 || key != 1 || bySource != 0 {
+		t.Fatalf("user_version %d, events_key %d, events_source %d", uv, key, bySource)
+	}
+}
+
+// A build from before the events were kept, run on a store migrated since, makes events_source again and writes
+// Claude Code by its old name. The next open of this build puts both right, and the one after has nothing to do.
+func TestAnOlderBuildsVisitIsPutRight(t *testing.T) {
+	ctx := context.Background()
+	st, path := open(t)
+	st.Close()
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE INDEX events_source ON events(source);
+	  INSERT INTO events (id, source, source_key, ts, harness, actor, kind, ingested) VALUES
+	    ('m', 'mistakes', 'k1', 1700000000000, 'claude-code', 'tool', 'tool-error', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	st, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	evs, err := st.Events(ctx, Query{Since: time.UnixMilli(0), Harness: "claude"})
+	if err != nil || len(evs) != 1 {
+		t.Fatalf("Claude Code's events after the visit: %+v %v", evs, err)
+	}
+	var old int
+	rawQuery(t, path, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'events_source'`, &old)
+	if old != 0 {
+		t.Fatal("events_source is still there")
+	}
+	if ok, err := current(st.db); err != nil || !ok {
+		t.Fatalf("after the repairs the store is not current: %v", err)
 	}
 }
 
@@ -142,9 +178,9 @@ func TestAStoreFromANewerBuildIsRefusedUnchanged(t *testing.T) {
 	}
 }
 
-// The next column of the events is one more entry in keptColumns, with a step for the sources to fill it. A store
-// from before gains it, keeps every event and stamp with the column's default, and drops its derived tables, so
-// the next ingest reads its sources again; the next open has nothing to do.
+// The next column of the events is one more entry in keptColumns, with a step that reads again for the sources to
+// fill it. A store from before gains it, keeps every event and stamp with the column's default, and drops its
+// derived tables, so the next ingest reads its sources again; the next open has nothing to do.
 func TestTheNextColumnIsOneEntryAndAStep(t *testing.T) {
 	ctx := context.Background()
 	st, path := open(t)
@@ -165,7 +201,7 @@ func TestTheNextColumnIsOneEntryAndAStep(t *testing.T) {
 	cols, was := keptColumns[0].columns, steps
 	t.Cleanup(func() { keptColumns[0].columns, steps = cols, was })
 	keptColumns[0].columns = append(slices.Clone(cols), [2]string{"tokens", "INTEGER NOT NULL DEFAULT 0"})
-	steps = append(slices.Clone(was), step{latest() + 1, `UPDATE events SET tokens = 0 WHERE tokens != 0`})
+	steps = append(slices.Clone(was), step{version: latest() + 1, sql: `UPDATE events SET tokens = 0 WHERE tokens != 0`, reread: true})
 
 	st, err := Open(path)
 	if err != nil {

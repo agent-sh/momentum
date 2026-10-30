@@ -11,19 +11,36 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// Gone counts the transcripts' events whose source is gone: a transcript whose plain file and compressed copy
-// are both deleted, or a Hermes session its store no longer holds (or whose store is deleted). A rebuild drops
-// them for good: the next ingest cannot read them again.
+// Gone counts the transcripts' events whose source is gone, which a rebuild drops for good: a transcript that is
+// neither at its path, plain or compressed, nor found under the homes by its name (an event's key holds the name,
+// so a rollout Codex archived since is read again), and a Hermes session its store no longer holds, or whose
+// store is gone. A rebuild also loses what a source took back from a file or session still there (lines past a
+// cut, rows Hermes took back), which Gone does not count.
 func (s Transcripts) Gone(ctx context.Context, st *store.Store) (int, error) {
 	origins, err := st.Origins(ctx, s.Name())
 	if err != nil {
 		return 0, err
 	}
+	found := map[string]bool{} // the names of the transcripts under the homes
+	for _, home := range s.Homes {
+		for _, src := range evidence.Sources(home) {
+			if src.Format == evidence.Hermes {
+				continue
+			}
+			files, err := evidence.Files(src)
+			if err != nil {
+				return 0, fmt.Errorf("%s: %w", src.Glob, err)
+			}
+			for _, f := range files {
+				found[evidence.Name(f)] = true
+			}
+		}
+	}
 	held := map[string]map[string]bool{} // a Hermes store's sessions, by the store
 	gone := 0
 	for o, n := range origins {
 		if o.Harness != "hermes" {
-			if missing(o.Path) {
+			if !found[evidence.Name(o.Path)] && missing(o.Path) {
 				gone += n
 			}
 			continue

@@ -96,13 +96,14 @@ type querier interface {
 // The store's tables are of two kinds.
 //
 // Kept tables hold what cannot be read again: every event, and when each live session entered its phase. A
-// schema change migrates them and never drops them. A kept table missing is made with the columns it was first
-// made with (keptTables), it gains each later column it lacks (keptColumns), and its rows change only in a step.
+// schema change migrates them and never drops them. A kept table that is missing is made with the columns it was
+// first made with (keptTables), it gains each later column it lacks (keptColumns), and its rows change only in a
+// step or a repair.
 //
 // Derived tables hold what the sources and the session trackers derived from what they read: where each source
 // stopped (with tacit's saved reader state), the files it parsed, what it could not parse, and the trackers'
-// checkpoints. Each step drops them, so the next ingest reads every source again from its start, and the next
-// sessions run reads every transcript once. Reading again cannot store an event twice (PutFiles).
+// checkpoints. A step that reads again drops them, so the next ingest reads every source again from its start, and
+// the next sessions run reads every transcript once (PutFiles says what reading again keeps).
 
 // keptTables makes the kept tables as they were first made, and schema_steps, the steps a store has taken.
 const keptTables = `
@@ -117,7 +118,7 @@ CREATE TABLE IF NOT EXISTS schema_steps (version INTEGER PRIMARY KEY, at INTEGER
 // gains it and keeps its rows: SQLite's ADD COLUMN writes no row, so it costs the same on any table. The next
 // column is one more entry here. A NOT NULL column needs a default other than NULL, and an added column cannot be
 // a key. The events from before it hold its default; for the sources to fill it in the events whose transcripts
-// are still there, add a step as well.
+// are still there, add a step that reads again as well.
 var keptColumns = []struct {
 	table   string
 	columns [][2]string
@@ -163,27 +164,41 @@ CREATE TABLE IF NOT EXISTS file_cursors (source TEXT NOT NULL, path TEXT NOT NUL
 // minutes of CPU once, and a transcript its harness deleted since is not read again: its events stay as they are.
 var derivedTables = []string{"cursors", "seen_files", "skipped", "trackers", "tracker_log", "file_cursors"}
 
-// step is a change to the kept tables' rows or indexes, run once, in order, in the transaction that opens a store
-// from before it, and recorded in schema_steps. A step also drops the derived tables, so the next ingest reads
-// every source again: what changed in how the sources read applies wherever they still hold what they read, and
-// the events of what they no longer hold stay as they were. A step runs on a store at the version before it.
+// step is a change to the schema, run once, in order, in the transaction that opens a store from before it, and
+// recorded in schema_steps; sql, when there is one, changes the kept tables' rows or indexes, on a store at the
+// version before it. A step that rereads changes what the sources derive from what they read (a column they fill,
+// a fix in how they read): it drops the derived tables, and the next ingest reads every source again from its
+// start. Reading again keeps what is gone and stores nothing twice of a transcript only ever appended to, but not
+// of one rewritten in place with lines that moved, and it credits each item as tacit does when it reads again
+// (PutFiles). So a step rereads only when it must, and a store that took several steps reads once.
 type step struct {
 	version int
 	sql     string
+	reread  bool
 }
 
-// steps are the schema's changes since the events are kept; their versions go on from legacyVersion. The next
-// change to a kept table's rows is one more step here.
+// steps are the schema's changes; their versions go on from legacyVersion. The next change to a kept table's rows
+// is one more step here.
 var steps = []step{
-	// The events are kept, and a record's events are found by their keys (events_key, which serves what
-	// events_source served). Every harness has one name, tacit's reader's: Claude Code is claude.
-	{4, `DROP INDEX IF EXISTS events_source; UPDATE events SET harness = 'claude' WHERE harness = 'claude-code'`},
+	// A store from before version 3 comes from builds that read every source again on a version change, and its
+	// derived tables are theirs: its sources are read again, as those builds would have.
+	{version: 3, reread: true},
+	// The events are kept (keptTables, keptColumns), and a record's events are found by their keys (events_key,
+	// which serves what events_source served). Nothing is read again. Every harness has one name, tacit's
+	// reader's: the repairs rename Claude Code's events to claude, and drop events_source.
+	{version: 4},
 }
 
-// legacyVersion is the last version user_version counted. A build up to it drops every derived table, the events
-// among them, when user_version is another number, so user_version stays at it: a build from before the events
-// were kept, opening a store migrated since, finds its own version and drops nothing. The versions since are the
-// steps in schema_steps.
+// repairs run in every migration, after the steps. They put right what a build from before the events were kept
+// does to a store migrated since: it makes events_source again, an index no build since reads, which costs every
+// write, and it writes Claude Code by its old name. current reports a store that holds events_source as not
+// current, so the next open after such a build runs them: one pass over the events.
+const repairs = `DROP INDEX IF EXISTS events_source; UPDATE events SET harness = 'claude' WHERE harness = 'claude-code'`
+
+// legacyVersion is the last version user_version counted. A build of that version drops every derived table, the
+// events among them, when user_version is another number, so user_version stays at it: such a build, opening a
+// store migrated since, finds its own version and drops nothing. A build from before it (user_version 2) drops the
+// events on any other number, so it must not open a store again. The versions since are the steps in schema_steps.
 const legacyVersion = 3
 
 // BusyTimeout is how long a statement waits for another connection's write transaction before it fails, and how
@@ -269,8 +284,9 @@ func version(q querier) (int, error) {
 // migrate brings the store to this schema. It checks with reads first, so opening a store that is up to date
 // never waits for a writer. Otherwise it changes the store in one write transaction, which takes the lock up front
 // (two first opens after an upgrade take turns), and reads the version again inside it: the kept tables gain what
-// they lack, the steps the store has not taken run after the derived tables are dropped, and what is missing is
-// made. A store at a version newer than this build's is refused, unchanged: this build does not know its steps.
+// they lack, the steps the store has not taken run (after the derived tables are dropped, when one of them
+// rereads), the repairs run, and what is missing is made. A store at a version newer than this build's is
+// refused, unchanged: this build does not know its steps.
 func migrate(db *sql.DB) error {
 	if ok, err := current(db); err != nil || ok {
 		return err
@@ -299,12 +315,13 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	var pending []step
+	reread := false
 	for _, s := range steps {
 		if s.version > v {
-			pending = append(pending, s)
+			pending, reread = append(pending, s), reread || s.reread
 		}
 	}
-	if len(pending) > 0 {
+	if reread {
 		for _, t := range derivedTables {
 			if _, err := tx.Exec(`DROP TABLE IF EXISTS ` + t); err != nil {
 				return err
@@ -313,12 +330,17 @@ func migrate(db *sql.DB) error {
 	}
 	now := time.Now().UnixMilli()
 	for _, s := range pending {
-		if _, err := tx.Exec(s.sql); err != nil {
-			return fmt.Errorf("step %d: %w", s.version, err)
+		if s.sql != "" {
+			if _, err := tx.Exec(s.sql); err != nil {
+				return fmt.Errorf("step %d: %w", s.version, err)
+			}
 		}
 		if _, err := tx.Exec(`INSERT INTO schema_steps (version, at) VALUES (?, ?)`, s.version, now); err != nil {
 			return err
 		}
+	}
+	if _, err := tx.Exec(repairs); err != nil {
+		return fmt.Errorf("repairs: %w", err)
 	}
 	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, legacyVersion)); err != nil {
 		return err
@@ -342,7 +364,9 @@ func migrate(db *sql.DB) error {
 }
 
 // current reports, with reads alone, whether the store already has this schema: user_version, the version of
-// its steps, every table and index, and the columns of the kept tables and the checkpoint tables.
+// its steps, every table and index, and the columns of the kept tables and the checkpoint tables. A store that
+// holds events_source is not current: a build from before the events were kept opened it, and the repairs put
+// right what it did.
 func current(q querier) (bool, error) {
 	ctx := context.Background()
 	var uv int
@@ -370,6 +394,9 @@ func current(q querier) (bool, error) {
 		if !have[n] {
 			return false, nil
 		}
+	}
+	if have["events_source"] {
+		return false, nil
 	}
 	if v, err := version(q); err != nil || v != latest() {
 		return false, err
@@ -537,8 +564,10 @@ type FileWrite struct {
 // PutFiles stores parts of files in one transaction, each part's events with the cursor after them, so a
 // cursor never runs ahead of what was stored. A record read again holds what this reading of it stores, and
 // nothing of an earlier one: an event stored under one of a part's places that the part does not hold is dropped
-// (a reader that now splits a turn otherwise numbers its events otherwise). It returns how many events were new,
-// and how many were dropped so.
+// (a reader that now splits a turn otherwise numbers its events otherwise). Places name records by their offset,
+// so this holds while a record stays where it was: a file rewritten in place with lines that moved stores them
+// again at their new places, and a record that now gives no item keeps the events it had. It returns how many
+// events were new, and how many were dropped.
 func (s *Store) PutFiles(ctx context.Context, ws []FileWrite) (added, dropped int, err error) {
 	if len(ws) == 0 {
 		return 0, 0, nil

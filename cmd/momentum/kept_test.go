@@ -71,7 +71,7 @@ func TestARebuildOfTheTranscriptsNeedsForceAndCountsWhatIsGone(t *testing.T) {
 	}
 	out.Reset()
 	errOut.Reset()
-	if code := run(ctx, []string{"evidence", "rebuild", "transcripts", "--force"}, &out, &errOut); code != 0 ||
+	if code := run(ctx, []string{"evidence", "rebuild", "--force=true", "transcripts"}, &out, &errOut); code != 0 ||
 		!strings.Contains(out.String(), "dropped 4 events; 2 of them have no source left") {
 		t.Fatalf("exit %d, with --force:\n%s%s", code, out.String(), errOut.String())
 	}

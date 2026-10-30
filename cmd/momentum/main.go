@@ -95,7 +95,7 @@ func evidence(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	case "status":
 		return status(ctx, args[1:], stdout)
 	case "rebuild":
-		return rebuild(ctx, args[1:], stdout)
+		return rebuild(ctx, args[1:], stdout, stderr)
 	}
 	return usageError{fmt.Sprintf("unknown evidence command %q", args[0])}
 }
@@ -277,36 +277,45 @@ func status(ctx context.Context, args []string, stdout io.Writer) error {
 // rebuild drops what a source contributed. The transcripts' events can be all that is left of transcripts their
 // harness deleted, so they go only with --force, which counts first how many of them have no source left. The
 // flag may come before or after the source's name.
-func rebuild(ctx context.Context, args []string, stdout io.Writer) error {
-	var name string
-	force := false
+func rebuild(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("rebuild", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	force := fs.Bool("force", false, "drop the transcripts' events too, which a deleted transcript cannot give back")
+	var flags, names []string
 	for _, a := range args {
-		switch {
-		case a == "--force" || a == "-force":
-			force = true
-		case strings.HasPrefix(a, "-"):
-			return usageError{fmt.Sprintf("rebuild: unknown flag %q", a)}
-		case name != "":
-			return usageError{"rebuild needs one source name"}
-		default:
-			name = a
+		if strings.HasPrefix(a, "-") {
+			flags = append(flags, a)
+		} else {
+			names = append(names, a)
 		}
 	}
-	if name == "" {
+	if err := fs.Parse(flags); err != nil {
+		return usageError{err.Error()}
+	}
+	if len(names) != 1 {
 		return usageError{"rebuild needs one source name"}
 	}
+	name := names[0]
 	st, err := store.Open(paths.DB())
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 	gone := 0
-	if name == store.Transcripts && force {
-		if gone, err = (source.Transcripts{}).Gone(ctx, st); err != nil {
+	if name == store.Transcripts && *force {
+		// The homes the ingest reads, where a transcript moved since is found again by its name.
+		var homes []string
+		switch c, err := config.Load(); {
+		case err == nil:
+			homes = c.Transcripts.Homes
+		case !errors.Is(err, config.ErrNoSources):
+			return err
+		}
+		if gone, err = (source.Transcripts{Homes: homes}).Gone(ctx, st); err != nil {
 			return err
 		}
 	}
-	n, err := st.Rebuild(ctx, name, force)
+	n, err := st.Rebuild(ctx, name, *force)
 	switch {
 	case errors.Is(err, store.ErrObserved):
 		return usageError{err.Error()}

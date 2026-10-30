@@ -16,8 +16,8 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// bumpSchema puts a store back at the schema version before its last change, as the build before that change
-// left it: the next open migrates it again.
+// bumpSchema puts a store back at an older schema version, one whose builds read every source again on a version
+// change (user_version 2, no steps): the next open moves it up through the steps, and one of them reads again.
 func bumpSchema(t *testing.T, path string) {
 	t.Helper()
 	db, err := sql.Open("sqlite", "file:"+path)
@@ -25,17 +25,8 @@ func bumpSchema(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.Exec(`PRAGMA user_version = 2`); err != nil { // the version a build before the last counted
+	if _, err := db.Exec(`PRAGMA user_version = 2; DROP TABLE IF EXISTS schema_steps`); err != nil {
 		t.Fatal(err)
-	}
-	var steps int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_steps'`).Scan(&steps); err != nil {
-		t.Fatal(err)
-	}
-	if steps > 0 {
-		if _, err := db.Exec(`DELETE FROM schema_steps WHERE version = (SELECT MAX(version) FROM schema_steps)`); err != nil {
-			t.Fatal(err)
-		}
 	}
 }
 
@@ -49,9 +40,10 @@ func openPath(t *testing.T, path string) *store.Store {
 	return st
 }
 
-// The transcripts' events are kept across a schema change. The change drops the cursors, so the next ingest reads
-// every transcript still there again; what it reads replaces what was read of it, record by record, so nothing is
-// stored twice, not even a turn the reader now splits otherwise. A transcript deleted in between keeps its events.
+// The transcripts' events are kept across a schema change that reads again. The change drops the cursors, so the
+// next ingest reads every transcript still there again; what it reads replaces what was read of it, record by
+// record, so nothing is stored twice, not even a turn the reader now splits otherwise. A transcript deleted in
+// between keeps its events.
 func TestTranscriptsKeepTheirEventsAcrossASchemaChange(t *testing.T) {
 	ctx := context.Background()
 	home := testHome(t)
@@ -132,12 +124,14 @@ func TestTranscriptsKeepTheirEventsAcrossASchemaChange(t *testing.T) {
 }
 
 // Gone counts the transcripts' events whose source is gone: a transcript deleted, and a Hermes session its store
-// no longer holds. A rollout whose compressed copy is still there is not gone.
+// no longer holds. A rollout whose compressed copy is still there is not gone, and nor is one Codex archived: the
+// next ingest finds it by its name.
 func TestGoneCountsTheEventsWhoseSourceIsGone(t *testing.T) {
 	ctx := context.Background()
 	home := testHome(t)
 	cpath := writeLines(t, claudePath(home), claudeSession()...)
 	xpath := writeLines(t, codexPath(home), codexRollout()...)
+	bare := writeLines(t, codexUnknownPath(home), codexUnknown()...)
 	hpath := filepath.Join(home, ".hermes", "state.db")
 	if err := os.MkdirAll(filepath.Dir(hpath), 0o700); err != nil {
 		t.Fatal(err)
@@ -170,8 +164,16 @@ func TestGoneCountsTheEventsWhoseSourceIsGone(t *testing.T) {
 	if want == 0 || desk == 0 {
 		t.Fatalf("setup: %d events to go, %d of the desk session", want, desk)
 	}
-	// The Claude Code transcript is deleted, the rollout compressed in place, the desk session deleted from its store.
+	// The Claude Code transcript is deleted, one rollout compressed in place and the other archived, the desk
+	// session deleted from its store.
 	if err := os.Remove(cpath); err != nil {
+		t.Fatal(err)
+	}
+	archived := filepath.Join(home, ".codex", "archived_sessions", filepath.Base(bare))
+	if err := os.MkdirAll(filepath.Dir(archived), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(bare, archived); err != nil {
 		t.Fatal(err)
 	}
 	raw, err := os.ReadFile(xpath)

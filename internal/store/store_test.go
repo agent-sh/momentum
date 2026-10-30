@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -255,9 +256,9 @@ func TestFileCursorsGoWithTheirEvents(t *testing.T) {
 	}
 }
 
-// A schema change keeps the events and drops the file cursors: the next ingest reads every transcript still there
-// again, and the events of one deleted since stay.
-func TestASchemaChangeKeepsTheEventsAndDropsTheFileCursors(t *testing.T) {
+// A step that does not read again keeps the file cursors; a step that reads again drops them, and the next ingest
+// reads every transcript still there again. Either way the events stay, those of a transcript deleted since too.
+func TestOnlyAStepThatReadsAgainDropsTheFileCursors(t *testing.T) {
 	ctx := context.Background()
 	st, path := open(t)
 	c := FileCursor{Source: "transcripts", Path: "/s/a.jsonl", Inode: 7, FP: "ab", Offset: 42, Size: 50, MTime: 9}
@@ -266,30 +267,20 @@ func TestASchemaChangeKeepsTheEventsAndDropsTheFileCursors(t *testing.T) {
 		t.Fatal(err)
 	}
 	st.Close()
-	rollBack(t, path)
-	st, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	if cs, _ := st.FileCursors(ctx, "transcripts"); len(cs) != 0 {
-		t.Fatalf("file cursors kept across a schema change: %+v", cs)
-	}
-	if evs, _ := st.Events(ctx, Query{Since: time.Unix(0, 0), Source: "transcripts"}); len(evs) != 1 {
-		t.Fatalf("events after a schema change: %d, want 1", len(evs))
-	}
-}
-
-// rollBack puts a store back at the version before its last step, as the build before it left it.
-func rollBack(t *testing.T, path string) {
-	t.Helper()
-	raw, err := sql.Open("sqlite", "file:"+path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer raw.Close()
-	if _, err := raw.Exec(`DELETE FROM schema_steps WHERE version = (SELECT MAX(version) FROM schema_steps)`); err != nil {
-		t.Fatal(err)
+	was := steps
+	t.Cleanup(func() { steps = was })
+	for _, reread := range []bool{false, true} {
+		steps = append(slices.Clone(steps), step{version: latest() + 1, reread: reread})
+		st, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cs, _ := st.FileCursors(ctx, "transcripts")
+		evs, _ := st.Events(ctx, Query{Since: time.Unix(0, 0), Source: "transcripts"})
+		st.Close()
+		if want := map[bool]int{false: 1, true: 0}[reread]; len(cs) != want || len(evs) != 1 {
+			t.Fatalf("after a step that rereads %v: %d file cursors (want %d), %d events (want 1)", reread, len(cs), want, len(evs))
+		}
 	}
 }
 

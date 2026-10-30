@@ -112,7 +112,7 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 			continue
 		}
 		keys[key] = true
-		s := &sessions.Session{Key: key, Tool: "claude", Name: f.Name, Named: f.Named && !reAutoName.MatchString(f.Name),
+		s := &sessions.Session{Key: key, Tool: src.Tool(), Name: f.Name, Named: f.Named && !reAutoName.MatchString(f.Name),
 			Cwd: f.Cwd, Project: src.Env.Project(f.Cwd), Where: f.Where, Pane: f.Pane, Job: f.Job, PID: f.PID, Model: f.Model,
 			PRs: f.PRs, Started: f.Started, LastActive: f.LastActive, JobState: f.JobState, Tasks: []sessions.Task{}}
 		if f.JobState == "failed" {
