@@ -22,13 +22,16 @@ func TestTheUVCacheIsPrunedOverItsSizeButNeverDuringAnInstall(t *testing.T) {
 		name   string
 		procs  []fakeProc
 		prunes bool
+		action string
 	}{
-		{"nothing installs", nil, true},
-		{"a pip install runs", []fakeProc{{pid: 4, ppid: 1, argv: []string{"/usr/bin/uv", "pip", "install", "x"}}}, false},
-		{"a uv run still syncs", []fakeProc{{pid: 4, ppid: 1, argv: []string{"uv", "run", "server"}}}, false},
+		{"no uv process runs", []fakeProc{{pid: 4, ppid: 1, argv: []string{"bash"}}}, true, ActDelete},
+		{"a pip install runs", []fakeProc{{pid: 4, ppid: 1, argv: []string{"/usr/bin/uv", "pip", "install", "x"}}}, false, ActKeep},
+		{"a uv run still syncs", []fakeProc{{pid: 4, ppid: 1, argv: []string{"uv", "run", "server"}}}, false, ActKeep},
 		{"a uv run past its sync", []fakeProc{{pid: 4, ppid: 1, argv: []string{"uv", "run", "server"}},
-			{pid: 5, ppid: 4, argv: []string{"python", "server.py"}}}, true},
-		{"a uvx tool runs", []fakeProc{{pid: 4, ppid: 1, argv: []string{"uvx", "mcp-x"}}, {pid: 5, ppid: 4, argv: []string{"mcp-x"}}}, true},
+			{pid: 5, ppid: 4, argv: []string{"python", "server.py"}}}, false, ActReport},
+		{"a uvx tool server runs", []fakeProc{{pid: 4, ppid: 1, argv: []string{"uvx", "mcp-x"}}, {pid: 5, ppid: 4, argv: []string{"mcp-x"}}}, false, ActReport},
+		{"a process maps a file from the cache", []fakeProc{{pid: 6, ppid: 1, argv: []string{"python3"},
+			maps: []string{"/home/u/.cache/uv/archive-v0/abc/lib.so"}}}, false, ActReport},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			var ran []string
@@ -43,6 +46,9 @@ func TestTheUVCacheIsPrunedOverItsSizeButNeverDuringAnInstall(t *testing.T) {
 			pruned := strings.Contains(strings.Join(ran, "\n"), "uv cache prune --ci --force")
 			if pruned != c.prunes {
 				t.Fatalf("pruned %v, want %v: %v %+v", pruned, c.prunes, ran, res.Rules)
+			}
+			if f := findings(res, RuleUV)["/home/u/.cache/uv"]; f.Action != c.action {
+				t.Errorf("action %q (%s), want %q", f.Action, f.Why, c.action)
 			}
 			if mark, _ := st.Mark(context.Background(), "prune:uv"); mark.IsZero() == c.prunes {
 				t.Errorf("a prune is marked, a wait is not: %v", mark)
