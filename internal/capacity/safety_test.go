@@ -253,6 +253,9 @@ func TestALookThatIsNotTheMachinesDeletesNothing(t *testing.T) {
 			if len(res.Problems) == 0 {
 				t.Error("and says why")
 			}
+			if n, ok, _ := st.Note(context.Background(), "capacity:hold:look"); !ok || !n.Done.IsZero() {
+				t.Errorf("a held run leaves a problem note: %+v", n)
+			}
 			ts, err := st.RunTimes(context.Background())
 			if err != nil {
 				t.Fatal(err)

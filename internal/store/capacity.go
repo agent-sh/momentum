@@ -17,7 +17,8 @@ const Capacity = "capacity"
 //   - capacity_seen: when the process sampler last saw a path in use (open, mapped, a working directory, a
 //     program, or named on a command line), and first.
 //   - capacity_runs: each run, the time its sample of the processes took, how many it read and how many it could
-//     not, and whether its look could not be trusted (blind): such a run watched nothing.
+//     not, and whether its look could not be trusted (blind, a column it gained: keptColumns): such a run watched
+//     nothing.
 //   - capacity_marks: when each rule last ran its scan, or last pruned.
 const capacityTables = `
 CREATE TABLE IF NOT EXISTS disk_samples (disk TEXT NOT NULL, at INTEGER NOT NULL, size INTEGER NOT NULL,
@@ -25,7 +26,7 @@ CREATE TABLE IF NOT EXISTS disk_samples (disk TEXT NOT NULL, at INTEGER NOT NULL
 CREATE TABLE IF NOT EXISTS capacity_seen (path TEXT PRIMARY KEY, first INTEGER NOT NULL, last INTEGER NOT NULL,
   how TEXT NOT NULL DEFAULT '', proc TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS capacity_runs (at INTEGER PRIMARY KEY, sample_ms INTEGER NOT NULL, procs INTEGER NOT NULL,
-  unreadable INTEGER NOT NULL, blind INTEGER NOT NULL DEFAULT 0);
+  unreadable INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS capacity_marks (mark TEXT PRIMARY KEY, at INTEGER NOT NULL);
 `
 
