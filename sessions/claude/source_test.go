@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/sessions"
+	"github.com/agent-sh/momentum/sessions/internal/fake"
 	"github.com/agent-sh/momentum/sessions/proc"
 )
 
@@ -129,5 +130,17 @@ func TestABackgroundJobKeepsTasksAcrossItsRespawn(t *testing.T) {
 	src := &Source{Lister: listed{{Tool: "claude", Job: "j", Where: "bg", Transcript: x.path, Started: later}}}
 	if s := scan(t, src, later)["j"]; s.Phase != sessions.Background || !strings.Contains(taskIDs(s), "tr1") {
 		t.Fatalf("got %s %s", s.Phase, taskIDs(s))
+	}
+}
+
+func TestARowWithoutAStartIsKeyedByTheProcesssRealStart(t *testing.T) {
+	tb, err := proc.Read(fake.ProcRoot(t, fake.Proc{PID: 7, Argv: []string{"claude"}, Start: 4321}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := &Source{Lister: listed{{Tool: "claude", PID: 7, Pane: "%2"}}}
+	ss, err := sessions.Scan(context.Background(), &sessions.World{Now: t0, Procs: tb}, src)
+	if err != nil || len(ss) != 1 || ss[0].Key != "claude:proc:7:4321" {
+		t.Fatalf("got %v %+v", err, ss)
 	}
 }

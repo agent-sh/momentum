@@ -103,8 +103,9 @@ func TestEachPiProcessGetsTheSessionItCreated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := &sessions.World{Now: newer.Add(2 * time.Minute), Env: sessions.Env{PiDir: agent}, Procs: tb}
-	ss, err := sessions.Scan(context.Background(), w, New(w.Env))
+	env := sessions.Env{PiDir: agent}
+	w := &sessions.World{Now: newer.Add(2 * time.Minute), Procs: tb}
+	ss, err := sessions.Scan(context.Background(), w, New(env))
 	if err != nil {
 		t.Fatal(err)
 	}

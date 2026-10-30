@@ -3,6 +3,7 @@
 package proc
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,13 +25,16 @@ type Proc struct {
 	Start      time.Time // StartTicks as a time, from the boot time
 }
 
-// Table is a snapshot of the processes under Root.
+// Table is a snapshot of the processes under Root. It is not changed after Read, so goroutines can share it.
 type Table struct {
 	Root  string
 	Boot  time.Time
 	ByPID map[int]*Proc
 	kids  map[int][]int
 }
+
+// maxTicks is the largest start a time.Duration can hold; stat never reports one, so a larger value is corrupt.
+const maxTicks = uint64(math.MaxInt64 / int64(time.Second/TicksPerSecond))
 
 // Read walks root (normally /proc). Kernel threads, which have no command line, are left out, and so is any
 // process that ends during the walk.
@@ -52,9 +56,18 @@ func Read(root string) (*Table, error) {
 		p := &Proc{PID: pid, Argv: strings.Split(strings.TrimRight(string(raw), "\x00"), "\x00")}
 		if st, err := os.ReadFile(filepath.Join(root, e.Name(), "stat")); err == nil {
 			p.PPID, p.StartTicks = parseStat(string(st))
-			p.Start = t.Boot.Add(time.Duration(p.StartTicks) * (time.Second / TicksPerSecond))
+			if p.StartTicks <= maxTicks {
+				p.Start = t.Boot.Add(time.Duration(p.StartTicks) * (time.Second / TicksPerSecond))
+			}
 		}
 		t.ByPID[pid] = p
+	}
+	t.kids = map[int][]int{}
+	for _, p := range t.ByPID {
+		t.kids[p.PPID] = append(t.kids[p.PPID], p.PID)
+	}
+	for _, k := range t.kids {
+		sort.Ints(k)
 	}
 	return t, nil
 }
@@ -86,18 +99,7 @@ func bootTime(root string) time.Time {
 }
 
 // Children returns the pids whose parent is pid, lowest first.
-func (t *Table) Children(pid int) []int {
-	if t.kids == nil {
-		t.kids = map[int][]int{}
-		for _, p := range t.ByPID {
-			t.kids[p.PPID] = append(t.kids[p.PPID], p.PID)
-		}
-		for _, k := range t.kids {
-			sort.Ints(k)
-		}
-	}
-	return t.kids[pid]
-}
+func (t *Table) Children(pid int) []int { return t.kids[pid] }
 
 // Alive reports whether the snapshot holds pid, and when start is not zero, whether it is the same process
 // (a recycled pid has a different start).

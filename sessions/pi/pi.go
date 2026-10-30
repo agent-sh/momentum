@@ -225,7 +225,7 @@ func (src *Source) session(slot proc.Slot, used map[string]bool, w *sessions.Wor
 		src.trackers[best] = t
 	}
 	src.seen[best] = w.Now
-	project := w.Env.Project(slot.Cwd)
+	project := src.Env.Project(slot.Cwd)
 	s := &sessions.Session{Key: "pi:" + strings.TrimSuffix(filepath.Base(best), ".jsonl"), Tool: "pi", Name: "pi in " + project,
 		Cwd: slot.Cwd, Project: project, Where: "tty", PID: p.PID, Started: p.Start, LastActive: bestT, Tasks: []sessions.Task{},
 		Transcript: best}

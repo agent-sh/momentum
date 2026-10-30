@@ -188,10 +188,11 @@ func Fit(items []string, limit int) string {
 
 var reJSON = regexp.MustCompile(`(?s)\{.*\}`)
 
-// Parse reads a model's reply for session s. It returns the review and the new dossier. A needs_you whose
-// evidence is not word for word in the last message is turned into done: a generated question is not evidence.
-// The caller sets Seq, At and Seen, and the Title from the dossier.
-func Parse(reply string, s *sessions.Session, now time.Time) (*Review, string, error) {
+// Parse reads a model's reply for session s, as it was when the review was asked for at dispatched (the
+// review's At, which Apply compares with the stretch's start). It returns the review and the new dossier. A
+// needs_you whose evidence is not word for word in the last message is turned into done: a generated question is
+// not evidence. The caller sets Seen, and the Title from the dossier.
+func Parse(reply string, s *sessions.Session, dispatched time.Time) (*Review, string, error) {
 	m := reJSON.FindString(reply)
 	var r struct {
 		Dossier     string  `json:"dossier"`
@@ -204,8 +205,8 @@ func Parse(reply string, s *sessions.Session, now time.Time) (*Review, string, e
 	if m == "" || json.Unmarshal([]byte(m), &r) != nil {
 		return nil, "", fmt.Errorf("verdict: no JSON object in the reply")
 	}
-	rv := &Review{Overall: clean(r.Overall, 140), Now: clean(r.Now, 90), Verdict: r.Verdict, At: now, Size: s.Size, Phase: s.Phase,
-		ReviewedText: s.LastText}
+	rv := &Review{Overall: clean(r.Overall, 140), Now: clean(r.Now, 90), Verdict: r.Verdict, At: dispatched, Size: s.Size, Seq: s.Seq,
+		Phase: s.Phase, ReviewedText: s.LastText}
 	if r.AskEvidence != nil {
 		rv.AskEvidence = strings.TrimSpace(*r.AskEvidence)
 	}
@@ -237,7 +238,8 @@ func HasEvidence(lastText, quote string) bool {
 
 // Apply lets a review settle an idle session, and only the idle stretch it describes: the review was asked in
 // idle, after the stretch began, at the same log length and on the same last message; a needs_you also needs
-// its evidence in that message. dismissed says the owner waved this ask away at this log length.
+// its evidence in that message. dismissed says the owner waved this ask away at this log length. Call it after
+// state.Stamps.Apply, which must see the scanned phase, not the settled one.
 func Apply(s *sessions.Session, r *Review, dismissed bool) {
 	if s.Phase != sessions.Idle || r == nil || r.Phase != sessions.Idle || r.At.Before(s.Since) || r.Seq != s.Seq ||
 		r.ReviewedText != s.LastText || (r.Verdict == VerdictNeedsYou && !HasEvidence(s.LastText, r.AskEvidence)) {

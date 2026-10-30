@@ -3,6 +3,8 @@ package codex
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,7 +23,7 @@ import (
 const Retain = 15 * time.Minute
 
 // Source reads Codex sessions: a Lister finds them, a Tracker per rollout reads what they did, and the state
-// database names their subagents.
+// database under Env.CodexHome names their subagents. Any Lister works; the database opens on first use.
 type Source struct {
 	Env    sessions.Env
 	Lister sessions.Lister
@@ -31,7 +33,7 @@ type Source struct {
 	seen     map[string]time.Time
 }
 
-// New reads Codex sessions with native discovery.
+// New reads Codex sessions with native discovery, which shares the Source's database handle.
 func New(env sessions.Env) *Source {
 	db := &stateDB{home: env.CodexHome}
 	return &Source{Env: env, Lister: &Native{Env: env, db: db}, db: db}
@@ -39,7 +41,15 @@ func New(env sessions.Env) *Source {
 
 func (src *Source) Tool() string { return "codex" }
 
+// Close closes the state database, if it was opened.
 func (src *Source) Close() error { return src.db.close() }
+
+func (src *Source) state() *stateDB {
+	if src.db == nil {
+		src.db = &stateDB{home: src.Env.CodexHome}
+	}
+	return src.db
+}
 
 // Scan lists the live sessions and reads each rollout.
 func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Session, error) {
@@ -63,7 +73,7 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 			continue
 		}
 		keys[key] = true
-		s := &sessions.Session{Key: key, Tool: "codex", Name: f.Name, Named: f.Named, Cwd: f.Cwd, Project: w.Env.Project(f.Cwd),
+		s := &sessions.Session{Key: key, Tool: "codex", Name: f.Name, Named: f.Named, Cwd: f.Cwd, Project: src.Env.Project(f.Cwd),
 			Where: f.Where, Pane: f.Pane, PID: f.PID, Model: f.Model, Started: f.Started, LastActive: f.LastActive,
 			Transcript: f.Transcript, Tasks: []sessions.Task{}}
 		if f.Transcript == "" {
@@ -77,7 +87,9 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 		t := src.tracker(f.Transcript, w.Now)
 		t.Facts(s, w.Now)
 		s.TurnOpen = t.Open()
-		s.Tasks = append(s.Tasks, src.children(ctx, f.Thread, w.Now)...)
+		kids, kerr := src.children(ctx, f.Thread, w.Now)
+		s.Tasks = append(s.Tasks, kids...)
+		err = errors.Join(err, kerr)
 		out = append(out, s)
 	}
 	for path, at := range src.seen {
@@ -101,16 +113,19 @@ func (src *Source) tracker(path string, now time.Time) *Tracker {
 
 // children returns the subagent threads of a thread whose turn is running. A spawn edge stays open after its
 // child finished, so the child's own rollout decides.
-func (src *Source) children(ctx context.Context, thread string, now time.Time) []sessions.Task {
-	db := src.db.get()
-	if db == nil || thread == "" {
-		return nil
+func (src *Source) children(ctx context.Context, thread string, now time.Time) ([]sessions.Task, error) {
+	if thread == "" {
+		return nil, nil
+	}
+	db, err := src.state().get()
+	if db == nil || err != nil {
+		return nil, err
 	}
 	rows, err := db.QueryContext(ctx, `select t.id, coalesce(t.agent_nickname, ''), coalesce(t.title, ''), coalesce(t.agent_role, ''),
 		t.rollout_path, coalesce(t.created_at_ms, t.created_at*1000) from thread_spawn_edges e join threads t on t.id = e.child_thread_id
 		where e.parent_thread_id = ? and e.status = 'open'`, thread)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("subagents of %s: %w", thread, err)
 	}
 	type child struct {
 		id, nick, title, role, path string
@@ -123,6 +138,7 @@ func (src *Source) children(ctx context.Context, thread string, now time.Time) [
 			kids = append(kids, c)
 		}
 	}
+	rerr := rows.Err()
 	rows.Close()
 	var out []sessions.Task
 	for _, c := range kids {
@@ -140,7 +156,7 @@ func (src *Source) children(ctx context.Context, thread string, now time.Time) [
 		}
 		out = append(out, k)
 	}
-	return out
+	return out, rerr
 }
 
 // Native finds Codex sessions the way they show on the machine: the native Codex process nearest a tmux pane's
@@ -151,17 +167,30 @@ type Native struct {
 	db  *stateDB
 }
 
-// NewNative returns a Native lister over the state database under env.CodexHome.
-func NewNative(env sessions.Env) *Native { return &Native{Env: env, db: &stateDB{home: env.CodexHome}} }
+// NewNative returns a Native lister over the state database under env.CodexHome. Close it when done; one that
+// New made shares the Source's handle, which the Source closes.
+func NewNative(env sessions.Env) *Native { return &Native{Env: env} }
 
-// List finds the live Codex sessions.
+// Close closes the state database, if it was opened.
+func (n *Native) Close() error { return n.db.close() }
+
+func (n *Native) state() *stateDB {
+	if n.db == nil {
+		n.db = &stateDB{home: n.Env.CodexHome}
+	}
+	return n.db
+}
+
+// List finds the live Codex sessions. A failed thread lookup still lists the process, without its thread.
 func (n *Native) List(ctx context.Context, w *sessions.World) ([]sessions.Found, error) {
 	var out []sessions.Found
+	var errs []error
 	for _, pa := range w.PaneAgents() {
 		if pa.Kind != "codex" {
 			continue
 		}
-		f := n.agent(ctx, w, pa.PID)
+		f, err := n.agent(ctx, w, pa.PID)
+		errs = append(errs, err)
 		f.Cwd, f.Where, f.Pane = text.FirstNonEmpty(f.Cwd, pa.Pane.Path), pa.Pane.Target(), pa.Pane.ID
 		if f.Name == "codex" {
 			f.Name = text.FirstNonEmpty(pa.Pane.WindowName, f.Name)
@@ -181,19 +210,20 @@ func (n *Native) List(ctx context.Context, w *sessions.World) ([]sessions.Found,
 		if parent := w.Proc(p.PPID); parent != nil && sessions.KindOf(parent.Argv) == "codex" {
 			continue
 		}
-		f := n.agent(ctx, w, pid)
+		f, err := n.agent(ctx, w, pid)
+		errs = append(errs, err)
 		f.Where = "tty"
 		if f.Thread != "" {
 			out = append(out, f)
 		}
 	}
-	return out, nil
+	return out, errors.Join(errs...)
 }
 
 var reRollout = regexp.MustCompile(`rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$`)
 
 // agent describes the session behind a Codex process: the main thread among the rollouts it holds open.
-func (n *Native) agent(ctx context.Context, w *sessions.World, pid int) sessions.Found {
+func (n *Native) agent(ctx context.Context, w *sessions.World, pid int) (sessions.Found, error) {
 	p := w.Proc(pid)
 	f := sessions.Found{Tool: "codex", Name: "codex", PID: pid, ProcStart: p.StartTicks}
 	for _, c := range w.Procs.Children(pid) {
@@ -207,9 +237,9 @@ func (n *Native) agent(ctx context.Context, w *sessions.World, pid int) sessions
 			ids = append(ids, m[1])
 		}
 	}
-	th := n.db.main(ctx, ids)
+	th, err := n.state().main(ctx, ids)
 	if th == nil {
-		return f
+		return f, err
 	}
 	f.Thread, f.Cwd, f.Model = th.id, th.cwd, th.model
 	f.Named = th.name != ""
@@ -218,20 +248,19 @@ func (n *Native) agent(ctx context.Context, w *sessions.World, pid int) sessions
 	if fi, err := os.Stat(th.rollout); err == nil && fi.ModTime().After(f.LastActive) {
 		f.LastActive = fi.ModTime()
 	}
-	return f
+	return f, nil
 }
 
-// stateDB is Codex's state database, opened read-only once it exists: the newest state_<n>.sqlite under the
-// Codex home.
+// stateDB is Codex's state database: the newest state_<n>.sqlite under the Codex home, opened read-only. Each use
+// looks again, so a Codex that moved to a newer file is followed.
 type stateDB struct {
 	home string
+	path string
 	db   *sql.DB
 }
 
-func (s *stateDB) get() *sql.DB {
-	if s.db != nil {
-		return s.db
-	}
+// get returns the database, or nil while Codex has none here.
+func (s *stateDB) get() (*sql.DB, error) {
 	files, _ := filepath.Glob(filepath.Join(s.home, "state_*.sqlite"))
 	best, bestN := "", -1
 	for _, f := range files {
@@ -240,17 +269,27 @@ func (s *stateDB) get() *sql.DB {
 			best, bestN = f, n
 		}
 	}
-	if best != "" {
-		s.db, _ = sql.Open("sqlite", "file:"+best+"?mode=ro&_pragma=busy_timeout(500)")
+	if best != s.path {
+		s.close()
+		if best != "" {
+			db, err := sql.Open("sqlite", "file:"+best+"?mode=ro&_pragma=busy_timeout(500)")
+			if err != nil {
+				return nil, err
+			}
+			s.db, s.path = db, best
+		}
 	}
-	return s.db
+	return s.db, nil
 }
 
+// close closes the database; closing again, or a nil stateDB, is a no-op.
 func (s *stateDB) close() error {
-	if s.db != nil {
-		return s.db.Close()
+	if s == nil || s.db == nil {
+		return nil
 	}
-	return nil
+	err := s.db.Close()
+	s.db, s.path = nil, ""
+	return err
 }
 
 type thread struct {
@@ -262,14 +301,17 @@ type thread struct {
 // main returns the thread among ids that is not a subagent's; after /new or /resume a process can hold two, and
 // the one updated last is current. A subagent thread can have no role, so the role alone does not tell; its
 // source and thread_source do.
-func (s *stateDB) main(ctx context.Context, ids []string) *thread {
-	db := s.get()
-	if db == nil || len(ids) == 0 {
-		return nil
+func (s *stateDB) main(ctx context.Context, ids []string) (*thread, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	db, err := s.get()
+	if db == nil || err != nil {
+		return nil, err
 	}
 	rows, err := db.QueryContext(ctx, `select * from threads where id in (?`+strings.Repeat(",?", len(ids)-1)+`)`, anys(ids)...)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("threads: %w", err)
 	}
 	defer rows.Close()
 	cols, _ := rows.Columns()
@@ -295,7 +337,7 @@ func (s *stateDB) main(ctx context.Context, ids []string) *thread {
 			best = th
 		}
 	}
-	return best
+	return best, rows.Err()
 }
 
 func anys(xs []string) []any {

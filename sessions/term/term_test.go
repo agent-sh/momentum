@@ -8,14 +8,14 @@ import (
 )
 
 func TestParsePanesReadsTheTabSeparatedFormat(t *testing.T) {
-	out := "%3\twork\t1\t0\tmy window\t4242\t/home/u/repo\t✳ title with\ttab\n" + // a title with a tab is malformed: skipped
+	out := "%3\twork\t1\t0\tmy window\t4242\t/home/u/repo\t✳ title with\ttab\n" + // a program put a tab in its title
 		"%4\twork\t1\t1\teditor\t4243\t/home/u/repo\tclaude\n" +
 		"garbage\n"
 	ps := term.ParsePanes(out)
-	if len(ps) != 1 {
+	if len(ps) != 2 || ps[0].Title != "✳ title with\ttab" || ps[0].PID != 4242 {
 		t.Fatalf("panes %+v", ps)
 	}
-	p := ps[0]
+	p := ps[1]
 	if p.ID != "%4" || p.PID != 4243 || p.WindowName != "editor" || p.Path != "/home/u/repo" || p.Target() != "work:1.1" {
 		t.Fatalf("pane %+v", p)
 	}

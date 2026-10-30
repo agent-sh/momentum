@@ -129,13 +129,14 @@ func TestUnexpectedIdleVerdictSettlesWithoutRepeatedReviews(t *testing.T) {
 
 func TestParseKeepsOnlyEvidencedRequests(t *testing.T) {
 	now := time.Now()
-	s := &sessions.Session{Phase: sessions.Idle, LastText: "Tests pass.\n\nShould I merge   it now?", Size: 99}
+	s := &sessions.Session{Phase: sessions.Idle, LastText: "Tests pass.\n\nShould I merge   it now?", Size: 99, Seq: 12}
 	reply := "Here you go:\n" + `{"dossier":"# Merge the fix\n**State:** green — ready","overall":"Fix is **green**","now":"waiting","needs_you":"Approve the merge","ask_evidence":"Should I merge it now?","verdict":"needs_you"}` + "\nthanks"
 	r, dossier, err := verdict.Parse(reply, s, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Verdict != verdict.VerdictNeedsYou || r.NeedsYou != "Approve the merge" || r.Overall != "Fix is green" || r.ReviewedText != s.LastText || r.Size != 99 {
+	if r.Verdict != verdict.VerdictNeedsYou || r.NeedsYou != "Approve the merge" || r.Overall != "Fix is green" || r.ReviewedText != s.LastText ||
+		r.Size != 99 || r.Seq != 12 || !r.At.Equal(now) {
 		t.Fatalf("review %+v", r)
 	}
 	if dossier != "# Merge the fix\n**State:** green , ready" || verdict.Title(dossier) != "Merge the fix" {

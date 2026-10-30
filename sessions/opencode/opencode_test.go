@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -83,8 +84,9 @@ func TestOpencodeTerminalsAndTheirSessions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := &sessions.World{Now: start.Add(3 * time.Minute), Env: sessions.Env{DataHome: data}, Procs: tb}
-	src := New(w.Env)
+	env := sessions.Env{DataHome: data}
+	w := &sessions.World{Now: start.Add(3 * time.Minute), Procs: tb}
+	src := New(env)
 	defer src.Close()
 	ss, err := sessions.Scan(context.Background(), w, src)
 	if err != nil {
@@ -116,8 +118,9 @@ func TestOpencodeStopsOnAnError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := &sessions.World{Now: start.Add(2 * time.Minute), Env: sessions.Env{DataHome: data}, Procs: tb}
-	ss, err := sessions.Scan(context.Background(), w, New(w.Env))
+	env := sessions.Env{DataHome: data}
+	w := &sessions.World{Now: start.Add(2 * time.Minute), Procs: tb}
+	ss, err := sessions.Scan(context.Background(), w, New(env))
 	if err != nil || len(ss) != 1 || ss[0].Phase != sessions.NeedsYou || ss[0].Ask != "stopped on an error: quota exceeded" {
 		t.Fatalf("got %v %+v", err, ss)
 	}
@@ -133,10 +136,14 @@ func TestTheLogReadsMessagesThatShareAMillisecondOnce(t *testing.T) {
 	src.open()
 	defer src.Close()
 	l := &dbLog{}
-	src.readLog(context.Background(), "s", l)
+	if err := src.readLog(context.Background(), "s", l); err != nil {
+		t.Fatal(err)
+	}
 	d.message("b", "s", at, map[string]any{"role": "user"}) // the same millisecond
 	d.part("pb", "b", "s", at, map[string]any{"type": "text", "text": "second"})
-	src.readLog(context.Background(), "s", l)
+	if err := src.readLog(context.Background(), "s", l); err != nil {
+		t.Fatal(err)
+	}
 	items, _ := l.log.Since(0)
 	if len(items) != 2 || items[0].Text != "first" || items[1].Text != "second" {
 		t.Fatalf("log %+v", items)
@@ -145,8 +152,9 @@ func TestTheLogReadsMessagesThatShareAMillisecondOnce(t *testing.T) {
 
 func TestNoOpencodeNoSessions(t *testing.T) {
 	tb, _ := proc.Read(fake.ProcRoot(t, fake.Proc{PID: 5, Argv: []string{"opencode"}, Cwd: t.TempDir()}))
-	w := &sessions.World{Now: time.Now(), Env: sessions.Env{DataHome: t.TempDir()}, Procs: tb}
-	if ss, err := sessions.Scan(context.Background(), w, New(w.Env)); err != nil || len(ss) != 0 {
+	env := sessions.Env{DataHome: t.TempDir()}
+	w := &sessions.World{Now: time.Now(), Procs: tb}
+	if ss, err := sessions.Scan(context.Background(), w, New(env)); err != nil || len(ss) != 0 {
 		t.Fatalf("got %v %v", ss, err)
 	}
 }
@@ -161,9 +169,54 @@ func TestTheLastTextIsTheAssistantsNotTheUsers(t *testing.T) {
 	d.message("m2", "ses", start.Add(3*time.Second), map[string]any{"role": "user"})
 	d.part("p2", "m2", "ses", start.Add(3*time.Second), map[string]any{"type": "text", "text": "Can you approve the restart?"})
 	tb, _ := proc.Read(fake.ProcRoot(t, fake.Proc{PID: 5, Argv: []string{"opencode"}, Start: 1000, Cwd: cwd}))
-	w := &sessions.World{Now: start.Add(2 * time.Minute), Env: sessions.Env{DataHome: data}, Procs: tb}
-	ss, err := sessions.Scan(context.Background(), w, New(w.Env))
+	env := sessions.Env{DataHome: data}
+	w := &sessions.World{Now: start.Add(2 * time.Minute), Procs: tb}
+	ss, err := sessions.Scan(context.Background(), w, New(env))
 	if err != nil || len(ss) != 1 || ss[0].LastText != "Done; the parser is fixed." {
 		t.Fatalf("got %v %+v", err, ss)
+	}
+}
+
+func TestTheLogReadsAConversationLongerThanAPage(t *testing.T) {
+	data, cwd := t.TempDir(), t.TempDir()
+	start := time.Unix(fake.Boot, 0).Add(10 * time.Second)
+	d := newDB(t, data)
+	d.session("ses", "", cwd, "long", start.Add(time.Second), start.Add(time.Hour))
+	old := pageMessages
+	pageMessages = 3
+	t.Cleanup(func() { pageMessages = old })
+	for i := 0; i < 8; i++ {
+		id := fmt.Sprintf("m%d", i)
+		d.message(id, "ses", start.Add(time.Duration(2+i)*time.Second), map[string]any{"role": "user"})
+		d.part("p"+id, id, "ses", start.Add(time.Duration(2+i)*time.Second), map[string]any{"type": "text", "text": id})
+	}
+	tb, _ := proc.Read(fake.ProcRoot(t, fake.Proc{PID: 5, Argv: []string{"opencode"}, Start: 1000, Cwd: cwd}))
+	env := sessions.Env{DataHome: data}
+	src := New(env)
+	defer src.Close()
+	w := &sessions.World{Now: start.Add(2 * time.Hour), Procs: tb}
+	first, err := sessions.Scan(context.Background(), w, src)
+	if err != nil || len(first) != 1 || first[0].Seq != 8 {
+		t.Fatalf("one scan reads every page: %v %+v", err, first)
+	}
+	w2 := &sessions.World{Now: start.Add(2*time.Hour + time.Minute), Procs: tb}
+	again, _ := sessions.Scan(context.Background(), w2, src)
+	if again[0].Seq != 8 {
+		t.Fatalf("nothing new, so the log length stays: %d", again[0].Seq)
+	}
+}
+
+func TestOpencodeReportsAQueryThatFails(t *testing.T) {
+	data, cwd := t.TempDir(), t.TempDir()
+	d := newDB(t, data)
+	d.exec(`DROP TABLE part`) // a schema this reader does not know
+	d.session("ses", "", cwd, "x", time.Unix(fake.Boot, 0).Add(11*time.Second), time.Unix(fake.Boot, 0).Add(time.Minute))
+	d.message("m1", "ses", time.Unix(fake.Boot, 0).Add(12*time.Second), map[string]any{"role": "user"})
+	tb, _ := proc.Read(fake.ProcRoot(t, fake.Proc{PID: 5, Argv: []string{"opencode"}, Start: 1000, Cwd: cwd}))
+	env := sessions.Env{DataHome: data}
+	w := &sessions.World{Now: time.Unix(fake.Boot, 0).Add(2 * time.Minute), Procs: tb}
+	ss, err := sessions.Scan(context.Background(), w, New(env))
+	if err == nil || len(ss) != 1 {
+		t.Fatalf("the session still shows, and the error says what failed: %v %+v", err, ss)
 	}
 }

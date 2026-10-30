@@ -43,10 +43,10 @@ func TestAPhaseChangeSeenLateDatesFromTheTurnsEnd(t *testing.T) {
 	if !s.Since.Equal(end) {
 		t.Fatalf("since %v, want the turn's end %v", s.Since, end)
 	}
-	done := sess("a", sessions.Done, 9, end) // a review settled it; the session itself did not move
-	st.Apply([]*sessions.Session{done}, t0.Add(12*time.Minute))
-	if !done.Since.Equal(t0.Add(12 * time.Minute)) {
-		t.Fatalf("a change without a move dates from the run: %v", done.Since)
+	asks := sess("a", sessions.NeedsYou, 9, end) // a permission dialog opened; the transcript did not move
+	st.Apply([]*sessions.Session{asks}, t0.Add(12*time.Minute))
+	if !asks.Since.Equal(t0.Add(12 * time.Minute)) {
+		t.Fatalf("a change without a move dates from the run: %v", asks.Since)
 	}
 }
 

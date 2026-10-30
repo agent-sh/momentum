@@ -3,6 +3,7 @@ package hermes
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -72,8 +73,9 @@ func TestHermesListsConversationsAndRunningAutomation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := &sessions.World{Now: now, Env: sessions.Env{HermesHome: home}, Procs: tb}
-	src := New(w.Env)
+	env := sessions.Env{HermesHome: home}
+	w := &sessions.World{Now: now, Procs: tb}
+	src := New(env)
 	defer src.Close()
 	ss, err := sessions.Scan(context.Background(), w, src)
 	if err != nil {
@@ -110,16 +112,62 @@ func TestHermesBeforeOwnerStartTimes(t *testing.T) {
 	exec(t, db, `INSERT INTO sessions VALUES ('c', 'cli', 't', '', '', '', ?, NULL, ?, '', 0, 0)`, sec-60, sec-30)
 	exec(t, db, `INSERT INTO async_delegations VALUES ('d1', 'c', 'c', NULL, 'running', ?, ?, 44, '{"goal":"g"}')`, sec-60, sec-30)
 	tb, _ := proc.Read(fake.ProcRoot(t, fake.Proc{PID: 44, Argv: []string{"hermes"}, Start: 4400}))
-	w := &sessions.World{Now: now, Env: sessions.Env{HermesHome: home}, Procs: tb}
-	ss, err := sessions.Scan(context.Background(), w, New(w.Env))
+	env := sessions.Env{HermesHome: home}
+	w := &sessions.World{Now: now, Procs: tb}
+	ss, err := sessions.Scan(context.Background(), w, New(env))
 	if err != nil || len(ss) != 1 || len(ss[0].Tasks) != 1 {
 		t.Fatalf("got %v %+v", err, ss)
 	}
 }
 
 func TestNoHermesNoSessions(t *testing.T) {
-	w := &sessions.World{Now: time.Now(), Env: sessions.Env{HermesHome: t.TempDir()}, Procs: &proc.Table{ByPID: map[int]*proc.Proc{}}}
-	if ss, err := sessions.Scan(context.Background(), w, New(w.Env)); err != nil || len(ss) != 0 {
+	env := sessions.Env{HermesHome: t.TempDir()}
+	w := &sessions.World{Now: time.Now(), Procs: &proc.Table{ByPID: map[int]*proc.Proc{}}}
+	if ss, err := sessions.Scan(context.Background(), w, New(env)); err != nil || len(ss) != 0 {
 		t.Fatalf("got %v %v", ss, err)
+	}
+}
+
+func TestTheLogReadsAConversationLongerThanAPage(t *testing.T) {
+	home := t.TempDir()
+	now := time.Unix(fake.Boot+86400, 0)
+	sec := float64(now.Unix())
+	db := stateDB(t, home, true)
+	exec(t, db, `INSERT INTO sessions VALUES ('c', 'cli', 't', '', '', '', ?, NULL, ?, '', 0, 0)`, sec-3600, sec-3000)
+	for i := 0; i < 7; i++ {
+		exec(t, db, `INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('c', 'user', ?, '', ?)`, fmt.Sprint("m", i), sec-3500+float64(i))
+	}
+	exec(t, db, `INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('c', 'assistant', 'Done.', '', ?)`, sec-3400)
+	old := pageRows
+	pageRows = 3
+	t.Cleanup(func() { pageRows = old })
+	tb, _ := proc.Read(fake.ProcRoot(t))
+	src := New(sessions.Env{HermesHome: home})
+	defer src.Close()
+	first, err := sessions.Scan(context.Background(), &sessions.World{Now: now, Procs: tb}, src)
+	if err != nil || len(first) != 1 || first[0].Seq != 8 {
+		t.Fatalf("one scan reads every page: %v %+v", err, first)
+	}
+	again, _ := sessions.Scan(context.Background(), &sessions.World{Now: now.Add(time.Minute), Procs: tb}, src)
+	if again[0].Seq != 8 || again[0].Phase != sessions.Idle {
+		t.Fatalf("nothing new, so the log length stays: %+v", again[0])
+	}
+}
+
+func TestHermesNamesProjectsFromTheWorkingDirectory(t *testing.T) {
+	home := t.TempDir()
+	now := time.Unix(fake.Boot+86400, 0)
+	sec := float64(now.Unix())
+	db := stateDB(t, home, true)
+	exec(t, db, `INSERT INTO sessions VALUES ('a', 'cli', 't', '', '/w/code/app', '', ?, NULL, ?, '', 0, 0)`, sec-60, sec-30)
+	exec(t, db, `INSERT INTO sessions VALUES ('b', 'mobile', 't', '', '', '', ?, NULL, ?, '', 0, 0)`, sec-60, sec-30)
+	tb, _ := proc.Read(fake.ProcRoot(t))
+	ss, err := sessions.Scan(context.Background(), &sessions.World{Now: now, Procs: tb}, New(sessions.Env{HermesHome: home, Projects: []string{"/w/code"}}))
+	got := map[string]string{}
+	for _, s := range ss {
+		got[s.Key] = s.Project
+	}
+	if err != nil || got["hermes:a"] != "app" || got["hermes:b"] != "mobile" {
+		t.Fatalf("got %v %v", err, got)
 	}
 }

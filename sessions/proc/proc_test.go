@@ -87,3 +87,13 @@ func TestSlotsGiveEachProcessTheNextStartInItsDirectory(t *testing.T) {
 		t.Fatalf("next starts: %+v", slots)
 	}
 }
+
+func TestACorruptStartIsLeftUnset(t *testing.T) {
+	tb, err := proc.Read(fake.ProcRoot(t, fake.Proc{PID: 3, Argv: []string{"x"}, Start: 18446744073709551615}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := tb.ByPID[3]; p.StartTicks != 18446744073709551615 || !p.Start.IsZero() {
+		t.Fatalf("a start no Duration can hold must not wrap around: %+v", p)
+	}
+}

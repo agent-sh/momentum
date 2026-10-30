@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -120,6 +121,7 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 	}
 	rows.Close()
 	var out []*sessions.Session
+	var errs []error
 	for _, h := range hs {
 		l := leases[h.id]
 		if !Human[h.source] && !l.live {
@@ -127,19 +129,23 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 		}
 		s := &sessions.Session{Key: "hermes:" + h.id, Tool: "hermes", Auto: !Human[h.source],
 			Name: text.FirstNonEmpty(text.OneLine(h.title, 60), text.OneLine(h.display, 60), "hermes "+h.source), Cwd: h.cwd,
-			Project: h.source, Where: h.source, Model: h.model, Started: epoch(h.started), LastActive: epoch(h.last), Tasks: []sessions.Task{}}
+			Project: text.FirstNonEmpty(src.Env.Project(h.cwd), h.source), Where: h.source, Model: h.model, Started: epoch(h.started),
+			LastActive: epoch(h.last), Tasks: []sessions.Task{}}
 		if l.terminal && (h.source == "cli" || h.source == "tui") {
 			s.PID = l.pid // only a terminal chat can be opened or typed into
 		}
-		s.TurnOpen = src.facts(ctx, h.id, s) || l.live
+		open, err := src.facts(ctx, h.id, s)
+		s.TurnOpen = open || l.live
 		lg := src.logOf(s.Key)
-		src.readLog(ctx, h.id, lg)
+		errs = append(errs, err, src.readLog(ctx, h.id, lg))
 		s.Log = &lg.log
 		if s.TurnOpen && s.Now == "" && h.act != "" {
 			s.Now, s.NowSince = text.OneLine(h.act, 140), s.LastActive
 		}
 		s.Size = int64(h.last * 1000)
-		s.Tasks = append(s.Tasks, src.delegations(ctx, h.id, w)...)
+		kids, err := src.delegations(ctx, h.id, w)
+		s.Tasks = append(s.Tasks, kids...)
+		errs = append(errs, err)
 		out = append(out, s)
 		src.seen[s.Key] = w.Now
 	}
@@ -149,7 +155,7 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 			delete(src.seen, k)
 		}
 	}
-	return out, nil
+	return out, errors.Join(errs...)
 }
 
 func (src *Source) logOf(key string) *dbLog {
@@ -162,11 +168,11 @@ func (src *Source) logOf(key string) *dbLog {
 }
 
 // facts reads the latest messages; it reports whether a turn is open.
-func (src *Source) facts(ctx context.Context, id string, s *sessions.Session) bool {
+func (src *Source) facts(ctx context.Context, id string, s *sessions.Session) (bool, error) {
 	rows, err := src.db.QueryContext(ctx, `select role, coalesce(content, ''), coalesce(tool_calls, ''), timestamp
 		from messages where session_id = ? and role in ('user', 'assistant', 'tool') order by id desc limit 12`, id)
 	if err != nil {
-		return false
+		return false, fmt.Errorf("messages: %w", err)
 	}
 	defer rows.Close()
 	first, open := true, false
@@ -190,7 +196,7 @@ func (src *Source) facts(ctx context.Context, id string, s *sessions.Session) bo
 			s.LastText = strings.TrimSpace(content)
 		}
 	}
-	return open
+	return open, rows.Err()
 }
 
 func toolCalls(raw string) [][2]string {
@@ -210,15 +216,30 @@ func toolCalls(raw string) [][2]string {
 	return out
 }
 
-// readLog appends the messages written since the last read.
-func (src *Source) readLog(ctx context.Context, id string, l *dbLog) {
+// pageRows is how many messages one query reads; the log reads page after page until it has them all.
+var pageRows = 3000
+
+// readLog appends every message written since the last read: a log that stopped at one page would make its
+// length mean how much was read, not what the conversation did.
+func (src *Source) readLog(ctx context.Context, id string, l *dbLog) error {
+	for {
+		n, err := src.readPage(ctx, id, l)
+		if err != nil || n < pageRows {
+			return err
+		}
+	}
+}
+
+func (src *Source) readPage(ctx context.Context, id string, l *dbLog) (int, error) {
 	rows, err := src.db.QueryContext(ctx, `select id, role, coalesce(content, ''), coalesce(tool_calls, '') from messages
-		where session_id = ? and id > ? and role in ('user', 'assistant', 'tool') order by id limit 3000`, id, l.cursor)
+		where session_id = ? and id > ? and role in ('user', 'assistant', 'tool') order by id limit ?`, id, l.cursor, pageRows)
 	if err != nil {
-		return
+		return 0, fmt.Errorf("log: %w", err)
 	}
 	defer rows.Close()
+	n := 0
 	for rows.Next() {
+		n++
 		var mid int64
 		var role, content, calls string
 		if rows.Scan(&mid, &role, &content, &calls) != nil {
@@ -239,11 +260,12 @@ func (src *Source) readLog(ctx context.Context, id string, l *dbLog) {
 		}
 		l.cursor = mid
 	}
+	return n, rows.Err()
 }
 
 // delegations returns a conversation's async delegations still in flight. One whose owner process is gone (or
 // whose pid now names another process: the start time differs) will never complete, so it is left out.
-func (src *Source) delegations(ctx context.Context, id string, w *sessions.World) []sessions.Task {
+func (src *Source) delegations(ctx context.Context, id string, w *sessions.World) ([]sessions.Task, error) {
 	const q = `select delegation_id, coalesce(task_json, ''), dispatched_at, updated_at, coalesce(owner_pid, 0), %s
 		from async_delegations where (origin_session_id = ? or origin_session = ? or parent_session_id = ?)
 		and state not in ('completed', 'failed', 'cancelled', 'canceled', 'error', 'timeout')`
@@ -252,7 +274,7 @@ func (src *Source) delegations(ctx context.Context, id string, w *sessions.World
 		rows, err = src.db.QueryContext(ctx, fmt.Sprintf(q, "0"), id, id, id)
 	}
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("delegations: %w", err)
 	}
 	defer rows.Close()
 	var out []sessions.Task
@@ -274,7 +296,7 @@ func (src *Source) delegations(ctx context.Context, id string, w *sessions.World
 		json.Unmarshal([]byte(task), &tj)
 		out = append(out, sessions.Task{ID: did, Kind: "agent", Label: text.OneLine(tj.Goal, 90), Type: tj.Role, Started: epoch(disp), LastActive: epoch(upd)})
 	}
-	return out
+	return out, rows.Err()
 }
 
 // epoch reads Hermes's float Unix seconds.

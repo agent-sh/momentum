@@ -14,9 +14,10 @@ import (
 )
 
 // World is one snapshot of the machine that every source reads: the time, the processes and the tmux panes.
+// Where each harness keeps its files is the Source's own Env. A World is not changed after Snapshot, so
+// goroutines can share it.
 type World struct {
 	Now   time.Time
-	Env   Env
 	Procs *proc.Table
 	Panes []term.Pane
 
@@ -32,7 +33,7 @@ func Snapshot(ctx context.Context, env Env, now time.Time) (*World, error) {
 	if err != nil {
 		return nil, fmt.Errorf("process table: %w", err)
 	}
-	w := &World{Now: now, Env: env, Procs: t}
+	w := &World{Now: now, Procs: t}
 	if w.Panes, err = term.ListPanes(ctx); err != nil {
 		return w, fmt.Errorf("tmux panes: %w", err)
 	}

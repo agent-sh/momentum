@@ -190,7 +190,7 @@ func TestDiscoveryPicksTheMainThreadAndItsRunningSubagents(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := sessions.Env{CodexHome: home}
-	w := &sessions.World{Now: main.at, Env: env, Procs: tb, Panes: []term.Pane{
+	w := &sessions.World{Now: main.at, Procs: tb, Panes: []term.Pane{
 		{ID: "%7", Session: "dev", Window: "2", Index: "0", WindowName: "codex-win", PID: 10, Path: "/w/app"},
 		{ID: "%8", Session: "dev", Window: "3", Index: "0", WindowName: "fresh", PID: 40, Path: "/w/new"},
 	}}
@@ -226,7 +226,7 @@ func TestACodexWithoutARolloutTakesItsTurnFromTheInhibitor(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := sessions.Env{CodexHome: t.TempDir()}
-	w := &sessions.World{Now: t0, Env: env, Procs: tb, Panes: []term.Pane{{ID: "%1", PID: 10}}}
+	w := &sessions.World{Now: t0, Procs: tb, Panes: []term.Pane{{ID: "%1", PID: 10}}}
 	ss, err := sessions.Scan(context.Background(), w, New(env))
 	if err != nil || len(ss) != 1 || ss[0].Phase != sessions.Working {
 		t.Fatalf("got %v %+v", err, ss)
@@ -235,7 +235,8 @@ func TestACodexWithoutARolloutTakesItsTurnFromTheInhibitor(t *testing.T) {
 
 func TestAfterNewTheThreadUpdatedLastIsCurrent(t *testing.T) {
 	home := t.TempDir()
-	const oldID, newID = "01a30000-0000-7000-8000-00000000000a", "01a20000-0000-7000-8000-00000000000b"
+	// thread ids are time-ordered, so the thread /new made sorts after the one it replaced
+	const oldID, newID = "01a20000-0000-7000-8000-00000000000a", "01a30000-0000-7000-8000-00000000000b"
 	old := newRollout(t, home, oldID).start().done("old work done")
 	cur := newRollout(t, home, newID).start()
 	ms := t0.UnixMilli()
@@ -248,11 +249,50 @@ func TestAfterNewTheThreadUpdatedLastIsCurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := sessions.Env{CodexHome: home}
-	w := &sessions.World{Now: cur.at, Env: env, Procs: tb}
+	w := &sessions.World{Now: cur.at, Procs: tb}
 	src := New(env)
 	defer src.Close()
 	ss, err := sessions.Scan(context.Background(), w, src)
 	if err != nil || len(ss) != 1 || ss[0].Key != newID || ss[0].Where != "tty" || !ss[0].Named || ss[0].Name != "named" || ss[0].Phase != sessions.Working {
 		t.Fatalf("got %v %+v", err, ss)
+	}
+}
+
+type listed []sessions.Found
+
+func (l listed) List(context.Context, *sessions.World) ([]sessions.Found, error) { return l, nil }
+
+func TestASourceWithAnotherListerReadsRolloutsAndSubagents(t *testing.T) {
+	home := t.TempDir()
+	main := newRollout(t, home, mainID).start().call("c1", "spawn_agent", `{"task_name":"x"}`)
+	child := newRollout(t, home, childID).start()
+	ms := t0.UnixMilli()
+	state(t, home, [][]any{{childID, child.path, ms / 1000, ms / 1000, `{"subagent":{}}`, "/w", "", "Kant", nil, nil, ms, ms, "subagent", nil}},
+		[][]any{{mainID, childID, "open"}})
+	tb, err := proc.Read(fake.ProcRoot(t, fake.Proc{PID: 5, Argv: []string{"codex"}, Start: 500}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// a struct literal, as a board that brings its own list builds it
+	src := &Source{Env: sessions.Env{CodexHome: home}, Lister: listed{
+		{Tool: "codex", Thread: mainID, PID: 5, Transcript: main.path},
+		{Tool: "codex", PID: 5, Name: "no thread yet"}, // the start comes from the process table
+		{Tool: "codex", Thread: "x", Host: "elsewhere"},
+	}}
+	ss, err := sessions.Scan(context.Background(), &sessions.World{Now: main.at, Procs: tb}, src)
+	if err != nil || len(ss) != 2 {
+		t.Fatalf("got %v %+v", err, ss)
+	}
+	if ss[0].Phase != sessions.Background && ss[0].Phase != sessions.Working || len(ss[0].Tasks) != 1 {
+		t.Fatalf("main: %+v", ss[0])
+	}
+	if ss[1].Key != "codex:proc:5:500" {
+		t.Fatalf("a row without a start is keyed by the process's real start: %q", ss[1].Key)
+	}
+	if err := src.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Source{}).Close(); err != nil {
+		t.Fatal("closing a Source that never opened its database is fine")
 	}
 }

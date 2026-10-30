@@ -68,7 +68,7 @@ func newMachine(t *testing.T) *machine {
 		{ID: "%4", Session: "main", Window: "3", Index: "0", PID: 400},
 		{ID: "%5", Session: "old", Window: "0", Index: "0", WindowName: "legacy", PID: 800, Path: "/srv/legacy"},
 	}
-	m.w = &sessions.World{Now: time.Unix(fake.Boot+3600, 0), Env: m.env, Procs: tb, Panes: panes}
+	m.w = &sessions.World{Now: time.Unix(fake.Boot+3600, 0), Procs: tb, Panes: panes}
 	return m
 }
 
@@ -171,5 +171,57 @@ func TestTranscriptPathFallsBackToAnyProjectDirectory(t *testing.T) {
 	}
 	if TranscriptPath(dir, "none", "/x") != "" || TranscriptPath(dir, "", "/x") != "" {
 		t.Fatal("no transcript")
+	}
+}
+
+func TestABackgroundSessionsLiveStatusIsReadFresh(t *testing.T) {
+	m := newMachine(t)
+	n := m.native()
+	ctx := context.Background()
+	found, _ := n.List(ctx, m.w)
+	if job := byKey(found)["job1"]; job.Status != "waiting" || job.JobState != "failed" {
+		t.Fatalf("setup %+v", job)
+	}
+	// the prompt was answered and the job went back to work; the cached list still says otherwise
+	fake.File(t, filepath.Join(m.env.ClaudeDir, "sessions", "700.json"), `{"pid":700,"sessionId":"s7","kind":"bg","status":"busy"}`)
+	fake.File(t, filepath.Join(m.env.ClaudeDir, "jobs", "job1", "state.json"), `{"state":"working"}`)
+	m.w.Now = m.w.Now.Add(30 * time.Second)
+	found, _ = n.List(ctx, m.w)
+	if job := byKey(found)["job1"]; job.Status != "busy" || job.WaitingFor != "" || job.JobState != "working" || m.calls != 1 {
+		t.Fatalf("the probe and the state file win over the cached list: %+v (list ran %d times)", job, m.calls)
+	}
+}
+
+func TestAFailingBackgroundListIsNotRunAgainOnEveryScan(t *testing.T) {
+	m := newMachine(t)
+	n := m.native()
+	n.Agents = func(context.Context) ([]byte, error) { m.calls++; return nil, errors.New("hung") }
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		m.w.Now = m.w.Now.Add(15 * time.Second)
+		if _, err := n.List(ctx, m.w); err == nil {
+			t.Fatal("the failure is reported on every scan")
+		}
+	}
+	if m.calls != 1 {
+		t.Fatalf("ran %d times within Every", m.calls)
+	}
+	m.w.Now = m.w.Now.Add(n.Every)
+	n.List(ctx, m.w)
+	if m.calls != 2 {
+		t.Fatalf("tried again after Every: %d", m.calls)
+	}
+}
+
+func TestWithoutClaudeCodeThereIsNothingAndNoError(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	env := sessions.Env{Home: t.TempDir(), ClaudeDir: filepath.Join(t.TempDir(), "none")}
+	tb, err := proc.Read(fake.ProcRoot(t, fake.Proc{PID: 9, Argv: []string{"bash"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found, err := NewNative(env).List(context.Background(), &sessions.World{Now: time.Now(), Procs: tb})
+	if err != nil || len(found) != 0 {
+		t.Fatalf("got %v %+v", err, found)
 	}
 }

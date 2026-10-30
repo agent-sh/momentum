@@ -6,6 +6,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -112,8 +114,11 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 	}
 	used := map[string]bool{}
 	var out []*sessions.Session
+	var errs []error
 	for _, slot := range w.Procs.Slots(ps) {
-		if s := src.session(ctx, slot, used, w); s != nil {
+		s, err := src.session(ctx, slot, used, w)
+		errs = append(errs, err)
+		if s != nil {
 			out = append(out, s)
 			src.seen[s.Key] = w.Now
 		}
@@ -124,16 +129,18 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 			delete(src.seen, k)
 		}
 	}
-	return out, nil
+	return out, errors.Join(errs...)
 }
 
-func (src *Source) session(ctx context.Context, slot proc.Slot, used map[string]bool, w *sessions.World) *sessions.Session {
+// session finds and reads the session of one opencode process. A query that fails after the session is found
+// still returns what was read, with the error.
+func (src *Source) session(ctx context.Context, slot proc.Slot, used map[string]bool, w *sessions.World) (*sessions.Session, error) {
 	p, db := slot.Proc, src.db
 	start := p.Start.UnixMilli() - 1000
 	rows, err := db.QueryContext(ctx, `select id, title, time_created, time_updated from session where directory = ? and parent_id is null
 		and time_archived is null and time_updated >= ? order by time_updated desc limit 20`, slot.Cwd, start)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("sessions: %w", err)
 	}
 	var id, title, fid, ftitle string
 	var updated, fupdated int64
@@ -150,46 +157,55 @@ func (src *Source) session(ctx context.Context, slot proc.Slot, used map[string]
 			fid, ftitle, fupdated = i, t, u
 		}
 	}
+	err = rows.Err()
 	rows.Close()
 	if id == "" {
 		id, title, updated = fid, ftitle, fupdated
 	}
 	if id == "" {
-		return nil
+		return nil, err
 	}
 	used[id] = true
 	s := &sessions.Session{Key: "opencode:" + id, Tool: "opencode", Name: text.FirstNonEmpty(text.OneLine(title, 60), "opencode"),
-		Cwd: slot.Cwd, Project: w.Env.Project(slot.Cwd), Where: "tty", PID: p.PID, Started: p.Start,
+		Cwd: slot.Cwd, Project: src.Env.Project(slot.Cwd), Where: "tty", PID: p.PID, Started: p.Start,
 		LastActive: time.UnixMilli(updated), Tasks: []sessions.Task{}}
-	s.TurnOpen = src.facts(ctx, id, s)
+	errs := []error{err}
+	open, err := src.facts(ctx, id, s)
+	s.TurnOpen = open
+	errs = append(errs, err)
 	l := src.logOf(s.Key)
-	src.readLog(ctx, id, l)
+	errs = append(errs, src.readLog(ctx, id, l))
 	s.Log = &l.log
 	s.Size = updated
 	// subagents are child sessions with a turn still open
-	if crs, err := db.QueryContext(ctx, `select id, title, time_created, time_updated from session where parent_id = ? and time_updated > ?`,
-		id, w.Now.Add(-childWindow).UnixMilli()); err == nil {
-		type child struct {
-			id, title string
-			c, u      int64
-		}
-		var kids []child
-		for crs.Next() {
-			var k child
-			if crs.Scan(&k.id, &k.title, &k.c, &k.u) == nil {
-				kids = append(kids, k)
-			}
-		}
-		crs.Close()
-		for _, k := range kids {
-			cs := &sessions.Session{}
-			if src.facts(ctx, k.id, cs) {
-				s.Tasks = append(s.Tasks, sessions.Task{ID: k.id, Kind: "agent", Label: text.OneLine(k.title, 90),
-					Started: time.UnixMilli(k.c), LastActive: time.UnixMilli(k.u), Now: cs.Now})
-			}
+	crs, err := db.QueryContext(ctx, `select id, title, time_created, time_updated from session where parent_id = ? and time_updated > ?`,
+		id, w.Now.Add(-childWindow).UnixMilli())
+	if err != nil {
+		return s, errors.Join(append(errs, fmt.Errorf("subagents: %w", err))...)
+	}
+	type child struct {
+		id, title string
+		c, u      int64
+	}
+	var kids []child
+	for crs.Next() {
+		var k child
+		if crs.Scan(&k.id, &k.title, &k.c, &k.u) == nil {
+			kids = append(kids, k)
 		}
 	}
-	return s
+	errs = append(errs, crs.Err())
+	crs.Close()
+	for _, k := range kids {
+		cs := &sessions.Session{}
+		open, err := src.facts(ctx, k.id, cs)
+		errs = append(errs, err)
+		if open {
+			s.Tasks = append(s.Tasks, sessions.Task{ID: k.id, Kind: "agent", Label: text.OneLine(k.title, 90),
+				Started: time.UnixMilli(k.c), LastActive: time.UnixMilli(k.u), Now: cs.Now})
+		}
+	}
+	return s, errors.Join(errs...)
 }
 
 func (src *Source) logOf(key string) *dbLog {
@@ -201,12 +217,15 @@ func (src *Source) logOf(key string) *dbLog {
 	return l
 }
 
-// facts reads a session's last messages; it reports whether a turn is open.
-func (src *Source) facts(ctx context.Context, id string, s *sessions.Session) bool {
+// facts reads a session's last messages; it reports whether a turn is open. A session without messages has none.
+func (src *Source) facts(ctx context.Context, id string, s *sessions.Session) (bool, error) {
 	db := src.db
 	var data string
-	if db.QueryRowContext(ctx, `select data from message where session_id = ? order by time_created desc limit 1`, id).Scan(&data) != nil {
-		return false
+	switch err := db.QueryRowContext(ctx, `select data from message where session_id = ? order by time_created desc limit 1`, id).Scan(&data); {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("messages: %w", err)
 	}
 	var last message
 	json.Unmarshal([]byte(data), &last)
@@ -218,7 +237,7 @@ func (src *Source) facts(ctx context.Context, id string, s *sessions.Session) bo
 	rows, err := db.QueryContext(ctx, `select p.data, coalesce(m.data, '') from part p left join message m on m.id = p.message_id
 		where p.session_id = ? order by p.time_created desc limit 40`, id)
 	if err != nil {
-		return open
+		return open, fmt.Errorf("parts: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
@@ -238,16 +257,30 @@ func (src *Source) facts(ctx context.Context, id string, s *sessions.Session) bo
 			s.LastText = strings.TrimSpace(p.Text)
 		}
 	}
-	return open
+	return open, rows.Err()
 }
 
-// readLog appends the messages finished since the last read.
-func (src *Source) readLog(ctx context.Context, id string, l *dbLog) {
-	db := src.db
-	rows, err := db.QueryContext(ctx, `select id, time_created, data from message where session_id = ? and time_created >= ?
-		order by time_created, id limit 2000`, id, l.cursor)
+// pageMessages is how many messages one query reads; the log reads page after page until it has them all.
+var pageMessages = 2000
+
+// readLog appends the messages finished since the last read, all of them: a log that stopped at one page
+// would make its length mean how much was read, not what the session did.
+func (src *Source) readLog(ctx context.Context, id string, l *dbLog) error {
+	for {
+		n, more, err := src.readPage(ctx, id, l)
+		if err != nil || !more || n < pageMessages {
+			return err
+		}
+	}
+}
+
+// readPage reads one page of messages. more is false when it stopped at a message still streaming, or when the
+// page brought nothing new.
+func (src *Source) readPage(ctx context.Context, id string, l *dbLog) (n int, more bool, err error) {
+	rows, err := src.db.QueryContext(ctx, `select id, time_created, data from message where session_id = ? and time_created >= ?
+		order by time_created, id limit ?`, id, l.cursor, pageMessages)
 	if err != nil {
-		return
+		return 0, false, fmt.Errorf("log: %w", err)
 	}
 	type msg struct {
 		id string
@@ -263,17 +296,22 @@ func (src *Source) readLog(ctx context.Context, id string, l *dbLog) {
 			ms = append(ms, x)
 		}
 	}
+	err = rows.Err()
 	rows.Close()
+	if err != nil {
+		return 0, false, fmt.Errorf("log: %w", err)
+	}
+	read := 0
 	for _, x := range ms {
 		if x.at == l.cursor && l.atCur[x.id] {
 			continue
 		}
 		if x.m.Role == "assistant" && x.m.Time.Completed == 0 && x.m.Error == nil {
-			return // still streaming: read it once it is done
+			return len(ms), false, nil // still streaming: read it once it is done
 		}
-		prs, err := db.QueryContext(ctx, `select data from part where message_id = ? order by time_created`, x.id)
+		prs, err := src.db.QueryContext(ctx, `select data from part where message_id = ? order by time_created`, x.id)
 		if err != nil {
-			return
+			return len(ms), false, fmt.Errorf("log parts: %w", err)
 		}
 		for prs.Next() {
 			var data string
@@ -296,5 +334,7 @@ func (src *Source) readLog(ctx context.Context, id string, l *dbLog) {
 			l.cursor, l.atCur = x.at, map[string]bool{}
 		}
 		l.atCur[x.id] = true
+		read++
 	}
+	return len(ms), read > 0, nil
 }

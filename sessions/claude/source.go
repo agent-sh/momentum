@@ -63,7 +63,7 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 		}
 		keys[key] = true
 		s := &sessions.Session{Key: key, Tool: "claude", Name: f.Name, Named: f.Named && !reAutoName.MatchString(f.Name),
-			Cwd: f.Cwd, Project: w.Env.Project(f.Cwd), Where: f.Where, Pane: f.Pane, Job: f.Job, PID: f.PID, Model: f.Model,
+			Cwd: f.Cwd, Project: src.Env.Project(f.Cwd), Where: f.Where, Pane: f.Pane, Job: f.Job, PID: f.PID, Model: f.Model,
 			PRs: f.PRs, Started: f.Started, LastActive: f.LastActive, JobState: f.JobState, Tasks: []sessions.Task{}}
 		if f.JobState == "failed" {
 			s.Failed = text.FirstNonEmpty(text.OneLine(f.Detail, 200), "the job failed")
@@ -139,7 +139,7 @@ func (src *Source) screen(ctx context.Context, w *sessions.World, s *sessions.Se
 	case s.Pane != "":
 		return term.CapturePane(ctx, s.Pane)
 	case s.PID > 0:
-		return term.KittyScreen(ctx, w.Env.Proc, s.PID)
+		return term.KittyScreen(ctx, w.Procs.Root, s.PID)
 	}
 	return ""
 }

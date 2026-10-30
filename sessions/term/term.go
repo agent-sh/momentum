@@ -34,11 +34,18 @@ const paneFormat = "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\
 // Timeout bounds every terminal command.
 const Timeout = 10 * time.Second
 
+// command runs a read-only terminal command; a child that keeps its pipe open past the command does not hold it.
+func command(ctx context.Context, name string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = time.Second
+	return cmd
+}
+
 // ListPanes returns every pane of the default tmux server. No tmux, or no server, is no panes.
 func ListPanes(ctx context.Context) ([]Pane, error) {
 	ctx, cancel := context.WithTimeout(ctx, Timeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "tmux", "list-panes", "-a", "-F", paneFormat).Output()
+	out, err := command(ctx, "tmux", "list-panes", "-a", "-F", paneFormat).Output()
 	var exit *exec.ExitError
 	if errors.Is(err, exec.ErrNotFound) || errors.As(err, &exit) {
 		return nil, nil
@@ -49,11 +56,12 @@ func ListPanes(ctx context.Context) ([]Pane, error) {
 	return ParsePanes(string(out)), nil
 }
 
-// ParsePanes reads list-panes output in the format ListPanes asks for.
+// ParsePanes reads list-panes output in the format ListPanes asks for. The title comes last, so a tab a program
+// put in it stays in it.
 func ParsePanes(out string) []Pane {
 	var ps []Pane
 	for _, l := range strings.Split(out, "\n") {
-		f := strings.Split(l, "\t")
+		f := strings.SplitN(l, "\t", 8)
 		if len(f) != 8 {
 			continue
 		}
@@ -67,7 +75,7 @@ func ParsePanes(out string) []Pane {
 func CapturePane(ctx context.Context, id string) string {
 	ctx, cancel := context.WithTimeout(ctx, Timeout)
 	defer cancel()
-	out, _ := exec.CommandContext(ctx, "tmux", "capture-pane", "-p", "-t", id).Output()
+	out, _ := command(ctx, "tmux", "capture-pane", "-p", "-t", id).Output()
 	return string(out)
 }
 
@@ -99,7 +107,7 @@ func KittyScreen(ctx context.Context, procRoot string, pid int) string {
 	}
 	ctx, cancel := context.WithTimeout(ctx, Timeout)
 	defer cancel()
-	out, _ := exec.CommandContext(ctx, "kitty", "@", "--to", listen, "get-text", "--match", "id:"+win, "--extent", "screen").Output()
+	out, _ := command(ctx, "kitty", "@", "--to", listen, "get-text", "--match", "id:"+win, "--extent", "screen").Output()
 	return string(out)
 }
 

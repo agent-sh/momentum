@@ -3,7 +3,7 @@ package claude
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,9 +35,12 @@ type Native struct {
 	// Zero reads it on every List.
 	Every time.Duration
 
-	cache []agentRow
-	sig   string
-	at    time.Time
+	cache   []agentRow
+	sig     string
+	at      time.Time
+	failed  error // the last run's failure, reused like a list until Every passes
+	failSig string
+	failAt  time.Time
 }
 
 // NewNative returns a Native lister that reuses the background-session list for up to two minutes while the
@@ -124,12 +127,16 @@ func (n *Native) List(ctx context.Context, w *sessions.World) ([]sessions.Found,
 			continue // its process has exited; the session is not live
 		}
 		meta, job := probes[e.PID], n.job(e.ID)
+		// The list can be up to Every old; the probe and the state file are read now, so they win.
+		status, waitingFor := e.Status, e.WaitingFor
+		if meta.Status != "" {
+			status, waitingFor = meta.Status, meta.WaitingFor
+		}
 		f := sessions.Found{Tool: "claude", Name: text.FirstNonEmpty(e.Name, e.ID), Named: true, Cwd: e.Cwd, Where: "bg",
 			Pane: attached[e.ID], Job: e.ID, Session: e.SessionID, PID: e.PID, ProcStart: p.StartTicks,
 			Started: epoch(e.StartedAt), Model: job.model(), PRs: job.prs(),
-			Transcript: TranscriptPath(n.Env.ClaudeDir, e.SessionID, e.Cwd),
-			Status:     text.FirstNonEmpty(e.Status, meta.Status), WaitingFor: text.FirstNonEmpty(e.WaitingFor, meta.WaitingFor),
-			JobState: text.FirstNonEmpty(e.State, job.State), Detail: text.OneLine(job.Detail, 240)}
+			Transcript: TranscriptPath(n.Env.ClaudeDir, e.SessionID, e.Cwd), Status: status, WaitingFor: waitingFor,
+			JobState: text.FirstNonEmpty(job.State, e.State), Detail: text.OneLine(job.Detail, 240)}
 		f.LastActive = latest(epoch(job.UpdatedAt), epoch(meta.StatusUpdatedAt), mtime(filepath.Join(n.Env.ClaudeDir, "jobs", e.ID, "timeline.jsonl")))
 		out = append(out, f)
 	}
@@ -177,7 +184,8 @@ func (n *Native) live(meta probe, p *proc.Proc, where, pane, fallback, cwd strin
 }
 
 // agents returns the background-session list, reusing the previous one while the Claude Code processes are the
-// same and it is younger than Every. On an error the previous list stays, and the next List tries again.
+// same and it is younger than Every. A failure keeps the previous list, and is reused the same way: a hung or
+// missing command is not run again on every scan.
 func (n *Native) agents(ctx context.Context, w *sessions.World) ([]agentRow, error) {
 	var pids []string
 	for _, p := range w.Procs.ByPID {
@@ -190,20 +198,23 @@ func (n *Native) agents(ctx context.Context, w *sessions.World) ([]agentRow, err
 	if n.cache != nil && sig == n.sig && n.Every > 0 && w.Now.Sub(n.at) < n.Every {
 		return n.cache, nil
 	}
+	if n.failed != nil && sig == n.failSig && n.Every > 0 && w.Now.Sub(n.failAt) < n.Every {
+		return n.cache, n.failed
+	}
 	run := n.Agents
 	if run == nil {
 		run = func(ctx context.Context) ([]byte, error) { return claudeAgents(ctx, n.Env.Home) }
 	}
 	out, err := run(ctx)
-	if err != nil {
-		return n.cache, err
-	}
 	var rows []agentRow
-	if len(strings.TrimSpace(string(out))) > 0 {
-		if err := json.Unmarshal(out, &rows); err != nil {
-			return n.cache, errors.New("claude agents --json: " + err.Error())
-		}
+	if err == nil && len(strings.TrimSpace(string(out))) > 0 {
+		err = json.Unmarshal(out, &rows)
 	}
+	if err != nil {
+		n.failed, n.failSig, n.failAt = fmt.Errorf("claude agents --json: %w", err), sig, w.Now
+		return n.cache, n.failed
+	}
+	n.failed = nil
 	n.cache, n.sig, n.at = rows, sig, w.Now
 	if n.cache == nil {
 		n.cache = []agentRow{}
@@ -223,7 +234,9 @@ func claudeAgents(ctx context.Context, home string) ([]byte, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	return exec.CommandContext(ctx, bin, "agents", "--json").Output()
+	cmd := exec.CommandContext(ctx, bin, "agents", "--json")
+	cmd.WaitDelay = time.Second // a child that keeps the pipe open does not hold the scan
+	return cmd.Output()
 }
 
 // jobFile is the part of a background session's state file used for what `claude agents --json` leaves out:

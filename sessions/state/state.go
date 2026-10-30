@@ -25,7 +25,9 @@ type Stamps map[string]Stamp
 // keeps its time: the same window a source keeps a departed session's tracker.
 const Keep = 15 * time.Minute
 
-// Apply sets every session's Since and updates the stamps, then drops stamps unseen for longer than Keep.
+// Apply sets every session's Since and updates the stamps, then drops stamps unseen for longer than Keep. It
+// takes the phases a scan decided, before verdict.Apply settles idle sessions: a stamp of a reviewed phase would
+// start a new idle stretch on the next scan, and the review of the last one would never apply again.
 //
 // A session starts a new stretch when it is seen for the first time, when its phase changed, or when it did
 // something (its log grew) while in a phase other than working: an idle session that ran a whole turn between
