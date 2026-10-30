@@ -93,6 +93,11 @@ func (r *runner) act(ctx context.Context) error {
 			}
 		}
 		f.Done = true
+		if r.opt.afterDelete != nil {
+			r.opt.afterDelete(*f)
+		}
+		r.ownDeletions(ctx)
+		r.addOwn(f.canon, r.opt.Clock())
 		if !r.opt.DryRun {
 			if err := r.recordDone(ctx, f); err != nil {
 				return err
