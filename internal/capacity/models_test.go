@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -224,5 +225,36 @@ func TestAScheduledJobsFailureDeletesNothing(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(f.root, "idle")); !os.IsNotExist(err) {
 		t.Error("and deletes what it held back")
+	}
+}
+
+func TestAContainersMountKeepsWhatItHolds(t *testing.T) {
+	for _, c := range []struct{ name, mount string }{{"an item", "idle"}, {"the whole root", ""}} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newModels(t)
+			st := openStore(t)
+			ctx := context.Background()
+			must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: f.now.Add(-35 * 24 * time.Hour)}, nil, nil))
+			cfg := f.cfg
+			cfg.Live = []string{RuleModels}
+			o := options(t, procRoot(t), f.now, nil)
+			o.Tools = fakeTools{answers: map[string]string{"uv": "ERR", "docker ps": "c1\n",
+				"docker inspect": "/vllm\t/etc/x\t" + filepath.Join(f.root, c.mount) + "\n"}}
+			res, err := Run(ctx, cfg, st, o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := findings(res, RuleModels)[filepath.Join(f.root, "idle")]
+			if got.Action != ActKeep || !strings.Contains(got.Why, "container vllm") {
+				t.Fatalf("a running container's bind mount keeps the item: %+v", got)
+			}
+			if _, err := os.Stat(filepath.Join(f.root, "idle")); err != nil {
+				t.Fatal("it was deleted")
+			}
+			seen, _ := st.SeenPaths(ctx)
+			if _, ok := seen[filepath.Join(f.root, "idle")]; !ok {
+				t.Error("and the mount is a sighting")
+			}
+		})
 	}
 }

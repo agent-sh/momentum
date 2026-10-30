@@ -73,6 +73,20 @@ func (r *runner) sampleSeen() []store.Seen {
 		if k, ok := r.modelKey(u.Path); ok {
 			add(k, u)
 		}
+		if u.How != "mount" {
+			continue
+		}
+		for _, x := range r.modelRoots { // a container's mount of a whole root uses every item in it
+			if !under(x.canon, u.Path) {
+				continue
+			}
+			ents, _ := os.ReadDir(x.shown)
+			for _, e := range ents {
+				if c := filepath.Join(x.canon, e.Name()); !r.modelSet[c] {
+					add(c, u)
+				}
+			}
+		}
 	}
 	for id, u := range r.sample.RepoIDs {
 		for _, k := range r.repoItems(id) {
