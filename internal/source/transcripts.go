@@ -39,7 +39,8 @@ type Transcripts struct {
 	Workers int      // files read at once; 0 is DefaultWorkers()
 
 	// records, redact and ready are tacit's redaction (evidence.RedactRecordsContext, evidence.RedactEvents,
-	// evidence.RedactionReady); tests replace them.
+	// evidence.RedactionReady); tests replace them. A source given redact and no records has no records mode:
+	// its texts go joined by the boundary through redact.
 	records func(context.Context, []string) ([]string, error)
 	redact  func(context.Context, []evidence.Event) ([]evidence.Event, error)
 	ready   func() error
@@ -147,7 +148,7 @@ func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error
 	if ready == nil {
 		ready = evidence.RedactionReady
 	}
-	if records == nil {
+	if records == nil && redact == nil {
 		records = evidence.RedactRecordsContext
 	}
 	if redact == nil {
@@ -493,6 +494,7 @@ type writer struct {
 	redact  func(context.Context, []evidence.Event) ([]evidence.Event, error)
 	t       *tally
 	source  string
+	joining sync.Once // the run's note that texts went joined by the boundary
 }
 
 // flush redacts a batch in as few scrump calls as its size allows and stores it. When redaction fails, each
@@ -595,8 +597,10 @@ var boundary = "\n#'\"\n" + strings.Repeat("\n", 1024) + "#\n"
 
 // mask redacts texts, at most redactBytes per scrump call. scrump's records mode (scrump 0.2.0 and later)
 // scans each text on its own, as a record (tacit's RedactRecordsContext): no hit can cross from one text into
-// the next, and nothing is added to the text scrump reads. A scrump without it gets the texts joined by the
-// boundary (joined).
+// the next, and scrump reads one separator per text, not a boundary (tacit adds its probe to its first call
+// of the process, and masks a text holding a separator in a call of its own). A scrump without records mode,
+// or one whose records tacit's probe shows are not kept apart, gets the texts joined by the boundary
+// (joined), and the run's result says so once.
 func (w *writer) mask(ctx context.Context, texts []string) ([]string, error) {
 	out := make([]string, 0, len(texts))
 	for start := 0; start < len(texts); {
@@ -607,6 +611,11 @@ func (w *writer) mask(ctx context.Context, texts []string) ([]string, error) {
 		}
 		red, err := w.asRecords(ctx, texts[start:end])
 		if errors.Is(err, evidence.ErrNoRecords) {
+			if w.t != nil {
+				w.joining.Do(func() {
+					w.t.note("scrump has no records mode that keeps texts apart: texts went joined by the boundary, which is slower; install scrump 0.2.0 or later")
+				})
+			}
 			red, err = w.joined(ctx, texts[start:end])
 		}
 		if err != nil {

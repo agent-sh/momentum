@@ -506,10 +506,14 @@ func TestTranscriptsRedactABatchInOneCallEachTextAsAlone(t *testing.T) {
 	}
 	shim := t.TempDir()
 	calls := filepath.Join(shim, "calls")
-	script := "#!/bin/sh\necho \"$*\" >> '" + calls + "'\nexec '" + real + "' \"$@\"\n"
+	// Each call's arguments, and its input in in.<n>.
+	script := "#!/bin/sh\nn=$(wc -l < '" + calls + "' 2>/dev/null || echo 0)\necho \"$*\" >> '" + calls + "'\n" +
+		"tee '" + shim + "/in.'$((n+0)) | '" + real + "' \"$@\"\n"
 	if err := os.WriteFile(filepath.Join(shim, "scrump"), []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	help, _ := exec.Command(real, "--help").Output()
+	hasRecords := strings.Contains(string(help), "--records")
 	home := testHome(t)
 	t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
 	pw := "pass" + "word"
@@ -562,13 +566,23 @@ func TestTranscriptsRedactABatchInOneCallEachTextAsAlone(t *testing.T) {
 	// batch joined.
 	got := strings.Split(strings.TrimSpace(string(b)), "\n")
 	plain, records := "--profile text scrub - -o -", "--profile text --records scrub - -o -"
-	want := []string{plain, records}
-	if _, err := evidence.RedactRecordsContext(context.Background(), []string{"x"}); errors.Is(err, evidence.ErrNoRecords) {
+	if !hasRecords {
 		got = slices.DeleteFunc(got, func(c string) bool { return c == records })
-		want = []string{plain, plain}
+		if want := []string{plain, plain}; strings.Join(got, "|") != strings.Join(want, "|") {
+			t.Fatalf("scrump calls %q, want %q", got, want)
+		}
+		return
 	}
-	if strings.Join(got, "|") != strings.Join(want, "|") {
+	if want := []string{plain, records}; strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("scrump calls %q, want %q", got, want)
+	}
+	// The texts went as records: separated, with no boundary between them.
+	in, err := os.ReadFile(filepath.Join(shim, "in.1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(in), boundary) || strings.Count(string(in), "\x1e") < 11 {
+		t.Fatalf("the records call got %d separators and the boundary %v", strings.Count(string(in), "\x1e"), strings.Contains(string(in), boundary))
 	}
 }
 
@@ -598,9 +612,21 @@ func TestTranscriptsMaskAsRecordsWhenScrumpHasThem(t *testing.T) {
 	}
 
 	w.records = func(context.Context, []string) ([]string, error) { return nil, evidence.ErrNoRecords }
+	w.t = &tally{failed: map[string]bool{}}
 	got, err = w.mask(context.Background(), texts)
 	if err != nil || len(joined) != 1 || !strings.Contains(joined[0], boundary) || strings.Contains(got[1], "tok_") {
 		t.Fatalf("without records mode: %v, joined %d, %q", err, len(joined), got)
+	}
+	if notes := strings.Join(w.t.res.Notes, "\n"); !strings.Contains(notes, "joined by the boundary") {
+		t.Fatalf("the fallback left no note: %q", notes)
+	}
+
+	// Records that do not line up with the texts fail the batch.
+	for name, bad := range map[string][]string{"one record short": {texts[0]}, "a record cut": {texts[0], "abc"}} {
+		w.records = func(context.Context, []string) ([]string, error) { return bad, nil }
+		if got, err := w.mask(context.Background(), texts); err == nil || len(joined) != 1 {
+			t.Fatalf("%s: %q %v, joined %d", name, got, err, len(joined))
+		}
 	}
 
 	w.records = func(context.Context, []string) ([]string, error) { return nil, errors.New("scrump: exit status 1") }
