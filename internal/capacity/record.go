@@ -56,6 +56,9 @@ func (r *runner) recordDone(ctx context.Context, f *Finding) error {
 	if _, err := r.st.Put(ctx, []store.Event{e}); err != nil {
 		return err
 	}
+	if f.none { // the event keeps that it ran; a note of nothing deleted would only crowd the decided list
+		return nil
+	}
 	_, err := r.st.PutNote(ctx, decidedNote(e, *f, r.now))
 	return err
 }

@@ -141,6 +141,7 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 	after := r.uvSize(ctx, dir)
 	if size >= 0 && after >= 0 {
 		f.Freed = max64(0, size-after)
+		f.none = f.Freed == 0
 	}
 	if err != nil {
 		f.Err = err.Error()
@@ -274,10 +275,15 @@ func (r *runner) docker(ctx context.Context, live bool) ([]Finding, []string, er
 	until := r.cfg.Docker.Until
 	var out []Finding
 	var notes []string
-	cache := Finding{Rule: RuleDocker, Path: "docker build cache", Action: ActDelete, Detail: "builder prune --filter until=" + until}
-	if du, err := r.tools.Docker(ctx, 2*time.Minute, "buildx", "du", "--filter", "until="+until); err == nil {
-		cache.Bytes = reclaimable(du)
-		cache.Detail += " (up to its reclaimable records' size)"
+	// What the prune removes is counted record by record: `buildx du` takes no age filter, and an estimate that
+	// counts the records an image shares (most of an old cache, often) lists gigabytes the prune cannot free.
+	cache := Finding{Rule: RuleDocker, Path: "docker build cache", Action: ActDelete}
+	if keep, err := time.ParseDuration(until); err == nil {
+		if du, err := r.tools.Docker(ctx, 2*time.Minute, "buildx", "du", "--format", "json"); err == nil {
+			n, size := prunable(du, keep)
+			cache.Bytes = size
+			cache.Detail = fmt.Sprintf("builder prune --filter until=%s: %d %s unused for %s", until, n, plural("record", n), until)
+		}
 	}
 	images := Finding{Rule: RuleDocker, Path: "docker dangling images", Action: ActDelete, Detail: "image prune"}
 	if ls, err := r.tools.Docker(ctx, time.Minute, "image", "ls", "--filter", "dangling=true", "--format", "{{.ID}}\t{{.Size}}"); err == nil {
@@ -312,10 +318,11 @@ func (r *runner) docker(ctx context.Context, live bool) ([]Finding, []string, er
 				f.Err = err.Error()
 			} else {
 				f.Done = true
-				f.Freed = parseSizeAfter(res, "Total:")
-				if f.Freed == 0 {
-					f.Freed = parseSizeAfter(res, "Total reclaimed space:")
+				var said bool
+				if f.Freed, said = parseSizeAfter(res, "Total:"); !said {
+					f.Freed, said = parseSizeAfter(res, "Total reclaimed space:")
 				}
+				f.none = said && f.Freed == 0
 			}
 		}
 		out = append(out, *f)
@@ -326,20 +333,56 @@ func (r *runner) docker(ctx context.Context, live bool) ([]Finding, []string, er
 	return out, notes, nil
 }
 
-// reclaimable sums the sizes of the reclaimable records `docker buildx du` lists, or reads its Reclaimable total
-// when it prints one. Shared records count in full, so the sum is at most what a prune frees.
-func reclaimable(du string) int64 {
-	if n := parseSizeAfter(du, "Reclaimable:"); n > 0 {
-		return n
-	}
-	var n int64
+// prunable counts the build cache records a prune limited by age removes, from `docker buildx du --format json`
+// (one record per line): those no build uses, that no image shares, that are not BuildKit's own (internal and
+// frontend records, which a prune without --all keeps), and that were last used longer ago than keep. Docker prints
+// the last use as a rough age ("12 days ago"); a record never used counts.
+func prunable(du string, keep time.Duration) (n int, size int64) {
 	for _, l := range strings.Split(du, "\n") {
-		f := strings.Fields(l)
-		if len(f) >= 3 && f[1] == "true" {
-			n += parseSize(strings.TrimSuffix(f[2], "*"))
+		var rec struct {
+			Reclaimable, Shared    bool
+			Type, Size, LastUsedAt string
 		}
+		if json.Unmarshal([]byte(l), &rec) != nil || !rec.Reclaimable || rec.Shared || rec.Type == "internal" || rec.Type == "frontend" {
+			continue
+		}
+		if rec.LastUsedAt != "" {
+			if age, ok := humanAge(rec.LastUsedAt); !ok || age < keep {
+				continue
+			}
+		}
+		n++
+		size += parseSize(rec.Size)
 	}
-	return n
+	return n, size
+}
+
+var ageRe = regexp.MustCompile(`^(\d+) (second|minute|hour|day|week|month|year)s?$`)
+
+// humanAge reads an age as Docker prints it (go-units' HumanDuration, with " ago"): the least it can be, since each
+// unit rounds down ("7 days" is 7 to 8 days).
+func humanAge(s string) (time.Duration, bool) {
+	s = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(s)), " ago")
+	switch s {
+	case "less than a second":
+		return 0, true
+	case "about a minute":
+		return time.Minute, true
+	case "about an hour":
+		return time.Hour, true
+	}
+	m := ageRe.FindStringSubmatch(s)
+	if m == nil {
+		return 0, false
+	}
+	v, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, false
+	}
+	day := 24 * time.Hour
+	unit := map[string]time.Duration{"second": time.Second, "minute": time.Minute, "hour": time.Hour, "day": day,
+		"week": 7 * day, "month": 30 * day, "year": 365 * day}[m[2]]
+	return time.Duration(v) * unit, true
 }
 
 // unusedVolumes is a report-only finding for the volumes no container uses, from `docker system df -v`'s JSON: a
@@ -382,14 +425,14 @@ func parseSize(s string) int64 {
 	return int64(v * mult)
 }
 
-// parseSizeAfter reads the size on the line that starts with a label.
-func parseSizeAfter(out, label string) int64 {
+// parseSizeAfter reads the size on the line that starts with a label, and whether there is such a line.
+func parseSizeAfter(out, label string) (int64, bool) {
 	for _, l := range strings.Split(out, "\n") {
 		if rest, ok := strings.CutPrefix(strings.TrimSpace(l), label); ok {
-			return parseSize(rest)
+			return parseSize(rest), true
 		}
 	}
-	return 0
+	return 0, false
 }
 
 func lastLine(s string) string {

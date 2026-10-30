@@ -41,6 +41,7 @@ type Finding struct {
 	blobs        []string  // a model's shared-store blobs that go with it, canonical
 	linked       []string  // every shared-store blob a model links, canonical
 	class        string    // why a report-only finding is reported, as a word: its note's group
+	none         bool      // a prune that freed nothing, as measured or as the tool says: no decided note
 }
 
 // The actions a finding can have.
