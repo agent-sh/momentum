@@ -186,3 +186,138 @@ func TestAStoreFromAnotherSchemaIsDroppedAndRebuilt(t *testing.T) {
 		t.Fatalf("the new schema is not in place: %v", err)
 	}
 }
+
+// One session's events, by its id or the start of it, read oldest first, the events of one moment in their
+// order in the source; Until ends the window.
+func TestASessionReadsOldestFirst(t *testing.T) {
+	ctx := context.Background()
+	st, _ := open(t)
+	at := time.Unix(1_700_000_000, 0)
+	var evs []Event
+	for i, k := range []string{"f@000000000100#001", "f@000000000100#000", "f@000000000020#000", "f@000000000300#000"} {
+		evs = append(evs, Event{Source: "transcripts", SourceKey: k, TS: at.Add(time.Duration(i/2) * time.Minute), Session: "5d1c-aa", Actor: ActorAgent, Kind: "agent_text"})
+	}
+	evs = append(evs, Event{Source: "transcripts", SourceKey: "g@1", TS: at, Session: "5d1d-bb", Actor: ActorOwner, Kind: "owner_text"})
+	if _, err := st.Put(ctx, evs); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.Events(ctx, Query{Since: time.Unix(0, 0), Session: "5d1c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	for _, e := range got {
+		keys = append(keys, e.SourceKey)
+	}
+	if fmt.Sprint(keys) != "[f@000000000100#000 f@000000000100#001 f@000000000020#000 f@000000000300#000]" {
+		t.Fatalf("session read in %v", keys)
+	}
+	if got, _ := st.Events(ctx, Query{Since: time.Unix(0, 0), Session: "5d1c-aa", Until: at.Add(time.Minute)}); len(got) != 2 {
+		t.Fatalf("until the second minute: %d events, want 2", len(got))
+	}
+}
+
+// A file cursor is stored with the events before it, read back, dropped by name, and dropped with its source.
+func TestFileCursorsGoWithTheirEvents(t *testing.T) {
+	ctx := context.Background()
+	st, _ := open(t)
+	c := FileCursor{Source: "transcripts", Path: "/s/a.jsonl", Inode: 7, FP: "ab", Offset: 42, State: []byte(`{"v":1}`), Size: 50, MTime: 9}
+	ev := Event{Source: "transcripts", SourceKey: "a@1", TS: time.Now(), Actor: ActorAgent, Kind: "agent_text"}
+	if n, err := st.PutFiles(ctx, []FileWrite{{Events: []Event{ev}, Cursor: c}, {Cursor: FileCursor{Source: "transcripts", Path: "/s/b.jsonl"}}}); err != nil || n != 1 {
+		t.Fatalf("put %d, %v", n, err)
+	}
+	cs, err := st.FileCursors(ctx, "transcripts")
+	if err != nil || len(cs) != 2 || fmt.Sprint(cs["/s/a.jsonl"]) != fmt.Sprint(c) {
+		t.Fatalf("cursors %+v, %v", cs, err)
+	}
+	if err := st.DropFileCursors(ctx, "transcripts", []string{"/s/b.jsonl"}); err != nil {
+		t.Fatal(err)
+	}
+	if cs, _ := st.FileCursors(ctx, "transcripts"); len(cs) != 1 {
+		t.Fatalf("after dropping one: %+v", cs)
+	}
+	if err := st.Rebuild(ctx, "transcripts"); err != nil {
+		t.Fatal(err)
+	}
+	if cs, _ := st.FileCursors(ctx, "transcripts"); len(cs) != 0 {
+		t.Fatalf("a rebuilt source kept its file cursors: %+v", cs)
+	}
+}
+
+// A schema change drops the file cursors with the events they go with: a cursor kept alone would make the
+// next ingest pass over what it no longer holds.
+func TestAVersionChangeDropsFileCursorsWithTheirEvents(t *testing.T) {
+	ctx := context.Background()
+	st, path := open(t)
+	c := FileCursor{Source: "transcripts", Path: "/s/a.jsonl", Inode: 7, FP: "ab", Offset: 42, Size: 50, MTime: 9}
+	ev := Event{Source: "transcripts", SourceKey: "a@1", TS: time.Now(), Actor: ActorAgent, Kind: "agent_text"}
+	if _, err := st.PutFiles(ctx, []FileWrite{{Events: []Event{ev}, Cursor: c}}); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion-1)); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+	st, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if cs, _ := st.FileCursors(ctx, "transcripts"); len(cs) != 0 {
+		t.Fatalf("file cursors kept across a schema change: %+v", cs)
+	}
+	if evs, _ := st.Events(ctx, Query{Since: time.Unix(0, 0), Source: "transcripts"}); len(evs) != 0 {
+		t.Fatalf("events kept across a schema change: %d", len(evs))
+	}
+}
+
+// A cursor never runs ahead of its events: when a part's events cannot be stored, neither can any cursor of
+// the same write.
+func TestPutFilesStoresNoCursorWithoutItsEvents(t *testing.T) {
+	ctx := context.Background()
+	st, _ := open(t)
+	good := FileWrite{Events: []Event{{Source: "transcripts", SourceKey: "a@1", TS: time.Now(), Actor: ActorAgent, Kind: "agent_text"}},
+		Cursor: FileCursor{Source: "transcripts", Path: "/s/a.jsonl", Offset: 10}}
+	bad := FileWrite{Events: []Event{{Source: "transcripts", TS: time.Now(), Actor: ActorAgent, Kind: "agent_text"}}, // no key
+		Cursor: FileCursor{Source: "transcripts", Path: "/s/b.jsonl", Offset: 20}}
+	if _, err := st.PutFiles(ctx, []FileWrite{good, bad}); err == nil {
+		t.Fatal("an event without a key was stored")
+	}
+	if cs, _ := st.FileCursors(ctx, "transcripts"); len(cs) != 0 {
+		t.Fatalf("cursors stored without their events: %+v", cs)
+	}
+	if evs, _ := st.Events(ctx, Query{Since: time.Unix(0, 0), Source: "transcripts"}); len(evs) != 0 {
+		t.Fatalf("events of a failed write: %d", len(evs))
+	}
+}
+
+// A session's listing holds its subagents' threads at any depth: a thread is an Agent inside its parent's
+// session, and its own subagents' events are in the session of its id.
+func TestASessionHoldsItsThreadsAtAnyDepth(t *testing.T) {
+	ctx := context.Background()
+	st, _ := open(t)
+	at := time.Unix(1_700_000_000, 0)
+	ev := func(key, session, agent string, min int) Event {
+		return Event{Source: "transcripts", SourceKey: key, TS: at.Add(time.Duration(min) * time.Minute), Session: session, Agent: agent, Actor: ActorAgent, Kind: "agent_text"}
+	}
+	if _, err := st.Put(ctx, []Event{ev("r@1", "root", "", 0), ev("c@1", "root", "child", 1), ev("g@1", "child", "grand", 2),
+		ev("x@1", "other", "", 3)}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.Events(ctx, Query{Since: time.Unix(0, 0), Session: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	for _, e := range got {
+		keys = append(keys, e.SourceKey)
+	}
+	if fmt.Sprint(keys) != "[r@1 c@1 g@1]" {
+		t.Fatalf("the root session lists %v", keys)
+	}
+}

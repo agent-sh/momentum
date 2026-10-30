@@ -25,7 +25,8 @@ var version = "0.0.0-dev"
 
 const usage = `usage:
   momentum evidence ingest              read what is new in every configured source into the store
-  momentum evidence events [--since DUR] [--kind K,K] [--source S] [--limit N] [--json]   events, newest first
+  momentum evidence events [--since WHEN] [--until WHEN] [--kind K,K] [--source S] [--session ID] [--limit N] [--json]
+                                        events, newest first; one session's (an id or its start) oldest first
   momentum evidence status [--since DUR]   events per source and kind, and unparsed records
   momentum evidence rebuild SOURCE      drop what SOURCE contributed; the next ingest reads it from the start
   momentum sessions [--json] [--all]    the live agent sessions and their phases, read without a model;
@@ -33,7 +34,8 @@ const usage = `usage:
   momentum version
 Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json).
 The store is $MOMENTUM_HOME/momentum.db (default ~/.local/share/momentum).
-DUR is a Go duration or a number of days, e.g. 36h or 7d. Exit: 0 done, 2 usage or configuration error,
+DUR is a Go duration or a number of days, e.g. 36h or 7d; WHEN is a DUR ago or a local time, e.g. 2026-01-02T15:04.
+Exit: 0 done, 2 usage or configuration error,
 3 error (for ingest and sessions: at least one source failed; the others still ran).`
 
 type usageError struct{ msg string }
@@ -83,7 +85,7 @@ func evidence(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	case "ingest":
 		return ingest(ctx, stdout, stderr)
 	case "events":
-		return events(ctx, args[1:], stdout)
+		return events(ctx, args[1:], stdout, stderr)
 	case "status":
 		return status(ctx, args[1:], stdout)
 	case "rebuild":
@@ -111,6 +113,9 @@ func configured() ([]source.Source, error) {
 	if c.Incidents.Dir != "" {
 		out = append(out, source.Incidents{Dir: c.Incidents.Dir})
 	}
+	if len(c.Transcripts.Homes) > 0 {
+		out = append(out, source.Transcripts{Homes: c.Transcripts.Homes, Workers: c.Transcripts.Workers})
+	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("%w: %s lists none", config.ErrNoSources, config.SourcesPath())
 	}
@@ -132,8 +137,8 @@ func ingest(ctx context.Context, stdout, stderr io.Writer) error {
 		if o.Err != nil {
 			failed++
 			fmt.Fprintf(stderr, "[ERROR] %s: %v\n", o.Name, o.Err)
-			continue
 		}
+		// What a failing source stored, and what failed, by name.
 		fmt.Fprintf(stdout, "%s: %d new, %d read, %d unparsed\n", o.Name, o.New, o.Read, o.Skipped)
 		for _, n := range o.Notes {
 			fmt.Fprintf(stdout, "  %s\n", n)
@@ -145,32 +150,52 @@ func ingest(ctx context.Context, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func events(ctx context.Context, args []string, stdout io.Writer) error {
+func events(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("events", flag.ContinueOnError)
-	since := fs.String("since", "1d", "how far back")
+	since := fs.String("since", "1d", "how far back, or from when (one session: its start)")
+	until := fs.String("until", "", "until when")
 	kinds := fs.String("kind", "", "comma-separated kinds")
 	src := fs.String("source", "", "one source")
-	limit := fs.Int("limit", 50, "most events to print")
+	session := fs.String("session", "", "one session, by its id or its start; oldest first")
+	limit := fs.Int("limit", 50, "most events to print (0: 200)")
 	asJSON := fs.Bool("json", false, "one JSON object per line")
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
 	}
-	d, err := parseSince(*since)
-	if err != nil {
-		return usageError{err.Error()}
+	if *limit <= 0 {
+		*limit = 200
+	}
+	sinceSet := false
+	fs.Visit(func(f *flag.Flag) { sinceSet = sinceSet || f.Name == "since" })
+	var from time.Time // one session reads from its start, unless --since says otherwise
+	if *session == "" || sinceSet {
+		var err error
+		if from, err = parseWhen(*since); err != nil {
+			return usageError{err.Error()}
+		}
+	}
+	var err error
+	q := store.Query{Since: from, Source: *src, Session: *session, Limit: *limit + 1}
+	if *until != "" {
+		if q.Until, err = parseWhen(*until); err != nil {
+			return usageError{err.Error()}
+		}
 	}
 	st, err := store.Open(paths.DB())
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	q := store.Query{Since: time.Now().Add(-d), Source: *src, Limit: *limit}
 	if *kinds != "" {
 		q.Kinds = strings.Split(*kinds, ",")
 	}
 	evs, err := st.Events(ctx, q)
 	if err != nil {
 		return err
+	}
+	if len(evs) > *limit {
+		evs = evs[:*limit]
+		defer fmt.Fprintf(stderr, "momentum: more events than --limit %d; raise it, or narrow with --since and --until\n", *limit)
 	}
 	enc := json.NewEncoder(stdout)
 	for _, e := range evs {
@@ -184,7 +209,17 @@ func events(ctx context.Context, args []string, stdout io.Writer) error {
 		if e.Experiment != "" {
 			tag = " [experiment " + e.Experiment + "]"
 		}
-		fmt.Fprintf(stdout, "%s  %-15s %-8s %-16s %s%s\n", e.TS.Format("01-02 15:04"), e.Source, e.Actor, e.Kind, e.Summary, tag)
+		what := e.Kind
+		if e.Tool != "" {
+			what += " " + e.Tool
+		}
+		if strings.Contains(e.Meta, `"is_error":true`) {
+			what += " (error)"
+		}
+		if e.Agent != "" {
+			tag += " [subagent " + e.Agent + "]"
+		}
+		fmt.Fprintf(stdout, "%s  %-15s %-8s %-16s %s%s\n", e.TS.Local().Format("01-02 15:04:05"), e.Source, e.Actor, what, e.Summary, tag)
 	}
 	return nil
 }
@@ -245,6 +280,23 @@ func rebuild(ctx context.Context, name string, stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "%s: dropped; the next ingest reads it from the start\n", name)
 	return nil
+}
+
+// parseWhen is a time: a duration ago (parseSince), or a local time ("2006-01-02T15:04", seconds optional)
+// or an RFC 3339 one.
+func parseWhen(s string) (time.Time, error) {
+	if d, err := parseSince(s); err == nil {
+		return time.Now().Add(-d), nil
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+	for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02T15:04", "2006-01-02"} {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("bad time %q: a duration (36h, 7d) or a time (2006-01-02T15:04)", s)
 }
 
 // parseSince accepts a Go duration or a whole number of days ("7d").
