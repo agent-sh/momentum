@@ -52,13 +52,20 @@ const usage = `usage:
   momentum supervise replay [--since WHEN] [--until WHEN] [--labels FILE] [--anchor] [--points FILE]
                                         run the rules over the store's history and measure them against the
                                         owner's own steps
+  momentum capacity [--dry-run] [--now] [--rule R,R] [--json] [--all]
+                                        keep the disks from filling: sample which paths processes use, record
+                                        each disk's use, and run the rules that are due (models, targets,
+                                        worktrees, uv, docker); a rule not live lists what it would delete.
+                                        --dry-run deletes and records nothing and runs every rule
   momentum version
-Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json).
+Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json), and the
+capacity rules in its capacity section.
 The store is $MOMENTUM_HOME/momentum.db (default ~/.local/share/momentum).
 DUR is a Go duration or a number of days, e.g. 36h or 7d; WHEN is a DUR ago or a local time, e.g. 2026-01-02T15:04.
 Exit: 0 done, 2 usage or configuration error,
-3 error (for ingest and sessions: at least one source failed; the others still ran; a report whose scan of a
-harness failed or was not done within 3 s still prints, exits 0 and names it on stderr).`
+3 error (for ingest and sessions: at least one source failed, for capacity at least one rule; the others still
+ran; a report whose scan of a harness failed or was not done within 3 s still prints, exits 0 and names it on
+stderr).`
 
 type usageError struct{ msg string }
 
@@ -85,6 +92,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		err = noteCmd(ctx, args[1:], stdout, stderr)
 	case "supervise":
 		err = superviseCmd(ctx, args[1:], stdout, stderr)
+	case "capacity":
+		err = capacityCmd(ctx, args[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintln(stdout, "momentum", version)
 	case "-h", "--help", "help":

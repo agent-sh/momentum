@@ -96,10 +96,10 @@ type querier interface {
 
 // The store's tables are of two kinds.
 //
-// Kept tables hold what cannot be read again: every event, when each live session entered its phase, and the notes
-// (notes.go). A schema change migrates them and never drops them. A kept table that is missing is made with the
-// columns it was first made with (keptTables), it gains each later column it lacks (keptColumns), and its rows
-// change only in a step or by its triggers (keptTriggers).
+// Kept tables hold what cannot be read again: every event, when each live session entered its phase, the notes
+// (notes.go), and what the capacity runs observed (capacity.go). A schema change migrates them and never drops
+// them. A kept table that is missing is made with the columns it was first made with (keptTables), it gains each
+// later column it lacks (keptColumns), and its rows change only in a step or by its triggers (keptTriggers).
 //
 // Derived tables hold what the sources and the session trackers derived from what they read: where each source
 // stopped (with tacit's saved reader state), the files it parsed, what it could not parse, and the trackers'
@@ -119,7 +119,7 @@ CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, kind TEXT NOT NULL, title
   detail TEXT NOT NULL DEFAULT '', effect TEXT NOT NULL DEFAULT '', links TEXT NOT NULL DEFAULT '[]',
   source TEXT NOT NULL DEFAULT '', importance INTEGER NOT NULL DEFAULT 0, at INTEGER NOT NULL,
   done INTEGER NOT NULL DEFAULT 0);
-`
+` + capacityTables
 
 // keptColumns are the columns each kept table gained after it was first made, in order. A table that lacks one
 // gains it and keeps its rows: SQLite's ADD COLUMN writes no row, so it costs the same on any table. The next
@@ -303,7 +303,7 @@ func busy(err error) bool {
 }
 
 // keptTableNames are the tables keptTables makes.
-var keptTableNames = []string{"events", "session_stamps", "schema_steps", "notes"}
+var keptTableNames = append([]string{"events", "session_stamps", "schema_steps", "notes"}, capacityTableNames...)
 
 // checkpointColumns are the columns the schema gives the checkpoint tables. They are a cache of what transcripts
 // hold, so tables with other columns (a build before this one made them) are dropped and made again, and the next
@@ -768,12 +768,12 @@ func (s *Store) Skipped(ctx context.Context, source string) (int, error) {
 
 // Rebuild drops everything a source contributed, so the next ingest reads it again from the start, and returns
 // how many events it dropped. Sources share one state space by name prefix: "radar" also drops "radar-feedback".
-// The observed events (Sessions) cannot be read again, so Rebuild refuses them with ErrObserved. The transcripts'
-// events can be all that is left of transcripts their harness deleted, so without force Rebuild refuses them with
-// ErrKept.
+// The observed events (Sessions, Supervise, Capacity) cannot be read again, so Rebuild refuses them with
+// ErrObserved. The transcripts' events can be all that is left of transcripts their harness deleted, so without
+// force Rebuild refuses them with ErrKept.
 func (s *Store) Rebuild(ctx context.Context, source string, force bool) (int, error) {
 	switch {
-	case source == Sessions, source == Supervise:
+	case source == Sessions, source == Supervise, source == Capacity:
 		return 0, fmt.Errorf("%s: %w", source, ErrObserved)
 	case source == Transcripts && !force:
 		return 0, fmt.Errorf("%s: %w", source, ErrKept)
