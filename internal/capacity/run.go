@@ -167,6 +167,7 @@ type runner struct {
 	dockerErr     string               // why Docker could not say which containers run: the run deletes nothing
 	dockerAsked   bool                 // whether this run asked Docker (only when a rule scans)
 	heads         *remoteHeads         // the remotes' branches, asked once per run
+	changed       map[changeKey]bool   // whether a work tree changed in the last quietTime, per look
 	res           *Result
 }
 

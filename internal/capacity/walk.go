@@ -91,7 +91,8 @@ func newest(s *syscall.Stat_t) time.Time {
 }
 
 // newerThan reports whether any directory under p (p among them) changed after t: creating, removing or renaming
-// an entry changes its directory. It reads directories only, so it is the cheap first look before Measure.
+// an entry changes its directory. It reads directories only, so it is the cheap first look before Measure. A .git
+// directory is git's store, not the tree: a fetch writes there.
 func newerThan(p string, t time.Time) bool {
 	stack := []string{p}
 	for len(stack) > 0 {
@@ -109,7 +110,7 @@ func newerThan(p string, t time.Time) bool {
 			continue
 		}
 		for _, e := range ents {
-			if e.IsDir() {
+			if e.IsDir() && e.Name() != ".git" {
 				stack = append(stack, filepath.Join(d, e.Name()))
 			}
 		}

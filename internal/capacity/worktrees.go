@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -269,11 +270,18 @@ func (r *runner) repoBusy(ctx context.Context, w, canon string, look *Sample) st
 		return "git worktree list failed: " + err.Error()
 	}
 	var trees []string
-	for _, l := range strings.Split(out, "\n") {
-		if p, ok := strings.CutPrefix(l, "worktree "); ok {
-			if c := r.m.Canon(p); c != canon {
-				trees = append(trees, c)
+	bare := map[string]bool{}
+	for _, block := range strings.Split(out, "\n\n") {
+		var tree string
+		for _, l := range strings.Split(block, "\n") {
+			if p, ok := strings.CutPrefix(l, "worktree "); ok {
+				tree = r.m.Canon(p)
+			} else if l == "bare" && tree != "" {
+				bare[tree] = true
 			}
+		}
+		if tree != "" && tree != canon {
+			trees = append(trees, tree)
 		}
 	}
 	self := os.Getpid()
@@ -289,7 +297,50 @@ func (r *runner) repoBusy(ctx context.Context, w, canon string, look *Sample) st
 			}
 		}
 	}
+	for _, t := range trees {
+		if !bare[t] && r.changedIn(t, r.now.Add(-quietTime), look) {
+			return fmt.Sprintf("a change in %s in the last %s", short(t), quietTime)
+		}
+	}
 	return ""
+}
+
+// changedIn reports whether someone changed a work tree since a time: an entry made, removed or renamed in one of
+// its directories, or git's own record of it (its index, HEAD and HEAD's log: an add, a commit, a checkout). An
+// agent between two commands runs no process there, but leaves these. A fetch, which writes only under .git's
+// objects and remote refs, is no change. Each tree is looked at once per look.
+func (r *runner) changedIn(tree string, since time.Time, look *Sample) bool {
+	key := changeKey{look, tree}
+	if v, ok := r.changed[key]; ok {
+		return v
+	}
+	gitdir := filepath.Join(tree, ".git")
+	if g, ok := isLinkedWorktree(tree); ok {
+		gitdir = g
+	}
+	v := false
+	for _, f := range []string{"index", "HEAD", filepath.Join("logs", "HEAD")} {
+		if st, err := os.Lstat(filepath.Join(gitdir, f)); err == nil {
+			if s, ok := st.Sys().(*syscall.Stat_t); ok && newest(s).After(since) {
+				v = true
+				break
+			}
+		}
+	}
+	if !v {
+		v = newerThan(tree, since)
+	}
+	if r.changed == nil {
+		r.changed = map[changeKey]bool{}
+	}
+	r.changed[key] = v
+	return v
+}
+
+// changeKey is a work tree, as one look judged it.
+type changeKey struct {
+	look *Sample
+	tree string
 }
 
 // liveSessions are the agent sessions on the machine, read once per run.
