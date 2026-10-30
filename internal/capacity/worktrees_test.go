@@ -599,3 +599,50 @@ func TestADirectoryChangedInTheMillisecondOfCapacitysDeletionIsItsOwn(t *testing
 		}
 	}
 }
+
+// hubFixture is the worktrees fixture plus a bare hub, named name, that holds a merged leftover worktree "hubbed".
+func hubFixture(t *testing.T, name string) (hub, wts string) {
+	t.Helper()
+	clone, wts := worktreesFixture(t)
+	hub = filepath.Join(filepath.Dir(clone), "lanes", name)
+	gitT(t, clone, "clone", "-q", "--bare", filepath.Join(filepath.Dir(clone), "remote.git"), hub)
+	gitT(t, hub, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+	gitT(t, hub, "fetch", "-q", "origin")
+	gitT(t, hub, "remote", "set-head", "origin", "main")
+	m := filepath.Join(wts, "hubbed")
+	gitT(t, hub, "worktree", "add", "-q", "-b", "feat/hubbed", m, "origin/main")
+	write(t, filepath.Join(m, "h"), "h\n")
+	gitT(t, m, "add", ".")
+	gitT(t, m, "commit", "-qm", "h")
+	gitT(t, m, "push", "-q", "-u", "origin", "feat/hubbed")
+	gitT(t, m, "push", "-q", "origin", "feat/hubbed:main")
+	gitT(t, hub, "fetch", "-q", "origin")
+	return hub, wts
+}
+
+func TestAWorktreeOfAnExcludedBareHubIsReported(t *testing.T) {
+	for _, c := range []struct {
+		name, hub string
+		ex        func(hub string) Exclude
+		excluded  bool
+	}{
+		{"the hub's path", "work.git", func(hub string) Exclude { return Exclude{Paths: []string{hub}} }, true},
+		{"the hub's name", "secret.git", func(string) Exclude { return Exclude{Names: []string{"*secret*"}} }, true},
+		{"no exclusion", "work.git", func(string) Exclude { return Exclude{} }, false},
+	} {
+		hub, wts := hubFixture(t, c.hub)
+		cfg := Config{Worktrees: WorktreesConfig{Roots: []string{wts}}, Exclude: c.ex(hub)}.Normal()
+		cfg.Live = []string{RuleWorktrees}
+		res, err := Run(context.Background(), cfg, openStore(t), options(t, procRoot(t), time.Now().Add(2*time.Hour), nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := findings(res, RuleWorktrees)[filepath.Join(wts, "hubbed")]
+		if got := f.Action == ActReport && f.class == "excluded"; got != c.excluded {
+			t.Errorf("%s: excluded %v, want %v: %+v", c.name, got, c.excluded, f)
+		}
+		if _, err := os.Stat(filepath.Join(wts, "hubbed")); os.IsNotExist(err) == c.excluded {
+			t.Errorf("%s: removed %v", c.name, os.IsNotExist(err))
+		}
+	}
+}

@@ -577,10 +577,7 @@ func (h *remoteHeads) of(ctx context.Context, w, common, remote string) (map[str
 // removeWorktree removes a worktree with git, which refuses one that is not clean, and then its branch, only if
 // the branch is still at the commit it was judged at.
 func (r *runner) removeWorktree(ctx context.Context, f *Finding) error {
-	main := f.repo
-	if filepath.Base(main) == ".git" {
-		main = filepath.Dir(main)
-	}
+	main := repoPlace(f.repo)
 	if _, err := gitRun(ctx, 2*time.Minute, main, "worktree", "remove", f.Path); err != nil {
 		return err
 	}

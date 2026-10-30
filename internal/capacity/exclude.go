@@ -68,30 +68,34 @@ func (r *runner) excluded(canon string) (string, bool) {
 // excludedRepo reports whether a repository is an excluded project's: by its remotes, or by the place of its main
 // checkout, which may also be under a root that is a link.
 func (r *runner) excludedRepo(rp *repo) (string, bool) {
-	if why, ok := r.ex.repo(rp); ok {
+	if why, ok := r.ex.byRemote(rp); ok {
 		return why, true
 	}
 	if rp.common != "" {
-		if why, ok := r.excluded(r.m.Canon(filepath.Dir(rp.common))); ok {
+		if why, ok := r.excluded(r.m.Canon(repoPlace(rp.common))); ok {
 			return "a worktree of a repository " + why, true
 		}
 	}
 	return "", false
 }
 
-// repo reports whether a repository is an excluded project's.
-func (e *excluder) repo(r *repo) (string, bool) {
+// repoPlace is where a repository is, from its common git directory: a main checkout's .git is in the checkout,
+// and a bare repository (a hub some lanes keep their worktrees on) is its directory itself.
+func repoPlace(common string) string {
+	if filepath.Base(common) == ".git" {
+		return filepath.Dir(common)
+	}
+	return common
+}
+
+// byRemote reports whether a repository is an excluded project's by its remotes.
+func (e *excluder) byRemote(r *repo) (string, bool) {
 	for _, u := range r.remotes {
 		slug := remoteSlug(u)
 		for _, x := range e.remotes {
 			if slug == x {
 				return "a checkout of " + x, true
 			}
-		}
-	}
-	if r.common != "" {
-		if why, ok := e.byPath(e.m.Canon(filepath.Dir(r.common))); ok {
-			return "a worktree of a repository " + why, true
 		}
 	}
 	return "", false
