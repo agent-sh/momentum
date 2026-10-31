@@ -188,8 +188,8 @@ func gitT(t *testing.T, dir string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// watchedSince gives a store a sampler record from from to now: a run every 20 minutes, and each model root of cfg
-// watched from from.
+// watchedSince gives a store a sampler record from from to now: a run every 20 minutes, and each model and scratch
+// root of cfg watched from from.
 func watchedSince(t *testing.T, st *store.Store, cfg Config, from, now time.Time) {
 	t.Helper()
 	var runs []store.CapacityRun
@@ -198,7 +198,7 @@ func watchedSince(t *testing.T, st *store.Store, cfg Config, from, now time.Time
 	}
 	ctx := context.Background()
 	must(t, st.PutRuns(ctx, runs))
-	for _, r := range cfg.Models.Roots {
+	for _, r := range append(append([]string{}, cfg.Models.Roots...), cfg.Scratch.Roots...) {
 		must(t, st.SetMark(ctx, "watch:"+filepath.Clean(r), from))
 	}
 }

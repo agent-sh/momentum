@@ -1,7 +1,8 @@
 // Package capacity keeps the machine's disks from filling: it samples which paths processes use, records each
 // disk's use at every run, and deletes what its rules find idle and rebuildable (models and caches idle for a
-// month, Rust build output idle for two days, the uv and Docker caches, worktrees whose work is merged). What it
-// cannot handle it reports. Every path is the machine's configuration; nothing is compiled in.
+// month, Rust build output idle for two days, the uv and Docker caches, worktrees whose work is merged), and
+// offloads tasks' idle scratch folders to restic. What it cannot handle it reports. Every path is the machine's
+// configuration; nothing is compiled in.
 package capacity
 
 import (
@@ -26,11 +27,12 @@ const (
 	RuleUV        = "uv"
 	RuleDocker    = "docker"
 	RuleWorktrees = "worktrees"
+	RuleScratch   = "scratch"
 	RuleDisk      = "disk"
 )
 
 // Rules are the rules that delete, in the order a run takes them.
-var Rules = []string{RuleModels, RuleTargets, RuleWorktrees, RuleUV, RuleDocker}
+var Rules = []string{RuleModels, RuleTargets, RuleWorktrees, RuleScratch, RuleUV, RuleDocker}
 
 // Config is the "capacity" section of sources.json.
 type Config struct {
@@ -50,6 +52,7 @@ type Config struct {
 	Models    ModelsConfig    `json:"models"`
 	Targets   TargetsConfig   `json:"targets"`
 	Worktrees WorktreesConfig `json:"worktrees"`
+	Scratch   ScratchConfig   `json:"scratch"`
 	UV        UVConfig        `json:"uv"`
 	Docker    DockerConfig    `json:"docker"`
 	Fill      FillConfig      `json:"fill"`
@@ -93,6 +96,20 @@ type TargetsConfig struct {
 // from its remote, and that are clean and pushed.
 type WorktreesConfig struct {
 	Roots      []string `json:"roots"`
+	EveryHours float64  `json:"every_hours"`
+}
+
+// ScratchConfig is the scratch rule: tasks' folders at the top of Roots (the cache directory agents keep their
+// scratch in). An idle one's model data goes after the models rule's idle time and the rest is offloaded with
+// Offload (evidence-offload, which backs a folder up to restic and leaves NAME.restic.txt in its place) after
+// IdleDays, tagged Tag. A folder in Keep, or holding a path in it, stays. Offload empty finds evidence-offload on
+// PATH.
+type ScratchConfig struct {
+	Roots      []string `json:"roots"`
+	Keep       []string `json:"keep"`
+	IdleDays   float64  `json:"idle_days"`
+	Offload    string   `json:"offload"`
+	Tag        string   `json:"tag"`
 	EveryHours float64  `json:"every_hours"`
 }
 
@@ -175,6 +192,7 @@ func (c Config) check() error {
 }
 
 // The defaults are the owner's and the disk study's: models idle for 30 days, Rust build output idle for 48 hours,
+// tasks' folders idle for 21 days (longer than the pauses after which a task comes back to its folder),
 // the uv cache over 30 GiB or weekly, Docker's build cache older than 168 hours, and a fill faster than 20 GiB an
 // hour or one that reaches 94% within 6 hours. MinMiB leaves the small entries at the top of a cache, its markers,
 // locks and credentials, which free nothing.
@@ -182,6 +200,8 @@ const (
 	defaultIdleDays    = 30
 	defaultMinMiB      = 1
 	defaultTargetHours = 48
+	defaultScratchDays = 21
+	defaultScratchTag  = "scratch-evidence"
 	defaultUVMaxGiB    = 30
 	defaultUVEveryDays = 7
 	defaultDockerUntil = "168h"
@@ -206,6 +226,11 @@ func (c Config) Normal() Config {
 	set(&c.Targets.IdleHours, defaultTargetHours)
 	set(&c.Targets.EveryHours, defaultScanHours)
 	set(&c.Worktrees.EveryHours, defaultScanHours)
+	set(&c.Scratch.IdleDays, defaultScratchDays)
+	set(&c.Scratch.EveryHours, defaultScanHours)
+	if c.Scratch.Tag == "" {
+		c.Scratch.Tag = defaultScratchTag
+	}
 	set(&c.UV.MaxGiB, defaultUVMaxGiB)
 	set(&c.UV.EveryDays, defaultUVEveryDays)
 	set(&c.UV.EveryHours, defaultScanHours)
@@ -233,6 +258,9 @@ func (c Config) Normal() Config {
 	c.Models.Keep = exp(c.Models.Keep)
 	c.Targets.Roots = exp(c.Targets.Roots)
 	c.Worktrees.Roots = exp(c.Worktrees.Roots)
+	c.Scratch.Roots = exp(c.Scratch.Roots)
+	c.Scratch.Keep = exp(c.Scratch.Keep)
+	c.Scratch.Offload = paths.Expand(c.Scratch.Offload)
 	c.Names.HermesJobs = paths.Expand(c.Names.HermesJobs)
 	c.Names.HermesScripts = paths.Expand(c.Names.HermesScripts)
 	c.Names.Links = exp(c.Names.Links)
@@ -247,7 +275,8 @@ func (c Config) IsLive(rule string) bool { return slices.Contains(c.Live, rule) 
 // every is a rule's cadence.
 func (c Config) every(rule string) time.Duration {
 	h := map[string]float64{RuleModels: c.Models.EveryHours, RuleTargets: c.Targets.EveryHours,
-		RuleWorktrees: c.Worktrees.EveryHours, RuleUV: c.UV.EveryHours, RuleDocker: c.Docker.EveryHours}[rule]
+		RuleWorktrees: c.Worktrees.EveryHours, RuleScratch: c.Scratch.EveryHours, RuleUV: c.UV.EveryHours,
+		RuleDocker: c.Docker.EveryHours}[rule]
 	return time.Duration(h * float64(time.Hour))
 }
 
@@ -260,6 +289,8 @@ func (c Config) configured(rule string) bool {
 		return len(c.Targets.Roots) > 0
 	case RuleWorktrees:
 		return len(c.Worktrees.Roots) > 0
+	case RuleScratch:
+		return len(c.Scratch.Roots) > 0
 	}
 	return true
 }

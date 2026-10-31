@@ -48,14 +48,14 @@ func (e *excluder) byPath(p string) (string, bool) {
 	return "", false
 }
 
-// excluded reports whether a path found under the targets or worktrees roots is an excluded project's by its place:
-// by its canonical path, or as its configured root spells it. A root that is a symlink, or under one, is walked
-// where it leads, and a name may be the link's alone.
+// excluded reports whether a path found under the targets, worktrees or scratch roots is an excluded project's by
+// its place: by its canonical path, or as its configured root spells it. A root that is a symlink, or under one, is
+// walked where it leads, and a name may be the link's alone.
 func (r *runner) excluded(canon string) (string, bool) {
 	if why, ok := r.ex.byPath(canon); ok {
 		return why, true
 	}
-	for _, rt := range append(append([]root{}, r.targetRoot...), r.wtRoots...) {
+	for _, rt := range append(append(append([]root{}, r.targetRoot...), r.wtRoots...), r.scratchRoots...) {
 		if rt.shown != rt.canon && under(canon, rt.canon) {
 			if why, ok := r.ex.byPath(filepath.Join(rt.shown, strings.TrimPrefix(canon, rt.canon))); ok {
 				return why, true

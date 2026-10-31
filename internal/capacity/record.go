@@ -26,11 +26,12 @@ import (
 
 // The event kinds.
 const (
-	KindDelete = "capacity-delete"
-	KindPrune  = "capacity-prune"
-	KindReport = "capacity-report"
-	KindFailed = "capacity-failed"
-	KindFill   = "capacity-fill"
+	KindDelete  = "capacity-delete"
+	KindOffload = "capacity-offload"
+	KindPrune   = "capacity-prune"
+	KindReport  = "capacity-report"
+	KindFailed  = "capacity-failed"
+	KindFill    = "capacity-fill"
 )
 
 // overrides say, per rule, how to have an item back or keep it, for its decided note.
@@ -38,21 +39,26 @@ var overrides = map[string]string{
 	RuleModels:    "Download it again when work on it resumes; to keep an item, list it in capacity.models.keep in sources.json.",
 	RuleTargets:   "Cargo builds it again on the next build; to keep a project's build output, list the project in capacity.exclude.paths.",
 	RuleWorktrees: "Its commits are on its remote, or its changes are in the default branch; git worktree add brings a branch back.",
-	RuleUV:        "uv downloads the wheels it dropped again on the next install.",
-	RuleDocker:    "Docker builds the cache again on the next build.",
+	RuleScratch: "Restic keeps the folder: the pointer file in its place gives the restore command. Model data is downloaded or made " +
+		"again. To keep a folder, list it in capacity.scratch.keep in sources.json.",
+	RuleUV:     "uv downloads the wheels it dropped again on the next install.",
+	RuleDocker: "Docker builds the cache again on the next build.",
 }
 
 // ruleText says what each rule deleted, for a note's title.
 var ruleText = map[string]string{
 	RuleModels: "idle model data", RuleTargets: "Rust build output", RuleWorktrees: "leftover worktree",
-	RuleUV: "uv cache", RuleDocker: "Docker",
+	RuleScratch: "task folder", RuleUV: "uv cache", RuleDocker: "Docker",
 }
 
-// recordDone records one deletion or prune at once: its event and its decided note.
+// recordDone records one deletion, offload or prune at once: its event and its decided note.
 func (r *runner) recordDone(ctx context.Context, f *Finding) error {
 	kind := KindDelete
-	if f.Rule == RuleUV || f.Rule == RuleDocker {
+	switch {
+	case f.Rule == RuleUV || f.Rule == RuleDocker:
 		kind = KindPrune
+	case f.Rule == RuleScratch && f.offloaded:
+		kind = KindOffload
 	}
 	e := r.event(kind, *f, fmt.Sprintf("%s/%s/%s/%d", kind, f.Rule, keyPath(*f), r.now.UnixMilli()), store.ActorAgent)
 	e.TS = r.opt.Clock() // when it went: a later run tells its own change to a directory from someone's by it
@@ -454,8 +460,23 @@ func (r *runner) event(kind string, f Finding, key string, actor store.Actor) st
 	if !f.Seen.IsZero() {
 		meta["seen"] = f.Seen.Format(time.RFC3339)
 	}
-	if kind == KindDelete && len(f.ownDirs) > 0 {
+	if (kind == KindDelete || kind == KindOffload) && len(f.ownDirs) > 0 {
 		meta["own"] = f.ownDirs // the directories it changed: a later run tells capacity's change from someone's
+	}
+	if f.Rule == RuleScratch {
+		if len(f.files) > 0 {
+			meta["model_files"], meta["model_bytes"] = len(f.files), f.modelBytes
+		}
+		if f.removed > 0 {
+			meta["model_deleted"] = f.removed
+		}
+		if f.snapshot != "" {
+			meta["snapshot"] = f.snapshot
+		}
+		if f.maker.session != "" {
+			meta["made_by"] = map[string]string{"session": f.maker.session, "harness": f.maker.harness,
+				"at": f.maker.at.Format(time.RFC3339)}
+		}
 	}
 	for k, v := range map[string]string{"why": f.Why, "detail": f.Detail, "error": f.Err, "class": f.class, "branch": f.branch} {
 		if v != "" {
@@ -469,7 +490,19 @@ func (r *runner) event(kind string, f Finding, key string, actor store.Actor) st
 
 func summary(kind string, f Finding) string {
 	switch kind {
-	case KindDelete, KindPrune:
+	case KindOffload:
+		s := fmt.Sprintf("offloaded task folder %s to restic snapshot %s: %s, freed %s", short(f.Path), f.snapshot,
+			gib(f.Bytes), gib(f.Freed))
+		if f.removed > 0 {
+			s += fmt.Sprintf(", its model data (%s) deleted", gib(f.removed))
+		}
+		return s
+	case KindDelete:
+		if f.Rule == RuleScratch {
+			return fmt.Sprintf("deleted the model data of task folder %s: %s, freed %s", short(f.Path), gib(f.removed), gib(f.Freed))
+		}
+		fallthrough
+	case KindPrune:
 		size, freed := gib(f.Bytes), gib(f.Freed)
 		if f.unsized {
 			size = "size unknown"
@@ -488,20 +521,32 @@ func summary(kind string, f Finding) string {
 func decidedNote(e store.Event, f Finding, now time.Time) store.Note {
 	title := fmt.Sprintf("Deleted %s %s (%s)", ruleText[f.Rule], short(f.Path), gib(f.Bytes))
 	effect := "Freed " + gib(f.Freed)
-	if f.Rule == RuleUV || f.Rule == RuleDocker {
+	switch {
+	case f.Rule == RuleUV || f.Rule == RuleDocker:
 		title = fmt.Sprintf("Pruned %s: %s", f.Path, gib(f.Freed))
+	case f.Rule == RuleScratch && f.offloaded:
+		title = fmt.Sprintf("Offloaded task folder %s (%s) to restic", short(f.Path), gib(f.Bytes))
+	case f.Rule == RuleScratch:
+		title = fmt.Sprintf("Deleted the model data of task folder %s (%s)", short(f.Path), gib(f.removed))
 	}
 	if f.unsaid {
 		title, effect = "Pruned "+f.Path, "Freed an amount the tool did not print"
 	}
 	var detail []string
+	if f.snapshot != "" {
+		detail = append(detail, "Restic snapshot "+f.snapshot+"; "+short(f.Path)+pointerSuffix+" says how to restore it.")
+	}
 	if f.Detail != "" {
 		detail = append(detail, upper(f.Detail)+".")
 	}
 	if !f.Idle.IsZero() {
 		detail = append(detail, "Idle since "+f.Idle.Format("2006-01-02")+".")
 	}
-	detail = append(detail, "Rule "+f.Rule+".", overrides[f.Rule])
+	override := overrides[f.Rule]
+	if f.Rule == RuleScratch && !f.offloaded {
+		override = "Model data is downloaded or made again when work on it resumes; to keep a folder, list it in capacity.scratch.keep in sources.json."
+	}
+	detail = append(detail, "Rule "+f.Rule+".", override)
 	return store.Note{ID: "capacity:deleted:" + e.ID(), Kind: store.NoteDecided, Title: title, Detail: strings.Join(detail, " "),
 		Effect: effect, Source: store.Capacity, Importance: store.ImportanceNormal, At: now}
 }
@@ -534,6 +579,8 @@ func groupNote(id, rule, class string, items []Finding, now time.Time) store.Not
 		title = fmt.Sprintf("Docker volumes no container uses hold %s, only reported", gib(total))
 	case rule == RuleUV && class == "busy":
 		title = fmt.Sprintf("The uv cache is %s and waits to be pruned: uv processes read it", gib(total))
+	case rule == RuleScratch && class == "unreadable":
+		title = fmt.Sprintf("%d %s with directories capacity cannot read, left (%s)", len(items), plural(what, len(items)), gib(total))
 	}
 	var parts []string
 	for _, f := range items[:min(len(items), 3)] {

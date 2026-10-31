@@ -238,9 +238,14 @@ func printCapacity(w io.Writer, res *capacity.Result, all bool) {
 				continue
 			}
 			act := f.Action
-			if f.Done {
+			switch {
+			case f.Done && r.Rule == capacity.RuleScratch:
+				act = "done"
+			case f.Done:
 				act = "deleted"
-			} else if f.Action == capacity.ActDelete && !r.Live {
+			case f.Action == capacity.ActDelete && !r.Live && r.Rule == capacity.RuleScratch:
+				act = "would act"
+			case f.Action == capacity.ActDelete && !r.Live:
 				act = "would delete"
 			}
 			line := fmt.Sprintf("  %-12s %10s  %s", act, gibText(f.Bytes), f.Path)

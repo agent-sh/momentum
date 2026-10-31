@@ -45,6 +45,15 @@ type Finding struct {
 	unsaid       bool      // a prune whose tool did not say what it freed
 	unsized      bool      // a prune whose size could not be read before it ran
 	ownDirs      []ownDir  // the directories its deletion changed, each with its last change before (ownBefore)
+	// a task folder's: its model data and their bytes, the session that made it, whether only its model data goes
+	// (an excluded project's), and what the act did: the model data's bytes it deleted, the snapshot it offloaded to
+	files      []modelFile
+	modelBytes int64
+	maker      maker
+	modelOnly  bool
+	removed    int64
+	snapshot   string
+	offloaded  bool
 }
 
 // The actions a finding can have.
@@ -178,7 +187,10 @@ type runner struct {
 	keep          map[string]bool // canonical
 	targetRoot    []root
 	wtRoots       []root
-	watchStart    map[string]time.Time // per canonical model root, the first run that watched it
+	scratchRoots  []root               // deepest first
+	scratchSet    map[string]bool      // canonical
+	scratchKeep   map[string]bool      // canonical
+	watchStart    map[string]time.Time // per canonical model or scratch root, the first run that watched it
 	runTimes      []time.Time          // every run, oldest first, this one among them
 	covered       []time.Duration      // the watched time up to each run (cover)
 	blind         string               // why this run cannot trust its look at the processes, so deletes nothing
@@ -344,7 +356,7 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 		}
 	}
 	var found Found
-	if due[RuleTargets] || due[RuleWorktrees] {
+	if due[RuleTargets] || due[RuleWorktrees] || due[RuleScratch] { // scratch reads the repositories the walk finds
 		found = Discover(append(shownOf(r.targetRoot), shownOf(r.wtRoots)...),
 			func(p string) bool { return r.inTargetRoots(r.m.Canon(p)) }, func(p string) bool { return r.inWorktreeRoots(r.m.Canon(p)) }, nil)
 	}
@@ -366,6 +378,10 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 				rr.Notes = append(rr.Notes, fmt.Sprintf("walked %d directories in %s", found.Dirs, found.Took.Round(time.Millisecond)))
 			case RuleWorktrees:
 				rr.Findings, err = r.worktrees(ctx, found.Worktrees)
+			case RuleScratch:
+				var notes []string
+				rr.Findings, notes, err = r.scratch(ctx, found)
+				rr.Notes = append(rr.Notes, notes...)
 			case RuleUV:
 				rr.Findings, rr.Notes, err = r.uv(ctx, rr.Live && r.mayPrune(rr))
 			case RuleDocker:
@@ -378,7 +394,7 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 			rr.TookMS = rr.Took.Milliseconds()
 		}
 	}
-	for _, rule := range []string{RuleModels, RuleTargets, RuleWorktrees} {
+	for _, rule := range []string{RuleModels, RuleTargets, RuleWorktrees, RuleScratch} {
 		scan(rule)
 	}
 	r.mountCheck()
@@ -423,12 +439,17 @@ func (r *runner) mayPrune(rr *RuleResult) bool {
 	return true
 }
 
+// judging reports whether a rule judges items and acts on them in act: its deletions follow its judgment at once.
+func judging(rule string) bool {
+	return rule == RuleModels || rule == RuleTargets || rule == RuleWorktrees || rule == RuleScratch
+}
+
 // mountCheck reports, at judgment, every item a judging rule would delete that holds a mount point: a dry run lists
 // it as act would leave it.
 func (r *runner) mountCheck() {
 	for i := range r.res.Rules {
 		rr := &r.res.Rules[i]
-		if rr.Rule != RuleModels && rr.Rule != RuleTargets && rr.Rule != RuleWorktrees {
+		if !judging(rr.Rule) {
 			continue
 		}
 		for j := range rr.Findings {
@@ -443,8 +464,8 @@ func (r *runner) mountCheck() {
 	}
 }
 
-// watchRecord loads every run's time and when the sampler began to watch each model root, and marks the roots this
-// run watches for the first time. A dry run adds itself as a run and marks nothing.
+// watchRecord loads every run's time and when the sampler began to watch each model and scratch root, and marks the
+// roots this run watches for the first time. A dry run adds itself as a run and marks nothing.
 func (r *runner) watchRecord(ctx context.Context) error {
 	r.watchStart = map[string]time.Time{}
 	if r.st != nil {
@@ -464,14 +485,14 @@ func (r *runner) watchRecord(ctx context.Context) error {
 			return err
 		}
 		for m := range marks {
-			if !r.modelSet[strings.TrimPrefix(m, "watch:")] {
+			if c := strings.TrimPrefix(m, "watch:"); !r.modelSet[c] && !r.scratchSet[c] {
 				if err := r.st.ClearMark(ctx, m); err != nil {
 					return err
 				}
 			}
 		}
 	}
-	for _, x := range r.modelRoots {
+	for _, x := range append(append([]root{}, r.modelRoots...), r.scratchRoots...) {
 		at, err := r.mark(ctx, "watch:"+x.canon)
 		if err != nil {
 			return err
@@ -555,6 +576,18 @@ func (r *runner) roots() {
 			}
 		}
 	}
+	r.scratchSet, r.scratchKeep = map[string]bool{}, map[string]bool{}
+	for _, p := range r.cfg.Scratch.Roots {
+		if c := r.m.resolve(p); !r.scratchSet[c] {
+			r.scratchSet[c] = true
+			r.scratchRoots = append(r.scratchRoots, root{shown: filepath.Clean(p), canon: c})
+		}
+	}
+	sort.SliceStable(r.scratchRoots, func(i, j int) bool { return len(r.scratchRoots[i].canon) > len(r.scratchRoots[j].canon) })
+	for _, p := range r.cfg.Scratch.Keep {
+		r.scratchKeep[r.m.Canon(filepath.Clean(p))] = true
+		r.scratchKeep[r.m.resolve(p)] = true
+	}
 }
 
 // inRoots reports whether a canonical path is under one of the roots.
@@ -570,10 +603,11 @@ func inRoots(p string, rs []root) bool {
 func (r *runner) inModelRoots(p string) bool    { return inRoots(p, r.modelRoots) }
 func (r *runner) inTargetRoots(p string) bool   { return inRoots(p, r.targetRoot) }
 func (r *runner) inWorktreeRoots(p string) bool { return inRoots(p, r.wtRoots) }
+func (r *runner) inScratchRoots(p string) bool  { return inRoots(p, r.scratchRoots) }
 
 // watched says which paths the sampler keeps: those under any rule's roots.
 func (r *runner) watched(p string) bool {
-	return r.inModelRoots(p) || r.inTargetRoots(p) || r.inWorktreeRoots(p)
+	return r.inModelRoots(p) || r.inTargetRoots(p) || r.inWorktreeRoots(p) || r.inScratchRoots(p)
 }
 
 // due reports whether a rule scans on this run: always on a dry run, with --now or while a disk fills fast;
@@ -682,7 +716,7 @@ func dockerDown(err error) bool {
 
 // holdsRoot reports whether a path holds one of the rules' roots: a mount of it gives a container every item.
 func (r *runner) holdsRoot(p string) bool {
-	for _, x := range append(append(append([]root{}, r.modelRoots...), r.targetRoot...), r.wtRoots...) {
+	for _, x := range append(append(append(append([]root{}, r.modelRoots...), r.targetRoot...), r.wtRoots...), r.scratchRoots...) {
 		if under(x.canon, p) {
 			return true
 		}

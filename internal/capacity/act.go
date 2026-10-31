@@ -10,18 +10,19 @@ import (
 	"time"
 )
 
-// act deletes what the live judging rules (models, targets, worktrees) found. Nothing is deleted when the scheduled
-// jobs could not all be read, or when the run cannot trust its look at the processes. Before each deletion the
-// item is judged again: the same inode as when it was judged, no process using it (one fresh look at the
-// processes, Docker's mounts among them), no write since, and for a worktree the same commit, still clean and still
-// a leftover. An item that holds a mount point is only reported: a deletion would reach into another filesystem,
-// or through a bind mount into another place. Each deletion is recorded at once, so a run stopped midway leaves
-// what it did on record.
+// act deletes what the live judging rules (models, targets, worktrees, scratch) found, and offloads the tasks'
+// folders scratch found. Nothing is deleted when the scheduled jobs could not all be read, or when the run cannot
+// trust its look at the processes. Before each deletion the item is judged again: the same inode as when it was
+// judged, no process using it (one fresh look at the processes, Docker's mounts among them), no write since, for a
+// worktree the same commit, still clean and still a leftover, and for a task's folder no live session in it or of
+// it. An item that holds a mount point is only reported: a deletion would reach into another filesystem, or through
+// a bind mount into another place. Each deletion is recorded at once, so a run stopped midway leaves what it did
+// on record. Offloads start for scratchBudget at most; the rest wait for the next run.
 func (r *runner) act(ctx context.Context) error {
 	var todo []*Finding
 	for i := range r.res.Rules {
 		rr := &r.res.Rules[i]
-		if !rr.Live || (rr.Rule != RuleModels && rr.Rule != RuleTargets && rr.Rule != RuleWorktrees) {
+		if !rr.Live || !judging(rr.Rule) {
 			continue
 		}
 		for j := range rr.Findings {
@@ -59,8 +60,13 @@ func (r *runner) act(ctx context.Context) error {
 		}
 		return nil
 	}
-	r.sessions = nil // the sessions read again, for the worktrees' second look
+	r.sessions = nil // the sessions read again, for the worktrees' and task folders' second look
+	start := time.Now()
 	for _, f := range todo {
+		if f.Rule == RuleScratch && time.Since(start) > scratchBudget {
+			f.Action, f.Why = ActKeep, "waits for the next run: this run's time for offloads is spent"
+			continue
+		}
 		if why := r.recheck(ctx, f); why != "" {
 			f.Action, f.Why = ActKeep, why
 			continue
@@ -77,6 +83,11 @@ func (r *runner) act(ctx context.Context) error {
 			err = r.removeWorktree(ctx, f)
 		case RuleModels:
 			err = r.removeModel(f)
+		case RuleScratch:
+			err = r.removeScratch(ctx, f)
+			if err != nil && f.removed > 0 { // its model data went; the folder stays, its failure reported
+				f.Detail = fmt.Sprintf("deleted %s of its model data; then: %s", gib(f.removed), f.Detail)
+			}
 		default:
 			err = r.removeTarget(f)
 		}
@@ -135,6 +146,13 @@ func (r *runner) recheck(ctx context.Context, f *Finding) string {
 	case RuleTargets:
 		if newerThan(f.Path, f.Newest) {
 			return "built since it was judged"
+		}
+	case RuleScratch:
+		if t := Measure(f.Path, nil); t.Newest.After(f.Newest) {
+			return "written since it was judged"
+		}
+		if why := r.sessionIn(ctx, f.canon, f.maker); why != "" {
+			return why
 		}
 	case RuleWorktrees:
 		g, ok := r.worktree(ctx, f.Path, f.canon, r.heads, r.fresh)

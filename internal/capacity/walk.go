@@ -165,13 +165,15 @@ var skipDirs = map[string]bool{".git": true, "node_modules": true, "__pycache__"
 type Found struct {
 	Targets   []string
 	Worktrees []string // linked worktrees, with a .git file
+	Repos     []string // git directories: a main checkout's .git, a bare repository
 	Dirs      int
 	Took      time.Duration
 }
 
 // Discover walks the roots once, without following symlinks or leaving each root's filesystem, for Cargo target
-// directories (it does not walk into one) and linked worktrees (it walks into them, for their targets). A path
-// excluded by skip is not walked. wantTargets and wantWorktrees say under which paths each counts.
+// directories (it does not walk into one), linked worktrees (it walks into them, for their targets) and git
+// directories. A path excluded by skip is not walked. wantTargets and wantWorktrees say under which paths each
+// counts.
 func Discover(roots []string, wantTargets, wantWorktrees func(string) bool, skip func(string) bool) Found {
 	start := time.Now()
 	var f Found
@@ -202,11 +204,17 @@ func Discover(roots []string, wantTargets, wantWorktrees func(string) bool, skip
 			if err != nil {
 				continue
 			}
+			if isGitDir(d, ents) {
+				f.Repos = append(f.Repos, d) // a bare repository
+			}
 			for _, e := range ents {
 				if e.Name() == ".git" && e.Type().IsRegular() && wantWorktrees(d) {
 					if _, ok := isLinkedWorktree(d); ok {
 						f.Worktrees = append(f.Worktrees, d)
 					}
+				}
+				if e.Name() == ".git" && e.IsDir() {
+					f.Repos = append(f.Repos, filepath.Join(d, e.Name()))
 				}
 				if !e.IsDir() || skipDirs[e.Name()] {
 					continue

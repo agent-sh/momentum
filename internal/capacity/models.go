@@ -61,8 +61,9 @@ func (r *runner) modelKey(p string) (string, bool) {
 	return "", false
 }
 
-// sampleSeen is what this run's sample saw in use under the model roots, by item: the paths processes use, and the
-// Hugging Face repositories their command lines name (org/name, in any cache among the roots).
+// sampleSeen is what this run's sample saw in use under the model and scratch roots, by item: the paths processes
+// use, and the Hugging Face repositories their command lines name (org/name, in any cache among the roots). A path
+// under a models root is its model item's; one under a scratch root but no models root, its folder's.
 func (r *runner) sampleSeen() []store.Seen {
 	byKey := map[string]store.Seen{}
 	add := func(key string, u Use) {
@@ -73,17 +74,20 @@ func (r *runner) sampleSeen() []store.Seen {
 	for _, u := range r.sample.Uses {
 		if k, ok := r.modelKey(u.Path); ok {
 			add(k, u)
+		} else if k, ok := r.scratchKey(u.Path); ok && !r.inModelRoots(u.Path) {
+			add(k, u)
 		}
 		if u.How != "mount" {
 			continue
 		}
-		for _, x := range r.modelRoots { // a container's mount of a whole root uses every item in it
+		// a container's mount of a whole root uses every item in it
+		for _, x := range append(append([]root{}, r.modelRoots...), r.scratchRoots...) {
 			if !under(x.canon, u.Path) {
 				continue
 			}
 			ents, _ := os.ReadDir(x.shown)
 			for _, e := range ents {
-				if c := filepath.Join(x.canon, e.Name()); !r.modelSet[c] {
+				if c := filepath.Join(x.canon, e.Name()); !r.modelSet[c] && !r.scratchSet[c] {
 					add(c, u)
 				}
 			}

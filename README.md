@@ -106,11 +106,12 @@ It keeps the disks from filling. Each run samples which paths processes use (ope
 - **models:** a top-level item of a models, datasets or model-cache root with no write and no use seen for 30 days of watching. A root's items wait until the sampler has watched it for 30 days, and time it did not run does not count. A Hugging Face cache's shared Xet blobs go with the last repository that links them, under Hugging Face's own locks.
 - **targets:** a Cargo target directory with no write for 48 hours, that no process uses, that git does not track, and whose project is known and not excluded. What Cargo does not build again (saved benchmark baselines) stays.
 - **worktrees:** a linked worktree whose branch is merged, landed or gone from its remote, clean (ignored files only in rebuildable caches), with every commit merged or on a branch its remote still has: `git worktree remove`, then its branch if it has not moved. One with uncommitted, ignored or unpushed work is reported; one whose repository someone works in (a process or session in one of its work trees, or a change to one in the last hour that capacity did not make) waits.
+- **scratch:** a task's idle folder at the top of the cache directory, one an agent's command named within minutes of its birth (a tool's cache is tagged, named like a command, or made by no agent), with no write and no use seen for 21 days of watching: offloaded to restic with `evidence-offload`, which leaves `NAME.restic.txt` in its place. Its model weights, checkpoints and datasets are deleted instead, after the models rule's 30 days. A folder a process uses, a job names, a live session works in or made, or a repository references stays; an excluded project's is reported, all but its model data.
 - **uv:** `uv cache prune --ci` over 30 GiB or weekly, never past uv's lock: a long-lived uv process that reads the cache is reported, and the prune waits for it.
 - **docker:** the build cache older than 168 hours and dangling images; unused volumes are reported. Its size counts only what the prune removes: a record an image shares stays and frees nothing, and so does a parent of a record that stays.
 - **disk:** a fill faster than 20 GiB an hour, or one that reaches 94% within 6 hours, names its writers in a problem note (by what each wrote at a look and since the run before, the fastest of every writer the fill's runs saw); a disk above 94% has a note of its own.
 
-Only the rules listed in `live` delete; the others list what they would delete. Whatever a systemd unit, timer, crontab line, Hermes job or installed command's symlink names stays, and so does what a process uses: each item is judged again just before it goes. Excluded projects are report-only for every rule but models. A run that cannot read the user's jobs, or that sees another PID namespace's processes, deletes nothing. Each deletion is an event and a decided note in the report, recorded as it happens; what a rule can only report is a problem note. Every path is configuration, under `capacity` in `sources.json`, and an unknown key is refused:
+Only the rules listed in `live` delete or offload; the others list what they would do. Whatever a systemd unit, timer, crontab line, Hermes job or installed command's symlink names stays, and so does what a process uses: each item is judged again just before it goes. Excluded projects are report-only for every rule but models. A run that cannot read the user's jobs, or that sees another PID namespace's processes, deletes nothing. Each deletion is an event and a decided note in the report, recorded as it happens; what a rule can only report is a problem note. Every path is configuration, under `capacity` in `sources.json`, and an unknown key is refused:
 
 ```json
 {"capacity": {
@@ -120,11 +121,12 @@ Only the rules listed in `live` delete; the others list what they would delete. 
   "names": {"hermes_jobs": "~/.hermes/cron/jobs.json", "hermes_scripts": "~/.hermes/scripts", "links": ["~/.local/bin"]},
   "models": {"roots": ["/srv/models", "~/.cache/huggingface", "~/.cache/huggingface/hub"], "keep": ["/srv/models/token"]},
   "targets": {"roots": ["~/code", "~/.cache"]},
-  "worktrees": {"roots": ["~/.cache", "~/code/*-worktrees"]}
+  "worktrees": {"roots": ["~/.cache", "~/code/*-worktrees"]},
+  "scratch": {"roots": ["~/.cache"], "offload": "~/.local/bin/evidence-offload", "keep": ["~/.cache/keep-me"]}
 }}
 ```
 
-Thresholds have defaults (`idle_days`, `idle_hours`, `max_gib`, `every_days`, `until`, `fill`, `min_mib`, `every_hours`). A dry run deletes and records nothing and runs every rule now.
+Thresholds have defaults (`idle_days`, `idle_hours`, `max_gib`, `every_days`, `until`, `fill`, `min_mib`, `every_hours`, scratch's `tag`). A dry run deletes and records nothing and runs every rule now.
 
 Run it with `momentum evidence ingest`'s timer: a oneshot unit of its own that the ingest unit `Wants=`, ordered `After=` it, so a failed ingest does not skip it and an hourly scan has its own timeout.
 

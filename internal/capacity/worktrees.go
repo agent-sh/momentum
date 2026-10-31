@@ -397,8 +397,8 @@ type ownDir struct {
 	Prev time.Time `json:"prev"`
 }
 
-// ownDeletions are the directories capacity's deletions changed: this run's, as it makes them, and the last hour's,
-// from their events (an event without the list, from an older build, explains nothing).
+// ownDeletions are the directories capacity's deletions and offloads changed: this run's, as it makes them, and the
+// last hour's, from their events (an event without the list, from an older build, explains nothing).
 func (r *runner) ownDeletions(ctx context.Context) map[string]ownChange {
 	if r.own != nil {
 		return r.own
@@ -407,7 +407,7 @@ func (r *runner) ownDeletions(ctx context.Context) map[string]ownChange {
 	if r.st == nil {
 		return r.own
 	}
-	evs, err := r.st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindDelete}, Since: r.now.Add(-quietTime),
+	evs, err := r.st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindDelete, KindOffload}, Since: r.now.Add(-quietTime),
 		Limit: math.MaxInt32})
 	if err != nil {
 		return r.own // none known: a repository looks busier, never idler

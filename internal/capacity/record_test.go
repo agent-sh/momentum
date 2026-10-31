@@ -273,7 +273,7 @@ func TestAFillWritersRunsAddUpTheFastestLookStandsAndANameOutlivesItsProcess(t *
 	p3 := proc(1801, dd)
 	fillRun(t, st, dir, now, p3, look(0, filepath.Join(p3, "41")))
 	n, _, _ := st.Note(ctx, "capacity:fill:"+dir)
-	if !strings.Contains(n.Detail, "dd (pid 41) wrote 4.0 GiB in 10m0s, 90 MiB/s at a look in "+dir) {
+	if !strings.Contains(n.Detail, "dd (pid 41) wrote 4.0 GiB in 10m0s, 90 MiB/s at a look in "+short(dir)) {
 		t.Errorf("what it wrote adds up over the runs, its fastest look from the fill's first run stands, the newest run "+
 			"names it, and its name and directory come from the sample when it ended during the look: %s", n.Detail)
 	}

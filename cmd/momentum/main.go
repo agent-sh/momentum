@@ -55,7 +55,8 @@ const usage = `usage:
   momentum capacity [--dry-run] [--now] [--rule R,R] [--json] [--all]
                                         keep the disks from filling: sample which paths processes use, record
                                         each disk's use, and run the rules that are due (models, targets,
-                                        worktrees, uv, docker); a rule not live lists what it would delete.
+                                        worktrees, scratch, uv, docker); a rule not live lists what it would
+                                        delete or offload.
                                         --dry-run deletes and records nothing and runs every rule
   momentum version
 Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json), and the
