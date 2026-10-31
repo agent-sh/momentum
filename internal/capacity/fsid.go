@@ -108,6 +108,22 @@ func (m *Mounts) Canon(p string) string {
 	return filepath.Join(prim.point, strings.TrimPrefix(inFS, prim.root))
 }
 
+// devOf is the device of the filesystem that holds p, as mountinfo gives it ("major:minor": its superblock's, which
+// /proc/locks prints too), or "" when no mount holds it. p is a path with its links resolved.
+func (m *Mounts) devOf(p string) string {
+	if m == nil {
+		return ""
+	}
+	var at mount
+	found := false
+	for _, mt := range m.list { // the last of the longest, as in Canon
+		if under(p, mt.point) && (!found || len(mt.point) >= len(at.point)) {
+			at, found = mt, true
+		}
+	}
+	return at.dev
+}
+
 // resolve is the canonical name of a path that may hold symlinks or not exist: its longest existing ancestor with
 // symlinks resolved, then what follows it, through Canon.
 func (m *Mounts) resolve(p string) string {
