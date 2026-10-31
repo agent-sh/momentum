@@ -232,16 +232,8 @@ func between(prev, cur writesSnap) map[int]wrote {
 			if now, ok := cur.ws[pid]; ok && now.Start == c.Start {
 				continue
 			}
-			for a, hops := c.PPID, 0; hops < 64; hops++ { // up past the ended ones, to the ancestor still running
-				p, ok := prev.ws[a]
-				if !ok {
-					break
-				}
-				if q, ok := cur.ws[a]; ok && q.Start == p.Start {
-					took[a] += c.Written
-					break
-				}
-				a = p.PPID
+			if a, ok := ancestor(prev, cur, c.PPID); ok {
+				took[a] += c.Written
 			}
 		}
 	}
@@ -267,6 +259,7 @@ func carry(procRoot string, prev writesSnap, cur *writesSnap) {
 	if prev.snap.At.IsZero() || prev.snap.Boot != cur.snap.Boot {
 		return
 	}
+	carried := map[int]bool{}
 	for pid, c := range prev.ws {
 		if now, ok := cur.ws[pid]; ok && now.Start == c.Start {
 			continue
@@ -276,7 +269,36 @@ func carry(procRoot string, prev writesSnap, cur *writesSnap) {
 			continue
 		}
 		cur.ws[pid] = store.ProcWrite{PID: pid, PPID: parentOf(string(st)), Start: c.Start, Written: c.Written}
+		carried[pid] = true
 	}
+	// one on record that ended under a carried one: the carried one took in its count, so its record keeps it, for
+	// the wait that takes the carried one in
+	for pid, c := range prev.ws {
+		if now, ok := cur.ws[pid]; ok && now.Start == c.Start {
+			continue
+		}
+		if a, ok := ancestor(prev, *cur, c.PPID); ok && carried[a] {
+			q := cur.ws[a]
+			q.Written += c.Written
+			cur.ws[a] = q
+		}
+	}
+}
+
+// ancestor is the nearest recorded ancestor of a process on record that is still the same process now (pid and
+// start), past the ones on record that ended: where an ended process's count went.
+func ancestor(prev, cur writesSnap, ppid int) (int, bool) {
+	for a, hops := ppid, 0; hops < 64; hops++ {
+		p, ok := prev.ws[a]
+		if !ok {
+			return 0, false
+		}
+		if q, ok := cur.ws[a]; ok && q.Start == p.Start {
+			return a, true
+		}
+		a = p.PPID
+	}
+	return 0, false
 }
 
 // startOf is a process's start from its stat, in clock ticks after boot, or 0.

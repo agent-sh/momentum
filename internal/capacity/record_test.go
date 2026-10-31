@@ -402,8 +402,60 @@ func TestAFillAfterARebootCountsAllEachProcessWrote(t *testing.T) {
 	}
 }
 
+// snapOf is a snapshot at an uptime on a boot, with these records.
+func snapOf(up int64, boot string, ws ...store.ProcWrite) writesSnap {
+	s := writesSnap{snap: store.Snapshot{At: time.Unix(1, 0), Uptime: up, Boot: boot}, ws: map[int]store.ProcWrite{}}
+	for _, w := range ws {
+		s.ws[w.PID] = w
+	}
+	return s
+}
+
+func TestAChildThatEndedUnderAZombieLauncherIsCountedOnce(t *testing.T) {
+	const g = 1 << 30
+	root := t.TempDir()
+	// python ended under uv, uv waited for it and ended, and bash has not waited for uv yet
+	write(t, filepath.Join(root, "31", "stat"), "31 (uv) Z 30 0 0 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 150 0 0\n")
+	prev := snapOf(1000, "b1", store.ProcWrite{PID: 30, Start: 100, Written: 1 * g}, store.ProcWrite{PID: 31, PPID: 30, Start: 150, Written: 10 << 20},
+		store.ProcWrite{PID: 32, PPID: 31, Start: 200, Written: 50 * g})
+	cur := snapOf(31000, "b1", store.ProcWrite{PID: 30, Start: 100, Written: 1 * g})
+	carry(root, prev, &cur)
+	if w := cur.ws[31]; w.Written != 50*g+10<<20 {
+		t.Errorf("uv's record keeps python's 50 GiB: %+v", w)
+	}
+	next := snapOf(61000, "b1", store.ProcWrite{PID: 30, Start: 100, Written: 1*g + 10<<20 + 60*g})
+	if got := between(cur, next); got[30].written != 10*g {
+		t.Errorf("bash wrote python's last 10 GiB: %+v", got[30])
+	}
+}
+
+func TestTheWalkAndTheCarryKeepTheirGuards(t *testing.T) {
+	const g = 1 << 30
+	// the walk passes a pid another process holds now: python's record is taken from the shell, not the newcomer
+	prev := snapOf(1000, "b1", store.ProcWrite{PID: 30, Start: 1, Written: 1 * g}, store.ProcWrite{PID: 31, PPID: 30, Start: 2, Written: 100 << 20},
+		store.ProcWrite{PID: 32, PPID: 31, Start: 3, Written: 50 * g})
+	got := between(prev, snapOf(31000, "b1", store.ProcWrite{PID: 30, Start: 1, Written: 1*g + 2*g + 150<<20 + 60*g},
+		store.ProcWrite{PID: 31, PPID: 1, Start: 2000, Written: 1 * g}))
+	if got[30].written != 2*g+50<<20+10*g || got[31].written != 1*g {
+		t.Errorf("the shell wrote 12 GiB and 50 MiB, the newcomer 1 GiB: %+v", got)
+	}
+	root := t.TempDir()
+	// a carried process keeps the parent its stat names now: one reparented since is no longer under its old parent
+	write(t, filepath.Join(root, "31", "stat"), "31 (x) S 1 0 0 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 200 0 0\n")
+	cur := snapOf(31000, "b1")
+	carry(root, snapOf(1000, "b1", store.ProcWrite{PID: 30, Start: 100}, store.ProcWrite{PID: 31, PPID: 30, Start: 200, Written: 5 * g}), &cur)
+	if w, ok := cur.ws[31]; !ok || w.PPID != 1 {
+		t.Errorf("carried with the parent its stat names now: %+v", cur.ws)
+	}
+	// after a reboot, a pid and start on record are another process's: nothing is carried
+	cur = snapOf(31000, "b2")
+	carry(root, snapOf(1000, "b1", store.ProcWrite{PID: 31, PPID: 30, Start: 200, Written: 5 * g}), &cur)
+	if _, ok := cur.ws[31]; ok {
+		t.Errorf("nothing is carried across a boot: %+v", cur.ws)
+	}
+}
+
 func TestAZombieOnARunStaysOnRecordUntilItsParentWaits(t *testing.T) {
-	ctx := context.Background()
 	st, dir, now, proc := fillFixture(t)
 	shell := fakeProc{pid: 30, ppid: 1, argv: []string{"bash"}, cwd: dir, written: 1 << 30}
 	train := fakeProc{pid: 31, ppid: 30, argv: []string{"torchrun"}, cwd: dir, written: 50 << 30, start: 200}
@@ -417,7 +469,6 @@ func TestAZombieOnARunStaysOnRecordUntilItsParentWaits(t *testing.T) {
 	if len(d.Writers) != 1 || d.Writers[0].PID != 30 || d.Writers[0].Written != 10<<30 {
 		t.Errorf("the shell wrote the child's last 10 GiB, not all 60: %+v", d.Writers)
 	}
-	_ = ctx
 }
 
 func TestALookWriterThatWroteNothingSinceSaysOnlyItsLook(t *testing.T) {
