@@ -225,24 +225,24 @@ func TestWritesAreReplacedByEachRecord(t *testing.T) {
 
 func TestAStoreWithoutTheWritesTablesGainsThem(t *testing.T) {
 	ctx := context.Background()
-	st, path := open(t)
-	st.Close()
-	db, err := sql.Open("sqlite", "file:"+path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, tb := range []string{"capacity_writes", "capacity_snapshot"} { // a store the build before them made
+	for _, tb := range []string{"capacity_writes", "capacity_snapshot"} { // a store without one, as a build before it made
+		st, path := open(t)
+		st.Close()
+		db, err := sql.Open("sqlite", "file:"+path)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if _, err := db.Exec(`DROP TABLE ` + tb); err != nil {
 			t.Fatal(err)
 		}
-	}
-	db.Close()
-	st, err = Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	if err := st.PutWrites(ctx, Snapshot{At: time.UnixMilli(1_800_000_000_000), Uptime: 1, Boot: "b"}, []ProcWrite{{PID: 1, Start: 1}}); err != nil {
-		t.Errorf("the next open makes them: %v", err)
+		db.Close()
+		st, err = Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.PutWrites(ctx, Snapshot{At: time.UnixMilli(1_800_000_000_000), Uptime: 1, Boot: "b"}, []ProcWrite{{PID: 1, Start: 1}}); err != nil {
+			t.Errorf("without %s, the next open makes it: %v", tb, err)
+		}
+		st.Close()
 	}
 }
