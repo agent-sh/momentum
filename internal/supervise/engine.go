@@ -91,9 +91,9 @@ type Supervisor struct {
 	// argument: a passive notice for its owner. It must not be a path that wakes him.
 	Notice []string
 	Now    func() time.Time
-	// Woke tells when the machine last woke from a suspend: a stalled request's wait counts from it when it came
-	// later. nil asks systemd (lastWake).
-	Woke func(ctx context.Context) time.Time
+	// Sleep tells when the machine's last suspend began and ended: a rule's wait counts from its end when it began
+	// before the wait ended. nil asks systemd (lastSleep).
+	Sleep func(ctx context.Context) (slept, woke time.Time)
 	// Prompted tells whether the session's transcript shows the message as the prompt of a turn since the scan,
 	// after an interrupt put it there; nil reads the transcript (claude.Prompted), a few seconds at most.
 	Prompted func(ctx context.Context, s *sessions.Session, text string) (found bool, interrupted time.Time, err error)
@@ -125,7 +125,7 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 	var lines []Line
 	probe := sv.Probe
 	seen := map[string]*seenSession{}
-	var woke *time.Time // asked once per run, and only when a session waits on a request
+	var sleep *[2]time.Time // asked once per run, and only when a session waits on a request or a run of its own
 	for _, s := range ss {
 		now := sv.now()
 		if s.Partial {
@@ -160,12 +160,13 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 		presence := h.presence(s, ownerAt, answered)
 		stop := StopOf(s, presence)
 		if !stop.RequestAt.IsZero() || !stop.WakeDue.IsZero() && stop.WakeDue.Before(now) {
-			if woke == nil {
-				w := sv.woke(ctx)
-				woke = &w
+			if sleep == nil {
+				a, b := sv.sleep(ctx)
+				sleep = &[2]time.Time{a, b}
 			}
-			stop.Woke = *woke
+			stop.Slept, stop.Woke = sleep[0], sleep[1]
 		}
+		stop.WakeHandled = stop.WakeKey != "" && h.wakes[stop.WakeKey]
 		var put []store.Event
 		resolved := sv.outcome(ctx, s, stop, &h, now, &put)
 		if !resolved {
@@ -281,6 +282,9 @@ func (sv *Supervisor) put(ctx context.Context, evs []store.Event) error {
 func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, d Decision, h past, starts map[int]uint64, line *Line) error {
 	t := act.TargetOf(s, starts[s.PID])
 	m := map[string]any{"rule": d.Rule, "try": d.Try, "text": d.Text, "why": d.Why, "stop_at": stop.At.UnixMilli(), "error": stop.Error, "seq": s.Seq}
+	if d.Rule == RuleOverdue {
+		m["wake_key"] = stop.WakeKey // one resync per wakeup or run
+	}
 	// A stalled turn takes the message through its queue while it runs on its screen, and Escape ends it. One its
 	// screen shows taken back is left alone: the message would resume work its owner stopped.
 	interrupt := d.Rule == RuleStalled
@@ -465,7 +469,8 @@ type past struct {
 	presentAt time.Time      // when its owner was last seen at the pane: a draft, a tmux mode, a line he cleared
 	atPane    map[int64]bool // the stops (their ms) whose last check met a draft or a mode
 	keys      map[string]bool
-	escapes   []time.Time // the interruptions momentum's own Escapes left in the transcript
+	escapes   []time.Time     // the interruptions momentum's own Escapes left in the transcript
+	wakes     map[string]bool // the wakeups and runs (their keys) a resync was typed for
 	// dryRequest is, by key, the request each dry act of a stalled turn was about (ms), as its last run put it
 	dryRequest map[string]int64
 }
@@ -477,7 +482,7 @@ type caseRec struct {
 }
 
 func history(evs []store.Event) past {
-	h := past{keys: map[string]bool{}, atPane: map[int64]bool{}, dryRequest: map[string]int64{}}
+	h := past{keys: map[string]bool{}, atPane: map[int64]bool{}, dryRequest: map[string]int64{}, wakes: map[string]bool{}}
 	outcomes := map[string]map[string]bool{}
 	for _, e := range evs {
 		h.keys[e.SourceKey] = true
@@ -499,6 +504,9 @@ func history(evs []store.Event) past {
 			}
 			if !ok && !sending {
 				continue
+			}
+			if k := str(m["wake_key"]); k != "" {
+				h.wakes[k] = true
 			}
 			h.sends = append(h.sends, sent{at: e.TS, rule: str(m["rule"]), try: num(m["try"]), seq: num(m["seq"]), key: e.SourceKey,
 				stopAt: time.UnixMilli(int64(num(m["stop_at"]))), text: fold(str(m["text"]))})
@@ -738,7 +746,7 @@ func StopOf(s *sessions.Session, presence time.Time) Stop {
 	st := Stop{Key: s.Key, Tool: s.Tool, Name: s.Name, Where: s.Where, Auto: s.Auto, Phase: s.Phase, At: s.Since,
 		Words: Words(s.LastText), Working: s.TurnOpen, Busy: s.Now != "", Tasks: len(s.Tasks), WakeAt: s.WakeAt, Loop: s.Loop,
 		ResumedAt: s.ResumedAt, RequestAt: s.RequestAt, Queued: s.Queued, WakeDue: s.WakeDue, WakeFor: s.WakeFor, OwnerAt: presence,
-		Started: s.Started}
+		WakeKey: s.WakeKey, WakeJob: s.WakeJob, WakeSign: s.WakeSign, TurnBegan: s.TurnBegan, IdleAt: s.IdleSince, Started: s.Started}
 	switch s.AskKind {
 	case sessions.AskError:
 		st.Error = strings.TrimPrefix(s.Ask, "stopped on an error: ")
@@ -783,27 +791,43 @@ func (c credentials) AccessBack(class string, since time.Time) (time.Time, bool)
 	return back, ok
 }
 
-func (sv *Supervisor) woke(ctx context.Context) time.Time {
-	if sv.Woke != nil {
-		return sv.Woke(ctx)
+func (sv *Supervisor) sleep(ctx context.Context) (slept, woke time.Time) {
+	if sv.Sleep != nil {
+		return sv.Sleep(ctx)
 	}
-	return lastWake(ctx)
+	return lastSleep(ctx)
 }
 
-// lastWake is when the machine last woke from a suspend, by systemd's sleep target, which goes inactive as the
-// machine resumes. Zero when it has not slept since it booted, or systemd cannot tell.
-func lastWake(ctx context.Context) time.Time {
+// lastSleep is when the machine's last suspend began and ended, by systemd's sleep target, which goes active as
+// the machine suspends and inactive as it resumes. Zero when it has not slept since it booted, or systemd cannot
+// tell.
+func lastSleep(ctx context.Context) (slept, woke time.Time) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "systemctl", "show", "sleep.target", "--property=InactiveEnterTimestamp", "--timestamp=unix", "--value").Output()
+	out, err := exec.CommandContext(ctx, "systemctl", "show", "sleep.target", "--property=ActiveEnterTimestamp,InactiveEnterTimestamp", "--timestamp=unix").Output()
 	if err != nil {
-		return time.Time{}
+		return time.Time{}, time.Time{}
 	}
-	n, err := strconv.ParseInt(strings.TrimPrefix(strings.TrimSpace(string(out)), "@"), 10, 64)
-	if err != nil || n <= 0 {
-		return time.Time{}
+	return parseSleep(string(out))
+}
+
+// parseSleep reads systemctl's properties of the sleep target: when it went active (the suspend) and inactive
+// (the wake).
+func parseSleep(out string) (slept, woke time.Time) {
+	for _, l := range strings.Split(out, "\n") {
+		k, v, _ := strings.Cut(strings.TrimSpace(l), "=")
+		n, err := strconv.ParseInt(strings.TrimPrefix(v, "@"), 10, 64)
+		if err != nil || n <= 0 {
+			continue
+		}
+		switch k {
+		case "ActiveEnterTimestamp":
+			slept = time.Unix(n, 0)
+		case "InactiveEnterTimestamp":
+			woke = time.Unix(n, 0)
+		}
 	}
-	return time.Unix(n, 0)
+	return slept, woke
 }
 
 // promptedWait is how long a message sent with an Escape has to show up in the transcript as the prompt of the

@@ -93,6 +93,11 @@ type Session struct {
 	Loop       string    `json:"loop,omitempty"`
 	WakeDue    time.Time `json:"wake_due,omitzero"`   // its own pending wakeup or loop run should have fired by then, at the latest
 	WakeFor    string    `json:"wake_for,omitempty"`  // what that wakeup or run is for: its reason, else its prompt
+	WakeKey    string    `json:"wake_key,omitempty"`  // which wakeup or run that is, the same on every scan
+	WakeJob    bool      `json:"wake_job,omitempty"`  // that is a scheduled job's run, not a self-paced loop's wakeup
+	WakeSign   string    `json:"wake_sign,omitempty"` // why a self-paced wakeup may have been lost: a cause its harness drops one for
+	TurnBegan  time.Time `json:"turn_began,omitzero"` // when its last turn began
+	IdleSince  time.Time `json:"idle_since,omitzero"` // when its last turn ended
 	LastText   string    `json:"last_text,omitempty"` // the last assistant message in full
 	LastActive time.Time `json:"last_active"`
 	// UserAt is when user-role text last opened a turn, by the harness's record. Whoever typed it: a program

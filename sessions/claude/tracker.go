@@ -6,6 +6,7 @@ package claude
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -22,12 +23,16 @@ import (
 
 // What tool results say when work outlives the call that started it.
 var (
-	reBgBash    = regexp.MustCompile(`running in background with ID: (\w+)`)
-	reAgentID   = regexp.MustCompile(`agentId: (\w+)`)
-	reWorkflow  = regexp.MustCompile(`Workflow launched in background\. Task ID: (\w+)`)
-	reMonitor   = regexp.MustCompile(`Monitor started \(task (\w+), expires in (\d+)(m|s|h)`)
-	reWake      = regexp.MustCompile(`Next wakeup scheduled for [0-9:]+ \(in (\d+)s\)`)
-	reCron      = regexp.MustCompile(`Scheduled (?:recurring|one-shot) job (\w+) \(([^)]*)\)`)
+	reBgBash   = regexp.MustCompile(`running in background with ID: (\w+)`)
+	reAgentID  = regexp.MustCompile(`agentId: (\w+)`)
+	reWorkflow = regexp.MustCompile(`Workflow launched in background\. Task ID: (\w+)`)
+	reMonitor  = regexp.MustCompile(`Monitor started \(task (\w+), expires in (\d+)(m|s|h)`)
+	reWake     = regexp.MustCompile(`Next wakeup scheduled for [0-9:]+ \(in (\d+)s\)`)
+	// reCron is CronCreate's result: a recurring job, or a one-shot task (a one-shot job in older versions), its id,
+	// and its schedule, in words in recent versions ("Every 10 minutes"), as the expression in older ones.
+	reCron = regexp.MustCompile(`Scheduled (recurring|one-shot) (?:job|task) (\w+) \(([^)]*)\)`)
+	// reWakeGone is Claude Code's notice that a restart past a wakeup's time lost it.
+	reWakeGone  = regexp.MustCompile(`so that wakeup will not fire`)
 	reTaskID    = regexp.MustCompile(`<task-id>([^<]+)</task-id>`)
 	reStatus    = regexp.MustCompile(`<status>(\w+)</status>`)
 	reOutFile   = regexp.MustCompile(`Output is being written to: (\S+?)\.output`)
@@ -63,6 +68,7 @@ type task struct {
 
 type cron struct {
 	Label   string    `json:"label"`
+	Expr    string    `json:"expr,omitempty"` // what it runs on: CronCreate's input, or the label where a version wrote it
 	At      time.Time `json:"at"`
 	OneShot bool      `json:"one_shot,omitempty"`
 	For     string    `json:"for,omitempty"`  // the prompt it runs
@@ -75,6 +81,7 @@ type call struct {
 	Label string    `json:"label,omitempty"` // an Agent call's description
 	Type  string    `json:"type,omitempty"`  // an Agent call's subagent type
 	For   string    `json:"for,omitempty"`   // what a wakeup or a scheduled job is for: its reason, else its prompt
+	Cron  string    `json:"cron,omitempty"`  // a CronCreate call's expression
 	At    time.Time `json:"at"`
 }
 
@@ -104,11 +111,16 @@ type track struct {
 	WakeAt   time.Time        `json:"wake_at"`
 	WakeFor  string           `json:"wake_for,omitempty"` // what the pending wakeup is for
 	WakeSet  time.Time        `json:"wake_set,omitzero"`  // when it was set
-	Crons    map[string]cron  `json:"crons"`
-	Model    string           `json:"model"`
-	UserAt   time.Time        `json:"user_at,omitzero"`    // when user-role text last opened a turn
-	Control  time.Time        `json:"control_at,omitzero"` // when its user last ran a local command, interrupted or answered
-	Resumed  time.Time        `json:"resumed,omitzero"`    // a resume record since which nothing else happened
+	// WakeSign is why the pending wakeup may have been lost: what came while it waited that Claude Code is known to
+	// drop a wakeup for (a task's notification, a compaction).
+	WakeSign  string          `json:"wake_sign,omitempty"`
+	TurnBegan time.Time       `json:"turn_began,omitzero"` // when the last turn began: an input, not the model's own record
+	TurnEnd   time.Time       `json:"turn_end,omitzero"`   // when the last turn ended
+	Crons     map[string]cron `json:"crons"`
+	Model     string          `json:"model"`
+	UserAt    time.Time       `json:"user_at,omitzero"`    // when user-role text last opened a turn
+	Control   time.Time       `json:"control_at,omitzero"` // when its user last ran a local command, interrupted or answered
+	Resumed   time.Time       `json:"resumed,omitzero"`    // a resume record since which nothing else happened
 	// Request is when the turn sent the model request it still waits on: the last record of the conversation is
 	// Claude Code's record of that request, and no reply, error or input has come after it.
 	Request time.Time `json:"request,omitzero"`
@@ -233,6 +245,15 @@ func (t *Tracker) line(raw []byte) {
 	}
 	at, _ := time.Parse(time.RFC3339Nano, e.Timestamp)
 	open := t.TurnOpen() // before this record answers anything: a reopening closes a turn that was open
+	defer func() {
+		switch now := t.TurnOpen(); {
+		case at.IsZero():
+		case open && !now:
+			t.st.TurnEnd = at
+		case !open && now && e.Type != "assistant": // a reply streamed in parts reopens nothing
+			t.st.TurnBegan = at
+		}
+	}()
 	t.answered(e, at)
 	if e.Message == nil {
 		// Notifications that arrive mid-turn are queued: recorded as queue operations and attachments.
@@ -252,8 +273,11 @@ func (t *Tracker) line(raw []byte) {
 		case "queue-operation":
 			t.queued(e)
 		case "system":
-			if e.Subtype == "scheduled_task_fire" {
+			switch e.Subtype {
+			case "scheduled_task_fire":
 				t.fired(raw, at)
+			case "compact_boundary":
+				t.waitedThrough("the conversation was compacted while it waited", at)
 			}
 		}
 		return
@@ -281,23 +305,41 @@ func (t *Tracker) answered(e line, at time.Time) {
 	}
 }
 
-// fired follows Claude Code's record of a scheduled run starting: a self-paced loop's wakeup, or a job CronCreate
-// scheduled, named by its task id.
+// fired follows Claude Code's record of a scheduled run starting: a job CronCreate scheduled, named by its task
+// id, or a self-paced loop's wakeup, which says so. A run of anything else (a task scheduled elsewhere) is
+// neither.
 func (t *Tracker) fired(raw []byte, at time.Time) {
 	var f struct {
-		Content string `json:"content"`
-		TaskID  string `json:"taskId"`
+		Content  string `json:"content"`
+		TaskID   string `json:"taskId"`
+		TaskKind string `json:"taskKind"`
 	}
 	json.Unmarshal(raw, &f)
 	st := &t.st
-	c, job := st.Crons[f.TaskID]
-	if job {
-		c.Fired = at
-		st.Crons[f.TaskID] = c
+	if c, job := st.Crons[f.TaskID]; job {
+		if c.OneShot {
+			delete(st.Crons, f.TaskID) // it fires once, then deletes itself
+		} else {
+			c.Fired = at
+			st.Crons[f.TaskID] = c
+		}
+		return
 	}
-	// A wakeup's run says so; a run of no job it knows, at or after the wakeup's time, is the wakeup's too.
-	if strings.Contains(f.Content, "wakeup") || !job && !st.WakeAt.IsZero() && !at.Before(st.WakeAt.Add(-sessions.WakeGrace)) {
-		st.WakeAt, st.WakeFor = time.Time{}, ""
+	if (f.TaskKind == "loop" || strings.Contains(f.Content, "wakeup")) && !st.WakeAt.IsZero() && !at.Before(st.WakeSet) {
+		t.clearWake()
+	}
+}
+
+// clearWake ends the pending wakeup: it fired, or Claude Code cancelled it.
+func (t *Tracker) clearWake() {
+	t.st.WakeAt, t.st.WakeFor, t.st.WakeSign = time.Time{}, "", ""
+}
+
+// waitedThrough notes that sign came while a wakeup was pending, before its time: a cause Claude Code is known to
+// drop one for. What comes after its time did not keep it from firing.
+func (t *Tracker) waitedThrough(sign string, at time.Time) {
+	if st := &t.st; !st.WakeAt.IsZero() && !at.Before(st.WakeSet) && at.Before(st.WakeAt) && st.WakeSign == "" {
+		st.WakeSign = sign
 	}
 }
 
@@ -313,36 +355,50 @@ func wakeFor(reason, prompt string) string {
 	return prompt
 }
 
-// due is when the session's own pending wakeup, or the next run of a recurring job it scheduled, should have
-// fired at the latest, and what for: the wakeup's time; the run's time and the most Claude Code delays it
-// (schedule.lateness). The earliest of them; zero when none is pending. Those of a process before started died
-// with it: a self-paced loop is not restored, and a job is not counted.
-func (t *Tracker) due(started, now time.Time) (time.Time, string) {
-	st := &t.st
-	var at time.Time
-	var why string
-	earlier := func(d time.Time, w string) {
-		if !d.IsZero() && (at.IsZero() || d.Before(at)) {
-			at, why = d, w
-		}
-	}
-	if t.ownWake(started) {
-		earlier(st.WakeAt, st.WakeFor)
-	}
-	for _, c := range st.Crons {
-		if c.OneShot || (!started.IsZero() && c.At.Before(started)) || now.Sub(c.At) > cronExpiry {
-			continue
-		}
-		if _, d, ok := LoopRun(c.Label, latest(c.At, c.Fired)); ok {
-			earlier(d, c.For)
-		}
-	}
-	return at, why
+// Due is the earliest run of the session's own that should have fired by now: its pending wakeup, or the next run
+// of a job it scheduled.
+type Due struct {
+	At   time.Time // the latest Claude Code starts it: the wakeup's time; the run's, and the most it delays one
+	For  string    // what it is for: the wakeup's reason, else its prompt; the job's prompt
+	Key  string    // which wakeup or run it is, the same on every scan
+	Job  bool      // a job's run, not a self-paced loop's wakeup
+	Sign string    // a pending wakeup's WakeSign
 }
 
-// ownWake reports a pending wakeup that this process set: one of an earlier process died with it.
-func (t *Tracker) ownWake(started time.Time) bool {
-	return !t.st.WakeAt.IsZero() && (started.IsZero() || !t.st.WakeSet.Before(started.Add(-2*time.Second)))
+// due is the session's Due, zero when nothing is pending. A restart keeps a wakeup due after it (Claude Code arms
+// it again) and loses one due before it (it says so); it restores the jobs, a recurring job from its first run
+// after the restart and a one-shot only before its time. A recurring job expires 7 days after it was made.
+func (t *Tracker) due(started, now time.Time) Due {
+	st := &t.st
+	var d Due
+	earlier := func(c Due) {
+		if !c.At.IsZero() && (d.At.IsZero() || c.At.Before(d.At)) {
+			d = c
+		}
+	}
+	if t.liveWake(started) {
+		earlier(Due{At: st.WakeAt, For: st.WakeFor, Key: fmt.Sprintf("wakeup@%d", st.WakeSet.UnixMilli()), Sign: st.WakeSign})
+	}
+	for id, c := range st.Crons {
+		if !c.OneShot && now.Sub(c.At) > cronExpiry {
+			continue
+		}
+		after := latest(c.At, c.Fired)
+		if !c.OneShot && !started.IsZero() && after.Before(started) {
+			after = started // a restored job does not run for the runs it missed
+		}
+		run, last, ok := ScheduledRun(text.FirstNonEmpty(c.Expr, c.Label), after, c.OneShot)
+		if !ok || c.OneShot && !started.IsZero() && run.Before(started) {
+			continue
+		}
+		earlier(Due{At: last, For: c.For, Key: fmt.Sprintf("job:%s@%d", id, run.UnixMilli()), Job: true})
+	}
+	return d
+}
+
+// liveWake reports a pending wakeup the session's process still holds: one due after the process started.
+func (t *Tracker) liveWake(started time.Time) bool {
+	return !t.st.WakeAt.IsZero() && (started.IsZero() || !t.st.WakeAt.Before(started))
 }
 
 // queued follows Claude Code's queue of what it sends when the turn allows: a message its user typed while the turn
@@ -438,6 +494,9 @@ func (t *Tracker) assistant(e line, at time.Time, open bool) {
 			if b.Name == "ScheduleWakeup" || b.Name == "CronCreate" {
 				c.For = text.OneLine(wakeFor(text.Str(in["reason"]), text.Str(in["prompt"])), 300)
 			}
+			if b.Name == "CronCreate" {
+				c.Cron = text.Str(in["cron"])
+			}
 			st.Calls[b.ID] = c
 			st.Group = append(st.Group, b.ID)
 			st.log.Add(sessions.Entry{Role: sessions.RoleTool, Name: b.Name, Text: text.OneLine(c.Desc, 200)})
@@ -460,6 +519,7 @@ func (t *Tracker) assistant(e line, at time.Time, open bool) {
 func (t *Tracker) user(e line, at time.Time) {
 	if e.Compact { // the summary written at compaction: context for the log, not a turn
 		t.st.log.Add(sessions.Entry{Role: sessions.RoleCompacted, Text: text.OneLine(text.BlocksText(e.Message.Content), 1500)})
+		t.waitedThrough("the conversation was compacted while it waited", at)
 		return
 	}
 	origin := originLabel(e.origin(), e.PromptSource)
@@ -522,6 +582,9 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 		st.LastMain = "ended"
 		st.Group = st.Group[:0]
 		st.Control = at // its user pressed Esc, or turned a tool call down
+		if !st.WakeAt.IsZero() && !at.Before(st.WakeSet) {
+			t.clearWake() // Claude Code cancels a pending loop wakeup on an Esc
+		}
 		return
 	}
 	if clean == "" {
@@ -536,6 +599,11 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 }
 
 func (t *Tracker) notified(s string, at time.Time) {
+	if reWakeGone.MatchString(s) {
+		t.clearWake()
+		return
+	}
+	t.waitedThrough("a task's notification came in while it waited", at)
 	status := ""
 	if m := reStatus.FindStringSubmatch(s); m != nil {
 		status = m[1]
@@ -597,12 +665,16 @@ func (t *Tracker) result(b block, at time.Time) {
 		k.Until = at.Add(time.Duration(n) * unit)
 	case c.Name == "ScheduleWakeup" && reWake.MatchString(out):
 		n, _ := strconv.Atoi(reWake.FindStringSubmatch(out)[1])
-		st.WakeAt, st.WakeFor, st.WakeSet = at.Add(time.Duration(n)*time.Second), c.For, at
-	case c.Name == "ScheduleWakeup" && strings.HasPrefix(out, "Loop stopped"):
-		st.WakeAt, st.WakeFor = time.Time{}, "" // the loop ended, and its pending wakeup with it
+		st.WakeAt, st.WakeFor, st.WakeSet, st.WakeSign = at.Add(time.Duration(n)*time.Second), c.For, at, ""
+	case c.Name == "ScheduleWakeup" && (strings.HasPrefix(out, "Loop stopped") || strings.HasPrefix(out, "Wakeup not scheduled")):
+		t.clearWake() // the loop ended, and its pending wakeup with it
 	case c.Name == "CronCreate" && reCron.MatchString(out):
 		m := reCron.FindStringSubmatch(out)
-		st.Crons[m[1]] = cron{Label: m[2], At: at, OneShot: strings.Contains(out, "one-shot"), For: c.For}
+		expr := c.Cron
+		if expr == "" {
+			expr = m[3] // a version that wrote the expression in its result
+		}
+		st.Crons[m[2]] = cron{Label: m[3], Expr: expr, At: at, OneShot: m[1] == "one-shot", For: c.For}
 	}
 	st.log.Add(sessions.Entry{Role: sessions.RoleOut, Text: text.OneLine(out, 160)})
 }
@@ -754,15 +826,17 @@ func (t *Tracker) Facts(s *sessions.Session, now time.Time) {
 	if s.Model == "" {
 		s.Model = t.st.Model
 	}
-	s.WakeDue, s.WakeFor = t.due(s.Started, now)
-	if t.ownWake(s.Started) && t.st.WakeAt.After(now.Add(-sessions.WakeGrace)) {
+	d := t.due(s.Started, now)
+	s.WakeDue, s.WakeFor, s.WakeKey, s.WakeJob, s.WakeSign = d.At, d.For, d.Key, d.Job, d.Sign
+	s.TurnBegan, s.IdleSince = t.st.TurnBegan, t.st.TurnEnd
+	if t.liveWake(s.Started) && t.st.WakeAt.After(now.Add(-sessions.WakeGrace)) {
 		s.WakeAt = t.st.WakeAt
 	}
 	var newest time.Time
 	newestID := ""
 	for id, c := range t.st.Crons {
-		if (!s.Started.IsZero() && c.At.Before(s.Started)) || now.Sub(c.At) > cronExpiry || (c.OneShot && now.Sub(c.At) > oneShotExpiry) {
-			continue // a session-only job of an earlier process, or one that expired
+		if now.Sub(c.At) > cronExpiry || (c.OneShot && now.Sub(c.At) > oneShotExpiry) {
+			continue // one that expired: a restart restores the others
 		}
 		if c.At.After(newest) || c.At.Equal(newest) && id > newestID {
 			newest, newestID, s.Loop = c.At, id, c.Label

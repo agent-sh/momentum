@@ -29,6 +29,7 @@ func TestStalledInterruptsATurnWaitingOnARequestWithNoReply(t *testing.T) {
 		{"tries used up: the last message's own request waits too", waiting(func(*Stop) {}), Tries{RuleStalled: 2}, nil, Wait, t0.Add(30 * time.Minute), 2, ""},
 		{"the machine slept after it", waiting(func(s *Stop) { s.Woke = t0.Add(2 * time.Hour) }), Tries{}, nil, Wait, t0.Add(2*time.Hour + 30*time.Minute), 1, ""},
 		{"it slept before it", waiting(func(s *Stop) { s.Woke = t0.Add(-time.Hour) }), Tries{}, nil, Wait, t0.Add(30 * time.Minute), 1, ""},
+		{"it slept after its time came", waiting(func(s *Stop) { s.Slept, s.Woke = t0.Add(40*time.Minute), t0.Add(2*time.Hour) }), Tries{}, nil, Wait, t0.Add(30 * time.Minute), 1, ""},
 		{"a call runs", waiting(func(s *Stop) { s.Busy = true }), Tries{}, nil, "", time.Time{}, 0, ""},
 		{"background work does not answer the model", waiting(func(s *Stop) { s.Tasks = 1 }), Tries{}, nil, Wait, t0.Add(30 * time.Minute), 1, ""},
 		{"its user queued a message", waiting(func(s *Stop) { s.Queued = 1 }), Tries{}, nil, "", time.Time{}, 0, ""},
@@ -154,7 +155,7 @@ func stalledLoop(t *testing.T) (*transcript, time.Time, func(time.Time) *session
 func liveStalled(st *store.Store, f Sender, now *time.Time) *Supervisor {
 	sv := supervisor(st, &fakeSender{}, now)
 	sv.Sender, sv.Live = f, map[string]bool{"stalled": true}
-	sv.Woke = func(context.Context) time.Time { return time.Time{} }
+	sv.Sleep = func(context.Context) (time.Time, time.Time) { return time.Time{}, time.Time{} }
 	return sv
 }
 
@@ -273,7 +274,7 @@ func TestADryStalledTurnGetsANeedsNote(t *testing.T) {
 	f := &fakeSender{}
 	now := t0.Add(31 * time.Minute)
 	sv := supervisor(st, f, &now) // stalled is not live
-	sv.Woke = func(context.Context) time.Time { return time.Time{} }
+	sv.Sleep = func(context.Context) (time.Time, time.Time) { return time.Time{}, time.Time{} }
 	s := waitingSession("sess-dry")
 	run(t, sv, s)
 	if len(f.sent) != 0 || f.checks != 0 {

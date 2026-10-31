@@ -113,7 +113,7 @@ func writePoints(path string, rs []supervise.Result) error {
 		v := map[string]any{"session": r.Point.Session, "tool": r.Point.Stop.Tool, "stop_at": r.Point.Stop.At, "phase": r.Point.Stop.Phase,
 			"error": r.Point.Stop.Error, "words": r.Point.Stop.Words, "tasks": r.Point.Stop.Tasks, "owner_at": r.Point.Stop.OwnerAt,
 			"resumed_at": r.Point.Stop.ResumedAt, "request_at": r.Point.Stop.RequestAt, "waiting": r.Point.Waiting,
-			"wake_due": r.Point.Stop.WakeDue, "wake_for": r.Point.Stop.WakeFor,
+			"wake_due": r.Point.Stop.WakeDue, "wake_for": r.Point.Stop.WakeFor, "wake_key": r.Point.Stop.WakeKey,
 			"next": r.Point.Next, "entry": r.Point.Entry, "rule": r.Decision.Rule,
 			"verdict": r.Decision.Verdict, "at": r.Decision.At, "why": r.Decision.Why, "fired": r.Fired, "outcome": r.Outcome}
 		if r.Label != nil {

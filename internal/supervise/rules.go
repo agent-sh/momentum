@@ -57,10 +57,16 @@ type Stop struct {
 	Loop            string
 	WakeDue         time.Time // when its own pending wakeup or loop run should have fired at the latest
 	WakeFor         string    // what that wakeup or run is for
+	WakeKey         string    // which wakeup or run that is
+	WakeJob         bool      // a scheduled job's run, not a self-paced loop's wakeup
+	WakeSign        string    // why a self-paced wakeup may have been lost: a cause its harness drops one for
+	WakeHandled     bool      // a resync for that wakeup or run went in already
+	TurnBegan       time.Time // when its last turn began
+	IdleAt          time.Time // when its last turn ended
 	ResumedAt       time.Time // the harness reopened the session after it ended mid-task, and nothing happened since
 	RequestAt       time.Time // the model request the open turn still waits on: nothing answered it since
 	Queued          int       // messages its user typed while the turn ran, which the harness holds
-	Woke            time.Time // when the machine last woke from a suspend: a wait counts from it when it came later
+	Slept, Woke     time.Time // the machine's last suspend: a wait counts from its end when it began before the wait ended
 	OwnerAt         time.Time // when the owner was last at the session: his last turn, or his opening it
 	Started         time.Time // when the session's process started; a stop before it is a past process's
 }
@@ -321,46 +327,76 @@ func stalled(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
 		return Decision{}, false
 	}
 	n := tries[RuleStalled]
-	from, why := s.RequestAt, "a model request with no reply since "+s.RequestAt.Local().Format("15:04")
-	if s.Woke.After(from) {
-		from, why = s.Woke, why+"; the machine was suspended, and woke at "+s.Woke.Local().Format("15:04")
-	}
+	from, why := afterSleep(s, s.RequestAt, p.StalledWait, "a model request with no reply since "+s.RequestAt.Local().Format("15:04"))
 	if n >= p.StalledTries { // the last message's own request: a case once it too has waited
 		return usedAt(RuleStalled, n, from.Add(p.StalledWait), why), true
 	}
 	return wait(RuleStalled, from.Add(p.StalledWait), n+1, StalledText, why), true
 }
 
-// overdue: the turn is over, nothing is in flight, and a wakeup or a run of a loop the session set itself came due
-// long ago and never fired: past the latest time its harness fires it (WakeDue), counted from the turn's end when
-// it came due while a turn ran (a run waits for the turn), or from the machine waking from a suspend. Claude Code
-// fires a run between turns, within a second when nothing holds it. A resync that quotes what it was for; twice
-// without the owner, then a case.
+// afterSleep counts a rule's wait, which began at from, from the machine's wake instead when the machine slept
+// before the wait ended and woke after it began: nothing could come while it slept. A suspend after the rule's time
+// came does not start the wait again, so a stale stop stays stale.
+func afterSleep(s Stop, from time.Time, wait time.Duration, why string) (time.Time, string) {
+	if s.Woke.After(from) && s.Slept.Before(from.Add(wait)) {
+		return s.Woke, why + "; the machine was suspended, and woke at " + s.Woke.Local().Format("15:04")
+	}
+	return from, why
+}
+
+// overdue: the turn is over, nothing is in flight, and a wakeup or a run of a job the session set itself came due
+// long ago and never fired: past the latest time its harness fires it (WakeDue), counted from the end of the last
+// turn when it came due while that turn ran (a run waits for the turn), or from the machine waking from a suspend.
+// One due before the last turn began had its time then: the turn since does not start its wait again.
+// Claude Code fires a run between turns, within a second when nothing holds it. An Esc at an idle prompt stops a
+// self-paced loop and leaves no record, so a wakeup that did not fire counts only with a sign that it was lost: a
+// task's notification or a compaction while it waited (WakeSign), or a suspend through its time. One resync per
+// wakeup or run, quoting what it was for; a second lost one without an owner turn, then a case.
 func overdue(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
-	if s.Tool != "claude" || s.WakeDue.IsZero() || s.Working || s.Error != "" || s.Tasks > 0 || priorProcess(s) || AsksOwner(s.Words) {
+	if s.Tool != "claude" || s.WakeDue.IsZero() || s.WakeHandled || s.Working || s.Error != "" || s.Tasks > 0 || priorProcess(s) || AsksOwner(s.Words) {
 		return Decision{}, false
 	}
+	sign := s.WakeSign
+	if sign == "" && !s.Slept.IsZero() && s.Slept.Before(s.WakeDue) && s.Woke.After(s.WakeDue) {
+		sign = "the machine slept through its time"
+	}
+	if !s.WakeJob && sign == "" {
+		return Decision{}, false
+	}
+	what := "its own wakeup"
+	if s.WakeJob {
+		what = "its scheduled job's run"
+	}
+	why := what + ", due by " + s.WakeDue.Local().Format("Jan 2 15:04") + ", did not fire"
+	if sign != "" {
+		why += "; " + sign
+	}
+	from := s.WakeDue
+	if s.IdleAt.After(from) && !s.TurnBegan.After(from) {
+		from = s.IdleAt // it came due while its last turn ran: the run waits for the turn
+	}
+	from, why = afterSleep(s, from, p.OverdueSlack, why)
 	n := tries[RuleOverdue]
-	from, why := s.WakeDue, "its own wakeup or loop run, due by "+s.WakeDue.Local().Format("15:04")+", did not fire"
-	if s.At.After(from) {
-		from = s.At
-	}
-	if s.Woke.After(from) {
-		from, why = s.Woke, why+"; the machine was suspended, and woke at "+s.Woke.Local().Format("15:04")
-	}
 	if n >= p.OverdueTries { // the turn the last message opened has just ended: a case once it too has waited
 		return usedAt(RuleOverdue, n, from.Add(p.OverdueSlack), why), true
 	}
-	return wait(RuleOverdue, from.Add(p.OverdueSlack), n+1, OverdueText(s.WakeDue, s.WakeFor), why), true
+	return wait(RuleOverdue, from.Add(p.OverdueSlack), n+1, OverdueText(s.WakeDue, s.WakeFor, s.WakeJob), why), true
 }
 
-// OverdueText is the overdue rule's message: when the run was due, and what it was for, quoted.
-func OverdueText(due time.Time, what string) string {
-	if what = clip(what, 140); what != "" {
-		return fmt.Sprintf("%s Your own wakeup, due by %s, did not fire, so nothing woke you for %q. Do it now, and set the next one.",
-			Marker, due.Local().Format("15:04"), what)
+// OverdueText is the overdue rule's message: what did not run, when it was due, and what it was for, quoted. A
+// job keeps its schedule; a self-paced loop needs its next wakeup set.
+func OverdueText(due time.Time, what string, job bool) string {
+	when := due.Local().Format("Jan 2 15:04")
+	what = clip(what, 140)
+	switch {
+	case job && what != "":
+		return fmt.Sprintf("%s Your scheduled job's run, due by %s, did not start, so nothing ran %q. Do it now; the job keeps its schedule.", Marker, when, what)
+	case job:
+		return fmt.Sprintf("%s Your scheduled job's run, due by %s, did not start. Do what it was for now; the job keeps its schedule.", Marker, when)
+	case what != "":
+		return fmt.Sprintf("%s Your own wakeup, due by %s, did not fire, so nothing woke you for %q. Do it now, and set the next one.", Marker, when, what)
 	}
-	return fmt.Sprintf("%s Your own wakeup, due by %s, did not fire. Do what it was for now, and set the next one.", Marker, due.Local().Format("15:04"))
+	return fmt.Sprintf("%s Your own wakeup, due by %s, did not fire. Do what it was for now, and set the next one.", Marker, when)
 }
 
 // promise: the turn ended, nothing is in flight or scheduled to wake it, and its last words promise to come back

@@ -14,13 +14,14 @@ type schedule struct {
 	anyDom, anyWd                bool
 }
 
-// parseSchedule reads a cron expression. false for one it cannot read (names, a sixth field): it names no run.
+// parseSchedule reads a cron expression as Claude Code does. false for one it refuses (names, a sixth field, a
+// number with a step): it names no run. A day field that holds every day is unrestricted, as a * is.
 func parseSchedule(expr string) (schedule, bool) {
 	f := strings.Fields(expr)
 	if len(f) != 5 {
 		return schedule{}, false
 	}
-	c := schedule{expr: strings.Join(f, " "), anyDom: f[2] == "*", anyWd: f[4] == "*"}
+	c := schedule{expr: strings.Join(f, " ")}
 	for i, spec := range []struct {
 		set    *[60]bool
 		lo, hi int
@@ -32,7 +33,17 @@ func parseSchedule(expr string) (schedule, bool) {
 	if c.wd[7] {
 		c.wd[0] = true // 7 is Sunday too
 	}
+	c.anyDom, c.anyWd = full(c.dom[1:32]), full(c.wd[0:7])
 	return c, true
+}
+
+func full(set []bool) bool {
+	for _, v := range set {
+		if !v {
+			return false
+		}
+	}
+	return true
 }
 
 func cronField(field string, lo, hi int, set *[60]bool) bool {
@@ -58,13 +69,10 @@ func cronField(field string, lo, hi int, set *[60]bool) bool {
 			}
 		default:
 			n, err := strconv.Atoi(part)
-			if err != nil {
-				return false
+			if err != nil || step > 1 {
+				return false // a step takes a range or *: Claude Code refuses 5/15
 			}
 			a, b = n, n
-			if step > 1 {
-				b = hi
-			}
 		}
 		if a < lo || b > hi || a > b {
 			return false
@@ -93,14 +101,28 @@ func (c schedule) runs(t time.Time) bool {
 }
 
 // next is the schedule's first run after t, at a whole minute of local time; zero when none comes within a year.
+// Claude Code matches a minute of the wall clock once: the hour a clock change repeats does not run again.
 func (c schedule) next(t time.Time) time.Time {
-	m := t.Local().Truncate(time.Minute).Add(time.Minute)
-	for end := m.AddDate(1, 0, 0); m.Before(end); m = m.Add(time.Minute) {
+	m := t.Local().Truncate(time.Minute)
+	seen := wall(m)
+	for end := m.AddDate(1, 0, 0); m.Before(end); {
+		m = m.Add(time.Minute)
+		w := wall(m)
+		if w <= seen {
+			continue // the wall clock went back: a minute it showed already
+		}
+		seen = w
 		if c.runs(m) {
 			return m
 		}
 	}
 	return time.Time{}
+}
+
+// wall is a local time's minute on the wall clock, in an order that follows the calendar.
+func wall(t time.Time) int64 {
+	y, mo, d := t.Date()
+	return ((int64(y)*100+int64(mo))*100+int64(d))*10000 + int64(t.Hour())*100 + int64(t.Minute())
 }
 
 // lateness is how late Claude Code may start a recurring task's run, by its documentation: up to half the gap to
@@ -116,16 +138,19 @@ func (c schedule) lateness(run time.Time) time.Duration {
 	return min(n.Sub(run)/2, 30*time.Minute)
 }
 
-// LoopRun is the next run after after of a recurring job on the cron expression expr, and the latest it starts:
-// the run's time and the most Claude Code delays it. false for an expression it cannot read, or one that names no
-// run.
-func LoopRun(expr string, after time.Time) (run, latest time.Time, ok bool) {
+// ScheduledRun is the next run after after of a job on the cron expression expr, and the latest it starts: for a
+// recurring job, the run's time and the most Claude Code delays it; a one-shot runs on time, or a little early.
+// false for an expression it cannot read, or one that names no run within a year.
+func ScheduledRun(expr string, after time.Time, oneShot bool) (run, latest time.Time, ok bool) {
 	sc, ok := parseSchedule(expr)
 	if !ok {
 		return time.Time{}, time.Time{}, false
 	}
 	if run = sc.next(after); run.IsZero() {
 		return time.Time{}, time.Time{}, false
+	}
+	if oneShot {
+		return run, run, true
 	}
 	return run, run.Add(sc.lateness(run)), true
 }
