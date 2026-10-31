@@ -20,6 +20,8 @@ const Capacity = "capacity"
 //     not, and whether its look could not be trusted (blind, a column it gained: keptColumns): such a run watched
 //     nothing.
 //   - capacity_marks: when each rule last ran its scan, or last pruned.
+//   - capacity_writes: each process's written bytes at the last run that could trust its look (by pid and start,
+//     so a pid used again is another process), for the next run to tell who wrote in between.
 const capacityTables = `
 CREATE TABLE IF NOT EXISTS disk_samples (disk TEXT NOT NULL, at INTEGER NOT NULL, size INTEGER NOT NULL,
   used INTEGER NOT NULL, avail INTEGER NOT NULL, PRIMARY KEY (disk, at)) WITHOUT ROWID;
@@ -28,10 +30,12 @@ CREATE TABLE IF NOT EXISTS capacity_seen (path TEXT PRIMARY KEY, first INTEGER N
 CREATE TABLE IF NOT EXISTS capacity_runs (at INTEGER PRIMARY KEY, sample_ms INTEGER NOT NULL, procs INTEGER NOT NULL,
   unreadable INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS capacity_marks (mark TEXT PRIMARY KEY, at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS capacity_writes (pid INTEGER NOT NULL, start INTEGER NOT NULL, written INTEGER NOT NULL,
+  PRIMARY KEY (pid, start)) WITHOUT ROWID;
 `
 
 // capacityTableNames are the tables capacityTables makes.
-var capacityTableNames = []string{"disk_samples", "capacity_seen", "capacity_runs", "capacity_marks"}
+var capacityTableNames = []string{"disk_samples", "capacity_seen", "capacity_runs", "capacity_marks", "capacity_writes"}
 
 // DiskSample is one disk at one run: its size, what is used and what is free to an unprivileged writer, in bytes.
 type DiskSample struct {
@@ -95,6 +99,61 @@ func (s *Store) PutCapacityRun(ctx context.Context, run CapacityRun, disks []Dis
 		}
 	}
 	return tx.Commit()
+}
+
+// ProcWrite is a process's written bytes (its I/O accounting's write_bytes, which takes in its reaped children's)
+// and its start, in clock ticks after boot.
+type ProcWrite struct {
+	PID            int
+	Start, Written int64
+}
+
+// PutWrites replaces the processes' written bytes on record with these, taken at at.
+func (s *Store) PutWrites(ctx context.Context, at time.Time, ws []ProcWrite) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM capacity_writes`); err != nil {
+		return err
+	}
+	stmt, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO capacity_writes (pid, start, written) VALUES (?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, w := range ws {
+		if _, err := stmt.ExecContext(ctx, w.PID, w.Start, w.Written); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO capacity_marks (mark, at) VALUES ('writes', ?)`, at.UnixMilli()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// Writes are the processes' written bytes on record, and when they were taken (zero with none).
+func (s *Store) Writes(ctx context.Context) (time.Time, []ProcWrite, error) {
+	at, err := s.Mark(ctx, "writes")
+	if err != nil || at.IsZero() {
+		return time.Time{}, nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT pid, start, written FROM capacity_writes`)
+	if err != nil {
+		return time.Time{}, nil, err
+	}
+	defer rows.Close()
+	var out []ProcWrite
+	for rows.Next() {
+		var w ProcWrite
+		if err := rows.Scan(&w.PID, &w.Start, &w.Written); err != nil {
+			return time.Time{}, nil, err
+		}
+		out = append(out, w)
+	}
+	return at, out, rows.Err()
 }
 
 // PutRuns records runs without disk samples or sightings, in one transaction: a record brought from elsewhere, or a

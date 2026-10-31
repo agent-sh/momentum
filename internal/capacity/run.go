@@ -86,14 +86,26 @@ type DiskState struct {
 	mountPath string
 }
 
-// Writer is a process writing fast while a disk filled.
+// Writer is a process that wrote fast while a disk filled: at the look (Rate, over a few seconds), or since the run
+// before (Written over Over), which shows a writer in bursts (a checkpoint save between two looks) and one whose
+// children wrote and ended (a process takes in its reaped children's writes).
 type Writer struct {
 	PID     int     `json:"pid"`
 	Comm    string  `json:"comm"`
 	Cwd     string  `json:"cwd"`
 	Rate    float64 `json:"mib_per_s"`
-	OnDisk  bool    `json:"on_disk"` // its working directory is on the disk
+	Written int64   `json:"written,omitempty"` // bytes it wrote, to any disk, over Over
+	Over    float64 `json:"over_s,omitempty"`  // seconds: since the run before, or since it started after it
+	OnDisk  bool    `json:"on_disk"`           // its working directory is on the disk
 	Session string  `json:"session,omitempty"`
+}
+
+// since is a writer's MiB per second since the run before, or 0 when that is not known.
+func (w Writer) since() float64 {
+	if w.Over <= 0 {
+		return 0
+	}
+	return float64(w.Written) / (1 << 20) / w.Over
 }
 
 // Result is one run.
@@ -165,15 +177,18 @@ type runner struct {
 	keep          map[string]bool // canonical
 	targetRoot    []root
 	wtRoots       []root
-	watchStart    map[string]time.Time // per canonical model root, the first run that watched it
-	runTimes      []time.Time          // every run, oldest first, this one among them
-	covered       []time.Duration      // the watched time up to each run (cover)
-	blind         string               // why this run cannot trust its look at the processes, so deletes nothing
-	dockerErr     string               // why Docker could not say which containers run: the run deletes nothing
-	dockerAsked   bool                 // whether this run asked Docker (only when a rule scans)
-	heads         *remoteHeads         // the remotes' branches, asked once per run
-	changed       map[changeKey]bool   // whether a work tree changed in the last quietTime, per look
-	own           map[string]ownChange // the directories this run's and recent runs' deletions changed
+	watchStart    map[string]time.Time    // per canonical model root, the first run that watched it
+	runTimes      []time.Time             // every run, oldest first, this one among them
+	covered       []time.Duration         // the watched time up to each run (cover)
+	blind         string                  // why this run cannot trust its look at the processes, so deletes nothing
+	dockerErr     string                  // why Docker could not say which containers run: the run deletes nothing
+	dockerAsked   bool                    // whether this run asked Docker (only when a rule scans)
+	heads         *remoteHeads            // the remotes' branches, asked once per run
+	changed       map[changeKey]bool      // whether a work tree changed in the last quietTime, per look
+	own           map[string]ownChange    // the directories this run's and recent runs' deletions changed
+	snap          map[int]store.ProcWrite // each process's written bytes at this run
+	prev          map[int]store.ProcWrite // and at the run before that could trust its look
+	prevAt        time.Time
 	res           *Result
 }
 
@@ -239,6 +254,17 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 	}
 	r.res.Since = r.samplerStart
 
+	r.snap = procWrites(opt.ProcRoot)
+	if st != nil {
+		at, ws, err := st.Writes(ctx)
+		if err != nil {
+			return nil, err
+		}
+		r.prevAt, r.prev = at, map[int]store.ProcWrite{}
+		for _, w := range ws {
+			r.prev[w.PID] = w
+		}
+	}
 	fast := r.disk(ctx, disks)
 	due := map[string]bool{}
 	for _, rule := range Rules {
@@ -280,6 +306,15 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 		if err := st.PutCapacityRun(ctx, store.CapacityRun{At: r.now, Sample: r.sample.Took, Procs: r.sample.Procs,
 			Unreadable: r.sample.Unreadable, Blind: r.blind != ""}, samples, seen); err != nil {
 			return nil, err
+		}
+		if r.blind == "" { // what the next run tells its writers by
+			ws := make([]store.ProcWrite, 0, len(r.snap))
+			for _, w := range r.snap {
+				ws = append(ws, w)
+			}
+			if err := st.PutWrites(ctx, r.now, ws); err != nil {
+				return nil, err
+			}
 		}
 	}
 	for _, v := range seen { // this run's sightings count at once
