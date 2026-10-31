@@ -59,6 +59,67 @@ func TestARequestWithNoReplyKeepsTheTurnOpen(t *testing.T) {
 	}
 }
 
+// TestAnEscapeThatSendsAQueuedPromptEndsTheTurnBeforeIt: Claude Code writes the interruption of an Escape that
+// sends a queued prompt, and the prompt, a few milliseconds apart in either order, then the new turn's request.
+// Either way the interruption ended the turn before the prompt, and the prompt's turn runs on, dated from the
+// prompt: through its request, and through a retry's backoff, when the retry's error has answered the request and
+// the retry's own request is not out yet.
+func TestAnEscapeThatSendsAQueuedPromptEndsTheTurnBeforeIt(t *testing.T) {
+	for _, promptFirst := range []bool{false, true} {
+		x := newScript(t).user("go").request() // a turn that waits on a request with no reply
+		at := x.at.Add(30 * time.Minute)
+		stamp := func(d time.Duration) string { return at.Add(d).Format(time.RFC3339Nano) }
+		escape := map[string]any{"type": "user", "timestamp": stamp(0),
+			"message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "[Request interrupted by user]"}}}}
+		prompt := map[string]any{"type": "user", "origin": map[string]any{"kind": "human"}, "promptSource": "queued", "timestamp": stamp(30 * time.Millisecond),
+			"message": map[string]any{"role": "user", "content": "continue where you left off"}}
+		escaped, prompted := at, at.Add(30*time.Millisecond)
+		if promptFirst {
+			escape["timestamp"], escaped = stamp(37*time.Millisecond), at.Add(37*time.Millisecond)
+			x.add(prompt).add(escape)
+		} else {
+			x.add(escape).add(prompt)
+		}
+		x.add(map[string]any{"type": "api-request", "querySource": "repl_main_thread", "timestamp": stamp(61 * time.Millisecond)})
+		tr := NewTracker(x.path)
+		s := x.facts(tr, at.Add(time.Minute))
+		if !s.TurnOpen || s.Phase != sessions.Working || !s.RequestAt.Equal(at.Add(61*time.Millisecond)) || !s.ControlAt.Equal(escaped) ||
+			!s.TurnBegan.Equal(prompted) {
+			t.Fatalf("prompt first %v: open %v phase %s request %v control %v began %v", promptFirst, s.TurnOpen, s.Phase, s.RequestAt,
+				s.ControlAt, s.TurnBegan)
+		}
+		x.add(map[string]any{"type": "system", "subtype": "api_error", "level": "error", "timestamp": stamp(10 * time.Minute)})
+		if s := x.facts(tr, at.Add(10*time.Minute+30*time.Second)); !s.TurnOpen || s.Phase != sessions.Working || !s.RequestAt.IsZero() {
+			t.Fatalf("prompt first %v, in the retry's backoff: open %v phase %s request %v", promptFirst, s.TurnOpen, s.Phase, s.RequestAt)
+		}
+	}
+	// An interruption seconds after the queued prompt is no Escape that sent it: it ends the prompt's own turn.
+	x := newScript(t).user("go").request()
+	x.add(map[string]any{"type": "user", "origin": map[string]any{"kind": "human"}, "promptSource": "queued",
+		"message": map[string]any{"role": "user", "content": "and the tests"}})
+	x.add(map[string]any{"type": "user", "timestamp": x.at.Add(5 * time.Second).Format(time.RFC3339Nano),
+		"message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "[Request interrupted by user]"}}}})
+	if s := x.facts(NewTracker(x.path), x.at.Add(time.Minute)); s.TurnOpen {
+		t.Fatalf("an interruption 5 s after the queued prompt left its turn open: phase %s", s.Phase)
+	}
+	// Nor is one after the prompt's turn sent its request, or one after a prompt its user typed: each takes back
+	// the turn the prompt opened.
+	for name, kind := range map[string]string{"after its request": "queued", "after a typed prompt": "typed"} {
+		y := newScript(t).user("go").request()
+		at := y.at.Add(30 * time.Minute)
+		y.add(map[string]any{"type": "user", "origin": map[string]any{"kind": "human"}, "promptSource": kind, "timestamp": at.Format(time.RFC3339Nano),
+			"message": map[string]any{"role": "user", "content": "and the tests"}})
+		if kind == "queued" {
+			y.add(map[string]any{"type": "api-request", "querySource": "repl_main_thread", "timestamp": at.Add(50 * time.Millisecond).Format(time.RFC3339Nano)})
+		}
+		y.add(map[string]any{"type": "user", "timestamp": at.Add(time.Second).Format(time.RFC3339Nano),
+			"message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "[Request interrupted by user]"}}}})
+		if s := y.facts(NewTracker(y.path), at.Add(time.Minute)); s.TurnOpen {
+			t.Fatalf("an interruption %s left the turn open: phase %s", name, s.Phase)
+		}
+	}
+}
+
 // TestALoopRestartedOnARequestThatNeverAnswers rebuilds a stall: a prompt typed by mistake, a /loop queued while it
 // ran, an Escape that ends it and sends the /loop, whose request then gets no reply; only notices follow. The
 // /loop's own records open no turn (its echo is a command's, its body the harness's), but its request does.
