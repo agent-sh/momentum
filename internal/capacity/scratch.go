@@ -40,6 +40,8 @@ var scratchBudget = 4 * time.Minute
 
 // offloadTimeout is the longest one offload may take, and so the longest a run's sampler waits on one: restic backs
 // the folder up before anything is removed, so a timeout leaves the folder whole, or backed up with its pointer.
+// restic backs up new data to a local repository at a few hundred MiB/s, so 10 minutes hold a folder of over 100
+// GiB; a bigger one fails, and is reported, until it is smaller or kept.
 var offloadTimeout = 10 * time.Minute
 
 // modelFile is one file of model data in a task folder, by its path in the folder and its inode when judged.
