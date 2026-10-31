@@ -13,11 +13,16 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// The disk rule. Every run records each disk's use. When a disk fills faster than the threshold over the window, or
-// would reach the full percent within the configured hours at that rate, the run measures which processes write
-// (their write_bytes over a few seconds), names each one's working directory and the agent session it runs under,
-// and leaves a problem note: never a notification. Every judging rule then scans on that run, whatever its
-// cadence. A disk above its full percent has its own note.
+// The disk rule. Every run records each disk's use, and each process's written bytes (a snapshot the next run
+// compares with). When a disk fills faster than the threshold over the window, or would reach the full percent
+// within the configured hours at that rate, the run names the processes that write: fast at a look of a few
+// seconds, or since the run before. It names each one's working directory and the agent session it runs under, and
+// leaves a problem note: never a notification. Every judging rule then scans on that run, whatever its cadence. A
+// disk above its full percent has its own note.
+
+// userHZ is the clock ticks a second of a process's start in /proc/PID/stat and of a snapshot's uptime: the
+// kernel's USER_HZ (sysconf(_SC_CLK_TCK)), which is 100 on every architecture this runs on.
+const userHZ = 100
 
 // minWindow is the shortest span of samples a rate is taken over: two runs a minute apart say little.
 const minWindow = 10 * time.Minute
@@ -63,8 +68,9 @@ func (r *runner) disk(ctx context.Context, disks []DiskState) bool {
 	return fast
 }
 
-// writers are the processes that wrote fastest over the writer wait, with their working directory, whether it is
-// on the disk, and their session. Another user's processes cannot be read (root's among them).
+// writers are the processes that wrote fastest over the writer wait, or since the run before, with their working
+// directory, whether it is on the disk, and their session. Another user's processes cannot be read (root's among
+// them).
 func (r *runner) writers(ctx context.Context, mountPath string) []Writer {
 	a := r.opt.Writes()
 	time.Sleep(r.opt.WriterWait)
@@ -75,34 +81,32 @@ func (r *runner) writers(ctx context.Context, mountPath string) []Writer {
 		diskDev = uint64(st.Sys().(*syscall.Stat_t).Dev)
 	}
 	sessions := r.liveSessions(ctx)
-	boot := time.Time{}
-	if up := uptimeOf(r.opt.ProcRoot); up > 0 {
-		boot = r.now.Add(-time.Duration(up * float64(time.Second)))
-	}
+	iv := between(r.prevWrites, r.writes)
+	// a writer since the run before counts from the slowest fill the rule reports, which a writer alone may make
+	slowest := r.cfg.Fill.MinGiBPerHour * 1024 / 3600
 	pids := map[int]bool{}
 	for pid := range b {
 		pids[pid] = true
 	}
-	for pid := range r.snap {
+	for pid := range r.writes.ws {
 		pids[pid] = true
 	}
 	var out []Writer
 	for pid := range pids {
-		w := Writer{PID: pid}
+		w := Writer{PID: pid, Start: r.writes.ws[pid].Start}
 		if before, had := a[pid]; had {
 			if n, ok := b[pid]; ok {
 				w.Rate = float64(n-before) / (1 << 20) / secs
 			}
 		}
-		if cur, ok := r.snap[pid]; ok && !r.prevAt.IsZero() {
-			if p, ok := r.prev[pid]; ok && p.Start == cur.Start {
-				w.Written, w.Over = cur.Written-p.Written, r.now.Sub(r.prevAt).Seconds()
-			} else if started := boot.Add(time.Duration(cur.Start) * 10 * time.Millisecond); !boot.IsZero() && started.After(r.prevAt) {
-				w.Written, w.Over = cur.Written, r.now.Sub(started).Seconds() // it started since: all it wrote
-			}
+		if d, ok := iv[pid]; ok {
+			w.Written, w.Over = d.written, d.over
 		}
-		if w.Rate < 1 && w.since() < 1 {
+		if w.Rate < 1 && (w.Over <= 0 || w.since() < slowest) {
 			continue
+		}
+		if p, ok := r.sample.Table[pid]; ok { // the sample's names, for a process that ended since
+			w.Comm, w.Cwd = p.Comm, p.Cwd
 		}
 		dir := filepath.Join(r.opt.ProcRoot, strconv.Itoa(pid))
 		if c, err := os.ReadFile(filepath.Join(dir, "comm")); err == nil {
@@ -110,7 +114,9 @@ func (r *runner) writers(ctx context.Context, mountPath string) []Writer {
 		}
 		if l, err := os.Readlink(filepath.Join(dir, "cwd")); err == nil {
 			w.Cwd = l
-			if st, err := os.Stat(l); err == nil && diskDev != 0 {
+		}
+		if w.Cwd != "" && diskDev != 0 {
+			if st, err := os.Stat(w.Cwd); err == nil {
 				w.OnDisk = uint64(st.Sys().(*syscall.Stat_t).Dev) == diskDev
 			}
 		}
@@ -137,8 +143,38 @@ func (r *runner) writers(ctx context.Context, mountPath string) []Writer {
 // pace is the faster of a writer's rate at the look and its rate since the run before.
 func (w Writer) pace() float64 { return max(w.Rate, w.since()) }
 
-// uptimeOf is the seconds since boot, from a /proc's uptime, or 0.
-func uptimeOf(procRoot string) float64 {
+// writesSnap is each process's written bytes at one look, with its parent and start from the run's sample, and
+// when the look was.
+type writesSnap struct {
+	snap store.Snapshot
+	ws   map[int]store.ProcWrite
+}
+
+// readWrites reads each sampled process's written bytes, with the boot's clock read first: a process's start and
+// the snapshot's uptime are on one count, so the wall clock drops out.
+func readWrites(procRoot string, table map[int]Proc, now time.Time) writesSnap {
+	out := writesSnap{snap: store.Snapshot{At: now, Uptime: uptimeTicks(procRoot), Boot: bootID(procRoot)}, ws: map[int]store.ProcWrite{}}
+	for pid, p := range table {
+		if p.Start <= 0 {
+			continue
+		}
+		io, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "io"))
+		if err != nil {
+			continue
+		}
+		for _, l := range strings.Split(string(io), "\n") {
+			if v, ok := strings.CutPrefix(l, "write_bytes:"); ok {
+				if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
+					out.ws[pid] = store.ProcWrite{PID: pid, PPID: p.PPID, Start: p.Start, Written: n}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// uptimeTicks is the time since boot in clock ticks, from a /proc's uptime, or 0.
+func uptimeTicks(procRoot string) int64 {
 	b, err := os.ReadFile(filepath.Join(procRoot, "uptime"))
 	if err != nil {
 		return 0
@@ -147,39 +183,62 @@ func uptimeOf(procRoot string) float64 {
 	if len(f) == 0 {
 		return 0
 	}
-	v, _ := strconv.ParseFloat(f[0], 64)
-	return v
+	v, err := strconv.ParseFloat(f[0], 64)
+	if err != nil {
+		return 0
+	}
+	return int64(v * userHZ)
 }
 
-// procWrites is each readable process's written bytes and its start (the 22nd field of its stat, in clock ticks
-// after boot), from a /proc.
-func procWrites(procRoot string) map[int]store.ProcWrite {
-	out := map[int]store.ProcWrite{}
-	ents, err := os.ReadDir(procRoot)
+// bootID names the boot, from a /proc's kernel boot_id, or "".
+func bootID(procRoot string) string {
+	b, err := os.ReadFile(filepath.Join(procRoot, "sys", "kernel", "random", "boot_id"))
 	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// wrote is what a process wrote between two snapshots, and over how many seconds.
+type wrote struct {
+	written int64
+	over    float64
+}
+
+// between is what each process wrote since the snapshot before. The same process (pid and start, on the same boot)
+// wrote the difference. One that started since wrote all it wrote, and on another boot every process started
+// since. A process takes in all a reaped child ever wrote; for a child on record that ended, the record holds what
+// came before, so its parent's difference loses that much, and keeps what the child wrote since. A counter that
+// went down, or a process there before but not on record (unreadable then), is not known.
+func between(prev, cur writesSnap) map[int]wrote {
+	out := map[int]wrote{}
+	if prev.snap.At.IsZero() || cur.snap.Uptime <= 0 {
 		return out
 	}
-	for _, e := range ents {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil {
-			continue
-		}
-		io, err := os.ReadFile(filepath.Join(procRoot, e.Name(), "io"))
-		if err != nil {
-			continue
-		}
-		st, err := os.ReadFile(filepath.Join(procRoot, e.Name(), "stat"))
-		if err != nil {
-			continue
-		}
-		w := store.ProcWrite{PID: pid, Start: startOf(string(st)), Written: -1}
-		for _, l := range strings.Split(string(io), "\n") {
-			if v, ok := strings.CutPrefix(l, "write_bytes:"); ok {
-				w.Written, _ = strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	sameBoot := prev.snap.Boot == cur.snap.Boot && cur.snap.Uptime >= prev.snap.Uptime
+	took := map[int]int64{}
+	if sameBoot {
+		for pid, c := range prev.ws {
+			if now, ok := cur.ws[pid]; ok && now.Start == c.Start {
+				continue
+			}
+			if p, ok := prev.ws[c.PPID]; ok {
+				if q, ok := cur.ws[c.PPID]; ok && q.Start == p.Start {
+					took[c.PPID] += c.Written
+				}
 			}
 		}
-		if w.Written >= 0 && w.Start > 0 {
-			out[pid] = w
+	}
+	for pid, w := range cur.ws {
+		p, ok := prev.ws[pid]
+		switch {
+		case sameBoot && ok && p.Start == w.Start:
+			if w.Written < p.Written {
+				continue
+			}
+			out[pid] = wrote{max(0, w.Written-p.Written-took[pid]), float64(cur.snap.Uptime-prev.snap.Uptime) / userHZ}
+		case !sameBoot || w.Start > prev.snap.Uptime:
+			out[pid] = wrote{w.Written, float64(max(0, cur.snap.Uptime-w.Start)) / userHZ}
 		}
 	}
 	return out
