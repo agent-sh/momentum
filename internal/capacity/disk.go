@@ -81,7 +81,10 @@ func (r *runner) writers(ctx context.Context, mountPath string) []Writer {
 		diskDev = uint64(st.Sys().(*syscall.Stat_t).Dev)
 	}
 	sessions := r.liveSessions(ctx)
-	iv := between(r.prevWrites, r.writes)
+	if r.iv == nil { // once a run, for every fast disk
+		r.iv = between(r.prevWrites, r.writes)
+	}
+	iv := r.iv
 	// a writer since the run before counts from the slowest fill the rule reports, which a writer alone may make
 	slowest := r.cfg.Fill.MinGiBPerHour * 1024 / 3600
 	pids := map[int]bool{}
@@ -150,10 +153,16 @@ type writesSnap struct {
 	ws   map[int]store.ProcWrite
 }
 
-// readWrites reads each sampled process's written bytes, with the boot's clock read first: a process's start and
-// the snapshot's uptime are on one count, so the wall clock drops out.
-func readWrites(procRoot string, table map[int]Proc, now time.Time) writesSnap {
-	out := writesSnap{snap: store.Snapshot{At: now, Uptime: uptimeTicks(procRoot), Boot: bootID(procRoot)}, ws: map[int]store.ProcWrite{}}
+// clockOf is the time of a look at the processes: the wall clock, and the boot's own count of clock ticks, read
+// before the look lists /proc, so a process that starts after it is past it; and which boot.
+func clockOf(procRoot string, now time.Time) store.Snapshot {
+	return store.Snapshot{At: now, Uptime: uptimeTicks(procRoot), Boot: bootID(procRoot)}
+}
+
+// readWrites reads each sampled process's written bytes. A process's start and the snapshot's uptime are on one
+// count, so the wall clock drops out.
+func readWrites(procRoot string, table map[int]Proc, snap store.Snapshot) writesSnap {
+	out := writesSnap{snap: snap, ws: map[int]store.ProcWrite{}}
 	for pid, p := range table {
 		if p.Start <= 0 {
 			continue
@@ -207,9 +216,10 @@ type wrote struct {
 
 // between is what each process wrote since the snapshot before. The same process (pid and start, on the same boot)
 // wrote the difference. One that started since wrote all it wrote, and on another boot every process started
-// since. A process takes in all a reaped child ever wrote; for a child on record that ended, the record holds what
-// came before, so its parent's difference loses that much, and keeps what the child wrote since. A counter that
-// went down, or a process there before but not on record (unreadable then), is not known.
+// since. A process takes in all a waited-for child ever wrote, and a launcher passes its children's on to its own
+// parent when it ends; so for a process on record that ended, the nearest recorded ancestor still running loses
+// what the record held of it, and keeps what it wrote since. A counter that went down, or a process there before
+// but not on record (unreadable then), is not known.
 func between(prev, cur writesSnap) map[int]wrote {
 	out := map[int]wrote{}
 	if prev.snap.At.IsZero() || cur.snap.Uptime <= 0 {
@@ -222,10 +232,16 @@ func between(prev, cur writesSnap) map[int]wrote {
 			if now, ok := cur.ws[pid]; ok && now.Start == c.Start {
 				continue
 			}
-			if p, ok := prev.ws[c.PPID]; ok {
-				if q, ok := cur.ws[c.PPID]; ok && q.Start == p.Start {
-					took[c.PPID] += c.Written
+			for a, hops := c.PPID, 0; hops < 64; hops++ { // up past the ended ones, to the ancestor still running
+				p, ok := prev.ws[a]
+				if !ok {
+					break
 				}
+				if q, ok := cur.ws[a]; ok && q.Start == p.Start {
+					took[a] += c.Written
+					break
+				}
+				a = p.PPID
 			}
 		}
 	}
@@ -237,11 +253,30 @@ func between(prev, cur writesSnap) map[int]wrote {
 				continue
 			}
 			out[pid] = wrote{max(0, w.Written-p.Written-took[pid]), float64(cur.snap.Uptime-prev.snap.Uptime) / userHZ}
-		case !sameBoot || w.Start > prev.snap.Uptime:
+		case !sameBoot || w.Start >= prev.snap.Uptime: // a start in the tick of the look before is after it
 			out[pid] = wrote{w.Written, float64(max(0, cur.snap.Uptime-w.Start)) / userHZ}
 		}
 	}
 	return out
+}
+
+// carry keeps on record a process on record that is still there (its pid and start, by its stat, which this user
+// can read) but whose written bytes cannot be read now: a zombie its parent has not waited for yet, or one that
+// became non-dumpable. It has not ended: its parent has taken in nothing of it.
+func carry(procRoot string, prev writesSnap, cur *writesSnap) {
+	if prev.snap.At.IsZero() || prev.snap.Boot != cur.snap.Boot {
+		return
+	}
+	for pid, c := range prev.ws {
+		if now, ok := cur.ws[pid]; ok && now.Start == c.Start {
+			continue
+		}
+		st, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "stat"))
+		if err != nil || startOf(string(st)) != c.Start {
+			continue
+		}
+		cur.ws[pid] = store.ProcWrite{PID: pid, PPID: parentOf(string(st)), Start: c.Start, Written: c.Written}
+	}
 }
 
 // startOf is a process's start from its stat, in clock ticks after boot, or 0.

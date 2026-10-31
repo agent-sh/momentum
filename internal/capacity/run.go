@@ -189,6 +189,7 @@ type runner struct {
 	own           map[string]ownChange // the directories this run's and recent runs' deletions changed
 	writes        writesSnap           // each process's written bytes at this run
 	prevWrites    writesSnap           // and at the last run before that could trust its look
+	iv            map[int]wrote        // what each wrote in between
 	res           *Result
 }
 
@@ -233,6 +234,7 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 	r.res = &Result{At: r.now, DryRun: opt.DryRun}
 	r.roots()
 
+	clock := clockOf(opt.ProcRoot, opt.Clock()) // before the look lists /proc
 	r.sample = TakeSample(opt.ProcRoot, r.m, r.watched)
 	r.res.SampleTook, r.res.Procs, r.res.Unreadable = r.sample.Took, r.sample.Procs, r.sample.Unreadable
 	r.res.SampleMS = r.sample.Took.Milliseconds()
@@ -254,7 +256,7 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 	}
 	r.res.Since = r.samplerStart
 
-	r.writes = readWrites(opt.ProcRoot, r.sample.Table, opt.Clock())
+	r.writes = readWrites(opt.ProcRoot, r.sample.Table, clock)
 	if st != nil {
 		snap, ws, err := st.Writes(ctx)
 		if err != nil {
@@ -264,6 +266,7 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 		for _, w := range ws {
 			r.prevWrites.ws[w.PID] = w
 		}
+		carry(opt.ProcRoot, r.prevWrites, &r.writes)
 	}
 	fast := r.disk(ctx, disks)
 	due := map[string]bool{}

@@ -406,7 +406,7 @@ func fillDetail(d DiskState) string {
 	var parts []string
 	for _, w := range d.Writers[:min(len(d.Writers), 4)] {
 		s := fmt.Sprintf("%s (pid %d)", w.Comm, w.PID)
-		if w.Over > 0 {
+		if w.Over > 0 && w.Written > 0 {
 			over := time.Duration(w.Over * float64(time.Second))
 			if over >= time.Minute {
 				over = over.Round(time.Minute)

@@ -323,6 +323,115 @@ func TestBetweenTwoSnapshots(t *testing.T) {
 	if got[1] != (wrote{400, 19.9}) {
 		t.Errorf("on another boot every process started since: %+v", got)
 	}
+	// a process that started in the very tick the look before read the clock is after it
+	got = between(snap(1000, "b1"), snap(31000, "b1", store.ProcWrite{PID: 5, Start: 1000, Written: 7}))
+	if got[5] != (wrote{7, 300}) {
+		t.Errorf("a start in the tick of the look before counts as since: %+v", got)
+	}
+	// without boot ids, an uptime that went down is another boot
+	got = between(snap(5000, "", store.ProcWrite{PID: 1, Start: 10, Written: 500}), snap(100, "", store.ProcWrite{PID: 1, Start: 10, Written: 600}))
+	if got[1] != (wrote{600, 0.9}) {
+		t.Errorf("an uptime that went down is another boot: %+v", got)
+	}
+	const g = 1 << 30
+	// a shell ran uv, which ran python; python wrote 10 GiB more and ended, then uv: the shell took in both whole
+	prev = snap(1000, "b1", store.ProcWrite{PID: 30, Start: 1, Written: 1 * g}, store.ProcWrite{PID: 31, PPID: 30, Start: 2, Written: 100 << 20},
+		store.ProcWrite{PID: 32, PPID: 31, Start: 3, Written: 50 * g})
+	got = between(prev, snap(31000, "b1", store.ProcWrite{PID: 30, Start: 1, Written: 1*g + 2*g + 150<<20 + 60*g}))
+	if got[30].written != 2*g+50<<20+10*g {
+		t.Errorf("the shell wrote its own 2 GiB, uv's last 50 MiB and python's last 10 GiB: %d", got[30].written)
+	}
+	// a parent's pid used again by another process since: the ended child's record is not taken from it
+	prev = snap(1000, "b1", store.ProcWrite{PID: 10, Start: 1, Written: 5 * g}, store.ProcWrite{PID: 11, PPID: 10, Start: 2, Written: 50 * g})
+	got = between(prev, snap(31000, "b1", store.ProcWrite{PID: 10, Start: 2000, Written: 3 * g}))
+	if got[10].written != 3*g {
+		t.Errorf("another process on the parent's pid counts all it wrote: %+v", got[10])
+	}
+	// the child's pid used again while the parent lives: the child ended, and the new one counts all it wrote
+	got = between(prev, snap(31000, "b1", store.ProcWrite{PID: 10, Start: 1, Written: 5*g + 60*g},
+		store.ProcWrite{PID: 11, PPID: 10, Start: 2000, Written: 1 * g}))
+	if got[10].written != 10*g || got[11].written != 1*g {
+		t.Errorf("the parent wrote the ended child's last 10 GiB, and the new process its 1 GiB: %+v", got)
+	}
+}
+
+func TestAZombieIsNotYetEnded(t *testing.T) {
+	const g = 1 << 30
+	root := t.TempDir()
+	// pid 31 has ended but its parent has not waited for it: /proc still has its stat, and no io this user can read
+	write(t, filepath.Join(root, "31", "stat"), "31 (torchrun) Z 30 0 0 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 200 0 0\n")
+	// pid 33 is another process now, one this user cannot read: its start is not the record's
+	write(t, filepath.Join(root, "33", "stat"), "33 (sudo) S 1 0 0 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 999 0 0\n")
+	snap := func(up int64, ws ...store.ProcWrite) writesSnap {
+		s := writesSnap{snap: store.Snapshot{At: time.Unix(1, 0), Uptime: up, Boot: "b1"}, ws: map[int]store.ProcWrite{}}
+		for _, w := range ws {
+			s.ws[w.PID] = w
+		}
+		return s
+	}
+	prev := snap(1000, store.ProcWrite{PID: 30, Start: 100, Written: 1 * g}, store.ProcWrite{PID: 31, PPID: 30, Start: 200, Written: 50 * g},
+		store.ProcWrite{PID: 33, PPID: 1, Start: 300, Written: 2 * g})
+	cur := snap(31000, store.ProcWrite{PID: 30, Start: 100, Written: 1 * g})
+	carry(root, prev, &cur)
+	if w, ok := cur.ws[31]; !ok || w.Written != 50*g || w.PPID != 30 {
+		t.Fatalf("the zombie stays on record as it was: %+v", cur.ws)
+	}
+	if _, ok := cur.ws[33]; ok {
+		t.Errorf("a pid another process holds now is not carried: %+v", cur.ws)
+	}
+	if got := between(prev, cur); got[30].written != 0 {
+		t.Errorf("nothing is taken from a parent that has not waited yet: %+v", got)
+	}
+	// then the parent waits: it takes in all 60 GiB, of which the record held 50
+	next := snap(61000, store.ProcWrite{PID: 30, Start: 100, Written: 61 * g})
+	if got := between(cur, next); got[30].written != 10*g {
+		t.Errorf("the parent wrote the child's last 10 GiB: %+v", got)
+	}
+}
+
+func TestAFillAfterARebootCountsAllEachProcessWrote(t *testing.T) {
+	st, dir, now, proc := fillFixture(t)
+	x := fakeProc{pid: 41, ppid: 1, argv: []string{"x"}, cwd: dir, written: 2 << 30}
+	fillRun(t, st, dir, now.Add(-5*time.Minute), proc(1201, x), quiet)
+	x.written = 3 << 30
+	p2 := proc(5000, x) // a later uptime on another boot: pid 41 and its start are another process's
+	write(t, filepath.Join(p2, "sys", "kernel", "random", "boot_id"), "b2\n")
+	d := fillRun(t, st, dir, now, p2, quiet).Disks[0]
+	if len(d.Writers) != 1 || d.Writers[0].Written != 3<<30 {
+		t.Errorf("after a reboot every process counts all it wrote: %+v", d.Writers)
+	}
+}
+
+func TestAZombieOnARunStaysOnRecordUntilItsParentWaits(t *testing.T) {
+	ctx := context.Background()
+	st, dir, now, proc := fillFixture(t)
+	shell := fakeProc{pid: 30, ppid: 1, argv: []string{"bash"}, cwd: dir, written: 1 << 30}
+	train := fakeProc{pid: 31, ppid: 30, argv: []string{"torchrun"}, cwd: dir, written: 50 << 30, start: 200}
+	fillRun(t, st, dir, now.Add(-10*time.Minute), proc(1201, shell, train), quiet)
+	// it ended with 60 GiB, and its parent has not waited yet: /proc has its stat only
+	p2 := proc(1501, shell)
+	write(t, filepath.Join(p2, "31", "stat"), "31 (torchrun) Z 30 0 0 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 200 0 0\n")
+	fillRun(t, st, dir, now.Add(-5*time.Minute), p2, quiet)
+	shell.written = 1<<30 + 60<<30 // then it waits, and takes in all 60 GiB
+	d := fillRun(t, st, dir, now, proc(1801, shell), quiet).Disks[0]
+	if len(d.Writers) != 1 || d.Writers[0].PID != 30 || d.Writers[0].Written != 10<<30 {
+		t.Errorf("the shell wrote the child's last 10 GiB, not all 60: %+v", d.Writers)
+	}
+	_ = ctx
+}
+
+func TestALookWriterThatWroteNothingSinceSaysOnlyItsLook(t *testing.T) {
+	ctx := context.Background()
+	st, dir, now, proc := fillFixture(t)
+	cp := fakeProc{pid: 42, ppid: 1, argv: []string{"cp"}, cwd: dir, written: 1 << 30}
+	fillRun(t, st, dir, now.Add(-5*time.Minute), proc(1201, cp), quiet)
+	n := 0
+	look := func() map[int]int64 { n++; return map[int]int64{42: int64(n) * 50 << 20 / 1000} }
+	fillRun(t, st, dir, now, proc(1501, cp), look)
+	note, _, _ := st.Note(ctx, "capacity:fill:"+dir)
+	if !strings.Contains(note.Detail, "cp (pid 42), 50 MiB/s at a look") || strings.Contains(note.Detail, "wrote 0") {
+		t.Errorf("a look writer that wrote nothing since the run before says its look only: %s", note.Detail)
+	}
 }
 
 func TestOnlyARunThatTrustsItsLookRecordsTheWrites(t *testing.T) {
