@@ -180,49 +180,79 @@ func TestARunsNoteCountsByRuleAndSaysOnceHowToKeepEach(t *testing.T) {
 		{rule: RuleScratch, path: "/h/.cache/y", size: 2 * G, freed: 2 * G, offload: true},
 		{rule: RuleUV, path: "/h/.cache/uv", size: 2 * G, freed: 2 * G},
 	}
-	if got, want := runTitle(items), "Freed 25.0 GiB: 2 Rust build outputs, 1 leftover worktree, 2 task folders (3.0 GiB to restic); "+
-		"pruned the uv cache"; got != want {
-		t.Errorf("title\n got %q\nwant %q", got, want)
-	}
-	// four rules' sentences leave room within the limit for the largest item alone
-	d := runDetail(items)
-	if !strings.HasPrefix(d, "Largest: ~/p/a/target 11.0 GiB. Each offloaded folder's NAME.restic.txt beside it says how to restore it. "+
-		modelDataGone) {
-		t.Errorf("the detail names the largest item, the offloads' pointers and that model data is not in restic: %q", d)
-	}
-	for _, rule := range []string{RuleTargets, RuleWorktrees, RuleScratch, RuleUV} {
-		if strings.Count(d, overrides[rule]) != 1 {
-			t.Errorf("how to keep a %s item, once: %q", rule, d)
+	check := func(what, got, want string) {
+		t.Helper()
+		if got != want {
+			t.Errorf("%s\n got %q\nwant %q", what, got, want)
 		}
 	}
-	if strings.Contains(d, overrides[RuleModels]) || utf8.RuneCountInString(d) > detailMax {
-		t.Errorf("only the rules that took something, within %d characters: %q", detailMax, d)
+	check("the title counts by rule, a folder with its model data once", runTitle(items),
+		"Freed 25.0 GiB: 2 Rust build outputs, 1 leftover worktree, 2 task folders (3.0 GiB to restic); pruned the uv cache")
+	// three items and every sentence would pass the limit: two items, and the prune's sentence left out
+	check("the detail", runDetail(items), "Largest: ~/p/a/target 11.0 GiB, model data in ~/.cache/x 6.0 GiB. "+
+		"Each offloaded folder's NAME.restic.txt beside it says how to restore it. "+modelDataGone+" To keep one next time, "+
+		"list a build output's project in capacity.exclude.paths, lock a worktree (git worktree lock) or list a task folder in "+
+		"capacity.scratch.keep.")
+	// a folder whose model data alone went (an excluded project's, or one whose offload failed) is not offloaded
+	check("folders offloaded apart from those whose model data alone went", runTitle([]runItem{
+		{rule: RuleScratch, path: "/h/.cache/y", size: G, freed: G, offload: true},
+		{rule: RuleScratch, path: "/h/.cache/e", size: 4 * G, freed: 4 * G, model: true},
+		{rule: RuleScratch, path: "/h/.cache/f", size: 5 * G, freed: 5 * G, model: true},
+	}), "Freed 10.0 GiB: 1 task folder (1.0 GiB to restic), model data of 2 task folders")
+	// a title too long for a line names the prunes by their tools, then counts them, then names the rules' items shorter
+	docker := append(items[:len(items):len(items)], runItem{rule: RuleDocker, path: "docker build cache", size: G, freed: G})
+	check("the prunes by their tools", runTitle(docker),
+		"Freed 26.0 GiB: 2 Rust build outputs, 1 leftover worktree, 2 task folders (3.0 GiB to restic); pruned uv and Docker")
+	unsaid := append(items[:len(items):len(items)], runItem{rule: RuleDocker, path: "docker build cache", unsaid: true},
+		runItem{rule: RuleDocker, path: "docker dangling images", size: G, freed: G})
+	check("the prunes counted, and at least what a prune with no total freed", runTitle(unsaid),
+		"Freed at least 26.0 GiB: 2 Rust build outputs, 1 leftover worktree, 2 task folders (3.0 GiB to restic); 3 prunes")
+	if d := runDetail(unsaid); strings.Contains(d, "docker build cache") || !strings.HasPrefix(d, "Largest: ~/p/a/target 11.0 GiB, ") {
+		t.Errorf("a prune with no total names no size: %q", d)
 	}
-	// a Docker prune that printed no total: the title says at least, and counts the prunes when their names do not fit
-	items = append(items, runItem{rule: RuleDocker, path: "docker build cache", unsaid: true})
-	if got, want := runTitle(items), "Freed at least 25.0 GiB: 2 Rust build outputs, 1 leftover worktree, 2 task folders "+
-		"(3.0 GiB to restic); 2 prunes"; got != want {
-		t.Errorf("title\n got %q\nwant %q", got, want)
+	var all []runItem
+	for i := range 7 {
+		all = append(all, runItem{rule: RuleTargets, path: "/h/p/" + strconv.Itoa(i) + "/target", size: G, freed: G})
 	}
-	if d := runDetail(items); !strings.Contains(d, "Docker did not print what its prune freed.") || strings.Contains(d, "docker build cache") {
-		t.Errorf("the detail says what is not known, and names no size for it: %q", d)
+	for _, r := range []runItem{{rule: RuleModels, path: "/h/m/a"}, {rule: RuleModels, path: "/h/m/b"},
+		{rule: RuleWorktrees, path: "/h/w/a"}, {rule: RuleWorktrees, path: "/h/w/b"}, {rule: RuleWorktrees, path: "/h/w/c"},
+		{rule: RuleWorktrees, path: "/h/w/d"},
+		{rule: RuleScratch, path: "/h/s/a", offload: true, size: G}, {rule: RuleScratch, path: "/h/s/b", offload: true, size: G},
+		{rule: RuleUV, path: "/h/.cache/uv", freed: 22 * G}, {rule: RuleDocker, path: "docker build cache", unsaid: true},
+		{rule: RuleDocker, path: "docker dangling images", freed: G}} {
+		all = append(all, r)
 	}
-	if got := runTitle(items[len(items)-1:]); got != "Freed an amount Docker did not print: pruned Docker" {
-		t.Errorf("a run whose one prune printed no total: %q", got)
+	check("the rules' items shorter", runTitle(all),
+		"Freed at least 30.0 GiB: 2 model data, 7 build outputs, 4 worktrees, 2 task folders (2.0 GiB to restic); 3 prunes")
+	check("a run whose one prune printed no total", runTitle(unsaid[len(unsaid)-2:len(unsaid)-1]),
+		"Freed an amount Docker did not print: pruned Docker")
+	// one offload names its pointer
+	check("one offload", runDetail([]runItem{{rule: RuleScratch, path: "/h/.cache/y", size: 2 * G, freed: 2 * G, offload: true}}),
+		"~/.cache/y 2.0 GiB to restic. ~/.cache/y.restic.txt says how to restore it. To keep one next time, list a task folder "+
+			"in capacity.scratch.keep.")
+	// a run of four rules and a prune with a home's ordinary paths names two items, within the limit
+	t.Setenv("HOME", "/home/user")
+	real := []runItem{
+		{rule: RuleModels, path: "/data/models/some-llm-8b", size: 16 * G, freed: 16 * G},
+		{rule: RuleTargets, path: "/home/user/projects/billing-service/target", size: 11 * G, freed: 11 * G},
+		{rule: RuleTargets, path: "/home/user/.cache/lane-review-482/target", size: 3 * G, freed: 3 * G},
+		{rule: RuleWorktrees, path: "/home/user/.cache/pr-1290-review", size: 300 << 20, freed: 300 << 20},
+		{rule: RuleScratch, path: "/home/user/.cache/train-run-7", size: G, freed: G, offload: true},
+		{rule: RuleDocker, path: "docker build cache", size: 2 * G, freed: 2 * G},
 	}
-	// one offload names its pointer; long paths leave fewer items named, within the limit
-	one := []runItem{{rule: RuleScratch, path: "/h/.cache/y", size: 2 * G, freed: 2 * G, offload: true}}
-	if got, want := runDetail(one), "~/.cache/y 2.0 GiB to restic. ~/.cache/y.restic.txt says how to restore it. "+
-		overrides[RuleScratch]; got != want {
-		t.Errorf("detail\n got %q\nwant %q", got, want)
+	d := runDetail(real)
+	if !strings.HasPrefix(d, "Largest: /data/models/some-llm-8b 16.0 GiB, ~/projects/billing-service/target 11.0 GiB. ") ||
+		utf8.RuneCountInString(d) > detailMax || !strings.Contains(d, "list model data in capacity.models.keep, ") {
+		t.Errorf("two items, how to keep one, within %d characters: %d %q", detailMax, utf8.RuneCountInString(d), d)
 	}
+	// names too long for any of that leave whole sentences from the end out
 	var long []runItem
 	for i := range 4 {
-		p := "/h/.cache/" + strings.Repeat("a-long-task-name-", 6) + strconv.Itoa(i) + "/target"
-		long = append(long, runItem{rule: RuleTargets, path: p, size: int64(4-i) * G, freed: int64(4-i) * G})
+		p := "/home/user/.cache/" + strings.Repeat("a-long-task-name-", 14) + strconv.Itoa(i)
+		long = append(long, runItem{rule: RuleScratch, path: p, size: int64(4-i) * G, freed: int64(4-i) * G, offload: true})
 	}
-	if d := runDetail(long); utf8.RuneCountInString(d) > detailMax || !strings.HasPrefix(d, "Largest: ") || strings.Count(d, "/target ") != 2 {
-		t.Errorf("long names leave two items named, within %d characters: %d %q", detailMax, utf8.RuneCountInString(d), d)
+	if d := runDetail(long); utf8.RuneCountInString(d) > detailMax || !strings.HasPrefix(d, "Largest: ") || !strings.HasSuffix(d, ".") {
+		t.Errorf("whole sentences within %d characters: %d %q", detailMax, utf8.RuneCountInString(d), d)
 	}
 }
 

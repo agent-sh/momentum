@@ -39,15 +39,19 @@ const (
 	KindFill    = "capacity-fill"
 )
 
-// overrides say, per rule, how to keep an item next time, or how what a prune took comes back, for the run's note.
-// The keys are sources.json's.
-var overrides = map[string]string{
-	RuleModels:    "To keep model data, list it in capacity.models.keep.",
-	RuleTargets:   "To keep a project's build output, list the project in capacity.exclude.paths.",
-	RuleWorktrees: "To keep a worktree, lock it (git worktree lock).",
-	RuleScratch:   "To keep a task folder, list it in capacity.scratch.keep.",
-	RuleUV:        "uv downloads the wheels it dropped again.",
-	RuleDocker:    "Docker builds its cache again on the next build.",
+// keeps say, per rule that deletes or offloads, how to keep an item next time: the run's note joins its rules' in
+// one sentence. The keys are sources.json's.
+var keeps = map[string]string{
+	RuleModels:    "list model data in capacity.models.keep",
+	RuleTargets:   "list a build output's project in capacity.exclude.paths",
+	RuleWorktrees: "lock a worktree (git worktree lock)",
+	RuleScratch:   "list a task folder in capacity.scratch.keep",
+}
+
+// comesBack says, per rule that prunes, how what it took comes back: there is nothing to keep.
+var comesBack = map[string]string{
+	RuleUV:     "uv downloads the wheels it dropped again.",
+	RuleDocker: "Docker builds its cache again on the next build.",
 }
 
 // modelDataGone says, in a run that deleted a task folder's model data, that restic does not hold it.
@@ -61,6 +65,9 @@ var ruleText = map[string]string{
 	RuleModels: "idle model data", RuleTargets: "Rust build output", RuleWorktrees: "leftover worktree",
 	RuleScratch: "task folder", RuleUV: "uv cache", RuleDocker: "Docker",
 }
+
+// briefText is ruleText shorter, for a run's title that would not fit on a line.
+var briefText = map[string]string{RuleModels: "model data", RuleTargets: "build output", RuleWorktrees: "worktree"}
 
 // recordDone records one deletion, offload or prune at once: its event, and the run's note with it.
 func (r *runner) recordDone(ctx context.Context, f *Finding) error {
@@ -603,40 +610,48 @@ func runNote(start, at time.Time, items []runItem) store.Note {
 		Title: runTitle(items), Detail: runDetail(items), Source: store.Capacity, Importance: store.ImportanceNormal, At: at}
 }
 
-// runTitle is a run's effect in one line: what it freed, how many items each rule took, what of the task folders went
-// to restic, and what it pruned ("Freed 12.4 GiB: 5 Rust build outputs, 2 leftover worktrees; pruned Docker").
+// runTitle is a run's effect in one line: what it freed, how many items each rule took, the task folders it offloaded
+// with what went to restic and those whose model data alone went, and what it pruned ("Freed 12.4 GiB: 5 Rust build
+// outputs, 2 leftover worktrees; pruned Docker"). A title too long for a line names the prunes by their tools, then
+// counts them, then names the rules' items shorter; the store clips one that still does not fit.
 func runTitle(items []runItem) string {
 	var freed, restic int64
-	unsaid, offloaded := "", false
-	count, folders, pruned := map[string]int{}, map[string]bool{}, map[string]bool{}
+	unsaid, prunes := "", 0
+	count, pruned := map[string]int{}, map[string]bool{}
+	offloaded, modelOnly := map[string]bool{}, map[string]bool{}
 	for _, it := range items {
 		freed += it.freed
 		switch {
 		case it.rule == RuleUV || it.rule == RuleDocker:
-			pruned[it.rule] = true
+			pruned[it.rule], prunes = true, prunes+1
 			if it.unsaid {
 				unsaid = pruneTool[it.rule]
 			}
-		case it.rule == RuleScratch: // a folder's model data and its offload are one folder
-			folders[it.path] = true
-			if it.offload {
-				offloaded, restic = true, restic+it.size
-			}
+		case it.offload:
+			offloaded[it.path], restic = true, restic+it.size
+		case it.model:
+			modelOnly[it.path] = true
 		default:
 			count[it.rule]++
 		}
 	}
-	var parts []string
-	for _, rule := range []string{RuleModels, RuleTargets, RuleWorktrees} {
-		if n := count[rule]; n > 0 {
-			parts = append(parts, fmt.Sprintf("%d %s", n, plural(ruleText[rule], n)))
-		}
+	for p := range offloaded { // a folder whose model data went before its offload is one folder, offloaded
+		delete(modelOnly, p)
 	}
-	switch n := len(folders); {
-	case n > 0 && offloaded:
-		parts = append(parts, fmt.Sprintf("%d %s (%s to restic)", n, plural(ruleText[RuleScratch], n), gib(restic)))
-	case n > 0:
-		parts = append(parts, fmt.Sprintf("model data of %d %s", n, plural(ruleText[RuleScratch], n)))
+	parts := func(names map[string]string) []string {
+		var out []string
+		for _, rule := range []string{RuleModels, RuleTargets, RuleWorktrees} {
+			if n := count[rule]; n > 0 {
+				out = append(out, fmt.Sprintf("%d %s", n, plural(names[rule], n)))
+			}
+		}
+		if n := len(offloaded); n > 0 {
+			out = append(out, fmt.Sprintf("%d %s (%s to restic)", n, plural(ruleText[RuleScratch], n), gib(restic)))
+		}
+		if n := len(modelOnly); n > 0 {
+			out = append(out, fmt.Sprintf("model data of %d %s", n, plural(ruleText[RuleScratch], n)))
+		}
+		return out
 	}
 	head := "Freed " + gib(freed)
 	switch {
@@ -645,8 +660,6 @@ func runTitle(items []runItem) string {
 	case unsaid != "":
 		head = "Freed at least " + gib(freed)
 	}
-	// the prunes by name, by their tools' short names, or counted: the first that fits in a title (the store clips
-	// one that still does not)
 	var long, brief []string
 	if pruned[RuleUV] {
 		long, brief = append(long, "the uv cache"), append(brief, pruneTool[RuleUV])
@@ -654,18 +667,23 @@ func runTitle(items []runItem) string {
 	if pruned[RuleDocker] {
 		long, brief = append(long, pruneTool[RuleDocker]), append(brief, pruneTool[RuleDocker])
 	}
-	clauses := []string{""}
-	if n := len(long); n > 0 {
-		clauses = []string{"pruned " + strings.Join(long, " and "), "pruned " + strings.Join(brief, " and "),
-			fmt.Sprintf("%d %s", n, plural("prune", n))}
+	type form struct {
+		names  map[string]string
+		prunes string
+	}
+	forms := []form{{ruleText, ""}, {briefText, ""}}
+	if prunes > 0 {
+		counted := fmt.Sprintf("%d %s", prunes, plural("prune", prunes))
+		forms = []form{{ruleText, "pruned " + strings.Join(long, " and ")}, {ruleText, "pruned " + strings.Join(brief, " and ")},
+			{ruleText, counted}, {briefText, counted}}
 	}
 	var title string
-	for _, c := range clauses {
-		list := strings.Join(parts, ", ")
-		if list != "" && c != "" {
+	for _, f := range forms {
+		list := strings.Join(parts(f.names), ", ")
+		if list != "" && f.prunes != "" {
 			list += "; "
 		}
-		if title = head + ": " + list + c; utf8.RuneCountInString(title) <= store.TitleMax {
+		if title = head + ": " + list + f.prunes; utf8.RuneCountInString(title) <= store.TitleMax {
 			break
 		}
 	}
@@ -675,9 +693,11 @@ func runTitle(items []runItem) string {
 // detailMax is the longest detail a run's note has when it can: the most the phone's view keeps of a detail.
 const detailMax = 400
 
-// runDetail is what a run took in plain sentences: its largest items with their sizes (three, or fewer when three
-// would make the detail longer than detailMax), where each offloaded folder's pointer is, and how to keep an item
-// next time, once per rule.
+// runDetail is what a run took in plain sentences: its largest items with their sizes; where each offloaded folder's
+// pointer is, and that model data is not offloaded; how to keep an item next time, in one sentence; and last, what is
+// not known of a prune and how what the prunes took comes back. It has three items, or two; when two do not fit in
+// detailMax it leaves out the prunes' sentences, then names one item, and then the sentences from its end that still do
+// not fit.
 func runDetail(items []runItem) string {
 	var sized, offloads []runItem
 	took, model, unsaid := map[string]bool{}, false, ""
@@ -693,41 +713,69 @@ func runDetail(items []runItem) string {
 		sized = append(sized, it)
 	}
 	sort.SliceStable(sized, func(i, j int) bool { return sized[i].size > sized[j].size })
-	var rest []string
+	var fixed, prunes []string
 	switch {
 	case len(offloads) == 1:
-		rest = append(rest, short(offloads[0].path)+pointerSuffix+" says how to restore it.")
+		fixed = append(fixed, short(offloads[0].path)+pointerSuffix+" says how to restore it.")
 	case len(offloads) > 1:
-		rest = append(rest, "Each offloaded folder's NAME"+pointerSuffix+" beside it says how to restore it.")
+		fixed = append(fixed, "Each offloaded folder's NAME"+pointerSuffix+" beside it says how to restore it.")
 	}
 	if model {
-		rest = append(rest, modelDataGone)
+		fixed = append(fixed, modelDataGone)
+	}
+	var clauses []string
+	for _, rule := range Rules {
+		if k := keeps[rule]; took[rule] && k != "" {
+			clauses = append(clauses, k)
+		}
+	}
+	switch n := len(clauses); {
+	case n == 1:
+		fixed = append(fixed, "To keep one next time, "+clauses[0]+".")
+	case n > 1:
+		fixed = append(fixed, "To keep one next time, "+strings.Join(clauses[:n-1], ", ")+" or "+clauses[n-1]+".")
 	}
 	if unsaid != "" {
-		rest = append(rest, unsaid+" did not print what its prune freed.")
+		prunes = append(prunes, unsaid+" did not print what its prune freed.")
 	}
 	for _, rule := range Rules {
-		if took[rule] {
-			rest = append(rest, overrides[rule])
+		if c := comesBack[rule]; took[rule] && c != "" {
+			prunes = append(prunes, c)
 		}
 	}
-	for n := min(3, len(sized)); ; n-- {
+	sentences := func(n int, withPrunes bool) []string {
 		var named []string
-		for _, it := range sized[:n] {
+		for _, it := range sized[:min(n, len(sized))] {
 			named = append(named, itemText(it))
 		}
-		lead := upper(strings.Join(named, ", "))
-		if n < len(sized) {
-			lead = "Largest: " + strings.Join(named, ", ")
+		var out []string
+		switch {
+		case len(named) == 0:
+		case len(named) < len(sized):
+			out = append(out, "Largest: "+strings.Join(named, ", ")+".")
+		default:
+			out = append(out, upper(strings.Join(named, ", "))+".")
 		}
-		if lead != "" {
-			lead += "."
+		out = append(out, fixed...)
+		if withPrunes {
+			out = append(out, prunes...)
 		}
-		detail := strings.Join(append([]string{lead}, rest...), " ")
-		if n <= 1 || utf8.RuneCountInString(detail) <= detailMax {
-			return strings.TrimSpace(detail)
+		return out
+	}
+	fits := func(ss []string) bool { return utf8.RuneCountInString(strings.Join(ss, " ")) <= detailMax }
+	for _, f := range []struct {
+		n          int
+		withPrunes bool
+	}{{3, true}, {2, true}, {2, false}, {1, false}} {
+		if ss := sentences(f.n, f.withPrunes); fits(ss) {
+			return strings.Join(ss, " ")
 		}
 	}
+	ss := sentences(1, false)
+	for len(ss) > 1 && !fits(ss) {
+		ss = ss[:len(ss)-1]
+	}
+	return strings.Join(ss, " ")
 }
 
 // itemText names what an item took, with its size.
