@@ -940,7 +940,8 @@ func TestModelDataDeletedBeforeAFailedOffloadIsADeletionOnRecord(t *testing.T) {
 	for _, e := range fails {
 		var m map[string]any
 		must(t, json.Unmarshal([]byte(e.Meta), &m))
-		if e.Ref == p && m["freed"] != nil {
+		// what other writers on the disk did meanwhile is in the measure too, but not the model data's 2 MiB
+		if freed, _ := m["freed"].(float64); e.Ref == p && freed >= 1<<20 {
 			t.Errorf("the failure's event counts the model data's freed space again: %v", m["freed"])
 		}
 	}
