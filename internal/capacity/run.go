@@ -167,6 +167,8 @@ type Options struct {
 	afterDelete func(Finding)
 	// beforeModelDelete runs before the scratch rule deletes a file of model data: a test's way into that gap.
 	beforeModelDelete func(Finding)
+	// afterUVLock runs once the uv rule's lock file is in the cache's lock file's place: a test's way into that gap.
+	afterUVLock func()
 }
 
 type runner struct {

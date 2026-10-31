@@ -22,7 +22,8 @@ type fakeProc struct {
 	fds       []string
 	maps      []string
 	written   int64
-	start     int // its start, in ticks after boot (100 a second); 0 is a second after boot
+	start     int      // its start, in ticks after boot (100 a second); 0 is a second after boot
+	env       []string // its environment, NAME=value each
 }
 
 // procRoot builds a synthetic /proc with these processes, and the test's own (a look without it is blind).
@@ -42,6 +43,9 @@ func procRoot(t *testing.T, ps ...fakeProc) string {
 		write(t, filepath.Join(dir, "stat"), strconv.Itoa(p.pid)+" (x) S "+strconv.Itoa(p.ppid)+" 0 0 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 "+
 			strconv.Itoa(start)+" 0 0\n")
 		write(t, filepath.Join(dir, "io"), "rchar: 0\nwrite_bytes: "+strconv.FormatInt(p.written, 10)+"\n")
+		if len(p.env) > 0 {
+			write(t, filepath.Join(dir, "environ"), strings.Join(p.env, "\x00")+"\x00")
+		}
 		if p.cwd != "" {
 			must(t, os.Symlink(p.cwd, filepath.Join(dir, "cwd")))
 		}
