@@ -12,7 +12,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -66,6 +68,13 @@ type folderWalk struct {
 func (r *runner) scratch(ctx context.Context, found Found) ([]Finding, []string, error) {
 	minBytes := int64(r.cfg.MinMiB * (1 << 20))
 	refs := repoRefs(found.Repos, r.m)
+	var err error
+	if r.scratchRepos, err = r.folderMarks(ctx, repoMark); err != nil {
+		return nil, nil, err
+	}
+	if r.scratchSlow, err = r.folderMarks(ctx, slowMark); err != nil {
+		return nil, nil, err
+	}
 	var out []Finding
 	tools, unmade, tasks := 0, 0, 0
 	for _, x := range r.scratchRoots {
@@ -103,6 +112,11 @@ func (r *runner) scratch(ctx context.Context, found Found) ([]Finding, []string,
 				continue
 			}
 			tasks++
+			if _, ok := r.scratchRepos[canon]; !ok {
+				if r.scratchRepos[canon], err = r.makerRepos(ctx, canon, makers); err != nil {
+					return out, nil, err
+				}
+			}
 			w := walkFolder(shown, r.m, minBytes)
 			f := Finding{Rule: RuleScratch, Path: shown, canon: canon, root: x.shown, Bytes: w.Bytes, Newest: w.Newest,
 				files: w.models, modelBytes: w.modelBytes, makers: makers}
@@ -118,6 +132,9 @@ func (r *runner) scratch(ctx context.Context, found Found) ([]Finding, []string,
 			}
 			out = append(out, r.decideScratch(ctx, f, x, w, refs))
 		}
+	}
+	if err := r.forgetGone(ctx); err != nil {
+		return out, nil, err
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Bytes > out[j].Bytes })
 	return out, []string{fmt.Sprintf("%d tasks' folders, %d tools' caches, %d folders no agent is on record making", tasks, tools,
@@ -186,8 +203,112 @@ func (r *runner) decideScratch(ctx context.Context, f Finding, x root, w folderW
 		f.Detail = fmt.Sprintf("delete %d model files (%s); an excluded project's (%s), so the rest is only reported",
 			len(f.files), gib(f.modelBytes), why)
 	}
+	if d := stuckDir(f.Path, f.files); d != "" { // its model data cannot go, so neither can the rest: restic would keep it
+		f.Action, f.class = ActReport, "stuck"
+		f.Why = "its model data cannot be removed by this user: " + short(d) + " is not writable"
+		return f
+	}
+	for _, v := range r.scratchSlow[f.canon] {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && !f.modelOnly && f.Bytes-f.modelBytes >= n {
+			f.Action, f.class = ActReport, "too-big"
+			f.Why = fmt.Sprintf("its offload of %s ran out of its %s, so it waits until it is smaller: offload it by hand, "+
+				"or list it in keep", gib(n), offloadTimeout)
+			return f
+		}
+	}
 	f.Action = ActDelete
 	return f
+}
+
+// The marks the scratch rule keeps per task folder, "<prefix><folder>|<value>": the repositories its makers worked
+// in, as the first look saw them ("r <remote>", "c <repository's place>", and "" once looked), and the sizes whose
+// offload ran out of its time.
+const (
+	repoMark = "scratch-repo:"
+	slowMark = "scratch-slow:"
+)
+
+// folderMarks are a prefix's marks, by task folder.
+func (r *runner) folderMarks(ctx context.Context, prefix string) (map[string][]string, error) {
+	out := map[string][]string{}
+	if r.st == nil {
+		return out, nil
+	}
+	ms, err := r.st.Marks(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	for k := range ms {
+		rest := strings.TrimPrefix(k, prefix)
+		if i := strings.LastIndex(rest, "|"); i >= 0 {
+			out[rest[:i]] = append(out[rest[:i]], rest[i+1:])
+		}
+	}
+	return out, nil
+}
+
+// makerRepos are the repositories a task folder's makers worked in, by their remotes and places, and are put on
+// record: a lane removes its checkout when it closes, and an excluded project's folder stays its after that.
+func (r *runner) makerRepos(ctx context.Context, canon string, makers []maker) ([]string, error) {
+	vals := []string{""}
+	for _, mk := range makers {
+		if mk.cwd == "" || !filepath.IsAbs(mk.cwd) {
+			continue
+		}
+		if rp := r.git.repoOf(ctx, r.m.Canon(mk.cwd)); rp != nil {
+			for _, u := range rp.remotes {
+				vals = append(vals, "r "+u)
+			}
+			if rp.common != "" {
+				vals = append(vals, "c "+r.m.Canon(repoPlace(rp.common)))
+			}
+		}
+	}
+	sort.Strings(vals)
+	vals = slices.Compact(vals)
+	if !r.opt.DryRun && r.st != nil {
+		for _, v := range vals {
+			if err := r.st.SetMark(ctx, repoMark+canon+"|"+v, r.now); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return vals, nil
+}
+
+// forgetGone clears the marks of task folders that are gone.
+func (r *runner) forgetGone(ctx context.Context) error {
+	if r.opt.DryRun || r.st == nil {
+		return nil
+	}
+	for prefix, marks := range map[string]map[string][]string{repoMark: r.scratchRepos, slowMark: r.scratchSlow} {
+		for folder, vals := range marks {
+			if _, err := os.Lstat(folder); !errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			for _, v := range vals {
+				if err := r.st.ClearMark(ctx, prefix+folder+"|"+v); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// stuckDir is the first directory of a task folder's model data the run cannot unlink a file in, or "".
+func stuckDir(p string, files []modelFile) string {
+	seen := map[string]bool{}
+	for _, mf := range files {
+		d := filepath.Join(p, filepath.Dir(mf.rel))
+		if !seen[d] {
+			seen[d] = true
+			if unix.Access(d, unix.W_OK|unix.X_OK) != nil {
+				return d
+			}
+		}
+	}
+	return ""
 }
 
 // scratchDetail says what an act on a task folder does.
@@ -196,9 +317,15 @@ func scratchDetail(f Finding) string {
 	if len(f.files) > 0 {
 		d = fmt.Sprintf("delete %d model files (%s), then %s", len(f.files), gib(f.modelBytes), d)
 	}
-	if len(f.makers) > 0 {
-		mk := f.makers[0]
-		d += fmt.Sprintf("; made by %s session %s on %s", mk.harness, mk.session, mk.at.Format("2006-01-02"))
+	var by []string
+	for _, mk := range f.makers[:min(len(f.makers), 3)] {
+		by = append(by, fmt.Sprintf("%s session %s on %s", mk.harness, mk.session, mk.at.Format("2006-01-02")))
+	}
+	if len(f.makers) > 3 {
+		by = append(by, fmt.Sprintf("%d more", len(f.makers)-3))
+	}
+	if len(by) > 0 {
+		d += "; made by " + strings.Join(by, ", ")
 	}
 	return d
 }
@@ -280,7 +407,11 @@ func (r *runner) keptScratch(canon string) bool {
 // still open, or "". The scheduled-AI policy leaves a task's folder to the task while it lasts. A session is the
 // one that made it when its harness's id for it is the id the making call's transcript carries.
 func (r *runner) sessionIn(ctx context.Context, canon string, makers []maker) string {
-	for _, s := range r.liveSessions(ctx) {
+	ss, err := r.liveSessions(ctx)
+	if err != nil {
+		return r.sessionsUnread(err)
+	}
+	for _, s := range ss {
 		name := firstNonEmpty(s.Name, s.Key)
 		if s.Cwd != "" && under(r.m.Canon(s.Cwd), canon) {
 			return fmt.Sprintf("session %s (%s) works in it", name, s.Tool)
@@ -296,7 +427,7 @@ func (r *runner) sessionIn(ctx context.Context, canon string, makers []maker) st
 
 // excludedScratch reports whether a task folder is an excluded project's: by its place, by the remote of a
 // repository in it, or by where a session that made it worked then (an excluded project's lane keeps its scratch
-// in the cache too), by that place or the remote of the checkout there.
+// in the cache too), by that place, or by the repository there as the first look at the folder saw it.
 func (r *runner) excludedScratch(ctx context.Context, canon string, w folderWalk, makers []maker) (string, bool) {
 	if why, ok := r.excluded(canon); ok {
 		return why, true
@@ -306,18 +437,25 @@ func (r *runner) excludedScratch(ctx context.Context, canon string, w folderWalk
 			return "it holds " + why, true
 		}
 	}
+	for _, v := range r.scratchRepos[canon] {
+		kind, val, _ := strings.Cut(v, " ")
+		switch {
+		case kind == "r":
+			if why, ok := r.ex.byRemote(&repo{remotes: []string{val}}); ok {
+				return "made in " + why, true
+			}
+		case kind == "c":
+			if why, ok := r.excluded(val); ok {
+				return "made in a worktree of a repository " + why, true
+			}
+		}
+	}
 	for _, mk := range makers {
 		if mk.cwd == "" || !filepath.IsAbs(mk.cwd) {
 			continue
 		}
 		cwd := r.m.Canon(mk.cwd)
-		why, ok := r.excluded(cwd)
-		if !ok {
-			if rp := r.git.repoOf(ctx, cwd); rp != nil {
-				why, ok = r.excludedRepo(rp)
-			}
-		}
-		if ok {
+		if why, ok := r.excluded(cwd); ok {
 			return "made in " + short(cwd) + ", " + why, true
 		}
 	}
@@ -647,22 +785,27 @@ func (r *runner) removeScratch(ctx context.Context, f *Finding, recorded func() 
 				return errChanged
 			}
 		}
+		var failed error
 		for _, mf := range f.files {
-			switch err := rt.Remove(mf.rel); {
-			case err == nil:
+			if err := rt.Remove(mf.rel); err == nil {
 				f.removed += mf.bytes
-			case !errors.Is(err, fs.ErrNotExist):
+			} else if !errors.Is(err, fs.ErrNotExist) {
+				failed = err
+				break
+			}
+		}
+		// what went is on record before anything else happens: a model-only act's success the act records itself
+		if f.removed > 0 && (failed != nil || !f.modelOnly) && recorded != nil {
+			if err := recorded(); err != nil {
 				return err
 			}
+		}
+		if failed != nil {
+			return failed
 		}
 	}
 	if f.modelOnly {
 		return nil
-	}
-	if f.removed > 0 && recorded != nil {
-		if err := recorded(); err != nil {
-			return err
-		}
 	}
 	out, err := runTool(ctx, offloadTimeout, r.cfg.Scratch.Offload, "evidence-offload", "EVIDENCE_TAG="+r.cfg.Scratch.Tag, f.Path)
 	if m := snapshotRe.FindStringSubmatch(out); m != nil {

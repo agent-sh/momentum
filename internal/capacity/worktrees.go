@@ -296,7 +296,11 @@ func (r *runner) repoBusy(ctx context.Context, w, canon string, look *Sample) st
 				return fmt.Sprintf("%s (pid %d) in %s", p.Comm, p.PID, short(t))
 			}
 		}
-		for _, s := range r.liveSessions(ctx) {
+		ss, err := r.liveSessions(ctx)
+		if err != nil {
+			return r.sessionsUnread(err)
+		}
+		for _, s := range ss {
 			if s.Cwd != "" && under(r.m.Canon(s.Cwd), t) {
 				return fmt.Sprintf("session %s (%s) in %s", firstNonEmpty(s.Name, s.Key), s.Tool, short(t))
 			}
@@ -466,17 +470,30 @@ type changeKey struct {
 	tree string
 }
 
-// liveSessions are the agent sessions on the machine, read once per run.
-func (r *runner) liveSessions(ctx context.Context) map[int]Session {
+// liveSessions are the agent sessions on the machine, read once per run (and again for each act's second look), or
+// why the look at them was not whole.
+func (r *runner) liveSessions(ctx context.Context) (map[int]Session, error) {
 	if r.sessions == nil {
-		r.sessions = map[int]Session{}
+		r.sessions, r.sessionsErr = map[int]Session{}, nil
 		if r.opt.Sessions != nil {
-			if ss := r.opt.Sessions(ctx); ss != nil {
+			r.sessionsRead = true
+			ss, err := r.opt.Sessions(ctx)
+			switch {
+			case err != nil:
+				r.sessionsErr = err
+			case ss != nil:
 				r.sessions = ss
 			}
 		}
 	}
-	return r.sessions
+	return r.sessions, r.sessionsErr
+}
+
+// sessionsUnread says why an item a session may protect stays when the look at the sessions was not whole, and
+// holds the run for it: its hold note.
+func (r *runner) sessionsUnread(err error) string {
+	r.sessionsHeld = err.Error()
+	return "the live agent sessions could not all be read (" + err.Error() + ")"
 }
 
 // upstream is a branch's remote and its name there: its upstream, else a remote-tracking branch of the same name.

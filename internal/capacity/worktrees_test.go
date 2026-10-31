@@ -2,6 +2,7 @@ package capacity
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -168,19 +169,22 @@ func TestAWorktreeChangedWithinTheHourOrInUseStays(t *testing.T) {
 
 func TestAWorktreeOfARepositorySomeoneWorksInStays(t *testing.T) {
 	for _, c := range []struct {
-		name     string
-		proc     []fakeProc
-		sessions map[int]Session
-		change   func(t *testing.T, base string, now time.Time) // what someone did 10 minutes ago
+		name        string
+		proc        []fakeProc
+		sessions    map[int]Session
+		sessionsErr error
+		change      func(t *testing.T, base string, now time.Time) // what someone did 10 minutes ago
 	}{
-		{"a shell in the main checkout", []fakeProc{{pid: 3, ppid: 1, argv: []string{"bash"}}}, nil, nil},
-		{"an agent session in another worktree", nil, map[int]Session{-1: {Key: "s9", Name: "fixing", Tool: "codex"}}, nil},
+		{"a shell in the main checkout", []fakeProc{{pid: 3, ppid: 1, argv: []string{"bash"}}}, nil, nil, nil},
+		{"an agent session in another worktree", nil, map[int]Session{-1: {Key: "s9", Name: "fixing", Tool: "codex"}}, nil, nil},
+		// a look at the sessions that ran out of time may have missed one at work there
+		{"the sessions cannot all be read", nil, nil, errors.New("1 session sources were not read in time"), nil},
 		// an agent between two commands runs nothing there, but its last command changed something
-		{"a file made in another worktree 10 minutes ago", nil, nil, touched("cache/ahead")},
-		{"a commit in the main checkout 10 minutes ago", nil, nil, func(t *testing.T, base string, now time.Time) {
+		{"a file made in another worktree 10 minutes ago", nil, nil, nil, touched("cache/ahead")},
+		{"a commit in the main checkout 10 minutes ago", nil, nil, nil, func(t *testing.T, base string, now time.Time) {
 			logged(t, filepath.Join(base, "clone/.git/logs/HEAD"), now.Add(-10*time.Minute))
 		}},
-		{"an add in another worktree 10 minutes ago", nil, nil, touched("clone/.git/worktrees/gone/index")},
+		{"an add in another worktree 10 minutes ago", nil, nil, nil, touched("clone/.git/worktrees/gone/index")},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			clone, wts := worktreesFixture(t)
@@ -198,7 +202,7 @@ func TestAWorktreeOfARepositorySomeoneWorksInStays(t *testing.T) {
 			cfg := Config{Worktrees: WorktreesConfig{Roots: []string{wts}}}.Normal()
 			cfg.Live = []string{RuleWorktrees}
 			o := options(t, procRoot(t, c.proc...), now, nil)
-			o.Sessions = func(context.Context) map[int]Session { return c.sessions }
+			o.Sessions = func(context.Context) (map[int]Session, error) { return c.sessions, c.sessionsErr }
 			res, err := Run(context.Background(), cfg, openStore(t), o)
 			if err != nil {
 				t.Fatal(err)

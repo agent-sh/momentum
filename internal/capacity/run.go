@@ -45,13 +45,15 @@ type Finding struct {
 	unsaid       bool      // a prune whose tool did not say what it freed
 	unsized      bool      // a prune whose size could not be read before it ran
 	ownDirs      []ownDir  // the directories its deletion changed, each with its last change before (ownBefore)
-	// a task folder's: its model data and their bytes, the session that made it, whether only its model data goes
-	// (an excluded project's), and what the act did: the model data's bytes it deleted, the snapshot it offloaded to
+	// a task folder's: its model data and their bytes, the sessions that made it, whether only its model data goes
+	// (an excluded project's), and what the act did: the model data's bytes it deleted and the space that freed,
+	// the snapshot it offloaded to
 	files      []modelFile
 	modelBytes int64
 	makers     []maker
 	modelOnly  bool
 	removed    int64
+	modelFreed int64
 	snapshot   string
 	offloaded  bool
 }
@@ -148,8 +150,10 @@ type Options struct {
 	ProcRoot  string   // default /proc
 	MountInfo string   // default /proc/self/mountinfo
 	Jobs      Jobs     // default SystemJobs
-	// Sessions maps a process to the agent session it runs under; nil names none.
-	Sessions func(ctx context.Context) map[int]Session
+	// Sessions maps a process to the agent session it runs under; nil names none. An error says the look at the
+	// sessions was not whole (a source failed or ran out of time): the task folders and worktrees it could protect
+	// stay.
+	Sessions func(ctx context.Context) (map[int]Session, error)
 	// Tools runs uv and docker; nil runs the real ones.
 	Tools Tools
 	// WriterWait is how long the writers of a fast fill are measured over; default 5 s.
@@ -180,6 +184,9 @@ type runner struct {
 	named        *Named
 	namedErr     error
 	sessions     map[int]Session // the live agent sessions, read when first needed
+	sessionsErr  error           // why the last look at them was not whole
+	sessionsHeld string          // why a look of this run was not whole: its hold note
+	sessionsRead bool            // whether this run looked at the sessions
 	seen         map[string]store.Seen
 	samplerStart time.Time
 
@@ -193,6 +200,8 @@ type runner struct {
 	scratchRoots  []root               // deepest first
 	scratchSet    map[string]bool      // canonical
 	scratchKeep   map[string]bool      // canonical
+	scratchRepos  map[string][]string  // by task folder: the repositories its makers worked in, as first seen
+	scratchSlow   map[string][]string  // by task folder: the sizes whose offload ran out of its time
 	watchStart    map[string]time.Time // per canonical model or scratch root, the first run that watched it
 	runTimes      []time.Time          // every run, oldest first, this one among them
 	covered       []time.Duration      // the watched time up to each run (cover)

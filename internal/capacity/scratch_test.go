@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -291,6 +292,10 @@ func TestAnIdleTaskFoldersModelDataGoesAndTheRestIsOffloaded(t *testing.T) {
 	if del == nil || del["bytes"] != del["model_deleted"] || del["bytes"].(float64)+meta["bytes"].(float64) != float64(got[run].Bytes) {
 		t.Errorf("the model data's deletion is an event of its own, and the offload's size is the rest: %v %v", del, meta)
 	}
+	if of, df := meta["freed"], del["freed"]; df == nil || (of != nil && of.(float64)+df.(float64) != float64(got[run].Freed)) {
+		t.Errorf("the act's freed space is the model data's and the offload's, each counted once: %v + %v, act %d", of, df,
+			got[run].Freed)
+	}
 	ns, err := f.st.Notes(context.Background())
 	must(t, err)
 	found := false
@@ -344,8 +349,8 @@ func TestATaskFolderStaysWhileSomethingHoldsIt(t *testing.T) {
 	jobs := fakeJobs{units: map[string]string{"user:x.service": "[Service]\nExecStart=/bin/run " + filepath.Join(named, "out.log") + "\n"}}
 	o := options(t, proc, f.now, jobs)
 	o.DryRun = true
-	o.Sessions = func(context.Context) map[int]Session {
-		return map[int]Session{-1: {Key: "live-1", Name: "lane", Tool: "claude"}, -2: {Key: "w", Name: "worker", Tool: "codex", Cwd: worked}}
+	o.Sessions = func(context.Context) (map[int]Session, error) {
+		return map[int]Session{-1: {Key: "live-1", Name: "lane", Tool: "claude"}, -2: {Key: "w", Name: "worker", Tool: "codex", Cwd: worked}}, nil
 	}
 	got := findings(f.run(t, o), RuleScratch)
 	for p, why := range map[string]string{open: "in use now", named: "named by", kept: "in keep", worked: "works in it",
@@ -371,6 +376,9 @@ func TestAnExcludedProjectsTaskFolderKeepsAllButItsModelData(t *testing.T) {
 	gitT(t, filepath.Join(clone, "repo"), "remote", "add", "origin", "git@github.com:owner/hidden.git")
 	lane := f.folder(t, "zq-lane", map[string]int{"build.log": 2 << 20}) // made by a session at work in an excluded project
 	f.named(t, lane, "s2", toolCall, 0, `{"command":"mkdir -p `+lane+`"}`, filepath.Join(f.base, "projects", "hush", "wt"))
+	second := f.folder(t, "zq-second", map[string]int{"build.log": 2 << 20}) // and another session in it too
+	f.named(t, second, "s1", toolCall, -time.Minute, `{"command":"mkdir -p `+second+`"}`, filepath.Join(f.base, "elsewhere"))
+	f.named(t, second, "s2", toolCall, 0, `{"command":"mkdir -p `+second+`/out"}`, filepath.Join(f.base, "projects", "hush", "wt"))
 	f.cfg.Exclude.Names = []string{"*secret*"}
 	f.cfg.Exclude.Paths = []string{filepath.Join(f.base, "projects", "hush")}
 	f.cfg.Exclude.Remotes = []string{"owner/hidden"}
@@ -383,6 +391,9 @@ func TestAnExcludedProjectsTaskFolderKeepsAllButItsModelData(t *testing.T) {
 	}
 	if g := got[lane]; g.Action != ActReport || g.class != "excluded" || !exists(lane) {
 		t.Errorf("a folder made by a session at work in an excluded project is only reported: %+v", g)
+	}
+	if g := got[second]; g.Action != ActReport || g.class != "excluded" || !exists(second) {
+		t.Errorf("a folder a session at work in an excluded project made too is only reported: %+v", g)
 	}
 	if !got[run].Done || exists(filepath.Join(run, "w.safetensors")) || !exists(filepath.Join(run, "notes.md")) || exists(run+pointerSuffix) {
 		t.Errorf("an excluded project's model data goes (the owner ruled on models directly) and the rest stays: %+v", got[run])
@@ -411,11 +422,11 @@ func TestATaskFolderIsJudgedAgainBeforeItGoes(t *testing.T) {
 	proc := procRoot(t)
 	o := options(t, proc, f.now, nil)
 	acting := false
-	o.Sessions = func(context.Context) map[int]Session {
+	o.Sessions = func(context.Context) (map[int]Session, error) {
 		if !acting {
-			return nil
+			return map[int]Session{}, nil
 		}
-		return map[int]Session{-1: {Key: "late", Name: "late", Tool: "codex", Cwd: joined}}
+		return map[int]Session{-1: {Key: "late", Name: "late", Tool: "codex", Cwd: joined}}, nil
 	}
 	o.beforeAct = func() {
 		acting = true // a session starts working in one after the judgment
@@ -651,7 +662,15 @@ func TestWithoutTheOffloadNothingOfAFolderGoes(t *testing.T) {
 func TestAFolderIsATasksOnlyWhenAnAgentsCallCreatesIt(t *testing.T) {
 	f := newScratch(t)
 	small := map[string]int{"out.log": 2 << 20}
-	cmd := func(c string) func(string) store.Event {
+	// py is a call that runs a Python script, with Q in it the folder (Path has a P of its own)
+	py := func(script string) func(string) store.Event {
+		return func(p string) store.Event {
+			script := strings.ReplaceAll(strings.ReplaceAll(script, "'P'", "'Q'"), "'P/", "'Q/")
+			return store.Event{Summary: `{"command":"python3 - <<'PY'\nimport os\nfrom pathlib import Path\n` +
+				strings.ReplaceAll(script, "Q", p) + `\nPY"}`}
+		}
+	}
+	cmd := func(c string) func(string) store.Event { // P in c is the folder: a call with another P is written out
 		return func(p string) store.Event {
 			return store.Event{Summary: `{"command":"` + strings.ReplaceAll(c, "P", p) + `"}`}
 		}
@@ -677,12 +696,58 @@ func TestAFolderIsATasksOnlyWhenAnAgentsCallCreatesIt(t *testing.T) {
 		{"copy-dest", cmd("cp -r /src P"), 0, true},
 		{"copy-source", cmd("cp -r P /elsewhere"), 0, false},
 		{"rsync", cmd("rsync -a host:dir/ P/"), 0, true},
-		{"tar", cmd("tar -C P -xf a.tar"), 0, true},
-		{"curl", cmd("curl -sL -o P/f https://x"), 0, true},
+		{"copy-into", cmd("cp f.txt P/f.txt"), 0, false},
+		{"tar", cmd("tar -C P -xf a.tar"), 0, false}, // tar's -C needs the directory
+		{"tar-read", cmd("tar -C P -cf out.tar ."), 0, false},
+		{"curl", cmd("curl -sL -o P/f https://x"), 0, false}, // curl writes into a directory that is there
+		{"curl-dirs", cmd("curl -sL --create-dirs -o P/f https://x"), 0, true},
+		{"unzip", cmd("unzip -q a.zip -d P"), 0, true},
+		{"wget", func(p string) store.Event {
+			return store.Event{Summary: `{"command":"wget -q -P ` + p + ` https://x/f"}`}
+		}, 0, true},
+		{"install", cmd("install -d P"), 0, true},
+		{"local-dir", cmd("hf download org/m --local-dir P"), 0, true},
+		{"file-output", cmd("pandoc a.md --output P/a.html"), 0, false},
+		{"checkpoint", cmd("python eval.py --checkpoint P/hub/r50.pth"), 0, false},
+		{"input-dir", cmd("python eval.py --input-dir P"), 0, false},
+		{"export", cmd("export HF_HOME=P"), 0, true},
+		{"tmpdir", func(p string) store.Event { return store.Event{Summary: `{"command":"TMPDIR=` + p + ` make"}`} }, 0, false},
+		{"mkdir-sub", cmd("mkdir P/a"), 0, false}, // without -p, P was there
+		{"mkdir-plain", cmd("mkdir P"), 0, true},
+		{"install-file", cmd("install -m 644 f.txt P/f.txt"), 0, false},
+		{"prefix", cmd("pip install --prefix P x"), 0, true},
+		{"mktemp-sub", cmd("mktemp -d P/run.XXXXXX"), 0, false},
+		{"test-bracket", cmd("[ -d P ] && echo installed"), 0, false},
+		{"test-cmd", cmd("test -d P || npx playwright install chromium"), 0, false},
+		{"ls-d", cmd("ls -d P/*"), 0, false},
+		{"rsync-remote", cmd("rsync -a P/ gpu-box:P/"), 0, false},
+		{"make-C", cmd("make -C P"), 0, false},
+		{"cd-P", func(p string) store.Event { return store.Event{Summary: `{"command":"cd -P ` + p + `"}`} }, 0, false},
 		{"option", cmd("python train.py --output_dir P --epochs 3"), 0, true},
 		{"option-eq", cmd("tool --cache-dir=P"), 0, true},
 		{"variable", cmd("HF_HOME=P python dl.py"), 0, true},
 		{"script", cmd(`python3 -c 'import os; os.makedirs(\"P/a\")'`), 0, true},
+		{"path-mkdir", func(p string) store.Event {
+			return store.Event{Summary: `{"command":"python3 -c 'from pathlib import Path; Path(\"` + p + `\").mkdir(parents=True)'"}`}
+		}, 0, true},
+		{"os-mkdir-sub", cmd(`python3 -c 'import os; os.mkdir(\"P/a\")'`), 0, false},
+		{"plain-word", cmd("echo dest P"), 0, false},
+		{"path-var", py(`R=Path('P');R.mkdir(exist_ok=True)`), 0, true},
+		{"path-var-cut", func(p string) store.Event {
+			return store.Event{Summary: `{"command":"python3 - <<'PY'\nfrom pathlib import Path\nout = Path(\"` + p + `\")\nout.mkdir(parents=True, exist_ok=Tr…`}
+		}, 0, true},
+		{"path-var-sub", py(`R=Path('P/sub');R.mkdir()`), 0, false},
+		{"path-var-sub-parents", py(`R=Path('P/sub');R.mkdir(parents=True)`), 0, true},
+		{"path-var-read", py(`R=Path('P');print(R.exists())`), 0, false},
+		{"path-sub", py(`Path('P/a').mkdir()`), 0, false},
+		{"path-sub-parents", py(`Path('P/a').mkdir(parents=True)`), 0, true},
+		{"str-var", py(`D = 'P'\nos.makedirs(D, exist_ok=True)`), 0, true},
+		{"str-var-read", py(`D = 'P'\nprint(os.listdir(D))`), 0, false},
+		{"path-read", func(p string) store.Event {
+			return store.Event{Summary: `{"command":"python3 -c 'from pathlib import Path; print(Path(\"` + p + `\").exists())'"}`}
+		}, 0, false},
+		{"py-read", cmd(`python3 -c 'import os; os.makedirs(\"out\", exist_ok=True); print(os.listdir(\"P\"))'`), 0, false},
+		{"py-rmtree", cmd(`python3 -c 'import os, shutil; shutil.rmtree(\"P\"); os.makedirs(\"/elsewhere/x\")'`), 0, false},
 		{"quoted", cmd(`cat \"P/out.log\"`), 0, false},
 		{"rm-script", cmd(`rm -rf \"P\" && python3 -c 'import os; os.makedirs(\"/elsewhere\")'`), 0, false},
 		{"exec-cmd", func(p string) store.Event {
@@ -736,6 +801,12 @@ func TestAFolderIsATasksOnlyWhenAnAgentsCallCreatesIt(t *testing.T) {
 	f.event(t, owned, store.Event{Session: "s1", Kind: toolResult, Tool: "Bash", Meta: `{"tool_id":"o1"}`, Actor: store.ActorTool,
 		Summary: owned + "\n"}, time.Second)
 	want["ownmk.Xy12"] = false
+	parent := f.folder(t, "zq-mkparent", small) // mktemp printed a name inside it: it was there
+	f.event(t, parent, store.Event{Session: "s1", Kind: toolCall, Tool: "Bash", Meta: `{"tool_id":"p1"}`,
+		Summary: `{"command":"mktemp -d ` + filepath.Join(parent, "run.XXXXXX") + `"}`}, time.Second)
+	f.event(t, parent, store.Event{Session: "s1", Kind: toolResult, Tool: "Bash", Meta: `{"tool_id":"p1"}`, Actor: store.ActorTool,
+		Summary: filepath.Join(parent, "run.Ab12Cd") + "\n"}, 2*time.Second)
+	want["mkparent"] = false
 	o := options(t, procRoot(t), f.now, nil)
 	o.DryRun = true
 	got := findings(f.run(t, o), RuleScratch)
@@ -798,11 +869,11 @@ func TestEachOffloadIsJudgedByALookOfItsOwn(t *testing.T) {
 		o := options(t, proc, f.now, nil)
 		if session { // the process the first offload starts is not read; a session is
 			o = options(t, procRoot(t), f.now, nil)
-			o.Sessions = func(context.Context) map[int]Session {
+			o.Sessions = func(context.Context) (map[int]Session, error) {
 				if exists(mark) {
-					return map[int]Session{-1: {Key: "late", Name: "late", Tool: "claude", Cwd: small}}
+					return map[int]Session{-1: {Key: "late", Name: "late", Tool: "claude", Cwd: small}}, nil
 				}
-				return nil
+				return map[int]Session{}, nil
 			}
 		}
 		got := findings(f.run(t, o), RuleScratch)
@@ -839,6 +910,9 @@ func TestModelDataDeletedBeforeAFailedOffloadIsADeletionOnRecord(t *testing.T) {
 	if !deleted || !decided {
 		t.Errorf("the model data went: a capacity-delete event (%v) and a decided note (%v)", deleted, decided)
 	}
+	if n, ok, err := f.st.Note(ctx, "capacity:scratch:failed"); err != nil || !ok || !strings.Contains(n.Title, "could not be offloaded") {
+		t.Errorf("the failure's note says what failed: %q", n.Title)
+	}
 }
 
 func TestAnOffloadThatFailedButLeftItsPointerWent(t *testing.T) {
@@ -853,7 +927,7 @@ func TestAnOffloadThatFailedButLeftItsPointerWent(t *testing.T) {
 	}
 }
 
-func TestAToolsTimeoutEndsItsProcessGroup(t *testing.T) {
+func TestAToolsTimeoutEndsItAndTheProcessesItStarted(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "tool")
 	write(t, p, "#!/bin/sh\nsleep 4\necho done\n")
 	must(t, os.Chmod(p, 0o755))
@@ -864,16 +938,37 @@ func TestAToolsTimeoutEndsItsProcessGroup(t *testing.T) {
 	}
 }
 
-func TestAToolsWaitEndsThoughAChildLeftItsGroup(t *testing.T) {
+func TestAToolsWaitEndsThoughAChildIgnoresTheStop(t *testing.T) {
 	defer func(d time.Duration) { toolWaitDelay = d }(toolWaitDelay)
 	toolWaitDelay = 200 * time.Millisecond
 	p := filepath.Join(t.TempDir(), "tool")
-	write(t, p, "#!/bin/sh\nsetsid sleep 6\necho done\n") // a child in a session of its own holds the output
+	write(t, p, "#!/bin/sh\ntrap '' TERM\nsleep 6\necho done\n") // the shell and its child ignore SIGTERM
 	must(t, os.Chmod(p, 0o755))
 	start := time.Now()
 	_, err := runTool(context.Background(), 300*time.Millisecond, p, "tool")
 	if took := time.Since(start); took > 3*time.Second || !errors.Is(err, errTimeout) {
 		t.Errorf("a tool's wait ends a moment after its timeout: it returned after %s (%v)", took.Round(100*time.Millisecond), err)
+	}
+}
+
+func TestAToolRunsInTheRunsProcessGroup(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "tool")
+	write(t, p, "#!/bin/sh\ncut -d' ' -f5 /proc/$$/stat\n")
+	must(t, os.Chmod(p, 0o755))
+	out, err := runTool(context.Background(), 5*time.Second, p, "tool")
+	if strings.TrimSpace(out) != strconv.Itoa(syscall.Getpgrp()) || err != nil {
+		t.Errorf("a stop from the terminal reaches a tool as it reaches the run: its process group is %q, the run's %d (%v)",
+			strings.TrimSpace(out), syscall.Getpgrp(), err)
+	}
+}
+
+func TestAnArgumentWithAnEqualsSignIsNoVariable(t *testing.T) {
+	tool := filepath.Join(t.TempDir(), "argc")
+	write(t, tool, "#!/bin/sh\necho \"$# $TAG\"\n")
+	must(t, os.Chmod(tool, 0o755))
+	out, err := runTool(context.Background(), 5*time.Second, tool, "argc", "TAG=x", "/c/lr=3e-4")
+	if strings.TrimSpace(out) != "1 x" {
+		t.Errorf("a path with = is an argument, a leading NAME=value the environment: got %q (%v)", strings.TrimSpace(out), err)
 	}
 }
 
@@ -934,11 +1029,15 @@ func TestTheSessionThatMadeAFolderIsKnownByItsHarnesssID(t *testing.T) {
 		Summary: `{"command": "mkdir -p ` + p + `/out"}`}, 0)
 	o := options(t, procRoot(t), f.now, nil)
 	o.DryRun = true
-	o.Sessions = func(context.Context) map[int]Session {
-		return map[int]Session{-1: {Key: "hermes:20261030_1", ID: "20261030_1", Name: "gateway", Tool: "hermes"}}
+	o.Sessions = func(context.Context) (map[int]Session, error) {
+		return map[int]Session{-1: {Key: "hermes:20261030_1", ID: "20261030_1", Name: "gateway", Tool: "hermes"}}, nil
 	}
-	if g := findings(f.run(t, o), RuleScratch)[p]; g.Action != ActKeep || !strings.Contains(g.Why, "the session that made it") {
+	g := findings(f.run(t, o), RuleScratch)[p]
+	if g.Action != ActKeep || !strings.Contains(g.Why, "the session that made it") {
 		t.Errorf("a live session keyed apart from its transcripts' id keeps the folder it made: %+v", g)
+	}
+	if !strings.Contains(g.Detail, "session s0") || !strings.Contains(g.Detail, "session 20261030_1") {
+		t.Errorf("the detail names every session that made it: %q", g.Detail)
 	}
 }
 
@@ -1101,6 +1200,295 @@ func TestTheModelDatasDeletionRecordsTheDirectoriesItChanged(t *testing.T) {
 	for _, p := range []string{failed, only} {
 		if exists(filepath.Join(p, "ckpt", "w.safetensors")) || !contains(own[p], filepath.Join(p, "ckpt")) {
 			t.Errorf("%s: a deletion in a folder's own directory is capacity's change, on record: %v", filepath.Base(p), own[p])
+		}
+	}
+}
+
+func TestAToolsCacheAnAgentTestedForIsNotOffloaded(t *testing.T) {
+	f := newScratch(t)
+	f.cfg.Live = []string{RuleScratch}
+	pw := f.folder(t, "zq-ms-playwright", map[string]int{"chromium-1/chrome-linux/chrome": 2 << 20})
+	f.named(t, pw, "s1", toolCall, 20*time.Second, `{"command":"npx playwright install chromium && [ -d `+pw+` ] && echo ok"}`, "")
+	f.run(t, options(t, procRoot(t), f.now, nil))
+	if !exists(filepath.Join(pw, "chromium-1", "chrome-linux", "chrome")) {
+		t.Errorf("a tool's cache an agent only tested for was offloaded:\n%s", f.offloadLog(t))
+	}
+}
+
+func TestAFolderNamedWithAnEqualsSignIsOffloaded(t *testing.T) {
+	f := newScratch(t)
+	f.cfg.Live = []string{RuleScratch}
+	p := f.task(t, "zq-lr=3e-4", "s1", map[string]int{"w.safetensors": 2 << 20, "notes.md": -1})
+	if g := findings(f.run(t, options(t, procRoot(t), f.now, nil)), RuleScratch)[p]; !g.Done || exists(p) || !exists(p+pointerSuffix) {
+		t.Errorf("a folder whose name holds = is the offload's argument: %+v", g)
+	}
+}
+
+func TestModelDataThisUserCannotRemoveLeavesTheFolderReported(t *testing.T) {
+	f := newScratch(t)
+	f.cfg.Live = []string{RuleScratch}
+	p := f.task(t, "zq-root-ckpt", "s1", map[string]int{"ckpt/w.safetensors": 2 << 20, "notes.md": -1})
+	ro := filepath.Join(p, "ckpt") // a container wrote it as root: the user cannot unlink in it
+	must(t, os.Chmod(ro, 0o555))
+	t.Cleanup(func() { os.Chmod(ro, 0o755) })
+	if os.WriteFile(filepath.Join(ro, "probe"), nil, 0o644) == nil {
+		t.Skip("the test runs as a user that writes any directory")
+	}
+	g := findings(f.run(t, options(t, procRoot(t), f.now, nil)), RuleScratch)[p]
+	if g.Action != ActReport || g.class != "stuck" || !exists(filepath.Join(ro, "w.safetensors")) || f.offloadLog(t) != "" {
+		t.Errorf("model data the run cannot remove leaves the whole folder, reported: %+v", g)
+	}
+	n, ok, err := f.st.Note(context.Background(), "capacity:scratch:stuck")
+	must(t, err)
+	if !ok || !strings.Contains(n.Title, "cannot remove") {
+		t.Errorf("its note says why it is left: %q", n.Title)
+	}
+}
+
+func TestAModelDeletionStoppedMidwayIsOnRecord(t *testing.T) {
+	f := newScratch(t)
+	f.cfg.Live = []string{RuleScratch}
+	p := f.task(t, "zq-task", "s1", map[string]int{"aa/w.safetensors": 2 << 20, "zz/w.safetensors": 2 << 20, "notes.md": -1})
+	var ro string
+	o := options(t, procRoot(t), f.now, nil)
+	o.beforeModelDelete = func(g Finding) { // after the check: the last file's directory turns read-only
+		ro = filepath.Join(p, filepath.Dir(g.files[len(g.files)-1].rel))
+		must(t, os.Chmod(ro, 0o555))
+	}
+	t.Cleanup(func() {
+		if ro != "" {
+			os.Chmod(ro, 0o755)
+		}
+	})
+	got := findings(f.run(t, o), RuleScratch)
+	if g := got[p]; g.Done || g.Err == "" || g.removed == 0 || !exists(filepath.Join(ro, "w.safetensors")) {
+		t.Fatalf("one model file goes, the other cannot, and the folder stays: %+v", g)
+	}
+	evs, err := f.st.Events(context.Background(), store.Query{Source: store.Capacity, Kinds: []string{KindDelete}})
+	must(t, err)
+	deleted := false
+	for _, e := range evs {
+		deleted = deleted || e.Ref == p
+	}
+	if !deleted {
+		t.Errorf("a model file is gone, and no capacity-delete is on record for it: %+v", got[p])
+	}
+}
+
+func TestAModelOnlyDeletionStoppedMidwayIsOnRecord(t *testing.T) {
+	f := newScratch(t)
+	p := f.task(t, "zq-secret-run", "s1", map[string]int{"aa/w.safetensors": 2 << 20, "zz/w.safetensors": 2 << 20, "notes.md": -1})
+	f.cfg.Exclude.Names = []string{"*secret*"}
+	f.cfg = f.cfg.Normal()
+	f.cfg.Live = []string{RuleScratch}
+	var ro string
+	o := options(t, procRoot(t), f.now, nil)
+	o.beforeModelDelete = func(g Finding) {
+		ro = filepath.Join(p, filepath.Dir(g.files[len(g.files)-1].rel))
+		must(t, os.Chmod(ro, 0o555))
+	}
+	t.Cleanup(func() {
+		if ro != "" {
+			os.Chmod(ro, 0o755)
+		}
+	})
+	if g := findings(f.run(t, o), RuleScratch)[p]; g.Done || g.removed == 0 {
+		t.Fatalf("an excluded project's model data stops midway: %+v", g)
+	}
+	evs, err := f.st.Events(context.Background(), store.Query{Source: store.Capacity, Kinds: []string{KindDelete}})
+	must(t, err)
+	if len(evs) != 1 || evs[0].Ref != p {
+		t.Errorf("what went of an excluded project's model data is on record: %+v", evs)
+	}
+}
+
+func TestTheModelDatasDeletionSaysWhatItFreed(t *testing.T) {
+	f := newScratch(t)
+	f.cfg.Live = []string{RuleScratch}
+	p := f.task(t, "zq-task", "s1", map[string]int{"w.safetensors": 32 << 20, "notes.md": -1})
+	if g := findings(f.run(t, options(t, procRoot(t), f.now, nil)), RuleScratch)[p]; !g.Done {
+		t.Fatalf("offloaded: %+v", g)
+	}
+	ns, err := f.st.Notes(context.Background())
+	must(t, err)
+	found := false
+	for _, n := range ns {
+		if strings.HasPrefix(n.Title, "Deleted the model data of task folder") {
+			found = true
+			if n.Effect == "Freed 0 MiB" {
+				t.Errorf("the model data's note says it freed nothing: %q / %q", n.Title, n.Effect)
+			}
+		}
+	}
+	if !found {
+		t.Error("no note for the model data's deletion")
+	}
+}
+
+func TestTheNoteOfAFolderBesideItsPointerSaysWhy(t *testing.T) {
+	f := newScratch(t)
+	f.cfg.Live = []string{RuleScratch}
+	write(t, filepath.Join(f.root, "zq-again"+pointerSuffix), "snapshot 1\n")
+	f.task(t, "zq-again", "s1", map[string]int{"out.log": 2 << 20})
+	f.run(t, options(t, procRoot(t), f.now, nil))
+	n, ok, err := f.st.Note(context.Background(), "capacity:scratch:pointer")
+	must(t, err)
+	if !ok || !strings.Contains(n.Title, "pointer") {
+		t.Errorf("the note's title says why the folder is left: %q", n.Title)
+	}
+}
+
+// lateDocker is a Docker whose one container, mounting a folder, runs once a mark exists.
+type lateDocker struct{ mark, mount string }
+
+func (d lateDocker) UV(context.Context, time.Duration, ...string) (string, error) {
+	return "", errNoTool
+}
+func (d lateDocker) Docker(_ context.Context, _ time.Duration, args ...string) (string, error) {
+	switch {
+	case len(args) > 0 && args[0] == "ps":
+		if exists(d.mark) {
+			return "c1\n", nil
+		}
+		return "", nil
+	case len(args) > 0 && args[0] == "inspect":
+		return "/box\t" + d.mount + "\n", nil
+	}
+	return "", errNoTool
+}
+
+func TestAContainerThatStartedDuringAnOffloadKeepsTheFolderItMounts(t *testing.T) {
+	f := newScratch(t)
+	f.cfg.Live = []string{RuleScratch}
+	big := f.task(t, "zq-big", "s1", map[string]int{"out.log": 8 << 20})
+	small := f.task(t, "zq-small", "s1", map[string]int{"out.log": 2 << 20})
+	write(t, f.offload, slowOffload)
+	must(t, os.Chmod(f.offload, 0o755))
+	mark := filepath.Join(f.base, "container-started")
+	t.Setenv("FX_PROC", t.TempDir()) // the offload's process is not in the sample's /proc
+	t.Setenv("FX_SMALL", small)
+	t.Setenv("FX_MARK", mark)
+	o := options(t, procRoot(t), f.now, nil)
+	o.Tools = lateDocker{mark: mark, mount: small}
+	got := findings(f.run(t, o), RuleScratch)
+	if !got[big].Done {
+		t.Fatalf("the bigger folder goes first: %+v", got[big])
+	}
+	if g := got[small]; g.Done || !exists(small) {
+		t.Errorf("a folder a container began to mount while another was offloaded stays: %+v", g)
+	}
+}
+
+func TestAnOffloadThatRemovedTheFolderWithoutItsPointerFailed(t *testing.T) {
+	f := newScratch(t)
+	f.cfg.Live = []string{RuleScratch}
+	write(t, f.offload, "#!/bin/sh\nfor d in \"$@\"; do rm -rf \"$d\"; done\nexit 1\n")
+	must(t, os.Chmod(f.offload, 0o755))
+	p := f.task(t, "zq-task", "s1", map[string]int{"out.log": 2 << 20})
+	if g := findings(f.run(t, options(t, procRoot(t), f.now, nil)), RuleScratch)[p]; g.Done || g.Err == "" {
+		t.Errorf("a folder gone without its pointer is a failure, not a deletion: %+v", g)
+	}
+}
+
+func TestASessionLookThatIsNotWholeLeavesTheTaskFolders(t *testing.T) {
+	f := newScratch(t)
+	f.cfg.Live = []string{RuleScratch}
+	p := f.task(t, "zq-task", "s1", map[string]int{"out.log": 2 << 20})
+	o := options(t, procRoot(t), f.now, nil)
+	o.Sessions = func(context.Context) (map[int]Session, error) {
+		return nil, errors.New("1 session sources were not read in time")
+	}
+	if g := findings(f.run(t, o), RuleScratch)[p]; g.Action != ActKeep || !strings.Contains(g.Why, "could not all be read") || !exists(p) {
+		t.Errorf("a session the look missed may have made the folder: %+v", g)
+	}
+	ctx := context.Background()
+	if n, ok, err := f.st.Note(ctx, "capacity:hold:sessions"); err != nil || !ok || !n.Done.IsZero() {
+		t.Fatalf("a run that could not read the sessions says so: %+v %v %v", n, ok, err)
+	}
+	o = options(t, procRoot(t), f.now.Add(time.Hour), nil)
+	o.Sessions = func(context.Context) (map[int]Session, error) { return map[int]Session{}, nil }
+	if g := findings(f.run(t, o), RuleScratch)[p]; !g.Done {
+		t.Errorf("with the sessions read whole, the folder goes: %+v", g)
+	}
+	if n, _, _ := f.st.Note(ctx, "capacity:hold:sessions"); n.Done.IsZero() {
+		t.Errorf("a run that reads the sessions whole resolves the note: %+v", n)
+	}
+}
+
+func TestAnOffloadThatRanOutOfTimeIsReportedUntilTheFolderIsSmaller(t *testing.T) {
+	defer func(d time.Duration) { offloadTimeout = d }(offloadTimeout)
+	offloadTimeout = 300 * time.Millisecond
+	f := newScratch(t)
+	f.cfg.Live = []string{RuleScratch}
+	write(t, f.offload, "#!/bin/sh\nsleep 3\n")
+	must(t, os.Chmod(f.offload, 0o755))
+	p := f.task(t, "zq-big", "s1", map[string]int{"a.log": 4 << 20, "b.log": 4 << 20})
+	g := findings(f.run(t, options(t, procRoot(t), f.now, nil)), RuleScratch)[p]
+	if g.Done || !strings.Contains(g.Err, "timed out") {
+		t.Fatalf("an offload that runs out of its time fails: %+v", g)
+	}
+	o := options(t, procRoot(t), f.now.Add(time.Hour), nil)
+	if g := findings(f.run(t, o), RuleScratch)[p]; g.Action != ActReport || g.class != "too-big" {
+		t.Errorf("then the folder is only reported, not offloaded again: %+v", g)
+	}
+	ctx := context.Background()
+	if n, ok, err := f.st.Note(ctx, "capacity:scratch:too-big"); err != nil || !ok || !strings.Contains(n.Title, "too big") {
+		t.Errorf("its note says why it is left: %q", n.Title)
+	}
+	must(t, os.Remove(filepath.Join(p, "b.log")))
+	f.ago(t, p, 40*24*time.Hour)
+	write(t, f.offload, fakeOffload)
+	o = options(t, procRoot(t), f.now.Add(2*time.Hour), nil)
+	if g := findings(f.run(t, o), RuleScratch)[p]; !g.Done {
+		t.Errorf("once it is smaller, it is offloaded: %+v", g)
+	}
+	f.run(t, options(t, procRoot(t), f.now.Add(3*time.Hour), nil))
+	for _, prefix := range []string{slowMark, repoMark} {
+		ms, err := f.st.Marks(ctx, prefix+p)
+		must(t, err)
+		if len(ms) > 0 {
+			t.Errorf("a gone folder's marks go: %v", ms)
+		}
+	}
+}
+
+func TestAnExcludedLanesFolderStaysItsWhenTheCheckoutIsGone(t *testing.T) {
+	gitEnv(t)
+	f := newScratch(t)
+	checkout := filepath.Join(f.base, "lanes", "l7")
+	write(t, filepath.Join(checkout, "README"), "x\n")
+	gitT(t, checkout, "init", "-q")
+	gitT(t, checkout, "remote", "add", "origin", "git@github.com:owner/hidden.git")
+	lane := f.folder(t, "zq-build", map[string]int{"build.log": 2 << 20})
+	f.named(t, lane, "s2", toolCall, 0, `{"command":"mkdir -p `+lane+`"}`, checkout)
+	// and one a session made in a linked worktree of a repository in an excluded place
+	main := filepath.Join(f.base, "hush", "main")
+	write(t, filepath.Join(main, "README"), "x\n")
+	gitT(t, main, "init", "-q")
+	gitT(t, main, "add", ".")
+	gitT(t, main, "commit", "-qm", "init")
+	wt := filepath.Join(f.base, "lanes", "w3")
+	gitT(t, main, "worktree", "add", "-q", "-b", "w3", wt)
+	other := f.folder(t, "zq-out", map[string]int{"out.log": 2 << 20})
+	f.named(t, other, "s3", toolCall, 0, `{"command":"mkdir -p `+other+`"}`, wt)
+	f.cfg.Exclude.Remotes = []string{"owner/hidden"}
+	f.cfg.Exclude.Paths = []string{filepath.Join(f.base, "hush")}
+	f.cfg = f.cfg.Normal()
+	f.cfg.Live = []string{RuleScratch}
+	got := findings(f.run(t, options(t, procRoot(t), f.now, nil)), RuleScratch)
+	for _, p := range []string{lane, other} {
+		if g := got[p]; g.Action != ActReport || g.class != "excluded" {
+			t.Fatalf("a folder made in a checkout of an excluded project is only reported: %+v", g)
+		}
+	}
+	must(t, os.RemoveAll(checkout)) // the lanes closed and removed their checkouts
+	gitT(t, main, "worktree", "remove", "--force", wt)
+	o := options(t, procRoot(t), f.now.Add(time.Hour), nil)
+	o.DryRun = true
+	got = findings(f.run(t, o), RuleScratch)
+	for _, p := range []string{lane, other} {
+		if g := got[p]; g.Action != ActReport || g.class != "excluded" {
+			t.Errorf("its exclusion is on record from the first look: %+v", g)
 		}
 	}
 }

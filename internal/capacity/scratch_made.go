@@ -96,41 +96,93 @@ func toolID(e store.Event) string {
 	return m.ToolID
 }
 
-// resultCreates reports whether a call's output says it created a folder: a writer that made directories, or the
-// path mktemp printed.
+// resultCreates reports whether a call's output says it created a folder: a writer that made directories (a file's
+// parents among them), or the path mktemp printed, which is the folder itself (mktemp makes no parents).
 func resultCreates(result, call string, spellings []string) bool {
 	text := unescapeJSON(result)
-	if !namesPath(text, spellings) {
-		return false
+	for _, at := range occurrences(text, spellings) {
+		if strings.Contains(text, `"dirs_created": true`) || strings.Contains(text, `"dirs_created":true`) ||
+			wholeName(text, at) && strings.Contains(unescapeJSON(call), "mktemp") {
+			return true
+		}
 	}
-	return strings.Contains(text, `"dirs_created": true`) || strings.Contains(text, `"dirs_created":true`) ||
-		strings.Contains(unescapeJSON(call), "mktemp")
+	return false
 }
 
 // writeTools are the tools that write a file at a path they are given, making its directories.
 var writeTools = map[string]bool{"Write": true, "write_file": true, "create_file": true}
 
 var (
-	pathField  = regexp.MustCompile(`"(?:file_path|path)"\s*:\s*"$`)
-	scriptMade = regexp.MustCompile(`mkdir\(|makedirs\(|mkdirSync\(|mkdirp|\.mkdir\(`)
+	pathField = regexp.MustCompile(`"(?:file_path|path)"\s*:\s*"$`)
+	// scriptMakes ends the text before a name a script makes a directory of, with its parents: os.makedirs("P",
+	// fs.mkdirSync('P', mkdirp("P". scriptMakesOne is the call that makes only the last directory of its name.
+	scriptMakes    = regexp.MustCompile(`(?:makedirs|mkdirSync|mkdirp)\(\s*[rRbBuUfF]{0,2}["']$`)
+	scriptMakesOne = regexp.MustCompile(`mkdir\(\s*[rRbBuUfF]{0,2}["']$`)
+	// pathOpen ends the text before a name a Path is made of; pathMkdir follows the rest of its string, with the
+	// call's arguments as far as the store kept them: Path("P").mkdir(parents=True).
+	pathOpen  = regexp.MustCompile(`Path\(\s*[rR]?["']$`)
+	pathMkdir = regexp.MustCompile(`^[^"'\n]*["']\s*\)\s*\.mkdir\(([^)]*)`)
+	// pathVar ends the text before a name a variable's Path is made of (out = Path("P); strVar a variable's string
+	// (R = "P); strEnd ends the name's string.
+	pathVar    = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:pathlib\.)?Path\(\s*[rR]?["']$`)
+	strVar     = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[rR]?["']$`)
+	strEnd     = regexp.MustCompile(`^[^"'\n]*["']`)
 	commandKey = regexp.MustCompile(`"(?:command|cmd)"\s*:\s*"|[^A-Za-z_"]cmd\s*:\s*"`)
 )
 
 // callCreates reports whether a call's input creates a folder: a write tool's path in it, a patch's Add File in it,
-// or a command that makes it.
+// a script that makes it, or a command that makes it.
 func callCreates(tool, input string, spellings []string) bool {
 	text := unescapeJSON(input)
 	for _, at := range occurrences(text, spellings) {
-		before := text[:at[0]]
-		if (writeTools[tool] && pathField.MatchString(before)) || strings.HasSuffix(before, "Add File: ") {
+		before, after, whole := text[:at[0]], text[at[1]:], wholeName(text, at)
+		switch {
+		case writeTools[tool] && pathField.MatchString(before), strings.HasSuffix(before, "Add File: "):
+			return true
+		case scriptCreates(before, after, whole):
 			return true
 		}
 	}
-	script := scriptMade.MatchString(text)
 	for _, c := range commandsIn(input) {
-		if commandCreates(c, spellings, script) {
+		if commandCreates(c, spellings) {
 			return true
 		}
+	}
+	return false
+}
+
+// scriptCreates reports whether a script makes the folder a name in it names, from the text before the name and
+// after it: a call that makes a directory of the name, or of a variable that holds it (out = Path("P");
+// out.mkdir(), or R = "P"; os.makedirs(R)). A call that makes only the last directory of its name makes the folder
+// only when the name is the folder itself, or when it is told to make parents (parents=True).
+func scriptCreates(before, after string, whole bool) bool {
+	parents := func(args string) bool { return whole || strings.Contains(args, "parents=True") }
+	if scriptMakes.MatchString(before) || whole && scriptMakesOne.MatchString(before) {
+		return true
+	}
+	if pathOpen.MatchString(before) {
+		if m := pathMkdir.FindStringSubmatch(after); m != nil && parents(m[1]) {
+			return true
+		}
+	}
+	end := strEnd.FindStringIndex(after)
+	if end == nil {
+		return false
+	}
+	rest := after[end[1]:]
+	if m := pathVar.FindStringSubmatch(before); m != nil {
+		v := regexp.QuoteMeta(m[1])
+		mm := regexp.MustCompile(`\b` + v + `\s*\.mkdir\(([^)]*)`).FindStringSubmatch(rest)
+		return mm != nil && parents(mm[1])
+	}
+	if m := strVar.FindStringSubmatch(before); m != nil {
+		v := regexp.QuoteMeta(m[1])
+		if regexp.MustCompile(`(?:makedirs|mkdirSync|mkdirp)\(\s*`+v+`\b`).MatchString(rest) ||
+			whole && regexp.MustCompile(`\bmkdir\(\s*`+v+`\b`).MatchString(rest) {
+			return true
+		}
+		mm := regexp.MustCompile(`Path\(\s*` + v + `\s*\)\s*\.mkdir\(([^)]*)`).FindStringSubmatch(rest)
+		return mm != nil && parents(mm[1])
 	}
 	return false
 }
@@ -168,26 +220,60 @@ func unescapeJSON(s string) string {
 var (
 	// shellSep ends a simple command.
 	shellSep = regexp.MustCompile("&&|\\|\\||[;|\n(){}`]|\\$\\(")
-	// outputOpt is an option that names where a program writes: its output, a directory, a cache, a prefix.
-	outputOpt = regexp.MustCompile(`(?i)^--?[a-z0-9_-]*(out|dir|dest|save|cache|home|prefix|root|work|target|log|ckpt|checkpoint|tmp)[a-z0-9_-]*$`)
-	// dirVar is a variable that names a directory a program writes to: HF_HOME, TMPDIR, UV_CACHE_DIR, OUT.
-	dirVar = regexp.MustCompile(`(?i)(^|_)(dir|home|cache|out|output|root|prefix|tmp|tmpdir|temp|models|dest|work|workdir|log|logs|state|data)$`)
+	// envAssign is an assignment of an environment variable: NAME=value.
+	envAssign = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
+	// dirVar is a variable that names a directory the program it is given to makes: HF_HOME, UV_CACHE_DIR,
+	// CARGO_TARGET_DIR, OLLAMA_MODELS. TMPDIR is not one: a program fails without it.
+	dirVar = regexp.MustCompile(`(?i)(^|_)(home|cache|cache_dir|out_dir|output_dir|outdir|target_dir|prefix|dest|dest_dir|save_dir|log_dir|logdir|checkpoint_dir|ckpt_dir|download_dir|local_dir|models)$`)
 )
 
-// shortOutput are the one-letter options that name where a program writes: -o, curl's and many others' output; -d,
-// unzip's directory; -C, tar's (git's and make's is a cd); -P, wget's prefix; -O.
-var shortOutput = map[string]bool{"-o": true, "-d": true, "-C": true, "-P": true, "-O": true}
-
-// wrappers run the command that follows them; deletions and cd make nothing of their arguments.
+// outWords and dirWords name the long options of a directory the program makes: --prefix, --dest, --outdir;
+// --output-dir, --cache-dir, --local-dir, --log-dir, --target-dir (a dirWord with dir after it). --output and
+// --checkpoint alone name a file, often one to read, and make nothing.
 var (
-	wrappers  = map[string]bool{"sudo": true, "env": true, "nice": true, "ionice": true, "timeout": true, "time": true, "command": true, "exec": true, "nohup": true, "setsid": true, "stdbuf": true, "systemd-run": true, "xargs": true}
-	deletions = map[string]bool{"rm": true, "rmdir": true, "unlink": true, "trash": true, "trash-put": true, "shred": true, "evidence-offload": true, "cd": true}
-	copies    = map[string]bool{"cp": true, "mv": true, "rsync": true, "scp": true}
+	outWords = map[string]bool{"dest": true, "destdir": true, "prefix": true, "outdir": true, "outputdir": true,
+		"logdir": true, "targetdir": true, "cachedir": true, "ckptdir": true, "checkpointdir": true, "savedir": true,
+		"downloaddir": true, "localdir": true}
+	dirWords = map[string]bool{"out": true, "output": true, "log": true, "logging": true, "target": true,
+		"checkpoint": true, "ckpt": true, "local": true, "save": true, "cache": true, "download": true, "dest": true}
 )
 
-// commandCreates reports whether a shell command creates a folder at one of its names. script says whether the call
-// makes directories in a script, where a quoted path is what it makes.
-func commandCreates(cmd string, spellings []string, script bool) bool {
+// outputOpt reports whether a word is a long option that names a directory its program makes.
+func outputOpt(w string) bool {
+	name := strings.ToLower(strings.TrimLeft(w, "-"))
+	if name == w {
+		return false // not an option
+	}
+	parts := strings.FieldsFunc(name, func(r rune) bool { return r == '-' || r == '_' })
+	for i, p := range parts {
+		if outWords[p] || (dirWords[p] && i+1 < len(parts) && parts[i+1] == "dir") {
+			return true
+		}
+	}
+	return false
+}
+
+// shortOutput are the one-letter options, per program, that name a directory it makes: unzip's -d, wget's -P.
+var shortOutput = map[string]map[string]bool{"unzip": {"-d": true}, "wget": {"-P": true}}
+
+// wrappers run the command that follows them; copies make their last argument.
+var (
+	wrappers = map[string]bool{"sudo": true, "env": true, "nice": true, "ionice": true, "timeout": true, "time": true, "command": true, "exec": true, "nohup": true, "setsid": true, "stdbuf": true, "systemd-run": true, "xargs": true}
+	copies   = map[string]bool{"cp": true, "mv": true, "rsync": true, "scp": true}
+)
+
+// commandCreates reports whether a shell command creates a folder at one of its names. What it counts is a list of
+// what makes a directory, so a command it does not know (a test, a listing, a read, a deletion) makes nothing:
+//   - mkdir makes its arguments, and their parents with -p; install -d makes its arguments;
+//   - git clone, git init and git worktree add make their directory, with its parents;
+//   - cp, mv, rsync and scp make their destination, the folder itself;
+//   - an option that names a directory its program makes, by its words (--output-dir, --cache-dir, --prefix) or per
+//     program (unzip -d, wget -P, curl -o with --create-dirs);
+//   - an assignment of a directory variable the program makes (HF_HOME=, UV_CACHE_DIR=), before the program or
+//     exported.
+//
+// A name inside another (P/x) is the folder only for what makes parents too. mktemp's name is in its output.
+func commandCreates(cmd string, spellings []string) bool {
 	for _, at := range occurrences(cmd, spellings) {
 		start := 0
 		for _, m := range shellSep.FindAllStringIndex(cmd[:at[0]], -1) {
@@ -204,19 +290,27 @@ func commandCreates(cmd string, spellings []string, script bool) bool {
 				idx = i
 			}
 		}
+		if idx < 0 {
+			continue
+		}
 		k := 0
 		for k < len(words) && (wrappers[words[k].text] || strings.HasPrefix(words[k].text, "-") || isNumber(words[k].text) ||
-			strings.Contains(words[k].text, "=")) {
+			envAssign.MatchString(words[k].text)) {
 			k++
 		}
 		prog := ""
 		if k < len(words) {
 			prog = filepath.Base(words[k].text)
 		}
-		if deletions[prog] {
-			continue
+		whole := wholeName(cmd, at)
+		has := func(opts ...string) bool {
+			for _, w := range words[min(k+1, len(words)):] {
+				if contains(opts, w.text) {
+					return true
+				}
+			}
+			return false
 		}
-		last := idx == len(words)-1
 		var sub []string // a git command's subcommand and its words, without its options
 		for i := k + 1; i < idx && i < len(words); i++ {
 			if w := words[i].text; prog == "git" && (w == "-C" || w == "-c") {
@@ -225,32 +319,37 @@ func commandCreates(cmd string, spellings []string, script bool) bool {
 				sub = append(sub, w)
 			}
 		}
-		switch {
-		case prog == "mkdir" || prog == "mktemp":
-			return true
-		case copies[prog] && last:
-			return true
-		case prog == "git" && len(sub) > 0 && ((sub[0] == "clone" && last) || sub[0] == "init" ||
-			(len(sub) > 1 && sub[0] == "worktree" && sub[1] == "add")):
-			return true
-		}
-		if idx > 0 {
+		if idx > k {
+			switch {
+			case prog == "mkdir" && (whole || has("-p", "--parents")):
+				return true
+			case prog == "install" && has("-d", "--directory"):
+				return true
+			case copies[prog] && whole && idx == len(words)-1:
+				return true
+			case prog == "git" && len(sub) > 0 && ((sub[0] == "clone" && idx == len(words)-1) || sub[0] == "init" ||
+				(len(sub) > 1 && sub[0] == "worktree" && sub[1] == "add")):
+				return true
+			}
 			prev := words[idx-1].text
-			cd := prev == "-C" && (prog == "git" || prog == "make") // git's and make's -C is a cd
-			if outputOpt.MatchString(prev) || shortOutput[prev] && !cd {
+			if outputOpt(prev) || shortOutput[prog][prev] || prog == "curl" && (prev == "-o" || prev == "--output") && has("--create-dirs") {
 				return true
 			}
 		}
-		if idx >= 0 {
-			if name, _, ok := strings.Cut(words[idx].text, "="); ok && (outputOpt.MatchString(name) || dirVar.MatchString(name)) {
+		if name, _, ok := strings.Cut(words[idx].text, "="); ok {
+			if (idx > k && outputOpt(name)) || ((idx < k || prog == "export") && dirVar.MatchString(name)) {
 				return true
 			}
-		}
-		if script && at[0] > 0 && (cmd[at[0]-1] == '\'' || cmd[at[0]-1] == '"') {
-			return true
 		}
 	}
 	return false
+}
+
+// wholeName reports whether an occurrence of a folder's name is the folder itself, not a path inside it: the name,
+// with a trailing slash at most.
+func wholeName(text string, at [2]int) bool {
+	end := at[1]
+	return end == len(text) || text[end] != '/' || end+1 == len(text) || !nameByte(text[end+1])
 }
 
 // shellWord is a word of a shell command, unquoted, and where it was.
@@ -307,9 +406,10 @@ func isNumber(s string) bool {
 	return s != ""
 }
 
-// occurrences are where a text names a path in one of its spellings, as a whole name: the spelling, then what cannot
-// go on a name (a slash, a space, a quote, the end). A name the store cut ends at its ellipsis, and is not a whole
-// name.
+// occurrences are where a text names a path in one of its spellings, as a whole name: it starts a word (the text's
+// start, a space, a quote, an assignment's or a separator's end; not after a host's colon or inside another path)
+// and ends at what cannot go on a name (a slash, a space, a quote, the end). A name the store cut ends at its
+// ellipsis, and is not a whole name.
 func occurrences(text string, spellings []string) [][2]int {
 	var out [][2]int
 	for _, s := range spellings {
@@ -319,7 +419,8 @@ func occurrences(text string, spellings []string) [][2]int {
 				break
 			}
 			start, end := i+j, i+j+len(s)
-			if (end == len(text) || !nameByte(text[end])) && !strings.HasPrefix(text[end:], "…") {
+			if (start == 0 || nameStart(text[start-1])) && (end == len(text) || !nameByte(text[end])) &&
+				!strings.HasPrefix(text[end:], "…") {
 				out = append(out, [2]int{start, end})
 			}
 			i = start + 1
@@ -331,6 +432,10 @@ func occurrences(text string, spellings []string) [][2]int {
 
 // namesPath reports whether a text names a path in one of its spellings, as a whole name.
 func namesPath(text string, spellings []string) bool { return len(occurrences(text, spellings)) > 0 }
+
+// nameStart reports whether a byte may come just before a path a command names: a space, a quote, an assignment, a
+// separator or a bracket.
+func nameStart(b byte) bool { return strings.IndexByte(" \t\r\n=\"'`(;|&<>{[,", b) >= 0 }
 
 // nameByte reports whether a byte may go on a file name as agents write them.
 func nameByte(b byte) bool {

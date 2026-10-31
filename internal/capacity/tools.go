@@ -50,7 +50,7 @@ func runTool(ctx context.Context, timeout time.Duration, path, name string, args
 		path = p
 	}
 	var env []string
-	for len(args) > 0 && strings.Contains(args[0], "=") && !strings.HasPrefix(args[0], "-") {
+	for len(args) > 0 && envAssign.MatchString(args[0]) {
 		env, args = append(env, args[0]), args[1:] // NAME=value before the arguments: the command's environment
 	}
 	cctx, cancel := context.WithTimeout(ctx, timeout)
@@ -59,10 +59,10 @@ func runTool(ctx context.Context, timeout time.Duration, path, name string, args
 	if len(env) > 0 {
 		cmd.Env = append(os.Environ(), env...)
 	}
-	// the timeout ends the tool's whole process group (a script's children among it, which would keep its output
-	// open), and the wait for its output after that
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM) }
+	// the timeout ends the tool and every process it started (a script's children, which would keep its output
+	// open), and bounds the wait for its output after that. The tool stays in the run's process group, so a stop
+	// from the terminal reaches it as it reaches the run.
+	cmd.Cancel = func() error { return stopTree(cmd.Process.Pid) }
 	cmd.WaitDelay = toolWaitDelay
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
@@ -80,9 +80,47 @@ func runTool(ctx context.Context, timeout time.Duration, path, name string, args
 	return out.String(), nil
 }
 
-// toolWaitDelay is how long a tool's process group has to end, and its output to close, once its timeout passed:
-// a child that left the group (setsid) may hold the output open.
+// toolWaitDelay is how long a tool and its children have to end, and its output to close, once its timeout passed:
+// a child that ignores the stop may hold the output open.
 var toolWaitDelay = 5 * time.Second
+
+// stopTree sends SIGTERM to a process and to every process it started, from the top down, so a parent stopped
+// first starts no more. The descendants are read from /proc once; one the run may not signal (a command sudo runs)
+// gets the stop from its parent (sudo relays it).
+func stopTree(pid int) error {
+	children := map[int][]int{}
+	if ents, err := os.ReadDir("/proc"); err == nil {
+		for _, e := range ents {
+			p, err := strconv.Atoi(e.Name())
+			if err != nil {
+				continue
+			}
+			b, err := os.ReadFile(filepath.Join("/proc", e.Name(), "stat"))
+			if err != nil {
+				continue
+			}
+			if i := bytes.LastIndexByte(b, ')'); i >= 0 {
+				if f := strings.Fields(string(b[i+1:])); len(f) > 1 {
+					if pp, err := strconv.Atoi(f[1]); err == nil {
+						children[pp] = append(children[pp], p)
+					}
+				}
+			}
+		}
+	}
+	tree := []int{pid}
+	for i := 0; i < len(tree) && len(tree) < 4096; i++ {
+		tree = append(tree, children[tree[i]]...)
+	}
+	err := syscall.Kill(pid, syscall.SIGTERM)
+	for _, p := range tree[1:] {
+		syscall.Kill(p, syscall.SIGTERM)
+	}
+	if errors.Is(err, syscall.ESRCH) {
+		return os.ErrProcessDone
+	}
+	return err
+}
 
 // uv prunes the uv cache with `uv cache prune --ci` when it is over its size, or when the last prune is
 // older than the cadence (or there was none). --ci keeps the wheels uv built and drops the ones it can download

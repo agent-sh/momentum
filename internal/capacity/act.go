@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -98,6 +99,9 @@ func (r *runner) act(ctx context.Context) error {
 		case RuleScratch:
 			f.ownDirs = dirs
 			err = r.removeScratch(ctx, f, func() error { // the model data's deletion is on record before the offload
+				if mid := r.free(f.Path); before >= 0 && mid >= 0 {
+					f.modelFreed = max(0, mid-before)
+				}
 				at := r.opt.Clock()
 				for _, d := range dirs {
 					r.addOwn(d, at)
@@ -119,6 +123,13 @@ func (r *runner) act(ctx context.Context) error {
 		if errors.Is(err, errLocked) || errors.Is(err, errChanged) {
 			f.Action, f.Why = ActKeep, err.Error()
 			continue
+		}
+		if f.Rule == RuleScratch && errors.Is(err, errTimeout) && !r.opt.DryRun {
+			// its next look reports it, until it is smaller: another try would run out of time too
+			mark := slowMark + f.canon + "|" + strconv.FormatInt(f.Bytes-f.removed, 10)
+			if serr := r.st.SetMark(ctx, mark, r.now); serr != nil {
+				return serr
+			}
 		}
 		if err != nil {
 			f.Err = err.Error()

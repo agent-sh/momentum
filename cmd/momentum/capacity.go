@@ -80,7 +80,7 @@ func capacityCmd(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	}
 	if st != nil {
 		defer st.Close()
-		opt.Sessions = func(ctx context.Context) map[int]capacity.Session { return sessionsByPID(ctx, st) }
+		opt.Sessions = func(ctx context.Context) (map[int]capacity.Session, error) { return sessionsByPID(ctx, st) }
 	}
 	res, err := capacity.Run(ctx, cfg, st, opt)
 	if err != nil {
@@ -129,8 +129,9 @@ func capacityLock(wait time.Duration) (func(), error) {
 }
 
 // sessionsByPID is each live agent session but the done ones, by its process (a session without one by a negative
-// key), from the scan the report makes: it saves nothing.
-func sessionsByPID(ctx context.Context, st *store.Store) map[int]capacity.Session {
+// key), from the scan the report makes: it saves nothing. A look that is not whole (no snapshot of the machine, a
+// harness that failed or ran out of time) is an error: a session it missed protects nothing.
+func sessionsByPID(ctx context.Context, st *store.Store) (map[int]capacity.Session, error) {
 	env := sessions.EnvFromOS()
 	if c, err := config.Load(); err == nil {
 		env.Projects = c.Sessions.Projects
@@ -142,12 +143,17 @@ func sessionsByPID(ctx context.Context, st *store.Store) map[int]capacity.Sessio
 		}
 	}()
 	w, snapErr := sessions.Snapshot(ctx, env, time.Now())
-	if w == nil {
-		return nil
+	if w == nil || snapErr != nil {
+		return nil, fmt.Errorf("the machine's snapshot: %v", snapErr)
 	}
-	ss, _, _, err := look(ctx, w, snapErr, st, buildID(), srcs, time.Now().Add(3*time.Second))
-	if err != nil {
-		return nil
+	ss, scanErr, cut, err := look(ctx, w, snapErr, st, buildID(), srcs, time.Now().Add(3*time.Second))
+	switch {
+	case err != nil:
+		return nil, err
+	case scanErr != nil:
+		return nil, scanErr
+	case len(cut) > 0:
+		return nil, fmt.Errorf("%d session sources were not read in time", len(cut))
 	}
 	out := map[int]capacity.Session{}
 	for i, s := range ss {
@@ -160,7 +166,7 @@ func sessionsByPID(ctx context.Context, st *store.Store) map[int]capacity.Sessio
 		}
 		out[key] = capacity.Session{Key: s.Key, ID: s.SessionID, Name: s.Name, Tool: s.Tool, Cwd: s.Cwd}
 	}
-	return out
+	return out, nil
 }
 
 func contains(xs []string, x string) bool {

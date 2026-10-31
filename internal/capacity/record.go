@@ -76,7 +76,7 @@ func (r *runner) recordDone(ctx context.Context, f *Finding) error {
 // event and decided note, so the deletion is on record whatever the offload does.
 func (r *runner) recordModelData(ctx context.Context, f *Finding) error {
 	g := *f
-	g.offloaded, g.snapshot, g.Freed, g.Bytes = false, "", 0, f.removed
+	g.offloaded, g.snapshot, g.Freed, g.Bytes = false, "", f.modelFreed, f.removed
 	e := r.event(KindDelete, g, fmt.Sprintf("%s/%s/%s/models/%d", KindDelete, f.Rule, keyPath(*f), r.now.UnixMilli()), store.ActorAgent)
 	e.TS = r.opt.Clock()
 	if _, err := r.st.Put(ctx, []store.Event{e}); err != nil {
@@ -181,8 +181,9 @@ func (r *runner) record(ctx context.Context) error {
 }
 
 // recordHolds records a run that could not trust its look at the processes, or could not ask Docker which
-// containers run, and so deleted nothing: a problem note for each reason, put when its reason is new to it, and
-// resolved by the next run that has no such reason. Docker is asked only when a rule scans.
+// containers run, and so deleted nothing, or could not read the live sessions whole, and so left the task folders
+// and worktrees: a problem note for each reason, put when its reason is new to it, and resolved by the next run that
+// has no such reason. Docker and the sessions are asked only when a rule needs them.
 func (r *runner) recordHolds(ctx context.Context) error {
 	for _, h := range []struct {
 		id, why, title string
@@ -190,6 +191,8 @@ func (r *runner) recordHolds(ctx context.Context) error {
 	}{
 		{"capacity:hold:look", r.blind, "Capacity deleted nothing: it cannot trust its look at the processes", true},
 		{"capacity:hold:docker", r.dockerErr, "Capacity deleted nothing: Docker could not be asked which containers run", r.dockerAsked},
+		{"capacity:hold:sessions", r.sessionsHeld, "Capacity left every task folder and worktree: the live agent sessions could not all be read",
+			r.sessionsRead},
 	} {
 		if !h.checked {
 			continue
@@ -465,11 +468,12 @@ func groupOf(gs map[string]*group, rule, class string) *group {
 // event is a finding as an event of source capacity.
 func (r *runner) event(kind string, f Finding, key string, actor store.Actor) store.Event {
 	meta := map[string]any{"rule": f.Rule, "path": f.Path, "bytes": f.Bytes}
+	freed := f.Freed
 	if kind == KindOffload {
-		meta["bytes"] = offloadedBytes(f)
+		meta["bytes"], freed = offloadedBytes(f), offloadFreed(f)
 	}
-	if f.Freed > 0 {
-		meta["freed"] = f.Freed
+	if freed > 0 {
+		meta["freed"] = freed
 	}
 	if !f.Idle.IsZero() {
 		meta["idle_since"] = f.Idle.Format(time.RFC3339)
@@ -511,11 +515,14 @@ func (r *runner) event(kind string, f Finding, key string, actor store.Actor) st
 // offloadedBytes is what of a task folder went to restic: all of it but the model data deleted before.
 func offloadedBytes(f Finding) int64 { return f.Bytes - f.removed }
 
+// offloadFreed is the space an offload freed: the act's, but what the model data's deletion before it freed.
+func offloadFreed(f Finding) int64 { return max(0, f.Freed-f.modelFreed) }
+
 func summary(kind string, f Finding) string {
 	switch kind {
 	case KindOffload:
 		s := fmt.Sprintf("offloaded task folder %s to restic snapshot %s: %s, freed %s", short(f.Path), f.snapshot,
-			gib(offloadedBytes(f)), gib(f.Freed))
+			gib(offloadedBytes(f)), gib(offloadFreed(f)))
 		if f.removed > 0 {
 			s += fmt.Sprintf(", its model data (%s) deleted before", gib(f.removed))
 		}
@@ -535,6 +542,9 @@ func summary(kind string, f Finding) string {
 		}
 		return fmt.Sprintf("%s %s: %s, freed %s", ruleText[f.Rule], short(f.Path), size, freed)
 	case KindFailed:
+		if f.Rule == RuleScratch {
+			return fmt.Sprintf("could not offload task folder %s: %s", short(f.Path), f.Err)
+		}
 		return fmt.Sprintf("could not delete %s %s: %s", ruleText[f.Rule], short(f.Path), f.Err)
 	}
 	return fmt.Sprintf("%s %s (%s) left: %s", ruleText[f.Rule], short(f.Path), gib(f.Bytes), f.Why)
@@ -549,6 +559,7 @@ func decidedNote(e store.Event, f Finding, now time.Time) store.Note {
 		title = fmt.Sprintf("Pruned %s: %s", f.Path, gib(f.Freed))
 	case f.Rule == RuleScratch && f.offloaded:
 		title = fmt.Sprintf("Offloaded task folder %s (%s) to restic", short(f.Path), gib(offloadedBytes(f)))
+		effect = "Freed " + gib(offloadFreed(f))
 	case f.Rule == RuleScratch:
 		title = fmt.Sprintf("Deleted the model data of task folder %s (%s)", short(f.Path), gib(f.removed))
 	}
@@ -586,6 +597,9 @@ var groupTitles = map[string]string{
 	"mount":       "holding a mount point, left",
 	"volumes":     "only reported",
 	"failed":      "that could not be deleted",
+	"pointer":     "beside the pointer of their offload, left",
+	"stuck":       "whose model data this user cannot remove, left",
+	"too-big":     "too big to offload in one run, left",
 }
 
 // groupNote is the problem note of one rule's report-only items for one reason.
@@ -604,6 +618,8 @@ func groupNote(id, rule, class string, items []Finding, now time.Time) store.Not
 		title = fmt.Sprintf("The uv cache is %s and waits to be pruned: uv processes read it", gib(total))
 	case rule == RuleScratch && class == "unreadable":
 		title = fmt.Sprintf("%d %s with directories capacity cannot read, left (%s)", len(items), plural(what, len(items)), gib(total))
+	case rule == RuleScratch && class == "failed":
+		title = fmt.Sprintf("%d %s that could not be offloaded (%s)", len(items), plural(what, len(items)), gib(total))
 	}
 	var parts []string
 	for _, f := range items[:min(len(items), 3)] {

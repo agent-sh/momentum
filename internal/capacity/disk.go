@@ -80,8 +80,8 @@ func (r *runner) writers(ctx context.Context, mountPath string) []Writer {
 	if st, err := os.Stat(mountPath); err == nil {
 		diskDev = uint64(st.Sys().(*syscall.Stat_t).Dev)
 	}
-	sessions := r.liveSessions(ctx)
-	if r.iv == nil { // once a run, for every fast disk
+	sessions, _ := r.liveSessions(ctx) // a writer's session is named when known
+	if r.iv == nil {                   // once a run, for every fast disk
 		r.iv = between(r.prevWrites, r.writes)
 	}
 	iv := r.iv

@@ -86,8 +86,8 @@ func TestAFastFillNamesItsWritersInANoteOncePerFill(t *testing.T) {
 	o := options(t, proc, now, nil)
 	o.Rules = []string{RuleUV} // the deleting rules are not what this test is about
 	o.Writes = func() map[int]int64 { calls++; return map[int]int64{21: int64(calls) * 200 << 20, 20: 0} }
-	o.Sessions = func(context.Context) map[int]Session {
-		return map[int]Session{20: {Key: "s1", Name: "copy job", Tool: "claude"}}
+	o.Sessions = func(context.Context) (map[int]Session, error) {
+		return map[int]Session{20: {Key: "s1", Name: "copy job", Tool: "claude"}}, nil
 	}
 	res, err := Run(ctx, cfg, st, o)
 	if err != nil {
