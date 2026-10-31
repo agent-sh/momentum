@@ -40,6 +40,7 @@ func turnScreenOf(above, input string) string {
 const (
 	tasksRows  = "● Reading the logs\n\n✻ Writing the tests… (12m 3s)\n  ⎿  ◼ Write the tests\n     ☐ Run them\n     ☐ Ship it\n\n"
 	narrowRows = "● Reading the logs\n\n✻ Writing the tests for the whole package…\n\n"
+	stillRows  = "● Reading the logs\n\n● Writing the tests… (12m 3s)\n  ⎿  Tip: a tip\n\n" // reduced motion
 )
 
 // fakeTurn answers the tmux commands Interrupt runs for a pane whose turn runs: the paste shows on the input line,
@@ -119,7 +120,7 @@ func TestInterruptQueuesTheMessageThenPressesEscape(t *testing.T) {
 	}
 	// Its task list under the running row, or no room for the row's time: the paste hides the key, and the row
 	// still says the turn runs.
-	for name, above := range map[string]string{"a task list": tasksRows, "no room for its time": narrowRows} {
+	for name, above := range map[string]string{"a task list": tasksRows, "no room for its time": narrowRows, "reduced motion": stillRows} {
 		f := &fakeTurn{above: above}
 		s, tgt := turnPane(t, f)
 		if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue", nil); err != nil || strings.Join(f.keys, " ") != "Enter Escape" {
@@ -149,6 +150,7 @@ func TestTheTurnRunsByClaudeCodesOwnRows(t *testing.T) {
 	// a thinking block.
 	for name, screen := range map[string]string{
 		"no room for its time":   narrowRows + box + status,
+		"reduced motion":         stillRows + box + status,
 		"a thinking block's row": "✻ Thinking…\n  ⎿  Interrupted · What should Claude do instead?\n\n" + box + status,
 	} {
 		if !TurnRuns(screen, "claude") || turnRunsSure(screen, "claude") {
@@ -160,6 +162,7 @@ func TestTheTurnRunsByClaudeCodesOwnRows(t *testing.T) {
 		"retry words in a tool's output":       "ran it: retrying in 5s (attempt 2/3)\n" + box + status,
 		"the agent's words about waiting":      "I am Waiting for API response from the vendor.\n" + box + status,
 		"a bullet that trails off":             "● Next steps:\n  * Next…\n\n" + box + status,
+		"a message that trails off":            "● Next…\n\n" + box + status,
 		"the key in the conversation above":    "press esc to interrupt it\n" + box + status,
 		"a running row above the conversation": "✻ Fermenting… (35m 11s)\n\n● It finished.\n  Its output\n\n" + box + status,
 		"a running row far up in the history":  "✻ Fermenting… (35m 11s)\none\ntwo\nthree\n" + box + status,

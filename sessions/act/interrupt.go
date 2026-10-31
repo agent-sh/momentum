@@ -25,6 +25,9 @@ var (
 	reTimed = regexp.MustCompile(`…\s*\(.*\b\d+[hms]\b`)
 	// reGlyph is the spinner glyph Claude Code starts its running row with, and its retry notices too.
 	reGlyph = regexp.MustCompile(`^[·✢✳✶✻✽*] `)
+	// reStill is the running row as Claude Code draws it with reduced motion: a still dot, the glyph its
+	// conversation's messages start with too, so only with how long it has run.
+	reStill = regexp.MustCompile(`^● +\S.*…\s*\(.*\b\d+[hms]\b`)
 	// reRetrying is what Claude Code writes in that row's place while it waits for, or retries, a request.
 	reRetrying = regexp.MustCompile(`Retrying in \d+[hms]|Waiting for API response · will retry in|No response from the API after \d|retrying(?: once)?, waiting up to \d|next try in \d+[hms]`)
 )
@@ -51,9 +54,12 @@ func TurnRuns(styled, tool string) bool {
 
 // turnRuns reads statusRows for a running turn. sure asks for what only a running turn shows: the key on the
 // status line, the running row with its time, or a retry notice in its place; without it, a running row with no
-// time counts too.
+// time counts too, and one drawn with reduced motion.
 func turnRuns(row string, under, below []string, sure bool) bool {
 	if reRunning.MatchString(strings.Join(below, "\n")) {
+		return true
+	}
+	if !sure && reStill.MatchString(row) {
 		return true
 	}
 	if !reGlyph.MatchString(row) {
