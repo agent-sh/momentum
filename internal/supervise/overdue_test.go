@@ -506,3 +506,65 @@ func TestAJobThatStopsNextToOneThatRunsStillEscalates(t *testing.T) {
 		t.Fatalf("sent %q, cases %+v", f.sent, events(t, st, KindCase))
 	}
 }
+
+func TestTheCountIsTheSameJobsOrLoops(t *testing.T) {
+	h := past{sends: []sent{
+		{at: t0, rule: RuleOverdue, wake: "job:b@1"}, {at: t0.Add(time.Hour), rule: RuleOverdue, wake: "job:b@2"},
+		{at: t0.Add(2 * time.Hour), rule: RuleOverdue, wake: "job:a@1"},
+	}}
+	if n := h.overdueTries(Stop{WakeKey: "job:a@2"}, time.Time{}); n != 1 {
+		t.Fatalf("job a: tries %d", n)
+	}
+	if n := h.overdueTries(Stop{WakeKey: "job:b@3"}, time.Time{}); n != 2 {
+		t.Fatalf("job b: tries %d", n)
+	}
+	// Its own job ran after its resyncs: the count starts again.
+	if n := h.overdueTries(Stop{WakeKey: "job:b@3", WakeRan: t0.Add(90 * time.Minute)}, time.Time{}); n != 0 {
+		t.Fatalf("job b after it ran: tries %d", n)
+	}
+}
+
+// TestALoopThatRecoversStartsTheCountAgain runs a self-paced loop through the real tracker: a wakeup is lost and
+// resynced, the next one fires, and the one after is lost again: its resync is a first try.
+func TestALoopThatRecoversStartsTheCountAgain(t *testing.T) {
+	x, due, scan := soakLoop(t, notification)
+	st := testStore(t)
+	f := &fakeSender{}
+	now := due.Add(10 * time.Minute)
+	sv := liveOverdue(st, f, &now)
+	run(t, sv, scan(now))
+	if len(f.sent) != 1 {
+		t.Fatalf("sent %q", f.sent)
+	}
+	// The resync's turn sets the next wakeup, which fires; that run's turn sets one more, which is lost.
+	wake := func(id string, at time.Time) {
+		x.at = at
+		x.add(map[string]any{"type": "assistant", "message": map[string]any{"content": []any{map[string]any{"type": "tool_use", "id": id,
+			"name": "ScheduleWakeup", "input": map[string]any{"delaySeconds": 600, "reason": "check the soak run"}}}}}).
+			add(map[string]any{"type": "user", "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": id,
+				"content": "Next wakeup scheduled for 11:00:00 (in 600s)."}}}}).
+			say("Next check in 10 minutes.").add(map[string]any{"type": "system", "subtype": "turn_duration"})
+	}
+	x.at = now
+	x.user(f.sent[0][strings.Index(f.sent[0], Marker):])
+	wake("tw2", now.Add(time.Second))
+	fired := x.at.Add(600 * time.Second)
+	x.at = fired
+	x.add(map[string]any{"type": "system", "subtype": "scheduled_task_fire", "taskKind": "loop", "content": "Claude resuming /loop wakeup"}).
+		add(map[string]any{"type": "user", "isMeta": true, "message": map[string]any{"content": "# Autonomous loop tick"}})
+	wake("tw3", x.at.Add(time.Second))
+	notification(x) // while it waits: a sign
+	lostDue := x.at.Add(600 * time.Second)
+	now = lostDue.Add(15 * time.Minute)
+	s := scan(now)
+	s.Since = x.at
+	run(t, sv, s)
+	if len(f.sent) != 2 || len(events(t, st, KindCase)) != 0 {
+		t.Fatalf("sent %q cases %+v", f.sent, events(t, st, KindCase))
+	}
+	for _, a := range events(t, st, KindAct) {
+		if try := metaMap(a)["try"]; try != float64(1) {
+			t.Fatalf("a resync is try %v: %s", try, a.Summary)
+		}
+	}
+}

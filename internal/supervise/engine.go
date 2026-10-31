@@ -188,9 +188,7 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 			probe = credentials{inner: p, path: filepath.Join(sv.ClaudeDir, ".credentials.json"), hold: sv.Params.OwnerWindow}
 		}
 		tries := h.tries(ownerAt)
-		if stop.WakeRan.After(ownerAt) { // its job, or its loop, ran since: its runs come again, so the count does too
-			tries[RuleOverdue] = h.tries(stop.WakeRan)[RuleOverdue]
-		}
+		tries[RuleOverdue] = h.overdueTries(stop, ownerAt)
 		d := Decide(stop, tries, sv.Params, probe, now)
 		if d.Rule != "" && d.Verdict != Case && d.Verdict != Skip && h.closed(d.Rule, ownerAt) {
 			d.Verdict, d.Why = Case, "a case is open since the owner's last turn"
@@ -467,6 +465,7 @@ type sent struct {
 	stopAt time.Time
 	key    string
 	text   string
+	wake   string          // the run an overdue resync was for (its key)
 	result map[string]bool // its outcomes so far
 }
 
@@ -521,7 +520,7 @@ func history(evs []store.Event) past {
 				h.wakes[k] = true
 			}
 			h.sends = append(h.sends, sent{at: e.TS, rule: str(m["rule"]), try: num(m["try"]), seq: num(m["seq"]), key: e.SourceKey,
-				stopAt: time.UnixMilli(int64(num(m["stop_at"]))), text: fold(str(m["text"]))})
+				stopAt: time.UnixMilli(int64(num(m["stop_at"]))), text: fold(str(m["text"])), wake: str(m["wake_key"])})
 		case KindPresent:
 			if e.TS.After(h.presentAt) {
 				h.presentAt = e.TS
@@ -571,6 +570,31 @@ func (h past) tries(ownerAt time.Time) Tries {
 		}
 	}
 	return t
+}
+
+// overdueTries counts the overdue rule's resyncs for the stop's run: those for runs of the same job, or for the
+// same loop's wakeups, since the owner's last turn and since that job or loop last ran.
+func (h past) overdueTries(stop Stop, ownerAt time.Time) int {
+	from := ownerAt
+	if stop.WakeRan.After(from) {
+		from = stop.WakeRan // its job, or its loop, ran since: its runs come again, so the count does too
+	}
+	n := 0
+	for _, s := range h.sends {
+		if s.rule == RuleOverdue && s.at.After(from) && runOwner(s.wake) == runOwner(stop.WakeKey) {
+			n++
+		}
+	}
+	return n
+}
+
+// runOwner is the job or the loop a run's key names: its job's id, or the loop's wakeups.
+func runOwner(key string) string {
+	if strings.HasPrefix(key, "wakeup@") {
+		return "wakeup"
+	}
+	owner, _, _ := strings.Cut(key, "@")
+	return owner
 }
 
 // closed reports a rule momentum must not send for again: a case is open for it since the owner's last turn
