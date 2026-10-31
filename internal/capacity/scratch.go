@@ -112,10 +112,8 @@ func (r *runner) scratch(ctx context.Context, found Found) ([]Finding, []string,
 				continue
 			}
 			tasks++
-			if _, ok := r.scratchRepos[canon]; !ok {
-				if r.scratchRepos[canon], err = r.makerRepos(ctx, canon, makers); err != nil {
-					return out, nil, err
-				}
+			if err := r.makerRepos(ctx, canon, born, makers); err != nil {
+				return out, nil, err
 			}
 			w := walkFolder(shown, r.m, minBytes)
 			f := Finding{Rule: RuleScratch, Path: shown, canon: canon, root: x.shown, Bytes: w.Bytes, Newest: w.Newest,
@@ -169,9 +167,6 @@ func (r *runner) decideScratch(ctx context.Context, f Finding, x root, w folderW
 	if j, ok := r.named.Protects(f.canon); ok {
 		return keep("named by " + j)
 	}
-	if why := r.sessionIn(ctx, f.canon, f.makers); why != "" {
-		return keep(why)
-	}
 	if why := referenced(f.canon, w.links, refs); why != "" {
 		return keep(why)
 	}
@@ -188,20 +183,30 @@ func (r *runner) decideScratch(ctx context.Context, f Finding, x root, w folderW
 		}
 		return f
 	}
+	// a session only keeps what would go: one look that is not whole holds the run
+	if why := r.sessionIn(ctx, f.canon, f.makers); why != "" {
+		return keep(why)
+	}
 	if w.Errs > 0 {
 		f.Action, f.class = ActReport, "unreadable"
 		f.Why = fmt.Sprintf("%d of its directories cannot be read, so its last write is not known", w.Errs)
 		return f
 	}
-	if why, ok := r.excludedScratch(ctx, f.canon, w, f.makers); ok {
+	class, why := "", ""
+	if ex, ok := r.excludedScratch(ctx, f.canon, w, f.makers); ok {
+		class, why = "excluded", "an excluded project's: "+ex
+	} else if d := r.unknownMaker(f.canon); d != "" {
+		class, why = "unknown", "made in "+short(d)+", which was gone when the rule first looked: its project cannot be known"
+	}
+	if class != "" {
 		if len(f.files) == 0 {
-			f.Action, f.class, f.Why = ActReport, "excluded", "an excluded project's: "+why
+			f.Action, f.class, f.Why = ActReport, class, why
 			return f
 		}
 		// the owner ruled on models directly: an excluded project's model data goes too, and the rest stays
-		f.modelOnly = true
-		f.Detail = fmt.Sprintf("delete %d model files (%s); an excluded project's (%s), so the rest is only reported",
-			len(f.files), gib(f.modelBytes), why)
+		f.modelOnly, f.class = true, class
+		f.Detail = fmt.Sprintf("delete %d model files (%s); %s, so the rest is only reported", len(f.files),
+			gib(f.modelBytes), why)
 	}
 	if d := stuckDir(f.Path, f.files); d != "" { // its model data cannot go, so neither can the rest: restic would keep it
 		f.Action, f.class = ActReport, "stuck"
@@ -212,7 +217,7 @@ func (r *runner) decideScratch(ctx context.Context, f Finding, x root, w folderW
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && !f.modelOnly && f.Bytes-f.modelBytes >= n {
 			f.Action, f.class = ActReport, "too-big"
 			f.Why = fmt.Sprintf("its offload of %s ran out of its %s, so it waits until it is smaller: offload it by hand, "+
-				"or list it in keep", gib(n), offloadTimeout)
+				"or list it in keep", gib(n), durationText(offloadTimeout))
 			return f
 		}
 	}
@@ -220,9 +225,11 @@ func (r *runner) decideScratch(ctx context.Context, f Finding, x root, w folderW
 	return f
 }
 
-// The marks the scratch rule keeps per task folder, "<prefix><folder>|<value>": the repositories its makers worked
-// in, as the first look saw them ("r <remote>", "c <repository's place>", and "" once looked), and the sizes whose
-// offload ran out of its time.
+// The marks the scratch rule keeps per task folder, "<prefix><folder>|<value>". Its repository marks: "b <birth>",
+// the folder they were taken for (one made again under its name has another birth, and starts again); "s
+// <harness>/<session>", a maker looked up; "r <remote>" and "c <repository's place>", the repositories the makers
+// worked in; "u <directory>", a maker whose working directory was gone when it was looked up. Its slow marks: the
+// sizes whose offload ran out of its time.
 const (
 	repoMark = "scratch-repo:"
 	slowMark = "scratch-slow:"
@@ -247,68 +254,113 @@ func (r *runner) folderMarks(ctx context.Context, prefix string) (map[string][]s
 	return out, nil
 }
 
-// makerRepos are the repositories a task folder's makers worked in, by their remotes and places, and are put on
-// record: a lane removes its checkout when it closes, and an excluded project's folder stays its after that.
-func (r *runner) makerRepos(ctx context.Context, canon string, makers []maker) ([]string, error) {
-	vals := []string{""}
+// makerRepos looks up the repositories a task folder's makers work in, each maker once, when the rule first sees it,
+// and puts them on record: a lane removes its checkout when it closes, and an excluded project's folder stays its
+// after that. A folder made again under its name starts again. A dry run keeps what it finds in memory.
+func (r *runner) makerRepos(ctx context.Context, canon string, born time.Time, makers []maker) error {
+	vals := r.scratchRepos[canon]
+	put := func(v string) error {
+		vals = append(vals, v)
+		if r.opt.DryRun || r.st == nil {
+			return nil
+		}
+		return r.st.SetMark(ctx, repoMark+canon+"|"+v, r.now)
+	}
+	if b := "b " + strconv.FormatInt(born.UnixNano(), 10); !slices.Contains(vals, b) {
+		if err := r.forget(ctx, canon); err != nil {
+			return err
+		}
+		vals = nil
+		if err := put(b); err != nil {
+			return err
+		}
+	}
 	for _, mk := range makers {
-		if mk.cwd == "" || !filepath.IsAbs(mk.cwd) {
+		s := "s " + mk.harness + "/" + mk.session
+		if slices.Contains(vals, s) {
 			continue
 		}
-		if rp := r.git.repoOf(ctx, r.m.Canon(mk.cwd)); rp != nil {
-			for _, u := range rp.remotes {
-				vals = append(vals, "r "+u)
-			}
-			if rp.common != "" {
-				vals = append(vals, "c "+r.m.Canon(repoPlace(rp.common)))
-			}
-		}
-	}
-	sort.Strings(vals)
-	vals = slices.Compact(vals)
-	if !r.opt.DryRun && r.st != nil {
-		for _, v := range vals {
-			if err := r.st.SetMark(ctx, repoMark+canon+"|"+v, r.now); err != nil {
-				return nil, err
+		add := []string{s}
+		if mk.cwd != "" && filepath.IsAbs(mk.cwd) {
+			cwd := r.m.Canon(mk.cwd)
+			if _, err := os.Lstat(cwd); errors.Is(err, fs.ErrNotExist) {
+				add = append(add, "u "+cwd)
+			} else if rp := r.git.repoOf(ctx, cwd); rp != nil {
+				for _, u := range rp.remotes {
+					add = append(add, "r "+u)
+				}
+				if rp.common != "" {
+					add = append(add, "c "+r.m.Canon(repoPlace(rp.common)))
+				}
 			}
 		}
-	}
-	return vals, nil
-}
-
-// forgetGone clears the marks of task folders that are gone.
-func (r *runner) forgetGone(ctx context.Context) error {
-	if r.opt.DryRun || r.st == nil {
-		return nil
-	}
-	for prefix, marks := range map[string]map[string][]string{repoMark: r.scratchRepos, slowMark: r.scratchSlow} {
-		for folder, vals := range marks {
-			if _, err := os.Lstat(folder); !errors.Is(err, fs.ErrNotExist) {
-				continue
-			}
-			for _, v := range vals {
-				if err := r.st.ClearMark(ctx, prefix+folder+"|"+v); err != nil {
+		for _, v := range add {
+			if !slices.Contains(vals, v) {
+				if err := put(v); err != nil {
 					return err
 				}
 			}
 		}
 	}
+	r.scratchRepos[canon] = vals
 	return nil
 }
 
-// stuckDir is the first directory of a task folder's model data the run cannot unlink a file in, or "".
+// forget clears a task folder's marks.
+func (r *runner) forget(ctx context.Context, folder string) error {
+	for prefix, marks := range map[string]map[string][]string{repoMark: r.scratchRepos, slowMark: r.scratchSlow} {
+		if !r.opt.DryRun && r.st != nil {
+			for _, v := range marks[folder] {
+				if err := r.st.ClearMark(ctx, prefix+folder+"|"+v); err != nil {
+					return err
+				}
+			}
+		}
+		delete(marks, folder)
+	}
+	return nil
+}
+
+// forgetGone clears the marks of task folders that are gone.
+func (r *runner) forgetGone(ctx context.Context) error {
+	gone := map[string]bool{}
+	for _, marks := range []map[string][]string{r.scratchRepos, r.scratchSlow} {
+		for folder := range marks {
+			if _, err := os.Lstat(folder); errors.Is(err, fs.ErrNotExist) {
+				gone[folder] = true
+			}
+		}
+	}
+	for folder := range gone {
+		if err := r.forget(ctx, folder); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// stuckDir is the first directory of a task folder's model data the run cannot unlink a file in, or "". The walk
+// found the files, so the run can search the directories; it must be able to write them too.
 func stuckDir(p string, files []modelFile) string {
 	seen := map[string]bool{}
 	for _, mf := range files {
 		d := filepath.Join(p, filepath.Dir(mf.rel))
 		if !seen[d] {
 			seen[d] = true
-			if unix.Access(d, unix.W_OK|unix.X_OK) != nil {
+			if unix.Access(d, unix.W_OK) != nil {
 				return d
 			}
 		}
 	}
 	return ""
+}
+
+// durationText is a duration in words: minutes, or seconds and less as Go prints them.
+func durationText(d time.Duration) string {
+	if d >= time.Minute {
+		return fmt.Sprintf("%.0f minutes", d.Minutes())
+	}
+	return d.String()
 }
 
 // scratchDetail says what an act on a task folder does.
@@ -427,7 +479,7 @@ func (r *runner) sessionIn(ctx context.Context, canon string, makers []maker) st
 
 // excludedScratch reports whether a task folder is an excluded project's: by its place, by the remote of a
 // repository in it, or by where a session that made it worked then (an excluded project's lane keeps its scratch
-// in the cache too), by that place, or by the repository there as the first look at the folder saw it.
+// in the cache too), by that place, or by the repository there as the rule first saw it or as it is now.
 func (r *runner) excludedScratch(ctx context.Context, canon string, w folderWalk, makers []maker) (string, bool) {
 	if why, ok := r.excluded(canon); ok {
 		return why, true
@@ -455,11 +507,28 @@ func (r *runner) excludedScratch(ctx context.Context, canon string, w folderWalk
 			continue
 		}
 		cwd := r.m.Canon(mk.cwd)
-		if why, ok := r.excluded(cwd); ok {
+		why, ok := r.excluded(cwd)
+		if !ok {
+			if rp := r.git.repoOf(ctx, cwd); rp != nil {
+				why, ok = r.excludedRepo(rp)
+			}
+		}
+		if ok {
 			return "made in " + short(cwd) + ", " + why, true
 		}
 	}
 	return "", false
+}
+
+// unknownMaker names a maker's working directory that was gone when the rule first looked it up, or "": the project
+// of a folder made there cannot be known, and it may be an excluded one's.
+func (r *runner) unknownMaker(canon string) string {
+	for _, v := range r.scratchRepos[canon] {
+		if kind, val, _ := strings.Cut(v, " "); kind == "u" {
+			return val
+		}
+	}
+	return ""
 }
 
 // referenced says what ties a folder to a repository outside it (from its own git links, or a repository's remote,
@@ -619,6 +688,9 @@ func walkFolder(p string, m *Mounts, minBytes int64) folderWalk {
 		for _, e := range ents {
 			fi, err := e.Info()
 			if err != nil {
+				if !errors.Is(err, fs.ErrNotExist) {
+					w.Errs++ // a directory it may list but not search hides what is in it
+				}
 				continue // gone since the listing
 			}
 			b, _ := count(fi)
@@ -703,20 +775,32 @@ func hfHub(d string) bool {
 	return false
 }
 
-// modelExts are the names of model weights', checkpoints' and datasets' files.
-var modelExts = map[string]bool{".safetensors": true, ".gguf": true, ".ggml": true, ".pt": true, ".pth": true,
-	".ckpt": true, ".distcp": true, ".onnx": true, ".tflite": true, ".parquet": true, ".arrow": true}
+// modelExts are the names of model weights', checkpoints' and datasets' files: TensorRT's engines, TFRecord and
+// MosaicML shards among them. tfShard is a TensorFlow checkpoint's shard (model.ckpt.data-00000-of-00001).
+var (
+	modelExts = map[string]bool{".safetensors": true, ".gguf": true, ".ggml": true, ".pt": true, ".pth": true,
+		".ckpt": true, ".distcp": true, ".onnx": true, ".tflite": true, ".parquet": true, ".arrow": true, ".engine": true,
+		".trt": true, ".tfrecord": true, ".tfrecords": true, ".mds": true}
+	tfShard = regexp.MustCompile(`\.data-\d{5}-of-\d{5}$`)
+)
 
-// modelFormat reports whether a file holds model data: by its name, or by its first bytes (GGUF, safetensors, a
-// PyTorch archive, Parquet, Arrow), which is how a blob named by its hash (Ollama's, Hugging Face's) is known. What
+// modelFormat reports whether a file holds model data: by its name, or by its first bytes (GGUF and legacy GGML,
+// safetensors, a PyTorch archive, Parquet, Arrow, a Megatron dataset), which is how a blob named by its hash
+// (Ollama's, Hugging Face's) is known. What
 // a run's results are kept in as often (JSON lines, CSV, NumPy and HDF5 arrays, pickles) is left to the offload:
 // restic keeps it.
 func modelFormat(p, name string, size int64) bool {
-	if modelExts[strings.ToLower(filepath.Ext(name))] {
+	if modelExts[strings.ToLower(filepath.Ext(name))] || tfShard.MatchString(name) {
 		return true
 	}
+	if strings.HasSuffix(name, ".bin") { // a Megatron dataset's data, beside its index
+		if bytes.HasPrefix(readHead(strings.TrimSuffix(p, ".bin")+".idx", 9), []byte("MMIDIDX\x00\x00")) {
+			return true
+		}
+	}
 	b := readHead(p, 256)
-	for _, magic := range []string{"GGUF", "PAR1", "ARROW1"} {
+	// GGUF, legacy GGML (ggml, ggmf, ggjt, little-endian), Parquet, Arrow, a Megatron dataset's index
+	for _, magic := range []string{"GGUF", "lmgg", "fmgg", "tjgg", "PAR1", "ARROW1", "MMIDIDX\x00\x00"} {
 		if bytes.HasPrefix(b, []byte(magic)) {
 			return true
 		}

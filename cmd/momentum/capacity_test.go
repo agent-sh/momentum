@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/capacity"
+	"github.com/agent-sh/momentum/sessions"
 )
 
 func TestCapacityWithoutItsSectionOrWithABadRuleIsAUsageError(t *testing.T) {
@@ -90,5 +91,28 @@ func TestACapacityDryRunRecordsNothing(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, "momentum.db")); !os.IsNotExist(err) {
 		t.Fatal("a dry run makes no store")
+	}
+}
+
+func TestASessionLookThatIsNotWholeProtectsNothing(t *testing.T) {
+	w := &sessions.World{Now: time.Now()}
+	live := []*sessions.Session{{Key: "k1", SessionID: "id1", PID: 5, Tool: "claude", Cwd: "/w", Phase: sessions.Working},
+		{Key: "k2", PID: 6, Tool: "codex", Phase: sessions.Done}, {Key: "hermes:h", SessionID: "h", Tool: "hermes"}}
+	for name, c := range map[string]struct {
+		w               *sessions.World
+		snap, scan, err error
+	}{
+		"no snapshot":  {nil, errors.New("no proc"), nil, nil},
+		"its error":    {w, errors.New("partial"), nil, nil},
+		"a scan error": {w, nil, errors.New("pi: not read in time"), nil},
+		"no stamps":    {w, nil, nil, errors.New("store")},
+	} {
+		if got, err := capacitySessions(c.w, c.snap, live, c.scan, c.err); err == nil {
+			t.Errorf("%s: a look that is not whole is an error, got %v", name, got)
+		}
+	}
+	got, err := capacitySessions(w, nil, live, nil, nil)
+	if err != nil || len(got) != 2 || got[5].ID != "id1" || got[5].Cwd != "/w" || got[-3].Key != "hermes:h" {
+		t.Errorf("a whole look keeps each session but the done ones, by its process: %+v %v", got, err)
 	}
 }

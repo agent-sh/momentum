@@ -476,13 +476,14 @@ func (r *runner) liveSessions(ctx context.Context) (map[int]Session, error) {
 	if r.sessions == nil {
 		r.sessions, r.sessionsErr = map[int]Session{}, nil
 		if r.opt.Sessions != nil {
-			r.sessionsRead = true
 			ss, err := r.opt.Sessions(ctx)
 			switch {
 			case err != nil:
 				r.sessionsErr = err
 			case ss != nil:
-				r.sessions = ss
+				r.sessions, r.sessionsWhole = ss, true
+			default:
+				r.sessionsWhole = true
 			}
 		}
 	}

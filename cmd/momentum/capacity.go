@@ -129,8 +129,7 @@ func capacityLock(wait time.Duration) (func(), error) {
 }
 
 // sessionsByPID is each live agent session but the done ones, by its process (a session without one by a negative
-// key), from the scan the report makes: it saves nothing. A look that is not whole (no snapshot of the machine, a
-// harness that failed or ran out of time) is an error: a session it missed protects nothing.
+// key), from the scan the report makes: it saves nothing. A look that is not whole is an error (capacitySessions).
 func sessionsByPID(ctx context.Context, st *store.Store) (map[int]capacity.Session, error) {
 	env := sessions.EnvFromOS()
 	if c, err := config.Load(); err == nil {
@@ -143,17 +142,24 @@ func sessionsByPID(ctx context.Context, st *store.Store) (map[int]capacity.Sessi
 		}
 	}()
 	w, snapErr := sessions.Snapshot(ctx, env, time.Now())
-	if w == nil || snapErr != nil {
-		return nil, fmt.Errorf("the machine's snapshot: %v", snapErr)
+	if w == nil {
+		return capacitySessions(nil, snapErr, nil, nil, nil)
 	}
-	ss, scanErr, cut, err := look(ctx, w, snapErr, st, buildID(), srcs, time.Now().Add(3*time.Second))
+	ss, scanErr, _, err := look(ctx, w, snapErr, st, buildID(), srcs, time.Now().Add(3*time.Second))
+	return capacitySessions(w, snapErr, ss, scanErr, err)
+}
+
+// capacitySessions are the live sessions capacity protects what they work on with, by process, or why the look was
+// not whole: no snapshot of the machine, a snapshot error, a harness that failed or ran out of time (scanAll gives
+// each its error), the store's stamps unread. A session it missed protects nothing, so capacity holds instead.
+func capacitySessions(w *sessions.World, snapErr error, ss []*sessions.Session, scanErr, err error) (map[int]capacity.Session, error) {
 	switch {
+	case w == nil || snapErr != nil:
+		return nil, fmt.Errorf("the machine's snapshot: %v", snapErr)
 	case err != nil:
 		return nil, err
 	case scanErr != nil:
 		return nil, scanErr
-	case len(cut) > 0:
-		return nil, fmt.Errorf("%d session sources were not read in time", len(cut))
 	}
 	out := map[int]capacity.Session{}
 	for i, s := range ss {

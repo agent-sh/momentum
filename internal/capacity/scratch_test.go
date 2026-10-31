@@ -589,6 +589,16 @@ func TestModelDataIsKnownByItsNameOrItsFirstBytes(t *testing.T) {
 		{"arrays.npy", []byte("\x93NUMPY"), false},
 		{"lib.so", []byte("\x7fELF"), false},
 		{"hdr-too-long", func() []byte { h := bytes.Clone(hdr); binary.LittleEndian.PutUint64(h, 1<<40); return h }(), false},
+		{"model.ckpt.data-00000-of-00001", nil, true},
+		{"llama.engine", nil, true},
+		{"train-00001.tfrecord", nil, true},
+		{"shard.00000.mds", nil, true},
+		{"old-ggml-model", []byte("lmgg"), true},
+		{"old-ggjt-model", []byte("tjgg"), true},
+		{"text_document.idx", []byte("MMIDIDX\x00\x00"), true},
+		{"text_document.bin", nil, true}, // beside its index
+		{"other.bin", nil, false},
+		{"notes.plan", nil, false},
 	} {
 		p, n := st(c.name, c.head, 4096)
 		if got := modelFormat(p, c.name, n); got != c.want {
@@ -732,6 +742,18 @@ func TestAFolderIsATasksOnlyWhenAnAgentsCallCreatesIt(t *testing.T) {
 		}, 0, true},
 		{"os-mkdir-sub", cmd(`python3 -c 'import os; os.mkdir(\"P/a\")'`), 0, false},
 		{"plain-word", cmd("echo dest P"), 0, false},
+		{"shell-var", cmd(`S=P; mkdir -p \"$S\" && cd \"$S\"`), 0, true},
+		{"shell-var-braces", cmd("OUT=P && mkdir -p ${OUT}/logs"), 0, true},
+		{"shell-var-export", cmd("export WORK=P; mkdir -p $WORK"), 0, true},
+		{"shell-var-rm", cmd(`S=P; rm -rf \"$S\"`), 0, false},
+		{"shell-var-home", func(p string) store.Event {
+			return store.Event{Summary: `{"command":"D=$HOME` + strings.TrimPrefix(p, homeDir()) + `; mkdir -p \"$D\""}`}
+		}, 0, true},
+		{"shell-then", cmd("if [ ! -d P ]; then mkdir -p P; fi"), 0, true},
+		{"shell-do", cmd("for d in a b; do mkdir -p P/$d; done"), 0, true},
+		{"codex-template", func(p string) store.Event {
+			return store.Event{Tool: "exec", Summary: "text(await tools.exec_command({cmd:`mkdir -p " + p + "/out`}))"}
+		}, 0, true},
 		{"path-var", py(`R=Path('P');R.mkdir(exist_ok=True)`), 0, true},
 		{"path-var-cut", func(p string) store.Event {
 			return store.Event{Summary: `{"command":"python3 - <<'PY'\nfrom pathlib import Path\nout = Path(\"` + p + `\")\nout.mkdir(parents=True, exist_ok=Tr…`}
@@ -912,6 +934,15 @@ func TestModelDataDeletedBeforeAFailedOffloadIsADeletionOnRecord(t *testing.T) {
 	}
 	if n, ok, err := f.st.Note(ctx, "capacity:scratch:failed"); err != nil || !ok || !strings.Contains(n.Title, "could not be offloaded") {
 		t.Errorf("the failure's note says what failed: %q", n.Title)
+	}
+	fails, err := f.st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindFailed}})
+	must(t, err)
+	for _, e := range fails {
+		var m map[string]any
+		must(t, json.Unmarshal([]byte(e.Meta), &m))
+		if e.Ref == p && m["freed"] != nil {
+			t.Errorf("the failure's event counts the model data's freed space again: %v", m["freed"])
+		}
 	}
 }
 
@@ -1246,6 +1277,9 @@ func TestModelDataThisUserCannotRemoveLeavesTheFolderReported(t *testing.T) {
 }
 
 func TestAModelDeletionStoppedMidwayIsOnRecord(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root unlinks in a directory it cannot write")
+	}
 	f := newScratch(t)
 	f.cfg.Live = []string{RuleScratch}
 	p := f.task(t, "zq-task", "s1", map[string]int{"aa/w.safetensors": 2 << 20, "zz/w.safetensors": 2 << 20, "notes.md": -1})
@@ -1276,6 +1310,9 @@ func TestAModelDeletionStoppedMidwayIsOnRecord(t *testing.T) {
 }
 
 func TestAModelOnlyDeletionStoppedMidwayIsOnRecord(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root unlinks in a directory it cannot write")
+	}
 	f := newScratch(t)
 	p := f.task(t, "zq-secret-run", "s1", map[string]int{"aa/w.safetensors": 2 << 20, "zz/w.safetensors": 2 << 20, "notes.md": -1})
 	f.cfg.Exclude.Names = []string{"*secret*"}
@@ -1299,6 +1336,11 @@ func TestAModelOnlyDeletionStoppedMidwayIsOnRecord(t *testing.T) {
 	must(t, err)
 	if len(evs) != 1 || evs[0].Ref != p {
 		t.Errorf("what went of an excluded project's model data is on record: %+v", evs)
+	}
+	fails, err := f.st.Events(context.Background(), store.Query{Source: store.Capacity, Kinds: []string{KindFailed}})
+	must(t, err)
+	if len(fails) != 1 || !strings.Contains(fails[0].Summary, "could not delete the model data") {
+		t.Errorf("its failure says the model data could not be deleted, not that an offload failed: %+v", fails)
 	}
 }
 
@@ -1405,6 +1447,14 @@ func TestASessionLookThatIsNotWholeLeavesTheTaskFolders(t *testing.T) {
 	if n, ok, err := f.st.Note(ctx, "capacity:hold:sessions"); err != nil || !ok || !n.Done.IsZero() {
 		t.Fatalf("a run that could not read the sessions says so: %+v %v %v", n, ok, err)
 	}
+	o = options(t, procRoot(t), f.now.Add(30*time.Minute), nil)
+	o.Sessions = func(context.Context) (map[int]Session, error) { return nil, errors.New("again") }
+	f.ago(t, p, time.Minute) // the folder written again: nothing is due on this run
+	f.run(t, o)
+	if n, _, _ := f.st.Note(ctx, "capacity:hold:sessions"); !n.Done.IsZero() {
+		t.Errorf("a run that never read the sessions whole leaves the note open: %+v", n)
+	}
+	f.ago(t, p, 40*24*time.Hour)
 	o = options(t, procRoot(t), f.now.Add(time.Hour), nil)
 	o.Sessions = func(context.Context) (map[int]Session, error) { return map[int]Session{}, nil }
 	if g := findings(f.run(t, o), RuleScratch)[p]; !g.Done {
@@ -1422,7 +1472,7 @@ func TestAnOffloadThatRanOutOfTimeIsReportedUntilTheFolderIsSmaller(t *testing.T
 	f.cfg.Live = []string{RuleScratch}
 	write(t, f.offload, "#!/bin/sh\nsleep 3\n")
 	must(t, os.Chmod(f.offload, 0o755))
-	p := f.task(t, "zq-big", "s1", map[string]int{"a.log": 4 << 20, "b.log": 4 << 20})
+	p := f.task(t, "zq-big", "s1", map[string]int{"a.log": 4 << 20, "b.log": 4 << 20, "w.safetensors": 4 << 20})
 	g := findings(f.run(t, options(t, procRoot(t), f.now, nil)), RuleScratch)[p]
 	if g.Done || !strings.Contains(g.Err, "timed out") {
 		t.Fatalf("an offload that runs out of its time fails: %+v", g)
@@ -1490,5 +1540,187 @@ func TestAnExcludedLanesFolderStaysItsWhenTheCheckoutIsGone(t *testing.T) {
 		if g := got[p]; g.Action != ActReport || g.class != "excluded" {
 			t.Errorf("its exclusion is on record from the first look: %+v", g)
 		}
+	}
+}
+
+// laneCheckout is a checkout whose remote is an excluded project's.
+func laneCheckout(t *testing.T, f *scratchFixture, name string) string {
+	t.Helper()
+	c := filepath.Join(f.base, "lanes", name)
+	write(t, filepath.Join(c, "README"), "x\n")
+	gitT(t, c, "init", "-q")
+	gitT(t, c, "remote", "add", "origin", "git@github.com:owner/hidden.git")
+	return c
+}
+
+func TestAMakerTheFirstLookMissedIsStillCheckedByItsRemote(t *testing.T) {
+	gitEnv(t)
+	f := newScratch(t)
+	lane := laneCheckout(t, f, "l7")
+	p := f.task(t, "zq-shared", "s1", map[string]int{"build.log": 2 << 20})
+	f.cfg.Exclude.Remotes = []string{"owner/hidden"}
+	f.cfg = f.cfg.Normal()
+	f.run(t, options(t, procRoot(t), f.now, nil)) // the first look; the rule is not live yet
+	f.named(t, p, "s2", toolCall, 5*time.Minute, `{"command":"mkdir -p `+p+`/out"}`, lane)
+	f.cfg.Live = []string{RuleScratch}
+	g := findings(f.run(t, options(t, procRoot(t), f.now.Add(time.Hour), nil)), RuleScratch)[p]
+	if g.Done || !exists(p) || g.class != "excluded" {
+		t.Errorf("an excluded lane made it too, and its checkout is there: %+v", g)
+	}
+}
+
+func TestAFolderMadeAgainUnderItsNameIsLookedAtAgain(t *testing.T) {
+	gitEnv(t)
+	f := newScratch(t)
+	lane := laneCheckout(t, f, "l8")
+	small := map[string]int{"build.log": 2 << 20}
+	p := f.folder(t, "zq-build", small) // the first task's folder, by a session in no repository
+	f.event(t, p, store.Event{Session: "s1", Kind: toolCall, Tool: "Bash", Summary: `{"command":"mkdir -p ` + p + `"}`}, 0)
+	f.cfg.Exclude.Remotes = []string{"owner/hidden"}
+	f.cfg = f.cfg.Normal()
+	f.run(t, options(t, procRoot(t), f.now, nil)) // its first look; the rule is not live yet
+	must(t, os.RemoveAll(p))                      // its task removes it; the next task makes it again, within the hour
+	p = f.folder(t, "zq-build", small)
+	f.event(t, p, store.Event{Session: "s2", Kind: toolCall, Tool: "Bash", Cwd: lane,
+		Summary: `{"command":"rm -rf ` + p + ` && mkdir -p ` + p + `"}`}, 0)
+	f.run(t, options(t, procRoot(t), f.now.Add(time.Hour), nil)) // the new folder's first look, its lane's checkout there
+	must(t, os.RemoveAll(lane))                                  // the lane closes
+	f.cfg.Live = []string{RuleScratch}
+	g := findings(f.run(t, options(t, procRoot(t), f.now.Add(2*time.Hour), nil)), RuleScratch)[p]
+	if g.Done || !exists(p) || g.class != "excluded" {
+		t.Errorf("a folder made again under its name has a first look of its own: %+v", g)
+	}
+}
+
+func TestAFolderWhoseMakersDirectoryWasGoneIsOnlyReported(t *testing.T) {
+	f := newScratch(t)
+	f.cfg.Live = []string{RuleScratch}
+	p := f.folder(t, "zq-orphan", map[string]int{"build.log": 2 << 20})
+	f.named(t, p, "s1", toolCall, 0, `{"command":"mkdir -p `+p+`"}`, filepath.Join(f.base, "closed-lane")) // never there
+	if g := findings(f.run(t, options(t, procRoot(t), f.now, nil)), RuleScratch)[p]; g.Action != ActReport || g.class != "unknown" || !exists(p) {
+		t.Errorf("a folder made in a directory that was gone when the rule looked is of no known project: %+v", g)
+	}
+	mp := f.folder(t, "zq-orphan-model", map[string]int{"w.safetensors": 2 << 20, "notes.md": -1})
+	f.named(t, mp, "s1", toolCall, 0, `{"command":"mkdir -p `+mp+`"}`, filepath.Join(f.base, "closed-lane"))
+	if g := findings(f.run(t, options(t, procRoot(t), f.now.Add(time.Hour), nil)), RuleScratch)[mp]; !g.Done ||
+		exists(filepath.Join(mp, "w.safetensors")) || !exists(filepath.Join(mp, "notes.md")) {
+		t.Errorf("its model data still goes, and the rest stays: %+v", g)
+	}
+}
+
+func TestAFailedLookWithNothingDuePutsNoHold(t *testing.T) {
+	f := newScratch(t)
+	f.cfg.Live = []string{RuleScratch}
+	p := f.task(t, "zq-task", "s1", map[string]int{"out.log": 2 << 20})
+	f.ago(t, p, time.Hour) // written an hour ago: pending for weeks
+	o := options(t, procRoot(t), f.now, nil)
+	o.Sessions = func(context.Context) (map[int]Session, error) {
+		return nil, errors.New("1 session sources were not read in time")
+	}
+	f.run(t, o)
+	if n, ok, err := f.st.Note(context.Background(), "capacity:hold:sessions"); err == nil && ok && n.Done.IsZero() {
+		t.Errorf("a problem note says task folders were left, with none due: %q", n.Title)
+	}
+}
+
+func TestADryRunOnAReadOnlyStoreWritesNoMark(t *testing.T) {
+	f := newScratch(t)
+	db := filepath.Join(t.TempDir(), "momentum.db")
+	st, err := store.Open(db)
+	must(t, err)
+	f.st = st
+	watchedSince(t, f.st, f.cfg, f.now.Add(-35*24*time.Hour), f.now)
+	p := f.task(t, "zq-task", "s1", map[string]int{"out.log": 2 << 20})
+	must(t, st.SetMark(context.Background(), repoMark+filepath.Join(f.root, "zq-gone")+"|b 1", f.now))
+	must(t, st.Close())
+	ro, err := store.OpenReadOnly(db)
+	must(t, err)
+	defer ro.Close()
+	o := options(t, procRoot(t), f.now, nil)
+	o.DryRun = true
+	res, err := Run(context.Background(), f.cfg, ro, o)
+	must(t, err)
+	for _, r := range res.Rules {
+		if r.Rule == RuleScratch && r.Err != "" {
+			t.Errorf("a dry run on a read-only store failed: %s", r.Err)
+		}
+	}
+	if g := findings(res, RuleScratch)[p]; g.Action != ActDelete {
+		t.Errorf("the dry run lists the folder: %+v", g)
+	}
+}
+
+func TestADirectoryThatCannotBeSearchedHidesNothing(t *testing.T) {
+	f := newScratch(t)
+	f.cfg.Live = []string{RuleScratch}
+	p := f.task(t, "zq-task", "s1", map[string]int{"ckpt/w.safetensors": 2 << 20, "notes.md": -1})
+	shut := filepath.Join(p, "ckpt")
+	must(t, os.Chmod(shut, 0o666)) // listed, not searched: the walk cannot tell what its files are
+	t.Cleanup(func() { os.Chmod(shut, 0o755) })
+	if os.Geteuid() == 0 {
+		t.Skip("root searches any directory")
+	}
+	if g := findings(f.run(t, options(t, procRoot(t), f.now, nil)), RuleScratch)[p]; g.Action != ActReport || g.class != "unreadable" || f.offloadLog(t) != "" {
+		t.Errorf("a folder with a directory the run cannot search is only reported, its model data maybe in it: %+v", g)
+	}
+}
+
+func TestTheDetailNamesTheFirstMakersAndCountsTheRest(t *testing.T) {
+	at := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	f := Finding{Bytes: 1 << 20, makers: []maker{{session: "a", harness: "claude", at: at}, {session: "b", harness: "codex", at: at},
+		{session: "c", harness: "pi", at: at}, {session: "d", harness: "hermes", at: at}}}
+	if d := scratchDetail(f); !strings.Contains(d, "pi session c") || strings.Contains(d, "session d") || !strings.HasSuffix(d, "1 more") {
+		t.Errorf("three makers by name, and a count of the rest: %q", d)
+	}
+}
+
+func TestAFolderMadeAgainLosesTheOldFoldersMarks(t *testing.T) {
+	defer func(d time.Duration) { offloadTimeout = d }(offloadTimeout)
+	offloadTimeout = 300 * time.Millisecond
+	f := newScratch(t)
+	f.cfg.Live = []string{RuleScratch}
+	write(t, f.offload, "#!/bin/sh\nsleep 3\n")
+	must(t, os.Chmod(f.offload, 0o755))
+	small := map[string]int{"a.log": 4 << 20}
+	p := f.task(t, "zq-again", "s1", small)
+	if g := findings(f.run(t, options(t, procRoot(t), f.now, nil)), RuleScratch)[p]; !strings.Contains(g.Err, "timed out") {
+		t.Fatalf("its offload runs out of its time: %+v", g)
+	}
+	must(t, os.RemoveAll(p)) // removed, and made again under its name by the same session, before a scan saw it gone
+	p = f.task(t, "zq-again", "s1", small)
+	f.ago(t, p, 40*24*time.Hour)
+	write(t, f.offload, fakeOffload)
+	if g := findings(f.run(t, options(t, procRoot(t), f.now.Add(time.Hour), nil)), RuleScratch)[p]; !g.Done {
+		t.Errorf("a new folder under the old name is judged as itself, not by the old one's marks: %+v", g)
+	}
+}
+
+func TestAMakersCheckoutThatBecameAnExcludedOnesCountsNow(t *testing.T) {
+	gitEnv(t)
+	f := newScratch(t)
+	dir := filepath.Join(f.base, "lanes", "l9")
+	must(t, os.MkdirAll(dir, 0o755)) // no repository yet when the rule first looks
+	p := f.folder(t, "zq-later", map[string]int{"build.log": 2 << 20})
+	f.named(t, p, "s2", toolCall, 0, `{"command":"mkdir -p `+p+`"}`, dir)
+	f.cfg.Exclude.Remotes = []string{"owner/hidden"}
+	f.cfg = f.cfg.Normal()
+	f.run(t, options(t, procRoot(t), f.now, nil))
+	gitT(t, dir, "init", "-q") // then the lane's checkout comes, of an excluded remote
+	gitT(t, dir, "remote", "add", "origin", "git@github.com:owner/hidden.git")
+	f.cfg.Live = []string{RuleScratch}
+	if g := findings(f.run(t, options(t, procRoot(t), f.now.Add(time.Hour), nil)), RuleScratch)[p]; g.Done || g.class != "excluded" {
+		t.Errorf("a maker's checkout is read as it is now too: %+v", g)
+	}
+}
+
+func TestACommandIsReadToItsOwnDelimiter(t *testing.T) {
+	if got := commandsIn("text(await tools.exec_command({cmd:`ls a b`, workdir:\"/w\"}))"); len(got) != 1 || got[0] != "ls a b" {
+		t.Errorf("a template literal's command ends at its backtick: %q", got)
+	}
+	if got := expandVars(`A=$A/x; echo "$A"`); got != `A=$A/x; echo "$A"` {
+		t.Errorf("a variable whose value uses itself is left as it is: %q", got)
+	}
+	if got := expandVars(`S=/c/x; mkdir -p "$S" ${S}/y $SS`); got != `S=/c/x; mkdir -p "/c/x" /c/x/y $SS` {
+		t.Errorf("a variable's uses are its value, another variable's are not: %q", got)
 	}
 }

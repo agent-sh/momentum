@@ -191,8 +191,8 @@ func (r *runner) recordHolds(ctx context.Context) error {
 	}{
 		{"capacity:hold:look", r.blind, "Capacity deleted nothing: it cannot trust its look at the processes", true},
 		{"capacity:hold:docker", r.dockerErr, "Capacity deleted nothing: Docker could not be asked which containers run", r.dockerAsked},
-		{"capacity:hold:sessions", r.sessionsHeld, "Capacity left every task folder and worktree: the live agent sessions could not all be read",
-			r.sessionsRead},
+		{"capacity:hold:sessions", r.sessionsHeld, "Capacity left task folders and worktrees: the live agent sessions could not all be read",
+			r.sessionsHeld != "" || r.sessionsWhole},
 	} {
 		if !h.checked {
 			continue
@@ -469,8 +469,11 @@ func groupOf(gs map[string]*group, rule, class string) *group {
 func (r *runner) event(kind string, f Finding, key string, actor store.Actor) store.Event {
 	meta := map[string]any{"rule": f.Rule, "path": f.Path, "bytes": f.Bytes}
 	freed := f.Freed
-	if kind == KindOffload {
+	switch {
+	case kind == KindOffload:
 		meta["bytes"], freed = offloadedBytes(f), offloadFreed(f)
+	case kind == KindFailed && f.Rule == RuleScratch:
+		freed = offloadFreed(f) // what its model data's deletion freed is on its own event
 	}
 	if freed > 0 {
 		meta["freed"] = freed
@@ -542,6 +545,9 @@ func summary(kind string, f Finding) string {
 		}
 		return fmt.Sprintf("%s %s: %s, freed %s", ruleText[f.Rule], short(f.Path), size, freed)
 	case KindFailed:
+		if f.Rule == RuleScratch && f.modelOnly {
+			return fmt.Sprintf("could not delete the model data of task folder %s: %s", short(f.Path), f.Err)
+		}
 		if f.Rule == RuleScratch {
 			return fmt.Sprintf("could not offload task folder %s: %s", short(f.Path), f.Err)
 		}

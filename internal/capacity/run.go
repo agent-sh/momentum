@@ -179,16 +179,16 @@ type runner struct {
 	ex    *excluder
 	tools Tools
 
-	sample       *Sample
-	fresh        *Sample // taken just before the deletions
-	named        *Named
-	namedErr     error
-	sessions     map[int]Session // the live agent sessions, read when first needed
-	sessionsErr  error           // why the last look at them was not whole
-	sessionsHeld string          // why a look of this run was not whole: its hold note
-	sessionsRead bool            // whether this run looked at the sessions
-	seen         map[string]store.Seen
-	samplerStart time.Time
+	sample        *Sample
+	fresh         *Sample // taken just before the deletions
+	named         *Named
+	namedErr      error
+	sessions      map[int]Session // the live agent sessions, read when first needed
+	sessionsErr   error           // why the last look at them was not whole
+	sessionsHeld  string          // why a look of this run was not whole: its hold note
+	sessionsWhole bool            // whether a look of this run at the sessions was whole
+	seen          map[string]store.Seen
+	samplerStart  time.Time
 
 	modelRoots    []root          // deepest first
 	modelSet      map[string]bool // canonical

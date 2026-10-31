@@ -127,7 +127,7 @@ var (
 	pathVar    = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:pathlib\.)?Path\(\s*[rR]?["']$`)
 	strVar     = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[rR]?["']$`)
 	strEnd     = regexp.MustCompile(`^[^"'\n]*["']`)
-	commandKey = regexp.MustCompile(`"(?:command|cmd)"\s*:\s*"|[^A-Za-z_"]cmd\s*:\s*"`)
+	commandKey = regexp.MustCompile("\"(?:command|cmd)\"\\s*:\\s*\"|[^A-Za-z_\"]cmd\\s*:\\s*[\"`]")
 )
 
 // callCreates reports whether a call's input creates a folder: a write tool's path in it, a patch's Add File in it,
@@ -187,11 +187,12 @@ func scriptCreates(before, after string, whole bool) bool {
 	return false
 }
 
-// commandsIn are the commands a call's input holds: a shell tool's "command", an exec tool's cmd. The input is the
-// call as the store keeps it, JSON escaped and maybe cut.
+// commandsIn are the commands a call's input holds: a shell tool's "command", an exec tool's cmd in quotes or in a
+// template literal. The input is the call as the store keeps it, JSON escaped and maybe cut.
 func commandsIn(input string) []string {
 	var out []string
 	for _, m := range commandKey.FindAllStringIndex(input, -1) {
+		closing := input[m[1]-1] // the quote or backtick that opened it
 		var b strings.Builder
 		for i := m[1]; i < len(input); i++ {
 			c := input[i]
@@ -201,7 +202,7 @@ func commandsIn(input string) []string {
 				i++
 				continue
 			}
-			if c == '"' {
+			if c == closing {
 				break
 			}
 			b.WriteByte(c)
@@ -256,10 +257,12 @@ func outputOpt(w string) bool {
 // shortOutput are the one-letter options, per program, that name a directory it makes: unzip's -d, wget's -P.
 var shortOutput = map[string]map[string]bool{"unzip": {"-d": true}, "wget": {"-P": true}}
 
-// wrappers run the command that follows them; copies make their last argument.
+// wrappers run the command that follows them, as the shell's keywords come before one; copies make their last
+// argument.
 var (
-	wrappers = map[string]bool{"sudo": true, "env": true, "nice": true, "ionice": true, "timeout": true, "time": true, "command": true, "exec": true, "nohup": true, "setsid": true, "stdbuf": true, "systemd-run": true, "xargs": true}
-	copies   = map[string]bool{"cp": true, "mv": true, "rsync": true, "scp": true}
+	wrappers = map[string]bool{"sudo": true, "env": true, "nice": true, "ionice": true, "timeout": true, "time": true, "command": true, "exec": true, "nohup": true, "setsid": true, "stdbuf": true, "systemd-run": true, "xargs": true,
+		"then": true, "do": true, "else": true, "elif": true, "if": true, "while": true, "until": true, "!": true}
+	copies = map[string]bool{"cp": true, "mv": true, "rsync": true, "scp": true}
 )
 
 // commandCreates reports whether a shell command creates a folder at one of its names. What it counts is a list of
@@ -274,6 +277,7 @@ var (
 //
 // A name inside another (P/x) is the folder only for what makes parents too. mktemp's name is in its output.
 func commandCreates(cmd string, spellings []string) bool {
+	cmd = expandVars(cmd)
 	for _, at := range occurrences(cmd, spellings) {
 		start := 0
 		for _, m := range shellSep.FindAllStringIndex(cmd[:at[0]], -1) {
@@ -343,6 +347,32 @@ func commandCreates(cmd string, spellings []string) bool {
 		}
 	}
 	return false
+}
+
+// shellAssign is a variable a shell command assigns: NAME=value, or export NAME=value.
+var shellAssign = regexp.MustCompile(`(?:^|[\s;&|(])(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|'[^']*'|[^\s;&|)]+)`)
+
+// expandVars puts in a command the values of the variables it assigns where it uses them after: S=P; mkdir "$S" is
+// mkdir "P", and D=$HOME/x; mkdir "$D" is mkdir "$HOME/x". A value that uses its own variable stays as it is.
+func expandVars(cmd string) string {
+	for round := 0; round < 16; round++ {
+		changed := false
+		for _, m := range shellAssign.FindAllStringSubmatchIndex(cmd, -1) {
+			name, val := cmd[m[2]:m[3]], strings.Trim(cmd[m[4]:m[5]], `"'`)
+			if val == "" || strings.Contains(val, "$"+name) || strings.Contains(val, "${"+name+"}") {
+				continue
+			}
+			use := regexp.MustCompile(`\$\{` + name + `\}|\$` + name + `\b`)
+			if rest := cmd[m[1]:]; use.MatchString(rest) {
+				cmd, changed = cmd[:m[1]]+use.ReplaceAllLiteralString(rest, val), true
+				break // its places moved: find the assignments again
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	return cmd
 }
 
 // wholeName reports whether an occurrence of a folder's name is the folder itself, not a path inside it: the name,
