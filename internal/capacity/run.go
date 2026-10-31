@@ -396,10 +396,13 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 				var notes []string
 				rr.Findings, notes, err = r.scratch(ctx, found)
 				rr.Notes = append(rr.Notes, notes...)
-			case RuleUV:
-				rr.Findings, rr.Notes, err = r.uv(ctx, rr.Live && r.mayPrune(rr))
-			case RuleDocker:
-				rr.Findings, rr.Notes, err = r.docker(ctx, rr.Live && r.mayPrune(rr))
+			case RuleUV, RuleDocker: // mayPrune's note comes first
+				prune, notes := r.uv, []string(nil)
+				if rr.Rule == RuleDocker {
+					prune = r.docker
+				}
+				rr.Findings, notes, err = prune(ctx, rr.Live && r.mayPrune(rr))
+				rr.Notes = append(rr.Notes, notes...)
 			}
 			if err != nil {
 				rr.Err = err.Error()
