@@ -3,6 +3,7 @@ package supervise
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -243,36 +244,53 @@ func waitingSession(key string) *sessions.Session {
 		RequestAt: t0, Tasks: []sessions.Task{}, Log: &sessions.Log{}, Transcript: "/sessions/" + key + ".jsonl", Size: 100}
 }
 
-func TestAStalledTurnTakenBackIsLeftToItsOwner(t *testing.T) {
+func TestAStalledTurnWhoseScreenShowsNoTurnTakesTheMessageAsItsNextPrompt(t *testing.T) {
 	st := testStore(t)
-	f := &fakeSender{checkInterrupt: act.ErrIdle} // its screen shows no turn running: its owner's Escape, most likely
+	// Its screen shows no turn running (an Escape takes one back without a record), and its plain check meets a
+	// running row the interrupt check could not be sure of.
+	f := &fakeSender{checkInterrupt: act.ErrIdle, check: act.ErrBusy}
 	now := t0.Add(31 * time.Minute)
-	sv := unread(liveStalled(st, f, &now))
-	s := waitingSession("sess-back")
-	for i := 0; i < 3; i++ {
-		run(t, sv, s)
-		now = now.Add(time.Minute)
-	}
-	// One odd look (a screen caught mid-redraw) does not take the note back: the stop was taken back.
-	f.checkInterrupt = act.ErrNoInput
+	sv := liveStalled(st, f, &now)
+	answered := false
+	sv.Answered = func(*sessions.Session, time.Time) (bool, error) { return answered, nil }
+	s := waitingSession("sess-idle")
 	run(t, sv, s)
-	if n, ok := note(t, st, AskNote+s.Key); !ok || !n.Done.IsZero() {
-		t.Fatalf("an odd look took the needs note back: %+v %v", n, ok)
+	if len(f.sent) != 0 || f.checks != 2 { // the interrupt check, then the plain one
+		t.Fatalf("a busy screen: sent %q checks %d", f.sent, f.checks)
 	}
+	// The screen clears, but the reply came since the scan: the turn went on by itself.
+	f.check, answered = nil, true
 	now = now.Add(time.Minute)
-	f.checkInterrupt = act.ErrIdle
 	run(t, sv, s)
-	acts := events(t, st, KindAct)
-	if len(f.sent) != 0 || len(acts) != 1 || !strings.Contains(metaMap(acts[0])["refused"].(string), "taken back") && !strings.Contains(metaMap(acts[0])["refused"].(string), "turn over") ||
-		len(events(t, st, KindCase)) != 0 {
-		t.Fatalf("sent %q, acts %+v, cases %+v", f.sent, acts, events(t, st, KindCase))
+	if len(f.sent) != 0 {
+		t.Fatalf("typed after the reply: %q", f.sent)
 	}
-	if n, ok := note(t, st, AskNote+s.Key); !ok || !strings.HasPrefix(n.Title, "Resume it?") || !n.Done.IsZero() {
-		t.Fatalf("needs note %+v %v", n, ok)
+	// No reply: the message goes in the plain way, as the next prompt.
+	answered = false
+	now = now.Add(time.Minute)
+	run(t, sv, s)
+	if len(f.sent) != 1 || f.sent[0] != "%4 "+StalledText {
+		t.Fatalf("sent %q", f.sent)
+	}
+	var sentAct map[string]any
+	for _, e := range events(t, st, KindAct) {
+		if m := metaMap(e); m["sent"] == true {
+			sentAct = m
+		}
+	}
+	if sentAct == nil || sentAct["interrupt"] != nil || sentAct["request_at"] != float64(t0.UnixMilli()) || len(events(t, st, KindCase)) != 0 {
+		t.Fatalf("its event %+v, cases %+v", sentAct, events(t, st, KindCase))
+	}
+	if n, ok := note(t, st, AskNote+s.Key); ok {
+		t.Fatalf("a needs note: %+v", n)
+	}
+	if n, ok := note(t, st, fmt.Sprintf("%s%s@%d", ResumedNote, s.Key, t0.UnixMilli())); !ok || n.Kind != store.NoteDecided ||
+		!strings.Contains(n.Title, "as its next prompt") {
+		t.Fatalf("decided note %+v %v", n, ok)
 	}
 }
 
-func TestADryStalledTurnGetsANeedsNote(t *testing.T) {
+func TestADryStalledTurnRecordsWhatItWouldHaveSent(t *testing.T) {
 	st := testStore(t)
 	f := &fakeSender{}
 	now := t0.Add(31 * time.Minute)
@@ -280,18 +298,57 @@ func TestADryStalledTurnGetsANeedsNote(t *testing.T) {
 	sv.Sleep = func(context.Context) (time.Time, time.Time) { return time.Time{}, time.Time{} }
 	s := waitingSession("sess-dry")
 	run(t, sv, s)
-	if len(f.sent) != 0 || f.checks != 0 {
-		t.Fatalf("sent %q checks %d", f.sent, f.checks)
+	acts := events(t, st, KindAct)
+	if len(f.sent) != 0 || f.checks != 0 || len(acts) != 1 || acts[0].Experiment != Dry {
+		t.Fatalf("sent %q checks %d acts %+v", f.sent, f.checks, acts)
 	}
-	if n, ok := note(t, st, AskNote+s.Key); !ok || !strings.HasPrefix(n.Title, "Resume it?") {
+	if ns, _ := sv.Store.Notes(context.Background()); len(ns) != 0 {
+		t.Fatalf("notes %+v", ns)
+	}
+}
+
+func TestAStalledTurnNoPathReachesGetsANeedsNoteForItsRequest(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{checkInterrupt: act.ErrNoPath} // no terminal or queue reaches it
+	now := t0.Add(31 * time.Minute)
+	sv := unread(liveStalled(st, f, &now))
+	s := waitingSession("sess-nowhere")
+	run(t, sv, s)
+	n, ok := note(t, st, AskNote+s.Key)
+	if !ok || !n.Done.IsZero() || !strings.HasPrefix(n.Title, "momentum could not resume ") || strings.Contains(n.Title, "?") || !n.At.Equal(t0) {
 		t.Fatalf("needs note %+v %v", n, ok)
 	}
-	// Its owner comes by (a local command): the rule holds, and the note stands, decided from the stop.
+	if _, ok := note(t, st, ProblemNote+s.Key); ok || len(events(t, st, KindCase)) != 0 || len(f.sent) != 0 {
+		t.Fatalf("a case for it: %+v, sent %q", events(t, st, KindCase), f.sent)
+	}
+	// Its owner comes by (a local command): the rule holds, and the note stands, kept by the mark for the request.
 	s.ControlAt = now
 	now = now.Add(time.Minute)
 	run(t, sv, s)
-	if n, _ := note(t, st, AskNote+s.Key); !n.Done.IsZero() {
-		t.Fatalf("a hold took the note back: %+v", n)
+	// Past its stale hour, nothing tries it, and the note stands.
+	now = t0.Add(30*time.Minute + DefaultParams.Stale + 2*time.Minute)
+	run(t, sv, s)
+	if n, _ := note(t, st, AskNote+s.Key); !n.Done.IsZero() || len(events(t, st, KindSkip)) != 2 {
+		t.Fatalf("the note %+v, skips %+v", n, events(t, st, KindSkip))
+	}
+	// Claude Code retries the request by itself: the wait starts again, and the note about the first goes.
+	s.RequestAt = now.Add(-time.Minute)
+	run(t, sv, s)
+	if n, _ := note(t, st, AskNote+s.Key); n.Done.IsZero() {
+		t.Fatalf("the note outlived its request: %+v", n)
+	}
+	// Before the retry has waited as long, no note about it: what the check found was about the first request.
+	retry := s.RequestAt
+	now = retry.Add(20 * time.Minute)
+	run(t, sv, s)
+	if n, _ := note(t, st, AskNote+s.Key); n.Done.IsZero() {
+		t.Fatalf("a note before the retry waited: %+v", n)
+	}
+	// The retry waits as long, and no path reaches it either: its own note.
+	now = retry.Add(30 * time.Minute)
+	run(t, sv, s)
+	if n, ok := note(t, st, AskNote+s.Key); !ok || !n.Done.IsZero() || !n.At.Equal(retry) {
+		t.Fatalf("the retry's note %+v %v", n, ok)
 	}
 	// Its reply comes: the note is done.
 	s.TurnOpen, s.RequestAt, s.Phase, s.Since, s.LastText = false, time.Time{}, sessions.Idle, now, "Done."
@@ -299,42 +356,6 @@ func TestADryStalledTurnGetsANeedsNote(t *testing.T) {
 	run(t, sv, s)
 	if n, _ := note(t, st, AskNote+s.Key); n.Done.IsZero() {
 		t.Fatalf("still stands: %+v", n)
-	}
-}
-
-func TestAStallsNeedsNoteGoesWithItsRequest(t *testing.T) {
-	for _, live := range []bool{false, true} {
-		st := testStore(t)
-		f := &fakeSender{checkInterrupt: act.ErrIdle} // live: its screen shows the turn taken back
-		now := t0.Add(31 * time.Minute)
-		sv := unread(liveStalled(st, f, &now))
-		if !live {
-			sv.Live = nil
-		}
-		s := waitingSession("sess-retried")
-		run(t, sv, s)
-		if n, ok := note(t, st, AskNote+s.Key); !ok || !n.Done.IsZero() {
-			t.Fatalf("live %v: needs note %+v %v", live, n, ok)
-		}
-		// Claude Code retries the request by itself: the wait starts again, and the note about the first goes.
-		s.RequestAt, now = t0.Add(40*time.Minute), t0.Add(41*time.Minute)
-		run(t, sv, s)
-		if n, _ := note(t, st, AskNote+s.Key); n.Done.IsZero() {
-			t.Fatalf("live %v: the note outlived its request: %+v", live, n)
-		}
-		// Before the retry has waited as long, no note about it: what the screen or the dry rule showed was about
-		// the first request.
-		now = t0.Add(56 * time.Minute)
-		run(t, sv, s)
-		if n, _ := note(t, st, AskNote+s.Key); n.Done.IsZero() {
-			t.Fatalf("live %v: a note before the retry waited: %+v", live, n)
-		}
-		// The retry waits as long: its own note.
-		now = t0.Add(71 * time.Minute)
-		run(t, sv, s)
-		if n, ok := note(t, st, AskNote+s.Key); !ok || !n.Done.IsZero() || !strings.Contains(n.Title, t0.Add(40*time.Minute).Local().Format("15:04")) {
-			t.Fatalf("live %v: the retry's note %+v %v", live, n, ok)
-		}
 	}
 }
 
@@ -372,6 +393,13 @@ func TestARequestAnsweredAfterTheScanIsLeftAlone(t *testing.T) {
 	}
 }
 
+// ended is a sender for a turn that ends between the check and the paste: Interrupt types nothing.
+type ended struct{ fakeSender }
+
+func (f *ended) Interrupt(context.Context, act.Target, string, func() error) (act.Path, error) {
+	return act.Tmux, act.ErrIdle
+}
+
 func TestAnInterruptThatDoesNotShowInTheTranscriptOpensACase(t *testing.T) {
 	st := testStore(t)
 	f := &fakeSender{}
@@ -398,13 +426,14 @@ func TestAnInterruptThatDoesNotShowInTheTranscriptOpensACase(t *testing.T) {
 	if len(acts) != 1 || metaMap(acts[0])["unstable"] != true {
 		t.Fatalf("acts %+v", acts)
 	}
-	// A refusal before anything was typed (the turn ended on its own meanwhile) passes by itself.
+	// A refusal before anything was typed (the turn ended on its own between the check and the paste) passes by
+	// itself.
 	st = testStore(t)
-	f = &fakeSender{checkInterrupt: act.ErrIdle}
-	sv = unread(liveStalled(st, f, &now))
+	e := &ended{}
+	sv = unread(liveStalled(st, e, &now))
 	run(t, sv, s)
-	if len(events(t, st, KindCase)) != 0 || len(f.sent) != 0 {
-		t.Fatalf("cases %+v sent %q", events(t, st, KindCase), f.sent)
+	if len(events(t, st, KindCase)) != 0 || len(e.sent) != 0 || len(events(t, st, KindAct)) != 1 {
+		t.Fatalf("cases %+v sent %q acts %+v", events(t, st, KindCase), e.sent, events(t, st, KindAct))
 	}
 	// A session whose place in its transcript the scan does not know: nothing could tell that the message went in.
 	st = testStore(t)
@@ -418,7 +447,7 @@ func TestAnInterruptThatDoesNotShowInTheTranscriptOpensACase(t *testing.T) {
 	}
 }
 
-func TestAStalledTurnPastItsStaleHourGetsANeedsNote(t *testing.T) {
+func TestAStalledTurnPastItsStaleHourIsLeftAlone(t *testing.T) {
 	st := testStore(t)
 	f := &fakeSender{}
 	now := t0.Add(30*time.Minute + DefaultParams.Stale + time.Minute) // its time came over an hour ago: nothing watched then
@@ -428,8 +457,8 @@ func TestAStalledTurnPastItsStaleHourGetsANeedsNote(t *testing.T) {
 	if len(f.sent) != 0 || f.checks != 0 {
 		t.Fatalf("sent %q checks %d", f.sent, f.checks)
 	}
-	if n, ok := note(t, st, AskNote+s.Key); !ok || !strings.HasPrefix(n.Title, "Resume it?") {
-		t.Fatalf("needs note %+v %v", n, ok)
+	if n, ok := note(t, st, AskNote+s.Key); ok {
+		t.Fatalf("a needs note: %+v", n)
 	}
 }
 

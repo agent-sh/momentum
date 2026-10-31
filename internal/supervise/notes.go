@@ -13,10 +13,12 @@ import (
 )
 
 // The ids of supervision's notes, by the session's key: its problem when it gives up on a session
-// (store.SessionProblem), and the question a session waits on its owner for.
+// (store.SessionProblem), what a session waits on its owner for, and a stalled turn it resumed (the key, then
+// @ and the request's time in ms).
 const (
 	ProblemNote = "supervise:"
 	AskNote     = "supervise-ask:"
+	ResumedNote = "supervise-resumed:"
 )
 
 // seenSession is what a run made of one session, for its notes. A nil one is a session the run left alone.
@@ -37,23 +39,28 @@ type ask struct {
 
 // waitsOnOwner is what a session waits on that only its owner can answer, if it does: a question, a plan or a
 // permission it asks him; a login or an organization block no sign of access has ended yet; an error no rule
-// tries again, or one whose stop is too old for its rule; or a turn over and idle on words that ask him
-// something. d is what the rules decided: a rule that still acts takes care of the session. An automated run is
-// no one's to answer, and a Hermes conversation on a messaging platform asked him there already.
-func waitsOnOwner(s *sessions.Session, stop Stop, d Decision, presence time.Time, p Params, stalledLeft bool) (ask, bool) {
+// tries again, or one whose stop is too old for its rule; a stalled turn no path reaches (noPath), which only he
+// can type into; or a turn over and idle on words that ask him something. d is what the rules decided: a rule
+// that still acts takes care of the session. An automated run is no one's to answer, and a Hermes conversation on
+// a messaging platform asked him there already.
+func waitsOnOwner(s *sessions.Session, stop Stop, d Decision, presence time.Time, p Params, noPath bool) (ask, bool) {
 	if s.Auto || stop.At.IsZero() || s.Tool == "hermes" && s.Where != "cli" && s.Where != "tui" {
 		return ask{}, false
 	}
 	var title string
 	wait, since := p.OwnerWindow, stop.At
+	detail := ""
 	switch {
 	case stop.Ask == sessions.AskQuestion, stop.Ask == sessions.AskPermission:
 		title = s.Ask
 	case stop.Ask == sessions.AskPlan:
 		title = "Approve the plan? " + s.Ask
-	case stalledLeft: // an ask per request: Claude Code's own retry starts the wait again
-		title = "Resume it? Its request to the model from " + stop.RequestAt.Local().Format("Jan 2 15:04") + " never got a reply"
+	case noPath: // one per request: Claude Code's own retry starts the wait again
+		// what momentum could not do, not a question: a message typed into the session resumes it
 		since = stop.RequestAt
+		title = "momentum could not resume " + sessionName(s) + ": no terminal it can type into reaches the session"
+		detail = fmt.Sprintf("%s (%s) has waited since %s on a request to the model that never got a reply. A message typed into it resumes it.",
+			sessionName(s), s.Tool, since.Local().Format("Jan 2 15:04"))
 	case s.TurnOpen:
 		return ask{}, false
 	case d.Rule == RuleAccess && d.Verdict == Wait && d.At.IsZero():
@@ -83,9 +90,34 @@ func waitsOnOwner(s *sessions.Session, stop Stop, d Decision, presence time.Time
 	if presence.After(due) {
 		due = presence
 	}
-	return ask{title: title, since: since, due: due.Add(wait),
-		detail: fmt.Sprintf("%s (%s) has waited for you since %s. momentum does not answer for you.", sessionName(s), s.Tool,
-			since.Local().Format("Jan 2 15:04"))}, true
+	if detail == "" {
+		detail = fmt.Sprintf("%s (%s) has waited for you since %s. momentum does not answer for you.", sessionName(s), s.Tool,
+			since.Local().Format("Jan 2 15:04"))
+	}
+	return ask{title: title, since: since, due: due.Add(wait), detail: detail}, true
+}
+
+// resumed is the decided note of a stalled turn the rule resumed: what it typed, how, and into which session,
+// and how to have the rule leave stalled turns alone. One per session and request.
+func resumed(s *sessions.Session, stop Stop, interrupt bool, now time.Time) store.Note {
+	title, how := "typed a resume message as its next prompt", "Its screen showed no turn running, so momentum typed a resume "+
+		"message as the next prompt."
+	if interrupt {
+		title, how = "queued a resume message, then pressed Escape", "momentum queued a resume message while the turn ran on its "+
+			"screen, then pressed Escape, which ended the turn and sent the message as the next prompt."
+	}
+	where := s.Tool
+	if s.Where != "" {
+		where += ", " + s.Where
+	}
+	if s.Cwd != "" {
+		where += ", in " + s.Cwd
+	}
+	detail := fmt.Sprintf("%s (%s) waited since %s on a request to the model that never got a reply. %s "+
+		"To have momentum leave stalled turns alone, list the live rules without stalled in supervise.live in sources.json.",
+		sessionName(s), where, stop.RequestAt.Local().Format("Jan 2 15:04"), how)
+	return store.Note{ID: fmt.Sprintf("%s%s@%d", ResumedNote, s.Key, stop.RequestAt.UnixMilli()), Kind: store.NoteDecided,
+		Title: "Resumed " + sessionName(s) + ": " + title, Detail: detail, Source: store.DefaultNoteSource, At: now}
 }
 
 // notes keeps supervision's notes in step with what the run saw. A session that has waited on its owner past the

@@ -122,8 +122,8 @@ var DefaultParams = Params{
 
 // Live are the rules that act by default; the others run dry, recording what they would have sent. A rule is live
 // when its replay acts unasked no more often than the owner's own nudges go to a session that would have gone on
-// by itself (SPEC.md, Supervision).
-var Live = map[string]bool{RuleTransient: true, RuleAccess: true}
+// by itself, or when the owner made it live over its replay, as he did stalled (SPEC.md, Supervision).
+var Live = map[string]bool{RuleTransient: true, RuleAccess: true, RuleStalled: true}
 
 // Decision is what supervision does about one session now.
 type Decision struct {
@@ -320,8 +320,9 @@ const StalledText = Marker + " Your last request to the model got no reply. Cont
 // stalled: a Claude Code turn waits on a model request that never got its reply: the last record of its
 // conversation is the request, and no tool call is in flight. Background work does not answer the model: its
 // notification waits in the queue behind the turn. Past the longest a reply legitimately takes to begin, counted
-// from the request or from the machine waking after it, the message goes in as the next prompt, and Escape ends
-// the turn that waits (act's Interrupt). A message its user queued waits for him. With its tries used up, a case
+// from the request or from the machine waking after it, the message goes in as the next prompt: queued, with
+// Escape to end the turn that waits, while the turn runs on its screen (act's Interrupt), or typed the plain way
+// when the screen shows no turn running. A message its user queued waits for him. With its tries used up, a case
 // opens once the last message's own request has waited as long.
 func stalled(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
 	if s.Tool != "claude" || s.RequestAt.IsZero() || !s.Working || s.Busy || s.Queued > 0 ||

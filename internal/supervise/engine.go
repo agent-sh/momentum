@@ -60,17 +60,11 @@ type Sender interface {
 	Interrupt(ctx context.Context, t act.Target, text string, still func() error) (act.Path, error)
 }
 
-// errTakenBack is the stalled rule's refusal when the screen shows no turn running while the transcript still
-// waits on the request: the turn was taken back (its owner's Escape takes one back without a record), and the
-// message would resume work its owner stopped. It passes when the session moves on.
-var errTakenBack = errors.New("its screen shows the turn over while its transcript still waits on the request")
-
 // errAnswered is a stalled request that something answered since the scan: the turn went on by itself.
 var errAnswered = errors.New("its transcript shows the request answered since the scan")
 
-// takenBack is the key suffix of the mark that a stalled turn's screen showed it taken back, while it waited on
-// its request.
-func takenBack(stop Stop) string { return fmt.Sprintf("#taken-back@%d", stop.RequestAt.UnixMilli()) }
+// noPath is the key suffix of the mark that no path reaches a stalled turn, while it waits on its request.
+func noPath(stop Stop) string { return fmt.Sprintf("#no-path@%d", stop.RequestAt.UnixMilli()) }
 
 // errNoPlace is a stalled session whose transcript place the scan does not know: nothing could tell that the
 // message went in.
@@ -107,7 +101,7 @@ type Line struct {
 	Session, Name, Rule, Verdict, Text, Why string
 	Sent                                    bool
 	Err                                     string
-	takenBack                               bool // the stalled turn's screen shows it taken back
+	noPath                                  bool // no path reaches the stalled turn
 }
 
 func (sv *Supervisor) now() time.Time {
@@ -249,16 +243,11 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 				return lines, err
 			}
 		}
-		// A stalled turn the rule leaves to its owner waits on him: only he can tell whether to resume it. It is
-		// decided from the stop and the request it waits on, not from one run's look: the rule runs dry and its time
-		// came (its dry act is on record, for this request), its screen showed the turn taken back (a mark on
-		// record, for this request), or it is past its stale hour. Claude Code's own retry starts the wait again.
-		if d.Rule == RuleStalled {
-			k := sv.event(s, stop, d, KindAct, now, "").SourceKey
-			dry := !sv.Live[d.Rule] && (d.Verdict == Act || h.keys[k] && h.dryRequest[k] == stop.RequestAt.UnixMilli())
-			if dry || line.takenBack || h.keys[k+takenBack(stop)] || d.Stale {
-				entry.ask, entry.asks = waitsOnOwner(s, stop, d, presence, sv.Params, true)
-			}
+		// A stalled turn no path reaches waits on its owner: momentum could not type into it. It is decided from the
+		// stop and the request it waits on, not from one run's look: the mark on record for the request keeps it
+		// while the rule holds, and past its stale hour. Claude Code's own retry starts the wait again.
+		if d.Rule == RuleStalled && (line.noPath || h.keys[sv.event(s, stop, d, KindAct, now, noPath(stop)).SourceKey]) {
+			entry.ask, entry.asks = waitsOnOwner(s, stop, d, presence, sv.Params, true)
 		}
 		lines = append(lines, line)
 	}
@@ -291,18 +280,26 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 	if d.Rule == RuleOverdue {
 		m["wake_key"] = stop.WakeKey // one resync per wakeup or run
 	}
-	// A stalled turn takes the message through its queue while it runs on its screen, and Escape ends it. One its
-	// screen shows taken back is left alone: the message would resume work its owner stopped.
-	interrupt := d.Rule == RuleStalled
+	// A stalled turn takes the message through its queue while it runs on its screen, and Escape ends it. A screen
+	// that shows no turn running while the transcript still waits on the request (an Escape takes a turn back
+	// without a record) takes it the plain way, as the next prompt, once the transcript still shows no reply.
+	stalled := d.Rule == RuleStalled
+	interrupt := stalled
+	if stalled {
+		m["request_at"] = stop.RequestAt.UnixMilli()
+	}
 	path, err := act.Path(""), act.CheckText(d.Text)
 	switch {
 	case err != nil:
-	case interrupt && (s.Transcript == "" || s.Size < 0):
+	case stalled && (s.Transcript == "" || s.Size < 0):
 		err = errNoPlace // the transcript tells whether the message went in, read from where the scan stopped
-	case interrupt:
+	case stalled:
 		path, err = sv.Sender.CheckInterrupt(ctx, t)
 		if errors.Is(err, act.ErrIdle) {
-			err, line.takenBack = errTakenBack, true
+			interrupt = false
+			if path, err = sv.Sender.Check(ctx, t); err == nil {
+				err = sv.unanswered(s, stop.RequestAt)
+			}
 		}
 	default:
 		path, err = sv.Sender.Check(ctx, t)
@@ -318,11 +315,13 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 		line.Err = "its owner cleared the input line since the last check"
 		return sv.put(ctx, []store.Event{sv.present(s, stop, "cleared")})
 	}
-	if line.takenBack && !h.keys[sv.event(s, stop, d, KindAct, sv.now(), takenBack(stop)).SourceKey] {
-		mark := sv.event(s, stop, d, KindAct, sv.now(), takenBack(stop))
+	line.noPath = stalled && errors.Is(err, act.ErrNoPath)
+	if line.noPath && !h.keys[sv.event(s, stop, d, KindAct, sv.now(), noPath(stop)).SourceKey] {
+		mark := sv.event(s, stop, d, KindAct, sv.now(), noPath(stop))
 		mark.Kind, mark.Actor = KindSkip, store.ActorDetector
-		mark.Summary = oneLine(d.Rule + ": " + errTakenBack.Error())
-		mark.Meta = meta(map[string]any{"rule": d.Rule, "try": d.Try, "why": errTakenBack.Error(), "stop_at": stop.At.UnixMilli()})
+		mark.Summary = oneLine(d.Rule + ": " + err.Error())
+		mark.Meta = meta(map[string]any{"rule": d.Rule, "try": d.Try, "why": err.Error(), "stop_at": stop.At.UnixMilli(),
+			"request_at": stop.RequestAt.UnixMilli()})
 		evs = append(evs, mark)
 	}
 	if err != nil {
@@ -368,6 +367,11 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 	} else {
 		m["sent"], line.Sent = true, true
 		e.Summary = oneLine(fmt.Sprintf("%s: sent %q (try %d) by %s", d.Rule, d.Text, d.Try, path))
+		if stalled { // what it did, for its owner to read and undo: a decided note
+			if _, err := sv.Store.PutNote(ctx, resumed(s, stop, interrupt, sv.now())); err != nil {
+				m["note"] = err.Error()
+			}
+		}
 	}
 	e.Meta = meta(m)
 	return sv.put(ctx, append([]store.Event{e}, evs...))
@@ -375,9 +379,12 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 
 // cannot is the case a refusal opens, if it is one that will not pass by itself: a paste that may sit on the input
 // line, a session nothing can type into, a harness whose input line act does not know, or a message act will not
-// type. A dialog, a draft or a busy turn passes, and the next run checks again.
+// type. A dialog, a draft or a busy turn passes, and the next run checks again. A stalled turn no path reaches
+// opens none: its needs note says what momentum could not do (Run).
 func (sv *Supervisor) cannot(ctx context.Context, s *sessions.Session, stop Stop, d Decision, err error) []store.Event {
 	switch {
+	case d.Rule == RuleStalled && errors.Is(err, act.ErrNoPath):
+		return nil
 	case errors.Is(err, act.ErrUnstable):
 		return []store.Event{sv.openCase(ctx, s, stop, d.Rule, "pasted, not known to be submitted: "+err.Error(), d.Try, sv.now())}
 	case errors.Is(err, act.ErrNoPath), errors.Is(err, act.ErrNoInput) && s.Tool != "claude" && s.Tool != "codex":
@@ -479,8 +486,6 @@ type past struct {
 	escapes   []time.Time     // the interruptions momentum's own Escapes left in the transcript
 	wakes     map[string]bool // the wakeups and runs (their keys) a resync was typed for
 	dryWakes  map[string]bool // the wakeups and runs the overdue rule, dry, recorded a resync for
-	// dryRequest is, by key, the request each dry act of a stalled turn was about (ms), as its last run put it
-	dryRequest map[string]int64
 }
 
 type caseRec struct {
@@ -490,7 +495,7 @@ type caseRec struct {
 }
 
 func history(evs []store.Event) past {
-	h := past{keys: map[string]bool{}, atPane: map[int64]bool{}, dryRequest: map[string]int64{}, wakes: map[string]bool{}, dryWakes: map[string]bool{}}
+	h := past{keys: map[string]bool{}, atPane: map[int64]bool{}, wakes: map[string]bool{}, dryWakes: map[string]bool{}}
 	outcomes := map[string]map[string]bool{}
 	for _, e := range evs {
 		h.keys[e.SourceKey] = true
@@ -499,7 +504,6 @@ func history(evs []store.Event) past {
 		switch e.Kind {
 		case KindAct:
 			if e.Experiment != "" {
-				h.dryRequest[e.SourceKey] = int64(num(m["request_at"]))
 				if k := str(m["wake_key"]); k != "" {
 					h.dryWakes[k] = true
 				}
