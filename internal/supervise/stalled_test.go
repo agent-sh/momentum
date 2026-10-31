@@ -253,7 +253,11 @@ func TestAStalledTurnWhoseScreenShowsNoTurnTakesTheMessageAsItsNextPrompt(t *tes
 	sv := liveStalled(st, f, &now)
 	answered := false
 	sv.Answered = func(*sessions.Session, time.Time) (bool, error) { return answered, nil }
+	sv.Prompted = func(context.Context, *sessions.Session, string) (bool, time.Time, error) {
+		return true, time.Time{}, nil
+	}
 	s := waitingSession("sess-idle")
+	s.Since = t0.Add(-5 * time.Minute) // the turn began before its request: the notes go by the request
 	run(t, sv, s)
 	if len(f.sent) != 0 || f.checks != 2 { // the interrupt check, then the plain one
 		t.Fatalf("a busy screen: sent %q checks %d", f.sent, f.checks)
@@ -265,9 +269,19 @@ func TestAStalledTurnWhoseScreenShowsNoTurnTakesTheMessageAsItsNextPrompt(t *tes
 	if len(f.sent) != 0 {
 		t.Fatalf("typed after the reply: %q", f.sent)
 	}
-	// No reply: the message goes in the plain way, as the next prompt.
+	// No reply, and the first look at the idle screen: its owner may have just taken the turn back, so the rule
+	// holds for the owner window from this look.
 	answered = false
 	now = now.Add(time.Minute)
+	idleAt := now
+	run(t, sv, s)
+	now = idleAt.Add(DefaultParams.OwnerWindow - time.Minute)
+	run(t, sv, s)
+	if len(f.sent) != 0 || len(events(t, st, KindHold)) != 2 {
+		t.Fatalf("within the window of its first idle look: sent %q holds %+v", f.sent, events(t, st, KindHold))
+	}
+	// Past it: the message goes in the plain way, as the next prompt.
+	now = idleAt.Add(DefaultParams.OwnerWindow + time.Second)
 	run(t, sv, s)
 	if len(f.sent) != 1 || f.sent[0] != "%4 "+StalledText {
 		t.Fatalf("sent %q", f.sent)
@@ -285,8 +299,20 @@ func TestAStalledTurnWhoseScreenShowsNoTurnTakesTheMessageAsItsNextPrompt(t *tes
 		t.Fatalf("a needs note: %+v", n)
 	}
 	if n, ok := note(t, st, fmt.Sprintf("%s%s@%d", ResumedNote, s.Key, t0.UnixMilli())); !ok || n.Kind != store.NoteDecided ||
-		!strings.Contains(n.Title, "as its next prompt") {
+		!strings.Contains(n.Title, "as its next prompt") || !strings.Contains(n.Detail, StalledText) {
 		t.Fatalf("decided note %+v %v", n, ok)
+	}
+	// A plain send whose paste may sit on the input line opens a case, and says nothing was resumed.
+	st = testStore(t)
+	f = &fakeSender{checkInterrupt: act.ErrIdle, send: act.ErrUnstable}
+	sv = liveStalled(st, f, &now)
+	sv.Answered = func(*sessions.Session, time.Time) (bool, error) { return false, nil }
+	idleAt = now
+	run(t, sv, s)
+	now = idleAt.Add(DefaultParams.OwnerWindow + time.Second)
+	run(t, sv, s)
+	if ns, _ := st.Notes(context.Background()); len(events(t, st, KindCase)) != 1 || len(ns) != 1 || ns[0].Kind != store.NoteProblem {
+		t.Fatalf("cases %+v notes %+v", events(t, st, KindCase), ns)
 	}
 }
 
@@ -321,6 +347,9 @@ func TestAStalledTurnNoPathReachesGetsANeedsNoteForItsRequest(t *testing.T) {
 	if _, ok := note(t, st, ProblemNote+s.Key); ok || len(events(t, st, KindCase)) != 0 || len(f.sent) != 0 {
 		t.Fatalf("a case for it: %+v, sent %q", events(t, st, KindCase), f.sent)
 	}
+	if acts := events(t, st, KindAct); len(acts) != 1 || metaMap(acts[0])["no_path"] != true || !strings.HasSuffix(n.Title, act.ErrNoPath.Error()) {
+		t.Fatalf("its refusal %+v, title %q", acts, n.Title)
+	}
 	// Its owner comes by (a local command): the rule holds, and the note stands, kept by the mark for the request.
 	s.ControlAt = now
 	now = now.Add(time.Minute)
@@ -328,7 +357,7 @@ func TestAStalledTurnNoPathReachesGetsANeedsNoteForItsRequest(t *testing.T) {
 	// Past its stale hour, nothing tries it, and the note stands.
 	now = t0.Add(30*time.Minute + DefaultParams.Stale + 2*time.Minute)
 	run(t, sv, s)
-	if n, _ := note(t, st, AskNote+s.Key); !n.Done.IsZero() || len(events(t, st, KindSkip)) != 2 {
+	if n, _ := note(t, st, AskNote+s.Key); !n.Done.IsZero() || len(events(t, st, KindSkip)) != 1 {
 		t.Fatalf("the note %+v, skips %+v", n, events(t, st, KindSkip))
 	}
 	// Claude Code retries the request by itself: the wait starts again, and the note about the first goes.
@@ -356,6 +385,99 @@ func TestAStalledTurnNoPathReachesGetsANeedsNoteForItsRequest(t *testing.T) {
 	run(t, sv, s)
 	if n, _ := note(t, st, AskNote+s.Key); n.Done.IsZero() {
 		t.Fatalf("still stands: %+v", n)
+	}
+	// A path that comes after one look found none (a pane the listing missed): the run that sends takes the note
+	// back with it.
+	st = testStore(t)
+	f = &fakeSender{checkInterrupt: act.ErrNoPath}
+	now = t0.Add(31 * time.Minute)
+	sv = unread(liveStalled(st, f, &now))
+	sv.Prompted = func(context.Context, *sessions.Session, string) (bool, time.Time, error) {
+		return true, time.Time{}, nil
+	}
+	s = waitingSession("sess-found")
+	run(t, sv, s)
+	f.checkInterrupt = nil
+	now = now.Add(time.Minute)
+	run(t, sv, s)
+	if n, ok := note(t, st, AskNote+s.Key); len(f.sent) != 1 || !ok || n.Done.IsZero() {
+		t.Fatalf("sent %q, note %+v %v", f.sent, n, ok)
+	}
+}
+
+func TestAStalledTurnItsLooksKeepRefusingGetsANeedsNoteAtItsStaleHour(t *testing.T) {
+	st := testStore(t)
+	// A dialog on its screen first, then a screen neither check reads plainly: no turn running by the interrupt
+	// check, a running row by the plain one, as on a pane too narrow for the row's time.
+	f := &fakeSender{checkInterrupt: act.ErrDialog}
+	now := t0.Add(31 * time.Minute)
+	sv := unread(liveStalled(st, f, &now))
+	s := waitingSession("sess-unsure")
+	run(t, sv, s)
+	f.checkInterrupt, f.check = act.ErrIdle, act.ErrBusy
+	for now.Before(t0.Add(85 * time.Minute)) {
+		now = now.Add(time.Minute)
+		run(t, sv, s)
+	}
+	s.ControlAt = now // its owner comes by just before its hour runs out
+	for now.Before(t0.Add(30*time.Minute + DefaultParams.Stale + 2*time.Minute)) {
+		now = now.Add(time.Minute)
+		run(t, sv, s)
+	}
+	if n, ok := note(t, st, AskNote+s.Key); ok || len(f.sent) != 0 || len(events(t, st, KindCase)) != 0 {
+		t.Fatalf("before the owner window since he came by: note %+v, sent %q, cases %+v", n, f.sent, events(t, st, KindCase))
+	}
+	// Its hour ran out and he has been gone the owner window: momentum stopped looking, and says what it could not
+	// do and why, by the last look.
+	now = s.ControlAt.Add(DefaultParams.OwnerWindow + time.Minute)
+	run(t, sv, s)
+	n, ok := note(t, st, AskNote+s.Key)
+	if !ok || !n.Done.IsZero() || n.Title != "momentum could not resume sess-unsure: "+errUnsure.Error() || !n.At.Equal(t0) {
+		t.Fatalf("needs note %+v %v", n, ok)
+	}
+	// A look its owner let through before then ends the refusals: no note.
+	st = testStore(t)
+	f = &fakeSender{checkInterrupt: act.ErrDialog}
+	now = t0.Add(31 * time.Minute)
+	sv = unread(liveStalled(st, f, &now))
+	sv.Prompted = func(context.Context, *sessions.Session, string) (bool, time.Time, error) {
+		return true, time.Time{}, nil
+	}
+	s = waitingSession("sess-let-through")
+	run(t, sv, s)
+	f.checkInterrupt = nil
+	now = now.Add(time.Minute)
+	run(t, sv, s)
+	if len(f.sent) != 1 {
+		t.Fatalf("after the dialog: sent %q", f.sent)
+	}
+	s.RequestAt = now // the message's own request
+	now = t0.Add(30*time.Minute + DefaultParams.Stale + 2*time.Minute)
+	run(t, sv, s)
+	if n, ok := note(t, st, AskNote+s.Key); ok {
+		t.Fatalf("a note after a look went through: %+v", n)
+	}
+}
+
+func TestADraftThatStaysOnAStalledTurnEndsInANeedsNote(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{checkInterrupt: act.ErrDraft}
+	now := t0.Add(31 * time.Minute)
+	sv := unread(liveStalled(st, f, &now))
+	s := waitingSession("sess-draft-stays")
+	for now.Before(t0.Add(30*time.Minute + DefaultParams.Stale)) { // its owner is at the pane: the rule holds
+		run(t, sv, s)
+		now = now.Add(time.Minute)
+	}
+	if n, ok := note(t, st, AskNote+s.Key); ok || len(f.sent) != 0 {
+		t.Fatalf("while it holds: note %+v, sent %q", n, f.sent)
+	}
+	for i := 0; i < 20; i++ { // past its stale hour, once the owner window passed since the last sighting
+		run(t, sv, s)
+		now = now.Add(time.Minute)
+	}
+	if n, ok := note(t, st, AskNote+s.Key); !ok || !strings.HasSuffix(n.Title, act.ErrDraft.Error()) || len(f.sent) != 0 {
+		t.Fatalf("needs note %+v %v, sent %q", n, ok, f.sent)
 	}
 }
 
@@ -426,14 +548,17 @@ func TestAnInterruptThatDoesNotShowInTheTranscriptOpensACase(t *testing.T) {
 	if len(acts) != 1 || metaMap(acts[0])["unstable"] != true {
 		t.Fatalf("acts %+v", acts)
 	}
+	if ns, _ := st.Notes(context.Background()); len(ns) != 1 || ns[0].Kind != store.NoteProblem {
+		t.Fatalf("notes %+v: nothing went in", ns)
+	}
 	// A refusal before anything was typed (the turn ended on its own between the check and the paste) passes by
 	// itself.
 	st = testStore(t)
 	e := &ended{}
 	sv = unread(liveStalled(st, e, &now))
 	run(t, sv, s)
-	if len(events(t, st, KindCase)) != 0 || len(e.sent) != 0 || len(events(t, st, KindAct)) != 1 {
-		t.Fatalf("cases %+v sent %q acts %+v", events(t, st, KindCase), e.sent, events(t, st, KindAct))
+	if ns, _ := st.Notes(context.Background()); len(events(t, st, KindCase)) != 0 || len(e.sent) != 0 || len(events(t, st, KindAct)) != 1 || len(ns) != 0 {
+		t.Fatalf("cases %+v sent %q acts %+v notes %+v", events(t, st, KindCase), e.sent, events(t, st, KindAct), ns)
 	}
 	// A session whose place in its transcript the scan does not know: nothing could tell that the message went in.
 	st = testStore(t)

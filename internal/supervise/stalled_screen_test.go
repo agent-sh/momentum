@@ -40,8 +40,8 @@ func (f *idling) Send(ctx context.Context, t act.Target, text string) (act.Path,
 // The loop's stall as its owner met it: the turn waits on a request that never got a reply, and nobody is at the
 // session. As the rules ship, the stalled rule resumes it at its time on either screen he may find there: through
 // the queue and Escape while the turn runs on it, as the next prompt typed the plain way when it shows no turn
-// running, also where sources.json names stalled live. Each send is a decided note that says what it did and
-// where; no needs note asks him anything.
+// running, once the owner window has passed since the first look that found it so. Each send is a decided note
+// that says what it did and where; no needs note asks him anything.
 func TestTheLoopsStallIsResumedOnEitherScreen(t *testing.T) {
 	for _, c := range []struct {
 		name, screen string
@@ -49,7 +49,7 @@ func TestTheLoopsStallIsResumedOnEitherScreen(t *testing.T) {
 	}{
 		{"running", "running", Live}, // as it ships
 		{"idle", "idle", Live},
-		{"idle, live by sources.json", "idle", map[string]bool{RuleStalled: true}},
+		{"idle, stalled the only live rule", "idle", map[string]bool{RuleStalled: true}},
 	} {
 		t.Run(c.name, func(t *testing.T) { stallResumed(t, c.screen, c.live) })
 	}
@@ -79,6 +79,13 @@ func stallResumed(t *testing.T, screen string, live map[string]bool) {
 	}
 	now = sent.Add(30 * time.Minute)
 	run(t, sv, scan(now))
+	if screen == "idle" { // the first look at the idle screen holds the owner window: an Escape leaves no record
+		if len(typed()) != 0 {
+			t.Fatalf("at the first look at the idle screen: %q", typed())
+		}
+		now = now.Add(DefaultParams.OwnerWindow + time.Second)
+		run(t, sv, scan(now))
+	}
 	want := "%9 " + StalledText
 	if screen == "running" {
 		want = "%9 interrupt " + StalledText

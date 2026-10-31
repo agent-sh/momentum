@@ -189,6 +189,9 @@ func TestATransientErrorWaitsThenSendsThenFollowsTheOutcome(t *testing.T) {
 	if len(tries) != 2 || !tries[1] || !tries[2] {
 		t.Fatalf("each try its own event: %+v", events(t, st, KindAct))
 	}
+	if ns, _ := st.Notes(context.Background()); len(ns) != 0 { // a decided note is the stalled rule's alone
+		t.Fatalf("notes %+v", ns)
+	}
 }
 
 func TestAMessageThatWorkedResetsTheTries(t *testing.T) {

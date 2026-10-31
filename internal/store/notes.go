@@ -22,7 +22,7 @@ import (
 type NoteKind string
 
 const (
-	NoteNeeds   NoteKind = "needs"   // a decision only the owner can make; its title is the question
+	NoteNeeds   NoteKind = "needs"   // a decision only the owner can make; its title is the question, or what momentum could not do
 	NoteDecided NoteKind = "decided" // a decision made on his behalf that he may override; its detail says how
 	NoteShipped NoteKind = "shipped" // an improvement that landed, with its measured effect when there is one
 	NoteProblem NoteKind = "problem" // something momentum saw and could not fix itself
@@ -55,7 +55,7 @@ type Link struct {
 type Note struct {
 	ID         string
 	Kind       NoteKind
-	Title      string // for needs, the question itself
+	Title      string // for needs, the question itself, or what momentum could not do
 	Detail     string // one or two short sentences; for decided, how to override it
 	Effect     string // for shipped, the measured effect
 	Links      []Link

@@ -63,8 +63,19 @@ type Sender interface {
 // errAnswered is a stalled request that something answered since the scan: the turn went on by itself.
 var errAnswered = errors.New("its transcript shows the request answered since the scan")
 
-// noPath is the key suffix of the mark that no path reaches a stalled turn, while it waits on its request.
-func noPath(stop Stop) string { return fmt.Sprintf("#no-path@%d", stop.RequestAt.UnixMilli()) }
+// errUnsure is a stalled turn's screen that neither check reads plainly: the interrupt check cannot tell that a
+// turn runs there, and the plain one sees a running row (one with no time or key, as on a narrow pane).
+var errUnsure = errors.New("its screen does not show whether the turn runs")
+
+// errIdleFirst is the first look, for a request, that finds a stalled turn's screen showing no turn running. An
+// Escape with nothing queued takes a turn back without a record, so its owner may be at the session: the message
+// waits the owner window from this look.
+var errIdleFirst = errors.New("its screen shows no turn running: its owner may have taken the turn back, so the message waits the owner window")
+
+// requestKey is the key suffix of a stalled turn's mark for the request it waits on: what, @, the request's ms.
+func requestKey(what string, stop Stop) string {
+	return fmt.Sprintf("%s@%d", what, stop.RequestAt.UnixMilli())
+}
 
 // errNoPlace is a stalled session whose transcript place the scan does not know: nothing could tell that the
 // message went in.
@@ -101,7 +112,7 @@ type Line struct {
 	Session, Name, Rule, Verdict, Text, Why string
 	Sent                                    bool
 	Err                                     string
-	noPath                                  bool // no path reaches the stalled turn
+	refused                                 *refusal // this run's refused look at a stalled turn
 }
 
 func (sv *Supervisor) now() time.Time {
@@ -191,7 +202,7 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 			d.Rule = planRules(stop, Tries{}, sv.Params, probe).Rule // the rule a guard keeps from acting, if any
 		}
 		entry := &seenSession{s: s, stop: stop, presence: presence}
-		entry.ask, entry.asks = waitsOnOwner(s, stop, d, presence, sv.Params, false)
+		entry.ask, entry.asks = waitsOnOwner(s, stop, d, presence, sv.Params)
 		seen[s.Key] = entry
 		if d.Rule == "" {
 			continue // no rule applies, or a guard and no rule would apply anyway: nothing was decided
@@ -243,11 +254,18 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 				return lines, err
 			}
 		}
-		// A stalled turn no path reaches waits on its owner: momentum could not type into it. It is decided from the
-		// stop and the request it waits on, not from one run's look: the mark on record for the request keeps it
-		// while the rule holds, and past its stale hour. Claude Code's own retry starts the wait again.
-		if d.Rule == RuleStalled && (line.noPath || h.keys[sv.event(s, stop, d, KindAct, now, noPath(stop)).SourceKey]) {
-			entry.ask, entry.asks = waitsOnOwner(s, stop, d, presence, sv.Params, true)
+		// A stalled turn momentum cannot resume waits on its owner: no path reaches it, or its stale hour came and the
+		// last look before it was refused (a dialog, a draft that stayed, a screen neither check reads plainly). It
+		// is decided from the refusal on record for the request and the try, not from one run's look, so it stands
+		// while the rule holds and past its stale hour. Claude Code's own retry starts the wait again.
+		if d.Rule == RuleStalled && d.Verdict != Case && !line.Sent {
+			r, ok := h.refused[sv.event(s, stop, d, KindAct, now, requestKey("#refused", stop)).SourceKey]
+			if line.refused != nil {
+				r, ok = *line.refused, true
+			}
+			if ok && (r.noPath || d.Stale) {
+				entry.ask, entry.asks = cannotResume(s, stop, r.why, presence, sv.Params)
+			}
 		}
 		lines = append(lines, line)
 	}
@@ -281,23 +299,29 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 		m["wake_key"] = stop.WakeKey // one resync per wakeup or run
 	}
 	// A stalled turn takes the message through its queue while it runs on its screen, and Escape ends it. A screen
-	// that shows no turn running while the transcript still waits on the request (an Escape takes a turn back
-	// without a record) takes it the plain way, as the next prompt, once the transcript still shows no reply.
-	stalled := d.Rule == RuleStalled
-	interrupt := stalled
-	if stalled {
+	// that shows no turn running while the transcript still waits on the request takes it the plain way, as the
+	// next prompt, once the transcript still shows no reply. An Escape with nothing queued takes a turn back without
+	// a record, so the first look that finds that screen, for a request, holds the rule for the owner window.
+	isStalled := d.Rule == RuleStalled
+	interrupt := isStalled
+	refusedKey := "#refused"
+	if isStalled {
 		m["request_at"] = stop.RequestAt.UnixMilli()
+		refusedKey = requestKey("#refused", stop) // once per request, its last reason on record
 	}
 	path, err := act.Path(""), act.CheckText(d.Text)
 	switch {
 	case err != nil:
-	case stalled && (s.Transcript == "" || s.Size < 0):
+	case isStalled && (s.Transcript == "" || s.Size < 0):
 		err = errNoPlace // the transcript tells whether the message went in, read from where the scan stopped
-	case stalled:
+	case isStalled:
 		path, err = sv.Sender.CheckInterrupt(ctx, t)
 		if errors.Is(err, act.ErrIdle) {
 			interrupt = false
-			if path, err = sv.Sender.Check(ctx, t); err == nil {
+			switch path, err = sv.Sender.Check(ctx, t); {
+			case errors.Is(err, act.ErrBusy):
+				err = errUnsure // no turn running by the interrupt check, a running row by the plain one
+			case err == nil:
 				err = sv.unanswered(s, stop.RequestAt)
 			}
 		}
@@ -314,21 +338,28 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 		// the draft or the mode the last check met is gone: its owner cleared it just now, and is there
 		line.Err = "its owner cleared the input line since the last check"
 		return sv.put(ctx, []store.Event{sv.present(s, stop, "cleared")})
-	}
-	line.noPath = stalled && errors.Is(err, act.ErrNoPath)
-	if line.noPath && !h.keys[sv.event(s, stop, d, KindAct, sv.now(), noPath(stop)).SourceKey] {
-		mark := sv.event(s, stop, d, KindAct, sv.now(), noPath(stop))
-		mark.Kind, mark.Actor = KindSkip, store.ActorDetector
-		mark.Summary = oneLine(d.Rule + ": " + err.Error())
-		mark.Meta = meta(map[string]any{"rule": d.Rule, "try": d.Try, "why": err.Error(), "stop_at": stop.At.UnixMilli(),
+	case err == nil && isStalled && !interrupt && h.idleAt[stop.RequestAt.UnixMilli()].IsZero():
+		// its screen shows no turn running for the first time since the request: its owner may be there
+		mark := sv.event(s, stop, d, KindAct, sv.now(), requestKey("#idle", stop))
+		mark.Kind, mark.Actor = KindHold, store.ActorDetector
+		mark.Summary = oneLine(d.Rule + ": " + errIdleFirst.Error())
+		mark.Meta = meta(map[string]any{"rule": d.Rule, "try": d.Try, "why": errIdleFirst.Error(), "stop_at": stop.At.UnixMilli(),
 			"request_at": stop.RequestAt.UnixMilli()})
-		evs = append(evs, mark)
+		line.Err = errIdleFirst.Error()
+		return sv.put(ctx, []store.Event{mark})
 	}
 	if err != nil {
-		e := sv.event(s, stop, d, KindAct, sv.now(), "#refused")
+		e := sv.event(s, stop, d, KindAct, sv.now(), refusedKey)
 		line.Err = err.Error()
-		if !h.keys[e.SourceKey] { // on record once, the first time; the next run checks again
+		if isStalled {
+			line.refused = &refusal{why: err.Error(), noPath: errors.Is(err, act.ErrNoPath)}
+		}
+		// on record once, the first time, and the next run checks again; a stalled turn's keeps its last reason
+		if r, had := h.refused[e.SourceKey]; !h.keys[e.SourceKey] || isStalled && had && r.why != err.Error() {
 			m["path"], m["refused"] = string(path), err.Error()
+			if isStalled && errors.Is(err, act.ErrNoPath) {
+				m["no_path"] = true
+			}
 			e.Meta = meta(m)
 			e.Summary = oneLine(fmt.Sprintf("%s: not sent (%v): %q", d.Rule, err, d.Text))
 			evs = append(evs, e)
@@ -348,11 +379,12 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 	}
 	if interrupt {
 		path, err = sv.Sender.Interrupt(ctx, t, d.Text, func() error { return sv.unanswered(s, stop.RequestAt) })
-		if err == nil {
-			err = sv.prompted(ctx, s, d.Text, m)
-		}
 	} else {
 		path, err = sv.Sender.Send(ctx, t, d.Text)
+	}
+	if err == nil && isStalled {
+		// the transcript tells whether it went in as a prompt: a turn that runs unseen would hold it in its queue
+		err = sv.prompted(ctx, s, d.Text, m)
 	}
 	delete(m, "sending")
 	m["path"] = string(path)
@@ -367,8 +399,8 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 	} else {
 		m["sent"], line.Sent = true, true
 		e.Summary = oneLine(fmt.Sprintf("%s: sent %q (try %d) by %s", d.Rule, d.Text, d.Try, path))
-		if stalled { // what it did, for its owner to read and undo: a decided note
-			if _, err := sv.Store.PutNote(ctx, resumed(s, stop, interrupt, sv.now())); err != nil {
+		if isStalled { // what it did, for its owner to read and undo: a decided note
+			if _, err := sv.Store.PutNote(ctx, resumed(s, stop, d.Text, interrupt, sv.now())); err != nil {
 				m["note"] = err.Error()
 			}
 		}
@@ -483,9 +515,17 @@ type past struct {
 	presentAt time.Time      // when its owner was last seen at the pane: a draft, a tmux mode, a line he cleared
 	atPane    map[int64]bool // the stops (their ms) whose last check met a draft or a mode
 	keys      map[string]bool
-	escapes   []time.Time     // the interruptions momentum's own Escapes left in the transcript
-	wakes     map[string]bool // the wakeups and runs (their keys) a resync was typed for
-	dryWakes  map[string]bool // the wakeups and runs the overdue rule, dry, recorded a resync for
+	escapes   []time.Time         // the interruptions momentum's own Escapes left in the transcript
+	wakes     map[string]bool     // the wakeups and runs (their keys) a resync was typed for
+	dryWakes  map[string]bool     // the wakeups and runs the overdue rule, dry, recorded a resync for
+	refused   map[string]refusal  // a stalled turn's refused looks, by key: one per stop, try and request
+	idleAt    map[int64]time.Time // by request (ms), the first look that found a stalled turn's screen idle
+}
+
+// refusal is the last refused look at a stalled turn, for the request it waits on.
+type refusal struct {
+	why    string
+	noPath bool // no terminal or queue reaches it
 }
 
 type caseRec struct {
@@ -495,14 +535,22 @@ type caseRec struct {
 }
 
 func history(evs []store.Event) past {
-	h := past{keys: map[string]bool{}, atPane: map[int64]bool{}, wakes: map[string]bool{}, dryWakes: map[string]bool{}}
+	h := past{keys: map[string]bool{}, atPane: map[int64]bool{}, wakes: map[string]bool{}, dryWakes: map[string]bool{},
+		refused: map[string]refusal{}, idleAt: map[int64]time.Time{}}
 	outcomes := map[string]map[string]bool{}
 	for _, e := range evs {
 		h.keys[e.SourceKey] = true
 		var m map[string]any
 		json.Unmarshal([]byte(e.Meta), &m)
 		switch e.Kind {
+		case KindHold:
+			if strings.Contains(e.SourceKey, "#idle@") {
+				h.idleAt[int64(num(m["request_at"]))] = e.TS
+			}
 		case KindAct:
+			if strings.Contains(e.SourceKey, "#refused@") {
+				h.refused[e.SourceKey] = refusal{why: str(m["refused"]), noPath: m["no_path"] == true}
+			}
 			if e.Experiment != "" {
 				if k := str(m["wake_key"]); k != "" {
 					h.dryWakes[k] = true
@@ -614,15 +662,20 @@ func (h past) closed(rule string, ownerAt time.Time) bool {
 
 // presence is when the owner was last at the session: his last turn by the store; the harness's last user turn,
 // unless it is one of momentum's own messages word for word; a local command or an interruption; an ask of the
-// session's he answered; a draft or a tmux mode that kept a message out; or the session's process starting (he
-// opened it). The rules hold while it is recent.
+// session's he answered; a draft or a tmux mode that kept a message out; the first look that found a stalled
+// turn's screen showing no turn running, for its request (an Escape leaves no record); or the session's process
+// starting (he opened it). The rules hold while it is recent.
 func (h past) presence(s *sessions.Session, ownerAt, answered time.Time) time.Time {
 	at := ownerAt
 	control := s.ControlAt
 	if h.ourEscape(control) {
 		control = time.Time{} // the interruption is momentum's own Escape, not its owner's
 	}
-	for _, t := range []time.Time{control, answered, h.presentAt, s.Started} {
+	var idle time.Time // the first look that found a stalled turn's screen idle: an Escape leaves no record
+	if !s.RequestAt.IsZero() {
+		idle = h.idleAt[s.RequestAt.UnixMilli()]
+	}
+	for _, t := range []time.Time{control, answered, h.presentAt, s.Started, idle} {
 		if t.After(at) {
 			at = t
 		}
