@@ -63,6 +63,17 @@ type Task struct {
 	Sync       bool      `json:"sync,omitempty"` // a subagent the current turn waits on
 }
 
+// Run is a run of a session's own that its harness should start: a self-paced loop's pending wakeup, or a run of a
+// job it scheduled, one that never started or its next.
+type Run struct {
+	Due  time.Time `json:"due"`            // the latest the harness starts it: the wakeup's time; the run's, and the most it delays one
+	For  string    `json:"for,omitempty"`  // what it is for: the wakeup's reason, else its prompt; the job's prompt
+	Key  string    `json:"key"`            // which wakeup or run it is, the same on every scan
+	Job  bool      `json:"job,omitempty"`  // a job's run, not a wakeup
+	Once bool      `json:"once,omitempty"` // a one-shot job's only run
+	Sign string    `json:"sign,omitempty"` // why a wakeup may have been lost: a cause its harness is known to drop one for
+}
+
 // Session is one live agent session and the facts the phase rule reads.
 type Session struct {
 	Key        string    `json:"key"` // stable across scans: a job, thread or session id, else the process
@@ -91,11 +102,7 @@ type Session struct {
 	Tasks      []Task    `json:"tasks"`
 	WakeAt     time.Time `json:"wake_at,omitzero"`
 	Loop       string    `json:"loop,omitempty"`
-	WakeDue    time.Time `json:"wake_due,omitzero"`   // its own pending wakeup or loop run should have fired by then, at the latest
-	WakeFor    string    `json:"wake_for,omitempty"`  // what that wakeup or run is for: its reason, else its prompt
-	WakeKey    string    `json:"wake_key,omitempty"`  // which wakeup or run that is, the same on every scan
-	WakeJob    bool      `json:"wake_job,omitempty"`  // that is a scheduled job's run, not a self-paced loop's wakeup
-	WakeSign   string    `json:"wake_sign,omitempty"` // why a self-paced wakeup may have been lost: a cause its harness drops one for
+	Runs       []Run     `json:"runs,omitempty"`      // its own runs its harness should start, earliest first
 	TurnBegan  time.Time `json:"turn_began,omitzero"` // when its last turn began
 	IdleSince  time.Time `json:"idle_since,omitzero"` // when its last turn ended
 	LastText   string    `json:"last_text,omitempty"` // the last assistant message in full

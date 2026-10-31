@@ -48,13 +48,13 @@ func full(set []bool) bool {
 
 func cronField(field string, lo, hi int, set *[60]bool) bool {
 	for _, part := range strings.Split(field, ",") {
-		step := 1
+		step, stepped := 1, false
 		if base, s, ok := strings.Cut(part, "/"); ok {
-			n, err := strconv.Atoi(s)
+			n, err := number(s)
 			if err != nil || n <= 0 {
 				return false
 			}
-			part, step = base, n
+			part, step, stepped = base, n, true
 		}
 		a, b := lo, hi
 		switch {
@@ -62,14 +62,14 @@ func cronField(field string, lo, hi int, set *[60]bool) bool {
 		case strings.Contains(part, "-"):
 			x, y, _ := strings.Cut(part, "-")
 			var err1, err2 error
-			a, err1 = strconv.Atoi(x)
-			b, err2 = strconv.Atoi(y)
+			a, err1 = number(x)
+			b, err2 = number(y)
 			if err1 != nil || err2 != nil {
 				return false
 			}
 		default:
-			n, err := strconv.Atoi(part)
-			if err != nil || step > 1 {
+			n, err := number(part)
+			if err != nil || stepped {
 				return false // a step takes a range or *: Claude Code refuses 5/15
 			}
 			a, b = n, n
@@ -82,6 +82,14 @@ func cronField(field string, lo, hi int, set *[60]bool) bool {
 		}
 	}
 	return true
+}
+
+// number is a field's number, digits only: Claude Code refuses a sign.
+func number(s string) (int, error) {
+	if s == "" || strings.Trim(s, "0123456789") != "" {
+		return 0, strconv.ErrSyntax
+	}
+	return strconv.Atoi(s)
 }
 
 func (c schedule) runs(t time.Time) bool {
@@ -101,18 +109,20 @@ func (c schedule) runs(t time.Time) bool {
 }
 
 // next is the schedule's first run after t, at a whole minute of local time; zero when none comes within a year.
-// Claude Code matches a minute of the wall clock once: the hour a clock change repeats does not run again.
+// Claude Code matches a minute of the wall clock once: the hour a clock change repeats does not run again, so the
+// clock is read from two hours before t, and a minute it showed before t counts as seen.
 func (c schedule) next(t time.Time) time.Time {
-	m := t.Local().Truncate(time.Minute)
+	from := t.Local().Truncate(time.Minute)
+	m := from.Add(-2 * time.Hour)
 	seen := wall(m)
-	for end := m.AddDate(1, 0, 0); m.Before(end); {
+	for end := from.AddDate(1, 0, 0); m.Before(end); {
 		m = m.Add(time.Minute)
 		w := wall(m)
 		if w <= seen {
 			continue // the wall clock went back: a minute it showed already
 		}
 		seen = w
-		if c.runs(m) {
+		if m.After(from) && c.runs(m) {
 			return m
 		}
 	}
@@ -138,19 +148,16 @@ func (c schedule) lateness(run time.Time) time.Duration {
 	return min(n.Sub(run)/2, 30*time.Minute)
 }
 
-// ScheduledRun is the next run after after of a job on the cron expression expr, and the latest it starts: for a
-// recurring job, the run's time and the most Claude Code delays it; a one-shot runs on time, or a little early.
-// false for an expression it cannot read, or one that names no run within a year.
-func ScheduledRun(expr string, after time.Time, oneShot bool) (run, latest time.Time, ok bool) {
+// ScheduledRun is the next run after after of a job on the cron expression expr, and the latest a recurring job
+// starts it: the run's time and the most Claude Code delays it (a one-shot runs on time, or a little early). false
+// for an expression it cannot read, or one that names no run within a year.
+func ScheduledRun(expr string, after time.Time) (run, latest time.Time, ok bool) {
 	sc, ok := parseSchedule(expr)
 	if !ok {
 		return time.Time{}, time.Time{}, false
 	}
 	if run = sc.next(after); run.IsZero() {
 		return time.Time{}, time.Time{}, false
-	}
-	if oneShot {
-		return run, run, true
 	}
 	return run, run.Add(sc.lateness(run)), true
 }

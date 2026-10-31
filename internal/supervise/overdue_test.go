@@ -39,12 +39,16 @@ func TestOverdueResyncsAWakeupThatNeverCame(t *testing.T) {
 		{"a suspend after its time does not start it again", waiting(func(s *Stop) { s.Slept, s.Woke = due.Add(time.Hour), due.Add(2*time.Hour) }), Tries{}, nil, Wait, due.Add(10 * time.Minute), 1, ""},
 		{"the second try", waiting(func(*Stop) {}), Tries{RuleOverdue: 1}, nil, Wait, due.Add(10 * time.Minute), 2, ""},
 		{"tries used up: the last message's turn waits as long", waiting(func(s *Stop) { s.IdleAt = due.Add(30 * time.Minute) }), Tries{RuleOverdue: 2}, nil, Wait, due.Add(40 * time.Minute), 2, ""},
-		{"nothing said what it was for", waiting(func(s *Stop) { s.WakeFor = "" }), Tries{}, nil, Wait, due.Add(10 * time.Minute), 1, "Do what it was for now, and set the next one"},
-		{"a resync for it went in already", waiting(func(s *Stop) { s.WakeHandled = true }), Tries{}, nil, "", time.Time{}, 0, ""},
+		{"nothing said what it was for", waiting(func(s *Stop) { s.WakeFor = "" }), Tries{}, nil, Wait, due.Add(10 * time.Minute), 1, "did not fire. If the loop is still wanted"},
+		{"a loop its owner may have stopped: ask him", waiting(func(*Stop) {}), Tries{}, nil, Wait, due.Add(10 * time.Minute), 1, "If the loop is still wanted, do it now and set the next one; when the conversation does not make that clear, ask your user first."},
+		{"a run due a moment before the last turn began", waiting(func(s *Stop) { s.TurnBegan, s.IdleAt = due.Add(3*time.Second), due.Add(30*time.Minute) }), Tries{}, nil, Wait, due.Add(40 * time.Minute), 1, ""},
 		{"no sign it was lost: an Esc may have stopped it", waiting(func(s *Stop) { s.WakeSign = "" }), Tries{}, nil, "", time.Time{}, 0, ""},
 		{"a suspend through its time is a sign", waiting(func(s *Stop) { s.WakeSign, s.Slept, s.Woke = "", due.Add(-time.Minute), due.Add(time.Minute) }), Tries{}, nil, Wait, due.Add(11 * time.Minute), 1, ""},
+		{"a wake with no known suspend is no sign", waiting(func(s *Stop) { s.WakeSign, s.Woke = "", due.Add(time.Minute) }), Tries{}, nil, "", time.Time{}, 0, ""},
 		{"a job's run needs no sign", job(func(*Stop) {}), Tries{}, nil, Wait, due.Add(10 * time.Minute), 1, `nothing ran "run the nightly report". Do it now; the job keeps its schedule.`},
-		{"a job's run with nothing said", job(func(s *Stop) { s.WakeFor = "" }), Tries{}, nil, Wait, due.Add(10 * time.Minute), 1, "did not start. Do what it was for now; the job keeps its schedule."},
+		{"a job's run with nothing said", job(func(s *Stop) { s.WakeFor = "" }), Tries{}, nil, Wait, due.Add(10 * time.Minute), 1, "did not start. Do it now; the job keeps its schedule."},
+		{"a job's second lost run", job(func(*Stop) {}), Tries{RuleOverdue: 1}, nil, Wait, due.Add(10 * time.Minute), 2, "did not start either, so nothing ran \"run the nightly report\". Do it now, and make the job again if it is still wanted"},
+		{"a one-shot's run", job(func(s *Stop) { s.WakeOnce = true }), Tries{}, nil, Wait, due.Add(10 * time.Minute), 1, "Your one-shot task, due by"},
 		{"a turn runs", waiting(func(s *Stop) { s.Working, s.Phase = true, sessions.Working }), Tries{}, nil, "", time.Time{}, 0, ""},
 		{"it stopped on an error", waiting(func(s *Stop) { s.Error = err503 }), Tries{}, nil, "", time.Time{}, 0, ""},
 		{"a task runs: its notification wakes it", waiting(func(s *Stop) { s.Tasks = 1 }), Tries{}, nil, "", time.Time{}, 0, ""},
@@ -65,6 +69,24 @@ func TestOverdueResyncsAWakeupThatNeverCame(t *testing.T) {
 	}
 	if d := Decide(ended, used, DefaultParams, nil, due.Add(40*time.Minute)); d.Verdict != Case || d.Why != "2 messages did not move it" {
 		t.Fatalf("at its time: %+v", d)
+	}
+}
+
+func TestTheRuleReadsTheEarliestRunNoResyncWentInFor(t *testing.T) {
+	due := t0.Add(20 * time.Minute)
+	run := func(at time.Time, key string) sessions.Run {
+		return sessions.Run{Due: at, For: key, Key: key, Job: true}
+	}
+	st := Stop{Runs: []sessions.Run{run(due.Add(-3*time.Hour), "old"), run(due, "first"), run(due.Add(10*time.Minute), "second")}}
+	handled := map[string]bool{}
+	st.Choose(func(k string) bool { return handled[k] }, due.Add(20*time.Minute), DefaultParams)
+	if st.WakeKey != "first" { // the old run's time came past the stale hour
+		t.Fatalf("chose %q", st.WakeKey)
+	}
+	handled["first"] = true
+	st.Choose(func(k string) bool { return handled[k] }, due.Add(20*time.Minute), DefaultParams)
+	if st.WakeKey != "second" || !st.WakeDue.Equal(due.Add(10*time.Minute)) {
+		t.Fatalf("after its resync: chose %q due %v", st.WakeKey, st.WakeDue)
 	}
 }
 
@@ -159,11 +181,12 @@ func TestALostWakeupGetsOneResync(t *testing.T) {
 		t.Fatalf("sent %q", f.sent)
 	}
 	// The resync's turn does the work and sets no wakeup; then its owner asks about something else, and leaves.
+	// Past his window, inside the wakeup's stale hour, nothing goes in for it again.
 	x.at = now
 	x.user(f.sent[0][strings.Index(f.sent[0], Marker):]).say("Checked: the soak finished.").add(map[string]any{"type": "system", "subtype": "turn_duration"})
 	x.user("what else is open?").say("Nothing.").add(map[string]any{"type": "system", "subtype": "turn_duration"})
-	for i := 0; i < 3; i++ {
-		now = now.Add(time.Hour)
+	for i := 0; i < 4; i++ {
+		now = now.Add(10 * time.Minute)
 		run(t, sv, scan(now))
 	}
 	if len(f.sent) != 1 || len(events(t, st, KindCase)) != 0 {
@@ -174,6 +197,7 @@ func TestALostWakeupGetsOneResync(t *testing.T) {
 // TestAJobsRunThatNeverStartsIsResynced runs a job CronCreate made, its result written as recent versions write
 // it (the schedule in words), through the real tracker: its run never starts.
 func TestAJobsRunThatNeverStartsIsResynced(t *testing.T) {
+	inUTCHere(t)
 	x := &transcript{t: t, path: filepath.Join(t.TempDir(), "s1.jsonl"), at: t0}
 	x.user("check the deploy every 10 minutes").
 		add(map[string]any{"type": "assistant", "message": map[string]any{"content": []any{map[string]any{"type": "tool_use", "id": "tc1",
@@ -263,5 +287,88 @@ func TestTheLastSuspendIsReadFromTheSleepTarget(t *testing.T) {
 	}
 	if slept, woke := parseSleep("ActiveEnterTimestamp=\nInactiveEnterTimestamp=\n"); !slept.IsZero() || !woke.IsZero() {
 		t.Fatalf("never slept: %v %v", slept, woke)
+	}
+}
+
+// TestAJobThatStopsRunningIsResyncedThenACase runs a job whose runs never start through the real tracker: each
+// lost run is its own, the second resync says so, and the third lost run opens a case.
+func TestAJobThatStopsRunningIsResyncedThenACase(t *testing.T) {
+	inUTCHere(t)
+	x := &transcript{t: t, path: filepath.Join(t.TempDir(), "s1.jsonl"), at: t0}
+	x.user("check the deploy every 10 minutes").
+		add(map[string]any{"type": "assistant", "message": map[string]any{"content": []any{map[string]any{"type": "tool_use", "id": "tc1",
+			"name": "CronCreate", "input": map[string]any{"cron": "*/10 * * * *", "prompt": "check the deploy"}}}}}).
+		add(map[string]any{"type": "user", "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "tc1",
+			"content": "Scheduled recurring job 7f3a9c21 (Every 10 minutes). Next run: 10:10."}}}}).
+		say("Checking every 10 minutes.").add(map[string]any{"type": "system", "subtype": "turn_duration"})
+	tr := claude.NewTracker(x.path)
+	scan := func(now time.Time) *sessions.Session {
+		s := &sessions.Session{Key: "sess-deploy", Tool: "claude", Name: "deploy", Where: "work:4.1", Pane: "%7", PID: 42,
+			Transcript: x.path, Started: t0.Add(-time.Hour), Tasks: []sessions.Task{}}
+		tr.Facts(s, now)
+		s.TurnOpen = tr.TurnOpen()
+		sessions.Decide(s, now)
+		s.Since = x.at
+		return s
+	}
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0
+	sv := liveOverdue(st, f, &now)
+	// Each resync's turn does the check, a tool call and its result, and ends: it worked, and the job's runs
+	// still never start.
+	for i := 0; i < 12; i++ {
+		now = now.Add(5 * time.Minute)
+		n := len(f.sent)
+		run(t, sv, scan(now))
+		if len(f.sent) > n {
+			x.at = now
+			x.user(f.sent[len(f.sent)-1][strings.Index(f.sent[len(f.sent)-1], Marker):]).
+				add(map[string]any{"type": "assistant", "message": map[string]any{"content": []any{map[string]any{"type": "tool_use", "id": fmt.Sprintf("tb%d", i),
+					"name": "Bash", "input": map[string]any{"command": "./check-deploy"}}}}}).
+				add(map[string]any{"type": "user", "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": fmt.Sprintf("tb%d", i), "content": "ok"}}}}).
+				say("Checked.").add(map[string]any{"type": "system", "subtype": "turn_duration"})
+		}
+	}
+	if r := results(t, st); !r[Worked] {
+		t.Fatalf("outcomes %v: a resync's turn that checked worked", r)
+	}
+	if len(f.sent) != 2 || !strings.Contains(f.sent[1], "did not start either") || len(events(t, st, KindCase)) != 1 {
+		t.Fatalf("sent %q, cases %+v", f.sent, events(t, st, KindCase))
+	}
+}
+
+func TestADryRuleRecordsOneResyncPerWakeup(t *testing.T) {
+	x, due, scan := soakLoop(t, notification)
+	st := testStore(t)
+	f := &fakeSender{}
+	now := due.Add(10 * time.Minute)
+	sv := liveOverdue(st, f, &now)
+	sv.Live = nil // overdue runs dry
+	// Its background tasks finish in between: each turn's end is a stop of its own, inside the stale hour.
+	for i := 0; i < 4; i++ {
+		s := scan(now)
+		s.Since = x.at
+		run(t, sv, s)
+		now = now.Add(10 * time.Minute)
+		x.at = now.Add(-9 * time.Minute)
+		notification(x)
+	}
+	if acts := events(t, st, KindAct); len(f.sent) != 0 || len(acts) != 1 || acts[0].Experiment != Dry {
+		t.Fatalf("sent %q, acts %+v", f.sent, acts)
+	}
+}
+
+func TestASuspendThroughAWakeupsTimeIsItsSign(t *testing.T) {
+	_, due, scan := soakLoop(t, func(*transcript) {}) // nothing else came while it waited
+	st := testStore(t)
+	f := &fakeSender{}
+	woke := due.Add(time.Hour)
+	now := woke.Add(10 * time.Minute)
+	sv := liveOverdue(st, f, &now)
+	sv.Sleep = func(context.Context) (time.Time, time.Time) { return due.Add(-time.Minute), woke }
+	run(t, sv, scan(now))
+	if len(f.sent) != 1 || !strings.Contains(f.sent[0], "did not fire") {
+		t.Fatalf("sent %q", f.sent)
 	}
 }

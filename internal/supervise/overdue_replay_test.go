@@ -93,14 +93,103 @@ func TestReplayLeavesWakeupsTheTranscriptShowsEnded(t *testing.T) {
 func TestReplayRestoresJobsAcrossAReopening(t *testing.T) {
 	inUTCHere(t)
 	st := testStore(t)
-	b := newTimeline(t, "restored").owner(0, "check the deploy every 10 minutes", "turn_duration").
-		call(time.Second, "CronCreate", "tc1", `{"cron":"*/10 * * * *","prompt":"check the deploy"}`).
-		result(time.Second, "CronCreate", "tc1", "Scheduled recurring job j1 (Every 10 minutes). Next run: 10:10.").say(time.Second, "Checking.")
-	// The session ends mid-task and is reopened: the job is restored, and its runs never start.
-	b.add(2*time.Minute, "harness_text", store.ActorHarness, "", "<task-notification><task-id>__orphan_summary__</task-id> didn't finish before the previous session ended</task-notification>", `{"why":"meta line"}`).
+	// The session ends mid-task and is reopened: the durable job is restored, and its runs never start; the
+	// session-only one died with the process.
+	for _, j := range []struct{ session, input, out string }{
+		{"durable", `{"cron":"*/10 * * * *","prompt":"check the deploy","durable":true}`, "Scheduled recurring job j1 (Every 10 minutes). Next run: 10:10. Persisted to .claude/scheduled_tasks.json."},
+		{"session-only", `{"cron":"*/10 * * * *","prompt":"check the deploy"}`, "Scheduled recurring job j1 (Every 10 minutes). Next run: 10:10. Session-only (not written to disk, dies when Claude exits)."},
+	} {
+		b := newTimeline(t, j.session).owner(0, "check the deploy every 10 minutes", "turn_duration").
+			call(time.Second, "CronCreate", "tc1", j.input).result(time.Second, "CronCreate", "tc1", j.out).say(time.Second, "Checking.")
+		b.add(2*time.Minute, "harness_text", store.ActorHarness, "", "<task-notification><task-id>__orphan_summary__</task-id> didn't finish before the previous session ended</task-notification>", `{"why":"meta line"}`).
+			say(time.Second, "Back.").owner(time.Hour, "status?", "turn_duration")
+		b.put(st)
+	}
+	if acted := overdueActs(t, st, t0.Add(3*time.Hour)); len(acted) != 1 || acted[0].Point.Session != "durable" || !strings.HasPrefix(acted[0].Point.Stop.WakeKey, "job:j1@") {
+		t.Fatalf("acted %s", fmt.Sprint(acted))
+	}
+	// A one-shot whose time came before the reopening is not restored.
+	st = testStore(t)
+	o := newTimeline(t, "once").owner(0, "remind me at 10:02", "turn_duration").
+		call(time.Second, "CronCreate", "tc1", `{"cron":"2 10 4 3 *","prompt":"remind me","recurring":false}`).
+		result(time.Second, "CronCreate", "tc1", "Scheduled one-shot task r1 (Mar 4 at 10:02 AM). Next run: 10:02.").say(time.Second, "Will remind you.")
+	o.add(5*time.Minute, "harness_text", store.ActorHarness, "", "<task-notification><task-id>__orphan_summary__</task-id> didn't finish before the previous session ended</task-notification>", `{"why":"meta line"}`).
 		say(time.Second, "Back.").owner(time.Hour, "status?", "turn_duration")
+	o.put(st)
+	if acted := overdueActs(t, st, t0.Add(3*time.Hour)); len(acted) != 0 {
+		t.Fatalf("a one-shot past its time: acted %s", fmt.Sprint(acted))
+	}
+}
+
+func TestReplayCreditsARunByItsPromptWhenTheTranscriptIsGone(t *testing.T) {
+	inUTCHere(t)
+	st := testStore(t)
+	b := newTimeline(t, "ran").owner(0, "check the deploy every half hour", "turn_duration").
+		call(time.Second, "CronCreate", "tc1", `{"cron":"*/30 * * * *","prompt":"check the deploy"}`).
+		result(time.Second, "CronCreate", "tc1", "Scheduled recurring job j1 (Every 30 minutes). Next run: 10:30.").say(time.Second, "Checking.")
+	b.add(30*time.Minute+30*time.Second, "harness_text", store.ActorHarness, "", "check the deploy", `{"prior":"scheduled_task_fire","why":"meta line"}`).
+		say(time.Second, "Checked.").owner(40*time.Minute, "status?", "turn_duration") // before the 11:00 run's time is past
 	b.put(st)
-	if acted := overdueActs(t, st, t0.Add(3*time.Hour)); len(acted) != 1 || !strings.HasPrefix(acted[0].Point.Stop.WakeKey, "job:j1@") {
+	if acted := overdueActs(t, st, t0.Add(3*time.Hour)); len(acted) != 0 {
+		t.Fatalf("acted %s", fmt.Sprint(acted))
+	}
+}
+
+func TestReplayDropsAWakeupARestartLost(t *testing.T) {
+	st := testStore(t)
+	for name, end := range map[string]string{
+		"a reopening":        "<task-notification><task-id>__orphan_summary__</task-id> didn't finish before the previous session ended</task-notification>",
+		"the restart notice": "<task-notification><task-id>tw1</task-id><status>stopped</status><summary>This session restarted 5 minutes after its next /loop wakeup was due, so that wakeup will not fire.</summary></task-notification>",
+	} {
+		b := newTimeline(t, name).owner(0, "watch the soak", "turn_duration").
+			call(time.Second, "ScheduleWakeup", "tw1", `{"delaySeconds":1800,"prompt":"<<autonomous-loop-dynamic>>","reason":"check the soak run"}`).
+			result(time.Second, "ScheduleWakeup", "tw1", "Next wakeup scheduled for 10:30:03 (in 1800s).").say(time.Second, "Next check at 10:30.").
+			add(5*time.Minute, "compaction", store.ActorHarness, "", "summary", "")
+		b.add(time.Minute, "harness_text", store.ActorHarness, "", end, `{"why":"meta line"}`).say(time.Second, "Back.").
+			owner(time.Hour, "status?", "turn_duration")
+		b.put(st)
+	}
+	if acted := overdueActs(t, st, t0.Add(3*time.Hour)); len(acted) != 0 {
+		t.Fatalf("acted %s", fmt.Sprint(acted))
+	}
+}
+
+func TestReplayTakesANoticeAfterTheTimeForASign(t *testing.T) {
+	st := testStore(t)
+	// A background agent runs through the wakeup's time; its notification comes after it, as #74569 shows.
+	b := newTimeline(t, "agent").owner(0, "watch the soak", "turn_duration").
+		call(time.Second, "Agent", "ta1", `{"description":"watch the logs","run_in_background":true}`).
+		result(time.Second, "Agent", "ta1", "Async agent launched successfully. agentId: a1").
+		call(time.Second, "ScheduleWakeup", "tw1", `{"delaySeconds":1800,"prompt":"<<autonomous-loop-dynamic>>","reason":"check the soak run"}`).
+		result(time.Second, "ScheduleWakeup", "tw1", "Next wakeup scheduled for 10:30:04 (in 1800s).").say(time.Second, "Next check at 10:30.")
+	b.add(45*time.Minute, "harness_text", store.ActorHarness, "", "<task-notification><task-id>a1</task-id><status>completed</status></task-notification>", `{"why":"meta line"}`).
+		say(time.Second, "The agent is done.").owner(time.Hour, "status?", "turn_duration")
+	b.put(st)
+	if acted := overdueActs(t, st, t0.Add(3*time.Hour)); len(acted) != 1 {
+		t.Fatalf("acted %s", fmt.Sprint(acted))
+	}
+}
+
+func TestReplayTakesANewVersionForARestart(t *testing.T) {
+	inUTCHere(t)
+	st := testStore(t)
+	r := newRecorded(t, "upgraded")
+	r.event(0, map[string]any{"type": "user", "version": "2.1.300", "message": map[string]any{"content": "check the deploy every 10 minutes"}},
+		"owner_text", store.ActorOwner, "", "check the deploy every 10 minutes", `{"input_kind":"typed"}`)
+	r.event(time.Second, map[string]any{"type": "assistant", "version": "2.1.300", "message": map[string]any{"content": []any{map[string]any{"type": "tool_use", "id": "tc1",
+		"name": "CronCreate", "input": map[string]any{"cron": "*/10 * * * *", "prompt": "check the deploy"}}}}},
+		"tool_call", store.ActorAgent, "CronCreate", `{"cron":"*/10 * * * *","prompt":"check the deploy"}`, `{"tool_id":"tc1"}`)
+	out := "Scheduled recurring job j1 (Every 10 minutes). Next run: 10:10. Session-only (not written to disk, dies when Claude exits)."
+	r.event(time.Second, map[string]any{"type": "user", "version": "2.1.300", "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "tc1", "content": out}}}},
+		"tool_result", store.ActorTool, "CronCreate", out, `{"tool_id":"tc1"}`)
+	// The owner restarts the session on a newer Claude Code: the session-only job died, and no run of it comes.
+	r.event(5*time.Minute, map[string]any{"type": "user", "version": "2.1.316", "message": map[string]any{"content": "status?"}},
+		"owner_text", store.ActorOwner, "", "status?", `{"input_kind":"typed"}`)
+	r.event(time.Second, map[string]any{"type": "assistant", "version": "2.1.316", "message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "Fine."}}}},
+		"agent_text", store.ActorAgent, "", "Fine.", "")
+	r.owner(time.Hour, "anything else?")
+	r.put(st)
+	if acted := overdueActs(t, st, t0.Add(3*time.Hour)); len(acted) != 0 {
 		t.Fatalf("acted %s", fmt.Sprint(acted))
 	}
 }

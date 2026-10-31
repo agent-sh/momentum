@@ -18,6 +18,14 @@ func (x *script) interrupted() *script {
 	return x.add(map[string]any{"type": "user", "message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "[Request interrupted by user]"}}}})
 }
 
+// first is a session's earliest own run, zero when it has none.
+func first(s *sessions.Session) sessions.Run {
+	if len(s.Runs) == 0 {
+		return sessions.Run{}
+	}
+	return s.Runs[0]
+}
+
 // inUTC runs a test on a machine whose zone is UTC: schedules read in local time.
 func inUTC(t *testing.T) {
 	l := time.Local
@@ -38,19 +46,19 @@ func TestAWakeupIsDueUntilItFires(t *testing.T) {
 	x, due := soak(t)
 	ended := x.at
 	tr := NewTracker(x.path)
-	if s := x.facts(tr, x.at); s.Phase != sessions.Scheduled || !s.WakeDue.Equal(due) || s.WakeFor != "check the soak run" || s.WakeJob ||
-		!strings.HasPrefix(s.WakeKey, "wakeup@") || s.WakeSign != "" || !s.IdleSince.Equal(ended) {
-		t.Fatalf("pending: phase %s due %v for %q key %q sign %q idle %v", s.Phase, s.WakeDue, s.WakeFor, s.WakeKey, s.WakeSign, s.IdleSince)
+	if s := x.facts(tr, x.at); s.Phase != sessions.Scheduled || !first(s).Due.Equal(due) || first(s).For != "check the soak run" || first(s).Job ||
+		!strings.HasPrefix(first(s).Key, "wakeup@") || first(s).Sign != "" || !s.IdleSince.Equal(ended) {
+		t.Fatalf("pending: phase %s due %v for %q key %q sign %q idle %v", s.Phase, first(s).Due, first(s).For, first(s).Key, first(s).Sign, s.IdleSince)
 	}
 	// Past its time and the grace, it is no longer scheduled; it is still due, and has not fired.
-	if s := x.facts(tr, due.Add(time.Hour)); s.Phase != sessions.Idle || !s.WakeDue.Equal(due) {
-		t.Fatalf("an hour late: phase %s due %v", s.Phase, s.WakeDue)
+	if s := x.facts(tr, due.Add(time.Hour)); s.Phase != sessions.Idle || !first(s).Due.Equal(due) {
+		t.Fatalf("an hour late: phase %s due %v", s.Phase, first(s).Due)
 	}
 	x.at = due
 	x.fire("Claude resuming /loop wakeup (Mar 4 10:30am)", "w1").
 		add(map[string]any{"type": "user", "isMeta": true, "promptSource": "system", "message": map[string]any{"content": "# Autonomous loop tick"}})
-	if s := x.facts(tr, x.at); !s.WakeDue.IsZero() || !s.WakeAt.IsZero() {
-		t.Fatalf("after it fired: due %v wake %v", s.WakeDue, s.WakeAt)
+	if s := x.facts(tr, x.at); !first(s).Due.IsZero() || !s.WakeAt.IsZero() {
+		t.Fatalf("after it fired: due %v wake %v", first(s).Due, s.WakeAt)
 	}
 	// What ends it: a run of a loop's kind, the loop stopped or past its age, an Esc, a restart past its time.
 	for name, end := range map[string]func(x *script){
@@ -71,27 +79,43 @@ func TestAWakeupIsDueUntilItFires(t *testing.T) {
 	} {
 		y, _ := soak(t)
 		end(y)
-		if s := y.facts(NewTracker(y.path), y.at); !s.WakeDue.IsZero() || !s.WakeAt.IsZero() {
-			t.Errorf("%s: due %v wake %v", name, s.WakeDue, s.WakeAt)
+		if s := y.facts(NewTracker(y.path), y.at); !first(s).Due.IsZero() || !s.WakeAt.IsZero() {
+			t.Errorf("%s: due %v wake %v", name, first(s).Due, s.WakeAt)
+		}
+	}
+	// A record dated before the wakeup was set (Claude Code writes some late) does not end it.
+	for name, end := range map[string]func(x *script){
+		"a run": func(x *script) {
+			x.add(map[string]any{"type": "system", "subtype": "scheduled_task_fire", "taskKind": "loop", "timestamp": t0.Format(time.RFC3339Nano)})
+		},
+		"an Esc": func(x *script) {
+			x.add(map[string]any{"type": "user", "timestamp": t0.Format(time.RFC3339Nano), "message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "[Request interrupted by user]"}}}})
+		},
+	} {
+		y, due := soak(t)
+		end(y)
+		if s := y.facts(NewTracker(y.path), y.at); !first(s).Due.Equal(due) {
+			t.Errorf("%s dated before it: due %v", name, first(s).Due)
 		}
 	}
 	// A run of a task it does not know is not the wakeup's.
 	w, due := soak(t)
 	w.at = due
 	w.fire("Running scheduled task (Mar 4 10:30am)", "r9")
-	if s := w.facts(NewTracker(w.path), w.at); !s.WakeDue.Equal(due) {
-		t.Fatalf("another task's run: due %v", s.WakeDue)
+	if s := w.facts(NewTracker(w.path), w.at); !first(s).Due.Equal(due) {
+		t.Fatalf("another task's run: due %v", first(s).Due)
 	}
-	// A restart keeps a wakeup due after it, which Claude Code arms again, and loses one due before it.
+	// A restart in the foreground loses a pending wakeup; a background session, whose start is not known, keeps it:
+	// its process arms it again.
 	z, due := soak(t)
 	for _, c := range []struct {
 		started time.Time
 		kept    bool
-	}{{due.Add(-time.Minute), true}, {due.Add(time.Minute), false}} {
+	}{{time.Time{}, true}, {due.Add(-20 * time.Minute), false}} {
 		s := &sessions.Session{Started: c.started, Tasks: []sessions.Task{}}
 		NewTracker(z.path).Facts(s, due.Add(2*time.Minute))
-		if s.WakeDue.IsZero() == c.kept {
-			t.Errorf("started %v: due %v", c.started, s.WakeDue)
+		if first(s).Due.IsZero() == c.kept {
+			t.Errorf("started %v: due %v", c.started, first(s).Due)
 		}
 	}
 }
@@ -105,6 +129,23 @@ func TestTheLastTurnBeginsAtAnInputAndEndsAtItsLastReply(t *testing.T) {
 	x.add(map[string]any{"type": "system", "subtype": "turn_duration"})
 	if s := x.facts(NewTracker(x.path), x.at); !s.TurnBegan.Equal(began) || !s.IdleSince.Equal(ended) {
 		t.Fatalf("began %v ended %v, want %v %v", s.TurnBegan, s.IdleSince, began, ended)
+	}
+}
+
+func TestAVersionThatRecordsNoRunsListsNone(t *testing.T) {
+	x := newScript(t)
+	x.add(map[string]any{"type": "user", "version": "2.1.284", "message": map[string]any{"content": "watch the soak"}})
+	x.add(map[string]any{"type": "assistant", "version": "2.1.284", "message": map[string]any{"content": []any{map[string]any{"type": "tool_use", "id": "tu1",
+		"name": "ScheduleWakeup", "input": map[string]any{"delaySeconds": 1800, "reason": "check the soak run"}}}}})
+	x.add(map[string]any{"type": "user", "version": "2.1.284", "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "tu1",
+		"content": "Next wakeup scheduled for 10:30:03 (in 1800s)."}}}})
+	if s := x.facts(NewTracker(x.path), x.at.Add(time.Hour)); len(s.Runs) != 0 {
+		t.Fatalf("runs %+v", s.Runs)
+	}
+	for v, want := range map[string]bool{"2.1.290": false, "2.1.291": true, "2.2.0": true, "3.0.0-beta": true, "": false, "x": false} {
+		if RecordsRuns(v) != want {
+			t.Errorf("%q: %v", v, !want)
+		}
 	}
 }
 
@@ -122,15 +163,21 @@ func TestWhatCameWhileAWakeupWaitedIsASignItWasLost(t *testing.T) {
 		"a compaction's text": {func(x *script) {
 			x.add(map[string]any{"type": "user", "isCompactSummary": true, "message": map[string]any{"content": "summary"}})
 		}, "the conversation was compacted while it waited"},
-		"a notice after its time": {func(x *script) { x.at = x.at.Add(time.Hour); x.notify("bt1", "completed") }, ""},
+		"a notice after its time": {func(x *script) { x.at = x.at.Add(time.Hour); x.notify("bt1", "completed") }, "a task's notification came in while it waited"},
+		"two signs: the first stays": {func(x *script) {
+			x.add(map[string]any{"type": "system", "subtype": "compact_boundary"}).notify("bt1", "completed")
+		}, "the conversation was compacted while it waited"},
+		"a sign dated before it was set": {func(x *script) {
+			x.add(map[string]any{"type": "system", "subtype": "compact_boundary", "timestamp": t0.Format(time.RFC3339Nano)})
+		}, ""},
 		"a new wakeup after it": {func(x *script) {
 			x.notify("bt1", "completed").call("tu2", "ScheduleWakeup", map[string]any{"delaySeconds": 600}).result("tu2", "Next wakeup scheduled for 10:41:00 (in 600s)")
 		}, ""},
 	} {
 		x, _ := soak(t)
 		c.came(x)
-		if s := x.facts(NewTracker(x.path), x.at); s.WakeSign != c.sign {
-			t.Errorf("%s: sign %q, want %q", name, s.WakeSign, c.sign)
+		if s := x.facts(NewTracker(x.path), x.at); first(s).Sign != c.sign {
+			t.Errorf("%s: sign %q, want %q", name, first(s).Sign, c.sign)
 		}
 	}
 }
@@ -144,35 +191,87 @@ func TestALoopsNextRunIsDueWithItsDelay(t *testing.T) {
 	tr := NewTracker(x.path)
 	// Created at 10:00:02: its next run is 10:10, and Claude Code may start it up to 5 minutes late.
 	run := time.Date(2026, 3, 4, 10, 10, 0, 0, time.UTC)
-	if s := x.facts(tr, x.at); !s.WakeDue.Equal(run.Add(5*time.Minute)) || s.WakeFor != "check the queue" || s.Phase != sessions.Scheduled || !s.WakeJob ||
-		s.WakeKey != "job:j1@"+strconv.FormatInt(run.UnixMilli(), 10) || s.Loop != "Every 10 minutes" {
-		t.Fatalf("due %v for %q phase %s job %v key %q loop %q, want %v", s.WakeDue, s.WakeFor, s.Phase, s.WakeJob, s.WakeKey, s.Loop, run.Add(5*time.Minute))
+	if s := x.facts(tr, x.at); !first(s).Due.Equal(run.Add(5*time.Minute)) || first(s).For != "check the queue" || s.Phase != sessions.Scheduled || !first(s).Job ||
+		first(s).Key != "job:j1@"+strconv.FormatInt(run.UnixMilli(), 10) || s.Loop != "Every 10 minutes" {
+		t.Fatalf("due %v for %q phase %s job %v key %q loop %q, want %v", first(s).Due, first(s).For, s.Phase, first(s).Job, first(s).Key, s.Loop, run.Add(5*time.Minute))
 	}
 	x.at = run.Add(3 * time.Minute)
 	x.fire("Running scheduled task (Mar 4 10:13am)", "j1")
-	if s := x.facts(tr, x.at); !s.WakeDue.Equal(run.Add(15 * time.Minute)) {
-		t.Fatalf("after its run: due %v, want the 10:20 run's latest start", s.WakeDue)
+	if s := x.facts(tr, x.at); !first(s).Due.Equal(run.Add(15 * time.Minute)) {
+		t.Fatalf("after its run: due %v, want the 10:20 run's latest start", first(s).Due)
 	}
 	// Another job's run is not this job's, and an Esc does not stop a job.
 	x.fire("Running scheduled task (Mar 4 10:25am)", "other").user("and the logs").interrupted()
-	if s := x.facts(tr, x.at); !s.WakeDue.Equal(run.Add(15 * time.Minute)) {
-		t.Fatalf("another job, an Esc: due %v", s.WakeDue)
+	if s := x.facts(tr, x.at); !first(s).Due.Equal(run.Add(15 * time.Minute)) {
+		t.Fatalf("another job, an Esc: due %v", first(s).Due)
 	}
-	// A restart restores it, from its first run after the restart: it does not run for the runs it missed.
+	// A session-only job dies with its process.
 	s := &sessions.Session{Started: run.Add(2 * time.Hour), Tasks: []sessions.Task{}}
 	NewTracker(x.path).Facts(s, run.Add(2*time.Hour))
-	if !s.WakeDue.Equal(run.Add(2*time.Hour + 15*time.Minute)) {
-		t.Fatalf("after a restart: due %v", s.WakeDue)
+	if len(s.Runs) != 0 || s.Loop != "" {
+		t.Fatalf("a session-only job after a restart: runs %+v loop %q", s.Runs, s.Loop)
+	}
+	// A durable one is restored, from its first run after the restart: it does not run for the runs it missed.
+	d := newScript(t).call("tu1", "CronCreate", map[string]any{"cron": "*/10 * * * *", "prompt": "check the queue", "durable": true}).
+		result("tu1", "Scheduled recurring job j1 (Every 10 minutes). Next run: 10:10. Persisted to .claude/scheduled_tasks.json. Auto-expires after 7 days.")
+	s = &sessions.Session{Started: run.Add(2 * time.Hour), Tasks: []sessions.Task{}}
+	NewTracker(d.path).Facts(s, run.Add(2*time.Hour))
+	if !first(s).Due.Equal(run.Add(2*time.Hour + 15*time.Minute)) {
+		t.Fatalf("a durable job after a restart: due %v", first(s).Due)
 	}
 	// It expires 7 days after it was made.
-	if s := x.facts(tr, t0.Add(7*24*time.Hour+time.Minute)); !s.WakeDue.IsZero() {
-		t.Fatalf("expired: due %v", s.WakeDue)
+	if s := x.facts(tr, t0.Add(7*24*time.Hour+time.Minute)); !first(s).Due.IsZero() {
+		t.Fatalf("expired: due %v", first(s).Due)
 	}
 	// An older version wrote the expression in its result, and no input names it.
 	y := newScript(t).call("tu1", "CronCreate", map[string]any{"prompt": "check the queue"}).
 		result("tu1", "Scheduled recurring job j1 (*/10 * * * *). Session-only (not written to disk, dies when Claude exits).")
-	if s := y.facts(NewTracker(y.path), y.at); !s.WakeDue.Equal(run.Add(5 * time.Minute)) {
-		t.Fatalf("an older result: due %v", s.WakeDue)
+	if s := y.facts(NewTracker(y.path), y.at); !first(s).Due.Equal(run.Add(5 * time.Minute)) {
+		t.Fatalf("an older result: due %v", first(s).Due)
+	}
+}
+
+func TestAJobThatStopsRunningListsEachRunItMissed(t *testing.T) {
+	inUTC(t)
+	x := newScript(t).call("tu1", "CronCreate", map[string]any{"cron": "*/10 * * * *", "prompt": "check the queue"}).
+		result("tu1", "Scheduled recurring job j1 (Every 10 minutes). Next run: 10:10.")
+	tr := NewTracker(x.path)
+	// At 10:42 the 10:10, 10:20 and 10:30 runs never started, and the 10:40 run may start until 10:45.
+	s := x.facts(tr, time.Date(2026, 3, 4, 10, 42, 0, 0, time.UTC))
+	var got []string
+	for _, r := range s.Runs {
+		got = append(got, r.Due.Format("15:04"))
+	}
+	if strings.Join(got, " ") != "10:15 10:25 10:35 10:45" {
+		t.Fatalf("runs %v", got)
+	}
+	// A job made days ago that never ran lists its runs of the last hours, up to its next.
+	old := x.facts(NewTracker(x.path), time.Date(2026, 3, 6, 10, 42, 0, 0, time.UTC))
+	if n := len(old.Runs); n == 0 || !old.Runs[n-1].Due.Equal(time.Date(2026, 3, 6, 10, 45, 0, 0, time.UTC)) {
+		t.Fatalf("days later: %d runs, the last %v", n, old.Runs[n-1].Due)
+	}
+	// Two jobs on one schedule: their runs are in the order of their keys, on every scan.
+	z := newScript(t)
+	for _, id := range []string{"j2", "j1"} {
+		z.call("t"+id, "CronCreate", map[string]any{"cron": "*/10 * * * *", "prompt": "check " + id}).
+			result("t"+id, "Scheduled recurring job "+id+" (Every 10 minutes). Next run: 10:10.")
+	}
+	if s := z.facts(NewTracker(z.path), z.at); len(s.Runs) != 2 || !strings.HasPrefix(s.Runs[0].Key, "job:j1@") {
+		t.Fatalf("a tie: %+v", s.Runs)
+	}
+	// A job every five minutes runs 4 minutes 45 seconds after its last run, on time.
+	y := newScript(t).call("tu1", "CronCreate", map[string]any{"cron": "*/5 * * * *", "prompt": "poll"}).
+		result("tu1", "Scheduled recurring job j5 (Every 5 minutes). Next run: 10:05.")
+	y.at = time.Date(2026, 3, 4, 10, 5, 0, 0, time.UTC)
+	y.fire("Running scheduled task (Mar 4 10:05am)", "j5")
+	ran := y.at
+	if s := y.facts(NewTracker(y.path), y.at); !first(s).Due.Equal(ran.Add(4*time.Minute + 45*time.Second)) {
+		t.Fatalf("five minutes: due %v", first(s).Due)
+	}
+	// A scheduled run begins a turn, though its prompt is the harness's.
+	y.add(map[string]any{"type": "user", "isMeta": true, "message": map[string]any{"content": "poll"}}).say("Polled.")
+	if s := y.facts(NewTracker(y.path), y.at); !s.TurnBegan.Equal(ran) {
+		t.Fatalf("the run's turn began %v, want %v", s.TurnBegan, ran)
 	}
 }
 
@@ -182,19 +281,32 @@ func TestAOneShotIsDueOnTime(t *testing.T) {
 		result("tu1", "Scheduled one-shot task r1 (Mar 4 at 10:20 AM). Next run: 10:20. Session-only (not written to disk, dies when Claude exits). It will fire once then auto-delete.")
 	tr := NewTracker(x.path)
 	run := time.Date(2026, 3, 4, 10, 20, 0, 0, time.UTC)
-	if s := x.facts(tr, x.at); !s.WakeDue.Equal(run) || !s.WakeJob || s.WakeFor != "remind me of the review" {
-		t.Fatalf("pending: due %v job %v for %q", s.WakeDue, s.WakeJob, s.WakeFor)
+	if s := x.facts(tr, x.at); !first(s).Due.Equal(run) || !first(s).Job || first(s).For != "remind me of the review" {
+		t.Fatalf("pending: due %v job %v for %q", first(s).Due, first(s).Job, first(s).For)
 	}
-	// A restart after its time loses it: Claude Code restores no one-shot whose time passed.
-	s := &sessions.Session{Started: run.Add(time.Minute), Tasks: []sessions.Task{}}
+	// A restart loses a session-only one; a durable one only if its time had come: Claude Code restores no
+	// one-shot whose time passed.
+	s := &sessions.Session{Started: run.Add(-time.Minute), Tasks: []sessions.Task{}}
 	NewTracker(x.path).Facts(s, run.Add(time.Hour))
-	if !s.WakeDue.IsZero() {
-		t.Fatalf("restarted after it: due %v", s.WakeDue)
+	if !first(s).Due.IsZero() {
+		t.Fatalf("a session-only one restarted: due %v", first(s).Due)
+	}
+	d := newScript(t).call("tu1", "CronCreate", map[string]any{"cron": "20 10 4 3 *", "prompt": "remind me of the review", "recurring": false, "durable": true}).
+		result("tu1", "Scheduled one-shot task r1 (Mar 4 at 10:20 AM). Next run: 10:20. Persisted to .claude/scheduled_tasks.json. It will fire once then auto-delete.")
+	for _, c := range []struct {
+		started time.Time
+		kept    bool
+	}{{run.Add(-time.Minute), true}, {run.Add(time.Minute), false}} {
+		s := &sessions.Session{Started: c.started, Tasks: []sessions.Task{}}
+		NewTracker(d.path).Facts(s, run.Add(time.Hour))
+		if first(s).Due.IsZero() == c.kept {
+			t.Errorf("a durable one restarted at %v: due %v", c.started, first(s).Due)
+		}
 	}
 	x.at = run
 	x.fire("Running scheduled task (Mar 4 10:20am)", "r1")
-	if s := x.facts(tr, x.at); !s.WakeDue.IsZero() || s.Loop != "" {
-		t.Fatalf("after it ran: due %v loop %q", s.WakeDue, s.Loop)
+	if s := x.facts(tr, x.at); !first(s).Due.IsZero() || s.Loop != "" {
+		t.Fatalf("after it ran: due %v loop %q", first(s).Due, s.Loop)
 	}
 }
 
@@ -218,6 +330,8 @@ func TestSchedulesReadAsCronDoes(t *testing.T) {
 		{"0 9 1-31 * 1", at(10, 0), day(9, 9, 0), 30 * time.Minute},    // every day of the month is no restriction: Mondays
 		{"0 9 1,15 * 0-6", at(10, 0), day(15, 9, 0), 30 * time.Minute}, // every day of the week is none: the 1st and the 15th
 		{"0 9 1 * 0-7", at(10, 0), time.Date(2026, 4, 1, 9, 0, 0, 0, time.Local), 30 * time.Minute},
+		{"0 9 1 * 1-7", at(10, 0), time.Date(2026, 4, 1, 9, 0, 0, 0, time.Local), 30 * time.Minute}, // 7 is Sunday: every day
+		{"0 9 1 * 1-6", at(10, 0), day(5, 9, 0), 30 * time.Minute},                                  // not Sunday: the 1st, or Monday to Saturday
 	}
 	for _, c := range cases {
 		sc, ok := parseSchedule(c.expr)
@@ -229,7 +343,7 @@ func TestSchedulesReadAsCronDoes(t *testing.T) {
 			t.Errorf("%s after %v: next %v lateness %v, want %v %v", c.expr, c.after, n, sc.lateness(n), c.next, c.lateness)
 		}
 	}
-	for _, bad := range []string{"", "* * * *", "0 9 * * MON", "61 * * * *", "*/0 * * * *", "5-1 * * * *", "5/15 * * * *"} {
+	for _, bad := range []string{"", "* * * *", "0 9 * * MON", "61 * * * *", "*/0 * * * *", "5-1 * * * *", "5/15 * * * *", "5/1 * * * *", "+5 * * * *"} {
 		if _, ok := parseSchedule(bad); ok {
 			t.Errorf("%q read", bad)
 		}
@@ -248,6 +362,12 @@ func TestAClockChangeRunsAMinuteOnce(t *testing.T) {
 	ran := time.Date(2026, 11, 1, 5, 30, 30, 0, time.UTC)                           // the first 01:30 there, before the clock goes back an hour
 	if n := sc.next(ran); !n.Equal(time.Date(2026, 11, 1, 7, 30, 0, 0, time.UTC)) { // 02:30, an hour after standard time began
 		t.Fatalf("after the repeated hour's first pass: next %v", n)
+	}
+	// A daily run Claude Code delayed into the repeated hour's second pass does not run again that night.
+	daily, _ := parseSchedule("45 1 * * *")
+	late := time.Date(2026, 11, 1, 6, 15, 0, 0, time.UTC) // 01:15 standard time, the hour's second pass
+	if n := daily.next(late); !n.Equal(time.Date(2026, 11, 2, 6, 45, 0, 0, time.UTC)) {
+		t.Fatalf("after a run in the second pass: next %v", n)
 	}
 	// Spring forward: the hour that never comes does not run.
 	sc, _ = parseSchedule("30 2 * * *")

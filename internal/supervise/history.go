@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"regexp"
@@ -118,18 +117,21 @@ type replayTask struct {
 }
 
 // replayCron is a job CronCreate scheduled, as the store keeps it: its expression, when it was made and last ran,
-// and what it runs.
+// what it runs, and whether its harness records its runs.
 type replayCron struct {
 	expr      string
 	at, fired time.Time
 	oneShot   bool
+	durable   bool
 	what      string
+	seen      bool
 }
 
 // replayCall is what a ScheduleWakeup or a CronCreate call asked for: what it is for (its reason, else its prompt,
 // unless the prompt is a loop's own sentinel), and a CronCreate call's expression.
 type replayCall struct {
 	what, cron string
+	durable    bool
 }
 
 // callOf reads a ScheduleWakeup or a CronCreate call's input from its record in the transcript while it is there
@@ -164,6 +166,7 @@ func callOf(e store.Event, id string) replayCall {
 	}
 	str := func(k string) string { v, _ := in[k].(string); return v }
 	c := replayCall{cron: str("cron"), what: str("reason")}
+	c.durable, _ = in["durable"].(bool)
 	if c.what == "" && !strings.HasPrefix(strings.TrimSpace(str("prompt")), "<<") {
 		c.what = str("prompt")
 	}
@@ -239,6 +242,32 @@ type replayWake struct {
 	at, set time.Time
 	what    string
 	sign    string // why it may have been lost
+	seen    bool   // its harness records its run
+}
+
+// recordsRunsAt reports whether the Claude Code that wrote an event's record records the scheduled runs it starts:
+// by the record's version while the transcript is there; true when it is gone, or the session showed a run's
+// record already.
+func recordsRunsAt(e store.Event, firesSeen bool) bool {
+	if firesSeen {
+		return true
+	}
+	v := versionAt(e.Ref)
+	return v == "" || claude.RecordsRuns(v)
+}
+
+// versionAt is the Claude Code version that wrote an event's record, "" when its transcript is gone or the record
+// does not say.
+func versionAt(ref string) string {
+	raw := recordAt(ref)
+	if raw == nil {
+		return ""
+	}
+	var rec struct {
+		Version string `json:"version"`
+	}
+	json.Unmarshal(raw, &rec)
+	return rec.Version
 }
 
 // timeline turns one session's events into its points: one for each input, with the stop before it, and one
@@ -250,18 +279,23 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 	calls := map[string]replayCall{} // a ScheduleWakeup or CronCreate call's id -> what it asked for
 	var wake replayWake
 	var ownerAt, resumed, turnBegan time.Time
+	firesSeen := false      // a run's record showed in the session: its harness records them
 	var restarted time.Time // the last reopening: what ran died with the process, and Claude Code restored its jobs
 	waitedThrough := func(sign string, at time.Time) {
-		if !wake.at.IsZero() && !at.Before(wake.set) && at.Before(wake.at) && wake.sign == "" {
+		if !wake.at.IsZero() && !at.Before(wake.set) && wake.sign == "" {
 			wake.sign = sign
 		}
 	}
-	reopened := func(at time.Time) {
-		restarted, resumed, tasks = at, at, map[string]replayTask{}
-		if wake.at.Before(at) {
-			wake = replayWake{} // due before the restart: lost, and Claude Code says so; one due after it is armed again
-		}
+	// restart is a new process: a restart in the foreground loses a pending wakeup, and a session-only job dies
+	// (JobRuns).
+	restart := func(at time.Time) {
+		restarted, wake = at, replayWake{}
 	}
+	reopened := func(at time.Time) {
+		resumed, tasks = at, map[string]replayTask{}
+		restart(at)
+	}
+	version := "" // the Claude Code version of the last record read: a new one is a new process
 	var words, entry, harness, prevRole, prevPrior string
 	var prevAt time.Time
 	var owes time.Time           // the model owes its reply since: an input, or the result of a turn's last call
@@ -284,28 +318,16 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			s.Loop = c.expr
 		}
 		s.TurnBegan, s.IdleAt = turnBegan, prevAt
-		// When its own pending wakeup, or its jobs' next run, should have fired at the latest, as the tracker reads it.
-		earliest := func(d time.Time, what, key, sign string, job bool) {
-			if !d.IsZero() && (s.WakeDue.IsZero() || d.Before(s.WakeDue)) {
-				s.WakeDue, s.WakeFor, s.WakeKey, s.WakeSign, s.WakeJob = d, what, key, sign, job
-			}
-		}
-		if !wake.at.IsZero() {
-			earliest(wake.at, wake.what, fmt.Sprintf("wakeup@%d", wake.set.UnixMilli()), wake.sign, false)
+		// Its own runs its harness should start, as the session layer lists them, a reopening for a restart.
+		if !wake.at.IsZero() && (wake.seen || firesSeen) {
+			s.Runs = append(s.Runs, claude.WakeRun(wake.at, wake.set, wake.what, wake.sign))
 		}
 		for id, c := range crons {
-			if !c.oneShot && at.Sub(c.at) > 7*24*time.Hour {
-				continue
-			}
-			after := latestOf(c.at, c.fired)
-			if !c.oneShot && after.Before(restarted) {
-				after = restarted
-			}
-			run, last, ok := claude.ScheduledRun(c.expr, after, c.oneShot)
-			if ok && !(c.oneShot && run.Before(restarted)) {
-				earliest(last, c.what, fmt.Sprintf("job:%s@%d", id, run.UnixMilli()), "", true)
+			if c.seen || firesSeen {
+				s.Runs = append(s.Runs, claude.JobRuns(id, c.expr, c.oneShot, c.durable, c.what, c.at, c.fired, restarted, at)...)
 			}
 		}
+		claude.SortRuns(s.Runs)
 		switch prevRole {
 		case "call":
 			s.Working, s.Busy = len(pending) > 0, len(pending) > 0
@@ -333,6 +355,12 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			harness = e.Harness
 		}
 		r := role(e, m)
+		if v := versionAt(e.Ref); v != "" {
+			if version != "" && v != version {
+				restart(e.TS)
+			}
+			version = v
+		}
 		if r == "compaction" {
 			waitedThrough("the conversation was compacted while it waited", e.TS)
 		}
@@ -386,6 +414,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			lastMainUser = true
 		case "self":
 			if prior, _ := m["prior"].(string); prior == "scheduled_task_fire" { // a scheduled run started
+				firesSeen = true
 				f, ok := fireBetween(lastRef, e.Ref)
 				if !ok { // the transcript is gone: the run whose prompt this is
 					for k, c := range crons {
@@ -480,14 +509,15 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 				}
 				if g := hWake.FindStringSubmatch(s); g != nil && e.Tool == "ScheduleWakeup" {
 					n, _ := strconv.Atoi(g[1])
-					wake = replayWake{at: e.TS.Add(time.Duration(n) * time.Second), set: e.TS, what: calls[id].what}
+					wake = replayWake{at: e.TS.Add(time.Duration(n) * time.Second), set: e.TS, what: calls[id].what, seen: recordsRunsAt(e, firesSeen)}
 				}
 				if (strings.HasPrefix(s, "Loop stopped") || strings.HasPrefix(s, "Wakeup not scheduled")) && e.Tool == "ScheduleWakeup" {
 					wake = replayWake{}
 				}
 				if g := hCron.FindStringSubmatch(s); g != nil && e.Tool == "CronCreate" {
 					c := calls[id]
-					crons[g[2]] = replayCron{expr: firstNonEmpty(c.cron, g[3]), at: e.TS, oneShot: g[1] == "one-shot", what: c.what}
+					crons[g[2]] = replayCron{expr: firstNonEmpty(c.cron, g[3]), at: e.TS, oneShot: g[1] == "one-shot", what: c.what, seen: recordsRunsAt(e, firesSeen),
+						durable: c.durable && !strings.Contains(s, "Session-only") || strings.Contains(s, "Persisted to")}
 				}
 			}
 			lastMainUser = true
@@ -526,13 +556,6 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		out = append(out, Point{Session: id, Stop: stopOf(until, ""), Next: Next{Kind: "none"}, Entry: entry})
 	}
 	return out
-}
-
-func latestOf(a, b time.Time) time.Time {
-	if b.After(a) {
-		return b
-	}
-	return a
 }
 
 // requestLimit bounds how much of a transcript requestBetween reads between two events.

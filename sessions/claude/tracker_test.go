@@ -33,10 +33,16 @@ func (x *script) stamp() string {
 	return x.at.Format(time.RFC3339Nano)
 }
 
+// version is the Claude Code version the synthetic transcripts are written by: one that records scheduled runs.
+const version = "2.1.316"
+
 func (x *script) add(line map[string]any) *script {
 	x.t.Helper()
 	if _, ok := line["timestamp"]; !ok {
 		line["timestamp"] = x.stamp()
+	}
+	if _, ok := line["version"]; !ok {
+		line["version"] = version
 	}
 	fake.Append(x.t, x.path, line)
 	return x

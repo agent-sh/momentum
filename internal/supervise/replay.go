@@ -157,15 +157,10 @@ func Replay(points []Point, labels []Label, p Params, probe Probe, until time.Ti
 	var out []Result
 	resynced := map[string]bool{} // a session's wakeups and runs the overdue rule acted on: one resync for each
 	for _, pt := range points {
-		if k := pt.Session + " " + pt.Stop.WakeKey; pt.Stop.WakeKey != "" && resynced[k] {
-			pt.Stop.WakeHandled = true
-		}
+		pt.Stop.Choose(func(k string) bool { return resynced[pt.Session+" "+k] }, pt.Stop.At, p)
 		d := Plan(pt.Stop, Tries{}, p, probe)
 		if pt.Waiting {
 			d = PlanOnly(RuleStalled, pt.Stop, Tries{}, p, probe)
-		}
-		if (d.Verdict == Wait || d.Verdict == Hold) && !d.RuleAt.IsZero() && p.Stale > 0 && pt.Stop.At.Sub(d.RuleAt) > p.Stale {
-			d.Verdict, d.Stale = Skip, true // its time came long before the stop: live, the first run after it finds it stale
 		}
 		r := Result{Point: pt, Decision: d, Label: labelOf(pt)}
 		end := pt.Next.At

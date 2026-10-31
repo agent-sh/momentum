@@ -159,14 +159,15 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 		}
 		presence := h.presence(s, ownerAt, answered)
 		stop := StopOf(s, presence)
-		if !stop.RequestAt.IsZero() || !stop.WakeDue.IsZero() && stop.WakeDue.Before(now) {
+		if !stop.RequestAt.IsZero() || len(stop.Runs) > 0 && stop.Runs[0].Due.Before(now) {
 			if sleep == nil {
 				a, b := sv.sleep(ctx)
 				sleep = &[2]time.Time{a, b}
 			}
 			stop.Slept, stop.Woke = sleep[0], sleep[1]
 		}
-		stop.WakeHandled = stop.WakeKey != "" && h.wakes[stop.WakeKey]
+		dryOverdue := !sv.Live[RuleOverdue]
+		stop.Choose(func(k string) bool { return h.wakes[k] || dryOverdue && h.dryWakes[k] }, now, sv.Params)
 		var put []store.Event
 		resolved := sv.outcome(ctx, s, stop, &h, now, &put)
 		if !resolved {
@@ -213,6 +214,9 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 					"error": stop.Error, "dry": true}
 				if !stop.RequestAt.IsZero() {
 					m["request_at"] = stop.RequestAt.UnixMilli() // the request a stalled turn waited on
+				}
+				if d.Rule == RuleOverdue {
+					m["wake_key"] = stop.WakeKey // one resync per wakeup or run, dry too
 				}
 				e.Meta = meta(m)
 				if err := sv.put(ctx, []store.Event{e}); err != nil {
@@ -471,6 +475,7 @@ type past struct {
 	keys      map[string]bool
 	escapes   []time.Time     // the interruptions momentum's own Escapes left in the transcript
 	wakes     map[string]bool // the wakeups and runs (their keys) a resync was typed for
+	dryWakes  map[string]bool // the wakeups and runs the overdue rule, dry, recorded a resync for
 	// dryRequest is, by key, the request each dry act of a stalled turn was about (ms), as its last run put it
 	dryRequest map[string]int64
 }
@@ -482,7 +487,7 @@ type caseRec struct {
 }
 
 func history(evs []store.Event) past {
-	h := past{keys: map[string]bool{}, atPane: map[int64]bool{}, dryRequest: map[string]int64{}, wakes: map[string]bool{}}
+	h := past{keys: map[string]bool{}, atPane: map[int64]bool{}, dryRequest: map[string]int64{}, wakes: map[string]bool{}, dryWakes: map[string]bool{}}
 	outcomes := map[string]map[string]bool{}
 	for _, e := range evs {
 		h.keys[e.SourceKey] = true
@@ -492,6 +497,9 @@ func history(evs []store.Event) past {
 		case KindAct:
 			if e.Experiment != "" {
 				h.dryRequest[e.SourceKey] = int64(num(m["request_at"]))
+				if k := str(m["wake_key"]); k != "" {
+					h.dryWakes[k] = true
+				}
 				continue // what a dry rule would have sent
 			}
 			sending, _ := m["sending"].(bool) // a run that died after it began to type
@@ -548,7 +556,8 @@ func (h past) tries(ownerAt time.Time) Tries {
 	t := Tries{}
 	from := map[string]time.Time{}
 	for _, s := range h.sends {
-		if s.result[Worked] && s.at.After(from[s.rule]) {
+		// a resync that worked does not start the count again: a session whose runs keep not starting is a case
+		if s.result[Worked] && s.rule != RuleOverdue && s.at.After(from[s.rule]) {
 			from[s.rule] = s.at
 		}
 	}
@@ -692,8 +701,6 @@ func (sv *Supervisor) outcome(ctx context.Context, s *sessions.Session, stop Sto
 		again = Cutoff(stop.Words)
 	case RulePromise:
 		again = Promise(stop.Words) != "" && stop.Tasks == 0 && stop.WakeAt.IsZero() && stop.Loop == ""
-	case RuleOverdue: // the run it was for came due before the message, and has not fired since
-		again = !stop.WakeDue.IsZero() && stop.WakeDue.Before(l.at)
 	}
 	switch {
 	case again:
@@ -745,8 +752,8 @@ func isAccess(text string) bool {
 func StopOf(s *sessions.Session, presence time.Time) Stop {
 	st := Stop{Key: s.Key, Tool: s.Tool, Name: s.Name, Where: s.Where, Auto: s.Auto, Phase: s.Phase, At: s.Since,
 		Words: Words(s.LastText), Working: s.TurnOpen, Busy: s.Now != "", Tasks: len(s.Tasks), WakeAt: s.WakeAt, Loop: s.Loop,
-		ResumedAt: s.ResumedAt, RequestAt: s.RequestAt, Queued: s.Queued, WakeDue: s.WakeDue, WakeFor: s.WakeFor, OwnerAt: presence,
-		WakeKey: s.WakeKey, WakeJob: s.WakeJob, WakeSign: s.WakeSign, TurnBegan: s.TurnBegan, IdleAt: s.IdleSince, Started: s.Started}
+		ResumedAt: s.ResumedAt, RequestAt: s.RequestAt, Queued: s.Queued, Runs: s.Runs, OwnerAt: presence,
+		TurnBegan: s.TurnBegan, IdleAt: s.IdleSince, Started: s.Started}
 	switch s.AskKind {
 	case sessions.AskError:
 		st.Error = strings.TrimPrefix(s.Ask, "stopped on an error: ")

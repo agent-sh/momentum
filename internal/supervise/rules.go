@@ -55,20 +55,21 @@ type Stop struct {
 	Tasks           int              // background work in flight
 	WakeAt          time.Time
 	Loop            string
-	WakeDue         time.Time // when its own pending wakeup or loop run should have fired at the latest
-	WakeFor         string    // what that wakeup or run is for
-	WakeKey         string    // which wakeup or run that is
-	WakeJob         bool      // a scheduled job's run, not a self-paced loop's wakeup
-	WakeSign        string    // why a self-paced wakeup may have been lost: a cause its harness drops one for
-	WakeHandled     bool      // a resync for that wakeup or run went in already
-	TurnBegan       time.Time // when its last turn began
-	IdleAt          time.Time // when its last turn ended
-	ResumedAt       time.Time // the harness reopened the session after it ended mid-task, and nothing happened since
-	RequestAt       time.Time // the model request the open turn still waits on: nothing answered it since
-	Queued          int       // messages its user typed while the turn ran, which the harness holds
-	Slept, Woke     time.Time // the machine's last suspend: a wait counts from its end when it began before the wait ended
-	OwnerAt         time.Time // when the owner was last at the session: his last turn, or his opening it
-	Started         time.Time // when the session's process started; a stop before it is a past process's
+	Runs            []sessions.Run // its own runs its harness should start, earliest first
+	WakeDue         time.Time      // when the run the overdue rule reads (Choose) should have started at the latest
+	WakeFor         string         // what that run is for
+	WakeKey         string         // which run that is
+	WakeJob         bool           // a scheduled job's run, not a self-paced loop's wakeup
+	WakeOnce        bool           // a one-shot job's only run
+	WakeSign        string         // why a self-paced wakeup may have been lost: a cause its harness drops one for
+	TurnBegan       time.Time      // when its last turn began
+	IdleAt          time.Time      // when its last turn ended
+	ResumedAt       time.Time      // the harness reopened the session after it ended mid-task, and nothing happened since
+	RequestAt       time.Time      // the model request the open turn still waits on: nothing answered it since
+	Queued          int            // messages its user typed while the turn ran, which the harness holds
+	Slept, Woke     time.Time      // the machine's last suspend: a wait counts from its end when it began before the wait ended
+	OwnerAt         time.Time      // when the owner was last at the session: his last turn, or his opening it
+	Started         time.Time      // when the session's process started; a stop before it is a past process's
 }
 
 // Tries counts a session's messages by rule in the episode that is still going: since the owner's last turn and
@@ -353,7 +354,7 @@ func afterSleep(s Stop, from time.Time, wait time.Duration, why string) (time.Ti
 // task's notification or a compaction while it waited (WakeSign), or a suspend through its time. One resync per
 // wakeup or run, quoting what it was for; a second lost one without an owner turn, then a case.
 func overdue(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
-	if s.Tool != "claude" || s.WakeDue.IsZero() || s.WakeHandled || s.Working || s.Error != "" || s.Tasks > 0 || priorProcess(s) || AsksOwner(s.Words) {
+	if s.Tool != "claude" || s.WakeDue.IsZero() || s.Working || s.Error != "" || s.Tasks > 0 || priorProcess(s) || AsksOwner(s.Words) {
 		return Decision{}, false
 	}
 	sign := s.WakeSign
@@ -371,32 +372,62 @@ func overdue(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
 	if sign != "" {
 		why += "; " + sign
 	}
-	from := s.WakeDue
-	if s.IdleAt.After(from) && !s.TurnBegan.After(from) {
-		from = s.IdleAt // it came due while its last turn ran: the run waits for the turn
-	}
-	from, why = afterSleep(s, from, p.OverdueSlack, why)
+	from, why := afterSleep(s, overdueFrom(s, s.WakeDue), p.OverdueSlack, why)
 	n := tries[RuleOverdue]
 	if n >= p.OverdueTries { // the turn the last message opened has just ended: a case once it too has waited
 		return usedAt(RuleOverdue, n, from.Add(p.OverdueSlack), why), true
 	}
-	return wait(RuleOverdue, from.Add(p.OverdueSlack), n+1, OverdueText(s.WakeDue, s.WakeFor, s.WakeJob), why), true
+	return wait(RuleOverdue, from.Add(p.OverdueSlack), n+1, OverdueText(s, n+1), why), true
 }
 
-// OverdueText is the overdue rule's message: what did not run, when it was due, and what it was for, quoted. A
-// job keeps its schedule; a self-paced loop needs its next wakeup set.
-func OverdueText(due time.Time, what string, job bool) string {
-	when := due.Local().Format("Jan 2 15:04")
-	what = clip(what, 140)
-	switch {
-	case job && what != "":
-		return fmt.Sprintf("%s Your scheduled job's run, due by %s, did not start, so nothing ran %q. Do it now; the job keeps its schedule.", Marker, when, what)
-	case job:
-		return fmt.Sprintf("%s Your scheduled job's run, due by %s, did not start. Do what it was for now; the job keeps its schedule.", Marker, when)
-	case what != "":
-		return fmt.Sprintf("%s Your own wakeup, due by %s, did not fire, so nothing woke you for %q. Do it now, and set the next one.", Marker, when, what)
+// turnGrace is how far apart a turn's start and a run's time may be and still be one moment: the records' clocks.
+const turnGrace = 5 * time.Second
+
+// overdueFrom is when a run due by due should have started: then, or when the last turn ended if it came due
+// while that turn ran (a run waits for the turn). One due before the last turn began had its time then.
+func overdueFrom(s Stop, due time.Time) time.Time {
+	if s.IdleAt.After(due) && !s.TurnBegan.After(due.Add(turnGrace)) {
+		return s.IdleAt
 	}
-	return fmt.Sprintf("%s Your own wakeup, due by %s, did not fire. Do what it was for now, and set the next one.", Marker, when)
+	return due
+}
+
+// Choose sets the run the overdue rule reads: the earliest of the stop's runs that no resync went in for (handled)
+// and whose time is not past the stale hour at now. A later run of a job that keeps missing them is its own.
+func (s *Stop) Choose(handled func(key string) bool, now time.Time, p Params) {
+	for _, r := range s.Runs {
+		if handled(r.Key) || overdueFrom(*s, r.Due).Add(p.OverdueSlack+p.Stale).Before(now) {
+			continue
+		}
+		s.WakeDue, s.WakeFor, s.WakeKey, s.WakeJob, s.WakeOnce, s.WakeSign = r.Due, r.For, r.Key, r.Job, r.Once, r.Sign
+		return
+	}
+}
+
+// OverdueText is the overdue rule's message for the stop's run and its try: what did not run, when it was due,
+// and what it was for, quoted. Claude Code cancels a self-paced loop's wakeup on its user's Esc and leaves no
+// record, so the loop goes on only if it is still wanted, and when the conversation does not say, the session asks
+// its user (Claude Code's own words for a wakeup a restart lost). A job keeps its schedule; one whose runs keep
+// not starting is made again.
+func OverdueText(s Stop, try int) string {
+	when := s.WakeDue.Local().Format("Jan 2 15:04")
+	what := clip(s.WakeFor, 140)
+	quoted := ""
+	if what != "" {
+		quoted = fmt.Sprintf(", so nothing ran %q", what)
+	}
+	switch {
+	case s.WakeOnce:
+		return fmt.Sprintf("%s Your one-shot task, due by %s, did not start%s. Do it now.", Marker, when, quoted)
+	case s.WakeJob && try > 1:
+		return fmt.Sprintf("%s Your scheduled job's run, due by %s, did not start either%s. Do it now, and make the job again if it is still wanted: its runs are not starting.", Marker, when, quoted)
+	case s.WakeJob:
+		return fmt.Sprintf("%s Your scheduled job's run, due by %s, did not start%s. Do it now; the job keeps its schedule.", Marker, when, quoted)
+	}
+	if what != "" {
+		quoted = fmt.Sprintf(", so nothing woke you for %q", what)
+	}
+	return fmt.Sprintf("%s Your own wakeup, due by %s, did not fire%s. If the loop is still wanted, do it now and set the next one; when the conversation does not make that clear, ask your user first.", Marker, when, quoted)
 }
 
 // promise: the turn ended, nothing is in flight or scheduled to wake it, and its last words promise to come back

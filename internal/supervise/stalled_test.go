@@ -64,6 +64,9 @@ func (x *transcript) add(line map[string]any) *transcript {
 	if _, ok := line["timestamp"]; !ok {
 		line["timestamp"] = x.at.Format(time.RFC3339Nano)
 	}
+	if _, ok := line["version"]; !ok {
+		line["version"] = "2.1.316" // a Claude Code that records scheduled runs
+	}
 	b, err := json.Marshal(line)
 	if err != nil {
 		x.t.Fatal(err)

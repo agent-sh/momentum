@@ -68,7 +68,8 @@ type task struct {
 
 type cron struct {
 	Label   string    `json:"label"`
-	Expr    string    `json:"expr,omitempty"` // what it runs on: CronCreate's input, or the label where a version wrote it
+	Expr    string    `json:"expr,omitempty"`    // what it runs on: CronCreate's input, or the label where a version wrote it
+	Durable bool      `json:"durable,omitempty"` // written to disk: a restart restores it; a session-only one dies with its process
 	At      time.Time `json:"at"`
 	OneShot bool      `json:"one_shot,omitempty"`
 	For     string    `json:"for,omitempty"`  // the prompt it runs
@@ -82,6 +83,7 @@ type call struct {
 	Type  string    `json:"type,omitempty"`  // an Agent call's subagent type
 	For   string    `json:"for,omitempty"`   // what a wakeup or a scheduled job is for: its reason, else its prompt
 	Cron  string    `json:"cron,omitempty"`  // a CronCreate call's expression
+	Kept  bool      `json:"kept,omitempty"`  // a CronCreate call that asked for a durable job
 	At    time.Time `json:"at"`
 }
 
@@ -127,7 +129,9 @@ type track struct {
 	// Queue is what Claude Code holds to send when the turn allows, oldest first (queueKey): a message its user
 	// typed by its text, "" for anything else it queued (a task's notification).
 	Queue []string `json:"queue,omitempty"`
-	log   sessions.Log
+	// Version is the Claude Code version of the latest record: an older one writes no record of a scheduled run.
+	Version string `json:"version,omitempty"`
+	log     sessions.Log
 }
 
 func newTrack() track {
@@ -210,6 +214,7 @@ type line struct {
 	IsMeta       bool   `json:"isMeta"`
 	Compact      bool   `json:"isCompactSummary"`
 	Timestamp    string `json:"timestamp"`
+	Version      string `json:"version"`
 	APIError     bool   `json:"isApiErrorMessage"`
 	Error        string `json:"error"` // an API error's kind, as Claude Code names it
 	PromptSource string `json:"promptSource"`
@@ -244,6 +249,9 @@ func (t *Tracker) line(raw []byte) {
 		return
 	}
 	at, _ := time.Parse(time.RFC3339Nano, e.Timestamp)
+	if e.Version != "" {
+		t.st.Version = e.Version
+	}
 	open := t.TurnOpen() // before this record answers anything: a reopening closes a turn that was open
 	defer func() {
 		switch now := t.TurnOpen(); {
@@ -316,6 +324,7 @@ func (t *Tracker) fired(raw []byte, at time.Time) {
 	}
 	json.Unmarshal(raw, &f)
 	st := &t.st
+	st.TurnBegan = at // the run's prompt opens a turn, recorded as the harness's own
 	if c, job := st.Crons[f.TaskID]; job {
 		if c.OneShot {
 			delete(st.Crons, f.TaskID) // it fires once, then deletes itself
@@ -335,10 +344,10 @@ func (t *Tracker) clearWake() {
 	t.st.WakeAt, t.st.WakeFor, t.st.WakeSign = time.Time{}, "", ""
 }
 
-// waitedThrough notes that sign came while a wakeup was pending, before its time: a cause Claude Code is known to
-// drop one for. What comes after its time did not keep it from firing.
+// waitedThrough notes that sign came while a wakeup was pending: a cause Claude Code is known to drop one for, as
+// a task's notification that comes after its time when the task ran through it.
 func (t *Tracker) waitedThrough(sign string, at time.Time) {
-	if st := &t.st; !st.WakeAt.IsZero() && !at.Before(st.WakeSet) && at.Before(st.WakeAt) && st.WakeSign == "" {
+	if st := &t.st; !st.WakeAt.IsZero() && !at.Before(st.WakeSet) && st.WakeSign == "" {
 		st.WakeSign = sign
 	}
 }
@@ -355,50 +364,135 @@ func wakeFor(reason, prompt string) string {
 	return prompt
 }
 
-// Due is the earliest run of the session's own that should have fired by now: its pending wakeup, or the next run
-// of a job it scheduled.
-type Due struct {
-	At   time.Time // the latest Claude Code starts it: the wakeup's time; the run's, and the most it delays one
-	For  string    // what it is for: the wakeup's reason, else its prompt; the job's prompt
-	Key  string    // which wakeup or run it is, the same on every scan
-	Job  bool      // a job's run, not a self-paced loop's wakeup
-	Sign string    // a pending wakeup's WakeSign
-}
+// Bounds on a job's runs a scan lists: one that came due longer ago than runsBack is past any rule, and a job lists
+// at most runsMax.
+const (
+	runsBack = 6 * time.Hour
+	runsMax  = 64
+)
 
-// due is the session's Due, zero when nothing is pending. A restart keeps a wakeup due after it (Claude Code arms
-// it again) and loses one due before it (it says so); it restores the jobs, a recurring job from its first run
-// after the restart and a one-shot only before its time. A recurring job expires 7 days after it was made.
-func (t *Tracker) due(started, now time.Time) Due {
+// runs are the session's own runs its harness should start, earliest first and the same on every scan: the
+// pending wakeup, and each job's runs since it last ran that never started (Claude Code does not start one later)
+// with its next. A restart in the foreground loses a pending wakeup; a background session's process arms it
+// again, and its start is not known. A restart restores the jobs: a recurring one from its first run after the
+// restart, a one-shot only before its time. A recurring job expires 7 days after it was made.
+func (t *Tracker) runs(started, now time.Time) []sessions.Run {
 	st := &t.st
-	var d Due
-	earlier := func(c Due) {
-		if !c.At.IsZero() && (d.At.IsZero() || c.At.Before(d.At)) {
-			d = c
-		}
+	if !RecordsRuns(st.Version) {
+		return nil // a run that started looks like one that did not
 	}
+	var out []sessions.Run
 	if t.liveWake(started) {
-		earlier(Due{At: st.WakeAt, For: st.WakeFor, Key: fmt.Sprintf("wakeup@%d", st.WakeSet.UnixMilli()), Sign: st.WakeSign})
+		out = append(out, WakeRun(st.WakeAt, st.WakeSet, st.WakeFor, st.WakeSign))
 	}
 	for id, c := range st.Crons {
-		if !c.OneShot && now.Sub(c.At) > cronExpiry {
-			continue
-		}
-		after := latest(c.At, c.Fired)
-		if !c.OneShot && !started.IsZero() && after.Before(started) {
-			after = started // a restored job does not run for the runs it missed
-		}
-		run, last, ok := ScheduledRun(text.FirstNonEmpty(c.Expr, c.Label), after, c.OneShot)
-		if !ok || c.OneShot && !started.IsZero() && run.Before(started) {
-			continue
-		}
-		earlier(Due{At: last, For: c.For, Key: fmt.Sprintf("job:%s@%d", id, run.UnixMilli()), Job: true})
+		out = append(out, JobRuns(id, text.FirstNonEmpty(c.Expr, c.Label), c.OneShot, c.Durable, c.For, c.At, c.Fired, started, now)...)
 	}
-	return d
+	SortRuns(out)
+	return out
 }
 
-// liveWake reports a pending wakeup the session's process still holds: one due after the process started.
+// firstRecording is the first Claude Code version the history shows writing a record of each scheduled run
+// (scheduled_task_fire); an older one starts runs without one.
+var firstRecording = [3]int{2, 1, 291}
+
+// RecordsRuns reports whether Claude Code at version v records the scheduled runs it starts. An unknown version
+// does not.
+func RecordsRuns(v string) bool {
+	var n [3]int
+	parts := strings.SplitN(v, ".", 3)
+	if len(parts) != 3 {
+		return false
+	}
+	for i, p := range parts {
+		x, err := strconv.Atoi(strings.TrimRightFunc(p, func(r rune) bool { return r < '0' || r > '9' }))
+		if err != nil {
+			return false
+		}
+		n[i] = x
+	}
+	for i := range n {
+		if n[i] != firstRecording[i] {
+			return n[i] > firstRecording[i]
+		}
+	}
+	return true
+}
+
+// WakeRun is a pending wakeup as a run, keyed by when it was set.
+func WakeRun(at, set time.Time, what, sign string) sessions.Run {
+	return sessions.Run{Due: at, For: what, Key: fmt.Sprintf("wakeup@%d", set.UnixMilli()), Sign: sign}
+}
+
+// JobRuns are a job's runs as runs does: made at made on the expression expr, last run at fired, in a process
+// that started at started (zero when not known). A session-only job made before that died with its process.
+func JobRuns(id, expr string, oneShot, durable bool, what string, made, fired, started, now time.Time) []sessions.Run {
+	key := func(run time.Time) string { return fmt.Sprintf("job:%s@%d", id, run.UnixMilli()) }
+	if !durable && !started.IsZero() && made.Before(started) {
+		return nil
+	}
+	if oneShot {
+		if run, _, ok := ScheduledRun(expr, made); ok && (started.IsZero() || !run.Before(started)) {
+			return []sessions.Run{{Due: run, For: what, Key: key(run), Job: true, Once: true}}
+		}
+		return nil
+	}
+	if now.Sub(made) > cronExpiry {
+		return nil
+	}
+	after, ran := made, false
+	if fired.After(after) {
+		after, ran = fired, true
+	}
+	if !started.IsZero() && after.Before(started) {
+		after, ran = started, false // a restored job does not run for the runs it missed
+	}
+	if back := now.Add(-runsBack); after.Before(back) {
+		after, ran = back, false
+	}
+	var out []sessions.Run
+	for range runsMax {
+		run, last, ok := jobRun(expr, after, ran)
+		if !ok {
+			break
+		}
+		out = append(out, sessions.Run{Due: last, For: what, Key: key(run), Job: true})
+		if !last.Before(now) {
+			break // its next run
+		}
+		after, ran = run, true // it never started; the next is spaced from it
+	}
+	return out
+}
+
+// SortRuns orders runs earliest first, a tie by key, so that the order is the same on every scan.
+func SortRuns(rs []sessions.Run) {
+	sort.Slice(rs, func(i, j int) bool {
+		if !rs[i].Due.Equal(rs[j].Due) {
+			return rs[i].Due.Before(rs[j].Due)
+		}
+		return rs[i].Key < rs[j].Key
+	})
+}
+
+// jobRun is a recurring job's run after after, and the latest it starts. A job every five minutes runs 4 minutes
+// 45 seconds after its last run, on time; any other on its schedule, delayed up to the most Claude Code delays it.
+func jobRun(expr string, after time.Time, ran bool) (run, latest time.Time, ok bool) {
+	if ran && strings.Join(strings.Fields(expr), " ") == "*/5 * * * *" {
+		run = after.Add(fiveMinuteGap)
+		return run, run, true
+	}
+	return ScheduledRun(expr, after)
+}
+
+// fiveMinuteGap is how long after its last run Claude Code starts a job that runs every five minutes: 15 seconds
+// before a five-minute prompt cache expires.
+const fiveMinuteGap = 4*time.Minute + 45*time.Second
+
+// liveWake reports a pending wakeup the session's process still holds: one this process set, or any in a session
+// whose process start is not known (a background session, whose process arms it again).
 func (t *Tracker) liveWake(started time.Time) bool {
-	return !t.st.WakeAt.IsZero() && (started.IsZero() || !t.st.WakeAt.Before(started))
+	return !t.st.WakeAt.IsZero() && (started.IsZero() || !t.st.WakeSet.Before(started.Add(-2*time.Second)))
 }
 
 // queued follows Claude Code's queue of what it sends when the turn allows: a message its user typed while the turn
@@ -496,6 +590,7 @@ func (t *Tracker) assistant(e line, at time.Time, open bool) {
 			}
 			if b.Name == "CronCreate" {
 				c.Cron = text.Str(in["cron"])
+				c.Kept, _ = in["durable"].(bool)
 			}
 			st.Calls[b.ID] = c
 			st.Group = append(st.Group, b.ID)
@@ -674,7 +769,8 @@ func (t *Tracker) result(b block, at time.Time) {
 		if expr == "" {
 			expr = m[3] // a version that wrote the expression in its result
 		}
-		st.Crons[m[2]] = cron{Label: m[3], Expr: expr, At: at, OneShot: m[1] == "one-shot", For: c.For}
+		st.Crons[m[2]] = cron{Label: m[3], Expr: expr, At: at, OneShot: m[1] == "one-shot", For: c.For,
+			Durable: c.Kept && !strings.Contains(out, "Session-only") || strings.Contains(out, "Persisted to")}
 	}
 	st.log.Add(sessions.Entry{Role: sessions.RoleOut, Text: text.OneLine(out, 160)})
 }
@@ -826,8 +922,7 @@ func (t *Tracker) Facts(s *sessions.Session, now time.Time) {
 	if s.Model == "" {
 		s.Model = t.st.Model
 	}
-	d := t.due(s.Started, now)
-	s.WakeDue, s.WakeFor, s.WakeKey, s.WakeJob, s.WakeSign = d.At, d.For, d.Key, d.Job, d.Sign
+	s.Runs = t.runs(s.Started, now)
 	s.TurnBegan, s.IdleSince = t.st.TurnBegan, t.st.TurnEnd
 	if t.liveWake(s.Started) && t.st.WakeAt.After(now.Add(-sessions.WakeGrace)) {
 		s.WakeAt = t.st.WakeAt
@@ -835,8 +930,8 @@ func (t *Tracker) Facts(s *sessions.Session, now time.Time) {
 	var newest time.Time
 	newestID := ""
 	for id, c := range t.st.Crons {
-		if now.Sub(c.At) > cronExpiry || (c.OneShot && now.Sub(c.At) > oneShotExpiry) {
-			continue // one that expired: a restart restores the others
+		if (!c.Durable && !s.Started.IsZero() && c.At.Before(s.Started)) || now.Sub(c.At) > cronExpiry || (c.OneShot && now.Sub(c.At) > oneShotExpiry) {
+			continue // a session-only job of an earlier process, or one that expired
 		}
 		if c.At.After(newest) || c.At.Equal(newest) && id > newestID {
 			newest, newestID, s.Loop = c.At, id, c.Label
