@@ -188,7 +188,8 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 		f.Action, f.class, f.Why = ActReport, "busy", "it waits: "+why
 		return []Finding{f}, notes, nil
 	}
-	envs := &uvEnvs{in: map[string]bool{}, ns: map[string]bool{}, resolve: true, hidden: r.m.hidesProcs(r.opt.ProcRoot)}
+	hides := r.m.procHides(r.opt.ProcRoot)
+	envs := &uvEnvs{in: map[string]bool{}, ns: map[string]bool{}, resolve: true, hidden: hides == procInvisible, hides: hides != procShown}
 	using := func(users string) string {
 		why := "these run from the cache or hold its lock unseen, and a prune deletes what they use (" + users + ")"
 		if len(envs.slow) > 0 {
@@ -200,7 +201,7 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 		return why
 	}
 	// the locks are read before the look, so a holder the look does not show has ended or is one it cannot read
-	lk := uvLock(r.opt.ProcRoot, c.named, c.lockReal, r.m)
+	lk := uvLock(r.opt.ProcRoot, c.named, c.lockReal, r.m, c.isLock)
 	up, now := uptimeTicks(r.opt.ProcRoot), look()
 	// a quiet wait for one uv process that has gone on for a day is reported: no install takes that long, and the
 	// rule cannot tell what such a process runs (a command that changed its environment, a stuck sync)
@@ -637,7 +638,8 @@ type uvEnvs struct {
 	in, ns       map[string]bool
 	resolve      bool
 	slow, unread []string
-	hidden       bool // /proc hides other users' processes (hidepid)
+	hidden       bool // /proc shows no directory for other users' processes (hidepid=invisible)
+	hides        bool // /proc hides other users' processes or what is in their directories (any hidepid)
 }
 
 // uvPlaceWait is how long the look waits for one place to be resolved and read; a place on a filesystem that does not
@@ -790,6 +792,8 @@ func uvUsers(s *Sample, procRoot string, c uvCache, holders map[int]bool, envs *
 			switch {
 			case unreadable(procRoot, q):
 				add(q, "a process the look cannot read runs under a holder of the lock")
+			case envs.hides && hiddenChild(s, procRoot, q):
+				add(q, "a process /proc hides runs under this one, under a holder of the lock")
 			case q != pid && layers && noPath(procRoot, q):
 				// its imports come from the cache's layer with no file of it open or mapped, and its environment, which
 				// would name the layer, is gone (setproctitle wrote over it)
@@ -809,23 +813,65 @@ func uvUsers(s *Sample, procRoot string, c uvCache, holders map[int]bool, envs *
 
 // uvLayers reports whether a uv process is a run that layers an environment of the cache over its command's (--with,
 // -w, --with-editable, --with-requirements): the command then imports from the cache with no file of it open or
-// mapped, while what it maps may come from the environment beneath. An argument of the command that looks so counts
-// too; that only holds a prune.
+// mapped, while what it maps may come from the environment beneath. It reads uv's options up to uv's command, the
+// first word that is no option or an option's value; every word after it is the command's own (gunicorn's -w,
+// Celery's --without-gossip). An option uvRunFlags does not know is read as one that takes a value, so a miss reads
+// on into the command's words, which only holds a prune.
 func uvLayers(argv []string) bool {
 	cmd := uvCommand(argv)
 	if len(cmd) == 0 || cmd[0] != "run" {
 		return false
 	}
-	for _, a := range cmd[1:] {
-		if a == "--" {
-			break
-		}
-		// -w alone, with its value after it, or among other short flags (-qw)
-		if strings.HasPrefix(a, "--with") || len(a) > 1 && a[0] == '-' && a[1] != '-' && strings.ContainsRune(a, 'w') {
-			return true
+	for i := 1; i < len(cmd); i++ {
+		switch a := cmd[i]; {
+		case a == "--" || a == "-" || !strings.HasPrefix(a, "-"):
+			return false // the command (- is a script on stdin)
+		case strings.HasPrefix(a, "--"):
+			name, _, valued := strings.Cut(a, "=")
+			if name == "--with" || name == "--with-editable" || name == "--with-requirements" {
+				return true
+			}
+			if !valued && !uvRunFlags[name] {
+				i++ // its value
+			}
+		default: // short options, one or more: -qw six, -qwsix
+			for j := 1; j < len(a); j++ {
+				o := "-" + a[j:j+1]
+				if o == "-w" {
+					return true
+				}
+				if !uvRunFlags[o] { // it takes the rest of the word as its value, or the next word
+					if j == len(a)-1 {
+						i++
+					}
+					break
+				}
+			}
 		}
 	}
 	return false
+}
+
+// uvRunFlags are the options of uv run, and uv's global ones, that take no value, in uv 0.12 and 0.13, as uv's own
+// command line definitions have them.
+var uvRunFlags = map[string]bool{
+	"--active": true, "--all-extras": true, "--all-groups": true, "--all-packages": true,
+	"--allow-python-downloads": true, "--binary": true, "--build": true, "--build-isolation": true,
+	"--compile": true, "--compile-bytecode": true, "--dev": true, "--editable": true, "--exact": true,
+	"--force-reinstall": true, "--frozen": true, "--gui-script": true, "--help": true, "--inexact": true,
+	"--isolated": true, "--locked": true, "--managed-python": true, "--module": true, "--native-tls": true,
+	"--no-active": true, "--no-all-extras": true, "--no-binary": true, "--no-build": true,
+	"--no-build-isolation": true, "--no-cache": true, "--no-cache-dir": true, "--no-color": true,
+	"--no-compile": true, "--no-compile-bytecode": true, "--no-config": true, "--no-default-groups": true,
+	"--no-dev": true, "--no-editable": true, "--no-env-file": true, "--no-exact": true, "--no-frozen": true,
+	"--no-index": true, "--no-installer-metadata": true, "--no-locked": true, "--no-managed-python": true,
+	"--no-native-tls": true, "--no-offline": true, "--no-preview": true, "--no-progress": true, "--no-project": true,
+	"--no-python-downloads": true, "--no-refresh": true, "--no-reinstall": true, "--no-require-build-hashes": true,
+	"--no-sources": true, "--no-sync": true, "--no-system-certs": true, "--no-upgrade": true, "--no_workspace": true,
+	"--offline": true, "--only-dev": true, "--pre": true, "--preview": true, "--quiet": true, "--refresh": true,
+	"--reinstall": true, "--require-build-hashes": true, "--script": true, "--show-resolution": true,
+	"--show-settings": true, "--system-certs": true, "--upgrade": true, "--verbose": true, "--version": true,
+	"-U": true, "-V": true, "-h": true, "-m": true, "-n": true, "-q": true, "-s": true, "-v": true,
 }
 
 // noPath reports whether a process's environment, as /proc reads it, holds no PATH: what uvGave counts a command by
@@ -834,6 +880,27 @@ func noPath(procRoot string, pid int) bool {
 	env, err := readEnviron(procRoot, pid)
 	_, ok := envValue(env, "PATH")
 	return err == nil && !ok
+}
+
+// hiddenChild reports whether a process has a child the look does not have: another user's, which a /proc mounted with
+// hidepid hides or leaves unreadable. The kernel lists every child in task/TID/children whatever hidepid hides; a
+// process without those files (a kernel without them) may have such a child too.
+func hiddenChild(s *Sample, procRoot string, pid int) bool {
+	files, _ := filepath.Glob(filepath.Join(procRoot, strconv.Itoa(pid), "task", "*", "children"))
+	if len(files) == 0 {
+		return true
+	}
+	for _, f := range files {
+		b, _ := os.ReadFile(f)
+		for _, w := range strings.Fields(string(b)) {
+			if c, err := strconv.Atoi(w); err == nil {
+				if _, ok := s.Table[c]; !ok {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // mountNS is a process's mount namespace, as /proc names it, or "".
@@ -998,18 +1065,53 @@ type uvLockState struct {
 // file or /proc/locks cannot be read, and then only uv's own lock may decide. /proc/locks names a file by its
 // filesystem's device, which mountinfo gives too; stat gives the same one but on btrfs, whose stat gives every
 // subvolume a device of its own, so both are names of the file.
-func uvLock(procRoot, file, real string, m *Mounts) uvLockState {
+func uvLock(procRoot, file, real string, m *Mounts, isLock func(string) bool) uvLockState {
 	l := uvLockState{file: file, locks: fileLocks{holders: map[int]bool{}, writers: map[int]bool{}}}
 	id, err := fileID(file)
 	if err != nil {
 		return l
 	}
 	l.id, l.keys = id, []lockID{id}
-	if maj, mnr, ok := parseDev(m.devOf(real)); ok && (maj != id.major || mnr != id.minor) {
+	maj, mnr, byMount := parseDev(m.devOf(real))
+	if byMount && (maj != id.major || mnr != id.minor) {
 		l.keys = append(l.keys, lockID{maj, mnr, id.ino})
+	}
+	// the lock files an earlier swap replaced, which their holders keep: they hold uv's lock as much as the file in
+	// place's holders do, and their process trees are judged the same way
+	for _, old := range replaced(procRoot, isLock, id) {
+		l.keys = append(l.keys, old)
+		if byMount && (maj != old.major || mnr != old.minor) {
+			l.keys = append(l.keys, lockID{maj, mnr, old.ino})
+		}
 	}
 	l.locks = lockHolders(procRoot, l.keys)
 	return l
+}
+
+// replaced are the lock files other than id that processes still have open where /proc names the lock file with
+// " (deleted)" after it: files an earlier swap renamed over. Only such a link is stat'ed.
+func replaced(procRoot string, isLock func(string) bool, id lockID) []lockID {
+	ents, _ := os.ReadDir(procRoot)
+	seen := map[lockID]bool{id: true}
+	var out []lockID
+	for _, e := range ents {
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+		fds := filepath.Join(procRoot, e.Name(), "fd")
+		names, _ := os.ReadDir(fds)
+		for _, n := range names {
+			l, err := os.Readlink(filepath.Join(fds, n.Name()))
+			if p, deleted := strings.CutSuffix(l, " (deleted)"); err != nil || !deleted || !isLock(p) {
+				continue
+			}
+			if got, err := fileID(filepath.Join(fds, n.Name())); err == nil && !seen[got] {
+				seen[got] = true
+				out = append(out, got)
+			}
+		}
+	}
+	return out
 }
 
 // parseDev reads mountinfo's "major:minor".
@@ -1100,13 +1202,13 @@ type uvSwap struct {
 	after    func() // a test's way into the moment after the rename
 }
 
-// lockInPlace returns the file that holds capacity's lock, or nil and why it gave up. It gives up without renaming
-// when the lock file is not the one the look saw, when looked, the caller's look at the processes, finds a reason, or
-// when, with capacity's lock taken on the new file, the old file has a holder the look did not see, a process that
-// waits for it or holds it alone, or one that has it open and was no holder (uv opens the file, then locks it). afterRename looks the same way after the rename; what it finds then
-// only keeps capacity's own prune from running: the new file stays, and a process that came to the old file in the
-// instant between the last look and the rename keeps a lock no later clean or prune waits for. The caller closes the
-// file it returns, which lets the lock go.
+// lockInPlace returns the file that holds capacity's lock, or nil and why it gave up. It gives up without renaming when
+// the lock file is not the one the look saw, when looked, the caller's look at the processes, finds a reason, or when,
+// with capacity's lock taken on the new file, the old file has a holder the look did not see, a process that waits for
+// it or holds it alone, or one that has it open and was no holder (uv opens the file, then locks it). afterRename looks
+// the same way after the rename; what it finds then only keeps capacity's own prune from running: the new file stays,
+// and a process that came to the old file in the instant between the last look and the rename keeps a lock no later
+// clean or prune waits for. The caller closes the file it returns, which lets the lock go.
 func (s uvSwap) lockInPlace(looked func() bool) (*os.File, string) {
 	lockFile := s.lk.file
 	if id, err := fileID(lockFile); err != nil || id != s.lk.id {

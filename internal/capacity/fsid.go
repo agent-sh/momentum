@@ -118,12 +118,18 @@ func (m *Mounts) Canon(p string) string {
 	return filepath.Join(prim.point, strings.TrimPrefix(inFS, prim.root))
 }
 
-// hidesProcs reports whether the proc filesystem at procRoot, or at /proc when procRoot is no mount, hides other
-// users' processes (hidepid=invisible, 2, ptraceable or 4): /proc then shows no directory for one, while /proc/locks
-// still names it.
-func (m *Mounts) hidesProcs(procRoot string) bool {
+// What a proc filesystem hides of other users' processes: nothing, what is in their directories (hidepid=noaccess, or
+// 1), or the directories too (invisible or 2, ptraceable or 4); /proc/locks still names them.
+const (
+	procShown = iota
+	procNoAccess
+	procInvisible
+)
+
+// procHides is what the proc filesystem at procRoot, or at /proc when procRoot is no mount, hides.
+func (m *Mounts) procHides(procRoot string) int {
 	if m == nil {
-		return false
+		return procShown
 	}
 	var at, proc *mount
 	for i := range m.list { // the last on a point hides the earlier
@@ -139,14 +145,18 @@ func (m *Mounts) hidesProcs(procRoot string) bool {
 		at = proc
 	}
 	if at == nil {
-		return false
+		return procShown
 	}
 	for _, o := range strings.Split(at.super, ",") {
-		if v, ok := strings.CutPrefix(o, "hidepid="); ok && (v == "invisible" || v == "2" || v == "ptraceable" || v == "4") {
-			return true
+		switch v, _ := strings.CutPrefix(o, "hidepid="); {
+		case !strings.HasPrefix(o, "hidepid="):
+		case v == "invisible" || v == "2" || v == "ptraceable" || v == "4":
+			return procInvisible
+		case v == "noaccess" || v == "1":
+			return procNoAccess
 		}
 	}
-	return false
+	return procShown
 }
 
 // devOf is the device of the filesystem that holds p, as mountinfo gives it ("major:minor": its superblock's, which

@@ -1632,6 +1632,28 @@ func TestAHolderWhosePIDAnotherProcessTookIsNew(t *testing.T) {
 	}
 }
 
+// withChildren writes each fixture process's task/PID/children, as the kernel lists them, from the processes' stat.
+func withChildren(t *testing.T, f *uvLockFixture) {
+	t.Helper()
+	kids := map[string][]string{}
+	ents, err := os.ReadDir(f.proc)
+	must(t, err)
+	for _, e := range ents {
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+		if st, err := os.ReadFile(filepath.Join(f.proc, e.Name(), "stat")); err == nil {
+			pp := strconv.Itoa(parentOf(string(st)))
+			kids[pp] = append(kids[pp], e.Name())
+		}
+	}
+	for _, e := range ents {
+		if _, err := strconv.Atoi(e.Name()); err == nil {
+			write(t, filepath.Join(f.proc, e.Name(), "task", e.Name(), "children"), strings.Join(kids[e.Name()], " ")+" ")
+		}
+	}
+}
+
 // inNamespaces gives the fixture's processes mount namespaces: those named in other the namespace of another, the
 // rest the run's.
 func inNamespaces(t *testing.T, f *uvLockFixture, other ...string) {
@@ -1702,8 +1724,9 @@ func TestALookUnderTheLockThatDoesNotEndLetsTheLockGo(t *testing.T) {
 	t.Cleanup(func() { close(stuck) })
 	defer func(s func(string) (os.FileInfo, error)) { statLock = s }(statLock)
 	statLock = func(p string) (os.FileInfo, error) {
-		if strings.HasSuffix(p, filepath.Join("13", "fd", "3")) && !exists(f.lock+".capacity") { // after the rename
-			<-stuck // a read of /proc that does not answer
+		var st syscall.Stat_t
+		if strings.HasSuffix(p, filepath.Join("13", "fd", "3")) && syscall.Stat(f.lock, &st) == nil && st.Ino != f.id.ino {
+			<-stuck // after the rename, a read of /proc that does not answer
 		}
 		return os.Stat(p)
 	}
@@ -1765,6 +1788,7 @@ func TestAHolderThatProcHidesHasNotEnded(t *testing.T) {
 	} {
 		t.Run(c.opt, func(t *testing.T) {
 			f := newUVLock(t, outside, 4, 6, 4243) // /proc shows no 4243, and /proc/locks names it
+			withChildren(t, f)
 			o := options(t, f.proc, time.Now(), nil)
 			write(t, o.MountInfo, "29 1 259:3 / / rw - ext4 /dev/sda2 rw\n30 29 0:25 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,"+
 				c.opt+"\n")
@@ -1877,6 +1901,7 @@ func TestAUVRunInsideABuildBackendRunsItsCommand(t *testing.T) {
 
 func TestAHiddenUVProcessThatTookTheLockBeforeTheRenameKeepsIt(t *testing.T) {
 	f := newUVLock(t, outside, 4, 6)
+	withChildren(t, f)
 	armed := false
 	o := options(t, f.proc, time.Now(), nil)
 	write(t, o.MountInfo, "29 1 259:3 / / rw - ext4 /dev/sda2 rw\n30 29 0:25 / /proc rw - proc proc rw,hidepid=invisible\n")
@@ -1909,5 +1934,115 @@ func TestTheDetailCountsTheHolders(t *testing.T) {
 		if g := f.run(t, options(t, f.proc, time.Now(), nil)); !g.Done || !strings.Contains(g.Detail, want) {
 			t.Errorf("the detail says how many hold the lock (%s): %q %q", want, g.Detail, g.Why)
 		}
+	}
+}
+
+func TestACommandsOwnOptionsAreNoLayer(t *testing.T) {
+	// every word after uv run's command is the command's: gunicorn's -w and Celery's --without-* are theirs, and both
+	// set their title with setproctitle from the project's .venv
+	zeroed := []string{strings.Repeat("\x00", 512)}
+	for _, argv := range [][]string{
+		{"uv", "run", "gunicorn", "-w", "4", "app:app"},
+		{"uv", "run", "--python", "3.12", "celery", "-A", "proj", "worker", "--without-gossip"},
+	} {
+		t.Run(strings.Join(argv, " "), func(t *testing.T) {
+			procs := func(cache, lock string) []fakeProc {
+				return append(outside(cache, lock),
+					fakeProc{pid: 8, ppid: 1, argv: argv, fds: []string{lock}, cwd: "/proj", env: uvEnv},
+					fakeProc{pid: 9, ppid: 8, argv: []string{"gunicorn: master [app:app]"}, exe: "/usr/bin/python3.12", cwd: "/proj",
+						maps: []string{"/proj/.venv/lib/python3.12/site-packages/setproctitle/_setproctitle.so"}, env: zeroed})
+			}
+			f := newUVLock(t, procs, 4, 6, 8)
+			if g := f.run(t, options(t, f.proc, time.Now(), nil)); !g.Done || !f.pruned(true) {
+				t.Fatalf("a run that layers nothing runs its titled command from the project's .venv: %s %q %v", g.Action, g.Why, f.ran)
+			}
+		})
+	}
+}
+
+func TestUVRunsOwnOptionsAreReadUpToItsCommand(t *testing.T) {
+	for _, c := range []struct {
+		argv   string
+		layers bool
+	}{
+		{"uv run --with six srv", true},
+		{"uv run --with=six srv", true},
+		{"uv run -p 3.12 --with six srv", true},
+		{"uv run -qw six srv", true},
+		{"uv run -qwsix srv", true},
+		{"uv --offline run -q --no-sync --with-requirements r.txt srv", true},
+		{"uv run --python 3.12 srv -w 4", false},
+		{"uv run srv --with six", false},
+		{"uv run -pw srv", false}, // -p takes the rest of its word: python w
+		{"uv run -- srv -w 4", false},
+		{"uv run - -w", false},                 // a script on stdin
+		{"uv run --new-option srv -w 4", true}, // an option not known takes the next word: a miss holds a prune
+	} {
+		if got := uvLayers(strings.Fields(c.argv)); got != c.layers {
+			t.Errorf("%s layers %v, want %v", c.argv, got, c.layers)
+		}
+	}
+}
+
+func TestAProcessProcHidesUnderAHolderIsOneTheLookCannotRead(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads every process")
+	}
+	for _, opt := range []string{"hidepid=invisible", "hidepid=noaccess", "hidepid=2", "hidepid=invisible, a kernel that lists no children"} {
+		t.Run(opt, func(t *testing.T) {
+			f := newUVLock(t, outside, 4, 6)
+			if opt, ok := strings.CutSuffix(opt, ", a kernel that lists no children"); ok {
+				o := options(t, f.proc, time.Now(), nil)
+				write(t, o.MountInfo, "29 1 259:3 / / rw - ext4 /dev/sda2 rw\n30 29 0:25 / /proc rw - proc proc rw,"+opt+"\n")
+				if g := f.run(t, o); g.Done || f.pruned(true) || !strings.Contains(g.Why, "a process /proc hides runs under this one") {
+					t.Fatalf("without the kernel's list, a holder's tree may hide a child: %s %q %v", g.Action, g.Why, f.ran)
+				}
+				return
+			}
+			withChildren(t, f)
+			write(t, filepath.Join(f.proc, "7", "task", "7", "children"), "4300 ") // the server ran a command with sudo
+			if opt == "hidepid=noaccess" {                                         // its directory shows, and nothing in it reads
+				dir := filepath.Join(f.proc, "4300")
+				write(t, filepath.Join(dir, "cmdline"), "sudo\x00worker\x00")
+				must(t, os.Chmod(filepath.Join(dir, "cmdline"), 0))
+				t.Cleanup(func() { os.Chmod(filepath.Join(dir, "cmdline"), 0o644) })
+			}
+			o := options(t, f.proc, time.Now(), nil)
+			write(t, o.MountInfo, "29 1 259:3 / / rw - ext4 /dev/sda2 rw\n30 29 0:25 / /proc rw - proc proc rw,"+opt+"\n")
+			if g := f.run(t, o); g.Done || f.pruned(true) || !strings.Contains(g.Why, "a process /proc hides runs under this one") {
+				t.Fatalf("a process /proc hides under a holder is one the look cannot read: %s %q %v", g.Action, g.Why, f.ran)
+			}
+		})
+	}
+	f := newUVLock(t, outside, 4, 6) // a /proc that hides nothing shows every child: the look's own rules judge them
+	if g := f.run(t, options(t, f.proc, time.Now(), nil)); !g.Done || !f.pruned(true) {
+		t.Fatalf("without hidepid no child is hidden: %s %q %v", g.Action, g.Why, f.ran)
+	}
+}
+
+func TestAHolderAnEarlierSwapLeftOnTheOldFileIsStillAHolder(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads every process")
+	}
+	procs := func(cache, lock string) []fakeProc { // the project's run kept the lock file an earlier swap replaced
+		return append(outside(cache, lock)[:2],
+			fakeProc{pid: 6, ppid: 1, argv: []string{"uv", "run", "server"}, fds: []string{lock + " (deleted)"}, env: uvEnv},
+			fakeProc{pid: 7, ppid: 6, argv: []string{"python", "server.py"}, exe: "/opt/python/bin/python3",
+				env: ran("/proj/.venv/bin", "VIRTUAL_ENV=/proj/.venv")},
+			fakeProc{pid: 9, ppid: 7, argv: []string{"sudo", "worker"}, env: []string{"PATH=/usr/bin"}})
+	}
+	f := newUVLock(t, procs, 4)
+	write(t, f.lock+" (deleted)", "") // the older file, where the fixture's /proc names it
+	old, err := fileID(f.lock + " (deleted)")
+	must(t, err)
+	b, err := os.ReadFile(filepath.Join(f.proc, "locks"))
+	must(t, err)
+	write(t, filepath.Join(f.proc, "locks"), string(b)+fmt.Sprintf("8: FLOCK  ADVISORY  READ 6 %02x:%02x:%d 0 EOF\n",
+		old.major, old.minor, old.ino))
+	must(t, os.Chmod(filepath.Join(f.proc, "9", "fd"), 0))
+	t.Cleanup(func() { os.Chmod(filepath.Join(f.proc, "9", "fd"), 0o755) })
+	if g := f.run(t, options(t, f.proc, time.Now(), nil)); g.Done || f.pruned(true) || !strings.Contains(g.Why, "cannot read runs under a holder of the lock (pid 9)") {
+		t.Fatalf("a process the look cannot read runs under a uv run that holds a lock file capacity replaced: %s %q %v",
+			g.Action, g.Why, f.ran)
 	}
 }
