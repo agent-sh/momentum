@@ -671,6 +671,7 @@ func TestWithoutTheOffloadNothingOfAFolderGoes(t *testing.T) {
 
 func TestAFolderIsATasksOnlyWhenAnAgentsCallCreatesIt(t *testing.T) {
 	f := newScratch(t)
+	t.Setenv("HOME", f.base) // the cache is ~/cache, wherever the test's directory is: a call may name it through $HOME
 	small := map[string]int{"out.log": 2 << 20}
 	// py is a call that runs a Python script, with Q in it the folder (Path has a P of its own)
 	py := func(script string) func(string) store.Event {
@@ -747,7 +748,7 @@ func TestAFolderIsATasksOnlyWhenAnAgentsCallCreatesIt(t *testing.T) {
 		{"shell-var-export", cmd("export WORK=P; mkdir -p $WORK"), 0, true},
 		{"shell-var-rm", cmd(`S=P; rm -rf \"$S\"`), 0, false},
 		{"shell-var-home", func(p string) store.Event {
-			return store.Event{Summary: `{"command":"D=$HOME` + strings.TrimPrefix(p, homeDir()) + `; mkdir -p \"$D\""}`}
+			return store.Event{Summary: `{"command":"D=$HOME` + strings.TrimPrefix(p, f.base) + `; mkdir -p \"$D\""}`}
 		}, 0, true},
 		{"shell-then", cmd("if [ ! -d P ]; then mkdir -p P; fi"), 0, true},
 		{"shell-do", cmd("for d in a b; do mkdir -p P/$d; done"), 0, true},
