@@ -63,7 +63,7 @@ type Stop struct {
 	WakeOnce        bool           // a one-shot job's only run
 	WakeSign        string         // why a self-paced wakeup may have been lost: a cause its harness drops one for
 	TurnBegan       time.Time      // when its last turn began
-	RanAt           time.Time      // when a scheduled run of its own last started
+	WakeRan         time.Time      // when the run the overdue rule reads last ran: its job, or its loop's last wakeup
 	IdleAt          time.Time      // when its last turn ended
 	ResumedAt       time.Time      // the harness reopened the session after it ended mid-task, and nothing happened since
 	RequestAt       time.Time      // the model request the open turn still waits on: nothing answered it since
@@ -409,7 +409,7 @@ func (s *Stop) Choose(handled func(key string) bool, now time.Time, p Params) {
 		if from, _ := afterSleep(*s, overdueFrom(*s, r.Due), p.OverdueSlack, ""); from.Add(p.OverdueSlack + p.Stale).Before(now) {
 			continue
 		}
-		s.WakeDue, s.WakeFor, s.WakeKey, s.WakeJob, s.WakeOnce, s.WakeSign = r.Due, r.For, r.Key, r.Job, r.Once, r.Sign
+		s.WakeDue, s.WakeFor, s.WakeKey, s.WakeJob, s.WakeOnce, s.WakeSign, s.WakeRan = r.Due, r.For, r.Key, r.Job, r.Once, r.Sign, r.Ran
 		return
 	}
 }

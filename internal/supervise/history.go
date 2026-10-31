@@ -293,12 +293,12 @@ func versionsOf(path string) []versionChange {
 		var off int64
 		for {
 			line, err := rd.ReadBytes('\n')
-			if i := bytes.Index(line, []byte(`"version":"`)); i >= 0 {
-				rest := line[i+len(`"version":"`):]
-				if j := bytes.IndexByte(rest, '"'); j >= 0 {
-					if v := string(rest[:j]); len(vs) == 0 || vs[len(vs)-1].version != v {
-						vs = append(vs, versionChange{off: off, version: v})
-					}
+			if bytes.Contains(line, []byte(`"version":"`)) { // the record's own field: a tool's result can hold one too
+				var rec struct {
+					Version string `json:"version"`
+				}
+				if json.Unmarshal(line, &rec) == nil && rec.Version != "" && (len(vs) == 0 || vs[len(vs)-1].version != rec.Version) {
+					vs = append(vs, versionChange{off: off, version: rec.Version})
 				}
 			}
 			off += int64(len(line))
@@ -362,7 +362,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		s.TurnBegan, s.IdleAt = turnBegan, prevAt
 		// Its own runs its harness should start, as the session layer lists them, a reopening for a restart.
 		if !wake.at.IsZero() && wake.seen {
-			s.Runs = append(s.Runs, claude.WakeRun(wake.at, wake.set, wake.what, wake.sign))
+			s.Runs = append(s.Runs, claude.WakeRun(wake.at, wake.set, wake.what, wake.sign, time.Time{}))
 		}
 		for id, c := range crons {
 			if c.seen {

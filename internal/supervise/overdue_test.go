@@ -458,3 +458,51 @@ func TestARunThatStartsBetweenResyncsStartsTheCountAgain(t *testing.T) {
 		t.Fatalf("after a run started: sent %q", f.sent)
 	}
 }
+
+// TestAJobThatStopsNextToOneThatRunsStillEscalates runs two jobs through the real tracker: one keeps running, the
+// other never does. The other job's lost runs are a first try, then a second, then a case: only its own runs
+// would start its count again.
+func TestAJobThatStopsNextToOneThatRunsStillEscalates(t *testing.T) {
+	inUTCHere(t)
+	x := &transcript{t: t, path: filepath.Join(t.TempDir(), "s1.jsonl"), at: t0}
+	x.user("check both every 10 minutes")
+	for _, j := range []struct{ id, call, what string }{{"aaaa1111", "tc1", "check A"}, {"bbbb2222", "tc2", "check B"}} {
+		x.add(map[string]any{"type": "assistant", "message": map[string]any{"content": []any{map[string]any{"type": "tool_use", "id": j.call,
+			"name": "CronCreate", "input": map[string]any{"cron": "*/10 * * * *", "prompt": j.what}}}}}).
+			add(map[string]any{"type": "user", "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": j.call,
+				"content": "Scheduled recurring job " + j.id + " (Every 10 minutes). Next run: 10:10."}}}})
+	}
+	x.say("Checking both.").add(map[string]any{"type": "system", "subtype": "turn_duration"})
+	tr := claude.NewTracker(x.path)
+	scan := func(now time.Time) *sessions.Session {
+		s := &sessions.Session{Key: "sess-two", Tool: "claude", Name: "two", Where: "work:5.1", Pane: "%8", PID: 42,
+			Transcript: x.path, Started: t0.Add(-time.Hour), Tasks: []sessions.Task{}}
+		tr.Facts(s, now)
+		s.TurnOpen = tr.TurnOpen()
+		sessions.Decide(s, now)
+		s.Since = x.at
+		return s
+	}
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0
+	sv := liveOverdue(st, f, &now)
+	for i := 0; i < 24; i++ {
+		now = now.Add(5 * time.Minute)
+		if now.Minute()%10 == 0 { // A runs on time, each of its runs a turn of its own
+			x.at = now
+			x.add(map[string]any{"type": "system", "subtype": "scheduled_task_fire", "taskId": "aaaa1111", "content": "Running scheduled task"}).
+				add(map[string]any{"type": "user", "isMeta": true, "message": map[string]any{"content": "check A"}}).
+				say("A is fine.").add(map[string]any{"type": "system", "subtype": "turn_duration"})
+		}
+		n := len(f.sent)
+		run(t, sv, scan(now.Add(30*time.Second)))
+		if len(f.sent) > n {
+			x.at = now.Add(30 * time.Second)
+			x.user(f.sent[len(f.sent)-1][strings.Index(f.sent[len(f.sent)-1], Marker):]).say("Checked B.").add(map[string]any{"type": "system", "subtype": "turn_duration"})
+		}
+	}
+	if len(f.sent) != 2 || !strings.Contains(f.sent[0], `"check B"`) || !strings.Contains(f.sent[1], "did not start either") || len(events(t, st, KindCase)) != 1 {
+		t.Fatalf("sent %q, cases %+v", f.sent, events(t, st, KindCase))
+	}
+}

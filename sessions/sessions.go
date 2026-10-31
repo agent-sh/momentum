@@ -72,6 +72,7 @@ type Run struct {
 	Job  bool      `json:"job,omitempty"`  // a job's run, not a wakeup
 	Once bool      `json:"once,omitempty"` // a one-shot job's only run
 	Sign string    `json:"sign,omitempty"` // why a wakeup may have been lost: a cause its harness is known to drop one for
+	Ran  time.Time `json:"ran,omitzero"`   // when its job last ran, or its loop's last wakeup fired
 }
 
 // Session is one live agent session and the facts the phase rule reads.
@@ -105,7 +106,6 @@ type Session struct {
 	Runs       []Run     `json:"runs,omitempty"`      // its own runs its harness should start, earliest first
 	TurnBegan  time.Time `json:"turn_began,omitzero"` // when its last turn began
 	IdleSince  time.Time `json:"idle_since,omitzero"` // when its last turn ended
-	RanAt      time.Time `json:"ran_at,omitzero"`     // when a scheduled run of its own last started
 	LastText   string    `json:"last_text,omitempty"` // the last assistant message in full
 	LastActive time.Time `json:"last_active"`
 	// UserAt is when user-role text last opened a turn, by the harness's record. Whoever typed it: a program

@@ -188,8 +188,8 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 			probe = credentials{inner: p, path: filepath.Join(sv.ClaudeDir, ".credentials.json"), hold: sv.Params.OwnerWindow}
 		}
 		tries := h.tries(ownerAt)
-		if stop.RanAt.After(ownerAt) { // a run of its own started since: its runs come again, so the count does too
-			tries[RuleOverdue] = h.tries(stop.RanAt)[RuleOverdue]
+		if stop.WakeRan.After(ownerAt) { // its job, or its loop, ran since: its runs come again, so the count does too
+			tries[RuleOverdue] = h.tries(stop.WakeRan)[RuleOverdue]
 		}
 		d := Decide(stop, tries, sv.Params, probe, now)
 		if d.Rule != "" && d.Verdict != Case && d.Verdict != Skip && h.closed(d.Rule, ownerAt) {
@@ -757,7 +757,7 @@ func StopOf(s *sessions.Session, presence time.Time) Stop {
 	st := Stop{Key: s.Key, Tool: s.Tool, Name: s.Name, Where: s.Where, Auto: s.Auto, Phase: s.Phase, At: s.Since,
 		Words: Words(s.LastText), Working: s.TurnOpen, Busy: s.Now != "", Tasks: len(s.Tasks), WakeAt: s.WakeAt, Loop: s.Loop,
 		ResumedAt: s.ResumedAt, RequestAt: s.RequestAt, Queued: s.Queued, Runs: s.Runs, OwnerAt: presence,
-		TurnBegan: s.TurnBegan, IdleAt: s.IdleSince, RanAt: s.RanAt, Started: s.Started}
+		TurnBegan: s.TurnBegan, IdleAt: s.IdleSince, Started: s.Started}
 	switch s.AskKind {
 	case sessions.AskError:
 		st.Error = strings.TrimPrefix(s.Ask, "stopped on an error: ")

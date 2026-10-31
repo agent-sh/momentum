@@ -267,6 +267,22 @@ func TestAJobThatStopsRunningListsEachRunItMissed(t *testing.T) {
 	if n := len(late.Runs); n == 0 || late.Runs[n-1].Due.Before(t0.Add(7*time.Hour)) || late.Runs[0].Due.Before(t0.Add(7*time.Hour-runsBack)) {
 		t.Fatalf("seven hours on: %d runs %+v", n, late.Runs)
 	}
+	// The list reaches as far back as a rule can act, and up to now, though the job runs every minute.
+	one := newScript(t).call("tu1", "CronCreate", map[string]any{"cron": "* * * * *", "prompt": "poll"}).
+		result("tu1", "Scheduled recurring job j1m (Every minute). Next run: 10:01.")
+	now := t0.Add(7 * time.Hour)
+	minute := one.facts(NewTracker(one.path), now)
+	if n := len(minute.Runs); n == 0 || minute.Runs[n-1].Due.Before(now) || minute.Runs[0].Due.After(now.Add(-100*time.Minute)) {
+		t.Fatalf("every minute, seven hours on: %d runs %v to %v", n, minute.Runs[0].Due, minute.Runs[n-1].Due)
+	}
+	// A job every five minutes keeps its runs' keys from scan to scan, though it has not run for hours.
+	still := newScript(t).call("tu1", "CronCreate", map[string]any{"cron": "*/5 * * * *", "prompt": "poll"}).
+		result("tu1", "Scheduled recurring job j5s (Every 5 minutes). Next run: 10:05.")
+	k1 := still.facts(NewTracker(still.path), now).Runs
+	k2 := still.facts(NewTracker(still.path), now.Add(15*time.Second)).Runs
+	if len(k1) == 0 || len(k2) == 0 || k1[len(k1)-1].Key != k2[len(k2)-1].Key {
+		t.Fatalf("five minutes, two scans: %+v %+v", k1[len(k1)-1], k2[len(k2)-1])
+	}
 	// A job made under a version that writes no record of its runs is not listed, though the session runs a newer one.
 	aged := newScript(t)
 	aged.add(map[string]any{"type": "assistant", "version": "2.1.284", "message": map[string]any{"content": []any{map[string]any{"type": "tool_use", "id": "tu1",

@@ -220,6 +220,34 @@ func TestReplayListsNoRunsOfAVersionThatRecordsNone(t *testing.T) {
 	}
 }
 
+func TestReplayReadsARecordsOwnVersion(t *testing.T) {
+	st := testStore(t)
+	r := newRecorded(t, "nested")
+	line := func(after time.Duration, v map[string]any, kind string, actor store.Actor, tool, summary, meta string) {
+		v["version"] = "2.1.316"
+		r.event(after, v, kind, actor, tool, summary, meta)
+	}
+	line(0, map[string]any{"type": "user", "message": map[string]any{"content": "watch the soak"}}, "owner_text", store.ActorOwner, "", "watch the soak", `{"input_kind":"typed"}`)
+	line(time.Second, map[string]any{"type": "assistant", "message": map[string]any{"content": []any{map[string]any{"type": "tool_use", "id": "tw1",
+		"name": "ScheduleWakeup", "input": map[string]any{"delaySeconds": 1800, "reason": "check the soak run"}}}}},
+		"tool_call", store.ActorAgent, "ScheduleWakeup", `{"delaySeconds":1800,"reason":"check the soak run"}`, `{"tool_id":"tw1"}`)
+	out := "Next wakeup scheduled for 10:30:03 (in 1800s)."
+	line(time.Second, map[string]any{"type": "user", "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "tw1", "content": out}}}},
+		"tool_result", store.ActorTool, "ScheduleWakeup", out, `{"tool_id":"tw1"}`)
+	line(5*time.Minute, map[string]any{"type": "system", "subtype": "compact_boundary"}, "compaction", store.ActorHarness, "", "summary", "")
+	// A tool's result whose own data names a version, written before the record's: no restart.
+	r.event(time.Minute, map[string]any{"toolUseResult": map[string]any{"version": "9.9.9"}, "type": "user", "version": "2.1.316",
+		"message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "tb1", "content": "ok"}}}},
+		"tool_result", store.ActorTool, "Bash", "ok", `{"tool_id":"tb1"}`)
+	line(time.Second, map[string]any{"type": "assistant", "message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "Noted."}}}},
+		"agent_text", store.ActorAgent, "", "Noted.", "")
+	r.owner(time.Hour, "status?")
+	r.put(st)
+	if acted := overdueActs(t, st, t0.Add(3*time.Hour)); len(acted) != 1 {
+		t.Fatalf("acted %s", fmt.Sprint(acted))
+	}
+}
+
 // inUTCHere runs a test on a machine whose zone is UTC: schedules read in local time.
 func inUTCHere(t *testing.T) {
 	l := time.Local

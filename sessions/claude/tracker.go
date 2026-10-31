@@ -117,7 +117,7 @@ type track struct {
 	WakeSign  string          `json:"wake_sign,omitempty"`
 	TurnBegan time.Time       `json:"turn_began,omitzero"` // when the last turn began: an input, not the model's own record
 	TurnEnd   time.Time       `json:"turn_end,omitzero"`   // when the last turn ended
-	RanAt     time.Time       `json:"ran_at,omitzero"`     // when a scheduled run of its own last started
+	WakeRan   time.Time       `json:"wake_ran,omitzero"`   // when the loop's last wakeup fired
 	Crons     map[string]cron `json:"crons"`
 	Model     string          `json:"model"`
 	UserAt    time.Time       `json:"user_at,omitzero"`    // when user-role text last opened a turn
@@ -324,7 +324,7 @@ func (t *Tracker) fired(raw []byte, at time.Time) {
 	}
 	json.Unmarshal(raw, &f)
 	st := &t.st
-	st.TurnBegan, st.RanAt = at, at // the run's prompt opens a turn, recorded as the harness's own
+	st.TurnBegan = at // the run's prompt opens a turn, recorded as the harness's own
 	if c, job := st.Crons[f.TaskID]; job {
 		if c.OneShot {
 			delete(st.Crons, f.TaskID) // it fires once, then deletes itself
@@ -336,6 +336,7 @@ func (t *Tracker) fired(raw []byte, at time.Time) {
 	}
 	if (f.TaskKind == "loop" || strings.Contains(f.Content, "wakeup")) && !st.WakeAt.IsZero() && !at.Before(st.WakeSet) {
 		t.clearWake()
+		st.WakeRan = at
 	}
 }
 
@@ -383,7 +384,7 @@ func (t *Tracker) runs(started, now time.Time) []sessions.Run {
 	}
 	var out []sessions.Run
 	if t.liveWake(started) {
-		out = append(out, WakeRun(st.WakeAt, st.WakeSet, st.WakeFor, st.WakeSign))
+		out = append(out, WakeRun(st.WakeAt, st.WakeSet, st.WakeFor, st.WakeSign, st.WakeRan))
 	}
 	for id, c := range st.Crons {
 		if RecordsRuns(text.FirstNonEmpty(c.Version, st.Version)) { // one an older version made shows none of its runs
@@ -421,9 +422,9 @@ func RecordsRuns(v string) bool {
 	return true
 }
 
-// WakeRun is a pending wakeup as a run, keyed by when it was set.
-func WakeRun(at, set time.Time, what, sign string) sessions.Run {
-	return sessions.Run{Due: at, For: what, Key: fmt.Sprintf("wakeup@%d", set.UnixMilli()), Sign: sign}
+// WakeRun is a pending wakeup as a run, keyed by when it was set; ran is when the loop's last wakeup fired.
+func WakeRun(at, set time.Time, what, sign string, ran time.Time) sessions.Run {
+	return sessions.Run{Due: at, For: what, Key: fmt.Sprintf("wakeup@%d", set.UnixMilli()), Sign: sign, Ran: ran}
 }
 
 // JobRuns are a job's runs as runs does: made at made on the expression expr, last run at fired, in a process
@@ -433,7 +434,7 @@ func JobRuns(id, expr string, oneShot bool, what string, made, fired, started, n
 	key := func(run time.Time) string { return fmt.Sprintf("job:%s@%d", id, run.UnixMilli()) }
 	if oneShot {
 		if run, _, ok := ScheduledRun(expr, made); ok && (started.IsZero() || !run.Before(started)) {
-			return []sessions.Run{{Due: run, For: what, Key: key(run), Job: true, Once: true}}
+			return []sessions.Run{{Due: run, For: what, Key: key(run), Job: true, Once: true, Ran: fired}}
 		}
 		return nil
 	}
@@ -448,7 +449,7 @@ func JobRuns(id, expr string, oneShot bool, what string, made, fired, started, n
 		after = started // a restored job does not run for the runs it missed
 	}
 	if back := now.Add(-runsBack); after.Before(back) {
-		after = back
+		after = skipTo(expr, after, back) // no rule acts on those before; the runs after keep their keys
 	}
 	var out []sessions.Run
 	for range runsMax {
@@ -456,7 +457,7 @@ func JobRuns(id, expr string, oneShot bool, what string, made, fired, started, n
 		if !ok {
 			break
 		}
-		out = append(out, sessions.Run{Due: last, For: what, Key: key(run), Job: true})
+		out = append(out, sessions.Run{Due: last, For: what, Key: key(run), Job: true, Ran: fired})
 		if !last.Before(now) {
 			break // its next run
 		}
@@ -475,11 +476,22 @@ func SortRuns(rs []sessions.Run) {
 	})
 }
 
+// skipTo moves a job's base from after to back, where the runs it lists begin: a job every five minutes by whole
+// gaps, so that its runs keep their times; any other to back itself, since its runs are on its schedule.
+func skipTo(expr string, after, back time.Time) time.Time {
+	if fiveMinutes(expr) {
+		return after.Add(back.Sub(after) / fiveMinuteGap * fiveMinuteGap)
+	}
+	return back
+}
+
+func fiveMinutes(expr string) bool { return strings.Join(strings.Fields(expr), " ") == "*/5 * * * *" }
+
 // jobRun is a recurring job's run after after, and the latest it starts. A job every five minutes runs 4 minutes
 // 45 seconds after its last run, or after it was made or restored, on time; any other on its schedule, delayed up
 // to the most Claude Code delays it.
 func jobRun(expr string, after time.Time) (run, latest time.Time, ok bool) {
-	if strings.Join(strings.Fields(expr), " ") == "*/5 * * * *" {
+	if fiveMinutes(expr) {
 		run = after.Add(fiveMinuteGap)
 		return run, run, true
 	}
@@ -922,7 +934,7 @@ func (t *Tracker) Facts(s *sessions.Session, now time.Time) {
 		s.Model = t.st.Model
 	}
 	s.Runs = t.runs(s.Started, now)
-	s.TurnBegan, s.IdleSince, s.RanAt = t.st.TurnBegan, t.st.TurnEnd, t.st.RanAt
+	s.TurnBegan, s.IdleSince = t.st.TurnBegan, t.st.TurnEnd
 	if t.liveWake(s.Started) && t.st.WakeAt.After(now.Add(-sessions.WakeGrace)) {
 		s.WakeAt = t.st.WakeAt
 	}
