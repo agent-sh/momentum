@@ -165,6 +165,23 @@ func (s *Store) PutNote(ctx context.Context, n Note) (Note, error) {
 	return n, tx.Commit()
 }
 
+// PutWithNote stores events, as Put does, and a note, as PutNote does, in one transaction: a note that sums the
+// events up holds what they hold, however the writer stops.
+func (s *Store) PutWithNote(ctx context.Context, evs []Event, n Note) (Note, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Note{}, err
+	}
+	defer tx.Rollback()
+	if _, err := put(ctx, tx, evs); err != nil {
+		return Note{}, err
+	}
+	if n, err = putNote(ctx, tx, n); err != nil {
+		return Note{}, err
+	}
+	return n, tx.Commit()
+}
+
 // PutNote stores a note in the run's transaction, as Store.PutNote does: a sessions run holds the store's write
 // lock, so a note from inside it goes in its transaction.
 func (r *Run) PutNote(n Note) (Note, error) { return putNote(r.ctx, r.tx, n) }

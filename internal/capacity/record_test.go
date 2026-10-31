@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -66,6 +68,161 @@ func TestAReportOnlyNoteStaysResolvedUntilItsEvidenceChanges(t *testing.T) {
 	runAt(now.Add(3 * time.Hour))
 	if n, _, _ := st.Note(ctx, id); n.Done.IsZero() {
 		t.Error("a rule that finds none of the note's items any more resolves it")
+	}
+}
+
+// threeTargets is a repository that ignores its build output, with three idle Cargo target dirs of 8, 5 and 3 MiB.
+func threeTargets(t *testing.T) (Config, []string) {
+	t.Helper()
+	gitEnv(t)
+	base := t.TempDir()
+	t.Setenv("HOME", base) // the notes name ~/projects/app/target, whatever the test's directory is
+	root := filepath.Join(base, "projects")
+	app := filepath.Join(root, "app")
+	write(t, filepath.Join(app, ".gitignore"), "target/\n")
+	write(t, filepath.Join(app, "src", "main.rs"), "fn main() {}\n")
+	gitT(t, app, "init", "-q")
+	gitT(t, app, "add", ".")
+	gitT(t, app, "commit", "-qm", "init")
+	var dirs []string
+	for i, rel := range []string{"target", "crates/a/target", "crates/b/target"} {
+		d := filepath.Join(app, rel)
+		cargoTarget(t, d)
+		blob(t, filepath.Join(d, "debug", "deps", "libbig.rlib"), []int{6, 3, 1}[i]<<20)
+		dirs = append(dirs, d)
+	}
+	cfg := Config{Targets: TargetsConfig{Roots: []string{root}}}.Normal()
+	cfg.Live = []string{RuleTargets}
+	return cfg, dirs
+}
+
+// decidedNotes are the store's decided notes from capacity.
+func decidedNotes(t *testing.T, st *store.Store) []store.Note {
+	t.Helper()
+	ns, err := st.Notes(context.Background())
+	must(t, err)
+	var out []store.Note
+	for _, n := range ns {
+		if n.Kind == store.NoteDecided && n.Source == store.Capacity {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+func TestARunsDeletionsAreOneDecidedNoteRewrittenAsEachGoes(t *testing.T) {
+	ctx := context.Background()
+	cfg, dirs := threeTargets(t)
+	st := openStore(t)
+	now := time.Now().Add(72 * time.Hour)
+	o := options(t, procRoot(t), now, nil)
+	var partial []string // the decided notes at each deletion, before it is recorded: what a run stopped there leaves
+	o.afterDelete = func(Finding) {
+		var titles []string
+		for _, n := range decidedNotes(t, st) {
+			titles = append(titles, n.Title)
+		}
+		partial = append(partial, strings.Join(titles, " | "))
+	}
+	res, err := Run(ctx, cfg, st, o)
+	must(t, err)
+	got := findings(res, RuleTargets)
+	for _, d := range dirs {
+		if !got[d].Done {
+			t.Fatalf("%s goes: %+v", d, got[d])
+		}
+	}
+	ns := decidedNotes(t, st)
+	if len(ns) != 1 {
+		t.Fatalf("three deletions in one run are one decided note, not one each: %d notes", len(ns))
+	}
+	n := ns[0]
+	if n.ID != fmt.Sprintf("capacity:run:%d", now.UnixMilli()) {
+		t.Errorf("the note is keyed by the run's start: %s", n.ID)
+	}
+	if !strings.HasPrefix(n.Title, "Freed ") || !strings.HasSuffix(n.Title, ": 3 Rust build outputs") {
+		t.Errorf("the title is the run's effect, counted by rule: %q", n.Title)
+	}
+	if len(partial) != 3 || partial[0] != "" || !strings.HasPrefix(partial[1], "Freed ") || !strings.HasSuffix(partial[1], ": 1 Rust build output") ||
+		strings.Contains(partial[1], " | ") || !strings.HasSuffix(partial[2], ": 2 Rust build outputs") || strings.Contains(partial[2], " | ") {
+		t.Errorf("the run's one note is rewritten as each item goes, so a run stopped midway leaves what it did: %q", partial)
+	}
+	a, b, c := strings.Index(n.Detail, short(dirs[0])+" 8 MiB"), strings.Index(n.Detail, short(dirs[1])+" 5 MiB"),
+		strings.Index(n.Detail, short(dirs[2])+" 3 MiB")
+	if a < 0 || b < a || c < b {
+		t.Errorf("the detail names the items with their sizes, the largest first: %q", n.Detail)
+	}
+	if strings.Count(n.Detail, "capacity.exclude.paths") != 1 {
+		t.Errorf("the detail says once how to keep a project's build output: %q", n.Detail)
+	}
+	evs, err := st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindDelete}})
+	if err != nil || len(evs) != 3 {
+		t.Errorf("each deletion keeps its own event: %d %v", len(evs), err)
+	}
+	o2 := options(t, procRoot(t), now.Add(time.Hour), nil)
+	o2.Now = true
+	_, err = Run(ctx, cfg, st, o2)
+	must(t, err)
+	if ns := decidedNotes(t, st); len(ns) != 1 {
+		t.Errorf("a run that deletes nothing writes no note: %d notes", len(ns))
+	}
+}
+
+func TestARunsNoteCountsByRuleAndSaysOnceHowToKeepEach(t *testing.T) {
+	t.Setenv("HOME", "/h")
+	const G = int64(1 << 30)
+	items := []runItem{
+		{rule: RuleTargets, path: "/h/p/a/target", size: 11 * G, freed: 11 * G},
+		{rule: RuleWorktrees, path: "/h/.cache/wt", size: 9 << 20, freed: 9 << 20},
+		{rule: RuleTargets, path: "/h/p/b/target", size: 3 * G, freed: 3 * G},
+		{rule: RuleScratch, path: "/h/.cache/x", size: 6 * G, freed: 6 * G, model: true}, // x's model data, then x
+		{rule: RuleScratch, path: "/h/.cache/x", size: G, freed: G, offload: true},
+		{rule: RuleScratch, path: "/h/.cache/y", size: 2 * G, freed: 2 * G, offload: true},
+		{rule: RuleUV, path: "/h/.cache/uv", size: 2 * G, freed: 2 * G},
+	}
+	if got, want := runTitle(items), "Freed 25.0 GiB: 2 Rust build outputs, 1 leftover worktree, 2 task folders (3.0 GiB to restic); "+
+		"pruned the uv cache"; got != want {
+		t.Errorf("title\n got %q\nwant %q", got, want)
+	}
+	// four rules' sentences leave room within the limit for the largest item alone
+	d := runDetail(items)
+	if !strings.HasPrefix(d, "Largest: ~/p/a/target 11.0 GiB. Each offloaded folder's NAME.restic.txt beside it says how to restore it. "+
+		modelDataGone) {
+		t.Errorf("the detail names the largest item, the offloads' pointers and that model data is not in restic: %q", d)
+	}
+	for _, rule := range []string{RuleTargets, RuleWorktrees, RuleScratch, RuleUV} {
+		if strings.Count(d, overrides[rule]) != 1 {
+			t.Errorf("how to keep a %s item, once: %q", rule, d)
+		}
+	}
+	if strings.Contains(d, overrides[RuleModels]) || utf8.RuneCountInString(d) > detailMax {
+		t.Errorf("only the rules that took something, within %d characters: %q", detailMax, d)
+	}
+	// a Docker prune that printed no total: the title says at least, and counts the prunes when their names do not fit
+	items = append(items, runItem{rule: RuleDocker, path: "docker build cache", unsaid: true})
+	if got, want := runTitle(items), "Freed at least 25.0 GiB: 2 Rust build outputs, 1 leftover worktree, 2 task folders "+
+		"(3.0 GiB to restic); 2 prunes"; got != want {
+		t.Errorf("title\n got %q\nwant %q", got, want)
+	}
+	if d := runDetail(items); !strings.Contains(d, "Docker did not print what its prune freed.") || strings.Contains(d, "docker build cache") {
+		t.Errorf("the detail says what is not known, and names no size for it: %q", d)
+	}
+	if got := runTitle(items[len(items)-1:]); got != "Freed an amount Docker did not print: pruned Docker" {
+		t.Errorf("a run whose one prune printed no total: %q", got)
+	}
+	// one offload names its pointer; long paths leave fewer items named, within the limit
+	one := []runItem{{rule: RuleScratch, path: "/h/.cache/y", size: 2 * G, freed: 2 * G, offload: true}}
+	if got, want := runDetail(one), "~/.cache/y 2.0 GiB to restic. ~/.cache/y.restic.txt says how to restore it. "+
+		overrides[RuleScratch]; got != want {
+		t.Errorf("detail\n got %q\nwant %q", got, want)
+	}
+	var long []runItem
+	for i := range 4 {
+		p := "/h/.cache/" + strings.Repeat("a-long-task-name-", 6) + strconv.Itoa(i) + "/target"
+		long = append(long, runItem{rule: RuleTargets, path: p, size: int64(4-i) * G, freed: int64(4-i) * G})
+	}
+	if d := runDetail(long); utf8.RuneCountInString(d) > detailMax || !strings.HasPrefix(d, "Largest: ") || strings.Count(d, "/target ") != 2 {
+		t.Errorf("long names leave two items named, within %d characters: %d %q", detailMax, utf8.RuneCountInString(d), d)
 	}
 }
 

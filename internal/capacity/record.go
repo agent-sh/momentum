@@ -8,16 +8,21 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agent-sh/momentum/internal/store"
 )
 
 // What a run did goes into the store, and into the report through notes (no notification):
-//   - each deletion and prune is an event (kind capacity-delete, capacity-prune) and a decided note that says what
-//     went, its size, since when it was idle, the rule, and how to have it back or keep it; a prune that removed
-//     nothing is an event only;
+//   - each deletion, offload and prune is an event (kind capacity-delete, capacity-offload, capacity-prune) that says
+//     what went, its size, the space it freed, since when it was idle and the rule;
+//   - together they are the run's one decided note (capacity:run:MS, the run's start), put with each one's event in
+//     one transaction, so a run stopped midway leaves a note of what it did until then: what the run freed, how many
+//     items each rule took, the largest of them, and how to keep one next time; a prune that removed nothing is an
+//     event only, and a run that took nothing writes no note;
 //   - each item only reported is an event (capacity-report), once, and its rule's problem note for that reason
 //     lists them; the note is put again only when an item new to it appears, so a note the owner resolved stays
 //     resolved until the evidence changes, and it is resolved by itself when the rule finds none;
@@ -34,16 +39,22 @@ const (
 	KindFill    = "capacity-fill"
 )
 
-// overrides say, per rule, how to have an item back or keep it, for its decided note.
+// overrides say, per rule, how to keep an item next time, or how what a prune took comes back, for the run's note.
+// The keys are sources.json's.
 var overrides = map[string]string{
-	RuleModels:    "Download it again when work on it resumes; to keep an item, list it in capacity.models.keep in sources.json.",
-	RuleTargets:   "Cargo builds it again on the next build; to keep a project's build output, list the project in capacity.exclude.paths.",
-	RuleWorktrees: "Its commits are on its remote, or its changes are in the default branch; git worktree add brings a branch back.",
-	RuleScratch: "Restic keeps the folder: the pointer file in its place gives the restore command. Model data is downloaded or made " +
-		"again. To keep a folder, list it in capacity.scratch.keep in sources.json.",
-	RuleUV:     "uv downloads the wheels it dropped again on the next install.",
-	RuleDocker: "Docker builds the cache again on the next build.",
+	RuleModels:    "To keep model data, list it in capacity.models.keep.",
+	RuleTargets:   "To keep a project's build output, list the project in capacity.exclude.paths.",
+	RuleWorktrees: "To keep a worktree, lock it (git worktree lock).",
+	RuleScratch:   "To keep a task folder, list it in capacity.scratch.keep.",
+	RuleUV:        "uv downloads the wheels it dropped again.",
+	RuleDocker:    "Docker builds its cache again on the next build.",
 }
+
+// modelDataGone says, in a run that deleted a task folder's model data, that restic does not hold it.
+const modelDataGone = "Model data is not offloaded: it is downloaded or made again."
+
+// pruneTool names the tool of each rule that prunes.
+var pruneTool = map[string]string{RuleUV: "uv", RuleDocker: "Docker"}
 
 // ruleText says what each rule deleted, for a note's title.
 var ruleText = map[string]string{
@@ -51,7 +62,7 @@ var ruleText = map[string]string{
 	RuleScratch: "task folder", RuleUV: "uv cache", RuleDocker: "Docker",
 }
 
-// recordDone records one deletion, offload or prune at once: its event and its decided note.
+// recordDone records one deletion, offload or prune at once: its event, and the run's note with it.
 func (r *runner) recordDone(ctx context.Context, f *Finding) error {
 	kind := KindDelete
 	switch {
@@ -62,28 +73,33 @@ func (r *runner) recordDone(ctx context.Context, f *Finding) error {
 	}
 	e := r.event(kind, *f, fmt.Sprintf("%s/%s/%s/%d", kind, f.Rule, keyPath(*f), r.now.UnixMilli()), store.ActorAgent)
 	e.TS = r.opt.Clock() // when it went: a later run tells its own change to a directory from someone's by it
-	if _, err := r.st.Put(ctx, []store.Event{e}); err != nil {
+	if f.none {
+		// the event keeps that it ran; in the run's note, a prune that removed nothing would only crowd it
+		_, err := r.st.Put(ctx, []store.Event{e})
 		return err
 	}
-	if f.none { // the event keeps that it ran; a note of nothing deleted would only crowd the decided list
-		return nil
-	}
-	_, err := r.st.PutNote(ctx, decidedNote(e, *f, e.TS))
-	return err
+	return r.recordTaken(ctx, e, itemOf(*f))
 }
 
 // recordModelData records, before the offload that follows, the model data a task folder's act deleted: its own
-// event and decided note, so the deletion is on record whatever the offload does.
+// event, and the run's note with it, so the deletion is on record whatever the offload does.
 func (r *runner) recordModelData(ctx context.Context, f *Finding) error {
 	g := *f
 	g.offloaded, g.snapshot, g.Freed, g.Bytes = false, "", f.modelFreed, f.removed
 	e := r.event(KindDelete, g, fmt.Sprintf("%s/%s/%s/models/%d", KindDelete, f.Rule, keyPath(*f), r.now.UnixMilli()), store.ActorAgent)
 	e.TS = r.opt.Clock()
-	if _, err := r.st.Put(ctx, []store.Event{e}); err != nil {
+	return r.recordTaken(ctx, e, itemOf(g))
+}
+
+// recordTaken puts an act's event and, in the same transaction, the run's note with what the act took added: a run
+// stopped midway leaves a note of what it did until then.
+func (r *runner) recordTaken(ctx context.Context, e store.Event, it runItem) error {
+	items := append(r.taken[:len(r.taken):len(r.taken)], it)
+	if _, err := r.st.PutWithNote(ctx, []store.Event{e}, runNote(r.now, e.TS, items)); err != nil {
 		return err
 	}
-	_, err := r.st.PutNote(ctx, decidedNote(e, g, e.TS))
-	return err
+	r.taken = items
+	return nil
 }
 
 // recordPrunes records the prunes one rule made on this run, as soon as it made them.
@@ -556,39 +572,175 @@ func summary(kind string, f Finding) string {
 	return fmt.Sprintf("%s %s (%s) left: %s", ruleText[f.Rule], short(f.Path), gib(f.Bytes), f.Why)
 }
 
-// decidedNote is a deletion's or a prune's note.
-func decidedNote(e store.Event, f Finding, now time.Time) store.Note {
-	title := fmt.Sprintf("Deleted %s %s (%s)", ruleText[f.Rule], short(f.Path), gib(f.Bytes))
-	effect := "Freed " + gib(f.Freed)
+// runItem is what one deletion, offload or prune of a run took, for the run's note.
+type runItem struct {
+	rule, path string
+	size       int64 // what went: the item, what of a task folder went to restic, its model data, what a prune freed
+	freed      int64 // the space it freed on its disk
+	offload    bool  // a task folder offloaded to restic
+	model      bool  // a task folder's model data
+	unsaid     bool  // a prune whose tool did not print what it freed
+}
+
+// itemOf is what a finding's act took, as the run's note counts it: an item's size, what of a task folder went to
+// restic, a task folder's model data, or what a prune freed.
+func itemOf(f Finding) runItem {
+	it := runItem{rule: f.Rule, path: f.Path, size: f.Bytes, freed: f.Freed, unsaid: f.unsaid}
 	switch {
 	case f.Rule == RuleUV || f.Rule == RuleDocker:
-		title = fmt.Sprintf("Pruned %s: %s", f.Path, gib(f.Freed))
+		it.size = f.Freed // a prune's size is the whole cache's; what went is what it freed
 	case f.Rule == RuleScratch && f.offloaded:
-		title = fmt.Sprintf("Offloaded task folder %s (%s) to restic", short(f.Path), gib(offloadedBytes(f)))
-		effect = "Freed " + gib(offloadFreed(f))
+		it.offload, it.size, it.freed = true, offloadedBytes(f), offloadFreed(f)
 	case f.Rule == RuleScratch:
-		title = fmt.Sprintf("Deleted the model data of task folder %s (%s)", short(f.Path), gib(f.removed))
+		it.model, it.size = true, f.removed
 	}
-	if f.unsaid {
-		title, effect = "Pruned "+f.Path, "Freed an amount the tool did not print"
+	return it
+}
+
+// runNote is a run's decided note, keyed by the run's start: what its deletions, offloads and prunes took so far.
+func runNote(start, at time.Time, items []runItem) store.Note {
+	return store.Note{ID: "capacity:run:" + strconv.FormatInt(start.UnixMilli(), 10), Kind: store.NoteDecided,
+		Title: runTitle(items), Detail: runDetail(items), Source: store.Capacity, Importance: store.ImportanceNormal, At: at}
+}
+
+// runTitle is a run's effect in one line: what it freed, how many items each rule took, what of the task folders went
+// to restic, and what it pruned ("Freed 12.4 GiB: 5 Rust build outputs, 2 leftover worktrees; pruned Docker").
+func runTitle(items []runItem) string {
+	var freed, restic int64
+	unsaid, offloaded := "", false
+	count, folders, pruned := map[string]int{}, map[string]bool{}, map[string]bool{}
+	for _, it := range items {
+		freed += it.freed
+		switch {
+		case it.rule == RuleUV || it.rule == RuleDocker:
+			pruned[it.rule] = true
+			if it.unsaid {
+				unsaid = pruneTool[it.rule]
+			}
+		case it.rule == RuleScratch: // a folder's model data and its offload are one folder
+			folders[it.path] = true
+			if it.offload {
+				offloaded, restic = true, restic+it.size
+			}
+		default:
+			count[it.rule]++
+		}
 	}
-	var detail []string
-	if f.snapshot != "" {
-		detail = append(detail, "Restic snapshot "+f.snapshot+"; "+short(f.Path)+pointerSuffix+" says how to restore it.")
+	var parts []string
+	for _, rule := range []string{RuleModels, RuleTargets, RuleWorktrees} {
+		if n := count[rule]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", n, plural(ruleText[rule], n)))
+		}
 	}
-	if f.Detail != "" {
-		detail = append(detail, upper(f.Detail)+".")
+	switch n := len(folders); {
+	case n > 0 && offloaded:
+		parts = append(parts, fmt.Sprintf("%d %s (%s to restic)", n, plural(ruleText[RuleScratch], n), gib(restic)))
+	case n > 0:
+		parts = append(parts, fmt.Sprintf("model data of %d %s", n, plural(ruleText[RuleScratch], n)))
 	}
-	if !f.Idle.IsZero() {
-		detail = append(detail, "Idle since "+f.Idle.Format("2006-01-02")+".")
+	head := "Freed " + gib(freed)
+	switch {
+	case unsaid != "" && freed == 0:
+		head = "Freed an amount " + unsaid + " did not print"
+	case unsaid != "":
+		head = "Freed at least " + gib(freed)
 	}
-	override := overrides[f.Rule]
-	if f.Rule == RuleScratch && !f.offloaded {
-		override = "Model data is downloaded or made again when work on it resumes; to keep a folder, list it in capacity.scratch.keep in sources.json."
+	// the prunes by name, by their tools' short names, or counted: the first that fits in a title (the store clips
+	// one that still does not)
+	var long, brief []string
+	if pruned[RuleUV] {
+		long, brief = append(long, "the uv cache"), append(brief, pruneTool[RuleUV])
 	}
-	detail = append(detail, "Rule "+f.Rule+".", override)
-	return store.Note{ID: "capacity:deleted:" + e.ID(), Kind: store.NoteDecided, Title: title, Detail: strings.Join(detail, " "),
-		Effect: effect, Source: store.Capacity, Importance: store.ImportanceNormal, At: now}
+	if pruned[RuleDocker] {
+		long, brief = append(long, pruneTool[RuleDocker]), append(brief, pruneTool[RuleDocker])
+	}
+	clauses := []string{""}
+	if n := len(long); n > 0 {
+		clauses = []string{"pruned " + strings.Join(long, " and "), "pruned " + strings.Join(brief, " and "),
+			fmt.Sprintf("%d %s", n, plural("prune", n))}
+	}
+	var title string
+	for _, c := range clauses {
+		list := strings.Join(parts, ", ")
+		if list != "" && c != "" {
+			list += "; "
+		}
+		if title = head + ": " + list + c; utf8.RuneCountInString(title) <= store.TitleMax {
+			break
+		}
+	}
+	return title
+}
+
+// detailMax is the longest detail a run's note has when it can: the most the phone's view keeps of a detail.
+const detailMax = 400
+
+// runDetail is what a run took in plain sentences: its largest items with their sizes (three, or fewer when three
+// would make the detail longer than detailMax), where each offloaded folder's pointer is, and how to keep an item
+// next time, once per rule.
+func runDetail(items []runItem) string {
+	var sized, offloads []runItem
+	took, model, unsaid := map[string]bool{}, false, ""
+	for _, it := range items {
+		took[it.rule], model = true, model || it.model
+		switch {
+		case it.unsaid:
+			unsaid = pruneTool[it.rule]
+			continue // what it freed is not known
+		case it.offload:
+			offloads = append(offloads, it)
+		}
+		sized = append(sized, it)
+	}
+	sort.SliceStable(sized, func(i, j int) bool { return sized[i].size > sized[j].size })
+	var rest []string
+	switch {
+	case len(offloads) == 1:
+		rest = append(rest, short(offloads[0].path)+pointerSuffix+" says how to restore it.")
+	case len(offloads) > 1:
+		rest = append(rest, "Each offloaded folder's NAME"+pointerSuffix+" beside it says how to restore it.")
+	}
+	if model {
+		rest = append(rest, modelDataGone)
+	}
+	if unsaid != "" {
+		rest = append(rest, unsaid+" did not print what its prune freed.")
+	}
+	for _, rule := range Rules {
+		if took[rule] {
+			rest = append(rest, overrides[rule])
+		}
+	}
+	for n := min(3, len(sized)); ; n-- {
+		var named []string
+		for _, it := range sized[:n] {
+			named = append(named, itemText(it))
+		}
+		lead := upper(strings.Join(named, ", "))
+		if n < len(sized) {
+			lead = "Largest: " + strings.Join(named, ", ")
+		}
+		if lead != "" {
+			lead += "."
+		}
+		detail := strings.Join(append([]string{lead}, rest...), " ")
+		if n <= 1 || utf8.RuneCountInString(detail) <= detailMax {
+			return strings.TrimSpace(detail)
+		}
+	}
+}
+
+// itemText names what an item took, with its size.
+func itemText(it runItem) string {
+	switch {
+	case it.rule == RuleUV || it.rule == RuleDocker:
+		return "pruned " + short(it.path) + " " + gib(it.size)
+	case it.offload:
+		return short(it.path) + " " + gib(it.size) + " to restic"
+	case it.model:
+		return "model data in " + short(it.path) + " " + gib(it.size)
+	}
+	return short(it.path) + " " + gib(it.size)
 }
 
 // groupTitles say what a rule's report-only items of one reason are.
@@ -644,7 +796,7 @@ func groupNote(id, rule, class string, items []Finding, now time.Time) store.Not
 }
 
 func plural(what string, n int) string {
-	if n == 1 || strings.HasSuffix(what, "output") || strings.HasSuffix(what, "data") || strings.HasSuffix(what, "cache") {
+	if n == 1 || strings.HasSuffix(what, "data") || strings.HasSuffix(what, "cache") {
 		return what
 	}
 	return what + "s"

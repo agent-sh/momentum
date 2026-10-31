@@ -241,7 +241,7 @@ func TestAPruneThatCanFreeNothingDoesNotRunAndOneThatRemovedNothingIsNoNote(t *t
 		name, du, said string
 		runs           bool
 		notes          int
-		effect         string
+		title          string // what the run's note's title says it freed
 	}{
 		{"only shared and recent records", `{"ID":"s","LastUsedAt":"12 days ago","Reclaimable":true,"Shared":true,"Size":"30GB","Type":"regular"}
 {"ID":"r","LastUsedAt":"About an hour ago","Reclaimable":true,"Shared":false,"Size":"20GB","Type":"regular"}`, "", false, 0, ""},
@@ -291,8 +291,8 @@ func TestAPruneThatCanFreeNothingDoesNotRunAndOneThatRemovedNothingIsNoNote(t *t
 		for _, x := range ns {
 			if x.Kind == store.NoteDecided {
 				n++
-				if !strings.Contains(x.Effect, c.effect) {
-					t.Errorf("%s: effect %q, want %q", c.name, x.Effect, c.effect)
+				if !strings.Contains(x.Title, c.title) || !strings.HasSuffix(x.Title, ": pruned Docker") {
+					t.Errorf("%s: title %q, want %q", c.name, x.Title, c.title)
 				}
 			}
 		}

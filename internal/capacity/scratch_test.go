@@ -296,15 +296,12 @@ func TestAnIdleTaskFoldersModelDataGoesAndTheRestIsOffloaded(t *testing.T) {
 		t.Errorf("the act's freed space is the model data's and the offload's, each counted once: %v + %v, act %d", of, df,
 			got[run].Freed)
 	}
-	ns, err := f.st.Notes(context.Background())
-	must(t, err)
-	found := false
-	for _, n := range ns {
-		found = found || (n.Kind == store.NoteDecided && strings.HasPrefix(n.Title, "Offloaded task folder") &&
-			strings.HasPrefix(n.Detail, "Restic snapshot 0123abcd;"))
-	}
-	if !found {
-		t.Errorf("an offload is a decided note that names its snapshot: %+v", ns)
+	// the two folders, the model data of one deleted before its offload, are one line of the run's note, with what
+	// went to restic
+	restic := ": 2 task folders (" + gib(offloadedBytes(got[run])+offloadedBytes(got[plain])) + " to restic)"
+	if ns := decidedNotes(t, f.st); len(ns) != 1 || !strings.HasSuffix(ns[0].Title, restic) ||
+		!strings.Contains(ns[0].Detail, "Each offloaded folder's NAME.restic.txt beside it says how to restore it.") {
+		t.Errorf("the offloads are the run's decided note, which says what went to restic and where its pointers are: %+v", ns)
 	}
 }
 
@@ -924,14 +921,11 @@ func TestModelDataDeletedBeforeAFailedOffloadIsADeletionOnRecord(t *testing.T) {
 	for _, e := range evs {
 		deleted = deleted || e.Ref == p
 	}
-	ns, err := f.st.Notes(ctx)
-	must(t, err)
-	decided := false
-	for _, n := range ns {
-		decided = decided || (n.Kind == store.NoteDecided && strings.HasPrefix(n.Title, "Deleted the model data of task folder"))
-	}
+	ns := decidedNotes(t, f.st)
+	decided := len(ns) == 1 && strings.HasSuffix(ns[0].Title, ": model data of 1 task folder") &&
+		strings.HasPrefix(ns[0].Detail, "Model data in "+short(p)+" 2 MiB.")
 	if !deleted || !decided {
-		t.Errorf("the model data went: a capacity-delete event (%v) and a decided note (%v)", deleted, decided)
+		t.Errorf("the model data went: a capacity-delete event (%v) and the run's decided note (%+v)", deleted, ns)
 	}
 	if n, ok, err := f.st.Note(ctx, "capacity:scratch:failed"); err != nil || !ok || !strings.Contains(n.Title, "could not be offloaded") {
 		t.Errorf("the failure's note says what failed: %q", n.Title)
@@ -1348,24 +1342,20 @@ func TestAModelOnlyDeletionStoppedMidwayIsOnRecord(t *testing.T) {
 
 func TestTheModelDatasDeletionSaysWhatItFreed(t *testing.T) {
 	f := newScratch(t)
+	t.Setenv("HOME", f.base) // the note names ~/cache/zq-task, whatever the test's directory is
 	f.cfg.Live = []string{RuleScratch}
 	p := f.task(t, "zq-task", "s1", map[string]int{"w.safetensors": 32 << 20, "notes.md": -1})
 	if g := findings(f.run(t, options(t, procRoot(t), f.now, nil)), RuleScratch)[p]; !g.Done {
 		t.Fatalf("offloaded: %+v", g)
 	}
-	ns, err := f.st.Notes(context.Background())
+	evs, err := f.st.Events(context.Background(), store.Query{Source: store.Capacity, Kinds: []string{KindDelete}})
 	must(t, err)
-	found := false
-	for _, n := range ns {
-		if strings.HasPrefix(n.Title, "Deleted the model data of task folder") {
-			found = true
-			if n.Effect == "Freed 0 MiB" {
-				t.Errorf("the model data's note says it freed nothing: %q / %q", n.Title, n.Effect)
-			}
-		}
+	if len(evs) != 1 || !strings.Contains(evs[0].Summary, "deleted the model data of task folder") ||
+		strings.HasSuffix(evs[0].Summary, "freed 0 MiB") {
+		t.Errorf("the model data's deletion is an event that says what it freed: %+v", evs)
 	}
-	if !found {
-		t.Error("no note for the model data's deletion")
+	if ns := decidedNotes(t, f.st); len(ns) != 1 || !strings.Contains(ns[0].Detail, "Model data in "+short(p)+" 32 MiB") {
+		t.Errorf("the run's note names the model data with its size: %+v", ns)
 	}
 }
 

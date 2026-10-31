@@ -151,24 +151,14 @@ func TestALiveModelsRunDeletesAnItemWithTheBlobsOnlyItLinked(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(f.hub, "blobs", hfStoreMarker)); err != nil {
 		t.Error("the store's marker stays")
 	}
-	ns, err := st.Notes(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	decided := 0
-	for _, n := range ns {
-		if n.Kind == store.NoteDecided && n.Source == store.Capacity {
-			decided++
-		}
-	}
 	deleted := 0
 	for _, f := range got {
 		if f.Done {
 			deleted++
 		}
 	}
-	if deleted != 7 || decided != deleted {
-		t.Errorf("seven items go (nothing uses or names them in this run), one decided note each: %d deleted, %d notes", deleted, decided)
+	if ns := decidedNotes(t, st); deleted != 7 || len(ns) != 1 || !strings.HasSuffix(ns[0].Title, ": 7 idle model data") {
+		t.Errorf("seven items go (nothing uses or names them in this run), in the run's one decided note: %d deleted, %+v", deleted, ns)
 	}
 	evs, err := st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindDelete}})
 	if err != nil || len(evs) != deleted {

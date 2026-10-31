@@ -41,7 +41,7 @@ type Finding struct {
 	blobs        []string  // a model's shared-store blobs that go with it, canonical
 	linked       []string  // every shared-store blob a model links, canonical
 	class        string    // why a report-only finding is reported, as a word: its note's group
-	none         bool      // a prune that removed nothing, as the tool lists it or uv counts it: no decided note
+	none         bool      // a prune that removed nothing, as the tool lists it or uv counts it: an event, not in the run's note
 	unsaid       bool      // a prune whose tool did not say what it freed
 	unsized      bool      // a prune whose size could not be read before it ran
 	ownDirs      []ownDir  // the directories its deletion changed, each with its last change before (ownBefore)
@@ -213,6 +213,7 @@ type runner struct {
 	heads         *remoteHeads         // the remotes' branches, asked once per run
 	changed       map[changeKey]bool   // whether a work tree changed in the last quietTime, per look
 	own           map[string]ownChange // the directories this run's and recent runs' deletions changed
+	taken         []runItem            // what this run's deletions, offloads and prunes took: its note
 	writes        writesSnap           // each process's written bytes at this run
 	prevWrites    writesSnap           // and at the last run before that could trust its look
 	iv            map[int]wrote        // what each wrote in between
