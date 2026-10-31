@@ -204,18 +204,45 @@ func TestARunsTableFromBeforeTheBlindColumnGainsIt(t *testing.T) {
 func TestWritesAreReplacedByEachRecord(t *testing.T) {
 	ctx := context.Background()
 	st, _ := open(t)
-	if at, ws, err := st.Writes(ctx); err != nil || !at.IsZero() || ws != nil {
-		t.Fatalf("none on record: %v %v %v", at, ws, err)
+	if snap, ws, err := st.Writes(ctx); err != nil || !snap.At.IsZero() || ws != nil {
+		t.Fatalf("none on record: %v %v %v", snap, ws, err)
 	}
 	t1 := time.UnixMilli(1_800_000_000_000)
-	if err := st.PutWrites(ctx, t1, []ProcWrite{{PID: 1, Start: 100, Written: 5}, {PID: 2, Start: 200, Written: 7}}); err != nil {
+	if err := st.PutWrites(ctx, Snapshot{At: t1, Uptime: 500, Boot: "b1"},
+		[]ProcWrite{{PID: 1, Start: 100, Written: 5}, {PID: 2, PPID: 1, Start: 200, Written: 7}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.PutWrites(ctx, t1.Add(time.Minute), []ProcWrite{{PID: 2, Start: 200, Written: 9}}); err != nil {
+	if err := st.PutWrites(ctx, Snapshot{At: t1.Add(time.Minute), Uptime: 6500, Boot: "b1"},
+		[]ProcWrite{{PID: 2, PPID: 1, Start: 200, Written: 9}}); err != nil {
 		t.Fatal(err)
 	}
-	at, ws, err := st.Writes(ctx)
-	if err != nil || !at.Equal(t1.Add(time.Minute)) || len(ws) != 1 || ws[0] != (ProcWrite{PID: 2, Start: 200, Written: 9}) {
-		t.Errorf("the last record only: %v %v %v", at, ws, err)
+	snap, ws, err := st.Writes(ctx)
+	if err != nil || snap != (Snapshot{At: t1.Add(time.Minute), Uptime: 6500, Boot: "b1"}) || len(ws) != 1 ||
+		ws[0] != (ProcWrite{PID: 2, PPID: 1, Start: 200, Written: 9}) {
+		t.Errorf("the last record only: %v %v %v", snap, ws, err)
+	}
+}
+
+func TestAStoreWithoutTheWritesTablesGainsThem(t *testing.T) {
+	ctx := context.Background()
+	st, path := open(t)
+	st.Close()
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tb := range []string{"capacity_writes", "capacity_snapshot"} { // a store the build before them made
+		if _, err := db.Exec(`DROP TABLE ` + tb); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+	st, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.PutWrites(ctx, Snapshot{At: time.UnixMilli(1_800_000_000_000), Uptime: 1, Boot: "b"}, []ProcWrite{{PID: 1, Start: 1}}); err != nil {
+		t.Errorf("the next open makes them: %v", err)
 	}
 }

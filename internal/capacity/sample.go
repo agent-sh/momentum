@@ -41,6 +41,7 @@ type Sample struct {
 // Proc is one process the sampler read, and its working directory (canonical), wherever it is.
 type Proc struct {
 	PID, PPID int
+	Start     int64 // clock ticks after boot (userHZ a second)
 	Comm      string
 	Argv      []string
 	Cwd       string
@@ -115,11 +116,11 @@ func TakeSample(procRoot string, m *Mounts, keep func(string) bool) *Sample {
 		if c, err := os.ReadFile(filepath.Join(dir, "comm")); err == nil {
 			comm = strings.TrimSpace(string(c))
 		}
-		ppid := 0
+		ppid, start := 0, int64(0)
 		if st, err := os.ReadFile(filepath.Join(dir, "stat")); err == nil {
-			ppid = parentOf(string(st))
+			ppid, start = parentOf(string(st)), startOf(string(st))
 		}
-		pr := Proc{PID: pid, PPID: ppid, Comm: comm, Argv: argv}
+		pr := Proc{PID: pid, PPID: ppid, Start: start, Comm: comm, Argv: argv}
 		if l, err := os.Readlink(filepath.Join(dir, "cwd")); err == nil {
 			add(l, "cwd", pid, comm)
 			if filepath.IsAbs(l) {

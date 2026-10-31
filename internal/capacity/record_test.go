@@ -2,6 +2,8 @@ package capacity
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -159,13 +161,14 @@ func TestJobsNameWhatTheyRun(t *testing.T) {
 	}
 }
 
-// fillRun is a run that sees dir fill at 45 GiB an hour, with the processes and the written bytes given.
-func fillRun(t *testing.T, st *store.Store, dir string, now time.Time, proc string, writes map[int]int64) *Result {
+// fillRun is a run that sees dir fill at 45 GiB an hour, with the processes given and the written bytes the look
+// reads (writes, called at the look's start and end).
+func fillRun(t *testing.T, st *store.Store, dir string, now time.Time, proc string, writes func() map[int]int64) *Result {
 	t.Helper()
 	cfg := Config{Disks: []string{dir}}.Normal()
 	o := options(t, proc, now, nil)
 	o.Rules = []string{RuleUV}
-	o.Writes = func() map[int]int64 { return writes }
+	o.Writes = writes
 	res, err := Run(context.Background(), cfg, st, o)
 	if err != nil {
 		t.Fatal(err)
@@ -173,61 +176,152 @@ func fillRun(t *testing.T, st *store.Store, dir string, now time.Time, proc stri
 	return res
 }
 
-func TestAFillNamesWhoWroteBetweenTheRunsAndEveryWriterItSaw(t *testing.T) {
+// fillFixture is a disk that held 15 GiB less 24 minutes before now (inside the 30-minute window of a run up to five
+// minutes later), and a run of fake /procs: each at an uptime, on one boot.
+func fillFixture(t *testing.T) (st *store.Store, dir string, now time.Time, proc func(uptime int, ps ...fakeProc) string) {
+	t.Helper()
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir = t.TempDir()
 	var fs syscall.Statfs_t
 	must(t, syscall.Statfs(dir, &fs))
 	used := int64(fs.Blocks-fs.Bfree) * int64(fs.Bsize)
-	st := openStore(t)
-	now := time.Now()
-	must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: now.Add(-25 * time.Minute)},
-		[]store.DiskSample{{Disk: dir, At: now.Add(-25 * time.Minute), Size: 1 << 40, Used: used - 15<<30, Avail: 1 << 39}}, nil))
-	// a training run (pid 31, under a shell) saves checkpoints between the looks: nothing in the seconds measured
-	quiet := map[int]int64{}
-	run := func(at time.Time, ps ...fakeProc) DiskState {
-		proc := procRoot(t, ps...)
-		write(t, filepath.Join(proc, "uptime"), "1201.00 1000.00\n")
-		return fillRun(t, st, dir, at, proc, quiet).Disks[0]
+	st = openStore(t)
+	now = time.Now()
+	must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: now.Add(-24 * time.Minute)},
+		[]store.DiskSample{{Disk: dir, At: now.Add(-24 * time.Minute), Size: 1 << 40, Used: used - 15<<30, Avail: 1 << 39}}, nil))
+	proc = func(uptime int, ps ...fakeProc) string {
+		root := procRoot(t, ps...)
+		write(t, filepath.Join(root, "uptime"), fmt.Sprintf("%d.00 1000.00\n", uptime))
+		write(t, filepath.Join(root, "sys", "kernel", "random", "boot_id"), "b1\n")
+		return root
 	}
+	return st, dir, now, proc
+}
+
+func quiet() map[int]int64 { return map[int]int64{} }
+
+func TestAFillNamesWhoWroteBetweenTheRunsAndEveryWriterItSaw(t *testing.T) {
+	ctx := context.Background()
+	st, dir, now, proc := fillFixture(t)
+	// a training run under a shell saves checkpoints between the looks: nothing in the seconds measured
 	shell := fakeProc{pid: 30, ppid: 1, argv: []string{"bash"}, cwd: dir, written: 1 << 30}
-	editor := fakeProc{pid: 32, ppid: 1, argv: []string{"editor"}, cwd: dir, written: 1 << 29}
 	train := fakeProc{pid: 31, ppid: 30, argv: []string{"torchrun"}, cwd: dir, written: 10 << 30}
-	gone := fakeProc{pid: 33, ppid: 1, argv: []string{"old"}, cwd: dir, written: 9 << 30} // its pid is used again later
-	if d := run(now.Add(-5*time.Minute), shell, editor, train, gone); !d.Fast || len(d.Writers) != 0 {
+	old := fakeProc{pid: 33, ppid: 1, argv: []string{"old"}, cwd: dir, written: 1 << 30} // its pid is used again later
+	sync := fakeProc{pid: 34, ppid: 1, argv: []string{"sync"}, cwd: dir}
+	if d := fillRun(t, st, dir, now.Add(-5*time.Minute), proc(1201, shell, train, old, sync), quiet).Disks[0]; !d.Fast || len(d.Writers) != 0 {
 		t.Fatalf("the first run has no run before to compare with: %+v", d)
 	}
-	train.written = 50 << 30
-	// a process two minutes old (started 1081 s after boot, 1201 s ago) that wrote 8 GiB
-	late := fakeProc{pid: 33, ppid: 1, argv: []string{"python"}, cwd: dir, written: 8 << 30, start: 108100}
-	d := run(now, shell, editor, train, late)
+	train.written, old.written = 50<<30, 9<<30
+	d := fillRun(t, st, dir, now, proc(1501, shell, train, old, sync), quiet).Disks[0]
 	got := map[int]Writer{}
 	for _, w := range d.Writers {
 		got[w.PID] = w
 	}
-	if w := got[31]; w.Written != 40<<30 || w.Over < 299.9 || w.Over > 300.1 {
+	if w := got[31]; w.Written != 40<<30 || w.Over != 300 {
 		t.Errorf("the training run wrote 40 GiB in the 5 minutes since the run before: %+v", got)
 	}
-	if w := got[33]; w.Written != 8<<30 || w.Over < 119 || w.Over > 121 {
+	if _, ok := got[30]; ok {
+		t.Errorf("a shell that wrote nothing since is no writer: %+v", got)
+	}
+	// five minutes on: the training run wrote 10 GiB more and ended, and its shell took in all of its 60 GiB; pid 33
+	// is a python started two minutes before, 1681 s after boot; sync writes slowly, as a slow fill's writer may
+	shell.written = 1<<30 + 60<<30
+	sync.written = 150 << 20
+	late := fakeProc{pid: 33, ppid: 1, argv: []string{"python"}, cwd: dir, written: 8 << 30, start: 168100}
+	d = fillRun(t, st, dir, now.Add(5*time.Minute), proc(1801, shell, late, sync), quiet).Disks[0]
+	got = map[int]Writer{}
+	for _, w := range d.Writers {
+		got[w.PID] = w
+	}
+	if w := got[30]; w.Written != 10<<30 {
+		t.Errorf("the shell wrote what its child wrote since the run before, 10 GiB, not the child's whole 60: %+v", got)
+	}
+	if w := got[33]; w.Written != 8<<30 || w.Over != 120 || w.Start != 168100 {
 		t.Errorf("a process that started since wrote all it wrote since it started: %+v", got)
 	}
-	if _, ok := got[32]; ok {
-		t.Errorf("a process that wrote nothing since is no writer: %+v", got)
+	if _, ok := got[34]; !ok {
+		t.Errorf("0.5 MiB/s since the run before names a writer: a fill from 1 GiB an hour is reported: %+v", got)
 	}
-	id := "capacity:fill:" + dir
-	if n, _, _ := st.Note(ctx, id); !strings.Contains(n.Detail, "torchrun (pid 31) wrote 40.0 GiB in 5m0s") ||
-		!strings.Contains(n.Detail, "python (pid 33) wrote 8.0 GiB in 2m0s") {
-		t.Fatalf("the note says who wrote what, and in how long: %s", n.Detail)
-	}
-	// five minutes on the training run has ended: its shell took in what it wrote last; python wrote 8 GiB more
-	shell.written, late.written = 31<<30, 16<<30
-	run(now.Add(5*time.Minute), shell, editor, late)
-	n, _, _ := st.Note(ctx, id)
-	for _, want := range []string{"bash (pid 30) wrote 30.0 GiB in 5m0s", "torchrun (pid 31) wrote 40.0 GiB in 5m0s",
-		"python (pid 33) wrote 16.0 GiB in 7m0s"} {
+	n, _, _ := st.Note(ctx, "capacity:fill:"+dir)
+	for _, want := range []string{"torchrun (pid 31) wrote 40.0 GiB in 5m0s", "bash (pid 30) wrote 10.0 GiB in 5m0s",
+		"python (pid 33) wrote 8.0 GiB in 2m0s", "old (pid 33) wrote 8.0 GiB in 5m0s"} {
 		if !strings.Contains(n.Detail, want) {
-			t.Errorf("the note names every writer the fill's runs saw, with all it wrote in them (%s): %s", want, n.Detail)
+			t.Errorf("the note names the fill's writers, a pid used again as two (%s): %s", want, n.Detail)
 		}
+	}
+}
+
+func TestAFillWritersRunsAddUpTheFastestLookStandsAndANameOutlivesItsProcess(t *testing.T) {
+	ctx := context.Background()
+	st, dir, now, proc := fillFixture(t)
+	dd := fakeProc{pid: 41, ppid: 1, argv: []string{"sh"}, cwd: dir, written: 1 << 30} // a shell that execs dd later
+	look := func(mibs int64, gone string) func() map[int]int64 {                       // the look's two reads, mibs MiB/s apart
+		n := 0
+		return func() map[int]int64 {
+			n++
+			if gone != "" { // it ends during the look
+				must(t, os.RemoveAll(gone))
+			}
+			return map[int]int64{41: int64(n) * mibs << 20 / 1000} // the look lasts a millisecond in tests
+		}
+	}
+	p1 := proc(1201, dd)
+	fillRun(t, st, dir, now.Add(-10*time.Minute), p1, look(90, ""))
+	dd.written = 3 << 30
+	fillRun(t, st, dir, now.Add(-5*time.Minute), proc(1501, dd), look(80, ""))
+	dd.written, dd.argv = 5<<30, []string{"dd"}
+	p3 := proc(1801, dd)
+	fillRun(t, st, dir, now, p3, look(0, filepath.Join(p3, "41")))
+	n, _, _ := st.Note(ctx, "capacity:fill:"+dir)
+	if !strings.Contains(n.Detail, "dd (pid 41) wrote 4.0 GiB in 10m0s, 90 MiB/s at a look in "+dir) {
+		t.Errorf("what it wrote adds up over the runs, its fastest look from the fill's first run stands, the newest run "+
+			"names it, and its name and directory come from the sample when it ended during the look: %s", n.Detail)
+	}
+}
+
+func TestAFillNoteReadsOnlyItsOwnFillsWriters(t *testing.T) {
+	ctx := context.Background()
+	st, dir, now, proc := fillFixture(t)
+	// an earlier fill of this disk, and one of another disk during this fill, each with a writer
+	put := func(at time.Time, disk string, pid int, comm string) {
+		meta, _ := json.Marshal(DiskState{Disk: disk, Fast: true, Writers: []Writer{{PID: pid, Comm: comm, Rate: 50}}})
+		_, err := st.Put(ctx, []store.Event{{Source: store.Capacity, SourceKey: fmt.Sprintf("fill/%s/%d", disk, at.UnixMilli()),
+			TS: at, Actor: store.ActorDetector, Kind: KindFill, Summary: "x", Meta: string(meta)}})
+		must(t, err)
+	}
+	put(now.Add(-3*time.Hour), dir, 51, "earlier")
+	fillRun(t, st, dir, now.Add(-5*time.Minute), proc(1201), quiet)
+	put(now.Add(-4*time.Minute), "/elsewhere", 52, "other")
+	cp := fakeProc{pid: 53, ppid: 1, argv: []string{"cp"}, cwd: dir, written: 2 << 30, start: 145600} // 45 s before
+	fillRun(t, st, dir, now, proc(1501, cp), quiet)
+	n, _, _ := st.Note(ctx, "capacity:fill:"+dir)
+	if strings.Contains(n.Detail, "earlier") || strings.Contains(n.Detail, "other") {
+		t.Errorf("the note names this fill's writers on this disk only: %s", n.Detail)
+	}
+	if !strings.Contains(n.Detail, "cp (pid 53) wrote 2.0 GiB in 45s") {
+		t.Errorf("under a minute reads in seconds: %s", n.Detail)
+	}
+}
+
+func TestBetweenTwoSnapshots(t *testing.T) {
+	snap := func(up int64, boot string, ws ...store.ProcWrite) writesSnap {
+		s := writesSnap{snap: store.Snapshot{At: time.Unix(1, 0), Uptime: up, Boot: boot}, ws: map[int]store.ProcWrite{}}
+		for _, w := range ws {
+			s.ws[w.PID] = w
+		}
+		return s
+	}
+	prev := snap(1000, "b1", store.ProcWrite{PID: 1, Start: 10, Written: 500}, store.ProcWrite{PID: 2, Start: 10, Written: 900})
+	got := between(prev, snap(31000, "b1", store.ProcWrite{PID: 1, Start: 10, Written: 400}, store.ProcWrite{PID: 2, Start: 10, Written: 950}))
+	if _, ok := got[1]; ok {
+		t.Errorf("a counter that went down is not known: %+v", got)
+	}
+	if got[2] != (wrote{50, 300}) {
+		t.Errorf("the same process wrote the difference: %+v", got)
+	}
+	got = between(prev, snap(2000, "b2", store.ProcWrite{PID: 1, Start: 10, Written: 400}))
+	if got[1] != (wrote{400, 19.9}) {
+		t.Errorf("on another boot every process started since: %+v", got)
 	}
 }
 
@@ -240,21 +334,21 @@ func TestOnlyARunThatTrustsItsLookRecordsTheWrites(t *testing.T) {
 	if _, err := Run(ctx, cfg, st, o); err != nil {
 		t.Fatal(err)
 	}
-	if at, _, _ := st.Writes(ctx); !at.IsZero() {
+	if snap, _, _ := st.Writes(ctx); !snap.At.IsZero() {
 		t.Error("a dry run records nothing")
 	}
 	o.DryRun, o.ProcRoot = false, t.TempDir() // an empty /proc: a look the run cannot trust
 	if _, err := Run(ctx, cfg, st, o); err != nil {
 		t.Fatal(err)
 	}
-	if at, _, _ := st.Writes(ctx); !at.IsZero() {
+	if snap, _, _ := st.Writes(ctx); !snap.At.IsZero() {
 		t.Error("a blind run records no writes: the next run would take every process for new")
 	}
 	o.ProcRoot = procRoot(t, fakeProc{pid: 40, ppid: 1, argv: []string{"x"}, written: 1 << 30})
 	if _, err := Run(ctx, cfg, st, o); err != nil {
 		t.Fatal(err)
 	}
-	if at, ws, _ := st.Writes(ctx); at.IsZero() || len(ws) < 2 {
-		t.Errorf("a run records each process's written bytes: %v %v", at, ws)
+	if snap, ws, _ := st.Writes(ctx); snap.At.IsZero() || len(ws) < 2 {
+		t.Errorf("a run records each process's written bytes: %v %v", snap, ws)
 	}
 }

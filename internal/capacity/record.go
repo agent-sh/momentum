@@ -360,16 +360,21 @@ func (r *runner) fillWriters(ctx context.Context, d DiskState, since time.Time) 
 	if err != nil {
 		return nil, err
 	}
-	by := map[int]Writer{}
-	add := func(w Writer) { // each run's writes are its own stretch: they add up
-		o, ok := by[w.PID]
-		if ok {
-			w.Written, w.Over, w.Rate = w.Written+o.Written, w.Over+o.Over, max(w.Rate, o.Rate)
-			w.Session = firstNonEmpty(w.Session, o.Session)
-		}
-		by[w.PID] = w
+	type key struct {
+		pid   int
+		start int64
 	}
-	for _, e := range evs { // this run's among them: its event is recorded first
+	by := map[key]Writer{}
+	add := func(w Writer) { // each run's writes are its own stretch: they add up; the newest run names it
+		k := key{w.PID, w.Start}
+		if o, ok := by[k]; ok {
+			o.Written, o.Over, o.Rate = o.Written+w.Written, o.Over+w.Over, max(o.Rate, w.Rate)
+			o.Session = firstNonEmpty(o.Session, w.Session)
+			w = o
+		}
+		by[k] = w
+	}
+	for _, e := range evs { // newest first, this run's among them: its event is recorded first
 		var past DiskState
 		if json.Unmarshal([]byte(e.Meta), &past) == nil && past.Disk == d.Disk {
 			for _, w := range past.Writers {
@@ -395,13 +400,20 @@ func fillTitle(d DiskState) string {
 
 func fillDetail(d DiskState) string {
 	if len(d.Writers) == 0 {
-		return "No process of this user wrote fast, at the looks or between the runs; a root writer (Docker, a system service) cannot be seen."
+		return "No process of this user wrote fast, at a look or since the run before. A root writer (Docker, a system service) cannot be seen, " +
+			"nor what a process wrote once it ended under systemd --user or as an orphan, or under a parent that does not wait for it."
 	}
 	var parts []string
 	for _, w := range d.Writers[:min(len(d.Writers), 4)] {
 		s := fmt.Sprintf("%s (pid %d)", w.Comm, w.PID)
 		if w.Over > 0 {
-			s += fmt.Sprintf(" wrote %s in %s", gib(w.Written), (time.Duration(w.Over) * time.Second).Round(time.Minute))
+			over := time.Duration(w.Over * float64(time.Second))
+			if over >= time.Minute {
+				over = over.Round(time.Minute)
+			} else {
+				over = over.Round(time.Second)
+			}
+			s += fmt.Sprintf(" wrote %s in %s", gib(w.Written), over)
 		}
 		if w.Rate >= 1 {
 			s += fmt.Sprintf(", %.0f MiB/s at a look", w.Rate)

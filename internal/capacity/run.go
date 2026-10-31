@@ -91,6 +91,7 @@ type DiskState struct {
 // children wrote and ended (a process takes in its reaped children's writes).
 type Writer struct {
 	PID     int     `json:"pid"`
+	Start   int64   `json:"start,omitempty"` // its start, in clock ticks after boot: with the pid, which process
 	Comm    string  `json:"comm"`
 	Cwd     string  `json:"cwd"`
 	Rate    float64 `json:"mib_per_s"`
@@ -177,18 +178,17 @@ type runner struct {
 	keep          map[string]bool // canonical
 	targetRoot    []root
 	wtRoots       []root
-	watchStart    map[string]time.Time    // per canonical model root, the first run that watched it
-	runTimes      []time.Time             // every run, oldest first, this one among them
-	covered       []time.Duration         // the watched time up to each run (cover)
-	blind         string                  // why this run cannot trust its look at the processes, so deletes nothing
-	dockerErr     string                  // why Docker could not say which containers run: the run deletes nothing
-	dockerAsked   bool                    // whether this run asked Docker (only when a rule scans)
-	heads         *remoteHeads            // the remotes' branches, asked once per run
-	changed       map[changeKey]bool      // whether a work tree changed in the last quietTime, per look
-	own           map[string]ownChange    // the directories this run's and recent runs' deletions changed
-	snap          map[int]store.ProcWrite // each process's written bytes at this run
-	prev          map[int]store.ProcWrite // and at the run before that could trust its look
-	prevAt        time.Time
+	watchStart    map[string]time.Time // per canonical model root, the first run that watched it
+	runTimes      []time.Time          // every run, oldest first, this one among them
+	covered       []time.Duration      // the watched time up to each run (cover)
+	blind         string               // why this run cannot trust its look at the processes, so deletes nothing
+	dockerErr     string               // why Docker could not say which containers run: the run deletes nothing
+	dockerAsked   bool                 // whether this run asked Docker (only when a rule scans)
+	heads         *remoteHeads         // the remotes' branches, asked once per run
+	changed       map[changeKey]bool   // whether a work tree changed in the last quietTime, per look
+	own           map[string]ownChange // the directories this run's and recent runs' deletions changed
+	writes        writesSnap           // each process's written bytes at this run
+	prevWrites    writesSnap           // and at the last run before that could trust its look
 	res           *Result
 }
 
@@ -254,15 +254,15 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 	}
 	r.res.Since = r.samplerStart
 
-	r.snap = procWrites(opt.ProcRoot)
+	r.writes = readWrites(opt.ProcRoot, r.sample.Table, opt.Clock())
 	if st != nil {
-		at, ws, err := st.Writes(ctx)
+		snap, ws, err := st.Writes(ctx)
 		if err != nil {
 			return nil, err
 		}
-		r.prevAt, r.prev = at, map[int]store.ProcWrite{}
+		r.prevWrites = writesSnap{snap: snap, ws: map[int]store.ProcWrite{}}
 		for _, w := range ws {
-			r.prev[w.PID] = w
+			r.prevWrites.ws[w.PID] = w
 		}
 	}
 	fast := r.disk(ctx, disks)
@@ -308,11 +308,11 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 			return nil, err
 		}
 		if r.blind == "" { // what the next run tells its writers by
-			ws := make([]store.ProcWrite, 0, len(r.snap))
-			for _, w := range r.snap {
+			ws := make([]store.ProcWrite, 0, len(r.writes.ws))
+			for _, w := range r.writes.ws {
 				ws = append(ws, w)
 			}
-			if err := st.PutWrites(ctx, r.now, ws); err != nil {
+			if err := st.PutWrites(ctx, r.writes.snap, ws); err != nil {
 				return nil, err
 			}
 		}
