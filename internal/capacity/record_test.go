@@ -427,6 +427,12 @@ func TestAChildThatEndedUnderAZombieLauncherIsCountedOnce(t *testing.T) {
 	if got := between(cur, next); got[30].written != 10*g {
 		t.Errorf("bash wrote python's last 10 GiB: %+v", got[30])
 	}
+	// and when another process already holds python's pid, python has still ended
+	cur = snapOf(31000, "b1", store.ProcWrite{PID: 30, Start: 100, Written: 1 * g}, store.ProcWrite{PID: 32, PPID: 1, Start: 30000, Written: 1 << 20})
+	carry(root, prev, &cur)
+	if w := cur.ws[31]; w.Written != 50*g+10<<20 {
+		t.Errorf("uv's record keeps python's 50 GiB though its pid is another process's now: %+v", w)
+	}
 }
 
 func TestTheWalkAndTheCarryKeepTheirGuards(t *testing.T) {
