@@ -297,7 +297,7 @@ func (t *Tracker) line(raw []byte) {
 	case "assistant":
 		t.assistant(e, at, open)
 	case "user":
-		t.user(e, at)
+		t.user(e, at, open)
 	}
 }
 
@@ -627,7 +627,7 @@ func (t *Tracker) assistant(e line, at time.Time, open bool) {
 	}
 }
 
-func (t *Tracker) user(e line, at time.Time) {
+func (t *Tracker) user(e line, at time.Time, open bool) {
 	if e.Compact { // the summary written at compaction: context for the log, not a turn
 		t.st.log.Add(sessions.Entry{Role: sessions.RoleCompacted, Text: text.OneLine(text.BlocksText(e.Message.Content), 1500)})
 		t.waitedThrough("the conversation was compacted while it waited", at)
@@ -636,7 +636,7 @@ func (t *Tracker) user(e line, at time.Time) {
 	origin := originLabel(e.origin(), e.PromptSource)
 	var s string
 	if json.Unmarshal(e.Message.Content, &s) == nil {
-		t.userText(s, at, e.IsMeta, e.origin(), origin)
+		t.userText(s, at, e.IsMeta, e.origin(), origin, open)
 		return
 	}
 	var bs []block
@@ -648,7 +648,7 @@ func (t *Tracker) user(e line, at time.Time) {
 		case "tool_result":
 			t.result(b, at)
 		case "text":
-			t.userText(b.Text, at, e.IsMeta, e.origin(), origin)
+			t.userText(b.Text, at, e.IsMeta, e.origin(), origin, open)
 		}
 	}
 }
@@ -666,7 +666,8 @@ func originLabel(kind, source string) string {
 	return source
 }
 
-func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin string) {
+// userText reads a user record's text; open is whether a turn was open before the record.
+func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin string, open bool) {
 	st := &t.st
 	if strings.Contains(s, "<task-notification>") {
 		t.notified(s, at)
@@ -692,9 +693,14 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 	if strings.HasPrefix(clean, "[Request interrupted") {
 		if q := st.QueuedPrompt; !q.IsZero() && st.LastMain == "user" && !at.IsZero() && at.Sub(q).Abs() <= InterruptSkew {
 			// the Escape that sent the queued prompt, written after it: it ended the turn before the prompt, and the
-			// prompt's turn runs on, dated from the prompt, as when the interruption comes first
+			// prompt's turn runs on, dated from the prompt, as when the interruption comes first; the turn before
+			// ended no later than the prompt began
 			st.QueuedPrompt = time.Time{}
-			st.Control, st.TurnEnd, st.TurnBegan = at, at, q
+			end := at
+			if at.After(q) {
+				end = q
+			}
+			st.Control, st.TurnEnd, st.TurnBegan = at, end, q
 			if !st.WakeAt.IsZero() && !at.Before(st.WakeSet) {
 				t.clearWake()
 			}
@@ -717,7 +723,10 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 	st.LastMain = "user"
 	st.UserAt, st.Resumed = at, time.Time{} // a planned wakeup still fires after a prompt: it stays
 	st.QueuedPrompt = time.Time{}
-	if strings.HasSuffix(origin, "queued") {
+	// Only a queued prompt written while the turn it waited behind still ran can have the Escape that sent it
+	// after it: not one a turn's end sent, nor one after the Escape that sent it, nor the second of a batch, whose
+	// turn the first opened within the skew.
+	if open && at.Sub(st.TurnBegan) > InterruptSkew && strings.HasSuffix(origin, "queued") {
 		st.QueuedPrompt = at
 	}
 	st.log.Add(sessions.Entry{Role: sessions.RoleUser, Origin: origin, Text: text.OneLine(clean, 1200)})

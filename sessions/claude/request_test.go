@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/sessions"
+	"github.com/agent-sh/momentum/sessions/internal/saved"
 )
 
 func (x *script) request() *script {
@@ -83,10 +84,14 @@ func TestAnEscapeThatSendsAQueuedPromptEndsTheTurnBeforeIt(t *testing.T) {
 		x.add(map[string]any{"type": "api-request", "querySource": "repl_main_thread", "timestamp": stamp(61 * time.Millisecond)})
 		tr := NewTracker(x.path)
 		s := x.facts(tr, at.Add(time.Minute))
+		ended := escaped // the turn before ended at the Escape, and no later than the prompt began
+		if promptFirst {
+			ended = prompted
+		}
 		if !s.TurnOpen || s.Phase != sessions.Working || !s.RequestAt.Equal(at.Add(61*time.Millisecond)) || !s.ControlAt.Equal(escaped) ||
-			!s.TurnBegan.Equal(prompted) {
-			t.Fatalf("prompt first %v: open %v phase %s request %v control %v began %v", promptFirst, s.TurnOpen, s.Phase, s.RequestAt,
-				s.ControlAt, s.TurnBegan)
+			!s.TurnBegan.Equal(prompted) || !s.IdleSince.Equal(ended) {
+			t.Fatalf("prompt first %v: open %v phase %s request %v control %v began %v ended %v", promptFirst, s.TurnOpen, s.Phase, s.RequestAt,
+				s.ControlAt, s.TurnBegan, s.IdleSince)
 		}
 		x.add(map[string]any{"type": "system", "subtype": "api_error", "level": "error", "timestamp": stamp(10 * time.Minute)})
 		if s := x.facts(tr, at.Add(10*time.Minute+30*time.Second)); !s.TurnOpen || s.Phase != sessions.Working || !s.RequestAt.IsZero() {
@@ -101,6 +106,16 @@ func TestAnEscapeThatSendsAQueuedPromptEndsTheTurnBeforeIt(t *testing.T) {
 		"message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "[Request interrupted by user]"}}}})
 	if s := x.facts(NewTracker(x.path), x.at.Add(time.Minute)); s.TurnOpen {
 		t.Fatalf("an interruption 5 s after the queued prompt left its turn open: phase %s", s.Phase)
+	}
+	// Nor is one dated 10 s before the prompt though written after it.
+	w := newScript(t).user("go").request()
+	q := w.at.Add(30 * time.Minute)
+	w.add(map[string]any{"type": "user", "origin": map[string]any{"kind": "human"}, "promptSource": "queued", "timestamp": q.Format(time.RFC3339Nano),
+		"message": map[string]any{"role": "user", "content": "continue"}})
+	w.add(map[string]any{"type": "user", "timestamp": q.Add(-10 * time.Second).Format(time.RFC3339Nano),
+		"message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "[Request interrupted by user]"}}}})
+	if s := w.facts(NewTracker(w.path), q.Add(time.Minute)); s.TurnOpen {
+		t.Fatalf("an interruption dated 10 s before the queued prompt read as its Escape: phase %s", s.Phase)
 	}
 	// Nor is one after the prompt's turn sent its request, or one after a prompt its user typed: each takes back
 	// the turn the prompt opened.
@@ -117,6 +132,79 @@ func TestAnEscapeThatSendsAQueuedPromptEndsTheTurnBeforeIt(t *testing.T) {
 		if s := y.facts(NewTracker(y.path), at.Add(time.Minute)); s.TurnOpen {
 			t.Fatalf("an interruption %s left the turn open: phase %s", name, s.Phase)
 		}
+	}
+}
+
+// TestAnEscapeInAQueuedPromptsTurnTakesItBack: a queued prompt no Escape sent (the turn before it ended by itself,
+// or the Escape that sent it is on record before it), then its owner's Escape a moment later, before anything of
+// its turn: the Escape takes the new turn back.
+func TestAnEscapeInAQueuedPromptsTurnTakesItBack(t *testing.T) {
+	queued := func(at time.Time, text string) map[string]any {
+		return map[string]any{"type": "user", "origin": map[string]any{"kind": "human"}, "promptSource": "queued",
+			"timestamp": at.Format(time.RFC3339Nano), "message": map[string]any{"role": "user", "content": text}}
+	}
+	escape := func(at time.Time) map[string]any {
+		return map[string]any{"type": "user", "timestamp": at.Format(time.RFC3339Nano),
+			"message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "[Request interrupted by user]"}}}}
+	}
+	for name, write := range map[string]func(x *script, at time.Time){
+		"sent by the turn's end": func(x *script, at time.Time) {
+			x.say("done").add(queued(at, "and the tests"))
+		},
+		"two sent by the turn's end": func(x *script, at time.Time) {
+			x.say("done").add(queued(at, "and the tests")).add(queued(at.Add(time.Millisecond), "and the docs"))
+		},
+		"sent by an Escape on record before it": func(x *script, at time.Time) {
+			x.add(escape(at.Add(-30 * time.Millisecond))).add(queued(at, "continue"))
+		},
+	} {
+		x := newScript(t).user("go")
+		at := x.at.Add(time.Minute)
+		write(x, at)
+		x.add(escape(at.Add(800 * time.Millisecond)))
+		if s := x.facts(NewTracker(x.path), at.Add(time.Hour)); s.TurnOpen {
+			t.Errorf("%s: the owner's Escape read as the one that sent it: phase %s", name, s.Phase)
+		}
+	}
+}
+
+// TestAnEscapeAfterItsQueuedPromptCancelsAPendingWakeup: like the Escape whose interruption comes first, the one
+// written after the queued prompt it sent cancels a self-paced wakeup that was pending.
+func TestAnEscapeAfterItsQueuedPromptCancelsAPendingWakeup(t *testing.T) {
+	x, _ := soak(t)
+	x.user("and look at the logs").request() // a turn that waits on a request with no reply; the wakeup stays
+	if s := x.facts(NewTracker(x.path), x.at); s.WakeAt.IsZero() {
+		t.Fatal("no wakeup pending before the Escape")
+	}
+	at := x.at.Add(30 * time.Minute)
+	x.add(map[string]any{"type": "user", "origin": map[string]any{"kind": "human"}, "promptSource": "queued", "timestamp": at.Format(time.RFC3339Nano),
+		"message": map[string]any{"role": "user", "content": "continue"}})
+	x.add(map[string]any{"type": "user", "timestamp": at.Add(7 * time.Millisecond).Format(time.RFC3339Nano),
+		"message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "[Request interrupted by user]"}}}})
+	if s := x.facts(NewTracker(x.path), at.Add(time.Minute)); !s.WakeAt.IsZero() || !s.TurnOpen {
+		t.Fatalf("after the Escape: wake %v open %v", s.WakeAt, s.TurnOpen)
+	}
+}
+
+// TestARunResumedBetweenAQueuedPromptAndItsEscapeDerivesWhatAColdRunDerives: a checkpoint taken after the queued
+// prompt and before the Escape's interruption written after it keeps the mark.
+func TestARunResumedBetweenAQueuedPromptAndItsEscapeDerivesWhatAColdRunDerives(t *testing.T) {
+	x := newScript(t).user("go").request()
+	found := listed{{Tool: "claude", Session: "a", Transcript: x.path, Started: t0}}
+	mem := saved.New()
+	at := x.at.Add(30 * time.Minute)
+	x.add(map[string]any{"type": "user", "origin": map[string]any{"kind": "human"}, "promptSource": "queued", "timestamp": at.Format(time.RFC3339Nano),
+		"message": map[string]any{"role": "user", "content": "continue"}})
+	runOnce(t, found, mem, at.Add(time.Millisecond))
+	x.add(map[string]any{"type": "user", "timestamp": at.Add(7 * time.Millisecond).Format(time.RFC3339Nano),
+		"message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "[Request interrupted by user]"}}}})
+	x.add(map[string]any{"type": "api-request", "querySource": "repl_main_thread", "timestamp": at.Add(30 * time.Millisecond).Format(time.RFC3339Nano)})
+	resumed := runOnce(t, found, mem, at.Add(time.Minute))
+	if diff := saved.Same(resumed, runOnce(t, found, nil, at.Add(time.Minute))); diff != "" {
+		t.Fatal(diff)
+	}
+	if len(resumed) != 1 || !resumed[0].TurnOpen || !resumed[0].TurnBegan.Equal(at) {
+		t.Fatalf("resumed: %+v", resumed)
 	}
 }
 

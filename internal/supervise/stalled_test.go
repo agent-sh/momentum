@@ -14,6 +14,7 @@ import (
 	"github.com/agent-sh/momentum/sessions"
 	"github.com/agent-sh/momentum/sessions/act"
 	"github.com/agent-sh/momentum/sessions/claude"
+	"github.com/agent-sh/momentum/sessions/state"
 )
 
 func TestStalledInterruptsATurnWaitingOnARequestWithNoReply(t *testing.T) {
@@ -249,6 +250,41 @@ func TestAnInterruptWrittenPromptFirstKeepsItsTurnThroughARetry(t *testing.T) {
 	run(t, sv, s)
 	if r := results(t, st); !s.TurnOpen || s.Phase != sessions.Working || !r[Delivered] || r[Otherwise] {
 		t.Fatalf("in the retry's backoff: open %v phase %s outcomes %v", s.TurnOpen, s.Phase, r)
+	}
+}
+
+// TestAMessageWrittenPromptFirstKeepsItsOutcomeThroughARetry: the stall resumed by the queue and Escape, written
+// prompt first, into a retry's backoff, then the retry's reply and the turn's work, with the phase stamp and the
+// log's sequence kept as a sessions run keeps them: the message worked.
+func TestAMessageWrittenPromptFirstKeepsItsOutcomeThroughARetry(t *testing.T) {
+	x, sent, scan := stalledLoop(t)
+	st := testStore(t)
+	now := sent.Add(30 * time.Minute)
+	sv := liveStalled(st, &queueing{x: x, now: &now, promptFirst: true}, &now)
+	stamps := state.Stamps{"sess-loop": {Phase: sessions.Working, Since: sent, Seen: sent}}
+	stamped := func(at time.Time) *sessions.Session {
+		s := scan(at)
+		s.Seq = s.Log.Seq()
+		stamps.Apply([]*sessions.Session{s}, at)
+		return s
+	}
+	run(t, sv, stamped(now))
+	now = now.Add(time.Minute)
+	run(t, sv, stamped(now))
+	x.at = now
+	x.add(map[string]any{"type": "system", "subtype": "api_error", "level": "error"})
+	now = now.Add(30 * time.Second)
+	run(t, sv, stamped(now)) // the retry's backoff
+	x.at = now
+	x.request().add(map[string]any{"type": "assistant", "message": map[string]any{"content": []any{map[string]any{"type": "tool_use",
+		"id": "tu9", "name": "Bash", "input": map[string]any{"command": "make test"}}}}}).
+		add(map[string]any{"type": "user", "message": map[string]any{"content": []any{map[string]any{"type": "tool_result",
+			"tool_use_id": "tu9", "content": "ok"}}}}).
+		say("Done: the tests pass.")
+	now = x.at.Add(time.Minute)
+	run(t, sv, stamped(now))
+	if r := results(t, st); !r[Worked] || r[Otherwise] {
+		t.Fatalf("outcomes %v, want worked", r)
 	}
 }
 
@@ -1034,12 +1070,13 @@ func TestPromptedReadsTheTranscriptSinceTheScan(t *testing.T) {
 	// The interruption written a moment after the prompt is its Escape's too; one long after it, or after another
 	// user record, is not.
 	for _, c := range []struct {
-		name  string
-		after time.Duration
-		other bool
-		want  bool
-	}{{"just after", 7 * time.Millisecond, false, true}, {"long after", 30 * time.Second, false, false},
-		{"after another record", 7 * time.Millisecond, true, false}} {
+		name    string
+		after   time.Duration
+		other   bool
+		want    bool
+		request bool
+	}{{"just after", 7 * time.Millisecond, false, true, false}, {"long after", 30 * time.Second, false, false, false},
+		{"after another record", 7 * time.Millisecond, true, false, false}, {"after its request", 30 * time.Millisecond, false, false, true}} {
 		w := &transcript{t: t, path: filepath.Join(dir, "w-"+strings.ReplaceAll(c.name, " ", "-")+".jsonl"), at: t0}
 		w.user("old turn")
 		fi, _ := os.Stat(w.path)
@@ -1047,6 +1084,9 @@ func TestPromptedReadsTheTranscriptSinceTheScan(t *testing.T) {
 		w.add(map[string]any{"type": "user", "promptSource": "queued", "timestamp": prompted.Format(time.RFC3339Nano), "message": map[string]any{"content": StalledText}})
 		if c.other {
 			w.add(map[string]any{"type": "user", "timestamp": prompted.Format(time.RFC3339Nano), "message": map[string]any{"content": "a typed line"}})
+		}
+		if c.request {
+			w.add(map[string]any{"type": "api-request", "querySource": "repl_main_thread", "timestamp": prompted.Add(20 * time.Millisecond).Format(time.RFC3339Nano)})
 		}
 		w.add(map[string]any{"type": "user", "timestamp": prompted.Add(c.after).Format(time.RFC3339Nano),
 			"message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "[Request interrupted by user]"}}}})

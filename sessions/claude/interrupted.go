@@ -47,11 +47,15 @@ const InterruptSkew = 2 * time.Second
 // Prompted reports whether the transcript at path, from byte offset from on (the size a scan read), records text
 // as a prompt that opened a turn: a user record, not one the harness injected, whose text is text, whitespace
 // folded. interrupted is when the interruption that ended the turn it waited behind was recorded: before it, or as
-// the next user record after it and within InterruptSkew of it; zero when none was.
+// the next user record after it, within InterruptSkew of it and before the prompt's own request or reply, as the
+// tracker reads it; zero when none was.
 func Prompted(path string, from int64, text string) (found bool, interrupted time.Time, err error) {
 	want := strings.Join(strings.Fields(text), " ")
 	var at time.Time // the prompt's
 	err = appended(path, from, func(e line, _ []byte) bool {
+		if found && (e.Type == "api-request" || e.Type == "assistant") {
+			return false // the prompt's turn went on: an interruption after this is not the Escape that sent it
+		}
 		if e.Type != "user" || e.IsMeta || e.Message == nil {
 			return true
 		}
