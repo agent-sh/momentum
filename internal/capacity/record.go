@@ -54,10 +54,12 @@ var keepsBrief = map[string]string{
 	RuleScratch: "capacity.scratch.keep",
 }
 
-// comesBack says, per rule that prunes, how what it took comes back: there is nothing to keep.
+// comesBack says how what a rule took comes back where the note says no other way: a removed worktree's work, and
+// what the prunes took (there is nothing of theirs to keep).
 var comesBack = map[string]string{
-	RuleUV:     "uv downloads the wheels it dropped again.",
-	RuleDocker: "Docker builds its cache again on the next build.",
+	RuleWorktrees: "A removed worktree's commits are merged or on its remote: git worktree add brings it back.",
+	RuleUV:        "uv downloads the wheels it dropped again.",
+	RuleDocker:    "Docker builds its cache again on the next build.",
 }
 
 // modelDataGone says, in a run that deleted a task folder's model data, that restic does not hold it.
@@ -624,7 +626,7 @@ func runNote(start, at time.Time, items []runItem) store.Note {
 // runTitle is a run's effect in one line: what it freed, how many items each rule took, the task folders it offloaded
 // with what went to restic and those whose model data alone went, and what it pruned ("Freed 12.4 GiB: 5 Rust build
 // outputs, 2 leftover worktrees; pruned Docker"). A title too long for a line names the prunes by their tools, then
-// counts them, then names the items shorter, then ends at the last whole clause that fits, with "and more".
+// names the items shorter, then counts the prunes, then ends at the last whole clause that fits, with "and more".
 func runTitle(items []runItem) string {
 	var freed, restic int64
 	unsaid, prunes := "", 0
@@ -693,8 +695,8 @@ func runTitle(items []runItem) string {
 	forms := []form{{countText, ""}, {briefText, ""}}
 	if prunes > 0 {
 		counted := fmt.Sprintf("%d %s", prunes, plural("prune", prunes))
-		forms = []form{{countText, "pruned " + strings.Join(long, " and ")}, {countText, "pruned " + strings.Join(brief, " and ")},
-			{countText, counted}, {briefText, counted}}
+		tools := "pruned " + strings.Join(brief, " and ")
+		forms = []form{{countText, "pruned " + strings.Join(long, " and ")}, {countText, tools}, {briefText, tools}, {briefText, counted}}
 	}
 	for _, f := range forms {
 		if t := compose(clauses(f.names), f.prunes); fits(t) {
@@ -716,7 +718,7 @@ func runTitle(items []runItem) string {
 	return compose(cs, p) + " and more" // the store clips it
 }
 
-// noteSize is a size in the run's note: as gib says it, but "under 1 MiB" for one above zero that it would say as 0.
+// noteSize is a size in the run's note: as gib says it, but "under 1 MiB" for one above zero and below 1 MiB.
 func noteSize(n int64) string {
 	if n > 0 && n < 1<<20 {
 		return "under 1 MiB"
@@ -729,9 +731,10 @@ const detailMax = 400
 
 // runDetail is what a run took in plain sentences: its largest three items with their sizes; where each offloaded
 // folder's pointer is, and that model data is not offloaded; how to keep an item next time, in one sentence; and last,
-// what is not known of a prune and how what the prunes took comes back. A detail longer than detailMax leaves out the
-// prunes' sentences, then names two items, then says how to keep one in fewer words, then leaves out the model data's
-// sentence, then names one item, then leaves out the pointer's, and last clips its item: how to keep one stays.
+// what is not known of a prune and how a removed worktree and what the prunes took come back. A detail longer than
+// detailMax leaves out those last sentences, then names two items, then says how to keep one in fewer words with three
+// items again, then two, then leaves out the model data's sentence, then names one item, then leaves out the pointer's,
+// and last clips its item: how to keep one stays.
 func runDetail(items []runItem) string {
 	var sized, offloads []runItem
 	took, model, unsaid := map[string]bool{}, false, ""
@@ -771,19 +774,19 @@ func runDetail(items []runItem) string {
 	if len(brief) > 0 {
 		keepBrief = "To keep one next time: " + strings.Join(brief, ", ") + "."
 	}
-	var prunes []string
+	var extra []string // what a detail short of room leaves out first
 	if unsaid != "" {
-		prunes = append(prunes, unsaid+" did not print what its prune freed.")
+		extra = append(extra, unsaid+" did not print what its prune freed.")
 	}
 	for _, rule := range Rules {
 		if took[rule] && comesBack[rule] != "" {
-			prunes = append(prunes, comesBack[rule])
+			extra = append(extra, comesBack[rule])
 		}
 	}
 	f := struct {
-		n                             int
-		prunes, brief, model, pointer bool
-	}{n: 3, prunes: true, model: model, pointer: pointer != ""}
+		n                            int
+		extra, brief, model, pointer bool
+	}{n: 3, extra: true, model: model, pointer: pointer != ""}
 	parts := func() (string, []string) {
 		var named []string
 		for _, it := range sized[:min(f.n, len(sized))] {
@@ -811,8 +814,8 @@ func runDetail(items []runItem) string {
 		if k != "" {
 			rest = append(rest, k)
 		}
-		if f.prunes {
-			rest = append(rest, prunes...)
+		if f.extra {
+			rest = append(rest, extra...)
 		}
 		return lead, rest
 	}
@@ -823,8 +826,8 @@ func runDetail(items []runItem) string {
 		return strings.Join(append([]string{lead}, rest...), " ")
 	}
 	steps := []func(){
-		func() { f.prunes = false }, func() { f.n = 2 }, func() { f.brief = true }, func() { f.model = false },
-		func() { f.n = 1 }, func() { f.pointer = false },
+		func() { f.extra = false }, func() { f.n = 2 }, func() { f.brief, f.n = true, 3 }, func() { f.n = 2 },
+		func() { f.model = false }, func() { f.n = 1 }, func() { f.pointer = false },
 	}
 	for _, step := range append(steps, nil) {
 		lead, rest := parts()

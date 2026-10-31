@@ -199,15 +199,21 @@ func TestARunsNoteCountsByRuleAndSaysOnceHowToKeepEach(t *testing.T) {
 		{rule: RuleScratch, path: "/h/.cache/e", size: 4 * G, freed: 4 * G, model: true},
 		{rule: RuleScratch, path: "/h/.cache/f", size: 5 * G, freed: 5 * G, model: true},
 	}), "Freed 10.0 GiB: 1 task folder (1.0 GiB to restic), model data of 2 task folders")
-	// a title too long for a line names the prunes by their tools, then counts them, then names the items shorter,
-	// then ends at the last whole clause that fits
+	// a title too long for a line names the prunes by their tools, then names the items shorter, then counts the
+	// prunes, then ends at the last whole clause that fits
 	docker := append(items[:len(items):len(items)], runItem{rule: RuleDocker, path: "docker build cache", size: G, freed: G})
 	check("the prunes by their tools", runTitle(docker),
 		"Freed 26.0 GiB: 2 Rust build outputs, 1 leftover worktree, 2 task folders (3.0 GiB to restic); pruned uv and Docker")
 	unsaid := append(items[:len(items):len(items)], runItem{rule: RuleDocker, path: "docker build cache", unsaid: true},
 		runItem{rule: RuleDocker, path: "docker dangling images", size: G, freed: G})
-	check("the prunes counted, and at least what a prune with no total freed", runTitle(unsaid),
-		"Freed at least 26.0 GiB: 2 Rust build outputs, 1 leftover worktree, 2 task folders (3.0 GiB to restic); 3 prunes")
+	check("the items shorter, and at least what a prune with no total freed", runTitle(unsaid),
+		"Freed at least 26.0 GiB: 2 build outputs, 1 worktree, 2 folders (3.0 GiB to restic); pruned uv and Docker")
+	var models []runItem
+	for i := range 10 {
+		models = append(models, runItem{rule: RuleModels, path: "/h/m/" + strconv.Itoa(i)})
+	}
+	check("the prunes counted", runTitle(append(models, unsaid...)),
+		"Freed at least 26.0 GiB: 10 model items, 2 build outputs, 1 worktree, 2 folders (3.0 GiB to restic); 3 prunes")
 	if d := runDetail(unsaid); strings.Contains(d, "docker build cache") || !strings.HasPrefix(d, "Largest: ~/p/a/target 11.0 GiB, ") {
 		t.Errorf("a prune with no total names no size: %q", d)
 	}
@@ -234,8 +240,10 @@ func TestARunsNoteCountsByRuleAndSaysOnceHowToKeepEach(t *testing.T) {
 		"Freed at least 26.0 GiB: 3 model items, 12 build outputs, 4 worktrees, 2 folders (2.0 GiB to restic) and more")
 	check("a run whose one prune printed no total", runTitle(unsaid[len(unsaid)-2:len(unsaid)-1]),
 		"Freed an amount Docker did not print: pruned Docker")
-	check("an item under 1 MiB", runTitle([]runItem{{rule: RuleWorktrees, path: "/h/.cache/wt", size: 300 << 10, freed: 300 << 10}}),
-		"Freed under 1 MiB: 1 leftover worktree")
+	wt := []runItem{{rule: RuleWorktrees, path: "/h/.cache/wt", size: 300 << 10, freed: 300 << 10}}
+	check("an item under 1 MiB", runTitle(wt), "Freed under 1 MiB: 1 leftover worktree")
+	check("a removed worktree comes back", runDetail(wt), "~/.cache/wt under 1 MiB. To keep one next time, lock a worktree "+
+		"(git worktree lock). A removed worktree's commits are merged or on its remote: git worktree add brings it back.")
 	// one offload names its pointer
 	check("one offload", runDetail([]runItem{{rule: RuleScratch, path: "/h/.cache/y", size: 2 * G, freed: 2 * G, offload: true}}),
 		"~/.cache/y 2.0 GiB to restic. ~/.cache/y.restic.txt says how to restore it. To keep one next time, list a task folder "+
@@ -250,6 +258,8 @@ func TestARunsNoteCountsByRuleAndSaysOnceHowToKeepEach(t *testing.T) {
 		{rule: RuleScratch, path: "/home/user/.cache/train-run-7", size: G, freed: G, offload: true},
 		{rule: RuleDocker, path: "docker build cache", size: 2 * G, freed: 2 * G},
 	}
+	check("four rules and a prune name the prune by its tool", runTitle(runs),
+		"Freed 33.3 GiB: 1 model item, 2 build outputs, 1 worktree, 1 folder (1.0 GiB to restic); pruned Docker")
 	d := runDetail(runs)
 	if !strings.HasPrefix(d, "Largest: /data/models/some-llm-8b 16.0 GiB, ~/projects/billing-service/target 11.0 GiB, "+
 		"~/.cache/lane-review-482/target 3.0 GiB. ") || utf8.RuneCountInString(d) > detailMax ||
@@ -265,6 +275,12 @@ func TestARunsNoteCountsByRuleAndSaysOnceHowToKeepEach(t *testing.T) {
 		{rule: RuleScratch, path: "/home/user/.cache/train-run-8", size: G, freed: G, offload: true},
 	}
 	brief := "To keep one next time: capacity.models.keep, capacity.exclude.paths (the project), git worktree lock, capacity.scratch.keep."
+	srv := append([]runItem{{rule: RuleModels, path: "/srv/models/llm-8b", size: 16 * G, freed: 16 * G}}, hub[1:]...)
+	if d := runDetail(srv); !strings.HasPrefix(d, "Largest: /srv/models/llm-8b 16.0 GiB, ~/projects/billing-service/target 11.0 GiB, "+
+		"model data in ~/.cache/train-run-7 6.0 GiB. ") || !strings.HasSuffix(d, " "+brief) || utf8.RuneCountInString(d) > detailMax {
+		t.Errorf("three items again once how to keep one is in fewer words, within %d characters: %d %q", detailMax,
+			utf8.RuneCountInString(d), d)
+	}
 	if d := runDetail(hub); !strings.HasPrefix(d, "Largest: ~/.cache/huggingface/hub/models--org--llm-8b 16.0 GiB, "+
 		"~/projects/billing-service/target 11.0 GiB. ") || !strings.HasSuffix(d, " "+modelDataGone+" "+brief) ||
 		utf8.RuneCountInString(d) > detailMax {
