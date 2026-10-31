@@ -13,9 +13,10 @@ import (
 // whichever a process used. Mounts gives every path one name, its canonical path, so a root, a process's open file
 // and a unit's argument compare as strings.
 
-// mount is one line of mountinfo: the filesystem's device, the directory of the filesystem it shows, and where.
+// mount is one line of mountinfo: the filesystem's device, the directory of the filesystem it shows, where, and the
+// filesystem's type and its own options.
 type mount struct {
-	dev, root, point string
+	dev, root, point, fstype, super string
 }
 
 // Mounts is the machine's mount table.
@@ -40,6 +41,15 @@ func ReadMounts(path string) *Mounts {
 			continue
 		}
 		mt := mount{dev: fs[2], root: unescapeMount(fs[3]), point: unescapeMount(fs[4])}
+		for i := 6; i+1 < len(fs); i++ { // the optional fields end at "-", then the type, the source, the options
+			if fs[i] == "-" {
+				mt.fstype = fs[i+1]
+				if i+3 < len(fs) {
+					mt.super = fs[i+3]
+				}
+				break
+			}
+		}
 		m.list = append(m.list, mt)
 		if p, ok := m.primary[mt.dev]; !ok || len(mt.root) < len(p.root) {
 			m.primary[mt.dev] = mt
@@ -106,6 +116,37 @@ func (m *Mounts) Canon(p string) string {
 		return p
 	}
 	return filepath.Join(prim.point, strings.TrimPrefix(inFS, prim.root))
+}
+
+// hidesProcs reports whether the proc filesystem at procRoot, or at /proc when procRoot is no mount, hides other
+// users' processes (hidepid=invisible, 2, ptraceable or 4): /proc then shows no directory for one, while /proc/locks
+// still names it.
+func (m *Mounts) hidesProcs(procRoot string) bool {
+	if m == nil {
+		return false
+	}
+	var at, proc *mount
+	for i := range m.list { // the last on a point hides the earlier
+		switch mt := &m.list[i]; {
+		case mt.fstype != "proc":
+		case mt.point == procRoot:
+			at = mt
+		case mt.point == "/proc":
+			proc = mt
+		}
+	}
+	if at == nil {
+		at = proc
+	}
+	if at == nil {
+		return false
+	}
+	for _, o := range strings.Split(at.super, ",") {
+		if v, ok := strings.CutPrefix(o, "hidepid="); ok && (v == "invisible" || v == "2" || v == "ptraceable" || v == "4") {
+			return true
+		}
+	}
+	return false
 }
 
 // devOf is the device of the filesystem that holds p, as mountinfo gives it ("major:minor": its superblock's, which

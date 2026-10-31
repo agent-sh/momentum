@@ -649,8 +649,9 @@ func TestAUVXThatStillInstallsIsNotPrunedUnder(t *testing.T) {
 			}
 			f := newUVLock(t, procs, 4, 6, 8)
 			g := f.run(t, options(t, f.proc, time.Now(), nil))
-			if f.pruned(true) || f.pruned(false) || g.Done || g.Action != ActKeep || !strings.Contains(g.Why, "waits for an install") {
-				t.Fatalf("a uv process that may write the cache now is waited for quietly: %s %q %v", g.Action, g.Why, f.ran)
+			if f.pruned(true) || f.pruned(false) || g.Done || g.Action != ActKeep || !strings.Contains(g.Why, "waits for an install") ||
+				strings.Contains(g.Why, "whose command") {
+				t.Fatalf("a uv process that may write the cache now is waited for quietly, by the look: %s %q %v", g.Action, g.Why, f.ran)
 			}
 			if id, err := fileID(f.lock); err != nil || id != f.id {
 				t.Errorf("capacity's lock never takes the place of one such a process holds: %v %v", id, err)
@@ -686,7 +687,8 @@ func TestAHelperUVRunsIsNotTheCommandItStarts(t *testing.T) {
 			}
 			f := newUVLock(t, procs, 4, 6, 8)
 			g := f.run(t, options(t, f.proc, time.Now(), nil))
-			if f.pruned(true) || f.pruned(false) || g.Done || g.Action != ActKeep || !strings.Contains(g.Why, argvHead(c.uv)+" (pid 8)") {
+			if f.pruned(true) || f.pruned(false) || g.Done || g.Action != ActKeep || !strings.Contains(g.Why, argvHead(c.uv)+" (pid 8)") ||
+				strings.Contains(g.Why, "whose command") {
 				t.Fatalf("a uv process whose child has uv's own environment has not started its command, and is waited for quietly: %s %q %v",
 					g.Action, g.Why, f.ran)
 			}
@@ -712,6 +714,12 @@ func TestAHolderWhoseCommandIsNotTheOneTheLookSawIsWaitedFor(t *testing.T) {
 			g := f.run(t, o)
 			if f.pruned(true) || g.Done || g.Action != ActKeep || !strings.Contains(g.Why, "uv tool run pkg (pid 4), whose command is not the one the look saw") {
 				t.Fatalf("a holder that does not run the command the look saw may be at its sync: %s %q %v", g.Action, g.Why, f.ran)
+			}
+			fh, err := os.Open(f.lock)
+			must(t, err)
+			defer fh.Close()
+			if err := syscall.Flock(int(fh.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+				t.Errorf("a uv process that starts gets the lock: %v", err)
 			}
 		})
 	}
@@ -1124,7 +1132,8 @@ func TestTheLookUnderTheLockReadsNoFilesystemForAPlaceItDidNotAnswer(t *testing.
 		f.addProc(t, 17, 7, "sh\x00", "VIRTUAL_ENV=/opt/env2\x00PATH=/opt/env2/bin:/usr/bin\x00")
 		on = true
 	}
-	if g := f.run(t, o); !g.Done || len(*resolved) > 0 {
+	// it counts as in use: only a read would say where it is
+	if g := f.run(t, o); g.Done || f.pruned(true) || len(*resolved) > 0 || !strings.Contains(g.Why, "/opt/env2 came after the lock went in") {
 		t.Fatalf("the look under capacity's lock reads /proc, and what the first look read: it resolved %v (%s %q)", *resolved, g.Action, g.Why)
 	}
 }
@@ -1196,7 +1205,7 @@ func TestTheLocksAreReadByTheFilesystemsDeviceToo(t *testing.T) {
 
 func TestALockFileThatChangedSinceTheLookIsNotReplaced(t *testing.T) {
 	f := newUVLock(t, outside, 4, 6)
-	held, why := uvSwap{lk: uvLockState{file: f.lock, id: lockID{f.id.major, f.id.minor, f.id.ino + 7}}, procRoot: f.proc}.lockInPlace()
+	held, why := uvSwap{lk: uvLockState{file: f.lock, id: lockID{f.id.major, f.id.minor, f.id.ino + 7}}, procRoot: f.proc}.lockInPlace(nil)
 	if held != nil || !strings.Contains(why, "changed since the look") {
 		t.Errorf("a lock file that is not the one the look saw is left as it is: %v %q", held, why)
 	}
@@ -1564,6 +1573,7 @@ func TestATitledCommandOfARunThatLayersIsOneTheLookCannotRead(t *testing.T) {
 	}{
 		{"--with", []string{"uv", "run", "--with", "six", "python", "srv.py"}, false},
 		{"-w", []string{"uv", "run", "-wsix", "python", "srv.py"}, false},
+		{"-w among other short flags", []string{"uv", "run", "-qw", "six", "python", "srv.py"}, false},
 		{"--with-requirements", []string{"uv", "run", "--with-requirements=r.txt", "python", "srv.py"}, false},
 		{"a run that layers nothing", []string{"uv", "run", "--", "srv", "-w", "4"}, true},
 	} {
@@ -1576,7 +1586,7 @@ func TestATitledCommandOfARunThatLayersIsOneTheLookCannotRead(t *testing.T) {
 			}
 			f := newUVLock(t, procs, 4, 6, 8)
 			g := f.run(t, options(t, f.proc, time.Now(), nil))
-			if g.Done != c.done || g.Done != f.pruned(true) || !c.done && !strings.Contains(g.Why, "a command whose environment reads as nothing runs under a uv run that layers") {
+			if g.Done != c.done || g.Done != f.pruned(true) || !c.done && !strings.Contains(g.Why, "a command whose environment holds no PATH runs under a uv run that layers") {
 				t.Fatalf("a layered run's command whose environment is gone may import from the cache: %s %q %v", g.Action, g.Why, f.ran)
 			}
 		})
@@ -1707,5 +1717,197 @@ func TestALookUnderTheLockThatDoesNotEndLetsTheLockGo(t *testing.T) {
 	defer fh.Close()
 	if err := syscall.Flock(int(fh.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
 		t.Errorf("a uv process that starts gets the lock: %v", err)
+	}
+}
+
+func TestATitleThatSpillsIntoTheEnvironmentOfALayeredRunHoldsNoPATH(t *testing.T) {
+	// a title longer than the command line runs on over the environment: /proc reads its tail, an = in it
+	spilled := []string{"wwwwwwww --prefetch-multiplier=4)" + strings.Repeat("\x00", 512)}
+	procs := func(cache, lock string) []fakeProc {
+		return append(outside(cache, lock),
+			fakeProc{pid: 8, ppid: 1, argv: []string{"uv", "run", "--with", "six", "celery", "-A", "proj", "worker"},
+				fds: []string{lock}, cwd: "/proj", env: uvEnv},
+			fakeProc{pid: 9, ppid: 8, argv: []string{"[celeryd: celery@host:MainProcess] -active- (-A proj worker)"},
+				exe: "/usr/bin/python3.12", cwd: "/proj",
+				maps: []string{"/proj/.venv/lib/python3.12/site-packages/setproctitle/_setproctitle.so"}, env: spilled})
+	}
+	f := newUVLock(t, procs, 4, 6, 8)
+	if g := f.run(t, options(t, f.proc, time.Now(), nil)); g.Done || f.pruned(true) || !strings.Contains(g.Why, "holds no PATH") {
+		t.Fatalf("a layered run's command whose environment holds no PATH may import from the layer: %s %q %v", g.Action, g.Why, f.ran)
+	}
+}
+
+func TestAProcessThatCameAfterTheRenameFromALinkedEnvironmentKeepsThePrune(t *testing.T) {
+	base := t.TempDir()
+	f := newUVLock(t, outside, 4, 6)
+	env := filepath.Join(f.cache, "environments-v2", "proj2-1") // a centralized project environment
+	must(t, os.MkdirAll(filepath.Join(env, "bin"), 0o755))
+	must(t, os.MkdirAll(filepath.Join(base, "proj2"), 0o755))
+	venv := filepath.Join(base, "proj2", ".venv")
+	must(t, os.Symlink(env, venv))
+	o := options(t, f.proc, time.Now(), nil)
+	o.afterUVLock = func() { // a script starts the other project's server directly
+		f.addProc(t, 17, 1, venv+"/bin/python\x00w.py\x00", "VIRTUAL_ENV="+venv+"\x00PATH="+venv+"/bin:/usr/bin\x00")
+	}
+	if g := f.run(t, o); g.Done || f.pruned(true) {
+		t.Fatalf("a process from an environment linked into the cache uses it, though only a read of the link says so: %s %q %v",
+			g.Action, g.Why, f.ran)
+	}
+}
+
+func TestAHolderThatProcHidesHasNotEnded(t *testing.T) {
+	for _, c := range []struct {
+		opt  string
+		done bool
+	}{
+		{"hidepid=invisible", false}, {"hidepid=2", false}, {"hidepid=ptraceable", false},
+		{"hidepid=noaccess", true}, // it shows every process's directory, so one it does not show ended
+	} {
+		t.Run(c.opt, func(t *testing.T) {
+			f := newUVLock(t, outside, 4, 6, 4243) // /proc shows no 4243, and /proc/locks names it
+			o := options(t, f.proc, time.Now(), nil)
+			write(t, o.MountInfo, "29 1 259:3 / / rw - ext4 /dev/sda2 rw\n30 29 0:25 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,"+
+				c.opt+"\n")
+			if g := f.run(t, o); g.Done != c.done || g.Done != f.pruned(true) || !c.done && !strings.Contains(g.Why, "cannot read holds the lock (pid 4243)") {
+				t.Fatalf("a holder a hiding /proc does not show is one the look cannot read: %s %q %v", g.Action, g.Why, f.ran)
+			}
+		})
+	}
+}
+
+func TestWhatTheLookFindsBeforeTheRenameKeepsTheLockFileInPlace(t *testing.T) {
+	for _, c := range []struct {
+		name, why, action string
+		came              func(*testing.T, *uvLockFixture)
+	}{
+		{"a holder's command ended", "whose command is not the one the look saw", ActKeep, func(t *testing.T, f *uvLockFixture) {
+			must(t, os.RemoveAll(filepath.Join(f.proc, "5")))
+		}},
+		{"a process came to use the cache", "python3 (pid 12)", ActReport, func(t *testing.T, f *uvLockFixture) {
+			dir := f.addProc(t, 12, 1, "python3\x00", "")
+			write(t, filepath.Join(dir, "maps"), "7f-7f r--s 0 0:0 1 "+filepath.Join(f.cache, "archive-v0", "y", "lib.so")+"\n")
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newUVLock(t, outside, 4, 6)
+			armed := false
+			o := options(t, f.proc, time.Now(), nil)
+			o.Tools = dockerHook{f.tools(nil), &armed, func() { c.came(t, f) }} // during the look, before the swap
+			g := f.runWith(t, o, f.cache)
+			if g.Done || f.pruned(true) || g.Action != c.action || !strings.Contains(g.Why, c.why) {
+				t.Fatalf("what the look finds before the rename keeps the prune from running: %s %q", g.Action, g.Why)
+			}
+			if id, err := fileID(f.lock); err != nil || id != f.id || exists(f.lock+".capacity") {
+				t.Errorf("and the lock file in place, every holder on it: %v %v", id, err)
+			}
+		})
+	}
+}
+
+func TestLocksThatCannotBeReadAgainKeepTheLockFile(t *testing.T) {
+	f := newUVLock(t, outside, 4, 6)
+	armed := false
+	o := options(t, f.proc, time.Now(), nil)
+	o.Tools = dockerHook{f.tools(nil), &armed, func() { must(t, os.Remove(filepath.Join(f.proc, "locks"))) }}
+	g := f.runWith(t, o, f.cache)
+	if g.Done || f.pruned(true) || !strings.Contains(g.Why, "cannot be read again") {
+		t.Fatalf("no swap blind to the locks: %s %q %v", g.Action, g.Why, f.ran)
+	}
+	if id, err := fileID(f.lock); err != nil || id != f.id {
+		t.Errorf("the lock file stays in place: %v %v", id, err)
+	}
+}
+
+func TestAFileAnEarlierRunLeftBesideTheLockIsNoBar(t *testing.T) {
+	f := newUVLock(t, outside, 4, 6)
+	write(t, f.lock+".capacity", "") // a run that died before its rename
+	if g := f.run(t, options(t, f.proc, time.Now(), nil)); !g.Done || !f.pruned(true) {
+		t.Fatalf("a file an earlier run left is replaced: %s %q %v", g.Action, g.Why, f.ran)
+	}
+}
+
+func TestAContainerThatMountsWhatReallyHoldsTheCacheIsWaitedFor(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	must(t, err)
+	f := newUVLockIn(t, filepath.Join(dir, "data", "uv"), outside, 4, 6)
+	link := filepath.Join(t.TempDir(), "uv-link") // uv names the cache through a link
+	must(t, os.Symlink(f.cache, link))
+	o := options(t, f.proc, time.Now(), nil)
+	o.Tools = f.tools(map[string]string{"uv cache dir": link + "\n", "docker ps": "c1\n",
+		"docker inspect": "/box\t" + filepath.Join(dir, "data") + "\n", "docker info": "ERR"})
+	if g := f.runWith(t, o, link); f.pruned(true) || f.pruned(false) || !strings.Contains(g.Why, "container box mounts") {
+		t.Fatalf("a container that mounts what really holds the cache may run from it: %s %q %v", g.Action, g.Why, f.ran)
+	}
+}
+
+func TestANamespaceWhoseViewDoesNotAnswerIsAnotherView(t *testing.T) {
+	defer func(d time.Duration) { uvPlaceWait = d }(uvPlaceWait)
+	uvPlaceWait = 50 * time.Millisecond
+	stuck := make(chan struct{})
+	t.Cleanup(func() { close(stuck) })
+	defer func(s func(string) (os.FileInfo, error)) { statView = s }(statView)
+	statView = func(p string) (os.FileInfo, error) { // a path walk in its view crosses a mount that does not answer
+		<-stuck
+		return nil, os.ErrNotExist
+	}
+	procs := func(cache, lock string) []fakeProc {
+		return append(outside(cache, lock), fakeProc{pid: 8, ppid: 1, argv: []string{"uv", "tool", "uvx", "srv"}, fds: []string{lock}, env: uvEnv},
+			fakeProc{pid: 9, ppid: 8, argv: []string{"srv"}, env: started("/opt/srv/bin")})
+	}
+	f := newUVLock(t, procs, 4, 6, 8)
+	inNamespaces(t, f, "8", "9")
+	start := time.Now()
+	g := f.run(t, options(t, f.proc, time.Now(), nil))
+	if g.Done || f.pruned(true) || !strings.Contains(g.Why, "another mount namespace") || time.Since(start) > 10*time.Second {
+		t.Fatalf("a namespace whose view does not answer is not the run's: %s %q after %s", g.Action, g.Why, time.Since(start))
+	}
+}
+
+func TestAUVRunInsideABuildBackendRunsItsCommand(t *testing.T) {
+	procs := func(cache, lock string) []fakeProc { // a backend ran uv run: both have the backend's build dir
+		inBuild := append([]string{"UV_INTERNAL__BUILD_DIR=/src/pkg"}, uvEnv...)
+		return append(outside(cache, lock), fakeProc{pid: 8, ppid: 1, argv: []string{"uv", "run", "gen.py"}, fds: []string{lock}, env: inBuild},
+			fakeProc{pid: 9, ppid: 8, argv: []string{"python", "gen.py"}, env: ran("/src/pkg/.venv/bin", "UV_INTERNAL__BUILD_DIR=/src/pkg")})
+	}
+	f := newUVLock(t, procs, 4, 6, 8)
+	if g := f.run(t, options(t, f.proc, time.Now(), nil)); !g.Done || !f.pruned(true) {
+		t.Fatalf("a uv run's command keeps the build dir its uv has, and is no backend: %s %q %v", g.Action, g.Why, f.ran)
+	}
+}
+
+func TestAHiddenUVProcessThatTookTheLockBeforeTheRenameKeepsIt(t *testing.T) {
+	f := newUVLock(t, outside, 4, 6)
+	armed := false
+	o := options(t, f.proc, time.Now(), nil)
+	write(t, o.MountInfo, "29 1 259:3 / / rw - ext4 /dev/sda2 rw\n30 29 0:25 / /proc rw - proc proc rw,hidepid=invisible\n")
+	o.Tools = dockerHook{f.tools(nil), &armed, func() { f.holds(t, 4250) }} // another user's uv, which /proc hides
+	g := f.runWith(t, o, f.cache)
+	if g.Done || f.pruned(true) || !strings.Contains(g.Why, "uv process (pid 4250) took the cache's lock since the look") {
+		t.Fatalf("a holder /proc hides that came before the rename is a new one: %s %q", g.Action, g.Why)
+	}
+	if id, err := fileID(f.lock); err != nil || id != f.id {
+		t.Errorf("the lock file stays in place: %v %v", id, err)
+	}
+}
+
+func TestTheRunsOwnLockFileIsNoUseOfTheCache(t *testing.T) {
+	f := newUVLock(t, outside, 4, 6)
+	// the run has capacity's new lock file open while it looks again before the rename, as /proc shows it
+	must(t, os.Symlink(f.lock+".capacity", filepath.Join(f.proc, strconv.Itoa(os.Getpid()), "fd", "3")))
+	if g := f.run(t, options(t, f.proc, time.Now(), nil)); !g.Done || !f.pruned(true) || !strings.Contains(g.Detail, "2 uv processes hold its lock") {
+		t.Fatalf("the file capacity puts in the lock's place is its own: %s %q %q %v", g.Action, g.Why, g.Detail, f.ran)
+	}
+}
+
+func TestTheDetailCountsTheHolders(t *testing.T) {
+	one := func(cache, lock string) []fakeProc { return outside(cache, lock)[:2] } // the installed tool alone
+	for want, c := range map[string]struct {
+		procs   func(cache, lock string) []fakeProc
+		holders []int
+	}{"1 uv process holds its lock": {one, []int{4}}, "2 uv processes hold its lock": {outside, []int{4, 6}}} {
+		f := newUVLock(t, c.procs, c.holders...)
+		if g := f.run(t, options(t, f.proc, time.Now(), nil)); !g.Done || !strings.Contains(g.Detail, want) {
+			t.Errorf("the detail says how many hold the lock (%s): %q %q", want, g.Detail, g.Why)
+		}
 	}
 }
