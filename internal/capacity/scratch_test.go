@@ -45,7 +45,7 @@ type scratchFixture struct {
 
 func newScratch(t *testing.T) *scratchFixture {
 	t.Helper()
-	base := t.TempDir()
+	base := filepath.Clean(t.TempDir()) // a TMPDIR with a doubled slash names the same place
 	f := &scratchFixture{base: base, root: filepath.Join(base, "cache"), links: filepath.Join(base, "bin"),
 		offload: filepath.Join(base, "evidence-offload"), now: time.Now().Add(40 * 24 * time.Hour)}
 	must(t, os.MkdirAll(f.root, 0o755))

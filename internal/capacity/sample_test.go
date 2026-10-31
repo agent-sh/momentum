@@ -82,7 +82,7 @@ func TestTheSamplerSeesOpenMappedAndWorkingPathsAndRepoIDs(t *testing.T) {
 func TestWordsFindPathsInUnitsAndCommandLines(t *testing.T) {
 	home := homeDir()
 	got := words(`ExecStart=-%h/bin/serve --model "/data/m/x y" -c 512` + "\nEnvironmentFile=-/etc/a.env\nPATH=/usr/bin:~/bin")
-	for _, w := range []string{home + "/bin/serve", "/data/m/x", "/etc/a.env", "/usr/bin", home + "/bin"} {
+	for _, w := range []string{filepath.Join(home, "bin", "serve"), "/data/m/x", "/etc/a.env", "/usr/bin", filepath.Join(home, "bin")} {
 		found := false
 		for _, g := range got {
 			found = found || g == w
