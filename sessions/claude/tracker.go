@@ -126,6 +126,9 @@ type track struct {
 	// Request is when the turn sent the model request it still waits on: the last record of the conversation is
 	// Claude Code's record of that request, and no reply, error or input has come after it.
 	Request time.Time `json:"request,omitzero"`
+	// QueuedPrompt is when a queued prompt opened the turn, while nothing of that turn has followed it yet: an
+	// interruption written right after it is the Escape that sent it (Claude Code writes the two in either order).
+	QueuedPrompt time.Time `json:"queued_prompt,omitzero"`
 	// Queue is what Claude Code holds to send when the turn allows, oldest first (queueKey): a message its user
 	// typed by its text, "" for anything else it queued (a task's notification).
 	Queue []string `json:"queue,omitempty"`
@@ -277,7 +280,7 @@ func (t *Tracker) line(raw []byte) {
 		}
 		switch e.Type {
 		case "api-request":
-			t.st.Request = at
+			t.st.Request, t.st.QueuedPrompt = at, time.Time{}
 		case "queue-operation":
 			t.queued(e)
 		case "system":
@@ -559,6 +562,7 @@ func (t *Tracker) assistant(e line, at time.Time, open bool) {
 		return
 	}
 	st := &t.st
+	st.QueuedPrompt = time.Time{}
 	// Reopening a session whose turn was open (the model owed a reply), Claude Code closes the turn with a
 	// synthetic "No response requested." and calls no model. After an interruption or its own retry it writes the
 	// same, but the turn was not open then. An API error can carry the same text: a rate limit it has no words for.
@@ -666,7 +670,7 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 	st := &t.st
 	if strings.Contains(s, "<task-notification>") {
 		t.notified(s, at)
-		st.LastMain = "user"
+		st.LastMain, st.QueuedPrompt = "user", time.Time{}
 		if reOrphan.MatchString(s) {
 			st.Resumed = at
 		}
@@ -677,7 +681,7 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 	if kind == "peer" || strings.HasPrefix(s, "Another Claude session sent a message") {
 		st.log.Add(sessions.Entry{Role: sessions.RolePeer, Text: text.OneLine(reSystemTag.ReplaceAllString(s, ""), 400)})
 		if !meta {
-			st.LastMain = "user"
+			st.LastMain, st.QueuedPrompt = "user", time.Time{}
 		}
 		return
 	}
@@ -686,6 +690,16 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 	}
 	clean := strings.TrimSpace(reSystemTag.ReplaceAllString(s, ""))
 	if strings.HasPrefix(clean, "[Request interrupted") {
+		if q := st.QueuedPrompt; !q.IsZero() && st.LastMain == "user" && !at.IsZero() && at.Sub(q).Abs() <= InterruptSkew {
+			// the Escape that sent the queued prompt, written after it: it ended the turn before the prompt, and the
+			// prompt's turn runs on, dated from the prompt, as when the interruption comes first
+			st.QueuedPrompt = time.Time{}
+			st.Control, st.TurnEnd, st.TurnBegan = at, at, q
+			if !st.WakeAt.IsZero() && !at.Before(st.WakeSet) {
+				t.clearWake()
+			}
+			return
+		}
 		st.LastMain = "ended"
 		st.Group = st.Group[:0]
 		st.Control = at // its user pressed Esc, or turned a tool call down
@@ -702,6 +716,10 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 	}
 	st.LastMain = "user"
 	st.UserAt, st.Resumed = at, time.Time{} // a planned wakeup still fires after a prompt: it stays
+	st.QueuedPrompt = time.Time{}
+	if strings.HasSuffix(origin, "queued") {
+		st.QueuedPrompt = at
+	}
 	st.log.Add(sessions.Entry{Role: sessions.RoleUser, Origin: origin, Text: text.OneLine(clean, 1200)})
 }
 
@@ -727,7 +745,7 @@ func (t *Tracker) notified(s string, at time.Time) {
 
 func (t *Tracker) result(b block, at time.Time) {
 	st := &t.st
-	st.LastMain = "user"
+	st.LastMain, st.QueuedPrompt = "user", time.Time{}
 	c := st.Calls[b.ToolUseID]
 	delete(st.Calls, b.ToolUseID)
 	out := text.BlocksText(b.Content)

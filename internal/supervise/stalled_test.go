@@ -231,6 +231,27 @@ func loopStalledInterrupted(t *testing.T, promptFirst bool) {
 	}
 }
 
+func TestAnInterruptWrittenPromptFirstKeepsItsTurnThroughARetry(t *testing.T) {
+	// Claude Code writes the queued prompt, then the Escape's interruption: the message's turn runs on, through a
+	// retry's backoff too, when the retry's error has answered the request and its own request is not out yet.
+	x, sent, scan := stalledLoop(t)
+	st := testStore(t)
+	now := sent.Add(30 * time.Minute)
+	f := &queueing{x: x, now: &now, promptFirst: true}
+	sv := liveStalled(st, f, &now)
+	run(t, sv, scan(now))
+	now = now.Add(time.Minute)
+	run(t, sv, scan(now))
+	x.at = now
+	x.add(map[string]any{"type": "system", "subtype": "api_error", "level": "error"})
+	now = now.Add(30 * time.Second)
+	s := scan(now)
+	run(t, sv, s)
+	if r := results(t, st); !s.TurnOpen || s.Phase != sessions.Working || !r[Delivered] || r[Otherwise] {
+		t.Fatalf("in the retry's backoff: open %v phase %s outcomes %v", s.TurnOpen, s.Phase, r)
+	}
+}
+
 func TestAStalledTurnsCaseWaitsForTheRequestItsLastMessageSent(t *testing.T) {
 	x, sent, scan := stalledLoop(t)
 	st := testStore(t)
