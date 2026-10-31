@@ -127,7 +127,7 @@ func noteDone(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	if was.Standing(now.Add(-reportWindow)) {
 		fmt.Fprintf(stdout, "%s: done, out of the report: %s\n", n.ID, n.Title)
 	} else {
-		fmt.Fprintf(stdout, "%s: done (older than the report's week, it was not in the report): %s\n", n.ID, n.Title)
+		fmt.Fprintf(stdout, "%s: done (older than the report's 12 hours, it was not in the report): %s\n", n.ID, n.Title)
 	}
 	return nil
 }
@@ -198,7 +198,7 @@ func noteList(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		case !n.Done.IsZero():
 			tags = append(tags, "done "+n.Done.Local().Format("01-02 15:04"))
 		case !n.Standing(since):
-			tags = append(tags, "older than the report's week")
+			tags = append(tags, "older than the report's 12 hours")
 		case !shown[n.ID]:
 			tags = append(tags, "counted, past the 20 the report shows")
 		}

@@ -136,7 +136,7 @@ func TestNoteListSaysWhatTheReportShows(t *testing.T) {
 	for i := range 25 {
 		ns = append(ns, store.Note{ID: fmt.Sprintf("ask-%02d", i), Kind: store.NoteNeeds, Title: "Question?", At: now.Add(time.Duration(i-30) * time.Minute)})
 	}
-	ns = append(ns, store.Note{ID: "dec-old", Kind: store.NoteDecided, Title: "Kept the cache", At: now.Add(-8 * 24 * time.Hour)})
+	ns = append(ns, store.Note{ID: "dec-old", Kind: store.NoteDecided, Title: "Kept the cache", At: now.Add(-13 * time.Hour)})
 	putNotes(t, ns...)
 	code, out, _ := momentum("note", "list", "--json")
 	shown := map[string]bool{}
@@ -157,7 +157,7 @@ func TestNoteListSaysWhatTheReportShows(t *testing.T) {
 		t.Fatalf("in_report: exit %d, %d of %d shown: %v", code, count, len(shown), shown)
 	}
 	if _, out, _ := momentum("note", "list"); !strings.Contains(out, "ask-00     needs ") || !strings.Contains(out, "[counted, past the 20 the report shows]") ||
-		!strings.Contains(out, "[older than the report's week]") {
+		!strings.Contains(out, "[older than the report's 12 hours]") {
 		t.Fatalf("list:\n%s", out)
 	}
 	if code, out, _ := momentum("note", "done", "dec-old"); code != 0 || !strings.Contains(out, "it was not in the report") {

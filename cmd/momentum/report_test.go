@@ -177,7 +177,7 @@ func putNotes(t *testing.T, ns ...store.Note) {
 }
 
 // The report holds the notes that stand, by importance and then newest first: needs and problems until done,
-// decided and shipped from the last 7 days. Running is what the scan finds in flight: the sessions working, and
+// decided and shipped from the last 12 hours. Running is what the scan finds in flight: the sessions working, and
 // the workflows, agents, background jobs and monitors of any session, an automated run's last.
 func TestTheReportHoldsTheNotesThatStandAndWhatRuns(t *testing.T) {
 	t.Setenv("MOMENTUM_HOME", t.TempDir())

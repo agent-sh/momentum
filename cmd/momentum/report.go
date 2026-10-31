@@ -22,13 +22,13 @@ import (
 )
 
 // The report is how momentum shows its state: one JSON object that views in surfaces the owner already looks at
-// read, with what needs him, what was decided and shipped this week, what runs now and what momentum could not
-// fix. momentum keeps no app or dashboard of its own.
+// read, with what needs him, what was decided and shipped in the last 12 hours, what runs now and what momentum
+// could not fix. momentum keeps no app or dashboard of its own.
 const (
 	reportVersion = 1
 	reportCap     = 20 // items in a section's array; its count covers them all
-	// how far back the decided and shipped notes reach (owner 2026-10-31: "7 days might be a too much information. I
-	// would want to know probably12 hours")
+	// how far back the decided and shipped notes reach. The owner's ruling (2026-10-31): a week was more than he
+	// wants to read; about the last 12 hours.
 	reportWindow = 12 * time.Hour
 )
 
