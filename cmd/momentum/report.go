@@ -26,8 +26,10 @@ import (
 // fix. momentum keeps no app or dashboard of its own.
 const (
 	reportVersion = 1
-	reportCap     = 20                 // items in a section's array; its count covers them all
-	reportWindow  = 7 * 24 * time.Hour // how far back the decided and shipped notes reach
+	reportCap     = 20 // items in a section's array; its count covers them all
+	// how far back the decided and shipped notes reach (owner 2026-10-31: "7 days might be a too much information. I
+	// would want to know probably12 hours")
+	reportWindow = 12 * time.Hour
 )
 
 // reportSources and reportSnapshot are what a report scans: the harnesses' sources and the machine. Tests put

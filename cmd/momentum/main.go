@@ -38,7 +38,7 @@ const usage = `usage:
                                         their events have no source left)
   momentum sessions [--json] [--all]    the live agent sessions and their phases, read without a model;
                                         each phase change is kept as an event of source sessions
-  momentum report [--json]              what needs the owner, what was decided and shipped in the last 7 days,
+  momentum report [--json]              what needs the owner, what was decided and shipped in the last 12 hours,
                                         what runs now and what momentum could not fix; changes nothing.
                                         --json prints the one object the owner's views read
   momentum note add --kind needs|decided|shipped|problem --title T [--detail D] [--effect E]

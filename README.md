@@ -74,7 +74,7 @@ Run after each `momentum sessions` scan (a second `ExecStart` of the sessions un
 momentum has no app or dashboard of its own. Its state shows inside surfaces the owner already looks at: a view there calls `momentum report --json` every minute or so, keeps its last good copy, and draws a short section in its own style.
 
 ```
-momentum report [--json]       what needs you, what was decided and shipped in the last 7 days, what runs now,
+momentum report [--json]       what needs you, what was decided and shipped in the last 12 hours, what runs now,
                                and what momentum could not fix; --json prints one JSON object on one line
 momentum note add --kind needs|decided|shipped|problem --title T [--detail D] [--effect E]
                   [--link LABEL=URL]... [--id ID] [--source S] [--importance high|normal|low]
@@ -91,7 +91,7 @@ momentum note list [--json]    every note, newest first, and whether the report 
 
 Every section is an array, sorted by importance and then newest first, of at most 20 items; `counts` counts them all. An item has an `id`, a one-line `title` of at most 120 characters, an optional `detail` and `effect` (what a shipped change measurably did), an `at` in RFC 3339, `links` and a `source`. All of it is plain text: no HTML or markdown, no control characters (escape sequences, bells) and no invisible format characters (bidi overrides).
 
-Four sections are notes: needs you (each title is the question), decided (the detail says how to override it), shipped, and problems. A note is kept state: a schema change keeps it and `evidence rebuild` never touches it. `note add` prints the note's id; the same `--id` again replaces that note and makes it stand again. A needs or problem note stays until `note done`; a decided or shipped one shows for 7 days.
+Four sections are notes: needs you (each title is the question), decided (the detail says how to override it), shipped, and problems. A note is kept state: a schema change keeps it and `evidence rebuild` never touches it. `note add` prints the note's id; the same `--id` again replaces that note and makes it stand again. A needs or problem note stays until `note done`; a decided or shipped one shows for 12 hours.
 
 `running` is computed live, by the scan `momentum sessions` makes: the sessions that are working, and the workflows, agents, background jobs and monitors in any session. The report resumes that scan from the checkpoints the last `momentum sessions` run saved, so with the sessions timer running it costs about what that run costs. It opens the store read-only and writes nothing; with no store, or one that is not this build's schema (the next `momentum sessions` of this build migrates it), it prints nothing and exits 3. Its scan has 3 seconds and reads the harnesses at once: a harness that fails is named on stderr and running keeps what it read, one not done by then is named and left out, and the report still prints.
 
