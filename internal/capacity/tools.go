@@ -10,11 +10,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // The uv and docker rules prune with each tool's own command, never by deleting its files: the tool knows what in
@@ -122,12 +125,16 @@ func stopTree(pid int) error {
 	return err
 }
 
-// uv prunes the uv cache with `uv cache prune --ci` when it is over its size, or when the last prune is
-// older than the cadence (or there was none). --ci keeps the wheels uv built and drops the ones it can download
-// again, and the unpacked wheels environments import from. A prune under a running uv process deletes files it
-// may still import, so the rule never passes --force: uv's own lock, which every uv process holds while it runs,
-// decides, and the rule looks first, to wait quietly for an install (a sync, a venv being made), which ends soon,
-// and to report a long-lived one (a tool server run with uvx, a script run with uv run) by name.
+// uv prunes the uv cache with `uv cache prune --ci` when it is over its size, or when the last prune is older than
+// the cadence (or there was none). --ci keeps the wheels uv built and drops the ones it can download again. Every
+// prune also deletes every environment uv keeps in its cache (a `uv run --with` layer, a `uv run --script` script's,
+// an uninstalled tool's that uvx runs), and a process running from one fails its next import; one running from an
+// environment outside the cache (a project's .venv, an installed tool's) is untouched, its files hardlinks of the
+// cache's. Every uv process holds uv's lock shared for its life, so a prune that takes the lock waits for all of
+// them. The rule looks first: it waits quietly for an install, a sync or a venv being made, which end soon, and
+// waits for, and names, a process that uses a path in the cache, or a holder of the lock it cannot read. Otherwise
+// it prunes: with uv's own lock when nobody holds it, or, when every holder runs outside the cache, with --force
+// under a lock of its own put in the lock file's place (uvLockInPlace).
 func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error) {
 	out, err := r.tools.UV(ctx, 30*time.Second, "cache", "dir")
 	if errors.Is(err, errNoTool) {
@@ -158,33 +165,52 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 		return nil, notes, nil
 	}
 	// a look at the processes now, for the uv processes and the uses of the cache, which may be under no other root
-	now := TakeSample(r.opt.ProcRoot, r.m, func(p string) bool { return under(p, f.canon) })
+	look := func() *Sample {
+		return TakeSample(r.opt.ProcRoot, r.m, func(p string) bool { return under(p, f.canon) })
+	}
+	now := look()
 	if busy := uvBusy(now); busy != "" {
 		f.Action, f.Why = ActKeep, "waits for an install: "+busy
 		return []Finding{f}, notes, nil
 	}
-	busyWhy := func(readers string) string {
-		w := "it waits: uv processes read the cache, and a prune under them would delete files they import"
-		if readers != "" {
-			w += " (" + readers + ")"
-		}
-		return w
+	busyWhy := func(users string) string {
+		return "it waits: these run from the cache or hold its lock unseen, and a prune deletes what they use (" + users + ")"
 	}
-	if readers := uvReaders(now, f.canon); readers != "" {
-		f.Action, f.class, f.Why = ActReport, "busy", busyWhy(readers)
+	lockFile := filepath.Join(dir, ".lock")
+	lock, holders := uvLock(r.opt.ProcRoot, lockFile)
+	if users := uvUsers(now, r.opt.ProcRoot, f.canon, r.m.Canon(lockFile), r.m.Canon, holders); users != "" {
+		f.Action, f.class, f.Why = ActReport, "busy", busyWhy(users)
 		return []Finding{f}, notes, nil
 	}
 	f.Action = ActDelete
+	forced := len(holders) > 0
+	if forced {
+		f.Detail += fmt.Sprintf("; %d uv processes hold its lock and none runs from the cache, so with --force under a lock "+
+			"of capacity's own", len(holders))
+	}
 	if !live {
 		return []Finding{f}, notes, nil
 	}
-	// No --force: uv's own lock, which every uv process holds shared while it runs, decides; one that started since
-	// the look keeps the cache, and the prune waits for the next run.
-	_, err = r.tools.UV(ctx, 20*time.Minute, "cache", "prune", "--ci")
-	if err != nil && uvInUse(err) {
-		f.Action, f.class, f.Why = ActReport, "busy", busyWhy(uvReaders(TakeSample(r.opt.ProcRoot, r.m,
-			func(p string) bool { return under(p, f.canon) }), f.canon))
-		return []Finding{f}, notes, nil
+	if !forced {
+		// uv's own lock decides: a process that started since the look keeps the cache, and the prune waits
+		_, err = r.tools.UV(ctx, 20*time.Minute, "cache", "prune", "--ci")
+		if err != nil && uvInUse(err) {
+			f.Action, f.class, f.Why = ActReport, "busy", "it waits: a uv process took the cache's lock since the look"
+			return []Finding{f}, notes, nil
+		}
+	} else {
+		held, why := uvLockInPlace(lockFile, lock, holders, r.opt.ProcRoot, r.opt.afterUVLock)
+		if held == nil {
+			f.Action, f.class, f.Why = ActReport, "busy", "it waits: "+why
+			return []Finding{f}, notes, nil
+		}
+		if users := uvUsers(look(), r.opt.ProcRoot, f.canon, r.m.Canon(lockFile), r.m.Canon, nil); users != "" {
+			held.Close()
+			f.Action, f.class, f.Why = ActReport, "busy", busyWhy(users)
+			return []Finding{f}, notes, nil
+		}
+		_, err = r.tools.UV(ctx, 20*time.Minute, "cache", "prune", "--ci", "--force")
+		held.Close() // a uv process that waited for it goes on
 	}
 	after, counted2 := r.uvSize(ctx, dir)
 	if size >= 0 && after >= 0 {
@@ -278,8 +304,13 @@ func uvBusy(s *Sample) string {
 	return ""
 }
 
-// uvReaders names, at most three, the uv processes running and the processes using a file in the cache, or "".
-func uvReaders(s *Sample, cache string) string {
+// uvUsers names, at most three, the processes a prune would break, each by the uv process it runs under, and the
+// holders of the lock the look did not read. A process uses the cache by a path in it other than its lock file (a
+// program, a mapped or open file, a working directory, an argument), by the program it was started as (a cached
+// environment's bin/python is a link to an interpreter outside the cache), or by its environment: uv starts a
+// command with the environment's bin first on PATH, and a script's with VIRTUAL_ENV, and the command's children
+// inherit them. "" is none.
+func uvUsers(s *Sample, procRoot, cache, lock string, canon func(string) string, holders map[int]bool) string {
 	if s == nil {
 		return ""
 	}
@@ -291,6 +322,28 @@ func uvReaders(s *Sample, cache string) string {
 		}
 		seen[pid] = true
 	}
+	byUV := func(pid int, what string) { // the uv process it runs under names it best
+		for p, hops := s.Table[pid], 0; hops < 8; hops++ {
+			if len(p.Argv) > 0 && (filepath.Base(p.Argv[0]) == "uv" || filepath.Base(p.Argv[0]) == "uvx") {
+				pid, what = p.PID, strings.Join(p.Argv[:min(len(p.Argv), 4)], " ")
+				break
+			}
+			q, ok := s.Table[p.PPID]
+			if !ok {
+				break
+			}
+			p = q
+		}
+		add(pid, what)
+	}
+	in := func(p string) bool { return filepath.IsAbs(p) && under(canon(p), cache) }
+	uses := append([]Use(nil), s.Uses...)
+	sort.Slice(uses, func(i, j int) bool { return uses[i].PID < uses[j].PID })
+	for _, u := range uses {
+		if cache != "" && under(u.Path, cache) && u.Path != lock {
+			byUV(u.PID, u.Comm)
+		}
+	}
 	pids := make([]int, 0, len(s.Table))
 	for pid := range s.Table {
 		pids = append(pids, pid)
@@ -298,19 +351,149 @@ func uvReaders(s *Sample, cache string) string {
 	sort.Ints(pids)
 	for _, pid := range pids {
 		p := s.Table[pid]
-		if len(p.Argv) > 0 && (filepath.Base(p.Argv[0]) == "uv" || filepath.Base(p.Argv[0]) == "uvx") {
-			add(pid, strings.Join(p.Argv[:min(len(p.Argv), 4)], " "))
+		if cache == "" || seen[pid] {
+			continue
+		}
+		if len(p.Argv) > 0 && in(p.Argv[0]) {
+			byUV(pid, p.Comm)
+			continue
+		}
+		for _, kv := range environ(procRoot, pid) {
+			k, v, _ := strings.Cut(kv, "=")
+			if (k == "VIRTUAL_ENV" && in(v)) || (k == "PATH" && slices.ContainsFunc(strings.Split(v, ":"), in)) {
+				byUV(pid, p.Comm)
+				break
+			}
 		}
 	}
-	for _, u := range s.Uses {
-		if cache != "" && under(u.Path, cache) {
-			add(u.PID, u.Comm)
+	held := make([]int, 0, len(holders))
+	for pid := range holders {
+		held = append(held, pid)
+	}
+	sort.Ints(held)
+	for _, pid := range held {
+		if _, ok := s.Table[pid]; !ok {
+			add(pid, "a process the look cannot read holds the lock")
 		}
 	}
 	if len(seen) > len(names) {
 		names = append(names, fmt.Sprintf("%d more", len(seen)-len(names)))
 	}
 	return strings.Join(names, ", ")
+}
+
+// lockID is a file as /proc/locks names it: its device's major and minor numbers, and its inode.
+type lockID struct {
+	major, minor uint32
+	ino          uint64
+}
+
+// uvLock is the cache's lock file's identity and the processes that hold a lock on it, from /proc/locks. None is
+// known when the file or /proc/locks cannot be read, and then only uv's own lock may decide. A process waiting for
+// the lock holds nothing.
+func uvLock(procRoot, lockFile string) (lockID, map[int]bool) {
+	st, err := os.Stat(lockFile)
+	if err != nil {
+		return lockID{}, nil
+	}
+	s, ok := st.Sys().(*syscall.Stat_t)
+	if !ok {
+		return lockID{}, nil
+	}
+	id := lockID{unix.Major(uint64(s.Dev)), unix.Minor(uint64(s.Dev)), s.Ino}
+	holders, _ := lockHolders(procRoot, id)
+	return id, holders
+}
+
+// lockHolders are the processes that hold a lock on a file, by /proc/locks ("1: FLOCK ADVISORY READ 4242
+// fc:00:1234 0 EOF"; a waiter's line has "->" after its number).
+func lockHolders(procRoot string, id lockID) (map[int]bool, bool) {
+	out := map[int]bool{}
+	b, err := os.ReadFile(filepath.Join(procRoot, "locks"))
+	if err != nil {
+		return out, false
+	}
+	for _, l := range strings.Split(string(b), "\n") {
+		f := strings.Fields(l)
+		waiter := len(f) > 1 && f[1] == "->"
+		if waiter {
+			f = append(f[:1:1], f[2:]...)
+		}
+		if len(f) < 6 {
+			continue
+		}
+		parts := strings.Split(f[5], ":")
+		if len(parts) != 3 {
+			continue
+		}
+		maj, err1 := strconv.ParseUint(parts[0], 16, 32)
+		mnr, err2 := strconv.ParseUint(parts[1], 16, 32)
+		ino, err3 := strconv.ParseUint(parts[2], 10, 64)
+		if err1 != nil || err2 != nil || err3 != nil || (lockID{uint32(maj), uint32(mnr), ino}) != id {
+			continue
+		}
+		if waiter {
+			continue // a process waiting for the lock holds nothing
+		}
+		if pid, err := strconv.Atoi(f[4]); err == nil {
+			out[pid] = true
+		}
+	}
+	return out, true
+}
+
+// uvLockSettle is how long the rule waits after its lock file takes the old one's place before it looks for a uv
+// process that opened the old file just then: uv locks the file the moment it opens it.
+var uvLockSettle = 100 * time.Millisecond
+
+// uvLockInPlace takes the cache's lock while processes hold it shared, none of which runs from the cache: a new
+// file, locked exclusively, is renamed over the lock file. A uv process that starts opens it and waits, as it waits
+// for uv's own prune; the holders keep the old file, whose lock protects nothing the prune removes. A uv process
+// that took the old file meanwhile (a holder not seen before) makes it let go, with why. The caller closes the file
+// it returns, which lets the lock go.
+func uvLockInPlace(lockFile string, old lockID, before map[int]bool, procRoot string, after func()) (*os.File, string) {
+	st, err := os.Stat(lockFile)
+	if err != nil {
+		return nil, "the lock file cannot be read: " + err.Error()
+	}
+	tmp := lockFile + ".capacity"
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err.Error()
+	}
+	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return nil, err.Error()
+	}
+	fail := func(why string) (*os.File, string) {
+		f.Close()
+		os.Remove(tmp)
+		return nil, why
+	}
+	if err := f.Chmod(st.Mode().Perm()); err != nil {
+		return fail(err.Error())
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return fail("its new lock file could not be locked: " + err.Error())
+	}
+	if err := os.Rename(tmp, lockFile); err != nil {
+		return fail(err.Error())
+	}
+	if after != nil {
+		after()
+	}
+	time.Sleep(uvLockSettle)
+	now, known := lockHolders(procRoot, old)
+	for pid := range now {
+		if !before[pid] {
+			f.Close()
+			return nil, fmt.Sprintf("a uv process (pid %d) took the cache's lock as capacity put its own in place", pid)
+		}
+	}
+	if !known {
+		f.Close()
+		return nil, "the locks cannot be read again"
+	}
+	return f, ""
 }
 
 // docker prunes Docker's build cache older than the configured age and its dangling images, once per cadence.
@@ -584,4 +767,13 @@ func gib(n int64) string {
 		return fmt.Sprintf("%.0f MiB", float64(n)/(1<<20))
 	}
 	return fmt.Sprintf("%.1f GiB", float64(n)/(1<<30))
+}
+
+// environ is a process's environment, NAME=value each, or none when it cannot be read.
+func environ(procRoot string, pid int) []string {
+	b, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "environ"))
+	if err != nil {
+		return nil
+	}
+	return strings.Split(strings.TrimRight(string(b), "\x00"), "\x00")
 }
