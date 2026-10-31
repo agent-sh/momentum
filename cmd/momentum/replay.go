@@ -30,6 +30,7 @@ func replay(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	window := fs.Duration("owner-window", supervise.DefaultParams.OwnerWindow, "hold while the owner typed into the session within it")
 	promiseWait := fs.Duration("promise-wait", supervise.DefaultParams.PromiseWait, "the promise rule's wait")
 	reopenWait := fs.Duration("reopen-wait", supervise.DefaultParams.ReopenWait, "the reopened rule's wait")
+	stalledWait := fs.Duration("stalled-wait", supervise.DefaultParams.StalledWait, "the stalled rule's wait")
 	cutoffWait := fs.Duration("cutoff-wait", supervise.DefaultParams.CutoffWait, "the cutoff rule's wait")
 	firstTry := fs.Duration("first-try", supervise.DefaultParams.Backoff[0], "the transient rule's first wait")
 	if err := fs.Parse(args); err != nil {
@@ -46,10 +47,10 @@ func replay(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		}
 	}
 	p := supervise.DefaultParams
-	p.OwnerWindow, p.PromiseWait, p.ReopenWait, p.CutoffWait = *window, *promiseWait, *reopenWait, *cutoffWait
+	p.OwnerWindow, p.PromiseWait, p.ReopenWait, p.CutoffWait, p.StalledWait = *window, *promiseWait, *reopenWait, *cutoffWait, *stalledWait
 	p.Backoff = append([]time.Duration{*firstTry}, p.Backoff[1:]...)
 	if *anchor {
-		p.OwnerWindow, p.PromiseWait, p.ReopenWait, p.CutoffWait, p.Backoff = 0, 0, 0, 0, []time.Duration{0}
+		p.OwnerWindow, p.PromiseWait, p.ReopenWait, p.CutoffWait, p.StalledWait, p.Backoff = 0, 0, 0, 0, 0, []time.Duration{0}
 	}
 	var labels []supervise.Label
 	if *labelsPath != "" {
@@ -109,7 +110,8 @@ func writePoints(path string, rs []supervise.Result) error {
 	for _, r := range rs {
 		v := map[string]any{"session": r.Point.Session, "tool": r.Point.Stop.Tool, "stop_at": r.Point.Stop.At, "phase": r.Point.Stop.Phase,
 			"error": r.Point.Stop.Error, "words": r.Point.Stop.Words, "tasks": r.Point.Stop.Tasks, "owner_at": r.Point.Stop.OwnerAt,
-			"resumed_at": r.Point.Stop.ResumedAt, "next": r.Point.Next, "entry": r.Point.Entry, "rule": r.Decision.Rule,
+			"resumed_at": r.Point.Stop.ResumedAt, "request_at": r.Point.Stop.RequestAt, "waiting": r.Point.Waiting,
+			"next": r.Point.Next, "entry": r.Point.Entry, "rule": r.Decision.Rule,
 			"verdict": r.Decision.Verdict, "at": r.Decision.At, "why": r.Decision.Why, "fired": r.Fired, "outcome": r.Outcome}
 		if r.Label != nil {
 			v["label"] = r.Label.Kind

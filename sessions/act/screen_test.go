@@ -44,6 +44,11 @@ func TestDraftReadsWhatIsTypedOnTheInputLine(t *testing.T) {
 		{"a colon color whose fields hold a 2 is not dim", "claude", ruleLine + "\n❯" + nbsp + "\x1b[38:2:0:2:2:2mtyped" + reset + "\n" + ruleLine, "typed", true},
 		{"claude, no rule below it is not its input line", "claude", ruleLine + "\n❯" + nbsp + "my draft\nmore text", "", false},
 		{"claude, a dim ❯ status line under the bottom rule", "claude", ruleLine + "\n❯" + nbsp + "my draft\n" + ruleLine + "\n" + dim + "❯ status" + reset, "my draft", true},
+		// The cursor is drawn reversed: on a dim placeholder it sits on its first letter.
+		{"claude, the cursor on a dim placeholder", "claude", ruleLine + "\n\x1b[39m❯" + nbsp + "\x1b[7m\x1b[39mP\x1b[0;2mress up to edit queued messages\x1b[0m\n" + ruleLine, "", true},
+		{"claude, the cursor inside typed text", "claude", ruleLine + "\n❯" + nbsp + "fi\x1b[7mx\x1b[0m it\n" + ruleLine, "fix it", true},
+		{"claude, the cursor on the last typed letter", "claude", ruleLine + "\n❯" + nbsp + "fix i\x1b[7mt\x1b[0m\n" + ruleLine, "fix it", true},
+		{"claude, the cursor after typed text", "claude", ruleLine + "\n❯" + nbsp + "fix it\x1b[7m \x1b[0m\n" + ruleLine, "fix it", true},
 	}
 	for _, c := range cases {
 		typed, ok := Draft(c.screen, c.tool)

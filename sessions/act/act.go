@@ -52,6 +52,10 @@ var (
 	ErrCommand   = errors.New("the message would run as a command")
 	ErrMessage   = errors.New("the message reads like the interface's own dialog or status")
 	ErrNoMessage = errors.New("nothing to send")
+	// Refusals of Interrupt before it types: the screen shows no turn to interrupt, or a message already waits in
+	// the harness's queue, which Escape would send.
+	ErrIdle   = errors.New("its screen shows no turn running")
+	ErrQueued = errors.New("its screen shows a message waiting in its queue")
 )
 
 // ErrUnstable means the paste began and the message was not known to be submitted: after the paste a check
@@ -327,6 +331,17 @@ func stat(root string, pid int) (procStat, error) {
 // tmuxReady checks t's pane and returns its styled screen. empty asks for an input line with nothing on it;
 // after a paste it holds the message, so the caller checks that itself.
 func (s *Sender) tmuxReady(ctx context.Context, t Target, empty bool) (string, error) {
+	screen, err := s.tmuxScreen(ctx, t)
+	if err != nil {
+		return "", err
+	}
+	return screen, ready(screen, t.Tool, empty)
+}
+
+// tmuxScreen checks that keys typed into t's pane reach t's process and nothing else, and returns the pane's styled
+// screen: the pane is live, no tmux mode owns its keyboard, its input goes to it alone, and its terminal runs the
+// process in its foreground.
+func (s *Sender) tmuxScreen(ctx context.Context, t Target) (string, error) {
 	out, err := s.tmux(ctx, "", "display-message", "-p", "-t", t.Pane, "#{pane_dead} #{pane_in_mode} #{pane_synchronized} #{pane_pid} #{pane_tty}")
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrGone, err)
@@ -352,7 +367,7 @@ func (s *Sender) tmuxReady(ctx context.Context, t Target, empty bool) (string, e
 	if err != nil {
 		return "", fmt.Errorf("capture: %w", err)
 	}
-	return string(screen), ready(string(screen), t.Tool, empty)
+	return string(screen), nil
 }
 
 // ready checks a styled screen: no dialog, no turn running, and an input line of the tool's, with nothing typed
@@ -411,16 +426,8 @@ func (s *Sender) sendTmux(ctx context.Context, t Target, text string) error {
 	if _, err := s.tmuxReady(ctx, t, true); err != nil {
 		return err
 	}
-	buf := "momentum-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	if _, err := s.tmux(ctx, text, "load-buffer", "-b", buf, "-"); err != nil {
-		s.dropBuffer(buf)
+	if err := s.pasteTmux(ctx, t, text); err != nil {
 		return err
-	}
-	// -p wraps the paste in bracketed-paste codes when the program asked for them, so it lands as one paste and
-	// does not submit itself; -d drops the buffer.
-	if _, err := s.tmux(ctx, "", "paste-buffer", "-p", "-d", "-b", buf, "-t", t.Pane); err != nil {
-		s.dropBuffer(buf)
-		return fmt.Errorf("%w: paste: %v", ErrUnstable, err)
 	}
 	if err := s.settled(func() (string, error) { return s.tmuxReady(ctx, t, false) }, t.Tool, text); err != nil {
 		return err
@@ -493,6 +500,15 @@ func (s *Sender) kittyRuns(ctx context.Context, t Target) error {
 }
 
 func (s *Sender) kittyReady(ctx context.Context, t Target, empty bool) (string, error) {
+	screen, err := s.kittyScreen(ctx, t)
+	if err != nil {
+		return "", err
+	}
+	return screen, ready(screen, t.Tool, empty)
+}
+
+// kittyScreen checks that keys sent to t's kitty window reach t's process, and returns the window's styled screen.
+func (s *Sender) kittyScreen(ctx context.Context, t Target) (string, error) {
 	if err := s.front(t, 0, ""); err != nil { // kitty lists the window's foreground from its own terminal
 		return "", err
 	}
@@ -503,7 +519,7 @@ func (s *Sender) kittyReady(ctx context.Context, t Target, empty bool) (string, 
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrGone, err)
 	}
-	return string(screen), ready(string(screen), t.Tool, empty)
+	return string(screen), nil
 }
 
 func (s *Sender) sendKitty(ctx context.Context, t Target, text string) error {

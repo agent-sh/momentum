@@ -118,14 +118,16 @@ func rule(s string) bool {
 }
 
 // undimmed returns the characters of a styled line that are not drawn dim: after glyph on the input line's first
-// line, all of them on a line it wraps to.
+// line, all of them on a line it wraps to. The cursor is a character drawn reversed: on a dim placeholder it sits
+// on the placeholder's first letter, so a reversed character followed by dim text is the placeholder's.
 func undimmed(line, glyph string, first bool) string {
 	var out strings.Builder
-	dim, past := false, !first
-	seen := ""
+	dim, rev, past := false, false, !first
+	seen, held := "", ""
 	for i := 0; i < len(line); {
 		if line[i] == 0x1b {
 			n, d := escape(line[i:], dim)
+			rev = sgrReverse(line[i:i+n], rev)
 			dim = d
 			i += n
 			continue
@@ -139,15 +141,58 @@ func undimmed(line, glyph string, first bool) string {
 			}
 			continue
 		}
-		if unicode.IsSpace(r) {
-			out.WriteRune(' ')
-			continue
+		if held != "" {
+			if !dim {
+				out.WriteString(held) // the cursor on a typed character
+			}
+			held = ""
 		}
-		if !dim && unicode.IsPrint(r) {
+		switch {
+		case unicode.IsSpace(r):
+			out.WriteRune(' ')
+		case !dim && rev && unicode.IsPrint(r):
+			held = string(r) // typed, unless dim text follows it
+		case !dim && unicode.IsPrint(r):
 			out.WriteRune(r)
 		}
 	}
-	return out.String()
+	return out.String() + held
+}
+
+// sgrReverse applies an escape sequence to the reversed state, when it is an SGR: 7 sets it, 27 and 0 (or an
+// empty list) clear it. Extended colors carry numbers that are not attributes, as sgrDim reads them.
+func sgrReverse(seq string, rev bool) bool {
+	if !strings.HasPrefix(seq, "\x1b[") || !strings.HasSuffix(seq, "m") {
+		return rev
+	}
+	params := seq[2 : len(seq)-1]
+	if params == "" {
+		return false
+	}
+	ps := strings.Split(params, ";")
+	for i := 0; i < len(ps); i++ {
+		code, _, sub := strings.Cut(ps[i], ":")
+		switch strings.TrimLeft(code, "0") {
+		case "":
+			if !sub {
+				rev = false
+			}
+		case "7":
+			rev = true
+		case "27":
+			rev = false
+		case "38", "48", "58":
+			if sub {
+				continue
+			}
+			if i+1 < len(ps) && ps[i+1] == "5" {
+				i += 2
+			} else if i+1 < len(ps) && ps[i+1] == "2" {
+				i += 4
+			}
+		}
+	}
+	return rev
 }
 
 // escape reads one escape sequence at the start of s and returns its length and the dim state after it. Only

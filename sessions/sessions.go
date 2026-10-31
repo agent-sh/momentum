@@ -100,7 +100,14 @@ type Session struct {
 	ControlAt time.Time `json:"control_at,omitzero"`
 	// ResumedAt is when the harness reopened the session after it ended mid-task (Claude Code's resume records:
 	// a call or a background task the end cut off), when nothing has happened in it since. Zero otherwise.
-	ResumedAt  time.Time `json:"resumed_at,omitzero"`
+	ResumedAt time.Time `json:"resumed_at,omitzero"`
+	// RequestAt is when the turn sent the model request it still waits on: the last record of its conversation is
+	// the request (Claude Code's api-request records), and no reply, error or input has come after it. Zero
+	// otherwise, and for a harness that does not record its requests.
+	RequestAt time.Time `json:"request_at,omitzero"`
+	// Queued counts the messages its user typed while the turn ran, which the harness holds to send when the turn
+	// allows.
+	Queued     int       `json:"queued,omitempty"`
 	Started    time.Time `json:"started"`
 	Transcript string    `json:"transcript,omitempty"`
 	Size       int64     `json:"-"` // how much of the transcript or database has been read; -1 when unreadable

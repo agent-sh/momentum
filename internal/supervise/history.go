@@ -23,7 +23,15 @@ type Point struct {
 	Stop    Stop
 	Next    Next
 	Entry   string // where the owner's turns came from (the harness's entrypoint), when the store says
+	// Waiting marks a turn that waited on its model's reply at least stallFloor, where no input ended the wait:
+	// the reply came (Next is the session going on by itself), or the session was reopened, which closed the turn
+	// (Next is its owner's restart). Only the stalled rule reads it (PlanOnly).
+	Waiting bool
 }
+
+// stallFloor is how long a turn must have waited on its model's reply to be a point of its own: no wait the
+// stalled rule could use is shorter, and every turn waits on its model for a moment.
+const stallFloor = time.Minute
 
 // Next is the input that ended a stop: the owner's (a turn, a slash command, a shell command, an interruption),
 // the session's own (a task's notification, a scheduled wakeup, another session's message), momentum's own
@@ -113,9 +121,11 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 	var wakeAt, ownerAt, resumed time.Time
 	var words, entry, harness, prevRole, prevPrior string
 	var prevAt time.Time
+	var owes time.Time // the model owes its reply since: an input, or the result of a turn's last call
+	var owesRef string
 	pending := map[string]bool{} // calls without a result yet
 	lastMainUser := false
-	stopOf := func(at time.Time) Stop {
+	stopOf := func(at time.Time, nextRef string) Stop {
 		s := Stop{Key: id, Tool: harness, At: prevAt, Words: words, OwnerAt: ownerAt, ResumedAt: resumed}
 		for k, t := range tasks {
 			if t.kind == "monitor" && !t.until.IsZero() && t.until.Before(at) {
@@ -140,6 +150,9 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		}
 		if prevRole == "interrupt" {
 			s.Working = false
+		}
+		if s.Working && !s.Busy && !owes.IsZero() && harness == "claude" {
+			s.RequestAt = requestBetween(owesRef, nextRef)
 		}
 		s.Phase = phaseOf(s)
 		return s
@@ -171,7 +184,21 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			if !prevAt.IsZero() {
 				prior, _ := m["prior"].(string)
 				prevPrior = prior
-				out = append(out, Point{Session: id, Stop: stopOf(e.TS), Next: next, Entry: entry})
+				out = append(out, Point{Session: id, Stop: stopOf(e.TS, e.Ref), Next: next, Entry: entry})
+			}
+		}
+		if (r == "agent" || r == "call" || r == "apierr" || r == "synthetic") && !owes.IsZero() && e.TS.Sub(owes) >= stallFloor {
+			// the wait ended after a long time without an input: the model's reply, or a reopening that closed the
+			// turn. What the stalled rule would have done is the point.
+			st := stopOf(e.TS, e.Ref)
+			st.Working, st.Busy, st.Error = true, false, ""
+			st.Phase = phaseOf(st)
+			next := Next{At: e.TS, Kind: "self", Text: "the model's reply"}
+			if r == "synthetic" {
+				next = Next{At: e.TS, Kind: "owner", InputKind: "restart", Text: "the session was reopened"}
+			}
+			if r != "synthetic" || !st.RequestAt.IsZero() {
+				out = append(out, Point{Session: id, Stop: st, Next: next, Entry: entry, Waiting: true})
 			}
 		}
 		why, _ := m["why"].(string)
@@ -275,11 +302,92 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		if r == "owner" || r == "self" || r == "interrupt" || r == "momentum" {
 			prevPrior = ""
 		}
+		switch {
+		case r == "owner" || r == "self" || r == "momentum", r == "result" && len(pending) == 0:
+			owes, owesRef = e.TS, e.Ref
+		case r == "agent" || r == "call" || r == "apierr" || r == "interrupt" || r == "synthetic":
+			owes, owesRef = time.Time{}, ""
+		}
 	}
 	if !prevAt.IsZero() {
-		out = append(out, Point{Session: id, Stop: stopOf(until), Next: Next{Kind: "none"}, Entry: entry})
+		out = append(out, Point{Session: id, Stop: stopOf(until, ""), Next: Next{Kind: "none"}, Entry: entry})
 	}
 	return out
+}
+
+// requestLimit bounds how much of a transcript requestBetween reads between two events.
+const requestLimit = 8 << 20
+
+// requestBetween is the model request a turn still waited on between two of its events, by Claude Code's
+// api-request records in the transcript between their places (Ref: path@offset#index): the last request, when
+// no record of the conversation answered it, as the session layer reads them. Zero when the transcript is gone,
+// predates those records, or holds no request there. to "" reads to the transcript's end.
+func requestBetween(from, to string) time.Time {
+	path, off, ok := refPlace(from)
+	if !ok {
+		return time.Time{}
+	}
+	end := int64(-1)
+	if to != "" {
+		p2, o2, ok := refPlace(to)
+		if !ok || p2 != path || o2 < off {
+			return time.Time{}
+		}
+		end = o2
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return time.Time{}
+	}
+	defer f.Close()
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
+		return time.Time{}
+	}
+	var r io.Reader = f
+	if end >= 0 {
+		r = io.LimitReader(f, end-off)
+	}
+	rd := bufio.NewReaderSize(io.LimitReader(r, requestLimit), 1<<16)
+	var req time.Time
+	for {
+		raw, err := rd.ReadBytes('\n')
+		if len(raw) > 0 {
+			var e struct {
+				Type      string `json:"type"`
+				Subtype   string `json:"subtype"`
+				Timestamp string `json:"timestamp"`
+				IsMeta    bool   `json:"isMeta"`
+				Sidechain bool   `json:"isSidechain"`
+			}
+			if json.Unmarshal(raw, &e) == nil && !e.Sidechain {
+				at, _ := time.Parse(time.RFC3339Nano, e.Timestamp)
+				switch {
+				case e.Type == "api-request":
+					req = at
+				case req.IsZero(), !at.IsZero() && at.Before(req):
+				case e.Type == "assistant", e.Type == "user" && !e.IsMeta, e.Type == "system" && e.Subtype != "informational":
+					req = time.Time{}
+				}
+			}
+		}
+		if err != nil {
+			return req
+		}
+	}
+}
+
+// refPlace splits an event's Ref (path@offset#index) into its transcript and the offset of its record.
+func refPlace(ref string) (string, int64, bool) {
+	at := strings.LastIndexByte(ref, '@')
+	if at < 0 {
+		return "", 0, false
+	}
+	path, rest := ref[:at], ref[at+1:]
+	if i := strings.IndexByte(rest, '#'); i >= 0 {
+		rest = rest[:i]
+	}
+	off, err := strconv.ParseInt(rest, 10, 64)
+	return path, off, err == nil
 }
 
 // whole is an event's summary with its record's line in the transcript (Ref: path@offset#index) after it, read

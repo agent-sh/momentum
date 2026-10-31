@@ -1,6 +1,7 @@
 // Package supervise keeps the owner's agent sessions moving without him: a session that stopped on a transient
-// API error, a login or a usage limit, a reopening after a restart, a Hermes output cutoff, or a turn that ended
-// on a promise nothing will wake it for gets the message that continues it. Deterministic rules decide; no
+// API error, a login or a usage limit, a reopening after a restart, a Hermes output cutoff, a model request that
+// never got its reply, or a turn that ended on a promise nothing will wake it for gets the message that continues
+// it. Deterministic rules decide; no
 // model takes part. Each rule is a small function of a Stop, and the replay runs the same functions over the
 // store's history to measure them.
 package supervise
@@ -19,11 +20,12 @@ const (
 	RuleAccess    = "access"    // the turn ended on a login, a usage limit or an organization block: resume once access is back
 	RuleCutoff    = "cutoff"    // Hermes stopped at the model's output limit and asks for `continue`
 	RuleReopened  = "reopened"  // the session was reopened after it ended mid-task and sits idle
+	RuleStalled   = "stalled"   // a Claude Code turn waits on a model request that never got its reply
 	RulePromise   = "promise"   // the turn ended on a promise or a step it announced, and nothing will wake it
 )
 
 // Rules lists them in order.
-var Rules = []string{RuleTransient, RuleAccess, RuleCutoff, RuleReopened, RulePromise}
+var Rules = []string{RuleTransient, RuleAccess, RuleCutoff, RuleReopened, RuleStalled, RulePromise}
 
 // Verdicts.
 const (
@@ -53,6 +55,9 @@ type Stop struct {
 	WakeAt          time.Time
 	Loop            string
 	ResumedAt       time.Time // the harness reopened the session after it ended mid-task, and nothing happened since
+	RequestAt       time.Time // the model request the open turn still waits on: nothing answered it since
+	Queued          int       // messages its user typed while the turn ran, which the harness holds
+	Woke            time.Time // when the machine last woke from a suspend: a wait counts from it when it came later
 	OwnerAt         time.Time // when the owner was last at the session: his last turn, or his opening it
 	Started         time.Time // when the session's process started; a stop before it is a past process's
 }
@@ -76,6 +81,8 @@ type Params struct {
 	CutoffWait   time.Duration
 	CutoffTries  int
 	ReopenWait   time.Duration
+	StalledWait  time.Duration // stalled: past the longest a reply legitimately takes to begin
+	StalledTries int
 	PromiseWait  time.Duration
 	PromiseTries int           // promise: messages without an owner turn in between
 	Stale        time.Duration // a rule whose time came longer ago than this does not act: the stop is past
@@ -91,6 +98,8 @@ var DefaultParams = Params{
 	CutoffWait:   2 * time.Minute,
 	CutoffTries:  3,
 	ReopenWait:   2 * time.Minute,
+	StalledWait:  30 * time.Minute,
+	StalledTries: 2,
 	PromiseWait:  17 * time.Minute,
 	PromiseTries: 2,
 	Stale:        time.Hour,
@@ -140,11 +149,27 @@ func Plan(s Stop, tries Tries, p Params, probe Probe) Decision {
 	return planRules(s, tries, p, probe)
 }
 
+// ruleFuncs are the rules, in Rules order.
+var ruleFuncs = map[string]func(Stop, Tries, Params, Probe) (Decision, bool){RuleTransient: transient, RuleAccess: access,
+	RuleCutoff: cutoff, RuleReopened: reopened, RuleStalled: stalled, RulePromise: promise}
+
 // planRules is the first rule that applies to a stop, past the guards, with the time it acts, held while the
 // owner typed into the session recently.
 func planRules(s Stop, tries Tries, p Params, probe Probe) Decision {
-	for _, rule := range []func(Stop, Tries, Params, Probe) (Decision, bool){transient, access, cutoff, reopened, promise} {
-		d, ok := rule(s, tries, p, probe)
+	return planWith(Rules, s, tries, p, probe)
+}
+
+// PlanOnly is Plan with one rule: the replay's stops whose turn went on to its reply are the stalled rule's alone.
+func PlanOnly(rule string, s Stop, tries Tries, p Params, probe Probe) Decision {
+	if d, never := guard(s); never {
+		return d
+	}
+	return planWith([]string{rule}, s, tries, p, probe)
+}
+
+func planWith(rules []string, s Stop, tries Tries, p Params, probe Probe) Decision {
+	for _, name := range rules {
+		d, ok := ruleFuncs[name](s, tries, p, probe)
 		if !ok {
 			continue
 		}
@@ -260,6 +285,31 @@ func reopened(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
 	}
 	text := Marker + " This session was reopened after it ended mid-task. Check what the interrupted work left behind, then continue where you left off."
 	return wait(RuleReopened, at.Add(p.ReopenWait), 1, text, "reopened after it ended mid-task"), true
+}
+
+// StalledText is the stalled rule's message. Nothing of the stall rides in it, so it is the same every time.
+const StalledText = Marker + " Your last request to the model got no reply. Continue where you left off."
+
+// stalled: a Claude Code turn waits on a model request that never got its reply: the last record of its
+// conversation is the request, and no tool call is in flight. Background work does not answer the model: its
+// notification waits in the queue behind the turn. Past the longest a reply legitimately takes to begin, counted
+// from the request or from the machine waking after it, the message goes in as the next prompt, and Escape ends
+// the turn that waits (act's Interrupt); a turn the harness already took back gets the message as any idle
+// session does. A message its user queued waits for him.
+func stalled(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
+	if s.Tool != "claude" || s.RequestAt.IsZero() || !s.Working || s.Busy || s.Queued > 0 ||
+		!s.Started.IsZero() && s.RequestAt.Before(s.Started) {
+		return Decision{}, false
+	}
+	n := tries[RuleStalled]
+	if n >= p.StalledTries {
+		return used(RuleStalled, n), true
+	}
+	from, why := s.RequestAt, "a model request with no reply since "+s.RequestAt.Local().Format("15:04")
+	if s.Woke.After(from) {
+		from, why = s.Woke, why+"; the machine was suspended, and woke at "+s.Woke.Local().Format("15:04")
+	}
+	return wait(RuleStalled, from.Add(p.StalledWait), n+1, StalledText, why), true
 }
 
 // promise: the turn ended, nothing is in flight or scheduled to wake it, and its last words promise to come back

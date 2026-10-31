@@ -19,6 +19,10 @@ import (
 type typist struct{ sent []string }
 
 func (t *typist) Check(context.Context, act.Target) (act.Path, error) { return act.Tmux, nil }
+func (t *typist) Interrupt(_ context.Context, _ act.Target, text string) (act.Path, error) {
+	t.sent = append(t.sent, text)
+	return act.Tmux, nil
+}
 func (t *typist) Send(_ context.Context, _ act.Target, text string) (act.Path, error) {
 	t.sent = append(t.sent, text)
 	return act.Tmux, nil

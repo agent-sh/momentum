@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -103,7 +104,13 @@ type track struct {
 	UserAt   time.Time        `json:"user_at,omitzero"`    // when user-role text last opened a turn
 	Control  time.Time        `json:"control_at,omitzero"` // when its user last ran a local command, interrupted or answered
 	Resumed  time.Time        `json:"resumed,omitzero"`    // a resume record since which nothing else happened
-	log      sessions.Log
+	// Request is when the turn sent the model request it still waits on: the last record of the conversation is
+	// Claude Code's record of that request, and no reply, error or input has come after it.
+	Request time.Time `json:"request,omitzero"`
+	// Queue is what Claude Code holds to send when the turn allows, oldest first (queueKey): a message its user
+	// typed by its text, "" for anything else it queued (a task's notification).
+	Queue []string `json:"queue,omitempty"`
+	log   sessions.Log
 }
 
 func newTrack() track {
@@ -179,6 +186,9 @@ type block struct {
 
 type line struct {
 	Type         string `json:"type"`
+	Subtype      string `json:"subtype"`   // a system record's kind: informational, turn_duration, api_error, ...
+	Operation    string `json:"operation"` // a queue operation: enqueue, dequeue, remove, popAll
+	Content      any    `json:"content"`   // a queue operation's message, a system record's text
 	IsSidechain  bool   `json:"isSidechain"`
 	IsMeta       bool   `json:"isMeta"`
 	Compact      bool   `json:"isCompactSummary"`
@@ -217,6 +227,7 @@ func (t *Tracker) line(raw []byte) {
 		return
 	}
 	at, _ := time.Parse(time.RFC3339Nano, e.Timestamp)
+	t.answered(e, at)
 	if e.Message == nil {
 		// Notifications that arrive mid-turn are queued: recorded as queue operations and attachments.
 		if (e.Type == "queue-operation" || e.Type == "attachment") && bytes.Contains(raw, []byte("<task-notification>")) {
@@ -229,6 +240,12 @@ func (t *Tracker) line(raw []byte) {
 			json.Unmarshal(raw, &q)
 			t.notified(text.FirstNonEmpty(q.Content, q.Attachment.Prompt), at)
 		}
+		switch e.Type {
+		case "api-request":
+			t.st.Request = at
+		case "queue-operation":
+			t.queued(e)
+		}
 		return
 	}
 	switch e.Type {
@@ -237,6 +254,64 @@ func (t *Tracker) line(raw []byte) {
 	case "user":
 		t.user(e, at)
 	}
+}
+
+// answered clears the request the turn waits on when a record of the conversation follows it: a reply or an
+// error (any assistant record), an input (a user record the harness did not inject: a prompt, a tool's result,
+// an interruption, a notification), or a system record other than a notice (the turn's end, a retry's error). A
+// record dated before the request was part of it, written after it: Claude Code writes the request's own prompt
+// or notification so. A notice (a plugin reload, an attachment, a link) answers nothing.
+func (t *Tracker) answered(e line, at time.Time) {
+	if t.st.Request.IsZero() || !at.IsZero() && at.Before(t.st.Request) {
+		return
+	}
+	switch {
+	case e.Type == "assistant", e.Type == "user" && !e.IsMeta, e.Type == "system" && e.Subtype != "informational":
+		t.st.Request = time.Time{}
+	}
+}
+
+// queued follows Claude Code's queue of what it sends when the turn allows: a message its user typed while the turn
+// ran, or a task's notification. An enqueue names what it adds; a dequeue takes the oldest; a remove names what
+// it takes, or takes the oldest; popAll takes everything back to the input line.
+func (t *Tracker) queued(e line) {
+	st := &t.st
+	content, _ := e.Content.(string)
+	key := queueKey(content)
+	switch e.Operation {
+	case "enqueue":
+		st.Queue = append(st.Queue, key)
+	case "dequeue", "remove":
+		i := 0
+		if e.Operation == "remove" && content != "" {
+			i = slices.Index(st.Queue, key)
+		}
+		if i >= 0 && i < len(st.Queue) {
+			st.Queue = slices.Delete(st.Queue, i, i+1)
+		}
+	case "popAll":
+		st.Queue = nil
+	}
+}
+
+// queueKey is how the queue keeps an item: a message its user typed by its text, folded and cut; anything else
+// Claude Code queues (a task's notification, an item named by reference) as "".
+func queueKey(content string) string {
+	if strings.Contains(content, "<task-notification>") {
+		return ""
+	}
+	return text.OneLine(content, 200)
+}
+
+// typedQueued counts the messages its user typed that wait in the queue.
+func (t *Tracker) typedQueued() int {
+	n := 0
+	for _, k := range t.st.Queue {
+		if k != "" {
+			n++
+		}
+	}
+	return n
 }
 
 func (t *Tracker) assistant(e line, at time.Time) {
@@ -459,8 +534,12 @@ func (t *Tracker) close(id string) {
 	delete(t.st.Tasks, id)
 }
 
-// TurnOpen reports whether the model owes a response, or a tool it called has not returned.
+// TurnOpen reports whether the model owes a response, or a tool it called has not returned. A request the turn
+// sent and still waits on keeps it open, whatever opened it: a slash command's prompt is no user text of its own.
 func (t *Tracker) TurnOpen() bool {
+	if !t.st.Request.IsZero() {
+		return true
+	}
 	switch t.st.LastMain {
 	case "user":
 		return true
@@ -591,6 +670,7 @@ func (t *Tracker) Facts(s *sessions.Session, now time.Time) {
 	s.Tasks = t.live(s.Started, now)
 	s.LastText = strings.TrimSpace(t.st.LastText)
 	s.UserAt, s.ControlAt, s.ResumedAt = t.st.UserAt, t.st.Control, t.st.Resumed
+	s.RequestAt, s.Queued = t.st.Request, t.typedQueued()
 	if s.Model == "" {
 		s.Model = t.st.Model
 	}

@@ -15,11 +15,17 @@ import (
 	"github.com/agent-sh/momentum/sessions/act"
 )
 
-// fakeSender records what it is asked to send. check is what the terminal check returns, send what sending does.
+// fakeSender records what it is asked to send. check is what the terminal check returns, send what sending does,
+// interrupt what an interrupt does.
 type fakeSender struct {
-	sent        []string
-	check, send error
-	checks      int
+	sent                   []string
+	check, send, interrupt error
+	checks                 int
+}
+
+func (f *fakeSender) Interrupt(_ context.Context, t act.Target, text string) (act.Path, error) {
+	f.sent = append(f.sent, t.Pane+" interrupt "+text)
+	return act.Tmux, f.interrupt
 }
 
 func (f *fakeSender) Check(_ context.Context, t act.Target) (act.Path, error) {

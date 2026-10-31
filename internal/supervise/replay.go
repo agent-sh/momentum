@@ -157,6 +157,9 @@ func Replay(points []Point, labels []Label, p Params, probe Probe, until time.Ti
 	var out []Result
 	for _, pt := range points {
 		d := Plan(pt.Stop, Tries{}, p, probe)
+		if pt.Waiting {
+			d = PlanOnly(RuleStalled, pt.Stop, Tries{}, p, probe)
+		}
 		r := Result{Point: pt, Decision: d, Label: labelOf(pt)}
 		end := pt.Next.At
 		if pt.Next.Kind == "none" {
