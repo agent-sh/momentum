@@ -93,8 +93,8 @@ func TestReplayLeavesWakeupsTheTranscriptShowsEnded(t *testing.T) {
 func TestReplayRestoresJobsAcrossAReopening(t *testing.T) {
 	inUTCHere(t)
 	st := testStore(t)
-	// The session ends mid-task and is reopened: the durable job is restored, and its runs never start; the
-	// session-only one died with the process.
+	// The session ends mid-task and is reopened: the job is restored, durable or session-only, and its runs never
+	// start.
 	for _, j := range []struct{ session, input, out string }{
 		{"durable", `{"cron":"*/10 * * * *","prompt":"check the deploy","durable":true}`, "Scheduled recurring job j1 (Every 10 minutes). Next run: 10:10. Persisted to .claude/scheduled_tasks.json."},
 		{"session-only", `{"cron":"*/10 * * * *","prompt":"check the deploy"}`, "Scheduled recurring job j1 (Every 10 minutes). Next run: 10:10. Session-only (not written to disk, dies when Claude exits)."},
@@ -105,7 +105,8 @@ func TestReplayRestoresJobsAcrossAReopening(t *testing.T) {
 			say(time.Second, "Back.").owner(time.Hour, "status?", "turn_duration")
 		b.put(st)
 	}
-	if acted := overdueActs(t, st, t0.Add(3*time.Hour)); len(acted) != 1 || acted[0].Point.Session != "durable" || !strings.HasPrefix(acted[0].Point.Stop.WakeKey, "job:j1@") {
+	acted := overdueActs(t, st, t0.Add(3*time.Hour))
+	if len(acted) != 2 || !strings.HasPrefix(acted[0].Point.Stop.WakeKey, "job:j1@") || !strings.HasPrefix(acted[1].Point.Stop.WakeKey, "job:j1@") {
 		t.Fatalf("acted %s", fmt.Sprint(acted))
 	}
 	// A one-shot whose time came before the reopening is not restored.
@@ -171,23 +172,48 @@ func TestReplayTakesANoticeAfterTheTimeForASign(t *testing.T) {
 }
 
 func TestReplayTakesANewVersionForARestart(t *testing.T) {
-	inUTCHere(t)
 	st := testStore(t)
 	r := newRecorded(t, "upgraded")
-	r.event(0, map[string]any{"type": "user", "version": "2.1.300", "message": map[string]any{"content": "check the deploy every 10 minutes"}},
-		"owner_text", store.ActorOwner, "", "check the deploy every 10 minutes", `{"input_kind":"typed"}`)
-	r.event(time.Second, map[string]any{"type": "assistant", "version": "2.1.300", "message": map[string]any{"content": []any{map[string]any{"type": "tool_use", "id": "tc1",
-		"name": "CronCreate", "input": map[string]any{"cron": "*/10 * * * *", "prompt": "check the deploy"}}}}},
-		"tool_call", store.ActorAgent, "CronCreate", `{"cron":"*/10 * * * *","prompt":"check the deploy"}`, `{"tool_id":"tc1"}`)
-	out := "Scheduled recurring job j1 (Every 10 minutes). Next run: 10:10. Session-only (not written to disk, dies when Claude exits)."
-	r.event(time.Second, map[string]any{"type": "user", "version": "2.1.300", "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "tc1", "content": out}}}},
-		"tool_result", store.ActorTool, "CronCreate", out, `{"tool_id":"tc1"}`)
-	// The owner restarts the session on a newer Claude Code: the session-only job died, and no run of it comes.
-	r.event(5*time.Minute, map[string]any{"type": "user", "version": "2.1.316", "message": map[string]any{"content": "status?"}},
+	line := func(after time.Duration, v map[string]any, kind string, actor store.Actor, tool, summary, meta string) {
+		v["version"] = "2.1.300"
+		r.event(after, v, kind, actor, tool, summary, meta)
+	}
+	line(0, map[string]any{"type": "user", "message": map[string]any{"content": "watch the soak"}}, "owner_text", store.ActorOwner, "", "watch the soak", `{"input_kind":"typed"}`)
+	line(time.Second, map[string]any{"type": "assistant", "message": map[string]any{"content": []any{map[string]any{"type": "tool_use", "id": "tw1",
+		"name": "ScheduleWakeup", "input": map[string]any{"delaySeconds": 1800, "reason": "check the soak run"}}}}},
+		"tool_call", store.ActorAgent, "ScheduleWakeup", `{"delaySeconds":1800,"reason":"check the soak run"}`, `{"tool_id":"tw1"}`)
+	out := "Next wakeup scheduled for 10:30:03 (in 1800s)."
+	line(time.Second, map[string]any{"type": "user", "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "tw1", "content": out}}}},
+		"tool_result", store.ActorTool, "ScheduleWakeup", out, `{"tool_id":"tw1"}`)
+	line(5*time.Minute, map[string]any{"type": "system", "subtype": "compact_boundary"}, "compaction", store.ActorHarness, "", "summary", "")
+	// The owner restarts the session on a newer Claude Code: the restart in the foreground lost the wakeup.
+	r.event(time.Minute, map[string]any{"type": "user", "version": "2.1.316", "message": map[string]any{"content": "status?"}},
 		"owner_text", store.ActorOwner, "", "status?", `{"input_kind":"typed"}`)
 	r.event(time.Second, map[string]any{"type": "assistant", "version": "2.1.316", "message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "Fine."}}}},
 		"agent_text", store.ActorAgent, "", "Fine.", "")
 	r.owner(time.Hour, "anything else?")
+	r.put(st)
+	if acted := overdueActs(t, st, t0.Add(3*time.Hour)); len(acted) != 0 {
+		t.Fatalf("acted %s", fmt.Sprint(acted))
+	}
+}
+
+func TestReplayListsNoRunsOfAVersionThatRecordsNone(t *testing.T) {
+	inUTCHere(t)
+	st := testStore(t)
+	r := newRecorded(t, "old")
+	line := func(after time.Duration, v map[string]any, kind string, actor store.Actor, tool, summary, meta string) {
+		v["version"] = "2.1.284"
+		r.event(after, v, kind, actor, tool, summary, meta)
+	}
+	line(0, map[string]any{"type": "user", "message": map[string]any{"content": "check the deploy every 10 minutes"}}, "owner_text", store.ActorOwner, "", "check the deploy every 10 minutes", `{"input_kind":"typed"}`)
+	line(time.Second, map[string]any{"type": "assistant", "message": map[string]any{"content": []any{map[string]any{"type": "tool_use", "id": "tc1",
+		"name": "CronCreate", "input": map[string]any{"cron": "*/10 * * * *", "prompt": "check the deploy"}}}}},
+		"tool_call", store.ActorAgent, "CronCreate", `{"cron":"*/10 * * * *","prompt":"check the deploy"}`, `{"tool_id":"tc1"}`)
+	out := "Scheduled recurring job j1 (*/10 * * * *). Session-only (not written to disk, dies when Claude exits)."
+	line(time.Second, map[string]any{"type": "user", "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "tc1", "content": out}}}},
+		"tool_result", store.ActorTool, "CronCreate", out, `{"tool_id":"tc1"}`)
+	line(time.Hour, map[string]any{"type": "user", "message": map[string]any{"content": "status?"}}, "owner_text", store.ActorOwner, "", "status?", `{"input_kind":"typed"}`)
 	r.put(st)
 	if acted := overdueActs(t, st, t0.Add(3*time.Hour)); len(acted) != 0 {
 		t.Fatalf("acted %s", fmt.Sprint(acted))

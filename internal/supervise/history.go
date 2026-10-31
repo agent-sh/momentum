@@ -2,6 +2,7 @@ package supervise
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/agent-sh/momentum/internal/store"
@@ -122,7 +124,6 @@ type replayCron struct {
 	expr      string
 	at, fired time.Time
 	oneShot   bool
-	durable   bool
 	what      string
 	seen      bool
 }
@@ -131,7 +132,6 @@ type replayCron struct {
 // unless the prompt is a loop's own sentinel), and a CronCreate call's expression.
 type replayCall struct {
 	what, cron string
-	durable    bool
 }
 
 // callOf reads a ScheduleWakeup or a CronCreate call's input from its record in the transcript while it is there
@@ -166,7 +166,6 @@ func callOf(e store.Event, id string) replayCall {
 	}
 	str := func(k string) string { v, _ := in[k].(string); return v }
 	c := replayCall{cron: str("cron"), what: str("reason")}
-	c.durable, _ = in["durable"].(bool)
 	if c.what == "" && !strings.HasPrefix(strings.TrimSpace(str("prompt")), "<<") {
 		c.what = str("prompt")
 	}
@@ -246,28 +245,71 @@ type replayWake struct {
 }
 
 // recordsRunsAt reports whether the Claude Code that wrote an event's record records the scheduled runs it starts:
-// by the record's version while the transcript is there; true when it is gone, or the session showed a run's
-// record already.
+// by the record's version while the transcript is there; when it is gone, whether the session showed a run's
+// record already, else yes.
 func recordsRunsAt(e store.Event, firesSeen bool) bool {
-	if firesSeen {
-		return true
+	if v := versionAt(e.Ref); v != "" {
+		return claude.RecordsRuns(v)
 	}
-	v := versionAt(e.Ref)
-	return v == "" || claude.RecordsRuns(v)
+	return true
 }
 
-// versionAt is the Claude Code version that wrote an event's record, "" when its transcript is gone or the record
-// does not say.
+// versionAt is the Claude Code version that wrote an event's record (Ref: path@offset#index), "" when its
+// transcript is gone or the records do not say. Each transcript's versions are read once.
 func versionAt(ref string) string {
-	raw := recordAt(ref)
-	if raw == nil {
+	path, off, ok := refPlace(ref)
+	if !ok {
 		return ""
 	}
-	var rec struct {
-		Version string `json:"version"`
+	vs := versionsOf(path)
+	i := sort.Search(len(vs), func(i int) bool { return vs[i].off > off }) - 1
+	if i < 0 {
+		return ""
 	}
-	json.Unmarshal(raw, &rec)
-	return rec.Version
+	return vs[i].version
+}
+
+// versionChange is where a transcript's records start to carry a version.
+type versionChange struct {
+	off     int64
+	version string
+}
+
+var (
+	versionsMu sync.Mutex
+	versions   = map[string][]versionChange{}
+)
+
+// versionsOf is where the version in a transcript's records changes, in order, read once per transcript.
+func versionsOf(path string) []versionChange {
+	versionsMu.Lock()
+	defer versionsMu.Unlock()
+	if vs, ok := versions[path]; ok {
+		return vs
+	}
+	var vs []versionChange
+	if f, err := os.Open(path); err == nil {
+		rd := bufio.NewReaderSize(f, 1<<16)
+		var off int64
+		for {
+			line, err := rd.ReadBytes('\n')
+			if i := bytes.Index(line, []byte(`"version":"`)); i >= 0 {
+				rest := line[i+len(`"version":"`):]
+				if j := bytes.IndexByte(rest, '"'); j >= 0 {
+					if v := string(rest[:j]); len(vs) == 0 || vs[len(vs)-1].version != v {
+						vs = append(vs, versionChange{off: off, version: v})
+					}
+				}
+			}
+			off += int64(len(line))
+			if err != nil {
+				break
+			}
+		}
+		f.Close()
+	}
+	versions[path] = vs
+	return vs
 }
 
 // timeline turns one session's events into its points: one for each input, with the stop before it, and one
@@ -286,8 +328,8 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			wake.sign = sign
 		}
 	}
-	// restart is a new process: a restart in the foreground loses a pending wakeup, and a session-only job dies
-	// (JobRuns).
+	// restart is a new process: a restart in the foreground loses a pending wakeup; Claude Code restores the jobs,
+	// each from its first run after the restart (JobRuns).
 	restart := func(at time.Time) {
 		restarted, wake = at, replayWake{}
 	}
@@ -319,12 +361,12 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		}
 		s.TurnBegan, s.IdleAt = turnBegan, prevAt
 		// Its own runs its harness should start, as the session layer lists them, a reopening for a restart.
-		if !wake.at.IsZero() && (wake.seen || firesSeen) {
+		if !wake.at.IsZero() && wake.seen {
 			s.Runs = append(s.Runs, claude.WakeRun(wake.at, wake.set, wake.what, wake.sign))
 		}
 		for id, c := range crons {
-			if c.seen || firesSeen {
-				s.Runs = append(s.Runs, claude.JobRuns(id, c.expr, c.oneShot, c.durable, c.what, c.at, c.fired, restarted, at)...)
+			if c.seen {
+				s.Runs = append(s.Runs, claude.JobRuns(id, c.expr, c.oneShot, c.what, c.at, c.fired, restarted, at)...)
 			}
 		}
 		claude.SortRuns(s.Runs)
@@ -516,8 +558,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 				}
 				if g := hCron.FindStringSubmatch(s); g != nil && e.Tool == "CronCreate" {
 					c := calls[id]
-					crons[g[2]] = replayCron{expr: firstNonEmpty(c.cron, g[3]), at: e.TS, oneShot: g[1] == "one-shot", what: c.what, seen: recordsRunsAt(e, firesSeen),
-						durable: c.durable && !strings.Contains(s, "Session-only") || strings.Contains(s, "Persisted to")}
+					crons[g[2]] = replayCron{expr: firstNonEmpty(c.cron, g[3]), at: e.TS, oneShot: g[1] == "one-shot", what: c.what, seen: recordsRunsAt(e, firesSeen)}
 				}
 			}
 			lastMainUser = true

@@ -69,7 +69,7 @@ type task struct {
 type cron struct {
 	Label   string    `json:"label"`
 	Expr    string    `json:"expr,omitempty"`    // what it runs on: CronCreate's input, or the label where a version wrote it
-	Durable bool      `json:"durable,omitempty"` // written to disk: a restart restores it; a session-only one dies with its process
+	Version string    `json:"version,omitempty"` // the Claude Code version that made it
 	At      time.Time `json:"at"`
 	OneShot bool      `json:"one_shot,omitempty"`
 	For     string    `json:"for,omitempty"`  // the prompt it runs
@@ -83,7 +83,6 @@ type call struct {
 	Type  string    `json:"type,omitempty"`  // an Agent call's subagent type
 	For   string    `json:"for,omitempty"`   // what a wakeup or a scheduled job is for: its reason, else its prompt
 	Cron  string    `json:"cron,omitempty"`  // a CronCreate call's expression
-	Kept  bool      `json:"kept,omitempty"`  // a CronCreate call that asked for a durable job
 	At    time.Time `json:"at"`
 }
 
@@ -118,6 +117,7 @@ type track struct {
 	WakeSign  string          `json:"wake_sign,omitempty"`
 	TurnBegan time.Time       `json:"turn_began,omitzero"` // when the last turn began: an input, not the model's own record
 	TurnEnd   time.Time       `json:"turn_end,omitzero"`   // when the last turn ended
+	RanAt     time.Time       `json:"ran_at,omitzero"`     // when a scheduled run of its own last started
 	Crons     map[string]cron `json:"crons"`
 	Model     string          `json:"model"`
 	UserAt    time.Time       `json:"user_at,omitzero"`    // when user-role text last opened a turn
@@ -324,7 +324,7 @@ func (t *Tracker) fired(raw []byte, at time.Time) {
 	}
 	json.Unmarshal(raw, &f)
 	st := &t.st
-	st.TurnBegan = at // the run's prompt opens a turn, recorded as the harness's own
+	st.TurnBegan, st.RanAt = at, at // the run's prompt opens a turn, recorded as the harness's own
 	if c, job := st.Crons[f.TaskID]; job {
 		if c.OneShot {
 			delete(st.Crons, f.TaskID) // it fires once, then deletes itself
@@ -364,11 +364,11 @@ func wakeFor(reason, prompt string) string {
 	return prompt
 }
 
-// Bounds on a job's runs a scan lists: one that came due longer ago than runsBack is past any rule, and a job lists
-// at most runsMax.
+// Bounds on a job's runs a scan lists: those of the last runsBack, past which no rule acts (the stale hour, the
+// slack and the most Claude Code delays a run), and at most runsMax, one a minute.
 const (
-	runsBack = 6 * time.Hour
-	runsMax  = 64
+	runsBack = 2 * time.Hour
+	runsMax  = 150
 )
 
 // runs are the session's own runs its harness should start, earliest first and the same on every scan: the
@@ -386,7 +386,9 @@ func (t *Tracker) runs(started, now time.Time) []sessions.Run {
 		out = append(out, WakeRun(st.WakeAt, st.WakeSet, st.WakeFor, st.WakeSign))
 	}
 	for id, c := range st.Crons {
-		out = append(out, JobRuns(id, text.FirstNonEmpty(c.Expr, c.Label), c.OneShot, c.Durable, c.For, c.At, c.Fired, started, now)...)
+		if RecordsRuns(text.FirstNonEmpty(c.Version, st.Version)) { // one an older version made shows none of its runs
+			out = append(out, JobRuns(id, text.FirstNonEmpty(c.Expr, c.Label), c.OneShot, c.For, c.At, c.Fired, started, now)...)
+		}
 	}
 	SortRuns(out)
 	return out
@@ -425,12 +427,10 @@ func WakeRun(at, set time.Time, what, sign string) sessions.Run {
 }
 
 // JobRuns are a job's runs as runs does: made at made on the expression expr, last run at fired, in a process
-// that started at started (zero when not known). A session-only job made before that died with its process.
-func JobRuns(id, expr string, oneShot, durable bool, what string, made, fired, started, now time.Time) []sessions.Run {
+// that started at started (zero when not known). Claude Code restores a session's jobs when it resumes it: a
+// recurring one runs from its first run after the restart, a one-shot only before its time.
+func JobRuns(id, expr string, oneShot bool, what string, made, fired, started, now time.Time) []sessions.Run {
 	key := func(run time.Time) string { return fmt.Sprintf("job:%s@%d", id, run.UnixMilli()) }
-	if !durable && !started.IsZero() && made.Before(started) {
-		return nil
-	}
 	if oneShot {
 		if run, _, ok := ScheduledRun(expr, made); ok && (started.IsZero() || !run.Before(started)) {
 			return []sessions.Run{{Due: run, For: what, Key: key(run), Job: true, Once: true}}
@@ -440,19 +440,19 @@ func JobRuns(id, expr string, oneShot, durable bool, what string, made, fired, s
 	if now.Sub(made) > cronExpiry {
 		return nil
 	}
-	after, ran := made, false
+	after := made
 	if fired.After(after) {
-		after, ran = fired, true
+		after = fired
 	}
 	if !started.IsZero() && after.Before(started) {
-		after, ran = started, false // a restored job does not run for the runs it missed
+		after = started // a restored job does not run for the runs it missed
 	}
 	if back := now.Add(-runsBack); after.Before(back) {
-		after, ran = back, false
+		after = back
 	}
 	var out []sessions.Run
 	for range runsMax {
-		run, last, ok := jobRun(expr, after, ran)
+		run, last, ok := jobRun(expr, after)
 		if !ok {
 			break
 		}
@@ -460,7 +460,7 @@ func JobRuns(id, expr string, oneShot, durable bool, what string, made, fired, s
 		if !last.Before(now) {
 			break // its next run
 		}
-		after, ran = run, true // it never started; the next is spaced from it
+		after = run // it never started; the next is spaced from it
 	}
 	return out
 }
@@ -476,9 +476,10 @@ func SortRuns(rs []sessions.Run) {
 }
 
 // jobRun is a recurring job's run after after, and the latest it starts. A job every five minutes runs 4 minutes
-// 45 seconds after its last run, on time; any other on its schedule, delayed up to the most Claude Code delays it.
-func jobRun(expr string, after time.Time, ran bool) (run, latest time.Time, ok bool) {
-	if ran && strings.Join(strings.Fields(expr), " ") == "*/5 * * * *" {
+// 45 seconds after its last run, or after it was made or restored, on time; any other on its schedule, delayed up
+// to the most Claude Code delays it.
+func jobRun(expr string, after time.Time) (run, latest time.Time, ok bool) {
+	if strings.Join(strings.Fields(expr), " ") == "*/5 * * * *" {
 		run = after.Add(fiveMinuteGap)
 		return run, run, true
 	}
@@ -590,7 +591,6 @@ func (t *Tracker) assistant(e line, at time.Time, open bool) {
 			}
 			if b.Name == "CronCreate" {
 				c.Cron = text.Str(in["cron"])
-				c.Kept, _ = in["durable"].(bool)
 			}
 			st.Calls[b.ID] = c
 			st.Group = append(st.Group, b.ID)
@@ -769,8 +769,7 @@ func (t *Tracker) result(b block, at time.Time) {
 		if expr == "" {
 			expr = m[3] // a version that wrote the expression in its result
 		}
-		st.Crons[m[2]] = cron{Label: m[3], Expr: expr, At: at, OneShot: m[1] == "one-shot", For: c.For,
-			Durable: c.Kept && !strings.Contains(out, "Session-only") || strings.Contains(out, "Persisted to")}
+		st.Crons[m[2]] = cron{Label: m[3], Expr: expr, At: at, OneShot: m[1] == "one-shot", For: c.For, Version: st.Version}
 	}
 	st.log.Add(sessions.Entry{Role: sessions.RoleOut, Text: text.OneLine(out, 160)})
 }
@@ -923,15 +922,15 @@ func (t *Tracker) Facts(s *sessions.Session, now time.Time) {
 		s.Model = t.st.Model
 	}
 	s.Runs = t.runs(s.Started, now)
-	s.TurnBegan, s.IdleSince = t.st.TurnBegan, t.st.TurnEnd
+	s.TurnBegan, s.IdleSince, s.RanAt = t.st.TurnBegan, t.st.TurnEnd, t.st.RanAt
 	if t.liveWake(s.Started) && t.st.WakeAt.After(now.Add(-sessions.WakeGrace)) {
 		s.WakeAt = t.st.WakeAt
 	}
 	var newest time.Time
 	newestID := ""
 	for id, c := range t.st.Crons {
-		if (!c.Durable && !s.Started.IsZero() && c.At.Before(s.Started)) || now.Sub(c.At) > cronExpiry || (c.OneShot && now.Sub(c.At) > oneShotExpiry) {
-			continue // a session-only job of an earlier process, or one that expired
+		if now.Sub(c.At) > cronExpiry || (c.OneShot && now.Sub(c.At) > oneShotExpiry) {
+			continue // one that expired: a restart restores the others
 		}
 		if c.At.After(newest) || c.At.Equal(newest) && id > newestID {
 			newest, newestID, s.Loop = c.At, id, c.Label

@@ -88,6 +88,18 @@ func TestTheRuleReadsTheEarliestRunNoResyncWentInFor(t *testing.T) {
 	if st.WakeKey != "second" || !st.WakeDue.Equal(due.Add(10*time.Minute)) {
 		t.Fatalf("after its resync: chose %q due %v", st.WakeKey, st.WakeDue)
 	}
+	// A wakeup with no sign that it was lost is one the rule would not act on: it hides no job's run.
+	quiet := Stop{Runs: []sessions.Run{{Due: due.Add(-time.Minute), Key: "wakeup@1"}, run(due, "job")}}
+	quiet.Choose(func(string) bool { return false }, due.Add(20*time.Minute), DefaultParams)
+	if quiet.WakeKey != "job" {
+		t.Fatalf("behind a wakeup with no sign: chose %q", quiet.WakeKey)
+	}
+	// A run the machine slept through counts from the wake, though its time came over the stale hour before.
+	slept := Stop{Runs: []sessions.Run{run(due, "slept")}, Slept: due.Add(-time.Minute), Woke: due.Add(2 * time.Hour)}
+	slept.Choose(func(string) bool { return false }, due.Add(2*time.Hour+10*time.Minute), DefaultParams)
+	if slept.WakeKey != "slept" {
+		t.Fatalf("after a long suspend: chose %q", slept.WakeKey)
+	}
 }
 
 // soakLoop writes a synthetic self-paced loop: the turn sets a wakeup and ends; its owner prompts before the
@@ -370,5 +382,79 @@ func TestASuspendThroughAWakeupsTimeIsItsSign(t *testing.T) {
 	run(t, sv, scan(now))
 	if len(f.sent) != 1 || !strings.Contains(f.sent[0], "did not fire") {
 		t.Fatalf("sent %q", f.sent)
+	}
+}
+
+func TestADryRecordDoesNotHoldARuleGoneLive(t *testing.T) {
+	_, due, scan := soakLoop(t, notification)
+	st := testStore(t)
+	f := &fakeSender{}
+	now := due.Add(10 * time.Minute)
+	sv := liveOverdue(st, f, &now)
+	sv.Live = nil
+	run(t, sv, scan(now))
+	if len(f.sent) != 0 || len(events(t, st, KindAct)) != 1 {
+		t.Fatalf("dry: sent %q acts %+v", f.sent, events(t, st, KindAct))
+	}
+	// The owner names it live: the run its dry record was about gets its resync.
+	sv.Live = map[string]bool{"overdue": true}
+	now = now.Add(time.Minute)
+	run(t, sv, scan(now))
+	if len(f.sent) != 1 {
+		t.Fatalf("live: sent %q", f.sent)
+	}
+}
+
+func TestARunThatStartsStartsTheCountAgain(t *testing.T) {
+	h := past{sends: []sent{{at: t0, rule: RuleOverdue}, {at: t0.Add(time.Hour), rule: RuleOverdue}}}
+	if n := h.tries(time.Time{})[RuleOverdue]; n != 2 {
+		t.Fatalf("tries %d", n)
+	}
+	// A run of its own started after both: the count starts again, as the engine reads it from the stop.
+	if n := h.tries(t0.Add(2 * time.Hour))[RuleOverdue]; n != 0 {
+		t.Fatalf("since the run: tries %d", n)
+	}
+}
+
+// TestARunThatStartsBetweenResyncsStartsTheCountAgain runs a job through the real tracker: a run is lost, the next
+// one starts, and a later one is lost again: its resync is a first try.
+func TestARunThatStartsBetweenResyncsStartsTheCountAgain(t *testing.T) {
+	inUTCHere(t)
+	x := &transcript{t: t, path: filepath.Join(t.TempDir(), "s1.jsonl"), at: t0}
+	x.user("check the deploy every 10 minutes").
+		add(map[string]any{"type": "assistant", "message": map[string]any{"content": []any{map[string]any{"type": "tool_use", "id": "tc1",
+			"name": "CronCreate", "input": map[string]any{"cron": "*/10 * * * *", "prompt": "check the deploy"}}}}}).
+		add(map[string]any{"type": "user", "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "tc1",
+			"content": "Scheduled recurring job 7f3a9c21 (Every 10 minutes). Next run: 10:10."}}}}).
+		say("Checking.").add(map[string]any{"type": "system", "subtype": "turn_duration"})
+	tr := claude.NewTracker(x.path)
+	scan := func(now time.Time) *sessions.Session {
+		s := &sessions.Session{Key: "sess-deploy", Tool: "claude", Name: "deploy", Where: "work:4.1", Pane: "%7", PID: 42,
+			Transcript: x.path, Started: t0.Add(-time.Hour), Tasks: []sessions.Task{}}
+		tr.Facts(s, now)
+		s.TurnOpen = tr.TurnOpen()
+		sessions.Decide(s, now)
+		s.Since = x.at
+		return s
+	}
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0.Add(25 * time.Minute) // the 10:10 run never started
+	sv := liveOverdue(st, f, &now)
+	run(t, sv, scan(now))
+	if len(f.sent) != 1 {
+		t.Fatalf("sent %q", f.sent)
+	}
+	x.at = now
+	x.user(f.sent[0][strings.Index(f.sent[0], Marker):]).say("Checked.").add(map[string]any{"type": "system", "subtype": "turn_duration"})
+	// The 10:20 run starts late, at 10:26; the 10:30 run never does.
+	x.at = t0.Add(26 * time.Minute)
+	x.add(map[string]any{"type": "system", "subtype": "scheduled_task_fire", "taskId": "7f3a9c21", "content": "Running scheduled task"}).
+		add(map[string]any{"type": "user", "isMeta": true, "message": map[string]any{"content": "check the deploy"}}).
+		say("Checked.").add(map[string]any{"type": "system", "subtype": "turn_duration"})
+	now = t0.Add(45 * time.Minute)
+	run(t, sv, scan(now))
+	if len(f.sent) != 2 || strings.Contains(f.sent[1], "either") {
+		t.Fatalf("after a run started: sent %q", f.sent)
 	}
 }

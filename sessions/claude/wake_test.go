@@ -142,6 +142,14 @@ func TestAVersionThatRecordsNoRunsListsNone(t *testing.T) {
 	if s := x.facts(NewTracker(x.path), x.at.Add(time.Hour)); len(s.Runs) != 0 {
 		t.Fatalf("runs %+v", s.Runs)
 	}
+	// A session that moved to a version that records them lists the runs it sets since.
+	x.add(map[string]any{"type": "assistant", "message": map[string]any{"content": []any{map[string]any{"type": "tool_use", "id": "tu2",
+		"name": "ScheduleWakeup", "input": map[string]any{"delaySeconds": 1800, "reason": "check the soak run"}}}}})
+	x.add(map[string]any{"type": "user", "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "tu2",
+		"content": "Next wakeup scheduled for 10:30:06 (in 1800s)."}}}})
+	if s := x.facts(NewTracker(x.path), x.at); len(s.Runs) != 1 {
+		t.Fatalf("after the upgrade: runs %+v", s.Runs)
+	}
 	for v, want := range map[string]bool{"2.1.290": false, "2.1.291": true, "2.2.0": true, "3.0.0-beta": true, "": false, "x": false} {
 		if RecordsRuns(v) != want {
 			t.Errorf("%q: %v", v, !want)
@@ -205,19 +213,12 @@ func TestALoopsNextRunIsDueWithItsDelay(t *testing.T) {
 	if s := x.facts(tr, x.at); !first(s).Due.Equal(run.Add(15 * time.Minute)) {
 		t.Fatalf("another job, an Esc: due %v", first(s).Due)
 	}
-	// A session-only job dies with its process.
+	// A restart restores it, session-only as it is, from its first run after the restart: it does not run for the
+	// runs it missed.
 	s := &sessions.Session{Started: run.Add(2 * time.Hour), Tasks: []sessions.Task{}}
 	NewTracker(x.path).Facts(s, run.Add(2*time.Hour))
-	if len(s.Runs) != 0 || s.Loop != "" {
-		t.Fatalf("a session-only job after a restart: runs %+v loop %q", s.Runs, s.Loop)
-	}
-	// A durable one is restored, from its first run after the restart: it does not run for the runs it missed.
-	d := newScript(t).call("tu1", "CronCreate", map[string]any{"cron": "*/10 * * * *", "prompt": "check the queue", "durable": true}).
-		result("tu1", "Scheduled recurring job j1 (Every 10 minutes). Next run: 10:10. Persisted to .claude/scheduled_tasks.json. Auto-expires after 7 days.")
-	s = &sessions.Session{Started: run.Add(2 * time.Hour), Tasks: []sessions.Task{}}
-	NewTracker(d.path).Facts(s, run.Add(2*time.Hour))
-	if !first(s).Due.Equal(run.Add(2*time.Hour + 15*time.Minute)) {
-		t.Fatalf("a durable job after a restart: due %v", first(s).Due)
+	if !first(s).Due.Equal(run.Add(2*time.Hour+15*time.Minute)) || s.Loop != "Every 10 minutes" {
+		t.Fatalf("after a restart: due %v loop %q", first(s).Due, s.Loop)
 	}
 	// It expires 7 days after it was made.
 	if s := x.facts(tr, t0.Add(7*24*time.Hour+time.Minute)); !first(s).Due.IsZero() {
@@ -259,6 +260,38 @@ func TestAJobThatStopsRunningListsEachRunItMissed(t *testing.T) {
 	if s := z.facts(NewTracker(z.path), z.at); len(s.Runs) != 2 || !strings.HasPrefix(s.Runs[0].Key, "job:j1@") {
 		t.Fatalf("a tie: %+v", s.Runs)
 	}
+	// A job every two minutes that stopped running seven hours ago still lists its runs of the last hours.
+	two := newScript(t).call("tu1", "CronCreate", map[string]any{"cron": "*/2 * * * *", "prompt": "poll"}).
+		result("tu1", "Scheduled recurring job j2 (Every 2 minutes). Next run: 10:02.")
+	late := two.facts(NewTracker(two.path), t0.Add(7*time.Hour))
+	if n := len(late.Runs); n == 0 || late.Runs[n-1].Due.Before(t0.Add(7*time.Hour)) || late.Runs[0].Due.Before(t0.Add(7*time.Hour-runsBack)) {
+		t.Fatalf("seven hours on: %d runs %+v", n, late.Runs)
+	}
+	// A job made under a version that writes no record of its runs is not listed, though the session runs a newer one.
+	aged := newScript(t)
+	aged.add(map[string]any{"type": "assistant", "version": "2.1.284", "message": map[string]any{"content": []any{map[string]any{"type": "tool_use", "id": "tu1",
+		"name": "CronCreate", "input": map[string]any{"cron": "*/10 * * * *", "prompt": "poll"}}}}})
+	aged.add(map[string]any{"type": "user", "version": "2.1.284", "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "tu1",
+		"content": "Scheduled recurring job jo (*/10 * * * *). Session-only (not written to disk, dies when Claude exits)."}}}})
+	aged.say("Upgraded.") // a record of the newer version
+	if s := aged.facts(NewTracker(aged.path), aged.at.Add(time.Hour)); len(s.Runs) != 0 {
+		t.Fatalf("an old version's job: runs %+v", s.Runs)
+	}
+	// A job every five minutes runs 4 minutes 45 seconds after it was made, and after a run it missed.
+	five := newScript(t).call("tu1", "CronCreate", map[string]any{"cron": "*/5 * * * *", "prompt": "poll"}).
+		result("tu1", "Scheduled recurring job j5 (Every 5 minutes). Next run: 10:05.")
+	made := five.at
+	if s := five.facts(NewTracker(five.path), made.Add(15*time.Minute)); len(s.Runs) < 2 ||
+		!s.Runs[0].Due.Equal(made.Add(4*time.Minute+45*time.Second)) || !s.Runs[1].Due.Equal(made.Add(9*time.Minute+30*time.Second)) {
+		t.Fatalf("five minutes from its making: %+v", s.Runs)
+	}
+	// And after a restart.
+	restarted := made.Add(time.Hour)
+	rs := &sessions.Session{Started: restarted, Tasks: []sessions.Task{}}
+	NewTracker(five.path).Facts(rs, restarted)
+	if !first(rs).Due.Equal(restarted.Add(4*time.Minute + 45*time.Second)) {
+		t.Fatalf("five minutes from a restart: %v", first(rs).Due)
+	}
 	// A job every five minutes runs 4 minutes 45 seconds after its last run, on time.
 	y := newScript(t).call("tu1", "CronCreate", map[string]any{"cron": "*/5 * * * *", "prompt": "poll"}).
 		result("tu1", "Scheduled recurring job j5 (Every 5 minutes). Next run: 10:05.")
@@ -284,23 +317,15 @@ func TestAOneShotIsDueOnTime(t *testing.T) {
 	if s := x.facts(tr, x.at); !first(s).Due.Equal(run) || !first(s).Job || first(s).For != "remind me of the review" {
 		t.Fatalf("pending: due %v job %v for %q", first(s).Due, first(s).Job, first(s).For)
 	}
-	// A restart loses a session-only one; a durable one only if its time had come: Claude Code restores no
-	// one-shot whose time passed.
-	s := &sessions.Session{Started: run.Add(-time.Minute), Tasks: []sessions.Task{}}
-	NewTracker(x.path).Facts(s, run.Add(time.Hour))
-	if !first(s).Due.IsZero() {
-		t.Fatalf("a session-only one restarted: due %v", first(s).Due)
-	}
-	d := newScript(t).call("tu1", "CronCreate", map[string]any{"cron": "20 10 4 3 *", "prompt": "remind me of the review", "recurring": false, "durable": true}).
-		result("tu1", "Scheduled one-shot task r1 (Mar 4 at 10:20 AM). Next run: 10:20. Persisted to .claude/scheduled_tasks.json. It will fire once then auto-delete.")
+	// A restart restores it only if its time had not come: Claude Code restores no one-shot whose time passed.
 	for _, c := range []struct {
 		started time.Time
 		kept    bool
 	}{{run.Add(-time.Minute), true}, {run.Add(time.Minute), false}} {
 		s := &sessions.Session{Started: c.started, Tasks: []sessions.Task{}}
-		NewTracker(d.path).Facts(s, run.Add(time.Hour))
+		NewTracker(x.path).Facts(s, run.Add(time.Hour))
 		if first(s).Due.IsZero() == c.kept {
-			t.Errorf("a durable one restarted at %v: due %v", c.started, first(s).Due)
+			t.Errorf("restarted at %v: due %v", c.started, first(s).Due)
 		}
 	}
 	x.at = run

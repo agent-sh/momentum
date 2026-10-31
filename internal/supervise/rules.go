@@ -63,6 +63,7 @@ type Stop struct {
 	WakeOnce        bool           // a one-shot job's only run
 	WakeSign        string         // why a self-paced wakeup may have been lost: a cause its harness drops one for
 	TurnBegan       time.Time      // when its last turn began
+	RanAt           time.Time      // when a scheduled run of its own last started
 	IdleAt          time.Time      // when its last turn ended
 	ResumedAt       time.Time      // the harness reopened the session after it ended mid-task, and nothing happened since
 	RequestAt       time.Time      // the model request the open turn still waits on: nothing answered it since
@@ -358,7 +359,7 @@ func overdue(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
 		return Decision{}, false
 	}
 	sign := s.WakeSign
-	if sign == "" && !s.Slept.IsZero() && s.Slept.Before(s.WakeDue) && s.Woke.After(s.WakeDue) {
+	if sign == "" && s.sleptThrough(s.WakeDue) {
 		sign = "the machine slept through its time"
 	}
 	if !s.WakeJob && sign == "" {
@@ -392,11 +393,20 @@ func overdueFrom(s Stop, due time.Time) time.Time {
 	return due
 }
 
-// Choose sets the run the overdue rule reads: the earliest of the stop's runs that no resync went in for (handled)
-// and whose time is not past the stale hour at now. A later run of a job that keeps missing them is its own.
+// sleptThrough reports whether the machine's last suspend spans t.
+func (s Stop) sleptThrough(t time.Time) bool {
+	return !s.Slept.IsZero() && s.Slept.Before(t) && s.Woke.After(t)
+}
+
+// Choose sets the run the overdue rule reads: the earliest of the stop's runs that no resync went in for (handled),
+// that the rule would act on (a wakeup with a sign that it was lost), and whose time, counted as the rule counts
+// it, is not past the stale hour at now. A later run of a job that keeps missing them is its own.
 func (s *Stop) Choose(handled func(key string) bool, now time.Time, p Params) {
 	for _, r := range s.Runs {
-		if handled(r.Key) || overdueFrom(*s, r.Due).Add(p.OverdueSlack+p.Stale).Before(now) {
+		if handled(r.Key) || !r.Job && r.Sign == "" && !s.sleptThrough(r.Due) {
+			continue
+		}
+		if from, _ := afterSleep(*s, overdueFrom(*s, r.Due), p.OverdueSlack, ""); from.Add(p.OverdueSlack + p.Stale).Before(now) {
 			continue
 		}
 		s.WakeDue, s.WakeFor, s.WakeKey, s.WakeJob, s.WakeOnce, s.WakeSign = r.Due, r.For, r.Key, r.Job, r.Once, r.Sign
