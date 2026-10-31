@@ -37,7 +37,7 @@ func TestTheUVCacheIsPrunedOverItsSizeButNeverDuringAnInstall(t *testing.T) {
 		{"a pip install runs", []fakeProc{{pid: 4, ppid: 1, argv: []string{"/usr/bin/uv", "pip", "install", "x"}}}, false, ActKeep},
 		{"a uv run still syncs", []fakeProc{{pid: 4, ppid: 1, argv: []string{"uv", "run", "server"}}}, false, ActKeep},
 		{"a uv run past its sync, outside the cache", []fakeProc{{pid: 4, ppid: 1, argv: []string{"uv", "run", "server"}, env: uvEnv},
-			{pid: 5, ppid: 4, argv: []string{"python", "server.py"}, exe: "/proj/.venv/bin/python", env: started("/proj/.venv/bin")}},
+			{pid: 5, ppid: 4, argv: []string{"python", "server.py"}, exe: "/proj/.venv/bin/python", env: ran("/proj/.venv/bin")}},
 			true, ActDelete},
 		{"a uvx tool server runs from the cache", []fakeProc{{pid: 4, ppid: 1, argv: []string{"uvx", "mcp-x"}, env: uvEnv},
 			{pid: 5, ppid: 4, argv: []string{"/home/u/.cache/uv/archive-v0/x/bin/python", "mcp-x"},
@@ -355,6 +355,11 @@ func started(bin string, more ...string) []string {
 	return append([]string{"PATH=" + bin + ":/usr/bin", "HOME=/home/u"}, more...)
 }
 
+// ran is the environment uv run gives its command: started's, with UV_RUN_RECURSION_DEPTH counted up.
+func ran(bin string, more ...string) []string {
+	return started(bin, append([]string{"UV_RUN_RECURSION_DEPTH=1"}, more...)...)
+}
+
 // newUVLock makes the cache, then the processes procs gives for it, of which holders hold its lock.
 func newUVLock(t *testing.T, procs func(cache, lock string) []fakeProc, holders ...int) *uvLockFixture {
 	t.Helper()
@@ -484,7 +489,7 @@ func outside(cache, lock string) []fakeProc {
 			env: started("/opt/tools/pkg/bin")},
 		{pid: 6, ppid: 1, argv: []string{"uv", "run", "server"}, fds: []string{lock}, env: uvEnv},
 		{pid: 7, ppid: 6, argv: []string{"python", "server.py"}, exe: "/opt/python/bin/python3",
-			env: started("/proj/.venv/bin", "VIRTUAL_ENV=/proj/.venv", "UV_RUN_RECURSION_DEPTH=1")}}
+			env: ran("/proj/.venv/bin", "VIRTUAL_ENV=/proj/.venv")}}
 }
 
 // fromCache is a uv process that holds the lock and a command of it that runs from the cache, as cmd says.
@@ -558,7 +563,7 @@ func TestAUVPruneWaitsForWhatItWouldBreak(t *testing.T) {
 			return append(outside(cache, lock), fakeProc{pid: 8, ppid: 1, argv: []string{"uv", "run", "--script", "s.py"},
 				fds: []string{lock}, env: uvEnv}, fakeProc{pid: 9, ppid: 8, argv: []string{"python", "s.py"},
 				maps: []string{filepath.Join(cache, "environments-v2", "s-1", "lib", "x.so")},
-				env:  started("/opt/s/bin", "UV_RUN_RECURSION_DEPTH=1")})
+				env:  ran("/opt/s/bin")})
 		}, []int{4, 6, 8}, nil, "uv run --script s.py (pid 8)"},
 		{"a uv process that took the old lock file as the new one went in", outside, []int{4, 6}, func(t *testing.T, f *uvLockFixture) {
 			f.addProc(t, 77, 1, "uv\x00run\x00x\x00", "")
@@ -749,8 +754,8 @@ func TestAProcessUnderAHolderThatTheRunCannotReadIsNamed(t *testing.T) {
 	}
 	procs := func(cache, lock string) []fakeProc {
 		return append(outside(cache, lock), fakeProc{pid: 8, ppid: 1, argv: []string{"uv", "run", "srv"}, fds: []string{lock}, env: uvEnv},
-			fakeProc{pid: 9, ppid: 8, argv: []string{"srv"}, env: started("/opt/srv/bin")},
-			fakeProc{pid: 10, ppid: 9, argv: []string{"sudo", "helper"}, env: started("/opt/srv/bin")})
+			fakeProc{pid: 9, ppid: 8, argv: []string{"srv"}, env: ran("/opt/srv/bin")},
+			fakeProc{pid: 10, ppid: 9, argv: []string{"sudo", "helper"}, env: ran("/opt/srv/bin")})
 	}
 	f := newUVLock(t, procs, 4, 6, 8)
 	must(t, os.Chmod(filepath.Join(f.proc, "10", "fd"), 0))
@@ -884,7 +889,7 @@ func TestAnEnvironmentLinkedIntoTheCacheIsUsed(t *testing.T) {
 			must(t, os.MkdirAll(target, 0o755))
 			must(t, os.MkdirAll(site, 0o755))
 			must(t, os.Symlink(target, filepath.Join(site, "pkg")))
-			return started(filepath.Join(base, "proj", ".venv", "bin"), "VIRTUAL_ENV="+filepath.Join(base, "proj", ".venv"))
+			return ran(filepath.Join(base, "proj", ".venv", "bin"), "VIRTUAL_ENV="+filepath.Join(base, "proj", ".venv"))
 		},
 		"packages as uv's symlink link mode lays them out": func(t *testing.T, base, cache string) []string {
 			// uv makes a package's directories and links its files
@@ -893,17 +898,17 @@ func TestAnEnvironmentLinkedIntoTheCacheIsUsed(t *testing.T) {
 			write(t, filepath.Join(arch, "pkg", "__init__.py"), "")
 			must(t, os.MkdirAll(filepath.Join(site, "pkg"), 0o755))
 			must(t, os.Symlink(filepath.Join(arch, "pkg", "__init__.py"), filepath.Join(site, "pkg", "__init__.py")))
-			return started(filepath.Join(base, "proj", ".venv", "bin"), "VIRTUAL_ENV="+filepath.Join(base, "proj", ".venv"))
+			return ran(filepath.Join(base, "proj", ".venv", "bin"), "VIRTUAL_ENV="+filepath.Join(base, "proj", ".venv"))
 		},
 		"an environment that is a link into the cache": func(t *testing.T, base, cache string) []string {
 			target := filepath.Join(cache, "environments-v2", "proj-1")
 			must(t, os.MkdirAll(filepath.Join(target, "bin"), 0o755))
 			must(t, os.MkdirAll(filepath.Join(base, "proj2"), 0o755))
 			must(t, os.Symlink(target, filepath.Join(base, "proj2", ".venv")))
-			return started(filepath.Join(base, "proj2", ".venv", "bin"))
+			return ran(filepath.Join(base, "proj2", ".venv", "bin"))
 		},
 		"uv's symlink link mode": func(t *testing.T, base, cache string) []string {
-			return started("/proj/.venv/bin", "UV_LINK_MODE=symlink")
+			return ran("/proj/.venv/bin", "UV_LINK_MODE=symlink")
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -914,7 +919,7 @@ func TestAnEnvironmentLinkedIntoTheCacheIsUsed(t *testing.T) {
 			}
 			f := newUVLock(t, procs, 4, 6, 8)
 			g := f.run(t, options(t, f.proc, time.Now(), nil))
-			if f.pruned(true) || g.Done || !strings.Contains(g.Why, "uv run srv (pid 8)") {
+			if f.pruned(true) || g.Done || g.Action != ActReport || !strings.Contains(g.Why, "uv run srv (pid 8)") {
 				t.Fatalf("a process whose files are links into the cache uses it: %s %q %v", g.Action, g.Why, f.ran)
 			}
 		})
@@ -935,7 +940,7 @@ func TestACacheBehindALinkIsSeenWhereTheKernelShowsIt(t *testing.T) {
 	o := options(t, f.proc, time.Now(), nil)
 	o.Tools = f.tools(map[string]string{"uv cache dir": link + "\n"})
 	g := f.runWith(t, o, link)
-	if f.pruned(true) || g.Done || !strings.Contains(g.Why, "uv tool uvx srv (pid 8)") {
+	if f.pruned(true) || g.Done || g.Action != ActReport || !strings.Contains(g.Why, "uv tool uvx srv (pid 8)") {
 		t.Fatalf("a mapped file of the cache, seen by its real path, is a use: %s %q %v", g.Action, g.Why, f.ran)
 	}
 }
@@ -1220,7 +1225,7 @@ func TestAToolIsHandedTheFilesItGets(t *testing.T) {
 }
 
 func TestAUVProcessPastItsSyncIsKnownHoweverItIsStarted(t *testing.T) {
-	cmd := started("/opt/tools/srv/bin")
+	cmd, runCmd := started("/opt/tools/srv/bin"), ran("/opt/tools/srv/bin")
 	for _, c := range []struct {
 		name          string
 		argv          []string
@@ -1232,8 +1237,8 @@ func TestAUVProcessPastItsSyncIsKnownHoweverItIsStarted(t *testing.T) {
 		{"a uvx with a suffix", []string{"/opt/uvx-0.13", "srv"}, uvEnv, cmd},
 		{"the uv a uvx with a suffix runs", []string{"/opt/uv-0.13", "tool", "uvx", "srv"}, uvEnv, cmd},
 		{"uv tool uvx", []string{"uv", "tool", "uvx", "srv"}, uvEnv, cmd},
-		{"a global option", []string{"uv", "--directory", "/srv/mcp", "run", "server.py"}, uvEnv, cmd},
-		{"global flags only", []string{"uv", "-q", "--offline", "run", "server.py"}, uvEnv, cmd},
+		{"a global option", []string{"uv", "--directory", "/srv/mcp", "run", "server.py"}, uvEnv, runCmd},
+		{"global flags only", []string{"uv", "-q", "--offline", "run", "server.py"}, uvEnv, runCmd},
 		{"a uv with no PATH", []string{"uv", "tool", "run", "srv"}, []string{"HOME=/home/u"}, []string{"PATH=/opt/tools/srv/bin"}},
 		{"a uv run's command, by the depth it counts", []string{"uv", "run", "server.py"}, uvEnv,
 			append([]string{"UV_RUN_RECURSION_DEPTH=1"}, uvEnv...)},
@@ -1272,7 +1277,262 @@ func TestACacheBehindABindMountIsSeenInAProcesssEnvironment(t *testing.T) {
 	o := options(t, f.proc, time.Now(), nil)
 	write(t, o.MountInfo, "29 1 259:3 / / rw - ext4 /dev/sda2 rw\n40 29 252:0 / "+filepath.Join(base, "data")+
 		" rw - ext4 /dev/mapper/data rw\n41 29 252:0 /cache "+filepath.Join(base, "home", ".cache")+" rw - ext4 /dev/mapper/data rw\n")
-	if g := f.run(t, o); f.pruned(true) || g.Done || !strings.Contains(g.Why, "uv tool run srv (pid 8)") {
+	if g := f.run(t, o); f.pruned(true) || g.Done || g.Action != ActReport || !strings.Contains(g.Why, "uv tool run srv (pid 8)") {
 		t.Fatalf("a PATH that names the cache through its bind mount runs from it: %s %q %v", g.Action, g.Why, f.ran)
+	}
+}
+
+func TestACommandThatSetItsTitleHasStarted(t *testing.T) {
+	// setproctitle (gunicorn, Celery, vLLM) writes the title over the memory /proc reads an environment from: the
+	// command's reads as NULs from then on, while uv's own reads as before
+	zeroed := []string{strings.Repeat("\x00", 512)}
+	for name, fromCache := range map[string]bool{"outside the cache": false, "from the cache": true} {
+		t.Run(name, func(t *testing.T) {
+			procs := func(cache, lock string) []fakeProc {
+				var maps []string
+				if fromCache { // the extension is mapped from the environment it runs in
+					maps = []string{filepath.Join(cache, "archive-v0", "x", "lib", "python3.12", "site-packages", "_setproctitle.so")}
+				}
+				return append(outside(cache, lock),
+					fakeProc{pid: 8, ppid: 1, argv: []string{"uv", "run", "srv"}, fds: []string{lock}, env: uvEnv},
+					fakeProc{pid: 9, ppid: 8, argv: []string{"srv: master"}, exe: "/opt/python/bin/python3", maps: maps, env: zeroed})
+			}
+			f := newUVLock(t, procs, 4, 6, 8)
+			g := f.run(t, options(t, f.proc, time.Now(), nil))
+			switch {
+			case !fromCache && (!g.Done || !f.pruned(true)):
+				t.Fatalf("a run whose command set its title has started it, here outside the cache: %s %q %v", g.Action, g.Why, f.ran)
+			case fromCache && (f.pruned(true) || g.Action != ActReport || !strings.Contains(g.Why, "uv run srv (pid 8)")):
+				t.Fatalf("one that runs from the cache is named in a problem note: %s %q %v", g.Action, g.Why, f.ran)
+			}
+		})
+	}
+}
+
+func TestAQuietWaitThatLastsADayIsReported(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		start int
+		want  string
+	}{
+		{"an hour", 172800*userHZ - 3600*userHZ, ActKeep},
+		{"two days", 100, ActReport},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			procs := func(cache, lock string) []fakeProc { // a tool server whose command set its own PATH looks unstarted
+				return append(outside(cache, lock), fakeProc{pid: 8, ppid: 1, argv: []string{"uv", "tool", "uvx", "srv"}, fds: []string{lock},
+					env: uvEnv, start: c.start}, fakeProc{pid: 9, ppid: 8, argv: []string{"srv"}, env: []string{"PATH=/opt/srv/wrap:/usr/bin"}})
+			}
+			f := newUVLock(t, procs, 4, 6, 8)
+			write(t, filepath.Join(f.proc, "uptime"), "172800.00 1000.00\n") // two days after boot
+			g := f.run(t, options(t, f.proc, time.Now(), nil))
+			if f.pruned(true) || g.Done || g.Action != c.want || !strings.Contains(g.Why, "uv tool uvx srv (pid 8)") {
+				t.Fatalf("a quiet wait of %s: %s %q %v", c.name, g.Action, g.Why, f.ran)
+			}
+		})
+	}
+}
+
+func TestAHolderInAnotherMountNamespaceIsJudgedByItsOwnView(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		root string // where the holder's namespace is rooted
+		done bool
+	}{
+		{"a namespace that binds the cache elsewhere", "", false},
+		{"a sandbox that sees the cache where the run does", "/", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			procs := func(cache, lock string) []fakeProc { // it names the cache by its own paths
+				return append(outside(cache, lock),
+					fakeProc{pid: 8, ppid: 1, argv: []string{"uv", "tool", "uvx", "srv"}, fds: []string{"/cache/uv/.lock"}, env: uvEnv},
+					fakeProc{pid: 9, ppid: 8, argv: []string{"/cache/uv/archive-v0/x/bin/python", "srv"}, exe: "/usr/bin/python3.12",
+						maps: []string{"/cache/uv/archive-v0/x/lib/_ext.so"}, env: started("/cache/uv/archive-v0/x/bin")})
+			}
+			f := newUVLock(t, procs, 4, 6, 8)
+			ns := func(pid, link string) {
+				must(t, os.MkdirAll(filepath.Join(f.proc, pid, "ns"), 0o755))
+				must(t, os.Symlink(link, filepath.Join(f.proc, pid, "ns", "mnt")))
+			}
+			for _, pid := range []string{"8", "9"} {
+				ns(pid, "mnt:[4026533333]")
+				root := c.root
+				if root == "" {
+					root = t.TempDir()
+				}
+				must(t, os.Symlink(root, filepath.Join(f.proc, pid, "root")))
+			}
+			for _, pid := range []string{"4", "5", "6", "7", strconv.Itoa(os.Getpid())} {
+				ns(pid, "mnt:[4026531841]")
+			}
+			g := f.run(t, options(t, f.proc, time.Now(), nil))
+			if g.Done != c.done || g.Done != f.pruned(true) || !c.done && !strings.Contains(g.Why, "another mount namespace") {
+				t.Fatalf("a holder in another mount namespace is judged by the paths it sees: %s %q %v", g.Action, g.Why, f.ran)
+			}
+		})
+	}
+}
+
+func TestABuildBackendIsNotTheCommandItsUVStarts(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		uv    []string
+		uvEnv []string
+	}{
+		{"a uv run", []string{"uv", "run", "srv"}, uvEnv},
+		{"a uvx", []string{"uv", "tool", "uvx", "srv"}, uvEnv},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			// a local package built without isolation: the backend gets the target environment's bin first on uv's PATH,
+			// as a command would, and only its -c script names the cache
+			procs := func(cache, lock string) []fakeProc {
+				return append(outside(cache, lock), fakeProc{pid: 8, ppid: 1, argv: c.uv, fds: []string{lock}, env: c.uvEnv},
+					fakeProc{pid: 9, ppid: 8, argv: []string{"/proj/.venv/bin/python", "-c", "import backend"}, cwd: "/proj",
+						env: started("/proj/.venv/bin", "VIRTUAL_ENV=/proj/.venv", "UV_INTERNAL__BUILD_DIR=/proj")})
+			}
+			f := newUVLock(t, procs, 4, 6, 8)
+			g := f.run(t, options(t, f.proc, time.Now(), nil))
+			if f.pruned(true) || g.Done || g.Action != ActKeep || !strings.Contains(g.Why, argvHead(c.uv)+" (pid 8)") {
+				t.Fatalf("a uv process whose child is a build backend is at its sync: %s %q %v", g.Action, g.Why, f.ran)
+			}
+		})
+	}
+}
+
+func TestAPlaceThatDoesNotAnswerKeepsThePrune(t *testing.T) {
+	defer func(d time.Duration) { uvPlaceWait = d }(uvPlaceWait)
+	uvPlaceWait = 50 * time.Millisecond
+	stuck := make(chan struct{})
+	t.Cleanup(func() { close(stuck) })
+	was := resolveLinks
+	t.Cleanup(func() { resolveLinks = was })
+	resolveLinks = func(p string) (string, error) {
+		if p == "/mnt/dead/env" { // a dead network mount: the call never returns
+			<-stuck
+		}
+		return was(p)
+	}
+	procs := func(cache, lock string) []fakeProc {
+		return append(outside(cache, lock), fakeProc{pid: 18, ppid: 1, argv: []string{"python"}, env: []string{"VIRTUAL_ENV=/mnt/dead/env"}})
+	}
+	f := newUVLock(t, procs, 4, 6)
+	start := time.Now()
+	g := f.run(t, options(t, f.proc, time.Now(), nil))
+	if f.pruned(true) || g.Done || !strings.Contains(g.Why, "/mnt/dead/env did not answer") || time.Since(start) > 10*time.Second {
+		t.Fatalf("a place that does not answer may be in use, and the run goes on: %s %q after %s", g.Action, g.Why, time.Since(start))
+	}
+}
+
+func TestAHolderOrUVProcessThatCameBeforeTheRenameKeepsTheLockFileInPlace(t *testing.T) {
+	for _, c := range []struct {
+		name, why string
+		root      bool
+		came      func(*testing.T, *uvLockFixture)
+	}{
+		{"a holder", "took the cache's lock since the look", true, func(t *testing.T, f *uvLockFixture) {
+			f.addProc(t, 77, 1, "uv\x00run\x00x\x00", "")
+			f.holds(t, 77)
+		}},
+		{"a uv process the run may not read", "started since the look may have the cache's lock open", false, func(t *testing.T, f *uvLockFixture) {
+			must(t, os.Chmod(filepath.Join(f.addProc(t, 30, 29, "uv\x00sync\x00", ""), "fd"), 0))
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if !c.root && os.Geteuid() == 0 {
+				t.Skip("root reads every process")
+			}
+			f := newUVLock(t, outside, 4, 6)
+			t.Cleanup(func() { os.Chmod(filepath.Join(f.proc, "30", "fd"), 0o755) })
+			armed := false
+			o := options(t, f.proc, time.Now(), nil)
+			o.Tools = dockerHook{f.tools(nil), &armed, func() { c.came(t, f) }} // during the look, before the rename
+			g := f.runWith(t, o, f.cache)
+			if g.Done || f.pruned(true) || !strings.Contains(g.Why, c.why) {
+				t.Fatalf("%s that came before the rename keeps the lock file in place: %s %q", c.name, g.Action, g.Why)
+			}
+			if id, err := fileID(f.lock); err != nil || id != f.id {
+				t.Errorf("the lock file stays the one every uv process opens: %v %v", id, err)
+			}
+		})
+	}
+}
+
+func TestAContainerThatMountsAPartOfTheCacheIsWaitedFor(t *testing.T) {
+	f := newUVLock(t, outside, 4, 6)
+	o := options(t, f.proc, time.Now(), nil)
+	o.Tools = f.tools(map[string]string{"docker ps": "c1\n", "docker inspect": "/box\t" + filepath.Join(f.cache, "archive-v0", "x") + "\n",
+		"docker info": "ERR"})
+	if g := f.runWith(t, o, f.cache); f.pruned(true) || f.pruned(false) || !strings.Contains(g.Why, "container box mounts") {
+		t.Fatalf("a container that mounts a part of the cache may run from it: %s %q %v", g.Action, g.Why, f.ran)
+	}
+}
+
+func TestAProcessIDAnotherProcessTookIsNotTheOneTheLookSaw(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		after func(*testing.T, *uvLockFixture)
+		done  bool
+	}{
+		// the installed tool ended and its pid went to another process: the old holder holds nothing now
+		{"a holder's", func(t *testing.T, f *uvLockFixture) {
+			must(t, os.RemoveAll(filepath.Join(f.proc, "4")))
+			must(t, os.RemoveAll(filepath.Join(f.proc, "5")))
+			f.addProc(t, 4, 1, "bash\x00", "PATH=/usr/bin\x00")
+		}, true},
+		// the tool's command ended and another, with the same pid, runs: it may be at its sync
+		{"a command's", func(t *testing.T, f *uvLockFixture) {
+			must(t, os.RemoveAll(filepath.Join(f.proc, "5")))
+			f.addProc(t, 5, 4, "python\x00pkg\x00", "PATH=/opt/tools/pkg/bin:/usr/bin\x00")
+		}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newUVLock(t, outside, 4, 6)
+			o := options(t, f.proc, time.Now(), nil)
+			o.afterUVLock = func() { c.after(t, f) }
+			if g := f.run(t, o); g.Done != c.done || g.Done != f.pruned(true) {
+				t.Fatalf("a process is the one the look saw by its pid and its start: %s %q %v", g.Action, g.Why, f.ran)
+			}
+		})
+	}
+}
+
+func TestAUVProcessThatTookTheIDOfOneTheLookSawIsNew(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads every process")
+	}
+	procs := func(cache, lock string) []fakeProc { // a container's uv the run may not read
+		return append(outside(cache, lock), fakeProc{pid: 30, ppid: 29, argv: []string{"uv", "run", "app"}, env: uvEnv},
+			fakeProc{pid: 31, ppid: 30, argv: []string{"python", "app"}, env: ran("/app/.venv/bin")})
+	}
+	f := newUVLock(t, procs, 4, 6)
+	for _, p := range []string{"30/fd", "30/environ", "31/fd", "31/environ"} {
+		must(t, os.Chmod(filepath.Join(f.proc, p), 0))
+	}
+	o := options(t, f.proc, time.Now(), nil)
+	o.afterUVLock = func() { // it ended, and a uv process the run may not read took its pid
+		must(t, os.Chmod(filepath.Join(f.proc, "30", "fd"), 0o755))
+		must(t, os.RemoveAll(filepath.Join(f.proc, "30")))
+		must(t, os.Chmod(filepath.Join(f.addProc(t, 30, 29, "uv\x00cache\x00clean\x00", ""), "fd"), 0))
+	}
+	t.Cleanup(func() {
+		for _, p := range []string{"30/fd", "31/fd"} {
+			os.Chmod(filepath.Join(f.proc, p), 0o755)
+		}
+	})
+	if g := f.run(t, o); g.Done || f.pruned(true) || !strings.Contains(g.Why, "uv process (pid 30) that started as capacity put its own in place") {
+		t.Fatalf("a uv process with the pid of one the look saw, and another start, is new: %s %q %v", g.Action, g.Why, f.ran)
+	}
+}
+
+func TestAPrunesNotesKeepWhyItMayNotPrune(t *testing.T) {
+	f := newUVLock(t, outside, 4, 6)
+	o := options(t, f.proc, time.Now(), fakeJobs{err: fmt.Errorf("a unit file cannot be read")})
+	o.Tools, o.Rules = f.tools(nil), []string{RuleUV}
+	res, err := Run(context.Background(), Config{Live: []string{RuleUV}}.Normal(), openStore(t), o)
+	must(t, err)
+	for _, rr := range res.Rules {
+		if rr.Rule == RuleUV && (!slices.Contains(rr.Notes, "no prune: the scheduled jobs could not all be read") || f.pruned(true) || f.pruned(false)) {
+			t.Errorf("the rule's notes keep why it may not prune: %q %v", rr.Notes, f.ran)
+		}
 	}
 }
