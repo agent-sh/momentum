@@ -133,8 +133,8 @@ func resumed(s *sessions.Session, stop Stop, text string, interrupt bool, now ti
 // owner window gets a needs note, once per ask: a note he resolved while the session still waits on the same ask
 // stays resolved, and a standing one takes the ask's latest title. A needs note is done when its session moves on:
 // the ask is answered or another took its place, or the session ended. A problem note is done when its owner came
-// back to the session or it works again: a turn open that waits on no model request, or a stop since without an
-// error. A session the run left alone keeps its notes as they are.
+// back to the session or it works again: a turn open (for Claude Code, with a call in flight), or a stop since
+// without an error. A session the run left alone keeps its notes as they are.
 func (sv *Supervisor) notes(ctx context.Context, seen map[string]*seenSession) error {
 	ns, err := sv.Store.Notes(ctx)
 	if err != nil {
@@ -171,9 +171,9 @@ func (sv *Supervisor) notes(ctx context.Context, seen map[string]*seenSession) e
 			if ok && e == nil {
 				continue
 			}
-			// it works again: a turn open now, but not one that waits on a model request with no reply (its case's,
-			// or Claude Code's own retry of it), or one that stopped since without an error
-			stuck := ok && !e.stop.RequestAt.IsZero()
+			// it works again: a turn open now (for Claude Code, one with a call in flight: an open turn may wait on a
+			// model request, or on a retry's backoff after an error), or one that stopped since without an error
+			stuck := ok && e.s.Tool == "claude" && e.s.Now == ""
 			again := ok && (e.s.TurnOpen && !stuck || e.stop.At.After(n.At) && e.stop.Error == "")
 			if !ok || e.presence.After(n.At) || again {
 				if err := done(n.ID); err != nil {

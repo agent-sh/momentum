@@ -307,7 +307,7 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 	// that shows no turn running while the transcript still waits on the request takes it the plain way, as the
 	// next prompt, once the transcript still shows no reply. An Escape with nothing queued takes a turn back without
 	// a record, so the first look that finds that screen, for a request, moves the rule's time to the owner window
-	// after it, unless a sighting of its owner since the request already held the rule.
+	// after it; a look that finds the line its owner cleared there is that first look.
 	isStalled := d.Rule == RuleStalled
 	interrupt := isStalled
 	refusedKey := "#refused"
@@ -410,7 +410,7 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 	}
 	if err == nil && isStalled {
 		// the transcript tells whether it went in as a prompt: a turn that runs unseen would hold it in its queue
-		err = sv.prompted(ctx, s, d.Text, m)
+		err = sv.prompted(ctx, s, d.Text, m, interrupt)
 	}
 	delete(m, "sending")
 	m["path"] = string(path)
@@ -948,11 +948,15 @@ func parseSleep(out string) (slept, woke time.Time) {
 // one after the turn its Escape ended, or the one it opened the plain way.
 var promptedWait = 10 * time.Second
 
+// interruptWait is how long, once the message shows as a prompt, the run reads on for the interruption its Escape
+// recorded: Claude Code may write it a moment after the prompt.
+var interruptWait = claude.InterruptSkew
+
 // prompted waits for the session's transcript to show the message as the prompt of a turn, after the Escape that
-// ended the turn the message waited behind or the plain way's Enter, and notes in m whether the transcript
-// recorded an interruption before it.
+// ended the turn the message waited behind (escaped) or the plain way's Enter, and notes in m whether the
+// transcript recorded the Escape's interruption, which Claude Code writes before the prompt or a moment after it.
 // When it does not show, the message is in a state nobody can tell (on the input line, in the queue): ErrUnstable.
-func (sv *Supervisor) prompted(ctx context.Context, s *sessions.Session, text string, m map[string]any) error {
+func (sv *Supervisor) prompted(ctx context.Context, s *sessions.Session, text string, m map[string]any, escaped bool) error {
 	look := sv.Prompted
 	if look == nil {
 		look = func(_ context.Context, s *sessions.Session, text string) (bool, time.Time, error) {
@@ -960,16 +964,28 @@ func (sv *Supervisor) prompted(ctx context.Context, s *sessions.Session, text st
 		}
 	}
 	end := time.Now().Add(promptedWait)
+	var shown time.Time // when the message first showed as a prompt, its interruption not on record yet
+	note := func(interrupted time.Time) error {
+		m["interrupted"] = !interrupted.IsZero()
+		if !interrupted.IsZero() {
+			m["interrupted_at"] = interrupted.UnixMilli()
+		}
+		return nil
+	}
 	for {
 		found, interrupted, err := look(ctx, s, text)
 		if err == nil && found {
-			m["interrupted"] = !interrupted.IsZero()
-			if !interrupted.IsZero() {
-				m["interrupted_at"] = interrupted.UnixMilli()
+			if !escaped || !interrupted.IsZero() {
+				return note(interrupted)
 			}
-			return nil
+			if shown.IsZero() {
+				shown = time.Now()
+			}
 		}
-		if !time.Now().Before(end) {
+		switch {
+		case !shown.IsZero() && time.Since(shown) >= interruptWait:
+			return note(time.Time{}) // it went in; its interruption was not on record in time
+		case shown.IsZero() && !time.Now().Before(end):
 			if err != nil {
 				return fmt.Errorf("%w: the transcript: %v", act.ErrUnstable, err)
 			}
@@ -977,6 +993,9 @@ func (sv *Supervisor) prompted(ctx context.Context, s *sessions.Session, text st
 		}
 		select {
 		case <-ctx.Done():
+			if !shown.IsZero() {
+				return note(time.Time{})
+			}
 			return fmt.Errorf("%w: %v", act.ErrUnstable, ctx.Err())
 		case <-time.After(250 * time.Millisecond):
 		}

@@ -102,21 +102,32 @@ func (x *transcript) notice(text string) *transcript {
 }
 
 // queueing is a sender for a pane whose turn runs: the terminal check sees the turn running, and an interrupt
-// writes what Claude Code writes for one: the interruption, then the queued message as the next prompt.
+// writes what Claude Code writes for one: the interruption and the queued message as the next prompt, a few
+// milliseconds apart, in either order (promptFirst).
 type queueing struct {
 	fakeSender
-	x   *transcript
-	now *time.Time
+	x           *transcript
+	now         *time.Time
+	promptFirst bool
 }
 
 func (f *queueing) Interrupt(ctx context.Context, t act.Target, text string, still func() error) (act.Path, error) {
 	if _, err := f.fakeSender.Interrupt(ctx, t, text, still); err != nil {
 		return act.Tmux, err
 	}
-	f.x.at = *f.now
-	f.x.add(map[string]any{"type": "user", "message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "[Request interrupted by user]"}}}})
-	f.x.add(map[string]any{"type": "user", "origin": map[string]any{"kind": "human"}, "promptSource": "queued",
-		"message": map[string]any{"role": "user", "content": text}})
+	stamp := func(d time.Duration) string { return f.now.Add(time.Second + d).Format(time.RFC3339Nano) }
+	escape := map[string]any{"type": "user", "timestamp": stamp(0),
+		"message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "[Request interrupted by user]"}}}}
+	prompt := map[string]any{"type": "user", "origin": map[string]any{"kind": "human"}, "promptSource": "queued", "timestamp": stamp(30 * time.Millisecond),
+		"message": map[string]any{"role": "user", "content": text}}
+	if f.promptFirst { // then the request of the turn the prompt opened, as Claude Code writes it in this order
+		escape["timestamp"] = stamp(37 * time.Millisecond)
+		f.x.add(prompt).add(escape).add(map[string]any{"type": "api-request", "querySource": "repl_main_thread",
+			"timestamp": stamp(61 * time.Millisecond)})
+	} else {
+		f.x.add(escape).add(prompt)
+	}
+	f.x.at = f.now.Add(2 * time.Second)
 	return act.Tmux, nil
 }
 
@@ -170,10 +181,17 @@ func unread(sv *Supervisor) *Supervisor {
 }
 
 func TestALoopStalledOnARequestIsInterruptedAndResumed(t *testing.T) {
+	// Claude Code writes the interruption and the queued prompt in either order: the Escape is momentum's both ways.
+	for _, promptFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("prompt first %v", promptFirst), func(t *testing.T) { loopStalledInterrupted(t, promptFirst) })
+	}
+}
+
+func loopStalledInterrupted(t *testing.T, promptFirst bool) {
 	x, sent, scan := stalledLoop(t)
 	st := testStore(t)
 	now := sent.Add(29 * time.Minute)
-	f := &queueing{x: x, now: &now}
+	f := &queueing{x: x, now: &now, promptFirst: promptFirst}
 	sv := liveStalled(st, f, &now)
 	run(t, sv, scan(now))
 	if len(f.sent) != 0 {
@@ -376,7 +394,7 @@ func TestAnIdleScreensWaitIsTheRulesOwnTime(t *testing.T) {
 	}
 	s = waitingSession("sess-cleared-then-escape")
 	run(t, sv, s)
-	f.checkInterrupt, f.interrupt = nil, act.ErrIdle // cleared, the turn still running; it ends before the paste
+	f.checkInterrupt = nil // cleared, the turn still running
 	now = now.Add(DefaultParams.OwnerWindow + time.Second)
 	run(t, sv, s)
 	f.checkInterrupt = act.ErrIdle // his Escape: no turn running, an empty line
@@ -397,6 +415,40 @@ func TestAnIdleScreensWaitIsTheRulesOwnTime(t *testing.T) {
 	run(t, sv, s)
 	if len(f.sent) != 1 {
 		t.Fatalf("past its window: sent %q", f.sent)
+	}
+}
+
+func TestAClearedLineTakesNoSecondIdleWait(t *testing.T) {
+	// The first idle look at 31, then his drafts on the idle screen hold the rule; he clears the line late and
+	// leaves. The look that finds it cleared is no first idle look: the wait it began stays at 31, the stale hour
+	// with it, and he held the stall into that hour, so neither a message nor a note.
+	st := testStore(t)
+	f := &fakeSender{checkInterrupt: act.ErrIdle}
+	now := t0.Add(31 * time.Minute)
+	sv := unread(liveStalled(st, f, &now))
+	sv.Prompted = func(context.Context, *sessions.Session, string) (bool, time.Time, error) {
+		return true, time.Time{}, nil
+	}
+	s := waitingSession("sess-cleared-twice")
+	run(t, sv, s)
+	f.checkInterrupt = act.ErrDraft
+	for now.Before(t0.Add(100 * time.Minute)) {
+		now = now.Add(time.Minute)
+		run(t, sv, s)
+	}
+	f.checkInterrupt = act.ErrIdle // cleared, on the idle screen
+	for now.Before(t0.Add(3 * time.Hour)) {
+		now = now.Add(time.Minute)
+		run(t, sv, s)
+	}
+	marks := 0
+	for _, e := range events(t, st, KindWait) {
+		if strings.Contains(e.SourceKey, "#idle@") {
+			marks++
+		}
+	}
+	if n, ok := note(t, st, AskNote+s.Key); len(f.sent) != 0 || ok || marks != 1 {
+		t.Fatalf("sent %q, needs note %+v %v, idle marks %d", f.sent, n, ok, marks)
 	}
 }
 
@@ -717,6 +769,10 @@ func TestAStalledCasesProblemNoteStandsThroughARetry(t *testing.T) {
 	if n, ok := note(t, st, ProblemNote+s.Key); !ok || !n.Done.IsZero() {
 		t.Fatalf("problem note %+v %v", n, ok)
 	}
+	// A scan in the retry's backoff: its error answered the request, and the retry's own request is not out yet.
+	s.RequestAt = time.Time{}
+	now = now.Add(9 * time.Minute)
+	run(t, sv, s)
 	s.RequestAt = t0.Add(40 * time.Minute)
 	for now.Before(t0.Add(3 * time.Hour)) {
 		now = now.Add(10 * time.Minute)
@@ -725,12 +781,12 @@ func TestAStalledCasesProblemNoteStandsThroughARetry(t *testing.T) {
 	if n, _ := note(t, st, ProblemNote+s.Key); !n.Done.IsZero() {
 		t.Fatalf("the problem note went with the retry: %+v", n)
 	}
-	// The reply comes and the turn goes on: it works again.
-	s.RequestAt = time.Time{}
+	// The reply comes and the turn goes on with a call: it works again.
+	s.RequestAt, s.Now = time.Time{}, "Bash: make test"
 	now = now.Add(time.Minute)
 	run(t, sv, s)
 	if n, _ := note(t, st, ProblemNote+s.Key); n.Done.IsZero() {
-		t.Fatalf("still stands after the reply: %+v", n)
+		t.Fatalf("still stands with a call in flight: %+v", n)
 	}
 }
 
@@ -862,6 +918,41 @@ func TestAStalledTurnPastItsStaleHourIsLeftAlone(t *testing.T) {
 	}
 }
 
+func TestAnInterruptReadsOnForItsEscapesRecord(t *testing.T) {
+	// The message shows as the prompt before its interruption is on record: the run reads on for it a moment.
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0.Add(31 * time.Minute)
+	sv := unread(liveStalled(st, f, &now))
+	looks := 0
+	escaped := t0.Add(31*time.Minute + time.Second)
+	sv.Prompted = func(context.Context, *sessions.Session, string) (bool, time.Time, error) {
+		if looks++; looks < 3 {
+			return true, time.Time{}, nil
+		}
+		return true, escaped, nil
+	}
+	defer func(w time.Duration) { interruptWait = w }(interruptWait)
+	interruptWait = 5 * time.Second
+	run(t, sv, waitingSession("sess-escape-late"))
+	acts := events(t, st, KindAct)
+	if len(acts) != 1 || metaMap(acts[0])["interrupted_at"] != float64(escaped.UnixMilli()) {
+		t.Fatalf("acts %+v after %d looks", acts, looks)
+	}
+	// It never comes: the message still went in, with no interruption on record, and no case.
+	st = testStore(t)
+	sv = unread(liveStalled(st, &fakeSender{}, &now))
+	sv.Prompted = func(context.Context, *sessions.Session, string) (bool, time.Time, error) {
+		return true, time.Time{}, nil
+	}
+	interruptWait = 300 * time.Millisecond
+	run(t, sv, waitingSession("sess-escape-never"))
+	if acts := events(t, st, KindAct); len(acts) != 1 || metaMap(acts[0])["sent"] != true || metaMap(acts[0])["interrupted"] != false ||
+		len(events(t, st, KindCase)) != 0 {
+		t.Fatalf("acts %+v cases %+v", acts, events(t, st, KindCase))
+	}
+}
+
 func TestPromptedReadsTheTranscriptSinceTheScan(t *testing.T) {
 	dir := t.TempDir()
 	x := &transcript{t: t, path: filepath.Join(dir, "s.jsonl"), at: t0}
@@ -880,6 +971,29 @@ func TestPromptedReadsTheTranscriptSinceTheScan(t *testing.T) {
 	found, interrupted, err := claude.Prompted(x.path, from, StalledText)
 	if !found || !interrupted.Equal(escaped) || err != nil {
 		t.Fatalf("found %v interrupted %v %v", found, interrupted, err)
+	}
+	// The interruption written a moment after the prompt is its Escape's too; one long after it, or after another
+	// user record, is not.
+	for _, c := range []struct {
+		name  string
+		after time.Duration
+		other bool
+		want  bool
+	}{{"just after", 7 * time.Millisecond, false, true}, {"long after", 30 * time.Second, false, false}, {"after another record", 7 * time.Millisecond, true, false}} {
+		w := &transcript{t: t, path: filepath.Join(dir, "w-"+strings.ReplaceAll(c.name, " ", "-")+".jsonl"), at: t0}
+		w.user("old turn")
+		fi, _ := os.Stat(w.path)
+		prompted := t0.Add(time.Minute)
+		w.add(map[string]any{"type": "user", "promptSource": "queued", "timestamp": prompted.Format(time.RFC3339Nano), "message": map[string]any{"content": StalledText}})
+		if c.other {
+			w.add(map[string]any{"type": "user", "timestamp": prompted.Format(time.RFC3339Nano), "message": map[string]any{"content": "a typed line"}})
+		}
+		w.add(map[string]any{"type": "user", "timestamp": prompted.Add(c.after).Format(time.RFC3339Nano),
+			"message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "[Request interrupted by user]"}}}})
+		found, interrupted, err := claude.Prompted(w.path, fi.Size(), StalledText)
+		if !found || interrupted.IsZero() == c.want || err != nil {
+			t.Fatalf("%s: found %v interrupted %v %v", c.name, found, interrupted, err)
+		}
 	}
 	// Answered: a notice since the scan answers nothing; a reply does.
 	y := &transcript{t: t, path: filepath.Join(dir, "a.jsonl"), at: t0}

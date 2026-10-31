@@ -40,12 +40,17 @@ func appended(path string, from int64, each func(e line, raw []byte) bool) error
 	}
 }
 
+// InterruptSkew is how far apart Claude Code dates the interruption an Escape records and the queued prompt the
+// Escape sends: it writes the two in either order, a few milliseconds apart.
+const InterruptSkew = 2 * time.Second
+
 // Prompted reports whether the transcript at path, from byte offset from on (the size a scan read), records text
 // as a prompt that opened a turn: a user record, not one the harness injected, whose text is text, whitespace
-// folded. interrupted is when an interruption came before it, the end of the turn it waited behind; zero when none
-// did.
+// folded. interrupted is when the interruption that ended the turn it waited behind was recorded: before it, or as
+// the next user record after it and within InterruptSkew of it; zero when none was.
 func Prompted(path string, from int64, text string) (found bool, interrupted time.Time, err error) {
 	want := strings.Join(strings.Fields(text), " ")
+	var at time.Time // the prompt's
 	err = appended(path, from, func(e line, _ []byte) bool {
 		if e.Type != "user" || e.IsMeta || e.Message == nil {
 			return true
@@ -61,12 +66,18 @@ func Prompted(path string, from int64, text string) (found bool, interrupted tim
 			}
 		}
 		s = strings.TrimSpace(reSystemTag.ReplaceAllString(s, ""))
+		ts, _ := time.Parse(time.RFC3339Nano, e.Timestamp)
+		interruption := strings.HasPrefix(s, "[Request interrupted")
 		switch {
-		case strings.HasPrefix(s, "[Request interrupted"):
-			interrupted, _ = time.Parse(time.RFC3339Nano, e.Timestamp)
-		case strings.Join(strings.Fields(s), " ") == want:
-			found = true
+		case found: // the next user record: the interruption, when Claude Code wrote it after the prompt
+			if interruption && interrupted.IsZero() && !ts.IsZero() && !at.IsZero() && ts.Sub(at).Abs() <= InterruptSkew {
+				interrupted = ts
+			}
 			return false
+		case interruption:
+			interrupted = ts
+		case strings.Join(strings.Fields(s), " ") == want:
+			found, at = true, ts
 		}
 		return true
 	})
