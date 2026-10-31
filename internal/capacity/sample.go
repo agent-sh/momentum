@@ -47,6 +47,14 @@ type Proc struct {
 	Cwd       string
 }
 
+// table is the sample's processes, none for no sample.
+func (s *Sample) table() map[int]Proc {
+	if s == nil {
+		return nil
+	}
+	return s.Table
+}
+
 // Children reports whether any process has pid as its parent.
 func (s *Sample) Children(pid int) bool {
 	for _, p := range s.Table {
