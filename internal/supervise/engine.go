@@ -68,6 +68,10 @@ var errTakenBack = errors.New("its screen shows the turn over while its transcri
 // errAnswered is a stalled request that something answered since the scan: the turn went on by itself.
 var errAnswered = errors.New("its transcript shows the request answered since the scan")
 
+// errNoPlace is a stalled session whose transcript place the scan does not know: nothing could tell that the
+// message went in.
+var errNoPlace = errors.New("the scan read no place in its transcript")
+
 // Supervisor runs the rules over the sessions one scan found, sends what the live rules decide, and records
 // every decision, every message and what came of it as an event.
 type Supervisor struct {
@@ -230,10 +234,15 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 				return lines, err
 			}
 		}
-		// A stalled turn the rule leaves to its owner (dry, taken back on its screen, or past its stale hour) waits on
-		// him: only he can tell whether to resume it.
-		if d.Rule == RuleStalled && (d.Verdict == Act && !sv.Live[d.Rule] || line.takenBack || d.Stale) {
-			entry.ask, entry.asks = waitsOnOwner(s, stop, d, presence, sv.Params, true)
+		// A stalled turn the rule leaves to its owner waits on him: only he can tell whether to resume it. It is
+		// decided from the stop, not from one run's look: the rule runs dry and its time came (its dry act is on
+		// record), its screen showed the turn taken back (a mark on record), or it is past its stale hour.
+		if d.Rule == RuleStalled {
+			k := sv.event(s, stop, d, KindAct, now, "").SourceKey
+			dry := !sv.Live[d.Rule] && (d.Verdict == Act || h.keys[k])
+			if dry || line.takenBack || h.keys[k+"#taken-back"] || d.Stale {
+				entry.ask, entry.asks = waitsOnOwner(s, stop, d, presence, sv.Params, true)
+			}
 		}
 		lines = append(lines, line)
 	}
@@ -269,6 +278,8 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 	path, err := act.Path(""), act.CheckText(d.Text)
 	switch {
 	case err != nil:
+	case interrupt && (s.Transcript == "" || s.Size < 0):
+		err = errNoPlace // the transcript tells whether the message went in, read from where the scan stopped
 	case interrupt:
 		path, err = sv.Sender.CheckInterrupt(ctx, t)
 		if errors.Is(err, act.ErrIdle) {
@@ -287,6 +298,13 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 		// the draft or the mode the last check met is gone: its owner cleared it just now, and is there
 		line.Err = "its owner cleared the input line since the last check"
 		return sv.put(ctx, []store.Event{sv.present(s, stop, "cleared")})
+	}
+	if line.takenBack && !h.keys[sv.event(s, stop, d, KindAct, sv.now(), "#taken-back").SourceKey] {
+		mark := sv.event(s, stop, d, KindAct, sv.now(), "#taken-back")
+		mark.Kind, mark.Actor = KindSkip, store.ActorDetector
+		mark.Summary = oneLine(d.Rule + ": " + errTakenBack.Error())
+		mark.Meta = meta(map[string]any{"rule": d.Rule, "try": d.Try, "why": errTakenBack.Error(), "stop_at": stop.At.UnixMilli()})
+		evs = append(evs, mark)
 	}
 	if err != nil {
 		e := sv.event(s, stop, d, KindAct, sv.now(), "#refused")
@@ -783,9 +801,6 @@ var promptedWait = 10 * time.Second
 func (sv *Supervisor) prompted(ctx context.Context, s *sessions.Session, text string, m map[string]any) error {
 	look := sv.Prompted
 	if look == nil {
-		if s.Transcript == "" || s.Size < 0 { // where the scan stopped is not known: an earlier try would answer
-			return fmt.Errorf("%w: no transcript place to read from", act.ErrUnstable)
-		}
 		look = func(_ context.Context, s *sessions.Session, text string) (bool, time.Time, error) {
 			return claude.Prompted(s.Transcript, s.Size, text)
 		}
@@ -819,9 +834,6 @@ func (sv *Supervisor) prompted(ctx context.Context, s *sessions.Session, text st
 func (sv *Supervisor) unanswered(s *sessions.Session, sent time.Time) error {
 	look := sv.Answered
 	if look == nil {
-		if s.Transcript == "" || s.Size < 0 {
-			return errors.New("no transcript place to read from")
-		}
 		look = func(s *sessions.Session, sent time.Time) (bool, error) {
 			return claude.Answered(s.Transcript, s.Size, sent)
 		}

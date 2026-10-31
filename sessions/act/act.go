@@ -374,14 +374,15 @@ func (s *Sender) tmuxScreen(ctx context.Context, t Target) (string, error) {
 	return string(screen), nil
 }
 
-// ready checks a styled screen: no dialog, no turn running, and an input line of the tool's, with nothing typed
-// on it when empty.
+// ready checks a styled screen: no dialog, no turn running (the key that interrupts it, or Claude Code's own
+// running row, which stays while text on the input line hides that key), and an input line of the tool's, with
+// nothing typed on it when empty.
 func ready(styled, tool string, empty bool) error {
 	plain := Plain(styled)
 	if d := Dialog(plain); d != "" {
 		return fmt.Errorf("%w: %s", ErrDialog, d)
 	}
-	if Running(plain) {
+	if Running(plain) || TurnRuns(styled, tool) {
 		return ErrBusy
 	}
 	typed, ok := Draft(styled, tool)

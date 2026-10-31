@@ -150,6 +150,12 @@ func liveStalled(st *store.Store, f Sender, now *time.Time) *Supervisor {
 	return sv
 }
 
+// unread makes a supervisor read no transcript: nothing answered the request since the scan.
+func unread(sv *Supervisor) *Supervisor {
+	sv.Answered = func(*sessions.Session, time.Time) (bool, error) { return false, nil }
+	return sv
+}
+
 func TestALoopStalledOnARequestIsInterruptedAndResumed(t *testing.T) {
 	x, sent, scan := stalledLoop(t)
 	st := testStore(t)
@@ -197,19 +203,28 @@ func TestALoopStalledOnARequestIsInterruptedAndResumed(t *testing.T) {
 // waitingSession is a Claude Code session whose turn has waited on a request since t0.
 func waitingSession(key string) *sessions.Session {
 	return &sessions.Session{Key: key, Tool: "claude", Pane: "%4", PID: 42, Phase: sessions.Working, TurnOpen: true, Since: t0,
-		RequestAt: t0, Tasks: []sessions.Task{}, Log: &sessions.Log{}}
+		RequestAt: t0, Tasks: []sessions.Task{}, Log: &sessions.Log{}, Transcript: "/sessions/" + key + ".jsonl", Size: 100}
 }
 
 func TestAStalledTurnTakenBackIsLeftToItsOwner(t *testing.T) {
 	st := testStore(t)
 	f := &fakeSender{checkInterrupt: act.ErrIdle} // its screen shows no turn running: its owner's Escape, most likely
 	now := t0.Add(31 * time.Minute)
-	sv := liveStalled(st, f, &now)
+	sv := unread(liveStalled(st, f, &now))
 	s := waitingSession("sess-back")
 	for i := 0; i < 3; i++ {
 		run(t, sv, s)
 		now = now.Add(time.Minute)
 	}
+	// One odd look (a screen caught mid-redraw) does not take the note back: the stop was taken back.
+	f.checkInterrupt = act.ErrNoInput
+	run(t, sv, s)
+	if n, ok := note(t, st, AskNote+s.Key); !ok || !n.Done.IsZero() {
+		t.Fatalf("an odd look took the needs note back: %+v %v", n, ok)
+	}
+	now = now.Add(time.Minute)
+	f.checkInterrupt = act.ErrIdle
+	run(t, sv, s)
 	acts := events(t, st, KindAct)
 	if len(f.sent) != 0 || len(acts) != 1 || !strings.Contains(metaMap(acts[0])["refused"].(string), "taken back") && !strings.Contains(metaMap(acts[0])["refused"].(string), "turn over") ||
 		len(events(t, st, KindCase)) != 0 {
@@ -234,6 +249,13 @@ func TestADryStalledTurnGetsANeedsNote(t *testing.T) {
 	if n, ok := note(t, st, AskNote+s.Key); !ok || !strings.HasPrefix(n.Title, "Resume it?") {
 		t.Fatalf("needs note %+v %v", n, ok)
 	}
+	// Its owner comes by (a local command): the rule holds, and the note stands, decided from the stop.
+	s.ControlAt = now
+	now = now.Add(time.Minute)
+	run(t, sv, s)
+	if n, _ := note(t, st, AskNote+s.Key); !n.Done.IsZero() {
+		t.Fatalf("a hold took the note back: %+v", n)
+	}
 	// Its reply comes: the note is done.
 	s.TurnOpen, s.RequestAt, s.Phase, s.Since, s.LastText = false, time.Time{}, sessions.Idle, now, "Done."
 	now = now.Add(time.Minute)
@@ -247,7 +269,7 @@ func TestADraftOnAStalledTurnIsItsOwnerAtThePane(t *testing.T) {
 	st := testStore(t)
 	f := &fakeSender{checkInterrupt: act.ErrDraft}
 	now := t0.Add(31 * time.Minute)
-	sv := liveStalled(st, f, &now)
+	sv := unread(liveStalled(st, f, &now))
 	s := waitingSession("sess-draft")
 	for i := 0; i < 3; i++ {
 		run(t, sv, s)
@@ -281,8 +303,7 @@ func TestAnInterruptThatDoesNotShowInTheTranscriptOpensACase(t *testing.T) {
 	st := testStore(t)
 	f := &fakeSender{}
 	now := t0.Add(31 * time.Minute)
-	sv := liveStalled(st, f, &now)
-	sv.Answered = func(*sessions.Session, time.Time) (bool, error) { return false, nil }
+	sv := unread(liveStalled(st, f, &now))
 	sv.Prompted = func(context.Context, *sessions.Session, string) (bool, time.Time, error) {
 		return false, time.Time{}, nil
 	}
@@ -307,10 +328,35 @@ func TestAnInterruptThatDoesNotShowInTheTranscriptOpensACase(t *testing.T) {
 	// A refusal before anything was typed (the turn ended on its own meanwhile) passes by itself.
 	st = testStore(t)
 	f = &fakeSender{checkInterrupt: act.ErrIdle}
-	sv = liveStalled(st, f, &now)
+	sv = unread(liveStalled(st, f, &now))
 	run(t, sv, s)
 	if len(events(t, st, KindCase)) != 0 || len(f.sent) != 0 {
 		t.Fatalf("cases %+v sent %q", events(t, st, KindCase), f.sent)
+	}
+	// A session whose place in its transcript the scan does not know: nothing could tell that the message went in.
+	st = testStore(t)
+	f = &fakeSender{}
+	sv = unread(liveStalled(st, f, &now))
+	blind := waitingSession("sess-blind")
+	blind.Size = -1
+	run(t, sv, blind)
+	if len(f.sent) != 0 || f.checks != 0 || len(events(t, st, KindCase)) != 0 || len(events(t, st, KindAct)) != 1 {
+		t.Fatalf("no place: sent %q checks %d cases %+v acts %+v", f.sent, f.checks, events(t, st, KindCase), events(t, st, KindAct))
+	}
+}
+
+func TestAStalledTurnPastItsStaleHourGetsANeedsNote(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0.Add(30*time.Minute + DefaultParams.Stale + time.Minute) // its time came over an hour ago: nothing watched then
+	sv := unread(liveStalled(st, f, &now))
+	s := waitingSession("sess-old")
+	run(t, sv, s)
+	if len(f.sent) != 0 || f.checks != 0 {
+		t.Fatalf("sent %q checks %d", f.sent, f.checks)
+	}
+	if n, ok := note(t, st, AskNote+s.Key); !ok || !strings.HasPrefix(n.Title, "Resume it?") {
+		t.Fatalf("needs note %+v %v", n, ok)
 	}
 }
 
@@ -342,8 +388,16 @@ func TestPromptedReadsTheTranscriptSinceTheScan(t *testing.T) {
 	if a, err := claude.Answered(y.path, fi.Size(), sent); a || err != nil {
 		t.Fatalf("a notice: %v %v", a, err)
 	}
-	y.say("Done.")
+	y.request() // Claude Code's own retry: the wait starts again from it
 	if a, err := claude.Answered(y.path, fi.Size(), sent); !a || err != nil {
+		t.Fatalf("a retry: %v %v", a, err)
+	}
+	z := &transcript{t: t, path: filepath.Join(dir, "z.jsonl"), at: t0}
+	z.user("go").request()
+	sent = z.at
+	fi, _ = os.Stat(z.path)
+	z.say("Done.")
+	if a, err := claude.Answered(z.path, fi.Size(), sent); !a || err != nil {
 		t.Fatalf("a reply: %v %v", a, err)
 	}
 }

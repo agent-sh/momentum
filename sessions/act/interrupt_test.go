@@ -36,6 +36,7 @@ type fakeTurn struct {
 	pasted   string
 	entered  bool
 	noQueue  bool // Enter submits instead of queueing: the turn ends and the hint never shows
+	ends     bool // the turn ends as the paste lands: the input line holds it, and no turn runs
 	newTurn  bool // Enter submits it as the prompt of a new turn, which runs: the input line is empty, no hint
 	late     int  // reads after the paste that still show the line empty
 	keys     []string
@@ -64,6 +65,8 @@ func (f *fakeTurn) run(_ context.Context, stdin, name string, args ...string) ([
 			return []byte(turnScreen("")), nil
 		case f.entered:
 			return []byte(turnScreen(queuedHint)), nil
+		case f.ends && f.pasted != "":
+			return []byte(emptyInputWith(f.line)), nil
 		case f.pasted != "" && f.late > 0:
 			f.late--
 			return []byte(turnScreen("")), nil
@@ -100,27 +103,39 @@ func TestInterruptQueuesTheMessageThenPressesEscape(t *testing.T) {
 	}
 }
 
-func TestTheTurnRunsByItsRunningLineToo(t *testing.T) {
+func TestTheTurnRunsByClaudeCodesOwnRows(t *testing.T) {
+	box := ruleLine + "\n❯" + nbsp + "\n" + ruleLine + "\n"
 	for name, screen := range map[string]string{
-		"the interrupt hint": "✻ Working…\n" + emptyInput + "\n  esc to interrupt",
-		"its running line":   "✻ Fermenting… (35m 11s)\n" + emptyInput,
-		"a waiting notice":   "Waiting for API response · will retry in 31s · check your network\n" + emptyInput,
-		"a retry notice":     "✻ Request timed out. · Retrying in 4s · attempt 3/10\n" + emptyInput,
+		"the interrupt key on the status line": "output\n\n" + box + "  ⏵⏵ auto mode on · esc to interrupt",
+		"its running row":                      "output\n✻ Fermenting… (35m 11s)\n\n" + box + status,
+		"a running row of several words":       "✻ Running the test suite… (2m · ↓ 3k tokens)\n  ⎿  Tip: a tip\n\n" + box + status,
+		"the waiting notice in its place":      "Waiting for API response · will retry in 31s · check your network\n" + box + status,
+		"the retry notice in its place":        "✻ Request timed out. · Retrying in 4s · attempt 3/10\n" + box + status,
 	} {
-		if !TurnRuns(Plain(screen)) {
+		if !TurnRuns(screen, "claude") {
 			t.Errorf("%s: not running", name)
 		}
 	}
-	if TurnRuns(Plain("✻ Worked for 3m 2s\n" + emptyInput)) {
-		t.Error("the line a finished turn leaves is not a running turn")
+	for name, screen := range map[string]string{
+		"the row a finished turn leaves":      "✻ Worked for 3m 2s\n\n" + box + status,
+		"retry words in a tool's output":      "ran it: retrying in 5s (attempt 2/3)\n" + box + status,
+		"the agent's words about waiting":     "I am Waiting for API response from the vendor.\n" + box + status,
+		"a bullet that trails off":            "* Next…\n" + box + status,
+		"the key in the conversation above":   "press esc to interrupt it\n" + box + status,
+		"a running row far up in the history": "✻ Fermenting… (35m 11s)\none\ntwo\nthree\n" + box + status,
+		"no input box":                        "✻ Fermenting… (35m 11s)\nesc to interrupt\n",
+	} {
+		if TurnRuns(screen, "claude") {
+			t.Errorf("%s: running", name)
+		}
 	}
 	for _, hint := range []string{queuedHint, dim + "Press up to select a queued message to edit, or Enter to send them now" + reset} {
 		if !Queued(turnScreen(hint), "claude") {
 			t.Errorf("%q: no message queued", hint)
 		}
 	}
-	if Queued("the queued messages went out\n"+emptyInput, "claude") {
-		t.Error("the words in the transcript are not the input line's")
+	if Queued("the queued messages went out\n"+emptyInput, "claude") || Queued(turnScreen("why are queued messages stuck"), "claude") {
+		t.Error("words in the transcript, or typed on the line, are not the harness's hint")
 	}
 }
 
@@ -133,6 +148,8 @@ func TestInterruptRefusesBeforeTypingAnything(t *testing.T) {
 		{"no turn running", emptyInput, "", "claude", ErrIdle},
 		{"a dialog", turnScreen("") + "\n  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n", "", "claude", ErrDialog},
 		{"a draft", turnScreen("half typed"), "", "claude", ErrDraft},
+		{"a draft under a running row of several words", strings.Replace(turnScreen("half typed"), "✻ Working…", "✻ Running the test suite…", 1), "", "claude", ErrDraft},
+		{"a draft that names the queue", turnScreen("why are queued messages stuck"), "", "claude", ErrDraft},
 		{"a message already queued", turnScreen(queuedHint), "", "claude", ErrQueued},
 		{"copy mode", turnScreen(""), "1", "claude", ErrMode},
 		{"no input line", "✻ Working… (esc to interrupt)\nplain output\n", "", "claude", ErrNoInput},
@@ -177,12 +194,30 @@ func TestInterruptPressesEscapeOnlyOnceTheMessageWaitsInTheQueue(t *testing.T) {
 	if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue", nil); !errors.Is(err, ErrUnstable) || len(f.keys) != 0 {
 		t.Fatalf("never drawn: %v keys %q", err, f.keys)
 	}
-	// still fails before the Escape (its reply came meanwhile): the message waits in the queue, and no Escape.
+	// The turn ends as the paste lands: no Enter, which would make the message its prompt.
+	f = &fakeTurn{ends: true}
+	s, tgt = turnPane(t, f)
+	if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue", nil); !errors.Is(err, ErrUnstable) || len(f.keys) != 0 {
+		t.Fatalf("ended at the paste: %v keys %q", err, f.keys)
+	}
+	// still fails before Enter: no Enter.
 	calls := 0
 	f = &fakeTurn{}
 	s, tgt = turnPane(t, f)
 	if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue", func() error {
 		if calls++; calls > 1 {
+			return errors.New("answered")
+		}
+		return nil
+	}); !errors.Is(err, ErrUnstable) || len(f.keys) != 0 {
+		t.Fatalf("still before Enter: %v keys %q", err, f.keys)
+	}
+	// still fails before the Escape (its reply came meanwhile): the message waits in the queue, and no Escape.
+	calls = 0
+	f = &fakeTurn{}
+	s, tgt = turnPane(t, f)
+	if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue", func() error {
+		if calls++; calls > 2 {
 			return errors.New("answered")
 		}
 		return nil

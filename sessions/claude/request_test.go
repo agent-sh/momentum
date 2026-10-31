@@ -104,9 +104,10 @@ func TestTheQueueCountsWhatItsUserTyped(t *testing.T) {
 	if s := x.facts(tr, x.at); s.Queued != 0 {
 		t.Fatalf("popAll takes them back: queued %d", s.Queued)
 	}
-	// A command typed while the turn ran is queued with no text recorded: it counts as typed.
+	// An item queued with no text recorded is nearly always a scheduled run's prompt, another session's message or
+	// a notification: it does not count as typed.
 	x.queue("enqueue", "")
-	if s := x.facts(tr, x.at); s.Queued != 1 {
-		t.Fatalf("a command: queued %d", s.Queued)
+	if s := x.facts(tr, x.at); s.Queued != 0 {
+		t.Fatalf("an item with no text: queued %d", s.Queued)
 	}
 }

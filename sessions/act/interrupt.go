@@ -16,33 +16,71 @@ var (
 	// reQueuedHint is what Claude Code writes on its input line while a message waits in its queue, in any of its
 	// wordings ("Press up to edit queued messages", "Press up to select a queued message ...").
 	reQueuedHint = regexp.MustCompile(`(?i)\bqueued messages?\b`)
-	// reSpinner is Claude Code's running line: a spinner glyph and a verb that goes on ("✻ Fermenting… (31m 4s)").
-	// The line it leaves when a turn is over says what it did and for how long, with no ellipsis.
-	reSpinner = regexp.MustCompile(`(?m)^\s*[·✢✳✶✻✽*]\s+\p{L}+…`)
-	// reRetrying is what Claude Code writes in place of its running line while it waits for, or retries, a request.
-	reRetrying = regexp.MustCompile(`(?i)\b(waiting for api response|retrying in \d+\s*s|attempt \d+/\d+)\b`)
+	// reSpinner is Claude Code's running row: a spinner glyph, what it does, an ellipsis, and how long it has run
+	// ("✻ Fermenting… (31m 4s)", "✻ Running the test suite… (2m · ↓ 3k tokens)"). The row a finished turn leaves
+	// says what it did and for how long, with no ellipsis.
+	reSpinner = regexp.MustCompile(`^\s*[·✢✳✶✻✽*]\s+.{1,120}…\s*\(\d+[hms]`)
+	// reRetrying is what Claude Code writes in that row's place while it waits for, or retries, a request.
+	reRetrying = regexp.MustCompile(`Retrying in \d+s · attempt \d+/\d+|Waiting for API response · will retry in`)
 )
 
-// Queued reports a styled screen whose input line says a message waits in the harness's queue.
+// Queued reports a styled screen whose input line says, in what it draws dim, that a message waits in the
+// harness's queue.
 func Queued(styled, tool string) bool {
 	line, ok := inputText(styled, tool)
+	if typed, _ := Draft(styled, tool); typed != "" {
+		line = "" // what is typed is not the harness's hint; the caller reads the draft first
+	}
 	return ok && reQueuedHint.MatchString(line)
 }
 
-// TurnRuns reports a plain screen whose bottom shows a Claude Code turn running: the key that interrupts it, or,
-// since Claude Code drops that hint while text sits on the input line, its running line or its retry notice.
-func TurnRuns(screen string) bool {
-	b := bottom(screen)
-	return Running(screen) || reSpinner.MatchString(b) || reRetrying.MatchString(b)
+// TurnRuns reports a styled screen of a Claude Code turn running, read only from Claude Code's own rows around
+// its input box: its running row or the retry notice in its place, just above the box, and the key that
+// interrupts the turn on the status line below it (dropped while text sits on the input line). The conversation
+// above says nothing about the turn.
+func TurnRuns(styled, tool string) bool {
+	above, below, ok := statusRows(styled, tool)
+	if !ok {
+		return false
+	}
+	for _, row := range above {
+		if reSpinner.MatchString(row) || reRetrying.MatchString(row) {
+			return true
+		}
+	}
+	return reRunning.MatchString(strings.Join(below, "\n"))
 }
 
-// bottom is the part of a screen a harness draws its input line, its dialogs and its running line in.
-func bottom(screen string) string {
-	lines := strings.Split(strings.TrimRight(screen, "\n"), "\n")
-	if len(lines) > dialogLines {
-		lines = lines[len(lines)-dialogLines:]
+// statusRows are the plain rows Claude Code draws around its input box: up to three rows with text above the box's
+// top rule, the nearest first, and every row below its bottom rule. false when the screen has no input box of
+// the tool's.
+func statusRows(styled, tool string) (above, below []string, ok bool) {
+	lines := strings.Split(styled, "\n")
+	for i := len(lines) - 1; i > 0; i-- {
+		trimmed := strings.TrimLeftFunc(Plain(lines[i]), unicode.IsSpace)
+		if tool != "claude" || !strings.HasPrefix(trimmed, claudeGlyph) || !rule(Plain(lines[i-1])) {
+			continue
+		}
+		end := i + 1
+		for ; end < len(lines); end++ {
+			if p := strings.TrimSpace(Plain(lines[end])); p == "" || rule(p) {
+				break
+			}
+		}
+		if end >= len(lines) || !rule(strings.TrimSpace(Plain(lines[end]))) {
+			continue // Claude Code's input line has a rule above it and below it
+		}
+		for j := i - 2; j >= 0 && len(above) < 3; j-- {
+			if p := Plain(lines[j]); strings.TrimSpace(p) != "" {
+				above = append(above, p)
+			}
+		}
+		for _, l := range lines[end+1:] {
+			below = append(below, Plain(l))
+		}
+		return above, below, true
 	}
-	return strings.Join(lines, "\n")
+	return nil, nil, false
 }
 
 // CheckInterrupt reports whether Interrupt could type into t now, and by which path: the checks it makes before it
@@ -65,10 +103,10 @@ func (s *Sender) CheckInterrupt(ctx context.Context, t Target) (Path, error) {
 // queued, takes the turn back without a record and puts its prompt back on the input line. text is typed as
 // SafeText makes it.
 //
-// Before the paste it checks what CheckInterrupt checks (the message, the terminal, no dialog, the turn running,
-// no message waiting in the queue, an input line with nothing typed on it), and still: an error from it, as from
+// Before the paste it checks what CheckInterrupt checks (the message, the terminal, no dialog, an input line with
+// nothing typed on it, no message waiting in the queue, the turn running), and still: an error from it, as from
 // the checks, means nothing was typed. After the paste it presses Enter only when the input line holds the
-// message alone, with no dialog. It presses Escape only once the input line is empty again and says that a
+// message alone, with no dialog, the turn still running, and still passing. It presses Escape only once the input line is empty again and says that a
 // message waits in the queue, with the turn running, no dialog, and still passing. A check that fails from the
 // paste on, or a command that fails, is ErrUnstable: the message may sit on the input line, or in the queue. That
 // the turn ended and the message went in is the transcript's to tell: Interrupt does not wait for it.
@@ -145,6 +183,9 @@ func (s *Sender) interrupt(term keys, tool, text string, still func() error) err
 	if err := s.until(term.screen, func(screen string) error { return holding(screen, tool, text) }); err != nil {
 		return err
 	}
+	if err := still(); err != nil {
+		return fmt.Errorf("%w: %v", ErrUnstable, err)
+	}
 	if err := term.press("enter"); err != nil {
 		return fmt.Errorf("%w: enter: %v", ErrUnstable, err)
 	}
@@ -160,18 +201,12 @@ func (s *Sender) interrupt(term keys, tool, text string, still func() error) err
 	return nil
 }
 
-// running checks a styled screen before anything is typed: no dialog, the turn running, nothing waiting in the
-// queue, and an input line of the tool's with nothing typed on it.
+// running checks a styled screen before anything is typed: no dialog, an input line of the tool's with nothing
+// typed on it (read first: text on the line hides the interrupt key, and a draft is its owner at the pane),
+// nothing waiting in the queue, and the turn running.
 func running(styled, tool string) error {
-	plain := Plain(styled)
-	if d := Dialog(plain); d != "" {
+	if d := Dialog(Plain(styled)); d != "" {
 		return fmt.Errorf("%w: %s", ErrDialog, d)
-	}
-	if !TurnRuns(plain) {
-		return ErrIdle
-	}
-	if Queued(styled, tool) {
-		return ErrQueued
 	}
 	switch typed, ok := Draft(styled, tool); {
 	case !ok:
@@ -179,11 +214,18 @@ func running(styled, tool string) error {
 	case typed != "":
 		return ErrDraft
 	}
+	if Queued(styled, tool) {
+		return ErrQueued
+	}
+	if !TurnRuns(styled, tool) {
+		return ErrIdle
+	}
 	return nil
 }
 
-// holding checks a styled screen after the paste: no dialog, and an input line that holds the message and nothing
-// else. Claude Code drops its interrupt hint while text sits on the input line, so the turn is not read here.
+// holding checks a styled screen after the paste: no dialog, the turn still running by its running row, and an
+// input line that holds the message and nothing else. A turn that ended meanwhile would take the message as its
+// prompt at Enter, and Escape would end the turn it opened.
 func holding(styled, tool, text string) error {
 	if d := Dialog(Plain(styled)); d != "" {
 		return fmt.Errorf("%w: %s", ErrDialog, d)
@@ -191,17 +233,19 @@ func holding(styled, tool, text string) error {
 	if !holds(styled, tool, text) {
 		return errors.New("the input line does not hold the message alone")
 	}
+	if !TurnRuns(styled, tool) {
+		return ErrIdle
+	}
 	return nil
 }
 
 // waiting checks a styled screen after Enter put the message in the queue: the turn still runs, no dialog, the
 // input line is empty again and says that a message waits in the queue.
 func waiting(styled, tool string) error {
-	plain := Plain(styled)
-	if d := Dialog(plain); d != "" {
+	if d := Dialog(Plain(styled)); d != "" {
 		return fmt.Errorf("%w: %s", ErrDialog, d)
 	}
-	if !TurnRuns(plain) {
+	if !TurnRuns(styled, tool) {
 		return ErrIdle
 	}
 	if typed, ok := Draft(styled, tool); !ok || typed != "" {

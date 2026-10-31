@@ -75,7 +75,8 @@ func Prompted(path string, from int64, text string) (found bool, interrupted tim
 
 // Answered reports whether the transcript at path, from byte offset from on, holds a record that answers a model
 // request sent at sent, as the tracker reads one: an assistant record, a user record the harness did not inject,
-// or a system record other than a notice, dated at or after the request.
+// or a system record other than a notice, dated at or after the request; or a request after it, Claude Code's
+// own retry, from which the wait starts again.
 func Answered(path string, from int64, sent time.Time) (bool, error) {
 	answered := false
 	err := appended(path, from, func(e line, _ []byte) bool {
@@ -84,7 +85,8 @@ func Answered(path string, from int64, sent time.Time) (bool, error) {
 			return true
 		}
 		switch {
-		case e.Type == "assistant", e.Type == "user" && !e.IsMeta, e.Type == "system" && e.Subtype != "informational":
+		case e.Type == "api-request" && at.After(sent),
+			e.Type == "assistant", e.Type == "user" && !e.IsMeta, e.Type == "system" && e.Subtype != "informational":
 			answered = true
 			return false
 		}

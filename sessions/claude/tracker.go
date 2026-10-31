@@ -295,14 +295,13 @@ func (t *Tracker) queued(e line) {
 	}
 }
 
-// queueKey is how the queue keeps an item: a message its user typed by its text, folded and cut; one recorded
-// without its text (a command typed while the turn ran) as "?"; a task's notification as "".
+// queueKey is how the queue keeps an item: a message its user typed by its text, folded and cut; anything else
+// Claude Code queues as "": a task's notification, and an item recorded without its text, which is nearly always a
+// scheduled run's prompt, another session's message or a notification (the screen's queue hint tells the rare
+// command typed meanwhile).
 func queueKey(content string) string {
-	switch {
-	case strings.Contains(content, "<task-notification>"):
+	if strings.TrimSpace(content) == "" || strings.Contains(content, "<task-notification>") {
 		return ""
-	case strings.TrimSpace(content) == "":
-		return "?"
 	}
 	return text.OneLine(content, 200)
 }

@@ -196,13 +196,14 @@ func TestSendRefusesWhenTheSessionIsNotWaitingForInput(t *testing.T) {
 func TestSendDoesNotPressEnterUnlessTheInputLineHoldsTheMessageAlone(t *testing.T) {
 	msg := "[momentum] continue"
 	cases := map[string]struct{ after, later string }{
-		"someone else's words":         {emptyInputWith("someone else's words"), ""},
-		"the message and more":         {emptyInputWith(msg + " and more"), ""},
-		"a dialog opened meanwhile":    {emptyInputWith(msg) + "\n  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n", ""},
-		"a turn started meanwhile":     {"✻ Working… (2s · esc to interrupt)\n" + emptyInputWith(msg), ""},
-		"the input line went away":     {"output only\n", ""},
-		"copy mode meanwhile":          {"", "1 0"},
-		"panes synchronized meanwhile": {"", "0 1"},
+		"someone else's words":             {emptyInputWith("someone else's words"), ""},
+		"the message and more":             {emptyInputWith(msg + " and more"), ""},
+		"a dialog opened meanwhile":        {emptyInputWith(msg) + "\n  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n", ""},
+		"a turn started meanwhile":         {"✻ Working… (2s · esc to interrupt)\n" + emptyInputWith(msg), ""},
+		"a turn whose key the paste hides": {strings.Replace(emptyInputWith(msg), "output\n", "output\n✻ Working… (2s)\n\n", 1), ""},
+		"the input line went away":         {"output only\n", ""},
+		"copy mode meanwhile":              {"", "1 0"},
+		"panes synchronized meanwhile":     {"", "0 1"},
 	}
 	for name, c := range cases {
 		f := &fakeTmux{screen: emptyInput, mode: "0", after: c.after, later: c.later}
