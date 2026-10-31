@@ -49,7 +49,6 @@ func TestTheLoopsStallIsResumedOnEitherScreen(t *testing.T) {
 	}{
 		{"running", "running", Live}, // as it ships
 		{"idle", "idle", Live},
-		{"idle, stalled the only live rule", "idle", map[string]bool{RuleStalled: true}},
 	} {
 		t.Run(c.name, func(t *testing.T) { stallResumed(t, c.screen, c.live) })
 	}

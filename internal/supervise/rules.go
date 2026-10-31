@@ -67,6 +67,7 @@ type Stop struct {
 	IdleAt          time.Time      // when its last turn ended
 	ResumedAt       time.Time      // the harness reopened the session after it ended mid-task, and nothing happened since
 	RequestAt       time.Time      // the model request the open turn still waits on: nothing answered it since
+	ScreenIdle      time.Time      // the first look that found its screen showing no turn running, for RequestAt
 	Queued          int            // messages its user typed while the turn ran, which the harness holds
 	Slept, Woke     time.Time      // the machine's last suspend: a wait counts from its end when it began before the wait ended
 	OwnerAt         time.Time      // when the owner was last at the session: his last turn, or his opening it
@@ -322,8 +323,10 @@ const StalledText = Marker + " Your last request to the model got no reply. Cont
 // notification waits in the queue behind the turn. Past the longest a reply legitimately takes to begin, counted
 // from the request or from the machine waking after it, the message goes in as the next prompt: queued, with
 // Escape to end the turn that waits, while the turn runs on its screen (act's Interrupt), or typed the plain way
-// when the screen shows no turn running. A message its user queued waits for him. With its tries used up, a case
-// opens once the last message's own request has waited as long.
+// when the screen shows no turn running. An Escape with nothing queued takes a turn back without a record, so on
+// that screen the message waits the owner window more, from the first look that found it (ScreenIdle). A message
+// its user queued waits for him. With its tries used up, a case opens once the last message's own request has
+// waited as long.
 func stalled(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
 	if s.Tool != "claude" || s.RequestAt.IsZero() || !s.Working || s.Busy || s.Queued > 0 ||
 		!s.Started.IsZero() && s.RequestAt.Before(s.Started) {
@@ -334,7 +337,11 @@ func stalled(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
 	if n >= p.StalledTries { // the last message's own request: a case once it too has waited
 		return usedAt(RuleStalled, n, from.Add(p.StalledWait), why), true
 	}
-	return wait(RuleStalled, from.Add(p.StalledWait), n+1, StalledText, why), true
+	at := from.Add(p.StalledWait)
+	if idle := s.ScreenIdle.Add(p.OwnerWindow); !s.ScreenIdle.IsZero() && idle.After(at) {
+		at, why = idle, why+"; its screen showed no turn running at "+s.ScreenIdle.Local().Format("15:04")+", which may be its owner's Escape"
+	}
+	return wait(RuleStalled, at, n+1, StalledText, why), true
 }
 
 // afterSleep counts a rule's wait, which began at from, from the machine's wake instead when the machine slept

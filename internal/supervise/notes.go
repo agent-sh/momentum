@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
 	"github.com/agent-sh/momentum/sessions"
 )
@@ -30,7 +31,8 @@ type seenSession struct {
 	asks     bool
 }
 
-// ask is what a session waits on that only its owner can answer: the needs note's title is the question itself.
+// ask is what a session waits on that only its owner can answer: the needs note's title is the question itself, or
+// what momentum could not do.
 type ask struct {
 	title, detail string
 	since         time.Time // when it began to wait: the note's time, so the same ask is the same note
@@ -128,7 +130,7 @@ func resumed(s *sessions.Session, stop Stop, text string, interrupt bool, now ti
 
 // notes keeps supervision's notes in step with what the run saw. A session that has waited on its owner past the
 // owner window gets a needs note, once per ask: a note he resolved while the session still waits on the same ask
-// stays resolved. A needs note is done when its session moves on: the ask is answered or another took its place,
+// stays resolved, and a standing one takes the ask's latest title. A needs note is done when its session moves on: the ask is answered or another took its place,
 // or the session ended. A problem note is done when its owner came back to the session or it works again: a turn
 // open, or a stop since without an error. A session the run left alone keeps its notes as they are.
 func (sv *Supervisor) notes(ctx context.Context, seen map[string]*seenSession) error {
@@ -183,8 +185,9 @@ func (sv *Supervisor) notes(ctx context.Context, seen map[string]*seenSession) e
 			continue
 		}
 		id := AskNote + key
-		if n, ok := held[id]; ok && n.At.UnixMilli() == e.ask.since.UnixMilli() {
-			continue // written already; standing, or resolved by its owner
+		if n, ok := held[id]; ok && n.At.UnixMilli() == e.ask.since.UnixMilli() &&
+			(!n.Done.IsZero() || n.Title == plain.Clip(plain.Line(e.ask.title), store.TitleMax)) {
+			continue // written already, and standing as it is or resolved by its owner; a new title replaces a standing one
 		}
 		n := store.Note{ID: id, Kind: store.NoteNeeds, Title: e.ask.title, Detail: e.ask.detail, Source: store.DefaultNoteSource, At: e.ask.since}
 		if _, err := sv.Store.PutNote(ctx, n); err != nil && !errors.Is(err, store.ErrBadNote) {
