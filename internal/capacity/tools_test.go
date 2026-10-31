@@ -398,6 +398,21 @@ func (f *uvLockFixture) addLock(t *testing.T, pid int, lock string) {
 		f.id.major, f.id.minor, f.id.ino))
 }
 
+// lets drops a holder's lock from the locks file, as its end does.
+func (f *uvLockFixture) lets(t *testing.T, pid int) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(f.proc, "locks"))
+	must(t, err)
+	var keep []string
+	for _, l := range strings.Split(string(b), "\n") {
+		if fs := strings.Fields(l); len(fs) > 4 && fs[4] == strconv.Itoa(pid) {
+			continue
+		}
+		keep = append(keep, l)
+	}
+	write(t, filepath.Join(f.proc, "locks"), strings.Join(keep, "\n"))
+}
+
 // holds adds a holder of the lock file's first inode; waits adds a process that waits for it.
 func (f *uvLockFixture) holds(t *testing.T, pid int) {
 	t.Helper()
@@ -1477,6 +1492,7 @@ func TestAProcessIDAnotherProcessTookIsNotTheOneTheLookSaw(t *testing.T) {
 		{"a holder's", func(t *testing.T, f *uvLockFixture) {
 			must(t, os.RemoveAll(filepath.Join(f.proc, "4")))
 			must(t, os.RemoveAll(filepath.Join(f.proc, "5")))
+			f.lets(t, 4)
 			f.addProc(t, 4, 1, "bash\x00", "PATH=/usr/bin\x00")
 		}, true},
 		// the tool's command ended and another, with the same pid, runs: it may be at its sync
@@ -1534,5 +1550,162 @@ func TestAPrunesNotesKeepWhyItMayNotPrune(t *testing.T) {
 		if rr.Rule == RuleUV && (!slices.Contains(rr.Notes, "no prune: the scheduled jobs could not all be read") || f.pruned(true) || f.pruned(false)) {
 			t.Errorf("the rule's notes keep why it may not prune: %q %v", rr.Notes, f.ran)
 		}
+	}
+}
+
+func TestATitledCommandOfARunThatLayersIsOneTheLookCannotRead(t *testing.T) {
+	// uv run --with runs its command from a layer in the cache over the project's .venv: setproctitle maps from the
+	// .venv, the layer's pure-Python modules were read and closed, and the environment that named the layer is gone
+	zeroed := []string{strings.Repeat("\x00", 512)}
+	for _, c := range []struct {
+		name string
+		argv []string
+		done bool
+	}{
+		{"--with", []string{"uv", "run", "--with", "six", "python", "srv.py"}, false},
+		{"-w", []string{"uv", "run", "-wsix", "python", "srv.py"}, false},
+		{"--with-requirements", []string{"uv", "run", "--with-requirements=r.txt", "python", "srv.py"}, false},
+		{"a run that layers nothing", []string{"uv", "run", "--", "srv", "-w", "4"}, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			procs := func(cache, lock string) []fakeProc {
+				return append(outside(cache, lock),
+					fakeProc{pid: 8, ppid: 1, argv: c.argv, fds: []string{lock}, cwd: "/proj", env: uvEnv},
+					fakeProc{pid: 9, ppid: 8, argv: []string{"srv: master"}, exe: "/usr/bin/python3.12", cwd: "/proj",
+						maps: []string{"/proj/.venv/lib/python3.12/site-packages/setproctitle/_setproctitle.so"}, env: zeroed})
+			}
+			f := newUVLock(t, procs, 4, 6, 8)
+			g := f.run(t, options(t, f.proc, time.Now(), nil))
+			if g.Done != c.done || g.Done != f.pruned(true) || !c.done && !strings.Contains(g.Why, "a command whose environment reads as nothing runs under a uv run that layers") {
+				t.Fatalf("a layered run's command whose environment is gone may import from the cache: %s %q %v", g.Action, g.Why, f.ran)
+			}
+		})
+	}
+}
+
+func TestAHolderThatCameDuringTheScanKeepsTheLockFileInPlace(t *testing.T) {
+	f := newUVLock(t, outside, 4, 6)
+	defer func(s func(string) (os.FileInfo, error)) { statLock = s }(statLock)
+	came := false
+	statLock = func(p string) (os.FileInfo, error) {
+		if !came && strings.HasPrefix(p, f.proc) { // the scan stats its first link that names the lock file
+			came = true
+			f.addProc(t, 77, 1, "uv\x00run\x00x\x00", "")
+			f.holds(t, 77)
+		}
+		return os.Stat(p)
+	}
+	g := f.run(t, options(t, f.proc, time.Now(), nil))
+	if g.Done || f.pruned(true) || !strings.Contains(g.Why, "took the cache's lock since the look") {
+		t.Fatalf("a uv process that took the lock during the scan before the rename keeps it: %s %q", g.Action, g.Why)
+	}
+	if id, err := fileID(f.lock); err != nil || id != f.id {
+		t.Errorf("the lock file it holds stays in place: %v %v", id, err)
+	}
+}
+
+func TestAHolderWhosePIDAnotherProcessTookIsNew(t *testing.T) {
+	f := newUVLock(t, outside, 4, 6)
+	armed := false
+	o := options(t, f.proc, time.Now(), nil)
+	o.Tools = dockerHook{f.tools(nil), &armed, func() { // the tool ended; a uv process took its pid, and the lock
+		must(t, os.RemoveAll(filepath.Join(f.proc, "4")))
+		must(t, os.RemoveAll(filepath.Join(f.proc, "5")))
+		f.addProc(t, 4, 1, "uv\x00run\x00x\x00", "")
+	}}
+	g := f.runWith(t, o, f.cache)
+	if g.Done || f.pruned(true) || !strings.Contains(g.Why, "uv process (pid 4) took the cache's lock since the look") {
+		t.Fatalf("a holder is the one the look saw by its pid and its start: %s %q", g.Action, g.Why)
+	}
+	if id, err := fileID(f.lock); err != nil || id != f.id {
+		t.Errorf("the lock file stays in place: %v %v", id, err)
+	}
+}
+
+// inNamespaces gives the fixture's processes mount namespaces: those named in other the namespace of another, the
+// rest the run's.
+func inNamespaces(t *testing.T, f *uvLockFixture, other ...string) {
+	t.Helper()
+	ents, err := os.ReadDir(f.proc)
+	must(t, err)
+	for _, e := range ents {
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+		ns := "mnt:[4026531841]"
+		if slices.Contains(other, e.Name()) {
+			ns = "mnt:[4026533333]"
+		}
+		must(t, os.MkdirAll(filepath.Join(f.proc, e.Name(), "ns"), 0o755))
+		must(t, os.Symlink(ns, filepath.Join(f.proc, e.Name(), "ns", "mnt")))
+	}
+}
+
+func TestTheLookUnderTheLockReadsNoNewNamespace(t *testing.T) {
+	f := newUVLock(t, outside, 4, 6)
+	inNamespaces(t, f)
+	o := options(t, f.proc, time.Now(), nil)
+	o.afterUVLock = func() { // the tool's command starts a sandbox that sees the cache where the run does
+		dir := f.addProc(t, 16, 5, "bwrap\x00srv\x00", "PATH=/usr/bin\x00")
+		must(t, os.MkdirAll(filepath.Join(dir, "ns"), 0o755))
+		must(t, os.Symlink("mnt:[4026533333]", filepath.Join(dir, "ns", "mnt")))
+		must(t, os.Symlink("/", filepath.Join(dir, "root")))
+	}
+	if g := f.run(t, o); g.Done || f.pruned(true) || !strings.Contains(g.Why, "another mount namespace") {
+		t.Fatalf("a namespace the first look did not answer is not read under the lock: %s %q %v", g.Action, g.Why, f.ran)
+	}
+}
+
+func TestANamespaceThatSeesTheCacheAsUVNamesItIsJudgedByItsView(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	must(t, err)
+	link := filepath.Join(dir, "uv-link") // uv names the cache through a link
+	procs := func(cache, lock string) []fakeProc {
+		return append(outside(cache, lock), fakeProc{pid: 8, ppid: 1, argv: []string{"uv", "tool", "uvx", "srv"},
+			fds: []string{filepath.Join(link, ".lock")}, env: uvEnv}, fakeProc{pid: 9, ppid: 8, argv: []string{"srv"}, env: started("/opt/srv/bin")})
+	}
+	f := newUVLockIn(t, filepath.Join(dir, "uv"), procs, 4, 6, 8)
+	must(t, os.Symlink(f.cache, link))
+	inNamespaces(t, f, "8", "9")
+	root := t.TempDir() // the sandbox has the lock file only where uv names it
+	must(t, os.MkdirAll(filepath.Join(root, link), 0o755))
+	must(t, os.Link(f.lock, filepath.Join(root, link, ".lock")))
+	for _, pid := range []string{"8", "9"} {
+		must(t, os.Symlink(root, filepath.Join(f.proc, pid, "root")))
+	}
+	o := options(t, f.proc, time.Now(), nil)
+	o.Tools = f.tools(map[string]string{"uv cache dir": link + "\n"})
+	if g := f.runWith(t, o, link); !g.Done || !f.pruned(true) {
+		t.Fatalf("a sandbox that sees the lock file where uv names it is judged by its paths: %s %q %v", g.Action, g.Why, f.ran)
+	}
+}
+
+func TestALookUnderTheLockThatDoesNotEndLetsTheLockGo(t *testing.T) {
+	defer func(d time.Duration) { uvUnderLockWait = d }(uvUnderLockWait)
+	uvUnderLockWait = 200 * time.Millisecond
+	procs := func(cache, lock string) []fakeProc { // it has the old lock file open, so the look after the rename stats it
+		return append(outside(cache, lock), fakeProc{pid: 13, ppid: 1, argv: []string{"server"}, fds: []string{lock + " (deleted)"}})
+	}
+	f := newUVLock(t, procs, 4, 6)
+	write(t, f.lock+" (deleted)", "")
+	stuck := make(chan struct{})
+	t.Cleanup(func() { close(stuck) })
+	defer func(s func(string) (os.FileInfo, error)) { statLock = s }(statLock)
+	statLock = func(p string) (os.FileInfo, error) {
+		if strings.HasSuffix(p, filepath.Join("13", "fd", "3")) && !exists(f.lock+".capacity") { // after the rename
+			<-stuck // a read of /proc that does not answer
+		}
+		return os.Stat(p)
+	}
+	start := time.Now()
+	g := f.run(t, options(t, f.proc, time.Now(), nil))
+	if g.Done || f.pruned(true) || !strings.Contains(g.Why, "did not end in 200ms") || time.Since(start) > 5*time.Second {
+		t.Fatalf("a look under the lock that does not end lets it go: %s %q after %s", g.Action, g.Why, time.Since(start))
+	}
+	fh, err := os.Open(f.lock)
+	must(t, err)
+	defer fh.Close()
+	if err := syscall.Flock(int(fh.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		t.Errorf("a uv process that starts gets the lock: %v", err)
 	}
 }

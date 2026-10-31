@@ -203,8 +203,8 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 	// rule cannot tell what such a process runs (a command that changed its environment, a stuck sync)
 	keep := func(pid int, why string) ([]Finding, []string, error) {
 		if p, ok := now.Table[pid]; ok && up > 0 && p.Start > 0 && up-p.Start >= int64(uvQuietMax.Seconds())*userHZ {
-			return report(fmt.Sprintf("%s has looked like a uv process that may write the cache for %s, and the rule "+
-				"cannot tell what it runs", why, (time.Duration(up-p.Start) * time.Second / userHZ).Round(time.Hour)))
+			return report(fmt.Sprintf("%s, which has run for %s, looks like a uv process that may write the cache, and the "+
+				"rule cannot tell what it runs", why, (time.Duration(up-p.Start) * time.Second / userHZ).Round(time.Hour)))
 		}
 		f.Action, f.Why = ActKeep, "waits for an install: "+why
 		return []Finding{f}, notes, nil
@@ -253,21 +253,48 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 		for pid := range lk.locks.holders {
 			cmds[pid], _ = uvStarted(now, r.opt.ProcRoot, pid)
 		}
-		held, why := uvSwap{lk: lk, look: now, procRoot: r.opt.ProcRoot, c: c, after: r.opt.afterUVLock}.lockInPlace()
+		swap := uvSwap{lk: lk, look: now, procRoot: r.opt.ProcRoot, c: c, after: r.opt.afterUVLock}
+		held, why := swap.lockInPlace()
 		if held == nil {
 			return report(why)
 		}
-		// the look under capacity's lock reads /proc, and of other filesystems only what the first look read: one that
-		// does not answer would keep every uv process that starts waiting
+		// the look under capacity's lock reads /proc, and of other filesystems only the lock file and what the first
+		// look read: one that does not answer would keep every uv process that starts waiting. A process stuck on such
+		// a filesystem can still hold up a read of its /proc files, so the look has a deadline too.
 		envs.resolve = false
-		again := look()
-		if pid, why := uvSameCommands(now, again, r.opt.ProcRoot, cmds); why != "" {
-			held.Close()
-			return keep(pid, why)
+		type verdict struct {
+			pid              int
+			keep, why, users string
 		}
-		if users := uvUsers(again, r.opt.ProcRoot, c, lk.locks.holders, envs); users != "" {
+		done := make(chan verdict, 1)
+		go func() {
+			if why := swap.afterRename(); why != "" {
+				done <- verdict{why: why}
+				return
+			}
+			again := look()
+			if pid, why := uvSameCommands(now, again, r.opt.ProcRoot, cmds); why != "" {
+				done <- verdict{pid: pid, keep: why}
+				return
+			}
+			done <- verdict{users: uvUsers(again, r.opt.ProcRoot, c, lk.locks.holders, envs)}
+		}()
+		var v verdict
+		select {
+		case v = <-done:
+		case <-time.After(uvUnderLockWait):
+			v.why = fmt.Sprintf("the look under capacity's lock did not end in %s: a process's files in /proc do not answer", uvUnderLockWait)
+		}
+		switch {
+		case v.why != "":
 			held.Close()
-			return report(using(users))
+			return report(v.why)
+		case v.keep != "":
+			held.Close()
+			return keep(v.pid, v.keep)
+		case v.users != "":
+			held.Close()
+			return report(using(v.users))
 		}
 		err = r.uvPrune(ctx, held, "--force")
 		held.Close() // a uv process that waited for it goes on
@@ -289,6 +316,11 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 	f.Detail += fmt.Sprintf("; %s to %s in %s", gib(size), gib(after), took)
 	return []Finding{f}, notes, r.st.SetMark(ctx, "prune:uv", r.now)
 }
+
+// uvUnderLockWait is how long the look under capacity's lock may take before the rule lets the lock go: about twenty
+// times what the look takes on a machine with some 700 processes, and short beside the UV_LOCK_TIMEOUT a new uv
+// process waits.
+var uvUnderLockWait = 10 * time.Second
 
 // uvQuietMax is how long the rule waits quietly for one uv process that may write the cache before it reports it: a
 // day, longer than any install (an extension built from source takes hours).
@@ -716,17 +748,26 @@ func uvUsers(s *Sample, procRoot string, c uvCache, holders map[int]bool, envs *
 	}
 	own := mountNS(procRoot, os.Getpid())
 	for _, pid := range sortedPIDs(holders) {
-		if _, ok := s.Table[pid]; !ok {
+		h, ok := s.Table[pid]
+		if !ok {
 			if _, err := os.Stat(filepath.Join(procRoot, strconv.Itoa(pid))); !errors.Is(err, fs.ErrNotExist) {
 				add(pid, "a process the look cannot read holds the lock")
 			}
 			continue
 		}
+		layers := uvLayers(h.Argv)
 		for _, q := range append([]int{pid}, descendants(s, pid)...) {
-			if unreadable(procRoot, q) {
+			switch {
+			case unreadable(procRoot, q):
 				add(q, "a process the look cannot read runs under a holder of the lock")
-			} else if ns := mountNS(procRoot, q); own != "" && ns != "" && ns != own && !envs.sameView(procRoot, q, ns, c) {
-				add(q, "a process that sees the cache by other paths (another mount namespace) runs under a holder of the lock")
+			case q != pid && layers && blankEnv(procRoot, q):
+				// its imports come from the cache's layer with no file of it open or mapped, and its environment, which
+				// would name the layer, is gone (setproctitle wrote over it)
+				add(q, "a command whose environment reads as nothing runs under a uv run that layers one of the cache's environments")
+			default:
+				if ns := mountNS(procRoot, q); own != "" && ns != "" && ns != own && !envs.sameView(procRoot, q, ns, c) {
+					add(q, "a process that sees the cache by other paths (another mount namespace) runs under a holder of the lock")
+				}
 			}
 		}
 	}
@@ -736,23 +777,56 @@ func uvUsers(s *Sample, procRoot string, c uvCache, holders map[int]bool, envs *
 	return strings.Join(names, ", ")
 }
 
+// uvLayers reports whether a uv process is a run that layers an environment of the cache over its command's (--with,
+// -w, --with-editable, --with-requirements): the command then imports from the cache with no file of it open or
+// mapped, while what it maps may come from the environment beneath. An argument of the command that starts so counts
+// too; that only holds a prune.
+func uvLayers(argv []string) bool {
+	cmd := uvCommand(argv)
+	if len(cmd) == 0 || cmd[0] != "run" {
+		return false
+	}
+	for _, a := range cmd[1:] {
+		if a == "--" {
+			break
+		}
+		if strings.HasPrefix(a, "--with") || strings.HasPrefix(a, "-w") {
+			return true
+		}
+	}
+	return false
+}
+
+// blankEnv reports whether a process's environment reads as nothing: a command that set its process title over it
+// (setproctitle), or one started with env -i.
+func blankEnv(procRoot string, pid int) bool {
+	env, err := readEnviron(procRoot, pid)
+	return err == nil && !slices.ContainsFunc(env, func(kv string) bool { return strings.Contains(kv, "=") })
+}
+
 // mountNS is a process's mount namespace, as /proc names it, or "".
 func mountNS(procRoot string, pid int) string {
 	l, _ := os.Readlink(filepath.Join(procRoot, strconv.Itoa(pid), "ns", "mnt"))
 	return l
 }
 
-// descendants are the processes under one in a sample, at most 256.
+// descendants are the processes under one in a sample, each once.
 func descendants(s *Sample, pid int) []int {
 	kids := map[int][]int{}
 	for _, q := range sortedPIDs(s.Table) {
 		kids[s.Table[q].PPID] = append(kids[s.Table[q].PPID], q)
 	}
+	seen := map[int]bool{pid: true}
 	var out []int
-	for todo := kids[pid]; len(todo) > 0 && len(out) < 256; {
+	for todo := kids[pid]; len(todo) > 0; {
 		q := todo[0]
-		todo = append(todo[1:], kids[q]...)
+		todo = todo[1:]
+		if seen[q] {
+			continue
+		}
+		seen[q] = true
 		out = append(out, q)
+		todo = append(todo, kids[q]...)
 	}
 	return out
 }
@@ -992,13 +1066,13 @@ type uvSwap struct {
 	after    func() // a test's way into the moment after the rename
 }
 
-// lockInPlace returns the file that holds capacity's lock, or nil and why it let go. It gives up without renaming
+// lockInPlace returns the file that holds capacity's lock, or nil and why it gave up. It gives up without renaming
 // when the lock file is not the one the look saw, or when, with capacity's lock taken on the new file, the old file
 // has a holder the look did not see, a process that waits for it or holds it alone, or one that has it open and was
-// no holder (uv opens the file, then locks it). It looks the same way after the rename and lets go on what it finds
-// then, which only keeps its own prune from running: the new file stays, and a process that came to the old file in
-// the instant between the last look and the rename keeps a lock no later clean or prune waits for. The caller closes
-// the file it returns, which lets the lock go.
+// no holder (uv opens the file, then locks it). afterRename looks the same way after the rename; what it finds then
+// only keeps capacity's own prune from running: the new file stays, and a process that came to the old file in the
+// instant between the last look and the rename keeps a lock no later clean or prune waits for. The caller closes the
+// file it returns, which lets the lock go.
 func (s uvSwap) lockInPlace() (*os.File, string) {
 	lockFile := s.lk.file
 	if id, err := fileID(lockFile); err != nil || id != s.lk.id {
@@ -1036,34 +1110,38 @@ func (s uvSwap) lockInPlace() (*os.File, string) {
 	if s.after != nil {
 		s.after()
 	}
-	time.Sleep(uvLockSettle)
-	if why := s.check(true, "as capacity put its own in place"); why != "" {
-		f.Close()
-		return nil, why
-	}
 	return f, ""
+}
+
+// afterRename looks at the old lock file again once it was renamed over, a moment after (uv opens the file, then
+// locks it), and says why capacity lets its lock go, or "".
+func (s uvSwap) afterRename() string {
+	time.Sleep(uvLockSettle)
+	return s.check(true, "as capacity put its own in place")
 }
 
 // check says why the old lock file keeps capacity's lock out of its place, or "": a holder the look did not see, a
 // process that waits for it or holds it alone, a process that has it open and was no holder, or a uv process the
 // look did not see whose open files the run may not read. renamed is whether the file was renamed over.
 func (s uvSwap) check(renamed bool, when string) string {
+	// the open files first and the locks last: uv locks the file as it opens it, so the read of the locks, just before
+	// the rename, sees a uv process that came during the scan
+	open, unseen := openers(s.procRoot, s.lk.id, s.c.isLock, renamed, s.look)
 	now := lockHolders(s.procRoot, s.lk.keys)
 	if !now.known {
 		return "the locks cannot be read again"
 	}
 	now.ended(nil, s.procRoot)
 	for _, pid := range sortedPIDs(now.holders) {
-		if !s.lk.locks.holders[pid] {
+		if !s.wasHolder(pid) {
 			return fmt.Sprintf("a uv process (pid %d) took the cache's lock %s", pid, when)
 		}
 	}
 	if why := now.blocks(); why != "" {
 		return why
 	}
-	open, unseen := openers(s.procRoot, s.lk.id, s.c.isLock, renamed, s.look)
 	for _, pid := range open {
-		if !s.lk.locks.holders[pid] {
+		if !s.wasHolder(pid) {
 			return fmt.Sprintf("a process (pid %d) opened the cache's lock %s", pid, when)
 		}
 	}
@@ -1072,6 +1150,16 @@ func (s uvSwap) check(renamed bool, when string) string {
 			"its open files", unseen[0], when)
 	}
 	return ""
+}
+
+// wasHolder reports whether a process is one the look saw hold the lock: the same pid, and the same start.
+func (s uvSwap) wasHolder(pid int) bool {
+	p, ok := s.look.Table[pid]
+	if !ok || !s.lk.locks.holders[pid] {
+		return false
+	}
+	st, err := os.ReadFile(filepath.Join(s.procRoot, strconv.Itoa(pid), "stat"))
+	return err == nil && startOf(string(st)) == p.Start
 }
 
 // openers are the processes that have the lock file open, by their /proc fds: a link /proc names as the lock file
