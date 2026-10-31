@@ -9,6 +9,9 @@
 // would answer it and Enter would pick its highlighted option), or the input line holds text someone typed and
 // has not sent. After the paste it makes the same checks again and presses Enter only when the input line holds
 // the message and nothing else. A refusal names its reason (the Err values).
+//
+// One more write breaks a Claude Code turn whose model request never got its reply (Interrupt): the message goes on
+// the input line while the turn runs, so Claude Code queues it, and Escape ends the turn and sends it.
 package act
 
 import (
@@ -60,7 +63,8 @@ var (
 
 // ErrUnstable means the paste began and the message was not known to be submitted: after the paste a check
 // failed or the input line did not hold the message alone, so Enter was not pressed, or a command from the paste
-// on failed. The message may sit on the input line unsent; when Enter itself failed, it may have gone through.
+// on failed. The message may sit on the input line unsent; when Enter itself failed, it may have gone through. From
+// Interrupt, it may also wait in the harness's queue, Escape not pressed.
 var ErrUnstable = errors.New("pasted, but not known to be submitted")
 
 // Target is a session as a sender needs it: where it runs and which process is its.

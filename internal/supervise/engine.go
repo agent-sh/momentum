@@ -52,10 +52,21 @@ const historyDays = 30
 type Sender interface {
 	Check(ctx context.Context, t act.Target) (act.Path, error)
 	Send(ctx context.Context, t act.Target, text string) (act.Path, error)
+	// CheckInterrupt is the checks Interrupt makes before it types anything: act.ErrIdle when no turn runs on the
+	// screen.
+	CheckInterrupt(ctx context.Context, t act.Target) (act.Path, error)
 	// Interrupt types the message into a turn that runs, which holds it in its queue, and ends the turn, which
-	// sends it: a turn stalled on a request with no reply.
-	Interrupt(ctx context.Context, t act.Target, text string) (act.Path, error)
+	// sends it: a turn stalled on a request with no reply. still is asked before the paste and before the Escape.
+	Interrupt(ctx context.Context, t act.Target, text string, still func() error) (act.Path, error)
 }
+
+// errTakenBack is the stalled rule's refusal when the screen shows no turn running while the transcript still
+// waits on the request: the turn was taken back (its owner's Escape takes one back without a record), and the
+// message would resume work its owner stopped. It passes when the session moves on.
+var errTakenBack = errors.New("its screen shows the turn over while its transcript still waits on the request")
+
+// errAnswered is a stalled request that something answered since the scan: the turn went on by itself.
+var errAnswered = errors.New("its transcript shows the request answered since the scan")
 
 // Supervisor runs the rules over the sessions one scan found, sends what the live rules decide, and records
 // every decision, every message and what came of it as an event.
@@ -77,7 +88,10 @@ type Supervisor struct {
 	Woke func(ctx context.Context) time.Time
 	// Prompted tells whether the session's transcript shows the message as the prompt of a turn since the scan,
 	// after an interrupt put it there; nil reads the transcript (claude.Prompted), a few seconds at most.
-	Prompted func(ctx context.Context, s *sessions.Session, text string) (found, interrupted bool, err error)
+	Prompted func(ctx context.Context, s *sessions.Session, text string) (found bool, interrupted time.Time, err error)
+	// Answered tells whether the session's transcript shows, since the scan, a record that answers a request sent
+	// at sent; nil reads the transcript (claude.Answered).
+	Answered func(s *sessions.Session, sent time.Time) (bool, error)
 }
 
 // Line is one decision of a run, for the command's output.
@@ -85,6 +99,7 @@ type Line struct {
 	Session, Name, Rule, Verdict, Text, Why string
 	Sent                                    bool
 	Err                                     string
+	takenBack                               bool // the stalled turn's screen shows it taken back
 }
 
 func (sv *Supervisor) now() time.Time {
@@ -170,7 +185,7 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 			d.Rule = planRules(stop, Tries{}, sv.Params, probe).Rule // the rule a guard keeps from acting, if any
 		}
 		entry := &seenSession{s: s, stop: stop, presence: presence}
-		entry.ask, entry.asks = waitsOnOwner(s, stop, d, presence, sv.Params)
+		entry.ask, entry.asks = waitsOnOwner(s, stop, d, presence, sv.Params, false)
 		seen[s.Key] = entry
 		if d.Rule == "" {
 			continue // no rule applies, or a guard and no rule would apply anyway: nothing was decided
@@ -215,6 +230,11 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 				return lines, err
 			}
 		}
+		// A stalled turn the rule leaves to its owner (dry, taken back on its screen, or past its stale hour) waits on
+		// him: only he can tell whether to resume it.
+		if d.Rule == RuleStalled && (d.Verdict == Act && !sv.Live[d.Rule] || line.takenBack || d.Stale) {
+			entry.ask, entry.asks = waitsOnOwner(s, stop, d, presence, sv.Params, true)
+		}
 		lines = append(lines, line)
 	}
 	return lines, sv.notes(ctx, seen)
@@ -243,15 +263,19 @@ func (sv *Supervisor) put(ctx context.Context, evs []store.Event) error {
 func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, d Decision, h past, starts map[int]uint64, line *Line) error {
 	t := act.TargetOf(s, starts[s.PID])
 	m := map[string]any{"rule": d.Rule, "try": d.Try, "text": d.Text, "why": d.Why, "stop_at": stop.At.UnixMilli(), "error": stop.Error, "seq": s.Seq}
+	// A stalled turn takes the message through its queue while it runs on its screen, and Escape ends it. One its
+	// screen shows taken back is left alone: the message would resume work its owner stopped.
+	interrupt := d.Rule == RuleStalled
 	path, err := act.Path(""), act.CheckText(d.Text)
-	if err == nil {
+	switch {
+	case err != nil:
+	case interrupt:
+		path, err = sv.Sender.CheckInterrupt(ctx, t)
+		if errors.Is(err, act.ErrIdle) {
+			err, line.takenBack = errTakenBack, true
+		}
+	default:
 		path, err = sv.Sender.Check(ctx, t)
-	}
-	// A stalled turn that runs on its screen takes the message through its queue, and Escape ends the turn; one
-	// the harness already took back shows its empty input line, and takes the message as any idle session does.
-	interrupt := d.Rule == RuleStalled && errors.Is(err, act.ErrBusy)
-	if interrupt {
-		err = nil
 	}
 	var evs []store.Event
 	switch {
@@ -287,7 +311,7 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 		return err // nothing typed
 	}
 	if interrupt {
-		path, err = sv.Sender.Interrupt(ctx, t, d.Text)
+		path, err = sv.Sender.Interrupt(ctx, t, d.Text, func() error { return sv.unanswered(s, stop.RequestAt) })
 		if err == nil {
 			err = sv.prompted(ctx, s, d.Text, m)
 		}
@@ -414,7 +438,7 @@ type past struct {
 	presentAt time.Time      // when its owner was last seen at the pane: a draft, a tmux mode, a line he cleared
 	atPane    map[int64]bool // the stops (their ms) whose last check met a draft or a mode
 	keys      map[string]bool
-	escapes   []time.Time // when momentum began each message it sent with an Escape after it
+	escapes   []time.Time // the interruptions momentum's own Escapes left in the transcript
 }
 
 type caseRec struct {
@@ -439,8 +463,8 @@ func history(evs []store.Event) past {
 			ok, _ := m["sent"].(bool)
 			if unstable, _ := m["unstable"].(bool); ok || sending || unstable {
 				h.texts = append(h.texts, fold(str(m["text"])))
-				if interrupt, _ := m["interrupt"].(bool); interrupt {
-					h.escapes = append(h.escapes, e.TS)
+				if at := num(m["interrupted_at"]); at > 0 {
+					h.escapes = append(h.escapes, time.UnixMilli(int64(at)))
 				}
 			}
 			if !ok && !sending {
@@ -530,11 +554,11 @@ func (h past) presence(s *sessions.Session, ownerAt, answered time.Time) time.Ti
 	return at
 }
 
-// ourEscape reports whether an interruption at t is momentum's own: it pressed Escape there, after it began to
-// type a message, a moment before.
+// ourEscape reports whether an interruption at t is momentum's own: the transcript's record of the Escape it
+// pressed after one of its messages, as the run that sent it read it.
 func (h past) ourEscape(t time.Time) bool {
 	for _, e := range h.escapes {
-		if !t.Before(e) && t.Before(e.Add(DeliveryWait)) {
+		if !t.IsZero() && t.UnixMilli() == e.UnixMilli() {
 			return true
 		}
 	}
@@ -759,15 +783,21 @@ var promptedWait = 10 * time.Second
 func (sv *Supervisor) prompted(ctx context.Context, s *sessions.Session, text string, m map[string]any) error {
 	look := sv.Prompted
 	if look == nil {
-		look = func(_ context.Context, s *sessions.Session, text string) (bool, bool, error) {
-			return claude.Prompted(s.Transcript, max(s.Size, 0), text)
+		if s.Transcript == "" || s.Size < 0 { // where the scan stopped is not known: an earlier try would answer
+			return fmt.Errorf("%w: no transcript place to read from", act.ErrUnstable)
+		}
+		look = func(_ context.Context, s *sessions.Session, text string) (bool, time.Time, error) {
+			return claude.Prompted(s.Transcript, s.Size, text)
 		}
 	}
 	end := time.Now().Add(promptedWait)
 	for {
 		found, interrupted, err := look(ctx, s, text)
 		if err == nil && found {
-			m["interrupted"] = interrupted
+			m["interrupted"] = !interrupted.IsZero()
+			if !interrupted.IsZero() {
+				m["interrupted_at"] = interrupted.UnixMilli()
+			}
 			return nil
 		}
 		if !time.Now().Before(end) {
@@ -782,6 +812,28 @@ func (sv *Supervisor) prompted(ctx context.Context, s *sessions.Session, text st
 		case <-time.After(250 * time.Millisecond):
 		}
 	}
+}
+
+// unanswered checks, just before it types and just before its Escape, that the request a stalled turn waits on is
+// still unanswered: something written since the scan (a reply, a call, an input) means the turn went on.
+func (sv *Supervisor) unanswered(s *sessions.Session, sent time.Time) error {
+	look := sv.Answered
+	if look == nil {
+		if s.Transcript == "" || s.Size < 0 {
+			return errors.New("no transcript place to read from")
+		}
+		look = func(s *sessions.Session, sent time.Time) (bool, error) {
+			return claude.Answered(s.Transcript, s.Size, sent)
+		}
+	}
+	answered, err := look(s, sent)
+	switch {
+	case err != nil:
+		return err
+	case answered:
+		return errAnswered
+	}
+	return nil
 }
 
 func meta(m map[string]any) string {

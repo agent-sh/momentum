@@ -18,12 +18,23 @@ import (
 // fakeSender records what it is asked to send. check is what the terminal check returns, send what sending does,
 // interrupt what an interrupt does.
 type fakeSender struct {
-	sent                   []string
-	check, send, interrupt error
-	checks                 int
+	sent                                   []string
+	check, send, checkInterrupt, interrupt error
+	checks                                 int
 }
 
-func (f *fakeSender) Interrupt(_ context.Context, t act.Target, text string) (act.Path, error) {
+func (f *fakeSender) CheckInterrupt(_ context.Context, t act.Target) (act.Path, error) {
+	f.checks++
+	return act.Tmux, f.checkInterrupt
+}
+
+func (f *fakeSender) Interrupt(_ context.Context, t act.Target, text string, still func() error) (act.Path, error) {
+	if f.checkInterrupt != nil {
+		return act.Tmux, f.checkInterrupt
+	}
+	if err := still(); err != nil {
+		return act.Tmux, err
+	}
 	f.sent = append(f.sent, t.Pane+" interrupt "+text)
 	return act.Tmux, f.interrupt
 }

@@ -18,8 +18,9 @@ import (
 // typist records what supervision would type.
 type typist struct{ sent []string }
 
-func (t *typist) Check(context.Context, act.Target) (act.Path, error) { return act.Tmux, nil }
-func (t *typist) Interrupt(_ context.Context, _ act.Target, text string) (act.Path, error) {
+func (t *typist) Check(context.Context, act.Target) (act.Path, error)          { return act.Tmux, nil }
+func (t *typist) CheckInterrupt(context.Context, act.Target) (act.Path, error) { return act.Tmux, nil }
+func (t *typist) Interrupt(_ context.Context, _ act.Target, text string, _ func() error) (act.Path, error) {
 	t.sent = append(t.sent, text)
 	return act.Tmux, nil
 }

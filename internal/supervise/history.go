@@ -121,8 +121,9 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 	var wakeAt, ownerAt, resumed time.Time
 	var words, entry, harness, prevRole, prevPrior string
 	var prevAt time.Time
-	var owes time.Time // the model owes its reply since: an input, or the result of a turn's last call
-	var owesRef string
+	var owes time.Time           // the model owes its reply since: an input, or the result of a turn's last call
+	var owesRef string           // where the transcript is read from for its request: the event before the one that owes
+	var lastRef string           // the place of the event before this one
 	pending := map[string]bool{} // calls without a result yet
 	lastMainUser := false
 	stopOf := func(at time.Time, nextRef string) Stop {
@@ -152,7 +153,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			s.Working = false
 		}
 		if s.Working && !s.Busy && !owes.IsZero() && harness == "claude" {
-			s.RequestAt = requestBetween(owesRef, nextRef)
+			s.RequestAt = requestBetween(owesRef, nextRef, until)
 		}
 		s.Phase = phaseOf(s)
 		return s
@@ -304,10 +305,12 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		}
 		switch {
 		case r == "owner" || r == "self" || r == "momentum", r == "result" && len(pending) == 0:
-			owes, owesRef = e.TS, e.Ref
+			// Claude Code may write the request before the record of the input it carries, dated before it
+			owes, owesRef = e.TS, firstNonEmpty(lastRef, e.Ref)
 		case r == "agent" || r == "call" || r == "apierr" || r == "interrupt" || r == "synthetic":
 			owes, owesRef = time.Time{}, ""
 		}
+		lastRef = e.Ref
 	}
 	if !prevAt.IsZero() {
 		out = append(out, Point{Session: id, Stop: stopOf(until, ""), Next: Next{Kind: "none"}, Entry: entry})
@@ -321,8 +324,9 @@ const requestLimit = 8 << 20
 // requestBetween is the model request a turn still waited on between two of its events, by Claude Code's
 // api-request records in the transcript between their places (Ref: path@offset#index): the last request, when
 // no record of the conversation answered it, as the session layer reads them. Zero when the transcript is gone,
-// predates those records, or holds no request there. to "" reads to the transcript's end.
-func requestBetween(from, to string) time.Time {
+// predates those records, or holds no request there. to "" reads to the transcript's end, and no record dated
+// after until counts.
+func requestBetween(from, to string, until time.Time) time.Time {
 	path, off, ok := refPlace(from)
 	if !ok {
 		return time.Time{}
@@ -361,6 +365,9 @@ func requestBetween(from, to string) time.Time {
 			}
 			if json.Unmarshal(raw, &e) == nil && !e.Sidechain {
 				at, _ := time.Parse(time.RFC3339Nano, e.Timestamp)
+				if !until.IsZero() && at.After(until) {
+					return req
+				}
 				switch {
 				case e.Type == "api-request":
 					req = at

@@ -130,7 +130,14 @@ func writePoints(path string, rs []supervise.Result) error {
 func minutes(d time.Duration) string { return fmt.Sprintf("%.0f", d.Minutes()) }
 
 func printReplay(out io.Writer, rs []supervise.Result, labels []supervise.Label, from, to time.Time) {
-	fmt.Fprintf(out, "window %s to %s, %d stops\n\n", from.Local().Format("2006-01-02 15:04"), to.Local().Format("2006-01-02 15:04"), len(rs))
+	waiting := 0
+	for _, r := range rs {
+		if r.Point.Waiting {
+			waiting++
+		}
+	}
+	fmt.Fprintf(out, "window %s to %s, %d stops and %d long waits for a reply\n\n", from.Local().Format("2006-01-02 15:04"),
+		to.Local().Format("2006-01-02 15:04"), len(rs)-waiting, waiting)
 	fmt.Fprintf(out, "%-10s %5s %8s %13s %8s %6s %5s %5s %5s %5s %7s %8s\n", "rule", "acts", "covered", "min earlier", "owner1st", "false",
 		"self", "other", "left", "bare", "false%", "w/o bare")
 	for _, s := range supervise.Summarize(rs) {
@@ -200,8 +207,9 @@ func printReplay(out io.Writer, rs []supervise.Result, labels []supervise.Label,
 }
 
 // printRedundant prints how often the owner's own labelled nudges went to a session that would have gone on by
-// itself: a tool call was running, background work was in flight, or a wakeup or a loop was due. It is the false
-// rate of the owner's own nudges, the bar a rule's false rate is held to.
+// itself: a tool call was running, background work was in flight, or a wakeup or a loop was due, unless its turn
+// waited on a request nothing answered, which none of those moves. It is the false rate of the owner's own nudges,
+// the bar a rule's false rate is held to.
 func printRedundant(out io.Writer, rs []supervise.Result) {
 	var n, by int
 	for _, r := range rs {
@@ -210,7 +218,7 @@ func printRedundant(out io.Writer, rs []supervise.Result) {
 		}
 		n++
 		s := r.Point.Stop
-		if s.Busy || s.Tasks > 0 || !s.WakeAt.IsZero() || s.Loop != "" {
+		if s.RequestAt.IsZero() && (s.Busy || s.Tasks > 0 || !s.WakeAt.IsZero() || s.Loop != "") {
 			by++
 		}
 	}

@@ -227,6 +227,7 @@ func (t *Tracker) line(raw []byte) {
 		return
 	}
 	at, _ := time.Parse(time.RFC3339Nano, e.Timestamp)
+	open := t.TurnOpen() // before this record answers anything: a reopening closes a turn that was open
 	t.answered(e, at)
 	if e.Message == nil {
 		// Notifications that arrive mid-turn are queued: recorded as queue operations and attachments.
@@ -250,7 +251,7 @@ func (t *Tracker) line(raw []byte) {
 	}
 	switch e.Type {
 	case "assistant":
-		t.assistant(e, at)
+		t.assistant(e, at, open)
 	case "user":
 		t.user(e, at)
 	}
@@ -294,11 +295,14 @@ func (t *Tracker) queued(e line) {
 	}
 }
 
-// queueKey is how the queue keeps an item: a message its user typed by its text, folded and cut; anything else
-// Claude Code queues (a task's notification, an item named by reference) as "".
+// queueKey is how the queue keeps an item: a message its user typed by its text, folded and cut; one recorded
+// without its text (a command typed while the turn ran) as "?"; a task's notification as "".
 func queueKey(content string) string {
-	if strings.Contains(content, "<task-notification>") {
+	switch {
+	case strings.Contains(content, "<task-notification>"):
 		return ""
+	case strings.TrimSpace(content) == "":
+		return "?"
 	}
 	return text.OneLine(content, 200)
 }
@@ -314,7 +318,7 @@ func (t *Tracker) typedQueued() int {
 	return n
 }
 
-func (t *Tracker) assistant(e line, at time.Time) {
+func (t *Tracker) assistant(e line, at time.Time, open bool) {
 	var bs []block
 	if json.Unmarshal(e.Message.Content, &bs) != nil {
 		return
@@ -324,7 +328,7 @@ func (t *Tracker) assistant(e line, at time.Time) {
 	// synthetic "No response requested." and calls no model. After an interruption or its own retry it writes the
 	// same, but the turn was not open then. An API error can carry the same text: a rate limit it has no words for.
 	if !e.APIError && e.Message.Model == synthetic && bytes.Contains(e.Message.Content, []byte(noResponse)) {
-		if st.LastMain == "user" {
+		if open {
 			st.Resumed = at
 		}
 	} else if !e.APIError {

@@ -71,11 +71,16 @@ func TestALoopRestartedOnARequestThatNeverAnswers(t *testing.T) {
 			map[string]any{"type": "text", "text": "# /loop\nRun the check now, then schedule the next one."}}}}).
 		request()
 	sent := x.at
-	x.notice("wait-guard: reloaded").notice("rulebook: reloaded")
+	x.notice("a plugin reloaded").notice("another plugin reloaded")
 	tr := NewTracker(x.path)
 	s := x.facts(tr, x.at.Add(4*time.Hour))
 	if !s.TurnOpen || s.Phase != sessions.Working || !s.RequestAt.Equal(sent) || s.Queued != 0 {
 		t.Fatalf("phase %s open %v request %v queued %d, want working on the request at %v", s.Phase, s.TurnOpen, s.RequestAt, s.Queued, sent)
+	}
+	// Reopened, Claude Code closes the turn the request held open: a reopening, as for a typed prompt's turn.
+	x.synthetic("No response requested.")
+	if s := x.facts(tr, x.at); s.ResumedAt.IsZero() || s.TurnOpen {
+		t.Fatalf("reopened: resumed %v open %v", s.ResumedAt, s.TurnOpen)
 	}
 }
 
@@ -98,5 +103,10 @@ func TestTheQueueCountsWhatItsUserTyped(t *testing.T) {
 	x.queue("enqueue", "a").queue("enqueue", "b").queue("popAll", "")
 	if s := x.facts(tr, x.at); s.Queued != 0 {
 		t.Fatalf("popAll takes them back: queued %d", s.Queued)
+	}
+	// A command typed while the turn ran is queued with no text recorded: it counts as typed.
+	x.queue("enqueue", "")
+	if s := x.facts(tr, x.at); s.Queued != 1 {
+		t.Fatalf("a command: queued %d", s.Queued)
 	}
 }

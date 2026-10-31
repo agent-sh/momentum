@@ -17,9 +17,14 @@ import (
 
 const queuedHint = "\x1b[7m\x1b[39mP\x1b[0;2mress up to edit queued messages\x1b[0m"
 
-// turnScreen is a Claude Code screen whose turn runs, with what its input line holds.
+// turnScreen is a Claude Code screen whose turn runs, with what its input line holds. As Claude Code does, its
+// status line offers the interrupt key only while nothing is typed on the input line.
 func turnScreen(input string) string {
-	return "● Reading the logs\n✻ Working… (31m 4s · esc to interrupt)\n\n" + ruleLine + "\n❯" + nbsp + input + "\n" + ruleLine + "\n" + status
+	hint := ""
+	if input == "" || input == queuedHint {
+		hint = " · esc to interrupt"
+	}
+	return "● Reading the logs\n✻ Working… (31m 4s)\n\n" + ruleLine + "\n❯" + nbsp + input + "\n" + ruleLine + "\n  ⏵⏵ auto mode on" + hint
 }
 
 // fakeTurn answers the tmux commands Interrupt runs for a pane whose turn runs: the paste shows on the input line,
@@ -86,12 +91,36 @@ func turnPane(t *testing.T, f *fakeTurn) (*Sender, Target) {
 func TestInterruptQueuesTheMessageThenPressesEscape(t *testing.T) {
 	f := &fakeTurn{late: settleReads - 1}
 	s, tgt := turnPane(t, f)
-	path, err := s.Interrupt(context.Background(), tgt, "[momentum] Your last request got\nno reply.")
+	path, err := s.Interrupt(context.Background(), tgt, "[momentum] Your last request got\nno reply.", nil)
 	if err != nil || path != Tmux {
 		t.Fatalf("interrupt: %v %v", path, err)
 	}
 	if f.pasted != "[momentum] Your last request got no reply." || strings.Join(f.keys, " ") != "Enter Escape" {
 		t.Fatalf("pasted %q, keys %q", f.pasted, f.keys)
+	}
+}
+
+func TestTheTurnRunsByItsRunningLineToo(t *testing.T) {
+	for name, screen := range map[string]string{
+		"the interrupt hint": "✻ Working…\n" + emptyInput + "\n  esc to interrupt",
+		"its running line":   "✻ Fermenting… (35m 11s)\n" + emptyInput,
+		"a waiting notice":   "Waiting for API response · will retry in 31s · check your network\n" + emptyInput,
+		"a retry notice":     "✻ Request timed out. · Retrying in 4s · attempt 3/10\n" + emptyInput,
+	} {
+		if !TurnRuns(Plain(screen)) {
+			t.Errorf("%s: not running", name)
+		}
+	}
+	if TurnRuns(Plain("✻ Worked for 3m 2s\n" + emptyInput)) {
+		t.Error("the line a finished turn leaves is not a running turn")
+	}
+	for _, hint := range []string{queuedHint, dim + "Press up to select a queued message to edit, or Enter to send them now" + reset} {
+		if !Queued(turnScreen(hint), "claude") {
+			t.Errorf("%q: no message queued", hint)
+		}
+	}
+	if Queued("the queued messages went out\n"+emptyInput, "claude") {
+		t.Error("the words in the transcript are not the input line's")
 	}
 }
 
@@ -113,7 +142,7 @@ func TestInterruptRefusesBeforeTypingAnything(t *testing.T) {
 		f := &fakeTurn{screen: c.screen, mode: c.mode}
 		s, tgt := turnPane(t, f)
 		tgt.Tool = c.tool
-		if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue"); !errors.Is(err, c.want) {
+		if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue", nil); !errors.Is(err, c.want) {
 			t.Errorf("%s: got %v, want %v", c.name, err, c.want)
 		}
 		if f.pasted != "" || len(f.keys) != 0 {
@@ -122,8 +151,22 @@ func TestInterruptRefusesBeforeTypingAnything(t *testing.T) {
 	}
 	f := &fakeTurn{}
 	s, tgt := turnPane(t, f)
-	if _, err := s.Interrupt(context.Background(), tgt, "/compact"); !errors.Is(err, ErrCommand) || f.pasted != "" {
+	if _, err := s.Interrupt(context.Background(), tgt, "/compact", nil); !errors.Is(err, ErrCommand) || f.pasted != "" {
 		t.Fatalf("a command: %v", err)
+	}
+	// still fails before the paste: nothing is typed, and its error comes back as it is.
+	answered := errors.New("answered")
+	f = &fakeTurn{}
+	s, tgt = turnPane(t, f)
+	if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue", func() error { return answered }); !errors.Is(err, answered) || errors.Is(err, ErrUnstable) ||
+		f.pasted != "" || len(f.keys) != 0 {
+		t.Fatalf("still: %v, pasted %q keys %q", err, f.pasted, f.keys)
+	}
+	// The same checks are CheckInterrupt's.
+	f = &fakeTurn{screen: emptyInput}
+	s, tgt = turnPane(t, f)
+	if _, err := s.CheckInterrupt(context.Background(), tgt); !errors.Is(err, ErrIdle) || len(f.keys) != 0 {
+		t.Fatalf("check: %v", err)
 	}
 }
 
@@ -131,13 +174,25 @@ func TestInterruptPressesEscapeOnlyOnceTheMessageWaitsInTheQueue(t *testing.T) {
 	// The paste never shows on the input line: no Enter.
 	f := &fakeTurn{late: settleReads}
 	s, tgt := turnPane(t, f)
-	if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue"); !errors.Is(err, ErrUnstable) || len(f.keys) != 0 {
+	if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue", nil); !errors.Is(err, ErrUnstable) || len(f.keys) != 0 {
 		t.Fatalf("never drawn: %v keys %q", err, f.keys)
+	}
+	// still fails before the Escape (its reply came meanwhile): the message waits in the queue, and no Escape.
+	calls := 0
+	f = &fakeTurn{}
+	s, tgt = turnPane(t, f)
+	if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue", func() error {
+		if calls++; calls > 1 {
+			return errors.New("answered")
+		}
+		return nil
+	}); !errors.Is(err, ErrUnstable) || strings.Join(f.keys, " ") != "Enter" {
+		t.Fatalf("still before the Escape: %v keys %q", err, f.keys)
 	}
 	// Enter submitted it instead (the turn had just ended): no Escape, which would end the turn it opened.
 	for name, f := range map[string]*fakeTurn{"the turn ended": {noQueue: true}, "a new turn runs it": {newTurn: true}} {
 		s, tgt = turnPane(t, f)
-		if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue"); !errors.Is(err, ErrUnstable) || strings.Join(f.keys, " ") != "Enter" {
+		if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue", nil); !errors.Is(err, ErrUnstable) || strings.Join(f.keys, " ") != "Enter" {
 			t.Fatalf("%s: %v keys %q", name, err, f.keys)
 		}
 	}
@@ -173,7 +228,7 @@ func TestInterruptTypesIntoARealPane(t *testing.T) {
 
 	s := &Sender{SocketPath: sock, Pause: 300 * time.Millisecond}
 	tgt := Target{Tool: "claude", Pane: pane, PID: agentPID, Start: startTicks(t, agentPID)}
-	if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue"); err != nil {
+	if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue", nil); err != nil {
 		t.Fatalf("interrupt: %v", err)
 	}
 	waitFor(t, func() bool { b, _ := os.ReadFile(got + ".queued"); return string(b) == "[momentum] continue" })

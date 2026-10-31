@@ -31,7 +31,9 @@ func newRecorded(t *testing.T, session string) *recorded {
 func (r *recorded) line(after time.Duration, v map[string]any) (int64, time.Time) {
 	r.t.Helper()
 	r.at = r.at.Add(after)
-	v["timestamp"] = r.at.Format(time.RFC3339Nano)
+	if _, ok := v["timestamp"]; !ok {
+		v["timestamp"] = r.at.Format(time.RFC3339Nano)
+	}
 	b, err := json.Marshal(v)
 	if err != nil {
 		r.t.Fatal(err)
@@ -104,6 +106,18 @@ func TestReplayFindsTheRequestATurnWaitedOn(t *testing.T) {
 	slow := newRecorded(t, "slow").owner(0, "prove it").call(time.Second, "tu1").result(time.Second, "tu1").request(time.Second).
 		say(20*time.Minute, "Proved.")
 	slow.put(st)
+	// A notification whose record Claude Code wrote after the request that carries it, dated before it.
+	late := newRecorded(t, "late").owner(0, "watch it").say(time.Second, "Watching.")
+	late.request(time.Minute)
+	carried := late.at
+	off, _ := late.line(0, map[string]any{"type": "user", "timestamp": carried.Add(-50 * time.Millisecond).Format(time.RFC3339Nano),
+		"message": map[string]any{"content": "<task-notification> done"}})
+	late.evs = append(late.evs, store.Event{Source: store.Transcripts, SourceKey: fmt.Sprintf("late@%d", off), TS: carried.Add(-50 * time.Millisecond),
+		Session: "late", Harness: "claude", Actor: store.ActorHarness, Kind: "harness_text",
+		Summary: "<task-notification> <task-id>b2</task-id> <status>completed</status> </task-notification>", Meta: `{"why":"origin task-notification"}`,
+		Ref: fmt.Sprintf("%s@%d#0", late.path, off)})
+	late.owner(40*time.Minute, "continue")
+	late.put(st)
 	// A notification at a turn's end that sent no request: nothing waited on the model.
 	quiet := newRecorded(t, "quiet").owner(0, "watch it").say(time.Second, "Watching.")
 	quiet.event(time.Second, map[string]any{"type": "user", "message": map[string]any{"content": "<task-notification> done"}},
@@ -117,7 +131,7 @@ func TestReplayFindsTheRequestATurnWaitedOn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	labels := []Label{{Session: "stuck", At: stuck.at, Kind: "nudge"}}
+	labels := []Label{{Session: "stuck", At: stuck.at, Kind: "nudge"}, {Session: "late", At: late.at, Kind: "nudge"}}
 	rs := Replay(points, labels, DefaultParams, probeAt(time.Time{}), until)
 	var stalls, replies []Result
 	for _, r := range rs {
@@ -128,9 +142,12 @@ func TestReplayFindsTheRequestATurnWaitedOn(t *testing.T) {
 			stalls = append(stalls, r)
 		}
 	}
-	if len(stalls) != 1 || stalls[0].Point.Session != "stuck" || !stalls[0].Point.Stop.RequestAt.Equal(sent) || stalls[0].Outcome != Covered ||
+	if len(stalls) != 2 || stalls[0].Point.Session != "stuck" || !stalls[0].Point.Stop.RequestAt.Equal(sent) || stalls[0].Outcome != Covered ||
 		stalls[0].Earlier != stuck.at.Sub(sent.Add(30*time.Minute)) {
 		t.Fatalf("stalls %+v", stalls)
+	}
+	if stalls[1].Point.Session != "late" || !stalls[1].Point.Stop.RequestAt.Equal(carried) || stalls[1].Outcome != Covered {
+		t.Fatalf("a request before the record it carries: %+v", stalls[1])
 	}
 	if len(replies) != 1 || replies[0].Point.Session != "slow" || replies[0].Fired || replies[0].Decision.Rule != RuleStalled {
 		t.Fatalf("replies %+v", replies)
@@ -161,5 +178,24 @@ func TestReplayFindsTheRequestATurnWaitedOn(t *testing.T) {
 		if r.Point.Session == "quiet" && r.Decision.Rule == RuleStalled {
 			t.Fatalf("a turn that sent no request: %+v", r)
 		}
+	}
+}
+
+func TestTheReplayReadsNoRequestRecordPastItsWindow(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	// The window ends while the request waits; its reply came after the window.
+	r := newRecorded(t, "open").owner(0, "prove it").request(time.Second)
+	sent := r.at
+	r.say(2*time.Hour, "Proved.")
+	r.put(st)
+	until := t0.Add(time.Hour)
+	points, err := History(ctx, st, t0.Add(-time.Hour), until)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := points[len(points)-1]
+	if last.Next.Kind != "none" || !last.Stop.RequestAt.Equal(sent) {
+		t.Fatalf("the last stop: %+v", last)
 	}
 }

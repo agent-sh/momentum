@@ -40,7 +40,7 @@ type ask struct {
 // tries again, or one whose stop is too old for its rule; or a turn over and idle on words that ask him
 // something. d is what the rules decided: a rule that still acts takes care of the session. An automated run is
 // no one's to answer, and a Hermes conversation on a messaging platform asked him there already.
-func waitsOnOwner(s *sessions.Session, stop Stop, d Decision, presence time.Time, p Params) (ask, bool) {
+func waitsOnOwner(s *sessions.Session, stop Stop, d Decision, presence time.Time, p Params, stalledLeft bool) (ask, bool) {
 	if s.Auto || stop.At.IsZero() || s.Tool == "hermes" && s.Where != "cli" && s.Where != "tui" {
 		return ask{}, false
 	}
@@ -51,6 +51,8 @@ func waitsOnOwner(s *sessions.Session, stop Stop, d Decision, presence time.Time
 		title = s.Ask
 	case stop.Ask == sessions.AskPlan:
 		title = "Approve the plan? " + s.Ask
+	case stalledLeft:
+		title = "Resume it? Its request to the model from " + stop.RequestAt.Local().Format("Jan 2 15:04") + " never got a reply"
 	case s.TurnOpen:
 		return ask{}, false
 	case d.Rule == RuleAccess && d.Verdict == Wait && d.At.IsZero():
@@ -126,8 +128,10 @@ func (sv *Supervisor) notes(ctx context.Context, seen map[string]*seenSession) e
 			if ok && e == nil {
 				continue
 			}
-			// it works again: a turn open now, or one that stopped since without an error
-			again := ok && (e.s.TurnOpen || e.stop.At.After(n.At) && e.stop.Error == "")
+			// it works again: a turn open now, but not one that still waits on a request from before the note, or
+			// one that stopped since without an error
+			stuck := ok && !e.stop.RequestAt.IsZero() && !e.stop.RequestAt.After(n.At)
+			again := ok && (e.s.TurnOpen && !stuck || e.stop.At.After(n.At) && e.stop.Error == "")
 			if !ok || e.presence.After(n.At) || again {
 				if err := done(n.ID); err != nil {
 					return err
