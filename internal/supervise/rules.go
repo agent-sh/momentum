@@ -1,7 +1,7 @@
 // Package supervise keeps the owner's agent sessions moving without him: a session that stopped on a transient
 // API error, a login or a usage limit, a reopening after a restart, a Hermes output cutoff, a model request that
-// never got its reply, or a turn that ended on a promise nothing will wake it for gets the message that continues
-// it. Deterministic rules decide; no
+// never got its reply, a wakeup or a loop run of its own that never came, or a turn that ended on a promise nothing
+// will wake it for gets the message that continues it. Deterministic rules decide; no
 // model takes part. Each rule is a small function of a Stop, and the replay runs the same functions over the
 // store's history to measure them.
 package supervise
@@ -21,11 +21,12 @@ const (
 	RuleCutoff    = "cutoff"    // Hermes stopped at the model's output limit and asks for `continue`
 	RuleReopened  = "reopened"  // the session was reopened after it ended mid-task and sits idle
 	RuleStalled   = "stalled"   // a Claude Code turn waits on a model request that never got its reply
+	RuleOverdue   = "overdue"   // a wakeup or a loop run the session set came due long ago and did not fire
 	RulePromise   = "promise"   // the turn ended on a promise or a step it announced, and nothing will wake it
 )
 
 // Rules lists them in order.
-var Rules = []string{RuleTransient, RuleAccess, RuleCutoff, RuleReopened, RuleStalled, RulePromise}
+var Rules = []string{RuleTransient, RuleAccess, RuleCutoff, RuleReopened, RuleStalled, RuleOverdue, RulePromise}
 
 // Verdicts.
 const (
@@ -54,6 +55,8 @@ type Stop struct {
 	Tasks           int              // background work in flight
 	WakeAt          time.Time
 	Loop            string
+	WakeDue         time.Time // when its own pending wakeup or loop run should have fired at the latest
+	WakeFor         string    // what that wakeup or run is for
 	ResumedAt       time.Time // the harness reopened the session after it ended mid-task, and nothing happened since
 	RequestAt       time.Time // the model request the open turn still waits on: nothing answered it since
 	Queued          int       // messages its user typed while the turn ran, which the harness holds
@@ -83,6 +86,8 @@ type Params struct {
 	ReopenWait   time.Duration
 	StalledWait  time.Duration // stalled: past the longest a reply legitimately takes to begin
 	StalledTries int
+	OverdueSlack time.Duration // overdue: past the latest a wakeup or a loop run that fired came
+	OverdueTries int
 	PromiseWait  time.Duration
 	PromiseTries int           // promise: messages without an owner turn in between
 	Stale        time.Duration // a rule whose time came longer ago than this does not act: the stop is past
@@ -100,6 +105,8 @@ var DefaultParams = Params{
 	ReopenWait:   2 * time.Minute,
 	StalledWait:  30 * time.Minute,
 	StalledTries: 2,
+	OverdueSlack: 10 * time.Minute,
+	OverdueTries: 2,
 	PromiseWait:  17 * time.Minute,
 	PromiseTries: 2,
 	Stale:        time.Hour,
@@ -155,7 +162,7 @@ func Plan(s Stop, tries Tries, p Params, probe Probe) Decision {
 
 // ruleFuncs are the rules, in Rules order.
 var ruleFuncs = map[string]func(Stop, Tries, Params, Probe) (Decision, bool){RuleTransient: transient, RuleAccess: access,
-	RuleCutoff: cutoff, RuleReopened: reopened, RuleStalled: stalled, RulePromise: promise}
+	RuleCutoff: cutoff, RuleReopened: reopened, RuleStalled: stalled, RuleOverdue: overdue, RulePromise: promise}
 
 // planRules is the first rule that applies to a stop, past the guards, with the time it acts, held while the
 // owner typed into the session recently.
@@ -322,6 +329,38 @@ func stalled(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
 		return usedAt(RuleStalled, n, from.Add(p.StalledWait), why), true
 	}
 	return wait(RuleStalled, from.Add(p.StalledWait), n+1, StalledText, why), true
+}
+
+// overdue: the turn is over, nothing is in flight, and a wakeup or a run of a loop the session set itself came due
+// long ago and never fired: past the latest time its harness fires it (WakeDue), counted from the turn's end when
+// it came due while a turn ran (a run waits for the turn), or from the machine waking from a suspend. Claude Code
+// fires a run between turns, within a second when nothing holds it. A resync that quotes what it was for; twice
+// without the owner, then a case.
+func overdue(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
+	if s.Tool != "claude" || s.WakeDue.IsZero() || s.Working || s.Error != "" || s.Tasks > 0 || priorProcess(s) || AsksOwner(s.Words) {
+		return Decision{}, false
+	}
+	n := tries[RuleOverdue]
+	from, why := s.WakeDue, "its own wakeup or loop run, due by "+s.WakeDue.Local().Format("15:04")+", did not fire"
+	if s.At.After(from) {
+		from = s.At
+	}
+	if s.Woke.After(from) {
+		from, why = s.Woke, why+"; the machine was suspended, and woke at "+s.Woke.Local().Format("15:04")
+	}
+	if n >= p.OverdueTries { // the turn the last message opened has just ended: a case once it too has waited
+		return usedAt(RuleOverdue, n, from.Add(p.OverdueSlack), why), true
+	}
+	return wait(RuleOverdue, from.Add(p.OverdueSlack), n+1, OverdueText(s.WakeDue, s.WakeFor), why), true
+}
+
+// OverdueText is the overdue rule's message: when the run was due, and what it was for, quoted.
+func OverdueText(due time.Time, what string) string {
+	if what = clip(what, 140); what != "" {
+		return fmt.Sprintf("%s Your own wakeup, due by %s, did not fire, so nothing woke you for %q. Do it now, and set the next one.",
+			Marker, due.Local().Format("15:04"), what)
+	}
+	return fmt.Sprintf("%s Your own wakeup, due by %s, did not fire. Do what it was for now, and set the next one.", Marker, due.Local().Format("15:04"))
 }
 
 // promise: the turn ended, nothing is in flight or scheduled to wake it, and its last words promise to come back

@@ -159,7 +159,7 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 		}
 		presence := h.presence(s, ownerAt, answered)
 		stop := StopOf(s, presence)
-		if !stop.RequestAt.IsZero() {
+		if !stop.RequestAt.IsZero() || !stop.WakeDue.IsZero() && stop.WakeDue.Before(now) {
 			if woke == nil {
 				w := sv.woke(ctx)
 				woke = &w
@@ -684,6 +684,8 @@ func (sv *Supervisor) outcome(ctx context.Context, s *sessions.Session, stop Sto
 		again = Cutoff(stop.Words)
 	case RulePromise:
 		again = Promise(stop.Words) != "" && stop.Tasks == 0 && stop.WakeAt.IsZero() && stop.Loop == ""
+	case RuleOverdue: // the run it was for came due before the message, and has not fired since
+		again = !stop.WakeDue.IsZero() && stop.WakeDue.Before(l.at)
 	}
 	switch {
 	case again:
@@ -735,7 +737,8 @@ func isAccess(text string) bool {
 func StopOf(s *sessions.Session, presence time.Time) Stop {
 	st := Stop{Key: s.Key, Tool: s.Tool, Name: s.Name, Where: s.Where, Auto: s.Auto, Phase: s.Phase, At: s.Since,
 		Words: Words(s.LastText), Working: s.TurnOpen, Busy: s.Now != "", Tasks: len(s.Tasks), WakeAt: s.WakeAt, Loop: s.Loop,
-		ResumedAt: s.ResumedAt, RequestAt: s.RequestAt, Queued: s.Queued, OwnerAt: presence, Started: s.Started}
+		ResumedAt: s.ResumedAt, RequestAt: s.RequestAt, Queued: s.Queued, WakeDue: s.WakeDue, WakeFor: s.WakeFor, OwnerAt: presence,
+		Started: s.Started}
 	switch s.AskKind {
 	case sessions.AskError:
 		st.Error = strings.TrimPrefix(s.Ask, "stopped on an error: ")

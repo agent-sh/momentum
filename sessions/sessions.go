@@ -91,6 +91,8 @@ type Session struct {
 	Tasks      []Task    `json:"tasks"`
 	WakeAt     time.Time `json:"wake_at,omitzero"`
 	Loop       string    `json:"loop,omitempty"`
+	WakeDue    time.Time `json:"wake_due,omitzero"`   // its own pending wakeup or loop run should have fired by then, at the latest
+	WakeFor    string    `json:"wake_for,omitempty"`  // what that wakeup or run is for: its reason, else its prompt
 	LastText   string    `json:"last_text,omitempty"` // the last assistant message in full
 	LastActive time.Time `json:"last_active"`
 	// UserAt is when user-role text last opened a turn, by the harness's record. Whoever typed it: a program

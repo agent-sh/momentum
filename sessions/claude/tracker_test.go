@@ -166,8 +166,8 @@ func TestWakeupsAndLoopsSchedule(t *testing.T) {
 		t.Fatalf("phase %s wake %v", s.Phase, s.WakeAt)
 	}
 	x.user("never mind, do this instead").say("ok")
-	if s := x.facts(tr, x.at); s.Phase != sessions.Idle || !s.WakeAt.IsZero() {
-		t.Fatalf("a new prompt takes over the wakeup: %s %v", s.Phase, s.WakeAt)
+	if s := x.facts(tr, x.at); s.Phase != sessions.Scheduled || !s.WakeAt.Equal(t0.Add(602*time.Second)) {
+		t.Fatalf("a wakeup still fires after a prompt: %s %v", s.Phase, s.WakeAt)
 	}
 	x.call("tu2", "CronCreate", map[string]any{"cron": "*/5 * * * *"}).
 		result("tu2", "Scheduled recurring job c1 (*/5 * * * *). It runs until deleted.").say("Looping.")

@@ -56,6 +56,8 @@ var (
 	hStatus    = regexp.MustCompile(`<status>(\w+)</status>`)
 	hTaskStop  = regexp.MustCompile(`"task_id":"(\w+)"`)
 	hCronDel   = regexp.MustCompile(`"id":"(\w+)"`)
+	hReason    = regexp.MustCompile(`"reason":"((?:[^"\\]|\\.)*)`)
+	hPrompt    = regexp.MustCompile(`"prompt":"((?:[^"\\]|\\.)*)`)
 	hCutCall   = regexp.MustCompile(`^\[Tool call interrupted: the session ended before`)
 	hOrphan    = regexp.MustCompile(`didn't finish before|__orphan_summary__`)
 	terminalSt = map[string]bool{"completed": true, "failed": true, "killed": true, "stopped": true, "error": true, "timeout": true, "cancelled": true}
@@ -112,12 +114,39 @@ type replayTask struct {
 	until time.Time // a monitor's expiry
 }
 
+// replayCron is a job CronCreate scheduled, as the store keeps it: its expression, when it was made and last ran,
+// and what it runs.
+type replayCron struct {
+	expr      string
+	at, fired time.Time
+	oneShot   bool
+	what      string
+}
+
+// callFor is what a ScheduleWakeup or a CronCreate call is for, from the store's summary of its input (its start):
+// its reason, else its prompt, unless the prompt is a loop's own sentinel.
+func callFor(summary string) string {
+	var reason, prompt string
+	if g := hReason.FindStringSubmatch(summary); g != nil {
+		reason = g[1]
+	}
+	if g := hPrompt.FindStringSubmatch(summary); g != nil {
+		prompt = g[1]
+	}
+	if reason == "" && strings.HasPrefix(prompt, "<<") {
+		prompt = ""
+	}
+	return strings.ReplaceAll(firstNonEmpty(reason, prompt), `\"`, `"`)
+}
+
 // timeline turns one session's events into its points: one for each input, with the stop before it, and one
 // for the last stop, whose Next is none.
 func timeline(id string, evs []store.Event, until time.Time) []Point {
 	var out []Point
 	tasks := map[string]replayTask{}
-	crons := map[string]string{}
+	crons := map[string]replayCron{}
+	calls := map[string]string{} // a call's id -> what it is for
+	var wakeFor string
 	var wakeAt, ownerAt, resumed time.Time
 	var words, entry, harness, prevRole, prevPrior string
 	var prevAt time.Time
@@ -137,8 +166,24 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		if !wakeAt.IsZero() && wakeAt.After(prevAt.Add(-sessions.WakeGrace)) {
 			s.WakeAt = wakeAt
 		}
-		for _, label := range crons {
-			s.Loop = label
+		for _, c := range crons {
+			s.Loop = c.expr
+		}
+		// When its own pending wakeup, or its loop's next run, should have fired at the latest, as the tracker reads it.
+		earliest := func(d time.Time, what string) {
+			if !d.IsZero() && (s.WakeDue.IsZero() || d.Before(s.WakeDue)) {
+				s.WakeDue, s.WakeFor = d, what
+			}
+		}
+		if !wakeAt.IsZero() {
+			earliest(wakeAt, wakeFor)
+		}
+		for _, c := range crons {
+			if !c.oneShot && at.Sub(c.at) <= 7*24*time.Hour {
+				if _, d, ok := claude.LoopRun(c.expr, latestOf(c.at, c.fired)); ok {
+					earliest(d, c.what)
+				}
+			}
 		}
 		switch prevRole {
 		case "call":
@@ -213,9 +258,21 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 					entry = v
 				}
 			}
-			wakeAt, resumed = time.Time{}, time.Time{}
+			resumed = time.Time{} // a planned wakeup still fires after a prompt: it stays
 			lastMainUser = true
 		case "self":
+			if prior, _ := m["prior"].(string); prior == "scheduled_task_fire" { // a scheduled run started
+				if !wakeAt.IsZero() && !e.TS.Before(wakeAt.Add(-sessions.WakeGrace)) {
+					wakeAt, wakeFor = time.Time{}, ""
+				} else {
+					for k, c := range crons { // the job whose run has come (one every five minutes starts a little early)
+						if run, _, ok := claude.LoopRun(c.expr, latestOf(c.at, c.fired)); ok && !run.After(e.TS.Add(20*time.Second)) {
+							c.fired = e.TS
+							crons[k] = c
+						}
+					}
+				}
+			}
 			st := hStatus.FindStringSubmatch(e.Summary)
 			for _, tm := range hTaskID.FindAllStringSubmatch(e.Summary, -1) {
 				t, ok := tasks[tm[1]]
@@ -228,11 +285,11 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			}
 			if hOrphan.MatchString(e.Summary) { // reopened: what ran died with the process
 				resumed = e.TS
-				tasks, crons = map[string]replayTask{}, map[string]string{}
+				tasks, crons, wakeAt = map[string]replayTask{}, map[string]replayCron{}, time.Time{}
 			}
 			lastMainUser = true
 		case "momentum": // a message momentum typed: it opens a turn, and is not the owner's
-			wakeAt, resumed = time.Time{}, time.Time{}
+			resumed = time.Time{}
 			lastMainUser = true
 		case "interrupt": // its owner pressed Esc or turned a call down: he was there, as the live layer counts it
 			ownerAt = e.TS
@@ -240,6 +297,9 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		case "call":
 			id, _ := m["tool_id"].(string)
 			pending[id] = true
+			if e.Tool == "ScheduleWakeup" || e.Tool == "CronCreate" {
+				calls[id] = callFor(e.Summary)
+			}
 			switch e.Tool {
 			case "TaskStop":
 				if g := hTaskStop.FindStringSubmatch(e.Summary); g != nil {
@@ -258,7 +318,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			s := e.Summary
 			if isErr && hCutCall.MatchString(s) {
 				resumed = e.TS
-				tasks, crons = map[string]replayTask{}, map[string]string{}
+				tasks, crons, wakeAt = map[string]replayTask{}, map[string]replayCron{}, time.Time{}
 			}
 			if !isErr {
 				if g := hBgBash.FindStringSubmatch(s); g != nil && e.Tool == "Bash" {
@@ -277,10 +337,13 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 				}
 				if g := hWake.FindStringSubmatch(s); g != nil && e.Tool == "ScheduleWakeup" {
 					n, _ := strconv.Atoi(g[1])
-					wakeAt = e.TS.Add(time.Duration(n) * time.Second)
+					wakeAt, wakeFor = e.TS.Add(time.Duration(n)*time.Second), calls[id]
+				}
+				if strings.HasPrefix(s, "Loop stopped") && e.Tool == "ScheduleWakeup" {
+					wakeAt, wakeFor = time.Time{}, ""
 				}
 				if g := hCron.FindStringSubmatch(s); g != nil && e.Tool == "CronCreate" {
-					crons[g[2]] = g[3]
+					crons[g[2]] = replayCron{expr: g[3], at: e.TS, oneShot: g[1] == "one-shot", what: calls[id]}
 				}
 			}
 			lastMainUser = true
@@ -316,6 +379,13 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		out = append(out, Point{Session: id, Stop: stopOf(until, ""), Next: Next{Kind: "none"}, Entry: entry})
 	}
 	return out
+}
+
+func latestOf(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
 }
 
 // requestLimit bounds how much of a transcript requestBetween reads between two events.
