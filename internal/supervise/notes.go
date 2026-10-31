@@ -45,14 +45,15 @@ func waitsOnOwner(s *sessions.Session, stop Stop, d Decision, presence time.Time
 		return ask{}, false
 	}
 	var title string
-	wait := p.OwnerWindow
+	wait, since := p.OwnerWindow, stop.At
 	switch {
 	case stop.Ask == sessions.AskQuestion, stop.Ask == sessions.AskPermission:
 		title = s.Ask
 	case stop.Ask == sessions.AskPlan:
 		title = "Approve the plan? " + s.Ask
-	case stalledLeft:
+	case stalledLeft: // an ask per request: Claude Code's own retry starts the wait again
 		title = "Resume it? Its request to the model from " + stop.RequestAt.Local().Format("Jan 2 15:04") + " never got a reply"
+		since = stop.RequestAt
 	case s.TurnOpen:
 		return ask{}, false
 	case d.Rule == RuleAccess && d.Verdict == Wait && d.At.IsZero():
@@ -78,13 +79,13 @@ func waitsOnOwner(s *sessions.Session, stop Stop, d Decision, presence time.Time
 	if strings.TrimSpace(title) == "" {
 		return ask{}, false
 	}
-	due := stop.At
+	due := since
 	if presence.After(due) {
 		due = presence
 	}
-	return ask{title: title, since: stop.At, due: due.Add(wait),
+	return ask{title: title, since: since, due: due.Add(wait),
 		detail: fmt.Sprintf("%s (%s) has waited for you since %s. momentum does not answer for you.", sessionName(s), s.Tool,
-			stop.At.Local().Format("Jan 2 15:04"))}, true
+			since.Local().Format("Jan 2 15:04"))}, true
 }
 
 // notes keeps supervision's notes in step with what the run saw. A session that has waited on its owner past the

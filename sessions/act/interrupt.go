@@ -16,12 +16,17 @@ var (
 	// reQueuedHint is what Claude Code writes on its input line while a message waits in its queue, in any of its
 	// wordings ("Press up to edit queued messages", "Press up to select a queued message ...").
 	reQueuedHint = regexp.MustCompile(`(?i)\bqueued messages?\b`)
-	// reSpinner is Claude Code's running row: a spinner glyph, what it does, an ellipsis, and how long it has run
-	// ("✻ Fermenting… (31m 4s)", "✻ Running the test suite… (2m · ↓ 3k tokens)"). The row a finished turn leaves
-	// says what it did and for how long, with no ellipsis.
-	reSpinner = regexp.MustCompile(`^\s*[·✢✳✶✻✽*]\s+.{1,120}…\s*\(\d+[hms]`)
+	// reSpinner is Claude Code's running row: a spinner glyph at the left edge, what it does, and an ellipsis, then
+	// how long it has run when the row has room ("✻ Fermenting… (31m 4s)", "✻ Running the test suite…"). The row a
+	// finished turn leaves says what it did and for how long, with no ellipsis.
+	reSpinner = regexp.MustCompile(`^[·✢✳✶✻✽*] +\S.*…(\s*\(.*\))?\s*$`)
+	// reTimed is a running row with how long it has run, which only a running row shows: the conversation draws a
+	// row like the rest of it for a thinking block (verbose, "✻ Thinking…").
+	reTimed = regexp.MustCompile(`…\s*\(.*\b\d+[hms]\b`)
+	// reGlyph is the spinner glyph Claude Code starts its running row with, and its retry notices too.
+	reGlyph = regexp.MustCompile(`^[·✢✳✶✻✽*] `)
 	// reRetrying is what Claude Code writes in that row's place while it waits for, or retries, a request.
-	reRetrying = regexp.MustCompile(`Retrying in \d+s · attempt \d+/\d+|Waiting for API response · will retry in`)
+	reRetrying = regexp.MustCompile(`Retrying in \d+[hms]|Waiting for API response · will retry in|No response from the API after \d|retrying(?: once)?, waiting up to \d|next try in \d+[hms]`)
 )
 
 // Queued reports a styled screen whose input line says, in what it draws dim, that a message waits in the
@@ -35,26 +40,45 @@ func Queued(styled, tool string) bool {
 }
 
 // TurnRuns reports a styled screen of a Claude Code turn running, read only from Claude Code's own rows around
-// its input box: its running row or the retry notice in its place, just above the box, and the key that
-// interrupts the turn on the status line below it (dropped while text sits on the input line). The conversation
-// above says nothing about the turn.
+// its input box (statusRows): its running row, or the retry notice in its place, and the key that interrupts the
+// turn on the status line below the box. The conversation above says nothing about the turn. Claude Code drops
+// the key while text sits on the input line, or when the status line has no room, and the running row's time
+// when it has none.
 func TurnRuns(styled, tool string) bool {
-	above, below, ok := statusRows(styled, tool)
-	if !ok {
-		return false
-	}
-	for _, row := range above {
-		if reSpinner.MatchString(row) || reRetrying.MatchString(row) {
-			return true
-		}
-	}
-	return reRunning.MatchString(strings.Join(below, "\n"))
+	row, under, below, ok := statusRows(styled, tool)
+	return ok && turnRuns(row, under, below, false)
 }
 
-// statusRows are the plain rows Claude Code draws around its input box: up to three rows with text above the box's
-// top rule, the nearest first, and every row below its bottom rule. false when the screen has no input box of
-// the tool's.
-func statusRows(styled, tool string) (above, below []string, ok bool) {
+// turnRuns reads statusRows for a running turn. sure asks for what only a running turn shows: the key on the
+// status line, the running row with its time, or a retry notice in its place; without it, a running row with no
+// time counts too.
+func turnRuns(row string, under, below []string, sure bool) bool {
+	if reRunning.MatchString(strings.Join(below, "\n")) {
+		return true
+	}
+	if !reGlyph.MatchString(row) {
+		return false
+	}
+	if reRetrying.MatchString(strings.Join(strings.Fields(row+" "+strings.Join(under, " ")), " ")) {
+		return true // a notice may wrap onto the rows under its first
+	}
+	return reSpinner.MatchString(row) && (!sure || reTimed.MatchString(row))
+}
+
+// turnRunsSure is TurnRuns by what only a running turn shows (turnRuns): before anything is typed, the input line
+// is empty and Claude Code shows the key, and the time once the turn has run a while.
+func turnRunsSure(styled, tool string) bool {
+	row, under, below, ok := statusRows(styled, tool)
+	return ok && turnRuns(row, under, below, true)
+}
+
+// statusRows are the plain rows Claude Code draws around its input box. row is the one its running row would be:
+// the first row above the box's top rule, past blank rows, that starts at the left edge, past the indented rows
+// right under it (Claude Code draws a tip or its task list there, the first under ⎿); empty when a blank row parts
+// those from the row above them, since nothing parts them from the running row. under are those indented rows, top
+// first, and below every row under the box's bottom rule. false when the screen has no input box of the tool's:
+// Claude Code's between its two rules.
+func statusRows(styled, tool string) (row string, under, below []string, ok bool) {
 	lines := strings.Split(styled, "\n")
 	for i := len(lines) - 1; i > 0; i-- {
 		trimmed := strings.TrimLeftFunc(Plain(lines[i]), unicode.IsSpace)
@@ -70,17 +94,26 @@ func statusRows(styled, tool string) (above, below []string, ok bool) {
 		if end >= len(lines) || !rule(strings.TrimSpace(Plain(lines[end]))) {
 			continue // Claude Code's input line has a rule above it and below it
 		}
-		for j := i - 2; j >= 0 && len(above) < 3; j-- {
-			if p := Plain(lines[j]); strings.TrimSpace(p) != "" {
-				above = append(above, p)
+		j := i - 2
+		for ; j >= 0 && strings.TrimSpace(Plain(lines[j])) == ""; j-- {
+		}
+		for ; j >= 0; j-- {
+			p := Plain(lines[j])
+			if strings.TrimSpace(p) == "" {
+				break // a blank row: the indented rows are not the running row's
 			}
+			if r := []rune(p); !unicode.IsSpace(r[0]) {
+				row = p
+				break
+			}
+			under = append([]string{p}, under...)
 		}
 		for _, l := range lines[end+1:] {
 			below = append(below, Plain(l))
 		}
-		return above, below, true
+		return row, under, below, true
 	}
-	return nil, nil, false
+	return "", nil, nil, false
 }
 
 // CheckInterrupt reports whether Interrupt could type into t now, and by which path: the checks it makes before it
@@ -203,7 +236,7 @@ func (s *Sender) interrupt(term keys, tool, text string, still func() error) err
 
 // running checks a styled screen before anything is typed: no dialog, an input line of the tool's with nothing
 // typed on it (read first: text on the line hides the interrupt key, and a draft is its owner at the pane),
-// nothing waiting in the queue, and the turn running.
+// nothing waiting in the queue, and the turn running, by what only a running turn shows (turnRunsSure).
 func running(styled, tool string) error {
 	if d := Dialog(Plain(styled)); d != "" {
 		return fmt.Errorf("%w: %s", ErrDialog, d)
@@ -217,7 +250,7 @@ func running(styled, tool string) error {
 	if Queued(styled, tool) {
 		return ErrQueued
 	}
-	if !TurnRuns(styled, tool) {
+	if !turnRunsSure(styled, tool) {
 		return ErrIdle
 	}
 	return nil

@@ -112,14 +112,15 @@ var Live = map[string]bool{RuleTransient: true, RuleAccess: true}
 
 // Decision is what supervision does about one session now.
 type Decision struct {
-	Rule    string
-	Verdict string
-	At      time.Time // when the rule acts; for a hold, when it looks again
-	RuleAt  time.Time // when the rule's own wait ends, whatever holds it: the stale hour counts from it
-	Text    string
-	Why     string
-	Try     int  // the try a message is, from 1
-	Stale   bool // the rule's time came longer ago than Params.Stale: it does not act
+	Rule     string
+	Verdict  string
+	At       time.Time // when the rule acts; for a hold, when it looks again
+	RuleAt   time.Time // when the rule's own wait ends, whatever holds it: the stale hour counts from it
+	Text     string
+	Why      string
+	Try      int  // the try a message is, from 1
+	Stale    bool // the rule's time came longer ago than Params.Stale: it does not act
+	thenCase bool // its time opens a case, not a message: the tries are used up, and only the wait tells
 }
 
 // Decide applies the guards and the rules to a stop at now. A zero Decision means no rule applies. A rule whose
@@ -136,6 +137,9 @@ func Decide(s Stop, tries Tries, p Params, probe Probe, now time.Time) Decision 
 	}
 	if !d.At.IsZero() && !now.Before(d.At) {
 		d.Verdict = Act
+		if d.thenCase {
+			d.Verdict, d.Why = Case, used(d.Rule, d.Try).Why
+		}
 	}
 	return d
 }
@@ -205,6 +209,14 @@ func wait(rule string, at time.Time, try int, text, why string) Decision {
 
 func used(rule string, n int) Decision {
 	return Decision{Rule: rule, Verdict: Case, Try: n, Why: fmt.Sprintf("%d messages did not move it", n)}
+}
+
+// usedAt is a case that waits for the rule's own time: the stop it reads comes back with the last message (a
+// stalled turn's message sends a request of its own), and only the wait tells that the message did not move it.
+func usedAt(rule string, n int, at time.Time, why string) Decision {
+	d := wait(rule, at, n, "", why+"; then a case: "+used(rule, n).Why)
+	d.thenCase = true
+	return d
 }
 
 // priorProcess reports a stop from before the session's process started: a process before this one stopped
@@ -294,20 +306,20 @@ const StalledText = Marker + " Your last request to the model got no reply. Cont
 // conversation is the request, and no tool call is in flight. Background work does not answer the model: its
 // notification waits in the queue behind the turn. Past the longest a reply legitimately takes to begin, counted
 // from the request or from the machine waking after it, the message goes in as the next prompt, and Escape ends
-// the turn that waits (act's Interrupt); a turn the harness already took back gets the message as any idle
-// session does. A message its user queued waits for him.
+// the turn that waits (act's Interrupt). A message its user queued waits for him. With its tries used up, a case
+// opens once the last message's own request has waited as long.
 func stalled(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
 	if s.Tool != "claude" || s.RequestAt.IsZero() || !s.Working || s.Busy || s.Queued > 0 ||
 		!s.Started.IsZero() && s.RequestAt.Before(s.Started) {
 		return Decision{}, false
 	}
 	n := tries[RuleStalled]
-	if n >= p.StalledTries {
-		return used(RuleStalled, n), true
-	}
 	from, why := s.RequestAt, "a model request with no reply since "+s.RequestAt.Local().Format("15:04")
 	if s.Woke.After(from) {
 		from, why = s.Woke, why+"; the machine was suspended, and woke at "+s.Woke.Local().Format("15:04")
+	}
+	if n >= p.StalledTries { // the last message's own request: a case once it too has waited
+		return usedAt(RuleStalled, n, from.Add(p.StalledWait), why), true
 	}
 	return wait(RuleStalled, from.Add(p.StalledWait), n+1, StalledText, why), true
 }

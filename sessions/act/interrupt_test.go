@@ -19,18 +19,34 @@ const queuedHint = "\x1b[7m\x1b[39mP\x1b[0;2mress up to edit queued messages\x1b
 
 // turnScreen is a Claude Code screen whose turn runs, with what its input line holds. As Claude Code does, its
 // status line offers the interrupt key only while nothing is typed on the input line.
-func turnScreen(input string) string {
+func turnScreen(input string) string { return turnScreenOf("", input) }
+
+// workingRows are the rows above the input box of a turn that runs: the conversation, and the running row.
+const workingRows = "● Reading the logs\n✻ Working… (31m 4s)\n\n"
+
+// turnScreenOf is turnScreen with other rows above the box ("" for workingRows).
+func turnScreenOf(above, input string) string {
+	if above == "" {
+		above = workingRows
+	}
 	hint := ""
 	if input == "" || input == queuedHint {
 		hint = " · esc to interrupt"
 	}
-	return "● Reading the logs\n✻ Working… (31m 4s)\n\n" + ruleLine + "\n❯" + nbsp + input + "\n" + ruleLine + "\n  ⏵⏵ auto mode on" + hint
+	return above + ruleLine + "\n❯" + nbsp + input + "\n" + ruleLine + "\n  ⏵⏵ auto mode on" + hint
 }
+
+// Claude Code's own layouts of a running turn's rows above the box.
+const (
+	tasksRows  = "● Reading the logs\n\n✻ Writing the tests… (12m 3s)\n  ⎿  ◼ Write the tests\n     ☐ Run them\n     ☐ Ship it\n\n"
+	narrowRows = "● Reading the logs\n\n✻ Writing the tests for the whole package…\n\n"
+)
 
 // fakeTurn answers the tmux commands Interrupt runs for a pane whose turn runs: the paste shows on the input line,
 // Enter moves it to the queue and the input line says a message waits there, Escape is recorded.
 type fakeTurn struct {
 	screen   string // the screen before anything is typed; "" is a running turn with an empty input line
+	above    string // the rows above the box of its running turn ("" for workingRows)
 	mode     string
 	line     string // what the input line holds now
 	pasted   string
@@ -62,16 +78,16 @@ func (f *fakeTurn) run(_ context.Context, stdin, name string, args ...string) ([
 		case f.entered && f.noQueue:
 			return []byte(emptyInput), nil
 		case f.entered && f.newTurn:
-			return []byte(turnScreen("")), nil
+			return []byte(turnScreenOf(f.above, "")), nil
 		case f.entered:
-			return []byte(turnScreen(queuedHint)), nil
+			return []byte(turnScreenOf(f.above, queuedHint)), nil
 		case f.ends && f.pasted != "":
 			return []byte(emptyInputWith(f.line)), nil
 		case f.pasted != "" && f.late > 0:
 			f.late--
-			return []byte(turnScreen("")), nil
+			return []byte(turnScreenOf(f.above, "")), nil
 		}
-		return []byte(turnScreen(f.line)), nil
+		return []byte(turnScreenOf(f.above, f.line)), nil
 	case "load-buffer":
 		f.pasted = stdin
 	case "paste-buffer":
@@ -101,29 +117,56 @@ func TestInterruptQueuesTheMessageThenPressesEscape(t *testing.T) {
 	if f.pasted != "[momentum] Your last request got no reply." || strings.Join(f.keys, " ") != "Enter Escape" {
 		t.Fatalf("pasted %q, keys %q", f.pasted, f.keys)
 	}
+	// Its task list under the running row, or no room for the row's time: the paste hides the key, and the row
+	// still says the turn runs.
+	for name, above := range map[string]string{"a task list": tasksRows, "no room for its time": narrowRows} {
+		f := &fakeTurn{above: above}
+		s, tgt := turnPane(t, f)
+		if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue", nil); err != nil || strings.Join(f.keys, " ") != "Enter Escape" {
+			t.Errorf("%s: %v keys %q", name, err, f.keys)
+		}
+	}
 }
 
 func TestTheTurnRunsByClaudeCodesOwnRows(t *testing.T) {
 	box := ruleLine + "\n❯" + nbsp + "\n" + ruleLine + "\n"
+	// What only a running turn shows: TurnRuns, and the sure reading made before anything is typed.
 	for name, screen := range map[string]string{
 		"the interrupt key on the status line": "output\n\n" + box + "  ⏵⏵ auto mode on · esc to interrupt",
-		"its running row":                      "output\n✻ Fermenting… (35m 11s)\n\n" + box + status,
+		"its running row":                      "● output\n\n✻ Fermenting… (35m 11s)\n\n" + box + status,
 		"a running row of several words":       "✻ Running the test suite… (2m · ↓ 3k tokens)\n  ⎿  Tip: a tip\n\n" + box + status,
-		"the waiting notice in its place":      "Waiting for API response · will retry in 31s · check your network\n" + box + status,
-		"the retry notice in its place":        "✻ Request timed out. · Retrying in 4s · attempt 3/10\n" + box + status,
+		"its task list under it":               tasksRows + box + status,
+		"the waiting notice in its place":      "✻ Waiting for API response · will retry in 31s · check your network\n" + box + status,
+		"the retry notice in its place":        "✻ Request timed out. · Retrying in 1m 30s · attempt 3/10\n" + box + status,
+		"a retry notice that wraps":            "✻ API Error: 529 Overloaded · Retrying\n  in 4s · attempt 3/10\n\n" + box + status,
+		"the notice of no first byte":          "✻ No response from the API after 5m · retrying, waiting up to 10m · attempt 2/10\n  A proxy can cause this\n\n" + box + status,
 	} {
-		if !TurnRuns(screen, "claude") {
-			t.Errorf("%s: not running", name)
+		if !TurnRuns(screen, "claude") || !turnRunsSure(screen, "claude") {
+			t.Errorf("%s: not running: %v, sure %v", name, TurnRuns(screen, "claude"), turnRunsSure(screen, "claude"))
+		}
+	}
+	// A running row with no room for its time says so too, but not surely: the conversation draws a row like it for
+	// a thinking block.
+	for name, screen := range map[string]string{
+		"no room for its time":   narrowRows + box + status,
+		"a thinking block's row": "✻ Thinking…\n  ⎿  Interrupted · What should Claude do instead?\n\n" + box + status,
+	} {
+		if !TurnRuns(screen, "claude") || turnRunsSure(screen, "claude") {
+			t.Errorf("%s: running %v, sure %v", name, TurnRuns(screen, "claude"), turnRunsSure(screen, "claude"))
 		}
 	}
 	for name, screen := range map[string]string{
-		"the row a finished turn leaves":      "✻ Worked for 3m 2s\n\n" + box + status,
-		"retry words in a tool's output":      "ran it: retrying in 5s (attempt 2/3)\n" + box + status,
-		"the agent's words about waiting":     "I am Waiting for API response from the vendor.\n" + box + status,
-		"a bullet that trails off":            "* Next…\n" + box + status,
-		"the key in the conversation above":   "press esc to interrupt it\n" + box + status,
-		"a running row far up in the history": "✻ Fermenting… (35m 11s)\none\ntwo\nthree\n" + box + status,
-		"no input box":                        "✻ Fermenting… (35m 11s)\nesc to interrupt\n",
+		"the row a finished turn leaves":       "✻ Worked for 3m 2s\n\n" + box + status,
+		"retry words in a tool's output":       "ran it: retrying in 5s (attempt 2/3)\n" + box + status,
+		"the agent's words about waiting":      "I am Waiting for API response from the vendor.\n" + box + status,
+		"a bullet that trails off":             "● Next steps:\n  * Next…\n\n" + box + status,
+		"the key in the conversation above":    "press esc to interrupt it\n" + box + status,
+		"a running row above the conversation": "✻ Fermenting… (35m 11s)\n\n● It finished.\n  Its output\n\n" + box + status,
+		"a running row far up in the history":  "✻ Fermenting… (35m 11s)\none\ntwo\nthree\n" + box + status,
+		"a running row in a tool's output":     "● Bash(./run)\n  ⎿  ✻ Running… (2m)\n     done\n\n" + box + status,
+		"a turn taken back":                    "❯ go on\n  ⎿  Interrupted · What should Claude do instead?\n\n" + box + status,
+		"a blank row under a running row":      "✻ Fermenting… (35m 11s)\n\n  ⎿  indented\n\n" + box + status,
+		"no input box":                         "✻ Fermenting… (35m 11s)\nesc to interrupt\n",
 	} {
 		if TurnRuns(screen, "claude") {
 			t.Errorf("%s: running", name)
@@ -150,6 +193,9 @@ func TestInterruptRefusesBeforeTypingAnything(t *testing.T) {
 		{"a draft", turnScreen("half typed"), "", "claude", ErrDraft},
 		{"a draft under a running row of several words", strings.Replace(turnScreen("half typed"), "✻ Working…", "✻ Running the test suite…", 1), "", "claude", ErrDraft},
 		{"a draft that names the queue", turnScreen("why are queued messages stuck"), "", "claude", ErrDraft},
+		{"a draft under a running row with no time", turnScreenOf(narrowRows, "half typed"), "", "claude", ErrDraft},
+		{"a running row with no time and no key", narrowRows + ruleLine + "\n❯" + nbsp + "\n" + ruleLine + "\n" + status, "", "claude", ErrIdle},
+		{"a thinking block's row", "✻ Thinking…\n  ⎿  Interrupted · What should Claude do instead?\n\n" + emptyInput, "", "claude", ErrIdle},
 		{"a message already queued", turnScreen(queuedHint), "", "claude", ErrQueued},
 		{"copy mode", turnScreen(""), "1", "claude", ErrMode},
 		{"no input line", "✻ Working… (esc to interrupt)\nplain output\n", "", "claude", ErrNoInput},

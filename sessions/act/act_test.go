@@ -131,6 +131,12 @@ func TestSendPastesThenPressesEnter(t *testing.T) {
 	if !strings.Contains(paste, " -p ") || !strings.Contains(paste, "-t %3") {
 		t.Fatalf("not a bracketed paste into the pane: %q", paste)
 	}
+	// On Claude Code's input box, only its own rows say a turn runs: the key in the conversation does not.
+	f = &fakeTmux{screen: "● Press esc to interrupt it when it hangs.\n\n" + strings.TrimPrefix(emptyInput, "output\n"), mode: "0"}
+	s, tgt = pane(t, f, agent)
+	if _, err := s.Send(context.Background(), tgt, "[momentum] continue"); err != nil || f.cmds[len(f.cmds)-1] != "tmux send-keys -t %3 Enter" {
+		t.Fatalf("the key in the conversation: %v %q", err, f.cmds)
+	}
 }
 
 func TestSendRefusesWhenTheSessionIsNotWaitingForInput(t *testing.T) {
@@ -140,7 +146,7 @@ func TestSendRefusesWhenTheSessionIsNotWaitingForInput(t *testing.T) {
 	recycled.Start = 99 // another process now has the pid
 	elsewhere.PPID = 1  // not under the pane's shell
 	ownTTY.TTY = 34816  // a terminal of its own, which another program in the pane opened for it
-	claudeWorking := "● Running the tests\n✻ Working… (12s · esc to interrupt)\n\n" + emptyInput
+	claudeWorking := "● Running the tests\n\n✻ Working… (12s · esc to interrupt)\n\n" + strings.TrimPrefix(emptyInput, "output\n")
 	codexWorking := "• Working (4s • esc to interrupt)\n\n\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\n"
 	cases := []struct {
 		name   string
@@ -199,7 +205,7 @@ func TestSendDoesNotPressEnterUnlessTheInputLineHoldsTheMessageAlone(t *testing.
 		"someone else's words":             {emptyInputWith("someone else's words"), ""},
 		"the message and more":             {emptyInputWith(msg + " and more"), ""},
 		"a dialog opened meanwhile":        {emptyInputWith(msg) + "\n  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n", ""},
-		"a turn started meanwhile":         {"✻ Working… (2s · esc to interrupt)\n" + emptyInputWith(msg), ""},
+		"a turn started meanwhile":         {"✻ Working… (2s · esc to interrupt)\n" + strings.TrimPrefix(emptyInputWith(msg), "output\n"), ""},
 		"a turn whose key the paste hides": {strings.Replace(emptyInputWith(msg), "output\n", "output\n✻ Working… (2s)\n\n", 1), ""},
 		"the input line went away":         {"output only\n", ""},
 		"copy mode meanwhile":              {"", "1 0"},

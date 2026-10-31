@@ -26,7 +26,7 @@ func TestStalledInterruptsATurnWaitingOnARequestWithNoReply(t *testing.T) {
 	check(t, stalled, []ruleCase{
 		{"a request with no reply", waiting(func(*Stop) {}), Tries{}, nil, Wait, t0.Add(30 * time.Minute), 1, "got no reply"},
 		{"the second try", waiting(func(*Stop) {}), Tries{RuleStalled: 1}, nil, Wait, t0.Add(30 * time.Minute), 2, Marker},
-		{"tries used up", waiting(func(*Stop) {}), Tries{RuleStalled: 2}, nil, Case, time.Time{}, 2, ""},
+		{"tries used up: the last message's own request waits too", waiting(func(*Stop) {}), Tries{RuleStalled: 2}, nil, Wait, t0.Add(30 * time.Minute), 2, ""},
 		{"the machine slept after it", waiting(func(s *Stop) { s.Woke = t0.Add(2 * time.Hour) }), Tries{}, nil, Wait, t0.Add(2*time.Hour + 30*time.Minute), 1, ""},
 		{"it slept before it", waiting(func(s *Stop) { s.Woke = t0.Add(-time.Hour) }), Tries{}, nil, Wait, t0.Add(30 * time.Minute), 1, ""},
 		{"a call runs", waiting(func(s *Stop) { s.Busy = true }), Tries{}, nil, "", time.Time{}, 0, ""},
@@ -39,6 +39,14 @@ func TestStalledInterruptsATurnWaitingOnARequestWithNoReply(t *testing.T) {
 	// The owner's prompt that sent the request holds nothing past his window: the wait is longer.
 	if d := Plan(waiting(func(*Stop) {}), Tries{}, DefaultParams, nil); d.Rule != RuleStalled || d.Verdict != Wait {
 		t.Fatalf("held: %+v", d)
+	}
+	// With the tries used up, its time opens a case, not a third message.
+	used := Tries{RuleStalled: 2}
+	if d := Decide(waiting(func(*Stop) {}), used, DefaultParams, nil, t0.Add(29*time.Minute)); d.Verdict != Wait {
+		t.Fatalf("before its time: %+v", d)
+	}
+	if d := Decide(waiting(func(*Stop) {}), used, DefaultParams, nil, t0.Add(30*time.Minute)); d.Verdict != Case || d.Why != "2 messages did not move it" {
+		t.Fatalf("at its time: %+v", d)
 	}
 }
 
@@ -200,6 +208,31 @@ func TestALoopStalledOnARequestIsInterruptedAndResumed(t *testing.T) {
 	}
 }
 
+func TestAStalledTurnsCaseWaitsForTheRequestItsLastMessageSent(t *testing.T) {
+	x, sent, scan := stalledLoop(t)
+	st := testStore(t)
+	now := sent.Add(30 * time.Minute)
+	f := &queueing{x: x, now: &now}
+	sv := liveStalled(st, f, &now)
+	for try := 1; try <= 2; try++ {
+		run(t, sv, scan(now))
+		if len(f.sent) != try {
+			t.Fatalf("try %d: sent %q", try, f.sent)
+		}
+		x.request() // the message's turn sends its request, and it gets no reply either
+		now = x.at.Add(time.Minute)
+		run(t, sv, scan(now)) // the message delivered, and its request only a minute old
+		if len(events(t, st, KindCase)) != 0 {
+			t.Fatalf("try %d: a case a minute after the message: %+v", try, events(t, st, KindCase))
+		}
+		now = x.at.Add(30 * time.Minute)
+	}
+	run(t, sv, scan(now))
+	if cs := events(t, st, KindCase); len(cs) != 1 || len(f.sent) != 2 || !strings.Contains(cs[0].Summary, "2 messages did not move it") {
+		t.Fatalf("at the last request's time: cases %+v, sent %q", cs, f.sent)
+	}
+}
+
 // waitingSession is a Claude Code session whose turn has waited on a request since t0.
 func waitingSession(key string) *sessions.Session {
 	return &sessions.Session{Key: key, Tool: "claude", Pane: "%4", PID: 42, Phase: sessions.Working, TurnOpen: true, Since: t0,
@@ -262,6 +295,42 @@ func TestADryStalledTurnGetsANeedsNote(t *testing.T) {
 	run(t, sv, s)
 	if n, _ := note(t, st, AskNote+s.Key); n.Done.IsZero() {
 		t.Fatalf("still stands: %+v", n)
+	}
+}
+
+func TestAStallsNeedsNoteGoesWithItsRequest(t *testing.T) {
+	for _, live := range []bool{false, true} {
+		st := testStore(t)
+		f := &fakeSender{checkInterrupt: act.ErrIdle} // live: its screen shows the turn taken back
+		now := t0.Add(31 * time.Minute)
+		sv := unread(liveStalled(st, f, &now))
+		if !live {
+			sv.Live = nil
+		}
+		s := waitingSession("sess-retried")
+		run(t, sv, s)
+		if n, ok := note(t, st, AskNote+s.Key); !ok || !n.Done.IsZero() {
+			t.Fatalf("live %v: needs note %+v %v", live, n, ok)
+		}
+		// Claude Code retries the request by itself: the wait starts again, and the note about the first goes.
+		s.RequestAt, now = t0.Add(40*time.Minute), t0.Add(41*time.Minute)
+		run(t, sv, s)
+		if n, _ := note(t, st, AskNote+s.Key); n.Done.IsZero() {
+			t.Fatalf("live %v: the note outlived its request: %+v", live, n)
+		}
+		// Before the retry has waited as long, no note about it: what the screen or the dry rule showed was about
+		// the first request.
+		now = t0.Add(56 * time.Minute)
+		run(t, sv, s)
+		if n, _ := note(t, st, AskNote+s.Key); n.Done.IsZero() {
+			t.Fatalf("live %v: a note before the retry waited: %+v", live, n)
+		}
+		// The retry waits as long: its own note.
+		now = t0.Add(71 * time.Minute)
+		run(t, sv, s)
+		if n, ok := note(t, st, AskNote+s.Key); !ok || !n.Done.IsZero() || !strings.Contains(n.Title, t0.Add(40*time.Minute).Local().Format("15:04")) {
+			t.Fatalf("live %v: the retry's note %+v %v", live, n, ok)
+		}
 	}
 }
 
