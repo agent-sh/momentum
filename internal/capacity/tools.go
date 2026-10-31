@@ -145,10 +145,12 @@ func stopTree(pid int) error {
 // files hardlinks or copies of the cache's) is untouched. Every uv process holds uv's lock shared for its life, so a
 // prune that takes the lock waits for all of them. The rule looks first. It waits quietly for a uv process that may
 // write the cache now (an install, a sync, a run that has not started its command), and waits for, and names, a
-// process that uses the cache: a path in it, an environment in it or linked into it, a container that mounts it, a
-// holder of the lock it cannot read, a process that waits for the lock or holds it alone (uv's own clean or prune).
-// Otherwise it prunes: with uv's own lock when nobody holds it, or, when every holder is a uv process past its sync
-// that runs outside the cache, with --force under a lock of its own put in the lock file's place (lockInPlace).
+// container that mounts the cache, a holder of the lock it cannot read, a process that waits for the lock or holds it
+// alone (uv's own clean or prune), and a process whose use of the cache it cannot tell. Otherwise it prunes: with
+// uv's own lock when nobody holds it, or, when every holder is a uv process past its sync that runs outside the
+// cache, with --force under a lock of its own put in the lock file's place (lockInPlace). When processes run from
+// the cache (a path in it, an environment in it or linked into it), it prunes around them instead (uvReachOf,
+// uvRemove), under uv's lock or its own in the lock file's place.
 func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error) {
 	out, err := r.tools.UV(ctx, 30*time.Second, "cache", "dir")
 	if errors.Is(err, errNoTool) {
@@ -179,8 +181,11 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 		return nil, notes, nil
 	}
 	// the cache as uv spells it and as the kernel does: /proc shows paths with their links resolved
-	c := uvCache{canon: f.canon, real: r.m.resolve(dir), name: r.m.Canon, named: filepath.Join(dir, ".lock")}
+	c := uvCache{canon: f.canon, real: r.m.resolve(dir), name: r.m.Canon, named: filepath.Join(dir, ".lock"), dir: dir}
 	c.lock, c.lockReal = r.m.Canon(c.named), filepath.Join(c.real, ".lock")
+	if p, err := filepath.EvalSymlinks(dir); err == nil {
+		c.dir = p
+	}
 	look := func() *Sample {
 		return TakeSample(r.opt.ProcRoot, r.m, func(p string) bool { return c.in(p) })
 	}
@@ -217,8 +222,22 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 	if pid, busy := uvBusy(now, r.opt.ProcRoot); busy != "" {
 		return keep(pid, busy)
 	}
-	if users := uvUsers(now, r.opt.ProcRoot, c, lk.locks.holders, envs); users != "" {
-		return report(using(users))
+	// processes that run from the cache: uv's prune would delete what they use, so the rule prunes around it, when the
+	// look can tell what that is
+	found := uvUsers(now, r.opt.ProcRoot, c, lk.locks.holders, envs)
+	var around *uvReach
+	// an entry of builds-v0 may be the environment of a command whose uv was killed, and once that command set its
+	// title over its environment nothing names it: uv's prune deletes builds-v0, so the prune goes around it too
+	if found.names != "" || uvHeld(c) {
+		switch {
+		case found.blind != "":
+			return report("the look cannot tell what these use of the cache, and a prune may delete it (" + found.blind + ")")
+		case len(envs.slow) > 0:
+			return report(using(found.names))
+		}
+		if around = uvReachOf(c, found); around.why != "" {
+			return report(around.why)
+		}
 	}
 	forced := len(lk.locks.holders) > 0
 	if forced {
@@ -236,7 +255,11 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 		if len(lk.locks.holders) == 1 {
 			holders = "1 uv process holds"
 		}
-		f.Detail += "; " + holders + " its lock and none runs from the cache, so with --force under a lock of capacity's own"
+		if around == nil {
+			f.Detail += "; " + holders + " its lock and none runs from the cache, so with --force under a lock of capacity's own"
+		} else {
+			f.Detail += "; " + holders + " its lock, so under a lock of capacity's own"
+		}
 	}
 	if why, err := r.uvContainers(ctx, c); err != nil || why != "" {
 		if err != nil {
@@ -244,12 +267,16 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 		}
 		return report(why)
 	}
+	if around != nil {
+		f.Detail += "; " + around.says(found)
+	}
 	f.Action = ActDelete
 	if !live {
 		return []Finding{f}, notes, nil
 	}
 	start := time.Now()
-	if !forced {
+	var removal uvRemoval
+	if !forced && around == nil {
 		// uv's own lock decides: a process that started since the look keeps the cache, and the prune waits
 		err = r.uvPrune(ctx, nil)
 		if err != nil && uvInUse(err) {
@@ -261,7 +288,7 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 			cmds[pid], _ = uvStarted(now, r.opt.ProcRoot, pid)
 		}
 		// a look at the processes: each holder that still runs runs the command the first look saw, and none uses the
-		// cache
+		// cache, or, around running environments, none uses what the first look did not keep
 		type verdict struct {
 			pid              int
 			keep, why, users string
@@ -271,7 +298,11 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 			if pid, why := uvSameCommands(now, again, r.opt.ProcRoot, cmds); why != "" {
 				return verdict{pid: pid, keep: why}
 			}
-			return verdict{users: uvUsers(again, r.opt.ProcRoot, c, lk.locks.holders, envs)}
+			found := uvUsers(again, r.opt.ProcRoot, c, lk.locks.holders, envs)
+			if around == nil {
+				return verdict{users: found.names}
+			}
+			return verdict{users: around.outside(found, envs)}
 		}
 		answer := func(v verdict) ([]Finding, []string, error) {
 			switch {
@@ -282,19 +313,34 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 			}
 			return report(using(v.users))
 		}
-		// it looks before the rename, so what it finds keeps the lock file in place, every holder on it
-		var before verdict
-		swap := uvSwap{lk: lk, look: now, procRoot: r.opt.ProcRoot, c: c, hidden: envs.hidden, after: r.opt.afterUVLock}
-		held, why := swap.lockInPlace(func() bool {
-			before = lookAgain()
-			return before.keep == "" && before.users == ""
-		})
-		if before.keep != "" || before.users != "" {
-			return answer(before)
+		var held *os.File
+		var swap uvSwap
+		if forced {
+			// it looks before the rename, so what it finds keeps the lock file in place, every holder on it
+			var before verdict
+			swap = uvSwap{lk: lk, look: now, procRoot: r.opt.ProcRoot, c: c, hidden: envs.hidden, after: r.opt.afterUVLock}
+			var why string
+			held, why = swap.lockInPlace(func() bool {
+				before = lookAgain()
+				return before.keep == "" && before.users == ""
+			})
+			if before.keep != "" || before.users != "" {
+				return answer(before)
+			}
+			if held == nil {
+				return report(why)
+			}
+		} else {
+			// nobody holds uv's lock: capacity takes it, as uv's own prune does, and a uv process that starts waits
+			var why string
+			if held, why = uvTakeLock(lk.file, lk.id); held == nil {
+				return report(why)
+			}
+			if r.opt.afterUVLock != nil {
+				r.opt.afterUVLock()
+			}
 		}
-		if held == nil {
-			return report(why)
-		}
+		lockedAt := time.Now()
 		// and after it, under capacity's lock, for what came in the moments between: that look reads /proc, and of
 		// other filesystems only the lock files /proc names; a place or a namespace no look read counts as in use. A
 		// process stuck on a filesystem that does not answer can still hold up a read of its /proc files, so the look
@@ -302,9 +348,11 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 		envs.resolve = false
 		done := make(chan verdict, 1)
 		go func() {
-			if why := swap.afterRename(); why != "" {
-				done <- verdict{why: why}
-				return
+			if forced {
+				if why := swap.afterRename(); why != "" {
+					done <- verdict{why: why}
+					return
+				}
 			}
 			done <- lookAgain()
 		}()
@@ -318,7 +366,14 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 			held.Close()
 			return answer(v)
 		}
-		err = r.uvPrune(ctx, held, "--force")
+		if around == nil {
+			err = r.uvPrune(ctx, held, "--force")
+		} else {
+			removal = uvRemove(c, around, lockedAt.Add(uvAroundFor))
+			if removal.removed == 0 && removal.failed > 0 {
+				err = errors.New(removal.err)
+			}
+		}
 		held.Close() // a uv process that waited for it goes on
 	}
 	took := time.Since(start).Round(time.Second)
@@ -335,6 +390,9 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 		return []Finding{f}, notes, nil
 	}
 	f.Done = true
+	if around != nil {
+		f.Detail += "; " + removal.says()
+	}
 	f.Detail += fmt.Sprintf("; %s to %s in %s", gib(size), gib(after), took)
 	return []Finding{f}, notes, r.st.SetMark(ctx, "prune:uv", r.now)
 }
@@ -367,10 +425,10 @@ func (r *runner) uvPrune(ctx context.Context, held *os.File, args ...string) err
 
 // uvCache is the cache's place as uv names it and with its links resolved (real), both canonical, its lock file in
 // both spellings and as uv names it, and how a path is given its canonical name (a bind mount's path is its
-// filesystem's).
+// filesystem's). dir is where the run reads and deletes in it: the place as uv names it, its links resolved.
 type uvCache struct {
-	canon, real, lock, lockReal, named string
-	name                               func(string) string
+	canon, real, lock, lockReal, named, dir string
+	name                                    func(string) string
 }
 
 // in reports whether a path, as a process, its environment or /proc gives it, is in the cache, other than its lock
@@ -712,32 +770,41 @@ var (
 	statView     = os.Stat
 )
 
-// uvUsers names, at most three, the processes a prune would break, each by the uv process it runs under, and the
-// holders of the lock the look cannot read. A process uses the cache by a path in it other than its lock file (a
-// program, a mapped or open file, a working directory, an argument), by the program it was started as (a cached
-// environment's bin/python is a link to an interpreter outside the cache), or by its environment: uv starts a
-// command with the environment's bin first on PATH, and a script's with VIRTUAL_ENV, and the command's children
-// inherit them. An environment counts as in the cache when it, with its links resolved, is there, or when its
-// packages are links into it (uv's symlink link mode). A holder, or a process under one, whose open files or
+// uvFound is what a look found of the processes that use the cache. names names them as a note does: at most three,
+// each by the uv process it runs under, then how many more. places are what they use of it, each with the name of its
+// process. blind names those the look cannot tell what they use of it by: a holder of the lock it cannot read, a
+// process under one it may not read or that /proc hides, one in another mount namespace with another view of the
+// cache, and one with UV_LINK_MODE=symlink (its packages may be links into the cache wherever its environment is).
+// users is how many processes it names.
+type uvFound struct {
+	names, blind string
+	users        int
+	places       []uvPlace
+}
+
+// uvPlace is a place in the cache a process uses, as it gives it (a path /proc shows, the root of its environment),
+// and the process, named as a note names it; a place the walk found has no process.
+type uvPlace struct{ path, who string }
+
+// uvUsers finds the processes a prune would break, each named by the uv process it runs under, and the holders of the
+// lock the look cannot read. A process uses the cache by a path in it other than its lock file (a program, a mapped or
+// open file, a working directory, an argument), by the program it was started as (a cached environment's bin/python
+// is a link to an interpreter outside the cache), or by its environment: uv starts a command with the environment's
+// bin first on PATH, and a script's with VIRTUAL_ENV, and the command's children inherit them; PYTHONPATH may name a
+// place in the cache too. An environment counts as in the cache when it, with its links resolved, is there, or when
+// its packages are links into it (uv's symlink link mode). A holder, or a process under one, whose open files or
 // environment the run may not read is one the look cannot read; a holder that ended since the locks were read is
-// none. A container's mount of the cache, or of what holds it, is a use. "" is none.
-func uvUsers(s *Sample, procRoot string, c uvCache, holders map[int]bool, envs *uvEnvs) string {
+// none.
+func uvUsers(s *Sample, procRoot string, c uvCache, holders map[int]bool, envs *uvEnvs) uvFound {
+	var out uvFound
 	if s == nil {
-		return ""
+		return out
 	}
-	seen := map[int]bool{}
-	var names []string
-	add := func(pid int, what string) {
-		if !seen[pid] && len(names) < 3 {
-			names = append(names, fmt.Sprintf("%s (pid %d)", what, pid))
-		}
-		seen[pid] = true
-	}
-	byUV := func(pid int, what string) { // the uv process it runs under names it best
+	all, blind := &pidNames{}, &pidNames{}
+	byUV := func(pid int, what string) (int, string) { // the uv process it runs under names it best
 		for p, hops := s.Table[pid], 0; hops < 8; hops++ {
 			if len(uvCommand(p.Argv)) > 0 {
-				pid, what = p.PID, argvHead(p.Argv)
-				break
+				return p.PID, argvHead(p.Argv)
 			}
 			q, ok := s.Table[p.PPID]
 			if !ok {
@@ -745,36 +812,51 @@ func uvUsers(s *Sample, procRoot string, c uvCache, holders map[int]bool, envs *
 			}
 			p = q
 		}
-		add(pid, what)
+		return pid, what
+	}
+	use := func(pid int, what, place string) {
+		pid, what = byUV(pid, what)
+		all.add(pid, what)
+		out.places = append(out.places, uvPlace{place, fmt.Sprintf("%s (pid %d)", what, pid)})
+	}
+	cannot := func(pid int, what string) {
+		all.add(pid, what)
+		blind.add(pid, what)
 	}
 	uses := append([]Use(nil), s.Uses...)
 	sort.Slice(uses, func(i, j int) bool { return uses[i].PID < uses[j].PID })
 	for _, u := range uses {
 		if c.in(u.Path) {
-			byUV(u.PID, u.Comm)
+			use(u.PID, u.Comm, u.Path)
 		}
 	}
 	for _, pid := range sortedPIDs(s.Table) {
 		p := s.Table[pid]
-		if seen[pid] {
-			continue
-		}
 		if len(p.Argv) > 0 && filepath.IsAbs(p.Argv[0]) && c.in(p.Argv[0]) {
-			byUV(pid, p.Comm)
-			continue
+			use(pid, p.Comm, p.Argv[0])
 		}
 		for _, kv := range environ(procRoot, pid) {
 			k, v, _ := strings.Cut(kv, "=")
-			switch {
-			case k == "VIRTUAL_ENV" && envs.has(v, c),
-				k == "PATH" && slices.ContainsFunc(strings.Split(v, ":"), func(b string) bool {
-					return c.in(b) || filepath.Base(b) == "bin" && envs.has(filepath.Dir(b), c)
-				}),
-				k == "UV_LINK_MODE" && v == "symlink":
-				byUV(pid, p.Comm)
-			}
-			if seen[pid] {
-				break
+			switch k {
+			case "VIRTUAL_ENV":
+				if envs.has(v, c) {
+					use(pid, p.Comm, v)
+				}
+			case "PATH", "PYTHONPATH":
+				for _, b := range strings.Split(v, ":") {
+					switch {
+					case c.in(b):
+						use(pid, p.Comm, b)
+					case k == "PATH" && filepath.Base(b) == "bin" && envs.has(filepath.Dir(b), c):
+						use(pid, p.Comm, filepath.Dir(b))
+					case k == "PYTHONPATH" && filepath.IsAbs(b) && envs.has(b, c):
+						use(pid, p.Comm, b)
+					}
+				}
+			case "UV_LINK_MODE":
+				if v == "symlink" {
+					cannot(byUV(pid, p.Comm))
+				}
 			}
 		}
 	}
@@ -783,7 +865,7 @@ func uvUsers(s *Sample, procRoot string, c uvCache, holders map[int]bool, envs *
 		h, ok := s.Table[pid]
 		if !ok {
 			if _, err := os.Stat(filepath.Join(procRoot, strconv.Itoa(pid))); envs.hidden || !errors.Is(err, fs.ErrNotExist) {
-				add(pid, "a process the look cannot read holds the lock")
+				cannot(pid, "a process the look cannot read holds the lock")
 			}
 			continue
 		}
@@ -791,24 +873,23 @@ func uvUsers(s *Sample, procRoot string, c uvCache, holders map[int]bool, envs *
 		for _, q := range append([]int{pid}, descendants(s, pid)...) {
 			switch {
 			case unreadable(procRoot, q):
-				add(q, "a process the look cannot read runs under a holder of the lock")
+				cannot(q, "a process the look cannot read runs under a holder of the lock")
 			case envs.hides && hiddenChild(s, procRoot, q):
-				add(q, "a process /proc hides runs under this one, under a holder of the lock")
+				cannot(q, "a process /proc hides runs under this one, under a holder of the lock")
 			case q != pid && layers && noPath(procRoot, q):
 				// its imports come from the cache's layer with no file of it open or mapped, and its environment, which
-				// would name the layer, is gone (setproctitle wrote over it)
-				add(q, "a command whose environment holds no PATH runs under a uv run that layers one of the cache's environments")
+				// would name the layer, is gone (setproctitle wrote over it). The overlay it runs in names the layer,
+				// so a prune around it keeps every overlay and what each names.
+				all.add(q, "a command whose environment holds no PATH runs under a uv run that layers one of the cache's environments")
 			default:
 				if ns := mountNS(procRoot, q); own != "" && ns != "" && ns != own && !envs.sameView(procRoot, q, ns, c) {
-					add(q, "a process that sees the cache by other paths (another mount namespace) runs under a holder of the lock")
+					cannot(q, "a process that sees the cache by other paths (another mount namespace) runs under a holder of the lock")
 				}
 			}
 		}
 	}
-	if len(seen) > len(names) {
-		names = append(names, fmt.Sprintf("%d more", len(seen)-len(names)))
-	}
-	return strings.Join(names, ", ")
+	out.names, out.blind, out.users = all.String(), blind.String(), len(all.seen)
+	return out
 }
 
 // uvLayers reports whether a uv process is a run that layers an environment of the cache over its command's (--with,
@@ -1131,11 +1212,19 @@ func fileID(p string) (lockID, error) {
 	if err != nil {
 		return lockID{}, err
 	}
-	s, ok := st.Sys().(*syscall.Stat_t)
-	if !ok {
+	if _, ok := st.Sys().(*syscall.Stat_t); !ok {
 		return lockID{}, fmt.Errorf("%s: no inode", p)
 	}
-	return lockID{unix.Major(uint64(s.Dev)), unix.Minor(uint64(s.Dev)), s.Ino}, nil
+	return idOf(st), nil
+}
+
+// idOf is a file's identity as /proc/locks names it, from its stat; none when it has no inode.
+func idOf(st os.FileInfo) lockID {
+	s, ok := st.Sys().(*syscall.Stat_t)
+	if !ok {
+		return lockID{}
+	}
+	return lockID{unix.Major(uint64(s.Dev)), unix.Minor(uint64(s.Dev)), s.Ino}
 }
 
 // lockHolders are the locks on a file, by /proc/locks ("1: FLOCK ADVISORY READ 4242 fc:00:1234 0 EOF"; a waiter's

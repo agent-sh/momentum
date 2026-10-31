@@ -39,11 +39,11 @@ func TestTheUVCacheIsPrunedOverItsSizeButNeverDuringAnInstall(t *testing.T) {
 		{"a uv run past its sync, outside the cache", []fakeProc{{pid: 4, ppid: 1, argv: []string{"uv", "run", "server"}, env: uvEnv},
 			{pid: 5, ppid: 4, argv: []string{"python", "server.py"}, exe: "/proj/.venv/bin/python", env: ran("/proj/.venv/bin")}},
 			true, ActDelete},
-		{"a uvx tool server runs from the cache", []fakeProc{{pid: 4, ppid: 1, argv: []string{"uvx", "mcp-x"}, env: uvEnv},
+		// a process that runs from the cache gets a prune around it (uvaround_test.go), under the cache's lock: this
+		// cache has no lock file to take
+		{"a uvx tool server runs from a cache with no lock file", []fakeProc{{pid: 4, ppid: 1, argv: []string{"uvx", "mcp-x"}, env: uvEnv},
 			{pid: 5, ppid: 4, argv: []string{"/home/u/.cache/uv/archive-v0/x/bin/python", "mcp-x"},
 				exe: "/home/u/.cache/uv/archive-v0/x/bin/python", env: started("/home/u/.cache/uv/archive-v0/x/bin")}}, false, ActReport},
-		{"a process maps a file from the cache", []fakeProc{{pid: 6, ppid: 1, argv: []string{"python3"},
-			maps: []string{"/home/u/.cache/uv/archive-v0/abc/lib.so"}}}, false, ActReport},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			var ran []string
@@ -549,6 +549,8 @@ func TestAUVPruneTakesTheLockWhenItsHoldersAllRunOutsideTheCache(t *testing.T) {
 }
 
 func TestAUVPruneWaitsForWhatItWouldBreak(t *testing.T) {
+	// what runs from the cache at the look gets a prune around it (uvaround_test.go); what comes after the look keeps
+	// the prune
 	for _, c := range []struct {
 		name    string
 		procs   func(cache, lock string) []fakeProc
@@ -556,30 +558,6 @@ func TestAUVPruneWaitsForWhatItWouldBreak(t *testing.T) {
 		after   func(*testing.T, *uvLockFixture)
 		why     string
 	}{
-		{"a tool run from the cache, by its program", fromCache(func(cache string) fakeProc {
-			py := filepath.Join(cache, "archive-v0", "x", "lib", "python3")
-			return fakeProc{argv: []string{"python", "srv"}, exe: py}
-		}), []int{4, 6, 8}, nil, "uv tool uvx srv (pid 8)"},
-		{"a tool run from the cache, by the program it was started as", fromCache(func(cache string) fakeProc {
-			return fakeProc{argv: []string{filepath.Join(cache, "archive-v0", "x", "bin", "python"), "srv"}}
-		}), []int{4, 6, 8}, nil, "uv tool uvx srv (pid 8)"},
-		{"a tool's command, by its PATH", fromCache(func(cache string) fakeProc {
-			return fakeProc{argv: []string{"srv"}, env: started(filepath.Join(cache, "archive-v0", "y", "bin"))}
-		}), []int{4, 6, 8}, nil, "uv tool uvx srv (pid 8)"},
-		{"a PATH that names a directory in the cache", func(cache, lock string) []fakeProc {
-			path := "PATH=/usr/bin:" + filepath.Join(cache, "tools-v0", "x", "libexec") // uv's own PATH, which its command's ends with
-			return append(outside(cache, lock), fakeProc{pid: 8, ppid: 1, argv: []string{"uv", "tool", "uvx", "srv"}, fds: []string{lock},
-				env: []string{path}}, fakeProc{pid: 9, ppid: 8, argv: []string{"srv"}, env: []string{"PATH=/opt/srv/bin:" + path[5:]}})
-		}, []int{4, 6, 8}, nil, "uv tool uvx srv (pid 8)"},
-		{"a script's command, by VIRTUAL_ENV", fromCache(func(cache string) fakeProc {
-			return fakeProc{argv: []string{"python", "s.py"}, env: []string{"VIRTUAL_ENV=" + filepath.Join(cache, "environments-v2", "s-1")}}
-		}), []int{4, 6, 8}, nil, "uv tool uvx srv (pid 8)"},
-		{"a script whose environment is in the cache, by a mapped file", func(cache, lock string) []fakeProc {
-			return append(outside(cache, lock), fakeProc{pid: 8, ppid: 1, argv: []string{"uv", "run", "--script", "s.py"},
-				fds: []string{lock}, env: uvEnv}, fakeProc{pid: 9, ppid: 8, argv: []string{"python", "s.py"},
-				maps: []string{filepath.Join(cache, "environments-v2", "s-1", "lib", "x.so")},
-				env:  ran("/opt/s/bin")})
-		}, []int{4, 6, 8}, nil, "uv run --script s.py (pid 8)"},
 		{"a uv process that took the old lock file as the new one went in", outside, []int{4, 6}, func(t *testing.T, f *uvLockFixture) {
 			f.addProc(t, 77, 1, "uv\x00run\x00x\x00", "")
 			f.holds(t, 77)
@@ -905,16 +883,20 @@ func TestNoSwapUnderUVsOwnClean(t *testing.T) {
 }
 
 func TestAnEnvironmentLinkedIntoTheCacheIsUsed(t *testing.T) {
-	for name, env := range map[string]func(t *testing.T, base, cache string) []string{
-		"packages linked into the cache": func(t *testing.T, base, cache string) []string {
+	for _, c := range []struct {
+		name string
+		env  func(t *testing.T, base, cache string) []string
+		kept string // the entry it links to, which the prune around it keeps; "" waits
+	}{
+		{"packages linked into the cache", func(t *testing.T, base, cache string) []string {
 			site := filepath.Join(base, "proj", ".venv", "lib", "python3.12", "site-packages")
 			target := filepath.Join(cache, "archive-v0", "w", "pkg")
 			must(t, os.MkdirAll(target, 0o755))
 			must(t, os.MkdirAll(site, 0o755))
 			must(t, os.Symlink(target, filepath.Join(site, "pkg")))
 			return ran(filepath.Join(base, "proj", ".venv", "bin"), "VIRTUAL_ENV="+filepath.Join(base, "proj", ".venv"))
-		},
-		"packages as uv's symlink link mode lays them out": func(t *testing.T, base, cache string) []string {
+		}, "archive-v0/w"},
+		{"packages as uv's symlink link mode lays them out", func(t *testing.T, base, cache string) []string {
 			// uv makes a package's directories and links its files
 			site := filepath.Join(base, "proj", ".venv", "lib", "python3.12", "site-packages")
 			arch := filepath.Join(cache, "archive-v0", "w")
@@ -922,29 +904,41 @@ func TestAnEnvironmentLinkedIntoTheCacheIsUsed(t *testing.T) {
 			must(t, os.MkdirAll(filepath.Join(site, "pkg"), 0o755))
 			must(t, os.Symlink(filepath.Join(arch, "pkg", "__init__.py"), filepath.Join(site, "pkg", "__init__.py")))
 			return ran(filepath.Join(base, "proj", ".venv", "bin"), "VIRTUAL_ENV="+filepath.Join(base, "proj", ".venv"))
-		},
-		"an environment that is a link into the cache": func(t *testing.T, base, cache string) []string {
+		}, "archive-v0/w"},
+		{"an environment that is a link into the cache", func(t *testing.T, base, cache string) []string {
 			target := filepath.Join(cache, "environments-v2", "proj-1")
 			must(t, os.MkdirAll(filepath.Join(target, "bin"), 0o755))
+			write(t, filepath.Join(target, "pyvenv.cfg"), "home = /opt/python/bin\n")
 			must(t, os.MkdirAll(filepath.Join(base, "proj2"), 0o755))
 			must(t, os.Symlink(target, filepath.Join(base, "proj2", ".venv")))
 			return ran(filepath.Join(base, "proj2", ".venv", "bin"))
-		},
-		"uv's symlink link mode": func(t *testing.T, base, cache string) []string {
+		}, "environments-v2/proj-1"},
+		{"uv's symlink link mode", func(t *testing.T, base, cache string) []string {
 			return ran("/proj/.venv/bin", "UV_LINK_MODE=symlink")
-		},
+		}, ""},
 	} {
-		t.Run(name, func(t *testing.T) {
+		t.Run(c.name, func(t *testing.T) {
 			base := t.TempDir()
 			procs := func(cache, lock string) []fakeProc {
 				return append(outside(cache, lock), fakeProc{pid: 8, ppid: 1, argv: []string{"uv", "run", "srv"}, fds: []string{lock}, env: uvEnv},
-					fakeProc{pid: 9, ppid: 8, argv: []string{"python", "srv"}, env: env(t, base, cache)})
+					fakeProc{pid: 9, ppid: 8, argv: []string{"python", "srv"}, env: c.env(t, base, cache)})
 			}
 			f := newUVLock(t, procs, 4, 6, 8)
+			uvEntries(t, f.cache, "archive-v0/stale")
 			g := f.run(t, options(t, f.proc, time.Now(), nil))
-			if f.pruned(true) || g.Done || g.Action != ActReport || !strings.Contains(g.Why, "uv run srv (pid 8)") {
-				t.Fatalf("a process whose files are links into the cache uses it: %s %q %v", g.Action, g.Why, f.ran)
+			if c.kept == "" {
+				if f.pruned(true) || g.Done || g.Action != ActReport || !strings.Contains(g.Why, "cannot tell what these use") ||
+					!strings.Contains(g.Why, "uv run srv (pid 8)") {
+					t.Fatalf("a process whose packages may be links into the cache wherever they are is one the look cannot tell: %s %q %v",
+						g.Action, g.Why, f.ran)
+				}
+				left(t, f.cache, []string{"archive-v0/stale"}, nil)
+				return
 			}
+			if !f.around(g) {
+				t.Fatalf("a process whose files are links into the cache uses what they link to: %s %q %v", g.Action, g.Why, f.ran)
+			}
+			left(t, f.cache, []string{c.kept}, []string{"archive-v0/stale"})
 		})
 	}
 }
@@ -958,14 +952,16 @@ func TestACacheBehindALinkIsSeenWhereTheKernelShowsIt(t *testing.T) {
 				env: started("/opt/srv/bin")})
 	}
 	f := newUVLock(t, procs, 4, 6, 8)
+	uvEntries(t, f.cache, "archive-v0/x", "archive-v0/stale")
 	link := filepath.Join(t.TempDir(), "uv-link") // uv names the cache through a link; /proc shows where it is
 	must(t, os.Symlink(real, link))
 	o := options(t, f.proc, time.Now(), nil)
 	o.Tools = f.tools(map[string]string{"uv cache dir": link + "\n"})
 	g := f.runWith(t, o, link)
-	if f.pruned(true) || g.Done || g.Action != ActReport || !strings.Contains(g.Why, "uv tool uvx srv (pid 8)") {
+	if !f.around(g) {
 		t.Fatalf("a mapped file of the cache, seen by its real path, is a use: %s %q %v", g.Action, g.Why, f.ran)
 	}
+	left(t, f.cache, []string{"archive-v0/x"}, []string{"archive-v0/stale"})
 }
 
 func TestACacheReachedThroughALinkPrunesPastHoldersOutsideIt(t *testing.T) {
@@ -1298,12 +1294,14 @@ func TestACacheBehindABindMountIsSeenInAProcesssEnvironment(t *testing.T) {
 			fakeProc{pid: 9, ppid: 8, argv: []string{"python", "srv"}, env: started(filepath.Join(cache, "archive-v0", "x", "bin"))})
 	}
 	f := newUVLockIn(t, shown, procs, 4, 6, 8)
+	uvEntries(t, f.cache, "archive-v0/x", "archive-v0/stale")
 	o := options(t, f.proc, time.Now(), nil)
 	write(t, o.MountInfo, "29 1 259:3 / / rw - ext4 /dev/sda2 rw\n40 29 252:0 / "+filepath.Join(base, "data")+
 		" rw - ext4 /dev/mapper/data rw\n41 29 252:0 /cache "+filepath.Join(base, "home", ".cache")+" rw - ext4 /dev/mapper/data rw\n")
-	if g := f.run(t, o); f.pruned(true) || g.Done || g.Action != ActReport || !strings.Contains(g.Why, "uv tool run srv (pid 8)") {
+	if g := f.run(t, o); !f.around(g) {
 		t.Fatalf("a PATH that names the cache through its bind mount runs from it: %s %q %v", g.Action, g.Why, f.ran)
 	}
+	left(t, f.cache, []string{"archive-v0/x"}, []string{"archive-v0/stale"})
 }
 
 func TestACommandThatSetItsTitleHasStarted(t *testing.T) {
@@ -1322,12 +1320,15 @@ func TestACommandThatSetItsTitleHasStarted(t *testing.T) {
 					fakeProc{pid: 9, ppid: 8, argv: []string{"srv: master"}, exe: "/opt/python/bin/python3", maps: maps, env: zeroed})
 			}
 			f := newUVLock(t, procs, 4, 6, 8)
+			uvEntries(t, f.cache, "archive-v0/x", "archive-v0/stale")
 			g := f.run(t, options(t, f.proc, time.Now(), nil))
 			switch {
 			case !fromCache && (!g.Done || !f.pruned(true)):
 				t.Fatalf("a run whose command set its title has started it, here outside the cache: %s %q %v", g.Action, g.Why, f.ran)
-			case fromCache && (f.pruned(true) || g.Action != ActReport || !strings.Contains(g.Why, "uv run srv (pid 8)")):
-				t.Fatalf("one that runs from the cache is named in a problem note: %s %q %v", g.Action, g.Why, f.ran)
+			case fromCache && !f.around(g):
+				t.Fatalf("one that runs from the cache gets a prune around what it maps: %s %q %v", g.Action, g.Why, f.ran)
+			case fromCache:
+				left(t, f.cache, []string{"archive-v0/x"}, []string{"archive-v0/stale"})
 			}
 		})
 	}
@@ -1562,9 +1563,10 @@ func TestAPrunesNotesKeepWhyItMayNotPrune(t *testing.T) {
 	}
 }
 
-func TestATitledCommandOfARunThatLayersIsOneTheLookCannotRead(t *testing.T) {
+func TestATitledCommandOfARunThatLayersKeepsEveryOverlay(t *testing.T) {
 	// uv run --with runs its command from a layer in the cache over the project's .venv: setproctitle maps from the
-	// .venv, the layer's pure-Python modules were read and closed, and the environment that named the layer is gone
+	// .venv, the layer's pure-Python modules were read and closed, and the environment that named the layer is gone.
+	// The overlay in builds-v0 the command runs in names its layer, and the prune around it keeps both.
 	zeroed := []string{strings.Repeat("\x00", 512)}
 	for _, c := range []struct {
 		name string
@@ -1585,9 +1587,20 @@ func TestATitledCommandOfARunThatLayersIsOneTheLookCannotRead(t *testing.T) {
 						maps: []string{"/proj/.venv/lib/python3.12/site-packages/setproctitle/_setproctitle.so"}, env: zeroed})
 			}
 			f := newUVLock(t, procs, 4, 6, 8)
+			uvEntries(t, f.cache, "archive-v0/envlayer", "archive-v0/stale")
+			if !c.done { // the overlay the layered run's command runs in
+				uvEntries(t, f.cache, "builds-v0/.tmpOv1")
+				write(t, filepath.Join(f.cache, "builds-v0", ".tmpOv1", "lib", "python3.12", "site-packages", "_uv_ephemeral_overlay.pth"),
+					`import site; site.addsitedir(__import__("os").fsdecode(b"`+filepath.Join(f.cache, "archive-v0", "envlayer", "lib")+`"))`+"\n")
+			}
 			g := f.run(t, options(t, f.proc, time.Now(), nil))
-			if g.Done != c.done || g.Done != f.pruned(true) || !c.done && !strings.Contains(g.Why, "a command whose environment holds no PATH runs under a uv run that layers") {
-				t.Fatalf("a layered run's command whose environment is gone may import from the cache: %s %q %v", g.Action, g.Why, f.ran)
+			switch {
+			case c.done && (!g.Done || !f.pruned(true)):
+				t.Fatalf("a run that layers nothing is judged by its command's files: %s %q %v", g.Action, g.Why, f.ran)
+			case !c.done && !f.around(g):
+				t.Fatalf("a layered run's command whose environment is gone gets a prune around every overlay: %s %q %v", g.Action, g.Why, f.ran)
+			case !c.done:
+				left(t, f.cache, []string{"builds-v0/.tmpOv1", "archive-v0/envlayer"}, []string{"archive-v0/stale"})
 			}
 		})
 	}
@@ -1755,9 +1768,11 @@ func TestATitleThatSpillsIntoTheEnvironmentOfALayeredRunHoldsNoPATH(t *testing.T
 				maps: []string{"/proj/.venv/lib/python3.12/site-packages/setproctitle/_setproctitle.so"}, env: spilled})
 	}
 	f := newUVLock(t, procs, 4, 6, 8)
-	if g := f.run(t, options(t, f.proc, time.Now(), nil)); g.Done || f.pruned(true) || !strings.Contains(g.Why, "holds no PATH") {
+	uvEntries(t, f.cache, "builds-v0/.tmpOv1", "archive-v0/stale")
+	if g := f.run(t, options(t, f.proc, time.Now(), nil)); !f.around(g) {
 		t.Fatalf("a layered run's command whose environment holds no PATH may import from the layer: %s %q %v", g.Action, g.Why, f.ran)
 	}
+	left(t, f.cache, []string{"builds-v0/.tmpOv1"}, []string{"archive-v0/stale"})
 }
 
 func TestAProcessThatCameAfterTheRenameFromALinkedEnvironmentKeepsThePrune(t *testing.T) {
