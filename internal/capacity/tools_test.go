@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"testing"
@@ -344,7 +345,13 @@ type uvLockFixture struct {
 // newUVLock makes the cache, then the processes procs gives for it, of which holders hold its lock.
 func newUVLock(t *testing.T, procs func(cache, lock string) []fakeProc, holders ...int) *uvLockFixture {
 	t.Helper()
-	f := &uvLockFixture{cache: filepath.Join(t.TempDir(), "uv"), lockedAtPrune: new(bool)}
+	return newUVLockIn(t, filepath.Join(t.TempDir(), "uv"), procs, holders...)
+}
+
+// newUVLockIn is newUVLock with the cache at a path of the test's choosing.
+func newUVLockIn(t *testing.T, cache string, procs func(cache, lock string) []fakeProc, holders ...int) *uvLockFixture {
+	t.Helper()
+	f := &uvLockFixture{cache: cache, lockedAtPrune: new(bool)}
 	f.lock = filepath.Join(f.cache, ".lock")
 	write(t, f.lock, "")
 	must(t, os.Chmod(f.lock, 0o666))
@@ -356,9 +363,9 @@ func newUVLock(t *testing.T, procs func(cache, lock string) []fakeProc, holders 
 	for i, pid := range holders {
 		fmt.Fprintf(&locks, "%d: FLOCK  ADVISORY  READ %d %02x:%02x:%d 0 EOF\n", i+1, pid, f.id.major, f.id.minor, f.id.ino)
 	}
-	// a prune waiting for the lock holds nothing, and a lock on another file is another's
-	fmt.Fprintf(&locks, "%d: -> FLOCK  ADVISORY  WRITE 99 %02x:%02x:%d 0 EOF\n", len(holders), f.id.major, f.id.minor, f.id.ino)
+	// a lock on another file, and a process waiting for it, are another file's
 	fmt.Fprintf(&locks, "%d: FLOCK  ADVISORY  WRITE 555 %02x:%02x:%d 0 EOF\n", len(holders)+1, f.id.major, f.id.minor, f.id.ino+1)
+	fmt.Fprintf(&locks, "%d: -> FLOCK  ADVISORY  WRITE 99 %02x:%02x:%d 0 EOF\n", len(holders)+1, f.id.major, f.id.minor, f.id.ino+1)
 	write(t, filepath.Join(f.proc, "locks"), locks.String())
 	return f
 }
@@ -484,6 +491,12 @@ func TestAUVPruneWaitsForWhatItWouldBreak(t *testing.T) {
 		{"a holder the look cannot read", outside, []int{4, 6, 4242}, nil, "the look cannot read"},
 		{"a uv process that took the old lock file as the new one went in", outside, []int{4, 6},
 			func(t *testing.T, f *uvLockFixture) { f.holds(t, 77) }, "took the cache's lock"},
+		{"a clean that came to wait for the lock as the new one went in", outside, []int{4, 6}, func(t *testing.T, f *uvLockFixture) {
+			b, err := os.ReadFile(filepath.Join(f.proc, "locks"))
+			must(t, err)
+			write(t, filepath.Join(f.proc, "locks"), string(b)+fmt.Sprintf("9: -> FLOCK  ADVISORY  WRITE 98 %02x:%02x:%d 0 EOF\n",
+				f.id.major, f.id.minor, f.id.ino))
+		}, "waits for the cache's lock"},
 		{"a process that came to use the cache meanwhile", outside, []int{4, 6}, func(t *testing.T, f *uvLockFixture) {
 			dir := filepath.Join(f.proc, "12")
 			must(t, os.MkdirAll(filepath.Join(dir, "fd"), 0o755))
@@ -518,5 +531,250 @@ func TestWithoutTheLocksATakenLockIsUVsToDecide(t *testing.T) {
 	g := f.run(t, options(t, f.proc, time.Now(), nil))
 	if !g.Done || !f.pruned(false) || f.pruned(true) {
 		t.Fatalf("without the locks, the prune takes uv's own lock: %+v %v", g, f.ran)
+	}
+}
+
+func TestAUVXThatStillInstallsIsNotPrunedUnder(t *testing.T) {
+	for name, argv := range map[string][]string{
+		"uvx":                              {"/home/u/.local/bin/uv", "tool", "uvx", "--python", "3.12", "srv@latest"},
+		"global option":                    {"uv", "--directory", "/srv/mcp", "run", "server.py"},
+		"versioned":                        {"/opt/uv@0.13.5", "tool", "run", "srv"},
+		"versioned uvx":                    {"/opt/uvx@0.13.5", "srv"},
+		"an install":                       {"uv", "--offline", "tool", "install", "srv"},
+		"uv's own clean":                   {"uv", "cache", "clean"},
+		"a command the rule does not know": {"uv", "tree"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			procs := func(cache, lock string) []fakeProc {
+				return append(outside(cache, lock), fakeProc{pid: 8, ppid: 1, argv: argv, fds: []string{lock}})
+			}
+			f := newUVLock(t, procs, 4, 6, 8)
+			g := f.run(t, options(t, f.proc, time.Now(), nil))
+			if f.pruned(true) || f.pruned(false) || g.Done || g.Action != ActKeep || !strings.Contains(g.Why, "waits for an install") {
+				t.Fatalf("a uv process that may write the cache now is waited for quietly: %s %q %v", g.Action, g.Why, f.ran)
+			}
+		})
+	}
+}
+
+func TestAHolderWhoseFilesCannotBeReadIsWaitedFor(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads every process")
+	}
+	procs := func(cache, lock string) []fakeProc {
+		return append(outside(cache, lock),
+			fakeProc{pid: 8, ppid: 1, argv: []string{"uv", "run", "--with", "x", "srv"}, fds: []string{lock},
+				env: []string{"PATH=/usr/bin"}},
+			fakeProc{pid: 9, ppid: 8, argv: []string{"python", "srv"},
+				maps: []string{filepath.Join(cache, "archive-v0", "x", "lib.so")},
+				env:  []string{"PATH=" + filepath.Join(cache, "builds-v0", ".tmpA", "bin") + ":/usr/bin"}})
+	}
+	f := newUVLock(t, procs, 4, 6, 8)
+	for _, pid := range []string{"8", "9"} {
+		dir := filepath.Join(f.proc, pid)
+		for _, p := range []string{"fd", "maps", "environ"} {
+			must(t, os.Chmod(filepath.Join(dir, p), 0))
+		}
+		t.Cleanup(func() {
+			os.Chmod(filepath.Join(dir, "fd"), 0o755)
+			os.Chmod(filepath.Join(dir, "maps"), 0o644)
+			os.Chmod(filepath.Join(dir, "environ"), 0o644)
+		})
+	}
+	g := f.run(t, options(t, f.proc, time.Now(), nil))
+	if f.pruned(true) || g.Done || !strings.Contains(g.Why, "cannot read") {
+		t.Fatalf("a holder whose files and environment cannot be read is one the look cannot read: %s %q %v", g.Action, g.Why, f.ran)
+	}
+}
+
+func TestACleanWaitingAtTheSwapKeepsTheLockFile(t *testing.T) {
+	f := newUVLock(t, outside, 4, 6)
+	b, err := os.ReadFile(filepath.Join(f.proc, "locks"))
+	must(t, err)
+	write(t, filepath.Join(f.proc, "locks"), string(b)+fmt.Sprintf("1: -> FLOCK  ADVISORY  WRITE 99 %02x:%02x:%d 0 EOF\n",
+		f.id.major, f.id.minor, f.id.ino))
+	holder, err := os.OpenFile(f.lock, os.O_RDWR, 0)
+	must(t, err)
+	defer holder.Close()
+	must(t, syscall.Flock(int(holder.Fd()), syscall.LOCK_SH)) // a project's uv run
+	clean, err := os.OpenFile(f.lock, os.O_RDWR, 0)
+	must(t, err)
+	got := make(chan struct{})
+	go func() { syscall.Flock(int(clean.Fd()), syscall.LOCK_EX); close(got) }()
+	time.Sleep(100 * time.Millisecond) // it waits behind the holder
+	g := f.run(t, options(t, f.proc, time.Now(), nil))
+	if g.Done || f.pruned(true) || !strings.Contains(g.Why, "waits for the cache's lock") {
+		t.Errorf("a waiter on the lock keeps capacity's lock out of its place: %s %q", g.Action, g.Why)
+	}
+	if id, err := fileID(f.lock); err != nil || id != f.id {
+		t.Errorf("the lock file the clean waits on stays the one every uv process opens: %v %v", id, err)
+	}
+	holder.Close() // the project's run ends, and the clean gets the lock everyone shares
+	<-got
+	clean.Close()
+}
+
+func TestNoSwapUnderUVsOwnClean(t *testing.T) {
+	procs := func(cache, lock string) []fakeProc {
+		return []fakeProc{{pid: 8, ppid: 1, argv: []string{"uv", "cache", "clean"}, fds: []string{lock}},
+			{pid: 9, ppid: 8, argv: []string{"helper"}}} // a child, so only the lock's kind tells
+	}
+	f := newUVLock(t, procs)
+	write(t, filepath.Join(f.proc, "locks"), fmt.Sprintf("1: FLOCK  ADVISORY  WRITE 8 %02x:%02x:%d 0 EOF\n",
+		f.id.major, f.id.minor, f.id.ino))
+	g := f.run(t, options(t, f.proc, time.Now(), nil))
+	if f.pruned(true) || g.Done || g.Action != ActKeep || !strings.Contains(g.Why, "uv cache clean") {
+		t.Fatalf("uv's own clean holds the lock exclusively, and is waited for quietly: %s %q %v", g.Action, g.Why, f.ran)
+	}
+	l := lockHolders(f.proc, f.id)
+	if !l.exclusive || !strings.Contains(l.blocks(), "alone") {
+		t.Errorf("a WRITE lock is one held alone: %+v", l)
+	}
+}
+
+func TestAnEnvironmentLinkedIntoTheCacheIsUsed(t *testing.T) {
+	for name, env := range map[string]func(t *testing.T, base, cache string) []string{
+		"packages linked into the cache": func(t *testing.T, base, cache string) []string {
+			site := filepath.Join(base, "proj", ".venv", "lib", "python3.12", "site-packages")
+			target := filepath.Join(cache, "archive-v0", "w", "pkg")
+			must(t, os.MkdirAll(target, 0o755))
+			must(t, os.MkdirAll(site, 0o755))
+			must(t, os.Symlink(target, filepath.Join(site, "pkg")))
+			return []string{"VIRTUAL_ENV=" + filepath.Join(base, "proj", ".venv")}
+		},
+		"an environment that is a link into the cache": func(t *testing.T, base, cache string) []string {
+			target := filepath.Join(cache, "environments-v2", "proj-1")
+			must(t, os.MkdirAll(filepath.Join(target, "bin"), 0o755))
+			must(t, os.MkdirAll(filepath.Join(base, "proj2"), 0o755))
+			must(t, os.Symlink(target, filepath.Join(base, "proj2", ".venv")))
+			return []string{"PATH=" + filepath.Join(base, "proj2", ".venv", "bin") + ":/usr/bin"}
+		},
+		"uv's symlink link mode": func(t *testing.T, base, cache string) []string {
+			return []string{"UV_LINK_MODE=symlink", "PATH=/usr/bin"}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			base := t.TempDir()
+			var f *uvLockFixture
+			procs := func(cache, lock string) []fakeProc {
+				return append(outside(cache, lock), fakeProc{pid: 8, ppid: 1, argv: []string{"uv", "run", "srv"}, fds: []string{lock}},
+					fakeProc{pid: 9, ppid: 8, argv: []string{"python", "srv"}, env: env(t, base, cache)})
+			}
+			f = newUVLock(t, procs, 4, 6, 8)
+			g := f.run(t, options(t, f.proc, time.Now(), nil))
+			if f.pruned(true) || g.Done || !strings.Contains(g.Why, "uv run srv (pid 8)") {
+				t.Fatalf("a process whose files are links into the cache uses it: %s %q %v", g.Action, g.Why, f.ran)
+			}
+		})
+	}
+}
+
+func TestACacheBehindALinkIsSeenWhereTheKernelShowsIt(t *testing.T) {
+	var real string
+	procs := func(cache, lock string) []fakeProc {
+		real = cache
+		return append(outside(cache, lock), fakeProc{pid: 8, ppid: 1, argv: []string{"uv", "tool", "uvx", "srv"}, fds: []string{lock}},
+			fakeProc{pid: 9, ppid: 8, argv: []string{"srv"}, maps: []string{filepath.Join(cache, "archive-v0", "x", "lib.so")}})
+	}
+	f := newUVLock(t, procs, 4, 6, 8)
+	link := filepath.Join(t.TempDir(), "uv-link") // uv names the cache through a link; /proc shows where it is
+	must(t, os.Symlink(real, link))
+	o := options(t, f.proc, time.Now(), nil)
+	o.Tools = nil
+	res, err := Run(context.Background(), Config{Live: []string{RuleUV}}.Normal(), openStore(t), func() Options {
+		o.Tools = lockCheckingUV{fakeTools{ran: &f.ran, answers: map[string]string{"uv cache dir": link + "\n",
+			"uv cache size": "40000000000\n", "docker": "ERR"}}, f}
+		o.Rules = []string{RuleUV}
+		return o
+	}())
+	must(t, err)
+	g := findings(res, RuleUV)[link]
+	if f.pruned(true) || g.Done || !strings.Contains(g.Why, "uv tool uvx srv (pid 8)") {
+		t.Fatalf("a mapped file of the cache, seen by its real path, is a use: %s %q %v", g.Action, g.Why, f.ran)
+	}
+}
+
+func TestAContainerThatMountsWhatHoldsTheCacheIsWaitedFor(t *testing.T) {
+	f := newUVLock(t, outside, 4, 6)
+	o := options(t, f.proc, time.Now(), nil)
+	res, err := Run(context.Background(), Config{Live: []string{RuleUV}}.Normal(), openStore(t), func() Options {
+		o.Tools = lockCheckingUV{fakeTools{ran: &f.ran, answers: map[string]string{"uv cache dir": f.cache + "\n",
+			"uv cache size": "40000000000\n", "docker ps": "c1\n", "docker inspect": "/box\t" + filepath.Dir(f.cache) + "\n",
+			"docker info": "ERR"}}, f}
+		o.Rules = []string{RuleUV}
+		return o
+	}())
+	must(t, err)
+	if g := findings(res, RuleUV)[f.cache]; f.pruned(true) || f.pruned(false) || !strings.Contains(g.Why, "container box mounts") {
+		t.Fatalf("a container that mounts what holds the cache may run from it: %s %q %v", g.Action, g.Why, f.ran)
+	}
+}
+
+func TestAProcessThatOpenedTheOldLockBeforeTheSwapKeepsIt(t *testing.T) {
+	var alias string
+	procs := func(cache, lock string) []fakeProc {
+		alias = filepath.Join(filepath.Dir(cache), "lock-alias") // the old file, as a process that opened it holds it
+		return append(outside(cache, lock), fakeProc{pid: 13, ppid: 1, argv: []string{"uv", "run", "x"}, fds: []string{alias}},
+			fakeProc{pid: 14, ppid: 13, argv: []string{"x"}})
+	}
+	f := newUVLock(t, procs, 4, 6)
+	must(t, os.Link(f.lock, alias))
+	g := f.run(t, options(t, f.proc, time.Now(), nil))
+	if f.pruned(true) || g.Done || !strings.Contains(g.Why, "opened the cache's lock") {
+		t.Fatalf("a uv process that opened the lock file before the swap, and locks it after, keeps it: %s %q %v", g.Action, g.Why, f.ran)
+	}
+}
+
+func TestALockFileThatChangedSinceTheLookIsNotReplaced(t *testing.T) {
+	f := newUVLock(t, outside, 4, 6)
+	held, why := uvLockInPlace(f.lock, lockID{f.id.major, f.id.minor, f.id.ino + 7}, map[int]bool{4: true}, f.proc, nil)
+	if held != nil || !strings.Contains(why, "changed since the look") {
+		t.Errorf("a lock file that is not the one the look saw is left as it is: %v %q", held, why)
+	}
+}
+
+func TestAPrunesTimeIsInItsDetail(t *testing.T) {
+	f := newUVLock(t, outside, 4, 6)
+	if g := f.run(t, options(t, f.proc, time.Now(), nil)); !g.Done || !regexp.MustCompile(` in \d+s$`).MatchString(g.Detail) {
+		t.Errorf("the prune's detail says how long it took, so a long one shows: %q", g.Detail)
+	}
+}
+
+func TestAUVProcessPastItsSyncIsKnownHoweverItIsStarted(t *testing.T) {
+	for name, argv := range map[string][]string{
+		"a versioned uv":    {"/opt/uv@0.13.5", "tool", "run", "srv"},
+		"uvx":               {"/opt/uvx", "srv"},
+		"a versioned uvx":   {"/opt/uvx@0.13.5", "srv"},
+		"uv tool uvx":       {"uv", "tool", "uvx", "srv"},
+		"a global option":   {"uv", "--directory", "/srv/mcp", "run", "server.py"},
+		"global flags only": {"uv", "-q", "--offline", "run", "server.py"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			procs := func(cache, lock string) []fakeProc {
+				return append(outside(cache, lock), fakeProc{pid: 8, ppid: 1, argv: argv, fds: []string{lock}},
+					fakeProc{pid: 9, ppid: 8, argv: []string{"/opt/tools/srv/bin/python", "srv"}, env: []string{"PATH=/opt/tools/srv/bin:/usr/bin"}})
+			}
+			f := newUVLock(t, procs, 4, 6, 8)
+			if g := f.run(t, options(t, f.proc, time.Now(), nil)); !g.Done || !f.pruned(true) {
+				t.Fatalf("a uv process that runs its command outside the cache is one a forced prune leaves alone: %s %q %v", g.Action, g.Why, f.ran)
+			}
+		})
+	}
+}
+
+func TestACacheBehindABindMountIsSeenInAProcesssEnvironment(t *testing.T) {
+	base := t.TempDir()
+	shown := filepath.Join(base, "home", ".cache", "uv") // as uv names it, through the bind mount of the data's /cache
+	procs := func(cache, lock string) []fakeProc {
+		return append(outside(cache, lock), fakeProc{pid: 8, ppid: 1, argv: []string{"uv", "tool", "run", "srv"}, fds: []string{lock}},
+			fakeProc{pid: 9, ppid: 8, argv: []string{"python", "srv"},
+				env: []string{"PATH=" + filepath.Join(cache, "archive-v0", "x", "bin") + ":/usr/bin"}})
+	}
+	f := newUVLockIn(t, shown, procs, 4, 6, 8)
+	o := options(t, f.proc, time.Now(), nil)
+	write(t, o.MountInfo, "29 1 259:3 / / rw - ext4 /dev/sda2 rw\n40 29 252:0 / "+filepath.Join(base, "data")+
+		" rw - ext4 /dev/mapper/data rw\n41 29 252:0 /cache "+filepath.Join(base, "home", ".cache")+" rw - ext4 /dev/mapper/data rw\n")
+	if g := f.run(t, o); f.pruned(true) || g.Done || !strings.Contains(g.Why, "uv tool run srv (pid 8)") {
+		t.Fatalf("a PATH that names the cache through its bind mount runs from it: %s %q %v", g.Action, g.Why, f.ran)
 	}
 }
