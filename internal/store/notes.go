@@ -56,7 +56,7 @@ type Note struct {
 	ID         string
 	Kind       NoteKind
 	Title      string // for needs, the question itself, or what momentum could not do
-	Detail     string // one or two short sentences; for decided, how to override it
+	Detail     string // short sentences, within what the views keep (the phone's, 400 characters); for decided, how to override it
 	Effect     string // for shipped, the measured effect
 	Links      []Link
 	Source     string // who wrote it: momentum, or another tool

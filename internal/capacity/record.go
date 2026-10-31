@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -40,12 +41,17 @@ const (
 )
 
 // keeps say, per rule that deletes or offloads, how to keep an item next time: the run's note joins its rules' in
-// one sentence. The keys are sources.json's.
+// one sentence, and a note short of room names only what to set (keepsBrief). The keys are sources.json's.
 var keeps = map[string]string{
 	RuleModels:    "list model data in capacity.models.keep",
 	RuleTargets:   "list a build output's project in capacity.exclude.paths",
 	RuleWorktrees: "lock a worktree (git worktree lock)",
 	RuleScratch:   "list a task folder in capacity.scratch.keep",
+}
+
+var keepsBrief = map[string]string{
+	RuleModels: "capacity.models.keep", RuleTargets: "capacity.exclude.paths (the project)", RuleWorktrees: "git worktree lock",
+	RuleScratch: "capacity.scratch.keep",
 }
 
 // comesBack says, per rule that prunes, how what it took comes back: there is nothing to keep.
@@ -66,8 +72,13 @@ var ruleText = map[string]string{
 	RuleScratch: "task folder", RuleUV: "uv cache", RuleDocker: "Docker",
 }
 
-// briefText is ruleText shorter, for a run's title that would not fit on a line.
-var briefText = map[string]string{RuleModels: "model data", RuleTargets: "build output", RuleWorktrees: "worktree"}
+// countText names what each rule deleted as a run's title counts it, and briefText shorter, for a title that would
+// not fit on a line.
+var (
+	countText = map[string]string{RuleModels: "idle model item", RuleTargets: "Rust build output", RuleWorktrees: "leftover worktree",
+		RuleScratch: "task folder"}
+	briefText = map[string]string{RuleModels: "model item", RuleTargets: "build output", RuleWorktrees: "worktree", RuleScratch: "folder"}
+)
 
 // recordDone records one deletion, offload or prune at once: its event, and the run's note with it.
 func (r *runner) recordDone(ctx context.Context, f *Finding) error {
@@ -613,7 +624,7 @@ func runNote(start, at time.Time, items []runItem) store.Note {
 // runTitle is a run's effect in one line: what it freed, how many items each rule took, the task folders it offloaded
 // with what went to restic and those whose model data alone went, and what it pruned ("Freed 12.4 GiB: 5 Rust build
 // outputs, 2 leftover worktrees; pruned Docker"). A title too long for a line names the prunes by their tools, then
-// counts them, then names the rules' items shorter; the store clips one that still does not fit.
+// counts them, then names the items shorter, then ends at the last whole clause that fits, with "and more".
 func runTitle(items []runItem) string {
 	var freed, restic int64
 	unsaid, prunes := "", 0
@@ -638,7 +649,7 @@ func runTitle(items []runItem) string {
 	for p := range offloaded { // a folder whose model data went before its offload is one folder, offloaded
 		delete(modelOnly, p)
 	}
-	parts := func(names map[string]string) []string {
+	clauses := func(names map[string]string) []string {
 		var out []string
 		for _, rule := range []string{RuleModels, RuleTargets, RuleWorktrees} {
 			if n := count[rule]; n > 0 {
@@ -646,20 +657,28 @@ func runTitle(items []runItem) string {
 			}
 		}
 		if n := len(offloaded); n > 0 {
-			out = append(out, fmt.Sprintf("%d %s (%s to restic)", n, plural(ruleText[RuleScratch], n), gib(restic)))
+			out = append(out, fmt.Sprintf("%d %s (%s to restic)", n, plural(names[RuleScratch], n), noteSize(restic)))
 		}
 		if n := len(modelOnly); n > 0 {
-			out = append(out, fmt.Sprintf("model data of %d %s", n, plural(ruleText[RuleScratch], n)))
+			out = append(out, fmt.Sprintf("model data of %d %s", n, plural(names[RuleScratch], n)))
 		}
 		return out
 	}
-	head := "Freed " + gib(freed)
+	head := "Freed " + noteSize(freed)
 	switch {
-	case unsaid != "" && freed == 0:
+	case unsaid != "" && freed < 1<<20:
 		head = "Freed an amount " + unsaid + " did not print"
 	case unsaid != "":
 		head = "Freed at least " + gib(freed)
 	}
+	compose := func(cs []string, p string) string {
+		list := strings.Join(cs, ", ")
+		if list != "" && p != "" {
+			list += "; "
+		}
+		return head + ": " + list + p
+	}
+	fits := func(s string) bool { return utf8.RuneCountInString(s) <= store.TitleMax }
 	var long, brief []string
 	if pruned[RuleUV] {
 		long, brief = append(long, "the uv cache"), append(brief, pruneTool[RuleUV])
@@ -671,33 +690,48 @@ func runTitle(items []runItem) string {
 		names  map[string]string
 		prunes string
 	}
-	forms := []form{{ruleText, ""}, {briefText, ""}}
+	forms := []form{{countText, ""}, {briefText, ""}}
 	if prunes > 0 {
 		counted := fmt.Sprintf("%d %s", prunes, plural("prune", prunes))
-		forms = []form{{ruleText, "pruned " + strings.Join(long, " and ")}, {ruleText, "pruned " + strings.Join(brief, " and ")},
-			{ruleText, counted}, {briefText, counted}}
+		forms = []form{{countText, "pruned " + strings.Join(long, " and ")}, {countText, "pruned " + strings.Join(brief, " and ")},
+			{countText, counted}, {briefText, counted}}
 	}
-	var title string
 	for _, f := range forms {
-		list := strings.Join(parts(f.names), ", ")
-		if list != "" && f.prunes != "" {
-			list += "; "
-		}
-		if title = head + ": " + list + f.prunes; utf8.RuneCountInString(title) <= store.TitleMax {
-			break
+		if t := compose(clauses(f.names), f.prunes); fits(t) {
+			return t
 		}
 	}
-	return title
+	last := forms[len(forms)-1]
+	cs, p := clauses(last.names), last.prunes
+	for p != "" || len(cs) > 1 { // whole clauses from the end, the prunes first
+		if p != "" {
+			p = ""
+		} else {
+			cs = cs[:len(cs)-1]
+		}
+		if t := compose(cs, p) + " and more"; fits(t) {
+			return t
+		}
+	}
+	return compose(cs, p) + " and more" // the store clips it
 }
 
-// detailMax is the longest detail a run's note has when it can: the most the phone's view keeps of a detail.
+// noteSize is a size in the run's note: as gib says it, but "under 1 MiB" for one above zero that it would say as 0.
+func noteSize(n int64) string {
+	if n > 0 && n < 1<<20 {
+		return "under 1 MiB"
+	}
+	return gib(n)
+}
+
+// detailMax is the longest detail a run's note has: the most the phone's view keeps of a detail.
 const detailMax = 400
 
-// runDetail is what a run took in plain sentences: its largest items with their sizes; where each offloaded folder's
-// pointer is, and that model data is not offloaded; how to keep an item next time, in one sentence; and last, what is
-// not known of a prune and how what the prunes took comes back. It has three items, or two; when two do not fit in
-// detailMax it leaves out the prunes' sentences, then names one item, and then the sentences from its end that still do
-// not fit.
+// runDetail is what a run took in plain sentences: its largest three items with their sizes; where each offloaded
+// folder's pointer is, and that model data is not offloaded; how to keep an item next time, in one sentence; and last,
+// what is not known of a prune and how what the prunes took comes back. A detail longer than detailMax leaves out the
+// prunes' sentences, then names two items, then says how to keep one in fewer words, then leaves out the model data's
+// sentence, then names one item, then leaves out the pointer's, and last clips its item: how to keep one stays.
 func runDetail(items []runItem) string {
 	var sized, offloads []runItem
 	took, model, unsaid := map[string]bool{}, false, ""
@@ -713,82 +747,109 @@ func runDetail(items []runItem) string {
 		sized = append(sized, it)
 	}
 	sort.SliceStable(sized, func(i, j int) bool { return sized[i].size > sized[j].size })
-	var fixed, prunes []string
+	var pointer string
 	switch {
 	case len(offloads) == 1:
-		fixed = append(fixed, short(offloads[0].path)+pointerSuffix+" says how to restore it.")
+		pointer = short(offloads[0].path) + pointerSuffix + " says how to restore it."
 	case len(offloads) > 1:
-		fixed = append(fixed, "Each offloaded folder's NAME"+pointerSuffix+" beside it says how to restore it.")
+		pointer = "Each offloaded folder's NAME" + pointerSuffix + " beside it says how to restore it."
 	}
-	if model {
-		fixed = append(fixed, modelDataGone)
-	}
-	var clauses []string
+	var long, brief []string
 	for _, rule := range Rules {
-		if k := keeps[rule]; took[rule] && k != "" {
-			clauses = append(clauses, k)
+		if took[rule] && keeps[rule] != "" {
+			long, brief = append(long, keeps[rule]), append(brief, keepsBrief[rule])
 		}
 	}
-	switch n := len(clauses); {
+	keep := ""
+	switch n := len(long); {
 	case n == 1:
-		fixed = append(fixed, "To keep one next time, "+clauses[0]+".")
+		keep = "To keep one next time, " + long[0] + "."
 	case n > 1:
-		fixed = append(fixed, "To keep one next time, "+strings.Join(clauses[:n-1], ", ")+" or "+clauses[n-1]+".")
+		keep = "To keep one next time, " + strings.Join(long[:n-1], ", ") + " or " + long[n-1] + "."
 	}
+	keepBrief := ""
+	if len(brief) > 0 {
+		keepBrief = "To keep one next time: " + strings.Join(brief, ", ") + "."
+	}
+	var prunes []string
 	if unsaid != "" {
 		prunes = append(prunes, unsaid+" did not print what its prune freed.")
 	}
 	for _, rule := range Rules {
-		if c := comesBack[rule]; took[rule] && c != "" {
-			prunes = append(prunes, c)
+		if took[rule] && comesBack[rule] != "" {
+			prunes = append(prunes, comesBack[rule])
 		}
 	}
-	sentences := func(n int, withPrunes bool) []string {
+	f := struct {
+		n                             int
+		prunes, brief, model, pointer bool
+	}{n: 3, prunes: true, model: model, pointer: pointer != ""}
+	parts := func() (string, []string) {
 		var named []string
-		for _, it := range sized[:min(n, len(sized))] {
+		for _, it := range sized[:min(f.n, len(sized))] {
 			named = append(named, itemText(it))
 		}
-		var out []string
+		lead := ""
 		switch {
 		case len(named) == 0:
 		case len(named) < len(sized):
-			out = append(out, "Largest: "+strings.Join(named, ", ")+".")
+			lead = "Largest: " + strings.Join(named, ", ") + "."
 		default:
-			out = append(out, upper(strings.Join(named, ", "))+".")
+			lead = upper(strings.Join(named, ", ")) + "."
 		}
-		out = append(out, fixed...)
-		if withPrunes {
-			out = append(out, prunes...)
+		var rest []string
+		if f.pointer {
+			rest = append(rest, pointer)
 		}
-		return out
-	}
-	fits := func(ss []string) bool { return utf8.RuneCountInString(strings.Join(ss, " ")) <= detailMax }
-	for _, f := range []struct {
-		n          int
-		withPrunes bool
-	}{{3, true}, {2, true}, {2, false}, {1, false}} {
-		if ss := sentences(f.n, f.withPrunes); fits(ss) {
-			return strings.Join(ss, " ")
+		if f.model {
+			rest = append(rest, modelDataGone)
 		}
+		k := keep
+		if f.brief {
+			k = keepBrief
+		}
+		if k != "" {
+			rest = append(rest, k)
+		}
+		if f.prunes {
+			rest = append(rest, prunes...)
+		}
+		return lead, rest
 	}
-	ss := sentences(1, false)
-	for len(ss) > 1 && !fits(ss) {
-		ss = ss[:len(ss)-1]
+	join := func(lead string, rest []string) string {
+		if lead == "" {
+			return strings.Join(rest, " ")
+		}
+		return strings.Join(append([]string{lead}, rest...), " ")
 	}
-	return strings.Join(ss, " ")
+	steps := []func(){
+		func() { f.prunes = false }, func() { f.n = 2 }, func() { f.brief = true }, func() { f.model = false },
+		func() { f.n = 1 }, func() { f.pointer = false },
+	}
+	for _, step := range append(steps, nil) {
+		lead, rest := parts()
+		if d := join(lead, rest); utf8.RuneCountInString(d) <= detailMax || step == nil {
+			if room := detailMax - utf8.RuneCountInString(join("", rest)) - 1; utf8.RuneCountInString(d) > detailMax && room > 1 {
+				d = join(plain.Clip(lead, room), rest) // an item whose name alone is too long
+			}
+			return d
+		}
+		step()
+	}
+	return ""
 }
 
 // itemText names what an item took, with its size.
 func itemText(it runItem) string {
 	switch {
 	case it.rule == RuleUV || it.rule == RuleDocker:
-		return "pruned " + short(it.path) + " " + gib(it.size)
+		return "pruned " + short(it.path) + " " + noteSize(it.size)
 	case it.offload:
-		return short(it.path) + " " + gib(it.size) + " to restic"
+		return short(it.path) + " " + noteSize(it.size) + " to restic"
 	case it.model:
-		return "model data in " + short(it.path) + " " + gib(it.size)
+		return "model data in " + short(it.path) + " " + noteSize(it.size)
 	}
-	return short(it.path) + " " + gib(it.size)
+	return short(it.path) + " " + noteSize(it.size)
 }
 
 // groupTitles say what a rule's report-only items of one reason are.

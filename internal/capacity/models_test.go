@@ -157,7 +157,7 @@ func TestALiveModelsRunDeletesAnItemWithTheBlobsOnlyItLinked(t *testing.T) {
 			deleted++
 		}
 	}
-	if ns := decidedNotes(t, st); deleted != 7 || len(ns) != 1 || !strings.HasSuffix(ns[0].Title, ": 7 idle model data") {
+	if ns := decidedNotes(t, st); deleted != 7 || len(ns) != 1 || !strings.HasSuffix(ns[0].Title, ": 7 idle model items") {
 		t.Errorf("seven items go (nothing uses or names them in this run), in the run's one decided note: %d deleted, %+v", deleted, ns)
 	}
 	evs, err := st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindDelete}})
