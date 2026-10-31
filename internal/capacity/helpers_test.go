@@ -22,6 +22,7 @@ type fakeProc struct {
 	fds       []string
 	maps      []string
 	written   int64
+	start     int // its start, in ticks after boot (100 a second); 0 is a second after boot
 }
 
 // procRoot builds a synthetic /proc with these processes, and the test's own (a look without it is blind).
@@ -34,7 +35,12 @@ func procRoot(t *testing.T, ps ...fakeProc) string {
 		must(t, os.MkdirAll(filepath.Join(dir, "fd"), 0o755))
 		write(t, filepath.Join(dir, "cmdline"), strings.Join(p.argv, "\x00")+"\x00")
 		write(t, filepath.Join(dir, "comm"), filepath.Base(p.argv[0])+"\n")
-		write(t, filepath.Join(dir, "stat"), strconv.Itoa(p.pid)+" (x) S "+strconv.Itoa(p.ppid)+" 0 0 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n")
+		start := 100
+		if p.start > 0 {
+			start = p.start
+		}
+		write(t, filepath.Join(dir, "stat"), strconv.Itoa(p.pid)+" (x) S "+strconv.Itoa(p.ppid)+" 0 0 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 "+
+			strconv.Itoa(start)+" 0 0\n")
 		write(t, filepath.Join(dir, "io"), "rchar: 0\nwrite_bytes: "+strconv.FormatInt(p.written, 10)+"\n")
 		if p.cwd != "" {
 			must(t, os.Symlink(p.cwd, filepath.Join(dir, "cwd")))

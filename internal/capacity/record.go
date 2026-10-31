@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -304,7 +305,14 @@ func (r *runner) recordFill(ctx context.Context, d DiskState) error {
 	if !open.IsZero() && had && !old.Done.IsZero() {
 		return nil // resolved during this fill: it stays resolved
 	}
-	n := store.Note{ID: id, Kind: store.NoteProblem, Title: fillTitle(d), Detail: fillDetail(d), Source: store.Capacity,
+	all := d
+	if !open.IsZero() { // the note names every writer the fill's runs saw: one may have finished since
+		all.Writers, err = r.fillWriters(ctx, d, open)
+		if err != nil {
+			return err
+		}
+	}
+	n := store.Note{ID: id, Kind: store.NoteProblem, Title: fillTitle(d), Detail: fillDetail(all), Source: store.Capacity,
 		Importance: store.ImportanceHigh, At: r.now}
 	if !open.IsZero() && had {
 		n.At = old.At // the same fill: it keeps its start
@@ -345,6 +353,38 @@ func (r *runner) recordFull(ctx context.Context, d DiskState) error {
 	return nil
 }
 
+// fillWriters are the writers of the fill's runs, this one's among them (from their events), each process once,
+// with what it wrote over the runs it was a writer in, and its fastest look.
+func (r *runner) fillWriters(ctx context.Context, d DiskState, since time.Time) ([]Writer, error) {
+	evs, err := r.st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindFill}, Since: since, Limit: math.MaxInt32})
+	if err != nil {
+		return nil, err
+	}
+	by := map[int]Writer{}
+	add := func(w Writer) { // each run's writes are its own stretch: they add up
+		o, ok := by[w.PID]
+		if ok {
+			w.Written, w.Over, w.Rate = w.Written+o.Written, w.Over+o.Over, max(w.Rate, o.Rate)
+			w.Session = firstNonEmpty(w.Session, o.Session)
+		}
+		by[w.PID] = w
+	}
+	for _, e := range evs { // this run's among them: its event is recorded first
+		var past DiskState
+		if json.Unmarshal([]byte(e.Meta), &past) == nil && past.Disk == d.Disk {
+			for _, w := range past.Writers {
+				add(w)
+			}
+		}
+	}
+	out := make([]Writer, 0, len(by))
+	for _, w := range by {
+		out = append(out, w)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].pace() > out[j].pace() })
+	return out, nil
+}
+
 func fillTitle(d DiskState) string {
 	t := fmt.Sprintf("%s is filling at %.0f GiB/h (%.0f%% used)", d.Disk, d.Rate, d.pctFull)
 	if d.FullIn > 0 {
@@ -355,17 +395,24 @@ func fillTitle(d DiskState) string {
 
 func fillDetail(d DiskState) string {
 	if len(d.Writers) == 0 {
-		return "No process of this user wrote fast in the seconds measured; a root writer (Docker, a system service) cannot be seen."
+		return "No process of this user wrote fast, at the looks or between the runs; a root writer (Docker, a system service) cannot be seen."
 	}
 	var parts []string
 	for _, w := range d.Writers[:min(len(d.Writers), 4)] {
-		s := fmt.Sprintf("%s (pid %d) %.0f MiB/s in %s", w.Comm, w.PID, w.Rate, short(w.Cwd))
+		s := fmt.Sprintf("%s (pid %d)", w.Comm, w.PID)
+		if w.Over > 0 {
+			s += fmt.Sprintf(" wrote %s in %s", gib(w.Written), (time.Duration(w.Over) * time.Second).Round(time.Minute))
+		}
+		if w.Rate >= 1 {
+			s += fmt.Sprintf(", %.0f MiB/s at a look", w.Rate)
+		}
+		s += " in " + short(w.Cwd)
 		if w.Session != "" {
 			s += ", session " + w.Session
 		}
 		parts = append(parts, s)
 	}
-	return "Writing: " + strings.Join(parts, "; ") + "."
+	return "Writers: " + strings.Join(parts, "; ") + "."
 }
 
 // group is one rule's report-only items for one reason, and their events.

@@ -158,3 +158,103 @@ func TestJobsNameWhatTheyRun(t *testing.T) {
 		t.Error("a repository id in a job's script is named")
 	}
 }
+
+// fillRun is a run that sees dir fill at 45 GiB an hour, with the processes and the written bytes given.
+func fillRun(t *testing.T, st *store.Store, dir string, now time.Time, proc string, writes map[int]int64) *Result {
+	t.Helper()
+	cfg := Config{Disks: []string{dir}}.Normal()
+	o := options(t, proc, now, nil)
+	o.Rules = []string{RuleUV}
+	o.Writes = func() map[int]int64 { return writes }
+	res, err := Run(context.Background(), cfg, st, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res
+}
+
+func TestAFillNamesWhoWroteBetweenTheRunsAndEveryWriterItSaw(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	var fs syscall.Statfs_t
+	must(t, syscall.Statfs(dir, &fs))
+	used := int64(fs.Blocks-fs.Bfree) * int64(fs.Bsize)
+	st := openStore(t)
+	now := time.Now()
+	must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: now.Add(-25 * time.Minute)},
+		[]store.DiskSample{{Disk: dir, At: now.Add(-25 * time.Minute), Size: 1 << 40, Used: used - 15<<30, Avail: 1 << 39}}, nil))
+	// a training run (pid 31, under a shell) saves checkpoints between the looks: nothing in the seconds measured
+	quiet := map[int]int64{}
+	run := func(at time.Time, ps ...fakeProc) DiskState {
+		proc := procRoot(t, ps...)
+		write(t, filepath.Join(proc, "uptime"), "1201.00 1000.00\n")
+		return fillRun(t, st, dir, at, proc, quiet).Disks[0]
+	}
+	shell := fakeProc{pid: 30, ppid: 1, argv: []string{"bash"}, cwd: dir, written: 1 << 30}
+	editor := fakeProc{pid: 32, ppid: 1, argv: []string{"editor"}, cwd: dir, written: 1 << 29}
+	train := fakeProc{pid: 31, ppid: 30, argv: []string{"torchrun"}, cwd: dir, written: 10 << 30}
+	gone := fakeProc{pid: 33, ppid: 1, argv: []string{"old"}, cwd: dir, written: 9 << 30} // its pid is used again later
+	if d := run(now.Add(-5*time.Minute), shell, editor, train, gone); !d.Fast || len(d.Writers) != 0 {
+		t.Fatalf("the first run has no run before to compare with: %+v", d)
+	}
+	train.written = 50 << 30
+	// a process two minutes old (started 1081 s after boot, 1201 s ago) that wrote 8 GiB
+	late := fakeProc{pid: 33, ppid: 1, argv: []string{"python"}, cwd: dir, written: 8 << 30, start: 108100}
+	d := run(now, shell, editor, train, late)
+	got := map[int]Writer{}
+	for _, w := range d.Writers {
+		got[w.PID] = w
+	}
+	if w := got[31]; w.Written != 40<<30 || w.Over < 299.9 || w.Over > 300.1 {
+		t.Errorf("the training run wrote 40 GiB in the 5 minutes since the run before: %+v", got)
+	}
+	if w := got[33]; w.Written != 8<<30 || w.Over < 119 || w.Over > 121 {
+		t.Errorf("a process that started since wrote all it wrote since it started: %+v", got)
+	}
+	if _, ok := got[32]; ok {
+		t.Errorf("a process that wrote nothing since is no writer: %+v", got)
+	}
+	id := "capacity:fill:" + dir
+	if n, _, _ := st.Note(ctx, id); !strings.Contains(n.Detail, "torchrun (pid 31) wrote 40.0 GiB in 5m0s") ||
+		!strings.Contains(n.Detail, "python (pid 33) wrote 8.0 GiB in 2m0s") {
+		t.Fatalf("the note says who wrote what, and in how long: %s", n.Detail)
+	}
+	// five minutes on the training run has ended: its shell took in what it wrote last; python wrote 8 GiB more
+	shell.written, late.written = 31<<30, 16<<30
+	run(now.Add(5*time.Minute), shell, editor, late)
+	n, _, _ := st.Note(ctx, id)
+	for _, want := range []string{"bash (pid 30) wrote 30.0 GiB in 5m0s", "torchrun (pid 31) wrote 40.0 GiB in 5m0s",
+		"python (pid 33) wrote 16.0 GiB in 7m0s"} {
+		if !strings.Contains(n.Detail, want) {
+			t.Errorf("the note names every writer the fill's runs saw, with all it wrote in them (%s): %s", want, n.Detail)
+		}
+	}
+}
+
+func TestOnlyARunThatTrustsItsLookRecordsTheWrites(t *testing.T) {
+	ctx := context.Background()
+	st := openStore(t)
+	cfg := Config{Disks: []string{t.TempDir()}}.Normal()
+	o := options(t, procRoot(t, fakeProc{pid: 40, ppid: 1, argv: []string{"x"}, written: 1 << 30}), time.Now(), nil)
+	o.Rules, o.DryRun = []string{RuleUV}, true
+	if _, err := Run(ctx, cfg, st, o); err != nil {
+		t.Fatal(err)
+	}
+	if at, _, _ := st.Writes(ctx); !at.IsZero() {
+		t.Error("a dry run records nothing")
+	}
+	o.DryRun, o.ProcRoot = false, t.TempDir() // an empty /proc: a look the run cannot trust
+	if _, err := Run(ctx, cfg, st, o); err != nil {
+		t.Fatal(err)
+	}
+	if at, _, _ := st.Writes(ctx); !at.IsZero() {
+		t.Error("a blind run records no writes: the next run would take every process for new")
+	}
+	o.ProcRoot = procRoot(t, fakeProc{pid: 40, ppid: 1, argv: []string{"x"}, written: 1 << 30})
+	if _, err := Run(ctx, cfg, st, o); err != nil {
+		t.Fatal(err)
+	}
+	if at, ws, _ := st.Writes(ctx); at.IsZero() || len(ws) < 2 {
+		t.Errorf("a run records each process's written bytes: %v %v", at, ws)
+	}
+}

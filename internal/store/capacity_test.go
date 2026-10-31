@@ -200,3 +200,22 @@ func TestARunsTableFromBeforeTheBlindColumnGainsIt(t *testing.T) {
 		t.Fatalf("the old run stays, the blind one is no watched time: %v %v", ts, err)
 	}
 }
+
+func TestWritesAreReplacedByEachRecord(t *testing.T) {
+	ctx := context.Background()
+	st, _ := open(t)
+	if at, ws, err := st.Writes(ctx); err != nil || !at.IsZero() || ws != nil {
+		t.Fatalf("none on record: %v %v %v", at, ws, err)
+	}
+	t1 := time.UnixMilli(1_800_000_000_000)
+	if err := st.PutWrites(ctx, t1, []ProcWrite{{PID: 1, Start: 100, Written: 5}, {PID: 2, Start: 200, Written: 7}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutWrites(ctx, t1.Add(time.Minute), []ProcWrite{{PID: 2, Start: 200, Written: 9}}); err != nil {
+		t.Fatal(err)
+	}
+	at, ws, err := st.Writes(ctx)
+	if err != nil || !at.Equal(t1.Add(time.Minute)) || len(ws) != 1 || ws[0] != (ProcWrite{PID: 2, Start: 200, Written: 9}) {
+		t.Errorf("the last record only: %v %v %v", at, ws, err)
+	}
+}

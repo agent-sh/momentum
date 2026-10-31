@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/agent-sh/momentum/internal/store"
 )
 
 // The disk rule. Every run records each disk's use. When a disk fills faster than the threshold over the window, or
@@ -73,13 +75,35 @@ func (r *runner) writers(ctx context.Context, mountPath string) []Writer {
 		diskDev = uint64(st.Sys().(*syscall.Stat_t).Dev)
 	}
 	sessions := r.liveSessions(ctx)
+	boot := time.Time{}
+	if up := uptimeOf(r.opt.ProcRoot); up > 0 {
+		boot = r.now.Add(-time.Duration(up * float64(time.Second)))
+	}
+	pids := map[int]bool{}
+	for pid := range b {
+		pids[pid] = true
+	}
+	for pid := range r.snap {
+		pids[pid] = true
+	}
 	var out []Writer
-	for pid, n := range b {
-		rate := float64(n-a[pid]) / (1 << 20) / secs
-		if _, had := a[pid]; !had || rate < 1 {
+	for pid := range pids {
+		w := Writer{PID: pid}
+		if before, had := a[pid]; had {
+			if n, ok := b[pid]; ok {
+				w.Rate = float64(n-before) / (1 << 20) / secs
+			}
+		}
+		if cur, ok := r.snap[pid]; ok && !r.prevAt.IsZero() {
+			if p, ok := r.prev[pid]; ok && p.Start == cur.Start {
+				w.Written, w.Over = cur.Written-p.Written, r.now.Sub(r.prevAt).Seconds()
+			} else if started := boot.Add(time.Duration(cur.Start) * 10 * time.Millisecond); !boot.IsZero() && started.After(r.prevAt) {
+				w.Written, w.Over = cur.Written, r.now.Sub(started).Seconds() // it started since: all it wrote
+			}
+		}
+		if w.Rate < 1 && w.since() < 1 {
 			continue
 		}
-		w := Writer{PID: pid, Rate: rate}
 		dir := filepath.Join(r.opt.ProcRoot, strconv.Itoa(pid))
 		if c, err := os.ReadFile(filepath.Join(dir, "comm")); err == nil {
 			w.Comm = strings.TrimSpace(string(c))
@@ -103,11 +127,76 @@ func (r *runner) writers(ctx context.Context, mountPath string) []Writer {
 		}
 		out = append(out, w)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Rate > out[j].Rate })
+	sort.Slice(out, func(i, j int) bool { return out[i].pace() > out[j].pace() })
 	if len(out) > 8 {
 		out = out[:8]
 	}
 	return out
+}
+
+// pace is the faster of a writer's rate at the look and its rate since the run before.
+func (w Writer) pace() float64 { return max(w.Rate, w.since()) }
+
+// uptimeOf is the seconds since boot, from a /proc's uptime, or 0.
+func uptimeOf(procRoot string) float64 {
+	b, err := os.ReadFile(filepath.Join(procRoot, "uptime"))
+	if err != nil {
+		return 0
+	}
+	f := strings.Fields(string(b))
+	if len(f) == 0 {
+		return 0
+	}
+	v, _ := strconv.ParseFloat(f[0], 64)
+	return v
+}
+
+// procWrites is each readable process's written bytes and its start (the 22nd field of its stat, in clock ticks
+// after boot), from a /proc.
+func procWrites(procRoot string) map[int]store.ProcWrite {
+	out := map[int]store.ProcWrite{}
+	ents, err := os.ReadDir(procRoot)
+	if err != nil {
+		return out
+	}
+	for _, e := range ents {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		io, err := os.ReadFile(filepath.Join(procRoot, e.Name(), "io"))
+		if err != nil {
+			continue
+		}
+		st, err := os.ReadFile(filepath.Join(procRoot, e.Name(), "stat"))
+		if err != nil {
+			continue
+		}
+		w := store.ProcWrite{PID: pid, Start: startOf(string(st)), Written: -1}
+		for _, l := range strings.Split(string(io), "\n") {
+			if v, ok := strings.CutPrefix(l, "write_bytes:"); ok {
+				w.Written, _ = strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			}
+		}
+		if w.Written >= 0 && w.Start > 0 {
+			out[pid] = w
+		}
+	}
+	return out
+}
+
+// startOf is a process's start from its stat, in clock ticks after boot, or 0.
+func startOf(stat string) int64 {
+	i := strings.LastIndexByte(stat, ')')
+	if i < 0 {
+		return 0
+	}
+	f := strings.Fields(stat[i+1:])
+	if len(f) < 20 {
+		return 0
+	}
+	n, _ := strconv.ParseInt(f[19], 10, 64)
+	return n
 }
 
 func firstNonEmpty(ss ...string) string {
