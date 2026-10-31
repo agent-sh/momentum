@@ -212,7 +212,7 @@ func TestDiscoveryPicksTheMainThreadAndItsRunningSubagents(t *testing.T) {
 		t.Fatalf("sessions %+v", ss)
 	}
 	s := ss[0]
-	if s.Key != mainID || s.Where != "dev:2.0" || s.Pane != "%7" || s.Name != "refactor the store" || s.Model != "gpt-test" || s.Phase != sessions.Working {
+	if s.Key != mainID || s.SessionID != mainID || s.Where != "dev:2.0" || s.Pane != "%7" || s.Name != "refactor the store" || s.Model != "gpt-test" || s.Phase != sessions.Working {
 		t.Fatalf("main thread: %+v", s)
 	}
 	if len(s.Tasks) != 1 || s.Tasks[0].ID != childID || s.Tasks[0].Label != "Kant" || s.Tasks[0].Now != "exec_command: rg TODO" {

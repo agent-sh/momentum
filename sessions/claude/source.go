@@ -113,7 +113,7 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 		}
 		keys[key] = true
 		s := &sessions.Session{Key: key, Tool: src.Tool(), Name: f.Name, Named: f.Named && !reAutoName.MatchString(f.Name),
-			Cwd: f.Cwd, Project: src.Env.Project(f.Cwd), Where: f.Where, Pane: f.Pane, Job: f.Job, PID: f.PID, Model: f.Model,
+			Cwd: f.Cwd, Project: src.Env.Project(f.Cwd), Where: f.Where, Pane: f.Pane, Job: f.Job, SessionID: f.Session, PID: f.PID, Model: f.Model,
 			PRs: f.PRs, Started: f.Started, LastActive: f.LastActive, JobState: f.JobState, Tasks: []sessions.Task{}}
 		if f.JobState == "failed" {
 			s.Failed = text.FirstNonEmpty(text.OneLine(f.Detail, 200), "the job failed")

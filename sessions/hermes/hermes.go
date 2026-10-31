@@ -147,7 +147,7 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 		if !Human[h.source] && !l.live {
 			continue
 		}
-		s := &sessions.Session{Key: "hermes:" + h.id, Tool: src.Tool(), Auto: !Human[h.source],
+		s := &sessions.Session{Key: "hermes:" + h.id, SessionID: h.id, Tool: src.Tool(), Auto: !Human[h.source],
 			Name: text.FirstNonEmpty(text.OneLine(h.title, 60), text.OneLine(h.display, 60), "hermes "+h.source), Cwd: h.cwd,
 			Project: text.FirstNonEmpty(src.Env.Project(h.cwd), h.source), Where: h.source, Model: h.model, Started: epoch(h.started),
 			LastActive: epoch(h.last), Tasks: []sessions.Task{}}

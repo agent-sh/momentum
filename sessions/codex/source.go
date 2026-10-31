@@ -95,7 +95,7 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 			continue
 		}
 		keys[key] = true
-		s := &sessions.Session{Key: key, Tool: src.Tool(), Name: f.Name, Named: f.Named, Cwd: f.Cwd, Project: src.Env.Project(f.Cwd),
+		s := &sessions.Session{Key: key, SessionID: f.Thread, Tool: src.Tool(), Name: f.Name, Named: f.Named, Cwd: f.Cwd, Project: src.Env.Project(f.Cwd),
 			Where: f.Where, Pane: f.Pane, PID: f.PID, Model: f.Model, Started: f.Started, LastActive: f.LastActive,
 			Transcript: f.Transcript, Tasks: []sessions.Task{}, Partial: f.Partial}
 		if f.Transcript == "" {

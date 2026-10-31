@@ -431,12 +431,18 @@ func (r *runner) addOwn(d ownDir, at time.Time) {
 	}
 }
 
-// ownBefore are the directories a deletion of p will change (p, and the directory it is in), each with its last
-// change that was not capacity's: its time now, or, when that is capacity's own deletion, what that one recorded.
-func (r *runner) ownBefore(ctx context.Context, p string) []ownDir {
+// ownBefore are the directories a deletion of p will change (p, the directory it is in, and more that a deletion in it
+// changes), each with its last change that was not capacity's: its time now, or, when that is capacity's own
+// deletion, what that one recorded.
+func (r *runner) ownBefore(ctx context.Context, p string, more ...string) []ownDir {
 	own := r.ownDeletions(ctx)
 	var out []ownDir
-	for _, d := range []string{p, filepath.Dir(p)} {
+	seen := map[string]bool{}
+	for _, d := range append([]string{p, filepath.Dir(p)}, more...) {
+		if seen[d] {
+			continue
+		}
+		seen[d] = true
 		st, err := os.Lstat(d)
 		if err != nil {
 			continue

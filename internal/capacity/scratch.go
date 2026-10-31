@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,52 +18,29 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
-
-	"github.com/agent-sh/momentum/internal/store"
 )
 
 // The scratch rule. Agents keep a task's scratch in a folder at the top of the cache directory, and the task that
 // made it is to remove it when it closes; many do not. The folders there are tools' caches and tasks' folders. A
-// folder is a task's when an agent made it: the store's transcripts hold an agent's tool call, or its output, that
-// names the folder from a minute before its birth to ten minutes after. These are never a task's: a folder tagged
-// as a cache (CACHEDIR.TAG at its top), one named like an installed command, one that came back after an offload
-// (its pointer beside it), a root of a rule or one that holds one, a Cargo target directory and a linked worktree
-// (other rules' items). An idle task folder (no write and no use for the idle time, in the sampler's watched time)
-// is offloaded with evidence-offload, which backs it up to restic and leaves NAME.restic.txt in its place. Its
-// model weights, checkpoints and datasets are not offloaded: they are deleted, after the models rule's idle time,
-// since the owner ruled they are downloaded or made again.
+// folder is a task's when an agent made it (madeBy). These are never a task's: a folder tagged as a cache
+// (CACHEDIR.TAG at its top), one named like an installed command, a root of a rule or one that holds one, a linked
+// worktree (another rule's item), a link and an empty folder. An idle task folder (no write and no use for the idle
+// time, in the sampler's watched time) is offloaded with evidence-offload, which backs it up to restic and leaves
+// NAME.restic.txt in its place. Its model weights, checkpoints and datasets are not offloaded: they are deleted,
+// after the models rule's idle time, since the owner ruled they are downloaded or made again. A folder beside its
+// pointer is only reported: an offload left it, or it was made again, and another offload would overwrite the
+// pointer.
 
 // pointerSuffix ends the name of the file evidence-offload leaves in a folder's place.
 const pointerSuffix = ".restic.txt"
 
-// madeBefore and madeAfter bound when an agent's tool call, or its output, names a folder it made: from a minute
-// before the folder's birth (a call is recorded as it is issued, before its command runs) to ten minutes after (an
-// agent names what a command it ran made, or the path mktemp printed). A tool that makes its cache again after an
-// agent looked at it or deleted it does so outside the window.
-const (
-	madeBefore = time.Minute
-	madeAfter  = 10 * time.Minute
-)
-
 // scratchBudget is how long a run starts offloads for: the timer starts a run every 5 minutes and the next run
-// waits 5 minutes for this one's lock, so a backlog goes over several runs and never stops the sampler.
+// waits 5 minutes for this one's lock, so a backlog goes over several runs.
 var scratchBudget = 4 * time.Minute
 
-// offloadTimeout is the longest one offload may take: restic backs the folder up before anything is removed, so a
-// timeout leaves the folder whole, or backed up with its pointer written.
-const offloadTimeout = 30 * time.Minute
-
-// The kinds of a transcript event that carry an agent's command and its output.
-const (
-	toolCall   = "tool_call"
-	toolResult = "tool_result"
-)
-
-// maker is the agent session a task folder's birth is on record with, and where it worked then.
-type maker struct {
-	session, harness, cwd string
-	at                    time.Time
-}
+// offloadTimeout is the longest one offload may take, and so the longest a run's sampler waits on one: restic backs
+// the folder up before anything is removed, so a timeout leaves the folder whole, or backed up with its pointer.
+var offloadTimeout = 10 * time.Minute
 
 // modelFile is one file of model data in a task folder, by its path in the folder and its inode when judged.
 type modelFile struct {
@@ -96,7 +72,7 @@ func (r *runner) scratch(ctx context.Context, found Found) ([]Finding, []string,
 			return out, nil, err
 		}
 		for _, e := range ents {
-			if !e.IsDir() { // files, links and pointers are not folders
+			if !e.IsDir() { // files, pointers and links: evidence-offload resolves a link and would remove its target
 				continue
 			}
 			name := e.Name()
@@ -104,7 +80,7 @@ func (r *runner) scratch(ctx context.Context, found Found) ([]Finding, []string,
 			if r.otherRules(x, canon, shown) {
 				continue
 			}
-			if why := r.toolCache(x, name, shown); why != "" {
+			if why := r.toolCache(name, shown); why != "" {
 				tools++
 				continue
 			}
@@ -116,19 +92,28 @@ func (r *runner) scratch(ctx context.Context, found Found) ([]Finding, []string,
 				unmade++
 				continue
 			}
-			mk, made, err := r.madeBy(ctx, r.spellings(x, name), canon, born)
+			makers, err := r.madeBy(ctx, r.spellings(x, name), born)
 			if err != nil {
 				return out, nil, err
 			}
-			if !made {
+			if len(makers) == 0 {
 				unmade++
 				continue
 			}
 			tasks++
-			w := walkFolder(shown, minBytes)
+			w := walkFolder(shown, r.m, minBytes)
 			f := Finding{Rule: RuleScratch, Path: shown, canon: canon, root: x.shown, Bytes: w.Bytes, Newest: w.Newest,
-				files: w.models, modelBytes: w.modelBytes, maker: mk}
+				files: w.models, modelBytes: w.modelBytes, makers: makers}
 			f.ino, _ = inodeOf(shown)
+			if pst, err := os.Lstat(filepath.Join(x.shown, name+pointerSuffix)); err == nil {
+				f.Action, f.class = ActReport, "pointer"
+				f.Why = "beside the pointer of its offload: it was made again, and another offload would overwrite the pointer"
+				if born.Before(pst.ModTime()) {
+					f.Why = "beside the pointer of its offload, which left it: what is still in it was not removed"
+				}
+				out = append(out, f)
+				continue
+			}
 			out = append(out, r.decideScratch(ctx, f, x, w, refs))
 		}
 	}
@@ -154,13 +139,18 @@ func (r *runner) decideScratch(ctx context.Context, f Finding, x root, w folderW
 	if r.keptScratch(f.canon) {
 		return keep("in keep")
 	}
+	for _, mf := range f.files {
+		if c := filepath.Join(f.canon, mf.rel); r.kept(c) {
+			return keep("a model file of it is in the models rule's keep: " + short(filepath.Join(f.Path, mf.rel)))
+		}
+	}
 	if u, ok := r.sample.InUse(f.canon); ok {
 		return keep("in use now: " + useText(u))
 	}
 	if j, ok := r.named.Protects(f.canon); ok {
 		return keep("named by " + j)
 	}
-	if why := r.sessionIn(ctx, f.canon, f.maker); why != "" {
+	if why := r.sessionIn(ctx, f.canon, f.makers); why != "" {
 		return keep(why)
 	}
 	if why := referenced(f.canon, w.links, refs); why != "" {
@@ -184,7 +174,7 @@ func (r *runner) decideScratch(ctx context.Context, f Finding, x root, w folderW
 		f.Why = fmt.Sprintf("%d of its directories cannot be read, so its last write is not known", w.Errs)
 		return f
 	}
-	if why, ok := r.excludedScratch(ctx, f.canon, w, f.maker); ok {
+	if why, ok := r.excludedScratch(ctx, f.canon, w, f.makers); ok {
 		if len(f.files) == 0 {
 			f.Action, f.class, f.Why = ActReport, "excluded", "an excluded project's: "+why
 			return f
@@ -204,8 +194,9 @@ func scratchDetail(f Finding) string {
 	if len(f.files) > 0 {
 		d = fmt.Sprintf("delete %d model files (%s), then %s", len(f.files), gib(f.modelBytes), d)
 	}
-	if f.maker.session != "" {
-		d += fmt.Sprintf("; made by %s session %s on %s", f.maker.harness, f.maker.session, f.maker.at.Format("2006-01-02"))
+	if len(f.makers) > 0 {
+		mk := f.makers[0]
+		d += fmt.Sprintf("; made by %s session %s on %s", mk.harness, mk.session, mk.at.Format("2006-01-02"))
 	}
 	return d
 }
@@ -228,15 +219,12 @@ func (r *runner) otherRules(x root, canon, shown string) bool {
 }
 
 // toolCache says why a folder at the top of a scratch root is a tool's cache and not a task's, or "".
-func (r *runner) toolCache(x root, name, shown string) string {
+func (r *runner) toolCache(name, shown string) string {
 	if b := readHead(filepath.Join(shown, "CACHEDIR.TAG"), len(cargoTag)); string(b) == cargoTag {
 		return "it is tagged as a cache (CACHEDIR.TAG)"
 	}
 	if r.command(name) {
 		return "it is named like an installed command"
-	}
-	if exists(filepath.Join(x.shown, name+pointerSuffix)) {
-		return "it came back after an offload: " + name + pointerSuffix + " is beside it"
 	}
 	return ""
 }
@@ -256,7 +244,7 @@ func (r *runner) command(name string) bool {
 func birth(p string) (time.Time, bool) {
 	var st unix.Statx_t
 	if err := unix.Statx(unix.AT_FDCWD, p, unix.AT_SYMLINK_NOFOLLOW, unix.STATX_BTIME, &st); err != nil ||
-		st.Mask&unix.STATX_BTIME == 0 || st.Btime.Sec == 0 {
+		st.Mask&unix.STATX_BTIME == 0 {
 		return time.Time{}, false
 	}
 	return time.Unix(st.Btime.Sec, int64(st.Btime.Nsec)), true
@@ -276,55 +264,6 @@ func (r *runner) spellings(x root, name string) []string {
 	return out
 }
 
-// madeBy is the agent session that made a folder: the earliest of the tool calls, and their outputs, that name it
-// (or work in it) from madeBefore before its birth to madeAfter after. Without a store none is on record.
-func (r *runner) madeBy(ctx context.Context, spellings []string, canon string, born time.Time) (maker, bool, error) {
-	if r.st == nil {
-		return maker{}, false, nil
-	}
-	evs, err := r.st.Events(ctx, store.Query{Source: store.Transcripts, Kinds: []string{toolCall, toolResult},
-		Since: born.Add(-madeBefore), Until: born.Add(madeAfter), Limit: math.MaxInt32})
-	if err != nil {
-		return maker{}, false, err
-	}
-	var mk maker
-	found := false
-	for _, e := range evs {
-		if !namesPath(e.Summary, spellings) && (e.Cwd == "" || !under(r.m.Canon(e.Cwd), canon)) {
-			continue
-		}
-		if !found || e.TS.Before(mk.at) {
-			mk, found = maker{session: e.Session, harness: e.Harness, cwd: e.Cwd, at: e.TS}, true
-		}
-	}
-	return mk, found, nil
-}
-
-// namesPath reports whether a text names a path in one of its spellings: the spelling, then what cannot go on a
-// name (a slash, a space, a quote, the end).
-func namesPath(text string, spellings []string) bool {
-	for _, s := range spellings {
-		for i := 0; i < len(text); {
-			j := strings.Index(text[i:], s)
-			if j < 0 {
-				break
-			}
-			end := i + j + len(s)
-			if end == len(text) || !nameByte(text[end]) {
-				return true
-			}
-			i += j + 1
-		}
-	}
-	return false
-}
-
-// nameByte reports whether a byte may go on a file name as agents write them.
-func nameByte(b byte) bool {
-	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_' || b == '.' || b == '-' ||
-		b == '@' || b == '+'
-}
-
 // keptScratch reports whether a folder is in scratch.keep, holds a path in it, or is inside one.
 func (r *runner) keptScratch(canon string) bool {
 	for k := range r.scratchKeep {
@@ -336,24 +275,27 @@ func (r *runner) keptScratch(canon string) bool {
 }
 
 // sessionIn says which live agent session works in a folder (its working directory is in it), or made it and is
-// still open, or "". The scheduled-AI policy leaves a task's folder to the task while it lasts.
-func (r *runner) sessionIn(ctx context.Context, canon string, mk maker) string {
+// still open, or "". The scheduled-AI policy leaves a task's folder to the task while it lasts. A session is the
+// one that made it when its harness's id for it is the id the making call's transcript carries.
+func (r *runner) sessionIn(ctx context.Context, canon string, makers []maker) string {
 	for _, s := range r.liveSessions(ctx) {
 		name := firstNonEmpty(s.Name, s.Key)
-		switch {
-		case s.Cwd != "" && under(r.m.Canon(s.Cwd), canon):
+		if s.Cwd != "" && under(r.m.Canon(s.Cwd), canon) {
 			return fmt.Sprintf("session %s (%s) works in it", name, s.Tool)
-		case mk.session != "" && s.Key == mk.session:
-			return fmt.Sprintf("the session that made it, %s (%s), is still open", name, s.Tool)
+		}
+		for _, mk := range makers {
+			if mk.session != "" && (s.ID == mk.session || s.Key == mk.session) {
+				return fmt.Sprintf("the session that made it, %s (%s), is still open", name, s.Tool)
+			}
 		}
 	}
 	return ""
 }
 
 // excludedScratch reports whether a task folder is an excluded project's: by its place, by the remote of a
-// repository in it, or by where the session that made it worked then (an excluded project's lane keeps its scratch
-// in the cache too).
-func (r *runner) excludedScratch(ctx context.Context, canon string, w folderWalk, mk maker) (string, bool) {
+// repository in it, or by where a session that made it worked then (an excluded project's lane keeps its scratch
+// in the cache too), by that place or the remote of the checkout there.
+func (r *runner) excludedScratch(ctx context.Context, canon string, w folderWalk, makers []maker) (string, bool) {
 	if why, ok := r.excluded(canon); ok {
 		return why, true
 	}
@@ -362,7 +304,10 @@ func (r *runner) excludedScratch(ctx context.Context, canon string, w folderWalk
 			return "it holds " + why, true
 		}
 	}
-	if mk.cwd != "" && filepath.IsAbs(mk.cwd) {
+	for _, mk := range makers {
+		if mk.cwd == "" || !filepath.IsAbs(mk.cwd) {
+			continue
+		}
 		cwd := r.m.Canon(mk.cwd)
 		why, ok := r.excluded(cwd)
 		if !ok {
@@ -397,13 +342,13 @@ func referenced(canon string, links []string, refs map[string]string) string {
 }
 
 // repoRefs are the paths the repositories the shared walk found name outside themselves (a remote that is a path,
-// their alternates, their worktrees), canonical, each with its repository's place.
+// their alternates, their worktrees), each with its repository's place, both canonical.
 func repoRefs(gitDirs []string, m *Mounts) map[string]string {
 	out := map[string]string{}
 	for _, g := range gitDirs {
-		place := repoPlace(g)
+		place := m.Canon(repoPlace(g))
 		for _, p := range gitRefs(g) {
-			if c := m.Canon(p); !under(c, m.Canon(place)) {
+			if c := m.Canon(p); !under(c, place) {
 				out[c] = place
 			}
 		}
@@ -478,9 +423,10 @@ func worktreeFiles(g string) []string {
 // as Measure counts them; its files of model data of at least minBytes, but in a package tree (an environment's
 // packages, node_modules, git's store, a Cargo target, a tool's tagged cache), which are no model a task kept; and
 // what git records that ties it to a repository outside it (a worktree in it of a repository outside, or a worktree
-// outside of a repository in it).
-func walkFolder(p string, minBytes int64) folderWalk {
+// outside of a repository in it), each path taken by its canonical name: git writes the one it was given.
+func walkFolder(p string, m *Mounts, minBytes int64) folderWalk {
 	var w folderWalk
+	cp := m.Canon(p)
 	st, err := os.Lstat(p)
 	if err != nil {
 		w.Errs++
@@ -525,7 +471,7 @@ func walkFolder(p string, minBytes int64) folderWalk {
 		if isGitDir(d.path, ents) {
 			w.gitDirs = append(w.gitDirs, d.path)
 			for _, wt := range worktreeFiles(d.path) {
-				if !under(wt, p) {
+				if !under(m.Canon(wt), cp) {
 					w.links = append(w.links, "a worktree at "+short(filepath.Dir(wt))+" belongs to the repository at "+short(repoPlace(d.path)))
 				}
 			}
@@ -544,7 +490,7 @@ func walkFolder(p string, minBytes int64) folderWalk {
 				}
 			case e.Name() == ".git" && fi.Mode().IsRegular():
 				// a linked worktree, or a checkout whose git directory is kept apart: the repository names it
-				if g, _ := isLinkedWorktree(d.path); g != "" && !under(g, p) && exists(g) {
+				if g, _ := isLinkedWorktree(d.path); g != "" && !under(m.Canon(g), cp) && exists(g) {
 					w.links = append(w.links, "it holds a checkout of the repository at "+short(repoPlace(gitCommon(g))))
 				}
 			case fi.Mode().IsRegular() && !d.noModel && fi.Size() >= minBytes && modelFormat(ep, e.Name(), fi.Size()):
@@ -589,14 +535,14 @@ func gitCommon(admin string) string {
 }
 
 // packageTree reports whether a directory holds what a tool installed or builds, whose files are no model a task
-// kept: an environment's packages, node_modules, git's store, a Python environment, a Cargo target, or a tool's
-// cache tagged as one.
+// kept: an environment's packages, node_modules, git's store, a Python environment, or a tool's cache tagged as one
+// (a Cargo target is).
 func packageTree(d, name string) bool {
 	switch name {
 	case "site-packages", "dist-packages", "node_modules", ".git":
 		return true
 	}
-	if exists(filepath.Join(d, "pyvenv.cfg")) || isTarget(d) {
+	if exists(filepath.Join(d, "pyvenv.cfg")) {
 		return true
 	}
 	b := readHead(filepath.Join(d, "CACHEDIR.TAG"), len(cargoTag))
@@ -651,10 +597,12 @@ func modelFormat(p, name string, size int64) bool {
 	return false
 }
 
-// removeScratch acts on a task folder: under an exclusive BSD lock on it, it deletes its model data, each file
-// through an os.Root of the folder and only while it is the inode judged, then offloads the rest with
-// evidence-offload, unless only the model data goes.
-func (r *runner) removeScratch(ctx context.Context, f *Finding) error {
+// removeScratch acts on a task folder: under an exclusive BSD lock on it, the directory opened checked to be the one
+// judged, it deletes its model data, each file through an os.Root of the folder and only while it is the inode
+// judged, and has recorded run once they are gone (a deletion is on record before the offload starts). Then it
+// offloads the rest with evidence-offload, unless only the model data goes. An offload that failed but left the
+// pointer and no folder went: restic keeps the folder.
+func (r *runner) removeScratch(ctx context.Context, f *Finding, recorded func() error) error {
 	if !f.modelOnly { // without the offload, nothing of the folder goes: its model data waits for it
 		if err := haveTool(r.cfg.Scratch.Offload, "evidence-offload"); err != nil {
 			return err
@@ -665,6 +613,11 @@ func (r *runner) removeScratch(ctx context.Context, f *Finding) error {
 		return err
 	}
 	defer dir.Close()
+	if st, err := dir.Stat(); err != nil || !st.IsDir() {
+		return errChanged
+	} else if s, ok := st.Sys().(*syscall.Stat_t); !ok || (inode{uint64(s.Dev), s.Ino}) != f.ino {
+		return errChanged // another directory in its place since the judgment
+	}
 	if err := syscall.Flock(int(dir.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return errLocked
 	}
@@ -674,43 +627,66 @@ func (r *runner) removeScratch(ctx context.Context, f *Finding) error {
 		if err != nil {
 			return err
 		}
+		defer rt.Close()
+		if r.opt.beforeModelDelete != nil {
+			r.opt.beforeModelDelete(*f)
+		}
+		// every file of its model data is the one judged, or none goes: one put in a file's place since would go to
+		// restic with the rest
 		for _, mf := range f.files {
 			fi, err := rt.Lstat(mf.rel)
 			if errors.Is(err, fs.ErrNotExist) {
 				continue
 			}
 			if err != nil {
-				rt.Close()
 				return err
 			}
 			if s, ok := fi.Sys().(*syscall.Stat_t); !ok || (inode{uint64(s.Dev), s.Ino}) != mf.ino {
-				continue // another file in its place since the judgment: it is not the one judged
+				return errChanged
 			}
-			if err := rt.Remove(mf.rel); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				rt.Close()
+		}
+		for _, mf := range f.files {
+			switch err := rt.Remove(mf.rel); {
+			case err == nil:
+				f.removed += mf.bytes
+			case !errors.Is(err, fs.ErrNotExist):
 				return err
 			}
-			f.removed += mf.bytes
 		}
-		rt.Close()
 	}
 	if f.modelOnly {
 		return nil
+	}
+	if f.removed > 0 && recorded != nil {
+		if err := recorded(); err != nil {
+			return err
+		}
 	}
 	out, err := runTool(ctx, offloadTimeout, r.cfg.Scratch.Offload, "evidence-offload", "EVIDENCE_TAG="+r.cfg.Scratch.Tag, f.Path)
 	if m := snapshotRe.FindStringSubmatch(out); m != nil {
 		f.snapshot = m[1]
 	}
+	pointer := f.Path + pointerSuffix
+	if !exists(f.Path) && exists(pointer) {
+		if f.snapshot == "" { // read it from the pointer, which evidence-offload writes before it removes the folder
+			if b, rerr := os.ReadFile(pointer); rerr == nil {
+				if m := snapshotRe.FindStringSubmatch(strings.Join(strings.Fields(string(b)), " ")); m != nil {
+					f.snapshot = m[1]
+				}
+			}
+		}
+		f.offloaded = true
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	if exists(f.Path) || !exists(f.Path+pointerSuffix) {
-		return fmt.Errorf("evidence-offload ran but did not leave %s in the folder's place: %s", short(f.Path)+pointerSuffix,
-			strings.TrimSpace(lastLine(out)))
-	}
-	f.offloaded = true
-	return nil
+	return fmt.Errorf("evidence-offload ran but did not leave %s in the folder's place: %s", short(pointer),
+		strings.TrimSpace(lastLine(out)))
 }
+
+// errChanged means the item at a path is not the one judged.
+var errChanged = errors.New("it changed since it was judged")
 
 // snapshotRe reads the snapshot evidence-offload says it made.
 var snapshotRe = regexp.MustCompile(`snapshot ([0-9a-f]{8,64})`)

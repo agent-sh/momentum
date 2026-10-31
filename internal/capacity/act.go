@@ -62,10 +62,18 @@ func (r *runner) act(ctx context.Context) error {
 	}
 	r.sessions = nil // the sessions read again, for the worktrees' and task folders' second look
 	start := time.Now()
-	for _, f := range todo {
+	for i, f := range todo {
 		if f.Rule == RuleScratch && time.Since(start) > scratchBudget {
 			f.Action, f.Why = ActKeep, "waits for the next run: this run's time for offloads is spent"
 			continue
+		}
+		if f.Rule == RuleScratch && i > 0 { // an offload takes minutes: each folder gets a look of its own
+			r.fresh = TakeSample(r.opt.ProcRoot, r.m, r.watched)
+			if err := r.addContainerUses(ctx, r.fresh); err != nil {
+				f.Action, f.Why = ActKeep, "Docker could not be asked which containers run"
+				continue
+			}
+			r.sessions = nil
 		}
 		if why := r.recheck(ctx, f); why != "" {
 			f.Action, f.Why = ActKeep, why
@@ -76,7 +84,11 @@ func (r *runner) act(ctx context.Context) error {
 			continue
 		}
 		before := r.free(f.Path)
-		dirs := r.ownBefore(ctx, f.canon)
+		var inner []string // the directories a task folder's model data is in, which its deletion changes
+		for _, mf := range f.files {
+			inner = append(inner, filepath.Join(f.canon, filepath.Dir(mf.rel)))
+		}
+		dirs := r.ownBefore(ctx, f.canon, inner...)
 		var err error
 		switch f.Rule {
 		case RuleWorktrees:
@@ -84,7 +96,17 @@ func (r *runner) act(ctx context.Context) error {
 		case RuleModels:
 			err = r.removeModel(f)
 		case RuleScratch:
-			err = r.removeScratch(ctx, f)
+			f.ownDirs = dirs
+			err = r.removeScratch(ctx, f, func() error { // the model data's deletion is on record before the offload
+				at := r.opt.Clock()
+				for _, d := range dirs {
+					r.addOwn(d, at)
+				}
+				if r.opt.DryRun {
+					return nil
+				}
+				return r.recordModelData(ctx, f)
+			})
 			if err != nil && f.removed > 0 { // its model data went; the folder stays, its failure reported
 				f.Detail = fmt.Sprintf("deleted %s of its model data; then: %s", gib(f.removed), f.Detail)
 			}
@@ -94,14 +116,14 @@ func (r *runner) act(ctx context.Context) error {
 		if after := r.free(f.Path); before >= 0 && after >= 0 {
 			f.Freed = max(0, after-before)
 		}
-		if errors.Is(err, errLocked) {
+		if errors.Is(err, errLocked) || errors.Is(err, errChanged) {
 			f.Action, f.Why = ActKeep, err.Error()
 			continue
 		}
 		if err != nil {
 			f.Err = err.Error()
-			if _, statErr := os.Lstat(f.Path); statErr == nil {
-				continue // still there: a failure, reported
+			if _, statErr := os.Lstat(f.Path); statErr == nil || f.Rule == RuleScratch {
+				continue // still there, or a task folder without its pointer: a failure, reported
 			}
 		}
 		f.Done = true
@@ -151,7 +173,7 @@ func (r *runner) recheck(ctx context.Context, f *Finding) string {
 		if t := Measure(f.Path, nil); t.Newest.After(f.Newest) {
 			return "written since it was judged"
 		}
-		if why := r.sessionIn(ctx, f.canon, f.maker); why != "" {
+		if why := r.sessionIn(ctx, f.canon, f.makers); why != "" {
 			return why
 		}
 	case RuleWorktrees:

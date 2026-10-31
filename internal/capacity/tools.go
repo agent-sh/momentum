@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -58,6 +59,11 @@ func runTool(ctx context.Context, timeout time.Duration, path, name string, args
 	if len(env) > 0 {
 		cmd.Env = append(os.Environ(), env...)
 	}
+	// the timeout ends the tool's whole process group (a script's children among it, which would keep its output
+	// open), and the wait for its output after that
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM) }
+	cmd.WaitDelay = toolWaitDelay
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err := cmd.Run()
@@ -73,6 +79,10 @@ func runTool(ctx context.Context, timeout time.Duration, path, name string, args
 	}
 	return out.String(), nil
 }
+
+// toolWaitDelay is how long a tool's process group has to end, and its output to close, once its timeout passed:
+// a child that left the group (setsid) may hold the output open.
+var toolWaitDelay = 5 * time.Second
 
 // uv prunes the uv cache with `uv cache prune --ci` when it is over its size, or when the last prune is
 // older than the cadence (or there was none). --ci keeps the wheels uv built and drops the ones it can download

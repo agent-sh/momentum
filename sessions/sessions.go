@@ -74,6 +74,7 @@ type Session struct {
 	Where      string    `json:"where"` // a tmux target, "tty", "bg", or a Hermes platform
 	Pane       string    `json:"pane,omitempty"`
 	Job        string    `json:"job,omitempty"`
+	SessionID  string    `json:"session_id,omitempty"` // the id its transcripts carry: Claude Code's, a Codex thread, a pi or Hermes session
 	PID        int       `json:"pid,omitempty"`
 	Model      string    `json:"model,omitempty"`
 	PRs        []string  `json:"prs,omitempty"`

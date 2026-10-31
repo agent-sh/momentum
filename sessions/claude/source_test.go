@@ -116,6 +116,14 @@ func TestAFailedBackgroundJobNeedsItsOwner(t *testing.T) {
 	}
 }
 
+func TestABackgroundJobCarriesItsTranscriptsSessionID(t *testing.T) {
+	x := newScript(t).user("nightly").say("Done.")
+	src := &Source{Lister: listed{{Tool: "claude", Job: "j1", Session: "sess-1", Where: "bg", Transcript: x.path}}}
+	if s := scan(t, src, x.at)["j1"]; s == nil || s.SessionID != "sess-1" {
+		t.Fatalf("a job is keyed by its id and carries the session id its transcript's events carry: %+v", s)
+	}
+}
+
 func TestDerivedNamesAreNotNames(t *testing.T) {
 	src := &Source{Lister: listed{
 		{Tool: "claude", Session: "a", Name: "projects-ce", Named: true},

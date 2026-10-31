@@ -72,6 +72,20 @@ func (r *runner) recordDone(ctx context.Context, f *Finding) error {
 	return err
 }
 
+// recordModelData records, before the offload that follows, the model data a task folder's act deleted: its own
+// event and decided note, so the deletion is on record whatever the offload does.
+func (r *runner) recordModelData(ctx context.Context, f *Finding) error {
+	g := *f
+	g.offloaded, g.snapshot, g.Freed, g.Bytes = false, "", 0, f.removed
+	e := r.event(KindDelete, g, fmt.Sprintf("%s/%s/%s/models/%d", KindDelete, f.Rule, keyPath(*f), r.now.UnixMilli()), store.ActorAgent)
+	e.TS = r.opt.Clock()
+	if _, err := r.st.Put(ctx, []store.Event{e}); err != nil {
+		return err
+	}
+	_, err := r.st.PutNote(ctx, decidedNote(e, g, e.TS))
+	return err
+}
+
 // recordPrunes records the prunes one rule made on this run, as soon as it made them.
 func (r *runner) recordPrunes(ctx context.Context, rule string) error {
 	for _, rr := range r.res.Rules {
@@ -451,6 +465,9 @@ func groupOf(gs map[string]*group, rule, class string) *group {
 // event is a finding as an event of source capacity.
 func (r *runner) event(kind string, f Finding, key string, actor store.Actor) store.Event {
 	meta := map[string]any{"rule": f.Rule, "path": f.Path, "bytes": f.Bytes}
+	if kind == KindOffload {
+		meta["bytes"] = offloadedBytes(f)
+	}
 	if f.Freed > 0 {
 		meta["freed"] = f.Freed
 	}
@@ -473,9 +490,12 @@ func (r *runner) event(kind string, f Finding, key string, actor store.Actor) st
 		if f.snapshot != "" {
 			meta["snapshot"] = f.snapshot
 		}
-		if f.maker.session != "" {
-			meta["made_by"] = map[string]string{"session": f.maker.session, "harness": f.maker.harness,
-				"at": f.maker.at.Format(time.RFC3339)}
+		if len(f.makers) > 0 {
+			var by []map[string]string
+			for _, mk := range f.makers {
+				by = append(by, map[string]string{"session": mk.session, "harness": mk.harness, "at": mk.at.Format(time.RFC3339)})
+			}
+			meta["made_by"] = by
 		}
 	}
 	for k, v := range map[string]string{"why": f.Why, "detail": f.Detail, "error": f.Err, "class": f.class, "branch": f.branch} {
@@ -488,13 +508,16 @@ func (r *runner) event(kind string, f Finding, key string, actor store.Actor) st
 		Summary: summary(kind, f), Meta: string(b), Ref: f.Path}
 }
 
+// offloadedBytes is what of a task folder went to restic: all of it but the model data deleted before.
+func offloadedBytes(f Finding) int64 { return f.Bytes - f.removed }
+
 func summary(kind string, f Finding) string {
 	switch kind {
 	case KindOffload:
 		s := fmt.Sprintf("offloaded task folder %s to restic snapshot %s: %s, freed %s", short(f.Path), f.snapshot,
-			gib(f.Bytes), gib(f.Freed))
+			gib(offloadedBytes(f)), gib(f.Freed))
 		if f.removed > 0 {
-			s += fmt.Sprintf(", its model data (%s) deleted", gib(f.removed))
+			s += fmt.Sprintf(", its model data (%s) deleted before", gib(f.removed))
 		}
 		return s
 	case KindDelete:
@@ -525,7 +548,7 @@ func decidedNote(e store.Event, f Finding, now time.Time) store.Note {
 	case f.Rule == RuleUV || f.Rule == RuleDocker:
 		title = fmt.Sprintf("Pruned %s: %s", f.Path, gib(f.Freed))
 	case f.Rule == RuleScratch && f.offloaded:
-		title = fmt.Sprintf("Offloaded task folder %s (%s) to restic", short(f.Path), gib(f.Bytes))
+		title = fmt.Sprintf("Offloaded task folder %s (%s) to restic", short(f.Path), gib(offloadedBytes(f)))
 	case f.Rule == RuleScratch:
 		title = fmt.Sprintf("Deleted the model data of task folder %s (%s)", short(f.Path), gib(f.removed))
 	}

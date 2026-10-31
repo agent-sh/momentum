@@ -158,7 +158,7 @@ func sessionsByPID(ctx context.Context, st *store.Store) map[int]capacity.Sessio
 		if key <= 0 { // a session without a process of its own still works somewhere
 			key = -(i + 1)
 		}
-		out[key] = capacity.Session{Key: s.Key, Name: s.Name, Tool: s.Tool, Cwd: s.Cwd}
+		out[key] = capacity.Session{Key: s.Key, ID: s.SessionID, Name: s.Name, Tool: s.Tool, Cwd: s.Cwd}
 	}
 	return out
 }

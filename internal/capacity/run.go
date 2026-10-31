@@ -49,7 +49,7 @@ type Finding struct {
 	// (an excluded project's), and what the act did: the model data's bytes it deleted, the snapshot it offloaded to
 	files      []modelFile
 	modelBytes int64
-	maker      maker
+	makers     []maker
 	modelOnly  bool
 	removed    int64
 	snapshot   string
@@ -136,6 +136,7 @@ type Result struct {
 // Session names the agent session behind a process, for the writers of a fast fill.
 type Session struct {
 	Key, Name, Tool string
+	ID              string // the id its harness's transcripts carry for it, where it has one
 	Cwd             string // where it works
 }
 
@@ -160,6 +161,8 @@ type Options struct {
 	beforeAct func()
 	// afterDelete runs after each deletion: a test's way to have the deletion's own change happen on its clock.
 	afterDelete func(Finding)
+	// beforeModelDelete runs before the scratch rule deletes a file of model data: a test's way into that gap.
+	beforeModelDelete func(Finding)
 }
 
 type runner struct {

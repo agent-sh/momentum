@@ -78,6 +78,9 @@ func TestCreatedReadsTheFileName(t *testing.T) {
 	if !Created("/x/other.jsonl").IsZero() {
 		t.Fatal("no time")
 	}
+	if got := ID("/x/2026-09-20T20-34-02-152Z_01a0.jsonl"); got != "01a0" {
+		t.Fatalf("the id after the time: %q", got)
+	}
 }
 
 func TestEachPiProcessGetsTheSessionItCreated(t *testing.T) {
@@ -123,5 +126,10 @@ func TestEachPiProcessGetsTheSessionItCreated(t *testing.T) {
 	}
 	if ss[0].Phase != sessions.Working || ss[0].Key[:3] != "pi:" {
 		t.Fatalf("a user message opens the turn: %+v", ss[0])
+	}
+	for _, s := range ss { // the id its transcript's events carry
+		if want := map[int]string{1: "a", 2: "b"}[s.PID]; s.SessionID != want {
+			t.Errorf("pid %d: session id %q, want %q", s.PID, s.SessionID, want)
+		}
 	}
 }

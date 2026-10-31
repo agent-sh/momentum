@@ -94,7 +94,8 @@ func TestHermesListsConversationsAndRunningAutomation(t *testing.T) {
 		t.Fatalf("sessions %v", got)
 	}
 	chat := got["hermes:chat"]
-	if chat.Phase != sessions.Working || chat.PID != 42 || chat.Now != "terminal: restic backup" || chat.Name != "Fix the backup" || chat.Auto {
+	if chat.Phase != sessions.Working || chat.PID != 42 || chat.Now != "terminal: restic backup" || chat.Name != "Fix the backup" || chat.Auto ||
+		chat.SessionID != "chat" {
 		t.Fatalf("chat %+v", chat)
 	}
 	if want := time.UnixMilli(int64(sec(-2*time.Minute) * 1000)); !chat.UserAt.Equal(want) {

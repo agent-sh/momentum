@@ -176,6 +176,12 @@ func Created(path string) time.Time {
 	return t
 }
 
+// ID is the id pi gives a session, which its transcript's events carry: its file's name after the creation time.
+func ID(path string) string {
+	name := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	return strings.TrimPrefix(name, reCreated.FindString(name))
+}
+
 // SessionDir is where pi keeps the sessions of a working directory: the leading separator dropped, every other
 // separator and colon turned into a dash, wrapped in double dashes.
 func SessionDir(agentDir, cwd string) string {
@@ -308,7 +314,7 @@ func (src *Source) session(ctx context.Context, slot proc.Slot, used map[string]
 	t, err := src.tracker(ctx, best)
 	src.seen[best] = w.Now
 	project := src.Env.Project(slot.Cwd)
-	s := &sessions.Session{Key: "pi:" + strings.TrimSuffix(filepath.Base(best), ".jsonl"), Tool: src.Tool(), Name: "pi in " + project,
+	s := &sessions.Session{Key: "pi:" + strings.TrimSuffix(filepath.Base(best), ".jsonl"), SessionID: ID(best), Tool: src.Tool(), Name: "pi in " + project,
 		Cwd: slot.Cwd, Project: project, Where: "tty", PID: p.PID, Started: p.Start, LastActive: bestT, Tasks: []sessions.Task{},
 		Transcript: best}
 	s.Size = t.Update()
