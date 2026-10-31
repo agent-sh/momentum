@@ -183,10 +183,6 @@ func (r *runner) decideScratch(ctx context.Context, f Finding, x root, w folderW
 		}
 		return f
 	}
-	// a session only keeps what would go: one look that is not whole holds the run
-	if why := r.sessionIn(ctx, f.canon, f.makers); why != "" {
-		return keep(why)
-	}
 	if w.Errs > 0 {
 		f.Action, f.class = ActReport, "unreadable"
 		f.Why = fmt.Sprintf("%d of its directories cannot be read, so its last write is not known", w.Errs)
@@ -196,7 +192,8 @@ func (r *runner) decideScratch(ctx context.Context, f Finding, x root, w folderW
 	if ex, ok := r.excludedScratch(ctx, f.canon, w, f.makers); ok {
 		class, why = "excluded", "an excluded project's: "+ex
 	} else if d := r.unknownMaker(f.canon); d != "" {
-		class, why = "unknown", "made in "+short(d)+", which was gone when the rule first looked: its project cannot be known"
+		class, why = "unknown", "made in "+short(d)+", which was gone when the rule first looked, so its project cannot be "+
+			"known: offload it by hand (evidence-offload) if it is no excluded project's"
 	}
 	if class != "" {
 		if len(f.files) == 0 {
@@ -220,6 +217,10 @@ func (r *runner) decideScratch(ctx context.Context, f Finding, x root, w folderW
 				"or list it in keep", gib(n), durationText(offloadTimeout))
 			return f
 		}
+	}
+	// a session only keeps what would go: a look at them that is not whole holds the run
+	if why := r.sessionIn(ctx, f.canon, f.makers); why != "" {
+		return keep(why)
 	}
 	f.Action = ActDelete
 	return f
@@ -687,11 +688,9 @@ func walkFolder(p string, m *Mounts, minBytes int64) folderWalk {
 		}
 		for _, e := range ents {
 			fi, err := e.Info()
-			if err != nil {
-				if !errors.Is(err, fs.ErrNotExist) {
-					w.Errs++ // a directory it may list but not search hides what is in it
-				}
-				continue // gone since the listing
+			if err != nil { // a directory it may list but not search hides what is in it; an idle folder loses nothing
+				w.Errs++
+				continue
 			}
 			b, _ := count(fi)
 			ep := filepath.Join(d.path, e.Name())
@@ -780,8 +779,11 @@ func hfHub(d string) bool {
 var (
 	modelExts = map[string]bool{".safetensors": true, ".gguf": true, ".ggml": true, ".pt": true, ".pth": true,
 		".ckpt": true, ".distcp": true, ".onnx": true, ".tflite": true, ".parquet": true, ".arrow": true, ".engine": true,
-		".trt": true, ".tfrecord": true, ".tfrecords": true, ".mds": true}
+		".trt": true}
 	tfShard = regexp.MustCompile(`\.data-\d{5}-of-\d{5}$`)
+	// shardExt is a dataset's shard: TFRecord (as TensorFlow Datasets names them, NAME.tfrecord-00000-of-00001)
+	// and MosaicML's, compressed or not
+	shardExt = regexp.MustCompile(`(?i)\.(?:tfrecords?(?:-\d{5}-of-\d{5})?|mds)(?:\.(?:gz|zst|zstd|bz2|xz|lz4|snappy))?$`)
 )
 
 // modelFormat reports whether a file holds model data: by its name, or by its first bytes (GGUF and legacy GGML,
@@ -790,7 +792,7 @@ var (
 // a run's results are kept in as often (JSON lines, CSV, NumPy and HDF5 arrays, pickles) is left to the offload:
 // restic keeps it.
 func modelFormat(p, name string, size int64) bool {
-	if modelExts[strings.ToLower(filepath.Ext(name))] || tfShard.MatchString(name) {
+	if modelExts[strings.ToLower(filepath.Ext(name))] || tfShard.MatchString(name) || shardExt.MatchString(name) {
 		return true
 	}
 	if strings.HasSuffix(name, ".bin") { // a Megatron dataset's data, beside its index

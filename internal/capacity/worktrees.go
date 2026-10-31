@@ -142,7 +142,8 @@ func (r *runner) worktree(ctx context.Context, w, canon string, heads *remoteHea
 		f.Action, f.Why = ActKeep, "locked: "+strings.TrimSpace(string(b))
 		return f, true
 	}
-	if busy := r.repoBusy(ctx, w, canon, look); busy != "" {
+	busy, unread := r.repoBusy(ctx, w, canon, look)
+	if busy != "" {
 		f.Action, f.Why = ActKeep, "its repository is in use: "+busy
 		return f, true
 	}
@@ -163,6 +164,10 @@ func (r *runner) worktree(ctx context.Context, w, canon string, heads *remoteHea
 			f.Why = fmt.Sprintf("%d commits on no branch %s still has, and their changes are not in %s", n, remote, into)
 			return f, true
 		}
+	}
+	if unread != nil { // a session the look missed may work in its repository
+		f.Action, f.Why = ActKeep, "its repository may be in use: "+r.sessionsUnread(unread)
+		return f, true
 	}
 	f.Action = ActDelete
 	return f, true
@@ -269,10 +274,10 @@ func shortSHA(s string) string {
 // repoBusy names what works in a worktree's repository now, or "": a process (other than this one) whose working
 // directory is in any of the repository's work trees, or a live agent session that works in one. The scheduled-AI
 // policy leaves a repository someone works on alone; a branch of it is not deleted under them.
-func (r *runner) repoBusy(ctx context.Context, w, canon string, look *Sample) string {
+func (r *runner) repoBusy(ctx context.Context, w, canon string, look *Sample) (string, error) {
 	out, err := gitOut(ctx, w, "worktree", "list", "--porcelain")
 	if err != nil {
-		return "git worktree list failed: " + err.Error()
+		return "git worktree list failed: " + err.Error(), nil
 	}
 	var trees []string
 	bare := map[string]bool{}
@@ -290,28 +295,25 @@ func (r *runner) repoBusy(ctx context.Context, w, canon string, look *Sample) st
 		}
 	}
 	self := os.Getpid()
+	ss, unread := r.liveSessions(ctx) // none when the look was not whole: the caller holds what would go
 	for _, t := range trees {
 		for _, p := range look.Table {
 			if p.PID != self && p.Cwd != "" && under(p.Cwd, t) {
-				return fmt.Sprintf("%s (pid %d) in %s", p.Comm, p.PID, short(t))
+				return fmt.Sprintf("%s (pid %d) in %s", p.Comm, p.PID, short(t)), nil
 			}
-		}
-		ss, err := r.liveSessions(ctx)
-		if err != nil {
-			return r.sessionsUnread(err)
 		}
 		for _, s := range ss {
 			if s.Cwd != "" && under(r.m.Canon(s.Cwd), t) {
-				return fmt.Sprintf("session %s (%s) in %s", firstNonEmpty(s.Name, s.Key), s.Tool, short(t))
+				return fmt.Sprintf("session %s (%s) in %s", firstNonEmpty(s.Name, s.Key), s.Tool, short(t)), nil
 			}
 		}
 	}
 	for _, t := range trees {
 		if !bare[t] && r.changedIn(ctx, t, r.now.Add(-quietTime), look) {
-			return fmt.Sprintf("a change in %s in the last %s", short(t), quietTime)
+			return fmt.Sprintf("a change in %s in the last %s", short(t), quietTime), nil
 		}
 	}
-	return ""
+	return "", unread
 }
 
 // changedIn reports whether someone changed a work tree since a time: an entry made, removed or renamed in one of
@@ -476,14 +478,10 @@ func (r *runner) liveSessions(ctx context.Context) (map[int]Session, error) {
 	if r.sessions == nil {
 		r.sessions, r.sessionsErr = map[int]Session{}, nil
 		if r.opt.Sessions != nil {
-			ss, err := r.opt.Sessions(ctx)
-			switch {
-			case err != nil:
+			if ss, err := r.opt.Sessions(ctx); err != nil {
 				r.sessionsErr = err
-			case ss != nil:
+			} else {
 				r.sessions, r.sessionsWhole = ss, true
-			default:
-				r.sessionsWhole = true
 			}
 		}
 	}

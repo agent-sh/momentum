@@ -352,19 +352,33 @@ func commandCreates(cmd string, spellings []string) bool {
 // shellAssign is a variable a shell command assigns: NAME=value, or export NAME=value.
 var shellAssign = regexp.MustCompile(`(?:^|[\s;&|(])(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|'[^']*'|[^\s;&|)]+)`)
 
-// expandVars puts in a command the values of the variables it assigns where it uses them after: S=P; mkdir "$S" is
-// mkdir "P", and D=$HOME/x; mkdir "$D" is mkdir "$HOME/x". A value that uses its own variable stays as it is.
+// expandVars puts in a command the values of the variables it assigns where it uses them after, up to the next
+// assignment of the same variable: S=P; mkdir "$S" is mkdir "P", and D=$HOME/x; mkdir "$D" is mkdir "$HOME/x". A
+// value that uses its own variable stays as it is. It stops at maxExpanded: the store keeps 240 bytes of a call, and
+// agents' commands expand to a few KiB at most, while a chain of variables can grow without end.
 func expandVars(cmd string) string {
 	for round := 0; round < 16; round++ {
 		changed := false
-		for _, m := range shellAssign.FindAllStringSubmatchIndex(cmd, -1) {
+		ms := shellAssign.FindAllStringSubmatchIndex(cmd, -1)
+		for i, m := range ms {
 			name, val := cmd[m[2]:m[3]], strings.Trim(cmd[m[4]:m[5]], `"'`)
 			if val == "" || strings.Contains(val, "$"+name) || strings.Contains(val, "${"+name+"}") {
 				continue
 			}
+			end := len(cmd) // up to the variable's next assignment
+			for _, n := range ms[i+1:] {
+				if cmd[n[2]:n[3]] == name {
+					end = n[0]
+					break
+				}
+			}
 			use := regexp.MustCompile(`\$\{` + name + `\}|\$` + name + `\b`)
-			if rest := cmd[m[1]:]; use.MatchString(rest) {
-				cmd, changed = cmd[:m[1]]+use.ReplaceAllLiteralString(rest, val), true
+			if span := cmd[m[1]:end]; use.MatchString(span) {
+				next := cmd[:m[1]] + use.ReplaceAllLiteralString(span, val) + cmd[end:]
+				if len(next) > maxExpanded {
+					return cmd
+				}
+				cmd, changed = next, true
 				break // its places moved: find the assignments again
 			}
 		}
@@ -374,6 +388,9 @@ func expandVars(cmd string) string {
 	}
 	return cmd
 }
+
+// maxExpanded is the longest a command grows to with its variables put in.
+const maxExpanded = 8 << 10
 
 // wholeName reports whether an occurrence of a folder's name is the folder itself, not a path inside it: the name,
 // with a trailing slash at most.

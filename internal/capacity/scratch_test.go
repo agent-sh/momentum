@@ -1724,3 +1724,152 @@ func TestACommandIsReadToItsOwnDelimiter(t *testing.T) {
 		t.Errorf("a variable's uses are its value, another variable's are not: %q", got)
 	}
 }
+
+func TestAFailedLookWithOnlyAReportDuePutsNoHold(t *testing.T) {
+	f := newScratch(t)
+	p := f.task(t, "zq-secret-plain", "s1", map[string]int{"out.log": 2 << 20})
+	f.cfg.Exclude.Names = []string{"*secret*"}
+	f.cfg = f.cfg.Normal()
+	f.cfg.Live = []string{RuleScratch}
+	ctx := context.Background()
+	whole := options(t, procRoot(t), f.now, nil)
+	whole.Sessions = func(context.Context) (map[int]Session, error) { return map[int]Session{}, nil }
+	if g := findings(f.run(t, whole), RuleScratch)[p]; g.Action != ActReport || g.class != "excluded" {
+		t.Fatalf("an excluded project's folder is reported: %+v", g)
+	}
+	o := options(t, procRoot(t), f.now.Add(time.Hour), nil)
+	o.Sessions = func(context.Context) (map[int]Session, error) {
+		return nil, errors.New("pi: not done by the scan's deadline")
+	}
+	g := findings(f.run(t, o), RuleScratch)[p]
+	hold, held, _ := f.st.Note(ctx, "capacity:hold:sessions")
+	ex, _, _ := f.st.Note(ctx, "capacity:scratch:excluded")
+	if g.Action != ActReport || (held && hold.Done.IsZero()) || !ex.Done.IsZero() {
+		t.Errorf("nothing would have gone: the folder is %s (%s), the hold note open %v, the excluded note resolved %v",
+			g.Action, g.Why, held && hold.Done.IsZero(), !ex.Done.IsZero())
+	}
+}
+
+func TestAFailedLookLeavesAWorktreesReport(t *testing.T) {
+	_, wts := worktreesFixture(t)
+	now := time.Now().Add(2 * time.Hour)
+	cfg := Config{Worktrees: WorktreesConfig{Roots: []string{wts}}}.Normal()
+	cfg.Live = []string{RuleWorktrees}
+	o := options(t, procRoot(t), now, nil)
+	o.Sessions = func(context.Context) (map[int]Session, error) {
+		return nil, errors.New("pi: not done by the scan's deadline")
+	}
+	res, err := Run(context.Background(), cfg, openStore(t), o)
+	must(t, err)
+	got := findings(res, RuleWorktrees)
+	if f := got[filepath.Join(wts, "dirty")]; f.Action != ActReport || f.class != "uncommitted" {
+		t.Errorf("a worktree it would only report is reported whatever the sessions: %s (%s)", f.Action, f.Why)
+	}
+	if f := got[filepath.Join(wts, "merged")]; f.Action != ActKeep || !strings.Contains(f.Why, "could not all be read") {
+		t.Errorf("one it would remove waits for a whole look: %s (%s)", f.Action, f.Why)
+	}
+}
+
+func TestAShortCallExpandsWithinABound(t *testing.T) {
+	c := "a=0123456789; b=$a$a$a$a$a$a$a$a$a$a; c=$b$b$b$b$b$b$b$b$b$b; d=$c$c$c$c$c$c$c$c$c$c; " +
+		"e=$d$d$d$d$d$d$d$d$d$d; f=$e$e$e$e$e$e$e$e$e$e; echo $f > out"
+	if out := expandVars(c); len(out) > maxExpanded {
+		t.Errorf("a %d-byte command expands to %d bytes", len(c), len(out))
+	}
+}
+
+func TestAVariableAssignedAgainIsItsLastValue(t *testing.T) {
+	tool, task := "/c/zq-browsers", "/c/zq-task"
+	call := `{"command":"D=` + tool + `; ls \"$D\"; D=` + task + `; mkdir -p \"$D\""}`
+	if callCreates("Bash", call, []string{tool}) {
+		t.Errorf("%s is counted as made by a call that lists it and makes %s", tool, task)
+	}
+	if !callCreates("Bash", call, []string{task}) {
+		t.Errorf("%s is made by the call", task)
+	}
+}
+
+func TestShardedAndCompressedDatasetsAreModelData(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"mnist-train.tfrecord-00000-of-00001", "train.tfrecord.gz", "shard.00000.mds.zstd",
+		"model.trt", "train.tfrecords"} {
+		p := filepath.Join(dir, name)
+		blob(t, p, 4096)
+		if !modelFormat(p, name, 4096) {
+			t.Errorf("%s is model data", name)
+		}
+	}
+	p := filepath.Join(dir, "old-ggmf-model")
+	write(t, p, "fmgg"+strings.Repeat("\x00", 4092))
+	if !modelFormat(p, "old-ggmf-model", 4096) {
+		t.Error("a legacy GGMF file is model data")
+	}
+}
+
+func TestAMakerLookedUpOnceStaysKnown(t *testing.T) {
+	gitEnv(t)
+	f := newScratch(t)
+	c := filepath.Join(f.base, "lanes", "open")
+	write(t, filepath.Join(c, "README"), "x\n")
+	gitT(t, c, "init", "-q")
+	gitT(t, c, "remote", "add", "origin", "git@github.com:owner/open.git")
+	p := f.folder(t, "zq-open", map[string]int{"build.log": 2 << 20})
+	f.named(t, p, "s1", toolCall, 0, `{"command":"mkdir -p `+p+`"}`, c)
+	f.cfg.Exclude.Remotes = []string{"owner/hidden"}
+	f.cfg = f.cfg.Normal()
+	f.run(t, options(t, procRoot(t), f.now, nil)) // the first look; the rule is not live yet
+	must(t, os.RemoveAll(c))                      // the lane closes
+	f.cfg.Live = []string{RuleScratch}
+	if g := findings(f.run(t, options(t, procRoot(t), f.now.Add(time.Hour), nil)), RuleScratch)[p]; !g.Done {
+		t.Errorf("a folder of a known project that is not excluded goes: %+v", g)
+	}
+}
+
+func TestAFolderMadeAgainBySameSessionIsLookedUpAgain(t *testing.T) {
+	gitEnv(t)
+	f := newScratch(t)
+	small := map[string]int{"build.log": 2 << 20}
+	p := f.folder(t, "zq-twice", small)
+	f.named(t, p, "s1", toolCall, 0, `{"command":"mkdir -p `+p+`"}`, f.base) // first in no checkout
+	f.cfg.Exclude.Remotes = []string{"owner/hidden"}
+	f.cfg = f.cfg.Normal()
+	f.run(t, options(t, procRoot(t), f.now, nil))
+	must(t, os.RemoveAll(p)) // the same session makes it again, now in an excluded lane's checkout
+	lane := laneCheckout(t, f, "l10")
+	p = f.folder(t, "zq-twice", small)
+	f.named(t, p, "s1", toolCall, 0, `{"command":"mkdir -p `+p+`"}`, lane)
+	f.run(t, options(t, procRoot(t), f.now.Add(time.Hour), nil))
+	must(t, os.RemoveAll(lane)) // and the lane closes
+	f.cfg.Live = []string{RuleScratch}
+	if g := findings(f.run(t, options(t, procRoot(t), f.now.Add(2*time.Hour), nil)), RuleScratch)[p]; g.Done || g.class != "excluded" {
+		t.Errorf("the new folder's maker is looked up for it, though it made the old one too: %+v", g)
+	}
+}
+
+func TestEachKeywordIsSkipped(t *testing.T) {
+	p := "/c/zq-kw"
+	for _, c := range []string{"if mkdir P; then :; fi", "if true; then :; else mkdir -p P; fi",
+		"if false; then :; elif mkdir P; then :; fi", "while ! mkdir P; do sleep 1; done", "until mkdir P; do sleep 1; done",
+		"! mkdir P"} {
+		c = strings.ReplaceAll(c, "P", p)
+		if !callCreates("Bash", `{"command":"`+c+`"}`, []string{p}) {
+			t.Errorf("%s makes the folder", c)
+		}
+	}
+}
+
+func TestAChainOfVariablesIsFollowed(t *testing.T) {
+	p := "/c/zq-chain"
+	if !callCreates("Bash", `{"command":"R=/c; D=$R/zq-chain; mkdir -p \"$D\""}`, []string{p}) {
+		t.Errorf(`R=/c; D=$R/zq-chain; mkdir -p "$D" makes %s`, p)
+	}
+	if got := expandVars(`A=${A}/x; echo "$A"`); got != `A=${A}/x; echo "$A"` {
+		t.Errorf("a variable whose value uses itself in braces is left as it is: %q", got)
+	}
+}
+
+func TestTheTimeoutIsInWords(t *testing.T) {
+	if got := durationText(10 * time.Minute); got != "10 minutes" {
+		t.Errorf("the too-big reason's time: %q", got)
+	}
+}
