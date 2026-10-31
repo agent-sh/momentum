@@ -100,9 +100,10 @@ func cannotResume(s *sessions.Session, stop Stop, why string, presence time.Time
 	if presence.After(due) {
 		due = presence
 	}
-	return ask{title: "momentum could not resume " + sessionName(s) + ": " + why, since: stop.RequestAt, due: due.Add(p.OwnerWindow),
-		detail: fmt.Sprintf("%s (%s) has waited since %s on a request to the model that never got a reply. A message typed into it resumes it.",
-			sessionName(s), s.Tool, stop.RequestAt.Local().Format("Jan 2 15:04"))}, true
+	detail := fmt.Sprintf("%s (%s) has waited since %s on a request to the model that never got a reply. "+
+		"A message typed into it resumes it.", sessionName(s), s.Tool, stop.RequestAt.Local().Format("Jan 2 15:04"))
+	return ask{title: "momentum could not resume " + sessionName(s) + ": " + why, since: stop.RequestAt,
+		due: due.Add(p.OwnerWindow), detail: detail}, true
 }
 
 // resumed is the decided note of a stalled turn the rule resumed: what it typed, how, and into which session,
@@ -130,9 +131,10 @@ func resumed(s *sessions.Session, stop Stop, text string, interrupt bool, now ti
 
 // notes keeps supervision's notes in step with what the run saw. A session that has waited on its owner past the
 // owner window gets a needs note, once per ask: a note he resolved while the session still waits on the same ask
-// stays resolved, and a standing one takes the ask's latest title. A needs note is done when its session moves on: the ask is answered or another took its place,
-// or the session ended. A problem note is done when its owner came back to the session or it works again: a turn
-// open, or a stop since without an error. A session the run left alone keeps its notes as they are.
+// stays resolved, and a standing one takes the ask's latest title. A needs note is done when its session moves on:
+// the ask is answered or another took its place, or the session ended. A problem note is done when its owner came
+// back to the session or it works again: a turn open that waits on no model request, or a stop since without an
+// error. A session the run left alone keeps its notes as they are.
 func (sv *Supervisor) notes(ctx context.Context, seen map[string]*seenSession) error {
 	ns, err := sv.Store.Notes(ctx)
 	if err != nil {
@@ -169,9 +171,9 @@ func (sv *Supervisor) notes(ctx context.Context, seen map[string]*seenSession) e
 			if ok && e == nil {
 				continue
 			}
-			// it works again: a turn open now, but not one that still waits on a request from before the note, or
-			// one that stopped since without an error
-			stuck := ok && !e.stop.RequestAt.IsZero() && !e.stop.RequestAt.After(n.At)
+			// it works again: a turn open now, but not one that waits on a model request with no reply (its case's,
+			// or Claude Code's own retry of it), or one that stopped since without an error
+			stuck := ok && !e.stop.RequestAt.IsZero()
 			again := ok && (e.s.TurnOpen && !stuck || e.stop.At.After(n.At) && e.stop.Error == "")
 			if !ok || e.presence.After(n.At) || again {
 				if err := done(n.ID); err != nil {
@@ -187,7 +189,7 @@ func (sv *Supervisor) notes(ctx context.Context, seen map[string]*seenSession) e
 		id := AskNote + key
 		if n, ok := held[id]; ok && n.At.UnixMilli() == e.ask.since.UnixMilli() &&
 			(!n.Done.IsZero() || n.Title == plain.Clip(plain.Line(e.ask.title), store.TitleMax)) {
-			continue // written already, and standing as it is or resolved by its owner; a new title replaces a standing one
+			continue // written already: standing as it is, or resolved by its owner; a new title replaces a standing one
 		}
 		n := store.Note{ID: id, Kind: store.NoteNeeds, Title: e.ask.title, Detail: e.ask.detail, Source: store.DefaultNoteSource, At: e.ask.since}
 		if _, err := sv.Store.PutNote(ctx, n); err != nil && !errors.Is(err, store.ErrBadNote) {

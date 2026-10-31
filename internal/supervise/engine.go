@@ -345,25 +345,34 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 		refused.Summary = oneLine(fmt.Sprintf("%s: a look went through after: %s", d.Rule, last.why))
 		evs = append(evs, refused)
 	}
+	// The first look, for the request, that finds a stalled turn's screen showing no turn running: its owner may
+	// have just taken the turn back, so the rule's time moves to the owner window after it (Stop.ScreenIdle).
+	firstIdle := err == nil && isStalled && !interrupt && stop.ScreenIdle.IsZero()
+	idleMark := func() store.Event {
+		mark := sv.event(s, stop, d, KindAct, sv.now(), requestKey("#idle", stop))
+		mark.Kind, mark.Actor = KindWait, store.ActorDetector
+		mark.Summary = oneLine(d.Rule + ": " + idleFirst)
+		mark.Meta = meta(map[string]any{"rule": d.Rule, "try": d.Try, "why": idleFirst, "stop_at": stop.At.UnixMilli(),
+			"request_at": stop.RequestAt.UnixMilli()})
+		return mark
+	}
 	switch {
 	case errors.Is(err, act.ErrDraft):
 		evs = append(evs, sv.present(s, stop, "draft")) // every sighting: its owner is at the pane
 	case errors.Is(err, act.ErrMode):
 		evs = append(evs, sv.present(s, stop, "mode"))
 	case err == nil && h.atPane[stop.At.UnixMilli()]:
-		// the draft or the mode the last check met is gone: its owner cleared it just now, and is there
+		// the draft or the mode the last check met is gone: its owner cleared it just now, and is there; on an idle
+		// screen this is its first idle look too, and its wait ends with the hold
 		line.Err = "its owner cleared the input line since the last check"
-		return sv.put(ctx, append(evs, sv.present(s, stop, "cleared")))
-	case err == nil && isStalled && !interrupt && stop.ScreenIdle.IsZero() && !h.presentAt.After(stop.RequestAt):
-		// its screen shows no turn running for the first time since the request, and nothing showed its owner at
-		// the pane since: he may have taken the turn back
-		mark := sv.event(s, stop, d, KindAct, sv.now(), requestKey("#idle", stop))
-		mark.Kind, mark.Actor = KindWait, store.ActorDetector
-		mark.Summary = oneLine(d.Rule + ": " + idleFirst)
-		mark.Meta = meta(map[string]any{"rule": d.Rule, "try": d.Try, "why": idleFirst, "stop_at": stop.At.UnixMilli(),
-			"request_at": stop.RequestAt.UnixMilli()})
+		evs = append(evs, sv.present(s, stop, "cleared"))
+		if firstIdle {
+			evs = append(evs, idleMark())
+		}
+		return sv.put(ctx, evs)
+	case firstIdle:
 		line.Verdict, line.Why = Wait, idleFirst
-		return sv.put(ctx, append(evs, mark))
+		return sv.put(ctx, append(evs, idleMark()))
 	}
 	if err != nil {
 		line.Err = err.Error()
@@ -371,7 +380,7 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 			// once per request, its last look: a no path stays until a look goes through
 			line.refused = &refusal{why: err.Error(), noPath: errors.Is(err, act.ErrNoPath) || had && !last.passed && last.noPath}
 		}
-		if !h.keys[refused.SourceKey] || isStalled && (last.passed || last.why != err.Error() || last.noPath != line.refused.noPath) {
+		if !h.keys[refused.SourceKey] || isStalled && (last.passed || last.why != err.Error()) {
 			m["path"], m["refused"] = string(path), err.Error()
 			if isStalled && line.refused.noPath {
 				m["no_path"] = true

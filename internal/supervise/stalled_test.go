@@ -346,7 +346,8 @@ func TestAnIdleScreensWaitIsTheRulesOwnTime(t *testing.T) {
 	if len(f.sent) != 2 {
 		t.Fatalf("past its window: sent %q", f.sent)
 	}
-	// A draft its owner cleared since the request already held the rule: no second window.
+	// A draft its owner cleared on the idle screen: that look is its first idle look too, and its wait ends with
+	// the hold of his clearing, not a window after it.
 	st = testStore(t)
 	f = &fakeSender{checkInterrupt: act.ErrDraft}
 	now = t0.Add(31 * time.Minute)
@@ -361,8 +362,41 @@ func TestAnIdleScreensWaitIsTheRulesOwnTime(t *testing.T) {
 	run(t, sv, s) // the check after the hold finds it cleared: him there just now
 	now = now.Add(DefaultParams.OwnerWindow + time.Second)
 	run(t, sv, s)
-	if len(f.sent) != 1 || len(events(t, st, KindWait)) != 0 {
+	if len(f.sent) != 1 || len(events(t, st, KindWait)) != 1 {
 		t.Fatalf("after the hold of his clearing: sent %q, waits %+v", f.sent, events(t, st, KindWait))
+	}
+	// He clears his draft while the turn still runs, then takes the turn back with Escape: the first look at the
+	// idle screen still waits the owner window, since the clearing came before the Escape.
+	st = testStore(t)
+	f = &fakeSender{checkInterrupt: act.ErrDraft}
+	now = t0.Add(31 * time.Minute)
+	sv = unread(liveStalled(st, f, &now))
+	sv.Prompted = func(context.Context, *sessions.Session, string) (bool, time.Time, error) {
+		return true, time.Time{}, nil
+	}
+	s = waitingSession("sess-cleared-then-escape")
+	run(t, sv, s)
+	f.checkInterrupt, f.interrupt = nil, act.ErrIdle // cleared, the turn still running; it ends before the paste
+	now = now.Add(DefaultParams.OwnerWindow + time.Second)
+	run(t, sv, s)
+	f.checkInterrupt = act.ErrIdle // his Escape: no turn running, an empty line
+	now = now.Add(DefaultParams.OwnerWindow + time.Second)
+	lines, err := sv.Run(context.Background(), []*sessions.Session{s}, map[int]uint64{42: 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.sent) != 0 || len(lines) != 1 || lines[0].Verdict != Wait || lines[0].Err != "" {
+		t.Fatalf("the first idle look after his Escape: sent %q, lines %+v", f.sent, lines)
+	}
+	now = now.Add(DefaultParams.OwnerWindow - time.Minute)
+	run(t, sv, s)
+	if len(f.sent) != 0 {
+		t.Fatalf("within its window: sent %q", f.sent)
+	}
+	now = now.Add(2 * time.Minute)
+	run(t, sv, s)
+	if len(f.sent) != 1 {
+		t.Fatalf("past its window: sent %q", f.sent)
 	}
 }
 
@@ -605,6 +639,98 @@ func TestALookThatWentThroughEndsTheRefusalsBeforeIt(t *testing.T) {
 	}
 	if n, ok := note(t, st, AskNote+s.Key); ok || len(f.sent) != 0 {
 		t.Fatalf("needs note %+v, sent %q", n, f.sent)
+	}
+}
+
+func TestARefusalAfterALookThatWentThroughStandsAgain(t *testing.T) {
+	// A dialog; the first idle look goes through and its wait begins; then the same dialog at every look until
+	// the stale hour: the note says so, though the reason is the one on record before the look that went through.
+	st := testStore(t)
+	f := &fakeSender{checkInterrupt: act.ErrDialog}
+	now := t0.Add(31 * time.Minute)
+	sv := unread(liveStalled(st, f, &now))
+	s := waitingSession("sess-dialog-again")
+	run(t, sv, s)
+	f.checkInterrupt = act.ErrIdle
+	now = now.Add(time.Minute)
+	run(t, sv, s)
+	f.checkInterrupt = act.ErrDialog
+	stale := now.Add(DefaultParams.OwnerWindow + DefaultParams.Stale)
+	for !now.After(stale.Add(time.Minute)) {
+		now = now.Add(time.Minute)
+		run(t, sv, s)
+	}
+	if n, ok := note(t, st, AskNote+s.Key); !ok || !n.Done.IsZero() || !strings.HasSuffix(n.Title, act.ErrDialog.Error()) || len(f.sent) != 0 {
+		t.Fatalf("needs note %+v %v, sent %q", n, ok, f.sent)
+	}
+}
+
+func TestADraftClearedWhileTheTurnRunsEndsItsRefusal(t *testing.T) {
+	// Drafts at every look, then he clears the line while the turn still runs and leaves; the hold of his
+	// clearing runs into the stale hour. He was there and left it as it is: no message, and no note naming a draft.
+	st := testStore(t)
+	f := &fakeSender{checkInterrupt: act.ErrDraft}
+	now := t0.Add(31 * time.Minute)
+	sv := unread(liveStalled(st, f, &now))
+	s := waitingSession("sess-cleared-late")
+	for now.Before(t0.Add(70 * time.Minute)) { // looks at 31, 46 and 61 meet the draft
+		run(t, sv, s)
+		now = now.Add(time.Minute)
+	}
+	f.checkInterrupt = nil // the line empty, the turn still running on its screen: the look at 76 finds it cleared
+	for now.Before(t0.Add(30*time.Minute + DefaultParams.Stale + 2*DefaultParams.OwnerWindow)) {
+		run(t, sv, s)
+		now = now.Add(time.Minute)
+	}
+	if n, ok := note(t, st, AskNote+s.Key); ok || len(f.sent) != 0 {
+		t.Fatalf("needs note %+v, sent %q", n, f.sent)
+	}
+}
+
+func TestAStalledNeedsNoteItsOwnerResolvedStaysResolved(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{checkInterrupt: act.ErrNoPath}
+	now := t0.Add(31 * time.Minute)
+	sv := unread(liveStalled(st, f, &now))
+	s := waitingSession("sess-resolved")
+	run(t, sv, s)
+	if _, _, err := st.DoneNote(context.Background(), AskNote+s.Key, now); err != nil {
+		t.Fatal(err)
+	}
+	f.checkInterrupt = act.ErrDialog // a new last look, and so a new title
+	now = now.Add(time.Minute)
+	run(t, sv, s)
+	if n, ok := note(t, st, AskNote+s.Key); !ok || n.Done.IsZero() {
+		t.Fatalf("a note he resolved stands again: %+v %v", n, ok)
+	}
+}
+
+func TestAStalledCasesProblemNoteStandsThroughARetry(t *testing.T) {
+	// The interrupt's paste may sit on the input line: a case and its problem note. Claude Code then retries the
+	// request by itself, and the retry gets no reply either: the turn does not work again, and the note stands.
+	st := testStore(t)
+	f := &fakeSender{interrupt: act.ErrUnstable}
+	now := t0.Add(31 * time.Minute)
+	sv := unread(liveStalled(st, f, &now))
+	s := waitingSession("sess-retry-after-case")
+	run(t, sv, s)
+	if n, ok := note(t, st, ProblemNote+s.Key); !ok || !n.Done.IsZero() {
+		t.Fatalf("problem note %+v %v", n, ok)
+	}
+	s.RequestAt = t0.Add(40 * time.Minute)
+	for now.Before(t0.Add(3 * time.Hour)) {
+		now = now.Add(10 * time.Minute)
+		run(t, sv, s)
+	}
+	if n, _ := note(t, st, ProblemNote+s.Key); !n.Done.IsZero() {
+		t.Fatalf("the problem note went with the retry: %+v", n)
+	}
+	// The reply comes and the turn goes on: it works again.
+	s.RequestAt = time.Time{}
+	now = now.Add(time.Minute)
+	run(t, sv, s)
+	if n, _ := note(t, st, ProblemNote+s.Key); n.Done.IsZero() {
+		t.Fatalf("still stands after the reply: %+v", n)
 	}
 }
 
