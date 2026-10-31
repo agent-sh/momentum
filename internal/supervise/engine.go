@@ -307,7 +307,7 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 	// that shows no turn running while the transcript still waits on the request takes it the plain way, as the
 	// next prompt, once the transcript still shows no reply. An Escape with nothing queued takes a turn back without
 	// a record, so the first look that finds that screen, for a request, moves the rule's time to the owner window
-	// after it; a look that finds the line its owner cleared there is that first look.
+	// after it; a look that finds the line its owner cleared there counts as that first look when none came before.
 	isStalled := d.Rule == RuleStalled
 	interrupt := isStalled
 	refusedKey := "#refused"
@@ -363,7 +363,8 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 		evs = append(evs, sv.present(s, stop, "mode"))
 	case err == nil && h.atPane[stop.At.UnixMilli()]:
 		// the draft or the mode the last check met is gone: its owner cleared it just now, and is there; on an idle
-		// screen this is its first idle look too, and its wait ends with the hold
+		// screen, with no idle look before it for the request, it is the first idle look too, and its wait ends
+		// with the hold
 		line.Err = "its owner cleared the input line since the last check"
 		evs = append(evs, sv.present(s, stop, "cleared"))
 		if firstIdle {
@@ -966,6 +967,9 @@ func (sv *Supervisor) prompted(ctx context.Context, s *sessions.Session, text st
 	end := time.Now().Add(promptedWait)
 	var shown time.Time // when the message first showed as a prompt, its interruption not on record yet
 	note := func(interrupted time.Time) error {
+		if !escaped {
+			interrupted = time.Time{} // the plain way pressed no Escape: an interruption on record is someone else's
+		}
 		m["interrupted"] = !interrupted.IsZero()
 		if !interrupted.IsZero() {
 			m["interrupted_at"] = interrupted.UnixMilli()

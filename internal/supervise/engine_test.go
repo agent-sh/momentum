@@ -316,6 +316,27 @@ func TestAProblemNoteIsDoneOnceTheSessionWorksAgain(t *testing.T) {
 	}
 }
 
+func TestAnotherHarnessesOpenTurnWorksAgain(t *testing.T) {
+	// A Codex session's case: its problem note ends once a turn is open again, a call in flight or not; only
+	// Claude Code's open turn may wait on a model request with no reply.
+	st := testStore(t)
+	f := &fakeSender{check: act.ErrNoPath}
+	now := t0.Add(11 * time.Minute)
+	sv := supervisor(st, f, &now)
+	s := erroring()
+	s.Tool = "codex"
+	run(t, sv, s)
+	if n, ok := note(t, st, ProblemNote+s.Key); !ok || !n.Done.IsZero() {
+		t.Fatalf("problem note %+v %v", n, ok)
+	}
+	s.TurnOpen, s.Now, s.AskKind, s.Ask = true, "", "", ""
+	now = now.Add(time.Minute)
+	run(t, sv, s)
+	if n, _ := note(t, st, ProblemNote+s.Key); n.Done.IsZero() {
+		t.Fatalf("a Codex turn open again left its note standing: %+v", n)
+	}
+}
+
 func TestARefusalIsRecordedOnceAndCheckedAgain(t *testing.T) {
 	st := testStore(t)
 	f := &fakeSender{check: act.ErrBusy}

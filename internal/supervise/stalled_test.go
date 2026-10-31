@@ -452,6 +452,30 @@ func TestAClearedLineTakesNoSecondIdleWait(t *testing.T) {
 	}
 }
 
+func TestThePlainWayTakesNoInterruptionForItsOwn(t *testing.T) {
+	// The plain way presses no Escape: an interruption the transcript shows by its prompt (its owner's Escape on
+	// the turn it opened) is his, and stays his presence.
+	st := testStore(t)
+	f := &fakeSender{checkInterrupt: act.ErrIdle}
+	now := t0.Add(31 * time.Minute)
+	sv := unread(liveStalled(st, f, &now))
+	his := t0.Add(46*time.Minute + 500*time.Millisecond)
+	sv.Prompted = func(context.Context, *sessions.Session, string) (bool, time.Time, error) { return true, his, nil }
+	s := waitingSession("sess-his-escape")
+	run(t, sv, s)
+	now = now.Add(DefaultParams.OwnerWindow + time.Second)
+	run(t, sv, s)
+	var sent map[string]any
+	for _, e := range events(t, st, KindAct) {
+		if m := metaMap(e); m["sent"] == true {
+			sent = m
+		}
+	}
+	if len(f.sent) != 1 || sent == nil || sent["interrupted"] != false || sent["interrupted_at"] != nil {
+		t.Fatalf("sent %q, its event %+v", f.sent, sent)
+	}
+}
+
 func TestAPlainSendTheTranscriptDoesNotShowOpensACase(t *testing.T) {
 	st := testStore(t)
 	f := &fakeSender{checkInterrupt: act.ErrIdle} // no turn running on the screen, though one may run unseen
@@ -939,6 +963,20 @@ func TestAnInterruptReadsOnForItsEscapesRecord(t *testing.T) {
 	if len(acts) != 1 || metaMap(acts[0])["interrupted_at"] != float64(escaped.UnixMilli()) {
 		t.Fatalf("acts %+v after %d looks", acts, looks)
 	}
+	// It shows late in the wait, its interruption not on record yet: the read-on runs past the wait, and it went in.
+	st = testStore(t)
+	sv = unread(liveStalled(st, &fakeSender{}, &now))
+	start := time.Now()
+	sv.Prompted = func(context.Context, *sessions.Session, string) (bool, time.Time, error) {
+		return time.Since(start) > 150*time.Millisecond, time.Time{}, nil
+	}
+	defer func(w time.Duration) { promptedWait = w }(promptedWait)
+	promptedWait = 200 * time.Millisecond
+	interruptWait = 300 * time.Millisecond
+	run(t, sv, waitingSession("sess-escape-shown-late"))
+	if acts := events(t, st, KindAct); len(acts) != 1 || metaMap(acts[0])["sent"] != true || len(events(t, st, KindCase)) != 0 {
+		t.Fatalf("shown late: acts %+v cases %+v", acts, events(t, st, KindCase))
+	}
 	// It never comes: the message still went in, with no interruption on record, and no case.
 	st = testStore(t)
 	sv = unread(liveStalled(st, &fakeSender{}, &now))
@@ -979,7 +1017,8 @@ func TestPromptedReadsTheTranscriptSinceTheScan(t *testing.T) {
 		after time.Duration
 		other bool
 		want  bool
-	}{{"just after", 7 * time.Millisecond, false, true}, {"long after", 30 * time.Second, false, false}, {"after another record", 7 * time.Millisecond, true, false}} {
+	}{{"just after", 7 * time.Millisecond, false, true}, {"long after", 30 * time.Second, false, false},
+		{"after another record", 7 * time.Millisecond, true, false}} {
 		w := &transcript{t: t, path: filepath.Join(dir, "w-"+strings.ReplaceAll(c.name, " ", "-")+".jsonl"), at: t0}
 		w.user("old turn")
 		fi, _ := os.Stat(w.path)
@@ -994,6 +1033,20 @@ func TestPromptedReadsTheTranscriptSinceTheScan(t *testing.T) {
 		if !found || interrupted.IsZero() == c.want || err != nil {
 			t.Fatalf("%s: found %v interrupted %v %v", c.name, found, interrupted, err)
 		}
+	}
+	// An interruption on record before the prompt is its Escape's; one right after it is someone else's then.
+	v := &transcript{t: t, path: filepath.Join(dir, "v.jsonl"), at: t0}
+	v.user("old turn")
+	fi, _ = os.Stat(v.path)
+	before := t0.Add(time.Minute)
+	v.add(map[string]any{"type": "user", "timestamp": before.Format(time.RFC3339Nano),
+		"message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "[Request interrupted by user]"}}}})
+	v.add(map[string]any{"type": "user", "promptSource": "queued", "timestamp": before.Add(30 * time.Millisecond).Format(time.RFC3339Nano),
+		"message": map[string]any{"content": StalledText}})
+	v.add(map[string]any{"type": "user", "timestamp": before.Add(500 * time.Millisecond).Format(time.RFC3339Nano),
+		"message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "[Request interrupted by user]"}}}})
+	if found, interrupted, err := claude.Prompted(v.path, fi.Size(), StalledText); !found || !interrupted.Equal(before) || err != nil {
+		t.Fatalf("an interruption before and one after: found %v interrupted %v %v", found, interrupted, err)
 	}
 	// Answered: a notice since the scan answers nothing; a reply does.
 	y := &transcript{t: t, path: filepath.Join(dir, "a.jsonl"), at: t0}
