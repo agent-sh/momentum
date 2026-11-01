@@ -145,12 +145,12 @@ func testSandbox(t *testing.T) Sandbox {
 		Path: []string{filepath.Join(env[0], "bin")}}
 }
 
-// testingCase is a case in testing whose evidence the signal zz-signal-text counts: four failed results.
+// testingCase is a case in testing whose evidence the signal zz-signal-text counts: six failed results.
 func testingCase(t *testing.T, st *store.Store) store.Case {
 	t.Helper()
 	ctx := context.Background()
 	var evs []store.Event
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 6; i++ {
 		evs = append(evs, store.Event{Source: store.Transcripts, SourceKey: fmt.Sprintf("s%d@%d", i%2, i), TS: time.Now().Add(-time.Duration(i+1) * time.Hour),
 			Session: fmt.Sprint("s", i%2), Harness: "claude", Actor: store.ActorTool, Kind: "tool_result", Tool: "Bash",
 			Summary: "Exit code 1 zz-signal-text: the thing broke", Meta: `{"is_error":true}`})
@@ -247,7 +247,7 @@ func TestAChangeShipsOnlyThroughItsPackage(t *testing.T) {
 	t.Setenv("GIT_COMMITTER_NAME", "Someone Else")
 	t.Setenv("EMAIL", "someone@example.com")
 	t.Setenv("GIT_DIR", filepath.Join(t.TempDir(), "elsewhere")) // git's own variables do not point the ship tool elsewhere
-	if p, err = s.Propose(ctx, c.ID, pr); err != nil || p.State != Proposed || p.PR != "https://github.com/agent-sh/fake/pull/7" || p.Plan.Before != 4 {
+	if p, err = s.Propose(ctx, c.ID, pr); err != nil || p.State != Proposed || p.PR != "https://github.com/agent-sh/fake/pull/7" || p.Plan.Before != 6 {
 		t.Fatalf("propose: %+v %v", p, err)
 	}
 	if who := run(t, p.Work, "git", "log", "-1", "--format=%an <%ae> / %cn <%ce>"); strings.TrimSpace(who) != "Owner Name <owner@example.com> / Owner Name <owner@example.com>" {

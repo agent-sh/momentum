@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/measure"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -103,6 +104,7 @@ type Plan struct {
 	Signal Signal        `json:"signal"`
 	Window time.Duration `json:"window"`
 	Before int           `json:"before"` // the signal's count over the window before the proposal
+	At     time.Time     `json:"at"`     // when it was counted: the window before ends here
 }
 
 // Signal is a deterministic filter of the store's events: of a source and kinds, of a tool and a harness when
@@ -441,8 +443,8 @@ type Proposal struct {
 }
 
 // MinSignal is the least the measurement's signal must count over the window before the change: below it, no
-// window could show the change helped.
-const MinSignal = 3
+// window could show the change helped (measure.MinBefore).
+const MinSignal = measure.MinBefore
 
 // Propose makes the checked change a proposal: it checks the measurement plan against the case's own evidence,
 // commits the change as the user, checks the gate on the committed tree, pushes the branch and opens its pull
@@ -491,7 +493,7 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package
 	if err != nil {
 		return p, err
 	}
-	p.Plan, p.Rollback, p.Title, p.Body, p.Lesson, p.Changed = &Plan{Signal: pr.Signal, Window: pr.Window, Before: before}, pr.Rollback,
+	p.Plan, p.Rollback, p.Title, p.Body, p.Lesson, p.Changed = &Plan{Signal: pr.Signal, Window: pr.Window, Before: before, At: s.now()}, pr.Rollback,
 		title, body, pr.Lesson, paths
 	// the commit first, so the work tree is clean when the scope check looks at every work tree of the repository
 	if head, err := s.git(ctx, p.Work, "rev-parse", "HEAD^{tree}"); err != nil || strings.TrimSpace(head) != tree {

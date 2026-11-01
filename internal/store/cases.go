@@ -1241,6 +1241,72 @@ func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, 
 	return c, tx.Commit()
 }
 
+// StartMeasuring is the measure tool's: a deployed case goes to measuring, with its measurement's window and the
+// signal's count over the window before its change, which the window after it is compared with.
+func (s *Store) StartMeasuring(ctx context.Context, id string, window time.Duration, before int, actor string) (Case, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Case{}, err
+	}
+	defer tx.Rollback()
+	c, err := getCase(ctx, tx, id)
+	if err != nil {
+		return Case{}, err
+	}
+	switch {
+	case c.Status != CaseDeployed:
+		return Case{}, badCase("case %s is %s: only a deployed case is measured", c.ID, c.Status)
+	case window <= 0 || before < 0:
+		return Case{}, badCase("a measurement needs its window and the count before its change")
+	}
+	now := time.Now()
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, window_ms = ?, before_n = ?, updated = ? WHERE id = ?`,
+		CaseMeasuring, window.Milliseconds(), before, now.UnixMilli(), c.ID); err != nil {
+		return Case{}, err
+	}
+	if err := caseLog(ctx, tx, c.ID, actor, "measuring", fmt.Sprintf("%d in the %s before its change; the %s after it is due %s", before,
+		days(window), days(window), c.Deployed.Add(window).Format(time.DateTime)), now); err != nil {
+		return Case{}, err
+	}
+	if c, err = getCase(ctx, tx, c.ID); err != nil {
+		return Case{}, err
+	}
+	return c, tx.Commit()
+}
+
+// CloseMeasured is the measure tool's: a measuring case whose change measurably helped closes as improved, with
+// its count after the change and the effect in words. Its old rate brings it back (comesBack).
+func (s *Store) CloseMeasured(ctx context.Context, id string, after int, effect, actor string) (Case, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Case{}, err
+	}
+	defer tx.Rollback()
+	c, err := getCase(ctx, tx, id)
+	if err != nil {
+		return Case{}, err
+	}
+	switch {
+	case c.Status != CaseMeasuring:
+		return Case{}, badCase("case %s is %s: only a measuring case closes as improved", c.ID, c.Status)
+	case strings.TrimSpace(effect) == "" || after < 0:
+		return Case{}, badCase("an improvement closes with its count after the change and its effect")
+	}
+	now := time.Now()
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, reason = ?, closed = ?, updated = ?, after_n = ?, effect = ?,
+	  closed_evidence = (SELECT COUNT(*) FROM case_evidence WHERE case_id = ?) WHERE id = ?`,
+		CaseClosed, string(Improved), now.UnixMilli(), now.UnixMilli(), after, caseText(effect, caseTextMax), c.ID, c.ID); err != nil {
+		return Case{}, err
+	}
+	if err := caseLog(ctx, tx, c.ID, actor, "closed", string(Improved)+": "+effect, now); err != nil {
+		return Case{}, err
+	}
+	if c, err = getCase(ctx, tx, c.ID); err != nil {
+		return Case{}, err
+	}
+	return c, tx.Commit()
+}
+
 // CaseNote logs a line on a case for a tool that changes nothing of its own: the ship tool's steps before it
 // deploys (prepared, checked, proposed, reviewed), the runner's runs.
 func (s *Store) CaseNote(ctx context.Context, id, action, detail, actor string) error {
