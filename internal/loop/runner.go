@@ -115,6 +115,10 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 			r.logf("swept %s: %s", c.ID, c.Title)
 		}
 	}
+	measured, err := r.Measure(ctx, o.Dry)
+	if err != nil {
+		return nil, err
+	}
 	families := r.Families
 	if len(o.Families) > 0 {
 		families = o.Families
@@ -131,6 +135,11 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		starts []reserved
 		picked error
 	)
+	for _, m := range measured {
+		if o.Case == "" || m.Case == o.Case {
+			done = append(done, Done{Family: "", Case: m.Case, Step: "measure", Skipped: strings.TrimSpace(m.Status + " " + m.Why)})
+		}
+	}
 	building := false
 	for _, fam := range families {
 		c, step, why, err := r.pick(ctx, fam, o.Case, o.Dry)
@@ -602,11 +611,14 @@ func (r *Runner) reviews(ctx context.Context, only string, families ...string) [
 			}
 		}
 		if p.Clean() {
-			if _, err := r.Ship.Land(ctx, c.ID); err != nil {
+			if lp, err := r.Ship.Land(ctx, c.ID); err != nil {
 				out = append(out, Done{Family: c.Family, Case: c.ID, Step: "land", Skipped: err.Error()})
 				r.Store.CaseNote(ctx, c.ID, "not landed", err.Error(), "loop")
 			} else {
 				out = append(out, Done{Family: c.Family, Case: c.ID, Step: "land"})
+				r.note(ctx, store.Note{Kind: store.NoteDecided, Title: plainClip("momentum landed a change for: "+c.Title, store.TitleMax),
+					Detail: fmt.Sprintf("Reviewed clean and landed; measured over the %s after it. To undo it: momentum ship rollback %s --why ...",
+						days(lp.Plan.Window), c.ID), Links: prLinks(lp.PR)})
 			}
 			continue
 		}
