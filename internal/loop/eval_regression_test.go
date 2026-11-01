@@ -476,6 +476,41 @@ func TestEveryTrialReadsTheSameHistoricalRepositories(t *testing.T) {
 	}
 }
 
+// A repository with no commit by a trial's end of store did not exist yet: the trial runs without it.
+func TestATrialRunsWithoutARepositoryThatDidNotExistYet(t *testing.T) {
+	e, task := evalFixture(t)
+	dir := t.TempDir()
+	end, _ := e.snapshotEnd(context.Background(), task)
+	var repos []string
+	for i, at := range []time.Time{end.Add(-time.Hour), end.Add(time.Hour)} {
+		src := filepath.Join(dir, fmt.Sprint("src", i))
+		run(t, dir, "git", "init", "-q", "-b", "main", src)
+		t.Setenv("GIT_AUTHOR_DATE", at.Format(time.RFC3339))
+		t.Setenv("GIT_COMMITTER_DATE", at.Format(time.RFC3339))
+		write(t, filepath.Join(src, "file"), "first")
+		run(t, src, "git", "add", "file")
+		run(t, src, "git", "commit", "-qm", "first")
+		repos = append(repos, src)
+	}
+	e.Repositories = repos
+	task.RepoPath, task.PreFix = repos[1], strings.TrimSpace(run(t, repos[1], "git", "rev-parse", "HEAD"))
+	trs, err := e.Run(context.Background(), []GoldenTask{task})
+	if err != nil || len(trs) != 2 {
+		t.Fatalf("%d %v", len(trs), err)
+	}
+	for _, tr := range trs {
+		if tr.Err != "" {
+			t.Fatalf("a repository born after the end of store failed the trial: %s", tr.Err)
+		}
+		if _, err := os.Stat(filepath.Join(tr.Run.Dir, "repo-1")); err != nil {
+			t.Fatalf("the repository that existed: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(tr.Run.Dir, "repo-2")); !os.IsNotExist(err) {
+			t.Fatalf("a repository born after the end of store was cloned: %v", err)
+		}
+	}
+}
+
 // The scheduler starts both arms of a task before the next task, then repeats the same k.
 func TestEvaluationJobsInterleaveTrialTaskAndArm(t *testing.T) {
 	e, a := evalFixture(t)

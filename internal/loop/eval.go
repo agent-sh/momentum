@@ -479,31 +479,33 @@ func evalGit(ctx context.Context, args ...string) *exec.Cmd {
 	return cmd
 }
 
-// cloneRepositories gives every trial the same repository set, with no hint of which one changed.
+// cloneRepositories gives every trial the same repository set, with no hint of which one changed: each repository
+// as its default branch stood at the trial's end of store (t.Cutoff by then), the fix's own repository too, since
+// its fix came after. A repository with no commit by then did not exist yet and is left out.
 func (e *Eval) cloneRepositories(ctx context.Context, t GoldenTask, dir string) ([]string, error) {
 	var out []string
 	for i, src := range e.Repositories {
-		commit := t.PreFix
-		if src != t.RepoPath || commit == "" {
-			ref, err := evalGit(ctx, "-C", src, "symbolic-ref", "refs/remotes/origin/HEAD").Output()
-			if err != nil {
-				for _, branch := range []string{"refs/heads/main", "refs/heads/master"} {
-					if _, checkErr := evalGit(ctx, "-C", src, "show-ref", "--verify", branch).Output(); checkErr == nil {
-						ref = []byte(branch)
-						err = nil
-						break
-					}
+		ref, err := evalGit(ctx, "-C", src, "symbolic-ref", "refs/remotes/origin/HEAD").Output()
+		if err != nil {
+			for _, branch := range []string{"refs/heads/main", "refs/heads/master"} {
+				if _, checkErr := evalGit(ctx, "-C", src, "show-ref", "--verify", branch).Output(); checkErr == nil {
+					ref = []byte(branch)
+					err = nil
+					break
 				}
 			}
-			if err != nil {
-				return nil, fmt.Errorf("default branch: %w", err)
-			}
-			before := time.Unix(t.Cutoff.Add(-time.Nanosecond).Unix(), 0)
-			raw, err := evalGit(ctx, "-C", src, "rev-list", "-1", "--before="+before.Format(time.RFC3339), strings.TrimSpace(string(ref)), "--").Output()
-			if err != nil || len(strings.TrimSpace(string(raw))) == 0 {
-				return nil, fmt.Errorf("no default-branch commit before the cutoff: %s", src)
-			}
-			commit = strings.TrimSpace(string(raw))
+		}
+		if err != nil {
+			return nil, fmt.Errorf("default branch: %w", err)
+		}
+		before := time.Unix(t.Cutoff.Add(-time.Nanosecond).Unix(), 0)
+		raw, err := evalGit(ctx, "-C", src, "rev-list", "-1", "--before="+before.Format(time.RFC3339), strings.TrimSpace(string(ref)), "--").Output()
+		if err != nil {
+			return nil, fmt.Errorf("the default branch of %s: %w", src, err)
+		}
+		commit := strings.TrimSpace(string(raw))
+		if commit == "" {
+			continue // no commit by then: the repository did not exist yet
 		}
 		dst := filepath.Join(dir, fmt.Sprintf("repo-%d", i+1))
 		if err := cloneAsOf(ctx, src, commit, dst); err != nil {
