@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -24,7 +25,7 @@ import (
 // commands, which print nothing the secret scrubber has not passed: a record an event names, a file, a service's
 // state and log. Each refuses where credentials are kept.
 
-// readMax is the most of a record or a file these commands print.
+// readMax bounds a complete record and the retained output. Oversized records are withheld.
 const readMax = 256 << 10
 
 // scrubbed writes a text through the secret scrubber, or refuses to write it.
@@ -57,34 +58,44 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if !ok {
 		return usageError{fmt.Sprintf("the store holds no event %s", id)}
 	}
-	fmt.Fprintf(stdout, "%s %s %s %s %s %s\n  %s\n", e.TS.Local().Format("2006-01-02 15:04:05"), e.Source, e.Actor, e.Kind, e.Session,
+	var output strings.Builder
+	fmt.Fprintf(&output, "%s %s %s %s %s %s\n  %s\n", e.TS.Local().Format("2006-01-02 15:04:05"), e.Source, e.Actor, e.Kind, e.Session,
 		plain.Line(e.Tool), plain.Line(e.Summary))
 	path, off, ok := placeOf(e.Ref)
 	if !ok {
-		return nil
+		return scrubbed(ctx, stdout, output.String())
 	}
 	if why := secretPath(path); why != "" {
-		fmt.Fprintf(stdout, "  (its record is not shown: %s)\n", why)
-		return nil
+		fmt.Fprintf(&output, "  (its record is not shown: %s)\n", why)
+		return scrubbed(ctx, stdout, output.String())
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		fmt.Fprintf(stdout, "  (its record is gone: %v)\n", err)
-		return nil
+		output.WriteString("  (its record is gone)\n")
+		return scrubbed(ctx, stdout, output.String())
 	}
 	defer f.Close()
+	if off < 0 {
+		return usageError{"negative record offset"}
+	}
+	if off > 0 {
+		var prev [1]byte
+		if _, err := f.ReadAt(prev[:], off-1); err != nil || prev[0] != '\n' {
+			return usageError{"offset is not a record boundary"}
+		}
+	}
 	if _, err := f.Seek(off, io.SeekStart); err != nil {
 		return err
 	}
-	line, err := bufio.NewReaderSize(f, 1<<16).ReadSlice('\n')
-	if err != nil && err != bufio.ErrBufferFull && len(line) == 0 {
-		fmt.Fprintf(stdout, "  (its record cannot be read: %v)\n", err)
-		return nil
+	line, err := bufio.NewReaderSize(f, readMax+1).ReadSlice('\n')
+	if err == bufio.ErrBufferFull || len(line) > readMax {
+		output.WriteString("  (oversized record withheld)\n")
+	} else if err != nil && err != io.EOF {
+		return err
+	} else {
+		output.Write(line)
 	}
-	if len(line) > readMax {
-		line = line[:readMax]
-	}
-	return scrubbed(ctx, stdout, strings.ToValidUTF8(strings.TrimRight(string(line), "\n"), "?")+"\n")
+	return scrubbed(ctx, stdout, output.String())
 }
 
 // placeOf splits a reference (path@offset, with #index) into its file and the offset of its record.
@@ -168,24 +179,12 @@ func evidenceFile(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		return usageError{err.Error()}
 	}
 	defer f.Close()
-	if *tail > 0 && st.Size() > readMax {
-		f.Seek(st.Size()-readMax, io.SeekStart)
-	}
-	b, err := io.ReadAll(io.LimitReader(f, readMax))
+	text, err := scrubRecords(ctx, f, *tail)
 	if err != nil {
 		return err
 	}
-	text := strings.ToValidUTF8(string(b), "?")
-	if *tail > 0 {
-		lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
-		if len(lines) > *tail {
-			lines = lines[len(lines)-*tail:]
-		}
-		text = strings.Join(lines, "\n") + "\n"
-	} else if st.Size() > readMax {
-		text += fmt.Sprintf("\n(cut at %d of its %d bytes; --tail N reads its end)\n", readMax, st.Size())
-	}
-	return scrubbed(ctx, stdout, text)
+	_, err = io.WriteString(stdout, text)
+	return err
 }
 
 var unitRe = regexp.MustCompile(`^[A-Za-z0-9@._:-]{1,128}$`)
@@ -214,11 +213,66 @@ func evidenceUnit(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	n := min(max(*lines, 1), 2000)
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	status, _ := exec.CommandContext(cctx, "systemctl", "--user", "status", "--no-pager", "--lines=0", "--", unit).CombinedOutput()
-	log, _ := exec.CommandContext(cctx, "journalctl", "--user", "--no-pager", "-o", "short-iso", "-n", strconv.Itoa(n), "-u", unit).CombinedOutput()
-	text := string(status) + "\n" + string(log)
-	if len(text) > readMax {
-		text = text[len(text)-readMax:]
+	var output bytes.Buffer
+	capture := &capped{w: &output, n: readMax + 1}
+	for _, args := range [][]string{
+		{"systemctl", "--user", "status", "--no-pager", "--lines=0", "--", unit},
+		{"journalctl", "--user", "--no-pager", "-o", "short-iso", "-n", strconv.Itoa(n), "-u", unit},
+	} {
+		cmd := exec.CommandContext(cctx, args[0], args[1:]...)
+		cmd.Stdout, cmd.Stderr = capture, capture
+		_ = cmd.Run()
 	}
-	return scrubbed(ctx, stdout, strings.ToValidUTF8(text, "?"))
+	if output.Len() > readMax {
+		return usageError{"unit output exceeds the record limit; narrow the command"}
+	}
+	return scrubbed(ctx, stdout, strings.ToValidUTF8(output.String(), "?"))
+}
+
+// scrubRecords withholds oversized records. Selection happens only after each complete record is scrubbed.
+// Output stays bounded and nothing is emitted if any scrub fails.
+func scrubRecords(ctx context.Context, input io.Reader, tail int) (string, error) {
+	r := bufio.NewReaderSize(input, readMax+1)
+	var lines []string
+	size := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		record, err := r.ReadSlice('\n')
+		if err == bufio.ErrBufferFull || len(record) > readMax {
+			for err == bufio.ErrBufferFull {
+				_, err = r.ReadSlice('\n')
+			}
+			record = []byte("(oversized record withheld)\n")
+		}
+		if err != nil && err != io.EOF {
+			return "", err
+		}
+		if len(record) > 0 {
+			clean, e := loop.Redact(ctx, strings.ToValidUTF8(string(record), "?"))
+			if e != nil {
+				return "", e
+			}
+			if len(clean) > readMax {
+				clean = "(oversized scrubbed record withheld)\n"
+			}
+			if tail <= 0 && size+len(clean) > readMax {
+				break
+			}
+			lines = append(lines, clean)
+			size += len(clean)
+			for len(lines) > 0 && (size > readMax || tail > 0 && len(lines) > tail) {
+				size -= len(lines[0])
+				lines = lines[1:]
+			}
+			if tail <= 0 && size >= readMax {
+				break
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+	}
+	return strings.Join(lines, ""), nil
 }

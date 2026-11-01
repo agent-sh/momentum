@@ -37,7 +37,7 @@ func Redact(ctx context.Context, text string) (string, error) {
 	var out, errOut bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errOut
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("%w: %v: %s", ErrNoScrubber, err, strings.TrimSpace(errOut.String()))
+		return "", fmt.Errorf("%w: %v", ErrNoScrubber, err)
 	}
 	return out.String(), nil
 }
@@ -46,12 +46,18 @@ var (
 	// mentionRe is a GitHub mention: an @ that opens a word, not one inside an address.
 	mentionRe = regexp.MustCompile(`(^|[^\w.@/-])@([A-Za-z0-9][\w-]*)`)
 	// refRe is a reference GitHub links and writes back into the issue it names: owner/repo#N, #N, GH-N.
-	refRe = regexp.MustCompile(`(?i)(^|[^\w/&])((?:[\w.-]+/[\w.-]+)?#|gh-)(\d+)`)
+	urlRefRe = regexp.MustCompile(`(?i)(?:https?://|//)(?:www\.)?github\.com/[^\s<>"()]+`)
+	refRe    = regexp.MustCompile(`(?i)(^|[^\w/&])((?:[\w.-]+/[\w.-]+)?#|gh-)(\d+)`)
 )
 
 // Neutral is a text in which no mention pages anyone and no reference writes into another issue: a zero-width
 // space after each @ and #, which GitHub renders unseen and does not read as a mention or a link.
 func Neutral(text string) string {
+	// Break the host of GitHub URLs, including encoded paths and Markdown destinations.
+	text = urlRefRe.ReplaceAllStringFunc(text, func(url string) string {
+		i := strings.Index(strings.ToLower(url), "github.com")
+		return url[:i] + "github[.]com" + url[i+len("github.com"):]
+	})
 	text = mentionRe.ReplaceAllString(text, "$1@\u200b$2")
 	return refRe.ReplaceAllString(text, "$1$2\u200b$3")
 }

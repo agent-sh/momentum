@@ -45,7 +45,7 @@ type LoopRun struct {
 	ID, Case, Family, Step string
 	Started, Ended         time.Time
 	Status, Failure        string
-	USD                    float64
+	USD                    float64 // reservation while running; charged cost after completion
 	Tokens                 int64
 	Turns                  int
 	Model, Dir, Summary    string
@@ -138,9 +138,92 @@ func (s *Store) LoopRuns(ctx context.Context, f RunFilter) ([]LoopRun, error) {
 // LoopSpend is what the live runs that started since a time spent, in US dollars. A run still running counts its
 // budget in full (reserved), since what it spends is known only when it ends.
 func (s *Store) LoopSpend(ctx context.Context, since time.Time, reserved float64) (float64, error) {
-	var spent, running float64
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN status = ? THEN 0 ELSE cost_usd END), 0),
-	  COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) FROM loop_runs WHERE experiment = '' AND started >= ?`,
-		RunRunning, RunRunning, since.UnixMilli()).Scan(&spent, &running)
-	return spent + running*reserved, err
+	var spent float64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN status = ? AND cost_usd = 0 THEN ? ELSE cost_usd END), 0)
+ FROM loop_runs WHERE experiment = '' AND started >= ?`, RunRunning, reserved, since.UnixMilli()).Scan(&spent)
+	return spent, err
+}
+
+// FinishLoopRun ends a reservation and charges its canonical case in one transaction, exactly once.
+func (s *Store) FinishLoopRun(ctx context.Context, r LoopRun) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var id, status string
+	var started int64
+	if err := tx.QueryRowContext(ctx, `SELECT case_id, status, started FROM loop_runs WHERE id = ?`, r.ID).Scan(&id, &status, &started); err != nil {
+		return err
+	}
+	if status != RunRunning {
+		return nil
+	}
+	if r.Status == RunRunning || r.Ended.IsZero() || r.USD < 0 {
+		return fmt.Errorf("invalid run completion")
+	}
+	c, err := live(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET cost_usd = cost_usd + ?, cost_tokens = cost_tokens + ?, cost_ms = cost_ms + ?,
+ runs = runs + 1, updated = ? WHERE id = ?`, r.USD, r.Tokens, max(int64(0), r.Ended.UnixMilli()-started), r.Ended.UnixMilli(), c.ID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE loop_runs SET ended = ?, status = ?, failure = ?, cost_usd = ?, tokens = ?, turns = ?, model = ?, summary = ? WHERE id = ?`,
+		r.Ended.UnixMilli(), r.Status, caseText(r.Failure, 400), r.USD, r.Tokens, r.Turns, r.Model, caseText(r.Summary, caseTextMax), r.ID); err != nil {
+		return err
+	}
+	if err := caseLog(ctx, tx, c.ID, "loop:"+r.ID, "run", r.Step+" "+r.ID+": "+r.Status+" "+r.Failure+" "+r.Summary, r.Ended); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// Lesson states on a case's log: the text reserved before tacit's write, and the receipt after it.
+const (
+	LessonReserved  = "publishing"
+	LessonPublished = "published"
+)
+
+// BeginLesson reserves a case's lesson before tacit's write, and returns the text to write: the one reserved first,
+// so a write tried again after one that failed partway writes the same lesson (tacit takes the same name and text
+// as the same fact). ok is false when the lesson is published already.
+func (s *Store) BeginLesson(ctx context.Context, id, text string) (string, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", false, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT action, detail FROM case_log WHERE case_id = ? AND action IN (?, ?) ORDER BY seq`, id,
+		LessonReserved, LessonPublished)
+	if err != nil {
+		return "", false, err
+	}
+	reserved := ""
+	for rows.Next() {
+		var action, detail string
+		if err := rows.Scan(&action, &detail); err != nil {
+			rows.Close()
+			return "", false, err
+		}
+		if action == LessonPublished {
+			rows.Close()
+			return "", false, nil
+		}
+		if reserved == "" {
+			reserved = detail
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return "", false, err
+	}
+	if reserved != "" {
+		return reserved, true, nil
+	}
+	if err := caseLog(ctx, tx, id, "loop", LessonReserved, text, time.Now()); err != nil {
+		return "", false, err
+	}
+	return caseText(text, caseTextMax), true, tx.Commit()
 }

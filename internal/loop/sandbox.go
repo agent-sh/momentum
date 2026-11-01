@@ -71,12 +71,9 @@ type Outcome struct {
 	Tail    string  `json:"tail"` // the end of what it printed
 }
 
-// Sandbox runs a test in a bubblewrap sandbox, every namespace its own and no capability: the root file system
-// read-only, with its own /tmp and /run (no socket of the user's session, his agent or a daemon is there) and his
-// home empty but for the toolchains it reads (ReadOnly); the tree under test, its scratch directory and the loop's
-// own build caches writable, the tree's .git read-only; no network; its own process tree, which ends with it. A
-// test of a change the loop made can then write nothing outside its tree, reach no service, and read none of the
-// user's files.
+// Sandbox runs a test in an empty bubblewrap root with explicit runtime and toolchain mounts.
+// Its namespaces and caches are its own. Only the test tree and scratch are writable.
+// Host paths and their sockets are absent unless admitted as runtime or toolchain mounts.
 type Sandbox struct {
 	Bwrap    string        // the bubblewrap binary
 	Home     string        // the user's home, which the test sees empty
@@ -114,14 +111,15 @@ func (s Sandbox) Run(ctx context.Context, dir string, words []string, env []stri
 	}
 	defer os.RemoveAll(scratch)
 	args := []string{"--unshare-all", "--die-with-parent", "--new-session", "--cap-drop", "ALL",
-		"--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run", "--tmpfs", "/var/tmp"}
-	if s.Home != "" {
-		args = append(args, "--tmpfs", s.Home)
-		for _, d := range s.ReadOnly {
-			if st, err := os.Stat(d); err == nil && st.IsDir() {
-				args = append(args, "--ro-bind", d, d)
-			}
+		"--tmpfs", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run", "--tmpfs", "/var/tmp"}
+	// Only runtime and explicitly admitted toolchains exist in the empty root.
+	for _, d := range append([]string{"/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/ld.so.cache", "/etc/alternatives"}, s.ReadOnly...) {
+		if _, err := os.Stat(d); err == nil {
+			args = append(args, "--ro-bind", d, d)
 		}
+	}
+	if s.Home != "" {
+		args = append(args, "--dir", s.Home)
 	}
 	args = append(args, "--bind", dir, dir, "--bind", scratch, scratch)
 	if st, err := os.Lstat(filepath.Join(dir, ".git")); err == nil && !st.IsDir() {

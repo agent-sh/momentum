@@ -553,8 +553,7 @@ func TestTheSandboxKeepsATestInItsTree(t *testing.T) {
 		t.Skip("no python3 here")
 	}
 	sb := testSandbox(t)
-	cache, _ := os.UserCacheDir()
-	home, err := os.MkdirTemp(cache, "momentum-sandbox-test-") // a home of the test's own, outside /tmp, with a file of his in it
+	home, err := os.MkdirTemp("", "home-") // a home of the test's own, outside /tmp, with a file of his in it
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -564,11 +563,21 @@ func TestTheSandboxKeepsATestInItsTree(t *testing.T) {
 	write(t, filepath.Join(tree, ".git"), "gitdir: /x\n")
 	outside := t.TempDir()
 	sock := filepath.Join(outside, "s.sock")
-	l, err := net.Listen("unix", sock)
+	socketDir, err := os.Open(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socketDir.Close()
+	l, err := net.Listen("unix", fmt.Sprintf("/proc/self/fd/%d/s.sock", socketDir.Fd()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer l.Close()
+	control, err := net.Dial("unix", fmt.Sprintf("/proc/self/fd/%d/s.sock", socketDir.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	control.Close()
 	tcp, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -579,9 +588,12 @@ func TestTheSandboxKeepsATestInItsTree(t *testing.T) {
 	probe := fmt.Sprintf(`
 import os, socket, sys
 bad = []
+cwd = os.getcwd()
 try:
-    s = socket.socket(socket.AF_UNIX); s.connect(%q); bad.append("unix socket")
+    os.chdir(%q)
+    s = socket.socket(socket.AF_UNIX); s.connect("s.sock"); bad.append("unix socket")
 except OSError: pass
+finally: os.chdir(cwd)
 try:
     s = socket.create_connection(("127.0.0.1", %d), timeout=2); bad.append("network")
 except OSError: pass
@@ -598,7 +610,7 @@ for k in ("DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK"):
 if os.environ.get("HOME") != %q: bad.append("HOME is " + os.environ.get("HOME", ""))
 open("inside.txt", "w").write("ok")
 print(" ".join(bad)); sys.exit(1 if bad else 0)
-`, sock, tcp.Addr().(*net.TCPAddr).Port, filepath.Join(outside, "x"), secret, sb.Home)
+`, outside, tcp.Addr().(*net.TCPAddr).Port, filepath.Join(outside, "x"), secret, sb.Home)
 	t.Setenv("SSH_AUTH_SOCK", sock)
 	o, err := sb.Run(context.Background(), tree, []string{"python3", "-c", probe}, nil)
 	if err != nil || o.Exit != 0 {

@@ -49,6 +49,7 @@ const (
 	Prepared   = "prepared"
 	Checked    = "checked"
 	Proposed   = "proposed"
+	Landing    = "landing"
 	Revising   = "revising" // a review found something: back to its build, on the same branch and pull request
 	Landed     = "landed"
 	RolledBack = "rolled back"
@@ -59,28 +60,29 @@ const MaxRounds = 3
 
 // Package is a case's change: where it goes, what checks it, how it is measured and undone, and where it stands.
 type Package struct {
-	Case     string    `json:"case"`
-	Kind     string    `json:"kind"` // repo
-	Repo     string    `json:"repo,omitempty"`
-	Base     string    `json:"base,omitempty"`
-	Branch   string    `json:"branch,omitempty"`
-	Dir      string    `json:"dir"`  // the repository's main checkout
-	Work     string    `json:"work"` // the loop's work tree
-	State    string    `json:"state"`
-	Check    *Check    `json:"check,omitempty"`
-	Plan     *Plan     `json:"plan,omitempty"`
-	Rollback string    `json:"rollback,omitempty"`
-	Title    string    `json:"title,omitempty"`
-	Body     string    `json:"body,omitempty"`
-	Lesson   string    `json:"lesson,omitempty"`
-	PR       string    `json:"pr,omitempty"`
-	Head     string    `json:"head,omitempty"` // the commit proposed
-	Reviews  []Review  `json:"reviews,omitempty"`
-	Landed   []string  `json:"landed,omitempty"` // the commits that went in
-	LandedAt time.Time `json:"landed_at,omitempty"`
-	Changed  []string  `json:"changed,omitempty"` // the paths the change touches
-	Created  time.Time `json:"created"`
-	Updated  time.Time `json:"updated"`
+	Case        string    `json:"case"`
+	Kind        string    `json:"kind"` // repo
+	Repo        string    `json:"repo,omitempty"`
+	Base        string    `json:"base,omitempty"`
+	Branch      string    `json:"branch,omitempty"`
+	Dir         string    `json:"dir"`  // the repository's main checkout
+	Work        string    `json:"work"` // the loop's work tree
+	State       string    `json:"state"`
+	Check       *Check    `json:"check,omitempty"`
+	Plan        *Plan     `json:"plan,omitempty"`
+	Rollback    string    `json:"rollback,omitempty"`
+	Title       string    `json:"title,omitempty"`
+	Body        string    `json:"body,omitempty"`
+	Lesson      string    `json:"lesson,omitempty"`
+	PR          string    `json:"pr,omitempty"`
+	LandingHead string    `json:"landing_head,omitempty"`
+	Head        string    `json:"head,omitempty"` // the commit proposed
+	Reviews     []Review  `json:"reviews,omitempty"`
+	Landed      []string  `json:"landed,omitempty"` // the commits that went in
+	LandedAt    time.Time `json:"landed_at,omitempty"`
+	Changed     []string  `json:"changed,omitempty"` // the paths the change touches
+	Created     time.Time `json:"created"`
+	Updated     time.Time `json:"updated"`
 }
 
 // Check is the evidence that a test discriminates the change: it fails on the code without the change (the
@@ -343,7 +345,7 @@ func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []strin
 		if err != nil {
 			return p, err
 		}
-		if err := writeFile(filepath.Join(before, f), []byte(b)); err != nil {
+		if err := writeTest(before, f, []byte(b)); err != nil {
 			return p, err
 		}
 	}
@@ -559,7 +561,7 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 // editsSignal refuses a change that edits the texts its own measurement counts: a change of words that only stops
 // the signal from matching would measure as a fix. It reads the lines the change removes, hunk by hunk.
 func (s *Ship) editsSignal(ctx context.Context, p Package, sig Signal) error {
-	diff, err := s.git(ctx, p.Work, "diff", "--cached", "--no-renames", "--no-ext-diff", "--no-textconv", "-U0", "origin/"+p.Base)
+	diff, err := s.git(ctx, p.Work, "diff", "--cached", "--no-renames", "--no-ext-diff", "--no-textconv", "--text", "-U0", "origin/"+p.Base)
 	if err != nil {
 		return err
 	}
@@ -633,7 +635,7 @@ func (s *Ship) Reviewed(ctx context.Context, caseID string, r Review) (Package, 
 	}
 	r.Round, r.At, r.Head = len(p.Reviews)+1, s.now(), p.Head
 	p.Reviews = append(p.Reviews, r)
-	if (r.High > 0 || r.Medium > 0) && len(p.Reviews) < MaxRounds {
+	if r.Comment != "" && (r.High > 0 || r.Medium > 0) && len(p.Reviews) < MaxRounds {
 		p.State = Revising
 	}
 	if err := s.save(&p); err != nil {
@@ -675,6 +677,42 @@ func (p Package) Clean() bool {
 // the user's own identity (prs.md), so GitHub marks the pull request merged. The case is then deployed.
 func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	p, ok, err := s.Load(caseID)
+	if err == nil && ok && p.State == Landing {
+		if !s.Live {
+			return p, refused("the loop is not live")
+		}
+		if err := s.ownTree(p); err != nil {
+			return p, err
+		}
+		// Restore only this package's interrupted operation before the clean-tree scope check.
+		_, _ = s.git(ctx, p.Work, "rebase", "--abort")
+		if _, err := s.git(ctx, p.Work, "reset", "--hard", p.Head); err != nil {
+			return p, err
+		}
+		if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
+			return p, err
+		}
+		if _, err := s.git(ctx, p.Work, "fetch", "--quiet", "origin", p.Base); err != nil {
+			return p, err
+		}
+		if p.LandingHead != "" {
+			if _, err := s.git(ctx, p.Work, "merge-base", "--is-ancestor", p.LandingHead, "origin/"+p.Base); err == nil {
+				p.Head, p.State, p.LandedAt = p.LandingHead, Landed, s.now()
+				if err := s.save(&p); err != nil {
+					return p, err
+				}
+				_, err := s.Store.DeployCase(ctx, p.Case, s.pkgDir(p.Case), p.LandedAt, p.PR+": "+p.Title, s.Actor)
+				return p, err
+			}
+		}
+		if _, err := s.git(ctx, p.Work, "reset", "--hard", p.Head); err != nil {
+			return p, err
+		}
+		p.State, p.LandingHead = Proposed, ""
+		if err := s.save(&p); err != nil {
+			return p, err
+		}
+	}
 	switch {
 	case err != nil:
 		return Package{}, err
@@ -706,6 +744,22 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	if _, err := s.git(ctx, p.Work, "fetch", "--quiet", "origin", p.Base); err != nil {
 		return p, err
 	}
+	p.State = Landing
+	if err := s.save(&p); err != nil {
+		return p, err
+	}
+	basePush := false
+	complete := false
+	defer func() {
+		if complete || basePush {
+			return
+		}
+		if _, err := s.git(context.Background(), p.Work, "reset", "--hard", p.Head); err != nil {
+			return
+		}
+		p.State, p.LandingHead = Proposed, ""
+		_ = s.save(&p)
+	}()
 	if _, err := s.git(ctx, p.Work, "rebase", "origin/"+p.Base); err != nil {
 		s.git(context.Background(), p.Work, "rebase", "--abort")
 		return p, refused("the change does not rebase on %s: %v", p.Base, err)
@@ -735,17 +789,23 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	if err != nil {
 		return p, err
 	}
+	p.LandingHead, p.Landed = head, strings.Fields(commits)
+	if err := s.save(&p); err != nil {
+		return p, err
+	}
 	if head != p.Head { // the pull request's head is what reaches the base, so GitHub marks it merged
 		if _, err := s.git(ctx, p.Work, "push", "--no-verify", "--force-with-lease", "origin", "HEAD:refs/heads/"+p.Branch); err != nil {
 			return p, err
 		}
 	}
+	basePush = true
 	if _, err := s.git(ctx, p.Work, "push", "--no-verify", "origin", "HEAD:refs/heads/"+p.Base); err != nil {
 		return p, refused("the push to %s did not go as a fast-forward: %v", p.Base, err)
 	}
 	s.git(ctx, p.Work, "push", "--no-verify", "--quiet", "origin", "--delete", p.Branch)
 	p.Landed, p.Head = strings.Fields(commits), head
 	p.State, p.LandedAt = Landed, s.now()
+	complete = true
 	if err := s.save(&p); err != nil {
 		return p, err
 	}
@@ -810,12 +870,15 @@ func (s *Ship) commit(ctx context.Context, dir, msg string) error {
 // monitor, no external diff, and the user's identity for every commit it writes (a commit, a rebase, a revert),
 // whatever the repository's configuration or the environment say.
 func (s *Ship) git(ctx context.Context, dir string, args ...string) (string, error) {
+	if err := CheckGitFilters(ctx, dir); err != nil {
+		return "", err
+	}
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	full := append([]string{"-C", dir, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "diff.external=",
 		"-c", "commit.gpgsign=false", "-c", "user.name=" + s.Identity[0], "-c", "user.email=" + s.Identity[1]}, args...)
 	cmd := exec.CommandContext(cctx, "git", full...)
-	cmd.Env = append(noGitEnv(), "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_AUTHOR_NAME="+s.Identity[0], "GIT_AUTHOR_EMAIL="+s.Identity[1],
+	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_AUTHOR_NAME="+s.Identity[0], "GIT_AUTHOR_EMAIL="+s.Identity[1],
 		"GIT_COMMITTER_NAME="+s.Identity[0], "GIT_COMMITTER_EMAIL="+s.Identity[1])
 	var errOut bytes.Buffer
 	cmd.Stderr = &errOut
@@ -909,4 +972,53 @@ func wrap(s string) string {
 		out = append(out, strings.Join(lines, "\n"))
 	}
 	return strings.Join(out, "\n\n")
+}
+
+// CheckGitFilters refuses repositories with external transformations before an unsandboxed Git operation.
+// Only names are read. Driver commands and their environment never run.
+func CheckGitFilters(ctx context.Context, dir string) error {
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "git", "-C", dir, "config", "--name-only", "--get-regexp", `^(filter\..*\.(clean|smudge|process)|merge\..*\.driver)$`)
+	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
+	out, err := cmd.Output()
+	if len(bytes.TrimSpace(out)) > 0 {
+		return refused("external Git filters or merge drivers are configured")
+	}
+	var ee *exec.ExitError
+	if err != nil && !(errors.As(err, &ee) && ee.ExitCode() == 1) {
+		return fmt.Errorf("inspect Git filter names: %w", err)
+	}
+	return nil
+}
+
+// writeTest refuses links in the base export. Root confines the write even if a component changes.
+func writeTest(dir, name string, data []byte) error {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	parts := strings.Split(filepath.ToSlash(name), "/")
+	for i := range parts {
+		part := filepath.Join(parts[:i+1]...)
+		st, err := root.Lstat(part)
+		if err == nil && st.Mode()&os.ModeSymlink != 0 {
+			return refused("base test path contains a symlink: %s", name)
+		}
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		if i < len(parts)-1 && errors.Is(err, fs.ErrNotExist) {
+			if err := root.Mkdir(part, 0o700); err != nil {
+				return err
+			}
+		}
+	}
+	f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	return errors.Join(err, f.Close())
 }
