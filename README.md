@@ -157,7 +157,7 @@ A case is one answer in progress to a standing question: its family, its evidenc
 momentum loop [--dry] [--family F,F] [--case ID] [--json]
 momentum loop runs [--since WHEN] [--case ID] [--json]
 momentum loop lesson --case ID --text T
-momentum measure [--dry] [--json]
+momentum measure [--dry] [--family F,F] [--case ID] [--json]
 momentum ship prepare|check|propose|status|land|rollback ...
 ```
 
@@ -165,7 +165,7 @@ The improvement loop takes each family's case one step a run: investigate it, bu
 
 Inside a run, everything momentum prints is scrubbed whole before the run reads it, including replay, whose file flags are refused. File evidence is scrubbed whole before line selection; files over 64 MiB are refused. Git outside a sandbox reads no attributes from the tree and refuses repository settings that name programs; ship authenticates through its own GitHub credential helper, and every push and review post checks its repository again, which goes only where origin's fetch and push addresses agree. A case with a run in flight waits for it.
 
-A change goes in only through `momentum ship`, and only to a repository: a work tree of the loop's own, a test that fails without the change and passes with it in a bubblewrap sandbox that reaches nothing of the user's, a measurement plan whose signal counts the case's own problem, a rollback, a pull request committed as the user with its text scrubbed and its mentions inert, a clean-context review posted on it (three rounds at most), and a fast-forward of the default branch, only when the loop is live. Each landed change is then measured over its window by its signal's rate of the activity it is part of (an exact test of two rates, at 5%): a change that helped closes its case as improved with a shipped note of its effect, one that did not is rolled back with a decided note. Its authority is configuration the loop never writes, and a key of it momentum does not know is an error:
+A change goes in only through `momentum ship`, and only to a repository: a work tree of the loop's own, a test that fails without the change and passes with it in a bubblewrap sandbox that reaches nothing of the user's, a measurement plan whose signal counts the case's own problem, a rollback, a pull request committed as the user with its text scrubbed and its mentions inert, a clean-context review posted on it (three rounds at most), and a fast-forward of the default branch, only when the loop is live. Each landed change is measured from when it is in effect (its repository's checkout holds it, and the file the machine runs it from changed), over its window, by the share of the sessions' active hours its signal counts against the window before (Fisher's exact test, at 5%): a change that helped closes its case as improved with a shipped note of its effect, one that did not is rolled back, while the loop is live, with a decided note, and a problem it fixed that is back at its old share brings its case back. Its authority is configuration the loop never writes, and a key of it momentum does not know is an error:
 
 ```json
 {"loop": {

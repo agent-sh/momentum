@@ -389,9 +389,8 @@ func addEvidence(ctx context.Context, q querier, id string, evs []Evidence, now 
 }
 
 // comesBack decides whether a closed case comes back on the evidence it holds now, and says why either way.
-//   - A case closed as improved comes back when the evidence of its last window (as long as its measurement's)
-//     reaches what the window before its change held: the problem is back at its old rate. Without a measurement,
-//     any evidence after the close brings it back.
+//   - A case closed as improved does not come back on its evidence: the measure step watches its signal, in the
+//     units its measurement counted, and brings it back at its old rate (RegressCase).
 //   - A case closed as already solved comes back on any evidence after the close.
 //   - A dismissed case (not worth it, insufficient evidence) comes back only once the evidence after the close
 //     reaches what it held when it closed: the problem has happened as often again.
@@ -407,19 +406,7 @@ func comesBack(ctx context.Context, q querier, c Case, now time.Time) (bool, str
 	}
 	switch c.Reason {
 	case Improved:
-		if c.Measurement.Window <= 0 {
-			return after > 0, fmt.Sprintf("%d new since it closed as improved", after), nil
-		}
-		from := now.Add(-c.Measurement.Window)
-		if from.Before(c.Closed) {
-			from = c.Closed
-		}
-		recent, err := count(from)
-		if err != nil {
-			return false, "", err
-		}
-		need := max(c.Measurement.Before, 1)
-		return recent >= need, fmt.Sprintf("%d in its last %s, %d before its change", recent, days(c.Measurement.Window), c.Measurement.Before), nil
+		return false, fmt.Sprintf("%d new since it closed as improved; the measure step brings it back at its old rate", after), nil
 	case Solved:
 		return after > 0, fmt.Sprintf("%d new since it closed as already solved", after), nil
 	case NotWorthIt, Insufficient:
@@ -1241,9 +1228,10 @@ func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, 
 	return c, tx.Commit()
 }
 
-// StartMeasuring is the measure tool's: a deployed case goes to measuring, with its measurement's window and the
-// signal's count over the window before its change, which the window after it is compared with.
-func (s *Store) StartMeasuring(ctx context.Context, id string, window time.Duration, before int, actor string) (Case, error) {
+// StartMeasuring is the measure tool's: a deployed case goes to measuring once its change is in effect, from, with
+// its measurement's window and the signal's count over the window before its change, which the window after it is
+// compared with. The window after counts from then: the case's deployed time becomes it.
+func (s *Store) StartMeasuring(ctx context.Context, id string, window time.Duration, before int, from time.Time, actor string) (Case, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Case{}, err
@@ -1258,14 +1246,16 @@ func (s *Store) StartMeasuring(ctx context.Context, id string, window time.Durat
 		return Case{}, badCase("case %s is %s: only a deployed case is measured", c.ID, c.Status)
 	case window <= 0 || before < 0:
 		return Case{}, badCase("a measurement needs its window and the count before its change")
+	case from.Before(c.Deployed):
+		return Case{}, badCase("case %s's change went in %s: its measurement counts from then or later", c.ID, c.Deployed.Format(time.DateTime))
 	}
 	now := time.Now()
-	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, window_ms = ?, before_n = ?, updated = ? WHERE id = ?`,
-		CaseMeasuring, window.Milliseconds(), before, now.UnixMilli(), c.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, window_ms = ?, before_n = ?, deployed = ?, updated = ? WHERE id = ?`,
+		CaseMeasuring, window.Milliseconds(), before, from.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
-	if err := caseLog(ctx, tx, c.ID, actor, "measuring", fmt.Sprintf("%d in the %s before its change; the %s after it is due %s", before,
-		days(window), days(window), c.Deployed.Add(window).Format(time.DateTime)), now); err != nil {
+	if err := caseLog(ctx, tx, c.ID, actor, "measuring", fmt.Sprintf("in effect from %s; %d in the %s before its change; the %s after it is due %s",
+		from.Format(time.DateTime), before, days(window), days(window), from.Add(window).Format(time.DateTime)), now); err != nil {
 		return Case{}, err
 	}
 	if c, err = getCase(ctx, tx, c.ID); err != nil {
@@ -1275,7 +1265,7 @@ func (s *Store) StartMeasuring(ctx context.Context, id string, window time.Durat
 }
 
 // CloseMeasured is the measure tool's: a measuring case whose change measurably helped closes as improved, with
-// its count after the change and the effect in words. Its old rate brings it back (comesBack).
+// its count after the change and the effect in words. Its old rate brings it back (RegressCase).
 func (s *Store) CloseMeasured(ctx context.Context, id string, after int, effect, actor string) (Case, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1299,6 +1289,35 @@ func (s *Store) CloseMeasured(ctx context.Context, id string, after int, effect,
 		return Case{}, err
 	}
 	if err := caseLog(ctx, tx, c.ID, actor, "closed", string(Improved)+": "+effect, now); err != nil {
+		return Case{}, err
+	}
+	if c, err = getCase(ctx, tx, c.ID); err != nil {
+		return Case{}, err
+	}
+	return c, tx.Commit()
+}
+
+// RegressCase is the measure tool's: a case closed as improved whose problem is back at its old rate comes back,
+// open, the same case with its history, its log saying it regressed and why.
+func (s *Store) RegressCase(ctx context.Context, id, why, actor string) (Case, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Case{}, err
+	}
+	defer tx.Rollback()
+	c, err := getCase(ctx, tx, id)
+	if err != nil {
+		return Case{}, err
+	}
+	if c.Status != CaseClosed || c.Reason != Improved {
+		return Case{}, badCase("case %s is %s %s: only a case closed as improved regresses", c.ID, c.Status, c.Reason)
+	}
+	now := time.Now()
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, reason = '', closed = 0, closed_evidence = 0, updated = ?, back = ?
+	  WHERE id = ?`, CaseOpen, now.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
+		return Case{}, err
+	}
+	if err := caseLog(ctx, tx, c.ID, actor, "regressed", "closed as improved; "+why, now); err != nil {
 		return Case{}, err
 	}
 	if c, err = getCase(ctx, tx, c.ID); err != nil {

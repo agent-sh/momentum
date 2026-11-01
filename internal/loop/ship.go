@@ -54,6 +54,7 @@ const (
 	Revising   = "revising" // a review found something: back to its build, on the same branch and pull request
 	Landed     = "landed"
 	RolledBack = "rolled back"
+	Kept       = "kept" // its case closed as improved: the change stays, and a regression builds another
 )
 
 // MaxRounds is how many review rounds a package gets: prs.md's three.
@@ -84,6 +85,12 @@ type Package struct {
 	Changed     []string  `json:"changed,omitempty"` // the paths the change touches
 	Created     time.Time `json:"created"`
 	Updated     time.Time `json:"updated"`
+	// What the measure step found and did: the measurement that kept the change, the problem note it stands for
+	// now (measure:CASE), the rollback it holds while the loop is not live, and its rollbacks that failed in a row.
+	Result           *measure.Result `json:"result,omitempty"`
+	Problem          string          `json:"problem,omitempty"`
+	Held             bool            `json:"held,omitempty"`
+	RollbackFailures int             `json:"rollback_failures,omitempty"`
 }
 
 // Check is the evidence that a test discriminates the change: it fails on the code without the change (the
@@ -98,13 +105,19 @@ type Check struct {
 	At        time.Time `json:"at"`
 }
 
-// Plan is how the change is measured: a signal over the store's events, counted over a window before the change
-// and as long after it (internal/measure).
+// Plan is how the change is measured: a signal over the store's events, counted in units of activity over a
+// window before the change and as long after it is in effect (internal/measure).
 type Plan struct {
-	Signal Signal        `json:"signal"`
-	Window time.Duration `json:"window"`
-	Before int           `json:"before"` // the signal's count over the window before the proposal
-	At     time.Time     `json:"at"`     // when it was counted: the window before ends here
+	Signal     Signal        `json:"signal"`
+	Window     time.Duration `json:"window"`
+	Units      string        `json:"units"`       // what it counts in: session hours, owner hours or machine hours
+	Before     int           `json:"before"`      // the units the signal counted in the window before the proposal
+	BeforeBase int           `json:"before_base"` // the units of activity in it
+	At         time.Time     `json:"at"`          // when it was counted: the window before ends here
+	// Installed is the file the machine runs the change from when that is no file of the repository's checkout (a
+	// binary built from it, an installed configuration): the change is in effect once the file changed after the
+	// landing.
+	Installed string `json:"installed,omitempty"`
 }
 
 // Signal is a deterministic filter of the store's events: of a source and kinds, of a tool and a harness when
@@ -202,8 +215,9 @@ func (s *Ship) public(ctx context.Context, text string) (string, error) {
 }
 
 // Prepare makes the case's work tree: a branch of the repository's default branch in a worktree of the loop's
-// own, once the gate allows the repository. A case has one package at a time; one rolled back can be prepared
-// again, its old work tree and branch gone first.
+// own, once the gate allows the repository. A case has one package at a time; one rolled back, or kept by a case
+// that came back regressed, can be prepared again: its old work tree and branch go first, and its record is kept
+// beside the new one (past/).
 func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, error) {
 	c, err := s.working(ctx, caseID)
 	if err != nil {
@@ -213,7 +227,7 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	if err != nil {
 		return Package{}, err
 	}
-	if had && old.State != RolledBack {
+	if had && old.State != RolledBack && old.State != Kept {
 		return old, refused("case %s has a package %s already (in %s)", c.ID, old.State, old.Work)
 	}
 	if repoDir == "" {
@@ -225,9 +239,12 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	}
 	work := s.workDir(c.ID)
 	branch := "momentum/" + c.ID
-	if had { // its last tree's registration, so the branch can be checked out again
+	if had { // its last tree's registration, so the branch can be checked out again, and its record kept
 		s.git(ctx, old.Dir, "worktree", "remove", "--force", old.Work)
 		s.git(ctx, old.Dir, "worktree", "prune")
+		if err := s.archive(old); err != nil {
+			return Package{}, err
+		}
 	}
 	if err := os.RemoveAll(work); err != nil {
 		return Package{}, err
@@ -253,6 +270,22 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 		return Package{}, err
 	}
 	return p, s.Store.CaseNote(ctx, c.ID, "prepared", fmt.Sprintf("%s in %s", p.Repo, p.Work), s.Actor)
+}
+
+// archive keeps a package's record before another replaces it: its files go to past/ under its directory, named by
+// when it was made.
+func (s *Ship) archive(p Package) error {
+	dir := s.pkgDir(p.Case)
+	past := filepath.Join(dir, "past", p.Created.UTC().Format("20060102T150405Z"))
+	if err := os.MkdirAll(past, 0o700); err != nil {
+		return err
+	}
+	for _, f := range []string{"package.json", "check.json"} {
+		if err := os.Rename(filepath.Join(dir, f), filepath.Join(past, f)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 // staged stages every change of the work tree and returns its tree, by its hash, and the paths it changes against
@@ -440,6 +473,7 @@ type Proposal struct {
 	Title, Body, Rollback, Lesson string
 	Signal                        Signal
 	Window                        time.Duration
+	Installed                     string // the file the machine runs the change from, when no file of the checkout (Plan)
 }
 
 // MinSignal is the least the measurement's signal must count over the window before the change: below it, no
@@ -478,7 +512,7 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package
 	case strings.TrimSpace(pr.Rollback) == "":
 		return p, refused("a proposal needs its rollback: how the change is undone")
 	}
-	before, err := s.validPlan(ctx, c, pr.Signal, pr.Window)
+	plan, err := s.validPlan(ctx, c, pr.Signal, pr.Window, pr.Installed, s.now())
 	if err != nil {
 		return p, err
 	}
@@ -493,8 +527,7 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package
 	if err != nil {
 		return p, err
 	}
-	p.Plan, p.Rollback, p.Title, p.Body, p.Lesson, p.Changed = &Plan{Signal: pr.Signal, Window: pr.Window, Before: before, At: s.now()}, pr.Rollback,
-		title, body, pr.Lesson, paths
+	p.Plan, p.Rollback, p.Title, p.Body, p.Lesson, p.Changed = &plan, pr.Rollback, title, body, pr.Lesson, paths
 	// the commit first, so the work tree is clean when the scope check looks at every work tree of the repository
 	if head, err := s.git(ctx, p.Work, "rev-parse", "HEAD^{tree}"); err != nil || strings.TrimSpace(head) != tree {
 		if err := s.commit(ctx, p.Work, fmt.Sprintf("%s\n\n%s\n\nCase %s.", title, wrap(body), c.ID)); err != nil {
@@ -534,36 +567,52 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package
 	if err := s.save(&p); err != nil {
 		return p, err
 	}
-	return p, s.Store.CaseNote(ctx, caseID, "proposed", fmt.Sprintf("%s %s; measured by %d events in the %s before", p.PR, title, before, pr.Window), s.Actor)
+	return p, s.Store.CaseNote(ctx, caseID, "proposed", fmt.Sprintf("%s %s; measured in %s: %d of %d in the %s before", p.PR, title, plan.Units,
+		plan.Before, plan.BeforeBase, days(pr.Window)), s.Actor)
 }
 
-// validPlan checks a measurement plan: a signal that names a source, kinds and at least one text, a window of at
-// least a day, a count over the window before of at least MinSignal, and a signal that counts the case's own
-// problem: the case holds events, and at least half of those in that window are among what it counts. It returns
-// the count before.
-func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window time.Duration) (int, error) {
+// validPlan checks a measurement plan and returns it, counted at at: a signal that names a source, kinds and at
+// least one text, a window of at least a day, at least MinSignal units of activity in which it counts an event
+// over the window before, and a signal that counts the case's own problem: the case holds events, and at least half
+// of those in that window are among what it counts. A file the change is installed in must be one there is.
+func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window time.Duration, installed string, at time.Time) (Plan, error) {
 	switch {
 	case sig.Source == "" || len(sig.Kinds) == 0 || len(sig.Match) == 0:
-		return 0, refused("a measurement signal names a source, kinds and at least one text its events hold")
+		return Plan{}, refused("a measurement signal names a source, kinds and at least one text its events hold")
 	case window < 24*time.Hour:
-		return 0, refused("a measurement window is at least a day")
+		return Plan{}, refused("a measurement window is at least a day")
 	}
 	for _, m := range sig.Match {
 		if len(strings.TrimSpace(m)) < 4 {
-			return 0, refused("the signal's text %q is too short to name a problem", m)
+			return Plan{}, refused("the signal's text %q is too short to name a problem", m)
 		}
 	}
-	now := s.now()
-	got, err := Count(ctx, s.Store, sig, now.Add(-window), now)
-	if err != nil {
-		return 0, err
+	if installed != "" {
+		path := expandHome(installed)
+		if !filepath.IsAbs(path) {
+			return Plan{}, refused("the file the change is installed in is an absolute path or one under ~/, not %q", installed)
+		}
+		if st, err := os.Stat(path); err != nil || !st.Mode().IsRegular() {
+			return Plan{}, refused("the file the change is installed in, %s, is no file here", installed)
+		}
 	}
-	if len(got) < MinSignal {
-		return 0, refused("the signal counts %d events in the %s before, fewer than %d: no window could show an effect", len(got), window, MinSignal)
+	got, err := Count(ctx, s.Store, sig, at.Add(-window), at)
+	if err != nil {
+		return Plan{}, err
+	}
+	plan := Plan{Signal: sig, Window: window, Units: unitsOf(got), At: at, Installed: installed}
+	before, err := tally(ctx, s.Store, sig, plan.Units, got, at.Add(-window), at)
+	if err != nil {
+		return Plan{}, err
+	}
+	plan.Before, plan.BeforeBase = before.Hits, before.Base
+	if before.Hits < MinSignal {
+		return Plan{}, refused("the signal counts events in %d %s of the %s before, fewer than %d: no window could show an effect", before.Hits,
+			plan.Units, days(window), MinSignal)
 	}
 	evs, err := s.Store.CaseEvidence(ctx, c.ID, 0)
 	if err != nil {
-		return 0, err
+		return Plan{}, err
 	}
 	counted := map[string]bool{}
 	for _, e := range got {
@@ -575,7 +624,7 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 			continue
 		}
 		events++
-		if e.At.Before(now.Add(-window)) {
+		if e.At.Before(at.Add(-window)) {
 			continue
 		}
 		in++
@@ -585,13 +634,23 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 	}
 	switch {
 	case events == 0:
-		return 0, refused("the case holds no event of the store: its measurement has nothing of its own problem to count")
+		return Plan{}, refused("the case holds no event of the store: its measurement has nothing of its own problem to count")
 	case in == 0:
-		return 0, refused("the case has no evidence in the window: measure over a window that holds it")
+		return Plan{}, refused("the case has no evidence in the window: measure over a window that holds it")
 	case hit*2 < in:
-		return 0, refused("the signal counts %d of the case's %d events in the window: it does not measure the case's problem", hit, in)
+		return Plan{}, refused("the signal counts %d of the case's %d events in the window: it does not measure the case's problem", hit, in)
 	}
-	return len(got), nil
+	return plan, nil
+}
+
+// expandHome is a path with a leading ~/ made the user's home.
+func expandHome(p string) string {
+	if rest, ok := strings.CutPrefix(p, "~/"); ok {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, rest)
+		}
+	}
+	return filepath.Clean(p)
 }
 
 // editsSignal refuses a change that edits the texts its own measurement counts: a change of words that only stops
@@ -852,8 +911,9 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	return p, nil
 }
 
-// RollBack undoes a landed change: a revert of its commits, by the user's identity, pushed to the default branch
-// as a fast-forward; the case goes back to testing.
+// RollBack undoes a landed change whose case is deployed or measuring: a revert of its commits, by the user's
+// identity, pushed to the default branch as a fast-forward; the case goes back to testing. A change kept by its
+// measurement is no landed package: its case closed as improved.
 func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error) {
 	p, ok, err := s.Load(caseID)
 	if err != nil {
@@ -861,6 +921,11 @@ func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error
 	}
 	if !ok || p.State != Landed {
 		return p, refused("case %s has no landed package to roll back", caseID)
+	}
+	if c, err := s.Store.CaseByID(ctx, caseID); err != nil {
+		return p, err
+	} else if c.Status != store.CaseDeployed && c.Status != store.CaseMeasuring {
+		return p, refused("case %s is %s: only a deployed or measuring case's change rolls back", caseID, c.Status)
 	}
 	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
 		return p, err
@@ -888,6 +953,45 @@ func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error
 	}
 	_, err = s.Store.RollBackCase(ctx, caseID, why, s.Actor)
 	return p, err
+}
+
+// InEffect says whether a landed change is in effect where the loop can see it, and since when: the repository's
+// checkout holds its commits, and the file it is installed in, when its plan names one, changed after the landing.
+// Otherwise it says what it waits for.
+func (s *Ship) InEffect(ctx context.Context, p Package) (time.Time, string, error) {
+	switch {
+	case len(p.Landed) == 0 || p.LandedAt.IsZero():
+		return time.Time{}, "", fmt.Errorf("case %s's package holds no landed commit", p.Case)
+	case p.Plan == nil:
+		return time.Time{}, "", fmt.Errorf("case %s's package has no plan", p.Case)
+	}
+	last := p.Landed[len(p.Landed)-1]
+	if _, err := s.git(ctx, p.Dir, "merge-base", "--is-ancestor", last, "HEAD"); err != nil {
+		return time.Time{}, fmt.Sprintf("the repository's checkout does not hold %.12s yet", last), nil
+	}
+	if p.Plan.Installed != "" {
+		st, err := os.Stat(expandHome(p.Plan.Installed))
+		if err != nil {
+			return time.Time{}, fmt.Sprintf("%s, where it is installed, is not there", filepath.Base(p.Plan.Installed)), nil
+		}
+		if !st.ModTime().After(p.LandedAt) {
+			return time.Time{}, fmt.Sprintf("%s, where it is installed, has not changed since the landing", filepath.Base(p.Plan.Installed)), nil
+		}
+	}
+	return s.now(), "", nil
+}
+
+// Keep records that a change's measurement kept it: its case closed as improved with the result.
+func (s *Ship) Keep(caseID string, res measure.Result) (Package, error) {
+	p, ok, err := s.Load(caseID)
+	switch {
+	case err != nil:
+		return p, err
+	case !ok || p.State != Landed:
+		return p, refused("case %s has no landed package to keep", caseID)
+	}
+	p.State, p.Result = Kept, &res
+	return p, s.save(&p)
 }
 
 // commit commits the work tree's staged change as the user.
@@ -956,8 +1060,11 @@ func (s *Ship) packageText(c store.Case, p Package) string {
 	fmt.Fprintf(&b, "- Check: `%s` fails without the change (exit %d) and passes with it (%.0f s).\n", strings.Join(p.Check.Test, " "),
 		p.Check.Before.Exit, p.Check.After.Seconds)
 	sig, _ := json.Marshal(p.Plan.Signal)
-	fmt.Fprintf(&b, "- Measurement: the signal `%s` counted %d events in the %s before; the same window after the change is compared with it.\n",
-		sig, p.Plan.Before, p.Plan.Window)
+	fmt.Fprintf(&b, "- Measurement: the signal `%s` counted events in %d of %d %s in the %s before; the same window after the change is in effect is compared with it (Fisher's exact test, one-sided, p below 0.05).\n",
+		sig, p.Plan.Before, p.Plan.BeforeBase, p.Plan.Units, days(p.Plan.Window))
+	if p.Plan.Installed != "" {
+		fmt.Fprintf(&b, "- In effect once `%s`, where it is installed, changed after the landing.\n", filepath.Base(p.Plan.Installed))
+	}
 	fmt.Fprintf(&b, "- Rollback: %s\n", p.Rollback)
 	b.WriteString("\nOpened by momentum's improvement loop. It lands by fast-forward only after a clean-context review finds nothing high or medium.\n")
 	return b.String()

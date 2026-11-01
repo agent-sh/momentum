@@ -47,6 +47,7 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	signal := fs.String("signal", "", `propose: the measurement's signal, {"source","kinds","tool","harness","match"}`)
 	window := fs.String("window", "7d", "propose: the measurement's window (at least a day)")
 	lesson := fs.String("lesson", "", "propose: the lesson the case teaches, one sentence")
+	installed := fs.String("installed", "", "propose: the file the machine runs the change from, when no file of the checkout (a built binary): it is in effect once that changed after the landing")
 	why := fs.String("why", "", "rollback: why")
 	asJSON := fs.Bool("json", false, "status: the package as JSON")
 	rest := args[1:]
@@ -118,7 +119,7 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		if err := json.Unmarshal([]byte(*signal), &pr.Signal); err != nil {
 			return usageError{"--signal is a JSON object: " + err.Error()}
 		}
-		pr.Title, pr.Rollback, pr.Lesson = *title, *rollback, *lesson
+		pr.Title, pr.Rollback, pr.Lesson, pr.Installed = *title, *rollback, *lesson, *installed
 		p, err = ship.Propose(ctx, *caseID, pr)
 	case "land":
 		p, err = ship.Land(ctx, *caseID)
