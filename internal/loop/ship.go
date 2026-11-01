@@ -237,7 +237,13 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	if _, err := s.git(ctx, t.Dir, "fetch", "--quiet", "origin", t.Base); err != nil {
 		return Package{}, err
 	}
-	if _, err := s.git(ctx, t.Dir, "worktree", "add", "-B", branch, work, "origin/"+t.Base); err != nil {
+	if _, err := s.git(ctx, t.Dir, "worktree", "add", "--no-checkout", "-B", branch, work, "origin/"+t.Base); err != nil {
+		return Package{}, err
+	}
+	if err := CheckGitFilters(ctx, work); err != nil {
+		return Package{}, err
+	}
+	if _, err := s.git(ctx, work, "reset", "--hard", "HEAD"); err != nil {
 		return Package{}, err
 	}
 	p := Package{Case: c.ID, Kind: "repo", Repo: t.Repo, Base: t.Base, Dir: t.Dir, Branch: branch, Work: work, State: Prepared, Created: s.now()}
@@ -476,7 +482,7 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package
 	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
 		return p, err
 	}
-	if _, err := s.git(ctx, p.Work, "push", "--no-verify", "--force-with-lease", "origin", "HEAD:refs/heads/"+p.Branch); err != nil {
+	if _, err := s.push(ctx, p, p.Work, "--no-verify", "--force-with-lease", "origin", "HEAD:refs/heads/"+p.Branch); err != nil {
 		return p, err
 	}
 	text, err := s.public(ctx, s.packageText(c, p))
@@ -794,15 +800,15 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 		return p, err
 	}
 	if head != p.Head { // the pull request's head is what reaches the base, so GitHub marks it merged
-		if _, err := s.git(ctx, p.Work, "push", "--no-verify", "--force-with-lease", "origin", "HEAD:refs/heads/"+p.Branch); err != nil {
+		if _, err := s.push(ctx, p, p.Work, "--no-verify", "--force-with-lease", "origin", "HEAD:refs/heads/"+p.Branch); err != nil {
 			return p, err
 		}
 	}
 	basePush = true
-	if _, err := s.git(ctx, p.Work, "push", "--no-verify", "origin", "HEAD:refs/heads/"+p.Base); err != nil {
+	if _, err := s.push(ctx, p, p.Work, "--no-verify", "origin", "HEAD:refs/heads/"+p.Base); err != nil {
 		return p, refused("the push to %s did not go as a fast-forward: %v", p.Base, err)
 	}
-	s.git(ctx, p.Work, "push", "--no-verify", "--quiet", "origin", "--delete", p.Branch)
+	s.push(ctx, p, p.Work, "--no-verify", "--quiet", "origin", "--delete", p.Branch)
 	p.Landed, p.Head = strings.Fields(commits), head
 	p.State, p.LandedAt = Landed, s.now()
 	complete = true
@@ -843,7 +849,7 @@ func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error
 	if _, err := s.git(ctx, dir, append([]string{"revert", "--no-edit"}, shas...)...); err != nil {
 		return p, err
 	}
-	if _, err := s.git(ctx, dir, "push", "--no-verify", "origin", "HEAD:refs/heads/"+p.Base); err != nil {
+	if _, err := s.push(ctx, p, dir, "--no-verify", "origin", "HEAD:refs/heads/"+p.Base); err != nil {
 		return p, err
 	}
 	p.State = RolledBack
@@ -876,7 +882,7 @@ func (s *Ship) git(ctx context.Context, dir string, args ...string) (string, err
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	full := append([]string{"-C", dir, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "diff.external=",
-		"-c", "commit.gpgsign=false", "-c", "user.name=" + s.Identity[0], "-c", "user.email=" + s.Identity[1]}, args...)
+		"-c", "commit.gpgsign=false", "-c", "user.name=" + s.Identity[0], "-c", "user.email=" + s.Identity[1]}, append(GitSafety(), args...)...)
 	cmd := exec.CommandContext(cctx, "git", full...)
 	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_AUTHOR_NAME="+s.Identity[0], "GIT_AUTHOR_EMAIL="+s.Identity[1],
 		"GIT_COMMITTER_NAME="+s.Identity[0], "GIT_COMMITTER_EMAIL="+s.Identity[1])
@@ -979,7 +985,7 @@ func wrap(s string) string {
 func CheckGitFilters(ctx context.Context, dir string) error {
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, "git", "-C", dir, "config", "--name-only", "--get-regexp", `^(filter\..*\.(clean|smudge|process)|merge\..*\.driver)$`)
+	cmd := exec.CommandContext(cctx, "git", append(append([]string{"-C", dir}, GitSafety()...), "config", "--name-only", "--get-regexp", `^(filter\..*\.(clean|smudge|process)|merge\..*\.driver)$`)...)
 	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
 	out, err := cmd.Output()
 	if len(bytes.TrimSpace(out)) > 0 {
@@ -1021,4 +1027,16 @@ func writeTest(dir, name string, data []byte) error {
 	}
 	_, err = f.Write(data)
 	return errors.Join(err, f.Close())
+}
+
+// push checks the actual work tree's destinations and current authority immediately before every push.
+func (s *Ship) push(ctx context.Context, p Package, dir string, args ...string) (string, error) {
+	t, err := s.Gate.Repository(ctx, dir)
+	if err != nil {
+		return "", err
+	}
+	if !strings.EqualFold(t.Repo, p.Repo) {
+		return "", refused("the push destination is not the package's repository")
+	}
+	return s.git(ctx, dir, append([]string{"push"}, args...)...)
 }

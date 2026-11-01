@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -270,3 +272,199 @@ func TestALessonWhoseWriteLeftNoReceiptIsWrittenTheSame(t *testing.T) {
 		t.Fatalf("tacit called after the receipt: %q", b)
 	}
 }
+
+// A path selector names a checked blob. A subtree cannot change the root of credential exclusions.
+func TestATreeSelectorIsRefused(t *testing.T) {
+	fakeScrubber(t)
+	dir := evidenceRepo(t)
+	if err := os.MkdirAll(filepath.Join(dir, "config"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config", ".env"), []byte("credential-only-marker\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", ".")
+	gitIn(t, dir, "commit", "-qm", "fixture")
+	for _, selector := range []string{"HEAD:config", "HEAD:", "HEAD:config/"} {
+		for _, sub := range [][]string{{"grep", "-e", "credential-only-marker"}, {"show"}} {
+			args := append([]string{"evidence", "git", dir}, sub...)
+			code, out, diag := momentum(append(args, selector)...)
+			if code == 0 || out != "" {
+				t.Errorf("%s: %d %q %s", selector, code, out, diag)
+			}
+		}
+	}
+	if code, out, diag := momentum("evidence", "git", dir, "show", "HEAD:ordinary.txt"); code != 0 || out == "" {
+		t.Fatalf("checked blob: %d %q %s", code, out, diag)
+	}
+}
+
+// Every command's two output streams are scrubbed whole before a run sees either. A failure emits neither.
+func TestARunReadsOnlyScrubbedCommandOutput(t *testing.T) {
+	fakeScrubber(t)
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	t.Setenv("MOMENTUM_LOOP_RUN", "fixture")
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	e := store.Event{Source: store.Transcripts, SourceKey: "fixture", TS: time.Now(), Actor: store.ActorTool, Kind: "tool_result", Summary: "password=secret-value"}
+	if _, err := st.Put(ctx, []store.Event{e}); err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: "fixture", Title: "secret-value", Evidence: []store.Evidence{{Ref: "ev:" + e.ID(), At: e.TS}}}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := [][]string{{"evidence", "events", "--json"}, {"case", "show", c.ID, "--json"}, {"case", "list", "--json"}, {"evidence", "events"}, {"secret-value"}}
+	for _, args := range commands {
+		code, out, diag := momentum(args...)
+		if strings.Contains(out+diag, "secret-value") || !strings.Contains(out+diag, "************") {
+			t.Errorf("%v: %d %q %q", args, code, out, diag)
+		}
+		if args[len(args)-1] == "--json" && !json.Valid([]byte(out)) {
+			t.Errorf("invalid JSON: %s", out)
+		}
+	}
+	// Both streams must wait even when the second scrub fails after the first succeeded.
+	e.SourceKey = "second"
+	if _, err := st.Put(ctx, []store.Event{e}); err != nil {
+		t.Fatal(err)
+	}
+	scrub := filepath.Join(t.TempDir(), "scrub")
+	text := `#!/bin/sh
+data=$(cat)
+case "$data" in momentum:*) exit 1;; esac
+printf '%s' "$data" | sed 's/secret-value/************/g'
+`
+	if err := os.WriteFile(scrub, []byte(text), 0700); err != nil {
+		t.Fatal(err)
+	}
+	loop.Scrubber = []string{scrub}
+	if code, out, diag := momentum("evidence", "events", "--json", "--limit", "1"); code == 0 || out != "" || diag != scrubFailed {
+		t.Fatalf("second scrub failed after stdout escaped: %d %q %q", code, out, diag)
+	}
+
+	if err := os.WriteFile(scrub, []byte("#!/bin/sh\ncat >/dev/null\nexit 1\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	loop.Scrubber = []string{scrub}
+	for _, args := range commands {
+		if code, out, diag := momentum(args...); code == 0 || out != "" || diag != scrubFailed {
+			t.Errorf("failed scrub: %v: %d %q %q", args, code, out, diag)
+		}
+	}
+}
+
+// A file's multiline context reaches the scrubber before the read cap or a tail selects its lines.
+func TestAFileIsScrubbedBeforeItsLinesAreSelected(t *testing.T) {
+	fakeScrubber(t)
+	scrub := filepath.Join(t.TempDir(), "scrub")
+	// This scrubber masks the body only when both delimiters reach the same invocation.
+	script := "#!/bin/sh\nsed ':a;N;$!ba;s/BEGIN\\nblock-value\\nEND/[masked]/g'\n"
+	if err := os.WriteFile(scrub, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	loop.Scrubber = []string{scrub}
+	file := filepath.Join(t.TempDir(), "ordinary.log")
+	for _, text := range []string{"BEGIN\nblock-value\nEND\n", strings.Repeat("safe\n", readMax/5) + "BEGIN\nblock-value\nEND\n"} {
+		if err := os.WriteFile(file, []byte(text), 0600); err != nil {
+			t.Fatal(err)
+		}
+		for _, tail := range []string{"0", "2", "3"} {
+			code, out, diag := momentum("evidence", "file", file, "--tail", tail)
+			if code != 0 || strings.Contains(out, "block-value") {
+				t.Fatalf("tail %s: %d %q %s", tail, code, out, diag)
+			}
+			if tail != "0" && !strings.Contains(out, "[masked]") {
+				t.Errorf("tail was selected before scrub: %q", out)
+			}
+		}
+	}
+	// A large tail window drops its first line, even when the window starts at a line boundary.
+	text := strings.Repeat("x", 1<<20) + "partial-line\n" + strings.Repeat("safe\n", (4<<20)/5-10) + "last\n"
+	if err := os.WriteFile(file, []byte(text), 0600); err != nil {
+		t.Fatal(err)
+	}
+	code, out, diag := momentum("evidence", "file", file, "--tail", "999999")
+	if code != 0 || strings.Contains(out, "partial-line") || !strings.Contains(out, "last") {
+		t.Fatalf("window: %d len=%d %s", code, len(out), diag)
+	}
+}
+
+// The installed text scrubber receives a synthetic PEM-shaped block whole. No key is made or read.
+func TestAFileKeepsTheScrubbersMultilineContext(t *testing.T) {
+	if _, err := exec.LookPath("scrump"); err != nil {
+		t.Skip("text scrubber is not installed")
+	}
+	was := loop.Scrubber
+	t.Cleanup(func() { loop.Scrubber = was })
+	loop.Scrubber = []string{"scrump", "--profile", "text", "scrub", "-", "-o", "-"}
+	body := strings.Repeat("c3ludGhldGlj", 6)
+	text := "-----BEGIN PRIVATE KEY-----\n" + body + "\n-----END PRIVATE KEY-----\n"
+	whole, err := loop.Redact(context.Background(), text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(whole, body) {
+		t.Fatal("control did not mask the whole block")
+	}
+	file := filepath.Join(t.TempDir(), "ordinary.log")
+	if err := os.WriteFile(file, []byte(text), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tail := range []string{"0", "2"} {
+		code, out, diag := momentum("evidence", "file", file, "--tail", tail)
+		if code != 0 || strings.Contains(out, body) {
+			t.Fatalf("tail %s: %d %q %s", tail, code, out, diag)
+		}
+	}
+}
+
+// Signature format atoms and display settings cannot run any configured verifier outside a sandbox.
+func TestGitEvidenceRunsNoSignatureProgram(t *testing.T) {
+	fakeScrubber(t)
+	for _, format := range []string{"openpgp", "x509", "ssh"} {
+		t.Run(format, func(t *testing.T) {
+			dir := evidenceRepo(t)
+			marker := filepath.Join(t.TempDir(), "marker")
+			verifier := filepath.Join(t.TempDir(), "verify")
+			if err := os.WriteFile(verifier, []byte("#!/bin/sh\necho ran > '"+marker+"'\nexit 1\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range []string{"gpg.program", "gpg.openpgp.program", "gpg.x509.program", "gpg.ssh.program"} {
+				gitIn(t, dir, "config", key, verifier)
+			}
+			gitIn(t, dir, "config", "log.showSignature", "true")
+			if format == "ssh" {
+				signers := filepath.Join(t.TempDir(), "allowed-signers")
+				if err := os.WriteFile(signers, []byte("fixture ssh-ed25519 c3ludGhldGlj\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				gitIn(t, dir, "config", "gpg.ssh.allowedSignersFile", signers)
+			}
+			signature := map[string]string{"openpgp": "PGP SIGNATURE", "x509": "SIGNED MESSAGE", "ssh": "SSH SIGNATURE"}[format]
+			tree := strings.TrimSpace(gitIn(t, dir, "rev-parse", "HEAD^{tree}"))
+			raw := "tree " + tree + "\nauthor Fixture <fixture@example.invalid> 1700000000 +0000\ncommitter Fixture <fixture@example.invalid> 1700000000 +0000\ngpgsig -----BEGIN " + signature + "-----\n c3ludGhldGlj\n -----END " + signature + "-----\n\nfixture\n"
+			file := filepath.Join(t.TempDir(), "object")
+			if err := os.WriteFile(file, []byte(raw), 0600); err != nil {
+				t.Fatal(err)
+			}
+			sha := strings.TrimSpace(gitIn(t, dir, "hash-object", "-t", "commit", "-w", file))
+			code, _, diag := momentum("evidence", "git", dir, "log", "--format=%G?", sha)
+			if code != 0 {
+				t.Fatalf("format: %d %s", code, diag)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("verifier ran: %v", err)
+			}
+		})
+	}
+}
+
+// scrubFailed is all a run reads of a command whose output the scrubber could not pass: a fixed line, nothing of
+// the command's.
+const scrubFailed = "momentum: the secret scrubber did not run, so nothing of this command is shown\n"

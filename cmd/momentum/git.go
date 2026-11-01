@@ -92,7 +92,7 @@ func evidenceGit(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	}
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, "git", append(append([]string{"-C", dir}, gitSafe...), argv...)...)
+	cmd := exec.CommandContext(cctx, "git", append(append(append([]string{"-C", dir}, gitSafe...), loop.GitSafety()...), argv...)...)
 	cmd.Env = gitEnv()
 	var out bytes.Buffer
 	capture := &capped{w: &out, n: (1 << 20) + 1}
@@ -249,6 +249,13 @@ func isRevision(ctx context.Context, dir, a string) error {
 			if err := repoPath(path); err != nil {
 				return err
 			}
+			kind, err := gitRead(ctx, dir, "cat-file", "-t", s)
+			if err != nil {
+				return err
+			}
+			if strings.TrimSpace(kind) != "blob" {
+				return fmt.Errorf("a path selector must name a blob, not a tree")
+			}
 		}
 		if _, err := gitRead(ctx, dir, "rev-parse", "--verify", "--quiet", "--end-of-options", s); err != nil {
 			return err
@@ -298,7 +305,7 @@ func gitRead(ctx context.Context, dir string, args ...string) (string, error) {
 	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, "git", append(append([]string{"-C", dir}, gitSafe...), args...)...)
+	cmd := exec.CommandContext(cctx, "git", append(append(append([]string{"-C", dir}, gitSafe...), loop.GitSafety()...), args...)...)
 	cmd.Env = gitEnv()
 	out, err := cmd.Output()
 	return string(out), err
@@ -307,13 +314,7 @@ func gitRead(ctx context.Context, dir string, args ...string) (string, error) {
 // gitEnv is momentum's environment without git's own variables (a GIT_DIR would point it elsewhere), never
 // prompting, taking no optional lock and running no external diff.
 func gitEnv() []string {
-	var env []string
-	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "GIT_") {
-			env = append(env, kv)
-		}
-	}
-	return append(env, "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_PAGER=cat", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
+	return loop.GitEnv()
 }
 
 func gitNames() string {

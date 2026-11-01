@@ -48,17 +48,44 @@ type Target struct {
 
 var remoteRe = regexp.MustCompile(`^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)([\w.-]+)/([\w.-]+?)(?:\.git)?/?$`)
 
-// RepoOf is a checkout's repository on GitHub, by its origin remote.
-func RepoOf(ctx context.Context, dir string) (string, error) {
-	out, err := gitOutput(ctx, dir, "remote", "get-url", "origin")
+// originRepository resolves the fetch URL and every expanded push URL. A custom resolver may name a
+// local test repository, but its destinations must still agree.
+func originRepository(ctx context.Context, dir string) (string, error) {
+	fetch, err := gitOutput(ctx, dir, "remote", "get-url", "origin")
 	if err != nil {
-		return "", fmt.Errorf("%s has no origin remote: %w", dir, err)
+		return "", err
 	}
-	m := remoteRe.FindStringSubmatch(strings.TrimSpace(out))
-	if m == nil {
-		return "", refused("%s's origin %q is not a GitHub repository", dir, strings.TrimSpace(out))
+	pushes, err := gitOutput(ctx, dir, "remote", "get-url", "--push", "--all", "origin")
+	if err != nil {
+		return "", err
 	}
-	return m[1] + "/" + m[2], nil
+	identity := func(url string) string {
+		url = strings.TrimSpace(url)
+		if m := remoteRe.FindStringSubmatch(url); m != nil {
+			return strings.ToLower(m[1] + "/" + m[2])
+		}
+		return "url:" + url
+	}
+	repo := identity(fetch)
+	urls := strings.Split(strings.TrimSpace(pushes), "\n")
+	for _, url := range urls {
+		if url == "" || identity(url) != repo {
+			return "", refused("origin's fetch and push destinations differ")
+		}
+	}
+	return repo, nil
+}
+
+// RepoOf is a checkout's repository on GitHub, shared by its fetch and all push destinations.
+func RepoOf(ctx context.Context, dir string) (string, error) {
+	repo, err := originRepository(ctx, dir)
+	if err != nil {
+		return "", err
+	}
+	if !regexp.MustCompile(`^[\w.-]+/[\w.-]+$`).MatchString(repo) {
+		return "", refused("origin is not a GitHub repository")
+	}
+	return repo, nil
 }
 
 // Repository checks that the loop may change a repository now, and returns it as a target: an owner it may write
@@ -81,7 +108,10 @@ func (g Gate) Repository(ctx context.Context, dir string) (Target, error) {
 	if resolve == nil {
 		resolve = RepoOf
 	}
-	repo, err := resolve(ctx, main)
+	if _, err := originRepository(ctx, dir); err != nil {
+		return Target{}, err
+	}
+	repo, err := resolve(ctx, dir)
 	if err != nil {
 		return Target{}, err
 	}
@@ -192,7 +222,7 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 	}
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, "git", append([]string{"-C", dir, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"}, args...)...)
+	cmd := exec.CommandContext(cctx, "git", append(append([]string{"-C", dir}, GitSafety()...), args...)...)
 	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0")
 	out, err := cmd.Output()
 	if err != nil {
@@ -205,7 +235,7 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 	return string(out), nil
 }
 
-// noGitEnv is the process's environment without git's own variables, or EMAIL, which git takes for an identity.
+// noGitEnv removes caller Git variables and EMAIL, which Git takes for an identity, and pins tree attributes.
 func noGitEnv() []string {
 	var env []string
 	for _, kv := range os.Environ() {
@@ -213,5 +243,19 @@ func noGitEnv() []string {
 			env = append(env, kv)
 		}
 	}
-	return env
+	return append(env, "GIT_ATTR_SOURCE=4b825dc642cb6eb9a060e54bf8d69288fbee4904", "GIT_ATTR_NOSYSTEM=1")
+}
+
+// GitSafety pins execution settings for every Git call outside a sandbox. Tree attributes cannot select
+// transformations, and no signature format or signing setting may run a repository's program.
+func GitSafety() []string {
+	return []string{"-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+		"-c", "core.attributesFile=/dev/null", "-c", "gpg.program=false", "-c", "gpg.openpgp.program=false",
+		"-c", "gpg.x509.program=false", "-c", "gpg.ssh.program=false", "-c", "log.showSignature=false",
+		"-c", "push.gpgSign=false"}
+}
+
+// GitEnv removes caller Git settings and disables system and global settings and tree attributes.
+func GitEnv() []string {
+	return append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_PAGER=cat")
 }

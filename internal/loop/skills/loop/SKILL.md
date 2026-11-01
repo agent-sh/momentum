@@ -21,11 +21,11 @@ Statuses run open, investigating, testing, deployed, measuring, closed. You move
 2. State the mechanism: what in the setup makes this happen, specific enough that a change follows from it. A symptom restated is not a mechanism.
 3. Name at least one alternative that would explain the same evidence.
 4. Define the next discriminating test: a check whose result differs between the mechanism and the alternative. Run it with what you can read: a count over the store, a reading of the code at a commit, the history of a file (`momentum evidence git DIR log -- FILE`). Record its result in the mechanism or the next test.
-5. Look for a fix that exists already: `tacit search` for the owner's rule or decision, `git log` of the component for a change that addressed it. A fix that landed after the newest evidence makes the case already solved; one that landed before it and did not hold is the mechanism's first clue.
+5. Look for a fix that exists already: `tacit search` for the owner's rule or decision, `momentum evidence git DIR log` of the component for a change that addressed it. A fix that landed after the newest evidence makes the case already solved; one that landed before it and did not hold is the mechanism's first clue.
 6. Record as you go, so a run cut short leaves what it found: `momentum case set $MOMENTUM_LOOP_CASE --status investigating --mechanism "..." --alternative "..." --next-test "..." --benefit "..."`. Add evidence you found with `momentum case evidence`.
-7. When the test supports the mechanism, name the root cause: `momentum case signature $MOMENTUM_LOOP_CASE root:KEY`, KEY a short slug of the cause (`root:wait-guard-pgrep-self-match`). A case that holds the same root takes this one in: work on there.
+7. When the test supports the mechanism, name the root cause: `momentum case signature $MOMENTUM_LOOP_CASE root:KEY`, KEY a short slug of the cause (`root:wait-guard-pgrep-self-match`). If another case holds that root, the command refuses: a run cannot merge its case into another. Put `root:KEY` in the report's `root`, name the other case's id in the mechanism, and end the run. The runner records the root after the run, with its own authority; the case that holds it takes this one in.
 8. Decide, and record it:
-   - close it: not worth it (any fix costs more than the problem), insufficient evidence (the evidence cannot decide), already solved (a change since fixed it), or a duplicate (`--into` the case with its root cause): `momentum case close ID --reason R --why "..."`;
+   - close it: not worth it (any fix costs more than the problem), insufficient evidence (the evidence cannot decide), already solved (a change since fixed it): `momentum case close ID --reason R --why "..."`;
    - or move it to testing when the mechanism holds, the test supports it, and a change within authority follows: `momentum case set ID --status testing`.
 
 ## Build (a case in testing)

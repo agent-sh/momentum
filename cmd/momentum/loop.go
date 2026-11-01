@@ -135,7 +135,9 @@ func toolchains(home string) (ro, path []string) {
 }
 
 func gitGlobal(key string) string {
-	out, _ := exec.Command("git", "config", "--global", key).Output()
+	cmd := exec.Command("git", append(loop.GitSafety(), "config", "--global", key)...)
+	cmd.Env = append(os.Environ(), "GIT_ATTR_SOURCE=4b825dc642cb6eb9a060e54bf8d69288fbee4904", "GIT_ATTR_NOSYSTEM=1")
+	out, _ := cmd.Output()
 	return strings.TrimSpace(string(out))
 }
 
