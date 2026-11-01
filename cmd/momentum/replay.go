@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -40,6 +41,12 @@ func replay(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	from, err := parseWhen(*since)
 	if err != nil {
 		return usageError{err.Error()}
+	}
+	// inside a loop run, the points go only into the run's own directory: its harness lets it write nowhere else
+	if dir := os.Getenv("MOMENTUM_LOOP_DIR"); dir != "" && *pointsPath != "" {
+		if abs, err := filepath.Abs(*pointsPath); err != nil || !within(abs, dir) {
+			return usageError{"in a loop run, --points writes only under " + dir}
+		}
 	}
 	to := time.Now()
 	if *until != "" {

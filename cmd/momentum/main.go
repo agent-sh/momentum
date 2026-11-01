@@ -32,6 +32,8 @@ const usage = `usage:
                                         events, newest first; one session's (an id or its start) oldest first;
                                         H is claude, codex, pi, opencode or hermes
   momentum evidence status [--since DUR]   events per source and kind, and unparsed records
+  momentum evidence git DIR GITCOMMAND [ARG]...
+                                        a git command that reads (log, show, diff, blame, ...), in DIR's repository
   momentum evidence rebuild SOURCE [--force]
                                         drop what SOURCE contributed; the next ingest reads it from the start
                                         (not sessions; transcripts and incidents only with --force: it says how
@@ -82,6 +84,20 @@ const usage = `usage:
                                         R is not-worth-it, insufficient-evidence, already-solved or duplicate
   momentum case reopen ID --evidence REF... [--at WHEN] --why W
                                         a closed case comes back only on evidence it does not hold
+  momentum loop [--dry] [--family F,F] [--case ID] [--json]
+                                        the improvement loop, once: detect, take each family's case a step with the
+                                        harness's agent, review and land what was proposed
+  momentum loop runs [--since WHEN] [--case ID] [--json]
+                                        the loop's runs, and what the live ones spent in the last day and week
+  momentum ship prepare (--repo DIR | --config DIR) [--case ID]
+  momentum ship check --test CMD [--test-files F,F] [--case ID]
+  momentum ship propose --title T --body-file F --rollback R --signal JSON [--window D] [--lesson L] [--case ID]
+  momentum ship status [--case ID] [--json]
+  momentum ship land ID
+  momentum ship rollback ID --why W
+                                        a case's change package: built in the loop's own work tree, checked by a
+                                        test that fails without it, proposed with its measurement and rollback,
+                                        landed only live and reviewed clean
   momentum version
 Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json), and the
 capacity rules in its capacity section.
@@ -121,6 +137,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		err = capacityCmd(ctx, args[1:], stdout, stderr)
 	case "case":
 		err = caseCmd(ctx, args[1:], stdout, stderr)
+	case "loop":
+		err = loopCmd(ctx, args[1:], stdout, stderr)
+	case "ship":
+		err = shipCmd(ctx, args[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintln(stdout, "momentum", version)
 	case "-h", "--help", "help":
@@ -154,6 +174,8 @@ func evidence(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return status(ctx, args[1:], stdout)
 	case "rebuild":
 		return rebuild(ctx, args[1:], stdout, stderr)
+	case "git":
+		return evidenceGit(ctx, args[1:], stdout, stderr)
 	}
 	return usageError{fmt.Sprintf("unknown evidence command %q", args[0])}
 }
