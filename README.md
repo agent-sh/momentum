@@ -130,6 +130,21 @@ Thresholds have defaults (`idle_days`, `idle_hours`, `max_gib`, `every_days`, `u
 
 Run it with `momentum evidence ingest`'s timer: a oneshot unit of its own that the ingest unit `Wants=`, ordered `After=` it, so a failed ingest does not skip it and an hourly scan has its own timeout.
 
+## Cases
+
+```
+momentum case list [--family F] [--status S,S] [--all] [--json]
+momentum case show ID [--evidence N] [--json]
+momentum case open --family F --signature S --title T [--evidence REF]...
+momentum case set ID [--status open|investigating|testing] [--mechanism M] [--alternative A]... [--next-test T] [--benefit B]
+momentum case evidence ID REF...        ev:EVENT, note:ID, git:OWNER/REPO@SHA, file:PATH, or an address
+momentum case signature ID root:KEY     the root cause; a case that names one another case holds goes into it
+momentum case close ID --reason not-worth-it|insufficient-evidence|already-solved|duplicate [--into ID] --why W
+momentum case reopen ID --evidence REF... --why W
+```
+
+A case is one answer in progress to a standing question: its family, its evidence, the suspected mechanism and the alternatives, the next test that tells them apart, the expected benefit, what it cost so far, and its status (open, investigating, testing, deployed, measuring, closed with a reason). A symptom's signature opens a case, and the same signature finds it again; the root cause's signature merges the cases it explains. A closed case comes back on new evidence only: a recurrence after it was solved, its old rate after it improved, or as much again as it was dismissed on. Only the ship tool deploys a case and only the measure tool closes one as improved. A case unseen for 30 days closes by itself.
+
 Knowledge stays in [tacit](https://github.com/agent-sh/tacit). Cases, evidence and state stay on the machine, never in this repository.
 
 MIT licensed.

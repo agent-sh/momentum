@@ -1,5 +1,5 @@
-// momentum keeps improving an agent system. This first slice is the evidence layer: it ingests the signal
-// stores that already exist into one local event store and lets an agent query them.
+// momentum keeps improving an agent system. It ingests the signal stores that already exist into one local event
+// store, keeps the live sessions moving, keeps the disks from filling, and keeps the cases its improvement loop works.
 package main
 
 import (
@@ -58,6 +58,23 @@ const usage = `usage:
                                         worktrees, scratch, uv, docker); a rule not live lists what it would
                                         delete or offload.
                                         --dry-run deletes and records nothing and runs every rule
+  momentum case list [--family F] [--status S,S] [--all] [--json]
+                                        the cases, the most recently changed first; closed ones with --all
+  momentum case show ID [--evidence N] [--json]
+                                        one case: its investigation, cost, signatures, newest evidence and log
+  momentum case open --family F --signature S --title T [--evidence REF]...
+                                        open a case, or give the case that holds S the evidence
+  momentum case set ID [--status open|investigating|testing] [--title T] [--mechanism M] [--alternative A]...
+                       [--next-test T] [--benefit B]
+                                        record the investigation; testing needs a mechanism and a next test
+  momentum case evidence ID [--at WHEN] [--kind K] [--summary S] REF...
+                                        more evidence: ev:EVENT, note:ID, git:OWNER/REPO@SHA, file:PATH, an address
+  momentum case signature ID SIG        another signature (the root cause's: root:KEY); one another case holds
+                                        merges this case into that one
+  momentum case close ID --reason R [--into ID] --why W
+                                        R is not-worth-it, insufficient-evidence, already-solved or duplicate
+  momentum case reopen ID --evidence REF... --why W
+                                        a closed case comes back only on evidence it does not hold
   momentum version
 Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json), and the
 capacity rules in its capacity section.
@@ -95,6 +112,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		err = superviseCmd(ctx, args[1:], stdout, stderr)
 	case "capacity":
 		err = capacityCmd(ctx, args[1:], stdout, stderr)
+	case "case":
+		err = caseCmd(ctx, args[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintln(stdout, "momentum", version)
 	case "-h", "--help", "help":

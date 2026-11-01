@@ -176,7 +176,7 @@ The `sessions` packages are exported, so the session board imports them instead 
 
 One SQLite file, `~/.local/share/momentum/momentum.db`, mode 0600.
 
-- **Kept tables** hold what cannot be read again: every event, when each session entered its phase, the notes (Report), and what the capacity runs observed (Capacity). A schema change migrates them and never drops them.
+- **Kept tables** hold what cannot be read again: every event, when each session entered its phase, the notes (Report), what the capacity runs observed (Capacity), and the cases with their evidence, signatures and logs (Cases). A schema change migrates them and never drops them.
   - A kept table gains a column it lacks, with the column's default, and keeps its rows. SQLite's ADD COLUMN writes no row, so it costs the same on any table. The next column is one more entry in the store's list of columns: a NOT NULL column needs a default, and an added column cannot be a key.
   - A new kept table takes no step: it changes no row. A store from before it gains it at its next open, and a build from before it, which never reads it, keeps working on the store.
   - A change to their rows is a step: numbered, run once and in order in the transaction that opens a store from before it, and recorded in `schema_steps`. A step that changes what the sources derive (a column they fill, a fix in how they read) reads again.
@@ -314,13 +314,27 @@ Phase 0 showed that each family needs history the machine does not keep today. T
 
 ## Cases
 
-A case holds: its family, evidence references, the suspected mechanism, alternatives, the next discriminating test, the expected benefit, the cost spent so far, and its status.
+`momentum case` keeps the cases, in kept tables of the store (Store). A case is one answer in progress to one of the standing questions. It holds its family, evidence references, the suspected mechanism, alternatives, the next discriminating test, the expected benefit, the cost spent so far (the model's money and tokens, the time, the runs), its signatures, its status, and a log of every change with who made it (`MOMENTUM_ACTOR`, which the loop sets to its run).
 
-Status runs open, investigating, testing, deployed, measuring, then closed with a reason: improved (with the measurement), not worth it, insufficient evidence, or already solved.
-- Cases dedupe by root cause, not by symptom.
-- A dismissed case does not come back unless its evidence changes.
-- A case unseen past its evidence retention closes by itself.
+- **Signatures.** A case is found by its signatures. A detector's names a symptom, a deterministic key of what it saw (The loop, Detectors). A finding whose signature no case holds opens a case; one a case holds gives that case the evidence it lacks, and the case keeps its own title. The same evidence twice changes nothing.
+- **Cases dedupe by root cause, not by symptom.** The investigation names the root cause as a signature of its own (`root:` and a key). A case that names a root another case holds goes into that case: its evidence, signatures and cost move there, it closes as a duplicate that points there, and what its symptom brings later lands there too. A root links symptoms and never opens a case: a stated cause is a guess until a test tells it from the alternatives, so only a symptom's signature opens one.
+- **Evidence** is a reference: an event (`ev:ID`, which takes the event's time, kind and summary and must be in the store), a note (`note:ID`), a commit (`git:OWNER/REPO@SHA`), a file (`file:PATH`, with `@OFFSET`), or an address. The material stays where the reference points.
+- **Status** runs open, investigating, testing, deployed, measuring, then closed with a reason: improved (with the measurement), not worth it, insufficient evidence, already solved, or duplicate (of the case with its root cause).
+  - An investigation moves a case among open, investigating and testing, and to testing only with a mechanism and the next discriminating test on record.
+  - Only the ship tool deploys a case, with its change package, and only its rollback takes a deployed case back (The loop). Only the measure tool moves a case to measuring and closes it as improved, with the measurement.
+  - A case closes by hand from open, investigating or testing, with a reason and why, never as improved.
+- **A dismissed case does not come back unless its evidence changes.** Evidence dated before the close changes nothing.
+  - A case closed as already solved comes back on any evidence after the close.
+  - One closed as improved comes back once its evidence over its last window, as long as its measurement's, reaches what the window before its change held: the problem is back at its old rate. It comes back as a regression, the same case with its history.
+  - One closed as not worth it or as insufficient evidence keeps what comes after the close, and comes back once that reaches what it held when it closed: the problem has happened as often again.
+  - `case reopen` brings one back by hand, only with evidence it does not hold.
+- **A case unseen past its evidence retention closes by itself**: open, investigating or testing, with no evidence for 30 days (about as long as Claude Code keeps a transcript), as insufficient evidence. A deployed or measuring case is its measurement's.
 - A loop that fails the same way twice stops and opens a case instead of retrying.
+- **Prior art.**
+  - Sentry groups events into an issue by a fingerprint, a versioned algorithm that applies to new events only; its similarity grouping merges new hashes into an issue and never splits one. A resolved issue that sees a new event regresses, in the same issue with its history, and "resolve in release" counts only the releases that hold the fix ([Issue grouping](https://docs.sentry.io/concepts/data-management/event-grouping/), [Issue status](https://docs.sentry.io/product/issues/states-triage/)). momentum follows it: a symptom's signature opens a case, a root cause merges cases, and a recurrence reopens the same case. A case closed as improved comes back at its old rate rather than on one event, since a family's signal is a rate and a fix may cut most of a problem, not all of it.
+  - PagerDuty folds alerts with one `dedup_key` into the open alert, and opens a new alert for that key after a resolve ([Sending an alert event](https://docs.pagerduty.com/developer/send-alert-event)). momentum does not: a new case would lose the history.
+  - ITIL 4's problem management keeps a problem, the cause of one or more incidents, apart from the incidents, finds problems by trend analysis and duplicate checks, and closes one only when its risk is removed or accepted, or it no longer applies. A case is the problem and its evidence the incidents.
+  - On Who&When ([Zhang et al., ICML 2025](https://proceedings.mlr.press/v267/zhang25cq.html)) the best automated method names the agent responsible for a failure 53.5% of the time and the decisive step 14.2%. So a stated root cause links cases but opens none, and a case moves to testing only with a test that discriminates its mechanism.
 
 ## The loop
 
