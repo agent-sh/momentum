@@ -34,8 +34,9 @@ const usage = `usage:
   momentum evidence status [--since DUR]   events per source and kind, and unparsed records
   momentum evidence rebuild SOURCE [--force]
                                         drop what SOURCE contributed; the next ingest reads it from the start
-                                        (not sessions; transcripts only with --force, which says how many of
-                                        their events have no source left)
+                                        (not sessions; transcripts and incidents only with --force: it says how
+                                        many transcript events have no source left, and incidents' sightings
+                                        are history their files do not keep)
   momentum sessions [--json] [--all]    the live agent sessions and their phases, read without a model;
                                         each phase change is kept as an event of source sessions
   momentum report [--json]              what needs the owner, what was decided and shipped in the last 12 hours,
@@ -333,12 +334,13 @@ func status(ctx context.Context, args []string, stdout io.Writer) error {
 }
 
 // rebuild drops what a source contributed. The transcripts' events can be all that is left of transcripts their
-// harness deleted, so they go only with --force, which counts first how many of them have no source left. The
-// flag may come before or after the source's name.
+// harness deleted, and the incidents' sightings are all there is of what each incident did over time, so they go
+// only with --force, which counts first how many transcript events have no source left. The flag may come before
+// or after the source's name.
 func rebuild(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("rebuild", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	force := fs.Bool("force", false, "drop the transcripts' events too, which a deleted transcript cannot give back")
+	force := fs.Bool("force", false, "drop kept events too (the transcripts', the incidents' sightings), which cannot be read again")
 	var flags, names []string
 	for _, a := range args {
 		if strings.HasPrefix(a, "-") {
@@ -382,7 +384,12 @@ func rebuild(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	case err != nil:
 		return err
 	}
-	if name != store.Transcripts {
+	switch name {
+	case store.Incidents:
+		fmt.Fprintf(stdout, "%s: dropped %d events; their sightings are gone for good, and the next ingest reads the files from the start\n", name, n)
+		return nil
+	case store.Transcripts:
+	default:
 		fmt.Fprintf(stdout, "%s: dropped %d events; the next ingest reads it from the start\n", name, n)
 		return nil
 	}

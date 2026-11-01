@@ -542,11 +542,18 @@ func caseReopen(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	return nil
 }
 
-// detectors are the families the loop runs, each with its detector, as the machine's configuration sets them.
-func detectors() []detect.Detector {
+// listDetectors is detectors, or what a test puts in their place.
+var listDetectors = detectors
+
+// detectors are the families the loop runs, each with its detector, as the machine's configuration sets them. A
+// configuration it cannot read is an error: without its prefixes, the wake loops' turns would count as his.
+func detectors() ([]detect.Detector, error) {
 	var programs detect.Programs
-	if c, err := config.Load(); err == nil {
+	switch c, err := config.Load(); {
+	case err == nil:
 		programs.Prefixes = c.Detect.ProgramPrefixes
+	case !errors.Is(err, config.ErrNoSources):
+		return nil, err
 	}
 	return []detect.Detector{
 		detect.Failures{},
@@ -554,7 +561,7 @@ func detectors() []detect.Detector {
 		detect.Sessions{Programs: programs, Platforms: func(ctx context.Context) (map[string]string, error) {
 			return hermes.Platforms(ctx, sessions.EnvFromOS().HermesHome)
 		}},
-	}
+	}, nil
 }
 
 // filedJSON is one finding as case detect --json prints it.
@@ -567,6 +574,7 @@ type filedJSON struct {
 	Case      string `json:"case,omitempty"`
 	Observed  string `json:"observed,omitempty"`
 	Status    string `json:"status,omitempty"`
+	Error     string `json:"error,omitempty"` // why the case store refused it
 }
 
 // caseDetect runs the detectors over the last days and files what they find: a new case for a signature no case
@@ -595,8 +603,12 @@ func caseDetect(ctx context.Context, args []string, stdout, stderr io.Writer) er
 			want[f] = true
 		}
 	}
+	every, err := listDetectors()
+	if err != nil {
+		return err
+	}
 	all, unknown := len(want) == 0, maps.Clone(want)
-	for _, d := range detectors() {
+	for _, d := range every {
 		if all || want[d.Family()] {
 			ds = append(ds, d)
 			delete(unknown, d.Family())
@@ -616,13 +628,14 @@ func caseDetect(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	}
 	defer st.Close()
 	outs, swept, sweepErr := detect.Run(ctx, st, ds, detect.Window{Since: since, Until: time.Now()}, caseActor(), *dry)
-	failed := 0
+	failed, refused := 0, 0
 	enc := json.NewEncoder(stdout)
 	for _, o := range outs {
 		if o.Err != nil {
 			failed++
 			fmt.Fprintf(stderr, "[ERROR] %s: %v\n", o.Family, o.Err)
 		}
+		refused += o.Refused()
 		for _, f := range o.Filed {
 			newest := ""
 			if len(f.Finding.Evidence) > 0 {
@@ -633,6 +646,9 @@ func caseDetect(ctx context.Context, args []string, stdout, stderr io.Writer) er
 					Newest: newest, Case: f.Case.ID, Observed: string(f.Observed)}
 				if f.Case.ID != "" {
 					j.Status = statusLine(f.Case)
+				}
+				if f.Err != nil {
+					j.Error = f.Err.Error()
 				}
 				if err := enc.Encode(j); err != nil {
 					return err
@@ -658,11 +674,18 @@ func caseDetect(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		}
 		fmt.Fprintf(stdout, "swept %s: unseen for %dd, closed as %s: %s\n", c.ID, int(store.CaseRetention.Hours()/24), c.Reason, c.Title)
 	}
+	var errs []error
 	if sweepErr != nil {
-		return fmt.Errorf("the sweep: %w", sweepErr)
+		errs = append(errs, fmt.Errorf("the sweep: %w", sweepErr))
 	}
 	if failed > 0 {
-		return fmt.Errorf("%d of %d detectors failed", failed, len(ds))
+		errs = append(errs, fmt.Errorf("%d of %d detectors failed", failed, len(ds)))
 	}
-	return nil
+	switch {
+	case refused == 1:
+		errs = append(errs, errors.New("the case store refused a finding"))
+	case refused > 1:
+		errs = append(errs, fmt.Errorf("the case store refused %d findings", refused))
+	}
+	return errors.Join(errs...)
 }

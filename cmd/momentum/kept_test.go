@@ -92,6 +92,30 @@ func TestARebuildOfTheTranscriptsNeedsForceAndCountsWhatIsGone(t *testing.T) {
 	}
 }
 
+// The incidents' sightings are kept too: what each incident did over time is not in its file. A rebuild of them is
+// refused without --force, and with it says the sightings are gone.
+func TestARebuildOfTheIncidentsNeedsForce(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	at := time.Now().Add(-time.Hour)
+	putEvents(t, store.Event{Source: store.Incidents, SourceKey: "inc-1", TS: at, Actor: store.ActorDetector, Kind: "incident"},
+		store.Event{Source: store.Incidents, SourceKey: "inc-1@x#3", TS: at, Actor: store.ActorDetector, Kind: "incident-seen"})
+	var out, errOut bytes.Buffer
+	if code := run(ctx, []string{"evidence", "rebuild", "incidents"}, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "--force") ||
+		!strings.Contains(errOut.String(), "sightings") {
+		t.Fatalf("exit %d, without --force:\n%s%s", code, out.String(), errOut.String())
+	}
+	if n := countEvents(t, store.Incidents); n != 2 {
+		t.Fatalf("a refused rebuild left %d events", n)
+	}
+	out.Reset()
+	if code := run(ctx, []string{"evidence", "rebuild", "incidents", "--force"}, &out, &errOut); code != 0 ||
+		!strings.Contains(out.String(), "dropped 2 events; their sightings are gone for good") {
+		t.Fatalf("exit %d, with --force:\n%s%s", code, out.String(), errOut.String())
+	}
+}
+
 // A query by harness takes its one name, and finds its events from every source; another name is refused.
 func TestEventsOfAHarnessFromEverySource(t *testing.T) {
 	ctx := context.Background()

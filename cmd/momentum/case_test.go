@@ -2,13 +2,17 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/detect"
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -172,7 +176,7 @@ func TestCaseDetectFilesWhatTheDetectorsFind(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().Add(-time.Hour)
-	deny := "<tool_use_error>wait-guard: pgrep -f 'x' also matches the shell running this command"
+	deny := "<tool_use_error>fence-guard: pgrep -f 'x' also matches the shell running this command"
 	var evs []store.Event
 	for i, s := range []string{"s1", "s1", "s2"} {
 		evs = append(evs, store.Event{Source: store.Transcripts, SourceKey: fmt.Sprintf("%s@%d", s, i), TS: now.Add(time.Duration(i) * time.Minute),
@@ -185,17 +189,99 @@ func TestCaseDetectFilesWhatTheDetectorsFind(t *testing.T) {
 	if code, out, errOut := momentum("case", "detect", "--dry", "--family", "owner-burden"); code != 0 || out != "" {
 		t.Fatalf("one family with nothing: exit %d %q %s", code, out, errOut)
 	}
-	if code, out, _ := momentum("case", "detect", "--dry", "--family", "failures"); code != 0 || !strings.Contains(out, "3 ev  found  wait-guard keeps refusing") {
+	if code, out, _ := momentum("case", "detect", "--dry", "--family", "failures"); code != 0 || !strings.Contains(out, "3 ev  found  fence-guard keeps refusing") {
 		t.Fatalf("dry: exit %d %q", code, out)
 	}
 	if code, out, _ := momentum("case", "list", "--all"); code != 0 || out != "" {
 		t.Fatalf("a dry run filed: %q", out)
 	}
 	code, out, errOut := momentum("case", "detect", "--family", "failures,owner-burden")
-	if code != 0 || !regexp.MustCompile(`c[0-9a-f]{8} opened \[open\]  wait-guard keeps refusing`).MatchString(out) {
+	if code != 0 || !regexp.MustCompile(`c[0-9a-f]{8} opened \[open\]  fence-guard keeps refusing`).MatchString(out) {
 		t.Fatalf("detect: exit %d %q %s", code, out, errOut)
 	}
 	if code, _, errOut := momentum("case", "detect", "--family", "weather"); code != 2 || !strings.Contains(errOut, "no detector") {
 		t.Fatalf("an unknown family: exit %d %s", code, errOut)
+	}
+}
+
+// partialDetector finds a finding the case store refuses, and one it files.
+type partialDetector struct{}
+
+func (partialDetector) Family() string { return "failures" }
+func (partialDetector) Detect(context.Context, *store.Store, detect.Window) ([]store.Finding, error) {
+	return []store.Finding{{Family: "failures", Signature: "bad\nsignature", Title: "x"},
+		{Family: "failures", Signature: "failures/v1:good", Title: "good", Evidence: []store.Evidence{{Ref: "file:/t/g", At: time.Now().Add(-time.Hour)}}}}, nil
+}
+
+// case detect says what the case store refused apart from a detector that failed: the refused finding's line, its
+// error in --json, and a run's error that counts it; a case swept closed has its line too. A configuration that
+// cannot be read stops the run, and a dry run reads a store from before this build as it is: it migrates nothing.
+func TestCaseDetectNamesWhatItRefusedAndSwept(t *testing.T) {
+	home, conf := t.TempDir(), t.TempDir()
+	t.Setenv("MOMENTUM_HOME", home)
+	t.Setenv("MOMENTUM_CONFIG", conf)
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, _, err := st.ObserveCase(context.Background(), store.Finding{Family: "failures", Signature: "failures/v1:old", Title: "an old one",
+		Evidence: []store.Evidence{{Ref: "file:/t/old", At: time.Now().Add(-40 * 24 * time.Hour)}}}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	db, err := sql.Open("sqlite", "file:"+paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	long := time.Now().Add(-40 * 24 * time.Hour).UnixMilli()
+	if _, err := db.Exec(`UPDATE cases SET opened = ?, seen = ?`, long, long); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	was := listDetectors
+	t.Cleanup(func() { listDetectors = was })
+	listDetectors = func() ([]detect.Detector, error) { return []detect.Detector{partialDetector{}}, nil }
+	code, out, errOut := momentum("case", "detect", "--json")
+	var lines []filedJSON
+	for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
+		var j filedJSON
+		if err := json.Unmarshal([]byte(l), &j); err != nil {
+			t.Fatalf("%q: %v", l, err)
+		}
+		lines = append(lines, j)
+	}
+	if code != 3 || !strings.Contains(errOut, "the case store refused a finding") || strings.Contains(errOut, "detectors failed") || len(lines) != 3 ||
+		!strings.Contains(lines[0].Error, "bad case") || lines[1].Error != "" || lines[1].Observed != "opened" ||
+		lines[2].Case != old.ID || lines[2].Observed != "swept" {
+		t.Fatalf("exit %d %s\n%+v", code, errOut, lines)
+	}
+	listDetectors = detectors
+	if err := os.WriteFile(filepath.Join(conf, "sources.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, errOut := momentum("case", "detect", "--dry"); code == 0 || !strings.Contains(errOut, "sources.json") {
+		t.Fatalf("an unreadable configuration: exit %d %s", code, errOut)
+	}
+	os.Remove(filepath.Join(conf, "sources.json"))
+	// a store from before the cases: the dry run refuses it and leaves it so
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	db, err = sql.Open("sqlite", "file:"+paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE events (id TEXT PRIMARY KEY, source TEXT NOT NULL, source_key TEXT NOT NULL, ts INTEGER NOT NULL,
+	  actor TEXT NOT NULL, kind TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if code, _, _ := momentum("case", "detect", "--dry"); code == 0 {
+		t.Fatal("a dry run read a store from before this build")
+	}
+	db, _ = sql.Open("sqlite", "file:"+paths.DB())
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = 'cases'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("a dry run migrated the store: %d %v", n, err)
 	}
 }

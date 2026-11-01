@@ -80,7 +80,10 @@ var ErrObserved = errors.New("its events are observations, not read from a sourc
 const Transcripts = "transcripts"
 
 // ErrKept means a source's events may be all that is left of what it read: Rebuild drops them only when forced.
-var ErrKept = errors.New("its events are kept: a transcript its harness deleted since cannot be read again")
+var ErrKept = errors.New("its events are kept")
+
+// Incidents is the source of an incident detector's incidents and their sightings (source.Incidents).
+const Incidents = "incidents"
 
 // Harnesses are the names events give the harnesses, one spelling in every source and in the sessions layer:
 // tacit's reader's (claude, codex, pi, hermes), and opencode, which only the sessions layer reads.
@@ -770,14 +773,17 @@ func (s *Store) Skipped(ctx context.Context, source string) (int, error) {
 // Rebuild drops everything a source contributed, so the next ingest reads it again from the start, and returns
 // how many events it dropped. Sources share one state space by name prefix: "radar" also drops "radar-feedback".
 // The observed events (Sessions, Supervise, Capacity) cannot be read again, so Rebuild refuses them with
-// ErrObserved. The transcripts' events can be all that is left of transcripts their harness deleted, so without
-// force Rebuild refuses them with ErrKept.
+// ErrObserved. The transcripts' events can be all that is left of transcripts their harness deleted, and the
+// incidents' sightings are all there is of what an incident did over time (its file keeps only its running count),
+// so without force Rebuild refuses them with ErrKept.
 func (s *Store) Rebuild(ctx context.Context, source string, force bool) (int, error) {
 	switch {
 	case source == Sessions, source == Supervise, source == Capacity:
 		return 0, fmt.Errorf("%s: %w", source, ErrObserved)
 	case source == Transcripts && !force:
-		return 0, fmt.Errorf("%s: %w", source, ErrKept)
+		return 0, fmt.Errorf("%s: %w: a transcript its harness deleted since cannot be read again", source, ErrKept)
+	case source == Incidents && !force:
+		return 0, fmt.Errorf("%s: %w: its sightings are what each incident did over time, and its file keeps only its running count", source, ErrKept)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -804,6 +810,72 @@ func (s *Store) Rebuild(ctx context.Context, source string, force bool) (int, er
 		}
 	}
 	return int(n), tx.Commit()
+}
+
+// CallsOf reads the calls the transcripts' results answer: for each result with a tool id, the tool call of its
+// session with that id, at most reach before it. It returns each call's text by its result's id.
+func (s *Store) CallsOf(ctx context.Context, results []Event, reach time.Duration) (map[string]string, error) {
+	type key struct{ session, id string }
+	type result struct {
+		id string
+		ts int64
+	}
+	want := map[key][]result{}
+	tools := map[string]bool{}
+	var lo, hi int64
+	for _, r := range results {
+		id := toolID(r.Meta)
+		if r.Source != Transcripts || id == "" {
+			continue
+		}
+		k := key{r.Session, id}
+		want[k] = append(want[k], result{r.ID(), r.TS.UnixMilli()})
+		tools[r.Tool] = true
+		if ms := r.TS.UnixMilli(); lo == 0 || ms < lo {
+			lo = ms
+		}
+		hi = max(hi, r.TS.UnixMilli())
+	}
+	if len(want) == 0 {
+		return nil, nil
+	}
+	args := []any{Transcripts, lo - reach.Milliseconds(), hi}
+	for t := range tools {
+		args = append(args, t)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT session, ts, meta, summary FROM events WHERE kind = 'tool_call' AND source = ? AND ts >= ?
+	  AND ts <= ? AND tool IN (?`+strings.Repeat(",?", len(tools)-1)+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var session, meta, summary string
+		var ts int64
+		if err := rows.Scan(&session, &ts, &meta, &summary); err != nil {
+			return nil, err
+		}
+		for _, r := range want[key{session, toolID(meta)}] {
+			if ts <= r.ts && ts >= r.ts-reach.Milliseconds() {
+				out[r.id] = summary
+			}
+		}
+	}
+	return out, rows.Err()
+}
+
+// toolID is the tool call's id an event's meta holds.
+func toolID(meta string) string {
+	i := strings.Index(meta, `"tool_id":"`)
+	if i < 0 {
+		return ""
+	}
+	rest := meta[i+len(`"tool_id":"`):]
+	if j := strings.IndexByte(rest, '"'); j >= 0 {
+		return rest[:j]
+	}
+	return ""
 }
 
 // EventByKey reads a source's event by its key; ok is false when the store holds none.

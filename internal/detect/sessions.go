@@ -43,11 +43,9 @@ func (d Sessions) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 	if r == (Recur{}) {
 		r = SessionsRecur
 	}
-	sup, err := st.Events(ctx, store.Query{Since: w.Since, Until: w.Until, Source: store.Supervise,
+	// each part's findings stand when another part fails: the errors come back beside them
+	sup, serr := st.Events(ctx, store.Query{Since: w.Since, Until: w.Until, Source: store.Supervise,
 		Kinds: []string{supervise.KindCase, supervise.KindOutcome}, Limit: maxRows})
-	if err != nil {
-		return nil, err
-	}
 	var gave, other []occurrence
 	for _, e := range sup {
 		var m struct {
@@ -67,12 +65,11 @@ func (d Sessions) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 				title: fmt.Sprintf("Supervision's %s messages: %s", m.Rule, m.Result)})
 		}
 	}
-	// each part's findings stand when another part fails: the error comes back beside them
 	nudged, nerr := d.nudged(ctx, st, w)
 	other = append(other, nudged...)
 	waited, werr := waits(ctx, st, w)
 	other = append(other, waited...)
-	return append(gather("sessions", gave, GaveUpRecur), gather("sessions", other, r)...), errors.Join(nerr, werr)
+	return append(gather("sessions", gave, GaveUpRecur), gather("sessions", other, r)...), errors.Join(serr, nerr, werr)
 }
 
 // nudged replays the rules over the window and keeps the stops the owner ended with a nudge that no rule would

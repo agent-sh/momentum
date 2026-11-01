@@ -396,52 +396,87 @@ func TestRunAllKeepsGoingPastAFailingSource(t *testing.T) {
 	}
 }
 
-// Each change of an incident's last sighting or count of repeats is a sighting of its own, with the repeats since
-// the one before: the incident's one event says only where it stands. A file read again with nothing new adds
-// none; a count that started again counts all of it.
+// Each change of an incident's last sighting or count of repeats is a sighting of its own, keyed by both, with the
+// repeats since the one before: the incident's one event says only where it stands. A file read again with
+// nothing new adds none, and neither does a change of anything else, nor a time the file writes to the
+// microsecond; a count that moves while the time stays is a sighting; a count that started again counts all of
+// it. A first sighting says so, and when the incident was first seen.
 func TestAnIncidentsSightingsAreEvents(t *testing.T) {
 	st := openStore(t)
 	dir := t.TempDir()
 	at := time.Now().Add(-time.Hour)
-	write := func(lastSeen string, repeat int, mtime time.Time) {
+	n := 0
+	write := func(f map[string]any) {
 		t.Helper()
 		if err := os.MkdirAll(filepath.Join(dir, "open"), 0o700); err != nil {
 			t.Fatal(err)
 		}
 		p := filepath.Join(dir, "open", "inc-9.json")
-		raw, _ := json.Marshal(map[string]any{"incident_id": "inc-9", "status": "reported", "summary": "a network drops", "last_seen": lastSeen,
-			"repeat_count": repeat})
+		f["incident_id"], f["status"], f["summary"] = "inc-9", "reported", "a network drops"
+		raw, _ := json.Marshal(f)
 		if err := os.WriteFile(p, raw, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Chtimes(p, mtime, mtime); err != nil {
+		n++
+		if err := os.Chtimes(p, at.Add(time.Duration(n)*time.Minute), at.Add(time.Duration(n)*time.Minute)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	inc := Incidents{Dir: dir}
-	write("2026-01-02T10:00:00Z", 12, at)
-	ingest(t, inc, st)
-	write("2026-01-02T11:00:00Z", 30, at.Add(time.Minute))
-	ingest(t, inc, st)
-	write("2026-01-02T11:00:00Z", 30, at.Add(2*time.Minute)) // touched, nothing new
-	ingest(t, inc, st)
-	write("2026-01-02T12:00:00Z", 4, at.Add(3*time.Minute)) // the detector started its count again
-	ingest(t, inc, st)
+	for _, f := range []map[string]any{
+		{"last_seen": "2026-01-02T10:00:00Z", "repeat_count": 12, "first_seen": "2026-01-01T08:00:00Z", "created_at": "2026-01-01T09:00:00Z"},
+		{"last_seen": "2026-01-02T11:00:00Z", "repeat_count": 30},
+		{"last_seen": "2026-01-02T11:00:00Z", "repeat_count": 30, "attempts": 2}, // a change of nothing it counts
+		{"last_seen": "2026-01-02T12:00:00.391086+00:00", "repeat_count": 35},
+		{"last_seen": "2026-01-02T12:00:00.391086+00:00", "repeat_count": 35, "attempts": 3}, // the same, to the microsecond
+		{"last_seen": "2026-01-02T12:00:00.391086+00:00", "repeat_count": 38},                // the count alone moves
+		{"last_seen": "2026-01-02T12:00:00.391086+00:00", "repeat_count": 41},
+		{"last_seen": "2026-01-02T13:00:00Z", "repeat_count": 4}, // the detector started its count again
+	} {
+		write(f)
+		ingest(t, inc, st)
+	}
 	var news []string
 	for k, e := range all(t, st, "incidents") {
 		if e.Kind != "incident-seen" {
 			continue
 		}
-		var m struct{ New, Repeat int }
+		var m struct {
+			New, Repeat int
+			Incident    string
+			First       bool
+			FirstSeen   string `json:"first_seen"`
+		}
 		json.Unmarshal([]byte(e.Meta), &m)
-		news = append(news, fmt.Sprintf("%s %d/%d", strings.TrimPrefix(k, "inc-9@"), m.New, m.Repeat))
+		line := fmt.Sprintf("%s %d/%d %s", strings.TrimPrefix(k, "inc-9@"), m.New, m.Repeat, m.Incident)
+		if m.First {
+			line += " first " + m.FirstSeen
+		}
+		news = append(news, line)
 	}
 	sort.Strings(news)
-	want := []string{"2026-01-02T10:00:00Z 12/12", "2026-01-02T11:00:00Z 18/30", "2026-01-02T12:00:00Z 4/4"}
+	want := []string{"2026-01-02T10:00:00Z#12 12/12 inc-9 first 2026-01-01T08:00:00Z", "2026-01-02T11:00:00Z#30 18/30 inc-9",
+		"2026-01-02T12:00:00.391086Z#35 5/35 inc-9", "2026-01-02T12:00:00.391086Z#38 3/38 inc-9", "2026-01-02T12:00:00.391086Z#41 3/41 inc-9",
+		"2026-01-02T13:00:00Z#4 4/4 inc-9"}
 	if !slices.Equal(news, want) {
-		t.Fatalf("sightings %v, want %v", news, want)
+		t.Fatalf("sightings\n%s\nwant\n%s", strings.Join(news, "\n"), strings.Join(want, "\n"))
 	}
 	if e := all(t, st, "incidents")["inc-9"]; !strings.Contains(e.Meta, `"repeat":4`) {
 		t.Fatalf("the incident %+v", e)
+	}
+	// a first sighting of no repeats counts itself; one with no first sighting of its own says when it was made
+	st2 := openStore(t)
+	dir2 := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir2, "open"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(map[string]any{"incident_id": "inc-1", "status": "new", "summary": "x", "last_seen": "2026-01-02T10:00:00Z",
+		"created_at": "2026-01-01T09:00:00Z", "repeat_count": 0})
+	if err := os.WriteFile(filepath.Join(dir2, "open", "inc-1.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ingest(t, Incidents{Dir: dir2}, st2)
+	if e := all(t, st2, "incidents")["inc-1@2026-01-02T10:00:00Z#0"]; !strings.Contains(e.Meta, `"new":1`) || !strings.Contains(e.Meta, `"first_seen":"2026-01-01T09:00:00Z"`) {
+		t.Fatalf("a first sighting of none: %+v", e)
 	}
 }

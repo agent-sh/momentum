@@ -9,8 +9,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
-	"fmt"
 	"regexp"
 	"sort"
 	"strings"
@@ -120,24 +118,42 @@ type Filed struct {
 	Finding  store.Finding
 	Case     store.Case
 	Observed store.Observed // empty on a dry run, and for a finding the store refused (Err)
-	Err      error
+	Err      error          // why the case store refused it
 }
 
-// Outcome is one detector's run: what it found and filed, and why it stopped short, if it did.
+// Outcome is one detector's run: what it found and filed, and why the detector stopped short, if it did (a finding
+// the case store refused says so in its own Err).
 type Outcome struct {
 	Family string
 	Filed  []Filed
 	Err    error
 }
 
+// Refused counts the findings the case store refused.
+func (o Outcome) Refused() int {
+	n := 0
+	for _, f := range o.Filed {
+		if f.Err != nil {
+			n++
+		}
+	}
+	return n
+}
+
 // Run runs each detector over the window and files what it finds. A detector that fails is named, and what it
 // found before it failed is filed; a finding the case store refuses is named, and the next one is filed. Then it
-// sweeps the cases unseen past their retention. A dry run files and sweeps nothing.
+// sweeps the cases unseen past their retention, of the families whose detector read the whole window: a family
+// whose detector failed, or did not run, was not looked at, so its cases are not taken for stopped. A dry run
+// files and sweeps nothing.
 func Run(ctx context.Context, st *store.Store, ds []Detector, w Window, actor string, dry bool) ([]Outcome, []store.Case, error) {
 	var out []Outcome
+	var looked []string
 	for _, d := range ds {
 		fs, err := d.Detect(ctx, st, w)
 		o := Outcome{Family: d.Family(), Err: err}
+		if err == nil {
+			looked = append(looked, d.Family())
+		}
 		for _, f := range fs {
 			if dry {
 				o.Filed = append(o.Filed, Filed{Finding: f})
@@ -145,23 +161,26 @@ func Run(ctx context.Context, st *store.Store, ds []Detector, w Window, actor st
 			}
 			c, obs, err := st.ObserveCase(ctx, f, actor)
 			o.Filed = append(o.Filed, Filed{Finding: f, Case: c, Observed: obs, Err: err})
-			if err != nil {
-				o.Err = errors.Join(o.Err, fmt.Errorf("%s: %w", f.Signature, err))
-			}
 		}
 		out = append(out, o)
 	}
-	if dry {
+	if dry || len(looked) == 0 {
 		return out, nil, nil
 	}
-	swept, err := st.SweepCases(ctx, w.Until, store.CaseRetention, actor)
+	swept, err := st.SweepCases(ctx, w.Until, store.CaseRetention, actor, looked...)
 	return out, swept, err
 }
 
-// Norm is a text with what varies between two sightings of one problem taken out, so they share a key: tags,
-// quoted values, addresses, paths, ids and numbers become a capital letter each (Q, U, P, H, N) in the lower-cased
-// text; one space between words, at most n characters, cut at a word.
+// Norm is a text with what varies between two sightings of one problem taken out (mask), so they share a key, with
+// no punctuation at its end, at most n characters, cut at a word.
 func Norm(s string, n int) string {
+	return cutWords(strings.TrimRight(mask(s), " .,;:"), n)
+}
+
+// mask is a text with what varies between two sightings of one problem taken out: tags, quoted values, addresses,
+// paths, file names, ids and numbers become a capital letter each (Q, U, P, H, N) in the lower-cased text, on one
+// line with one space between words.
+func mask(s string) string {
 	s = strings.ToLower(s)
 	for _, r := range normRules {
 		s = r.re.ReplaceAllString(s, r.to)
@@ -173,7 +192,14 @@ func Norm(s string, n int) string {
 		return w
 	})
 	s = numRe.ReplaceAllString(s, "N")
-	s = strings.TrimRight(strings.Join(strings.Fields(plain.Line(s)), " "), " .,;:")
+	return strings.Join(strings.Fields(plain.Line(s)), " ")
+}
+
+// masked says a word is all value: one of mask's letters alone.
+func masked(w string) bool { return len(w) == 1 && strings.Contains("QUPHN", w) }
+
+// cutWords is s in at most n characters, cut at a word when one ends in its second half.
+func cutWords(s string, n int) string {
 	if utf8.RuneCountInString(s) <= n {
 		return s
 	}
@@ -183,6 +209,11 @@ func Norm(s string, n int) string {
 	}
 	return cut
 }
+
+// fileExt are the endings of a file's name with no slash in it, which mask takes for a path.
+const fileExt = `txt|md|rst|json|jsonl|ndjson|ya?ml|toml|ini|cfg|conf|env|lock|log|csv|tsv|xml|html?|css|sql|db|sqlite3?|go|mod|sum|rs|py|pyc|ipynb|` +
+	`js|mjs|cjs|ts|tsx|jsx|c|cc|cpp|h|hpp|java|kt|swift|rb|php|sh|bash|zsh|ps1|patch|diff|tar|gz|tgz|zip|xz|zst|whl|png|jpe?g|gif|svg|` +
+	`pdf|parquet|safetensors|gguf|bin|exe|so|dylib|out|tmp|bak|pid|sock|service|timer|plist`
 
 var normRules = []struct {
 	re *regexp.Regexp
@@ -194,8 +225,10 @@ var normRules = []struct {
 	// a single quote opens a quoted value only with no letter or digit before it: can't is a word, not a quote
 	{regexp.MustCompile(`(^|[^\pL\pN])'[^'\n]*'`), "${1}Q"},
 	{regexp.MustCompile(`[a-z][a-z0-9+.-]*://\S+`), "U"},
-	{regexp.MustCompile(`\b[\w.-]+(?:/[\w.@%+-]+)+`), "P"}, // a relative path, by its slashes
+	{regexp.MustCompile(`\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b`), "U"}, // a mail or ssh address: user@host
+	{regexp.MustCompile(`\b[\w.-]+(?:/[\w.@%+-]+)+`), "P"},        // a relative path, by its slashes
 	{regexp.MustCompile(`~[\w./@%+-]*|\.{0,2}/[\w./@%+-]*[\w/]`), "P"},
+	{regexp.MustCompile(`\b[\w-]+(?:\.[\w-]+)*\.(?:` + fileExt + `)\b`), "P"}, // a file's name, by its ending
 	{regexp.MustCompile(`\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b`), "H"},
 	{regexp.MustCompile(`\b0x[0-9a-f]+\b`), "H"},
 	{regexp.MustCompile(`\b(?:[0-9a-f]*[0-9][0-9a-f]*[a-f][0-9a-f]*|[0-9a-f]*[a-f][0-9a-f]*[0-9][0-9a-f]*)\b`), "H"},
@@ -221,21 +254,21 @@ func slug(s string, n int) string {
 	return out
 }
 
-// Programs are what marks a turn the transcripts credit to the owner as a program's (SPEC, Boundaries): momentum's
-// own marker, the prefixes of the machine's wake loops and briefs (configured), the same text in two sessions
-// within 2 seconds, and a long text sent in three sessions of a window (a template a program fills). A short text
-// he types every day, a nudge, is his.
+// Programs are what marks a turn the transcripts credit to the owner as a program's (SPEC, Boundaries): the
+// prefixes of the machine's wake loops and briefs (configured), the same text in two sessions within 2 seconds, and
+// a long text sent in three sessions of a window (a template a program fills). A short text he types every day, a
+// nudge, is his. momentum's own messages are not among the owner's turns at all (the transcripts source keeps them
+// as harness text), so a turn of his that opens with its marker holds his own words after it, and is his.
 type Programs struct {
 	Prefixes []string // the machine's wake loops' and briefs' prefixes, from its configuration
 }
 
 // Program-text rules.
 const (
-	momentumMarker = "[momentum]"
-	twinSpan       = 2 * time.Second // the same text in two sessions this close: a program sent it
-	templateSess   = 3               // a long text in this many sessions of a window: a template
-	templateWords  = 8               // a text this long or longer can be a template; a shorter one is his
-	sameTurn       = 2 * time.Minute // the same text again in a session this soon: one turn recorded twice
+	twinSpan      = 2 * time.Second // the same text in two sessions this close: a program sent it
+	templateSess  = 3               // a long text in this many sessions of a window: a template
+	templateWords = 8               // a text this long or longer can be a template; a shorter one is his
+	sameTurn      = 2 * time.Minute // the same text again in a session this soon: one turn recorded twice
 )
 
 // Of marks the owner events (oldest first) that a program typed, and the ones that repeat a turn recorded twice;
@@ -262,7 +295,7 @@ func (p Programs) Of(turns []store.Event, since time.Time) map[int]bool {
 	for i, t := range turns {
 		text := strings.TrimSpace(t.Summary)
 		switch {
-		case text == "" || strings.HasPrefix(text, momentumMarker):
+		case text == "":
 			out[i] = true
 		case len(strings.Fields(text)) >= templateWords && len(sessions[text]) >= templateSess:
 			out[i] = true

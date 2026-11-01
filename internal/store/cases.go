@@ -1090,16 +1090,23 @@ func (s *Store) AddCaseCost(ctx context.Context, id string, c Cost, actor string
 // SweepCases closes, as insufficient evidence, every case open, investigating or testing whose newest evidence is
 // older than the retention and that has been open as long since it opened or last came back: the problem stopped,
 // and what it rests on is gone from its source. Any evidence after the close brings it back. A deployed or
-// measuring case is its measurement's. It returns the cases it closed.
-func (s *Store) SweepCases(ctx context.Context, now time.Time, retention time.Duration, actor string) ([]Case, error) {
+// measuring case is its measurement's. Only the families named are swept (none named: every family), since a
+// family nothing looked at says nothing stopped. It returns the cases it closed.
+func (s *Store) SweepCases(ctx context.Context, now time.Time, retention time.Duration, actor string, families ...string) ([]Case, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
 	cut := now.Add(-retention).UnixMilli()
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM cases WHERE status IN (?,?,?) AND seen < ? AND MAX(opened, back) < ?`, CaseOpen,
-		CaseInvestigating, CaseTesting, cut, cut)
+	q, args := `SELECT id FROM cases WHERE status IN (?,?,?) AND seen < ? AND MAX(opened, back) < ?`, []any{CaseOpen, CaseInvestigating, CaseTesting, cut, cut}
+	if len(families) > 0 {
+		q += ` AND family IN (?` + strings.Repeat(",?", len(families)-1) + `)`
+		for _, f := range families {
+			args = append(args, f)
+		}
+	}
+	rows, err := tx.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}

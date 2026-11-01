@@ -17,14 +17,16 @@ import (
 // either changes, and a file never seen is parsed whatever its time says (a move, cp -p, rsync -a or a
 // restore keeps an old mtime). A file that cannot be read is reported and retried on the next run.
 //
-// An incident is one event, rewritten as its file changes: its last sighting and its running count of repeats.
-// Each change of those is also an event of its own, a sighting (kind incident-seen, keyed by the incident and
-// its last sighting), with the repeats since the sighting before it: what the incident did over time, which the
-// one event no longer says. A rebuild reads the files again and keeps one sighting per incident, the one its
-// file shows now.
+// An incident is one event, rewritten as its file changes: its status, its last sighting and its running count of
+// repeats. Each change of the last sighting or the count is also an event of its own, a sighting (kind
+// incident-seen, keyed by the incident, its last sighting and its count), with the repeats since the sighting
+// before it: what the incident did over time, which the one event no longer says. A change of anything else (a
+// note, its status, its attempts) files no sighting. The sightings are kept: a rebuild drops them only when forced
+// (store.Rebuild), and then each incident's next sighting is a first one again, which holds its whole count; it
+// carries when the incident was first seen, so a count from before a window is not read as the window's.
 type Incidents struct{ Dir string }
 
-func (i Incidents) Name() string { return "incidents" }
+func (i Incidents) Name() string { return store.Incidents }
 
 type incidentFile struct {
 	ID        string `json:"incident_id"`
@@ -32,6 +34,7 @@ type incidentFile struct {
 	Summary   string `json:"summary"`
 	Signature string `json:"normalized_signature"`
 	LastSeen  string `json:"last_seen"`
+	FirstSeen string `json:"first_seen"`
 	CreatedAt string `json:"created_at"`
 	Repeat    int    `json:"repeat_count"`
 	Severity  string `json:"severity"`
@@ -114,14 +117,25 @@ func (i Incidents) Ingest(ctx context.Context, st *store.Store) (Result, error) 
 			if had {
 				json.Unmarshal([]byte(prev.Meta), &was)
 			}
-			if !had || !prev.TS.Equal(ts) || was.Repeat != inc.Repeat {
+			// the store keeps a time to the millisecond, a file may write it to the microsecond
+			if !had || prev.TS.UnixMilli() != ts.UnixMilli() || was.Repeat != inc.Repeat {
 				fresh := inc.Repeat - was.Repeat
 				if !had || fresh < 0 { // a first sighting, or a count that started again, holds all it counts
 					fresh = inc.Repeat
 				}
-				evs = append(evs, store.Event{Source: i.Name(), SourceKey: inc.ID + "@" + ts.UTC().Format(time.RFC3339Nano), TS: ts,
-					Actor: store.ActorDetector, Kind: "incident-seen", Summary: e.Summary, Ref: p,
-					Meta: meta(map[string]any{"status": inc.Status, "repeat": inc.Repeat, "new": max(fresh, 1), "severity": inc.Severity})})
+				first := inc.FirstSeen
+				if parseTime(first).IsZero() {
+					first = inc.CreatedAt
+				}
+				m := map[string]any{"incident": inc.ID, "status": inc.Status, "repeat": inc.Repeat, "new": max(fresh, 1), "severity": inc.Severity}
+				if !had {
+					m["first"] = true
+					if t := parseTime(first); !t.IsZero() {
+						m["first_seen"] = t.UTC().Format(time.RFC3339Nano)
+					}
+				}
+				evs = append(evs, store.Event{Source: i.Name(), SourceKey: fmt.Sprintf("%s@%s#%d", inc.ID, ts.UTC().Format(time.RFC3339Nano), inc.Repeat),
+					TS: ts, Actor: store.ActorDetector, Kind: "incident-seen", Summary: e.Summary, Ref: p, Meta: meta(m)})
 			}
 			evs = append(evs, e)
 			marks = append(marks, parsed{p, mtime, size})
