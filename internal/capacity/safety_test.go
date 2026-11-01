@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -319,8 +320,8 @@ func TestASharedBlobGoesOnlyUnderItsLock(t *testing.T) {
 	}
 }
 
-// A note the rule resolved itself stands again when its items come back; one the owner resolved does not. uv's
-// prune that a uv process holds off is a problem.
+// A note the rule resolved itself stands again when its items come back; one the owner resolved does not, while the
+// same problem lasts. uv's prune that a uv process holds off for a day is a problem, and the hold's note follows it.
 func TestANoteTheRuleResolvedStandsAgainForTheSameItems(t *testing.T) {
 	ctx := context.Background()
 	cfg := Config{Live: []string{RuleUV}}.Normal()
@@ -338,23 +339,31 @@ func TestANoteTheRuleResolvedStandsAgainForTheSameItems(t *testing.T) {
 	}
 	id := "capacity:" + RuleUV + ":busy"
 	runWith(now, held)
+	runWith(now.Add(24*time.Hour), held)
 	if n, ok, _ := st.Note(ctx, id); !ok || !n.Done.IsZero() || !strings.Contains(n.Title, "waits to be pruned") {
-		t.Fatalf("setup: a prune a uv process holds off is a problem note: %+v", n)
+		t.Fatalf("setup: a prune a uv process holds off for a day is a problem note: %+v", n)
 	}
-	runWith(now.Add(time.Hour), uvTools("40000000000", nil)) // the prune goes through: the rule resolves the note
+	runWith(now.Add(25*time.Hour), uvTools("40000000000", nil)) // the prune goes through: the rule resolves the note
 	if n, _, _ := st.Note(ctx, id); n.Done.IsZero() {
 		t.Fatal("setup: the rule resolves a note none of whose items it finds")
 	}
-	runWith(now.Add(2*time.Hour), held)
+	runWith(now.Add(26*time.Hour), held)
+	runWith(now.Add(50*time.Hour), held)
 	if n, _, _ := st.Note(ctx, id); !n.Done.IsZero() {
 		t.Fatal("a note the rule resolved stands again when its item is back")
 	}
-	if _, _, err := st.DoneNote(ctx, id, now.Add(2*time.Hour)); err != nil {
+	if _, _, err := st.DoneNote(ctx, id, now.Add(50*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	runWith(now.Add(3*time.Hour), held)
+	runWith(now.Add(51*time.Hour), held)
 	if n, _, _ := st.Note(ctx, id); n.Done.IsZero() {
 		t.Error("a note the owner resolved stays resolved while its item is the same")
+	}
+	runWith(now.Add(52*time.Hour), uvTools("40000000000", nil)) // that hold ends; the next one lasts a day
+	runWith(now.Add(53*time.Hour), held)
+	runWith(now.Add(77*time.Hour), held)
+	if n, _, _ := st.Note(ctx, id); !n.Done.IsZero() {
+		t.Error("the owner's resolution lasts while its hold does: the next hold that lasts a day stands")
 	}
 	evs, _ := st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindReport}})
 	if len(evs) != 1 || !evs[0].TS.Equal(now.Truncate(time.Millisecond)) {
@@ -393,6 +402,49 @@ func TestAFullDiskIsNotAFastFill(t *testing.T) {
 	}
 	if n, _, _ := st.Note(ctx, "capacity:full:"+dir); n.Done.IsZero() {
 		t.Error("a disk below its full percent again resolves it")
+	}
+}
+
+// A disk's notes name it by its path, escaped where an id may not hold a character of it: a disk whose path holds a
+// space has its fill, full and filled notes, and the run goes on. The notes' text names the disk as it is.
+func TestADiskWhosePathHoldsASpaceHasItsNotes(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "my disk")
+	must(t, os.MkdirAll(dir, 0o755))
+	st := openStore(t)
+	now := time.Now()
+	var fs syscall.Statfs_t
+	must(t, syscall.Statfs(dir, &fs))
+	used := int64(fs.Blocks-fs.Bfree) * int64(fs.Bsize)
+	// 24 minutes ago the disk held 15 GiB less: it fills fast, and it is past a full percent this low
+	must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: now.Add(-24 * time.Minute)},
+		[]store.DiskSample{{Disk: dir, At: now.Add(-24 * time.Minute), Size: 1 << 40, Used: used - 15<<30, Avail: 1 << 39}}, nil))
+	cfg := Config{Disks: []string{dir}, Fill: FillConfig{Full: 0.001}}.Normal()
+	o := options(t, procRoot(t), now, nil)
+	o.Rules = []string{RuleUV}
+	if _, err := Run(ctx, cfg, st, o); err != nil {
+		t.Fatalf("a disk whose path holds a space fails the run: %v", err)
+	}
+	key := strings.ReplaceAll(dir, " ", "%20")
+	for _, id := range []string{"capacity:fill:" + key, "capacity:full:" + key} {
+		if n, ok, _ := st.Note(ctx, id); !ok || n.Kind != store.NoteProblem || !n.Done.IsZero() || !strings.HasPrefix(n.Title, dir+" is ") {
+			t.Errorf("%s: a problem note that names the disk as it is: %+v", id, n)
+		}
+	}
+	// 40 minutes on the fill is over, and the disk is below a full percent of 100
+	cfg.Fill.Full = 100
+	o.Clock = func() time.Time { return now.Add(40 * time.Minute) }
+	if _, err := Run(ctx, cfg, st, o); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"capacity:fill:" + key, "capacity:full:" + key} {
+		if n, _, _ := st.Note(ctx, id); n.Done.IsZero() {
+			t.Errorf("%s: resolved: %+v", id, n)
+		}
+	}
+	if n, ok, _ := st.Note(ctx, "capacity:filled:"+key+"@"+strconv.FormatInt(now.UnixMilli(), 10)); !ok || n.Kind != store.NoteDecided ||
+		!strings.HasPrefix(n.Title, dir+" filled fast from ") {
+		t.Errorf("the fill that ended is a decided note: %+v", n)
 	}
 }
 

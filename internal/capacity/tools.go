@@ -188,6 +188,10 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 	if err != nil {
 		return nil, nil, err
 	}
+	held, err := r.mark(ctx, uvHeldMark) // when the scans that hold the prune off began, whatever held it (uvHold)
+	if err != nil {
+		return nil, nil, err
+	}
 	max := int64(r.cfg.UV.MaxGiB * (1 << 30))
 	every := time.Duration(r.cfg.UV.EveryDays * 24 * float64(time.Hour))
 	notes := []string{fmt.Sprintf("cache %s at %s", gib(size), short(dir))}
@@ -241,11 +245,16 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 	lk := uvLock(r.opt.ProcRoot, c.named, c.lockReal, r.m, c.isLock)
 	up, now := uptimeTicks(r.opt.ProcRoot), look()
 	// a quiet wait for one uv process that has gone on for a day is reported: no install takes that long, and the
-	// rule cannot tell what such a process runs (a command that changed its environment, a stuck sync)
+	// rule cannot tell what such a process runs (a command that changed its environment, a stuck sync). So is any
+	// quiet wait once the rule has been held off for a day, whatever held it before: the hold is a problem by then.
 	keep := func(pid int, why string) ([]Finding, []string, error) {
+		f.class = "busy" // a hold all the same: its day counts from the first scan it held off (uvHold)
 		if p, ok := now.Table[pid]; ok && up > 0 && p.Start > 0 && up-p.Start >= int64(uvQuietMax.Seconds())*userHZ {
 			return report(fmt.Sprintf("%s, which has run for %s, looks like a uv process that may write the cache, and the "+
 				"rule cannot tell what it runs", why, (time.Duration(up-p.Start) * time.Second / userHZ).Round(time.Hour)))
+		}
+		if !held.IsZero() && r.now.Sub(held) >= uvQuietMax {
+			return report(why + " may write the cache")
 		}
 		f.Action, f.Why = ActKeep, "waits for an install: "+why
 		return []Finding{f}, notes, nil
@@ -516,7 +525,8 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 var uvUnderLockWait = 10 * time.Second
 
 // uvQuietMax is how long the rule waits quietly for one uv process that may write the cache before it reports it: a
-// day, longer than any install (an extension built from source takes hours).
+// day, longer than any install (an extension built from source takes hours). It is also how long the prune may be
+// held off, whatever holds it, before the hold is a problem note (record).
 var uvQuietMax = 24 * time.Hour
 
 // uvHolder is a Tools whose uv can be handed open files: the forced prune gets the file that holds capacity's lock,

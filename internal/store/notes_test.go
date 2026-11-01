@@ -262,6 +262,35 @@ func TestANoteIsPlainTextAndAWrongOneIsRefused(t *testing.T) {
 	}
 }
 
+// A name an id may hold is its own part of an id; any other is escaped into one the store takes, and two of those
+// never meet.
+func TestANameIsAPartOfAnIDTheStoreTakes(t *testing.T) {
+	ctx := context.Background()
+	st, _ := open(t)
+	for name, want := range map[string]string{
+		"/data":                 "/data",
+		"/mnt/100%":             "/mnt/100%",
+		"/mnt/caf\u00e9":        "/mnt/caf\u00e9",
+		"/media/u/My Disk":      "/media/u/My%20Disk",
+		"/mnt/100% full":        "/mnt/100%25%20full",
+		"/mnt/a\tb":             "/mnt/a%09b",
+		"/mnt/zero\u200bwidth ": "/mnt/zero%E2%80%8Bwidth%20",
+		"/mnt/no\xffutf8 x":     "/mnt/no%FFutf8%20x",
+		"/mnt/caf\u00e9 x":      "/mnt/caf\u00e9%20x",
+	} {
+		got := IDPart(name)
+		if got != want {
+			t.Errorf("%q: %q, want %q", name, got, want)
+		}
+		if _, err := st.PutNote(ctx, Note{ID: "x:" + got, Kind: NoteProblem, Title: "a disk"}); err != nil {
+			t.Errorf("%q: the store refuses %q: %v", name, got, err)
+		}
+	}
+	if a, b := IDPart("/mnt/a b%20"), IDPart("/mnt/a b "); a == b {
+		t.Errorf("two names that need the escape give one part: %q", a)
+	}
+}
+
 // A needs or problem note stands until done; a decided or shipped one from the window on.
 func TestWhichNotesStand(t *testing.T) {
 	since := time.UnixMilli(1_700_000_000_000)

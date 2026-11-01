@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -110,7 +111,9 @@ func TestANoteForExactlyTheProblemReasons(t *testing.T) {
 	for _, rule := range Rules {
 		res.Rules = append(res.Rules, RuleResult{Rule: rule, Ran: true, Findings: found[rule]})
 	}
-	must(t, (&runner{st: st, now: time.Now(), res: res}).record(ctx))
+	now := time.Now()
+	must(t, st.SetMark(ctx, uvHeldMark, now.Add(-uvQuietMax))) // a uv hold is a problem once it has lasted a day
+	must(t, (&runner{st: st, now: now, res: res}).record(ctx))
 	for _, c := range reasons {
 		id := "capacity:" + c.rule + ":" + c.class
 		if n, ok, err := st.Note(ctx, id); err != nil || ok != c.problem || ok && !n.Done.IsZero() {
@@ -805,6 +808,112 @@ func TestAFillNoteReadsOnlyItsOwnFillsWriters(t *testing.T) {
 	}
 	if !strings.Contains(n.Detail, "cp (pid 53) wrote 2.0 GiB in 45s") {
 		t.Errorf("under a minute reads in seconds: %s", n.Detail)
+	}
+}
+
+// A fill that ended waits for nobody: at the first run without it, its problem note is resolved and a decided note
+// says what happened, with the writers the fill's runs saw. The report shows it for 12 hours from the fill's end, as
+// it shows every decided note. The next fill has a problem note again.
+func TestAFillThatEndedIsADecidedNote(t *testing.T) {
+	ctx := context.Background()
+	st, dir, now, proc := fillFixture(t)
+	start, end := now.Add(-5*time.Minute), now.Add(40*time.Minute)
+	train := fakeProc{pid: 31, ppid: 1, argv: []string{"torchrun"}, cwd: dir, written: 1 << 30}
+	fillRun(t, st, dir, start, proc(1201, train), quiet)
+	// the disk held 3 GiB less at the fill's first run than it holds now
+	var fs syscall.Statfs_t
+	must(t, syscall.Statfs(dir, &fs))
+	before := int64(fs.Blocks-fs.Bfree)*int64(fs.Bsize) - 3<<30
+	must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: start, Procs: 2},
+		[]store.DiskSample{{Disk: dir, At: start, Size: 1 << 40, Used: before, Avail: 1 << 39}}, nil))
+	train.written = 11 << 30
+	if d := fillRun(t, st, dir, now, proc(1501, train), quiet).Disks[0]; !d.Fast {
+		t.Fatalf("setup: the fill goes on: %+v", d)
+	}
+	id := "capacity:fill:" + dir
+	if n, ok, _ := st.Note(ctx, id); !ok || !n.Done.IsZero() {
+		t.Fatalf("setup: a fill that goes on stands: %+v", n)
+	}
+	// 40 minutes on, no sample of the window is old enough for a rate: the fill is over
+	d := fillRun(t, st, dir, end, proc(1801, train), quiet).Disks[0]
+	if d.Fast {
+		t.Fatalf("setup: the fill ended: %+v", d)
+	}
+	if n, _, _ := st.Note(ctx, id); n.Done.IsZero() {
+		t.Errorf("a fill that ended resolves its problem note: %+v", n)
+	}
+	n, ok, _ := st.Note(ctx, "capacity:filled:"+dir+"@"+strconv.FormatInt(start.UnixMilli(), 10))
+	clock := end.Format("15:04")
+	if end.YearDay() != start.YearDay() {
+		clock = end.Format("Jan 2 15:04")
+	}
+	title := plain.Clip(fmt.Sprintf("%s filled fast from %s to %s (+%s)", dir, start.Format("Jan 2 15:04"), clock, gib(d.Used-before)),
+		store.TitleMax)
+	if !ok || n.Kind != store.NoteDecided || n.Title != title || n.At.UnixMilli() != end.UnixMilli() || n.Source != store.Capacity {
+		t.Fatalf("a decided note says when the fill began and ended and what the disk gained, dated at its end: %+v, want %q", n, title)
+	}
+	if !strings.Contains(n.Detail, "torchrun (pid 31) wrote 10.0 GiB in 5m0s") {
+		t.Errorf("its detail names the fill's writers: %s", n.Detail)
+	}
+	if !n.Standing(end.Add(11*time.Hour).Add(-12*time.Hour)) || n.Standing(end.Add(13*time.Hour).Add(-12*time.Hour)) {
+		t.Errorf("the report shows it for 12 hours: %+v", n)
+	}
+	fillRun(t, st, dir, end.Add(5*time.Minute), proc(2101, train), quiet)
+	ns, _ := st.Notes(ctx)
+	for _, x := range ns {
+		if strings.HasPrefix(x.ID, "capacity:fill") && x.ID != id && x.ID != n.ID {
+			t.Errorf("a run after the fill's end writes nothing more: %+v", x)
+		}
+	}
+	// the next fill: the disk held 15 GiB less 24 minutes before it
+	next := end.Add(time.Hour)
+	must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: next.Add(-24 * time.Minute), Procs: 2},
+		[]store.DiskSample{{Disk: dir, At: next.Add(-24 * time.Minute), Size: 1 << 40, Used: before - 12<<30, Avail: 1 << 39}}, nil))
+	fillRun(t, st, dir, next, proc(5401, train), quiet)
+	if n, _, _ := st.Note(ctx, id); !n.Done.IsZero() || n.At.UnixMilli() != next.UnixMilli() {
+		t.Errorf("the next fill is a problem again, from its own start: %+v", n)
+	}
+}
+
+// An older build kept the problem note of a fill that ended, rewritten to say so, until someone resolved it. The next
+// run ends that fill as a fill ends now: from its first run to the first run after its last, with its writers.
+func TestAnOlderBuildsEndedFillEndsAsAFillEndsNow(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st := openStore(t)
+	now := time.Now()
+	start, last, end := now.Add(-50*time.Minute), now.Add(-45*time.Minute), now.Add(-40*time.Minute)
+	for at, used := range map[time.Time]int64{start: 100 << 30, last: 104 << 30, end: 106 << 30} {
+		must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: at, Procs: 2},
+			[]store.DiskSample{{Disk: dir, At: at, Size: 1 << 40, Used: used, Avail: 1 << 39}}, nil))
+	}
+	for _, at := range []time.Time{start, last} {
+		meta, _ := json.Marshal(DiskState{Disk: dir, Fast: true, Writers: []Writer{{PID: 61, Comm: "rsync", Cwd: dir, Written: 4 << 30, Over: 300}}})
+		_, err := st.Put(ctx, []store.Event{{Source: store.Capacity, SourceKey: fmt.Sprintf("fill/%s/%d", dir, at.UnixMilli()), TS: at,
+			Actor: store.ActorDetector, Kind: KindFill, Summary: "x", Meta: string(meta)}})
+		must(t, err)
+	}
+	id := "capacity:fill:" + dir
+	_, err := st.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Source: store.Capacity, Importance: store.ImportanceHigh,
+		At: start, Title: dir + " filled fast from " + start.Format("Jan 2 15:04") + " to " + end.Format("15:04") + "; 66% used now"})
+	must(t, err)
+	o := options(t, procRoot(t), now, nil)
+	o.Rules = []string{RuleUV}
+	if _, err := Run(ctx, Config{Disks: []string{dir}}.Normal(), st, o); err != nil {
+		t.Fatal(err)
+	}
+	if n, _, _ := st.Note(ctx, id); n.Done.IsZero() {
+		t.Errorf("the older build's note of a fill that ended is resolved: %+v", n)
+	}
+	n, ok, _ := st.Note(ctx, "capacity:filled:"+dir+"@"+strconv.FormatInt(start.UnixMilli(), 10))
+	clock := end.Format("15:04")
+	if end.YearDay() != start.YearDay() {
+		clock = end.Format("Jan 2 15:04")
+	}
+	title := plain.Clip(fmt.Sprintf("%s filled fast from %s to %s (+6.0 GiB)", dir, start.Format("Jan 2 15:04"), clock), store.TitleMax)
+	if !ok || n.Kind != store.NoteDecided || n.Title != title || n.At.UnixMilli() != end.UnixMilli() ||
+		!strings.Contains(n.Detail, "rsync (pid 61) wrote 8.0 GiB in 10m0s") {
+		t.Errorf("a decided note from the fill's first run to the run after its last, with its writers: %+v, want %q", n, title)
 	}
 }
 

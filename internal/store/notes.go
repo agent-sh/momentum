@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/agent-sh/momentum/internal/plain"
 )
@@ -107,7 +108,7 @@ func clean(n Note, now time.Time) (Note, error) {
 		return bad("importance %d is not high (1), normal (0) or low (-1)", n.Importance)
 	}
 	switch {
-	case strings.IndexFunc(n.ID, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) }) >= 0:
+	case strings.IndexFunc(n.ID, notInID) >= 0:
 		return bad("id %q holds a space, a control or a format character", n.ID)
 	case strings.HasPrefix(n.ID, "-"):
 		return bad("id %q starts with -", n.ID)
@@ -140,6 +141,35 @@ func clean(n Note, now time.Time) (Note, error) {
 	}
 	n.Done = time.Time{}
 	return n, nil
+}
+
+// notInID reports whether a note's id may not hold a character: a space, a control or a format character.
+func notInID(r rune) bool {
+	return unicode.IsSpace(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r)
+}
+
+// IDPart is a name as a part of a note's id, for a writer that keys a note by a name it does not choose (a disk's
+// path). A name an id may hold is the part as it is, so the id of such a name never changes. In any other name, each
+// character an id may not hold (a space, a control or a format character), each % and each byte that is no UTF-8 is
+// written as %XX, one for each of its bytes. Two names that need the escape never give the same part; one gives the
+// part of a name that needs none only when that name spells its escape out.
+func IDPart(name string) string {
+	if strings.IndexFunc(name, notInID) < 0 {
+		return name
+	}
+	var b strings.Builder
+	for i := 0; i < len(name); {
+		r, n := utf8.DecodeRuneInString(name[i:])
+		if r == '%' || notInID(r) || r == utf8.RuneError && n == 1 {
+			for _, c := range []byte(name[i : i+n]) {
+				fmt.Fprintf(&b, "%%%02X", c)
+			}
+		} else {
+			b.WriteString(name[i : i+n])
+		}
+		i += n
+	}
+	return b.String()
 }
 
 // newNoteID is a short random id: n and 8 hex digits.
