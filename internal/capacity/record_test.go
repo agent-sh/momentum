@@ -821,7 +821,7 @@ func endText(from, to time.Time) string {
 
 // A fill that ended waits for nobody: at the first run without it, its problem note is resolved and the disk's
 // decided note says what happened, from the start of the window its first run read (which holds the growth that
-// showed the fill) to its end, with what the disk gained and the writers its runs saw. The report shows it for 12
+// showed the fill) to its last fast run, with what the disk gained in that span and the writers its runs saw. The report shows it for 12
 // hours from the fill's end, as it shows every decided note. The next fill is a problem again, and its end replaces
 // the decided note.
 func TestAFillThatEndedIsADecidedNote(t *testing.T) {
@@ -942,6 +942,40 @@ func TestAnOlderBuildsEndedFillEndsAsAFillEndsNow(t *testing.T) {
 		!strings.Contains(n.Detail, "rsync (pid 61) wrote 8.0 GiB in 10m0s") {
 		t.Errorf("a decided note from the window of the fill's first run to its last fast run, with its writers: %+v, want %q",
 			n, title)
+	}
+}
+
+// A store that holds no sample at the fill's last fast run (one that lost it) gets the span to the fill's end, with
+// the change to it, whatever its sign.
+func TestAFillWithNoSampleAtItsLastRunSpansToItsEnd(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st := openStore(t)
+	base := time.Date(2026, 3, 3, 23, 40, 0, 0, time.Local)
+	start, last, end := base.Add(15*time.Minute), base.Add(20*time.Minute), base.Add(25*time.Minute)
+	// no sample at last
+	for at, used := range map[time.Time]int64{base: 100 << 30, start: 110 << 30, end: 98 << 30} {
+		must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: at, Procs: 2},
+			[]store.DiskSample{{Disk: dir, At: at, Size: 1 << 40, Used: used, Avail: 1 << 39}}, nil))
+	}
+	for at, window := range map[time.Time]time.Duration{start: start.Sub(base), last: 10 * time.Minute} {
+		meta, _ := json.Marshal(DiskState{Disk: dir, Fast: true, WindowMS: window.Milliseconds()})
+		_, err := st.Put(ctx, []store.Event{{Source: store.Capacity, SourceKey: fmt.Sprintf("fill/%s/%d", dir, at.UnixMilli()), TS: at,
+			Actor: store.ActorDetector, Kind: KindFill, Summary: "x", Meta: string(meta)}})
+		must(t, err)
+	}
+	_, err := st.PutNote(ctx, store.Note{ID: "capacity:fill:" + dir, Kind: store.NoteProblem, Source: store.Capacity,
+		Importance: store.ImportanceHigh, At: start, Title: dir + " is filling"})
+	must(t, err)
+	o := options(t, procRoot(t), end.Add(55*time.Minute), nil)
+	o.Rules = []string{RuleUV}
+	if _, err := Run(ctx, Config{Disks: []string{dir}}.Normal(), st, o); err != nil {
+		t.Fatal(err)
+	}
+	n, ok, _ := st.Note(ctx, "capacity:filled:"+dir)
+	title := plain.Clip(dir+" filled fast from Mar 3 23:40 to Mar 4 00:05 (-2.0 GiB)", store.TitleMax)
+	if !ok || n.Title != title {
+		t.Errorf("with no sample at the last fast run, the span runs to the end: %+v, want %q", n, title)
 	}
 }
 

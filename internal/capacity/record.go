@@ -556,10 +556,12 @@ func (r *runner) recordFill(ctx context.Context, d DiskState) error {
 }
 
 // filled ends the fill that began at start (its first run): its problem note is resolved, and its decided note says
-// when it began, when it ended, what the disk's use grew by between the two, and the writers its runs saw. It began
-// where the window its first run read the rate over began: the growth that showed the fill is the fill's. It ended at
-// the first sample after its last run (this run's, for a fill that ends on it), which the store keeps for a run that
-// comes after one that died. The note is dated at the end, so the report shows it for 12 hours from then.
+// when it began, its last fast run, what the disk's use grew by between the two, and the writers its runs saw. It
+// began where the window its first run read the rate over began: the growth that showed the fill is the fill's. A drop
+// after its last fast run (a cleanup, a deleted checkpoint) is not the fill's. It ended at the first sample after its
+// last run (this run's, for a fill that ends on it), which the store keeps for a run that comes after one that died;
+// the note is dated then, so the report shows it for 12 hours from the end. A store that holds no fast run of the fill,
+// or no sample at its last one, gets the span to the end instead.
 func (r *runner) filled(ctx context.Context, d DiskState, start time.Time) error {
 	runs, err := r.fastRuns(ctx, d.Disk, start)
 	if err != nil {
@@ -580,19 +582,33 @@ func (r *runner) filled(ctx context.Context, d DiskState, start time.Time) error
 	if len(after) > 0 {
 		end = after[0].At
 	}
-	// The title spans the fill, its first run's window to its last fast run, and says what the disk gained in it. A drop
-	// after the last fast run (a cleanup, a deleted checkpoint) is not the fill's, so it does not cut the figure.
-	title := fmt.Sprintf("%s filled fast from %s to %s", d.Disk, from.Format("Jan 2 15:04"), endClock(from, last))
-	base, err := r.st.DiskSamples(ctx, d.Disk, from)
+	samples, err := r.st.DiskSamples(ctx, d.Disk, from)
 	if err != nil {
 		return err
 	}
-	peak, err := r.st.DiskSamples(ctx, d.Disk, last)
-	if err != nil {
-		return err
+	// the span's end: the sample at the last fast run, or the end where the store holds none of it
+	var base, peak *store.DiskSample
+	for i := range samples {
+		s := &samples[i]
+		if base == nil {
+			base = s
+		}
+		if len(runs) > 0 && s.At.Equal(last) {
+			peak = s
+		}
 	}
-	if len(base) > 0 && len(peak) > 0 && base[0].At.Before(peak[0].At) {
-		title += " (" + signedGiB(peak[0].Used-base[0].Used) + ")"
+	upTo := last
+	if peak == nil {
+		upTo = end
+		for i := range samples {
+			if !samples[i].At.After(end) {
+				peak = &samples[i]
+			}
+		}
+	}
+	title := fmt.Sprintf("%s filled fast from %s to %s", d.Disk, from.Format("Jan 2 15:04"), endClock(from, upTo))
+	if base != nil && peak != nil && base.At.Before(peak.At) {
+		title += " (" + signedGiB(peak.Used-base.Used) + ")"
 	}
 	all := d
 	all.Writers = writersOf(runs)
@@ -606,7 +622,7 @@ func (r *runner) filled(ctx context.Context, d DiskState, start time.Time) error
 	return nil
 }
 
-// endClock is a fill's end as its note says it: the time, and the date too when it is not the start's.
+// endClock is the end of a fill's span as its note says it: the time, and the date too when it is not the start's.
 func endClock(start, end time.Time) string {
 	if y, m, day := start.Date(); end.Year() == y && end.Month() == m && end.Day() == day {
 		return end.Format("15:04")
