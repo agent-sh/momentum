@@ -79,6 +79,21 @@ func TestTheCaseCommands(t *testing.T) {
 	if code, out, _ := momentum("case", "list", "--all"); code != 0 || !strings.Contains(out, "closed: duplicate of "+id) {
 		t.Fatalf("list --all: exit %d %q", code, out)
 	}
+	if code, out, _ := momentum("case", "list", "--status", "closed"); code != 0 || !strings.HasPrefix(out, other) || strings.Contains(out, "\n"+id) {
+		t.Fatalf("list --status closed: exit %d %q", code, out)
+	}
+	if code, out, _ := momentum("case", "list", "--status", "investigating,open"); code != 0 || strings.Contains(out, other) || !strings.HasPrefix(out, id) {
+		t.Fatalf("list --status investigating,open: exit %d %q", code, out)
+	}
+	if code, _, errOut := momentum("case", "show", id, other, "--json"); code != 2 || !strings.Contains(errOut, "one case's id") {
+		t.Fatalf("show with two ids: exit %d %s", code, errOut)
+	}
+	_, out, _ = momentum("case", "open", "--family", "failures", "--signature", "failures:third", "--title", "a third", "--evidence", "file:/c@1")
+	third := strings.SplitN(out, ":", 2)[0]
+	if code, out, _ := momentum("case", "close", third, "--reason", "duplicate", "--into", id, "--why", "same"); code != 0 ||
+		!strings.HasPrefix(out, id+": "+third+" went into this case") {
+		t.Fatalf("close --into: exit %d %q", code, out)
+	}
 	if code, _, errOut := momentum("case", "close", id, "--reason", "not-worth-it"); code != 2 || !strings.Contains(errOut, "--why") {
 		t.Fatalf("close without why: exit %d %s", code, errOut)
 	}

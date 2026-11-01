@@ -188,6 +188,10 @@ func caseList(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return err
 	}
 	enc := json.NewEncoder(stdout)
+	width := 14
+	for _, c := range cs {
+		width = max(width, len(statusLine(c)))
+	}
 	for _, c := range cs {
 		if *asJSON {
 			if err := enc.Encode(caseJSON(c)); err != nil {
@@ -195,7 +199,7 @@ func caseList(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			}
 			continue
 		}
-		fmt.Fprintf(stdout, "%-9s %-16s %-14s %4d ev  $%6.2f  %s  %s\n", c.ID, c.Family, statusLine(c), c.Evidence, c.Cost.USD,
+		fmt.Fprintf(stdout, "%-9s %-16s %-*s %4d ev  $%6.2f  %s  %s\n", c.ID, c.Family, width, statusLine(c), c.Evidence, c.Cost.USD,
 			c.Updated.Local().Format("01-02 15:04"), c.Title)
 	}
 	return nil
@@ -235,6 +239,9 @@ func caseShow(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	asJSON := fs.Bool("json", false, "one JSON object")
 	if err := fs.Parse(rest); err != nil {
 		return usageError{err.Error()}
+	}
+	if fs.NArg() > 0 {
+		return usageError{fmt.Sprintf("case show takes one case's id, got %q too", fs.Arg(0))}
 	}
 	st, err := store.Open(paths.DB())
 	if err != nil {

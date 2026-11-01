@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS cases (id TEXT PRIMARY KEY, family TEXT NOT NULL, tit
   runs INTEGER NOT NULL DEFAULT 0, closed_evidence INTEGER NOT NULL DEFAULT 0, opened INTEGER NOT NULL,
   updated INTEGER NOT NULL, seen INTEGER NOT NULL, closed INTEGER NOT NULL DEFAULT 0, deployed INTEGER NOT NULL DEFAULT 0,
   package TEXT NOT NULL DEFAULT '', window_ms INTEGER NOT NULL DEFAULT 0, before_n INTEGER NOT NULL DEFAULT 0,
-  after_n INTEGER NOT NULL DEFAULT 0, effect TEXT NOT NULL DEFAULT '');
+  after_n INTEGER NOT NULL DEFAULT 0, effect TEXT NOT NULL DEFAULT '', back INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS case_signatures (signature TEXT PRIMARY KEY, case_id TEXT NOT NULL, at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS case_evidence (case_id TEXT NOT NULL, ref TEXT NOT NULL, at INTEGER NOT NULL,
   kind TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', added INTEGER NOT NULL,
@@ -126,6 +126,7 @@ type Case struct {
 	Seen           time.Time // its newest evidence
 	Closed         time.Time
 	Deployed       time.Time // when its change went in, which its measurement counts from
+	Back           time.Time // when it last came back after a close: its retention counts from the later of this and Opened
 	Package        string    // its change package's directory
 	Measurement    Measurement
 	Signatures     []string
@@ -215,7 +216,7 @@ func checkSignature(sig string) error {
 }
 
 // refForms are the forms a reference takes: an event, a note, a commit, a file, an address.
-var refForms = regexp.MustCompile(`^(?:ev:[0-9a-f]{24}|note:[^\s]+|git:[\w.-]+/[\w.-]+@[0-9a-f]{7,40}|file:(?:/|~/)[^@]*(?:@\d+)?|https?://\S+)$`)
+var refForms = regexp.MustCompile(`^(?:ev:[0-9a-f]{24}|note:[^\s]+|git:[\w.-]+/[\w.-]+@[0-9a-f]{7,40}|file:(?:/|~/).+|https?://\S+)$`)
 
 func checkRef(ref string) error {
 	switch {
@@ -240,15 +241,15 @@ func newCaseID() string {
 
 const caseColumns = `id, family, title, status, reason, merged_into, mechanism, alternatives, next_test, benefit, cost_usd,
   cost_tokens, cost_ms, runs, closed_evidence, opened, updated, seen, closed, deployed, package, window_ms, before_n,
-  after_n, effect`
+  after_n, effect, back`
 
 func scanCase(row interface{ Scan(...any) error }) (Case, error) {
 	var c Case
 	var status, reason, alts string
-	var costMS, opened, updated, seen, closed, deployed, window int64
+	var costMS, opened, updated, seen, closed, deployed, window, back int64
 	if err := row.Scan(&c.ID, &c.Family, &c.Title, &status, &reason, &c.Into, &c.Mechanism, &alts, &c.NextTest, &c.Benefit,
 		&c.Cost.USD, &c.Cost.Tokens, &costMS, &c.Cost.Runs, &c.ClosedEvidence, &opened, &updated, &seen, &closed, &deployed,
-		&c.Package, &window, &c.Measurement.Before, &c.Measurement.After, &c.Measurement.Effect); err != nil {
+		&c.Package, &window, &c.Measurement.Before, &c.Measurement.After, &c.Measurement.Effect, &back); err != nil {
 		return Case{}, err
 	}
 	c.Status, c.Reason = CaseStatus(status), CloseReason(reason)
@@ -262,6 +263,9 @@ func scanCase(row interface{ Scan(...any) error }) (Case, error) {
 	}
 	if deployed != 0 {
 		c.Deployed = time.UnixMilli(deployed)
+	}
+	if back != 0 {
+		c.Back = time.UnixMilli(back)
 	}
 	return c, nil
 }
@@ -345,9 +349,15 @@ func resolveEvidence(ctx context.Context, q querier, e Evidence, now time.Time) 
 	if e.At.IsZero() {
 		e.At = now
 	}
+	if e.At.After(now.Add(clockSkew)) {
+		return Evidence{}, badCase("%q is dated %s, after now: evidence is of what happened", e.Ref, e.At.Format(time.RFC3339))
+	}
 	e.Kind, e.Summary = caseText(e.Kind, 80), caseText(e.Summary, evidenceTextMax)
 	return e, nil
 }
+
+// clockSkew is how far after now a piece of evidence may be dated: two clocks of one machine read a moment apart.
+const clockSkew = time.Minute
 
 // addEvidence stores the evidence a case does not hold yet, and returns how many were new and the newest time
 // among them.
@@ -435,8 +445,8 @@ func reopenIfBack(ctx context.Context, q querier, c Case, added, actor string, n
 	if !back {
 		return false, caseLog(ctx, q, c.ID, actor, "kept closed", added+"; "+why, now)
 	}
-	if _, err := q.ExecContext(ctx, `UPDATE cases SET status = ?, reason = '', closed = 0, closed_evidence = 0, updated = ?
-	  WHERE id = ?`, CaseOpen, now.UnixMilli(), c.ID); err != nil {
+	if _, err := q.ExecContext(ctx, `UPDATE cases SET status = ?, reason = '', closed = 0, closed_evidence = 0, updated = ?, back = ?
+	  WHERE id = ?`, CaseOpen, now.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
 		return false, err
 	}
 	action := "reopened"
@@ -836,7 +846,7 @@ func (s *Store) ReopenCase(ctx context.Context, id string, evs []Evidence, why, 
 		return Case{}, badCase("case %s comes back only on evidence it does not hold", c.ID)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, reason = '', closed = 0, closed_evidence = 0, updated = ?,
-	  seen = MAX(seen, ?) WHERE id = ?`, CaseOpen, now.UnixMilli(), newest.UnixMilli(), c.ID); err != nil {
+	  seen = MAX(seen, ?), back = ? WHERE id = ?`, CaseOpen, now.UnixMilli(), newest.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
 	if err := caseLog(ctx, tx, c.ID, actor, "reopened", fmt.Sprintf("closed as %s; %d new evidence: %s", c.Reason, added, why), now); err != nil {
@@ -952,6 +962,10 @@ func merge(ctx context.Context, q querier, c Case, into, why, actor string, now 
 	if _, err := q.ExecContext(ctx, `UPDATE cases SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...); err != nil {
 		return Case{}, err
 	}
+	// Each case that went into c goes where c goes: one hop from its live case, however many merges come.
+	if _, err := q.ExecContext(ctx, `UPDATE cases SET merged_into = ? WHERE merged_into = ?`, dst.ID, c.ID); err != nil {
+		return Case{}, err
+	}
 	// The cost moves: the duplicate keeps none, so a sum over cases counts each run once. Its log keeps its lines.
 	if _, err := q.ExecContext(ctx, `UPDATE cases SET status = ?, reason = ?, merged_into = ?, closed = ?, updated = ?,
 	  closed_evidence = 0, cost_usd = 0, cost_tokens = 0, cost_ms = 0, runs = 0 WHERE id = ?`, CaseClosed, string(Duplicate),
@@ -1022,6 +1036,11 @@ func (s *Store) AddCaseSignature(ctx context.Context, id, sig, actor string) (Ca
 		return Case{}, false, badCase("case %s holds %q, and case %s is %s: only an open, investigating or testing case goes into another",
 			h.ID, sig, c.ID, c.Status)
 	}
+	if h.Status == CaseClosed {
+		return Case{}, false, badCase("case %s holds %q and is closed (%s): a case does not go into a closed one by its signature. If this "+
+			"case's evidence is new to it, bring it back first (case reopen %s --evidence REF... --why WHY), then add the signature", h.ID, sig,
+			h.Reason, h.ID)
+	}
 	if c, err = merge(ctx, tx, c, h.ID, "the same signature "+sig, actor, now); err != nil {
 		return Case{}, false, err
 	}
@@ -1059,17 +1078,17 @@ func (s *Store) AddCaseCost(ctx context.Context, id string, c Cost, actor string
 }
 
 // SweepCases closes, as insufficient evidence, every case open, investigating or testing whose newest evidence is
-// older than the retention and that has been open as long: the problem stopped, and what it rests on is gone from
-// its source. Any evidence after the close brings it back. A deployed or measuring case is its measurement's. It
-// returns the cases it closed.
-func (s *Store) SweepCases(ctx context.Context, now time.Time, retention time.Duration) ([]Case, error) {
+// older than the retention and that has been open as long since it opened or last came back: the problem stopped,
+// and what it rests on is gone from its source. Any evidence after the close brings it back. A deployed or
+// measuring case is its measurement's. It returns the cases it closed.
+func (s *Store) SweepCases(ctx context.Context, now time.Time, retention time.Duration, actor string) ([]Case, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
 	cut := now.Add(-retention).UnixMilli()
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM cases WHERE status IN (?,?,?) AND seen < ? AND opened < ?`, CaseOpen,
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM cases WHERE status IN (?,?,?) AND seen < ? AND MAX(opened, back) < ?`, CaseOpen,
 		CaseInvestigating, CaseTesting, cut, cut)
 	if err != nil {
 		return nil, err
@@ -1094,7 +1113,7 @@ func (s *Store) SweepCases(ctx context.Context, now time.Time, retention time.Du
 		  WHERE id = ?`, CaseClosed, string(Insufficient), now.UnixMilli(), now.UnixMilli(), id); err != nil {
 			return nil, err
 		}
-		if err := caseLog(ctx, tx, id, "sweep", "closed", fmt.Sprintf("%s: unseen for %s, past its evidence's retention", Insufficient,
+		if err := caseLog(ctx, tx, id, actor, "closed", fmt.Sprintf("%s: unseen for %s, past its evidence's retention", Insufficient,
 			days(retention)), now); err != nil {
 			return nil, err
 		}
