@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -329,9 +328,9 @@ func TestANoteTheRuleResolvedStandsAgainForTheSameItems(t *testing.T) {
 	now := time.Now()
 	held := fakeTools{answers: map[string]string{"uv cache dir": "/home/u/.cache/uv\n", "uv cache size": "40000000000\n",
 		"uv cache prune": "ERR-INUSE", "docker": "ERR"}}
-	runWith := func(at time.Time, tools Tools) {
+	runWith := func(at time.Time, tools Tools, procs ...fakeProc) {
 		t.Helper()
-		o := options(t, procRoot(t), at, nil)
+		o := options(t, procRoot(t, procs...), at, nil)
 		o.Now, o.Tools, o.Rules = true, tools, []string{RuleUV}
 		if _, err := Run(ctx, cfg, st, o); err != nil {
 			t.Fatal(err)
@@ -359,9 +358,11 @@ func TestANoteTheRuleResolvedStandsAgainForTheSameItems(t *testing.T) {
 	if n, _, _ := st.Note(ctx, id); n.Done.IsZero() {
 		t.Error("a note the owner resolved stays resolved while its item is the same")
 	}
-	runWith(now.Add(52*time.Hour), uvTools("40000000000", nil)) // that hold ends; the next one lasts a day
-	runWith(now.Add(53*time.Hour), held)
-	runWith(now.Add(77*time.Hour), held)
+	// that hold ends; the next is an install the rule waits for quietly, for a day
+	runWith(now.Add(52*time.Hour), uvTools("40000000000", nil))
+	install := fakeProc{pid: 4, ppid: 1, argv: []string{"/usr/bin/uv", "pip", "install", "x"}}
+	runWith(now.Add(53*time.Hour), held, install)
+	runWith(now.Add(77*time.Hour), held, install)
 	if n, _, _ := st.Note(ctx, id); !n.Done.IsZero() {
 		t.Error("the owner's resolution lasts while its hold does: the next hold that lasts a day stands")
 	}
@@ -406,7 +407,8 @@ func TestAFullDiskIsNotAFastFill(t *testing.T) {
 }
 
 // A disk's notes name it by its path, escaped where an id may not hold a character of it: a disk whose path holds a
-// space has its fill, full and filled notes, and the run goes on. The notes' text names the disk as it is.
+// space has its fill, full and filled notes, and the run goes on. The notes' text names the disk as it is. An older
+// build, whose run failed on the id, left the full stretch's mark with no note: the note comes, dated from the mark.
 func TestADiskWhosePathHoldsASpaceHasItsNotes(t *testing.T) {
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "my disk")
@@ -422,6 +424,8 @@ func TestADiskWhosePathHoldsASpaceHasItsNotes(t *testing.T) {
 	cfg := Config{Disks: []string{dir}, Fill: FillConfig{Full: 0.001}}.Normal()
 	o := options(t, procRoot(t), now, nil)
 	o.Rules = []string{RuleUV}
+	stretch := now.Add(-time.Hour) // the older build's mark of the full stretch
+	must(t, st.SetMark(ctx, "full-open:"+dir, stretch))
 	if _, err := Run(ctx, cfg, st, o); err != nil {
 		t.Fatalf("a disk whose path holds a space fails the run: %v", err)
 	}
@@ -430,6 +434,9 @@ func TestADiskWhosePathHoldsASpaceHasItsNotes(t *testing.T) {
 		if n, ok, _ := st.Note(ctx, id); !ok || n.Kind != store.NoteProblem || !n.Done.IsZero() || !strings.HasPrefix(n.Title, dir+" is ") {
 			t.Errorf("%s: a problem note that names the disk as it is: %+v", id, n)
 		}
+	}
+	if n, _, _ := st.Note(ctx, "capacity:full:"+key); n.At.UnixMilli() != stretch.UnixMilli() {
+		t.Errorf("the full note is dated from its stretch's mark: %+v", n)
 	}
 	// 40 minutes on the fill is over, and the disk is below a full percent of 100
 	cfg.Fill.Full = 100
@@ -442,7 +449,7 @@ func TestADiskWhosePathHoldsASpaceHasItsNotes(t *testing.T) {
 			t.Errorf("%s: resolved: %+v", id, n)
 		}
 	}
-	if n, ok, _ := st.Note(ctx, "capacity:filled:"+key+"@"+strconv.FormatInt(now.UnixMilli(), 10)); !ok || n.Kind != store.NoteDecided ||
+	if n, ok, _ := st.Note(ctx, "capacity:filled:"+key); !ok || n.Kind != store.NoteDecided ||
 		!strings.HasPrefix(n.Title, dir+" filled fast from ") {
 		t.Errorf("the fill that ended is a decided note: %+v", n)
 	}

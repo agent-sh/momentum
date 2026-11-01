@@ -34,7 +34,7 @@ import (
 //   - a rule that could not run, and a disk whose use could not be read, is an event (capacity-failed) and a problem
 //     note that names the error (recordScans);
 //   - a fast fill is an event (capacity-fill) and the disk's problem note, high importance, put once per fill; once it
-//     ended, the note is resolved and a decided note (capacity:filled:DISK@MS, the fill's start) says what it filled.
+//     ended, the note is resolved and the disk's decided note (capacity:filled:DISK) says what it filled.
 
 // The event kinds.
 const (
@@ -170,7 +170,7 @@ func (r *runner) record(ctx context.Context) error {
 			}
 		}
 	}
-	held, heldEnded, err := r.uvHold(ctx)
+	held, err := r.uvHold(ctx)
 	if err != nil {
 		return err
 	}
@@ -228,11 +228,6 @@ func (r *runner) record(ctx context.Context) error {
 			if err := r.ended(ctx, n.ID); err != nil {
 				return err
 			}
-		}
-	}
-	if heldEnded { // its note went above: the next hold counts from its own first scan
-		if err := r.st.ClearMark(ctx, uvHeldMark); err != nil {
-			return err
 		}
 	}
 	if err := r.recordJobs(ctx); err != nil {
@@ -401,9 +396,11 @@ const uvHeldMark = "busy-open:uv"
 
 // uvHold is when the uv rule's prune was first held off in the stretch of its scans this run's carries on, whatever
 // held it off (its findings' class is busy, a quiet wait's too), or zero when its scan did not run whole or was not
-// held. The first scan of a stretch sets the mark. A whole scan that was not held ends the stretch (ended): the caller
-// clears the mark once the hold's note is resolved. A rule this run did not scan leaves the stretch as it is.
-func (r *runner) uvHold(ctx context.Context) (since time.Time, ended bool, err error) {
+// held. The first scan of a stretch sets the mark. A whole scan that was not held ends the stretch and clears the
+// mark, before the stretch's note is resolved, so a run that stops between the two leaves no stretch behind: the
+// next resolves the note. A run that cannot trust its look at the processes, which may not see the holders, ends no
+// stretch, and a rule this run did not scan leaves it as it is.
+func (r *runner) uvHold(ctx context.Context) (time.Time, error) {
 	for _, rr := range r.res.Rules {
 		if rr.Rule != RuleUV || !rr.Ran || rr.Err != "" {
 			continue
@@ -412,16 +409,20 @@ func (r *runner) uvHold(ctx context.Context) (since time.Time, ended bool, err e
 		for _, f := range rr.Findings {
 			held = held || f.class == "busy"
 		}
-		if !held {
-			return time.Time{}, true, nil
+		switch at, err := r.st.Mark(ctx, uvHeldMark); {
+		case err != nil:
+			return time.Time{}, err
+		case !held && r.blind == "" && !at.IsZero():
+			return time.Time{}, r.st.ClearMark(ctx, uvHeldMark)
+		case !held:
+			return time.Time{}, nil
+		case at.IsZero():
+			return r.now, r.st.SetMark(ctx, uvHeldMark, r.now)
+		default:
+			return at, nil
 		}
-		at, err := r.st.Mark(ctx, uvHeldMark)
-		if err != nil || !at.IsZero() {
-			return at, false, err
-		}
-		return r.now, false, r.st.SetMark(ctx, uvHeldMark, r.now)
 	}
-	return time.Time{}, false, nil
+	return time.Time{}, nil
 }
 
 // putNew stores the events the store does not hold yet, so an item's event keeps its first sighting, and reports
@@ -486,13 +487,12 @@ func (r *runner) recordDisks(ctx context.Context) error {
 }
 
 // fillID, fullID and filledID are a disk's notes: the problem notes of its fast fill and of its full percent, and the
-// decided note of a fill that ended, keyed by the fill's start. They name the disk by its path, escaped where an id
-// may not hold a character of it (store.IDPart): a path that needs no escape keeps the ids it always had.
-func fillID(disk string) string { return "capacity:fill:" + store.IDPart(disk) }
-func fullID(disk string) string { return "capacity:full:" + store.IDPart(disk) }
-func filledID(disk string, start time.Time) string {
-	return "capacity:filled:" + store.IDPart(disk) + "@" + strconv.FormatInt(start.UnixMilli(), 10)
-}
+// decided note of its last fill that ended, which the next fill's end replaces. They name the disk by its path,
+// escaped where an id may not hold a character of it (store.IDPart): a path that needs no escape keeps the ids it
+// always had.
+func fillID(disk string) string   { return "capacity:fill:" + store.IDPart(disk) }
+func fullID(disk string) string   { return "capacity:full:" + store.IDPart(disk) }
+func filledID(disk string) string { return "capacity:filled:" + store.IDPart(disk) }
 
 func (r *runner) recordFill(ctx context.Context, d DiskState) error {
 	id := fillID(d.Disk)
@@ -504,26 +504,26 @@ func (r *runner) recordFill(ctx context.Context, d DiskState) error {
 	if err != nil {
 		return err
 	}
-	if open.IsZero() && had && old.Done.IsZero() {
-		// an older build's fill that ended: it kept the note, rewritten to say so, until someone resolved it. It ends
-		// as a fill ends now, at the first run after the fill's last.
-		end, used, err := r.fillEnd(ctx, d, old.At)
-		if err != nil {
+	// A fill that ended: one open that this run does not see, or one whose problem note stands with no fill open (an
+	// older build kept it, rewritten to say the fill ended, until someone resolved it; a run that died once the mark
+	// went leaves it so too). The mark goes first, so the next run ends a fill this run did not finish ending.
+	var start time.Time
+	switch {
+	case !open.IsZero() && !d.Fast:
+		start = open
+		if err := r.st.ClearMark(ctx, "fill-open:"+d.Disk); err != nil {
 			return err
 		}
-		if err := r.filled(ctx, d, old.At, end, used); err != nil {
+	case open.IsZero() && had && old.Done.IsZero():
+		start = old.At
+	}
+	if !start.IsZero() {
+		if err := r.filled(ctx, d, start); err != nil {
 			return err
 		}
-		old.Done = r.now
 	}
 	if !d.Fast {
-		if open.IsZero() {
-			return nil
-		}
-		if err := r.filled(ctx, d, open, r.now, d.Used); err != nil {
-			return err
-		}
-		return r.st.ClearMark(ctx, "fill-open:"+d.Disk)
+		return nil
 	}
 	f := Finding{Rule: RuleDisk, Path: d.Disk, Detail: fillDetail(d)}
 	e := r.event(KindFill, f, fmt.Sprintf("fill/%s/%d", d.Disk, r.now.UnixMilli()), store.ActorDetector)
@@ -537,10 +537,11 @@ func (r *runner) recordFill(ctx context.Context, d DiskState) error {
 	}
 	all := d
 	if !open.IsZero() { // the note names every writer the fill's runs saw: one may have finished since
-		all.Writers, err = r.fillWriters(ctx, d, open, time.Time{})
+		runs, err := r.fastRuns(ctx, d.Disk, open)
 		if err != nil {
 			return err
 		}
+		all.Writers = writersOf(runs)
 	}
 	n := store.Note{ID: id, Kind: store.NoteProblem, Title: fillTitle(d), Detail: fillDetail(all), Source: store.Capacity,
 		Importance: store.ImportanceHigh, At: r.now}
@@ -553,24 +554,42 @@ func (r *runner) recordFill(ctx context.Context, d DiskState) error {
 	return err
 }
 
-// filled ends a fill: a decided note says when it began and ended, what the disk's use grew by between the two, and
-// the writers its runs saw, and its problem note is resolved. The note's time is the fill's end, so the report shows
-// it for 12 hours from then.
-func (r *runner) filled(ctx context.Context, d DiskState, start, end time.Time, used int64) error {
-	all := d
-	var err error
-	if all.Writers, err = r.fillWriters(ctx, d, start, end); err != nil {
-		return err
-	}
-	title := fmt.Sprintf("%s filled fast from %s to %s", d.Disk, start.Format("Jan 2 15:04"), endClock(start, end))
-	samples, err := r.st.DiskSamples(ctx, d.Disk, start)
+// filled ends the fill that began at start (its first run): its problem note is resolved, and its decided note says
+// when it began, when it ended, what the disk's use grew by between the two, and the writers its runs saw. It began
+// where the window its first run read the rate over began: the growth that showed the fill is the fill's. It ended at
+// the first sample after its last run (this run's, for a fill that ends on it), which the store keeps for a run that
+// comes after one that died. The note is dated at the end, so the report shows it for 12 hours from then.
+func (r *runner) filled(ctx context.Context, d DiskState, start time.Time) error {
+	runs, err := r.fastRuns(ctx, d.Disk, start)
 	if err != nil {
 		return err
 	}
-	if len(samples) > 0 && !samples[0].At.After(end) { // the fill's first run's sample
-		title += " (" + signedGiB(used-samples[0].Used) + ")"
+	from, last := start, start
+	if len(runs) > 0 { // newest first
+		last = runs[0].at
+		if first := runs[len(runs)-1]; first.state.WindowMS > 0 {
+			from = first.at.Add(-time.Duration(first.state.WindowMS) * time.Millisecond)
+		}
 	}
-	if _, err := r.st.PutNote(ctx, store.Note{ID: filledID(d.Disk, start), Kind: store.NoteDecided, Title: title,
+	end, used := r.now, d.Used
+	after, err := r.st.DiskSamples(ctx, d.Disk, last.Add(time.Millisecond))
+	if err != nil {
+		return err
+	}
+	if len(after) > 0 {
+		end, used = after[0].At, after[0].Used
+	}
+	title := fmt.Sprintf("%s filled fast from %s to %s", d.Disk, from.Format("Jan 2 15:04"), endClock(from, end))
+	base, err := r.st.DiskSamples(ctx, d.Disk, from)
+	if err != nil {
+		return err
+	}
+	if len(base) > 0 && base[0].At.Before(end) {
+		title += " (" + signedGiB(used-base[0].Used) + ")"
+	}
+	all := d
+	all.Writers = writersOf(runs)
+	if _, err := r.st.PutNote(ctx, store.Note{ID: filledID(d.Disk), Kind: store.NoteDecided, Title: title,
 		Detail: fillDetail(all), Source: store.Capacity, At: end}); err != nil {
 		return err
 	}
@@ -578,27 +597,6 @@ func (r *runner) filled(ctx context.Context, d DiskState, start, end time.Time, 
 		return err
 	}
 	return nil
-}
-
-// fillEnd is when an older build's fill that ended was over, and the disk's use then: the first sample after the
-// fill's last run, or this run's when there is none.
-func (r *runner) fillEnd(ctx context.Context, d DiskState, start time.Time) (time.Time, int64, error) {
-	evs, err := r.st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindFill}, Since: start, Limit: math.MaxInt32})
-	if err != nil {
-		return time.Time{}, 0, err
-	}
-	last := start
-	for _, e := range evs {
-		var past DiskState
-		if json.Unmarshal([]byte(e.Meta), &past) == nil && past.Disk == d.Disk && e.TS.After(last) {
-			last = e.TS
-		}
-	}
-	samples, err := r.st.DiskSamples(ctx, d.Disk, last.Add(time.Millisecond))
-	if err != nil || len(samples) == 0 {
-		return r.now, d.Used, err
-	}
-	return samples[0].At, samples[0].Used, nil
 }
 
 // endClock is a fill's end as its note says it: the time, and the date too when it is not the start's.
@@ -617,27 +615,36 @@ func signedGiB(n int64) string {
 	return "+" + gib(n)
 }
 
+// recordFull puts a disk's full note once per stretch above its full percent, dated when the stretch began, and
+// resolves it when the disk drops below. A run that set the stretch's mark and put no note (an older build's, on an id
+// the store refused, or one that died between the two) leaves it to the next.
 func (r *runner) recordFull(ctx context.Context, d DiskState) error {
 	id := fullID(d.Disk)
 	open, err := r.st.Mark(ctx, "full-open:"+d.Disk)
 	if err != nil {
 		return err
 	}
+	n, had, err := r.st.Note(ctx, id)
+	if err != nil {
+		return err
+	}
 	full := d.pctFull >= r.cfg.Fill.Full
 	switch {
-	case full && open.IsZero():
-		if err := r.st.SetMark(ctx, "full-open:"+d.Disk, r.now); err != nil {
-			return err
+	case full && (open.IsZero() || !had || n.At.Before(open)):
+		at := open
+		if open.IsZero() {
+			at = r.now
+			if err := r.st.SetMark(ctx, "full-open:"+d.Disk, r.now); err != nil {
+				return err
+			}
 		}
 		_, err := r.st.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Source: store.Capacity, Importance: store.ImportanceHigh,
-			At:     r.now,
+			At:     at,
 			Title:  fmt.Sprintf("%s is %.0f%% used, above %.0f%%: %s free", d.Disk, d.pctFull, r.cfg.Fill.Full, gib(d.Avail)),
 			Detail: "Capacity deletes only what its rules find idle; momentum capacity --dry-run --all lists what they leave, and why."})
 		return err
 	case !full && !open.IsZero():
-		if n, had, err := r.st.Note(ctx, id); err != nil {
-			return err
-		} else if had && n.Done.IsZero() {
+		if had && n.Done.IsZero() {
 			if _, _, err := r.st.DoneNote(ctx, id, r.now); err != nil {
 				return err
 			}
@@ -647,14 +654,31 @@ func (r *runner) recordFull(ctx context.Context, d DiskState) error {
 	return nil
 }
 
-// fillWriters are the writers of the fill's runs from since and before until (zero: this run's among them), from
-// their events, each process once, with what it wrote over the runs it was a writer in, and its fastest look.
-func (r *runner) fillWriters(ctx context.Context, d DiskState, since, until time.Time) ([]Writer, error) {
-	evs, err := r.st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindFill}, Since: since, Until: until,
-		Limit: math.MaxInt32})
+// fastRun is one run that saw a disk fill fast, from its event: when it was, and what it saw of the disk.
+type fastRun struct {
+	at    time.Time
+	state DiskState
+}
+
+// fastRuns are the runs that saw the disk fill fast from since on, newest first, from their events.
+func (r *runner) fastRuns(ctx context.Context, disk string, since time.Time) ([]fastRun, error) {
+	evs, err := r.st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindFill}, Since: since, Limit: math.MaxInt32})
 	if err != nil {
 		return nil, err
 	}
+	var out []fastRun
+	for _, e := range evs {
+		var past DiskState
+		if json.Unmarshal([]byte(e.Meta), &past) == nil && past.Disk == disk {
+			out = append(out, fastRun{at: e.TS, state: past})
+		}
+	}
+	return out, nil
+}
+
+// writersOf are the writers of a fill's runs, each process once, with what it wrote over the runs it was a writer in,
+// and its fastest look.
+func writersOf(runs []fastRun) []Writer {
 	type key struct {
 		pid   int
 		start int64
@@ -669,12 +693,9 @@ func (r *runner) fillWriters(ctx context.Context, d DiskState, since, until time
 		}
 		by[k] = w
 	}
-	for _, e := range evs { // newest first, this run's among them: its event is recorded first
-		var past DiskState
-		if json.Unmarshal([]byte(e.Meta), &past) == nil && past.Disk == d.Disk {
-			for _, w := range past.Writers {
-				add(w)
-			}
+	for _, run := range runs { // newest first, this run's among them: its event is recorded first
+		for _, w := range run.state.Writers {
+			add(w)
 		}
 	}
 	out := make([]Writer, 0, len(by))
@@ -682,7 +703,7 @@ func (r *runner) fillWriters(ctx context.Context, d DiskState, since, until time
 		out = append(out, w)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].pace() > out[j].pace() })
-	return out, nil
+	return out
 }
 
 func fillTitle(d DiskState) string {

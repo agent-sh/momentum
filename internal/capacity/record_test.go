@@ -811,26 +811,30 @@ func TestAFillNoteReadsOnlyItsOwnFillsWriters(t *testing.T) {
 	}
 }
 
-// A fill that ended waits for nobody: at the first run without it, its problem note is resolved and a decided note
-// says what happened, with the writers the fill's runs saw. The report shows it for 12 hours from the fill's end, as
-// it shows every decided note. The next fill has a problem note again.
+// endText is a fill's end as a test expects its note to say it: the time, with the date when it is another day's.
+func endText(from, to time.Time) string {
+	if to.YearDay() != from.YearDay() {
+		return to.Format("Jan 2 15:04")
+	}
+	return to.Format("15:04")
+}
+
+// A fill that ended waits for nobody: at the first run without it, its problem note is resolved and the disk's
+// decided note says what happened, from the start of the window its first run read (which holds the growth that
+// showed the fill) to its end, with what the disk gained and the writers its runs saw. The report shows it for 12
+// hours from the fill's end, as it shows every decided note. The next fill is a problem again, and its end replaces
+// the decided note.
 func TestAFillThatEndedIsADecidedNote(t *testing.T) {
 	ctx := context.Background()
 	st, dir, now, proc := fillFixture(t)
 	start, end := now.Add(-5*time.Minute), now.Add(40*time.Minute)
 	train := fakeProc{pid: 31, ppid: 1, argv: []string{"torchrun"}, cwd: dir, written: 1 << 30}
 	fillRun(t, st, dir, start, proc(1201, train), quiet)
-	// the disk held 3 GiB less at the fill's first run than it holds now
-	var fs syscall.Statfs_t
-	must(t, syscall.Statfs(dir, &fs))
-	before := int64(fs.Blocks-fs.Bfree)*int64(fs.Bsize) - 3<<30
-	must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: start, Procs: 2},
-		[]store.DiskSample{{Disk: dir, At: start, Size: 1 << 40, Used: before, Avail: 1 << 39}}, nil))
 	train.written = 11 << 30
 	if d := fillRun(t, st, dir, now, proc(1501, train), quiet).Disks[0]; !d.Fast {
 		t.Fatalf("setup: the fill goes on: %+v", d)
 	}
-	id := "capacity:fill:" + dir
+	id, filled := "capacity:fill:"+dir, "capacity:filled:"+dir
 	if n, ok, _ := st.Note(ctx, id); !ok || !n.Done.IsZero() {
 		t.Fatalf("setup: a fill that goes on stands: %+v", n)
 	}
@@ -842,13 +846,13 @@ func TestAFillThatEndedIsADecidedNote(t *testing.T) {
 	if n, _, _ := st.Note(ctx, id); n.Done.IsZero() {
 		t.Errorf("a fill that ended resolves its problem note: %+v", n)
 	}
-	n, ok, _ := st.Note(ctx, "capacity:filled:"+dir+"@"+strconv.FormatInt(start.UnixMilli(), 10))
-	clock := end.Format("15:04")
-	if end.YearDay() != start.YearDay() {
-		clock = end.Format("Jan 2 15:04")
-	}
-	title := plain.Clip(fmt.Sprintf("%s filled fast from %s to %s (+%s)", dir, start.Format("Jan 2 15:04"), clock, gib(d.Used-before)),
-		store.TitleMax)
+	// the window of the fill's first run began at the fixture's sample, which held 15 GiB less
+	base, err := st.DiskSamples(ctx, dir, now.Add(-24*time.Minute))
+	must(t, err)
+	from := base[0].At
+	title := plain.Clip(fmt.Sprintf("%s filled fast from %s to %s (+%s)", dir, from.Format("Jan 2 15:04"), endText(from, end),
+		gib(d.Used-base[0].Used)), store.TitleMax)
+	n, ok, _ := st.Note(ctx, filled)
 	if !ok || n.Kind != store.NoteDecided || n.Title != title || n.At.UnixMilli() != end.UnixMilli() || n.Source != store.Capacity {
 		t.Fatalf("a decided note says when the fill began and ended and what the disk gained, dated at its end: %+v, want %q", n, title)
 	}
@@ -858,46 +862,68 @@ func TestAFillThatEndedIsADecidedNote(t *testing.T) {
 	if !n.Standing(end.Add(11*time.Hour).Add(-12*time.Hour)) || n.Standing(end.Add(13*time.Hour).Add(-12*time.Hour)) {
 		t.Errorf("the report shows it for 12 hours: %+v", n)
 	}
+	// a run that died before the fill's mark went: the next run ends the fill at the same end
+	must(t, st.SetMark(ctx, "fill-open:"+dir, start))
 	fillRun(t, st, dir, end.Add(5*time.Minute), proc(2101, train), quiet)
+	if again, _, _ := st.Note(ctx, filled); again.Title != n.Title || !again.At.Equal(n.At) {
+		t.Errorf("the run after one that died keeps the fill's end: %+v, want %+v", again, n)
+	}
+	// the owner withdraws the decided note: a run with no fill leaves it withdrawn
+	if _, _, err := st.DoneNote(ctx, filled, end.Add(6*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	fillRun(t, st, dir, end.Add(10*time.Minute), proc(2401, train), quiet)
 	ns, _ := st.Notes(ctx)
 	for _, x := range ns {
-		if strings.HasPrefix(x.ID, "capacity:fill") && x.ID != id && x.ID != n.ID {
-			t.Errorf("a run after the fill's end writes nothing more: %+v", x)
+		switch {
+		case x.ID == filled && x.Done.IsZero():
+			t.Errorf("a decided note the owner withdrew stays withdrawn: %+v", x)
+		case strings.HasPrefix(x.ID, "capacity:fill") && x.ID != id && x.ID != filled:
+			t.Errorf("one decided note per disk: %+v", x)
 		}
 	}
 	// the next fill: the disk held 15 GiB less 24 minutes before it
 	next := end.Add(time.Hour)
+	var fs syscall.Statfs_t
+	must(t, syscall.Statfs(dir, &fs))
+	used := int64(fs.Blocks-fs.Bfree) * int64(fs.Bsize)
 	must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: next.Add(-24 * time.Minute), Procs: 2},
-		[]store.DiskSample{{Disk: dir, At: next.Add(-24 * time.Minute), Size: 1 << 40, Used: before - 12<<30, Avail: 1 << 39}}, nil))
+		[]store.DiskSample{{Disk: dir, At: next.Add(-24 * time.Minute), Size: 1 << 40, Used: used - 15<<30, Avail: 1 << 39}}, nil))
 	fillRun(t, st, dir, next, proc(5401, train), quiet)
 	if n, _, _ := st.Note(ctx, id); !n.Done.IsZero() || n.At.UnixMilli() != next.UnixMilli() {
 		t.Errorf("the next fill is a problem again, from its own start: %+v", n)
 	}
+	fillRun(t, st, dir, next.Add(40*time.Minute), proc(7801, train), quiet)
+	if n, _, _ := st.Note(ctx, filled); !n.Done.IsZero() || n.At.UnixMilli() != next.Add(40*time.Minute).UnixMilli() {
+		t.Errorf("the next fill's end replaces the disk's decided note, and it stands again: %+v", n)
+	}
 }
 
 // An older build kept the problem note of a fill that ended, rewritten to say so, until someone resolved it. The next
-// run ends that fill as a fill ends now: from its first run to the first run after its last, with its writers.
+// run ends that fill as a fill ends now. This one ran past midnight, and its writer deleted more than it wrote by the
+// end: the end names its date, and the change its sign.
 func TestAnOlderBuildsEndedFillEndsAsAFillEndsNow(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	st := openStore(t)
-	now := time.Now()
-	start, last, end := now.Add(-50*time.Minute), now.Add(-45*time.Minute), now.Add(-40*time.Minute)
-	for at, used := range map[time.Time]int64{start: 100 << 30, last: 104 << 30, end: 106 << 30} {
+	base := time.Date(2026, 3, 3, 23, 40, 0, 0, time.Local) // where the window the fill's first run read began
+	start, last, end := base.Add(15*time.Minute), base.Add(20*time.Minute), base.Add(25*time.Minute)
+	for at, used := range map[time.Time]int64{base: 100 << 30, start: 110 << 30, last: 112 << 30, end: 98 << 30} {
 		must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: at, Procs: 2},
 			[]store.DiskSample{{Disk: dir, At: at, Size: 1 << 40, Used: used, Avail: 1 << 39}}, nil))
 	}
 	for _, at := range []time.Time{start, last} {
-		meta, _ := json.Marshal(DiskState{Disk: dir, Fast: true, Writers: []Writer{{PID: 61, Comm: "rsync", Cwd: dir, Written: 4 << 30, Over: 300}}})
+		meta, _ := json.Marshal(DiskState{Disk: dir, Fast: true, WindowMS: at.Sub(base).Milliseconds(),
+			Writers: []Writer{{PID: 61, Comm: "rsync", Cwd: dir, Written: 4 << 30, Over: 300}}})
 		_, err := st.Put(ctx, []store.Event{{Source: store.Capacity, SourceKey: fmt.Sprintf("fill/%s/%d", dir, at.UnixMilli()), TS: at,
 			Actor: store.ActorDetector, Kind: KindFill, Summary: "x", Meta: string(meta)}})
 		must(t, err)
 	}
 	id := "capacity:fill:" + dir
 	_, err := st.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Source: store.Capacity, Importance: store.ImportanceHigh,
-		At: start, Title: dir + " filled fast from " + start.Format("Jan 2 15:04") + " to " + end.Format("15:04") + "; 66% used now"})
+		At: start, Title: dir + " filled fast from Mar 3 23:55 to 00:05; 66% used now"})
 	must(t, err)
-	o := options(t, procRoot(t), now, nil)
+	o := options(t, procRoot(t), end.Add(55*time.Minute), nil)
 	o.Rules = []string{RuleUV}
 	if _, err := Run(ctx, Config{Disks: []string{dir}}.Normal(), st, o); err != nil {
 		t.Fatal(err)
@@ -905,15 +931,12 @@ func TestAnOlderBuildsEndedFillEndsAsAFillEndsNow(t *testing.T) {
 	if n, _, _ := st.Note(ctx, id); n.Done.IsZero() {
 		t.Errorf("the older build's note of a fill that ended is resolved: %+v", n)
 	}
-	n, ok, _ := st.Note(ctx, "capacity:filled:"+dir+"@"+strconv.FormatInt(start.UnixMilli(), 10))
-	clock := end.Format("15:04")
-	if end.YearDay() != start.YearDay() {
-		clock = end.Format("Jan 2 15:04")
-	}
-	title := plain.Clip(fmt.Sprintf("%s filled fast from %s to %s (+6.0 GiB)", dir, start.Format("Jan 2 15:04"), clock), store.TitleMax)
+	n, ok, _ := st.Note(ctx, "capacity:filled:"+dir)
+	title := plain.Clip(dir+" filled fast from Mar 3 23:40 to Mar 4 00:05 (-2.0 GiB)", store.TitleMax)
 	if !ok || n.Kind != store.NoteDecided || n.Title != title || n.At.UnixMilli() != end.UnixMilli() ||
 		!strings.Contains(n.Detail, "rsync (pid 61) wrote 8.0 GiB in 10m0s") {
-		t.Errorf("a decided note from the fill's first run to the run after its last, with its writers: %+v, want %q", n, title)
+		t.Errorf("a decided note from the window of the fill's first run to the run after its last, with its writers: %+v, want %q",
+			n, title)
 	}
 }
 

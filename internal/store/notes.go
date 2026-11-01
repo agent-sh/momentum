@@ -150,9 +150,9 @@ func notInID(r rune) bool {
 
 // IDPart is a name as a part of a note's id, for a writer that keys a note by a name it does not choose (a disk's
 // path). A name an id may hold is the part as it is, so the id of such a name never changes. In any other name, each
-// character an id may not hold (a space, a control or a format character), each % and each byte that is no UTF-8 is
-// written as %XX, one for each of its bytes. Two names that need the escape never give the same part; one gives the
-// part of a name that needs none only when that name spells its escape out.
+// character an id may not hold (a space, a control or a format character), each % and each byte that is not UTF-8 is
+// written as %XX, one for each byte. Two names that need the escape never give the same part; a name that needs none
+// gives the part of another only when it spells that one's escape out (/mnt/a%20b, /mnt/a b).
 func IDPart(name string) string {
 	if strings.IndexFunc(name, notInID) < 0 {
 		return name

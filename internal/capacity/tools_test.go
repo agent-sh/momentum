@@ -148,18 +148,21 @@ func TestAPruneUVRefusesForItsLockIsReportedNotRetriedPastIt(t *testing.T) {
 	}
 }
 
-// Every hold of the uv prune waits the rule's day before it is a problem note, whatever holds it: a uv process that
-// takes the cache's lock during the prune is listed by the run at once, with no note. The note comes once the prune
-// has been held off for a day, by any reason in turn, dated from the hold's first scan; the scan that prunes ends it,
-// and the next hold waits its own day.
+// Every hold of the uv prune waits the rule's day before it is a problem note, whatever holds it, one reason after
+// another: a quiet wait for an install, then a uv process that takes the cache's lock during the prune, which the run
+// lists at once, with no note; a note an older build put at once is resolved. The note comes once the prune has been
+// held off for a day, dated from the hold's first scan, and a quiet wait is reported by then. The scan that prunes
+// ends it; a run that cannot trust its look ends no hold, and the next hold waits its own day.
 func TestAUVHoldIsAProblemOnlyOnceItHasLastedADay(t *testing.T) {
 	ctx := context.Background()
 	t0 := time.Now()
 	cfg := Config{Live: []string{RuleUV}}.Normal()
 	st := openStore(t)
-	run := func(at time.Time, prune string, procs ...fakeProc) Finding {
+	const id = "capacity:uv:busy"
+	install := fakeProc{pid: 4, ppid: 1, argv: []string{"/usr/bin/uv", "pip", "install", "x"}}
+	runIn := func(proc string, at time.Time, prune string) Finding {
 		t.Helper()
-		o := options(t, procRoot(t, procs...), at, nil)
+		o := options(t, proc, at, nil)
 		o.Tools = fakeTools{answers: map[string]string{"uv cache dir": "/home/u/.cache/uv\n", "uv cache size": "40000000000\n",
 			"uv cache prune": prune, "docker": "ERR"}}
 		o.Rules = []string{RuleUV}
@@ -167,24 +170,32 @@ func TestAUVHoldIsAProblemOnlyOnceItHasLastedADay(t *testing.T) {
 		must(t, err)
 		return findings(res, RuleUV)["/home/u/.cache/uv"]
 	}
+	run := func(at time.Time, prune string, procs ...fakeProc) Finding {
+		t.Helper()
+		return runIn(procRoot(t, procs...), at, prune)
+	}
 	standing := func() (store.Note, bool) {
 		t.Helper()
-		n, ok, err := st.Note(ctx, "capacity:uv:busy")
+		n, ok, err := st.Note(ctx, id)
 		must(t, err)
 		return n, ok && n.Done.IsZero()
 	}
-	if f := run(t0, "ERR-INUSE"); f.Action != ActReport || f.class != "busy" || !strings.Contains(f.Why, "took the cache's lock") {
+	if f := run(t0, "ERR-INUSE", install); f.Action != ActKeep {
+		t.Fatalf("setup: the hold begins with a quiet wait: %+v", f)
+	}
+	_, err := st.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Source: store.Capacity, Title: "an older build's, put at once",
+		At: t0.Add(11 * time.Hour)})
+	must(t, err)
+	if f := run(t0.Add(12*time.Hour), "ERR-INUSE"); f.Action != ActReport || f.class != "busy" || !strings.Contains(f.Why, "took the cache's lock") {
 		t.Fatalf("setup: a uv process that took the lock during the prune holds it off, and the run says why: %+v", f)
 	}
 	if n, ok := standing(); ok {
-		t.Fatalf("a hold is no problem at its first scan: %+v", n)
+		t.Fatalf("a hold half a day old is no problem, and an older build's note for it is resolved: %+v", n)
 	}
 	run(t0.Add(23*time.Hour), "ERR-INUSE")
 	if n, ok := standing(); ok {
 		t.Fatalf("nor 23 hours on: %+v", n)
 	}
-	// a day on, a quiet wait holds it off: an install
-	install := fakeProc{pid: 4, ppid: 1, argv: []string{"/usr/bin/uv", "pip", "install", "x"}}
 	if f := run(t0.Add(24*time.Hour), "ERR-INUSE", install); f.Action != ActReport || !strings.Contains(f.Why, "pip install x (pid 4)") {
 		t.Fatalf("a quiet wait is reported once the prune has been held off for a day: %+v", f)
 	}
@@ -201,9 +212,16 @@ func TestAUVHoldIsAProblemOnlyOnceItHasLastedADay(t *testing.T) {
 	if n, ok := standing(); ok {
 		t.Fatalf("the next hold waits its own day: %+v", n)
 	}
+	// a run in a PID namespace of its own sees no holder: it cannot tell the hold ended
+	blind := procRoot(t)
+	must(t, os.MkdirAll(filepath.Join(blind, "self", "ns"), 0o755))
+	must(t, os.Symlink("pid:[4026532999]", filepath.Join(blind, "self", "ns", "pid")))
+	if f := runIn(blind, t0.Add(40*time.Hour), "Removed 3 files (1.0GiB)\n"); f.Done || f.class == "busy" {
+		t.Fatalf("setup: a blind run prunes nothing and sees no hold: %+v", f)
+	}
 	run(t0.Add(50*time.Hour), "ERR-INUSE")
 	if n, ok := standing(); !ok || n.At.UnixMilli() != t0.Add(26*time.Hour).UnixMilli() {
-		t.Fatalf("and is a problem once it has waited it: %+v %v", n, ok)
+		t.Fatalf("and is a problem once it has waited it, a blind run in it or not: %+v %v", n, ok)
 	}
 }
 
