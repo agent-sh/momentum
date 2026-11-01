@@ -445,3 +445,129 @@ func TestARunChargesItsCaseOnce(t *testing.T) {
 		t.Fatalf("duplicate completion charge: %+v %v", got.Cost, err)
 	}
 }
+
+// Repository configuration names no program, including mixed-case keys and inactive includes. A refusal
+// precedes the scope checker as well as direct Git; neither gets to execute the configured program.
+func TestRepositoryProgramSettingsAreRefused(t *testing.T) {
+	keys := []string{"core.fsMonitor", "core.sshCommand", "core.askPass", "core.gitProxy", "core.alternateRefsCommand", "core.pager", "core.editor", "sequence.editor", "interactive.diffFilter", "credential.helper", "credential.https://github.com.helper", "url.fixture.insteadOf", "include.path", "includeIf.onbranch:never.path", "filter.fixture.required", "merge.fixture.driver", "diff.fixture.textconv", "diff.fixture.command", "gpg.program", "remote.origin.receivePack", "remote.origin.uploadPack", "remote.origin.vcs", "uploadpack.packObjectsHook", "pager.log"}
+	for _, key := range keys {
+		t.Run(key, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			run(t, dir, "git", "init", "-q")
+			marker := filepath.Join(t.TempDir(), "ran")
+			program := script(t, t.TempDir(), "program", "echo ran > '"+marker+"'")
+			value := program
+			if strings.HasPrefix(strings.ToLower(key), "include") {
+				value = filepath.Join(t.TempDir(), "included-config")
+				write(t, value, "[core]\n sshCommand = "+program+"\n")
+			}
+			run(t, dir, "git", "config", key, value)
+			if err := CheckGitConfig(ctx, dir); !errors.Is(err, ErrRefused) {
+				t.Fatalf("accepted %s: %v", key, err)
+			}
+			if _, err := gitOutput(ctx, dir, "status"); !errors.Is(err, ErrRefused) {
+				t.Fatalf("git accepted %s: %v", key, err)
+			}
+			gate := Gate{RepoGuard: []string{program}}
+			if err := gate.scope(ctx, "agent-sh/fixture", dir); !errors.Is(err, ErrRefused) {
+				t.Fatalf("scope accepted %s: %v", key, err)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("refused repository ran a program: %v", err)
+			}
+		})
+	}
+	for _, value := range []string{"false", "FALSE", "0", "off"} {
+		dir := t.TempDir()
+		run(t, dir, "git", "init", "-q")
+		run(t, dir, "git", "config", "core.fsmonitor", value)
+		if err := CheckGitConfig(context.Background(), dir); err != nil {
+			t.Fatalf("disabled monitor refused: %v", err)
+		}
+	}
+}
+
+// A repository's hook path is allowed. The fixture scope checker runs status without refreshing the index,
+// even when a checker strips configuration pins; the forge's Git also has hooks and the monitor disabled.
+func TestScopeAndForgeGitKeepTheirPins(t *testing.T) {
+	ctx := context.Background()
+	f := newRepo(t, nil)
+	marker := filepath.Join(f.dir, "hook-ran")
+	hooks := filepath.Join(f.dir, "hooks")
+	script(t, hooks, "post-index-change", "echo ran > '"+marker+"'")
+	run(t, f.main, "git", "config", "core.hooksPath", hooks)
+	if err := CheckGitConfig(ctx, f.main); err != nil {
+		t.Fatal(err)
+	}
+	// A content-preserving edit makes status refresh the index. Prove the hook would run without the pins.
+	touch := func() {
+		t.Helper()
+		path := filepath.Join(f.main, "fake.go")
+		at := time.Now().Add(-time.Hour)
+		if err := os.Chtimes(path, at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	touch()
+	run(t, f.main, "git", "status", "--porcelain")
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("unprotected status did not exercise hook: %v", err)
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	touch()
+	checker := script(t, f.dir, "checker", `unset GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM
+exec '`+f.guard+`' "$@"`)
+	gate := Gate{RepoGuard: []string{checker}}
+	if err := gate.scope(ctx, "agent-sh/fixture", f.main); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("scope wrote the index: %v", err)
+	}
+	forge := script(t, f.dir, "forge", `set -eu
+[ "$GIT_OPTIONAL_LOCKS" = 0 ]
+[ "$GIT_ATTR_SOURCE" = 4b825dc642cb6eb9a060e54bf8d69288fbee4904 ]
+[ "$(git config --get core.hooksPath)" = /dev/null ]
+[ "$(git config --get core.fsmonitor)" = false ]
+[ "$(git config --get fixture.global)" = trusted ]
+git status --porcelain`)
+	home := t.TempDir()
+	write(t, filepath.Join(home, ".gitconfig"), "[fixture]\n global = trusted\n")
+	t.Setenv("HOME", home)
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
+	t.Setenv("GIT_CONFIG_VALUE_0", hooks)
+	t.Setenv("GIT_ATTR_SOURCE", "HEAD")
+	s := &Ship{GH: forge}
+	if _, err := s.gh(ctx, f.main, "status"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("forge wrote the index: %v", err)
+	}
+}
+
+// No git call of momentum's goes into a submodule, another repository with settings of its own, whatever the
+// repository's settings ask.
+func TestNoGitCallGoesIntoASubmodule(t *testing.T) {
+	f := newRepo(t, nil)
+	st := testStore(t)
+	s := shipFor(t, st, f)
+	run(t, f.main, "git", "config", "submodule.recurse", "true")
+	run(t, f.main, "git", "config", "fetch.recurseSubmodules", "on-demand")
+	run(t, f.main, "git", "config", "push.recurseSubmodules", "on-demand")
+	for key, want := range map[string]string{"submodule.recurse": "false", "fetch.recurseSubmodules": "false", "push.recurseSubmodules": "no"} {
+		got, err := s.git(context.Background(), f.main, "config", "--get", key)
+		if err != nil || strings.TrimSpace(got) != want {
+			t.Errorf("%s in a ship git call: %q %v, want %s", key, got, err, want)
+		}
+		got, err = gitOutput(context.Background(), f.main, "config", "--get", key)
+		if err != nil || strings.TrimSpace(got) != want {
+			t.Errorf("%s in a gate git call: %q %v, want %s", key, got, err, want)
+		}
+	}
+}

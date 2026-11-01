@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -807,5 +808,95 @@ func TestAnEvaluationsRunsAreNotTheLoops(t *testing.T) {
 	}
 	if run, err := st.LoopRunByID(ctx, "eval-run"); err != nil || run.Status != store.RunRunning {
 		t.Fatalf("the evaluation's run: %+v %v", run, err)
+	}
+}
+
+// A report arriving after its assigned case merged cannot choose another root for the new holder.
+func TestAReportedRootCannotChangeAnAliasTarget(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := runnerFor(t, st, nil)
+	a := openCase(t, st, "failures", "a", 1)
+	b := openCase(t, st, "failures", "b", 1)
+	c := openCase(t, st, "failures", "c", 1)
+	for _, v := range []struct{ id, sig string }{{b.ID, "root:b"}, {c.ID, "root:c"}} {
+		if _, _, err := st.AddCaseSignature(ctx, v.id, v.sig, "fixture"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run, why := r.reserve(ctx, a.Family, a.ID, StepInvestigate)
+	if why != "" {
+		t.Fatal(why)
+	}
+	if _, _, err := st.AddCaseSignature(ctx, a.ID, "root:b", "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	var logs string
+	r.Log = func(format string, args ...any) { logs += fmt.Sprintf(format, args...) }
+	r.finish(ctx, a, &run, Result{Status: store.RunOK, CostKnown: true, USD: 0.75, Report: json.RawMessage(`{"root":"root:c"}`)}, nil)
+	got, err := st.CaseLive(ctx, b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("unassigned target merged=%v", got.ID == c.ID)
+	if got.ID != b.ID || got.Cost.USD != 0.75 {
+		t.Fatalf("stale report changed its alias target or lost its charge: %+v", got)
+	}
+	if !strings.Contains(logs, "ignored") {
+		t.Fatalf("stale report not explained: %s", logs)
+	}
+	if got, err := st.CaseLive(ctx, c.ID); err != nil || got.Cost.USD != 0 {
+		t.Fatalf("unrelated root holder changed: %+v %v", got, err)
+	}
+}
+
+// Spare case and day budgets leave only the running hold to reject a pick. Publishing is held too,
+// even when its case has spent its budget; ending the run admits each step again.
+func TestARunningHoldIsIndependentOfBudgets(t *testing.T) {
+	for _, step := range []string{StepInvestigate, StepPublish} {
+		t.Run(step, func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "m.db")
+			st, err := store.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			r := runnerFor(t, st, nil)
+			c := openCase(t, st, "failures", "held", 1)
+			if step == StepPublish {
+				db, err := sql.Open("sqlite", path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = db.Exec(`UPDATE cases SET status='closed', reason='improved', cost_usd=? WHERE id=?`, r.Budgets.Case, c.ID)
+				db.Close()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got, next, _, err := r.pick(ctx, c.Family, c.ID, false); err != nil || got.ID != c.ID || next != step {
+				t.Fatalf("control pick: %s %s %v", got.ID, next, err)
+			}
+			reservation, why := r.reserve(ctx, c.Family, c.ID, step)
+			if why != "" {
+				t.Fatal(why)
+			}
+			if why, err := r.affordable(ctx); err != nil || why != "" {
+				t.Fatalf("fixture has no spare day budget: %s %v", why, err)
+			}
+			if step == StepInvestigate {
+				if spent, _, err := r.caseRoom(ctx, c); err != nil || spent+r.Budgets.Run > r.Budgets.Case {
+					t.Fatalf("fixture has no spare case budget: %v %v", spent, err)
+				}
+			}
+			if got, _, why, err := r.pick(ctx, c.Family, c.ID, false); err != nil || got.ID != "" || !strings.Contains(why, "in flight") {
+				t.Fatalf("running case admitted: %s %s %v", got.ID, why, err)
+			}
+			r.finish(ctx, c, &reservation, Result{Status: store.RunOK, CostKnown: true}, nil)
+			if got, next, _, err := r.pick(ctx, c.Family, c.ID, false); err != nil || got.ID != c.ID || next != step {
+				t.Fatalf("ended run holds case: %s %s %v", got.ID, next, err)
+			}
+		})
 	}
 }

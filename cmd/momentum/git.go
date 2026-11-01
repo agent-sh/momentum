@@ -87,7 +87,7 @@ func evidenceGit(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	if err != nil {
 		return err
 	}
-	if err := loop.CheckGitFilters(ctx, dir); err != nil {
+	if err := loop.CheckGitConfig(ctx, dir); err != nil {
 		return err
 	}
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
@@ -300,7 +300,7 @@ func repoPath(p string) error {
 
 // gitRead runs one git command of momentum's own, with the safe settings.
 func gitRead(ctx context.Context, dir string, args ...string) (string, error) {
-	if err := loop.CheckGitFilters(ctx, dir); err != nil {
+	if err := loop.CheckGitConfig(ctx, dir); err != nil {
 		return "", err
 	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)

@@ -996,8 +996,8 @@ func TestBranchConditionalDriversAreRefused(t *testing.T) {
 				}
 			}
 			run(t, f.main, "git", "config", "includeIf.onbranch:momentum/**.path", cfg)
-			if err := CheckGitFilters(ctx, f.main); err != nil {
-				t.Fatalf("main has no driver: %v", err)
+			if err := CheckGitConfig(ctx, f.main); !errors.Is(err, ErrRefused) {
+				t.Fatalf("conditional include accepted on main: %v", err)
 			}
 			switch step {
 			case "prepare":
@@ -1024,8 +1024,8 @@ func TestBranchConditionalDriversAreRefused(t *testing.T) {
 	}
 }
 
-// A configured signer or verifier never runs through the ship lifecycle, even on a signed ancestor. The
-// attributes variant also exercises the lifecycle with the filter refusal removed by a test overlay.
+// A configured signer, verifier or transformation is refused even on a signed ancestor. With configuration
+// refusal removed by an overlay, the same fixture checks the remaining pins through the ship lifecycle.
 func TestShipGitRunsNoRepositoryPrograms(t *testing.T) {
 	for _, surface := range []string{"signatures", "attributes"} {
 		t.Run(surface, func(t *testing.T) {
@@ -1046,9 +1046,7 @@ func TestShipGitRunsNoRepositoryPrograms(t *testing.T) {
 				for _, key := range []string{"filter.fixture.clean", "filter.fixture.smudge", "diff.fixture.command", "merge.fixture.driver"} {
 					run(t, f.main, "git", "config", key, program)
 				}
-				if err := CheckGitFilters(ctx, f.main); err != nil {
-					t.Skip("filter refusal holds; the overlay removes it to check attribute isolation independently")
-				}
+
 			} else {
 				for _, key := range []string{"gpg.program", "gpg.openpgp.program", "gpg.x509.program", "gpg.ssh.program"} {
 					run(t, f.main, "git", "config", key, program)
@@ -1056,6 +1054,18 @@ func TestShipGitRunsNoRepositoryPrograms(t *testing.T) {
 				for _, key := range []string{"log.showSignature", "commit.gpgSign", "push.gpgSign"} {
 					run(t, f.main, "git", "config", key, "true")
 				}
+			}
+			if err := CheckGitConfig(ctx, f.main); err != nil {
+				if !errors.Is(err, ErrRefused) {
+					t.Fatal(err)
+				}
+				if _, err := s.Prepare(ctx, testingCase(t, st).ID, f.main); !errors.Is(err, ErrRefused) {
+					t.Fatal(err)
+				}
+				if _, err := os.Stat(marker); !os.IsNotExist(err) {
+					t.Fatalf("repository program ran: %v", err)
+				}
+				return
 			}
 			// The scope checker is an independent program. This fixture checks only its authority receipt.
 			s.Gate.RepoGuard = []string{script(t, f.dir, "allow", `echo '{"allowed":true}'`)}
@@ -1160,5 +1170,155 @@ func TestEveryPushChecksItsPackageDestination(t *testing.T) {
 	}
 	if originHead(t, f, "main") != base {
 		t.Fatal("origin changed")
+	}
+}
+
+// A tracked transport cannot redirect a proposal or landing. The advertised origin is GitHub-shaped,
+// but the synthetic wrapper only routes to local bare repositories and must never run after configuration.
+func TestShipRefusesRepositoryTransport(t *testing.T) {
+	for _, step := range []string{"prepare", "check", "propose", "land"} {
+		t.Run(step, func(t *testing.T) {
+			ctx := context.Background()
+			st := testStore(t)
+			f := newRepo(t, map[string]string{"transport": "exit 1\n"})
+			s := shipFor(t, st, f)
+			c := testingCase(t, st)
+			other := filepath.Join(f.dir, "other.git")
+			run(t, f.dir, "git", "clone", "--bare", f.origin, other)
+			marker := filepath.Join(f.dir, "transport-ran")
+			transport := "echo ran > '" + marker + "'\ncase \"$*\" in\n *git-upload-pack*) exec git-upload-pack '" + f.origin + "';;\n *git-receive-pack*) exec git-receive-pack '" + other + "';;\n *) exit 1;;\nesac\n"
+			dir := f.main
+			if step != "prepare" {
+				p, err := s.Prepare(ctx, c.ID, f.main)
+				if err != nil {
+					t.Fatal(err)
+				}
+				dir = p.Work
+				write(t, filepath.Join(dir, "transport"), transport)
+				write(t, filepath.Join(dir, "fake.go"), fixed("42"))
+				write(t, filepath.Join(dir, "fake_test.go"), answerTest)
+				if step != "check" {
+					if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if step == "land" {
+					if _, err := s.Propose(ctx, c.ID, Proposal{Title: "Fixture", Body: "Synthetic change.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := s.Reviewed(ctx, c.ID, Review{Comment: "https://example.invalid/review"}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if step == "prepare" {
+				write(t, filepath.Join(dir, "transport"), transport)
+			}
+			run(t, f.main, "git", "config", "core.sshCommand", "sh transport")
+			run(t, f.main, "git", "remote", "set-url", "origin", "ssh://git@github.com/agent-sh/fake.git")
+			s.Gate.Resolve = nil
+			s.Gate.RepoGuard = []string{script(t, f.dir, "allow", `echo '{"allowed":true}'`)}
+			var err error
+			switch step {
+			case "prepare":
+				_, err = s.Prepare(ctx, c.ID, dir)
+			case "check":
+				_, err = s.Check(ctx, c.ID, "go test ./...", nil)
+			case "propose":
+				_, err = s.Propose(ctx, c.ID, Proposal{Title: "Fixture", Body: "Synthetic change.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour})
+			case "land":
+				_, err = s.Land(ctx, c.ID)
+			}
+			if !errors.Is(err, ErrRefused) {
+				t.Fatalf("transport accepted: %v", err)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("transport ran: %v", err)
+			}
+		})
+	}
+}
+
+// A monitor configured after prepare cannot run through the status calls of the fixture scope checker.
+func TestScopeRefusesAnEditedRepositoryMonitor(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	f := newRepo(t, map[string]string{"monitor": "#!/bin/sh\nexit 1\n"})
+	s := shipFor(t, st, f)
+	c := testingCase(t, st)
+	p, err := s.Prepare(ctx, c.ID, f.main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(f.dir, "monitor-ran")
+	script(t, p.Work, "monitor", "echo ran > '"+marker+"'\nexit 1")
+	run(t, f.main, "git", "config", "core.fsmonitor", "./monitor")
+	if err := s.Gate.scope(ctx, "agent-sh/fake", p.Work); !errors.Is(err, ErrRefused) {
+		t.Fatalf("scope accepted monitor: %v", err)
+	}
+	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) {
+		t.Fatalf("check accepted monitor: %v", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("monitor ran: %v", err)
+	}
+}
+
+// Ship resets credential helpers and supplies only its own GitHub helper, including an executable path
+// with shell punctuation. Caller and global configuration cannot add a helper; local helpers are refused.
+func TestShipOwnsItsCredentialPath(t *testing.T) {
+	ctx := context.Background()
+	f := newRepo(t, nil)
+	marker := filepath.Join(f.dir, "helper-ran")
+	gh := script(t, f.dir, "forge's cli", `test "$1 $2" = 'auth git-credential' || exit 1
+cat >/dev/null
+echo ran > '`+marker+`'
+printf 'username=fixture\npassword=synthetic\n'`)
+	s := &Ship{GH: gh}
+	run(t, f.main, "git", "config", "protocol.ext.allow", "always")
+	global := filepath.Join(t.TempDir(), "global-config")
+	write(t, global, "[credential]\n helper = untrusted\n")
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	t.Setenv("GIT_CONFIG_COUNT", "2")
+	t.Setenv("GIT_CONFIG_KEY_0", "credential.helper")
+	t.Setenv("GIT_CONFIG_VALUE_0", "untrusted")
+	t.Setenv("GIT_CONFIG_KEY_1", "protocol.ext.allow")
+	t.Setenv("GIT_CONFIG_VALUE_1", "always")
+	t.Setenv("GIT_CONFIG_PARAMETERS", "'credential.helper=untrusted'")
+	for _, cli := range []string{gh, ""} {
+		s.GH = cli
+		for key, want := range map[string]string{"credential.helper": "\n", "credential.https://github.com.helper": "!" + shellQuote(firstOf(cli, "gh")) + " auth git-credential\n"} {
+			out, err := s.git(ctx, f.main, "config", "--get-all", key)
+			if err != nil || out != want {
+				t.Fatalf("%s: %q, want %q: %v", key, out, want, err)
+			}
+		}
+		if out, err := s.git(ctx, f.main, "config", "--get", "protocol.ext.allow"); err != nil || out != "never\n" {
+			t.Fatalf("effective ext protocol policy: %q %v", out, err)
+		}
+	}
+	s.GH = gh
+	// The effective helper command invokes the configured CLI without contacting a remote or reading credentials.
+	out, err := s.git(ctx, f.main, "config", "--get-urlmatch", "credential.helper", "https://github.com/agent-sh/fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := strings.TrimPrefix(strings.TrimSpace(out), "!")
+	cmd := exec.Command("sh", "-c", helper+" get")
+	cmd.Stdin = strings.NewReader("protocol=https\nhost=github.com\n\n")
+	if out, err := cmd.CombinedOutput(); err != nil || !strings.Contains(string(out), "username=fixture") {
+		t.Fatalf("helper: %s %v", out, err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("trusted helper did not run: %v", err)
+	}
+	// Set local configuration without the caller's injected settings.
+	cmd = exec.Command("git", "-C", f.main, "config", "credential.helper", "untrusted")
+	cmd.Env = GitEnv()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("configure fixture: %s %v", out, err)
+	}
+	if _, err := s.git(ctx, f.main, "config", "--get-all", "credential.helper"); !errors.Is(err, ErrRefused) {
+		t.Fatalf("local helper accepted: %v", err)
 	}
 }

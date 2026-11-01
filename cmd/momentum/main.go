@@ -204,7 +204,7 @@ func evidence(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	case "events":
 		return events(ctx, args[1:], stdout, stderr)
 	case "status":
-		return status(ctx, args[1:], stdout)
+		return status(ctx, args[1:], stdout, stderr)
 	case "rebuild":
 		return rebuild(ctx, args[1:], stdout, stderr)
 	case "git":
@@ -274,6 +274,7 @@ func ingest(ctx context.Context, stdout, stderr io.Writer) error {
 
 func events(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("events", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	since := fs.String("since", "1d", "how far back, or from when (one session: its start)")
 	until := fs.String("until", "", "until when")
 	kinds := fs.String("kind", "", "comma-separated kinds")
@@ -352,8 +353,9 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	return nil
 }
 
-func status(ctx context.Context, args []string, stdout io.Writer) error {
+func status(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	since := fs.String("since", "7d", "how far back")
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
