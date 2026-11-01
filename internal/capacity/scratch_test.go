@@ -401,8 +401,18 @@ func TestAnExcludedProjectsTaskFolderKeepsAllButItsModelData(t *testing.T) {
 	if f.offloadLog(t) != "" {
 		t.Errorf("nothing of an excluded project is offloaded:\n%s", f.offloadLog(t))
 	}
-	if n, ok, err := f.st.Note(context.Background(), "capacity:scratch:excluded"); err != nil || !ok || !n.Done.IsZero() {
-		t.Errorf("the reported folder is a problem note: %+v %v %v", n, ok, err)
+	ctx := context.Background()
+	evs, err := f.st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindReport}})
+	must(t, err)
+	reported := map[string]bool{}
+	for _, e := range evs {
+		reported[e.Ref] = true
+	}
+	if len(evs) != 4 || !reported[clone] || !reported[lane] || !reported[second] || !reported[plain] {
+		t.Errorf("each reported folder is an event: %+v", evs)
+	}
+	if n, ok, err := f.st.Note(ctx, "capacity:scratch:excluded"); err != nil || ok {
+		t.Errorf("an excluded project's folder is left by design, no problem: %+v %v %v", n, ok, err)
 	}
 }
 
@@ -1359,16 +1369,20 @@ func TestTheModelDatasDeletionSaysWhatItFreed(t *testing.T) {
 	}
 }
 
-func TestTheNoteOfAFolderBesideItsPointerSaysWhy(t *testing.T) {
+func TestTheEventOfAFolderBesideItsPointerSaysWhy(t *testing.T) {
 	f := newScratch(t)
 	f.cfg.Live = []string{RuleScratch}
 	write(t, filepath.Join(f.root, "zq-again"+pointerSuffix), "snapshot 1\n")
-	f.task(t, "zq-again", "s1", map[string]int{"out.log": 2 << 20})
+	p := f.task(t, "zq-again", "s1", map[string]int{"out.log": 2 << 20})
 	f.run(t, options(t, procRoot(t), f.now, nil))
-	n, ok, err := f.st.Note(context.Background(), "capacity:scratch:pointer")
+	ctx := context.Background()
+	evs, err := f.st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindReport}})
 	must(t, err)
-	if !ok || !strings.Contains(n.Title, "pointer") {
-		t.Errorf("the note's title says why the folder is left: %q", n.Title)
+	if len(evs) != 1 || evs[0].Ref != p || !strings.Contains(evs[0].Summary, "beside the pointer of its offload") {
+		t.Errorf("the folder's event says why it is left: %+v", evs)
+	}
+	if n, ok, err := f.st.Note(ctx, "capacity:scratch:pointer"); err != nil || ok {
+		t.Errorf("a folder beside its pointer is left by design, no problem: %+v %v %v", n, ok, err)
 	}
 }
 
@@ -1735,10 +1749,9 @@ func TestAFailedLookWithOnlyAReportDuePutsNoHold(t *testing.T) {
 	}
 	g := findings(f.run(t, o), RuleScratch)[p]
 	hold, held, _ := f.st.Note(ctx, "capacity:hold:sessions")
-	ex, _, _ := f.st.Note(ctx, "capacity:scratch:excluded")
-	if g.Action != ActReport || (held && hold.Done.IsZero()) || !ex.Done.IsZero() {
-		t.Errorf("nothing would have gone: the folder is %s (%s), the hold note open %v, the excluded note resolved %v",
-			g.Action, g.Why, held && hold.Done.IsZero(), !ex.Done.IsZero())
+	if g.Action != ActReport || (held && hold.Done.IsZero()) {
+		t.Errorf("nothing would have gone: the folder is %s (%s), the hold note open %v", g.Action, g.Why,
+			held && hold.Done.IsZero())
 	}
 }
 

@@ -28,45 +28,114 @@ func excludedTargets(t *testing.T, names ...string) (Config, string) {
 	return cfg, root
 }
 
-func TestAReportOnlyNoteStaysResolvedUntilItsEvidenceChanges(t *testing.T) {
+// standingProblems are the ids of capacity's problem notes the report shows.
+func standingProblems(t *testing.T, st *store.Store) []string {
+	t.Helper()
+	ns, err := st.Notes(context.Background())
+	must(t, err)
+	var out []string
+	for _, n := range ns {
+		if n.Kind == store.NoteProblem && n.Source == store.Capacity && n.Done.IsZero() {
+			out = append(out, n.ID)
+		}
+	}
+	return out
+}
+
+// What a rule leaves by design is no problem: a run whose only findings are such items puts no note, and resolves
+// the notes an older build put for them, whichever rules it scans. Their items are still events.
+func TestWhatARuleLeavesByDesignIsNoProblem(t *testing.T) {
 	ctx := context.Background()
 	cfg, root := excludedTargets(t, "a")
 	st := openStore(t)
 	now := time.Now().Add(72 * time.Hour)
+	// an older build's notes for items left by design, of the rule that scans and of rules that do not, and one for
+	// a problem of a rule that does not scan, which nothing on this run says is over
+	for _, id := range []string{"capacity:targets:excluded", "capacity:targets:unknown", "capacity:worktrees:excluded",
+		"capacity:scratch:pointer", "capacity:docker:volumes", "capacity:uv:busy"} {
+		_, err := st.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Source: store.Capacity, Title: "an older build's note",
+			At: now.Add(-time.Hour)})
+		must(t, err)
+	}
+	runAt := func(at time.Time) *Result {
+		t.Helper()
+		o := options(t, procRoot(t), at, nil)
+		o.Now, o.Rules = true, []string{RuleTargets}
+		res, err := Run(ctx, cfg, st, o)
+		must(t, err)
+		return res
+	}
+	res := runAt(now)
+	if f := findings(res, RuleTargets)[filepath.Join(root, "secret-a", "target")]; f.Action != ActReport || f.class != "excluded" {
+		t.Fatalf("setup: an excluded project's build output is only reported: %+v", f)
+	}
+	if got := standingProblems(t, st); len(got) != 1 || got[0] != "capacity:uv:busy" {
+		t.Errorf("no note for what a rule leaves by design, an older build's resolved at once, a problem of a rule "+
+			"that did not scan left as it is: %v", got)
+	}
+	cargoTarget(t, filepath.Join(root, "secret-b", "target"))
+	runAt(now.Add(time.Hour))
+	if got := standingProblems(t, st); len(got) != 1 {
+		t.Errorf("an item new to its reason puts no note either: %v", got)
+	}
+	evs, err := st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindReport}})
+	if err != nil || len(evs) != 2 {
+		t.Errorf("each item left by design is an event, once: %d %v", len(evs), err)
+	}
+}
+
+// A problem note the owner resolved stays resolved until its evidence changes: task folders whose model data this
+// user cannot remove are one.
+func TestAProblemNoteStaysResolvedUntilItsEvidenceChanges(t *testing.T) {
+	ctx := context.Background()
+	f := newScratch(t)
+	f.cfg.Live = []string{RuleScratch}
+	stuck := func(name string) string { // a container wrote its model data as root: the user cannot unlink in it
+		t.Helper()
+		p := f.task(t, name, "s1", map[string]int{"ckpt/w.safetensors": 2 << 20, "notes.md": -1})
+		ro := filepath.Join(p, "ckpt")
+		must(t, os.Chmod(ro, 0o555))
+		t.Cleanup(func() { os.Chmod(ro, 0o755) })
+		return p
+	}
+	a := stuck("zq-root-a")
+	if os.WriteFile(filepath.Join(a, "ckpt", "probe"), nil, 0o644) == nil {
+		t.Skip("the test runs as a user that writes any directory")
+	}
 	runAt := func(at time.Time) {
 		t.Helper()
 		o := options(t, procRoot(t), at, nil)
 		o.Now = true
-		if _, err := Run(ctx, cfg, st, o); err != nil {
-			t.Fatal(err)
-		}
+		f.run(t, o)
 	}
-	id := "capacity:" + RuleTargets + ":excluded"
-	runAt(now)
-	n, ok, err := st.Note(ctx, id)
-	if err != nil || !ok || n.Kind != store.NoteProblem || !strings.Contains(n.Title, "1 Rust build output") {
-		t.Fatalf("the first report-only item puts its group's note: %+v %v %v", n, ok, err)
+	id := "capacity:" + RuleScratch + ":stuck"
+	runAt(f.now)
+	n, ok, err := f.st.Note(ctx, id)
+	if err != nil || !ok || n.Kind != store.NoteProblem || !strings.Contains(n.Title, "1 task folder ") {
+		t.Fatalf("the first item of a problem reason puts its note: %+v %v %v", n, ok, err)
 	}
-	if _, _, err := st.DoneNote(ctx, id, now); err != nil {
+	if _, _, err := f.st.DoneNote(ctx, id, f.now); err != nil {
 		t.Fatal(err)
 	}
-	runAt(now.Add(time.Hour))
-	if n, _, _ := st.Note(ctx, id); n.Done.IsZero() {
+	runAt(f.now.Add(time.Hour))
+	if n, _, _ := f.st.Note(ctx, id); n.Done.IsZero() {
 		t.Fatal("the same items again leave a note the owner resolved resolved")
 	}
-	cargoTarget(t, filepath.Join(root, "secret-b", "target"))
-	runAt(now.Add(2 * time.Hour))
-	if n, _, _ := st.Note(ctx, id); !n.Done.IsZero() || !strings.Contains(n.Title, "2 Rust build output") {
+	b := stuck("zq-root-b")
+	runAt(f.now.Add(2 * time.Hour))
+	if n, _, _ := f.st.Note(ctx, id); !n.Done.IsZero() || !strings.Contains(n.Title, "2 task folders") {
 		t.Fatalf("a new item makes the note stand again, with both: %+v", n)
 	}
-	evs, err := st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindReport}})
+	evs, err := f.st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindReport}})
 	if err != nil || len(evs) != 2 {
 		t.Errorf("one event per item, not per run: %d %v", len(evs), err)
 	}
-	must(t, os.RemoveAll(filepath.Join(root, "secret-a")))
-	must(t, os.RemoveAll(filepath.Join(root, "secret-b")))
-	runAt(now.Add(3 * time.Hour))
-	if n, _, _ := st.Note(ctx, id); n.Done.IsZero() {
+	for _, p := range []string{a, b} {
+		must(t, os.Chmod(filepath.Join(p, "ckpt"), 0o755))
+		must(t, os.RemoveAll(p))
+	}
+	runAt(f.now.Add(3 * time.Hour))
+	if n, _, _ := f.st.Note(ctx, id); n.Done.IsZero() {
 		t.Error("a rule that finds none of the note's items any more resolves it")
 	}
 }

@@ -25,9 +25,10 @@ import (
 //     one transaction, so a run stopped midway leaves a note of what it did until then: what the run freed on disk,
 //     how many items each rule took, the largest of them, and how to keep one next time; a prune that removed nothing
 //     is an event only, and a run that took nothing writes no note;
-//   - each item only reported is an event (capacity-report), once, and its rule's problem note for that reason
-//     lists them; the note is put again only when an item new to it appears, so a note the owner resolved stays
-//     resolved until the evidence changes, and it is resolved by itself when the rule finds none;
+//   - each item only reported is an event (capacity-report), once; what a rule leaves by design is no problem and has
+//     no note, and a reason that is a problem (problemReasons) has its rule's problem note, which lists them; the note
+//     is put again only when an item new to it appears, so a note the owner resolved stays resolved until the
+//     evidence changes, and it is resolved by itself when the rule finds none;
 //   - a deletion that failed is an event (capacity-failed) and its rule's problem note for failures;
 //   - a fast fill is an event (capacity-fill) and the disk's problem note, high importance, put once per fill.
 
@@ -170,6 +171,9 @@ func (r *runner) record(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		if !problemReasons[g.class] {
+			continue // left by design: its events and the run's output say so, and no note
+		}
 		id := "capacity:" + g.rule + ":" + g.class
 		old, had, err := r.st.Note(ctx, id)
 		if err != nil {
@@ -188,7 +192,8 @@ func (r *runner) record(ctx context.Context) error {
 		}
 	}
 	// A problem note whose rule ran and found none of its items any more is resolved, by the rule: it stands again
-	// when its items come back, unlike one the owner resolved.
+	// when its items come back, unlike one the owner resolved. An older build's note for items left by design is
+	// resolved by any run: it is no problem.
 	ns, err := r.st.Notes(ctx)
 	if err != nil {
 		return err
@@ -199,7 +204,13 @@ func (r *runner) record(ctx context.Context) error {
 			continue
 		}
 		rule, class, _ := strings.Cut(rest, ":")
-		if ran[rule] && groups[rule+"\x00"+class] == nil {
+		switch {
+		case !contains(Rules, rule): // a disk's, a hold's or the jobs' note: their own records resolve them
+		case !problemReasons[class]:
+			if _, _, err := r.st.DoneNote(ctx, n.ID, r.now); err != nil {
+				return err
+			}
+		case ran[rule] && groups[rule+"\x00"+class] == nil:
 			if _, _, err := r.st.DoneNote(ctx, n.ID, r.now); err != nil {
 				return err
 			}
@@ -398,7 +409,7 @@ func (r *runner) recordFull(ctx context.Context, d DiskState) error {
 		_, err := r.st.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Source: store.Capacity, Importance: store.ImportanceHigh,
 			At:     r.now,
 			Title:  fmt.Sprintf("%s is %.0f%% used, above %.0f%%: %s free", d.Disk, d.pctFull, r.cfg.Fill.Full, gib(d.Avail)),
-			Detail: "Capacity deletes only what its rules find idle; what it can only report is among the problems."})
+			Detail: "Capacity deletes only what its rules find idle; momentum capacity lists what they leave, and why."})
 		return err
 	case !full && !open.IsZero():
 		if n, had, err := r.st.Note(ctx, id); err != nil {
@@ -937,24 +948,23 @@ func itemText(it runItem) string {
 // a later deletion of the run may take too.
 const linkedElsewhere = "A file linked elsewhere frees nothing until its last link goes."
 
-// groupTitles say what a rule's report-only items of one reason are.
+// problemReasons are the reasons whose items are a problem: a deletion that failed, and an item its rule would act on
+// and cannot. uv's prune waits on processes or a lock it cannot wait out (busy), a task folder's offload ran out of
+// its time (too-big) or its model data cannot be removed by this user (stuck), and an item cannot be read
+// (unreadable). Every other reason is its rule's own design (an excluded project's, one of no known project, a build
+// git does not ignore, a worktree that holds work, a mount point, a folder beside its pointer, Docker's volumes):
+// its items are events, and the run lists them, with no note.
+var problemReasons = map[string]bool{"failed": true, "busy": true, "too-big": true, "stuck": true, "unreadable": true}
+
+// groupTitles say what a rule's items of one problem reason are.
 var groupTitles = map[string]string{
-	"excluded":    "in excluded projects, left for their owners",
-	"unknown":     "of no known project, left",
-	"tracked":     "that git does not ignore, left",
-	"uncommitted": "with uncommitted work, left",
-	"unpushed":    "with commits on no remote, left",
-	"unreadable":  "git could not read, left",
-	"ignored":     "with ignored files that are not a cache, left",
-	"mount":       "holding a mount point, left",
-	"volumes":     "only reported",
-	"failed":      "that could not be deleted",
-	"pointer":     "beside the pointer of their offload, left",
-	"stuck":       "whose model data this user cannot remove, left",
-	"too-big":     "too big to offload in one run, left",
+	"unreadable": "git could not read, left",
+	"failed":     "that could not be deleted",
+	"stuck":      "whose model data this user cannot remove, left",
+	"too-big":    "too big to offload in one run, left",
 }
 
-// groupNote is the problem note of one rule's report-only items for one reason.
+// groupNote is the problem note of one rule's items for one problem reason.
 func groupNote(id, rule, class string, items []Finding, now time.Time) store.Note {
 	sort.SliceStable(items, func(i, j int) bool { return items[i].Bytes > items[j].Bytes })
 	var total int64
@@ -964,8 +974,6 @@ func groupNote(id, rule, class string, items []Finding, now time.Time) store.Not
 	what := ruleText[rule]
 	title := fmt.Sprintf("%d %s %s (%s)", len(items), plural(what, len(items)), groupTitles[class], gib(total))
 	switch {
-	case rule == RuleDocker && class == "volumes":
-		title = fmt.Sprintf("Docker volumes no container uses hold %s, only reported", gib(total))
 	case rule == RuleUV && class == "busy":
 		title = fmt.Sprintf("The uv cache is %s and waits to be pruned: uv processes read it", gib(total))
 	case rule == RuleScratch && class == "unreadable":

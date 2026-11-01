@@ -319,30 +319,42 @@ func TestASharedBlobGoesOnlyUnderItsLock(t *testing.T) {
 	}
 }
 
-// A note the rule resolved itself stands again when its items come back; one the owner resolved does not.
+// A note the rule resolved itself stands again when its items come back; one the owner resolved does not. uv's
+// prune that a uv process holds off is a problem.
 func TestANoteTheRuleResolvedStandsAgainForTheSameItems(t *testing.T) {
 	ctx := context.Background()
-	cfg, root := excludedTargets(t, "a")
+	cfg := Config{Live: []string{RuleUV}}.Normal()
 	st := openStore(t)
-	now := time.Now().Add(72 * time.Hour)
-	runWith := func(at time.Time, proc string) {
+	now := time.Now()
+	held := fakeTools{answers: map[string]string{"uv cache dir": "/home/u/.cache/uv\n", "uv cache size": "40000000000\n",
+		"uv cache prune": "ERR-INUSE", "docker": "ERR"}}
+	runWith := func(at time.Time, tools Tools) {
 		t.Helper()
-		o := options(t, proc, at, nil)
-		o.Now = true
+		o := options(t, procRoot(t), at, nil)
+		o.Now, o.Tools, o.Rules = true, tools, []string{RuleUV}
 		if _, err := Run(ctx, cfg, st, o); err != nil {
 			t.Fatal(err)
 		}
 	}
-	id := "capacity:" + RuleTargets + ":excluded"
-	runWith(now, procRoot(t))
-	busy := procRoot(t, fakeProc{pid: 5, ppid: 1, argv: []string{"cargo"}, cwd: filepath.Join(root, "secret-a", "target")})
-	runWith(now.Add(time.Hour), busy) // in use: not reported, so the rule resolves the note
+	id := "capacity:" + RuleUV + ":busy"
+	runWith(now, held)
+	if n, ok, _ := st.Note(ctx, id); !ok || !n.Done.IsZero() || !strings.Contains(n.Title, "waits to be pruned") {
+		t.Fatalf("setup: a prune a uv process holds off is a problem note: %+v", n)
+	}
+	runWith(now.Add(time.Hour), uvTools("40000000000", nil)) // the prune goes through: the rule resolves the note
 	if n, _, _ := st.Note(ctx, id); n.Done.IsZero() {
 		t.Fatal("setup: the rule resolves a note none of whose items it finds")
 	}
-	runWith(now.Add(2*time.Hour), procRoot(t))
+	runWith(now.Add(2*time.Hour), held)
 	if n, _, _ := st.Note(ctx, id); !n.Done.IsZero() {
 		t.Fatal("a note the rule resolved stands again when its item is back")
+	}
+	if _, _, err := st.DoneNote(ctx, id, now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	runWith(now.Add(3*time.Hour), held)
+	if n, _, _ := st.Note(ctx, id); n.Done.IsZero() {
+		t.Error("a note the owner resolved stays resolved while its item is the same")
 	}
 	evs, _ := st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindReport}})
 	if len(evs) != 1 || !evs[0].TS.Equal(now.Truncate(time.Millisecond)) {
