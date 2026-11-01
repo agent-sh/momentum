@@ -850,8 +850,11 @@ func TestAFillThatEndedIsADecidedNote(t *testing.T) {
 	base, err := st.DiskSamples(ctx, dir, now.Add(-24*time.Minute))
 	must(t, err)
 	from := base[0].At
-	title := plain.Clip(fmt.Sprintf("%s filled fast from %s to %s (+%s)", dir, from.Format("Jan 2 15:04"), endText(from, end),
-		gib(d.Used-base[0].Used)), store.TitleMax)
+	// up to its last fast run, the run at now
+	peak, err := st.DiskSamples(ctx, dir, now)
+	must(t, err)
+	title := plain.Clip(fmt.Sprintf("%s filled fast from %s to %s (+%s)", dir, from.Format("Jan 2 15:04"), endText(from, now),
+		gib(peak[0].Used-base[0].Used)), store.TitleMax)
 	n, ok, _ := st.Note(ctx, filled)
 	if !ok || n.Kind != store.NoteDecided || n.Title != title || n.At.UnixMilli() != end.UnixMilli() || n.Source != store.Capacity {
 		t.Fatalf("a decided note says when the fill began and ended and what the disk gained, dated at its end: %+v, want %q", n, title)
@@ -933,10 +936,11 @@ func TestAnOlderBuildsEndedFillEndsAsAFillEndsNow(t *testing.T) {
 		t.Errorf("the older build's note of a fill that ended is resolved: %+v", n)
 	}
 	n, ok, _ := st.Note(ctx, "capacity:filled:"+dir)
-	title := plain.Clip(dir+" filled fast from Mar 3 23:40 to Mar 4 00:05 (-2.0 GiB)", store.TitleMax)
+	// what the fill added up to its last fast run (100 to 112 GiB); the drop to 98 after it is not the fill's
+	title := plain.Clip(dir+" filled fast from Mar 3 23:40 to Mar 4 00:00 (+12.0 GiB)", store.TitleMax)
 	if !ok || n.Kind != store.NoteDecided || n.Title != title || n.At.UnixMilli() != end.UnixMilli() ||
 		!strings.Contains(n.Detail, "rsync (pid 61) wrote 8.0 GiB in 10m0s") {
-		t.Errorf("a decided note from the window of the fill's first run to the run after its last, with its writers: %+v, want %q",
+		t.Errorf("a decided note from the window of the fill's first run to its last fast run, with its writers: %+v, want %q",
 			n, title)
 	}
 }

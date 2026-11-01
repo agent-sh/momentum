@@ -572,21 +572,27 @@ func (r *runner) filled(ctx context.Context, d DiskState, start time.Time) error
 			from = first.at.Add(-time.Duration(first.state.WindowMS) * time.Millisecond)
 		}
 	}
-	end, used := r.now, d.Used
+	end := r.now
 	after, err := r.st.DiskSamples(ctx, d.Disk, last.Add(time.Millisecond))
 	if err != nil {
 		return err
 	}
 	if len(after) > 0 {
-		end, used = after[0].At, after[0].Used
+		end = after[0].At
 	}
-	title := fmt.Sprintf("%s filled fast from %s to %s", d.Disk, from.Format("Jan 2 15:04"), endClock(from, end))
+	// The title spans the fill, its first run's window to its last fast run, and says what the disk gained in it. A drop
+	// after the last fast run (a cleanup, a deleted checkpoint) is not the fill's, so it does not cut the figure.
+	title := fmt.Sprintf("%s filled fast from %s to %s", d.Disk, from.Format("Jan 2 15:04"), endClock(from, last))
 	base, err := r.st.DiskSamples(ctx, d.Disk, from)
 	if err != nil {
 		return err
 	}
-	if len(base) > 0 && base[0].At.Before(end) {
-		title += " (" + signedGiB(used-base[0].Used) + ")"
+	peak, err := r.st.DiskSamples(ctx, d.Disk, last)
+	if err != nil {
+		return err
+	}
+	if len(base) > 0 && len(peak) > 0 && base[0].At.Before(peak[0].At) {
+		title += " (" + signedGiB(peak[0].Used-base[0].Used) + ")"
 	}
 	all := d
 	all.Writers = writersOf(runs)
