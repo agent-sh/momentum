@@ -466,7 +466,7 @@ func TestOneCaseBuildsAtATime(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	done, err := r.Once(ctx, Options{})
+	done, err := r.Once(ctx, Options{Families: []string{"failures", "owner-burden", "sessions"}}) // sessions has no case
 	builds, waits := 0, 0
 	for _, d := range done {
 		switch {
@@ -476,7 +476,7 @@ func TestOneCaseBuildsAtATime(t *testing.T) {
 			waits++
 		}
 	}
-	if err != nil || builds != 1 || waits != 1 {
+	if err != nil || builds != 1 || waits != 1 || len(done) != 3 {
 		t.Fatalf("%d builds, %d waiting: %+v %v", builds, waits, done, err)
 	}
 }
@@ -502,5 +502,54 @@ func TestAStaleRunCountsItsBudgetAndARefusalFallsBack(t *testing.T) {
 	}
 	if run, _ := st.LoopRunByID(ctx, "stale"); run.Status != store.RunFailed || run.Failure != "killed" || run.USD != r.Budgets.Run {
 		t.Fatalf("the stale run %+v", run)
+	}
+}
+
+// A pick that fails ends the loop's run only once the runs it started have ended: none is left running when Once
+// returns, and the families' steps are recorded whole.
+func TestAPickThatFailsWaitsForTheRunsItStarted(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	slow := script(t, t.TempDir(), "agent", "sleep 1\necho '{\"type\":\"system\",\"subtype\":\"init\"}'\necho '"+okResult+"'")
+	r := runnerFor(t, st, []string{slow})
+	openCase(t, st, "failures", "a", 1)
+	broken := openCase(t, st, "owner-burden", "b", 1)
+	mech, next := "m", "n"
+	if _, err := st.UpdateCase(ctx, broken.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mech, NextTest: &next}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(r.Ship.pkgDir(broken.ID), "package.json"), "{not a package")
+	if _, err := r.Once(ctx, Options{}); err == nil || !strings.Contains(err.Error(), "package") {
+		t.Fatalf("a package that cannot be read: %v", err)
+	}
+	runs, _ := st.LoopRuns(ctx, store.RunFilter{})
+	if len(runs) != 1 || runs[0].Status != store.RunOK {
+		t.Fatalf("the run started before the error: %+v", runs)
+	}
+}
+
+// A case whose change waits on its review is not built again: its review, or its landing, comes next.
+func TestACaseWhoseChangeWaitsOnItsReviewIsNotBuilt(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	r := runnerFor(t, st, fakeAgent(t, okResult))
+	c := openCase(t, st, "failures", "a", 1)
+	mech, next := "m", "n"
+	if _, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mech, NextTest: &next}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	p := Package{Case: c.ID, Kind: "repo", State: Proposed, Head: "abc123"}
+	if err := r.Ship.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	if got, step, why, err := r.pick(ctx, "failures", "", false); err != nil || got.ID != "" {
+		t.Fatalf("a proposed change picked for %s: %s %v", step, why, err)
+	}
+	p.State = Revising
+	if err := r.Ship.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	if got, step, _, err := r.pick(ctx, "failures", "", false); err != nil || got.ID != c.ID || step != StepBuild {
+		t.Fatalf("a change sent back by its review: %s %s %v", got.ID, step, err)
 	}
 }

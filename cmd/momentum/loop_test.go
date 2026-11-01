@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -287,6 +288,20 @@ func TestARepositoryIsBusyWhenSomeoneWorksInIt(t *testing.T) {
 		if got, err := busyIn(ctx, st, repo, c.ss); err != nil || (c.want == "") != (got == "") || !strings.Contains(got, c.want) {
 			t.Errorf("%+v: %q %v", c.ss, got, err)
 		}
+	}
+	// a process at work in the tree, whatever started it
+	sub := filepath.Join(repo, "sub")
+	os.MkdirAll(sub, 0o700)
+	sleep := exec.Command("sleep", "30")
+	sleep.Dir = sub
+	if err := sleep.Start(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := busyIn(ctx, st, repo, nil)
+	sleep.Process.Kill()
+	sleep.Wait()
+	if err != nil || !strings.Contains(got, fmt.Sprintf("sleep (pid %d) in %s", sleep.Process.Pid, repo)) {
+		t.Errorf("a process in the tree: %q %v", got, err)
 	}
 	os.WriteFile(filepath.Join(repo, "a.txt"), []byte("b\n"), 0o600)
 	if got, _ := busyIn(ctx, st, repo, nil); !strings.Contains(got, "uncommitted") {

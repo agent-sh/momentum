@@ -118,14 +118,24 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 	if len(o.Families) > 0 {
 		families = o.Families
 	}
-	var mu sync.Mutex
-	var done []Done
-	var wg sync.WaitGroup
+	// every family's run is reserved before any starts, so the budgets count each in flight at its whole budget
+	// whatever the others spend meanwhile; a pick that fails stops the reserving, and the runs reserved still run
+	type reserved struct {
+		fam, step string
+		c         store.Case
+		run       store.LoopRun
+	}
+	var (
+		done   []Done
+		starts []reserved
+		picked error
+	)
 	building := false
 	for _, fam := range families {
 		c, step, why, err := r.pick(ctx, fam, o.Case, o.Dry)
 		if err != nil {
-			return done, err
+			picked = err
+			break
 		}
 		switch {
 		case c.ID == "":
@@ -145,16 +155,26 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 			continue
 		}
 		building = building || step == StepBuild
+		starts = append(starts, reserved{fam, step, c, run})
+	}
+	var (
+		mu sync.Mutex
+		wg sync.WaitGroup
+	)
+	for _, s := range starts {
 		wg.Add(1)
-		go func(fam string, c store.Case, step string, run store.LoopRun) {
+		go func(s reserved) {
 			defer wg.Done()
-			d := r.step(ctx, fam, c, step, run)
+			d := r.step(ctx, s.fam, s.c, s.step, s.run)
 			mu.Lock()
 			done = append(done, d)
 			mu.Unlock()
-		}(fam, c, step, run)
+		}(s)
 	}
 	wg.Wait()
+	if picked != nil {
+		return done, picked
+	}
 	if !o.Dry {
 		done = append(done, r.reviews(ctx, o.Case)...)
 	}
