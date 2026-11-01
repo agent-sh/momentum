@@ -1501,11 +1501,14 @@ func uvWaits(procRoot string, pid int) time.Duration {
 	env, err := readEnviron(procRoot, pid)
 	if v, ok := envValue(env, "UV_LOCK_TIMEOUT"); err == nil && ok {
 		if n, err := strconv.ParseUint(strings.TrimPrefix(v, "+"), 10, 64); err == nil {
-			wait = time.Duration(min(n, uint64(math.MaxInt64/int64(time.Second)))) * time.Second
+			if n > math.MaxInt64/uint64(time.Second) {
+				return math.MaxInt64 // longer than a Duration holds: a wait with no end, to the run
+			}
+			wait = time.Duration(n) * time.Second
 		}
 	}
 	if wait > math.MaxInt64-uvLockMargin {
-		return math.MaxInt64 // a wait with no end, to uv
+		return math.MaxInt64
 	}
 	return wait + uvLockMargin
 }
