@@ -10,24 +10,28 @@ import (
 )
 
 // Tree is what a walk of a file or directory found: the bytes it holds on disk (each inode once, as du counts
-// them), its newest write (the later of a modification and a status change, of any entry), and how many entries.
-// A status change counts as a write: a file moved or copied in with its old modification time is new here.
+// them), its newest write (the later of a modification and a status change, of any entry), how many entries, and
+// its links: what deleting it frees (links). A status change counts as a write: a file moved or copied in with its
+// old modification time is new here, and so is one a link was made to or taken from.
 type Tree struct {
 	Bytes  int64
 	Newest time.Time
 	Files  int
 	Errs   int // entries that could not be read
+	links  links
 }
 
 type inode struct{ dev, ino uint64 }
 
-// Measure walks p without following symlinks or leaving its filesystem. seen holds the inodes counted already, so
-// a hardlink counts once across walks that share it; nil counts each walk on its own.
-func Measure(p string, seen map[inode]bool) Tree {
-	if seen == nil {
-		seen = map[inode]bool{}
-	}
+// Measure walks p without following symlinks or leaving its filesystem.
+func Measure(p string) Tree { return measure(p, nil) }
+
+// measure is Measure that passes over each path skip says yes to, with what is under it.
+func measure(p string, skip func(string) bool) Tree {
 	var t Tree
+	if skip != nil && skip(p) {
+		return t
+	}
 	st, err := os.Lstat(p)
 	if err != nil {
 		t.Errs++
@@ -37,6 +41,7 @@ func Measure(p string, seen map[inode]bool) Tree {
 	if !ok {
 		return t
 	}
+	seen := map[inode]bool{}
 	count := func(fi os.FileInfo) {
 		s, ok := fi.Sys().(*syscall.Stat_t)
 		if !ok {
@@ -47,16 +52,18 @@ func Measure(p string, seen map[inode]bool) Tree {
 			t.Newest = w
 		}
 		k := inode{uint64(s.Dev), s.Ino}
-		if !seen[k] {
+		first := !seen[k]
+		if first {
 			seen[k] = true
 			t.Bytes += s.Blocks * 512
 		}
+		t.links.add(s, first)
 	}
 	count(st)
-	if !st.IsDir() {
-		return t
-	}
 	stack := []string{p}
+	if !st.IsDir() {
+		stack = nil
+	}
 	for len(stack) > 0 {
 		d := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
@@ -66,6 +73,10 @@ func Measure(p string, seen map[inode]bool) Tree {
 			continue
 		}
 		for _, e := range ents {
+			q := filepath.Join(d, e.Name())
+			if skip != nil && skip(q) {
+				continue
+			}
 			fi, err := e.Info()
 			if err != nil {
 				continue // gone since the listing
@@ -73,11 +84,12 @@ func Measure(p string, seen map[inode]bool) Tree {
 			count(fi)
 			if e.IsDir() {
 				if s, ok := fi.Sys().(*syscall.Stat_t); ok && s.Dev == root.Dev {
-					stack = append(stack, filepath.Join(d, e.Name()))
+					stack = append(stack, q)
 				}
 			}
 		}
 	}
+	t.links.settle()
 	return t
 }
 

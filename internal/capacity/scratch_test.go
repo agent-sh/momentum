@@ -1006,7 +1006,7 @@ func TestAnOffloadGoesOnlyToTheDirectoryJudged(t *testing.T) {
 	must(t, err)
 	r := &runner{cfg: f.cfg}
 	g := &Finding{Rule: RuleScratch, Path: p, ino: inode{ino.dev, ino.ino + 1}} // another directory was judged
-	if err := r.removeScratch(context.Background(), g, nil); !errors.Is(err, errChanged) || !exists(filepath.Join(p, "out.log")) {
+	if err := r.removeScratch(context.Background(), g, nil, nil); !errors.Is(err, errChanged) || !exists(filepath.Join(p, "out.log")) {
 		t.Errorf("a folder that is not the directory judged stays: %v", err)
 	}
 	if f.offloadLog(t) != "" {

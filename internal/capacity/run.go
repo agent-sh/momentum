@@ -25,31 +25,44 @@ type Finding struct {
 	Idle   time.Time `json:"idle_since,omitzero"`
 	// Action is delete (it qualifies; Done says whether this run deleted it), pending (it will qualify at
 	// Eligible if nothing changes), keep (it would qualify but for Why) or report (only reported: Why says why).
-	Action       string    `json:"action"`
-	Why          string    `json:"why,omitempty"`
-	Eligible     time.Time `json:"eligible,omitzero"`
-	Done         bool      `json:"done,omitempty"`
-	Freed        int64     `json:"freed,omitempty"` // measured on its disk when it was deleted
-	Err          string    `json:"error,omitempty"`
-	Detail       string    `json:"detail,omitempty"`
-	canon        string    // the canonical path, which every comparison uses (Mounts)
-	root         string    // the directory it is deleted under (os.Root): no symlink leads the deletion out of it
-	ino          inode     // its inode when the rule judged it: one put in its place since is not deleted
-	parts        []string  // a target dir's own entries, when it holds others that Cargo does not build
-	repo, branch string    // a worktree's common git directory and its branch
-	head         string    // a worktree's commit when the rule judged it
-	blobs        []string  // a model's shared-store blobs that go with it, canonical
-	linked       []string  // every shared-store blob a model links, canonical
-	class        string    // why a report-only finding is reported, as a word: its note's group
-	none         bool      // a prune that removed nothing, as the tool lists it or uv counts it: an event, not in the run's note
-	unsaid       bool      // a prune whose tool did not say what it freed
-	unsized      bool      // a prune whose size could not be read before it ran
-	ownDirs      []ownDir  // the directories its deletion changed, each with its last change before (ownBefore)
-	// a task folder's: its model data and their bytes, the sessions that made it, whether only its model data goes
-	// (an excluded project's), and what the act did: the model data's bytes it deleted and the space that freed,
-	// the snapshot it offloaded to
+	Action   string    `json:"action"`
+	Why      string    `json:"why,omitempty"`
+	Eligible time.Time `json:"eligible,omitzero"`
+	Done     bool      `json:"done,omitempty"`
+	// Freed is the space its deletion freed on disk: the files whose last link it removed (freed.go). A prune
+	// done by a tool has the tool's own figure, and By names the tool; Unsaid is one whose tool printed none. Out
+	// is what went out of a pruned cache, its size before less its size after. WouldFree is, for one a rule that is
+	// not live would delete (a dry run), what its deletion would free.
+	Freed        int64    `json:"freed,omitempty"`
+	By           string   `json:"freed_by,omitempty"`
+	Unsaid       bool     `json:"unsaid,omitempty"`
+	Out          int64    `json:"out,omitempty"`
+	WouldFree    *int64   `json:"would_free,omitempty"`
+	Err          string   `json:"error,omitempty"`
+	Detail       string   `json:"detail,omitempty"`
+	canon        string   // the canonical path, which every comparison uses (Mounts)
+	root         string   // the directory it is deleted under (os.Root): no symlink leads the deletion out of it
+	ino          inode    // its inode when the rule judged it: one put in its place since is not deleted
+	parts        []string // a target dir's own entries, when it holds others that Cargo does not build
+	repo, branch string   // a worktree's common git directory and its branch
+	head         string   // a worktree's commit when the rule judged it
+	admin        string   // a worktree's administrative directory, which git removes with it
+	blobs        []string // a model's shared-store blobs that go with it, canonical
+	linked       []string // every shared-store blob a model links, canonical
+	// shares are a model's shared-store blobs other repositories link too, each with how many repositories link
+	// it: the last of them to go takes it
+	shares  map[string]int
+	links   links    // what its deletion frees as the rule judged it: a task folder's, all of it but its model data
+	class   string   // why a report-only finding is reported, as a word: its note's group
+	none    bool     // a prune that removed nothing, as the tool lists it or uv counts it: an event, not in the run's note
+	unsized bool     // a prune whose size could not be read before it ran
+	ownDirs []ownDir // the directories its deletion changed, each with its last change before (ownBefore)
+	// a task folder's: its model data, their bytes and their links, the sessions that made it, whether only its model
+	// data goes (an excluded project's), and what the act did: the model data's bytes it deleted and the space that
+	// freed, the snapshot it offloaded to
 	files      []modelFile
 	modelBytes int64
+	modelLinks links
 	makers     []maker
 	modelOnly  bool
 	removed    int64
@@ -416,6 +429,7 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 		scan(rule)
 	}
 	r.mountCheck()
+	r.estimate()
 	if err := r.act(ctx); err != nil {
 		return r.res, err
 	}
@@ -740,19 +754,6 @@ func (r *runner) holdsRoot(p string) bool {
 		}
 	}
 	return false
-}
-
-// free is the free space of the disk a path is on, or -1.
-func (r *runner) free(p string) int64 {
-	var s syscall.Statfs_t
-	for cur := p; ; cur = filepath.Dir(cur) {
-		if err := syscall.Statfs(cur, &s); err == nil {
-			return int64(s.Bavail) * int64(s.Bsize)
-		}
-		if cur == filepath.Dir(cur) {
-			return -1
-		}
-	}
 }
 
 // useText is a use in words: what process used it and how.

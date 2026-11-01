@@ -54,12 +54,14 @@ type modelFile struct {
 }
 
 // folderWalk is what a walk of a task folder found: its size and newest write (as Measure counts them), its model
-// data, and what git records that ties it to a repository outside it.
+// data, the links of its model data and of the rest (what deleting each frees), and what git records that ties it
+// to a repository outside it.
 type folderWalk struct {
 	Tree
 	models     []modelFile
 	modelBytes int64
-	links      []string
+	modelLinks links
+	ties       []string
 	gitDirs    []string // the git directories in it
 }
 
@@ -117,7 +119,7 @@ func (r *runner) scratch(ctx context.Context, found Found) ([]Finding, []string,
 			}
 			w := walkFolder(shown, r.m, minBytes)
 			f := Finding{Rule: RuleScratch, Path: shown, canon: canon, root: x.shown, Bytes: w.Bytes, Newest: w.Newest,
-				files: w.models, modelBytes: w.modelBytes, makers: makers}
+				files: w.models, modelBytes: w.modelBytes, makers: makers, links: w.links, modelLinks: w.modelLinks}
 			f.ino, _ = inodeOf(shown)
 			if pst, err := os.Lstat(filepath.Join(x.shown, name+pointerSuffix)); err == nil {
 				f.Action, f.class = ActReport, "pointer"
@@ -167,7 +169,7 @@ func (r *runner) decideScratch(ctx context.Context, f Finding, x root, w folderW
 	if j, ok := r.named.Protects(f.canon); ok {
 		return keep("named by " + j)
 	}
-	if why := referenced(f.canon, w.links, refs); why != "" {
+	if why := referenced(f.canon, w.ties, refs); why != "" {
 		return keep(why)
 	}
 	if watched < window {
@@ -647,24 +649,27 @@ func walkFolder(p string, m *Mounts, minBytes int64) folderWalk {
 		return w
 	}
 	seen := map[inode]bool{}
-	count := func(fi os.FileInfo) (int64, bool) {
+	// count counts an entry, each inode's bytes once, and its link in the links of the model data or of the rest
+	count := func(fi os.FileInfo, l *links) int64 {
 		s, ok := fi.Sys().(*syscall.Stat_t)
 		if !ok {
-			return 0, false
+			return 0
 		}
 		w.Files++
 		if t := newest(s); t.After(w.Newest) {
 			w.Newest = t
 		}
 		k := inode{uint64(s.Dev), s.Ino}
-		if seen[k] {
-			return 0, true
+		first := !seen[k]
+		l.add(s, first)
+		if !first {
+			return 0
 		}
 		seen[k] = true
 		w.Bytes += s.Blocks * 512
-		return s.Blocks * 512, true
+		return s.Blocks * 512
 	}
-	count(st)
+	count(st, &w.links)
 	type dir struct {
 		path    string
 		noModel bool
@@ -682,7 +687,7 @@ func walkFolder(p string, m *Mounts, minBytes int64) folderWalk {
 			w.gitDirs = append(w.gitDirs, d.path)
 			for _, wt := range worktreeFiles(d.path) {
 				if !under(m.Canon(wt), cp) {
-					w.links = append(w.links, "a worktree at "+short(filepath.Dir(wt))+" belongs to the repository at "+short(repoPlace(d.path)))
+					w.ties = append(w.ties, "a worktree at "+short(filepath.Dir(wt))+" belongs to the repository at "+short(repoPlace(d.path)))
 				}
 			}
 		}
@@ -692,19 +697,25 @@ func walkFolder(p string, m *Mounts, minBytes int64) folderWalk {
 				w.Errs++
 				continue
 			}
-			b, _ := count(fi)
 			ep := filepath.Join(d.path, e.Name())
+			gitFile := e.Name() == ".git" && fi.Mode().IsRegular()
+			model := !gitFile && fi.Mode().IsRegular() && !d.noModel && fi.Size() >= minBytes && modelFormat(ep, e.Name(), fi.Size())
+			l := &w.links
+			if model {
+				l = &w.modelLinks
+			}
+			b := count(fi, l)
 			switch {
 			case e.IsDir():
 				if s, ok := fi.Sys().(*syscall.Stat_t); ok && s.Dev == rootStat.Dev {
 					stack = append(stack, dir{ep, d.noModel || packageTree(ep, e.Name())})
 				}
-			case e.Name() == ".git" && fi.Mode().IsRegular():
+			case gitFile:
 				// a linked worktree, or a checkout whose git directory is kept apart: the repository names it
 				if g, _ := isLinkedWorktree(d.path); g != "" && !under(m.Canon(g), cp) && exists(g) {
-					w.links = append(w.links, "it holds a checkout of the repository at "+short(repoPlace(gitCommon(g))))
+					w.ties = append(w.ties, "it holds a checkout of the repository at "+short(repoPlace(gitCommon(g))))
 				}
-			case fi.Mode().IsRegular() && !d.noModel && fi.Size() >= minBytes && modelFormat(ep, e.Name(), fi.Size()):
+			case model:
 				ino, _ := inodeOf(ep)
 				rel, _ := filepath.Rel(p, ep)
 				w.models = append(w.models, modelFile{rel: rel, ino: ino, bytes: b})
@@ -712,6 +723,8 @@ func walkFolder(p string, m *Mounts, minBytes int64) folderWalk {
 			}
 		}
 	}
+	w.links.settle()
+	w.modelLinks.settle()
 	return w
 }
 
@@ -826,9 +839,10 @@ func modelFormat(p, name string, size int64) bool {
 // removeScratch acts on a task folder: under an exclusive BSD lock on it, the directory opened checked to be the one
 // judged, it deletes its model data, each file through an os.Root of the folder and only while it is the inode
 // judged, and has recorded run once they are gone (a deletion is on record before the offload starts). Then it
-// offloads the rest with evidence-offload, unless only the model data goes. An offload that failed but left the
-// pointer and no folder went: restic keeps the folder.
-func (r *runner) removeScratch(ctx context.Context, f *Finding, recorded func() error) error {
+// offloads the rest with evidence-offload, unless only the model data goes, with offloading run just before: what the
+// folder holds then is what the offload removes. An offload that failed but left the pointer and no folder went:
+// restic keeps the folder.
+func (r *runner) removeScratch(ctx context.Context, f *Finding, recorded func() error, offloading func()) error {
 	if !f.modelOnly { // without the offload, nothing of the folder goes: its model data waits for it
 		if err := haveTool(r.cfg.Scratch.Offload, "evidence-offload"); err != nil {
 			return err
@@ -892,6 +906,9 @@ func (r *runner) removeScratch(ctx context.Context, f *Finding, recorded func() 
 	}
 	if f.modelOnly {
 		return nil
+	}
+	if offloading != nil {
+		offloading()
 	}
 	out, err := runTool(ctx, offloadTimeout, r.cfg.Scratch.Offload, "evidence-offload", "EVIDENCE_TAG="+r.cfg.Scratch.Tag, f.Path)
 	if m := snapshotRe.FindStringSubmatch(out); m != nil {

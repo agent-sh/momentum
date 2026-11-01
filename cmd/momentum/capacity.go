@@ -275,8 +275,18 @@ func printCapacity(w io.Writer, res *capacity.Result, all bool) {
 					line += "; " + s
 				}
 			}
-			if f.Freed > 0 {
+			switch {
+			case f.Done && f.Unsaid:
+				line += "; freed an amount " + f.By + " did not print"
+			case f.Done && f.By != "":
+				line += "; freed " + gibText(f.Freed) + " by " + f.By + "'s count"
+			case f.Done:
 				line += "; freed " + gibText(f.Freed)
+			case f.WouldFree != nil:
+				line += "; would free " + gibText(*f.WouldFree)
+			}
+			if f.Out > 0 {
+				line += ", " + gibText(f.Out) + " out of it"
 			}
 			fmt.Fprintln(w, line)
 		}

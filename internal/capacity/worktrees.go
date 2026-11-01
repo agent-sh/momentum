@@ -118,8 +118,9 @@ func (r *runner) worktree(ctx context.Context, w, canon string, heads *remoteHea
 		f.Action, f.Why = ActKeep, "changed in the last "+quietTime.String()
 		return f, true
 	}
-	t := Measure(w, nil)
-	f.Bytes, f.Newest, f.Idle = t.Bytes, t.Newest, t.Newest
+	t, admin := Measure(w), Measure(gitdir) // git removes its administrative directory with it
+	f.Bytes, f.Newest, f.Idle, f.links, f.admin = t.Bytes+admin.Bytes, t.Newest, t.Newest, t.links, gitdir
+	f.links.merge(admin.links)
 	if why, ok := r.excluded(canon); ok {
 		f.Action, f.class, f.Why = ActReport, "excluded", "an excluded project's: "+why
 		return f, true

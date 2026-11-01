@@ -200,20 +200,34 @@ func TestARunsNoteCountsByRuleAndSaysOnceHowToKeepEach(t *testing.T) {
 		{rule: RuleScratch, path: "/h/.cache/f", size: 5 * G, freed: 5 * G, model: true},
 	}), "Freed 10.0 GiB: 1 task folder (1.0 GiB to restic), model data of 2 task folders")
 	// a title too long for a line names the prunes by their tools, then names the items shorter, then counts the
-	// prunes, then ends at the last whole clause that fits
-	docker := append(items[:len(items):len(items)], runItem{rule: RuleDocker, path: "docker build cache", size: G, freed: G})
+	// prunes, then ends at the last whole clause that fits. What Docker says it freed is Docker's figure, not in what
+	// the run freed.
+	docker := append(items[:len(items):len(items)], runItem{rule: RuleDocker, path: "docker build cache", size: G, freed: G, by: "Docker"})
 	check("the prunes by their tools", runTitle(docker),
-		"Freed 26.0 GiB: 2 Rust build outputs, 1 leftover worktree, 2 task folders (3.0 GiB to restic); pruned uv and Docker")
-	unsaid := append(items[:len(items):len(items)], runItem{rule: RuleDocker, path: "docker build cache", unsaid: true},
-		runItem{rule: RuleDocker, path: "docker dangling images", size: G, freed: G})
-	check("the items shorter, and at least what a prune with no total freed", runTitle(unsaid),
-		"Freed at least 26.0 GiB: 2 build outputs, 1 worktree, 2 folders (3.0 GiB to restic); pruned uv and Docker")
+		"Freed 25.0 GiB: 2 Rust build outputs, 1 leftover worktree, 2 task folders (3.0 GiB to restic); pruned uv and Docker")
+	check("a tool's figure, named as the tool's", runTitle(docker[3:]),
+		"Freed 11.0 GiB: 2 task folders (3.0 GiB to restic); pruned the uv cache and Docker (1.0 GiB by Docker's count)")
+	unsaid := append(items[:len(items):len(items)], runItem{rule: RuleDocker, path: "docker build cache", unsaid: true, by: "Docker"},
+		runItem{rule: RuleDocker, path: "docker dangling images", size: G, freed: G, by: "Docker"})
+	check("a prune with no total, and a figure of its tool's, are not in what the run freed", runTitle(unsaid),
+		"Freed 25.0 GiB: 2 Rust build outputs, 1 leftover worktree, 2 task folders (3.0 GiB to restic); pruned uv and Docker")
+	check("what Docker printed of two prunes, one of which printed nothing", runTitle(unsaid[len(unsaid)-2:]),
+		"Pruned Docker (at least 1.0 GiB by Docker's count)")
 	var models []runItem
 	for i := range 10 {
 		models = append(models, runItem{rule: RuleModels, path: "/h/m/" + strconv.Itoa(i)})
 	}
-	check("the prunes counted", runTitle(append(models, unsaid...)),
-		"Freed at least 26.0 GiB: 10 model items, 2 build outputs, 1 worktree, 2 folders (3.0 GiB to restic); 3 prunes")
+	check("the items shorter", runTitle(append(models, unsaid...)),
+		"Freed 25.0 GiB: 10 model items, 2 build outputs, 1 worktree, 2 folders (3.0 GiB to restic); pruned uv and Docker")
+	var counted []runItem
+	for i := range 12 {
+		counted = append(counted, runItem{rule: RuleTargets, path: "/h/p/" + strconv.Itoa(i) + "/target", size: G, freed: G})
+	}
+	counted = append(counted, runItem{rule: RuleWorktrees, path: "/h/w/a"}, runItem{rule: RuleWorktrees, path: "/h/w/b"},
+		runItem{rule: RuleScratch, path: "/h/s/a", offload: true, size: G}, runItem{rule: RuleScratch, path: "/h/s/c", model: true,
+			size: 10 * G, freed: 10 * G})
+	check("the prunes counted", runTitle(append(counted, unsaid[len(unsaid)-3:]...)),
+		"Freed 24.0 GiB: 12 build outputs, 2 worktrees, 1 folder (1.0 GiB to restic), model data of 1 folder; 3 prunes")
 	if d := runDetail(unsaid); strings.Contains(d, "docker build cache") || !strings.HasPrefix(d, "Largest: ~/p/a/target 11.0 GiB, ") {
 		t.Errorf("a prune with no total names no size: %q", d)
 	}
@@ -236,10 +250,11 @@ func TestARunsNoteCountsByRuleAndSaysOnceHowToKeepEach(t *testing.T) {
 	check("the items shorter", runTitle(every()),
 		"Freed 25.0 GiB: 3 model items, 12 build outputs, 4 worktrees, 2 folders (2.0 GiB to restic), model data of 1 folder")
 	check("the last whole clauses that fit", runTitle(every(runItem{rule: RuleUV, path: "/h/.cache/uv", freed: G},
-		runItem{rule: RuleDocker, path: "docker build cache", unsaid: true}, runItem{rule: RuleDocker, path: "docker dangling images"})),
-		"Freed at least 26.0 GiB: 3 model items, 12 build outputs, 4 worktrees, 2 folders (2.0 GiB to restic) and more")
+		runItem{rule: RuleDocker, path: "docker build cache", unsaid: true, by: "Docker"},
+		runItem{rule: RuleDocker, path: "docker dangling images", by: "Docker"})),
+		"Freed 26.0 GiB: 3 model items, 12 build outputs, 4 worktrees, 2 folders (2.0 GiB to restic) and more")
 	check("a run whose one prune printed no total", runTitle(unsaid[len(unsaid)-2:len(unsaid)-1]),
-		"Freed an amount Docker did not print: pruned Docker")
+		"Pruned Docker (Docker printed no total)")
 	wt := []runItem{{rule: RuleWorktrees, path: "/h/.cache/wt", size: 300 << 10, freed: 300 << 10}}
 	check("an item under 1 MiB", runTitle(wt), "Freed under 1 MiB: 1 leftover worktree")
 	check("a removed worktree comes back", runDetail(wt), "~/.cache/wt under 1 MiB. To keep one next time, lock a worktree "+
@@ -256,10 +271,10 @@ func TestARunsNoteCountsByRuleAndSaysOnceHowToKeepEach(t *testing.T) {
 		{rule: RuleTargets, path: "/home/user/.cache/lane-review-482/target", size: 3 * G, freed: 3 * G},
 		{rule: RuleWorktrees, path: "/home/user/.cache/pr-1290-review", size: 300 << 20, freed: 300 << 20},
 		{rule: RuleScratch, path: "/home/user/.cache/train-run-7", size: G, freed: G, offload: true},
-		{rule: RuleDocker, path: "docker build cache", size: 2 * G, freed: 2 * G},
+		{rule: RuleDocker, path: "docker build cache", size: 2 * G, freed: 2 * G, by: "Docker"},
 	}
 	check("four rules and a prune name the prune by its tool", runTitle(runs),
-		"Freed 33.3 GiB: 1 model item, 2 build outputs, 1 worktree, 1 folder (1.0 GiB to restic); pruned Docker")
+		"Freed 31.3 GiB: 1 model item, 2 build outputs, 1 worktree, 1 folder (1.0 GiB to restic); pruned Docker")
 	d := runDetail(runs)
 	if !strings.HasPrefix(d, "Largest: /data/models/some-llm-8b 16.0 GiB, ~/projects/billing-service/target 11.0 GiB, "+
 		"~/.cache/lane-review-482/target 3.0 GiB. ") || utf8.RuneCountInString(d) > detailMax ||

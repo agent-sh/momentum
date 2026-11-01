@@ -17,8 +17,9 @@ import (
 // judged, no process using it (one fresh look at the processes, Docker's mounts among them), no write since, for a
 // worktree the same commit, still clean and still a leftover, and for a task's folder no live session in it or of
 // it. An item that holds a mount point is only reported: a deletion would reach into another filesystem, or through
-// a bind mount into another place. Each deletion is recorded at once, so a run stopped midway leaves what it did
-// on record. Offloads start for scratchBudget at most; the rest wait for the next run.
+// a bind mount into another place. Each deletion counts what it frees (countFreed) and is recorded at once, so a run
+// stopped midway leaves what it did on record. Offloads start for scratchBudget at most; the rest wait for the next
+// run.
 func (r *runner) act(ctx context.Context) error {
 	var todo []*Finding
 	for i := range r.res.Rules {
@@ -84,7 +85,6 @@ func (r *runner) act(ctx context.Context) error {
 			f.Action, f.class, f.Why = ActReport, "mount", "it holds a mount point ("+mp+"): a deletion would reach past it"
 			continue
 		}
-		before := r.free(f.Path)
 		var inner []string // the directories a task folder's model data is in, which its deletion changes
 		for _, mf := range f.files {
 			inner = append(inner, filepath.Join(f.canon, filepath.Dir(mf.rel)))
@@ -93,32 +93,14 @@ func (r *runner) act(ctx context.Context) error {
 		var err error
 		switch f.Rule {
 		case RuleWorktrees:
-			err = r.removeWorktree(ctx, f)
+			f.Freed, err = countFreed(r.deletes(f), func() error { return r.removeWorktree(ctx, f) })
 		case RuleModels:
-			err = r.removeModel(f)
+			f.Freed, err = countFreed(r.deletes(f), func() error { return r.removeModel(f) })
 		case RuleScratch:
 			f.ownDirs = dirs
-			err = r.removeScratch(ctx, f, func() error { // the model data's deletion is on record before the offload
-				if mid := r.free(f.Path); before >= 0 && mid >= 0 {
-					f.modelFreed = max(0, mid-before)
-				}
-				at := r.opt.Clock()
-				for _, d := range dirs {
-					r.addOwn(d, at)
-				}
-				if r.opt.DryRun {
-					return nil
-				}
-				return r.recordModelData(ctx, f)
-			})
-			if err != nil && f.removed > 0 { // its model data went; the folder stays, its failure reported
-				f.Detail = fmt.Sprintf("deleted %s of its model data; then: %s", gib(f.removed), f.Detail)
-			}
+			err = r.actScratch(ctx, f, dirs)
 		default:
-			err = r.removeTarget(f)
-		}
-		if after := r.free(f.Path); before >= 0 && after >= 0 {
-			f.Freed = max(0, after-before)
+			f.Freed, err = countFreed(r.deletes(f), func() error { return r.removeTarget(f) })
 		}
 		if errors.Is(err, errLocked) || errors.Is(err, errChanged) {
 			f.Action, f.Why = ActKeep, err.Error()
@@ -155,6 +137,43 @@ func (r *runner) act(ctx context.Context) error {
 	return nil
 }
 
+// actScratch deletes a task folder's model data and offloads the rest, and counts what each freed: the model data's
+// files, and the folder as the offload found it. The model data's deletion is on record before the offload starts.
+func (r *runner) actScratch(ctx context.Context, f *Finding, dirs []ownDir) error {
+	models := modelPaths(f)
+	before := linksOf(models, nil)
+	counted := false
+	countModels := func() {
+		if !counted {
+			f.modelFreed, counted = max(0, before.own-linksOf(models, nil).own), true
+		}
+	}
+	var rest *links
+	err := r.removeScratch(ctx, f, func() error {
+		countModels()
+		at := r.opt.Clock()
+		for _, d := range dirs {
+			r.addOwn(d, at)
+		}
+		if r.opt.DryRun {
+			return nil
+		}
+		return r.recordModelData(ctx, f)
+	}, func() {
+		l := linksOf([]string{f.Path}, nil)
+		rest = &l
+	})
+	countModels()
+	f.Freed = f.modelFreed
+	if rest != nil {
+		f.Freed += max(0, rest.own-linksOf([]string{f.Path}, nil).own)
+	}
+	if err != nil && f.removed > 0 { // its model data went; the folder stays, its failure reported
+		f.Detail = fmt.Sprintf("deleted %s of its model data; then: %s", gib(f.removed), f.Detail)
+	}
+	return err
+}
+
 // recheck judges an item again just before its deletion, and says why it stays, or "".
 func (r *runner) recheck(ctx context.Context, f *Finding) string {
 	if ino, err := inodeOf(f.Path); err != nil || ino != f.ino {
@@ -173,7 +192,7 @@ func (r *runner) recheck(ctx context.Context, f *Finding) string {
 				return "in use now: " + useText(u)
 			}
 		}
-		if t := Measure(f.Path, nil); t.Newest.After(f.Newest) {
+		if t := Measure(f.Path); t.Newest.After(f.Newest) {
 			return "written since it was judged"
 		}
 	case RuleTargets:
@@ -181,7 +200,7 @@ func (r *runner) recheck(ctx context.Context, f *Finding) string {
 			return "built since it was judged"
 		}
 	case RuleScratch:
-		if t := Measure(f.Path, nil); t.Newest.After(f.Newest) {
+		if t := Measure(f.Path); t.Newest.After(f.Newest) {
 			return "written since it was judged"
 		}
 		if why := r.sessionIn(ctx, f.canon, f.makers); why != "" {

@@ -39,14 +39,19 @@ var errNoTool = errors.New("not installed")
 type execTools struct{ uv, docker string }
 
 // UV runs uv with a short wait on its cache lock: a prune that another uv process blocks fails at once instead of
-// waiting its default 5 minutes.
+// waiting its default 5 minutes. Its output is what uv wrote to stderr (its report, such as what a prune removed),
+// then what it wrote to stdout (an answer, such as the cache's place).
 func (t execTools) UV(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
 	return t.UVWith(ctx, timeout, nil, args...)
 }
 
 // UVWith is UV with open files uv inherits, from fd 3 on.
 func (t execTools) UVWith(ctx context.Context, timeout time.Duration, files []*os.File, args ...string) (string, error) {
-	return runToolWith(ctx, timeout, t.uv, "uv", files, append([]string{"UV_LOCK_TIMEOUT=10"}, args...)...)
+	out, report, err := runToolBoth(ctx, timeout, t.uv, "uv", files, append([]string{"UV_LOCK_TIMEOUT=10"}, args...)...)
+	if report != "" && err == nil {
+		out = strings.TrimRight(report, "\n") + "\n" + out
+	}
+	return out, err
 }
 
 func (t execTools) Docker(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
@@ -59,10 +64,16 @@ func runTool(ctx context.Context, timeout time.Duration, path, name string, args
 
 // runToolWith is runTool with open files the tool inherits, from fd 3 on.
 func runToolWith(ctx context.Context, timeout time.Duration, path, name string, files []*os.File, args ...string) (string, error) {
+	out, _, err := runToolBoth(ctx, timeout, path, name, files, args...)
+	return out, err
+}
+
+// runToolBoth is runToolWith that gives what the tool wrote to stderr too.
+func runToolBoth(ctx context.Context, timeout time.Duration, path, name string, files []*os.File, args ...string) (string, string, error) {
 	if path == "" {
 		p, err := exec.LookPath(name)
 		if err != nil {
-			return "", fmt.Errorf("%s: %w", name, errNoTool)
+			return "", "", fmt.Errorf("%s: %w", name, errNoTool)
 		}
 		path = p
 	}
@@ -86,16 +97,17 @@ func runToolWith(ctx context.Context, timeout time.Duration, path, name string, 
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err := cmd.Run()
 	if cctx.Err() != nil {
-		return out.String(), fmt.Errorf("%s %s: %w after %s", name, strings.Join(args[:min(len(args), 2)], " "), errTimeout, timeout)
+		return out.String(), errb.String(), fmt.Errorf("%s %s: %w after %s", name, strings.Join(args[:min(len(args), 2)], " "),
+			errTimeout, timeout)
 	}
 	if err != nil {
 		msg := strings.TrimSpace(errb.String())
 		if len(msg) > 600 { // its head says what failed, its tail where
 			msg = msg[:300] + " ... " + msg[len(msg)-300:]
 		}
-		return out.String(), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args[:min(len(args), 2)], " "), err, msg)
+		return out.String(), errb.String(), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args[:min(len(args), 2)], " "), err, msg)
 	}
-	return out.String(), nil
+	return out.String(), errb.String(), nil
 }
 
 // toolWaitDelay is how long a tool and its children have to end, and its output to close, once its timeout passed:
@@ -306,10 +318,10 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 	}
 	start := time.Now()
 	var removal uvRemoval
-	var restored string
+	var restored, printed string
 	if !forced && around == nil {
 		// uv's own lock decides: a process that started since the look keeps the cache, and the prune waits
-		err = r.uvPrune(ctx, nil)
+		printed, err = r.uvPrune(ctx, nil)
 		if err != nil && uvInUse(err) {
 			return report("a uv process took the cache's lock since the look")
 		}
@@ -419,7 +431,7 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 			return got, n, e
 		}
 		if around == nil {
-			err = r.uvPrune(ctx, held, "--force")
+			printed, err = r.uvPrune(ctx, held, "--force")
 		} else {
 			// what a job names was a place of the walk; an entry that holds a mount point stays, as with every rule
 			stay := func(p string) string {
@@ -432,9 +444,13 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 		}
 		letGo()
 		if around != nil {
-			if err := uvEmptyTrash(c.dir); err != nil {
-				removal.trash = err.Error()
+			// what went is what was moved aside, the files of files-v0 and the links it removed: what it frees counts
+			// as every deletion's does, so a wheel an environment outside the cache still links frees nothing
+			freed, terr := countFreed(uvTrashed(c.dir), func() error { return uvEmptyTrash(c.dir) })
+			if terr != nil {
+				removal.trash = terr.Error()
 			}
+			removal.freed += freed
 			if removal.removed == 0 && len(removal.failures) > 0 {
 				err = errors.New(removal.failures[0])
 			}
@@ -443,7 +459,15 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 	took := time.Since(start).Round(time.Second)
 	after, counted2 := r.uvSize(ctx, dir)
 	if size >= 0 && after >= 0 {
-		f.Freed = max64(0, size-after)
+		f.Out = max64(0, size-after)
+	}
+	switch {
+	case around != nil:
+		f.Freed = removal.freed
+	case err == nil: // uv's own prune: what uv says it freed, as uv's
+		var said bool
+		f.Freed, said = uvReclaimed(printed)
+		f.By, f.Unsaid = "uv", !said
 	}
 	// nothing went only when uv's own count is the same before and after: a walk, or a cache that grew meanwhile,
 	// cannot tell
@@ -466,6 +490,14 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 	f.Done = true
 	if around != nil {
 		f.Detail += "; " + removal.says()
+	}
+	switch {
+	case around != nil:
+		f.Detail += fmt.Sprintf("; it freed %s, as it counts what went: a file still linked from outside it stays", gib(f.Freed))
+	case f.Unsaid:
+		f.Detail += "; uv printed no total of what it freed"
+	default:
+		f.Detail += fmt.Sprintf("; uv says it freed %s", gib(f.Freed))
 	}
 	f.Detail += fmt.Sprintf("; %s to %s in %s", gib(size), gib(after), took)
 	if around != nil && after >= 0 {
@@ -490,16 +522,39 @@ type uvHolder interface {
 	UVWith(ctx context.Context, timeout time.Duration, files []*os.File, args ...string) (string, error)
 }
 
-// uvPrune runs `uv cache prune --ci` with these arguments, handing it held when there is one and the tools can.
-func (r *runner) uvPrune(ctx context.Context, held *os.File, args ...string) error {
+// uvPrune runs `uv cache prune --ci` with these arguments, handing it held when there is one and the tools can, and
+// gives what it printed.
+func (r *runner) uvPrune(ctx context.Context, held *os.File, args ...string) (string, error) {
 	args = append([]string{"cache", "prune", "--ci"}, args...)
 	if h, ok := r.tools.(uvHolder); ok && held != nil {
-		_, err := h.UVWith(ctx, 20*time.Minute, []*os.File{held}, args...)
-		return err
+		return h.UVWith(ctx, 20*time.Minute, []*os.File{held}, args...)
 	}
-	_, err := r.tools.UV(ctx, 20*time.Minute, args...)
-	return err
+	return r.tools.UV(ctx, 20*time.Minute, args...)
 }
+
+// uvRemovedRe is the summary uv's prune prints: "Removed 412 files (48.0KiB)", or "(at least 1.0MiB)" where uv could
+// not measure every entry.
+var uvRemovedRe = regexp.MustCompile(`Removed \d+ (?:files?|director(?:y|ies)) \((?:at least )?(\d+(?:\.\d+)?) ?([KMGTPE]iB|B)\)`)
+
+// uvReclaimed is what uv's prune says it freed, by its report: since 0.12.6 uv counts a file as it removes it, when
+// that removes its last link. A prune that found nothing to remove freed nothing; a report this build cannot read
+// says nothing.
+func uvReclaimed(report string) (int64, bool) {
+	report = ansiRe.ReplaceAllString(report, "")
+	m := uvRemovedRe.FindStringSubmatch(report)
+	if m == nil {
+		return 0, strings.Contains(report, "No unused entries found")
+	}
+	v, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return 0, false
+	}
+	unit := map[string]float64{"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40, "PiB": 1 << 50, "EiB": 1 << 60}
+	return int64(v * unit[m[2]]), true
+}
+
+// ansiRe is a terminal's color sequence, which a tool may print around a figure.
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 // uvCache is the cache's place as uv names it and with its links resolved (real), both canonical, its lock file in
 // both spellings and as uv names it, and how a path is given its canonical name (a bind mount's path is its
@@ -554,7 +609,7 @@ func (r *runner) uvSize(ctx context.Context, dir string) (int64, bool) {
 	if dir == "" {
 		return -1, false
 	}
-	return Measure(dir, nil).Bytes, false
+	return Measure(dir).Bytes, false
 }
 
 // uvCommands are uv's commands, hidden ones and aliases among them, which come after its global options (and their
@@ -1856,13 +1911,13 @@ func (r *runner) docker(ctx context.Context, live bool) ([]Finding, []string, er
 			if err != nil {
 				f.Err = err.Error()
 			} else {
-				f.Done = true
+				f.Done, f.By = true, "Docker" // what Docker says it reclaimed, as Docker's: its store is root's
 				var said bool
 				if f.Freed, said = parseSizeAfter(res, "Total:"); !said {
 					f.Freed, said = parseSizeAfter(res, "Total reclaimed space:")
 				}
 				f.none = said && f.Freed == 0 && removedNothing(res)
-				f.unsaid = !said
+				f.Unsaid = !said
 			}
 		}
 		out = append(out, *f)

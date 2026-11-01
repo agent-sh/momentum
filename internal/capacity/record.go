@@ -19,11 +19,12 @@ import (
 
 // What a run did goes into the store, and into the report through notes (no notification):
 //   - each deletion, offload and prune is an event (kind capacity-delete, capacity-offload, capacity-prune) that says
-//     what went, its size, the space it freed, since when it was idle and the rule;
+//     what went, its size, the space it freed (the files whose last link it removed, or a prune's tool's own
+//     figure, named as the tool's), since when it was idle and the rule;
 //   - together they are the run's one decided note (capacity:run:MS, the run's start), put with each one's event in
-//     one transaction, so a run stopped midway leaves a note of what it did until then: what the run freed, how many
-//     items each rule took, the largest of them, and how to keep one next time; a prune that removed nothing is an
-//     event only, and a run that took nothing writes no note;
+//     one transaction, so a run stopped midway leaves a note of what it did until then: what the run freed on disk,
+//     how many items each rule took, the largest of them, and how to keep one next time; a prune that removed nothing
+//     is an event only, and a run that took nothing writes no note;
 //   - each item only reported is an event (capacity-report), once, and its rule's problem note for that reason
 //     lists them; the note is put again only when an item new to it appears, so a note the owner resolved stays
 //     resolved until the evidence changes, and it is resolved by itself when the rule finds none;
@@ -511,8 +512,15 @@ func (r *runner) event(kind string, f Finding, key string, actor store.Actor) st
 	case kind == KindFailed && f.Rule == RuleScratch:
 		freed = offloadFreed(f) // what its model data's deletion freed is on its own event
 	}
-	if freed > 0 {
+	// what went says what it freed, nothing among it; a failure, what went before it failed
+	if (kind == KindDelete || kind == KindOffload || kind == KindPrune) && !f.Unsaid || freed > 0 {
 		meta["freed"] = freed
+	}
+	if f.By != "" {
+		meta["freed_by"] = f.By // the tool's own figure
+	}
+	if f.Out > 0 {
+		meta["out"] = f.Out
 	}
 	if !f.Idle.IsZero() {
 		meta["idle_since"] = f.Idle.Format(time.RFC3339)
@@ -561,25 +569,28 @@ func summary(kind string, f Finding) string {
 	switch kind {
 	case KindOffload:
 		s := fmt.Sprintf("offloaded task folder %s to restic snapshot %s: %s, freed %s", short(f.Path), f.snapshot,
-			gib(offloadedBytes(f)), gib(offloadFreed(f)))
+			gib(offloadedBytes(f)), noteSize(offloadFreed(f)))
 		if f.removed > 0 {
 			s += fmt.Sprintf(", its model data (%s) deleted before", gib(f.removed))
 		}
 		return s
 	case KindDelete:
 		if f.Rule == RuleScratch {
-			return fmt.Sprintf("deleted the model data of task folder %s: %s, freed %s", short(f.Path), gib(f.removed), gib(f.Freed))
+			return fmt.Sprintf("deleted the model data of task folder %s: %s, freed %s", short(f.Path), gib(f.removed), noteSize(f.Freed))
 		}
-		fallthrough
+		return fmt.Sprintf("%s %s: %s, freed %s", ruleText[f.Rule], short(f.Path), gib(f.Bytes), noteSize(f.Freed))
 	case KindPrune:
-		size, freed := gib(f.Bytes), gib(f.Freed)
+		s := fmt.Sprintf("%s %s: %s", ruleText[f.Rule], short(f.Path), gib(f.Bytes))
 		if f.unsized {
-			size = "size unknown"
+			s = fmt.Sprintf("%s %s: size unknown", ruleText[f.Rule], short(f.Path))
 		}
-		if f.unsaid {
-			freed = "an amount the tool did not print"
+		if f.Out > 0 {
+			s += ", " + gib(f.Out) + " out of it"
 		}
-		return fmt.Sprintf("%s %s: %s, freed %s", ruleText[f.Rule], short(f.Path), size, freed)
+		if f.Unsaid {
+			return s + ", freed an amount " + pruneTool[f.Rule] + " did not print"
+		}
+		return s + ", freed " + noteSize(f.Freed) + byCount(f.By)
 	case KindFailed:
 		if f.Rule == RuleScratch && f.modelOnly {
 			return fmt.Sprintf("could not delete the model data of task folder %s: %s", short(f.Path), f.Err)
@@ -595,20 +606,24 @@ func summary(kind string, f Finding) string {
 // runItem is what one deletion, offload or prune of a run took, for the run's note.
 type runItem struct {
 	rule, path string
-	size       int64 // what went: the item, what of a task folder went to restic, its model data, what a prune freed
-	freed      int64 // the space it freed on its disk
-	offload    bool  // a task folder offloaded to restic
-	model      bool  // a task folder's model data
-	unsaid     bool  // a prune whose tool did not print what it freed
+	size       int64  // what went: the item, what of a task folder went to restic, its model data, what left a cache
+	freed      int64  // the space it freed on its disk: the files whose last link it removed, or a tool's own figure
+	by         string // the tool whose figure freed is, or "" for capacity's own count
+	offload    bool   // a task folder offloaded to restic
+	model      bool   // a task folder's model data
+	unsaid     bool   // a prune whose tool did not print what it freed
 }
 
 // itemOf is what a finding's act took, as the run's note counts it: an item's size, what of a task folder went to
-// restic, a task folder's model data, or what a prune freed.
+// restic, a task folder's model data, or what went out of a pruned cache (else what the prune's tool says it freed).
 func itemOf(f Finding) runItem {
-	it := runItem{rule: f.Rule, path: f.Path, size: f.Bytes, freed: f.Freed, unsaid: f.unsaid}
+	it := runItem{rule: f.Rule, path: f.Path, size: f.Bytes, freed: f.Freed, by: f.By, unsaid: f.Unsaid}
 	switch {
 	case f.Rule == RuleUV || f.Rule == RuleDocker:
-		it.size = f.Freed // a prune's size is the whole cache's; what went is what it freed
+		it.size = f.Out // a prune's size is the whole cache's
+		if it.size == 0 {
+			it.size = f.Freed
+		}
 	case f.Rule == RuleScratch && f.offloaded:
 		it.offload, it.size, it.freed = true, offloadedBytes(f), offloadFreed(f)
 	case f.Rule == RuleScratch:
@@ -623,23 +638,40 @@ func runNote(start, at time.Time, items []runItem) store.Note {
 		Title: runTitle(items), Detail: runDetail(items), Source: store.Capacity, Importance: store.ImportanceNormal, At: at}
 }
 
-// runTitle is a run's effect in one line: what it freed, how many items each rule took, the task folders it offloaded
-// with what went to restic and those whose model data alone went, and what it pruned ("Freed 12.4 GiB: 5 Rust build
-// outputs, 2 leftover worktrees; pruned Docker"). A title too long for a line names the prunes by their tools, then
-// names the items shorter, then counts the prunes, then ends at the last whole clause that fits, with "and more".
+// runTitle is a run's effect in one line: what it freed on disk, how many items each rule took, the task folders it
+// offloaded with what went to restic and those whose model data alone went, and what it pruned ("Freed 12.4 GiB: 5
+// Rust build outputs, 2 leftover worktrees; pruned Docker (1.2 GiB by Docker's count)"). What a prune done by a tool
+// freed is the tool's own figure, named as the tool's and not in what the run freed. A title too long for a line
+// names the prunes by their tools, then names the items shorter, then counts the prunes, then ends at the last whole
+// clause that fits, with "and more".
 func runTitle(items []runItem) string {
 	var freed, restic int64
-	unsaid, prunes := "", 0
+	counted, prunes := false, 0
 	count, pruned := map[string]int{}, map[string]bool{}
 	offloaded, modelOnly := map[string]bool{}, map[string]bool{}
+	type figure struct {
+		n            int64
+		said, unsaid bool
+	}
+	figures := map[string]*figure{} // per rule whose prune a tool did, the tool's own figure
 	for _, it := range items {
-		freed += it.freed
+		if it.by == "" && !it.unsaid {
+			freed, counted = freed+it.freed, true
+		} else {
+			g := figures[it.rule]
+			if g == nil {
+				g = &figure{}
+				figures[it.rule] = g
+			}
+			if it.unsaid {
+				g.unsaid = true
+			} else {
+				g.n, g.said = g.n+it.freed, true
+			}
+		}
 		switch {
 		case it.rule == RuleUV || it.rule == RuleDocker:
 			pruned[it.rule], prunes = true, prunes+1
-			if it.unsaid {
-				unsaid = pruneTool[it.rule]
-			}
 		case it.offload:
 			offloaded[it.path], restic = true, restic+it.size
 		case it.model:
@@ -666,27 +698,37 @@ func runTitle(items []runItem) string {
 		}
 		return out
 	}
-	head := "Freed " + noteSize(freed)
-	switch {
-	case unsaid != "" && freed < 1<<20:
-		head = "Freed an amount " + unsaid + " did not print"
-	case unsaid != "":
-		head = "Freed at least " + gib(freed)
+	head := "" // a run whose only act is a tool's prune has no count of its own
+	if counted {
+		head = "Freed " + noteSize(freed)
 	}
 	compose := func(cs []string, p string) string {
 		list := strings.Join(cs, ", ")
 		if list != "" && p != "" {
 			list += "; "
 		}
+		if head == "" {
+			return upper(list + p)
+		}
 		return head + ": " + list + p
 	}
 	fits := func(s string) bool { return utf8.RuneCountInString(s) <= store.TitleMax }
 	var long, brief []string
-	if pruned[RuleUV] {
-		long, brief = append(long, "the uv cache"), append(brief, pruneTool[RuleUV])
-	}
-	if pruned[RuleDocker] {
-		long, brief = append(long, pruneTool[RuleDocker]), append(brief, pruneTool[RuleDocker])
+	for _, rule := range []string{RuleUV, RuleDocker} {
+		if !pruned[rule] {
+			continue
+		}
+		name := map[string]string{RuleUV: "the uv cache", RuleDocker: pruneTool[RuleDocker]}[rule]
+		switch g := figures[rule]; {
+		case g == nil: // capacity's own count, in what the run freed
+		case g.said && g.unsaid:
+			name += fmt.Sprintf(" (at least %s by %s's count)", noteSize(g.n), pruneTool[rule])
+		case g.said:
+			name += fmt.Sprintf(" (%s by %s's count)", noteSize(g.n), pruneTool[rule])
+		default:
+			name += fmt.Sprintf(" (%s printed no total)", pruneTool[rule])
+		}
+		long, brief = append(long, name), append(brief, pruneTool[rule])
 	}
 	type form struct {
 		names  map[string]string
@@ -729,15 +771,16 @@ func noteSize(n int64) string {
 // detailMax is the longest detail a run's note has: the most the phone's view keeps of a detail.
 const detailMax = 400
 
-// runDetail is what a run took in plain sentences: its largest three items with their sizes; where each offloaded
-// folder's pointer is, and that model data is not offloaded; how to keep an item next time, in one sentence; and last,
-// what is not known of a prune and how a removed worktree and what the prunes took come back. A detail longer than
-// detailMax leaves out those last sentences, then names two items, then says how to keep one in fewer words with three
-// items again, then two, then leaves out the model data's sentence, then names one item, then leaves out the pointer's,
-// and last clips its item: how to keep one stays.
+// runDetail is what a run took in plain sentences: its largest three items with their sizes, and what each freed where
+// that is another size; where each offloaded folder's pointer is, and that model data is not offloaded; how to keep an
+// item next time, in one sentence; and last, that what is still hardlinked elsewhere stays on disk, what is not known
+// of a prune, and how a removed worktree and what the prunes took come back. A detail longer than detailMax leaves out
+// those last sentences, then names two items, then says how to keep one in fewer words with three items again, then
+// two, then leaves out the model data's sentence, then names one item, then leaves out the pointer's, and last clips
+// its item: how to keep one stays.
 func runDetail(items []runItem) string {
 	var sized, offloads []runItem
-	took, model, unsaid := map[string]bool{}, false, ""
+	took, model, unsaid, linked := map[string]bool{}, false, "", false
 	for _, it := range items {
 		took[it.rule], model = true, model || it.model
 		switch {
@@ -747,6 +790,7 @@ func runDetail(items []runItem) string {
 		case it.offload:
 			offloads = append(offloads, it)
 		}
+		linked = linked || it.freed < it.size && noteSize(it.freed) != noteSize(it.size)
 		sized = append(sized, it)
 	}
 	sort.SliceStable(sized, func(i, j int) bool { return sized[i].size > sized[j].size })
@@ -775,6 +819,9 @@ func runDetail(items []runItem) string {
 		keepBrief = "To keep one next time: " + strings.Join(brief, ", ") + "."
 	}
 	var extra []string // what a detail short of room leaves out first
+	if linked {
+		extra = append(extra, linkedElsewhere)
+	}
 	if unsaid != "" {
 		extra = append(extra, unsaid+" did not print what its prune freed.")
 	}
@@ -784,9 +831,9 @@ func runDetail(items []runItem) string {
 		}
 	}
 	f := struct {
-		n                            int
-		extra, brief, model, pointer bool
-	}{n: 3, extra: true, model: model, pointer: pointer != ""}
+		n, extra              int
+		brief, model, pointer bool
+	}{n: 3, extra: len(extra), model: model, pointer: pointer != ""}
 	parts := func() (string, []string) {
 		var named []string
 		for _, it := range sized[:min(f.n, len(sized))] {
@@ -814,10 +861,7 @@ func runDetail(items []runItem) string {
 		if k != "" {
 			rest = append(rest, k)
 		}
-		if f.extra {
-			rest = append(rest, extra...)
-		}
-		return lead, rest
+		return lead, append(rest, extra[:f.extra]...)
 	}
 	join := func(lead string, rest []string) string {
 		if lead == "" {
@@ -825,10 +869,12 @@ func runDetail(items []runItem) string {
 		}
 		return strings.Join(append([]string{lead}, rest...), " ")
 	}
-	steps := []func(){
-		func() { f.extra = false }, func() { f.n = 2 }, func() { f.brief, f.n = true, 3 }, func() { f.n = 2 },
-		func() { f.model = false }, func() { f.n = 1 }, func() { f.pointer = false },
+	var steps []func()
+	for range extra { // the last sentence first: why less was freed than went is the last to go
+		steps = append(steps, func() { f.extra-- })
 	}
+	steps = append(steps, func() { f.n = 2 }, func() { f.brief, f.n = true, 3 }, func() { f.n = 2 },
+		func() { f.model = false }, func() { f.n = 1 }, func() { f.pointer = false })
 	for _, step := range append(steps, nil) {
 		lead, rest := parts()
 		if d := join(lead, rest); utf8.RuneCountInString(d) <= detailMax || step == nil {
@@ -842,18 +888,31 @@ func runDetail(items []runItem) string {
 	return ""
 }
 
-// itemText names what an item took, with its size.
+// itemText names what an item took, with its size, and what it freed on disk where that is another size: a file
+// still linked elsewhere frees nothing. A tool's own figure is named as the tool's.
 func itemText(it runItem) string {
+	s := short(it.path) + " " + noteSize(it.size)
 	switch {
 	case it.rule == RuleUV || it.rule == RuleDocker:
-		return "pruned " + short(it.path) + " " + noteSize(it.size)
+		s = "pruned " + s
 	case it.offload:
-		return short(it.path) + " " + noteSize(it.size) + " to restic"
+		s += " to restic"
 	case it.model:
-		return "model data in " + short(it.path) + " " + noteSize(it.size)
+		s = "model data in " + s
 	}
-	return short(it.path) + " " + noteSize(it.size)
+	switch freed := noteSize(it.freed); {
+	case it.by != "" && freed == noteSize(it.size):
+		s += " (" + it.by + "'s count)"
+	case it.by != "":
+		s += " (" + freed + " freed by " + it.by + "'s count)"
+	case freed != noteSize(it.size):
+		s += " (" + freed + " freed)"
+	}
+	return s
 }
+
+// linkedElsewhere says, in a run that freed less than what went, why.
+const linkedElsewhere = "Files still hardlinked elsewhere stay on disk."
 
 // groupTitles say what a rule's report-only items of one reason are.
 var groupTitles = map[string]string{

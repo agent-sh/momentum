@@ -241,16 +241,17 @@ func TestAPruneThatCanFreeNothingDoesNotRunAndOneThatRemovedNothingIsNoNote(t *t
 		name, du, said string
 		runs           bool
 		notes          int
-		title          string // what the run's note's title says it freed
+		title          string // the run's note's title: what Docker says it freed, as Docker's
 	}{
 		{"only shared and recent records", `{"ID":"s","LastUsedAt":"12 days ago","Reclaimable":true,"Shared":true,"Size":"30GB","Type":"regular"}
 {"ID":"r","LastUsedAt":"About an hour ago","Reclaimable":true,"Shared":false,"Size":"20GB","Type":"regular"}`, "", false, 0, ""},
 		{"Docker removes nothing", duRecords, "Total:\t0B\n", true, 0, ""},
-		{"Docker removes empty records", duRecords, removed, true, 1, "Freed 0 MiB"},
-		{"Docker prints no total", duRecords, "", true, 1, "did not print"},
+		{"Docker removes empty records", duRecords, removed, true, 1, "Pruned Docker (0 MiB by Docker's count)"},
+		{"Docker prints no total", duRecords, "", true, 1, "Pruned Docker (Docker printed no total)"},
 		// a size that cannot be read is no reason to stop Docker's own prune
-		{"du fails", "ERR", "Total:\t1GB\n", true, 1, "Freed 954 MiB"},
-		{"du prints nothing this build reads", "ID  RECLAIMABLE  SIZE\nx  true  1GB\n", "Total:\t1GB\n", true, 1, "Freed 954 MiB"},
+		{"du fails", "ERR", "Total:\t1GB\n", true, 1, "Pruned Docker (954 MiB by Docker's count)"},
+		{"du prints nothing this build reads", "ID  RECLAIMABLE  SIZE\nx  true  1GB\n", "Total:\t1GB\n", true, 1,
+			"Pruned Docker (954 MiB by Docker's count)"},
 		// the line it cannot read may be the child that holds the old base
 		{"du prints a line this build cannot read", `{"ID":"base","LastUsedAt":"30 days ago","Reclaimable":true,"Shared":false,"Size":"1GB","Type":"regular"}
 {"ID":"child","Parents":["base"],"LastUsedAt":2}`, "Total:\t0B\n", true, 0, ""},
@@ -291,7 +292,7 @@ func TestAPruneThatCanFreeNothingDoesNotRunAndOneThatRemovedNothingIsNoNote(t *t
 		for _, x := range ns {
 			if x.Kind == store.NoteDecided {
 				n++
-				if !strings.Contains(x.Title, c.title) || !strings.HasSuffix(x.Title, ": pruned Docker") {
+				if x.Title != c.title {
 					t.Errorf("%s: title %q, want %q", c.name, x.Title, c.title)
 				}
 			}

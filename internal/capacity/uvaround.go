@@ -708,11 +708,13 @@ const uvTrash = ".capacity-trash"
 
 // uvRemoval is what a prune around running environments did: the entries it moved aside, the files of files-v0 it
 // removed, the entries that could not go (each with why), those that stay since they hold a mount point, those it
-// left when its time ran out, and why what it moved aside could not all be deleted.
+// left when its time ran out, why what it moved aside could not all be deleted, and what it freed: each file whose
+// last link it removed.
 type uvRemoval struct {
 	removed, files, left int
 	failures, stayed     []string
 	trash                string
+	freed                int64
 }
 
 // uvRemove moves aside, under the cache's lock, every entry of environments-v2 and archive-v0 that k does not keep: a
@@ -834,8 +836,11 @@ func (u *uvRemoval) removeLinks(rt *os.Root, c uvCache, k *uvReach, shard string
 			left++
 			continue
 		}
-		switch err := rt.Remove(rel); {
-		case err == nil, errors.Is(err, fs.ErrNotExist):
+		switch n, err := removeCounted(rt, rel); {
+		case err == nil:
+			u.removed++
+			u.freed += n // a link with a long target holds a block
+		case errors.Is(err, fs.ErrNotExist):
 			u.removed++
 		default:
 			left++
@@ -843,8 +848,25 @@ func (u *uvRemoval) removeLinks(rt *os.Root, c uvCache, k *uvReach, shard string
 		}
 	}
 	if left == 0 {
-		rt.Remove(shard) // empty, or a link came since: then it stays
+		if n, err := removeCounted(rt, shard); err == nil { // empty, or a link came since: then it stays
+			u.freed += n
+		}
 	}
+}
+
+// removeCounted removes one entry through the cache's root and says what that freed: its blocks, when it was a
+// directory or its file's last link.
+func removeCounted(rt *os.Root, rel string) (int64, error) {
+	var n int64
+	if fi, err := rt.Lstat(rel); err == nil {
+		if s, ok := fi.Sys().(*syscall.Stat_t); ok && (fi.IsDir() || s.Nlink <= 1) {
+			n = s.Blocks * 512
+		}
+	}
+	if err := rt.Remove(rel); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // uvFiles removes the files of files-v0 that nothing links any more, and then its directories left empty. uv 0.13's
@@ -867,14 +889,32 @@ func uvFiles(rt *os.Root, dir string, until time.Time, stopped func() bool, out 
 			if info, err := d.Info(); err == nil {
 				if s, ok := info.Sys().(*syscall.Stat_t); ok && s.Nlink == 1 && rt.Remove(rel) == nil {
 					out.files++
+					out.freed += s.Blocks * 512 // its last link
 				}
 			}
 		}
 		return nil
 	})
 	for i := len(dirs) - 1; i >= 0; i-- {
-		rt.Remove(dirs[i]) // children first; one that is not empty stays
+		if n, err := removeCounted(rt, dirs[i]); err == nil { // children first; one that is not empty stays
+			out.freed += n
+		}
 	}
+}
+
+// uvTrashed are the entries prunes around running environments moved aside, each where its move put it
+// (.capacity-trash/STAMP/BUCKET/NAME): what deleting the trash deletes, but the directories the moves made.
+func uvTrashed(dir string) []string {
+	var out []string
+	for _, stamp := range listDirs(filepath.Join(dir, uvTrash)) {
+		for _, bucket := range listDirs(stamp) {
+			ents, _ := os.ReadDir(bucket)
+			for _, e := range ents {
+				out = append(out, filepath.Join(bucket, e.Name()))
+			}
+		}
+	}
+	return out
 }
 
 // uvEmptyTrash deletes what prunes around running environments moved aside, through an os.Root of the cache: once it

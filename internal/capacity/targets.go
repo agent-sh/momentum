@@ -26,20 +26,22 @@ func (r *runner) targets(ctx context.Context, paths []string) ([]Finding, error)
 		if newerThan(t, cutoff) { // a build in the idle time: the cheap look at its directories says so
 			continue
 		}
-		tree := Measure(t, nil)
+		tree := Measure(t)
 		if tree.Newest.After(cutoff) || tree.Bytes < int64(r.cfg.MinMiB*(1<<20)) {
 			continue
 		}
 		canon := r.m.Canon(t)
 		f := Finding{Rule: RuleTargets, Path: t, canon: canon, Bytes: tree.Bytes, Newest: tree.Newest, Idle: tree.Newest,
-			Eligible: tree.Newest.Add(idle), root: filepath.Dir(t)}
+			Eligible: tree.Newest.Add(idle), root: filepath.Dir(t), links: tree.links}
 		f.ino, _ = inodeOf(t)
 		if own, foreign := cargoEntries(t); len(foreign) > 0 {
 			// Cargo builds its own entries again, not the others (Criterion's saved baselines, a build script's
 			// downloads): those stay
-			f.parts, f.Bytes = own, 0
+			f.parts, f.Bytes, f.links = own, 0, links{}
 			for _, e := range own {
-				f.Bytes += Measure(filepath.Join(t, e), nil).Bytes
+				part := Measure(filepath.Join(t, e))
+				f.Bytes += part.Bytes
+				f.links.merge(part.links)
 			}
 			f.Detail = "keeps what Cargo does not build: " + strings.Join(foreign[:min(len(foreign), 4)], ", ")
 		}

@@ -150,8 +150,8 @@ func (r *runner) models(ctx context.Context) ([]Finding, error) {
 				continue
 			}
 			shown := filepath.Join(x.shown, e.Name())
-			t := Measure(shown, nil)
-			f := Finding{Rule: RuleModels, Path: shown, canon: canon, Bytes: t.Bytes, Newest: t.Newest, root: x.shown}
+			t := Measure(shown)
+			f := Finding{Rule: RuleModels, Path: shown, canon: canon, Bytes: t.Bytes, Newest: t.Newest, root: x.shown, links: t.links}
 			f.ino, _ = inodeOf(shown)
 			if (r.stores[x.canon] || r.unknownStores[x.canon]) && isRepoDir(e.Name()) {
 				ls := storeLinks(shown, x)
@@ -166,7 +166,8 @@ func (r *runner) models(ctx context.Context) ([]Finding, error) {
 			logical := f.Bytes // with the blobs it shares: an item that only shares still keeps them from going
 			for _, b := range links[f.canon] {
 				f.linked = append(f.linked, b)
-				st, err := os.Lstat(r.shownBlob(x, b))
+				shown := r.shownBlob(x, b)
+				st, err := os.Lstat(shown)
 				if err != nil {
 					continue
 				}
@@ -178,6 +179,12 @@ func (r *runner) models(ctx context.Context) ([]Finding, error) {
 					if len(users[b]) == 1 {
 						f.blobs = append(f.blobs, b)
 						f.Bytes += s.Blocks * 512
+						f.links.merge(linksOf([]string{shown, shown + ".refs"}, nil))
+					} else {
+						if f.shares == nil {
+							f.shares = map[string]int{}
+						}
+						f.shares[b] = len(users[b])
 					}
 				}
 			}
