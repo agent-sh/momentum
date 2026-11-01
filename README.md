@@ -151,6 +151,33 @@ momentum case reopen ID --evidence REF... [--at WHEN] --why W
 
 A case is one answer in progress to a standing question: its family, its evidence, the suspected mechanism and the alternatives, the next test that tells them apart, the expected benefit, what it cost so far, and its status (open, investigating, testing, deployed, measuring, closed with a reason). A symptom's signature opens a case, and the same signature finds it again; the root cause's signature merges the cases it explains. A closed case comes back on new evidence only: a recurrence after it was solved, its old rate after it improved, or as much again as it was dismissed on. Only the ship tool deploys a case and only the measure tool closes one as improved. A case unseen for 30 days closes by itself.
 
+## Loop
+
+```
+momentum loop [--dry] [--family F,F] [--case ID] [--json]
+momentum loop runs [--since WHEN] [--case ID] [--json]
+momentum ship prepare|check|propose|status|land|rollback ...
+```
+
+The improvement loop takes each family's case one step a run: investigate it, build its change, or publish its lesson. A step is one run of the harness's own agent (Claude Code in print mode, `--bare`, Opus 5.5 with Sonnet 5.5 as fallback), with the loop's procedure and the family's skill in its system prompt, the harness's permissions in dontAsk mode (it reads, runs momentum's own tools, and writes only in its run's directory and its case's work tree), and a budget per run, per case, per day and per week. A case whose runs fail the same way twice stops, and the loop opens a case about itself.
+
+A change goes in only through `momentum ship`: a work tree of the loop's own, a test that fails without the change and passes with it in a bubblewrap sandbox, a measurement plan whose signal counts the case's own problem, a rollback, a pull request committed as the user, a clean-context review posted on it, and a fast-forward of the default branch, only when the loop is live. Its authority is configuration the loop never writes:
+
+```json
+{"loop": {
+  "runner": ["~/.local/bin/claude-bedrock"],
+  "live": false,
+  "owners": ["your-github-user"],
+  "exclude": ["your-github-user/do-not-touch"],
+  "repo_guard": ["~/.local/bin/scope-check"],
+  "rules": ["~/.config/agents/SHARED.md"],
+  "constraints": ["never wake me"],
+  "capacity_gate": ["~/.local/bin/waitfor", "--capacity", "20,8", "--timeout", "10m"]
+}}
+```
+
+Run it from a oneshot user unit on a timer of its own, after the ingest.
+
 Knowledge stays in [tacit](https://github.com/agent-sh/tacit). Cases, evidence and state stay on the machine, never in this repository.
 
 MIT licensed.

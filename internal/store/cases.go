@@ -1142,3 +1142,72 @@ func (s *Store) SweepCases(ctx context.Context, now time.Time, retention time.Du
 	}
 	return out, tx.Commit()
 }
+
+// DeployCase is the ship tool's: a case in testing goes to deployed, with its change package and the time its
+// change went in, from which its measurement counts. Nothing else deploys a case.
+func (s *Store) DeployCase(ctx context.Context, id, pkg string, at time.Time, what, actor string) (Case, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Case{}, err
+	}
+	defer tx.Rollback()
+	c, err := getCase(ctx, tx, id)
+	if err != nil {
+		return Case{}, err
+	}
+	if c.Status != CaseTesting {
+		return Case{}, badCase("case %s is %s: only a case in testing deploys", c.ID, c.Status)
+	}
+	if pkg == "" || at.IsZero() {
+		return Case{}, badCase("a deployed case names its package and when its change went in")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, package = ?, deployed = ?, updated = ? WHERE id = ?`,
+		CaseDeployed, pkg, at.UnixMilli(), time.Now().UnixMilli(), c.ID); err != nil {
+		return Case{}, err
+	}
+	if err := caseLog(ctx, tx, c.ID, actor, "deployed", what, time.Now()); err != nil {
+		return Case{}, err
+	}
+	if c, err = getCase(ctx, tx, c.ID); err != nil {
+		return Case{}, err
+	}
+	return c, tx.Commit()
+}
+
+// RollBackCase is the ship tool's: a deployed or measuring case whose change was undone goes back to testing,
+// with no measurement, since its change is gone.
+func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Case{}, err
+	}
+	defer tx.Rollback()
+	c, err := getCase(ctx, tx, id)
+	if err != nil {
+		return Case{}, err
+	}
+	if c.Status != CaseDeployed && c.Status != CaseMeasuring {
+		return Case{}, badCase("case %s is %s: only a deployed or measuring case rolls back", c.ID, c.Status)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, deployed = 0, window_ms = 0, before_n = 0, after_n = 0,
+	  effect = '', updated = ? WHERE id = ?`, CaseTesting, time.Now().UnixMilli(), c.ID); err != nil {
+		return Case{}, err
+	}
+	if err := caseLog(ctx, tx, c.ID, actor, "rolled back", why, time.Now()); err != nil {
+		return Case{}, err
+	}
+	if c, err = getCase(ctx, tx, c.ID); err != nil {
+		return Case{}, err
+	}
+	return c, tx.Commit()
+}
+
+// CaseNote logs a line on a case for a tool that changes nothing of its own: the ship tool's steps before it
+// deploys (prepared, checked, proposed, reviewed), the runner's runs.
+func (s *Store) CaseNote(ctx context.Context, id, action, detail, actor string) error {
+	c, err := live(ctx, s.db, id)
+	if err != nil {
+		return err
+	}
+	return caseLog(ctx, s.db, c.ID, actor, action, detail, time.Now())
+}
