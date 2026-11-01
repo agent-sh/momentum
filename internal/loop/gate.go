@@ -256,8 +256,11 @@ func GitSafety() []string {
 		"-c", "core.attributesFile=/dev/null", "-c", "gpg.program=false", "-c", "gpg.openpgp.program=false",
 		"-c", "gpg.x509.program=false", "-c", "gpg.ssh.program=false", "-c", "log.showSignature=false",
 		"-c", "push.gpgSign=false",
-		// a submodule is another repository, with settings of its own: no git call of momentum's goes into one
-		"-c", "submodule.recurse=false", "-c", "fetch.recurseSubmodules=false", "-c", "push.recurseSubmodules=no"}
+		// a submodule is another repository, with settings of its own: no git call of momentum's fetches, pushes or
+		// updates one (a status still reads its work tree)
+		"-c", "submodule.recurse=false", "-c", "fetch.recurseSubmodules=false", "-c", "push.recurseSubmodules=no",
+		// no maintenance runs on the side of a call: it runs what the repository's maintenance settings name
+		"-c", "gc.auto=0", "-c", "maintenance.auto=false"}
 }
 
 // GitEnv removes caller Git settings and disables system and global settings and tree attributes.

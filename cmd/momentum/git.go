@@ -202,15 +202,7 @@ func gitArgs(ctx context.Context, dir, sub string, spec gitSpec, rest []string) 
 }
 
 // credentialExcludes keeps implicit history and wildcard path queries from reading credential files too.
-func credentialExcludes() []string {
-	names := []string{".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*", "*credential*", "*secret*", "*token*", "*.kdbx", "*.keystore", "auth.json"}
-	names = append(names, secretDirs...)
-	var out []string
-	for _, name := range names {
-		out = append(out, ":(top,exclude,icase,glob)**/"+name, ":(top,exclude,icase,glob)**/"+name+"/**")
-	}
-	return out
-}
+func credentialExcludes() []string { return loop.CredentialPathspecs() }
 
 // gitValue checks an option's value: a revision for the options that take one, and a value that is no option.
 func gitValue(ctx context.Context, dir string, spec gitSpec, name, val string) error {

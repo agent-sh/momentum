@@ -1013,13 +1013,15 @@ func CheckGitConfig(ctx context.Context, dir string) error {
 		}
 		blocked := false
 		switch key {
-		case "core.sshcommand", "core.askpass", "core.gitproxy", "core.alternaterefscommand", "core.pager", "core.editor", "sequence.editor", "interactive.difffilter":
+		case "core.sshcommand", "core.askpass", "core.gitproxy", "core.alternaterefscommand", "core.pager", "core.editor", "sequence.editor",
+			"interactive.difffilter", "gc.recentobjectshook":
 			blocked = true
 		}
-		for _, prefix := range []string{"credential.", "url.", "include.", "includeif.", "filter.", "gpg.", "uploadpack.", "pager."} {
+		for _, prefix := range []string{"credential.", "url.", "include.", "includeif.", "filter.", "gpg.", "uploadpack.", "pager.", "hook.", "trailer."} {
 			blocked = blocked || strings.HasPrefix(key, prefix)
 		}
-		for _, pair := range [][2]string{{"merge.", ".driver"}, {"diff.", ".textconv"}, {"diff.", ".command"}, {"remote.", ".receivepack"}, {"remote.", ".uploadpack"}, {"remote.", ".vcs"}} {
+		for _, pair := range [][2]string{{"merge.", ".driver"}, {"diff.", ".textconv"}, {"diff.", ".command"}, {"remote.", ".receivepack"},
+			{"remote.", ".uploadpack"}, {"remote.", ".vcs"}, {"submodule.", ".update"}} {
 			blocked = blocked || strings.HasPrefix(key, pair[0]) && strings.HasSuffix(key, pair[1])
 		}
 		if blocked {

@@ -70,3 +70,23 @@ func Public(ctx context.Context, text string) (string, error) {
 	}
 	return Neutral(r), nil
 }
+
+// CredentialDirs are the directories that hold credentials, under a home or anywhere in a tree.
+var CredentialDirs = []string{".ssh", ".gnupg", ".aws", ".azure", ".config/gcloud", ".config/gh", ".config/glab-cli", ".config/github-copilot",
+	".local/share/keyrings", ".password-store", ".claude/.credentials.json", ".claude.json", ".netrc", ".git-credentials", ".docker",
+	".config/claude-code", ".config/rclone", ".npmrc", ".cargo/credentials", ".cargo/credentials.toml", ".codex/auth.json", ".kube",
+	".mozilla", ".config/google-chrome", ".config/chromium", ".config/BraveSoftware", ".pki", ".local/share/momentum"}
+
+// credentialNames are the names of files that hold a secret.
+var credentialNames = []string{".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*",
+	"*credential*", "*secret*", "*token*", "*.kdbx", "*.keystore", "auth.json"}
+
+// CredentialPathspecs are git pathspecs that leave the credential files and directories out of a diff, a history
+// or a search, wherever they are in the tree.
+func CredentialPathspecs() []string {
+	var out []string
+	for _, name := range append(append([]string{}, credentialNames...), CredentialDirs...) {
+		out = append(out, ":(top,exclude,icase,glob)**/"+name, ":(top,exclude,icase,glob)**/"+name+"/**")
+	}
+	return out
+}

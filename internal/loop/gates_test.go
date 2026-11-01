@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -449,7 +450,7 @@ func TestARunChargesItsCaseOnce(t *testing.T) {
 // Repository configuration names no program, including mixed-case keys and inactive includes. A refusal
 // precedes the scope checker as well as direct Git; neither gets to execute the configured program.
 func TestRepositoryProgramSettingsAreRefused(t *testing.T) {
-	keys := []string{"core.fsMonitor", "core.sshCommand", "core.askPass", "core.gitProxy", "core.alternateRefsCommand", "core.pager", "core.editor", "sequence.editor", "interactive.diffFilter", "credential.helper", "credential.https://github.com.helper", "url.fixture.insteadOf", "include.path", "includeIf.onbranch:never.path", "filter.fixture.required", "merge.fixture.driver", "diff.fixture.textconv", "diff.fixture.command", "gpg.program", "remote.origin.receivePack", "remote.origin.uploadPack", "remote.origin.vcs", "uploadpack.packObjectsHook", "pager.log"}
+	keys := []string{"core.fsMonitor", "core.sshCommand", "core.askPass", "core.gitProxy", "core.alternateRefsCommand", "core.pager", "core.editor", "sequence.editor", "interactive.diffFilter", "credential.helper", "credential.https://github.com.helper", "url.fixture.insteadOf", "include.path", "includeIf.onbranch:never.path", "filter.fixture.required", "merge.fixture.driver", "diff.fixture.textconv", "diff.fixture.command", "gpg.program", "remote.origin.receivePack", "remote.origin.uploadPack", "remote.origin.vcs", "uploadpack.packObjectsHook", "pager.log", "gc.recentObjectsHook", "hook.fixture.command", "trailer.fixture.command", "submodule.child.update"}
 	for _, key := range keys {
 		t.Run(key, func(t *testing.T) {
 			ctx := context.Background()
@@ -551,16 +552,19 @@ git status --porcelain`)
 	}
 }
 
-// No git call of momentum's goes into a submodule, another repository with settings of its own, whatever the
-// repository's settings ask.
-func TestNoGitCallGoesIntoASubmodule(t *testing.T) {
+// No git call of momentum's fetches, pushes or updates a submodule, another repository with settings of its own,
+// and none runs maintenance on its side, whatever the repository's settings ask.
+func TestNoGitCallRecursesOrRunsMaintenance(t *testing.T) {
 	f := newRepo(t, nil)
 	st := testStore(t)
 	s := shipFor(t, st, f)
 	run(t, f.main, "git", "config", "submodule.recurse", "true")
 	run(t, f.main, "git", "config", "fetch.recurseSubmodules", "on-demand")
 	run(t, f.main, "git", "config", "push.recurseSubmodules", "on-demand")
-	for key, want := range map[string]string{"submodule.recurse": "false", "fetch.recurseSubmodules": "false", "push.recurseSubmodules": "no"} {
+	run(t, f.main, "git", "config", "gc.auto", "1")
+	run(t, f.main, "git", "config", "maintenance.auto", "true")
+	for key, want := range map[string]string{"submodule.recurse": "false", "fetch.recurseSubmodules": "false", "push.recurseSubmodules": "no",
+		"gc.auto": "0", "maintenance.auto": "false"} {
 		got, err := s.git(context.Background(), f.main, "config", "--get", key)
 		if err != nil || strings.TrimSpace(got) != want {
 			t.Errorf("%s in a ship git call: %q %v, want %s", key, got, err, want)
@@ -568,6 +572,93 @@ func TestNoGitCallGoesIntoASubmodule(t *testing.T) {
 		got, err = gitOutput(context.Background(), f.main, "config", "--get", key)
 		if err != nil || strings.TrimSpace(got) != want {
 			t.Errorf("%s in a gate git call: %q %v, want %s", key, got, err, want)
+		}
+	}
+}
+
+// What the runner hands a run is scrubbed: its prompt, which holds the case's title, the review's diff, which leaves
+// the content of every credential file out and names it, and the package; a scrubber that cannot run starts no run.
+func TestWhatARunIsHandedIsScrubbed(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	was := Scrubber
+	t.Cleanup(func() { Scrubber = was })
+	Scrubber = []string{script(t, dir, "scrub", "sed 's/zz-private-value/****************/g'")}
+	st := testStore(t)
+	agent := fakeAgent(t, okResult)
+	r := runnerFor(t, st, agent)
+	if _, _, err := st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: "failures/v1:p", Title: "it fails with password=zz-private-value",
+		Evidence: []store.Evidence{{Ref: "file:/t/p", At: time.Now().Add(-time.Hour)}}}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if done, err := r.Once(ctx, Options{Families: []string{"failures"}}); err != nil || len(done) != 1 || done[0].Run.Status != store.RunOK {
+		t.Fatalf("%+v %v", done, err)
+	}
+	if args, _ := agentArgs(t, agent); strings.Contains(args, "zz-private-value") || !strings.Contains(args, "password=****") {
+		t.Fatalf("the prompt went unscrubbed:\n%s", args)
+	}
+	// the review's files
+	f := newRepo(t, map[string]string{".env": "password=zz-private-value\n", "notes.txt": "a note\n"})
+	s := shipFor(t, st, f)
+	r.Ship = s
+	tc := testingCase(t, st)
+	p, err := s.Prepare(ctx, tc.ID, f.main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(p.Work, ".env"), "password=zz-other-value\n")
+	write(t, filepath.Join(p.Work, "notes.txt"), "a note, and zz-private-value said again\n")
+	run(t, p.Work, "git", "add", "-A")
+	run(t, p.Work, "git", "commit", "-q", "-m", "the change")
+	p.Head, p.State, p.Base = strings.TrimSpace(run(t, p.Work, "git", "rev-parse", "HEAD")), Proposed, "main"
+	p.Check = &Check{Before: Outcome{Tail: "a test printed zz-private-value"}}
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	run2, why := r.reserve(ctx, tc.Family, tc.ID, StepReview)
+	if why != "" {
+		t.Fatal(why)
+	}
+	if _, err := r.invokeReview(ctx, tc, p, run2); err != nil {
+		t.Fatal(err)
+	}
+	diff, _ := os.ReadFile(filepath.Join(run2.Dir, "diff.patch"))
+	pkg, _ := os.ReadFile(filepath.Join(run2.Dir, "package.json"))
+	switch {
+	case strings.Contains(string(diff), "zz-private-value") || strings.Contains(string(diff), "zz-other-value"):
+		t.Errorf("the review's diff holds a secret:\n%s", diff)
+	case !strings.Contains(string(diff), "withheld here: .env") || !strings.Contains(string(diff), "notes.txt"):
+		t.Errorf("the review's diff does not name the withheld file, or lost the rest:\n%s", diff)
+	case strings.Contains(string(pkg), "zz-private-value") || !json.Valid(pkg):
+		t.Errorf("the review's package:\n%s", pkg)
+	}
+	// a scrubber that cannot run starts no run
+	Scrubber = []string{filepath.Join(dir, "no-such-scrubber")}
+	other := openCase(t, st, "owner-burden", "q", 3)
+	r.Agent.Runner = fakeAgent(t, okResult)
+	if done, _ := r.Once(ctx, Options{Families: []string{"owner-burden"}}); len(done) != 1 || done[0].Case != other.ID || done[0].Run.Status != store.RunFailed {
+		t.Fatalf("a run started with no scrubber: %+v", done)
+	}
+	if args, _ := agentArgs(t, r.Agent.Runner); args != "" {
+		t.Fatalf("the agent ran: %s", args)
+	}
+}
+
+// A review's report is an object with its findings and its summary: a result that holds neither (null, or missing
+// fields) is a failed run, not a clean review, and lands nothing.
+func TestAReviewWithoutItsFindingsIsNoReview(t *testing.T) {
+	for _, out := range []string{`null`, `{"summary":"fine"}`, `{"findings":[]}`} {
+		ctx := context.Background()
+		r, c, _ := reviewFixture(t)
+		r.Agent.Runner = fakeAgent(t, `{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":1,"structured_output":`+out+`}`)
+		r.Post = func(context.Context, string, string, string) (string, error) {
+			return "https://example.invalid/c/1", nil
+		}
+		r.Ship.Gate = reviewGate(t)
+		done := r.reviews(ctx, "")
+		p, _, _ := r.Ship.Load(c.ID)
+		if len(done) != 1 || done[0].Run.Status != store.RunFailed || done[0].Run.Failure != "an unreadable review" || len(p.Reviews) != 0 {
+			t.Fatalf("%s: %+v %+v", out, done, p.Reviews)
 		}
 	}
 }
