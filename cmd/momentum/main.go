@@ -35,6 +35,8 @@ const usage = `usage:
                                         H is claude, codex, pi, opencode or hermes
   momentum evidence status [--since DUR]   events per source and kind, and unparsed records
   momentum evidence show ID             an event, and the record of the transcript or log it names (scrubbed)
+  momentum evidence search TEXT [--since WHEN] [--until WHEN] [--kind K,K] [--actor A] [--session ID] [--limit N]
+                                        the transcripts' events whose text holds TEXT, newest first (scrubbed)
   momentum evidence git DIR GITCOMMAND [ARG]... [-- PATH...]
                                         a git command that reads (log, show, diff, blame, grep, ...) in DIR's
                                         work tree, with only the options that read; revisions are checked,
@@ -104,6 +106,10 @@ const usage = `usage:
                                         the loop's runs, and what the live ones spent in the last day and week
   momentum loop lesson --case ID --text T
                                         a case closed as improved: its lesson to tacit, as the loop's observation
+  momentum loop eval [--golden FILE] [--trials N] [--task T,T] [--budget USD] [--parallel N] [--native] [--json]
+                                        the golden-set evaluation: the loop's investigation of each past problem
+                                        as of before its fix, judged against its verified root cause; --native
+                                        runs the native path on the same tasks, the baseline it is set against
   momentum ship prepare --repo DIR [--case ID]
   momentum ship check --test CMD [--test-files F,F] [--case ID]
   momentum ship propose --title T --body-file F --rollback R --signal JSON [--window D] [--lesson L]
@@ -222,6 +228,8 @@ func evidence(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return evidenceShow(ctx, args[1:], stdout, stderr)
 	case "file":
 		return evidenceFile(ctx, args[1:], stdout, stderr)
+	case "search":
+		return evidenceSearch(ctx, args[1:], stdout, stderr)
 	case "unit":
 		return evidenceUnit(ctx, args[1:], stdout, stderr)
 	}

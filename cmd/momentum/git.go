@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -75,6 +76,12 @@ func evidenceGit(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	dir, sub, rest := paths.Expand(args[0]), args[1], args[2:]
 	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
 		return usageError{fmt.Sprintf("%s is no directory", dir)}
+	}
+	// an evaluation reads only the repositories made for it, as of its moment
+	if os.Getenv("MOMENTUM_EVAL") != "" {
+		if abs, err := filepath.Abs(dir); err != nil || !within(abs, os.Getenv("MOMENTUM_LOOP_DIR")) {
+			return usageError{"in an evaluation, evidence git reads only under " + os.Getenv("MOMENTUM_LOOP_DIR")}
+		}
 	}
 	spec, ok := gitSpecs[sub]
 	if !ok {

@@ -283,3 +283,64 @@ func scrubRecords(ctx context.Context, input io.ReadSeeker, tail int) (string, e
 	}
 	return strings.Join(lines, ""), nil
 }
+
+// evidenceSearch prints the events whose text holds a phrase, newest first, scrubbed: what an investigation
+// traces a cause by (the owner's words about a rule or an approval, an earlier failure, a setting's name).
+func evidenceSearch(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("evidence search", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	since := fs.String("since", "30d", "how far back: a duration or a time")
+	until := fs.String("until", "", "up to: a duration ago or a time (default now)")
+	kinds := fs.String("kind", "", "comma-separated kinds (owner_text, agent_text, tool_call, tool_result, ...)")
+	actor := fs.String("actor", "", "only one actor's: owner, agent, tool, harness")
+	session := fs.String("session", "", "one session's")
+	limit := fs.Int("limit", 50, "at most this many")
+	var text string
+	var rest []string
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") && text == "" {
+			text = a
+			continue
+		}
+		rest = append(rest, a)
+	}
+	if err := fs.Parse(rest); err != nil {
+		return usageError{err.Error()}
+	}
+	if len(strings.TrimSpace(text)) < 3 || fs.NArg() > 0 {
+		return usageError{"evidence search takes one phrase of 3 characters or more, then its flags"}
+	}
+	from, err := parseWhen(*since)
+	if err != nil {
+		return usageError{err.Error()}
+	}
+	q := store.Query{Since: from, Text: text, Session: *session, Actor: store.Actor(*actor), Source: store.Transcripts, Limit: min(max(*limit, 1), 500)}
+	if *until != "" {
+		if q.Until, err = parseWhen(*until); err != nil {
+			return usageError{err.Error()}
+		}
+	}
+	for _, k := range strings.Split(*kinds, ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			q.Kinds = append(q.Kinds, k)
+		}
+	}
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	evs, err := st.Events(ctx, q)
+	if err != nil {
+		return err
+	}
+	var b strings.Builder
+	for _, e := range evs {
+		fmt.Fprintf(&b, "%s ev:%s %s %s %s %s\n  %s\n", e.TS.Local().Format("2006-01-02 15:04:05"), e.ID(), e.Session, e.Actor, e.Kind,
+			plain.Line(e.Tool), plain.Line(e.Summary))
+	}
+	if len(evs) == q.Limit {
+		fmt.Fprintf(&b, "(the first %d; narrow it with --since, --kind, --actor or --session)\n", q.Limit)
+	}
+	return scrubbed(ctx, stdout, b.String())
+}
