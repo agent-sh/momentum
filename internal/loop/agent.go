@@ -199,7 +199,7 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 		StopScope(unit)
 	}
 	res, perr := readStream(transcript)
-	res.Duration, res.Transcript, res.Model = time.Since(start), transcript, a.Model
+	res.Duration, res.Transcript, res.Model = time.Since(start), transcript, firstOf(res.Model, a.Model)
 	switch {
 	case timedOut:
 		res.Status, res.Failure = store.RunTimeout, "timeout"
@@ -281,6 +281,13 @@ func readStream(path string) (Result, error) {
 	sc.Buffer(make([]byte, 1<<20), 64<<20)
 	for sc.Scan() {
 		line := sc.Bytes()
+		var message struct {
+			Type    string
+			Message struct{ Model string }
+		}
+		if json.Unmarshal(line, &message) == nil && message.Type == "assistant" && message.Message.Model != "" {
+			res.Model = message.Message.Model
+		}
 		if !bytes.Contains(line, []byte(`"type":"result"`)) && !bytes.Contains(line, []byte(`"type": "result"`)) {
 			continue
 		}
@@ -305,7 +312,7 @@ func readStream(path string) (Result, error) {
 			continue
 		}
 		found = true
-		res = Result{Text: r.Result, Report: r.StructuredOutput, Session: r.SessionID,
+		res = Result{Model: res.Model, Text: r.Result, Report: r.StructuredOutput, Session: r.SessionID,
 			Denials: len(r.PermissionDenials), Tokens: r.Usage.Input + r.Usage.Output + r.Usage.CacheRead + r.Usage.CacheCreate}
 		if r.TotalCostUSD != nil && *r.TotalCostUSD >= 0 && !math.IsInf(*r.TotalCostUSD, 0) && !math.IsNaN(*r.TotalCostUSD) {
 			res.USD, res.CostKnown = *r.TotalCostUSD, true
@@ -377,7 +384,7 @@ func lastLine(path string) string {
 // and what the loop sets. Nothing else of the caller's environment reaches it: a harness's plugin list or session
 // id would change what runs. A check's test gets less (Sandbox).
 func CleanEnv(extra map[string]string, bins ...string) []string {
-	keep := []string{"HOME", "LANG", "LC_ALL", "TZ", "USER", "LOGNAME", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR",
+	keep := []string{"TMPDIR", "HOME", "LANG", "LC_ALL", "TZ", "USER", "LOGNAME", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR",
 		"MOMENTUM_HOME", "MOMENTUM_CONFIG", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"}
 	var env []string
 	for _, k := range keep {

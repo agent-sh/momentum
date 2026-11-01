@@ -199,3 +199,14 @@ func TestTheReplayReadsNoRequestRecordPastItsWindow(t *testing.T) {
 		t.Fatalf("the last stop: %+v", last)
 	}
 }
+
+// A request at the snapshot's exclusive end cannot change the replay's pending request.
+func TestReplayRequestReadsStopAtTheSnapshotEnd(t *testing.T) {
+	r := newRecorded(t, "bounded").owner(0, "inspect the worker").request(time.Second)
+	sent := r.at
+	r.request(time.Hour)
+	end := r.at
+	if got := requestBetween(r.evs[0].Ref, "", end); !got.Equal(sent) {
+		t.Fatalf("request %s want %s", got, sent)
+	}
+}

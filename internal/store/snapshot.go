@@ -33,7 +33,7 @@ func AsOf(ctx context.Context, src, dst string, since, until time.Time) error {
 	cols := `id, source, source_key, ts, session, agent, harness, model, cwd, actor, kind, tool, summary, meta, ref, heuristic,
 	  experiment, ingested`
 	if _, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO main.events (`+cols+`) SELECT `+cols+` FROM src.events
-	  WHERE ts >= ? AND ts < ?`, since.UnixMilli(), until.UnixMilli()); err != nil {
+	  WHERE ts >= ? AND ts < ? AND NOT (source = 'incidents' AND kind = 'incident')`, since.UnixMilli(), until.UnixMilli()); err != nil {
 		return fmt.Errorf("copy the events: %w", err)
 	}
 	ncols := `id, kind, title, detail, effect, links, source, importance, at, done`

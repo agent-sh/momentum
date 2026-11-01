@@ -284,8 +284,7 @@ func scrubRecords(ctx context.Context, input io.ReadSeeker, tail int) (string, e
 	return strings.Join(lines, ""), nil
 }
 
-// evidenceSearch prints the events whose text holds a phrase, newest first, scrubbed: what an investigation
-// traces a cause by (the owner's words about a rule or an approval, an earlier failure, a setting's name).
+// evidenceSearch matches stored summaries, newest first and scrubbed. evidence show reads the whole record.
 func evidenceSearch(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("evidence search", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -295,33 +294,68 @@ func evidenceSearch(ctx context.Context, args []string, stdout, stderr io.Writer
 	actor := fs.String("actor", "", "only one actor's: owner, agent, tool, harness")
 	session := fs.String("session", "", "one session's")
 	limit := fs.Int("limit", 50, "at most this many")
-	var text string
-	var rest []string
-	for _, a := range args {
-		if !strings.HasPrefix(a, "-") && text == "" {
-			text = a
+	fs.Usage = func() {
+		fmt.Fprintln(stderr, "evidence search [flags] TEXT: stored summaries, newest first. Agent text: first 160 and last 80 bytes; calls and results: first 240 (errors keep 1,000). evidence show reads the whole record.")
+		fs.PrintDefaults()
+	}
+	// Consume each flag and its value before collecting positional arguments.
+	var flags, phrases []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			phrases = append(phrases, args[i+1:]...)
+			break
+		}
+		if !strings.HasPrefix(a, "-") {
+			phrases = append(phrases, a)
 			continue
 		}
-		rest = append(rest, a)
+		flags = append(flags, a)
+		if strings.Contains(a, "=") || a == "-h" || a == "--help" {
+			continue
+		}
+		if i+1 >= len(args) {
+			return usageError{"missing flag value: " + a}
+		}
+		i++
+		flags = append(flags, args[i])
 	}
-	if err := fs.Parse(rest); err != nil {
+	if err := fs.Parse(flags); err != nil {
 		return usageError{err.Error()}
 	}
-	if len(strings.TrimSpace(text)) < 3 || fs.NArg() > 0 {
-		return usageError{"evidence search takes one phrase of 3 characters or more, then its flags"}
+	if len(phrases) != 1 || len(strings.TrimSpace(phrases[0])) < 3 {
+		return usageError{"evidence search takes exactly one phrase of 3 characters or more; flags may come anywhere"}
+	}
+	text := phrases[0]
+	switch *actor {
+	case "", "owner", "agent", "tool", "harness", "detector", "unknown":
+	default:
+		return usageError{"unknown actor: " + *actor}
 	}
 	from, err := parseWhen(*since)
 	if err != nil {
 		return usageError{err.Error()}
 	}
-	q := store.Query{Since: from, Text: text, Session: *session, Actor: store.Actor(*actor), Source: store.Transcripts, Limit: min(max(*limit, 1), 500)}
+	now, err := commandNow()
+	if err != nil {
+		return err
+	}
+	q := store.Query{Until: now, Since: from, Text: text, Session: *session, Actor: store.Actor(*actor), Source: store.Transcripts, Limit: min(max(*limit, 1), 500)}
 	if *until != "" {
 		if q.Until, err = parseWhen(*until); err != nil {
 			return usageError{err.Error()}
 		}
 	}
+	if os.Getenv("MOMENTUM_NOW") != "" && q.Until.After(now) {
+		q.Until = now
+	}
 	for _, k := range strings.Split(*kinds, ",") {
 		if k = strings.TrimSpace(k); k != "" {
+			switch k {
+			case "owner_text", "agent_text", "tool_call", "tool_result", "harness_text", "compaction", "unknown":
+			default:
+				return usageError{"unknown kind: " + k}
+			}
 			q.Kinds = append(q.Kinds, k)
 		}
 	}

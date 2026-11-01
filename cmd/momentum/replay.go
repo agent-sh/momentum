@@ -52,11 +52,18 @@ func replay(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 			return usageError{"in a loop run, --" + refused + " is refused; read replay output"}
 		}
 	}
-	to := time.Now()
+	now, err := commandNow()
+	if err != nil {
+		return err
+	}
+	to := now
 	if *until != "" {
 		if to, err = parseWhen(*until); err != nil {
 			return usageError{err.Error()}
 		}
+	}
+	if os.Getenv("MOMENTUM_NOW") != "" && to.After(now) {
+		to = now
 	}
 	p := supervise.DefaultParams
 	p.OwnerWindow, p.PromiseWait, p.ReopenWait, p.CutoffWait, p.StalledWait = *window, *promiseWait, *reopenWait, *cutoffWait, *stalledWait
@@ -87,7 +94,10 @@ func replay(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		return err
 	}
 	// The store does not keep the platform a Hermes conversation runs on; Hermes's own database does.
-	platforms, err := hermes.Platforms(ctx, sessions.EnvFromOS().HermesHome)
+	platforms := map[string]string{}
+	if os.Getenv("MOMENTUM_EVAL") == "" {
+		platforms, err = hermes.Platforms(ctx, sessions.EnvFromOS().HermesHome, to)
+	}
 	if err != nil {
 		return err
 	}
