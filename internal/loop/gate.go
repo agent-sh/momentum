@@ -92,7 +92,7 @@ func RepoOf(ctx context.Context, dir string) (string, error) {
 // to, a repository it does not exclude, the machine's scope check allows it, and nothing else works in it (the
 // scheduled-AI policy leaves a repository another agent or a human works on alone).
 func (g Gate) Repository(ctx context.Context, dir string) (Target, error) {
-	if err := CheckGitFilters(ctx, dir); err != nil {
+	if err := CheckGitConfig(ctx, dir); err != nil {
 		return Target{}, err
 	}
 	dir, err := filepath.Abs(dir)
@@ -146,10 +146,13 @@ func (g Gate) Repository(ctx context.Context, dir string) (Target, error) {
 // scope runs the machine's read-only scope check for scheduled repository work: a nonzero exit or a disposition
 // of report only is no write.
 func (g Gate) scope(ctx context.Context, repo, dir string) error {
+	if err := CheckGitConfig(ctx, dir); err != nil {
+		return err
+	}
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, g.RepoGuard[0], append(append([]string{}, g.RepoGuard[1:]...), "--repo", repo, "--path", dir)...)
-	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
+	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0")
 	out, err := cmd.Output()
 	var v struct {
 		Allowed     bool     `json:"allowed"`
@@ -217,7 +220,7 @@ func under(p, dir string) bool {
 // gitOutput runs git in a directory and returns what it printed. Git runs without optional locks, hooks or a
 // file-system monitor, never prompts, and reads none of git's own variables (a GIT_DIR would point it elsewhere).
 func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
-	if err := CheckGitFilters(ctx, dir); err != nil {
+	if err := CheckGitConfig(ctx, dir); err != nil {
 		return "", err
 	}
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
@@ -252,7 +255,9 @@ func GitSafety() []string {
 	return []string{"-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
 		"-c", "core.attributesFile=/dev/null", "-c", "gpg.program=false", "-c", "gpg.openpgp.program=false",
 		"-c", "gpg.x509.program=false", "-c", "gpg.ssh.program=false", "-c", "log.showSignature=false",
-		"-c", "push.gpgSign=false"}
+		"-c", "push.gpgSign=false",
+		// a submodule is another repository, with settings of its own: no git call of momentum's goes into one
+		"-c", "submodule.recurse=false", "-c", "fetch.recurseSubmodules=false", "-c", "push.recurseSubmodules=no"}
 }
 
 // GitEnv removes caller Git settings and disables system and global settings and tree attributes.

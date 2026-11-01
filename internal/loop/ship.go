@@ -240,7 +240,7 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	if _, err := s.git(ctx, t.Dir, "worktree", "add", "--no-checkout", "-B", branch, work, "origin/"+t.Base); err != nil {
 		return Package{}, err
 	}
-	if err := CheckGitFilters(ctx, work); err != nil {
+	if err := CheckGitConfig(ctx, work); err != nil {
 		return Package{}, err
 	}
 	if _, err := s.git(ctx, work, "reset", "--hard", "HEAD"); err != nil {
@@ -876,13 +876,17 @@ func (s *Ship) commit(ctx context.Context, dir, msg string) error {
 // monitor, no external diff, and the user's identity for every commit it writes (a commit, a rebase, a revert),
 // whatever the repository's configuration or the environment say.
 func (s *Ship) git(ctx context.Context, dir string, args ...string) (string, error) {
-	if err := CheckGitFilters(ctx, dir); err != nil {
+	if err := CheckGitConfig(ctx, dir); err != nil {
 		return "", err
 	}
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	full := append([]string{"-C", dir, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "diff.external=",
-		"-c", "commit.gpgsign=false", "-c", "user.name=" + s.Identity[0], "-c", "user.email=" + s.Identity[1]}, append(GitSafety(), args...)...)
+	full := append([]string{"-C", dir, "-c", "diff.external=", "-c", "commit.gpgsign=false",
+		"-c", "user.name=" + s.Identity[0], "-c", "user.email=" + s.Identity[1]}, GitSafety()...)
+	full = append(full, "-c", "credential.helper=",
+		"-c", "credential.https://github.com.helper=!"+shellQuote(firstOf(s.GH, "gh"))+" auth git-credential",
+		"-c", "protocol.ext.allow=never")
+	full = append(full, args...)
 	cmd := exec.CommandContext(cctx, "git", full...)
 	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_AUTHOR_NAME="+s.Identity[0], "GIT_AUTHOR_EMAIL="+s.Identity[1],
 		"GIT_COMMITTER_NAME="+s.Identity[0], "GIT_COMMITTER_EMAIL="+s.Identity[1])
@@ -896,10 +900,14 @@ func (s *Ship) git(ctx context.Context, dir string, args ...string) (string, err
 }
 
 func (s *Ship) gh(ctx context.Context, dir string, args ...string) (string, error) {
+	if err := CheckGitConfig(ctx, dir); err != nil {
+		return "", err
+	}
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, firstOf(s.GH, "gh"), args...)
 	cmd.Dir = dir
+	cmd.Env = append(noGitEnv(), "GIT_OPTIONAL_LOCKS=0", "GIT_CONFIG_COUNT=2", "GIT_CONFIG_KEY_0=core.hooksPath", "GIT_CONFIG_VALUE_0=/dev/null", "GIT_CONFIG_KEY_1=core.fsmonitor", "GIT_CONFIG_VALUE_1=false")
 	out, err := cmd.Output()
 	if err != nil {
 		var ee *exec.ExitError
@@ -980,20 +988,43 @@ func wrap(s string) string {
 	return strings.Join(out, "\n\n")
 }
 
-// CheckGitFilters refuses repositories with external transformations before an unsandboxed Git operation.
-// Only names are read. Driver commands and their environment never run.
-func CheckGitFilters(ctx context.Context, dir string) error {
+// CheckGitConfig refuses repository settings that name programs before an unsandboxed operation.
+// The directory's own configuration and includes are read without our pins, system or global settings.
+func CheckGitConfig(ctx context.Context, dir string) error {
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, "git", append(append([]string{"-C", dir}, GitSafety()...), "config", "--name-only", "--get-regexp", `^(filter\..*\.(clean|smudge|process)|merge\..*\.driver)$`)...)
-	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
-	out, err := cmd.Output()
-	if len(bytes.TrimSpace(out)) > 0 {
-		return refused("external Git filters or merge drivers are configured")
+	config := func(args ...string) ([]byte, error) {
+		cmd := exec.CommandContext(cctx, "git", append([]string{"-C", dir, "config"}, args...)...)
+		cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0")
+		return cmd.Output()
 	}
-	var ee *exec.ExitError
-	if err != nil && !(errors.As(err, &ee) && ee.ExitCode() == 1) {
-		return fmt.Errorf("inspect Git filter names: %w", err)
+	out, err := config("--null", "--name-only", "--list")
+	if err != nil {
+		return fmt.Errorf("inspect Git configuration names: %w", err)
+	}
+	for _, name := range strings.Split(string(out), "\x00") {
+		key := strings.ToLower(name)
+		if key == "core.fsmonitor" {
+			value, err := config("--type=bool", "--get", key)
+			if err == nil && strings.TrimSpace(string(value)) == "false" {
+				continue
+			}
+			return refused("repository Git setting %s names a program", key)
+		}
+		blocked := false
+		switch key {
+		case "core.sshcommand", "core.askpass", "core.gitproxy", "core.alternaterefscommand", "core.pager", "core.editor", "sequence.editor", "interactive.difffilter":
+			blocked = true
+		}
+		for _, prefix := range []string{"credential.", "url.", "include.", "includeif.", "filter.", "gpg.", "uploadpack.", "pager."} {
+			blocked = blocked || strings.HasPrefix(key, prefix)
+		}
+		for _, pair := range [][2]string{{"merge.", ".driver"}, {"diff.", ".textconv"}, {"diff.", ".command"}, {"remote.", ".receivepack"}, {"remote.", ".uploadpack"}, {"remote.", ".vcs"}} {
+			blocked = blocked || strings.HasPrefix(key, pair[0]) && strings.HasSuffix(key, pair[1])
+		}
+		if blocked {
+			return refused("repository Git setting %s names a program", key)
+		}
 	}
 	return nil
 }
@@ -1039,4 +1070,9 @@ func (s *Ship) push(ctx context.Context, p Package, dir string, args ...string) 
 		return "", refused("the push destination is not the package's repository")
 	}
 	return s.git(ctx, dir, append([]string{"push"}, args...)...)
+}
+
+// shellQuote keeps a configured executable path one word in Git's credential helper.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }

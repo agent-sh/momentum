@@ -11,7 +11,7 @@ The standing question: which sessions stopped, stalled or wait on him, and which
 
 A sessions case holds supervision's own record (a rule that gave up, a message that did not land or whose turn stopped the same way again), the owner's nudges to stopped sessions that no rule would have continued (by why none would), or the waits on him past the owner window (by what the session asked).
 
-Read the stop: the session's events before it and up to what moved it (`momentum evidence events --session ID --since T --until T`), its last words, its last call, the error it ended on, what was in flight. `momentum supervise replay --since 7d --points FILE` writes every stop the rules saw, with what each rule decided and why; `--anchor` prints how long stops of each rule sat before what came next.
+Read the stop: the session's events before it and up to what moved it (`momentum evidence events --session ID --since T --until T`), its last words, its last call, the error it ended on, what was in flight. `momentum supervise replay --since 7d` prints the replay; `--anchor` prints how long stops of each rule sat before what came next. Read that output, which the run scrubs whole. A run never uses `--points` or `--labels`: replay reads and writes no file for it.
 
 ## Finding the mechanism
 

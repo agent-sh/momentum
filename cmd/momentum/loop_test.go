@@ -181,7 +181,7 @@ func TestALoopRunKeepsToItsOwnCase(t *testing.T) {
 		t.Errorf("its own case: exit %d %s", code, errOut)
 	}
 	if code, _, errOut := momentum("supervise", "replay", "--since", "1d", "--points", filepath.Join(t.TempDir(), "p.jsonl")); code != 2 ||
-		!strings.Contains(errOut, "writes only under") {
+		!strings.Contains(errOut, "--points is refused") {
 		t.Errorf("points outside the run: exit %d %s", code, errOut)
 	}
 	outside := filepath.Join(t.TempDir(), "body.md")

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -384,7 +385,7 @@ func TestAFileIsScrubbedBeforeItsLinesAreSelected(t *testing.T) {
 			}
 		}
 	}
-	// A large tail window drops its first line, even when the window starts at a line boundary.
+	// A large file is scrubbed whole before selecting its tail.
 	text := strings.Repeat("x", 1<<20) + "partial-line\n" + strings.Repeat("safe\n", (4<<20)/5-10) + "last\n"
 	if err := os.WriteFile(file, []byte(text), 0600); err != nil {
 		t.Fatal(err)
@@ -455,8 +456,8 @@ func TestGitEvidenceRunsNoSignatureProgram(t *testing.T) {
 			}
 			sha := strings.TrimSpace(gitIn(t, dir, "hash-object", "-t", "commit", "-w", file))
 			code, _, diag := momentum("evidence", "git", dir, "log", "--format=%G?", sha)
-			if code != 0 {
-				t.Fatalf("format: %d %s", code, diag)
+			if code == 0 {
+				t.Fatalf("repository verifier accepted: %d %s", code, diag)
 			}
 			if _, err := os.Stat(marker); !os.IsNotExist(err) {
 				t.Fatalf("verifier ran: %v", err)
@@ -468,3 +469,91 @@ func TestGitEvidenceRunsNoSignatureProgram(t *testing.T) {
 // scrubFailed is all a run reads of a command whose output the scrubber could not pass: a fixed line, nothing of
 // the command's.
 const scrubFailed = "momentum: the secret scrubber did not run, so nothing of this command is shown\n"
+
+// A synthetic PEM-shaped block crosses the former window boundary. Its tail keeps the opening context.
+func TestAFileScrubsAcrossTheFormerWindowBoundary(t *testing.T) {
+	was := loop.Scrubber
+	defer func() { loop.Scrubber = was }()
+	loop.Scrubber = []string{"scrump", "--profile", "text", "scrub", "-", "-o", "-"}
+	body := strings.Repeat("c3ludGhldGlj", 6)
+	raw := "-----BEGIN PRIVATE KEY-----\n" + strings.Repeat("YWJj\n", (4<<20)/5+4) + body + "\n-----END PRIVATE KEY-----\n"
+	whole, err := loop.Redact(context.Background(), raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(whole, body) {
+		t.Fatal("control did not mask whole block")
+	}
+	path := filepath.Join(t.TempDir(), "ordinary.log")
+	if err = os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MOMENTUM_LOOP_RUN", "fixture")
+	code, out, diag := momentum("evidence", "file", path, "--tail", "2")
+	t.Logf("code=%d whole masked=%v tail sentinel=%v", code, !strings.Contains(whole, body), strings.Contains(out, body))
+	if code != 0 {
+		t.Fatalf("file failed %s", diag)
+	}
+	if strings.Contains(out, body) {
+		t.Fatal("window started inside multiline secret")
+	}
+}
+
+// A file over the whole-text scrub limit is refused before any fragment reaches the scrubber or the run.
+func TestAFileTooLargeToScrubWholeIsRefused(t *testing.T) {
+	fakeScrubber(t)
+	t.Setenv("MOMENTUM_LOOP_RUN", "fixture")
+	path := filepath.Join(t.TempDir(), "ordinary.log")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate((64 << 20) + 1); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	for _, tail := range []string{"0", "2"} {
+		code, out, diag := momentum("evidence", "file", path, "--tail="+tail)
+		if code == 0 || out != "" || !strings.Contains(diag, "too large to scrub whole") {
+			t.Fatalf("oversized file: %d %q %s", code, out, diag)
+		}
+	}
+}
+
+// Flag diagnostics use the supplied stderr, so the run scrubs them too. Neither a successful scrub nor a
+// failed one may leak a diagnostic to process stderr.
+func TestFlagDiagnosticsStayInTheRunStreams(t *testing.T) {
+	for _, fails := range []bool{false, true} {
+		t.Run(fmt.Sprint(fails), func(t *testing.T) {
+			fakeScrubber(t)
+			if fails {
+				loop.Scrubber = []string{filepath.Join(t.TempDir(), "absent")}
+			}
+			t.Setenv("MOMENTUM_LOOP_RUN", "fixture")
+			f, err := os.CreateTemp(t.TempDir(), "stderr")
+			if err != nil {
+				t.Fatal(err)
+			}
+			was := os.Stderr
+			os.Stderr = f
+			defer func() { os.Stderr = was; f.Close() }()
+			code, out, diag := momentum("evidence", "events", "--limit=secret-value")
+			if _, err := f.Seek(0, 0); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := io.ReadAll(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if code == 0 || len(raw) != 0 || strings.Contains(out+diag, "secret-value") {
+				t.Fatalf("diagnostic escaped: %d process=%q out=%q diag=%q", code, raw, out, diag)
+			}
+			if fails && diag != scrubFailed {
+				t.Fatalf("failed scrub: %q", diag)
+			}
+			if !fails && !strings.Contains(diag, "************") {
+				t.Fatalf("no scrubbed diagnostic: %q", diag)
+			}
+		})
+	}
+}

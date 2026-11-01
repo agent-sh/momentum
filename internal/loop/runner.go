@@ -420,8 +420,10 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 			Root string `json:"root"`
 		}
 		if json.Unmarshal(res.Report, &report) == nil && strings.HasPrefix(report.Root, "root:") {
-			if _, _, err := r.Store.AddCaseSignature(ctx, c.ID, report.Root, "loop"); err != nil {
-				r.logf("record root of %s: %v", c.ID, err)
+			if own, recorded, err := r.Store.RecordRoot(ctx, run.Case, report.Root, "loop"); err != nil {
+				r.logf("record root of %s: %v", run.Case, err)
+			} else if !recorded {
+				r.logf("root of %s ignored: its case went into %s", run.Case, own.Into)
 			}
 		}
 	}

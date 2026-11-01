@@ -229,31 +229,25 @@ func evidenceUnit(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	return scrubbed(ctx, stdout, strings.ToValidUTF8(output.String(), "?"))
 }
 
-// scrubRecords scrubs one bounded window whole, then selects lines. A tail window drops its first line
-// when it starts inside the file. No fragment of an oversized line is printed.
+// scrubRecords scrubs the whole file before selecting any lines. A file too large to scrub whole is refused.
 func scrubRecords(ctx context.Context, input io.ReadSeeker, tail int) (string, error) {
-	const window = 4 << 20
+	const limit = 64 << 20
 	end, err := input.Seek(0, io.SeekEnd)
 	if err != nil {
 		return "", err
 	}
-	start := int64(0)
-	if tail > 0 && end > window {
-		start = end - window
+	if end > limit {
+		return "", fmt.Errorf("file too large to scrub whole (over 64 MiB)")
 	}
-	if _, err := input.Seek(start, io.SeekStart); err != nil {
+	if _, err := input.Seek(0, io.SeekStart); err != nil {
 		return "", err
 	}
-	raw, err := io.ReadAll(io.LimitReader(input, window))
+	raw, err := io.ReadAll(io.LimitReader(input, limit+1))
 	if err != nil {
 		return "", err
 	}
-	if start > 0 {
-		if i := bytes.IndexByte(raw, '\n'); i >= 0 {
-			raw = raw[i+1:]
-		} else {
-			raw = nil
-		}
+	if len(raw) > limit {
+		return "", fmt.Errorf("file too large to scrub whole (over 64 MiB)")
 	}
 	clean, err := loop.Redact(ctx, strings.ToValidUTF8(string(raw), "?"))
 	if err != nil {

@@ -1015,13 +1015,49 @@ func (s *Store) AddCaseSignature(ctx context.Context, id, sig, actor string) (Ca
 		return Case{}, false, err
 	}
 	defer tx.Rollback()
-	now := time.Now()
 	c, err := live(ctx, tx, id)
 	if err != nil {
 		return Case{}, false, err
 	}
+	c, merged, err := addCaseSignature(ctx, tx, c, sig, actor)
+	if err != nil {
+		return Case{}, false, err
+	}
+	return c, merged, tx.Commit()
+}
+
+// RecordRoot applies a run's root only while its assigned case has not gone into another case.
+// It reads that id and adds the signature in one transaction. The bool says whether the root was recorded.
+func (s *Store) RecordRoot(ctx context.Context, id, sig, actor string) (Case, bool, error) {
+	if !strings.HasPrefix(sig, "root:") {
+		return Case{}, false, badCase("a reported root starts with root:")
+	}
+	if err := checkSignature(sig); err != nil {
+		return Case{}, false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Case{}, false, err
+	}
+	defer tx.Rollback()
+	c, err := getCase(ctx, tx, id)
+	if err != nil {
+		return Case{}, false, err
+	}
+	if c.Into != "" {
+		return c, false, nil
+	}
+	c, _, err = addCaseSignature(ctx, tx, c, sig, actor)
+	if err != nil {
+		return Case{}, false, err
+	}
+	return c, true, tx.Commit()
+}
+
+func addCaseSignature(ctx context.Context, tx *sql.Tx, c Case, sig, actor string) (Case, bool, error) {
+	now := time.Now()
 	var holder string
-	err = tx.QueryRowContext(ctx, `SELECT case_id FROM case_signatures WHERE signature = ?`, sig).Scan(&holder)
+	err := tx.QueryRowContext(ctx, `SELECT case_id FROM case_signatures WHERE signature = ?`, sig).Scan(&holder)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		if _, err := tx.ExecContext(ctx, `INSERT INTO case_signatures (signature, case_id, at) VALUES (?,?,?)`, sig, c.ID,
@@ -1034,7 +1070,7 @@ func (s *Store) AddCaseSignature(ctx context.Context, id, sig, actor string) (Ca
 		if c, err = getCase(ctx, tx, c.ID); err != nil {
 			return Case{}, false, err
 		}
-		return c, false, tx.Commit()
+		return c, false, nil
 	case err != nil:
 		return Case{}, false, err
 	}
@@ -1043,7 +1079,7 @@ func (s *Store) AddCaseSignature(ctx context.Context, id, sig, actor string) (Ca
 		return Case{}, false, err
 	}
 	if h.ID == c.ID {
-		return c, false, tx.Commit()
+		return c, false, nil
 	}
 	if !slices.Contains(working, c.Status) {
 		return Case{}, false, badCase("case %s holds %q, and case %s is %s: only an open, investigating or testing case goes into another",
@@ -1057,7 +1093,7 @@ func (s *Store) AddCaseSignature(ctx context.Context, id, sig, actor string) (Ca
 	if c, err = merge(ctx, tx, c, h.ID, "the same signature "+sig, actor, now); err != nil {
 		return Case{}, false, err
 	}
-	return c, true, tx.Commit()
+	return c, true, nil
 }
 
 // AddCaseCost adds what a run spent on a case.
