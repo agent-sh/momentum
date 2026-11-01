@@ -115,11 +115,17 @@ func TestADeletionFreesOnlyTheFilesWhoseLastLinkItRemoves(t *testing.T) {
 		}
 	}
 	cfg.Live = []string{RuleTargets}
-	res, err = Run(ctx, cfg, st, options(t, procRoot(t), now, nil))
+	live := options(t, procRoot(t), now, nil)
+	writer := filepath.Join(filepath.Dir(outside), "writer")
+	live.duringDelete = func(f Finding) { // another process writes on the disk while each goes
+		blob(t, filepath.Join(writer, filepath.Base(filepath.Dir(f.Path))), 16<<20)
+	}
+	res, err = Run(ctx, cfg, st, live)
 	must(t, err)
 	got := findings(res, RuleTargets)
 	if !got[a].Done || !got[b].Done || got[a].Freed != wantA || got[b].Freed != wantB {
-		t.Errorf("the run frees what the dry run said: %d and %d, want %d and %d", got[a].Freed, got[b].Freed, wantA, wantB)
+		t.Errorf("the run frees what the dry run said, whatever else the disk does meanwhile: %d and %d, want %d and %d",
+			got[a].Freed, got[b].Freed, wantA, wantB)
 	}
 	if fi, err := os.Stat(outside); err != nil || fi.Size() != 8<<20 {
 		t.Errorf("the file outside stays whole: %v", err)
@@ -324,5 +330,84 @@ func TestAnItemHoldingOneDeletedBeforeItCountsWhatIsLeft(t *testing.T) {
 	}
 	if g := findings(res, RuleWorktrees)[merged]; !g.Done || g.Freed != wantW {
 		t.Errorf("the worktree frees %d, what the dry run said: %d %+v", wantW, g.Freed, g)
+	}
+}
+
+func TestABlobAKeptRepositoryLinksIsNotTheOtherRepositorys(t *testing.T) {
+	f := newModels(t)
+	two := filepath.Join(f.hub, "models--org--two")
+	f.cfg.Models.Keep = append(f.cfg.Models.Keep, two) // its link to the shared blob keeps the blob
+	st := openStore(t)
+	ctx := context.Background()
+	watchedSince(t, st, f.cfg, f.now.Add(-35*24*time.Hour), f.now)
+	one := filepath.Join(f.hub, "models--org--one")
+	shared := filepath.Join(f.hub, "blobs", "aa", "shared")
+	dry := options(t, procRoot(t), f.now, nil)
+	dry.DryRun = true
+	res, err := Run(ctx, f.cfg, st, dry)
+	must(t, err)
+	est := findingsJSON(t, res, RuleModels)[one]
+	if size, _ := est["bytes"].(float64); int64(size) != onDisk(t, one, filepath.Join(f.hub, "blobs", "bb", "sole")) {
+		t.Errorf("the repository's size is its own and the blob only it links, not the one the kept repository links: %v", est)
+	}
+	cfg := f.cfg
+	cfg.Live = []string{RuleModels}
+	res, err = Run(ctx, cfg, st, options(t, procRoot(t), f.now, nil))
+	must(t, err)
+	g := findings(res, RuleModels)[one]
+	if would, _ := est["would_free"].(float64); !g.Done || g.Freed != int64(would) {
+		t.Errorf("what the dry run says it would free is what it freed: %v, %d", est["would_free"], g.Freed)
+	}
+	if _, err := os.Stat(shared); err != nil {
+		t.Errorf("the blob the kept repository links stays: %v", err)
+	}
+}
+
+func TestARuleNotLiveIsEstimatedAfterWhatTheLiveRulesDeleted(t *testing.T) {
+	ctx := context.Background()
+	clone, wts := worktreesFixture(t)
+	merged := filepath.Join(wts, "merged")
+	target := filepath.Join(merged, "target")
+	write(t, filepath.Join(clone, ".git", "info", "exclude"), "target/\n")
+	cargoTarget(t, target)
+	b, err := os.ReadFile(filepath.Join(merged, ".git"))
+	must(t, err)
+	admin := strings.TrimPrefix(strings.TrimSpace(string(b)), "gitdir: ")
+	want := onDisk(t, merged) - onDisk(t, target) + onDisk(t, admin)
+	cfg := Config{Worktrees: WorktreesConfig{Roots: []string{wts}}, Targets: TargetsConfig{Roots: []string{wts}},
+		Exclude: Exclude{Names: []string{"secretlane"}}}.Normal()
+	cfg.Live = []string{RuleTargets} // the build goes; the worktree is only listed
+	res, err := Run(ctx, cfg, openStore(t), options(t, procRoot(t), time.Now().Add(49*time.Hour), nil))
+	must(t, err)
+	if g := findings(res, RuleTargets)[target]; !g.Done {
+		t.Fatalf("the build goes: %+v", g)
+	}
+	if got, _ := findingsJSON(t, res, RuleWorktrees)[merged]["would_free"].(float64); int64(got) != want {
+		t.Errorf("the worktree would free what is left of it after the run, %d: %v", want, got)
+	}
+}
+
+func TestWhatUVSaysItFreedAtLeastIsALowerBoundEverywhere(t *testing.T) {
+	t.Setenv("HOME", "/home/u")
+	for _, c := range []struct {
+		report, title, detail string
+	}{
+		{"Removed 3 files (at least 1.5MiB)\n", "Pruned the uv cache (at least 2 MiB by uv's count)",
+			"Pruned ~/.cache/uv 14.0 GiB (at least 2 MiB freed by uv's count)."},
+		{"Removed 3 files\n", "Pruned the uv cache (uv printed no total)", "Pruned ~/.cache/uv 14.0 GiB (uv printed no total)."},
+	} {
+		pruned := false
+		tools := uvTools("40000000000", nil)
+		tools.answers["uv cache prune"] = c.report
+		o := options(t, procRoot(t), time.Now(), nil)
+		o.Tools, o.Rules = shrinking{tools, "25000000000", &pruned}, []string{RuleUV}
+		st := openStore(t)
+		if _, err := Run(context.Background(), Config{Live: []string{RuleUV}}.Normal(), st, o); err != nil {
+			t.Fatal(err)
+		}
+		ns := decidedNotes(t, st)
+		if len(ns) != 1 || ns[0].Title != c.title || !strings.HasPrefix(ns[0].Detail, c.detail) {
+			t.Errorf("%q: the note says what uv said, and what left the cache: %+v", c.report, ns)
+		}
 	}
 }

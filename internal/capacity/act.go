@@ -77,6 +77,13 @@ func (r *runner) act(ctx context.Context) error {
 			}
 			r.sessions = nil
 		}
+		// what its deletion frees counts from its paths' links before the recheck, so the recheck stays the last look
+		// before it: a task folder's model data here, the rest as the offload finds it
+		paths := r.deletes(f)
+		if f.Rule == RuleScratch {
+			paths = modelPaths(f)
+		}
+		before := linksOf(paths, nil)
 		if why := r.recheck(ctx, f); why != "" {
 			f.Action, f.Why = ActKeep, why
 			continue
@@ -90,17 +97,25 @@ func (r *runner) act(ctx context.Context) error {
 			inner = append(inner, filepath.Join(f.canon, filepath.Dir(mf.rel)))
 		}
 		dirs := r.ownBefore(ctx, f.canon, inner...)
+		del := func(rm func() error) error {
+			if r.opt.duringDelete != nil {
+				r.opt.duringDelete(*f)
+			}
+			err := rm()
+			f.Freed, f.took = max(0, before.own-linksOf(paths, nil).own), []links{before}
+			return err
+		}
 		var err error
 		switch f.Rule {
 		case RuleWorktrees:
-			f.Freed, err = countFreed(r.deletes(f), func() error { return r.removeWorktree(ctx, f) })
+			err = del(func() error { return r.removeWorktree(ctx, f) })
 		case RuleModels:
-			f.Freed, err = countFreed(r.deletes(f), func() error { return r.removeModel(f) })
+			err = del(func() error { return r.removeModel(f) })
 		case RuleScratch:
 			f.ownDirs = dirs
-			err = r.actScratch(ctx, f, dirs)
+			err = r.actScratch(ctx, f, dirs, before)
 		default:
-			f.Freed, err = countFreed(r.deletes(f), func() error { return r.removeTarget(f) })
+			err = del(func() error { return r.removeTarget(f) })
 		}
 		if errors.Is(err, errLocked) || errors.Is(err, errChanged) {
 			f.Action, f.Why = ActKeep, err.Error()
@@ -138,10 +153,11 @@ func (r *runner) act(ctx context.Context) error {
 }
 
 // actScratch deletes a task folder's model data and offloads the rest, and counts what each freed: the model data's
-// files, and the folder as the offload found it. The model data's deletion is on record before the offload starts.
-func (r *runner) actScratch(ctx context.Context, f *Finding, dirs []ownDir) error {
+// files from their links before (counted before the recheck), and the folder as the offload found it. The model
+// data's deletion is on record before the offload starts.
+func (r *runner) actScratch(ctx context.Context, f *Finding, dirs []ownDir, before links) error {
 	models := modelPaths(f)
-	before := linksOf(models, nil)
+	f.took = []links{before}
 	counted := false
 	countModels := func() {
 		if !counted {
@@ -161,7 +177,7 @@ func (r *runner) actScratch(ctx context.Context, f *Finding, dirs []ownDir) erro
 		return r.recordModelData(ctx, f)
 	}, func() {
 		l := linksOf([]string{f.Path}, nil)
-		rest = &l
+		rest, f.took = &l, append(f.took, l)
 	})
 	countModels()
 	f.Freed = f.modelFreed

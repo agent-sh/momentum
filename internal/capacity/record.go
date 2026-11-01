@@ -587,8 +587,11 @@ func summary(kind string, f Finding) string {
 		if f.Out > 0 {
 			s += ", " + gib(f.Out) + " out of it"
 		}
-		if f.Unsaid {
+		switch {
+		case f.Unsaid:
 			return s + ", freed an amount " + pruneTool[f.Rule] + " did not print"
+		case f.AtLeast:
+			return s + ", freed at least " + noteSize(f.Freed) + byCount(f.By)
 		}
 		return s + ", freed " + noteSize(f.Freed) + byCount(f.By)
 	case KindFailed:
@@ -612,12 +615,13 @@ type runItem struct {
 	offload    bool   // a task folder offloaded to restic
 	model      bool   // a task folder's model data
 	unsaid     bool   // a prune whose tool did not print what it freed
+	atLeast    bool   // a prune whose tool said what it freed is at least its figure
 }
 
 // itemOf is what a finding's act took, as the run's note counts it: an item's size, what of a task folder went to
 // restic, a task folder's model data, or what went out of a pruned cache (else what the prune's tool says it freed).
 func itemOf(f Finding) runItem {
-	it := runItem{rule: f.Rule, path: f.Path, size: f.Bytes, freed: f.Freed, by: f.By, unsaid: f.Unsaid}
+	it := runItem{rule: f.Rule, path: f.Path, size: f.Bytes, freed: f.Freed, by: f.By, unsaid: f.Unsaid, atLeast: f.AtLeast}
 	switch {
 	case f.Rule == RuleUV || f.Rule == RuleDocker:
 		it.size = f.Out // a prune's size is the whole cache's
@@ -663,9 +667,10 @@ func runTitle(items []runItem) string {
 				g = &figure{}
 				figures[it.rule] = g
 			}
-			if it.unsaid {
+			if it.unsaid || it.atLeast { // its figure, if any, is a lower bound
 				g.unsaid = true
-			} else {
+			}
+			if !it.unsaid {
 				g.n, g.said = g.n+it.freed, true
 			}
 		}
@@ -784,13 +789,16 @@ func runDetail(items []runItem) string {
 	for _, it := range items {
 		took[it.rule], model = true, model || it.model
 		switch {
-		case it.unsaid:
+		case it.unsaid && it.size == 0:
 			unsaid = pruneTool[it.rule]
-			continue // what it freed is not known
+			continue // nothing of it is known
+		case it.unsaid: // what left the cache is known, and the item says its tool printed no total
 		case it.offload:
 			offloads = append(offloads, it)
+			fallthrough
+		default:
+			linked = linked || it.freed < it.size && noteSize(it.freed) != noteSize(it.size)
 		}
-		linked = linked || it.freed < it.size && noteSize(it.freed) != noteSize(it.size)
 		sized = append(sized, it)
 	}
 	sort.SliceStable(sized, func(i, j int) bool { return sized[i].size > sized[j].size })
@@ -900,7 +908,13 @@ func itemText(it runItem) string {
 	case it.model:
 		s = "model data in " + s
 	}
-	switch freed := noteSize(it.freed); {
+	freed := noteSize(it.freed)
+	if it.atLeast {
+		freed = "at least " + freed
+	}
+	switch {
+	case it.unsaid:
+		s += " (" + pruneTool[it.rule] + " printed no total)"
 	case it.by != "" && freed == noteSize(it.size):
 		s += " (" + it.by + "'s count)"
 	case it.by != "":

@@ -1255,6 +1255,24 @@ func TestAToolIsHandedTheFilesItGets(t *testing.T) {
 	}
 }
 
+func TestUVsReportOnStderrIsWhatItsPruneFreedAndItsAnswersStayItsOwn(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	must(t, err)
+	tool := filepath.Join(dir, "uv")
+	// as uv does, the prune's report goes to stderr, and an answer to stdout after any warning on stderr
+	write(t, tool, "#!/bin/sh\nif [ \"$2\" = prune ]; then echo 'Pruning cache at: /c/uv' >&2; "+
+		"printf 'Removed 412 files (48.0KiB)\\n' >&2; else echo 'warning: a setting is ignored' >&2; echo /c/uv; fi\n")
+	must(t, os.Chmod(tool, 0o755))
+	ctx := context.Background()
+	out, err := execTools{uv: tool}.UV(ctx, 5*time.Second, "cache", "prune", "--ci")
+	if n, said, _ := uvReclaimed(out); err != nil || !said || n != 48<<10 {
+		t.Errorf("uv's report on stderr is what its prune freed: %d %v %v %q", n, said, err, out)
+	}
+	if out, err := (execTools{uv: tool}).UV(ctx, 5*time.Second, "cache", "dir"); err != nil || lastLine(out) != "/c/uv" {
+		t.Errorf("an answer on stdout is still the last line: %q %v", out, err)
+	}
+}
+
 func TestAUVProcessPastItsSyncIsKnownHoweverItIsStarted(t *testing.T) {
 	cmd, runCmd := started("/opt/tools/srv/bin"), ran("/opt/tools/srv/bin")
 	for _, c := range []struct {

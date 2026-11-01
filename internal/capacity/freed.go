@@ -153,21 +153,28 @@ func modelPaths(f *Finding) []string {
 }
 
 // estimate says, for each item a rule that is not live would delete, what its deletion would free (WouldFree): its
-// links as the rule judged them, in the order act deletes, a file counting with the deletion that takes its last
-// link. A shared blob counts with the last repository linking it to go. An item inside one deleted before it frees
-// nothing more, and one that holds one is counted again without it.
+// links as the rule judged them, after what this run's deletions took (their links as they counted them), in the
+// order act deletes, a file counting with the deletion that takes its last link. A shared blob counts with the last
+// repository linking it to go. An item inside one deleted before it frees nothing more, and one that holds one is
+// counted again without it.
 func (r *runner) estimate() {
-	var todo []*Finding
+	var done, todo []*Finding
 	for i := range r.res.Rules {
 		rr := &r.res.Rules[i]
-		if rr.Live || !judging(rr.Rule) {
+		if !judging(rr.Rule) {
 			continue
 		}
 		for j := range rr.Findings {
-			if rr.Findings[j].Action == ActDelete {
-				todo = append(todo, &rr.Findings[j])
+			switch f := &rr.Findings[j]; {
+			case rr.Live && f.Done:
+				done = append(done, f)
+			case !rr.Live && f.Action == ActDelete:
+				todo = append(todo, f)
 			}
 		}
+	}
+	if len(todo) == 0 {
+		return
 	}
 	left := map[inode]uint64{} // the links left of each file a deletion before took some of
 	take := func(l links) int64 {
@@ -187,13 +194,36 @@ func (r *runner) estimate() {
 		}
 		return n
 	}
-	var taken []string        // the places the deletions before took, by their canonical names
+	var taken []string // the places the deletions before took, by their canonical names
+	took := func(f *Finding, canon string) {
+		switch {
+		case f.Rule == RuleTargets && len(f.parts) > 0:
+			for _, p := range f.parts {
+				taken = append(taken, filepath.Join(canon, p))
+			}
+		case f.Rule == RuleScratch && f.modelOnly:
+			for _, mf := range f.files {
+				taken = append(taken, filepath.Join(canon, mf.rel))
+			}
+		default:
+			taken = append(taken, canon)
+		}
+	}
+	canonOf := func(f *Finding) string {
+		if f.canon != "" {
+			return f.canon
+		}
+		return r.m.Canon(f.Path)
+	}
+	for _, f := range done {
+		for _, l := range f.took {
+			take(l)
+		}
+		took(f, canonOf(f))
+	}
 	users := map[string]int{} // how many repositories gone so far link each blob they share
 	for _, f := range todo {
-		canon := f.canon
-		if canon == "" {
-			canon = r.m.Canon(f.Path)
-		}
+		canon := canonOf(f)
 		inside, inner := false, []string(nil)
 		for _, t := range taken {
 			inside = inside || under(canon, t)
@@ -236,18 +266,8 @@ func (r *runner) estimate() {
 			}
 		}
 		f.WouldFree = &n
-		switch {
-		case inside:
-		case f.Rule == RuleTargets && len(f.parts) > 0:
-			for _, p := range f.parts {
-				taken = append(taken, filepath.Join(canon, p))
-			}
-		case f.Rule == RuleScratch && f.modelOnly:
-			for _, mf := range f.files {
-				taken = append(taken, filepath.Join(canon, mf.rel))
-			}
-		default:
-			taken = append(taken, canon)
+		if !inside {
+			took(f, canon)
 		}
 	}
 }

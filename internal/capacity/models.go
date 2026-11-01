@@ -146,20 +146,23 @@ func (r *runner) models(ctx context.Context) ([]Finding, error) {
 		users := map[string][]string{} // shared blob -> the items that link it
 		for _, e := range ents {
 			canon := filepath.Join(x.canon, e.Name())
-			if r.modelSet[canon] || r.kept(canon) || ((r.stores[x.canon] || r.unknownStores[x.canon]) && e.Name() == "blobs") {
+			if r.modelSet[canon] || ((r.stores[x.canon] || r.unknownStores[x.canon]) && e.Name() == "blobs") {
 				continue
 			}
 			shown := filepath.Join(x.shown, e.Name())
-			t := Measure(shown)
-			f := Finding{Rule: RuleModels, Path: shown, canon: canon, Bytes: t.Bytes, Newest: t.Newest, root: x.shown, links: t.links}
-			f.ino, _ = inodeOf(shown)
 			if (r.stores[x.canon] || r.unknownStores[x.canon]) && isRepoDir(e.Name()) {
 				ls := storeLinks(shown, x)
 				links[canon] = ls
-				for _, b := range ls {
+				for _, b := range ls { // a kept repository is no item, and the blobs it links are its too
 					users[b] = append(users[b], canon)
 				}
 			}
+			if r.kept(canon) {
+				continue
+			}
+			t := Measure(shown)
+			f := Finding{Rule: RuleModels, Path: shown, canon: canon, Bytes: t.Bytes, Newest: t.Newest, root: x.shown, links: t.links}
+			f.ino, _ = inodeOf(shown)
 			items = append(items, f)
 		}
 		for _, f := range items {

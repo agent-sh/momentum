@@ -30,12 +30,14 @@ type Finding struct {
 	Eligible time.Time `json:"eligible,omitzero"`
 	Done     bool      `json:"done,omitempty"`
 	// Freed is the space its deletion freed on disk: the files whose last link it removed (freed.go). A prune
-	// done by a tool has the tool's own figure, and By names the tool; Unsaid is one whose tool printed none. Out
-	// is what went out of a pruned cache, its size before less its size after. WouldFree is, for one a rule that is
-	// not live would delete (a dry run), what its deletion would free.
-	Freed        int64    `json:"freed,omitempty"`
+	// done by a tool has the tool's own figure, and By names the tool; Unsaid is one whose tool printed none, and
+	// AtLeast one whose tool said its figure is a lower bound. Out is what went out of a pruned cache, its size
+	// before less its size after. WouldFree is, for one a rule that is not live would delete (a dry run), what its
+	// deletion would free.
+	Freed        int64    `json:"freed"`
 	By           string   `json:"freed_by,omitempty"`
 	Unsaid       bool     `json:"unsaid,omitempty"`
+	AtLeast      bool     `json:"at_least,omitempty"`
 	Out          int64    `json:"out,omitempty"`
 	WouldFree    *int64   `json:"would_free,omitempty"`
 	Err          string   `json:"error,omitempty"`
@@ -53,6 +55,7 @@ type Finding struct {
 	// it: the last of them to go takes it
 	shares  map[string]int
 	links   links    // what its deletion frees as the rule judged it: a task folder's, all of it but its model data
+	took    []links  // what a deletion of this run counted it took, in order: where an estimate after it starts
 	class   string   // why a report-only finding is reported, as a word: its note's group
 	none    bool     // a prune that removed nothing, as the tool lists it or uv counts it: an event, not in the run's note
 	unsized bool     // a prune whose size could not be read before it ran
@@ -180,6 +183,9 @@ type Options struct {
 	afterDelete func(Finding)
 	// beforeModelDelete runs before the scratch rule deletes a file of model data: a test's way into that gap.
 	beforeModelDelete func(Finding)
+	// duringDelete runs inside a deletion, between the two looks that count what it frees: a test's way to have
+	// another writer on the disk then.
+	duringDelete func(Finding)
 	// afterUVLock runs once the uv rule's lock file is in the cache's lock file's place: a test's way into that gap.
 	afterUVLock func()
 }
@@ -429,10 +435,10 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 		scan(rule)
 	}
 	r.mountCheck()
-	r.estimate()
 	if err := r.act(ctx); err != nil {
 		return r.res, err
 	}
+	r.estimate()
 	for _, rule := range []string{RuleUV, RuleDocker} {
 		scan(rule)
 		if !opt.DryRun {

@@ -116,3 +116,47 @@ func TestASessionLookThatIsNotWholeProtectsNothing(t *testing.T) {
 		t.Errorf("a whole look keeps each session but the done ones, by its process: %+v %v", got, err)
 	}
 }
+
+func TestTheCapacityListingSaysWhatEachItemFreedAndWhoseFigureItIs(t *testing.T) {
+	const M = int64(1 << 20)
+	zero, six := int64(0), 6*M
+	res := &capacity.Result{At: time.Now(), Rules: []capacity.RuleResult{
+		{Rule: capacity.RuleTargets, Live: true, Ran: true, Findings: []capacity.Finding{
+			{Rule: capacity.RuleTargets, Path: "/p/a/target", Bytes: 9 * M, Action: capacity.ActDelete, Done: true, Freed: 4 * M},
+			{Rule: capacity.RuleTargets, Path: "/p/b/target", Bytes: 9 * M, Action: capacity.ActDelete, Freed: 2 * M, Err: "stopped"},
+		}},
+		{Rule: capacity.RuleWorktrees, Ran: true, Findings: []capacity.Finding{
+			{Rule: capacity.RuleWorktrees, Path: "/c/wt", Bytes: 7 * M, Action: capacity.ActDelete, WouldFree: &six},
+			{Rule: capacity.RuleWorktrees, Path: "/c/linked", Bytes: 7 * M, Action: capacity.ActDelete, WouldFree: &zero},
+		}},
+		{Rule: capacity.RuleUV, Live: true, Ran: true, Findings: []capacity.Finding{
+			{Rule: capacity.RuleUV, Path: "/c/uv", Bytes: 40 * M, Action: capacity.ActDelete, Done: true, Freed: 3 * M, By: "uv",
+				AtLeast: true, Out: 30 * M},
+		}},
+		{Rule: capacity.RuleDocker, Live: true, Ran: true, Findings: []capacity.Finding{
+			{Rule: capacity.RuleDocker, Path: "docker build cache", Action: capacity.ActDelete, Done: true, By: "Docker", Unsaid: true},
+		}},
+	}}
+	var out bytes.Buffer
+	printCapacity(&out, res, false)
+	for _, want := range []string{
+		"/p/a/target; freed 4 MiB\n",
+		"/p/b/target; stopped; freed 2 MiB\n", // a deletion that stopped midway freed what went
+		"/c/wt; would free 6 MiB\n",
+		"/c/linked; would free 0 MiB\n",
+		"/c/uv; freed at least 3 MiB by uv's count, 30 MiB out of it\n",
+		"docker build cache; freed an amount Docker did not print\n",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("the listing has %q:\n%s", want, out.String())
+		}
+	}
+	b, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"path":"/p/a/target","bytes":9437184,"action":"delete","done":true,"freed":4194304`) ||
+		!strings.Contains(string(b), `"path":"docker build cache","bytes":0,"action":"delete","done":true,"freed":0,"freed_by":"Docker","unsaid":true`) {
+		t.Errorf("the JSON says what each freed, nothing among it: %s", b)
+	}
+}

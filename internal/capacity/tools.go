@@ -466,7 +466,7 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 		f.Freed = removal.freed
 	case err == nil: // uv's own prune: what uv says it freed, as uv's
 		var said bool
-		f.Freed, said = uvReclaimed(printed)
+		f.Freed, said, f.AtLeast = uvReclaimed(printed)
 		f.By, f.Unsaid = "uv", !said
 	}
 	// nothing went only when uv's own count is the same before and after: a walk, or a cache that grew meanwhile,
@@ -496,6 +496,8 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 		f.Detail += fmt.Sprintf("; it freed %s, as it counts what went: a file still linked from outside it stays", gib(f.Freed))
 	case f.Unsaid:
 		f.Detail += "; uv printed no total of what it freed"
+	case f.AtLeast:
+		f.Detail += fmt.Sprintf("; uv says it freed at least %s", gib(f.Freed))
 	default:
 		f.Detail += fmt.Sprintf("; uv says it freed %s", gib(f.Freed))
 	}
@@ -534,23 +536,23 @@ func (r *runner) uvPrune(ctx context.Context, held *os.File, args ...string) (st
 
 // uvRemovedRe is the summary uv's prune prints: "Removed 412 files (48.0KiB)", or "(at least 1.0MiB)" where uv could
 // not measure every entry.
-var uvRemovedRe = regexp.MustCompile(`Removed \d+ (?:files?|director(?:y|ies)) \((?:at least )?(\d+(?:\.\d+)?) ?([KMGTPE]iB|B)\)`)
+var uvRemovedRe = regexp.MustCompile(`Removed \d+ (?:files?|director(?:y|ies)) \((at least )?(\d+(?:\.\d+)?) ?([KMGTPE]iB|B)\)`)
 
-// uvReclaimed is what uv's prune says it freed, by its report: since 0.12.6 uv counts a file as it removes it, when
-// that removes its last link. A prune that found nothing to remove freed nothing; a report this build cannot read
-// says nothing.
-func uvReclaimed(report string) (int64, bool) {
+// uvReclaimed is what uv's prune says it freed, by its report, and whether uv said that is at least what it freed:
+// since 0.12.6 uv counts a file as it removes it, when that removes its last link. A prune that found nothing to
+// remove freed nothing; a report this build cannot read says nothing.
+func uvReclaimed(report string) (n int64, said, atLeast bool) {
 	report = ansiRe.ReplaceAllString(report, "")
 	m := uvRemovedRe.FindStringSubmatch(report)
 	if m == nil {
-		return 0, strings.Contains(report, "No unused entries found")
+		return 0, strings.Contains(report, "No unused entries found"), false
 	}
-	v, err := strconv.ParseFloat(m[1], 64)
+	v, err := strconv.ParseFloat(m[2], 64)
 	if err != nil {
-		return 0, false
+		return 0, false, false
 	}
 	unit := map[string]float64{"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40, "PiB": 1 << 50, "EiB": 1 << 60}
-	return int64(v * unit[m[2]]), true
+	return int64(v * unit[m[3]]), true, m[1] != ""
 }
 
 // ansiRe is a terminal's color sequence, which a tool may print around a figure.

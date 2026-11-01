@@ -275,13 +275,17 @@ func printCapacity(w io.Writer, res *capacity.Result, all bool) {
 					line += "; " + s
 				}
 			}
+			freed := gibText(f.Freed)
+			if f.AtLeast {
+				freed = "at least " + freed
+			}
 			switch {
 			case f.Done && f.Unsaid:
 				line += "; freed an amount " + f.By + " did not print"
 			case f.Done && f.By != "":
-				line += "; freed " + gibText(f.Freed) + " by " + f.By + "'s count"
-			case f.Done:
-				line += "; freed " + gibText(f.Freed)
+				line += "; freed " + freed + " by " + f.By + "'s count"
+			case f.Done, f.Freed > 0: // a deletion that stopped midway freed what went
+				line += "; freed " + freed
 			case f.WouldFree != nil:
 				line += "; would free " + gibText(*f.WouldFree)
 			}

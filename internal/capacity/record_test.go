@@ -316,6 +316,26 @@ func TestARunsNoteCountsByRuleAndSaysOnceHowToKeepEach(t *testing.T) {
 	}
 }
 
+func TestADetailShortOfRoomLeavesItsLastSentencesOutTheLastFirst(t *testing.T) {
+	t.Setenv("HOME", "/home/user")
+	const G = int64(1 << 30)
+	items := []runItem{
+		{rule: RuleWorktrees, path: "/home/user/.cache/pr-review", size: 4 * G, freed: G},
+		{rule: RuleTargets, path: "/home/user/projects/billing-service/target", size: 11 * G, freed: 11 * G},
+		{rule: RuleUV, path: "/home/user/.cache/uv", size: 12 * G, freed: 3 * G},
+	}
+	d := runDetail(items)
+	if utf8.RuneCountInString(d) > detailMax || !strings.Contains(d, "Files still hardlinked elsewhere stay on disk.") ||
+		!strings.Contains(d, comesBack[RuleWorktrees]) ||
+		strings.Contains(d, comesBack[RuleUV]) {
+		t.Errorf("the uv sentence, last, goes first; why less was freed than went stays: %d %q", utf8.RuneCountInString(d), d)
+	}
+	if !strings.HasPrefix(d, "Pruned ~/.cache/uv 12.0 GiB (3.0 GiB freed), ~/projects/billing-service/target 11.0 GiB, "+
+		"~/.cache/pr-review 4.0 GiB (1.0 GiB freed). ") {
+		t.Errorf("each item says what it freed where that is another size: %q", d)
+	}
+}
+
 func TestAFastFillNamesItsWritersInANoteOncePerFill(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
