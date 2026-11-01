@@ -144,6 +144,21 @@ func (r *runner) deletes(f *Finding) []string {
 	return []string{f.Path}
 }
 
+// alone are the paths an item's deletion removes that only it holds, as the rule judged it: a model with the blobs only
+// it links (a blob others link too goes with the last of them), else what deletes says.
+func (r *runner) alone(f *Finding) []string {
+	if f.Rule != RuleModels {
+		return r.deletes(f)
+	}
+	out := []string{f.Path}
+	for _, b := range f.blobs {
+		if p, ok := r.blobPath(b); ok {
+			out = append(out, p, p+".refs")
+		}
+	}
+	return out
+}
+
 // blobPaths are the shared-store blobs a model links, under the roots as configured.
 func (r *runner) blobPaths(f *Finding) []string {
 	var out []string
@@ -177,8 +192,8 @@ func modelPaths(f *Finding) []string {
 // estimate says, for each item a rule that is not live would delete, what its deletion would free (WouldFree): its
 // links as the rule judged them, after what this run's deletions took (their links as they counted them), in the
 // order act deletes, a file counting with the deletion that takes its last link. A shared blob counts with the last
-// repository linking it to go. An item inside one deleted before it frees nothing more, and one that holds one is
-// counted again without it.
+// repository linking it to go. An item inside one deleted before it frees nothing more, one that holds one is counted
+// again without it, and one nested either way with a deletion that stopped midway is counted again as it is.
 func (r *runner) estimate() {
 	var done, todo []*Finding
 	for i := range r.res.Rules {
@@ -237,24 +252,31 @@ func (r *runner) estimate() {
 		}
 		return r.m.Canon(f.Path)
 	}
+	var stopped []string // the places of the deletions that stopped midway: what is left of them is walked again
 	for _, f := range done {
 		for _, l := range f.took {
 			take(l)
 		}
 		if f.Done {
 			took(f, canonOf(f))
+		} else {
+			stopped = append(stopped, canonOf(f))
 		}
 	}
 	users := map[string]int{} // how many repositories gone so far link each blob they share
 	for _, f := range todo {
 		canon := canonOf(f)
-		inside, inner := false, []string(nil)
+		inside, inner, fresh := false, []string(nil), false
 		for _, t := range taken {
 			inside = inside || under(canon, t)
 			if under(t, canon) { // as the walk of this item spells it
 				inner = append(inner, filepath.Join(f.Path, strings.TrimPrefix(t, canon)))
 			}
 		}
+		for _, t := range stopped { // its links as judged hold what that deletion took
+			fresh = fresh || under(t, canon) || under(canon, t)
+		}
+		fresh = fresh || len(inner) > 0
 		skip := func(p string) bool {
 			for _, t := range inner {
 				if under(p, t) {
@@ -266,7 +288,7 @@ func (r *runner) estimate() {
 		var n int64
 		switch {
 		case inside:
-		case f.Rule == RuleScratch && len(inner) > 0:
+		case f.Rule == RuleScratch && fresh:
 			models := modelPaths(f)
 			n = take(linksOf(models, skip))
 			if !f.modelOnly {
@@ -277,8 +299,8 @@ func (r *runner) estimate() {
 			if !f.modelOnly {
 				n += take(f.links)
 			}
-		case len(inner) > 0:
-			n = take(linksOf(r.deletes(f), skip))
+		case fresh:
+			n = take(linksOf(r.alone(f), skip))
 		default:
 			n = take(f.links)
 		}

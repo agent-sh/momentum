@@ -133,7 +133,7 @@ func TestADeletionFreesOnlyTheFilesWhoseLastLinkItRemoves(t *testing.T) {
 	ns := decidedNotes(t, st)
 	if len(ns) != 1 || ns[0].Title != "Freed "+gib(wantA+wantB)+": 2 Rust build outputs" ||
 		!strings.Contains(ns[0].Detail, short(a)+" "+gib(got[a].Bytes)+" ("+gib(wantA)+" freed)") ||
-		!strings.Contains(ns[0].Detail, "Files still hardlinked elsewhere stay on disk.") {
+		!strings.Contains(ns[0].Detail, "A file linked elsewhere frees nothing until its last link goes.") {
 		t.Errorf("the note's title says what the disk gained, its detail each item's size and what it freed: %+v", ns)
 	}
 	evs, err := st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindDelete}})
@@ -195,7 +195,7 @@ func TestAPruneAroundRunningEnvironmentsFreesNoWheelAnEnvironmentOutsideLinks(t 
 	}
 	ns := decidedNotes(t, st)
 	if len(ns) != 1 || ns[0].Title != "Freed 8 MiB: pruned the uv cache" ||
-		!strings.HasPrefix(ns[0].Detail, "Pruned "+short(f.cache)+" 16 MiB (8 MiB freed). Files still hardlinked elsewhere stay on disk.") {
+		!strings.HasPrefix(ns[0].Detail, "Pruned "+short(f.cache)+" 16 MiB (8 MiB freed). A file linked elsewhere frees nothing until its last link goes.") {
 		t.Errorf("the note's title says what the disk gained, and its detail what went out of the cache: %+v", ns)
 	}
 }
@@ -217,8 +217,9 @@ func TestUVsOwnPruneIsNamedWithWhatUVSaysItFreed(t *testing.T) {
 	// 15 GB left the cache: uv counts a wheel an environment still links as freeing nothing
 	ns := decidedNotes(t, st)
 	if len(ns) != 1 || ns[0].Title != "Pruned the uv cache (under 1 MiB by uv's count)" ||
-		!strings.HasPrefix(ns[0].Detail, "Pruned ~/.cache/uv 14.0 GiB (under 1 MiB freed by uv's count).") {
-		t.Errorf("the note names uv's figure as uv's, not as what the run freed: %+v", ns)
+		!strings.HasPrefix(ns[0].Detail, "Pruned ~/.cache/uv 14.0 GiB (under 1 MiB freed by uv's count).") ||
+		strings.Contains(ns[0].Detail, "last link") {
+		t.Errorf("the note names uv's figure as uv's, not as what the run freed, and says nothing of links it did not count: %+v", ns)
 	}
 	evs, err := st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindPrune}})
 	if err != nil || len(evs) != 1 || !strings.HasSuffix(evs[0].Summary, "14.0 GiB out of it, freed under 1 MiB by uv's count") {
@@ -403,8 +404,10 @@ func TestWhatUVSaysItFreedAtLeastIsALowerBoundEverywhere(t *testing.T) {
 	}{
 		{"Removed 3 files (at least 1.5MiB)\n", "Pruned the uv cache (at least 2 MiB by uv's count)",
 			"Pruned ~/.cache/uv 14.0 GiB (at least 2 MiB freed by uv's count).", true, nil},
-		{"Removed 3 files\n", "Pruned the uv cache (uv printed no total)", "Pruned ~/.cache/uv 14.0 GiB (uv printed no total).",
-			nil, true},
+		{"Removed 3 files\n", "Pruned the uv cache (0 MiB by uv's count)", "Pruned ~/.cache/uv 14.0 GiB (0 MiB freed by uv's count).",
+			nil, nil}, // uv before 0.12.6 prints no figure for nothing freed
+		{"Pruning cache at: /home/u/.cache/uv\n", "Pruned the uv cache (uv printed no total)",
+			"Pruned ~/.cache/uv 14.0 GiB (uv printed no total).", nil, true},
 	} {
 		pruned := false
 		tools := uvTools("40000000000", nil)
@@ -427,6 +430,56 @@ func TestWhatUVSaysItFreedAtLeastIsALowerBoundEverywhere(t *testing.T) {
 		}
 		if len(evs) != 1 || m["at_least"] != c.atLeast || m["unsaid"] != c.unsaid {
 			t.Errorf("%q: the event keeps whether uv's figure is a lower bound or none: %v", c.report, m)
+		}
+	}
+}
+
+// stoppingTarget is an idle build at dir whose removal stops midway: a directory in it holds a file the user may not
+// unlink. Its read-only directory is made writable again when the test ends.
+func stoppingTarget(t *testing.T, dir string) {
+	t.Helper()
+	cargoTarget(t, dir)
+	ro := filepath.Join(dir, "release", "ro")
+	blob(t, filepath.Join(ro, "kept.rlib"), 1<<20)
+	must(t, os.Chmod(ro, 0o555))
+	t.Cleanup(func() { os.Chmod(ro, 0o755) })
+}
+
+func TestADeletionThatStoppedMidwayCountsInTheEstimateAfterIt(t *testing.T) {
+	ctx := context.Background()
+	clone, wts := worktreesFixture(t)
+	write(t, filepath.Join(clone, ".git", "info", "exclude"), "target/\nnode_modules/\n")
+	merged, squashed := filepath.Join(wts, "merged"), filepath.Join(wts, "squashed")
+	// a build beside a leftover worktree, which holds the other link of one of its files, and stops after Cargo's
+	// own debug went (its parts go in order, a build with what Cargo does not make going part by part)
+	beside := filepath.Join(wts, "local", "target")
+	stoppingTarget(t, beside)
+	blob(t, filepath.Join(beside, "criterion", "base.json"), 4096)
+	big := filepath.Join(beside, "debug", "deps", "libbig.rlib")
+	blob(t, big, 4<<20)
+	must(t, os.MkdirAll(filepath.Join(merged, "node_modules"), 0o755))
+	must(t, os.Link(big, filepath.Join(merged, "node_modules", "big.node")))
+	// and a build inside another leftover worktree, which stops partway
+	stoppingTarget(t, filepath.Join(squashed, "target"))
+	cfg := Config{Worktrees: WorktreesConfig{Roots: []string{wts}}, Targets: TargetsConfig{Roots: []string{wts}},
+		Exclude: Exclude{Names: []string{"secretlane"}}}.Normal()
+	cfg.Live = []string{RuleTargets} // the builds go, as far as they can; the worktrees are only listed
+	res, err := Run(ctx, cfg, openStore(t), options(t, procRoot(t), time.Now().Add(49*time.Hour), nil))
+	must(t, err)
+	for _, p := range []string{beside, filepath.Join(squashed, "target")} {
+		if g := findings(res, RuleTargets)[p]; g.Done || g.Err == "" || g.Freed == 0 {
+			t.Fatalf("%s stops midway, having freed what went: %+v", p, g)
+		}
+	}
+	admin := func(w string) string {
+		b, err := os.ReadFile(filepath.Join(w, ".git"))
+		must(t, err)
+		return strings.TrimPrefix(strings.TrimSpace(string(b)), "gitdir: ")
+	}
+	est := findingsJSON(t, res, RuleWorktrees)
+	for _, w := range []string{merged, squashed} { // all each holds is its own now: what of it the builds took is gone
+		if got, _ := est[w]["would_free"].(float64); int64(got) != onDisk(t, w, admin(w)) {
+			t.Errorf("%s would free all it holds after the run, %d: %v", w, onDisk(t, w, admin(w)), got)
 		}
 	}
 }

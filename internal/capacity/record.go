@@ -786,11 +786,11 @@ const detailMax = 400
 
 // runDetail is what a run took in plain sentences: its largest three items with their sizes, and what each freed where
 // that is another size; where each offloaded folder's pointer is, and that model data is not offloaded; how to keep an
-// item next time, in one sentence; and last, that what is still hardlinked elsewhere stays on disk, what is not known
-// of a prune, and how a removed worktree and what the prunes took come back. A detail longer than detailMax leaves out
-// those last sentences, then names two items, then says how to keep one in fewer words with three items again, then
-// two, then leaves out the model data's sentence, then names one item, then leaves out the pointer's, and last clips
-// its item: how to keep one stays.
+// item next time, in one sentence; and last, that a file linked elsewhere frees nothing until its last link goes
+// (when a deletion freed less than went with it), what is not known of a prune, and how a removed worktree and what the
+// prunes took come back. A detail longer than detailMax leaves out those last sentences, the last first, then names two
+// items, then says how to keep one in fewer words with three items again, then two, then leaves out the model data's
+// sentence, then names one item, then leaves out the pointer's, and last clips its item: how to keep one stays.
 func runDetail(items []runItem) string {
 	var sized, offloads []runItem
 	took, model, unsaid, linked := map[string]bool{}, false, "", false
@@ -933,8 +933,9 @@ func itemText(it runItem) string {
 	return s
 }
 
-// linkedElsewhere says, in a run that freed less than what went, why.
-const linkedElsewhere = "Files still hardlinked elsewhere stay on disk."
+// linkedElsewhere says, in a run whose deletion freed less than went with it, why: the file's other links, which
+// a later deletion of the run may take too.
+const linkedElsewhere = "A file linked elsewhere frees nothing until its last link goes."
 
 // groupTitles say what a rule's report-only items of one reason are.
 var groupTitles = map[string]string{

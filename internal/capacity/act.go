@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -309,7 +311,9 @@ func (r *runner) removeItem(f *Finding) error {
 	return removeIn(f.root, rel)
 }
 
-// removeTarget deletes a target dir, or only Cargo's own entries of one that holds others.
+// removeTarget deletes a target dir, or only Cargo's own entries of one that holds others. Of those, it takes the
+// lock of every directory before the first goes, so one another process holds keeps them all, and it removes Cargo's
+// tag and info files last: a removal that stops midway leaves a target dir a later run knows.
 func (r *runner) removeTarget(f *Finding) error {
 	if len(f.parts) == 0 {
 		return r.removeItem(f)
@@ -322,8 +326,41 @@ func (r *runner) removeTarget(f *Finding) error {
 	if err := syscall.Flock(int(rt.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return errLocked
 	}
-	for _, p := range f.parts {
-		if err := removeIn(f.Path, p); err != nil && !errors.Is(err, os.ErrNotExist) {
+	root, err := os.OpenRoot(f.Path)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	parts := slices.Clone(f.parts)
+	marker := func(p string) bool { return p == "CACHEDIR.TAG" || p == ".rustc_info.json" }
+	slices.SortStableFunc(parts, func(a, b string) int {
+		switch {
+		case marker(a) == marker(b):
+			return strings.Compare(a, b)
+		case marker(a):
+			return 1
+		}
+		return -1
+	})
+	for _, p := range parts {
+		fi, err := root.Lstat(p)
+		if errors.Is(err, os.ErrNotExist) || err == nil && !fi.IsDir() {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		fh, err := root.Open(p)
+		if err != nil {
+			return err
+		}
+		defer fh.Close()
+		if syscall.Flock(int(fh.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+			return errLocked
+		}
+	}
+	for _, p := range parts {
+		if err := root.RemoveAll(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}

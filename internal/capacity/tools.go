@@ -537,17 +537,20 @@ func (r *runner) uvPrune(ctx context.Context, held *os.File, args ...string) (st
 }
 
 // uvRemovedRe is the summary uv's prune prints: "Removed 412 files (48.0KiB)", or "(at least 1.0MiB)" where uv could
-// not measure every entry.
-var uvRemovedRe = regexp.MustCompile(`Removed \d+ (?:files?|director(?:y|ies)) \((at least )?(\d+(?:\.\d+)?) ?([KMGTPE]iB|B)\)`)
+// not measure every entry. uv before 0.12.6 prints the figure only when it is above zero.
+var uvRemovedRe = regexp.MustCompile(`Removed \d+ (?:files?|director(?:y|ies))(?: \((at least )?(\d+(?:\.\d+)?) ?([KMGTPE]iB|B)\))?`)
 
 // uvReclaimed is what uv's prune says it freed, by its report, and whether uv said that is at least what it freed:
 // since 0.12.6 uv counts a file as it removes it, when that removes its last link. A prune that found nothing to
-// remove freed nothing; a report this build cannot read says nothing.
+// remove, or whose summary has no figure, freed nothing by uv's count; a report with no summary says nothing.
 func uvReclaimed(report string) (n int64, said, atLeast bool) {
 	report = ansiRe.ReplaceAllString(report, "")
 	m := uvRemovedRe.FindStringSubmatch(report)
-	if m == nil {
+	switch {
+	case m == nil:
 		return 0, strings.Contains(report, "No unused entries found"), false
+	case m[2] == "":
+		return 0, true, false
 	}
 	v, err := strconv.ParseFloat(m[2], 64)
 	if err != nil {

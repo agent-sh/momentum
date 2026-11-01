@@ -411,6 +411,37 @@ func TestATargetKeepsWhatCargoDoesNotBuild(t *testing.T) {
 	}
 }
 
+// A lock another process holds on one of a target dir's own entries keeps them all, so no part goes before it.
+func TestALockOnOnePartOfATargetKeepsEveryPart(t *testing.T) {
+	gitEnv(t)
+	root := filepath.Join(t.TempDir(), "projects")
+	app := filepath.Join(root, "app")
+	write(t, filepath.Join(app, ".gitignore"), "target/\n")
+	gitT(t, app, "init", "-q")
+	tgt := filepath.Join(app, "target")
+	cargoTarget(t, tgt)
+	blob(t, filepath.Join(tgt, "criterion", "bench", "base", "estimates.json"), 2<<20)
+	blob(t, filepath.Join(tgt, "release", "app"), 2<<20)
+	held, err := os.Open(filepath.Join(tgt, "release"))
+	must(t, err)
+	defer held.Close()
+	must(t, syscall.Flock(int(held.Fd()), syscall.LOCK_EX|syscall.LOCK_NB))
+	cfg := Config{Targets: TargetsConfig{Roots: []string{root}}}.Normal()
+	cfg.Live = []string{RuleTargets}
+	res, err := Run(context.Background(), cfg, openStore(t), options(t, procRoot(t), time.Now().Add(72*time.Hour), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f := findings(res, RuleTargets)[tgt]; f.Done || f.Action != ActKeep {
+		t.Fatalf("a lock on a part keeps the target dir: %+v", f)
+	}
+	for _, p := range []string{"debug", "CACHEDIR.TAG", ".rustc_info.json", "release/app"} {
+		if _, err := os.Stat(filepath.Join(tgt, p)); err != nil {
+			t.Errorf("%s stays while another process holds a lock on a part: %v", p, err)
+		}
+	}
+}
+
 // A typo in the capacity section is refused: it would drop a protection without a word.
 func TestAnUnknownKeyInTheCapacitySectionIsRefused(t *testing.T) {
 	cfgDir := t.TempDir()
