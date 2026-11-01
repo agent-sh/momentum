@@ -30,7 +30,8 @@ import (
 // uvBuckets are the buckets that hold environments, as uv 0.12 and 0.13 name them: its temporary environments, its
 // environments and the links to cached ones, and the unpacked wheels and cached environments. The rule deletes from
 // the last two (uvDeletes) when it prunes around running environments. Every other bucket (the wheels' pointers and
-// metadata, the index, the built wheels, git) stays for uv's own prune: nothing runs from it. So does builds-v0: uv
+// metadata, the index, the built wheels, git) stays for uv's own prune, but for what files-v0 holds that nothing links
+// any more (uvFiles): nothing runs from them. So does builds-v0: uv
 // removes an entry when the process that made it ends, and one whose uv was killed may still be the environment of the
 // command it started (an overlay), which a command that set its title over its environment names nowhere.
 var (
@@ -83,13 +84,15 @@ var uvReachWait = 30 * time.Second
 
 // uvReach is what the processes that use the cache keep of it: each entry a place of theirs is in, and every entry
 // such an entry reaches (see walk). places are the places it answered, as the processes give them, so a later look
-// knows them without reading a filesystem; bytes is the kept entries' size on disk, each file once; envs is how many
-// kept entries are environments. resolve resolves a path's links: resolveLinks, read once by the caller.
+// knows them without reading a filesystem; bytes is the kept entries' size on disk, each file once, and builds what
+// of it is in builds-v0; envs is how many kept entries outside builds-v0 are environments. resolve resolves a path's
+// links: resolveLinks, read once by the caller.
 type uvReach struct {
 	c          uvCache
 	keep       map[string]bool
 	places     map[string]bool
 	bytes      int64
+	builds     int64
 	envs       int
 	why        string
 	seen       map[inode]bool
@@ -221,10 +224,14 @@ func (r *uvReach) place(pl uvPlace) {
 		}
 	}
 	r.keep[e] = true
-	if exists(filepath.Join(dir, "pyvenv.cfg")) {
+	if exists(filepath.Join(dir, "pyvenv.cfg")) && !strings.HasPrefix(e, "builds-v0/") {
 		r.envs++
 	}
+	before := r.bytes
 	r.walk(dir, true)
+	if strings.HasPrefix(e, "builds-v0/") {
+		r.builds += r.bytes - before
+	}
 }
 
 // walk reads a directory's tree, not following its links, and puts on the queue what it reaches in the cache: each
@@ -289,8 +296,9 @@ func (r *uvReach) named(paths []string) {
 
 // outside names the processes of a later look that use what the first look did not keep, or "". A place the first
 // look answered is known; any other is judged by its name alone, since the look under the lock reads no filesystem
-// but /proc: one in an entry the first look kept, or in the cache but in no bucket that holds environments, is fine.
-// A place no look could read (envs.unread) is not.
+// but /proc: one in an entry the first look kept is fine, and so is one /proc gave resolved in another bucket. One
+// that names another bucket on a command line or in an environment is not: a wheel's pointer there is a link into
+// archive-v0, which the name does not say. A place no look could read (envs.unread) is not either.
 func (r *uvReach) outside(found uvFound, envs *uvEnvs) string {
 	if found.blind != "" {
 		return found.blind
@@ -301,7 +309,7 @@ func (r *uvReach) outside(found uvFound, envs *uvEnvs) string {
 			continue
 		}
 		e, whole := r.c.entry(pl.path)
-		if !whole && !slices.Contains(envs.unread, pl.path) && (e == "" && r.c.in(pl.path) || r.keep[e]) {
+		if !whole && !slices.Contains(envs.unread, pl.path) && (e != "" && r.keep[e] || e == "" && pl.resolved && r.c.in(pl.path)) {
 			continue
 		}
 		names.addWho(whoOr(pl.who, short(pl.path)))
@@ -351,9 +359,9 @@ func (r *uvReach) says(found uvFound) string {
 	if r.envs == 1 {
 		envs = "1 environment"
 	}
-	return fmt.Sprintf("%s, so the prune goes around what they use: it keeps %s and what they reach (%s), and builds-v0; "+
-		"the rest of environments-v2 and archive-v0 goes, and the other buckets stay for uv's own prune",
-		strings.Join(why, " and "), envs, gib(r.bytes))
+	return fmt.Sprintf("%s, so the prune goes around what they use: it keeps %s and what they reach (%s), and builds-v0 "+
+		"(%s); the rest of environments-v2 and archive-v0 goes, and the other buckets stay for uv's own prune",
+		strings.Join(why, " and "), envs, gib(r.bytes-r.builds), gib(r.builds))
 }
 
 // says what a prune around running environments did, for its finding's detail.
@@ -380,7 +388,7 @@ func (u uvRemoval) says() string {
 			"process waits for", u.left, uvAroundFor)
 	}
 	if u.trash != "" {
-		s += "; what it moved aside could not all be deleted, and a later run deletes the rest: " + u.trash
+		s += "; what it moved aside could not all be deleted, and each later run tries again: " + u.trash
 	}
 	return s
 }
@@ -609,6 +617,13 @@ func (u *uvRemoval) move(rt *os.Root, rel, to string) {
 	if err == nil {
 		err = rt.Rename(rel, to)
 	}
+	if errors.Is(err, fs.ErrPermission) {
+		// a directory the user may not write cannot go to another parent: as uv does before it deletes, it is made
+		// writable first
+		if fi, e := rt.Lstat(rel); e == nil && fi.IsDir() && rt.Chmod(rel, fi.Mode().Perm()|0o700) == nil {
+			err = rt.Rename(rel, to)
+		}
+	}
 	switch {
 	case err == nil, errors.Is(err, fs.ErrNotExist):
 		u.removed++
@@ -687,17 +702,56 @@ func uvFiles(rt *os.Root, dir string, until time.Time, out *uvRemoval) {
 }
 
 // uvEmptyTrash deletes what prunes around running environments moved aside, through an os.Root of the cache: once it
-// is aside nothing reaches it, so no lock is needed.
+// is aside nothing reaches it, so no lock is needed. A directory the user may not read or write is made so first, as
+// uv does before it deletes.
 func uvEmptyTrash(dir string) error {
 	rt, err := os.OpenRoot(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
 	defer rt.Close()
-	if err := rt.RemoveAll(uvTrash); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	err = rt.RemoveAll(uvTrash)
+	if errors.Is(err, fs.ErrPermission) {
+		// the walk sees a directory before it reads it, so one made readable here is walked too
+		filepath.WalkDir(filepath.Join(dir, uvTrash), func(p string, d fs.DirEntry, err error) error {
+			if err == nil && d.IsDir() {
+				if info, err := d.Info(); err == nil {
+					rel, _ := filepath.Rel(dir, p)
+					rt.Chmod(rel, info.Mode().Perm()|0o700)
+				}
+			}
+			return nil
+		})
+		err = rt.RemoveAll(uvTrash)
+	}
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 	return nil
+}
+
+// uvJobPlace is a place a scheduled job names in an entry of a bucket that holds environments: the path as the job
+// gives it, or, when that is outside the cache, the path through the nearest directory above it that resolves into
+// the cache (a project's .venv that links into it). A job that names the cache, one of its buckets, or a path in
+// another bucket names no environment.
+func uvJobPlace(c uvCache, p string) (string, bool) {
+	q := p
+	if _, in := c.rel(p); !in {
+		q = ""
+		for d := filepath.Dir(p); d != filepath.Dir(d); d = filepath.Dir(d) {
+			if res, err := filepath.EvalSymlinks(d); err == nil {
+				if _, in := c.rel(res); in {
+					q = filepath.Join(res, strings.TrimPrefix(p, d+"/"))
+					break
+				}
+			}
+		}
+	}
+	e, whole := c.entry(q)
+	return q, q != "" && e != "" && !whole
 }
 
 // pidNames names processes for a note: at most three, each once, then how many more.

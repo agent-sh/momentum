@@ -349,6 +349,116 @@ func TestACleanThatCameWhileCapacityHeldTheLockIsWaitedOut(t *testing.T) {
 	}
 }
 
+func TestACleansOwnLockTimeoutIsWaitedOut(t *testing.T) {
+	defer func(a, b time.Duration) { uvCleanWait, uvLockMargin = a, b }(uvCleanWait, uvLockMargin)
+	uvCleanWait, uvLockMargin = 100*time.Millisecond, 100*time.Millisecond
+	f := newUVLock(t, byPATH("archive-v0/envx"), 4, 6, 8)
+	uvEntries(t, f.cache, "archive-v0/envx", "archive-v0/stale")
+	o := options(t, f.proc, time.Now(), nil)
+	o.afterUVLock = func() { // a uv cache clean with a longer UV_LOCK_TIMEOUT opened capacity's file, and waits for it alone
+		f.addProc(t, 31, 1, "uv\x00cache\x00clean\x00", "UV_LOCK_TIMEOUT=0.4\x00")
+		var st syscall.Stat_t
+		must(t, syscall.Stat(f.lock, &st))
+		b, err := os.ReadFile(filepath.Join(f.proc, "locks"))
+		must(t, err)
+		write(t, filepath.Join(f.proc, "locks"), string(b)+fmt.Sprintf("9: -> FLOCK  ADVISORY  WRITE 31 %02x:%02x:%d 0 EOF\n",
+			f.id.major, f.id.minor, st.Ino))
+	}
+	start := time.Now()
+	g := f.run(t, o)
+	if !f.around(g) || !strings.Contains(g.Detail, "waited for it past 500ms") || time.Since(start) < 500*time.Millisecond {
+		t.Fatalf("a clean is waited out as long as its own lock timeout: %s %q %q after %s", g.Action, g.Why, g.Detail, time.Since(start))
+	}
+}
+
+func TestAStopDuringThePruneAroundWaitsForTheOldLockFile(t *testing.T) {
+	seen := make(chan os.Signal, 4)
+	signal.Notify(seen, syscall.SIGHUP) // the test's own, so the stop it sends does not end it
+	defer signal.Stop(seen)
+	f := newUVLock(t, byPATH("archive-v0/envx"), 4, 6, 8)
+	uvEntries(t, f.cache, "archive-v0/envx", "archive-v0/stale")
+	o := options(t, f.proc, time.Now(), nil)
+	o.afterUVLock = func() { must(t, syscall.Kill(os.Getpid(), syscall.SIGHUP)) } // the old file is aside now
+	if g := f.run(t, o); !f.around(g) {
+		t.Fatalf("the prune runs: %s %q", g.Action, g.Why)
+	}
+	n := 0
+	for done := time.After(2 * time.Second); n < 2; n++ {
+		select {
+		case <-seen:
+		case <-done:
+			t.Fatalf("a stop that came while the old lock file was aside is sent on once it is back: %d of 2", n)
+		}
+	}
+}
+
+func TestAJobThatNamesTheCacheOrAnotherBucketNamesNoEnvironment(t *testing.T) {
+	for name, word := range map[string]string{"the cache": "", "another bucket": "/git-v1/checkouts"} {
+		t.Run(name, func(t *testing.T) {
+			f := newUVLock(t, func(cache, lock string) []fakeProc { return []fakeProc{{pid: 4, ppid: 1, argv: []string{"bash"}}} })
+			uvEntries(t, f.cache, "archive-v0/stale")
+			o := options(t, f.proc, time.Now(), fakeJobs{units: map[string]string{"u.service": "Environment=UV_CACHE_DIR=" +
+				f.cache + word + "\nExecStart=/usr/bin/true\n"}})
+			g := f.run(t, o)
+			if !g.Done || !f.pruned(false) {
+				t.Fatalf("a job that names the cache, or a place in no bucket of environments, leaves uv's own prune to run: %s %q %v",
+					g.Action, g.Why, f.ran)
+			}
+		})
+	}
+}
+
+func TestAJobThatStartsAnInterpreterThroughALinkKeepsItsEnvironment(t *testing.T) {
+	base := t.TempDir()
+	f := newUVLock(t, func(cache, lock string) []fakeProc { return nil })
+	uvEntries(t, f.cache, "environments-v2/proj-cpython3.12-1", "archive-v0/stale")
+	must(t, os.MkdirAll(filepath.Join(base, "proj"), 0o755))
+	must(t, os.Symlink(filepath.Join(f.cache, "environments-v2", "proj-cpython3.12-1"), filepath.Join(base, "proj", ".venv")))
+	o := options(t, f.proc, time.Now(), fakeJobs{units: map[string]string{"srv.service": "ExecStart=" +
+		filepath.Join(base, "proj", ".venv", "bin", "python") + " /srv/serve.py\n"}})
+	g := f.run(t, o)
+	if !f.around(g) {
+		t.Fatalf("a job that starts an environment's interpreter through a link keeps the environment: %s %q %v", g.Action, g.Why, f.ran)
+	}
+	left(t, f.cache, []string{"environments-v2/proj-cpython3.12-1"}, []string{"archive-v0/stale"})
+}
+
+func TestAProcessThatCameThroughAWheelsPointerKeepsThePrune(t *testing.T) {
+	f := newUVLock(t, byPATH("archive-v0/envx"), 4, 6, 8)
+	uvEntries(t, f.cache, "archive-v0/envx", "archive-v0/stale")
+	pointer := filepath.Join(f.cache, "wheels-v6", "pypi", "pkg", "1.0-py3-none-any")
+	must(t, os.MkdirAll(filepath.Dir(pointer), 0o755))
+	must(t, os.Symlink("../../../archive-v0/stale", pointer))
+	o := options(t, f.proc, time.Now(), nil)
+	o.afterUVLock = func() { // started by a path through a wheel's pointer, which leads into archive-v0
+		f.addProc(t, 14, 1, filepath.Join(pointer, "lib", "x.so")+"\x00", "")
+	}
+	g := f.run(t, o)
+	if g.Done || g.Action != ActReport {
+		t.Fatalf("a path in another bucket a later look cannot resolve keeps the prune: %s %q %v", g.Action, g.Why, f.ran)
+	}
+	left(t, f.cache, []string{"archive-v0/envx", "archive-v0/stale"}, nil)
+}
+
+func TestAnEntryTheUserMayNotWriteGoesAsUVWouldDeleteIt(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes every directory")
+	}
+	// a wheel can unpack a directory without write permission; uv makes it writable before it deletes it
+	f := newUVLock(t, byPATH("archive-v0/envx"), 4, 6, 8)
+	uvEntries(t, f.cache, "archive-v0/envx", "archive-v0/readonly", "archive-v0/innerro")
+	ro := filepath.Join(f.cache, "archive-v0", "readonly")
+	inner := filepath.Join(f.cache, "archive-v0", "innerro", "lib")
+	must(t, os.Chmod(ro, 0o555))
+	must(t, os.Chmod(inner, 0o555))
+	t.Cleanup(func() { os.Chmod(ro, 0o755); os.Chmod(inner, 0o755) })
+	g := f.run(t, options(t, f.proc, time.Now(), nil))
+	if !f.around(g) || strings.Contains(g.Detail, "could not") {
+		t.Fatalf("an entry the user may not write goes: %s %q %q", g.Action, g.Why, g.Detail)
+	}
+	left(t, f.cache, []string{"archive-v0/envx"}, []string{"archive-v0/readonly", "archive-v0/innerro", uvTrash})
+}
+
 func TestAStopThatComesWhileTheLockIsAsideEndsTheRunAfterIt(t *testing.T) {
 	seen := make(chan os.Signal, 2)
 	signal.Notify(seen, syscall.SIGHUP) // the test's own, so the stop it sends does not end it
@@ -375,14 +485,23 @@ func TestAStopThatComesWhileTheLockIsAsideEndsTheRunAfterIt(t *testing.T) {
 
 func TestALockFileAnEarlierRunSetAsideIsPutBack(t *testing.T) {
 	for _, c := range []struct {
-		name string
-		held bool
-	}{{"nothing holds the one in place", false}, {"a uv process holds the one in place", true}} {
+		name      string
+		held, due bool
+		half      bool // killed between the link and the rename: the file aside is the one in place
+	}{
+		{"nothing holds the one in place", false, true, false},
+		{"no prune is due", false, false, false},
+		{"a uv process holds the one in place", true, true, false},
+		{"the run was killed before its rename", true, true, true},
+	} {
 		t.Run(c.name, func(t *testing.T) {
-			f := newUVLock(t, outside, 4, 6)
-			// the earlier run was killed under its lock: its file is in the lock file's place, the old one aside
-			must(t, os.Rename(f.lock, f.lock+uvAsideSuffix))
-			write(t, f.lock, "")
+			f := newUVLock(t, func(cache, lock string) []fakeProc { return []fakeProc{{pid: 4, ppid: 1, argv: []string{"bash"}}} })
+			if c.half {
+				must(t, os.Link(f.lock, f.lock+uvAsideSuffix))
+			} else { // the earlier run was killed under its lock: its file is in the lock file's place, the old one aside
+				must(t, os.Rename(f.lock, f.lock+uvAsideSuffix))
+				write(t, f.lock, "")
+			}
 			var st syscall.Stat_t
 			must(t, syscall.Stat(f.lock, &st))
 			if c.held {
@@ -391,14 +510,25 @@ func TestALockFileAnEarlierRunSetAsideIsPutBack(t *testing.T) {
 				write(t, filepath.Join(f.proc, "locks"), string(b)+fmt.Sprintf("9: FLOCK  ADVISORY  READ 40 %02x:%02x:%d 0 EOF\n",
 					f.id.major, f.id.minor, st.Ino))
 			}
-			g := f.run(t, options(t, f.proc, time.Now(), nil))
+			o := options(t, f.proc, time.Now(), nil)
+			o.Tools, o.Rules = f.tools(nil), []string{RuleUV}
+			store := openStore(t)
+			if !c.due { // under its size, and pruned a moment ago
+				o.Tools = f.tools(map[string]string{"uv cache size": "1000\n"})
+				must(t, store.SetMark(context.Background(), "prune:uv", time.Now()))
+			}
+			res, err := Run(context.Background(), Config{Live: []string{RuleUV}}.Normal(), store, o)
+			must(t, err)
+			g := findings(res, RuleUV)[f.cache]
 			var now syscall.Stat_t
 			must(t, syscall.Stat(f.lock, &now))
 			switch {
-			case c.held && (g.Done || !strings.Contains(g.Why, "set the cache's lock file aside") || now.Ino != st.Ino):
+			case c.half && (exists(f.lock+uvAsideSuffix) || now.Ino != st.Ino):
+				t.Fatalf("a second link to the file in place goes, and the file stays: %s %q", g.Action, g.Why)
+			case c.held && !c.half && (g.Done || !strings.Contains(g.Why, "set the cache's lock file aside") || now.Ino != st.Ino):
 				t.Fatalf("with the one in place held, the old file waits aside and the rule waits: %s %q", g.Action, g.Why)
-			case !c.held && (now.Ino != f.id.ino || exists(f.lock+uvAsideSuffix) || !g.Done):
-				t.Fatalf("with nothing on the one in place, the old file goes back and the rule goes on: %s %q", g.Action, g.Why)
+			case !c.held && (now.Ino != f.id.ino || exists(f.lock+uvAsideSuffix)):
+				t.Fatalf("with nothing on the one in place, the old file goes back, a prune due or not: %s %q", g.Action, g.Why)
 			}
 		})
 	}
@@ -752,10 +882,11 @@ func TestADryRunSaysWhatAPruneAroundKeeps(t *testing.T) {
 	f := newUVLock(t, byPATH("archive-v0/envx"), 4, 6, 8)
 	uvEntries(t, f.cache, "archive-v0/envx", "archive-v0/stale")
 	blob(t, filepath.Join(f.cache, "archive-v0", "envx", "lib", "big.so"), 3<<20)
+	blob(t, filepath.Join(f.cache, "builds-v0", ".tmpB", "lib", "big.so"), 2<<20)
 	o := options(t, f.proc, time.Now(), nil)
 	o.DryRun = true
 	g := f.run(t, o)
-	if g.Done || g.Action != ActDelete || !strings.Contains(g.Detail, "it keeps 1 environment and what they reach (3 MiB)") {
+	if g.Done || g.Action != ActDelete || !strings.Contains(g.Detail, "it keeps 1 environment and what they reach (3 MiB), and builds-v0 (2 MiB)") {
 		t.Fatalf("a dry run says the prune would run around the environment: %s %q %q", g.Action, g.Why, g.Detail)
 	}
 	left(t, f.cache, []string{"archive-v0/envx", "archive-v0/stale"}, nil)

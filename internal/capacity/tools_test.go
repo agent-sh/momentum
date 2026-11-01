@@ -345,6 +345,7 @@ type uvLockFixture struct {
 	ran               []string
 	lockedAtPrune     *bool
 	handedLock        *bool
+	asideAtPrune      *bool // whether an old lock file was set aside when uv's prune ran: the prune deletes it
 }
 
 // uvEnv is a uv process's environment; started is the one uv gives a command it starts: an environment's bin put
@@ -369,7 +370,7 @@ func newUVLock(t *testing.T, procs func(cache, lock string) []fakeProc, holders 
 // newUVLockIn is newUVLock with the cache at a path of the test's choosing.
 func newUVLockIn(t *testing.T, cache string, procs func(cache, lock string) []fakeProc, holders ...int) *uvLockFixture {
 	t.Helper()
-	f := &uvLockFixture{cache: cache, lockedAtPrune: new(bool), handedLock: new(bool)}
+	f := &uvLockFixture{cache: cache, lockedAtPrune: new(bool), handedLock: new(bool), asideAtPrune: new(bool)}
 	f.lock = filepath.Join(f.cache, ".lock")
 	write(t, f.lock, "")
 	must(t, os.Chmod(f.lock, 0o666))
@@ -449,6 +450,14 @@ func (u lockCheckingUV) UV(ctx context.Context, d time.Duration, args ...string)
 			*u.f.lockedAtPrune = syscall.Flock(int(fh.Fd()), syscall.LOCK_SH|syscall.LOCK_NB) != nil
 			fh.Close()
 		}
+		*u.f.asideAtPrune = exists(u.f.lock + uvAsideSuffix)
+		// as uv's prune does, it removes every file at the top of the cache but its markers and its lock
+		ents, _ := os.ReadDir(u.f.cache)
+		for _, e := range ents {
+			if !e.IsDir() && !slices.Contains([]string{"CACHEDIR.TAG", ".gitignore", ".git", ".lock"}, e.Name()) {
+				os.Remove(filepath.Join(u.f.cache, e.Name()))
+			}
+		}
 	}
 	return u.fakeTools.UV(ctx, d, args...)
 }
@@ -526,7 +535,7 @@ func fromCache(cmd func(cache string) fakeProc) func(cache, lock string) []fakeP
 func TestAUVPruneTakesTheLockWhenItsHoldersAllRunOutsideTheCache(t *testing.T) {
 	f := newUVLock(t, outside, 4, 6)
 	g := f.run(t, options(t, f.proc, time.Now(), nil))
-	if !g.Done || !f.pruned(true) || f.pruned(false) {
+	if !g.Done || !f.pruned(true) || f.pruned(false) || strings.Contains(g.Detail, "old lock file") || *f.asideAtPrune {
 		t.Fatalf("with every holder outside the cache, the prune runs with --force: %+v %v", g, f.ran)
 	}
 	if !*f.lockedAtPrune {
@@ -534,8 +543,9 @@ func TestAUVPruneTakesTheLockWhenItsHoldersAllRunOutsideTheCache(t *testing.T) {
 	}
 	var st syscall.Stat_t
 	must(t, syscall.Stat(f.lock, &st))
-	if st.Ino != f.id.ino || exists(f.lock+uvAsideSuffix) {
-		t.Errorf("the old lock file is back in its place, its holders on it: inode %d (was %d)", st.Ino, f.id.ino)
+	if st.Ino == f.id.ino || st.Mode&0o777 != 0o666 || exists(f.lock+uvAsideSuffix) {
+		t.Errorf("the lock file in place is a new file with the old one's mode, and none is set aside (uv's prune would "+
+			"delete it; the holders run outside the cache): inode %d (was %d), mode %o", st.Ino, f.id.ino, st.Mode&0o777)
 	}
 	fh, err := os.Open(f.lock)
 	must(t, err)
@@ -1201,7 +1211,7 @@ func TestTheLocksAreReadByTheFilesystemsDeviceToo(t *testing.T) {
 
 func TestALockFileThatChangedSinceTheLookIsNotReplaced(t *testing.T) {
 	f := newUVLock(t, outside, 4, 6)
-	held, why := uvSwap{lk: uvLockState{file: f.lock, id: lockID{f.id.major, f.id.minor, f.id.ino + 7}}, procRoot: f.proc}.lockInPlace(nil)
+	held, _, why := uvSwap{lk: uvLockState{file: f.lock, id: lockID{f.id.major, f.id.minor, f.id.ino + 7}}, procRoot: f.proc}.lockInPlace(nil, false)
 	if held != nil || !strings.Contains(why, "changed since the look") {
 		t.Errorf("a lock file that is not the one the look saw is left as it is: %v %q", held, why)
 	}
