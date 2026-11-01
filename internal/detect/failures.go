@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"path"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -221,8 +223,10 @@ var (
 	harnessRe = regexp.MustCompile(`(?i)^(this agent is isolated in the worktree|permission for this command was denied|claude code holds|blocked:|` +
 		`permission to use \S+ (?:with command .*? )?has been denied|permission for this (?:action|tool use) (?:has been|was) denied|` +
 		`this action was denied by the claude code auto mode classifier)`)
-	// deniedCmdRe is Claude Code's deny of a command by a rule: what it ran stays out of the key but its program.
-	deniedCmdRe = regexp.MustCompile(`(?i)^permission to use (\S+) with command (\S+).*? has been denied`)
+	// deniedCmdRe is Claude Code's deny of a command by a rule: what it ran stays out of the key but its programs.
+	deniedCmdRe = regexp.MustCompile(`(?i)^permission to use (\S+) with command (.*?) has been denied`)
+	// ansiRe is a terminal's escape sequence, which colours a line and is no part of its words.
+	ansiRe = regexp.MustCompile("\x1b\\[[0-9;?]*[A-Za-z]|\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)")
 	// headerRe is what a harness prints before a failed command's output: Claude Code's exit code; Codex's exit code
 	// and wall time, or its chunk, wall time, exit code and token count, up to its output.
 	headerRe = regexp.MustCompile(`(?is)^(?:exit code:? -?\d+\s*(?:wall time:.*?output:\s*)?|chunk id:.*?output:\s*)`)
@@ -238,12 +242,13 @@ var (
 	workRe = regexp.MustCompile(`(?i)(--- fail:|^fail\s|\sfail\s+[\w./-]+\s+[\d.]+s|panic: test timed out|\bpanicked at\b|` +
 		`\b\w[\w./-]*\.(?:go|rs|py|ts|tsx|js|c|cc|cpp|h|java|kt|swift):\d+:\d+:|\berror\[e\d{4}\]|assertionerror|\btests? failed\b|` +
 		`\b\d+ failed(?:,| in )|\bfailed [\w./-]+::\S|\bfailed \((?:failures|errors)=|\btest result: failed\b|\b\d+ failing\b|` +
-		`[✗✖]|lint(?:er)? (?:error|failed))`)
+		`=+ (?:failures|errors) =+|(?:^|\s)(?:fail|error): test\w* \(|[✗✖●]|lint(?:er)? (?:error|failed))`)
 	// infraRe are the marks of a failure of the setup rather than of the work: a command, an option or a file that
 	// is not there, an access refused, a network, a lock or a resource that failed, a usage message.
 	infraRe = regexp.MustCompile(`(?i)(command not found|not found in path|no such command|no such file or directory|\bsh: \d+: [^\s:]+: not found|` +
 		`unknown (?:option|flag|command|subcommand|parameter|argument|shorthand)|flag provided but not defined|` +
-		`unrecognized (?:option|argument|arguments)|invalid (?:option|argument|choice|value|flag)|\busage: |accepts \d+ arg|requires (?:an|at least|exactly) \w+ arg|` +
+		`unrecognized (?:option|argument|arguments)|invalid (?:option|argument|choice|value|flag)|\busage: \S+(?: [a-z][\w-]*)* [\[<-]|accepts \d+ arg|` +
+		`requires (?:an|at least|exactly) \w+ arg|` +
 		`not a git repository|permission denied|operation not permitted|read-only file system|no space left|connection (?:refused|reset|timed out)|` +
 		`couldn'?t connect to server|could not resolve host|temporary failure in name resolution|name or service not known|address already in use|` +
 		`\b(?:etimedout|enotfound|econnrefused|econnreset|eai_again|ehostunreach|enetunreach|eaddrinuse)\b|cannot allocate memory|out of memory|` +
@@ -265,7 +270,7 @@ var (
 // setup's failure or says nothing to key it by: the owner's own no, and a call the harness cancelled because
 // another one beside it failed.
 func FailureOf(harness, tool, text, call string) (FailureKey, bool) {
-	text = strings.TrimSpace(text)
+	text = strings.TrimSpace(ansiRe.ReplaceAllString(text, ""))
 	wrapped := strings.HasPrefix(text, "<tool_use_error>")
 	text = strings.TrimSpace(strings.TrimPrefix(text, "<tool_use_error>"))
 	if text == "" || ownerNoRe.MatchString(text) {
@@ -297,7 +302,7 @@ func FailureOf(harness, tool, text, call string) (FailureKey, bool) {
 	if harnessRe.MatchString(text) {
 		key := firstClause(text)
 		if m := deniedCmdRe.FindStringSubmatch(text); m != nil {
-			key = "permission to use " + m[1] + " with command " + path.Base(m[2]) + " has been denied"
+			key = "permission to use " + m[1] + " with command " + programsOf(m[2]) + " has been denied"
 		} else if i := strings.Index(key, ": "); i >= 0 {
 			if j := strings.Index(key[i+2:], ": "); j >= 0 { // a refusal's kind, not the call it quotes after it
 				key = key[:i+2+j]
@@ -317,7 +322,8 @@ func FailureOf(harness, tool, text, call string) (FailureKey, bool) {
 			}
 			return FailureKey{Origin: "tool:" + slug(tool, 30), Text: Norm(firstClause(msg), keyChars)}, true
 		}
-		if m := hermesExit.FindStringSubmatch(text); m != nil && m[1] != "0" {
+		// an exit of 0 is no failure; one past the store's cut is not in view, and the result is flagged an error
+		if m := hermesExit.FindStringSubmatch(text); m == nil || m[1] != "0" {
 			if o := hermesOutRe.FindStringSubmatch(text); o != nil {
 				return execKey(unescape(o[1]), callPrograms(call))
 			}
@@ -369,15 +375,16 @@ var sentenceRe = regexp.MustCompile(`[.;!?]\s`)
 // tailRe is the word after a mark when a colon follows it.
 var tailRe = regexp.MustCompile(`^:\s+([^\s,;]{1,40})`)
 
-// execKey keys a failed command's output by the message that holds its first mark of the setup failing (infraRe),
-// read in the output with what varies taken out (mask) but the mark, so a path or a quoted name is one letter
-// whatever its length:
-//   - The message ends at the mark, with the word after it when a colon follows (zsh's "command not found: foo",
-//     the host that does not resolve); a usage message, at the word that names its program.
+// execKey keys a failed command's output by the message that holds its first mark of the setup failing (infraRe)
+// outside a quoted value, read in the output with what varies taken out (mask) but the mark, so a path or a
+// quoted name is one letter whatever its length:
+//   - The message ends at the mark, with what follows its colon: another mark (Node's "ENOENT: no such file or
+//     directory"), or one word (zsh's "command not found: foo", the host that does not resolve). A usage message
+//     ends at the program it names.
 //   - It starts at the name of a program the call ran, the closest before the mark within reach ("ls: ", "curl:
-//     "): a program's message opens with its name, and its later words may end in a colon too ("after 0 ms: ").
-//     Else it starts at the name closest before the mark ("connect: ", "FileNotFoundError: "), else at the three
-//     words before it; never before a sentence's end.
+//     "): a program's message opens with its name, and its later words may end in a colon too ("after 0 ms: "),
+//     though an exception's name after it ("ModuleNotFoundError: ") opens a message of its own. Else it starts at
+//     the name closest before the mark ("connect: "), else at the mark; never before a sentence's end.
 //
 // The key holds no program of its own: where a program is known, its name opens the message, and a word of the
 // output alone does not say that it named one. An output that shows the work failing has no key.
@@ -386,16 +393,14 @@ func execKey(out string, programs map[string]bool) (FailureKey, bool) {
 	if workRe.MatchString(out) {
 		return FailureKey{}, false
 	}
-	loc := infraRe.FindStringIndex(out)
+	loc := firstMark(out)
 	if loc == nil {
 		return FailureKey{}, false
 	}
 	before, mark, after := out[:loc[0]], markText(out[loc[0]:loc[1]]), out[loc[1]:]
-	if strings.HasPrefix(mark, "usage") { // a usage message names its program after it, by its path or its name
-		if w := strings.Fields(clipBytes(after, 200)); len(w) > 0 {
-			mark += " " + strings.ToLower(strings.TrimRight(path.Base(strings.Trim(w[0], "'\"`")), ".,;:"))
-		}
-		return FailureKey{Origin: "exec", Text: cutWords(mark, execChars)}, true
+	if u, ok := strings.CutPrefix(strings.ToLower(out[loc[0]:loc[1]]), "usage: "); ok { // a usage message names its program first, by its path or its name
+		prog := strings.TrimRight(path.Base(strings.Trim(strings.Fields(u)[0], "'\"`")), ".,;:")
+		return FailureKey{Origin: "exec", Text: cutWords("usage: "+strings.ToLower(plain.Line(prog)), execChars)}, true
 	}
 	floor := 0
 	if ms := sentenceRe.FindAllStringIndex(before, -1); ms != nil {
@@ -403,43 +408,71 @@ func execKey(out string, programs map[string]bool) (FailureKey, bool) {
 	}
 	within := func(p int) bool { return len(mask(before[p:])) <= reach }
 	names := namesIn(before, floor)
-	start := -1
+	start := len(before)
 	for k := len(names) - 1; k >= 0 && within(names[k][0]); k-- {
 		if programs[strings.ToLower(before[names[k][0]:names[k][1]])] {
 			start = names[k][0]
+			for _, n := range names[k+1:] { // an exception's name after the program's opens a message of its own
+				if exceptionRe.MatchString(before[n[0]:n[1]]) {
+					start = n[0]
+				}
+			}
 			break
 		}
 	}
-	if start < 0 && len(names) > 0 && within(names[len(names)-1][0]) {
+	if start == len(before) && len(names) > 0 && within(names[len(names)-1][0]) {
 		start = names[len(names)-1][0]
-	}
-	if start < 0 {
-		start = wordsBack(before, floor, 3)
 	}
 	text := mask(before[start:])
 	if text != "" && strings.HasSuffix(before, " ") {
 		text += " "
 	}
 	text += mark
-	if t := tailRe.FindStringSubmatch(mask(clipBytes(after, 200))); t != nil {
-		if w := strings.TrimRight(t[1], ".)'\""); w != "" {
-			text += ": " + w
+	rest := clipBytes(after, 200)
+	if c, ok := strings.CutPrefix(rest, ": "); ok {
+		if next := firstMark(c); next != nil && next[0] == 0 { // what follows the colon is another mark
+			text += ": " + markText(c[:next[1]])
+		} else if t := tailRe.FindStringSubmatch(mask(rest)); t != nil {
+			if w := strings.TrimRight(t[1], ".)'\""); w != "" {
+				text += ": " + w
+			}
 		}
 	}
 	return FailureKey{Origin: "exec", Text: cutWords(text, execChars)}, true
 }
 
-// markText is a mark as a key keeps it: masked, but for an HTTP status, which says what failed, and but for what
-// the masks would leave of it no word of.
+// exceptionRe is an exception's name: Python's, Java's, JavaScript's (ModuleNotFoundError, IOException).
+var exceptionRe = regexp.MustCompile(`^(?:[\w.]+\.)?[A-Z][A-Za-z0-9]*(?:Error|Exception)$`)
+
+// quotedRe are the quoted values of an output, inside which a mark is a value's word (a file named after an
+// error, a line of code), not what the command said.
+var quotedRe = regexp.MustCompile("'[^'\n]*'|\"[^\"\n]*\"|`[^`\n]*`|‘[^’\n]*’|“[^”\n]*”")
+
+// firstMark is where the first mark of the setup failing outside a quoted value is in out, or nil.
+func firstMark(out string) []int {
+	quoted := quotedRe.FindAllStringIndex(out, -1)
+	for _, m := range infraRe.FindAllStringIndex(out, -1) {
+		in := false
+		for _, q := range quoted {
+			if m[0] > q[0] && m[0] < q[1] {
+				in = true
+				break
+			}
+		}
+		if !in {
+			return m
+		}
+	}
+	return nil
+}
+
+// markText is a mark as a key keeps it: masked (a line's number, a lock's path), but for an HTTP status, which
+// says what failed.
 func markText(raw string) string {
-	m := strings.ToLower(strings.TrimSpace(raw))
-	if strings.HasPrefix(m, "http ") {
+	if m := strings.ToLower(strings.TrimSpace(raw)); strings.HasPrefix(m, "http ") {
 		return m
 	}
-	if mm := mask(raw); mm != "" && !masked(mm) {
-		return mm
-	}
-	return m
+	return mask(raw)
 }
 
 // namesIn are the names before a colon and a space in s from floor on, in order, as [start, end) pairs: a word
@@ -469,19 +502,6 @@ func nameByte(b byte) bool {
 	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_' || b == '.' || b == '+' || b == '-'
 }
 
-// wordsBack is where the last n words of s from floor on start.
-func wordsBack(s string, floor, n int) int {
-	i := len(s)
-	for k := 0; k < n; k++ {
-		j := strings.LastIndexByte(strings.TrimRight(s[floor:i], " "), ' ')
-		if j < 0 {
-			return floor
-		}
-		i = floor + j + 1
-	}
-	return i
-}
-
 // clipBytes is s cut to at most n bytes, at a character.
 func clipBytes(s string, n int) string {
 	if len(s) <= n {
@@ -508,6 +528,23 @@ var (
 		"!": true, "if": true, "then": true, "else": true, "elif": true, "do": true, "while": true, "until": true}
 )
 
+// programsOf names the programs of a command line, joined with "+", but cd when they are more: what a rule that
+// refused it was about.
+func programsOf(cmd string) string {
+	var out []string
+	for p := range commandPrograms(cmd) {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	if len(out) > 1 {
+		out = slices.DeleteFunc(out, func(p string) bool { return p == "cd" })
+	}
+	if len(out) == 0 {
+		return "a command"
+	}
+	return strings.Join(out, "+")
+}
+
 // callPrograms are the programs a shell call runs, by name: the first word of each command of its input, past
 // assignments and the wrappers that run another program, as a base name. The store keeps a call's first 240
 // bytes, so the programs of a long command's end are not known; nor is a here-document's text a command.
@@ -516,7 +553,11 @@ func callPrograms(call string) map[string]bool {
 	if m == nil {
 		return nil
 	}
-	cmd := unescape(m[1])
+	return commandPrograms(unescape(m[1]))
+}
+
+// commandPrograms are the programs a command line runs, by name.
+func commandPrograms(cmd string) map[string]bool {
 	if i := strings.Index(cmd, "<<"); i >= 0 {
 		cmd = cmd[:i]
 	}

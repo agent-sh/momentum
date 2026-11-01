@@ -71,20 +71,24 @@ func signatures(fs []store.Finding) []string {
 // address, a number, an id) is taken out, and so is the punctuation that ends it.
 func TestNormKeysTwoSightingsAlike(t *testing.T) {
 	for _, pair := range [][2]string{
-		{"pgrep -f 'dbtest.py' also matches the shell (pid 4312) in /home/u/x/run.sh at 0x7f3a2c1b.",
-			"pgrep -f 'bench.sh 12' also matches the shell (pid 77) in ~/y/z.py at 0x11aa22bb"},
+		{"a match on 'dbtest.py' takes the shell too (pid 4312) in /home/u/x/run.sh at 0x7f3a2c1b.",
+			"a match on 'bench.sh 12' takes the shell too (pid 77) in ~/y/z.py at 0x11aa22bb"},
 		{"Error: can't open 'config.yaml'", "Error: can't open 'data.json'"},
 		{"request req_011CUjQ9xYzAbC failed", "request req_9ZZqT7mmK2pL failed"},
 		{"open internal/detect/testdata/a.json: permission denied", "open cmd/x/b.json: permission denied"},
 		{"fatal: bad object 3f1c9e2", "fatal: bad object 9ab04de"},
 		{"cat: notes.txt: No such file or directory", "cat: run-2.log: No such file or directory"},
 		{"deploy@build-a.example: Permission denied (publickey)", "git@forge.example.org: Permission denied (publickey)"},
+		{"cat: .venv/bin/activate: No such file or directory", "cat: venv/bin/activate: No such file or directory"},
+		{"cat: ./venv/bin/activate: No such file or directory", "cat: .config/app/settings.toml: No such file or directory"},
+		{"ls: cannot access ‘build’: No such file or directory", "ls: cannot access 'build': No such file or directory"},
+		{"ls: cannot access “build”: No such file or directory", "ls: cannot access `build': No such file or directory"},
 	} {
 		if a, b := Norm(pair[0], 80), Norm(pair[1], 80); a != b {
 			t.Errorf("%q and %q key apart: %q, %q", pair[0], pair[1], a, b)
 		}
 	}
-	if got := Norm("pgrep -f 'dbtest.py' also matches the shell (pid 4312) in /home/u/x/run.sh at 0x7f3a2c1b.", 80); got != "pgrep -f Q also matches the shell (pid N) in P at H" {
+	if got := Norm("a match on 'dbtest.py' takes the shell too (pid 4312) in /home/u/x/run.sh at 0x7f3a2c1b.", 80); got != "a match on Q takes the shell too (pid N) in P at H" {
 		t.Errorf("norm %q", got)
 	}
 	if got := Norm("Error: can't open 'config.yaml'", 80); got != "error: can't open Q" {
@@ -92,6 +96,9 @@ func TestNormKeysTwoSightingsAlike(t *testing.T) {
 	}
 	if got := Norm("it's 2'x' and 'y'", 80); got != "it's N'x' and Q" {
 		t.Errorf("a quote after a digit: %q", got)
+	}
+	if got := Norm("req xy12zw34 and xy12zw3 failed", 80); got != "req H and xyNzwN failed" {
+		t.Errorf("an id of 8 and a word of 7: %q", got)
 	}
 	if got := Norm(strings.Repeat("word ", 40), 23); got != "word word word word" {
 		t.Fatalf("cut %q", got)
@@ -118,20 +125,20 @@ func TestASignatureFitsTheStore(t *testing.T) {
 // whose output shows the work failing are no setup's failure. The guards, hooks and servers here are made up.
 func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 	for _, c := range []struct{ harness, tool, text, want string }{
-		{"claude", "Bash", "<tool_use_error>fence-guard: a loop with sleep and no deadline: it spins if the condition never comes",
-			"guard:fence-guard:a loop with sleep and no deadline: it spins if the condition never comes"},
-		{"claude", "Bash", "<tool_use_error>load-gate: held `go vet ./...`: the machine is busy, load 20.7 (limit 20).",
-			"guard:load-gate:held Q: the machine is busy, load N (limit N)"},
+		{"claude", "Bash", "<tool_use_error>fence-guard: a retry loop with no bound: give it a limit and a way out",
+			"guard:fence-guard:a retry loop with no bound: give it a limit and a way out"},
+		{"claude", "Bash", "<tool_use_error>load-gate: held `make check`: the box is full, 31 jobs (limit 30).",
+			"guard:load-gate:held Q: the box is full, N jobs (limit N)"},
 		// a hook's deny names its guard in lower case; Claude Code's own messages there open with a capital
-		{"claude", "Write", "<tool_use_error>ledger: a reviewer refused this note", "guard:ledger:a reviewer refused this note"},
-		{"claude", "Write", "ledger: a reviewer refused this note", "tool:write:ledger: a reviewer refused this note"},
+		{"claude", "Write", "<tool_use_error>ledger: this note names no source", "guard:ledger:this note names no source"},
+		{"claude", "Write", "ledger: this note names no source", "tool:write:ledger: this note names no source"},
 		{"claude", "Grep", "<tool_use_error>Error: No such tool available: Grep", "tool:grep:error: no such tool available: grep"},
-		{"claude", "Write", "Held for the owner's review as rule r7 by the ledger mod: the call waits", "guard:ledger:held for the owner's review as rule rN by the ledger"},
+		{"claude", "Write", "Held for the owner's review as item 7 by the ledger: it waits", "guard:ledger:held for the owner's review as item N by the ledger"},
 		// a hook by the name its message opens with, the command in Claude Code's brackets, or none
-		{"claude", "Bash", "PreToolUse:Bash hook error: deep-scan guard: `rg x` over ~ is a scan of the whole home",
-			"guard:deep-scan-guard:Q over P is a scan of the whole home"},
-		{"claude", "Bash", "PreToolUse:Bash hook error: keeper-check: Gate C can't be recorded: run the check first", "guard:keeper-check:gate c can't be recorded: run the check first"},
-		{"claude", "Write", "PreToolUse:Write hook error: keeper-check: Gate C can't be recorded: run the check first", "guard:keeper-check:gate c can't be recorded: run the check first"},
+		{"claude", "Bash", "PreToolUse:Bash hook error: deep-scan guard: `find /` reads every disk",
+			"guard:deep-scan-guard:Q reads every disk"},
+		{"claude", "Bash", "PreToolUse:Bash hook error: keeper-check: step B is not recorded: record it first", "guard:keeper-check:step b is not recorded: record it first"},
+		{"claude", "Write", "PreToolUse:Write hook error: keeper-check: step B is not recorded: record it first", "guard:keeper-check:step b is not recorded: record it first"},
 		{"claude", "Edit", "PreToolUse:Edit hook error: [~/.claude/hooks/fence.sh]: the edit touches a lock", "guard:fence:the edit touches a lock"},
 		{"claude", "Edit", "PreToolUse:Edit hook error: Blocked by policy", "guard:hook:blocked by policy"},
 		{"claude", "Bash", "PreToolUse:Bash hook error: Error: the command touches main", "guard:hook:error: the command touches main"},
@@ -148,6 +155,8 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 			"harness:claude:permission for this action was denied by the claude code auto mode classifier"},
 		{"claude", "Bash", "This action was denied by the Claude Code auto mode classifier. Reason: it deletes a tree",
 			"harness:claude:this action was denied by the claude code auto mode classifier"},
+		{"claude", "Bash", "Permission to use Bash with command cd /srv/app && git push origin main has been denied.", "harness:claude:permission to use bash with command git has been denied"},
+		{"claude", "Bash", "Permission to use Bash with command timeout 60 /usr/bin/curl -s x has been denied.", "harness:claude:permission to use bash with command curl has been denied"},
 		{"claude", "mcp__web-tools__fetch", "tool failed: spawn failed for /usr/bin/x: spawn /usr/bin/x ENOENT",
 			"mcp:web-tools:tool failed: spawn failed for P: spawn P enoent"},
 		// Hermes: a tool's error, a guard inside one, a command that exits otherwise than 0, code that failed
@@ -157,6 +166,8 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		{"hermes", "terminal", `{"output": "== x: usage: fake-repo-check [-h] --repo REPO", "exit_code": 2, "error": null}`, "exec:usage: fake-repo-check"},
 		{"claude", "Bash", "Exit code 2 usage: /opt/tools/bin/x-tool [-h] --repo REPO", "exec:usage: x-tool"},
 		{"hermes", "terminal", `{"output": "ls: cannot access 'x': No such file or directory", "exit_code": 0, "error": null}`, ""},
+		{"hermes", "terminal", `{"output": "cat: a.txt: No such file or directory and more output past the store's cut`, "exec:cat: P: no such file or directory"},
+		{"hermes", "execute_code", "ModuleNotFoundError: No module named 'yaml'", "exec:modulenotfounderror: no module named"},
 		{"hermes", "execute_code", `{"status": "error", "output": "Traceback (most recent call last):\n  File \"x.py\", line 3, in <module>\nModuleNotFoundError: No module named 'yaml'"}`,
 			"exec:modulenotfounderror: no module named"},
 		// Codex: a script's error, its commands under either header, the stdin it writes
@@ -167,6 +178,8 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		{"codex", "exec_command", "Chunk ID: 9b1e44 Wall time: 1.2034 seconds Process exited with code 1 Original token count: 30 Output: fatal: unable to access 'https://x/y.git/': Could not resolve host: x",
 			"exec:fatal: unable to access Q: could not resolve host: x"},
 		{"codex", "shell", "Exit code: 1 Wall time: 0.2 seconds Output: connection refused", "exec:connection refused"},
+		{"codex", "exec_command", "Chunk ID: 1a Wall time: 0.1 seconds Process exited with code 1 Original token count: 3 Output: connection refused", "exec:connection refused"},
+		{"pi", "bash_output", "ls: cannot access 'a.txt': No such file or directory", "exec:ls: cannot access Q: no such file or directory"},
 		{"codex", "write_stdin", "Chunk ID: 1a Wall time: 1.0 seconds Process exited with code 1 Original token count: 3 Output: cat: a.txt: No such file or directory",
 			"exec:cat: P: no such file or directory"},
 		{"codex", "exec_command", "bash: rgg: command not found", "exec:rgg: command not found"},
@@ -184,6 +197,18 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		{"claude", "Bash", "Exit code 1 === RUN TestX --- PASS (0.00s) dial tcp: connection refused", "exec:tcp: connection refused"},
 		{"claude", "Bash", "Exit code 1 cat: /x/y.txt: No such file or directory", "exec:cat: P: no such file or directory"},
 		{"claude", "Bash", "Exit code 128 fatal: Unable to create '/r/.git/index.lock': File exists.", "exec:fatal: unable to create Q: file exists"},
+		// Node's error code and its message, a mark in a quoted value, a usage line in colour and none
+		{"claude", "Bash", "Exit code 1 Error: ENOENT: no such file or directory, open '/srv/app/a.json'", "exec:error: enoent: no such file or directory"},
+		{"claude", "Bash", "Exit code 2 grep: 'connection refused': No such file or directory", "exec:grep: Q: no such file or directory"},
+		{"claude", "Bash", "Exit code 1 Traceback (most recent call last): File \"x.py\", line 9, in <module> if \"no module named\" in err: raise", ""},
+		{"claude", "Bash", "Exit code 2 usage: \x1b[1mx-tool\x1b[0m [-h] --repo REPO", "exec:usage: x-tool"},
+		{"claude", "Bash", "Exit code 1 CPU usage: 12.5% memory usage: 40% check failed", ""},
+		{"claude", "Bash", "Exit code 1 httpx.ConnectError: [Errno -3] Temporary failure in name resolution", "exec:httpx.connecterror: [errno -N] temporary failure in name resolution"},
+		{"claude", "Bash", "Exit code 1 9lives: connection refused", "exec:connection refused"},
+		{"claude", "Bash", "Exit code 1 x:y connection refused", "exec:connection refused"},
+		{"claude", "Bash", "Exit code 1 x: failed(connection refused)", "exec:x: failed(connection refused"},
+		{"claude", "Bash", "Exit code 127 zsh: command not found: rgg.", "exec:zsh: command not found: rgg"},
+		{"claude", "Bash", "Exit code 127 zsh: command not found: " + strings.Repeat("x", 45), "exec:zsh: command not found: " + strings.Repeat("x", 40)},
 		{"claude", "Read", "File does not exist. Note: your current working directory is /home/u.", "tool:read:file does not exist. note: your current working directory is P"},
 		{"claude", "Bash", "<tool_use_error>Cancelled: parallel tool call Bash(go test) errored", ""},
 		{"claude", "Edit", "<tool_use_error>Cancelled: parallel tool call Bash(go test) errored", ""},
@@ -230,16 +255,21 @@ func TestACommandsFailureIsKeyedByItsMessage(t *testing.T) {
 		{`{"command":"go run ./cmd/server"}`, "exec:connect: connection refused", []string{
 			"Exit code 1 dial tcp 127.0.0.1:5432: connect: connection refused",
 			"Exit code 1 2026/03/02 10:00:00 dial tcp [::1]:5432: connect: connection refused"}},
-		{`{"command":"git push"}`, "exec:U: permission denied", []string{
+		{`{"command":"git push"}`, "exec:permission denied", []string{
 			"Exit code 128 git@github.com: Permission denied (publickey). fatal: Could not read from remote repository."}},
 		{`{"command":"rgg x"}`, "exec:rgg: command not found", []string{"Exit code 127 /bin/bash: line 1: rgg: command not found"}},
 		{`{"command":"rgg x"}`, "exec:zsh: command not found: rgg", []string{"Exit code 127 zsh: command not found: rgg"}},
-		{`{"command":"waitfor --timeout 1m --file x && wc -l x"}`, "exec:wc: P: no such file or directory", []string{
-			"Exit code 1 waitfor: done after 3s wc: x/y: No such file or directory", "Exit code 1 wc: x/z: No such file or directory"}},
+		{`{"command":"poll-ready --file x && wc -l x"}`, "exec:wc: P: no such file or directory", []string{
+			"Exit code 1 poll-ready: done after 3s wc: x/y: No such file or directory", "Exit code 1 wc: x/z: No such file or directory"}},
 		// a program's name past the reach or a sentence's end opens another message; with no name, three words
 		{`{"command":"ls x"}`, "exec:x: no such file or directory", []string{
 			"Exit code 2 ls: " + strings.Repeat("word ", 25) + "x: No such file or directory", "Exit code 2 ls: done. x: No such file or directory"}},
-		{`{"command":"run"}`, "exec:c d e connection refused", []string{"Exit code 1 a b c d e connection refused"}},
+		{`{"command":"run"}`, "exec:connection refused", []string{"Exit code 1 a b c d e connection refused", "Exit code 1 ok connection refused",
+			"Exit code 1 x: " + strings.Repeat("word ", 25) + "connection refused"}},
+		{`{"command":"ls x"}`, "exec:x: no such file or directory", []string{"Exit code 2 ls: done; x: No such file or directory",
+			"Exit code 2 ls: done! x: No such file or directory", "Exit code 2 ls: done? x: No such file or directory"}},
+		{`{"command":"poll-ready --file x; python3 run.py"}`, "exec:modulenotfounderror: no module named", []string{
+			"Exit code 1 poll-ready: gave up after 60s ModuleNotFoundError: No module named 'yaml'", "Exit code 1 ModuleNotFoundError: No module named 'yaml'"}},
 		{`{"command":"run"}`, "exec:sh: N: rgg: not found", []string{"Exit code 127 sh: 1: rgg: not found", "Exit code 127 sh: 7: rgg: not found"}},
 	} {
 		for _, out := range set.outs {
@@ -306,7 +336,10 @@ func TestEveryMarkSaysWhoseFailureItIs(t *testing.T) {
 		"FAILED tests/test_net.py::test_fetch - ConnectionRefusedError: [Errno 111] Connection refused",
 		"Ran 1 test in 0.001s FAILED (errors=1) FileNotFoundError: [Errno 2] No such file or directory: 'x'",
 		"test x ... FAILED No such file or directory test result: FAILED. 1 passed; 1 failed; 0 ignored",
-		"● reads › fails ENOENT: no such file or directory, open 'x' Tests: 1 failed, 1 total",
+		"● reads › fails ENOENT: no such file or directory, open 'x'",
+		"Tests: 1 failed, 1 total ENOENT: no such file or directory, open 'x'",
+		"collected 3 items ===== FAILURES ===== ____ test_reads ____ FileNotFoundError: [Errno 2] No such file or directory: 'x'",
+		"FAIL: test_reads (tests.test_io.TestIO) FileNotFoundError: [Errno 2] No such file or directory: 'x'",
 		"0 passing (5ms) 1 failing 1) reads: Error: ENOENT: no such file or directory",
 		"✖ reads a file (1.2ms) Error: ENOENT: no such file or directory",
 		"lint error: unused variable x, no such file or directory",
@@ -348,18 +381,18 @@ func TestACallNamesItsPrograms(t *testing.T) {
 // error) counts.
 func TestFailuresAreFoundWhenTheyRecur(t *testing.T) {
 	st := testStore(t)
-	deny := "<tool_use_error>fence-guard: pgrep -f 'x' also matches the shell running this command"
+	deny := "<tool_use_error>fence-guard: a process match on 'x' takes its own shell too"
 	curl := func(ms int) string {
 		return fmt.Sprintf("Exit code 7 curl: (7) Failed to connect to localhost port 8080 after %d ms: Connection refused", ms)
 	}
 	put(t, st, toolError("s1", "Bash", deny, t0), toolError("s1", "Bash", deny, t0.Add(time.Hour)), toolError("s2", "Bash", deny, t0.Add(2*time.Hour)),
 		// one session only: no finding
-		toolError("s3", "Bash", "<tool_use_error>fence-guard: an rm whose argument is a glob", t0),
-		toolError("s3", "Bash", "<tool_use_error>fence-guard: an rm whose argument is a glob", t0.Add(time.Minute)),
-		toolError("s3", "Bash", "<tool_use_error>fence-guard: an rm whose argument is a glob", t0.Add(2*time.Minute)),
+		toolError("s3", "Bash", "<tool_use_error>fence-guard: a wildcard delete", t0),
+		toolError("s3", "Bash", "<tool_use_error>fence-guard: a wildcard delete", t0.Add(time.Minute)),
+		toolError("s3", "Bash", "<tool_use_error>fence-guard: a wildcard delete", t0.Add(2*time.Minute)),
 		// two sightings in two sessions: no finding
-		toolError("s4", "Bash", "<tool_use_error>fence-guard: a session link would go into a commit", t0),
-		toolError("s5", "Bash", "<tool_use_error>fence-guard: a session link would go into a commit", t0),
+		toolError("s4", "Bash", "<tool_use_error>fence-guard: a private link in a commit message", t0),
+		toolError("s5", "Bash", "<tool_use_error>fence-guard: a private link in a commit message", t0),
 		// the work failing, not the setup
 		toolError("s4", "Bash", "Exit code 1 --- FAIL: TestX", t0), toolError("s5", "Bash", "Exit code 1 --- FAIL: TestX", t0), toolError("s6", "Bash", "Exit code 1 --- FAIL: TestX", t0),
 		// a result that is no error
@@ -371,15 +404,17 @@ func TestFailuresAreFoundWhenTheyRecur(t *testing.T) {
 		call("c2", "Bash", "t3", `{"command":"curl -s localhost:8080"}`, t0.Add(2*time.Hour)), result("c2", "Bash", "t3", curl(0), t0.Add(2*time.Hour+time.Second)),
 		call("c3", "Bash", "t4", `{"command":"curl -s localhost:8080"}`, t0.Add(5*time.Hour)), result("c3", "Bash", "t4", curl(0), t0.Add(30*time.Hour)),
 		result("c4", "Bash", "t5", curl(0), t0), call("c4", "Bash", "t5", `{"command":"curl -s localhost:8080"}`, t0.Add(time.Minute)),
+		// the window's first result, its call ten minutes before it
+		call("c5", "Bash", "t6", `{"command":"curl -s localhost:8080"}`, t0.Add(-30*time.Minute)), result("c5", "Bash", "t6", curl(0), t0.Add(-20*time.Minute)),
 	)
 	held := "load-gate: held `make`: the machine is busy"
 	put(t, st,
 		// the transcript's first deny again, 3 s on, its text the same: the same sighting
 		ev("mistakes", "s1", "deny", store.ActorHarness, "Bash", "Bash: "+strings.TrimPrefix(deny, "<tool_use_error>"), "", t0.Add(3*time.Second)),
 		// a refusal of the model, three times in two sessions
-		ev("mistakes", "s7", "refusal", store.ActorAgent, "", "This request triggered restrictions on violative content", "", t0),
-		ev("mistakes", "s8", "refusal", store.ActorAgent, "", "This request triggered restrictions on violative content", "", t0.Add(time.Hour)),
-		ev("mistakes", "s8", "refusal", store.ActorAgent, "", "This request triggered restrictions on violative content", "", t0.Add(2*time.Hour)),
+		ev("mistakes", "s7", "refusal", store.ActorAgent, "", "The model declined this request as written", "", t0),
+		ev("mistakes", "s8", "refusal", store.ActorAgent, "", "The model declined this request as written", "", t0.Add(time.Hour)),
+		ev("mistakes", "s8", "refusal", store.ActorAgent, "", "The model declined this request as written", "", t0.Add(2*time.Hour)),
 		// a hold of the mistakes log's own: 6 s after a failure of the transcript's, of another tool beside one, and alone;
 		// and one a second after the transcript's failure of its session and tool, which is that one
 		ev("mistakes", "s1", "held", store.ActorHarness, "Bash", "Bash: "+held, "", t0.Add(6*time.Second)),
@@ -387,9 +422,9 @@ func TestFailuresAreFoundWhenTheyRecur(t *testing.T) {
 		ev("mistakes", "s9", "held", store.ActorHarness, "Bash", "Bash: "+held, "", t0),
 		ev("mistakes", "s2", "held", store.ActorHarness, "Bash", "Bash: "+held, "", t0.Add(2*time.Hour+time.Second)),
 		// a deny of a guard of one word, which only the log's kind says is a guard's; and the turns' errors
-		ev("mistakes", "s10", "deny", store.ActorHarness, "Write", "Write: ledger: a reviewer refused this note", "", t0),
-		ev("mistakes", "s11", "deny", store.ActorHarness, "Write", "Write: ledger: a reviewer refused this note", "", t0),
-		ev("mistakes", "s11", "deny", store.ActorHarness, "Write", "Write: ledger: a reviewer refused this note", "", t0.Add(time.Minute)),
+		ev("mistakes", "s10", "deny", store.ActorHarness, "Write", "Write: ledger: this note names no source", "", t0),
+		ev("mistakes", "s11", "deny", store.ActorHarness, "Write", "Write: ledger: this note names no source", "", t0),
+		ev("mistakes", "s11", "deny", store.ActorHarness, "Write", "Write: ledger: this note names no source", "", t0.Add(time.Minute)),
 		ev("mistakes", "s12", "turn-error", store.ActorHarness, "", "API Error: 529 overloaded", "", t0),
 		ev("mistakes", "s13", "turn-error", store.ActorHarness, "", "API Error: 529 overloaded", "", t0),
 		ev("mistakes", "s13", "turn-error", store.ActorHarness, "", "API Error: 529 overloaded", "", t0.Add(time.Minute)),
@@ -399,17 +434,17 @@ func TestFailuresAreFoundWhenTheyRecur(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
-		"failures/v1:exec:curl: (N) failed to connect to localhost port N after N ms: connection refused 3",
-		"failures/v1:guard:fence-guard:pgrep -f Q also matches the shell running this command 3",
-		"failures/v1:guard:ledger:a reviewer refused this note 3",
+		"failures/v1:exec:curl: (N) failed to connect to localhost port N after N ms: connection refused 4",
+		"failures/v1:guard:fence-guard:a process match on Q takes its own shell too 3",
+		"failures/v1:guard:ledger:this note names no source 3",
 		"failures/v1:guard:load-gate:held Q: the machine is busy 3",
-		"failures/v1:model:refusal:this request triggered restrictions on violative content 3",
+		"failures/v1:model:refusal:the model declined this request as written 3",
 		"failures/v1:turn:claude:api error: N overloaded 3",
 	}
 	if got := signatures(fs); !slices.Equal(got, want) {
 		t.Fatalf("found\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
-	if fs[1].Title != "fence-guard keeps refusing calls: pgrep -f Q also matches the shell running this command" || fs[1].Family != "failures" {
+	if fs[1].Title != "fence-guard keeps refusing calls: a process match on Q takes its own shell too" || fs[1].Family != "failures" {
 		t.Fatalf("finding %+v", fs[1])
 	}
 	if fs[5].Title != "Claude Code's turns keep failing: api error: N overloaded" {
@@ -474,7 +509,7 @@ func TestIncidentsCountTheirSightings(t *testing.T) {
 // A finding files at most MaxEvidence of its newest sightings on a run.
 func TestAFindingFilesItsNewestEvidence(t *testing.T) {
 	st := testStore(t)
-	deny := "<tool_use_error>fence-guard: pgrep -f 'x' also matches the shell running this command"
+	deny := "<tool_use_error>fence-guard: a process match on 'x' takes its own shell too"
 	var evs []store.Event
 	for i := 0; i < MaxEvidence+1; i++ {
 		evs = append(evs, toolError(fmt.Sprint("s", i%2), "Bash", deny, t0.Add(time.Duration(i)*time.Minute)))
@@ -506,7 +541,7 @@ func TestAnOwnerTurnIsReadWithTheAgentsLastWords(t *testing.T) {
 			t.Errorf("%q after %q: %q, want %q", c.owner, c.agent, got, c.want)
 		}
 	}
-	if got := OwnerClass("send the apk to my new phone again please", "", []string{"please send the apk to my new phone"}); got != "repeat" {
+	if got := OwnerClass("send the build to the test phone again please", "", []string{"please send the build to the test phone"}); got != "repeat" {
 		t.Errorf("a turn he repeats: %q", got)
 	}
 	// five words he shares with what he said are a repeat; four are not
@@ -515,6 +550,10 @@ func TestAnOwnerTurnIsReadWithTheAgentsLastWords(t *testing.T) {
 	}
 	if got := OwnerClass("ship the beta build", "", []string{"ship the beta build"}); got != "" {
 		t.Errorf("four words again: %q", got)
+	}
+	// half the words in common is no repeat
+	if got := OwnerClass("alpha beta gamma delta epsilon zeta", "", []string{"alpha beta gamma delta eta theta"}); got != "" {
+		t.Errorf("half the words again: %q", got)
 	}
 }
 
@@ -537,7 +576,7 @@ func TestOwnerBurdenIsFoundInHisOwnWords(t *testing.T) {
 	sub.Agent = "sub-1"
 	other := ownerTurn("k", "why do you ask, you can decide", t0.Add(time.Minute))
 	other.Actor = store.ActorHarness
-	template := "nightly sweep: why do you ask me, you decide which repo goes first"
+	template := "scheduled pass: why do you ask me, you decide which item goes first"
 	put(t, st,
 		agentSays("a", ask, t0), ownerTurn("a", "why do you ask, you can decide", t0.Add(time.Minute)),
 		ownerTurn("a", "why do you ask, you can decide", t0.Add(90*time.Second)), // the same turn recorded twice
@@ -546,7 +585,7 @@ func TestOwnerBurdenIsFoundInHisOwnWords(t *testing.T) {
 		// his words after momentum's marker
 		agentSays("c", ask, t0), ownerTurn("c", "[momentum] why stop, you can decide", t0.Add(time.Minute)),
 		// the same handback, typed by programs
-		agentSays("d", ask, t0), ownerTurn("d", "Wake nonce=1 why stop, you can decide", t0.Add(time.Minute)),
+		agentSays("d", ask, t0), ownerTurn("d", "Ping id=1 why stop, you can decide", t0.Add(time.Minute)),
 		agentSays("e", ask, t0), ownerTurn("e", template, t0.Add(time.Minute)),
 		agentSays("f", ask, t0), ownerTurn("f", template, t0.Add(2*time.Hour)),
 		agentSays("g", ask, t0), ownerTurn("g", template, t0.Add(3*time.Hour)),
@@ -554,7 +593,7 @@ func TestOwnerBurdenIsFoundInHisOwnWords(t *testing.T) {
 		agentSays("i", ask, t0), ownerTurn("i", "why, you decide this", t0.Add(4*time.Hour+time.Second)),
 		agentSays("j", ask, t0), sub, agentSays("k", ask, t0), other,
 	)
-	fs, err := OwnerBurden{Programs: Programs{Prefixes: []string{"Wake nonce="}}}.Detect(context.Background(), st, week())
+	fs, err := OwnerBurden{Programs: Programs{Prefixes: []string{"Ping id="}}}.Detect(context.Background(), st, week())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -646,11 +685,11 @@ func TestOwnerBurdenReadsTheWindowsTurnsAndTheSessionsOwnWords(t *testing.T) {
 // counts), a configured prefix, the same text in two sessions within 2 seconds, a long text in three sessions of the
 // window (sessions before it do not count).
 func TestProgramsMarkWhatAProgramTyped(t *testing.T) {
-	p := Programs{Prefixes: []string{"Wake nonce="}}
-	long := "nightly sweep: pick the next repo and go on with its open work"
+	p := Programs{Prefixes: []string{"Ping id="}}
+	long := "scheduled pass: take the next item and go on with its open work"
 	turns := []store.Event{
 		ownerTurn("a", "go on", t0), ownerTurn("a", "go on", t0.Add(90*time.Second)), ownerTurn("a", "go on", t0.Add(210*time.Second)),
-		ownerTurn("b", "Wake nonce=7 look at the queue", t0),
+		ownerTurn("b", "Ping id=7 look at the queue", t0),
 		ownerTurn("c", "is it done", t0), ownerTurn("d", "is it done", t0.Add(time.Second)), ownerTurn("e", "is it done", t0.Add(4*time.Second)),
 		ownerTurn("f", long, t0.Add(-2*24*time.Hour)), ownerTurn("g", long, t0), ownerTurn("h", long, t0.Add(time.Hour)),
 		ownerTurn("i", long+" now", t0), ownerTurn("j", long+" now", t0.Add(time.Hour)), ownerTurn("k", long+" now", t0.Add(2*time.Hour)),
@@ -769,8 +808,12 @@ func TestTheNudgesNoRuleCoversAreFound(t *testing.T) {
 }
 
 // Each part of the sessions detector stands when another fails: supervision's record that cannot be read leaves
-// the nudges found, and the error comes back beside them.
+// the nudges found, and the error comes back beside them; a replay that cannot run says so too.
 func TestEachSessionsPartStandsWhenAnotherFails(t *testing.T) {
+	broken := func(context.Context) (map[string]string, error) { return nil, fmt.Errorf("no hermes") }
+	if _, err := (Sessions{Platforms: broken}).Detect(context.Background(), testStore(t), week()); err == nil {
+		t.Fatal("a replay that could not run came back as read")
+	}
 	path := filepath.Join(t.TempDir(), "m.db")
 	st, err := store.Open(path)
 	if err != nil {
@@ -802,7 +845,7 @@ func TestEachSessionsPartStandsWhenAnotherFails(t *testing.T) {
 func TestRunFilesFindingsIntoCases(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	deny := "<tool_use_error>fence-guard: pgrep -f 'x' also matches the shell running this command"
+	deny := "<tool_use_error>fence-guard: a process match on 'x' takes its own shell too"
 	put(t, st, toolError("s1", "Bash", deny, t0), toolError("s1", "Bash", deny, t0.Add(time.Hour)), toolError("s2", "Bash", deny, t0.Add(2*time.Hour)))
 	w := week()
 	dry, _, err := Run(ctx, st, []Detector{Failures{}}, w, "test", true)
@@ -824,7 +867,7 @@ func TestRunFilesFindingsIntoCases(t *testing.T) {
 		t.Fatalf("again %+v %v", again, err)
 	}
 	c := out[1].Filed[0].Case
-	if c.Family != "failures" || c.Evidence != 3 || c.Title != "fence-guard keeps refusing calls: pgrep -f Q also matches the shell running this command" {
+	if c.Family != "failures" || c.Evidence != 3 || c.Title != "fence-guard keeps refusing calls: a process match on Q takes its own shell too" {
 		t.Fatalf("case %+v", c)
 	}
 }
@@ -901,5 +944,12 @@ func TestTheSweepTakesOnlyTheFamiliesItLookedAt(t *testing.T) {
 	}
 	if _, swept, err := Run(ctx, st, []Detector{failing{family: "failures"}}, now, "test", false); err != nil || len(swept) != 0 {
 		t.Fatalf("nothing looked at, swept %v %v", swept, err)
+	}
+	hour := Window{Since: time.Now().Add(-time.Hour), Until: time.Now()}
+	if _, swept, err := Run(ctx, st, []Detector{OwnerBurden{}}, hour, "test", false); err != nil || len(swept) != 0 {
+		t.Fatalf("an hour's look swept %v %v", swept, err)
+	}
+	if _, swept, err := Run(ctx, st, []Detector{OwnerBurden{}}, now, "test", false); err != nil || len(swept) != 1 || swept[0].ID != ids[1] {
+		t.Fatalf("a week's look: %v %v", swept, err)
 	}
 }

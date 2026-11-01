@@ -141,10 +141,10 @@ func (o Outcome) Refused() int {
 }
 
 // Run runs each detector over the window and files what it finds. A detector that fails is named, and what it
-// found before it failed is filed; a finding the case store refuses is named, and the next one is filed. Then it
-// sweeps the cases unseen past their retention, of the families whose detector read the whole window: a family
-// whose detector failed, or did not run, was not looked at, so its cases are not taken for stopped. A dry run
-// files and sweeps nothing.
+// found before it failed is filed; a finding the case store refuses is named, and the next one is filed. Then, when
+// the window is a whole DefaultWindow or more, it sweeps the cases unseen past their retention, of the families
+// whose detector read the whole window: a family whose detector failed, or did not run, or a shorter window, was
+// not looked at, so its cases are not taken for stopped. A dry run files and sweeps nothing.
 func Run(ctx context.Context, st *store.Store, ds []Detector, w Window, actor string, dry bool) ([]Outcome, []store.Case, error) {
 	var out []Outcome
 	var looked []string
@@ -164,7 +164,7 @@ func Run(ctx context.Context, st *store.Store, ds []Detector, w Window, actor st
 		}
 		out = append(out, o)
 	}
-	if dry || len(looked) == 0 {
+	if dry || len(looked) == 0 || w.Until.Sub(w.Since) < DefaultWindow {
 		return out, nil, nil
 	}
 	swept, err := st.SweepCases(ctx, w.Until, store.CaseRetention, actor, looked...)
@@ -221,12 +221,14 @@ var normRules = []struct {
 }{
 	{regexp.MustCompile(`</?tool_use_error>`), " "},
 	{regexp.MustCompile("`[^`\n]*`"), "Q"},
+	{regexp.MustCompile("`[^`'\n]*'"), "Q"}, // GNU's `quoted'
 	{regexp.MustCompile(`"[^"\n]*"`), "Q"},
+	{regexp.MustCompile(`‘[^’\n]*’|“[^”\n]*”`), "Q"}, // curly quotes, which coreutils use in a UTF-8 locale
 	// a single quote opens a quoted value only with no letter or digit before it: can't is a word, not a quote
 	{regexp.MustCompile(`(^|[^\pL\pN])'[^'\n]*'`), "${1}Q"},
 	{regexp.MustCompile(`[a-z][a-z0-9+.-]*://\S+`), "U"},
 	{regexp.MustCompile(`\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b`), "U"}, // a mail or ssh address: user@host
-	{regexp.MustCompile(`\b[\w.-]+(?:/[\w.@%+-]+)+`), "P"},        // a relative path, by its slashes
+	{regexp.MustCompile(`(?:\.|\b)[\w.-]+(?:/[\w.@%+-]+)+`), "P"}, // a relative path, by its slashes, a dotted one too
 	{regexp.MustCompile(`~[\w./@%+-]*|\.{0,2}/[\w./@%+-]*[\w/]`), "P"},
 	{regexp.MustCompile(`\b[\w-]+(?:\.[\w-]+)*\.(?:` + fileExt + `)\b`), "P"}, // a file's name, by its ending
 	{regexp.MustCompile(`\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b`), "H"},

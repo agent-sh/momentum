@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -176,7 +177,7 @@ func TestCaseDetectFilesWhatTheDetectorsFind(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().Add(-time.Hour)
-	deny := "<tool_use_error>fence-guard: pgrep -f 'x' also matches the shell running this command"
+	deny := "<tool_use_error>fence-guard: a process match on 'x' takes its own shell too"
 	var evs []store.Event
 	for i, s := range []string{"s1", "s1", "s2"} {
 		evs = append(evs, store.Event{Source: store.Transcripts, SourceKey: fmt.Sprintf("%s@%d", s, i), TS: now.Add(time.Duration(i) * time.Minute),
@@ -211,6 +212,14 @@ func (partialDetector) Family() string { return "failures" }
 func (partialDetector) Detect(context.Context, *store.Store, detect.Window) ([]store.Finding, error) {
 	return []store.Finding{{Family: "failures", Signature: "bad\nsignature", Title: "x"},
 		{Family: "failures", Signature: "failures/v1:good", Title: "good", Evidence: []store.Evidence{{Ref: "file:/t/g", At: time.Now().Add(-time.Hour)}}}}, nil
+}
+
+// brokenDetector fails without a finding.
+type brokenDetector struct{}
+
+func (brokenDetector) Family() string { return "sessions" }
+func (brokenDetector) Detect(context.Context, *store.Store, detect.Window) ([]store.Finding, error) {
+	return nil, errors.New("no source")
 }
 
 // case detect says what the case store refused apart from a detector that failed: the refused finding's line, its
@@ -255,6 +264,16 @@ func TestCaseDetectNamesWhatItRefusedAndSwept(t *testing.T) {
 		!strings.Contains(lines[0].Error, "bad case") || lines[1].Error != "" || lines[1].Observed != "opened" ||
 		lines[2].Case != old.ID || lines[2].Observed != "swept" {
 		t.Fatalf("exit %d %s\n%+v", code, errOut, lines)
+	}
+	// the text lines: a refused finding's, and a failed detector's count
+	listDetectors = func() ([]detect.Detector, error) { return []detect.Detector{partialDetector{}, brokenDetector{}}, nil }
+	code, out, errOut = momentum("case", "detect")
+	if code != 3 || !strings.Contains(out, "refused (") || !strings.Contains(errOut, "1 of 2 detectors failed") {
+		t.Fatalf("text: exit %d %q %s", code, out, errOut)
+	}
+	listDetectors = func() ([]detect.Detector, error) { return []detect.Detector{brokenDetector{}}, nil }
+	if code, _, errOut := momentum("case", "detect"); code != 3 || !strings.Contains(errOut, "1 of 1 detectors failed") {
+		t.Fatalf("a failed detector alone: exit %d %s", code, errOut)
 	}
 	listDetectors = detectors
 	if err := os.WriteFile(filepath.Join(conf, "sources.json"), []byte("{"), 0o600); err != nil {
