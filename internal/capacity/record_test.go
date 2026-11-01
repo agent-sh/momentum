@@ -125,67 +125,131 @@ func TestANoteForExactlyTheProblemReasons(t *testing.T) {
 	}
 }
 
-// A rule that could not run, and a disk whose use cannot be read, are problems. Each note names its error, is
-// resolved by the next scan that works, stands again when the scan fails again, and stays resolved by the owner while
-// its error is the same.
+// A rule that could not run, and a disk whose use cannot be read, are problems. Each note names its error and keeps
+// the time the failure began. A run that does not scan the rule leaves the note; the next scan that works resolves
+// it. It stands again when the rule fails again, whoever resolved it, and a note the owner resolved stays resolved
+// while the same failure lasts.
 func TestARuleThatCouldNotRunIsAProblem(t *testing.T) {
 	ctx := context.Background()
 	st := openStore(t)
 	gone := filepath.Join(t.TempDir(), "gone")
 	cfg := Config{Live: []string{RuleUV}, Disks: []string{gone}}.Normal()
-	now := time.Now()
+	t0 := time.Now()
+	works := uvTools("1000", nil)
 	failing := func(how string) Tools {
 		return fakeTools{answers: map[string]string{"uv cache dir": how, "docker": "ERR"}}
 	}
-	runWith := func(at time.Time, tools Tools) *Result {
+	run := func(at time.Duration, tools Tools, now bool, rules ...string) *Result {
 		t.Helper()
-		o := options(t, procRoot(t), at, nil)
-		o.Now, o.Tools, o.Rules = true, tools, []string{RuleUV}
+		o := options(t, procRoot(t), t0.Add(at), nil)
+		o.Now, o.Tools, o.Rules = now, tools, rules
 		res, err := Run(ctx, cfg, st, o)
 		must(t, err)
 		return res
 	}
 	id, disk := "capacity:scan:"+RuleUV, "capacity:scan:disk"
-	stands := func(id string) bool {
+	note := func(id string) (store.Note, bool) {
 		t.Helper()
 		n, ok, err := st.Note(ctx, id)
 		must(t, err)
-		return ok && n.Done.IsZero()
+		return n, ok && n.Done.IsZero()
 	}
-	if res := runWith(now, failing("ERR-INUSE")); res.Rules[0].Err == "" {
+	resolve := func(id string, at time.Duration) {
+		t.Helper()
+		_, _, err := st.DoneNote(ctx, id, t0.Add(at))
+		must(t, err)
+	}
+	run(0, works, true, RuleUV)
+	if res := run(10*time.Minute, failing("ERR-INUSE"), true, RuleUV); res.Rules[0].Err == "" {
 		t.Fatalf("setup: the uv rule could not run: %+v", res.Rules[0])
 	}
-	if n, _, _ := st.Note(ctx, id); !stands(id) || !strings.Contains(n.Detail, "in-use") {
+	if n, stands := note(id); !stands || !strings.Contains(n.Detail, "in-use") {
 		t.Errorf("a rule that could not run is a problem that names its error: %+v", n)
 	}
 	// the title names the disk too, clipped as every title is; this test's disk has a long name
-	if n, _, _ := st.Note(ctx, disk); !stands(disk) || !strings.HasPrefix(n.Title, "Capacity cannot watch ") ||
+	if n, stands := note(disk); !stands || !strings.HasPrefix(n.Title, "Capacity cannot watch ") ||
 		!strings.Contains(n.Detail, gone+": no such file") {
 		t.Errorf("a disk whose use cannot be read is a problem that names it: %+v", n)
 	}
+	run(15*time.Minute, works, false, RuleUV) // the rule is not due: its last scan that worked was 15 minutes ago
+	if _, stands := note(id); !stands {
+		t.Error("a run on which the rule is not due leaves its note")
+	}
+	run(20*time.Minute, works, true, RuleDocker)
+	if _, stands := note(id); !stands {
+		t.Error("a run that does not scan the rule (--rule) leaves its note")
+	}
+	run(25*time.Minute, failing("ERR-INUSE"), true, RuleUV)
+	if n, _ := note(id); !n.At.Equal(t0.Add(10 * time.Minute).Truncate(time.Millisecond)) {
+		t.Errorf("a note that stands keeps the time its failure began: %v", n.At)
+	}
 	must(t, os.MkdirAll(gone, 0o755))
-	runWith(now.Add(time.Hour), uvTools("1000", nil))
-	if stands(id) || stands(disk) {
+	run(time.Hour, works, true, RuleUV)
+	_, uvStands := note(id)
+	if _, diskStands := note(disk); uvStands || diskStands {
 		t.Fatal("a scan that works resolves its note")
 	}
-	runWith(now.Add(2*time.Hour), failing("ERR-INUSE"))
-	if !stands(id) {
+	run(2*time.Hour, failing("ERR-INUSE"), true, RuleUV)
+	if _, stands := note(id); !stands {
 		t.Fatal("a rule that fails again with the same error stands again")
 	}
-	if _, _, err := st.DoneNote(ctx, id, now.Add(2*time.Hour)); err != nil {
-		t.Fatal(err)
+	resolve(id, 2*time.Hour)
+	run(3*time.Hour, failing("ERR-INUSE"), true, RuleUV)
+	if _, stands := note(id); stands {
+		t.Error("a note the owner resolved stays resolved while the same failure lasts")
 	}
-	runWith(now.Add(3*time.Hour), failing("ERR-INUSE"))
-	if stands(id) {
-		t.Error("a note the owner resolved stays resolved while its error is the same")
-	}
-	runWith(now.Add(4*time.Hour), failing("ERR-DENIED"))
-	if !stands(id) {
+	run(4*time.Hour, failing("ERR-DENIED"), true, RuleUV)
+	if _, stands := note(id); !stands {
 		t.Error("another error makes it stand again")
+	}
+	resolve(id, 4*time.Hour)
+	run(5*time.Hour, works, true, RuleUV)
+	run(6*time.Hour, failing("ERR-DENIED"), true, RuleUV)
+	if _, stands := note(id); !stands {
+		t.Error("a failure that comes back after a scan that worked stands again, though the owner resolved its note")
 	}
 	evs, err := st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindFailed}})
 	if err != nil || len(evs) != 3 {
 		t.Errorf("each error is an event, once: %d %v", len(evs), err)
+	}
+}
+
+// The scheduled jobs that could not be read are a problem again when they cannot be read again, after a run that read
+// them, whoever resolved the note.
+func TestJobsThatCannotBeReadAgainAreAProblemAgain(t *testing.T) {
+	ctx := context.Background()
+	st := openStore(t)
+	cfg, _ := excludedTargets(t, "a")
+	t0 := time.Now().Add(72 * time.Hour)
+	broken := fakeJobs{err: os.ErrPermission}
+	run := func(at time.Duration, jobs Jobs) {
+		t.Helper()
+		o := options(t, procRoot(t), t0.Add(at), jobs)
+		o.Now = true
+		_, err := Run(ctx, cfg, st, o)
+		must(t, err)
+	}
+	stands := func() bool {
+		t.Helper()
+		n, ok, err := st.Note(ctx, "capacity:jobs")
+		must(t, err)
+		return ok && n.Done.IsZero()
+	}
+	run(0, broken)
+	run(time.Hour, fakeJobs{})
+	if stands() {
+		t.Fatal("setup: a run that reads the jobs resolves the note")
+	}
+	run(2*time.Hour, broken)
+	if !stands() {
+		t.Error("the same error after a run that read them stands again")
+	}
+	_, _, err := st.DoneNote(ctx, "capacity:jobs", t0.Add(2*time.Hour))
+	must(t, err)
+	run(3*time.Hour, fakeJobs{})
+	run(4*time.Hour, broken)
+	if !stands() {
+		t.Error("and so it does after the owner resolved it")
 	}
 }
 

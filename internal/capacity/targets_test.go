@@ -26,27 +26,41 @@ func cargoTarget(t *testing.T, dir string, sources ...string) {
 }
 
 // A build git cannot answer for is a problem, as a worktree git fails on is: the rule would take it, and git keeps
-// it. With no git on PATH, git cannot say whether it ignores the build.
+// it. Git cannot say whether it ignores the build when it is not on PATH, or fails on the repository.
 func TestABuildGitCannotAnswerForIsAProblem(t *testing.T) {
 	gitEnv(t)
-	root := filepath.Join(t.TempDir(), "projects")
-	app := filepath.Join(root, "app")
-	write(t, filepath.Join(app, ".gitignore"), "target/\n")
-	gitT(t, app, "init", "-q")
-	cargoTarget(t, filepath.Join(app, "target"))
-	t.Setenv("PATH", t.TempDir())
-	cfg := Config{Targets: TargetsConfig{Roots: []string{root}}}.Normal()
-	cfg.Live = []string{RuleTargets}
-	st := openStore(t)
-	res, err := Run(context.Background(), cfg, st, options(t, procRoot(t), time.Now().Add(49*time.Hour), nil))
-	must(t, err)
-	if f := findings(res, RuleTargets)[filepath.Join(app, "target")]; f.Action != ActReport || f.class != "unreadable" ||
-		!strings.Contains(f.Why, "git could not say") {
-		t.Fatalf("a build git cannot answer for is only reported, as one git could not read: %+v", f)
-	}
-	n, ok, err := st.Note(context.Background(), "capacity:"+RuleTargets+":unreadable")
-	if err != nil || !ok || !n.Done.IsZero() || !strings.Contains(n.Title, "git could not read") {
-		t.Errorf("its note says git could not read it: %+v %v %v", n, ok, err)
+	for _, c := range []struct {
+		name  string
+		setup func(t *testing.T, app string)
+	}{
+		{"no git on PATH", func(t *testing.T, app string) {
+			gitT(t, app, "init", "-q")
+			t.Setenv("PATH", t.TempDir())
+		}},
+		{"a repository git fails on", func(t *testing.T, app string) { // its .git names a directory that is gone
+			write(t, filepath.Join(app, ".git"), "gitdir: "+filepath.Join(app, "gone")+"\n")
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "projects")
+			app := filepath.Join(root, "app")
+			write(t, filepath.Join(app, ".gitignore"), "target/\n")
+			c.setup(t, app)
+			cargoTarget(t, filepath.Join(app, "target"))
+			cfg := Config{Targets: TargetsConfig{Roots: []string{root}}}.Normal()
+			cfg.Live = []string{RuleTargets}
+			st := openStore(t)
+			res, err := Run(context.Background(), cfg, st, options(t, procRoot(t), time.Now().Add(49*time.Hour), nil))
+			must(t, err)
+			if f := findings(res, RuleTargets)[filepath.Join(app, "target")]; f.Action != ActReport || f.class != "unreadable" ||
+				!strings.Contains(f.Why, "git could not say") {
+				t.Fatalf("a build git cannot answer for is only reported, as one git could not read: %+v", f)
+			}
+			n, ok, err := st.Note(context.Background(), "capacity:"+RuleTargets+":unreadable")
+			if err != nil || !ok || !n.Done.IsZero() || !strings.Contains(n.Title, "git could not read") {
+				t.Errorf("its note says git could not read it: %+v %v %v", n, ok, err)
+			}
+		})
 	}
 }
 

@@ -1369,6 +1369,44 @@ func TestTheModelDatasDeletionSaysWhatItFreed(t *testing.T) {
 	}
 }
 
+// A scan that stopped partway keeps what came of what it found: an offload that failed before the error is on record
+// with its note, and the rule's note says it stopped partway. A rule no longer configured resolves that note.
+func TestAScanThatStoppedPartwayKeepsItsFailures(t *testing.T) {
+	ctx := context.Background()
+	f := newScratch(t)
+	f.cfg.Live = []string{RuleScratch}
+	f.cfg.Scratch.Roots = append(f.cfg.Scratch.Roots, filepath.Join(f.base, "gone")) // shallower: scanned after the cache
+	done := f.task(t, "zq-done", "s1", map[string]int{"out.log": 2 << 20, "notes.md": -1})
+	fails := f.task(t, "zq-fail", "s1", map[string]int{"out.log": 2 << 20, "notes.md": -1})
+	res, err := Run(ctx, f.cfg, f.st, options(t, procRoot(t), f.now, nil))
+	must(t, err)
+	got := findings(res, RuleScratch)
+	for _, rr := range res.Rules {
+		if rr.Rule == RuleScratch && (rr.Err == "" || !got[done].Done || got[fails].Err == "") {
+			t.Fatalf("setup: the scan of the second root fails after the first root's folders were acted on: %+v", rr)
+		}
+	}
+	evs, err := f.st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindFailed}})
+	must(t, err)
+	failed := false
+	for _, e := range evs {
+		failed = failed || e.Ref == fails
+	}
+	if n, ok, err := f.st.Note(ctx, "capacity:scratch:failed"); err != nil || !ok || !n.Done.IsZero() || !failed {
+		t.Errorf("the offload that failed is an event (%v) and a problem note: %+v %v %v", failed, n, ok, err)
+	}
+	if n, ok, err := f.st.Note(ctx, "capacity:scan:scratch"); err != nil || !ok || !strings.Contains(n.Title, "stopped partway") {
+		t.Errorf("the rule's note says it stopped partway: %+v %v %v", n, ok, err)
+	}
+	f.cfg.Scratch.Roots = nil
+	if _, err := Run(ctx, f.cfg, f.st, options(t, procRoot(t), f.now.Add(time.Hour), nil)); err != nil {
+		t.Fatal(err)
+	}
+	if n, _, _ := f.st.Note(ctx, "capacity:scan:scratch"); n.Done.IsZero() {
+		t.Error("a rule no longer configured resolves its note")
+	}
+}
+
 func TestTheEventOfAFolderBesideItsPointerSaysWhy(t *testing.T) {
 	f := newScratch(t)
 	f.cfg.Live = []string{RuleScratch}

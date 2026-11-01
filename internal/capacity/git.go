@@ -72,3 +72,17 @@ func gitOK(ctx context.Context, dir string, args ...string) (bool, error) {
 	}
 	return false, err
 }
+
+// gitIgnores reports whether git in dir ignores p. check-ignore exits 0 when it does and 1 when it does not; any other
+// exit (a broken repository), a git that could not run and one that did not finish are an error.
+func gitIgnores(ctx context.Context, dir, p string) (bool, error) {
+	_, err := gitRun(ctx, 30*time.Second, dir, "check-ignore", "-q", p)
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.As(err, &ee) && ee.ExitCode() == 1:
+		return false, nil
+	}
+	return false, err
+}

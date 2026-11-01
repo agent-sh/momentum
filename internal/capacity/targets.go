@@ -71,7 +71,7 @@ func (r *runner) targetOwner(ctx context.Context, t, canon string) (action, clas
 		if w, ok := r.excludedRepo(rp); ok {
 			return ActReport, "excluded", "an excluded project's: " + w
 		}
-		ignored, err := gitOK(ctx, rp.top, "check-ignore", "-q", t)
+		ignored, err := gitIgnores(ctx, rp.top, t)
 		if err != nil {
 			return ActReport, "unreadable", "git could not say whether it ignores it: " + err.Error()
 		}

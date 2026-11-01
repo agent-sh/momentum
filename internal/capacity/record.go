@@ -147,20 +147,21 @@ func (r *runner) recordPrunes(ctx context.Context, rule string) error {
 // recorded as they happened.
 func (r *runner) record(ctx context.Context) error {
 	groups := map[string]*group{}
-	ran := map[string]bool{}
+	ran := map[string]bool{} // the rules whose scan ran whole: what they did not find is gone
 	for _, rr := range r.res.Rules {
-		if !rr.Ran || rr.Err != "" {
+		if !rr.Ran {
 			continue
 		}
-		ran[rr.Rule] = true
+		whole := rr.Err == ""
+		ran[rr.Rule] = whole
 		for _, f := range rr.Findings {
 			switch {
 			case f.Done:
-			case f.Err != "":
+			case f.Err != "": // a deletion that failed is on record, whatever the scan did after it
 				g := groupOf(groups, f.Rule, "failed")
 				g.items = append(g.items, f)
 				g.events = append(g.events, r.event(KindFailed, f, fmt.Sprintf("failed/%s/%s", f.Rule, keyPath(f)), store.ActorDetector))
-			case f.Action == ActReport:
+			case f.Action == ActReport && whole:
 				g := groupOf(groups, f.Rule, f.class)
 				g.items = append(g.items, f)
 				g.events = append(g.events, r.event(KindReport, f, fmt.Sprintf("report/%s/%s/%s", f.Rule, f.class, keyPath(f)), store.ActorDetector))
@@ -200,7 +201,7 @@ func (r *runner) record(ctx context.Context) error {
 				return err
 			}
 		case ran[rule] && groups[rule+"\x00"+class] == nil:
-			if err := r.resolve(ctx, n.ID); err != nil {
+			if err := r.ended(ctx, n.ID); err != nil {
 				return err
 			}
 		}
@@ -217,8 +218,9 @@ func (r *runner) record(ctx context.Context) error {
 	return r.recordScans(ctx)
 }
 
-// putAgain puts a problem note when what it is about is new to the store (fresh), when it stands, or when capacity
-// resolved it itself and it holds again. One the owner resolved stays resolved until what it is about changes.
+// putAgain puts a problem note when what it is about is new to the store (fresh), when it stands, or when it holds
+// again after it ended (ended). One the owner resolved stays resolved while the same problem lasts. A note that stands
+// keeps its time, when the problem began, and takes the latest title and detail.
 func (r *runner) putAgain(ctx context.Context, n store.Note, fresh bool) error {
 	old, had, err := r.st.Note(ctx, n.ID)
 	if err != nil {
@@ -229,28 +231,43 @@ func (r *runner) putAgain(ctx context.Context, n store.Note, fresh bool) error {
 		return err
 	}
 	standing := had && old.Done.IsZero()
-	resolvedByUs := had && !old.Done.IsZero() && !auto.IsZero() && !old.Done.After(auto)
-	if fresh || standing || resolvedByUs {
+	again := had && !old.Done.IsZero() && !auto.IsZero() && !old.Done.After(auto)
+	if standing {
+		n.At = old.At
+	}
+	if fresh || standing || again {
 		_, err = r.st.PutNote(ctx, n)
 	}
 	return err
 }
 
-// resolve resolves a problem note that stands as capacity's own doing, so putAgain puts it again when it holds again.
-// A note that does not stand is left as it is: one the owner resolved stays his.
-func (r *runner) resolve(ctx context.Context, id string) error {
-	_, stood, err := r.st.DoneNote(ctx, id, r.now)
-	if err != nil || !stood {
+// ended says that what a problem note is about is over: a note that stands is resolved, and putAgain puts the note
+// again when the problem comes back, whoever resolved it.
+func (r *runner) ended(ctx context.Context, id string) error {
+	old, had, err := r.st.Note(ctx, id)
+	if err != nil || !had {
 		return err
+	}
+	auto, err := r.st.Mark(ctx, "auto:"+id)
+	if err != nil {
+		return err
+	}
+	switch {
+	case old.Done.IsZero():
+		if _, _, err := r.st.DoneNote(ctx, id, r.now); err != nil {
+			return err
+		}
+	case !auto.IsZero() && !old.Done.After(auto):
+		return nil // the mark says already that it ended after its last resolution
 	}
 	return r.st.SetMark(ctx, "auto:"+id, r.now)
 }
 
 // recordScans records each rule that could not run (its scan failed, or its last scan's mark could not be read), a
 // problem note each (capacity:scan:RULE), and the disks whose use could not be read, one note that names them
-// (capacity:scan:disk). Each error is an event (capacity-failed), once; a note is put as putAgain puts one, and
-// resolved by the next run that scans without an error. A rule this run did not scan (not due, or not among --rule's)
-// leaves its note as it is; a rule no longer configured resolves its own.
+// (capacity:scan:disk). Each error is an event (capacity-failed), once; a note is put as putAgain puts one, and ends
+// at the next run that scans without an error. A rule this run did not scan (not due, or not among --rule's) leaves
+// its note as it is; a rule no longer configured ends its own.
 func (r *runner) recordScans(ctx context.Context) error {
 	failed := func(rule, key, summary, why string) store.Event {
 		h := sha256.Sum256([]byte(why))
@@ -268,6 +285,9 @@ func (r *runner) recordScans(ctx context.Context) error {
 			continue // not scanned on this run: nothing says whether it works now
 		}
 		s := scan{id: "capacity:scan:" + rr.Rule, title: "Capacity's " + rr.Rule + " rule could not run", detail: upper(rr.Err) + "."}
+		if len(rr.Findings) > 0 { // it found items before the error: the run's output and events say what came of them
+			s.title = "Capacity's " + rr.Rule + " rule stopped partway"
+		}
 		if rr.Err != "" {
 			s.events = []store.Event{failed(rr.Rule, rr.Rule, "the "+rr.Rule+" rule could not run: "+rr.Err, rr.Err)}
 		}
@@ -293,12 +313,8 @@ func (r *runner) recordScans(ctx context.Context) error {
 	scans = append(scans, disks)
 	for _, s := range scans {
 		if len(s.events) == 0 {
-			if _, had, err := r.st.Note(ctx, s.id); err != nil {
+			if err := r.ended(ctx, s.id); err != nil {
 				return err
-			} else if had {
-				if err := r.resolve(ctx, s.id); err != nil {
-					return err
-				}
 			}
 			continue
 		}
@@ -316,8 +332,8 @@ func (r *runner) recordScans(ctx context.Context) error {
 
 // recordHolds records a run that could not trust its look at the processes, or could not ask Docker which
 // containers run, and so deleted nothing, or could not read the live sessions whole, and so left the task folders
-// and worktrees: a problem note for each reason, put when its reason is new to it, and resolved by the next run that
-// has no such reason. Docker and the sessions are asked only when a rule needs them.
+// and worktrees: a problem note for each reason, put as putAgain puts one, and ended by the next run that has no such
+// reason. Docker and the sessions are asked only when a rule needs them.
 func (r *runner) recordHolds(ctx context.Context) error {
 	for _, h := range []struct {
 		id, why, title string
@@ -331,15 +347,9 @@ func (r *runner) recordHolds(ctx context.Context) error {
 		if !h.checked {
 			continue
 		}
-		old, had, err := r.st.Note(ctx, h.id)
-		if err != nil {
-			return err
-		}
 		if h.why == "" {
-			if had && old.Done.IsZero() {
-				if _, _, err := r.st.DoneNote(ctx, h.id, r.now); err != nil {
-					return err
-				}
+			if err := r.ended(ctx, h.id); err != nil {
+				return err
 			}
 			continue
 		}
@@ -349,11 +359,9 @@ func (r *runner) recordHolds(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if fresh || (had && old.Done.IsZero()) {
-			if _, err := r.st.PutNote(ctx, store.Note{ID: h.id, Kind: store.NoteProblem, Source: store.Capacity, At: r.now,
-				Title: h.title, Detail: upper(h.why) + "."}); err != nil {
-				return err
-			}
+		if err := r.putAgain(ctx, store.Note{ID: h.id, Kind: store.NoteProblem, Source: store.Capacity, At: r.now,
+			Title: h.title, Detail: upper(h.why) + "."}, fresh); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -379,22 +387,15 @@ func (r *runner) putNew(ctx context.Context, evs []store.Event) (bool, error) {
 	return true, err
 }
 
-// recordJobs records a run that could not read the scheduled jobs, and so deleted nothing: a problem note, put when
-// its error is new to it, and resolved by the next run that reads them all.
+// recordJobs records a run that could not read the scheduled jobs, and so deleted nothing: a problem note, put as
+// putAgain puts one, and ended by the next run that reads them all.
 func (r *runner) recordJobs(ctx context.Context) error {
 	const id = "capacity:jobs"
 	if r.named == nil && r.namedErr == nil {
 		return nil // no rule scanned: the jobs were not read
 	}
-	old, had, err := r.st.Note(ctx, id)
-	if err != nil {
-		return err
-	}
 	if r.namedErr == nil {
-		if had && old.Done.IsZero() {
-			_, _, err = r.st.DoneNote(ctx, id, r.now)
-		}
-		return err
+		return r.ended(ctx, id)
 	}
 	h := sha256.Sum256([]byte(r.namedErr.Error()))
 	e := r.event(KindFailed, Finding{Rule: "jobs", Path: "scheduled jobs", Err: r.namedErr.Error()},
@@ -403,12 +404,9 @@ func (r *runner) recordJobs(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if fresh || (had && old.Done.IsZero()) {
-		_, err = r.st.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Source: store.Capacity, At: r.now,
-			Title:  "Capacity deleted and pruned nothing: the scheduled jobs could not all be read",
-			Detail: "A job may name a path it would delete, so it waits until they can be read: " + r.namedErr.Error()})
-	}
-	return err
+	return r.putAgain(ctx, store.Note{ID: id, Kind: store.NoteProblem, Source: store.Capacity, At: r.now,
+		Title:  "Capacity deleted and pruned nothing: the scheduled jobs could not all be read",
+		Detail: "A job may name a path it would delete, so it waits until they can be read: " + r.namedErr.Error()}, fresh)
 }
 
 // recordDisks records each fast fill: an event at every run that sees it, and the disk's note, put once per fill and
