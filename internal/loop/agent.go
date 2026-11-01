@@ -10,6 +10,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -161,7 +163,7 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	prog, argv := a.Runner[0], args
 	unit := ""
 	if a.Scope {
-		unit = ScopeUnit(filepath.Base(inv.Dir))
+		unit = ScopeUnit(inv.Dir)
 		prog, argv = "systemd-run", append([]string{"--user", "--scope", "--quiet", "--collect", "--unit", unit, "--", a.Runner[0]}, args...)
 	}
 	cmd := exec.Command(prog, argv...)
@@ -208,8 +210,11 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	return res, nil
 }
 
-// ScopeUnit is the systemd scope a run runs in, by its directory's name (the run's id).
-func ScopeUnit(run string) string { return "momentum-loop-" + run + ".scope" }
+// ScopeUnit is the systemd scope a run runs in, named by its directory: two runs at once never share one.
+func ScopeUnit(dir string) string {
+	sum := sha256.Sum256([]byte(filepath.Clean(dir)))
+	return "momentum-loop-" + hex.EncodeToString(sum[:6]) + ".scope"
+}
 
 // StopScope kills every process of a run's scope and stops it.
 func StopScope(unit string) {
