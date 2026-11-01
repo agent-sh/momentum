@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/config"
+	"github.com/agent-sh/momentum/internal/loop"
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/source"
@@ -124,7 +126,30 @@ func main() {
 	os.Exit(run(context.Background(), os.Args[1:], os.Stdout, os.Stderr))
 }
 
+// run runs a command. Inside one of the loop's runs, all a command prints is scrubbed whole after it ends, both
+// streams, before any of it is written: a run reads nothing of momentum's that the secret scrubber has not passed.
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if os.Getenv("MOMENTUM_LOOP_RUN") == "" {
+		return runCommand(ctx, args, stdout, stderr)
+	}
+	var out, diag bytes.Buffer
+	code := runCommand(ctx, args, &out, &diag)
+	cleanOut, outErr := loop.Redact(ctx, out.String())
+	cleanDiag, diagErr := loop.Redact(ctx, diag.String())
+	if outErr != nil || diagErr != nil {
+		fmt.Fprintln(stderr, "momentum: the secret scrubber did not run, so nothing of this command is shown")
+		return 3
+	}
+	if _, err := io.WriteString(stdout, cleanOut); err != nil {
+		return 3
+	}
+	if _, err := io.WriteString(stderr, cleanDiag); err != nil {
+		return 3
+	}
+	return code
+}
+
+func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, usage)
 		return 2

@@ -272,8 +272,9 @@ func reviewFixture(t *testing.T) (*Runner, store.Case, Package) {
 	r := runnerFor(t, st, fakeAgent(t, `{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":1,"structured_output":{"summary":"clean","findings":[]}}`))
 	c := testingCase(t, st)
 	work, head := reviewable(t)
-	p := Package{Case: c.ID, Kind: "repo", Repo: "agent-sh/fake", Base: "main", Work: work, State: Proposed, Head: head, PR: "https://example.invalid/pull/1"}
+	p := Package{Case: c.ID, Kind: "repo", Repo: "agent-sh/fake", Base: "main", Dir: work, Work: work, State: Proposed, Head: head, PR: "https://example.invalid/pull/1"}
 	r.Ship.Public = func(_ context.Context, s string) (string, error) { return Neutral(s), nil }
+	r.Ship.Gate = reviewGate(t)
 	if err := r.Ship.save(&p); err != nil {
 		t.Fatal(err)
 	}

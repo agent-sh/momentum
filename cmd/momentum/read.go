@@ -229,16 +229,40 @@ func evidenceUnit(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	return scrubbed(ctx, stdout, strings.ToValidUTF8(output.String(), "?"))
 }
 
-// scrubRecords withholds oversized records. Selection happens only after each complete record is scrubbed.
-// Output stays bounded and nothing is emitted if any scrub fails.
-func scrubRecords(ctx context.Context, input io.Reader, tail int) (string, error) {
-	r := bufio.NewReaderSize(input, readMax+1)
+// scrubRecords scrubs one bounded window whole, then selects lines. A tail window drops its first line
+// when it starts inside the file. No fragment of an oversized line is printed.
+func scrubRecords(ctx context.Context, input io.ReadSeeker, tail int) (string, error) {
+	const window = 4 << 20
+	end, err := input.Seek(0, io.SeekEnd)
+	if err != nil {
+		return "", err
+	}
+	start := int64(0)
+	if tail > 0 && end > window {
+		start = end - window
+	}
+	if _, err := input.Seek(start, io.SeekStart); err != nil {
+		return "", err
+	}
+	raw, err := io.ReadAll(io.LimitReader(input, window))
+	if err != nil {
+		return "", err
+	}
+	if start > 0 {
+		if i := bytes.IndexByte(raw, '\n'); i >= 0 {
+			raw = raw[i+1:]
+		} else {
+			raw = nil
+		}
+	}
+	clean, err := loop.Redact(ctx, strings.ToValidUTF8(string(raw), "?"))
+	if err != nil {
+		return "", err
+	}
+	r := bufio.NewReaderSize(strings.NewReader(clean), readMax+1)
 	var lines []string
 	size := 0
 	for {
-		if err := ctx.Err(); err != nil {
-			return "", err
-		}
 		record, err := r.ReadSlice('\n')
 		if err == bufio.ErrBufferFull || len(record) > readMax {
 			for err == bufio.ErrBufferFull {
@@ -250,24 +274,14 @@ func scrubRecords(ctx context.Context, input io.Reader, tail int) (string, error
 			return "", err
 		}
 		if len(record) > 0 {
-			clean, e := loop.Redact(ctx, strings.ToValidUTF8(string(record), "?"))
-			if e != nil {
-				return "", e
-			}
-			if len(clean) > readMax {
-				clean = "(oversized scrubbed record withheld)\n"
-			}
-			if tail <= 0 && size+len(clean) > readMax {
+			if tail <= 0 && size+len(record) > readMax {
 				break
 			}
-			lines = append(lines, clean)
-			size += len(clean)
+			lines = append(lines, string(record))
+			size += len(record)
 			for len(lines) > 0 && (size > readMax || tail > 0 && len(lines) > tail) {
 				size -= len(lines[0])
 				lines = lines[1:]
-			}
-			if tail <= 0 && size >= readMax {
-				break
 			}
 		}
 		if err == io.EOF {

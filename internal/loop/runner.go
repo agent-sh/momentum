@@ -187,7 +187,8 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 // that ran them. What such a run spent is unknown, so it counts its whole budget, and its scope is stopped with
 // whatever it left running.
 func (r *Runner) endStale(ctx context.Context) error {
-	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{})
+	live := "" // an evaluation's runs are its own: their cases are in their trials' stores, not this one
+	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Experiment: &live})
 	if err != nil {
 		return err
 	}
@@ -229,12 +230,28 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 		if only != "" && c.ID != only {
 			continue
 		}
+		spent, running, err := r.caseRoom(ctx, c)
+		if err != nil {
+			return store.Case{}, "", "", err
+		}
+		if running {
+			passed = append(passed, c.ID+" has a run in flight")
+			continue
+		}
 		step, rank := "", 0
 		switch c.Status {
 		case store.CaseTesting:
 			step, rank = StepBuild, 3
 			if p, ok, err := r.Ship.Load(c.ID); err != nil {
 				return store.Case{}, "", "", err
+			} else if ok && p.State == Landed {
+				if !dry {
+					if _, err := r.Store.DeployCase(ctx, c.ID, r.Ship.pkgDir(c.ID), p.LandedAt, p.PR+": "+p.Title, "loop"); err != nil {
+						return store.Case{}, "", "", err
+					}
+				}
+				passed = append(passed, c.ID+" has landed; deployment precedes more work")
+				continue
 			} else if ok && (p.State == Proposed || p.State == Landing) {
 				if n := len(p.Reviews); n >= MaxRounds && !p.Clean() && p.Reviews[n-1].Head == p.Head {
 					passed = append(passed, c.ID+" used its review rounds")
@@ -253,8 +270,8 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 		default:
 			continue // deployed or measuring: the measure tool's
 		}
-		if step != StepPublish && c.Cost.USD+r.Budgets.Run > r.Budgets.Case {
-			passed = append(passed, fmt.Sprintf("%s spent $%.2f of its $%.0f, no room for a run", c.ID, c.Cost.USD, r.Budgets.Case))
+		if step != StepPublish && spent+r.Budgets.Run > r.Budgets.Case {
+			passed = append(passed, fmt.Sprintf("%s spent $%.2f of its $%.0f, no room for a run", c.ID, spent, r.Budgets.Case))
 			continue
 		}
 		if stop, err := r.stopped(ctx, c, dry); err != nil {
@@ -395,6 +412,18 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 	}
 	if err := r.Store.FinishLoopRun(ctx, *run); err != nil {
 		r.logf("record run %s: %v", run.ID, err)
+		return
+	}
+	// A report cannot choose another case to change. Its root is applied to this run's case, after it ends.
+	if err == nil && res.Status == store.RunOK && run.Step != StepReview {
+		var report struct {
+			Root string `json:"root"`
+		}
+		if json.Unmarshal(res.Report, &report) == nil && strings.HasPrefix(report.Root, "root:") {
+			if _, _, err := r.Store.AddCaseSignature(ctx, c.ID, report.Root, "loop"); err != nil {
+				r.logf("record root of %s: %v", c.ID, err)
+			}
+		}
 	}
 }
 
@@ -457,7 +486,7 @@ func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step s
 // runSchema is the report every run ends with.
 const runSchema = `{"type":"object","additionalProperties":false,"required":["case","step","outcome","summary"],
 "properties":{"case":{"type":"string"},"step":{"type":"string"},
-"outcome":{"type":"string","enum":["investigated","testing","closed","merged","proposed","published","blocked","nothing"]},
+"outcome":{"type":"string","enum":["investigated","testing","closed","proposed","published","blocked","nothing"]},
 "mechanism":{"type":"string"},"root":{"type":"string"},"summary":{"type":"string"},"blocked_by":{"type":"string"}}}`
 
 // reviewSchema is a review run's report: its findings, which its counts are made from.
@@ -540,6 +569,15 @@ func (r *Runner) reviews(ctx context.Context, only string, families ...string) [
 		if only != "" && c.ID != only {
 			continue
 		}
+		spent, running, err := r.caseRoom(ctx, c)
+		if err != nil || running {
+			why := "a run is in flight"
+			if err != nil {
+				why = "cannot read the case's reservations: " + err.Error()
+			}
+			out = append(out, Done{Family: c.Family, Case: c.ID, Step: StepReview, Skipped: why})
+			continue
+		}
 		p, ok, err := r.Ship.Load(c.ID)
 		if err != nil || !ok || (p.State != Proposed && p.State != Landing) {
 			continue
@@ -564,8 +602,8 @@ func (r *Runner) reviews(ctx context.Context, only string, families ...string) [
 		if n := len(p.Reviews); n > 0 && p.Reviews[n-1].Head == p.Head || n >= MaxRounds {
 			continue // reviewed on its head: its findings go back to the build, or its rounds are used
 		}
-		if c.Cost.USD+r.Budgets.Run > r.Budgets.Case {
-			out = append(out, Done{Family: c.Family, Case: c.ID, Step: StepReview, Skipped: fmt.Sprintf("spent $%.2f of its $%.0f, no room for a review", c.Cost.USD, r.Budgets.Case)})
+		if spent+r.Budgets.Run > r.Budgets.Case {
+			out = append(out, Done{Family: c.Family, Case: c.ID, Step: StepReview, Skipped: fmt.Sprintf("spent $%.2f of its $%.0f, no room for a review", spent, r.Budgets.Case)})
 			continue
 		}
 		if stop, err := r.stopped(ctx, c, false); err != nil || stop != "" {
@@ -715,6 +753,13 @@ func (r *Runner) postReview(ctx context.Context, p Package) (Package, error) {
 	if err != nil {
 		return p, err
 	}
+	t, err := r.Ship.Gate.Repository(ctx, p.Dir)
+	if err != nil {
+		return p, err
+	}
+	if !strings.EqualFold(t.Repo, p.Repo) {
+		return p, refused("the review destination is not the package's repository")
+	}
 	url, err := r.Post(ctx, p.Repo, p.PR, pub)
 	if err != nil {
 		return p, err
@@ -727,4 +772,34 @@ func (r *Runner) postReview(ctx context.Context, p Package) (Package, error) {
 		p.State = Revising
 	}
 	return p, r.Ship.save(&p)
+}
+
+// caseRoom counts a case's running reservations as well as its charged cost, including runs started elsewhere
+// and runs of a case merged into this one. Until recovery ends them, they also block work on the case.
+func (r *Runner) caseRoom(ctx context.Context, c store.Case) (float64, bool, error) {
+	live := ""
+	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Experiment: &live})
+	if err != nil {
+		return 0, false, err
+	}
+	spent, running := c.Cost.USD, false
+	for _, run := range runs {
+		if run.Status != store.RunRunning {
+			continue
+		}
+		holder, err := r.Store.CaseLive(ctx, run.Case)
+		if err != nil {
+			return 0, false, err
+		}
+		if holder.ID != c.ID {
+			continue
+		}
+		running = true
+		cost := run.USD
+		if cost == 0 {
+			cost = r.Budgets.Run
+		}
+		spent += cost
+	}
+	return spent, running, nil
 }

@@ -20,12 +20,12 @@ For each piece you open, read three things: the call that failed (the event just
 - **A tool or service is broken or missing**: an MCP server that fails to start, a path that is not there, a credential that expired. The test: does it fail for every caller, and since when? The fix is in the tool's repository or its configuration.
 - **An environment differs**: a sandbox, a worktree, another PATH, another user. The test: does the same call work outside it?
 - **A model refusal**: a request a provider's safety filter declines. The test: what the requests share. The fix is in how the work is asked, or the case is not worth it.
-- **An incident**: read its log lines and the service's own history (`journalctl --user -u UNIT`, `systemctl --user status UNIT`).
+- **An incident**: read its log lines and the service's own history (`momentum evidence unit NAME`).
 
 ## Judgment calls
 
 - A change that only rewrites the words of a message does not fix a failure, and the measurement must count what the agents do, not those words.
 - Fix the source, not the symptom: the tool's bug in its repository, the guard's rule in the guard. A note to agents is the last resort, never the first.
 - Not worth it: a failure that costs seconds, that agents route around at once, in a tool used rarely.
-- Already solved: a fix landed after the newest evidence (git log of the tool), and nothing since.
-- Another case's cause: when the failure is a symptom of what another case holds (the same root), close as a duplicate into it.
+- Already solved: a fix landed after the newest evidence (`momentum evidence git DIR log` of the tool), and nothing since.
+- Another case's cause: when the failure is a symptom of what another case holds (the same root), name the root with `momentum case signature $MOMENTUM_LOOP_CASE root:KEY`. If another case holds it, report the root and the other case's id in the mechanism, then end the run. The runner records the root and merges outside the run.

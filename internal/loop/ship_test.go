@@ -957,3 +957,208 @@ func TestACleanReviewIsOfTheHeadProposed(t *testing.T) {
 		t.Fatal("a clean posted review of the head")
 	}
 }
+
+// The work tree's branch activates its own configuration before any file is materialized. Every later step
+// refuses a driver activated there too, and none runs it on the host.
+func TestBranchConditionalDriversAreRefused(t *testing.T) {
+	for _, step := range []string{"prepare", "check", "propose", "land"} {
+		t.Run(step, func(t *testing.T) {
+			ctx := context.Background()
+			st := testStore(t)
+			f := newRepo(t, map[string]string{".gitattributes": "fake.go filter=fixture\n"})
+			s := shipFor(t, st, f)
+			c := testingCase(t, st)
+			marker := filepath.Join(f.dir, "marker")
+			filter := script(t, f.dir, "filter", "echo ran > '"+marker+"'\ncat")
+			cfg := filepath.Join(f.dir, "branch-config")
+			write(t, cfg, "[filter \"fixture\"]\n smudge = "+filter+"\n clean = "+filter+"\n")
+			var p Package
+			var err error
+			if step != "prepare" {
+				p, err = s.Prepare(ctx, c.ID, f.main)
+				if err != nil {
+					t.Fatal(err)
+				}
+				write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
+				write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
+				if step != "check" {
+					if _, err = s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if step == "land" {
+					if _, err = s.Propose(ctx, c.ID, Proposal{Title: "Answer", Body: "Fix it.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
+						t.Fatal(err)
+					}
+					if _, err = s.Reviewed(ctx, c.ID, Review{Comment: "https://example.invalid/review"}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			run(t, f.main, "git", "config", "includeIf.onbranch:momentum/**.path", cfg)
+			if err := CheckGitFilters(ctx, f.main); err != nil {
+				t.Fatalf("main has no driver: %v", err)
+			}
+			switch step {
+			case "prepare":
+				_, err = s.Prepare(ctx, c.ID, f.main)
+			case "check":
+				_, err = s.Check(ctx, c.ID, "go test ./...", nil)
+			case "propose":
+				_, err = s.Propose(ctx, c.ID, Proposal{Title: "Answer", Body: "Fix it.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour})
+			case "land":
+				_, err = s.Land(ctx, c.ID)
+			}
+			if !errors.Is(err, ErrRefused) {
+				t.Fatalf("%s: %v", step, err)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("driver ran: %v", err)
+			}
+			if step == "prepare" {
+				if _, err := os.Stat(filepath.Join(s.workDir(c.ID), "fake.go")); !os.IsNotExist(err) {
+					t.Fatal("files materialized before branch configuration check")
+				}
+			}
+		})
+	}
+}
+
+// A configured signer or verifier never runs through the ship lifecycle, even on a signed ancestor. The
+// attributes variant also exercises the lifecycle with the filter refusal removed by a test overlay.
+func TestShipGitRunsNoRepositoryPrograms(t *testing.T) {
+	for _, surface := range []string{"signatures", "attributes"} {
+		t.Run(surface, func(t *testing.T) {
+			ctx := context.Background()
+			st := testStore(t)
+			f := newRepo(t, map[string]string{".gitattributes": "fake.go filter=fixture diff=fixture merge=fixture\n"})
+			s := shipFor(t, st, f)
+			marker := filepath.Join(f.dir, "marker")
+			program := script(t, f.dir, "program", "echo ran > '"+marker+"'\ncat")
+			tree := strings.TrimSpace(run(t, f.main, "git", "rev-parse", "HEAD^{tree}"))
+			raw := "tree " + tree + "\nauthor Fixture <fixture@example.invalid> 1700000000 +0000\ncommitter Fixture <fixture@example.invalid> 1700000000 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n c3ludGhldGlj\n -----END PGP SIGNATURE-----\n\nfixture\n"
+			object := filepath.Join(f.dir, "object")
+			write(t, object, raw)
+			sha := strings.TrimSpace(run(t, f.main, "git", "hash-object", "-t", "commit", "-w", object))
+			run(t, f.main, "git", "reset", "--hard", sha)
+			run(t, f.main, "git", "push", "--force", "origin", "HEAD:main")
+			if surface == "attributes" {
+				for _, key := range []string{"filter.fixture.clean", "filter.fixture.smudge", "diff.fixture.command", "merge.fixture.driver"} {
+					run(t, f.main, "git", "config", key, program)
+				}
+				if err := CheckGitFilters(ctx, f.main); err != nil {
+					t.Skip("filter refusal holds; the overlay removes it to check attribute isolation independently")
+				}
+			} else {
+				for _, key := range []string{"gpg.program", "gpg.openpgp.program", "gpg.x509.program", "gpg.ssh.program"} {
+					run(t, f.main, "git", "config", key, program)
+				}
+				for _, key := range []string{"log.showSignature", "commit.gpgSign", "push.gpgSign"} {
+					run(t, f.main, "git", "config", key, "true")
+				}
+			}
+			// The scope checker is an independent program. This fixture checks only its authority receipt.
+			s.Gate.RepoGuard = []string{script(t, f.dir, "allow", `echo '{"allowed":true}'`)}
+			c, p := reviewedChange(t, s, st, f)
+			if _, err := s.git(ctx, p.Work, "log", "--format=%G?"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := gitOutput(ctx, p.Work, "log", "--format=%G?"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.Land(ctx, c.ID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.RollBack(ctx, c.ID, "fixture"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("repository program ran: %v", err)
+			}
+		})
+	}
+}
+
+// Fetch and every expanded push URL name the same repository, including rewrites and branch-local settings.
+func TestPushDestinationsMustAgree(t *testing.T) {
+	ctx := context.Background()
+	for _, mode := range []string{"pushurl", "multiple", "pushInsteadOf", "insteadOf", "branch"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newRepo(t, nil)
+			run(t, f.main, "git", "remote", "set-url", "origin", "https://github.com/agent-sh/fake.git")
+			dir := f.main
+			switch mode {
+			case "pushurl":
+				run(t, dir, "git", "config", "remote.origin.pushurl", "https://github.com/elsewhere/other.git")
+			case "multiple":
+				run(t, dir, "git", "config", "--add", "remote.origin.pushurl", "git@github.com:agent-sh/fake.git")
+				run(t, dir, "git", "config", "--add", "remote.origin.pushurl", "https://github.com/elsewhere/other.git")
+			case "pushInsteadOf":
+				run(t, dir, "git", "config", "url.https://github.com/elsewhere/.pushInsteadOf", "https://github.com/agent-sh/")
+			case "insteadOf":
+				run(t, dir, "git", "config", "remote.origin.pushurl", "fixture:other.git")
+				run(t, dir, "git", "config", "url.https://github.com/elsewhere/.insteadOf", "fixture:")
+			case "branch":
+				cfg := filepath.Join(f.dir, "branch-config")
+				write(t, cfg, "[remote \"origin\"]\n pushurl = https://github.com/elsewhere/other.git\n")
+				run(t, dir, "git", "config", "includeIf.onbranch:momentum/**.path", cfg)
+				dir = filepath.Join(f.dir, "branch")
+				run(t, f.main, "git", "worktree", "add", "-b", "momentum/fixture", dir, "HEAD")
+			}
+			if repo, err := RepoOf(ctx, dir); !errors.Is(err, ErrRefused) {
+				t.Fatalf("%s: %s %v", mode, repo, err)
+			}
+			gate := reviewGate(t)
+			if _, err := gate.Repository(ctx, dir); !errors.Is(err, ErrRefused) {
+				t.Fatalf("gate: %v", err)
+			}
+		})
+	}
+	f := newRepo(t, nil)
+	run(t, f.main, "git", "remote", "set-url", "origin", "https://github.com/agent-sh/fake.git")
+	run(t, f.main, "git", "config", "--add", "remote.origin.pushurl", "git@github.com:agent-sh/fake.git")
+	run(t, f.main, "git", "config", "--add", "remote.origin.pushurl", "ssh://git@github.com/agent-sh/fake")
+	if repo, err := RepoOf(ctx, f.main); err != nil || repo != "agent-sh/fake" {
+		t.Fatalf("same repository: %s %v", repo, err)
+	}
+}
+
+// A changed push destination cannot take a proposal, landing, deletion or rollback. The check uses the actual
+// work tree and compares its identity to the package, even when the fetch and push URLs agree with each other.
+func TestEveryPushChecksItsPackageDestination(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	f := newRepo(t, nil)
+	s := shipFor(t, st, f)
+	c, p := reviewedChange(t, s, st, f)
+	other := filepath.Join(f.dir, "other.git")
+	run(t, f.dir, "git", "clone", "--bare", f.origin, other)
+	base := originHead(t, f, "main")
+	for _, rewrite := range []bool{false, true} {
+		if rewrite {
+			run(t, f.main, "git", "config", "--unset-all", "remote.origin.pushurl")
+			run(t, f.main, "git", "config", "url."+other+".pushInsteadOf", f.origin)
+		} else {
+			run(t, f.main, "git", "config", "remote.origin.pushurl", other)
+		}
+		for _, args := range [][]string{{"--no-verify", "origin", "HEAD:refs/heads/" + p.Branch}, {"--no-verify", "origin", "HEAD:refs/heads/main"}, {"--no-verify", "origin", "--delete", p.Branch}} {
+			if _, err := s.push(ctx, p, p.Work, args...); !errors.Is(err, ErrRefused) {
+				t.Fatalf("push %v: %v", args, err)
+			}
+		}
+		if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) {
+			t.Fatalf("land: %v", err)
+		}
+		if got := strings.TrimSpace(run(t, f.dir, "git", "--git-dir", other, "rev-parse", "main")); got != base {
+			t.Fatal("foreign repository changed")
+		}
+	}
+	run(t, f.main, "git", "config", "--unset-all", "url."+other+".pushInsteadOf")
+	s.Gate.Resolve = func(context.Context, string) (string, error) { return "agent-sh/other", nil }
+	if _, err := s.push(ctx, p, p.Work, "origin", "HEAD:refs/heads/main"); !errors.Is(err, ErrRefused) {
+		t.Fatalf("different package identity: %v", err)
+	}
+	if originHead(t, f, "main") != base {
+		t.Fatal("origin changed")
+	}
+}

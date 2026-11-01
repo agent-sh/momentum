@@ -285,6 +285,7 @@ func reviewable(t *testing.T) (string, string) {
 	t.Helper()
 	work := t.TempDir()
 	run(t, work, "git", "init", "-q", "-b", "main")
+	run(t, work, "git", "remote", "add", "origin", "https://github.com/agent-sh/fake.git")
 	write(t, filepath.Join(work, "x.go"), "package x\n")
 	run(t, work, "git", "add", "-A")
 	run(t, work, "git", "commit", "-q", "-m", "base")
@@ -363,13 +364,14 @@ func TestAReviewIsHeldAsARunIsAndGoesBackToTheBuild(t *testing.T) {
 	r := runnerFor(t, st, fakeAgent(t, review))
 	c := testingCase(t, st)
 	work, head := reviewable(t)
-	p := Package{Case: c.ID, Kind: "repo", Repo: "agent-sh/fake", Base: "main", Work: work, State: Proposed, Head: head, PR: "https://x/pull/1"}
+	p := Package{Case: c.ID, Kind: "repo", Repo: "agent-sh/fake", Base: "main", Dir: work, Work: work, State: Proposed, Head: head, PR: "https://x/pull/1"}
 	if err := r.Ship.save(&p); err != nil {
 		t.Fatal(err)
 	}
 	posted := ""
 	r.Post = func(_ context.Context, repo, pr, body string) (string, error) { posted = body; return pr + "#c", nil }
 	r.Ship.Public = func(_ context.Context, s string) (string, error) { return Neutral(s), nil }
+	r.Ship.Gate = reviewGate(t)
 	done := r.reviews(ctx, "")
 	if len(done) != 1 || done[0].Step != StepReview {
 		t.Fatalf("reviews %+v", done)
@@ -397,7 +399,7 @@ func TestAReviewIsHeldAsARunIsAndGoesBackToTheBuild(t *testing.T) {
 	st2 := testStore(t)
 	r2 := runnerFor(t, st2, fakeAgent(t, `{"type":"result","subtype":"success","is_error":true,"num_turns":1,"total_cost_usd":3.5,"result":"the safeguards blocked it"}`))
 	c2 := testingCase(t, st2)
-	p2 := Package{Case: c2.ID, Kind: "repo", Repo: "agent-sh/fake", Base: "main", Work: work, State: Proposed, Head: head, PR: "https://x/pull/1"}
+	p2 := Package{Case: c2.ID, Kind: "repo", Repo: "agent-sh/fake", Base: "main", Dir: work, Work: work, State: Proposed, Head: head, PR: "https://x/pull/1"}
 	r2.Ship.save(&p2)
 	for i := 0; i < 2; i++ {
 		if d := r2.reviews(ctx, ""); len(d) != 1 || d[0].Run.Status != store.RunFailed {
@@ -411,7 +413,7 @@ func TestAReviewIsHeldAsARunIsAndGoesBackToTheBuild(t *testing.T) {
 	r3 := runnerFor(t, st3, fakeAgent(t, review))
 	c3 := testingCase(t, st3)
 	st3.AddCaseCost(ctx, c3.ID, store.Cost{USD: 17}, "test")
-	p3 := Package{Case: c3.ID, Kind: "repo", Repo: "agent-sh/fake", Base: "main", Work: work, State: Proposed, Head: head, PR: "https://x/pull/1"}
+	p3 := Package{Case: c3.ID, Kind: "repo", Repo: "agent-sh/fake", Base: "main", Dir: work, Work: work, State: Proposed, Head: head, PR: "https://x/pull/1"}
 	r3.Ship.save(&p3)
 	if d := r3.reviews(ctx, ""); len(d) != 1 || !strings.Contains(d[0].Skipped, "no room") {
 		t.Fatalf("a review over the case's budget: %+v", d)
@@ -433,7 +435,8 @@ func TestADryRunWritesNothing(t *testing.T) {
 		st.PutLoopRun(ctx, store.LoopRun{ID: fmt.Sprint("f", i), Case: c.ID, Family: "failures", Step: StepInvestigate,
 			Started: time.Now().Add(-time.Duration(i+1) * time.Minute), Ended: time.Now(), Status: store.RunTurns, Failure: "turns"})
 	}
-	st.PutLoopRun(ctx, store.LoopRun{ID: "old", Case: "c0", Family: "failures", Step: StepInvestigate, Started: time.Now().Add(-5 * time.Hour), Status: store.RunRunning})
+	oldCase := openCase(t, st, "sessions", "old", 1)
+	st.PutLoopRun(ctx, store.LoopRun{ID: "old", Case: oldCase.ID, Family: "failures", Step: StepInvestigate, Started: time.Now().Add(-5 * time.Hour), Status: store.RunRunning})
 	done, err := r.Once(ctx, Options{Dry: true, Families: []string{"failures"}})
 	if err != nil || len(done) != 1 || !strings.Contains(done[0].Skipped, "stopped") {
 		t.Fatalf("dry %+v %v", done, err)
@@ -551,5 +554,258 @@ func TestACaseWhoseChangeWaitsOnItsReviewIsNotBuilt(t *testing.T) {
 	}
 	if got, step, _, err := r.pick(ctx, "failures", "", false); err != nil || got.ID != c.ID || step != StepBuild {
 		t.Fatalf("a change sent back by its review: %s %s %v", got.ID, step, err)
+	}
+}
+
+// reviewGate authorizes the synthetic review repository without contacting a forge.
+func reviewGate(t *testing.T) Gate {
+	return Gate{Owners: []string{"agent-sh"}, RepoGuard: []string{script(t, t.TempDir(), "guard", `echo '{"allowed":true}'`)}}
+}
+
+// A recent reservation, whoever of the loop's runners started it (one killed before stale recovery could end its
+// run), blocks another run and holds its case's room until stale recovery ends it.
+func TestARunningReservationHoldsItsCase(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := runnerFor(t, st, fakeAgent(t, okResult))
+	c := openCase(t, st, "failures", "recent", 1)
+	r.Budgets.Run = 4
+	r.Budgets.Case = 4
+	r.Budgets.Day = 20
+	old := store.LoopRun{ID: "other-run", Case: c.ID, Family: c.Family, Step: StepInvestigate, Started: time.Now(), Status: store.RunRunning, USD: 4}
+	if err := st.PutLoopRun(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if spent, running, err := r.caseRoom(ctx, c); err != nil || spent != 4 || !running {
+		t.Fatalf("room %v %v %v", spent, running, err)
+	}
+	if _, err := r.Once(ctx, Options{Families: []string{"failures"}}); err != nil {
+		t.Fatal(err)
+	}
+	runs, err := st.LoopRuns(ctx, store.RunFilter{Case: c.ID})
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("second run admitted: %d %v", len(runs), err)
+	}
+	r.Now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	if err := r.endStale(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.CaseByID(ctx, c.ID)
+	if err != nil || got.Cost.USD != 4 {
+		t.Fatalf("recovery charge: %+v %v", got.Cost, err)
+	}
+	if c, _, _, err := r.pick(ctx, "failures", "", false); err != nil || c.ID != "" {
+		t.Fatalf("spent case picked: %s %v", c.ID, err)
+	}
+}
+
+// A running reservation also blocks reviews, review-post retries and landings of its case.
+func TestReviewsPassOverACaseWithARunInFlight(t *testing.T) {
+	ctx := context.Background()
+	for _, state := range []string{"unreviewed", "pending", "clean"} {
+		t.Run(state, func(t *testing.T) {
+			r, c, p := reviewFixture(t)
+			if state != "unreviewed" {
+				p.Reviews = []Review{{Head: p.Head, Text: "clean"}}
+			}
+			if state == "clean" {
+				p.Reviews[0].Comment = "https://example.invalid/receipt"
+			}
+			if err := r.Ship.save(&p); err != nil {
+				t.Fatal(err)
+			}
+			reservation, why := r.reserve(ctx, c.Family, c.ID, StepBuild)
+			if why != "" {
+				t.Fatal(why)
+			}
+			posts := 0
+			r.Post = func(context.Context, string, string, string) (string, error) {
+				posts++
+				return "https://example.invalid/review", nil
+			}
+			done := r.reviews(ctx, "")
+			runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID})
+			if err != nil || len(runs) != 1 || runs[0].ID != reservation.ID || posts != 0 {
+				t.Fatalf("review crossed reservation: %+v posts=%d %v", runs, posts, err)
+			}
+			if len(done) != 1 || !strings.Contains(done[0].Skipped, "in flight") {
+				t.Fatalf("not skipped: %+v", done)
+			}
+		})
+	}
+}
+
+// Every review post rechecks current repository authority. A refusal leaves its receipt pending and spends
+// neither a new run nor a round; restoring authority permits the same review to be posted.
+func TestAReviewPostRechecksRepositoryAuthority(t *testing.T) {
+	ctx := context.Background()
+	for _, reason := range []string{"owner", "excluded", "busy", "scope", "identity"} {
+		t.Run(reason, func(t *testing.T) {
+			r, c, p := reviewFixture(t)
+			p.Reviews = []Review{{Head: p.Head, Text: "clean"}}
+			if err := r.Ship.save(&p); err != nil {
+				t.Fatal(err)
+			}
+			gate := r.Ship.Gate
+			switch reason {
+			case "owner":
+				r.Ship.Gate.Owners = nil
+			case "excluded":
+				r.Ship.Gate.Exclude = []string{p.Repo}
+			case "busy":
+				r.Ship.Gate.Busy = func(context.Context, string) (string, error) { return "fixture", nil }
+			case "scope":
+				r.Ship.Gate.RepoGuard = []string{"false"}
+			case "identity":
+				r.Ship.Gate.Resolve = func(context.Context, string) (string, error) { return "agent-sh/other", nil }
+			}
+			posts := 0
+			r.Post = func(context.Context, string, string, string) (string, error) {
+				posts++
+				return "https://example.invalid/receipt", nil
+			}
+			// The first post and the scan's retry use the same boundary.
+			if _, err := r.postReview(ctx, p); err == nil {
+				t.Fatal("first post was authorized")
+			}
+			r.reviews(ctx, "")
+			got, _, err := r.Ship.Load(c.ID)
+			runs, runErr := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID})
+			if err != nil || runErr != nil || posts != 0 || got.Clean() || len(got.Reviews) != 1 || len(runs) != 0 {
+				t.Fatalf("refusal spent or posted: posts=%d reviews=%d runs=%d %v %v", posts, len(got.Reviews), len(runs), err, runErr)
+			}
+			r.Ship.Gate = gate
+			r.reviews(ctx, "")
+			got, _, err = r.Ship.Load(c.ID)
+			if err != nil || posts != 1 || !got.Clean() {
+				t.Fatalf("pending review lost: posts=%d clean=%v %v", posts, got.Clean(), err)
+			}
+		})
+	}
+}
+
+// A package saved as landed is reconciled before its testing case can build again, after a fresh or resumed
+// landing. The recorded landing time survives retries and a dry pick writes nothing.
+func TestALandedPackageFinishesItsDeployment(t *testing.T) {
+	ctx := context.Background()
+	for _, resumed := range []bool{false, true} {
+		t.Run(fmt.Sprint(resumed), func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "store.db")
+			st, err := store.Open(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			f := newRepo(t, nil)
+			s := shipFor(t, st, f)
+			c, p := reviewedChange(t, s, st, f)
+			if resumed {
+				run(t, p.Work, "git", "push", "origin", "HEAD:main")
+				p.State, p.LandingHead = Landing, p.Head
+				if err := s.save(&p); err != nil {
+					t.Fatal(err)
+				}
+			}
+			db, err := sql.Open("sqlite", file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if _, err := db.Exec(`CREATE TRIGGER fail_deploy BEFORE UPDATE OF status ON cases WHEN NEW.status='deployed' BEGIN SELECT RAISE(ABORT, 'fixture interruption'); END`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.Land(ctx, c.ID); err == nil {
+				t.Fatal("deployment should fail")
+			}
+			landed, _, err := s.Load(c.ID)
+			if err != nil || landed.State != Landed || landed.LandedAt.IsZero() {
+				t.Fatalf("landing not saved: %+v %v", landed, err)
+			}
+			if _, err := db.Exec(`DROP TRIGGER fail_deploy`); err != nil {
+				t.Fatal(err)
+			}
+			r := runnerFor(t, st, nil)
+			r.Ship = s
+			if picked, _, _, err := r.pick(ctx, c.Family, c.ID, true); err != nil || picked.ID != "" {
+				t.Fatalf("dry pick: %s %v", picked.ID, err)
+			}
+			got, err := st.CaseByID(ctx, c.ID)
+			if err != nil || got.Status != store.CaseTesting {
+				t.Fatalf("dry deployed: %s %v", got.Status, err)
+			}
+			if picked, _, _, err := r.pick(ctx, c.Family, c.ID, false); err != nil || picked.ID != "" {
+				t.Fatalf("picked landed case: %s %v", picked.ID, err)
+			}
+			got, err = st.CaseByID(ctx, c.ID)
+			if err != nil || got.Status != store.CaseDeployed || got.Deployed.UnixMilli() != landed.LandedAt.UnixMilli() {
+				t.Fatalf("deployment lost: %+v %v", got, err)
+			}
+			if picked, _, _, err := r.pick(ctx, c.Family, c.ID, false); err != nil || picked.ID != "" {
+				t.Fatalf("picked deployed case: %s %v", picked.ID, err)
+			}
+		})
+	}
+}
+
+// A run reports a root but cannot merge into its holder. After the run ends, the runner records the root on
+// the run's own case, ignoring a different case id in the report, and the store merges by that root.
+func TestTheRunnerRecordsAReportsRootOnItsOwnCase(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	a := openCase(t, st, "failures", "a", 1)
+	b := openCase(t, st, "failures", "b", 1)
+	unrelated := openCase(t, st, "failures", "unrelated", 1)
+	if _, _, err := st.AddCaseSignature(ctx, b.ID, "root:fixture", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.AddCaseSignature(store.WithCaseAuthority(ctx, a.ID), a.ID, "root:fixture", "run"); err == nil {
+		t.Fatal("run merged its case")
+	}
+	result := strings.Replace(okResult, `"case":"x"`, `"case":"`+unrelated.ID+`","root":"root:fixture","mechanism":"same as `+b.ID+`"`, 1)
+	r := runnerFor(t, st, fakeAgent(t, result))
+	if _, err := r.Once(ctx, Options{Case: a.ID, Families: []string{"failures"}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.CaseLive(ctx, a.ID)
+	if err != nil || got.ID != b.ID || got.Cost.USD != 0.75 {
+		t.Fatalf("root not reconciled: %+v %v", got, err)
+	}
+	untouched, err := st.CaseLive(ctx, unrelated.ID)
+	if err != nil || untouched.ID != unrelated.ID || untouched.Cost.USD != 0 {
+		t.Fatalf("report chose another case: %+v %v", untouched, err)
+	}
+	procedure, err := Skill("loop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	failures, err := Skill("failures")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(runSchema, `"merged"`) || strings.Contains(procedure, "or a duplicate") || strings.Contains(procedure, "work on there") || !strings.Contains(procedure, "report's `root`") {
+		t.Fatal("procedure prescribes a merge inside the run")
+	}
+	if strings.Contains(failures, "journalctl") || strings.Contains(failures, "systemctl") || !strings.Contains(failures, "momentum evidence unit NAME") {
+		t.Fatal("failures skill bypasses evidence unit")
+	}
+}
+
+// An evaluation's runs are its own: one left running (its process killed) is neither ended by the loop's stale
+// recovery, whose cases they are not, nor counted against a live case, and the loop runs on.
+func TestAnEvaluationsRunsAreNotTheLoops(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := runnerFor(t, st, fakeAgent(t, okResult))
+	c := openCase(t, st, "failures", "live", 2)
+	if err := st.PutLoopRun(ctx, store.LoopRun{ID: "eval-run", Case: "c-of-a-trial", Family: "failures", Step: StepInvestigate,
+		Started: time.Now().Add(-3 * time.Hour), Status: store.RunRunning, USD: 4, Experiment: "eval:x:task:1"}); err != nil {
+		t.Fatal(err)
+	}
+	done, err := r.Once(ctx, Options{Families: []string{"failures"}})
+	if err != nil || len(done) != 1 || done[0].Case != c.ID || done[0].Run.Status != store.RunOK {
+		t.Fatalf("the loop with an evaluation's run left running: %+v %v", done, err)
+	}
+	if run, err := st.LoopRunByID(ctx, "eval-run"); err != nil || run.Status != store.RunRunning {
+		t.Fatalf("the evaluation's run: %+v %v", run, err)
 	}
 }
