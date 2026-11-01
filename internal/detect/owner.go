@@ -11,17 +11,19 @@ import (
 
 // OwnerBurden finds what keeps making the owner step in: his own turns that push back, correct or repeat, read
 // with what the agent did just before. Only his words count, as tacit credits them (an owner event of the
-// transcripts, in a session's own thread): never generated text, never a program's. Each kind of step-in is a
-// signature of its own, keyed by what the agent's last words did:
+// transcripts, in a session's own thread), less what a program typed (Programs): never generated text. Each kind
+// of step-in is a signature of its own, keyed by what the agent's last words did:
 //   - attribution: they credited him with words or a rule, and he pushed back;
 //   - handback: their last words handed him a step or a decision, and he pushed back or handed it back;
 //   - done-claim: their last words claimed a result, and he said it does not hold;
 //   - stopped: their last words said they wait or will report, and he had to nudge;
 //   - repeat: he said again what he had said in the session that day.
 //
+// A turn is read with the agent's last words since his turn before it: words he answered once are not read again.
 // A push back with none of those before it is not keyed: the words alone do not say what made him step in.
 type OwnerBurden struct {
-	Recur Recur // default OwnerRecur
+	Recur    Recur // default OwnerRecur
+	Programs Programs
 }
 
 // OwnerRecur: three of his turns of one kind in two sessions in a week.
@@ -35,21 +37,22 @@ const lookBack = 6 * time.Hour
 // repeatSpan is how far back in a session a turn he repeats may be.
 const repeatSpan = 24 * time.Hour
 
+// The marks are plain English phrasing of a push back, a nudge, a hand-back and a claim, not any one person's
+// idiom; their precision was checked on a month of labelled turns, whose labels and counts stay on the machine.
 var (
-	// pushRe are the marks of a push back in his words, each kept for its precision on a labelled month of turns
-	// (the labels and counts stay on the machine): why, a doubled ? or !, what he said or asked, what the agent did
-	// not do, a what? or a wtf, what should have been, do it yourself, my rule, how many times, a turn that opens
-	// with no.
+	// pushRe are the marks of a push back in his words: why, a doubled ? or !, what he said or asked, what the
+	// agent did not do, a what? or a wtf, what should have been, do it yourself, my rule, how many times, a turn
+	// that opens with no.
 	pushRe = regexp.MustCompile(`(?i)(\bwhy\b|\?\?|!!|\bi\s+(?:said|told|asked|wrote|mentioned)\b|\bi\s+(?:didn'?t|did\s+not|never)\s+(?:say|said|ask|want|mean)\b|` +
-		`\byou\s+(?:didn'?t|did\s+not|dont|don'?t|never|keep|kept|missed|forgot|ignored|broke|can\s+do|can\s+simply)\b|\bwhat\?|\bwtf\b|\bseriously\b|` +
-		`\bshould\s+have\b|\bsupposed\s+to\b|\bunacceptable\b|\buseless\b|\bunusable\b|\bdo\s+it\s+yourself\b|\bperform\s+what\b|` +
+		`\byou\s+(?:didn'?t|did\s+not|dont|don'?t|never|keep|kept|missed|forgot|ignored|broke)\b|\bwhat\?|\bwtf\b|\bseriously\b|` +
+		`\bshould\s+have\b|\bsupposed\s+to\b|\bunacceptable\b|\buseless\b|\bunusable\b|\bdo\s+it\s+yourself\b|` +
 		`\bwhy\s+(?:do\s+)?you\s+need\s+me\b|\bmy\s+rule\b|\bhow\s+many\s+times\b|^\s*no\b)`)
 	// nudgeRe are his nudges to a session that stopped.
 	nudgeRe = regexp.MustCompile(`(?i)(\bare you (?:off|there|alive|stuck|done|working)\b|\bwhat are (?:we|you) waiting\b|^\s*status\??\s*$|\bwhats? the status\b|` +
 		`\bwhy (?:did you )?stop|\bwhy (?:are you )?idle\b|^\s*(?:continue|go on|keep going|proceed)\b|\bany progress\b|^\s*\?+\s*$)`)
 	// delegateRe: he hands a decision back to the agent that asked him for it.
 	delegateRe = regexp.MustCompile(`(?i)(\byou (?:can )?decide\b|\bdo (?:as|what) you think\b|\byou can do\b|\bdo it yourself\b|\bjust do\b|` +
-		`\bno need\b|\bdon'?t ask\b|\bdont ask\b|\bup to you\b|\byour call\b|\bperform what\b|\byou have (?:the )?approval\b)`)
+		`\bno need\b|\bdon'?t ask\b|\bdont ask\b|\bup to you\b|\byour call\b|\byou have (?:the )?approval\b)`)
 	// notDoneRe: he says a result does not hold.
 	notDoneRe = regexp.MustCompile(`(?i)(\bdoes?n'?t work|\bdont work|\bnot work|\bisn'?t work|\bstill (?:not|broken|fail|the same|doesn|dont|isn|no\b)|` +
 		`\bnot fixed\b|\bbroken\b|\bdidn'?t (?:work|fix|change|land)|\bdidnt (?:work|fix|change|land)|\bnothing (?:changed|happen)|` +
@@ -71,7 +74,7 @@ var (
 	wordRe = regexp.MustCompile(`[a-z0-9][a-z0-9/._-]{2,}`)
 )
 
-// ownerClasses are the kinds, in the order they are tried, with their cases' titles.
+// ownerTitles are the kinds' cases' titles.
 var ownerTitles = map[string]string{
 	"attribution": "Agents credit the owner with words or rules he pushes back on",
 	"handback":    "Agents hand the owner a step or a decision, and he pushes back",
@@ -86,6 +89,7 @@ var ownerTitles = map[string]string{
 func OwnerClass(text, agentBefore string, earlier []string) string {
 	push, last := pushRe.MatchString(text), lastWords(agentBefore)
 	switch {
+	case agentBefore == "":
 	case push && attrRe.MatchString(agentBefore):
 		return "attribution"
 	case (push || delegateRe.MatchString(text)) && handRe.MatchString(last):
@@ -138,71 +142,59 @@ func jaccard(a, b map[string]bool) float64 {
 	return float64(inter) / float64(len(a)+len(b)-inter)
 }
 
-// Programmatic text: what the transcripts may credit to the owner but a program typed (SPEC, Boundaries).
-const (
-	momentumMarker = "[momentum]"
-	wakePrefix     = "Wake nonce="
-	twinSpan       = 2 * time.Second // the same text in two sessions this close: a program sent it
-	templateTimes  = 3               // the same text this often in a window: a template a program fills
-	sameTurn       = 2 * time.Minute // the same text again in a session this soon: one turn recorded twice
-)
+// ownerTurns are the owner's turns from since to until, oldest first, and which of them a program typed.
+func ownerTurns(ctx context.Context, st *store.Store, p Programs, since, until, window time.Time) ([]store.Event, map[int]bool, error) {
+	turns, err := st.Events(ctx, store.Query{Since: since, Until: until, Kinds: []string{"owner_text"}, Source: store.Transcripts,
+		Actor: store.ActorOwner, Main: true, Limit: maxRows})
+	if err != nil {
+		return nil, nil, err
+	}
+	for i, j := 0, len(turns)-1; i < j; i, j = i+1, j-1 {
+		turns[i], turns[j] = turns[j], turns[i]
+	}
+	return turns, p.Of(turns, window), nil
+}
 
 func (o OwnerBurden) Detect(ctx context.Context, st *store.Store, w Window) ([]store.Finding, error) {
 	r := o.Recur
 	if r == (Recur{}) {
 		r = OwnerRecur
 	}
-	turns, err := st.Events(ctx, store.Query{Since: w.Since.Add(-repeatSpan), Until: w.Until, Kinds: []string{"owner_text"},
-		Source: store.Transcripts, Actor: store.ActorOwner, Main: true, Limit: maxRows})
+	turns, program, err := ownerTurns(ctx, st, o.Programs, w.Since.Add(-repeatSpan), w.Until, w.Since)
 	if err != nil {
 		return nil, err
-	}
-	// oldest first; a program's text is dropped
-	for i, j := 0, len(turns)-1; i < j; i, j = i+1, j-1 {
-		turns[i], turns[j] = turns[j], turns[i]
-	}
-	times := map[string]int{}
-	for _, t := range turns {
-		times[strings.TrimSpace(t.Summary)]++
-	}
-	twin := map[int]bool{}
-	for i := range turns {
-		for j := i + 1; j < len(turns) && turns[j].TS.Sub(turns[i].TS) <= twinSpan; j++ {
-			if turns[j].Session != turns[i].Session && strings.TrimSpace(turns[j].Summary) == strings.TrimSpace(turns[i].Summary) {
-				twin[i], twin[j] = true, true
-			}
-		}
 	}
 	earlier := map[string][]store.Event{}
 	var occ []occurrence
 	for i, t := range turns {
-		text := strings.TrimSpace(t.Summary)
-		if text == "" || twin[i] || times[text] >= templateTimes || strings.HasPrefix(text, momentumMarker) || strings.HasPrefix(text, wakePrefix) {
+		if program[i] {
 			continue
 		}
-		if prev := earlier[t.Session]; len(prev) > 0 && strings.TrimSpace(prev[len(prev)-1].Summary) == text &&
-			t.TS.Sub(prev[len(prev)-1].TS) <= sameTurn {
-			continue // one turn the transcript holds twice (queued, then sent)
-		}
 		var before []string
+		prevAt := time.Time{}
 		for _, e := range earlier[t.Session] {
 			if t.TS.Sub(e.TS) <= repeatSpan {
 				before = append(before, e.Summary)
 			}
+			prevAt = e.TS
 		}
 		earlier[t.Session] = append(earlier[t.Session], t)
 		if t.TS.Before(w.Since) {
 			continue // read only for what he repeats
 		}
-		prior, err := st.Before(ctx, t.Session, []string{"agent_text"}, t.TS.Add(-lookBack), t.TS, 1)
+		after := t.TS.Add(-lookBack)
+		if prevAt.After(after) {
+			after = prevAt // what he answered already is not read again
+		}
+		prior, err := st.Before(ctx, t.Session, []string{"agent_text"}, after, t.TS, 1)
 		if err != nil {
-			return nil, err
+			return gather("owner-burden", occ, r), err
 		}
 		agent := ""
 		if len(prior) > 0 {
 			agent = prior[0].Summary
 		}
-		class := OwnerClass(text, agent, before)
+		class := OwnerClass(strings.TrimSpace(t.Summary), agent, before)
 		if class == "" {
 			continue
 		}

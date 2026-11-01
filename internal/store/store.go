@@ -806,6 +806,16 @@ func (s *Store) Rebuild(ctx context.Context, source string, force bool) (int, er
 	return int(n), tx.Commit()
 }
 
+// EventByKey reads a source's event by its key; ok is false when the store holds none.
+func (s *Store) EventByKey(ctx context.Context, source, key string) (Event, bool, error) {
+	evs, err := scanEvents(s.db.QueryContext(ctx, `SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
+	  tool, summary, meta, ref, heuristic, experiment FROM events WHERE id = ?`, Event{Source: source, SourceKey: key}.ID()))
+	if err != nil || len(evs) == 0 {
+		return Event{}, false, err
+	}
+	return evs[0], true, nil
+}
+
 // Origin is where events were read from: the file or store their Ref names (all of it before its last '@'),
 // with their harness, session and subagent.
 type Origin struct{ Harness, Path, Session, Agent string }

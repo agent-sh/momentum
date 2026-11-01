@@ -16,6 +16,12 @@ import (
 // Each file is recorded with the modification time and size it had when parsed; a file is parsed again when
 // either changes, and a file never seen is parsed whatever its time says (a move, cp -p, rsync -a or a
 // restore keeps an old mtime). A file that cannot be read is reported and retried on the next run.
+//
+// An incident is one event, rewritten as its file changes: its last sighting and its running count of repeats.
+// Each change of those is also an event of its own, a sighting (kind incident-seen, keyed by the incident and
+// its last sighting), with the repeats since the sighting before it: what the incident did over time, which the
+// one event no longer says. A rebuild reads the files again and keeps one sighting per incident, the one its
+// file shows now.
 type Incidents struct{ Dir string }
 
 func (i Incidents) Name() string { return "incidents" }
@@ -88,7 +94,7 @@ func (i Incidents) Ingest(ctx context.Context, st *store.Store) (Result, error) 
 			if text == "" {
 				text = inc.Signature
 			}
-			evs = append(evs, store.Event{
+			e := store.Event{
 				Source:    i.Name(),
 				SourceKey: inc.ID,
 				TS:        ts,
@@ -97,7 +103,27 @@ func (i Incidents) Ingest(ctx context.Context, st *store.Store) (Result, error) 
 				Summary:   clip(text, 240),
 				Meta:      meta(map[string]any{"status": inc.Status, "repeat": inc.Repeat, "severity": inc.Severity}),
 				Ref:       p,
-			})
+			}
+			prev, had, err := st.EventByKey(ctx, i.Name(), inc.ID)
+			if err != nil {
+				return res, err
+			}
+			var was struct {
+				Repeat int `json:"repeat"`
+			}
+			if had {
+				json.Unmarshal([]byte(prev.Meta), &was)
+			}
+			if !had || !prev.TS.Equal(ts) || was.Repeat != inc.Repeat {
+				fresh := inc.Repeat - was.Repeat
+				if !had || fresh < 0 { // a first sighting, or a count that started again, holds all it counts
+					fresh = inc.Repeat
+				}
+				evs = append(evs, store.Event{Source: i.Name(), SourceKey: inc.ID + "@" + ts.UTC().Format(time.RFC3339Nano), TS: ts,
+					Actor: store.ActorDetector, Kind: "incident-seen", Summary: e.Summary, Ref: p,
+					Meta: meta(map[string]any{"status": inc.Status, "repeat": inc.Repeat, "new": max(fresh, 1), "severity": inc.Severity})})
+			}
+			evs = append(evs, e)
 			marks = append(marks, parsed{p, mtime, size})
 		}
 	}

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/config"
 	"github.com/agent-sh/momentum/internal/detect"
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/plain"
@@ -541,12 +542,16 @@ func caseReopen(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	return nil
 }
 
-// detectors are the families the loop runs, each with its detector.
+// detectors are the families the loop runs, each with its detector, as the machine's configuration sets them.
 func detectors() []detect.Detector {
+	var programs detect.Programs
+	if c, err := config.Load(); err == nil {
+		programs.Prefixes = c.Detect.ProgramPrefixes
+	}
 	return []detect.Detector{
 		detect.Failures{},
-		detect.OwnerBurden{},
-		detect.Sessions{Platforms: func(ctx context.Context) (map[string]string, error) {
+		detect.OwnerBurden{Programs: programs},
+		detect.Sessions{Programs: programs, Platforms: func(ctx context.Context) (map[string]string, error) {
 			return hermes.Platforms(ctx, sessions.EnvFromOS().HermesHome)
 		}},
 	}
@@ -570,7 +575,7 @@ func caseDetect(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	fs := flag.NewFlagSet("case detect", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	families := fs.String("family", "", "comma-separated families (default: every one with a detector)")
-	window := fs.String("since", "7d", "how far back the detectors read: a duration or a time")
+	window := fs.String("since", fmt.Sprintf("%dd", int(detect.DefaultWindow.Hours()/24)), "how far back the detectors read: a duration or a time")
 	dry := fs.Bool("dry", false, "print what the detectors find and file nothing")
 	asJSON := fs.Bool("json", false, "one JSON object per finding")
 	if err := fs.Parse(args); err != nil {
@@ -600,15 +605,17 @@ func caseDetect(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	for f := range unknown {
 		return usageError{fmt.Sprintf("no detector for family %q", f)}
 	}
-	st, err := store.Open(paths.DB())
+	// a dry run reads the store as it is: it migrates nothing, and a store not this build's is an error
+	open := store.Open
+	if *dry {
+		open = store.OpenReadOnly
+	}
+	st, err := open(paths.DB())
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	outs, swept, err := detect.Run(ctx, st, ds, detect.Window{Since: since, Until: time.Now()}, caseActor(), *dry)
-	if err != nil {
-		return err
-	}
+	outs, swept, sweepErr := detect.Run(ctx, st, ds, detect.Window{Since: since, Until: time.Now()}, caseActor(), *dry)
 	failed := 0
 	enc := json.NewEncoder(stdout)
 	for _, o := range outs {
@@ -633,16 +640,26 @@ func caseDetect(ctx context.Context, args []string, stdout, stderr io.Writer) er
 				continue
 			}
 			what := "found"
-			if f.Observed != "" {
+			switch {
+			case f.Err != nil:
+				what = "refused (" + f.Err.Error() + ")"
+			case f.Observed != "":
 				what = fmt.Sprintf("%s %s [%s]", f.Case.ID, f.Observed, statusLine(f.Case))
 			}
 			fmt.Fprintf(stdout, "%-12s %4d ev  %s  %s\n  %s\n", o.Family, len(f.Finding.Evidence), what, f.Finding.Title, f.Finding.Signature)
 		}
 	}
 	for _, c := range swept {
-		if !*asJSON {
-			fmt.Fprintf(stdout, "swept %s: unseen for %s, closed as %s: %s\n", c.ID, "30d", c.Reason, c.Title)
+		if *asJSON {
+			if err := enc.Encode(filedJSON{Family: c.Family, Title: c.Title, Case: c.ID, Observed: "swept", Status: statusLine(c)}); err != nil {
+				return err
+			}
+			continue
 		}
+		fmt.Fprintf(stdout, "swept %s: unseen for %dd, closed as %s: %s\n", c.ID, int(store.CaseRetention.Hours()/24), c.Reason, c.Title)
+	}
+	if sweepErr != nil {
+		return fmt.Errorf("the sweep: %w", sweepErr)
 	}
 	if failed > 0 {
 		return fmt.Errorf("%d of %d detectors failed", failed, len(ds))

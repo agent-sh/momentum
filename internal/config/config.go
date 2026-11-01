@@ -45,6 +45,11 @@ type Sources struct {
 		Notice []string `json:"notice"`
 		Off    bool     `json:"off"`
 	} `json:"supervise"`
+	// Detect configures the loop's detectors. ProgramPrefixes open the turns the machine's programs type into
+	// sessions (a wake loop's, a brief's), which the transcripts may credit to the owner: none of them is his.
+	Detect struct {
+		ProgramPrefixes []string `json:"program_prefixes"`
+	} `json:"detect"`
 }
 
 // ErrNoSources means no sources file exists yet.

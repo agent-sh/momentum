@@ -4,8 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -336,7 +339,7 @@ func TestIncidentsParseOnlyNewOrChangedFiles(t *testing.T) {
 	writeIncident(t, dir, "open", "inc-1", "reported", "2026-01-02T10:00:00+02:00", t0)
 	writeIncident(t, dir, "closed", "inc-2", "closed", "2026-01-02T10:00:00+02:00", t0)
 	inc := Incidents{Dir: dir}
-	if r := ingest(t, inc, st); r.New != 2 || r.Read != 2 {
+	if r := ingest(t, inc, st); r.New != 4 || r.Read != 2 { // two incidents, and a first sighting of each
 		t.Fatalf("first run %+v", r)
 	}
 	if r := ingest(t, inc, st); r.Read != 0 {
@@ -345,7 +348,7 @@ func TestIncidentsParseOnlyNewOrChangedFiles(t *testing.T) {
 	writeIncident(t, dir, "open", "inc-1", "resolved-now", "2026-01-02T11:00:00+02:00", t0) // same mtime, new size
 	// a file that arrives late with an old mtime (mv, cp -p, rsync -a, a restore)
 	writeIncident(t, dir, "open", "inc-3", "new", "2026-01-01T09:00:00+02:00", t0.Add(-24*time.Hour))
-	if r := ingest(t, inc, st); r.Read != 2 || r.New != 1 {
+	if r := ingest(t, inc, st); r.Read != 2 || r.New != 3 { // inc-1's new sighting; inc-3 and its first
 		t.Fatalf("third run %+v, want the changed file and the late file", r)
 	}
 	got := all(t, st, "incidents")
@@ -371,7 +374,7 @@ func TestIncidentsRetryAFileThatWasUnreadable(t *testing.T) {
 	if err := os.Chmod(p, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if r := ingest(t, inc, st); r.New != 1 {
+	if r := ingest(t, inc, st); r.New != 2 || r.Read != 1 { // the incident and its first sighting
 		t.Fatalf("the file was not retried: %+v", r)
 	}
 }
@@ -390,5 +393,55 @@ func TestRunAllKeepsGoingPastAFailingSource(t *testing.T) {
 	out := RunAll(context.Background(), st, []Source{failing{}, Mistakes{Path: log}})
 	if out[0].Err == nil || out[1].Err != nil || out[1].New != 1 {
 		t.Fatalf("outcomes %+v", out)
+	}
+}
+
+// Each change of an incident's last sighting or count of repeats is a sighting of its own, with the repeats since
+// the one before: the incident's one event says only where it stands. A file read again with nothing new adds
+// none; a count that started again counts all of it.
+func TestAnIncidentsSightingsAreEvents(t *testing.T) {
+	st := openStore(t)
+	dir := t.TempDir()
+	at := time.Now().Add(-time.Hour)
+	write := func(lastSeen string, repeat int, mtime time.Time) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(dir, "open"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(dir, "open", "inc-9.json")
+		raw, _ := json.Marshal(map[string]any{"incident_id": "inc-9", "status": "reported", "summary": "a network drops", "last_seen": lastSeen,
+			"repeat_count": repeat})
+		if err := os.WriteFile(p, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inc := Incidents{Dir: dir}
+	write("2026-01-02T10:00:00Z", 12, at)
+	ingest(t, inc, st)
+	write("2026-01-02T11:00:00Z", 30, at.Add(time.Minute))
+	ingest(t, inc, st)
+	write("2026-01-02T11:00:00Z", 30, at.Add(2*time.Minute)) // touched, nothing new
+	ingest(t, inc, st)
+	write("2026-01-02T12:00:00Z", 4, at.Add(3*time.Minute)) // the detector started its count again
+	ingest(t, inc, st)
+	var news []string
+	for k, e := range all(t, st, "incidents") {
+		if e.Kind != "incident-seen" {
+			continue
+		}
+		var m struct{ New, Repeat int }
+		json.Unmarshal([]byte(e.Meta), &m)
+		news = append(news, fmt.Sprintf("%s %d/%d", strings.TrimPrefix(k, "inc-9@"), m.New, m.Repeat))
+	}
+	sort.Strings(news)
+	want := []string{"2026-01-02T10:00:00Z 12/12", "2026-01-02T11:00:00Z 18/30", "2026-01-02T12:00:00Z 4/4"}
+	if !slices.Equal(news, want) {
+		t.Fatalf("sightings %v, want %v", news, want)
+	}
+	if e := all(t, st, "incidents")["inc-9"]; !strings.Contains(e.Meta, `"repeat":4`) {
+		t.Fatalf("the incident %+v", e)
 	}
 }

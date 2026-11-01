@@ -3,6 +3,7 @@ package detect
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -22,6 +23,7 @@ type Sessions struct {
 	// Platforms names the platform each Hermes conversation runs on, which the store does not keep (nil: none
 	// known, and the replay leaves those conversations alone, as supervision does).
 	Platforms func(context.Context) (map[string]string, error)
+	Programs  Programs // a nudge a program typed is not his
 }
 
 // SessionsRecur: three in two sessions in a week. A rule that gives up is a finding at once.
@@ -65,17 +67,12 @@ func (d Sessions) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 				title: fmt.Sprintf("Supervision's %s messages: %s", m.Rule, m.Result)})
 		}
 	}
-	nudged, err := d.nudged(ctx, st, w)
-	if err != nil {
-		return nil, err
-	}
+	// each part's findings stand when another part fails: the error comes back beside them
+	nudged, nerr := d.nudged(ctx, st, w)
 	other = append(other, nudged...)
-	waited, err := waits(ctx, st, w)
-	if err != nil {
-		return nil, err
-	}
+	waited, werr := waits(ctx, st, w)
 	other = append(other, waited...)
-	return append(gather("sessions", gave, GaveUpRecur), gather("sessions", other, r)...), nil
+	return append(gather("sessions", gave, GaveUpRecur), gather("sessions", other, r)...), errors.Join(nerr, werr)
 }
 
 // nudged replays the rules over the window and keeps the stops the owner ended with a nudge that no rule would
@@ -100,6 +97,16 @@ func (d Sessions) nudged(ctx context.Context, st *store.Store, w Window) ([]occu
 	if err != nil {
 		return nil, err
 	}
+	turns, program, err := ownerTurns(ctx, st, d.Programs, w.Since, w.Until, w.Since)
+	if err != nil {
+		return nil, err
+	}
+	programs := map[string]bool{}
+	for i, t := range turns {
+		if program[i] {
+			programs[t.ID()] = true
+		}
+	}
 	var occ []occurrence
 	for _, res := range supervise.Replay(points, nil, supervise.DefaultParams, probe, w.Until) {
 		next := res.Point.Next
@@ -109,10 +116,10 @@ func (d Sessions) nudged(ctx context.Context, st *store.Store, w Window) ([]occu
 		why := supervise.Why(res)
 		turn, err := st.Before(ctx, res.Point.Session, []string{"owner_text"}, next.At.Add(-time.Second), next.At.Add(time.Second), 1)
 		if err != nil {
-			return nil, err
+			return occ, err
 		}
-		if len(turn) == 0 {
-			continue
+		if len(turn) == 0 || programs[turn[0].ID()] {
+			continue // no turn of his in the store, or a program typed it
 		}
 		key := slug(Norm(why, 60), 60)
 		occ = append(occ, occurrence{sig: signature("sessions", "nudged:"+key), ev: turn[0],
