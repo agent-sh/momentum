@@ -708,13 +708,13 @@ const uvTrash = ".capacity-trash"
 
 // uvRemoval is what a prune around running environments did: the entries it moved aside, the files of files-v0 it
 // removed, the entries that could not go (each with why), those that stay since they hold a mount point, those it
-// left when its time ran out, why what it moved aside could not all be deleted, and what it freed: each file whose
-// last link it removed.
+// left when its time ran out, why what it moved aside could not all be deleted, what went (its size, each inode
+// once), and what it freed: each file whose last link it removed.
 type uvRemoval struct {
 	removed, files, left int
 	failures, stayed     []string
 	trash                string
-	freed                int64
+	went, freed          int64
 }
 
 // uvRemove moves aside, under the cache's lock, every entry of environments-v2 and archive-v0 that k does not keep: a
@@ -839,7 +839,7 @@ func (u *uvRemoval) removeLinks(rt *os.Root, c uvCache, k *uvReach, shard string
 		switch n, err := removeCounted(rt, rel); {
 		case err == nil:
 			u.removed++
-			u.freed += n // a link with a long target holds a block
+			u.went, u.freed = u.went+n, u.freed+n // a link with a long target holds a block
 		case errors.Is(err, fs.ErrNotExist):
 			u.removed++
 		default:
@@ -849,7 +849,7 @@ func (u *uvRemoval) removeLinks(rt *os.Root, c uvCache, k *uvReach, shard string
 	}
 	if left == 0 {
 		if n, err := removeCounted(rt, shard); err == nil { // empty, or a link came since: then it stays
-			u.freed += n
+			u.went, u.freed = u.went+n, u.freed+n
 		}
 	}
 }
@@ -889,7 +889,7 @@ func uvFiles(rt *os.Root, dir string, until time.Time, stopped func() bool, out 
 			if info, err := d.Info(); err == nil {
 				if s, ok := info.Sys().(*syscall.Stat_t); ok && s.Nlink == 1 && rt.Remove(rel) == nil {
 					out.files++
-					out.freed += s.Blocks * 512 // its last link
+					out.went, out.freed = out.went+s.Blocks*512, out.freed+s.Blocks*512 // its last link
 				}
 			}
 		}
@@ -897,7 +897,7 @@ func uvFiles(rt *os.Root, dir string, until time.Time, stopped func() bool, out 
 	})
 	for i := len(dirs) - 1; i >= 0; i-- {
 		if n, err := removeCounted(rt, dirs[i]); err == nil { // children first; one that is not empty stays
-			out.freed += n
+			out.went, out.freed = out.went+n, out.freed+n
 		}
 	}
 }

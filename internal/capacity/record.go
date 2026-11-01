@@ -519,6 +519,12 @@ func (r *runner) event(kind string, f Finding, key string, actor store.Actor) st
 	if f.By != "" {
 		meta["freed_by"] = f.By // the tool's own figure
 	}
+	if f.AtLeast {
+		meta["at_least"] = true // the tool's figure is a lower bound
+	}
+	if f.Unsaid {
+		meta["unsaid"] = true // the tool printed no figure
+	}
 	if f.Out > 0 {
 		meta["out"] = f.Out
 	}
@@ -612,6 +618,7 @@ type runItem struct {
 	size       int64  // what went: the item, what of a task folder went to restic, its model data, what left a cache
 	freed      int64  // the space it freed on its disk: the files whose last link it removed, or a tool's own figure
 	by         string // the tool whose figure freed is, or "" for capacity's own count
+	went       int64  // what went, each inode once, as capacity counted it: more than freed is what is still linked
 	offload    bool   // a task folder offloaded to restic
 	model      bool   // a task folder's model data
 	unsaid     bool   // a prune whose tool did not print what it freed
@@ -621,7 +628,8 @@ type runItem struct {
 // itemOf is what a finding's act took, as the run's note counts it: an item's size, what of a task folder went to
 // restic, a task folder's model data, or what went out of a pruned cache (else what the prune's tool says it freed).
 func itemOf(f Finding) runItem {
-	it := runItem{rule: f.Rule, path: f.Path, size: f.Bytes, freed: f.Freed, by: f.By, unsaid: f.Unsaid, atLeast: f.AtLeast}
+	it := runItem{rule: f.Rule, path: f.Path, size: f.Bytes, freed: f.Freed, by: f.By, went: f.went, unsaid: f.Unsaid,
+		atLeast: f.AtLeast}
 	switch {
 	case f.Rule == RuleUV || f.Rule == RuleDocker:
 		it.size = f.Out // a prune's size is the whole cache's
@@ -629,9 +637,9 @@ func itemOf(f Finding) runItem {
 			it.size = f.Freed
 		}
 	case f.Rule == RuleScratch && f.offloaded:
-		it.offload, it.size, it.freed = true, offloadedBytes(f), offloadFreed(f)
+		it.offload, it.size, it.freed, it.went = true, offloadedBytes(f), offloadFreed(f), f.went-f.modelWent
 	case f.Rule == RuleScratch:
-		it.model, it.size = true, f.removed
+		it.model, it.size, it.went = true, f.removed, f.modelWent
 	}
 	return it
 }
@@ -796,8 +804,8 @@ func runDetail(items []runItem) string {
 		case it.offload:
 			offloads = append(offloads, it)
 			fallthrough
-		default:
-			linked = linked || it.freed < it.size && noteSize(it.freed) != noteSize(it.size)
+		default: // a deletion that took more than it freed left files linked elsewhere; a tool's figure says nothing of it
+			linked = linked || it.went > it.freed && noteSize(it.went) != noteSize(it.freed)
 		}
 		sized = append(sized, it)
 	}

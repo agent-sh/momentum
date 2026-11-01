@@ -323,13 +323,21 @@ func TestAnItemHoldingOneDeletedBeforeItCountsWhatIsLeft(t *testing.T) {
 		t.Errorf("the worktree would free what is left of it once its build went, with its administrative directory, %d: %v", wantW, got)
 	}
 	cfg.Live = []string{RuleTargets, RuleWorktrees}
+	t.Setenv("HOME", filepath.Dir(wts)) // the note names ~/cache/merged
 	res, err = Run(ctx, cfg, st, options(t, procRoot(t), now, nil))
 	must(t, err)
 	if g := findings(res, RuleTargets)[target]; !g.Done || g.Freed != wantT {
 		t.Errorf("the build frees %d: %+v", wantT, g)
 	}
-	if g := findings(res, RuleWorktrees)[merged]; !g.Done || g.Freed != wantW {
-		t.Errorf("the worktree frees %d, what the dry run said: %d %+v", wantW, g.Freed, g)
+	g := findings(res, RuleWorktrees)[merged]
+	if !g.Done || g.Freed != wantW || g.Bytes != wantW {
+		t.Errorf("the worktree frees %d, what the dry run said, and its size is what went with it: %+v", wantW, g)
+	}
+	// nothing is linked elsewhere: the worktree's size is the rest of it, and the note does not blame links
+	ns := decidedNotes(t, st)
+	if len(ns) != 1 || strings.Contains(ns[0].Detail, "hardlinked") || strings.Contains(ns[0].Detail, "freed)") ||
+		!strings.Contains(ns[0].Detail, short(target)+" "+gib(wantT)) {
+		t.Errorf("each item's size is what went with it, and freed no less: %+v", ns)
 	}
 }
 
@@ -391,10 +399,12 @@ func TestWhatUVSaysItFreedAtLeastIsALowerBoundEverywhere(t *testing.T) {
 	t.Setenv("HOME", "/home/u")
 	for _, c := range []struct {
 		report, title, detail string
+		atLeast, unsaid       any
 	}{
 		{"Removed 3 files (at least 1.5MiB)\n", "Pruned the uv cache (at least 2 MiB by uv's count)",
-			"Pruned ~/.cache/uv 14.0 GiB (at least 2 MiB freed by uv's count)."},
-		{"Removed 3 files\n", "Pruned the uv cache (uv printed no total)", "Pruned ~/.cache/uv 14.0 GiB (uv printed no total)."},
+			"Pruned ~/.cache/uv 14.0 GiB (at least 2 MiB freed by uv's count).", true, nil},
+		{"Removed 3 files\n", "Pruned the uv cache (uv printed no total)", "Pruned ~/.cache/uv 14.0 GiB (uv printed no total).",
+			nil, true},
 	} {
 		pruned := false
 		tools := uvTools("40000000000", nil)
@@ -408,6 +418,15 @@ func TestWhatUVSaysItFreedAtLeastIsALowerBoundEverywhere(t *testing.T) {
 		ns := decidedNotes(t, st)
 		if len(ns) != 1 || ns[0].Title != c.title || !strings.HasPrefix(ns[0].Detail, c.detail) {
 			t.Errorf("%q: the note says what uv said, and what left the cache: %+v", c.report, ns)
+		}
+		evs, err := st.Events(context.Background(), store.Query{Source: store.Capacity, Kinds: []string{KindPrune}})
+		must(t, err)
+		var m map[string]any
+		if len(evs) == 1 {
+			must(t, json.Unmarshal([]byte(evs[0].Meta), &m))
+		}
+		if len(evs) != 1 || m["at_least"] != c.atLeast || m["unsaid"] != c.unsaid {
+			t.Errorf("%q: the event keeps whether uv's figure is a lower bound or none: %v", c.report, m)
 		}
 	}
 }

@@ -320,9 +320,9 @@ func TestADetailShortOfRoomLeavesItsLastSentencesOutTheLastFirst(t *testing.T) {
 	t.Setenv("HOME", "/home/user")
 	const G = int64(1 << 30)
 	items := []runItem{
-		{rule: RuleWorktrees, path: "/home/user/.cache/pr-review", size: 4 * G, freed: G},
-		{rule: RuleTargets, path: "/home/user/projects/billing-service/target", size: 11 * G, freed: 11 * G},
-		{rule: RuleUV, path: "/home/user/.cache/uv", size: 12 * G, freed: 3 * G},
+		{rule: RuleWorktrees, path: "/home/user/.cache/pr-review", size: 4 * G, freed: G, went: 4 * G},
+		{rule: RuleTargets, path: "/home/user/projects/billing-service/target", size: 11 * G, freed: 11 * G, went: 11 * G},
+		{rule: RuleUV, path: "/home/user/.cache/uv", size: 12 * G, freed: 3 * G, went: 12 * G},
 	}
 	d := runDetail(items)
 	if utf8.RuneCountInString(d) > detailMax || !strings.Contains(d, "Files still hardlinked elsewhere stay on disk.") ||

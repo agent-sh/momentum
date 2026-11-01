@@ -11,15 +11,16 @@ import (
 // links, a clone's objects its source still links, a file another item links, free nothing when this link goes. So a
 // deletion's freed bytes are those of the paths it removes that only those paths hold: each directory, each file with
 // one link, and each file whose every link is among them, each inode once. A live run counts the paths just before
-// each deletion and what is left of them after (countFreed), so a link an earlier deletion of the run took is gone by
-// then, and only what went counts. A run that only says what it would do counts them as it judged them, in the order
-// it would delete them (estimate).
+// each deletion and what is left of them after (countAfter), so a link an earlier deletion of the run took is gone
+// by then, and only what went counts. A run that only says what it would do counts them as it judged them, in the
+// order it would delete them (estimate).
 
-// links are what a set of paths holds on disk, by link. own is the bytes only the set holds; shared are its files
-// with links outside it, by inode: what another deletion of the run may take the rest of.
+// links are what a set of paths holds on disk, by link. bytes is all it holds, each inode once (as du counts it);
+// own is what only the set holds; shared are its files with links outside it, by inode: what another deletion of the
+// run may take the rest of.
 type links struct {
-	own    int64
-	shared map[inode]share
+	bytes, own int64
+	shared     map[inode]share
 }
 
 // share is a file with links outside a set: its bytes on disk, its links in the set, and all its links (st_nlink).
@@ -33,6 +34,9 @@ type share struct {
 // name again (through a bind mount).
 func (l *links) add(s *syscall.Stat_t, first bool) {
 	b := s.Blocks * 512
+	if first {
+		l.bytes += b
+	}
 	if s.Mode&syscall.S_IFMT == syscall.S_IFDIR || s.Nlink <= 1 {
 		if first {
 			l.own += b
@@ -63,17 +67,36 @@ func (l *links) settle() {
 
 // merge adds another set's links, of paths apart from this set's.
 func (l *links) merge(o links) {
-	l.own += o.own
+	l.bytes, l.own = l.bytes+o.bytes, l.own+o.own
 	for k, c := range o.shared {
 		if l.shared == nil {
 			l.shared = map[inode]share{}
 		}
-		if x, ok := l.shared[k]; ok {
+		if x, ok := l.shared[k]; ok { // one file both sets link: its bytes once
 			c.in += x.in
+			l.bytes -= c.blocks
 		}
 		l.shared[k] = c
 	}
 	l.settle()
+}
+
+// minus is what of l is gone in after, a later count of the same paths: the files whose links in them went, and the
+// links of each file that went.
+func (l links) minus(after links) links {
+	out := links{bytes: max(0, l.bytes-after.bytes), own: max(0, l.own-after.own)}
+	for k, c := range l.shared {
+		if a, ok := after.shared[k]; ok {
+			c.in -= min(c.in, a.in)
+		}
+		if c.in > 0 {
+			if out.shared == nil {
+				out.shared = map[inode]share{}
+			}
+			out.shared[k] = c
+		}
+	}
+	return out
 }
 
 // linksOf counts the links of these paths, each a file or a directory's tree, walked as Measure walks; skip passes over
@@ -86,12 +109,11 @@ func linksOf(paths []string, skip func(string) bool) links {
 	return l
 }
 
-// countFreed runs a deletion of these paths and says what it freed: what only they held just before it, less what only
-// they hold of what is left after it.
-func countFreed(paths []string, del func() error) (int64, error) {
-	before := linksOf(paths, nil)
-	err := del()
-	return max(0, before.own-linksOf(paths, nil).own), err
+// countAfter counts what a deletion of these paths took, from their links before it and what is left of them after
+// it: what went (its size, each inode once), what that freed (what only the paths held), and the links it took.
+func countAfter(paths []string, before links) (went, freed int64, took links) {
+	t := before.minus(linksOf(paths, nil))
+	return t.bytes, t.own, t
 }
 
 // deletes are the paths a model's, a target dir's or a worktree's deletion removes: a model with its shared-store
@@ -166,7 +188,7 @@ func (r *runner) estimate() {
 		}
 		for j := range rr.Findings {
 			switch f := &rr.Findings[j]; {
-			case rr.Live && f.Done:
+			case rr.Live && len(f.took) > 0: // a deletion that ran, whole or stopped midway
 				done = append(done, f)
 			case !rr.Live && f.Action == ActDelete:
 				todo = append(todo, f)
@@ -219,7 +241,9 @@ func (r *runner) estimate() {
 		for _, l := range f.took {
 			take(l)
 		}
-		took(f, canonOf(f))
+		if f.Done {
+			took(f, canonOf(f))
+		}
 	}
 	users := map[string]int{} // how many repositories gone so far link each blob they share
 	for _, f := range todo {

@@ -17,7 +17,7 @@ import (
 // judged, no process using it (one fresh look at the processes, Docker's mounts among them), no write since, for a
 // worktree the same commit, still clean and still a leftover, and for a task's folder no live session in it or of
 // it. An item that holds a mount point is only reported: a deletion would reach into another filesystem, or through
-// a bind mount into another place. Each deletion counts what it frees (countFreed) and is recorded at once, so a run
+// a bind mount into another place. Each deletion counts what it frees (countAfter) and is recorded at once, so a run
 // stopped midway leaves what it did on record. Offloads start for scratchBudget at most; the rest wait for the next
 // run.
 func (r *runner) act(ctx context.Context) error {
@@ -102,7 +102,9 @@ func (r *runner) act(ctx context.Context) error {
 				r.opt.duringDelete(*f)
 			}
 			err := rm()
-			f.Freed, f.took = max(0, before.own-linksOf(paths, nil).own), []links{before}
+			var took links
+			f.went, f.Freed, took = countAfter(paths, before)
+			f.took = []links{took}
 			return err
 		}
 		var err error
@@ -135,6 +137,9 @@ func (r *runner) act(ctx context.Context) error {
 			}
 		}
 		f.Done = true
+		if f.Rule != RuleScratch { // its size is what went with it: what of it a deletion before took is that one's
+			f.Bytes = f.went
+		}
 		if r.opt.afterDelete != nil {
 			r.opt.afterDelete(*f)
 		}
@@ -157,11 +162,12 @@ func (r *runner) act(ctx context.Context) error {
 // data's deletion is on record before the offload starts.
 func (r *runner) actScratch(ctx context.Context, f *Finding, dirs []ownDir, before links) error {
 	models := modelPaths(f)
-	f.took = []links{before}
 	counted := false
 	countModels := func() {
 		if !counted {
-			f.modelFreed, counted = max(0, before.own-linksOf(models, nil).own), true
+			var took links
+			f.modelWent, f.modelFreed, took = countAfter(models, before)
+			f.took, counted = []links{took}, true
 		}
 	}
 	var rest *links
@@ -177,12 +183,13 @@ func (r *runner) actScratch(ctx context.Context, f *Finding, dirs []ownDir, befo
 		return r.recordModelData(ctx, f)
 	}, func() {
 		l := linksOf([]string{f.Path}, nil)
-		rest, f.took = &l, append(f.took, l)
+		rest = &l
 	})
 	countModels()
-	f.Freed = f.modelFreed
+	f.went, f.Freed = f.modelWent, f.modelFreed
 	if rest != nil {
-		f.Freed += max(0, rest.own-linksOf([]string{f.Path}, nil).own)
+		went, freed, took := countAfter([]string{f.Path}, *rest)
+		f.went, f.Freed, f.took = f.went+went, f.Freed+freed, append(f.took, took)
 	}
 	if err != nil && f.removed > 0 { // its model data went; the folder stays, its failure reported
 		f.Detail = fmt.Sprintf("deleted %s of its model data; then: %s", gib(f.removed), f.Detail)

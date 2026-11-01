@@ -56,6 +56,7 @@ type Finding struct {
 	shares  map[string]int
 	links   links    // what its deletion frees as the rule judged it: a task folder's, all of it but its model data
 	took    []links  // what a deletion of this run counted it took, in order: where an estimate after it starts
+	went    int64    // what went with this run's deletion of it: its size, each inode once, as the deletion counted it
 	class   string   // why a report-only finding is reported, as a word: its note's group
 	none    bool     // a prune that removed nothing, as the tool lists it or uv counts it: an event, not in the run's note
 	unsized bool     // a prune whose size could not be read before it ran
@@ -69,6 +70,7 @@ type Finding struct {
 	makers     []maker
 	modelOnly  bool
 	removed    int64
+	modelWent  int64
 	modelFreed int64
 	snapshot   string
 	offloaded  bool

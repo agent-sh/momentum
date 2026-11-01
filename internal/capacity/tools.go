@@ -446,11 +446,13 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 		if around != nil {
 			// what went is what was moved aside, the files of files-v0 and the links it removed: what it frees counts
 			// as every deletion's does, so a wheel an environment outside the cache still links frees nothing
-			freed, terr := countFreed(uvTrashed(c.dir), func() error { return uvEmptyTrash(c.dir) })
-			if terr != nil {
+			trashed := uvTrashed(c.dir)
+			before := linksOf(trashed, nil)
+			if terr := uvEmptyTrash(c.dir); terr != nil {
 				removal.trash = terr.Error()
 			}
-			removal.freed += freed
+			went, freed, _ := countAfter(trashed, before)
+			removal.went, removal.freed = removal.went+went, removal.freed+freed
 			if removal.removed == 0 && len(removal.failures) > 0 {
 				err = errors.New(removal.failures[0])
 			}
@@ -463,7 +465,7 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 	}
 	switch {
 	case around != nil:
-		f.Freed = removal.freed
+		f.Freed, f.went = removal.freed, removal.went
 	case err == nil: // uv's own prune: what uv says it freed, as uv's
 		var said bool
 		f.Freed, said, f.AtLeast = uvReclaimed(printed)
