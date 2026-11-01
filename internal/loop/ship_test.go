@@ -25,6 +25,7 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	testCache = dir
+	Scrubber = []string{"cat"} // the tests' own: a test that reads what the scrubber does sets one that does it
 	code := m.Run()
 	os.RemoveAll(dir)
 	os.Exit(code)

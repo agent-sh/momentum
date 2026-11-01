@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -555,5 +556,42 @@ func TestFlagDiagnosticsStayInTheRunStreams(t *testing.T) {
 				t.Fatalf("no scrubbed diagnostic: %q", diag)
 			}
 		})
+	}
+}
+
+// An event's record is read only from a regular file, opened without waiting on it: a reference that now names a
+// pipe returns at once, with its record withheld.
+func TestAnEventsRecordIsReadOnlyFromAFile(t *testing.T) {
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	fakeScrubber(t)
+	fifo := filepath.Join(t.TempDir(), "record")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skip("no fifo here:", err)
+	}
+	e := store.Event{Source: store.Transcripts, SourceKey: "pipe", TS: time.Now().Add(-time.Minute), Session: "s1", Actor: store.ActorTool,
+		Kind: "tool_result", Summary: "a result", Ref: fifo + "@0"}
+	putEvents(t, e)
+	t.Setenv("MOMENTUM_LOOP_RUN", "r1")
+	type res struct {
+		code     int
+		out, err string
+	}
+	ch := make(chan res, 1)
+	go func() {
+		code, out, errOut := momentum("evidence", "show", e.ID())
+		ch <- res{code, out, errOut}
+	}()
+	select {
+	case got := <-ch:
+		if got.code != 0 || !strings.Contains(got.out, "not a regular file") {
+			t.Fatalf("exit %d %q %s", got.code, got.out, got.err)
+		}
+	case <-time.After(5 * time.Second):
+		w, err := os.OpenFile(fifo, os.O_WRONLY, 0) // let the blocked reader go before failing
+		if err == nil {
+			w.Close()
+		}
+		t.Fatal("evidence show waited on a pipe")
 	}
 }

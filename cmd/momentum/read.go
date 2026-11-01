@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/agent-sh/momentum/internal/loop"
@@ -69,12 +70,18 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		fmt.Fprintf(&output, "  (its record is not shown: %s)\n", why)
 		return scrubbed(ctx, stdout, output.String())
 	}
-	f, err := os.Open(path)
+	// opened without waiting on a writer, and read only when it is a regular file: a reference may now name a pipe or
+	// a device, which would hold the run
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		output.WriteString("  (its record is gone)\n")
 		return scrubbed(ctx, stdout, output.String())
 	}
 	defer f.Close()
+	if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() {
+		output.WriteString("  (its record is not a regular file)\n")
+		return scrubbed(ctx, stdout, output.String())
+	}
 	if off < 0 {
 		return usageError{"negative record offset"}
 	}
@@ -113,10 +120,7 @@ func placeOf(ref string) (string, int64, bool) {
 }
 
 // secretDirs are where the user's credentials are kept, under his home: none of it is shown.
-var secretDirs = []string{".ssh", ".gnupg", ".aws", ".azure", ".config/gcloud", ".config/gh", ".config/glab-cli", ".config/github-copilot",
-	".local/share/keyrings", ".password-store", ".claude/.credentials.json", ".claude.json", ".netrc", ".git-credentials", ".docker",
-	".config/claude-code", ".config/rclone", ".npmrc", ".cargo/credentials", ".cargo/credentials.toml", ".codex/auth.json", ".kube",
-	".mozilla", ".config/google-chrome", ".config/chromium", ".config/BraveSoftware", ".pki", ".local/share/momentum"}
+var secretDirs = loop.CredentialDirs
 
 // secretName is a file's name that says it holds a secret.
 var secretName = regexp.MustCompile(`(?i)(^\.env($|\.)|\.pem$|\.key$|\.p12$|\.pfx$|^id_(rsa|dsa|ecdsa|ed25519)|credential|secret|token|\.kdbx$|\.keystore$)`)

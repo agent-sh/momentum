@@ -468,7 +468,11 @@ func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step s
 		inv.AddDirs = []string{r.Ship.workDir(c.ID)}
 		if p, ok, _ := r.Ship.Load(c.ID); ok && p.State == Revising && len(p.Reviews) > 0 {
 			last := p.Reviews[len(p.Reviews)-1]
-			if err := os.WriteFile(filepath.Join(run.Dir, "review.md"), []byte(last.Text), 0o600); err != nil {
+			text, err := Redact(ctx, last.Text)
+			if err != nil {
+				return Result{}, err
+			}
+			if err := os.WriteFile(filepath.Join(run.Dir, "review.md"), []byte(text), 0o600); err != nil {
 				return Result{}, err
 			}
 			inv.Prompt += fmt.Sprintf("\nIts change %s was reviewed: round %d found %d high, %d medium and %d low, in review.md. Revise the change "+
@@ -479,6 +483,10 @@ func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step s
 		inv.AddDirs = append(inv.AddDirs, r.ReadDirs...)
 	}
 	inv.Settings = r.permissions(step, c, run)
+	// the prompt holds the case's title, which a detector made of what it read: a run reads nothing unscrubbed
+	if inv.Prompt, err = Redact(ctx, inv.Prompt); err != nil {
+		return Result{}, err
+	}
 	agent := r.Agent
 	agent.Env = CleanEnv(map[string]string{"MOMENTUM_ACTOR": "loop:" + run.ID, "MOMENTUM_LOOP_RUN": run.ID, "MOMENTUM_LOOP_CASE": c.ID,
 		"MOMENTUM_LOOP_DIR": run.Dir}, r.Bins...)
@@ -629,16 +637,16 @@ func (r *Runner) review(ctx context.Context, c store.Case, p Package, run store.
 	res, err := r.invokeReview(ctx, c, p, run)
 	if err == nil && res.Status == store.RunOK {
 		var rep struct {
-			Summary  string    `json:"summary"`
-			Findings []Finding `json:"findings"`
+			Summary  *string    `json:"summary"`
+			Findings *[]Finding `json:"findings"`
 		}
-		if json.Unmarshal(res.Report, &rep) != nil {
+		if json.Unmarshal(res.Report, &rep) != nil || rep.Summary == nil || rep.Findings == nil {
 			res.Status, res.Failure = store.RunFailed, "an unreadable review"
-		} else if h, m, l, cerr := countFindings(rep.Findings); cerr != nil {
+		} else if h, m, l, cerr := countFindings(*rep.Findings); cerr != nil {
 			res.Status, res.Failure = store.RunFailed, cerr.Error()
 		} else {
-			text := reviewText(len(p.Reviews)+1, h, m, l, rep.Summary, rep.Findings)
-			rev := Review{Findings: rep.Findings, Text: text}
+			text := reviewText(len(p.Reviews)+1, h, m, l, *rep.Summary, *rep.Findings)
+			rev := Review{Findings: *rep.Findings, Text: text}
 			saved, saveErr := r.Ship.Reviewed(ctx, c.ID, rev)
 			if saveErr != nil {
 				res.Status, res.Failure = store.RunFailed, saveErr.Error()
@@ -646,7 +654,7 @@ func (r *Runner) review(ctx context.Context, c store.Case, p Package, run store.
 				r.logf("post the review of %s: %v", c.ID, postErr)
 			}
 
-			run.Summary = fmt.Sprintf("%d high, %d medium, %d low: %s", h, m, l, rep.Summary)
+			run.Summary = fmt.Sprintf("%d high, %d medium, %d low: %s", h, m, l, *rep.Summary)
 		}
 	}
 	r.finish(ctx, c, &run, res, err)
@@ -662,7 +670,7 @@ func (r *Runner) invokeReview(ctx context.Context, c store.Case, p Package, run 
 	if err := os.MkdirAll(run.Dir, 0o700); err != nil {
 		return Result{}, err
 	}
-	diff, err := r.Ship.git(ctx, p.Work, "diff", "--no-ext-diff", "--no-textconv", "origin/"+p.Base+"..."+p.Head)
+	diff, err := r.reviewDiff(ctx, p)
 	if err != nil {
 		return Result{}, err
 	}
@@ -670,7 +678,14 @@ func (r *Runner) invokeReview(ctx context.Context, c store.Case, p Package, run 
 		return Result{}, err
 	}
 	raw, _ := json.MarshalIndent(p, "", "  ")
-	if err := os.WriteFile(filepath.Join(run.Dir, "package.json"), raw, 0o600); err != nil {
+	pkg, err := Redact(ctx, string(raw))
+	if err != nil {
+		return Result{}, err
+	}
+	if !json.Valid([]byte(pkg)) {
+		pkg = `{"withheld": "the package's record did not stay valid once scrubbed"}`
+	}
+	if err := os.WriteFile(filepath.Join(run.Dir, "package.json"), []byte(pkg), 0o600); err != nil {
 		return Result{}, err
 	}
 	inv := Invocation{Dir: run.Dir, System: system, Schema: reviewSchema, MaxTurns: r.Budgets.MaxTurns, BudgetUSD: r.Budgets.Run,
@@ -679,6 +694,9 @@ func (r *Runner) invokeReview(ctx context.Context, c store.Case, p Package, run 
 		"working directory %s; the work tree is %s. Read the case with `momentum case show %s --json`. End with the review's report.",
 		c.ID, c.Family, p.Title, run.Dir, p.Work, c.ID)
 	inv.Settings = r.permissions(StepReview, c, run)
+	if inv.Prompt, err = Redact(ctx, inv.Prompt); err != nil {
+		return Result{}, err
+	}
 	agent := r.Agent
 	agent.Env = CleanEnv(map[string]string{"MOMENTUM_ACTOR": "loop:" + run.ID, "MOMENTUM_LOOP_RUN": run.ID, "MOMENTUM_LOOP_CASE": c.ID,
 		"MOMENTUM_LOOP_DIR": run.Dir}, r.Bins...)
@@ -804,4 +822,36 @@ func (r *Runner) caseRoom(ctx context.Context, c store.Case) (float64, bool, err
 		spent += cost
 	}
 	return spent, running, nil
+}
+
+// reviewDiff is the change as its review reads it: scrubbed, and with no credential file in it (each one the change
+// touches is named, and its content withheld).
+func (r *Runner) reviewDiff(ctx context.Context, p Package) (string, error) {
+	span := "origin/" + p.Base + "..." + p.Head
+	all, err := r.Ship.git(ctx, p.Work, "diff", "--name-only", "-z", "--no-renames", span)
+	if err != nil {
+		return "", err
+	}
+	shown, err := r.Ship.git(ctx, p.Work, append([]string{"diff", "--name-only", "-z", "--no-renames", span, "--"}, CredentialPathspecs()...)...)
+	if err != nil {
+		return "", err
+	}
+	kept := map[string]bool{}
+	for _, f := range strings.Split(shown, "\x00") {
+		kept[f] = true
+	}
+	var withheld []string
+	for _, f := range strings.Split(all, "\x00") {
+		if f != "" && !kept[f] {
+			withheld = append(withheld, f)
+		}
+	}
+	diff, err := r.Ship.git(ctx, p.Work, append([]string{"diff", "--no-ext-diff", "--no-textconv", "--no-renames", span, "--"}, CredentialPathspecs()...)...)
+	if err != nil {
+		return "", err
+	}
+	if len(withheld) > 0 {
+		diff = "# The change also touches credential files, whose content is withheld here: " + strings.Join(withheld, ", ") + "\n" + diff
+	}
+	return Redact(ctx, diff)
 }
