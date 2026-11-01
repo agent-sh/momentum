@@ -58,6 +58,9 @@ const usage = `usage:
                                         worktrees, scratch, uv, docker); a rule not live lists what it would
                                         delete or offload.
                                         --dry-run deletes and records nothing and runs every rule
+  momentum case detect [--since WHEN] [--family F,F] [--dry] [--json]
+                                        run the detectors (failures, owner-burden, sessions) over the store and
+                                        file what recurs: a case per signature; then cases unseen for 30 days close
   momentum case list [--family F] [--status S,S] [--all] [--json]
                                         the cases, the most recently changed first; closed ones with --all
   momentum case show ID [--evidence N] [--log N] [--json]

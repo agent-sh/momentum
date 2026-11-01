@@ -133,6 +133,7 @@ Run it with `momentum evidence ingest`'s timer: a oneshot unit of its own that t
 ## Cases
 
 ```
+momentum case detect [--since WHEN] [--family F,F] [--dry] [--json]
 momentum case list [--family F] [--status S,S] [--all] [--json]
 momentum case show ID [--evidence N] [--log N] [--json]
 momentum case open --family F --signature S --title T [--evidence REF]...
@@ -145,6 +146,8 @@ momentum case signature ID root:KEY     the root cause; a case that names one an
 momentum case close ID --reason not-worth-it|insufficient-evidence|already-solved|duplicate [--into ID] --why W
 momentum case reopen ID --evidence REF... [--at WHEN] --why W
 ```
+
+`case detect` runs the detectors, deterministic reads of the store with no model: recurring tool and infrastructure failures (guard refusals, harness and tool errors, commands that fail the setup's way, model refusals, incidents), the owner's own turns that push back or repeat with the agent's last words before them, and what keeps sessions waiting on him (supervision's give-ups, nudges no rule covers, long waits). Each finding is a signature; a case opens for a new one, and the case that holds it takes the evidence.
 
 A case is one answer in progress to a standing question: its family, its evidence, the suspected mechanism and the alternatives, the next test that tells them apart, the expected benefit, what it cost so far, and its status (open, investigating, testing, deployed, measuring, closed with a reason). A symptom's signature opens a case, and the same signature finds it again; the root cause's signature merges the cases it explains. A closed case comes back on new evidence only: a recurrence after it was solved, its old rate after it improved, or as much again as it was dismissed on. Only the ship tool deploys a case and only the measure tool closes one as improved. A case unseen for 30 days closes by itself.
 

@@ -7,14 +7,18 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/detect"
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
+	"github.com/agent-sh/momentum/sessions"
+	"github.com/agent-sh/momentum/sessions/hermes"
 )
 
 // caseCmd keeps the cases: one answer in progress each, to one of the standing questions. A detector or an agent
@@ -22,9 +26,11 @@ import (
 // ship and measure tools move it through deployed and measuring; it closes with a reason.
 func caseCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usageError{"case needs list, show, open, set, evidence, signature, close or reopen"}
+		return usageError{"case needs detect, list, show, open, set, evidence, signature, close or reopen"}
 	}
 	switch args[0] {
+	case "detect":
+		return caseDetect(ctx, args[1:], stdout, stderr)
 	case "list":
 		return caseList(ctx, args[1:], stdout, stderr)
 	case "show":
@@ -532,5 +538,114 @@ func caseReopen(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		return caseErr(err)
 	}
 	printCase(stdout, c, "reopened")
+	return nil
+}
+
+// detectors are the families the loop runs, each with its detector.
+func detectors() []detect.Detector {
+	return []detect.Detector{
+		detect.Failures{},
+		detect.OwnerBurden{},
+		detect.Sessions{Platforms: func(ctx context.Context) (map[string]string, error) {
+			return hermes.Platforms(ctx, sessions.EnvFromOS().HermesHome)
+		}},
+	}
+}
+
+// filedJSON is one finding as case detect --json prints it.
+type filedJSON struct {
+	Family    string `json:"family"`
+	Signature string `json:"signature"`
+	Title     string `json:"title"`
+	Evidence  int    `json:"evidence"`
+	Newest    string `json:"newest"`
+	Case      string `json:"case,omitempty"`
+	Observed  string `json:"observed,omitempty"`
+	Status    string `json:"status,omitempty"`
+}
+
+// caseDetect runs the detectors over the last days and files what they find: a new case for a signature no case
+// holds, the evidence for the case that holds it. Then cases unseen past their retention close. --dry files nothing.
+func caseDetect(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("case detect", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	families := fs.String("family", "", "comma-separated families (default: every one with a detector)")
+	window := fs.String("since", "7d", "how far back the detectors read: a duration or a time")
+	dry := fs.Bool("dry", false, "print what the detectors find and file nothing")
+	asJSON := fs.Bool("json", false, "one JSON object per finding")
+	if err := fs.Parse(args); err != nil {
+		return usageError{err.Error()}
+	}
+	if fs.NArg() > 0 {
+		return usageError{fmt.Sprintf("case detect takes no arguments, got %q", fs.Arg(0))}
+	}
+	since, err := parseWhen(*window)
+	if err != nil {
+		return usageError{err.Error()}
+	}
+	var ds []detect.Detector
+	want := map[string]bool{}
+	for _, f := range strings.Split(*families, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			want[f] = true
+		}
+	}
+	all, unknown := len(want) == 0, maps.Clone(want)
+	for _, d := range detectors() {
+		if all || want[d.Family()] {
+			ds = append(ds, d)
+			delete(unknown, d.Family())
+		}
+	}
+	for f := range unknown {
+		return usageError{fmt.Sprintf("no detector for family %q", f)}
+	}
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	outs, swept, err := detect.Run(ctx, st, ds, detect.Window{Since: since, Until: time.Now()}, caseActor(), *dry)
+	if err != nil {
+		return err
+	}
+	failed := 0
+	enc := json.NewEncoder(stdout)
+	for _, o := range outs {
+		if o.Err != nil {
+			failed++
+			fmt.Fprintf(stderr, "[ERROR] %s: %v\n", o.Family, o.Err)
+		}
+		for _, f := range o.Filed {
+			newest := ""
+			if len(f.Finding.Evidence) > 0 {
+				newest = rfc3339(f.Finding.Evidence[0].At)
+			}
+			if *asJSON {
+				j := filedJSON{Family: o.Family, Signature: f.Finding.Signature, Title: f.Finding.Title, Evidence: len(f.Finding.Evidence),
+					Newest: newest, Case: f.Case.ID, Observed: string(f.Observed)}
+				if f.Case.ID != "" {
+					j.Status = statusLine(f.Case)
+				}
+				if err := enc.Encode(j); err != nil {
+					return err
+				}
+				continue
+			}
+			what := "found"
+			if f.Observed != "" {
+				what = fmt.Sprintf("%s %s [%s]", f.Case.ID, f.Observed, statusLine(f.Case))
+			}
+			fmt.Fprintf(stdout, "%-12s %4d ev  %s  %s\n  %s\n", o.Family, len(f.Finding.Evidence), what, f.Finding.Title, f.Finding.Signature)
+		}
+	}
+	for _, c := range swept {
+		if !*asJSON {
+			fmt.Fprintf(stdout, "swept %s: unseen for %s, closed as %s: %s\n", c.ID, "30d", c.Reason, c.Title)
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d of %d detectors failed", failed, len(ds))
+	}
 	return nil
 }

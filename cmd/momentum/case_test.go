@@ -1,10 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/agent-sh/momentum/internal/paths"
+	"github.com/agent-sh/momentum/internal/store"
 )
 
 // The case commands open a case by its signature (the same signature again finds it), record the investigation,
@@ -152,5 +158,44 @@ func TestTheCaseCommands(t *testing.T) {
 	}
 	if !found || len(more.Log) != 2 || more.LogLines < 5 || more.Log[1].Action != "evidence" {
 		t.Fatalf("show --log 2: %+v", more)
+	}
+}
+
+// case detect runs the detectors over the window and files what they find; --dry files nothing, --family runs only
+// the families it names, and a family with no detector is a usage error.
+func TestCaseDetectFilesWhatTheDetectorsFind(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MOMENTUM_HOME", home)
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Add(-time.Hour)
+	deny := "<tool_use_error>wait-guard: pgrep -f 'x' also matches the shell running this command"
+	var evs []store.Event
+	for i, s := range []string{"s1", "s1", "s2"} {
+		evs = append(evs, store.Event{Source: store.Transcripts, SourceKey: fmt.Sprintf("%s@%d", s, i), TS: now.Add(time.Duration(i) * time.Minute),
+			Session: s, Harness: "claude", Actor: store.ActorTool, Kind: "tool_result", Tool: "Bash", Summary: deny, Meta: `{"is_error":true}`})
+	}
+	if _, err := st.Put(context.Background(), evs); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	if code, out, errOut := momentum("case", "detect", "--dry", "--family", "owner-burden"); code != 0 || out != "" {
+		t.Fatalf("one family with nothing: exit %d %q %s", code, out, errOut)
+	}
+	if code, out, _ := momentum("case", "detect", "--dry", "--family", "failures"); code != 0 || !strings.Contains(out, "3 ev  found  wait-guard keeps refusing") {
+		t.Fatalf("dry: exit %d %q", code, out)
+	}
+	if code, out, _ := momentum("case", "list", "--all"); code != 0 || out != "" {
+		t.Fatalf("a dry run filed: %q", out)
+	}
+	code, out, errOut := momentum("case", "detect", "--family", "failures,owner-burden")
+	if code != 0 || !regexp.MustCompile(`c[0-9a-f]{8} opened \[open\]  wait-guard keeps refusing`).MatchString(out) {
+		t.Fatalf("detect: exit %d %q %s", code, out, errOut)
+	}
+	if code, _, errOut := momentum("case", "detect", "--family", "weather"); code != 2 || !strings.Contains(errOut, "no detector") {
+		t.Fatalf("an unknown family: exit %d %s", code, errOut)
 	}
 }

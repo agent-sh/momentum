@@ -845,6 +845,9 @@ type Query struct {
 	Until   time.Time
 	Limit   int
 	Harness string
+	Actor   Actor  // when set, only its events
+	Main    bool   // only a session's own events, not its subagents'
+	MetaHas string // when set, only events whose meta holds it, e.g. `"is_error":true`
 }
 
 func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
@@ -864,6 +867,15 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 	if !q.Until.IsZero() {
 		where, args = append(where, "ts < ?"), append(args, q.Until.UnixMilli())
 	}
+	if q.Actor != "" {
+		where, args = append(where, "actor = ?"), append(args, string(q.Actor))
+	}
+	if q.Main {
+		where = append(where, "agent = ''")
+	}
+	if q.MetaHas != "" {
+		where, args = append(where, "instr(meta, ?) > 0"), append(args, q.MetaHas)
+	}
 	order := "ts DESC, source_key DESC"
 	if q.Session != "" {
 		// An id or its first characters (a range the session index serves), and the threads under it at any
@@ -880,9 +892,13 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 	if limit <= 0 {
 		limit = 200
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
+	return scanEvents(s.db.QueryContext(ctx, `SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
 	  tool, summary, meta, ref, heuristic, experiment FROM events WHERE `+strings.Join(where, " AND ")+` ORDER BY `+order+` LIMIT ?`,
-		append(args, limit)...)
+		append(args, limit)...))
+}
+
+// scanEvents reads the rows of a query of every event column, in order.
+func scanEvents(rows *sql.Rows, err error) ([]Event, error) {
 	if err != nil {
 		return nil, err
 	}
@@ -900,6 +916,22 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// Before is a session's own transcript events of some kinds from after up to before (not its subagents'), the
+// newest first, at most limit of them: what led up to a moment. The session index serves it.
+func (s *Store) Before(ctx context.Context, session string, kinds []string, after, before time.Time, limit int) ([]Event, error) {
+	if len(kinds) == 0 || limit <= 0 {
+		return nil, nil
+	}
+	args := []any{session, Transcripts, after.UnixMilli(), before.UnixMilli()}
+	for _, k := range kinds {
+		args = append(args, k)
+	}
+	return scanEvents(s.db.QueryContext(ctx, `SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
+	  tool, summary, meta, ref, heuristic, experiment FROM events WHERE session = ? AND agent = '' AND source = ? AND ts > ?
+	  AND ts < ? AND kind IN (?`+strings.Repeat(",?", len(kinds)-1)+`) ORDER BY ts DESC, source_key DESC LIMIT ?`,
+		append(args, limit)...))
 }
 
 // Counts returns events per source and kind since a time, for the status view.
