@@ -2,15 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/agent-sh/momentum/internal/config"
 	"github.com/agent-sh/momentum/internal/loop"
@@ -18,7 +19,7 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// loopEval runs the golden-set evaluation: each task's investigation, as of the moment before its fix, several
+// loopEval runs the golden-set evaluation: each task's investigation, as of the moment its case could have opened, several
 // times, graded by a clean-context judge against its verified root cause.
 func loopEval(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("loop eval", flag.ContinueOnError)
@@ -28,10 +29,21 @@ func loopEval(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	tasks := fs.String("task", "", "comma-separated task ids (default: every task)")
 	budget := fs.Float64("budget", 120, "the most the evaluation spends, in US dollars")
 	parallel := fs.Int("parallel", 3, "trials at once")
-	native := fs.Bool("native", false, "run the native path instead: the harness's agent with the same evidence and limits, without the loop's procedure, skill or case")
+	arms := fs.String("arms", "loop,native", "arms to compare: loop,native, or one alone")
 	asJSON := fs.Bool("json", false, "one JSON object per trial, then one per task")
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
+	}
+	if *trials < 1 || *parallel < 1 || *budget < 0 || math.IsNaN(*budget) || math.IsInf(*budget, 0) {
+		return usageError{"trials and parallel must be positive; budget must not be negative"}
+	}
+	selected := strings.Split(*arms, ",")
+	seen := map[string]bool{}
+	for _, a := range selected {
+		if (a != "loop" && a != "native") || seen[a] {
+			return usageError{"arms must be loop,native, or one alone"}
+		}
+		seen[a] = true
 	}
 	if os.Getenv("MOMENTUM_LOOP_RUN") != "" {
 		return usageError{"an evaluation does not run inside one of the loop's runs"}
@@ -70,55 +82,56 @@ func loopEval(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	if err != nil {
 		return err
 	}
-	id := time.Now().Format("20060102-1504")
-	if *native {
-		id += "-native"
+	id := loop.NewEvalID()
+	raw, err := os.ReadFile(*golden)
+	if err != nil {
+		return err
 	}
-	e := &loop.Eval{Runner: r, Source: paths.DB(), Dir: filepath.Join(loopDir(), "eval", id), Trials: *trials, Budget: *budget,
-		Parallel: *parallel, ID: id, Judge: loop.Agent{Runner: r.Agent.Runner, Model: r.Agent.Model, Fallback: r.Agent.Fallback}, Native: *native}
-	fmt.Fprintf(stderr, "evaluation %s: %d tasks, %d trials each, in %s\n", id, len(picked), *trials, e.Dir)
+	var repositories []string
+	for _, t := range all {
+		if t.RepoPath != "" {
+			repositories = append(repositories, t.RepoPath)
+		}
+	}
+	e := &loop.Eval{Runner: r, Source: paths.DB(), Dir: filepath.Join(loopDir(), "eval", id), Trials: *trials, Budget: *budget, Parallel: *parallel, ID: id,
+		Judge: loop.Agent{Runner: r.Agent.Runner, Model: r.Agent.Model}, Arms: selected, Repositories: repositories, GoldenHash: fmt.Sprintf("%x", sha256.Sum256(raw))}
+	fmt.Fprintf(stderr, "evaluation %s: %d tasks, %d trials per arm, in %s\n", id, len(picked), *trials, e.Dir)
 	trs, err := e.Run(ctx, picked)
 	if err != nil {
 		return err
 	}
-	sums := loop.Summarize(trs)
-	raw, _ := json.MarshalIndent(map[string]any{"trials": trs, "tasks": sums}, "", "  ")
-	os.WriteFile(filepath.Join(e.Dir, "results.json"), raw, 0o600)
-	enc := json.NewEncoder(stdout)
+	results := e.Results(trs)
+	if err := e.WriteResults(results); err != nil {
+		return fmt.Errorf("write results: %w", err)
+	}
 	if *asJSON {
-		for _, t := range trs {
-			enc.Encode(t)
-		}
-		for _, s := range sums {
-			enc.Encode(s)
-		}
-		return nil
+		return json.NewEncoder(stdout).Encode(results)
 	}
-	var usd, judge, minutes float64
-	reached, any, every, flips, n := 0, 0, 0, 0, 0
-	for _, s := range sums {
-		flip := ""
-		if s.Flipped {
-			flip, flips = " flipped", flips+1
-		}
-		fmt.Fprintf(stdout, "%-34s %-13s %s  %d/%d reached%s  $%.2f  %.1f min  %.0f turns\n", s.Task, s.Family, strings.Join(s.Verdicts, ","),
-			s.Reached, len(s.Verdicts), flip, s.USD, s.Minutes, s.Turns)
-		for _, e := range s.Errors {
-			fmt.Fprintf(stdout, "  error: %s\n", e)
-		}
-		usd, judge, minutes = usd+s.USD, judge+s.JudgeUSD, minutes+s.Minutes*float64(len(s.Verdicts))
-		reached, n = reached+s.Reached, n+len(s.Verdicts)
-		if s.AnyReached {
-			any++
-		}
-		if s.AllReached && len(s.Verdicts) > 0 {
-			every++
-		}
-	}
-	if n > 0 {
-		fmt.Fprintf(stdout, "trials: %d of %d reached the root cause; tasks: %d of %d in at least one trial (pass@k), %d in every trial (pass^k), %d flipped\n",
-			reached, n, any, len(sums), every, flips)
-		fmt.Fprintf(stdout, "cost: $%.2f in the investigations (mean $%.2f, %.1f min a trial), $%.2f in the judge\n", usd, usd/float64(n), minutes/float64(n), judge)
-	}
+	printEvaluation(stdout, results)
 	return nil
+}
+
+// printEvaluation uses the same counts and rates that results.json records.
+func printEvaluation(out io.Writer, r loop.EvaluationResults) {
+	rate := func(x *float64) string {
+		if x == nil {
+			return "undefined"
+		}
+		return fmt.Sprintf("%.3f", *x)
+	}
+	for _, a := range r.Arms {
+		fmt.Fprintf(out, "%s: %d/%d graded trials reached; %d partial, %d missed, %d wrong, %d errors, %d runs cut short; %d/%d ran\n", a.Arm, a.Reached, a.Graded, a.Partial, a.Missed, a.Wrong, a.Errors, a.CutShort, a.Ran, a.Planned)
+		fmt.Fprintf(out, "  cost $%.2f; time %.2f min; per trial $%s, %s min; per root cause reached $%s, %s min; judge $%.2f\n", a.USD, a.Minutes, rate(a.USDPerTrial), rate(a.MinutesPerTrial), rate(a.USDPerReached), rate(a.MinutesPerReached), a.JudgeUSD)
+		fmt.Fprintf(out, "  k=%d: pass@k %.3f, pass^k %.3f; %d tasks flipped\n", a.K, a.PassAtK, a.PassAllK, a.Flips)
+	}
+	for _, t := range r.Comparison.Tasks {
+		fmt.Fprintf(out, "%s: loop %d, native %d reached; more often: %s\n", t.Task, t.LoopReached, t.NativeReached, t.MoreOften)
+	}
+	interval := func(x *loop.Interval) string {
+		if x == nil {
+			return "undefined"
+		}
+		return fmt.Sprintf("[%.4f, %.4f]", x.Low, x.High)
+	}
+	fmt.Fprintf(out, "loop minus native, task bootstrap 90%% interval (%d resamples, seed %d): reached per dollar %s; reached per minute %s\n", r.Comparison.Resamples, r.Comparison.Seed, interval(r.Comparison.ReachedPerDollar), interval(r.Comparison.ReachedPerMinute))
 }

@@ -345,13 +345,13 @@ func TestEvidenceSearchFindsAPhrase(t *testing.T) {
 	ev := func(key, actor, text string, ago time.Duration) store.Event {
 		return store.Event{Source: store.Transcripts, SourceKey: key, TS: at.Add(-ago), Session: "s1", Actor: store.Actor(actor), Kind: "owner_text", Summary: text}
 	}
-	putEvents(t, ev("a", "owner", "use the noreply identity for the export only, secret-value", 2*time.Hour),
-		ev("b", "agent", "set user.email to the noreply identity", time.Hour), ev("c", "owner", "100% done_now", 0))
-	code, out, errOut := momentum("evidence", "search", "noreply identity")
-	if code != 0 || strings.Count(out, "ev:") != 2 || strings.Contains(out, "secret-value") || strings.Index(out, "set user.email") > strings.Index(out, "export only") {
+	putEvents(t, ev("a", "owner", "the queue stalls during the export, secret-value", 2*time.Hour),
+		ev("b", "agent", "inspect the queue stalls in the worker", time.Hour), ev("c", "owner", "100% done_now", 0))
+	code, out, errOut := momentum("evidence", "search", "queue stalls")
+	if code != 0 || strings.Count(out, "ev:") != 2 || strings.Contains(out, "secret-value") || strings.Index(out, "inspect the queue") > strings.Index(out, "during the export") {
 		t.Fatalf("exit %d %q %s", code, out, errOut)
 	}
-	if _, out, _ := momentum("evidence", "search", "noreply", "--actor", "owner"); strings.Count(out, "ev:") != 1 {
+	if _, out, _ := momentum("evidence", "search", "queue", "--actor", "owner"); strings.Count(out, "ev:") != 1 {
 		t.Fatalf("his words only: %q", out)
 	}
 	if _, out, _ := momentum("evidence", "search", "0% d"); strings.Count(out, "ev:") != 1 {

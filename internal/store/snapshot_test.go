@@ -67,3 +67,44 @@ func TestAStoreAsOfAMomentHoldsOnlyWhatCameBefore(t *testing.T) {
 		t.Fatal("a source's state went into the snapshot")
 	}
 }
+
+// A snapshot keeps immutable incident sightings, never the incident row rewritten with its later resolution.
+func TestASnapshotLeavesOutRewrittenIncidents(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	src := filepath.Join(dir, "source.db")
+	st, err := Open(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	end := time.Now().Add(-40 * 24 * time.Hour).Truncate(time.Second)
+	since := end.Add(-CaseRetention)
+	var events []Event
+	for i, at := range []time.Time{since.Add(-time.Millisecond), since, end.Add(-time.Millisecond), end, end.Add(time.Second)} {
+		events = append(events, Event{Source: Transcripts, SourceKey: at.String(), TS: at, Actor: ActorTool, Kind: "tool_result", Summary: string(rune('a' + i))})
+	}
+	events = append(events, Event{Source: "incidents", SourceKey: "incident", Actor: ActorDetector, TS: end.Add(-time.Hour), Kind: "incident", Summary: "resolved: the later answer"},
+		Event{Source: "incidents", SourceKey: "seen", Actor: ActorDetector, TS: end.Add(-time.Hour), Kind: "incident-seen", Summary: "the symptom"})
+	if _, err = st.Put(ctx, events); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	dst := filepath.Join(dir, "snapshot.db")
+	if err = AsOf(ctx, src, dst, since, end); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := Open(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.Close()
+	got, err := snap.Events(ctx, Query{Since: time.Unix(0, 0), Limit: 100})
+	if err != nil || len(got) != 3 {
+		t.Fatalf("events %+v %v", got, err)
+	}
+	for _, ev := range got {
+		if ev.Kind == "incident" || ev.TS.Before(since) || !ev.TS.Before(end) {
+			t.Fatalf("leaked %+v", ev)
+		}
+	}
+}

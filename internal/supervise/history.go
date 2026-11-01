@@ -646,7 +646,7 @@ func requestBetween(from, to string, until time.Time) time.Time {
 			}
 			if json.Unmarshal(raw, &e) == nil && !e.Sidechain {
 				at, _ := time.Parse(time.RFC3339Nano, e.Timestamp)
-				if !until.IsZero() && at.After(until) {
+				if !until.IsZero() && !at.IsZero() && !at.Before(until) {
 					return req
 				}
 				switch {

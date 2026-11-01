@@ -48,12 +48,12 @@ func TestGoldenTasksAreReadWhole(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	p := filepath.Join(t.TempDir(), "golden.jsonl")
-	write(t, p, `{"id":"a","family":"failures","case_title":"x keeps failing","cutoff":"2026-03-02T10:00:00Z","symptom":{"query":{"event_ids":["e1"]}},"key_facts":["f"],"repo_path":"~/projects/x"}`+"\n\n")
+	write(t, p, `{"id":"a","family":"failures","case_title":"x keeps failing","cutoff":"2026-03-02T10:00:00Z","symptom":{"query":{"event_ids":["e1"]}},"root_cause":"a cause","key_facts":["f"],"repo_path":"~/projects/x"}`+"\n\n")
 	ts, err := ReadGolden(p)
 	if err != nil || len(ts) != 1 || ts[0].RepoPath != filepath.Join(home, "projects", "x") {
 		t.Fatalf("%+v %v", ts, err)
 	}
-	write(t, p, `{"id":"a","family":"failures","case_title":"x","cutoff":"2026-03-02T10:00:00Z","symptom":{"query":{"event_ids":[]}},"key_facts":["f"]}`+"\n")
+	write(t, p, `{"id":"a","family":"failures","case_title":"x","cutoff":"2026-03-02T10:00:00Z","symptom":{"query":{"event_ids":[]}},"root_cause":"a cause","key_facts":["f"]}`+"\n")
 	if _, err := ReadGolden(p); err == nil {
 		t.Fatal("a task with no events was read")
 	}
@@ -116,7 +116,7 @@ echo '`+grade+`'`)
 func TestAnEvaluationStopsAtItsBudget(t *testing.T) {
 	st := testStore(t)
 	e := &Eval{Runner: &Runner{Store: st, Budgets: Budgets{Run: 4}}, Source: filepath.Join(t.TempDir(), "none.db"), Dir: t.TempDir(), Trials: 2, Budget: 3,
-		Parallel: 1, ID: "x"}
+		Parallel: 1, ID: "x", Arms: []string{"loop"}}
 	trs, err := e.Run(context.Background(), []GoldenTask{{ID: "a", Family: "failures"}})
 	if err != nil || len(trs) != 2 {
 		t.Fatalf("%+v %v", trs, err)
@@ -168,7 +168,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total
 		st := testStore(t)
 		e := &Eval{Runner: &Runner{Store: st, Agent: Agent{Runner: agent(name, out), Model: "m"}, Budgets: Budgets{Run: 4, RunTime: time.Minute, MaxTurns: 9},
 			Rules: []string{rules}, Constraints: []string{"never wake him"}}, Source: source, Dir: filepath.Join(dir, "out", name), Trials: 1, Budget: 10,
-			Parallel: 1, ID: name, Judge: Agent{Runner: []string{judge}, Model: "j"}, Native: native}
+			Parallel: 1, ID: name, Judge: Agent{Runner: []string{judge}, Model: "j"}, Native: native, Arms: []string{name}}
 		trs, err := e.Run(ctx, []GoldenTask{task})
 		if err != nil || len(trs) != 1 || trs[0].Err != "" || trs[0].Grade.Verdict != "partial" || trs[0].Run.USD != 0.5 {
 			t.Fatalf("%s: %+v %v", name, trs, err)

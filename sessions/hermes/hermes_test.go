@@ -208,3 +208,20 @@ func TestHermesNamesProjectsFromTheWorkingDirectory(t *testing.T) {
 		t.Fatalf("got %v %v", err, got)
 	}
 }
+
+// A historical platform lookup reads only sessions that started before its end.
+func TestPlatformLookupHonorsItsEnd(t *testing.T) {
+	home := t.TempDir()
+	db := stateDB(t, home, true)
+	end := time.Unix(1800000000, 0)
+	for _, row := range []struct {
+		id string
+		at float64
+	}{{"before", float64(end.Unix() - 1)}, {"boundary", float64(end.Unix())}, {"after", float64(end.Unix() + 1)}} {
+		exec(t, db, `INSERT INTO sessions VALUES (?, 'cli', 't', '', '', '', ?, NULL, ?, '', 0, 0)`, row.id, row.at, row.at)
+	}
+	got, err := Platforms(context.Background(), home, end)
+	if err != nil || len(got) != 1 || got["before"] != "cli" {
+		t.Fatalf("platforms %v %v", got, err)
+	}
+}
