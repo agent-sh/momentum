@@ -946,6 +946,7 @@ type Query struct {
 	ExcludeCwd string // exclude this directory and its descendants
 	Main       bool   // only a session's own events, not its subagents'
 	MetaHas    string // when set, only events whose meta holds it, e.g. `"is_error":true`
+	Text       string // when set, only events whose summary holds it, ASCII letters in either case
 }
 
 func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
@@ -974,6 +975,10 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 	}
 	if q.MetaHas != "" {
 		where, args = append(where, "instr(meta, ?) > 0"), append(args, q.MetaHas)
+	}
+	if q.Text != "" {
+		esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q.Text)
+		where, args = append(where, `summary LIKE ? ESCAPE '\'`), append(args, "%"+esc+"%")
 	}
 	order := "ts DESC, source_key DESC"
 	if q.Session != "" {

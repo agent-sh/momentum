@@ -312,3 +312,55 @@ func TestARepositoryIsBusyWhenSomeoneWorksInIt(t *testing.T) {
 		t.Errorf("uncommitted changes: %q", got)
 	}
 }
+
+// In an evaluation, evidence git reads only the repositories made for it, in the trial's directory: the
+// repositories on the machine hold what came after its moment.
+func TestAnEvaluationReadsOnlyItsOwnRepositories(t *testing.T) {
+	trial := t.TempDir()
+	inside, outside := filepath.Join(trial, "repo"), t.TempDir()
+	for _, d := range []string{inside, outside} {
+		os.MkdirAll(d, 0o700)
+		gitIn(t, d, "init", "-q", "-b", "main")
+		os.WriteFile(filepath.Join(d, "a.txt"), []byte("a\n"), 0o600) // history keeps only the commits that touch a file outside credentials
+		gitIn(t, d, "add", "a.txt")
+		gitIn(t, d, "commit", "-q", "-m", "first")
+	}
+	t.Setenv("MOMENTUM_EVAL", "x")
+	t.Setenv("MOMENTUM_LOOP_DIR", trial)
+	if code, out, errOut := momentum("evidence", "git", inside, "log", "--oneline"); code != 0 || !strings.Contains(out, "first") {
+		t.Fatalf("its own: exit %d %q %s", code, out, errOut)
+	}
+	if code, _, errOut := momentum("evidence", "git", outside, "log", "--oneline"); code != 2 || !strings.Contains(errOut, "evaluation") {
+		t.Fatalf("the machine's: exit %d %s", code, errOut)
+	}
+}
+
+// evidence search finds the transcripts' events whose text holds a phrase, newest first and scrubbed, a phrase's
+// % and _ taken as they are.
+func TestEvidenceSearchFindsAPhrase(t *testing.T) {
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	fakeScrubber(t)
+	at := time.Now().Add(-time.Hour)
+	ev := func(key, actor, text string, ago time.Duration) store.Event {
+		return store.Event{Source: store.Transcripts, SourceKey: key, TS: at.Add(-ago), Session: "s1", Actor: store.Actor(actor), Kind: "owner_text", Summary: text}
+	}
+	putEvents(t, ev("a", "owner", "use the noreply identity for the export only, secret-value", 2*time.Hour),
+		ev("b", "agent", "set user.email to the noreply identity", time.Hour), ev("c", "owner", "100% done_now", 0))
+	code, out, errOut := momentum("evidence", "search", "noreply identity")
+	if code != 0 || strings.Count(out, "ev:") != 2 || strings.Contains(out, "secret-value") || strings.Index(out, "set user.email") > strings.Index(out, "export only") {
+		t.Fatalf("exit %d %q %s", code, out, errOut)
+	}
+	if _, out, _ := momentum("evidence", "search", "noreply", "--actor", "owner"); strings.Count(out, "ev:") != 1 {
+		t.Fatalf("his words only: %q", out)
+	}
+	if _, out, _ := momentum("evidence", "search", "0% d"); strings.Count(out, "ev:") != 1 {
+		t.Fatalf("a percent sign: %q", out)
+	}
+	if _, out, _ := momentum("evidence", "search", "0_ d"); strings.Count(out, "ev:") != 0 {
+		t.Fatalf("an underscore as a wildcard: %q", out)
+	}
+	if code, _, _ := momentum("evidence", "search", "no"); code != 2 {
+		t.Fatal("a two-letter phrase was searched")
+	}
+}
