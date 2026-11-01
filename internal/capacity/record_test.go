@@ -84,6 +84,111 @@ func TestWhatARuleLeavesByDesignIsNoProblem(t *testing.T) {
 	}
 }
 
+// Every reason a rule only reports an item for is a problem or the rule's own policy: a note for exactly the
+// problems, a reason the list does not know among them, and for a deletion that failed.
+func TestANoteForExactlyTheProblemReasons(t *testing.T) {
+	ctx := context.Background()
+	st := openStore(t)
+	reasons := []struct {
+		rule, class string
+		problem     bool
+	}{
+		{RuleTargets, "excluded", false}, {RuleTargets, "unknown", false}, {RuleTargets, "tracked", false},
+		{RuleWorktrees, "uncommitted", false}, {RuleWorktrees, "unpushed", false}, {RuleWorktrees, "ignored", false},
+		{RuleModels, "mount", false}, {RuleScratch, "pointer", false}, {RuleDocker, "volumes", false},
+		{RuleUV, "busy", true}, {RuleScratch, "too-big", true}, {RuleScratch, "stuck", true}, {RuleScratch, "unreadable", true},
+		{RuleWorktrees, "unreadable", true}, {RuleTargets, "unreadable", true}, {RuleModels, "new-reason", true},
+	}
+	found := map[string][]Finding{}
+	for i, c := range reasons {
+		found[c.rule] = append(found[c.rule], Finding{Rule: c.rule, Path: fmt.Sprintf("/synthetic/%d", i), Action: ActReport,
+			class: c.class, Why: "a reason", Bytes: 1 << 20})
+	}
+	found[RuleTargets] = append(found[RuleTargets], Finding{Rule: RuleTargets, Path: "/synthetic/failed", Action: ActDelete,
+		Err: "permission denied", Bytes: 1 << 20})
+	res := &Result{}
+	for _, rule := range Rules {
+		res.Rules = append(res.Rules, RuleResult{Rule: rule, Ran: true, Findings: found[rule]})
+	}
+	must(t, (&runner{st: st, now: time.Now(), res: res}).record(ctx))
+	for _, c := range reasons {
+		id := "capacity:" + c.rule + ":" + c.class
+		if n, ok, err := st.Note(ctx, id); err != nil || ok != c.problem || ok && !n.Done.IsZero() {
+			t.Errorf("%s: a standing note %v, want %v (%v)", id, ok && n.Done.IsZero(), c.problem, err)
+		}
+	}
+	if _, ok, err := st.Note(ctx, "capacity:"+RuleTargets+":failed"); err != nil || !ok {
+		t.Errorf("a deletion that failed is a problem: %v %v", ok, err)
+	}
+	if n, _, _ := st.Note(ctx, "capacity:"+RuleModels+":new-reason"); !strings.Contains(n.Title, "left: new-reason") {
+		t.Errorf("a reason with no title of its own is named in the note's: %q", n.Title)
+	}
+}
+
+// A rule that could not run, and a disk whose use cannot be read, are problems. Each note names its error, is
+// resolved by the next scan that works, stands again when the scan fails again, and stays resolved by the owner while
+// its error is the same.
+func TestARuleThatCouldNotRunIsAProblem(t *testing.T) {
+	ctx := context.Background()
+	st := openStore(t)
+	gone := filepath.Join(t.TempDir(), "gone")
+	cfg := Config{Live: []string{RuleUV}, Disks: []string{gone}}.Normal()
+	now := time.Now()
+	failing := func(how string) Tools {
+		return fakeTools{answers: map[string]string{"uv cache dir": how, "docker": "ERR"}}
+	}
+	runWith := func(at time.Time, tools Tools) *Result {
+		t.Helper()
+		o := options(t, procRoot(t), at, nil)
+		o.Now, o.Tools, o.Rules = true, tools, []string{RuleUV}
+		res, err := Run(ctx, cfg, st, o)
+		must(t, err)
+		return res
+	}
+	id, disk := "capacity:scan:"+RuleUV, "capacity:scan:disk"
+	stands := func(id string) bool {
+		t.Helper()
+		n, ok, err := st.Note(ctx, id)
+		must(t, err)
+		return ok && n.Done.IsZero()
+	}
+	if res := runWith(now, failing("ERR-INUSE")); res.Rules[0].Err == "" {
+		t.Fatalf("setup: the uv rule could not run: %+v", res.Rules[0])
+	}
+	if n, _, _ := st.Note(ctx, id); !stands(id) || !strings.Contains(n.Detail, "in-use") {
+		t.Errorf("a rule that could not run is a problem that names its error: %+v", n)
+	}
+	// the title names the disk too, clipped as every title is; this test's disk has a long name
+	if n, _, _ := st.Note(ctx, disk); !stands(disk) || !strings.HasPrefix(n.Title, "Capacity cannot watch ") ||
+		!strings.Contains(n.Detail, gone+": no such file") {
+		t.Errorf("a disk whose use cannot be read is a problem that names it: %+v", n)
+	}
+	must(t, os.MkdirAll(gone, 0o755))
+	runWith(now.Add(time.Hour), uvTools("1000", nil))
+	if stands(id) || stands(disk) {
+		t.Fatal("a scan that works resolves its note")
+	}
+	runWith(now.Add(2*time.Hour), failing("ERR-INUSE"))
+	if !stands(id) {
+		t.Fatal("a rule that fails again with the same error stands again")
+	}
+	if _, _, err := st.DoneNote(ctx, id, now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	runWith(now.Add(3*time.Hour), failing("ERR-INUSE"))
+	if stands(id) {
+		t.Error("a note the owner resolved stays resolved while its error is the same")
+	}
+	runWith(now.Add(4*time.Hour), failing("ERR-DENIED"))
+	if !stands(id) {
+		t.Error("another error makes it stand again")
+	}
+	evs, err := st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindFailed}})
+	if err != nil || len(evs) != 3 {
+		t.Errorf("each error is an event, once: %d %v", len(evs), err)
+	}
+}
+
 // A problem note the owner resolved stays resolved until its evidence changes: task folders whose model data this
 // user cannot remove are one.
 func TestAProblemNoteStaysResolvedUntilItsEvidenceChanges(t *testing.T) {

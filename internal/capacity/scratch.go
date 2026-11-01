@@ -194,8 +194,7 @@ func (r *runner) decideScratch(ctx context.Context, f Finding, x root, w folderW
 	if ex, ok := r.excludedScratch(ctx, f.canon, w, f.makers); ok {
 		class, why = "excluded", "an excluded project's: "+ex
 	} else if d := r.unknownMaker(f.canon); d != "" {
-		class, why = "unknown", "made in "+short(d)+", which was gone when the rule first looked, so its project cannot be "+
-			"known: offload it by hand (evidence-offload) if it is no excluded project's"
+		class, why = "unknown", "made in "+short(d)+", which was gone when the rule first looked, so its project cannot be known"
 	}
 	if class != "" {
 		if len(f.files) == 0 {

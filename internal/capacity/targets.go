@@ -73,7 +73,7 @@ func (r *runner) targetOwner(ctx context.Context, t, canon string) (action, clas
 		}
 		ignored, err := gitOK(ctx, rp.top, "check-ignore", "-q", t)
 		if err != nil {
-			return ActReport, "unknown", "git could not say whether it ignores it: " + err.Error()
+			return ActReport, "unreadable", "git could not say whether it ignores it: " + err.Error()
 		}
 		if !ignored {
 			return ActReport, "tracked", "git in " + short(rp.top) + " does not ignore it"

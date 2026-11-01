@@ -25,11 +25,13 @@ import (
 //     one transaction, so a run stopped midway leaves a note of what it did until then: what the run freed on disk,
 //     how many items each rule took, the largest of them, and how to keep one next time; a prune that removed nothing
 //     is an event only, and a run that took nothing writes no note;
-//   - each item only reported is an event (capacity-report), once; what a rule leaves by design is no problem and has
-//     no note, and a reason that is a problem (problemReasons) has its rule's problem note, which lists them; the note
-//     is put again only when an item new to it appears, so a note the owner resolved stays resolved until the
-//     evidence changes, and it is resolved by itself when the rule finds none;
+//   - each item only reported is an event (capacity-report), once; what a rule leaves by its own policy is no problem
+//     and has no note (leftByDesign), and any other reason has its rule's problem note, which lists them; the note is
+//     put again only when an item new to it appears, so a note the owner resolved stays resolved until the evidence
+//     changes, and it is resolved by itself when the rule finds none;
 //   - a deletion that failed is an event (capacity-failed) and its rule's problem note for failures;
+//   - a rule that could not run, and a disk whose use could not be read, is an event (capacity-failed) and a problem
+//     note that names the error (recordScans);
 //   - a fast fill is an event (capacity-fill) and the disk's problem note, high importance, put once per fill.
 
 // The event kinds.
@@ -171,24 +173,11 @@ func (r *runner) record(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if !problemReasons[g.class] {
-			continue // left by design: its events and the run's output say so, and no note
+		if leftByDesign[g.class] {
+			continue // the rule's own policy: its events and the run's output say so, and no note
 		}
-		id := "capacity:" + g.rule + ":" + g.class
-		old, had, err := r.st.Note(ctx, id)
-		if err != nil {
+		if err := r.putAgain(ctx, groupNote("capacity:"+g.rule+":"+g.class, g.rule, g.class, g.items, r.now), fresh); err != nil {
 			return err
-		}
-		auto, err := r.st.Mark(ctx, "auto:"+id)
-		if err != nil {
-			return err
-		}
-		standing := had && old.Done.IsZero()
-		resolvedByUs := had && !old.Done.IsZero() && !auto.IsZero() && !old.Done.After(auto)
-		if fresh || standing || resolvedByUs {
-			if _, err := r.st.PutNote(ctx, groupNote(id, g.rule, g.class, g.items, r.now)); err != nil {
-				return err
-			}
 		}
 	}
 	// A problem note whose rule ran and found none of its items any more is resolved, by the rule: it stands again
@@ -205,16 +194,13 @@ func (r *runner) record(ctx context.Context) error {
 		}
 		rule, class, _ := strings.Cut(rest, ":")
 		switch {
-		case !contains(Rules, rule): // a disk's, a hold's or the jobs' note: their own records resolve them
-		case !problemReasons[class]:
+		case !contains(Rules, rule): // a disk's, a scan's, a hold's or the jobs' note: their own records resolve them
+		case leftByDesign[class]:
 			if _, _, err := r.st.DoneNote(ctx, n.ID, r.now); err != nil {
 				return err
 			}
 		case ran[rule] && groups[rule+"\x00"+class] == nil:
-			if _, _, err := r.st.DoneNote(ctx, n.ID, r.now); err != nil {
-				return err
-			}
-			if err := r.st.SetMark(ctx, "auto:"+n.ID, r.now); err != nil {
+			if err := r.resolve(ctx, n.ID); err != nil {
 				return err
 			}
 		}
@@ -225,7 +211,107 @@ func (r *runner) record(ctx context.Context) error {
 	if err := r.recordHolds(ctx); err != nil {
 		return err
 	}
-	return r.recordDisks(ctx)
+	if err := r.recordDisks(ctx); err != nil {
+		return err
+	}
+	return r.recordScans(ctx)
+}
+
+// putAgain puts a problem note when what it is about is new to the store (fresh), when it stands, or when capacity
+// resolved it itself and it holds again. One the owner resolved stays resolved until what it is about changes.
+func (r *runner) putAgain(ctx context.Context, n store.Note, fresh bool) error {
+	old, had, err := r.st.Note(ctx, n.ID)
+	if err != nil {
+		return err
+	}
+	auto, err := r.st.Mark(ctx, "auto:"+n.ID)
+	if err != nil {
+		return err
+	}
+	standing := had && old.Done.IsZero()
+	resolvedByUs := had && !old.Done.IsZero() && !auto.IsZero() && !old.Done.After(auto)
+	if fresh || standing || resolvedByUs {
+		_, err = r.st.PutNote(ctx, n)
+	}
+	return err
+}
+
+// resolve resolves a problem note that stands as capacity's own doing, so putAgain puts it again when it holds again.
+// A note that does not stand is left as it is: one the owner resolved stays his.
+func (r *runner) resolve(ctx context.Context, id string) error {
+	_, stood, err := r.st.DoneNote(ctx, id, r.now)
+	if err != nil || !stood {
+		return err
+	}
+	return r.st.SetMark(ctx, "auto:"+id, r.now)
+}
+
+// recordScans records each rule that could not run (its scan failed, or its last scan's mark could not be read), a
+// problem note each (capacity:scan:RULE), and the disks whose use could not be read, one note that names them
+// (capacity:scan:disk). Each error is an event (capacity-failed), once; a note is put as putAgain puts one, and
+// resolved by the next run that scans without an error. A rule this run did not scan (not due, or not among --rule's)
+// leaves its note as it is; a rule no longer configured resolves its own.
+func (r *runner) recordScans(ctx context.Context) error {
+	failed := func(rule, key, summary, why string) store.Event {
+		h := sha256.Sum256([]byte(why))
+		e := r.event(KindFailed, Finding{Rule: rule, Path: key, Err: why}, "scan/"+key+"/"+hex.EncodeToString(h[:8]), store.ActorDetector)
+		e.Summary = summary
+		return e
+	}
+	type scan struct {
+		id, title, detail string
+		events            []store.Event // none: it worked
+	}
+	var scans []scan
+	for _, rr := range r.res.Rules {
+		if !rr.Ran && rr.Err == "" && r.cfg.configured(rr.Rule) {
+			continue // not scanned on this run: nothing says whether it works now
+		}
+		s := scan{id: "capacity:scan:" + rr.Rule, title: "Capacity's " + rr.Rule + " rule could not run", detail: upper(rr.Err) + "."}
+		if rr.Err != "" {
+			s.events = []store.Event{failed(rr.Rule, rr.Rule, "the "+rr.Rule+" rule could not run: "+rr.Err, rr.Err)}
+		}
+		scans = append(scans, s)
+	}
+	disks := scan{id: "capacity:scan:disk"}
+	var names, unread []string
+	for _, d := range r.res.Disks {
+		if d.Err != "" {
+			names, unread = append(names, d.Disk), append(unread, d.Disk+": "+d.Err)
+			disks.events = append(disks.events, failed(RuleDisk, d.Disk, "the use of "+d.Disk+" could not be read: "+d.Err, d.Err))
+		}
+	}
+	switch len(names) {
+	case 0:
+	case 1:
+		disks.title = "Capacity cannot watch " + names[0] + ": its use could not be read"
+		disks.detail = unread[0] + ". No fill or full note can come for it until its use can be read."
+	default:
+		disks.title = fmt.Sprintf("Capacity cannot watch %d disks: their use could not be read", len(names))
+		disks.detail = strings.Join(unread, "; ") + ". No fill or full note can come for them until their use can be read."
+	}
+	scans = append(scans, disks)
+	for _, s := range scans {
+		if len(s.events) == 0 {
+			if _, had, err := r.st.Note(ctx, s.id); err != nil {
+				return err
+			} else if had {
+				if err := r.resolve(ctx, s.id); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		fresh, err := r.putNew(ctx, s.events)
+		if err != nil {
+			return err
+		}
+		if err := r.putAgain(ctx, store.Note{ID: s.id, Kind: store.NoteProblem, Source: store.Capacity, At: r.now,
+			Title: s.title, Detail: s.detail}, fresh); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // recordHolds records a run that could not trust its look at the processes, or could not ask Docker which
@@ -409,7 +495,7 @@ func (r *runner) recordFull(ctx context.Context, d DiskState) error {
 		_, err := r.st.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Source: store.Capacity, Importance: store.ImportanceHigh,
 			At:     r.now,
 			Title:  fmt.Sprintf("%s is %.0f%% used, above %.0f%%: %s free", d.Disk, d.pctFull, r.cfg.Fill.Full, gib(d.Avail)),
-			Detail: "Capacity deletes only what its rules find idle; momentum capacity lists what they leave, and why."})
+			Detail: "Capacity deletes only what its rules find idle; momentum capacity --dry-run --all lists what they leave, and why."})
 		return err
 	case !full && !open.IsZero():
 		if n, had, err := r.st.Note(ctx, id); err != nil {
@@ -948,13 +1034,14 @@ func itemText(it runItem) string {
 // a later deletion of the run may take too.
 const linkedElsewhere = "A file linked elsewhere frees nothing until its last link goes."
 
-// problemReasons are the reasons whose items are a problem: a deletion that failed, and an item its rule would act on
-// and cannot. uv's prune waits on processes or a lock it cannot wait out (busy), a task folder's offload ran out of
-// its time (too-big) or its model data cannot be removed by this user (stuck), and an item cannot be read
-// (unreadable). Every other reason is its rule's own design (an excluded project's, one of no known project, a build
-// git does not ignore, a worktree that holds work, a mount point, a folder beside its pointer, Docker's volumes):
-// its items are events, and the run lists them, with no note.
-var problemReasons = map[string]bool{"failed": true, "busy": true, "too-big": true, "stuck": true, "unreadable": true}
+// leftByDesign are the reasons a rule leaves an item by its own policy: whose the item is, the work it holds, a
+// mount it must not reach past, a pointer it would overwrite, a volume that may hold data. They are no problem: their
+// items are events, and the run lists them, with no note. Any other reason is a problem, with its rule's note: the
+// rule would take the item and something outside the rule keeps it (uv's prune that processes or a lock hold off,
+// busy; an offload out of its time, too-big; model data this user cannot remove, stuck; an item it cannot read,
+// unreadable), or a deletion failed. A reason new to this list is a problem until it is placed here.
+var leftByDesign = map[string]bool{"excluded": true, "unknown": true, "tracked": true, "uncommitted": true,
+	"unpushed": true, "ignored": true, "mount": true, "pointer": true, "volumes": true}
 
 // groupTitles say what a rule's items of one problem reason are.
 var groupTitles = map[string]string{
@@ -971,8 +1058,11 @@ func groupNote(id, rule, class string, items []Finding, now time.Time) store.Not
 	for _, f := range items {
 		total += f.Bytes
 	}
-	what := ruleText[rule]
-	title := fmt.Sprintf("%d %s %s (%s)", len(items), plural(what, len(items)), groupTitles[class], gib(total))
+	what, why := ruleText[rule], groupTitles[class]
+	if why == "" { // a reason with no title of its own: its name says it
+		why = "left: " + class
+	}
+	title := fmt.Sprintf("%d %s %s (%s)", len(items), plural(what, len(items)), why, gib(total))
 	switch {
 	case rule == RuleUV && class == "busy":
 		title = fmt.Sprintf("The uv cache is %s and waits to be pruned: uv processes read it", gib(total))

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -21,6 +22,31 @@ func cargoTarget(t *testing.T, dir string, sources ...string) {
 			d += " " + s
 		}
 		write(t, filepath.Join(dir, "debug", "app.d"), d+"\n")
+	}
+}
+
+// A build git cannot answer for is a problem, as a worktree git fails on is: the rule would take it, and git keeps
+// it. With no git on PATH, git cannot say whether it ignores the build.
+func TestABuildGitCannotAnswerForIsAProblem(t *testing.T) {
+	gitEnv(t)
+	root := filepath.Join(t.TempDir(), "projects")
+	app := filepath.Join(root, "app")
+	write(t, filepath.Join(app, ".gitignore"), "target/\n")
+	gitT(t, app, "init", "-q")
+	cargoTarget(t, filepath.Join(app, "target"))
+	t.Setenv("PATH", t.TempDir())
+	cfg := Config{Targets: TargetsConfig{Roots: []string{root}}}.Normal()
+	cfg.Live = []string{RuleTargets}
+	st := openStore(t)
+	res, err := Run(context.Background(), cfg, st, options(t, procRoot(t), time.Now().Add(49*time.Hour), nil))
+	must(t, err)
+	if f := findings(res, RuleTargets)[filepath.Join(app, "target")]; f.Action != ActReport || f.class != "unreadable" ||
+		!strings.Contains(f.Why, "git could not say") {
+		t.Fatalf("a build git cannot answer for is only reported, as one git could not read: %+v", f)
+	}
+	n, ok, err := st.Note(context.Background(), "capacity:"+RuleTargets+":unreadable")
+	if err != nil || !ok || !n.Done.IsZero() || !strings.Contains(n.Title, "git could not read") {
+		t.Errorf("its note says git could not read it: %+v %v %v", n, ok, err)
 	}
 }
 
