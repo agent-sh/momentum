@@ -347,6 +347,9 @@ echo '`+okResult+`'`)
 	if _, err := os.Stat(marker); err == nil {
 		t.Fatal("a process that left the run's group outlived it")
 	}
+	if ScopeUnit(filepath.Join(dir, "a", "1")) == ScopeUnit(filepath.Join(dir, "b", "1")) {
+		t.Fatal("two runs' directories of one name share a scope")
+	}
 }
 
 // A review run is a run: the stop rule and the case's budget hold it, and its counts are its findings'. A review

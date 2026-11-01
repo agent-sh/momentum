@@ -174,7 +174,7 @@ func (r *Runner) endStale(ctx context.Context) error {
 		if run.Status == store.RunRunning && r.now().Sub(run.Started) > r.Budgets.RunTime+15*time.Minute {
 			run.Status, run.Failure, run.Ended, run.USD = store.RunFailed, "killed", r.now(), max(run.USD, r.Budgets.Run)
 			if r.Agent.Scope && run.Dir != "" {
-				StopScope(ScopeUnit(filepath.Base(run.Dir)))
+				StopScope(ScopeUnit(run.Dir))
 			}
 			if err := r.Store.PutLoopRun(ctx, run); err != nil {
 				return err
