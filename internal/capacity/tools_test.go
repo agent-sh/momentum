@@ -534,8 +534,8 @@ func TestAUVPruneTakesTheLockWhenItsHoldersAllRunOutsideTheCache(t *testing.T) {
 	}
 	var st syscall.Stat_t
 	must(t, syscall.Stat(f.lock, &st))
-	if st.Ino == f.id.ino || st.Mode&0o777 != 0o666 {
-		t.Errorf("the lock file in place is a new file with the old one's mode: inode %d (was %d), mode %o", st.Ino, f.id.ino, st.Mode&0o777)
+	if st.Ino != f.id.ino || exists(f.lock+uvAsideSuffix) {
+		t.Errorf("the old lock file is back in its place, its holders on it: inode %d (was %d)", st.Ino, f.id.ino)
 	}
 	fh, err := os.Open(f.lock)
 	must(t, err)
@@ -1180,7 +1180,7 @@ func TestTheLookForOpenersStatsOnlyWhatNamesTheLock(t *testing.T) {
 	fd := func(n int) string { return filepath.Join(f.proc, "20", "fd", strconv.Itoa(n)) }
 	for renamed, want := range map[bool]string{false: fd(5), true: fd(4)} {
 		statted = nil
-		openers(f.proc, f.id, c.isLock, renamed, &Sample{Table: map[int]Proc{}})
+		openers(f.proc, f.id, c.isLock, renamed, &Sample{Table: map[int]Proc{}}, statLock)
 		if len(statted) != 1 || statted[0] != want {
 			t.Errorf("only a link /proc names as the lock file is stat'ed (renamed %v): %v, want %s", renamed, statted, want)
 		}

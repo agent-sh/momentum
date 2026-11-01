@@ -83,7 +83,8 @@ var uvReachWait = 30 * time.Second
 
 // uvReach is what the processes that use the cache keep of it: each entry a place of theirs is in, and every entry
 // such an entry reaches (see walk). places are the places it answered, as the processes give them, so a later look
-// knows them without reading a filesystem; bytes is the kept entries' size on disk, each file once.
+// knows them without reading a filesystem; bytes is the kept entries' size on disk, each file once; envs is how many
+// kept entries are environments. resolve resolves a path's links: resolveLinks, read once by the caller.
 type uvReach struct {
 	c          uvCache
 	keep       map[string]bool
@@ -94,6 +95,7 @@ type uvReach struct {
 	seen       map[inode]bool
 	queue      []uvPlace
 	walkedOuts map[string]bool
+	resolve    func(string) (string, error)
 }
 
 // uvReachOf walks what the places reach: found's, and every entry of builds-v0, which stays (uvBuckets): a command may
@@ -102,7 +104,7 @@ type uvReach struct {
 // cache or a bucket itself, a directory of a kept entry it cannot read, and a walk that does not end in uvReachWait.
 func uvReachOf(c uvCache, found uvFound) *uvReach {
 	r := &uvReach{c: c, keep: map[string]bool{}, places: map[string]bool{}, seen: map[inode]bool{},
-		walkedOuts: map[string]bool{}}
+		walkedOuts: map[string]bool{}, resolve: resolveLinks}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -122,11 +124,25 @@ func uvReachOf(c uvCache, found uvFound) *uvReach {
 	}
 }
 
-// uvHeld reports whether builds-v0 holds an entry, or cannot be read: uv makes one for a build or a run, removes it as
-// that ends, and leaves it when its uv is killed, maybe with the command it started still running in it.
+// uvHeld reports whether builds-v0 holds an overlay, the environment a `uv run --with` runs its command in (its
+// site-packages holds `_uv_ephemeral_overlay.pth`, its pyvenv.cfg names extends-environment), or cannot be read. uv
+// removes an overlay as its run ends, and leaves it when its uv is killed, maybe with the command still running in
+// it; uv's prune would delete it. Another entry there (a build's environment, an isolated run's) holds the extension
+// a command that set its title maps, so the look finds such a command by its files.
 func uvHeld(c uvCache) bool {
-	ents, err := os.ReadDir(filepath.Join(c.dir, "builds-v0"))
-	return len(ents) > 0 || err != nil && !errors.Is(err, fs.ErrNotExist)
+	dir := filepath.Join(c.dir, "builds-v0")
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return !errors.Is(err, fs.ErrNotExist)
+	}
+	for _, e := range ents {
+		p := filepath.Join(dir, e.Name())
+		if pth, _ := filepath.Glob(filepath.Join(p, "lib", "python*", "site-packages", "_uv_ephemeral_overlay.pth")); len(pth) > 0 ||
+			slices.Contains(cfgKeys(readSmall(filepath.Join(p, "pyvenv.cfg"))), "extends-environment") {
+			return true
+		}
+	}
+	return false
 }
 
 // bucket puts every entry of a bucket on the walk's queue.
@@ -142,19 +158,40 @@ func (r *uvReach) bucket(name string) {
 	}
 }
 
-// place keeps the entry a place is in, with its links resolved, and puts what that entry reaches on the queue. A
-// process's place outside the cache is an environment whose packages link into it: what it reaches is walked, and
-// nothing of it is kept. A place in one of environments-v2's directories of links is the link it goes through: one
-// that leads nowhere keeps nothing.
+// where is a place with its links resolved, as far as it names the entry it is in: the place resolved when that is in
+// the cache, else the nearest directory above it that resolves into the cache, with what follows that directory (an
+// environment's bin/python links to an interpreter outside it, and a project's .venv outside the cache may link into
+// it). A place no directory of which resolves into the cache is the place resolved, or as given.
+func (r *uvReach) where(p string) string {
+	for q := p; ; q = filepath.Dir(q) {
+		if res, err := r.resolve(q); err == nil {
+			if _, in := r.c.rel(res); in {
+				if q == p {
+					return res
+				}
+				return filepath.Join(res, strings.TrimPrefix(p, q+"/"))
+			}
+		}
+		if q == filepath.Dir(q) {
+			break
+		}
+	}
+	if res, err := r.resolve(p); err == nil {
+		return res
+	}
+	return p
+}
+
+// place keeps the entry a place is in (where), and puts what that entry reaches on the queue. A process's place
+// outside the cache is an environment whose packages link into it: what it reaches is walked, and nothing of it is
+// kept. A place in one of environments-v2's directories of links is the link it goes through: one that leads nowhere
+// keeps nothing.
 func (r *uvReach) place(pl uvPlace) {
 	if r.places[pl.path] {
 		return
 	}
 	r.places[pl.path] = true
-	real := pl.path
-	if res, err := resolveLinks(pl.path); err == nil {
-		real = res
-	}
+	real := r.where(pl.path)
 	e, whole := r.c.entry(real)
 	if whole {
 		r.why = fmt.Sprintf("%s uses %s itself", whoOr(pl.who, "a process"), short(real))
@@ -176,7 +213,7 @@ func (r *uvReach) place(pl uvPlace) {
 			link := filepath.Join(dir, parts[2])
 			if fi, err := os.Lstat(link); err == nil && fi.Mode()&fs.ModeSymlink != 0 {
 				// a link to a cached environment, among the links of its interpreter: what it leads to is kept
-				if t, err := resolveLinks(link); err == nil {
+				if t, err := r.resolve(link); err == nil {
 					r.queue = append(r.queue, uvPlace{path: t, who: pl.who})
 				}
 				return
@@ -215,7 +252,7 @@ func (r *uvReach) walk(dir string, measure bool) {
 		}
 		switch {
 		case d.Type()&fs.ModeSymlink != 0:
-			if t, err := resolveLinks(p); err == nil && r.c.in(t) {
+			if t, err := r.resolve(p); err == nil && r.c.in(t) {
 				r.queue = append(r.queue, uvPlace{path: t})
 			}
 		case !d.Type().IsRegular():
@@ -242,7 +279,7 @@ func (r *uvReach) named(paths []string) {
 	for _, q := range paths {
 		if _, in := r.c.rel(q); in {
 			r.queue = append(r.queue, uvPlace{path: q})
-		} else if t, err := resolveLinks(q); err == nil && t != q {
+		} else if t, err := r.resolve(q); err == nil && t != q {
 			if _, in := r.c.rel(t); in {
 				r.queue = append(r.queue, uvPlace{path: t})
 			}
@@ -272,21 +309,51 @@ func (r *uvReach) outside(found uvFound, envs *uvEnvs) string {
 	return names.String()
 }
 
-// says what the prune around running environments keeps, for its finding's detail.
+// newBuilds names an entry of builds-v0 the first look did not keep, made since it looked, or says that builds-v0
+// cannot be read again: what such an entry reaches was not walked. Under the cache's lock no uv process makes one, so
+// this is the rule's last word before it deletes, read from the cache itself.
+func (r *uvReach) newBuilds() string {
+	ents, err := os.ReadDir(filepath.Join(r.c.dir, "builds-v0"))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return "builds-v0 cannot be read again: " + err.Error()
+	}
+	for _, e := range ents {
+		if !r.keep["builds-v0/"+e.Name()] {
+			return fmt.Sprintf("%s was made since the look", short(filepath.Join(r.c.dir, "builds-v0", e.Name())))
+		}
+	}
+	return ""
+}
+
+// says what the prune around running environments keeps, for its finding's detail: how many processes run from the
+// cache (each named by the uv process it runs under, as the notes name them), the jobs that name places in it, or
+// builds-v0's overlays alone, and the environments it keeps with what they reach.
 func (r *uvReach) says(found uvFound) string {
-	procs, envs := "processes run", "environments"
-	if found.users == 1 {
-		procs = "process runs"
+	var why []string
+	switch found.users {
+	case 0:
+	case 1:
+		why = append(why, "1 process runs from it")
+	default:
+		why = append(why, fmt.Sprintf("%d processes run from it", found.users))
 	}
+	switch found.jobs {
+	case 0:
+	case 1:
+		why = append(why, "1 job names a place in it")
+	default:
+		why = append(why, fmt.Sprintf("%d jobs name places in it", found.jobs))
+	}
+	if len(why) == 0 {
+		why = append(why, "builds-v0 holds an overlay a command whose uv was killed may run in")
+	}
+	envs := fmt.Sprintf("%d environments", r.envs)
 	if r.envs == 1 {
-		envs = "environment"
+		envs = "1 environment"
 	}
-	what := fmt.Sprintf("%d %s from %d %s in it", found.users, procs, r.envs, envs)
-	if found.users == 0 {
-		what = fmt.Sprintf("builds-v0 holds what a command whose uv was killed may run from, %d %s", r.envs, envs)
-	}
-	return fmt.Sprintf("%s (%s with what they reach), so around them: the rest of environments-v2 and archive-v0 goes, "+
-		"and builds-v0 and its other buckets stay for uv's own prune", what, gib(r.bytes))
+	return fmt.Sprintf("%s, so the prune goes around what they use: it keeps %s and what they reach (%s), and builds-v0; "+
+		"the rest of environments-v2 and archive-v0 goes, and the other buckets stay for uv's own prune",
+		strings.Join(why, " and "), envs, gib(r.bytes))
 }
 
 // says what a prune around running environments did, for its finding's detail.
@@ -295,14 +362,25 @@ func (u uvRemoval) says() string {
 	if u.removed == 1 {
 		s = "it removed 1 entry"
 	}
-	if u.files > 0 {
+	switch u.files {
+	case 0:
+	case 1:
+		s += " and 1 file of files-v0 no archive links any more"
+	default:
 		s += fmt.Sprintf(" and %d files of files-v0 no archive links any more", u.files)
 	}
-	if u.failed > 0 {
-		s += fmt.Sprintf(", %d could not be removed (%s)", u.failed, u.err)
+	if len(u.failures) > 0 {
+		s += fmt.Sprintf(", %d could not be removed (%s)", len(u.failures), u.failures[0])
+	}
+	if len(u.stayed) > 0 {
+		s += fmt.Sprintf(", %d stay (%s)", len(u.stayed), u.stayed[0])
 	}
 	if u.left > 0 {
-		s += fmt.Sprintf(", and left %d for a later run: it deletes for %s at most under the lock a new uv process waits for", u.left, uvAroundFor)
+		s += fmt.Sprintf(", and left %d for a later run: it moves entries aside for %s at most under the lock a new uv "+
+			"process waits for", u.left, uvAroundFor)
+	}
+	if u.trash != "" {
+		s += "; what it moved aside could not all be deleted, and a later run deletes the rest: " + u.trash
 	}
 	return s
 }
@@ -438,36 +516,53 @@ func shebangPath(p string) []string {
 	return nil
 }
 
-// uvAroundFor is how long the rule deletes under the cache's lock: a uv process that starts meanwhile waits for the
-// lock up to its UV_LOCK_TIMEOUT, 5 minutes by default, and then fails. No entry starts after this.
-var uvAroundFor = 4 * time.Minute
-
-// uvRemoval is what a prune around running environments did: the entries it removed, the files of files-v0 it
-// removed, those it could not (with the first error), and those it left when its time ran out.
-type uvRemoval struct {
-	removed, files, failed, left int
-	err                          string
-}
-
-// uvRemove deletes, under the cache's lock, every entry of environments-v2 and archive-v0 that k does not keep: a
-// script's or a project's environment, a link to a cached environment that is not kept (or to none), an unpacked
-// wheel, a cached environment. Each goes whole, through an os.Root of its bucket, so no link leads the deletion out of
-// it. In environments-v2 a directory of links goes when none is left in it, and what is neither an environment nor
-// such a link stays. A name archive-v0 holds that starts with a dot is no entry uv made, and stays. No entry starts
-// after until.
-func uvRemove(c uvCache, k *uvReach, until time.Time) uvRemoval {
-	var out uvRemoval
-	gone := func(dir, name string) {
-		switch err := removeIn(dir, name); {
-		case err == nil, errors.Is(err, fs.ErrNotExist):
-			out.removed++
-		default:
-			out.failed++
-			if out.err == "" {
-				out.err = fmt.Sprintf("%s: %v", short(filepath.Join(dir, name)), err)
-			}
+// cfgKeys are the keys a pyvenv.cfg sets.
+func cfgKeys(b []byte) []string {
+	var out []string
+	for _, l := range strings.Split(string(b), "\n") {
+		if k, _, ok := strings.Cut(l, "="); ok {
+			out = append(out, strings.TrimSpace(k))
 		}
 	}
+	return out
+}
+
+// uvAroundFor is how long the rule moves entries aside under the cache's lock: a uv process that starts meanwhile
+// waits for the lock up to its UV_LOCK_TIMEOUT, 5 minutes by default, and then fails. No entry starts after this.
+var uvAroundFor = 4 * time.Minute
+
+// uvTrash is where a prune around running environments moves what it deletes, under the cache's lock: an entry leaves
+// uv's names whole and at once, and is deleted once the lock is gone, since nothing can reach it there. A run stopped
+// midway leaves it there for the next run to delete; uv's own prune removes it too, as no bucket of its own.
+const uvTrash = ".capacity-trash"
+
+// uvRemoval is what a prune around running environments did: the entries it moved aside, the files of files-v0 it
+// removed, the entries that could not go (each with why), those that stay since they hold a mount point, those it
+// left when its time ran out, and why what it moved aside could not all be deleted.
+type uvRemoval struct {
+	removed, files, left int
+	failures, stayed     []string
+	trash                string
+}
+
+// uvRemove moves aside, under the cache's lock, every entry of environments-v2 and archive-v0 that k does not keep: a
+// script's or a project's environment, an unpacked wheel, a cached environment. A link of environments-v2 to a cached
+// environment that is not kept, or to none, goes as it is, and a directory of such links once it is empty; what is
+// neither an environment nor such a link stays. A name archive-v0 holds that starts with a dot is no entry uv made,
+// and stays. stay says why an entry stays, if it does (it holds a mount point). Each move goes through
+// an os.Root of the cache, so no link leads it out, with an exclusive BSD lock on the entry: another holder of a lock
+// keeps it. First it removes the files of files-v0 nothing links any more (an archive this rule moved aside earlier
+// held their last links). No entry starts after until.
+func uvRemove(c uvCache, k *uvReach, until time.Time, stay func(string) string) uvRemoval {
+	var out uvRemoval
+	rt, err := os.OpenRoot(c.dir)
+	if err != nil {
+		out.failures = append(out.failures, short(c.dir)+": "+err.Error())
+		return out
+	}
+	defer rt.Close()
+	uvFiles(rt, c.dir, until, &out)
+	aside := filepath.Join(uvTrash, strconv.FormatInt(time.Now().UnixNano(), 36))
 	late := func() bool {
 		if time.Now().After(until) {
 			out.left++
@@ -476,50 +571,106 @@ func uvRemove(c uvCache, k *uvReach, until time.Time) uvRemoval {
 		return false
 	}
 	for _, b := range uvDeletes {
-		dir := filepath.Join(c.dir, b)
-		ents, err := os.ReadDir(dir)
-		if err != nil {
-			continue
+		ents, err := os.ReadDir(filepath.Join(c.dir, b))
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			out.failures = append(out.failures, b+": "+err.Error())
 		}
 		for _, e := range ents {
-			name := b + "/" + e.Name()
+			rel := b + "/" + e.Name()
 			switch {
-			case k.keep[name]:
+			case k.keep[rel]:
 			case b == "archive-v0" && strings.HasPrefix(e.Name(), "."):
-			case b == "environments-v2" && e.Type()&fs.ModeSymlink == 0 && e.IsDir() && !exists(filepath.Join(dir, e.Name(), "pyvenv.cfg")):
-				links(c, k, filepath.Join(dir, e.Name()), late, gone)
+			case b == "environments-v2" && e.IsDir() && !exists(filepath.Join(c.dir, rel, "pyvenv.cfg")):
+				out.removeLinks(rt, c, k, rel, late)
 			case b == "environments-v2" && !e.IsDir():
+			case stay(filepath.Join(c.dir, rel)) != "":
+				out.stayed = append(out.stayed, rel+": "+stay(filepath.Join(c.dir, rel)))
 			case late():
 			default:
-				gone(dir, e.Name())
+				out.move(rt, rel, filepath.Join(aside, rel))
 			}
 		}
-	}
-	if time.Now().Before(until) {
-		uvFiles(c, until, &out)
 	}
 	return out
 }
 
-// uvFiles removes the files of files-v0 that nothing links any more, and then its directories left empty. uv 0.13's
-// content-addressed cache (a preview) keeps a wheel's files there and hardlinks them into the wheel's archive, and
-// an environment's files are links of those, so an archive that went leaves each file only it linked with one link:
-// uv's own prune removes those. A running environment's link keeps its file's count above one.
-func uvFiles(c uvCache, until time.Time, out *uvRemoval) {
-	dir := filepath.Join(c.dir, "files-v0")
-	rt, err := os.OpenRoot(dir)
+// move moves an entry aside, through the cache's root, while it holds an exclusive BSD lock on it.
+func (u *uvRemoval) move(rt *os.Root, rel, to string) {
+	fh, err := rt.Open(rel)
+	if err == nil {
+		defer fh.Close()
+		if syscall.Flock(int(fh.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+			err = errLocked
+		}
+	}
+	if err == nil {
+		err = rt.MkdirAll(filepath.Dir(to), 0o700)
+	}
+	if err == nil {
+		err = rt.Rename(rel, to)
+	}
+	switch {
+	case err == nil, errors.Is(err, fs.ErrNotExist):
+		u.removed++
+	default:
+		u.failures = append(u.failures, rel+": "+err.Error())
+	}
+}
+
+// removeLinks removes the links of one of environments-v2's directories of links whose cached environment is not
+// kept, or that lead nowhere, and the directory once it is empty. What is no link stays.
+func (u *uvRemoval) removeLinks(rt *os.Root, c uvCache, k *uvReach, shard string, late func() bool) {
+	ents, err := os.ReadDir(filepath.Join(c.dir, shard))
 	if err != nil {
 		return
 	}
-	defer rt.Close()
+	left := 0
+	for _, l := range ents {
+		rel := shard + "/" + l.Name()
+		if l.Type()&fs.ModeSymlink == 0 {
+			left++
+			continue
+		}
+		t, err := rt.Readlink(rel)
+		if err == nil && !filepath.IsAbs(t) {
+			t = filepath.Join(c.dir, shard, t)
+		}
+		if e, _ := c.entry(filepath.Clean(t)); err == nil && k.keep[e] {
+			left++
+			continue
+		}
+		if late() {
+			left++
+			continue
+		}
+		switch err := rt.Remove(rel); {
+		case err == nil, errors.Is(err, fs.ErrNotExist):
+			u.removed++
+		default:
+			left++
+			u.failures = append(u.failures, rel+": "+err.Error())
+		}
+	}
+	if left == 0 {
+		rt.Remove(shard) // empty, or a link came since: then it stays
+	}
+}
+
+// uvFiles removes the files of files-v0 that nothing links any more, and then its directories left empty. uv 0.13's
+// content-addressed cache (a preview) keeps a wheel's files there and hardlinks them into the wheel's archive, and an
+// environment's files are links of those, so each file only an archive that went linked has one link left: uv's own
+// prune removes those. A running environment's link keeps its file's count above one. An archive moved aside still
+// links its files until it is deleted, after the lock, so they go at the next prune.
+func uvFiles(rt *os.Root, dir string, until time.Time, out *uvRemoval) {
+	files := filepath.Join(dir, "files-v0")
 	var dirs []string
-	filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+	filepath.WalkDir(files, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || time.Now().After(until) {
 			return filepath.SkipAll
 		}
 		rel, _ := filepath.Rel(dir, p)
 		switch {
-		case d.IsDir() && rel != ".":
+		case d.IsDir() && p != files:
 			dirs = append(dirs, rel)
 		case d.Type().IsRegular():
 			if info, err := d.Info(); err == nil {
@@ -535,36 +686,18 @@ func uvFiles(c uvCache, until time.Time, out *uvRemoval) {
 	}
 }
 
-// links deletes the links of one of environments-v2's directories of links whose cached environment is not kept, or
-// that lead nowhere, and the directory once it is empty. What is no link stays.
-func links(c uvCache, k *uvReach, shard string, late func() bool, gone func(dir, name string)) {
-	ents, err := os.ReadDir(shard)
+// uvEmptyTrash deletes what prunes around running environments moved aside, through an os.Root of the cache: once it
+// is aside nothing reaches it, so no lock is needed.
+func uvEmptyTrash(dir string) error {
+	rt, err := os.OpenRoot(dir)
 	if err != nil {
-		return
+		return err
 	}
-	left := 0
-	for _, l := range ents {
-		if l.Type()&fs.ModeSymlink == 0 {
-			left++
-			continue
-		}
-		t, err := os.Readlink(filepath.Join(shard, l.Name()))
-		if err == nil && !filepath.IsAbs(t) {
-			t = filepath.Join(shard, t)
-		}
-		if e, _ := c.entry(filepath.Clean(t)); err == nil && k.keep[e] {
-			left++
-			continue
-		}
-		if late() {
-			left++
-			continue
-		}
-		gone(shard, l.Name())
+	defer rt.Close()
+	if err := rt.RemoveAll(uvTrash); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
 	}
-	if left == 0 {
-		os.Remove(shard) // empty, or another process put a link in since: then it stays
-	}
+	return nil
 }
 
 // pidNames names processes for a note: at most three, each once, then how many more.
@@ -609,9 +742,14 @@ func uvTakeLock(lock string, id lockID) (*os.File, string) {
 		f.Close()
 		return nil, "the cache's lock file changed since the look"
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	switch err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); {
+	case err == nil:
+		return f, ""
+	case errors.Is(err, syscall.EWOULDBLOCK):
 		f.Close()
 		return nil, "a uv process took the cache's lock since the look"
+	default:
+		f.Close()
+		return nil, "the cache's lock cannot be taken: " + err.Error()
 	}
-	return f, ""
 }
