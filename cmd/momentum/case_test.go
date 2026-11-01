@@ -104,8 +104,15 @@ func TestTheCaseCommands(t *testing.T) {
 	if code, _, errOut := momentum("case", "reopen", id, "--evidence", "file:/a@1", "--why", "again"); code != 2 || !strings.Contains(errOut, "does not hold") {
 		t.Fatalf("reopen on old evidence: exit %d %s", code, errOut)
 	}
-	if code, out, _ := momentum("case", "reopen", id, "--evidence", "file:/a@9", "--why", "it came back"); code != 0 || !strings.Contains(out, "reopened [open]") {
+	if code, out, _ := momentum("case", "reopen", id, "--evidence", "file:/a@9", "--at", "2026-01-02T03:04", "--why", "it came back"); code != 0 ||
+		!strings.Contains(out, "reopened [open]") {
 		t.Fatalf("reopen: exit %d %q", code, out)
+	}
+	if code, out, _ := momentum("case", "show", id, "--json"); code != 0 || !strings.Contains(out, `"back":`) {
+		t.Fatalf("a reopened case shows when it came back: %q", out)
+	}
+	if code, out, _ := momentum("case", "show", id, "--json", "--evidence", "0"); code != 0 || !strings.Contains(out, `"ref":"file:/a@9","at":"2026-01-02T03:04`) {
+		t.Fatalf("reopen --at dates the evidence: %q", out)
 	}
 	if code, _, errOut := momentum("case", "show", "c00000000"); code != 2 || !strings.Contains(errOut, "no case") {
 		t.Fatalf("show of an unknown case: exit %d %s", code, errOut)

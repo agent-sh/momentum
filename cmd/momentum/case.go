@@ -102,6 +102,7 @@ type listedCase struct {
 	Seen           string   `json:"seen"`
 	Closed         string   `json:"closed,omitempty"`
 	Deployed       string   `json:"deployed,omitempty"`
+	Back           string   `json:"back,omitempty"`
 	Package        string   `json:"package,omitempty"`
 	Measurement    *struct {
 		WindowHours float64 `json:"window_hours"`
@@ -129,6 +130,9 @@ func caseJSON(c store.Case) listedCase {
 	}
 	if !c.Deployed.IsZero() {
 		l.Deployed = rfc3339(c.Deployed)
+	}
+	if !c.Back.IsZero() {
+		l.Back = rfc3339(c.Back)
 	}
 	if m := c.Measurement; m.Window > 0 || m.Effect != "" {
 		l.Measurement = &struct {
@@ -288,6 +292,9 @@ func caseShow(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	field("benefit", c.Benefit)
 	field("cost", fmt.Sprintf("$%.2f, %d tokens, %s over %d runs", c.Cost.USD, c.Cost.Tokens, c.Cost.Duration.Round(time.Second), c.Cost.Runs))
 	field("signatures", strings.Join(c.Signatures, " | "))
+	if !c.Back.IsZero() {
+		field("came back", c.Back.Local().Format("2006-01-02 15:04"))
+	}
 	if !c.Deployed.IsZero() {
 		field("deployed", c.Deployed.Local().Format("2006-01-02 15:04")+" "+c.Package)
 	}
@@ -494,8 +501,16 @@ func caseReopen(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	var evs refs
 	fs.Var(&evs, "evidence", "a reference the case does not hold; repeat for more")
 	why := fs.String("why", "", "how the evidence changed, in a short line")
+	at := fs.String("at", "", "when the evidence happened, for references that are not events or notes (default: now)")
 	if err := fs.Parse(rest); err != nil {
 		return usageError{err.Error()}
+	}
+	var when time.Time
+	if *at != "" {
+		var err error
+		if when, err = parseWhen(*at); err != nil {
+			return usageError{err.Error()}
+		}
 	}
 	if fs.NArg() > 0 {
 		return usageError{fmt.Sprintf("case reopen takes one case's id, got %q too", fs.Arg(0))}
@@ -505,7 +520,7 @@ func caseReopen(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	}
 	var es []store.Evidence
 	for _, r := range evs {
-		es = append(es, store.Evidence{Ref: r})
+		es = append(es, store.Evidence{Ref: r, At: when})
 	}
 	st, err := store.Open(paths.DB())
 	if err != nil {

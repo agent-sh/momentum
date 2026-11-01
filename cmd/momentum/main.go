@@ -71,11 +71,11 @@ const usage = `usage:
   momentum case evidence ID [--at WHEN] [--kind K] [--summary S] REF...
                                         more evidence: ev:EVENT, note:ID, git:OWNER/REPO@SHA, file:PATH[@OFFSET],
                                         an address; an event or a note takes its own time, kind and summary
-  momentum case signature ID SIG        another signature (the root cause's: root:KEY); one another case holds
-                                        merges this case into that one
+  momentum case signature ID SIG        another signature (the root cause's: root:KEY); one another open case
+                                        holds merges this case into that one (a closed one comes back first)
   momentum case close ID --reason R [--into ID] --why W
                                         R is not-worth-it, insufficient-evidence, already-solved or duplicate
-  momentum case reopen ID --evidence REF... --why W
+  momentum case reopen ID --evidence REF... [--at WHEN] --why W
                                         a closed case comes back only on evidence it does not hold
   momentum version
 Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json), and the

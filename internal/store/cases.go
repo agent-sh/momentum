@@ -822,6 +822,9 @@ func (s *Store) AddCaseEvidence(ctx context.Context, id string, evs []Evidence, 
 // reopening with nothing new is refused, so a dismissed case does not come back on the evidence it was dismissed
 // on, and so is a duplicate's: the case it went into holds its evidence.
 func (s *Store) ReopenCase(ctx context.Context, id string, evs []Evidence, why, actor string) (Case, error) {
+	if strings.TrimSpace(why) == "" {
+		return Case{}, badCase("a reopening says why the evidence changed")
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Case{}, err
@@ -849,7 +852,11 @@ func (s *Store) ReopenCase(ctx context.Context, id string, evs []Evidence, why, 
 	  seen = MAX(seen, ?), back = ? WHERE id = ?`, CaseOpen, now.UnixMilli(), newest.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
-	if err := caseLog(ctx, tx, c.ID, actor, "reopened", fmt.Sprintf("closed as %s; %d new evidence: %s", c.Reason, added, why), now); err != nil {
+	action := "reopened"
+	if c.Reason == Improved || c.Reason == Solved {
+		action = "regressed" // its fix did not hold
+	}
+	if err := caseLog(ctx, tx, c.ID, actor, action, fmt.Sprintf("closed as %s; %d new evidence: %s", c.Reason, added, why), now); err != nil {
 		return Case{}, err
 	}
 	if c, err = getCase(ctx, tx, c.ID); err != nil {
@@ -862,6 +869,9 @@ func (s *Store) ReopenCase(ctx context.Context, id string, evs []Evidence, why, 
 // which only the measure tool gives. A duplicate goes into the case into names, followed to where it went: its
 // evidence, signatures and cost move there, and so does what its investigation found where that case has none.
 func (s *Store) CloseCase(ctx context.Context, id string, reason CloseReason, into, why, actor string) (Case, error) {
+	if strings.TrimSpace(why) == "" {
+		return Case{}, badCase("a close says why")
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Case{}, err

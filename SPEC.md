@@ -321,7 +321,7 @@ Phase 0 showed that each family needs history the machine does not keep today. T
   - A case goes into a closed one only when its closer names it (`case close --reason duplicate --into`), never by a signature: the closed case comes back first (`case reopen`, with evidence it does not hold), then takes the other in.
   - A duplicate's own id closes and reopens nothing: the case it went into holds its evidence. Evidence, a change, a signature or a cost given by its id go to that case.
 - **Evidence** is a reference: an event (`ev:ID`), a note (`note:ID`), a commit (`git:OWNER/REPO@SHA`), a file (`file:PATH`, absolute or under `~/`, with an optional `@OFFSET`), or an http or https address; anything else is refused. An event's reference always takes the event's own time, kind and summary, and a note's the note's, whatever the caller gives; either must be in the store. Evidence is of what happened: none is dated after now. The material stays where the reference points.
-- **Status** runs open, investigating, testing, deployed, measuring, then closed with a reason: improved (with the measurement), not worth it, insufficient evidence, already solved, or duplicate (of the case with its root cause).
+- **Status** runs open, investigating, testing, deployed, measuring, then closed with a reason: improved (with the measurement), not worth it, insufficient evidence, already solved, or duplicate (of the case it went into).
   - An investigation moves a case among open, investigating and testing. A case is in testing only with a mechanism and the next discriminating test on record: a change that would leave a testing case without either is refused.
   - Only the ship tool deploys a case, with its change package, and only its rollback takes a deployed case back (The loop). Only the measure tool moves a case to measuring and closes it as improved, with the measurement.
   - A case closes by hand from open, investigating or testing, with a reason and why, never as improved.
@@ -330,7 +330,7 @@ Phase 0 showed that each family needs history the machine does not keep today. T
   - One closed as improved comes back once the problem is back at its old rate: its evidence over its last window reaches what the window before its change held, each window as long as its measurement's.
   - Either comes back regressed (its log says so), the same case with its history: its fix did not hold.
   - One closed as not worth it or as insufficient evidence keeps what comes after the close, and comes back once that reaches what it held when it closed: the problem has happened as often again.
-  - `case reopen` brings one back by hand, only with evidence it does not hold.
+  - `case reopen` brings one back by hand, only with evidence it does not hold and a why; one closed as improved or already solved comes back regressed there too.
 - **A case unseen past its evidence retention closes by itself**: one open, investigating or testing that has had no evidence for 30 days (about as long as Claude Code keeps a transcript), and has been open for 30 days since it opened or last came back, closes as insufficient evidence on the loop's next run. The problem stopped, which judges nothing about its evidence, so any evidence after the close brings it back. A case opened or brought back on older evidence has its 30 days from then. A deployed or measuring case is its measurement's.
 - A loop that fails the same way twice stops and opens a case instead of retrying.
 - **Prior art.**

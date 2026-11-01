@@ -728,3 +728,43 @@ func TestTheCasesAreKept(t *testing.T) {
 		t.Fatalf("id %q", got.ID)
 	}
 }
+
+// A reopening by hand of a case closed as already solved comes back regressed; a close and a reopening say why;
+// a case open for long with fresh evidence is not swept; a comeback on its own evidence stamps when it came back.
+func TestTheLastRulesOfACasesComeBack(t *testing.T) {
+	st := caseStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	c, _ := observeOK(t, st, Finding{Family: "failures", Signature: "s", Title: "t", Evidence: refsAt("a", 1, now.Add(-2*time.Hour))})
+	if _, err := st.CloseCase(ctx, c.ID, Solved, "", " ", "agent"); !errors.Is(err, ErrBadCase) {
+		t.Fatalf("a close without why: %v", err)
+	}
+	if _, err := st.CloseCase(ctx, c.ID, Solved, "", "fixed", "agent"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ReopenCase(ctx, c.ID, refsAt("b", 1, now.Add(-time.Minute)), "", "agent"); !errors.Is(err, ErrBadCase) {
+		t.Fatalf("a reopening without why: %v", err)
+	}
+	if _, err := st.ReopenCase(ctx, c.ID, refsAt("b", 1, now.Add(-time.Minute)), "it recurred", "agent"); err != nil {
+		t.Fatal(err)
+	}
+	if log, _ := st.CaseLog(ctx, c.ID); log[len(log)-1].Action != "regressed" {
+		t.Fatalf("a solved case reopened by hand logs %q", log[len(log)-1].Action)
+	}
+	old, _ := observeOK(t, st, Finding{Family: "failures", Signature: "o", Title: "o", Evidence: refsAt("o", 1, now.Add(-5*24*time.Hour))})
+	if _, err := st.db.ExecContext(ctx, `UPDATE cases SET opened = ? WHERE id = ?`, now.Add(-40*24*time.Hour).UnixMilli(), old.ID); err != nil {
+		t.Fatal(err)
+	}
+	if swept, err := st.SweepCases(ctx, now, CaseRetention, "loop:test"); err != nil || len(swept) != 0 {
+		t.Fatalf("a long-open case with fresh evidence was swept: %+v %v", swept, err)
+	}
+	d, _ := observeOK(t, st, Finding{Family: "failures", Signature: "d", Title: "d", Evidence: refsAt("d", 1, now.Add(-3*time.Hour))})
+	if _, err := st.CloseCase(ctx, d.ID, Solved, "", "fixed", "agent"); err != nil {
+		t.Fatal(err)
+	}
+	closedAt(t, st, d.ID, now.Add(-2*time.Hour))
+	got, obs := observeOK(t, st, Finding{Family: "failures", Signature: "d", Evidence: refsAt("d2", 1, now.Add(-time.Hour))})
+	if obs != Reopened || got.Back.IsZero() {
+		t.Fatalf("a comeback on its own evidence: %s back %v", obs, got.Back)
+	}
+}
