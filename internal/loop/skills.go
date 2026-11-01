@@ -30,18 +30,6 @@ func Skill(name string) (string, error) {
 	return strings.TrimSpace(s), nil
 }
 
-// Families are the families the loop has a skill for.
-func Families() []string {
-	var out []string
-	entries, _ := fs.ReadDir(skills, "skills")
-	for _, e := range entries {
-		if n := e.Name(); n != "loop" && n != "review" {
-			out = append(out, n)
-		}
-	}
-	return out
-}
-
 // systemPrompt is what a run's agent reads before its prompt: the loop's procedure, the skill of its step, the
 // standing constraints, and the machine's rules, read from their files at each run.
 func systemPrompt(step, family string, rules []string, constraints []string) (string, error) {

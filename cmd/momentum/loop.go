@@ -10,10 +10,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/capacity"
 	"github.com/agent-sh/momentum/internal/config"
 	"github.com/agent-sh/momentum/internal/loop"
 	"github.com/agent-sh/momentum/internal/paths"
@@ -52,10 +54,15 @@ func setup(st *store.Store, c config.Loop) (*loop.Runner, *loop.Ship, error) {
 		b.MaxTurns = c.MaxTurns
 	}
 	name, email := gitGlobal("user.name"), gitGlobal("user.email")
-	bwrap, _ := exec.LookPath("bwrap")
+	bwrap, err := exec.LookPath("bwrap")
+	if err != nil {
+		bwrap = "bwrap" // a check then fails to start, and says so
+	}
 	exe, _ := os.Executable()
 	bins := []string{filepath.Dir(exe), filepath.Join(home, ".local", "bin")}
-	sb := loop.Sandbox{Bwrap: bwrap, Writable: []string{filepath.Join(home, ".cache", "go-build"), filepath.Join(home, ".cache", "uv")}}
+	ro, toolPath := toolchains(home)
+	sb := loop.Sandbox{Bwrap: bwrap, Home: home, ReadOnly: append(ro, c.SandboxRead...), Cache: filepath.Join(loopDir(), "cache"),
+		Scratch: filepath.Join(loopDir(), "tmp"), Path: toolPath}
 	if len(c.CapacityGate) > 0 {
 		gate := c.CapacityGate
 		sb.Gate = func(ctx context.Context) error {
@@ -67,12 +74,8 @@ func setup(st *store.Store, c config.Loop) (*loop.Runner, *loop.Ship, error) {
 		}
 	}
 	ship := &loop.Ship{Store: st, Dir: loopDir(), Live: c.Live, Actor: caseActor(), Identity: [2]string{name, email}, Sandbox: sb,
-		Env: loop.CleanEnv(nil, bins...),
-		Gate: loop.Gate{Owners: c.Owners, Exclude: c.Exclude, ConfigAllow: c.ConfigAllow, RepoGuard: c.RepoGuard, Own: loopDir(),
+		Gate: loop.Gate{Owners: c.Owners, Exclude: c.Exclude, RepoGuard: c.RepoGuard, Own: loopDir(),
 			Home: home, Busy: func(ctx context.Context, dir string) (string, error) { return repoBusy(ctx, st, dir) }}}
-	if bwrap == "" {
-		ship.Sandbox.Bwrap = "bwrap" // a check then fails to start, and says so
-	}
 	model, fallback := c.Model, c.FallbackModel
 	if model == "" {
 		model = defaultModel
@@ -84,8 +87,14 @@ func setup(st *store.Store, c config.Loop) (*loop.Runner, *loop.Ship, error) {
 	if len(families) == 0 {
 		families = defaultFamilies
 	}
-	r := &loop.Runner{Store: st, Agent: loop.Agent{Runner: c.Runner, Model: model, Fallback: fallback}, Ship: ship, Detectors: detectors(),
-		Families: families, Budgets: b, Rules: c.Rules, Constraints: c.Constraints, MCP: c.MCP, Dir: loopDir(), Home: home, Bins: bins,
+	ds, err := listDetectors()
+	if err != nil {
+		return nil, nil, err
+	}
+	_, scope := exec.LookPath("systemd-run")
+	r := &loop.Runner{Store: st, Agent: loop.Agent{Runner: c.Runner, Model: model, Fallback: fallback, Scope: scope == nil}, Ship: ship,
+		Detectors: ds, Families: families, Budgets: b, Rules: c.Rules, Constraints: c.Constraints, MCP: c.MCP, ReadDirs: c.ReadDirs,
+		Dir: loopDir(), Home: home, Bins: bins,
 		Post: func(ctx context.Context, repo, pr, body string) (string, error) {
 			cctx, cancel := context.WithTimeout(ctx, time.Minute)
 			defer cancel()
@@ -95,15 +104,55 @@ func setup(st *store.Store, c config.Loop) (*loop.Runner, *loop.Ship, error) {
 	return r, ship, nil
 }
 
+// toolchains are what a check's test reads under the home, read-only (the toolchains of the test runners a check
+// may run, and their module and crate caches), and the directories of their programs, first on its path.
+func toolchains(home string) (ro, path []string) {
+	add := func(dir string) {
+		if dir != "" && within(dir, home) && !slices.Contains(ro, dir) {
+			if st, err := os.Stat(dir); err == nil && st.IsDir() {
+				ro = append(ro, dir)
+			}
+		}
+	}
+	if out, err := exec.Command("go", "env", "GOROOT", "GOMODCACHE").Output(); err == nil {
+		f := strings.Fields(string(out))
+		if len(f) == 2 {
+			add(f[0])
+			add(f[1])
+			path = append(path, filepath.Join(f[0], "bin"))
+		}
+	}
+	for _, d := range []string{".cargo/bin", ".cargo/registry", ".cargo/git", ".rustup", ".nvm"} {
+		add(filepath.Join(home, d))
+	}
+	path = append(path, filepath.Join(home, ".cargo", "bin"))
+	if p, err := exec.LookPath("node"); err == nil {
+		if real, err := filepath.EvalSymlinks(p); err == nil {
+			path = append(path, filepath.Dir(real))
+		}
+	}
+	return ro, path
+}
+
 func gitGlobal(key string) string {
 	out, _ := exec.Command("git", "config", "--global", key).Output()
 	return strings.TrimSpace(string(out))
 }
 
 // repoBusy names what works in a repository now, or "": a live agent session (any phase but done) in one of its
-// work trees, a process with its working directory in one, or a change in one in the last hour. The loop's own
-// trees and processes are its own.
+// work trees, or above one whose calls of the last hour name it; a process with its working directory in one; a
+// change to its tracked files not committed; or a commit, a checkout or a staging in one in the last hour. The
+// loop's own trees and processes are its own.
 func repoBusy(ctx context.Context, st *store.Store, dir string) (string, error) {
+	ss, err := sessionsByPID(ctx, st)
+	if err != nil {
+		return "", err
+	}
+	return busyIn(ctx, st, dir, ss)
+}
+
+// busyIn is repoBusy over the live sessions given.
+func busyIn(ctx context.Context, st *store.Store, dir string, ss map[int]capacity.Session) (string, error) {
 	out, err := exec.CommandContext(ctx, "git", "-C", dir, "worktree", "list", "--porcelain").Output()
 	if err != nil {
 		return "", fmt.Errorf("git worktree list: %w", err)
@@ -115,14 +164,29 @@ func repoBusy(ctx context.Context, st *store.Store, dir string) (string, error) 
 			trees = append(trees, t)
 		}
 	}
-	ss, err := sessionsByPID(ctx, st)
-	if err != nil {
-		return "", err
-	}
+	home := paths.Home()
 	for _, t := range trees {
 		for _, s := range ss {
-			if s.Cwd != "" && within(s.Cwd, t) && !within(s.Cwd, own) {
+			switch {
+			case s.Cwd == "" || within(s.Cwd, own):
+			case within(s.Cwd, t):
 				return fmt.Sprintf("session %s (%s) works in %s", firstText(s.Name, s.Key), s.Tool, t), nil
+			case within(t, s.Cwd) && s.ID != "":
+				// a session above the tree: its last hour's calls say whether it works in it
+				calls, err := st.Events(ctx, store.Query{Since: time.Now().Add(-time.Hour), Session: s.ID, Kinds: []string{"tool_call"},
+					Source: store.Transcripts, Limit: 2000})
+				if err != nil {
+					return "", err
+				}
+				rel, _ := filepath.Rel(s.Cwd, t)
+				names := []string{t, "~/" + strings.TrimPrefix(strings.TrimPrefix(t, home), "/"), rel}
+				for _, e := range calls {
+					for _, n := range names {
+						if n != "" && n != "." && strings.Contains(e.Summary, n) {
+							return fmt.Sprintf("session %s (%s) works in %s from %s", firstText(s.Name, s.Key), s.Tool, t, s.Cwd), nil
+						}
+					}
+				}
 			}
 		}
 	}
@@ -154,6 +218,12 @@ func repoBusy(ctx context.Context, st *store.Store, dir string) (string, error) 
 				return fmt.Sprintf("a change in %s in the last hour", t), nil
 			}
 		}
+		// his tree's status, read without the lock that would rewrite its index
+		cmd := exec.CommandContext(ctx, "git", "-C", t, "-c", "core.fsmonitor=false", "status", "--porcelain", "--untracked-files=no")
+		cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+		if st, err := cmd.Output(); err == nil && strings.TrimSpace(string(st)) != "" {
+			return fmt.Sprintf("uncommitted changes in %s", t), nil
+		}
 	}
 	return "", nil
 }
@@ -167,6 +237,9 @@ func within(p, dir string) bool {
 func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) > 0 && args[0] == "runs" {
 		return loopRuns(ctx, args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "lesson" {
+		return loopLesson(ctx, args[1:], stdout, stderr)
 	}
 	fs := flag.NewFlagSet("loop", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -288,4 +361,56 @@ func loopRuns(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		fmt.Fprintf(stdout, "spent by live runs: $%.2f in the last day, $%.2f in the last week\n", day, week)
 	}
 	return nil
+}
+
+// loopLesson publishes a case's validated lesson to tacit: a case closed as improved, its lesson one line,
+// scrubbed, written as the loop's observation (never the owner's words) in the scope of the repository its change
+// went to. In a loop run it is the run's own case's.
+func loopLesson(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("loop lesson", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	caseID := fs.String("case", os.Getenv("MOMENTUM_LOOP_CASE"), "the case (in a loop run: its own)")
+	text := fs.String("text", "", "the lesson, one line")
+	if err := fs.Parse(args); err != nil {
+		return usageError{err.Error()}
+	}
+	if run := os.Getenv("MOMENTUM_LOOP_RUN"); run != "" && *caseID != os.Getenv("MOMENTUM_LOOP_CASE") {
+		return usageError{fmt.Sprintf("this loop run works case %s, not %s", os.Getenv("MOMENTUM_LOOP_CASE"), *caseID)}
+	}
+	line := strings.TrimSpace(*text)
+	switch {
+	case *caseID == "":
+		return usageError{"which case: --case ID"}
+	case line == "" || strings.ContainsAny(line, "\n\r") || len(line) > 300:
+		return usageError{"a lesson is one line of at most 300 characters"}
+	}
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	c, err := st.CaseByID(ctx, *caseID)
+	if err != nil {
+		return usageError{err.Error()}
+	}
+	if c.Status != store.CaseClosed || c.Reason != store.Improved {
+		return usageError{fmt.Sprintf("case %s is %s: a lesson is published only for a case closed as improved", c.ID, statusLine(c))}
+	}
+	pub, err := loop.Public(ctx, line)
+	if err != nil {
+		return err
+	}
+	scope := "projects/momentum"
+	if p, ok, _ := (&loop.Ship{Dir: loopDir()}).Load(c.ID); ok && p.Repo != "" {
+		scope = "projects/" + p.Repo[strings.IndexByte(p.Repo, '/')+1:]
+	}
+	cctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	out, err := exec.CommandContext(cctx, "tacit", "add", "--harness", "claude", "--kind", "observed", "--scope", scope,
+		"--desc", pub, "--body", fmt.Sprintf("Learned by momentum's improvement loop on case %s (%s): %s", c.ID, c.Family, c.Title)).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("tacit add: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	fmt.Fprintf(stdout, "%s: published to %s: %s\n", c.ID, scope, pub)
+	return st.CaseNote(ctx, c.ID, "published", scope+": "+pub, caseActor())
 }

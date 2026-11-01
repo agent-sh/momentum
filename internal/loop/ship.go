@@ -1,9 +1,8 @@
 package loop
 
 import (
+	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,9 +20,11 @@ import (
 )
 
 // Ship is the one way a change of the loop's goes in: a change package per case, built in a work tree of the
-// loop's own, checked by a test that fails without the change and passes with it, proposed with a rollback and a
-// measurement plan, reviewed in a clean context, and landed only when the loop is live and the review found
-// nothing high or medium. Every step checks the authority again (Gate).
+// loop's own on a branch of an owned repository, checked by a test that fails without the change and passes with
+// it, proposed as a pull request with a rollback and a measurement plan, reviewed in a clean context, revised for
+// what a review finds (three rounds at most), and landed only when the loop is live and the last review found
+// nothing high or medium. Every step checks the authority again (Gate). A configuration directory is no target:
+// the loop changes only repositories, through pull requests.
 type Ship struct {
 	Store   *store.Store
 	Gate    Gate
@@ -33,12 +34,14 @@ type Ship struct {
 	Actor   string
 	Now     func() time.Time
 	// Identity is the git author and committer every commit of the loop's takes: the user's own, from his global
-	// git configuration, never a repository's override.
+	// git configuration, never a repository's override or the environment's.
 	Identity [2]string
 	GH       string // the GitHub CLI
-	Window   time.Duration
-	// Env is the environment a check's test runs with.
+	// Env is what a check's test adds to the sandbox's own environment (a toolchain's settings); nothing of the
+	// user's session.
 	Env []string
+	// Public makes a text the loop posts publishable (loop.Public: secrets scrubbed, mentions neutral).
+	Public func(ctx context.Context, text string) (string, error)
 }
 
 // Package states.
@@ -46,6 +49,7 @@ const (
 	Prepared   = "prepared"
 	Checked    = "checked"
 	Proposed   = "proposed"
+	Revising   = "revising" // a review found something: back to its build, on the same branch and pull request
 	Landed     = "landed"
 	RolledBack = "rolled back"
 )
@@ -56,12 +60,12 @@ const MaxRounds = 3
 // Package is a case's change: where it goes, what checks it, how it is measured and undone, and where it stands.
 type Package struct {
 	Case     string    `json:"case"`
-	Kind     string    `json:"kind"` // repo or config
+	Kind     string    `json:"kind"` // repo
 	Repo     string    `json:"repo,omitempty"`
 	Base     string    `json:"base,omitempty"`
 	Branch   string    `json:"branch,omitempty"`
-	Dir      string    `json:"dir"`  // the repository's main checkout, or the configuration directory
-	Work     string    `json:"work"` // the loop's work tree, or its copy of the configuration
+	Dir      string    `json:"dir"`  // the repository's main checkout
+	Work     string    `json:"work"` // the loop's work tree
 	State    string    `json:"state"`
 	Check    *Check    `json:"check,omitempty"`
 	Plan     *Plan     `json:"plan,omitempty"`
@@ -80,13 +84,14 @@ type Package struct {
 }
 
 // Check is the evidence that a test discriminates the change: it fails on the code without the change (the
-// test's own files kept) and passes with it.
+// test's own files kept) and passes with it, both run on what the change commits (its tree), not on the files
+// beside it in the work tree.
 type Check struct {
 	Test      []string  `json:"test"`
 	TestFiles []string  `json:"test_files"`
 	Before    Outcome   `json:"before"`
 	After     Outcome   `json:"after"`
-	Tree      string    `json:"tree"` // the change it checked, by its hash: an edit after it needs a new check
+	Tree      string    `json:"tree"` // the tree it checked: an edit after it needs a new check
 	At        time.Time `json:"at"`
 }
 
@@ -108,16 +113,25 @@ type Signal struct {
 	Match   []string `json:"match"`
 }
 
+// Finding is one finding of a review.
+type Finding struct {
+	Severity string `json:"severity"` // high, medium or low
+	Where    string `json:"where"`
+	Problem  string `json:"problem"`
+	Fix      string `json:"fix"`
+}
+
 // Review is one round of the clean-context review.
 type Review struct {
-	Round   int       `json:"round"`
-	High    int       `json:"high"`
-	Medium  int       `json:"medium"`
-	Low     int       `json:"low"`
-	Head    string    `json:"head"`
-	Comment string    `json:"comment,omitempty"` // where it was posted
-	Text    string    `json:"text"`
-	At      time.Time `json:"at"`
+	Round    int       `json:"round"`
+	High     int       `json:"high"`
+	Medium   int       `json:"medium"`
+	Low      int       `json:"low"`
+	Findings []Finding `json:"findings,omitempty"`
+	Head     string    `json:"head"`
+	Comment  string    `json:"comment,omitempty"` // where it was posted
+	Text     string    `json:"text"`
+	At       time.Time `json:"at"`
 }
 
 func (s *Ship) now() time.Time {
@@ -175,103 +189,110 @@ func (s *Ship) working(ctx context.Context, caseID string) (store.Case, error) {
 	return c, nil
 }
 
+// public is a text as the loop may post it.
+func (s *Ship) public(ctx context.Context, text string) (string, error) {
+	if s.Public == nil {
+		return Public(ctx, text)
+	}
+	return s.Public(ctx, text)
+}
+
 // Prepare makes the case's work tree: a branch of the repository's default branch in a worktree of the loop's
-// own, or a copy of the configuration directory, once the gate allows the target. A case has one package at a
-// time; one rolled back can be prepared again.
-func (s *Ship) Prepare(ctx context.Context, caseID, repoDir, configDir string) (Package, error) {
+// own, once the gate allows the repository. A case has one package at a time; one rolled back can be prepared
+// again, its old work tree and branch gone first.
+func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, error) {
 	c, err := s.working(ctx, caseID)
 	if err != nil {
 		return Package{}, err
 	}
-	if p, ok, err := s.Load(c.ID); err != nil {
+	old, had, err := s.Load(c.ID)
+	if err != nil {
 		return Package{}, err
-	} else if ok && p.State != RolledBack {
-		return p, refused("case %s has a package %s already (%s, in %s)", c.ID, p.State, p.Kind, p.Work)
+	}
+	if had && old.State != RolledBack {
+		return old, refused("case %s has a package %s already (in %s)", c.ID, old.State, old.Work)
+	}
+	if repoDir == "" {
+		return Package{}, refused("a package goes to one repository: --repo, a checkout of it")
+	}
+	t, err := s.Gate.Repository(ctx, repoDir)
+	if err != nil {
+		return Package{}, err
 	}
 	work := s.workDir(c.ID)
+	branch := "momentum/" + c.ID
+	if had { // its last tree's registration, so the branch can be checked out again
+		s.git(ctx, old.Dir, "worktree", "remove", "--force", old.Work)
+		s.git(ctx, old.Dir, "worktree", "prune")
+	}
 	if err := os.RemoveAll(work); err != nil {
 		return Package{}, err
 	}
+	s.git(ctx, t.Dir, "worktree", "prune")
 	if err := os.MkdirAll(filepath.Dir(work), 0o700); err != nil {
 		return Package{}, err
 	}
-	p := Package{Case: c.ID, Work: work, State: Prepared, Created: s.now()}
-	switch {
-	case repoDir != "" && configDir == "":
-		t, err := s.Gate.Repository(ctx, repoDir)
-		if err != nil {
-			return Package{}, err
-		}
-		if _, err := gitOutput(ctx, t.Dir, "fetch", "--quiet", "origin", t.Base); err != nil {
-			return Package{}, err
-		}
-		p.Kind, p.Repo, p.Base, p.Dir, p.Branch = "repo", t.Repo, t.Base, t.Dir, "momentum/"+c.ID
-		if _, err := gitOutput(ctx, t.Dir, "worktree", "add", "-B", p.Branch, work, "origin/"+t.Base); err != nil {
-			return Package{}, err
-		}
-	case configDir != "" && repoDir == "":
-		t, err := s.Gate.Config(configDir)
-		if err != nil {
-			return Package{}, err
-		}
-		p.Kind, p.Dir = "config", t.Dir
-		if err := copyTree(t.Dir, work); err != nil {
-			return Package{}, err
-		}
-	default:
-		return Package{}, refused("a package goes to one repository (--repo) or one configuration directory (--config)")
+	if _, err := s.git(ctx, t.Dir, "fetch", "--quiet", "origin", t.Base); err != nil {
+		return Package{}, err
 	}
+	if _, err := s.git(ctx, t.Dir, "worktree", "add", "-B", branch, work, "origin/"+t.Base); err != nil {
+		return Package{}, err
+	}
+	p := Package{Case: c.ID, Kind: "repo", Repo: t.Repo, Base: t.Base, Dir: t.Dir, Branch: branch, Work: work, State: Prepared, Created: s.now()}
 	if err := s.save(&p); err != nil {
 		return Package{}, err
 	}
-	return p, s.Store.CaseNote(ctx, c.ID, "prepared", fmt.Sprintf("%s %s in %s", p.Kind, firstOf(p.Repo, p.Dir), p.Work), s.Actor)
+	return p, s.Store.CaseNote(ctx, c.ID, "prepared", fmt.Sprintf("%s in %s", p.Repo, p.Work), s.Actor)
 }
 
-// changed lists the paths the change touches, relative to its tree, and the hash of the change.
-func (s *Ship) changed(ctx context.Context, p Package) ([]string, string, error) {
-	h := sha256.New()
+// staged stages every change of the work tree and returns its tree, by its hash, and the paths it changes against
+// the default branch: both sides of a rename (git's renames are off), each name as git keeps it (NUL-separated).
+func (s *Ship) staged(ctx context.Context, p Package) (string, []string, error) {
+	if err := s.ownTree(p); err != nil {
+		return "", nil, err
+	}
+	if _, err := s.git(ctx, p.Work, "add", "-A"); err != nil {
+		return "", nil, err
+	}
+	tree, err := s.git(ctx, p.Work, "write-tree")
+	if err != nil {
+		return "", nil, err
+	}
+	out, err := s.git(ctx, p.Work, "diff", "--cached", "--name-status", "--no-renames", "-z", "origin/"+p.Base)
+	if err != nil {
+		return "", nil, err
+	}
 	var paths []string
-	switch p.Kind {
-	case "repo":
-		if _, err := gitOutput(ctx, p.Work, "add", "-A"); err != nil {
-			return nil, "", err
-		}
-		names, err := gitOutput(ctx, p.Work, "diff", "--cached", "--name-only", "origin/"+p.Base)
-		if err != nil {
-			return nil, "", err
-		}
-		diff, err := gitOutput(ctx, p.Work, "diff", "--cached", "--binary", "origin/"+p.Base)
-		if err != nil {
-			return nil, "", err
-		}
-		h.Write([]byte(diff))
-		for _, n := range strings.Split(strings.TrimSpace(names), "\n") {
-			if n != "" {
-				paths = append(paths, n)
-			}
-		}
-	case "config":
-		var err error
-		if paths, err = treeDiff(p.Dir, p.Work); err != nil {
-			return nil, "", err
-		}
-		for _, rel := range paths {
-			b, _ := os.ReadFile(filepath.Join(p.Work, rel))
-			h.Write([]byte(rel + "\x00"))
-			h.Write(b)
-		}
+	f := strings.Split(strings.TrimRight(out, "\x00"), "\x00")
+	for i := 0; i+1 < len(f); i += 2 {
+		paths = append(paths, f[i+1])
 	}
 	sort.Strings(paths)
-	return paths, hex.EncodeToString(h.Sum(nil)), nil
+	return strings.TrimSpace(tree), slices.Compact(paths), nil
+}
+
+// ownTree refuses a work tree whose link to its repository is no longer the one git made: a .git that points
+// elsewhere would make the loop's own git calls read another repository's configuration.
+func (s *Ship) ownTree(p Package) error {
+	b, err := os.ReadFile(filepath.Join(p.Work, ".git"))
+	if err != nil {
+		return refused("%s's .git is not the link git made: %v", p.Work, err)
+	}
+	link := strings.TrimSpace(strings.TrimPrefix(string(b), "gitdir: "))
+	common := filepath.Join(p.Dir, ".git", "worktrees")
+	if !strings.HasPrefix(string(b), "gitdir: ") || !under(link, common) {
+		return refused("%s's .git points to %q, not to its repository's work trees", p.Work, link)
+	}
+	return nil
 }
 
 // testFileRe are the names a test file has in the languages the owned repositories use.
 var testFileRe = regexp.MustCompile(`(_test\.go|\.test\.[cm]?[jt]sx?|\.spec\.[cm]?[jt]sx?|(^|/)test_[^/]*\.py|_test\.py|(^|/)tests?/.*|\.bats)$`)
 
-// Check runs the case's test twice in the sandbox: on the base with only the test's own files of the change (it
-// must fail), and on the change (it must pass). The test's files are those the change touches that are named as
-// tests, or the ones named. A check that does not come out so is recorded as it came out, and the package stays
-// unchecked.
+// Check runs the case's test twice in the sandbox, each time in a tree of the change's commit as it would be (no
+// ignored file of the work tree in it): the default branch with only the test's own files of the change (it must
+// fail), and the change (it must pass). The test's files are those the change touches that are named as tests, or
+// the ones named. A check that does not come out so is recorded as it came out, and the package stays unchecked.
 func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []string) (Package, error) {
 	if _, err := s.working(ctx, caseID); err != nil {
 		return Package{}, err
@@ -280,19 +301,22 @@ func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []strin
 	if err != nil {
 		return Package{}, err
 	}
-	if !ok || (p.State != Prepared && p.State != Checked) {
+	if !ok || (p.State != Prepared && p.State != Checked && p.State != Revising) {
 		return p, refused("case %s has no package to check (prepare it first; a proposed one is reviewed, not checked again)", caseID)
 	}
 	words, err := Words(test)
 	if err != nil {
 		return p, err
 	}
-	paths, tree, err := s.changed(ctx, p)
+	tree, paths, err := s.staged(ctx, p)
 	if err != nil {
 		return p, err
 	}
 	if len(paths) == 0 {
 		return p, refused("the change is empty: edit the files in %s first", p.Work)
+	}
+	if err := CheckPaths(Target{Repo: p.Repo}, paths); err != nil {
+		return p, err
 	}
 	if len(testFiles) == 0 {
 		for _, c := range paths {
@@ -309,37 +333,30 @@ func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []strin
 			return p, refused("%s is not a file the change touches", f)
 		}
 	}
-	if err := CheckPaths(Target{Repo: p.Repo}, paths); err != nil {
+	before, err := s.export(ctx, p, "before", "origin/"+p.Base)
+	if err != nil {
 		return p, err
 	}
-	before := filepath.Join(s.Dir, "work", ".before-"+caseID)
-	os.RemoveAll(before)
-	defer func() {
-		if p.Kind == "repo" {
-			gitOutput(context.Background(), p.Dir, "worktree", "remove", "--force", before)
-		}
-		os.RemoveAll(before)
-	}()
-	switch p.Kind {
-	case "repo":
-		if _, err := gitOutput(ctx, p.Dir, "worktree", "add", "--detach", before, "origin/"+p.Base); err != nil {
-			return p, err
-		}
-	case "config":
-		if err := copyTree(p.Dir, before); err != nil {
-			return p, err
-		}
-	}
+	defer s.unexport(p, before)
 	for _, f := range testFiles {
-		if err := copyFile(filepath.Join(p.Work, f), filepath.Join(before, f)); err != nil {
+		b, err := s.git(ctx, p.Work, "show", tree+":"+f)
+		if err != nil {
+			return p, err
+		}
+		if err := writeFile(filepath.Join(before, f), []byte(b)); err != nil {
 			return p, err
 		}
 	}
+	after, err := s.export(ctx, p, "after", tree)
+	if err != nil {
+		return p, err
+	}
+	defer s.unexport(p, after)
 	b, err := s.Sandbox.Run(ctx, before, words, s.Env)
 	if err != nil {
 		return p, err
 	}
-	a, err := s.Sandbox.Run(ctx, p.Work, words, s.Env)
+	a, err := s.Sandbox.Run(ctx, after, words, s.Env)
 	if err != nil {
 		return p, err
 	}
@@ -360,6 +377,26 @@ func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []strin
 	return p, s.Store.CaseNote(ctx, caseID, "checked", fmt.Sprintf("%s: fails without the change (exit %d), passes with it", strings.Join(words, " "), b.Exit), s.Actor)
 }
 
+// export makes a tree of a commit or a tree object, in a detached work tree of the loop's own: what a test runs on.
+func (s *Ship) export(ctx context.Context, p Package, name, treeish string) (string, error) {
+	dir := filepath.Join(s.Dir, "work", "."+name+"-"+p.Case)
+	s.unexport(p, dir)
+	if _, err := s.git(ctx, p.Dir, "worktree", "add", "--detach", dir, "origin/"+p.Base); err != nil {
+		return "", err
+	}
+	if _, err := s.git(ctx, dir, "read-tree", "-u", "--reset", treeish); err != nil {
+		s.unexport(p, dir)
+		return "", err
+	}
+	return dir, nil
+}
+
+func (s *Ship) unexport(p Package, dir string) {
+	s.git(context.Background(), p.Dir, "worktree", "remove", "--force", dir)
+	os.RemoveAll(dir)
+	s.git(context.Background(), p.Dir, "worktree", "prune")
+}
+
 // Proposal is what a change is proposed with.
 type Proposal struct {
 	Title, Body, Rollback, Lesson string
@@ -372,8 +409,9 @@ type Proposal struct {
 const MinSignal = 3
 
 // Propose makes the checked change a proposal: it checks the measurement plan against the case's own evidence,
-// commits the change as the user, pushes its branch and opens a pull request (a repository), or keeps the diff (a
-// configuration). The change must be the one the check passed.
+// commits the change as the user, checks the gate on the committed tree, pushes the branch and opens its pull
+// request, or, for a revision after a review, updates the one it has. The change must be the one the check passed.
+// A proposal that failed after its commit is taken up again where it stopped.
 func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package, error) {
 	c, err := s.working(ctx, caseID)
 	if err != nil {
@@ -386,12 +424,15 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package
 	if !ok || p.State != Checked || p.Check == nil {
 		return p, refused("case %s has no checked package: a change is proposed only after its check passed", caseID)
 	}
-	paths, tree, err := s.changed(ctx, p)
+	tree, paths, err := s.staged(ctx, p)
 	if err != nil {
 		return p, err
 	}
 	if tree != p.Check.Tree {
 		return p, refused("the change differs from the one the check passed: check it again")
+	}
+	if err := CheckPaths(Target{Repo: p.Repo}, paths); err != nil {
+		return p, err
 	}
 	switch {
 	case strings.TrimSpace(pr.Title) == "" || strings.TrimSpace(pr.Body) == "":
@@ -406,47 +447,62 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package
 	if err := s.editsSignal(ctx, p, pr.Signal); err != nil {
 		return p, err
 	}
+	title, err := s.public(ctx, strings.TrimSpace(pr.Title))
+	if err != nil {
+		return p, err
+	}
+	body, err := s.public(ctx, strings.TrimSpace(pr.Body))
+	if err != nil {
+		return p, err
+	}
 	p.Plan, p.Rollback, p.Title, p.Body, p.Lesson, p.Changed = &Plan{Signal: pr.Signal, Window: pr.Window, Before: before}, pr.Rollback,
-		pr.Title, pr.Body, pr.Lesson, paths
-	switch p.Kind {
-	case "repo":
-		if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
+		title, body, pr.Lesson, paths
+	// the commit first, so the work tree is clean when the scope check looks at every work tree of the repository
+	if head, err := s.git(ctx, p.Work, "rev-parse", "HEAD^{tree}"); err != nil || strings.TrimSpace(head) != tree {
+		if err := s.commit(ctx, p.Work, fmt.Sprintf("%s\n\n%s\n\nCase %s.", title, wrap(body), c.ID)); err != nil {
 			return p, err
 		}
-		if err := s.commit(ctx, p.Work, fmt.Sprintf("%s\n\n%s\n\nCase %s.", pr.Title, wrap(pr.Body), c.ID)); err != nil {
-			return p, err
-		}
-		head, err := gitOutput(ctx, p.Work, "rev-parse", "HEAD")
+	}
+	head, err := s.git(ctx, p.Work, "rev-parse", "HEAD")
+	if err != nil {
+		return p, err
+	}
+	p.Head = strings.TrimSpace(head)
+	if n := len(p.Reviews); n > 0 && p.Reviews[n-1].Head == p.Head {
+		return p, refused("the revision changes nothing of the commit the review read: change what its findings name")
+	}
+	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
+		return p, err
+	}
+	if _, err := s.git(ctx, p.Work, "push", "--no-verify", "--force-with-lease", "origin", "HEAD:refs/heads/"+p.Branch); err != nil {
+		return p, err
+	}
+	text, err := s.public(ctx, s.packageText(c, p))
+	if err != nil {
+		return p, err
+	}
+	if p.PR == "" {
+		url, err := s.gh(ctx, p.Work, "pr", "create", "--repo", p.Repo, "--base", p.Base, "--head", p.Branch, "--title", title, "--body", body+"\n\n"+text)
 		if err != nil {
-			return p, err
-		}
-		p.Head = strings.TrimSpace(head)
-		if _, err := gitOutput(ctx, p.Work, "push", "--force-with-lease", "origin", "HEAD:refs/heads/"+p.Branch); err != nil {
-			return p, err
-		}
-		body := pr.Body + "\n\n" + s.packageText(c, p)
-		url, err := s.gh(ctx, p.Work, "pr", "create", "--repo", p.Repo, "--base", p.Base, "--head", p.Branch, "--title", pr.Title, "--body", body)
-		if err != nil {
+			s.save(&p) // its commit and head: a retry takes it from there
 			return p, err
 		}
 		p.PR = strings.TrimSpace(lastOf(strings.Split(strings.TrimSpace(url), "\n")))
-	case "config":
-		if err := s.writeDiff(p); err != nil {
-			return p, err
-		}
+	} else if _, err := s.gh(ctx, p.Work, "pr", "edit", p.PR, "--repo", p.Repo, "--title", title, "--body", body+"\n\n"+text); err != nil {
+		s.save(&p)
+		return p, err
 	}
 	p.State = Proposed
 	if err := s.save(&p); err != nil {
 		return p, err
 	}
-	return p, s.Store.CaseNote(ctx, caseID, "proposed", fmt.Sprintf("%s %s; measured by %d events in the %s before", firstOf(p.PR, p.Dir),
-		pr.Title, before, pr.Window), s.Actor)
+	return p, s.Store.CaseNote(ctx, caseID, "proposed", fmt.Sprintf("%s %s; measured by %d events in the %s before", p.PR, title, before, pr.Window), s.Actor)
 }
 
 // validPlan checks a measurement plan: a signal that names a source, kinds and at least one text, a window of at
 // least a day, a count over the window before of at least MinSignal, and a signal that counts the case's own
-// problem: at least half of the case's evidence events in that window are among what it counts. It returns the
-// count before.
+// problem: the case holds events, and at least half of those in that window are among what it counts. It returns
+// the count before.
 func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window time.Duration) (int, error) {
 	switch {
 	case sig.Source == "" || len(sig.Kinds) == 0 || len(sig.Match) == 0:
@@ -475,9 +531,13 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 	for _, e := range got {
 		counted["ev:"+e.ID()] = true
 	}
-	in, hit := 0, 0
+	events, in, hit := 0, 0, 0
 	for _, e := range evs {
-		if !strings.HasPrefix(e.Ref, "ev:") || e.At.Before(now.Add(-window)) {
+		if !strings.HasPrefix(e.Ref, "ev:") {
+			continue
+		}
+		events++
+		if e.At.Before(now.Add(-window)) {
 			continue
 		}
 		in++
@@ -485,47 +545,34 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 			hit++
 		}
 	}
-	if in > 0 && hit*2 < in {
-		return 0, refused("the signal counts %d of the case's %d events in the window: it does not measure the case's problem", hit, in)
-	}
-	if in == 0 && len(evs) > 0 {
+	switch {
+	case events == 0:
+		return 0, refused("the case holds no event of the store: its measurement has nothing of its own problem to count")
+	case in == 0:
 		return 0, refused("the case has no evidence in the window: measure over a window that holds it")
+	case hit*2 < in:
+		return 0, refused("the signal counts %d of the case's %d events in the window: it does not measure the case's problem", hit, in)
 	}
 	return len(got), nil
 }
 
 // editsSignal refuses a change that edits the texts its own measurement counts: a change of words that only stops
-// the signal from matching would measure as a fix.
+// the signal from matching would measure as a fix. It reads the lines the change removes, hunk by hunk.
 func (s *Ship) editsSignal(ctx context.Context, p Package, sig Signal) error {
+	diff, err := s.git(ctx, p.Work, "diff", "--cached", "--no-renames", "--no-ext-diff", "--no-textconv", "-U0", "origin/"+p.Base)
+	if err != nil {
+		return err
+	}
 	var removed []string
-	switch p.Kind {
-	case "repo":
-		diff, err := gitOutput(ctx, p.Work, "diff", "--cached", "-U0", "origin/"+p.Base)
-		if err != nil {
-			return err
-		}
-		for _, l := range strings.Split(diff, "\n") {
-			if strings.HasPrefix(l, "-") && !strings.HasPrefix(l, "---") {
-				removed = append(removed, strings.ToLower(l))
-			}
-		}
-	case "config":
-		paths, err := treeDiff(p.Dir, p.Work)
-		if err != nil {
-			return err
-		}
-		for _, rel := range paths {
-			old, _ := os.ReadFile(filepath.Join(p.Dir, rel))
-			now, _ := os.ReadFile(filepath.Join(p.Work, rel))
-			kept := map[string]bool{}
-			for _, l := range strings.Split(string(now), "\n") {
-				kept[l] = true
-			}
-			for _, l := range strings.Split(string(old), "\n") {
-				if !kept[l] {
-					removed = append(removed, strings.ToLower(l))
-				}
-			}
+	inHunk := false
+	for _, l := range strings.Split(diff, "\n") {
+		switch {
+		case strings.HasPrefix(l, "diff --git "):
+			inHunk = false
+		case strings.HasPrefix(l, "@@"):
+			inHunk = true
+		case inHunk && strings.HasPrefix(l, "-"):
+			removed = append(removed, strings.ToLower(l[1:]))
 		}
 	}
 	for _, m := range sig.Match {
@@ -562,7 +609,9 @@ func Count(ctx context.Context, st *store.Store, sig Signal, since, until time.T
 	return out, nil
 }
 
-// Reviewed records a round of the clean-context review: its findings by severity, and where it was posted.
+// Reviewed records a round of the clean-context review on the proposed head: its findings, counted by severity
+// from the findings themselves, and where it was posted. A review that finds something high or medium sends the
+// package back to its build (revising), until its rounds are used.
 func (s *Ship) Reviewed(ctx context.Context, caseID string, r Review) (Package, error) {
 	p, ok, err := s.Load(caseID)
 	if err != nil {
@@ -571,8 +620,22 @@ func (s *Ship) Reviewed(ctx context.Context, caseID string, r Review) (Package, 
 	if !ok || p.State != Proposed {
 		return p, refused("case %s has no proposed package to review", caseID)
 	}
+	if len(r.Findings) > 0 || (r.High == 0 && r.Medium == 0 && r.Low == 0) {
+		h, m, l, err := countFindings(r.Findings)
+		if err != nil {
+			return p, err
+		}
+		if (r.High != 0 || r.Medium != 0 || r.Low != 0) && (h != r.High || m != r.Medium || l != r.Low) {
+			return p, refused("the review counts %d high, %d medium, %d low, and its findings %d, %d, %d: the counts are the findings'",
+				r.High, r.Medium, r.Low, h, m, l)
+		}
+		r.High, r.Medium, r.Low = h, m, l
+	}
 	r.Round, r.At, r.Head = len(p.Reviews)+1, s.now(), p.Head
 	p.Reviews = append(p.Reviews, r)
+	if (r.High > 0 || r.Medium > 0) && len(p.Reviews) < MaxRounds {
+		p.State = Revising
+	}
 	if err := s.save(&p); err != nil {
 		return p, err
 	}
@@ -580,19 +643,36 @@ func (s *Ship) Reviewed(ctx context.Context, caseID string, r Review) (Package, 
 		r.Low, r.Comment), s.Actor)
 }
 
-// Clean reports whether a package's last review found nothing high or medium on the commit it proposes now.
+func countFindings(fs []Finding) (h, m, l int, err error) {
+	for _, f := range fs {
+		switch strings.ToLower(f.Severity) {
+		case "high":
+			h++
+		case "medium":
+			m++
+		case "low":
+			l++
+		default:
+			return 0, 0, 0, refused("a finding of severity %q: high, medium or low", f.Severity)
+		}
+	}
+	return h, m, l, nil
+}
+
+// Clean reports whether a package's last review found nothing high or medium on the commit it proposes now, and
+// was posted on its pull request.
 func (p Package) Clean() bool {
 	if len(p.Reviews) == 0 {
 		return false
 	}
 	r := p.Reviews[len(p.Reviews)-1]
-	return r.High == 0 && r.Medium == 0 && r.Head == p.Head
+	return r.High == 0 && r.Medium == 0 && r.Head == p.Head && r.Comment != ""
 }
 
-// Land puts a proposed change in: only when the loop is live, its last review is clean, and the gate allows the
-// target again. A repository's branch is rebased on its default branch, checked again, and pushed to it as a
-// fast-forward by the user's own identity (prs.md); a configuration's files are replaced, its originals kept for
-// the rollback, and its test run in place, which undoes the change when it fails. The case is then deployed.
+// Land puts a proposed change in: only when the loop is live, its last review is clean on the work tree's head,
+// and the gate allows the repository again. Its branch is rebased on the default branch, checked again on its
+// tree, pushed to its pull request when the rebase moved it, and pushed to the default branch as a fast-forward by
+// the user's own identity (prs.md), so GitHub marks the pull request merged. The case is then deployed.
 func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	p, ok, err := s.Load(caseID)
 	switch {
@@ -603,7 +683,7 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	case !s.Live:
 		return p, refused("the loop is not live (loop.live): it proposes and does not land")
 	case !p.Clean():
-		return p, refused("case %s's last review is not clean on its head: no landing", caseID)
+		return p, refused("case %s's last review is not clean on its head, or was not posted: no landing", caseID)
 	case p.Check == nil:
 		return p, refused("case %s's package has no check", caseID)
 	}
@@ -611,91 +691,73 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	if err != nil {
 		return p, err
 	}
-	switch p.Kind {
-	case "repo":
-		if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
+	if err := s.ownTree(p); err != nil {
+		return p, err
+	}
+	if head, err := s.git(ctx, p.Work, "rev-parse", "HEAD"); err != nil || strings.TrimSpace(head) != p.Head {
+		return p, refused("the work tree's head is not the reviewed %s: no landing", p.Head)
+	}
+	if st, err := s.git(ctx, p.Work, "status", "--porcelain"); err != nil || strings.TrimSpace(st) != "" {
+		return p, refused("the work tree holds changes besides the reviewed commit: no landing")
+	}
+	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
+		return p, err
+	}
+	if _, err := s.git(ctx, p.Work, "fetch", "--quiet", "origin", p.Base); err != nil {
+		return p, err
+	}
+	if _, err := s.git(ctx, p.Work, "rebase", "origin/"+p.Base); err != nil {
+		s.git(context.Background(), p.Work, "rebase", "--abort")
+		return p, refused("the change does not rebase on %s: %v", p.Base, err)
+	}
+	head, err := s.git(ctx, p.Work, "rev-parse", "HEAD")
+	if err != nil {
+		return p, err
+	}
+	head = strings.TrimSpace(head)
+	tree, err := s.export(ctx, p, "land", head)
+	if err != nil {
+		return p, err
+	}
+	a, err := s.Sandbox.Run(ctx, tree, p.Check.Test, s.Env)
+	s.unexport(p, tree)
+	if err != nil {
+		return p, err
+	}
+	if a.Exit != 0 {
+		return p, refused("after the rebase the test fails (exit %d): no landing", a.Exit)
+	}
+	base, err := s.git(ctx, p.Work, "rev-parse", "origin/"+p.Base)
+	if err != nil {
+		return p, err
+	}
+	commits, err := s.git(ctx, p.Work, "rev-list", "--reverse", strings.TrimSpace(base)+"..HEAD")
+	if err != nil {
+		return p, err
+	}
+	if head != p.Head { // the pull request's head is what reaches the base, so GitHub marks it merged
+		if _, err := s.git(ctx, p.Work, "push", "--no-verify", "--force-with-lease", "origin", "HEAD:refs/heads/"+p.Branch); err != nil {
 			return p, err
-		}
-		if _, err := gitOutput(ctx, p.Work, "fetch", "--quiet", "origin", p.Base); err != nil {
-			return p, err
-		}
-		// the rebase writes its commits anew: as the user, never a repository's override of his identity
-		if _, err := gitOutput(ctx, p.Work, "-c", "user.name="+s.Identity[0], "-c", "user.email="+s.Identity[1], "-c", "commit.gpgsign=false",
-			"rebase", "origin/"+p.Base); err != nil {
-			gitOutput(context.Background(), p.Work, "rebase", "--abort")
-			return p, refused("the change does not rebase on %s: %v", p.Base, err)
-		}
-		a, err := s.Sandbox.Run(ctx, p.Work, p.Check.Test, s.Env)
-		if err != nil {
-			return p, err
-		}
-		if a.Exit != 0 {
-			return p, refused("after the rebase the test fails (exit %d): no landing", a.Exit)
-		}
-		base, err := gitOutput(ctx, p.Work, "rev-parse", "origin/"+p.Base)
-		if err != nil {
-			return p, err
-		}
-		commits, err := gitOutput(ctx, p.Work, "rev-list", "--reverse", strings.TrimSpace(base)+"..HEAD")
-		if err != nil {
-			return p, err
-		}
-		if _, err := gitOutput(ctx, p.Work, "push", "origin", "HEAD:refs/heads/"+p.Base); err != nil {
-			return p, refused("the push to %s did not go as a fast-forward: %v", p.Base, err)
-		}
-		gitOutput(ctx, p.Work, "push", "--quiet", "origin", "--delete", p.Branch)
-		p.Landed = strings.Fields(commits)
-	case "config":
-		if _, err := s.Gate.Config(p.Dir); err != nil {
-			return p, err
-		}
-		backup := filepath.Join(s.pkgDir(caseID), "backup")
-		os.RemoveAll(backup)
-		for _, rel := range p.Changed {
-			src := filepath.Join(p.Dir, rel)
-			if _, err := os.Stat(src); err == nil {
-				if err := copyFile(src, filepath.Join(backup, rel)); err != nil {
-					return p, err
-				}
-			}
-		}
-		for _, rel := range p.Changed {
-			if err := replaceFile(filepath.Join(p.Work, rel), filepath.Join(p.Dir, rel)); err != nil {
-				s.restore(p, backup)
-				return p, err
-			}
-		}
-		a, err := s.Sandbox.Run(ctx, p.Dir, p.Check.Test, s.Env)
-		if err != nil || a.Exit != 0 {
-			s.restore(p, backup)
-			return p, refused("the test failed in place (exit %d, %v): the change was undone", a.Exit, err)
 		}
 	}
+	if _, err := s.git(ctx, p.Work, "push", "--no-verify", "origin", "HEAD:refs/heads/"+p.Base); err != nil {
+		return p, refused("the push to %s did not go as a fast-forward: %v", p.Base, err)
+	}
+	s.git(ctx, p.Work, "push", "--no-verify", "--quiet", "origin", "--delete", p.Branch)
+	p.Landed, p.Head = strings.Fields(commits), head
 	p.State, p.LandedAt = Landed, s.now()
 	if err := s.save(&p); err != nil {
 		return p, err
 	}
-	what := fmt.Sprintf("%s: %s", firstOf(p.PR, p.Dir), p.Title)
+	what := fmt.Sprintf("%s: %s", p.PR, p.Title)
 	if _, err := s.Store.DeployCase(ctx, c.ID, s.pkgDir(caseID), p.LandedAt, what, s.Actor); err != nil {
 		return p, err
 	}
 	return p, nil
 }
 
-// restore puts a configuration's originals back from its backup, and removes the files the change added.
-func (s *Ship) restore(p Package, backup string) {
-	for _, rel := range p.Changed {
-		dst := filepath.Join(p.Dir, rel)
-		if _, err := os.Stat(filepath.Join(backup, rel)); err == nil {
-			replaceFile(filepath.Join(backup, rel), dst)
-		} else {
-			os.Remove(dst)
-		}
-	}
-}
-
-// RollBack undoes a landed change: a revert of its commits pushed to the default branch as a fast-forward, or the
-// configuration's originals put back; the case goes back to testing.
+// RollBack undoes a landed change: a revert of its commits, by the user's identity, pushed to the default branch
+// as a fast-forward; the case goes back to testing.
 func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error) {
 	p, ok, err := s.Load(caseID)
 	if err != nil {
@@ -704,33 +766,25 @@ func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error
 	if !ok || p.State != Landed {
 		return p, refused("case %s has no landed package to roll back", caseID)
 	}
-	switch p.Kind {
-	case "repo":
-		if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
-			return p, err
-		}
-		dir := filepath.Join(s.Dir, "work", ".revert-"+caseID)
-		os.RemoveAll(dir)
-		if _, err := gitOutput(ctx, p.Dir, "fetch", "--quiet", "origin", p.Base); err != nil {
-			return p, err
-		}
-		if _, err := gitOutput(ctx, p.Dir, "worktree", "add", "--detach", dir, "origin/"+p.Base); err != nil {
-			return p, err
-		}
-		defer func() {
-			gitOutput(context.Background(), p.Dir, "worktree", "remove", "--force", dir)
-		}()
-		shas := append([]string{}, p.Landed...)
-		slices.Reverse(shas)
-		args := append([]string{"-c", "user.name=" + s.Identity[0], "-c", "user.email=" + s.Identity[1], "revert", "--no-edit"}, shas...)
-		if _, err := gitOutput(ctx, dir, args...); err != nil {
-			return p, err
-		}
-		if _, err := gitOutput(ctx, dir, "push", "origin", "HEAD:refs/heads/"+p.Base); err != nil {
-			return p, err
-		}
-	case "config":
-		s.restore(p, filepath.Join(s.pkgDir(caseID), "backup"))
+	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
+		return p, err
+	}
+	dir := filepath.Join(s.Dir, "work", ".revert-"+caseID)
+	s.unexport(p, dir)
+	if _, err := s.git(ctx, p.Dir, "fetch", "--quiet", "origin", p.Base); err != nil {
+		return p, err
+	}
+	if _, err := s.git(ctx, p.Dir, "worktree", "add", "--detach", dir, "origin/"+p.Base); err != nil {
+		return p, err
+	}
+	defer s.unexport(p, dir)
+	shas := append([]string{}, p.Landed...)
+	slices.Reverse(shas)
+	if _, err := s.git(ctx, dir, append([]string{"revert", "--no-edit"}, shas...)...); err != nil {
+		return p, err
+	}
+	if _, err := s.git(ctx, dir, "push", "--no-verify", "origin", "HEAD:refs/heads/"+p.Base); err != nil {
+		return p, err
 	}
 	p.State = RolledBack
 	if err := s.save(&p); err != nil {
@@ -740,18 +794,36 @@ func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error
 	return p, err
 }
 
-// commit commits the work tree's change as the user: his global identity, set on the command, so a repository's
-// override never takes it.
+// commit commits the work tree's staged change as the user.
 func (s *Ship) commit(ctx context.Context, dir, msg string) error {
 	if s.Identity[0] == "" || s.Identity[1] == "" {
 		return refused("no git identity: set user.name and user.email in the global git configuration")
 	}
-	if _, err := gitOutput(ctx, dir, "add", "-A"); err != nil {
+	if _, err := s.git(ctx, dir, "add", "-A"); err != nil {
 		return err
 	}
-	_, err := gitOutput(ctx, dir, "-c", "user.name="+s.Identity[0], "-c", "user.email="+s.Identity[1], "-c", "commit.gpgsign=false",
-		"commit", "--quiet", "--author", s.Identity[0]+" <"+s.Identity[1]+">", "-m", msg)
+	_, err := s.git(ctx, dir, "commit", "--quiet", "--no-verify", "-m", msg)
 	return err
+}
+
+// git runs git as the ship tool does: no hooks (a tracked hooks directory is the change's own), no file-system
+// monitor, no external diff, and the user's identity for every commit it writes (a commit, a rebase, a revert),
+// whatever the repository's configuration or the environment say.
+func (s *Ship) git(ctx context.Context, dir string, args ...string) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	full := append([]string{"-C", dir, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "diff.external=",
+		"-c", "commit.gpgsign=false", "-c", "user.name=" + s.Identity[0], "-c", "user.email=" + s.Identity[1]}, args...)
+	cmd := exec.CommandContext(cctx, "git", full...)
+	cmd.Env = append(noGitEnv(), "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_AUTHOR_NAME="+s.Identity[0], "GIT_AUTHOR_EMAIL="+s.Identity[1],
+		"GIT_COMMITTER_NAME="+s.Identity[0], "GIT_COMMITTER_EMAIL="+s.Identity[1])
+	var errOut bytes.Buffer
+	cmd.Stderr = &errOut
+	out, err := cmd.Output()
+	if err != nil {
+		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(errOut.String()))
+	}
+	return string(out), nil
 }
 
 func (s *Ship) gh(ctx context.Context, dir string, args ...string) (string, error) {
@@ -784,92 +856,11 @@ func (s *Ship) packageText(c store.Case, p Package) string {
 	return b.String()
 }
 
-func (s *Ship) writeDiff(p Package) error {
-	paths, err := treeDiff(p.Dir, p.Work)
-	if err != nil {
+func writeFile(path string, b []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	var b strings.Builder
-	for _, rel := range paths {
-		fmt.Fprintf(&b, "=== %s\n", rel)
-		out, _ := exec.Command("diff", "-u", filepath.Join(p.Dir, rel), filepath.Join(p.Work, rel)).Output()
-		b.Write(out)
-	}
-	return os.WriteFile(filepath.Join(s.pkgDir(p.Case), "diff.patch"), []byte(b.String()), 0o600)
-}
-
-// treeDiff lists the files of b that differ from a's (new ones too), relative to b.
-func treeDiff(a, b string) ([]string, error) {
-	var out []string
-	err := filepath.WalkDir(b, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			if d.Name() == "node_modules" || d.Name() == ".git" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		rel, _ := filepath.Rel(b, p)
-		nb, err := os.ReadFile(p)
-		if err != nil {
-			return err
-		}
-		na, err := os.ReadFile(filepath.Join(a, rel))
-		if err != nil || string(na) != string(nb) {
-			out = append(out, rel)
-		}
-		return nil
-	})
-	return out, err
-}
-
-func copyTree(src, dst string) error {
-	return filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, _ := filepath.Rel(src, p)
-		target := filepath.Join(dst, rel)
-		switch {
-		case d.IsDir() && (d.Name() == "node_modules" || d.Name() == ".git") && rel != ".":
-			return filepath.SkipDir
-		case d.IsDir():
-			return os.MkdirAll(target, 0o700)
-		case d.Type()&fs.ModeSymlink != 0:
-			l, err := os.Readlink(p)
-			if err != nil {
-				return err
-			}
-			return os.Symlink(l, target)
-		}
-		return copyFile(p, target)
-	})
-}
-
-func copyFile(src, dst string) error {
-	b, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	st, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		return err
-	}
-	return os.WriteFile(dst, b, st.Mode().Perm())
-}
-
-// replaceFile puts src's content at dst in one rename, so a reader sees the old file or the new one.
-func replaceFile(src, dst string) error {
-	tmp := dst + ".momentum-new"
-	if err := copyFile(src, tmp); err != nil {
-		return err
-	}
-	return os.Rename(tmp, dst)
+	return os.WriteFile(path, b, 0o644)
 }
 
 func writeJSON(path string, v any) error {

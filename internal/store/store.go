@@ -879,6 +879,16 @@ func toolID(meta string) string {
 	return ""
 }
 
+// EventByID reads an event by its id; ok is false when the store holds none.
+func (s *Store) EventByID(ctx context.Context, id string) (Event, bool, error) {
+	evs, err := scanEvents(s.db.QueryContext(ctx, `SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
+	  tool, summary, meta, ref, heuristic, experiment FROM events WHERE id = ?`, id))
+	if err != nil || len(evs) == 0 {
+		return Event{}, false, err
+	}
+	return evs[0], true, nil
+}
+
 // EventByKey reads a source's event by its key; ok is false when the store holds none.
 func (s *Store) EventByKey(ctx context.Context, source, key string) (Event, bool, error) {
 	evs, err := scanEvents(s.db.QueryContext(ctx, `SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,

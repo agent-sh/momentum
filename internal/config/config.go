@@ -3,6 +3,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,16 +52,16 @@ type Sources struct {
 		ProgramPrefixes []string `json:"program_prefixes"`
 	} `json:"detect"`
 	// Loop configures the improvement loop (momentum loop, momentum ship). Nothing of it is compiled in but the
-	// budgets' defaults: without a runner the loop investigates nothing, without owners the ship tool writes to no
-	// repository, and without config_allow it changes no configuration in place.
+	// budgets' defaults: without a runner the loop investigates nothing, and without owners the ship tool writes to
+	// no repository. It changes no configuration in place: only repositories, through pull requests.
 	Loop Loop `json:"loop"`
 }
 
 // Loop is the loop's configuration. Runner is the command that starts the harness's main agent headless, with
 // its first arguments (Claude Code on this machine's provider). Model and FallbackModel are the agent's models.
 // Owners are the repository owners the ship tool may write to; every other repository is report-only, and
-// Exclude names repositories (OWNER/REPO) it never touches. ConfigAllow are configuration directories it may
-// change in place. Rules are the files of the machine's shared rules every run reads. RepoGuard is the
+// Exclude names repositories (OWNER/REPO) it never touches. Rules are the files of the machine's shared rules
+// every run reads. RepoGuard is the
 // read-only scope check every repository write runs first. MCP is an MCP configuration for the runs that build a
 // change (a web search for prior art). Live, false by default, lets the ship tool land what it proposed. The
 // budgets are in US dollars, the run's time in minutes; zero takes the default.
@@ -72,16 +73,20 @@ type Loop struct {
 	Families      []string `json:"families"`
 	Owners        []string `json:"owners"`
 	Exclude       []string `json:"exclude"`
-	ConfigAllow   []string `json:"config_allow"`
-	Rules         []string `json:"rules"`
-	RepoGuard     []string `json:"repo_guard"`
-	MCP           string   `json:"mcp"`
-	RunUSD        float64  `json:"run_usd"`
-	CaseUSD       float64  `json:"case_usd"`
-	DayUSD        float64  `json:"day_usd"`
-	WeekUSD       float64  `json:"week_usd"`
-	RunMinutes    int      `json:"run_minutes"`
-	MaxTurns      int      `json:"max_turns"`
+	// ReadDirs are the directories an investigation's file tools reach besides its own (a run reads the rest of
+	// the machine only through momentum's commands, which scrub secrets).
+	ReadDirs []string `json:"read_dirs"`
+	// SandboxRead are the directories under the home a check's test reads besides its toolchains'.
+	SandboxRead []string `json:"sandbox_read"`
+	Rules       []string `json:"rules"`
+	RepoGuard   []string `json:"repo_guard"`
+	MCP         string   `json:"mcp"`
+	RunUSD      float64  `json:"run_usd"`
+	CaseUSD     float64  `json:"case_usd"`
+	DayUSD      float64  `json:"day_usd"`
+	WeekUSD     float64  `json:"week_usd"`
+	RunMinutes  int      `json:"run_minutes"`
+	MaxTurns    int      `json:"max_turns"`
 	// Constraints are the owner's standing constraints every run reads, in his words.
 	Constraints []string `json:"constraints"`
 	// CapacityGate is a command that waits until the machine has room for a check's test and exits 0, or fails.
@@ -107,6 +112,20 @@ func Load() (Sources, error) {
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return s, fmt.Errorf("%s: %w", SourcesPath(), err)
 	}
+	// the loop's section holds its authority: a key it does not know (a typo of exclude) is an error, not a
+	// protection silently gone
+	var sections struct {
+		Loop json.RawMessage `json:"loop"`
+	}
+	json.Unmarshal(raw, &sections)
+	if len(sections.Loop) > 0 {
+		d := json.NewDecoder(bytes.NewReader(sections.Loop))
+		d.DisallowUnknownFields()
+		var l Loop
+		if err := d.Decode(&l); err != nil {
+			return s, fmt.Errorf("%s: loop: %w", SourcesPath(), err)
+		}
+	}
 	s.Mistakes.Path = paths.Expand(s.Mistakes.Path)
 	s.Radar.Path = paths.Expand(s.Radar.Path)
 	s.Incidents.Dir = paths.Expand(s.Incidents.Dir)
@@ -128,7 +147,7 @@ func Load() (Sources, error) {
 	if len(s.Loop.CapacityGate) > 0 {
 		s.Loop.CapacityGate[0] = paths.Expand(s.Loop.CapacityGate[0])
 	}
-	for _, l := range [][]string{s.Loop.ConfigAllow, s.Loop.Rules} {
+	for _, l := range [][]string{s.Loop.ReadDirs, s.Loop.SandboxRead, s.Loop.Rules} {
 		for i, p := range l {
 			l[i] = paths.Expand(p)
 		}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,21 @@ import (
 
 	"github.com/agent-sh/momentum/internal/store"
 )
+
+// testCache is the sandbox's build cache the package's tests share: one cache of their own, so each check does not
+// build the standard library again, and none of the user's.
+var testCache string
+
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "loop-test-cache-")
+	if err != nil {
+		panic(err)
+	}
+	testCache = dir
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}
 
 func testStore(t *testing.T) *store.Store {
 	t.Helper()
@@ -28,7 +44,12 @@ func run(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "GIT_DIR=") && !strings.HasPrefix(kv, "GIT_INDEX_FILE=") {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	cmd.Env = append(cmd.Env, "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("%v: %v: %s", args, err, out)
@@ -57,53 +78,70 @@ func script(t *testing.T, dir, name, body string) string {
 }
 
 // repoFixture is a repository with an origin of its own (a bare repository), a Go module whose Answer is wrong,
-// and the scripts the ship tool calls: a scope check that allows it, and a GitHub CLI that opens a pull request.
+// and the scripts the ship tool calls: a scope check that refuses, as the machine's does, while any work tree of
+// the repository holds uncommitted work, and a GitHub CLI that opens and edits a pull request (and fails once when
+// told to).
 type repoFixture struct {
 	origin, main, dir string
 	guard, gh         string
 }
 
-func newRepo(t *testing.T) repoFixture {
+const fakeGo = "package fake\n\n// Answer is the answer.\nfunc Answer() int { return 41 }\n\n// Note says zz-signal-text.\nfunc Note() string { return \"zz-signal-text\" }\n"
+
+func newRepo(t *testing.T, files map[string]string) repoFixture {
 	t.Helper()
 	dir := t.TempDir()
 	f := repoFixture{dir: dir, origin: filepath.Join(dir, "origin.git"), main: filepath.Join(dir, "main")}
 	run(t, dir, "git", "init", "-q", "--bare", "-b", "main", f.origin)
 	run(t, dir, "git", "clone", "-q", f.origin, f.main)
 	write(t, filepath.Join(f.main, "go.mod"), "module example.com/fake\n\ngo 1.21\n")
-	write(t, filepath.Join(f.main, "fake.go"), "package fake\n\n// Answer is the answer.\nfunc Answer() int { return 41 }\n\n// Note says zz-signal-text.\nfunc Note() string { return \"zz-signal-text\" }\n")
+	write(t, filepath.Join(f.main, "fake.go"), fakeGo)
+	for p, body := range files {
+		write(t, filepath.Join(f.main, p), body)
+	}
 	run(t, f.main, "git", "add", "-A")
 	run(t, f.main, "git", "commit", "-q", "-m", "init")
 	run(t, f.main, "git", "push", "-q", "origin", "HEAD:main")
 	run(t, f.main, "git", "remote", "set-head", "origin", "main")
+	script(t, filepath.Join(f.origin, "hooks"), "post-receive", `while read old new ref; do echo "$ref $new" >> "`+filepath.Join(dir, "pushes")+`"; done`)
 	f.guard = script(t, dir, "guard", `if [ -e "`+filepath.Join(dir, "report-only")+`" ]; then echo '{"allowed": false, "disposition": "report_only", "reasons": ["excluded"]}'; exit 1; fi
+for wt in $(git -C "`+f.main+`" worktree list --porcelain | sed -n 's/^worktree //p'); do
+  if [ -n "$(git -C "$wt" status --porcelain)" ]; then echo '{"allowed": false, "disposition": "report_only", "reasons": ["uncommitted or untracked work"]}'; exit 1; fi
+done
 echo '{"allowed": true, "disposition": "allowed_scope_only", "reasons": []}'`)
-	f.gh = script(t, dir, "gh", `echo "https://github.com/agent-sh/fake/pull/7"`)
+	f.gh = script(t, dir, "gh", `if [ -e "`+filepath.Join(dir, "gh-fails")+`" ]; then rm "`+filepath.Join(dir, "gh-fails")+`"; echo "gh: network down" >&2; exit 1; fi
+echo "$@" >> "`+filepath.Join(dir, "gh-calls")+`"
+if [ "$2" = "create" ]; then echo "https://github.com/agent-sh/fake/pull/7"; fi`)
 	return f
 }
 
-// shipFor is a ship tool over the fixture: live, its gate allowing agent-sh, its sandbox a bubblewrap one with a
-// Go build cache of the test's own.
+// shipFor is a ship tool over the fixture: live, its gate allowing agent-sh, its sandbox a bubblewrap one over the
+// user's home with the Go toolchain read-only and the tests' own build cache, and its posts kept as they are but
+// neutral (no scrubber in a test).
 func shipFor(t *testing.T, st *store.Store, f repoFixture) *Ship {
+	t.Helper()
+	sb := testSandbox(t)
+	return &Ship{Store: st, Dir: filepath.Join(f.dir, "loop"), Live: true, Actor: "loop:test", Identity: [2]string{"Owner Name", "owner@example.com"},
+		GH: f.gh, Sandbox: sb, Public: func(_ context.Context, s string) (string, error) { return Neutral(s), nil },
+		Gate: Gate{Owners: []string{"agent-sh"}, RepoGuard: []string{f.guard}, Home: sb.Home, Own: filepath.Join(f.dir, "loop"),
+			Resolve: func(context.Context, string) (string, error) { return "agent-sh/fake", nil },
+			Busy:    func(context.Context, string) (string, error) { return "", nil }}}
+}
+
+func testSandbox(t *testing.T) Sandbox {
 	t.Helper()
 	bwrap, err := exec.LookPath("bwrap")
 	if err != nil {
 		t.Skip("no bubblewrap here")
 	}
-	goBin, err := exec.LookPath("go")
+	out, err := exec.Command("go", "env", "GOROOT", "GOMODCACHE").Output()
 	if err != nil {
 		t.Skip("no go here")
 	}
-	cache := filepath.Join(f.dir, "gocache")
-	os.MkdirAll(cache, 0o700)
+	env := strings.Fields(string(out))
 	home, _ := os.UserHomeDir()
-	return &Ship{Store: st, Dir: filepath.Join(f.dir, "loop"), Live: true, Actor: "loop:test", Identity: [2]string{"Owner Name", "owner@example.com"},
-		GH:      f.gh,
-		Sandbox: Sandbox{Bwrap: bwrap, Writable: []string{cache}},
-		Env: []string{"HOME=" + home, "PATH=" + filepath.Dir(goBin) + ":/usr/bin:/bin", "GOCACHE=" + cache, "GOTOOLCHAIN=local", "GOTELEMETRY=off",
-			"GOFLAGS=-buildvcs=false"},
-		Gate: Gate{Owners: []string{"agent-sh"}, RepoGuard: []string{f.guard}, Home: home, Own: filepath.Join(f.dir, "loop"),
-			Resolve: func(context.Context, string) (string, error) { return "agent-sh/fake", nil },
-			Busy:    func(context.Context, string) (string, error) { return "", nil }}}
+	return Sandbox{Bwrap: bwrap, Home: home, ReadOnly: env, Cache: testCache, Scratch: filepath.Join(t.TempDir(), "tmp"),
+		Path: []string{filepath.Join(env[0], "bin")}}
 }
 
 // testingCase is a case in testing whose evidence the signal zz-signal-text counts: four failed results.
@@ -136,26 +174,31 @@ func testingCase(t *testing.T, st *store.Store) store.Case {
 
 var goodSignal = Signal{Source: store.Transcripts, Kinds: []string{"tool_result"}, Tool: "Bash", Match: []string{"zz-signal-text"}}
 
+const answerTest = "package fake\n\nimport \"testing\"\n\nfunc TestAnswer(t *testing.T) {\n\tif Answer() != 42 {\n\t\tt.Fatal(Answer())\n\t}\n}\n"
+
+func fixed(answer string) string { return strings.Replace(fakeGo, "return 41", "return "+answer, 1) }
+
 // A change goes in only through its package: prepared in a work tree of the loop's own, checked by a test that
-// fails without it and passes with it, proposed with a measurement of the case's own problem and a rollback,
-// committed by the user's own identity, reviewed clean, and landed live by a fast-forward of the default branch;
-// its rollback reverts it and takes the case back to testing.
+// fails without it and passes with it (each run on the tree the change commits), proposed with a measurement of
+// the case's own problem and a rollback, committed by the user's own identity whatever the environment says,
+// reviewed, revised on the same branch and pull request for what a review found, reviewed clean and posted, and
+// landed live by a fast-forward of the default branch; its rollback reverts it, takes the case back to testing,
+// and lets it be prepared again.
 func TestAChangeShipsOnlyThroughItsPackage(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	f := newRepo(t)
+	f := newRepo(t, nil)
 	s := shipFor(t, st, f)
 	c := testingCase(t, st)
-	p, err := s.Prepare(ctx, c.ID, f.main, "")
+	p, err := s.Prepare(ctx, c.ID, f.main)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Prepare(ctx, c.ID, f.main, ""); !errors.Is(err, ErrRefused) {
+	if _, err := s.Prepare(ctx, c.ID, f.main); !errors.Is(err, ErrRefused) {
 		t.Fatalf("a second package: %v", err)
 	}
 	test := "go test ./..."
-	// no test file yet
-	write(t, filepath.Join(p.Work, "fake.go"), "package fake\n\n// Answer is the answer.\nfunc Answer() int { return 42 }\n\n// Note says zz-signal-text.\nfunc Note() string { return \"zz-signal-text\" }\n")
+	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
 	if _, err := s.Check(ctx, c.ID, test, nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "no test file") {
 		t.Fatalf("a check without a test: %v", err)
 	}
@@ -165,15 +208,18 @@ func TestAChangeShipsOnlyThroughItsPackage(t *testing.T) {
 		t.Fatalf("a test that passes on the base: %v", err)
 	}
 	os.Remove(filepath.Join(p.Work, "note_test.go"))
-	write(t, filepath.Join(p.Work, "fake_test.go"), "package fake\n\nimport \"testing\"\n\nfunc TestAnswer(t *testing.T) {\n\tif Answer() != 42 {\n\t\tt.Fatal(Answer())\n\t}\n}\n")
+	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
 	if _, err := s.Check(ctx, c.ID, "go test ./... | tee x", nil); !errors.Is(err, ErrRefused) {
 		t.Fatalf("a shell in the test command: %v", err)
 	}
+	// a file the commit would not hold (ignored) is not what the check runs on
+	write(t, filepath.Join(p.Work, ".gitignore"), "go.work\n")
+	write(t, filepath.Join(p.Work, "go.work"), "this is no go.work file\n")
 	if p, err = s.Check(ctx, c.ID, test, nil); err != nil || p.State != Checked || p.Check.Before.Exit == 0 || p.Check.After.Exit != 0 {
 		t.Fatalf("check: %+v %v", p.Check, err)
 	}
-	pr := Proposal{Title: "Answer is 42", Body: "Answer was off by one.", Rollback: "revert the commit", Lesson: "Answers are 42.", Signal: goodSignal,
-		Window: 7 * 24 * time.Hour}
+	pr := Proposal{Title: "Answer is 42", Body: "Answer was off by one; see agent-sh/fake#3, ask @owner.", Rollback: "revert the commit",
+		Lesson: "Answers are 42.", Signal: goodSignal, Window: 7 * 24 * time.Hour}
 	bad := pr
 	bad.Signal = Signal{Source: store.Transcripts, Kinds: []string{"tool_result"}, Match: []string{"something else entirely"}}
 	if _, err := s.Propose(ctx, c.ID, bad); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "fewer than") {
@@ -186,45 +232,104 @@ func TestAChangeShipsOnlyThroughItsPackage(t *testing.T) {
 	}
 	os.Remove(filepath.Join(p.Work, "extra.go"))
 	// a change that rewrites the words its signal counts
-	write(t, filepath.Join(p.Work, "fake.go"), "package fake\n\n// Answer is the answer.\nfunc Answer() int { return 42 }\n\n// Note says nothing.\nfunc Note() string { return \"quiet\" }\n")
+	write(t, filepath.Join(p.Work, "fake.go"), strings.Replace(fixed("42"), "\"zz-signal-text\"", "\"quiet\"", 1))
 	if _, err := s.Check(ctx, c.ID, test, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Propose(ctx, c.ID, pr); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "edits") {
 		t.Fatalf("a change that edits its signal's text: %v", err)
 	}
-	write(t, filepath.Join(p.Work, "fake.go"), "package fake\n\n// Answer is the answer.\nfunc Answer() int { return 42 }\n\n// Note says zz-signal-text.\nfunc Note() string { return \"zz-signal-text\" }\n")
+	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
 	if _, err := s.Check(ctx, c.ID, test, nil); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("GIT_COMMITTER_NAME", "Someone Else")
+	t.Setenv("EMAIL", "someone@example.com")
+	t.Setenv("GIT_DIR", filepath.Join(t.TempDir(), "elsewhere")) // git's own variables do not point the ship tool elsewhere
 	if p, err = s.Propose(ctx, c.ID, pr); err != nil || p.State != Proposed || p.PR != "https://github.com/agent-sh/fake/pull/7" || p.Plan.Before != 4 {
 		t.Fatalf("propose: %+v %v", p, err)
 	}
 	if who := run(t, p.Work, "git", "log", "-1", "--format=%an <%ae> / %cn <%ce>"); strings.TrimSpace(who) != "Owner Name <owner@example.com> / Owner Name <owner@example.com>" {
 		t.Fatalf("committed as %q", who)
 	}
+	if msg := run(t, p.Work, "git", "log", "-1", "--format=%B"); strings.Contains(msg, "#3") || strings.Contains(msg, "@owner") {
+		t.Fatalf("the commit's mentions and references are live: %q", msg)
+	}
 	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "review") {
 		t.Fatalf("landed unreviewed: %v", err)
 	}
-	if _, err := s.Reviewed(ctx, c.ID, Review{High: 0, Medium: 1, Low: 2, Text: "M1"}); err != nil {
-		t.Fatal(err)
+	if _, err := s.Reviewed(ctx, c.ID, Review{High: 1, Findings: []Finding{{Severity: "low", Where: "x", Problem: "y", Fix: "z"}}}); !errors.Is(err, ErrRefused) ||
+		!strings.Contains(err.Error(), "the counts are the findings'") {
+		t.Fatalf("counts that are not the findings': %v", err)
+	}
+	// a review that finds a medium sends it back to its build, on the same branch and pull request
+	if p, err = s.Reviewed(ctx, c.ID, Review{Findings: []Finding{{Severity: "medium", Where: "fake.go", Problem: "no comment", Fix: "add one"}},
+		Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || p.State != Revising || p.Reviews[0].Medium != 1 {
+		t.Fatalf("reviewed: %+v %v", p, err)
 	}
 	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) {
 		t.Fatalf("landed on a medium: %v", err)
 	}
-	if _, err := s.Reviewed(ctx, c.ID, Review{Low: 1, Text: "fine"}); err != nil {
+	if _, err := s.Reviewed(ctx, c.ID, Review{Medium: 0, High: 1, Findings: []Finding{{Severity: "low"}}}); !errors.Is(err, ErrRefused) {
+		t.Fatalf("a review of a package back at its build: %v", err)
+	}
+	first := p.Head
+	if _, err := s.Check(ctx, c.ID, test, nil); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.Propose(ctx, c.ID, pr); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "changes nothing") {
+		t.Fatalf("a revision that changes nothing: %v", err)
+	}
+	write(t, filepath.Join(p.Work, "fake.go"), strings.Replace(fixed("42"), "// Answer is the answer.", "// Answer is the answer, 42.", 1))
+	if p, err = s.Check(ctx, c.ID, test, nil); err != nil || p.State != Checked {
+		t.Fatalf("the revision's check: %+v %v", p, err)
+	}
+	if p, err = s.Propose(ctx, c.ID, pr); err != nil || p.State != Proposed || p.Head == first || p.PR != "https://github.com/agent-sh/fake/pull/7" {
+		t.Fatalf("the revision: %+v %v", p, err)
+	}
+	if calls, _ := os.ReadFile(filepath.Join(f.dir, "gh-calls")); !strings.Contains(string(calls), "pr edit https://github.com/agent-sh/fake/pull/7") {
+		t.Fatalf("the revision did not update its pull request: %s", calls)
+	}
+	// a clean review that was not posted lands nothing
+	if p, err = s.Reviewed(ctx, c.ID, Review{Findings: []Finding{{Severity: "low", Where: "x", Problem: "y", Fix: "z"}}}); err != nil || p.Clean() {
+		t.Fatalf("an unposted review: %+v %v", p, err)
+	}
+	p.Reviews[len(p.Reviews)-1].Comment = "https://github.com/agent-sh/fake/pull/7#c2"
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	// a commit after the review is no reviewed commit
+	write(t, filepath.Join(p.Work, "late.go"), "package fake\n")
+	run(t, p.Work, "git", "add", "-A")
+	run(t, p.Work, "git", "commit", "-q", "-m", "late")
+	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "not the reviewed") {
+		t.Fatalf("landed a commit after its review: %v", err)
+	}
+	run(t, p.Work, "git", "reset", "-q", "--hard", p.Head)
 	s.Live = false
 	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "not live") {
 		t.Fatalf("landed while not live: %v", err)
 	}
 	s.Live = true
-	if p, err = s.Land(ctx, c.ID); err != nil || p.State != Landed || len(p.Landed) != 1 {
+	// the default branch moved since: the landing rebases, checks again and pushes the pull request's head first
+	other := filepath.Join(f.dir, "other")
+	run(t, f.dir, "git", "clone", "-q", f.origin, other)
+	write(t, filepath.Join(other, "README"), "a readme\n")
+	run(t, other, "git", "add", "-A")
+	run(t, other, "git", "commit", "-q", "-m", "readme")
+	run(t, other, "git", "push", "-q", "origin", "HEAD:main")
+	if p, err = s.Land(ctx, c.ID); err != nil || p.State != Landed || len(p.Landed) != 2 {
 		t.Fatalf("land: %+v %v", p, err)
 	}
-	if head := strings.TrimSpace(run(t, f.dir, "git", "--git-dir", f.origin, "rev-parse", "main")); head != p.Landed[0] {
-		t.Fatalf("origin's main is %s, not the landed %s", head, p.Landed[0])
+	if head := strings.TrimSpace(run(t, f.dir, "git", "--git-dir", f.origin, "rev-parse", "main")); head != p.Landed[1] || head != p.Head {
+		t.Fatalf("origin's main is %s, not the landed %v", head, p.Landed)
+	}
+	pushes, _ := os.ReadFile(filepath.Join(f.dir, "pushes"))
+	if i, j := strings.Index(string(pushes), "refs/heads/"+p.Branch+" "+p.Head), strings.Index(string(pushes), "refs/heads/main "+p.Head); i < 0 || j < i {
+		t.Fatalf("the pull request's head did not reach its branch before the base:\n%s", pushes)
+	}
+	if who := run(t, f.dir, "git", "--git-dir", f.origin, "log", "-1", "--format=%cn <%ce>", "main"); strings.TrimSpace(who) != "Owner Name <owner@example.com>" {
+		t.Fatalf("rebased as %q", who)
 	}
 	if got, _ := st.CaseByID(ctx, c.ID); got.Status != store.CaseDeployed || got.Deployed.IsZero() {
 		t.Fatalf("the case after landing: %+v", got)
@@ -235,19 +340,154 @@ func TestAChangeShipsOnlyThroughItsPackage(t *testing.T) {
 	if body := run(t, f.dir, "git", "--git-dir", f.origin, "show", "main:fake.go"); !strings.Contains(body, "return 41") {
 		t.Fatalf("the rollback left %s", body)
 	}
+	if who := run(t, f.dir, "git", "--git-dir", f.origin, "log", "-1", "--format=%an / %cn", "main"); strings.TrimSpace(who) != "Owner Name / Owner Name" {
+		t.Fatalf("reverted as %q", who)
+	}
 	if got, _ := st.CaseByID(ctx, c.ID); got.Status != store.CaseTesting {
 		t.Fatalf("the case after the rollback: %s", got.Status)
+	}
+	if p, err = s.Prepare(ctx, c.ID, f.main); err != nil || p.State != Prepared {
+		t.Fatalf("prepared again after its rollback: %+v %v", p, err)
+	}
+}
+
+// The scope check sees every work tree of the repository: a proposal commits first, so the loop's own tree is
+// clean when it looks. A proposal whose pull request could not be opened is taken up again where it stopped,
+// without a second commit.
+func TestAProposalCommitsBeforeTheScopeCheckAndResumes(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	f := newRepo(t, nil)
+	s := shipFor(t, st, f)
+	c := testingCase(t, st)
+	p, err := s.Prepare(ctx, c.ID, f.main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
+	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
+	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+		t.Fatal(err)
+	}
+	pr := Proposal{Title: "Answer is 42", Body: "Off by one.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}
+	write(t, filepath.Join(f.dir, "gh-fails"), "")
+	if p, err = s.Propose(ctx, c.ID, pr); err == nil || p.State != Checked || p.Head == "" {
+		t.Fatalf("a proposal whose pull request failed: %+v %v", p, err)
+	}
+	head := p.Head
+	if p, err = s.Propose(ctx, c.ID, pr); err != nil || p.State != Proposed || p.Head != head {
+		t.Fatalf("taken up again: %+v %v", p, err)
+	}
+	if n := strings.Count(run(t, p.Work, "git", "log", "--format=%s", "origin/main..HEAD"), "\n"); n != 1 {
+		t.Fatalf("%d commits on the branch", n)
+	}
+	// a dirty work tree of another (the owner's checkout) is report only
+	write(t, filepath.Join(f.main, "wip.txt"), "his work\n")
+	if _, err := s.Gate.Repository(ctx, f.main); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "uncommitted") {
+		t.Fatalf("a dirty checkout of his: %v", err)
+	}
+}
+
+// The ship tool's git runs none of the repository's hooks (a tracked hooks directory is the change's own), and a
+// work tree whose link to its repository was changed is refused.
+func TestTheChangesOwnGitFilesDoNotRun(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	marker := filepath.Join(t.TempDir(), "hook-ran")
+	hook := "#!/bin/sh\ntouch " + marker + "\n"
+	f := newRepo(t, map[string]string{".githooks/post-commit": hook, ".githooks/post-checkout": hook})
+	os.Chmod(filepath.Join(f.main, ".githooks", "post-commit"), 0o755)
+	os.Chmod(filepath.Join(f.main, ".githooks", "post-checkout"), 0o755)
+	run(t, f.main, "git", "commit", "-q", "-am", "hooks run")
+	run(t, f.main, "git", "push", "-q", "origin", "HEAD:main")
+	run(t, f.main, "git", "config", "core.hooksPath", ".githooks")
+	s := shipFor(t, st, f)
+	c := testingCase(t, st)
+	p, err := s.Prepare(ctx, c.ID, f.main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
+	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
+	write(t, filepath.Join(p.Work, ".githooks", "post-commit"), "#!/bin/sh\ntouch "+marker+" # the change's own\n")
+	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Propose(ctx, c.ID, Proposal{Title: "t", Body: "b", Rollback: "r", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("a hook of the repository ran")
+	}
+	c2 := testingCase2(t, st)
+	p2, err := s.Prepare(ctx, c2.ID, f.main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(p2.Work, ".git"), "gitdir: "+filepath.Join(t.TempDir(), "evil")+"\n")
+	if _, err := s.Check(ctx, c2.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), ".git") {
+		t.Fatalf("a work tree linked elsewhere: %v", err)
+	}
+}
+
+func testingCase2(t *testing.T, st *store.Store) store.Case {
+	t.Helper()
+	ctx := context.Background()
+	c, _, err := st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: "failures/v1:zz2", Title: "another",
+		Evidence: []store.Evidence{{Ref: "file:/t/zz2", At: time.Now().Add(-time.Hour)}}}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mech, next := "m", "n"
+	c, err = st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mech, NextTest: &next}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// In momentum's own repository a change may not touch what the loop's judgment or authority rests on: not by an
+// edit, not by moving the file away, not by a new file whose name git would quote.
+func TestAChangeToTheLoopsOwnCodeIsRefusedHoweverItIsMade(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	f := newRepo(t, map[string]string{"internal/loop/gate.go": "package loop\n", "internal/supervise/rules.go": "package supervise\n", "docs/x.txt": "notes\n"})
+	s := shipFor(t, st, f)
+	s.Gate.Resolve = func(context.Context, string) (string, error) { return SelfRepo, nil }
+	c := testingCase(t, st)
+	p, err := s.Prepare(ctx, c.ID, f.main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
+	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
+	run(t, p.Work, "git", "mv", "internal/loop/gate.go", "gate.go.txt")
+	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/loop/gate.go") {
+		t.Fatalf("a protected file moved away: %v", err)
+	}
+	run(t, p.Work, "git", "mv", "gate.go.txt", "internal/loop/gate.go")
+	run(t, p.Work, "git", "mv", "docs/x.txt", "internal/loop/x.go")
+	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/loop/x.go") {
+		t.Fatalf("a file moved into a protected path: %v", err)
+	}
+	run(t, p.Work, "git", "mv", "internal/loop/x.go", "docs/x.txt")
+	write(t, filepath.Join(p.Work, "internal", "loop", "é.go"), "package loop\n")
+	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/loop/é.go") {
+		t.Fatalf("a new protected file with a quoted name: %v", err)
+	}
+	os.Remove(filepath.Join(p.Work, "internal", "loop", "é.go"))
+	write(t, filepath.Join(p.Work, "internal", "supervise", "rules.go"), "package supervise\n\n// a rule\n")
+	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+		t.Fatalf("supervision's rules are the system it improves: %v", err)
 	}
 }
 
 // The gate is the loop's authority: a repository of an owner it may write to, not excluded, that the machine's
-// scope check allows and nobody works in; a configuration directory it was given and none its own judgment rests
-// on; never the loop's own detectors, measurement, gates or skills.
+// scope check allows and nobody works in; never what momentum's judgment rests on in its own repository.
 func TestTheGateKeepsTheLoopsAuthority(t *testing.T) {
 	ctx := context.Background()
-	f := newRepo(t)
-	home := t.TempDir()
-	g := Gate{Owners: []string{"agent-sh"}, RepoGuard: []string{f.guard}, Home: home,
+	f := newRepo(t, nil)
+	g := Gate{Owners: []string{"agent-sh"}, RepoGuard: []string{f.guard},
 		Resolve: func(context.Context, string) (string, error) { return "agent-sh/fake", nil },
 		Busy:    func(context.Context, string) (string, error) { return "", nil }}
 	if _, err := g.Repository(ctx, f.main); err != nil {
@@ -274,29 +514,22 @@ func TestTheGateKeepsTheLoopsAuthority(t *testing.T) {
 	if _, err := g.Repository(ctx, f.main); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "report_only") {
 		t.Errorf("the scope check's report only: %v", err)
 	}
-	mods := filepath.Join(home, ".claude", "mods")
-	os.MkdirAll(filepath.Join(mods, "guard"), 0o700)
-	os.MkdirAll(filepath.Join(mods, "mistakes"), 0o700)
-	os.MkdirAll(filepath.Join(home, ".config", "momentum"), 0o700)
-	g.ConfigAllow = []string{mods, filepath.Join(home, ".config")}
-	if _, err := g.Config(filepath.Join(mods, "guard")); err != nil {
-		t.Errorf("an allowed directory: %v", err)
-	}
-	for _, d := range []string{filepath.Join(mods, "mistakes"), filepath.Join(home, ".config", "momentum"), filepath.Join(home, "elsewhere")} {
-		if _, err := g.Config(d); !errors.Is(err, ErrRefused) {
-			t.Errorf("%s: %v", d, err)
-		}
-	}
-	for _, p := range []string{"internal/detect/failures.go", "internal/loop/gate.go", "internal/store/cases.go", "cmd/momentum/ship.go"} {
+	for _, p := range []string{"internal/detect/failures.go", "internal/loop/gate.go", "internal/measure/x.go", "internal/store/events.go",
+		"internal/source/transcripts.go", "internal/plain/plain.go", "internal/config/config.go", "internal/paths/paths.go",
+		"cmd/momentum/git.go", "cmd/momentum/replay.go", "go.mod", "go.sum", ".github/workflows/ci.yml", "SPEC.md", "AGENTS.md"} {
 		if err := CheckPaths(Target{Repo: SelfRepo}, []string{"README.md", p}); !errors.Is(err, ErrRefused) {
 			t.Errorf("momentum's own %s: %v", p, err)
 		}
 	}
-	if err := CheckPaths(Target{Repo: SelfRepo}, []string{"internal/supervise/rules.go"}); err != nil {
-		t.Errorf("supervision's rules are no evaluator: %v", err)
+	if err := CheckPaths(Target{Repo: SelfRepo}, []string{"internal/supervise/rules.go", "internal/capacity/rules.go", "README.md"}); err != nil {
+		t.Errorf("supervision's and capacity's rules are no evaluator: %v", err)
 	}
 	if err := CheckPaths(Target{Repo: "agent-sh/fake"}, []string{"internal/loop/x.go"}); err != nil {
 		t.Errorf("another repository's paths: %v", err)
+	}
+	Protected()[0] = "x"
+	if err := CheckPaths(Target{Repo: SelfRepo}, []string{"internal/detect/x.go"}); !errors.Is(err, ErrRefused) {
+		t.Errorf("a change to the list one call returned changed the next: %v", err)
 	}
 }
 
@@ -309,5 +542,132 @@ func TestATestCommandRunsWithoutAShell(t *testing.T) {
 		if _, err := Words(bad); !errors.Is(err, ErrRefused) {
 			t.Errorf("%q: %v", bad, err)
 		}
+	}
+}
+
+// A check's test runs where it can change only its tree: it writes nothing outside it, reaches no network and no
+// socket of the user's (his session's bus, an agent, a daemon), sees none of his home's files but the toolchains,
+// and has nothing of his session in its environment.
+func TestTheSandboxKeepsATestInItsTree(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("no python3 here")
+	}
+	sb := testSandbox(t)
+	cache, _ := os.UserCacheDir()
+	home, err := os.MkdirTemp(cache, "momentum-sandbox-test-") // a home of the test's own, outside /tmp, with a file of his in it
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(home)
+	sb.Home = home
+	tree := t.TempDir()
+	write(t, filepath.Join(tree, ".git"), "gitdir: /x\n")
+	outside := t.TempDir()
+	sock := filepath.Join(outside, "s.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	tcp, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcp.Close()
+	secret := filepath.Join(sb.Home, ".config", "x", "token")
+	write(t, secret, "a secret")
+	probe := fmt.Sprintf(`
+import os, socket, sys
+bad = []
+try:
+    s = socket.socket(socket.AF_UNIX); s.connect(%q); bad.append("unix socket")
+except OSError: pass
+try:
+    s = socket.create_connection(("127.0.0.1", %d), timeout=2); bad.append("network")
+except OSError: pass
+try:
+    open(%q, "w").write("x"); bad.append("wrote outside")
+except OSError: pass
+if os.path.exists(%q): bad.append("read the home")
+if os.listdir("/run"): bad.append("/run holds " + " ".join(os.listdir("/run")[:5]))
+try:
+    open(".git", "w").write("gitdir: /elsewhere"); bad.append("wrote its .git link")
+except OSError: pass
+for k in ("DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK"):
+    if k in os.environ: bad.append(k)
+open("inside.txt", "w").write("ok")
+print(" ".join(bad)); sys.exit(1 if bad else 0)
+`, sock, tcp.Addr().(*net.TCPAddr).Port, filepath.Join(outside, "x"), secret)
+	t.Setenv("SSH_AUTH_SOCK", sock)
+	o, err := sb.Run(context.Background(), tree, []string{"python3", "-c", probe}, nil)
+	if err != nil || o.Exit != 0 {
+		t.Fatalf("exit %d %v: %s", o.Exit, err, o.Tail)
+	}
+	if b, _ := os.ReadFile(filepath.Join(tree, "inside.txt")); string(b) != "ok" {
+		t.Fatal("the test could not write its own tree")
+	}
+}
+
+// A change may not remove a line holding its signal's text, whatever the line starts with.
+func TestAChangeMayNotRewriteItsSignalsText(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	f := newRepo(t, map[string]string{"notes.md": "-- zz-signal-text is what fails\n"})
+	s := shipFor(t, st, f)
+	c := testingCase(t, st)
+	p, err := s.Prepare(ctx, c.ID, f.main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(p.Work, "notes.md"), "quiet now\n")
+	if _, _, err := s.staged(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.editsSignal(ctx, p, goodSignal); !errors.Is(err, ErrRefused) {
+		t.Fatalf("a removed line that opens with dashes: %v", err)
+	}
+}
+
+// What the loop posts is scrubbed of secrets and its mentions and references are made inert; with no scrubber
+// nothing is posted.
+func TestWhatTheLoopPostsIsScrubbedAndInert(t *testing.T) {
+	dir := t.TempDir()
+	was := Scrubber
+	defer func() { Scrubber = was }()
+	Scrubber = []string{script(t, dir, "scrub", "sed 's/hunter2/*******/g'")}
+	got, err := Public(context.Background(), "the password hunter2; ping @owner and agent-sh/x#12, see #3, mail a@b.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, "hunter2") || strings.Contains(got, "@owner") || strings.Contains(got, "x#12") || strings.Contains(got, " #3") ||
+		!strings.Contains(got, "a@b.example") {
+		t.Fatalf("%q", got)
+	}
+	Scrubber = []string{filepath.Join(dir, "none")}
+	if _, err := Public(context.Background(), "text"); !errors.Is(err, ErrNoScrubber) {
+		t.Fatalf("no scrubber: %v", err)
+	}
+}
+
+// A measurement counts the case's own problem: a case that holds no event of the store has nothing of it to count.
+func TestAProposalNeedsTheCasesOwnEvents(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	f := newRepo(t, nil)
+	s := shipFor(t, st, f)
+	testingCase(t, st) // the store's events the signal counts, of another case
+	c := testingCase2(t, st)
+	p, err := s.Prepare(ctx, c.ID, f.main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
+	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
+	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Propose(ctx, c.ID, Proposal{Title: "t", Body: "b", Rollback: "r", Signal: goodSignal, Window: 7 * 24 * time.Hour}); !errors.Is(err, ErrRefused) ||
+		!strings.Contains(err.Error(), "holds no event") {
+		t.Fatalf("a case with no event of its own: %v", err)
 	}
 }
