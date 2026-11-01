@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -23,7 +24,8 @@ import (
 )
 
 // The uv and docker rules prune with each tool's own command: the tool knows its cache. The uv rule deletes entries of
-// uv's cache itself only around processes that run from it, which uv's prune cannot keep (uvaround.go).
+// uv's cache itself only around what uv's prune cannot keep: processes that run from it, places scheduled jobs name in
+// it, and overlays a command may run in unseen (uvaround.go).
 
 // Tools runs uv and docker.
 type Tools interface {
@@ -151,7 +153,7 @@ func stopTree(pid int) error {
 // uv's own lock when nobody holds it, or, when every holder is a uv process past its sync that runs outside the
 // cache, with --force under a lock of its own put in the lock file's place (lockInPlace). When processes run from
 // the cache (a path in it, an environment in it or linked into it), a scheduled job names a place in one of its
-// environments, or builds-v0 holds an overlay a command whose uv was killed may run in, it prunes around them instead
+// environments, or builds-v0 holds an overlay a command may run in unseen (uvBuildsOf), it prunes around them instead
 // (uvReachOf, uvRemove), under uv's lock or its own in the lock file's place, the old file put back after (restore).
 func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error) {
 	out, err := r.tools.UV(ctx, 30*time.Second, "cache", "dir")
@@ -194,9 +196,10 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 		f.Action, f.class, f.Why = ActReport, "busy", "it waits: "+why
 		return []Finding{f}, notes, nil
 	}
-	// an old lock file a killed run set aside goes back at every scan, a prune due or not: until it does, uv's own
-	// clean or prune does not wait for the processes that hold it
-	if why := uvPutBack(r.opt.ProcRoot, c, r.m, live); why != "" {
+	// an old lock file a killed run set aside goes back at every scan of the rule live, a prune due or not, and one
+	// that may not prune (the jobs could not all be read): until it does, uv's own clean or prune does not wait for
+	// the processes that hold it. Putting it back deletes nothing.
+	if why := uvPutBack(r.opt.ProcRoot, c, r.m, !r.opt.DryRun && r.cfg.IsLive(RuleUV)); why != "" {
 		return report(why)
 	}
 	switch {
@@ -241,28 +244,28 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 	}
 	// processes that run from the cache: uv's prune would delete what they use, so the rule prunes around it, when the
 	// look can tell what that is. So it does around what a scheduled job names in the cache, as every rule keeps what a
-	// job names, and around an overlay in builds-v0: a command whose uv was killed may run in it, and once that command
-	// set its title over its environment nothing names it.
+	// job names, and around an overlay of builds-v0 a command may run in that names nothing (uvBuildsOf).
 	found := uvUsers(now, r.opt.ProcRoot, c, lk.locks.holders, envs)
 	if r.named != nil {
 		jobs := map[string]bool{}
 		for _, p := range sortedKeys(r.named.Paths) {
-			if q, ok := uvJobPlace(c, p); ok {
+			if q, ok := uvJobPlace(c, resolveLinks, p); ok {
 				found.places = append(found.places, uvPlace{path: q, who: "the job " + r.named.Paths[p]})
 				jobs[r.named.Paths[p]] = true
 			}
 		}
 		found.jobs = len(jobs)
 	}
+	builds := uvBuildsOf(c, now, r.opt.ProcRoot)
 	var around *uvReach
-	if found.names != "" || found.jobs > 0 || uvHeld(c) {
+	if found.names != "" || found.jobs > 0 || len(builds.live) > 0 || builds.blind {
 		switch {
 		case found.blind != "":
 			return report("the look cannot tell what these use of the cache, and a prune may delete it (" + found.blind + ")")
 		case len(envs.slow) > 0:
 			return report(using(found.names))
 		}
-		if around = uvReachOf(c, found); around.why != "" {
+		if around = uvReachOf(c, found, builds); around.why != "" {
 			return report(around.why)
 		}
 	}
@@ -348,7 +351,7 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 		var held *os.File
 		swap := uvSwap{lk: lk, look: now, procRoot: r.opt.ProcRoot, c: c, hidden: envs.hidden, after: r.opt.afterUVLock,
 			stat: statLock}
-		release := func() {}
+		var hold *stopHold
 		if forced {
 			// it looks before the rename, so what it finds keeps the lock file in place, every holder on it. Around
 			// running environments the old file is set aside to be put back (restore): its holders may run from the
@@ -356,7 +359,7 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 			// outside the cache.
 			var before verdict
 			var why string
-			held, release, why = swap.lockInPlace(func() bool {
+			held, hold, why = swap.lockInPlace(func() bool {
 				before = lookAgain()
 				return before.keep == "" && before.users == "" && before.why == ""
 			}, around != nil)
@@ -401,9 +404,9 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 		// let capacity's lock go: the old lock file back in its place, when it took the lock file's place
 		letGo := func() {
 			if forced && around != nil {
-				restored = swap.restore(held, release)
+				restored = swap.restore(held, hold)
 			} else {
-				release()
+				hold.end()
 			}
 			held.Close() // a uv process that waited for it goes on
 		}
@@ -425,7 +428,7 @@ func (r *runner) uv(ctx context.Context, live bool) ([]Finding, []string, error)
 				}
 				return ""
 			}
-			removal = uvRemove(c, around, lockedAt.Add(uvAroundFor), stay)
+			removal = uvRemove(c, around, lockedAt.Add(uvAroundFor), hold.came, stay)
 		}
 		letGo()
 		if around != nil {
@@ -970,7 +973,7 @@ func uvUsers(s *Sample, procRoot string, c uvCache, holders map[int]bool, envs *
 			case q != pid && layers && noPath(procRoot, q):
 				// its imports come from the cache's layer with no file of it open or mapped, and its environment, which
 				// would name the layer, is gone (setproctitle wrote over it). The overlay it runs in names the layer,
-				// so a prune around it keeps every overlay and what each names.
+				// and a prune around it keeps that overlay and what it names (uvBuildsOf).
 				all.add(q, "a command whose environment holds no PATH runs under a uv run that layers one of the cache's environments")
 			default:
 				if ns := mountNS(procRoot, q); own != "" && ns != "" && ns != own && !envs.sameView(procRoot, q, ns, c) {
@@ -1189,12 +1192,13 @@ type lockID struct {
 }
 
 // fileLocks are the locks on a file, by /proc/locks: the processes that hold one, those of them that hold it alone,
-// how many wait for it, and those of them that wait to hold it alone. known is false when /proc/locks cannot be read.
+// how many wait for it and which (waiting), and those of them that wait to hold it alone. known is false when
+// /proc/locks cannot be read.
 type fileLocks struct {
-	holders, writers map[int]bool
-	waiters          int
-	alone            []int
-	known            bool
+	holders, writers, waiting map[int]bool
+	waiters                   int
+	alone                     []int
+	known                     bool
 }
 
 // blocks says why the locks on uv's lock file keep capacity from putting its own in place, or "": a process that
@@ -1334,7 +1338,7 @@ func idOf(st os.FileInfo) lockID {
 // lockHolders are the locks on a file, by /proc/locks ("1: FLOCK ADVISORY READ 4242 fc:00:1234 0 EOF"; a waiter's
 // line has "->" after its number), under any of its names.
 func lockHolders(procRoot string, keys []lockID) fileLocks {
-	out := fileLocks{holders: map[int]bool{}, writers: map[int]bool{}}
+	out := fileLocks{holders: map[int]bool{}, writers: map[int]bool{}, waiting: map[int]bool{}}
 	b, err := os.ReadFile(filepath.Join(procRoot, "locks"))
 	if err != nil {
 		return out
@@ -1361,8 +1365,11 @@ func lockHolders(procRoot string, keys []lockID) fileLocks {
 		}
 		if waiter {
 			out.waiters++ // a process waiting for the lock holds nothing yet
-			if pid, err := strconv.Atoi(f[4]); err == nil && f[3] == "WRITE" {
-				out.alone = append(out.alone, pid)
+			if pid, err := strconv.Atoi(f[4]); err == nil {
+				out.waiting[pid] = true
+				if f[3] == "WRITE" {
+					out.alone = append(out.alone, pid)
+				}
 			}
 			continue
 		}
@@ -1404,49 +1411,81 @@ type uvSwap struct {
 // uvAsideSuffix names the cache's old lock file while capacity's lock is in its place.
 const uvAsideSuffix = ".capacity-old"
 
-// uvCleanWait is how long capacity keeps its lock at least, its own file no longer in the lock file's place, while a
+// uvCleanWait is how long capacity keeps its lock at most, its own file no longer in the lock file's place, while a
 // uv process that opened that file waits for it alone (a clean or a prune that came while capacity held it): that one
 // would run while the old file's holders run from the cache. uv waits UV_LOCK_TIMEOUT for a lock, 300 s by default,
-// and then gives up; a waiter whose environment sets a longer one is waited out as long, and 10 s more.
+// and then gives up; the run waits as long and uvLockMargin more, and no longer than uv's default: it holds every rule
+// of the run, the disk's among them, while it waits.
 var uvCleanWait = 5*time.Minute + 10*time.Second
 
-// restore puts the old lock file back in the lock file's place, its holders on it, ends the hold on stops (release),
-// and says what it could not do, or "". A uv process that starts then shares the lock with the holders, and uv's own
-// clean or prune waits for them. One that opened capacity's file meanwhile goes on under it once capacity lets it go,
-// a lock no later clean waits for; one that waits for it alone is waited out first, and the uv processes that came to
-// capacity's file before that one wait as long, and may give up.
-func (s uvSwap) restore(held *os.File, release func()) string {
+// restore puts the old lock file back in the lock file's place, its holders on it, waits out a uv clean or prune that
+// waits for capacity's file (uvWaitOut), then ends the hold on stops, and says what it could not do, or "". A uv
+// process that starts then shares the lock with the holders, and uv's own clean or prune waits for them. One that
+// opened capacity's file meanwhile goes on under it once capacity lets it go, a lock no later clean waits for; the uv
+// processes that came to capacity's file before a clean that waits for it alone wait as long as that one is waited
+// out, and may give up.
+func (s uvSwap) restore(held *os.File, hold *stopHold) string {
+	defer hold.end()
 	aside := s.lk.file + uvAsideSuffix
 	if st, err := os.Stat(aside); err != nil || idOf(st) != s.lk.id {
-		release()
 		return "the cache's old lock file is not beside it, so its holders keep a lock no later clean or prune waits for"
 	}
 	if err := os.Rename(aside, s.lk.file); err != nil {
-		release()
 		return "the cache's old lock file could not be put back, so its holders keep a lock no later clean or prune " +
 			"waits for: " + err.Error()
 	}
-	release()
+	return uvWaitOut(s.procRoot, s.lk, held, s.c.isLock, s.look, s.stat)
+}
+
+// uvWaitOut holds capacity's file, no longer in the lock file's place, while a uv process waits for it alone (a clean
+// or a prune that came to it, which would run while the old file's holders run from the cache), and says why it let
+// go before that one gave up, or "". uv opens the file, tries it without waiting, then waits for it, and between the
+// two is on no line of /proc/locks: so the run waits uvLockSettle before each read, and while a process that has the
+// file open neither holds it nor waits for it. No process opens it by its name any more, so once every one that has
+// it open is on a line, the open files are not read again. A waiter is waited out by its UV_LOCK_TIMEOUT (uvWaits),
+// uvCleanWait at most.
+func uvWaitOut(procRoot string, lk uvLockState, held *os.File, isLock func(string) bool, look *Sample,
+	stat func(string) (os.FileInfo, error)) string {
 	st, err := held.Stat()
 	if err != nil {
 		return ""
 	}
-	keys := s.lk.keysOf(idOf(st).ino)
+	id := idOf(st)
+	keys := lk.keysOf(id.ino)
 	var deadline time.Time
-	for start := time.Now(); ; time.Sleep(100 * time.Millisecond) {
-		l := lockHolders(s.procRoot, keys)
-		if len(l.alone) == 0 {
+	scan := true
+	for start := time.Now(); ; {
+		time.Sleep(uvLockSettle)
+		l := lockHolders(procRoot, keys)
+		var between []int
+		if scan {
+			open, _ := openers(procRoot, id, isLock, true, look, stat)
+			for _, pid := range open {
+				if pid != os.Getpid() && !l.holders[pid] && !l.waiting[pid] {
+					between = append(between, pid)
+				}
+			}
+			scan = len(between) > 0
+		}
+		if len(l.alone) == 0 && len(between) == 0 {
 			return ""
 		}
 		if deadline.IsZero() {
-			wait := uvCleanWait
-			for _, pid := range l.alone {
-				wait = max(wait, uvWaits(s.procRoot, pid))
+			var wait time.Duration
+			for _, pid := range append(slices.Clone(l.alone), between...) {
+				wait = max(wait, uvWaits(procRoot, pid))
 			}
-			deadline = start.Add(wait)
+			deadline = start.Add(min(wait, uvCleanWait))
 		}
 		if time.Now().After(deadline) {
-			return fmt.Sprintf("a uv clean or prune that came while capacity held the lock waited for it past %s", deadline.Sub(start))
+			if len(l.alone) > 0 {
+				return fmt.Sprintf("a uv clean or prune (pid %d) that came while capacity held the lock waits for it past "+
+					"%s, as long as the run waits, so it may run while processes run from the cache", l.alone[0],
+					deadline.Sub(start))
+			}
+			return fmt.Sprintf("a process (pid %d) has capacity's lock file open, and neither holds it nor waits for it, "+
+				"past %s; a clean that waits for it after capacity lets go may run while processes run from the cache",
+				between[0], deadline.Sub(start))
 		}
 	}
 }
@@ -1454,42 +1493,79 @@ func (s uvSwap) restore(held *os.File, release func()) string {
 // uvLockMargin is how long past its UV_LOCK_TIMEOUT a waiter is waited out: it gives up as its timeout ends.
 var uvLockMargin = 10 * time.Second
 
-// uvWaits is how long a uv process waits for a lock, by the UV_LOCK_TIMEOUT its environment sets (in seconds), and
-// uvLockMargin more, or 0 when it sets none the run can read.
+// uvWaits is how long a uv process waits for a lock, and uvLockMargin more: the UV_LOCK_TIMEOUT its environment sets,
+// in whole seconds as uv reads it (a u64, an optional + first), and 300 s, uv's default, when it sets none, sets
+// another value (uv warns, and waits that long), or the run cannot read its environment.
 func uvWaits(procRoot string, pid int) time.Duration {
+	wait := 300 * time.Second
 	env, err := readEnviron(procRoot, pid)
-	if err != nil {
-		return 0
+	if v, ok := envValue(env, "UV_LOCK_TIMEOUT"); err == nil && ok {
+		if n, err := strconv.ParseUint(strings.TrimPrefix(v, "+"), 10, 64); err == nil {
+			wait = time.Duration(min(n, uint64(math.MaxInt64/int64(time.Second)))) * time.Second
+		}
 	}
-	v, ok := envValue(env, "UV_LOCK_TIMEOUT")
-	n, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
-	if !ok || err != nil || n < 0 {
-		return 0
+	if wait > math.MaxInt64-uvLockMargin {
+		return math.MaxInt64 // a wait with no end, to uv
 	}
-	return time.Duration(n*float64(time.Second)) + uvLockMargin
+	return wait + uvLockMargin
 }
 
-// holdStops keeps a stop (SIGINT, SIGTERM, SIGHUP) from ending the run while capacity's lock is in the cache's lock
-// file's place and the old file is aside: its holders would keep a lock no clean waits for. The func it returns ends
-// the hold, and a stop that came meanwhile ends the run then.
-func holdStops() func() {
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	return func() {
-		signal.Stop(ch)
+// stopHold keeps a stop (SIGINT, SIGTERM, SIGHUP) from ending the run while capacity's lock file is in the cache's
+// lock file's place and the old file is aside, and then while a clean waits for capacity's file (uvWaitOut): the old
+// file's holders would keep a lock no clean waits for, and the clean would run while they run from the cache. end
+// ends the hold, and a stop that came meanwhile then ends the run; came reports whether one came. A nil hold holds
+// nothing.
+type stopHold struct {
+	ch   chan os.Signal
+	got  os.Signal
+	done bool
+}
+
+func holdStops() *stopHold {
+	h := &stopHold{ch: make(chan os.Signal, 1)}
+	signal.Notify(h.ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	return h
+}
+
+// came reports whether a stop came during the hold.
+func (h *stopHold) came() bool {
+	if h == nil {
+		return false
+	}
+	if h.got == nil && !h.done {
 		select {
-		case s := <-ch:
-			if sig, ok := s.(syscall.Signal); ok {
-				syscall.Kill(os.Getpid(), sig)
-			}
+		case h.got = <-h.ch:
 		default:
 		}
 	}
+	return h.got != nil
 }
 
+// end ends the hold, once: a stop that came meanwhile ends the run now.
+func (h *stopHold) end() {
+	if h == nil || h.done {
+		return
+	}
+	signal.Stop(h.ch) // no stop comes to the channel after this, and one that came is in it
+	h.came()
+	h.done = true
+	if holdEnded != nil {
+		holdEnded()
+	}
+	if sig, ok := h.got.(syscall.Signal); ok {
+		syscall.Kill(os.Getpid(), sig)
+	}
+}
+
+// holdEnded is a test's way into the moment a hold on stops ends, and uvAfterPutBack into the moment after the
+// put-back's rename.
+var holdEnded, uvAfterPutBack func()
+
 // uvPutBack puts back the cache's old lock file that a run set aside and did not put back (it was killed under its
-// lock): the file in place is that run's, and the old one's holders keep a lock no clean waits for. It does so when no
-// process holds or waits for the file in place, and says why it waits otherwise, or on a dry run, or "".
+// lock): the file in place is that run's, and the old one's holders keep a lock no clean waits for. It takes the file
+// in place alone without waiting, so no process gets it meanwhile, puts the old one back, and waits out a uv clean or
+// prune that waits for the file it took (uvWaitOut), a stop held meanwhile. It says why it waits instead (a process
+// holds the file in place), why it did not, or why the old file stays on a run that may not put it back, or "".
 func uvPutBack(procRoot string, c uvCache, m *Mounts, live bool) string {
 	aside := c.named + uvAsideSuffix
 	if _, err := os.Lstat(aside); errors.Is(err, fs.ErrNotExist) {
@@ -1497,7 +1573,7 @@ func uvPutBack(procRoot string, c uvCache, m *Mounts, live bool) string {
 	}
 	why := "an earlier run set the cache's lock file aside and did not put it back"
 	if !live {
-		return why + "; a run that deletes puts it back"
+		return why + "; a run with the rule live puts it back"
 	}
 	l := uvLock(procRoot, c.named, c.lockReal, m, c.isLock)
 	if l.id == (lockID{}) {
@@ -1510,11 +1586,30 @@ func uvPutBack(procRoot string, c uvCache, m *Mounts, live bool) string {
 		}
 		return ""
 	}
-	if cur := lockHolders(procRoot, l.keysOf(l.id.ino)); !cur.known || len(cur.holders) > 0 || cur.waiters > 0 {
-		return why + ": a uv process holds or waits for the one in its place, so it goes back once that ends"
+	if !l.locks.known {
+		return why + ", and the locks cannot be read"
 	}
+	f, err := os.OpenFile(c.named, os.O_RDWR, 0)
+	if err != nil {
+		return why + ": " + err.Error()
+	}
+	defer f.Close()
+	if st, err := f.Stat(); err != nil || idOf(st) != l.id {
+		return why + ", and the lock file in its place changed as it looked"
+	}
+	if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+		return why + ": a uv process holds the one in its place, so it goes back once that ends"
+	}
+	hold := holdStops()
+	defer hold.end()
 	if err := os.Rename(aside, c.named); err != nil {
 		return why + ": " + err.Error()
+	}
+	if uvAfterPutBack != nil {
+		uvAfterPutBack()
+	}
+	if w := uvWaitOut(procRoot, l, f, c.isLock, nil, statLock); w != "" {
+		return why + "; it is back, but " + w
 	}
 	return ""
 }
@@ -1528,8 +1623,8 @@ func uvPutBack(procRoot string, c uvCache, m *Mounts, live bool) string {
 // keeps capacity's own prune from running, and a process that came to the old file in the instant between the last
 // look and the rename keeps a lock no later clean or prune waits for. The caller closes the file it returns, which lets
 // the lock go.
-func (s uvSwap) lockInPlace(looked func() bool, aside bool) (*os.File, func(), string) {
-	none := func() {}
+func (s uvSwap) lockInPlace(looked func() bool, aside bool) (*os.File, *stopHold, string) {
+	var none *stopHold
 	lockFile := s.lk.file
 	if id, err := fileID(lockFile); err != nil || id != s.lk.id {
 		return nil, none, "the cache's lock file changed since the look"
@@ -1546,7 +1641,7 @@ func (s uvSwap) lockInPlace(looked func() bool, aside bool) (*os.File, func(), s
 	if err != nil {
 		return nil, none, err.Error()
 	}
-	fail := func(why string) (*os.File, func(), string) {
+	fail := func(why string) (*os.File, *stopHold, string) {
 		f.Close()
 		os.Remove(tmp)
 		return nil, none, why
@@ -1563,16 +1658,16 @@ func (s uvSwap) lockInPlace(looked func() bool, aside bool) (*os.File, func(), s
 	if why := s.check(false, "since the look"); why != "" {
 		return fail(why)
 	}
-	release, kept := none, lockFile+uvAsideSuffix
+	hold, kept := none, lockFile+uvAsideSuffix
 	if aside {
-		release = holdStops()
+		hold = holdStops()
 		if err := os.Link(lockFile, kept); err != nil {
-			release()
+			hold.end()
 			return fail("the cache's lock file could not be set aside: " + err.Error())
 		}
 		if st, err := os.Stat(kept); err != nil || idOf(st) != s.lk.id {
 			os.Remove(kept)
-			release()
+			hold.end()
 			return fail("the cache's lock file changed since the look")
 		}
 	}
@@ -1580,13 +1675,13 @@ func (s uvSwap) lockInPlace(looked func() bool, aside bool) (*os.File, func(), s
 		if aside {
 			os.Remove(kept)
 		}
-		release()
+		hold.end()
 		return fail(err.Error())
 	}
 	if s.after != nil {
 		s.after()
 	}
-	return f, release, ""
+	return f, hold, ""
 }
 
 // afterRename looks at the old lock file again once it was renamed over, a moment after (uv opens the file, then
@@ -1691,7 +1786,7 @@ func newUV(look *Sample, dir string, pid int) bool {
 	if err != nil {
 		return false
 	}
-	p, ok := look.Table[pid]
+	p, ok := look.table()[pid]
 	return !ok || p.Start != startOf(string(st))
 }
 
