@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -207,9 +208,14 @@ func checkSignature(sig string) error {
 		return badCase("signature %q is not one plain line", sig)
 	case len(sig) > signatureMax:
 		return badCase("signature is %d bytes, at most %d", len(sig), signatureMax)
+	case sig == RootPrefix || strings.HasPrefix(sig, RootPrefix) && strings.TrimSpace(sig[len(RootPrefix):]) == "":
+		return badCase("a root cause's signature names it: root:KEY")
 	}
 	return nil
 }
+
+// refForms are the forms a reference takes: an event, a note, a commit, a file, an address.
+var refForms = regexp.MustCompile(`^(?:ev:[0-9a-f]{24}|note:[^\s]+|git:[\w.-]+/[\w.-]+@[0-9a-f]{7,40}|file:(?:/|~/)[^@]*(?:@\d+)?|https?://\S+)$`)
 
 func checkRef(ref string) error {
 	switch {
@@ -219,8 +225,8 @@ func checkRef(ref string) error {
 		return badCase("reference %q is not one plain line", ref)
 	case len(ref) > refMax:
 		return badCase("reference is %d bytes, at most %d", len(ref), refMax)
-	case strings.HasPrefix(ref, "-"):
-		return badCase("reference %q starts with -", ref)
+	case !refForms.MatchString(ref):
+		return badCase("reference %q is none of ev:EVENT, note:ID, git:OWNER/REPO@SHA, file:PATH[@OFFSET] (absolute or ~/), an http or https address", ref)
 	}
 	return nil
 }
@@ -310,31 +316,31 @@ func caseLog(ctx context.Context, q querier, id, actor, action, detail string, a
 	return err
 }
 
-// resolveEvidence checks a piece of evidence and fills it in: an event's reference (ev:ID) takes the event's time,
-// kind and summary, and an event the store does not hold is an error; another without a time is dated now.
+// resolveEvidence checks a piece of evidence and fills it in. An event's reference (ev:ID) always takes the
+// event's own time, kind and summary, whatever the caller gave, and a note's (note:ID) the note's time, kind and
+// title: an event or a note the store does not hold is an error. Another reference without a time is dated now.
 func resolveEvidence(ctx context.Context, q querier, e Evidence, now time.Time) (Evidence, error) {
 	if err := checkRef(e.Ref); err != nil {
 		return Evidence{}, err
 	}
-	if id, ok := strings.CutPrefix(e.Ref, "ev:"); ok {
+	var row *sql.Row
+	switch {
+	case strings.HasPrefix(e.Ref, "ev:"):
+		row = q.QueryRowContext(ctx, `SELECT ts, kind, summary FROM events WHERE id = ?`, e.Ref[len("ev:"):])
+	case strings.HasPrefix(e.Ref, "note:"):
+		row = q.QueryRowContext(ctx, `SELECT at, 'note:' || kind, title FROM notes WHERE id = ?`, e.Ref[len("note:"):])
+	}
+	if row != nil {
 		var ts int64
 		var kind, summary string
-		err := q.QueryRowContext(ctx, `SELECT ts, kind, summary FROM events WHERE id = ?`, id).Scan(&ts, &kind, &summary)
+		err := row.Scan(&ts, &kind, &summary)
 		if errors.Is(err, sql.ErrNoRows) {
-			return Evidence{}, badCase("no event has the id in %q", e.Ref)
+			return Evidence{}, badCase("the store holds nothing by %q", e.Ref)
 		}
 		if err != nil {
 			return Evidence{}, err
 		}
-		if e.At.IsZero() {
-			e.At = time.UnixMilli(ts)
-		}
-		if e.Kind == "" {
-			e.Kind = kind
-		}
-		if e.Summary == "" {
-			e.Summary = summary
-		}
+		e.At, e.Kind, e.Summary = time.UnixMilli(ts), kind, summary
 	}
 	if e.At.IsZero() {
 		e.At = now
@@ -418,20 +424,61 @@ func days(d time.Duration) string {
 	return fmt.Sprintf("%dd", int(d.Hours()/24))
 }
 
-// reopenIfBack reopens a closed case its evidence brings back.
-func reopenIfBack(ctx context.Context, q querier, c Case, actor string, now time.Time) (bool, error) {
+// reopenIfBack reopens a closed case its evidence brings back, and logs what came in and what it did, in one line:
+// added says what came in. A case closed as improved or already solved that comes back regressed: its fix did not
+// hold.
+func reopenIfBack(ctx context.Context, q querier, c Case, added, actor string, now time.Time) (bool, error) {
 	back, why, err := comesBack(ctx, q, c, now)
 	if err != nil {
 		return false, err
 	}
 	if !back {
-		return false, caseLog(ctx, q, c.ID, actor, "kept closed", why, now)
+		return false, caseLog(ctx, q, c.ID, actor, "kept closed", added+"; "+why, now)
 	}
 	if _, err := q.ExecContext(ctx, `UPDATE cases SET status = ?, reason = '', closed = 0, closed_evidence = 0, updated = ?
 	  WHERE id = ?`, CaseOpen, now.UnixMilli(), c.ID); err != nil {
 		return false, err
 	}
-	return true, caseLog(ctx, q, c.ID, actor, "reopened", fmt.Sprintf("closed as %s; %s", c.Reason, why), now)
+	action := "reopened"
+	if c.Reason == Improved || c.Reason == Solved {
+		action = "regressed"
+	}
+	return true, caseLog(ctx, q, c.ID, actor, action, fmt.Sprintf("%s; closed as %s; %s", added, c.Reason, why), now)
+}
+
+// takeEvidence gives a case the evidence it does not hold yet, moves its seen to the newest of it, and logs it: a
+// closed case comes back as comesBack says.
+func takeEvidence(ctx context.Context, q querier, c Case, evs []Evidence, by, actor string, now time.Time) (Case, Observed, error) {
+	added, newest, err := addEvidence(ctx, q, c.ID, evs, now)
+	if err != nil {
+		return Case{}, "", err
+	}
+	if added == 0 {
+		return c, Unchanged, nil
+	}
+	if _, err := q.ExecContext(ctx, `UPDATE cases SET seen = MAX(seen, ?), updated = ? WHERE id = ?`, newest.UnixMilli(),
+		now.UnixMilli(), c.ID); err != nil {
+		return Case{}, "", err
+	}
+	what := fmt.Sprintf("%d new", added)
+	if by != "" {
+		what += " by " + by
+	}
+	obs := Updated
+	if c.Status == CaseClosed {
+		back, err := reopenIfBack(ctx, q, c, what, actor, now)
+		if err != nil {
+			return Case{}, "", err
+		}
+		obs = KeptShut
+		if back {
+			obs = Reopened
+		}
+	} else if err := caseLog(ctx, q, c.ID, actor, "evidence", what, now); err != nil {
+		return Case{}, "", err
+	}
+	c, err = getCase(ctx, q, c.ID)
+	return c, obs, err
 }
 
 func checkFamily(f string) error {
@@ -514,33 +561,7 @@ func observe(ctx context.Context, q querier, f Finding, actor string, now time.T
 	if err != nil {
 		return Case{}, "", err
 	}
-	added, newest, err := addEvidence(ctx, q, c.ID, f.Evidence, now)
-	if err != nil {
-		return Case{}, "", err
-	}
-	if added == 0 {
-		return c, Unchanged, nil
-	}
-	if _, err := q.ExecContext(ctx, `UPDATE cases SET seen = MAX(seen, ?), updated = ? WHERE id = ?`, newest.UnixMilli(),
-		now.UnixMilli(), c.ID); err != nil {
-		return Case{}, "", err
-	}
-	if err := caseLog(ctx, q, c.ID, actor, "evidence", fmt.Sprintf("%d new by %s", added, f.Signature), now); err != nil {
-		return Case{}, "", err
-	}
-	obs := Updated
-	if c.Status == CaseClosed {
-		back, err := reopenIfBack(ctx, q, c, actor, now)
-		if err != nil {
-			return Case{}, "", err
-		}
-		obs = KeptShut
-		if back {
-			obs = Reopened
-		}
-	}
-	c, err = getCase(ctx, q, c.ID)
-	return c, obs, err
+	return takeEvidence(ctx, q, c, f.Evidence, f.Signature, actor, now)
 }
 
 // CaseByID reads a case. A case closed as a duplicate is read as it is: CaseLive follows it.
@@ -739,18 +760,20 @@ func (s *Store) UpdateCase(ctx context.Context, id string, u CaseUpdate, actor s
 		return Case{}, badCase("case %s is closed (%s): reopen it with new evidence before changing it", c.ID, c.Reason)
 	}
 	// A change is built only for a mechanism with a test that tells it from the alternatives: an investigation's
-	// stated cause is a guess until a test discriminates it.
-	if u.Status == CaseTesting && c.Status != CaseTesting {
-		mech, next := c.Mechanism, c.NextTest
-		if u.Mechanism != nil {
-			mech = caseText(*u.Mechanism, caseTextMax)
-		}
-		if u.NextTest != nil {
-			next = caseText(*u.NextTest, caseTextMax)
-		}
-		if mech == "" || next == "" {
-			return Case{}, badCase("case %s moves to testing only with a mechanism and the next discriminating test on record", c.ID)
-		}
+	// stated cause is a guess until a test discriminates it. So a case in testing, after the update as before it,
+	// holds both.
+	after, mech, next := c.Status, c.Mechanism, c.NextTest
+	if u.Status != "" {
+		after = u.Status
+	}
+	if u.Mechanism != nil {
+		mech = caseText(*u.Mechanism, caseTextMax)
+	}
+	if u.NextTest != nil {
+		next = caseText(*u.NextTest, caseTextMax)
+	}
+	if after == CaseTesting && (mech == "" || next == "") {
+		return Case{}, badCase("case %s is in testing only with a mechanism and the next discriminating test on record", c.ID)
 	}
 	sets, args = append(sets, "updated = ?"), append(args, now.UnixMilli(), c.ID)
 	if _, err := tx.ExecContext(ctx, `UPDATE cases SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...); err != nil {
@@ -765,7 +788,8 @@ func (s *Store) UpdateCase(ctx context.Context, id string, u CaseUpdate, actor s
 	return c, tx.Commit()
 }
 
-// AddCaseEvidence gives a case more evidence. A closed case keeps it, and comes back only as comesBack says.
+// AddCaseEvidence gives a case more evidence, or the case it went into a duplicate's. A closed case keeps it, and
+// comes back only as comesBack says.
 func (s *Store) AddCaseEvidence(ctx context.Context, id string, evs []Evidence, actor string) (Case, Observed, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -777,32 +801,8 @@ func (s *Store) AddCaseEvidence(ctx context.Context, id string, evs []Evidence, 
 	if err != nil {
 		return Case{}, "", err
 	}
-	added, newest, err := addEvidence(ctx, tx, c.ID, evs, now)
+	c, obs, err := takeEvidence(ctx, tx, c, evs, "", actor, now)
 	if err != nil {
-		return Case{}, "", err
-	}
-	obs := Unchanged
-	if added > 0 {
-		obs = Updated
-		if _, err := tx.ExecContext(ctx, `UPDATE cases SET seen = MAX(seen, ?), updated = ? WHERE id = ?`, newest.UnixMilli(),
-			now.UnixMilli(), c.ID); err != nil {
-			return Case{}, "", err
-		}
-		if err := caseLog(ctx, tx, c.ID, actor, "evidence", fmt.Sprintf("%d new", added), now); err != nil {
-			return Case{}, "", err
-		}
-		if c.Status == CaseClosed {
-			back, err := reopenIfBack(ctx, tx, c, actor, now)
-			if err != nil {
-				return Case{}, "", err
-			}
-			obs = KeptShut
-			if back {
-				obs = Reopened
-			}
-		}
-	}
-	if c, err = getCase(ctx, tx, c.ID); err != nil {
 		return Case{}, "", err
 	}
 	return c, obs, tx.Commit()
@@ -810,7 +810,7 @@ func (s *Store) AddCaseEvidence(ctx context.Context, id string, evs []Evidence, 
 
 // ReopenCase brings a closed case back on evidence it did not hold: someone judged that the evidence changed. A
 // reopening with nothing new is refused, so a dismissed case does not come back on the evidence it was dismissed
-// on.
+// on, and so is a duplicate's: the case it went into holds its evidence.
 func (s *Store) ReopenCase(ctx context.Context, id string, evs []Evidence, why, actor string) (Case, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -818,12 +818,15 @@ func (s *Store) ReopenCase(ctx context.Context, id string, evs []Evidence, why, 
 	}
 	defer tx.Rollback()
 	now := time.Now()
-	c, err := live(ctx, tx, id)
+	c, err := getCase(ctx, tx, id)
 	if err != nil {
 		return Case{}, err
 	}
-	if c.Status != CaseClosed {
+	switch {
+	case c.Status != CaseClosed:
 		return Case{}, badCase("case %s is %s, not closed", c.ID, c.Status)
+	case c.Reason == Duplicate:
+		return Case{}, badCase("case %s went into %s, which holds its evidence: reopen that one", c.ID, c.Into)
 	}
 	added, newest, err := addEvidence(ctx, tx, c.ID, evs, now)
 	if err != nil {
@@ -845,8 +848,9 @@ func (s *Store) ReopenCase(ctx context.Context, id string, evs []Evidence, why, 
 	return c, tx.Commit()
 }
 
-// CloseCase closes a case that is open, investigating or testing, with a reason other than improved, which only
-// the measure tool gives. A duplicate goes into the case into names: its evidence, signatures and cost move there.
+// CloseCase closes the case it names when it is open, investigating or testing, with a reason other than improved,
+// which only the measure tool gives. A duplicate goes into the case into names, followed to where it went: its
+// evidence, signatures and cost move there, and so does what its investigation found where that case has none.
 func (s *Store) CloseCase(ctx context.Context, id string, reason CloseReason, into, why, actor string) (Case, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -854,11 +858,13 @@ func (s *Store) CloseCase(ctx context.Context, id string, reason CloseReason, in
 	}
 	defer tx.Rollback()
 	now := time.Now()
-	c, err := live(ctx, tx, id)
+	c, err := getCase(ctx, tx, id)
 	if err != nil {
 		return Case{}, err
 	}
 	switch {
+	case c.Status == CaseClosed && c.Reason == Duplicate:
+		return Case{}, badCase("case %s is closed already: a duplicate of %s", c.ID, c.Into)
 	case !slices.Contains(CloseReasons, reason):
 		return Case{}, badCase("reason %q is not one of not-worth-it, insufficient-evidence, already-solved, duplicate", reason)
 	case reason == Improved:
@@ -924,24 +930,46 @@ func merge(ctx context.Context, q querier, c Case, into, why, actor string, now 
 	if _, err := q.ExecContext(ctx, `DELETE FROM case_evidence WHERE case_id = ?`, c.ID); err != nil {
 		return Case{}, err
 	}
-	if _, err := q.ExecContext(ctx, `UPDATE cases SET cost_usd = cost_usd + ?, cost_tokens = cost_tokens + ?,
-	  cost_ms = cost_ms + ?, runs = runs + ?, seen = MAX(seen, ?), updated = ? WHERE id = ?`, c.Cost.USD, c.Cost.Tokens,
-		c.Cost.Duration.Milliseconds(), c.Cost.Runs, newest, now.UnixMilli(), dst.ID); err != nil {
+	// What the duplicate's investigation found goes where the target has none.
+	var took []string
+	sets, args := []string{}, []any{}
+	for _, f := range []struct{ col, name, from, to string }{{"mechanism", "mechanism", c.Mechanism, dst.Mechanism},
+		{"next_test", "next test", c.NextTest, dst.NextTest}, {"benefit", "benefit", c.Benefit, dst.Benefit}} {
+		if f.from != "" && f.to == "" {
+			sets, args, took = append(sets, f.col+" = ?"), append(args, f.from), append(took, f.name)
+		}
+	}
+	if len(c.Alternatives) > 0 && len(dst.Alternatives) == 0 {
+		raw, err := json.Marshal(c.Alternatives)
+		if err != nil {
+			return Case{}, err
+		}
+		sets, args, took = append(sets, "alternatives = ?"), append(args, string(raw)), append(took, "alternatives")
+	}
+	sets = append(sets, "cost_usd = cost_usd + ?", "cost_tokens = cost_tokens + ?", "cost_ms = cost_ms + ?", "runs = runs + ?",
+		"seen = MAX(seen, ?)", "updated = ?")
+	args = append(args, c.Cost.USD, c.Cost.Tokens, c.Cost.Duration.Milliseconds(), c.Cost.Runs, newest, now.UnixMilli(), dst.ID)
+	if _, err := q.ExecContext(ctx, `UPDATE cases SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...); err != nil {
 		return Case{}, err
 	}
+	// The cost moves: the duplicate keeps none, so a sum over cases counts each run once. Its log keeps its lines.
 	if _, err := q.ExecContext(ctx, `UPDATE cases SET status = ?, reason = ?, merged_into = ?, closed = ?, updated = ?,
-	  closed_evidence = 0 WHERE id = ?`, CaseClosed, string(Duplicate), dst.ID, now.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
+	  closed_evidence = 0, cost_usd = 0, cost_tokens = 0, cost_ms = 0, runs = 0 WHERE id = ?`, CaseClosed, string(Duplicate),
+		dst.ID, now.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
 	if err := caseLog(ctx, q, c.ID, actor, "closed", fmt.Sprintf("duplicate of %s: %s", dst.ID, why), now); err != nil {
 		return Case{}, err
 	}
-	if err := caseLog(ctx, q, dst.ID, actor, "merged", fmt.Sprintf("took in %s (%d new evidence, %d signatures): %s", c.ID, moved,
-		len(c.Signatures), why), now); err != nil {
+	what := fmt.Sprintf("took in %s (%d new evidence, %d signatures", c.ID, moved, len(c.Signatures))
+	if len(took) > 0 {
+		what += ", its " + strings.Join(took, ", ")
+	}
+	if err := caseLog(ctx, q, dst.ID, actor, "merged", what+"): "+why, now); err != nil {
 		return Case{}, err
 	}
 	if dst.Status == CaseClosed && moved > 0 {
-		if _, err := reopenIfBack(ctx, q, dst, actor, now); err != nil {
+		if _, err := reopenIfBack(ctx, q, dst, fmt.Sprintf("%d new from %s", moved, c.ID), actor, now); err != nil {
 			return Case{}, err
 		}
 	}
@@ -1031,16 +1059,18 @@ func (s *Store) AddCaseCost(ctx context.Context, id string, c Cost, actor string
 }
 
 // SweepCases closes, as insufficient evidence, every case open, investigating or testing whose newest evidence is
-// older than the retention: what it rests on is gone from its source. A deployed or measuring case is its
-// measurement's. It returns the cases it closed.
+// older than the retention and that has been open as long: the problem stopped, and what it rests on is gone from
+// its source. Any evidence after the close brings it back. A deployed or measuring case is its measurement's. It
+// returns the cases it closed.
 func (s *Store) SweepCases(ctx context.Context, now time.Time, retention time.Duration) ([]Case, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM cases WHERE status IN (?,?,?) AND seen < ?`, CaseOpen, CaseInvestigating,
-		CaseTesting, now.Add(-retention).UnixMilli())
+	cut := now.Add(-retention).UnixMilli()
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM cases WHERE status IN (?,?,?) AND seen < ? AND opened < ?`, CaseOpen,
+		CaseInvestigating, CaseTesting, cut, cut)
 	if err != nil {
 		return nil, err
 	}
@@ -1059,9 +1089,9 @@ func (s *Store) SweepCases(ctx context.Context, now time.Time, retention time.Du
 	}
 	var out []Case
 	for _, id := range ids {
-		if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, reason = ?, closed = ?, updated = ?,
-		  closed_evidence = (SELECT COUNT(*) FROM case_evidence WHERE case_id = ?) WHERE id = ?`, CaseClosed, string(Insufficient),
-			now.UnixMilli(), now.UnixMilli(), id, id); err != nil {
+		// The problem stopped, which judges nothing about its evidence: any evidence after the close brings it back.
+		if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, reason = ?, closed = ?, updated = ?, closed_evidence = 0
+		  WHERE id = ?`, CaseClosed, string(Insufficient), now.UnixMilli(), now.UnixMilli(), id); err != nil {
 			return nil, err
 		}
 		if err := caseLog(ctx, tx, id, "sweep", "closed", fmt.Sprintf("%s: unseen for %s, past its evidence's retention", Insufficient,

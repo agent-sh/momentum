@@ -26,7 +26,7 @@ func caseStore(t *testing.T) *Store {
 func refsAt(prefix string, n int, at time.Time) []Evidence {
 	var out []Evidence
 	for i := 0; i < n; i++ {
-		out = append(out, Evidence{Ref: fmt.Sprintf("file:%s-%d", prefix, i), At: at.Add(time.Duration(i) * time.Minute), Kind: "test"})
+		out = append(out, Evidence{Ref: fmt.Sprintf("file:/t/%s-%d", prefix, i), At: at.Add(time.Duration(i) * time.Minute), Kind: "test"})
 	}
 	return out
 }
@@ -207,8 +207,35 @@ func TestASolvedCaseComesBackWhenItRecurs(t *testing.T) {
 	if got, obs := observeOK(t, st, Finding{Family: "failures", Signature: "i", Evidence: refsAt("j", 3, now.Add(time.Minute))}); obs != KeptShut {
 		t.Fatalf("3 in its window of 4 before %s: %+v", obs, got)
 	}
+	// evidence after the close but outside its last window does not count: the window slides
+	if _, err := st.db.ExecContext(ctx, `UPDATE case_evidence SET at = ? WHERE case_id = ? AND ref LIKE 'file:/t/j-%'`,
+		now.Add(-6*24*time.Hour).UnixMilli(), imp.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE cases SET closed = ? WHERE id = ?`, now.Add(-8*24*time.Hour).UnixMilli(), imp.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE case_evidence SET at = ? WHERE case_id = ? AND ref LIKE 'file:/t/i-%'`,
+		now.Add(-9*24*time.Hour).UnixMilli(), imp.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE case_evidence SET at = ? WHERE case_id = ? AND ref = 'file:/t/j-0'`,
+		now.Add(-7*24*time.Hour-time.Hour).UnixMilli(), imp.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, obs := observeOK(t, st, Finding{Family: "failures", Signature: "i", Evidence: refsAt("w", 1, now.Add(time.Minute))}); obs != KeptShut {
+		t.Fatalf("2 of them in its last window and 1 new, 4 before %s: %+v", obs, got)
+	}
 	if got, obs := observeOK(t, st, Finding{Family: "failures", Signature: "i", Evidence: refsAt("k", 1, now.Add(time.Hour))}); obs != Reopened || got.Status != CaseOpen {
 		t.Fatalf("back at its old rate %s: %+v", obs, got)
+	}
+	// without a measurement's window, any evidence after the close brings it back
+	nw, _ := observeOK(t, st, Finding{Family: "failures", Signature: "nw", Title: "t", Evidence: refsAt("nw", 4, now.Add(-time.Hour))})
+	if _, err := st.db.ExecContext(ctx, `UPDATE cases SET status = 'closed', reason = 'improved', closed = ? WHERE id = ?`, now.UnixMilli(), nw.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, obs := observeOK(t, st, Finding{Family: "failures", Signature: "nw", Evidence: refsAt("nw2", 1, now.Add(time.Hour))}); obs != Reopened || got.Status != CaseOpen {
+		t.Fatalf("improved without a window %s: %+v", obs, got)
 	}
 }
 
@@ -224,6 +251,10 @@ func TestARootCauseMergesTheCasesThatShareIt(t *testing.T) {
 	if _, err := st.AddCaseCost(ctx, b.ID, Cost{USD: 1.5, Tokens: 1000, Duration: time.Minute, Runs: 1}, "loop"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := st.UpdateCase(ctx, b.ID, CaseUpdate{Mechanism: ptr("the cache is stale"), NextTest: ptr("clear it"),
+		Alternatives: []string{"a race"}}, "agent"); err != nil {
+		t.Fatal(err)
+	}
 	if _, merged, err := st.AddCaseSignature(ctx, a.ID, "root:cache", "agent"); err != nil || merged {
 		t.Fatalf("a's root: merged %v, %v", merged, err)
 	}
@@ -231,11 +262,12 @@ func TestARootCauseMergesTheCasesThatShareIt(t *testing.T) {
 	if err != nil || !merged || got.ID != a.ID {
 		t.Fatalf("b's root: %+v merged %v, %v", got, merged, err)
 	}
-	if got.Evidence != 5 || got.Cost.USD != 1.5 || got.Cost.Runs != 1 || !slices.Equal(got.Signatures, []string{"sym:a", "sym:b", "root:cache"}) {
+	if got.Evidence != 5 || got.Cost.USD != 1.5 || got.Cost.Runs != 1 || !slices.Equal(got.Signatures, []string{"sym:a", "sym:b", "root:cache"}) ||
+		got.Mechanism != "the cache is stale" || got.NextTest != "clear it" || !slices.Equal(got.Alternatives, []string{"a race"}) {
 		t.Fatalf("merged %+v", got)
 	}
 	gone, err := st.CaseByID(ctx, b.ID)
-	if err != nil || gone.Status != CaseClosed || gone.Reason != Duplicate || gone.Into != a.ID || gone.Evidence != 0 {
+	if err != nil || gone.Status != CaseClosed || gone.Reason != Duplicate || gone.Into != a.ID || gone.Evidence != 0 || gone.Cost != (Cost{}) {
 		t.Fatalf("b after the merge %+v %v", gone, err)
 	}
 	if c, obs := observeOK(t, st, Finding{Family: "failures", Signature: "sym:b", Evidence: refsAt("b2", 1, now)}); c.ID != a.ID || obs != Updated {
@@ -249,6 +281,9 @@ func TestARootCauseMergesTheCasesThatShareIt(t *testing.T) {
 	}
 	if c, _ := st.CaseByID(ctx, a.ID); c.Mechanism != "stale cache" {
 		t.Fatalf("a's mechanism %q", c.Mechanism)
+	}
+	if c, err := st.AddCaseCost(ctx, b.ID, Cost{USD: 0.5, Runs: 1}, "loop"); err != nil || c.ID != a.ID || c.Cost.USD != 2 {
+		t.Fatalf("b's cost goes where it went: %+v %v", c, err)
 	}
 
 	// a regression the investigation finds: the new case's root is a closed case's
@@ -270,7 +305,7 @@ func TestAReopeningNeedsNewEvidence(t *testing.T) {
 	st := caseStore(t)
 	ctx := context.Background()
 	c, _ := observeOK(t, st, Finding{Family: "owner-burden", Signature: "s", Title: "t", Evidence: refsAt("a", 2, time.Now())})
-	if _, err := st.ReopenCase(ctx, c.ID, refsAt("a", 1, time.Now()), "again", "agent"); !errors.Is(err, ErrBadCase) {
+	if _, err := st.ReopenCase(ctx, c.ID, refsAt("new", 1, time.Now()), "again", "agent"); !errors.Is(err, ErrBadCase) {
 		t.Fatalf("an open case reopened: %v", err)
 	}
 	if _, err := st.CloseCase(ctx, c.ID, Insufficient, "", "two turns", "agent"); err != nil {
@@ -285,15 +320,20 @@ func TestAReopeningNeedsNewEvidence(t *testing.T) {
 	}
 }
 
-// A case unseen past its evidence's retention closes by itself, as insufficient evidence; a deployed one is its
-// measurement's and stays.
+// A case unseen past its evidence's retention, and open as long, closes by itself, as insufficient evidence, and
+// any evidence after brings it back: the problem stopped, which judges nothing about what it rests on. One opened
+// within the retention on older evidence stays its while, and a deployed one is its measurement's.
 func TestTheSweepClosesACaseUnseenPastItsRetention(t *testing.T) {
 	st := caseStore(t)
 	ctx := context.Background()
 	old := time.Now().Add(-40 * 24 * time.Hour)
-	stale, _ := observeOK(t, st, Finding{Family: "failures", Signature: "old", Title: "old", Evidence: refsAt("o", 2, old)})
+	stale, _ := observeOK(t, st, Finding{Family: "failures", Signature: "old", Title: "old", Evidence: refsAt("o", 12, old)})
+	recent, _ := observeOK(t, st, Finding{Family: "failures", Signature: "late", Title: "opened late", Evidence: refsAt("l", 2, old)})
 	fresh, _ := observeOK(t, st, Finding{Family: "failures", Signature: "new", Title: "new", Evidence: refsAt("n", 2, time.Now())})
 	deployed, _ := observeOK(t, st, Finding{Family: "failures", Signature: "dep", Title: "dep", Evidence: refsAt("d", 2, old)})
+	if _, err := st.db.ExecContext(ctx, `UPDATE cases SET opened = ? WHERE id IN (?, ?)`, old.UnixMilli(), stale.ID, deployed.ID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := st.db.ExecContext(ctx, `UPDATE cases SET status = 'deployed' WHERE id = ?`, deployed.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -301,13 +341,186 @@ func TestTheSweepClosesACaseUnseenPastItsRetention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(closed) != 1 || closed[0].ID != stale.ID || closed[0].Reason != Insufficient || closed[0].ClosedEvidence != 2 {
+	if len(closed) != 1 || closed[0].ID != stale.ID || closed[0].Reason != Insufficient || closed[0].ClosedEvidence != 0 {
 		t.Fatalf("swept %+v", closed)
 	}
-	for _, id := range []string{fresh.ID, deployed.ID} {
+	for _, id := range []string{recent.ID, fresh.ID, deployed.ID} {
 		if c, _ := st.CaseByID(ctx, id); c.Status == CaseClosed {
 			t.Errorf("%s swept", c.Title)
 		}
+	}
+	if got, obs := observeOK(t, st, Finding{Family: "failures", Signature: "old", Evidence: refsAt("o2", 1, time.Now().Add(time.Minute))}); obs != Reopened || got.Status != CaseOpen {
+		t.Fatalf("one recurrence after the sweep %s: %+v", obs, got)
+	}
+}
+
+// A case in testing holds a mechanism and the next test, after any change as before it.
+func TestATestingCaseKeepsItsMechanismAndNextTest(t *testing.T) {
+	st := caseStore(t)
+	ctx := context.Background()
+	c, _ := observeOK(t, st, Finding{Family: "failures", Signature: "s", Title: "t", Evidence: refsAt("a", 1, time.Now())})
+	if _, err := st.UpdateCase(ctx, c.ID, CaseUpdate{Status: CaseTesting, Mechanism: ptr("m"), NextTest: ptr("n")}, "agent"); err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range []CaseUpdate{{Mechanism: ptr("")}, {NextTest: ptr("  ")}, {Mechanism: ptr(""), NextTest: ptr("")}} {
+		if _, err := st.UpdateCase(ctx, c.ID, u, "agent"); !errors.Is(err, ErrBadCase) {
+			t.Errorf("%+v on a testing case: %v", u, err)
+		}
+	}
+	if got, err := st.UpdateCase(ctx, c.ID, CaseUpdate{Status: CaseInvestigating, Mechanism: ptr("")}, "agent"); err != nil || got.Mechanism != "" {
+		t.Fatalf("back to investigating without a mechanism: %+v %v", got, err)
+	}
+}
+
+// What only the ship and measure tools move stays where it is: a deployed or measuring case is not moved, closed,
+// reopened or merged by hand.
+func TestADeployedCaseIsTheToolsToMove(t *testing.T) {
+	st := caseStore(t)
+	ctx := context.Background()
+	for _, status := range []CaseStatus{CaseDeployed, CaseMeasuring} {
+		c, _ := observeOK(t, st, Finding{Family: "failures", Signature: "s" + string(status), Title: "t", Evidence: refsAt(string(status), 1, time.Now())})
+		if _, err := st.db.ExecContext(ctx, `UPDATE cases SET status = ? WHERE id = ?`, status, c.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.UpdateCase(ctx, c.ID, CaseUpdate{Status: CaseInvestigating}, "agent"); !errors.Is(err, ErrBadCase) {
+			t.Errorf("%s moved by hand: %v", status, err)
+		}
+		if _, err := st.CloseCase(ctx, c.ID, NotWorthIt, "", "x", "agent"); !errors.Is(err, ErrBadCase) {
+			t.Errorf("%s closed by hand: %v", status, err)
+		}
+		if _, err := st.ReopenCase(ctx, c.ID, refsAt("new"+string(status), 1, time.Now()), "x", "agent"); !errors.Is(err, ErrBadCase) {
+			t.Errorf("%s reopened: %v", status, err)
+		}
+		other, _ := observeOK(t, st, Finding{Family: "failures", Signature: "o" + string(status), Title: "o", Evidence: refsAt("o"+string(status), 1, time.Now())})
+		if _, _, err := st.AddCaseSignature(ctx, other.ID, "root:r"+string(status), "agent"); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := st.AddCaseSignature(ctx, c.ID, "root:r"+string(status), "agent"); !errors.Is(err, ErrBadCase) {
+			t.Errorf("%s merged by its root: %v", status, err)
+		}
+		if got, _ := st.CaseByID(ctx, c.ID); got.Status != status {
+			t.Errorf("%s is %s", status, got.Status)
+		}
+	}
+	c, _ := observeOK(t, st, Finding{Family: "failures", Signature: "x", Title: "x", Evidence: refsAt("x", 1, time.Now())})
+	if _, err := st.CloseCase(ctx, c.ID, NotWorthIt, c.ID, "x", "agent"); !errors.Is(err, ErrBadCase) {
+		t.Fatalf("--into without duplicate: %v", err)
+	}
+}
+
+// A duplicate's id closes and reopens nothing: the case it went into holds its evidence, and only --into follows
+// merges, along a chain of them.
+func TestADuplicatesIDDoesNotReachWhereItWent(t *testing.T) {
+	st := caseStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	a, _ := observeOK(t, st, Finding{Family: "failures", Signature: "a", Title: "a", Evidence: refsAt("a", 1, now)})
+	b, _ := observeOK(t, st, Finding{Family: "failures", Signature: "b", Title: "b", Evidence: refsAt("b", 1, now)})
+	c, _ := observeOK(t, st, Finding{Family: "failures", Signature: "c", Title: "c", Evidence: refsAt("c", 1, now)})
+	if _, err := st.CloseCase(ctx, a.ID, Duplicate, b.ID, "same", "agent"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CloseCase(ctx, b.ID, Duplicate, c.ID, "same", "agent"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := st.CaseLive(ctx, a.ID); err != nil || got.ID != c.ID || got.Evidence != 3 {
+		t.Fatalf("a lives in %+v %v", got, err)
+	}
+	if _, err := st.CloseCase(ctx, a.ID, NotWorthIt, "", "bury it", "agent"); !errors.Is(err, ErrBadCase) {
+		t.Fatalf("closing a duplicate's id: %v", err)
+	}
+	if got, _ := st.CaseByID(ctx, c.ID); got.Status != CaseOpen {
+		t.Fatalf("the case it went into is %s", got.Status)
+	}
+	if _, err := st.CloseCase(ctx, c.ID, NotWorthIt, "", "rare", "agent"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ReopenCase(ctx, a.ID, refsAt("z", 1, now), "again", "agent"); !errors.Is(err, ErrBadCase) {
+		t.Fatalf("reopening a duplicate's id: %v", err)
+	}
+	d, _ := observeOK(t, st, Finding{Family: "failures", Signature: "d", Title: "d", Evidence: refsAt("d", 1, now)})
+	if got, err := st.CloseCase(ctx, d.ID, Duplicate, a.ID, "same", "agent"); err != nil || got.ID != c.ID {
+		t.Fatalf("--into a duplicate goes where it went: %+v %v", got, err)
+	}
+}
+
+// An event's reference takes the event's own time, kind and summary whatever the caller gives, so an event from
+// before a close cannot bring the case back by a later date; a note's reference takes the note's.
+func TestAnEventsReferenceTakesTheEventsOwn(t *testing.T) {
+	st := caseStore(t)
+	ctx := context.Background()
+	before := time.Now().Add(-2 * time.Hour)
+	e := Event{Source: "mistakes", SourceKey: "k", TS: before, Actor: ActorTool, Kind: "tool-error", Summary: "exit 2"}
+	if _, err := st.Put(ctx, []Event{e}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PutNote(ctx, Note{ID: "n-1", Kind: NoteProblem, Title: "a disk fills", At: before}); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := observeOK(t, st, Finding{Family: "failures", Signature: "s", Title: "t", Evidence: refsAt("a", 1, before.Add(-time.Hour))})
+	if _, err := st.CloseCase(ctx, c.ID, Solved, "", "fixed", "agent"); err != nil {
+		t.Fatal(err)
+	}
+	got, obs, err := st.AddCaseEvidence(ctx, c.ID, []Evidence{{Ref: "ev:" + e.ID(), At: time.Now().Add(time.Hour), Kind: "made up", Summary: "made up"},
+		{Ref: "note:n-1", At: time.Now().Add(time.Hour)}}, "agent")
+	if err != nil || obs != KeptShut || got.Status != CaseClosed {
+		t.Fatalf("an event and a note from before the close: %s %+v %v", obs, got, err)
+	}
+	evs, _ := st.CaseEvidence(ctx, c.ID, 0)
+	for _, ev := range evs {
+		switch ev.Ref {
+		case "ev:" + e.ID():
+			if !ev.At.Equal(before.Truncate(time.Millisecond)) || ev.Kind != "tool-error" || ev.Summary != "exit 2" {
+				t.Errorf("the event as stored: %+v", ev)
+			}
+		case "note:n-1":
+			if ev.Kind != "note:problem" || ev.Summary != "a disk fills" {
+				t.Errorf("the note as stored: %+v", ev)
+			}
+		}
+	}
+	got, obs, err = st.AddCaseEvidence(ctx, c.ID, []Evidence{{Ref: "https://example.com/issue/4", At: time.Now().Add(time.Minute)}}, "agent")
+	if err != nil || obs != Reopened || got.Status != CaseOpen {
+		t.Fatalf("a recurrence after already solved: %s %+v %v", obs, got, err)
+	}
+	log, _ := st.CaseLog(ctx, c.ID)
+	if last := log[len(log)-1]; last.Action != "regressed" || !strings.Contains(last.Detail, "1 new") {
+		t.Fatalf("the log's last line %+v", last)
+	}
+	for _, ref := range []string{"typo", "note:nope", "ev:0123", "file:relative/x", "git:repo@abc", "ftp://x"} {
+		if _, _, err := st.AddCaseEvidence(ctx, c.ID, []Evidence{{Ref: ref}}, "agent"); !errors.Is(err, ErrBadCase) {
+			t.Errorf("reference %q: %v", ref, err)
+		}
+	}
+	if _, _, err := st.AddCaseSignature(ctx, c.ID, "root:", "agent"); !errors.Is(err, ErrBadCase) {
+		t.Errorf("a root without a key: %v", err)
+	}
+}
+
+// A closed case logs one line for each observation that brings it nothing back, and its seen moves with the newest
+// evidence, also when a merge brings it.
+func TestAClosedCaseLogsOneLineAnObservationAndSeenMoves(t *testing.T) {
+	st := caseStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	c, _ := observeOK(t, st, Finding{Family: "failures", Signature: "s", Title: "t", Evidence: refsAt("a", 10, now.Add(-3*time.Hour))})
+	if _, err := st.CloseCase(ctx, c.ID, NotWorthIt, "", "rare", "agent"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		observeOK(t, st, Finding{Family: "failures", Signature: "s", Evidence: refsAt(fmt.Sprint("o", i), 1, now.Add(time.Duration(i)*time.Minute))})
+	}
+	log, _ := st.CaseLog(ctx, c.ID)
+	if len(log) != 2+5 || log[6].Action != "kept closed" || !strings.Contains(log[6].Detail, "1 new by s") {
+		t.Fatalf("log %+v", log)
+	}
+	if got, _ := st.CaseByID(ctx, c.ID); !got.Seen.Equal(now.Add(4 * time.Minute).Truncate(time.Millisecond)) {
+		t.Fatalf("seen %v", got.Seen)
+	}
+	other, _ := observeOK(t, st, Finding{Family: "failures", Signature: "o", Title: "o", Evidence: refsAt("x", 1, now.Add(time.Hour))})
+	open, _ := observeOK(t, st, Finding{Family: "failures", Signature: "p", Title: "p", Evidence: refsAt("y", 1, now.Add(-time.Hour))})
+	if got, err := st.CloseCase(ctx, other.ID, Duplicate, open.ID, "same", "agent"); err != nil || !got.Seen.Equal(now.Add(time.Hour).Truncate(time.Millisecond)) {
+		t.Fatalf("seen after a merge %v %v", got.Seen, err)
 	}
 }
 
@@ -339,6 +552,9 @@ func TestTheCasesAreKept(t *testing.T) {
 	}
 	if st, err = Open(path); err != nil {
 		t.Fatal(err)
+	}
+	if evs, err := st.Events(ctx, Query{Source: "mistakes"}); err != nil || len(evs) != 1 {
+		t.Fatalf("the events of a store from before the cases: %d %v", len(evs), err)
 	}
 	c, _ := observeOK(t, st, Finding{Family: "failures", Signature: "s", Title: "kept", Evidence: refsAt("a", 1, time.Now())})
 	if _, err := st.Rebuild(ctx, "mistakes", false); err != nil {

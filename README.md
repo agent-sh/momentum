@@ -134,10 +134,12 @@ Run it with `momentum evidence ingest`'s timer: a oneshot unit of its own that t
 
 ```
 momentum case list [--family F] [--status S,S] [--all] [--json]
-momentum case show ID [--evidence N] [--json]
+momentum case show ID [--evidence N] [--log N] [--json]
 momentum case open --family F --signature S --title T [--evidence REF]...
-momentum case set ID [--status open|investigating|testing] [--mechanism M] [--alternative A]... [--next-test T] [--benefit B]
-momentum case evidence ID REF...        ev:EVENT, note:ID, git:OWNER/REPO@SHA, file:PATH, or an address
+momentum case set ID [--status open|investigating|testing] [--title T] [--mechanism M] [--alternative A]... [--next-test T]
+                     [--benefit B]
+momentum case evidence ID [--at WHEN] [--kind K] [--summary S] REF...
+                                        ev:EVENT, note:ID, git:OWNER/REPO@SHA, file:PATH[@OFFSET], or an address
 momentum case signature ID root:KEY     the root cause; a case that names one another case holds goes into it
 momentum case close ID --reason not-worth-it|insufficient-evidence|already-solved|duplicate [--into ID] --why W
 momentum case reopen ID --evidence REF... --why W

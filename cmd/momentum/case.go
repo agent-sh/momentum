@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -165,9 +166,16 @@ func caseList(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return usageError{fmt.Sprintf("case list takes no arguments, got %q", fs.Arg(0))}
 	}
 	f := store.CaseFilter{Family: *family, All: *all}
+	if f.Family != "" && !slices.Contains(store.Families, f.Family) {
+		return usageError{fmt.Sprintf("--family %q is not one of %s", f.Family, strings.Join(store.Families, ", "))}
+	}
 	if *status != "" {
 		for _, s := range strings.Split(*status, ",") {
-			f.Statuses = append(f.Statuses, store.CaseStatus(strings.TrimSpace(s)))
+			st := store.CaseStatus(strings.TrimSpace(s))
+			if !slices.Contains(store.CaseStatuses, st) {
+				return usageError{fmt.Sprintf("--status %q is not a case's status: open, investigating, testing, deployed, measuring, closed", st)}
+			}
+			f.Statuses = append(f.Statuses, st)
 		}
 	}
 	st, err := store.Open(paths.DB())
@@ -196,8 +204,9 @@ func caseList(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 // shownCase is a case as show --json prints it: the case, its newest evidence and its log.
 type shownCase struct {
 	listedCase
-	Recent []shownEvidence `json:"recent_evidence"`
-	Log    []shownEntry    `json:"log"`
+	Recent   []shownEvidence `json:"recent_evidence"`
+	Log      []shownEntry    `json:"log"`       // its last --log lines
+	LogLines int             `json:"log_lines"` // how many lines its log holds
 }
 
 type shownEvidence struct {
@@ -222,6 +231,7 @@ func caseShow(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	fs := flag.NewFlagSet("case show", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	n := fs.Int("evidence", 20, "how much of its newest evidence to print (0: all)")
+	logN := fs.Int("log", 20, "how many of its log's last lines to print (0: all)")
 	asJSON := fs.Bool("json", false, "one JSON object")
 	if err := fs.Parse(rest); err != nil {
 		return usageError{err.Error()}
@@ -243,8 +253,12 @@ func caseShow(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	if err != nil {
 		return err
 	}
+	logged := len(log)
+	if *logN > 0 && len(log) > *logN {
+		log = log[len(log)-*logN:]
+	}
 	if *asJSON {
-		out := shownCase{listedCase: caseJSON(c), Recent: []shownEvidence{}, Log: []shownEntry{}}
+		out := shownCase{listedCase: caseJSON(c), Recent: []shownEvidence{}, Log: []shownEntry{}, LogLines: logged}
 		for _, e := range evs {
 			out.Recent = append(out.Recent, shownEvidence{Ref: e.Ref, At: rfc3339(e.At), Kind: e.Kind, Summary: e.Summary})
 		}
@@ -277,7 +291,7 @@ func caseShow(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	for _, e := range evs {
 		fmt.Fprintf(stdout, "    %s  %-14s %s  %s\n", e.At.Local().Format("01-02 15:04"), e.Kind, e.Ref, plain.Clip(e.Summary, 120))
 	}
-	fmt.Fprintln(stdout, "  log:")
+	fmt.Fprintf(stdout, "  log: %d lines, the last %d\n", logged, len(log))
 	for _, e := range log {
 		fmt.Fprintf(stdout, "    %s  %-10s %-12s %s\n", e.At.Local().Format("01-02 15:04"), e.Actor, e.Action, e.Detail)
 	}
@@ -374,9 +388,9 @@ func caseEvidence(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	}
 	fs := flag.NewFlagSet("case evidence", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	at := fs.String("at", "", "when it happened, for a reference that is not an event (default: now)")
-	kind := fs.String("kind", "", "what it is, for a reference that is not an event")
-	summary := fs.String("summary", "", "a short line about it, for a reference that is not an event")
+	at := fs.String("at", "", "when it happened (default: now); an event or a note always takes its own")
+	kind := fs.String("kind", "", "what it is; an event or a note always takes its own")
+	summary := fs.String("summary", "", "a short line about it; an event or a note always takes its own")
 	if err := fs.Parse(rest); err != nil {
 		return usageError{err.Error()}
 	}

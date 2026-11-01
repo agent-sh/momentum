@@ -60,15 +60,17 @@ const usage = `usage:
                                         --dry-run deletes and records nothing and runs every rule
   momentum case list [--family F] [--status S,S] [--all] [--json]
                                         the cases, the most recently changed first; closed ones with --all
-  momentum case show ID [--evidence N] [--json]
-                                        one case: its investigation, cost, signatures, newest evidence and log
+  momentum case show ID [--evidence N] [--log N] [--json]
+                                        one case: its investigation, cost, signatures, newest evidence and its
+                                        log's last lines
   momentum case open --family F --signature S --title T [--evidence REF]...
                                         open a case, or give the case that holds S the evidence
   momentum case set ID [--status open|investigating|testing] [--title T] [--mechanism M] [--alternative A]...
                        [--next-test T] [--benefit B]
                                         record the investigation; testing needs a mechanism and a next test
   momentum case evidence ID [--at WHEN] [--kind K] [--summary S] REF...
-                                        more evidence: ev:EVENT, note:ID, git:OWNER/REPO@SHA, file:PATH, an address
+                                        more evidence: ev:EVENT, note:ID, git:OWNER/REPO@SHA, file:PATH[@OFFSET],
+                                        an address; an event or a note takes its own time, kind and summary
   momentum case signature ID SIG        another signature (the root cause's: root:KEY); one another case holds
                                         merges this case into that one
   momentum case close ID --reason R [--into ID] --why W
