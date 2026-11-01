@@ -94,16 +94,19 @@ const usage = `usage:
   momentum loop [--dry] [--family F,F] [--case ID] [--json]
                                         the improvement loop, once: detect, take each family's case a step with the
                                         harness's agent, review and land what was proposed
-  momentum measure [--dry] [--json]   the measure step: a deployed change measured over its window after it
-                                        against the window before, by its signal's rate of its activity; improved
-                                        closes its case, no effect rolls it back
+  momentum measure [--dry] [--family F,F] [--case ID] [--json]
+                                        the measure step: a deployed change, once in effect, measured over its
+                                        window after it against the window before, by its signal's share of the
+                                        active hours; improved closes its case and keeps the change, no effect
+                                        rolls it back; an improved case comes back at its old share
   momentum loop runs [--since WHEN] [--case ID] [--json]
                                         the loop's runs, and what the live ones spent in the last day and week
   momentum loop lesson --case ID --text T
                                         a case closed as improved: its lesson to tacit, as the loop's observation
   momentum ship prepare --repo DIR [--case ID]
   momentum ship check --test CMD [--test-files F,F] [--case ID]
-  momentum ship propose --title T --body-file F --rollback R --signal JSON [--window D] [--lesson L] [--case ID]
+  momentum ship propose --title T --body-file F --rollback R --signal JSON [--window D] [--lesson L]
+                        [--installed FILE] [--case ID]
   momentum ship status [--case ID] [--json]
   momentum ship land ID
   momentum ship rollback ID --why W

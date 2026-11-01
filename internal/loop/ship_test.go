@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/measure"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -898,6 +899,61 @@ func TestARevisionDoesNotOverwriteAnotherPushToItsBranch(t *testing.T) {
 	}
 }
 
+// A change its measurement kept is no landed package: it never rolls back (nothing is pushed), and no change of a
+// case that is not deployed or measuring does either. When its case comes back, regressed, a new package is
+// prepared, and the kept one's record stays beside it.
+func TestAKeptChangeIsPreparedAgainAndNeverRolledBack(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	f := newRepo(t, nil)
+	s := shipFor(t, st, f)
+	c, _ := reviewedChange(t, s, st, f)
+	p, err := s.Land(ctx, c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// a landed change whose case is no longer deployed or measuring is not rolled back
+	if _, err := st.StartMeasuring(ctx, c.ID, 24*time.Hour, 6, p.LandedAt, "loop:measure"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CloseMeasured(ctx, c.ID, 0, "6 of 10 active hours before, 0 of 10 after", "loop:measure"); err != nil {
+		t.Fatal(err)
+	}
+	before := originHead(t, f, "main")
+	if _, err := s.RollBack(ctx, c.ID, "x"); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "only a deployed or measuring") {
+		t.Fatalf("a closed case's change rolled back: %v", err)
+	}
+	if _, err := s.Keep(c.ID, measure.Result{Effect: "6 to 0"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RollBack(ctx, c.ID, "x"); !errors.Is(err, ErrRefused) {
+		t.Fatalf("a kept change rolled back: %v", err)
+	}
+	if head := originHead(t, f, "main"); head != before {
+		t.Fatalf("a refused rollback pushed: %s, was %s", head, before)
+	}
+	if _, err := s.Prepare(ctx, c.ID, f.main); !errors.Is(err, ErrRefused) {
+		t.Fatalf("a closed case prepared: %v", err)
+	}
+	if _, err := st.RegressCase(ctx, c.ID, "back at its old share", "loop:measure"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	q, err := s.Prepare(ctx, c.ID, f.main)
+	if err != nil || q.State != Prepared {
+		t.Fatalf("prepared again after its case came back: %+v %v", q, err)
+	}
+	past, _ := filepath.Glob(filepath.Join(s.pkgDir(c.ID), "past", "*", "package.json"))
+	if len(past) != 1 {
+		t.Fatalf("the kept package's record: %v", past)
+	}
+	if raw, _ := os.ReadFile(past[0]); !strings.Contains(string(raw), `"state": "kept"`) {
+		t.Fatalf("the record kept %s", raw)
+	}
+}
+
 // A package prepared again after its rollback, in another checkout of the repository, leaves no registration of
 // its old work tree in the first.
 func TestAPackagePreparedAgainLeavesNoOldTreeBehind(t *testing.T) {
@@ -924,26 +980,80 @@ func TestAPackagePreparedAgainLeavesNoOldTreeBehind(t *testing.T) {
 }
 
 // A measurement's signal counts the case's own problem: one that counts enough events, none of them the case's, is
-// refused.
+// refused. It counts in units of activity: the hours of the sessions in which it counts an event, among the hours
+// in which they did anything; the owner's hours for a signal of his words alone; the machine's hours for events no
+// session holds. A problem that repeats inside one session's hour counts once, and fewer than five units is
+// refused. A file the change is installed in must be one there is.
 func TestAPlanMeasuresTheCasesOwnProblem(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 	s := &Ship{Store: st}
 	c := testingCase(t, st)
+	now := time.Now()
 	var evs []store.Event
+	put := func(key string, at time.Time, session string, actor store.Actor, kind, text string) {
+		evs = append(evs, store.Event{Source: store.Transcripts, SourceKey: key, TS: at, Session: session, Harness: "claude", Actor: actor,
+			Kind: kind, Tool: map[bool]string{true: "Bash"}[kind == "tool_result"], Summary: text})
+	}
 	for i := 0; i < 6; i++ {
-		evs = append(evs, store.Event{Source: store.Transcripts, SourceKey: fmt.Sprint("other@", i), TS: time.Now().Add(-time.Duration(i+1) * time.Hour),
-			Session: "s9", Harness: "claude", Actor: store.ActorTool, Kind: "tool_result", Tool: "Bash", Summary: "Exit code 1 zz-other-text"})
+		put(fmt.Sprint("other@", i), now.Add(-time.Duration(i+1)*time.Hour), "s9", store.ActorTool, "tool_result", "Exit code 1 zz-other-text")
+		put(fmt.Sprint("said@", i), now.Add(-time.Duration(i+1)*time.Hour), "s8", store.ActorOwner, "owner_text", "zz-pushback again")
+	}
+	hour := now.Add(-30 * time.Hour).Truncate(time.Hour) // a clock hour's start: a unit's hour is the clock's
+	for i := 0; i < 10; i++ {                            // ten in one hour of one session: one unit
+		put(fmt.Sprint("burst@", i), hour.Add(time.Duration(i)*time.Minute), "s7", store.ActorTool, "tool_result", "Exit code 1 zz-burst-text")
 	}
 	if _, err := st.Put(ctx, evs); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := st.Put(ctx, []store.Event{{Source: store.Incidents, SourceKey: "inc@1", TS: now.Add(-2 * time.Hour), Actor: store.ActorHarness, Kind: "incident", Summary: "zz-incident-text"}}); err != nil {
+		t.Fatal(err)
+	}
+	week := 7 * 24 * time.Hour
 	other := Signal{Source: store.Transcripts, Kinds: []string{"tool_result"}, Tool: "Bash", Match: []string{"zz-other-text"}}
-	if _, err := s.validPlan(ctx, c, other, 7*24*time.Hour); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "does not measure the case's problem") {
+	if _, err := s.validPlan(ctx, c, other, week, "", now); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "does not measure the case's problem") {
 		t.Fatalf("a signal of another problem: %v", err)
 	}
-	if n, err := s.validPlan(ctx, c, goodSignal, 7*24*time.Hour); err != nil || n != 4 {
-		t.Fatalf("the case's own signal: %d %v", n, err)
+	plan, err := s.validPlan(ctx, c, goodSignal, week, "", now)
+	// six hours of two sessions hold the problem, among the hours of the four sessions that did anything in the week
+	if err != nil || plan.Units != SessionHours || plan.Before != 6 || plan.BeforeBase != 6+6+6+1 || !plan.At.Equal(now) || plan.Window != week {
+		t.Fatalf("the case's own signal: %+v %v", plan, err)
+	}
+	burst := Signal{Source: store.Transcripts, Kinds: []string{"tool_result"}, Tool: "Bash", Match: []string{"zz-burst-text"}}
+	if _, err := s.validPlan(ctx, c, burst, week, "", now); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "in 1 session hours") {
+		t.Fatalf("ten events in one session's hour: %v", err)
+	}
+	// four units are fewer than five, whatever else the signal counts
+	if _, err := s.validPlan(ctx, c, goodSignal, week, "", now.Add(-2*time.Hour-time.Minute)); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "fewer than 5") {
+		t.Fatalf("four units: %v", err)
+	}
+	if units := unitsOf(evs[1:2]); units != OwnerHours {
+		t.Errorf("the owner's words count in %s", units)
+	}
+	if units := unitsOf([]store.Event{{Session: ""}}); units != MachineHours {
+		t.Errorf("events of no session count in %s", units)
+	}
+	if units := unitsOf(evs[:2]); units != SessionHours {
+		t.Errorf("a tool's and the owner's count in %s", units)
+	}
+	owner := Signal{Source: store.Transcripts, Kinds: []string{"owner_text"}, Match: []string{"zz-pushback"}}
+	if counts, err := Tally(ctx, st, owner, OwnerHours, now.Add(-week), now); err != nil || counts != (measure.Counts{Hits: 6, Base: 6}) {
+		t.Errorf("the owner's hours: %+v %v", counts, err)
+	}
+	machine := Signal{Source: store.Incidents, Kinds: []string{"incident"}, Match: []string{"zz-incident-text"}}
+	if counts, err := Tally(ctx, st, machine, MachineHours, now.Add(-week), now); err != nil || counts.Hits != 1 || counts.Base < 7 {
+		t.Errorf("the machine's hours: %+v %v", counts, err)
+	}
+	if _, err := s.validPlan(ctx, c, goodSignal, week, filepath.Join(t.TempDir(), "nothing-here"), now); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "no file here") {
+		t.Fatalf("an installed file that is not there: %v", err)
+	}
+	if _, err := s.validPlan(ctx, c, goodSignal, week, "relative/bin", now); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "absolute path") {
+		t.Fatalf("a relative installed file: %v", err)
+	}
+	bin := filepath.Join(t.TempDir(), "tool")
+	write(t, bin, "a build")
+	if plan, err := s.validPlan(ctx, c, goodSignal, week, bin, now); err != nil || plan.Installed != bin {
+		t.Fatalf("an installed file: %+v %v", plan, err)
 	}
 }
 

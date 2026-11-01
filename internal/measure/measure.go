@@ -1,12 +1,13 @@
 // Package measure decides whether a deployed change helped: deterministic, no model. A change's signal (what its
-// case's problem is in the store) is counted over a window before the change and over as long after it, each with
-// the activity it is a part of: the events of the signal's source, kinds, tool and harness, matched or not. A
-// quieter week after a change is not a fix, so the two counts are compared as rates of that activity.
+// case's problem is in the store) is counted over a window before the change and over as long after it, in units of
+// activity: the hours of the sessions that did anything in the window (the machine's own hours for a signal of the
+// machine), and the units in which the signal counts an event. A quieter week is not a fix, so the two windows are
+// compared as shares of their activity; a change cannot move the activity by adding work inside an hour, and a
+// problem that repeats inside one hour of a session counts once there.
 //
-// The test is the exact conditional test of two Poisson rates: under no change, the share of the problem's events
-// that fall after the change is binomial, with the after window's share of the activity as its chance. The change
-// helped when the after count is lower than that share makes likely (a one-sided p-value below Alpha) and its rate
-// fell.
+// The test is Fisher's exact test, one-sided: under no change, which of both windows' units hold the problem is
+// chance, so the after window's count of them is hypergeometric, its draws the after window's units. The change
+// helped when the after count is lower than chance makes likely (a p-value below Alpha) and its share fell.
 package measure
 
 import (
@@ -17,12 +18,13 @@ import (
 // Alpha is the test's level: an effect this unlikely under no change is taken as the change's.
 const Alpha = 0.05
 
-// MinBefore is the least the signal must count before a change for any drop to tell from chance at Alpha: with
-// as much activity after as before, a drop to none of five has a chance of 1 in 32 under no change, and of four 1 in
-// 16, above Alpha.
+// MinBefore is the least the signal must count before a change for a drop to tell from chance at Alpha: with as
+// much activity after as before, a drop to none of five units has a chance of about 1 in 32 under no change, and one
+// of four about 1 in 16, above Alpha. Five is the floor at equal activity; a quieter window after needs more
+// (Measurable).
 const MinBefore = 5
 
-// Counts are a window's: the events the signal counts, and the activity they are a part of.
+// Counts are a window's: the units of activity in which the signal counts an event, and the units of activity.
 type Counts struct {
 	Hits int `json:"hits"`
 	Base int `json:"base"`
@@ -38,53 +40,67 @@ func (c Counts) Rate() float64 {
 
 // Result is a measurement.
 type Result struct {
-	Before, After Counts
-	P             float64 // the chance, under no change, of an after count this low or lower
-	Improved      bool
-	Effect        string // the effect in words
+	Before   Counts  `json:"before"`
+	After    Counts  `json:"after"`
+	P        float64 `json:"p"` // the chance, under no change, of an after count this low or lower
+	Improved bool    `json:"improved"`
+	Effect   string  `json:"effect"` // the effect in words
 }
 
-// Compare decides whether the rate fell from before to after. With no activity in either window there is nothing
+// Compare decides whether the share fell from before to after. With no activity in either window there is nothing
 // to compare, and ok is false.
 func Compare(before, after Counts) (Result, bool) {
 	r := Result{Before: before, After: after, P: 1}
 	if before.Base == 0 || after.Base == 0 {
 		return r, false
 	}
-	n := before.Hits + after.Hits
-	q := float64(after.Base) / float64(after.Base+before.Base)
-	if n > 0 {
-		r.P = binomialCDF(after.Hits, n, q)
-	}
+	r.P = tail(after.Hits, before.Base+after.Base, before.Hits+after.Hits, after.Base)
 	r.Improved = r.P < Alpha && after.Rate() < before.Rate()
-	r.Effect = fmt.Sprintf("%d of %d before, %d of %d after (%s to %s), p=%.3f", before.Hits, before.Base, after.Hits, after.Base,
-		percent(before.Rate()), percent(after.Rate()), r.P)
+	r.Effect = fmt.Sprintf("%d of %d active hours before, %d of %d after (%s to %s), p=%.3f", before.Hits, before.Base, after.Hits,
+		after.Base, percent(before.Rate()), percent(after.Rate()), r.P)
 	return r, true
+}
+
+// Measurable reports whether a window after with as much activity as afterBase could show any effect: whether a
+// drop to none would pass the test. It reads the count before and the activity after, never the count after, so
+// waiting for more activity looks at no outcome: when none would pass, no count after would.
+func Measurable(before Counts, afterBase int) bool {
+	if before.Base == 0 || afterBase == 0 {
+		return false
+	}
+	return tail(0, before.Base+afterBase, before.Hits, afterBase) < Alpha
+}
+
+// Back reports whether a problem a change helped is back at its old rate: over a window as long as its
+// measurement's, its share of the activity is at least what it was before the change, and it counts at least
+// MinBefore units, the least any measurement could tell from chance.
+func Back(before, recent Counts) bool {
+	return recent.Hits >= MinBefore && recent.Hits*before.Base >= before.Hits*recent.Base
 }
 
 func percent(x float64) string { return fmt.Sprintf("%.2f%%", 100*x) }
 
-// binomialCDF is P(X <= k) for X binomial over n tries at chance q, summed in logs.
-func binomialCDF(k, n int, q float64) float64 {
-	if k >= n {
+// tail is P(X <= k) for X hypergeometric: n draws, without replacement, from N units of which K hold the
+// problem. Its terms are summed in logs.
+func tail(k, N, K, n int) float64 {
+	lo, hi := max(0, n-(N-K)), min(n, K)
+	switch {
+	case k >= hi:
 		return 1
-	}
-	if q <= 0 {
-		return 1
-	}
-	if q >= 1 {
-		if k >= n {
-			return 1
-		}
+	case k < lo:
 		return 0
 	}
-	lq, lp := math.Log(q), math.Log1p(-q)
-	lnN, _ := math.Lgamma(float64(n + 1))
+	den := logChoose(N, n)
 	sum := 0.0
-	for i := 0; i <= k; i++ {
-		li, _ := math.Lgamma(float64(i + 1))
-		lni, _ := math.Lgamma(float64(n - i + 1))
-		sum += math.Exp(lnN - li - lni + float64(i)*lq + float64(n-i)*lp)
+	for i := lo; i <= k; i++ {
+		sum += math.Exp(logChoose(K, i) + logChoose(N-K, n-i) - den)
 	}
 	return math.Min(sum, 1)
+}
+
+func logChoose(n, k int) float64 {
+	a, _ := math.Lgamma(float64(n + 1))
+	b, _ := math.Lgamma(float64(k + 1))
+	c, _ := math.Lgamma(float64(n - k + 1))
+	return a - b - c
 }

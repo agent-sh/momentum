@@ -24,6 +24,7 @@ const (
 	StepBuild       = "build"       // testing: build and propose the change, or revise it for its review
 	StepReview      = "review"      // a proposed change: a clean-context review
 	StepPublish     = "publish"     // closed as improved: the lesson to tacit
+	StepMeasure     = "measure"     // deployed, measuring or improved: the measure step, no agent (Measure)
 )
 
 // Budgets are the loop's limits, in US dollars and time. The defaults come from the Phase 0 baseline: what the
@@ -72,6 +73,7 @@ type Done struct {
 	Family, Case, Step string
 	Run                store.LoopRun
 	Skipped            string // why no step ran
+	Did                string // what a step that is no agent's run did: the measure step's outcome
 }
 
 func (r *Runner) now() time.Time {
@@ -115,7 +117,7 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 			r.logf("swept %s: %s", c.ID, c.Title)
 		}
 	}
-	measured, err := r.Measure(ctx, o.Dry)
+	measured, err := r.Measure(ctx, o)
 	if err != nil {
 		return nil, err
 	}
@@ -136,9 +138,13 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		picked error
 	)
 	for _, m := range measured {
-		if o.Case == "" || m.Case == o.Case {
-			done = append(done, Done{Family: "", Case: m.Case, Step: "measure", Skipped: strings.TrimSpace(m.Status + " " + m.Why)})
+		did := m.Status
+		for _, s := range []string{m.Result.Effect, m.Why} {
+			if s != "" && !strings.Contains(did, s) {
+				did += ": " + s
+			}
 		}
+		done = append(done, Done{Case: m.Case, Step: StepMeasure, Did: did})
 	}
 	building := false
 	for _, fam := range families {
