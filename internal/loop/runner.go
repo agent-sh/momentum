@@ -139,7 +139,11 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 	)
 	for _, m := range measured {
 		did := m.Status
-		for _, s := range []string{m.Result.Effect, m.Why} {
+		effect := ""
+		if m.Result != nil {
+			effect = m.Result.Effect
+		}
+		for _, s := range []string{effect, m.Why} {
 			if s != "" && !strings.Contains(did, s) {
 				did += ": " + s
 			}

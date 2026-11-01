@@ -63,9 +63,14 @@ func TestTheMeasureCommand(t *testing.T) {
 	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &m); err != nil {
 		t.Fatalf("its JSON %q: %v", out, err)
 	}
-	for _, k := range []string{"case", "title", "status", "why", "result"} {
+	for _, k := range []string{"case", "title", "status", "why"} {
 		if _, ok := m[k]; !ok {
 			t.Errorf("its JSON lacks %q: %s", k, out)
+		}
+	}
+	for _, key := range []string{"due", "result"} {
+		if _, ok := m[key]; ok {
+			t.Errorf("unmeasured JSON holds %s: %s", key, out)
 		}
 	}
 	if _, ok := m["Case"]; ok || m["case"] != c.ID || m["status"] != "failed" {

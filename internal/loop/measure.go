@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/agent-sh/momentum/internal/measure"
@@ -13,13 +14,13 @@ import (
 
 // Measured is what the measure step did with one case.
 type Measured struct {
-	Case   string         `json:"case"`
-	Title  string         `json:"title"`
-	PR     string         `json:"pr,omitempty"`
-	Status string         `json:"status"` // measuring, waiting, improved, rolled back, held, back, failed
-	Result measure.Result `json:"result"`
-	Due    time.Time      `json:"due,omitempty"` // when its window after the change ends
-	Why    string         `json:"why,omitempty"`
+	Case   string          `json:"case"`
+	Title  string          `json:"title"`
+	PR     string          `json:"pr,omitempty"`
+	Status string          `json:"status"` // measuring, waiting, improved, rolled back, held, back, failed
+	Result *measure.Result `json:"result,omitempty"`
+	Due    time.Time       `json:"due,omitzero"` // when its window after the change ends
+	Why    string          `json:"why,omitempty"`
 }
 
 // The units a plan's measurement counts in (internal/measure): the hours of the sessions (of the signal's harness,
@@ -46,17 +47,17 @@ func unitsOf(counted []store.Event) string {
 
 // Tally counts a signal over a span in its units: the units in which it counts an event, and the units of activity
 // they are among.
-func Tally(ctx context.Context, st *store.Store, sig Signal, units string, since, until time.Time) (measure.Counts, error) {
-	evs, err := Count(ctx, st, sig, since, until)
+func Tally(ctx context.Context, st *store.Store, sig Signal, units string, since, until time.Time, excludeCwd string) (measure.Counts, error) {
+	evs, err := Count(ctx, st, sig, since, until, excludeCwd)
 	if err != nil {
 		return measure.Counts{}, err
 	}
-	return tally(ctx, st, sig, units, evs, since, until)
+	return tally(ctx, st, sig, units, evs, since, until, excludeCwd)
 }
 
 // tally is Tally over the events the signal counted already. The activity holds every unit the signal counts.
-func tally(ctx context.Context, st *store.Store, sig Signal, units string, evs []store.Event, since, until time.Time) (measure.Counts, error) {
-	q := store.ActivityQuery{Since: since, Until: until}
+func tally(ctx context.Context, st *store.Store, sig Signal, units string, evs []store.Event, since, until time.Time, excludeCwd string) (measure.Counts, error) {
+	q := store.ActivityQuery{Since: since, Until: until, ExcludeCwd: excludeCwd}
 	switch units {
 	case SessionHours:
 		q.BySession, q.Harness = true, sig.Harness
@@ -87,19 +88,49 @@ func (o Options) takes(c store.Case) bool {
 }
 
 // Measure is the measure step, deterministic. A deployed case starts measuring once its change is in effect (the
-// repository's checkout holds it, and the file it is installed in changed after the landing), with its plan's
+// repository's checkout holds it, and the file it is installed in changed after the checkout took the change), with its plan's
 // window and count before; until then it waits, and a problem note says so after a window. A measuring case whose
 // window after its change has ended is measured against the window before it: one whose share of the activity fell
 // beyond chance (measure.Compare) closes as improved, its change kept, with a shipped note of what it did; one
 // whose share did not has its change rolled back, with a decided note. A window after too quiet for any count to
 // show an effect (measure.Measurable) waits one more window, then counts both; still too quiet, the change is
 // rolled back, since nothing could show it helped. While the loop is not live, it rolls nothing back and says so.
-// A case closed as improved comes back, regressed, once its problem is back at its old share (measure.Back). The
+// A case closed as improved comes back only through its completed watch windows (measure.Back). The
 // options narrow it as they narrow the run. A dry measure says what it would do and changes nothing.
 func (r *Runner) Measure(ctx context.Context, o Options) ([]Measured, error) {
 	cs, err := r.Store.Cases(ctx, store.CaseFilter{Statuses: []store.CaseStatus{store.CaseDeployed, store.CaseMeasuring}})
 	if err != nil {
 		return nil, err
+	}
+	if !o.Dry {
+		notes, err := r.Store.Notes(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, n := range notes {
+			id, ok := strings.CutPrefix(n.ID, "measure:")
+			if !ok || !n.Done.IsZero() {
+				continue
+			}
+			c, err := r.Store.CaseByID(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+			if !o.takes(c) || c.Status == store.CaseDeployed || c.Status == store.CaseMeasuring {
+				continue
+			}
+			if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
+				return nil, err
+			}
+			if p, ok, err := r.Ship.Load(id); err != nil {
+				return nil, err
+			} else if ok {
+				p.Problem = ""
+				if err := r.Ship.save(&p); err != nil {
+					return nil, err
+				}
+			}
+		}
 	}
 	var out []Measured
 	for _, c := range cs {
@@ -149,22 +180,43 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 	}
 	plan := *p.Plan
 	now := r.now()
-	if c.Status == store.CaseDeployed {
-		since, why, err := r.Ship.InEffect(ctx, p)
-		switch {
-		case err != nil:
-			return failed(err.Error())
-		case why != "":
-			m.Status, m.Why = "waiting", "its change is not in effect yet: "+why
-			if !dry && now.After(p.LandedAt.Add(plan.Window)) {
-				r.problem(ctx, &p, "momentum's change is not in effect: "+c.Title, fmt.Sprintf("It landed %s ago and %s. Its measurement starts when it is.",
-					days(now.Sub(p.LandedAt)), why))
+	since, why, err := r.Ship.InEffect(ctx, p)
+	if err != nil {
+		return failed(err.Error())
+	}
+	if why != "" {
+		m.Status, m.Why = "waiting", "its change is not in effect: "+why
+		from := p.LandedAt
+		if c.Status == store.CaseMeasuring {
+			if p.OutOfEffect.IsZero() {
+				p.OutOfEffect = now
+				if !dry {
+					if err := r.Ship.save(&p); err != nil {
+						return failed(err.Error())
+					}
+				}
 			}
-			return m
+			from = p.OutOfEffect
 		}
+		if !dry && !now.Before(from.Add(plan.Window)) {
+			r.problem(ctx, &p, "momentum's change is not in effect: "+c.Title,
+				fmt.Sprintf("It has waited %s and %s. Its window after starts again when it is in effect.", days(now.Sub(from)), why))
+		}
+		return m
+	}
+	if c.Status == store.CaseDeployed || !p.OutOfEffect.IsZero() {
 		m.Status, m.Due = "measuring", since.Add(plan.Window)
 		if !dry {
-			if _, err := r.Store.StartMeasuring(ctx, c.ID, plan.Window, plan.Before, since, "loop:measure"); err != nil {
+			if c.Status == store.CaseDeployed {
+				_, err = r.Store.StartMeasuring(ctx, c.ID, plan.Window, plan.Before, since, "loop:measure")
+			} else {
+				_, err = r.Store.RestartMeasuring(ctx, c.ID, since, "loop:measure")
+			}
+			if err != nil {
+				return failed(err.Error())
+			}
+			p.OutOfEffect = time.Time{}
+			if err := r.Ship.save(&p); err != nil {
 				return failed(err.Error())
 			}
 			r.resolve(ctx, &p)
@@ -176,11 +228,8 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		m.Status = "waiting"
 		return m
 	}
-	before, err := Tally(ctx, r.Store, plan.Signal, plan.Units, plan.At.Add(-plan.Window), plan.At)
-	if err != nil {
-		return failed(err.Error())
-	}
-	after, err := Tally(ctx, r.Store, plan.Signal, plan.Units, c.Deployed, m.Due)
+	before := measure.Counts{Hits: plan.Before, Base: plan.BeforeBase}
+	after, err := Tally(ctx, r.Store, plan.Signal, plan.Units, c.Deployed, m.Due, r.Dir)
 	if err != nil {
 		return failed(err.Error())
 	}
@@ -191,16 +240,22 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 				after.Base, before.Hits, before.Base)
 			return m
 		}
-		if after, err = Tally(ctx, r.Store, plan.Signal, plan.Units, c.Deployed, m.Due); err != nil {
+		if after, err = Tally(ctx, r.Store, plan.Signal, plan.Units, c.Deployed, m.Due, r.Dir); err != nil {
 			return failed(err.Error())
 		}
 	}
 	res, compared := measure.Compare(before, after)
-	m.Result = res
+	if compared {
+		m.Result = &res
+	}
 	if compared && res.Improved {
 		m.Status = "improved"
 		if dry {
 			return m
+		}
+		p.Result = &res
+		if err := r.Ship.save(&p); err != nil {
+			return failed(err.Error())
 		}
 		if _, err := r.Store.CloseMeasured(ctx, c.ID, after.Hits, res.Effect, "loop:measure"); err != nil {
 			return failed(err.Error())
@@ -210,14 +265,16 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		}
 		r.resolve(ctx, &p)
 		r.note(ctx, store.Note{Kind: store.NoteShipped, Title: plainClip("momentum improved: "+c.Title, store.TitleMax),
-			Detail: fmt.Sprintf("Its change (%s) measurably helped over the %s after it was in effect.", firstOf(p.PR, "a package"), days(plan.Window)),
+			Detail: fmt.Sprintf("Its change (%s) measurably helped over the %s after it was in effect.", firstOf(p.PR, "a package"), days(m.Due.Sub(c.Deployed))),
 			Effect: res.Effect, Links: prLinks(p.PR)})
 		return m
 	}
-	why := "no measured effect: " + res.Effect
+	why = "no measured effect: " + res.Effect
 	switch {
-	case !compared:
+	case before.Base == 0:
 		why = "nothing to measure it by: no activity in the window before its change"
+	case after.Base == 0:
+		why = "nothing could show it helped: no activity in the two windows after its change, too quiet to tell"
 	case !measure.Measurable(before, after.Base):
 		why = "nothing could show it helped: two windows after it were too quiet to tell (" + res.Effect + ")"
 	}
@@ -266,36 +323,98 @@ func (r *Runner) rollbackFailed(ctx context.Context, c store.Case, cause error) 
 	}
 }
 
-// watch brings a case closed as improved back, regressed, once its problem is back at its old share over its last
-// window (measure.Back). ok says whether it came back.
+// watch finishes an interrupted keep, then reads each ended window since the close once. The windows do not
+// overlap. Back spends a shrinking test level over them, so repeated runs do not buy more chances to reopen.
 func (r *Runner) watch(ctx context.Context, c store.Case, dry bool) (Measured, bool) {
 	p, ok, err := r.Ship.Load(c.ID)
-	if err != nil || !ok || p.State != Kept || p.Plan == nil || p.Result == nil {
+	m := Measured{Case: c.ID, Title: c.Title, PR: p.PR}
+	failed := func(err error) (Measured, bool) { m.Status, m.Why = "failed", err.Error(); return m, true }
+	if err != nil {
+		return failed(err)
+	}
+	if !ok || (p.State != Kept && p.State != Landed) || p.Plan == nil {
 		return Measured{}, false
+	}
+	if p.Plan.Window <= 0 {
+		return failed(fmt.Errorf("its plan has no window"))
+	}
+	if p.State == Landed {
+		if p.Result == nil {
+			// A close from before results were saved ahead of it: recover the window's activity.
+			before := measure.Counts{Hits: p.Plan.Before, Base: p.Plan.BeforeBase}
+			after, err := Tally(ctx, r.Store, p.Plan.Signal, p.Plan.Units, c.Deployed, c.Deployed.Add(p.Plan.Window), r.Dir)
+			if err != nil {
+				return failed(err)
+			}
+			if !measure.Measurable(before, after.Base) {
+				after, err = Tally(ctx, r.Store, p.Plan.Signal, p.Plan.Units, c.Deployed, c.Deployed.Add(2*p.Plan.Window), r.Dir)
+				if err != nil {
+					return failed(err)
+				}
+			}
+			after.Hits = c.Measurement.After
+			res, _ := measure.Compare(before, after)
+			p.Result = &res
+		}
+		if !dry {
+			p, err = r.Ship.Keep(c.ID, *p.Result)
+			if err != nil {
+				return failed(err)
+			}
+		}
+	}
+	if p.Result == nil {
+		return failed(fmt.Errorf("its kept package has no measurement"))
+	}
+	reference := p.Result.After
+	if p.WatchReference != nil {
+		reference = *p.WatchReference
+	} else if p.WatchWindow > 0 {
+		// Recover progress saved before packages recorded the pooled reference.
+		prior, err := Tally(ctx, r.Store, p.Plan.Signal, p.Plan.Units, c.Closed, c.Closed.Add(time.Duration(p.WatchWindow)*p.Plan.Window), r.Dir)
+		if err != nil {
+			return failed(err)
+		}
+		reference.Hits += prior.Hits
+		reference.Base += prior.Base
 	}
 	now := r.now()
-	m := Measured{Case: c.ID, Title: c.Title, PR: p.PR}
-	recent, err := Tally(ctx, r.Store, p.Plan.Signal, p.Plan.Units, now.Add(-p.Plan.Window), now)
-	if err != nil {
-		m.Status, m.Why = "failed", err.Error()
-		return m, true
+	ended := int(now.Sub(c.Closed) / p.Plan.Window)
+	for j := p.WatchWindow + 1; j <= ended; j++ {
+		start := c.Closed.Add(time.Duration(j-1) * p.Plan.Window)
+		recent, err := Tally(ctx, r.Store, p.Plan.Signal, p.Plan.Units, start, start.Add(p.Plan.Window), r.Dir)
+		if err != nil {
+			return failed(err)
+		}
+		if measure.Back(p.Result.Before, reference, recent, j) {
+			m.Status = "back"
+			m.Why = fmt.Sprintf("%d of %d active hours in window %d since its close (%s), %d of %d before its change",
+				recent.Hits, recent.Base, j, days(p.Plan.Window), p.Result.Before.Hits, p.Result.Before.Base)
+			if dry {
+				return m, true
+			}
+			if _, err := r.Store.RegressCase(ctx, c.ID, m.Why, "loop:measure"); err != nil {
+				return failed(err)
+			}
+			p.WatchWindow = j
+			if err := r.Ship.save(&p); err != nil {
+				return failed(err)
+			}
+			r.note(ctx, store.Note{Kind: store.NoteDecided, Title: plainClip("momentum: a problem it fixed is back: "+c.Title, store.TitleMax),
+				Detail: "Back at its old share beyond chance (" + m.Why + "): the case is open again. Its lesson in tacit is not withdrawn.", Links: prLinks(p.PR)})
+			return m, true
+		}
+		reference.Hits += recent.Hits
+		reference.Base += recent.Base
+		p.WatchReference = &reference
+		p.WatchWindow = j
+		if !dry {
+			if err := r.Ship.save(&p); err != nil {
+				return failed(err)
+			}
+		}
 	}
-	before := p.Result.Before
-	if !measure.Back(before, recent) {
-		return Measured{}, false
-	}
-	m.Status = "back"
-	m.Why = fmt.Sprintf("%d of %d active hours in its last %s, %d of %d before its change", recent.Hits, recent.Base, days(p.Plan.Window), before.Hits, before.Base)
-	if dry {
-		return m, true
-	}
-	if _, err := r.Store.RegressCase(ctx, c.ID, m.Why, "loop:measure"); err != nil {
-		m.Status, m.Why = "failed", err.Error()
-		return m, true
-	}
-	r.note(ctx, store.Note{Kind: store.NoteDecided, Title: plainClip("momentum: a problem it fixed is back: "+c.Title, store.TitleMax),
-		Detail: "Back at its old rate (" + m.Why + "): the case is open again, and its lesson no longer stands as measured.", Links: prLinks(p.PR)})
-	return m, true
+	return Measured{}, false
 }
 
 // problem puts the case's problem note (measure:CASE) in the report, passive, once for what it says: a note the

@@ -146,7 +146,7 @@ func testSandbox(t *testing.T) Sandbox {
 		Path: []string{filepath.Join(env[0], "bin")}}
 }
 
-// testingCase is a case in testing whose evidence the signal zz-signal-text counts: six failed results.
+// testingCase is a case in testing with six failed results in its gate and an independent weekly baseline.
 func testingCase(t *testing.T, st *store.Store) store.Case {
 	t.Helper()
 	ctx := context.Background()
@@ -155,6 +155,11 @@ func testingCase(t *testing.T, st *store.Store) store.Case {
 		evs = append(evs, store.Event{Source: store.Transcripts, SourceKey: fmt.Sprintf("s%d@%d", i%2, i), TS: time.Now().Add(-time.Duration(i+1) * time.Hour),
 			Session: fmt.Sprint("s", i%2), Harness: "claude", Actor: store.ActorTool, Kind: "tool_result", Tool: "Bash",
 			Summary: "Exit code 1 zz-signal-text: the thing broke", Meta: `{"is_error":true}`})
+	}
+	for _, e := range append([]store.Event(nil), evs...) {
+		e.SourceKey += "-baseline"
+		e.TS = e.TS.Add(-8 * 24 * time.Hour)
+		evs = append(evs, e)
 	}
 	if _, err := st.Put(ctx, evs); err != nil {
 		t.Fatal(err)
@@ -993,7 +998,7 @@ func TestAPlanMeasuresTheCasesOwnProblem(t *testing.T) {
 	var evs []store.Event
 	put := func(key string, at time.Time, session string, actor store.Actor, kind, text string) {
 		evs = append(evs, store.Event{Source: store.Transcripts, SourceKey: key, TS: at, Session: session, Harness: "claude", Actor: actor,
-			Kind: kind, Tool: map[bool]string{true: "Bash"}[kind == "tool_result"], Summary: text})
+			Kind: kind, Tool: map[bool]string{true: "Bash"}[kind == "tool_result"], Summary: text, Meta: `{"is_error":true}`})
 	}
 	for i := 0; i < 6; i++ {
 		put(fmt.Sprint("other@", i), now.Add(-time.Duration(i+1)*time.Hour), "s9", store.ActorTool, "tool_result", "Exit code 1 zz-other-text")
@@ -1015,8 +1020,8 @@ func TestAPlanMeasuresTheCasesOwnProblem(t *testing.T) {
 		t.Fatalf("a signal of another problem: %v", err)
 	}
 	plan, err := s.validPlan(ctx, c, goodSignal, week, "", now)
-	// six hours of two sessions hold the problem, among the hours of the four sessions that did anything in the week
-	if err != nil || plan.Units != SessionHours || plan.Before != 6 || plan.BeforeBase != 6+6+6+1 || !plan.At.Equal(now) || plan.Window != week {
+	// The baseline holds six hours; the gate also holds the other signals and their activity.
+	if err != nil || plan.Units != SessionHours || plan.Before != 6 || plan.BeforeBase != 6 || plan.GateBase != 6+6+6+1 || !plan.At.Equal(now) || plan.Window != week {
 		t.Fatalf("the case's own signal: %+v %v", plan, err)
 	}
 	burst := Signal{Source: store.Transcripts, Kinds: []string{"tool_result"}, Tool: "Bash", Match: []string{"zz-burst-text"}}
@@ -1037,11 +1042,11 @@ func TestAPlanMeasuresTheCasesOwnProblem(t *testing.T) {
 		t.Errorf("a tool's and the owner's count in %s", units)
 	}
 	owner := Signal{Source: store.Transcripts, Kinds: []string{"owner_text"}, Match: []string{"zz-pushback"}}
-	if counts, err := Tally(ctx, st, owner, OwnerHours, now.Add(-week), now); err != nil || counts != (measure.Counts{Hits: 6, Base: 6}) {
+	if counts, err := Tally(ctx, st, owner, OwnerHours, now.Add(-week), now, ""); err != nil || counts != (measure.Counts{Hits: 6, Base: 6}) {
 		t.Errorf("the owner's hours: %+v %v", counts, err)
 	}
 	machine := Signal{Source: store.Incidents, Kinds: []string{"incident"}, Match: []string{"zz-incident-text"}}
-	if counts, err := Tally(ctx, st, machine, MachineHours, now.Add(-week), now); err != nil || counts.Hits != 1 || counts.Base < 7 {
+	if counts, err := Tally(ctx, st, machine, MachineHours, now.Add(-week), now, ""); err != nil || counts.Hits != 1 || counts.Base < 7 {
 		t.Errorf("the machine's hours: %+v %v", counts, err)
 	}
 	if _, err := s.validPlan(ctx, c, goodSignal, week, filepath.Join(t.TempDir(), "nothing-here"), now); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "no file here") {
@@ -1431,5 +1436,145 @@ printf 'username=fixture\npassword=synthetic\n'`)
 	}
 	if _, err := s.git(ctx, f.main, "config", "--get-all", "credential.helper"); !errors.Is(err, ErrRefused) {
 		t.Fatalf("local helper accepted: %v", err)
+	}
+}
+
+// A proposal records its own count time, the last window's gate, and the three earlier windows of baseline. Events at
+// either end and after the plan cannot leak across its half-open bounds.
+func TestAProposalRecordsItsGateAndLongerBaseline(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	f := newRepo(t, nil)
+	s := shipFor(t, st, f)
+	at := time.Now().Truncate(time.Second)
+	s.Now = func() time.Time { return at }
+	c := testingCase(t, st)
+	p, err := s.Prepare(ctx, c.ID, f.main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
+	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
+	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+		t.Fatal(err)
+	}
+	w := 24 * time.Hour
+	hours(t, st, "older", at.Add(-4*w), 3*w, 30, 9)
+	hours(t, st, "too-old", at.Add(-4*w-time.Second), time.Second, 1, 1)
+	hours(t, st, "end", at, time.Hour, 10, 10)
+	p, err = s.Propose(ctx, c.ID, Proposal{Title: "Correct the answer", Body: "Return the expected value.", Rollback: "revert", Signal: goodSignal, Window: w})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.Plan.At.Equal(at) || p.Plan.Before != 9 || p.Plan.BeforeBase != 30 || p.Plan.Gate != 6 || p.Plan.GateBase != 6 {
+		t.Fatalf("proposal counts: %+v", p.Plan)
+	}
+}
+
+// validPlan chooses the signal's units from its own gated events. Another harness adds no session or owner
+// hours when the signal names one. Machine signals count distinct machine hours instead of sessions.
+func TestAPlanChoosesItsSignalsUnitsAndHarness(t *testing.T) {
+	for _, units := range []string{SessionHours, OwnerHours, MachineHours} {
+		t.Run(units, func(t *testing.T) {
+			ctx := context.Background()
+			st := testStore(t)
+			s := &Ship{Store: st}
+			at := time.Date(2026, 1, 10, 12, 0, 0, 0, time.UTC)
+			sig := Signal{Source: store.Transcripts, Kinds: []string{"tool_result"}, Match: []string{"synthetic failure"}, Harness: "chosen"}
+			actor, session := store.ActorTool, "one"
+			if units == OwnerHours {
+				actor, sig.Kinds = store.ActorOwner, []string{"owner_text"}
+			}
+			if units == MachineHours {
+				session, sig.Harness, sig.Source, sig.Kinds = "", "", store.Incidents, []string{"incident"}
+			}
+			f := store.Finding{Family: "failures", Signature: "failures/v1:units", Title: "a failure"}
+			var evs []store.Event
+			for i := 0; i < 6; i++ {
+				e := store.Event{Source: sig.Source, SourceKey: fmt.Sprint(i), TS: at.Add(-time.Duration(i+1) * time.Hour), Session: session,
+					Harness: "chosen", Actor: actor, Kind: sig.Kinds[0], Summary: "synthetic failure", Meta: `{"is_error":true}`}
+				evs = append(evs, e)
+				f.Evidence = append(f.Evidence, store.Evidence{Ref: "ev:" + e.ID()})
+				e.SourceKey, e.Session, e.Harness, e.Summary = fmt.Sprint("other", i), "other", "another", "ordinary work"
+				evs = append(evs, e)
+			}
+			for _, e := range append([]store.Event(nil), evs...) {
+				e.SourceKey += "-baseline"
+				e.TS = e.TS.Add(-24 * time.Hour)
+				evs = append(evs, e)
+			}
+			if _, err := st.Put(ctx, evs); err != nil {
+				t.Fatal(err)
+			}
+			c, _, err := st.ObserveCase(ctx, f, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, err := s.validPlan(ctx, c, sig, 24*time.Hour, "", at)
+			if err != nil || p.Units != units || p.Before != 6 || p.BeforeBase != 6 {
+				t.Fatalf("%s: %+v %v", units, p, err)
+			}
+		})
+	}
+}
+
+// Resuming a push whose package already recorded its landing preserves that time, so a build made before the
+// recovery is not mistaken for one made before the landing.
+func TestAResumedLandingKeepsItsRecordedTime(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	f := newRepo(t, nil)
+	s := shipFor(t, st, f)
+	c, p := reviewedChange(t, s, st, f)
+	run(t, p.Work, "git", "push", "origin", "HEAD:main")
+	landed := time.Now().Add(-time.Hour).Truncate(time.Millisecond)
+	p.State, p.LandingHead, p.LandedAt, p.Landed = Landing, p.Head, landed, []string{p.Head}
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	p, err := s.Land(ctx, c.ID)
+	if err != nil || !p.LandedAt.Equal(landed) {
+		t.Fatalf("resumed: %+v %v", p, err)
+	}
+	got, err := st.CaseByID(ctx, c.ID)
+	if err != nil || !got.Deployed.Equal(landed) {
+		t.Fatalf("case: %+v %v", got, err)
+	}
+}
+
+// A recent burst passes the gate but cannot supply its own baseline. A baseline too rare to show a drop to
+// none within two windows is refused; shortening the window can reach the problem's more recent history.
+func TestAPlanNeedsAMeasurableIndependentBaseline(t *testing.T) {
+	for _, oldHits := range []int{0, 1, 3, 4} {
+		t.Run(fmt.Sprint(oldHits), func(t *testing.T) {
+			ctx := context.Background()
+			st := testStore(t)
+			s := &Ship{Store: st}
+			at := time.Date(2026, 1, 10, 12, 0, 0, 0, time.UTC)
+			w := 24 * time.Hour
+			gate := hours(t, st, "gate", at.Add(-w), w, 100, 6)
+			hours(t, st, "recent", at.Add(-2*w), w, 100, 6)
+			hours(t, st, "old", at.Add(-28*w), 21*w, 300, oldHits)
+			f := store.Finding{Family: "failures", Signature: "failures/v1:history", Title: "a recurring failure"}
+			for _, e := range gate[:6] {
+				f.Evidence = append(f.Evidence, store.Evidence{Ref: "ev:" + e.ID()})
+			}
+			c, _, err := st.ObserveCase(ctx, f, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = s.validPlan(ctx, c, goodSignal, 7*w, "", at)
+			if oldHits == 4 {
+				if err != nil {
+					t.Fatalf("baseline measurable over two windows: %v", err)
+				}
+			} else if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "too new or too rare") || !strings.Contains(err.Error(), "a shorter window reads more recent history") {
+				t.Fatalf("unmeasurable weekly baseline: %v", err)
+			}
+			p, err := s.validPlan(ctx, c, goodSignal, w, "", at)
+			if err != nil || p.Before != 6 || p.BeforeBase != 100 || p.Gate != 6 || p.GateBase != 100 {
+				t.Fatalf("measurable daily plan: %+v %v", p, err)
+			}
+		})
 	}
 }
