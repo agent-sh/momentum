@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -18,7 +19,8 @@ import (
 )
 
 // shipCmd is the one way a change of the loop's goes in (loop.Ship). A loop run builds with prepare, check and
-// propose, for its own case only; landing and rolling back are the loop's own steps, never a run's.
+// propose, for its own case only; landing and rolling back are the loop's own steps, never a run's. A change goes
+// to a repository, never a configuration in place.
 func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return usageError{"ship needs prepare, check, propose, status, land or rollback"}
@@ -37,11 +39,10 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	fs.SetOutput(stderr)
 	caseID := fs.String("case", os.Getenv("MOMENTUM_LOOP_CASE"), "the case (in a loop run: its own, by default)")
 	repo := fs.String("repo", "", "prepare: a checkout of the repository the change goes to")
-	cfg := fs.String("config", "", "prepare: the configuration directory the change goes to")
 	test := fs.String("test", "", "check: the test command, one program and its arguments, run without a shell")
 	testFiles := fs.String("test-files", "", "check: comma-separated files of the change that hold the test (default: by their names)")
 	title := fs.String("title", "", "propose: the change's title")
-	bodyFile := fs.String("body-file", "", "propose: a file with the change's description")
+	bodyFile := fs.String("body-file", "", "propose: a file with the change's description (in a loop run: one in its own directory)")
 	rollback := fs.String("rollback", "", "propose: how the change is undone")
 	signal := fs.String("signal", "", `propose: the measurement's signal, {"source","kinds","tool","harness","match"}`)
 	window := fs.String("window", "7d", "propose: the measurement's window (at least a day)")
@@ -93,7 +94,7 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		}
 		p = pk
 	case "prepare":
-		p, err = ship.Prepare(ctx, *caseID, *repo, *cfg)
+		p, err = ship.Prepare(ctx, *caseID, *repo)
 	case "check":
 		var files []string
 		for _, f := range strings.Split(*testFiles, ",") {
@@ -108,11 +109,11 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 			return usageError{err.Error()}
 		}
 		if *bodyFile != "" {
-			b, err := os.ReadFile(*bodyFile)
+			b, err := readBody(*bodyFile, run)
 			if err != nil {
-				return usageError{err.Error()}
+				return err
 			}
-			pr.Body = string(b)
+			pr.Body = b
 		}
 		if err := json.Unmarshal([]byte(*signal), &pr.Signal); err != nil {
 			return usageError{"--signal is a JSON object: " + err.Error()}
@@ -144,4 +145,37 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		fmt.Fprintf(stdout, "  landed %s: %s\n", p.LandedAt.Local().Format(time.DateTime), strings.Join(p.Landed, " "))
 	}
 	return nil
+}
+
+// bodyMax is the longest description a proposal takes.
+const bodyMax = 64 << 10
+
+// readBody reads a proposal's description. In a loop run it is a file of the run's own directory: a path
+// elsewhere would publish what the user can read.
+func readBody(path, run string) (string, error) {
+	if run != "" {
+		real, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return "", usageError{err.Error()}
+		}
+		own, err := filepath.EvalSymlinks(os.Getenv("MOMENTUM_LOOP_DIR"))
+		if err != nil || os.Getenv("MOMENTUM_LOOP_DIR") == "" || !within(real, own) {
+			return "", usageError{fmt.Sprintf("in a loop run the body is a file of the run's own directory, not %s", path)}
+		}
+		path = real
+	}
+	st, err := os.Stat(path)
+	switch {
+	case err != nil:
+		return "", usageError{err.Error()}
+	case !st.Mode().IsRegular():
+		return "", usageError{fmt.Sprintf("%s is not a file", path)}
+	case st.Size() > bodyMax:
+		return "", usageError{fmt.Sprintf("%s holds %d bytes, more than a description's %d", path, st.Size(), bodyMax)}
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", usageError{err.Error()}
+	}
+	return string(b), nil
 }

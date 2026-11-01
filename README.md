@@ -156,12 +156,13 @@ A case is one answer in progress to a standing question: its family, its evidenc
 ```
 momentum loop [--dry] [--family F,F] [--case ID] [--json]
 momentum loop runs [--since WHEN] [--case ID] [--json]
+momentum loop lesson --case ID --text T
 momentum ship prepare|check|propose|status|land|rollback ...
 ```
 
-The improvement loop takes each family's case one step a run: investigate it, build its change, or publish its lesson. A step is one run of the harness's own agent (Claude Code in print mode, `--bare`, Opus 5.5 with Sonnet 5.5 as fallback), with the loop's procedure and the family's skill in its system prompt, the harness's permissions in dontAsk mode (it reads, runs momentum's own tools, and writes only in its run's directory and its case's work tree), and a budget per run, per case, per day and per week. A case whose runs fail the same way twice stops, and the loop opens a case about itself.
+The improvement loop takes each family's case one step a run: investigate it, build its change (or revise it for its review), or publish its lesson. A step is one run of the harness's own agent (Claude Code in print mode, bare and restricted, Opus 5.5 with Sonnet 5.5 when Opus's safeguards refuse), with the loop's procedure and the family's skill in its system prompt, the harness's permissions in dontAsk mode (its file tools reach only its directories; it reads the rest of the machine through momentum's commands, which scrub secrets; it writes only in its run's directory and its case's work tree), and a budget per run, per case, per day and per week. A case whose runs fail the same way twice stops, and the loop opens a case about itself.
 
-A change goes in only through `momentum ship`: a work tree of the loop's own, a test that fails without the change and passes with it in a bubblewrap sandbox, a measurement plan whose signal counts the case's own problem, a rollback, a pull request committed as the user, a clean-context review posted on it, and a fast-forward of the default branch, only when the loop is live. Its authority is configuration the loop never writes:
+A change goes in only through `momentum ship`, and only to a repository: a work tree of the loop's own, a test that fails without the change and passes with it in a bubblewrap sandbox that reaches nothing of the user's, a measurement plan whose signal counts the case's own problem, a rollback, a pull request committed as the user with its text scrubbed and its mentions inert, a clean-context review posted on it (three rounds at most), and a fast-forward of the default branch, only when the loop is live. Its authority is configuration the loop never writes, and a key of it momentum does not know is an error:
 
 ```json
 {"loop": {
@@ -171,6 +172,7 @@ A change goes in only through `momentum ship`: a work tree of the loop's own, a 
   "exclude": ["your-github-user/do-not-touch"],
   "repo_guard": ["~/.local/bin/scope-check"],
   "rules": ["~/.config/agents/SHARED.md"],
+  "read_dirs": ["~/projects"],
   "constraints": ["never wake me"],
   "capacity_gate": ["~/.local/bin/waitfor", "--capacity", "20,8", "--timeout", "10m"]
 }}

@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,7 +32,14 @@ type Agent struct {
 	// Env is the environment the agent runs with, whole: the runner builds it (cleanEnv), so nothing of the
 	// calling shell's (a harness's plugin list, a session's id) reaches the run.
 	Env []string
+	// Scope runs each run in a systemd user scope of its own (systemd-run), so its stop reaches every process it
+	// started, those that left its process group too. Without it, the stop reaches its process group.
+	Scope bool
 }
+
+// DefaultTools are the harness's built-in tools a loop run has: the file tools (confined to its directories),
+// the shell (only the commands its permissions allow) and subagents.
+const DefaultTools = "Read,Grep,Glob,Write,Edit,Bash,Agent"
 
 // Invocation is one run of the agent.
 type Invocation struct {
@@ -45,9 +51,10 @@ type Invocation struct {
 	MaxTurns  int
 	BudgetUSD float64
 	Timeout   time.Duration
-	MCP       string // an MCP configuration file, or none
-	Persist   bool   // keep the session's transcript (live runs); an evaluation's runs keep none
-	AddDirs   []string
+	MCP       string   // an MCP configuration file, or none
+	Persist   bool     // keep the session's transcript (live runs); an evaluation's runs keep none
+	AddDirs   []string // the directories the file tools reach besides Dir
+	Tools     string   // the built-in tools it has: DefaultTools when empty, "none" none (a judge), or a list
 }
 
 // Settings are the permissions the harness enforces: what the agent may call, by the harness's rules. The mode is
@@ -70,14 +77,20 @@ type Result struct {
 	Denials    int             // calls the permissions refused
 	Session    string
 	Transcript string // the run's stream of events, in Dir
+	Model      string // the model that ran it
 }
 
 // stopGrace is how long a run that ran out of its time has to stop after SIGTERM before it is killed.
-const stopGrace = 10 * time.Second
+var stopGrace = 10 * time.Second
 
 // Run runs the agent once and returns what came of it. It writes the run's files into inv.Dir (its system prompt,
 // settings, schema and the stream of its events) and waits for it, at most inv.Timeout; then it stops the run and
 // every process it started.
+//
+// The harness runs restricted: it reads none of the user's settings files (only the run's own, so no allow rule of
+// his reaches a run), its file tools reach only the run's directories (Dir and AddDirs), only a person may
+// approve a write to a settings, git or tool-configuration file, and it has only the tools named. --bare keeps
+// the user's hooks, plugins, memory and CLAUDE.md out.
 func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	if len(a.Runner) == 0 {
 		return Result{}, errors.New("no runner: set loop.runner in sources.json")
@@ -104,8 +117,15 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	if _, err := write("schema.json", []byte(inv.Schema)); err != nil {
 		return Result{}, err
 	}
+	tools := inv.Tools
+	switch tools {
+	case "":
+		tools = DefaultTools
+	case "none":
+		tools = ""
+	}
 	args := append(append([]string{}, a.Runner[1:]...), "-p", inv.Prompt,
-		"--bare", "--settings", settings, "--permission-mode", "dontAsk",
+		"--bare", "--restricted", "--tools", tools, "--settings", settings, "--permission-mode", "dontAsk",
 		"--output-format", "stream-json", "--verbose",
 		"--append-system-prompt-file", system,
 		"--model", a.Model,
@@ -138,12 +158,18 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	defer errLog.Close()
 	runCtx, cancel := context.WithTimeout(ctx, inv.Timeout)
 	defer cancel()
-	cmd := exec.Command(a.Runner[0], args...)
+	prog, argv := a.Runner[0], args
+	unit := ""
+	if a.Scope {
+		unit = ScopeUnit(filepath.Base(inv.Dir))
+		prog, argv = "systemd-run", append([]string{"--user", "--scope", "--quiet", "--collect", "--unit", unit, "--", a.Runner[0]}, args...)
+	}
+	cmd := exec.Command(prog, argv...)
 	cmd.Dir, cmd.Env, cmd.Stdout, cmd.Stderr = inv.Dir, a.Env, out, errLog
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // its own group: a stop reaches every process it started
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
-		return Result{}, fmt.Errorf("start %s: %w", a.Runner[0], err)
+		return Result{}, fmt.Errorf("start %s: %w", prog, err)
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -161,8 +187,13 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 			waitErr = <-done
 		}
 	}
+	// what it started dies with it: its group, and its scope's every process, those that left the group too
+	syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	if unit != "" {
+		StopScope(unit)
+	}
 	res, perr := readStream(transcript)
-	res.Duration, res.Transcript = time.Since(start), transcript
+	res.Duration, res.Transcript, res.Model = time.Since(start), transcript, a.Model
 	switch {
 	case timedOut:
 		res.Status, res.Failure = store.RunTimeout, "timeout"
@@ -175,6 +206,36 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 		}
 	}
 	return res, nil
+}
+
+// ScopeUnit is the systemd scope a run runs in, by its directory's name (the run's id).
+func ScopeUnit(run string) string { return "momentum-loop-" + run + ".scope" }
+
+// StopScope kills every process of a run's scope and stops it.
+func StopScope(unit string) {
+	cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	exec.CommandContext(cctx, "systemctl", "--user", "kill", "--signal=SIGKILL", unit).Run()
+	exec.CommandContext(cctx, "systemctl", "--user", "stop", unit).Run()
+}
+
+// RunOrFallback runs the agent, and when the model's safeguards refuse the run, runs it once more on the
+// fallback model: Opus first, Sonnet when Opus fails. The result says which model ran (Model) and counts both
+// runs' cost.
+func (a Agent) RunOrFallback(ctx context.Context, inv Invocation) (Result, error) {
+	res, err := a.Run(ctx, inv)
+	if err != nil || res.Failure != "the model's safeguards" || a.Fallback == "" || a.Fallback == a.Model {
+		return res, err
+	}
+	first := res
+	b := a
+	b.Model, b.Fallback = a.Fallback, ""
+	os.Rename(filepath.Join(inv.Dir, "transcript.jsonl"), filepath.Join(inv.Dir, "transcript.refused.jsonl"))
+	res, err = b.Run(ctx, inv)
+	res.USD += first.USD
+	res.Tokens += first.Tokens
+	res.Duration += first.Duration
+	return res, err
 }
 
 // readStream reads the run's stream of events (Claude Code's stream-json): its last result says how the run
@@ -277,8 +338,9 @@ func lastLine(path string) string {
 }
 
 // CleanEnv is the environment a run starts with: the user's home, a path to momentum's tools, the locale and the
-// user's session bus (the provider's credentials come from the user's keyring), and what the loop sets. Nothing
-// else of the caller's environment reaches it: a harness's plugin list or session id would change what runs.
+// user's session bus (the provider's credentials come from the user's keyring, and the scope from his systemd),
+// and what the loop sets. Nothing else of the caller's environment reaches it: a harness's plugin list or session
+// id would change what runs. A check's test gets less (Sandbox).
 func CleanEnv(extra map[string]string, bins ...string) []string {
 	keep := []string{"HOME", "LANG", "LC_ALL", "TZ", "USER", "LOGNAME", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR",
 		"MOMENTUM_HOME", "MOMENTUM_CONFIG", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"}
@@ -294,13 +356,4 @@ func CleanEnv(extra map[string]string, bins ...string) []string {
 		env = append(env, k+"="+v)
 	}
 	return env
-}
-
-// tail copies the end of a reader, for a short excerpt of a long output.
-func tail(r io.Reader, n int) string {
-	b, _ := io.ReadAll(r)
-	if len(b) > n {
-		b = b[len(b)-n:]
-	}
-	return string(b)
 }

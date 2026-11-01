@@ -9,7 +9,7 @@ The standing question: which tool or infrastructure failures recur, what is the 
 
 ## The evidence
 
-A failures case holds tool results that failed (a guard's refusal, the harness's own refusal, a tool's error, a command that failed the setup's way), a model's refusals, or an incident detector's reports. Its signature says where it came from: `guard:NAME`, `harness:...`, `tool:NAME`, `mcp:SERVER`, `exec:PROGRAM`, `model:refusal`, `incident:...`.
+A failures case holds tool results that failed (a guard's refusal, the harness's own refusal, a tool's error, a command that failed the setup's way), a model's refusals, or an incident detector's reports. Its signature says where it came from: `guard:NAME`, `harness:...`, `turn:HARNESS` (a turn's error), `tool:NAME`, `mcp:SERVER`, `exec:` and the failed command's message (from the program's name when its call names one), `model:refusal`, `incident:...`.
 
 For each piece you open, read three things: the call that failed (the event just before, a tool call), the result, and what the agent did next (retried the same form, used the form the message offered, gave up, worked around).
 

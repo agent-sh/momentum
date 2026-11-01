@@ -71,12 +71,19 @@ type Outcome struct {
 	Tail    string  `json:"tail"` // the end of what it printed
 }
 
-// Sandbox runs a test in a bubblewrap sandbox: the whole filesystem read-only, but the tree under test, its own
-// scratch directory and the build caches the user's toolchains keep; no network; its own process tree, which ends
-// with it. A test of a change the loop made can then write nothing outside its tree.
+// Sandbox runs a test in a bubblewrap sandbox, every namespace its own and no capability: the root file system
+// read-only, with its own /tmp and /run (no socket of the user's session, his agent or a daemon is there) and his
+// home empty but for the toolchains it reads (ReadOnly); the tree under test, its scratch directory and the loop's
+// own build caches writable, the tree's .git read-only; no network; its own process tree, which ends with it. A
+// test of a change the loop made can then write nothing outside its tree, reach no service, and read none of the
+// user's files.
 type Sandbox struct {
 	Bwrap    string        // the bubblewrap binary
-	Writable []string      // the build caches it may write (Go's, Cargo's), when they exist
+	Home     string        // the user's home, which the test sees empty
+	ReadOnly []string      // the directories under the home the test reads: its toolchains and their caches
+	Cache    string        // the loop's own build caches, writable, which nothing of the user's reads
+	Scratch  string        // where each test's scratch directory goes
+	Path     []string      // the test's PATH: its toolchains' directories first
 	Timeout  time.Duration // how long a test may run
 	// Gate runs before each test and waits until the machine has room for it (capacity), or returns why not.
 	Gate func(ctx context.Context) error
@@ -85,27 +92,49 @@ type Sandbox struct {
 // DefaultTestTimeout is how long one run of a check's test may take: a package's suite, not the world's.
 const DefaultTestTimeout = 20 * time.Minute
 
-// Run runs words in dir and returns how it went. Its environment is the user's home and path, a scratch
-// directory of its own as TMPDIR, and the caches' variables.
+// Run runs words in dir and returns how it went. The environment is only what the test needs: its home, its
+// path, a scratch directory of its own as TMPDIR, the build caches' variables, and env's own entries (a
+// toolchain's settings). Nothing of the user's session reaches it.
 func (s Sandbox) Run(ctx context.Context, dir string, words []string, env []string) (Outcome, error) {
 	if s.Gate != nil {
 		if err := s.Gate(ctx); err != nil {
 			return Outcome{}, err
 		}
 	}
-	scratch, err := os.MkdirTemp(filepath.Dir(dir), ".check-")
+	base := s.Scratch
+	if base == "" {
+		base = filepath.Dir(dir)
+	}
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		return Outcome{}, err
+	}
+	scratch, err := os.MkdirTemp(base, ".check-")
 	if err != nil {
 		return Outcome{}, err
 	}
 	defer os.RemoveAll(scratch)
-	args := []string{"--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--bind", dir, dir, "--bind", scratch, scratch,
-		"--unshare-net", "--unshare-pid", "--die-with-parent", "--new-session", "--chdir", dir}
-	for _, w := range s.Writable {
-		if st, err := os.Stat(w); err == nil && st.IsDir() {
-			args = append(args, "--bind", w, w)
+	args := []string{"--unshare-all", "--die-with-parent", "--new-session", "--cap-drop", "ALL",
+		"--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run", "--tmpfs", "/var/tmp"}
+	if s.Home != "" {
+		args = append(args, "--tmpfs", s.Home)
+		for _, d := range s.ReadOnly {
+			if st, err := os.Stat(d); err == nil && st.IsDir() {
+				args = append(args, "--ro-bind", d, d)
+			}
 		}
 	}
-	args = append(append(args, "--"), words...)
+	args = append(args, "--bind", dir, dir, "--bind", scratch, scratch)
+	if st, err := os.Lstat(filepath.Join(dir, ".git")); err == nil && !st.IsDir() {
+		args = append(args, "--ro-bind", filepath.Join(dir, ".git"), filepath.Join(dir, ".git")) // its link to the repository stays the loop's
+	}
+	cache := s.Cache
+	if cache != "" {
+		if err := os.MkdirAll(filepath.Join(cache, "go-build"), 0o700); err != nil {
+			return Outcome{}, err
+		}
+		args = append(args, "--bind", cache, cache)
+	}
+	args = append(append(args, "--chdir", dir, "--"), words...)
 	timeout := s.Timeout
 	if timeout <= 0 {
 		timeout = DefaultTestTimeout
@@ -113,7 +142,7 @@ func (s Sandbox) Run(ctx context.Context, dir string, words []string, env []stri
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, s.Bwrap, args...)
-	cmd.Env = append(append([]string{}, env...), "TMPDIR="+scratch, "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = s.env(scratch, cache, env)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -131,6 +160,18 @@ func (s Sandbox) Run(ctx context.Context, dir string, words []string, env []stri
 		return o, fmt.Errorf("the sandbox did not run: %w", err)
 	}
 	return o, nil
+}
+
+// env is a test's whole environment.
+func (s Sandbox) env(scratch, cache string, extra []string) []string {
+	path := append(append([]string{}, s.Path...), "/usr/local/bin", "/usr/bin", "/bin")
+	env := []string{"HOME=" + firstOf(s.Home, scratch), "PATH=" + strings.Join(path, ":"), "TMPDIR=" + scratch, "LANG=C.UTF-8",
+		"GIT_TERMINAL_PROMPT=0", "GOTOOLCHAIN=local", "GOTELEMETRY=off", "GOPROXY=off", "CARGO_NET_OFFLINE=true"}
+	if cache != "" {
+		env = append(env, "GOCACHE="+filepath.Join(cache, "go-build"), "UV_CACHE_DIR="+filepath.Join(cache, "uv"),
+			"npm_config_cache="+filepath.Join(cache, "npm"))
+	}
+	return append(env, extra...)
 }
 
 func tailOf(b []byte, n int) string {

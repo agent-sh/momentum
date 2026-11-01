@@ -32,8 +32,13 @@ const usage = `usage:
                                         events, newest first; one session's (an id or its start) oldest first;
                                         H is claude, codex, pi, opencode or hermes
   momentum evidence status [--since DUR]   events per source and kind, and unparsed records
-  momentum evidence git DIR GITCOMMAND [ARG]...
-                                        a git command that reads (log, show, diff, blame, ...), in DIR's repository
+  momentum evidence show ID             an event, and the record of the transcript or log it names (scrubbed)
+  momentum evidence git DIR GITCOMMAND [ARG]... [-- PATH...]
+                                        a git command that reads (log, show, diff, blame, grep, ...) in DIR's
+                                        work tree, with only the options that read; revisions are checked,
+                                        paths come after --
+  momentum evidence file PATH [--tail N]   a file of the machine, scrubbed of secrets; not where credentials are
+  momentum evidence unit NAME [--lines N]  a user service's state and the end of its log, scrubbed
   momentum evidence rebuild SOURCE [--force]
                                         drop what SOURCE contributed; the next ingest reads it from the start
                                         (not sessions; transcripts and incidents only with --force: it says how
@@ -89,15 +94,18 @@ const usage = `usage:
                                         harness's agent, review and land what was proposed
   momentum loop runs [--since WHEN] [--case ID] [--json]
                                         the loop's runs, and what the live ones spent in the last day and week
-  momentum ship prepare (--repo DIR | --config DIR) [--case ID]
+  momentum loop lesson --case ID --text T
+                                        a case closed as improved: its lesson to tacit, as the loop's observation
+  momentum ship prepare --repo DIR [--case ID]
   momentum ship check --test CMD [--test-files F,F] [--case ID]
   momentum ship propose --title T --body-file F --rollback R --signal JSON [--window D] [--lesson L] [--case ID]
   momentum ship status [--case ID] [--json]
   momentum ship land ID
   momentum ship rollback ID --why W
                                         a case's change package: built in the loop's own work tree, checked by a
-                                        test that fails without it, proposed with its measurement and rollback,
-                                        landed only live and reviewed clean
+                                        test that fails without it, proposed as a pull request with its
+                                        measurement and rollback, revised for its review, landed only live and
+                                        reviewed clean
   momentum version
 Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json), and the
 capacity rules in its capacity section.
@@ -176,6 +184,12 @@ func evidence(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return rebuild(ctx, args[1:], stdout, stderr)
 	case "git":
 		return evidenceGit(ctx, args[1:], stdout, stderr)
+	case "show":
+		return evidenceShow(ctx, args[1:], stdout, stderr)
+	case "file":
+		return evidenceFile(ctx, args[1:], stdout, stderr)
+	case "unit":
+		return evidenceUnit(ctx, args[1:], stdout, stderr)
 	}
 	return usageError{fmt.Sprintf("unknown evidence command %q", args[0])}
 }
