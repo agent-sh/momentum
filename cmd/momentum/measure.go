@@ -79,7 +79,7 @@ func measureCmd(ctx context.Context, args []string, stdout, stderr io.Writer) er
 			due = m.Due.Local().Format(time.DateTime)
 		}
 		fmt.Fprintf(stdout, "%s %-11s due %s  %s\n", m.Case, m.Status, due, m.Title)
-		if m.Result.Effect != "" {
+		if m.Result != nil && m.Result.Effect != "" {
 			fmt.Fprintf(stdout, "  %s\n", m.Result.Effect)
 		}
 		if m.Why != "" {

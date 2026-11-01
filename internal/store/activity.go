@@ -26,6 +26,7 @@ func UnitOf(e Event, bySession bool) Unit {
 // ActivityQuery picks the units of activity over a span.
 type ActivityQuery struct {
 	Since, Until time.Time
+	ExcludeCwd   string // exclude this directory and its descendants
 	BySession    bool   // the sessions' hours; otherwise the machine's
 	Harness      string // when set, only that harness's events
 	Actor        Actor  // when set, only the hours in which it did something (the owner's turns, say)
@@ -38,6 +39,10 @@ func (s *Store) Activity(ctx context.Context, q ActivityQuery) (map[Unit]bool, e
 		return nil, errors.New("an activity span ends after it starts")
 	}
 	where, args := []string{"ts >= ?", "ts < ?"}, []any{q.Since.UnixMilli(), q.Until.UnixMilli()}
+	if q.ExcludeCwd != "" {
+		prefix := strings.TrimRight(q.ExcludeCwd, "/") + "/"
+		where, args = append(where, "cwd != ? AND instr(cwd, ?) != 1"), append(args, strings.TrimRight(q.ExcludeCwd, "/"), prefix)
+	}
 	if q.Harness != "" {
 		where, args = append(where, "harness = ?"), append(args, q.Harness)
 	}

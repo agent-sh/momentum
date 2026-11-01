@@ -931,16 +931,17 @@ func (s *Store) Origins(ctx context.Context, source string) (map[Origin]int, err
 // moment keep their order in the source (SourceKey). Until, when set, is the end of the window. Harness, when
 // set, is one of Harnesses: its events from every source.
 type Query struct {
-	Since   time.Time
-	Kinds   []string
-	Source  string
-	Session string
-	Until   time.Time
-	Limit   int
-	Harness string
-	Actor   Actor  // when set, only its events
-	Main    bool   // only a session's own events, not its subagents'
-	MetaHas string // when set, only events whose meta holds it, e.g. `"is_error":true`
+	Since      time.Time
+	Kinds      []string
+	Source     string
+	Session    string
+	Until      time.Time
+	Limit      int
+	Harness    string
+	Actor      Actor  // when set, only its events
+	ExcludeCwd string // exclude this directory and its descendants
+	Main       bool   // only a session's own events, not its subagents'
+	MetaHas    string // when set, only events whose meta holds it, e.g. `"is_error":true`
 }
 
 func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
@@ -953,6 +954,10 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 	}
 	if q.Source != "" {
 		where, args = append(where, "source = ?"), append(args, q.Source)
+	}
+	if q.ExcludeCwd != "" {
+		prefix := strings.TrimRight(q.ExcludeCwd, "/") + "/"
+		where, args = append(where, "cwd != ? AND instr(cwd, ?) != 1"), append(args, strings.TrimRight(q.ExcludeCwd, "/"), prefix)
 	}
 	if q.Harness != "" {
 		where, args = append(where, "harness = ?"), append(args, q.Harness)

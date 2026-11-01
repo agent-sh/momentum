@@ -1254,11 +1254,40 @@ func (s *Store) StartMeasuring(ctx context.Context, id string, window time.Durat
 		CaseMeasuring, window.Milliseconds(), before, from.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
-	if err := caseLog(ctx, tx, c.ID, actor, "measuring", fmt.Sprintf("in effect from %s; %d in the %s before its change; the %s after it is due %s",
-		from.Format(time.DateTime), before, days(window), days(window), from.Add(window).Format(time.DateTime)), now); err != nil {
+	if err := caseLog(ctx, tx, c.ID, actor, "measuring", fmt.Sprintf("in effect from %s; %d in its baseline; the %s after it is due %s",
+		from.Format(time.DateTime), before, days(window), from.Add(window).Format(time.DateTime)), now); err != nil {
 		return Case{}, err
 	}
 	if c, err = getCase(ctx, tx, c.ID); err != nil {
+		return Case{}, err
+	}
+	return c, tx.Commit()
+}
+
+// RestartMeasuring starts a fresh window after a measuring change is in effect again. The old window decides
+// nothing; the deployed time and the log record the restart.
+func (s *Store) RestartMeasuring(ctx context.Context, id string, from time.Time, actor string) (Case, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Case{}, err
+	}
+	defer tx.Rollback()
+	c, err := getCase(ctx, tx, id)
+	if err != nil {
+		return Case{}, err
+	}
+	if c.Status != CaseMeasuring || !from.After(c.Deployed) {
+		return Case{}, badCase("case %s needs a later in-effect time while measuring", id)
+	}
+	now := time.Now()
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET deployed = ?, updated = ? WHERE id = ?`, from.UnixMilli(), now.UnixMilli(), id); err != nil {
+		return Case{}, err
+	}
+	if err := caseLog(ctx, tx, id, actor, "measuring restarted", "in effect again from "+from.Format(time.DateTime), now); err != nil {
+		return Case{}, err
+	}
+	c, err = getCase(ctx, tx, id)
+	if err != nil {
 		return Case{}, err
 	}
 	return c, tx.Commit()

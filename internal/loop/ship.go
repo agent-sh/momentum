@@ -90,6 +90,9 @@ type Package struct {
 	Result           *measure.Result `json:"result,omitempty"`
 	Problem          string          `json:"problem,omitempty"`
 	Held             bool            `json:"held,omitempty"`
+	WatchReference   *measure.Counts `json:"watch_reference,omitempty"` // measurement after plus earlier watched windows
+	WatchWindow      int             `json:"watch_window,omitempty"`    // last completed window read since the close
+	OutOfEffect      time.Time       `json:"out_of_effect,omitzero"`    // first run that found the measuring change absent
 	RollbackFailures int             `json:"rollback_failures,omitempty"`
 }
 
@@ -105,18 +108,19 @@ type Check struct {
 	At        time.Time `json:"at"`
 }
 
-// Plan is how the change is measured: a signal over the store's events, counted in units of activity over a
-// window before the change and as long after it is in effect (internal/measure).
+// Plan is how the change is measured: a signal over the store's events, counted in units of activity over
+// the three windows before the gated window and one window after it is in effect (internal/measure).
 type Plan struct {
 	Signal     Signal        `json:"signal"`
 	Window     time.Duration `json:"window"`
 	Units      string        `json:"units"`       // what it counts in: session hours, owner hours or machine hours
-	Before     int           `json:"before"`      // the units the signal counted in the window before the proposal
+	Before     int           `json:"before"`      // the units the signal counted in the three windows before the gate
 	BeforeBase int           `json:"before_base"` // the units of activity in it
-	At         time.Time     `json:"at"`          // when it was counted: the window before ends here
+	Gate       int           `json:"gate"`        // hits in the last window before the plan
+	GateBase   int           `json:"gate_base"`   // activity in that window
+	At         time.Time     `json:"at"`          // when it was counted: the gated window ends here
 	// Installed is the file the machine runs the change from when that is no file of the repository's checkout (a
-	// binary built from it, an installed configuration): the change is in effect once the file changed after the
-	// landing.
+	// binary built from it, an installed configuration): the file must change after the checkout took the change.
 	Installed string `json:"installed,omitempty"`
 }
 
@@ -567,8 +571,8 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package
 	if err := s.save(&p); err != nil {
 		return p, err
 	}
-	return p, s.Store.CaseNote(ctx, caseID, "proposed", fmt.Sprintf("%s %s; measured in %s: %d of %d in the %s before", p.PR, title, plan.Units,
-		plan.Before, plan.BeforeBase, days(pr.Window)), s.Actor)
+	return p, s.Store.CaseNote(ctx, caseID, "proposed", fmt.Sprintf("%s %s; measured in %s: %d of %d in the %s baseline; gate %d of %d in the last %s", p.PR, title, plan.Units,
+		plan.Before, plan.BeforeBase, days(measure.BaselineWindows*pr.Window), plan.Gate, plan.GateBase, days(pr.Window)), s.Actor)
 }
 
 // validPlan checks a measurement plan and returns it, counted at at: a signal that names a source, kinds and at
@@ -596,16 +600,16 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 			return Plan{}, refused("the file the change is installed in, %s, is no file here", installed)
 		}
 	}
-	got, err := Count(ctx, s.Store, sig, at.Add(-window), at)
+	got, err := Count(ctx, s.Store, sig, at.Add(-window), at, s.Dir)
 	if err != nil {
 		return Plan{}, err
 	}
 	plan := Plan{Signal: sig, Window: window, Units: unitsOf(got), At: at, Installed: installed}
-	before, err := tally(ctx, s.Store, sig, plan.Units, got, at.Add(-window), at)
+	before, err := tally(ctx, s.Store, sig, plan.Units, got, at.Add(-window), at, s.Dir)
 	if err != nil {
 		return Plan{}, err
 	}
-	plan.Before, plan.BeforeBase = before.Hits, before.Base
+	plan.Gate, plan.GateBase = before.Hits, before.Base
 	if before.Hits < MinSignal {
 		return Plan{}, refused("the signal counts events in %d %s of the %s before, fewer than %d: no window could show an effect", before.Hits,
 			plan.Units, days(window), MinSignal)
@@ -624,7 +628,7 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 			continue
 		}
 		events++
-		if e.At.Before(at.Add(-window)) {
+		if e.At.Before(at.Add(-window)) || !e.At.Before(at) {
 			continue
 		}
 		in++
@@ -640,6 +644,14 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 	case hit*2 < in:
 		return Plan{}, refused("the signal counts %d of the case's %d events in the window: it does not measure the case's problem", hit, in)
 	}
+	baseline, err := Tally(ctx, s.Store, sig, plan.Units, at.Add(-(measure.BaselineWindows+1)*window), at.Add(-window), s.Dir)
+	if err != nil {
+		return Plan{}, err
+	}
+	if !measure.Measurable(baseline, 2*plan.GateBase) {
+		return Plan{}, refused("the problem is too new or too rare to measure with that window: a shorter window reads more recent history")
+	}
+	plan.Before, plan.BeforeBase = baseline.Hits, baseline.Base
 	return plan, nil
 }
 
@@ -684,13 +696,16 @@ func (s *Ship) editsSignal(ctx context.Context, p Package, sig Signal) error {
 }
 
 // Count is the events a signal counts over a span.
-func Count(ctx context.Context, st *store.Store, sig Signal, since, until time.Time) ([]store.Event, error) {
-	evs, err := st.Events(ctx, store.Query{Since: since, Until: until, Source: sig.Source, Kinds: sig.Kinds, Harness: sig.Harness, Limit: 1_000_000})
+func Count(ctx context.Context, st *store.Store, sig Signal, since, until time.Time, excludeCwd string) ([]store.Event, error) {
+	evs, err := st.Events(ctx, store.Query{Since: since, Until: until, ExcludeCwd: excludeCwd, Source: sig.Source, Kinds: sig.Kinds, Harness: sig.Harness, Limit: 1_000_000})
 	if err != nil {
 		return nil, err
 	}
 	var out []store.Event
 	for _, e := range evs {
+		if e.Kind == "tool_result" && !strings.Contains(e.Meta, `"is_error":true`) {
+			continue
+		}
 		if sig.Tool != "" && e.Tool != sig.Tool {
 			continue
 		}
@@ -792,7 +807,10 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 		}
 		if p.LandingHead != "" {
 			if _, err := s.git(ctx, p.Work, "merge-base", "--is-ancestor", p.LandingHead, "origin/"+p.Base); err == nil {
-				p.Head, p.State, p.LandedAt = p.LandingHead, Landed, s.now()
+				p.Head, p.State = p.LandingHead, Landed
+				if p.LandedAt.IsZero() {
+					p.LandedAt = s.now()
+				}
 				if err := s.save(&p); err != nil {
 					return p, err
 				}
@@ -956,7 +974,7 @@ func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error
 }
 
 // InEffect says whether a landed change is in effect where the loop can see it, and since when: the repository's
-// checkout holds its commits, and the file it is installed in, when its plan names one, changed after the landing.
+// checkout holds its commits, and the file it is installed in, when its plan names one, changed after the checkout took the change.
 // Otherwise it says what it waits for.
 func (s *Ship) InEffect(ctx context.Context, p Package) (time.Time, string, error) {
 	switch {
@@ -969,13 +987,30 @@ func (s *Ship) InEffect(ctx context.Context, p Package) (time.Time, string, erro
 	if _, err := s.git(ctx, p.Dir, "merge-base", "--is-ancestor", last, "HEAD"); err != nil {
 		return time.Time{}, fmt.Sprintf("the repository's checkout does not hold %.12s yet", last), nil
 	}
+	checkoutAt := p.LandedAt
+	var newest time.Time
+	for _, path := range p.Changed {
+		st, err := os.Stat(filepath.Join(p.Dir, path))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return time.Time{}, "", err
+		}
+		if st.ModTime().After(newest) {
+			newest = st.ModTime()
+		}
+	}
+	if !newest.IsZero() {
+		checkoutAt = newest
+	}
 	if p.Plan.Installed != "" {
 		st, err := os.Stat(expandHome(p.Plan.Installed))
 		if err != nil {
 			return time.Time{}, fmt.Sprintf("%s, where it is installed, is not there", filepath.Base(p.Plan.Installed)), nil
 		}
-		if !st.ModTime().After(p.LandedAt) {
-			return time.Time{}, fmt.Sprintf("%s, where it is installed, has not changed since the landing", filepath.Base(p.Plan.Installed)), nil
+		if !st.ModTime().After(checkoutAt) {
+			return time.Time{}, fmt.Sprintf("%s, where it is installed, has not changed since the checkout held the change", filepath.Base(p.Plan.Installed)), nil
 		}
 	}
 	return s.now(), "", nil
@@ -987,6 +1022,8 @@ func (s *Ship) Keep(caseID string, res measure.Result) (Package, error) {
 	switch {
 	case err != nil:
 		return p, err
+	case ok && p.State == Kept:
+		return p, nil
 	case !ok || p.State != Landed:
 		return p, refused("case %s has no landed package to keep", caseID)
 	}
@@ -1060,10 +1097,10 @@ func (s *Ship) packageText(c store.Case, p Package) string {
 	fmt.Fprintf(&b, "- Check: `%s` fails without the change (exit %d) and passes with it (%.0f s).\n", strings.Join(p.Check.Test, " "),
 		p.Check.Before.Exit, p.Check.After.Seconds)
 	sig, _ := json.Marshal(p.Plan.Signal)
-	fmt.Fprintf(&b, "- Measurement: the signal `%s` counted events in %d of %d %s in the %s before; the same window after the change is in effect is compared with it (Fisher's exact test, one-sided, p below 0.05).\n",
-		sig, p.Plan.Before, p.Plan.BeforeBase, p.Plan.Units, days(p.Plan.Window))
+	fmt.Fprintf(&b, "- Measurement: the signal `%s` counted events in %d of %d %s in the %s baseline before the gated window; the gate counted %d of %d in its last %s. The %s after the change is in effect is compared with the baseline (Fisher's exact test, one-sided, p below 0.05).\n",
+		sig, p.Plan.Before, p.Plan.BeforeBase, p.Plan.Units, days(measure.BaselineWindows*p.Plan.Window), p.Plan.Gate, p.Plan.GateBase, days(p.Plan.Window), days(p.Plan.Window))
 	if p.Plan.Installed != "" {
-		fmt.Fprintf(&b, "- In effect once `%s`, where it is installed, changed after the landing.\n", filepath.Base(p.Plan.Installed))
+		fmt.Fprintf(&b, "- In effect once `%s`, where it is installed, changed after the checkout took the change.\n", filepath.Base(p.Plan.Installed))
 	}
 	fmt.Fprintf(&b, "- Rollback: %s\n", p.Rollback)
 	b.WriteString("\nOpened by momentum's improvement loop. It lands by fast-forward only after a clean-context review finds nothing high or medium.\n")

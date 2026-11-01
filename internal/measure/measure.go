@@ -24,6 +24,9 @@ const Alpha = 0.05
 // (Measurable).
 const MinBefore = 5
 
+// BaselineWindows counts the three windows before the one selected by the gate.
+const BaselineWindows = 3
+
 // Counts are a window's: the units of activity in which the signal counts an event, and the units of activity.
 type Counts struct {
 	Hits int `json:"hits"`
@@ -71,11 +74,18 @@ func Measurable(before Counts, afterBase int) bool {
 	return tail(0, before.Base+afterBase, before.Hits, afterBase) < Alpha
 }
 
-// Back reports whether a problem a change helped is back at its old rate: over a window as long as its
-// measurement's, its share of the activity is at least what it was before the change, and it counts at least
-// MinBefore units, the least any measurement could tell from chance.
-func Back(before, recent Counts) bool {
-	return recent.Hits >= MinBefore && recent.Hits*before.Base >= before.Hits*recent.Base
+// Back tests a completed watch window against the pooled reference, by Fisher's upper tail.
+// The reference holds the measured window after and every earlier window that did not bring the case back.
+// Window j spends Alpha / 2^j, starting at one. The levels sum to Alpha over all windows.
+// Its share must also reach the baseline's, in at least MinBefore units.
+func Back(before, reference, recent Counts, window int) bool {
+	if window < 1 || before.Base == 0 || reference.Base == 0 || recent.Base == 0 ||
+		recent.Hits < MinBefore || recent.Rate() < before.Rate() || recent.Rate() <= reference.Rate() {
+		return false
+	}
+	// Exchange the windows: the lower tail of the reference count is the upper tail of the recent count.
+	p := tail(reference.Hits, reference.Base+recent.Base, reference.Hits+recent.Hits, reference.Base)
+	return p < math.Ldexp(Alpha, -window)
 }
 
 func percent(x float64) string { return fmt.Sprintf("%.2f%%", 100*x) }
