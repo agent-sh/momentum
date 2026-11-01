@@ -224,6 +224,7 @@ func (r *runner) record(ctx context.Context) error {
 			if _, _, err := r.st.DoneNote(ctx, n.ID, r.now); err != nil {
 				return err
 			}
+		case rule == RuleUV && class == "busy" && r.blind != "": // a look that may not see the holders: the hold goes on
 		case ran[rule] && groups[rule+"\x00"+class] == nil:
 			if err := r.ended(ctx, n.ID); err != nil {
 				return err
@@ -617,7 +618,8 @@ func signedGiB(n int64) string {
 
 // recordFull puts a disk's full note once per stretch above its full percent, dated when the stretch began, and
 // resolves it when the disk drops below. A run that set the stretch's mark and put no note (an older build's, on an id
-// the store refused, or one that died between the two) leaves it to the next.
+// the store refused, or one that died between the two) leaves it to the next, and so does one that cleared the mark
+// and did not resolve the note.
 func (r *runner) recordFull(ctx context.Context, d DiskState) error {
 	id := fullID(d.Disk)
 	open, err := r.st.Mark(ctx, "full-open:"+d.Disk)
@@ -643,13 +645,19 @@ func (r *runner) recordFull(ctx context.Context, d DiskState) error {
 			Title:  fmt.Sprintf("%s is %.0f%% used, above %.0f%%: %s free", d.Disk, d.pctFull, r.cfg.Fill.Full, gib(d.Avail)),
 			Detail: "Capacity deletes only what its rules find idle; momentum capacity --dry-run --all lists what they leave, and why."})
 		return err
-	case !full && !open.IsZero():
+	case !full:
+		// the mark goes first: a run that dies before the note goes leaves it standing with no mark, and the next
+		// resolves it, where a mark on a resolved note would read as the owner's resolution
+		if !open.IsZero() {
+			if err := r.st.ClearMark(ctx, "full-open:"+d.Disk); err != nil {
+				return err
+			}
+		}
 		if had && n.Done.IsZero() {
 			if _, _, err := r.st.DoneNote(ctx, id, r.now); err != nil {
 				return err
 			}
 		}
-		return r.st.ClearMark(ctx, "full-open:"+d.Disk)
 	}
 	return nil
 }

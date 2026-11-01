@@ -223,6 +223,10 @@ func TestAUVHoldIsAProblemOnlyOnceItHasLastedADay(t *testing.T) {
 	if n, ok := standing(); !ok || n.At.UnixMilli() != t0.Add(26*time.Hour).UnixMilli() {
 		t.Fatalf("and is a problem once it has waited it, a blind run in it or not: %+v %v", n, ok)
 	}
+	runIn(blind, t0.Add(51*time.Hour), "Removed 3 files (1.0GiB)\n")
+	if n, ok := standing(); !ok {
+		t.Fatalf("a blind run leaves the hold's note standing: %+v", n)
+	}
 }
 
 func TestTheUVCacheUnderItsSizeIsPrunedWeekly(t *testing.T) {

@@ -912,8 +912,9 @@ func TestAnOlderBuildsEndedFillEndsAsAFillEndsNow(t *testing.T) {
 		must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: at, Procs: 2},
 			[]store.DiskSample{{Disk: dir, At: at, Size: 1 << 40, Used: used, Avail: 1 << 39}}, nil))
 	}
-	for _, at := range []time.Time{start, last} {
-		meta, _ := json.Marshal(DiskState{Disk: dir, Fast: true, WindowMS: at.Sub(base).Milliseconds(),
+	// the first run read its rate from base, the last from its own window, 10 minutes back
+	for at, window := range map[time.Time]time.Duration{start: start.Sub(base), last: 10 * time.Minute} {
+		meta, _ := json.Marshal(DiskState{Disk: dir, Fast: true, WindowMS: window.Milliseconds(),
 			Writers: []Writer{{PID: 61, Comm: "rsync", Cwd: dir, Written: 4 << 30, Over: 300}}})
 		_, err := st.Put(ctx, []store.Event{{Source: store.Capacity, SourceKey: fmt.Sprintf("fill/%s/%d", dir, at.UnixMilli()), TS: at,
 			Actor: store.ActorDetector, Kind: KindFill, Summary: "x", Meta: string(meta)}})

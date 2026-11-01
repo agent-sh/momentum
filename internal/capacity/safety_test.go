@@ -449,6 +449,28 @@ func TestADiskWhosePathHoldsASpaceHasItsNotes(t *testing.T) {
 			t.Errorf("%s: resolved: %+v", id, n)
 		}
 	}
+	// a run that died between a new stretch's mark and its note, the last stretch's note resolved: the next run that
+	// finds the disk full puts it, dated from the mark
+	stretch = now.Add(50 * time.Minute)
+	must(t, st.SetMark(ctx, "full-open:"+dir, stretch))
+	cfg.Fill.Full = 0.001
+	o.Clock = func() time.Time { return now.Add(55 * time.Minute) }
+	if _, err := Run(ctx, cfg, st, o); err != nil {
+		t.Fatal(err)
+	}
+	if n, _, _ := st.Note(ctx, "capacity:full:"+key); !n.Done.IsZero() || n.At.UnixMilli() != stretch.UnixMilli() {
+		t.Errorf("a new stretch's mark with no note of its own: the note comes, dated from the mark: %+v", n)
+	}
+	// a run that died once the stretch's mark went and before its note did: below the line, the note goes
+	must(t, st.ClearMark(ctx, "full-open:"+dir))
+	cfg.Fill.Full = 100
+	o.Clock = func() time.Time { return now.Add(60 * time.Minute) }
+	if _, err := Run(ctx, cfg, st, o); err != nil {
+		t.Fatal(err)
+	}
+	if n, _, _ := st.Note(ctx, "capacity:full:"+key); n.Done.IsZero() {
+		t.Errorf("a full note that stands with no mark goes once the disk is below the line: %+v", n)
+	}
 	if n, ok, _ := st.Note(ctx, "capacity:filled:"+key); !ok || n.Kind != store.NoteDecided ||
 		!strings.HasPrefix(n.Title, dir+" filled fast from ") {
 		t.Errorf("the fill that ended is a decided note: %+v", n)
