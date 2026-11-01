@@ -15,9 +15,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -70,6 +72,8 @@ type Settings struct {
 type Result struct {
 	Status     string // store.RunOK, RunFailed, RunBudget, RunTurns, RunTimeout
 	Failure    string // how it failed, when it did: a short key the stop rule compares
+	CostKnown  bool
+	TurnsKnown bool
 	USD        float64
 	Tokens     int64
 	Turns      int
@@ -132,7 +136,7 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 		"--append-system-prompt-file", system,
 		"--model", a.Model,
 		"--max-turns", fmt.Sprint(inv.MaxTurns),
-		"--max-budget-usd", fmt.Sprintf("%.2f", inv.BudgetUSD),
+		"--max-budget-usd", strconv.FormatFloat(inv.BudgetUSD, 'f', -1, 64),
 		"--json-schema", inv.Schema)
 	if a.Fallback != "" {
 		args = append(args, "--fallback-model", a.Fallback)
@@ -228,17 +232,37 @@ func StopScope(unit string) {
 // fallback model: Opus first, Sonnet when Opus fails. The result says which model ran (Model) and counts both
 // runs' cost.
 func (a Agent) RunOrFallback(ctx context.Context, inv Invocation) (Result, error) {
-	res, err := a.Run(ctx, inv)
+	deadline, cancel := context.WithTimeout(ctx, inv.Timeout)
+	defer cancel()
+	started := time.Now()
+	res, err := a.Run(deadline, inv)
 	if err != nil || res.Failure != "the model's safeguards" || a.Fallback == "" || a.Fallback == a.Model {
 		return res, err
 	}
+	if !res.CostKnown || !res.TurnsKnown {
+		res.USD = inv.BudgetUSD
+		return res, nil
+	}
 	first := res
+	inv.BudgetUSD -= first.USD
+	inv.MaxTurns -= first.Turns
+	inv.Timeout -= time.Since(started)
+	if inv.BudgetUSD <= 0 || inv.MaxTurns <= 0 || inv.Timeout <= 0 || deadline.Err() != nil {
+		return first, nil
+	}
 	b := a
 	b.Model, b.Fallback = a.Fallback, ""
-	os.Rename(filepath.Join(inv.Dir, "transcript.jsonl"), filepath.Join(inv.Dir, "transcript.refused.jsonl"))
-	res, err = b.Run(ctx, inv)
+	if err := os.Rename(filepath.Join(inv.Dir, "transcript.jsonl"), filepath.Join(inv.Dir, "transcript.refused.jsonl")); err != nil {
+		return first, err
+	}
+	res, err = b.Run(deadline, inv)
+	if !res.CostKnown {
+		res.USD = inv.BudgetUSD
+	}
 	res.USD += first.USD
+	res.CostKnown = true
 	res.Tokens += first.Tokens
+	res.Turns += first.Turns
 	res.Duration += first.Duration
 	return res, err
 }
@@ -264,8 +288,8 @@ func readStream(path string) (Result, error) {
 			Type              string          `json:"type"`
 			Subtype           string          `json:"subtype"`
 			IsError           bool            `json:"is_error"`
-			NumTurns          int             `json:"num_turns"`
-			TotalCostUSD      float64         `json:"total_cost_usd"`
+			NumTurns          *int            `json:"num_turns"`
+			TotalCostUSD      *float64        `json:"total_cost_usd"`
 			Result            string          `json:"result"`
 			StructuredOutput  json.RawMessage `json:"structured_output"`
 			SessionID         string          `json:"session_id"`
@@ -281,8 +305,14 @@ func readStream(path string) (Result, error) {
 			continue
 		}
 		found = true
-		res = Result{USD: r.TotalCostUSD, Turns: r.NumTurns, Text: r.Result, Report: r.StructuredOutput, Session: r.SessionID,
+		res = Result{Text: r.Result, Report: r.StructuredOutput, Session: r.SessionID,
 			Denials: len(r.PermissionDenials), Tokens: r.Usage.Input + r.Usage.Output + r.Usage.CacheRead + r.Usage.CacheCreate}
+		if r.TotalCostUSD != nil && *r.TotalCostUSD >= 0 && !math.IsInf(*r.TotalCostUSD, 0) && !math.IsNaN(*r.TotalCostUSD) {
+			res.USD, res.CostKnown = *r.TotalCostUSD, true
+		}
+		if r.NumTurns != nil && *r.NumTurns >= 0 {
+			res.Turns, res.TurnsKnown = *r.NumTurns, true
+		}
 		res.Status, res.Failure = resultStatus(r.Subtype, r.IsError, len(r.StructuredOutput) > 0)
 		if res.Status == store.RunFailed && r.IsError && r.Subtype == "success" {
 			res.Failure = errorKind(r.Result)

@@ -423,7 +423,12 @@ func tmuxServer(t *testing.T) (sock string, run func(args ...string) string) {
 		t.Skip("no tmux")
 	}
 	dir := t.TempDir()
-	sock = filepath.Join(dir, "tmux.sock")
+	socketDir, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { socketDir.Close() })
+	sock = fmt.Sprintf("/proc/%d/fd/%d/tmux.sock", os.Getpid(), socketDir.Fd())
 	// The server and its shells get a home of their own: an interactive shell saves its history there, not in
 	// the home of whoever runs the test.
 	env := append(os.Environ(), "HOME="+dir, "HISTFILE="+filepath.Join(dir, "history"))

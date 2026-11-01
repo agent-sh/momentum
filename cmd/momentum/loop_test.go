@@ -31,6 +31,7 @@ func gitIn(t *testing.T, dir string, args ...string) string {
 // an argument before `--` is a revision of the repository, checked; a path comes after `--`, inside the
 // repository. The loop's agent reads history through it and runs no git of its own.
 func TestEvidenceGitOnlyReads(t *testing.T) {
+	fakeScrubber(t)
 	dir := t.TempDir()
 	gitIn(t, dir, "init", "-q", "-b", "main")
 	os.WriteFile(filepath.Join(dir, "a.txt"), []byte("one\ntwo\n"), 0o600)
@@ -237,6 +238,9 @@ func TestALessonIsTheLoopsObservation(t *testing.T) {
 		t.Fatalf("exit %d %q %s", code, out, errOut)
 	}
 	got, _ := os.ReadFile(args)
+	if !strings.HasSuffix(string(got), "\nmomentum-lesson-"+strings.ToLower(c.ID)+"\n") {
+		t.Errorf("tacit add lacks the lesson's name, its last argument:\n%s", got)
+	}
 	for _, want := range []string{"--harness\nclaude", "--kind\nobserved", "--scope\nprojects/fake"} {
 		if !strings.Contains(string(got), want) {
 			t.Errorf("tacit add lacks %q:\n%s", want, got)

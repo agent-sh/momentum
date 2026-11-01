@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -176,7 +177,7 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		return done, picked
 	}
 	if !o.Dry {
-		done = append(done, r.reviews(ctx, o.Case)...)
+		done = append(done, r.reviews(ctx, o.Case, families...)...)
 	}
 	sort.Slice(done, func(i, j int) bool { return done[i].Family+done[i].Step < done[j].Family+done[j].Step })
 	return done, nil
@@ -186,17 +187,20 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 // that ran them. What such a run spent is unknown, so it counts its whole budget, and its scope is stopped with
 // whatever it left running.
 func (r *Runner) endStale(ctx context.Context) error {
-	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Since: r.now().Add(-7 * 24 * time.Hour)})
+	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{})
 	if err != nil {
 		return err
 	}
 	for _, run := range runs {
 		if run.Status == store.RunRunning && r.now().Sub(run.Started) > r.Budgets.RunTime+15*time.Minute {
-			run.Status, run.Failure, run.Ended, run.USD = store.RunFailed, "killed", r.now(), max(run.USD, r.Budgets.Run)
+			run.Status, run.Failure, run.Ended = store.RunFailed, "killed", r.now()
+			if run.USD == 0 {
+				run.USD = r.Budgets.Run
+			}
 			if r.Agent.Scope && run.Dir != "" {
 				StopScope(ScopeUnit(run.Dir))
 			}
-			if err := r.Store.PutLoopRun(ctx, run); err != nil {
+			if err := r.Store.FinishLoopRun(ctx, run); err != nil {
 				return err
 			}
 		}
@@ -231,7 +235,7 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 			step, rank = StepBuild, 3
 			if p, ok, err := r.Ship.Load(c.ID); err != nil {
 				return store.Case{}, "", "", err
-			} else if ok && p.State == Proposed {
+			} else if ok && (p.State == Proposed || p.State == Landing) {
 				if n := len(p.Reviews); n >= MaxRounds && !p.Clean() && p.Reviews[n-1].Head == p.Head {
 					passed = append(passed, c.ID+" used its review rounds")
 				}
@@ -281,14 +285,19 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 	return cands[0].c, cands[0].step, fmt.Sprintf("%s %s (%s, %d evidence)", cands[0].step, cands[0].c.ID, cands[0].c.Status, cands[0].c.Evidence), nil
 }
 
-// published reports whether a case's lesson went to tacit: a publish run of it that ended well.
+// LessonRetry is how long a lesson whose write left no receipt waits before a publish run tries it again.
+const LessonRetry = 24 * time.Hour
+
+// published says whether a case's publish step is done for now: the lesson command left its receipt on the case
+// (never the harness's outcome: a run that ended well may have published nothing), or it reserved the lesson
+// within the last LessonRetry and tacit's write did not go through, which waits that long before it is tried again.
 func (r *Runner) published(ctx context.Context, id string) bool {
-	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: id})
+	entries, err := r.Store.CaseLog(ctx, id)
 	if err != nil {
 		return true // unread: do not publish twice
 	}
-	for _, run := range runs {
-		if run.Step == StepPublish && run.Status == store.RunOK {
+	for _, entry := range entries {
+		if entry.Action == store.LessonPublished || entry.Action == store.LessonReserved && r.now().Sub(entry.At) < LessonRetry {
 			return true
 		}
 	}
@@ -347,7 +356,7 @@ func (r *Runner) reserve(ctx context.Context, family, caseID, step string) (stor
 		r.Store.PutLoopRun(ctx, run)
 		return run, run.Failure
 	}
-	run.Dir, run.Status = filepath.Join(r.Dir, "runs", run.ID), store.RunRunning
+	run.Dir, run.Status, run.USD = filepath.Join(r.Dir, "runs", run.ID), store.RunRunning, r.Budgets.Run
 	if err := r.Store.PutLoopRun(ctx, run); err != nil {
 		return run, err.Error()
 	}
@@ -367,6 +376,10 @@ func (r *Runner) step(ctx context.Context, family string, c store.Case, step str
 
 // finish records how a run ended, on the run and on its case.
 func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, res Result, err error) {
+	reserved := run.USD
+	if reserved == 0 {
+		reserved = r.Budgets.Run
+	}
 	run.Ended = r.now()
 	if err != nil {
 		run.Status, run.Failure = store.RunFailed, err.Error()
@@ -377,17 +390,12 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 			run.Summary = summaryOf(res)
 		}
 	}
-	if run.USD == 0 && run.Status != store.RunOK {
-		run.USD = r.Budgets.Run // what it spent is unknown: its whole budget
+	if !res.CostKnown {
+		run.USD = reserved // what it spent is unknown: its whole budget
 	}
-	if err := r.Store.PutLoopRun(ctx, *run); err != nil {
+	if err := r.Store.FinishLoopRun(ctx, *run); err != nil {
 		r.logf("record run %s: %v", run.ID, err)
 	}
-	if _, err := r.Store.AddCaseCost(ctx, c.ID, store.Cost{USD: run.USD, Tokens: run.Tokens, Duration: run.Ended.Sub(run.Started), Runs: 1},
-		"loop:"+run.ID); err != nil {
-		r.logf("cost of run %s: %v", run.ID, err)
-	}
-	r.Store.CaseNote(ctx, c.ID, "run", fmt.Sprintf("%s %s: %s %s", run.Step, run.ID, run.Status, firstOf(run.Failure, run.Summary)), "loop:"+run.ID)
 }
 
 // affordable says why no run may start now: the day's or the week's spend, with the runs in flight counted at
@@ -518,7 +526,7 @@ func mcpServers(path string) []string {
 // reviews runs the clean-context review of each proposed change that has none on its head, posts it, and lands
 // the change when it is clean and the loop is live. A review run is a run: the stop rule, the case's budget and
 // the loop's budgets hold it as they hold any other.
-func (r *Runner) reviews(ctx context.Context, only string) []Done {
+func (r *Runner) reviews(ctx context.Context, only string, families ...string) []Done {
 	var out []Done
 	cs, err := r.Store.Cases(ctx, store.CaseFilter{Statuses: []store.CaseStatus{store.CaseTesting}})
 	if err != nil {
@@ -526,12 +534,23 @@ func (r *Runner) reviews(ctx context.Context, only string) []Done {
 		return nil
 	}
 	for _, c := range cs {
+		if len(families) > 0 && !slices.Contains(families, c.Family) {
+			continue
+		}
 		if only != "" && c.ID != only {
 			continue
 		}
 		p, ok, err := r.Ship.Load(c.ID)
-		if err != nil || !ok || p.State != Proposed {
+		if err != nil || !ok || (p.State != Proposed && p.State != Landing) {
 			continue
+		}
+		if n := len(p.Reviews); n > 0 && p.Reviews[n-1].Head == p.Head && p.Reviews[n-1].Comment == "" {
+			var err error
+			p, err = r.postReview(ctx, p)
+			if err != nil {
+				out = append(out, Done{Family: c.Family, Case: c.ID, Step: StepReview, Skipped: err.Error()})
+				continue
+			}
 		}
 		if p.Clean() {
 			if _, err := r.Ship.Land(ctx, c.ID); err != nil {
@@ -580,18 +599,13 @@ func (r *Runner) review(ctx context.Context, c store.Case, p Package, run store.
 		} else {
 			text := reviewText(len(p.Reviews)+1, h, m, l, rep.Summary, rep.Findings)
 			rev := Review{Findings: rep.Findings, Text: text}
-			if r.Post != nil && p.PR != "" {
-				if pub, perr := r.Ship.public(ctx, text); perr != nil {
-					r.logf("the review of %s is not posted: %v", c.ID, perr)
-				} else if url, perr := r.Post(ctx, p.Repo, p.PR, pub); perr != nil {
-					r.logf("post the review of %s: %v", c.ID, perr)
-				} else {
-					rev.Comment, rev.Text = url, pub
-				}
+			saved, saveErr := r.Ship.Reviewed(ctx, c.ID, rev)
+			if saveErr != nil {
+				res.Status, res.Failure = store.RunFailed, saveErr.Error()
+			} else if _, postErr := r.postReview(ctx, saved); postErr != nil {
+				r.logf("post the review of %s: %v", c.ID, postErr)
 			}
-			if _, err := r.Ship.Reviewed(ctx, c.ID, rev); err != nil {
-				res.Status, res.Failure = store.RunFailed, err.Error()
-			}
+
 			run.Summary = fmt.Sprintf("%d high, %d medium, %d low: %s", h, m, l, rep.Summary)
 		}
 	}
@@ -686,4 +700,31 @@ func plainClip(s string, n int) string {
 		return string(r[:n-1]) + "…"
 	}
 	return s
+}
+
+// postReview retries the saved review, without another model invocation or review round.
+func (r *Runner) postReview(ctx context.Context, p Package) (Package, error) {
+	n := len(p.Reviews) - 1
+	if n < 0 || p.Reviews[n].Comment != "" {
+		return p, nil
+	}
+	if r.Post == nil || p.PR == "" {
+		return p, fmt.Errorf("review posting is unavailable")
+	}
+	pub, err := r.Ship.public(ctx, p.Reviews[n].Text)
+	if err != nil {
+		return p, err
+	}
+	url, err := r.Post(ctx, p.Repo, p.PR, pub)
+	if err != nil {
+		return p, err
+	}
+	if url == "" {
+		return p, fmt.Errorf("review post returned no receipt")
+	}
+	p.Reviews[n].Text, p.Reviews[n].Comment = pub, url
+	if (p.Reviews[n].High > 0 || p.Reviews[n].Medium > 0) && len(p.Reviews) < MaxRounds {
+		p.State = Revising
+	}
+	return p, r.Ship.save(&p)
 }

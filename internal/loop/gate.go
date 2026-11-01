@@ -65,6 +65,9 @@ func RepoOf(ctx context.Context, dir string) (string, error) {
 // to, a repository it does not exclude, the machine's scope check allows it, and nothing else works in it (the
 // scheduled-AI policy leaves a repository another agent or a human works on alone).
 func (g Gate) Repository(ctx context.Context, dir string) (Target, error) {
+	if err := CheckGitFilters(ctx, dir); err != nil {
+		return Target{}, err
+	}
 	dir, err := filepath.Abs(dir)
 	if err != nil {
 		return Target{}, err
@@ -116,6 +119,7 @@ func (g Gate) scope(ctx context.Context, repo, dir string) error {
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, g.RepoGuard[0], append(append([]string{}, g.RepoGuard[1:]...), "--repo", repo, "--path", dir)...)
+	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
 	out, err := cmd.Output()
 	var v struct {
 		Allowed     bool     `json:"allowed"`
@@ -183,10 +187,13 @@ func under(p, dir string) bool {
 // gitOutput runs git in a directory and returns what it printed. Git runs without optional locks, hooks or a
 // file-system monitor, never prompts, and reads none of git's own variables (a GIT_DIR would point it elsewhere).
 func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
+	if err := CheckGitFilters(ctx, dir); err != nil {
+		return "", err
+	}
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "git", append([]string{"-C", dir, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"}, args...)...)
-	cmd.Env = append(noGitEnv(), "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0")
 	out, err := cmd.Output()
 	if err != nil {
 		var ee *exec.ExitError

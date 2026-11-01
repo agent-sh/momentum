@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/loop"
 	"github.com/agent-sh/momentum/internal/paths"
 )
 
@@ -86,16 +87,26 @@ func evidenceGit(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	if err != nil {
 		return err
 	}
+	if err := loop.CheckGitFilters(ctx, dir); err != nil {
+		return err
+	}
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "git", append(append([]string{"-C", dir}, gitSafe...), argv...)...)
 	cmd.Env = gitEnv()
 	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &capped{w: &out, n: 1 << 20}, stderr
+	capture := &capped{w: &out, n: (1 << 20) + 1}
+	cmd.Stdout, cmd.Stderr = capture, capture
 	err = cmd.Run()
-	stdout.Write(out.Bytes())
-	if out.Len() >= 1<<20 {
-		fmt.Fprintln(stderr, "momentum: the output was cut at 1 MiB; narrow the command")
+	if out.Len() > 1<<20 {
+		return usageError{"git output exceeds 1 MiB; narrow the command"}
+	}
+	clean, scrubErr := loop.Redact(ctx, out.String())
+	if scrubErr != nil {
+		return scrubErr
+	}
+	if _, writeErr := io.WriteString(stdout, clean); writeErr != nil {
+		return writeErr
 	}
 	return err
 }
@@ -109,7 +120,7 @@ func gitArgs(ctx context.Context, dir, sub string, spec gitSpec, rest []string) 
 	if sub == "log" || sub == "show" || sub == "diff" {
 		out = append(out, "--no-ext-diff", "--no-textconv")
 	}
-	revs, pathArgs := 0, 0
+	revs, pathArgs, blobs := 0, 0, 0
 	afterDash := false
 	for i := 0; i < len(rest); i++ {
 		a := rest[i]
@@ -142,7 +153,11 @@ func gitArgs(ctx context.Context, dir, sub string, spec gitSpec, rest []string) 
 				if err := gitValue(ctx, dir, spec, a, rest[i+1]); err != nil {
 					return nil, refuse("%s", err)
 				}
-				out, i = append(out, a, rest[i+1]), i+1
+				joined := a + rest[i+1]
+				if strings.HasPrefix(a, "--") {
+					joined = a + "=" + rest[i+1]
+				}
+				out, i = append(out, joined), i+1
 			case len(a) > 2 && a[1] != '-' && contains(spec.values, a[:2]): // a short option's value attached: -n5, -U3
 				if err := gitValue(ctx, dir, spec, a[:2], a[2:]); err != nil {
 					return nil, refuse("%s", err)
@@ -163,6 +178,9 @@ func gitArgs(ctx context.Context, dir, sub string, spec gitSpec, rest []string) 
 			return nil, refuse("%q is no revision of the repository (a path goes after --)", a)
 		}
 		revs++
+		if strings.Contains(a, ":") {
+			blobs++
+		}
 		if spec.most > 0 && revs > spec.most {
 			return nil, refuse("it takes at most %d revisions", spec.most)
 		}
@@ -171,11 +189,34 @@ func gitArgs(ctx context.Context, dir, sub string, spec gitSpec, rest []string) 
 	if spec.need && pathArgs != 1 {
 		return nil, refuse("it takes one path, after --")
 	}
+	if blobs > 0 && (revs != 1 || pathArgs > 0) {
+		return nil, refuse("a blob selector must be the only revision, with no paths")
+	}
+	if blobs == 0 && contains([]string{"log", "show", "diff", "grep"}, sub) {
+		if !afterDash {
+			out = append(out, "--")
+		}
+		out = append(out, credentialExcludes()...)
+	}
 	return out, nil
+}
+
+// credentialExcludes keeps implicit history and wildcard path queries from reading credential files too.
+func credentialExcludes() []string {
+	names := []string{".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*", "*credential*", "*secret*", "*token*", "*.kdbx", "*.keystore", "auth.json"}
+	names = append(names, secretDirs...)
+	var out []string
+	for _, name := range names {
+		out = append(out, ":(top,exclude,icase,glob)**/"+name, ":(top,exclude,icase,glob)**/"+name+"/**")
+	}
+	return out
 }
 
 // gitValue checks an option's value: a revision for the options that take one, and a value that is no option.
 func gitValue(ctx context.Context, dir string, spec gitSpec, name, val string) error {
+	if val == "" || strings.HasPrefix(val, "-") {
+		return fmt.Errorf("%s requires a non-option value", name)
+	}
 	if contains(spec.revVal, name) {
 		if err := isRevision(ctx, dir, val); err != nil {
 			return fmt.Errorf("%s %q is no revision", name, val)
@@ -201,8 +242,25 @@ func isRevision(ctx context.Context, dir, a string) error {
 		if s == "" {
 			continue // A.. is A..HEAD
 		}
+		if rev, path, ok := strings.Cut(s, ":"); ok {
+			if rev == "" {
+				return fmt.Errorf("index blob selectors are not shown")
+			}
+			if err := repoPath(path); err != nil {
+				return err
+			}
+		}
 		if _, err := gitRead(ctx, dir, "rev-parse", "--verify", "--quiet", "--end-of-options", s); err != nil {
 			return err
+		}
+		if !strings.Contains(s, ":") {
+			kind, err := gitRead(ctx, dir, "cat-file", "-t", s+"^{}")
+			if err != nil {
+				return err
+			}
+			if strings.TrimSpace(kind) == "blob" {
+				return fmt.Errorf("a blob needs a checked repository path")
+			}
 		}
 	}
 	return nil
@@ -212,6 +270,16 @@ func isRevision(ctx context.Context, dir, a string) error {
 // magic.
 func repoPath(p string) error {
 	clean := path.Clean(p)
+	for _, protected := range secretDirs {
+		if clean == protected || strings.HasPrefix(clean, protected+"/") || strings.Contains(clean, "/"+protected+"/") || strings.HasSuffix(clean, "/"+protected) {
+			return fmt.Errorf("credential path is not shown")
+		}
+	}
+	for _, part := range strings.Split(clean, "/") {
+		if secretName.MatchString(part) || contains(secretDirs, part) || part == "auth.json" {
+			return fmt.Errorf("credential path is not shown")
+		}
+	}
 	switch {
 	case p == "" || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "~"):
 		return fmt.Errorf("%q is not a path inside the repository", p)
@@ -225,6 +293,9 @@ func repoPath(p string) error {
 
 // gitRead runs one git command of momentum's own, with the safe settings.
 func gitRead(ctx context.Context, dir string, args ...string) (string, error) {
+	if err := loop.CheckGitFilters(ctx, dir); err != nil {
+		return "", err
+	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "git", append(append([]string{"-C", dir}, gitSafe...), args...)...)
@@ -242,7 +313,7 @@ func gitEnv() []string {
 			env = append(env, kv)
 		}
 	}
-	return append(env, "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_PAGER=cat", "GIT_CONFIG_NOSYSTEM=1")
+	return append(env, "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_PAGER=cat", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
 }
 
 func gitNames() string {

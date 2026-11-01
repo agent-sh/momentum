@@ -153,7 +153,7 @@ func repoBusy(ctx context.Context, st *store.Store, dir string) (string, error) 
 
 // busyIn is repoBusy over the live sessions given.
 func busyIn(ctx context.Context, st *store.Store, dir string, ss map[int]capacity.Session) (string, error) {
-	out, err := exec.CommandContext(ctx, "git", "-C", dir, "worktree", "list", "--porcelain").Output()
+	out, err := gitRead(ctx, dir, "worktree", "list", "--porcelain")
 	if err != nil {
 		return "", fmt.Errorf("git worktree list: %w", err)
 	}
@@ -219,9 +219,11 @@ func busyIn(ctx context.Context, st *store.Store, dir string, ss map[int]capacit
 			}
 		}
 		// his tree's status, read without the lock that would rewrite its index
-		cmd := exec.CommandContext(ctx, "git", "-C", t, "-c", "core.fsmonitor=false", "status", "--porcelain", "--untracked-files=no")
-		cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
-		if st, err := cmd.Output(); err == nil && strings.TrimSpace(string(st)) != "" {
+		status, err := gitRead(ctx, t, "status", "--porcelain", "--untracked-files=no")
+		if err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(status) != "" {
 			return fmt.Sprintf("uncommitted changes in %s", t), nil
 		}
 	}
@@ -396,7 +398,7 @@ func loopLesson(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	if c.Status != store.CaseClosed || c.Reason != store.Improved {
 		return usageError{fmt.Sprintf("case %s is %s: a lesson is published only for a case closed as improved", c.ID, statusLine(c))}
 	}
-	pub, err := loop.Public(ctx, line)
+	scrubbed, err := loop.Redact(ctx, line)
 	if err != nil {
 		return err
 	}
@@ -404,13 +406,30 @@ func loopLesson(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	if p, ok, _ := (&loop.Ship{Dir: loopDir()}).Load(c.ID); ok && p.Repo != "" {
 		scope = "projects/" + p.Repo[strings.IndexByte(p.Repo, '/')+1:]
 	}
+	// the text reserved first (scrubbed) is the one written, its mentions and references made inert, under a name of
+	// the case's own: tacit takes the same name and text again as the same fact, so a write tried again after one
+	// that failed partway writes nothing twice
+	reserved, start, err := st.BeginLesson(ctx, c.ID, scrubbed)
+	if err != nil {
+		return err
+	}
+	if !start {
+		fmt.Fprintf(stdout, "%s: its lesson is published already\n", c.ID)
+		return nil
+	}
+	pub := loop.Neutral(reserved)
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	out, err := exec.CommandContext(cctx, "tacit", "add", "--harness", "claude", "--kind", "observed", "--scope", scope,
-		"--desc", pub, "--body", fmt.Sprintf("Learned by momentum's improvement loop on case %s (%s): %s", c.ID, c.Family, c.Title)).CombinedOutput()
+	out, err := exec.CommandContext(cctx, "tacit", "add", "--harness", "claude", "--kind", "observed", "--scope", scope, "--desc", pub,
+		"--body", fmt.Sprintf("Learned by momentum's improvement loop on case %s (%s): %s", c.ID, c.Family, c.Title), lessonName(c.ID)).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("tacit add: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	fmt.Fprintf(stdout, "%s: published to %s: %s\n", c.ID, scope, pub)
-	return st.CaseNote(ctx, c.ID, "published", scope+": "+pub, caseActor())
+	return st.CaseNote(ctx, c.ID, store.LessonPublished, scope+": "+pub, caseActor())
+}
+
+// lessonName is the name of a case's lesson in tacit: one per case, so its write is the same fact each time.
+func lessonName(caseID string) string {
+	return "momentum-lesson-" + strings.ToLower(caseID)
 }

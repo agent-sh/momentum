@@ -272,6 +272,9 @@ func scanCase(row interface{ Scan(...any) error }) (Case, error) {
 
 // getCase reads a case with its evidence count and signatures. A missing case is ErrNoCase.
 func getCase(ctx context.Context, q querier, id string) (Case, error) {
+	if own, ok := ctx.Value(caseAuthority{}).(string); ok && id != own {
+		return Case{}, badCase("this run changes only its own canonical case")
+	}
 	c, err := scanCase(q.QueryRowContext(ctx, `SELECT `+caseColumns+` FROM cases WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Case{}, fmt.Errorf("%w: %q", ErrNoCase, id)
@@ -1210,4 +1213,11 @@ func (s *Store) CaseNote(ctx context.Context, id, action, detail, actor string) 
 		return err
 	}
 	return caseLog(ctx, s.db, c.ID, actor, action, detail, time.Now())
+}
+
+type caseAuthority struct{}
+
+// WithCaseAuthority confines mutations to one canonical case. Alias resolution checks it in the transaction.
+func WithCaseAuthority(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, caseAuthority{}, id)
 }

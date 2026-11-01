@@ -32,6 +32,9 @@ func caseCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if err := ownCase(args); err != nil {
 		return err
 	}
+	if os.Getenv("MOMENTUM_LOOP_RUN") != "" && args[0] != "list" && args[0] != "show" {
+		ctx = store.WithCaseAuthority(ctx, os.Getenv("MOMENTUM_LOOP_CASE"))
+	}
 	switch args[0] {
 	case "detect":
 		return caseDetect(ctx, args[1:], stdout, stderr)

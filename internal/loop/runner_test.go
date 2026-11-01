@@ -86,7 +86,7 @@ func TestTheLoopTakesEachFamilysCaseOneStep(t *testing.T) {
 	}
 	args, env := agentArgs(t, agent)
 	for _, want := range []string{"--bare", "--restricted", "--tools\n" + DefaultTools, "--permission-mode\ndontAsk", "--model\nmodel-x",
-		"--max-budget-usd\n4.00", "--max-turns\n30", "--strict-mcp-config", "--append-system-prompt-file", "--add-dir\n/srv/projects"} {
+		"--max-budget-usd\n4\n", "--max-turns\n30", "--strict-mcp-config", "--append-system-prompt-file", "--add-dir\n/srv/projects"} {
 		if !strings.Contains(args, want) {
 			t.Errorf("the agent's arguments lack %q:\n%s", want, args)
 		}
@@ -492,7 +492,7 @@ func TestAStaleRunCountsItsBudgetAndARefusalFallsBack(t *testing.T) {
 	r := runnerFor(t, st, []string{p})
 	r.Agent.Fallback = "model-y"
 	c := openCase(t, st, "failures", "a", 2)
-	if err := st.PutLoopRun(ctx, store.LoopRun{ID: "stale", Case: "c0", Family: "failures", Step: StepInvestigate, Started: time.Now().Add(-3 * time.Hour),
+	if err := st.PutLoopRun(ctx, store.LoopRun{ID: "stale", Case: c.ID, Family: "failures", Step: StepInvestigate, Started: time.Now().Add(-3 * time.Hour),
 		Status: store.RunRunning}); err != nil {
 		t.Fatal(err)
 	}
