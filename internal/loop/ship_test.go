@@ -538,7 +538,7 @@ func TestATestCommandRunsWithoutAShell(t *testing.T) {
 	if w, err := Words(`go test ./internal/x -run 'TestA|TestB' -count=1`); err != nil || strings.Join(w, "|") != "go|test|./internal/x|-run|TestA|TestB|-count=1" {
 		t.Fatalf("%q %v", w, err)
 	}
-	for _, bad := range []string{"go test ./... | tee x", "go test && rm -rf /", "go test $(echo x)", "rm -rf x", "go test 'unclosed", "", "go test > out"} {
+	for _, bad := range []string{"go test ./... | tee x", "go test && rm -rf /", "go test $(echo x)", "rm -rf x", "go test 'unclosed", "", "go test > out", "go test -run $NAME"} {
 		if _, err := Words(bad); !errors.Is(err, ErrRefused) {
 			t.Errorf("%q: %v", bad, err)
 		}
@@ -595,9 +595,10 @@ try:
 except OSError: pass
 for k in ("DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK"):
     if k in os.environ: bad.append(k)
+if os.environ.get("HOME") != %q: bad.append("HOME is " + os.environ.get("HOME", ""))
 open("inside.txt", "w").write("ok")
 print(" ".join(bad)); sys.exit(1 if bad else 0)
-`, sock, tcp.Addr().(*net.TCPAddr).Port, filepath.Join(outside, "x"), secret)
+`, sock, tcp.Addr().(*net.TCPAddr).Port, filepath.Join(outside, "x"), secret, sb.Home)
 	t.Setenv("SSH_AUTH_SOCK", sock)
 	o, err := sb.Run(context.Background(), tree, []string{"python3", "-c", probe}, nil)
 	if err != nil || o.Exit != 0 {
@@ -669,5 +670,278 @@ func TestAProposalNeedsTheCasesOwnEvents(t *testing.T) {
 	if _, err := s.Propose(ctx, c.ID, Proposal{Title: "t", Body: "b", Rollback: "r", Signal: goodSignal, Window: 7 * 24 * time.Hour}); !errors.Is(err, ErrRefused) ||
 		!strings.Contains(err.Error(), "holds no event") {
 		t.Fatalf("a case with no event of its own: %v", err)
+	}
+}
+
+// reviewedChange takes the fixture's case to a proposed change whose clean review was posted: what a landing needs.
+func reviewedChange(t *testing.T, s *Ship, st *store.Store, f repoFixture) (store.Case, Package) {
+	t.Helper()
+	ctx := context.Background()
+	c := testingCase(t, st)
+	p, err := s.Prepare(ctx, c.ID, f.main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
+	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
+	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Propose(ctx, c.ID, Proposal{Title: "Answer is 42", Body: "Off by one.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if p, err = s.Reviewed(ctx, c.ID, Review{Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || !p.Clean() {
+		t.Fatalf("a clean review: %+v %v", p, err)
+	}
+	return c, p
+}
+
+// originHead is a branch's head in the fixture's origin.
+func originHead(t *testing.T, f repoFixture, branch string) string {
+	t.Helper()
+	return strings.TrimSpace(run(t, f.dir, "git", "--git-dir", f.origin, "rev-parse", branch))
+}
+
+// pushOther commits files to the origin's branch from a clone of someone else's.
+func pushOther(t *testing.T, f repoFixture, branch string, files map[string]string) string {
+	t.Helper()
+	other := t.TempDir()
+	run(t, f.dir, "git", "clone", "-q", "-b", branch, f.origin, other)
+	for p, body := range files {
+		write(t, filepath.Join(other, p), body)
+	}
+	run(t, other, "git", "add", "-A")
+	run(t, other, "git", "commit", "-q", "-m", "someone else's")
+	run(t, other, "git", "push", "-q", "origin", "HEAD:"+branch)
+	return strings.TrimSpace(run(t, other, "git", "rev-parse", "HEAD"))
+}
+
+// Every step after a change's check checks again what it rests on. A check refuses a change that fails its own
+// test and a test file the change does not touch; a proposal, a landing and a rollback each refuse what the gate
+// refuses now, before anything is pushed; a landing refuses a work tree that holds changes besides the reviewed
+// commit, and one whose .git was pointed at another repository that holds the same commit.
+func TestEachStepChecksAgainWhatItRestsOn(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	f := newRepo(t, nil)
+	s := shipFor(t, st, f)
+	c := testingCase(t, st)
+	p, err := s.Prepare(ctx, c.ID, f.main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	test := "go test ./..."
+	write(t, filepath.Join(p.Work, "fake.go"), fixed("43"))
+	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
+	if _, err := s.Check(ctx, c.ID, test, nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "fails with the change") {
+		t.Fatalf("a change that fails its own test: %v", err)
+	}
+	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
+	if _, err := s.Check(ctx, c.ID, test, []string{"other_test.go"}); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "not a file the change touches") {
+		t.Fatalf("a test file the change does not touch: %v", err)
+	}
+	if _, err := s.Check(ctx, c.ID, test, nil); err != nil {
+		t.Fatal(err)
+	}
+	base := originHead(t, f, "main")
+	stop := filepath.Join(f.dir, "report-only")
+	pr := Proposal{Title: "Answer is 42", Body: "Off by one.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}
+	write(t, stop, "")
+	if _, err := s.Propose(ctx, c.ID, pr); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "report_only") {
+		t.Fatalf("a proposal the gate refuses now: %v", err)
+	}
+	if pushes, _ := os.ReadFile(filepath.Join(f.dir, "pushes")); strings.Contains(string(pushes), p.Branch) {
+		t.Fatalf("a proposal the gate refused was pushed:\n%s", pushes)
+	}
+	os.Remove(stop)
+	if _, err := s.Propose(ctx, c.ID, pr); err != nil {
+		t.Fatal(err)
+	}
+	if p, err = s.Reviewed(ctx, c.ID, Review{Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || !p.Clean() {
+		t.Fatalf("a clean review: %+v %v", p, err)
+	}
+	write(t, stop, "")
+	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "report_only") || originHead(t, f, "main") != base {
+		t.Fatalf("a landing the gate refuses now: %v", err)
+	}
+	os.Remove(stop)
+	write(t, filepath.Join(p.Work, "stray.txt"), "not reviewed\n")
+	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "holds changes") || originHead(t, f, "main") != base {
+		t.Fatalf("a landing with a change besides the reviewed commit: %v", err)
+	}
+	os.Remove(filepath.Join(p.Work, "stray.txt"))
+	// another repository that holds the reviewed commit, and a .git pointed at it
+	elsewhere := t.TempDir()
+	run(t, f.dir, "git", "clone", "-q", f.origin, elsewhere)
+	run(t, elsewhere, "git", "fetch", "-q", "origin", p.Branch)
+	run(t, elsewhere, "git", "checkout", "-q", "--detach", p.Head)
+	link, _ := os.ReadFile(filepath.Join(p.Work, ".git"))
+	write(t, filepath.Join(p.Work, ".git"), "gitdir: "+filepath.Join(elsewhere, ".git")+"\n")
+	if head := strings.TrimSpace(run(t, p.Work, "git", "rev-parse", "HEAD")); head != p.Head {
+		t.Fatalf("the other repository's head is %s, not the reviewed %s", head, p.Head)
+	}
+	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), ".git points to") || originHead(t, f, "main") != base {
+		t.Fatalf("a landing through a .git pointed elsewhere: %v", err)
+	}
+	write(t, filepath.Join(p.Work, ".git"), string(link))
+	if p, err = s.Land(ctx, c.ID); err != nil || p.State != Landed {
+		t.Fatalf("land: %+v %v", p, err)
+	}
+	landed := originHead(t, f, "main")
+	write(t, stop, "")
+	if _, err := s.RollBack(ctx, c.ID, "no effect"); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "report_only") || originHead(t, f, "main") != landed {
+		t.Fatalf("a rollback the gate refuses now: %v", err)
+	}
+	os.Remove(stop)
+	if p, err = s.RollBack(ctx, c.ID, "no effect"); err != nil || p.State != RolledBack {
+		t.Fatalf("rollback: %+v %v", p, err)
+	}
+}
+
+// A landing tests the change as it lands: rebased on a default branch under which its test fails, it does not
+// land.
+func TestALandingTestsTheRebasedChange(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	f := newRepo(t, nil)
+	s := shipFor(t, st, f)
+	c, _ := reviewedChange(t, s, st, f)
+	moved := pushOther(t, f, "main", map[string]string{"boom_test.go": "package fake\n\nimport \"testing\"\n\nfunc TestBoom(t *testing.T) { t.Fatal(\"boom\") }\n"})
+	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "after the rebase the test fails") {
+		t.Fatalf("a rebased change whose test fails: %v", err)
+	}
+	if head := originHead(t, f, "main"); head != moved {
+		t.Fatalf("the default branch is %s, not %s", head, moved)
+	}
+}
+
+// A landing pushes the default branch only as a fast-forward: a commit that reaches it between the landing's
+// rebase and its push stays, and the landing does not go in.
+func TestALandingPushesOnlyAFastForward(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	f := newRepo(t, nil)
+	s := shipFor(t, st, f)
+	c, _ := reviewedChange(t, s, st, f)
+	pushOther(t, f, "main", map[string]string{"README": "a readme\n"}) // the base moved: the landing rebases and pushes its branch first
+	// when the branch is pushed, someone's commit reaches the default branch
+	race, raced := filepath.Join(f.dir, "race"), filepath.Join(f.dir, "raced")
+	script(t, filepath.Join(f.origin, "hooks"), "post-receive", `while read old new ref; do
+  echo "$ref $new" >> "`+filepath.Join(f.dir, "pushes")+`"
+  case "$ref" in refs/heads/momentum/*)
+    if [ -e "`+race+`" ]; then
+      rm "`+race+`"
+      tree=$(git rev-parse refs/heads/main^{tree})
+      c=$(echo race | GIT_AUTHOR_NAME=r GIT_AUTHOR_EMAIL=r@example.com GIT_COMMITTER_NAME=r GIT_COMMITTER_EMAIL=r@example.com git commit-tree -p refs/heads/main "$tree")
+      git update-ref refs/heads/main "$c"
+      echo "$c" > "`+raced+`"
+    fi ;;
+  esac
+done`)
+	write(t, race, "")
+	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "fast-forward") {
+		t.Fatalf("a landing past a commit that came between: %v", err)
+	}
+	other, _ := os.ReadFile(raced)
+	if head := originHead(t, f, "main"); head != strings.TrimSpace(string(other)) || head == "" {
+		t.Fatalf("the default branch is %s, not the commit that came between (%s)", head, other)
+	}
+}
+
+// A revision does not overwrite what someone else pushed to its branch since: its push holds a lease on the branch
+// as the loop last pushed it.
+func TestARevisionDoesNotOverwriteAnotherPushToItsBranch(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	f := newRepo(t, nil)
+	s := shipFor(t, st, f)
+	c := testingCase(t, st)
+	p, err := s.Prepare(ctx, c.ID, f.main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
+	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
+	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+		t.Fatal(err)
+	}
+	pr := Proposal{Title: "Answer is 42", Body: "Off by one.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}
+	if p, err = s.Propose(ctx, c.ID, pr); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Reviewed(ctx, c.ID, Review{Findings: []Finding{{Severity: "medium", Where: "fake.go", Problem: "p", Fix: "f"}}, Comment: "c1"}); err != nil {
+		t.Fatal(err)
+	}
+	theirs := pushOther(t, f, p.Branch, map[string]string{"theirs.txt": "a fix of someone's\n"})
+	write(t, filepath.Join(p.Work, "fake.go"), strings.Replace(fixed("42"), "// Answer is the answer.", "// Answer is 42.", 1))
+	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Propose(ctx, c.ID, pr); err == nil {
+		t.Fatal("a revision overwrote another push to its branch")
+	}
+	if head := originHead(t, f, p.Branch); head != theirs {
+		t.Fatalf("the branch is %s, not the other push %s", head, theirs)
+	}
+}
+
+// A package prepared again after its rollback, in another checkout of the repository, leaves no registration of
+// its old work tree in the first.
+func TestAPackagePreparedAgainLeavesNoOldTreeBehind(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	f := newRepo(t, nil)
+	s := shipFor(t, st, f)
+	c, p := reviewedChange(t, s, st, f)
+	if _, err := s.Land(ctx, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RollBack(ctx, c.ID, "no effect"); err != nil {
+		t.Fatal(err)
+	}
+	second := filepath.Join(f.dir, "second")
+	run(t, f.dir, "git", "clone", "-q", f.origin, second)
+	q, err := s.Prepare(ctx, c.ID, second)
+	if err != nil || q.Dir != second || q.Work != p.Work {
+		t.Fatalf("prepared again in another checkout: %+v %v", q, err)
+	}
+	if list := run(t, f.main, "git", "worktree", "list", "--porcelain"); strings.Contains(list, p.Work) {
+		t.Fatalf("the first checkout still registers the old work tree:\n%s", list)
+	}
+}
+
+// A measurement's signal counts the case's own problem: one that counts enough events, none of them the case's, is
+// refused.
+func TestAPlanMeasuresTheCasesOwnProblem(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	s := &Ship{Store: st}
+	c := testingCase(t, st)
+	var evs []store.Event
+	for i := 0; i < 6; i++ {
+		evs = append(evs, store.Event{Source: store.Transcripts, SourceKey: fmt.Sprint("other@", i), TS: time.Now().Add(-time.Duration(i+1) * time.Hour),
+			Session: "s9", Harness: "claude", Actor: store.ActorTool, Kind: "tool_result", Tool: "Bash", Summary: "Exit code 1 zz-other-text"})
+	}
+	if _, err := st.Put(ctx, evs); err != nil {
+		t.Fatal(err)
+	}
+	other := Signal{Source: store.Transcripts, Kinds: []string{"tool_result"}, Tool: "Bash", Match: []string{"zz-other-text"}}
+	if _, err := s.validPlan(ctx, c, other, 7*24*time.Hour); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "does not measure the case's problem") {
+		t.Fatalf("a signal of another problem: %v", err)
+	}
+	if n, err := s.validPlan(ctx, c, goodSignal, 7*24*time.Hour); err != nil || n != 4 {
+		t.Fatalf("the case's own signal: %d %v", n, err)
+	}
+}
+
+// A review is clean only of the head it read: a later commit needs its own.
+func TestACleanReviewIsOfTheHeadProposed(t *testing.T) {
+	p := Package{Head: "b", Reviews: []Review{{Head: "a", Comment: "c1"}}}
+	if p.Clean() {
+		t.Fatal("a review of an older head is clean on the new one")
+	}
+	p.Reviews[0].Head = "b"
+	if !p.Clean() {
+		t.Fatal("a clean posted review of the head")
 	}
 }
