@@ -27,6 +27,10 @@ func TestMain(m *testing.M) {
 	}
 	testCache = dir
 	Scrubber = []string{"cat"} // the tests' own: a test that reads what the scrubber does sets one that does it
+	// a run's route is its relay's alone: no fake started outside a run reaches a broker the shell's environment names
+	for _, k := range append(append([]string{}, bedrockKeys...), otherRoutes...) {
+		os.Unsetenv(k)
+	}
 	code := m.Run()
 	os.RemoveAll(dir)
 	os.Exit(code)
@@ -71,7 +75,7 @@ func write(t *testing.T, path, text string) {
 
 // bedrockCall is the model request a fake harness sends through the route a run gives it, as Claude Code does,
 // so its run counts as on Bedrock; outside a run the variable is unset and the line does nothing.
-const bedrockCall = `if [ -n "$ANTHROPIC_BEDROCK_BASE_URL" ]; then curl -s -o /dev/null -X POST -d '{}' "$ANTHROPIC_BEDROCK_BASE_URL/model/global.anthropic.claude-opus-5-5/invoke"; fi
+const bedrockCall = `if [ -n "$ANTHROPIC_BEDROCK_BASE_URL" ]; then printf 'url = "%s/model/global.anthropic.claude-opus-5-5/invoke"\n' "$ANTHROPIC_BEDROCK_BASE_URL" | curl -s -o /dev/null -X POST -d '{}' -K -; fi
 `
 
 func script(t *testing.T, dir, name, body string) string {

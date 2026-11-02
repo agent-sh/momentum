@@ -115,8 +115,8 @@ echo '`+grade+`'`)
 // An evaluation stops starting trials when its budget has no room for another whole run.
 func TestAnEvaluationStopsAtItsBudget(t *testing.T) {
 	st := testStore(t)
-	e := &Eval{Runner: &Runner{Store: st, Budgets: Budgets{Run: 4}}, Source: filepath.Join(t.TempDir(), "none.db"), Dir: t.TempDir(), Trials: 2, Budget: 3,
-		Parallel: 1, ID: "x", Arms: []string{"loop"}}
+	e := &Eval{Runner: &Runner{Store: st, Budgets: Budgets{Run: 4}, Agent: Agent{Bedrock: testBedrock(t)}}, Source: filepath.Join(t.TempDir(), "none.db"), Dir: t.TempDir(), Trials: 2, Budget: 3,
+		Parallel: 1, ID: "x", Arms: []string{"loop"}, Judge: Agent{Bedrock: testBedrock(t)}}
 	trs, err := e.Run(context.Background(), []GoldenTask{{ID: "a", Family: "failures"}})
 	if err != nil || len(trs) != 2 {
 		t.Fatalf("%+v %v", trs, err)

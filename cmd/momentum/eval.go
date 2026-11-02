@@ -82,7 +82,7 @@ func loopEval(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	if err != nil {
 		return err
 	}
-	if err := r.Agent.Bedrock.Check(); err != nil {
+	if err := onBedrock(r.Agent); err != nil {
 		return err // every trial and judge is on Bedrock: with no route, the evaluation does not start
 	}
 	id := loop.NewEvalID()

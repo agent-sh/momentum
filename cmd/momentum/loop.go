@@ -34,6 +34,20 @@ var defaultFamilies = []string{"failures", "owner-burden", "sessions"}
 // loopDir is where the loop keeps its runs, packages and work trees: next to the store.
 func loopDir() string { return filepath.Join(paths.Data(), "loop") }
 
+// onBedrock says whether the loop's agent can start a run now: on Bedrock, by its route, with Bedrock's models. The
+// commands that start a model check it first; the rest of the loop (a dry pick, the ship tool, measuring) do not.
+func onBedrock(a loop.Agent) error {
+	if err := a.Bedrock.Check(); err != nil {
+		return err
+	}
+	for _, m := range []string{a.Model, a.Fallback} {
+		if !loop.BedrockModel(m) {
+			return fmt.Errorf("loop model %q is no Bedrock model: every headless run is on Bedrock, on a global inference profile (global.anthropic.claude-...)", m)
+		}
+	}
+	return nil
+}
+
 // setup builds the loop's parts from the machine's configuration: its runner and its ship tool, both under the
 // gates the configuration gives.
 func setup(st *store.Store, c config.Loop) (*loop.Runner, *loop.Ship, error) {
@@ -83,11 +97,7 @@ func setup(st *store.Store, c config.Loop) (*loop.Runner, *loop.Ship, error) {
 	if fallback == "" {
 		fallback = defaultFallback
 	}
-	for _, m := range []string{model, fallback} {
-		if !loop.BedrockModel(m) {
-			return nil, nil, fmt.Errorf("loop model %q is no Bedrock model: every headless run is on Bedrock (global.anthropic.claude-...)", m)
-		}
-	}
+
 	families := c.Families
 	if len(families) == 0 {
 		families = defaultFamilies
@@ -291,7 +301,7 @@ func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	r.Log = func(format string, a ...any) { fmt.Fprintf(stderr, format+"\n", a...) }
 	if !*dry {
-		if err := r.Agent.Bedrock.Check(); err != nil {
+		if err := onBedrock(r.Agent); err != nil {
 			return err // no route, no run: nothing is reserved or started
 		}
 	}

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -186,6 +187,13 @@ const judgeBudget = 1.0
 
 // Run interleaves trial, task and arm. Each slot reserves all arms and their judges before either arm starts.
 func (e *Eval) Run(ctx context.Context, tasks []GoldenTask) ([]Trial, error) {
+	// every trial and judge is on Bedrock: with no route for either, the evaluation does not start
+	if err := e.Runner.Agent.Bedrock.Check(); err != nil {
+		return nil, fmt.Errorf("the trials: %w", err)
+	}
+	if err := e.Judge.Bedrock.Check(); err != nil {
+		return nil, fmt.Errorf("the judge: %w", err)
+	}
 	if err := os.MkdirAll(e.Dir, 0o700); err != nil {
 		return nil, err
 	}
@@ -569,6 +577,10 @@ func (e *Eval) trial(ctx context.Context, t GoldenTask, n int) (tr Trial) {
 	}
 	e.Runner.Store.PutLoopRun(ctx, run)
 	tr.Run = run
+	if errors.Is(err, ErrNoBedrock) {
+		tr.Err = err.Error() // a run not on Bedrock does not count: no findings into its case, no judge
+		return tr
+	}
 	if !e.Native { // the runner's bookkeeping, as a live investigation's: the report goes into the case, whatever error ended the run
 		why := undecided(res, err)
 		if f, reported, ok := investigationFindings(res, dir); ok || why != "" {

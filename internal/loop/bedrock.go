@@ -56,7 +56,7 @@ func (b *Bedrock) path() string {
 func (b *Bedrock) read() (map[string]string, error) {
 	f, err := os.Open(b.path())
 	if err != nil {
-		return nil, fmt.Errorf("%w: the broker's env file cannot be read (%s)", ErrNoBedrock, errors.Unwrap(err))
+		return nil, fmt.Errorf("%w: the broker's env file %s cannot be read (%s)", ErrNoBedrock, b.path(), errors.Unwrap(err))
 	}
 	defer f.Close()
 	vars := map[string]string{}
@@ -77,6 +77,11 @@ func (b *Bedrock) read() (map[string]string, error) {
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("%w: the broker's env file cannot be read", ErrNoBedrock)
+	}
+	for _, k := range bedrockKeys {
+		if strings.HasPrefix(k, "ANTHROPIC_DEFAULT_") && vars[k] != "" && !BedrockModel(vars[k]) {
+			return nil, fmt.Errorf("%w: the broker's env file pins %s to %q, no global inference profile", ErrNoBedrock, k, vars[k])
+		}
 	}
 	switch {
 	case vars["CLAUDE_CODE_USE_BEDROCK"] != "1":
@@ -127,12 +132,23 @@ func (b *Bedrock) open() (*relay, []string, error) {
 	}
 	prefix := "/" + strings.ToLower(rand.Text())
 	r := &relay{url: "http://" + ln.Addr().String() + prefix}
-	base := strings.TrimSuffix(target.Path, "/")
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			rest := strings.TrimPrefix(pr.In.URL.Path, prefix)
+			// the path as it came, escapes and all: a model id may hold an escaped slash
+			rest := strings.TrimPrefix(pr.In.URL.EscapedPath(), prefix)
 			pr.Out.URL.Scheme, pr.Out.URL.Host, pr.Out.Host = target.Scheme, target.Host, target.Host
-			pr.Out.URL.Path, pr.Out.URL.RawPath = base+rest, ""
+			pr.Out.URL.RawPath = target.EscapedPath() + rest
+			if strings.HasSuffix(target.EscapedPath(), "/") {
+				pr.Out.URL.RawPath = strings.TrimSuffix(target.EscapedPath(), "/") + rest
+			}
+			pr.Out.URL.Path, _ = url.PathUnescape(pr.Out.URL.RawPath)
+		},
+		// the proof counts a model request the broker answered, not one that only reached the relay
+		ModifyResponse: func(resp *http.Response) error {
+			if resp.Request.Method == http.MethodPost && strings.Contains(resp.Request.URL.Path, "/model/") && resp.StatusCode/100 == 2 {
+				r.models.Add(1)
+			}
+			return nil
 		},
 		FlushInterval: -1, // a streamed answer streams on
 		ErrorLog:      log.New(io.Discard, "", 0),
@@ -145,9 +161,6 @@ func (b *Bedrock) open() (*relay, []string, error) {
 		if !ok || rest != "" && rest[0] != '/' {
 			http.NotFound(w, req)
 			return
-		}
-		if req.Method == http.MethodPost && strings.HasPrefix(rest, "/model/") {
-			r.models.Add(1)
 		}
 		proxy.ServeHTTP(w, req)
 	})}
@@ -166,8 +179,8 @@ func (b *Bedrock) open() (*relay, []string, error) {
 
 func (r *relay) close() { r.srv.Close() }
 
-// routed is a run's environment on its route: the caller's, without any variable that would send it elsewhere,
-// and the route's.
+// routed is a run's environment on its route: the caller's, without any variable that would send it elsewhere
+// (another provider's switch, URL or key, by name or by its prefix), and the route's.
 func routed(env, route []string) []string {
 	if env == nil {
 		env = CleanEnv(nil)
@@ -175,21 +188,27 @@ func routed(env, route []string) []string {
 	var out []string
 	for _, kv := range env {
 		k, _, _ := strings.Cut(kv, "=")
-		if !slices.Contains(otherRoutes, k) && !slices.Contains(bedrockKeys, k) {
+		if !slices.Contains(otherRoutes, k) && !slices.Contains(bedrockKeys, k) && !otherRoute(k) {
 			out = append(out, kv)
 		}
 	}
 	return append(out, route...)
 }
 
-// BedrockModel says whether a model names a Claude model on Bedrock: a global inference profile, or an alias the
-// broker's file pins to one.
-func BedrockModel(m string) bool {
-	m = strings.TrimSuffix(m, "[1m]")
-	return strings.HasPrefix(m, "global.anthropic.claude-") || slices.Contains([]string{"opus", "sonnet", "haiku", "fable"}, m)
+// otherRoute says whether a variable names a route of its own: a provider's switch (CLAUDE_CODE_USE_...), its auth
+// (CLAUDE_CODE_SKIP_..._AUTH), an Anthropic or AWS URL, key, token or profile.
+func otherRoute(k string) bool {
+	return strings.HasPrefix(k, "CLAUDE_CODE_USE_") || strings.HasPrefix(k, "CLAUDE_CODE_SKIP_") || strings.HasPrefix(k, "ANTHROPIC_") ||
+		strings.HasPrefix(k, "AWS_")
 }
 
-// modelRan says whether a run's stream shows the model answered: a turn, a token or a cost.
+// BedrockModel says whether a model names a Claude model on Bedrock as the owner's runs take it: a global inference
+// profile (a regional one or an alias, which the harness may resolve to a regional one, is not).
+func BedrockModel(m string) bool {
+	return strings.HasPrefix(strings.TrimSuffix(m, "[1m]"), "global.anthropic.claude-")
+}
+
+// modelRan says whether a run's stream shows the model answered: a message of its own, a turn, a token or a cost.
 func modelRan(res Result) bool {
-	return res.TurnsKnown && res.Turns > 0 || res.Tokens > 0 || res.CostKnown && res.USD > 0
+	return res.answered || res.TurnsKnown && res.Turns > 0 || res.Tokens > 0 || res.CostKnown && res.USD > 0
 }

@@ -88,6 +88,7 @@ type Result struct {
 	Session    string
 	Transcript string // the run's stream of events, in Dir
 	Model      string // the model that ran it
+	answered   bool   // the stream holds a message of the model's, whether or not a result followed
 }
 
 // stopGrace is how long a run that ran out of its time has to stop after SIGTERM before it is killed.
@@ -224,7 +225,8 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 			res.Failure = fmt.Sprintf("exit %v: %s", waitErr, lastLine(filepath.Join(inv.Dir, "stderr.txt")))
 		}
 	}
-	// the proof a run was on Bedrock: the model ran, and its requests went through the run's relay to the broker
+	// the proof a run was on Bedrock: the model ran (a result, or only a message of its own in a run cut short),
+	// and the broker answered a model request of it, through the run's relay
 	if modelRan(res) && route.models.Load() == 0 {
 		res.Status, res.Failure = store.RunFailed, "not on Bedrock"
 		return res, fmt.Errorf("%w: the run's model answered, but no request of it reached the Bedrock broker", ErrNoBedrock)
@@ -303,8 +305,11 @@ func readStream(path string) (Result, error) {
 			Type    string
 			Message struct{ Model string }
 		}
-		if json.Unmarshal(line, &message) == nil && message.Type == "assistant" && message.Message.Model != "" {
-			res.Model = message.Message.Model
+		if json.Unmarshal(line, &message) == nil && message.Type == "assistant" {
+			res.answered = true
+			if message.Message.Model != "" {
+				res.Model = message.Message.Model
+			}
 		}
 		if !bytes.Contains(line, []byte(`"type":"result"`)) && !bytes.Contains(line, []byte(`"type": "result"`)) {
 			continue
@@ -330,7 +335,7 @@ func readStream(path string) (Result, error) {
 			continue
 		}
 		found = true
-		res = Result{Model: res.Model, Text: r.Result, Report: r.StructuredOutput, Session: r.SessionID,
+		res = Result{Model: res.Model, answered: res.answered, Text: r.Result, Report: r.StructuredOutput, Session: r.SessionID,
 			Denials: len(r.PermissionDenials), Tokens: r.Usage.Input + r.Usage.Output + r.Usage.CacheRead + r.Usage.CacheCreate}
 		if r.TotalCostUSD != nil && *r.TotalCostUSD >= 0 && !math.IsInf(*r.TotalCostUSD, 0) && !math.IsNaN(*r.TotalCostUSD) {
 			res.USD, res.CostKnown = *r.TotalCostUSD, true

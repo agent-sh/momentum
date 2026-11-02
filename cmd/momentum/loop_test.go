@@ -383,9 +383,44 @@ func TestTheLoopRunsOnBedrock(t *testing.T) {
 	if r.Agent.Bedrock == nil || r.Agent.Bedrock.File != route || !loop.BedrockModel(r.Agent.Model) || !loop.BedrockModel(r.Agent.Fallback) {
 		t.Fatalf("the loop's agent: %+v", r.Agent)
 	}
-	for _, c := range []config.Loop{{Runner: []string{"claude"}, Model: "claude-opus-5-5"}, {Runner: []string{"claude"}, FallbackModel: "us.anthropic.claude-sonnet-5-5"}} {
-		if _, _, err := setup(st, c); err == nil || !strings.Contains(err.Error(), "no Bedrock model") {
+	write := func(name, text string) string {
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, []byte(text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	good := write("bedrock.env", "CLAUDE_CODE_USE_BEDROCK=\"1\"\nANTHROPIC_BEDROCK_BASE_URL=\"http://127.0.0.1:9/n\"\nCLAUDE_CODE_SKIP_BEDROCK_AUTH=\"1\"\nANTHROPIC_DEFAULT_OPUS_MODEL=\"global.anthropic.claude-opus-5-5\"\n")
+	for _, c := range []config.Loop{{Model: "claude-opus-5-5"}, {FallbackModel: "us.anthropic.claude-sonnet-5-5"}, {Model: "haiku"}, {FallbackModel: "fable"}} {
+		c.Runner, c.BedrockEnv = []string{"claude"}, good
+		r, _, err := setup(st, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := onBedrock(r.Agent); err == nil || !strings.Contains(err.Error(), "no Bedrock model") {
 			t.Errorf("%+v: %v", c, err)
 		}
+	}
+	r, _, err = setup(st, config.Loop{Runner: []string{"claude"}, BedrockEnv: good})
+	if err != nil || onBedrock(r.Agent) != nil {
+		t.Fatalf("the defaults on a good route: %v %v", err, onBedrock(r.Agent))
+	}
+	// a pin that is no global profile is no route
+	r, _, _ = setup(st, config.Loop{Runner: []string{"claude"}, BedrockEnv: write("regional.env", "CLAUDE_CODE_USE_BEDROCK=\"1\"\nANTHROPIC_BEDROCK_BASE_URL=\"http://127.0.0.1:9/n\"\nCLAUDE_CODE_SKIP_BEDROCK_AUTH=\"1\"\nANTHROPIC_DEFAULT_HAIKU_MODEL=\"us.anthropic.claude-haiku-5-5\"\n")})
+	if err := onBedrock(r.Agent); err == nil || !strings.Contains(err.Error(), "no global inference profile") {
+		t.Errorf("a regional pin: %v", err)
+	}
+}
+
+// With no Bedrock route the loop starts nothing: no run is reserved.
+func TestALoopWithNoBedrockRouteStartsNothing(t *testing.T) {
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	conf := `{"loop":{"runner":["claude"],"bedrock_env":"` + filepath.Join(t.TempDir(), "absent.env") + `"}}`
+	if err := os.WriteFile(filepath.Join(os.Getenv("MOMENTUM_CONFIG"), "sources.json"), []byte(conf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, diag := momentum("loop"); code == 0 || !strings.Contains(diag, "no Bedrock route") {
+		t.Fatalf("exit %d %s", code, diag)
 	}
 }

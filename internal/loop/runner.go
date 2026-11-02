@@ -500,8 +500,12 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 		reserved = r.Budgets.Run
 	}
 	run.Ended = r.now()
+	notOnBedrock := errors.Is(err, ErrNoBedrock)
 	if err != nil {
 		run.Status, run.Failure = store.RunFailed, err.Error()
+		if res.CostKnown { // what it spent, wherever it went
+			run.USD, run.Tokens, run.Turns = res.USD, res.Tokens, res.Turns
+		}
 	} else {
 		run.Status, run.Failure, run.USD, run.Tokens, run.Turns = res.Status, res.Failure, res.USD, res.Tokens, res.Turns
 		run.Model = firstOf(res.Model, run.Model)
@@ -519,7 +523,7 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 	// or, when it was cut short, from the findings it kept as it went, whatever error ended the run. It is recorded
 	// before the run ends, so a loop that dies between the two leaves a running run, which stale recovery ends and
 	// records again under the same guard.
-	if run.Step == StepInvestigate {
+	if run.Step == StepInvestigate && !notOnBedrock { // a run not on Bedrock does not count: nothing goes into its case
 		// one that ended well with a report short of a mechanism or a fix did not decide: its case closes as
 		// insufficient evidence, and comes back once as much evidence again comes in (Cases)
 		why := undecided(res, err)
@@ -536,7 +540,7 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 	}
 	// A report cannot choose another case to change. Its root is applied to this run's case, after it ends, but not
 	// while the case's change is open on its pull request, where a merge by the root would close the case under it.
-	if err == nil && res.Status == store.RunOK && run.Step != StepReview {
+	if err == nil && res.Status == store.RunOK && run.Step != StepReview { // a run not on Bedrock has its error
 		var report struct {
 			Root string `json:"root"`
 		}
