@@ -48,8 +48,21 @@ const maxPath = 4096
 // sandbox makes itself: Command refuses all of these.
 //
 // What a program writes under a writable mount is input to every process outside the sandbox that reads or runs it
-// afterwards. Command makes the control files git runs in a repository the mount holds read-only (gitControl); the
-// rest is for the caller's gates to check before it reads what the program left, not the sandbox's to prevent.
+// afterwards. The sandbox guards one case. A writable mount that holds a .git directory gets that whole directory
+// read-only, bound onto itself right after the mount (--ro-bind PATH/.git PATH/.git). A list of the files git runs
+// would not hold: a program could replace .git, redirect git with a commondir or a config.worktree file, or make a
+// hooks directory the repository did not have, and git would run what it wrote, outside, with the environment and
+// the credentials of whoever runs git.
+//
+// Inside, a program reads the history (git log, diff, status, show, branch) and writes its work tree. It cannot add
+// or commit, change anything in .git, or move .git away: the caller commits outside. That costs it everything that
+// writes the index, a ref or the configuration. git add, git commit, git config, git remote add and the upstream of
+// git push -u fail with "Read-only file system", and a move or removal of .git itself with "Device or resource busy".
+//
+// A .git that is a file or a link is left alone: a linked work tree's .git is a file that links outside, and the
+// caller's gates check the link. Everything else under a writable mount is for those gates to check before git, or
+// any other process, reads what the program left: a linked work tree's control files, .gitmodules and a nested .git
+// among them.
 type Mount struct {
 	Path  string
 	Write bool
@@ -73,23 +86,18 @@ type Spec struct {
 }
 
 // etc are the files of /etc a program may need to start, read-only: the dynamic loader's cache, the alternatives'
-// links, name service and protocol tables, time zones, and the public certificate authorities (the certs directory
-// and the OpenSSL configuration, not /etc/ssl whole: its private directory holds keys that its group can read, and
-// the sandbox keeps the caller's groups). The certs directory links into /usr/share/ca-certificates, which /usr
-// holds; on a system whose links lead elsewhere under /etc they dangle inside until that directory is added here.
-// passwd, group and hosts are the sandbox's own (identity). Nothing else of /etc is there.
+// links, name service and protocol tables, time zones, the MIME types and os-release, and the public certificate
+// authorities (the certs directory and the OpenSSL configuration, not /etc/ssl whole: its private directory holds
+// keys that its group can read, and the sandbox keeps the caller's groups). The certs directory links into
+// /usr/share/ca-certificates, which /usr holds; on a system whose links lead elsewhere under /etc they dangle inside
+// until that directory is added here. passwd, group and hosts are the sandbox's own (identity). Nothing else of /etc
+// is there.
 var etc = []string{"/etc/alternatives", "/etc/gai.conf", "/etc/host.conf", "/etc/ld.so.cache", "/etc/ld.so.conf",
 	"/etc/ld.so.conf.d", "/etc/localtime", "/etc/mime.types", "/etc/nsswitch.conf", "/etc/os-release", "/etc/protocols",
 	"/etc/services", "/etc/ssl/certs", "/etc/ssl/openssl.cnf", "/etc/timezone"}
 
 // system are the directories of programs and libraries, read-only. On a merged /usr the others are links into it.
 var system = []string{"/usr", "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/libx32"}
-
-// gitControl are the paths in a repository's .git that git runs or reads as commands: its hooks, its configuration
-// (fsmonitor, sshCommand, aliases, filter drivers) and its info directory (attributes). What a run writes there is
-// run by git outside the sandbox, with that process's environment and credentials, and a reviewed diff does not show
-// it, since git does not track .git. A writable mount that holds a .git directory gets these read-only.
-var gitControl = []string{".git/hooks", ".git/config", ".git/info"}
 
 // Command is argv run in the sandbox. The command it returns is bubblewrap's; its environment is the program's.
 //
@@ -216,12 +224,12 @@ func (s Spec) check() (home string, mounts []string, err error) {
 			continue
 		}
 		mounts = append(mounts, "--bind", m.Path, m.Path)
-		guarded, err := gitReadOnly(m.Path)
+		git, err := gitDir(m.Path)
 		if err != nil {
 			return "", nil, err
 		}
-		for _, p := range guarded {
-			mounts = append(mounts, "--ro-bind", p, p)
+		if git != "" {
+			mounts = append(mounts, "--ro-bind", git, git)
 		}
 	}
 	return home, mounts, nil
@@ -232,37 +240,24 @@ func holds(a, b string) bool {
 	return a == b || a == "/" || strings.HasPrefix(b, a+"/")
 }
 
-// gitReadOnly returns the paths of gitControl that exist in the repository at root, when root holds a .git directory:
-// they are bound read-only over the writable mount, after it. A .git that is a file (a linked work tree: it links to
-// a directory outside) has none of them, and what it links to is the caller's to check. A control path that is a link
-// is refused: a mount over a link lands on its target, and the run could replace the link. The paths are looked at
-// when Command runs, so a control file that does not exist then is not guarded.
-func gitReadOnly(root string) ([]string, error) {
+// gitDir returns the .git directory of the repository at root, when root is a directory that holds one, and "" when
+// it holds none: Command binds it read-only over the writable mount, after it (see Mount). A .git that is a file (a
+// linked work tree's: it links to a directory outside) or a link is not a directory to bind and is left alone: what
+// it leads to is the caller's to check. The directory is looked at when Command runs.
+func gitDir(root string) (string, error) {
 	if st, err := os.Stat(root); err != nil || !st.IsDir() {
-		return nil, nil // a file, or nothing: bubblewrap says what is wrong with a mount it cannot make
+		return "", nil // a file, or nothing: bubblewrap says what is wrong with a mount it cannot make
 	}
-	switch st, err := os.Lstat(filepath.Join(root, ".git")); {
+	git := filepath.Join(root, ".git")
+	switch st, err := os.Lstat(git); {
 	case errors.Is(err, fs.ErrNotExist):
-		return nil, nil
+		return "", nil
 	case err != nil:
-		return nil, err
+		return "", err
 	case !st.IsDir():
-		return nil, nil
+		return "", nil
 	}
-	var paths []string
-	for _, rel := range gitControl {
-		p := filepath.Join(root, rel)
-		switch st, err := os.Lstat(p); {
-		case errors.Is(err, fs.ErrNotExist):
-		case err != nil:
-			return nil, err
-		case st.Mode()&os.ModeSymlink != 0:
-			return nil, fmt.Errorf("jail: %s is a link, and a mount cannot make a link read-only", p)
-		default:
-			paths = append(paths, p)
-		}
-	}
-	return paths, nil
+	return git, nil
 }
 
 // dataFile is the read end of a pipe that holds data, for bubblewrap's --ro-bind-data. The data is written from a

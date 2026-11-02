@@ -2,6 +2,7 @@ package jail
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -209,7 +210,20 @@ func answer(ctx context.Context, c net.Conn, run func(context.Context, Request) 
 	case json.Unmarshal(line, &req) != nil || len(req.Argv) == 0 || req.Argv[0] == "":
 		return Refuse("momentum: the door read no command")
 	}
-	return safely(ctx, run, req)
+	// The client sends its one line, ended by a newline, and then waits for the reply: it sends nothing more and does
+	// not half-close. So a read that returns now (end of file, or an error) means the client is gone, and the command
+	// it asked for ends with it; a command nobody waits for would run on, holding its locks, until it finished or its
+	// own time ran out. What the client may still send is discarded. A request that the client ended by half-closing
+	// instead of by a newline has already met end of file, which then says nothing: that command runs to its end.
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if bytes.HasSuffix(line, []byte("\n")) {
+		go func() {
+			io.Copy(io.Discard, c)
+			cancel()
+		}()
+	}
+	return safely(runCtx, run, req)
 }
 
 var errTooLong = errors.New("request over the limit")

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -201,8 +202,45 @@ func TestTheDoorsSocketAndItsDirectoryAreTheOwners(t *testing.T) {
 	}
 }
 
+// watched is a listener whose connections tell the test when the door first reads from one and when it first writes
+// to one: the door is then waiting on the peer for a request, or stuck in a reply the peer does not read.
+type watched struct {
+	net.Listener
+	reading, writing    chan struct{}
+	readOnce, writeOnce sync.Once
+}
+
+func newWatched(ln net.Listener) *watched {
+	return &watched{Listener: ln, reading: make(chan struct{}), writing: make(chan struct{})}
+}
+
+func (l *watched) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &watchedConn{Conn: c, l: l}, nil
+}
+
+type watchedConn struct {
+	net.Conn
+	l *watched
+}
+
+func (c *watchedConn) Read(p []byte) (int, error) {
+	c.l.readOnce.Do(func() { close(c.l.reading) })
+	return c.Conn.Read(p)
+}
+
+func (c *watchedConn) Write(p []byte) (int, error) {
+	c.l.writeOnce.Do(func() { close(c.l.writing) })
+	return c.Conn.Write(p)
+}
+
 // stop never waits on a client: not on one that connects and sends nothing, and not on one that sent its request and
-// never reads the 8 MiB reply (the door's write is stuck in it).
+// never reads the 8 MiB reply (the door's write is stuck in it). stop is called only once the door is waiting on the
+// peer - reading for a request, or writing a reply - so that it is stop that has to end the wait: before that, a
+// connection the door has not accepted yet makes the case pass whether the door closes connections on stop or not.
 func TestAClientThatSendsNothingOrNeverReadsDoesNotHoldStop(t *testing.T) {
 	big := make([]byte, MaxStream)
 	for _, c := range []struct {
@@ -211,18 +249,28 @@ func TestAClientThatSendsNothingOrNeverReadsDoesNotHoldStop(t *testing.T) {
 	}{{"sends nothing", false}, {"never reads its reply", true}} {
 		t.Run(c.name, func(t *testing.T) {
 			sock := filepath.Join(jailtest.SocketDir(t), "d.sock")
-			stop, err := ServeDoor(sock, func(context.Context, Request) Reply { return Reply{Stdout: big} })
+			ln, err := listenPrivate(sock)
 			if err != nil {
 				t.Fatal(err)
 			}
+			w := newWatched(ln)
+			stop := serve(w, sock, func(context.Context, Request) Reply { return Reply{Stdout: big} })
 			conn, err := net.Dial("unix", sock)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer conn.Close()
+			waiting := w.reading
 			if c.send {
 				conn.Write(requestOf(t, 100))
-				time.Sleep(200 * time.Millisecond) // the door is now writing a reply nobody reads
+				waiting = w.writing
+			}
+			select {
+			case <-waiting:
+			case <-time.After(5 * time.Second):
+				conn.Close()
+				stop()
+				t.Fatal("the door never took up the connection")
 			}
 			done := make(chan struct{})
 			go func() { stop(); close(done) }()
@@ -607,4 +655,165 @@ func TestCallRefusesWhatTheDoorWouldRewriteOrRefuse(t *testing.T) {
 	if len(seen) != 0 {
 		t.Errorf("the door read %d requests that Call should have refused: %+v", len(seen), seen)
 	}
+}
+
+// failing is a listener whose Accept fails until a time has passed, counting the calls that failed, and then hands
+// out the connections it was given.
+type failing struct {
+	until  time.Time
+	failed atomic.Int32
+	conns  chan net.Conn
+	done   chan struct{}
+	once   sync.Once
+}
+
+func (l *failing) Accept() (net.Conn, error) {
+	if time.Now().Before(l.until) {
+		l.failed.Add(1)
+		return nil, emfile()
+	}
+	select {
+	case c := <-l.conns:
+		return c, nil
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *failing) Close() error   { l.once.Do(func() { close(l.done) }); return nil }
+func (l *failing) Addr() net.Addr { return &net.UnixAddr{Name: "failing", Net: "unix"} }
+
+// The accept loop waits between errors, as SPEC says: 5 ms at first and twice as long each time. A listener that
+// fails for 100 ms is asked about 5 times (at 0, 5, 15, 35 and 75 ms), where a loop that does not wait asks it
+// thousands of times, and the connection that comes after the errors is served.
+func TestTheAcceptLoopWaitsBetweenErrorsAndServesOnceTheyEnd(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	l := &failing{until: time.Now().Add(100 * time.Millisecond), conns: make(chan net.Conn, 1), done: make(chan struct{})}
+	l.conns <- server
+	served := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	ended := make(chan struct{})
+	go func() {
+		acceptLoop(ctx, l, func(c net.Conn) { c.Close(); served <- struct{}{} })
+		close(ended)
+	}()
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Error("the loop did not serve the connection that came after the errors")
+	}
+	failed := l.failed.Load()
+	cancel()
+	l.Close()
+	<-ended
+	if failed < 3 || failed > 8 {
+		t.Errorf("the listener was asked %d times while it failed for 100 ms, want about 5", failed)
+	}
+}
+
+// SPEC states the door's numbers next to what they bound, and the code holds them in constants. A test written with
+// the constants passes whatever they are, so this one reads SPEC and fails when the two disagree.
+func TestSpecStatesTheNumbersTheDoorUses(t *testing.T) {
+	doc, err := os.ReadFile("../../SPEC.md")
+	if err != nil {
+		t.Fatalf("SPEC.md is what the door's numbers are checked against: %v", err)
+	}
+	_, section, ok := strings.Cut(string(doc), "\n## Sandbox\n")
+	if !ok {
+		t.Fatal("SPEC.md has no Sandbox section")
+	}
+	section, _, _ = strings.Cut(section, "\n## ")
+	mib := func(name string, n int) string {
+		if n%(1<<20) != 0 {
+			t.Fatalf("%s is %d bytes, not a whole number of MiB", name, n)
+		}
+		return fmt.Sprintf("%d MiB", n>>20)
+	}
+	secs := func(name string, d time.Duration) string {
+		if d%time.Second != 0 {
+			t.Fatalf("%s is %v, not a whole number of seconds", name, d)
+		}
+		return fmt.Sprintf("%d s", d/time.Second)
+	}
+	for _, c := range []struct{ name, phrase string }{
+		{"MaxRequest", "one line of at most " + mib("MaxRequest", MaxRequest)},
+		{"requestTimeout", "arrives within " + secs("requestTimeout", requestTimeout)},
+		{"MaxStream", "carries at most " + mib("MaxStream", MaxStream) + " of each stream"},
+		{"replyTimeout", "taken within " + secs("replyTimeout", replyTimeout)},
+		{"MaxInFlight", fmt.Sprintf("At most %d requests", MaxInFlight)},
+		{"cutMarker", fmt.Sprintf("%d-byte marker", len(cutMarker))},
+	} {
+		if !strings.Contains(section, c.phrase) {
+			t.Errorf("%s: SPEC's Sandbox section does not say %q", c.name, c.phrase)
+		}
+	}
+}
+
+// A command whose client has gone ends with it: its context is cancelled while the door keeps serving others, and a
+// client that ends its request by half-closing instead of a newline keeps its command running.
+func TestACommandEndsWhenItsClientGoesAway(t *testing.T) {
+	started, ended := make(chan struct{}, 4), make(chan string, 4)
+	sock := stubDoor(t, func(ctx context.Context, r Request) Reply {
+		if r.Argv[0] == "ping" {
+			return Reply{Stdout: []byte("pong")}
+		}
+		started <- struct{}{}
+		select {
+		case <-ctx.Done():
+			ended <- r.Argv[0] + " cancelled"
+			return Reply{}
+		case <-time.After(3 * time.Second):
+			ended <- r.Argv[0] + " finished"
+			return Reply{Stdout: []byte("done")}
+		}
+	})
+	c, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Write(append(mustJSON(t, Request{Argv: []string{"slow"}, Dir: "/"}), '\n')); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	c.Close()
+	select {
+	case got := <-ended:
+		if got != "slow cancelled" {
+			t.Fatalf("the command ended as %q, want cancelled", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the command kept running after its client closed the connection")
+	}
+	// the door still serves another client
+	r, err := exchange(t, sock, append(mustJSON(t, Request{Argv: []string{"ping"}, Dir: "/"}), '\n'))
+	if err != nil || string(r.Stdout) != "pong" {
+		t.Fatalf("the door stopped serving: %q, %v", r.Stdout, err)
+	}
+	// a request ended by half-closing, with no newline, is not a client that has gone
+	c2, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	c2.Write(mustJSON(t, Request{Argv: []string{"halfclosed"}, Dir: "/"}))
+	c2.(*net.UnixConn).CloseWrite()
+	<-started
+	select {
+	case got := <-ended:
+		if got != "halfclosed finished" {
+			t.Fatalf("a half-closed request ended as %q, want it to run to its end", got)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("the half-closed request never ended")
+	}
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }

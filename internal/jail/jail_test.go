@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -705,100 +706,134 @@ func TestMomentumsBinaryInsideIsReadOnly(t *testing.T) {
 	}
 }
 
-// A writable mount of a repository leaves its hooks, its configuration and its info directory read-only: git runs
-// what is written there when it next runs outside the sandbox. Outside, the same writes land, so each refusal is the
-// sandbox's. The rest of .git and the working tree stay writable. The fixture is a directory shaped like a
-// repository, not one git would use.
-func TestAWritableMountOfARepositoryKeepsItsControlFilesReadOnly(t *testing.T) {
+// /tmp and /var/tmp inside are the sandbox's own: a file planted in the machine's is not there, and a file the run
+// writes there does not reach the machine's. Outside, the planted file lists and reads, so the test fails when the
+// machine's directory is bound in, read-only or not.
+func TestTmpAndVarTmpInsideAreTheSandboxsOwn(t *testing.T) {
 	s := spec(t)
-	repo := s.Mounts[0].Path
-	git := filepath.Join(repo, ".git")
-	write(t, filepath.Join(git, "config"), "[core]\n\tbare = false\n")
-	write(t, filepath.Join(git, "hooks", "pre-commit.sample"), "# sample\n")
-	write(t, filepath.Join(git, "info", "exclude"), "# none\n")
-	write(t, filepath.Join(git, "HEAD"), "ref: refs/heads/main\n")
-	script := fmt.Sprintf(`cd %q
-for p in .git/config .git/hooks/post-commit .git/hooks/pre-commit.sample .git/info/attributes .git/info/exclude; do
-  if echo "%s" >> $p; then echo "wrote $p"; else echo "refused $p"; fi
-done
-echo "%s" >> .git/HEAD && echo "wrote .git/HEAD"; echo "%s" > work.txt && echo "wrote work.txt"`, repo, marker, marker, marker)
-	out, err := run(t, s, script)
-	if err != nil {
-		t.Fatalf("%v: %s", err, out)
-	}
-	for _, p := range []string{".git/config", ".git/hooks/post-commit", ".git/hooks/pre-commit.sample", ".git/info/attributes", ".git/info/exclude"} {
-		if !strings.Contains(out, "refused "+p) {
-			t.Errorf("a write to %s is not refused:\n%s", p, out)
-		}
-	}
-	for _, p := range []string{".git/HEAD", "work.txt"} {
-		if !strings.Contains(out, "wrote "+p) {
-			t.Errorf("a write to %s is refused:\n%s", p, out)
-		}
-	}
-	if got, _ := os.ReadFile(filepath.Join(git, "config")); string(got) != "[core]\n\tbare = false\n" {
-		t.Errorf(".git/config changed: %q", got)
-	}
-	for _, p := range []string{"hooks/post-commit", "info/attributes"} {
-		if _, err := os.Stat(filepath.Join(git, p)); err == nil {
-			t.Errorf("%s was created", p)
-		}
-	}
-	if o := outside(script); strings.Contains(o, "refused") {
-		t.Fatalf("outside the sandbox the same writes land:\n%s", o)
+	for _, dir := range []string{"/tmp", "/var/tmp"} {
+		t.Run(dir, func(t *testing.T) {
+			planted := filepath.Join(dir, "planted-"+randomHex(t))
+			if err := os.WriteFile(planted, []byte(marker+"\n"), 0o600); err != nil {
+				t.Skipf("the machine's %s takes no file here: %v", dir, err)
+			}
+			t.Cleanup(func() { os.Remove(planted) })
+			written := filepath.Join(dir, "written-inside-"+randomHex(t))
+			t.Cleanup(func() { os.Remove(written) }) // only if a write inside reaches the machine's directory
+			look := fmt.Sprintf(`ls -A %s; echo '== read'; cat %q 2>/dev/null; echo '== end'`, dir, planted)
+			if out := outside(look); !strings.Contains(out, filepath.Base(planted)) || !strings.Contains(out, marker) {
+				t.Fatalf("outside the sandbox the planted file lists and reads: %s", out)
+			}
+			out, err := run(t, s, look+fmt.Sprintf(`; echo inside > %q && echo wrote-inside`, written))
+			if err != nil {
+				t.Fatalf("%v: %s", err, out)
+			}
+			listing, rest, _ := strings.Cut(out, "== read")
+			read, rest, _ := strings.Cut(rest, "== end")
+			if strings.Contains(listing, filepath.Base(planted)) || strings.Contains(read, marker) {
+				t.Fatalf("the machine's %s is inside:\n%s", dir, out)
+			}
+			if !strings.Contains(rest, "wrote-inside") {
+				t.Errorf("the sandbox's %s takes no write:\n%s", dir, out)
+			}
+			if _, err := os.Lstat(written); err == nil {
+				t.Errorf("a file written inside %s reached the machine's", dir)
+			}
+		})
 	}
 }
 
-// Command binds the control files that exist after a writable mount that holds a .git directory, and only then. This
-// is the shape of the arguments; the sandbox itself is the test above.
-func TestCommandBindsGitsControlFilesAfterAWritableMountOfARepository(t *testing.T) {
-	repo := t.TempDir()
-	git := filepath.Join(repo, ".git")
-	write(t, filepath.Join(git, "config"), "[core]\n")
-	write(t, filepath.Join(git, "hooks", "pre-commit.sample"), "# sample\n")
-	// no info directory: whatever exists is bound
-	argsOf := func(s Spec) []string {
-		t.Helper()
-		cmd, err := s.Command(context.Background(), "true")
-		if err != nil {
-			t.Fatal(err)
-		}
-		Close(cmd)
-		return cmd.Args
+// /dev inside is the sandbox's own: the nodes bubblewrap makes and none of the machine's others. Every node the
+// machine's /dev has beyond those is looked for inside and is not there, so the test fails when the machine's /dev is
+// bound in, read-only or not.
+func TestDevInsideIsTheSandboxsOwn(t *testing.T) {
+	s := spec(t)
+	// what bubblewrap makes in a /dev of its own: the nodes it binds from the machine's, the links, and /dev/core, a link
+	// to /proc/kcore; console is there only when bubblewrap's standard input is a terminal
+	own := map[string]bool{"core": true, "console": true, "fd": true, "full": true, "null": true, "ptmx": true, "pts": true,
+		"random": true, "shm": true, "stderr": true, "stdin": true, "stdout": true, "tty": true, "urandom": true, "zero": true}
+	ents, err := os.ReadDir("/dev")
+	if err != nil {
+		t.Skipf("the machine's /dev cannot be listed: %v", err)
 	}
-	contains := func(args []string, seq ...string) bool {
-		for i := 0; i+len(seq) <= len(args); i++ {
-			if strings.Join(args[i:i+len(seq)], "\x00") == strings.Join(seq, "\x00") {
-				return true
+	var machine []string // the machine's nodes that a sandbox does not make
+	for _, e := range ents {
+		if !own[e.Name()] {
+			machine = append(machine, e.Name())
+		}
+	}
+	if len(machine) == 0 {
+		t.Log("the machine's /dev holds only what a sandbox's does: there is no other node to look for")
+	}
+	argv := append([]string{"/bin/bash", "-c", `ls -A /dev; echo '== machine'; for n; do if test -e "/dev/$n"; then echo "present $n"; fi; done`, "bash"}, machine...)
+	out, err := runArgv(t, s, argv...)
+	if err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	listing, present, _ := strings.Cut(out, "== machine")
+	inside := map[string]bool{}
+	var extra []string
+	for _, n := range strings.Fields(listing) {
+		inside[n] = true
+		if !own[n] {
+			extra = append(extra, n)
+		}
+	}
+	if len(extra) > 0 {
+		t.Errorf("/dev holds %d nodes that bubblewrap does not make: %v", len(extra), extra)
+	}
+	for _, n := range []string{"null", "zero", "full", "random", "urandom"} {
+		if !inside[n] {
+			t.Errorf("/dev holds no %s", n)
+		}
+	}
+	if strings.Contains(present, "present") {
+		t.Errorf("nodes of the machine's /dev are inside:\n%s", present)
+	}
+}
+
+// The program starts with exactly the environment the Spec gives it - Spec.Env, DoorEnv when there is a door, and the
+// PWD that bubblewrap sets - with a route (where sandbox-init starts it) and without one. Nothing of the caller's own
+// environment passes on, and nothing of sandbox-init's. The caller's environment is given a synthetic variable here; a
+// variable that arrives unasked is named in the failure and its value is not printed.
+func TestTheProgramGetsExactlyTheEnvironmentTheSpecGives(t *testing.T) {
+	t.Setenv("PRIVATE_SETTING", marker)
+	for _, c := range []struct {
+		name        string
+		route, door bool
+	}{{"no route, no door", false, false}, {"a door", false, true}, {"a route", true, false}, {"a route and a door", true, true}} {
+		t.Run(c.name, func(t *testing.T) {
+			s := spec(t)
+			s.Env = append(s.Env, "PROBE_ONE="+marker, "PROBE_TWO=two words")
+			want := slices.Clone(s.Env)
+			if c.route {
+				s = withRoute(t, s)
 			}
-		}
-		return false
-	}
-	home := t.TempDir()
-	hooks, config, info := filepath.Join(git, "hooks"), filepath.Join(git, "config"), filepath.Join(git, "info")
-	args := argsOf(Spec{Home: home, Mounts: []Mount{{Path: repo, Write: true}}})
-	if !contains(args, "--bind", repo, repo, "--ro-bind", hooks, hooks, "--ro-bind", config, config) {
-		t.Errorf("want hooks and config read-only right after the writable mount: %v", args)
-	}
-	if contains(args, "--ro-bind", info, info) {
-		t.Errorf("an info directory that does not exist is bound: %v", args)
-	}
-	if args := argsOf(Spec{Home: home, Mounts: []Mount{{Path: repo}}}); contains(args, "--ro-bind", hooks, hooks) || contains(args, "--ro-bind", config, config) {
-		t.Errorf("a read-only mount needs no extra binds: %v", args)
-	}
-	linked := t.TempDir() // a linked work tree: .git is a file that links outside
-	write(t, filepath.Join(linked, ".git"), "gitdir: /synthetic/main/.git/worktrees/w\n")
-	if args := argsOf(Spec{Home: home, Mounts: []Mount{{Path: linked, Write: true}}}); strings.Contains(strings.Join(args, " "), linked+"/.git") {
-		t.Errorf("a .git file is bound: %v", args)
-	}
-	file := filepath.Join(t.TempDir(), "result.json") // a writable single file is not a repository
-	write(t, file, "{}\n")
-	argsOf(Spec{Home: home, Mounts: []Mount{{Path: file, Write: true}}})
-	// a control file that is a link is refused: a mount over it lands on its target, and the run could replace the link
-	if err := os.Symlink(filepath.Join(t.TempDir(), "elsewhere"), filepath.Join(git, "info")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := (Spec{Home: home, Mounts: []Mount{{Path: repo, Write: true}}}).Command(context.Background(), "true"); err == nil || !strings.Contains(err.Error(), "link") {
-		t.Errorf("a link in place of .git/info: %v", err)
+			if c.door {
+				s.Door = stubDoor(t, func(context.Context, Request) Reply { return Reply{} })
+				want = append(want, DoorEnv+"="+DoorSocket)
+			}
+			want = append(want, "PWD="+s.Dir)
+			out, err := runArgv(t, s, "/usr/bin/env")
+			if err != nil {
+				t.Fatalf("%v: %s", err, out)
+			}
+			got := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+			var missing, unasked []string
+			for _, kv := range want {
+				if !slices.Contains(got, kv) {
+					missing = append(missing, kv)
+				}
+			}
+			for _, kv := range got {
+				if !slices.Contains(want, kv) {
+					name, _, _ := strings.Cut(kv, "=")
+					unasked = append(unasked, name)
+				}
+			}
+			if len(missing) > 0 || len(unasked) > 0 {
+				t.Errorf("the program got %d variables, want %d\nmissing: %q\nunasked: %v", len(got), len(want), missing, unasked)
+			}
+		})
 	}
 }
