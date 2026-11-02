@@ -106,7 +106,7 @@ func TestEvidenceIsCheckedAndAnEventFillsItsOwn(t *testing.T) {
 func ptr(s string) *string { return &s }
 
 // An investigation moves a case among open, investigating and testing, and to testing only with a mechanism and a
-// next discriminating test on record. Deploying is the ship tool's, measuring and improved the measure tool's.
+// fix (its next test) on record. Deploying is the ship tool's, measuring and improved the measure tool's.
 func TestAnInvestigationMovesACaseOnlyWhereItMay(t *testing.T) {
 	st := caseStore(t)
 	ctx := context.Background()

@@ -17,11 +17,11 @@ import (
 )
 
 // A case is one answer in progress to one of the standing questions (SPEC, Cases): its family, the evidence behind
-// it, the suspected mechanism, the alternatives, the next test that tells them apart, the expected benefit, what it
+// it, the suspected mechanism, the alternatives, the next test (the fix a build tests), the expected benefit, what it
 // cost so far, and its status. Cases are kept: nothing derives them, so a schema change keeps them and Rebuild never
 // touches them. A case is found by its signatures, so the same problem seen again lands in the same case: a
-// detector's signature names a symptom, and the investigation adds the root cause's ("root:" and a key), which
-// merges every case that shares it into one.
+// detector's signature names a symptom, and a build that checked the findings adds the root cause's ("root:" and a
+// key), which merges every case that shares it into one.
 
 // caseTables are the case store's kept tables. A new kept table takes no step: a store from before it gains it at its
 // next open.
@@ -91,8 +91,8 @@ var CloseReasons = []CloseReason{Improved, NotWorthIt, Insufficient, Solved, Dup
 // transcript, past which the evidence behind it is gone from its source.
 const CaseRetention = 30 * 24 * time.Hour
 
-// RootPrefix starts the signature of a root cause, which an investigation adds to its case: it links the cases of
-// one cause, and never opens one, since a stated cause is a guess until a test discriminates it.
+// RootPrefix starts the signature of a root cause, which a build adds to its case once the findings hold: it links
+// the cases of one cause, and never opens one, since a stated cause is a guess until a test discriminates it.
 const RootPrefix = "root:"
 
 // Lengths a case's texts are kept to.
@@ -114,7 +114,7 @@ type Case struct {
 	Into         string      // when closed as a duplicate: the case it went into
 	Mechanism    string      // the suspected mechanism
 	Alternatives []string    // the other mechanisms that could explain the evidence
-	NextTest     string      // the next discriminating test
+	NextTest     string      // the next test: the fix the investigation found, which a build tests
 	Benefit      string      // the expected benefit
 	Cost         Cost        // what investigating and changing it cost so far
 	Evidence     int         // how many evidence refs it holds
@@ -512,7 +512,7 @@ func observe(ctx context.Context, q querier, f Finding, actor string, now time.T
 		return Case{}, "", err
 	}
 	if strings.HasPrefix(f.Signature, RootPrefix) {
-		return Case{}, "", badCase("%q names a root cause: an investigation adds it to its case, and a symptom's signature opens one", f.Signature)
+		return Case{}, "", badCase("%q names a root cause: a build adds it to its case, and a symptom's signature opens one", f.Signature)
 	}
 	var id string
 	err := q.QueryRowContext(ctx, `SELECT case_id FROM case_signatures WHERE signature = ?`, f.Signature).Scan(&id)
@@ -682,7 +682,8 @@ type CaseUpdate struct {
 	Benefit      *string
 }
 
-// working are the statuses an investigation moves a case among.
+// working are the statuses the loop moves a case among: the runner records an investigation into testing, and a
+// build that finds the findings do not hold sends it back.
 var working = []CaseStatus{CaseOpen, CaseInvestigating, CaseTesting}
 
 // UpdateCase changes a case's investigation, as CaseUpdate says, and logs what changed. A case closed as a
@@ -804,7 +805,7 @@ func updateCase(ctx context.Context, tx *sql.Tx, c Case, u CaseUpdate, actor str
 		next = caseText(*u.NextTest, caseTextMax)
 	}
 	if after == CaseTesting && (mech == "" || next == "") {
-		return Case{}, badCase("case %s is in testing only with a mechanism and the next discriminating test on record", c.ID)
+		return Case{}, badCase("case %s is in testing only with a mechanism and a fix (its next test) on record", c.ID)
 	}
 	sets, args = append(sets, "updated = ?"), append(args, now.UnixMilli(), c.ID)
 	if _, err := tx.ExecContext(ctx, `UPDATE cases SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...); err != nil {
@@ -1021,8 +1022,8 @@ func merge(ctx context.Context, q querier, c Case, into, why, actor string, now 
 	return getCase(ctx, q, dst.ID)
 }
 
-// AddCaseSignature gives a case another signature, so what a detector sees by it lands there; the investigation
-// names the root cause so ("root:" and a key). A signature another case holds merges this case into that one:
+// AddCaseSignature gives a case another signature, so what a detector sees by it lands there; a build names the
+// root cause so ("root:" and a key). A signature another case holds merges this case into that one:
 // cases dedupe by root cause. It returns the case that holds the evidence now, and whether a merge happened.
 func (s *Store) AddCaseSignature(ctx context.Context, id, sig, actor string) (Case, bool, error) {
 	if err := checkSignature(sig); err != nil {

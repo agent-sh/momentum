@@ -182,6 +182,20 @@ func (s *Ship) pkgDir(c string) string  { return filepath.Join(s.Dir, "packages"
 func (s *Ship) workDir(c string) string { return filepath.Join(s.Dir, "work", c) }
 
 // Load reads a case's package; ok is false when it has none.
+// ChangeOpen says whether a case's change waits on its pull request (proposed, revising or landing), and its state.
+// Such a case answers its review: closing it, sending it back or merging it by a root would leave its pull request
+// open with nothing in the loop to return to it. A package that cannot be read counts as open.
+func (s *Ship) ChangeOpen(caseID string) (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	p, ok, err := s.Load(caseID)
+	if err != nil {
+		return "unreadable", true
+	}
+	return p.State, ok && slices.Contains([]string{Proposed, Revising, Landing}, p.State)
+}
+
 func (s *Ship) Load(caseID string) (Package, bool, error) {
 	raw, err := os.ReadFile(filepath.Join(s.pkgDir(caseID), "package.json"))
 	if errors.Is(err, fs.ErrNotExist) {
@@ -221,7 +235,7 @@ func (s *Ship) working(ctx context.Context, caseID string) (store.Case, error) {
 		return store.Case{}, err
 	}
 	if c.Status != store.CaseTesting {
-		return store.Case{}, refused("case %s is %s: a change is built only for a case in testing (a mechanism and a discriminating test on record)", c.ID, c.Status)
+		return store.Case{}, refused("case %s is %s: a change is built only for a case in testing (a mechanism and a fix on record)", c.ID, c.Status)
 	}
 	return c, nil
 }

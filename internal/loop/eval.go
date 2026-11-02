@@ -486,7 +486,7 @@ func (e *Eval) trial(ctx context.Context, t GoldenTask, n int) (tr Trial) {
 	// mechanism nor a fix; the loop's are on its case, where the runner wrote them, with the summary they came with
 	found, _, _ := investigationFindings(res, dir)
 	if !e.Native {
-		found = finding{Mechanism: after.Mechanism, Alternatives: after.Alternatives, Fix: after.NextTest, Report: found.Report}
+		found = loopFinding(after, found)
 	} else {
 		tr.Status = "native"
 	}
@@ -693,11 +693,10 @@ type finding struct {
 	Report       string   `json:"summary"`
 }
 
-// caseFinding reads only findings the investigation wrote, never the evaluation's own signature.
-func caseFinding(c store.Case, res Result) finding {
-	var rep struct{ Summary string }
-	json.Unmarshal(res.Report, &rep)
-	return finding{Mechanism: c.Mechanism, Alternatives: c.Alternatives, Fix: c.NextTest, Report: rep.Summary}
+// loopFinding is the loop arm's findings for its judge: what the runner wrote into its case (never the evaluation's
+// own signature or a root), with the summary the investigation's findings came with, read as the native arm's are.
+func loopFinding(c store.Case, found finding) finding {
+	return finding{Mechanism: c.Mechanism, Alternatives: c.Alternatives, Fix: c.NextTest, Report: found.Report}
 }
 
 // nativeFinding reads an investigation's report; alternatives given as one text, not the schema's list, are kept.

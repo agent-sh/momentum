@@ -37,7 +37,7 @@ func TestTheCaseCommands(t *testing.T) {
 		t.Fatalf("open again: exit %d %q", code, out)
 	}
 	if code, _, errOut := momentum("case", "set", id, "--status", "testing", "--mechanism", "the PATH lacks go"); code != 2 ||
-		!strings.Contains(errOut, "next discriminating test") {
+		!strings.Contains(errOut, "a fix (its next test)") {
 		t.Fatalf("testing without a next test: exit %d %s", code, errOut)
 	}
 	if code, _, errOut := momentum("case", "set", id, "--status", "investigating", "--mechanism", "the PATH lacks go",

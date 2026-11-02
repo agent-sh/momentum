@@ -182,7 +182,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total
 			t.Errorf("%s: the system prompt lacks the owner's constraints, or holds the machine's rules as they are now:\n%s", name, system)
 		case strings.Contains(string(system), "momentum's improvement loop") || !strings.HasPrefix(string(system), nativeBrief):
 			t.Errorf("%s: not the native brief alone:\n%s", name, system)
-		case strings.Contains(string(args), "Bash(momentum case") || !strings.Contains(string(args), e1.ID()):
+		case strings.Contains(settingsOf(t, string(args)), "Bash(momentum case") || !strings.Contains(string(args), e1.ID()):
 			t.Errorf("%s: it may change a case, or it is not given its events:\n%s", name, args)
 		case !native && (!strings.Contains(string(args), "zz-signal-text") || !strings.Contains(string(judged), "the loop mechanism") ||
 			!strings.Contains(string(judged), "the loop fix") || trs[0].Status != string(store.CaseTesting)):
@@ -193,4 +193,21 @@ echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total
 			t.Errorf("native: its status %q", trs[0].Status)
 		}
 	}
+}
+
+// settingsOf reads the settings file a harness's arguments name (--settings PATH): its rules are what the run may do.
+func settingsOf(t *testing.T, args string) string {
+	t.Helper()
+	lines := strings.Split(args, "\n")
+	for i, a := range lines {
+		if a == "--settings" && i+1 < len(lines) {
+			raw, err := os.ReadFile(lines[i+1])
+			if err != nil {
+				t.Fatalf("its settings: %v", err)
+			}
+			return string(raw)
+		}
+	}
+	t.Fatalf("no --settings in %q", args)
+	return ""
 }

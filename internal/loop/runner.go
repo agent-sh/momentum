@@ -221,16 +221,15 @@ func (r *Runner) endStale(ctx context.Context) error {
 			if r.Agent.Scope && run.Dir != "" {
 				StopScope(ScopeUnit(run.Dir))
 			}
-			if err := r.Store.FinishLoopRun(ctx, run); err != nil {
-				return err
-			}
-			// a killed investigation leaves its findings file: the case keeps what it found, still investigating
+			// a killed investigation leaves its findings file: the case keeps what it found, still investigating,
+			// recorded before the run ends, as the runner records a run's
 			if run.Step == StepInvestigate && run.Dir != "" {
 				if f, _, ok := investigationFindings(Result{}, run.Dir); ok {
-					if _, _, err := recordFindings(ctx, r.Store, run.Case, f, false, "loop:"+run.ID); err != nil {
-						r.logf("record the findings of %s: %v", run.Case, err)
-					}
+					r.keepFindings(ctx, run, f, false)
 				}
+			}
+			if err := r.Store.FinishLoopRun(ctx, run); err != nil {
+				return err
 			}
 		}
 	}
@@ -451,36 +450,50 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 	case !res.CostKnown:
 		run.USD = reserved // what it spent is unknown: its whole budget
 	}
+	// The runner keeps an investigation's case: what the run found goes into it, deterministically, from its report
+	// or, when it was cut short, from the findings it kept as it went, whatever error ended the run. It is recorded
+	// before the run ends, so a loop that dies between the two leaves a running run, which stale recovery ends and
+	// records again under the same guard.
+	if run.Step == StepInvestigate {
+		if f, reported, ok := investigationFindings(res, run.Dir); ok {
+			r.keepFindings(ctx, *run, f, reported)
+		}
+	}
 	if err := r.Store.FinishLoopRun(ctx, *run); err != nil {
 		r.logf("record run %s: %v", run.ID, err)
 		return
 	}
-	// The runner keeps an investigation's case: what the run found goes into it, deterministically, from its report
-	// or, when it was cut short, from the findings it kept as it went, whatever error ended the run.
 	if run.Step == StepInvestigate {
-		if f, reported, ok := investigationFindings(res, run.Dir); ok {
-			if own, recorded, err := recordFindings(ctx, r.Store, run.Case, f, reported, "loop:"+run.ID); err != nil {
-				r.logf("record the findings of %s: %v", run.Case, err)
-			} else if !recorded && own.Into != "" {
-				r.logf("findings of %s not recorded: it went into %s", run.Case, own.Into)
-			} else if !recorded {
-				r.logf("findings of %s not recorded: it is %s now", run.Case, own.Status)
-			}
-		}
 		return
 	}
-	// A report cannot choose another case to change. Its root is applied to this run's case, after it ends.
+	// A report cannot choose another case to change. Its root is applied to this run's case, after it ends, but not
+	// while the case's change is open on its pull request, where a merge by the root would close the case under it.
 	if err == nil && res.Status == store.RunOK && run.Step != StepReview {
 		var report struct {
 			Root string `json:"root"`
 		}
 		if json.Unmarshal(res.Report, &report) == nil && strings.HasPrefix(report.Root, "root:") {
-			if own, recorded, err := r.Store.RecordRoot(ctx, run.Case, report.Root, "loop"); err != nil {
+			if state, open := r.Ship.ChangeOpen(run.Case); open {
+				r.logf("root of %s ignored: its change is %s on its pull request", run.Case, state)
+			} else if own, recorded, err := r.Store.RecordRoot(ctx, run.Case, report.Root, "loop"); err != nil {
 				r.logf("record root of %s: %v", run.Case, err)
 			} else if !recorded {
 				r.logf("root of %s ignored: its case went into %s", run.Case, own.Into)
 			}
 		}
+	}
+}
+
+// keepFindings records an investigation's findings into its case, and logs why when it records nothing.
+func (r *Runner) keepFindings(ctx context.Context, run store.LoopRun, f finding, reported bool) {
+	own, recorded, err := recordFindings(ctx, r.Store, run.Case, f, reported, "loop:"+run.ID)
+	switch {
+	case err != nil:
+		r.logf("record the findings of %s: %v", run.Case, err)
+	case !recorded && own.Into != "":
+		r.logf("findings of %s not recorded: it went into %s", run.Case, own.Into)
+	case !recorded:
+		r.logf("findings of %s not recorded: it is %s now", run.Case, own.Status)
 	}
 }
 

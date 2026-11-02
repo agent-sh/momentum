@@ -230,7 +230,7 @@ NOTES
 	if err != nil || len(trs) != 2 {
 		t.Fatalf("%v %v", trs, err)
 	}
-	want := judgePrompt(task, caseFinding(store.Case{Mechanism: "cause", Alternatives: []string{"alternative"}, NextTest: "fix"}, Result{}))
+	want := judgePrompt(task, loopFinding(store.Case{Mechanism: "cause", Alternatives: []string{"alternative"}, NextTest: "fix"}, reportedFinding(t, Result{})))
 	for _, tr := range trs {
 		if tr.Err != "" {
 			t.Fatal(tr.Err)

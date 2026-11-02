@@ -166,7 +166,7 @@ func TestBothArmsUseTheTrialClockAndQuestion(t *testing.T) {
 func TestTheJudgeReadsTheSameFieldsFromBothArms(t *testing.T) {
 	report := json.RawMessage(`{"mechanism":"mechanism","root":"root:cause","summary":"summary"}`)
 	c := store.Case{Mechanism: "mechanism", Signatures: []string{"eval:answer"}, Alternatives: []string{"alternative"}, NextTest: "fix"}
-	loop := caseFinding(c, Result{Report: report})
+	loop := loopFinding(c, reportedFinding(t, Result{Report: report}))
 	native := nativeFinding(Result{Report: json.RawMessage(`{"mechanism":"mechanism","root_cause":"root:cause","alternatives":["alternative"],"fix":"fix","summary":"summary"}`)})
 	if !reflect.DeepEqual(loop, native) {
 		t.Fatalf("loop %+v native %+v", loop, native)
@@ -175,7 +175,7 @@ func TestTheJudgeReadsTheSameFieldsFromBothArms(t *testing.T) {
 		t.Fatal("judge inputs differ")
 	}
 	c.Signatures = append(c.Signatures, "root:recorded")
-	if strings.Contains(judgeFinding(caseFinding(c, Result{Report: report})), "root:") {
+	if strings.Contains(judgeFinding(loopFinding(c, reportedFinding(t, Result{Report: report}))), "root:") {
 		t.Fatal("root slug reached the judge")
 	}
 	long := strings.Repeat("a", 2100) + "forbidden-tail"
@@ -560,14 +560,20 @@ func TestEvaluationJobsInterleaveTrialTaskAndArm(t *testing.T) {
 // A stopped loop run retains its case findings, including findings absent from its final report.
 func TestACutShortLoopKeepsItsCaseFindings(t *testing.T) {
 	c := store.Case{Mechanism: "case mechanism", Alternatives: []string{"ruled out"}, NextTest: "case fix", Signatures: []string{"eval/opaque", "root:case"}}
-	f := caseFinding(c, Result{Status: store.RunTimeout})
+	f := loopFinding(c, reportedFinding(t, Result{Status: store.RunTimeout}))
 	if f.Mechanism != "case mechanism" || f.Fix != "case fix" || len(f.Alternatives) != 1 {
 		t.Fatalf("%+v", f)
 	}
-	f = caseFinding(c, Result{Report: json.RawMessage(`{"mechanism":"report mechanism","summary":"report summary"}`)})
+	f = loopFinding(c, reportedFinding(t, Result{Report: json.RawMessage(`{"mechanism":"report mechanism","summary":"report summary"}`)}))
 	if f.Mechanism != "case mechanism" || f.Report != "report summary" {
 		t.Fatalf("%+v", f)
 	}
+}
+
+// reportedFinding reads a run's findings as a trial does: its report, else the findings file of its directory.
+func reportedFinding(t *testing.T, res Result) finding {
+	f, _, _ := investigationFindings(res, t.TempDir())
+	return f
 }
 
 // The result records each family's procedure, and the system prompts the arms ran, which no family changes.

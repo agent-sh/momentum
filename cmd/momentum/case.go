@@ -24,8 +24,9 @@ import (
 )
 
 // caseCmd keeps the cases: one answer in progress each, to one of the standing questions. A detector or an agent
-// opens one by its signature; the investigation records its mechanism, alternatives, next test and benefit; the
-// ship and measure tools move it through deployed and measuring; it closes with a reason.
+// opens one by its signature; the runner records an investigation's mechanism, alternatives and fix (its next
+// test), and a build its root; the ship and measure tools move it through deployed and measuring; it closes with a
+// reason.
 func caseCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return usageError{"case needs detect, list, show, open, set, evidence, signature, close or reopen"}
@@ -79,13 +80,31 @@ func ownCase(args []string) error {
 		}
 		// a case whose change is proposed answers its review: closing it, sending it back or merging it by a root
 		// would leave its pull request open with nothing in the loop to return to it
-		if args[0] == "close" || args[0] == "signature" || args[0] == "set" && slices.Contains(args, "--status") {
-			if p, ok, err := (&loop.Ship{Dir: loopDir()}).Load(own); err == nil && ok && slices.Contains([]string{loop.Proposed, loop.Revising, loop.Landing}, p.State) {
-				return usageError{fmt.Sprintf("case %s's change is %s on its pull request: a revision answers its review, and the review decides", own, p.State)}
+		if args[0] == "close" || args[0] == "signature" || args[0] == "set" && setsStatus(args[1:]) {
+			if state, open := (&loop.Ship{Dir: loopDir()}).ChangeOpen(own); open {
+				return usageError{fmt.Sprintf("case %s's change is %s on its pull request: a revision answers its review, and the review decides", own, state)}
 			}
 		}
 	}
 	return nil
+}
+
+// setsStatus says whether case set's arguments set a status, in any form Go's flag package reads: one or two
+// dashes, with the value after = or as the next argument.
+func setsStatus(args []string) bool {
+	for _, a := range args {
+		if a == "--" {
+			return false
+		}
+		if !strings.HasPrefix(a, "-") {
+			continue
+		}
+		name, _, _ := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(a, "-"), "-"), "=")
+		if name == "status" {
+			return true
+		}
+	}
+	return false
 }
 
 // caseActor is who a change is logged as: $MOMENTUM_ACTOR (the loop sets its run), else the command line.

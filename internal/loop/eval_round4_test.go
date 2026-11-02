@@ -130,10 +130,10 @@ printf '%s\n' '{"type":"result","subtype":"success","num_turns":1,"total_cost_us
 // The judge reads both arms' fields in one shape, folded to one line, as the case store keeps the loop's.
 func TestTheJudgeReadsBothArmsInOneShape(t *testing.T) {
 	written := "the job reads the lockfile before it takes the lock\n- seen in both failures\n- the lock is taken 40 ms later"
-	loop := caseFinding(store.Case{Mechanism: plain.Clip(plain.Line(written), 2000), Alternatives: []string{"disk latency"}, NextTest: "take the lock first"},
-		Result{Report: json.RawMessage(`{"summary":"found"}`)})
 	raw, _ := json.Marshal(map[string]any{"mechanism": written, "alternatives": []string{"disk latency"}, "fix": "take the lock first", "summary": "found"})
-	native := nativeFinding(Result{Report: raw})
+	loop := loopFinding(store.Case{Mechanism: plain.Clip(plain.Line(written), 2000), Alternatives: []string{"disk latency"}, NextTest: "take the lock first"},
+		reportedFinding(t, Result{Report: raw}))
+	native := reportedFinding(t, Result{Report: raw})
 	if judgeFinding(loop) != judgeFinding(native) {
 		t.Fatalf("the shapes differ:\n%s\n%s", judgeFinding(loop), judgeFinding(native))
 	}

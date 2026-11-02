@@ -163,7 +163,7 @@ func TestTrialPromptsEndWithTheSameCommandReference(t *testing.T) {
 func TestJudgeInputsAndDirectoriesDoNotIdentifyAnArm(t *testing.T) {
 	e, task := evalFixture(t)
 	c := store.Case{Mechanism: "the read precedes the lock", Alternatives: []string{"disk latency ruled out"}, NextTest: "take lock first", Signatures: []string{"root:lock-order"}}
-	l := caseFinding(c, Result{Report: json.RawMessage(`{"mechanism":"discarded report hypothesis","summary":"found it","root":"root:lock-order"}`)})
+	l := loopFinding(c, reportedFinding(t, Result{Report: json.RawMessage(`{"mechanism":"discarded report hypothesis","summary":"found it","root":"root:lock-order"}`)}))
 	n := nativeFinding(Result{Report: json.RawMessage(`{"mechanism":"the read precedes the lock","alternatives":["disk latency ruled out"],"fix":"take lock first","summary":"found it","root_cause":"a different shape"}`)})
 	if judgePrompt(task, l) != judgePrompt(task, n) {
 		t.Fatalf("loop %s native %s", judgeFinding(l), judgeFinding(n))

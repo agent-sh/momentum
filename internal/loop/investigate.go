@@ -107,7 +107,10 @@ func investigationFindings(res Result, dir string) (f finding, reported, ok bool
 		return finding{}, false, false
 	}
 	f = findingsFile(string(raw))
-	return f, false, f.Mechanism != "" || f.Fix != ""
+	if f.Mechanism == "" && f.Fix == "" {
+		return finding{}, false, false // alternatives alone are no finding, for the loop's case and the native arm alike
+	}
+	return f, false, true
 }
 
 // caseHolds is what a case holds from its earlier runs, for an investigation's prompt: the mechanism, the
@@ -132,10 +135,11 @@ func caseHolds(c store.Case) string {
 }
 
 // recordFindings is the runner's bookkeeping of an investigation: its mechanism, alternatives and fix (the case's
-// next test) go into the case it investigated. A report that names both a mechanism and a fix moves the case to
-// testing; a run cut short, whose findings file is all it left, or a report short of either, leaves it investigating,
-// so two stops in a row still trip the stop rule. A case that went into another, or moved on while the run ran, keeps
-// what it has; the bool says whether the findings were recorded.
+// next test) go into the case it investigated. A report replaces all three; a findings file sets only the ones it
+// holds, so a run cut short does not clear what the case held from an earlier run. A report that names both a
+// mechanism and a fix moves the case to testing; a run cut short, whose findings file is all it left, or a report
+// short of either, leaves it investigating, so two stops in a row still trip the stop rule. A case that went into
+// another, or moved on while the run ran, keeps what it has; the bool says whether the findings were recorded.
 func recordFindings(ctx context.Context, st *store.Store, caseID string, f finding, reported bool, actor string) (store.Case, bool, error) {
 	var alternatives []string
 	for _, a := range f.Alternatives {
@@ -144,12 +148,23 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, f findi
 		}
 	}
 	mechanism, fix := strings.TrimSpace(f.Mechanism), strings.TrimSpace(f.Fix)
-	u := store.CaseUpdate{Status: store.CaseInvestigating, Mechanism: &mechanism, NextTest: &fix, Alternatives: alternatives}
-	if alternatives == nil {
-		u.Alternatives = []string{}
+	u := store.CaseUpdate{Status: store.CaseInvestigating}
+	if reported {
+		u.Mechanism, u.NextTest, u.Alternatives = &mechanism, &fix, alternatives
+		if alternatives == nil {
+			u.Alternatives = []string{}
+		}
+		if mechanism != "" && fix != "" {
+			u.Status = store.CaseTesting
+		}
+		return st.RecordFindings(ctx, caseID, u, actor)
 	}
-	if reported && mechanism != "" && fix != "" {
-		u.Status = store.CaseTesting
+	if mechanism != "" {
+		u.Mechanism = &mechanism
 	}
+	if fix != "" {
+		u.NextTest = &fix
+	}
+	u.Alternatives = alternatives // nil keeps the case's
 	return st.RecordFindings(ctx, caseID, u, actor)
 }
