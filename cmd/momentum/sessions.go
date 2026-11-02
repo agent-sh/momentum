@@ -275,7 +275,7 @@ func phaseEvents(changes []state.Change, ss []*sessions.Session, now time.Time) 
 		meta, _ := json.Marshal(m)
 		// A session's tool is its harness, by the name every source gives it (store.Harnesses).
 		e := store.Event{Source: store.Sessions, SourceKey: c.Key + "@" + strconv.FormatInt(now.UnixMilli(), 10), TS: c.At,
-			Session: c.Key, Harness: c.Tool, Actor: store.ActorHarness, Kind: kind, Summary: oneLine(changeSummary(c), 240), Meta: string(meta)}
+			Cwd: c.Cwd, Session: c.Key, Harness: c.Tool, Actor: store.ActorHarness, Kind: kind, Summary: oneLine(changeSummary(c), 240), Meta: string(meta)}
 		if s := byKey[c.Key]; s != nil {
 			e.Model, e.Cwd = s.Model, s.Cwd
 			if s.Transcript != "" && s.Size >= 0 {

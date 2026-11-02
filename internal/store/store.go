@@ -139,7 +139,7 @@ var keptColumns = []struct {
 		{"ref", "TEXT NOT NULL DEFAULT ''"}, {"heuristic", "INTEGER NOT NULL DEFAULT 0"},
 		{"experiment", "TEXT NOT NULL DEFAULT ''"}, {"ingested", "INTEGER NOT NULL DEFAULT 0"}}},
 	{"session_stamps", [][2]string{{"tool", "TEXT NOT NULL DEFAULT ''"}, {"name", "TEXT NOT NULL DEFAULT ''"},
-		{"auto", "INTEGER NOT NULL DEFAULT 0"}, {"ask", "TEXT NOT NULL DEFAULT ''"}, {"ask_kind", "TEXT NOT NULL DEFAULT ''"}}},
+		{"cwd", "TEXT NOT NULL DEFAULT ''"}, {"auto", "INTEGER NOT NULL DEFAULT 0"}, {"ask", "TEXT NOT NULL DEFAULT ''"}, {"ask_kind", "TEXT NOT NULL DEFAULT ''"}}},
 	{"capacity_runs", [][2]string{{"blind", "INTEGER NOT NULL DEFAULT 0"}}},
 }
 
@@ -801,12 +801,16 @@ func (s *Store) Rebuild(ctx context.Context, source string, force bool) (int, er
 		return 0, err
 	}
 	for _, q := range []string{
-		`DELETE FROM cursors WHERE source=? OR source LIKE ?`,
+		`DELETE FROM cursors WHERE source=? OR source LIKE ? OR source = ? || ':read' OR source LIKE ? || ':read:%'`,
 		`DELETE FROM seen_files WHERE source=? OR source LIKE ?`,
 		`DELETE FROM skipped WHERE source=? OR source LIKE ?`,
 		`DELETE FROM file_cursors WHERE source=? OR source LIKE ?`,
 	} {
-		if _, err := tx.ExecContext(ctx, q, source, like); err != nil {
+		args := []any{source, like}
+		if strings.Contains(q, "DELETE FROM cursors") {
+			args = append(args, source, source)
+		}
+		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
 			return 0, err
 		}
 	}

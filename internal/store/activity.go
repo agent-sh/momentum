@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -27,10 +28,11 @@ func UnitOf(e Event, bySession bool) Unit {
 // ActivityQuery picks the units of activity over a span.
 type ActivityQuery struct {
 	Since, Until time.Time
-	ExcludeCwd   string // exclude this directory and its descendants
-	BySession    bool   // the sessions' hours; otherwise the machine's
-	Harness      string // when set, only that harness's events
-	Actor        Actor  // when set, only the hours in which it did something (the owner's turns, say)
+	Sources      []string // nil counts every source; otherwise only these sources
+	ExcludeCwd   string   // exclude this directory and its descendants
+	BySession    bool     // the sessions' hours; otherwise the machine's
+	Harness      string   // when set, only that harness's events
+	Actor        Actor    // when set, only the hours in which it did something (the owner's turns, say)
 }
 
 // Activity returns the units of activity over a span: the hours in which the sessions picked (an event of a
@@ -66,6 +68,14 @@ func activityWhere(q ActivityQuery) ([]string, []any, string) {
 	if q.Actor != "" {
 		where, args = append(where, "actor = ?"), append(args, string(q.Actor))
 	}
+	if q.Sources != nil {
+		marks := make([]string, len(q.Sources))
+		for i, source := range q.Sources {
+			marks[i] = "?"
+			args = append(args, source)
+		}
+		where = append(where, "source IN ("+strings.Join(marks, ",")+")")
+	}
 	session := "''"
 	if q.BySession {
 		session = "session"
@@ -90,8 +100,8 @@ func excludeDirectory(where []string, args []any, dir string) ([]string, []any) 
 	return where, args
 }
 
-// UnreadSources names the signal and activity sources not successfully read after the span ended.
-func (s *Store) UnreadSources(ctx context.Context, signal string, q ActivityQuery) ([]string, error) {
+// Sources names the signal and every source with an event in the selected span.
+func (s *Store) Sources(ctx context.Context, signal string, q ActivityQuery) ([]string, error) {
 	where, args, _ := activityWhere(q)
 	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT source FROM events WHERE `+strings.Join(where, " AND ")+` UNION SELECT ? ORDER BY 1`, append(args, signal)...)
 	if err != nil {
@@ -111,9 +121,22 @@ func (s *Store) UnreadSources(ctx context.Context, signal string, q ActivityQuer
 	if err != nil {
 		return nil, err
 	}
+	return sources, nil
+}
+
+// UnreadSources checks recorded sources even when a window has none of their events.
+func (s *Store) UnreadSources(ctx context.Context, signal string, q ActivityQuery) ([]string, error) {
+	sources := q.Sources
+	if sources == nil {
+		var err error
+		sources, err = s.Sources(ctx, signal, q)
+		if err != nil {
+			return nil, err
+		}
+	}
 	var unread []string
 	for _, source := range sources {
-		at, err := s.ReadThrough(ctx, source)
+		at, err := s.ReadWindowThrough(ctx, source, q.Since)
 		if err != nil {
 			return nil, err
 		}
@@ -124,10 +147,10 @@ func (s *Store) UnreadSources(ctx context.Context, signal string, q ActivityQuer
 	return unread, nil
 }
 
-// ReadThrough reads the source cursor's update time, including a complete read with no new events.
+// ReadThrough reads only the complete run start, never a cursor update after the read.
 func (s *Store) ReadThrough(ctx context.Context, source string) (time.Time, error) {
 	var updated int64
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(updated),0) FROM cursors WHERE source IN (?, ?)`, source, source+":read").Scan(&updated)
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(updated),0) FROM cursors WHERE source = ?`, source+":read").Scan(&updated)
 	if updated == 0 {
 		return time.Time{}, err
 	}
@@ -139,5 +162,40 @@ func (s *Store) ReadThrough(ctx context.Context, source string) (time.Time, erro
 func (s *Store) MarkRead(ctx context.Context, source string, at time.Time) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO cursors(source,position,updated) VALUES (?, '', ?)
  ON CONFLICT(source) DO UPDATE SET updated=MAX(updated, excluded.updated)`, source+":read", at.UnixMilli())
+	return err
+}
+
+// ReadWindowThrough includes a partial run only when its failed files predate the window.
+func (s *Store) ReadWindowThrough(ctx context.Context, source string, since time.Time) (time.Time, error) {
+	at, err := s.ReadThrough(ctx, source)
+	if err != nil {
+		return at, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT position, updated FROM cursors WHERE source LIKE ?`, source+":read:run:%")
+	if err != nil {
+		return at, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var failed string
+		var started int64
+		if err := rows.Scan(&failed, &started); err != nil {
+			return at, err
+		}
+		newest, err := strconv.ParseInt(failed, 10, 64)
+		if err != nil {
+			return at, err
+		}
+		if time.UnixMilli(newest).Before(since) && time.UnixMilli(started).After(at) {
+			at = time.UnixMilli(started)
+		}
+	}
+	return at, rows.Err()
+}
+
+// MarkPartialRead records a listed run and the newest modification among files it failed to read.
+func (s *Store) MarkPartialRead(ctx context.Context, source string, started, failed time.Time) error {
+	_, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO cursors(source,position,updated) VALUES (?,?,?)`,
+		source+":read:run:"+strconv.FormatInt(started.UnixNano(), 10), strconv.FormatInt(failed.UnixMilli(), 10), started.UnixMilli())
 	return err
 }

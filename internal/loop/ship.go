@@ -3,9 +3,12 @@ package loop
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"debug/buildinfo"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -27,13 +30,14 @@ import (
 // nothing high or medium. Every step checks the authority again (Gate). A configuration directory is no target:
 // the loop changes only repositories, through pull requests.
 type Ship struct {
-	Store   *store.Store
-	Gate    Gate
-	Sandbox Sandbox
-	Dir     string // the loop's directory: packages/<case> and work/<case> under it
-	Live    bool
-	Actor   string
-	Now     func() time.Time
+	SourceLive func(string) bool // nil means every recorded source is live
+	Store      *store.Store
+	Gate       Gate
+	Sandbox    Sandbox
+	Dir        string // the loop's directory: packages/<case> and work/<case> under it
+	Live       bool
+	Actor      string
+	Now        func() time.Time
 	// Identity is the git author and committer every commit of the loop's takes: the user's own, from his global
 	// git configuration, never a repository's override or the environment's.
 	Identity [2]string
@@ -90,9 +94,14 @@ type Package struct {
 	Result           *measure.Result  `json:"result,omitempty"`
 	Problem          string           `json:"problem,omitempty"`
 	Held             bool             `json:"held,omitempty"`
+	Omitted          []string         `json:"omitted,omitempty"`
+	WatchSources     []string         `json:"watch_sources,omitempty"`
+	InstalledAt      time.Time        `json:"installed_at,omitzero"`
+	InstalledHash    string           `json:"installed_hash,omitempty"`
+	InstalledOK      bool             `json:"installed_ok,omitempty"`
 	WatchRecent      []measure.Counts `json:"watch_recent,omitempty"` // last three completed watch windows
 	CheckoutAt       time.Time        `json:"checkout_at,omitzero"`   // first observed checkout time, kept for an installed build
-	ProposalAt       time.Time        `json:"proposal_at,omitzero"`   // stable boundary while the plan waits for ingestion
+	ProposalAt       time.Time        `json:"proposal_at,omitzero"`   // boundary of the latest waiting proposal
 	ReadUntil        time.Time        `json:"read_until,omitzero"`    // end of the window whose sources are behind
 	ReadWait         time.Time        `json:"read_wait,omitzero"`     // first run waiting for a complete source read
 	WatchWindow      int              `json:"watch_window,omitempty"` // last completed window read since the close
@@ -115,6 +124,8 @@ type Check struct {
 // Plan is how the change is measured: a signal over the store's events, counted in units of activity over
 // the three windows before the gated window and one window after it is in effect (internal/measure).
 type Plan struct {
+	Sources    []string      `json:"sources,omitempty"` // signal and every source in the counted span
+	Omitted    []string      `json:"omitted,omitempty"`
 	Signal     Signal        `json:"signal"`
 	Window     time.Duration `json:"window"`
 	Units      string        `json:"units"`       // what it counts in: session hours, owner hours or machine hours
@@ -124,7 +135,7 @@ type Plan struct {
 	GateBase   int           `json:"gate_base"`   // activity in that window
 	At         time.Time     `json:"at"`          // when it was counted: the gated window ends here
 	// Installed is the built or installed file the machine runs (a binary, an installed configuration):
-	// it must change after the recorded time the checkout first held the change.
+	// a recorded Go revision must hold the change; other files are checked by their hash and time.
 	Installed string `json:"installed,omitempty"`
 }
 
@@ -520,17 +531,14 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package
 	case strings.TrimSpace(pr.Rollback) == "":
 		return p, refused("a proposal needs its rollback: how the change is undone")
 	}
-	at := p.ProposalAt
-	if at.IsZero() {
-		at = s.now()
-	}
+	at := s.now()
 	plan, err := s.validPlan(ctx, c, pr.Signal, pr.Window, pr.Installed, at)
 	if err != nil {
 		var unread *unreadPlan
 		if errors.As(err, &unread) {
-			p.Plan, p.ProposalAt = &plan, at
+			p.Plan, p.ProposalAt = &plan, plan.At
 			r := &Runner{Store: s.Store, Ship: s, Dir: s.Dir, Now: s.Now}
-			if _, readErr := r.readWindow(ctx, &p, plan.At.Add(-(measure.BaselineWindows+1)*plan.Window), plan.At, false); readErr != nil {
+			if _, readErr := r.readWindow(ctx, &p, plan, plan.At.Add(-(measure.BaselineWindows+1)*plan.Window), plan.At, false); readErr != nil {
 				return p, readErr
 			}
 		}
@@ -593,11 +601,15 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package
 	if err := s.save(&p); err != nil {
 		return p, err
 	}
-	return p, s.Store.CaseNote(ctx, caseID, "proposed", fmt.Sprintf("%s %s; measured in %s: %d of %d in the %s baseline; gate %d of %d in the last %s", p.PR, title, plan.Units,
-		plan.Before, plan.BeforeBase, days(measure.BaselineWindows*pr.Window), plan.Gate, plan.GateBase, days(pr.Window)), s.Actor)
+	detail := fmt.Sprintf("%s %s; measured in %s: %d of %d in the %s baseline; gate %d of %d in the last %s", p.PR, title, plan.Units,
+		plan.Before, plan.BeforeBase, days(measure.BaselineWindows*pr.Window), plan.Gate, plan.GateBase, days(pr.Window))
+	if len(plan.Omitted) > 0 {
+		detail += "; sources left out of both counts: " + strings.Join(plan.Omitted, ", ")
+	}
+	return p, s.Store.CaseNote(ctx, caseID, "proposed", detail, s.Actor)
 }
 
-// unreadPlan keeps a proposal waiting on its store, with a stable window boundary.
+// unreadPlan keeps a proposal waiting until its sources supply a current boundary.
 type unreadPlan struct{ sources []string }
 
 func (e *unreadPlan) Error() string {
@@ -630,12 +642,61 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 			return Plan{}, refused("the file the change is installed in, %s, is no file here", installed)
 		}
 	}
+	sources, err := s.Store.Sources(ctx, sig.Source, store.ActivityQuery{Since: at.Add(-4 * window), Until: at, ExcludeCwd: s.Dir})
+	if err != nil {
+		return Plan{}, err
+	}
+	var omitted []string
+	sources, omitted = s.liveSources(sources)
+	if !slices.Contains(sources, sig.Source) {
+		return Plan{}, refused("the signal's source stopped: %s", sig.Source)
+	}
+	boundary := at
+	// Moving the boundary can expose another source at the start of the baseline. Include it before counting.
+	for {
+		previous := boundary
+		for _, source := range sources {
+			read, err := s.Store.ReadWindowThrough(ctx, source, boundary.Add(-4*window))
+			if err != nil {
+				return Plan{}, err
+			}
+			if !read.After(boundary) {
+				boundary = read
+				if !read.IsZero() {
+					boundary = read.Add(-time.Millisecond)
+				}
+			}
+		}
+		if boundary.IsZero() || at.Sub(boundary) > window {
+			return Plan{Signal: sig, Window: window, Units: MachineHours, At: at, Sources: sources, Omitted: omitted}, &unreadPlan{sources: sources}
+		}
+		found, err := s.Store.Sources(ctx, sig.Source, store.ActivityQuery{Since: boundary.Add(-4 * window), Until: boundary, ExcludeCwd: s.Dir})
+		if err != nil {
+			return Plan{}, err
+		}
+		found, dropped := s.liveSources(found)
+		omitted = append(omitted, dropped...)
+		added := false
+		for _, source := range found {
+			if !slices.Contains(sources, source) {
+				sources = append(sources, source)
+				added = true
+			}
+		}
+		if !added && boundary.Equal(previous) {
+			break
+		}
+	}
+	at = boundary
+	slices.Sort(sources)
+	slices.Sort(omitted)
+	omitted = slices.Compact(omitted)
 	got, err := Count(ctx, s.Store, sig, at.Add(-window), at, s.Dir)
 	if err != nil {
 		return Plan{}, err
 	}
-	plan := Plan{Signal: sig, Window: window, Units: unitsOf(got), At: at, Installed: installed}
-	before, err := tally(ctx, s.Store, sig, plan.Units, got, at.Add(-window), at, s.Dir)
+	plan := Plan{Signal: sig, Window: window, Units: unitsOf(got), At: at, Installed: installed, Sources: sources, Omitted: omitted}
+	before, err := tallySources(ctx, s.Store, sig, plan.Units, got, at.Add(-window), at, s.Dir, sources)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -679,7 +740,7 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 	case hit*2 < in:
 		return Plan{}, refused("the signal counts %d of the case's %d events in the window: it does not measure the case's problem", hit, in)
 	}
-	baseline, err := Tally(ctx, s.Store, sig, plan.Units, at.Add(-(measure.BaselineWindows+1)*window), at.Add(-window), s.Dir)
+	baseline, err := tallyPlan(ctx, s.Store, plan, at.Add(-(measure.BaselineWindows+1)*window), at.Add(-window), s.Dir)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -1008,8 +1069,8 @@ func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error
 	return p, err
 }
 
-// InEffect checks an installed file against the first recorded checkout time. With no installed file it checks
-// the checkout as it stands. It records that first time in p; the caller saves it except on a dry run.
+// InEffect checks a Go binary's recorded revision, or another installed file's hash and time against its checkout.
+// An unchanged file keeps its decision. The caller saves the build and first checkout records except on a dry run.
 func (s *Ship) InEffect(ctx context.Context, p *Package) (time.Time, string, error) {
 	switch {
 	case len(p.Landed) == 0 || p.LandedAt.IsZero():
@@ -1017,7 +1078,58 @@ func (s *Ship) InEffect(ctx context.Context, p *Package) (time.Time, string, err
 	case p.Plan == nil:
 		return time.Time{}, "", fmt.Errorf("case %s's package has no plan", p.Case)
 	}
-	if p.Plan.Installed == "" || p.CheckoutAt.IsZero() {
+	if p.Plan.Installed != "" {
+		path := expandHome(p.Plan.Installed)
+		if info, err := buildinfo.ReadFile(path); err == nil {
+			revision, modified := "", ""
+			for _, setting := range info.Settings {
+				switch setting.Key {
+				case "vcs.revision":
+					revision = setting.Value
+				case "vcs.modified":
+					modified = setting.Value
+				}
+			}
+			if revision != "" && modified != "" {
+				if modified != "false" {
+					return time.Time{}, "the installed Go binary was built from a modified tree", nil
+				}
+				if _, err := s.git(ctx, p.Dir, "merge-base", "--is-ancestor", p.Landed[len(p.Landed)-1], revision); err != nil {
+					return time.Time{}, "the installed Go binary's revision does not hold the change: " + err.Error(), nil
+				}
+				return s.now(), "", nil
+			}
+		}
+	}
+	var installedAt time.Time
+	var installedHash string
+	changed := false
+	if p.Plan.Installed != "" {
+		f, err := os.Open(expandHome(p.Plan.Installed))
+		if err != nil {
+			return time.Time{}, fmt.Sprintf("%s, where it is installed, is not there", filepath.Base(p.Plan.Installed)), nil
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			return time.Time{}, "", err
+		}
+		hash := sha256.New()
+		if _, err := io.Copy(hash, f); err != nil {
+			return time.Time{}, "", err
+		}
+		installedAt, installedHash = info.ModTime(), fmt.Sprintf("%x", hash.Sum(nil))
+		changed = !installedAt.Equal(p.InstalledAt) || installedHash != p.InstalledHash
+		if !changed && p.InstalledHash != "" && !p.CheckoutAt.IsZero() {
+			if p.InstalledOK {
+				return s.now(), "", nil
+			}
+			return time.Time{}, "the installed file has not changed since a build from a checkout without the change", nil
+		}
+		// A rejected build stays rejected even if the checkout moves back before another build.
+		p.InstalledAt, p.InstalledHash, p.InstalledOK = installedAt, installedHash, false
+	}
+	if p.Plan.Installed == "" || p.CheckoutAt.IsZero() || changed {
 		last := p.Landed[len(p.Landed)-1]
 		if _, err := s.git(ctx, p.Dir, "merge-base", "--is-ancestor", last, "HEAD"); err != nil {
 			var exit *exec.ExitError
@@ -1043,17 +1155,20 @@ func (s *Ship) InEffect(ctx context.Context, p *Package) (time.Time, string, err
 		if !newest.IsZero() {
 			checkoutAt = newest
 		}
-		p.CheckoutAt = checkoutAt
+		if p.Plan.Installed == "" || p.CheckoutAt.IsZero() {
+			p.CheckoutAt = checkoutAt
+		}
 	}
 	if p.Plan.Installed != "" {
-		st, err := os.Stat(expandHome(p.Plan.Installed))
-		if err != nil {
-			return time.Time{}, fmt.Sprintf("%s, where it is installed, is not there", filepath.Base(p.Plan.Installed)), nil
+		if !changed {
+			return time.Time{}, "the installed file has not changed since a build from a checkout without the change", nil
 		}
-		if !st.ModTime().After(p.CheckoutAt) {
+		if !installedAt.After(p.CheckoutAt) {
 			return time.Time{}, fmt.Sprintf("%s, where it is installed, has not changed since the checkout held the change", filepath.Base(p.Plan.Installed)), nil
 		}
+		p.InstalledOK = true
 	}
+
 	return s.now(), "", nil
 }
 

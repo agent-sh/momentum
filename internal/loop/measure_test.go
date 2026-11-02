@@ -814,7 +814,7 @@ func TestWatchCatchesAnEndedRunOfWindowsOnALateRun(t *testing.T) {
 // A late return at the baseline share has the same three-window rule as an immediate one, across reloads.
 func TestWatchCatchesALateReturnAtTheOldShare(t *testing.T) {
 	ctx := context.Background()
-	for _, delay := range []int{0, 6, 26, 104} {
+	for _, delay := range []int{0, 1, 3, 6, 26, 104} {
 		m := keptCase(t)
 		closed := m.theCase(t).Closed
 		p, _, _ := m.r.Ship.Load(m.c.ID)

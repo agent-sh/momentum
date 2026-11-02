@@ -55,6 +55,9 @@ func measureCmd(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		defer unlock()
 	}
 	r, _, err := setup(st, c.Loop)
+	if err == nil {
+		r.Ship.SourceLive = c.SourceLive
+	}
 	if err != nil {
 		return err
 	}
