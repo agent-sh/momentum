@@ -138,7 +138,8 @@ DUR is a Go duration or a number of days, e.g. 36h or 7d; WHEN is a DUR ago, a l
 Exit: 0 done, 2 usage or configuration error,
 3 error (for ingest and sessions: at least one source failed, for capacity at least one rule; the others still
 ran; a report whose scan of a harness failed or was not done within 3 s still prints, exits 0 and names it on
-stderr).`
+stderr).
+exit status: 0 done, 1 a read that found nothing (a grep with no match), 2 a usage or a refusal, 3 an error`
 
 type usageError struct{ msg string }
 
@@ -362,8 +363,10 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		return err
 	}
 	defer st.Close()
-	if *kinds != "" {
-		q.Kinds = strings.Split(*kinds, ",")
+	for _, k := range strings.Split(*kinds, ",") { // as search reads them: "a, b" is two kinds
+		if k = strings.TrimSpace(k); k != "" {
+			q.Kinds = append(q.Kinds, k)
+		}
 	}
 	if err := knownKinds(ctx, st, q.Kinds); err != nil {
 		return err
@@ -378,8 +381,11 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	}
 	enc := json.NewEncoder(stdout)
 	for _, e := range evs {
-		if *asJSON {
-			if err := enc.Encode(e); err != nil {
+		if *asJSON { // each line with its id, which evidence show takes
+			if err := enc.Encode(struct {
+				ID string `json:"ID"`
+				store.Event
+			}{e.ID(), e}); err != nil {
 				return err
 			}
 			continue

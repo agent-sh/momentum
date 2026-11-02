@@ -1040,7 +1040,6 @@ func (s *Store) Before(ctx context.Context, session string, kinds []string, afte
 		append(args, limit)...))
 }
 
-// Counts returns events per source and kind since a time, for the status view.
 // UnknownKinds are the kinds of a list that no event of the store has, with the kinds its events do have, sorted;
 // a store with no events knows no kind, so it names none unknown.
 func (s *Store) UnknownKinds(ctx context.Context, kinds []string) (unknown, held []string, err error) {
@@ -1077,6 +1076,7 @@ func (s *Store) UnknownKinds(ctx context.Context, kinds []string) (unknown, held
 	return unknown, held, nil
 }
 
+// Counts returns events per source and kind since a time, for the status view.
 func (s *Store) Counts(ctx context.Context, since time.Time, until ...time.Time) (map[string]map[string]int, error) {
 	where := "ts >= ?"
 	args := []any{since.UnixMilli()}

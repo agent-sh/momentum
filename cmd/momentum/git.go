@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -206,8 +207,19 @@ func gitArgs(ctx context.Context, dir, sub string, spec gitSpec, rest []string) 
 		out = append(out, "--no-ext-diff", "--no-textconv")
 	}
 	revs, pathArgs, blobs := 0, 0, 0
+	var grepRevs []string
 	afterDash := false
-	patterned := false // grep: a pattern given, with -e or as its first word
+	// grep: a pattern given, with -e anywhere before -- (then every word is a revision, as git reads it) or as its
+	// first word
+	patterned := false
+	if sub == "grep" {
+		for _, a := range rest {
+			if a == "--" {
+				break
+			}
+			patterned = patterned || a == "-e" || strings.HasPrefix(a, "-e") && len(a) > 2
+		}
+	}
 	for i := 0; i < len(rest); i++ {
 		a := rest[i]
 		switch {
@@ -280,7 +292,18 @@ func gitArgs(ctx context.Context, dir, sub string, spec gitSpec, rest []string) 
 		if spec.most > 0 && revs > spec.most {
 			return nil, refuse("it takes at most %d revisions", spec.most)
 		}
+		if sub == "grep" { // git grep reads no option after its first revision: the revisions go after every option
+			grepRevs = append(grepRevs, a)
+			continue
+		}
 		out = append(out, a)
+	}
+	if len(grepRevs) > 0 {
+		at := slices.Index(out, "--")
+		if at < 0 {
+			at = len(out)
+		}
+		out = append(out[:at], append(grepRevs, out[at:]...)...)
 	}
 	if spec.need && pathArgs != 1 {
 		return nil, refuse("it takes one path, after --")

@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"os"
 	"os/exec"
@@ -149,8 +150,14 @@ func showEvent(ctx context.Context, st *store.Store, id string, n int) (string, 
 	if n > 0 && len(clean) > n {
 		whole := len(clean)
 		clean = clean[:n]
-		for !utf8.ValidString(clean) {
-			clean = clean[:len(clean)-1]
+		// back off only a rune the cut split, not to an earlier invalid byte
+		for i := len(clean) - 1; i >= 0 && i >= len(clean)-utf8.UTFMax; i-- {
+			if utf8.RuneStart(clean[i]) {
+				if !utf8.FullRuneInString(clean[i:]) {
+					clean = clean[:i]
+				}
+				break
+			}
 		}
 		clean += fmt.Sprintf("\n  (its first %d of %d bytes)\n", len(clean), whole)
 	}
@@ -278,20 +285,60 @@ func hermesRow(ctx context.Context, path string, id int64, e store.Event) (strin
 	case len(row.Content)+len(row.ToolCalls) > readMax:
 		return "", "  (oversized record withheld)\n", nil
 	}
+	// the row at the id is the event's own only while it is of the event's session at the event's time: a Hermes
+	// store made again starts its ids over, and an old event's id then names another session's message
+	at := hermesAt(row.Timestamp)
+	if diff := at.UnixMilli() - e.TS.UnixMilli(); row.Session != e.Session && row.Session != e.Agent || diff < -1 || diff > 1 { // a float's millisecond
+		return "", "  (its record is gone: the row at its id is another's, the store was made again since)\n", nil
+	}
 	if os.Getenv("MOMENTUM_NOW") != "" {
 		end, err := commandNow()
 		if err != nil {
 			return "", "", err
 		}
-		if at := time.UnixMilli(int64(row.Timestamp * 1000)); !at.Before(end) {
+		if !at.Before(end) {
 			return "", "  (record withheld: timestamp is at or after the evaluation end)\n", nil
 		}
 	}
-	raw, err := json.Marshal(row)
-	if err != nil {
+	// printed as Hermes stores it, one level deep: the content as written, each call's arguments as the JSON they
+	// are, and no HTML escapes, so the scrubber reads the text as an agent wrote it
+	out := map[string]any{"id": row.ID, "session_id": row.Session, "role": row.Role, "content": row.Content, "timestamp": row.Timestamp}
+	if row.ToolName != "" {
+		out["tool_name"] = row.ToolName
+	}
+	if row.ToolCalls != "" {
+		out["tool_calls"] = hermesCalls(row.ToolCalls)
+	}
+	var b strings.Builder
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(out); err != nil {
 		return "", "", err
 	}
-	return string(raw) + "\n", "", nil
+	return b.String(), "", nil
+}
+
+// hermesAt is a Hermes row's time as tacit's reader dates its events: seconds, their fraction to the nanosecond.
+func hermesAt(ts float64) time.Time {
+	sec, frac := math.Modf(ts)
+	return time.Unix(int64(sec), int64(frac*1e9))
+}
+
+// hermesCalls is a row's tool calls as JSON, each call's arguments (a JSON text in OpenAI's form) embedded as the JSON
+// they hold; text that is no JSON stays text.
+func hermesCalls(raw string) any {
+	var calls []map[string]any
+	if json.Unmarshal([]byte(raw), &calls) != nil {
+		return raw
+	}
+	for _, c := range calls {
+		if fn, ok := c["function"].(map[string]any); ok {
+			if args, ok := fn["arguments"].(string); ok && json.Valid([]byte(args)) {
+				fn["arguments"] = json.RawMessage(args)
+			}
+		}
+	}
+	return calls
 }
 
 // ownRecord says whether a line is the event's own record where the event says which line that is: a mistakes

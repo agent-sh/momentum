@@ -16,7 +16,8 @@ momentum evidence events --session ID one session's events, its subagents' among
 momentum evidence status              events per source and kind, and unparsed records
 momentum evidence search TEXT         stored summaries of every source holding TEXT, newest first (--source, --kind,
                                       --actor, --session, --since, --until, --limit)
-momentum evidence show ID             an event, with the record of the transcript or log it names
+momentum evidence show ID...          up to ten events, each with its record: a transcript's or a log's line, or
+                                      a Hermes message row (--bytes N cuts each)
 momentum evidence rebuild SOURCE      drop a source's events; the next ingest reads it again
                                       (not sessions; transcripts only with --force)
 ```
