@@ -6,6 +6,16 @@ It asks standing questions (what made the owner step in, what he keeps doing by 
 
 Status: milestone 1 (the evidence layer) in progress. See [SPEC.md](SPEC.md).
 
+## Sandbox
+
+`internal/sandbox` runs a fixed bubblewrap layout in a transient systemd user service. It reuses bubblewrap and socat for isolation and the optional relay route. Programs run as the caller's UID and GID. There is no host shell.
+
+The unit bounds memory, CPU, tasks and runtime. Defaults are 4G, 400%, 512 tasks and 1800 seconds. Cancellation stops the service and joins its client. The loop supplies its own budgets and calls `StopLeftover` before new runs. A broken user manager is a cleanup error; the unit's runtime limit remains the last bound.
+
+Only the system's fixed read-only mounts, caller binds and an optional relay socket are visible. Bind destinations are `/work`, `/out`, `/run/input`, or under `/ro/` and `/opt/`, with no overlapping destinations. Sources are host-created, clean and free of sockets; the relay is checked separately. The environment starts with four fixed variables and the caller's additions. Without a relay, the program runs directly with only private loopback.
+
+A golden argv, the plain PASS/FAIL script and five test-only widenings check the boundary. Namespace tests skip with a reason when the real unit probe cannot run. The launch, exit-status ambiguity, Ubuntu mount restriction, vendor guidance, pinned `srt` fallback, Podman alternative and primary sources are in [Sandbox](SPEC.md#sandbox).
+
 ## Evidence
 
 ```

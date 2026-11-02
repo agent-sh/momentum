@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/config"
-	"github.com/agent-sh/momentum/internal/jail"
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/source"
@@ -100,11 +99,6 @@ type usageError struct{ msg string }
 func (u usageError) Error() string { return u.msg }
 
 func main() {
-	// inside a sandbox (internal/jail): its first process forwards the route's port, and the momentum and tacit
-	// commands are the door's client, since nothing of the machine's is there for them to read
-	if code, ok := jail.Inside(os.Args, os.Stdout, os.Stderr); ok {
-		os.Exit(code)
-	}
 	os.Exit(run(context.Background(), os.Args[1:], os.Stdout, os.Stderr))
 }
 
