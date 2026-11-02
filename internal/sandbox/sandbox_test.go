@@ -11,8 +11,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func basicSpec(t *testing.T) Spec {
@@ -393,10 +395,42 @@ func TestOneWriterForBothStreams(t *testing.T) {
 	if shared.bytes() == 0 {
 		t.Fatal("nothing was written")
 	}
+	if shared.overlap.Load() {
+		t.Fatal("two goroutines wrote to the shared writer at once")
+	}
 }
 
-// lockedCounter fails under the race detector when two goroutines write at once.
-type lockedCounter struct{ n int }
+// lockedCounter notes when two goroutines are inside Write at once, with or without the race detector.
+type lockedCounter struct {
+	n       int
+	in      atomic.Bool
+	overlap atomic.Bool
+}
 
-func (c *lockedCounter) Write(p []byte) (int, error) { c.n += len(p); return len(p), nil }
-func (c *lockedCounter) bytes() int                  { return c.n }
+func (c *lockedCounter) Write(p []byte) (int, error) {
+	if !c.in.CompareAndSwap(false, true) {
+		c.overlap.Store(true)
+	}
+	time.Sleep(time.Millisecond)
+	c.n += len(p)
+	c.in.Store(false)
+	return len(p), nil
+}
+func (c *lockedCounter) bytes() int { return c.n }
+
+// A client killed by a signal reads as 128 plus the signal; a launcher failure prefix marks a failure only with a
+// nonzero exit.
+func TestResultsOfTheLauncher(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "kill -TERM $$")
+	r, err := runCommand(context.Background(), "momentum-run-signal-test", cmd, io.Discard, io.Discard)
+	if err != nil || r.Code != 128+int(syscall.SIGTERM) {
+		t.Fatalf("a client killed by SIGTERM: %+v %v", r, err)
+	}
+	for exit, wantFailed := range map[string]bool{"0": false, "1": true} {
+		cmd = exec.Command("/bin/sh", "-c", "echo 'bwrap: marker-7f3a' >&2; exit "+exit)
+		r, err = runCommand(context.Background(), "momentum-run-prefix-test", cmd, io.Discard, io.Discard)
+		if err != nil || r.Failed != wantFailed {
+			t.Fatalf("exit %s after a launcher prefix: %+v %v", exit, r, err)
+		}
+	}
+}

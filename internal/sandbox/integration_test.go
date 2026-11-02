@@ -716,3 +716,69 @@ func TestAvailableWithATmpdirThroughALink(t *testing.T) {
 		t.Fatalf("unavailable with a linked TMPDIR: %v", err)
 	}
 }
+
+// A unit stopped from outside reads as an exit 0 with the output so far: the documented case a caller must not take
+// for a finished program.
+func TestAUnitStoppedFromOutsideReadsAsExitZero(t *testing.T) {
+	needSandbox(t, false)
+	s := basicSpec(t)
+	s.Unit = "momentum-run-outside-stop-" + filepath.Base(s.Host)
+	s.Argv = []string{"/bin/sh", "-c", "echo ready; sleep 30; echo finished"}
+	ready := make(chan struct{})
+	var out strings.Builder
+	w := &readyWriter{ready: ready}
+	done := make(chan struct{})
+	var r Result
+	var err error
+	go func() {
+		r, err = s.Run(context.Background(), io.MultiWriter(&out, w), io.Discard)
+		close(done)
+	}()
+	select {
+	case <-ready:
+	case <-time.After(20 * time.Second):
+		t.Fatal("unit did not become ready")
+	}
+	if stopErr := exec.Command("systemctl", "--user", "stop", s.Unit+".service").Run(); stopErr != nil {
+		t.Fatal(stopErr)
+	}
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("run did not end after its unit was stopped")
+	}
+	if err != nil || r.Code != 0 || r.Failed || strings.Contains(out.String(), "finished") {
+		t.Fatalf("a unit stopped from outside: %+v %v", r, err)
+	}
+}
+
+// Two live runs never share a unit name.
+func TestARunRefusesAUnitNameInUse(t *testing.T) {
+	needSandbox(t, false)
+	first := basicSpec(t)
+	first.Unit = "momentum-run-twice-" + filepath.Base(first.Host)
+	first.Argv = []string{"/bin/sh", "-c", "echo ready; sleep 30"}
+	ctx, cancel := context.WithCancel(context.Background())
+	ready, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		first.Run(ctx, &readyWriter{ready: ready}, io.Discard)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	select {
+	case <-ready:
+	case <-time.After(20 * time.Second):
+		t.Fatal("first unit did not become ready")
+	}
+	second := basicSpec(t)
+	second.Unit = first.Unit
+	if _, err := second.Run(context.Background(), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "already in use") {
+		t.Fatalf("a second run with the same unit name: %v", err)
+	}
+	if out, err := exec.Command("systemctl", "--user", "is-active", first.Unit+".service").Output(); err != nil || strings.TrimSpace(string(out)) != "active" {
+		t.Fatal("the first run was disturbed")
+	}
+}

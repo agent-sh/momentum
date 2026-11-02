@@ -150,6 +150,12 @@ func (s Spec) Run(ctx context.Context, stdout, stderr io.Writer) (Result, error)
 	if err != nil {
 		return Result{Code: -1, Failed: true}, err
 	}
+	// Two live runs with one name would stop each other: a cancelled second start stops the first run's unit.
+	if inUse, err := unitLoaded(ctx, s.Unit); err != nil {
+		return Result{Code: -1, Failed: true}, err
+	} else if inUse {
+		return Result{Code: -1, Failed: true}, fmt.Errorf("sandbox: unit %s is already in use", s.Unit)
+	}
 	remove, err := s.identity()
 	if err != nil {
 		return Result{Code: -1, Failed: true}, err
@@ -299,6 +305,15 @@ func result(err error, failed bool) Result {
 	}
 	r.Failed = failed && r.Code != 0
 	return r
+}
+
+// unitLoaded says whether the user manager holds a unit of that name: a running run's, or one left by a dead caller.
+func unitLoaded(ctx context.Context, unit string) (bool, error) {
+	out, err := exec.CommandContext(ctx, "systemctl", "--user", "show", "--property=LoadState", "--value", unit+".service").Output()
+	if err != nil {
+		return false, fmt.Errorf("sandbox: ask the user manager about %s: %w", unit, err)
+	}
+	return strings.TrimSpace(string(out)) != "not-found", nil
 }
 
 // stopUnit queues the unit's stop (SIGTERM, then SIGKILL after systemd's own timeout) and returns without waiting.
