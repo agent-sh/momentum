@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -306,7 +307,7 @@ func TestIdentity(t *testing.T) {
 }
 
 func TestFailurePrefixes(t *testing.T) {
-	for _, text := range []string{"bwrap: setup failed\n", "Failed to start transient service unit\n", "systemd-run: failed\n"} {
+	for _, text := range []string{"bwrap: setup failed\n", "Failed to start transient service unit\n", "systemd-run: failed\n", "Job for momentum-run-x.service failed\n"} {
 		var out bytes.Buffer
 		w := failureWriter{dst: &out}
 		for _, b := range []byte(text) {
@@ -324,3 +325,78 @@ func TestFailurePrefixes(t *testing.T) {
 		t.Fatal("ordinary program stderr classified as launcher failure")
 	}
 }
+
+// Each rule of Spec.validate that nothing else exercises.
+func TestValidationRules(t *testing.T) {
+	refused := map[string]func(s *Spec){
+		"program starting with a dash":   func(s *Spec) { s.Argv = []string{"-x"} },
+		"empty program":                  func(s *Spec) { s.Argv = []string{""} },
+		"no program":                     func(s *Spec) { s.Argv = nil },
+		"NUL in an argument":             func(s *Spec) { s.Argv = []string{"/bin/true", "a\x00b"} },
+		"no tasks":                       func(s *Spec) { s.Limits.Tasks = -1 },
+		"no runtime":                     func(s *Spec) { s.Limits.RuntimeSec = -1 },
+		"relative directory":             func(s *Spec) { s.Dir = "work" },
+		"unit not anchored at the start": func(s *Spec) { s.Unit = "xmomentum-run-a" },
+		"unit with a capital":            func(s *Spec) { s.Unit = "momentum-run-A" },
+		"memory with a newline":          func(s *Spec) { s.Limits.Memory = "1G\n" },
+		"top-level socket as a source": func(s *Spec) {
+			path := filepath.Join(shortTemp(t), "top.sock")
+			socketFixture(t, path)
+			s.Binds[0].Src = path
+		},
+		"fifo as a source": func(s *Spec) {
+			path := filepath.Join(shortTemp(t), "pipe")
+			if err := syscall.Mkfifo(path, 0600); err != nil {
+				t.Fatal(err)
+			}
+			s.Binds[0].Src = path
+		},
+		"host reached through a link in a parent": func(s *Spec) {
+			link := filepath.Join(shortTemp(t), "link")
+			if err := os.Symlink(filepath.Dir(s.Host), link); err != nil {
+				t.Fatal(err)
+			}
+			s.Host = filepath.Join(link, filepath.Base(s.Host))
+		},
+	}
+	for name, mutate := range refused {
+		t.Run(name, func(t *testing.T) {
+			s := basicSpec(t)
+			mutate(&s)
+			if _, err := s.Command(context.Background()); err == nil {
+				t.Fatal("the spec was accepted")
+			}
+		})
+	}
+}
+
+// Run gives the launcher no standard input, whatever the command held.
+func TestStdinIsNotForwarded(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "cat; echo done")
+	cmd.Stdin = strings.NewReader("marker-7f3a\n")
+	var out bytes.Buffer
+	if _, err := runCommand(context.Background(), "momentum-run-stdin-test", cmd, &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "done\n" {
+		t.Fatalf("the command read input: %q", out.String())
+	}
+}
+
+// One writer for both streams is serialized (os/exec would have done it for a pair of equal writers).
+func TestOneWriterForBothStreams(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "for i in 1 2 3 4 5 6 7 8 9 10; do echo out$i; echo err$i >&2; done")
+	var shared lockedCounter
+	if _, err := runCommand(context.Background(), "momentum-run-shared-writer-test", cmd, &shared, &shared); err != nil {
+		t.Fatal(err)
+	}
+	if shared.bytes() == 0 {
+		t.Fatal("nothing was written")
+	}
+}
+
+// lockedCounter fails under the race detector when two goroutines write at once.
+type lockedCounter struct{ n int }
+
+func (c *lockedCounter) Write(p []byte) (int, error) { c.n += len(p); return len(p), nil }
+func (c *lockedCounter) bytes() int                  { return c.n }

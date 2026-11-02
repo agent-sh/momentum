@@ -36,6 +36,9 @@ func shortTemp(t *testing.T) string {
 			t.Error(err)
 		}
 	})
+	if real, err := filepath.EvalSymlinks(dir); err == nil {
+		return real
+	}
 	return dir
 }
 
@@ -698,5 +701,18 @@ func TestRunRemovesItsIdentityFiles(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(s.Host, name)); err == nil {
 			t.Fatalf("%s is still in Host after the run", name)
 		}
+	}
+}
+
+// A TMPDIR that goes through a link does not make the sandbox unavailable.
+func TestAvailableWithATmpdirThroughALink(t *testing.T) {
+	needSandbox(t, false)
+	link := filepath.Join(shortTemp(t), "tmp-link")
+	if err := os.Symlink(shortTemp(t), link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", link)
+	if err := Available(); err != nil {
+		t.Fatalf("unavailable with a linked TMPDIR: %v", err)
 	}
 }

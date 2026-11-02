@@ -65,7 +65,7 @@ Session supervision is core, not a later extra. In Phase 0, most of the owner's 
 
 ```text
 systemd-run --user --wait --pipe --collect --quiet --expand-environment=no --unit=momentum-run-ID
-  -p MemoryMax=MEM -p CPUQuota=CPU -p TasksMax=TASKS -p RuntimeMaxSec=SECS
+  -p MemoryMax=MEM -p MemorySwapMax=0 -p CPUQuota=CPU -p TasksMax=TASKS -p RuntimeMaxSec=SECS
   -p NoNewPrivileges=yes -p "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK" --
 bwrap --unshare-all --unshare-user --disable-userns --die-with-parent --new-session --clearenv
   --ro-bind /usr /usr

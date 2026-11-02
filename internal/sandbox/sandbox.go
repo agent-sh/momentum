@@ -169,9 +169,12 @@ func runCommand(ctx context.Context, unit string, cmd *exec.Cmd, stdout, stderr 
 	// a caller that bounds its writers by failing them expects the run to end, not to go on writing nowhere.
 	stopCtx, stopNow := context.WithCancel(ctx)
 	defer stopNow()
+	// One lock serves both streams: os/exec copies them in two goroutines, and serializes the writes only when they go
+	// to the same writer, which these wrappers hide. A caller may pass one writer for both.
 	var writes writeFailure
-	diagnostic := &failureWriter{dst: &failSafeWriter{w: stderr, f: &writes, stop: stopNow}}
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, &failSafeWriter{w: stdout, f: &writes, stop: stopNow}, diagnostic
+	var order sync.Mutex
+	diagnostic := &failureWriter{dst: &failSafeWriter{w: stderr, f: &writes, stop: stopNow, mu: &order}}
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, &failSafeWriter{w: stdout, f: &writes, stop: stopNow, mu: &order}, diagnostic
 	// Close inherited output pipes if a broken manager leaves descendants alive
 	// after the client exits. Normal unit cleanup finishes before this delay.
 	cmd.WaitDelay = stopTimeout
@@ -266,10 +269,13 @@ type failSafeWriter struct {
 	w    io.Writer
 	f    *writeFailure
 	stop func()
+	mu   *sync.Mutex
 }
 
 func (w *failSafeWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
 	n, err := w.w.Write(p)
+	w.mu.Unlock()
 	if err != nil {
 		w.f.set(err)
 		w.stop()
@@ -366,6 +372,10 @@ func Available(withRelay ...bool) error {
 		return fmt.Errorf("sandbox: probe directory: %w", err)
 	}
 	defer os.RemoveAll(host)
+	// A TMPDIR that goes through a link makes a host path the sources rule refuses: the probe uses the real one.
+	if real, err := filepath.EvalSymlinks(host); err == nil {
+		host = real
+	}
 	s := Spec{Unit: "momentum-run-probe-" + filepath.Base(host), Host: host, Dir: "/", Argv: []string{"/bin/true"}}
 	// MkdirTemp's suffix consists of decimal digits.
 	if relay {
