@@ -572,7 +572,7 @@ func (e *Eval) trial(ctx context.Context, t GoldenTask, n int) (tr Trial) {
 	if err != nil {
 		run.Status, run.Failure = store.RunFailed, err.Error()
 	} else {
-		run.Status, run.Failure, run.Tokens, run.Turns, run.Summary = res.Status, res.Failure, res.Tokens, res.Turns, summaryOf(res)
+		run.Status, run.Failure, run.Tokens, run.Usage, run.Turns, run.Summary = res.Status, res.Failure, res.Tokens, res.Usage, res.Turns, summaryOf(res)
 		run.Model = firstOf(res.Model, run.Model)
 	}
 	e.Runner.Store.PutLoopRun(ctx, run)
@@ -1075,7 +1075,7 @@ func (e *Eval) grade(ctx context.Context, t GoldenTask, f finding, jdir string, 
 		}
 		spent += jr.USD
 		jrun := store.LoopRun{ID: newRunID(time.Now()), Case: run.Case, Family: t.Family, Step: "judge", Started: time.Now().Add(-jr.Duration),
-			Ended: time.Now(), Status: jr.Status, Failure: jr.Failure, USD: jr.USD, Tokens: jr.Tokens, Turns: jr.Turns, Model: jr.Model, Dir: jdir,
+			Ended: time.Now(), Status: jr.Status, Failure: jr.Failure, USD: jr.USD, Tokens: jr.Tokens, Usage: jr.Usage, Turns: jr.Turns, Model: jr.Model, Dir: jdir,
 			Experiment: run.Experiment}
 		e.Runner.Store.PutLoopRun(ctx, jrun)
 		if err != nil {

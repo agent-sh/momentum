@@ -17,6 +17,7 @@ type Summary struct {
 	Verdicts                                                   []string
 	AnyReached, AllReached, Flipped                            bool
 	USD, JudgeUSD, Minutes, TotalMinutes, Turns                float64
+	Usage                                                      store.Usage // the investigations' tokens by kind
 	Errors                                                     []string
 }
 
@@ -45,6 +46,7 @@ func Summarize(trials []Trial, requested ...int) []Summary {
 			s.Errors = append(s.Errors, tr.Run.Failure)
 		}
 		s.USD += tr.Run.USD
+		s.Usage = s.Usage.Add(tr.Run.Usage)
 		s.JudgeUSD += tr.JudgeUSD
 		if !tr.Run.Started.IsZero() {
 			s.Ran++
@@ -96,6 +98,7 @@ type ArmSummary struct {
 	Ungraded, ComparedReached                                      int
 	PassAtK, PassAllK                                              float64
 	USD, JudgeUSD, Minutes                                         float64
+	Usage                                                          store.Usage // the investigations' tokens by kind
 	ComparedUSD, ComparedMinutes                                   float64
 	USDPerTrial, MinutesPerTrial, USDPerReached, MinutesPerReached *float64
 }
@@ -202,6 +205,7 @@ func (e *Eval) Results(trials []Trial) EvaluationResults {
 		a.CutShort += s.CutShort
 		a.Skipped += s.Skipped
 		a.USD += s.USD
+		a.Usage = a.Usage.Add(s.Usage)
 		a.JudgeUSD += s.JudgeUSD
 		a.Minutes += s.TotalMinutes
 	}

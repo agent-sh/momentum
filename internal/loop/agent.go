@@ -78,8 +78,9 @@ type Result struct {
 	Failure    string // how it failed, when it did: a short key the stop rule compares
 	CostKnown  bool
 	TurnsKnown bool
-	USD        float64
+	USD        float64 // at Bedrock's rates for the models with one (bedrockRates), at the harness's own for the rest
 	Tokens     int64
+	Usage      Usage // the tokens, by kind
 	Turns      int
 	Duration   time.Duration
 	Report     json.RawMessage // the final report, by the schema
@@ -282,6 +283,7 @@ func (a Agent) RunOrFallback(ctx context.Context, inv Invocation) (Result, error
 	res.USD += first.USD
 	res.CostKnown = true
 	res.Tokens += first.Tokens
+	res.Usage = res.Usage.Add(first.Usage)
 	res.Turns += first.Turns
 	res.Duration += first.Duration
 	return res, err
@@ -325,21 +327,56 @@ func readStream(path string) (Result, error) {
 			SessionID         string          `json:"session_id"`
 			PermissionDenials []any           `json:"permission_denials"`
 			Usage             struct {
-				Input       int64 `json:"input_tokens"`
-				Output      int64 `json:"output_tokens"`
-				CacheRead   int64 `json:"cache_read_input_tokens"`
-				CacheCreate int64 `json:"cache_creation_input_tokens"`
+				Input         int64 `json:"input_tokens"`
+				Output        int64 `json:"output_tokens"`
+				CacheRead     int64 `json:"cache_read_input_tokens"`
+				CacheCreate   int64 `json:"cache_creation_input_tokens"`
+				CacheCreation struct {
+					Hour int64 `json:"ephemeral_1h_input_tokens"`
+				} `json:"cache_creation"`
 			} `json:"usage"`
+			// each model's tokens and the harness's price for them, subagents' and a fallback's models among them
+			ModelUsage map[string]struct {
+				Input       int64    `json:"inputTokens"`
+				Output      int64    `json:"outputTokens"`
+				CacheRead   int64    `json:"cacheReadInputTokens"`
+				CacheCreate int64    `json:"cacheCreationInputTokens"`
+				Hour        int64    `json:"cacheCreationEphemeral1hInputTokens"`
+				CostUSD     *float64 `json:"costUSD"`
+			} `json:"modelUsage"`
 		}
 		if json.Unmarshal(line, &r) != nil || r.Type != "result" {
 			continue
 		}
 		found = true
 		res = Result{Model: res.Model, answered: res.answered, Text: r.Result, Report: r.StructuredOutput, Session: r.SessionID,
-			Denials: len(r.PermissionDenials), Tokens: r.Usage.Input + r.Usage.Output + r.Usage.CacheRead + r.Usage.CacheCreate}
-		if r.TotalCostUSD != nil && *r.TotalCostUSD >= 0 && !math.IsInf(*r.TotalCostUSD, 0) && !math.IsNaN(*r.TotalCostUSD) {
+			Denials: len(r.PermissionDenials), Usage: Usage{Input: r.Usage.Input, Output: r.Usage.Output, CacheRead: r.Usage.CacheRead,
+				CacheWrite: r.Usage.CacheCreate, CacheWrite1h: r.Usage.CacheCreation.Hour}}
+		if r.TotalCostUSD != nil && known(*r.TotalCostUSD) {
 			res.USD, res.CostKnown = *r.TotalCostUSD, true
 		}
+		// with each model's tokens, the run is priced at Bedrock's rates, model by model; a model with no rate keeps
+		// the harness's price, and without a price of the harness's for it, the run's whole price stays the harness's
+		if len(r.ModelUsage) > 0 {
+			var u Usage
+			usd, priced := 0.0, true
+			for model, m := range r.ModelUsage {
+				mu := Usage{Input: m.Input, Output: m.Output, CacheRead: m.CacheRead, CacheWrite: m.CacheCreate, CacheWrite1h: m.Hour}
+				u = u.Add(mu)
+				if p, ok := bedrockPrice(model, mu); ok {
+					usd += p
+				} else if m.CostUSD != nil && known(*m.CostUSD) {
+					usd += *m.CostUSD
+				} else {
+					priced = false
+				}
+			}
+			res.Usage = u
+			if priced && res.CostKnown {
+				res.USD = usd
+			}
+		}
+		res.Tokens = res.Usage.Total()
 		if r.NumTurns != nil && *r.NumTurns >= 0 {
 			res.Turns, res.TurnsKnown = *r.NumTurns, true
 		}
@@ -356,6 +393,9 @@ func readStream(path string) (Result, error) {
 	}
 	return res, nil
 }
+
+// known is a price that is a number and not below zero.
+func known(usd float64) bool { return usd >= 0 && !math.IsInf(usd, 0) && !math.IsNaN(usd) }
 
 // resultStatus reads how a run ended from its result's subtype: a success with its report is ok; a limit is its
 // limit; a success that is an error (the provider's, ending the turn) is an error; anything else failed, by its

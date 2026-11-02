@@ -40,6 +40,20 @@ const (
 	RunRefused = "refused" // a gate refused to start it (no budget left, a case blocked)
 )
 
+// Usage is what a run's model calls took, by the kind of token Bedrock prices: input, output, cache reads and cache
+// writes, the writes at the one-hour lifetime among them (a write lives five minutes otherwise).
+type Usage struct {
+	Input, Output, CacheRead, CacheWrite, CacheWrite1h int64
+}
+
+// Total is every token of the usage.
+func (u Usage) Total() int64 { return u.Input + u.Output + u.CacheRead + u.CacheWrite }
+
+// Add sums two usages.
+func (u Usage) Add(v Usage) Usage {
+	return Usage{u.Input + v.Input, u.Output + v.Output, u.CacheRead + v.CacheRead, u.CacheWrite + v.CacheWrite, u.CacheWrite1h + v.CacheWrite1h}
+}
+
 // LoopRun is one run of the loop's agent on a case.
 type LoopRun struct {
 	ID, Case, Family, Step string
@@ -47,6 +61,7 @@ type LoopRun struct {
 	Status, Failure        string
 	USD                    float64 // reservation while running; charged cost after completion
 	Tokens                 int64
+	Usage                  Usage // the tokens by kind; none for a run whose stream gave no result
 	Turns                  int
 	Model, Dir, Summary    string
 	Experiment             string // "" for a live run; otherwise what it was (an evaluation's task and trial)
@@ -65,17 +80,27 @@ func (s *Store) PutLoopRun(ctx context.Context, r LoopRun) error {
 		ended = r.Ended.UnixMilli()
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO loop_runs (id, case_id, family, step, started, ended, status, failure, cost_usd,
-	  tokens, turns, model, dir, summary, experiment) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	  tokens, turns, model, dir, summary, experiment, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+	  cache_write_1h_tokens) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 	  ON CONFLICT(id) DO UPDATE SET case_id = excluded.case_id, family = excluded.family, step = excluded.step,
 	    started = excluded.started, ended = excluded.ended, status = excluded.status, failure = excluded.failure,
 	    cost_usd = excluded.cost_usd, tokens = excluded.tokens, turns = excluded.turns, model = excluded.model,
-	    dir = excluded.dir, summary = excluded.summary, experiment = excluded.experiment`,
+	    dir = excluded.dir, summary = excluded.summary, experiment = excluded.experiment, input_tokens = excluded.input_tokens,
+	    output_tokens = excluded.output_tokens, cache_read_tokens = excluded.cache_read_tokens,
+	    cache_write_tokens = excluded.cache_write_tokens, cache_write_1h_tokens = excluded.cache_write_1h_tokens`,
 		r.ID, r.Case, r.Family, r.Step, r.Started.UnixMilli(), ended, r.Status, caseText(r.Failure, 400), r.USD, r.Tokens, r.Turns,
-		r.Model, r.Dir, caseText(r.Summary, caseTextMax), r.Experiment)
+		r.Model, r.Dir, caseText(r.Summary, caseTextMax), r.Experiment, r.Usage.Input, r.Usage.Output, r.Usage.CacheRead,
+		r.Usage.CacheWrite, r.Usage.CacheWrite1h)
 	return err
 }
 
-const loopColumns = `id, case_id, family, step, started, ended, status, failure, cost_usd, tokens, turns, model, dir, summary, experiment`
+const loopColumns = `id, case_id, family, step, started, ended, status, failure, cost_usd, tokens, turns, model, dir, summary, experiment,
+  input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cache_write_1h_tokens`
+
+// loopRunColumns are the columns loop_runs gained after it was first made (keptColumns): a run's tokens by kind.
+var loopRunColumns = [][2]string{{"input_tokens", "INTEGER NOT NULL DEFAULT 0"}, {"output_tokens", "INTEGER NOT NULL DEFAULT 0"},
+	{"cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"}, {"cache_write_tokens", "INTEGER NOT NULL DEFAULT 0"},
+	{"cache_write_1h_tokens", "INTEGER NOT NULL DEFAULT 0"}}
 
 func scanRuns(rows *sql.Rows, err error) ([]LoopRun, error) {
 	if err != nil {
@@ -87,7 +112,8 @@ func scanRuns(rows *sql.Rows, err error) ([]LoopRun, error) {
 		var r LoopRun
 		var started, ended int64
 		if err := rows.Scan(&r.ID, &r.Case, &r.Family, &r.Step, &started, &ended, &r.Status, &r.Failure, &r.USD, &r.Tokens,
-			&r.Turns, &r.Model, &r.Dir, &r.Summary, &r.Experiment); err != nil {
+			&r.Turns, &r.Model, &r.Dir, &r.Summary, &r.Experiment, &r.Usage.Input, &r.Usage.Output, &r.Usage.CacheRead,
+			&r.Usage.CacheWrite, &r.Usage.CacheWrite1h); err != nil {
 			return nil, err
 		}
 		r.Started = time.UnixMilli(started)
@@ -170,8 +196,10 @@ func (s *Store) FinishLoopRun(ctx context.Context, r LoopRun) error {
  runs = runs + 1, updated = ? WHERE id = ?`, r.USD, r.Tokens, max(int64(0), r.Ended.UnixMilli()-started), r.Ended.UnixMilli(), c.ID); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE loop_runs SET ended = ?, status = ?, failure = ?, cost_usd = ?, tokens = ?, turns = ?, model = ?, summary = ? WHERE id = ?`,
-		r.Ended.UnixMilli(), r.Status, caseText(r.Failure, 400), r.USD, r.Tokens, r.Turns, r.Model, caseText(r.Summary, caseTextMax), r.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE loop_runs SET ended = ?, status = ?, failure = ?, cost_usd = ?, tokens = ?, turns = ?, model = ?, summary = ?,
+ input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?, cache_write_1h_tokens = ? WHERE id = ?`,
+		r.Ended.UnixMilli(), r.Status, caseText(r.Failure, 400), r.USD, r.Tokens, r.Turns, r.Model, caseText(r.Summary, caseTextMax),
+		r.Usage.Input, r.Usage.Output, r.Usage.CacheRead, r.Usage.CacheWrite, r.Usage.CacheWrite1h, r.ID); err != nil {
 		return err
 	}
 	if err := caseLog(ctx, tx, c.ID, "loop:"+r.ID, "run", r.Step+" "+r.ID+": "+r.Status+" "+r.Failure+" "+r.Summary, r.Ended); err != nil {

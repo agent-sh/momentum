@@ -504,10 +504,10 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 	if err != nil {
 		run.Status, run.Failure = store.RunFailed, err.Error()
 		if res.CostKnown { // what it spent, wherever it went
-			run.USD, run.Tokens, run.Turns = res.USD, res.Tokens, res.Turns
+			run.USD, run.Tokens, run.Usage, run.Turns = res.USD, res.Tokens, res.Usage, res.Turns
 		}
 	} else {
-		run.Status, run.Failure, run.USD, run.Tokens, run.Turns = res.Status, res.Failure, res.USD, res.Tokens, res.Turns
+		run.Status, run.Failure, run.USD, run.Tokens, run.Usage, run.Turns = res.Status, res.Failure, res.USD, res.Tokens, res.Usage, res.Turns
 		run.Model = firstOf(res.Model, run.Model)
 		if run.Summary == "" {
 			run.Summary = summaryOf(res)
