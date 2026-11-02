@@ -1,0 +1,2 @@
+# go build ./cmd/momentum at the root writes the binary here; build output never enters the repository
+/momentum

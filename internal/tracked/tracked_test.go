@@ -1,0 +1,151 @@
+package tracked
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// repo is a synthetic repository a test commits to.
+type repo struct {
+	t   *testing.T
+	dir string
+}
+
+func newRepo(t *testing.T) repo {
+	t.Helper()
+	r := repo{t, t.TempDir()}
+	r.git("init", "-q", "-b", "main")
+	r.commit("README.md", []byte("a small text file\n"))
+	return r
+}
+
+func (r repo) git(args ...string) string {
+	r.t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", r.dir, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+		"-c", "commit.gpgsign=false"}, args...)...)
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		r.t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// commit writes a file, or deletes it when data is nil, and commits.
+func (r repo) commit(name string, data []byte) string {
+	r.t.Helper()
+	p := filepath.Join(r.dir, name)
+	if data == nil {
+		r.git("rm", "-q", name)
+	} else {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			r.t.Fatal(err)
+		}
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			r.t.Fatal(err)
+		}
+		r.git("add", name)
+	}
+	r.git("commit", "-q", "-m", "change "+name)
+	return r.git("rev-parse", "HEAD")
+}
+
+func check(t *testing.T, r repo, revs ...string) []Problem {
+	t.Helper()
+	ps, err := Check(context.Background(), r.dir, revs...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ps
+}
+
+func wantOne(t *testing.T, ps []Problem, path, why string) {
+	t.Helper()
+	if len(ps) != 1 || ps[0].Path != path || !strings.Contains(ps[0].Why, why) {
+		t.Fatalf("want one problem for %s (%s), got %v", path, why, ps)
+	}
+}
+
+func TestAFileOverAMebibyteFailsTheCheck(t *testing.T) {
+	r := newRepo(t)
+	base := r.git("rev-parse", "HEAD")
+	r.commit("data/exact.txt", bytes.Repeat([]byte("a"), Limit)) // at the limit: taken
+	if ps := check(t, r, base+"..HEAD"); len(ps) != 0 {
+		t.Fatalf("a file of exactly %d bytes is taken, got %v", Limit, ps)
+	}
+	r.commit("data/big.txt", bytes.Repeat([]byte("a"), Limit+1))
+	wantOne(t, check(t, r, base+"..HEAD"), "data/big.txt", "over")
+}
+
+func TestAnExecutableBinaryFailsTheCheck(t *testing.T) {
+	elf := append([]byte("\x7fELF\x02\x01\x01"), bytes.Repeat([]byte{0}, 64)...)
+	machO := append([]byte{0xcf, 0xfa, 0xed, 0xfe}, bytes.Repeat([]byte{0}, 64)...)
+	pe := make([]byte, 0x80)
+	copy(pe, "MZ")
+	binary.LittleEndian.PutUint32(pe[0x3c:], 0x40)
+	copy(pe[0x40:], "PE\x00\x00")
+	for _, c := range []struct {
+		name string
+		data []byte
+		kind string
+	}{{"momentum", elf, "ELF"}, {"bin/tool", machO, "Mach-O"}, {"tool.exe", pe, "PE"}, {"m.wasm", []byte("\x00asm\x01\x00\x00\x00"), "WebAssembly"}} {
+		t.Run(c.kind, func(t *testing.T) {
+			r := newRepo(t)
+			base := r.git("rev-parse", "HEAD")
+			r.commit(c.name, c.data)
+			wantOne(t, check(t, r, base+"..HEAD"), c.name, c.kind)
+		})
+	}
+}
+
+func TestAFileACommitAddsAndALaterCommitDeletesStillFails(t *testing.T) {
+	r := newRepo(t)
+	base := r.git("rev-parse", "HEAD")
+	r.commit("momentum", append([]byte("\x7fELF"), bytes.Repeat([]byte{1}, 100)...))
+	r.commit("momentum", nil)
+	r.commit("notes.md", []byte("the change\n"))
+	wantOne(t, check(t, r, base+"..HEAD"), "momentum", "ELF")
+	if _, err := os.Stat(filepath.Join(r.dir, "momentum")); !os.IsNotExist(err) {
+		t.Fatalf("the head should not hold the binary: %v", err)
+	}
+}
+
+func TestTextAndOrdinaryDataPassTheCheck(t *testing.T) {
+	r := newRepo(t)
+	base := r.git("rev-parse", "HEAD")
+	r.commit("doc/MZ.md", []byte("MZ is not a PE file without its signature\n"+strings.Repeat("x", 200)))
+	r.commit("testdata/image.png", []byte("\x89PNG\r\n\x1a\nsynthetic"))
+	r.commit("run.sh", []byte("#!/bin/sh\necho ok\n"))
+	if ps := check(t, r, base+"..HEAD"); len(ps) != 0 {
+		t.Fatalf("text and ordinary data are taken, got %v", ps)
+	}
+	// the whole history, as a push of a new branch reads it
+	if ps := check(t, r, "HEAD"); len(ps) != 0 {
+		t.Fatalf("the whole history holds nothing to refuse, got %v", ps)
+	}
+}
+
+func TestOnlyWhatTheRangeAddsIsRead(t *testing.T) {
+	r := newRepo(t)
+	r.commit("old/big.txt", bytes.Repeat([]byte("b"), Limit+1))
+	base := r.git("rev-parse", "HEAD")
+	r.commit("new.txt", []byte("small\n"))
+	if ps := check(t, r, base+"..HEAD"); len(ps) != 0 {
+		t.Fatalf("a file the base already holds is not the range's, got %v", ps)
+	}
+	wantOne(t, check(t, r, "HEAD"), "old/big.txt", "over")
+}
+
+func TestExecutableNamesOnlyBinaries(t *testing.T) {
+	for _, b := range [][]byte{nil, []byte("MZ"), []byte("MZ" + strings.Repeat(" ", 100)), []byte("\x7fEL"), []byte("plain text")} {
+		if k := Executable(b); k != "" {
+			t.Errorf("Executable(%q) = %q, want none", b, k)
+		}
+	}
+}
