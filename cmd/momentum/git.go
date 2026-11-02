@@ -269,15 +269,8 @@ func isRevision(ctx context.Context, dir, a string) error {
 // magic.
 func repoPath(p string) error {
 	clean := path.Clean(p)
-	for _, protected := range secretDirs {
-		if clean == protected || strings.HasPrefix(clean, protected+"/") || strings.Contains(clean, "/"+protected+"/") || strings.HasSuffix(clean, "/"+protected) {
-			return fmt.Errorf("credential path is not shown")
-		}
-	}
-	for _, part := range strings.Split(clean, "/") {
-		if secretName.MatchString(part) || contains(secretDirs, part) || part == "auth.json" {
-			return fmt.Errorf("credential path is not shown")
-		}
+	if loop.CredentialPath(clean) {
+		return fmt.Errorf("credential path is not shown")
 	}
 	switch {
 	case p == "" || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "~"):

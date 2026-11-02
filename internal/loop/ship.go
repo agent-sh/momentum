@@ -326,6 +326,13 @@ func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []strin
 	if err := CheckPaths(Target{Repo: p.Repo}, paths); err != nil {
 		return p, err
 	}
+	// a clean review has read the whole change: the review's diff leaves credential files out, and the loop never
+	// changes one
+	for _, c := range paths {
+		if CredentialPath(c) {
+			return p, refused("%s is a credential file or lies where credentials are kept: the loop never changes one", c)
+		}
+	}
 	if len(testFiles) == 0 {
 		for _, c := range paths {
 			if testFileRe.MatchString(c) {
@@ -395,6 +402,27 @@ func (s *Ship) export(ctx context.Context, p Package, name, treeish string) (str
 	if _, err := s.git(ctx, dir, "read-tree", "-u", "--reset", treeish); err != nil {
 		s.unexport(p, dir)
 		return "", err
+	}
+	// the test runs on the tree without its credential files: what a test prints reaches the build and the review
+	listed, err := s.git(ctx, dir, append([]string{"ls-files", "-z", "--"}, credentialIncludes()...)...)
+	if err != nil {
+		s.unexport(p, dir)
+		return "", err
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		s.unexport(p, dir)
+		return "", err
+	}
+	defer root.Close()
+	for _, f := range strings.Split(listed, "\x00") {
+		if f == "" {
+			continue
+		}
+		if err := root.Remove(f); err != nil && !errors.Is(err, os.ErrNotExist) {
+			s.unexport(p, dir)
+			return "", fmt.Errorf("leave %s out of the test's tree: %w", f, err)
+		}
 	}
 	return dir, nil
 }
@@ -1021,8 +1049,16 @@ func CheckGitConfig(ctx context.Context, dir string) error {
 			blocked = blocked || strings.HasPrefix(key, prefix)
 		}
 		for _, pair := range [][2]string{{"merge.", ".driver"}, {"diff.", ".textconv"}, {"diff.", ".command"}, {"remote.", ".receivepack"},
-			{"remote.", ".uploadpack"}, {"remote.", ".vcs"}, {"submodule.", ".update"}} {
+			{"remote.", ".uploadpack"}, {"remote.", ".vcs"}} {
 			blocked = blocked || strings.HasPrefix(key, pair[0]) && strings.HasSuffix(key, pair[1])
+		}
+		if strings.HasPrefix(key, "submodule.") && strings.HasSuffix(key, ".update") {
+			// checkout, rebase, merge and none are the modes git submodule init writes; any other value (! and a
+			// command) runs a program
+			value, err := config("--get-all", key)
+			for _, v := range strings.Split(strings.TrimSpace(string(value)), "\n") {
+				blocked = blocked || err != nil || !slices.Contains([]string{"checkout", "rebase", "merge", "none"}, strings.ToLower(strings.TrimSpace(v)))
+			}
 		}
 		if blocked {
 			return refused("repository Git setting %s names a program", key)

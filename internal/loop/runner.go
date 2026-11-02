@@ -407,7 +407,10 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 			run.Summary = summaryOf(res)
 		}
 	}
-	if !res.CostKnown {
+	switch {
+	case !res.CostKnown && err != nil && res.Transcript == "":
+		run.USD = 0 // it never started (its prompt could not be scrubbed, the harness did not start): it spent nothing
+	case !res.CostKnown:
 		run.USD = reserved // what it spent is unknown: its whole budget
 	}
 	if err := r.Store.FinishLoopRun(ctx, *run); err != nil {
@@ -483,7 +486,7 @@ func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step s
 		inv.AddDirs = append(inv.AddDirs, r.ReadDirs...)
 	}
 	inv.Settings = r.permissions(step, c, run)
-	// the prompt holds the case's title, which a detector made of what it read: a run reads nothing unscrubbed
+	// the prompt holds the case's title, which a detector made of what it read: it reaches the run scrubbed
 	if inv.Prompt, err = Redact(ctx, inv.Prompt); err != nil {
 		return Result{}, err
 	}
@@ -521,9 +524,7 @@ func (r *Runner) permissions(step string, c store.Case, run store.LoopRun) Setti
 			"Bash(momentum evidence git *)", "Bash(momentum evidence file *)", "Bash(momentum evidence unit *)",
 			"Bash(momentum supervise replay *)", "Bash(momentum report *)", "Bash(momentum ship status *)",
 			"Bash(tacit search *)", "Bash(tacit fact *)", "Bash(tacit tree *)", "Agent", "Task"},
-		Deny: []string{"Read(**/.env)", "Read(**/.env.*)", "Read(**/*.pem)", "Read(**/*.key)", "Read(**/id_rsa*)", "Read(**/id_ed25519*)",
-			"Read(**/.git-credentials)", "Read(**/.netrc)", "Read(**/credentials*)", "Read(**/.npmrc)", "Read(**/auth.json)",
-			"WebFetch", "WebSearch"},
+		Deny: append(CredentialDenials(), "WebFetch", "WebSearch"),
 	}
 	switch step {
 	case StepBuild:
