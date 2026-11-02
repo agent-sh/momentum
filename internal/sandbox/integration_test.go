@@ -555,7 +555,7 @@ func TestDirectRunAndExitStatus(t *testing.T) {
 func TestStopLeftover(t *testing.T) {
 	needSandbox(t, false)
 	s := basicSpec(t)
-	s.Unit = "momentum-run-leftover-" + filepath.Base(s.Host)
+	s.Unit = "momentum-run-leftover-test-" + filepath.Base(s.Host)
 	s.Argv = []string{"/bin/sh", "-c", `echo ready; exec sleep 60`}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -588,9 +588,31 @@ func TestStopLeftover(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("leftover did not become ready")
 	}
-	// This API intentionally stops every matching unit. Do not run concurrently
-	// with other sandbox integration tests or with a live momentum loop.
-	if err := StopLeftover(ctx); err != nil {
+	// A unit of another prefix, started now, must outlive the call: one caller's startup never stops another's runs.
+	other := basicSpec(t)
+	other.Unit = "momentum-run-other-test-" + filepath.Base(other.Host)
+	other.Argv = []string{"/bin/sh", "-c", `echo ready; exec sleep 60`}
+	otherCtx, stopOther := context.WithCancel(ctx)
+	otherReady, otherDone := make(chan struct{}), make(chan struct{})
+	go func() {
+		other.Run(otherCtx, &readyWriter{ready: otherReady}, io.Discard)
+		close(otherDone)
+	}()
+	defer func() {
+		stopOther()
+		<-otherDone
+	}()
+	select {
+	case <-otherReady:
+	case <-ctx.Done():
+		t.Fatal("the other unit did not become ready")
+	}
+	for _, bad := range []string{"", "momentum-run-", "momentum-run-loop", "loop-", "momentum-run-Loop-"} {
+		if err := StopLeftover(ctx, bad); err == nil {
+			t.Fatalf("prefix %q was accepted", bad)
+		}
+	}
+	if err := StopLeftover(ctx, "momentum-run-leftover-test-"); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -599,4 +621,7 @@ func TestStopLeftover(t *testing.T) {
 		t.Fatal("leftover client did not exit after stop")
 	}
 	assertUnitGone(t, s.Unit)
+	if out, err := exec.Command("systemctl", "--user", "is-active", other.Unit+".service").Output(); err != nil || strings.TrimSpace(string(out)) != "active" {
+		t.Fatal("a unit of another prefix was stopped")
+	}
 }

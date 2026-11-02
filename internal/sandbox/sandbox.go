@@ -35,6 +35,8 @@ const (
 var (
 	unitPattern = regexp.MustCompile(`^momentum-run-[a-z0-9-]+$`)
 	envPattern  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	// prefixPattern is what StopLeftover accepts: the reserved prefix and a name that ends in a hyphen.
+	prefixPattern = regexp.MustCompile(`^momentum-run-([a-z0-9]+-)+$`)
 )
 
 type Bind struct {
@@ -243,11 +245,16 @@ func stopUnit(ctx context.Context, unit string) error {
 	return cmd.Run()
 }
 
-// StopLeftover is for startup, before the caller begins any new runs.
-// It stops all loaded momentum-run services, including inactive and failed ones.
-func StopLeftover(ctx context.Context) error {
+// StopLeftover is for startup, before the caller begins any new runs. It stops the loaded services whose names begin
+// with prefix, inactive and failed ones included, and no other: each kind of caller names its units with a prefix of
+// its own (momentum-run-loop-, momentum-run-eval-), so one caller's startup never stops another's runs. The prefix is
+// momentum-run- followed by words of [a-z0-9]+ that each end in a hyphen.
+func StopLeftover(ctx context.Context, prefix string) error {
+	if !prefixPattern.MatchString(prefix) {
+		return fmt.Errorf("sandbox: leftover prefix %q is not momentum-run- and a name ending in a hyphen", prefix)
+	}
 	cmd := exec.CommandContext(ctx, "systemctl", "--user", "list-units",
-		"--all", "--type=service", "--plain", "--no-legend", "--no-pager", "momentum-run-*.service")
+		"--all", "--type=service", "--plain", "--no-legend", "--no-pager", prefix+"*.service")
 	out, err := cmd.Output()
 	if err != nil {
 		return fmt.Errorf("sandbox: list leftover units: %w", err)
@@ -260,7 +267,7 @@ func StopLeftover(ctx context.Context) error {
 		}
 		// Cleanup also covers stale names from earlier callers. Spec's stricter
 		// name validation applies to new launches, not the reserved prefix.
-		if !strings.HasPrefix(fields[0], "momentum-run-") || !strings.HasSuffix(fields[0], ".service") {
+		if !strings.HasPrefix(fields[0], prefix) || !strings.HasSuffix(fields[0], ".service") {
 			return errors.New("sandbox: unexpected unit in leftover list")
 		}
 		units = append(units, fields[0])
