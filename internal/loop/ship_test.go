@@ -164,6 +164,9 @@ func testingCase(t *testing.T, st *store.Store) store.Case {
 	if _, err := st.Put(ctx, evs); err != nil {
 		t.Fatal(err)
 	}
+	if err := st.MarkRead(ctx, store.Transcripts, time.Now().Add(24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
 	f := store.Finding{Family: "failures", Signature: "failures/v1:zz", Title: "the thing breaks"}
 	for _, e := range evs {
 		f.Evidence = append(f.Evidence, store.Evidence{Ref: "ev:" + e.ID()})
@@ -1458,7 +1461,7 @@ func TestAProposalRecordsItsGateAndLongerBaseline(t *testing.T) {
 	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
 		t.Fatal(err)
 	}
-	w := 24 * time.Hour
+	w := 7 * 24 * time.Hour
 	hours(t, st, "older", at.Add(-4*w), 3*w, 30, 9)
 	hours(t, st, "too-old", at.Add(-4*w-time.Second), time.Second, 1, 1)
 	hours(t, st, "end", at, time.Hour, 10, 10)
@@ -1466,7 +1469,7 @@ func TestAProposalRecordsItsGateAndLongerBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !p.Plan.At.Equal(at) || p.Plan.Before != 9 || p.Plan.BeforeBase != 30 || p.Plan.Gate != 6 || p.Plan.GateBase != 6 {
+	if !p.Plan.At.Equal(at) || p.Plan.Before != 15 || p.Plan.BeforeBase != 36 || p.Plan.Gate != 6 || p.Plan.GateBase != 6 {
 		t.Fatalf("proposal counts: %+v", p.Plan)
 	}
 }
@@ -1500,7 +1503,7 @@ func TestAPlanChoosesItsSignalsUnitsAndHarness(t *testing.T) {
 			}
 			for _, e := range append([]store.Event(nil), evs...) {
 				e.SourceKey += "-baseline"
-				e.TS = e.TS.Add(-24 * time.Hour)
+				e.TS = e.TS.Add(-7 * 24 * time.Hour)
 				evs = append(evs, e)
 			}
 			if _, err := st.Put(ctx, evs); err != nil {
@@ -1510,7 +1513,10 @@ func TestAPlanChoosesItsSignalsUnitsAndHarness(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			p, err := s.validPlan(ctx, c, sig, 24*time.Hour, "", at)
+			if err := st.MarkRead(ctx, sig.Source, at.Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			p, err := s.validPlan(ctx, c, sig, 7*24*time.Hour, "", at)
 			if err != nil || p.Units != units || p.Before != 6 || p.BeforeBase != 6 {
 				t.Fatalf("%s: %+v %v", units, p, err)
 			}
@@ -1543,7 +1549,7 @@ func TestAResumedLandingKeepsItsRecordedTime(t *testing.T) {
 }
 
 // A recent burst passes the gate but cannot supply its own baseline. A baseline too rare to show a drop to
-// none within two windows is refused; shortening the window can reach the problem's more recent history.
+// none within two windows is refused; a whole week can reach the problem's more recent history.
 func TestAPlanNeedsAMeasurableIndependentBaseline(t *testing.T) {
 	for _, oldHits := range []int{0, 1, 3, 4} {
 		t.Run(fmt.Sprint(oldHits), func(t *testing.T) {
@@ -1551,7 +1557,7 @@ func TestAPlanNeedsAMeasurableIndependentBaseline(t *testing.T) {
 			st := testStore(t)
 			s := &Ship{Store: st}
 			at := time.Date(2026, 1, 10, 12, 0, 0, 0, time.UTC)
-			w := 24 * time.Hour
+			w := 7 * 24 * time.Hour
 			gate := hours(t, st, "gate", at.Add(-w), w, 100, 6)
 			hours(t, st, "recent", at.Add(-2*w), w, 100, 6)
 			hours(t, st, "old", at.Add(-28*w), 21*w, 300, oldHits)
@@ -1563,17 +1569,20 @@ func TestAPlanNeedsAMeasurableIndependentBaseline(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if err := st.MarkRead(ctx, goodSignal.Source, at.Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
 			_, err = s.validPlan(ctx, c, goodSignal, 7*w, "", at)
 			if oldHits == 4 {
 				if err != nil {
 					t.Fatalf("baseline measurable over two windows: %v", err)
 				}
-			} else if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "too new or too rare") || !strings.Contains(err.Error(), "a shorter window reads more recent history") {
-				t.Fatalf("unmeasurable weekly baseline: %v", err)
+			} else if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "too new or too rare") || !strings.Contains(err.Error(), "use a week, or two for a rarer problem") {
+				t.Fatalf("unmeasurable longer baseline: %v", err)
 			}
 			p, err := s.validPlan(ctx, c, goodSignal, w, "", at)
 			if err != nil || p.Before != 6 || p.BeforeBase != 100 || p.Gate != 6 || p.GateBase != 100 {
-				t.Fatalf("measurable daily plan: %+v %v", p, err)
+				t.Fatalf("measurable weekly plan: %+v %v", p, err)
 			}
 		})
 	}

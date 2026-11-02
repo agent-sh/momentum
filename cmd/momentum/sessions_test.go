@@ -367,3 +367,28 @@ func TestAnIncompleteSnapshotMakesNoSessionVanish(t *testing.T) {
 		t.Fatalf("one appearance and no departure: %+v %v", evs, err)
 	}
 }
+
+// Only a complete sessions scan advances the source's read time, including a scan with no live sessions.
+func TestOnlyACompleteSessionsScanAdvancesItsReadTime(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "m.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if _, scanErr, err := board(ctx, &sessions.World{Now: start}, nil, st, "test", []sessions.Source{fixed{}}); err != nil || scanErr != nil {
+		t.Fatal(scanErr, err)
+	}
+	read, err := st.ReadThrough(ctx, store.Sessions)
+	if err != nil || !read.Equal(start) {
+		t.Fatalf("complete scan: %v %v", read, err)
+	}
+	if _, _, err := board(ctx, &sessions.World{Now: start.Add(time.Hour)}, errors.New("incomplete snapshot"), st, "test", []sessions.Source{fixed{}}); err != nil {
+		t.Fatal(err)
+	}
+	read, err = st.ReadThrough(ctx, store.Sessions)
+	if err != nil || !read.Equal(start) {
+		t.Fatalf("incomplete scan advanced: %v %v", read, err)
+	}
+}

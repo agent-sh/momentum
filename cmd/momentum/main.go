@@ -96,9 +96,10 @@ const usage = `usage:
                                         harness's agent, review and land what was proposed
   momentum measure [--dry] [--family F,F] [--case ID] [--json]
                                         the measure step: a deployed change, once in effect, measured over its
-                                        window after it against the window before, by its signal's share of the
+                                        whole-week window after against the three windows before the gate, once
+                                        their sources have read them, by its signal's share of the
                                         active hours; improved closes its case and keeps the change, no effect
-                                        rolls it back; an improved case comes back at its old share
+                                        rolls it back; three read watch windows at its old share bring it back
   momentum loop runs [--since WHEN] [--case ID] [--json]
                                         the loop's runs, and what the live ones spent in the last day and week
   momentum loop lesson --case ID --text T

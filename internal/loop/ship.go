@@ -87,13 +87,17 @@ type Package struct {
 	Updated     time.Time `json:"updated"`
 	// What the measure step found and did: the measurement that kept the change, the problem note it stands for
 	// now (measure:CASE), the rollback it holds while the loop is not live, and its rollbacks that failed in a row.
-	Result           *measure.Result `json:"result,omitempty"`
-	Problem          string          `json:"problem,omitempty"`
-	Held             bool            `json:"held,omitempty"`
-	WatchReference   *measure.Counts `json:"watch_reference,omitempty"` // measurement after plus earlier watched windows
-	WatchWindow      int             `json:"watch_window,omitempty"`    // last completed window read since the close
-	OutOfEffect      time.Time       `json:"out_of_effect,omitzero"`    // first run that found the measuring change absent
-	RollbackFailures int             `json:"rollback_failures,omitempty"`
+	Result           *measure.Result  `json:"result,omitempty"`
+	Problem          string           `json:"problem,omitempty"`
+	Held             bool             `json:"held,omitempty"`
+	WatchRecent      []measure.Counts `json:"watch_recent,omitempty"` // last three completed watch windows
+	CheckoutAt       time.Time        `json:"checkout_at,omitzero"`   // first observed checkout time, kept for an installed build
+	ProposalAt       time.Time        `json:"proposal_at,omitzero"`   // stable boundary while the plan waits for ingestion
+	ReadUntil        time.Time        `json:"read_until,omitzero"`    // end of the window whose sources are behind
+	ReadWait         time.Time        `json:"read_wait,omitzero"`     // first run waiting for a complete source read
+	WatchWindow      int              `json:"watch_window,omitempty"` // last completed window read since the close
+	OutOfEffect      time.Time        `json:"out_of_effect,omitzero"` // first run that found the measuring change absent
+	RollbackFailures int              `json:"rollback_failures,omitempty"`
 }
 
 // Check is the evidence that a test discriminates the change: it fails on the code without the change (the
@@ -119,8 +123,8 @@ type Plan struct {
 	Gate       int           `json:"gate"`        // hits in the last window before the plan
 	GateBase   int           `json:"gate_base"`   // activity in that window
 	At         time.Time     `json:"at"`          // when it was counted: the gated window ends here
-	// Installed is the file the machine runs the change from when that is no file of the repository's checkout (a
-	// binary built from it, an installed configuration): the file must change after the checkout took the change.
+	// Installed is the built or installed file the machine runs (a binary, an installed configuration):
+	// it must change after the recorded time the checkout first held the change.
 	Installed string `json:"installed,omitempty"`
 }
 
@@ -516,9 +520,27 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package
 	case strings.TrimSpace(pr.Rollback) == "":
 		return p, refused("a proposal needs its rollback: how the change is undone")
 	}
-	plan, err := s.validPlan(ctx, c, pr.Signal, pr.Window, pr.Installed, s.now())
+	at := p.ProposalAt
+	if at.IsZero() {
+		at = s.now()
+	}
+	plan, err := s.validPlan(ctx, c, pr.Signal, pr.Window, pr.Installed, at)
 	if err != nil {
+		var unread *unreadPlan
+		if errors.As(err, &unread) {
+			p.Plan, p.ProposalAt = &plan, at
+			r := &Runner{Store: s.Store, Ship: s, Dir: s.Dir, Now: s.Now}
+			if _, readErr := r.readWindow(ctx, &p, plan.At.Add(-(measure.BaselineWindows+1)*plan.Window), plan.At, false); readErr != nil {
+				return p, readErr
+			}
+		}
 		return p, err
+	}
+	p.ProposalAt = time.Time{}
+	if !p.ReadWait.IsZero() {
+		p.ReadWait, p.ReadUntil = time.Time{}, time.Time{}
+		r := &Runner{Store: s.Store, Ship: s, Dir: s.Dir, Now: s.Now}
+		r.resolve(ctx, &p)
 	}
 	if err := s.editsSignal(ctx, p, pr.Signal); err != nil {
 		return p, err
@@ -575,16 +597,24 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package
 		plan.Before, plan.BeforeBase, days(measure.BaselineWindows*pr.Window), plan.Gate, plan.GateBase, days(pr.Window)), s.Actor)
 }
 
+// unreadPlan keeps a proposal waiting on its store, with a stable window boundary.
+type unreadPlan struct{ sources []string }
+
+func (e *unreadPlan) Error() string {
+	return "the store has not read past the window before: " + strings.Join(e.sources, ", ")
+}
+func (e *unreadPlan) Unwrap() error { return ErrRefused }
+
 // validPlan checks a measurement plan and returns it, counted at at: a signal that names a source, kinds and at
-// least one text, a window of at least a day, at least MinSignal units of activity in which it counts an event
+// least one text, a window of whole weeks, at least MinSignal units of activity in which it counts an event
 // over the window before, and a signal that counts the case's own problem: the case holds events, and at least half
 // of those in that window are among what it counts. A file the change is installed in must be one there is.
 func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window time.Duration, installed string, at time.Time) (Plan, error) {
 	switch {
 	case sig.Source == "" || len(sig.Kinds) == 0 || len(sig.Match) == 0:
 		return Plan{}, refused("a measurement signal names a source, kinds and at least one text its events hold")
-	case window < 24*time.Hour:
-		return Plan{}, refused("a measurement window is at least a day")
+	case !measure.WholeWeeks(window):
+		return Plan{}, refused("a measurement window is a whole number of weeks (7d, 14d and so on)")
 	}
 	for _, m := range sig.Match {
 		if len(strings.TrimSpace(m)) < 4 {
@@ -608,6 +638,11 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 	before, err := tally(ctx, s.Store, sig, plan.Units, got, at.Add(-window), at, s.Dir)
 	if err != nil {
 		return Plan{}, err
+	}
+	if unread, err := unreadWindow(ctx, s.Store, plan, at.Add(-(measure.BaselineWindows+1)*window), at, s.Dir); err != nil {
+		return Plan{}, err
+	} else if len(unread) > 0 {
+		return plan, &unreadPlan{sources: unread}
 	}
 	plan.Gate, plan.GateBase = before.Hits, before.Base
 	if before.Hits < MinSignal {
@@ -649,7 +684,7 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 		return Plan{}, err
 	}
 	if !measure.Measurable(baseline, 2*plan.GateBase) {
-		return Plan{}, refused("the problem is too new or too rare to measure with that window: a shorter window reads more recent history")
+		return Plan{}, refused("the problem is too new or too rare to measure with that window: use a week, or two for a rarer problem, once enough history is read")
 	}
 	plan.Before, plan.BeforeBase = baseline.Hits, baseline.Base
 	return plan, nil
@@ -973,43 +1008,49 @@ func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error
 	return p, err
 }
 
-// InEffect says whether a landed change is in effect where the loop can see it, and since when: the repository's
-// checkout holds its commits, and the file it is installed in, when its plan names one, changed after the checkout took the change.
-// Otherwise it says what it waits for.
-func (s *Ship) InEffect(ctx context.Context, p Package) (time.Time, string, error) {
+// InEffect checks an installed file against the first recorded checkout time. With no installed file it checks
+// the checkout as it stands. It records that first time in p; the caller saves it except on a dry run.
+func (s *Ship) InEffect(ctx context.Context, p *Package) (time.Time, string, error) {
 	switch {
 	case len(p.Landed) == 0 || p.LandedAt.IsZero():
 		return time.Time{}, "", fmt.Errorf("case %s's package holds no landed commit", p.Case)
 	case p.Plan == nil:
 		return time.Time{}, "", fmt.Errorf("case %s's package has no plan", p.Case)
 	}
-	last := p.Landed[len(p.Landed)-1]
-	if _, err := s.git(ctx, p.Dir, "merge-base", "--is-ancestor", last, "HEAD"); err != nil {
-		return time.Time{}, fmt.Sprintf("the repository's checkout does not hold %.12s yet", last), nil
-	}
-	checkoutAt := p.LandedAt
-	var newest time.Time
-	for _, path := range p.Changed {
-		st, err := os.Stat(filepath.Join(p.Dir, path))
-		if errors.Is(err, os.ErrNotExist) {
-			continue
+	if p.Plan.Installed == "" || p.CheckoutAt.IsZero() {
+		last := p.Landed[len(p.Landed)-1]
+		if _, err := s.git(ctx, p.Dir, "merge-base", "--is-ancestor", last, "HEAD"); err != nil {
+			var exit *exec.ExitError
+			if errors.As(err, &exit) && exit.ExitCode() == 1 {
+				return time.Time{}, fmt.Sprintf("the repository's checkout does not hold %.12s yet", last), nil
+			}
+			return time.Time{}, fmt.Sprintf("cannot check the repository's checkout: %v", err), nil
 		}
-		if err != nil {
-			return time.Time{}, "", err
+		checkoutAt := p.LandedAt
+		var newest time.Time
+		for _, path := range p.Changed {
+			st, err := os.Stat(filepath.Join(p.Dir, path))
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return time.Time{}, "", err
+			}
+			if st.ModTime().After(newest) {
+				newest = st.ModTime()
+			}
 		}
-		if st.ModTime().After(newest) {
-			newest = st.ModTime()
+		if !newest.IsZero() {
+			checkoutAt = newest
 		}
-	}
-	if !newest.IsZero() {
-		checkoutAt = newest
+		p.CheckoutAt = checkoutAt
 	}
 	if p.Plan.Installed != "" {
 		st, err := os.Stat(expandHome(p.Plan.Installed))
 		if err != nil {
 			return time.Time{}, fmt.Sprintf("%s, where it is installed, is not there", filepath.Base(p.Plan.Installed)), nil
 		}
-		if !st.ModTime().After(checkoutAt) {
+		if !st.ModTime().After(p.CheckoutAt) {
 			return time.Time{}, fmt.Sprintf("%s, where it is installed, has not changed since the checkout held the change", filepath.Base(p.Plan.Installed)), nil
 		}
 	}

@@ -50,12 +50,17 @@ type measured struct {
 
 func measuredCase(t *testing.T) *measured {
 	t.Helper()
+	return measuredCaseWithRead(t, true)
+}
+
+func measuredCaseWithRead(t *testing.T, read bool) *measured {
+	t.Helper()
 	ctx := context.Background()
 	st := testStore(t)
 	m := &measured{st: st, r: runnerFor(t, st, nil)}
 	m.r.Now = func() time.Time { return m.clock }
 	m.r.Ship.Now = m.r.Now
-	m.deployed = time.Now().Add(-48 * time.Hour).Truncate(time.Hour)
+	m.deployed = time.Now().Add(-365 * 24 * time.Hour).Truncate(time.Hour)
 	m.planAt = m.deployed.Add(-time.Hour)
 	m.clock = m.deployed.Add(10 * time.Minute)
 	before := hours(t, st, "b", m.planAt.Add(-24*time.Hour), 24*time.Hour, 100, 6)
@@ -86,6 +91,11 @@ func measuredCase(t *testing.T) *measured {
 	}
 	if m.c, err = st.DeployCase(ctx, c.ID, m.r.Ship.pkgDir(c.ID), m.deployed, "landed", "test"); err != nil {
 		t.Fatal(err)
+	}
+	if read {
+		if err := st.MarkRead(ctx, store.Transcripts, time.Now().Add(365*24*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return m
 }
@@ -151,8 +161,10 @@ func TestAChangeIsMeasuredFromWhenItIsInEffect(t *testing.T) {
 	if ns := m.notes(t); len(ns) != 1 || ns[0].ID != "measure:"+m.c.ID || ns[0].Kind != store.NoteProblem || !strings.Contains(ns[0].Title, "not in effect") {
 		t.Fatalf("the problem note %+v", ns)
 	}
+	noteAt := m.notes(t)[0].At
+	m.clock = m.clock.Add(time.Hour)
 	m.measure(t, Options{})
-	if ns := m.notes(t); len(ns) != 1 {
+	if ns := m.notes(t); len(ns) != 1 || !ns[0].At.Equal(noteAt) {
 		t.Fatalf("the problem note added again: %+v", ns)
 	}
 	run(t, m.repo, "git", "merge", "-q", "--ff-only", "elsewhere")
@@ -394,7 +406,7 @@ func TestTheLoopsOwnRunsCannotMakeAnUnchangedProblemImprove(t *testing.T) {
 		if _, err := m.st.Put(ctx, evs); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := m.r.Ship.validPlan(ctx, c, goodSignal, 24*time.Hour, "", m.planAt); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "in 1 session hours") {
+		if _, err := m.r.Ship.validPlan(ctx, c, goodSignal, 7*24*time.Hour, "", m.planAt); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "in 1 session hours") {
 			t.Fatalf("the loop passed the gate: %v", err)
 		}
 		got, err := Tally(ctx, m.st, goodSignal, SessionHours, m.planAt.Add(-24*time.Hour), m.planAt, m.r.Dir)
@@ -477,6 +489,7 @@ func TestAnInstalledFileMustFollowTheCheckoutChange(t *testing.T) {
 func TestAMeasuringChangeRestartsAfterItReturnsToEffect(t *testing.T) {
 	ctx := context.Background()
 	m := measuredCase(t)
+	m.clock = m.clock.Add(10 * 24 * time.Hour)
 	m.measure(t, Options{})
 	old := m.clock
 	run(t, m.repo, "git", "checkout", "-q", "--orphan", "other")
@@ -484,6 +497,9 @@ func TestAMeasuringChangeRestartsAfterItReturnsToEffect(t *testing.T) {
 	m.clock = old.Add(time.Minute)
 	if got := m.measure(t, Options{}); got.Status != "waiting" || !strings.Contains(got.Why, "not in effect") {
 		t.Fatalf("lost: %+v", got)
+	}
+	if len(m.notes(t)) != 0 {
+		t.Fatal("a fresh gap was dated from landing")
 	}
 	hours(t, m.st, "absent", old.Add(time.Hour), 22*time.Hour, 100, 0)
 	m.clock = old.Add(25 * time.Hour)
@@ -555,51 +571,56 @@ func TestAKeepInterruptedAfterTheCloseIsFinished(t *testing.T) {
 	if _, err := m.r.Ship.Keep(m.c.ID, res); err != nil {
 		t.Fatalf("keep twice: %v", err)
 	}
-	hours(t, m.st, "back", m.clock.Add(time.Minute), 23*time.Hour, 100, 12)
-	m.clock = m.clock.Add(24 * time.Hour)
+	for i := 0; i < 3; i++ {
+		hours(t, m.st, fmt.Sprint("back", i), m.clock.Add(time.Duration(i)*24*time.Hour), 23*time.Hour, 100, 12)
+	}
+	m.clock = m.clock.Add(72 * time.Hour)
 	if got := m.measure(t, Options{}); got.Status != "back" {
 		t.Fatalf("recovered keep not watched: %+v", got)
 	}
 }
 
-// Watch reads consecutive completed windows since the close, once each, including catch-up windows on a late
-// run. It never reads an unfinished window or folds two quiet windows into a louder one.
+// Watch reads each completed window once, saves the last three separately and leaves quiet progress untouched when dry.
 func TestWatchReadsEachCompletedWindowOnce(t *testing.T) {
 	ctx := context.Background()
-	m := measuredCase(t)
-	m.measure(t, Options{})
-	hours(t, m.st, "after", m.clock.Add(time.Minute), 23*time.Hour, 100, 0)
-	m.clock = m.clock.Add(25 * time.Hour)
-	m.measure(t, Options{})
+	m := keptCase(t)
 	closed := m.theCase(t).Closed
-	hours(t, m.st, "first", closed.Add(time.Minute), 23*time.Hour, 100, 3)
-	hours(t, m.st, "second", closed.Add(25*time.Hour), 22*time.Hour, 100, 3)
+	for i := 0; i < 3; i++ {
+		hours(t, m.st, fmt.Sprint("window", i), closed.Add(time.Duration(i)*24*time.Hour), 23*time.Hour, 100, 6)
+	}
 	m.clock = closed.Add(47 * time.Hour)
+	before, _ := os.ReadFile(filepath.Join(m.r.Ship.pkgDir(m.c.ID), "package.json"))
+	if ms, err := m.r.Measure(ctx, Options{Dry: true}); err != nil || len(ms) != 0 {
+		t.Fatalf("dry quiet: %+v %v", ms, err)
+	}
+	after, _ := os.ReadFile(filepath.Join(m.r.Ship.pkgDir(m.c.ID), "package.json"))
+	if string(before) != string(after) {
+		t.Fatal("dry watch saved quiet progress")
+	}
 	if ms, err := m.r.Measure(ctx, Options{}); err != nil || len(ms) != 0 {
 		t.Fatalf("partial: %+v %v", ms, err)
 	}
 	p, _, _ := m.r.Ship.Load(m.c.ID)
-	if p.WatchWindow != 1 || p.WatchReference == nil || *p.WatchReference != (measure.Counts{Hits: 3, Base: 200}) {
-		t.Fatalf("watch progress: %+v", p)
+	if p.WatchWindow != 1 || len(p.WatchRecent) != 1 || p.WatchRecent[0] != (measure.Counts{Hits: 6, Base: 100}) {
+		t.Fatalf("progress: %+v", p)
 	}
-	// Late ingestion into a window already read cannot buy another test.
-	hours(t, m.st, "late", closed.Add(time.Hour), time.Hour, 100, 100)
+	// Re-reading the first window would now break the run of three.
+	hours(t, m.st, "late", closed.Add(time.Hour), time.Hour, 1000, 0)
 	m.clock = closed.Add(48 * time.Hour)
 	if ms, err := m.r.Measure(ctx, Options{}); err != nil || len(ms) != 0 {
-		t.Fatalf("repeated or combined: %+v %v", ms, err)
+		t.Fatalf("second: %+v %v", ms, err)
 	}
 	p, _, _ = m.r.Ship.Load(m.c.ID)
-	if p.WatchWindow != 2 || p.WatchReference == nil || *p.WatchReference != (measure.Counts{Hits: 6, Base: 300}) {
-		t.Fatalf("read %d windows", p.WatchWindow)
+	if p.WatchWindow != 2 || len(p.WatchRecent) != 2 {
+		t.Fatalf("progress: %+v", p)
 	}
-	hours(t, m.st, "third", closed.Add(49*time.Hour), 22*time.Hour, 100, 30)
 	m.clock = closed.Add(72 * time.Hour)
 	if got := m.measure(t, Options{Dry: true}); got.Status != "back" || m.theCase(t).Status != store.CaseClosed {
 		t.Fatalf("dry back: %+v", got)
 	}
 	p, _, _ = m.r.Ship.Load(m.c.ID)
-	if p.WatchWindow != 2 || p.WatchReference == nil || *p.WatchReference != (measure.Counts{Hits: 6, Base: 300}) {
-		t.Fatal("dry watch saved its progress")
+	if p.WatchWindow != 2 {
+		t.Fatal("dry back saved progress")
 	}
 	if got := m.measure(t, Options{}); got.Status != "back" || !strings.Contains(got.Why, "window 3") {
 		t.Fatalf("back: %+v", got)
@@ -607,16 +628,24 @@ func TestWatchReadsEachCompletedWindowOnce(t *testing.T) {
 	if m.theCase(t).Status != store.CaseOpen {
 		t.Fatal("case not reopened")
 	}
-	p, _, _ = m.r.Ship.Load(m.c.ID)
-	if p.WatchWindow != 3 || p.WatchReference == nil || *p.WatchReference != (measure.Counts{Hits: 6, Base: 300}) {
-		t.Fatalf("the comeback changed its reference or lost its window: %+v", p)
-	}
 	for _, n := range m.notes(t) {
 		if n.Kind == store.NoteDecided && strings.Contains(n.Detail, "lesson in tacit is not withdrawn") {
 			return
 		}
 	}
-	t.Fatal("back note omits the lesson's status")
+	t.Fatal("back note omits lesson status")
+}
+
+func keptCase(t *testing.T) *measured {
+	t.Helper()
+	m := measuredCase(t)
+	m.measure(t, Options{})
+	hours(t, m.st, "after", m.clock.Add(time.Minute), 23*time.Hour, 100, 0)
+	m.clock = m.clock.Add(25 * time.Hour)
+	if got := m.measure(t, Options{}); got.Status != "improved" {
+		t.Fatalf("keep: %+v", got)
+	}
+	return m
 }
 
 // An empty window is named for where it fell. Two empty windows after are too quiet to tell, not evidence of
@@ -740,6 +769,9 @@ func TestTheStepLandsAndRollsBackWithItsNotes(t *testing.T) {
 	m.measure(t, Options{})
 	hours(t, st, "after", clock.Add(time.Minute), 23*time.Hour, 100, 6)
 	clock = clock.Add(25 * time.Hour)
+	if err := st.MarkRead(ctx, store.Transcripts, clock.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	r.problem(ctx, &p, "cannot roll back", "a prior failure")
 	if got := m.measure(t, Options{}); got.Status != "rolled back" {
 		t.Fatalf("rollback: %+v", got)
@@ -762,62 +794,51 @@ func TestTheStepLandsAndRollsBackWithItsNotes(t *testing.T) {
 	t.Fatal("rollback decided note missing")
 }
 
-// A late run tests every ended window, not just the latest: a return in the first one cannot disappear behind
-// a quiet second one, and it is tested at the first window's level.
-func TestWatchCatchesAnEndedWindowOnALateRun(t *testing.T) {
-	m := measuredCase(t)
-	m.measure(t, Options{})
-	hours(t, m.st, "after", m.clock.Add(time.Minute), 23*time.Hour, 100, 0)
-	m.clock = m.clock.Add(25 * time.Hour)
-	m.measure(t, Options{})
+// A late run reads every completed window: three windows at the old share cannot hide behind a quiet fourth.
+func TestWatchCatchesAnEndedRunOfWindowsOnALateRun(t *testing.T) {
+	m := keptCase(t)
 	closed := m.theCase(t).Closed
-	hours(t, m.st, "first", closed.Add(time.Minute), 23*time.Hour, 100, 12)
-	hours(t, m.st, "second", closed.Add(25*time.Hour), 22*time.Hour, 1000, 0)
-	m.clock = closed.Add(48 * time.Hour)
-	if got := m.measure(t, Options{}); got.Status != "back" || !strings.Contains(got.Why, "window 1") {
-		t.Fatalf("missed ended window: %+v", got)
+	for i := 0; i < 4; i++ {
+		hits := 6
+		if i == 3 {
+			hits = 0
+		}
+		hours(t, m.st, fmt.Sprint(i), closed.Add(time.Duration(i)*24*time.Hour), 23*time.Hour, 100, hits)
+	}
+	m.clock = closed.Add(96 * time.Hour)
+	if got := m.measure(t, Options{}); got.Status != "back" || !strings.Contains(got.Why, "window 3") {
+		t.Fatalf("late: %+v", got)
 	}
 }
 
-// A quiet watched window joins the measured window after as the next window's reference. The pooled counts
-// survive a reload, work on catch-up and dry runs, and recover packages that saved only their window number.
-func TestWatchComparesWithWhatTheFixHeld(t *testing.T) {
-	for _, mode := range []string{"reload", "catch-up", "recover"} {
-		t.Run(mode, func(t *testing.T) {
-			ctx := context.Background()
-			m := measuredCase(t)
-			m.measure(t, Options{})
-			hours(t, m.st, "after", m.clock.Add(time.Minute), 23*time.Hour, 100, 0)
-			m.clock = m.clock.Add(25 * time.Hour)
-			m.measure(t, Options{})
-			closed := m.theCase(t).Closed
-			p, _, _ := m.r.Ship.Load(m.c.ID)
-			p.Result.Before, p.Result.After = measure.Counts{Hits: 30, Base: 300}, measure.Counts{Hits: 5, Base: 100}
-			if err := m.r.Ship.save(&p); err != nil {
+// A late return at the baseline share has the same three-window rule as an immediate one, across reloads.
+func TestWatchCatchesALateReturnAtTheOldShare(t *testing.T) {
+	ctx := context.Background()
+	for _, delay := range []int{0, 6, 26, 104} {
+		m := keptCase(t)
+		closed := m.theCase(t).Closed
+		p, _, _ := m.r.Ship.Load(m.c.ID)
+		p.Result.Before, p.Result.After = measure.Counts{Hits: 30, Base: 300}, measure.Counts{Hits: 5, Base: 100}
+		if err := m.r.Ship.save(&p); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < delay+3; i++ {
+			hits := 5
+			if i >= delay {
+				hits = 10
+			}
+			hours(t, m.st, fmt.Sprint("watch", i), closed.Add(time.Duration(i)*24*time.Hour), 23*time.Hour, 100, hits)
+			m.clock = closed.Add(time.Duration(i+1) * 24 * time.Hour)
+			ms, err := m.r.Measure(ctx, Options{})
+			if err != nil {
 				t.Fatal(err)
 			}
-			hours(t, m.st, "quiet", closed, 24*time.Hour, 100, 0)
-			hours(t, m.st, "return", closed.Add(24*time.Hour), 24*time.Hour, 100, 10)
-			if mode != "catch-up" {
-				m.clock = closed.Add(24 * time.Hour)
-				if ms, err := m.r.Measure(ctx, Options{}); err != nil || len(ms) != 0 {
-					t.Fatalf("quiet: %+v %v", ms, err)
-				}
-				if mode == "recover" {
-					p, _, _ = m.r.Ship.Load(m.c.ID)
-					p.WatchReference = nil
-					if err := m.r.Ship.save(&p); err != nil {
-						t.Fatal(err)
-					}
-				}
+			if i < delay+2 && len(ms) != 0 {
+				t.Fatalf("early: %+v", ms)
 			}
-			m.clock = closed.Add(48 * time.Hour)
-			if got := m.measure(t, Options{Dry: true}); got.Status != "back" || m.theCase(t).Status != store.CaseClosed {
-				t.Fatalf("dry: %+v", got)
+			if i == delay+2 && (len(ms) != 1 || ms[0].Status != "back") {
+				t.Fatalf("missed return: %+v", ms)
 			}
-			if got := m.measure(t, Options{}); got.Status != "back" || !strings.Contains(got.Why, "window 2") {
-				t.Fatalf("pooled return: %+v", got)
-			}
-		})
+		}
 	}
 }

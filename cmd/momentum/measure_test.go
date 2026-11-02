@@ -81,3 +81,16 @@ func TestTheMeasureCommand(t *testing.T) {
 		t.Fatalf("a measure inside a loop's run: exit %d", code)
 	}
 }
+
+// Help describes the independent baseline, read watch windows and the installed file's recorded checkout time.
+func TestMeasurementHelpNamesTheCurrentContract(t *testing.T) {
+	_, _, help := momentum("ship", "propose", "--help")
+	if !strings.Contains(help, "after the checkout first held the change") || !strings.Contains(help, "whole weeks") || strings.Contains(help, "after the landing") {
+		t.Fatalf("ship help: %s", help)
+	}
+	_, out, errOut := momentum("--help")
+	text := out + errOut
+	if !strings.Contains(text, "three windows before the gate") || !strings.Contains(text, "three read watch windows") {
+		t.Fatalf("measure help: %s", text)
+	}
+}

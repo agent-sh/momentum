@@ -13,6 +13,7 @@ package measure
 import (
 	"fmt"
 	"math"
+	"time"
 )
 
 // Alpha is the test's level: an effect this unlikely under no change is taken as the change's.
@@ -74,18 +75,25 @@ func Measurable(before Counts, afterBase int) bool {
 	return tail(0, before.Base+afterBase, before.Hits, afterBase) < Alpha
 }
 
-// Back tests a completed watch window against the pooled reference, by Fisher's upper tail.
-// The reference holds the measured window after and every earlier window that did not bring the case back.
-// Window j spends Alpha / 2^j, starting at one. The levels sum to Alpha over all windows.
-// Its share must also reach the baseline's, in at least MinBefore units.
-func Back(before, reference, recent Counts, window int) bool {
-	if window < 1 || before.Base == 0 || reference.Base == 0 || recent.Base == 0 ||
-		recent.Hits < MinBefore || recent.Rate() < before.Rate() || recent.Rate() <= reference.Rate() {
+// WholeWeeks reports whether a plan compares the same days of the week.
+func WholeWeeks(window time.Duration) bool {
+	const week = 7 * 24 * time.Hour
+	return window >= week && window%week == 0
+}
+
+// Back needs three consecutive completed windows at the baseline share, with five hit units among them.
+func Back(before Counts, windows []Counts) bool {
+	if before.Base == 0 || len(windows) != 3 {
 		return false
 	}
-	// Exchange the windows: the lower tail of the reference count is the upper tail of the recent count.
-	p := tail(reference.Hits, reference.Base+recent.Base, reference.Hits+recent.Hits, reference.Base)
-	return p < math.Ldexp(Alpha, -window)
+	hits := 0
+	for _, recent := range windows {
+		if recent.Base == 0 || recent.Rate() < before.Rate() {
+			return false
+		}
+		hits += recent.Hits
+	}
+	return hits >= MinBefore
 }
 
 func percent(x float64) string { return fmt.Sprintf("%.2f%%", 100*x) }

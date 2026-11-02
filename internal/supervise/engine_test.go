@@ -889,3 +889,25 @@ func TestNeedsNotesForWhatOnlyTheOwnerCanAnswer(t *testing.T) {
 		}
 	}
 }
+
+// A complete supervision run records its read time even with no events; a partial session keeps the last
+// complete time, so it cannot turn a missing decision into a measured improvement.
+func TestOnlyACompleteSupervisionRunAdvancesItsReadTime(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	now := t0.Add(time.Hour)
+	sv := supervisor(st, &fakeSender{}, &now)
+	run(t, sv)
+	read, err := st.ReadThrough(ctx, store.Supervise)
+	if err != nil || !read.Equal(now) {
+		t.Fatalf("complete: %v %v", read, err)
+	}
+	now = now.Add(time.Hour)
+	part := erroring()
+	part.Partial = true
+	run(t, sv, part)
+	after, err := st.ReadThrough(ctx, store.Supervise)
+	if err != nil || !after.Equal(read) {
+		t.Fatalf("partial advanced: %v %v", after, err)
+	}
+}

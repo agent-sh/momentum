@@ -276,6 +276,9 @@ func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error
 	if len(t.failed) > 0 {
 		return t.res, fmt.Errorf("%d of %d files not stored past their cursor", len(t.failed), len(jobs))
 	}
+	if !listed {
+		return t.res, fmt.Errorf("not every transcript source could be listed")
+	}
 	return t.res, nil
 }
 

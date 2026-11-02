@@ -14,7 +14,7 @@ Judge, in order:
 2. **The mechanism.** Does the case's evidence support the mechanism the change addresses, over its alternatives? A change for a cause the evidence does not show is high.
 3. **The test.** Does it fail without the change for the reason the change fixes, and pass with it? A test that would pass on a broken change is medium.
 4. **Authority.** The change stays within the loop's authority: no external repository, no change to the loop's own detectors, measurement, gates, skills or budgets, nothing that pages the owner, no paid compute, no widened permission. Anything outside is high.
-5. **The measurement.** The signal counts the case's problem in what agents and the owner do, not words the change rewrites, and its window can show an effect. A signal the change can satisfy without fixing anything is high.
+5. **The measurement.** The signal counts the case's problem in what agents and the owner do, not words the change rewrites, and its window can show an effect over whole weeks. A change the machine runs from a file built or installed from the repository (a binary, an installed configuration) names that file with `--installed FILE`. A signal the change can satisfy without fixing anything is high.
 6. **The rollback.** It undoes the change completely.
 7. **Scope and prose.** One cause, one change. Repository conventions (its AGENTS.md), no personal content in a repository.
 

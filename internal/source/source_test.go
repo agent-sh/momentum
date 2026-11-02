@@ -480,3 +480,41 @@ func TestAnIncidentsSightingsAreEvents(t *testing.T) {
 		t.Fatalf("a first sighting of none: %+v", e)
 	}
 }
+
+// A source-wide successful read is saved even with no events. A failed read cannot advance it.
+func TestOnlyACompleteIngestAdvancesItsReadTime(t *testing.T) {
+	st := openStore(t)
+	ctx := context.Background()
+	src := readFixture{}
+	before := time.Now().Add(-time.Hour)
+	if err := st.MarkRead(ctx, src.Name(), before); err != nil {
+		t.Fatal(err)
+	}
+	out := RunAll(ctx, st, []Source{src})
+	if len(out) != 1 || out[0].Err != nil {
+		t.Fatalf("complete: %+v", out)
+	}
+	read, err := st.ReadThrough(ctx, src.Name())
+	if err != nil || !read.After(before) {
+		t.Fatalf("read time: %v %v", read, err)
+	}
+	src.fail = true
+	out = RunAll(ctx, st, []Source{src})
+	if len(out) != 1 || out[0].Err == nil {
+		t.Fatalf("failed: %+v", out)
+	}
+	after, err := st.ReadThrough(ctx, src.Name())
+	if err != nil || !after.Equal(read) {
+		t.Fatalf("failed read advanced: %v %v", after, err)
+	}
+}
+
+type readFixture struct{ fail bool }
+
+func (readFixture) Name() string { return "synthetic" }
+func (r readFixture) Ingest(context.Context, *store.Store) (Result, error) {
+	if r.fail {
+		return Result{}, fmt.Errorf("read failed")
+	}
+	return Result{}, nil
+}

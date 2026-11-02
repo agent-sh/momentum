@@ -45,9 +45,9 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	bodyFile := fs.String("body-file", "", "propose: a file with the change's description (in a loop run: one in its own directory)")
 	rollback := fs.String("rollback", "", "propose: how the change is undone")
 	signal := fs.String("signal", "", `propose: the measurement's signal, {"source","kinds","tool","harness","match"}`)
-	window := fs.String("window", "7d", "propose: the measurement's window (at least a day)")
+	window := fs.String("window", "7d", "propose: the measurement's window (whole weeks: 7d, 14d and so on)")
 	lesson := fs.String("lesson", "", "propose: the lesson the case teaches, one sentence")
-	installed := fs.String("installed", "", "propose: the file the machine runs the change from, when no file of the checkout (a built binary): it is in effect once that changed after the landing")
+	installed := fs.String("installed", "", "propose: the built or installed file the machine runs (a binary, an installed configuration): it is in effect once it changed after the checkout first held the change")
 	why := fs.String("why", "", "rollback: why")
 	asJSON := fs.Bool("json", false, "status: the package as JSON")
 	rest := args[1:]

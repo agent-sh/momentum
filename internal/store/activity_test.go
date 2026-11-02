@@ -2,6 +2,10 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -43,4 +47,80 @@ func TestActivityAndEventsRespectDirectoryAndTimeBounds(t *testing.T) {
 			t.Errorf("excluded event: %+v", e)
 		}
 	}
+}
+
+// A loop entered through an alias records its resolved working directory. Both forms and their descendants
+// are excluded from hits, activity and source checks, while a sibling is still counted.
+func TestTheLoopDirectoryIsExcludedThroughItsSymlink(t *testing.T) {
+	st, _ := open(t)
+	ctx := context.Background()
+	real := filepath.Join(t.TempDir(), "loop_%")
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.MkdirAll(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, alias); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := start.Add(time.Hour)
+	var evs []Event
+	for i, cwd := range []string{real, filepath.Join(real, "runs", "one"), alias, filepath.Join(alias, "runs", "two"), real + "-sibling"} {
+		evs = append(evs, Event{Source: Transcripts, SourceKey: fmt.Sprint(i), Session: fmt.Sprint(i), Actor: ActorTool, Kind: "tool_result", TS: start, Cwd: cwd})
+	}
+	if _, err := st.Put(ctx, evs); err != nil {
+		t.Fatal(err)
+	}
+	q := ActivityQuery{Since: start, Until: end, BySession: true, ExcludeCwd: alias}
+	base, err := st.Activity(ctx, q)
+	if err != nil || len(base) != 1 || !base[UnitOf(evs[4], true)] {
+		t.Fatalf("activity: %+v %v", base, err)
+	}
+	got, err := st.Events(ctx, Query{Since: start, Until: end, ExcludeCwd: alias})
+	if err != nil || len(got) != 1 || got[0].Cwd != real+"-sibling" {
+		t.Fatalf("events: %+v %v", got, err)
+	}
+}
+
+// Readiness uses successful cursor updates, not event times or write times. An equal boundary is not past it,
+// a quiet successful read is sufficient, and a different source's activity has its own requirement.
+func TestWindowReadinessUsesEverySourcesSuccessfulRead(t *testing.T) {
+	st, _ := open(t)
+	ctx := context.Background()
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := start.Add(time.Hour)
+	ev := Event{Source: Sessions, SourceKey: "phase", Session: "one", Actor: ActorHarness, Kind: "phase", TS: start}
+	if _, err := st.Put(ctx, []Event{ev}); err != nil {
+		t.Fatal(err)
+	}
+	q := ActivityQuery{Since: start, Until: end, BySession: true}
+	check := func(want string) {
+		t.Helper()
+		got, err := st.UnreadSources(ctx, Transcripts, q)
+		if err != nil || strings.Join(got, ",") != want {
+			t.Fatalf("unread: %v %v, want %s", got, err, want)
+		}
+	}
+	check("sessions,transcripts")
+	if err := st.MarkRead(ctx, Transcripts, end); err != nil {
+		t.Fatal(err)
+	}
+	check("sessions,transcripts")
+	if err := st.MarkRead(ctx, Transcripts, end.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	check("sessions")
+	if err := st.SetCursor(ctx, Sessions, "complete"); err != nil {
+		t.Fatal(err)
+	}
+	check("")
+	if err := st.MarkRead(ctx, Transcripts, start); err != nil {
+		t.Fatal(err)
+	}
+	check("")
+	q.Actor = ActorOwner
+	if _, err := st.db.ExecContext(ctx, `DELETE FROM cursors WHERE source=?`, Sessions); err != nil {
+		t.Fatal(err)
+	}
+	check("") // no sessions-source event is in the owner's activity
 }

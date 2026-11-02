@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"sort"
 	"testing"
+	"time"
 )
 
 // A change helped when its signal's share of the activity fell beyond what chance gives: the after window's units
@@ -71,23 +72,23 @@ func TestAWindowTooQuietToShowAnythingIsNotMeasurable(t *testing.T) {
 	}
 }
 
-// A problem a change helped is back when its share of the activity is at its old one again, and counts at least
-// MinBefore units.
-func TestAProblemIsBackAtItsOldShare(t *testing.T) {
-	before := Counts{6, 100}
+// A comeback needs three consecutive windows at the old share and five hit units among them.
+func TestAProblemIsBackAfterThreeWindowsAtItsOldShare(t *testing.T) {
 	for _, c := range []struct {
-		recent Counts
-		want   bool
+		before  Counts
+		windows []Counts
+		want    bool
 	}{
-		{Counts{6, 100}, true},
-		{Counts{6, 90}, true},
-		{Counts{12, 200}, true},
-		{Counts{5, 100}, false}, // below its old share
-		{Counts{4, 40}, false},  // above it, on too few units to tell
-		{Counts{11, 200}, false},
+		{Counts{6, 100}, []Counts{{6, 100}, {6, 100}, {6, 100}}, true},
+		{Counts{6, 100}, []Counts{{6, 100}, {6, 100}}, false},
+		{Counts{6, 100}, []Counts{{6, 100}, {5, 100}, {6, 100}}, false},
+		{Counts{6, 100}, []Counts{{6, 100}, {0, 0}, {6, 100}}, false},
+		{Counts{6, 100}, []Counts{{1, 10}, {1, 10}, {2, 20}}, false},
+		{Counts{6, 100}, []Counts{{1, 10}, {2, 20}, {2, 20}}, true},
+		{Counts{}, []Counts{{6, 100}, {6, 100}, {6, 100}}, false},
 	} {
-		if got := Back(before, Counts{0, 100}, c.recent, 1); got != c.want {
-			t.Errorf("%+v after %+v: %v, want %v", c.recent, before, got, c.want)
+		if got := Back(c.before, c.windows); got != c.want {
+			t.Errorf("%+v: %v", c, got)
 		}
 	}
 }
@@ -151,6 +152,15 @@ func TestTheGatedBaselineKeepsAtMostFivePercentOfUnchangedProblems(t *testing.T)
 					t.Errorf("share %d%%: removal power %.4f%% below %.1f%%", share, 100*removed/gatePass, 100*floor)
 				}
 			}
+			if want, ok := map[[2]int]float64{{50, 1}: 36.8, {50, 2}: 14.4, {50, 3}: 6.7, {100, 1}: 14.6}[[2]int{units, share}]; ok && math.Abs(100*kept/admitted-want) > 0.06 {
+				t.Errorf("admitted rate %.4f%%, want %.1f%%", 100*kept/admitted, want)
+			}
+			if math.Abs(removed/admitted-1) > 1e-12 {
+				t.Errorf("removal detection among admitted plans: %.4f%%", 100*removed/admitted)
+			}
+			if units == 200 && share == 12 && math.Abs(100*kept/gatePass-3.7719) > 0.0001 {
+				t.Errorf("grid maximum: %.4f%%", 100*kept/gatePass)
+			}
 			rate := kept / gatePass
 			t.Logf("%d units, share %d%%: false keep %.4f%% of gated plans; %.4f%% of admitted plans; removal power %.4f%% of gated plans", units, share, 100*rate, 100*kept/admitted, 100*removed/gatePass)
 			if rate > Alpha {
@@ -170,65 +180,151 @@ func binomial(n int, p float64) []float64 {
 	return out
 }
 
-// Watching spends its 5% level over every window, never a fresh 5% on each run. A fixed seed pins false
-// comebacks of a halved problem over 26 windows, pooling every earlier window that did not bring it back.
-func TestWatchingAHalvedProblemSpendsAtMostFivePercent(t *testing.T) {
-	rate := watchRate(0.05, 26)
-	t.Logf("halved problem: false comeback within 26 windows %.4f%%", 100*rate)
-	if rate > Alpha {
-		t.Fatalf("false comeback %.4f%% exceeds 5%%", 100*rate)
+// A fixed seed pins false comebacks of a halved problem and detection at the old share, even after quiet windows.
+func TestWatchingThreeWindowsSeparatesAHalvedProblemFromAReturn(t *testing.T) {
+	for _, old := range []int{10, 6, 5, 4} {
+		falseRate := watchRate(old, float64(old)/200, 26, 0)
+		detection := watchRate(old, float64(old)/100, 26, 0)
+		late := watchRate(old, float64(old)/100, 26, 26)
+		early := watchRate(old, float64(old)/100, 6, 0)
+		t.Logf("old %d%%: halved comeback %.3f%%; detection in 6 %.3f%%, in 26 %.3f%%, late %.3f%%", old, 100*falseRate, 100*early, 100*detection, 100*late)
+		if old >= 5 && falseRate > 0.05 {
+			t.Errorf("false comeback %.4f exceeds 5%%", falseRate)
+		}
+		if detection < 0.90 || late < 0.90 {
+			t.Errorf("return detection below 90%%")
+		}
+		if early < 0.35 || early > 0.50 {
+			t.Errorf("six-window detection %.4f", early)
+		}
+		want := map[int]float64{10: 0.001, 6: 0.013, 5: 0.028, 4: 0.058}[old]
+		if math.Abs(falseRate-want) > 0.005 {
+			t.Errorf("halved comeback %.4f differs from %.4f", falseRate, want)
+		}
 	}
 }
 
-// watchRate simulates 100000 independent paths from a measured drop from 10% to 5%, at 100 units a window.
-func watchRate(share float64, windows int) float64 {
+func watchRate(old int, share float64, windows, delay int) float64 {
 	const draws = 100000
 	rng := rand.New(rand.NewSource(431))
 	cdf := binomial(100, share)
 	for i := 1; i < len(cdf); i++ {
 		cdf[i] += cdf[i-1]
 	}
-	decisions := map[[3]int]bool{}
 	found := 0
 	for i := 0; i < draws; i++ {
-		reference := Counts{5, 100}
-		for j := 1; j <= windows; j++ {
-			hits := sort.SearchFloat64s(cdf, rng.Float64())
-			key := [3]int{j, reference.Hits, hits}
-			back, ok := decisions[key]
-			if !ok {
-				back = Back(Counts{30, 300}, reference, Counts{hits, 100}, j)
-				decisions[key] = back
+		var recent []Counts
+		for j := 0; j < windows+delay; j++ {
+			hits := 0
+			if j >= delay {
+				hits = sort.SearchFloat64s(cdf, rng.Float64())
 			}
-			if back {
+			recent = append(recent, Counts{hits, 100})
+			if len(recent) > 3 {
+				recent = recent[1:]
+			}
+			if Back(Counts{3 * old, 300}, recent) {
 				found++
 				break
 			}
-			reference.Hits += hits
-			reference.Base += 100
 		}
 	}
 	return float64(found) / draws
 }
 
-// The same count can pass the first watch level and fail the second. Watch uses the upper tail: a share that
-// fell since measurement is not a comeback, even if it reaches the older baseline.
-func TestEachWatchWindowSpendsItsOwnLevel(t *testing.T) {
-	before, after, recent := Counts{6, 100}, Counts{0, 100}, Counts{6, 100}
-	if !Back(before, after, recent, 1) || Back(before, after, recent, 2) || Back(before, after, recent, 0) {
-		t.Fatal("watch level did not shrink from .025 to .0125")
-	}
-	if Back(before, Counts{20, 100}, recent, 1) {
-		t.Fatal("a falling share came back")
-	}
-}
-
-// A return to the old 10% share has limited power at 100 units a window. The fixed seed pins the measured
-// detection rate within six completed windows, with the preceding quiet windows pooled into the reference.
-func TestWatchDetectsAReturnAtItsMeasuredRate(t *testing.T) {
-	rate := watchRate(0.10, 6)
-	t.Logf("return to 10%%: %.4f%% detected within six windows", 100*rate)
-	if rate < 0.128 {
-		t.Fatalf("return detected in %.4f%%, below the measured floor", 100*rate)
+// Whole weeks compare the same mix of weekdays and weekends. The full gate, admission and quiet-window rule
+// keep fewer than five percent of admitted unchanged problems under each weekly cycle.
+func TestWholeWeeksKeepTheWeeklyCycleBelowFivePercent(t *testing.T) {
+	for _, cycle := range [][2]float64{{0.05, 0.01}, {0.04, 0.01}, {0.05, 0}} {
+		rng := rand.New(rand.NewSource(77))
+		cdfs := map[bool][]float64{}
+		for _, weekday := range []bool{true, false} {
+			n, p := 60, cycle[1]
+			if weekday {
+				n, p = 100, cycle[0]
+			}
+			cdf := binomial(n, p)
+			for i := 1; i < len(cdf); i++ {
+				cdf[i] += cdf[i-1]
+			}
+			cdfs[weekday] = cdf
+		}
+		day := func(d int) Counts {
+			weekday := ((d%7)+7)%7 < 5
+			n := 60
+			if weekday {
+				n = 100
+			}
+			return Counts{sort.SearchFloat64s(cdfs[weekday], rng.Float64()), n}
+		}
+		cache := map[[4]int]bool{}
+		measurable := map[[3]int]bool{}
+		can := func(b Counts, n int) bool {
+			key := [3]int{b.Hits, b.Base, n}
+			v, ok := measurable[key]
+			if !ok {
+				v = Measurable(b, n)
+				measurable[key] = v
+			}
+			return v
+		}
+		admitted, kept := 0, 0
+		for i := 0; i < 40000; i++ {
+			at := 60 + rng.Intn(7)
+			hist := map[int]Counts{}
+			for d := at - 56; d < at; d++ {
+				hist[d] = day(d)
+			}
+			for w := 1; w <= 14; w++ {
+				if !WholeWeeks(time.Duration(w) * 24 * time.Hour) {
+					continue
+				}
+				before, gate := Counts{}, Counts{}
+				for d := at - 4*w; d < at; d++ {
+					c := hist[d]
+					if d < at-w {
+						before.Hits += c.Hits
+						before.Base += c.Base
+					} else {
+						gate.Hits += c.Hits
+						gate.Base += c.Base
+					}
+				}
+				if gate.Hits < MinBefore || !can(before, 2*gate.Base) {
+					continue
+				}
+				start := at + 1 + rng.Intn(3)
+				after := Counts{}
+				for d := start; d < start+w; d++ {
+					c := day(d)
+					after.Hits += c.Hits
+					after.Base += c.Base
+				}
+				if !can(before, after.Base) {
+					for d := start + w; d < start+2*w; d++ {
+						c := day(d)
+						after.Hits += c.Hits
+						after.Base += c.Base
+					}
+				}
+				key := [4]int{before.Hits, before.Base, after.Hits, after.Base}
+				keep, ok := cache[key]
+				if !ok {
+					res, _ := Compare(before, after)
+					keep = res.Improved
+					cache[key] = keep
+				}
+				admitted++
+				if keep {
+					kept++
+				}
+				break
+			}
+		}
+		rate := float64(kept) / float64(admitted)
+		t.Logf("weekday %.0f%%, weekend %.0f%%: %d admitted, false keep %.3f%%", 100*cycle[0], 100*cycle[1], admitted, 100*rate)
+		if admitted < 39000 || rate > 0.05 || rate < 0.025 {
+			t.Fatalf("weekly cycle: %d admitted, %.4f kept", admitted, rate)
+		}
 	}
 }
