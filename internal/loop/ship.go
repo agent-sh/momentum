@@ -181,10 +181,11 @@ func (s *Ship) now() time.Time {
 func (s *Ship) pkgDir(c string) string  { return filepath.Join(s.Dir, "packages", c) }
 func (s *Ship) workDir(c string) string { return filepath.Join(s.Dir, "work", c) }
 
-// Load reads a case's package; ok is false when it has none.
-// ChangeOpen says whether a case's change waits on its pull request (proposed, revising or landing), and its state.
-// Such a case answers its review: closing it, sending it back or merging it by a root would leave its pull request
-// open with nothing in the loop to return to it. A package that cannot be read counts as open.
+// ChangeOpen says whether a case's change is in progress (prepared, checked, proposed, revising or landing: any
+// package but a landed, rolled-back or kept one), and its state. The build that finds it resumes it, and its review
+// decides: closing the case, sending it back or merging it by a root would leave its work tree, and its pull
+// request when it has one, with nothing in the loop to return to them. A package that cannot be read counts as
+// open.
 func (s *Ship) ChangeOpen(caseID string) (string, bool) {
 	if s == nil {
 		return "", false
@@ -193,9 +194,10 @@ func (s *Ship) ChangeOpen(caseID string) (string, bool) {
 	if err != nil {
 		return "unreadable", true
 	}
-	return p.State, ok && slices.Contains([]string{Proposed, Revising, Landing}, p.State)
+	return p.State, ok && !slices.Contains([]string{Landed, RolledBack, Kept}, p.State)
 }
 
+// Load reads a case's package; ok is false when it has none.
 func (s *Ship) Load(caseID string) (Package, bool, error) {
 	raw, err := os.ReadFile(filepath.Join(s.pkgDir(caseID), "package.json"))
 	if errors.Is(err, fs.ErrNotExist) {

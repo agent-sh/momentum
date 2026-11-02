@@ -221,7 +221,7 @@ func TestALoopThatFailsTheSameWayTwiceStops(t *testing.T) {
 func TestTheBudgetsHoldTheRuns(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	agent := fakeAgent(t, okResult)
+	agent := fakeAgent(t, investigatedResult)
 	r := runnerFor(t, st, agent)
 	c := openCase(t, st, "failures", "a", 2)
 	if err := st.PutLoopRun(ctx, store.LoopRun{ID: "r0", Case: "c0", Family: "failures", Step: StepInvestigate, Started: time.Now().Add(-time.Hour),
@@ -240,7 +240,7 @@ func TestTheBudgetsHoldTheRuns(t *testing.T) {
 	}
 	// the day has room for one run: of three families, one starts
 	st2 := testStore(t)
-	r2 := runnerFor(t, st2, fakeAgent(t, okResult))
+	r2 := runnerFor(t, st2, fakeAgent(t, investigatedResult))
 	r2.Families = []string{"failures", "owner-burden", "sessions"}
 	r2.Budgets.Day = 5
 	for _, fam := range r2.Families {
@@ -514,7 +514,7 @@ func TestAStaleRunCountsItsBudgetAndARefusalFallsBack(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	refused := `{"type":"result","subtype":"success","is_error":true,"num_turns":1,"total_cost_usd":0.25,"result":"the safeguards blocked it"}`
-	p := script(t, dir, "agent", `case "$*" in *"--model model-x"*) echo '`+refused+`' ;; *) echo '`+okResult+`' ;; esac`)
+	p := script(t, dir, "agent", `case "$*" in *"--model model-x"*) echo '`+refused+`' ;; *) echo '`+investigatedResult+`' ;; esac`)
 	r := runnerFor(t, st, []string{p})
 	r.Agent.Fallback = "model-y"
 	c := openCase(t, st, "failures", "a", 2)
@@ -536,7 +536,7 @@ func TestAStaleRunCountsItsBudgetAndARefusalFallsBack(t *testing.T) {
 func TestAPickThatFailsWaitsForTheRunsItStarted(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	slow := script(t, t.TempDir(), "agent", "sleep 1\necho '{\"type\":\"system\",\"subtype\":\"init\"}'\necho '"+okResult+"'")
+	slow := script(t, t.TempDir(), "agent", "sleep 1\necho '{\"type\":\"system\",\"subtype\":\"init\"}'\necho '"+investigatedResult+"'")
 	r := runnerFor(t, st, []string{slow})
 	openCase(t, st, "failures", "a", 1)
 	broken := openCase(t, st, "owner-burden", "b", 1)
@@ -822,7 +822,7 @@ func TestTheRunnerRecordsAReportsRootOnItsOwnCase(t *testing.T) {
 func TestAnEvaluationsRunsAreNotTheLoops(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
-	r := runnerFor(t, st, fakeAgent(t, okResult))
+	r := runnerFor(t, st, fakeAgent(t, investigatedResult))
 	c := openCase(t, st, "failures", "live", 2)
 	if err := st.PutLoopRun(ctx, store.LoopRun{ID: "eval-run", Case: "c-of-a-trial", Family: "failures", Step: StepInvestigate,
 		Started: time.Now().Add(-3 * time.Hour), Status: store.RunRunning, USD: 4, Experiment: "eval:x:task:1"}); err != nil {

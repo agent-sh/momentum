@@ -12,10 +12,11 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// A loop run may not close, send back or merge by a root a case whose change is proposed: its pull request would
-// stay open with nothing in the loop to return to it. Its revision answers the review.
+// A loop run may not close, send back or merge by a root a case whose change is in progress (prepared, checked,
+// proposed, revising or landing): its work tree, and its pull request when it has one, would stay with nothing in
+// the loop to return to them. Its build resumes it, and its review decides.
 func TestARunLeavesAProposedCaseToItsReview(t *testing.T) {
-	for _, state := range []string{"proposed", "revising", "landing"} {
+	for _, state := range []string{"prepared", "checked", "proposed", "revising", "landing"} {
 		t.Run(state, func(t *testing.T) {
 			t.Setenv("MOMENTUM_HOME", t.TempDir())
 			t.Setenv("MOMENTUM_CONFIG", t.TempDir())
@@ -47,6 +48,8 @@ func TestARunLeavesAProposedCaseToItsReview(t *testing.T) {
 				{"case", "set", c.ID, "-status", "investigating"},
 				{"case", "set", c.ID, "-status=investigating"},
 				{"case", "set", c.ID, "--mechanism", "the order", "--status", "investigating"},
+				{"case", "set", c.ID, "--mechanism", "--", "--status", "investigating"},
+				{"case", "set", c.ID, "--alternative", "--", "-status=investigating"},
 				{"case", "signature", c.ID, "root:lock-order"},
 			} {
 				if code, _, diag := momentum(args...); code != 2 || !strings.Contains(diag, state) {

@@ -224,8 +224,10 @@ func (r *Runner) endStale(ctx context.Context) error {
 			// a killed investigation leaves its findings file: the case keeps what it found, still investigating,
 			// recorded before the run ends, as the runner records a run's
 			if run.Step == StepInvestigate && run.Dir != "" {
-				if f, _, ok := investigationFindings(Result{}, run.Dir); ok {
-					r.keepFindings(ctx, run, f, false)
+				// its report, when its stream holds one, else the findings file
+				res, _ := readStream(filepath.Join(run.Dir, "transcript.jsonl"))
+				if f, reported, ok := investigationFindings(res, run.Dir); ok {
+					r.keepFindings(ctx, run, f, reported)
 				}
 			}
 			if err := r.Store.FinishLoopRun(ctx, run); err != nil {
@@ -455,8 +457,14 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 	// before the run ends, so a loop that dies between the two leaves a running run, which stale recovery ends and
 	// records again under the same guard.
 	if run.Step == StepInvestigate {
-		if f, reported, ok := investigationFindings(res, run.Dir); ok {
+		f, reported, ok := investigationFindings(res, run.Dir)
+		if ok {
 			r.keepFindings(ctx, *run, f, reported)
+		}
+		// one that ended well but reported no mechanism and fix moved its case nowhere: it is a stop, so two in a row
+		// trip the stop rule, as runs cut short do, before the case's budget is gone
+		if err == nil && run.Status == store.RunOK && !(reported && strings.TrimSpace(f.Mechanism) != "" && strings.TrimSpace(f.Fix) != "") {
+			run.Status, run.Failure = store.RunFailed, "no fix"
 		}
 	}
 	if err := r.Store.FinishLoopRun(ctx, *run); err != nil {
@@ -537,7 +545,11 @@ func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step s
 	case StepBuild:
 		inv.MCP = r.MCP
 		inv.AddDirs = []string{r.Ship.workDir(c.ID)}
-		if p, ok, _ := r.Ship.Load(c.ID); ok && p.State == Revising && len(p.Reviews) > 0 {
+		p, ok, _ := r.Ship.Load(c.ID)
+		_, inProgress := r.Ship.ChangeOpen(c.ID)
+		switch {
+		case ok && (p.State == Revising || p.State == Checked) && len(p.Reviews) > 0:
+			// a revision, or one checked and not proposed again yet: it answers its last review
 			last := p.Reviews[len(p.Reviews)-1]
 			text, err := Redact(ctx, last.Text)
 			if err != nil {
@@ -549,6 +561,9 @@ func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step s
 			inv.Prompt += fmt.Sprintf("\nIts change %s was reviewed: round %d found %d high, %d medium and %d low, in review.md. Revise the change "+
 				"in its work tree %s for what the review found, check it again (`momentum ship check`) and propose it again (`momentum ship "+
 				"propose`), which updates its pull request.", p.PR, last.Round, last.High, last.Medium, last.Low, p.Work)
+		case ok && inProgress:
+			inv.Prompt += fmt.Sprintf("\nIts change is %s, in its work tree %s: resume it from there (`momentum ship status` says where it "+
+				"stands); its findings were checked when the change began.", p.State, p.Work)
 		}
 	}
 	inv.Settings = r.permissions(step, c, run)

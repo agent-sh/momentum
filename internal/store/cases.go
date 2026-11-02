@@ -791,9 +791,8 @@ func updateCase(ctx context.Context, tx *sql.Tx, c Case, u CaseUpdate, actor str
 	if c.Status == CaseClosed {
 		return Case{}, badCase("case %s is closed (%s): reopen it with new evidence before changing it", c.ID, c.Reason)
 	}
-	// A change is built only for a mechanism with a test that tells it from the alternatives: an investigation's
-	// stated cause is a guess until a test discriminates it. So a case in testing, after the update as before it,
-	// holds both.
+	// A change is built only for a mechanism with a fix to test: an investigation's stated cause is a guess until
+	// a build's test discriminates it. So a case in testing, after the update as before it, holds both.
 	after, mech, next := c.Status, c.Mechanism, c.NextTest
 	if u.Status != "" {
 		after = u.Status

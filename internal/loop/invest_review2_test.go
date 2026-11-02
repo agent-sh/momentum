@@ -124,15 +124,15 @@ echo '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":3
 	}
 }
 
-// A change is open on its pull request while it is proposed, revising or landing, and an unreadable package counts
-// as open; the runner's root and the case commands both ask this.
+// A change is in progress while it is prepared, checked, proposed, revising or landing, and an unreadable package
+// counts as in progress; the runner's root and the case commands both ask this.
 func TestAChangeIsOpenWhileItsPullRequestIs(t *testing.T) {
 	st := testStore(t)
 	s := &Ship{Store: st, Dir: t.TempDir()}
 	if _, open := s.ChangeOpen("c00000001"); open {
 		t.Fatal("a case with no package is open")
 	}
-	for state, want := range map[string]bool{Proposed: true, Revising: true, Landing: true, Landed: false, RolledBack: false} {
+	for state, want := range map[string]bool{Prepared: true, Checked: true, Proposed: true, Revising: true, Landing: true, Landed: false, RolledBack: false, Kept: false} {
 		p := Package{Case: "c00000001", Kind: "repo", State: state}
 		if err := s.save(&p); err != nil {
 			t.Fatal(err)

@@ -80,31 +80,25 @@ func ownCase(args []string) error {
 		}
 		// a case whose change is proposed answers its review: closing it, sending it back or merging it by a root
 		// would leave its pull request open with nothing in the loop to return to it
-		if args[0] == "close" || args[0] == "signature" || args[0] == "set" && setsStatus(args[1:]) {
-			if state, open := (&loop.Ship{Dir: loopDir()}).ChangeOpen(own); open {
-				return usageError{fmt.Sprintf("case %s's change is %s on its pull request: a revision answers its review, and the review decides", own, state)}
+		if args[0] == "close" || args[0] == "signature" {
+			if err := changeInProgress(own); err != nil {
+				return err
 			}
 		}
 	}
 	return nil
 }
 
-// setsStatus says whether case set's arguments set a status, in any form Go's flag package reads: one or two
-// dashes, with the value after = or as the next argument.
-func setsStatus(args []string) bool {
-	for _, a := range args {
-		if a == "--" {
-			return false
-		}
-		if !strings.HasPrefix(a, "-") {
-			continue
-		}
-		name, _, _ := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(a, "-"), "-"), "=")
-		if name == "status" {
-			return true
-		}
+// changeInProgress refuses, inside a loop run, to close, send back or merge by a root a case whose change is in
+// progress: the build that finds it resumes it, and its review decides.
+func changeInProgress(id string) error {
+	if os.Getenv("MOMENTUM_LOOP_RUN") == "" {
+		return nil
 	}
-	return false
+	if state, open := (&loop.Ship{Dir: loopDir()}).ChangeOpen(id); open {
+		return usageError{fmt.Sprintf("case %s's change is %s: the build resumes it and its review decides, so a run neither closes it, sends it back nor merges it", id, state)}
+	}
+	return nil
 }
 
 // caseActor is who a change is logged as: $MOMENTUM_ACTOR (the loop sets its run), else the command line.
@@ -417,12 +411,12 @@ func caseSet(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	fs := flag.NewFlagSet("case set", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	status := fs.String("status", "", "open, investigating or testing (testing needs a mechanism and a next test)")
+	status := fs.String("status", "", "open, investigating or testing (testing needs a mechanism and a fix, its next test)")
 	var alts refs
 	fs.Var(&alts, "alternative", "another mechanism that could explain the evidence; repeat for more (replaces the list)")
 	texts := map[string]*string{}
 	for name, usage := range map[string]string{"title": "its title", "mechanism": "the suspected mechanism",
-		"next-test": "the next test that tells the mechanism from the alternatives", "benefit": "the expected benefit"} {
+		"next-test": "the fix the investigation found, which a build tests", "benefit": "the expected benefit"} {
 		texts[name] = fs.String(name, "", usage)
 	}
 	if err := fs.Parse(rest); err != nil {
@@ -434,6 +428,12 @@ func caseSet(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	u := store.CaseUpdate{Status: store.CaseStatus(*status)}
 	set := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	// decided after the parse, which reads every form a status takes (a flag's value may be "--")
+	if set["status"] && id == os.Getenv("MOMENTUM_LOOP_CASE") {
+		if err := changeInProgress(id); err != nil {
+			return err
+		}
+	}
 	pick := func(name string) *string {
 		if set[name] {
 			return texts[name]

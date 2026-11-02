@@ -585,7 +585,7 @@ func TestWhatARunIsHandedIsScrubbed(t *testing.T) {
 	t.Cleanup(func() { Scrubber = was })
 	Scrubber = []string{script(t, dir, "scrub", "sed 's/zz-private-value/****************/g'")}
 	st := testStore(t)
-	agent := fakeAgent(t, okResult)
+	agent := fakeAgent(t, investigatedResult)
 	r := runnerFor(t, st, agent)
 	if _, _, err := st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: "failures/v1:p", Title: "it fails with password=zz-private-value",
 		Evidence: []store.Evidence{{Ref: "file:/t/p", At: time.Now().Add(-time.Hour)}}}, "test"); err != nil {
