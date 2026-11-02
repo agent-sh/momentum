@@ -26,7 +26,8 @@ import (
 
 // The golden-set evaluation runs the loop's investigation on real past problems whose root cause and fix are
 // verified, each as of the moment its case could have opened: a store that holds only what came before, the code of the fixed
-// repositories at the end of store, and no tacit (a lesson published since would give the answer). A
+// repositories and tacit's store as they stood at the end of store, and no file of the machine as it is now (a lesson
+// published or a fix written since would give the answer). A
 // clean-context judge grades whether the investigation reached the verified root cause. Each task runs several
 // times, each trial from nothing of another's, and the results say which tasks flipped.
 
@@ -99,10 +100,11 @@ type Eval struct {
 	// trial's momentum is the build results.json names, whatever momentum lies beside it or elsewhere on the PATH.
 	Self string
 	// Tacit is tacit's store, a git repository a trial reads as of its end (read-only, through tacit's own search),
-	// or none.
-	Tacit string
-	bin   string     // the directory of the evaluating binary's copy
-	pair  pairInputs // the store as of the trial's end and tacit's, made once for both arms of a trial; each arm runs on a copy of the store
+	// or none; TacitWarm the command that builds its index before either arm runs (tacit's tree by default).
+	Tacit     string
+	TacitWarm []string
+	bin       string     // the directory of the evaluating binary's copy
+	pair      pairInputs // the store as of the trial's end and tacit's, made once for both arms of a trial; each arm runs on a copy of the store
 }
 
 // Grade is the judge's reading of one investigation.
@@ -133,6 +135,8 @@ type Trial struct {
 	JudgeUSD        float64
 	Mechanism       string
 	Root            string
+	Tacit           bool   // the trial read tacit's store as of its end
+	TacitErr        string `json:",omitempty"` // why it did not, when the machine has the store
 	Status          string // the case's status after the run, with its reason when closed
 	Err             string
 }
@@ -314,17 +318,36 @@ func (e *Eval) pairStore(ctx context.Context, t GoldenTask, n int) (pairInputs, 
 	// directory, so its file tools cannot change it; both arms share it and the index the first search builds
 	if e.Tacit != "" {
 		clone := filepath.Join(dir, "tacit")
-		if made, err := repositoryAsOf(ctx, e.Tacit, end, clone); err == nil && made {
+		made, err := repositoryAsOf(ctx, e.Tacit, end, clone)
+		switch {
+		case err != nil:
+			in.tacitErr = "tacit's store as of the end: " + err.Error()
+		case !made:
+			in.tacitErr = "tacit's store held no commit by the end"
+		default:
 			in.tacit, in.tacitIndex = clone, filepath.Join(dir, "tacit-index")
 			os.MkdirAll(in.tacitIndex, 0o700)
+			// the index is built before either arm runs, so neither pays for it inside its own command and its deadline
+			warm := filepath.Join(dir, "tacit-warm")
+			os.MkdirAll(warm, 0o700)
+			warmUp := e.TacitWarm
+			if len(warmUp) == 0 {
+				warmUp = []string{"tacit", "tree", "--depth", "1"} // opening the index builds it
+			}
+			cmd := exec.CommandContext(ctx, warmUp[0], warmUp[1:]...)
+			cmd.Dir, cmd.Env = warm, CleanEnv(tacitAsOf(in, warm), e.Runner.Bins...)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				in.tacit, in.tacitErr = "", fmt.Sprintf("tacit's index of its store as of the end: %v: %s", err, plain.Clip(plain.Line(string(out)), 200))
+			}
 		}
 	}
 	return in, done
 }
 
-// pairInputs are what both arms of a trial read, made once before either runs.
+// pairInputs are what both arms of a trial read, made once before either runs; tacitErr says why a trial reads no
+// tacit when the machine has its store.
 type pairInputs struct {
-	store, tacit, tacitIndex string
+	store, tacit, tacitIndex, tacitErr string
 }
 
 // copyStore copies a closed store, its write-ahead log with it when there is one.
@@ -391,6 +414,7 @@ func (e *Eval) trial(ctx context.Context, t GoldenTask, n int) (tr Trial) {
 		arm = "native"
 	}
 	tr = e.newTrial(t, n, arm)
+	tr.Tacit, tr.TacitErr = e.pair.tacit != "", e.pair.tacitErr
 	dir := filepath.Join(e.Dir, tr.Key, digest(tr.Key + "\x00" + arm)[:16])
 	// A repeated id must not wipe another evaluation's files.
 	if _, err := os.Stat(dir); err == nil {
@@ -721,7 +745,8 @@ func (e *Eval) harnessHome(name string) (string, error) {
 // investigate runs the investigation step of a trial as the loop runs it: the native path's brief, tools and report,
 // with the case's evidence in its prompt, under an evaluation's permissions: the trial's directory alone to read and
 // write, the store as of the cutoff through momentum, the records its events name (evidence show), the
-// repositories at the end of store, and no tacit, no services, no report.
+// repositories and tacit's store at the end of store, a service's log up to it, and no file, report or replay of the
+// machine as it is now.
 func (e *Eval) investigate(ctx context.Context, t GoldenTask, c store.Case, dir, repo, evidence string, run store.LoopRun) (Result, error) {
 	return e.invokeTrial(ctx, t, c, dir, repo, evidence, run, "loop")
 }

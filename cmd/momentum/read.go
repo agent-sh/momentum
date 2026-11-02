@@ -459,7 +459,7 @@ func evidenceFile(ctx context.Context, args []string, stdout, stderr io.Writer) 
 var unitRe = regexp.MustCompile(`^[A-Za-z0-9@._:-]{1,128}$`)
 
 // evidenceUnit prints a user service's state and the end of its log, scrubbed: systemd's status, and journald's
-// last lines of the unit (200, or --lines N up to 2000).
+// last lines of the unit (200, or --lines N up to 2000). In an evaluation, only its log up to the end of store.
 func evidenceUnit(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("evidence unit", flag.ContinueOnError)
 	fs.SetOutput(stderr)

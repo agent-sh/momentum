@@ -96,7 +96,11 @@ func loopEval(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	e := &loop.Eval{Runner: r, Source: paths.DB(), Dir: filepath.Join(loopDir(), "eval", id), Trials: *trials, Budget: *budget, Parallel: *parallel, ID: id,
 		Judge: loop.Agent{Runner: r.Agent.Runner, Model: r.Agent.Model}, Arms: selected, Repositories: repositories, GoldenHash: fmt.Sprintf("%x", sha256.Sum256(raw)),
 		Self: selfBinary(), Tacit: tacitStore()}
-	fmt.Fprintf(stderr, "evaluation %s: %d tasks, %d trials per arm, in %s\n", id, len(picked), *trials, e.Dir)
+	tacit := "no tacit (no store)"
+	if e.Tacit != "" {
+		tacit = "tacit's store as of each end"
+	}
+	fmt.Fprintf(stderr, "evaluation %s: %d tasks, %d trials per arm, %s, in %s\n", id, len(picked), *trials, tacit, e.Dir)
 	trs, err := e.Run(ctx, picked)
 	if err != nil {
 		return err
