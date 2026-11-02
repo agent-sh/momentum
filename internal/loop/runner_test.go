@@ -41,6 +41,11 @@ const okResult = `{"type":"result","subtype":"success","is_error":false,"num_tur
 	`"structured_output":{"case":"x","step":"investigate","outcome":"investigated","summary":"looked at it"},` +
 	`"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}`
 
+// investigatedResult is an investigation's result: the native report.
+const investigatedResult = `{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":0.75,"session_id":"s1",` +
+	`"structured_output":{"mechanism":"the export reads the lockfile before it takes the lock","alternatives":["a slow disk"],"fix":"take the lock first","summary":"looked at it"},` +
+	`"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}`
+
 func runnerFor(t *testing.T, st *store.Store, agent []string) *Runner {
 	t.Helper()
 	dir := t.TempDir()
@@ -65,13 +70,14 @@ func openCase(t *testing.T, st *store.Store, family, sig string, n int) store.Ca
 }
 
 // A run takes each family's case one step: the one with the most evidence, in testing before investigating before
-// open. The agent runs headless and restricted with the family's skill and the machine's rules in its system
-// prompt, its file tools in its own directory, refused what no rule allows, with nothing of the caller's
-// environment, and its cost goes on the case and the run.
+// open. An investigation runs headless and restricted with the native brief, the owner's constraints and the
+// machine's rules in its system prompt and the case's evidence in its prompt, its file tools in its own directory,
+// refused what no rule allows (no case command among what it may run), with nothing of the caller's environment;
+// its cost goes on the case and the run, and its report into the case.
 func TestTheLoopTakesEachFamilysCaseOneStep(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	agent := fakeAgent(t, okResult)
+	agent := fakeAgent(t, investigatedResult)
 	r := runnerFor(t, st, agent)
 	r.ReadDirs = []string{"/srv/projects"}
 	small := openCase(t, st, "failures", "a", 1)
@@ -96,32 +102,48 @@ func TestTheLoopTakesEachFamilysCaseOneStep(t *testing.T) {
 		t.Errorf("the agent's environment:\n%s", env)
 	}
 	system, _ := os.ReadFile(filepath.Join(done[0].Run.Dir, "system.md"))
-	for _, want := range []string{"# One run on one case", "# Failures", "never wake him", "Delete with literal paths."} {
+	for _, want := range []string{nativeBrief, "never wake him", "Delete with literal paths."} {
 		if !strings.Contains(string(system), want) {
 			t.Errorf("the system prompt lacks %q", want)
 		}
 	}
-	if strings.Contains(string(system), "# Owner burden") {
-		t.Error("the system prompt holds another family's skill")
+	for _, not := range []string{"# One run on one case", "# Failures", "# Owner burden"} {
+		if strings.Contains(string(system), not) {
+			t.Errorf("an investigation's system prompt holds %q", not)
+		}
+	}
+	if !strings.Contains(args, "The case's evidence, newest first (3 of 3)") || !strings.Contains(args, "file:/t/b-0") || !strings.Contains(args, "findings.md") {
+		t.Errorf("the prompt lacks the case's evidence or the findings file:\n%s", args)
 	}
 	settings, _ := os.ReadFile(filepath.Join(done[0].Run.Dir, "settings.json"))
-	for _, want := range []string{`"Write(/` + done[0].Run.Dir + `/**)"`, `"Bash(momentum case *)"`, `"Bash(momentum evidence file *)"`, `"Read(**/.env)"`} {
+	for _, want := range []string{`"Write(/` + done[0].Run.Dir + `/**)"`, `"Bash(momentum evidence file *)"`, `"Read(**/.env)"`} {
 		if !strings.Contains(string(settings), want) {
 			t.Errorf("an investigation's permissions lack %s: %s", want, settings)
 		}
 	}
-	for _, not := range []string{"momentum ship propose", "journalctl", "systemctl", "tacit add", "///"} {
+	for _, not := range []string{"momentum case", "momentum ship propose", "journalctl", "systemctl", "tacit add", "///"} {
 		if strings.Contains(string(settings), not) {
 			t.Errorf("an investigation's permissions hold %s: %s", not, settings)
 		}
+	}
+	if got, _ := st.CaseByID(ctx, big.ID); got.Status != store.CaseTesting || got.Mechanism != "the export reads the lockfile before it takes the lock" ||
+		got.NextTest != "take the lock first" || len(got.Alternatives) != 1 {
+		t.Errorf("the runner did not write the report into the case: %+v", got)
 	}
 	if got, _ := st.CaseByID(ctx, big.ID); got.Cost.USD != 0.75 || got.Cost.Runs != 1 || got.Cost.Tokens != 100 {
 		t.Fatalf("the case's cost %+v", got.Cost)
 	}
 	runs, _ := st.LoopRuns(ctx, store.RunFilter{})
-	if len(runs) != 1 || runs[0].Case != big.ID || runs[0].Summary != "investigated: looked at it" || runs[0].Turns != 4 {
+	if len(runs) != 1 || runs[0].Case != big.ID || runs[0].Summary != "looked at it" || runs[0].Turns != 4 {
 		t.Fatalf("runs %+v", runs)
 	}
+	if c, step, _, _ := r.pick(ctx, "failures", "", false); c.ID != big.ID || step != StepBuild {
+		t.Fatalf("a case in testing comes first, to its build: %s %s", c.ID, step)
+	}
+	if _, err := st.CloseCase(ctx, big.ID, store.NotWorthIt, "", "fixture", "test"); err != nil {
+		t.Fatal(err)
+	}
+	openCase(t, st, "failures", "e", 5)
 	if _, err := st.UpdateCase(ctx, small.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "test"); err != nil {
 		t.Fatal(err)
 	}
@@ -748,12 +770,16 @@ func TestALandedPackageFinishesItsDeployment(t *testing.T) {
 	}
 }
 
-// A run reports a root but cannot merge into its holder. After the run ends, the runner records the root on
+// A build reports a root but cannot merge into its holder. After the run ends, the runner records the root on
 // the run's own case, ignoring a different case id in the report, and the store merges by that root.
 func TestTheRunnerRecordsAReportsRootOnItsOwnCase(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	a := openCase(t, st, "failures", "a", 1)
+	mechanism, fix := "the lockfile is read before the lock", "take the lock first"
+	if _, err := st.UpdateCase(ctx, a.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
 	b := openCase(t, st, "failures", "b", 1)
 	unrelated := openCase(t, st, "failures", "unrelated", 1)
 	if _, _, err := st.AddCaseSignature(ctx, b.ID, "root:fixture", "test"); err != nil {
@@ -824,7 +850,7 @@ func TestAReportedRootCannotChangeAnAliasTarget(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	run, why := r.reserve(ctx, a.Family, a.ID, StepInvestigate)
+	run, why := r.reserve(ctx, a.Family, a.ID, StepBuild)
 	if why != "" {
 		t.Fatal(why)
 	}
