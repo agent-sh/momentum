@@ -35,8 +35,8 @@ const usage = `usage:
                                         H is claude, codex, pi, opencode or hermes
   momentum evidence status [--since WHEN]   events per source and kind, and unparsed records
   momentum evidence show ID             an event, and the record of the transcript or log it names (scrubbed)
-  momentum evidence search TEXT [--since WHEN] [--until WHEN] [--kind K,K] [--actor A] [--session ID] [--limit N]
-                                        stored summaries matching TEXT, newest first, also with --session (scrubbed); flags anywhere
+  momentum evidence search TEXT [--source SOURCE] [--since WHEN] [--until WHEN] [--kind K,K] [--actor A] [--session ID] [--limit N]
+                                        stored summaries of every source matching TEXT, newest first, also with --session (scrubbed); flags anywhere
                                         agent text: first 160 and last 80 bytes; calls and results: first 240
                                         (error results keep 1,000); evidence show reads the whole record
   momentum evidence git DIR GITCOMMAND [ARG]... [-- PATH...]

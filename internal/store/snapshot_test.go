@@ -108,3 +108,37 @@ func TestASnapshotLeavesOutRewrittenIncidents(t *testing.T) {
 		}
 	}
 }
+
+// A scout title rewritten after the cutoff cannot appear at the finding's original timestamp.
+func TestASnapshotLeavesOutRewrittenScoutFindings(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	src := filepath.Join(dir, "source.db")
+	st, err := Open(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now().Add(-time.Hour)
+	ev := Event{Source: "radar", SourceKey: "finding:1", TS: at, Actor: ActorDetector, Kind: "finding", Summary: "the job fails"}
+	if _, err = st.Put(ctx, []Event{ev}); err != nil {
+		t.Fatal(err)
+	}
+	ev.Summary = "the job fails: fixed by taking the lock first"
+	if _, err = st.Put(ctx, []Event{ev}); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	dst := filepath.Join(dir, "snapshot.db")
+	if err = AsOf(ctx, src, dst, at.Add(-time.Hour), at.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := Open(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.Close()
+	got, err := snap.Events(ctx, Query{Since: at.Add(-time.Hour), Limit: 10})
+	if err != nil || len(got) != 0 {
+		t.Fatalf("rewritten finding: %+v %v", got, err)
+	}
+}

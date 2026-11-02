@@ -122,7 +122,7 @@ func TestAnEvaluationStopsAtItsBudget(t *testing.T) {
 		t.Fatalf("%+v %v", trs, err)
 	}
 	for _, tr := range trs {
-		if !strings.Contains(tr.Err, "budget") {
+		if !strings.Contains(tr.Skipped, "budget") {
 			t.Errorf("a trial started past the budget: %+v", tr)
 		}
 	}
@@ -184,7 +184,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total
 			t.Errorf("%s: the loop's procedure in its system prompt: %v", name, procedure)
 		case native && (strings.Contains(string(args), "Bash(momentum case") || !strings.Contains(string(args), e1.ID())):
 			t.Errorf("native: it may change a case, or it is not given its events:\n%s", args)
-		case native && (!strings.Contains(string(judged), "the native mechanism") || !strings.Contains(string(judged), "the native root")):
+		case native && (!strings.Contains(string(judged), "the native mechanism")):
 			t.Errorf("native: the judge did not read its report:\n%s", judged)
 		case native && trs[0].Status != "native":
 			t.Errorf("native: its status %q", trs[0].Status)

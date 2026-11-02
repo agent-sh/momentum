@@ -77,7 +77,7 @@ func TestATrialUsesAnOpaqueKey(t *testing.T) {
 		if strings.Contains(tr.Run.Dir+tr.Run.Experiment, task.ID) || tr.Key == "" {
 			t.Fatalf("not opaque: %+v", tr)
 		}
-		for _, f := range []string{"args.txt", "system.md", "case.json", "judge/args.txt", "trial.json"} {
+		for _, f := range []string{"args.txt", "system.md", "case.json", "trial.json"} {
 			raw, err := os.ReadFile(filepath.Join(tr.Run.Dir, f))
 			if err != nil {
 				t.Fatal(err)
@@ -127,8 +127,8 @@ NOTES
 		if tr.Err != "" || !tr.CutShort || tr.Run.USD != 4 {
 			t.Fatalf("%+v", tr)
 		}
-		raw, _ := os.ReadFile(filepath.Join(tr.Run.Dir, "judge", "args.txt"))
-		for _, s := range []string{"the retained mechanism", "the retained root", "the retained fix", "the other cause was tested"} {
+		raw, _ := os.ReadFile(filepath.Join(tr.JudgeDir, "args.txt"))
+		for _, s := range []string{"the retained mechanism", "the retained fix", "the other cause was tested"} {
 			if !strings.Contains(string(raw), s) {
 				t.Errorf("judge lost %s: %s", s, raw)
 			}
@@ -162,10 +162,10 @@ func TestBothArmsUseTheTrialClockAndQuestion(t *testing.T) {
 	}
 }
 
-// The judge reads one capped and fenced shape, with case findings and report findings preserved equally.
+// The judge reads one capped and fenced shape, with the case as the loop record and the report as the native record.
 func TestTheJudgeReadsTheSameFieldsFromBothArms(t *testing.T) {
 	report := json.RawMessage(`{"mechanism":"mechanism","root":"root:cause","summary":"summary"}`)
-	c := store.Case{Signatures: []string{"eval:answer"}, Alternatives: []string{"alternative"}, NextTest: "fix"}
+	c := store.Case{Mechanism: "mechanism", Signatures: []string{"eval:answer"}, Alternatives: []string{"alternative"}, NextTest: "fix"}
 	loop := caseFinding(c, Result{Report: report})
 	native := nativeFinding(Result{Report: json.RawMessage(`{"mechanism":"mechanism","root_cause":"root:cause","alternatives":["alternative"],"fix":"fix","summary":"summary"}`)})
 	if !reflect.DeepEqual(loop, native) {
@@ -175,11 +175,11 @@ func TestTheJudgeReadsTheSameFieldsFromBothArms(t *testing.T) {
 		t.Fatal("judge inputs differ")
 	}
 	c.Signatures = append(c.Signatures, "root:recorded")
-	if caseFinding(c, Result{Report: report}).Root != "root:recorded" {
-		t.Fatal("case root lost")
+	if strings.Contains(judgeFinding(caseFinding(c, Result{Report: report})), "root:") {
+		t.Fatal("root slug reached the judge")
 	}
 	long := strings.Repeat("a", 2100) + "forbidden-tail"
-	raw := judgeFinding(finding{Mechanism: long, Alternatives: []string{long}, Root: long, Fix: long, Report: "```\n" + long})
+	raw := judgeFinding(finding{Mechanism: long, Alternatives: []string{long}, Fix: long, Report: "```\n" + long})
 	if strings.Contains(raw, "forbidden-tail") || strings.Count(raw, "```") != 2 || strings.Contains(raw, "Status") {
 		t.Fatalf("unclipped or unfenced: %s", raw)
 	}
@@ -199,7 +199,7 @@ func TestTrialsInFlightHoldTheirBudget(t *testing.T) {
 	e, task := evalFixture(t)
 	e.Trials = 5
 	e.Parallel = 3
-	e.Budget = 5
+	e.Budget = 10
 	e.Runner.Agent.Runner = []string{script(t, t.TempDir(), "no-price", `sleep 0.1`)}
 	trs, err := e.Run(context.Background(), []GoldenTask{task})
 	if err != nil || len(trs) != 10 {
@@ -213,7 +213,7 @@ func TestTrialsInFlightHoldTheirBudget(t *testing.T) {
 		}
 		spent += tr.Run.USD + tr.JudgeUSD
 	}
-	if ran != 1 || spent > e.Budget {
+	if ran != 2 || spent > e.Budget {
 		t.Fatalf("ran %d spent %g", ran, spent)
 	}
 }
@@ -221,10 +221,10 @@ func TestTrialsInFlightHoldTheirBudget(t *testing.T) {
 // Missing trials do not pass every time, and only disagreement on reaching the cause is a flip.
 func TestPairedSummariesKeepTheSameK(t *testing.T) {
 	at := time.Now()
-	trial := func(task, arm, v string) Trial {
-		return Trial{Task: task, Arm: arm, Grade: Grade{Verdict: v}, Run: store.LoopRun{Started: at, Ended: at.Add(time.Minute), USD: 2}}
+	trial := func(task, arm, v string, n int) Trial {
+		return Trial{Task: task, Arm: arm, N: n, Grade: Grade{Verdict: v}, Run: store.LoopRun{Started: at, Ended: at.Add(time.Minute), USD: 2}}
 	}
-	trs := []Trial{trial("a", "loop", "reached"), trial("a", "loop", "reached"), {Task: "a", Arm: "loop", Err: "budget"}, trial("a", "native", "missed"), trial("a", "native", "wrong"), trial("a", "native", "missed")}
+	trs := []Trial{trial("a", "loop", "reached", 1), trial("a", "loop", "reached", 2), {Task: "a", Arm: "loop", N: 3, Skipped: "budget"}, trial("a", "native", "missed", 1), trial("a", "native", "wrong", 2), trial("a", "native", "missed", 3)}
 	e, _ := evalFixture(t)
 	e.Trials = 3
 	r := e.Results(trs)
@@ -262,9 +262,9 @@ func TestTrialPermissionsKeepLiveDenialsAndProgramWords(t *testing.T) {
 				if !strings.HasPrefix(pattern, "momentum ") {
 					t.Fatalf("non-program rule: %s", a)
 				}
-				for _, cmd := range []string{"MOMENTUM_NOW=now momentum evidence events", "env MOMENTUM_HOME=/other momentum evidence search text", "export MOMENTUM_EVAL=; momentum evidence events"} {
+				for _, cmd := range []string{"TZ=UTC LANG=C MOMENTUM_NOW=now momentum evidence events", "MOMENTUM_NOW=now momentum evidence events", "env MOMENTUM_HOME=/other momentum evidence search text", "export MOMENTUM_EVAL=; momentum evidence events"} {
 					// Bash rules match from the program word, not a substring of the command.
-					match, _ := filepath.Match(pattern, cmd)
+					match := trialBashRuleMatches(pattern, cmd)
 					if match {
 						t.Fatalf("%s permits %s", a, cmd)
 					}
@@ -312,7 +312,7 @@ func TestTrialsRecordTheirProvenanceAndModels(t *testing.T) {
 		if tr.Provenance.Skills["loop"] != digest(skill) {
 			t.Fatal("skill hash differs")
 		}
-		raw, _ := os.ReadFile(filepath.Join(tr.Run.Dir, "judge", "args.txt"))
+		raw, _ := os.ReadFile(filepath.Join(tr.JudgeDir, "args.txt"))
 		if strings.Contains(string(raw), "--fallback-model") {
 			t.Fatal("judge fallback enabled")
 		}
@@ -544,11 +544,11 @@ func TestEvaluationJobsInterleaveTrialTaskAndArm(t *testing.T) {
 func TestACutShortLoopKeepsItsCaseFindings(t *testing.T) {
 	c := store.Case{Mechanism: "case mechanism", Alternatives: []string{"ruled out"}, NextTest: "case fix", Signatures: []string{"eval/opaque", "root:case"}}
 	f := caseFinding(c, Result{Status: store.RunTimeout})
-	if f.Mechanism != "case mechanism" || f.Fix != "case fix" || f.Root != "root:case" || len(f.Alternatives) != 1 {
+	if f.Mechanism != "case mechanism" || f.Fix != "case fix" || len(f.Alternatives) != 1 {
 		t.Fatalf("%+v", f)
 	}
 	f = caseFinding(c, Result{Report: json.RawMessage(`{"mechanism":"report mechanism","summary":"report summary"}`)})
-	if !strings.Contains(f.Mechanism, "case mechanism") || !strings.Contains(f.Mechanism, "report mechanism") || f.Report != "report summary" {
+	if f.Mechanism != "case mechanism" || f.Report != "report summary" {
 		t.Fatalf("%+v", f)
 	}
 }

@@ -120,7 +120,7 @@ func printEvaluation(out io.Writer, r loop.EvaluationResults) {
 		return fmt.Sprintf("%.3f", *x)
 	}
 	for _, a := range r.Arms {
-		fmt.Fprintf(out, "%s: %d/%d graded trials reached; %d partial, %d missed, %d wrong, %d errors, %d runs cut short; %d/%d ran\n", a.Arm, a.Reached, a.Graded, a.Partial, a.Missed, a.Wrong, a.Errors, a.CutShort, a.Ran, a.Planned)
+		fmt.Fprintf(out, "%s: %d/%d graded trials reached; %d partial, %d missed, %d wrong, %d errors, %d skipped, %d runs cut short; %d/%d ran\n", a.Arm, a.Reached, a.Graded, a.Partial, a.Missed, a.Wrong, a.Errors, a.Skipped, a.CutShort, a.Ran, a.Planned)
 		fmt.Fprintf(out, "  cost $%.2f; time %.2f min; per trial $%s, %s min; per root cause reached $%s, %s min; judge $%.2f\n", a.USD, a.Minutes, rate(a.USDPerTrial), rate(a.MinutesPerTrial), rate(a.USDPerReached), rate(a.MinutesPerReached), a.JudgeUSD)
 		fmt.Fprintf(out, "  k=%d: pass@k %.3f, pass^k %.3f; %d tasks flipped\n", a.K, a.PassAtK, a.PassAllK, a.Flips)
 	}
