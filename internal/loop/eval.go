@@ -100,7 +100,7 @@ type Eval struct {
 	// trial's momentum is the build results.json names, whatever momentum lies beside it or elsewhere on the PATH.
 	Self string
 	// Tacit is tacit's store, a git repository a trial reads as of its end (read-only, through tacit's own search),
-	// or none; TacitWarm the command that builds its index before either arm runs (tacit's tree by default).
+	// or none; TacitWarm the command that builds its index before either arm runs (tacit's hook index by default).
 	Tacit     string
 	TacitWarm []string
 	bin       string     // the directory of the evaluating binary's copy
@@ -136,6 +136,7 @@ type Trial struct {
 	Mechanism       string
 	Root            string
 	Tacit           bool   // the trial read tacit's store as of its end
+	TacitCommit     string `json:",omitempty"` // the commit of tacit's store it read
 	TacitErr        string `json:",omitempty"` // why it did not, when the machine has the store
 	Status          string // the case's status after the run, with its reason when closed
 	Err             string
@@ -315,7 +316,7 @@ func (e *Eval) pairStore(ctx context.Context, t GoldenTask, n int) (pairInputs, 
 		return pairInputs{}, func() {}
 	}
 	// tacit's store is a git repository: the trial reads it as the machine held it at the end, outside the trial's
-	// directory, so its file tools cannot change it; both arms share it and the index the first search builds
+	// directory, so its file tools cannot change it; both arms share it and its index, built before either runs
 	if e.Tacit != "" {
 		clone := filepath.Join(dir, "tacit")
 		made, err := repositoryAsOf(ctx, e.Tacit, end, clone)
@@ -327,27 +328,80 @@ func (e *Eval) pairStore(ctx context.Context, t GoldenTask, n int) (pairInputs, 
 		default:
 			in.tacit, in.tacitIndex = clone, filepath.Join(dir, "tacit-index")
 			os.MkdirAll(in.tacitIndex, 0o700)
-			// the index is built before either arm runs, so neither pays for it inside its own command and its deadline
-			warm := filepath.Join(dir, "tacit-warm")
-			os.MkdirAll(warm, 0o700)
-			warmUp := e.TacitWarm
-			if len(warmUp) == 0 {
-				warmUp = []string{"tacit", "tree", "--depth", "1"} // opening the index builds it
-			}
-			cmd := exec.CommandContext(ctx, warmUp[0], warmUp[1:]...)
-			cmd.Dir, cmd.Env = warm, CleanEnv(tacitAsOf(in, warm), e.Runner.Bins...)
-			if out, err := cmd.CombinedOutput(); err != nil {
-				in.tacit, in.tacitErr = "", fmt.Sprintf("tacit's index of its store as of the end: %v: %s", err, plain.Clip(plain.Line(string(out)), 200))
+			if why := e.warmTacit(ctx, &in, dir); why != "" {
+				in.tacit, in.tacitHead, in.tacitErr = "", "", why
 			}
 		}
 	}
 	return in, done
 }
 
+// warmTacit builds the index of a pair's tacit clone before either arm runs, so neither pays for it inside its own
+// command and its deadline, with the tacit the arms run (the first on their path), and checks that the index of
+// the clone's commit is there: tacit's hook index exits 0 whatever happened, and a build cut short leaves none. It
+// is given twice tacit's own five minutes. It says why the trials read no tacit, or nothing.
+func (e *Eval) warmTacit(ctx context.Context, in *pairInputs, dir string) string {
+	head, err := evalGit(ctx, "-C", in.tacit, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return "tacit's store as of the end: no commit: " + err.Error()
+	}
+	in.tacitHead = strings.TrimSpace(string(head))
+	warm := filepath.Join(dir, "tacit-warm")
+	if err := os.MkdirAll(warm, 0o700); err != nil {
+		return "tacit's index of its store as of the end: " + err.Error()
+	}
+	warmUp := e.TacitWarm
+	if len(warmUp) == 0 {
+		warmUp = []string{"tacit", "hook", "index"} // builds the index of the store's commit, and waits for it
+	}
+	env := CleanEnv(tacitAsOf(*in, warm), e.trialBins()...)
+	bin, err := lookPathIn(warmUp[0], envValue(env, "PATH"))
+	if err != nil {
+		return "tacit's index of its store as of the end: " + err.Error()
+	}
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, bin, warmUp[1:]...)
+	cmd.Dir, cmd.Env = warm, env
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("tacit's index of its store as of the end: %v: %s", err, plain.Clip(plain.Line(string(out)), 200))
+	}
+	if built, _ := filepath.Glob(filepath.Join(in.tacitIndex, "index-v*-"+in.tacitHead+".db")); len(built) == 0 {
+		return "tacit's index of its store as of the end was not built: " + plain.Clip(plain.Line(string(out)), 200)
+	}
+	return ""
+}
+
+// lookPathIn finds a command as a shell with that PATH would: a name with a slash as it is, else the first
+// executable file of that name on the path.
+func lookPathIn(name, path string) (string, error) {
+	if strings.Contains(name, "/") {
+		return name, nil
+	}
+	for _, d := range filepath.SplitList(path) {
+		p := filepath.Join(d, name)
+		if st, err := os.Stat(p); err == nil && st.Mode().IsRegular() && st.Mode()&0o111 != 0 {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("%s is not on the trials' path", name)
+}
+
+// envValue is a variable's value in an environment list.
+func envValue(env []string, key string) string {
+	for _, kv := range env {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == key {
+			return v
+		}
+	}
+	return ""
+}
+
 // pairInputs are what both arms of a trial read, made once before either runs; tacitErr says why a trial reads no
 // tacit when the machine has its store.
 type pairInputs struct {
-	store, tacit, tacitIndex, tacitErr string
+	store, tacit, tacitIndex, tacitHead, tacitErr string
 }
 
 // copyStore copies a closed store, its write-ahead log with it when there is one.
@@ -414,7 +468,7 @@ func (e *Eval) trial(ctx context.Context, t GoldenTask, n int) (tr Trial) {
 		arm = "native"
 	}
 	tr = e.newTrial(t, n, arm)
-	tr.Tacit, tr.TacitErr = e.pair.tacit != "", e.pair.tacitErr
+	tr.Tacit, tr.TacitCommit, tr.TacitErr = e.pair.tacit != "", e.pair.tacitHead, e.pair.tacitErr
 	dir := filepath.Join(e.Dir, tr.Key, digest(tr.Key + "\x00" + arm)[:16])
 	// A repeated id must not wipe another evaluation's files.
 	if _, err := os.Stat(dir); err == nil {
