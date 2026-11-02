@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -77,7 +78,8 @@ type Options struct {
 type Done struct {
 	Family, Case, Step string
 	Run                store.LoopRun
-	Skipped            string // why no step ran
+	Skipped            string   // why no step ran
+	Refused            []string // what the run's relay refused to forward (also in the run's summary)
 }
 
 func (r *Runner) now() time.Time {
@@ -184,6 +186,9 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 	}
 	if !o.Dry {
 		done = append(done, r.reviews(ctx, o.Case, families...)...)
+		if err := r.noteWaiting(ctx); err != nil {
+			r.logf("notes: %v", err)
+		}
 	}
 	sort.Slice(done, func(i, j int) bool { return done[i].Family+done[i].Step < done[j].Family+done[j].Step })
 	return done, nil
@@ -270,7 +275,7 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 				passed = append(passed, c.ID+" has landed; deployment precedes more work")
 				continue
 			} else if ok && (p.State == Proposed || p.State == Landing) {
-				if n := len(p.Reviews); n >= MaxRounds && !p.Clean() && p.Reviews[n-1].Head == p.Head {
+				if roundsUsed(p) {
 					passed = append(passed, c.ID+" used its review rounds")
 				}
 				continue // its review or its landing comes next (reviews)
@@ -404,7 +409,7 @@ func (r *Runner) step(ctx context.Context, family string, c store.Case, step str
 	d := Done{Family: family, Case: c.ID, Step: step}
 	res, err := r.invoke(ctx, family, c, step, run)
 	r.finish(ctx, c, &run, res, err)
-	d.Run = run
+	d.Run, d.Refused = run, res.Refused
 	return d
 }
 
@@ -422,6 +427,16 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 		run.Model = firstOf(res.Model, run.Model)
 		if run.Summary == "" {
 			run.Summary = summaryOf(res)
+		}
+		if len(res.Refused) > 0 {
+			// what the relay refused is shown with the run, beside its failure and never in it: the fallback and the stop
+			// rule compare the failure
+			run.Summary = strings.TrimSpace(run.Summary + " (the relay refused " + strings.Join(res.Refused, "; ") + ")")
+		}
+		if run.Status == store.RunOK && run.Step == StepPublish && !r.published(ctx, c.ID) {
+			// a publish is done by its receipt, never by the run ending well: one that left none failed, and the stop rule
+			// stops a case whose publishes keep leaving none
+			run.Status, run.Failure = store.RunFailed, "no receipt"
 		}
 	}
 	switch {
@@ -487,7 +502,12 @@ func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step s
 	if step == StepBuild {
 		work := r.Ship.workDir(c.ID)
 		roots = append(roots, work)
+		// what a run writes is made before its sandbox mounts it: the first build on a machine has neither a work tree
+		// nor a build cache, and a mount whose source is missing does not start
 		if err := os.MkdirAll(work, 0o700); err != nil {
+			return Result{}, err
+		}
+		if err := r.Toolchains.makeCaches(); err != nil {
 			return Result{}, err
 		}
 		inv.Mounts = append([]jail.Mount{{Path: work, Write: true}}, r.Toolchains.mounts()...)
@@ -624,7 +644,7 @@ func (r *Runner) review(ctx context.Context, c store.Case, p Package, run store.
 		}
 	}
 	r.finish(ctx, c, &run, res, err)
-	d.Run = run
+	d.Run, d.Refused = run, res.Refused
 	return d
 }
 
@@ -656,13 +676,17 @@ func (r *Runner) invokeReview(ctx context.Context, c store.Case, p Package, run 
 	}
 	inv := Invocation{Dir: run.Dir, System: system, Schema: reviewSchema, MaxTurns: r.Budgets.MaxTurns, BudgetUSD: r.Budgets.Run,
 		Timeout: r.Budgets.RunTime, Persist: true}
+	// the work tree is read-only, and its .git link names a directory the sandbox does not hold: its history is read
+	// through the door, which reads repositories in it as a build's does
+	roots := []string{run.Dir}
 	if p.Work != "" {
 		inv.Mounts = []jail.Mount{{Path: p.Work}}
+		roots = append(roots, p.Work)
 	}
 	inv.Prompt = fmt.Sprintf("Review the change package of case %s (%s): %s. The change is diff.patch and the package package.json in your "+
 		"working directory %s; the work tree is %s. Read the case with `momentum case show %s --json`. End with the review's report.",
 		c.ID, c.Family, p.Title, run.Dir, p.Work, c.ID)
-	inv.Door = r.door(StepReview, c, run, []string{run.Dir})
+	inv.Door = r.door(StepReview, c, run, roots)
 	if inv.Prompt, err = Redact(ctx, inv.Prompt); err != nil {
 		return Result{}, err
 	}
@@ -799,4 +823,65 @@ func (r *Runner) reviewDiff(ctx context.Context, p Package) (string, error) {
 		return "", err
 	}
 	return Redact(ctx, diff)
+}
+
+// roundsUsed says whether a proposed change used its review rounds: the last of them found something on the commit it
+// proposes now, and no round is left. Nothing builds or reviews it more.
+func roundsUsed(p Package) bool {
+	n := len(p.Reviews)
+	return (p.State == Proposed || p.State == Landing) && n >= MaxRounds && !p.Clean() && p.Reviews[n-1].Head == p.Head
+}
+
+// waitingPrefix starts the id of the report's note about a change that waits for a person.
+const waitingPrefix = "loop-rounds:"
+
+// noteWaiting keeps the report's passive note about each change that used its review rounds, since the loop builds
+// and reviews it no more and nothing else says it waits. One note for each case, keyed by it, so a loop run that finds
+// the change still waiting replaces the note and adds none: a low problem, put when the change reaches that state and
+// done when it leaves it (the case closes, the change is revised or lands). A note its reader resolved while the
+// change still waits stays resolved. Nothing pages anyone: the report is the owner's passive surface.
+func (r *Runner) noteWaiting(ctx context.Context) error {
+	cs, err := r.Store.Cases(ctx, store.CaseFilter{Statuses: []store.CaseStatus{store.CaseTesting}})
+	if err != nil {
+		return err
+	}
+	notes, err := r.Store.Notes(ctx)
+	if err != nil {
+		return err
+	}
+	have := map[string]store.Note{}
+	for _, n := range notes {
+		have[n.ID] = n
+	}
+	waiting := map[string]bool{}
+	for _, c := range cs {
+		p, ok, err := r.Ship.Load(c.ID)
+		if err != nil || !ok || !roundsUsed(p) {
+			continue
+		}
+		id := waitingPrefix + store.IDPart(c.ID)
+		waiting[id] = true
+		at := p.Reviews[len(p.Reviews)-1].At
+		if n, ok := have[id]; ok && (n.Done.IsZero() || !n.At.Before(at.Truncate(time.Millisecond))) {
+			continue // it stands, or it was resolved while this change waited
+		}
+		note := store.Note{ID: id, Kind: store.NoteProblem, Importance: store.ImportanceLow, At: at,
+			Title: fmt.Sprintf("The loop's change for case %s used its %d review rounds and waits for a person", c.ID, MaxRounds),
+			Detail: fmt.Sprintf("The last review still found a high or medium problem in %s. The loop builds and reviews this change no more. "+
+				"Take it over in its pull request, or close the case.", firstOf(p.PR, "its change"))}
+		if u, err := url.Parse(p.PR); err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" {
+			note.Links = []store.Link{{Label: "pull request", URL: p.PR}}
+		}
+		if _, err := r.Store.PutNote(ctx, note); err != nil {
+			return err
+		}
+	}
+	for id, n := range have {
+		if strings.HasPrefix(id, waitingPrefix) && n.Done.IsZero() && !waiting[id] {
+			if _, _, err := r.Store.DoneNote(ctx, id, r.now()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

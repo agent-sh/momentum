@@ -37,14 +37,18 @@ func loopDir() string { return filepath.Join(paths.Data(), "loop") }
 // onBedrock says whether the loop's agent can start a run now: on Bedrock, by its route, with Bedrock's models. The
 // commands that start a model check it first; the rest of the loop (a dry pick, the ship tool, measuring) do not.
 // The relay holds every request of every run to a global inference profile; this says before any run starts that
-// a configured model could never run.
+// a configured model could never run. The model and the fallback model are each one model: a list is refused, since
+// a run refused by the model's safeguards would pass the whole list as its model.
 func onBedrock(a loop.Agent) error {
 	if err := a.Bedrock.Check(); err != nil {
 		return err
 	}
-	for _, m := range append([]string{a.Model}, strings.Split(a.Fallback, ",")...) {
-		if m = strings.TrimSpace(m); m != "" && !loop.BedrockModel(m) {
-			return fmt.Errorf("loop model %q is no Bedrock model: every headless run is on Bedrock, on a global inference profile (global.anthropic.claude-...)", m)
+	for _, c := range []struct{ name, model string }{{"model", a.Model}, {"fallback_model", a.Fallback}} {
+		switch m := strings.TrimSpace(c.model); {
+		case strings.ContainsAny(m, ", \t"):
+			return fmt.Errorf("loop %s %q is a list: the loop takes one model, and one fallback model", c.name, m)
+		case m != "" && !loop.BedrockModel(m):
+			return fmt.Errorf("loop %s %q is no Bedrock model: every headless run is on Bedrock, on a global inference profile (global.anthropic.claude-...)", c.name, m)
 		}
 	}
 	return nil
@@ -320,20 +324,29 @@ func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	done, err := r.Once(ctx, loop.Options{Dry: *dry, Families: fams, Case: *only})
 	enc := json.NewEncoder(stdout)
 	for _, d := range done {
-		if *asJSON {
-			enc.Encode(map[string]any{"family": d.Family, "case": d.Case, "step": d.Step, "run": d.Run.ID, "status": d.Run.Status,
-				"failure": d.Run.Failure, "usd": d.Run.USD, "summary": d.Run.Summary, "skipped": d.Skipped})
-			continue
-		}
-		switch {
-		case d.Skipped != "":
-			fmt.Fprintf(stdout, "%-14s %-10s %s\n", d.Family, firstText(d.Case, "-"), d.Skipped)
-		default:
-			fmt.Fprintf(stdout, "%-14s %-10s %s %s: %s $%.2f %s\n", d.Family, d.Case, d.Step, d.Run.ID, d.Run.Status, d.Run.USD,
-				firstText(d.Run.Failure, d.Run.Summary))
-		}
+		printDone(stdout, enc, d, *asJSON)
 	}
 	return err
+}
+
+// printDone prints one step the loop took, or why it took none: a line, or an object with --json. What the run's relay
+// refused comes after the line, apart from the failure the stop rule compares.
+func printDone(stdout io.Writer, enc *json.Encoder, d loop.Done, asJSON bool) {
+	if asJSON {
+		enc.Encode(map[string]any{"family": d.Family, "case": d.Case, "step": d.Step, "run": d.Run.ID, "status": d.Run.Status,
+			"failure": d.Run.Failure, "usd": d.Run.USD, "summary": d.Run.Summary, "skipped": d.Skipped, "relay_refused": d.Refused})
+		return
+	}
+	if d.Skipped != "" {
+		fmt.Fprintf(stdout, "%-14s %-10s %s\n", d.Family, firstText(d.Case, "-"), d.Skipped)
+		return
+	}
+	line := fmt.Sprintf("%-14s %-10s %s %s: %s $%.2f %s", d.Family, d.Case, d.Step, d.Run.ID, d.Run.Status, d.Run.USD,
+		firstText(d.Run.Failure, d.Run.Summary))
+	if len(d.Refused) > 0 {
+		line += " (the relay refused " + strings.Join(d.Refused, "; ") + ")"
+	}
+	fmt.Fprintln(stdout, line)
 }
 
 // lockLoop takes the loop's lock beside the store: one loop at a time, since runs of two would pick the same

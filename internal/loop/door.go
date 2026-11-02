@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
@@ -121,6 +122,15 @@ type Toolchains struct {
 	ReadOnly []string
 	Cache    string
 	Path     []string
+}
+
+// makeCaches makes the loop's build caches before a sandbox mounts them: the directory a build mounts writable, and
+// Go's build cache in it. A machine's first build finds neither, and a mount whose source is missing does not start.
+func (t Toolchains) makeCaches() error {
+	if t.Cache == "" {
+		return nil
+	}
+	return os.MkdirAll(filepath.Join(t.Cache, "go-build"), 0o700)
 }
 
 func (t Toolchains) mounts() []jail.Mount {

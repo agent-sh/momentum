@@ -17,7 +17,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/agent-sh/momentum/internal/paths"
 )
@@ -107,11 +106,10 @@ func loopback(host string) bool {
 // forwards to the broker a model request of a Claude model on a global inference profile and the harness's listing of
 // the inference profiles, and refuses anything else.
 type relay struct {
-	srv      *http.Server
-	prefix   string
-	answered atomic.Int64 // model requests the broker answered with a 2xx
-	mu       sync.Mutex
-	refused  []string // what it refused, for the run's failure
+	srv     *http.Server
+	prefix  string
+	mu      sync.Mutex
+	refused []string // what it refused, each kind once: shown with the run
 }
 
 // open reads the broker's file and starts the run's relay on the socket; env is what the run's harness takes
@@ -140,12 +138,6 @@ func (b *Bedrock) open(socket string) (*relay, []string, error) {
 			pr.Out.URL.RawPath = strings.TrimSuffix(target.EscapedPath(), "/") + rest
 			pr.Out.URL.Path, _ = url.PathUnescape(pr.Out.URL.RawPath)
 		},
-		ModifyResponse: func(resp *http.Response) error {
-			if resp.Request.Method == http.MethodPost && resp.StatusCode/100 == 2 {
-				r.answered.Add(1)
-			}
-			return nil
-		},
 		FlushInterval: -1, // a streamed answer streams on
 		ErrorLog:      log.New(io.Discard, "", 0),
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
@@ -155,7 +147,7 @@ func (b *Bedrock) open(socket string) (*relay, []string, error) {
 	r.srv = &http.Server{ErrorLog: log.New(io.Discard, "", 0), Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if why := r.admit(req); why != "" {
 			r.mu.Lock()
-			if len(r.refused) < 8 {
+			if len(r.refused) < 8 && !slices.Contains(r.refused, why) {
 				r.refused = append(r.refused, why)
 			}
 			r.mu.Unlock()
@@ -199,7 +191,7 @@ func (r *relay) admit(req *http.Request) string {
 	return fmt.Sprintf("%s %s is no model request", req.Method, plainClip("/"+strings.Join(parts, "/"), 80))
 }
 
-// refusals is what the relay refused, for a run that failed.
+// refusals is what the relay refused: shown with the run, never part of its failure.
 func (r *relay) refusals() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()

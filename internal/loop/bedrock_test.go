@@ -118,7 +118,7 @@ func TestARunGoesThroughItsRelayToTheBroker(t *testing.T) {
 
 // The relay forwards only a model request of a Claude model on a global inference profile, and the harness's
 // listing of the profiles: a regional profile, an alias, an ARN, a path outside the run's own and any other request
-// are refused at the relay and never reach the broker; a run that fails says what was refused.
+// are refused at the relay and never reach the broker; the run says what was refused.
 func TestTheRelayForwardsOnlyGlobalProfileModelRequests(t *testing.T) {
 	b := fakeBroker(t)
 	harness := harnessOnRoute(t, `{"type":"result","subtype":"success","is_error":true,"result":"API Error: 403"}`,
@@ -140,8 +140,10 @@ func TestTheRelayForwardsOnlyGlobalProfileModelRequests(t *testing.T) {
 	if seen := b.seen(); len(seen) != 1 || !strings.HasSuffix(seen[0], "/model/global.anthropic.claude-sonnet-5-5/invoke") {
 		t.Fatalf("the broker saw %q", seen)
 	}
-	if res.Status == "ok" || !strings.Contains(res.Failure, "the relay refused") || !strings.Contains(res.Failure, "us.anthropic.claude-haiku") {
-		t.Fatalf("the run's failure: %+v", res)
+	// what the relay refused is the result's own field, never part of the failure the fallback and the stop rule compare
+	if res.Status == "ok" || !strings.Contains(strings.Join(res.Refused, "\n"), "us.anthropic.claude-haiku") || strings.Contains(res.Failure, "relay") ||
+		strings.Contains(res.Failure, "haiku") {
+		t.Fatalf("the run's failure and refusals: %+v", res)
 	}
 }
 

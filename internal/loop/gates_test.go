@@ -158,11 +158,16 @@ fi`)
 			}
 		})
 	}
+	// The run's time is shared by its attempts: the fallback has what the first left, not a fresh allowance. The race
+	// detector adds about a second to each sandboxed attempt (the sandbox's init is the test binary, race-built, and the
+	// race runtime sleeps a second as it exits), so the times leave room for it: the first attempt (3 s) ends inside the
+	// run's 5 s with and without it; the fallback (3 s) cannot end in the 2 s or less left to it, and would end inside
+	// a fresh 5 s even with the second added.
 	t.Run("deadline", func(t *testing.T) {
 		dir := t.TempDir()
-		fake := script(t, dir, "fixture", `case "$*" in *"--model primary"*) sleep 0.15; echo '{"type":"result","subtype":"success","is_error":true,"num_turns":1,"total_cost_usd":1,"result":"safeguards"}' ;; *) sleep 0.3; echo '`+okResult+`' ;; esac`)
-		res, err := testJail(t, Agent{Runner: []string{fake}, Model: "primary", Fallback: "fallback"}).RunOrFallback(context.Background(), Invocation{Dir: filepath.Join(dir, "run"), BudgetUSD: 4, MaxTurns: 10, Timeout: 350 * time.Millisecond})
-		if err != nil || res.Status != store.RunTimeout || res.USD != 4 {
+		fake := script(t, dir, "fixture", `case "$*" in *"--model primary"*) sleep 3; echo '{"type":"result","subtype":"success","is_error":true,"num_turns":1,"total_cost_usd":1,"result":"safeguards"}' ;; *) sleep 3; echo '`+okResult+`' ;; esac`)
+		res, err := testJail(t, Agent{Runner: []string{fake}, Model: "primary", Fallback: "fallback"}).RunOrFallback(context.Background(), Invocation{Dir: filepath.Join(dir, "run"), BudgetUSD: 4, MaxTurns: 10, Timeout: 5 * time.Second})
+		if err != nil || res.Status != store.RunTimeout || res.USD != 4 || res.Model != "fallback" {
 			t.Fatalf("fallback restarted time or lost unknown cost: %+v %v", res, err)
 		}
 	})

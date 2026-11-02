@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -88,6 +89,9 @@ type Result struct {
 	Session    string
 	Transcript string // the run's stream of events, in Dir
 	Model      string // the model that ran it
+	// Refused is what the run's relay refused to forward, one entry for each kind of request: shown with the run, never
+	// part of Failure, which the fallback and the stop rule compare.
+	Refused []string
 }
 
 // stopGrace is how long a run that ran out of its time has to stop after SIGTERM before it is killed.
@@ -115,6 +119,14 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	for _, d := range []string{inv.Dir, filepath.Join(inv.Dir, "tmp"), filepath.Join(inv.Dir, "claude")} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return Result{}, err
+		}
+	}
+	mounts := append(append([]jail.Mount{{Path: inv.Dir, Write: true}, {Path: harness}}, a.Mounts...), inv.Mounts...)
+	for _, m := range mounts {
+		if _, err := os.Stat(m.Path); errors.Is(err, os.ErrNotExist) {
+			return Result{}, fmt.Errorf("the sandbox cannot mount %s: it does not exist", m.Path)
+		} else if err != nil {
+			return Result{}, fmt.Errorf("the sandbox cannot mount %s: %w", m.Path, err)
 		}
 	}
 	write := func(name string, data []byte) (string, error) {
@@ -172,8 +184,7 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 		}
 		defer stop()
 	}
-	mounts := append([]jail.Mount{{Path: inv.Dir, Write: true}, {Path: harness}}, a.Mounts...)
-	spec := jail.Spec{Bwrap: a.Bwrap, Self: a.Self, Home: a.Home, Mounts: jail.Tidy(append(mounts, inv.Mounts...)), Dir: inv.Dir,
+	spec := jail.Spec{Bwrap: a.Bwrap, Self: a.Self, Home: a.Home, Mounts: jail.Tidy(mounts), Dir: inv.Dir,
 		Env: sandboxEnv(a.Home, inv.Dir, routeEnv, a.Env, inv.Env), Route: filepath.Join(sockets, "route.sock"), RoutePort: RoutePort, Door: door}
 	cmd, err := spec.Command(context.Background(), append([]string{harness}, args...)...)
 	if err != nil {
@@ -228,9 +239,7 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 			res.Failure = fmt.Sprintf("exit %v: %s", waitErr, lastLine(filepath.Join(inv.Dir, "stderr.txt")))
 		}
 	}
-	if refused := route.refusals(); len(refused) > 0 && res.Status != store.RunOK {
-		res.Failure += "; the relay refused " + strings.Join(refused, "; ")
-	}
+	res.Refused = route.refusals()
 	return res, nil
 }
 
@@ -324,6 +333,7 @@ func (a Agent) RunOrFallback(ctx context.Context, inv Invocation) (Result, error
 	res.Tokens += first.Tokens
 	res.Turns += first.Turns
 	res.Duration += first.Duration
+	res.Refused = slices.Concat(first.Refused, slices.DeleteFunc(res.Refused, func(r string) bool { return slices.Contains(first.Refused, r) }))
 	return res, err
 }
 

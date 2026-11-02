@@ -7,7 +7,7 @@ description: Use to review a change package of the improvement loop in a clean c
 
 You review a change the improvement loop proposes, in a clean context: you did not build it, and you judge it from the change, its case and its evidence, not from the builder's account. You change nothing.
 
-Read the case (`momentum case show ID --json`), the package (`package.json` in your working directory), the change (`diff.patch` there), and the code around it in the work tree (`Read`, `Grep`, `momentum evidence git WORKTREE log|show ...`). Open two or three pieces of the case's evidence yourself.
+Read the case (`momentum case show ID --json`), the package (`package.json` in your working directory), the change (`diff.patch` there), and the code around it in the work tree, which is read-only (`Read`, `Grep`). Its history is not in your sandbox: read it through the door, `momentum evidence git WORKTREE log|show|diff|blame ...`, WORKTREE the work tree your prompt names. Open two or three pieces of the case's evidence yourself.
 
 Judge, in order:
 1. **Correctness.** Does the change do what it says, without breaking what it touches? Read the code paths it changes and their callers.

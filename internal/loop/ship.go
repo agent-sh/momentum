@@ -211,8 +211,13 @@ func (s *Ship) public(ctx context.Context, text string) (string, error) {
 
 // Prepare makes the case's work tree: a branch of the repository's default branch in a worktree of the loop's
 // own, once the gate allows the repository. A case has one package at a time; one rolled back can be prepared
-// again, its old work tree and branch gone first.
+// again, its old tree's files and registration gone first. The work tree's directory stays: it is emptied in place.
 func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, error) {
+	unlock, err := s.lock(ctx, caseID)
+	if err != nil {
+		return Package{}, err
+	}
+	defer unlock()
 	c, err := s.working(ctx, caseID)
 	if err != nil {
 		return Package{}, err
@@ -233,20 +238,22 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	}
 	work := s.workDir(c.ID)
 	branch := "momentum/" + c.ID
-	if had { // its last tree's registration, so the branch can be checked out again
-		s.git(ctx, old.Dir, "worktree", "remove", "--force", old.Work)
-		s.git(ctx, old.Dir, "worktree", "prune")
-	}
-	if err := os.RemoveAll(work); err != nil {
-		return Package{}, err
-	}
-	s.git(ctx, t.Dir, "worktree", "prune")
 	if err := os.MkdirAll(filepath.Dir(work), 0o700); err != nil {
 		return Package{}, err
 	}
 	if _, err := s.git(ctx, t.Dir, "fetch", "--quiet", "origin", t.Base); err != nil {
 		return Package{}, err
 	}
+	// A build's sandbox mounts the directory before it asks for the tree, and a mount keeps the directory it was made
+	// on: the directory stays, emptied in place, and the tree is made in it. Git forgets a tree whose directory has
+	// no .git left (its last tree's registration, so the branch can be checked out again).
+	if err := emptyDir(work); err != nil {
+		return Package{}, err
+	}
+	if had {
+		s.git(ctx, old.Dir, "worktree", "prune")
+	}
+	s.git(ctx, t.Dir, "worktree", "prune")
 	if _, err := s.git(ctx, t.Dir, "worktree", "add", "--no-checkout", "-B", branch, work, "origin/"+t.Base); err != nil {
 		return Package{}, err
 	}
@@ -317,6 +324,11 @@ var testFileRe = regexp.MustCompile(`(_test\.go|\.test\.[cm]?[jt]sx?|\.spec\.[cm
 // fail), and the change (it must pass). The test's files are those the change touches that are named as tests, or
 // the ones named. A check that does not come out so is recorded as it came out, and the package stays unchecked.
 func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []string) (Package, error) {
+	unlock, err := s.lock(ctx, caseID)
+	if err != nil {
+		return Package{}, err
+	}
+	defer unlock()
 	if _, err := s.working(ctx, caseID); err != nil {
 		return Package{}, err
 	}
@@ -436,6 +448,11 @@ const MinSignal = 3
 // request, or, for a revision after a review, updates the one it has. The change must be the one the check passed.
 // A proposal that failed after its commit is taken up again where it stopped.
 func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package, error) {
+	unlock, err := s.lock(ctx, caseID)
+	if err != nil {
+		return Package{}, err
+	}
+	defer unlock()
 	c, err := s.working(ctx, caseID)
 	if err != nil {
 		return Package{}, err
@@ -724,6 +741,11 @@ func (p Package) Clean() bool {
 // tree, pushed to its pull request when the rebase moved it, and pushed to the default branch as a fast-forward by
 // the user's own identity (prs.md), so GitHub marks the pull request merged. The case is then deployed.
 func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
+	unlock, err := s.lock(ctx, caseID)
+	if err != nil {
+		return Package{}, err
+	}
+	defer unlock()
 	p, ok, err := s.Load(caseID)
 	if err == nil && ok && p.State == Landing {
 		if !s.Live {
@@ -867,6 +889,11 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 // RollBack undoes a landed change: a revert of its commits, by the user's identity, pushed to the default branch
 // as a fast-forward; the case goes back to testing.
 func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error) {
+	unlock, err := s.lock(ctx, caseID)
+	if err != nil {
+		return Package{}, err
+	}
+	defer unlock()
 	p, ok, err := s.Load(caseID)
 	if err != nil {
 		return Package{}, err
@@ -1091,9 +1118,11 @@ func CheckGitConfig(ctx context.Context, dir string) error {
 		return fmt.Errorf("inspect Git configuration names: %w", err)
 	}
 	for _, name := range strings.Split(string(out), "\x00") {
+		// git lists a name with its section and variable in lower case and its subsection as written, and a subsection is
+		// case sensitive: a value is read by the name as git listed it
 		key := strings.ToLower(name)
 		if key == "core.fsmonitor" {
-			value, err := config("--type=bool", "--get", key)
+			value, err := config("--type=bool", "--get", name)
 			if err == nil && strings.TrimSpace(string(value)) == "false" {
 				continue
 			}
@@ -1115,7 +1144,7 @@ func CheckGitConfig(ctx context.Context, dir string) error {
 		if strings.HasPrefix(key, "submodule.") && strings.HasSuffix(key, ".update") {
 			// checkout, rebase, merge and none are the modes git submodule init writes; any other value (! and a
 			// command) runs a program
-			value, err := config("--get-all", key)
+			value, err := config("--get-all", name)
 			for _, v := range strings.Split(strings.TrimSpace(string(value)), "\n") {
 				blocked = blocked || err != nil || !slices.Contains([]string{"checkout", "rebase", "merge", "none"}, strings.ToLower(strings.TrimSpace(v)))
 			}

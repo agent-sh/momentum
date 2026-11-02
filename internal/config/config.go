@@ -51,14 +51,17 @@ type Sources struct {
 	Detect struct {
 		ProgramPrefixes []string `json:"program_prefixes"`
 	} `json:"detect"`
-	// Loop configures the improvement loop (momentum loop, momentum ship). Nothing of it is compiled in but the
-	// budgets' defaults: without a runner the loop investigates nothing, and without owners the ship tool writes to
-	// no repository. It changes no configuration in place: only repositories, through pull requests.
+	// Loop configures the improvement loop (momentum loop, momentum ship). Compiled in: the budgets' defaults, the
+	// models (Opus 5.5, and Sonnet 5.5 when its safeguards refuse a run, both on Bedrock's global inference profiles),
+	// the families (failures, owner-burden, sessions) and the Bedrock broker's env file (~/.config/claude-code/bedrock.env).
+	// Without a runner the loop investigates nothing, and without owners the ship tool writes to no repository. It
+	// changes no configuration in place: only repositories, through pull requests.
 	Loop Loop `json:"loop"`
 }
 
 // Loop is the loop's configuration. Runner is the command that starts the harness's main agent headless, with
-// its first arguments (Claude Code on this machine's provider). Model and FallbackModel are the agent's models.
+// its first arguments (Claude Code on this machine's provider). Model and FallbackModel are the agent's models, one each:
+// a list is refused.
 // Owners are the repository owners the ship tool may write to; every other repository is report-only, and
 // Exclude names repositories (OWNER/REPO) it never touches. Rules are the files of the machine's shared rules
 // every run reads. RepoGuard is the
