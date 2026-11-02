@@ -1,7 +1,7 @@
-// Command check fails when a range of commits adds a file over 1 MiB or an executable, object or archive file,
-// in any of its commits. CI runs it on each pull request (go run ./internal/tracked/check BASE..HEAD) and on each
-// push to main (HEAD: the whole history). It exits 0 when the range holds nothing to refuse, 1 when it does, and 2
-// when it could not read the range.
+// Command check fails when a range of commits adds a file over 1 MiB or an ELF, Mach-O, PE, WebAssembly or ar-archive
+// file, in any of its commits. CI runs it on each pull request and on each push to main on the head's whole history
+// (go run ./internal/tracked/check HEAD); a range such as BASE..HEAD reads what it adds to BASE. It exits 0 when the
+// range holds nothing to refuse, 1 when it does, and 2 when it could not read the range.
 package main
 
 import (
@@ -29,7 +29,7 @@ func run(dir string, revs []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, p)
 	}
 	if len(problems) > 0 {
-		fmt.Fprintf(stderr, "check: %d file(s) the repository does not take: none over %d bytes, and no executable, object or archive file\n",
+		fmt.Fprintf(stderr, "check: %d file(s) the repository does not take: none over %d bytes, and no ELF, Mach-O, PE, WebAssembly or ar-archive file\n",
 			len(problems), tracked.Limit)
 		return 1
 	}

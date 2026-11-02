@@ -1,5 +1,5 @@
-// Package tracked checks the files a range of commits adds to a repository: none over a mebibyte and none an
-// executable binary. main keeps every commit of a pull request, so a file one commit adds stays in its history
+// Package tracked checks the files a range of commits adds to a repository: none over a mebibyte and none an ELF,
+// Mach-O, PE, WebAssembly or ar-archive file (Executable). main keeps every commit of a pull request, so a file one commit adds stays in its history
 // even when a later commit deletes it: the check reads every commit of the range, not only its last.
 package tracked
 
@@ -29,8 +29,8 @@ func (p Problem) String() string { return fmt.Sprintf("%s (%d bytes): %s", p.Pat
 
 // Check reads every file the commits of revs add, in every commit: revs are git rev-list's arguments, BASE..HEAD
 // for what a pull request adds, HEAD for the whole history. Every object the range reaches and its base does not
-// goes through one batch read; each blob is refused when it is over Limit or starts as an executable, object or
-// archive file does (Executable).
+// goes through one batch read; each blob is refused when it is over Limit or starts as one of the formats
+// Executable names does.
 func Check(ctx context.Context, dir string, revs ...string) ([]Problem, error) {
 	if len(revs) == 0 {
 		return nil, fmt.Errorf("no revisions to check")
@@ -99,7 +99,7 @@ func Check(ctx context.Context, dir string, revs ...string) ([]Problem, error) {
 			problems = append(problems, Problem{Path: path, Size: size, Why: fmt.Sprintf("over %d bytes", Limit)})
 		}
 		if kind := Executable(body[:size]); kind != "" {
-			problems = append(problems, Problem{Path: path, Size: size, Why: "an executable binary (" + kind + ")"})
+			problems = append(problems, Problem{Path: path, Size: size, Why: "a program, object or archive file (" + kind + ")"})
 		}
 	}
 	if err := cat.Wait(); err != nil {

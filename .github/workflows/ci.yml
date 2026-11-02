@@ -1,14 +1,13 @@
 name: ci
 
-# Thin on purpose: what every commit must hold (no large file, no build output), format, vet and build. The tests
-# run on the machine before a push (AGENTS.md). The repository is public, so the jobs use GitHub's runners.
+# Thin on purpose: what every commit must hold (no large file, no ELF, Mach-O, PE, WebAssembly or ar-archive file),
+# format, vet and build. The tests run on the machine before a push (AGENTS.md). The repository is public, so the
+# jobs use GitHub's runners.
 
 on:
   push:
     branches: [main]
-  # edited: a pull request whose base changes (a stacked one moved to main) is read again against its new base
   pull_request:
-    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
@@ -19,9 +18,11 @@ concurrency:
 
 jobs:
   # main keeps every commit of a pull request, so each one is read, not only the head: a file a commit adds and a
-  # later one deletes stays in main's history for good. A pull request reads what it adds to its base; a push to
-  # main reads main's whole history (a fraction of a second), so a push whose run was cancelled or replaced is
-  # read by the next.
+  # later one deletes stays in main's history for good. Both a pull request and a push read their head's whole
+  # history (a fraction of a second), never a range from a base: a base that moves, is rewound or was never read
+  # cannot hide a commit, and a push whose run was cancelled or replaced is read by the next. The check is built
+  # from the checked-out tree, so a change to internal/tracked or to this file is read by its own copy: review
+  # those by hand (AGENTS.md).
   tracked:
     runs-on: ubuntu-24.04
     steps:
@@ -32,16 +33,10 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - name: no file over 1 MiB and no executable, object or archive file in any commit
+      - name: no file over 1 MiB and no ELF, Mach-O, PE, WebAssembly or ar-archive file in any commit
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-        run: |
-          if [ "$GITHUB_EVENT_NAME" = pull_request ] && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
-            go run ./internal/tracked/check "$BASE..$HEAD"
-          else
-            go run ./internal/tracked/check "$HEAD"
-          fi
+        run: go run ./internal/tracked/check "$HEAD"
 
   build:
     runs-on: ubuntu-24.04

@@ -125,7 +125,7 @@ func TestTextAndOrdinaryDataPassTheCheck(t *testing.T) {
 	if ps := check(t, r, base+"..HEAD"); len(ps) != 0 {
 		t.Fatalf("text and ordinary data are taken, got %v", ps)
 	}
-	// the whole history, as a push of a new branch reads it
+	// the whole history, as a push to main reads it
 	if ps := check(t, r, "HEAD"); len(ps) != 0 {
 		t.Fatalf("the whole history holds nothing to refuse, got %v", ps)
 	}
@@ -174,6 +174,34 @@ func TestExecutableNamesOnlyBinaries(t *testing.T) {
 	for _, b := range [][]byte{nil, []byte("MZ"), []byte("MZ" + strings.Repeat(" ", 100)), []byte("\x7fEL"), []byte("plain text")} {
 		if k := Executable(b); k != "" {
 			t.Errorf("Executable(%q) = %q, want none", b, k)
+		}
+	}
+}
+
+// A pull request is read from its head's whole history, not from a range that starts at its base: a base that moves,
+// is rewound or was never read would hide a commit the head still reaches. The first half pins the premise with the
+// check itself (main holds a large file, a pull request is made from it, main is rewound before it: the range from
+// the old base is clean and the head's history is not); the second pins the workflow, which fails on a range.
+func TestAPullRequestReadsItsHeadsWholeHistory(t *testing.T) {
+	r := newRepo(t)
+	oldBase := r.commit("data/big.bin", bytes.Repeat([]byte("b"), Limit+1))
+	head := r.commit("notes.md", []byte("the change\n"))
+	if ps := check(t, r, oldBase+".."+head); len(ps) != 0 {
+		t.Fatalf("the range from the old base is clean, got %v", ps)
+	}
+	wantOne(t, check(t, r, head), "data/big.bin", "over")
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "ci.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, `go run ./internal/tracked/check "$HEAD"`) {
+		t.Errorf("the workflow's tracked step must run the check on the head alone")
+	}
+	for _, forbidden := range []string{"base.sha", "$BASE", "BASE.."} {
+		if strings.Contains(text, forbidden) {
+			t.Errorf("the workflow reads %q: a pull request must read its head's whole history, not a range from its base", forbidden)
 		}
 	}
 }
