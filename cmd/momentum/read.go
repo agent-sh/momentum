@@ -5,11 +5,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +22,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agent-sh/momentum/internal/loop"
 	"github.com/agent-sh/momentum/internal/paths"
@@ -43,98 +47,251 @@ func scrubbed(ctx context.Context, w io.Writer, text string) error {
 	return err
 }
 
-// evidenceShow prints an event of the store and, where its reference names a record of a transcript or a log
-// (path@offset), that record as the file holds it, scrubbed. A scan place names the next record, not the event.
-// With MOMENTUM_NOW set, a record dated at or after that end is withheld, and so is an undated one a scan place names.
+// showMost is how many events one evidence show prints.
+const showMost = 10
+
+// evidenceShow prints events of the store and, where an event's reference names a record of a transcript or a log
+// (path@offset), that record as the file holds it, or a Hermes event's message row, each scrubbed whole and then cut
+// to --bytes. A scan place names the next record, not the event. With MOMENTUM_NOW set, a record dated at or after
+// that end is withheld, and so is an undated one a scan place names.
 func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
-		return usageError{"evidence show takes one event: its id, or ev:ID"}
+	fs := flag.NewFlagSet("evidence show", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cut := fs.Int("bytes", 0, "each record's first N bytes, once it is scrubbed whole (default: all of it)")
+	var flags, ids []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") {
+			ids = append(ids, a)
+			continue
+		}
+		flags = append(flags, a)
+		if !strings.Contains(a, "=") && a != "-h" && a != "--help" && i+1 < len(args) {
+			i++
+			flags = append(flags, args[i])
+		}
 	}
-	id := strings.TrimPrefix(args[0], "ev:")
+	if err := fs.Parse(flags); err != nil {
+		return usageError{err.Error()}
+	}
+	if len(ids) == 0 || len(ids) > showMost || *cut < 0 {
+		return usageError{fmt.Sprintf("evidence show takes 1 to %d events, each its id or ev:ID, and --bytes N", showMost)}
+	}
 	st, err := store.Open(paths.DB())
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	e, ok, err := st.EventByID(ctx, id)
-	if err != nil {
+	var output strings.Builder
+	shown := 0
+	for i, raw := range ids {
+		text, err := showEvent(ctx, st, strings.TrimPrefix(raw, "ev:"), *cut)
+		var ue usageError
+		switch {
+		case err == nil:
+			shown++
+		case errors.As(err, &ue) && len(ids) > 1:
+			text = fmt.Sprintf("%s: %s\n", plain.Line(raw), ue.msg)
+		default:
+			return err
+		}
+		if i > 0 {
+			output.WriteString("\n")
+		}
+		output.WriteString(text)
+	}
+	if err := scrubbed(ctx, stdout, output.String()); err != nil {
 		return err
 	}
-	if !ok {
-		return usageError{fmt.Sprintf("the store holds no event %s", id)}
+	if shown == 0 {
+		return usageError{"none of them is an event of the store"}
 	}
-	var output strings.Builder
-	fmt.Fprintf(&output, "%s %s %s %s %s %s\n  %s\n", e.TS.Local().Format("2006-01-02 15:04:05"), e.Source, e.Actor, e.Kind, e.Session,
-		plain.Line(e.Tool), plain.Line(e.Summary))
+	return nil
+}
+
+// noEvent says why an id names no event, and what does.
+func noEvent(id string) string {
+	switch {
+	case strings.Contains(id, "@"):
+		return fmt.Sprintf("%s is a record's place, not an event's id: evidence events and evidence search print each event's ev:ID", id)
+	case uuidLike.MatchString(id):
+		return fmt.Sprintf("%s is a session's id, not an event's: evidence events --session %s reads its events", id, id)
+	}
+	return fmt.Sprintf("the store holds no event %s (an event's id is the 24 hex characters evidence events and evidence search print after ev:)", id)
+}
+
+var uuidLike = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-`)
+
+// showEvent is one event as evidence show prints it, with its record, scrubbed: the record whole first, then its
+// first n bytes when n is set.
+func showEvent(ctx context.Context, st *store.Store, id string, n int) (string, error) {
+	e, ok, err := st.EventByID(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", usageError{noEvent(id)}
+	}
+	head := fmt.Sprintf("%s ev:%s %s %s %s %s %s\n  %s\n", e.TS.Local().Format("2006-01-02 15:04:05"), e.ID(), e.Source, e.Actor, e.Kind,
+		e.Session, plain.Line(e.Tool), plain.Line(e.Summary))
+	record, note, err := eventRecord(ctx, e)
+	if err != nil {
+		return "", err
+	}
+	text, err := loop.Redact(ctx, head+note)
+	if err != nil || record == "" {
+		return text, err
+	}
+	clean, err := loop.Redact(ctx, record)
+	if err != nil {
+		return "", err
+	}
+	if n > 0 && len(clean) > n {
+		whole := len(clean)
+		clean = clean[:n]
+		for !utf8.ValidString(clean) {
+			clean = clean[:len(clean)-1]
+		}
+		clean += fmt.Sprintf("\n  (its first %d of %d bytes)\n", len(clean), whole)
+	}
+	return text + clean, nil
+}
+
+// eventRecord reads the record an event's reference names: the record, or a note that says why there is none.
+func eventRecord(ctx context.Context, e store.Event) (record, note string, err error) {
 	path, off, ok := placeOf(e.Ref)
 	if !ok {
-		return scrubbed(ctx, stdout, output.String())
+		return "", "", nil
 	}
 	if why := secretPath(path); why != "" {
-		fmt.Fprintf(&output, "  (its record is not shown: %s)\n", why)
-		return scrubbed(ctx, stdout, output.String())
+		return "", fmt.Sprintf("  (its record is not shown: %s)\n", why), nil
 	}
 	// opened without waiting on a writer, and read only when it is a regular file: a reference may now name a pipe or
 	// a device, which would hold the run
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		output.WriteString("  (its record is gone)\n")
-		return scrubbed(ctx, stdout, output.String())
+		return "", "  (its record is gone)\n", nil
 	}
 	defer f.Close()
 	if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() {
-		output.WriteString("  (its record is not a regular file)\n")
-		return scrubbed(ctx, stdout, output.String())
+		return "", "  (its record is not a regular file)\n", nil
 	}
 	if off < 0 {
-		return usageError{"negative record offset"}
+		return "", "", usageError{"negative record offset"}
 	}
 	var magic [16]byte
 	if n, _ := f.ReadAt(magic[:], 0); n == len(magic) && string(magic[:]) == "SQLite format 3\x00" {
-		// a Hermes event's reference names its message row by the row's id, not a byte offset of the file
-		output.WriteString("  (its record is a row of the Hermes store, which evidence show does not read)\n")
-		return scrubbed(ctx, stdout, output.String())
+		// a Hermes event's reference names its message row: the offset is the row's id
+		return hermesRow(ctx, path, off, e)
 	}
 	if off > 0 {
 		var prev [1]byte
 		if _, err := f.ReadAt(prev[:], off-1); err != nil || prev[0] != '\n' {
-			return usageError{"offset is not a record boundary"}
+			return "", "", usageError{"offset is not a record boundary"}
 		}
 	}
 	if _, err := f.Seek(off, io.SeekStart); err != nil {
-		return err
+		return "", "", err
 	}
 	line, err := bufio.NewReaderSize(f, readMax+1).ReadSlice('\n')
-	if err == bufio.ErrBufferFull || len(line) > readMax {
-		output.WriteString("  (oversized record withheld)\n")
-	} else if err != nil && err != io.EOF {
-		return err
-	} else if !ownRecord(e, line) {
+	switch {
+	case err == bufio.ErrBufferFull || len(line) > readMax:
+		return "", "  (oversized record withheld)\n", nil
+	case err != nil && err != io.EOF:
+		return "", "", err
+	case !ownRecord(e, line):
 		// a log read again from its start after a rotation gives its rows new places: the old place names another row
-		output.WriteString("  (its record is gone: the line at its place is another's, the log was rewritten since)\n")
-	} else if os.Getenv("MOMENTUM_NOW") != "" {
+		return "", "  (its record is gone: the line at its place is another's, the log was rewritten since)\n", nil
+	}
+	if os.Getenv("MOMENTUM_NOW") == "" {
+		return string(line), "", nil
+	}
+	end, err := commandNow()
+	if err != nil {
+		return "", "", err
+	}
+	var dated struct {
+		Timestamp string `json:"timestamp"`
+	}
+	_ = json.Unmarshal(line, &dated)
+	at, err := time.Parse(time.RFC3339Nano, dated.Timestamp)
+	switch {
+	case err == nil && !at.IsZero() && !at.Before(end):
+		return "", "  (record withheld: timestamp is at or after the evaluation end)\n", nil
+	case err == nil && !at.IsZero(), !scanPlace(e.Source):
+		// an event's own record is as old as the event, which the snapshot bounds, whatever its format dates it by
+		return string(line), "", nil
+	}
+	return "", "  (record withheld: no valid timestamp)\n", nil
+}
+
+// hermesRow reads a Hermes message row by its id, read-only, as one JSON record.
+func hermesRow(ctx context.Context, path string, id int64, e store.Event) (string, string, error) {
+	if scanPlace(e.Source) {
+		return "", "  (a scan place in a Hermes store names no record)\n", nil
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", "", err
+	}
+	u := url.URL{Scheme: "file", Path: filepath.ToSlash(abs), RawQuery: "mode=ro&_pragma=busy_timeout(2000)&_pragma=query_only(1)"}
+	db, err := sql.Open("sqlite", u.String())
+	if err != nil {
+		return "", "", err
+	}
+	defer db.Close()
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	var row struct {
+		ID        int64   `json:"id"`
+		Session   string  `json:"session_id"`
+		Role      string  `json:"role"`
+		Content   string  `json:"content"`
+		ToolCalls string  `json:"tool_calls,omitempty"`
+		ToolName  string  `json:"tool_name,omitempty"`
+		Timestamp float64 `json:"timestamp"`
+	}
+	// an older Hermes store has no tool columns
+	has := map[string]bool{}
+	if names, err := db.QueryContext(cctx, `SELECT name FROM pragma_table_info('messages')`); err == nil {
+		for names.Next() {
+			var name string
+			if names.Scan(&name) == nil {
+				has[name] = true
+			}
+		}
+		names.Close()
+	}
+	column := func(name string) string {
+		if has[name] {
+			return "coalesce(" + name + ", '')"
+		}
+		return "''"
+	}
+	err = db.QueryRowContext(cctx, `SELECT id, session_id, role, coalesce(content, ''), `+column("tool_calls")+`, `+column("tool_name")+`, timestamp
+	  FROM messages WHERE id = ?`, id).Scan(&row.ID, &row.Session, &row.Role, &row.Content, &row.ToolCalls, &row.ToolName, &row.Timestamp)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return "", "  (its record is gone)\n", nil
+	case err != nil:
+		return "", "  (its record could not be read: " + plain.Line(err.Error()) + ")\n", nil
+	case len(row.Content)+len(row.ToolCalls) > readMax:
+		return "", "  (oversized record withheld)\n", nil
+	}
+	if os.Getenv("MOMENTUM_NOW") != "" {
 		end, err := commandNow()
 		if err != nil {
-			return err
+			return "", "", err
 		}
-		var record struct {
-			Timestamp string `json:"timestamp"`
+		if at := time.UnixMilli(int64(row.Timestamp * 1000)); !at.Before(end) {
+			return "", "  (record withheld: timestamp is at or after the evaluation end)\n", nil
 		}
-		_ = json.Unmarshal(line, &record)
-		at, err := time.Parse(time.RFC3339Nano, record.Timestamp)
-		switch {
-		case err == nil && !at.IsZero() && !at.Before(end):
-			output.WriteString("  (record withheld: timestamp is at or after the evaluation end)\n")
-		case err == nil && !at.IsZero(), !scanPlace(e.Source):
-			// an event's own record is as old as the event, which the snapshot bounds, whatever its format dates it by
-			output.Write(line)
-		default:
-			output.WriteString("  (record withheld: no valid timestamp)\n")
-		}
-	} else {
-		output.Write(line)
 	}
-	return scrubbed(ctx, stdout, output.String())
+	raw, err := json.Marshal(row)
+	if err != nil {
+		return "", "", err
+	}
+	return string(raw) + "\n", "", nil
 }
 
 // ownRecord says whether a line is the event's own record where the event says which line that is: a mistakes
@@ -360,6 +517,9 @@ func evidenceSearch(ctx context.Context, args []string, stdout, stderr io.Writer
 			phrases = append(phrases, a)
 			continue
 		}
+		if name, _, _ := strings.Cut(strings.TrimLeft(a, "-"), "="); fs.Lookup(name) == nil && a != "-h" && a != "--help" {
+			return usageError{fmt.Sprintf("flag provided but not defined: %s; a phrase that starts with a dash goes after --: evidence search [flags] -- PHRASE", a)}
+		}
 		flags = append(flags, a)
 		if strings.Contains(a, "=") || a == "-h" || a == "--help" {
 			continue
@@ -371,16 +531,17 @@ func evidenceSearch(ctx context.Context, args []string, stdout, stderr io.Writer
 		flags = append(flags, args[i])
 	}
 	if err := fs.Parse(flags); err != nil {
+		if strings.Contains(err.Error(), "flag provided but not defined") {
+			return usageError{err.Error() + "; a phrase that starts with a dash goes after --: evidence search [flags] -- PHRASE"}
+		}
 		return usageError{err.Error()}
 	}
-	if len(phrases) != 1 || len(strings.TrimSpace(phrases[0])) < 3 {
-		return usageError{"evidence search takes exactly one phrase of 3 characters or more; flags may come anywhere"}
+	if len(phrases) != 1 || len([]rune(strings.TrimSpace(phrases[0]))) < 2 {
+		return usageError{fmt.Sprintf("evidence search takes exactly one phrase of 2 characters or more (it has %d); flags may come anywhere, and each search is its own command", len(phrases))}
 	}
 	text := phrases[0]
-	switch *actor {
-	case "", string(store.ActorOwner), string(store.ActorAgent), string(store.ActorTool), string(store.ActorHarness), string(store.ActorDetector), string(store.ActorUnknown):
-	default:
-		return usageError{"unknown actor: " + *actor}
+	if err := knownActor(*actor); err != nil {
+		return err
 	}
 	from, err := parseWhen(*since)
 	if err != nil {
@@ -422,6 +583,9 @@ func evidenceSearch(ctx context.Context, args []string, stdout, stderr io.Writer
 			sort.Strings(sources)
 			return usageError{fmt.Sprintf("unknown source %q; the store holds: %s", *source, strings.Join(sources, ", "))}
 		}
+	}
+	if err := knownKinds(ctx, st, q.Kinds); err != nil {
+		return err
 	}
 	evs, err := st.Events(ctx, q)
 	if err != nil {

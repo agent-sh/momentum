@@ -360,7 +360,7 @@ func TestEvidenceSearchFindsAPhrase(t *testing.T) {
 	if _, out, _ := momentum("evidence", "search", "0_ d"); strings.Count(out, "ev:") != 0 {
 		t.Fatalf("an underscore as a wildcard: %q", out)
 	}
-	if code, _, _ := momentum("evidence", "search", "no"); code != 2 {
-		t.Fatal("a two-letter phrase was searched")
+	if code, _, _ := momentum("evidence", "search", "n"); code != 2 {
+		t.Fatal("a one-letter phrase was searched")
 	}
 }

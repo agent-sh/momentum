@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -152,7 +153,47 @@ func evidenceGit(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	if _, writeErr := io.WriteString(stdout, clean); writeErr != nil {
 		return writeErr
 	}
+	// git's own answer of no, as its exit status 1 says it: a grep that matched nothing, an ancestry that does not hold
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 && out.Len() == 0 {
+		switch {
+		case sub == "grep":
+			return answeredNo{"git grep: no match"}
+		case sub == "merge-base" && contains(rest, "--is-ancestor"):
+			return answeredNo{"git merge-base: the first commit is not an ancestor of the second"}
+		}
+	}
 	return err
+}
+
+// counts says whether a command takes git's -N for its most commits.
+func counts(sub string) bool { return sub == "log" || sub == "rev-list" || sub == "shortlog" }
+
+func digits(s string) bool {
+	if s == "" || len(s) > 9 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// optionNames are the options a command runs with, as a refusal names them.
+func optionNames(sub string, spec gitSpec) string {
+	names := append([]string{}, spec.flags...)
+	for _, v := range spec.values {
+		names = append(names, v+" V")
+	}
+	if counts(sub) {
+		names = append(names, "-N")
+	}
+	if len(names) == 0 {
+		return "it takes no options"
+	}
+	return "it runs with " + strings.Join(names, ", ")
 }
 
 // gitArgs checks a command's arguments against its spec and returns them as git takes them.
@@ -166,6 +207,7 @@ func gitArgs(ctx context.Context, dir, sub string, spec gitSpec, rest []string) 
 	}
 	revs, pathArgs, blobs := 0, 0, 0
 	afterDash := false
+	patterned := false // grep: a pattern given, with -e or as its first word
 	for i := 0; i < len(rest); i++ {
 		a := rest[i]
 		switch {
@@ -210,9 +252,16 @@ func gitArgs(ctx context.Context, dir, sub string, spec gitSpec, rest []string) 
 					return nil, refuse("%s", err)
 				}
 				out = append(out, a)
+			case counts(sub) && digits(a[1:]): // git's -N, the most commits: as --max-count=N
+				out = append(out, "--max-count="+a[1:])
 			default:
-				return nil, refuse("%s is not an option it runs with", a)
+				return nil, refuse("%s is not an option it runs with (%s)", a, optionNames(sub, spec))
 			}
+			patterned = patterned || sub == "grep" && strings.HasPrefix(a, "-e")
+			continue
+		}
+		if sub == "grep" && !patterned { // as git reads it: with no -e, the first word is the pattern
+			out, patterned = append(out, "-e", a), true
 			continue
 		}
 		if !spec.revs {
@@ -220,7 +269,7 @@ func gitArgs(ctx context.Context, dir, sub string, spec gitSpec, rest []string) 
 		}
 		if err := isRevision(ctx, dir, a); err != nil {
 			if sub == "grep" {
-				return nil, refuse("%q is no revision of the repository (a pattern goes with -e, a path after --)", a)
+				return nil, refuse("%q is no revision of the repository (the pattern is the first word or goes with -e, a path goes after --)", a)
 			}
 			return nil, refuse("%q is no revision of the repository (a path goes after --)", a)
 		}

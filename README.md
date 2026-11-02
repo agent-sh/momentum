@@ -10,7 +10,8 @@ Status: milestone 1 (the evidence layer) in progress. See [SPEC.md](SPEC.md).
 
 ```
 momentum evidence ingest              read what is new in every configured source
-momentum evidence events --since 1d   events, newest first (--kind, --source, --harness, --until, --json)
+momentum evidence events --since 1d   events, newest first, each with its ev:ID (--kind, --source, --harness,
+                                      --actor, --until, --json)
 momentum evidence events --session ID one session's events, its subagents' among them, oldest first
 momentum evidence status              events per source and kind, and unparsed records
 momentum evidence search TEXT         stored summaries of every source holding TEXT, newest first (--source, --kind,
