@@ -86,7 +86,9 @@ const usage = `usage:
 Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json), and the
 capacity rules in its capacity section.
 The store is $MOMENTUM_HOME/momentum.db (default ~/.local/share/momentum).
-DUR is a Go duration or a number of days, e.g. 36h or 7d; WHEN is a DUR ago or a local time, e.g. 2026-01-02T15:04.
+DUR is a Go duration or a number of days, e.g. 36h or 7d; WHEN is a DUR ago, a local time (2026-01-02T15:04,
+"2026-01-02 15:04", seconds optional, or a date) or a time with its offset (2026-01-02T15:04:05+03:00,
+"2026-01-02 15:04:05 +0300").
 Exit: 0 done, 2 usage or configuration error,
 3 error (for ingest and sessions: at least one source failed, for capacity at least one rule; the others still
 ran; a report whose scan of a harness failed or was not done within 3 s still prints, exits 0 and names it on
@@ -223,6 +225,9 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	asJSON := fs.Bool("json", false, "one JSON object per line")
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
+	}
+	if fs.NArg() > 0 {
+		return usageError{strayArgs("evidence events", fs.Arg(0))}
 	}
 	if *limit <= 0 {
 		*limit = 200
@@ -402,22 +407,31 @@ func rebuild(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	return nil
 }
 
-// parseWhen is a time: a duration ago (parseSince), or a local time ("2006-01-02T15:04" or "2006-01-02 15:04",
-// seconds optional; a date) or an RFC 3339 one.
+// parseWhen is a time: a duration ago (parseSince), a local time ("2006-01-02T15:04" or "2006-01-02 15:04",
+// seconds optional; a date), or one with its offset (RFC 3339, or git's iso date: "2006-01-02 15:04:05 -0700").
 func parseWhen(s string) (time.Time, error) {
 	if d, err := parseSince(s); err == nil {
 		return time.Now().Add(-d), nil
 	}
-	if t, err := time.Parse(time.RFC3339, s); err == nil {
-		return t, nil
+	// a time with its offset keeps it: git's iso date puts it after a space
+	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05 -0700", "2006-01-02 15:04 -0700", "2006-01-02 15:04:05 -07:00", "2006-01-02 15:04:05Z07:00"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
 	}
-	// agents write a local time with a T or with a space, as git and most logs print it
+	// agents write a local time with a T or with a space, as momentum and many logs print it
 	for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02T15:04", "2006-01-02 15:04:05", "2006-01-02 15:04", "2006-01-02"} {
 		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
 			return t, nil
 		}
 	}
-	return time.Time{}, fmt.Errorf("bad time %q: a duration (36h, 7d) or a time (2006-01-02T15:04 or 2006-01-02 15:04)", s)
+	return time.Time{}, fmt.Errorf(`bad time %q: a duration (36h, 7d), a local time (2006-01-02T15:04 or "2006-01-02 15:04") or one with its offset (2006-01-02T15:04:05+03:00 or "2006-01-02 15:04:05 +0300")`, s)
+}
+
+// strayArgs is the refusal of a command that takes no arguments: most often a time with a space, unquoted, which
+// the shell split.
+func strayArgs(cmd, arg string) string {
+	return fmt.Sprintf("%s takes no arguments, got %q (a time with a space goes in quotes)", cmd, arg)
 }
 
 // parseSince accepts a Go duration or a whole number of days ("7d").

@@ -129,7 +129,15 @@ func TestTranscriptsFromTheConfigAndASessionInOrder(t *testing.T) {
 	}
 }
 
+// inZone runs a test in a zone that is not UTC, so a time read in UTC where a local one was meant shows.
+func inZone(t *testing.T) {
+	l := time.Local
+	time.Local = time.FixedZone("UTC+3", 3*60*60)
+	t.Cleanup(func() { time.Local = l })
+}
+
 func TestWhenIsADurationOrALocalTime(t *testing.T) {
+	inZone(t)
 	for _, s := range []string{"36h", "7d", "2026-10-20T10:00", "2026-10-20T10:00:05", "2026-10-20", "2026-10-20T10:00:05+03:00"} {
 		if _, err := parseWhen(s); err != nil {
 			t.Errorf("%s: %v", s, err)
@@ -143,17 +151,40 @@ func TestWhenIsADurationOrALocalTime(t *testing.T) {
 	}
 }
 
-// A local time with a space, as git and most logs print it, is the same time as with a T.
+// A local time with a space, as momentum and many logs print it, is the same time as with a T; one with its offset
+// after a space, as git's iso date prints it, keeps the offset.
 func TestALocalTimeTakesASpace(t *testing.T) {
+	inZone(t)
 	for s, want := range map[string]time.Time{
-		"2026-10-20 10:00":    time.Date(2026, 10, 20, 10, 0, 0, 0, time.Local),
-		"2026-10-20 10:00:05": time.Date(2026, 10, 20, 10, 0, 5, 0, time.Local),
+		"2026-10-20 10:00":           time.Date(2026, 10, 20, 10, 0, 0, 0, time.Local),
+		"2026-10-20 10:00:05":        time.Date(2026, 10, 20, 10, 0, 5, 0, time.Local),
+		"2026-10-20 10:00:05 +0000":  time.Date(2026, 10, 20, 10, 0, 5, 0, time.UTC),
+		"2026-10-20 10:00 -0130":     time.Date(2026, 10, 20, 11, 30, 0, 0, time.UTC),
+		"2026-10-20 10:00:05 +02:00": time.Date(2026, 10, 20, 8, 0, 5, 0, time.UTC),
+		"2026-10-20 10:00:05Z":       time.Date(2026, 10, 20, 10, 0, 5, 0, time.UTC),
 	} {
 		if got, err := parseWhen(s); err != nil || !got.Equal(want) {
 			t.Errorf("%s: %v %v", s, got, err)
 		}
 	}
-	if _, err := parseWhen("2026-10-20 10"); err == nil || !strings.Contains(err.Error(), "2006-01-02 15:04") {
-		t.Errorf("a refusal names both forms: %v", err)
+	_, err := parseWhen("2026-10-20 10")
+	if err == nil || !strings.Contains(err.Error(), `"2006-01-02 15:04"`) || !strings.Contains(err.Error(), `"2006-01-02 15:04:05 +0300"`) {
+		t.Errorf("a refusal names the forms: %v", err)
+	}
+}
+
+// A spaced time the shell split for want of quotes is refused, not read as its date's midnight with the rest of
+// the command dropped.
+func TestASplitTimeIsRefused(t *testing.T) {
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	for _, args := range [][]string{
+		{"evidence", "events", "--since", "2026-10-20", "10:00", "--until", "2026-10-20 12:00"},
+		{"supervise", "replay", "--since", "2026-10-20", "10:00"},
+	} {
+		code, _, diag := momentum(args...)
+		if code != 2 || !strings.Contains(diag, `got "10:00"`) || !strings.Contains(diag, "in quotes") {
+			t.Errorf("%v: exit %d %s", args, code, diag)
+		}
 	}
 }

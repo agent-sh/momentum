@@ -37,6 +37,9 @@ func replay(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
 	}
+	if fs.NArg() > 0 {
+		return usageError{strayArgs("supervise replay", fs.Arg(0))}
+	}
 	from, err := parseWhen(*since)
 	if err != nil {
 		return usageError{err.Error()}
