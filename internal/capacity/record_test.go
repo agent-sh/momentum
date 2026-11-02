@@ -803,7 +803,8 @@ func TestAFillNoteReadsOnlyItsOwnFillsWriters(t *testing.T) {
 	cp := fakeProc{pid: 53, ppid: 1, argv: []string{"cp"}, cwd: dir, written: 2 << 30, start: 145600} // 45 s before
 	fillRun(t, st, dir, now, proc(1501, cp), quiet)
 	n, _, _ := st.Note(ctx, "capacity:fill:"+dir)
-	if strings.Contains(n.Detail, "earlier") || strings.Contains(n.Detail, "other") {
+	// by their pids: the temporary directory the note names may hold either word
+	if strings.Contains(n.Detail, "(pid 51)") || strings.Contains(n.Detail, "(pid 52)") {
 		t.Errorf("the note names this fill's writers on this disk only: %s", n.Detail)
 	}
 	if !strings.Contains(n.Detail, "cp (pid 53) wrote 2.0 GiB in 45s") {

@@ -411,7 +411,10 @@ func TestAFullDiskIsNotAFastFill(t *testing.T) {
 // build, whose run failed on the id, left the full stretch's mark with no note: the note comes, dated from the mark.
 func TestADiskWhosePathHoldsASpaceHasItsNotes(t *testing.T) {
 	ctx := context.Background()
-	dir := filepath.Join(t.TempDir(), "my disk")
+	// the disk by a relative path: a note's title is clipped at TitleMax characters, which a deep temporary
+	// directory would reach inside the words the checks read
+	t.Chdir(t.TempDir())
+	dir := "my disk"
 	must(t, os.MkdirAll(dir, 0o755))
 	st := openStore(t)
 	now := time.Now()
@@ -471,10 +474,8 @@ func TestADiskWhosePathHoldsASpaceHasItsNotes(t *testing.T) {
 	if n, _, _ := st.Note(ctx, "capacity:full:"+key); n.Done.IsZero() {
 		t.Errorf("a full note that stands with no mark goes once the disk is below the line: %+v", n)
 	}
-	// a title is clipped at TitleMax characters, which a long temporary directory reaches inside this prefix
-	prefix := dir + " filled fast from "
 	if n, ok, _ := st.Note(ctx, "capacity:filled:"+key); !ok || n.Kind != store.NoteDecided ||
-		!strings.HasPrefix(n.Title, prefix) && !(strings.HasSuffix(n.Title, "…") && strings.HasPrefix(prefix, strings.TrimSuffix(n.Title, "…"))) {
+		!strings.HasPrefix(n.Title, dir+" filled fast from ") {
 		t.Errorf("the fill that ended is a decided note: %+v", n)
 	}
 }

@@ -423,7 +423,18 @@ func tmuxServer(t *testing.T) (sock string, run func(args ...string) string) {
 		t.Skip("no tmux")
 	}
 	dir := t.TempDir()
-	sock = filepath.Join(dir, "tmux.sock")
+	// a socket's path holds at most 107 bytes, which a deep temporary directory passes: the socket goes in the
+	// runtime directory, where sockets belong, when there is one
+	sockDir := dir
+	if rt := os.Getenv("XDG_RUNTIME_DIR"); rt != "" {
+		d, err := os.MkdirTemp(rt, "momentum-test-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.RemoveAll(d) })
+		sockDir = d
+	}
+	sock = filepath.Join(sockDir, "tmux.sock")
 	// The server and its shells get a home of their own: an interactive shell saves its history there, not in
 	// the home of whoever runs the test.
 	env := append(os.Environ(), "HOME="+dir, "HISTFILE="+filepath.Join(dir, "history"))
