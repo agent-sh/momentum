@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -431,7 +432,7 @@ func TestADiskWhosePathHoldsASpaceHasItsNotes(t *testing.T) {
 	}
 	key := strings.ReplaceAll(dir, " ", "%20")
 	for _, id := range []string{"capacity:fill:" + key, "capacity:full:" + key} {
-		if n, ok, _ := st.Note(ctx, id); !ok || n.Kind != store.NoteProblem || !n.Done.IsZero() || !strings.HasPrefix(n.Title, dir+" is ") {
+		if n, ok, _ := st.Note(ctx, id); !ok || n.Kind != store.NoteProblem || !n.Done.IsZero() || !strings.HasPrefix(n.Title, plain.Clip(dir+" is ", store.TitleMax)) {
 			t.Errorf("%s: a problem note that names the disk as it is: %+v", id, n)
 		}
 	}
@@ -472,7 +473,7 @@ func TestADiskWhosePathHoldsASpaceHasItsNotes(t *testing.T) {
 		t.Errorf("a full note that stands with no mark goes once the disk is below the line: %+v", n)
 	}
 	if n, ok, _ := st.Note(ctx, "capacity:filled:"+key); !ok || n.Kind != store.NoteDecided ||
-		!strings.HasPrefix(n.Title, dir+" filled fast from ") {
+		!strings.HasPrefix(n.Title, plain.Clip(dir+" filled fast from ", store.TitleMax)) {
 		t.Errorf("the fill that ended is a decided note: %+v", n)
 	}
 }

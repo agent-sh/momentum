@@ -1,0 +1,229 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+)
+
+// The improvement loop's record of its own runs: one row for each run of its agent on a case, what the run was
+// for, how it ended, what it cost and where its files are. It is kept: what a run spent cannot be read again, and
+// the loop's budgets and its stop rule read it.
+const loopTables = `
+CREATE TABLE IF NOT EXISTS loop_runs (id TEXT PRIMARY KEY, case_id TEXT NOT NULL, family TEXT NOT NULL, step TEXT NOT NULL,
+  started INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, failure TEXT NOT NULL DEFAULT '',
+  cost_usd REAL NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0, turns INTEGER NOT NULL DEFAULT 0,
+  model TEXT NOT NULL DEFAULT '', dir TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
+  experiment TEXT NOT NULL DEFAULT '');
+`
+
+var loopTableNames = []string{"loop_runs"}
+
+const loopIndexes = `
+CREATE INDEX IF NOT EXISTS loop_runs_case ON loop_runs(case_id, started);
+CREATE INDEX IF NOT EXISTS loop_runs_started ON loop_runs(started);
+`
+
+var loopIndexNames = []string{"loop_runs_case", "loop_runs_started"}
+
+// LoopRun statuses.
+const (
+	RunRunning = "running" // started, not ended: a run killed midway stays so, and counts its budget in full
+	RunOK      = "ok"      // the agent finished and reported
+	RunFailed  = "failed"  // the agent or a tool failed; Failure says how
+	RunBudget  = "budget"  // it reached its budget
+	RunTurns   = "turns"   // it reached its turns
+	RunTimeout = "timeout" // it ran out of its time and was stopped
+	RunRefused = "refused" // a gate refused to start it (no budget left, a case blocked)
+)
+
+// LoopRun is one run of the loop's agent on a case.
+type LoopRun struct {
+	ID, Case, Family, Step string
+	Started, Ended         time.Time
+	Status, Failure        string
+	USD                    float64 // reservation while running; charged cost after completion
+	Tokens                 int64
+	Turns                  int
+	Model, Dir, Summary    string
+	Experiment             string // "" for a live run; otherwise what it was (an evaluation's task and trial)
+}
+
+// ErrNoRun means no run has the id.
+var ErrNoRun = errors.New("no loop run has this id")
+
+// PutLoopRun stores a run, or replaces the run of its id: a run is put when it starts, and again when it ends.
+func (s *Store) PutLoopRun(ctx context.Context, r LoopRun) error {
+	if r.ID == "" || r.Step == "" || r.Status == "" || r.Started.IsZero() {
+		return fmt.Errorf("a loop run needs an id, a step, a status and a start")
+	}
+	var ended int64
+	if !r.Ended.IsZero() {
+		ended = r.Ended.UnixMilli()
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO loop_runs (id, case_id, family, step, started, ended, status, failure, cost_usd,
+	  tokens, turns, model, dir, summary, experiment) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	  ON CONFLICT(id) DO UPDATE SET case_id = excluded.case_id, family = excluded.family, step = excluded.step,
+	    started = excluded.started, ended = excluded.ended, status = excluded.status, failure = excluded.failure,
+	    cost_usd = excluded.cost_usd, tokens = excluded.tokens, turns = excluded.turns, model = excluded.model,
+	    dir = excluded.dir, summary = excluded.summary, experiment = excluded.experiment`,
+		r.ID, r.Case, r.Family, r.Step, r.Started.UnixMilli(), ended, r.Status, caseText(r.Failure, 400), r.USD, r.Tokens, r.Turns,
+		r.Model, r.Dir, caseText(r.Summary, caseTextMax), r.Experiment)
+	return err
+}
+
+const loopColumns = `id, case_id, family, step, started, ended, status, failure, cost_usd, tokens, turns, model, dir, summary, experiment`
+
+func scanRuns(rows *sql.Rows, err error) ([]LoopRun, error) {
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LoopRun
+	for rows.Next() {
+		var r LoopRun
+		var started, ended int64
+		if err := rows.Scan(&r.ID, &r.Case, &r.Family, &r.Step, &started, &ended, &r.Status, &r.Failure, &r.USD, &r.Tokens,
+			&r.Turns, &r.Model, &r.Dir, &r.Summary, &r.Experiment); err != nil {
+			return nil, err
+		}
+		r.Started = time.UnixMilli(started)
+		if ended != 0 {
+			r.Ended = time.UnixMilli(ended)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// LoopRunByID reads one run.
+func (s *Store) LoopRunByID(ctx context.Context, id string) (LoopRun, error) {
+	rs, err := scanRuns(s.db.QueryContext(ctx, `SELECT `+loopColumns+` FROM loop_runs WHERE id = ?`, id))
+	if err != nil {
+		return LoopRun{}, err
+	}
+	if len(rs) == 0 {
+		return LoopRun{}, fmt.Errorf("%w: %q", ErrNoRun, id)
+	}
+	return rs[0], nil
+}
+
+// RunFilter selects runs: of one case, since a time, live ones or one experiment's, at most Limit of them.
+type RunFilter struct {
+	Case       string
+	Since      time.Time
+	Experiment *string // nil: every run; "": the live ones
+	Limit      int
+}
+
+// LoopRuns lists runs, the newest first.
+func (s *Store) LoopRuns(ctx context.Context, f RunFilter) ([]LoopRun, error) {
+	where, args := []string{"started >= ?"}, []any{f.Since.UnixMilli()}
+	if f.Case != "" {
+		where, args = append(where, "case_id = ?"), append(args, f.Case)
+	}
+	if f.Experiment != nil {
+		where, args = append(where, "experiment = ?"), append(args, *f.Experiment)
+	}
+	q := `SELECT ` + loopColumns + ` FROM loop_runs WHERE ` + strings.Join(where, " AND ") + ` ORDER BY started DESC, id DESC`
+	if f.Limit > 0 {
+		q, args = q+` LIMIT ?`, append(args, f.Limit)
+	}
+	return scanRuns(s.db.QueryContext(ctx, q, args...))
+}
+
+// LoopSpend is what the live runs that started since a time spent, in US dollars. A run still running counts its
+// budget in full (reserved), since what it spends is known only when it ends.
+func (s *Store) LoopSpend(ctx context.Context, since time.Time, reserved float64) (float64, error) {
+	var spent float64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN status = ? AND cost_usd = 0 THEN ? ELSE cost_usd END), 0)
+ FROM loop_runs WHERE experiment = '' AND started >= ?`, RunRunning, reserved, since.UnixMilli()).Scan(&spent)
+	return spent, err
+}
+
+// FinishLoopRun ends a reservation and charges its canonical case in one transaction, exactly once.
+func (s *Store) FinishLoopRun(ctx context.Context, r LoopRun) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var id, status string
+	var started int64
+	if err := tx.QueryRowContext(ctx, `SELECT case_id, status, started FROM loop_runs WHERE id = ?`, r.ID).Scan(&id, &status, &started); err != nil {
+		return err
+	}
+	if status != RunRunning {
+		return nil
+	}
+	if r.Status == RunRunning || r.Ended.IsZero() || r.USD < 0 {
+		return fmt.Errorf("invalid run completion")
+	}
+	c, err := live(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET cost_usd = cost_usd + ?, cost_tokens = cost_tokens + ?, cost_ms = cost_ms + ?,
+ runs = runs + 1, updated = ? WHERE id = ?`, r.USD, r.Tokens, max(int64(0), r.Ended.UnixMilli()-started), r.Ended.UnixMilli(), c.ID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE loop_runs SET ended = ?, status = ?, failure = ?, cost_usd = ?, tokens = ?, turns = ?, model = ?, summary = ? WHERE id = ?`,
+		r.Ended.UnixMilli(), r.Status, caseText(r.Failure, 400), r.USD, r.Tokens, r.Turns, r.Model, caseText(r.Summary, caseTextMax), r.ID); err != nil {
+		return err
+	}
+	if err := caseLog(ctx, tx, c.ID, "loop:"+r.ID, "run", r.Step+" "+r.ID+": "+r.Status+" "+r.Failure+" "+r.Summary, r.Ended); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// Lesson states on a case's log: the text reserved before tacit's write, and the receipt after it.
+const (
+	LessonReserved  = "publishing"
+	LessonPublished = "published"
+)
+
+// BeginLesson reserves a case's lesson before tacit's write, and returns the text to write: the one reserved first,
+// so a write tried again after one that failed partway writes the same lesson (tacit takes the same name and text
+// as the same fact). ok is false when the lesson is published already.
+func (s *Store) BeginLesson(ctx context.Context, id, text string) (string, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", false, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT action, detail FROM case_log WHERE case_id = ? AND action IN (?, ?) ORDER BY seq`, id,
+		LessonReserved, LessonPublished)
+	if err != nil {
+		return "", false, err
+	}
+	reserved := ""
+	for rows.Next() {
+		var action, detail string
+		if err := rows.Scan(&action, &detail); err != nil {
+			rows.Close()
+			return "", false, err
+		}
+		if action == LessonPublished {
+			rows.Close()
+			return "", false, nil
+		}
+		if reserved == "" {
+			reserved = detail
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return "", false, err
+	}
+	if reserved != "" {
+		return reserved, true, nil
+	}
+	if err := caseLog(ctx, tx, id, "loop", LessonReserved, text, time.Now()); err != nil {
+		return "", false, err
+	}
+	return caseText(text, caseTextMax), true, tx.Commit()
+}

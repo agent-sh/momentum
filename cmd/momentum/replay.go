@@ -41,6 +41,17 @@ func replay(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	if err != nil {
 		return usageError{err.Error()}
 	}
+	if os.Getenv("MOMENTUM_LOOP_RUN") != "" {
+		var refused string
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "points" || f.Name == "labels" {
+				refused = f.Name
+			}
+		})
+		if refused != "" {
+			return usageError{"in a loop run, --" + refused + " is refused; read replay output"}
+		}
+	}
 	to := time.Now()
 	if *until != "" {
 		if to, err = parseWhen(*until); err != nil {

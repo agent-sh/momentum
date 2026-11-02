@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/config"
+	"github.com/agent-sh/momentum/internal/loop"
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/source"
@@ -32,6 +34,13 @@ const usage = `usage:
                                         events, newest first; one session's (an id or its start) oldest first;
                                         H is claude, codex, pi, opencode or hermes
   momentum evidence status [--since DUR]   events per source and kind, and unparsed records
+  momentum evidence show ID             an event, and the record of the transcript or log it names (scrubbed)
+  momentum evidence git DIR GITCOMMAND [ARG]... [-- PATH...]
+                                        a git command that reads (log, show, diff, blame, grep, ...) in DIR's
+                                        work tree, with only the options that read; revisions are checked,
+                                        paths come after --
+  momentum evidence file PATH [--tail N]   a file of the machine, scrubbed of secrets; not where credentials are
+  momentum evidence unit NAME [--lines N]  a user service's state and the end of its log, scrubbed
   momentum evidence rebuild SOURCE [--force]
                                         drop what SOURCE contributed; the next ingest reads it from the start
                                         (not sessions; transcripts and incidents only with --force: it says how
@@ -82,6 +91,23 @@ const usage = `usage:
                                         R is not-worth-it, insufficient-evidence, already-solved or duplicate
   momentum case reopen ID --evidence REF... [--at WHEN] --why W
                                         a closed case comes back only on evidence it does not hold
+  momentum loop [--dry] [--family F,F] [--case ID] [--json]
+                                        the improvement loop, once: detect, take each family's case a step with the
+                                        harness's agent, review and land what was proposed
+  momentum loop runs [--since WHEN] [--case ID] [--json]
+                                        the loop's runs, and what the live ones spent in the last day and week
+  momentum loop lesson --case ID --text T
+                                        a case closed as improved: its lesson to tacit, as the loop's observation
+  momentum ship prepare --repo DIR [--case ID]
+  momentum ship check --test CMD [--test-files F,F] [--case ID]
+  momentum ship propose --title T --body-file F --rollback R --signal JSON [--window D] [--lesson L] [--case ID]
+  momentum ship status [--case ID] [--json]
+  momentum ship land ID
+  momentum ship rollback ID --why W
+                                        a case's change package: built in the loop's own work tree, checked by a
+                                        test that fails without it, proposed as a pull request with its
+                                        measurement and rollback, revised for its review, landed only live and
+                                        reviewed clean
   momentum version
 Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json), and the
 capacity rules in its capacity section.
@@ -100,7 +126,30 @@ func main() {
 	os.Exit(run(context.Background(), os.Args[1:], os.Stdout, os.Stderr))
 }
 
+// run runs a command. Inside one of the loop's runs, all a command prints is scrubbed whole after it ends, both
+// streams, before any of it is written: a run reads nothing of momentum's that the secret scrubber has not passed.
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if os.Getenv("MOMENTUM_LOOP_RUN") == "" {
+		return runCommand(ctx, args, stdout, stderr)
+	}
+	var out, diag bytes.Buffer
+	code := runCommand(ctx, args, &out, &diag)
+	cleanOut, outErr := loop.Redact(ctx, out.String())
+	cleanDiag, diagErr := loop.Redact(ctx, diag.String())
+	if outErr != nil || diagErr != nil {
+		fmt.Fprintln(stderr, "momentum: the secret scrubber did not run, so nothing of this command is shown")
+		return 3
+	}
+	if _, err := io.WriteString(stdout, cleanOut); err != nil {
+		return 3
+	}
+	if _, err := io.WriteString(stderr, cleanDiag); err != nil {
+		return 3
+	}
+	return code
+}
+
+func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, usage)
 		return 2
@@ -121,6 +170,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		err = capacityCmd(ctx, args[1:], stdout, stderr)
 	case "case":
 		err = caseCmd(ctx, args[1:], stdout, stderr)
+	case "loop":
+		err = loopCmd(ctx, args[1:], stdout, stderr)
+	case "ship":
+		err = shipCmd(ctx, args[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintln(stdout, "momentum", version)
 	case "-h", "--help", "help":
@@ -151,9 +204,17 @@ func evidence(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	case "events":
 		return events(ctx, args[1:], stdout, stderr)
 	case "status":
-		return status(ctx, args[1:], stdout)
+		return status(ctx, args[1:], stdout, stderr)
 	case "rebuild":
 		return rebuild(ctx, args[1:], stdout, stderr)
+	case "git":
+		return evidenceGit(ctx, args[1:], stdout, stderr)
+	case "show":
+		return evidenceShow(ctx, args[1:], stdout, stderr)
+	case "file":
+		return evidenceFile(ctx, args[1:], stdout, stderr)
+	case "unit":
+		return evidenceUnit(ctx, args[1:], stdout, stderr)
 	}
 	return usageError{fmt.Sprintf("unknown evidence command %q", args[0])}
 }
@@ -213,6 +274,7 @@ func ingest(ctx context.Context, stdout, stderr io.Writer) error {
 
 func events(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("events", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	since := fs.String("since", "1d", "how far back, or from when (one session: its start)")
 	until := fs.String("until", "", "until when")
 	kinds := fs.String("kind", "", "comma-separated kinds")
@@ -291,8 +353,9 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	return nil
 }
 
-func status(ctx context.Context, args []string, stdout io.Writer) error {
+func status(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	since := fs.String("since", "7d", "how far back")
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
