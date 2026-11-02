@@ -43,7 +43,7 @@ func scrubbed(ctx context.Context, w io.Writer, text string) error {
 
 // evidenceShow prints an event of the store and, where its reference names a record of a transcript or a log
 // (path@offset), that record as the file holds it, scrubbed. A scan place names the next record, not the event.
-// With MOMENTUM_NOW set, only a record whose own timestamp precedes that end is shown.
+// With MOMENTUM_NOW set, a record dated at or after that end is withheld, and so is an undated one a scan place names.
 func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
 		return usageError{"evidence show takes one event: its id, or ev:ID"}
@@ -111,17 +111,25 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		}
 		_ = json.Unmarshal(line, &record)
 		at, err := time.Parse(time.RFC3339Nano, record.Timestamp)
-		if err != nil || at.IsZero() {
-			output.WriteString("  (record withheld: no valid timestamp)\n")
-		} else if !at.Before(end) {
+		switch {
+		case err == nil && !at.IsZero() && !at.Before(end):
 			output.WriteString("  (record withheld: timestamp is at or after the evaluation end)\n")
-		} else {
+		case err == nil && !at.IsZero(), !scanPlace(e.Source):
+			// an event's own record is as old as the event, which the snapshot bounds, whatever its format dates it by
 			output.Write(line)
+		default:
+			output.WriteString("  (record withheld: no valid timestamp)\n")
 		}
 	} else {
 		output.Write(line)
 	}
 	return scrubbed(ctx, stdout, output.String())
+}
+
+// scanPlace says whether a source's references name a scan's place in a transcript (how far it had read), whose
+// record is the next one written, rather than the event's own record.
+func scanPlace(source string) bool {
+	return source == store.Sessions || source == store.Supervise
 }
 
 // placeOf splits a reference (path@offset, with #index) into its file and the offset of its record.

@@ -99,6 +99,44 @@ func TestEvidenceShowWithholdsRecordsAtOrAfterTheEnd(t *testing.T) {
 
 }
 
+// An event's own record is shown in an evaluation whatever its format dates it by: the snapshot already bounds the
+// event, and only a scan place names a record that is not the event's.
+func TestEvidenceShowKeepsAnEventsOwnRecordInAnEvaluation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	fakeScrubber(t)
+	ctx := context.Background()
+	end := time.Now().Add(-40 * 24 * time.Hour).Truncate(time.Second)
+	t.Setenv("MOMENTUM_NOW", end.Format(time.RFC3339Nano))
+	t.Setenv("MOMENTUM_EVAL", "fixture")
+	t.Setenv("MOMENTUM_LOOP_RUN", "fixture-run")
+	log := filepath.Join(t.TempDir(), "events.jsonl")
+	first := `{"ts":"2026-01-01T00:00:00","kind":"tool-error","session":"s1","cwd":"/w","model":"m"}` + "\n"
+	own := `{"ts":"2026-01-01T00:01:00","kind":"tool-error","session":"s1","cwd":"/w","model":"m","detail":"the lock was taken twice"}` + "\n"
+	if err := os.WriteFile(log, []byte(first+own), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(t.TempDir(), "source.db")
+	st, err := store.Open(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev := store.Event{Source: "mistakes", SourceKey: "events.jsonl@1", TS: end.Add(-time.Hour), Session: "s1", Harness: "claude",
+		Actor: store.ActorTool, Kind: "tool-error", Summary: "tool-error: the lock was taken twice", Ref: fmt.Sprintf("%s@%d", log, len(first))}
+	if _, err := st.Put(ctx, []store.Event{ev}); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	if err := store.AsOf(ctx, src, paths.DB(), end.Add(-30*24*time.Hour), end); err != nil {
+		t.Fatal(err)
+	}
+	code, out, diag := momentum("evidence", "show", ev.ID())
+	if code != 0 || !strings.Contains(out, `"detail":"the lock was taken twice"`) || strings.Contains(out, "withheld") {
+		t.Fatalf("own record: %d %s %s", code, out, diag)
+	}
+}
+
 // Replay refuses evaluation requests before help can disclose the compiled rules' waits.
 func TestEvaluationRefusesReplayBeforeParsingFlags(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
