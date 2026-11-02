@@ -245,6 +245,9 @@ func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if len(args) > 0 && args[0] == "lesson" {
 		return loopLesson(ctx, args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "eval" {
+		return loopEval(ctx, args[1:], stdout, stderr)
+	}
 	fs := flag.NewFlagSet("loop", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	dry := fs.Bool("dry", false, "pick each family's case and step, and run nothing")

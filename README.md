@@ -13,6 +13,9 @@ momentum evidence ingest              read what is new in every configured sourc
 momentum evidence events --since 1d   events, newest first (--kind, --source, --harness, --until, --json)
 momentum evidence events --session ID one session's events, its subagents' among them, oldest first
 momentum evidence status              events per source and kind, and unparsed records
+momentum evidence search TEXT         stored summaries of every source holding TEXT, newest first (--source, --kind,
+                                      --actor, --session, --since, --until, --limit)
+momentum evidence show ID             an event, with the record of the transcript or log it names
 momentum evidence rebuild SOURCE      drop a source's events; the next ingest reads it again
                                       (not sessions; transcripts only with --force)
 ```
@@ -157,11 +160,14 @@ A case is one answer in progress to a standing question: its family, its evidenc
 momentum loop [--dry] [--family F,F] [--case ID] [--json]
 momentum loop runs [--since WHEN] [--case ID] [--json]
 momentum loop lesson --case ID --text T
+momentum loop eval [--golden FILE] [--task ID,ID] [--trials K] [--arms loop,native] [--budget USD] [--parallel N] [--json]
 momentum measure [--dry] [--family F,F] [--case ID] [--json]
 momentum ship prepare|check|propose|status|land|rollback ...
 ```
 
 The improvement loop takes each family's case one step a run: investigate it, build its change (or revise it for its review), or publish its lesson. A step is one run of the harness's own agent (Claude Code in print mode, bare and restricted, Opus 5.5 with Sonnet 5.5 when Opus's safeguards refuse), with the loop's procedure and the family's skill in its system prompt, the harness's permissions in dontAsk mode (its file tools reach only its directories; it reads the rest of the machine through momentum's commands, which scrub secrets; it writes only in its run's directory and its case's work tree), and a budget per run, per case, per day and per week. A case whose runs fail the same way twice stops, and the loop opens a case about itself.
+
+`loop eval` is the gate before the loop goes live: it runs the loop's investigation and the native path on a golden set kept on the machine, real past problems with verified root causes, each as of the moment its case could have opened (the store and the repositories as they stood then, no reading of the machine as it is now), several times, and a clean-context judge grades whether each reached the cause. It prints, per arm, the causes reached, pass@k and pass^k, the cost and time per cause reached, the tasks that flipped, and a paired bootstrap over tasks of the difference; `results.json` keeps every trial.
 
 Inside a run, everything momentum prints is scrubbed whole before the run reads it, including replay, whose file flags are refused. File evidence is scrubbed whole before line selection; files over 64 MiB are refused. Git outside a sandbox reads no attributes from the tree and refuses repository settings that name programs; ship authenticates through its own GitHub credential helper, and every push and review post checks its repository again, which goes only where origin's fetch and push addresses agree. A case with a run in flight waits for it.
 

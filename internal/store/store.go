@@ -946,6 +946,7 @@ type Query struct {
 	ExcludeCwd string // exclude this directory and its descendants
 	Main       bool   // only a session's own events, not its subagents'
 	MetaHas    string // when set, only events whose meta holds it, e.g. `"is_error":true`
+	Text       string // when set, only events whose summary holds it, ASCII letters in either case
 }
 
 func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
@@ -975,6 +976,10 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 	if q.MetaHas != "" {
 		where, args = append(where, "instr(meta, ?) > 0"), append(args, q.MetaHas)
 	}
+	if q.Text != "" {
+		esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q.Text)
+		where, args = append(where, `summary LIKE ? ESCAPE '\'`), append(args, "%"+esc+"%")
+	}
 	order := "ts DESC, source_key DESC"
 	if q.Session != "" {
 		// An id or its first characters (a range the session index serves), and the threads under it at any
@@ -985,7 +990,9 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 		    UNION SELECT DISTINCT e.agent FROM events e JOIN tree ON e.session = tree.id WHERE e.agent != '' AND e.agent != e.session)
 		  SELECT id FROM tree)`)
 		args = append(args, q.Session, q.Session+"\uffff")
-		order = "ts, source_key"
+		if q.Text == "" {
+			order = "ts, source_key"
+		}
 	}
 	limit := q.Limit
 	if limit <= 0 {
@@ -1034,8 +1041,14 @@ func (s *Store) Before(ctx context.Context, session string, kinds []string, afte
 }
 
 // Counts returns events per source and kind since a time, for the status view.
-func (s *Store) Counts(ctx context.Context, since time.Time) (map[string]map[string]int, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT source, kind, COUNT(*) FROM events WHERE ts >= ? GROUP BY source, kind`, since.UnixMilli())
+func (s *Store) Counts(ctx context.Context, since time.Time, until ...time.Time) (map[string]map[string]int, error) {
+	where := "ts >= ?"
+	args := []any{since.UnixMilli()}
+	if len(until) > 0 && !until[0].IsZero() {
+		where += " AND ts < ?"
+		args = append(args, until[0].UnixMilli())
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT source, kind, COUNT(*) FROM events WHERE `+where+` GROUP BY source, kind`, args...)
 	if err != nil {
 		return nil, err
 	}

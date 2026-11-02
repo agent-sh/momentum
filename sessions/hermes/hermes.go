@@ -345,7 +345,7 @@ func epoch(f float64) time.Time {
 
 // Platforms maps every Hermes conversation in the state database under home to the platform it runs on (its
 // source: cli, tui, mobile, telegram, cron, ...). No database is no conversations.
-func Platforms(ctx context.Context, home string) (map[string]string, error) {
+func Platforms(ctx context.Context, home string, until ...time.Time) (map[string]string, error) {
 	path := filepath.Join(home, "state.db")
 	if _, err := os.Stat(path); err != nil {
 		return map[string]string{}, nil
@@ -355,7 +355,13 @@ func Platforms(ctx context.Context, home string) (map[string]string, error) {
 		return nil, err
 	}
 	defer db.Close()
-	rows, err := db.QueryContext(ctx, `select id, source from sessions`)
+	query := `select id, source from sessions`
+	var args []any
+	if len(until) > 0 {
+		query += ` where started_at < ?`
+		args = append(args, float64(until[0].Unix()))
+	}
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

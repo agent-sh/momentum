@@ -551,7 +551,7 @@ func (r *Runner) permissions(step string, c store.Case, run store.LoopRun) Setti
 	s := Settings{
 		Allow: []string{"Read", "Grep", "Glob", rule("Write", run.Dir+"/**"), rule("Edit", run.Dir+"/**"),
 			"Bash(momentum case *)", "Bash(momentum evidence events *)", "Bash(momentum evidence status *)", "Bash(momentum evidence show *)",
-			"Bash(momentum evidence git *)", "Bash(momentum evidence file *)", "Bash(momentum evidence unit *)",
+			"Bash(momentum evidence search *)", "Bash(momentum evidence git *)", "Bash(momentum evidence file *)", "Bash(momentum evidence unit *)",
 			"Bash(momentum supervise replay *)", "Bash(momentum report *)", "Bash(momentum ship status *)",
 			"Bash(tacit search *)", "Bash(tacit fact *)", "Bash(tacit tree *)", "Agent", "Task"},
 		Deny: append(CredentialDenials(), "WebFetch", "WebSearch"),

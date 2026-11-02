@@ -33,8 +33,12 @@ const usage = `usage:
                            [--limit N] [--json]
                                         events, newest first; one session's (an id or its start) oldest first;
                                         H is claude, codex, pi, opencode or hermes
-  momentum evidence status [--since DUR]   events per source and kind, and unparsed records
+  momentum evidence status [--since WHEN]   events per source and kind, and unparsed records
   momentum evidence show ID             an event, and the record of the transcript or log it names (scrubbed)
+  momentum evidence search TEXT [--source SOURCE] [--since WHEN] [--until WHEN] [--kind K,K] [--actor A] [--session ID] [--limit N]
+                                        stored summaries of every source matching TEXT, newest first, also with --session (scrubbed); flags anywhere
+                                        agent text: first 160 and last 80 bytes; calls and results: first 240
+                                        (error results keep 1,000); evidence show reads the whole record
   momentum evidence git DIR GITCOMMAND [ARG]... [-- PATH...]
                                         a git command that reads (log, show, diff, blame, grep, ...) in DIR's
                                         work tree, with only the options that read; revisions are checked,
@@ -104,6 +108,10 @@ const usage = `usage:
                                         the loop's runs, and what the live ones spent in the last day and week
   momentum loop lesson --case ID --text T
                                         a case closed as improved: its lesson to tacit, as the loop's observation
+  momentum loop eval [--golden FILE] [--trials N] [--task T,T] [--budget USD] [--parallel N] [--arms loop,native] [--json]
+                                        the golden-set evaluation: the loop's investigation of each past problem
+                                        as of its symptom, judged against its verified root cause; compares both arms
+                                        by default, or --arms loop or --arms native runs one alone
   momentum ship prepare --repo DIR [--case ID]
   momentum ship check --test CMD [--test-files F,F] [--case ID]
   momentum ship propose --title T --body-file F --rollback R --signal JSON [--window D] [--lesson L]
@@ -222,6 +230,8 @@ func evidence(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return evidenceShow(ctx, args[1:], stdout, stderr)
 	case "file":
 		return evidenceFile(ctx, args[1:], stdout, stderr)
+	case "search":
+		return evidenceSearch(ctx, args[1:], stdout, stderr)
 	case "unit":
 		return evidenceUnit(ctx, args[1:], stdout, stderr)
 	}
@@ -311,11 +321,18 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		return usageError{fmt.Sprintf("unknown harness %q: one of %s", *harness, strings.Join(store.Harnesses, ", "))}
 	}
 	var err error
-	q := store.Query{Since: from, Source: *src, Harness: *harness, Session: *session, Limit: *limit + 1}
+	now, err := commandNow()
+	if err != nil {
+		return err
+	}
+	q := store.Query{Until: now, Since: from, Source: *src, Harness: *harness, Session: *session, Limit: *limit + 1}
 	if *until != "" {
 		if q.Until, err = parseWhen(*until); err != nil {
 			return usageError{err.Error()}
 		}
+	}
+	if os.Getenv("MOMENTUM_NOW") != "" && q.Until.After(now) {
+		q.Until = now
 	}
 	st, err := store.Open(paths.DB())
 	if err != nil {
@@ -365,11 +382,11 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 func status(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	since := fs.String("since", "7d", "how far back")
+	since := fs.String("since", "7d", "how far back: a duration or a time")
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
 	}
-	d, err := parseSince(*since)
+	from, err := parseWhen(*since)
 	if err != nil {
 		return usageError{err.Error()}
 	}
@@ -378,7 +395,11 @@ func status(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		return err
 	}
 	defer st.Close()
-	counts, err := st.Counts(ctx, time.Now().Add(-d))
+	now, err := commandNow()
+	if err != nil {
+		return err
+	}
+	counts, err := st.Counts(ctx, from, now)
 	if err != nil {
 		return err
 	}
@@ -474,11 +495,27 @@ func rebuild(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	return nil
 }
 
+// commandNow pins evidence commands to the evaluation's clock. A bad clock fails closed.
+func commandNow() (time.Time, error) {
+	if s := os.Getenv("MOMENTUM_NOW"); s != "" {
+		t, err := time.Parse(time.RFC3339Nano, s)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("bad MOMENTUM_NOW: %w", err)
+		}
+		return t, nil
+	}
+	return time.Now(), nil
+}
+
 // parseWhen is a time: a duration ago (parseSince), or a local time ("2006-01-02T15:04", seconds optional)
 // or an RFC 3339 one.
 func parseWhen(s string) (time.Time, error) {
 	if d, err := parseSince(s); err == nil {
-		return time.Now().Add(-d), nil
+		now, err := commandNow()
+		if err != nil {
+			return time.Time{}, err
+		}
+		return now.Add(-d), nil
 	}
 	if t, err := time.Parse(time.RFC3339, s); err == nil {
 		return t, nil
