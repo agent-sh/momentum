@@ -59,7 +59,8 @@ const (
 	Revising   = "revising" // a review found something: back to its build, on the same branch and pull request
 	Landed     = "landed"
 	RolledBack = "rolled back"
-	Kept       = "kept" // its case closed as improved: the change stays, and a regression builds another
+	Kept       = "kept"    // its case closed as improved: the change stays, and a regression builds another
+	Dropped    = "dropped" // ended before its proposal, its case closed or sent back: its work tree and branch are gone
 )
 
 // MaxRounds is how many review rounds a package gets: prs.md's three.
@@ -181,11 +182,11 @@ func (s *Ship) now() time.Time {
 func (s *Ship) pkgDir(c string) string  { return filepath.Join(s.Dir, "packages", c) }
 func (s *Ship) workDir(c string) string { return filepath.Join(s.Dir, "work", c) }
 
-// ChangeOpen says whether a case's change is in progress (prepared, checked, proposed, revising or landing: any
-// package but a landed, rolled-back or kept one), and its state. The build that finds it resumes it, and its review
-// decides: closing the case, sending it back or merging it by a root would leave its work tree, and its pull
-// request when it has one, with nothing in the loop to return to them. A package that cannot be read counts as
-// open.
+// ChangeOpen says whether a case's change is on its pull request (proposed, revising, landing, or checked again
+// after a review), and its state: its review decides it, so no run closes the case, sends it back or merges it by a
+// root, which would leave the pull request with nothing in the loop to return to it. A change before its proposal
+// (prepared, or checked with no pull request) is the build's to resume or to end: when its case leaves testing, the
+// next loop run drops it (Drop). A package that cannot be read counts as open.
 func (s *Ship) ChangeOpen(caseID string) (string, bool) {
 	if s == nil {
 		return "", false
@@ -194,7 +195,42 @@ func (s *Ship) ChangeOpen(caseID string) (string, bool) {
 	if err != nil {
 		return "unreadable", true
 	}
-	return p.State, ok && !slices.Contains([]string{Landed, RolledBack, Kept}, p.State)
+	return p.State, ok && (slices.Contains([]string{Proposed, Revising, Landing}, p.State) || p.State == Checked && p.PR != "")
+}
+
+// unproposed says whether a case's change is before its proposal: prepared, or checked with no pull request.
+func unproposed(p Package) bool { return p.State == Prepared || p.State == Checked && p.PR == "" }
+
+// Drop ends a change before its proposal whose case left testing (closed, sent back or merged into another): its
+// work tree and its branch go, and its record stays, dropped, until the case's next prepare keeps it in past/. A
+// change on its pull request is its review's, and is refused.
+func (s *Ship) Drop(ctx context.Context, caseID, why string) (Package, error) {
+	p, ok, err := s.Load(caseID)
+	if err != nil {
+		return Package{}, err
+	}
+	if !ok || !unproposed(p) {
+		return p, refused("case %s has no change before its proposal to drop", caseID)
+	}
+	if p.Work != "" {
+		if p.Dir != "" {
+			s.git(ctx, p.Dir, "worktree", "remove", "--force", p.Work)
+		}
+		if err := os.RemoveAll(p.Work); err != nil {
+			return p, err
+		}
+	}
+	if p.Dir != "" {
+		s.git(ctx, p.Dir, "worktree", "prune")
+		if p.Branch != "" {
+			s.git(ctx, p.Dir, "branch", "-D", p.Branch)
+		}
+	}
+	p.State = Dropped
+	if err := s.save(&p); err != nil {
+		return p, err
+	}
+	return p, s.Store.CaseNote(ctx, caseID, "dropped", why, s.Actor)
 }
 
 // Load reads a case's package; ok is false when it has none.
@@ -251,9 +287,9 @@ func (s *Ship) public(ctx context.Context, text string) (string, error) {
 }
 
 // Prepare makes the case's work tree: a branch of the repository's default branch in a worktree of the loop's
-// own, once the gate allows the repository. A case has one package at a time; one rolled back, or kept by a case
-// that came back regressed, can be prepared again: its old work tree and branch go first, and its record is kept
-// beside the new one (past/).
+// own, once the gate allows the repository. A case has one package at a time; one rolled back, dropped, or kept by
+// a case that came back regressed, can be prepared again: its old work tree and branch go first, and its record is
+// kept beside the new one (past/).
 func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, error) {
 	c, err := s.working(ctx, caseID)
 	if err != nil {
@@ -263,7 +299,7 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	if err != nil {
 		return Package{}, err
 	}
-	if had && old.State != RolledBack && old.State != Kept {
+	if had && old.State != RolledBack && old.State != Kept && old.State != Dropped {
 		return old, refused("case %s has a package %s already (in %s)", c.ID, old.State, old.Work)
 	}
 	if repoDir == "" {

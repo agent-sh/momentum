@@ -459,8 +459,9 @@ func (e *Eval) trial(ctx context.Context, t GoldenTask, n int) (tr Trial) {
 	e.Runner.Store.PutLoopRun(ctx, run)
 	tr.Run = run
 	if !e.Native { // the runner's bookkeeping, as a live investigation's: the report goes into the case, whatever error ended the run
-		if f, reported, ok := investigationFindings(res, dir); ok {
-			if _, _, err := recordFindings(ctx, snap, c.ID, f, reported, "eval:"+run.ID); err != nil {
+		why := undecided(res, err)
+		if f, reported, ok := investigationFindings(res, dir); ok || why != "" {
+			if _, _, err := recordFindings(ctx, snap, c.ID, f, reported, why, "eval:"+run.ID); err != nil {
 				tr.Err = "the case's findings: " + err.Error()
 				return tr
 			}

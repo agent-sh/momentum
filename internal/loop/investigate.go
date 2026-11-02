@@ -137,10 +137,12 @@ func caseHolds(c store.Case) string {
 // recordFindings is the runner's bookkeeping of an investigation: its mechanism, alternatives and fix (the case's
 // next test) go into the case it investigated. A report replaces all three; a findings file sets only the ones it
 // holds, so a run cut short does not clear what the case held from an earlier run. A report that names both a
-// mechanism and a fix moves the case to testing; a run cut short, whose findings file is all it left, or a report
-// short of either, leaves it investigating, so two stops in a row still trip the stop rule. A case that went into
-// another, or moved on while the run ran, keeps what it has; the bool says whether the findings were recorded.
-func recordFindings(ctx context.Context, st *store.Store, caseID string, f finding, reported bool, actor string) (store.Case, bool, error) {
+// mechanism and a fix moves the case to testing; a run cut short, whose findings file is all it left, leaves it
+// investigating. A run that ended well with a report short of either did not decide (undecided, its summary): its
+// findings go in and the case closes as insufficient evidence, which Cases' rule brings back once as much evidence
+// again comes in. A case that went into another, or moved on while the run ran, keeps what it has; the bool says
+// whether the findings were recorded.
+func recordFindings(ctx context.Context, st *store.Store, caseID string, f finding, reported bool, undecided, actor string) (store.Case, bool, error) {
 	var alternatives []string
 	for _, a := range f.Alternatives {
 		if a = strings.TrimSpace(a); a != "" {
@@ -157,14 +159,40 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, f findi
 		if mechanism != "" && fix != "" {
 			u.Status = store.CaseTesting
 		}
-		return st.RecordFindings(ctx, caseID, u, actor)
+	} else {
+		if mechanism != "" {
+			u.Mechanism = &mechanism
+		}
+		if fix != "" {
+			u.NextTest = &fix
+		}
+		u.Alternatives = alternatives // nil keeps the case's
 	}
-	if mechanism != "" {
-		u.Mechanism = &mechanism
+	if undecided != "" && u.Status != store.CaseTesting {
+		return st.RecordUndecided(ctx, caseID, u, undecided, actor)
 	}
-	if fix != "" {
-		u.NextTest = &fix
-	}
-	u.Alternatives = alternatives // nil keeps the case's
 	return st.RecordFindings(ctx, caseID, u, actor)
+}
+
+// undecided is why an investigation that ended well decided nothing, from its report: "" when it named both a
+// mechanism and a fix, or did not end well (a run cut short, an error), whose case stays investigating.
+func undecided(res Result, err error) string {
+	if err != nil || res.Status != store.RunOK || len(res.Report) == 0 {
+		return ""
+	}
+	f := nativeFinding(res)
+	if strings.TrimSpace(f.Mechanism) != "" && strings.TrimSpace(f.Fix) != "" {
+		return ""
+	}
+	why := "the investigation named no mechanism and fix"
+	switch {
+	case strings.TrimSpace(f.Mechanism) != "":
+		why = "the investigation named a mechanism and no fix"
+	case strings.TrimSpace(f.Fix) != "":
+		why = "the investigation named a fix and no mechanism"
+	}
+	if s := strings.TrimSpace(f.Report); s != "" {
+		why += ": " + plain.Clip(plain.Line(s), 400)
+	}
+	return why
 }

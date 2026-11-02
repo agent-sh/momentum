@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -117,6 +119,7 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		for _, c := range swept {
 			r.logf("swept %s: %s", c.ID, c.Title)
 		}
+		r.dropLeft(ctx)
 	}
 	measured, err := r.Measure(ctx, o)
 	if err != nil {
@@ -227,7 +230,7 @@ func (r *Runner) endStale(ctx context.Context) error {
 				// its report, when its stream holds one, else the findings file
 				res, _ := readStream(filepath.Join(run.Dir, "transcript.jsonl"))
 				if f, reported, ok := investigationFindings(res, run.Dir); ok {
-					r.keepFindings(ctx, run, f, reported)
+					r.keepFindings(ctx, run, f, reported, "") // a run killed did not end well: it closes nothing
 				}
 			}
 			if err := r.Store.FinishLoopRun(ctx, run); err != nil {
@@ -236,6 +239,44 @@ func (r *Runner) endStale(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// dropLeft drops each change before its proposal whose case left testing (closed, sent back, merged into another,
+// swept): nothing else in the loop returns to its work tree, which the scope check reads as someone's work.
+func (r *Runner) dropLeft(ctx context.Context) {
+	if r.Ship == nil {
+		return
+	}
+	entries, err := os.ReadDir(filepath.Join(r.Ship.Dir, "packages"))
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			r.logf("changes left by their cases: %v", err)
+		}
+		return
+	}
+	for _, e := range entries {
+		p, ok, err := r.Ship.Load(e.Name())
+		if !e.IsDir() || err != nil || !ok || !unproposed(p) {
+			continue
+		}
+		c, err := r.Store.CaseByID(ctx, p.Case)
+		if err != nil {
+			r.logf("the change of %s: %v", p.Case, err)
+			continue
+		}
+		if c.Status == store.CaseTesting && c.Into == "" {
+			continue
+		}
+		why := "its case is " + string(c.Status)
+		if c.Reason != "" {
+			why += " (" + string(c.Reason) + ")"
+		}
+		if _, err := r.Ship.Drop(ctx, p.Case, why); err != nil {
+			r.logf("drop the change of %s: %v", p.Case, err)
+			continue
+		}
+		r.logf("dropped the change of %s: %s", p.Case, why)
+	}
 }
 
 // pick chooses a family's case and its step: a case in testing first (finish what is in flight: its build, or its
@@ -371,7 +412,8 @@ func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, e
 	}
 	var runs []store.LoopRun
 	for _, run := range all {
-		if run.Status != store.RunRefused && run.Status != store.RunRunning && len(runs) < 2 {
+		// a case that came back after a close starts over: its runs from before count no more
+		if run.Status != store.RunRefused && run.Status != store.RunRunning && run.Started.After(c.Back) && len(runs) < 2 {
 			runs = append(runs, run)
 		}
 	}
@@ -424,10 +466,31 @@ func (r *Runner) reserve(ctx context.Context, family, caseID, step string) (stor
 // budget.
 func (r *Runner) step(ctx context.Context, family string, c store.Case, step string, run store.LoopRun) Done {
 	d := Done{Family: family, Case: c.ID, Step: step}
+	began := "" // a build that resumes a change before its proposal
+	if step == StepBuild && r.Ship != nil {
+		if p, ok, _ := r.Ship.Load(c.ID); ok && unproposed(p) {
+			began = p.State
+		}
+	}
 	res, err := r.invoke(ctx, family, c, step, run)
+	// one that ended well with its change where it began, and its case still in testing, moved nothing: it is a stop,
+	// so two in a row trip the stop rule before the case's budget is gone
+	if began != "" && err == nil && res.Status == store.RunOK && r.idle(ctx, c.ID, began) {
+		res.Status, res.Failure = store.RunFailed, "no progress"
+	}
 	r.finish(ctx, c, &run, res, err)
 	d.Run = run
 	return d
+}
+
+// idle says whether a build left its case in testing and its change before its proposal, in the state it began in.
+func (r *Runner) idle(ctx context.Context, caseID, began string) bool {
+	c, err := r.Store.CaseByID(ctx, caseID)
+	if err != nil || c.Status != store.CaseTesting || c.Into != "" {
+		return false
+	}
+	p, ok, err := r.Ship.Load(caseID)
+	return err == nil && ok && unproposed(p) && p.State == began
 }
 
 // finish records how a run ended, on the run and on its case.
@@ -457,14 +520,11 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 	// before the run ends, so a loop that dies between the two leaves a running run, which stale recovery ends and
 	// records again under the same guard.
 	if run.Step == StepInvestigate {
-		f, reported, ok := investigationFindings(res, run.Dir)
-		if ok {
-			r.keepFindings(ctx, *run, f, reported)
-		}
-		// one that ended well but reported no mechanism and fix moved its case nowhere: it is a stop, so two in a row
-		// trip the stop rule, as runs cut short do, before the case's budget is gone
-		if err == nil && run.Status == store.RunOK && !(reported && strings.TrimSpace(f.Mechanism) != "" && strings.TrimSpace(f.Fix) != "") {
-			run.Status, run.Failure = store.RunFailed, "no fix"
+		// one that ended well with a report short of a mechanism or a fix did not decide: its case closes as
+		// insufficient evidence, and comes back once as much evidence again comes in (Cases)
+		why := undecided(res, err)
+		if f, reported, ok := investigationFindings(res, run.Dir); ok || why != "" {
+			r.keepFindings(ctx, *run, f, reported, why)
 		}
 	}
 	if err := r.Store.FinishLoopRun(ctx, *run); err != nil {
@@ -493,8 +553,8 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 }
 
 // keepFindings records an investigation's findings into its case, and logs why when it records nothing.
-func (r *Runner) keepFindings(ctx context.Context, run store.LoopRun, f finding, reported bool) {
-	own, recorded, err := recordFindings(ctx, r.Store, run.Case, f, reported, "loop:"+run.ID)
+func (r *Runner) keepFindings(ctx context.Context, run store.LoopRun, f finding, reported bool, undecided string) {
+	own, recorded, err := recordFindings(ctx, r.Store, run.Case, f, reported, undecided, "loop:"+run.ID)
 	switch {
 	case err != nil:
 		r.logf("record the findings of %s: %v", run.Case, err)
@@ -561,9 +621,13 @@ func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step s
 			inv.Prompt += fmt.Sprintf("\nIts change %s was reviewed: round %d found %d high, %d medium and %d low, in review.md. Revise the change "+
 				"in its work tree %s for what the review found, check it again (`momentum ship check`) and propose it again (`momentum ship "+
 				"propose`), which updates its pull request.", p.PR, last.Round, last.High, last.Medium, last.Low, p.Work)
-		case ok && inProgress:
+		case ok && (inProgress || unproposed(p)):
 			inv.Prompt += fmt.Sprintf("\nIts change is %s, in its work tree %s: resume it from there (`momentum ship status` says where it "+
 				"stands); its findings were checked when the change began.", p.State, p.Work)
+			if !inProgress {
+				inv.Prompt += " If it cannot go on (its test does not tell the change apart, its plan cannot count the problem), close the " +
+					"case or send it back: the loop drops a change whose case left testing."
+			}
 		}
 	}
 	inv.Settings = r.permissions(step, c, run)

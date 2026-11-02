@@ -83,7 +83,7 @@ func TestRecordFindingsKeepsToItsOwnOpenCase(t *testing.T) {
 	}
 	f := finding{Mechanism: "zz-run-mechanism", Fix: "zz-run-fix"}
 	for _, id := range []string{a.ID, moved.ID, closed.ID} {
-		if _, recorded, err := recordFindings(ctx, st, id, f, true, "loop:r"); err != nil || recorded {
+		if _, recorded, err := recordFindings(ctx, st, id, f, true, "", "loop:r"); err != nil || recorded {
 			t.Errorf("%s: recorded %v %v", id, recorded, err)
 		}
 	}
@@ -92,7 +92,7 @@ func TestRecordFindingsKeepsToItsOwnOpenCase(t *testing.T) {
 			t.Errorf("%s took another run's findings: %+v", id, got)
 		}
 	}
-	if got, recorded, err := recordFindings(ctx, st, short.ID, finding{Mechanism: "zz-only-a-mechanism"}, true, "loop:r"); err != nil || !recorded ||
+	if got, recorded, err := recordFindings(ctx, st, short.ID, finding{Mechanism: "zz-only-a-mechanism"}, true, "", "loop:r"); err != nil || !recorded ||
 		got.Status != store.CaseInvestigating || got.NextTest != "" {
 		t.Fatalf("a report with no fix: %+v %v %v", got, recorded, err)
 	}

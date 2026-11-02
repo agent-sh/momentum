@@ -64,32 +64,6 @@ func TestACheckedRevisionResumesItsReview(t *testing.T) {
 	}
 }
 
-// An investigation whose report names a mechanism and no fix moved its case nowhere: it is a stop, so two in a row
-// trip the stop rule and the loop opens a case of its own, before the case's budget is gone.
-func TestAReportWithNoFixIsAStop(t *testing.T) {
-	st := testStore(t)
-	ctx := context.Background()
-	noFix := `{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":4,"session_id":"s1",` +
-		`"structured_output":{"mechanism":"the export reads the lockfile before it takes the lock","alternatives":[],"fix":"","summary":"no fix within reach: the evidence cannot decide"}}`
-	r := runnerFor(t, st, fakeAgent(t, noFix))
-	c := openCase(t, st, "failures", "a", 2)
-	var steps []string
-	for i := 0; i < 7; i++ {
-		done, err := r.Once(ctx, Options{Families: []string{"failures"}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, d := range done {
-			steps = append(steps, d.Step+" "+string(d.Run.Status)+" "+d.Skipped)
-		}
-	}
-	got, _ := st.CaseByID(ctx, c.ID)
-	health, _ := st.Cases(ctx, store.CaseFilter{Family: "component-health", All: true})
-	if got.Cost.Runs != 2 || len(health) != 1 {
-		t.Fatalf("steps:\n%s\ncase: %s, spent $%.2f over %d runs; loop cases: %d", strings.Join(steps, "\n"), got.Status, got.Cost.USD, got.Cost.Runs, len(health))
-	}
-}
-
 // A build that finds a prepared change, which a build cut short left with uncommitted work, resumes it: a reported
 // root leaves the case where it is, so its work tree stays its own.
 func TestABuildResumesAPreparedChange(t *testing.T) {

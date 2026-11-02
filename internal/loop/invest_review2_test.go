@@ -124,21 +124,28 @@ echo '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":3
 	}
 }
 
-// A change is in progress while it is prepared, checked, proposed, revising or landing, and an unreadable package
-// counts as in progress; the runner's root and the case commands both ask this.
+// A change is in progress while it is on its pull request (proposed, revising, landing, or checked again after a
+// review), and an unreadable package counts as in progress; the runner's root and the case commands both ask this.
 func TestAChangeIsOpenWhileItsPullRequestIs(t *testing.T) {
 	st := testStore(t)
 	s := &Ship{Store: st, Dir: t.TempDir()}
 	if _, open := s.ChangeOpen("c00000001"); open {
 		t.Fatal("a case with no package is open")
 	}
-	for state, want := range map[string]bool{Prepared: true, Checked: true, Proposed: true, Revising: true, Landing: true, Landed: false, RolledBack: false, Kept: false} {
-		p := Package{Case: "c00000001", Kind: "repo", State: state}
+	// a change before its proposal (prepared, checked with no pull request) is the build's to resume or end; one on its
+	// pull request is its review's
+	for _, tc := range []struct {
+		state, pr string
+		want      bool
+	}{{Prepared, "", false}, {Checked, "", false}, {Checked, "https://example.com/pr/1", true}, {Proposed, "https://example.com/pr/1", true},
+		{Revising, "https://example.com/pr/1", true}, {Landing, "https://example.com/pr/1", true}, {Landed, "", false}, {RolledBack, "", false},
+		{Kept, "", false}, {Dropped, "", false}} {
+		p := Package{Case: "c00000001", Kind: "repo", State: tc.state, PR: tc.pr}
 		if err := s.save(&p); err != nil {
 			t.Fatal(err)
 		}
-		if got, open := s.ChangeOpen("c00000001"); open != want || got != state {
-			t.Errorf("%s: open %v (%q)", state, open, got)
+		if got, open := s.ChangeOpen("c00000001"); open != tc.want || got != tc.state {
+			t.Errorf("%s %q: open %v (%q)", tc.state, tc.pr, open, got)
 		}
 	}
 	write(t, filepath.Join(s.pkgDir("c00000001"), "package.json"), "{not json")

@@ -727,6 +727,40 @@ func (s *Store) RecordFindings(ctx context.Context, id string, u CaseUpdate, act
 	return c, true, tx.Commit()
 }
 
+// RecordUndecided is RecordFindings for an investigation that ended well without naming both a mechanism and a fix:
+// the evidence did not decide. Its findings go into the case, which it then closes as insufficient evidence, why
+// saying so, in the same transaction and under the same guard; Cases' rule brings the case back once as much
+// evidence again comes in.
+func (s *Store) RecordUndecided(ctx context.Context, id string, u CaseUpdate, why, actor string) (Case, bool, error) {
+	if strings.TrimSpace(why) == "" {
+		why = "the investigation named no mechanism and fix"
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Case{}, false, err
+	}
+	defer tx.Rollback()
+	now := time.Now()
+	c, err := getCase(ctx, tx, id)
+	if err != nil {
+		return Case{}, false, err
+	}
+	if c.Into != "" || c.Status != CaseOpen && c.Status != CaseInvestigating {
+		return c, false, nil
+	}
+	u.Status = "" // it closes
+	if c, err = updateCase(ctx, tx, c, u, actor, now); err != nil {
+		return Case{}, false, err
+	}
+	if err := closeAs(ctx, tx, c.ID, Insufficient, why, actor, now); err != nil {
+		return Case{}, false, err
+	}
+	if c, err = getCase(ctx, tx, c.ID); err != nil {
+		return Case{}, false, err
+	}
+	return c, true, tx.Commit()
+}
+
 // updateCase is UpdateCase's change of a case already read in the transaction.
 func updateCase(ctx context.Context, tx *sql.Tx, c Case, u CaseUpdate, actor string, now time.Time) (Case, error) {
 	var err error
@@ -925,18 +959,23 @@ func (s *Store) CloseCase(ctx context.Context, id string, reason CloseReason, in
 		}
 		return c, tx.Commit()
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, reason = ?, closed = ?, updated = ?,
-	  closed_evidence = (SELECT COUNT(*) FROM case_evidence WHERE case_id = ?) WHERE id = ?`,
-		CaseClosed, string(reason), now.UnixMilli(), now.UnixMilli(), c.ID, c.ID); err != nil {
-		return Case{}, err
-	}
-	if err := caseLog(ctx, tx, c.ID, actor, "closed", string(reason)+": "+why, now); err != nil {
+	if err := closeAs(ctx, tx, c.ID, reason, why, actor, now); err != nil {
 		return Case{}, err
 	}
 	if c, err = getCase(ctx, tx, c.ID); err != nil {
 		return Case{}, err
 	}
 	return c, tx.Commit()
+}
+
+// closeAs closes a case with a reason other than a duplicate's, keeping how much evidence it held, and logs why.
+func closeAs(ctx context.Context, q querier, id string, reason CloseReason, why, actor string, now time.Time) error {
+	if _, err := q.ExecContext(ctx, `UPDATE cases SET status = ?, reason = ?, closed = ?, updated = ?,
+	  closed_evidence = (SELECT COUNT(*) FROM case_evidence WHERE case_id = ?) WHERE id = ?`,
+		CaseClosed, string(reason), now.UnixMilli(), now.UnixMilli(), id, id); err != nil {
+		return err
+	}
+	return caseLog(ctx, q, id, actor, "closed", string(reason)+": "+why, now)
 }
 
 // merge closes c as a duplicate of the case into names (followed to where it went), and moves c's evidence,

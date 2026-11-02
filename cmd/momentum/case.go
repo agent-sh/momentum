@@ -89,14 +89,14 @@ func ownCase(args []string) error {
 	return nil
 }
 
-// changeInProgress refuses, inside a loop run, to close, send back or merge by a root a case whose change is in
-// progress: the build that finds it resumes it, and its review decides.
+// changeInProgress refuses, inside a loop run, to close, send back or merge by a root a case whose change is on its
+// pull request: its review decides. A change before its proposal ends with its case, and the loop drops it.
 func changeInProgress(id string) error {
 	if os.Getenv("MOMENTUM_LOOP_RUN") == "" {
 		return nil
 	}
 	if state, open := (&loop.Ship{Dir: loopDir()}).ChangeOpen(id); open {
-		return usageError{fmt.Sprintf("case %s's change is %s: the build resumes it and its review decides, so a run neither closes it, sends it back nor merges it", id, state)}
+		return usageError{fmt.Sprintf("case %s's change is %s on its pull request: its review decides, so a run neither closes it, sends it back nor merges it", id, state)}
 	}
 	return nil
 }
