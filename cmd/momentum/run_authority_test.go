@@ -313,7 +313,8 @@ func TestARunReadsOnlyScrubbedCommandOutput(t *testing.T) {
 	}
 	defer st.Close()
 	ctx := context.Background()
-	e := store.Event{Source: store.Transcripts, SourceKey: "fixture", TS: time.Now(), Actor: store.ActorTool, Kind: "tool_result", Summary: "password=secret-value"}
+	// a second before the clock: a listing ends before the clock's millisecond, which an event dated now can share
+	e := store.Event{Source: store.Transcripts, SourceKey: "fixture", TS: time.Now().Add(-time.Second), Actor: store.ActorTool, Kind: "tool_result", Summary: "password=secret-value"}
 	if _, err := st.Put(ctx, []store.Event{e}); err != nil {
 		t.Fatal(err)
 	}
