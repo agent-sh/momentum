@@ -704,10 +704,10 @@ func (s *Store) UpdateCase(ctx context.Context, id string, u CaseUpdate, actor s
 }
 
 // RecordFindings writes an investigation's findings into the case it investigated, the runner's bookkeeping for
-// the run: the update and the evidence it cites, in one transaction, only while that case has not gone into
-// another and is still open or investigating (a case moved on since the run started keeps what it has). The bool
-// says whether they were recorded.
-func (s *Store) RecordFindings(ctx context.Context, id string, u CaseUpdate, evs []Evidence, actor string) (Case, bool, error) {
+// the run, in one transaction that reads the case by its own id without following a merge, only while that case
+// has not gone into another and is still open or investigating (a case moved on since the run started keeps what
+// it has). The bool says whether they were recorded.
+func (s *Store) RecordFindings(ctx context.Context, id string, u CaseUpdate, actor string) (Case, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Case{}, false, err
@@ -720,14 +720,8 @@ func (s *Store) RecordFindings(ctx context.Context, id string, u CaseUpdate, evs
 	if c.Into != "" || c.Status != CaseOpen && c.Status != CaseInvestigating {
 		return c, false, nil
 	}
-	now := time.Now()
-	if c, err = updateCase(ctx, tx, c, u, actor, now); err != nil {
+	if c, err = updateCase(ctx, tx, c, u, actor, time.Now()); err != nil {
 		return Case{}, false, err
-	}
-	if len(evs) > 0 {
-		if c, _, err = takeEvidence(ctx, tx, c, evs, "", actor, now); err != nil {
-			return Case{}, false, err
-		}
 	}
 	return c, true, tx.Commit()
 }

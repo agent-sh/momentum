@@ -89,8 +89,8 @@ type Eval struct {
 	Parallel int     // trials at once
 	ID       string  // this evaluation's name, in its runs' experiment tags
 	Judge    Agent
-	// Native runs the native path in place of the loop: the harness's own agent, asked the question with the same
-	// evidence and the same limits, without the loop's procedure, the family's skill or a case to record on.
+	// Native runs the native path in place of the loop: the harness's own agent, asked the same question with the same
+	// brief, tools and limits, its prompt naming the symptom events where the loop's lists its case's evidence.
 	Native       bool // compatibility for callers selecting only the native arm
 	Arms         []string
 	Repositories []string
@@ -458,9 +458,9 @@ func (e *Eval) trial(ctx context.Context, t GoldenTask, n int) (tr Trial) {
 	}
 	e.Runner.Store.PutLoopRun(ctx, run)
 	tr.Run = run
-	if !e.Native && err == nil { // the runner's bookkeeping, as a live investigation's: the report goes into the case
-		if f, ok := investigationFindings(res, dir); ok {
-			if _, _, err := recordFindings(ctx, snap, c.ID, f, "eval:"+run.ID); err != nil {
+	if !e.Native { // the runner's bookkeeping, as a live investigation's: the report goes into the case, whatever error ended the run
+		if f, reported, ok := investigationFindings(res, dir); ok {
+			if _, _, err := recordFindings(ctx, snap, c.ID, f, reported, "eval:"+run.ID); err != nil {
 				tr.Err = "the case's findings: " + err.Error()
 				return tr
 			}
@@ -484,7 +484,7 @@ func (e *Eval) trial(ctx context.Context, t GoldenTask, n int) (tr Trial) {
 	os.WriteFile(filepath.Join(dir, "case.json"), raw, 0o600)
 	// both arms' findings are read the one way: the report, or the findings file when the report gives neither a
 	// mechanism nor a fix; the loop's are on its case, where the runner wrote them, with the summary they came with
-	found, _ := investigationFindings(res, dir)
+	found, _, _ := investigationFindings(res, dir)
 	if !e.Native {
 		found = finding{Mechanism: after.Mechanism, Alternatives: after.Alternatives, Fix: after.NextTest, Report: found.Report}
 	} else {
@@ -752,7 +752,9 @@ func judgeFinding(f finding) string {
 	fold := func(s string) string { return plain.Clip(plain.Line(s), 2000) }
 	var alternatives []string
 	for _, a := range f.Alternatives {
-		alternatives = append(alternatives, fold(a))
+		if a = fold(a); a != "" { // the case store keeps no empty alternative: neither does the judge's input
+			alternatives = append(alternatives, a)
+		}
 	}
 	fields := struct{ Mechanism, Alternatives, Fix, Summary string }{clip(fold(f.Mechanism)), clip(strings.Join(alternatives, " | ")), clip(fold(f.Fix)), clip(fold(f.Report))}
 	raw, _ := json.MarshalIndent(fields, "", "  ")

@@ -15,6 +15,7 @@ import (
 
 	"github.com/agent-sh/momentum/internal/config"
 	"github.com/agent-sh/momentum/internal/detect"
+	"github.com/agent-sh/momentum/internal/loop"
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
@@ -75,6 +76,13 @@ func ownCase(args []string) error {
 		}
 		if id != own {
 			return usageError{fmt.Sprintf("this loop run works case %s, not %q: it changes only its own", own, id)}
+		}
+		// a case whose change is proposed answers its review: closing it, sending it back or merging it by a root
+		// would leave its pull request open with nothing in the loop to return to it
+		if args[0] == "close" || args[0] == "signature" || args[0] == "set" && slices.Contains(args, "--status") {
+			if p, ok, err := (&loop.Ship{Dir: loopDir()}).Load(own); err == nil && ok && slices.Contains([]string{loop.Proposed, loop.Revising, loop.Landing}, p.State) {
+				return usageError{fmt.Sprintf("case %s's change is %s on its pull request: a revision answers its review, and the review decides", own, p.State)}
+			}
 		}
 	}
 	return nil

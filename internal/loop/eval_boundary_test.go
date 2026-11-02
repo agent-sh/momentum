@@ -241,8 +241,8 @@ NOTES
 	}
 }
 
-// A live investigation cut short keeps what it found: the runner records its findings file into the case, which
-// moves to testing with a mechanism and a fix, and a report later replaces them.
+// A live investigation cut short keeps what it found: the runner records its findings file into the case, which stays
+// investigating (only a report moves it to testing), and the second stop in a row trips the stop rule.
 func TestTheRunnerRecordsAnInvestigationsFindings(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
@@ -263,13 +263,20 @@ echo '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":3
 		t.Fatalf("%+v %v", done, err)
 	}
 	got, err := st.CaseByID(ctx, c.ID)
-	if err != nil || got.Status != store.CaseTesting || got.Mechanism != "the export reads the lockfile before it takes the lock" ||
+	if err != nil || got.Status != store.CaseInvestigating || got.Mechanism != "the export reads the lockfile before it takes the lock" ||
 		got.NextTest != "take the lock first" || len(got.Alternatives) != 1 || got.Alternatives[0] != "a slow disk" {
 		t.Fatalf("the case after a run cut short: %+v %v", got, err)
 	}
 	log, _ := st.CaseLog(ctx, c.ID)
 	if len(log) == 0 || log[len(log)-1].Actor != "loop:"+done[0].Run.ID {
 		t.Fatalf("the change is the run's: %+v", log)
+	}
+	// the second investigation, shown what the first left, stops the same way: the stop rule holds the case
+	if done, err = r.Once(ctx, Options{Families: []string{"failures"}}); err != nil || len(done) != 1 || done[0].Run.Status != store.RunTurns {
+		t.Fatalf("second: %+v %v", done, err)
+	}
+	if done, err = r.Once(ctx, Options{Families: []string{"failures"}}); err != nil || len(done) != 1 || done[0].Run.ID != "" || !strings.Contains(done[0].Skipped, "stopped") {
+		t.Fatalf("a third run after two stops: %+v %v", done, err)
 	}
 }
 

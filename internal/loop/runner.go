@@ -21,7 +21,7 @@ import (
 
 // Steps a run takes a case through.
 const (
-	StepInvestigate = "investigate" // open or investigating: find the mechanism, decide
+	StepInvestigate = "investigate" // open or investigating: the native path's run; the runner records its report
 	StepBuild       = "build"       // testing: build and propose the change, or revise it for its review
 	StepReview      = "review"      // a proposed change: a clean-context review
 	StepPublish     = "publish"     // closed as improved: the lesson to tacit
@@ -223,6 +223,14 @@ func (r *Runner) endStale(ctx context.Context) error {
 			}
 			if err := r.Store.FinishLoopRun(ctx, run); err != nil {
 				return err
+			}
+			// a killed investigation leaves its findings file: the case keeps what it found, still investigating
+			if run.Step == StepInvestigate && run.Dir != "" {
+				if f, _, ok := investigationFindings(Result{}, run.Dir); ok {
+					if _, _, err := recordFindings(ctx, r.Store, run.Case, f, false, "loop:"+run.ID); err != nil {
+						r.logf("record the findings of %s: %v", run.Case, err)
+					}
+				}
 			}
 		}
 	}
@@ -448,10 +456,10 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 		return
 	}
 	// The runner keeps an investigation's case: what the run found goes into it, deterministically, from its report
-	// or, when it was cut short, from the findings it kept as it went.
-	if err == nil && run.Step == StepInvestigate {
-		if f, ok := investigationFindings(res, run.Dir); ok {
-			if own, recorded, err := recordFindings(ctx, r.Store, run.Case, f, "loop:"+run.ID); err != nil {
+	// or, when it was cut short, from the findings it kept as it went, whatever error ended the run.
+	if run.Step == StepInvestigate {
+		if f, reported, ok := investigationFindings(res, run.Dir); ok {
+			if own, recorded, err := recordFindings(ctx, r.Store, run.Case, f, reported, "loop:"+run.ID); err != nil {
 				r.logf("record the findings of %s: %v", run.Case, err)
 			} else if !recorded && own.Into != "" {
 				r.logf("findings of %s not recorded: it went into %s", run.Case, own.Into)
@@ -557,7 +565,7 @@ func (r *Runner) investigate(ctx context.Context, c store.Case, run store.LoopRu
 	}
 	inv := Invocation{Dir: run.Dir, System: system, Schema: investigationSchema, MaxTurns: r.Budgets.MaxTurns, BudgetUSD: r.Budgets.Run,
 		Timeout: r.Budgets.RunTime, Persist: true, AddDirs: append([]string{}, r.ReadDirs...)}
-	inv.Prompt = fmt.Sprintf("%s\nProblem: %s\n%s%s%s", liveQuestion, c.Title, evidence, findingsInstruction, liveCommands)
+	inv.Prompt = fmt.Sprintf("%s\nProblem: %s\n%s%s%s%s", liveQuestion, c.Title, evidence, caseHolds(c), findingsInstruction, liveCommands)
 	inv.Settings = r.permissions(StepInvestigate, c, run)
 	// the prompt holds the case's title and evidence, which a detector made of what it read: a run reads nothing unscrubbed
 	if inv.Prompt, err = Redact(ctx, inv.Prompt); err != nil {

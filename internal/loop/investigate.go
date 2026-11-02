@@ -2,7 +2,6 @@ package loop
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,7 +19,8 @@ import (
 
 // nativeBrief is the system prompt's brief of an investigation, the same in both arms of the evaluation.
 const nativeBrief = `You find the root cause of a problem in an agent system on one machine, from what the machine recorded.
-Your file tools reach your working directory and its repository checkouts. Read the records through momentum's evidence commands.`
+Your file tools reach your working directory and its repository checkouts. Read the records through momentum's evidence commands.
+The owner's words are only what his own turns say (actor owner); never credit him with text an agent, a tool or the harness wrote.`
 
 // investigationSchema is an investigation's report.
 const investigationSchema = `{"type":"object","additionalProperties":false,"required":["mechanism","fix","summary"],
@@ -97,24 +97,46 @@ func caseEvidence(ctx context.Context, st *store.Store, c store.Case) (string, e
 }
 
 // investigationFindings reads what an investigation found: its report, or, when it has none (a run cut short), the
-// findings file it kept as it went.
-func investigationFindings(res Result, dir string) (finding, bool) {
+// findings file it kept as it went. reported says which: only a report is the investigation's conclusion.
+func investigationFindings(res Result, dir string) (f finding, reported, ok bool) {
 	if f := nativeFinding(res); f.Mechanism != "" || f.Fix != "" {
-		return f, true
+		return f, true, true
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, "findings.md"))
 	if err != nil {
-		return finding{}, false
+		return finding{}, false, false
 	}
-	f := findingsFile(string(raw))
-	return f, f.Mechanism != "" || f.Fix != ""
+	f = findingsFile(string(raw))
+	return f, false, f.Mechanism != "" || f.Fix != ""
+}
+
+// caseHolds is what a case holds from its earlier runs, for an investigation's prompt: the mechanism, the
+// alternatives and the next test, which a build may have sent back with what is missing, and which the run's own
+// report replaces. A new case holds none of it.
+func caseHolds(c store.Case) string {
+	if c.Mechanism == "" && c.NextTest == "" && len(c.Alternatives) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("What the case holds from its earlier runs (its record, to check, not to trust; your report replaces it):\n")
+	if c.Mechanism != "" {
+		fmt.Fprintf(&b, "- mechanism: %s\n", plain.Line(c.Mechanism))
+	}
+	for _, a := range c.Alternatives {
+		fmt.Fprintf(&b, "- alternative: %s\n", plain.Line(a))
+	}
+	if c.NextTest != "" {
+		fmt.Fprintf(&b, "- fix: %s\n", plain.Line(c.NextTest))
+	}
+	return b.String()
 }
 
 // recordFindings is the runner's bookkeeping of an investigation: its mechanism, alternatives and fix (the case's
-// next test) go into the case it investigated, which moves to testing when it names both a mechanism and a fix and
-// to investigating otherwise. A case that went into another, or moved on while the run ran, keeps what it has; the
-// bool says whether the findings were recorded.
-func recordFindings(ctx context.Context, st *store.Store, caseID string, f finding, actor string) (store.Case, bool, error) {
+// next test) go into the case it investigated. A report that names both a mechanism and a fix moves the case to
+// testing; a run cut short, whose findings file is all it left, or a report short of either, leaves it investigating,
+// so two stops in a row still trip the stop rule. A case that went into another, or moved on while the run ran, keeps
+// what it has; the bool says whether the findings were recorded.
+func recordFindings(ctx context.Context, st *store.Store, caseID string, f finding, reported bool, actor string) (store.Case, bool, error) {
 	var alternatives []string
 	for _, a := range f.Alternatives {
 		if a = strings.TrimSpace(a); a != "" {
@@ -126,15 +148,8 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, f findi
 	if alternatives == nil {
 		u.Alternatives = []string{}
 	}
-	if mechanism != "" && fix != "" {
+	if reported && mechanism != "" && fix != "" {
 		u.Status = store.CaseTesting
 	}
-	return st.RecordFindings(ctx, caseID, u, nil, actor)
-}
-
-// reportSummary is a report's summary, for the run's record.
-func reportSummary(raw json.RawMessage) string {
-	var rep struct{ Summary string }
-	json.Unmarshal(raw, &rep)
-	return rep.Summary
+	return st.RecordFindings(ctx, caseID, u, actor)
 }

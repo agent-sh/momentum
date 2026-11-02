@@ -28,4 +28,4 @@ For each piece you open, read three things: the call that failed (the event just
 - Fix the source, not the symptom: the tool's bug in its repository, the guard's rule in the guard. A note to agents is the last resort, never the first.
 - Not worth it: a failure that costs seconds, that agents route around at once, in a tool used rarely.
 - Already solved: a fix landed after the newest evidence (`momentum evidence git DIR log` of the tool), and nothing since.
-- Another case's cause: when the failure is a symptom of what another case holds (the same root), name the root with `momentum case signature $MOMENTUM_LOOP_CASE root:KEY`. If another case holds it, report the root and the other case's id in the mechanism, then end the run. The runner records the root and merges outside the run.
+- Another case's cause: when the failure is a symptom of what another case holds (the same root), name the root with `momentum case signature $MOMENTUM_LOOP_CASE root:KEY`. If another case holds it, report the root and the other case's id in the summary, then end the run. The runner records the root and merges outside the run.
