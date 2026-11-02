@@ -253,7 +253,7 @@ func TestEvaluationContractStatesHistoricalLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, text := range []string{"first record after the scan's place", "record's own timestamp", "Sessions tasks run without replay", "reflog reaches back", "newest commit dated before", "derivation of their last read", "covers less than its nominal 90%", "reads the interval with its task count"} {
+	for _, text := range []string{"first record after the scan's place", "record's own timestamp", "whatever its format dates it by", "Sessions tasks run without replay", "reflog reaches back", "newest commit dated before", "derivation of their last read", "covers less than its nominal 90%", "reads the interval with its task count"} {
 		if !strings.Contains(string(raw), text) {
 			t.Errorf("contract omits %q", text)
 		}
