@@ -94,13 +94,20 @@ const usage = `usage:
   momentum loop [--dry] [--family F,F] [--case ID] [--json]
                                         the improvement loop, once: detect, take each family's case a step with the
                                         harness's agent, review and land what was proposed
+  momentum measure [--dry] [--family F,F] [--case ID] [--json]
+                                        the measure step: a deployed change, once in effect, measured over its
+                                        whole-week window after against the three windows before the gate, once
+                                        their sources have read them, by its signal's share of the
+                                        active hours; improved closes its case and keeps the change, no effect
+                                        rolls it back; three consecutive read windows at its old share with five hits among them bring it back
   momentum loop runs [--since WHEN] [--case ID] [--json]
                                         the loop's runs, and what the live ones spent in the last day and week
   momentum loop lesson --case ID --text T
                                         a case closed as improved: its lesson to tacit, as the loop's observation
   momentum ship prepare --repo DIR [--case ID]
   momentum ship check --test CMD [--test-files F,F] [--case ID]
-  momentum ship propose --title T --body-file F --rollback R --signal JSON [--window D] [--lesson L] [--case ID]
+  momentum ship propose --title T --body-file F --rollback R --signal JSON [--window D] [--lesson L]
+                        [--installed FILE] [--case ID]
   momentum ship status [--case ID] [--json]
   momentum ship land ID
   momentum ship rollback ID --why W
@@ -172,6 +179,8 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		err = caseCmd(ctx, args[1:], stdout, stderr)
 	case "loop":
 		err = loopCmd(ctx, args[1:], stdout, stderr)
+	case "measure":
+		err = measureCmd(ctx, args[1:], stdout, stderr)
 	case "ship":
 		err = shipCmd(ctx, args[1:], stdout, stderr)
 	case "version":

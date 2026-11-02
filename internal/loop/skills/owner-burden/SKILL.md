@@ -31,5 +31,5 @@ Check tacit for his rulings on the matter (`tacit search`). A ruling's quote is 
 
 - Fewer questions to him is no success when it comes from assumptions he did not authorize. Never decide for him what only he can decide, and never widen what agents may do without asking.
 - Prefer a deterministic check (a hook that catches the hand-back of an authorized step before the turn ends, a check of a claimed result) over another instruction. An instruction is checked against the live harness before it ships.
-- The measurement counts his turns of that kind, in his own words, over a week before and after.
+- The measurement counts his turns of that kind, in his own words, using a week, or two for a rarer problem, in whole weeks; compare the three windows before the gated one with one after the change is in effect, or two when the first is too quiet.
 - Not worth it: a one-off situation that will not recur, or a step-in that was his choice to make.

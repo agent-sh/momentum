@@ -203,8 +203,8 @@ func TestADismissedCaseComesBackOnlyOnAsMuchNewEvidence(t *testing.T) {
 	}
 }
 
-// A case closed as already solved comes back on any evidence after the close, and one closed as improved once its
-// last window holds as much as the window before its change did. Either comes back regressed.
+// A case closed as already solved comes back on any evidence after the close, regressed. One closed as improved
+// does not come back on its evidence, however much of it: the measure step watches its signal (RegressCase).
 func TestASolvedCaseComesBackWhenItRecurs(t *testing.T) {
 	st := caseStore(t)
 	ctx := context.Background()
@@ -218,36 +218,17 @@ func TestASolvedCaseComesBackWhenItRecurs(t *testing.T) {
 	if got, obs := observeOK(t, st, Finding{Family: "failures", Signature: "s", Evidence: refsAt("b", 1, now.Add(-day))}); obs != Reopened || got.Status != CaseOpen {
 		t.Fatalf("a recurrence after already solved %s: %+v", obs, got)
 	}
-
+	if log, _ := st.CaseLog(ctx, c.ID); log[len(log)-1].Action != "regressed" {
+		t.Fatalf("its comeback logs %q", log[len(log)-1].Action)
+	}
 	imp, _ := observeOK(t, st, Finding{Family: "failures", Signature: "i", Title: "t", Evidence: refsAt("i", 4, now.Add(-9*day))})
 	// what the measure tool leaves: closed as improved, 4 in the week before its change, 0 after
 	if _, err := st.db.ExecContext(ctx, `UPDATE cases SET status = 'closed', reason = 'improved', closed = ?, window_ms = ?,
 	  before_n = 4, after_n = 0 WHERE id = ?`, now.Add(-8*day).UnixMilli(), (7 * day).Milliseconds(), imp.ID); err != nil {
 		t.Fatal(err)
 	}
-	// one after the close but outside its last window, which slides, and two in it
-	if got, obs := observeOK(t, st, Finding{Family: "failures", Signature: "i", Evidence: evidenceAt("j", now.Add(-7*day-time.Hour),
-		now.Add(-6*day), now.Add(-6*day+time.Minute))}); obs != KeptShut {
-		t.Fatalf("2 in its last window of 4 before %s: %+v", obs, got)
-	}
-	if got, obs := observeOK(t, st, Finding{Family: "failures", Signature: "i", Evidence: evidenceAt("w", now.Add(-time.Hour))}); obs != KeptShut {
-		t.Fatalf("3 in its last window, 4 before %s: %+v", obs, got)
-	}
-	if got, obs := observeOK(t, st, Finding{Family: "failures", Signature: "i", Evidence: evidenceAt("k", now.Add(-30*time.Minute))}); obs != Reopened || got.Status != CaseOpen {
-		t.Fatalf("back at its old rate %s: %+v", obs, got)
-	}
-	for _, id := range []string{c.ID, imp.ID} {
-		if log, _ := st.CaseLog(ctx, id); log[len(log)-1].Action != "regressed" {
-			t.Fatalf("%s's comeback logs %q", id, log[len(log)-1].Action)
-		}
-	}
-	// without a measurement's window, any evidence after the close brings it back
-	nw, _ := observeOK(t, st, Finding{Family: "failures", Signature: "nw", Title: "t", Evidence: refsAt("nw", 4, now.Add(-2*day))})
-	if _, err := st.db.ExecContext(ctx, `UPDATE cases SET status = 'closed', reason = 'improved', closed = ? WHERE id = ?`, now.Add(-day).UnixMilli(), nw.ID); err != nil {
-		t.Fatal(err)
-	}
-	if got, obs := observeOK(t, st, Finding{Family: "failures", Signature: "nw", Evidence: refsAt("nw2", 1, now.Add(-time.Hour))}); obs != Reopened || got.Status != CaseOpen {
-		t.Fatalf("improved without a window %s: %+v", obs, got)
+	if got, obs := observeOK(t, st, Finding{Family: "failures", Signature: "i", Evidence: refsAt("j", 9, now.Add(-time.Hour))}); obs != KeptShut || got.Status != CaseClosed {
+		t.Fatalf("nine in its last window, four before its change %s: %+v", obs, got)
 	}
 }
 
@@ -795,5 +776,64 @@ func TestRecordRootKeepsTheAssignedCase(t *testing.T) {
 	got, err := st.CaseLive(ctx, b.ID)
 	if err != nil || got.ID != b.ID || slices.Contains(got.Signatures, "root:c") || slices.Contains(got.Signatures, "root:new") {
 		t.Fatalf("alias target changed: %+v %v", got, err)
+	}
+}
+
+// Measuring is the measure tool's: only a deployed case starts it, once its change is in effect (not before it
+// went in), with its window and the count before its change, and its window after counts from then; only a
+// measuring case closes as improved, with the count after and the effect. A case closed so does not come back on
+// its evidence, however much: the measure tool brings it back regressed, by its signal (RegressCase).
+func TestOnlyTheMeasureToolMeasuresAndClosesAsImproved(t *testing.T) {
+	st := caseStore(t)
+	ctx := context.Background()
+	c, _ := observeOK(t, st, Finding{Family: "failures", Signature: "s", Title: "t", Evidence: refsAt("a", 2, time.Now().Add(-48*time.Hour))})
+	landed := time.Now().Add(-25 * time.Hour)
+	if _, err := st.StartMeasuring(ctx, c.ID, 24*time.Hour, 6, landed, "loop:measure"); !errors.Is(err, ErrBadCase) {
+		t.Fatalf("an open case measured: %v", err)
+	}
+	if _, err := st.UpdateCase(ctx, c.ID, CaseUpdate{Status: CaseTesting, Mechanism: ptr("m"), NextTest: ptr("n")}, "agent"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CloseMeasured(ctx, c.ID, 0, "6 to 0", "loop:measure"); !errors.Is(err, ErrBadCase) {
+		t.Fatalf("a testing case closed as improved: %v", err)
+	}
+	if _, err := st.DeployCase(ctx, c.ID, "/l/packages/x", landed, "landed", "loop:ship"); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []struct {
+		w    time.Duration
+		n    int
+		from time.Time
+	}{{0, 6, landed}, {time.Hour, -1, landed}, {time.Hour, 6, landed.Add(-time.Minute)}} {
+		if _, err := st.StartMeasuring(ctx, c.ID, bad.w, bad.n, bad.from, "loop:measure"); !errors.Is(err, ErrBadCase) {
+			t.Errorf("a measurement of %v and %d from %v: %v", bad.w, bad.n, bad.from, err)
+		}
+	}
+	effect := landed.Add(3 * time.Hour)
+	m, err := st.StartMeasuring(ctx, c.ID, 24*time.Hour, 6, effect, "loop:measure")
+	if err != nil || m.Status != CaseMeasuring || m.Measurement.Window != 24*time.Hour || m.Measurement.Before != 6 || !m.Deployed.Equal(effect.Truncate(time.Millisecond)) {
+		t.Fatalf("measuring %+v %v", m, err)
+	}
+	if _, err := st.RegressCase(ctx, c.ID, "back", "loop:measure"); !errors.Is(err, ErrBadCase) {
+		t.Fatalf("a measuring case regressed: %v", err)
+	}
+	if _, err := st.CloseMeasured(ctx, c.ID, 0, " ", "loop:measure"); !errors.Is(err, ErrBadCase) {
+		t.Fatalf("an improvement with no effect: %v", err)
+	}
+	m, err = st.CloseMeasured(ctx, c.ID, 2, "6 of 100 before, 2 of 100 after", "loop:measure")
+	if err != nil || m.Status != CaseClosed || m.Reason != Improved || m.Measurement.After != 2 || m.Measurement.Effect == "" {
+		t.Fatalf("improved %+v %v", m, err)
+	}
+	// its evidence, however much, does not bring it back
+	got, _ := observeOK(t, st, Finding{Family: "failures", Signature: "s", Title: "t", Evidence: refsAt("b", 20, time.Now().Add(-time.Hour))})
+	if got.Status != CaseClosed {
+		t.Fatalf("its evidence brought it back: %s", got.Status)
+	}
+	got, err = st.RegressCase(ctx, c.ID, "7 of 100 active hours in its last 1d, 6 of 100 before its change", "loop:measure")
+	if err != nil || got.Status != CaseOpen || got.Reason != "" || got.Back.IsZero() {
+		t.Fatalf("regressed %+v %v", got, err)
+	}
+	if log, _ := st.CaseLog(ctx, c.ID); !strings.Contains(log[len(log)-1].Action, "regressed") || !strings.Contains(log[len(log)-1].Detail, "7 of 100") {
+		t.Fatalf("its log %+v", log[len(log)-1])
 	}
 }

@@ -45,8 +45,9 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	bodyFile := fs.String("body-file", "", "propose: a file with the change's description (in a loop run: one in its own directory)")
 	rollback := fs.String("rollback", "", "propose: how the change is undone")
 	signal := fs.String("signal", "", `propose: the measurement's signal, {"source","kinds","tool","harness","match"}`)
-	window := fs.String("window", "7d", "propose: the measurement's window (at least a day)")
+	window := fs.String("window", "7d", "propose: the measurement's window (whole weeks: 7d, 14d and so on)")
 	lesson := fs.String("lesson", "", "propose: the lesson the case teaches, one sentence")
+	installed := fs.String("installed", "", "propose: the built or installed file the machine runs (a binary, an installed configuration): a Go binary is in effect when its revision holds the change; another file once it changed after the checkout first held the change, from a checkout that held it then")
 	why := fs.String("why", "", "rollback: why")
 	asJSON := fs.Bool("json", false, "status: the package as JSON")
 	rest := args[1:]
@@ -75,6 +76,9 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	defer st.Close()
 	_, ship, err := setup(st, c.Loop)
+	if err == nil {
+		ship.SourceLive = c.SourceLive
+	}
 	if err != nil {
 		return err
 	}
@@ -118,7 +122,7 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		if err := json.Unmarshal([]byte(*signal), &pr.Signal); err != nil {
 			return usageError{"--signal is a JSON object: " + err.Error()}
 		}
-		pr.Title, pr.Rollback, pr.Lesson = *title, *rollback, *lesson
+		pr.Title, pr.Rollback, pr.Lesson, pr.Installed = *title, *rollback, *lesson, *installed
 		p, err = ship.Propose(ctx, *caseID, pr)
 	case "land":
 		p, err = ship.Land(ctx, *caseID)

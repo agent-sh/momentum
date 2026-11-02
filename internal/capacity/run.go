@@ -461,6 +461,11 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 			return r.res, err
 		}
 	}
+	if !opt.DryRun {
+		if err := st.MarkRead(ctx, store.Capacity, r.now); err != nil {
+			return r.res, err
+		}
+	}
 	return r.res, nil
 }
 

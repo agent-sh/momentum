@@ -15,6 +15,7 @@ import (
 // saw it. It also keeps what a later run needs to report the session once it is gone: its tool, its name, whether
 // it is an automated run, and what a needs_you stretch waits on, as the stretch began.
 type Stamp struct {
+	Cwd     string           `json:"cwd,omitempty"`
 	Phase   sessions.Phase   `json:"phase"`
 	Since   time.Time        `json:"since"`
 	Seq     int              `json:"seq"`
@@ -36,6 +37,7 @@ const Keep = 15 * time.Minute
 // Change is a session moving from one stretch to the next, as a run sees it: into another phase, into a new
 // stretch of the same phase (it did something between two runs), seen for the first time, or gone.
 type Change struct {
+	Cwd  string
 	Key  string
 	Tool string
 	Name string
@@ -83,6 +85,10 @@ func (st Stamps) Apply(ss []*sessions.Session, now time.Time, failed ...string) 
 			}
 			continue
 		}
+		cwd := s.Cwd
+		if cwd == "" {
+			cwd = prev.Cwd
+		}
 		tool, name := s.Tool, s.Name // a scan that lost them does not erase them
 		if tool == "" {
 			tool = prev.Tool
@@ -97,7 +103,7 @@ func (st Stamps) Apply(ss []*sessions.Session, now time.Time, failed ...string) 
 				(!ok || s.LastActive.After(prev.Seen)) {
 				at = s.LastActive
 			}
-			c := Change{Key: s.Key, Tool: tool, Name: name, Auto: s.Auto, To: s.Phase, At: at}
+			c := Change{Cwd: cwd, Key: s.Key, Tool: tool, Name: name, Auto: s.Auto, To: s.Phase, At: at}
 			if ok {
 				c.From, c.Since, c.Seen, c.For = prev.Phase, prev.Since, prev.Seen, max(0, at.Sub(prev.Since))
 				c.FromAsk, c.FromAskKind = prev.Ask, prev.AskKind
@@ -109,13 +115,14 @@ func (st Stamps) Apply(ss []*sessions.Session, now time.Time, failed ...string) 
 			}
 			out = append(out, c)
 		}
+		prev.Cwd = cwd
 		prev.Seq, prev.Seen, prev.Tool, prev.Name, prev.Auto = s.Seq, now, tool, name, s.Auto
 		st[s.Key] = prev
 		s.Since = prev.Since
 	}
 	for k, r := range st {
 		if now.Sub(r.Seen) > Keep && !slices.Contains(failed, r.Tool) {
-			out = append(out, Change{Key: k, Tool: r.Tool, Name: r.Name, Auto: r.Auto, From: r.Phase, At: r.Seen, Since: r.Since,
+			out = append(out, Change{Cwd: r.Cwd, Key: k, Tool: r.Tool, Name: r.Name, Auto: r.Auto, From: r.Phase, At: r.Seen, Since: r.Since,
 				Seen: r.Seen, For: max(0, r.Seen.Sub(r.Since)), FromAsk: r.Ask, FromAskKind: r.AskKind})
 			delete(st, k)
 		}

@@ -275,6 +275,9 @@ func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	defer unlock()
 	r, _, err := setup(st, c.Loop)
+	if err == nil {
+		r.Ship.SourceLive = c.SourceLive
+	}
 	if err != nil {
 		return err
 	}
@@ -290,10 +293,12 @@ func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	for _, d := range done {
 		if *asJSON {
 			enc.Encode(map[string]any{"family": d.Family, "case": d.Case, "step": d.Step, "run": d.Run.ID, "status": d.Run.Status,
-				"failure": d.Run.Failure, "usd": d.Run.USD, "summary": d.Run.Summary, "skipped": d.Skipped})
+				"failure": d.Run.Failure, "usd": d.Run.USD, "summary": d.Run.Summary, "skipped": d.Skipped, "did": d.Did})
 			continue
 		}
 		switch {
+		case d.Did != "":
+			fmt.Fprintf(stdout, "%-14s %-10s %s %s\n", firstText(d.Family, "-"), d.Case, d.Step, d.Did)
 		case d.Skipped != "":
 			fmt.Fprintf(stdout, "%-14s %-10s %s\n", d.Family, firstText(d.Case, "-"), d.Skipped)
 		default:

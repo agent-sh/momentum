@@ -128,6 +128,13 @@ func board(ctx context.Context, w *sessions.World, snapErr error, st *store.Stor
 	if err != nil {
 		return nil, nil, err
 	}
+	if scanErr == nil && snapErr == nil {
+		// a session gone from this scan is written vanished up to state.Keep later, dated when it was last seen: the
+		// scan has read the sessions only up to that much before its own time
+		if err := st.MarkRead(ctx, store.Sessions, w.Now.Add(-state.Keep)); err != nil {
+			return nil, nil, err
+		}
+	}
 	sort.SliceStable(ss, func(i, j int) bool {
 		if a, b := sessions.Order[ss[i].Phase], sessions.Order[ss[j].Phase]; a != b {
 			return a < b
@@ -270,7 +277,7 @@ func phaseEvents(changes []state.Change, ss []*sessions.Session, now time.Time) 
 		meta, _ := json.Marshal(m)
 		// A session's tool is its harness, by the name every source gives it (store.Harnesses).
 		e := store.Event{Source: store.Sessions, SourceKey: c.Key + "@" + strconv.FormatInt(now.UnixMilli(), 10), TS: c.At,
-			Session: c.Key, Harness: c.Tool, Actor: store.ActorHarness, Kind: kind, Summary: oneLine(changeSummary(c), 240), Meta: string(meta)}
+			Cwd: c.Cwd, Session: c.Key, Harness: c.Tool, Actor: store.ActorHarness, Kind: kind, Summary: oneLine(changeSummary(c), 240), Meta: string(meta)}
 		if s := byKey[c.Key]; s != nil {
 			e.Model, e.Cwd = s.Model, s.Cwd
 			if s.Transcript != "" && s.Size >= 0 {

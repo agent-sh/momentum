@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/detect"
+	"github.com/agent-sh/momentum/internal/measure"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -24,6 +25,7 @@ const (
 	StepBuild       = "build"       // testing: build and propose the change, or revise it for its review
 	StepReview      = "review"      // a proposed change: a clean-context review
 	StepPublish     = "publish"     // closed as improved: the lesson to tacit
+	StepMeasure     = "measure"     // deployed, measuring or improved: the measure step, no agent (Measure)
 )
 
 // Budgets are the loop's limits, in US dollars and time. The defaults come from the Phase 0 baseline: what the
@@ -72,6 +74,7 @@ type Done struct {
 	Family, Case, Step string
 	Run                store.LoopRun
 	Skipped            string // why no step ran
+	Did                string // what a step that is no agent's run did: the measure step's outcome
 }
 
 func (r *Runner) now() time.Time {
@@ -115,6 +118,10 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 			r.logf("swept %s: %s", c.ID, c.Title)
 		}
 	}
+	measured, err := r.Measure(ctx, o)
+	if err != nil {
+		return nil, err
+	}
 	families := r.Families
 	if len(o.Families) > 0 {
 		families = o.Families
@@ -131,6 +138,19 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		starts []reserved
 		picked error
 	)
+	for _, m := range measured {
+		did := m.Status
+		effect := ""
+		if m.Result != nil {
+			effect = m.Result.Effect
+		}
+		for _, s := range []string{effect, m.Why} {
+			if s != "" && !strings.Contains(did, s) {
+				did += ": " + s
+			}
+		}
+		done = append(done, Done{Case: m.Case, Step: StepMeasure, Did: did})
+	}
 	building := false
 	for _, fam := range families {
 		c, step, why, err := r.pick(ctx, fam, o.Case, o.Dry)
@@ -257,6 +277,16 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 					passed = append(passed, c.ID+" used its review rounds")
 				}
 				continue // its review or its landing comes next (reviews)
+			} else if ok && !p.ReadWait.IsZero() && p.Plan != nil {
+				// a proposal that waits on a source's read: a build now would be refused the same way, so it waits
+				// until the source reads past what the proposal needs
+				plan := *p.Plan
+				plan.Sources, _ = r.Ship.liveSources(ctx, plan.Sources, plan.Window, r.now()) // a stopped reader holds nothing
+				since := plan.At.Add(-time.Duration(measure.BaselineWindows+1) * plan.Window)
+				if unread, err := unreadWindow(ctx, r.Store, plan, since, p.ReadUntil, r.Dir); err == nil && len(unread) > 0 {
+					passed = append(passed, c.ID+"'s proposal waits on a read of "+strings.Join(unread, ", "))
+					continue
+				}
 			}
 		case store.CaseInvestigating:
 			step, rank = StepInvestigate, 2
@@ -602,11 +632,14 @@ func (r *Runner) reviews(ctx context.Context, only string, families ...string) [
 			}
 		}
 		if p.Clean() {
-			if _, err := r.Ship.Land(ctx, c.ID); err != nil {
+			if lp, err := r.Ship.Land(ctx, c.ID); err != nil {
 				out = append(out, Done{Family: c.Family, Case: c.ID, Step: "land", Skipped: err.Error()})
 				r.Store.CaseNote(ctx, c.ID, "not landed", err.Error(), "loop")
 			} else {
 				out = append(out, Done{Family: c.Family, Case: c.ID, Step: "land"})
+				r.note(ctx, store.Note{Kind: store.NoteDecided, Title: plainClip("momentum landed a change for: "+c.Title, store.TitleMax),
+					Detail: fmt.Sprintf("Reviewed clean and landed; measured over the %s after it. To undo it: momentum ship rollback %s --why ...",
+						days(lp.Plan.Window), c.ID), Links: prLinks(lp.PR)})
 			}
 			continue
 		}

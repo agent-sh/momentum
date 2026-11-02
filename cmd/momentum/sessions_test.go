@@ -198,7 +198,7 @@ func TestPhaseChangesAreKeptAsEvents(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, errOut.String())
 	}
 	var e store.Event
-	if err := json.Unmarshal(out.Bytes(), &e); err != nil || e.Kind != "vanished" || !strings.Contains(e.Meta, `"from":"idle"`) || e.Cwd != "" {
+	if err := json.Unmarshal(out.Bytes(), &e); err != nil || e.Kind != "vanished" || !strings.Contains(e.Meta, `"from":"idle"`) || e.Cwd != "/w/parser" {
 		t.Fatalf("json %s: %v", out.String(), err)
 	}
 }
@@ -365,5 +365,31 @@ func TestAnIncompleteSnapshotMakesNoSessionVanish(t *testing.T) {
 	defer st.Close()
 	if evs, err := st.Events(ctx, store.Query{Since: t0.Add(-time.Hour), Source: store.Sessions}); err != nil || len(evs) != 1 || evs[0].Kind != "appeared" {
 		t.Fatalf("one appearance and no departure: %+v %v", evs, err)
+	}
+}
+
+// Only a complete sessions scan advances the source's read time, including a scan with no live sessions.
+func TestOnlyACompleteSessionsScanAdvancesItsReadTime(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "m.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if _, scanErr, err := board(ctx, &sessions.World{Now: start}, nil, st, "test", []sessions.Source{fixed{}}); err != nil || scanErr != nil {
+		t.Fatal(scanErr, err)
+	}
+	// a session gone from a scan is written vanished up to state.Keep later: the scan has read up to that much before it
+	read, err := st.ReadThrough(ctx, store.Sessions)
+	if err != nil || !read.Equal(start.Add(-state.Keep)) {
+		t.Fatalf("complete scan: %v %v", read, err)
+	}
+	if _, _, err := board(ctx, &sessions.World{Now: start.Add(time.Hour)}, errors.New("incomplete snapshot"), st, "test", []sessions.Source{fixed{}}); err != nil {
+		t.Fatal(err)
+	}
+	read, err = st.ReadThrough(ctx, store.Sessions)
+	if err != nil || !read.Equal(start.Add(-state.Keep)) {
+		t.Fatalf("incomplete scan advanced: %v %v", read, err)
 	}
 }
