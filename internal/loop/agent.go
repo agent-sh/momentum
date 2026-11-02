@@ -79,6 +79,7 @@ type Result struct {
 	CostKnown  bool
 	TurnsKnown bool
 	USD        float64 // at Bedrock's rates for the models with one (bedrockRates), at the harness's own for the rest
+	listUSD    float64 // the harness's own price for the run, at the provider's list rates
 	Tokens     int64
 	Usage      Usage // the tokens, by kind
 	Turns      int
@@ -230,6 +231,9 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	// and the broker answered a model request of it, through the run's relay
 	if modelRan(res) && route.models.Load() == 0 {
 		res.Status, res.Failure = store.RunFailed, "not on Bedrock"
+		if res.CostKnown {
+			res.USD = res.listUSD // it went by another route, at that route's prices: what its stream says it spent
+		}
 		return res, fmt.Errorf("%w: the run's model answered, but no request of it reached the Bedrock broker", ErrNoBedrock)
 	}
 	return res, nil
@@ -281,6 +285,7 @@ func (a Agent) RunOrFallback(ctx context.Context, inv Invocation) (Result, error
 		res.USD = inv.BudgetUSD
 	}
 	res.USD += first.USD
+	res.listUSD += first.listUSD
 	res.CostKnown = true
 	res.Tokens += first.Tokens
 	res.Usage = res.Usage.Add(first.Usage)
@@ -353,26 +358,31 @@ func readStream(path string) (Result, error) {
 			Denials: len(r.PermissionDenials), Usage: Usage{Input: r.Usage.Input, Output: r.Usage.Output, CacheRead: r.Usage.CacheRead,
 				CacheWrite: r.Usage.CacheCreate, CacheWrite1h: r.Usage.CacheCreation.Hour}}
 		if r.TotalCostUSD != nil && known(*r.TotalCostUSD) {
-			res.USD, res.CostKnown = *r.TotalCostUSD, true
+			res.USD, res.listUSD, res.CostKnown = *r.TotalCostUSD, *r.TotalCostUSD, true
 		}
-		// with each model's tokens, the run is priced at Bedrock's rates, model by model; a model with no rate keeps
-		// the harness's price, and without a price of the harness's for it, the run's whole price stays the harness's
+		// with each model's tokens, the run is priced at Bedrock's rates, model by model. The harness's own prices
+		// check them: a model whose tokens price outside what Bedrock's rates can be against its list price (half of
+		// it to all of it) keeps the harness's price, and a run whose models' prices do not add up to its own, or
+		// with a model the harness gave no price, keeps the harness's price whole
 		if len(r.ModelUsage) > 0 {
 			var u Usage
-			usd, priced := 0.0, true
+			usd, list, priced := 0.0, 0.0, true
 			for model, m := range r.ModelUsage {
 				mu := Usage{Input: m.Input, Output: m.Output, CacheRead: m.CacheRead, CacheWrite: m.CacheCreate, CacheWrite1h: m.Hour}
 				u = u.Add(mu)
-				if p, ok := bedrockPrice(model, mu); ok {
-					usd += p
-				} else if m.CostUSD != nil && known(*m.CostUSD) {
-					usd += *m.CostUSD
-				} else {
+				if m.CostUSD == nil || !known(*m.CostUSD) {
 					priced = false
+					continue
+				}
+				list += *m.CostUSD
+				if p, ok := bedrockPrice(model, mu); ok && p >= *m.CostUSD/2-priceSlack && p <= *m.CostUSD+priceSlack {
+					usd += p
+				} else {
+					usd += *m.CostUSD
 				}
 			}
 			res.Usage = u
-			if priced && res.CostKnown {
+			if priced && res.CostKnown && math.Abs(list-res.USD) <= priceSlack {
 				res.USD = usd
 			}
 		}
@@ -393,6 +403,9 @@ func readStream(path string) (Result, error) {
 	}
 	return res, nil
 }
+
+// priceSlack is how far apart two prices of one run may be and still agree: half a cent, the harness's rounding.
+const priceSlack = 0.005
 
 // known is a price that is a number and not below zero.
 func known(usd float64) bool { return usd >= 0 && !math.IsInf(usd, 0) && !math.IsNaN(usd) }

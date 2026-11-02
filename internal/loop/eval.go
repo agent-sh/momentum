@@ -572,8 +572,11 @@ func (e *Eval) trial(ctx context.Context, t GoldenTask, n int) (tr Trial) {
 	if err != nil {
 		run.Status, run.Failure = store.RunFailed, err.Error()
 	} else {
-		run.Status, run.Failure, run.Tokens, run.Usage, run.Turns, run.Summary = res.Status, res.Failure, res.Tokens, res.Usage, res.Turns, summaryOf(res)
+		run.Status, run.Failure, run.Summary = res.Status, res.Failure, summaryOf(res)
 		run.Model = firstOf(res.Model, run.Model)
+	}
+	if err == nil || res.CostKnown { // what it spent, wherever it went, as a live run keeps it
+		run.Tokens, run.Usage, run.Turns = res.Tokens, res.Usage, res.Turns
 	}
 	e.Runner.Store.PutLoopRun(ctx, run)
 	tr.Run = run

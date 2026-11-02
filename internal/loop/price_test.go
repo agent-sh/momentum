@@ -120,7 +120,7 @@ func TestAnEvaluationsRunsArePricedAtBedrocksRates(t *testing.T) {
 		t.Fatal(err)
 	}
 	src.Close()
-	judged := `{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":0.1,"structured_output":{"verdict":"reached","facts":[],"reason":"r"},` +
+	judged := `{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":0.11,"structured_output":{"verdict":"reached","facts":[],"reason":"r"},` +
 		`"modelUsage":{"global.anthropic.claude-sonnet-5-5":{"inputTokens":20000,"outputTokens":1000,"cacheReadInputTokens":300000,"costUSD":0.11}}}`
 	judge := script(t, dir, "judge", `echo '`+judged+`'`)
 	rules := filepath.Join(dir, "rules.md")

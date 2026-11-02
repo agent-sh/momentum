@@ -358,3 +358,12 @@ func TestEvaluationGitSetsItsDiscoveryCeiling(t *testing.T) {
 		t.Fatalf("ceilings %v", ceilings)
 	}
 }
+
+// The printed summary gives each arm's investigations' tokens by kind beside its cost.
+func TestEvaluationPrintsEachArmsTokensByKind(t *testing.T) {
+	var out bytes.Buffer
+	printEvaluation(&out, loop.EvaluationResults{Arms: []loop.ArmSummary{{Arm: "native", Usage: store.Usage{Input: 1, Output: 2, CacheRead: 3, CacheWrite: 5, CacheWrite1h: 4}}}})
+	if !strings.Contains(out.String(), "tokens: 1 input, 2 output, 3 cache read, 5 cache write (4 of them for an hour)") {
+		t.Fatal(out.String())
+	}
+}

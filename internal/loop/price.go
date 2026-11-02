@@ -31,6 +31,7 @@ func bedrockPrice(model string, u Usage) (usd float64, ok bool) {
 	if !global {
 		return 0, false
 	}
+	name = strings.TrimSuffix(name, "[1m]") // the 1M-context name: Bedrock prices it as the model
 	r, ok := bedrockRates[name]
 	if !ok {
 		return 0, false
