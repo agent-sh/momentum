@@ -62,7 +62,11 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	var flags, ids []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
-		if !strings.HasPrefix(a, "-") {
+		if a == "--" { // the end of the flags: every word after it is an id
+			ids = append(ids, args[i+1:]...)
+			break
+		}
+		if !strings.HasPrefix(a, "-") || a == "-" {
 			ids = append(ids, a)
 			continue
 		}
@@ -74,6 +78,9 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	}
 	if err := fs.Parse(flags); err != nil {
 		return usageError{err.Error()}
+	}
+	if fs.NArg() > 0 { // a flag's value that is no value: nothing given is left unread
+		return usageError{fmt.Sprintf("evidence show: %q is no flag's value: give each event's id, flags as --bytes N", fs.Arg(0))}
 	}
 	if len(ids) == 0 || len(ids) > showMost || *cut < 0 {
 		return usageError{fmt.Sprintf("evidence show takes 1 to %d events, each its id or ev:ID, and --bytes N", showMost)}
@@ -105,7 +112,7 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		return err
 	}
 	if shown == 0 {
-		return usageError{"none of them is an event of the store"}
+		return usageError{"none of them could be shown"}
 	}
 	return nil
 }
@@ -284,6 +291,9 @@ func hermesRow(ctx context.Context, path string, id int64, e store.Event) (strin
 		return "", "  (its record could not be read: " + plain.Line(err.Error()) + ")\n", nil
 	case len(row.Content)+len(row.ToolCalls) > readMax:
 		return "", "  (oversized record withheld)\n", nil
+	case math.IsNaN(row.Timestamp) || row.Timestamp < 0 || row.Timestamp >= hermesLatest:
+		// a time no clock reads (Hermes writes seconds since 1970): it fails closed, before any conversion
+		return "", "  (record withheld: its timestamp is no time)\n", nil
 	}
 	// the row at the id is the event's own only while it is of the event's session at the event's time: a Hermes
 	// store made again starts its ids over, and an old event's id then names another session's message
@@ -317,6 +327,10 @@ func hermesRow(ctx context.Context, path string, id int64, e store.Event) (strin
 	}
 	return b.String(), "", nil
 }
+
+// hermesLatest bounds a Hermes row's timestamp, in seconds: past it (the year 33658) no row is dated, and the
+// conversion to a time stays far from int64's overflow.
+const hermesLatest = 1e12
 
 // hermesAt is a Hermes row's time as tacit's reader dates its events: seconds, their fraction to the nanosecond.
 func hermesAt(ts float64) time.Time {
@@ -584,7 +598,7 @@ func evidenceSearch(ctx context.Context, args []string, stdout, stderr io.Writer
 		return usageError{err.Error()}
 	}
 	if len(phrases) != 1 || len([]rune(strings.TrimSpace(phrases[0]))) < 2 {
-		return usageError{fmt.Sprintf("evidence search takes exactly one phrase of 2 characters or more (it has %d); flags may come anywhere, and each search is its own command", len(phrases))}
+		return usageError{fmt.Sprintf("evidence search takes exactly one phrase of 2 characters or more (it has %d phrases); flags may come anywhere, and each search is its own command", len(phrases))}
 	}
 	text := phrases[0]
 	if err := knownActor(*actor); err != nil {

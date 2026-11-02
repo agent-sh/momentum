@@ -135,11 +135,11 @@ The store is $MOMENTUM_HOME/momentum.db (default ~/.local/share/momentum).
 DUR is a Go duration or a number of days, e.g. 36h or 7d; WHEN is a DUR ago, a local time (2026-01-02T15:04,
 "2026-01-02 15:04", seconds optional, or a date) or a time with its offset (2026-01-02T15:04:05+03:00,
 "2026-01-02 15:04:05 +0300").
-Exit: 0 done, 2 usage or configuration error,
+Exit: 0 done, 1 a read that found nothing (evidence git's grep with no match, an --is-ancestor that does not
+hold), 2 usage, configuration error or a refusal,
 3 error (for ingest and sessions: at least one source failed, for capacity at least one rule; the others still
 ran; a report whose scan of a harness failed or was not done within 3 s still prints, exits 0 and names it on
-stderr).
-exit status: 0 done, 1 a read that found nothing (a grep with no match), 2 a usage or a refusal, 3 an error`
+stderr).`
 
 type usageError struct{ msg string }
 

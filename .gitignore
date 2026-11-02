@@ -1,0 +1,2 @@
+# the binary a go build ./cmd/momentum writes at the root
+/momentum
