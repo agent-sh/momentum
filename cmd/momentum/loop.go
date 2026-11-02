@@ -63,10 +63,8 @@ func expandAll(ps []string) []string {
 	return out
 }
 
-// setup builds the loop's parts from the machine's configuration: its runner and its ship tool, both under the
-// gates the configuration gives.
-func setup(st *store.Store, c config.Loop) (*loop.Runner, *loop.Ship, error) {
-	home := paths.Home()
+// selectionRunner reads only the store and its packages. It discovers no programs, toolchains or live sources.
+func selectionRunner(st *store.Store, c config.Loop) *loop.Runner {
 	b := loop.DefaultBudgets
 	for _, v := range []struct {
 		dst *float64
@@ -82,6 +80,19 @@ func setup(st *store.Store, c config.Loop) (*loop.Runner, *loop.Ship, error) {
 	if c.MaxTurns > 0 {
 		b.MaxTurns = c.MaxTurns
 	}
+	families := c.Families
+	if len(families) == 0 {
+		families = defaultFamilies
+	}
+	return &loop.Runner{Store: st, Ship: &loop.Ship{Store: st, Dir: loopDir()},
+		Families: families, Budgets: b, Dir: loopDir()}
+}
+
+// setup builds the live loop's parts from the machine's configuration: its runner and its ship tool, both under
+// the gates the configuration gives.
+func setup(st *store.Store, c config.Loop) (*loop.Runner, *loop.Ship, error) {
+	r := selectionRunner(st, c)
+	home := paths.Home()
 	name, email := gitGlobal("user.name"), gitGlobal("user.email")
 	bwrap, err := exec.LookPath("bwrap")
 	if err != nil {
@@ -112,26 +123,23 @@ func setup(st *store.Store, c config.Loop) (*loop.Runner, *loop.Ship, error) {
 	if fallback == "" {
 		fallback = defaultFallback
 	}
-	families := c.Families
-	if len(families) == 0 {
-		families = defaultFamilies
-	}
 	ds, err := listDetectors()
 	if err != nil {
 		return nil, nil, err
 	}
 	tacit, _ := exec.LookPath("tacit")
-	r := &loop.Runner{Store: st, Agent: loop.Agent{Runner: c.Runner, Model: model, Fallback: fallback, Bwrap: bwrap, Self: exe, Home: home,
-		Bedrock: &loop.Bedrock{File: c.BedrockEnv}}, Ship: ship,
-		Detectors: ds, Families: families, Budgets: b, Rules: c.Rules, Constraints: c.Constraints, ReadDirs: expandAll(c.ReadDirs),
-		Dir: loopDir(), Home: home, Bins: bins, Momentum: exe, Tacit: tacit,
-		Toolchains: loop.Toolchains{ReadOnly: sb.ReadOnly, Cache: sb.Cache, Path: toolPath},
-		Post: func(ctx context.Context, repo, pr, body string) (string, error) {
-			cctx, cancel := context.WithTimeout(ctx, time.Minute)
-			defer cancel()
-			out, err := commandOutput(exec.CommandContext(cctx, "gh", "pr", "comment", pr, "--repo", repo, "--body", body), false)
-			return strings.TrimSpace(string(out)), err
-		}}
+	r.Agent = loop.Agent{Runner: c.Runner, Model: model, Fallback: fallback, Bwrap: bwrap, Self: exe, Home: home,
+		Bedrock: &loop.Bedrock{File: c.BedrockEnv}}
+	r.Ship, r.Detectors = ship, ds
+	r.Rules, r.Constraints, r.ReadDirs = c.Rules, c.Constraints, expandAll(c.ReadDirs)
+	r.Home, r.Bins, r.Momentum, r.Tacit = home, bins, exe, tacit
+	r.Toolchains = loop.Toolchains{ReadOnly: sb.ReadOnly, Cache: sb.Cache, Path: toolPath}
+	r.Post = func(ctx context.Context, repo, pr, body string) (string, error) {
+		cctx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		out, err := commandOutput(exec.CommandContext(cctx, "gh", "pr", "comment", pr, "--repo", repo, "--body", body), false)
+		return strings.TrimSpace(string(out)), err
+	}
 	return r, ship, nil
 }
 
@@ -317,9 +325,12 @@ func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		}
 		defer unlock()
 	}
-	r, _, err := setup(st, c.Loop)
-	if err != nil {
-		return err
+	r := selectionRunner(st, c.Loop)
+	if !*dry {
+		r, _, err = setup(st, c.Loop)
+		if err != nil {
+			return err
+		}
 	}
 	r.Log = func(format string, a ...any) { fmt.Fprintf(stderr, format+"\n", a...) }
 	if !*dry {

@@ -46,6 +46,67 @@ func localRunner(t *testing.T, st *store.Store) *Runner {
 		Families: []string{"failures"}, Budgets: DefaultBudgets}
 }
 
+// A known primary result stays chargeable when a fallback's directory check prevents it from starting.
+func TestAFallbackStartupErrorKeepsKnownAccounting(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "marker-7f3a", 1)
+	run, why := r.reserve(ctx, c.Family, c.ID, StepInvestigate)
+	if why != "" {
+		t.Fatal(why)
+	}
+	write(t, filepath.Join(HostDir(run.Dir), "transcript.jsonl"), `{"type":"result","subtype":"success","is_error":true,"result":"the safeguards blocked it","total_cost_usd":0.25,"num_turns":1,"usage":{"input_tokens":10,"output_tokens":20}}`+"\n")
+	primary, err := readStream(filepath.Join(HostDir(run.Dir), "transcript.jsonl"))
+	if err != nil || !primary.CostKnown || primary.Failure != "the model's safeguards" {
+		t.Fatalf("primary result: %+v %v", primary, err)
+	}
+	primary.Model = "primary"
+	if err := os.MkdirAll(run.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("marker-7f3a", filepath.Join(run.Dir, "tmp")); err != nil {
+		t.Fatal(err)
+	}
+	startErr := runDirectories(run.Dir)
+	if startErr == nil {
+		t.Fatal("fallback accepted the planted directory link")
+	}
+	r.finish(ctx, c, &run, primary, startErr)
+	got, err := st.LoopRunByID(ctx, run.ID)
+	if err != nil || got.Status != store.RunFailed || got.Failure != "run" || !strings.Contains(got.Summary, startErr.Error()) || got.USD != 0.25 ||
+		got.Tokens != 30 || got.Turns != 1 || got.Model != "primary" {
+		t.Errorf("known primary accounting was lost: %+v %v", got, err)
+	}
+	if got, err := st.CaseByID(ctx, c.ID); err != nil || got.Cost.USD != 0.25 || got.Cost.Tokens != 30 || got.Cost.Runs != 1 {
+		t.Errorf("known primary accounting was lost on the case: %+v %v", got.Cost, err)
+	}
+}
+
+// The real sandbox returns the primary's known spend alongside an error when its fallback cannot start.
+func TestAFallbackThatNeverStartsChargesOnlyThePrimary(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	harness := script(t, t.TempDir(), "harness", `rmdir tmp || exit 1
+ln -s marker-7f3a tmp || exit 1
+`+modelResult(`{"type":"result","subtype":"success","is_error":true,"result":"the safeguards blocked it","total_cost_usd":0.25,"num_turns":1,"usage":{"input_tokens":10,"output_tokens":20}}`))
+	r := runnerFor(t, st, []string{harness})
+	r.Agent.Model, r.Agent.Fallback = "primary", "fallback"
+	c := openCase(t, st, "failures", "marker-7f3a", 1)
+	done, err := r.Once(ctx, Options{Families: []string{c.Family}})
+	if err != nil || len(done) != 1 {
+		t.Fatalf("fallback run: %+v %v", done, err)
+	}
+	run := done[0].Run
+	if run.Status != store.RunFailed || run.Failure != "run" || !strings.Contains(run.Summary, "run directory tmp is not a directory") ||
+		run.USD != 0.25 || run.Tokens != 30 || run.Turns != 1 || run.Model != "primary" {
+		t.Errorf("fallback startup lost known primary accounting: %+v", run)
+	}
+	if got, err := st.CaseByID(ctx, c.ID); err != nil || got.Cost.USD != 0.25 || got.Cost.Tokens != 30 || got.Cost.Runs != 1 {
+		t.Errorf("fallback startup lost the case's charge: %+v %v", got.Cost, err)
+	}
+}
+
 // Preparing a package is a build run. Its reservation and charge leave less room for the build that uses the clone.
 func TestAPreparationCountsTowardTheBuildBudgets(t *testing.T) {
 	ctx := context.Background()

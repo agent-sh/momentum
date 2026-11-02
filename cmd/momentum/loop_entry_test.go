@@ -220,6 +220,40 @@ func dryConfig(t *testing.T) {
 	}
 }
 
+// Dry selection executes no toolchain discovery, even when the discovered program would write outside the store.
+func TestADryLoopRunsNoToolchainDiscovery(t *testing.T) {
+	isolatedHome(t)
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	dryConfig(t)
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := st.ObserveCase(context.Background(), store.Finding{Family: "failures", Signature: "failures/v1:marker-7f3a",
+		Title: "marker-7f3a", Evidence: []store.Evidence{{Ref: "file:/fixture/marker-7f3a", At: time.Now()}}}, "test")
+	if closeErr := st.Close(); err != nil || closeErr != nil {
+		t.Fatalf("fixture store: %v %v", err, closeErr)
+	}
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "marker")
+	goFixture := filepath.Join(dir, "go")
+	if err := os.WriteFile(goFixture, []byte("#!/bin/sh\nprintf 'marker-7f3a' > '"+marker+"'\nprintf '/fixture/toolchain\\n/fixture/modules\\n'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	before := dryFiles(t, paths.Data())
+	code, out, errOut := momentum("loop", "--dry", "--json")
+	if code != 0 || !strings.Contains(out, c.ID) || !strings.Contains(out, `"step":"investigate"`) {
+		t.Errorf("dry selection: exit %d: %s %s", code, out, errOut)
+	}
+	if body, err := os.ReadFile(marker); !os.IsNotExist(err) {
+		t.Errorf("dry selection invoked go: marker %q, error %v", body, err)
+	}
+	if after := dryFiles(t, paths.Data()); !reflect.DeepEqual(before, after) {
+		t.Error("dry selection changed the store")
+	}
+}
+
 // A dry CLI call creates no store, schema, data directory or lock, and explains that no store exists.
 func TestADryLoopWithNoStoreCreatesNothing(t *testing.T) {
 	for _, directoryExists := range []bool{false, true} {

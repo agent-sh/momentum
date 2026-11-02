@@ -433,11 +433,12 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 		reserved = r.Budgets.Run
 	}
 	run.Ended = r.now()
+	run.USD, run.Tokens, run.Turns = res.USD, res.Tokens, res.Turns
+	run.Model = firstOf(res.Model, run.Model)
 	if err != nil {
 		run.Status, run.Failure, run.Summary = store.RunFailed, "run", err.Error()
 	} else {
-		run.Status, run.Failure, run.USD, run.Tokens, run.Turns = res.Status, res.Failure, res.USD, res.Tokens, res.Turns
-		run.Model = firstOf(res.Model, run.Model)
+		run.Status, run.Failure = res.Status, res.Failure
 		if run.Summary == "" {
 			run.Summary = summaryOf(res)
 		}

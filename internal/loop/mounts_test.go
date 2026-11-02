@@ -219,7 +219,7 @@ func TestAReviewReadsItsChangesWorkTreeThroughItsDoor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(p.Work, "notes.txt"), "a note\n")
+	write(t, filepath.Join(p.Work, "notes.txt"), "marker-7f3a\n")
 	tree, _, err := s.applyPatch(ctx, p, []Patch{fixturePatch(t, s, c.ID)})
 	if err != nil {
 		t.Fatal(err)
@@ -232,7 +232,11 @@ func TestAReviewReadsItsChangesWorkTreeThroughItsDoor(t *testing.T) {
 	if err := s.save(&p); err != nil {
 		t.Fatal(err)
 	}
-	harness := script(t, dir, "harness", `echo forbidden > '`+filepath.Join(export, "forbidden.txt")+`' 2> /dev/null; echo "tree-write=$?" >> codes
+	harness := script(t, dir, "harness", `cat '`+filepath.Join(export, "notes.txt")+`' > seen-tree; echo "tree-read=$?" >> codes
+test ! -e '`+filepath.Join(export, ".git")+`' && test ! -L '`+filepath.Join(export, ".git")+`'; echo "git-absent=$?" >> codes
+test ! -e '`+p.Work+`' && test ! -L '`+p.Work+`'; echo "clone-absent=$?" >> codes
+if echo forbidden > '`+filepath.Join(export, "forbidden.txt")+`' 2> /dev/null; then echo "tree-write=allowed" >> codes
+else echo "tree-write=denied" >> codes; fi
 test -s /run/momentum/input/diff.patch && echo "diff=present" >> codes
 test -s /run/momentum/input/package.json && echo "package=present" >> codes
 git -C '`+export+`' log > inner-git 2>&1; echo "inner-git=$?" >> codes
@@ -252,17 +256,17 @@ momentum case set `+c.ID+` --status open > set-out 2>&1; echo "case-set=$?" >> c
 	if err != nil || res.Status != store.RunOK {
 		t.Fatalf("%+v %v", res, err)
 	}
+	if b, err := os.ReadFile(filepath.Join(review.Dir, "seen-tree")); err != nil || string(b) != "marker-7f3a\n" {
+		t.Fatalf("the review could not read the proposed tree: %q %v", b, err)
+	}
 	codes, _ := os.ReadFile(filepath.Join(review.Dir, "codes"))
-	for _, want := range []string{"diff=present", "package=present", "tree-git=0", "prepare=126", "case-set=126"} {
+	for _, want := range []string{"tree-read=0", "tree-write=denied", "git-absent=0", "clone-absent=0", "diff=present", "package=present", "tree-git=0", "prepare=126", "case-set=126"} {
 		if !strings.Contains(string(codes), want+"\n") {
 			t.Errorf("the review's record lacks %q:\n%s", want, codes)
 		}
 	}
-	if strings.Contains(string(codes), "tree-write=0") || strings.Contains(string(codes), "inner-git=0") {
-		t.Errorf("the review changed its work tree, or read history in its sandbox:\n%s", codes)
-	}
-	if _, err := os.Stat(filepath.Join(p.Work, "forbidden.txt")); err == nil {
-		t.Error("the review wrote in the change's work tree")
+	if strings.Contains(string(codes), "inner-git=0") {
+		t.Errorf("the review read Git history from its export:\n%s", codes)
 	}
 	if b, _ := os.ReadFile(filepath.Join(review.Dir, "git-out")); !strings.Contains(string(b), "history of "+f.main) {
 		t.Errorf("the review read no history of its work tree through its door: %q", b)
