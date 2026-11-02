@@ -52,12 +52,22 @@ func emptyDir(dir string) error {
 			return err
 		}
 	default:
-		entries, err := os.ReadDir(dir)
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			return err
+		}
+		defer root.Close()
+		f, err := root.Open(".")
+		if err != nil {
+			return err
+		}
+		entries, err := f.ReadDir(-1)
+		f.Close()
 		if err != nil {
 			return err
 		}
 		for _, e := range entries {
-			if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			if err := root.RemoveAll(e.Name()); err != nil {
 				return err
 			}
 		}

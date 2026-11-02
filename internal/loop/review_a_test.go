@@ -303,7 +303,7 @@ func TestShipSandboxBuildsAnExportedGoCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir, err := s.export(context.Background(), p, "go-command", "origin/main")
+	dir, err := s.export(context.Background(), p, "before", "origin/main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +343,7 @@ func TestRunOutputAndGitLinkReadersRefuseSymlinks(t *testing.T) {
 	if err := (&Ship{}).ownTree(Package{Dir: repo, Work: dir}); err == nil {
 		t.Fatal("a linked git registration was accepted")
 	}
-	if f, err := createOutput(dir, "transcript.jsonl"); err == nil {
+	if f, err := exclusiveOutput(dir, "transcript.jsonl"); err == nil {
 		f.Close()
 		t.Fatal("a linked output was opened for truncation")
 	}

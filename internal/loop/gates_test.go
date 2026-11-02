@@ -166,7 +166,7 @@ fi`)
 	t.Run("deadline", func(t *testing.T) {
 		dir := t.TempDir()
 		fake := script(t, dir, "fixture", `case "$*" in *"--model primary"*) sleep 3; echo '{"type":"result","subtype":"success","is_error":true,"num_turns":1,"total_cost_usd":1,"result":"safeguards"}' ;; *) sleep 3; echo '`+okResult+`' ;; esac`)
-		res, err := testJail(t, Agent{Runner: []string{fake}, Model: "primary", Fallback: "fallback"}).RunOrFallback(context.Background(), Invocation{Dir: filepath.Join(dir, "run"), BudgetUSD: 4, MaxTurns: 10, Timeout: 5 * time.Second})
+		res, err := testJail(t, Agent{Runner: []string{fake}, Model: "primary", Fallback: "fallback"}).RunOrFallback(context.Background(), Invocation{Dir: filepath.Join(t.TempDir(), "run"), BudgetUSD: 4, MaxTurns: 10, Timeout: 5 * time.Second})
 		if err != nil || res.Status != store.RunTimeout || res.USD != 4 || res.Model != "fallback" {
 			t.Fatalf("fallback restarted time or lost unknown cost: %+v %v", res, err)
 		}
@@ -250,9 +250,11 @@ func TestABinaryDiffHidesNoSignalEdit(t *testing.T) {
 				text += "\x00\n"
 			}
 			write(t, filepath.Join(p.Work, "message.txt"), text)
-			if _, _, err := s.staged(context.Background(), p); err != nil {
+			tree, _, err := s.staged(context.Background(), p)
+			if err != nil {
 				t.Fatal(err)
 			}
+			p.Check = &Check{Tree: tree}
 			if err := s.editsSignal(context.Background(), p, goodSignal); err == nil {
 				t.Fatal("binary diff hid a removed signal")
 			}
@@ -627,8 +629,8 @@ func TestWhatARunIsHandedIsScrubbed(t *testing.T) {
 	if _, err := r.invokeReview(ctx, tc, p, run2); err != nil {
 		t.Fatal(err)
 	}
-	diff, _ := os.ReadFile(filepath.Join(run2.Dir, "diff.patch"))
-	pkg, _ := os.ReadFile(filepath.Join(run2.Dir, "package.json"))
+	diff, _ := os.ReadFile(filepath.Join(HostDir(run2.Dir), "primary", "diff.patch"))
+	pkg, _ := os.ReadFile(filepath.Join(HostDir(run2.Dir), "primary", "package.json"))
 	switch {
 	case strings.Contains(string(diff), "zz-private-value"):
 		t.Errorf("the review's diff went unscrubbed:\n%s", diff)

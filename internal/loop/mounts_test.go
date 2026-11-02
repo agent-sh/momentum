@@ -226,8 +226,8 @@ func TestAReviewReadsItsChangesWorkTreeThroughItsDoor(t *testing.T) {
 		t.Fatal(err)
 	}
 	harness := script(t, dir, "harness", `echo forbidden > '`+filepath.Join(p.Work, "forbidden.txt")+`' 2> /dev/null; echo "tree-write=$?" >> codes
-test -s diff.patch && echo "diff=present" >> codes
-test -s package.json && echo "package=present" >> codes
+test -s /run/momentum/input/diff.patch && echo "diff=present" >> codes
+test -s /run/momentum/input/package.json && echo "package=present" >> codes
 git -C '`+p.Work+`' log > inner-git 2>&1; echo "inner-git=$?" >> codes
 momentum evidence git '`+p.Work+`' log > git-out 2>&1; echo "tree-git=$?" >> codes
 momentum ship prepare --repo /somewhere > prepare-out 2>&1; echo "prepare=$?" >> codes

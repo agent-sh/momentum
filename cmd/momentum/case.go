@@ -205,6 +205,9 @@ func caseList(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return usageError{fmt.Sprintf("case list takes no arguments, got %q", fs.Arg(0))}
 	}
 	f := store.CaseFilter{Family: *family, All: *all}
+	if os.Getenv("MOMENTUM_LOOP_RUN") != "" {
+		f.Limit = loopQueryLimit + 1
+	}
 	if f.Family != "" && !slices.Contains(store.Families, f.Family) {
 		return usageError{fmt.Sprintf("--family %q is not one of %s", f.Family, strings.Join(store.Families, ", "))}
 	}
@@ -225,6 +228,10 @@ func caseList(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	cs, err := st.Cases(ctx, f)
 	if err != nil {
 		return err
+	}
+	if f.Limit > 0 && len(cs) > loopQueryLimit {
+		cs = cs[:loopQueryLimit]
+		defer fmt.Fprintln(stderr, "momentum: more cases; narrow with --family or --status")
 	}
 	enc := json.NewEncoder(stdout)
 	width := 14
@@ -282,6 +289,9 @@ func caseShow(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	if fs.NArg() > 0 {
 		return usageError{fmt.Sprintf("case show takes one case's id, got %q too", fs.Arg(0))}
 	}
+	if os.Getenv("MOMENTUM_LOOP_RUN") != "" && (*n <= 0 || *n > loopQueryLimit || *logN <= 0 || *logN > loopQueryLimit) {
+		return usageError{"a loop run reads 1 to 200 evidence and log entries; narrow the query"}
+	}
 	st, err := store.Open(paths.DB())
 	if err != nil {
 		return err
@@ -295,11 +305,14 @@ func caseShow(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	if err != nil {
 		return err
 	}
-	log, err := st.CaseLog(ctx, c.ID)
+	log, err := st.CaseLogLimit(ctx, c.ID, *logN)
 	if err != nil {
 		return err
 	}
-	logged := len(log)
+	logged, err := st.CaseLogCount(ctx, c.ID)
+	if err != nil {
+		return err
+	}
 	if *logN > 0 && len(log) > *logN {
 		log = log[len(log)-*logN:]
 	}

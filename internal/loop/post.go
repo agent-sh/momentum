@@ -1,7 +1,6 @@
 package loop
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/agent-sh/momentum/internal/jail"
 )
 
 // What the loop writes where others read it (a commit message, a pull request's title and body, a review it
@@ -24,6 +25,9 @@ var ErrNoScrubber = errors.New("the secret scrubber (scrump) does not run here")
 
 // Redact is a text with every secret the scrubber finds masked.
 func Redact(ctx context.Context, text string) (string, error) {
+	if len(text) > jail.MaxStream {
+		return "", fmt.Errorf("text exceeds the whole-stream limit")
+	}
 	if text == "" {
 		return "", nil
 	}
@@ -34,10 +38,13 @@ func Redact(ctx context.Context, text string) (string, error) {
 	defer cancel()
 	cmd := exec.CommandContext(cctx, Scrubber[0], Scrubber[1:]...)
 	cmd.Stdin = strings.NewReader(text)
-	var out, errOut bytes.Buffer
+	out, errOut := Capture{Limit: jail.MaxStream}, Capture{Limit: jail.MaxStream}
 	cmd.Stdout, cmd.Stderr = &out, &errOut
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("%w: %v", ErrNoScrubber, err)
+	}
+	if out.Over() || errOut.Over() {
+		return "", fmt.Errorf("%w: output exceeds the whole-stream limit", ErrNoScrubber)
 	}
 	if out.Len() == 0 && strings.TrimSpace(text) != "" {
 		// a scrubber that read a text and printed nothing did not scrub it: nothing goes on unscrubbed or empty

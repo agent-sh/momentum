@@ -89,7 +89,12 @@ type Spec struct {
 	// Door is a Unix socket outside, served by ServeDoor: the momentum and tacit commands inside send it their
 	// arguments. With no door they have nothing to read.
 	Door string
+	// Inputs is a host-owned directory descriptor mounted read-only at InputDir.
+	// It contains only the files this invocation needs, never its archived output.
+	Inputs *os.File
 }
+
+const InputDir = "/run/momentum/input"
 
 // etc are the files of /etc a program may need to start, read-only: the dynamic loader's cache, the alternatives'
 // links, name service and protocol tables, time zones, the MIME types and os-release, and the public certificate
@@ -165,6 +170,20 @@ func (s Spec) Command(ctx context.Context, argv ...string) (*exec.Cmd, error) {
 		args = append(args, "--ro-bind-data", strconv.Itoa(2+len(files)), f.path)
 	}
 	args = append(args, "--dir", home)
+	if s.Inputs != nil {
+		st, err := s.Inputs.Stat()
+		if err != nil || !st.IsDir() {
+			closeAll(files)
+			return nil, fmt.Errorf("jail: inputs must be a directory")
+		}
+		fd, err := dupCloexec(s.Inputs)
+		if err != nil {
+			closeAll(files)
+			return nil, err
+		}
+		files = append(files, fd)
+		args = append(args, "--ro-bind-fd", strconv.Itoa(2+len(files)), InputDir)
+	}
 	for _, a := range mounts {
 		if n, ok := pinned(a); ok {
 			fd, err := dupCloexec(pins[n])

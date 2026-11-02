@@ -2,11 +2,15 @@ package loop
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -17,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/agent-sh/momentum/internal/paths"
 )
@@ -106,21 +111,56 @@ func loopback(host string) bool {
 // forwards to the broker a model request of a Claude model on a global inference profile and the harness's listing of
 // the inference profiles, and refuses anything else.
 type relay struct {
-	srv     *http.Server
-	prefix  string
-	mu      sync.Mutex
-	refused []string // what it refused, each kind once: shown with the run
+	srv                           *http.Server
+	prefix                        string
+	mu                            sync.Mutex
+	refused                       []string // what it refused, each kind once: shown with the run
+	allowance, spent, reserved    float64
+	admittedN, refusedN, chargedN int
+	slots                         chan struct{}
+	wg                            sync.WaitGroup
+	closed                        bool
+	stop                          sync.Once
 }
+
+const relayBodyLimit = 8 << 20
+const relayInFlight = 8
+const relayWait = 3 * time.Second
+
+type relayRate struct {
+	input, output, read, write5, write1 float64
+	maxOutput                           int64
+}
+
+// Bedrock global rates, per million tokens. Source: Amazon Bedrock pricing,
+// global cross-region inference, 2026-11-02. The evaluation's bedrockRates
+// table uses these same values and will replace this small relay table.
+// The output ceiling is the models' 128K maximum:
+// https://platform.claude.com/docs/en/models/overview
+var relayRates = map[string]relayRate{
+	"global.anthropic.claude-opus-5-5":   {4, 20, .2, 5, 8, 128000},
+	"global.anthropic.claude-sonnet-5-5": {2, 10, .1, 2.5, 4, 128000},
+}
+
+type relayCharge struct {
+	reservation float64
+	rate        relayRate
+	parser      *usageParser
+}
+type relayChargeKey struct{}
 
 // open reads the broker's file and starts the run's relay on the socket; env is what the run's harness takes
 // inside its sandbox: the file's switch, auth and pins, with the relay's port and path as the broker's URL.
-func (b *Bedrock) open(socket string) (*relay, []string, error) {
+func (b *Bedrock) open(socket string, budget float64) (*relay, []string, error) {
 	vars, err := b.read()
 	if err != nil {
 		return nil, nil, err
 	}
 	target, _ := url.Parse(vars["ANTHROPIC_BEDROCK_BASE_URL"])
-	os.Remove(socket)
+	// A socket directory belongs to the host, never a run's writable mount.
+	if _, err := os.Lstat(socket); err == nil {
+		return nil, nil, fmt.Errorf("the relay socket already exists")
+	}
 	ln, err := net.Listen("unix", socket)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: the run's relay cannot listen: %v", ErrNoBedrock, err)
@@ -129,33 +169,11 @@ func (b *Bedrock) open(socket string) (*relay, []string, error) {
 		ln.Close()
 		return nil, nil, err
 	}
-	r := &relay{prefix: "/" + strings.ToLower(rand.Text())}
-	proxy := &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			// the path as it came, escapes and all: a model id may hold an escaped character
-			rest := strings.TrimPrefix(pr.In.URL.EscapedPath(), r.prefix)
-			pr.Out.URL.Scheme, pr.Out.URL.Host, pr.Out.Host = target.Scheme, target.Host, target.Host
-			pr.Out.URL.RawPath = strings.TrimSuffix(target.EscapedPath(), "/") + rest
-			pr.Out.URL.Path, _ = url.PathUnescape(pr.Out.URL.RawPath)
-		},
-		FlushInterval: -1, // a streamed answer streams on
-		ErrorLog:      log.New(io.Discard, "", 0),
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
-			http.Error(w, "the Bedrock broker did not answer", http.StatusBadGateway)
-		},
+	if budget <= 0 || budget > math.MaxFloat64/1.5 || math.IsNaN(budget) || math.IsInf(budget, 0) {
+		ln.Close()
+		return nil, nil, fmt.Errorf("invalid relay budget")
 	}
-	r.srv = &http.Server{ErrorLog: log.New(io.Discard, "", 0), Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if why := r.admit(req); why != "" {
-			r.mu.Lock()
-			if len(r.refused) < 8 && !slices.Contains(r.refused, why) {
-				r.refused = append(r.refused, why)
-			}
-			r.mu.Unlock()
-			http.Error(w, "momentum's relay refused the request: "+why, http.StatusForbidden)
-			return
-		}
-		proxy.ServeHTTP(w, req)
-	})}
+	r := newRelay(target, budget, nil)
 	go r.srv.Serve(ln)
 	var env []string
 	for _, k := range bedrockKeys {
@@ -167,6 +185,122 @@ func (b *Bedrock) open(socket string) (*relay, []string, error) {
 		}
 	}
 	return r, env, nil
+}
+
+func newRelay(target *url.URL, budget float64, transport http.RoundTripper) *relay {
+	r := &relay{prefix: "/" + strings.ToLower(rand.Text()), allowance: 1.5 * budget, slots: make(chan struct{}, relayInFlight)}
+	proxy := &httputil.ReverseProxy{
+		Transport: transport,
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			// the path as it came, escapes and all: a model id may hold an escaped character
+			rest := strings.TrimPrefix(pr.In.URL.EscapedPath(), r.prefix)
+			pr.Out.URL.Scheme, pr.Out.URL.Host, pr.Out.Host = target.Scheme, target.Host, target.Host
+			pr.Out.URL.RawPath = strings.TrimSuffix(target.EscapedPath(), "/") + rest
+			pr.Out.URL.Path, _ = url.PathUnescape(pr.Out.URL.RawPath)
+		},
+		FlushInterval: -1, // a streamed answer streams on
+		ModifyResponse: func(resp *http.Response) error {
+			if c, ok := resp.Request.Context().Value(relayChargeKey{}).(*relayCharge); ok {
+				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+					c.parser.bad = true
+				}
+				resp.Body = &usageBody{ReadCloser: resp.Body, parser: c.parser}
+			}
+			return nil
+		},
+		ErrorLog: log.New(io.Discard, "", 0),
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
+			http.Error(w, "the Bedrock broker did not answer", http.StatusBadGateway)
+		},
+	}
+	r.srv = &http.Server{ErrorLog: log.New(io.Discard, "", 0), Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		r.mu.Lock()
+		if r.closed {
+			r.mu.Unlock()
+			http.Error(w, "relay closed", 429)
+			return
+		}
+		r.wg.Add(1)
+		r.mu.Unlock()
+		defer r.wg.Done()
+		if why := r.admit(req); why != "" {
+			r.refuse(w, why, http.StatusForbidden)
+			return
+		}
+		if req.Method == http.MethodPost {
+			// Waiting peers retain no request body. Only these eight slots capture one.
+			timer := time.NewTimer(relayWait)
+			defer timer.Stop()
+			select {
+			case r.slots <- struct{}{}:
+				defer func() { <-r.slots }()
+			case <-timer.C:
+				r.refuse(w, "eight model requests are already in flight", 429)
+				return
+			case <-req.Context().Done():
+				r.refuse(w, "request ended while waiting", 429)
+				return
+			}
+			req.Body = http.MaxBytesReader(w, req.Body, relayBodyLimit)
+			body, err := io.ReadAll(req.Body)
+			req.Body.Close()
+			if err != nil {
+				r.refuse(w, "request body exceeds 8 MiB or could not be read", 413)
+				return
+			}
+			parts := strings.Split(req.URL.EscapedPath(), "/")
+			model, _ := url.PathUnescape(parts[len(parts)-2])
+			rate, ok := relayRates[model]
+			if !ok {
+				r.refuse(w, "no bounded price for this model", 403)
+				return
+			}
+			var input struct {
+				MaxTokens *int64 `json:"max_tokens"`
+			}
+			if json.Unmarshal(body, &input) != nil {
+				r.refuse(w, "invalid model request", 400)
+				return
+			}
+			output := rate.maxOutput
+			if input.MaxTokens != nil {
+				if *input.MaxTokens <= 0 || *input.MaxTokens > output {
+					r.refuse(w, "invalid max_tokens", 400)
+					return
+				}
+				output = *input.MaxTokens
+			}
+			reserve := (float64(output)*rate.output + float64(len(body))*rate.input/4) / 1e6
+			r.mu.Lock()
+			left := r.allowance - r.spent - r.reserved
+			if left <= 1e-12 {
+				r.mu.Unlock()
+				r.refuse(w, "run dollar allowance exhausted", 429)
+				return
+			}
+			reserve = min(reserve, left)
+			r.reserved += reserve
+			r.admittedN++
+			r.mu.Unlock()
+			c := &relayCharge{reservation: reserve, rate: rate, parser: &usageParser{stream: strings.HasSuffix(req.URL.Path, "/invoke-with-response-stream")}}
+			defer func() {
+				cost, ok := c.parser.cost(rate)
+				if !ok {
+					cost = reserve
+				}
+				r.mu.Lock()
+				r.reserved -= reserve
+				r.spent += cost
+				r.chargedN++
+				r.mu.Unlock()
+			}()
+			req = req.WithContext(context.WithValue(req.Context(), relayChargeKey{}, c))
+			req.Body = io.NopCloser(bytes.NewReader(body))
+			req.ContentLength = int64(len(body))
+		}
+		proxy.ServeHTTP(w, req)
+	}), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second}
+	return r
 }
 
 // admit says why the relay refuses a request, or "": under the relay's own path, a POST to a Claude model on a
@@ -186,7 +320,9 @@ func (r *relay) admit(req *http.Request) string {
 		if err != nil || !BedrockModel(id) || strings.Contains(id, "[") {
 			return fmt.Sprintf("model %q is no Claude model on a global inference profile", plainClip(id, 80))
 		}
-		return ""
+		if parts[2] == "invoke" || parts[2] == "invoke-with-response-stream" {
+			return ""
+		}
 	}
 	return fmt.Sprintf("%s %s is no model request", req.Method, plainClip("/"+strings.Join(parts, "/"), 80))
 }
@@ -198,7 +334,31 @@ func (r *relay) refusals() []string {
 	return append([]string{}, r.refused...)
 }
 
-func (r *relay) close() { r.srv.Close() }
+func (r *relay) refuse(w http.ResponseWriter, why string, code int) {
+	r.mu.Lock()
+	r.refusedN++
+	if len(r.refused) < 8 && !slices.Contains(r.refused, why) {
+		r.refused = append(r.refused, why)
+	}
+	r.mu.Unlock()
+	http.Error(w, "momentum's relay refused the request: "+why, code)
+}
+
+func (r *relay) accounting() (float64, int, int, int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.spent, r.admittedN, r.refusedN, r.chargedN
+}
+
+func (r *relay) close() {
+	r.stop.Do(func() {
+		r.mu.Lock()
+		r.closed = true
+		r.mu.Unlock()
+		r.srv.Close()
+		r.wg.Wait()
+	})
+}
 
 // BedrockModel says whether a model names a Claude model on Bedrock as the owner's runs take it: a global inference
 // profile. A regional one, or an alias the harness may resolve to one, is not. The relay holds every request to it;

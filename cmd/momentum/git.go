@@ -76,6 +76,11 @@ func evidenceGit(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		return usageError{"evidence git takes a repository's directory, then a git command that reads (log, show, diff, blame, ...)"}
 	}
 	dir, sub, rest := paths.Expand(args[0]), args[1], args[2:]
+	var err error
+	ctx, err = evidenceGitContext(ctx, dir)
+	if err != nil {
+		return err
+	}
 	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
 		return usageError{fmt.Sprintf("%s is no directory", dir)}
 	}
@@ -116,7 +121,7 @@ func evidenceGit(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	}
 	const home = "/run/momentum/home"
 	cmd, err := (jail.Spec{Home: home, Dir: resolved(dir), Mounts: jail.Tidy(mounts), Env: append(gitEnv(), "HOME="+home)}).Command(cctx,
-		append([]string{"git", "-C", resolved(dir)}, append(append(append([]string{}, gitSafe...), loop.GitSafety()...), argv...)...)...)
+		append(append([]string{"git"}, loop.GitLocation(ctx, dir)...), append(append(append([]string{}, gitSafe...), loop.GitSafety()...), argv...)...)...)
 	if err != nil {
 		return fmt.Errorf("evidence git requires its filesystem sandbox: %w", err)
 	}
@@ -384,15 +389,37 @@ func repoPath(p string) error {
 
 // gitRead runs one git command of momentum's own, with the safe settings.
 func gitRead(ctx context.Context, dir string, args ...string) (string, error) {
+	var err error
+	ctx, err = evidenceGitContext(ctx, dir)
+	if err != nil {
+		return "", err
+	}
 	if err := loop.CheckGitConfig(ctx, dir); err != nil {
 		return "", err
 	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, "git", append(append(append([]string{"-C", dir}, gitSafe...), loop.GitSafety()...), args...)...)
+	cmd := exec.CommandContext(cctx, "git", append(append(append(loop.GitLocation(ctx, dir), gitSafe...), loop.GitSafety()...), args...)...)
 	cmd.Env = gitEnv()
-	out, err := cmd.Output()
-	return string(out), err
+	out, diag := loop.Capture{Limit: jail.MaxStream}, loop.Capture{Limit: jail.MaxStream}
+	cmd.Stdout, cmd.Stderr = &out, &diag
+	err = cmd.Run()
+	if out.Over() || diag.Over() {
+		return "", fmt.Errorf("Git output exceeds the whole-stream limit")
+	}
+	return out.String(), err
+}
+
+func evidenceGitContext(ctx context.Context, dir string) (context.Context, error) {
+	work := os.Getenv("MOMENTUM_LOOP_WORK")
+	if os.Getenv("MOMENTUM_LOOP_RUN") != "" && work != "" && within(dir, work) {
+		reg := os.Getenv("MOMENTUM_LOOP_GIT_DIR")
+		if err := loop.VerifyGitDirectory(work, reg); err != nil {
+			return ctx, err
+		}
+		ctx = loop.WithGitDirectory(ctx, work, reg)
+	}
+	return ctx, nil
 }
 
 // gitEnv is momentum's environment without git's own variables (a GIT_DIR would point it elsewhere), never

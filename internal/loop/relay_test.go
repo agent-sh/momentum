@@ -26,7 +26,7 @@ func TestASafeguardsRefusalAfterARelayRefusalStillFallsBack(t *testing.T) {
 	harness := script(t, dir, "harness", `curl -s -o /dev/null -X POST -d '{}' "$ANTHROPIC_BEDROCK_BASE_URL/model/us.anthropic.claude-haiku-4-5-20251001-v1:0/invoke"
 case "$*" in *"--model model-a"*) echo '`+refused+`' ;; *) echo '`+okResult+`' ;; esac`)
 	a := testJail(t, Agent{Runner: []string{harness}, Model: "model-a", Fallback: "model-b", Bedrock: b.Bedrock})
-	res, err := a.RunOrFallback(context.Background(), Invocation{Dir: filepath.Join(dir, "run"), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Minute})
+	res, err := a.RunOrFallback(context.Background(), Invocation{Dir: filepath.Join(t.TempDir(), "run"), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Minute})
 	if err != nil || res.Status != store.RunOK || res.Model != "model-b" || res.USD != 1 || res.Failure != "" {
 		t.Fatalf("the run after a relay refusal and a safeguards stop: %+v %v", res, err)
 	}
@@ -158,7 +158,7 @@ code -X POST -d '{}' "$base/model/global.anthropic.claude-opus-5-5%5B1m%5D/invok
 code -X POST -d '{}' "$base/model/global.anthropic.claude-opus-5-5/invoke"
 echo '`+okResult+`'`)
 	a := testJail(t, Agent{Runner: []string{harness}, Model: "global.anthropic.claude-opus-5-5", Bedrock: b.Bedrock})
-	if _, err := a.Run(context.Background(), Invocation{Dir: filepath.Join(dir, "run"), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Minute}); err != nil {
+	if _, err := a.Run(context.Background(), Invocation{Dir: filepath.Join(t.TempDir(), "run"), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Minute}); err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.Join(codes(t, []string{harness}), " "); got != "200 403 403 403 200" {

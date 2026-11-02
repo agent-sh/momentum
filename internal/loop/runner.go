@@ -374,7 +374,10 @@ func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, e
 	for _, run := range runs {
 		ref := "file:" + filepath.Join(r.Dir, "runs", run.ID)
 		if run.Dir != "" {
-			ref = "file:" + filepath.Join(run.Dir, "transcript.jsonl")
+			ref = "file:" + filepath.Join(HostDir(run.Dir), "transcript.jsonl")
+			if st, err := os.Stat(filepath.Join(HostDir(run.Dir), "transcript.fallback.jsonl")); err == nil && st.Mode().IsRegular() {
+				ref = "file:" + filepath.Join(HostDir(run.Dir), "transcript.fallback.jsonl")
+			}
 		}
 		f.Evidence = append(f.Evidence, store.Evidence{Ref: ref, At: run.Started, Kind: "loop-run", Summary: run.Step + " " + run.Case + ": " + run.Failure})
 	}
@@ -433,6 +436,10 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 			// rule compare the failure
 			run.Summary = strings.TrimSpace(run.Summary + " (the relay refused " + strings.Join(res.Refused, "; ") + ")")
 		}
+		if res.RelayAdmitted > 0 {
+			run.Summary = strings.TrimSpace(run.Summary + fmt.Sprintf(" (relay: %d admitted, %d refused, %d charged, $%.6f)",
+				res.RelayAdmitted, res.RelayRefused, res.RelayCharged, res.RelayUSD))
+		}
 		if run.Status == store.RunOK && run.Step == StepPublish && !r.published(ctx, c.ID) {
 			// a publish is done by its receipt, never by the run ending well: one that left none failed, and the stop rule
 			// stops a case whose publishes keep leaving none
@@ -445,6 +452,7 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 	case !res.CostKnown:
 		run.USD = reserved // what it spent is unknown: its whole budget
 	}
+	run.USD = max(run.USD, res.RelayUSD)
 	if err := r.Store.FinishLoopRun(ctx, *run); err != nil {
 		r.logf("record run %s: %v", run.ID, err)
 		return
@@ -518,11 +526,9 @@ func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step s
 			if err != nil {
 				return Result{}, err
 			}
-			if err := os.WriteFile(filepath.Join(run.Dir, "review.md"), []byte(text), 0o600); err != nil {
-				return Result{}, err
-			}
+			inv.Files = map[string][]byte{"review.md": []byte(text)}
 			inv.Prompt += fmt.Sprintf("\nIts change %s was reviewed: round %d found %d high, %d medium and %d low, in review.md. Revise the change "+
-				"in its work tree %s for what the review found, check it again (`momentum ship check`) and propose it again (`momentum ship "+
+				"in its work tree %s for what the review found (read /run/momentum/input/review.md), check it again (`momentum ship check`) and propose it again (`momentum ship "+
 				"propose`), which updates its pull request.", p.PR, last.Round, last.High, last.Medium, last.Low, p.Work)
 		}
 	}
@@ -660,9 +666,6 @@ func (r *Runner) invokeReview(ctx context.Context, c store.Case, p Package, run 
 	if err != nil {
 		return Result{}, err
 	}
-	if err := os.WriteFile(filepath.Join(run.Dir, "diff.patch"), []byte(diff), 0o600); err != nil {
-		return Result{}, err
-	}
 	raw, _ := json.MarshalIndent(p, "", "  ")
 	pkg, err := Redact(ctx, string(raw))
 	if err != nil {
@@ -671,11 +674,8 @@ func (r *Runner) invokeReview(ctx context.Context, c store.Case, p Package, run 
 	if !json.Valid([]byte(pkg)) {
 		pkg = `{"withheld": "the package's record did not stay valid once scrubbed"}`
 	}
-	if err := os.WriteFile(filepath.Join(run.Dir, "package.json"), []byte(pkg), 0o600); err != nil {
-		return Result{}, err
-	}
 	inv := Invocation{Dir: run.Dir, System: system, Schema: reviewSchema, MaxTurns: r.Budgets.MaxTurns, BudgetUSD: r.Budgets.Run,
-		Timeout: r.Budgets.RunTime, Persist: true}
+		Timeout: r.Budgets.RunTime, Persist: true, Files: map[string][]byte{"diff.patch": []byte(diff), "package.json": []byte(pkg)}}
 	// the work tree is read-only, and its .git link names a directory the sandbox does not hold: its history is read
 	// through the door, which reads repositories in it as a build's does
 	roots := []string{run.Dir}
@@ -683,7 +683,7 @@ func (r *Runner) invokeReview(ctx context.Context, c store.Case, p Package, run 
 		inv.Mounts = []jail.Mount{{Path: p.Work}}
 		roots = append(roots, p.Work)
 	}
-	inv.Prompt = fmt.Sprintf("Review the change package of case %s (%s): %s. The change is diff.patch and the package package.json in your "+
+	inv.Prompt = fmt.Sprintf("Review the change package of case %s (%s): %s. The change is /run/momentum/input/diff.patch and the package /run/momentum/input/package.json. Your "+
 		"working directory %s; the work tree is %s. Read the case with `momentum case show %s --json`. End with the review's report.",
 		c.ID, c.Family, p.Title, run.Dir, p.Work, c.ID)
 	inv.Door = r.door(StepReview, c, run, roots)

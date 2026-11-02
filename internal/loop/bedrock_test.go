@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,22 +22,41 @@ type broker struct {
 	url   string
 	mu    sync.Mutex
 	paths []string
+	reply []byte
 }
 
 func fakeBroker(t *testing.T) *broker {
 	t.Helper()
 	b := &broker{}
 	nonce := "/n" + strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("fake broker cannot listen in this sandbox: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		b.mu.Lock()
 		b.paths = append(b.paths, req.Method+" "+req.URL.Path)
+		reply := append([]byte{}, b.reply...)
 		b.mu.Unlock()
 		if !strings.HasPrefix(req.URL.Path, nonce+"/") {
 			http.Error(w, "no", http.StatusForbidden)
 			return
 		}
-		w.Write([]byte("{}"))
+		if strings.HasSuffix(req.URL.Path, "/invoke-with-response-stream") {
+			w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
+			if len(reply) > 0 {
+				w.Write(reply)
+				return
+			}
+			w.Write(eventFrame([]byte(`{"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0}}}`)))
+			w.Write(eventFrame([]byte(`{"type":"message_delta","usage":{"output_tokens":0}}`)))
+		} else {
+			w.Write([]byte(`{"usage":{"input_tokens":0,"output_tokens":0}}`))
+		}
 	}))
+	srv.Listener.Close()
+	srv.Listener = listener
+	srv.Start()
 	t.Cleanup(srv.Close)
 	b.url = srv.URL + nonce
 	file := filepath.Join(t.TempDir(), "bedrock.env")
@@ -90,8 +110,7 @@ func TestARunGoesThroughItsRelayToTheBroker(t *testing.T) {
 	b := fakeBroker(t)
 	harness := harnessOnRoute(t, okResult, "POST /model/global.anthropic.claude-opus-5-5/invoke-with-response-stream", "GET /inference-profiles")
 	a := testJail(t, Agent{Runner: harness, Model: "global.anthropic.claude-opus-5-5", Bedrock: b.Bedrock})
-	dir := t.TempDir()
-	res, err := a.Run(context.Background(), Invocation{Dir: filepath.Join(dir, "run"), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Minute})
+	res, err := a.Run(context.Background(), Invocation{Dir: filepath.Join(t.TempDir(), "run"), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Minute})
 	if err != nil || res.Status != "ok" {
 		t.Fatalf("%+v %v", res, err)
 	}
@@ -163,7 +182,7 @@ echo '`+okResult+`'`)
 	}
 	before := len(b.seen())
 	a := testJail(t, Agent{Runner: []string{p}, Model: "global.anthropic.claude-opus-5-5", Bedrock: b.Bedrock})
-	if _, err := a.Run(context.Background(), Invocation{Dir: filepath.Join(dir, "run"), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Minute}); err != nil {
+	if _, err := a.Run(context.Background(), Invocation{Dir: filepath.Join(t.TempDir(), "run"), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Minute}); err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.Join(codes(t, []string{p}), " "); !strings.Contains(got, "refused") && !strings.HasPrefix(got, "000") {
@@ -194,7 +213,7 @@ echo '`+okResult+`'`)
 		if route == nil {
 			a.Bedrock = nil
 		}
-		_, err := a.Run(context.Background(), Invocation{Dir: filepath.Join(dir, name), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Minute})
+		_, err := a.Run(context.Background(), Invocation{Dir: filepath.Join(t.TempDir(), name), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Minute})
 		if !errors.Is(err, ErrNoBedrock) {
 			t.Errorf("%s: %v", name, err)
 		}

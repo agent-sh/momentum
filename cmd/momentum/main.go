@@ -3,7 +3,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -122,6 +121,10 @@ stderr).`
 
 type usageError struct{ msg string }
 
+// loopQueryLimit reuses evidence events' existing zero-limit default.
+// Door queries stop materializing rows before the stream cap is reached.
+const loopQueryLimit = 200
+
 func (u usageError) Error() string { return u.msg }
 
 func main() {
@@ -139,8 +142,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if os.Getenv("MOMENTUM_LOOP_RUN") == "" {
 		return runCommand(ctx, args, stdout, stderr)
 	}
-	var out, diag bytes.Buffer
+	out, diag := loop.Capture{Limit: jail.MaxStream}, loop.Capture{Limit: jail.MaxStream}
 	code := runCommand(ctx, args, &out, &diag)
+	if out.Over() || diag.Over() {
+		fmt.Fprintln(stderr, "(output withheld: over the door's limit)")
+		return 3
+	}
 	cleanOut, outErr := loop.Redact(ctx, out.String())
 	cleanDiag, diagErr := loop.Redact(ctx, diag.String())
 	if outErr != nil || diagErr != nil {
@@ -295,7 +302,10 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		return usageError{strayArgs("evidence events", fs.Arg(0))}
 	}
 	if *limit <= 0 {
-		*limit = 200
+		*limit = loopQueryLimit
+	}
+	if os.Getenv("MOMENTUM_LOOP_RUN") != "" && *limit > loopQueryLimit {
+		return usageError{"a loop run reads at most 200 events; narrow the query"}
 	}
 	sinceSet := false
 	fs.Visit(func(f *flag.Flag) { sinceSet = sinceSet || f.Name == "since" })

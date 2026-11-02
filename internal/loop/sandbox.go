@@ -1,7 +1,6 @@
 package loop
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +11,8 @@ import (
 	"syscall"
 	"time"
 	"unicode"
+
+	"github.com/agent-sh/momentum/internal/jail"
 )
 
 // testPrograms are the programs a check may run as its test: the test runners of the languages the owned
@@ -127,7 +128,7 @@ func (s Sandbox) Run(ctx context.Context, dir string, words []string, env []stri
 	}
 	cache := s.Cache
 	if cache != "" {
-		if err := os.MkdirAll(filepath.Join(cache, "go-build"), 0o700); err != nil {
+		if err := (Toolchains{Cache: cache}).makeCaches(); err != nil {
 			return Outcome{}, err
 		}
 		args = append(args, "--bind", cache, cache)
@@ -141,12 +142,15 @@ func (s Sandbox) Run(ctx context.Context, dir string, words []string, env []stri
 	defer cancel()
 	cmd := exec.CommandContext(cctx, s.Bwrap, args...)
 	cmd.Env = s.env(scratch, cache, env)
-	var out bytes.Buffer
+	out := Capture{Limit: jail.MaxStream}
 	cmd.Stdout, cmd.Stderr = &out, &out
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	start := time.Now()
 	err = cmd.Run()
+	if out.Over() {
+		return Outcome{}, fmt.Errorf("test output exceeds the whole-stream limit")
+	}
 	o := Outcome{Seconds: time.Since(start).Seconds(), Tail: tailOf(out.Bytes(), 1500)}
 	var ee *exec.ExitError
 	switch {

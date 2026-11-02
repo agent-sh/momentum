@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/agent-sh/momentum/internal/jail"
 )
 
 // ErrRefused is a gate's refusal: the write is outside the loop's authority, now or ever. The agent's run ends its
@@ -153,13 +155,18 @@ func (g Gate) scope(ctx context.Context, repo, dir string) error {
 	defer cancel()
 	cmd := exec.CommandContext(cctx, g.RepoGuard[0], append(append([]string{}, g.RepoGuard[1:]...), "--repo", repo, "--path", dir)...)
 	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0")
-	out, err := cmd.Output()
+	out, diag := Capture{Limit: jail.MaxStream}, Capture{Limit: jail.MaxStream}
+	cmd.Stdout, cmd.Stderr = &out, &diag
+	err := cmd.Run()
+	if out.Over() || diag.Over() {
+		return refused("scope output exceeds the whole-stream limit")
+	}
 	var v struct {
 		Allowed     bool     `json:"allowed"`
 		Disposition string   `json:"disposition"`
 		Reasons     []string `json:"reasons"`
 	}
-	if jerr := json.Unmarshal(out, &v); err != nil || jerr != nil || !v.Allowed || v.Disposition == "report_only" {
+	if jerr := json.Unmarshal(out.Bytes(), &v); err != nil || jerr != nil || !v.Allowed || v.Disposition == "report_only" {
 		why := strings.Join(v.Reasons, "; ")
 		if why == "" && err != nil {
 			why = err.Error()
@@ -225,17 +232,22 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 	}
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, "git", append(append([]string{"-C", dir}, GitSafety()...), args...)...)
+	cmd := exec.CommandContext(cctx, "git", append(append(gitLocation(ctx, dir), GitSafety()...), args...)...)
 	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0")
-	out, err := cmd.Output()
+	out, diag := Capture{Limit: jail.MaxStream}, Capture{Limit: jail.MaxStream}
+	cmd.Stdout, cmd.Stderr = &out, &diag
+	err := cmd.Run()
+	if out.Over() || diag.Over() {
+		return "", refused("Git output exceeds the whole-stream limit")
+	}
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
-			return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(ee.Stderr)))
+			return out.String(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(diag.String()))
 		}
-		return string(out), err
+		return out.String(), err
 	}
-	return string(out), nil
+	return out.String(), nil
 }
 
 // noGitEnv removes caller Git variables and EMAIL, which Git takes for an identity, and pins tree attributes.

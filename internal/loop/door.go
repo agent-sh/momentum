@@ -1,15 +1,16 @@
 package loop
 
 import (
-	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/agent-sh/momentum/internal/jail"
 	"github.com/agent-sh/momentum/internal/store"
@@ -68,16 +69,30 @@ func (r *Runner) door(step string, c store.Case, run store.LoopRun, roots []stri
 		defer cancel()
 		cmd := exec.CommandContext(cctx, prog, req.Argv[1:]...)
 		cmd.Env, cmd.Dir = env, run.Dir
-		for _, root := range roots {
-			if within(req.Dir, root) {
-				cmd.Dir = req.Dir
+		if r.Ship != nil {
+			if p, ok, err := r.Ship.Load(c.ID); err != nil {
+				return jail.Refuse("cannot read the host's package: %v", err)
+			} else if ok {
+				cmd.Env = append(append([]string{}, cmd.Env...), "MOMENTUM_LOOP_GIT_DIR="+p.GitDir, "MOMENTUM_LOOP_WORK="+p.Work)
 			}
 		}
-		var out, diag bytes.Buffer
+		cwd, err := doorDirectory(req.Dir, run.Dir, roots)
+		if err != nil {
+			return jail.Refuse("command directory: %v", err)
+		}
+		defer cwd.Close()
+		// Keep the parent descriptor alive until the child ends. Path replacements
+		// cannot redirect the child's chdir outside its checked root.
+		cmd.Dir = fmt.Sprintf("/proc/%d/fd/%d", os.Getpid(), cwd.Fd())
+		out, diag := Capture{Limit: jail.MaxStream}, Capture{Limit: jail.MaxStream}
 		cmd.Stdout, cmd.Stderr = &out, &diag
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
-		err := cmd.Run()
+		cmd.WaitDelay = time.Second
+		err = cmd.Run()
+		if out.Over() || diag.Over() {
+			return jail.Reply{Stderr: []byte("(output withheld: over the door's limit)\n"), Code: 126}
+		}
 		code := 0
 		var ee *exec.ExitError
 		switch {
@@ -97,6 +112,31 @@ func (r *Runner) door(step string, c store.Case, run store.LoopRun, roots []stri
 		}
 		return reply
 	}
+}
+
+func doorDirectory(want, fallback string, roots []string) (*os.File, error) {
+	if want == "" {
+		want = fallback
+	}
+	for _, dir := range roots {
+		if !within(want, dir) {
+			continue
+		}
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			return nil, err
+		}
+		name, err := filepath.Rel(dir, want)
+		if err != nil {
+			root.Close()
+			return nil, err
+		}
+		f, err := root.OpenFile(name, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+		root.Close()
+		return f, err
+	}
+	// An outside directory keeps the established fallback to the run's own directory.
+	return doorDirectory("", fallback, []string{fallback})
 }
 
 func firstWords(argv []string, n int) []string {
@@ -130,7 +170,25 @@ func (t Toolchains) makeCaches() error {
 	if t.Cache == "" {
 		return nil
 	}
-	return os.MkdirAll(filepath.Join(t.Cache, "go-build"), 0o700)
+	if err := os.MkdirAll(t.Cache, 0o700); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(t.Cache)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	st, err := root.Lstat("go-build")
+	if errors.Is(err, os.ErrNotExist) {
+		return root.Mkdir("go-build", 0o700)
+	}
+	if err != nil {
+		return err
+	}
+	if !st.IsDir() || st.Mode()&os.ModeSymlink != 0 {
+		return errors.New("build cache is not a directory")
+	}
+	return nil
 }
 
 func (t Toolchains) mounts() []jail.Mount {

@@ -67,25 +67,3 @@ func regularOwned(f *os.File) (os.FileInfo, error) {
 	}
 	return st, nil
 }
-
-// createOutput opens a run's output without truncating anything before the descriptor is checked. A fallback
-// uses the same run directory, which the earlier attempt could have filled with links or pipes.
-func createOutput(dir, name string) (*os.File, error) {
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		return nil, err
-	}
-	defer root.Close()
-	f, err := root.OpenFile(name, os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	if _, err = regularOwned(f); err == nil {
-		err = f.Truncate(0)
-	}
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
-	return f, nil
-}

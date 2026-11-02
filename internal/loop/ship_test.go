@@ -37,6 +37,10 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	testCache = dir
+	// Relays belong to the fixtures, never the caller's runtime directory or store.
+	if err := os.Setenv("XDG_RUNTIME_DIR", firstOf(os.Getenv("TMPDIR"), dir)); err != nil {
+		panic(err)
+	}
 	Scrubber = []string{"cat"} // the tests' own: a test that reads what the scrubber does sets one that does it
 	code := m.Run()
 	os.RemoveAll(dir)
@@ -670,9 +674,11 @@ func TestAChangeMayNotRewriteItsSignalsText(t *testing.T) {
 		t.Fatal(err)
 	}
 	write(t, filepath.Join(p.Work, "notes.md"), "quiet now\n")
-	if _, _, err := s.staged(ctx, p); err != nil {
+	tree, _, err := s.staged(ctx, p)
+	if err != nil {
 		t.Fatal(err)
 	}
+	p.Check = &Check{Tree: tree}
 	if err := s.editsSignal(ctx, p, goodSignal); !errors.Is(err, ErrRefused) {
 		t.Fatalf("a removed line that opens with dashes: %v", err)
 	}
@@ -829,7 +835,7 @@ func TestEachStepChecksAgainWhatItRestsOn(t *testing.T) {
 	if head := strings.TrimSpace(run(t, p.Work, "git", "rev-parse", "HEAD")); head != p.Head {
 		t.Fatalf("the other repository's head is %s, not the reviewed %s", head, p.Head)
 	}
-	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), ".git points to") || originHead(t, f, "main") != base {
+	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "recorded registration") || originHead(t, f, "main") != base {
 		t.Fatalf("a landing through a .git pointed elsewhere: %v", err)
 	}
 	write(t, filepath.Join(p.Work, ".git"), string(link))
@@ -922,6 +928,7 @@ func TestARevisionDoesNotOverwriteAnotherPushToItsBranch(t *testing.T) {
 		t.Fatal(err)
 	}
 	theirs := pushOther(t, f, p.Branch, map[string]string{"theirs.txt": "a fix of someone's\n"})
+	run(t, f.main, "git", "fetch", "origin", p.Branch)
 	write(t, filepath.Join(p.Work, "fake.go"), strings.Replace(fixed("42"), "// Answer is the answer.", "// Answer is 42.", 1))
 	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
 		t.Fatal(err)

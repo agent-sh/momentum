@@ -57,7 +57,7 @@ const DefaultTools = "Read,Grep,Glob,Write,Edit,Bash,Agent"
 
 // Invocation is one run of the agent.
 type Invocation struct {
-	Dir       string // the run's own directory: its working directory, where its files and its transcript go
+	Dir       string // the run's writable directory: temporary files, configuration and sessions
 	Prompt    string
 	System    string // appended to the harness's system prompt: the loop's procedure, the family's skill, the rules
 	Schema    string // the JSON schema of the run's final report
@@ -67,7 +67,9 @@ type Invocation struct {
 	Persist   bool         // keep the session's transcript (live runs), in the run's own directory
 	Mounts    []jail.Mount // what the run reaches besides its own directory: a build's work tree, a review's
 	Env       map[string]string
-	Tools     string // the built-in tools it has: DefaultTools when empty, "none" none (a judge), or a list
+	Tools     string            // the built-in tools it has: DefaultTools when empty, "none" none (a judge), or a list
+	Files     map[string][]byte // host-owned review inputs, mounted read-only beside the system and schema
+	fallback  bool
 	// Door runs the momentum and tacit commands the run types, outside its sandbox: what its step allows, as the
 	// loop runs them. Nil: the run has none.
 	Door func(context.Context, jail.Request) jail.Reply
@@ -87,18 +89,20 @@ type Result struct {
 	Text       string          // the final text
 	Denials    int             // calls the harness refused
 	Session    string
-	Transcript string // the run's stream of events, in Dir
+	Transcript string // the run's host-only stream archive, outside every run mount
 	Model      string // the model that ran it
 	// Refused is what the run's relay refused to forward, one entry for each kind of request: shown with the run, never
 	// part of Failure, which the fallback and the stop rule compare.
-	Refused []string
+	Refused                                   []string
+	RelayUSD                                  float64
+	RelayAdmitted, RelayRefused, RelayCharged int
 }
 
 // stopGrace is how long a run that ran out of its time has to stop after SIGTERM before it is killed.
 var stopGrace = 10 * time.Second
 
-// Run runs the agent once in its sandbox and returns what came of it. It writes the run's files into inv.Dir (its
-// system prompt, schema and the stream of its events) and waits for it, at most inv.Timeout; then it stops the
+// Run runs the agent once in its sandbox and returns what came of it. It writes trusted files into HostDir(inv.Dir)
+// and gives the harness only its read-only inputs. It waits at most inv.Timeout; then it stops the
 // sandbox, and every process the run started goes with it.
 //
 // Inside, the harness has its own directory and inv.Mounts, an empty home, and no network but its relay; it runs
@@ -116,30 +120,53 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	for _, d := range []string{inv.Dir, filepath.Join(inv.Dir, "tmp"), filepath.Join(inv.Dir, "claude")} {
+	for _, d := range []string{inv.Dir, HostDir(inv.Dir), filepath.Join(inv.Dir, "tmp"), filepath.Join(inv.Dir, "claude")} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return Result{}, err
 		}
 	}
+	if err := hostDir(HostDir(inv.Dir)); err != nil {
+		return Result{}, err
+	}
 	mounts := append(append([]jail.Mount{{Path: inv.Dir, Write: true}, {Path: harness}}, a.Mounts...), inv.Mounts...)
 	for _, m := range mounts {
+		if within(HostDir(inv.Dir), m.Path) || within(m.Path, HostDir(inv.Dir)) {
+			return Result{}, fmt.Errorf("a run mount reaches its host-only directory")
+		}
 		if _, err := os.Stat(m.Path); errors.Is(err, os.ErrNotExist) {
 			return Result{}, fmt.Errorf("the sandbox cannot mount %s: it does not exist", m.Path)
 		} else if err != nil {
 			return Result{}, fmt.Errorf("the sandbox cannot mount %s: %w", m.Path, err)
 		}
 	}
-	write := func(name string, data []byte) (string, error) {
-		p := filepath.Join(inv.Dir, name)
-		return p, os.WriteFile(p, data, 0o600)
+	attempt := "primary"
+	streamName, errName := "transcript.jsonl", "stderr.txt"
+	if inv.fallback {
+		attempt, streamName, errName = "fallback", "transcript.fallback.jsonl", "stderr.fallback.txt"
 	}
-	system, err := write("system.md", []byte(inv.System))
+	inputDir := filepath.Join(HostDir(inv.Dir), attempt)
+	if err := hostDir(inputDir); err != nil {
+		return Result{}, err
+	}
+	for name, data := range inv.Files {
+		if filepath.Base(name) != name || name == "system.md" || name == "schema.json" {
+			return Result{}, fmt.Errorf("invalid run input name")
+		}
+		if err := writeExclusive(inputDir, name, data); err != nil {
+			return Result{}, err
+		}
+	}
+	if err := writeExclusive(inputDir, "system.md", []byte(inv.System)); err != nil {
+		return Result{}, err
+	}
+	if err := writeExclusive(inputDir, "schema.json", []byte(inv.Schema)); err != nil {
+		return Result{}, err
+	}
+	inputs, err := os.Open(inputDir)
 	if err != nil {
 		return Result{}, err
 	}
-	if _, err := write("schema.json", []byte(inv.Schema)); err != nil {
-		return Result{}, err
-	}
+	defer inputs.Close()
 	tools := inv.Tools
 	switch tools {
 	case "":
@@ -150,7 +177,7 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	args := append(append([]string{}, a.Runner[1:]...), "-p", inv.Prompt,
 		"--bare", "--dangerously-skip-permissions", "--tools", tools,
 		"--output-format", "stream-json", "--verbose",
-		"--append-system-prompt-file", system,
+		"--append-system-prompt-file", jail.InputDir+"/system.md",
 		"--model", a.Model,
 		"--max-turns", fmt.Sprint(inv.MaxTurns),
 		"--max-budget-usd", strconv.FormatFloat(inv.BudgetUSD, 'f', -1, 64),
@@ -170,7 +197,7 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	}
 	defer os.RemoveAll(sockets)
 	// the route is read now, at this launch: the broker writes its file again when it restarts
-	route, routeEnv, err := a.Bedrock.open(filepath.Join(sockets, "route.sock"))
+	route, routeEnv, err := a.Bedrock.open(filepath.Join(sockets, "route.sock"), inv.BudgetUSD)
 	if err != nil {
 		return Result{}, err
 	}
@@ -185,24 +212,25 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 		defer stop()
 	}
 	spec := jail.Spec{Bwrap: a.Bwrap, Self: a.Self, Home: a.Home, Mounts: jail.Tidy(mounts), Dir: inv.Dir,
-		Env: sandboxEnv(a.Home, inv.Dir, routeEnv, a.Env, inv.Env), Route: filepath.Join(sockets, "route.sock"), RoutePort: RoutePort, Door: door}
+		Env: sandboxEnv(a.Home, inv.Dir, routeEnv, a.Env, inv.Env), Route: filepath.Join(sockets, "route.sock"), RoutePort: RoutePort, Door: door, Inputs: inputs}
 	cmd, err := spec.Command(context.Background(), append([]string{harness}, args...)...)
 	if err != nil {
 		return Result{}, err
 	}
 	defer jail.Close(cmd)
-	transcript := filepath.Join(inv.Dir, "transcript.jsonl")
-	out, err := createOutput(inv.Dir, "transcript.jsonl")
+	transcript := filepath.Join(HostDir(inv.Dir), streamName)
+	out, err := exclusiveOutput(HostDir(inv.Dir), streamName)
 	if err != nil {
 		return Result{}, err
 	}
 	defer out.Close()
-	errLog, err := createOutput(inv.Dir, "stderr.txt")
+	errLog, err := exclusiveOutput(HostDir(inv.Dir), errName)
 	if err != nil {
 		return Result{}, err
 	}
 	defer errLog.Close()
-	cmd.Stdout, cmd.Stderr = out, errLog
+	stream, diag := &boundedFile{w: out, left: 64 << 20}, &boundedFile{w: errLog, left: jail.MaxStream}
+	cmd.Stdout, cmd.Stderr = stream, diag
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	runCtx, cancel := context.WithTimeout(ctx, inv.Timeout)
 	defer cancel()
@@ -233,14 +261,33 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 		res.Status, res.Failure = store.RunTimeout, "timeout"
 	case ctx.Err() != nil:
 		res.Status, res.Failure = store.RunFailed, "stopped"
+	case stream.over || diag.over:
+		res.Status, res.Failure = store.RunFailed, "stream limit"
+	case waitErr != nil && perr == nil && res.Status == store.RunOK:
+		reconcileExit(&res, waitErr)
 	case perr != nil:
 		res.Status, res.Failure = store.RunFailed, "no result: "+perr.Error()
 		if waitErr != nil {
-			res.Failure = fmt.Sprintf("exit %v: %s", waitErr, lastLine(filepath.Join(inv.Dir, "stderr.txt")))
+			res.Failure = fmt.Sprintf("exit %v: %s", waitErr, lastLine(filepath.Join(HostDir(inv.Dir), errName)))
 		}
 	}
+	route.close()
 	res.Refused = route.refusals()
+	res.RelayUSD, res.RelayAdmitted, res.RelayRefused, res.RelayCharged = route.accounting()
 	return res, nil
+}
+
+func reconcileExit(res *Result, waitErr error) {
+	if waitErr == nil || res.Status != store.RunOK {
+		return
+	}
+	var ee *exec.ExitError
+	if errors.As(waitErr, &ee) {
+		res.Failure = fmt.Sprintf("exit %d", ee.ExitCode())
+	} else {
+		res.Failure = "exit failure"
+	}
+	res.Status = store.RunFailed
 }
 
 // harnessBinary is the harness's binary as it lies on disk, links followed, which the sandbox binds read-only.
@@ -306,35 +353,55 @@ func (a Agent) RunOrFallback(ctx context.Context, inv Invocation) (Result, error
 	started := time.Now()
 	res, err := a.Run(deadline, inv)
 	if err != nil || res.Failure != "the model's safeguards" || a.Fallback == "" || a.Fallback == a.Model {
+		if res.CostKnown {
+			res.USD = max(res.USD, res.RelayUSD)
+		}
 		return res, err
 	}
 	if !res.CostKnown || !res.TurnsKnown {
-		res.USD = inv.BudgetUSD
+		res.USD = max(inv.BudgetUSD, res.RelayUSD)
 		return res, nil
 	}
 	first := res
-	inv.BudgetUSD -= first.USD
+	firstCharge := max(first.USD, first.RelayUSD)
+	inv.BudgetUSD -= firstCharge
 	inv.MaxTurns -= first.Turns
 	inv.Timeout -= time.Since(started)
 	if inv.BudgetUSD <= 0 || inv.MaxTurns <= 0 || inv.Timeout <= 0 || deadline.Err() != nil {
+		first.USD = firstCharge
 		return first, nil
 	}
 	b := a
 	b.Model, b.Fallback = a.Fallback, ""
-	if err := os.Rename(filepath.Join(inv.Dir, "transcript.jsonl"), filepath.Join(inv.Dir, "transcript.refused.jsonl")); err != nil {
+	inv.fallback = true
+	res, err = b.Run(deadline, inv)
+	if err != nil && res.Transcript == "" {
+		// A fallback that never started adds no spend to the completed first attempt.
+		first.USD = firstCharge
 		return first, err
 	}
-	res, err = b.Run(deadline, inv)
+	return finishFallback(first, res, inv.BudgetUSD), err
+}
+
+// The charge compares the totals of both attempts, rather than summing two maxima.
+// An unknown fallback still holds all of its remaining reservation.
+func finishFallback(first, res Result, remaining float64) Result {
 	if !res.CostKnown {
-		res.USD = inv.BudgetUSD
+		res.USD = max(first.USD, first.RelayUSD) + remaining
+	} else {
+		res.USD += first.USD
 	}
-	res.USD += first.USD
 	res.CostKnown = true
 	res.Tokens += first.Tokens
 	res.Turns += first.Turns
 	res.Duration += first.Duration
+	res.RelayUSD += first.RelayUSD
+	res.RelayAdmitted += first.RelayAdmitted
+	res.RelayRefused += first.RelayRefused
+	res.RelayCharged += first.RelayCharged
+	res.USD = max(res.USD, res.RelayUSD)
 	res.Refused = slices.Concat(first.Refused, slices.DeleteFunc(res.Refused, func(r string) bool { return slices.Contains(first.Refused, r) }))
-	return res, err
+	return res
 }
 
 // readStream reads the run's stream of events (Claude Code's stream-json): its last result says how the run

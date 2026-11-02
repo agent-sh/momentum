@@ -588,6 +588,7 @@ type CaseFilter struct {
 	Family   string
 	Statuses []CaseStatus
 	All      bool // every status, closed ones too
+	Limit    int  // zero: all; callers inside a run bound materialization
 }
 
 // Cases lists cases, the most recently changed first.
@@ -610,7 +611,12 @@ func (s *Store) Cases(ctx context.Context, f CaseFilter) ([]Case, error) {
 	if len(where) > 0 {
 		q += ` WHERE ` + strings.Join(where, " AND ")
 	}
-	rows, err := s.db.QueryContext(ctx, q+` ORDER BY updated DESC, id`, args...)
+	q += ` ORDER BY updated DESC, id`
+	if f.Limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, f.Limit)
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -663,9 +669,28 @@ func (s *Store) CaseEvidence(ctx context.Context, id string, limit int) ([]Evide
 	return out, rows.Err()
 }
 
+// CaseLogCount counts the entries without materializing them.
+func (s *Store) CaseLogCount(ctx context.Context, id string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM case_log WHERE case_id = ?`, id).Scan(&n)
+	return n, err
+}
+
 // CaseLog is a case's log, oldest first.
 func (s *Store) CaseLog(ctx context.Context, id string) ([]CaseEntry, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT seq, at, actor, action, detail FROM case_log WHERE case_id = ? ORDER BY seq`, id)
+	return s.CaseLogLimit(ctx, id, 0)
+}
+
+// CaseLogLimit selects the newest limit entries before materializing their text.
+// Zero retains the caller's unrestricted history interface.
+func (s *Store) CaseLogLimit(ctx context.Context, id string, limit int) ([]CaseEntry, error) {
+	q := `SELECT seq, at, actor, action, detail FROM case_log WHERE case_id = ? ORDER BY seq`
+	args := []any{id}
+	if limit > 0 {
+		q = `SELECT seq, at, actor, action, detail FROM (SELECT seq, at, actor, action, detail FROM case_log WHERE case_id = ? ORDER BY seq DESC LIMIT ?) ORDER BY seq`
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -96,7 +96,7 @@ func setup(st *store.Store, c config.Loop) (*loop.Runner, *loop.Ship, error) {
 		gate := c.CapacityGate
 		sb.Gate = func(ctx context.Context) error {
 			cmd := exec.CommandContext(ctx, gate[0], gate[1:]...)
-			if out, err := cmd.CombinedOutput(); err != nil {
+			if out, err := commandOutput(cmd, true); err != nil {
 				return fmt.Errorf("the machine has no room for the test now (%s): %w", strings.TrimSpace(string(out)), err)
 			}
 			return nil
@@ -129,7 +129,7 @@ func setup(st *store.Store, c config.Loop) (*loop.Runner, *loop.Ship, error) {
 		Post: func(ctx context.Context, repo, pr, body string) (string, error) {
 			cctx, cancel := context.WithTimeout(ctx, time.Minute)
 			defer cancel()
-			out, err := exec.CommandContext(cctx, "gh", "pr", "comment", pr, "--repo", repo, "--body", body).Output()
+			out, err := commandOutput(exec.CommandContext(cctx, "gh", "pr", "comment", pr, "--repo", repo, "--body", body), false)
 			return strings.TrimSpace(string(out)), err
 		}}
 	return r, ship, nil
@@ -145,7 +145,7 @@ func toolchains(home string) (ro, path []string) {
 			}
 		}
 	}
-	if out, err := exec.Command("go", "env", "GOROOT", "GOMODCACHE").Output(); err == nil {
+	if out, err := commandOutput(exec.Command("go", "env", "GOROOT", "GOMODCACHE"), false); err == nil {
 		f := strings.Fields(string(out))
 		if len(f) == 2 {
 			add(f[0])
@@ -168,7 +168,7 @@ func toolchains(home string) (ro, path []string) {
 func gitGlobal(key string) string {
 	cmd := exec.Command("git", append(loop.GitSafety(), "config", "--global", key)...)
 	cmd.Env = append(os.Environ(), "GIT_ATTR_SOURCE=4b825dc642cb6eb9a060e54bf8d69288fbee4904", "GIT_ATTR_NOSYSTEM=1")
-	out, _ := cmd.Output()
+	out, _ := commandOutput(cmd, false)
 	return strings.TrimSpace(string(out))
 }
 
@@ -472,8 +472,8 @@ func loopLesson(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	}
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	out, err := exec.CommandContext(cctx, "tacit", "add", "--harness", "claude", "--kind", "observed", "--scope", scope, "--desc", pub,
-		"--body", loop.Neutral(body), lessonName(c.ID)).CombinedOutput()
+	out, err := commandOutput(exec.CommandContext(cctx, "tacit", "add", "--harness", "claude", "--kind", "observed", "--scope", scope, "--desc", pub,
+		"--body", loop.Neutral(body), lessonName(c.ID)), true)
 	if err != nil {
 		return fmt.Errorf("tacit add: %w: %s", err, strings.TrimSpace(string(out)))
 	}

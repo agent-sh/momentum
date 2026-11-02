@@ -86,7 +86,7 @@ func TestTheReviewsTextAndPromptAreScrubbed(t *testing.T) {
 	if _, err := r.invoke(ctx, tc.Family, tc, StepBuild, build); err != nil {
 		t.Fatal(err)
 	}
-	if raw, _ := os.ReadFile(filepath.Join(build.Dir, "review.md")); !strings.Contains(string(raw), "it logs ****") || strings.Contains(string(raw), "zz-private-value") {
+	if raw, _ := os.ReadFile(filepath.Join(HostDir(build.Dir), "primary", "review.md")); !strings.Contains(string(raw), "it logs ****") || strings.Contains(string(raw), "zz-private-value") {
 		t.Fatalf("review.md: %q", raw)
 	}
 	run(t, p.Work, "git", "commit", "-q", "--allow-empty", "-m", "the change")

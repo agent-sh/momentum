@@ -105,7 +105,7 @@ func TestTheLoopTakesEachFamilysCaseOneStep(t *testing.T) {
 			t.Errorf("the agent's environment holds %q:\n%s", not, env)
 		}
 	}
-	system, _ := os.ReadFile(filepath.Join(done[0].Run.Dir, "system.md"))
+	system, _ := os.ReadFile(filepath.Join(HostDir(done[0].Run.Dir), "primary", "system.md"))
 	for _, want := range []string{"# One run on one case", "# Failures", "never wake him", "Delete with literal paths."} {
 		if !strings.Contains(string(system), want) {
 			t.Errorf("the system prompt lacks %q", want)
@@ -286,7 +286,7 @@ func TestASafeguardsRefusalFallsBack(t *testing.T) {
 	refused := `{"type":"result","subtype":"success","is_error":true,"num_turns":1,"total_cost_usd":0.25,"result":"the safeguards blocked it"}`
 	p := script(t, dir, "agent", `case "$*" in *"--model model-a"*) echo '`+refused+`' ;; *) echo '`+okResult+`' ;; esac`)
 	a := testJail(t, Agent{Runner: []string{p}, Model: "model-a", Fallback: "model-b"})
-	res, err := a.RunOrFallback(context.Background(), Invocation{Dir: filepath.Join(dir, "run"), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Minute})
+	res, err := a.RunOrFallback(context.Background(), Invocation{Dir: filepath.Join(t.TempDir(), "run"), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Minute})
 	if err != nil || res.Status != store.RunOK || res.Model != "model-b" || res.USD != 1 {
 		t.Fatalf("%+v %v", res, err)
 	}
@@ -318,7 +318,7 @@ func TestATimedOutRunLeavesNothingRunning(t *testing.T) {
 (trap '' TERM; sleep 3; touch "`+marker+`") &
 sleep 30`)
 	a := testJail(t, Agent{Runner: []string{p}, Model: "m"})
-	res, err := a.Run(context.Background(), Invocation{Dir: filepath.Join(dir, "run"), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Second})
+	res, err := a.Run(context.Background(), Invocation{Dir: filepath.Join(t.TempDir(), "run"), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Second})
 	if err != nil || res.Status != store.RunTimeout {
 		t.Fatalf("%+v %v", res, err)
 	}
@@ -330,7 +330,7 @@ sleep 30`)
 	marker2 := filepath.Join(dir, "survived2")
 	p2 := script(t, dir, "agent2", `(trap '' TERM; sleep 3; touch "`+marker2+`") &
 sleep 30`)
-	res, err = testJail(t, Agent{Runner: []string{p2}, Model: "m"}).Run(context.Background(), Invocation{Dir: filepath.Join(dir, "run2"), Schema: runSchema, MaxTurns: 3,
+	res, err = testJail(t, Agent{Runner: []string{p2}, Model: "m"}).Run(context.Background(), Invocation{Dir: filepath.Join(t.TempDir(), "run2"), Schema: runSchema, MaxTurns: 3,
 		BudgetUSD: 1, Timeout: time.Second})
 	if err != nil || res.Status != store.RunTimeout {
 		t.Fatalf("%+v %v", res, err)
@@ -349,7 +349,7 @@ func TestARunsProcessesEndWithIt(t *testing.T) {
 	p := script(t, dir, "agent", `setsid sh -c 'sleep 3; touch "`+marker+`"' > /dev/null 2>&1 < /dev/null &
 echo '`+okResult+`'`)
 	a := testJail(t, Agent{Runner: []string{p}, Model: "m"})
-	res, err := a.Run(context.Background(), Invocation{Dir: filepath.Join(dir, "run-"+newRunID(time.Now())), Schema: runSchema, MaxTurns: 3,
+	res, err := a.Run(context.Background(), Invocation{Dir: filepath.Join(t.TempDir(), "run-"+newRunID(time.Now())), Schema: runSchema, MaxTurns: 3,
 		BudgetUSD: 1, Timeout: time.Minute})
 	if err != nil || res.Status != store.RunOK {
 		t.Fatalf("%+v %v", res, err)
@@ -396,7 +396,7 @@ func TestAReviewIsHeldAsARunIsAndGoesBackToTheBuild(t *testing.T) {
 	if err != nil || len(built) == 0 || built[0].Step != StepBuild {
 		t.Fatalf("the build after its review: %+v %v", built, err)
 	}
-	if b, _ := os.ReadFile(filepath.Join(built[0].Run.Dir, "review.md")); !strings.Contains(string(b), "Not ready to merge") {
+	if b, _ := os.ReadFile(filepath.Join(HostDir(built[0].Run.Dir), "primary", "review.md")); !strings.Contains(string(b), "Not ready to merge") {
 		t.Fatalf("the build's run has no review: %q", b)
 	}
 	if args, _ := agentArgs(t, r.Agent.Runner); !strings.Contains(args, "review.md") {
