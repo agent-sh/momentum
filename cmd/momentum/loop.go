@@ -51,7 +51,7 @@ func onBedrock(a loop.Agent) error {
 			return fmt.Errorf("loop %s %q is no Bedrock model: every headless run is on Bedrock, on a global inference profile (global.anthropic.claude-...)", c.name, m)
 		}
 	}
-	return nil
+	return loop.CheckDoorClient(a.Self)
 }
 
 // expandAll is each path with its home expanded.
@@ -99,6 +99,8 @@ func setup(st *store.Store, c config.Loop) (*loop.Runner, *loop.Ship, error) {
 		bwrap = "bwrap" // a check then fails to start, and says so
 	}
 	exe, _ := os.Executable()
+	// Check only when a command starts a run: dry picks and the ship tool need no client.
+	client, _ := loop.DoorClient(c.DoorClient, exe)
 	bins := []string{filepath.Dir(exe), filepath.Join(home, ".local", "bin")}
 	ro, toolPath := toolchains(home)
 	sb := loop.Sandbox{Bwrap: bwrap, Home: home, ReadOnly: append(ro, c.SandboxRead...), Cache: filepath.Join(loopDir(), "cache"),
@@ -128,7 +130,7 @@ func setup(st *store.Store, c config.Loop) (*loop.Runner, *loop.Ship, error) {
 		return nil, nil, err
 	}
 	tacit, _ := exec.LookPath("tacit")
-	r.Agent = loop.Agent{Runner: c.Runner, Model: model, Fallback: fallback, Bwrap: bwrap, Self: exe, Home: home,
+	r.Agent = loop.Agent{Runner: c.Runner, Model: model, Fallback: fallback, Bwrap: bwrap, Self: client, Home: home,
 		Bedrock: &loop.Bedrock{File: c.BedrockEnv}}
 	r.Ship, r.Detectors = ship, ds
 	r.Rules, r.Constraints, r.ReadDirs = c.Rules, c.Constraints, expandAll(c.ReadDirs)
@@ -283,6 +285,9 @@ func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	if len(args) > 0 && args[0] == "lesson" {
 		return loopLesson(ctx, args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "eval" {
+		return loopEval(ctx, args[1:], stdout, stderr)
 	}
 	fs := flag.NewFlagSet("loop", flag.ContinueOnError)
 	fs.SetOutput(stderr)

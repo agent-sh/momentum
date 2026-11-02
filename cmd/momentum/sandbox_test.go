@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -46,6 +48,9 @@ func TestMomentumAndTacitAreTheDoorsClient(t *testing.T) {
 		return jail.Reply{Stdout: []byte("door: " + strings.Join(r.Argv, " ") + "\n"), Code: 3}
 	})
 	if err != nil {
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+			t.Skipf("Unix door sockets unavailable here: %v", err)
+		}
 		t.Fatal(err)
 	}
 	defer stop()

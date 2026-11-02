@@ -1,0 +1,245 @@
+package loop
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// A later fast-forward cannot admit older-dated commits that were absent from the default branch.
+func TestHistoricalCloneUsesTheBranchReflog(t *testing.T) {
+	e, task := evalFixture(t)
+	end, err := e.snapshotEnd(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	historyGit(t, dir, end.Add(-2*time.Hour), "init", "-q", "-b", "main", src)
+	write(t, filepath.Join(src, "job"), "reads the lockfile, then takes the lock")
+	historyGit(t, src, end.Add(-2*time.Hour), "add", "-A")
+	historyGit(t, src, end.Add(-2*time.Hour), "commit", "-qm", "the job")
+	stood := historyGit(t, src, time.Time{}, "rev-parse", "HEAD")
+	historyGit(t, src, end.Add(-90*time.Minute), "checkout", "-qb", "lock-order")
+	write(t, filepath.Join(src, "job_test"), "the job takes its lock before it reads the lockfile")
+	historyGit(t, src, end.Add(-30*time.Minute), "add", "-A")
+	historyGit(t, src, end.Add(-30*time.Minute), "commit", "-qm", "a failing test: take the lock before reading the lockfile")
+	historyGit(t, src, time.Time{}, "checkout", "-q", "main")
+	historyGit(t, src, time.Time{}, "merge", "-q", "--ff-only", "lock-order") // today: after the end
+	atEnd := historyGit(t, src, time.Time{}, "rev-parse", "main@{"+end.Format(time.RFC3339)+"}")
+	repos, err := cloneRepositories(context.Background(), []string{src}, end, filepath.Join(dir, "repos"))
+	if err != nil || len(repos) != 1 {
+		t.Fatalf("%v %v", repos, err)
+	}
+	head := historyGit(t, repos[0], time.Time{}, "rev-parse", "HEAD")
+	_, statErr := os.Stat(filepath.Join(repos[0], "job_test"))
+	if head != stood || atEnd != stood || !os.IsNotExist(statErr) {
+		t.Fatalf("stood %s reflog %s head %s file %v", stood, atEnd, head, statErr)
+	}
+}
+
+// Skipped repositories leave no gaps in the neutral checkout names.
+func TestHistoricalCloneNumbersOnlyRepositoriesMade(t *testing.T) {
+	e, task := evalFixture(t)
+	end, _ := e.snapshotEnd(context.Background(), task)
+	dir := t.TempDir()
+	var sources []string
+	for i, at := range []time.Time{end.Add(time.Hour), end.Add(-time.Hour), end.Add(time.Hour), end.Add(-time.Hour)} {
+		src := filepath.Join(dir, fmt.Sprint("source", i))
+		historyGit(t, dir, at, "init", "-q", "-b", "main", src)
+		commitAt(t, src, at, "job", "contents", "job")
+		sources = append(sources, src)
+	}
+	repos, err := cloneRepositories(context.Background(), sources, end, filepath.Join(dir, "repos"))
+	if err != nil || len(repos) != 2 {
+		t.Fatalf("%v %v", repos, err)
+	}
+	for i, repo := range repos {
+		if filepath.Base(repo) != fmt.Sprint("repo-", i+1) {
+			t.Fatalf("gap: %v", repos)
+		}
+	}
+}
+
+// A checkout drops escaping tracked links, keeps internal links, and retains both in history.
+func TestHistoricalCloneDropsEscapingSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	src, dst := filepath.Join(dir, "source"), filepath.Join(dir, "clone")
+	historyGit(t, dir, time.Now(), "init", "-q", "-b", "main", src)
+	outside := filepath.Join(dir, "outside")
+	write(t, outside, "later answer")
+	write(t, filepath.Join(src, "inside"), "historical text")
+	for name, target := range map[string]string{"absolute": outside, "relative": "../outside", "internal": "inside", "chain": "relative"} {
+		if err := os.Symlink(target, filepath.Join(src, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	historyGit(t, src, time.Now(), "add", "-A")
+	historyGit(t, src, time.Now(), "commit", "-qm", "links")
+	head := historyGit(t, src, time.Now(), "rev-parse", "HEAD")
+	if err := cloneAsOf(context.Background(), src, head, dst); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"absolute", "relative", "chain"} {
+		if _, err := os.Lstat(filepath.Join(dst, name)); !os.IsNotExist(err) {
+			t.Fatalf("escaping link %s retained: %v", name, err)
+		}
+		if historyGit(t, dst, time.Now(), "show", "HEAD:"+name) == "" {
+			t.Fatal("history lost")
+		}
+	}
+	raw, err := os.ReadFile(filepath.Join(dst, "internal"))
+	if err != nil || string(raw) != "historical text" {
+		t.Fatalf("internal link %s %v", raw, err)
+	}
+}
+
+// Both trials expose only shared evidence commands in their reference, and neither working directory names its arm.
+func TestTrialCommandsAndDirectoriesAreNeutral(t *testing.T) {
+	e, task := evalFixture(t)
+	trs, err := e.Run(context.Background(), []GoldenTask{task})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tr := range trs {
+		if tr.Err != "" {
+			t.Fatal(tr.Err)
+		}
+		rel, err := filepath.Rel(e.Dir, tr.Run.Dir)
+		if err != nil || strings.Contains(rel, "loop") || strings.Contains(rel, "native") {
+			t.Fatalf("directory identifies arm: %s %v", rel, err)
+		}
+		raw, err := os.ReadFile(filepath.Join(tr.Run.Dir, "prompt.txt"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		prompt := string(raw)
+		start := strings.Index(prompt, "\n\n## Commands available in this trial")
+		if start < 0 {
+			t.Fatal("reference absent")
+		}
+		shared := prompt[start:]
+		for _, forbidden := range []string{"loop arm", "native arm", "momentum case", "supervise replay", "momentum report", "source, actor and kind"} {
+			if strings.Contains(shared, forbidden) {
+				t.Errorf("shared reference exposes %q", forbidden)
+			}
+		}
+		if strings.Contains(shared, " radar,") {
+			t.Error("reference names radar, whose findings no snapshot holds")
+		}
+		for _, required := range []string{"source and kind", "transcripts", "incidents", "mistakes", "sessions", "supervise", "radar-feedback", "capacity"} {
+			if !strings.Contains(shared, required) {
+				t.Errorf("reference omits %q", required)
+			}
+		}
+		if strings.Contains(prompt, "momentum case") {
+			t.Fatal("an investigation keeps no case: the runner records its report")
+		}
+		// the loop's prompt lists its case's evidence where the native one names the symptom events
+		evidence := strings.Contains(prompt, "The case's evidence, newest first") && strings.Contains(prompt, "ev:"+task.Symptom.Query.EventIDs[0])
+		if evidence != (tr.Arm == "loop") || strings.Contains(prompt, "Symptom events: ") == (tr.Arm == "loop") {
+			t.Fatalf("%s prompt:\n%s", tr.Arm, prompt)
+		}
+	}
+}
+
+// Without a final report, both arms give the judge only mechanism, alternatives and fix: the native arm from its
+// findings file, the loop from its case, where the runner recorded the same file.
+func TestUnfinishedTrialsUseTheSameJudgeFields(t *testing.T) {
+	e, task := evalFixture(t)
+	harness := filepath.Dir(e.Runner.Agent.Runner[0])
+	e.Runner.Agent.Runner = []string{script(t, harness, "unfinished", `cat > findings.md <<'NOTES'
+extra introduction
+## Mechanism
+cause
+## Alternatives ruled out
+alternative
+## Fix
+fix
+## Summary
+extra summary
+NOTES
+`)}
+	trs, err := e.Run(context.Background(), []GoldenTask{task})
+	if err != nil || len(trs) != 2 {
+		t.Fatalf("%v %v", trs, err)
+	}
+	want := judgePrompt(task, finding{Mechanism: "cause", Alternatives: []string{"alternative"}, Fix: "fix"})
+	for _, tr := range trs {
+		if tr.Err != "" {
+			t.Fatal(tr.Err)
+		}
+		if tr.JudgePromptHash != digest(want) {
+			raw, _ := os.ReadFile(filepath.Join(tr.JudgeDir, "prompt.txt"))
+			t.Fatalf("the %s arm's unfinished finding differs:\n%s", tr.Arm, raw)
+		}
+	}
+}
+
+// The historical-evidence contract names place references, replay exclusion, derivation and interval limits.
+func TestEvaluationContractStatesHistoricalLimits(t *testing.T) {
+	raw, err := os.ReadFile("../../SPEC.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{"first record after the scan's place", "record's own timestamp", "whatever its format dates it by", "so a sessions task is investigated without it",
+		"reflog reaches back", "newest commit dated before", "derivation of their last read", "covers less than its nominal 90%", "reads the interval with its task count",
+		"read-only", "one set of checkouts", "SHA-256 of each copy"} {
+		if !strings.Contains(string(raw), text) {
+			t.Errorf("contract omits %q", text)
+		}
+	}
+}
+
+// An expired reflog falls back to the latest commit dated strictly before the end.
+func TestHistoricalCloneFallsBackWhenTheReflogDoesNotReachTheEnd(t *testing.T) {
+	e, task := evalFixture(t)
+	end, err := e.snapshotEnd(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "source")
+	historyGit(t, dir, time.Now(), "init", "-q", "-b", "main", src)
+	want := commitAt(t, src, end.Add(-time.Hour), "job", "before", "before")
+	commitAt(t, src, end, "job", "at end", "at end")
+	historyGit(t, src, time.Now(), "reflog", "expire", "--expire=now", "--all")
+	repos, err := cloneRepositories(context.Background(), []string{src}, end, filepath.Join(dir, "repos"))
+	if err != nil || len(repos) != 1 {
+		t.Fatalf("%v %v", repos, err)
+	}
+	if got := historyGit(t, repos[0], time.Now(), "rev-parse", "HEAD"); got != want {
+		t.Fatalf("got %s want %s", got, want)
+	}
+}
+
+// Both arms' findings are read the one way, a report whose alternatives are one text rather than the schema's list
+// among them: the judge reads the same investigation from either arm.
+func TestBothArmsReadTheirFindingsTheOneWay(t *testing.T) {
+	e, task := evalFixture(t)
+	harness := filepath.Dir(e.Runner.Agent.Runner[0])
+	e.Runner.Agent.Runner = []string{script(t, harness, "odd-report", modelResult(`{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":1,"structured_output":{"mechanism":"the job reads the lockfile before it takes the lock","alternatives":"disk latency","fix":"take the lock first","summary":"found"}}`))}
+	trs, err := e.Run(context.Background(), []GoldenTask{task})
+	if err != nil || len(trs) != 2 {
+		t.Fatalf("%v %v", trs, err)
+	}
+	var prompts []string
+	for _, tr := range trs {
+		if tr.Err != "" {
+			t.Fatal(tr.Err)
+		}
+		raw, _ := os.ReadFile(filepath.Join(tr.JudgeDir, "prompt.txt"))
+		if !strings.Contains(string(raw), "takes the lock") || !strings.Contains(string(raw), "disk latency") {
+			t.Fatalf("%s: the judge lost the findings:\n%s", tr.Arm, raw)
+		}
+		prompts = append(prompts, string(raw))
+	}
+	// the loop's summary is its report's, the native's its report's: here the same, so the prompts match whole
+	if prompts[0] != prompts[1] {
+		t.Fatalf("the arms' judge prompts differ:\n%s\n%s", prompts[0], prompts[1])
+	}
+}

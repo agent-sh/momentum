@@ -18,7 +18,7 @@ func testJail(t *testing.T, a Agent) Agent {
 	if err != nil {
 		t.Skip("no bubblewrap on this machine")
 	}
-	if out, err := exec.Command(bwrap, "--unshare-all", "--ro-bind", "/", "/", "true").CombinedOutput(); err != nil {
+	if out, err := exec.Command(bwrap, "--unshare-all", "--ro-bind", "/", "/", "/bin/true").CombinedOutput(); err != nil {
 		t.Skipf("bubblewrap cannot make a sandbox here: %v: %s", err, out)
 	}
 	exe, err := os.Executable()

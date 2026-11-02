@@ -58,6 +58,7 @@ const (
 	Landed      = "landed"
 	RollingBack = "rolling back"
 	RolledBack  = "rolled back"
+	Dropped     = "dropped" // ended before its proposal, its case closed or sent back: its host and run clones are gone
 )
 
 // MaxRounds is how many review rounds a package gets: prs.md's three.
@@ -165,6 +166,56 @@ func (s *Ship) now() time.Time {
 func (s *Ship) pkgDir(c string) string  { return filepath.Join(s.Dir, "packages", c) }
 func (s *Ship) workDir(c string) string { return filepath.Join(s.Dir, "work", c) }
 
+// ChangeOpen says whether a case's change is on its pull request (proposed, revising, landing, or checked again
+// after a review), and its state: its review decides it, so no run closes the case, sends it back or merges it by a
+// root, which would leave the pull request with nothing in the loop to return to it. A change before its proposal
+// (prepared, or checked with no pull request) is the build's to resume or to end: when its case leaves testing, the
+// next loop run drops it (Drop). A package that cannot be read counts as open.
+func (s *Ship) ChangeOpen(caseID string) (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	p, ok, err := s.Load(caseID)
+	if err != nil {
+		return "unreadable", true
+	}
+	return p.State, ok && (slices.Contains([]string{Proposed, Revising, Landing}, p.State) || p.State == Checked && p.PR != "")
+}
+
+// unproposed says whether a case's change is before its proposal: prepared, or checked with no pull request.
+func unproposed(p Package) bool { return p.State == Prepared || p.State == Checked && p.PR == "" }
+
+// Drop ends a change before its proposal whose case left testing (closed, sent back or merged into another): its
+// host and run clones go, and its record stays, dropped, until the case's next prepare replaces it. A change
+// on its pull request is its review's, and is refused.
+func (s *Ship) Drop(ctx context.Context, caseID, why string) (Package, error) {
+	unlock, err := s.lock(ctx, caseID)
+	if err != nil {
+		return Package{}, err
+	}
+	defer unlock()
+	p, ok, err := s.Load(caseID)
+	if err != nil {
+		return Package{}, err
+	}
+	if !ok || !unproposed(p) {
+		return p, refused("case %s has no change before its proposal to drop", caseID)
+	}
+	// These clones are independent. Remove them as directories, never run Git in the run clone.
+	for _, dir := range []string{p.Work, p.Host} {
+		if dir != "" {
+			if err := os.RemoveAll(dir); err != nil {
+				return p, err
+			}
+		}
+	}
+	p.State = Dropped
+	if err := s.save(&p); err != nil {
+		return p, err
+	}
+	return p, s.Store.CaseNote(ctx, caseID, "dropped", why, s.Actor)
+}
+
 // Load reads a case's package; ok is false when it has none.
 func (s *Ship) Load(caseID string) (Package, bool, error) {
 	if caseID == "" || caseID != filepath.Base(caseID) || strings.HasPrefix(caseID, ".") {
@@ -201,14 +252,14 @@ func (s *Ship) save(p *Package) error {
 	return os.Rename(tmp, filepath.Join(dir, "package.json"))
 }
 
-// working reads a case that a change may be built for: in testing, as the investigation left it.
+// working reads a case that a change may be built for: in testing, as the investigation's findings left it.
 func (s *Ship) working(ctx context.Context, caseID string) (store.Case, error) {
 	c, err := s.Store.CaseByID(ctx, caseID)
 	if err != nil {
 		return store.Case{}, err
 	}
 	if c.Status != store.CaseTesting {
-		return store.Case{}, refused("case %s is %s: a change is built only for a case in testing (a mechanism and a discriminating test on record)", c.ID, c.Status)
+		return store.Case{}, refused("case %s is %s: a change is built only for a case in testing (a mechanism and a fix on record)", c.ID, c.Status)
 	}
 	return c, nil
 }
@@ -222,6 +273,7 @@ func (s *Ship) public(ctx context.Context, text string) (string, error) {
 }
 
 // Prepare creates a host-only clone and an independent run clone before any writable mount uses it.
+// A rolled-back or dropped package may be prepared again.
 func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, error) {
 	unlock, err := s.lock(ctx, caseID)
 	if err != nil {
@@ -236,7 +288,7 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	if err != nil {
 		return Package{}, err
 	}
-	if had && old.State != RolledBack {
+	if had && old.State != RolledBack && old.State != Dropped {
 		return old, refused("case %s has a package already (in %s)", c.ID, old.State)
 	}
 	if repoDir == "" {

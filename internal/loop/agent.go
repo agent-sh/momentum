@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -39,8 +40,8 @@ type Agent struct {
 	Runner   []string
 	Model    string
 	Fallback string
-	// Bwrap, Self and Home make the sandbox: bubblewrap, momentum's binary (the sandbox's init and its momentum and
-	// tacit commands, the door's client) and the home's path, empty inside.
+	// Bwrap, Self and Home make the sandbox: bubblewrap, momentum-door (the sandbox's init and its momentum and
+	// tacit command client) and the home's path, empty inside.
 	Bwrap, Self, Home string
 	// Mounts are paths every run reads besides its own (a test's fake harness keeps its records in one).
 	Mounts []jail.Mount
@@ -78,12 +79,14 @@ type Invocation struct {
 
 // Result is what a run came to.
 type Result struct {
+	Started    bool   // bubblewrap reported that its sandboxed program started
 	Status     string // store.RunOK, RunFailed, RunBudget, RunTurns, RunTimeout
 	Failure    string // how it failed, when it did: a short key the stop rule compares
 	CostKnown  bool
 	TurnsKnown bool
-	USD        float64
+	USD        float64 // at Bedrock's rates for the models with one (bedrockRates), at the harness's own for the rest
 	Tokens     int64
+	Usage      Usage // the tokens, by kind
 	Turns      int
 	Duration   time.Duration
 	Report     json.RawMessage // the final report, by the schema
@@ -111,6 +114,9 @@ var stopGrace = 10 * time.Second
 // Claude Code recommends only for a sandbox with no internet access), bare (no hooks, plugins, memory or
 // CLAUDE.md), and with only the tools named.
 func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
+	if err := CheckDoorClient(a.Self); err != nil {
+		return Result{}, err
+	}
 	if len(a.Runner) == 0 {
 		return Result{}, errors.New("no runner: set loop.runner in sources.json")
 	}
@@ -220,13 +226,16 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 		}
 		defer stop()
 	}
+	var status *os.File
 	spec := jail.Spec{Bwrap: a.Bwrap, Self: a.Self, Home: a.Home, Mounts: jail.Tidy(mounts), Dir: inv.Dir,
-		Env: sandboxEnv(a.Home, inv.Dir, routeEnv, a.Env, inv.Env), Route: filepath.Join(sockets, "route.sock"), RoutePort: RoutePort, Door: door, Inputs: inputs}
+		Status: func(r *os.File) { status = r },
+		Env:    sandboxEnv(a.Home, inv.Dir, routeEnv, a.Env, inv.Env), Route: filepath.Join(sockets, "route.sock"), RoutePort: RoutePort, Door: door, Inputs: inputs}
 	cmd, err := spec.Command(context.Background(), append([]string{harness}, args...)...)
 	if err != nil {
 		return Result{}, err
 	}
 	defer jail.Close(cmd)
+	defer status.Close()
 	transcript := filepath.Join(HostDir(inv.Dir), streamName)
 	out, err := exclusiveOutput(HostDir(inv.Dir), streamName)
 	if err != nil {
@@ -245,8 +254,11 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	defer cancel()
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
-		return Result{}, fmt.Errorf("start the sandbox: %w", err)
+		return Result{Status: store.RunFailed, Failure: "sandbox", CostKnown: true, Text: fmt.Sprintf("start the sandbox: %v", err)}, nil
 	}
+	jail.Close(cmd)
+	started := make(chan bool, 1)
+	go func() { started <- sandboxStarted(status) }()
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	var waitErr error
@@ -265,6 +277,16 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	}
 	res, perr := readStream(transcript)
 	res.Duration, res.Transcript, res.Model = time.Since(start), transcript, firstOf(res.Model, a.Model)
+	select {
+	case res.Started = <-started:
+	case <-runCtx.Done():
+		status.Close() // a launcher holding the status pipe cannot outlive the invocation's deadline
+		res.Started = <-started
+	}
+	if !res.Started {
+		return Result{Status: store.RunFailed, Failure: "sandbox", Transcript: transcript, Model: a.Model, CostKnown: true,
+			Text: lastLine(filepath.Join(HostDir(inv.Dir), errName))}, nil
+	}
 	route.close()
 	res.Refused = route.refusals()
 	res.RelayUSD, res.RelayAdmitted, res.RelayRefused, res.RelayCharged = route.accounting()
@@ -288,6 +310,107 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 		res.Status, res.Failure = store.RunFailed, "stream"
 	case !hadReport && res.Failure == "report" && inv.MaxTurns > 0 && res.RelayAdmitted >= inv.MaxTurns:
 		res.Status, res.Failure = store.RunTurns, "turns"
+	}
+	// Stale recovery must use the host's authenticated result, never the harness's stdout as proof of a report.
+	resultName := "result.json"
+	if inv.fallback {
+		resultName = "result.fallback.json"
+	}
+	if err := keepHostResult(ctx, inv.Dir, resultName, &res); err != nil {
+		return res, err
+	}
+	return res, nil
+}
+
+// keepHostResult keeps the result only after report authentication and the host's exit checks. The raw stream
+// remains an archive; the result used by stale recovery has its model text cleaned before storage.
+func keepHostResult(ctx context.Context, dir, name string, res *Result) error {
+	if len(res.Report) > 0 {
+		clean, err := cleanReport(ctx, res.Report)
+		if err != nil {
+			res.Report = nil
+			res.Status, res.Failure, res.Text = store.RunFailed, "scrub", "(report withheld: the cleaner failed)"
+			return err
+		}
+		res.Report = clean
+	}
+	// Recovery needs only the host's outcome and report, not the harness's session text or accounting.
+	raw, err := json.Marshal(struct {
+		Started         bool
+		Status, Failure string
+		Report          json.RawMessage
+	}{res.Started, res.Status, res.Failure, res.Report})
+	if err != nil {
+		return err
+	}
+	return writeExclusive(HostDir(dir), name, raw)
+}
+
+// cleanReport decodes strings before cleaning: JSON escapes must not hide text from the cleaner.
+// Numbers stay JSON numbers so cleaning cannot change a report's precision.
+func cleanReport(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var value any
+	if err := dec.Decode(&value); err != nil {
+		return nil, err
+	}
+	var clean func(any) (any, error)
+	clean = func(value any) (any, error) {
+		switch value := value.(type) {
+		case string:
+			return Redact(ctx, value)
+		case []any:
+			for i, item := range value {
+				next, err := clean(item)
+				if err != nil {
+					return nil, err
+				}
+				value[i] = next
+			}
+		case map[string]any:
+			next := make(map[string]any, len(value))
+			for key, item := range value {
+				name, err := Redact(ctx, key)
+				if err != nil {
+					return nil, err
+				}
+				if _, exists := next[name]; exists {
+					return nil, errors.New("cleaned report keys collide")
+				}
+				next[name], err = clean(item)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return next, nil
+		}
+		return value, nil
+	}
+	value, err := clean(value)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(value)
+}
+
+func readHostResult(dir string) (Result, error) {
+	name := "result.json"
+	if _, err := os.Lstat(filepath.Join(HostDir(dir), "transcript.fallback.jsonl")); !errors.Is(err, os.ErrNotExist) {
+		name = "result.fallback.json"
+	}
+	f, err := OpenFile(HostDir(dir), name)
+	if err != nil {
+		return Result{}, err
+	}
+	defer f.Close()
+	raw, err := ReadFile(f, 64<<20)
+	if err != nil {
+		return Result{}, err
+	}
+	var res Result
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return Result{}, err
 	}
 	return res, nil
 }
@@ -326,6 +449,31 @@ func reconcileExit(res *Result, waitErr error) {
 	}
 	res.Status = store.RunFailed
 }
+
+// readRunFile reads a file a run's agent wrote in its directory, for the loop to use: a regular file of at most
+// 1 MiB, opened without following a link or waiting on a writer. The agent writes there as it likes inside its
+// sandbox, a link to a path of the machine's outside it included, which this process, outside, must not follow.
+func readRunFile(dir, name string) ([]byte, error) {
+	f, err := os.OpenFile(filepath.Join(dir, name), os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", name)
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, runFileMax+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > runFileMax {
+		return nil, fmt.Errorf("%s is over %d bytes", name, runFileMax)
+	}
+	return raw, nil
+}
+
+// runFileMax bounds a file of a run's the loop reads.
+const runFileMax = 1 << 20
 
 // harnessBinary is the harness's binary as it lies on disk, links followed, which the sandbox binds read-only.
 func harnessBinary(name string) (string, error) {
@@ -423,13 +571,15 @@ func (a Agent) RunOrFallback(ctx context.Context, inv Invocation) (Result, error
 // The charge compares the totals of both attempts, rather than summing two maxima.
 // An unknown fallback still holds all of its remaining reservation.
 func finishFallback(first, res Result, remaining float64) Result {
-	if !res.CostKnown {
+	if !res.CostKnown && res.Started {
 		res.USD = max(first.USD, first.RelayUSD) + remaining
 	} else {
 		res.USD += first.USD
 	}
+	res.Started = res.Started || first.Started
 	res.CostKnown = true
 	res.Tokens += first.Tokens
+	res.Usage = res.Usage.Add(first.Usage)
 	res.Turns += first.Turns
 	res.Duration += first.Duration
 	res.RelayUSD += first.RelayUSD
@@ -472,21 +622,62 @@ func readStream(path string) (Result, error) {
 			SessionID         string          `json:"session_id"`
 			PermissionDenials []any           `json:"permission_denials"`
 			Usage             struct {
-				Input       int64 `json:"input_tokens"`
-				Output      int64 `json:"output_tokens"`
-				CacheRead   int64 `json:"cache_read_input_tokens"`
-				CacheCreate int64 `json:"cache_creation_input_tokens"`
+				Input         int64 `json:"input_tokens"`
+				Output        int64 `json:"output_tokens"`
+				CacheRead     int64 `json:"cache_read_input_tokens"`
+				CacheCreate   int64 `json:"cache_creation_input_tokens"`
+				CacheCreation struct {
+					Hour int64 `json:"ephemeral_1h_input_tokens"`
+				} `json:"cache_creation"`
 			} `json:"usage"`
+			// each model's tokens and the harness's price for them, subagents' and a fallback's models among them
+			ModelUsage map[string]struct {
+				Input       int64    `json:"inputTokens"`
+				Output      int64    `json:"outputTokens"`
+				CacheRead   int64    `json:"cacheReadInputTokens"`
+				CacheCreate int64    `json:"cacheCreationInputTokens"`
+				Hour        int64    `json:"cacheCreationEphemeral1hInputTokens"`
+				CostUSD     *float64 `json:"costUSD"`
+			} `json:"modelUsage"`
 		}
 		if json.Unmarshal(line, &r) != nil || r.Type != "result" {
 			continue
 		}
 		found = true
-		res = Result{Text: r.Result, Report: r.StructuredOutput, Session: r.SessionID,
-			Denials: len(r.PermissionDenials), Tokens: r.Usage.Input + r.Usage.Output + r.Usage.CacheRead + r.Usage.CacheCreate}
-		if r.TotalCostUSD != nil && *r.TotalCostUSD >= 0 && !math.IsInf(*r.TotalCostUSD, 0) && !math.IsNaN(*r.TotalCostUSD) {
+		res = Result{Text: r.Result, Report: r.StructuredOutput, Session: r.SessionID, Denials: len(r.PermissionDenials),
+			Usage: Usage{Input: r.Usage.Input, Output: r.Usage.Output, CacheRead: r.Usage.CacheRead, CacheWrite: r.Usage.CacheCreate,
+				CacheWrite1h: r.Usage.CacheCreation.Hour}}
+		res.Started = true // a stored final result proves startup for stale recovery; Run uses bubblewrap's status
+		if r.TotalCostUSD != nil && known(*r.TotalCostUSD) {
 			res.USD, res.CostKnown = *r.TotalCostUSD, true
 		}
+		// with each model's tokens, the run is priced at Bedrock's rates, model by model. The harness's own prices
+		// check them: a model whose tokens price outside what Bedrock's rates can be against its list price (half of
+		// it to all of it) keeps the harness's price, and a run whose models' prices do not add up to its own, or
+		// with a model the harness gave no price, keeps the harness's price whole
+		if len(r.ModelUsage) > 0 {
+			var u Usage
+			usd, list, priced := 0.0, 0.0, true
+			for model, m := range r.ModelUsage {
+				mu := Usage{Input: m.Input, Output: m.Output, CacheRead: m.CacheRead, CacheWrite: m.CacheCreate, CacheWrite1h: m.Hour}
+				u = u.Add(mu)
+				if m.CostUSD == nil || !known(*m.CostUSD) {
+					priced = false
+					continue
+				}
+				list += *m.CostUSD
+				if p, ok := bedrockPrice(model, mu); ok && p >= *m.CostUSD/2-priceSlack && p <= *m.CostUSD+priceSlack {
+					usd += p
+				} else {
+					usd += *m.CostUSD
+				}
+			}
+			res.Usage = u
+			if priced && res.CostKnown && math.Abs(list-res.USD) <= priceSlack {
+				res.USD = usd
+			}
+		}
+		res.Tokens = res.Usage.Total()
 		if r.NumTurns != nil && *r.NumTurns >= 0 {
 			res.Turns, res.TurnsKnown = *r.NumTurns, true
 		}
@@ -503,6 +694,12 @@ func readStream(path string) (Result, error) {
 	}
 	return res, nil
 }
+
+// priceSlack is how far apart two prices of one run may be and still agree: half a cent, the harness's rounding.
+const priceSlack = 0.005
+
+// known is a price that is a number and not below zero.
+func known(usd float64) bool { return usd >= 0 && !math.IsInf(usd, 0) && !math.IsNaN(usd) }
 
 // resultStatus reads how a run ended from its result's subtype: a success with its report is ok; a limit is its
 // limit; a success that is an error (the provider's, ending the turn) is an error; anything else failed, by its
@@ -557,11 +754,11 @@ func lastLine(path string) string {
 
 // CleanEnv is the environment of what the loop runs outside a sandbox for a run: the commands its door runs
 // (momentum's, which read the store and the records, and tacit's). It has the user's home, a path to momentum's
-// tools, the locale, the session bus (evidence unit reads a service's state) and what the loop sets. Nothing else
+// tools, the locale, the temporary directory the caller chose, the session bus (evidence unit reads a service's state) and what the loop sets. Nothing else
 // of the caller's environment reaches them: a harness's plugin list or session id would change what runs. A check's
 // test gets less (Sandbox).
 func CleanEnv(extra map[string]string, bins ...string) []string {
-	keep := []string{"HOME", "LANG", "LC_ALL", "TZ", "USER", "LOGNAME", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR",
+	keep := []string{"TMPDIR", "HOME", "LANG", "LC_ALL", "TZ", "USER", "LOGNAME", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR",
 		"MOMENTUM_HOME", "MOMENTUM_CONFIG", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"}
 	var env []string
 	for _, k := range keep {

@@ -129,7 +129,7 @@ func TestAPreparationCountsTowardTheBuildBudgets(t *testing.T) {
 	if err != nil || p.State != Prepared {
 		t.Fatalf("prepare: %+v %v", p, err)
 	}
-	r.finish(ctx, c, &run, Result{Status: store.RunOK, CostKnown: true, USD: 0.75,
+	r.finish(ctx, c, &run, Result{Started: true, Status: store.RunOK, CostKnown: true, USD: 0.75,
 		Report: json.RawMessage(`{"outcome":"testing","summary":"package prepared"}`)}, nil)
 	saved, err := st.LoopRunByID(ctx, run.ID)
 	if err != nil || saved.Step != StepBuild || saved.Status != store.RunOK || saved.USD != 0.75 {
@@ -178,7 +178,7 @@ func TestFailedPreparationsUseTheBuildStopRule(t *testing.T) {
 		if _, err := r.Ship.Prepare(ctx, c.ID, f.main); err == nil {
 			t.Fatal("fixture preparation should be refused")
 		} else {
-			r.finish(ctx, c, &run, Result{Status: store.RunFailed, Failure: err.Error(), CostKnown: true, USD: 0.75}, nil)
+			r.finish(ctx, c, &run, Result{Started: true, Status: store.RunFailed, Failure: err.Error(), CostKnown: true, USD: 0.75}, nil)
 		}
 		if _, ok, err := r.Ship.Load(c.ID); err != nil || ok {
 			t.Fatalf("a refused preparation left a package: %v %v", ok, err)
@@ -354,7 +354,7 @@ func TestAPublishFinishRequiresADurableReceipt(t *testing.T) {
 			if err := leave(st, c); err != nil {
 				t.Fatal(err)
 			}
-			r.finish(ctx, c, &run, Result{Status: store.RunOK, CostKnown: true, USD: 1}, nil)
+			r.finish(ctx, c, &run, Result{Started: true, Status: store.RunOK, CostKnown: true, USD: 1}, nil)
 			wantStatus, wantFailure := store.RunFailed, "no receipt"
 			if name == "receipt" {
 				wantStatus, wantFailure = store.RunOK, ""
@@ -573,13 +573,13 @@ func TestAPackageReadErrorPreservesItsWaitingNote(t *testing.T) {
 	}
 }
 
-// A report's root is recorded for an investigation, a build or a publish, and never for a review, whose report is
-// its findings: it cannot merge the case it reviews into another.
+// A build's or publish's report can record a root. A review and a native investigation keep findings instead:
+// neither can merge its case by a root field left over from an older report.
 func TestOnlyAStepsReportRecordsItsRoot(t *testing.T) {
 	ctx := context.Background()
-	for step, merged := range map[string]bool{StepReview: false, StepInvestigate: true} {
+	for step, merged := range map[string]bool{StepBuild: true, StepPublish: true, StepReview: false, StepInvestigate: false} {
 		st := testStore(t)
-		r := runnerFor(t, st, nil)
+		r := localRunner(t, st)
 		a, b := openCase(t, st, "failures", "a", 1), openCase(t, st, "failures", "b", 1)
 		if _, _, err := st.AddCaseSignature(ctx, b.ID, "root:fixture", "fixture"); err != nil {
 			t.Fatal(err)
@@ -588,10 +588,22 @@ func TestOnlyAStepsReportRecordsItsRoot(t *testing.T) {
 		if why != "" {
 			t.Fatal(why)
 		}
-		r.finish(ctx, a, &run, Result{Status: store.RunOK, CostKnown: true, Report: json.RawMessage(`{"findings":[],"summary":"x","root":"root:fixture"}`)}, nil)
+		if step == StepPublish {
+			if err := st.CaseNote(ctx, a.ID, store.LessonPublished, "synthetic lesson receipt", "fixture"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		r.finish(ctx, a, &run, Result{Started: true, Status: store.RunOK, CostKnown: true,
+			Report: json.RawMessage(`{"mechanism":"the lock order","alternatives":[],"fix":"take the lock first","findings":[],"summary":"x","root":"root:fixture"}`)}, nil)
+		if run.Status != store.RunOK {
+			t.Fatalf("%s did not finish successfully: %+v", step, run)
+		}
 		got, err := st.CaseLive(ctx, a.ID)
 		if err != nil || (got.ID == b.ID) != merged {
 			t.Errorf("%s: the case is %s, merged into %s: %v, want %v", step, got.ID, b.ID, got.ID == b.ID, merged)
+		}
+		if step == StepInvestigate && (got.Status != store.CaseTesting || got.Mechanism != "the lock order" || got.NextTest != "take the lock first") {
+			t.Errorf("the native investigation lost its findings: %+v", got)
 		}
 	}
 }

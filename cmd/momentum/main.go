@@ -29,16 +29,25 @@ var version = "0.0.0-dev"
 
 const usage = `usage:
   momentum evidence ingest              read what is new in every configured source into the store
-  momentum evidence events [--since WHEN] [--until WHEN] [--kind K,K] [--source S] [--harness H] [--session ID]
-                           [--limit N] [--json]
-                                        events, newest first; one session's (an id or its start) oldest first;
-                                        H is claude, codex, pi, opencode or hermes
-  momentum evidence status [--since DUR]   events per source and kind, and unparsed records
-  momentum evidence show ID             an event, and the record of the transcript or log it names (scrubbed)
+  momentum evidence events [--since WHEN] [--until WHEN] [--kind K,K] [--source S] [--harness H] [--actor A]
+                           [--session ID] [--limit N] [--json]
+                                        events, newest first, each with its ev:ID; one session's (an id or its
+                                        start) oldest first; H is claude, codex, pi, opencode or hermes
+  momentum evidence status [--since WHEN]   events per source and kind, and unparsed records
+  momentum evidence show ID... [--bytes N]
+                                        up to ten events, each with the record of the transcript or log it names,
+                                        or its Hermes message row (scrubbed whole, then its first N bytes)
+  momentum evidence search TEXT [--source SOURCE] [--since WHEN] [--until WHEN] [--kind K,K] [--actor A] [--session ID] [--limit N]
+                                        stored summaries of every source matching TEXT (2 characters or more; one
+                                        that starts with a dash after --), newest first, also with --session
+                                        (scrubbed); flags anywhere
+                                        agent text: first 160 and last 80 bytes; calls and results: first 240
+                                        (error results keep 1,000); evidence show reads the whole record
   momentum evidence git DIR GITCOMMAND [ARG]... [-- PATH...]
                                         a git command that reads (log, show, diff, blame, grep, ...) in DIR's
-                                        work tree, with only the options that read; revisions are checked,
-                                        paths come after --
+                                        work tree, with only the options that read (and git's -N for a count;
+                                        grep's first word is its pattern); revisions are checked, paths come
+                                        after --; a grep with no match exits 1
   momentum evidence unit NAME [--lines N]  a user service's state and the end of its log, scrubbed
   momentum evidence rebuild SOURCE [--force]
                                         drop what SOURCE contributed; the next ingest reads it from the start
@@ -97,6 +106,10 @@ const usage = `usage:
                                         the loop's runs, and what the live ones spent in the last day and week
   momentum loop lesson --case ID --text T
                                         a case closed as improved: its lesson to tacit, as the loop's observation
+  momentum loop eval [--golden FILE] [--trials N] [--task T,T] [--budget USD] [--parallel N] [--arms loop,native] [--json]
+                                        the golden-set evaluation: the loop's investigation of each past problem
+                                        as of its symptom, judged against its verified root cause; compares both arms
+                                        by default, or --arms loop or --arms native runs one alone
   momentum ship prepare --repo DIR [--case ID]
   momentum ship check --test CMD [--test-files F,F] [--case ID]
   momentum ship propose --title T --body-file F --rollback R --signal JSON [--window D] [--lesson L] [--case ID]
@@ -114,7 +127,8 @@ The store is $MOMENTUM_HOME/momentum.db (default ~/.local/share/momentum).
 DUR is a Go duration or a number of days, e.g. 36h or 7d; WHEN is a DUR ago, a local time (2026-01-02T15:04,
 "2026-01-02 15:04", seconds optional, or a date) or a time with its offset (2026-01-02T15:04:05+03:00,
 "2026-01-02 15:04:05 +0300").
-Exit: 0 done, 2 usage or configuration error,
+Exit: 0 done, 1 a read that found nothing (evidence git's grep with no match, an --is-ancestor that does not
+hold), 2 usage, configuration error or a refusal,
 3 error (for ingest and sessions: at least one source failed, for capacity at least one rule; the others still
 ran; a report whose scan of a harness failed or was not done within 3 s still prints, exits 0 and names it on
 stderr).`
@@ -126,6 +140,11 @@ type usageError struct{ msg string }
 const loopQueryLimit = 200
 
 func (u usageError) Error() string { return u.msg }
+
+// answeredNo is a read that worked and found nothing, as grep says it: the command exits 1 and says what it found.
+type answeredNo struct{ msg string }
+
+func (a answeredNo) Error() string { return a.msg }
 
 func main() {
 	// inside a sandbox (internal/jail): its first process forwards the route's port, and the momentum and tacit
@@ -196,9 +215,13 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		err = usageError{fmt.Sprintf("unknown command %q", args[0])}
 	}
 	var ue usageError
+	var no answeredNo
 	switch {
 	case err == nil:
 		return 0
+	case errors.As(err, &no):
+		fmt.Fprintln(stderr, "momentum:", err)
+		return 1
 	case errors.As(err, &ue), errors.Is(err, config.ErrNoSources):
 		fmt.Fprintln(stderr, "momentum:", err)
 		return 2
@@ -225,6 +248,8 @@ func evidence(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return evidenceGit(ctx, args[1:], stdout, stderr)
 	case "show":
 		return evidenceShow(ctx, args[1:], stdout, stderr)
+	case "search":
+		return evidenceSearch(ctx, args[1:], stdout, stderr)
 	case "unit":
 		return evidenceUnit(ctx, args[1:], stdout, stderr)
 	}
@@ -293,13 +318,17 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	src := fs.String("source", "", "one source")
 	harness := fs.String("harness", "", "one harness's events, from every source: "+strings.Join(store.Harnesses, ", "))
 	session := fs.String("session", "", "one session, by its id or its start; oldest first")
+	actor := fs.String("actor", "", "only one actor: owner, agent, tool, harness, detector, unknown")
 	limit := fs.Int("limit", 50, "most events to print (0: 200)")
 	asJSON := fs.Bool("json", false, "one JSON object per line")
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
 	}
 	if fs.NArg() > 0 {
-		return usageError{strayArgs("evidence events", fs.Arg(0))}
+		return usageError{strayArgs("evidence events", fs.Arg(0)) + "; a phrase to match goes to evidence search"}
+	}
+	if err := knownActor(*actor); err != nil {
+		return err
 	}
 	if *limit <= 0 {
 		*limit = loopQueryLimit
@@ -319,20 +348,31 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	if *harness != "" && !slices.Contains(store.Harnesses, *harness) {
 		return usageError{fmt.Sprintf("unknown harness %q: one of %s", *harness, strings.Join(store.Harnesses, ", "))}
 	}
-	var err error
-	q := store.Query{Since: from, Source: *src, Harness: *harness, Session: *session, Limit: *limit + 1}
+	now, err := commandNow()
+	if err != nil {
+		return err
+	}
+	q := store.Query{Until: now, Since: from, Source: *src, Harness: *harness, Session: *session, Actor: store.Actor(*actor), Limit: *limit + 1}
 	if *until != "" {
 		if q.Until, err = parseWhen(*until); err != nil {
 			return usageError{err.Error()}
 		}
+	}
+	if os.Getenv("MOMENTUM_NOW") != "" && q.Until.After(now) {
+		q.Until = now
 	}
 	st, err := store.Open(paths.DB())
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	if *kinds != "" {
-		q.Kinds = strings.Split(*kinds, ",")
+	for _, k := range strings.Split(*kinds, ",") { // as search reads them: "a, b" is two kinds
+		if k = strings.TrimSpace(k); k != "" {
+			q.Kinds = append(q.Kinds, k)
+		}
+	}
+	if err := knownKinds(ctx, st, q.Kinds); err != nil {
+		return err
 	}
 	evs, err := st.Events(ctx, q)
 	if err != nil {
@@ -344,8 +384,11 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	}
 	enc := json.NewEncoder(stdout)
 	for _, e := range evs {
-		if *asJSON {
-			if err := enc.Encode(e); err != nil {
+		if *asJSON { // each line with its id, which evidence show takes
+			if err := enc.Encode(struct {
+				ID string `json:"ID"`
+				store.Event
+			}{e.ID(), e}); err != nil {
 				return err
 			}
 			continue
@@ -364,21 +407,46 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		if e.Agent != "" {
 			tag += " [subagent " + e.Agent + "]"
 		}
-		// Plain text: a summary holds what agents and tools wrote, which must not act on the terminal.
-		fmt.Fprintf(stdout, "%s  %-15s %-8s %-16s %s%s\n", e.TS.Local().Format("01-02 15:04:05"), e.Source, e.Actor, plain.Line(what),
+		// Plain text: a summary holds what agents and tools wrote, which must not act on the terminal. The id is what
+		// evidence show takes.
+		fmt.Fprintf(stdout, "%s ev:%s  %-15s %-8s %-16s %s%s\n", e.TS.Local().Format("01-02 15:04:05"), e.ID(), e.Source, e.Actor, plain.Line(what),
 			plain.Line(e.Summary), plain.Line(tag))
 	}
 	return nil
 }
 
+// knownActor refuses an actor the store never records.
+func knownActor(actor string) error {
+	switch store.Actor(actor) {
+	case "", store.ActorOwner, store.ActorAgent, store.ActorTool, store.ActorHarness, store.ActorDetector, store.ActorUnknown:
+		return nil
+	}
+	return usageError{fmt.Sprintf("unknown actor %q: one of owner, agent, tool, harness, detector, unknown", actor)}
+}
+
+// knownKinds refuses a kind no event of the store has, naming the kinds it holds.
+func knownKinds(ctx context.Context, st *store.Store, kinds []string) error {
+	var named []string
+	for _, k := range kinds {
+		if k = strings.TrimSpace(k); k != "" {
+			named = append(named, k)
+		}
+	}
+	unknown, held, err := st.UnknownKinds(ctx, named)
+	if err != nil || len(unknown) == 0 {
+		return err
+	}
+	return usageError{fmt.Sprintf("unknown kind %s; the store's kinds are %s", strings.Join(unknown, ", "), strings.Join(held, ", "))}
+}
+
 func status(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	since := fs.String("since", "7d", "how far back")
+	since := fs.String("since", "7d", "how far back: a duration or a time")
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
 	}
-	d, err := parseSince(*since)
+	from, err := parseWhen(*since)
 	if err != nil {
 		return usageError{err.Error()}
 	}
@@ -387,7 +455,11 @@ func status(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		return err
 	}
 	defer st.Close()
-	counts, err := st.Counts(ctx, time.Now().Add(-d))
+	now, err := commandNow()
+	if err != nil {
+		return err
+	}
+	counts, err := st.Counts(ctx, from, now)
 	if err != nil {
 		return err
 	}
@@ -483,11 +555,30 @@ func rebuild(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	return nil
 }
 
-// parseWhen is a time: a duration ago (parseSince), a local time ("2006-01-02T15:04" or "2006-01-02 15:04",
-// seconds optional; a date), or one with its offset (RFC 3339, or git's iso date: "2006-01-02 15:04:05 -0700").
+// commandNow is the clock the evidence commands read: the wall clock, or in an evaluation's trial the end of its
+// store (MOMENTUM_NOW, which the trial's door sets), so a default window and a duration ago count back from then. A
+// bad clock fails closed.
+func commandNow() (time.Time, error) {
+	if s := os.Getenv("MOMENTUM_NOW"); s != "" {
+		t, err := time.Parse(time.RFC3339Nano, s)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("bad MOMENTUM_NOW: %w", err)
+		}
+		return t, nil
+	}
+	return time.Now(), nil
+}
+
+// parseWhen is a time: a duration ago (parseSince, counted back from the command's clock), a local time
+// ("2006-01-02T15:04" or "2006-01-02 15:04", seconds optional; a date), or one with its offset (RFC 3339, or git's
+// iso date: "2006-01-02 15:04:05 -0700").
 func parseWhen(s string) (time.Time, error) {
 	if d, err := parseSince(s); err == nil {
-		return time.Now().Add(-d), nil
+		now, err := commandNow()
+		if err != nil {
+			return time.Time{}, err
+		}
+		return now.Add(-d), nil
 	}
 	// a time with its offset keeps it: git's iso date puts it after a space
 	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05 -0700", "2006-01-02 15:04 -0700", "2006-01-02 15:04:05 -07:00", "2006-01-02 15:04:05Z07:00"} {

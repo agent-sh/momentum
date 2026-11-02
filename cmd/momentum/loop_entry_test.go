@@ -135,6 +135,7 @@ func TestALoopRunChecksItsModelsBeforeItStartsAnything(t *testing.T) {
 		{Model: "global.anthropic.claude-opus-5-5", Fallback: "global.anthropic.claude-sonnet-5-5", Bedrock: &loop.Bedrock{File: bedrockFile(t)}},
 		{Model: "global.anthropic.claude-opus-5-5[1m]", Bedrock: &loop.Bedrock{File: bedrockFile(t)}},
 	} {
+		a.Self, _ = os.Executable()
 		if err := onBedrock(a); err != nil {
 			t.Errorf("%+v: %v", a, err)
 		}

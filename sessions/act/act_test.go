@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -435,6 +436,12 @@ func tmuxServer(t *testing.T) (sock string, run func(args ...string) string) {
 		sockDir = d
 	}
 	sock = filepath.Join(sockDir, "tmux.sock")
+	probe, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Skipf("tmux's Unix socket is unavailable here: %v", err)
+	}
+	probe.Close()
+	os.Remove(sock)
 	// The server and its shells get a home of their own: an interactive shell saves its history there, not in
 	// the home of whoever runs the test.
 	env := append(os.Environ(), "HOME="+dir, "HISTFILE="+filepath.Join(dir, "history"))

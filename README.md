@@ -10,9 +10,14 @@ Status: milestone 1 (the evidence layer) in progress. See [SPEC.md](SPEC.md).
 
 ```
 momentum evidence ingest              read what is new in every configured source
-momentum evidence events --since 1d   events, newest first (--kind, --source, --harness, --until, --json)
+momentum evidence events --since 1d   events, newest first, each with its ev:ID (--kind, --source, --harness,
+                                      --actor, --until, --json)
 momentum evidence events --session ID one session's events, its subagents' among them, oldest first
 momentum evidence status              events per source and kind, and unparsed records
+momentum evidence search TEXT         stored summaries of every source holding TEXT, newest first (--source, --kind,
+                                      --actor, --session, --since, --until, --limit)
+momentum evidence show ID...          up to ten events, each with its record: a transcript's or a log's line, or
+                                      a Hermes message row (--bytes N cuts each)
 momentum evidence rebuild SOURCE      drop a source's events; the next ingest reads it again
                                       (not sessions; transcripts only with --force)
 ```
@@ -149,20 +154,31 @@ momentum case reopen ID --evidence REF... [--at WHEN] --why W
 
 `case detect` runs the detectors, deterministic reads with no model (of the store, and for sessions of what the replay of supervision reads): recurring tool and infrastructure failures (guard refusals, harness and tool errors, commands that fail the setup's way, model refusals, incidents), the owner's own turns that push back or repeat with the agent's last words before them, and what keeps sessions waiting on him (supervision's give-ups, nudges no rule covers, long waits). Each finding is a signature; a case opens for a new one, and the case that holds it takes the evidence.
 
-A case is one answer in progress to a standing question: its family, its evidence, the suspected mechanism and the alternatives, the next test that tells them apart, the expected benefit, what it cost so far, and its status (open, investigating, testing, deployed, measuring, closed with a reason). A symptom's signature opens a case, and the same signature finds it again; the root cause's signature merges the cases it explains. A closed case comes back on new evidence only: a recurrence after it was solved, its old rate after it improved, or as much again as it was dismissed on. Only the ship tool deploys a case and only the measure tool closes one as improved. A case unseen for 30 days closes by itself.
+A case is one answer in progress to a standing question: its family, its evidence, the suspected mechanism and the alternatives, the next test (the fix that follows, which the change's own test discriminates), the expected benefit, what it cost so far, and its status (open, investigating, testing, deployed, measuring, closed with a reason). A symptom's signature opens a case, and the same signature finds it again; the root cause's signature merges the cases it explains. A closed case comes back on new evidence only: a recurrence after it was solved, its old rate after it improved, or as much again as it was dismissed on. Only the ship tool deploys a case and only the measure tool closes one as improved. A case unseen for 30 days closes by itself.
 
 ## Loop
+
+Install both commands from the checkout:
+
+```sh
+go install ./cmd/...
+```
+
+The loop mounts `momentum-door`, the small sandbox init and command client. It finds it beside `momentum`, or at `loop.door_client`. `momentum loop` and `momentum loop eval` refuse to start a run when the client is missing or not executable. The client contains no local momentum subcommands.
 
 ```
 momentum loop [--dry] [--family F,F] [--case ID] [--json]
 momentum loop runs [--since WHEN] [--case ID] [--json]
 momentum loop lesson --case ID --text T
+momentum loop eval [--golden FILE] [--task ID,ID] [--trials K] [--arms loop,native] [--budget USD] [--parallel N] [--json]
 momentum ship prepare|check|propose|status|land|rollback ...
 ```
 
-The improvement loop takes each family's case one step a run: investigate it, build its change (or revise it for its review), or publish its lesson. A step is one run of the harness's own agent (Claude Code in print mode, bare, on Bedrock: Opus 5.5, with Sonnet 5.5 when Opus's safeguards refuse), with the loop's procedure and the family's skill in its system prompt, and a budget per run, per case, per day and per week. A case whose runs fail the same way twice stops, and the loop opens a case about itself; a publish that leaves no receipt counts as a failure. A change that used its three review rounds waits for a person, and the report shows a low problem note for it.
+The improvement loop takes each family's case one step a run: investigate it, build its change (or revise it for its review), or publish its lesson. A step is one run of the harness's own agent (Claude Code in print mode, bare, on Bedrock: Opus 5.5, with Sonnet 5.5 when Opus's safeguards refuse), with the loop's procedure and the family's skill in its system prompt (an investigation is the native path's instead: the native brief, and the case's evidence and record in its prompt; the runner writes its report into the case), and a budget per run, per case, per day and per week. A case whose runs fail the same way twice stops, and the loop opens a case about itself; a publish that leaves no receipt counts as a failure. A change that used its three review rounds waits for a person, and the report shows a low problem note for it.
 
 Each run is in a bubblewrap sandbox where what it must not reach does not exist: an empty home, its own directory, a build's independent clone and the toolchains its tests need, and no network but a relay to the machine's Bedrock broker, which forwards only Claude models on Bedrock's global inference profiles. It reads the machine through momentum's and tacit's commands, which its door runs outside the sandbox (only those its step allows) and which scrub secrets from all they print, replay included, whose file flags are refused. Git outside a sandbox reads no attributes from the tree and refuses repository settings that name programs; ship authenticates through its own GitHub credential helper, and every push and review post checks its repository again, which goes only where origin's fetch and push addresses agree. A case with a run in flight waits for it.
+
+`loop eval` is the gate before the loop goes live: it runs the loop's investigation and the native path on a golden set kept on the machine, real past problems with verified root causes, each as of the moment its case could have opened (the store and the repositories as they stood then, no reading of the machine as it is now), several times, and a clean-context judge grades whether each reached the cause. Each trial and each judge runs in the same kind of sandbox as a loop run, on the same route: the golden file and its answers are not in it, its checkouts are read-only copies, and its door runs the evidence commands on the trial's clock and store. It prints, per arm, the causes reached, pass@k and pass^k, the cost (at Bedrock's rates) and time per cause reached, the tokens by kind, the tasks that flipped, and a paired bootstrap over tasks of the difference; `results.json` keeps every trial.
 
 A change goes in only through `momentum ship`, and only to a repository: an independent run clone and a host-only clone, a bounded patch applied to the host clone, a test that fails without the change and passes with it in a bubblewrap sandbox that reaches nothing of the user's, a measurement plan whose signal counts the case's own problem, a rollback, a pull request committed as the user with its text scrubbed and its mentions inert, a clean-context review posted on it (three rounds at most), and a fast-forward of the default branch, only when the loop is live. Its authority is configuration the loop never writes, and a key of it momentum does not know is an error:
 

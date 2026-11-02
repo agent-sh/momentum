@@ -240,11 +240,11 @@ func TestRunSummariesAreCleanedBeforePersistence(t *testing.T) {
 	r := Runner{Store: st, Budgets: Budgets{Run: 1}}
 	c := openCase(t, st, "failures", "fixture", 1)
 	for i, res := range []Result{
-		{Status: store.RunOK, CostKnown: true, Report: json.RawMessage(`{"outcome":"investigated","summary":"marker-7f3a","root":"root:marker-7f3a"}`)},
-		{Status: store.RunFailed, Failure: "the model's safeguards", CostKnown: true, Text: "marker-7f3a"},
-		{Status: store.RunOK, CostKnown: true},
+		{Started: true, Status: store.RunOK, CostKnown: true, Report: json.RawMessage(`{"outcome":"investigated","summary":"marker-7f3a","root":"root:marker-7f3a"}`)},
+		{Started: true, Status: store.RunFailed, Failure: "the model's safeguards", CostKnown: true, Text: "marker-7f3a"},
+		{Started: true, Status: store.RunOK, CostKnown: true},
 	} {
-		run := store.LoopRun{ID: fmt.Sprint(i), Case: c.ID, Family: c.Family, Step: StepInvestigate,
+		run := store.LoopRun{ID: fmt.Sprint(i), Case: c.ID, Family: c.Family, Step: StepBuild,
 			Started: time.Now(), Status: store.RunRunning, USD: 1}
 		if i == 2 {
 			run.Step, run.Summary = StepReview, "0 high, 0 medium, 0 low: marker-7f3a"
@@ -271,7 +271,7 @@ func TestRunSummariesAreCleanedBeforePersistence(t *testing.T) {
 	Scrubber = []string{filepath.Join(t.TempDir(), "missing")}
 	run := store.LoopRun{ID: "failed-cleaner", Case: c.ID, Step: StepInvestigate, Status: store.RunRunning, Started: time.Now(), USD: 1}
 	st.PutLoopRun(ctx, run)
-	r.finish(ctx, c, &run, Result{Status: store.RunOK, CostKnown: true, Text: "marker-7f3a"}, nil)
+	r.finish(ctx, c, &run, Result{Started: true, Status: store.RunOK, CostKnown: true, Text: "marker-7f3a"}, nil)
 	saved, _ := st.LoopRunByID(ctx, run.ID)
 	if saved.Status != store.RunFailed || strings.Contains(saved.Summary, "marker-7f3a") || strings.Contains(run.Summary, "marker-7f3a") {
 		t.Fatalf("failed cleaner leaked a summary: %+v", saved)

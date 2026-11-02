@@ -24,8 +24,9 @@ import (
 )
 
 // caseCmd keeps the cases: one answer in progress each, to one of the standing questions. A detector or an agent
-// opens one by its signature; the investigation records its mechanism, alternatives, next test and benefit; the
-// ship and measure tools move it through deployed and measuring; it closes with a reason.
+// opens one by its signature; the runner records an investigation's mechanism, alternatives and fix (its next
+// test), and a build its root; the ship and measure tools move it through deployed and measuring; it closes with a
+// reason.
 func caseCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return usageError{"case needs detect, list, show, open, set, evidence, signature, close or reopen"}
@@ -96,6 +97,25 @@ func ownCase(args []string) error {
 		if id != own {
 			return usageError{fmt.Sprintf("this loop run works case %s, not %q: it changes only its own", own, id)}
 		}
+		// a case whose change is proposed answers its review: closing it, sending it back or merging it by a root
+		// would leave its pull request open with nothing in the loop to return to it
+		if args[0] == "close" || args[0] == "signature" {
+			if err := changeInProgress(own); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// changeInProgress refuses, inside a loop run, to close, send back or merge by a root a case whose change is on its
+// pull request: its review decides. A change before its proposal ends with its case, and the loop drops it.
+func changeInProgress(id string) error {
+	if os.Getenv("MOMENTUM_LOOP_RUN") == "" {
+		return nil
+	}
+	if state, open := (&loop.Ship{Dir: loopDir()}).ChangeOpen(id); open {
+		return usageError{fmt.Sprintf("case %s's change is %s on its pull request: its review decides, so a run neither closes it, sends it back nor merges it", id, state)}
 	}
 	return nil
 }
@@ -423,12 +443,12 @@ func caseSet(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	fs := flag.NewFlagSet("case set", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	status := fs.String("status", "", "open, investigating or testing (testing needs a mechanism and a next test)")
+	status := fs.String("status", "", "open, investigating or testing (testing needs a mechanism and a fix, its next test)")
 	var alts refs
 	fs.Var(&alts, "alternative", "another mechanism that could explain the evidence; repeat for more (replaces the list)")
 	texts := map[string]*string{}
 	for name, usage := range map[string]string{"title": "its title", "mechanism": "the suspected mechanism",
-		"next-test": "the next test that tells the mechanism from the alternatives", "benefit": "the expected benefit"} {
+		"next-test": "the fix the investigation found, which a build tests", "benefit": "the expected benefit"} {
 		texts[name] = fs.String(name, "", usage)
 	}
 	if err := fs.Parse(rest); err != nil {
@@ -440,6 +460,12 @@ func caseSet(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	u := store.CaseUpdate{Status: store.CaseStatus(*status)}
 	set := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	// decided after the parse, which reads every form a status takes (a flag's value may be "--")
+	if set["status"] && id == os.Getenv("MOMENTUM_LOOP_CASE") {
+		if err := changeInProgress(id); err != nil {
+			return err
+		}
+	}
 	pick := func(name string) *string {
 		if set[name] {
 			return texts[name]

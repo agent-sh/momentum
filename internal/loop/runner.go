@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -23,7 +24,7 @@ import (
 
 // Steps a run takes a case through.
 const (
-	StepInvestigate = "investigate" // open or investigating: find the mechanism, decide
+	StepInvestigate = "investigate" // open or investigating: the native run; the runner records its report
 	StepBuild       = "build"       // testing: prepare, then build and propose in the next run, or revise for its review
 	StepReview      = "review"      // a proposed change: a clean-context review
 	StepPublish     = "publish"     // closed as improved: the lesson to tacit
@@ -125,6 +126,7 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		for _, c := range swept {
 			r.logf("swept %s: %s", c.ID, c.Title)
 		}
+		r.dropLeft(ctx)
 	}
 	families := r.Families
 	if len(o.Families) > 0 {
@@ -211,12 +213,61 @@ func (r *Runner) endStale(ctx context.Context) error {
 			if run.USD == 0 {
 				run.USD = r.Budgets.Run
 			}
+			// a killed investigation leaves its findings file: the case keeps what it found, still investigating,
+			// recorded before the run ends, as the runner records a run's
+			if run.Step == StepInvestigate && run.Dir != "" {
+				// Only the host's completed, authenticated result can conclude an investigation. Without it,
+				// an unfinished run's findings file is still useful, but its stdout cannot move the case.
+				res, streamErr := readHostResult(run.Dir)
+				why := undecided(res, streamErr)
+				if f, reported, ok := investigationFindings(res, run.Dir); ok || why != "" {
+					r.keepFindings(ctx, run, f, reported, why)
+				}
+			}
 			if err := r.Store.FinishLoopRun(ctx, run); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// dropLeft drops each change before its proposal whose case left testing (closed, sent back, merged into another,
+// swept): nothing else in the loop returns to its host and run clones.
+func (r *Runner) dropLeft(ctx context.Context) {
+	if r.Ship == nil {
+		return
+	}
+	entries, err := os.ReadDir(filepath.Join(r.Ship.Dir, "packages"))
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			r.logf("changes left by their cases: %v", err)
+		}
+		return
+	}
+	for _, e := range entries {
+		p, ok, err := r.Ship.Load(e.Name())
+		if !e.IsDir() || err != nil || !ok || !unproposed(p) {
+			continue
+		}
+		c, err := r.Store.CaseByID(ctx, p.Case)
+		if err != nil {
+			r.logf("the change of %s: %v", p.Case, err)
+			continue
+		}
+		if c.Status == store.CaseTesting && c.Into == "" {
+			continue
+		}
+		why := "its case is " + string(c.Status)
+		if c.Reason != "" {
+			why += " (" + string(c.Reason) + ")"
+		}
+		if _, err := r.Ship.Drop(ctx, p.Case, why); err != nil {
+			r.logf("drop the change of %s: %v", p.Case, err)
+			continue
+		}
+		r.logf("dropped the change of %s: %s", p.Case, why)
+	}
 }
 
 // pick chooses a family's case and its step: a case in testing first (finish what is in flight: its build, or its
@@ -364,7 +415,11 @@ func (r *Runner) published(ctx context.Context, id string) bool {
 // health, the first time, with both runs' transcripts as its evidence, and says why. A dry check opens nothing.
 func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, error) {
 	live := ""
-	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID, Experiment: &live, Ran: true, Limit: 2})
+	since := c.Back
+	if !since.IsZero() {
+		since = since.Add(time.Millisecond) // the kept clock is in milliseconds; only runs after the return count
+	}
+	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID, Experiment: &live, Ran: true, Since: since, Limit: 2})
 	if err != nil {
 		return "", err
 	}
@@ -412,6 +467,11 @@ func (r *Runner) reserve(ctx context.Context, family, caseID, step string) (stor
 	if err := r.Store.PutLoopRun(ctx, run); err != nil {
 		return run, err.Error()
 	}
+	stored, err := r.Store.LoopRunByID(ctx, run.ID)
+	if err != nil {
+		return run, err.Error()
+	}
+	run.CaseEpisode = stored.CaseEpisode
 	return run, ""
 }
 
@@ -420,10 +480,31 @@ func (r *Runner) reserve(ctx context.Context, family, caseID, step string) (stor
 // budget.
 func (r *Runner) step(ctx context.Context, family string, c store.Case, step string, run store.LoopRun) Done {
 	d := Done{Family: family, Case: c.ID, Step: step}
+	began := "" // a build that resumes a change before its proposal
+	if step == StepBuild && r.Ship != nil {
+		if p, ok, _ := r.Ship.Load(c.ID); ok && unproposed(p) {
+			began = p.State
+		}
+	}
 	res, err := r.invoke(ctx, family, c, step, run)
+	// one that ended well with its change where it began, and its case still in testing, moved nothing: it is a stop,
+	// so two in a row trip the stop rule before the case's budget is gone
+	if began != "" && err == nil && res.Status == store.RunOK && r.idle(ctx, c.ID, began) {
+		res.Status, res.Failure = store.RunFailed, "no progress"
+	}
 	r.finish(ctx, c, &run, res, err)
 	d.Run, d.Refused = run, res.Refused
 	return d
+}
+
+// idle says whether a build left its case in testing and its change before its proposal, in the state it began in.
+func (r *Runner) idle(ctx context.Context, caseID, began string) bool {
+	c, err := r.Store.CaseByID(ctx, caseID)
+	if err != nil || c.Status != store.CaseTesting || c.Into != "" {
+		return false
+	}
+	p, ok, err := r.Ship.Load(caseID)
+	return err == nil && ok && unproposed(p) && p.State == began
 }
 
 // finish records how a run ended, on the run and on its case.
@@ -433,7 +514,7 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 		reserved = r.Budgets.Run
 	}
 	run.Ended = r.now()
-	run.USD, run.Tokens, run.Turns = res.USD, res.Tokens, res.Turns
+	run.USD, run.Tokens, run.Usage, run.Turns = res.USD, res.Tokens, res.Usage, res.Turns
 	run.Model = firstOf(res.Model, run.Model)
 	if err != nil {
 		run.Status, run.Failure, run.Summary = store.RunFailed, "run", err.Error()
@@ -458,8 +539,9 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 		}
 	}
 	switch {
-	case !res.CostKnown && err != nil && res.Transcript == "":
+	case !res.Started:
 		run.USD = 0 // it never started (its prompt could not be scrubbed, the harness did not start): it spent nothing
+		run.Started = time.Time{}
 	case !res.CostKnown:
 		run.USD = reserved // what it spent is unknown: its whole budget
 	}
@@ -474,7 +556,7 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 		run.Summary = clean
 	}
 	root := ""
-	if err == nil && run.Status == store.RunOK && run.Step != StepReview {
+	if err == nil && run.Status == store.RunOK && run.Step != StepReview && run.Step != StepInvestigate {
 		var report struct {
 			Root string `json:"root"`
 		}
@@ -486,18 +568,54 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 			}
 		}
 	}
+	// The runner keeps an investigation's case: what the run found goes into it, deterministically, from its report
+	// or, when it was cut short, from the findings it kept as it went, whatever error ended the run. It is recorded
+	// before the run ends, so a loop that dies between the two leaves a running run, which stale recovery ends and
+	// records again under the same guard.
+	if run.Step == StepInvestigate && res.Started && cleanErr == nil {
+		// one that ended well with a report short of a mechanism or a fix did not decide: its case closes as
+		// insufficient evidence, and comes back once as much evidence again comes in (Cases)
+		why := undecided(res, err)
+		if f, reported, ok := investigationFindings(res, run.Dir); ok || why != "" {
+			if err := r.keepFindings(ctx, *run, f, reported, why); err != nil {
+				run.Status, run.Failure, run.Summary = store.RunFailed, "findings", "(findings withheld: recording failed)"
+				if errors.Is(err, ErrNoScrubber) {
+					run.Failure = "scrub"
+				}
+			}
+		}
+	}
 	if err := r.Store.FinishLoopRun(ctx, *run); err != nil {
 		r.logf("record run %s: %v", run.ID, err)
 		return
 	}
-	// A report cannot choose another case to change. Its root is applied to this run's case, after it ends.
+	// A report cannot choose another case to change. Investigations record only their findings, and an open
+	// proposal keeps its case while its review decides it.
 	if root != "" {
-		if own, recorded, err := r.Store.RecordRoot(ctx, run.Case, root, "loop"); err != nil {
+		if state, open := r.Ship.ChangeOpen(run.Case); open {
+			r.logf("root of %s ignored: its change is %s on its pull request", run.Case, state)
+		} else if own, recorded, err := r.Store.RecordRoot(ctx, run.Case, root, "loop"); err != nil {
 			r.logf("record root of %s: %v", run.Case, err)
 		} else if !recorded {
 			r.logf("root of %s ignored: its case went into %s", run.Case, own.Into)
 		}
 	}
+}
+
+// keepFindings records an investigation's findings into its case, and logs why when it records nothing.
+func (r *Runner) keepFindings(ctx context.Context, run store.LoopRun, f finding, reported bool, undecided string) error {
+	own, recorded, err := recordFindings(ctx, r.Store, run.Case, run.CaseEpisode, f, reported, undecided, "loop:"+run.ID)
+	switch {
+	case err != nil:
+		r.logf("record the findings of %s: %v", run.Case, err)
+	case !recorded && own.Into != "":
+		r.logf("findings of %s not recorded: it went into %s", run.Case, own.Into)
+	case !recorded && own.Episode != run.CaseEpisode:
+		r.logf("findings of %s not recorded: its episode changed", run.Case)
+	case !recorded:
+		r.logf("findings of %s not recorded: it is %s now", run.Case, own.Status)
+	}
+	return err
 }
 
 // affordable says why no run may start now: the day's or the week's spend, with the runs in flight counted at
@@ -523,6 +641,9 @@ func (r *Runner) affordable(ctx context.Context) (string, error) {
 // invoke runs the agent for a step, in its sandbox: its own directory, a prepared build's clone and the toolchains its
 // tests need, and its step's commands through its door.
 func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step string, run store.LoopRun) (Result, error) {
+	if step == StepInvestigate {
+		return r.investigate(ctx, c, run)
+	}
 	system, err := systemPrompt(step, family, r.Rules, r.Constraints)
 	if err != nil {
 		return Result{}, err
@@ -541,7 +662,7 @@ func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step s
 		if err != nil {
 			return Result{}, err
 		}
-		if ok && p.State != RolledBack && (p.Host == "" || p.BaseCommit == "") {
+		if ok && p.State != RolledBack && p.State != Dropped && (p.Host == "" || p.BaseCommit == "") {
 			return Result{}, refused("legacy package has no independent host clone; prepare a fresh package before building")
 		}
 		if ok && p.RefreshBase {
@@ -556,7 +677,7 @@ func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step s
 			inv.Files = map[string][]byte{"previous.patch": previous}
 			inv.Prompt += "\nThe default branch moved. Start from /run/momentum/input/previous.patch, which is read-only. Adapt it to the new base."
 		}
-		if !ok || p.State == RolledBack {
+		if !ok || p.State == RolledBack || p.State == Dropped {
 			inv.Prompt += "\nNo clone is mounted yet. Choose a repository with the evidence commands and call momentum ship prepare --repo DIR. End this run after preparation with the report; the next build mounts the complete clone. Preparation counts toward all budgets and the stop rule."
 		} else {
 			roots = append(roots, p.Work)
@@ -567,7 +688,10 @@ func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step s
 			inv.Env = r.Toolchains.env()
 			inv.Prompt += fmt.Sprintf("\nYour independent clone is %s. BASE is %s. Host repositories and the host clone are absent. Use git inside your sandbox for history. Finish with git add -A && git diff --cached --binary %s > $MOMENTUM_LOOP_DIR/change.patch, then ship check and ship propose. Every revision is cumulative against BASE.", p.Work, p.BaseCommit, p.BaseCommit)
 		}
-		if p, ok, _ := r.Ship.Load(c.ID); ok && p.State == Revising && len(p.Reviews) > 0 {
+		_, inProgress := r.Ship.ChangeOpen(c.ID)
+		switch {
+		case ok && (p.State == Revising || p.State == Checked) && len(p.Reviews) > 0:
+			// A checked revision still answers its last review before it is proposed again.
 			last := p.Reviews[len(p.Reviews)-1]
 			text, err := Redact(ctx, last.Text)
 			if err != nil {
@@ -580,6 +704,13 @@ func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step s
 			inv.Prompt += fmt.Sprintf("\nIts change %s was reviewed: round %d found %d high, %d medium and %d low, in review.md. Revise the change "+
 				"in its independent clone %s for what the review found (read /run/momentum/input/review.md), check it again (`momentum ship check`) and propose it again (`momentum ship "+
 				"propose`), which updates its pull request.", p.PR, last.Round, last.High, last.Medium, last.Low, p.Work)
+		case ok && (inProgress || unproposed(p)):
+			inv.Prompt += fmt.Sprintf("\nIts change is %s, in its independent clone %s: resume it from there (`momentum ship status` says where it "+
+				"stands); its findings were checked when the change began.", p.State, p.Work)
+			if !inProgress {
+				inv.Prompt += " If it cannot go on (its test does not tell the change apart, its plan cannot count the problem), close the " +
+					"case or send it back: the loop drops a change whose case left testing."
+			}
 		}
 	}
 	inv.Door = r.door(step, c, run, roots)
@@ -779,6 +910,9 @@ func summaryOf(res Result) string {
 		BlockedBy string `json:"blocked_by"`
 	}
 	if json.Unmarshal(res.Report, &rep) == nil && rep.Summary != "" {
+		if rep.Outcome == "" { // an investigation's report has no outcome: the runner moves its case
+			return rep.Summary
+		}
 		s := rep.Outcome + ": " + rep.Summary
 		if rep.BlockedBy != "" {
 			s += " (blocked by " + rep.BlockedBy + ")"

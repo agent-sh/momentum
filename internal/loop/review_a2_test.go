@@ -245,7 +245,7 @@ func TestRunnerChargesTheHigherOfHarnessAndRelay(t *testing.T) {
 		if why != "" {
 			t.Fatal(why)
 		}
-		r.finish(context.Background(), c, &row, Result{Status: store.RunOK, CostKnown: tc.known, USD: tc.harness, RelayUSD: tc.relay}, nil)
+		r.finish(context.Background(), c, &row, Result{Started: true, Status: store.RunOK, CostKnown: tc.known, USD: tc.harness, RelayUSD: tc.relay}, nil)
 		got, err := st.LoopRunByID(context.Background(), row.ID)
 		if err != nil || got.USD != tc.want {
 			t.Fatalf("charge: %+v %v, want %f", got, err, tc.want)
@@ -288,7 +288,8 @@ exec '`+gitBinary+`' "$@"`)
 
 func TestRunRefusesAMountThatExposesItsHostDirectory(t *testing.T) {
 	root := t.TempDir()
-	a := Agent{Runner: []string{"true"}, Bedrock: &Bedrock{File: filepath.Join(root, "absent")},
+	exe, _ := os.Executable()
+	a := Agent{Self: exe, Runner: []string{"true"}, Bedrock: &Bedrock{File: filepath.Join(root, "absent")},
 		Mounts: []jail.Mount{{Path: root, Write: true}}}
 	_, err := a.Run(context.Background(), Invocation{Dir: filepath.Join(root, "run"), BudgetUSD: 1})
 	if err == nil || !strings.Contains(err.Error(), "host-only directory") {
@@ -306,13 +307,13 @@ func TestPackageReadsRefuseTraversal(t *testing.T) {
 }
 
 func TestFallbackComparesAggregateHarnessAndRelayCharges(t *testing.T) {
-	first := Result{CostKnown: true, USD: .8, RelayUSD: .1}
-	second := Result{CostKnown: true, USD: .1, RelayUSD: .8}
+	first := Result{Started: true, CostKnown: true, USD: .8, RelayUSD: .1}
+	second := Result{Started: true, CostKnown: true, USD: .1, RelayUSD: .8}
 	got := finishFallback(first, second, .2)
 	if math.Abs(got.USD-.9) > 1e-10 || math.Abs(got.RelayUSD-.9) > 1e-10 {
 		t.Fatalf("summed per-attempt maxima instead of the two totals: %+v", got)
 	}
-	unknown := finishFallback(Result{CostKnown: true, USD: .1, RelayUSD: .7}, Result{CostKnown: false, RelayUSD: .2}, .3)
+	unknown := finishFallback(Result{Started: true, CostKnown: true, USD: .1, RelayUSD: .7}, Result{Started: true, CostKnown: false, RelayUSD: .2}, .3)
 	if math.Abs(unknown.USD-1) > 1e-10 || !unknown.CostKnown {
 		t.Fatalf("unknown fallback lost its reservation: %+v", unknown)
 	}

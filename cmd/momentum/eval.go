@@ -1,0 +1,183 @@
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"maps"
+	"math"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/agent-sh/momentum/internal/config"
+	"github.com/agent-sh/momentum/internal/loop"
+	"github.com/agent-sh/momentum/internal/paths"
+	"github.com/agent-sh/momentum/internal/store"
+)
+
+// loopEval runs the golden-set evaluation: each task's investigation, as of the moment its case could have opened, several
+// times, graded by a clean-context judge against its verified root cause.
+func loopEval(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("loop eval", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	golden := fs.String("golden", filepath.Join(paths.Data(), "golden", "golden.jsonl"), "the golden set, one task per line")
+	trials := fs.Int("trials", 3, "runs of each task")
+	tasks := fs.String("task", "", "comma-separated task ids (default: every task)")
+	budget := fs.Float64("budget", 120, "the most the evaluation spends, in US dollars")
+	parallel := fs.Int("parallel", 3, "trials at once")
+	arms := fs.String("arms", "loop,native", "arms to compare: loop,native, or one alone")
+	asJSON := fs.Bool("json", false, "prints one results object")
+	if err := fs.Parse(args); err != nil {
+		return usageError{err.Error()}
+	}
+	if *trials < 1 || *parallel < 1 || *budget < 0 || math.IsNaN(*budget) || math.IsInf(*budget, 0) {
+		return usageError{"trials and parallel must be positive; budget must not be negative"}
+	}
+	selected := strings.Split(*arms, ",")
+	seen := map[string]bool{}
+	for _, a := range selected {
+		if (a != "loop" && a != "native") || seen[a] {
+			return usageError{"arms must be loop,native, or one alone"}
+		}
+		seen[a] = true
+	}
+	if os.Getenv("MOMENTUM_LOOP_RUN") != "" {
+		return usageError{"an evaluation does not run inside one of the loop's runs"}
+	}
+	all, err := loop.ReadGolden(*golden)
+	if err != nil {
+		return usageError{err.Error()}
+	}
+	var picked []loop.GoldenTask
+	want := map[string]bool{}
+	for _, t := range strings.Split(*tasks, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			want[t] = true
+		}
+	}
+	allTasks, unknown := len(want) == 0, maps.Clone(want)
+	for _, t := range all {
+		if allTasks || want[t.ID] {
+			picked = append(picked, t)
+			delete(unknown, t.ID)
+		}
+	}
+	for t := range unknown {
+		return usageError{fmt.Sprintf("no task %q in %s", t, *golden)}
+	}
+	c, err := config.Load()
+	if err != nil {
+		return err
+	}
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	r, _, err := setup(st, c.Loop)
+	if err != nil {
+		return err
+	}
+	if err := onBedrock(r.Agent); err != nil {
+		return err // every trial and judge is on Bedrock: with no route, the evaluation does not start
+	}
+	id := loop.NewEvalID()
+	raw, err := os.ReadFile(*golden)
+	if err != nil {
+		return err
+	}
+	var repositories []string
+	for _, t := range all {
+		if t.RepoPath != "" {
+			repositories = append(repositories, t.RepoPath)
+		}
+	}
+	// the programs the trials run are the evaluating process's own binary, which Run copies once: the sandbox's momentum
+	// (its init and the door's client) and the door's, whatever replaces the installed one meanwhile
+	r.Momentum = selfBinary()
+	judge := r.Agent
+	judge.Fallback = ""
+	e := &loop.Eval{Runner: r, Source: paths.DB(), Dir: filepath.Join(loopDir(), "eval", id), Trials: *trials, Budget: *budget, Parallel: *parallel, ID: id,
+		Judge: judge, Arms: selected, Repositories: repositories, GoldenHash: fmt.Sprintf("%x", sha256.Sum256(raw)), Tacit: tacitStore()}
+	tacit := "no tacit (no store)"
+	if e.Tacit != "" {
+		tacit = "tacit's store as of each end"
+	}
+	fmt.Fprintf(stderr, "evaluation %s: %d tasks, %d trials per arm, %s, in %s\n", id, len(picked), *trials, tacit, e.Dir)
+	trs, err := e.Run(ctx, picked)
+	if err != nil {
+		return err
+	}
+	results := e.Results(trs)
+	if err := e.WriteResults(results); err != nil {
+		return fmt.Errorf("write results: %w", err)
+	}
+	if *asJSON {
+		return json.NewEncoder(stdout).Encode(results)
+	}
+	printEvaluation(stdout, results)
+	return nil
+}
+
+// printEvaluation uses the same counts and rates that results.json records.
+func printEvaluation(out io.Writer, r loop.EvaluationResults) {
+	rate := func(x *float64) string {
+		if x == nil {
+			return "undefined"
+		}
+		return fmt.Sprintf("%.3f", *x)
+	}
+	for _, a := range r.Arms {
+		fmt.Fprintf(out, "%s: %d/%d graded trials reached; %d partial, %d missed, %d wrong, %d errors, %d skipped, %d runs cut short; %d/%d ran\n", a.Arm, a.Reached, a.Graded, a.Partial, a.Missed, a.Wrong, a.Errors, a.Skipped, a.CutShort, a.Ran, a.Planned)
+		fmt.Fprintf(out, "  cost $%.2f; time %.2f min; per trial $%s, %s min; per root cause reached $%s, %s min; judge $%.2f\n", a.USD, a.Minutes, rate(a.USDPerTrial), rate(a.MinutesPerTrial), rate(a.USDPerReached), rate(a.MinutesPerReached), a.JudgeUSD)
+		fmt.Fprintf(out, "  tokens: %d input, %d output, %d cache read, %d cache write (%d of them for an hour)\n", a.Usage.Input, a.Usage.Output, a.Usage.CacheRead, a.Usage.CacheWrite, a.Usage.CacheWrite1h)
+		fmt.Fprintf(out, "  compared: %d tasks, %d root causes reached among them; %d trials ungraded, left out with their pairs; pass@k, pass^k and the rates per root cause read the compared trials alone\n", a.ComparedTasks, a.ComparedReached, a.Ungraded)
+		fmt.Fprintf(out, "  k=%d: pass@k %.3f, pass^k %.3f; %d tasks flipped\n", a.K, a.PassAtK, a.PassAllK, a.Flips)
+	}
+	for _, t := range r.Comparison.Tasks {
+		fmt.Fprintf(out, "%s: loop %d, native %d reached; more often: %s\n", t.Task, t.LoopReached, t.NativeReached, t.MoreOften)
+	}
+	interval := func(x *loop.Interval) string {
+		if x == nil {
+			return "undefined"
+		}
+		return fmt.Sprintf("[%.4f, %.4f]", x.Low, x.High)
+	}
+	compared := 0
+	for _, task := range r.Comparison.Tasks {
+		if task.MoreOften != "not compared" {
+			compared++
+		}
+	}
+	fmt.Fprintf(out, "loop minus native, task bootstrap 90%% interval (%d compared tasks; %d resamples, seed %d): reached per dollar %s; reached per minute %s\n", compared, r.Comparison.Resamples, r.Comparison.Seed, interval(r.Comparison.ReachedPerDollar), interval(r.Comparison.ReachedPerMinute))
+}
+
+// selfBinary is the running binary: on Linux the process's own executable, which stays the build that started even
+// when its file is replaced.
+func selfBinary() string {
+	if _, err := os.Stat("/proc/self/exe"); err == nil {
+		return "/proc/self/exe"
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return exe
+}
+
+// tacitStore is tacit's store on this machine, a git repository a trial reads as of its end: $TACIT_STORE, else
+// tacit's default; none when it is no repository.
+func tacitStore() string {
+	dir := os.Getenv("TACIT_STORE")
+	if dir == "" {
+		dir = filepath.Join(paths.Home(), ".local", "share", "tacit", "store")
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+		return ""
+	}
+	return dir
+}

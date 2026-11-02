@@ -71,6 +71,9 @@ type Store struct {
 	readLock *os.File
 }
 
+// Path is the database file this store opened. Private scratch can live beside it.
+func (s *Store) Path() string { return s.path }
+
 // Sessions is the source of the events `momentum sessions` writes: each phase change of a live session, as the
 // runs saw it. They are observations, not read from a signal store.
 const Sessions = "sessions"
@@ -144,6 +147,8 @@ var keptColumns = []struct {
 	{"session_stamps", [][2]string{{"tool", "TEXT NOT NULL DEFAULT ''"}, {"name", "TEXT NOT NULL DEFAULT ''"},
 		{"auto", "INTEGER NOT NULL DEFAULT 0"}, {"ask", "TEXT NOT NULL DEFAULT ''"}, {"ask_kind", "TEXT NOT NULL DEFAULT ''"}}},
 	{"capacity_runs", [][2]string{{"blind", "INTEGER NOT NULL DEFAULT 0"}}},
+	{"loop_runs", loopRunColumns},
+	{"cases", [][2]string{{"episode", "INTEGER NOT NULL DEFAULT 1"}}},
 }
 
 // keptIndexes are the events' indexes. events_key finds a record's events by the prefix of their keys (PutFiles)
@@ -998,6 +1003,7 @@ type Query struct {
 	Actor   Actor  // when set, only its events
 	Main    bool   // only a session's own events, not its subagents'
 	MetaHas string // when set, only events whose meta holds it, e.g. `"is_error":true`
+	Text    string // when set, only events whose summary holds it, ASCII letters in either case
 }
 
 func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
@@ -1026,6 +1032,10 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 	if q.MetaHas != "" {
 		where, args = append(where, "instr(meta, ?) > 0"), append(args, q.MetaHas)
 	}
+	if q.Text != "" {
+		esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q.Text)
+		where, args = append(where, `summary LIKE ? ESCAPE '\'`), append(args, "%"+esc+"%")
+	}
 	order := "ts DESC, source_key DESC"
 	if q.Session != "" {
 		// An id or its first characters (a range the session index serves), and the threads under it at any
@@ -1036,7 +1046,9 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 		    UNION SELECT DISTINCT e.agent FROM events e JOIN tree ON e.session = tree.id WHERE e.agent != '' AND e.agent != e.session)
 		  SELECT id FROM tree)`)
 		args = append(args, q.Session, q.Session+"\uffff")
-		order = "ts, source_key"
+		if q.Text == "" {
+			order = "ts, source_key"
+		}
 	}
 	limit := q.Limit
 	if limit <= 0 {
@@ -1084,9 +1096,51 @@ func (s *Store) Before(ctx context.Context, session string, kinds []string, afte
 		append(args, limit)...))
 }
 
-// Counts returns events per source and kind since a time, for the status view.
-func (s *Store) Counts(ctx context.Context, since time.Time) (map[string]map[string]int, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT source, kind, COUNT(*) FROM events WHERE ts >= ? GROUP BY source, kind`, since.UnixMilli())
+// UnknownKinds are the kinds of a list that no event of the store has, with the kinds its events do have, sorted;
+// a store with no events knows no kind, so it names none unknown.
+func (s *Store) UnknownKinds(ctx context.Context, kinds []string) (unknown, held []string, err error) {
+	for _, k := range kinds {
+		var one int
+		switch err := s.db.QueryRowContext(ctx, `SELECT 1 FROM events WHERE kind = ? LIMIT 1`, k).Scan(&one); {
+		case errors.Is(err, sql.ErrNoRows):
+			unknown = append(unknown, k)
+		case err != nil:
+			return nil, nil, err
+		}
+	}
+	if len(unknown) == 0 {
+		return nil, nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT kind FROM events ORDER BY kind`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, nil, err
+		}
+		held = append(held, k)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	if len(held) == 0 {
+		return nil, nil, nil
+	}
+	return unknown, held, nil
+}
+
+// Counts returns events per source and kind since a time, and before until when it is given, for the status view.
+func (s *Store) Counts(ctx context.Context, since time.Time, until ...time.Time) (map[string]map[string]int, error) {
+	where := "ts >= ?"
+	args := []any{since.UnixMilli()}
+	if len(until) > 0 && !until[0].IsZero() {
+		where += " AND ts < ?"
+		args = append(args, until[0].UnixMilli())
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT source, kind, COUNT(*) FROM events WHERE `+where+` GROUP BY source, kind`, args...)
 	if err != nil {
 		return nil, err
 	}

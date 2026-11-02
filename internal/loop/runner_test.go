@@ -16,6 +16,124 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
+func TestMergedInvestigationCleansItsFieldsBeforeStorage(t *testing.T) {
+	old := Scrubber
+	t.Cleanup(func() { Scrubber = old })
+	Scrubber = []string{script(t, t.TempDir(), "cleaner", "sed 's/marker-7f3a/[masked]/g'")}
+	ctx := context.Background()
+	r := recordingRunner(t)
+	c := openCase(t, r.Store, "failures", "synthetic", 1)
+	run, why := r.reserve(ctx, c.Family, c.ID, StepInvestigate)
+	if why != "" {
+		t.Fatal(why)
+	}
+	report := json.RawMessage(`{"mechanism":"cause marker-7f3a","alternatives":["ruled out marker-7f3a"],"fix":"fix marker-7f3a","summary":"summary marker-7f3a"}`)
+	r.finish(ctx, c, &run, Result{Started: true, Status: store.RunOK, CostKnown: true, Report: report}, nil)
+	got, err := r.Store.CaseByID(ctx, c.ID)
+	if err != nil || got.Status != store.CaseTesting || got.Mechanism != "cause [masked]" ||
+		got.NextTest != "fix [masked]" || len(got.Alternatives) != 1 || got.Alternatives[0] != "ruled out [masked]" {
+		t.Fatalf("unclean investigation fields: %+v %v", got, err)
+	}
+	log, err := r.Store.CaseLog(ctx, c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range log {
+		if strings.Contains(entry.Detail, "marker-7f3a") {
+			t.Fatalf("unclean investigation log: %+v", entry)
+		}
+	}
+}
+
+func TestMergedInvestigationWithholdsFieldsWhenCleaningFails(t *testing.T) {
+	old := Scrubber
+	t.Cleanup(func() { Scrubber = old })
+	Scrubber = []string{script(t, t.TempDir(), "cleaner", `text=$(cat)
+case "$text" in *marker-7f3a*) exit 1 ;; esac
+printf '%s' "$text"`)}
+	ctx := context.Background()
+	r := recordingRunner(t)
+	c := openCase(t, r.Store, "failures", "synthetic", 1)
+	run, why := r.reserve(ctx, c.Family, c.ID, StepInvestigate)
+	if why != "" {
+		t.Fatal(why)
+	}
+	r.finish(ctx, c, &run, Result{Started: true, Status: store.RunOK, CostKnown: true, USD: .25,
+		Report: json.RawMessage(`{"mechanism":"marker-7f3a","fix":"a fix","summary":"a summary"}`)}, nil)
+	got, err := r.Store.CaseByID(ctx, c.ID)
+	if err != nil || got.Status != store.CaseOpen || got.Mechanism != "" || got.NextTest != "" ||
+		run.Status != store.RunFailed || run.Failure != "scrub" || run.USD != .25 {
+		t.Fatalf("failed cleaner allowed investigation fields or lost accounting: %+v %+v %v", got, run, err)
+	}
+}
+
+func TestMergedStaleRecoveryRejectsAnUnauthenticatedReport(t *testing.T) {
+	ctx := context.Background()
+	r := recordingRunner(t)
+	c := openCase(t, r.Store, "failures", "synthetic", 1)
+	run, why := r.reserve(ctx, c.Family, c.ID, StepInvestigate)
+	if why != "" {
+		t.Fatal(why)
+	}
+	write(t, filepath.Join(HostDir(run.Dir), "transcript.jsonl"), investigatedResult+"\n")
+	r.Now = func() time.Time { return run.Started.Add(r.Budgets.RunTime + time.Hour) }
+	if err := r.endStale(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.Store.CaseByID(ctx, c.ID)
+	if err != nil || got.Status != store.CaseOpen || got.Mechanism != "" || got.NextTest != "" {
+		t.Fatalf("unobserved stdout report changed the case: %+v %v", got, err)
+	}
+}
+
+func TestMergedHostResultCleansDecodedModelText(t *testing.T) {
+	old := Scrubber
+	t.Cleanup(func() { Scrubber = old })
+	Scrubber = []string{script(t, t.TempDir(), "cleaner", "sed 's/marker-7f3a/[masked]/g'")}
+	dir := t.TempDir()
+	if err := hostDir(HostDir(dir)); err != nil {
+		t.Fatal(err)
+	}
+	res := Result{Started: true, Status: store.RunOK, Report: json.RawMessage(`{"summary":"marker-\u0037f3a","facts":[{"fact":"marker-\u0037f3a","reached":true}],"turns":9007199254740993}`)}
+	if err := keepHostResult(context.Background(), dir, "result.json", &res); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := readHostResult(dir)
+	if err != nil || strings.Contains(string(saved.Report), "marker-7f3a") ||
+		!strings.Contains(string(saved.Report), `"summary":"[masked]"`) ||
+		!strings.Contains(string(saved.Report), `"fact":"[masked]"`) ||
+		!strings.Contains(string(saved.Report), "9007199254740993") {
+		t.Fatalf("host result was not cleaned or lost numeric precision: %s %v", saved.Report, err)
+	}
+}
+
+// authenticatedFixture records the host result after an explicit synthetic model observation.
+func authenticatedFixture(t *testing.T, dir, stream, result string) {
+	t.Helper()
+	res, err := readStream(filepath.Join(HostDir(dir), stream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record struct {
+		Report json.RawMessage `json:"structured_output"`
+	}
+	if err := json.Unmarshal([]byte(result), &record); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := canonicalReport(record.Report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticateReport(&res, []json.RawMessage{observed}, false)
+	name := "result.json"
+	if stream == "transcript.fallback.jsonl" {
+		name = "result.fallback.json"
+	}
+	if err := keepHostResult(context.Background(), dir, name, &res); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // fakeAgent is a runner that ends with the result line given, as Claude Code's stream does, and keeps the
 // arguments it was given in a file beside it.
 func fakeAgent(t *testing.T, result string) []string {
@@ -38,6 +156,11 @@ func agentArgs(t *testing.T, runner []string) (string, string) {
 
 const okResult = `{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":0.75,"session_id":"s1",` +
 	`"structured_output":{"case":"x","step":"investigate","outcome":"investigated","summary":"looked at it"},` +
+	`"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}`
+
+// investigatedResult is an investigation's result: the native report.
+const investigatedResult = `{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":0.75,"session_id":"s1",` +
+	`"structured_output":{"mechanism":"the export reads the lockfile before it takes the lock","alternatives":["a slow disk"],"fix":"take the lock first","summary":"looked at it"},` +
 	`"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}`
 
 func runnerFor(t *testing.T, st *store.Store, agent []string) *Runner {
@@ -64,13 +187,14 @@ func openCase(t *testing.T, st *store.Store, family, sig string, n int) store.Ca
 }
 
 // A run takes each family's case one step: the one with the most evidence, in testing before investigating before
-// open. The agent runs headless and bare in its sandbox with the family's skill and the machine's rules in its
-// system prompt, its door's commands, nothing of the caller's environment, and its cost goes on the case and the
-// run.
+// open. An investigation runs headless and bare in its sandbox with the native brief, the owner's constraints and the
+// machine's rules in its system prompt and the case's evidence in its prompt, its door's commands (no case command
+// among them), nothing of the caller's environment; its cost goes on the case and the run, and its report into the
+// case.
 func TestTheLoopTakesEachFamilysCaseOneStep(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	agent := fakeAgent(t, okResult)
+	agent := fakeAgent(t, investigatedResult)
 	r := runnerFor(t, st, agent)
 	small := openCase(t, st, "failures", "a", 1)
 	big := openCase(t, st, "failures", "b", 3)
@@ -106,21 +230,37 @@ func TestTheLoopTakesEachFamilysCaseOneStep(t *testing.T) {
 		}
 	}
 	system, _ := os.ReadFile(filepath.Join(HostDir(done[0].Run.Dir), "primary", "system.md"))
-	for _, want := range []string{"# One run on one case", "# Failures", "never wake him", "Delete with literal paths."} {
+	for _, want := range []string{nativeBrief, "never wake him", "Delete with literal paths."} {
 		if !strings.Contains(string(system), want) {
 			t.Errorf("the system prompt lacks %q", want)
 		}
 	}
-	if strings.Contains(string(system), "# Owner burden") {
-		t.Error("the system prompt holds another family's skill")
+	for _, not := range []string{"# One run on one case", "# Failures", "# Owner burden"} {
+		if strings.Contains(string(system), not) {
+			t.Errorf("an investigation's system prompt holds %q", not)
+		}
+	}
+	if !strings.Contains(args, "The case's evidence, newest first (3 of 3)") || !strings.Contains(args, "file:/t/b-0") || !strings.Contains(args, "findings.md") {
+		t.Errorf("the prompt lacks the case's evidence or the findings file:\n%s", args)
+	}
+	if got, _ := st.CaseByID(ctx, big.ID); got.Status != store.CaseTesting || got.Mechanism != "the export reads the lockfile before it takes the lock" ||
+		got.NextTest != "take the lock first" || len(got.Alternatives) != 1 {
+		t.Errorf("the runner did not write the report into the case: %+v", got)
 	}
 	if got, _ := st.CaseByID(ctx, big.ID); got.Cost.USD != 0.75 || got.Cost.Runs != 1 || got.Cost.Tokens != 100 {
 		t.Fatalf("the case's cost %+v", got.Cost)
 	}
 	runs, _ := st.LoopRuns(ctx, store.RunFilter{})
-	if len(runs) != 1 || runs[0].Case != big.ID || !strings.HasPrefix(runs[0].Summary, "investigated: looked at it") || runs[0].Turns != 4 {
+	if len(runs) != 1 || runs[0].Case != big.ID || !strings.HasPrefix(runs[0].Summary, "looked at it") || runs[0].Turns != 4 {
 		t.Fatalf("runs %+v", runs)
 	}
+	if c, step, _, _ := r.pick(ctx, "failures", "", false); c.ID != big.ID || step != StepBuild {
+		t.Fatalf("a case in testing comes first, to its build: %s %s", c.ID, step)
+	}
+	if _, err := st.CloseCase(ctx, big.ID, store.NotWorthIt, "", "fixture", "test"); err != nil {
+		t.Fatal(err)
+	}
+	openCase(t, st, "failures", "e", 5)
 	if _, err := st.UpdateCase(ctx, small.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "test"); err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +273,7 @@ func TestTheLoopTakesEachFamilysCaseOneStep(t *testing.T) {
 // Each step's door runs what the step reads the machine with, and what it changes only through momentum's own
 // gates: a build the ship tool's building steps, a publish the lesson; a review only reads. Nothing else runs.
 func TestEachStepHasItsOwnDoor(t *testing.T) {
-	reads := [][]string{{"momentum", "evidence", "show", "ev:1"}, {"momentum", "evidence", "git", "/r", "log"}, {"momentum", "case", "show", "c1"},
+	reads := [][]string{{"momentum", "evidence", "show", "ev:1"}, {"momentum", "evidence", "git", "/r", "log"},
 		{"tacit", "search", "lock"}, {"momentum", "report", "--json"}}
 	for _, step := range []string{StepInvestigate, StepBuild, StepReview, StepPublish} {
 		for _, argv := range reads {
@@ -165,6 +305,21 @@ func TestEachStepHasItsOwnDoor(t *testing.T) {
 	}
 	if doorAllows(StepReview, []string{"momentum", "case", "set", "c1"}) || !doorAllows(StepBuild, []string{"momentum", "case", "set", "c1"}) {
 		t.Error("a review changes no case; a build changes its own")
+	}
+	// an investigation keeps no case: the runner writes its report into it, so it reads and changes none; every other
+	// step reads cases
+	for _, argv := range [][]string{{"momentum", "case", "show", "c1"}, {"momentum", "case", "list"}, {"momentum", "case", "set", "c1"},
+		{"momentum", "case", "evidence", "c1"}, {"momentum", "case", "signature", "c1", "root:x"}, {"momentum", "case", "close", "c1"}} {
+		if doorAllows(StepInvestigate, argv) {
+			t.Errorf("an investigation: %v allowed", argv)
+		}
+	}
+	for _, argv := range [][]string{{"momentum", "case", "show", "c1"}, {"momentum", "case", "list"}} {
+		for _, step := range []string{StepBuild, StepReview, StepPublish} {
+			if !doorAllows(step, argv) {
+				t.Errorf("%s: %v refused", step, argv)
+			}
+		}
 	}
 }
 
@@ -760,12 +915,16 @@ func TestALandedPackageFinishesItsDeployment(t *testing.T) {
 	}
 }
 
-// A run reports a root but cannot merge into its holder. After the run ends, the runner records the root on
+// A build reports a root but cannot merge into its holder. After the run ends, the runner records the root on
 // the run's own case, ignoring a different case id in the report, and the store merges by that root.
 func TestTheRunnerRecordsAReportsRootOnItsOwnCase(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	a := openCase(t, st, "failures", "a", 1)
+	mechanism, fix := "the lockfile is read before the lock", "take the lock first"
+	if _, err := st.UpdateCase(ctx, a.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
 	b := openCase(t, st, "failures", "b", 1)
 	unrelated := openCase(t, st, "failures", "unrelated", 1)
 	if _, _, err := st.AddCaseSignature(ctx, b.ID, "root:fixture", "test"); err != nil {
@@ -836,7 +995,7 @@ func TestAReportedRootCannotChangeAnAliasTarget(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	run, why := r.reserve(ctx, a.Family, a.ID, StepInvestigate)
+	run, why := r.reserve(ctx, a.Family, a.ID, StepBuild)
 	if why != "" {
 		t.Fatal(why)
 	}
@@ -845,7 +1004,7 @@ func TestAReportedRootCannotChangeAnAliasTarget(t *testing.T) {
 	}
 	var logs string
 	r.Log = func(format string, args ...any) { logs += fmt.Sprintf(format, args...) }
-	r.finish(ctx, a, &run, Result{Status: store.RunOK, CostKnown: true, USD: 0.75, Report: json.RawMessage(`{"root":"root:c"}`)}, nil)
+	r.finish(ctx, a, &run, Result{Started: true, Status: store.RunOK, CostKnown: true, USD: 0.75, Report: json.RawMessage(`{"root":"root:c"}`)}, nil)
 	got, err := st.CaseLive(ctx, b.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -905,7 +1064,7 @@ func TestARunningHoldIsIndependentOfBudgets(t *testing.T) {
 			if got, _, why, err := r.pick(ctx, c.Family, c.ID, false); err != nil || got.ID != "" || !strings.Contains(why, "in flight") {
 				t.Fatalf("running case admitted: %s %s %v", got.ID, why, err)
 			}
-			r.finish(ctx, c, &reservation, Result{Status: store.RunOK, CostKnown: true}, nil)
+			r.finish(ctx, c, &reservation, Result{Started: true, Status: store.RunOK, CostKnown: true}, nil)
 			if got, next, _, err := r.pick(ctx, c.Family, c.ID, false); err != nil || got.ID != c.ID || next != step {
 				t.Fatalf("ended run holds case: %s %s %v", got.ID, next, err)
 			}

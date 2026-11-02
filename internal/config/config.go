@@ -71,6 +71,7 @@ type Sources struct {
 type Loop struct {
 	Live          bool     `json:"live"`
 	Runner        []string `json:"runner"`
+	DoorClient    string   `json:"door_client"` // momentum-door; empty finds it beside momentum
 	Model         string   `json:"model"`
 	FallbackModel string   `json:"fallback_model"`
 	Families      []string `json:"families"`
@@ -156,5 +157,6 @@ func Load() (Sources, error) {
 		}
 	}
 	s.Loop.BedrockEnv = paths.Expand(s.Loop.BedrockEnv)
+	s.Loop.DoorClient = paths.Expand(s.Loop.DoorClient)
 	return s, nil
 }

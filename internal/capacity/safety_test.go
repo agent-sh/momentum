@@ -276,6 +276,10 @@ func TestATargetWithMoreSourcesThanAreReadIsReported(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "cache")
 	tgt := filepath.Join(root, "shared-target")
 	cargoTarget(t, tgt)
+	// This fixture's scratch directory must not depend on a parent checkout for git check-ignore.
+	gitEnv(t)
+	gitT(t, root, "init", "-q")
+	write(t, filepath.Join(root, ".gitignore"), "shared-target/\n")
 	for _, n := range []string{"a", "b", "c"} {
 		write(t, filepath.Join(tgt, "debug", "deps", n+".d"), "x: /src/"+n+"/src/lib.rs\n")
 	}

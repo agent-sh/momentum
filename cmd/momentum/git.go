@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -118,8 +120,9 @@ func evidenceGit(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		mounts = append(mounts, jail.Mount{Path: p, File: f})
 	}
 	const home = "/run/momentum/home"
-	cmd, err := (jail.Spec{Home: home, Dir: resolved(dir), Mounts: jail.Tidy(mounts), Env: append(gitEnv(), "HOME="+home)}).Command(cctx,
-		append(append([]string{"git"}, []string{"-C", dir}...), append(append(append([]string{}, gitSafe...), loop.GitSafety()...), argv...)...)...)
+	checkedDir := places[0]
+	cmd, err := (jail.Spec{Home: home, Dir: checkedDir, Mounts: jail.Tidy(mounts), Env: append(gitEnv(), "HOME="+home)}).Command(cctx,
+		append(append([]string{"git"}, []string{"-C", checkedDir}...), append(append(append([]string{}, gitSafe...), loop.GitSafety()...), argv...)...)...)
 	if err != nil {
 		return fmt.Errorf("evidence git requires its filesystem sandbox: %w", err)
 	}
@@ -137,6 +140,16 @@ func evidenceGit(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	}
 	if _, writeErr := io.WriteString(stdout, clean); writeErr != nil {
 		return writeErr
+	}
+	// git's own answer of no, as its exit status 1 says it: a grep that matched nothing, an ancestry that does not hold
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 && out.Len() == 0 {
+		switch {
+		case sub == "grep":
+			return answeredNo{"git grep: no match"}
+		case sub == "merge-base" && contains(rest, "--is-ancestor"):
+			return answeredNo{"git merge-base: the first commit is not an ancestor of the second"}
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("evidence git sandbox or Git failed (no unsandboxed fallback): %w", err)
@@ -173,6 +186,36 @@ func openGitDirectory(p string) (*os.File, error) {
 		return f, err
 	}
 	return nil, fmt.Errorf("%s is outside the run's repository read roots", p)
+}
+
+// counts says whether a command takes git's -N for its most commits.
+func counts(sub string) bool { return sub == "log" || sub == "rev-list" || sub == "shortlog" }
+
+func digits(s string) bool {
+	if s == "" || len(s) > 9 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// optionNames are the options a command runs with, as a refusal names them.
+func optionNames(sub string, spec gitSpec) string {
+	names := append([]string{}, spec.flags...)
+	for _, v := range spec.values {
+		names = append(names, v+" V")
+	}
+	if counts(sub) {
+		names = append(names, "-N")
+	}
+	if len(names) == 0 {
+		return "it takes no options"
+	}
+	return "it runs with " + strings.Join(names, ", ")
 }
 
 // gitReadable keeps a loop run's git to the repositories the loop reads (MOMENTUM_LOOP_READ, which the run's door
@@ -235,7 +278,19 @@ func gitArgs(ctx context.Context, dir, sub string, spec gitSpec, rest []string) 
 		out = append(out, "--no-ext-diff", "--no-textconv")
 	}
 	revs, pathArgs, blobs := 0, 0, 0
+	var grepRevs []string
 	afterDash := false
+	// grep: a pattern given, with -e anywhere before -- (then every word is a revision, as git reads it) or as its
+	// first word
+	patterned := false
+	if sub == "grep" {
+		for _, a := range rest {
+			if a == "--" {
+				break
+			}
+			patterned = patterned || a == "-e" || strings.HasPrefix(a, "-e") && len(a) > 2
+		}
+	}
 	for i := 0; i < len(rest); i++ {
 		a := rest[i]
 		switch {
@@ -277,9 +332,16 @@ func gitArgs(ctx context.Context, dir, sub string, spec gitSpec, rest []string) 
 					return nil, refuse("%s", err)
 				}
 				out = append(out, a)
+			case counts(sub) && digits(a[1:]): // git's -N, the most commits: as --max-count=N
+				out = append(out, "--max-count="+a[1:])
 			default:
-				return nil, refuse("%s is not an option it runs with", a)
+				return nil, refuse("%s is not an option it runs with (%s)", a, optionNames(sub, spec))
 			}
+			patterned = patterned || sub == "grep" && strings.HasPrefix(a, "-e")
+			continue
+		}
+		if sub == "grep" && !patterned { // as git reads it: with no -e, the first word is the pattern
+			out, patterned = append(out, "-e", a), true
 			continue
 		}
 		if !spec.revs {
@@ -287,7 +349,7 @@ func gitArgs(ctx context.Context, dir, sub string, spec gitSpec, rest []string) 
 		}
 		if err := isRevision(ctx, dir, a); err != nil {
 			if sub == "grep" {
-				return nil, refuse("%q is no revision of the repository (a pattern goes with -e, a path after --)", a)
+				return nil, refuse("%q is no revision of the repository (the pattern is the first word or goes with -e, a path goes after --)", a)
 			}
 			return nil, refuse("%q is no revision of the repository (a path goes after --)", a)
 		}
@@ -298,7 +360,26 @@ func gitArgs(ctx context.Context, dir, sub string, spec gitSpec, rest []string) 
 		if spec.most > 0 && revs > spec.most {
 			return nil, refuse("it takes at most %d revisions", spec.most)
 		}
+		if sub == "grep" { // git grep reads no option after its first revision: the revisions go after every option
+			grepRevs = append(grepRevs, a)
+			continue
+		}
 		out = append(out, a)
+	}
+	if len(grepRevs) > 0 {
+		at := slices.Index(out, "--")
+		if at < 0 {
+			at = len(out)
+		}
+		out = append(out[:at], append(grepRevs, out[at:]...)...)
+	}
+	// shortlog with no revision reads its standard input, which is nothing here: it counts from HEAD, as log does
+	if sub == "shortlog" && revs == 0 {
+		at := slices.Index(out, "--")
+		if at < 0 {
+			at = len(out)
+		}
+		out = append(out[:at], append([]string{"HEAD"}, out[at:]...)...)
 	}
 	if spec.need && pathArgs != 1 {
 		return nil, refuse("it takes one path, after --")

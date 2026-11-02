@@ -28,6 +28,11 @@ type broker struct {
 
 func fakeBroker(t *testing.T) *broker {
 	t.Helper()
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("loopback sockets unavailable: %v", err)
+	}
+	probe.Close()
 	b := &broker{}
 	nonce := "/n" + strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

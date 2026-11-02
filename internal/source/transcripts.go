@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -99,8 +100,9 @@ type job struct {
 	fp     string
 	packed bool
 	// a Hermes session
-	db      *evidence.HermesDB
-	session evidence.HermesSession
+	db       *evidence.HermesDB
+	session  evidence.HermesSession
+	snapshot string // immutable rows from one SQLite read transaction
 }
 
 // part is a piece of a job read and not yet stored: its items, the cursor after them, and the places of the
@@ -117,9 +119,10 @@ type part struct {
 // texts its summary is made of cut to what is kept plus spare, not yet redacted (one, or an agent text's
 // head and tail), and how the summary is made of them once they are.
 type pending struct {
-	e     evidence.Event
-	texts []string
-	keep  func(redacted []string) string
+	e      evidence.Event
+	texts  []string
+	keep   func(redacted []string) string
+	digest string // the same row version the reader parsed, kept through redaction
 }
 
 // tally is a run's counts, shared by the workers.
@@ -170,7 +173,7 @@ func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error
 	var jobs []*job
 	seen := map[string]bool{}
 	listed := true // every source was listed, so a cursor not seen is a file gone
-	var dbs []*evidence.HermesDB
+	var dbs []*hermesRead
 	defer func() {
 		for _, db := range dbs {
 			db.Close()
@@ -179,7 +182,7 @@ func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error
 	for _, home := range s.Homes {
 		for _, src := range evidence.Sources(home) {
 			if src.Format == evidence.Hermes {
-				js, db, err := hermesJobs(ctx, src, cursors, seen)
+				js, db, err := hermesJobs(ctx, src, cursors, seen, filepath.Dir(st.Path()))
 				if db != nil {
 					dbs = append(dbs, db)
 				}
@@ -360,24 +363,25 @@ func (j *job) from() (from evidence.State, restart bool) {
 }
 
 // hermesJobs are the sessions of a Hermes store with rows past their cursor.
-func hermesJobs(ctx context.Context, src evidence.Source, cursors map[string]store.FileCursor, seen map[string]bool) ([]*job, *evidence.HermesDB, error) {
+func hermesJobs(ctx context.Context, src evidence.Source, cursors map[string]store.FileCursor, seen map[string]bool, scratch string) ([]*job, *hermesRead, error) {
 	if src.DB == "" {
 		return nil, nil, nil
 	}
 	if _, err := os.Stat(src.DB); errors.Is(err, os.ErrNotExist) {
 		return nil, nil, nil
 	}
-	db, err := evidence.OpenHermes(src.DB)
+	read, err := snapshotHermes(ctx, src.DB, scratch)
 	if err != nil {
 		return nil, nil, err
 	}
+	db := read.db
 	ss, err := db.Sessions(ctx)
 	if err != nil {
-		return nil, db, err
+		return nil, read, err
 	}
 	last, err := db.LastIDs(ctx)
 	if err != nil {
-		return nil, db, err
+		return nil, read, err
 	}
 	var out []*job
 	for _, s := range ss {
@@ -390,14 +394,16 @@ func hermesJobs(ctx context.Context, src evidence.Source, cursors map[string]sto
 		if ok && c.Offset == last[s.ID] || !ok && last[s.ID] == 0 {
 			continue
 		}
-		out = append(out, &job{path: key, format: evidence.Hermes, cur: c, ok: ok, db: db, session: s})
+		out = append(out, &job{path: key, format: evidence.Hermes, cur: c, ok: ok, db: db, session: s, snapshot: read.snapshot})
 	}
-	return out, db, nil
+	return out, read, nil
 }
 
 // readJob reads what is new in one transcript or Hermes session, a part at a time, and hands each part to
 // add, which says whether to go on.
 func (s Transcripts) readJob(ctx context.Context, j *job, t *tally, add func(part) bool) {
+	var digests hermesDigests
+	defer digests.close()
 	from, restart := j.from()
 	retried := false
 	for {
@@ -417,6 +423,9 @@ func (s Transcripts) readJob(ctx context.Context, j *job, t *tally, add func(par
 				p.places = append(p.places, pl)
 			}
 			if it, ok := toPending(e); ok {
+				if j.format == evidence.Hermes {
+					it.digest = digests.of(ctx, j.snapshot, int64(e.Offset))
+				}
 				p.items = append(p.items, it)
 			}
 			return nil
@@ -581,7 +590,7 @@ func (w *writer) events(ctx context.Context, parts []part) ([][]store.Event, int
 	unknown := 0
 	for _, it := range items {
 		n := len(it.texts)
-		e, unk := toEvent(w.source, it.e, it.keep(red[:n]), w.ours(ctx, it.e, it.keep(it.texts)))
+		e, unk := toEvent(w.source, it.e, it.keep(red[:n]), w.ours(ctx, it.e, it.keep(it.texts)), it.digest)
 		red = red[n:]
 		if unk {
 			unknown++
@@ -841,10 +850,11 @@ func place(e evidence.Event) string {
 	return fmt.Sprintf("%s@%012d#", name, e.Offset)
 }
 
-// toEvent maps one item. The actor follows the kind: the owner's text is his; agent text and tool calls an
-// agent's; a tool's result the tool's; harness text and compactions the harness's. A call the owner made
-// himself (a !command he ran in pi) is his, and an item tacit credits to no one is unknown.
-func toEvent(source string, e evidence.Event, summary string, ours bool) (store.Event, bool) {
+// toEvent maps one item, with the digest of the Hermes row it came from, when it came from one (hermes_digest.go).
+// The actor follows the kind: the owner's text is his; agent text and tool calls an agent's; a tool's result the
+// tool's; harness text and compactions the harness's. A call the owner made himself (a !command he ran in pi) is
+// his, and an item tacit credits to no one is unknown.
+func toEvent(source string, e evidence.Event, summary string, ours bool, rowDigest string) (store.Event, bool) {
 	var actor store.Actor
 	switch e.Kind {
 	case evidence.KindOwnerText:
@@ -895,7 +905,7 @@ func toEvent(source string, e evidence.Event, summary string, ours bool) (store.
 		Tool:      e.ToolName,
 		Summary:   summary,
 		Meta: meta(map[string]any{"tool_id": e.ToolID, "is_error": e.IsError, "input_kind": string(e.InputKind),
-			"prior": e.Prior, "why": why, "parent": e.Parent}),
+			"prior": e.Prior, "why": why, "parent": e.Parent, HermesDigestKey: rowDigest}),
 		Ref: fmt.Sprintf("%s@%d#%d", e.Path, e.Offset, e.Index),
 	}, unknown
 }

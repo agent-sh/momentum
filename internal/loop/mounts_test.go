@@ -2,6 +2,7 @@ package loop
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -33,9 +34,12 @@ func TestABuildSeesTheCompleteCloneBeforeItStarts(t *testing.T) {
  git -C '`+p.Work+`' diff --cached --binary '`+p.BaseCommit+`' > "$MOMENTUM_LOOP_DIR/change.patch" || exit 1
  test -z "$(git -C '`+p.Work+`' remote)" || exit 1
  test ! -e '`+p.Host+`' || exit 1
+ momentum ship check --test "go test ./..." || exit 1
  `+modelResult(okResult))
 	r := runnerFor(t, st, []string{harness})
 	r.Ship = s
+	outside := t.TempDir()
+	r.Momentum = checkedBuildDoor(t, outside, filepath.Join(outside, "ran"), s, p)
 	done, err := r.Once(ctx, Options{Families: []string{"failures"}})
 	if err != nil || len(done) != 1 || done[0].Run.Status != store.RunOK {
 		t.Fatalf("%+v %v", done, err)
@@ -59,6 +63,9 @@ func TestABuildSeesTheCompleteCloneBeforeItStarts(t *testing.T) {
 	}
 	if args, _ := agentArgs(t, r.Agent.Runner); !strings.Contains(args, "BASE is "+p.BaseCommit) || !strings.Contains(args, "git diff --cached --binary "+p.BaseCommit) {
 		t.Fatalf("the prepared build prompt lost its patch base: %s", args)
+	}
+	if p, ok, err := s.Load(c.ID); err != nil || !ok || p.State != Checked {
+		t.Fatalf("the build did not check its patch: %+v %v", p, err)
 	}
 }
 
@@ -131,6 +138,25 @@ fi
 echo "answered $1"`)
 }
 
+// checkedBuildDoor simulates ship check after a build supplies its patch. These tests check the run's mounts and
+// door; the ship tests check patch application and tests. Only this host-side program changes the package.
+func checkedBuildDoor(t *testing.T, dir, log string, s *Ship, p Package) string {
+	t.Helper()
+	door := doorProgram(t, dir, log)
+	p.State = Checked
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked := filepath.Join(dir, "checked.json")
+	write(t, checked, string(raw))
+	return script(t, dir, "build-momentum", `if [ "$1 $2" = "ship check" ]; then
+  test -s "$MOMENTUM_LOOP_DIR/change.patch" || exit 1
+  cp '`+checked+`' '`+filepath.Join(s.pkgDir(p.Case), "package.json")+`' || exit 1
+fi
+exec '`+door+`' "$@"`)
+}
+
 // A build runs through its mounts and its door, in the real sandbox: its own directory, its clone and the loop's
 // build cache are writable, the toolchains read-only and offline. Its door uses a host-only command directory
 // and reads only the configured read repositories.
@@ -157,16 +183,20 @@ echo changed > '`+filepath.Join(toolchain, "new.txt")+`' 2> /dev/null; echo "too
 echo cached > "$GOCACHE/marker-7f3a"; echo "cache-write=$?" >> codes
 echo "offline=$GOPROXY" >> codes
 echo built > '`+filepath.Join(work, "built.txt")+`'; echo "tree-write=$?" >> codes
+git -C '`+work+`' add -A || exit 1
+git -C '`+work+`' diff --cached --binary '`+p.BaseCommit+`' > "$MOMENTUM_LOOP_DIR/change.patch" || exit 1
 momentum evidence git '`+work+`' log > git-out 2>&1; echo "tree-git=$?" >> codes
 momentum evidence git '`+toolchain+`' log > other-out 2>&1; echo "other-git=$?" >> codes
 (cd '`+work+`' && momentum case show here > /dev/null); (cd /usr && momentum case show there > /dev/null)
 momentum ship prepare --repo /somewhere > prepare-out 2>&1; echo "prepare=$?" >> codes
+momentum ship check --test "go test ./..." > check-out 2>&1 || exit 1
+echo "check=0" >> codes
 momentum loop lesson --text x > lesson-out 2>&1; echo "lesson=$?" >> codes
 `+modelResult(okResult))
 	r := runnerFor(t, st, []string{harness})
 	r.Ship = s
 	r.ReadDirs = []string{f.main}
-	r.Momentum = doorProgram(t, outside, log)
+	r.Momentum = checkedBuildDoor(t, outside, log, s, p)
 	r.Toolchains = Toolchains{ReadOnly: []string{toolchain}, Cache: cache}
 	done, err := r.Once(ctx, Options{Families: []string{"failures"}})
 	if err != nil || len(done) != 1 || done[0].Step != StepBuild || done[0].Run.Status != store.RunOK {
@@ -174,7 +204,7 @@ momentum loop lesson --text x > lesson-out 2>&1; echo "lesson=$?" >> codes
 	}
 	runDir := done[0].Run.Dir
 	codes, _ := os.ReadFile(filepath.Join(runDir, "codes"))
-	for _, want := range []string{"cache-write=0", "offline=off", "tree-write=0", "tree-git=2", "other-git=2", "prepare=0", "lesson=126"} {
+	for _, want := range []string{"cache-write=0", "offline=off", "tree-write=0", "tree-git=2", "other-git=2", "prepare=0", "check=0", "lesson=126"} {
 		if !strings.Contains(string(codes), want+"\n") {
 			t.Errorf("the run's record lacks %q:\n%s", want, codes)
 		}
@@ -191,9 +221,15 @@ momentum loop lesson --text x > lesson-out 2>&1; echo "lesson=$?" >> codes
 			t.Errorf("%s: %q %v, want %q", path, b, err, want)
 		}
 	}
+	if b, err := os.ReadFile(filepath.Join(runDir, "change.patch")); err != nil || !strings.Contains(string(b), "+built") {
+		t.Fatalf("the build did not supply its patch: %q %v", b, err)
+	}
+	if p, ok, err := s.Load(c.ID); err != nil || !ok || p.State != Checked {
+		t.Fatalf("the build did not check its patch: %+v %v", p, err)
+	}
 	ran, _ := os.ReadFile(log)
 	for _, want := range []string{"evidence git " + work + " log pwd=" + HostDir(runDir) + " read=" + f.main, "case show here pwd=" + HostDir(runDir), "case show there pwd=" + HostDir(runDir),
-		"ship prepare --repo /somewhere pwd=" + HostDir(runDir)} {
+		"ship prepare --repo /somewhere pwd=" + HostDir(runDir), "ship check --test go test ./... pwd=" + HostDir(runDir)} {
 		if !strings.Contains(string(ran), want) {
 			t.Errorf("the door ran:\n%s\nwant %q", ran, want)
 		}

@@ -67,6 +67,7 @@ func TestABuildGitCannotAnswerForIsAProblem(t *testing.T) {
 func TestTargetsGoWhenIdleIgnoredAndOfAKnownProject(t *testing.T) {
 	gitEnv(t)
 	base := t.TempDir()
+	requireLooseScratch(t, base)
 	projects, cache := filepath.Join(base, "projects"), filepath.Join(base, "cache")
 	now := time.Now().Add(72 * time.Hour)
 	// a repository that ignores its target
@@ -168,6 +169,7 @@ func TestATargetsRootThatIsASymlinkOrUnderOneIsWalkedWhereItLeads(t *testing.T) 
 func TestANameThatOnlyAnAliasCarriesStillExcludes(t *testing.T) {
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	must(t, err)
+	requireLooseScratch(t, base)
 	now := time.Now().Add(72 * time.Hour)
 	// a targets root that is a link the excluded name reaches, to a place it does not
 	real := filepath.Join(base, "disk", "code")
@@ -203,6 +205,7 @@ func TestBuildsReachedThroughAnAliasRootAreTheAliasProjects(t *testing.T) {
 	gitEnv(t)
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	must(t, err)
+	requireLooseScratch(t, base)
 	code := filepath.Join(base, "disk", "code")
 	must(t, os.MkdirAll(code, 0o755))
 	must(t, os.Symlink(code, filepath.Join(base, "secret-code"))) // a targets root the excluded name reaches as a link

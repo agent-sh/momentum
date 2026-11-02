@@ -22,18 +22,11 @@ var testCache string
 
 func TestMain(m *testing.M) {
 	// in a run's sandbox the test binary is momentum's: its init, and the door's client
-	if len(os.Args) > 1 && os.Args[1] == jail.InitCommand {
-		os.Exit(jail.Init(os.Args[2:]))
-	}
 	if len(os.Args) == 3 && os.Args[1] == "fixture-model-result" {
 		os.Exit(sendFixtureResult(os.Args[2]))
 	}
-	if door := os.Getenv("MOMENTUM_DOOR"); door != "" {
-		name := "momentum"
-		if filepath.Base(os.Args[0]) == "tacit" {
-			name = "tacit"
-		}
-		os.Exit(jail.Call(door, name, os.Args[1:], os.Stdout, os.Stderr))
+	if code, inside := jail.Inside(os.Args, os.Stdout, os.Stderr); inside {
+		os.Exit(code)
 	}
 	dir, err := os.MkdirTemp("", "loop-test-cache-")
 	if err != nil {
@@ -158,7 +151,7 @@ func testSandbox(t *testing.T) Sandbox {
 	if err != nil {
 		t.Skip("no bubblewrap here")
 	}
-	if out, err := exec.Command(bwrap, "--unshare-all", "--ro-bind", "/", "/", "true").CombinedOutput(); err != nil {
+	if out, err := exec.Command(bwrap, "--unshare-all", "--ro-bind", "/", "/", "/bin/true").CombinedOutput(); err != nil {
 		t.Skipf("bubblewrap cannot make a sandbox here: %v: %s", err, out)
 	}
 	out, err := exec.Command("go", "env", "GOROOT", "GOMODCACHE").Output()
@@ -485,7 +478,8 @@ func testingCase2(t *testing.T, st *store.Store) store.Case {
 func TestAChangeToTheLoopsOwnCodeIsRefusedHoweverItIsMade(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	f := newRepo(t, map[string]string{"internal/loop/gate.go": "package loop\n", "internal/jail/jail.go": "package jail\n", "internal/supervise/rules.go": "package supervise\n", "docs/x.txt": "notes\n"})
+	f := newRepo(t, map[string]string{"internal/loop/gate.go": "package loop\n", "internal/jail/jail.go": "package jail\n",
+		"cmd/momentum-door/main.go": "package main\n", "internal/supervise/rules.go": "package supervise\n", "docs/x.txt": "notes\n"})
 	s := shipFor(t, st, f)
 	s.Gate.Resolve = func(context.Context, string) (string, error) { return SelfRepo, nil }
 	c := testingCase(t, st)
@@ -522,6 +516,23 @@ func TestAChangeToTheLoopsOwnCodeIsRefusedHoweverItIsMade(t *testing.T) {
 		t.Fatalf("the sandbox path added: %v", err)
 	}
 	os.Remove(filepath.Join(p.Work, "internal/jail/new.go"))
+	write(t, filepath.Join(p.Work, "cmd/momentum-door/main.go"), "package main\n// edited\n")
+	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "cmd/momentum-door/") {
+		t.Fatalf("the door client edited: %v", err)
+	}
+	write(t, filepath.Join(p.Work, "cmd/momentum-door/main.go"), "package main\n")
+	for _, move := range [][2]string{{"cmd/momentum-door/main.go", "door.txt"}, {"docs/x.txt", "cmd/momentum-door/x.go"}} {
+		run(t, p.Work, "git", "mv", move[0], move[1])
+		if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "cmd/momentum-door/") {
+			t.Fatalf("the door client path moved %v: %v", move, err)
+		}
+		run(t, p.Work, "git", "mv", move[1], move[0])
+	}
+	write(t, filepath.Join(p.Work, "cmd/momentum-door/new.go"), "package main\n")
+	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "cmd/momentum-door/") {
+		t.Fatalf("the door client path added: %v", err)
+	}
+	os.Remove(filepath.Join(p.Work, "cmd/momentum-door/new.go"))
 	write(t, filepath.Join(p.Work, "internal", "loop", "é.go"), "package loop\n")
 	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/loop/é.go") {
 		t.Fatalf("a new protected file with a quoted name: %v", err)
@@ -535,6 +546,39 @@ func TestAChangeToTheLoopsOwnCodeIsRefusedHoweverItIsMade(t *testing.T) {
 
 // The gate is the loop's authority: a repository of an owner it may write to, not excluded, that the machine's
 // scope check allows and nobody works in; never what momentum's judgment rests on in its own repository.
+func TestDoorClientIsProtectedFromEditsAdditionsAndMoves(t *testing.T) {
+	for _, how := range []string{"edit", "addition", "move out", "move in"} {
+		t.Run(how, func(t *testing.T) {
+			ctx := context.Background()
+			st := testStore(t)
+			f := newRepo(t, map[string]string{"cmd/momentum-door/main.go": "package main\n", "docs/x.txt": "notes\n"})
+			s := recoveryShip(t, st, f)
+			s.Gate.Resolve = func(context.Context, string) (string, error) { return SelfRepo, nil }
+			c := testingCase(t, st)
+			p, err := s.Prepare(ctx, c.ID, f.main)
+			if err != nil {
+				t.Fatal(err)
+			}
+			write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
+			write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
+			switch how {
+			case "edit":
+				write(t, filepath.Join(p.Work, "cmd/momentum-door/main.go"), "package main\n// edited\n")
+			case "addition":
+				write(t, filepath.Join(p.Work, "cmd/momentum-door/new.go"), "package main\n")
+			case "move out":
+				run(t, p.Work, "git", "mv", "cmd/momentum-door/main.go", "door.txt")
+			case "move in":
+				run(t, p.Work, "git", "mv", "docs/x.txt", "cmd/momentum-door/x.go")
+			}
+			test := `python3 -c 'from pathlib import Path; assert "return 42" in Path("fake.go").read_text()'`
+			if _, err := checkPatch(t, s, ctx, c.ID, test, nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "cmd/momentum-door/") {
+				t.Fatalf("door client %s escaped protection: %v", how, err)
+			}
+		})
+	}
+}
+
 func TestTheGateKeepsTheLoopsAuthority(t *testing.T) {
 	ctx := context.Background()
 	f := newRepo(t, nil)
@@ -567,7 +611,8 @@ func TestTheGateKeepsTheLoopsAuthority(t *testing.T) {
 	}
 	for _, p := range []string{"internal/detect/failures.go", "internal/loop/gate.go", "internal/jail/jail.go", "internal/jail/new.go", "internal/measure/x.go", "internal/store/events.go",
 		"internal/source/transcripts.go", "internal/plain/plain.go", "internal/config/config.go", "internal/paths/paths.go",
-		"cmd/momentum/git.go", "cmd/momentum/replay.go", "go.mod", "go.sum", ".github/workflows/ci.yml", "SPEC.md", "AGENTS.md"} {
+		"cmd/momentum/git.go", "cmd/momentum/replay.go", "cmd/momentum-door/main.go", "cmd/momentum-door/new.go",
+		"go.mod", "go.sum", ".github/workflows/ci.yml", "SPEC.md", "AGENTS.md"} {
 		if err := CheckPaths(Target{Repo: SelfRepo}, []string{"README.md", p}); !errors.Is(err, ErrRefused) {
 			t.Errorf("momentum's own %s: %v", p, err)
 		}

@@ -317,8 +317,8 @@ func TestShipSandboxBuildsAnExportedGoCommand(t *testing.T) {
 
 func TestTheDoorOffersOnlyExistingEvidenceCommands(t *testing.T) {
 	for _, step := range []string{StepBuild, StepInvestigate, StepPublish, StepReview} {
-		if doorAllows(step, []string{"momentum", "evidence", "search", "fixture"}) {
-			t.Fatalf("%s offers an absent command", step)
+		if !doorAllows(step, []string{"momentum", "evidence", "search", "fixture"}) {
+			t.Fatalf("%s lost the evaluation's evidence search command", step)
 		}
 		if !doorAllows(step, []string{"momentum", "evidence", "show", "fixture"}) {
 			t.Fatalf("%s lost evidence show", step)

@@ -105,8 +105,8 @@ func TestEvidenceIsCheckedAndAnEventFillsItsOwn(t *testing.T) {
 
 func ptr(s string) *string { return &s }
 
-// An investigation moves a case among open, investigating and testing, and to testing only with a mechanism and a
-// next discriminating test on record. Deploying is the ship tool's, measuring and improved the measure tool's.
+// The loop moves a case among open, investigating and testing, and to testing only with a mechanism and a fix (its
+// next test) on record. Deploying is the ship tool's, measuring and improved the measure tool's.
 func TestAnInvestigationMovesACaseOnlyWhereItMay(t *testing.T) {
 	st := caseStore(t)
 	ctx := context.Background()
@@ -251,7 +251,7 @@ func TestASolvedCaseComesBackWhenItRecurs(t *testing.T) {
 	}
 }
 
-// Cases dedupe by root cause: the investigation names it as a signature, and a case that names one another case
+// Cases dedupe by root cause: a build names it as a signature, and a case that names one another case
 // holds goes into that case, its evidence, signatures and cost with it. What its own symptom brings later lands in
 // the case it went into, and a merge that brings a closed case's problem back reopens it.
 func TestARootCauseMergesTheCasesThatShareIt(t *testing.T) {

@@ -82,7 +82,7 @@ type Mount struct {
 // Spec is one sandbox.
 type Spec struct {
 	Bwrap  string   // the bubblewrap binary; "bwrap" on the path when empty
-	Self   string   // momentum's binary: the sandbox's init, and the momentum and tacit commands inside (BinDir)
+	Self   string   // momentum-door: the sandbox's init and command client (BinDir)
 	Home   string   // the home inside: an empty directory at this path, which nothing outside sees
 	Mounts []Mount  // what exists inside besides the system's directories, at the same paths (see Mount)
 	Env    []string // the program's environment: these variables, DoorEnv when there is a door, and PWD, which bubblewrap sets
@@ -97,6 +97,9 @@ type Spec struct {
 	// Inputs is a host-owned directory descriptor mounted read-only at InputDir.
 	// It contains only the files this invocation needs, never its archived output.
 	Inputs *os.File
+	// Status receives the reader of bubblewrap's JSON status pipe. The caller closes it and closes the command's
+	// ExtraFiles with Close after Start, so EOF follows bubblewrap's exit.
+	Status func(*os.File)
 }
 
 const InputDir = "/run/momentum/input"
@@ -217,9 +220,23 @@ func (s Spec) Command(ctx context.Context, argv ...string) (*exec.Cmd, error) {
 		args = append(args, BinDir+"/momentum", InitCommand, "--port", strconv.Itoa(s.RoutePort), "--")
 	}
 	args = append(args, argv...)
+	var status *os.File
+	if s.Status != nil {
+		r, w, err := os.Pipe()
+		if err != nil {
+			closeAll(files)
+			return nil, err
+		}
+		status = r
+		files = append(files, w)
+		args = append([]string{"--json-status-fd", strconv.Itoa(2 + len(files))}, args...)
+	}
 	cmd := exec.CommandContext(ctx, bwrap, args...)
 	cmd.Env = env
 	cmd.ExtraFiles = files
+	if status != nil {
+		s.Status(status)
+	}
 	return cmd, nil
 }
 

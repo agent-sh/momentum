@@ -195,7 +195,7 @@ func defaultBranch(ctx context.Context, dir string) (string, error) {
 // of its own: nothing a change compiles in can empty it.
 func Protected() []string {
 	return []string{"internal/detect/", "internal/loop/", "internal/jail/", "internal/measure/", "internal/store/", "internal/source/", "internal/plain/",
-		"internal/config/", "internal/paths/", "cmd/momentum/", "go.mod", "go.sum", ".github/", "SPEC.md", "AGENTS.md"}
+		"internal/config/", "internal/paths/", "cmd/momentum/", "cmd/momentum-door/", "go.mod", "go.sum", ".github/", "SPEC.md", "AGENTS.md"}
 }
 
 // SelfRepo is momentum's own repository, where Protected applies.
