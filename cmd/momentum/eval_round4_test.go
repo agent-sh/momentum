@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -162,5 +163,29 @@ func TestEvidenceEventsStopsAtTheTrialClock(t *testing.T) {
 	code, out, diag := momentum("evidence", "events", "--since", end.Add(-2*time.Hour).Format(time.RFC3339), "--until", end.Add(2*time.Hour).Format(time.RFC3339))
 	if code != 0 || !strings.Contains(out, "before the end") || strings.Contains(out, "after the end") {
 		t.Fatalf("exit %d %q %s", code, out, diag)
+	}
+}
+
+// In an evaluation evidence unit reads the unit's log up to the end of store, never its state now, and evidence
+// file is refused: a file read now holds what came after the end.
+func TestAnEvaluationReadsAUnitsLogUpToItsEndAndNoFile(t *testing.T) {
+	end := time.Now().Add(-40 * 24 * time.Hour).Truncate(time.Second)
+	evalEnvAt(t, end)
+	bin := t.TempDir()
+	calls := filepath.Join(bin, "calls")
+	for _, name := range []string{"journalctl", "systemctl"} {
+		os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\nprintf '%s %s\\n' "+name+" \"$*\" >> "+calls+"\necho a line of the unit\n"), 0o755)
+	}
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	code, out, diag := momentum("evidence", "unit", "backup.service", "--lines", "50")
+	raw, _ := os.ReadFile(calls)
+	if code != 0 || !strings.Contains(out, "a line of the unit") || strings.Contains(string(raw), "systemctl") ||
+		!strings.Contains(string(raw), "--until @"+strconv.FormatInt(end.Unix(), 10)) {
+		t.Fatalf("exit %d %q %s; calls %q", code, out, diag, raw)
+	}
+	f := filepath.Join(t.TempDir(), "notes.txt")
+	os.WriteFile(f, []byte("written after the end"), 0o600)
+	if code, out, diag := momentum("evidence", "file", f); code != 2 || strings.Contains(out, "after the end") || !strings.Contains(diag, "not available") {
+		t.Fatalf("evidence file in an evaluation: exit %d %q %s", code, out, diag)
 	}
 }

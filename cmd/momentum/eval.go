@@ -94,7 +94,8 @@ func loopEval(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		}
 	}
 	e := &loop.Eval{Runner: r, Source: paths.DB(), Dir: filepath.Join(loopDir(), "eval", id), Trials: *trials, Budget: *budget, Parallel: *parallel, ID: id,
-		Judge: loop.Agent{Runner: r.Agent.Runner, Model: r.Agent.Model}, Arms: selected, Repositories: repositories, GoldenHash: fmt.Sprintf("%x", sha256.Sum256(raw))}
+		Judge: loop.Agent{Runner: r.Agent.Runner, Model: r.Agent.Model}, Arms: selected, Repositories: repositories, GoldenHash: fmt.Sprintf("%x", sha256.Sum256(raw)),
+		Tacit: tacitStore()}
 	fmt.Fprintf(stderr, "evaluation %s: %d tasks, %d trials per arm, in %s\n", id, len(picked), *trials, e.Dir)
 	trs, err := e.Run(ctx, picked)
 	if err != nil {
@@ -140,4 +141,17 @@ func printEvaluation(out io.Writer, r loop.EvaluationResults) {
 		}
 	}
 	fmt.Fprintf(out, "loop minus native, task bootstrap 90%% interval (%d compared tasks; %d resamples, seed %d): reached per dollar %s; reached per minute %s\n", compared, r.Comparison.Resamples, r.Comparison.Seed, interval(r.Comparison.ReachedPerDollar), interval(r.Comparison.ReachedPerMinute))
+}
+
+// tacitStore is tacit's store on this machine, a git repository a trial reads as of its end: $TACIT_STORE, else
+// tacit's default; none when it is no repository.
+func tacitStore() string {
+	dir := os.Getenv("TACIT_STORE")
+	if dir == "" {
+		dir = filepath.Join(paths.Home(), ".local", "share", "tacit", "store")
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+		return ""
+	}
+	return dir
 }

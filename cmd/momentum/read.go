@@ -352,6 +352,9 @@ func secretPath(p string) string {
 // evidenceFile prints a file of the machine, scrubbed: all of it up to 256 KiB, or its last lines. A file where
 // credentials are kept, or named as one that holds them, is refused.
 func evidenceFile(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if os.Getenv("MOMENTUM_EVAL") != "" {
+		return usageError{"in an evaluation, evidence file is not available: a file read now holds what came after the end of store"}
+	}
 	fs := flag.NewFlagSet("evidence file", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	tail := fs.Int("tail", 0, "its last N lines only")
@@ -420,10 +423,20 @@ func evidenceUnit(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	defer cancel()
 	var output bytes.Buffer
 	capture := &capped{w: &output, n: readMax + 1}
-	for _, args := range [][]string{
+	calls := [][]string{
 		{"systemctl", "--user", "status", "--no-pager", "--lines=0", "--", unit},
 		{"journalctl", "--user", "--no-pager", "-o", "short-iso", "-n", strconv.Itoa(n), "-u", unit},
-	} {
+	}
+	if os.Getenv("MOMENTUM_NOW") != "" {
+		// an evaluation reads the unit as it stood at the end: its log up to then, which a later line cannot change,
+		// and not its state now
+		end, err := commandNow()
+		if err != nil {
+			return err
+		}
+		calls = [][]string{{"journalctl", "--user", "--no-pager", "-o", "short-iso", "-n", strconv.Itoa(n), "--until", "@" + strconv.FormatInt(end.Unix(), 10), "-u", unit}}
+	}
+	for _, args := range calls {
 		cmd := exec.CommandContext(cctx, args[0], args[1:]...)
 		cmd.Stdout, cmd.Stderr = capture, capture
 		_ = cmd.Run()
