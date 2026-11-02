@@ -693,11 +693,48 @@ func (s *Store) UpdateCase(ctx context.Context, id string, u CaseUpdate, actor s
 		return Case{}, err
 	}
 	defer tx.Rollback()
-	now := time.Now()
 	c, err := live(ctx, tx, id)
 	if err != nil {
 		return Case{}, err
 	}
+	if c, err = updateCase(ctx, tx, c, u, actor, time.Now()); err != nil {
+		return Case{}, err
+	}
+	return c, tx.Commit()
+}
+
+// RecordFindings writes an investigation's findings into the case it investigated, the runner's bookkeeping for
+// the run: the update and the evidence it cites, in one transaction, only while that case has not gone into
+// another and is still open or investigating (a case moved on since the run started keeps what it has). The bool
+// says whether they were recorded.
+func (s *Store) RecordFindings(ctx context.Context, id string, u CaseUpdate, evs []Evidence, actor string) (Case, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Case{}, false, err
+	}
+	defer tx.Rollback()
+	c, err := getCase(ctx, tx, id)
+	if err != nil {
+		return Case{}, false, err
+	}
+	if c.Into != "" || c.Status != CaseOpen && c.Status != CaseInvestigating {
+		return c, false, nil
+	}
+	now := time.Now()
+	if c, err = updateCase(ctx, tx, c, u, actor, now); err != nil {
+		return Case{}, false, err
+	}
+	if len(evs) > 0 {
+		if c, _, err = takeEvidence(ctx, tx, c, evs, "", actor, now); err != nil {
+			return Case{}, false, err
+		}
+	}
+	return c, true, tx.Commit()
+}
+
+// updateCase is UpdateCase's change of a case already read in the transaction.
+func updateCase(ctx context.Context, tx *sql.Tx, c Case, u CaseUpdate, actor string, now time.Time) (Case, error) {
+	var err error
 	var sets []string
 	var args []any
 	var changed []string
@@ -754,7 +791,7 @@ func (s *Store) UpdateCase(ctx context.Context, id string, u CaseUpdate, actor s
 		changed = append(changed, fmt.Sprintf("%d alternatives", len(alts)))
 	}
 	if len(sets) == 0 {
-		return c, tx.Commit()
+		return c, nil
 	}
 	if c.Status == CaseClosed {
 		return Case{}, badCase("case %s is closed (%s): reopen it with new evidence before changing it", c.ID, c.Reason)
@@ -785,7 +822,7 @@ func (s *Store) UpdateCase(ctx context.Context, id string, u CaseUpdate, actor s
 	if c, err = getCase(ctx, tx, c.ID); err != nil {
 		return Case{}, err
 	}
-	return c, tx.Commit()
+	return c, nil
 }
 
 // AddCaseEvidence gives a case more evidence, or the case it went into a duplicate's. A closed case keeps it, and

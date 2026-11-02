@@ -138,12 +138,8 @@ func (e *Eval) Results(trials []Trial) EvaluationResults {
 	r.Provenance.Skills = map[string]string{}
 	for _, tr := range trials {
 		r.Procedures[tr.Family] = tr.Provenance
-		for arm, hash := range tr.Provenance.Systems {
-			key := arm
-			if arm == "loop" {
-				key += "/" + tr.Family
-			}
-			r.Provenance.Systems[key] = hash
+		for arm, hash := range tr.Provenance.Systems { // an investigation's system prompt is the same for every family
+			r.Provenance.Systems[arm] = hash
 		}
 		for name, hash := range tr.Provenance.Skills {
 			r.Provenance.Skills[name] = hash
