@@ -29,20 +29,25 @@ var version = "0.0.0-dev"
 
 const usage = `usage:
   momentum evidence ingest              read what is new in every configured source into the store
-  momentum evidence events [--since WHEN] [--until WHEN] [--kind K,K] [--source S] [--harness H] [--session ID]
-                           [--limit N] [--json]
-                                        events, newest first; one session's (an id or its start) oldest first;
-                                        H is claude, codex, pi, opencode or hermes
+  momentum evidence events [--since WHEN] [--until WHEN] [--kind K,K] [--source S] [--harness H] [--actor A]
+                           [--session ID] [--limit N] [--json]
+                                        events, newest first, each with its ev:ID; one session's (an id or its
+                                        start) oldest first; H is claude, codex, pi, opencode or hermes
   momentum evidence status [--since WHEN]   events per source and kind, and unparsed records
-  momentum evidence show ID             an event, and the record of the transcript or log it names (scrubbed)
+  momentum evidence show ID... [--bytes N]
+                                        up to ten events, each with the record of the transcript or log it names,
+                                        or its Hermes message row (scrubbed whole, then its first N bytes)
   momentum evidence search TEXT [--source SOURCE] [--since WHEN] [--until WHEN] [--kind K,K] [--actor A] [--session ID] [--limit N]
-                                        stored summaries of every source matching TEXT, newest first, also with --session (scrubbed); flags anywhere
+                                        stored summaries of every source matching TEXT (2 characters or more; one
+                                        that starts with a dash after --), newest first, also with --session
+                                        (scrubbed); flags anywhere
                                         agent text: first 160 and last 80 bytes; calls and results: first 240
                                         (error results keep 1,000); evidence show reads the whole record
   momentum evidence git DIR GITCOMMAND [ARG]... [-- PATH...]
                                         a git command that reads (log, show, diff, blame, grep, ...) in DIR's
-                                        work tree, with only the options that read; revisions are checked,
-                                        paths come after --
+                                        work tree, with only the options that read (and git's -N for a count;
+                                        grep's first word is its pattern); revisions are checked, paths come
+                                        after --; a grep with no match exits 1
   momentum evidence file PATH [--tail N]   a file of the machine, scrubbed of secrets; not where credentials are
   momentum evidence unit NAME [--lines N]  a user service's state and the end of its log, scrubbed
   momentum evidence rebuild SOURCE [--force]
@@ -137,6 +142,11 @@ type usageError struct{ msg string }
 
 func (u usageError) Error() string { return u.msg }
 
+// answeredNo is a read that worked and found nothing, as grep says it: the command exits 1 and says what it found.
+type answeredNo struct{ msg string }
+
+func (a answeredNo) Error() string { return a.msg }
+
 func main() {
 	os.Exit(run(context.Background(), os.Args[1:], os.Stdout, os.Stderr))
 }
@@ -199,9 +209,13 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		err = usageError{fmt.Sprintf("unknown command %q", args[0])}
 	}
 	var ue usageError
+	var no answeredNo
 	switch {
 	case err == nil:
 		return 0
+	case errors.As(err, &no):
+		fmt.Fprintln(stderr, "momentum:", err)
+		return 1
 	case errors.As(err, &ue), errors.Is(err, config.ErrNoSources):
 		fmt.Fprintln(stderr, "momentum:", err)
 		return 2
@@ -300,10 +314,17 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	src := fs.String("source", "", "one source")
 	harness := fs.String("harness", "", "one harness's events, from every source: "+strings.Join(store.Harnesses, ", "))
 	session := fs.String("session", "", "one session, by its id or its start; oldest first")
+	actor := fs.String("actor", "", "only one actor: owner, agent, tool, harness, detector, unknown")
 	limit := fs.Int("limit", 50, "most events to print (0: 200)")
 	asJSON := fs.Bool("json", false, "one JSON object per line")
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
+	}
+	if fs.NArg() > 0 {
+		return usageError{fmt.Sprintf("evidence events takes only flags, not %q: a phrase to match goes to evidence search", fs.Arg(0))}
+	}
+	if err := knownActor(*actor); err != nil {
+		return err
 	}
 	if *limit <= 0 {
 		*limit = 200
@@ -325,7 +346,7 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	if err != nil {
 		return err
 	}
-	q := store.Query{Until: now, Since: from, Source: *src, Harness: *harness, Session: *session, Limit: *limit + 1}
+	q := store.Query{Until: now, Since: from, Source: *src, Harness: *harness, Session: *session, Actor: store.Actor(*actor), Limit: *limit + 1}
 	if *until != "" {
 		if q.Until, err = parseWhen(*until); err != nil {
 			return usageError{err.Error()}
@@ -341,6 +362,9 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	defer st.Close()
 	if *kinds != "" {
 		q.Kinds = strings.Split(*kinds, ",")
+	}
+	if err := knownKinds(ctx, st, q.Kinds); err != nil {
+		return err
 	}
 	evs, err := st.Events(ctx, q)
 	if err != nil {
@@ -372,11 +396,36 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		if e.Agent != "" {
 			tag += " [subagent " + e.Agent + "]"
 		}
-		// Plain text: a summary holds what agents and tools wrote, which must not act on the terminal.
-		fmt.Fprintf(stdout, "%s  %-15s %-8s %-16s %s%s\n", e.TS.Local().Format("01-02 15:04:05"), e.Source, e.Actor, plain.Line(what),
+		// Plain text: a summary holds what agents and tools wrote, which must not act on the terminal. The id is what
+		// evidence show takes.
+		fmt.Fprintf(stdout, "%s ev:%s  %-15s %-8s %-16s %s%s\n", e.TS.Local().Format("01-02 15:04:05"), e.ID(), e.Source, e.Actor, plain.Line(what),
 			plain.Line(e.Summary), plain.Line(tag))
 	}
 	return nil
+}
+
+// knownActor refuses an actor the store never records.
+func knownActor(actor string) error {
+	switch store.Actor(actor) {
+	case "", store.ActorOwner, store.ActorAgent, store.ActorTool, store.ActorHarness, store.ActorDetector, store.ActorUnknown:
+		return nil
+	}
+	return usageError{fmt.Sprintf("unknown actor %q: one of owner, agent, tool, harness, detector, unknown", actor)}
+}
+
+// knownKinds refuses a kind no event of the store has, naming the kinds it holds.
+func knownKinds(ctx context.Context, st *store.Store, kinds []string) error {
+	var named []string
+	for _, k := range kinds {
+		if k = strings.TrimSpace(k); k != "" {
+			named = append(named, k)
+		}
+	}
+	unknown, held, err := st.UnknownKinds(ctx, named)
+	if err != nil || len(unknown) == 0 {
+		return err
+	}
+	return usageError{fmt.Sprintf("unknown kind %s; the store's kinds are %s", strings.Join(unknown, ", "), strings.Join(held, ", "))}
 }
 
 func status(ctx context.Context, args []string, stdout, stderr io.Writer) error {
