@@ -31,14 +31,20 @@ func TestATrialReadsTacitAsOfItsEnd(t *testing.T) {
 	seen := filepath.Join(dir, "seen")
 	// the harness runs the user's shell startup before each command, which here points tacit at the live store; the
 	// trial's env file, sourced after it, points it back
+	functions := filepath.Join(dir, "functions")
 	e.Runner.Agent.Runner = []string{script(t, dir, "tacit-reader", `TACIT_STORE=`+src+`; export TACIT_STORE
+tacit() { echo the live store; }
 if [ -n "$CLAUDE_ENV_FILE" ]; then . "$CLAUDE_ENV_FILE"; fi
+command -v tacit >> `+functions+`
 printf '%s %s %s %s %s %s %s %s %s %s\n' "$TACIT_STORE" "$TACIT_LOCAL_LAYER" "$TACIT_SETTINGS" "$(ls "$TACIT_STORE" | tr '\n' ',')" "$TACIT_INDEX" "$TACIT_STATE_DIR" "$TACIT_LOCAL" "$(ls "$TACIT_INDEX" | tr '\n' ',')" "$(cat "$TACIT_SETTINGS")" "$(ls -A "$TACIT_LOCAL" | wc -l)" >> `+seen+`
 printf '%s\n' '{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":1,"structured_output":{"mechanism":"m","fix":"f","summary":"s"}}'`)}
 	before := strings.TrimSpace(run(t, src, "git", "rev-parse", "HEAD~1"))
 	trs, err := e.Run(context.Background(), []GoldenTask{task})
 	if err != nil || len(trs) != 2 {
 		t.Fatalf("%+v %v", trs, err)
+	}
+	if raw, _ := os.ReadFile(functions); len(raw) != 0 {
+		t.Fatalf("a tacit of the startup's own stayed: %q", raw)
 	}
 	raw, _ := os.ReadFile(seen)
 	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
@@ -159,7 +165,7 @@ func TestTheWarmUpRunsTheArmsTacit(t *testing.T) {
 	os.MkdirAll(arms, 0o700)
 	os.MkdirAll(process, 0o700)
 	script(t, arms, "tacit", `touch "$TACIT_INDEX/index-v15-$(git -C "$TACIT_STORE" rev-parse HEAD).db"`)
-	script(t, process, "tacit", `echo the evaluating process's tacit; exit 1`)
+	script(t, process, "tacit", `echo the evaluating process tacit; exit 1`)
 	t.Setenv("PATH", process+string(os.PathListSeparator)+os.Getenv("PATH"))
 	e.Tacit, e.Runner.Bins = src, []string{arms}
 	trs, err := e.Run(context.Background(), []GoldenTask{task})
@@ -168,6 +174,30 @@ func TestTheWarmUpRunsTheArmsTacit(t *testing.T) {
 	}
 	for _, tr := range trs {
 		if !tr.Tacit || tr.TacitErr != "" {
+			t.Fatalf("%s: %v %q", tr.Arm, tr.Tacit, tr.TacitErr)
+		}
+	}
+}
+
+// A pair whose store cannot be made reads no tacit either, and its trials say why.
+func TestATrialWithNoPairSaysWhyItHasNoTacit(t *testing.T) {
+	e, task := evalFixture(t)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "tacit-store")
+	end, err := e.snapshotEnd(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	historyGit(t, dir, end.Add(-48*time.Hour), "init", "-q", "-b", "main", src)
+	commitAt(t, src, end.Add(-24*time.Hour), "a.md", "a fact", "a fact before the end")
+	e.Tacit = src
+	e.Source = filepath.Join(dir, "no-such-store.db")
+	trs, err := e.Run(context.Background(), []GoldenTask{task})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tr := range trs {
+		if tr.Tacit || !strings.Contains(tr.TacitErr, "tacit's store as of the end") {
 			t.Fatalf("%s: %v %q", tr.Arm, tr.Tacit, tr.TacitErr)
 		}
 	}

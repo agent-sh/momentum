@@ -301,19 +301,26 @@ func (e *Eval) newTrial(t GoldenTask, n int, arm string) Trial {
 // pairStore makes the store as of a trial's end once, for both its arms, and says how to remove it; with no store
 // (its end unreadable, the copy failed) each arm makes and reports its own.
 func (e *Eval) pairStore(ctx context.Context, t GoldenTask, n int) (pairInputs, func()) {
+	// with no pair, each arm makes its own store and reads no tacit: the trial says why
+	none := func(why string) pairInputs {
+		if e.Tacit == "" {
+			return pairInputs{}
+		}
+		return pairInputs{tacitErr: "tacit's store as of the end: " + why}
+	}
 	end, err := e.snapshotEnd(ctx, t)
 	if err != nil {
-		return pairInputs{}, func() {}
+		return none("the trial's end could not be read"), func() {}
 	}
 	dir := filepath.Join(e.Dir, "pairs", digest(fmt.Sprintf("%s\x00%s\x00%d", e.ID, t.ID, n))[:16])
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return pairInputs{}, func() {}
+		return none("the pair's directory could not be made"), func() {}
 	}
 	done := func() { os.RemoveAll(dir) }
 	in := pairInputs{store: filepath.Join(dir, "momentum.db")}
 	if err := store.AsOf(ctx, e.Source, in.store, end.Add(-store.CaseRetention), end); err != nil {
 		done()
-		return pairInputs{}, func() {}
+		return none("the pair's store could not be made"), func() {}
 	}
 	// tacit's store is a git repository: the trial reads it as the machine held it at the end, outside the trial's
 	// directory, so its file tools cannot change it; both arms share it and its index, built before either runs
