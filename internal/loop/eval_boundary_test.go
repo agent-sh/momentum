@@ -157,13 +157,18 @@ func TestTrialCommandsAndDirectoriesAreNeutral(t *testing.T) {
 				t.Errorf("reference omits %q", required)
 			}
 		}
-		if strings.Contains(prompt, "momentum case") != (tr.Arm == "loop") {
-			t.Fatal("case reference belongs only in loop prompt")
+		if strings.Contains(prompt, "momentum case") {
+			t.Fatal("an investigation keeps no case: the runner records its report")
+		}
+		// the loop's prompt lists its case's evidence where the native one names the symptom events
+		evidence := strings.Contains(prompt, "The case's evidence, newest first") && strings.Contains(prompt, "ev:"+task.Symptom.Query.EventIDs[0])
+		if evidence != (tr.Arm == "loop") || strings.Contains(prompt, "Symptom events: ") == (tr.Arm == "loop") {
+			t.Fatalf("%s prompt:\n%s", tr.Arm, prompt)
 		}
 	}
 }
 
-// Replay is absent from both trials' actual settings and explicitly unavailable in the loop procedure.
+// Replay is absent from both trials' actual settings and prompts, which have the same system prompt.
 func TestTrialReplayIsUnavailableInSettingsAndPrompts(t *testing.T) {
 	e, task := evalFixture(t)
 	task.Family = "sessions"
@@ -195,22 +200,20 @@ func TestTrialReplayIsUnavailableInSettingsAndPrompts(t *testing.T) {
 		if strings.Contains(string(raw), "supervise replay") {
 			t.Fatal("prompt offers replay")
 		}
-		if tr.Arm == "loop" {
-			raw, err = os.ReadFile(filepath.Join(tr.Run.Dir, "system.md"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !strings.Contains(string(raw), "momentum supervise replay are not available") {
-				t.Fatal("replay not marked unavailable")
-			}
+		system, err := os.ReadFile(filepath.Join(tr.Run.Dir, "system.md"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(system), "replay") || !strings.HasPrefix(string(system), nativeBrief) {
+			t.Fatalf("%s system prompt:\n%s", tr.Arm, system)
 		}
 	}
 }
 
-// Without a final report, both arms give the judge only mechanism, alternatives and fix.
+// Without a final report, both arms give the judge only mechanism, alternatives and fix: the native arm from its
+// findings file, the loop from its case, where the runner recorded the same file.
 func TestUnfinishedTrialsUseTheSameJudgeFields(t *testing.T) {
 	e, task := evalFixture(t)
-	e.Arms = []string{"native"}
 	e.Runner.Agent.Runner = []string{script(t, t.TempDir(), "unfinished", `cat > findings.md <<'NOTES'
 extra introduction
 ## Mechanism
@@ -224,29 +227,49 @@ extra summary
 NOTES
 `)}
 	trs, err := e.Run(context.Background(), []GoldenTask{task})
-	if err != nil || len(trs) != 1 {
+	if err != nil || len(trs) != 2 {
 		t.Fatalf("%v %v", trs, err)
 	}
-	if trs[0].Err != "" {
-		t.Fatal(trs[0].Err)
-	}
 	want := judgePrompt(task, caseFinding(store.Case{Mechanism: "cause", Alternatives: []string{"alternative"}, NextTest: "fix"}, Result{}))
-	if trs[0].JudgePromptHash != digest(want) {
-		t.Fatal("unfinished native finding differs from the same loop case")
+	for _, tr := range trs {
+		if tr.Err != "" {
+			t.Fatal(tr.Err)
+		}
+		if tr.JudgePromptHash != digest(want) {
+			t.Fatalf("the %s arm's unfinished finding differs", tr.Arm)
+		}
 	}
 }
 
-// The investigation checks alternatives and reserves room for the report that prevents repeated limit stops.
-func TestInvestigationKeepsRoomForItsReport(t *testing.T) {
-	e, _ := evalFixture(t)
-	system, err := e.system("loop", "failures")
-	if err != nil {
-		t.Fatal(err)
+// A live investigation cut short keeps what it found: the runner records its findings file into the case, which
+// moves to testing with a mechanism and a fix, and a report later replaces them.
+func TestTheRunnerRecordsAnInvestigationsFindings(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	agent := []string{script(t, t.TempDir(), "unfinished", `cat > findings.md <<'NOTES'
+## Mechanism
+the export reads the lockfile before it takes the lock
+## Alternatives ruled out
+a slow disk
+## Fix
+take the lock first
+NOTES
+echo '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":30,"total_cost_usd":1.5}'
+`)}
+	r := runnerFor(t, st, agent)
+	c := openCase(t, st, "failures", "a", 2)
+	done, err := r.Once(ctx, Options{Families: []string{"failures"}})
+	if err != nil || len(done) != 1 || done[0].Run.Status != store.RunTurns {
+		t.Fatalf("%+v %v", done, err)
 	}
-	for _, text := range []string{"Run the checks rather than stopping at the first explanation that fits", "Stop with room for the report", "budget or turn limit reports nothing", "two such stops pass the case over"} {
-		if !strings.Contains(system, text) {
-			t.Fatalf("procedure omits %q", text)
-		}
+	got, err := st.CaseByID(ctx, c.ID)
+	if err != nil || got.Status != store.CaseTesting || got.Mechanism != "the export reads the lockfile before it takes the lock" ||
+		got.NextTest != "take the lock first" || len(got.Alternatives) != 1 || got.Alternatives[0] != "a slow disk" {
+		t.Fatalf("the case after a run cut short: %+v %v", got, err)
+	}
+	log, _ := st.CaseLog(ctx, c.ID)
+	if len(log) == 0 || log[len(log)-1].Actor != "loop:"+done[0].Run.ID {
+		t.Fatalf("the change is the run's: %+v", log)
 	}
 }
 
@@ -284,5 +307,30 @@ func TestHistoricalCloneFallsBackWhenTheReflogDoesNotReachTheEnd(t *testing.T) {
 	}
 	if got := historyGit(t, repos[0], time.Now(), "rev-parse", "HEAD"); got != want {
 		t.Fatalf("got %s want %s", got, want)
+	}
+}
+
+// Both arms' findings are read the one way, a report whose alternatives are one text rather than the schema's list
+// among them: the judge reads the same investigation from either arm.
+func TestBothArmsReadTheirFindingsTheOneWay(t *testing.T) {
+	e, task := evalFixture(t)
+	e.Runner.Agent.Runner = []string{script(t, t.TempDir(), "odd-report", `echo '{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":1,"structured_output":{"mechanism":"the job reads the lockfile before it takes the lock","alternatives":"disk latency","fix":"take the lock first","summary":"found"}}'`)}
+	trs, err := e.Run(context.Background(), []GoldenTask{task})
+	if err != nil || len(trs) != 2 {
+		t.Fatalf("%v %v", trs, err)
+	}
+	var prompts []string
+	for _, tr := range trs {
+		if tr.Err != "" {
+			t.Fatal(tr.Err)
+		}
+		raw, _ := os.ReadFile(filepath.Join(tr.JudgeDir, "prompt.txt"))
+		if !strings.Contains(string(raw), "takes the lock") || !strings.Contains(string(raw), "disk latency") {
+			t.Fatalf("%s: the judge lost the findings:\n%s", tr.Arm, raw)
+		}
+		prompts = append(prompts, string(raw))
+	}
+	if prompts[0] != prompts[1] {
+		t.Fatalf("the arms' judge prompts differ:\n%s\n%s", prompts[0], prompts[1])
 	}
 }

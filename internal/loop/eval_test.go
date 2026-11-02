@@ -128,10 +128,11 @@ func TestAnEvaluationStopsAtItsBudget(t *testing.T) {
 	}
 }
 
-// A trial runs the loop's investigation, its system prompt the loop's procedure and the family's skill, or the
-// native path: the same agent, evidence, permissions and limits, asked the question with no procedure, skill or case,
-// its report what the judge reads. Neither may change a case of the store it reads, and neither reads the machine's
-// rules as they are now, which hold the lessons of later fixes.
+// A trial runs the loop's investigation or the native path: the same agent, system prompt, report, permissions and
+// limits, asked the question with no procedure or skill. The loop's prompt holds its case's evidence and the runner
+// writes its report into the case, which the judge reads; the native arm's report is what the judge reads. Neither
+// may change a case itself, and neither reads the machine's rules as they are now, which hold the lessons of later
+// fixes.
 func TestATrialRunsTheLoopOrTheNativePath(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -161,7 +162,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total
 	task.Symptom.Query.EventIDs = []string{e1.ID()}
 	for _, native := range []bool{false, true} {
 		name := map[bool]string{false: "loop", true: "native"}[native]
-		out := `{"case":"x","step":"investigate","outcome":"investigated","summary":"looked"}`
+		out := `{"mechanism":"the loop mechanism","alternatives":["another"],"fix":"the loop fix","summary":"looked"}`
 		if native {
 			out = `{"mechanism":"the native mechanism","alternatives":["another"],"root_cause":"the native root","summary":"found it"}`
 		}
@@ -176,14 +177,16 @@ echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total
 		system, _ := os.ReadFile(filepath.Join(dir, name+".system"))
 		args, _ := os.ReadFile(filepath.Join(dir, name+".args"))
 		judged, _ := os.ReadFile(filepath.Join(dir, "judge.args"))
-		procedure := strings.Contains(string(system), "momentum's improvement loop")
 		switch {
 		case !strings.Contains(string(system), "never wake him") || strings.Contains(string(system), "Delete with literal paths."):
 			t.Errorf("%s: the system prompt lacks the owner's constraints, or holds the machine's rules as they are now:\n%s", name, system)
-		case procedure == native:
-			t.Errorf("%s: the loop's procedure in its system prompt: %v", name, procedure)
-		case native && (strings.Contains(string(args), "Bash(momentum case") || !strings.Contains(string(args), e1.ID())):
-			t.Errorf("native: it may change a case, or it is not given its events:\n%s", args)
+		case strings.Contains(string(system), "momentum's improvement loop") || !strings.HasPrefix(string(system), nativeBrief):
+			t.Errorf("%s: not the native brief alone:\n%s", name, system)
+		case strings.Contains(string(args), "Bash(momentum case") || !strings.Contains(string(args), e1.ID()):
+			t.Errorf("%s: it may change a case, or it is not given its events:\n%s", name, args)
+		case !native && (!strings.Contains(string(args), "zz-signal-text") || !strings.Contains(string(judged), "the loop mechanism") ||
+			!strings.Contains(string(judged), "the loop fix") || trs[0].Status != string(store.CaseTesting)):
+			t.Errorf("loop: its case's evidence is not in its prompt, or its report is not on its case:\n%s\n%s\n%s", args, judged, trs[0].Status)
 		case native && (!strings.Contains(string(judged), "the native mechanism")):
 			t.Errorf("native: the judge did not read its report:\n%s", judged)
 		case native && trs[0].Status != "native":

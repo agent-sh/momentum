@@ -106,7 +106,7 @@ func TestTrialPromptsEndWithTheSameCommandReference(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var blocks []string
+	var blocks, systems []string
 	for _, tr := range trs {
 		if tr.Err != "" {
 			t.Fatal(tr.Err)
@@ -140,20 +140,19 @@ func TestTrialPromptsEndWithTheSameCommandReference(t *testing.T) {
 				if !strings.Contains(prompt, cmd) {
 					t.Fatalf("unexplained command %s", cmd)
 				}
-				if tr.Arm == "native" && strings.HasPrefix(cmd, "momentum case") {
-					t.Fatal("native case command allowed")
+				if strings.HasPrefix(cmd, "momentum case") {
+					t.Fatalf("%s: an investigation keeps no case, yet %s is allowed", tr.Arm, cmd)
 				}
 			}
 		}
-		if tr.Arm == "loop" {
-			raw, err = os.ReadFile(filepath.Join(tr.Run.Dir, "system.md"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !strings.Contains(string(raw), "tacit, momentum evidence file, momentum evidence unit, momentum report and momentum supervise replay are not available") {
-				t.Fatal("unavailable commands unmarked")
-			}
+		raw, err = os.ReadFile(filepath.Join(tr.Run.Dir, "system.md"))
+		if err != nil {
+			t.Fatal(err)
 		}
+		systems = append(systems, string(raw))
+	}
+	if len(systems) != 2 || systems[0] != systems[1] {
+		t.Fatalf("the arms' system prompts differ: %q", systems)
 	}
 	if len(blocks) != 2 || blocks[0] != blocks[1] {
 		t.Fatalf("references differ: %v", blocks)

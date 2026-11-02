@@ -322,9 +322,8 @@ func TestTrialsRecordTheirProvenanceAndModels(t *testing.T) {
 		if tr.Provenance.Systems[tr.Arm] != digest(string(system)) {
 			t.Fatal("system hash differs")
 		}
-		skill, _ := Skill("loop")
-		if tr.Provenance.Skills["loop"] != digest(skill) {
-			t.Fatal("skill hash differs")
+		if len(tr.Provenance.Skills) != 0 {
+			t.Fatalf("an investigation loads no skill, yet its provenance names %v", tr.Provenance.Skills)
 		}
 		raw, _ := os.ReadFile(filepath.Join(tr.JudgeDir, "args.txt"))
 		if strings.Contains(string(raw), "--fallback-model") {
@@ -571,13 +570,14 @@ func TestACutShortLoopKeepsItsCaseFindings(t *testing.T) {
 	}
 }
 
-// The result's procedure hashes name every family actually selected, not a fixed default family.
+// The result records each family's procedure, and the system prompts the arms ran, which no family changes.
 func TestResultProvenanceNamesEachFamily(t *testing.T) {
 	e, task := evalFixture(t)
 	task.Family = "sessions"
 	tr := e.newTrial(task, 1, "loop")
 	r := e.Results([]Trial{tr})
-	if r.Provenance.Systems["loop/sessions"] != tr.Provenance.Systems["loop"] || r.Provenance.Systems["loop/sessions"] == "" || r.Provenance.Skills["sessions"] == "" || r.Provenance.Systems["loop"] != "" {
+	if r.Procedures["sessions"].Systems["loop"] == "" || r.Provenance.Systems["loop"] != tr.Provenance.Systems["loop"] ||
+		r.Provenance.Systems["loop"] != r.Provenance.Systems["native"] || len(r.Provenance.Skills) != 0 {
 		t.Fatalf("%+v", r.Provenance)
 	}
 }

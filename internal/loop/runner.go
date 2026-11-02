@@ -447,6 +447,20 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 		r.logf("record run %s: %v", run.ID, err)
 		return
 	}
+	// The runner keeps an investigation's case: what the run found goes into it, deterministically, from its report
+	// or, when it was cut short, from the findings it kept as it went.
+	if err == nil && run.Step == StepInvestigate {
+		if f, ok := investigationFindings(res, run.Dir); ok {
+			if own, recorded, err := recordFindings(ctx, r.Store, run.Case, f, "loop:"+run.ID); err != nil {
+				r.logf("record the findings of %s: %v", run.Case, err)
+			} else if !recorded && own.Into != "" {
+				r.logf("findings of %s not recorded: it went into %s", run.Case, own.Into)
+			} else if !recorded {
+				r.logf("findings of %s not recorded: it is %s now", run.Case, own.Status)
+			}
+		}
+		return
+	}
 	// A report cannot choose another case to change. Its root is applied to this run's case, after it ends.
 	if err == nil && res.Status == store.RunOK && run.Step != StepReview {
 		var report struct {
@@ -484,6 +498,9 @@ func (r *Runner) affordable(ctx context.Context) (string, error) {
 
 // invoke runs the agent for a step.
 func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step string, run store.LoopRun) (Result, error) {
+	if step == StepInvestigate {
+		return r.investigate(ctx, c, run)
+	}
 	system, err := systemPrompt(step, family, r.Rules, r.Constraints)
 	if err != nil {
 		return Result{}, err
@@ -512,8 +529,6 @@ func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step s
 				"in its work tree %s for what the review found, check it again (`momentum ship check`) and propose it again (`momentum ship "+
 				"propose`), which updates its pull request.", p.PR, last.Round, last.High, last.Medium, last.Low, p.Work)
 		}
-	case StepInvestigate:
-		inv.AddDirs = append(inv.AddDirs, r.ReadDirs...)
 	}
 	inv.Settings = r.permissions(step, c, run)
 	// the prompt holds the case's title, which a detector made of what it read: it reaches the run scrubbed
@@ -525,6 +540,37 @@ func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step s
 		"MOMENTUM_LOOP_DIR": run.Dir}, r.Bins...)
 	return agent.RunOrFallback(ctx, inv)
 }
+
+// investigate runs an investigation: the native path's brief, tools and report, and the case's title and evidence in
+// its prompt. It changes no case; the runner writes its report into the case when it ends (finish).
+func (r *Runner) investigate(ctx context.Context, c store.Case, run store.LoopRun) (Result, error) {
+	system, err := investigationSystem(r.Rules, r.Constraints)
+	if err != nil {
+		return Result{}, err
+	}
+	if err := os.MkdirAll(run.Dir, 0o700); err != nil {
+		return Result{}, err
+	}
+	evidence, err := caseEvidence(ctx, r.Store, c)
+	if err != nil {
+		return Result{}, err
+	}
+	inv := Invocation{Dir: run.Dir, System: system, Schema: investigationSchema, MaxTurns: r.Budgets.MaxTurns, BudgetUSD: r.Budgets.Run,
+		Timeout: r.Budgets.RunTime, Persist: true, AddDirs: append([]string{}, r.ReadDirs...)}
+	inv.Prompt = fmt.Sprintf("%s\nProblem: %s\n%s%s%s", liveQuestion, c.Title, evidence, findingsInstruction, liveCommands)
+	inv.Settings = r.permissions(StepInvestigate, c, run)
+	// the prompt holds the case's title and evidence, which a detector made of what it read: a run reads nothing unscrubbed
+	if inv.Prompt, err = Redact(ctx, inv.Prompt); err != nil {
+		return Result{}, err
+	}
+	agent := r.Agent
+	agent.Env = CleanEnv(map[string]string{"MOMENTUM_ACTOR": "loop:" + run.ID, "MOMENTUM_LOOP_RUN": run.ID, "MOMENTUM_LOOP_CASE": c.ID,
+		"MOMENTUM_LOOP_DIR": run.Dir}, r.Bins...)
+	return agent.RunOrFallback(ctx, inv)
+}
+
+// liveQuestion is what a live investigation is asked.
+const liveQuestion = "Find the root cause of this problem and the fix. State the mechanism, the alternatives ruled out, the fix, and a summary. Build no change."
 
 // runSchema is the report every run ends with.
 const runSchema = `{"type":"object","additionalProperties":false,"required":["case","step","outcome","summary"],
@@ -550,11 +596,14 @@ func rule(tool, path string) string { return tool + "(/" + filepath.Clean(path) 
 func (r *Runner) permissions(step string, c store.Case, run store.LoopRun) Settings {
 	s := Settings{
 		Allow: []string{"Read", "Grep", "Glob", rule("Write", run.Dir+"/**"), rule("Edit", run.Dir+"/**"),
-			"Bash(momentum case *)", "Bash(momentum evidence events *)", "Bash(momentum evidence status *)", "Bash(momentum evidence show *)",
+			"Bash(momentum evidence events *)", "Bash(momentum evidence status *)", "Bash(momentum evidence show *)",
 			"Bash(momentum evidence search *)", "Bash(momentum evidence git *)", "Bash(momentum evidence file *)", "Bash(momentum evidence unit *)",
 			"Bash(momentum supervise replay *)", "Bash(momentum report *)", "Bash(momentum ship status *)",
 			"Bash(tacit search *)", "Bash(tacit fact *)", "Bash(tacit tree *)", "Agent", "Task"},
 		Deny: append(CredentialDenials(), "WebFetch", "WebSearch"),
+	}
+	if step != StepInvestigate { // an investigation keeps no case: the runner writes its report into it
+		s.Allow = append(s.Allow, "Bash(momentum case *)")
 	}
 	switch step {
 	case StepBuild:
@@ -763,6 +812,9 @@ func summaryOf(res Result) string {
 		BlockedBy string `json:"blocked_by"`
 	}
 	if json.Unmarshal(res.Report, &rep) == nil && rep.Summary != "" {
+		if rep.Outcome == "" { // an investigation's report has no outcome: the runner moves its case
+			return rep.Summary
+		}
 		s := rep.Outcome + ": " + rep.Summary
 		if rep.BlockedBy != "" {
 			s += " (blocked by " + rep.BlockedBy + ")"

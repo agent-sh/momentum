@@ -167,12 +167,7 @@ func (e *Eval) provenance(family string) Provenance {
 		}
 	}
 	p.Systems["judge"] = digest(judgeSystem)
-	for _, name := range []string{"loop", family} {
-		if sk, err := Skill(name); err == nil {
-			p.Skills[name] = digest(sk)
-		}
-	}
-	return p
+	return p // an investigation loads no skill: Skills stays empty
 }
 
 const judgeBudget = 1.0
@@ -440,11 +435,14 @@ func (e *Eval) trial(ctx context.Context, t GoldenTask, n int) (tr Trial) {
 	run := store.LoopRun{ID: newRunID(time.Now()), Case: c.ID, Family: t.Family, Step: StepInvestigate, Started: time.Now(),
 		Model: e.Runner.Agent.Model, Dir: dir, Experiment: "eval:" + tr.Key + ":" + arm, Status: store.RunRunning}
 	e.Runner.Store.PutLoopRun(ctx, run)
-	step := e.investigate
+	step, evidence := e.investigate, ""
 	if e.Native {
 		step = e.native
+	} else if evidence, err = caseEvidence(ctx, snap, c); err != nil {
+		tr.Err = "the case's evidence: " + err.Error()
+		return tr
 	}
-	res, err := step(ctx, t, c, dir, repo, run)
+	res, err := step(ctx, t, c, dir, repo, evidence, run)
 	tr.PromptHash = res.promptHash
 	run.Ended = time.Now()
 	run.USD = res.USD
@@ -460,6 +458,14 @@ func (e *Eval) trial(ctx context.Context, t GoldenTask, n int) (tr Trial) {
 	}
 	e.Runner.Store.PutLoopRun(ctx, run)
 	tr.Run = run
+	if !e.Native && err == nil { // the runner's bookkeeping, as a live investigation's: the report goes into the case
+		if f, ok := investigationFindings(res, dir); ok {
+			if _, _, err := recordFindings(ctx, snap, c.ID, f, "eval:"+run.ID); err != nil {
+				tr.Err = "the case's findings: " + err.Error()
+				return tr
+			}
+		}
+	}
 	after, err := snap.CaseLive(ctx, c.ID)
 	if err != nil {
 		tr.Err = err.Error()
@@ -476,15 +482,12 @@ func (e *Eval) trial(ctx context.Context, t GoldenTask, n int) (tr Trial) {
 	}
 	raw, _ := json.MarshalIndent(caseRecord(after), "", "  ")
 	os.WriteFile(filepath.Join(dir, "case.json"), raw, 0o600)
-	found := caseFinding(after, res)
-	if e.Native {
-		found = nativeFinding(res)
-		if len(res.Report) == 0 {
-			raw, readErr := os.ReadFile(filepath.Join(dir, "findings.md"))
-			if readErr == nil {
-				found = findingsFile(string(raw))
-			}
-		}
+	// both arms' findings are read the one way: the report, or the findings file when the report gives neither a
+	// mechanism nor a fix; the loop's are on its case, where the runner wrote them, with the summary they came with
+	found, _ := investigationFindings(res, dir)
+	if !e.Native {
+		found = finding{Mechanism: after.Mechanism, Alternatives: after.Alternatives, Fix: after.NextTest, Report: found.Report}
+	} else {
 		tr.Status = "native"
 	}
 	tr.Mechanism = found.Mechanism
@@ -603,19 +606,13 @@ func (e *Eval) cloneRepositories(ctx context.Context, t GoldenTask, dir string) 
 	return out, nil
 }
 
-// investigate runs the investigation step of a trial: the loop's own procedure and skill, with an evaluation's
-// permissions: the trial's directory alone to read and write, the store as of the cutoff through momentum, the
-// records its events name (evidence show), the repositories at the end of store, and no tacit, no services, no report.
-func (e *Eval) investigate(ctx context.Context, t GoldenTask, c store.Case, dir, repo string, run store.LoopRun) (Result, error) {
-	return e.invokeTrial(ctx, t, c, dir, repo, run, "loop")
+// investigate runs the investigation step of a trial as the loop runs it: the native path's brief, tools and report,
+// with the case's evidence in its prompt, under an evaluation's permissions: the trial's directory alone to read and
+// write, the store as of the cutoff through momentum, the records its events name (evidence show), the
+// repositories at the end of store, and no tacit, no services, no report.
+func (e *Eval) investigate(ctx context.Context, t GoldenTask, c store.Case, dir, repo, evidence string, run store.LoopRun) (Result, error) {
+	return e.invokeTrial(ctx, t, c, dir, repo, evidence, run, "loop")
 }
-
-const nativeSchema = `{"type":"object","additionalProperties":false,"required":["mechanism","fix","summary"],
-"properties":{"mechanism":{"type":"string"},"alternatives":{"type":"array","items":{"type":"string"}},
-"fix":{"type":"string"},"summary":{"type":"string"}}}`
-
-const nativeBrief = `You find the root cause of a problem in an agent system on one machine, from what the machine recorded.
-Your file tools reach your working directory and its repository checkouts. Read the records through momentum's evidence commands.`
 
 const investigationQuestion = "This run evaluates the investigation. Find the root cause and the fix. State the mechanism, the alternatives ruled out, the fix, and a summary. Build no change."
 
@@ -632,16 +629,10 @@ Your working directory is . (the trial's isolated directory). File tools read it
 No other shell commands are available: the harness refuses any other program, and a pipe, a loop, a substitution or a redirection.
 `
 
+// system is both arms' system prompt: an investigation's, with no rules file (today's rules hold lessons from later
+// fixes).
 func (e *Eval) system(arm, family string) (string, error) {
-	if arm == "loop" {
-		s, err := systemPrompt(StepInvestigate, family, nil, e.Runner.Constraints)
-		return s + "\nIn this evaluation, tacit, momentum evidence file, momentum evidence unit, momentum report and momentum supervise replay are not available. Do not call them.\n", err
-	}
-	s := nativeBrief + "\n"
-	for _, c := range e.Runner.Constraints {
-		s += "- " + c + "\n"
-	}
-	return s, nil
+	return investigationSystem(nil, e.Runner.Constraints)
 }
 
 // evalPermissions inherits the live investigation's denials and removes commands that read today's machine.
@@ -649,7 +640,7 @@ func (e *Eval) evalPermissions(c store.Case, run store.LoopRun, native bool) Set
 	s := e.Runner.permissions(StepInvestigate, c, run)
 	var allow []string
 	for _, a := range s.Allow {
-		if strings.HasPrefix(a, "Bash(momentum supervise replay ") || strings.HasPrefix(a, "Bash(tacit ") || strings.HasPrefix(a, "Bash(momentum evidence file ") || strings.HasPrefix(a, "Bash(momentum evidence unit ") || strings.HasPrefix(a, "Bash(momentum report ") || strings.HasPrefix(a, "Bash(momentum ship ") || (native && strings.HasPrefix(a, "Bash(momentum case ")) {
+		if strings.HasPrefix(a, "Bash(momentum supervise replay ") || strings.HasPrefix(a, "Bash(tacit ") || strings.HasPrefix(a, "Bash(momentum evidence file ") || strings.HasPrefix(a, "Bash(momentum evidence unit ") || strings.HasPrefix(a, "Bash(momentum report ") || strings.HasPrefix(a, "Bash(momentum ship ") || strings.HasPrefix(a, "Bash(momentum case ") {
 			continue
 		}
 		allow = append(allow, a)
@@ -658,25 +649,26 @@ func (e *Eval) evalPermissions(c store.Case, run store.LoopRun, native bool) Set
 	return s
 }
 
-func (e *Eval) native(ctx context.Context, t GoldenTask, c store.Case, dir, repo string, run store.LoopRun) (Result, error) {
-	return e.invokeTrial(ctx, t, c, dir, repo, run, "native")
+func (e *Eval) native(ctx context.Context, t GoldenTask, c store.Case, dir, repo, evidence string, run store.LoopRun) (Result, error) {
+	return e.invokeTrial(ctx, t, c, dir, repo, evidence, run, "native")
 }
 
-func (e *Eval) invokeTrial(ctx context.Context, t GoldenTask, c store.Case, dir, repo string, run store.LoopRun, arm string) (Result, error) {
+// invokeTrial runs one arm of a trial. Both arms have the same system prompt, report and commands; the loop's
+// prompt holds its case's evidence where the native arm's names the symptom events.
+func (e *Eval) invokeTrial(ctx context.Context, t GoldenTask, c store.Case, dir, repo, evidence string, run store.LoopRun, arm string) (Result, error) {
 	r := e.Runner
 	system, err := e.system(arm, t.Family)
 	if err != nil {
 		return Result{}, err
 	}
-	inv := Invocation{Dir: dir, System: system, Schema: runSchema, MaxTurns: r.Budgets.MaxTurns, BudgetUSD: r.Budgets.Run, Timeout: r.Budgets.RunTime}
-	inv.Prompt = fmt.Sprintf("%s\nProblem: %s\nSymptom events: %s. The store ends at %s. Repository checkouts: %s.\n", investigationQuestion, c.Title, strings.Join(t.Symptom.Query.EventIDs, " "), t.Cutoff.Format(time.RFC3339Nano), firstOf(repo, "none"))
+	inv := Invocation{Dir: dir, System: system, Schema: investigationSchema, MaxTurns: r.Budgets.MaxTurns, BudgetUSD: r.Budgets.Run, Timeout: r.Budgets.RunTime}
+	inv.Prompt = fmt.Sprintf("%s\nProblem: %s\n", investigationQuestion, c.Title)
 	if arm == "loop" {
-		inv.Prompt += "momentum case ...: reads snapshot cases and changes only the assigned case.\n"
-		inv.Prompt += fmt.Sprintf("Read case %s with `momentum case show %s --json`. Follow the loop's procedure and the %s skill. Record findings as you go on the case, and the fix in its next test.", c.ID, c.ID, t.Family)
+		inv.Prompt += evidence
 	} else {
-		inv.Schema = nativeSchema
-		inv.Prompt += "Keep findings as you go in findings.md in your directory. Use the headings ## Mechanism, ## Alternatives ruled out, ## Fix, and ## Summary. End with your report of the same fields."
+		inv.Prompt += fmt.Sprintf("Symptom events: %s.\n", strings.Join(t.Symptom.Query.EventIDs, " "))
 	}
+	inv.Prompt += fmt.Sprintf("The store ends at %s. Repository checkouts: %s.\n%s", t.Cutoff.Format(time.RFC3339Nano), firstOf(repo, "none"), findingsInstruction)
 	inv.Prompt += trialCommands
 	inv.Settings = e.evalPermissions(c, run, arm == "native")
 	if inv.Prompt, err = Redact(ctx, inv.Prompt); err != nil {
@@ -708,16 +700,24 @@ func caseFinding(c store.Case, res Result) finding {
 	return finding{Mechanism: c.Mechanism, Alternatives: c.Alternatives, Fix: c.NextTest, Report: rep.Summary}
 }
 
+// nativeFinding reads an investigation's report; alternatives given as one text, not the schema's list, are kept.
 func nativeFinding(res Result) finding {
 	var rep struct {
 		Mechanism    string
-		Alternatives []string
+		Alternatives json.RawMessage
 		Fix, Summary string
 	}
 	if json.Unmarshal(res.Report, &rep) != nil {
 		return finding{}
 	}
-	return finding{Mechanism: rep.Mechanism, Alternatives: rep.Alternatives, Fix: rep.Fix, Report: rep.Summary}
+	f := finding{Mechanism: rep.Mechanism, Fix: rep.Fix, Report: rep.Summary}
+	if json.Unmarshal(rep.Alternatives, &f.Alternatives) != nil {
+		var one string
+		if json.Unmarshal(rep.Alternatives, &one) == nil && strings.TrimSpace(one) != "" {
+			f.Alternatives = []string{one}
+		}
+	}
+	return f
 }
 
 // findingsFile reads only the three fields a case retains when neither arm has a report.
