@@ -509,7 +509,7 @@ func (r *Runner) watch(ctx context.Context, c store.Case, dry bool) (Measured, b
 		}
 		if measure.Back(measure.Counts{Hits: plan.Before, Base: plan.BeforeBase}, p.WatchRecent) {
 			m.Status = "back"
-			m.Why = fmt.Sprintf("%d of %d active hours in window %d, the third consecutive window at its old share since its close (%s), %d of %d before its change",
+			m.Why = fmt.Sprintf("%d of %d active hours in window %d since its close, the third consecutive window (of %s) at its old share, %d of %d before its change",
 				recent.Hits, recent.Base, j, days(p.Plan.Window), plan.Before, plan.BeforeBase)
 			if dry {
 				return m, true
@@ -583,10 +583,27 @@ func days(d time.Duration) string {
 	return fmt.Sprintf("%dd", int(d.Hours()/24))
 }
 
-// liveSources leaves out only readers known to have stopped.
-func (s *Ship) liveSources(sources []string) (live, omitted []string) {
+// commandSources are the sources a command writes, each run reading all it reads or recording no read.
+var commandSources = []string{store.Sessions, store.Supervise, "capacity"}
+
+// liveSources leaves out the readers that stopped: one switched off or no longer configured, and a command's
+// source (a sessions scan, supervision, a capacity run) that has not finished a complete read for a whole window, or
+// that never finished one in more than a window since its first event
+// (one harness's scan that keeps failing, a session supervision keeps reading in part, a timer that no longer
+// runs), which would otherwise hold every decision that waits on it for good. An ingest source reads per file, and
+// its partial runs say which windows they cover.
+func (s *Ship) liveSources(ctx context.Context, sources []string, window time.Duration, now time.Time) (live, omitted []string) {
 	for _, source := range sources {
-		if s.SourceLive != nil && !s.SourceLive(source) {
+		stopped := s.SourceLive != nil && !s.SourceLive(source)
+		if !stopped && s.Store != nil && window > 0 && slices.Contains(commandSources, source) {
+			// its newest complete read, or, when it never finished one, its first event: how long it has run unread
+			since, err := s.Store.ReadThrough(ctx, source)
+			if err == nil && since.IsZero() {
+				since, err = s.Store.FirstEvent(ctx, source)
+			}
+			stopped = err == nil && !since.IsZero() && now.Sub(since) > window
+		}
+		if stopped {
 			omitted = append(omitted, source)
 		} else {
 			live = append(live, source)
@@ -617,7 +634,7 @@ func (r *Runner) countingPlan(ctx context.Context, p *Package, dry bool) (Plan, 
 			return plan, "", err
 		}
 	}
-	live, omitted := r.Ship.liveSources(sources)
+	live, omitted := r.Ship.liveSources(ctx, sources, plan.Window, r.now())
 	plan.Sources = live
 	if !slices.Equal(p.Omitted, omitted) && !dry {
 		detail := "sources left out of both counts: " + strings.Join(omitted, ", ")

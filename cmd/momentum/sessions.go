@@ -129,7 +129,9 @@ func board(ctx context.Context, w *sessions.World, snapErr error, st *store.Stor
 		return nil, nil, err
 	}
 	if scanErr == nil && snapErr == nil {
-		if err := st.MarkRead(ctx, store.Sessions, w.Now); err != nil {
+		// a session gone from this scan is written vanished up to state.Keep later, dated when it was last seen: the
+		// scan has read the sessions only up to that much before its own time
+		if err := st.MarkRead(ctx, store.Sessions, w.Now.Add(-state.Keep)); err != nil {
 			return nil, nil, err
 		}
 	}

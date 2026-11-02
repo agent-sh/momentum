@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -88,6 +89,10 @@ func TestActivityAndWatchWaitForTheirSources(t *testing.T) {
 	if _, err := m.st.Put(ctx, []store.Event{ev}); err != nil {
 		t.Fatal(err)
 	}
+	// the sessions scan reads, but not yet past the window's end: within a window of its last read it holds the decision
+	if err := m.st.MarkRead(ctx, store.Sessions, start.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
 	hours(t, m.st, "after", start, 23*time.Hour, 100, 0)
 	m.clock = start.Add(25 * time.Hour)
 	if err := m.st.MarkRead(ctx, store.Transcripts, m.clock); err != nil {
@@ -144,20 +149,28 @@ func TestAPlanWaitsForItsBaselineSources(t *testing.T) {
 	w := 7 * 24 * time.Hour
 	hours(t, m.st, "baseline", m.planAt.Add(-4*w), 3*w, 100, 10)
 	ev := store.Event{Source: store.Sessions, SourceKey: "baseline-phase", Session: "phase", Actor: store.ActorHarness, Kind: "phase", TS: m.planAt.Add(-2 * w)}
-	if _, err := m.st.Put(ctx, []store.Event{ev}); err != nil {
+	first := store.Event{Source: store.Sessions, SourceKey: "first-phase", Session: "phase", Actor: store.ActorHarness, Kind: "phase", TS: m.planAt.Add(-5 * w)} // a reader from before the span
+	if _, err := m.st.Put(ctx, []store.Event{ev, first}); err != nil {
 		t.Fatal(err)
 	}
-	for _, source := range []string{store.Transcripts, store.Sessions} {
-		_, err := m.r.Ship.validPlan(ctx, m.c, goodSignal, w, "", m.planAt)
-		if err == nil || !strings.Contains(err.Error(), source) {
-			t.Fatalf("unread %s: %v", source, err)
-		}
-		if err := m.st.MarkRead(ctx, source, m.planAt.Add(time.Second)); err != nil {
-			t.Fatal(err)
-		}
+	_, err := m.r.Ship.validPlan(ctx, m.c, goodSignal, w, "", m.planAt)
+	if err == nil || !strings.Contains(err.Error(), store.Transcripts) {
+		t.Fatalf("unread transcripts: %v", err)
 	}
-	if _, err := m.r.Ship.validPlan(ctx, m.c, goodSignal, w, "", m.planAt); err != nil {
+	if err := m.st.MarkRead(ctx, store.Transcripts, m.planAt.Add(time.Second)); err != nil {
 		t.Fatal(err)
+	}
+	// the sessions scan, a command's source, never finished a read in the five weeks since its first event: it
+	// stopped, and the plan leaves it out of both sides and names it, rather than wait on it for good
+	plan, err := m.r.Ship.validPlan(ctx, m.c, goodSignal, w, "", m.planAt)
+	if err != nil || slices.Contains(plan.Sources, store.Sessions) || !slices.Contains(plan.Omitted, store.Sessions) {
+		t.Fatalf("a stopped sessions scan: %+v %v", plan, err)
+	}
+	if err := m.st.MarkRead(ctx, store.Sessions, m.planAt.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if plan, err = m.r.Ship.validPlan(ctx, m.c, goodSignal, w, "", m.planAt); err != nil || !slices.Contains(plan.Sources, store.Sessions) {
+		t.Fatalf("a sessions scan read again: %+v %v", plan, err)
 	}
 }
 
