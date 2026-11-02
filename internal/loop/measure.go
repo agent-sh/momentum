@@ -57,10 +57,15 @@ func Tally(ctx context.Context, st *store.Store, sig Signal, units string, since
 
 // tally is Tally over the events the signal counted already. The activity holds every unit the signal counts.
 func tally(ctx context.Context, st *store.Store, sig Signal, units string, evs []store.Event, since, until time.Time, excludeCwd string) (measure.Counts, error) {
+	return tallySources(ctx, st, sig, units, evs, since, until, excludeCwd, nil)
+}
+
+func tallySources(ctx context.Context, st *store.Store, sig Signal, units string, evs []store.Event, since, until time.Time, excludeCwd string, sources []string) (measure.Counts, error) {
 	q, err := activityQuery(sig, units, since, until, excludeCwd)
 	if err != nil {
 		return measure.Counts{}, err
 	}
+	q.Sources = sources
 	base, err := st.Activity(ctx, q)
 	if err != nil {
 		return measure.Counts{}, err
@@ -96,12 +101,13 @@ func unreadWindow(ctx context.Context, st *store.Store, plan Plan, since, until 
 	if err != nil {
 		return nil, err
 	}
+	q.Sources = plan.Sources
 	return st.UnreadSources(ctx, plan.Signal.Source, q)
 }
 
 // readWindow holds a decision until every source counted has read past its end.
-func (r *Runner) readWindow(ctx context.Context, p *Package, since, until time.Time, dry bool) (string, error) {
-	unread, err := unreadWindow(ctx, r.Store, *p.Plan, since, until, r.Dir)
+func (r *Runner) readWindow(ctx context.Context, p *Package, plan Plan, since, until time.Time, dry bool) (string, error) {
+	unread, err := unreadWindow(ctx, r.Store, plan, since, until, r.Dir)
 	if err != nil {
 		return "", err
 	}
@@ -137,7 +143,7 @@ func (o Options) takes(c store.Case) bool {
 }
 
 // Measure is the measure step, deterministic. A deployed case starts measuring once its change is in effect (the
-// repository's checkout holds it, and the file it is installed in changed after the checkout took the change), with its plan's
+// installed build holds it, or the repository's checkout does when no installed file is named), with its plan's
 // window and count before; until then it waits, and a problem note says so after a window. A measuring case whose
 // window after its change has ended and been read is measured against its independent baseline: one whose share fell
 // beyond chance (measure.Compare) closes as improved, its change kept, with a shipped note of what it did; one
@@ -180,7 +186,7 @@ func (r *Runner) Measure(ctx context.Context, o Options) ([]Measured, error) {
 				if err != nil {
 					return err
 				}
-				if !p.ProposalAt.IsZero() && !p.ReadWait.IsZero() {
+				if c.Status == store.CaseTesting && !p.ProposalAt.IsZero() && !p.ReadWait.IsZero() {
 					return nil
 				}
 				if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
@@ -245,7 +251,14 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		}
 		return m
 	}
-	plan := *p.Plan
+	plan, why, err := r.countingPlan(ctx, &p, dry)
+	if err != nil {
+		return failed(err.Error())
+	}
+	if why != "" {
+		m.Status, m.Why = "waiting", why
+		return m
+	}
 	now := r.now()
 	since, why, err := r.Ship.InEffect(ctx, &p)
 	if err != nil {
@@ -300,14 +313,14 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		m.Status = "waiting"
 		return m
 	}
-	if why, err := r.readWindow(ctx, &p, c.Deployed, m.Due, dry); err != nil {
+	if why, err := r.readWindow(ctx, &p, plan, c.Deployed, m.Due, dry); err != nil {
 		return failed(err.Error())
 	} else if why != "" {
 		m.Status, m.Why = "waiting", why
 		return m
 	}
 	before := measure.Counts{Hits: plan.Before, Base: plan.BeforeBase}
-	after, err := Tally(ctx, r.Store, plan.Signal, plan.Units, c.Deployed, m.Due, r.Dir)
+	after, err := tallyPlan(ctx, r.Store, plan, c.Deployed, m.Due, r.Dir)
 	if err != nil {
 		return failed(err.Error())
 	}
@@ -318,13 +331,13 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 				after.Base, before.Hits, before.Base)
 			return m
 		}
-		if why, err := r.readWindow(ctx, &p, c.Deployed, m.Due, dry); err != nil {
+		if why, err := r.readWindow(ctx, &p, plan, c.Deployed, m.Due, dry); err != nil {
 			return failed(err.Error())
 		} else if why != "" {
 			m.Status, m.Why = "waiting", why
 			return m
 		}
-		if after, err = Tally(ctx, r.Store, plan.Signal, plan.Units, c.Deployed, m.Due, r.Dir); err != nil {
+		if after, err = tallyPlan(ctx, r.Store, plan, c.Deployed, m.Due, r.Dir); err != nil {
 			return failed(err.Error())
 		}
 	}
@@ -422,28 +435,42 @@ func (r *Runner) watch(ctx context.Context, c store.Case, dry bool) (Measured, b
 	if p.Plan.Window <= 0 {
 		return failed(fmt.Errorf("its plan has no window"))
 	}
+	plan, why, err := r.countingPlan(ctx, &p, dry)
+	if err != nil {
+		return failed(err)
+	}
+	if why != "" {
+		m.Status, m.Why = "waiting", why
+		return m, true
+	}
+	if !slices.Equal(p.WatchSources, plan.Sources) {
+		p.WatchSources = slices.Clone(plan.Sources)
+		p.WatchRecent = nil
+		// Recount past windows under the same sources before advancing the watch.
+		p.WatchWindow = 0
+	}
 	if p.State == Landed {
 		if p.Result == nil {
 			// A close from before results were saved ahead of it: recover the window's activity.
-			if why, err := r.readWindow(ctx, &p, c.Deployed, c.Deployed.Add(p.Plan.Window), dry); err != nil {
+			if why, err := r.readWindow(ctx, &p, plan, c.Deployed, c.Deployed.Add(p.Plan.Window), dry); err != nil {
 				return failed(err)
 			} else if why != "" {
 				m.Status, m.Why = "waiting", why
 				return m, true
 			}
-			before := measure.Counts{Hits: p.Plan.Before, Base: p.Plan.BeforeBase}
-			after, err := Tally(ctx, r.Store, p.Plan.Signal, p.Plan.Units, c.Deployed, c.Deployed.Add(p.Plan.Window), r.Dir)
+			before := measure.Counts{Hits: plan.Before, Base: plan.BeforeBase}
+			after, err := tallyPlan(ctx, r.Store, plan, c.Deployed, c.Deployed.Add(p.Plan.Window), r.Dir)
 			if err != nil {
 				return failed(err)
 			}
 			if !measure.Measurable(before, after.Base) {
-				if why, err := r.readWindow(ctx, &p, c.Deployed, c.Deployed.Add(2*p.Plan.Window), dry); err != nil {
+				if why, err := r.readWindow(ctx, &p, plan, c.Deployed, c.Deployed.Add(2*p.Plan.Window), dry); err != nil {
 					return failed(err)
 				} else if why != "" {
 					m.Status, m.Why = "waiting", why
 					return m, true
 				}
-				after, err = Tally(ctx, r.Store, p.Plan.Signal, p.Plan.Units, c.Deployed, c.Deployed.Add(2*p.Plan.Window), r.Dir)
+				after, err = tallyPlan(ctx, r.Store, plan, c.Deployed, c.Deployed.Add(2*p.Plan.Window), r.Dir)
 				if err != nil {
 					return failed(err)
 				}
@@ -466,13 +493,13 @@ func (r *Runner) watch(ctx context.Context, c store.Case, dry bool) (Measured, b
 	ended := int(now.Sub(c.Closed) / p.Plan.Window)
 	for j := p.WatchWindow + 1; j <= ended; j++ {
 		start := c.Closed.Add(time.Duration(j-1) * p.Plan.Window)
-		if why, err := r.readWindow(ctx, &p, start, start.Add(p.Plan.Window), dry); err != nil {
+		if why, err := r.readWindow(ctx, &p, plan, start, start.Add(p.Plan.Window), dry); err != nil {
 			return failed(err)
 		} else if why != "" {
 			m.Status, m.Why = "waiting", why
 			return m, true
 		}
-		recent, err := Tally(ctx, r.Store, p.Plan.Signal, p.Plan.Units, start, start.Add(p.Plan.Window), r.Dir)
+		recent, err := tallyPlan(ctx, r.Store, plan, start, start.Add(p.Plan.Window), r.Dir)
 		if err != nil {
 			return failed(err)
 		}
@@ -480,10 +507,10 @@ func (r *Runner) watch(ctx context.Context, c store.Case, dry bool) (Measured, b
 		if len(p.WatchRecent) > 3 {
 			p.WatchRecent = p.WatchRecent[len(p.WatchRecent)-3:]
 		}
-		if measure.Back(p.Result.Before, p.WatchRecent) {
+		if measure.Back(measure.Counts{Hits: plan.Before, Base: plan.BeforeBase}, p.WatchRecent) {
 			m.Status = "back"
 			m.Why = fmt.Sprintf("%d of %d active hours in window %d, the third consecutive window at its old share since its close (%s), %d of %d before its change",
-				recent.Hits, recent.Base, j, days(p.Plan.Window), p.Result.Before.Hits, p.Result.Before.Base)
+				recent.Hits, recent.Base, j, days(p.Plan.Window), plan.Before, plan.BeforeBase)
 			if dry {
 				return m, true
 			}
@@ -554,4 +581,76 @@ func days(d time.Duration) string {
 		return fmt.Sprintf("%dh", int(d.Hours()))
 	}
 	return fmt.Sprintf("%dd", int(d.Hours()/24))
+}
+
+// liveSources leaves out only readers known to have stopped.
+func (s *Ship) liveSources(sources []string) (live, omitted []string) {
+	for _, source := range sources {
+		if s.SourceLive != nil && !s.SourceLive(source) {
+			omitted = append(omitted, source)
+		} else {
+			live = append(live, source)
+		}
+	}
+	return
+}
+
+func tallyPlan(ctx context.Context, st *store.Store, plan Plan, since, until time.Time, dir string) (measure.Counts, error) {
+	evs, err := Count(ctx, st, plan.Signal, since, until, dir)
+	if err != nil {
+		return measure.Counts{}, err
+	}
+	return tallySources(ctx, st, plan.Signal, plan.Units, evs, since, until, dir, plan.Sources)
+}
+
+// countingPlan recounts the original baseline when a recorded reader stopped. Its sources stay recorded.
+func (r *Runner) countingPlan(ctx context.Context, p *Package, dry bool) (Plan, string, error) {
+	plan := *p.Plan
+	if p.Result != nil {
+		plan.Before, plan.BeforeBase = p.Result.Before.Hits, p.Result.Before.Base
+	}
+	sources := plan.Sources
+	if len(sources) == 0 { // packages counted before sources were recorded
+		var err error
+		sources, err = r.Store.Sources(ctx, plan.Signal.Source, store.ActivityQuery{Since: plan.At.Add(-4 * plan.Window), Until: plan.At, ExcludeCwd: r.Dir})
+		if err != nil {
+			return plan, "", err
+		}
+	}
+	live, omitted := r.Ship.liveSources(sources)
+	plan.Sources = live
+	if !slices.Equal(p.Omitted, omitted) && !dry {
+		detail := "sources left out of both counts: " + strings.Join(omitted, ", ")
+		if len(omitted) == 0 {
+			detail = "all recorded sources are live again"
+		}
+		if err := r.Store.CaseNote(ctx, p.Case, "measurement sources", detail, "loop:measure"); err != nil {
+			return plan, "", err
+		}
+		p.Omitted = omitted
+		if err := r.Ship.save(p); err != nil {
+			return plan, "", err
+		}
+	}
+	if !slices.Contains(live, plan.Signal.Source) {
+		why := "the signal's source stopped: " + plan.Signal.Source
+		if !dry {
+			r.problem(ctx, p, why, "There is no decision while the signal's source is stopped.")
+		}
+		return plan, why, nil
+	}
+	if !dry && strings.HasPrefix(p.Problem, "the signal's source stopped:") {
+		r.resolve(ctx, p)
+	}
+	if len(omitted) > 0 {
+		if why, err := r.readWindow(ctx, p, plan, plan.At.Add(-4*plan.Window), plan.At.Add(-plan.Window), dry); err != nil || why != "" {
+			return plan, why, err
+		}
+		before, err := tallyPlan(ctx, r.Store, plan, plan.At.Add(-4*plan.Window), plan.At.Add(-plan.Window), r.Dir)
+		if err != nil {
+			return plan, "", err
+		}
+		plan.Before, plan.BeforeBase = before.Hits, before.Base
+	}
+	return plan, "", nil
 }

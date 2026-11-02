@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unicode/utf8"
 
 	"github.com/agent-sh/tacit/client/pkg/evidence"
@@ -148,6 +149,7 @@ func (t *tally) fail(path string, err error) {
 }
 
 func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error) {
+	started := time.Now()
 	ready, records, redact := s.ready, s.records, s.redact
 	if ready == nil {
 		ready = evidence.RedactionReady
@@ -272,6 +274,25 @@ func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error
 	sort.Strings(t.res.Notes)
 	if err := ctx.Err(); err != nil {
 		return t.res, err
+	}
+	if len(t.failed) > 0 && listed {
+		newest := time.Time{}
+		known := true
+		for path := range t.failed {
+			info, err := os.Stat(path)
+			if err != nil {
+				known = false
+				break
+			}
+			if info.ModTime().After(newest) {
+				newest = info.ModTime()
+			}
+		}
+		if known {
+			if err := st.MarkPartialRead(ctx, s.Name(), started, newest); err != nil {
+				return t.res, err
+			}
+		}
 	}
 	if len(t.failed) > 0 {
 		return t.res, fmt.Errorf("%d of %d files not stored past their cursor", len(t.failed), len(jobs))

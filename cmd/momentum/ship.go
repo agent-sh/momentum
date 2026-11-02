@@ -76,6 +76,9 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	defer st.Close()
 	_, ship, err := setup(st, c.Loop)
+	if err == nil {
+		ship.SourceLive = c.SourceLive
+	}
 	if err != nil {
 		return err
 	}

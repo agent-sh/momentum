@@ -182,7 +182,7 @@ func binomial(n int, p float64) []float64 {
 
 // A fixed seed pins false comebacks of a halved problem and detection at the old share, even after quiet windows.
 func TestWatchingThreeWindowsSeparatesAHalvedProblemFromAReturn(t *testing.T) {
-	for _, old := range []int{10, 6, 5, 4} {
+	for _, old := range []int{10, 6, 5, 4, 3, 2} {
 		falseRate := watchRate(old, float64(old)/200, 26, 0)
 		detection := watchRate(old, float64(old)/100, 26, 0)
 		late := watchRate(old, float64(old)/100, 26, 26)
@@ -197,8 +197,8 @@ func TestWatchingThreeWindowsSeparatesAHalvedProblemFromAReturn(t *testing.T) {
 		if early < 0.35 || early > 0.50 {
 			t.Errorf("six-window detection %.4f", early)
 		}
-		want := map[int]float64{10: 0.001, 6: 0.013, 5: 0.028, 4: 0.058}[old]
-		if math.Abs(falseRate-want) > 0.005 {
+		want := map[int]float64{10: 0.00052, 6: 0.01165, 5: 0.02563, 4: 0.05700, 3: 0.129, 2: 0.293}[old]
+		if math.Abs(falseRate-want) > 5*math.Sqrt(want*(1-want)/100000)+0.0005 {
 			t.Errorf("halved comeback %.4f differs from %.4f", falseRate, want)
 		}
 	}
@@ -325,6 +325,111 @@ func TestWholeWeeksKeepTheWeeklyCycleBelowFivePercent(t *testing.T) {
 		t.Logf("weekday %.0f%%, weekend %.0f%%: %d admitted, false keep %.3f%%", 100*cycle[0], 100*cycle[1], admitted, 100*rate)
 		if admitted < 39000 || rate > 0.05 || rate < 0.025 {
 			t.Fatalf("weekly cycle: %d admitted, %.4f kept", admitted, rate)
+		}
+	}
+}
+
+// The watch compares with the baseline as counted, conditional on admission and a successful measurement.
+// Each rate uses the actual kept sample size for its five-standard-error tolerance.
+func TestWatchRatesIncludeTheCountedBaselineAndKeep(t *testing.T) {
+	for _, tc := range []struct {
+		old                    float64
+		removed                bool
+		false26, back26, back6 float64
+	}{
+		{0.10, true, 0, 0.741, 0.374},
+		{0.10, false, 0.0041, 0.597, 0.245},
+		{0.06, false, 0.0153, 0, 0},
+		{0.05, false, 0.0276, 0, 0},
+		{0.04, false, 0.0481, 0, 0},
+	} {
+		rng := rand.New(rand.NewSource(2026))
+		cdf := func(n int, p float64) []float64 {
+			v := binomial(n, p)
+			for i := 1; i < len(v); i++ {
+				v[i] += v[i-1]
+			}
+			return v
+		}
+		baseCDF, gateCDF := cdf(300, tc.old), cdf(100, tc.old)
+		afterShare := tc.old / 2
+		if tc.removed {
+			afterShare = 0
+		}
+		afterCDF := map[int][]float64{100: cdf(100, afterShare), 200: cdf(200, afterShare)}
+		watchCDF, halfCDF := cdf(100, tc.old), cdf(100, tc.old/2)
+		draw := func(c []float64) int { return sort.SearchFloat64s(c, rng.Float64()) }
+		bases := map[int]int{}
+		keptByCounts := map[[2]int]bool{}
+		known := map[[2]int]bool{}
+		kept, false26, back26, back6 := 0, 0, 0, 0
+		const draws = 400000
+		for i := 0; i < draws; i++ {
+			before := Counts{draw(baseCDF), 300}
+			if draw(gateCDF) < MinBefore {
+				continue
+			}
+			n, ok := bases[before.Hits]
+			if !ok {
+				if Measurable(before, 200) {
+					n = 100
+					if !Measurable(before, 100) {
+						n = 200
+					}
+				}
+				bases[before.Hits] = n
+			}
+			if n == 0 {
+				continue
+			}
+			after := Counts{draw(afterCDF[n]), n}
+			key := [2]int{before.Hits, after.Hits}
+			if !known[key] {
+				res, _ := Compare(before, after)
+				keptByCounts[key] = res.Improved
+				known[key] = true
+			}
+			if !keptByCounts[key] {
+				continue
+			}
+			kept++
+			watch := func(c []float64) int {
+				recent := make([]Counts, 0, 3)
+				for j := 1; j <= 26; j++ {
+					recent = append(recent, Counts{draw(c), 100})
+					if len(recent) > 3 {
+						recent = recent[1:]
+					}
+					if Back(before, recent) {
+						return j
+					}
+				}
+				return 0
+			}
+			if j := watch(watchCDF); j > 0 {
+				back26++
+				if j <= 6 {
+					back6++
+				}
+			}
+			if watch(halfCDF) > 0 {
+				false26++
+			}
+		}
+		pin := func(name string, hits int, want float64) {
+			got := float64(hits) / float64(kept)
+			tolerance := 5*math.Sqrt(want*(1-want)/float64(kept)) + 0.0005 // reference rounded to a tenth of a percent
+			t.Logf("old %.0f%% removed %v: %s %.3f%% (%d kept), tolerance %.3f%%", 100*tc.old, tc.removed, name, 100*got, kept, 100*tolerance)
+			if math.Abs(got-want) > tolerance {
+				t.Errorf("%s %.5f, want %.5f +/- %.5f", name, got, want, tolerance)
+			}
+		}
+		if tc.back26 > 0 {
+			pin("return in 26", back26, tc.back26)
+			pin("return in six", back6, tc.back6)
+		}
+		if !tc.removed {
+			pin("halved comeback", false26, tc.false26)
 		}
 	}
 }

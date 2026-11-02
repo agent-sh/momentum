@@ -198,7 +198,7 @@ func TestPhaseChangesAreKeptAsEvents(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, errOut.String())
 	}
 	var e store.Event
-	if err := json.Unmarshal(out.Bytes(), &e); err != nil || e.Kind != "vanished" || !strings.Contains(e.Meta, `"from":"idle"`) || e.Cwd != "" {
+	if err := json.Unmarshal(out.Bytes(), &e); err != nil || e.Kind != "vanished" || !strings.Contains(e.Meta, `"from":"idle"`) || e.Cwd != "/w/parser" {
 		t.Fatalf("json %s: %v", out.String(), err)
 	}
 }

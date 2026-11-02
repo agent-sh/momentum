@@ -155,3 +155,21 @@ func Load() (Sources, error) {
 	s.Loop.MCP = paths.Expand(s.Loop.MCP)
 	return s, nil
 }
+
+// SourceLive reports which configured readers can still contribute to a measurement.
+func (s Sources) SourceLive(source string) bool {
+	switch source {
+	case "mistakes":
+		return s.Mistakes.Path != ""
+	case "radar":
+		return s.Radar.Path != ""
+	case "incidents":
+		return s.Incidents.Dir != ""
+	case "transcripts":
+		return len(s.Transcripts.Homes) > 0
+	case "supervise":
+		return !s.Supervise.Off
+	default:
+		return true // sessions and capacity are commands, not configured ingest paths
+	}
+}

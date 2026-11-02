@@ -82,7 +82,7 @@ func TestTheLoopDirectoryIsExcludedThroughItsSymlink(t *testing.T) {
 	}
 }
 
-// Readiness uses successful cursor updates, not event times or write times. An equal boundary is not past it,
+// Readiness uses successful run starts, not event times or write times. An equal boundary is not past it,
 // a quiet successful read is sufficient, and a different source's activity has its own requirement.
 func TestWindowReadinessUsesEverySourcesSuccessfulRead(t *testing.T) {
 	st, _ := open(t)
@@ -113,6 +113,10 @@ func TestWindowReadinessUsesEverySourcesSuccessfulRead(t *testing.T) {
 	if err := st.SetCursor(ctx, Sessions, "complete"); err != nil {
 		t.Fatal(err)
 	}
+	check("sessions")
+	if err := st.MarkRead(ctx, Sessions, end.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
 	check("")
 	if err := st.MarkRead(ctx, Transcripts, start); err != nil {
 		t.Fatal(err)
@@ -123,4 +127,29 @@ func TestWindowReadinessUsesEverySourcesSuccessfulRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("") // no sessions-source event is in the owner's activity
+}
+
+// Rebuilding drops complete and per-run read records atomically with the source's events and cursors.
+func TestRebuildDropsAllSourceReadRecords(t *testing.T) {
+	st, _ := open(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := st.MarkRead(ctx, "mistakes", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkPartialRead(ctx, "mistakes", now, now.Add(-48*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkRead(ctx, "mistakes-file", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Rebuild(ctx, "mistakes", false); err != nil {
+		t.Fatal(err)
+	}
+	for _, source := range []string{"mistakes", "mistakes-file"} {
+		at, err := st.ReadWindowThrough(ctx, source, now.Add(-24*time.Hour))
+		if err != nil || !at.IsZero() {
+			t.Fatalf("read record survived for %s: %v %v", source, at, err)
+		}
+	}
 }

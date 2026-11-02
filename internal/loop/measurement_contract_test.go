@@ -20,6 +20,13 @@ func TestUnreadWindowsWaitForEveryCountedSource(t *testing.T) {
 	for _, activity := range []bool{false, true} {
 		t.Run(fmt.Sprint(activity), func(t *testing.T) {
 			m := measuredCaseWithRead(t, false)
+			if activity {
+				p, _, _ := m.r.Ship.Load(m.c.ID)
+				p.Plan.Sources = []string{store.Transcripts, store.Sessions}
+				if err := m.r.Ship.save(&p); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if err := m.st.MarkRead(ctx, store.Transcripts, m.clock); err != nil {
 				t.Fatal(err)
 			}
@@ -70,6 +77,11 @@ func TestUnreadWindowsWaitForEveryCountedSource(t *testing.T) {
 func TestActivityAndWatchWaitForTheirSources(t *testing.T) {
 	ctx := context.Background()
 	m := measuredCaseWithRead(t, false)
+	p, _, _ := m.r.Ship.Load(m.c.ID)
+	p.Plan.Sources = []string{store.Transcripts, store.Sessions}
+	if err := m.r.Ship.save(&p); err != nil {
+		t.Fatal(err)
+	}
 	m.measure(t, Options{})
 	start := m.clock
 	ev := store.Event{Source: store.Sessions, SourceKey: "phase", Session: "phase", Actor: store.ActorHarness, Kind: "phase", TS: start}
@@ -98,7 +110,7 @@ func TestActivityAndWatchWaitForTheirSources(t *testing.T) {
 	if got := m.measure(t, Options{Dry: true}); got.Status != "waiting" {
 		t.Fatalf("dry watch: %+v", got)
 	}
-	p, _, _ := m.r.Ship.Load(m.c.ID)
+	p, _, _ = m.r.Ship.Load(m.c.ID)
 	if p.WatchWindow != 0 || !p.ReadWait.IsZero() {
 		t.Fatal("dry unread watch saved")
 	}
@@ -115,6 +127,9 @@ func TestActivityAndWatchWaitForTheirSources(t *testing.T) {
 		t.Fatal("watch stall has no note")
 	}
 	if err := m.st.MarkRead(ctx, store.Transcripts, m.clock); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.st.MarkRead(ctx, store.Sessions, m.clock); err != nil {
 		t.Fatal(err)
 	}
 	if got := m.measure(t, Options{}); got.Status != "back" {
@@ -334,7 +349,7 @@ func TestMeasurementDocsStateTheConditionalRates(t *testing.T) {
 		t.Fatal(err)
 	}
 	spec := string(raw)
-	for _, text := range []string{"36.8%, 14.4% and 6.7%", "14.6% at 100 units", "five-hit gate makes admission rare", "5.8% from 4% to 2%", "at least 90% pinned", "whole number of weeks"} {
+	for _, text := range []string{"36.8%, 14.4% and 6.7%", "14.6% at 100 units", "five-hit gate makes admission rare", "0.41%, 1.53%, 2.76% and 4.81%", "0.052%, 1.165%, 2.563% and 5.700%", "12.9% and 29.3%", "count per window", "74.1%", "37.4%", "59.7%", "24.5%", "4.0%, 6.8% and 9.6%", "5.3%, 10.2% and 16.4%", "whole number of weeks"} {
 		if !strings.Contains(spec, text) {
 			t.Errorf("SPEC omits %q", text)
 		}
@@ -349,16 +364,14 @@ func TestMeasurementDocsStateTheConditionalRates(t *testing.T) {
 	}
 }
 
-// A proposal keeps its original boundary while ingestion catches up. Waiting a window raises one passive note,
-// and the next successful read lets the same proposal proceed without chasing the next run's time.
-func TestAProposalKeepsItsBoundaryWhileTheStoreCatchesUp(t *testing.T) {
+// A stale proposal waits with one passive note. A later complete read gives it a new counted boundary.
+func TestAWaitingProposalTakesANewCompleteBoundary(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	f := newRepo(t, nil)
 	s := shipFor(t, st, f)
-	c := testingCase(t, st)
-	clock := time.Now().Add(2 * 24 * time.Hour).Truncate(time.Millisecond)
-	at := clock
+	c := testingCaseReadAt(t, st, time.Now().Add(-30*24*time.Hour))
+	clock := time.Now().Add(-20 * 24 * time.Hour).Truncate(time.Millisecond)
 	s.Now = func() time.Time { return clock }
 	p, err := s.Prepare(ctx, c.ID, f.main)
 	if err != nil {
@@ -372,7 +385,7 @@ func TestAProposalKeepsItsBoundaryWhileTheStoreCatchesUp(t *testing.T) {
 	proposal := Proposal{Title: "Correct the answer", Body: "Return the expected value.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}
 	for i := 0; i < 2; i++ {
 		p, err = s.Propose(ctx, c.ID, proposal)
-		if err == nil || !strings.Contains(err.Error(), "has not read") || !p.ProposalAt.Equal(at) || p.State != Checked {
+		if err == nil || !strings.Contains(err.Error(), "has not read") || !p.ProposalAt.Equal(clock) || p.State != Checked {
 			t.Fatalf("waiting proposal: %+v %v", p, err)
 		}
 		clock = clock.Add(7 * 24 * time.Hour)
@@ -389,11 +402,20 @@ func TestAProposalKeepsItsBoundaryWhileTheStoreCatchesUp(t *testing.T) {
 	if !ns[0].Done.IsZero() {
 		t.Fatal("waiting proposal's note resolved")
 	}
+	fresh := hours(t, st, "fresh", clock.Add(-24*time.Hour), 23*time.Hour, 100, 10)
+	hours(t, st, "fresh-base", clock.Add(-28*24*time.Hour), 21*24*time.Hour, 300, 30)
+	finding := store.Finding{Family: c.Family, Signature: "failures/v1:zz", Title: c.Title}
+	for _, e := range fresh[:10] {
+		finding.Evidence = append(finding.Evidence, store.Evidence{Ref: "ev:" + e.ID()})
+	}
+	if _, _, err := st.ObserveCase(ctx, finding, "test"); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.MarkRead(ctx, store.Transcripts, clock); err != nil {
 		t.Fatal(err)
 	}
 	p, err = s.Propose(ctx, c.ID, proposal)
-	if err != nil || p.State != Proposed || !p.Plan.At.Equal(at) || !p.ProposalAt.IsZero() || !p.ReadWait.IsZero() {
+	if err != nil || p.State != Proposed || !p.Plan.At.Equal(clock.Add(-time.Millisecond)) || !p.ProposalAt.IsZero() || !p.ReadWait.IsZero() {
 		t.Fatalf("read proposal: %+v %v", p, err)
 	}
 	ns, _ = st.Notes(ctx)

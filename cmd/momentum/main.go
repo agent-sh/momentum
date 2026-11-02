@@ -99,7 +99,7 @@ const usage = `usage:
                                         whole-week window after against the three windows before the gate, once
                                         their sources have read them, by its signal's share of the
                                         active hours; improved closes its case and keeps the change, no effect
-                                        rolls it back; three read watch windows at its old share bring it back
+                                        rolls it back; three consecutive read windows at its old share with five hits among them bring it back
   momentum loop runs [--since WHEN] [--case ID] [--json]
                                         the loop's runs, and what the live ones spent in the last day and week
   momentum loop lesson --case ID --text T

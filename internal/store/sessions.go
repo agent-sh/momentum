@@ -37,7 +37,7 @@ func (s *Store) SaveSessionStamps(ctx context.Context, st state.Stamps) error {
 }
 
 func loadStamps(ctx context.Context, q querier) (state.Stamps, error) {
-	rows, err := q.QueryContext(ctx, `SELECT key, phase, since, seq, seen, tool, name, auto, ask, ask_kind FROM session_stamps`)
+	rows, err := q.QueryContext(ctx, `SELECT key, phase, since, seq, seen, tool, name, auto, ask, ask_kind, cwd FROM session_stamps`)
 	if err != nil {
 		return nil, err
 	}
@@ -47,7 +47,7 @@ func loadStamps(ctx context.Context, q querier) (state.Stamps, error) {
 		var key, phase, askKind string
 		var since, seen int64
 		var r state.Stamp
-		if err := rows.Scan(&key, &phase, &since, &r.Seq, &seen, &r.Tool, &r.Name, &r.Auto, &r.Ask, &askKind); err != nil {
+		if err := rows.Scan(&key, &phase, &since, &r.Seq, &seen, &r.Tool, &r.Name, &r.Auto, &r.Ask, &askKind, &r.Cwd); err != nil {
 			return nil, err
 		}
 		r.Phase, r.AskKind, r.Since, r.Seen = sessions.Phase(phase), sessions.AskKind(askKind), time.UnixMilli(since), time.UnixMilli(seen)
@@ -61,9 +61,9 @@ func saveStamps(ctx context.Context, q querier, st state.Stamps) error {
 		return err
 	}
 	for k, r := range st {
-		if _, err := q.ExecContext(ctx, `INSERT INTO session_stamps (key, phase, since, seq, seen, tool, name, auto, ask, ask_kind)
-		  VALUES (?,?,?,?,?,?,?,?,?,?)`, k, string(r.Phase), r.Since.UnixMilli(), r.Seq, r.Seen.UnixMilli(), r.Tool, r.Name, r.Auto,
-			r.Ask, string(r.AskKind)); err != nil {
+		if _, err := q.ExecContext(ctx, `INSERT INTO session_stamps (key, phase, since, seq, seen, tool, name, auto, ask, ask_kind, cwd)
+		  VALUES (?,?,?,?,?,?,?,?,?,?,?)`, k, string(r.Phase), r.Since.UnixMilli(), r.Seq, r.Seen.UnixMilli(), r.Tool, r.Name, r.Auto,
+			r.Ask, string(r.AskKind), r.Cwd); err != nil {
 			return err
 		}
 	}

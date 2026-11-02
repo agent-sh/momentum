@@ -1017,6 +1017,9 @@ func TestAPlanMeasuresTheCasesOwnProblem(t *testing.T) {
 	if _, err := st.Put(ctx, []store.Event{{Source: store.Incidents, SourceKey: "inc@1", TS: now.Add(-2 * time.Hour), Actor: store.ActorHarness, Kind: "incident", Summary: "zz-incident-text"}}); err != nil {
 		t.Fatal(err)
 	}
+	if err := st.MarkRead(ctx, store.Incidents, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	week := 7 * 24 * time.Hour
 	other := Signal{Source: store.Transcripts, Kinds: []string{"tool_result"}, Tool: "Bash", Match: []string{"zz-other-text"}}
 	if _, err := s.validPlan(ctx, c, other, week, "", now); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "does not measure the case's problem") {

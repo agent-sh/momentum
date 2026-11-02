@@ -90,7 +90,7 @@ func TestMeasurementHelpNamesTheCurrentContract(t *testing.T) {
 	}
 	_, out, errOut := momentum("--help")
 	text := out + errOut
-	if !strings.Contains(text, "three windows before the gate") || !strings.Contains(text, "three read watch windows") {
+	if !strings.Contains(text, "three windows before the gate") || !strings.Contains(text, "three consecutive read windows") || !strings.Contains(text, "five hits among them") {
 		t.Fatalf("measure help: %s", text)
 	}
 }
