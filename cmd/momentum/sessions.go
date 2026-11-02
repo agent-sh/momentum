@@ -128,6 +128,11 @@ func board(ctx context.Context, w *sessions.World, snapErr error, st *store.Stor
 	if err != nil {
 		return nil, nil, err
 	}
+	if scanErr == nil && snapErr == nil {
+		if err := st.MarkRead(ctx, store.Sessions, w.Now); err != nil {
+			return nil, nil, err
+		}
+	}
 	sort.SliceStable(ss, func(i, j int) bool {
 		if a, b := sessions.Order[ss[i].Phase], sessions.Order[ss[j].Phase]; a != b {
 			return a < b

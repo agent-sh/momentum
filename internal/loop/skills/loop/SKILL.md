@@ -35,10 +35,11 @@ A change package is built only with the ship tool. Its gates are the loop's auth
 1. `momentum ship prepare --repo DIR`, DIR a checkout of a repository the loop may write to. It prints the work tree. Edit only there. The loop changes repositories only, through pull requests: never a configuration in place.
 2. Write the test first: one that fails without the change and passes with it. Then the change: the smallest that removes the mechanism.
 3. `momentum ship check --test "go test ./internal/x -run TestY"` runs the test in a sandbox, without the change (with the test's own files) and with it. It must fail first and pass second.
-4. `momentum ship propose --title "..." --body-file FILE --rollback "..." --signal JSON --window D --lesson "..."`, FILE a file you wrote in your own directory:
+4. `momentum ship propose --title "..." --body-file FILE --rollback "..." --signal JSON --window D [--installed FILE] --lesson "..."`, FILE a file you wrote in your own directory:
    - the body says what changes, why, the evidence, and the prior art you found; what it posts is scrubbed of secrets, and its mentions and issue references are made inert;
    - the signal counts the problem in the store (`{"source":"transcripts","kinds":["tool_result"],"tool":"Bash","match":["text the failure holds"]}`), over the case's own events: never the words your change rewrites;
-   - choose the shortest window D whose gate and baseline accept the plan: a day for a problem seen daily, longer for a rarer one; the baseline is the three windows before the gated one, and measurement ends one window after the change is in effect, or two when the first is too quiet;
+   - pass `--installed FILE` when the machine runs the change from a file built or installed from the repository (a binary, an installed configuration); name the file it runs;
+   - choose a week, or two for a rarer problem, in whole weeks; the baseline is the three windows before the gated one, and measurement ends one window after the change is in effect, or two when the first is too quiet;
    - the lesson is one sentence of what the case taught, true whatever the measurement shows, with the conditions it holds under.
 5. The loop then reviews the proposal in a clean context and lands it when the review finds nothing high or medium. A review that finds something sends the case back to you, with the review in `review.md`: revise the change in the same work tree for what it found, `ship check` it again and `ship propose` it again, which updates the same pull request. Three review rounds at most.
 

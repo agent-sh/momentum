@@ -127,6 +127,8 @@ func (sv *Supervisor) now() time.Time {
 // session the scan read only in part is left alone. Then it keeps the report's notes about the sessions in step
 // (notes). It returns the run's decisions.
 func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts map[int]uint64) ([]Line, error) {
+	readAt := sv.now()
+	complete := true
 	var lines []Line
 	probe := sv.Probe
 	seen := map[string]*seenSession{}
@@ -134,6 +136,7 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 	for _, s := range ss {
 		now := sv.now()
 		if s.Partial {
+			complete = false
 			seen[s.Key] = nil // its facts may be short: decide on the next scan, and keep its notes as they are
 			if err := sv.put(ctx, []store.Event{sv.note(s, KindSkip, "partial", now, "the scan read it only in part: decided on the next scan")}); err != nil {
 				return lines, err
@@ -273,7 +276,13 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 		}
 		lines = append(lines, line)
 	}
-	return lines, sv.notes(ctx, seen)
+	if err := sv.notes(ctx, seen); err != nil {
+		return lines, err
+	}
+	if complete {
+		return lines, sv.Store.MarkRead(ctx, store.Supervise, readAt)
+	}
+	return lines, nil
 }
 
 // note is a supervise event about a session that is no rule's decision: a session left for the next scan, a

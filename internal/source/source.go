@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -43,7 +44,11 @@ type Outcome struct {
 func RunAll(ctx context.Context, st *store.Store, sources []Source) []Outcome {
 	out := make([]Outcome, 0, len(sources))
 	for _, s := range sources {
+		started := time.Now()
 		r, err := s.Ingest(ctx, st)
+		if err == nil {
+			err = st.MarkRead(ctx, s.Name(), started)
+		}
 		out = append(out, Outcome{Name: s.Name(), Result: r, Err: err})
 	}
 	return out

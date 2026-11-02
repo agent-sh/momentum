@@ -727,8 +727,18 @@ func TestTranscriptsReadHermesSessionsByTheirLastRow(t *testing.T) {
 		if err := os.Chmod(path, 0); err != nil {
 			t.Fatal(err)
 		}
-		if r := ingest(t, src, st); len(r.Notes) != 1 || !strings.Contains(r.Notes[0], "hermes store") {
-			t.Fatalf("an unreadable store must be named: %+v", r)
+		ctx := context.Background()
+		before, err := st.ReadThrough(ctx, store.Transcripts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		outcomes := RunAll(ctx, st, []Source{src})
+		if len(outcomes) != 1 || outcomes[0].Err == nil || len(outcomes[0].Notes) != 1 || !strings.Contains(outcomes[0].Notes[0], "hermes store") {
+			t.Fatalf("an unreadable store must fail its complete read: %+v", outcomes)
+		}
+		after, err := st.ReadThrough(ctx, store.Transcripts)
+		if err != nil || !after.Equal(before) {
+			t.Fatalf("an incomplete read advanced: %v %v", after, err)
 		}
 		if err := os.Chmod(path, 0o600); err != nil {
 			t.Fatal(err)

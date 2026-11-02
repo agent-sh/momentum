@@ -955,10 +955,7 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 	if q.Source != "" {
 		where, args = append(where, "source = ?"), append(args, q.Source)
 	}
-	if q.ExcludeCwd != "" {
-		prefix := strings.TrimRight(q.ExcludeCwd, "/") + "/"
-		where, args = append(where, "cwd != ? AND instr(cwd, ?) != 1"), append(args, strings.TrimRight(q.ExcludeCwd, "/"), prefix)
-	}
+	where, args = excludeDirectory(where, args, q.ExcludeCwd)
 	if q.Harness != "" {
 		where, args = append(where, "harness = ?"), append(args, q.Harness)
 	}

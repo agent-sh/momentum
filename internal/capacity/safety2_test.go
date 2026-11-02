@@ -348,3 +348,27 @@ func TestASlowCreepIsNoFastFill(t *testing.T) {
 		t.Fatalf("0.2 GiB an hour is no fast fill, even with the line due in %s: %+v", d.FullIn, d)
 	}
 }
+
+// A recorded capacity run is a complete observation of its generated events. A dry run advances no source read.
+func TestOnlyARecordedCapacityRunAdvancesItsReadTime(t *testing.T) {
+	ctx := context.Background()
+	f := newModels(t)
+	st := openStore(t)
+	opt := options(t, procRoot(t), f.now, nil)
+	opt.DryRun = true
+	if _, err := Run(ctx, f.cfg, st, opt); err != nil {
+		t.Fatal(err)
+	}
+	read, err := st.ReadThrough(ctx, store.Capacity)
+	if err != nil || !read.IsZero() {
+		t.Fatalf("dry: %v %v", read, err)
+	}
+	opt.DryRun = false
+	if _, err := Run(ctx, f.cfg, st, opt); err != nil {
+		t.Fatal(err)
+	}
+	read, err = st.ReadThrough(ctx, store.Capacity)
+	if err != nil || !read.Equal(f.now.Truncate(time.Millisecond)) {
+		t.Fatalf("recorded: %v %v", read, err)
+	}
+}

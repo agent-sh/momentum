@@ -57,15 +57,9 @@ func Tally(ctx context.Context, st *store.Store, sig Signal, units string, since
 
 // tally is Tally over the events the signal counted already. The activity holds every unit the signal counts.
 func tally(ctx context.Context, st *store.Store, sig Signal, units string, evs []store.Event, since, until time.Time, excludeCwd string) (measure.Counts, error) {
-	q := store.ActivityQuery{Since: since, Until: until, ExcludeCwd: excludeCwd}
-	switch units {
-	case SessionHours:
-		q.BySession, q.Harness = true, sig.Harness
-	case OwnerHours:
-		q.BySession, q.Harness, q.Actor = true, sig.Harness, store.ActorOwner
-	case MachineHours:
-	default:
-		return measure.Counts{}, fmt.Errorf("a measurement in %q: %s, %s or %s", units, SessionHours, OwnerHours, MachineHours)
+	q, err := activityQuery(sig, units, since, until, excludeCwd)
+	if err != nil {
+		return measure.Counts{}, err
 	}
 	base, err := st.Activity(ctx, q)
 	if err != nil {
@@ -82,6 +76,61 @@ func tally(ctx context.Context, st *store.Store, sig Signal, units string, evs [
 	return measure.Counts{Hits: len(hits), Base: len(base)}, nil
 }
 
+// activityQuery picks the same activity for a tally and its source-read check.
+func activityQuery(sig Signal, units string, since, until time.Time, excludeCwd string) (store.ActivityQuery, error) {
+	q := store.ActivityQuery{Since: since, Until: until, ExcludeCwd: excludeCwd}
+	switch units {
+	case SessionHours:
+		q.BySession, q.Harness = true, sig.Harness
+	case OwnerHours:
+		q.BySession, q.Harness, q.Actor = true, sig.Harness, store.ActorOwner
+	case MachineHours:
+	default:
+		return store.ActivityQuery{}, fmt.Errorf("a measurement in %q: %s, %s or %s", units, SessionHours, OwnerHours, MachineHours)
+	}
+	return q, nil
+}
+
+func unreadWindow(ctx context.Context, st *store.Store, plan Plan, since, until time.Time, dir string) ([]string, error) {
+	q, err := activityQuery(plan.Signal, plan.Units, since, until, dir)
+	if err != nil {
+		return nil, err
+	}
+	return st.UnreadSources(ctx, plan.Signal.Source, q)
+}
+
+// readWindow holds a decision until every source counted has read past its end.
+func (r *Runner) readWindow(ctx context.Context, p *Package, since, until time.Time, dry bool) (string, error) {
+	unread, err := unreadWindow(ctx, r.Store, *p.Plan, since, until, r.Dir)
+	if err != nil {
+		return "", err
+	}
+	if len(unread) == 0 {
+		if !dry && !p.ReadWait.IsZero() && !until.Before(p.ReadUntil) {
+			p.ReadWait, p.ReadUntil = time.Time{}, time.Time{}
+			r.resolve(ctx, p)
+			if err := r.Ship.save(p); err != nil {
+				return "", err
+			}
+		}
+		return "", nil
+	}
+	why := "the store has not read past the window's end: " + strings.Join(unread, ", ")
+	if !dry {
+		if p.ReadWait.IsZero() {
+			p.ReadWait = r.now()
+		}
+		p.ReadUntil = until
+		if err := r.Ship.save(p); err != nil {
+			return "", err
+		}
+		if !r.now().Before(p.ReadWait.Add(p.Plan.Window)) {
+			r.problem(ctx, p, "the store is behind on "+strings.Join(unread, ", "), why)
+		}
+	}
+	return why, nil
+}
+
 // takes reports whether a run narrowed to a case or to families takes this case.
 func (o Options) takes(c store.Case) bool {
 	return (o.Case == "" || c.ID == o.Case) && (len(o.Families) == 0 || slices.Contains(o.Families, c.Family))
@@ -90,7 +139,7 @@ func (o Options) takes(c store.Case) bool {
 // Measure is the measure step, deterministic. A deployed case starts measuring once its change is in effect (the
 // repository's checkout holds it, and the file it is installed in changed after the checkout took the change), with its plan's
 // window and count before; until then it waits, and a problem note says so after a window. A measuring case whose
-// window after its change has ended is measured against the window before it: one whose share of the activity fell
+// window after its change has ended and been read is measured against its independent baseline: one whose share fell
 // beyond chance (measure.Compare) closes as improved, its change kept, with a shipped note of what it did; one
 // whose share did not has its change rolled back, with a decided note. A window after too quiet for any count to
 // show an effect (measure.Measurable) waits one more window, then counts both; still too quiet, the change is
@@ -102,6 +151,8 @@ func (r *Runner) Measure(ctx context.Context, o Options) ([]Measured, error) {
 	if err != nil {
 		return nil, err
 	}
+	var out []Measured
+	bad := map[string]bool{}
 	if !o.Dry {
 		notes, err := r.Store.Notes(ctx)
 		if err != nil {
@@ -114,27 +165,43 @@ func (r *Runner) Measure(ctx context.Context, o Options) ([]Measured, error) {
 			}
 			c, err := r.Store.CaseByID(ctx, id)
 			if err != nil {
-				return nil, err
-			}
-			if !o.takes(c) || c.Status == store.CaseDeployed || c.Status == store.CaseMeasuring {
+				if o.Case == "" || o.Case == id {
+					out = append(out, Measured{Case: id, Status: "failed", Why: err.Error()})
+					r.logf("note %s: %v", n.ID, err)
+					bad[id] = true
+				}
 				continue
 			}
-			if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
-				return nil, err
+			if !o.takes(c) || c.Status == store.CaseDeployed || c.Status == store.CaseMeasuring || (c.Status == store.CaseClosed && c.Reason == store.Improved) {
+				continue
 			}
-			if p, ok, err := r.Ship.Load(id); err != nil {
-				return nil, err
-			} else if ok {
-				p.Problem = ""
-				if err := r.Ship.save(&p); err != nil {
-					return nil, err
+			cleanup := func() error {
+				p, ok, err := r.Ship.Load(id)
+				if err != nil {
+					return err
 				}
+				if !p.ProposalAt.IsZero() && !p.ReadWait.IsZero() {
+					return nil
+				}
+				if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
+					return err
+				}
+				if ok {
+					p.Problem = ""
+					return r.Ship.save(&p)
+				}
+				return nil
 			}
+			if err := cleanup(); err != nil {
+				out = append(out, Measured{Case: id, Title: c.Title, Status: "failed", Why: err.Error()})
+				bad[id] = true
+				r.logf("note %s: %v", n.ID, err)
+			}
+
 		}
 	}
-	var out []Measured
 	for _, c := range cs {
-		if o.takes(c) {
+		if o.takes(c) && !bad[c.ID] {
 			out = append(out, r.measureCase(ctx, c, o.Dry))
 		}
 	}
@@ -143,7 +210,7 @@ func (r *Runner) Measure(ctx context.Context, o Options) ([]Measured, error) {
 		return out, err
 	}
 	for _, c := range closed {
-		if c.Reason == store.Improved && o.takes(c) {
+		if c.Reason == store.Improved && o.takes(c) && !bad[c.ID] {
 			if m, ok := r.watch(ctx, c, o.Dry); ok {
 				out = append(out, m)
 			}
@@ -180,9 +247,14 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 	}
 	plan := *p.Plan
 	now := r.now()
-	since, why, err := r.Ship.InEffect(ctx, p)
+	since, why, err := r.Ship.InEffect(ctx, &p)
 	if err != nil {
 		return failed(err.Error())
+	}
+	if !dry {
+		if err := r.Ship.save(&p); err != nil {
+			return failed(err.Error())
+		}
 	}
 	if why != "" {
 		m.Status, m.Why = "waiting", "its change is not in effect: "+why
@@ -228,6 +300,12 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		m.Status = "waiting"
 		return m
 	}
+	if why, err := r.readWindow(ctx, &p, c.Deployed, m.Due, dry); err != nil {
+		return failed(err.Error())
+	} else if why != "" {
+		m.Status, m.Why = "waiting", why
+		return m
+	}
 	before := measure.Counts{Hits: plan.Before, Base: plan.BeforeBase}
 	after, err := Tally(ctx, r.Store, plan.Signal, plan.Units, c.Deployed, m.Due, r.Dir)
 	if err != nil {
@@ -238,6 +316,12 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		if now.Before(m.Due) {
 			m.Status, m.Why = "waiting", fmt.Sprintf("its window after was too quiet to show anything (%d active hours, after %d of %d before): it waits one more window",
 				after.Base, before.Hits, before.Base)
+			return m
+		}
+		if why, err := r.readWindow(ctx, &p, c.Deployed, m.Due, dry); err != nil {
+			return failed(err.Error())
+		} else if why != "" {
+			m.Status, m.Why = "waiting", why
 			return m
 		}
 		if after, err = Tally(ctx, r.Store, plan.Signal, plan.Units, c.Deployed, m.Due, r.Dir); err != nil {
@@ -324,7 +408,7 @@ func (r *Runner) rollbackFailed(ctx context.Context, c store.Case, cause error) 
 }
 
 // watch finishes an interrupted keep, then reads each ended window since the close once. The windows do not
-// overlap. Back spends a shrinking test level over them, so repeated runs do not buy more chances to reopen.
+// overlap. Back needs three consecutive windows at the old share, so repeated runs cannot add windows.
 func (r *Runner) watch(ctx context.Context, c store.Case, dry bool) (Measured, bool) {
 	p, ok, err := r.Ship.Load(c.ID)
 	m := Measured{Case: c.ID, Title: c.Title, PR: p.PR}
@@ -341,12 +425,24 @@ func (r *Runner) watch(ctx context.Context, c store.Case, dry bool) (Measured, b
 	if p.State == Landed {
 		if p.Result == nil {
 			// A close from before results were saved ahead of it: recover the window's activity.
+			if why, err := r.readWindow(ctx, &p, c.Deployed, c.Deployed.Add(p.Plan.Window), dry); err != nil {
+				return failed(err)
+			} else if why != "" {
+				m.Status, m.Why = "waiting", why
+				return m, true
+			}
 			before := measure.Counts{Hits: p.Plan.Before, Base: p.Plan.BeforeBase}
 			after, err := Tally(ctx, r.Store, p.Plan.Signal, p.Plan.Units, c.Deployed, c.Deployed.Add(p.Plan.Window), r.Dir)
 			if err != nil {
 				return failed(err)
 			}
 			if !measure.Measurable(before, after.Base) {
+				if why, err := r.readWindow(ctx, &p, c.Deployed, c.Deployed.Add(2*p.Plan.Window), dry); err != nil {
+					return failed(err)
+				} else if why != "" {
+					m.Status, m.Why = "waiting", why
+					return m, true
+				}
 				after, err = Tally(ctx, r.Store, p.Plan.Signal, p.Plan.Units, c.Deployed, c.Deployed.Add(2*p.Plan.Window), r.Dir)
 				if err != nil {
 					return failed(err)
@@ -366,29 +462,27 @@ func (r *Runner) watch(ctx context.Context, c store.Case, dry bool) (Measured, b
 	if p.Result == nil {
 		return failed(fmt.Errorf("its kept package has no measurement"))
 	}
-	reference := p.Result.After
-	if p.WatchReference != nil {
-		reference = *p.WatchReference
-	} else if p.WatchWindow > 0 {
-		// Recover progress saved before packages recorded the pooled reference.
-		prior, err := Tally(ctx, r.Store, p.Plan.Signal, p.Plan.Units, c.Closed, c.Closed.Add(time.Duration(p.WatchWindow)*p.Plan.Window), r.Dir)
-		if err != nil {
-			return failed(err)
-		}
-		reference.Hits += prior.Hits
-		reference.Base += prior.Base
-	}
 	now := r.now()
 	ended := int(now.Sub(c.Closed) / p.Plan.Window)
 	for j := p.WatchWindow + 1; j <= ended; j++ {
 		start := c.Closed.Add(time.Duration(j-1) * p.Plan.Window)
+		if why, err := r.readWindow(ctx, &p, start, start.Add(p.Plan.Window), dry); err != nil {
+			return failed(err)
+		} else if why != "" {
+			m.Status, m.Why = "waiting", why
+			return m, true
+		}
 		recent, err := Tally(ctx, r.Store, p.Plan.Signal, p.Plan.Units, start, start.Add(p.Plan.Window), r.Dir)
 		if err != nil {
 			return failed(err)
 		}
-		if measure.Back(p.Result.Before, reference, recent, j) {
+		p.WatchRecent = append(p.WatchRecent, recent)
+		if len(p.WatchRecent) > 3 {
+			p.WatchRecent = p.WatchRecent[len(p.WatchRecent)-3:]
+		}
+		if measure.Back(p.Result.Before, p.WatchRecent) {
 			m.Status = "back"
-			m.Why = fmt.Sprintf("%d of %d active hours in window %d since its close (%s), %d of %d before its change",
+			m.Why = fmt.Sprintf("%d of %d active hours in window %d, the third consecutive window at its old share since its close (%s), %d of %d before its change",
 				recent.Hits, recent.Base, j, days(p.Plan.Window), p.Result.Before.Hits, p.Result.Before.Base)
 			if dry {
 				return m, true
@@ -401,12 +495,9 @@ func (r *Runner) watch(ctx context.Context, c store.Case, dry bool) (Measured, b
 				return failed(err)
 			}
 			r.note(ctx, store.Note{Kind: store.NoteDecided, Title: plainClip("momentum: a problem it fixed is back: "+c.Title, store.TitleMax),
-				Detail: "Back at its old share beyond chance (" + m.Why + "): the case is open again. Its lesson in tacit is not withdrawn.", Links: prLinks(p.PR)})
+				Detail: "Back at its old share for three consecutive windows (" + m.Why + "): the case is open again. Its lesson in tacit is not withdrawn.", Links: prLinks(p.PR)})
 			return m, true
 		}
-		reference.Hits += recent.Hits
-		reference.Base += recent.Base
-		p.WatchReference = &reference
 		p.WatchWindow = j
 		if !dry {
 			if err := r.Ship.save(&p); err != nil {
