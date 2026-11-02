@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -103,15 +102,8 @@ func (u usageError) Error() string { return u.msg }
 func main() {
 	// inside a sandbox (internal/jail): its first process forwards the route's port, and the momentum and tacit
 	// commands are the door's client, since nothing of the machine's is there for them to read
-	if len(os.Args) > 1 && os.Args[1] == jail.InitCommand {
-		os.Exit(jail.Init(os.Args[2:]))
-	}
-	if door := os.Getenv("MOMENTUM_DOOR"); door != "" {
-		name := "momentum"
-		if filepath.Base(os.Args[0]) == "tacit" {
-			name = "tacit"
-		}
-		os.Exit(jail.Call(door, name, os.Args[1:], os.Stdout, os.Stderr))
+	if code, ok := jail.Inside(os.Args, os.Stdout, os.Stderr); ok {
+		os.Exit(code)
 	}
 	os.Exit(run(context.Background(), os.Args[1:], os.Stdout, os.Stderr))
 }

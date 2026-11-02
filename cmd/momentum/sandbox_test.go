@@ -3,8 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"net"
 	"os"
 	"os/exec"
@@ -15,39 +13,28 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/jail"
+	"github.com/agent-sh/momentum/internal/jail/jailtest"
 )
 
-// momentumBinary is momentum's binary, built for a test that runs it as a program.
+// momentumBinary is momentum's binary, built for a test that runs it as a program. With HOME unset the go command
+// has no cache or module directory to build in, and the test skips with that reason.
 func momentumBinary(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "momentum")
 	if out, err := exec.Command("go", "build", "-o", path, ".").CombinedOutput(); err != nil {
+		if os.Getenv("HOME") == "" {
+			t.Skipf("HOME is unset, and go cannot build momentum without its cache: %v: %s", err, out)
+		}
 		t.Fatalf("build momentum: %v: %s", err, out)
 	}
 	return path
-}
-
-func socketDir(t *testing.T) string {
-	t.Helper()
-	base := os.Getenv("XDG_RUNTIME_DIR")
-	if base == "" {
-		base = t.TempDir()
-	}
-	b := make([]byte, 4)
-	rand.Read(b)
-	d := filepath.Join(base, "mc-"+hex.EncodeToString(b))
-	if err := os.MkdirAll(d, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(d) })
-	return d
 }
 
 // With MOMENTUM_DOOR set, momentum and tacit (a link to momentum by that name) send their arguments to the door
 // and print its reply, as they do inside a sandbox: momentum's main reads nothing of the machine's then.
 func TestMomentumAndTacitAreTheDoorsClient(t *testing.T) {
 	bin := momentumBinary(t)
-	sock := filepath.Join(socketDir(t), "d.sock")
+	sock := filepath.Join(jailtest.SocketDir(t), "d.sock")
 	var (
 		mu  sync.Mutex
 		got [][]string
@@ -73,7 +60,7 @@ func TestMomentumAndTacitAreTheDoorsClient(t *testing.T) {
 		want string
 	}{{bin, []string{"evidence", "status"}, "door: momentum evidence status"}, {tacit, []string{"search", "lock"}, "door: tacit search lock"}} {
 		cmd := exec.Command(c.prog, c.args...)
-		cmd.Env = append(os.Environ(), "MOMENTUM_DOOR="+sock, "MOMENTUM_HOME="+t.TempDir())
+		cmd.Env = append(os.Environ(), jail.DoorEnv+"="+sock, "MOMENTUM_HOME="+t.TempDir())
 		var out bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &out, &out
 		err := cmd.Run()
@@ -89,15 +76,13 @@ func TestMomentumAndTacitAreTheDoorsClient(t *testing.T) {
 	}
 }
 
-// momentum sandbox-init, the first process of a sandbox with a route, forwards the route's port inside to the
-// route's socket outside, runs its program and exits as the program does.
+// momentum sandbox-init, the first process a sandbox with a route starts, forwards the route's port inside to the
+// route's socket outside, runs its program and exits as the program does. The test skips, with the same reason as
+// the sandbox tests of internal/jail, where bubblewrap cannot make a sandbox.
 func TestSandboxInitForwardsTheRoute(t *testing.T) {
-	bwrap, err := exec.LookPath("bwrap")
-	if err != nil {
-		t.Skip("no bubblewrap")
-	}
+	bwrap := jailtest.NeedBwrap(t)
 	bin := momentumBinary(t)
-	sock := filepath.Join(socketDir(t), "r.sock")
+	sock := filepath.Join(jailtest.SocketDir(t), "r.sock")
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)
@@ -113,8 +98,7 @@ func TestSandboxInitForwardsTheRoute(t *testing.T) {
 			c.Close()
 		}
 	}()
-	work := t.TempDir()
-	home := os.Getenv("HOME")
+	work, home := t.TempDir(), t.TempDir()
 	s := jail.Spec{Bwrap: bwrap, Self: bin, Home: home, Dir: work, Mounts: []jail.Mount{{Path: work, Write: true}},
 		Env: []string{"HOME=" + home, "PATH=" + jail.BinDir + ":/usr/bin:/bin"}, Route: sock, RoutePort: 4171}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
