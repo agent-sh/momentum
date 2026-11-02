@@ -3,7 +3,6 @@ package loop
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,11 +46,10 @@ func doorAllows(step string, argv []string) bool {
 	return false
 }
 
-// door is a run's door: what its step allows, run as the loop runs it, in the run's directory or the directory of
-// its own it was typed in (its work tree), with the loop's variables and none of the sandbox's. What tacit prints is
-// scrubbed here; what momentum prints, by momentum.
+// door runs only a step's commands, in a host-only directory, with the loop's variables and none of the
+// sandbox's. Requested directories are data and never become a host process's working directory.
 func (r *Runner) door(step string, c store.Case, run store.LoopRun, roots []string) func(context.Context, jail.Request) jail.Reply {
-	reads := append(append([]string{}, r.ReadDirs...), roots[1:]...)
+	reads := append([]string{}, r.ReadDirs...)
 	env := CleanEnv(map[string]string{"MOMENTUM_ACTOR": "loop:" + run.ID, "MOMENTUM_LOOP_RUN": run.ID, "MOMENTUM_LOOP_CASE": c.ID,
 		"MOMENTUM_LOOP_DIR": run.Dir, "MOMENTUM_LOOP_READ": strings.Join(reads, string(filepath.ListSeparator))}, r.Bins...)
 	return func(ctx context.Context, req jail.Request) jail.Reply {
@@ -68,28 +66,18 @@ func (r *Runner) door(step string, c store.Case, run store.LoopRun, roots []stri
 		cctx, cancel := context.WithTimeout(ctx, r.Budgets.RunTime)
 		defer cancel()
 		cmd := exec.CommandContext(cctx, prog, req.Argv[1:]...)
-		cmd.Env, cmd.Dir = env, run.Dir
-		if r.Ship != nil {
-			if p, ok, err := r.Ship.Load(c.ID); err != nil {
-				return jail.Refuse("cannot read the host's package: %v", err)
-			} else if ok {
-				cmd.Env = append(append([]string{}, cmd.Env...), "MOMENTUM_LOOP_GIT_DIR="+p.GitDir, "MOMENTUM_LOOP_WORK="+p.Work)
-			}
+		cmd.Env = env
+		// Host commands never chdir into a writable run path. Relative inputs are resolved by their command's confined root.
+		if err := hostDir(HostDir(run.Dir)); err != nil {
+			return jail.Refuse("host command directory: %v", err)
 		}
-		cwd, err := doorDirectory(req.Dir, run.Dir, roots)
-		if err != nil {
-			return jail.Refuse("command directory: %v", err)
-		}
-		defer cwd.Close()
-		// Keep the parent descriptor alive until the child ends. Path replacements
-		// cannot redirect the child's chdir outside its checked root.
-		cmd.Dir = fmt.Sprintf("/proc/%d/fd/%d", os.Getpid(), cwd.Fd())
+		cmd.Dir = HostDir(run.Dir)
 		out, diag := Capture{Limit: jail.MaxStream}, Capture{Limit: jail.MaxStream}
 		cmd.Stdout, cmd.Stderr = &out, &diag
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 		cmd.WaitDelay = time.Second
-		err = cmd.Run()
+		err := cmd.Run()
 		if out.Over() || diag.Over() {
 			return jail.Reply{Stderr: []byte("(output withheld: over the door's limit)\n"), Code: 126}
 		}
@@ -112,31 +100,6 @@ func (r *Runner) door(step string, c store.Case, run store.LoopRun, roots []stri
 		}
 		return reply
 	}
-}
-
-func doorDirectory(want, fallback string, roots []string) (*os.File, error) {
-	if want == "" {
-		want = fallback
-	}
-	for _, dir := range roots {
-		if !within(want, dir) {
-			continue
-		}
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			return nil, err
-		}
-		name, err := filepath.Rel(dir, want)
-		if err != nil {
-			root.Close()
-			return nil, err
-		}
-		f, err := root.OpenFile(name, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
-		root.Close()
-		return f, err
-	}
-	// An outside directory keeps the established fallback to the run's own directory.
-	return doorDirectory("", fallback, []string{fallback})
 }
 
 func firstWords(argv []string, n int) []string {

@@ -104,16 +104,28 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 // A record inside a run-writable tree is untrusted even though its reference came from the store. Resolve it
 // through that root. Other records also refuse a final symlink and are checked through their descriptor.
 func openRecord(path string) (*os.File, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	path = abs
+	real := resolved(path)
+	for _, name := range []string{"work", "cache", "exports"} {
+		if within(path, filepath.Join(loopDir(), name)) || within(real, filepath.Join(loopDir(), name)) {
+			return nil, fmt.Errorf("evidence never reads a writable clone, cache or test export")
+		}
+	}
+	roots := []string{os.Getenv("MOMENTUM_LOOP_DIR"), filepath.Join(loopDir(), "runs")}
 	if os.Getenv("MOMENTUM_LOOP_RUN") != "" {
-		roots := append([]string{os.Getenv("MOMENTUM_LOOP_DIR")}, filepath.SplitList(os.Getenv("MOMENTUM_LOOP_READ"))...)
-		for _, dir := range roots {
-			if dir != "" && within(path, dir) {
-				name, err := filepath.Rel(dir, path)
-				if err != nil {
-					return nil, err
-				}
-				return loop.OpenFile(dir, name)
+		roots = append(roots, filepath.SplitList(os.Getenv("MOMENTUM_LOOP_READ"))...)
+	}
+	for _, dir := range roots {
+		if dir != "" && within(path, dir) {
+			name, err := filepath.Rel(dir, path)
+			if err != nil {
+				return nil, err
 			}
+			return loop.OpenFile(dir, name)
 		}
 	}
 	return os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)

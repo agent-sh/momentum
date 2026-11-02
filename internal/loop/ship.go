@@ -1,6 +1,7 @@
 package loop
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,7 +12,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
@@ -19,8 +19,8 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// Ship is the one way a change of the loop's goes in: a change package per case, built in a work tree of the
-// loop's own on a branch of an owned repository, checked by a test that fails without the change and passes with
+// Ship is the one way a change of the loop's goes in: a change package per case, built in an independent run clone
+// and imported as a patch into the host clone, checked by a test that fails without the change and passes with
 // it, proposed as a pull request with a rollback and a measurement plan, reviewed in a clean context, revised for
 // what a review finds (three rounds at most), and landed only when the loop is live and the last review found
 // nothing high or medium. Every step checks the authority again (Gate). A configuration directory is no target:
@@ -29,7 +29,7 @@ type Ship struct {
 	Store   *store.Store
 	Gate    Gate
 	Sandbox Sandbox
-	Dir     string // the loop's directory: packages/<case> and work/<case> under it
+	Dir     string // the loop's directory: packages/<case>, host/<case> and work/<case> under it
 	Live    bool
 	Actor   string
 	Now     func() time.Time
@@ -44,6 +44,8 @@ type Ship struct {
 	Public func(ctx context.Context, text string) (string, error)
 	// BeforeCommit is a test hook for an edit after the proposal's gates.
 	BeforeCommit func()
+	// AfterPatchRead is a test hook after the one confined read.
+	AfterPatchRead func()
 }
 
 // Package states.
@@ -68,10 +70,12 @@ type Package struct {
 	Repo          string           `json:"repo,omitempty"`
 	Base          string           `json:"base,omitempty"`
 	Branch        string           `json:"branch,omitempty"`
-	Dir           string           `json:"dir"`  // the repository's main checkout
-	Work          string           `json:"work"` // the loop's work tree
-	GitDir        string           `json:"git_dir"`
+	Dir           string           `json:"dir"`         // the repository's main checkout
+	Work          string           `json:"work"`        // independent run clone, never read by host steps
+	Host          string           `json:"host"`        // host-only independent clone
+	BaseCommit    string           `json:"base_commit"` // immutable patch base
 	PublishedHead string           `json:"published_head,omitempty"`
+	RefreshBase   bool             `json:"refresh_base,omitempty"`
 	State         string           `json:"state"`
 	Check         *Check           `json:"check,omitempty"`
 	Plan          *Plan            `json:"plan,omitempty"`
@@ -216,9 +220,7 @@ func (s *Ship) public(ctx context.Context, text string) (string, error) {
 	return s.Public(ctx, text)
 }
 
-// Prepare makes the case's work tree: a branch of the repository's default branch in a worktree of the loop's
-// own, once the gate allows the repository. A case has one package at a time; one rolled back can be prepared
-// again, its old tree's files and registration gone first. The work tree's directory stays: it is emptied in place.
+// Prepare creates a host-only clone and an independent run clone before any writable mount uses it.
 func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, error) {
 	unlock, err := s.lock(ctx, caseID)
 	if err != nil {
@@ -234,91 +236,114 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 		return Package{}, err
 	}
 	if had && old.State != RolledBack {
-		return old, refused("case %s has a package %s already (in %s)", c.ID, old.State, old.Work)
+		return old, refused("case %s has a package already (in %s)", c.ID, old.State)
 	}
 	if repoDir == "" {
-		return Package{}, refused("a package goes to one repository: --repo, a checkout of it")
+		return Package{}, refused("prepare needs --repo, a host repository")
 	}
-	ctx, err = s.gitContext(ctx, repoDir)
+	abs, err := filepath.Abs(repoDir)
 	if err != nil {
 		return Package{}, err
 	}
-	t, err := s.Gate.Repository(ctx, repoDir)
+	real, err := filepath.EvalSymlinks(abs)
 	if err != nil {
 		return Package{}, err
 	}
-	work := s.workDir(c.ID)
-	branch := "momentum/" + c.ID
-	if err := os.MkdirAll(filepath.Dir(work), 0o700); err != nil {
+	if under(abs, s.Dir) || under(real, s.Dir) || os.Getenv("MOMENTUM_LOOP_DIR") != "" && under(real, os.Getenv("MOMENTUM_LOOP_DIR")) || s.Sandbox.Cache != "" && under(real, s.Sandbox.Cache) {
+		return Package{}, refused("prepare reads host repositories, never the loop's clones, run directories or writable caches")
+	}
+	abs = real
+	t, err := s.Gate.Repository(ctx, abs)
+	if err != nil {
 		return Package{}, err
 	}
 	if _, err := s.git(ctx, t.Dir, "fetch", "--quiet", "origin", t.Base); err != nil {
 		return Package{}, err
 	}
-	// A build's sandbox mounts the directory before it asks for the tree, and a mount keeps the directory it was made
-	// on: the directory stays, emptied in place, and the tree is made in it. Git forgets a tree whose directory has
-	// no .git left (its last tree's registration, so the branch can be checked out again).
-	if err := emptyDir(work); err != nil {
+	host, work := filepath.Join(s.Dir, "host", c.ID), s.workDir(c.ID)
+	for _, d := range []string{host, work} {
+		if err := os.MkdirAll(filepath.Dir(d), 0700); err != nil {
+			return Package{}, err
+		}
+		if err := os.RemoveAll(d); err != nil {
+			return Package{}, err
+		}
+	}
+	if _, err := s.git(ctx, t.Dir, "clone", "--quiet", "--no-hardlinks", "--dissociate", "--no-checkout", "--template=", t.Dir, host); err != nil {
 		return Package{}, err
 	}
-	if had {
-		s.git(ctx, old.Dir, "worktree", "prune")
-	}
-	s.git(ctx, t.Dir, "worktree", "prune")
-	if _, err := s.git(ctx, t.Dir, "worktree", "add", "--no-checkout", "-B", branch, work, "origin/"+t.Base); err != nil {
-		return Package{}, err
-	}
-	reg, err := recordedRegistration(t.Dir, work)
+	origin, err := s.git(ctx, t.Dir, "remote", "get-url", "origin")
 	if err != nil {
 		return Package{}, err
 	}
-	p := Package{Case: c.ID, Kind: "repo", Repo: t.Repo, Base: t.Base, Dir: t.Dir, Branch: branch, Work: work, GitDir: reg, State: Prepared, Created: s.now()}
+	if _, err := s.git(ctx, host, "remote", "set-url", "origin", strings.TrimSpace(origin)); err != nil {
+		return Package{}, err
+	}
+	if _, err := s.git(ctx, host, "fetch", "--quiet", "origin", t.Base); err != nil {
+		return Package{}, err
+	}
+	branch := "momentum/" + c.ID
+	if _, err := s.git(ctx, host, "checkout", "--quiet", "-B", branch, "origin/"+t.Base); err != nil {
+		return Package{}, err
+	}
+	base, err := s.git(ctx, host, "rev-parse", "HEAD")
+	if err != nil {
+		return Package{}, err
+	}
+	p := Package{Case: c.ID, Kind: "repo", Repo: t.Repo, Base: t.Base, BaseCommit: strings.TrimSpace(base), Dir: t.Dir, Branch: branch,
+		Work: work, Host: host, State: Prepared, Created: s.now()}
+	if err := s.freshRunClone(ctx, p); err != nil {
+		return Package{}, err
+	}
 	if err := s.save(&p); err != nil {
 		return Package{}, err
 	}
-	if err := CheckGitConfig(WithGitDirectory(ctx, work, reg), work); err != nil {
-		return Package{}, err
-	}
-	if _, err := s.git(ctx, work, "reset", "--hard", "HEAD"); err != nil {
-		return Package{}, err
-	}
-	if err := s.save(&p); err != nil {
-		return Package{}, err
-	}
-	return p, s.Store.CaseNote(ctx, c.ID, "prepared", fmt.Sprintf("%s in %s", p.Repo, p.Work), s.Actor)
+	return p, s.Store.CaseNote(ctx, c.ID, "prepared", fmt.Sprintf("%s at %s", p.Repo, p.BaseCommit), s.Actor)
 }
 
-// staged stages every change of the work tree and returns its tree, by its hash, and the paths it changes against
-// the default branch: both sides of a rename (git's renames are off), each name as git keeps it (NUL-separated).
-func (s *Ship) staged(ctx context.Context, p Package) (string, []string, error) {
-	if err := s.ownTree(p); err != nil {
-		return "", nil, err
+// freshRunClone is used only before a run starts. No later host operation inspects this clone.
+func (s *Ship) freshRunClone(ctx context.Context, p Package) error {
+	if err := os.RemoveAll(p.Work); err != nil {
+		return err
 	}
-	if _, err := s.git(ctx, p.Work, "add", "-A"); err != nil {
-		return "", nil, err
+	// Use the trusted host clone as the command directory. The destination has no shared objects or remotes.
+	if _, err := s.git(ctx, p.Host, "clone", "--quiet", "--no-hardlinks", "--dissociate", "--no-checkout", "--template=", p.Host, p.Work); err != nil {
+		return err
 	}
-	tree, err := s.git(ctx, p.Work, "write-tree")
-	if err != nil {
-		return "", nil, err
+	// Initialization happens before the run can write here. It is the only host Git allowed in this destination.
+	if _, err := s.gitInitial(ctx, p.Work, "remote", "remove", "origin"); err != nil {
+		return err
 	}
-	tree = strings.TrimSpace(tree)
-	out, err := s.git(ctx, p.Work, "diff", "--name-status", "--no-renames", "-z", "origin/"+p.Base, tree)
-	if err != nil {
-		return "", nil, err
-	}
-	var paths []string
-	f := strings.Split(strings.TrimRight(out, "\x00"), "\x00")
-	for i := 0; i+1 < len(f); i += 2 {
-		paths = append(paths, f[i+1])
-	}
-	sort.Strings(paths)
-	return strings.TrimSpace(tree), slices.Compact(paths), nil
+	_, err := s.gitInitial(ctx, p.Work, "checkout", "--quiet", "--detach", p.BaseCommit)
+	return err
 }
 
-// ownTree refuses a work tree whose link to its repository is no longer the one git made: a .git that points
-// elsewhere would make the loop's own git calls read another repository's configuration.
-func (s *Ship) ownTree(p Package) error {
-	return VerifyGitDirectory(p.Work, p.GitDir)
+// refreshBase runs before a replacement build is mounted. The old patch is kept in host package data.
+func (s *Ship) refreshBase(ctx context.Context, p Package) (Package, error) {
+	unlock, err := s.lock(ctx, p.Case)
+	if err != nil {
+		return p, err
+	}
+	defer unlock()
+	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
+		return p, err
+	}
+	if _, err := s.git(ctx, p.Host, "fetch", "--quiet", "origin", p.Base); err != nil {
+		return p, err
+	}
+	base, err := s.git(ctx, p.Host, "rev-parse", "origin/"+p.Base)
+	if err != nil {
+		return p, err
+	}
+	p.BaseCommit = strings.TrimSpace(base)
+	if _, err := s.git(ctx, p.Host, "reset", "--hard", p.BaseCommit); err != nil {
+		return p, err
+	}
+	if err := s.freshRunClone(ctx, p); err != nil {
+		return p, err
+	}
+	p.Check, p.Head, p.RefreshBase, p.State = nil, "", false, Prepared
+	return p, s.save(&p)
 }
 
 // testFileRe are the names a test file has in the languages the owned repositories use.
@@ -328,7 +353,7 @@ var testFileRe = regexp.MustCompile(`(_test\.go|\.test\.[cm]?[jt]sx?|\.spec\.[cm
 // ignored file of the work tree in it): the default branch with only the test's own files of the change (it must
 // fail), and the change (it must pass). The test's files are those the change touches that are named as tests, or
 // the ones named. A check that does not come out so is recorded as it came out, and the package stays unchecked.
-func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []string) (Package, error) {
+func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []string, patch ...Patch) (Package, error) {
 	unlock, err := s.lock(ctx, caseID)
 	if err != nil {
 		return Package{}, err
@@ -344,16 +369,22 @@ func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []strin
 	if !ok || (p.State != Prepared && p.State != Checked && p.State != Revising) {
 		return p, refused("case %s has no package to check (prepare it first; a proposed one is reviewed, not checked again)", caseID)
 	}
+	if p.Host == "" || p.BaseCommit == "" {
+		return p, refused("legacy package has no host clone and patch base; prepare a fresh package")
+	}
+	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
+		return p, err
+	}
 	words, err := Words(test)
 	if err != nil {
 		return p, err
 	}
-	tree, paths, err := s.staged(ctx, p)
+	tree, paths, err := s.applyPatch(ctx, p, patch)
 	if err != nil {
 		return p, err
 	}
 	if len(paths) == 0 {
-		return p, refused("the change is empty: edit the files in %s first", p.Work)
+		return p, refused("the patch is empty: produce a cumulative diff against %s", p.BaseCommit)
 	}
 	if err := CheckPaths(Target{Repo: p.Repo}, paths); err != nil {
 		return p, err
@@ -373,13 +404,13 @@ func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []strin
 			return p, refused("%s is not a file the change touches", f)
 		}
 	}
-	before, err := s.export(ctx, p, "before", "origin/"+p.Base)
+	before, err := s.export(ctx, p, "before", p.BaseCommit)
 	if err != nil {
 		return p, err
 	}
 	defer s.unexport(p, before)
 	for _, f := range testFiles {
-		b, err := s.git(ctx, p.Work, "show", tree+":"+f)
+		b, err := s.git(ctx, p.Host, "show", tree+":"+f)
 		if err != nil {
 			return p, err
 		}
@@ -411,30 +442,13 @@ func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []strin
 		return p, refused("the test fails with the change (exit %d): the change does not pass its own test; the check is in check.json", a.Exit)
 	}
 	p.Check, p.State, p.Changed = ck, Checked, paths
+	if err := s.keepPatch(p); err != nil {
+		return p, err
+	}
 	if err := s.save(&p); err != nil {
 		return p, err
 	}
 	return p, s.Store.CaseNote(ctx, caseID, "checked", fmt.Sprintf("%s: fails without the change (exit %d), passes with it", strings.Join(words, " "), b.Exit), s.Actor)
-}
-
-// export makes a tree of a commit or a tree object, in a detached work tree of the loop's own: what a test runs on.
-func (s *Ship) export(ctx context.Context, p Package, name, treeish string) (string, error) {
-	dir := filepath.Join(s.Dir, "work", "."+name+"-"+p.Case)
-	s.unexport(p, dir)
-	if _, err := s.git(ctx, p.Dir, "worktree", "add", "--detach", dir, "origin/"+p.Base); err != nil {
-		return "", err
-	}
-	if _, err := s.git(ctx, dir, "read-tree", "-u", "--reset", treeish); err != nil {
-		s.unexport(p, dir)
-		return "", err
-	}
-	return dir, nil
-}
-
-func (s *Ship) unexport(p Package, dir string) {
-	s.git(context.Background(), p.Dir, "worktree", "remove", "--force", dir)
-	os.RemoveAll(dir)
-	s.git(context.Background(), p.Dir, "worktree", "prune")
 }
 
 // Proposal is what a change is proposed with.
@@ -452,7 +466,7 @@ const MinSignal = 3
 // commits the change as the user, checks the gate on the committed tree, pushes the branch and opens its pull
 // request, or, for a revision after a review, updates the one it has. The change must be the one the check passed.
 // A proposal that failed after its commit is taken up again where it stopped.
-func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package, error) {
+func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ...Patch) (Package, error) {
 	unlock, err := s.lock(ctx, caseID)
 	if err != nil {
 		return Package{}, err
@@ -469,14 +483,14 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package
 	if !ok || p.State != Checked || p.Check == nil {
 		return p, refused("case %s has no checked package: a change is proposed only after its check passed", caseID)
 	}
-	tree, paths, err := s.staged(ctx, p)
+	tree, paths, err := s.applyPatch(ctx, p, patch)
 	if err != nil {
 		return p, err
 	}
 	if tree != p.Check.Tree {
 		return p, refused("the change differs from the one the check passed: check it again")
 	}
-	parent, err := s.git(ctx, p.Work, "rev-parse", "HEAD")
+	parent, err := s.git(ctx, p.Host, "rev-parse", firstOf(p.Head, p.BaseCommit))
 	if err != nil {
 		return p, err
 	}
@@ -507,36 +521,45 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package
 	}
 	p.Plan, p.Rollback, p.Title, p.Body, p.Lesson, p.Changed = &Plan{Signal: pr.Signal, Window: pr.Window, Before: before}, pr.Rollback,
 		title, body, pr.Lesson, paths
-	// the commit first, so the work tree is clean when the scope check looks at every work tree of the repository
-	if head, err := s.git(ctx, p.Work, "rev-parse", parent+"^{tree}"); err != nil || strings.TrimSpace(head) != tree {
-		if s.BeforeCommit != nil {
-			s.BeforeCommit()
-		}
-		// Refuse a concurrent edit before creating any commit. This reads the working tree against
-		// the immutable tree without staging again; the commit below always uses that tree.
-		diff, err := s.git(ctx, p.Work, "diff", "--name-only", tree, "--")
+	// A review cannot be satisfied by a new commit with the same tree.
+	if n := len(p.Reviews); n > 0 {
+		reviewed, err := s.git(ctx, p.Host, "rev-parse", p.Reviews[n-1].Head+"^{tree}")
 		if err != nil {
 			return p, err
 		}
-		untracked, err := s.git(ctx, p.Work, "ls-files", "--others", "--exclude-standard")
-		if err != nil || strings.TrimSpace(diff+untracked) != "" {
-			return p, refused("the work tree changed during proposal validation")
+		if strings.TrimSpace(reviewed) == tree {
+			return p, refused("the revision changes nothing of the tree the review read")
+		}
+	}
+	if got, err := s.git(ctx, p.Host, "rev-parse", parent+"^{tree}"); err != nil || strings.TrimSpace(got) != tree {
+		if s.BeforeCommit != nil {
+			s.BeforeCommit()
 		}
 		if err := s.commitTree(ctx, p, tree, parent, fmt.Sprintf("%s\n\n%s\n\nCase %s.", title, wrap(body), c.ID)); err != nil {
 			return p, err
 		}
+	} else {
+		if _, err := s.git(ctx, p.Host, "update-ref", "refs/heads/"+p.Branch, parent); err != nil {
+			return p, err
+		}
 	}
-	head, err := s.git(ctx, p.Work, "rev-parse", "HEAD")
+	head, err := s.git(ctx, p.Host, "rev-parse", "HEAD")
 	if err != nil {
 		return p, err
 	}
 	p.Head = strings.TrimSpace(head)
-	committedTree, err := s.git(ctx, p.Work, "rev-parse", p.Head+"^{tree}")
+	committedTree, err := s.git(ctx, p.Host, "rev-parse", p.Head+"^{tree}")
 	if err != nil || strings.TrimSpace(committedTree) != tree {
 		return p, refused("the commit is not the checked tree")
 	}
 	if n := len(p.Reviews); n > 0 && p.Reviews[n-1].Head == p.Head {
 		return p, refused("the revision changes nothing of the commit the review read: change what its findings name")
+	}
+	if err := s.keepPatch(p); err != nil {
+		return p, err
+	}
+	if err := s.save(&p); err != nil {
+		return p, err
 	}
 	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
 		return p, err
@@ -554,7 +577,7 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package
 		}
 		// Creation can succeed while its response is lost. Match the package's exact branch, base and commit
 		// before issuing another create, including a request that was closed or merged in the meantime.
-		list, err := s.gh(ctx, p.Work, "pr", "list", "--repo", p.Repo, "--head", p.Branch, "--base", p.Base, "--state", "all",
+		list, err := s.gh(ctx, p.Host, "pr", "list", "--repo", p.Repo, "--head", p.Branch, "--base", p.Base, "--state", "all",
 			"--json", "number,url,headRefOid")
 		if err != nil {
 			return p, err
@@ -576,13 +599,13 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package
 			}
 		}
 		if p.PR == "" {
-			url, err := s.gh(ctx, p.Work, "pr", "create", "--repo", p.Repo, "--base", p.Base, "--head", p.Branch, "--title", title, "--body", body+"\n\n"+text)
+			url, err := s.gh(ctx, p.Host, "pr", "create", "--repo", p.Repo, "--base", p.Base, "--head", p.Branch, "--title", title, "--body", body+"\n\n"+text)
 			if err != nil {
 				return p, err
 			}
 			p.PR = strings.TrimSpace(lastOf(strings.Split(strings.TrimSpace(url), "\n")))
 		}
-	} else if _, err := s.gh(ctx, p.Work, "pr", "edit", p.PR, "--repo", p.Repo, "--title", title, "--body", body+"\n\n"+text); err != nil {
+	} else if _, err := s.gh(ctx, p.Host, "pr", "edit", p.PR, "--repo", p.Repo, "--title", title, "--body", body+"\n\n"+text); err != nil {
 		s.save(&p)
 		return p, err
 	}
@@ -653,7 +676,7 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 // editsSignal refuses a change that edits the texts its own measurement counts: a change of words that only stops
 // the signal from matching would measure as a fix. It reads the lines the change removes, hunk by hunk.
 func (s *Ship) editsSignal(ctx context.Context, p Package, sig Signal) error {
-	diff, err := s.git(ctx, p.Work, "diff", "--no-renames", "--no-ext-diff", "--no-textconv", "--text", "-U0", "origin/"+p.Base, p.Check.Tree)
+	diff, err := s.git(ctx, p.Host, "diff", "--no-renames", "--no-ext-diff", "--no-textconv", "--text", "-U0", p.BaseCommit, p.Check.Tree)
 	if err != nil {
 		return err
 	}
@@ -778,22 +801,19 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 		if !s.Live {
 			return p, refused("the loop is not live")
 		}
-		if err := s.ownTree(p); err != nil {
-			return p, err
-		}
 		// Restore only this package's interrupted operation before the clean-tree scope check.
-		_, _ = s.git(ctx, p.Work, "rebase", "--abort")
-		if _, err := s.git(ctx, p.Work, "reset", "--hard", p.Head); err != nil {
+		_, _ = s.git(ctx, p.Host, "rebase", "--abort")
+		if _, err := s.git(ctx, p.Host, "reset", "--hard", p.Head); err != nil {
 			return p, err
 		}
 		if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
 			return p, err
 		}
-		if _, err := s.git(ctx, p.Work, "fetch", "--quiet", "origin", p.Base); err != nil {
+		if _, err := s.git(ctx, p.Host, "fetch", "--quiet", "origin", p.Base); err != nil {
 			return p, err
 		}
 		if p.LandingHead != "" {
-			if _, err := s.git(ctx, p.Work, "merge-base", "--is-ancestor", p.LandingHead, "origin/"+p.Base); err == nil {
+			if _, err := s.git(ctx, p.Host, "merge-base", "--is-ancestor", p.LandingHead, "origin/"+p.Base); err == nil {
 				p.Head, p.State, p.LandedAt = p.LandingHead, Landed, s.now()
 				if err := s.save(&p); err != nil {
 					return p, err
@@ -802,7 +822,7 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 				return p, err
 			}
 		}
-		if _, err := s.git(ctx, p.Work, "reset", "--hard", p.Head); err != nil {
+		if _, err := s.git(ctx, p.Host, "reset", "--hard", p.Head); err != nil {
 			return p, err
 		}
 		p.State, p.LandingHead = Proposed, ""
@@ -826,19 +846,16 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	if err != nil {
 		return p, err
 	}
-	if err := s.ownTree(p); err != nil {
-		return p, err
-	}
-	if head, err := s.git(ctx, p.Work, "rev-parse", "HEAD"); err != nil || strings.TrimSpace(head) != p.Head {
+	if head, err := s.git(ctx, p.Host, "rev-parse", "HEAD"); err != nil || strings.TrimSpace(head) != p.Head {
 		return p, refused("the work tree's head is not the reviewed %s: no landing", p.Head)
 	}
-	if st, err := s.git(ctx, p.Work, "status", "--porcelain"); err != nil || strings.TrimSpace(st) != "" {
+	if st, err := s.git(ctx, p.Host, "status", "--porcelain"); err != nil || strings.TrimSpace(st) != "" {
 		return p, refused("the work tree holds changes besides the reviewed commit: no landing")
 	}
 	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
 		return p, err
 	}
-	if _, err := s.git(ctx, p.Work, "fetch", "--quiet", "origin", p.Base); err != nil {
+	if _, err := s.git(ctx, p.Host, "fetch", "--quiet", "origin", p.Base); err != nil {
 		return p, err
 	}
 	p.State = Landing
@@ -851,17 +868,22 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 		if complete || basePush {
 			return
 		}
-		if _, err := s.git(context.Background(), p.Work, "reset", "--hard", p.Head); err != nil {
+		if _, err := s.git(context.Background(), p.Host, "reset", "--hard", p.Head); err != nil {
 			return
 		}
 		p.State, p.LandingHead = Proposed, ""
 		_ = s.save(&p)
 	}()
-	if _, err := s.git(ctx, p.Work, "rebase", "origin/"+p.Base); err != nil {
-		s.git(context.Background(), p.Work, "rebase", "--abort")
+	if _, err := s.git(ctx, p.Host, "rebase", "origin/"+p.Base); err != nil {
+		s.git(context.Background(), p.Host, "rebase", "--abort")
+		p.State, p.RefreshBase = Revising, true
+		complete = true
+		if err := s.save(&p); err != nil {
+			return p, err
+		}
 		return p, refused("the change does not rebase on %s: %v", p.Base, err)
 	}
-	head, err := s.git(ctx, p.Work, "rev-parse", "HEAD")
+	head, err := s.git(ctx, p.Host, "rev-parse", "HEAD")
 	if err != nil {
 		return p, err
 	}
@@ -878,11 +900,11 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	if a.Exit != 0 {
 		return p, refused("after the rebase the test fails (exit %d): no landing", a.Exit)
 	}
-	base, err := s.git(ctx, p.Work, "rev-parse", "origin/"+p.Base)
+	base, err := s.git(ctx, p.Host, "rev-parse", "origin/"+p.Base)
 	if err != nil {
 		return p, err
 	}
-	commits, err := s.git(ctx, p.Work, "rev-list", "--reverse", strings.TrimSpace(base)+"..HEAD")
+	commits, err := s.git(ctx, p.Host, "rev-list", "--reverse", strings.TrimSpace(base)+"..HEAD")
 	if err != nil {
 		return p, err
 	}
@@ -896,10 +918,10 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 		}
 	}
 	basePush = true
-	if _, err := s.push(ctx, p, p.Work, "--no-verify", "origin", head+":refs/heads/"+p.Base); err != nil {
+	if _, err := s.push(ctx, p, p.Host, "--no-verify", "origin", head+":refs/heads/"+p.Base); err != nil {
 		return p, refused("the push to %s did not go as a fast-forward: %v", p.Base, err)
 	}
-	s.push(ctx, p, p.Work, "--no-verify", "--quiet", "origin", "--delete", p.Branch)
+	s.push(ctx, p, p.Host, "--no-verify", "--quiet", "origin", "--delete", p.Branch)
 	p.Landed, p.Head = strings.Fields(commits), head
 	p.State, p.LandedAt = Landed, s.now()
 	complete = true
@@ -931,17 +953,23 @@ func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error
 	if p.State == RolledBack {
 		return p, s.rollbackReceipt(ctx, p, why)
 	}
+	if p.Host == "" || p.BaseCommit == "" {
+		return p, refused("legacy package has no host clone; migrate its receipt before rollback")
+	}
 	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
 		return p, err
 	}
-	dir := filepath.Join(s.Dir, "work", ".revert-"+caseID)
-	s.unexport(p, dir)
-	if _, err := s.git(ctx, p.Dir, "fetch", "--quiet", "origin", p.Base); err != nil {
+	dir := filepath.Join(s.Dir, "exports", ".revert-"+caseID)
+	s.dropRollback(p, dir)
+	if err := os.MkdirAll(filepath.Dir(dir), 0700); err != nil {
+		return p, err
+	}
+	if _, err := s.git(ctx, p.Host, "fetch", "--quiet", "origin", p.Base); err != nil {
 		return p, err
 	}
 	start := "origin/" + p.Base
 	if p.Undo != nil {
-		if _, err := s.git(ctx, p.Dir, "merge-base", "--is-ancestor", p.Undo.Head, start); err == nil {
+		if _, err := s.git(ctx, p.Host, "merge-base", "--is-ancestor", p.Undo.Head, start); err == nil {
 			p.State = RolledBack
 			if err := s.save(&p); err != nil {
 				return p, err
@@ -950,10 +978,10 @@ func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error
 		}
 		start = p.Undo.Head
 	}
-	if _, err := s.git(ctx, p.Dir, "worktree", "add", "--detach", dir, start); err != nil {
+	if _, err := s.git(ctx, p.Host, "worktree", "add", "--detach", dir, start); err != nil {
 		return p, err
 	}
-	defer s.unexport(p, dir)
+	defer s.dropRollback(p, dir)
 	if p.Undo == nil {
 		shas := append([]string{}, p.Landed...)
 		if len(shas) == 0 {
@@ -1007,16 +1035,16 @@ func (s *Ship) commitTree(ctx context.Context, p Package, tree, parent, msg stri
 	if s.Identity[0] == "" || s.Identity[1] == "" {
 		return refused("no git identity: set user.name and user.email in the global git configuration")
 	}
-	head, err := s.git(ctx, p.Work, "commit-tree", tree, "-p", parent, "-m", msg)
+	head, err := s.git(ctx, p.Host, "commit-tree", tree, "-p", parent, "-m", msg)
 	if err != nil {
 		return err
 	}
 	head = strings.TrimSpace(head)
-	got, err := s.git(ctx, p.Work, "rev-parse", head+"^{tree}")
+	got, err := s.git(ctx, p.Host, "rev-parse", head+"^{tree}")
 	if err != nil || strings.TrimSpace(got) != tree {
 		return refused("commit-tree did not produce the checked tree")
 	}
-	_, err = s.git(ctx, p.Work, "update-ref", "refs/heads/"+p.Branch, head, parent)
+	_, err = s.git(ctx, p.Host, "update-ref", "refs/heads/"+p.Branch, head, parent)
 	return err
 }
 
@@ -1024,17 +1052,26 @@ func (s *Ship) commitTree(ctx context.Context, p Package, tree, parent, msg stri
 // monitor, no external diff, and the user's identity for every commit it writes (a commit, a rebase, a revert),
 // whatever the repository's configuration or the environment say.
 func (s *Ship) git(ctx context.Context, dir string, args ...string) (string, error) {
-	var err error
-	ctx, err = s.gitContext(ctx, dir)
-	if err != nil {
-		return "", err
+	if dir == "" {
+		return "", refused("host Git requires an explicit host repository")
 	}
+	if under(dir, filepath.Join(s.Dir, "work")) || under(dir, filepath.Join(s.Dir, "runs")) || s.Sandbox.Cache != "" && under(dir, s.Sandbox.Cache) {
+		return "", refused("host Git never reads a run clone, run directory or writable build cache")
+	}
+	return s.gitInput(ctx, dir, nil, args...)
+}
+
+func (s *Ship) gitInitial(ctx context.Context, dir string, args ...string) (string, error) {
+	return s.gitInput(ctx, dir, nil, args...)
+}
+
+func (s *Ship) gitInput(ctx context.Context, dir string, input []byte, args ...string) (string, error) {
 	if err := CheckGitConfig(ctx, dir); err != nil {
 		return "", err
 	}
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	full := append(gitLocation(ctx, dir), []string{"-c", "diff.external=", "-c", "commit.gpgsign=false",
+	full := append([]string{"-C", dir}, []string{"-c", "diff.external=", "-c", "commit.gpgsign=false",
 		"-c", "user.name=" + s.Identity[0], "-c", "user.email=" + s.Identity[1]}...)
 	full = append(full, GitSafety()...)
 	full = append(full, "-c", "credential.helper=",
@@ -1042,11 +1079,12 @@ func (s *Ship) git(ctx context.Context, dir string, args ...string) (string, err
 		"-c", "protocol.ext.allow=never", "-c", "push.followTags=false")
 	full = append(full, args...)
 	cmd := exec.CommandContext(cctx, "git", full...)
+	cmd.Stdin = bytes.NewReader(input)
 	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_AUTHOR_NAME="+s.Identity[0], "GIT_AUTHOR_EMAIL="+s.Identity[1],
 		"GIT_COMMITTER_NAME="+s.Identity[0], "GIT_COMMITTER_EMAIL="+s.Identity[1])
 	out, errOut := Capture{Limit: jail.MaxStream}, Capture{Limit: jail.MaxStream}
 	cmd.Stdout, cmd.Stderr = &out, &errOut
-	err = cmd.Run()
+	err := cmd.Run()
 	if out.Over() || errOut.Over() {
 		return "", refused("Git output exceeds the whole-stream limit")
 	}
@@ -1057,11 +1095,6 @@ func (s *Ship) git(ctx context.Context, dir string, args ...string) (string, err
 }
 
 func (s *Ship) gh(ctx context.Context, dir string, args ...string) (string, error) {
-	var err error
-	ctx, err = s.gitContext(ctx, dir)
-	if err != nil {
-		return "", err
-	}
 	if err := CheckGitConfig(ctx, dir); err != nil {
 		return "", err
 	}
@@ -1069,13 +1102,10 @@ func (s *Ship) gh(ctx context.Context, dir string, args ...string) (string, erro
 	defer cancel()
 	cmd := exec.CommandContext(cctx, firstOf(s.GH, "gh"), args...)
 	cmd.Dir = dir
-	cmd.Env = append(noGitEnv(), "GIT_OPTIONAL_LOCKS=0", "GIT_CONFIG_COUNT=2", "GIT_CONFIG_KEY_0=core.hooksPath", "GIT_CONFIG_VALUE_0=/dev/null", "GIT_CONFIG_KEY_1=core.fsmonitor", "GIT_CONFIG_VALUE_1=false")
-	if pin, ok := ctx.Value(gitDirectoryKey{}).(gitDirectory); ok {
-		cmd.Env = append(cmd.Env, "GIT_DIR="+pin.registration, "GIT_WORK_TREE="+pin.work)
-	}
+	cmd.Env = gitChildEnv()
 	out, diag := Capture{Limit: jail.MaxStream}, Capture{Limit: jail.MaxStream}
 	cmd.Stdout, cmd.Stderr = &out, &diag
-	err = cmd.Run()
+	err := cmd.Run()
 	if out.Over() || diag.Over() {
 		return "", refused("GitHub CLI output exceeds the whole-stream limit")
 	}
@@ -1157,7 +1187,7 @@ func CheckGitConfig(ctx context.Context, dir string) error {
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	config := func(args ...string) ([]byte, error) {
-		cmd := exec.CommandContext(cctx, "git", append(append(gitLocation(ctx, dir), "config"), args...)...)
+		cmd := exec.CommandContext(cctx, "git", append(append([]string{"-C", dir}, "config"), args...)...)
 		cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0")
 		out, diag := Capture{Limit: jail.MaxStream}, Capture{Limit: jail.MaxStream}
 		cmd.Stdout, cmd.Stderr = &out, &diag
@@ -1243,17 +1273,20 @@ func writeTest(dir, name string, data []byte) error {
 
 // push checks the actual work tree's destinations and current authority immediately before every push.
 func (s *Ship) push(ctx context.Context, p Package, dir string, args ...string) (string, error) {
-	var err error
-	ctx, err = s.gitContext(ctx, dir)
-	if err != nil {
-		return "", err
-	}
-	t, err := s.Gate.Repository(ctx, dir)
+	t, err := s.Gate.Repository(ctx, p.Dir)
 	if err != nil {
 		return "", err
 	}
 	if !strings.EqualFold(t.Repo, p.Repo) {
 		return "", refused("the push destination is not the package's repository")
+	}
+	actual, err := originRepository(ctx, dir)
+	if err != nil {
+		return "", err
+	}
+	source, err := originRepository(ctx, p.Dir)
+	if err != nil || actual != source {
+		return "", refused("the host clone's destination changed")
 	}
 	return s.git(ctx, dir, append([]string{"push", "--no-follow-tags"}, args...)...)
 }

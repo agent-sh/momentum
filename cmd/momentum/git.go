@@ -76,9 +76,7 @@ func evidenceGit(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		return usageError{"evidence git takes a repository's directory, then a git command that reads (log, show, diff, blame, ...)"}
 	}
 	dir, sub, rest := paths.Expand(args[0]), args[1], args[2:]
-	var err error
-	ctx, err = evidenceGitContext(ctx, dir)
-	if err != nil {
+	if err := evidenceRoot(dir); err != nil {
 		return err
 	}
 	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
@@ -121,7 +119,7 @@ func evidenceGit(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	}
 	const home = "/run/momentum/home"
 	cmd, err := (jail.Spec{Home: home, Dir: resolved(dir), Mounts: jail.Tidy(mounts), Env: append(gitEnv(), "HOME="+home)}).Command(cctx,
-		append(append([]string{"git"}, loop.GitLocation(ctx, dir)...), append(append(append([]string{}, gitSafe...), loop.GitSafety()...), argv...)...)...)
+		append(append([]string{"git"}, []string{"-C", dir}...), append(append(append([]string{}, gitSafe...), loop.GitSafety()...), argv...)...)...)
 	if err != nil {
 		return fmt.Errorf("evidence git requires its filesystem sandbox: %w", err)
 	}
@@ -178,7 +176,7 @@ func openGitDirectory(p string) (*os.File, error) {
 }
 
 // gitReadable keeps a loop run's git to the repositories the loop reads (MOMENTUM_LOOP_READ, which the run's door
-// sets: loop.read_dirs and the run's own work tree): the directory, its repository's top-level work tree and its git
+// sets: loop.read_dirs): the directory, its repository's top-level work tree and its git
 // directories lie under one of them, so a .git file that names another repository reads nothing. Outside a run,
 // any repository.
 func gitReadable(ctx context.Context, dir string) ([]string, error) {
@@ -209,7 +207,7 @@ func gitReadable(ctx context.Context, dir string) ([]string, error) {
 			ok = ok || within(p, r)
 		}
 		if !ok {
-			return nil, fmt.Errorf("%s is not where this run reads repositories: under loop.read_dirs, or its own work tree", dir)
+			return nil, fmt.Errorf("%s is not where this run reads repositories: under loop.read_dirs", dir)
 		}
 	}
 	return places, nil
@@ -389,37 +387,45 @@ func repoPath(p string) error {
 
 // gitRead runs one git command of momentum's own, with the safe settings.
 func gitRead(ctx context.Context, dir string, args ...string) (string, error) {
-	var err error
-	ctx, err = evidenceGitContext(ctx, dir)
-	if err != nil {
-		return "", err
-	}
 	if err := loop.CheckGitConfig(ctx, dir); err != nil {
 		return "", err
 	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, "git", append(append(append(loop.GitLocation(ctx, dir), gitSafe...), loop.GitSafety()...), args...)...)
+	cmd := exec.CommandContext(cctx, "git", append(append(append([]string{"-C", dir}, gitSafe...), loop.GitSafety()...), args...)...)
 	cmd.Env = gitEnv()
 	out, diag := loop.Capture{Limit: jail.MaxStream}, loop.Capture{Limit: jail.MaxStream}
 	cmd.Stdout, cmd.Stderr = &out, &diag
-	err = cmd.Run()
+	err := cmd.Run()
 	if out.Over() || diag.Over() {
 		return "", fmt.Errorf("Git output exceeds the whole-stream limit")
 	}
 	return out.String(), err
 }
 
-func evidenceGitContext(ctx context.Context, dir string) (context.Context, error) {
-	work := os.Getenv("MOMENTUM_LOOP_WORK")
-	if os.Getenv("MOMENTUM_LOOP_RUN") != "" && work != "" && within(dir, work) {
-		reg := os.Getenv("MOMENTUM_LOOP_GIT_DIR")
-		if err := loop.VerifyGitDirectory(work, reg); err != nil {
-			return ctx, err
-		}
-		ctx = loop.WithGitDirectory(ctx, work, reg)
+// evidenceRoot checks the authority before even reading a requested directory's Git configuration.
+func evidenceRoot(dir string) error {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return err
 	}
-	return ctx, nil
+	real := resolved(abs)
+	runDir := os.Getenv("MOMENTUM_LOOP_DIR")
+	if within(abs, loopDir()) || within(real, loopDir()) || runDir != "" && (within(abs, runDir) || within(real, runDir)) {
+		return usageError{"evidence git never reads the loop's clones or run directories"}
+	}
+	if os.Getenv("MOMENTUM_LOOP_RUN") == "" {
+		return nil
+	}
+	for _, root := range filepath.SplitList(os.Getenv("MOMENTUM_LOOP_READ")) {
+		if root != "" && within(abs, root) {
+			if within(real, loopDir()) || !within(real, resolved(root)) {
+				return usageError{"evidence git directory escapes its read root"}
+			}
+			return nil
+		}
+	}
+	return usageError{"evidence git reads only repositories under loop.read_dirs"}
 }
 
 // gitEnv is momentum's environment without git's own variables (a GIT_DIR would point it elsewhere), never

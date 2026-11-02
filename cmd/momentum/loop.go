@@ -103,7 +103,7 @@ func setup(st *store.Store, c config.Loop) (*loop.Runner, *loop.Ship, error) {
 		}
 	}
 	ship := &loop.Ship{Store: st, Dir: loopDir(), Live: c.Live, Actor: caseActor(), Identity: [2]string{name, email}, Sandbox: sb,
-		Gate: loop.Gate{Owners: c.Owners, Exclude: c.Exclude, RepoGuard: c.RepoGuard, Own: loopDir(),
+		Gate: loop.Gate{Owners: c.Owners, Exclude: c.Exclude, RepoGuard: c.RepoGuard,
 			Home: home, Busy: func(ctx context.Context, dir string) (string, error) { return repoBusy(ctx, st, dir) }}}
 	model, fallback := c.Model, c.FallbackModel
 	if model == "" {

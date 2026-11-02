@@ -13,7 +13,7 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// Two steps of one case do not overlap: they share its work tree, its scratch trees and its package file. A step that
+// Two steps of one case do not overlap: they share its host clone, its exports and its package file. A step that
 // finds another running fails at once and says so, and the first runs to its end.
 func TestTwoShipStepsOnOneCaseDoNotOverlap(t *testing.T) {
 	ctx := context.Background()
@@ -37,7 +37,7 @@ func TestTwoShipStepsOnOneCaseDoNotOverlap(t *testing.T) {
 	}
 	first := make(chan error, 1)
 	go func() {
-		_, err := s.Check(ctx, c.ID, "go test ./...", nil)
+		_, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil)
 		first <- err
 	}()
 	defer func() { // the first check ends whatever the test found
@@ -56,7 +56,7 @@ func TestTwoShipStepsOnOneCaseDoNotOverlap(t *testing.T) {
 	}
 	second := make(chan error, 1)
 	go func() {
-		_, err := s.Check(ctx, c.ID, "go test ./...", nil)
+		_, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil)
 		second <- err
 	}()
 	select {
@@ -95,8 +95,8 @@ func TestEveryShipStepTakesTheCasesLock(t *testing.T) {
 	}
 	steps := map[string]func() error{
 		"prepare": func() error { _, err := s.Prepare(ctx, c.ID, f.main); return err },
-		"check":   func() error { _, err := s.Check(ctx, c.ID, "go test ./...", nil); return err },
-		"propose": func() error { _, err := s.Propose(ctx, c.ID, Proposal{}); return err },
+		"check":   func() error { _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); return err },
+		"propose": func() error { _, err := proposePatch(t, s, ctx, c.ID, Proposal{}); return err },
 		"land":    func() error { _, err := s.Land(ctx, c.ID); return err },
 		"rollback": func() error {
 			_, err := s.RollBack(ctx, c.ID, "because")
@@ -126,64 +126,6 @@ func TestEveryShipStepTakesTheCasesLock(t *testing.T) {
 	}
 }
 
-// A work tree's directory is emptied in place, never removed: a sandbox that mounts it holds that directory. What is in
-// it goes, links among it without what they name, and a missing directory or a file or a link in its place is made a
-// directory.
-func TestEmptyDirKeepsTheDirectoryItself(t *testing.T) {
-	root := t.TempDir()
-	outside := filepath.Join(root, "outside")
-	write(t, filepath.Join(outside, "kept.txt"), "marker-7f3a")
-	dir := filepath.Join(root, "work")
-	write(t, filepath.Join(dir, ".git"), "gitdir: nowhere")
-	write(t, filepath.Join(dir, "a", "b", "file.go"), "package a")
-	write(t, filepath.Join(dir, ".hidden"), "x")
-	if err := os.Symlink(outside, filepath.Join(dir, "link-to-dir")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(filepath.Join(outside, "kept.txt"), filepath.Join(dir, "link-to-file")); err != nil {
-		t.Fatal(err)
-	}
-	before, err := os.Stat(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := emptyDir(dir); err != nil {
-		t.Fatal(err)
-	}
-	after, err := os.Stat(dir)
-	if err != nil || !os.SameFile(before, after) {
-		t.Fatalf("the directory was replaced: %v", err)
-	}
-	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
-		t.Fatalf("the directory holds %d entries", len(entries))
-	}
-	if b, err := os.ReadFile(filepath.Join(outside, "kept.txt")); err != nil || string(b) != "marker-7f3a" {
-		t.Fatalf("what a link named was removed: %q %v", b, err)
-	}
-	// nothing there, a file there, a link there
-	missing := filepath.Join(root, "missing", "deeper")
-	file := filepath.Join(root, "file")
-	write(t, file, "x")
-	link := filepath.Join(root, "link")
-	if err := os.Symlink(outside, link); err != nil {
-		t.Fatal(err)
-	}
-	for _, d := range []string{missing, file, link} {
-		if err := emptyDir(d); err != nil {
-			t.Fatalf("%s: %v", d, err)
-		}
-		if st, err := os.Lstat(d); err != nil || !st.IsDir() {
-			t.Fatalf("%s is no directory: %v", d, err)
-		}
-	}
-	if b, err := os.ReadFile(filepath.Join(outside, "kept.txt")); err != nil || string(b) != "marker-7f3a" {
-		t.Fatalf("what the link named was changed: %q %v", b, err)
-	}
-}
-
-// A repository's submodule names are read as git lists them: the subsection of a name is case sensitive. A capitalised
-// name with a mode git writes is no program, and a capitalised name with a command is one even beside a lower-case
-// name with a mode.
 func TestSubmoduleNamesAreReadAsGitListsThem(t *testing.T) {
 	dir := t.TempDir()
 	run(t, dir, "git", "init", "-q", "-b", "main")

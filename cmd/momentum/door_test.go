@@ -34,10 +34,13 @@ func TestARunsGitReadsOnlyWhereTheLoopReads(t *testing.T) {
 	if code, out, diag := momentum("evidence", "git", inside, "log", "--oneline"); code != 0 || !strings.Contains(out, "inside") {
 		t.Fatalf("a repository under the root: %d %q %s", code, out, diag)
 	}
-	for _, dir := range []string{outside, linked} {
-		if code, out, diag := momentum("evidence", "git", dir, "log", "--oneline"); code == 0 || strings.Contains(out, "synthetic") ||
-			!strings.Contains(diag, "not where this run reads repositories") {
-			t.Errorf("%s read in a run: %d %q %s", dir, code, out, diag)
+	for _, tc := range []struct{ dir, why string }{
+		{outside, "evidence git reads only repositories under loop.read_dirs"},
+		{linked, "not where this run reads repositories"},
+	} {
+		if code, out, diag := momentum("evidence", "git", tc.dir, "log", "--oneline"); code == 0 || strings.Contains(out, "synthetic") ||
+			!strings.Contains(diag, tc.why) {
+			t.Errorf("%s read in a run: %d %q %s", tc.dir, code, out, diag)
 		}
 	}
 	t.Setenv("MOMENTUM_LOOP_READ", "")

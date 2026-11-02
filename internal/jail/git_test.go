@@ -432,3 +432,33 @@ func TestCommandBindsTheWholeGitDirectoryReadOnlyAfterAWritableMount(t *testing.
 		t.Errorf("a writable file has an extra bind: %v", args)
 	}
 }
+
+// A mount that says it holds the program's own repository keeps its .git writable: the program commits, changes the
+// configuration and rewrites .git freely, because nothing outside reads it. The default (the test above) is the
+// opposite, and a flag that only one of two mounts carries leaves the other guarded.
+func TestAnOwnRepositoryKeepsItsGitWritableAndOnlyThatMount(t *testing.T) {
+	s := spec(t)
+	needGit(t)
+	own, _, env := fixture{}.newRepo(t)
+	other, _, _ := fixture{}.newRepo(t)
+	s.Mounts, s.Dir = []Mount{{Path: own, Write: true, OwnRepository: true}, {Path: other, Write: true}}, own
+	s.Env = append(s.Env, gitIdentity...)
+	script := "git config user.name nobody && echo changed >> file.txt && git add -A && git commit -q -m inside && echo own-committed;" +
+		" cd " + other + " && git config user.name nobody 2>&1; true"
+	out, err := run(t, s, script)
+	if err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if !strings.Contains(out, "own-committed") {
+		t.Errorf("the program could not commit in its own repository: %s", out)
+	}
+	if !strings.Contains(out, "Read-only file system") {
+		t.Errorf("the other mount's .git is not guarded: %s", out)
+	}
+	if commits := strings.TrimSpace(runGit(t, own, env, "rev-list", "--count", "HEAD")); commits != "3" {
+		t.Errorf("the own repository has %s commits, want 3", commits)
+	}
+	if commits := strings.TrimSpace(runGit(t, other, env, "rev-list", "--count", "HEAD")); commits != "2" {
+		t.Errorf("the guarded repository has %s commits, want 2", commits)
+	}
+}

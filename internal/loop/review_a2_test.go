@@ -3,7 +3,6 @@ package loop
 import (
 	"context"
 	"errors"
-	"fmt"
 	"math"
 	"os"
 	"os/exec"
@@ -24,40 +23,19 @@ func TestProposalRefusesAProtectedEditDuringValidation(t *testing.T) {
 	s := recoveryShip(t, st, f)
 	s.Gate.Resolve = func(context.Context, string) (string, error) { return "agent-sh/momentum", nil }
 	c, p, pr := recoveryChecked(t, s, st, f)
-	parent := strings.TrimSpace(run(t, p.Work, "git", "rev-parse", "HEAD"))
 	s.Public = func(_ context.Context, text string) (string, error) {
 		write(t, filepath.Join(p.Work, "internal/jail/probe.go"), "package jail // marker-7f3a\n")
 		return text, nil
 	}
-	if _, err := s.Propose(context.Background(), c.ID, pr); err == nil {
-		t.Fatal("proposal accepted a protected edit during validation")
-	}
-	if got := strings.TrimSpace(run(t, p.Work, "git", "rev-parse", "HEAD")); got != parent {
-		t.Fatal("proposal committed after a concurrent edit")
-	}
-	if got := run(t, f.main, "git", "ls-remote", "origin", "refs/heads/"+p.Branch); got != "" {
-		t.Fatal("proposal pushed after a concurrent edit")
-	}
-}
-
-func TestShipRefusesASiblingRegistration(t *testing.T) {
-	st := testStore(t)
-	f := newRepo(t, nil)
-	s := recoveryShip(t, st, f)
-	c := testingCase(t, st)
-	p, err := s.Prepare(context.Background(), c.ID, f.main)
+	q, err := proposePatch(t, s, context.Background(), c.ID, pr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sibling := filepath.Join(f.dir, "sibling")
-	run(t, f.main, "git", "worktree", "add", "--detach", sibling, "HEAD")
-	link, err := os.ReadFile(filepath.Join(sibling, ".git"))
-	if err != nil {
-		t.Fatal(err)
+	if tree := strings.TrimSpace(run(t, p.Host, "git", "rev-parse", q.Head+"^{tree}")); tree != p.Check.Tree {
+		t.Fatal("concurrent run write changed the commit")
 	}
-	write(t, filepath.Join(p.Work, ".git"), string(link))
-	if err := s.ownTree(p); err == nil {
-		t.Fatal("accepted another work tree's registration")
+	if strings.Contains(run(t, p.Host, "git", "ls-tree", "-r", q.Head), "internal/jail") {
+		t.Fatal("protected run file shipped")
 	}
 }
 
@@ -73,11 +51,11 @@ func TestFetchedBranchDoesNotWeakenProposalLease(t *testing.T) {
 	theirs := pushOther(t, f, p.Branch, map[string]string{"theirs.txt": "marker-7f3a\n"})
 	run(t, f.main, "git", "fetch", "origin", p.Branch)
 	write(t, filepath.Join(p.Work, "fake.go"), strings.Replace(fixed("42"), "// Answer is the answer.", "// Answer is 42.", 1))
-	if _, err := s.Check(ctx, c.ID, `python3 -c 'from pathlib import Path; assert "return 42" in Path("fake.go").read_text()'`, nil); err != nil {
+	if _, err := checkPatch(t, s, ctx, c.ID, `python3 -c 'from pathlib import Path; assert "return 42" in Path("fake.go").read_text()'`, nil); err != nil {
 		t.Fatal(err)
 	}
 	pr := Proposal{Title: "Answer is 42", Body: "Off by one.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}
-	if _, err := s.Propose(ctx, c.ID, pr); err == nil {
+	if _, err := proposePatch(t, s, ctx, c.ID, pr); err == nil {
 		t.Fatal("revision overwrote the fetched remote change")
 	}
 	if originHead(t, f, p.Branch) != theirs {
@@ -102,16 +80,16 @@ func TestProposalHookRefusesAProtectedEditBeforeCommit(t *testing.T) {
 	s := recoveryShip(t, st, f)
 	s.Gate.Resolve = func(context.Context, string) (string, error) { return "agent-sh/momentum", nil }
 	c, p, pr := recoveryChecked(t, s, st, f)
-	parent := strings.TrimSpace(run(t, p.Work, "git", "rev-parse", "HEAD"))
 	s.BeforeCommit = func() { write(t, filepath.Join(p.Work, "internal/jail/probe.go"), "package jail // marker-7f3a\n") }
-	if _, err := s.Propose(context.Background(), c.ID, pr); err == nil {
-		t.Fatal("hook's edit accepted")
+	q, err := proposePatch(t, s, context.Background(), c.ID, pr)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if strings.TrimSpace(run(t, p.Work, "git", "rev-parse", "HEAD")) != parent {
-		t.Fatal("created a commit")
+	if tree := strings.TrimSpace(run(t, p.Host, "git", "rev-parse", q.Head+"^{tree}")); tree != p.Check.Tree {
+		t.Fatal("concurrent run write changed the commit")
 	}
-	if run(t, f.main, "git", "ls-remote", "origin", "refs/heads/"+p.Branch) != "" {
-		t.Fatal("pushed a commit")
+	if strings.Contains(run(t, p.Host, "git", "ls-tree", "-r", q.Head), "internal/jail") {
+		t.Fatal("protected run file shipped")
 	}
 }
 
@@ -133,7 +111,7 @@ func TestFetchedBranchDoesNotWeakenRebasedLandingLease(t *testing.T) {
 	if theirs == "" || originHead(t, f, p.Branch) != theirs {
 		t.Fatal("another push was lost")
 	}
-	if strings.TrimSpace(run(t, p.Work, "git", "rev-parse", "HEAD")) != p.Head {
+	if strings.TrimSpace(run(t, p.Host, "git", "rev-parse", "HEAD")) != p.Head {
 		t.Fatal("reviewed head was not restored")
 	}
 }
@@ -237,78 +215,6 @@ func TestHostWritesIgnorePlantedRunFiles(t *testing.T) {
 	}
 }
 
-func TestAShipCallPinsItsRegistrationDuringLinkReplacement(t *testing.T) {
-	st := testStore(t)
-	f := newRepo(t, nil)
-	s := recoveryShip(t, st, f)
-	p, err := s.Prepare(context.Background(), testingCase(t, st).ID, f.main)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sibling := filepath.Join(f.dir, "sibling")
-	run(t, f.main, "git", "worktree", "add", "--detach", sibling, "HEAD")
-	before := run(t, sibling, "git", "write-tree")
-	link, _ := os.ReadFile(filepath.Join(sibling, ".git"))
-	gitBinary, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
-	marker := filepath.Join(f.dir, "replace-once")
-	write(t, marker, "marker-7f3a")
-	binDir := filepath.Join(f.dir, "bin")
-	script(t, binDir, "git", `if [ -f '`+marker+`' ]; then
- rm '`+marker+`'
- printf '%s\n' '`+strings.TrimSpace(string(link))+`' > '`+filepath.Join(p.Work, ".git")+`'
-fi
-exec '`+gitBinary+`' "$@"`)
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	write(t, filepath.Join(p.Work, "marker.txt"), "marker-7f3a\n")
-	if _, err := s.git(context.Background(), p.Work, "add", "-A"); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", filepath.Dir(gitBinary)+string(os.PathListSeparator)+os.Getenv("PATH"))
-	if got := run(t, sibling, "git", "write-tree"); got != before {
-		t.Fatal("sibling index changed")
-	}
-	if got := run(t, f.main, "git", "--git-dir="+p.GitDir, "--work-tree="+p.Work, "ls-files", "marker.txt"); strings.TrimSpace(got) != "marker.txt" {
-		t.Fatal("call did not operate on the pinned registration")
-	}
-	if _, err := s.git(context.Background(), p.Work, "status"); err == nil {
-		t.Fatal("subsequent call accepted the replaced link")
-	}
-}
-
-func TestDoorDirectoryCannotFollowAnOutsideLinkOrReplacement(t *testing.T) {
-	root := t.TempDir()
-	outside := t.TempDir()
-	if err := os.Symlink(outside, filepath.Join(root, "link")); err != nil {
-		t.Fatal(err)
-	}
-	if f, err := doorDirectory(filepath.Join(root, "link"), root, []string{root}); err == nil {
-		f.Close()
-		t.Fatal("door followed a directory link outside its root")
-	}
-	sub := filepath.Join(root, "sub")
-	if err := os.Mkdir(sub, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	f, err := doorDirectory(sub, root, []string{root})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	if err := os.Rename(sub, sub+"-original"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(outside, sub); err != nil {
-		t.Fatal(err)
-	}
-	got, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%d", os.Getpid(), f.Fd()))
-	if err != nil || got != sub+"-original" {
-		t.Fatalf("directory descriptor was redirected: %q %v", got, err)
-	}
-}
-
 func TestNonzeroExitCannotKeepAParsedSuccess(t *testing.T) {
 	res := Result{Status: store.RunOK, CostKnown: true, USD: .75}
 	err := exec.Command("sh", "-c", "exit 7").Run()
@@ -370,7 +276,7 @@ func TestProposalAdoptsTheExactPushAfterALostResponse(t *testing.T) {
 esac
 exec '`+gitBinary+`' "$@"`)
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	p, err := s.Propose(context.Background(), c.ID, pr)
+	p, err := proposePatch(t, s, context.Background(), c.ID, pr)
 	if err != nil || p.PublishedHead != p.Head || p.State != Proposed {
 		t.Fatalf("lost response was not adopted: %+v %v", p, err)
 	}

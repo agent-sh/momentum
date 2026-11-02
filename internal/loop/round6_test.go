@@ -89,8 +89,8 @@ func TestTheReviewsTextAndPromptAreScrubbed(t *testing.T) {
 	if raw, _ := os.ReadFile(filepath.Join(HostDir(build.Dir), "primary", "review.md")); !strings.Contains(string(raw), "it logs ****") || strings.Contains(string(raw), "zz-private-value") {
 		t.Fatalf("review.md: %q", raw)
 	}
-	run(t, p.Work, "git", "commit", "-q", "--allow-empty", "-m", "the change")
-	p.Head, p.State, p.Base = strings.TrimSpace(run(t, p.Work, "git", "rev-parse", "HEAD")), Proposed, "main"
+	write(t, filepath.Join(p.Work, "notes.txt"), "marker-7f3a\n")
+	p = fixtureCandidate(t, s, p)
 	if err := s.save(&p); err != nil {
 		t.Fatal(err)
 	}

@@ -24,7 +24,7 @@ import (
 // Steps a run takes a case through.
 const (
 	StepInvestigate = "investigate" // open or investigating: find the mechanism, decide
-	StepBuild       = "build"       // testing: build and propose the change, or revise it for its review
+	StepBuild       = "build"       // testing: prepare, then build and propose in the next run, or revise for its review
 	StepReview      = "review"      // a proposed change: a clean-context review
 	StepPublish     = "publish"     // closed as improved: the lesson to tacit
 )
@@ -52,7 +52,7 @@ type Runner struct {
 	Budgets     Budgets
 	Rules       []string // the machine's rules files
 	Constraints []string
-	ReadDirs    []string // where a run's evidence git reads repositories besides its work tree (loop.read_dirs)
+	ReadDirs    []string // the only repositories a run's evidence git reads (loop.read_dirs)
 	Dir         string   // the loop's directory
 	Home        string
 	Bins        []string // the directories of momentum's tools, first on the path of what a run's door runs
@@ -155,7 +155,7 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Skipped: "dry: " + why})
 			continue
 		case step == StepBuild && building:
-			// one build at a time: a build leaves its work tree changed, which the scope check of another reads as work
+			// one build at a time, including preparation runs
 			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Skipped: "another case builds in this run; the next run takes this one"})
 			continue
 		}
@@ -500,7 +500,7 @@ func (r *Runner) affordable(ctx context.Context) (string, error) {
 	return "", nil
 }
 
-// invoke runs the agent for a step, in its sandbox: its own directory, a build's work tree and the toolchains its
+// invoke runs the agent for a step, in its sandbox: its own directory, a prepared build's clone and the toolchains its
 // tests need, and its step's commands through its door.
 func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step string, run store.LoopRun) (Result, error) {
 	system, err := systemPrompt(step, family, r.Rules, r.Constraints)
@@ -512,31 +512,53 @@ func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step s
 	}
 	inv := Invocation{Dir: run.Dir, System: system, Schema: runSchema, MaxTurns: r.Budgets.MaxTurns, BudgetUSD: r.Budgets.Run,
 		Timeout: r.Budgets.RunTime, Persist: true}
+	inv.Private = []string{filepath.Join(r.Ship.Dir, "host"), filepath.Join(r.Ship.Dir, "packages")}
 	inv.Prompt = fmt.Sprintf("Case %s (%s, %s): %s\nStep: %s. Read the case with `momentum case show %s --json`, then take this step as the "+
 		"loop's procedure and the %s skill say. Your working directory is %s.", c.ID, c.Family, c.Status, c.Title, step, c.ID, family, run.Dir)
 	roots := []string{run.Dir}
 	if step == StepBuild {
-		work := r.Ship.workDir(c.ID)
-		roots = append(roots, work)
-		// what a run writes is made before its sandbox mounts it: the first build on a machine has neither a work tree
-		// nor a build cache, and a mount whose source is missing does not start
-		if err := os.MkdirAll(work, 0o700); err != nil {
+		p, ok, err := r.Ship.Load(c.ID)
+		if err != nil {
 			return Result{}, err
 		}
-		if err := r.Toolchains.makeCaches(); err != nil {
-			return Result{}, err
+		if ok && p.State != RolledBack && (p.Host == "" || p.BaseCommit == "") {
+			return Result{}, refused("legacy package has no independent host clone; prepare a fresh package before building")
 		}
-		inv.Mounts = append([]jail.Mount{{Path: work, Write: true}}, r.Toolchains.mounts()...)
-		inv.Env = r.Toolchains.env()
+		if ok && p.RefreshBase {
+			p, err = r.Ship.refreshBase(ctx, p)
+			if err != nil {
+				return Result{}, err
+			}
+			previous, err := os.ReadFile(filepath.Join(r.Ship.pkgDir(c.ID), "change.patch"))
+			if err != nil {
+				return Result{}, err
+			}
+			inv.Files = map[string][]byte{"previous.patch": previous}
+			inv.Prompt += "\nThe default branch moved. Start from /run/momentum/input/previous.patch, which is read-only. Adapt it to the new base."
+		}
+		if !ok || p.State == RolledBack {
+			inv.Prompt += "\nNo clone is mounted yet. Choose a repository with the evidence commands and call momentum ship prepare --repo DIR. End this run after preparation with the report; the next build mounts the complete clone. Preparation counts toward all budgets and the stop rule."
+		} else {
+			roots = append(roots, p.Work)
+			if err := r.Toolchains.makeCaches(); err != nil {
+				return Result{}, err
+			}
+			inv.Mounts = append([]jail.Mount{{Path: p.Work, Write: true, OwnRepository: true}}, r.Toolchains.mounts()...)
+			inv.Env = r.Toolchains.env()
+			inv.Prompt += fmt.Sprintf("\nYour independent clone is %s. BASE is %s. Host repositories and the host clone are absent. Use git inside your sandbox for history. Finish with git add -A && git diff --cached --binary %s > $MOMENTUM_LOOP_DIR/change.patch, then ship check and ship propose. Every revision is cumulative against BASE.", p.Work, p.BaseCommit, p.BaseCommit)
+		}
 		if p, ok, _ := r.Ship.Load(c.ID); ok && p.State == Revising && len(p.Reviews) > 0 {
 			last := p.Reviews[len(p.Reviews)-1]
 			text, err := Redact(ctx, last.Text)
 			if err != nil {
 				return Result{}, err
 			}
-			inv.Files = map[string][]byte{"review.md": []byte(text)}
+			if inv.Files == nil {
+				inv.Files = map[string][]byte{}
+			}
+			inv.Files["review.md"] = []byte(text)
 			inv.Prompt += fmt.Sprintf("\nIts change %s was reviewed: round %d found %d high, %d medium and %d low, in review.md. Revise the change "+
-				"in its work tree %s for what the review found (read /run/momentum/input/review.md), check it again (`momentum ship check`) and propose it again (`momentum ship "+
+				"in its independent clone %s for what the review found (read /run/momentum/input/review.md), check it again (`momentum ship check`) and propose it again (`momentum ship "+
 				"propose`), which updates its pull request.", p.PR, last.Round, last.High, last.Medium, last.Low, p.Work)
 		}
 	}
@@ -684,16 +706,20 @@ func (r *Runner) invokeReview(ctx context.Context, c store.Case, p Package, run 
 	}
 	inv := Invocation{Dir: run.Dir, System: system, Schema: reviewSchema, MaxTurns: r.Budgets.MaxTurns, BudgetUSD: r.Budgets.Run,
 		Timeout: r.Budgets.RunTime, Persist: true, Files: map[string][]byte{"diff.patch": []byte(diff), "package.json": []byte(pkg)}}
-	// the work tree is read-only, and its .git link names a directory the sandbox does not hold: its history is read
-	// through the door, which reads repositories in it as a build's does
-	roots := []string{run.Dir}
-	if p.Work != "" {
-		inv.Mounts = []jail.Mount{{Path: p.Work}}
-		roots = append(roots, p.Work)
+	inv.Private = []string{filepath.Join(r.Ship.Dir, "host"), filepath.Join(r.Ship.Dir, "packages")}
+	export, err := r.Ship.export(ctx, p, "review", p.Head)
+	if err != nil {
+		return Result{}, err
 	}
-	inv.Prompt = fmt.Sprintf("Review the change package of case %s (%s): %s. The change is /run/momentum/input/diff.patch and the package /run/momentum/input/package.json. Your "+
-		"working directory %s; the work tree is %s. Read the case with `momentum case show %s --json`. End with the review's report.",
-		c.ID, c.Family, p.Title, run.Dir, p.Work, c.ID)
+	defer r.Ship.unexport(p, export)
+	pin, err := os.Open(export)
+	if err != nil {
+		return Result{}, err
+	}
+	defer pin.Close()
+	roots := []string{run.Dir}
+	inv.Mounts = []jail.Mount{{Path: export, File: pin}}
+	inv.Prompt = fmt.Sprintf("Review case %s (%s): %s. Read /run/momentum/input/diff.patch and /run/momentum/input/package.json. Your working directory is %s. The proposed tree is exported read-only at %s with no .git. Use momentum evidence git only for repositories named by loop.read_dirs. Read momentum case show %s --json. End with the review report.", c.ID, c.Family, p.Title, run.Dir, export, c.ID)
 	inv.Door = r.door(StepReview, c, run, roots)
 	if inv.Prompt, err = Redact(ctx, inv.Prompt); err != nil {
 		return Result{}, err
@@ -826,7 +852,7 @@ func (r *Runner) caseRoom(ctx context.Context, c store.Case) (float64, bool, err
 
 // reviewDiff is the change as its review reads it, scrubbed: what the change's branch holds that its base does not.
 func (r *Runner) reviewDiff(ctx context.Context, p Package) (string, error) {
-	diff, err := r.Ship.git(ctx, p.Work, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "origin/"+p.Base+"..."+p.Head)
+	diff, err := r.Ship.git(ctx, p.Host, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", p.BaseCommit, p.Head)
 	if err != nil {
 		return "", err
 	}

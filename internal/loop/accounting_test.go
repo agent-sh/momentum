@@ -46,6 +46,88 @@ func localRunner(t *testing.T, st *store.Store) *Runner {
 		Families: []string{"failures"}, Budgets: DefaultBudgets}
 }
 
+// Preparing a package is a build run. Its reservation and charge leave less room for the build that uses the clone.
+func TestAPreparationCountsTowardTheBuildBudgets(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	f := newRepo(t, nil)
+	r := localRunner(t, st)
+	r.Ship = recoveryShip(t, st, f)
+	c := testingCase(t, st)
+	run, why := r.reserve(ctx, c.Family, c.ID, StepBuild)
+	if why != "" {
+		t.Fatal(why)
+	}
+	if spent, running, err := r.caseRoom(ctx, c); err != nil || !running || spent != r.Budgets.Run {
+		t.Fatalf("preparation did not reserve the case: %v %v %v", spent, running, err)
+	}
+	if spent, err := st.LoopSpend(ctx, time.Now().Add(-24*time.Hour), r.Budgets.Run); err != nil || spent != r.Budgets.Run {
+		t.Fatalf("preparation did not reserve the loop: %v %v", spent, err)
+	}
+	p, err := r.Ship.Prepare(ctx, c.ID, f.main)
+	if err != nil || p.State != Prepared {
+		t.Fatalf("prepare: %+v %v", p, err)
+	}
+	r.finish(ctx, c, &run, Result{Status: store.RunOK, CostKnown: true, USD: 0.75,
+		Report: json.RawMessage(`{"outcome":"testing","summary":"package prepared"}`)}, nil)
+	saved, err := st.LoopRunByID(ctx, run.ID)
+	if err != nil || saved.Step != StepBuild || saved.Status != store.RunOK || saved.USD != 0.75 {
+		t.Fatalf("preparation was not an ordinary build run: %+v %v", saved, err)
+	}
+	c, err = st.CaseByID(ctx, c.ID)
+	if err != nil || c.Cost.USD != 0.75 {
+		t.Fatalf("preparation cost left the case: %+v %v", c.Cost, err)
+	}
+	if next, step, _, err := r.pick(ctx, c.Family, c.ID, true); err != nil || next.ID != c.ID || step != StepBuild {
+		t.Fatalf("the prepared clone did not get another build: %s %s %v", next.ID, step, err)
+	}
+	r.Budgets.Case = r.Budgets.Run
+	if next, _, why, err := r.pick(ctx, c.Family, c.ID, true); err != nil || next.ID != "" || !strings.Contains(why, "no room") {
+		t.Fatalf("preparation spent none of the case budget: %s %q %v", next.ID, why, err)
+	}
+	r.Budgets.Case = DefaultBudgets.Case
+	for _, limit := range []string{"day", "week"} {
+		r.Budgets.Day, r.Budgets.Week = DefaultBudgets.Day, DefaultBudgets.Week
+		if limit == "day" {
+			r.Budgets.Day = r.Budgets.Run
+		} else {
+			r.Budgets.Week = r.Budgets.Run
+		}
+		refused, why := r.reserve(ctx, c.Family, c.ID, StepBuild)
+		if refused.Status != store.RunRefused || !strings.Contains(why, limit+" budget") {
+			t.Fatalf("preparation spent none of the %s budget: %+v %q", limit, refused, why)
+		}
+	}
+}
+
+// Two preparation runs that fail alike stop a third build, even though neither left a package.
+func TestFailedPreparationsUseTheBuildStopRule(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	f := newRepo(t, nil)
+	r := localRunner(t, st)
+	r.Ship = recoveryShip(t, st, f)
+	r.Ship.Gate.Owners = nil
+	c := testingCase(t, st)
+	for i := 0; i < 2; i++ {
+		run, why := r.reserve(ctx, c.Family, c.ID, StepBuild)
+		if why != "" {
+			t.Fatal(why)
+		}
+		if _, err := r.Ship.Prepare(ctx, c.ID, f.main); err == nil {
+			t.Fatal("fixture preparation should be refused")
+		} else {
+			r.finish(ctx, c, &run, Result{Status: store.RunFailed, Failure: err.Error(), CostKnown: true, USD: 0.75}, nil)
+		}
+		if _, ok, err := r.Ship.Load(c.ID); err != nil || ok {
+			t.Fatalf("a refused preparation left a package: %v %v", ok, err)
+		}
+	}
+	if next, _, why, err := r.pick(ctx, c.Family, c.ID, true); err != nil || next.ID != "" || !strings.Contains(why, "two build runs failed the same way") {
+		t.Fatalf("a third preparation was admitted: %s %q %v", next.ID, why, err)
+	}
+}
+
 // A running reservation is stale only after its allowed duration, with no extra grace period.
 func TestARunIsStaleOnlyPastTheTimeARunMayLast(t *testing.T) {
 	ctx := context.Background()

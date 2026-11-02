@@ -907,3 +907,18 @@ func TestTidyOrdersAParentBeforeWhatItHoldsAndMergesRepeats(t *testing.T) {
 		t.Errorf("tidy mounts are accepted: %v", err)
 	}
 }
+
+func TestTidyKeepsTheOwnRepositoryWhenMountsRepeat(t *testing.T) {
+	for _, first := range []bool{false, true} {
+		mounts := Tidy([]Mount{{Path: "/work/own", OwnRepository: first}, {Path: "/work/own", Write: true, OwnRepository: !first},
+			{Path: "/work/other", Write: true}})
+		for _, m := range mounts {
+			if m.Path == "/work/own" && (!m.Write || !m.OwnRepository) {
+				t.Errorf("the own repository lost its writable Git: %+v", m)
+			}
+			if m.Path == "/work/other" && m.OwnRepository {
+				t.Errorf("an ordinary mount lost its Git guard: %+v", m)
+			}
+		}
+	}
+}

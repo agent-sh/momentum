@@ -44,3 +44,28 @@ func exclusiveOutput(dir, name string) (*os.File, error) {
 	defer root.Close()
 	return root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
 }
+
+// Reused writable directories are metadata only. Never follow a link left by a primary attempt.
+func runDirectories(dir string) error {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	for _, name := range []string{"tmp", "claude"} {
+		st, err := root.Lstat(name)
+		if errors.Is(err, os.ErrNotExist) {
+			if err := root.Mkdir(name, 0700); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !st.IsDir() {
+			return fmt.Errorf("run directory %s is not a directory", name)
+		}
+	}
+	return nil
+}

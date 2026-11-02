@@ -53,7 +53,11 @@ func TestABaseTestLinkIsRefused(t *testing.T) {
 			run(t, f.main, "git", "add", ".")
 			run(t, f.main, "git", "commit", "-qm", "base link")
 			run(t, f.main, "git", "push", "-q", "origin", "main")
-			s := shipFor(t, st, f)
+			s := recoveryShip(t, st, f)
+			s.Sandbox.Gate = func(context.Context) error {
+				t.Fatal("a base link reached a test sandbox")
+				return nil
+			}
 			c := testingCase(t, st)
 			p, err := s.Prepare(ctx, c.ID, f.main)
 			if err != nil {
@@ -68,8 +72,9 @@ func TestABaseTestLinkIsRefused(t *testing.T) {
 			}
 			write(t, filepath.Join(p.Work, name), answerTest)
 			write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
-			_, err = s.Check(ctx, c.ID, "go test ./...", []string{name})
-			if err == nil || !strings.Contains(err.Error(), "symlink") {
+			_, err = checkPatch(t, s, ctx, c.ID, "go test ./...", []string{name})
+			// The cumulative patch deletes the base link. Its mode is refused before a test export is made.
+			if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "refused mode 120000") {
 				t.Errorf("base link accepted: %v", err)
 			}
 			if b, _ := os.ReadFile(target); string(b) != "KEEP" {
@@ -87,23 +92,24 @@ func TestGitFiltersNeverRunOnTheHost(t *testing.T) {
 			st := testStore(t)
 			ctx := context.Background()
 			f := newRepo(t, map[string]string{".gitattributes": "fake.go filter=fixture\n", "filter.sh": "cat\n"})
-			s := shipFor(t, st, f)
+			s := recoveryShip(t, st, f)
 			c := testingCase(t, st)
 			p, err := s.Prepare(ctx, c.ID, f.main)
 			if err != nil {
 				t.Fatal(err)
 			}
 			marker := filepath.Join(f.dir, "outside-marker")
-			write(t, filepath.Join(p.Work, "filter.sh"), "echo ran > '"+marker+"'\ncat\n")
-			write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
+			// Host configuration is independent of the source and run clones. Pin the repository Git will read.
+			write(t, filepath.Join(p.Host, "filter.sh"), "echo ran > '"+marker+"'\ncat\n")
+			write(t, filepath.Join(p.Host, "fake.go"), fixed("42"))
 			key := "filter.fixture." + driver
 			if driver == "merge" {
 				key = "merge.fixture.driver"
 			}
-			run(t, f.main, "git", "config", key, "sh filter.sh")
+			run(t, p.Host, "git", "config", key, "sh filter.sh")
 			for _, args := range [][]string{{"status", "--porcelain"}, {"add", "-A"}, {"read-tree", "-u", "--reset", "HEAD"}} {
-				if _, err := s.git(ctx, p.Work, args...); err == nil {
-					t.Errorf("external %s allowed for %v", driver, args)
+				if _, err := s.git(ctx, p.Host, args...); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), key) {
+					t.Errorf("external %s not refused before %v: %v", driver, args, err)
 				}
 			}
 			if _, err := os.Stat(marker); !os.IsNotExist(err) {
@@ -250,7 +256,7 @@ func TestABinaryDiffHidesNoSignalEdit(t *testing.T) {
 				text += "\x00\n"
 			}
 			write(t, filepath.Join(p.Work, "message.txt"), text)
-			tree, _, err := s.staged(context.Background(), p)
+			tree, _, err := s.applyPatch(context.Background(), p, []Patch{fixturePatch(t, s, p.Case)})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -279,8 +285,7 @@ func reviewFixture(t *testing.T) (*Runner, store.Case, Package) {
 	st := testStore(t)
 	r := runnerFor(t, st, fakeAgent(t, `{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":1,"structured_output":{"summary":"clean","findings":[]}}`))
 	c := testingCase(t, st)
-	work, head := reviewable(t)
-	p := Package{Case: c.ID, Kind: "repo", Repo: "agent-sh/fake", Base: "main", Dir: work, Work: work, State: Proposed, Head: head, PR: "https://example.invalid/pull/1"}
+	p := reviewable(t, r.Ship, c.ID)
 	r.Ship.Public = func(_ context.Context, s string) (string, error) { return Neutral(s), nil }
 	r.Ship.Gate = reviewGate(t)
 	if err := r.Ship.save(&p); err != nil {
@@ -329,7 +334,7 @@ func TestALandingWhoseRebasedTestFailsCanResume(t *testing.T) {
 			t.Fatalf("attempt %d cannot resume: %v", i, err)
 		}
 		saved, _, _ := s.Load(c.ID)
-		head := strings.TrimSpace(run(t, p.Work, "git", "rev-parse", "HEAD"))
+		head := strings.TrimSpace(run(t, p.Host, "git", "rev-parse", "HEAD"))
 		if saved.State != Proposed || saved.Head != head || head != p.Head {
 			t.Fatalf("stranded state %+v local=%s", saved, head)
 		}
@@ -540,7 +545,7 @@ exec '`+f.guard+`' "$@"`)
 [ "$GIT_ATTR_SOURCE" = 4b825dc642cb6eb9a060e54bf8d69288fbee4904 ]
 [ "$(git config --get core.hooksPath)" = /dev/null ]
 [ "$(git config --get core.fsmonitor)" = false ]
-[ "$(git config --get fixture.global)" = trusted ]
+if git config --get fixture.global > /dev/null; then exit 9; fi
 git status --porcelain`)
 	home := t.TempDir()
 	write(t, filepath.Join(home, ".gitconfig"), "[fixture]\n global = trusted\n")
@@ -615,9 +620,7 @@ func TestWhatARunIsHandedIsScrubbed(t *testing.T) {
 	}
 	write(t, filepath.Join(p.Work, "settings.conf"), "value changed\n")
 	write(t, filepath.Join(p.Work, "notes.txt"), "a note, and zz-private-value said again\n")
-	run(t, p.Work, "git", "add", "-A")
-	run(t, p.Work, "git", "commit", "-q", "-m", "the change")
-	p.Head, p.State, p.Base = strings.TrimSpace(run(t, p.Work, "git", "rev-parse", "HEAD")), Proposed, "main"
+	p = fixtureCandidate(t, s, p)
 	p.Check = &Check{Before: Outcome{Tail: "a test printed zz-private-value"}}
 	if err := s.save(&p); err != nil {
 		t.Fatal(err)

@@ -32,9 +32,8 @@ type Gate struct {
 	Exclude   []string // OWNER/REPO it never touches
 	RepoGuard []string // the machine's read-only scope check, run before any repository write
 	// Busy names what works in a repository now (a live session, a process, a recent change), or "" when nothing
-	// does; Own is the loop's own work directory, whose trees and processes are its own.
+	// does. Only host repositories enter this check.
 	Busy func(ctx context.Context, repoDir string) (string, error)
-	Own  string
 	Home string
 	// Resolve names a checkout's repository (OWNER/REPO); RepoOf, by its GitHub origin, when nil.
 	Resolve func(ctx context.Context, dir string) (string, error)
@@ -154,7 +153,7 @@ func (g Gate) scope(ctx context.Context, repo, dir string) error {
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, g.RepoGuard[0], append(append([]string{}, g.RepoGuard[1:]...), "--repo", repo, "--path", dir)...)
-	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0")
+	cmd.Env = gitChildEnv()
 	out, diag := Capture{Limit: jail.MaxStream}, Capture{Limit: jail.MaxStream}
 	cmd.Stdout, cmd.Stderr = &out, &diag
 	err := cmd.Run()
@@ -232,7 +231,7 @@ func gitOutput(ctx context.Context, dir string, args ...string) (string, error) 
 	}
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, "git", append(append(gitLocation(ctx, dir), GitSafety()...), args...)...)
+	cmd := exec.CommandContext(cctx, "git", append(append([]string{"-C", dir}, GitSafety()...), args...)...)
 	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0")
 	out, diag := Capture{Limit: jail.MaxStream}, Capture{Limit: jail.MaxStream}
 	cmd.Stdout, cmd.Stderr = &out, &diag
@@ -278,4 +277,15 @@ func GitSafety() []string {
 // GitEnv removes caller Git settings and disables system and global settings and tree attributes.
 func GitEnv() []string {
 	return append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_PAGER=cat")
+}
+
+// A trusted helper may start Git itself. Give its children the same pins as a direct host Git call.
+func gitChildEnv() []string {
+	pins := append(GitSafety(), "-c", "diff.external=", "-c", "push.followTags=false")
+	env := append(GitEnv(), fmt.Sprintf("GIT_CONFIG_COUNT=%d", len(pins)/2))
+	for i := 0; i < len(pins); i += 2 {
+		key, value, _ := strings.Cut(pins[i+1], "=")
+		env = append(env, fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", i/2, key), fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i/2, value))
+	}
+	return env
 }

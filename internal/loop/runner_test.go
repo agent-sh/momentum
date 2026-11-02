@@ -292,19 +292,22 @@ func TestASafeguardsRefusalFallsBack(t *testing.T) {
 	}
 }
 
-// reviewable is a work tree with a change to review: a commit on origin/main's.
-func reviewable(t *testing.T) (string, string) {
+// reviewable prepares independent clones, then imports a run patch into the host for a review-only fixture.
+func reviewable(t *testing.T, s *Ship, caseID string) Package {
 	t.Helper()
-	work := t.TempDir()
-	run(t, work, "git", "init", "-q", "-b", "main")
-	run(t, work, "git", "remote", "add", "origin", "https://github.com/agent-sh/fake.git")
-	write(t, filepath.Join(work, "x.go"), "package x\n")
-	run(t, work, "git", "add", "-A")
-	run(t, work, "git", "commit", "-q", "-m", "base")
-	run(t, work, "git", "update-ref", "refs/remotes/origin/main", "HEAD")
-	write(t, filepath.Join(work, "x.go"), "package x\n\n// X is x.\nconst X = 1\n")
-	run(t, work, "git", "commit", "-q", "-am", "change")
-	return work, strings.TrimSpace(run(t, work, "git", "rev-parse", "HEAD"))
+	f := newRepo(t, map[string]string{"x.go": "package fake\n"})
+	s.Gate = recoveryShip(t, s.Store, f).Gate
+	s.Identity = [2]string{"Owner Name", "owner@example.com"}
+	p, err := s.Prepare(context.Background(), caseID, f.main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(p.Work, "x.go"), "package fake\n\n// X is x.\nconst X = 1\n")
+	p = fixtureCandidate(t, s, p)
+	// The review gate resolves a forge-shaped source URL without using the local bare remote or the network.
+	run(t, p.Dir, "git", "remote", "set-url", "origin", "https://github.com/agent-sh/fake.git")
+	p.PR = "https://example.invalid/pull/1"
+	return p
 }
 
 // A run stopped at its time takes every process it started with it, those that ignore its TERM too.
@@ -370,8 +373,7 @@ func TestAReviewIsHeldAsARunIsAndGoesBackToTheBuild(t *testing.T) {
 		`"structured_output":{"summary":"one problem","findings":[{"severity":"medium","where":"x.go:1","problem":"p","fix":"f"}]}}`
 	r := runnerFor(t, st, fakeAgent(t, review))
 	c := testingCase(t, st)
-	work, head := reviewable(t)
-	p := Package{Case: c.ID, Kind: "repo", Repo: "agent-sh/fake", Base: "main", Dir: work, Work: work, State: Proposed, Head: head, PR: "https://x/pull/1"}
+	p := reviewable(t, r.Ship, c.ID)
 	if err := r.Ship.save(&p); err != nil {
 		t.Fatal(err)
 	}
@@ -406,8 +408,10 @@ func TestAReviewIsHeldAsARunIsAndGoesBackToTheBuild(t *testing.T) {
 	st2 := testStore(t)
 	r2 := runnerFor(t, st2, fakeAgent(t, `{"type":"result","subtype":"success","is_error":true,"num_turns":1,"total_cost_usd":3.5,"result":"the safeguards blocked it"}`))
 	c2 := testingCase(t, st2)
-	p2 := Package{Case: c2.ID, Kind: "repo", Repo: "agent-sh/fake", Base: "main", Dir: work, Work: work, State: Proposed, Head: head, PR: "https://x/pull/1"}
-	r2.Ship.save(&p2)
+	p2 := reviewable(t, r2.Ship, c2.ID)
+	if err := r2.Ship.save(&p2); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 2; i++ {
 		if d := r2.reviews(ctx, ""); len(d) != 1 || d[0].Run.Status != store.RunFailed {
 			t.Fatalf("review run %d: %+v", i, d)
@@ -420,8 +424,10 @@ func TestAReviewIsHeldAsARunIsAndGoesBackToTheBuild(t *testing.T) {
 	r3 := runnerFor(t, st3, fakeAgent(t, review))
 	c3 := testingCase(t, st3)
 	st3.AddCaseCost(ctx, c3.ID, store.Cost{USD: 17}, "test")
-	p3 := Package{Case: c3.ID, Kind: "repo", Repo: "agent-sh/fake", Base: "main", Dir: work, Work: work, State: Proposed, Head: head, PR: "https://x/pull/1"}
-	r3.Ship.save(&p3)
+	p3 := reviewable(t, r3.Ship, c3.ID)
+	if err := r3.Ship.save(&p3); err != nil {
+		t.Fatal(err)
+	}
 	if d := r3.reviews(ctx, ""); len(d) != 1 || !strings.Contains(d[0].Skipped, "no room") {
 		t.Fatalf("a review over the case's budget: %+v", d)
 	}
@@ -707,7 +713,7 @@ func TestALandedPackageFinishesItsDeployment(t *testing.T) {
 			s := shipFor(t, st, f)
 			c, p := reviewedChange(t, s, st, f)
 			if resumed {
-				run(t, p.Work, "git", "push", "origin", "HEAD:main")
+				run(t, p.Host, "git", "push", "origin", "HEAD:main")
 				p.State, p.LandingHead = Landing, p.Head
 				if err := s.save(&p); err != nil {
 					t.Fatal(err)

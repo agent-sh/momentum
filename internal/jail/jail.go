@@ -68,6 +68,11 @@ const maxPath = 4096
 type Mount struct {
 	Path  string
 	Write bool
+	// OwnRepository says the mount holds a repository that only the program uses: nothing outside the sandbox reads
+	// its .git or runs git in it, so its .git stays writable and the program can commit, change its configuration
+	// and rewrite it freely. The caller takes only bytes the program chose to hand back (a patch), never a path,
+	// a configuration or an executable from the mount.
+	OwnRepository bool
 	// File, when set, pins the source of a read-only mount: Command duplicates it (the caller keeps its own, and
 	// closes it) and bubblewrap binds that descriptor instead of resolving Path, which the program could replace
 	// with a link between the caller's checks and the mount. A pinned mount is never writable.
@@ -268,6 +273,9 @@ func (s Spec) check() (home string, mounts []string, pins []*os.File, err error)
 			continue
 		}
 		mounts = append(mounts, "--bind", m.Path, m.Path)
+		if m.OwnRepository {
+			continue
+		}
 		git, err := gitDir(m.Path)
 		if err != nil {
 			return "", nil, nil, err
@@ -280,7 +288,7 @@ func (s Spec) check() (home string, mounts []string, pins []*os.File, err error)
 }
 
 // Tidy returns mounts as Command needs them: a parent before what it holds, and each path once. Listings of one path
-// are merged: the mount is writable if any listing is, and pinned by the first listing that has a File. The caller
+// are merged: Write and OwnRepository hold if any listing says so, and the first File pins it. The caller
 // keeps (and closes) every File it gave, dropped listings included.
 func Tidy(mounts []Mount) []Mount {
 	sorted := append([]Mount(nil), mounts...)
@@ -292,6 +300,7 @@ func Tidy(mounts []Mount) []Mount {
 	for _, m := range sorted {
 		if i, ok := at[m.Path]; ok {
 			out[i].Write = out[i].Write || m.Write
+			out[i].OwnRepository = out[i].OwnRepository || m.OwnRepository
 			if out[i].File == nil {
 				out[i].File = m.File
 			}

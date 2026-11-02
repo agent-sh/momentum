@@ -123,9 +123,6 @@ func (s Sandbox) Run(ctx context.Context, dir string, words []string, env []stri
 		args = append(args, "--dir", s.Home)
 	}
 	args = append(args, "--bind", dir, dir, "--bind", scratch, scratch)
-	if st, err := os.Lstat(filepath.Join(dir, ".git")); err == nil && !st.IsDir() {
-		args = append(args, "--ro-bind", filepath.Join(dir, ".git"), filepath.Join(dir, ".git")) // its link to the repository stays the loop's
-	}
 	cache := s.Cache
 	if cache != "" {
 		if err := (Toolchains{Cache: cache}).makeCaches(); err != nil {

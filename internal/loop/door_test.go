@@ -11,7 +11,7 @@ import (
 )
 
 // A run's door runs, outside the sandbox, the commands its step allows: momentum's with the loop's variables, in the
-// run's directory, tacit's scrubbed; what the step does not allow runs nothing. The harness types them inside, as
+// host-only directory, tacit's scrubbed; what the step does not allow runs nothing. The harness types them inside, as
 // plain momentum and tacit commands.
 func TestARunsDoorRunsItsStepsCommandsOutsideTheSandbox(t *testing.T) {
 	was := Scrubber
@@ -40,7 +40,7 @@ echo '`+okResult+`'`)
 	}
 	ran, _ := os.ReadFile(log)
 	got, _ := os.ReadFile(out)
-	if want := "momentum evidence show ev:1 in " + done[0].Run.Dir + " run=" + done[0].Run.ID + " case=" + c.ID + " door=none"; !strings.Contains(string(ran), want) {
+	if want := "momentum evidence show ev:1 in " + HostDir(done[0].Run.Dir) + " run=" + done[0].Run.ID + " case=" + c.ID + " door=none"; !strings.Contains(string(ran), want) {
 		t.Errorf("the door ran:\n%s\nwant %q", ran, want)
 	}
 	if strings.Contains(string(ran), "propose") {

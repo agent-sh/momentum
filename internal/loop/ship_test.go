@@ -144,7 +144,7 @@ func shipFor(t *testing.T, st *store.Store, f repoFixture) *Ship {
 func shipWithSandbox(st *store.Store, f repoFixture, sb Sandbox) *Ship {
 	return &Ship{Store: st, Dir: filepath.Join(f.dir, "loop"), Live: true, Actor: "loop:test", Identity: [2]string{"Owner Name", "owner@example.com"},
 		GH: f.gh, Sandbox: sb, Public: func(_ context.Context, s string) (string, error) { return Neutral(s), nil },
-		Gate: Gate{Owners: []string{"agent-sh"}, RepoGuard: []string{f.guard}, Home: sb.Home, Own: filepath.Join(f.dir, "loop"),
+		Gate: Gate{Owners: []string{"agent-sh"}, RepoGuard: []string{f.guard}, Home: sb.Home,
 			Resolve: func(context.Context, string) (string, error) { return "agent-sh/fake", nil },
 			Busy:    func(context.Context, string) (string, error) { return "", nil }}}
 }
@@ -223,60 +223,60 @@ func TestAChangeShipsOnlyThroughItsPackage(t *testing.T) {
 	}
 	test := "go test ./..."
 	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
-	if _, err := s.Check(ctx, c.ID, test, nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "no test file") {
+	if _, err := checkPatch(t, s, ctx, c.ID, test, nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "no test file") {
 		t.Fatalf("a check without a test: %v", err)
 	}
 	// a test that passes without the change does not discriminate it
 	write(t, filepath.Join(p.Work, "note_test.go"), "package fake\n\nimport \"testing\"\n\nfunc TestNote(t *testing.T) {\n\tif Note() == \"\" {\n\t\tt.Fatal(1)\n\t}\n}\n")
-	if _, err := s.Check(ctx, c.ID, test, []string{"note_test.go"}); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "passes without the change") {
+	if _, err := checkPatch(t, s, ctx, c.ID, test, []string{"note_test.go"}); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "passes without the change") {
 		t.Fatalf("a test that passes on the base: %v", err)
 	}
 	os.Remove(filepath.Join(p.Work, "note_test.go"))
 	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
-	if _, err := s.Check(ctx, c.ID, "go test ./... | tee x", nil); !errors.Is(err, ErrRefused) {
+	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./... | tee x", nil); !errors.Is(err, ErrRefused) {
 		t.Fatalf("a shell in the test command: %v", err)
 	}
 	// a file the commit would not hold (ignored) is not what the check runs on
 	write(t, filepath.Join(p.Work, ".gitignore"), "go.work\n")
 	write(t, filepath.Join(p.Work, "go.work"), "this is no go.work file\n")
-	if p, err = s.Check(ctx, c.ID, test, nil); err != nil || p.State != Checked || p.Check.Before.Exit == 0 || p.Check.After.Exit != 0 {
+	if p, err = checkPatch(t, s, ctx, c.ID, test, nil); err != nil || p.State != Checked || p.Check.Before.Exit == 0 || p.Check.After.Exit != 0 {
 		t.Fatalf("check: %+v %v", p.Check, err)
 	}
 	pr := Proposal{Title: "Answer is 42", Body: "Answer was off by one; see agent-sh/fake#3, ask @owner.", Rollback: "revert the commit",
 		Lesson: "Answers are 42.", Signal: goodSignal, Window: 7 * 24 * time.Hour}
 	bad := pr
 	bad.Signal = Signal{Source: store.Transcripts, Kinds: []string{"tool_result"}, Match: []string{"something else entirely"}}
-	if _, err := s.Propose(ctx, c.ID, bad); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "fewer than") {
+	if _, err := proposePatch(t, s, ctx, c.ID, bad); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "fewer than") {
 		t.Fatalf("a signal that counts nothing: %v", err)
 	}
 	// an edit after the check needs a new check
 	write(t, filepath.Join(p.Work, "extra.go"), "package fake\n")
-	if _, err := s.Propose(ctx, c.ID, pr); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "check it again") {
+	if _, err := proposePatch(t, s, ctx, c.ID, pr); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "check it again") {
 		t.Fatalf("a change edited after its check: %v", err)
 	}
 	os.Remove(filepath.Join(p.Work, "extra.go"))
 	// a change that rewrites the words its signal counts
 	write(t, filepath.Join(p.Work, "fake.go"), strings.Replace(fixed("42"), "\"zz-signal-text\"", "\"quiet\"", 1))
-	if _, err := s.Check(ctx, c.ID, test, nil); err != nil {
+	if _, err := checkPatch(t, s, ctx, c.ID, test, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Propose(ctx, c.ID, pr); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "edits") {
+	if _, err := proposePatch(t, s, ctx, c.ID, pr); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "edits") {
 		t.Fatalf("a change that edits its signal's text: %v", err)
 	}
 	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
-	if _, err := s.Check(ctx, c.ID, test, nil); err != nil {
+	if _, err := checkPatch(t, s, ctx, c.ID, test, nil); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("GIT_COMMITTER_NAME", "Someone Else")
 	t.Setenv("EMAIL", "someone@example.com")
 	t.Setenv("GIT_DIR", filepath.Join(t.TempDir(), "elsewhere")) // git's own variables do not point the ship tool elsewhere
-	if p, err = s.Propose(ctx, c.ID, pr); err != nil || p.State != Proposed || p.PR != "https://github.com/agent-sh/fake/pull/7" || p.Plan.Before != 4 {
+	if p, err = proposePatch(t, s, ctx, c.ID, pr); err != nil || p.State != Proposed || p.PR != "https://github.com/agent-sh/fake/pull/7" || p.Plan.Before != 4 {
 		t.Fatalf("propose: %+v %v", p, err)
 	}
-	if who := run(t, p.Work, "git", "log", "-1", "--format=%an <%ae> / %cn <%ce>"); strings.TrimSpace(who) != "Owner Name <owner@example.com> / Owner Name <owner@example.com>" {
+	if who := run(t, p.Host, "git", "log", "-1", "--format=%an <%ae> / %cn <%ce>"); strings.TrimSpace(who) != "Owner Name <owner@example.com> / Owner Name <owner@example.com>" {
 		t.Fatalf("committed as %q", who)
 	}
-	if msg := run(t, p.Work, "git", "log", "-1", "--format=%B"); strings.Contains(msg, "#3") || strings.Contains(msg, "@owner") {
+	if msg := run(t, p.Host, "git", "log", "-1", "--format=%B"); strings.Contains(msg, "#3") || strings.Contains(msg, "@owner") {
 		t.Fatalf("the commit's mentions and references are live: %q", msg)
 	}
 	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "review") {
@@ -298,17 +298,17 @@ func TestAChangeShipsOnlyThroughItsPackage(t *testing.T) {
 		t.Fatalf("a review of a package back at its build: %v", err)
 	}
 	first := p.Head
-	if _, err := s.Check(ctx, c.ID, test, nil); err != nil {
+	if _, err := checkPatch(t, s, ctx, c.ID, test, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Propose(ctx, c.ID, pr); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "changes nothing") {
+	if _, err := proposePatch(t, s, ctx, c.ID, pr); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "changes nothing") {
 		t.Fatalf("a revision that changes nothing: %v", err)
 	}
 	write(t, filepath.Join(p.Work, "fake.go"), strings.Replace(fixed("42"), "// Answer is the answer.", "// Answer is the answer, 42.", 1))
-	if p, err = s.Check(ctx, c.ID, test, nil); err != nil || p.State != Checked {
+	if p, err = checkPatch(t, s, ctx, c.ID, test, nil); err != nil || p.State != Checked {
 		t.Fatalf("the revision's check: %+v %v", p, err)
 	}
-	if p, err = s.Propose(ctx, c.ID, pr); err != nil || p.State != Proposed || p.Head == first || p.PR != "https://github.com/agent-sh/fake/pull/7" {
+	if p, err = proposePatch(t, s, ctx, c.ID, pr); err != nil || p.State != Proposed || p.Head == first || p.PR != "https://github.com/agent-sh/fake/pull/7" {
 		t.Fatalf("the revision: %+v %v", p, err)
 	}
 	if calls, _ := os.ReadFile(filepath.Join(f.dir, "gh-calls")); !strings.Contains(string(calls), "pr edit https://github.com/agent-sh/fake/pull/7") {
@@ -323,13 +323,13 @@ func TestAChangeShipsOnlyThroughItsPackage(t *testing.T) {
 		t.Fatal(err)
 	}
 	// a commit after the review is no reviewed commit
-	write(t, filepath.Join(p.Work, "late.go"), "package fake\n")
-	run(t, p.Work, "git", "add", "-A")
-	run(t, p.Work, "git", "commit", "-q", "-m", "late")
+	write(t, filepath.Join(p.Host, "late.go"), "package fake\n")
+	run(t, p.Host, "git", "add", "-A")
+	run(t, p.Host, "git", "commit", "-q", "-m", "late")
 	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "not the reviewed") {
 		t.Fatalf("landed a commit after its review: %v", err)
 	}
-	run(t, p.Work, "git", "reset", "-q", "--hard", p.Head)
+	run(t, p.Host, "git", "reset", "-q", "--hard", p.Head)
 	s.Live = false
 	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "not live") {
 		t.Fatalf("landed while not live: %v", err)
@@ -390,19 +390,19 @@ func TestAProposalCommitsBeforeTheScopeCheckAndResumes(t *testing.T) {
 	}
 	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
 	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
-	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); err != nil {
 		t.Fatal(err)
 	}
 	pr := Proposal{Title: "Answer is 42", Body: "Off by one.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}
 	write(t, filepath.Join(f.dir, "gh-fails"), "")
-	if p, err = s.Propose(ctx, c.ID, pr); err == nil || p.State != Checked || p.Head == "" {
+	if p, err = proposePatch(t, s, ctx, c.ID, pr); err == nil || p.State != Checked || p.Head == "" {
 		t.Fatalf("a proposal whose pull request failed: %+v %v", p, err)
 	}
 	head := p.Head
-	if p, err = s.Propose(ctx, c.ID, pr); err != nil || p.State != Proposed || p.Head != head {
+	if p, err = proposePatch(t, s, ctx, c.ID, pr); err != nil || p.State != Proposed || p.Head != head {
 		t.Fatalf("taken up again: %+v %v", p, err)
 	}
-	if n := strings.Count(run(t, p.Work, "git", "log", "--format=%s", "origin/main..HEAD"), "\n"); n != 1 {
+	if n := strings.Count(run(t, p.Host, "git", "log", "--format=%s", "origin/main..HEAD"), "\n"); n != 1 {
 		t.Fatalf("%d commits on the branch", n)
 	}
 	// a dirty work tree of another (the owner's checkout) is report only
@@ -434,10 +434,10 @@ func TestTheChangesOwnGitFilesDoNotRun(t *testing.T) {
 	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
 	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
 	write(t, filepath.Join(p.Work, ".githooks", "post-commit"), "#!/bin/sh\ntouch "+marker+" # the change's own\n")
-	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Propose(ctx, c.ID, Proposal{Title: "t", Body: "b", Rollback: "r", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
+	if _, err := proposePatch(t, s, ctx, c.ID, Proposal{Title: "t", Body: "b", Rollback: "r", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(marker); err == nil {
@@ -448,10 +448,17 @@ func TestTheChangesOwnGitFilesDoNotRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(p2.Work, ".git"), "gitdir: "+filepath.Join(t.TempDir(), "evil")+"\n")
-	if _, err := s.Check(ctx, c2.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), ".git") {
-		t.Fatalf("a work tree linked elsewhere: %v", err)
+	write(t, filepath.Join(p2.Work, "fake.go"), fixed("42"))
+	write(t, filepath.Join(p2.Work, "fake_test.go"), answerTest)
+	in := fixturePatch(t, s, c2.ID)
+	if err := os.RemoveAll(filepath.Join(p2.Work, ".git")); err != nil {
+		t.Fatal(err)
 	}
+	write(t, filepath.Join(p2.Work, ".git"), "gitdir: /fixture/denied\n")
+	if _, err := s.Check(ctx, c2.ID, "go test ./...", nil, in); err != nil {
+		t.Fatalf("host read run Git: %v", err)
+	}
+
 }
 
 func testingCase2(t *testing.T, st *store.Store) store.Case {
@@ -486,39 +493,39 @@ func TestAChangeToTheLoopsOwnCodeIsRefusedHoweverItIsMade(t *testing.T) {
 	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
 	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
 	run(t, p.Work, "git", "mv", "internal/loop/gate.go", "gate.go.txt")
-	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/loop/gate.go") {
+	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/loop/gate.go") {
 		t.Fatalf("a protected file moved away: %v", err)
 	}
 	run(t, p.Work, "git", "mv", "gate.go.txt", "internal/loop/gate.go")
 	run(t, p.Work, "git", "mv", "docs/x.txt", "internal/loop/x.go")
-	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/loop/x.go") {
+	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/loop/x.go") {
 		t.Fatalf("a file moved into a protected path: %v", err)
 	}
 	run(t, p.Work, "git", "mv", "internal/loop/x.go", "docs/x.txt")
 	write(t, filepath.Join(p.Work, "internal/jail/jail.go"), "package jail\n// edited\n")
-	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/jail/") {
+	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/jail/") {
 		t.Fatalf("the sandbox edited: %v", err)
 	}
 	write(t, filepath.Join(p.Work, "internal/jail/jail.go"), "package jail\n")
 	for _, move := range [][2]string{{"internal/jail/jail.go", "jail.txt"}, {"docs/x.txt", "internal/jail/x.go"}} {
 		run(t, p.Work, "git", "mv", move[0], move[1])
-		if _, err := s.Check(ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/jail/") {
+		if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/jail/") {
 			t.Fatalf("the sandbox path moved %v: %v", move, err)
 		}
 		run(t, p.Work, "git", "mv", move[1], move[0])
 	}
 	write(t, filepath.Join(p.Work, "internal/jail/new.go"), "package jail\n")
-	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/jail/") {
+	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/jail/") {
 		t.Fatalf("the sandbox path added: %v", err)
 	}
 	os.Remove(filepath.Join(p.Work, "internal/jail/new.go"))
 	write(t, filepath.Join(p.Work, "internal", "loop", "é.go"), "package loop\n")
-	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/loop/é.go") {
+	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/loop/é.go") {
 		t.Fatalf("a new protected file with a quoted name: %v", err)
 	}
 	os.Remove(filepath.Join(p.Work, "internal", "loop", "é.go"))
 	write(t, filepath.Join(p.Work, "internal", "supervise", "rules.go"), "package supervise\n\n// a rule\n")
-	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); err != nil {
 		t.Fatalf("supervision's rules are the system it improves: %v", err)
 	}
 }
@@ -601,7 +608,6 @@ func TestTheSandboxKeepsATestInItsTree(t *testing.T) {
 	defer os.RemoveAll(home)
 	sb.Home = home
 	tree := t.TempDir()
-	write(t, filepath.Join(tree, ".git"), "gitdir: /x\n")
 	outside := t.TempDir()
 	sock := filepath.Join(outside, "s.sock")
 	socketDir, err := os.Open(outside)
@@ -643,9 +649,8 @@ try:
 except OSError: pass
 if os.path.exists(%q): bad.append("read the home")
 if os.listdir("/run"): bad.append("/run holds " + " ".join(os.listdir("/run")[:5]))
-try:
-    open(".git", "w").write("gitdir: /elsewhere"); bad.append("wrote its .git link")
-except OSError: pass
+if os.path.lexists(".git"): bad.append("export has Git control files")
+open(".git", "w").write("gitdir: /elsewhere")
 for k in ("DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK"):
     if k in os.environ: bad.append(k)
 if os.environ.get("HOME") != %q: bad.append("HOME is " + os.environ.get("HOME", ""))
@@ -659,6 +664,9 @@ print(" ".join(bad)); sys.exit(1 if bad else 0)
 	}
 	if b, _ := os.ReadFile(filepath.Join(tree, "inside.txt")); string(b) != "ok" {
 		t.Fatal("the test could not write its own tree")
+	}
+	if b, _ := os.ReadFile(filepath.Join(tree, ".git")); string(b) != "gitdir: /elsewhere" {
+		t.Fatal("the disposable export could not write its own files")
 	}
 }
 
@@ -674,7 +682,7 @@ func TestAChangeMayNotRewriteItsSignalsText(t *testing.T) {
 		t.Fatal(err)
 	}
 	write(t, filepath.Join(p.Work, "notes.md"), "quiet now\n")
-	tree, _, err := s.staged(ctx, p)
+	tree, _, err := s.applyPatch(ctx, p, []Patch{fixturePatch(t, s, p.Case)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -719,10 +727,10 @@ func TestAProposalNeedsTheCasesOwnEvents(t *testing.T) {
 	}
 	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
 	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
-	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Propose(ctx, c.ID, Proposal{Title: "t", Body: "b", Rollback: "r", Signal: goodSignal, Window: 7 * 24 * time.Hour}); !errors.Is(err, ErrRefused) ||
+	if _, err := proposePatch(t, s, ctx, c.ID, Proposal{Title: "t", Body: "b", Rollback: "r", Signal: goodSignal, Window: 7 * 24 * time.Hour}); !errors.Is(err, ErrRefused) ||
 		!strings.Contains(err.Error(), "holds no event") {
 		t.Fatalf("a case with no event of its own: %v", err)
 	}
@@ -739,10 +747,10 @@ func reviewedChange(t *testing.T, s *Ship, st *store.Store, f repoFixture) (stor
 	}
 	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
 	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
-	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Propose(ctx, c.ID, Proposal{Title: "Answer is 42", Body: "Off by one.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
+	if _, err := proposePatch(t, s, ctx, c.ID, Proposal{Title: "Answer is 42", Body: "Off by one.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
 		t.Fatal(err)
 	}
 	if p, err = s.Reviewed(ctx, c.ID, Review{Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || !p.Clean() {
@@ -788,28 +796,28 @@ func TestEachStepChecksAgainWhatItRestsOn(t *testing.T) {
 	test := "go test ./..."
 	write(t, filepath.Join(p.Work, "fake.go"), fixed("43"))
 	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
-	if _, err := s.Check(ctx, c.ID, test, nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "fails with the change") {
+	if _, err := checkPatch(t, s, ctx, c.ID, test, nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "fails with the change") {
 		t.Fatalf("a change that fails its own test: %v", err)
 	}
 	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
-	if _, err := s.Check(ctx, c.ID, test, []string{"other_test.go"}); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "not a file the change touches") {
+	if _, err := checkPatch(t, s, ctx, c.ID, test, []string{"other_test.go"}); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "not a file the change touches") {
 		t.Fatalf("a test file the change does not touch: %v", err)
 	}
-	if _, err := s.Check(ctx, c.ID, test, nil); err != nil {
+	if _, err := checkPatch(t, s, ctx, c.ID, test, nil); err != nil {
 		t.Fatal(err)
 	}
 	base := originHead(t, f, "main")
 	stop := filepath.Join(f.dir, "report-only")
 	pr := Proposal{Title: "Answer is 42", Body: "Off by one.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}
 	write(t, stop, "")
-	if _, err := s.Propose(ctx, c.ID, pr); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "report_only") {
+	if _, err := proposePatch(t, s, ctx, c.ID, pr); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "report_only") {
 		t.Fatalf("a proposal the gate refuses now: %v", err)
 	}
 	if pushes, _ := os.ReadFile(filepath.Join(f.dir, "pushes")); strings.Contains(string(pushes), p.Branch) {
 		t.Fatalf("a proposal the gate refused was pushed:\n%s", pushes)
 	}
 	os.Remove(stop)
-	if _, err := s.Propose(ctx, c.ID, pr); err != nil {
+	if _, err := proposePatch(t, s, ctx, c.ID, pr); err != nil {
 		t.Fatal(err)
 	}
 	if p, err = s.Reviewed(ctx, c.ID, Review{Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || !p.Clean() {
@@ -820,25 +828,11 @@ func TestEachStepChecksAgainWhatItRestsOn(t *testing.T) {
 		t.Fatalf("a landing the gate refuses now: %v", err)
 	}
 	os.Remove(stop)
-	write(t, filepath.Join(p.Work, "stray.txt"), "not reviewed\n")
+	write(t, filepath.Join(p.Host, "stray.txt"), "not reviewed\n")
 	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "holds changes") || originHead(t, f, "main") != base {
 		t.Fatalf("a landing with a change besides the reviewed commit: %v", err)
 	}
-	os.Remove(filepath.Join(p.Work, "stray.txt"))
-	// another repository that holds the reviewed commit, and a .git pointed at it
-	elsewhere := t.TempDir()
-	run(t, f.dir, "git", "clone", "-q", f.origin, elsewhere)
-	run(t, elsewhere, "git", "fetch", "-q", "origin", p.Branch)
-	run(t, elsewhere, "git", "checkout", "-q", "--detach", p.Head)
-	link, _ := os.ReadFile(filepath.Join(p.Work, ".git"))
-	write(t, filepath.Join(p.Work, ".git"), "gitdir: "+filepath.Join(elsewhere, ".git")+"\n")
-	if head := strings.TrimSpace(run(t, p.Work, "git", "rev-parse", "HEAD")); head != p.Head {
-		t.Fatalf("the other repository's head is %s, not the reviewed %s", head, p.Head)
-	}
-	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "recorded registration") || originHead(t, f, "main") != base {
-		t.Fatalf("a landing through a .git pointed elsewhere: %v", err)
-	}
-	write(t, filepath.Join(p.Work, ".git"), string(link))
+	os.Remove(filepath.Join(p.Host, "stray.txt"))
 	if p, err = s.Land(ctx, c.ID); err != nil || p.State != Landed {
 		t.Fatalf("land: %+v %v", p, err)
 	}
@@ -917,11 +911,11 @@ func TestARevisionDoesNotOverwriteAnotherPushToItsBranch(t *testing.T) {
 	}
 	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
 	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
-	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); err != nil {
 		t.Fatal(err)
 	}
 	pr := Proposal{Title: "Answer is 42", Body: "Off by one.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}
-	if p, err = s.Propose(ctx, c.ID, pr); err != nil {
+	if p, err = proposePatch(t, s, ctx, c.ID, pr); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Reviewed(ctx, c.ID, Review{Findings: []Finding{{Severity: "medium", Where: "fake.go", Problem: "p", Fix: "f"}}, Comment: "c1"}); err != nil {
@@ -930,10 +924,10 @@ func TestARevisionDoesNotOverwriteAnotherPushToItsBranch(t *testing.T) {
 	theirs := pushOther(t, f, p.Branch, map[string]string{"theirs.txt": "a fix of someone's\n"})
 	run(t, f.main, "git", "fetch", "origin", p.Branch)
 	write(t, filepath.Join(p.Work, "fake.go"), strings.Replace(fixed("42"), "// Answer is the answer.", "// Answer is 42.", 1))
-	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Propose(ctx, c.ID, pr); err == nil {
+	if _, err := proposePatch(t, s, ctx, c.ID, pr); err == nil {
 		t.Fatal("a revision overwrote another push to its branch")
 	}
 	if head := originHead(t, f, p.Branch); head != theirs {
@@ -1026,12 +1020,12 @@ func TestBranchConditionalDriversAreRefused(t *testing.T) {
 				write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
 				write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
 				if step != "check" {
-					if _, err = s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+					if _, err = checkPatch(t, s, ctx, c.ID, "go test ./...", nil); err != nil {
 						t.Fatal(err)
 					}
 				}
 				if step == "land" {
-					if _, err = s.Propose(ctx, c.ID, Proposal{Title: "Answer", Body: "Fix it.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
+					if _, err = proposePatch(t, s, ctx, c.ID, Proposal{Title: "Answer", Body: "Fix it.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
 						t.Fatal(err)
 					}
 					if _, err = s.Reviewed(ctx, c.ID, Review{Comment: "https://example.invalid/review"}); err != nil {
@@ -1047,9 +1041,9 @@ func TestBranchConditionalDriversAreRefused(t *testing.T) {
 			case "prepare":
 				_, err = s.Prepare(ctx, c.ID, f.main)
 			case "check":
-				_, err = s.Check(ctx, c.ID, "go test ./...", nil)
+				_, err = checkPatch(t, s, ctx, c.ID, "go test ./...", nil)
 			case "propose":
-				_, err = s.Propose(ctx, c.ID, Proposal{Title: "Answer", Body: "Fix it.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour})
+				_, err = proposePatch(t, s, ctx, c.ID, Proposal{Title: "Answer", Body: "Fix it.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour})
 			case "land":
 				_, err = s.Land(ctx, c.ID)
 			}
@@ -1114,10 +1108,10 @@ func TestShipGitRunsNoRepositoryPrograms(t *testing.T) {
 			// The scope checker is an independent program. This fixture checks only its authority receipt.
 			s.Gate.RepoGuard = []string{script(t, f.dir, "allow", `echo '{"allowed":true}'`)}
 			c, p := reviewedChange(t, s, st, f)
-			if _, err := s.git(ctx, p.Work, "log", "--format=%G?"); err != nil {
+			if _, err := s.git(ctx, p.Host, "log", "--format=%G?"); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := gitOutput(ctx, p.Work, "log", "--format=%G?"); err != nil {
+			if _, err := gitOutput(ctx, p.Host, "log", "--format=%G?"); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := s.Land(ctx, c.ID); err != nil {
@@ -1196,7 +1190,7 @@ func TestEveryPushChecksItsPackageDestination(t *testing.T) {
 			run(t, f.main, "git", "config", "remote.origin.pushurl", other)
 		}
 		for _, args := range [][]string{{"--no-verify", "origin", "HEAD:refs/heads/" + p.Branch}, {"--no-verify", "origin", "HEAD:refs/heads/main"}, {"--no-verify", "origin", "--delete", p.Branch}} {
-			if _, err := s.push(ctx, p, p.Work, args...); !errors.Is(err, ErrRefused) {
+			if _, err := s.push(ctx, p, p.Host, args...); !errors.Is(err, ErrRefused) {
 				t.Fatalf("push %v: %v", args, err)
 			}
 		}
@@ -1209,7 +1203,7 @@ func TestEveryPushChecksItsPackageDestination(t *testing.T) {
 	}
 	run(t, f.main, "git", "config", "--unset-all", "url."+other+".pushInsteadOf")
 	s.Gate.Resolve = func(context.Context, string) (string, error) { return "agent-sh/other", nil }
-	if _, err := s.push(ctx, p, p.Work, "origin", "HEAD:refs/heads/main"); !errors.Is(err, ErrRefused) {
+	if _, err := s.push(ctx, p, p.Host, "origin", "HEAD:refs/heads/main"); !errors.Is(err, ErrRefused) {
 		t.Fatalf("different package identity: %v", err)
 	}
 	if originHead(t, f, "main") != base {
@@ -1242,12 +1236,12 @@ func TestShipRefusesRepositoryTransport(t *testing.T) {
 				write(t, filepath.Join(dir, "fake.go"), fixed("42"))
 				write(t, filepath.Join(dir, "fake_test.go"), answerTest)
 				if step != "check" {
-					if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err != nil {
+					if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); err != nil {
 						t.Fatal(err)
 					}
 				}
 				if step == "land" {
-					if _, err := s.Propose(ctx, c.ID, Proposal{Title: "Fixture", Body: "Synthetic change.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
+					if _, err := proposePatch(t, s, ctx, c.ID, Proposal{Title: "Fixture", Body: "Synthetic change.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
 						t.Fatal(err)
 					}
 					if _, err := s.Reviewed(ctx, c.ID, Review{Comment: "https://example.invalid/review"}); err != nil {
@@ -1267,9 +1261,9 @@ func TestShipRefusesRepositoryTransport(t *testing.T) {
 			case "prepare":
 				_, err = s.Prepare(ctx, c.ID, dir)
 			case "check":
-				_, err = s.Check(ctx, c.ID, "go test ./...", nil)
+				_, err = checkPatch(t, s, ctx, c.ID, "go test ./...", nil)
 			case "propose":
-				_, err = s.Propose(ctx, c.ID, Proposal{Title: "Fixture", Body: "Synthetic change.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour})
+				_, err = proposePatch(t, s, ctx, c.ID, Proposal{Title: "Fixture", Body: "Synthetic change.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour})
 			case "land":
 				_, err = s.Land(ctx, c.ID)
 			}
@@ -1297,10 +1291,10 @@ func TestScopeRefusesAnEditedRepositoryMonitor(t *testing.T) {
 	marker := filepath.Join(f.dir, "monitor-ran")
 	script(t, p.Work, "monitor", "echo ran > '"+marker+"'\nexit 1")
 	run(t, f.main, "git", "config", "core.fsmonitor", "./monitor")
-	if err := s.Gate.scope(ctx, "agent-sh/fake", p.Work); !errors.Is(err, ErrRefused) {
+	if err := s.Gate.scope(ctx, "agent-sh/fake", f.main); !errors.Is(err, ErrRefused) {
 		t.Fatalf("scope accepted monitor: %v", err)
 	}
-	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) {
+	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) {
 		t.Fatalf("check accepted monitor: %v", err)
 	}
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {

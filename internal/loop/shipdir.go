@@ -3,7 +3,6 @@ package loop
 import (
 	"context"
 	"errors"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,41 +36,4 @@ func (s *Ship) lock(ctx context.Context, caseID string) (func(), error) {
 		return nil, err
 	}
 	return func() { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
-}
-
-// emptyDir makes dir an empty directory without removing it when it is one: a build's sandbox mounts the case's work
-// tree before the build asks for the tree, and a mount keeps the directory it was made on, so the tree has to be made
-// in that directory, not in a new one at the same path.
-func emptyDir(dir string) error {
-	switch fi, err := os.Lstat(dir); {
-	case errors.Is(err, fs.ErrNotExist):
-	case err != nil:
-		return err
-	case !fi.IsDir():
-		if err := os.Remove(dir); err != nil {
-			return err
-		}
-	default:
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			return err
-		}
-		defer root.Close()
-		f, err := root.Open(".")
-		if err != nil {
-			return err
-		}
-		entries, err := f.ReadDir(-1)
-		f.Close()
-		if err != nil {
-			return err
-		}
-		for _, e := range entries {
-			if err := root.RemoveAll(e.Name()); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	return os.MkdirAll(dir, 0o700)
 }

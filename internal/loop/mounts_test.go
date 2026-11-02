@@ -13,77 +13,56 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// whenStarted calls fn in the background once the file marker exists (a fake harness touches it when it starts), and
-// returns a function that waits for fn and gives what it returned: the run it watches is over by then.
-func whenStarted(marker string, fn func() error) (wait func() error) {
-	res := make(chan error, 1)
-	stop := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-stop:
-				res <- errors.New("the harness never started")
-				return
-			default:
-			}
-			if _, err := os.Stat(marker); err == nil {
-				res <- fn()
-				return
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-	}()
-	return func() error {
-		close(stop)
-		return <-res
-	}
-}
-
-// A build's sandbox mounts the case's work tree before the build runs, and `ship prepare` makes the tree while it
-// runs, from outside: the tree has to be made in the directory the sandbox holds, not in a new one at its path. The
-// run lists the files prepare made, and what it writes there is what the host sees.
-func TestABuildSeesTheWorkTreeThatPrepareMakes(t *testing.T) {
+// Preparation completes before the build starts; the sandbox can use all of its independent Git clone.
+func TestABuildSeesTheCompleteCloneBeforeItStarts(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	f := newRepo(t, nil)
 	s := shipFor(t, st, f)
 	c := testingCase(t, st)
-	work := s.workDir(c.ID)
+	p, err := s.Prepare(ctx, c.ID, f.main)
+	if err != nil {
+		t.Fatal(err)
+	}
 	dir := t.TempDir()
-	started, prepared := filepath.Join(dir, "started"), filepath.Join(dir, "prepared")
-	harness := script(t, dir, "harness", `touch '`+started+`'
-while [ ! -e '`+prepared+`' ]; do sleep 0.05; done
-ls -A '`+work+`' > '`+filepath.Join(dir, "listing")+`' 2>&1
-echo marker-7f3a > '`+filepath.Join(work, "from-the-run.txt")+`' 2> '`+filepath.Join(dir, "write-error")+`'
-echo '`+okResult+`'`)
+	harness := script(t, dir, "harness", `printf '%s\n' "$@" > "$(dirname "$0")/args"
+ ls -A '`+p.Work+`' > listing
+ git -C '`+p.Work+`' log -1 > history
+ echo marker-7f3a > '`+filepath.Join(p.Work, "from-the-run.txt")+`'
+ git -C '`+p.Work+`' add -A || exit 1
+ git -C '`+p.Work+`' diff --cached --binary '`+p.BaseCommit+`' > "$MOMENTUM_LOOP_DIR/change.patch" || exit 1
+ test -z "$(git -C '`+p.Work+`' remote)" || exit 1
+ test ! -e '`+p.Host+`' || exit 1
+ echo '`+okResult+`'`)
 	r := runnerFor(t, st, []string{harness})
 	r.Ship = s
-	wait := whenStarted(started, func() error {
-		_, err := s.Prepare(ctx, c.ID, f.main)
-		return errors.Join(err, os.WriteFile(prepared, nil, 0o644))
-	})
 	done, err := r.Once(ctx, Options{Families: []string{"failures"}})
-	if prepErr := wait(); prepErr != nil {
-		t.Fatalf("prepare: %v", prepErr)
-	}
 	if err != nil || len(done) != 1 || done[0].Run.Status != store.RunOK {
 		t.Fatalf("%+v %v", done, err)
 	}
-	listing, _ := os.ReadFile(filepath.Join(dir, "listing"))
+	listing, _ := os.ReadFile(filepath.Join(done[0].Run.Dir, "listing"))
 	for _, want := range []string{".git", "fake.go", "go.mod"} {
 		if !strings.Contains(string(listing), want) {
-			writeErr, _ := os.ReadFile(filepath.Join(dir, "write-error"))
-			t.Fatalf("the run lists %q in its work tree, want %s (its write said %q)", listing, want, writeErr)
+			t.Fatal("incomplete clone")
 		}
 	}
-	if b, err := os.ReadFile(filepath.Join(work, "from-the-run.txt")); err != nil || strings.TrimSpace(string(b)) != "marker-7f3a" {
-		writeErr, _ := os.ReadFile(filepath.Join(dir, "write-error"))
-		t.Fatalf("the host does not see what the run wrote in its work tree: %q %v (the run said %q)", b, err, writeErr)
+	history, _ := os.ReadFile(filepath.Join(done[0].Run.Dir, "history"))
+	if !strings.Contains(string(history), "init") {
+		t.Fatal("sandbox cannot read its own Git")
+	}
+	b, err := os.ReadFile(filepath.Join(p.Work, "from-the-run.txt"))
+	if err != nil || strings.TrimSpace(string(b)) != "marker-7f3a" {
+		t.Fatal("clone was not writable")
+	}
+	if b, err := os.ReadFile(filepath.Join(done[0].Run.Dir, "change.patch")); err != nil || !strings.Contains(string(b), "+marker-7f3a") {
+		t.Fatalf("the run could not produce its patch with writable Git: %q %v", b, err)
+	}
+	if args, _ := agentArgs(t, r.Agent.Runner); !strings.Contains(args, "BASE is "+p.BaseCommit) || !strings.Contains(args, "git diff --cached --binary "+p.BaseCommit) {
+		t.Fatalf("the prepared build prompt lost its patch base: %s", args)
 	}
 }
 
-// The first build on a machine has no work tree and no build cache yet: the runner makes what the run writes before
-// its sandbox starts, so the run starts and ends.
+// A first preparation run starts without a clone or cache mount.
 func TestTheFirstBuildOnAMachineStarts(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -95,8 +74,17 @@ func TestTheFirstBuildOnAMachineStarts(t *testing.T) {
 	if err != nil || len(done) != 1 || done[0].Case != c.ID || done[0].Step != StepBuild || done[0].Run.Status != store.RunOK {
 		t.Fatalf("the first build: %+v %v", done, err)
 	}
-	if st, err := os.Stat(filepath.Join(cache, "go-build")); err != nil || !st.IsDir() {
-		t.Fatalf("the build cache was not made: %v", err)
+	if _, err := os.Stat(cache); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("a preparation run mounts no cache or clone")
+	}
+	if args, _ := agentArgs(t, r.Agent.Runner); !strings.Contains(args, "No clone is mounted yet") ||
+		!strings.Contains(args, "End this run after preparation with the report") || !strings.Contains(args, "Preparation counts toward all budgets and the stop rule") ||
+		strings.Contains(args, "Your independent clone is") {
+		t.Fatalf("the first build did not ask only for preparation: %s", args)
+	}
+	system, err := os.ReadFile(filepath.Join(HostDir(done[0].Run.Dir), "primary", "system.md"))
+	if err != nil || !strings.Contains(string(system), "End this preparation run with the report") {
+		t.Fatalf("the skill did not ask the preparation run to end: %s %v", system, err)
 	}
 }
 
@@ -108,6 +96,12 @@ func TestAMountThatIsMissingIsAClearErrorAndCostsNothing(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "toolchain-that-is-gone")
 	r.Toolchains = Toolchains{ReadOnly: []string{missing}, Cache: filepath.Join(t.TempDir(), "cache")}
 	c := testingCase(t, st)
+	f := newRepo(t, nil)
+	s := shipFor(t, st, f)
+	if _, err := s.Prepare(ctx, c.ID, f.main); err != nil {
+		t.Fatal(err)
+	}
+	r.Ship = s
 	done, err := r.Once(ctx, Options{Families: []string{"failures"}})
 	if err != nil || len(done) != 1 {
 		t.Fatalf("%+v %v", done, err)
@@ -136,9 +130,9 @@ fi
 echo "answered $1"`)
 }
 
-// A build runs through its mounts and its door, in the real sandbox: its own directory, its work tree and the loop's
-// build cache are writable, the toolchains it tests with read-only and offline, and its door reads repositories in
-// its work tree, in the directory it typed a command in when that is the work tree.
+// A build runs through its mounts and its door, in the real sandbox: its own directory, its clone and the loop's
+// build cache are writable, the toolchains read-only and offline. Its door uses a host-only command directory
+// and reads only the configured read repositories.
 func TestABuildRunsThroughItsMountsAndItsDoor(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -148,9 +142,14 @@ func TestABuildRunsThroughItsMountsAndItsDoor(t *testing.T) {
 	toolchain := t.TempDir()
 	write(t, filepath.Join(toolchain, "tool.txt"), "marker-7f3a")
 	cache := filepath.Join(t.TempDir(), "cache")
-	s := &Ship{Store: st, Dir: filepath.Join(t.TempDir(), "loop")}
+	f := newRepo(t, nil)
+	s := shipFor(t, st, f)
 	c := testingCase(t, st)
-	work := s.workDir(c.ID)
+	p, err := s.Prepare(ctx, c.ID, f.main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := p.Work
 	harness := script(t, dir, "harness", `echo own > own.txt
 cat '`+filepath.Join(toolchain, "tool.txt")+`' > seen-tool.txt
 echo changed > '`+filepath.Join(toolchain, "new.txt")+`' 2> /dev/null; echo "toolchain-write=$?" >> codes
@@ -165,6 +164,7 @@ momentum loop lesson --text x > lesson-out 2>&1; echo "lesson=$?" >> codes
 echo '`+okResult+`'`)
 	r := runnerFor(t, st, []string{harness})
 	r.Ship = s
+	r.ReadDirs = []string{f.main}
 	r.Momentum = doorProgram(t, outside, log)
 	r.Toolchains = Toolchains{ReadOnly: []string{toolchain}, Cache: cache}
 	done, err := r.Once(ctx, Options{Families: []string{"failures"}})
@@ -173,7 +173,7 @@ echo '`+okResult+`'`)
 	}
 	runDir := done[0].Run.Dir
 	codes, _ := os.ReadFile(filepath.Join(runDir, "codes"))
-	for _, want := range []string{"cache-write=0", "offline=off", "tree-write=0", "tree-git=0", "other-git=2", "prepare=0", "lesson=126"} {
+	for _, want := range []string{"cache-write=0", "offline=off", "tree-write=0", "tree-git=2", "other-git=2", "prepare=0", "lesson=126"} {
 		if !strings.Contains(string(codes), want+"\n") {
 			t.Errorf("the run's record lacks %q:\n%s", want, codes)
 		}
@@ -191,8 +191,8 @@ echo '`+okResult+`'`)
 		}
 	}
 	ran, _ := os.ReadFile(log)
-	for _, want := range []string{"evidence git " + work + " log pwd=" + runDir + " read=" + work, "case show here pwd=" + work, "case show there pwd=" + runDir,
-		"ship prepare --repo /somewhere pwd=" + runDir} {
+	for _, want := range []string{"evidence git " + work + " log pwd=" + HostDir(runDir) + " read=" + f.main, "case show here pwd=" + HostDir(runDir), "case show there pwd=" + HostDir(runDir),
+		"ship prepare --repo /somewhere pwd=" + HostDir(runDir)} {
 		if !strings.Contains(string(ran), want) {
 			t.Errorf("the door ran:\n%s\nwant %q", ran, want)
 		}
@@ -202,9 +202,9 @@ echo '`+okResult+`'`)
 	}
 }
 
-// A review runs through its mounts and its door, in the real sandbox: its work tree is read-only and its history is
-// read through the door (the work tree's .git link names a directory the sandbox does not hold), its change and
-// package are in its own directory, and its door runs no ship step.
+// A review runs through its mounts and its door, in the real sandbox: the proposed export is read-only with no .git.
+// Its history is read through the door in configured repositories. Its change and package are read-only inputs,
+// and its door runs no ship step.
 func TestAReviewReadsItsChangesWorkTreeThroughItsDoor(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -219,22 +219,29 @@ func TestAReviewReadsItsChangesWorkTreeThroughItsDoor(t *testing.T) {
 		t.Fatal(err)
 	}
 	write(t, filepath.Join(p.Work, "notes.txt"), "a note\n")
-	run(t, p.Work, "git", "add", "-A")
-	run(t, p.Work, "git", "commit", "-q", "-m", "the change")
-	p.Head, p.State, p.Base = strings.TrimSpace(run(t, p.Work, "git", "rev-parse", "HEAD")), Proposed, "main"
+	tree, _, err := s.applyPatch(ctx, p, []Patch{fixturePatch(t, s, c.ID)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.commitTree(ctx, p, tree, p.BaseCommit, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	p.Head, p.State = strings.TrimSpace(run(t, p.Host, "git", "rev-parse", "HEAD")), Proposed
+	export := filepath.Join(s.Dir, "exports", ".review-"+c.ID)
 	if err := s.save(&p); err != nil {
 		t.Fatal(err)
 	}
-	harness := script(t, dir, "harness", `echo forbidden > '`+filepath.Join(p.Work, "forbidden.txt")+`' 2> /dev/null; echo "tree-write=$?" >> codes
+	harness := script(t, dir, "harness", `echo forbidden > '`+filepath.Join(export, "forbidden.txt")+`' 2> /dev/null; echo "tree-write=$?" >> codes
 test -s /run/momentum/input/diff.patch && echo "diff=present" >> codes
 test -s /run/momentum/input/package.json && echo "package=present" >> codes
-git -C '`+p.Work+`' log > inner-git 2>&1; echo "inner-git=$?" >> codes
-momentum evidence git '`+p.Work+`' log > git-out 2>&1; echo "tree-git=$?" >> codes
+git -C '`+export+`' log > inner-git 2>&1; echo "inner-git=$?" >> codes
+momentum evidence git '`+f.main+`' log > git-out 2>&1; echo "tree-git=$?" >> codes
 momentum ship prepare --repo /somewhere > prepare-out 2>&1; echo "prepare=$?" >> codes
 momentum case set `+c.ID+` --status open > set-out 2>&1; echo "case-set=$?" >> codes
 echo '`+okResult+`'`)
 	r := runnerFor(t, st, []string{harness})
 	r.Ship = s
+	r.ReadDirs = []string{f.main}
 	r.Momentum = doorProgram(t, outside, log)
 	review, why := r.reserve(ctx, c.Family, c.ID, StepReview)
 	if why != "" {
@@ -256,11 +263,11 @@ echo '`+okResult+`'`)
 	if _, err := os.Stat(filepath.Join(p.Work, "forbidden.txt")); err == nil {
 		t.Error("the review wrote in the change's work tree")
 	}
-	if b, _ := os.ReadFile(filepath.Join(review.Dir, "git-out")); !strings.Contains(string(b), "history of "+p.Work) {
+	if b, _ := os.ReadFile(filepath.Join(review.Dir, "git-out")); !strings.Contains(string(b), "history of "+f.main) {
 		t.Errorf("the review read no history of its work tree through its door: %q", b)
 	}
 	ran, _ := os.ReadFile(log)
-	if !strings.Contains(string(ran), "evidence git "+p.Work+" log pwd="+review.Dir+" read="+p.Work) {
+	if !strings.Contains(string(ran), "evidence git "+f.main+" log pwd="+HostDir(review.Dir)+" read="+f.main) {
 		t.Errorf("the door ran:\n%s", ran)
 	}
 	if strings.Contains(string(ran), "ship prepare") || strings.Contains(string(ran), "case set") {
@@ -268,8 +275,7 @@ echo '`+okResult+`'`)
 	}
 }
 
-// A door runs a command where it was typed only when that is in one of the run's roots, with the loop's own
-// environment and none of the caller's, and ends it with its request or its run's time.
+// Every door command runs in a host-only directory, regardless of the client's directory.
 func TestADoorRunsACommandInTheRunsRootsWithTheLoopsEnvironment(t *testing.T) {
 	outside := t.TempDir()
 	runDir, work := t.TempDir(), t.TempDir()
@@ -291,7 +297,7 @@ func TestADoorRunsACommandInTheRunsRootsWithTheLoopsEnvironment(t *testing.T) {
 		}
 		return string(reply.Stdout)
 	}
-	for dir, want := range map[string]string{work: work, sub: sub, sibling: runDir, outside: runDir, "": runDir, "/": runDir} {
+	for dir, want := range map[string]string{work: HostDir(runDir), sub: HostDir(runDir), sibling: HostDir(runDir), outside: HostDir(runDir), "": HostDir(runDir), "/": HostDir(runDir)} {
 		if got := ask(dir); !strings.Contains(got, "\npwd="+want+"\n") && !strings.HasPrefix(got, "pwd="+want+"\n") {
 			t.Errorf("a command typed in %q ran in:\n%s\nwant %s", dir, got, want)
 		}
@@ -300,7 +306,7 @@ func TestADoorRunsACommandInTheRunsRootsWithTheLoopsEnvironment(t *testing.T) {
 	if strings.Contains(env, "ZZ_HOST_ONLY") {
 		t.Errorf("the caller's environment reached the command:\n%s", env)
 	}
-	for _, want := range []string{"MOMENTUM_LOOP_RUN=r1\n", "MOMENTUM_LOOP_CASE=c1\n", "MOMENTUM_LOOP_DIR=" + runDir + "\n", "MOMENTUM_LOOP_READ=" + work + "\n"} {
+	for _, want := range []string{"MOMENTUM_LOOP_RUN=r1\n", "MOMENTUM_LOOP_CASE=c1\n", "MOMENTUM_LOOP_DIR=" + runDir + "\n", "MOMENTUM_LOOP_READ=\n"} {
 		if !strings.Contains(env, want) {
 			t.Errorf("the command's environment lacks %q:\n%s", want, env)
 		}

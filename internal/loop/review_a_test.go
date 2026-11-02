@@ -41,7 +41,7 @@ func recoveryChecked(t *testing.T, s *Ship, st *store.Store, f repoFixture) (sto
 	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
 	// This fixture checks the same change without invoking a compiler.
 	test := `python3 -c 'from pathlib import Path; assert "return 42" in Path("fake.go").read_text()'`
-	p, err = s.Check(ctx, c.ID, test, nil)
+	p, err = checkPatch(t, s, ctx, c.ID, test, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func recoveryChecked(t *testing.T, s *Ship, st *store.Store, f repoFixture) (sto
 func recoveryReviewed(t *testing.T, s *Ship, st *store.Store, f repoFixture) (store.Case, Package) {
 	t.Helper()
 	c, _, pr := recoveryChecked(t, s, st, f)
-	if _, err := s.Propose(context.Background(), c.ID, pr); err != nil {
+	if _, err := proposePatch(t, s, context.Background(), c.ID, pr); err != nil {
 		t.Fatal(err)
 	}
 	p, err := s.Reviewed(context.Background(), c.ID, Review{Comment: "https://example.invalid/review/1"})
@@ -76,7 +76,7 @@ func TestShipPushesPublishNoReachableTags(t *testing.T) {
 			t.Fatalf("%s published a tag: %s", stage, got)
 		}
 	}
-	if _, err := s.Propose(ctx, c.ID, pr); err != nil {
+	if _, err := proposePatch(t, s, ctx, c.ID, pr); err != nil {
 		t.Fatal(err)
 	}
 	checkTags("proposal")
@@ -84,14 +84,14 @@ func TestShipPushesPublishNoReachableTags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run(t, p.Work, "git", "tag", "-a", "landing-tag", "-m", "fixture", "origin/main")
+	run(t, p.Host, "git", "tag", "-a", "landing-tag", "-m", "fixture", "origin/main")
 	// Advance the base, so landing pushes both the rebased proposal branch and the base.
 	pushOther(t, f, "main", map[string]string{"README": "fixture\n"})
 	if p, err = s.Land(ctx, c.ID); err != nil {
 		t.Fatal(err)
 	}
 	checkTags("landing")
-	run(t, p.Work, "git", "tag", "-a", "rollback-tag", "-m", "fixture")
+	run(t, p.Host, "git", "tag", "-a", "rollback-tag", "-m", "fixture")
 	if _, err := s.RollBack(ctx, c.ID, "fixture"); err != nil {
 		t.Fatal(err)
 	}
@@ -115,10 +115,10 @@ func TestProposalAdoptsACreatedPullRequestAfterALostResponse(t *testing.T) {
   echo 'fixture lost response' >&2
   exit 1 ;;
 esac`)
-	if p, err := s.Propose(ctx, c.ID, pr); err == nil || p.Head == "" || p.PR != "" || p.State != Checked {
+	if p, err := proposePatch(t, s, ctx, c.ID, pr); err == nil || p.Head == "" || p.PR != "" || p.State != Checked {
 		t.Fatalf("fixture did not lose the receipt: %+v %v", p, err)
 	}
-	p, err := s.Propose(ctx, c.ID, pr)
+	p, err := proposePatch(t, s, ctx, c.ID, pr)
 	if err != nil || p.State != Proposed || p.PR != "https://example.invalid/pull/7" {
 		t.Fatalf("created pull request was not adopted: %+v %v", p, err)
 	}
@@ -140,7 +140,7 @@ func TestProposalDoesNotAdoptAHistoricalPullRequestAtAnotherHead(t *testing.T) {
 	s.GH = script(t, f.dir, "mismatched-gh", `if [ "$2" = list ]; then
  echo '[{"number":7,"url":"https://example.invalid/pull/7","headRefOid":"different"}]'
 else echo create > '`+calls+`'; echo 'https://example.invalid/pull/8'; fi`)
-	p, err := s.Propose(context.Background(), c.ID, pr)
+	p, err := proposePatch(t, s, context.Background(), c.ID, pr)
 	if err != nil || p.PR != "https://example.invalid/pull/8" {
 		t.Fatalf("a historical head was adopted or blocked creation: %+v %v", p, err)
 	}
@@ -336,18 +336,11 @@ func TestRunOutputAndGitLinkReadersRefuseSymlinks(t *testing.T) {
 	if got := lastLine(filepath.Join(dir, "transcript.jsonl")); got != "" {
 		t.Fatalf("read a linked run diagnostic: %q", got)
 	}
-	repo := t.TempDir()
-	meta := filepath.Join(repo, ".git", "worktrees", "fixture")
-	write(t, target, "gitdir: "+meta+"\n")
-	os.Symlink(target, filepath.Join(dir, ".git"))
-	if err := (&Ship{}).ownTree(Package{Dir: repo, Work: dir}); err == nil {
-		t.Fatal("a linked git registration was accepted")
-	}
 	if f, err := exclusiveOutput(dir, "transcript.jsonl"); err == nil {
 		f.Close()
 		t.Fatal("a linked output was opened for truncation")
 	}
-	if got, _ := os.ReadFile(target); !strings.HasPrefix(string(got), "gitdir: ") {
+	if got, _ := os.ReadFile(target); !strings.Contains(string(got), "denied-marker-9c2b") {
 		t.Fatal("a substituted output truncated the external fixture")
 	}
 }

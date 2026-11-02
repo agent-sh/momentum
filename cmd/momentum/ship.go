@@ -42,6 +42,7 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	repo := fs.String("repo", "", "prepare: a checkout of the repository the change goes to")
 	test := fs.String("test", "", "check: the test command, one program and its arguments, run without a shell")
 	testFiles := fs.String("test-files", "", "check: comma-separated files of the change that hold the test (default: by their names)")
+	patchFile := fs.String("patch", filepath.Join(os.Getenv("MOMENTUM_LOOP_DIR"), "change.patch"), "check, propose: cumulative patch against the package's base, in the run directory")
 	title := fs.String("title", "", "propose: the change's title")
 	bodyFile := fs.String("body-file", "", "propose: a file with the change's description (in a loop run: one in its own directory)")
 	rollback := fs.String("rollback", "", "propose: how the change is undone")
@@ -79,6 +80,14 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if err != nil {
 		return err
 	}
+	patch := loop.Patch{Dir: os.Getenv("MOMENTUM_LOOP_DIR"), File: *patchFile}
+	if run == "" && patch.Dir == "" {
+		abs, e := filepath.Abs(*patchFile)
+		if e != nil {
+			return e
+		}
+		patch.Dir, patch.File = filepath.Dir(abs), filepath.Base(abs)
+	}
 	var p loop.Package
 	switch args[0] {
 	case "status":
@@ -103,7 +112,7 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 				files = append(files, f)
 			}
 		}
-		p, err = ship.Check(ctx, *caseID, *test, files)
+		p, err = ship.Check(ctx, *caseID, *test, files, patch)
 	case "propose":
 		var pr loop.Proposal
 		if pr.Window, err = parseSince(*window); err != nil {
@@ -120,7 +129,7 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 			return usageError{"--signal is a JSON object: " + err.Error()}
 		}
 		pr.Title, pr.Rollback, pr.Lesson = *title, *rollback, *lesson
-		p, err = ship.Propose(ctx, *caseID, pr)
+		p, err = ship.Propose(ctx, *caseID, pr, patch)
 	case "land":
 		p, err = ship.Land(ctx, *caseID)
 	case "rollback":
@@ -136,6 +145,9 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		return err
 	}
 	fmt.Fprintf(stdout, "%s: %s %s, %s\n", p.Case, p.Kind, p.State, firstText(p.PR, p.Work))
+	if args[0] == "prepare" {
+		fmt.Fprintf(stdout, "  base: %s; run clone: %s; ready for the next build run\n", p.BaseCommit, p.Work)
+	}
 	if p.Check != nil {
 		fmt.Fprintf(stdout, "  check: %s: exit %d without the change, %d with it\n", strings.Join(p.Check.Test, " "), p.Check.Before.Exit, p.Check.After.Exit)
 	}
@@ -157,6 +169,9 @@ func readBody(path, run string) (string, error) {
 	var f *os.File
 	var err error
 	if run != "" {
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(os.Getenv("MOMENTUM_LOOP_DIR"), path)
+		}
 		abs, e := filepath.Abs(path)
 		own := os.Getenv("MOMENTUM_LOOP_DIR")
 		if e != nil || own == "" || !within(abs, own) {

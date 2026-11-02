@@ -69,6 +69,7 @@ type Invocation struct {
 	Env       map[string]string
 	Tools     string            // the built-in tools it has: DefaultTools when empty, "none" none (a judge), or a list
 	Files     map[string][]byte // host-owned review inputs, mounted read-only beside the system and schema
+	Private   []string          // host clone and package directories, absent from every mount
 	fallback  bool
 	// Door runs the momentum and tacit commands the run types, outside its sandbox: what its step allows, as the
 	// loop runs them. Nil: the run has none.
@@ -120,16 +121,24 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	for _, d := range []string{inv.Dir, HostDir(inv.Dir), filepath.Join(inv.Dir, "tmp"), filepath.Join(inv.Dir, "claude")} {
+	for _, d := range []string{inv.Dir, HostDir(inv.Dir)} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return Result{}, err
 		}
+	}
+	if err := runDirectories(inv.Dir); err != nil {
+		return Result{}, err
 	}
 	if err := hostDir(HostDir(inv.Dir)); err != nil {
 		return Result{}, err
 	}
 	mounts := append(append([]jail.Mount{{Path: inv.Dir, Write: true}, {Path: harness}}, a.Mounts...), inv.Mounts...)
 	for _, m := range mounts {
+		for _, dir := range inv.Private {
+			if within(dir, m.Path) || within(m.Path, dir) {
+				return Result{}, fmt.Errorf("a run mount reaches a host-only repository or package directory")
+			}
+		}
 		if within(HostDir(inv.Dir), m.Path) || within(m.Path, HostDir(inv.Dir)) {
 			return Result{}, fmt.Errorf("a run mount reaches its host-only directory")
 		}
