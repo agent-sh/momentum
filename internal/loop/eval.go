@@ -653,10 +653,13 @@ func (e *Eval) copySelf() error {
 
 // trialEnv is a trial's environment, and a file of its own that exports the trial's variables and PATH again,
 // which the harness sources inside every command (CLAUDE_ENV_FILE), after the user's shell startup: a startup file
-// that moves another momentum first on the PATH, or points a variable elsewhere, changes nothing a trial runs.
+// that moves another momentum first on the PATH, points a variable elsewhere, or defines a function or an alias
+// named momentum or tacit, changes nothing a trial runs.
 func trialEnv(extra map[string]string, home string, bins []string) ([]string, error) {
 	env := CleanEnv(extra, bins...)
 	var b strings.Builder
+	// the startup may define a function or an alias of the commands a trial runs, which no PATH reaches
+	b.WriteString("unalias momentum tacit 2>/dev/null; unset -f momentum tacit 2>/dev/null\n")
 	for _, kv := range env {
 		k, v, _ := strings.Cut(kv, "=")
 		if _, ours := extra[k]; ours || k == "PATH" {

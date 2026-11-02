@@ -682,12 +682,15 @@ func TestAShellStartupCannotChangeWhatATrialRuns(t *testing.T) {
 	e.Self = script(t, dir, "this-build", `echo this-build`)
 	other := t.TempDir()
 	script(t, other, "momentum", `echo another-build`)
-	seen, clock := filepath.Join(dir, "seen"), filepath.Join(dir, "clock")
-	// the harness's Bash tool, as Claude Code runs it: the user's startup, then CLAUDE_ENV_FILE, then the command
+	seen, clock, envFile := filepath.Join(dir, "seen"), filepath.Join(dir, "clock"), filepath.Join(dir, "env-file")
+	// the harness's Bash tool, as Claude Code runs it: the user's startup (another momentum first on the PATH, another
+	// clock, and a function named momentum, as a snapshot replays it), then CLAUDE_ENV_FILE, then the command
 	e.Runner.Agent.Runner = []string{script(t, dir, "harness", `PATH="`+other+`:$PATH"; MOMENTUM_NOW=2099-01-01T00:00:00Z; export MOMENTUM_NOW
+momentum() { echo a-function; }
 if [ -n "$CLAUDE_ENV_FILE" ]; then . "$CLAUDE_ENV_FILE"; fi
 momentum >> `+seen+`
 printf '%s\n' "$MOMENTUM_NOW" >> `+clock+`
+printf '%s\n' "$CLAUDE_ENV_FILE" >> `+envFile+`
 printf '%s\n' '{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":1,"structured_output":{"mechanism":"m","fix":"f","summary":"s"}}'`)}
 	if _, err := e.Run(context.Background(), []GoldenTask{task}); err != nil {
 		t.Fatal(err)
@@ -702,6 +705,16 @@ printf '%s\n' '{"type":"result","subtype":"success","num_turns":1,"total_cost_us
 	want := end.Format(time.RFC3339Nano)
 	if raw, _ := os.ReadFile(clock); string(raw) != want+"\n"+want+"\n" {
 		t.Fatalf("the trials' clock %q, want the end of store %s", raw, want)
+	}
+	// the env file is the run's own, outside the trial's directory, which the trial's file tools reach
+	raw, _ := os.ReadFile(envFile)
+	for _, f := range strings.Fields(string(raw)) {
+		if !strings.HasPrefix(f, filepath.Join(e.Dir, "harness")+string(filepath.Separator)) {
+			t.Fatalf("the env file %s is not under the evaluation's harness directory", f)
+		}
+	}
+	if len(strings.Fields(string(raw))) != 2 {
+		t.Fatalf("env files %q", raw)
 	}
 }
 
