@@ -471,8 +471,10 @@ func TestADiskWhosePathHoldsASpaceHasItsNotes(t *testing.T) {
 	if n, _, _ := st.Note(ctx, "capacity:full:"+key); n.Done.IsZero() {
 		t.Errorf("a full note that stands with no mark goes once the disk is below the line: %+v", n)
 	}
+	// a title is clipped at TitleMax characters, which a long temporary directory reaches inside this prefix
+	prefix := dir + " filled fast from "
 	if n, ok, _ := st.Note(ctx, "capacity:filled:"+key); !ok || n.Kind != store.NoteDecided ||
-		!strings.HasPrefix(n.Title, dir+" filled fast from ") {
+		!strings.HasPrefix(n.Title, prefix) && !(strings.HasSuffix(n.Title, "…") && strings.HasPrefix(prefix, strings.TrimSuffix(n.Title, "…"))) {
 		t.Errorf("the fill that ended is a decided note: %+v", n)
 	}
 }
