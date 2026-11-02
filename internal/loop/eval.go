@@ -95,7 +95,11 @@ type Eval struct {
 	Arms         []string
 	Repositories []string
 	GoldenHash   string
-	pair         string // the store as of the trial's end, made once for both arms of a trial; each arm runs on a copy
+	// Self is the evaluating binary. Run copies it into the evaluation's directory, first on each trial's PATH, so a
+	// trial's momentum is the build results.json names, whatever momentum lies beside it or elsewhere on the PATH.
+	Self string
+	bin  string // the directory of that copy
+	pair string // the store as of the trial's end, made once for both arms of a trial; each arm runs on a copy
 }
 
 // Grade is the judge's reading of one investigation.
@@ -176,6 +180,11 @@ const judgeBudget = 1.0
 func (e *Eval) Run(ctx context.Context, tasks []GoldenTask) ([]Trial, error) {
 	if err := os.MkdirAll(e.Dir, 0o700); err != nil {
 		return nil, err
+	}
+	if e.Self != "" {
+		if err := e.copySelf(); err != nil {
+			return nil, fmt.Errorf("copy the evaluating binary for the trials: %w", err)
+		}
 	}
 	arms := e.Arms
 	if len(arms) == 0 {
@@ -611,6 +620,49 @@ func (e *Eval) cloneRepositories(ctx context.Context, t GoldenTask, dir string) 
 // CLAUDE_CONFIG_DIR, TMPDIR and CLAUDE_CODE_TMPDIR),
 // outside the run's directory, which its file tools reach: what the harness keeps of a session, its large tool
 // outputs among them, goes there and is removed when the run ends, so nothing of a trial stays in the user's.
+// copySelf copies the evaluating binary into the evaluation's own bin directory: a copy, not a link, so a rebuild
+// of the installed binary while the evaluation runs does not change what its trials run.
+func (e *Eval) copySelf() error {
+	in, err := os.Open(e.Self)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	dir := filepath.Join(e.Dir, "bin")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".momentum-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := io.Copy(tmp, in); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o755); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp.Name(), filepath.Join(dir, "momentum")); err != nil {
+		return err
+	}
+	e.bin = dir
+	return nil
+}
+
+// trialBins are the directories first on a trial's PATH: the evaluating binary's copy, then the runner's.
+func (e *Eval) trialBins() []string {
+	if e.bin == "" {
+		return e.Runner.Bins
+	}
+	return append([]string{e.bin}, e.Runner.Bins...)
+}
+
 func (e *Eval) harnessHome(name string) (string, error) {
 	dir := filepath.Join(e.Dir, "harness", name)
 	// its temporary files too: Claude Code keeps a session's scratchpad and its background commands' output under
@@ -694,7 +746,7 @@ func (e *Eval) invokeTrial(ctx context.Context, t GoldenTask, c store.Case, dir,
 	agent := r.Agent
 	agent.Env = CleanEnv(map[string]string{"MOMENTUM_HOME": dir, "MOMENTUM_EVAL": e.ID, "MOMENTUM_NOW": t.Cutoff.Format(time.RFC3339Nano), "MOMENTUM_ACTOR": "eval:" + run.ID,
 		"MOMENTUM_LOOP_RUN": run.ID, "MOMENTUM_LOOP_CASE": c.ID, "MOMENTUM_LOOP_DIR": dir, "CLAUDE_CONFIG_DIR": home,
-		"TMPDIR": filepath.Join(home, "tmp"), "CLAUDE_CODE_TMPDIR": filepath.Join(home, "tmp")}, r.Bins...)
+		"TMPDIR": filepath.Join(home, "tmp"), "CLAUDE_CODE_TMPDIR": filepath.Join(home, "tmp")}, e.trialBins()...)
 	if err := os.WriteFile(filepath.Join(dir, "prompt.txt"), []byte(inv.Prompt), 0o600); err != nil {
 		return Result{}, err
 	}

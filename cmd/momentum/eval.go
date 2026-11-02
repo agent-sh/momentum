@@ -94,7 +94,8 @@ func loopEval(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		}
 	}
 	e := &loop.Eval{Runner: r, Source: paths.DB(), Dir: filepath.Join(loopDir(), "eval", id), Trials: *trials, Budget: *budget, Parallel: *parallel, ID: id,
-		Judge: loop.Agent{Runner: r.Agent.Runner, Model: r.Agent.Model}, Arms: selected, Repositories: repositories, GoldenHash: fmt.Sprintf("%x", sha256.Sum256(raw))}
+		Judge: loop.Agent{Runner: r.Agent.Runner, Model: r.Agent.Model}, Arms: selected, Repositories: repositories, GoldenHash: fmt.Sprintf("%x", sha256.Sum256(raw)),
+		Self: selfBinary()}
 	fmt.Fprintf(stderr, "evaluation %s: %d tasks, %d trials per arm, in %s\n", id, len(picked), *trials, e.Dir)
 	trs, err := e.Run(ctx, picked)
 	if err != nil {
@@ -140,4 +141,17 @@ func printEvaluation(out io.Writer, r loop.EvaluationResults) {
 		}
 	}
 	fmt.Fprintf(out, "loop minus native, task bootstrap 90%% interval (%d compared tasks; %d resamples, seed %d): reached per dollar %s; reached per minute %s\n", compared, r.Comparison.Resamples, r.Comparison.Seed, interval(r.Comparison.ReachedPerDollar), interval(r.Comparison.ReachedPerMinute))
+}
+
+// selfBinary is the running binary: on Linux the process's own executable, which stays the build that started even
+// when its file is replaced.
+func selfBinary() string {
+	if _, err := os.Stat("/proc/self/exe"); err == nil {
+		return "/proc/self/exe"
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return exe
 }

@@ -647,3 +647,28 @@ exec "$@"`)
 		}
 	}
 }
+
+// A trial's momentum is the evaluating build, whatever momentum lies first on the runner's path, and a rebuild of
+// that binary while the evaluation runs does not change what its trials run.
+func TestATrialRunsTheEvaluatingBuild(t *testing.T) {
+	e, task := evalFixture(t)
+	dir := t.TempDir()
+	e.Self = script(t, dir, "this-build", `echo this-build`)
+	other := t.TempDir()
+	script(t, other, "momentum", `echo another-build`)
+	e.Runner.Bins = []string{other}
+	seen := filepath.Join(dir, "seen")
+	e.Runner.Agent.Runner = []string{script(t, dir, "runs-momentum", `momentum >> `+seen+`
+printf '%s\n' '{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":1,"structured_output":{"mechanism":"m","fix":"f","summary":"s"}}'`)}
+	if _, err := e.Run(context.Background(), []GoldenTask{task}); err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(seen); string(raw) != "this-build\nthis-build\n" {
+		t.Fatalf("the trials ran %q", raw)
+	}
+	script(t, dir, "this-build", `echo rebuilt`)
+	out, err := exec.Command(filepath.Join(e.Dir, "bin", "momentum")).Output()
+	if err != nil || string(out) != "this-build\n" {
+		t.Fatalf("the evaluation's copy runs %q %v", out, err)
+	}
+}
