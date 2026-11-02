@@ -172,7 +172,7 @@ The `sessions` packages are exported, so the session board imports them instead 
 
 The incidents source keeps one event per incident, rewritten as its file changes: its status, its last sighting and its running count of repeats. Each change of the last sighting or the count is also a sighting, an event of its own (kind `incident-seen`, keyed by the incident, its last sighting and its count), with the repeats since the sighting before: what the incident did over time. Times compare at the store's millisecond, so a file that writes microseconds files no sighting again; a change of anything else (a note, the status, the attempts) files none. A first sighting holds the whole count and carries when the incident was first seen. The sightings are kept: `evidence rebuild incidents` drops them only with `--force`, since the files keep only the running counts.
 
-`momentum evidence events --session ID` prints one session's events, with its subagents' among them, oldest first, from its start; `--since` and `--until` take a duration or a local time, and a listing the limit cut says so. `--harness NAME` prints one harness's events from every source.
+`momentum evidence events --session ID` prints one session's events, with its subagents' among them, oldest first, from its start; `--since` and `--until` take a duration or a local time (`2006-01-02T15:04` or `2006-01-02 15:04`, seconds optional; a date; or RFC 3339), and a listing the limit cut says so. `--harness NAME` prints one harness's events from every source.
 
 ## Store
 

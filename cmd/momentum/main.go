@@ -402,8 +402,8 @@ func rebuild(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	return nil
 }
 
-// parseWhen is a time: a duration ago (parseSince), or a local time ("2006-01-02T15:04", seconds optional)
-// or an RFC 3339 one.
+// parseWhen is a time: a duration ago (parseSince), or a local time ("2006-01-02T15:04" or "2006-01-02 15:04",
+// seconds optional; a date) or an RFC 3339 one.
 func parseWhen(s string) (time.Time, error) {
 	if d, err := parseSince(s); err == nil {
 		return time.Now().Add(-d), nil
@@ -411,12 +411,13 @@ func parseWhen(s string) (time.Time, error) {
 	if t, err := time.Parse(time.RFC3339, s); err == nil {
 		return t, nil
 	}
-	for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02T15:04", "2006-01-02"} {
+	// agents write a local time with a T or with a space, as git and most logs print it
+	for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02T15:04", "2006-01-02 15:04:05", "2006-01-02 15:04", "2006-01-02"} {
 		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
 			return t, nil
 		}
 	}
-	return time.Time{}, fmt.Errorf("bad time %q: a duration (36h, 7d) or a time (2006-01-02T15:04)", s)
+	return time.Time{}, fmt.Errorf("bad time %q: a duration (36h, 7d) or a time (2006-01-02T15:04 or 2006-01-02 15:04)", s)
 }
 
 // parseSince accepts a Go duration or a whole number of days ("7d").

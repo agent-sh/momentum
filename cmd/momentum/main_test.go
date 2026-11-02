@@ -142,3 +142,18 @@ func TestWhenIsADurationOrALocalTime(t *testing.T) {
 		t.Error("yesterday parsed")
 	}
 }
+
+// A local time with a space, as git and most logs print it, is the same time as with a T.
+func TestALocalTimeTakesASpace(t *testing.T) {
+	for s, want := range map[string]time.Time{
+		"2026-10-20 10:00":    time.Date(2026, 10, 20, 10, 0, 0, 0, time.Local),
+		"2026-10-20 10:00:05": time.Date(2026, 10, 20, 10, 0, 5, 0, time.Local),
+	} {
+		if got, err := parseWhen(s); err != nil || !got.Equal(want) {
+			t.Errorf("%s: %v %v", s, got, err)
+		}
+	}
+	if _, err := parseWhen("2026-10-20 10"); err == nil || !strings.Contains(err.Error(), "2006-01-02 15:04") {
+		t.Errorf("a refusal names both forms: %v", err)
+	}
+}
