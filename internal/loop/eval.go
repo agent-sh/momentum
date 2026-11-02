@@ -607,12 +607,15 @@ func (e *Eval) cloneRepositories(ctx context.Context, t GoldenTask, dir string) 
 	return out, nil
 }
 
-// harnessHome is one evaluation run's own configuration directory for the harness (Claude Code's CLAUDE_CONFIG_DIR),
+// harnessHome is one evaluation run's own configuration and temporary directory for the harness (Claude Code's
+// CLAUDE_CONFIG_DIR, TMPDIR and CLAUDE_CODE_TMPDIR),
 // outside the run's directory, which its file tools reach: what the harness keeps of a session, its large tool
 // outputs among them, goes there and is removed when the run ends, so nothing of a trial stays in the user's.
 func (e *Eval) harnessHome(name string) (string, error) {
 	dir := filepath.Join(e.Dir, "harness", name)
-	return dir, os.MkdirAll(dir, 0o700)
+	// its temporary files too: Claude Code keeps a session's scratchpad and its background commands' output under
+	// the temporary directory, not the configuration one
+	return dir, os.MkdirAll(filepath.Join(dir, "tmp"), 0o700)
 }
 
 // investigate runs the investigation step of a trial as the loop runs it: the native path's brief, tools and report,
@@ -690,7 +693,8 @@ func (e *Eval) invokeTrial(ctx context.Context, t GoldenTask, c store.Case, dir,
 	defer os.RemoveAll(home)
 	agent := r.Agent
 	agent.Env = CleanEnv(map[string]string{"MOMENTUM_HOME": dir, "MOMENTUM_EVAL": e.ID, "MOMENTUM_NOW": t.Cutoff.Format(time.RFC3339Nano), "MOMENTUM_ACTOR": "eval:" + run.ID,
-		"MOMENTUM_LOOP_RUN": run.ID, "MOMENTUM_LOOP_CASE": c.ID, "MOMENTUM_LOOP_DIR": dir, "CLAUDE_CONFIG_DIR": home}, r.Bins...)
+		"MOMENTUM_LOOP_RUN": run.ID, "MOMENTUM_LOOP_CASE": c.ID, "MOMENTUM_LOOP_DIR": dir, "CLAUDE_CONFIG_DIR": home,
+		"TMPDIR": filepath.Join(home, "tmp"), "CLAUDE_CODE_TMPDIR": filepath.Join(home, "tmp")}, r.Bins...)
 	if err := os.WriteFile(filepath.Join(dir, "prompt.txt"), []byte(inv.Prompt), 0o600); err != nil {
 		return Result{}, err
 	}
@@ -821,7 +825,7 @@ func (e *Eval) grade(ctx context.Context, t GoldenTask, f finding, jdir string, 
 	defer os.RemoveAll(home)
 	judge := e.Judge
 	judge.Fallback = ""
-	judge.Env = CleanEnv(map[string]string{"CLAUDE_CONFIG_DIR": home}, e.Runner.Bins...)
+	judge.Env = CleanEnv(map[string]string{"CLAUDE_CONFIG_DIR": home, "TMPDIR": filepath.Join(home, "tmp"), "CLAUDE_CODE_TMPDIR": filepath.Join(home, "tmp")}, e.Runner.Bins...)
 	// a judge that fails (an API error, an answer off its schema) is tried once more on the same model, its first
 	// stream kept beside it; a trial still without a grade is left out of the comparison with its pair (Results)
 	spent := 0.0

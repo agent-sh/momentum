@@ -598,7 +598,8 @@ func TestATrialsHarnessKeepsNothing(t *testing.T) {
 	keep := func(name string) string {
 		return script(t, dir, name, `mkdir -p "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/p/s/tool-results"
 printf 'a large tool output' > "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/p/s/tool-results/out.txt"
-printf '%s\n' "${CLAUDE_CONFIG_DIR:-unset}" >> "`+filepath.Join(dir, name+".homes")+`"
+printf 'scratch' > "${TMPDIR:-/nonexistent}/scratchpad.txt"
+printf '%s %s\n' "${CLAUDE_CONFIG_DIR:-unset}" "${TMPDIR:-unset}" >> "`+filepath.Join(dir, name+".homes")+`"
 exec "$@"`)
 	}
 	e.Runner.Agent.Runner = append([]string{keep("trial")}, e.Runner.Agent.Runner...)
@@ -612,19 +613,29 @@ exec "$@"`)
 			t.Fatal(tr.Err)
 		}
 	}
+	seen := map[string]bool{}
 	for _, name := range []string{"trial", "judge"} {
 		raw, _ := os.ReadFile(filepath.Join(dir, name+".homes"))
-		homes := strings.Fields(string(raw))
-		if len(homes) != 2 {
+		lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+		if len(lines) != 2 {
 			t.Fatalf("%s: %q", name, raw)
 		}
-		for _, h := range homes {
-			if !strings.HasPrefix(h, filepath.Join(e.Dir, "harness")+"/") {
-				t.Errorf("%s: its harness kept its session in %s", name, h)
+		for _, line := range lines {
+			f := strings.Fields(line)
+			if len(f) != 2 {
+				t.Fatalf("%s: %q", name, line)
+			}
+			h, tmp := f[0], f[1]
+			if !strings.HasPrefix(h, filepath.Join(e.Dir, "harness")+"/") || !strings.HasPrefix(tmp, h+"/") {
+				t.Errorf("%s: its harness kept its session in %s, its temporary files in %s", name, h, tmp)
 			}
 			if _, err := os.Stat(h); err == nil {
 				t.Errorf("%s: %s outlived its run", name, h)
 			}
+			if seen[h] {
+				t.Errorf("%s: two runs shared %s", name, h)
+			}
+			seen[h] = true
 		}
 	}
 	if _, err := os.Stat(filepath.Join(home, ".claude")); err == nil {
