@@ -672,3 +672,57 @@ printf '%s\n' '{"type":"result","subtype":"success","num_turns":1,"total_cost_us
 		t.Fatalf("the evaluation's copy runs %q %v", out, err)
 	}
 }
+
+// A trial's commands run the evaluating build, with the trial's variables, even when the user's shell startup,
+// which the harness runs before each command, puts another momentum first or changes a variable: the harness
+// sources the trial's own env file after it.
+func TestAShellStartupCannotChangeWhatATrialRuns(t *testing.T) {
+	e, task := evalFixture(t)
+	dir := t.TempDir()
+	e.Self = script(t, dir, "this-build", `echo this-build`)
+	other := t.TempDir()
+	script(t, other, "momentum", `echo another-build`)
+	seen, clock := filepath.Join(dir, "seen"), filepath.Join(dir, "clock")
+	// the harness's Bash tool, as Claude Code runs it: the user's startup, then CLAUDE_ENV_FILE, then the command
+	e.Runner.Agent.Runner = []string{script(t, dir, "harness", `PATH="`+other+`:$PATH"; MOMENTUM_NOW=2099-01-01T00:00:00Z; export MOMENTUM_NOW
+if [ -n "$CLAUDE_ENV_FILE" ]; then . "$CLAUDE_ENV_FILE"; fi
+momentum >> `+seen+`
+printf '%s\n' "$MOMENTUM_NOW" >> `+clock+`
+printf '%s\n' '{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":1,"structured_output":{"mechanism":"m","fix":"f","summary":"s"}}'`)}
+	if _, err := e.Run(context.Background(), []GoldenTask{task}); err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(seen); string(raw) != "this-build\nthis-build\n" {
+		t.Fatalf("the trials ran %q", raw)
+	}
+	end, err := e.snapshotEnd(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := end.Format(time.RFC3339Nano)
+	if raw, _ := os.ReadFile(clock); string(raw) != want+"\n"+want+"\n" {
+		t.Fatalf("the trials' clock %q, want the end of store %s", raw, want)
+	}
+}
+
+// The env file exports each value as the shell reads it back, a quote and a space too, and the harness is told
+// where it is.
+func TestATrialsEnvFileReadsBack(t *testing.T) {
+	home := t.TempDir()
+	env, err := trialEnv(map[string]string{"MOMENTUM_ACTOR": "eval:it's a run"}, home, []string{"/opt/a b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(home, "env.sh")
+	found := false
+	for _, kv := range env {
+		found = found || kv == "CLAUDE_ENV_FILE="+file
+	}
+	if !found {
+		t.Fatalf("no CLAUDE_ENV_FILE in %q", env)
+	}
+	out, err := exec.Command("sh", "-c", `. "$1"; printf '%s|%s' "$MOMENTUM_ACTOR" "$PATH"`, "sh", file).Output()
+	if err != nil || string(out) != "eval:it's a run|/opt/a b:/usr/local/bin:/usr/bin:/bin" {
+		t.Fatalf("read back %q %v", out, err)
+	}
+}

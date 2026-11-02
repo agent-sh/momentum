@@ -616,10 +616,6 @@ func (e *Eval) cloneRepositories(ctx context.Context, t GoldenTask, dir string) 
 	return out, nil
 }
 
-// harnessHome is one evaluation run's own configuration and temporary directory for the harness (Claude Code's
-// CLAUDE_CONFIG_DIR, TMPDIR and CLAUDE_CODE_TMPDIR),
-// outside the run's directory, which its file tools reach: what the harness keeps of a session, its large tool
-// outputs among them, goes there and is removed when the run ends, so nothing of a trial stays in the user's.
 // copySelf copies the evaluating binary into the evaluation's own bin directory: a copy, not a link, so a rebuild
 // of the installed binary while the evaluation runs does not change what its trials run.
 func (e *Eval) copySelf() error {
@@ -655,6 +651,25 @@ func (e *Eval) copySelf() error {
 	return nil
 }
 
+// trialEnv is a trial's environment, and a file of its own that exports the trial's variables and PATH again,
+// which the harness sources inside every command (CLAUDE_ENV_FILE), after the user's shell startup: a startup file
+// that moves another momentum first on the PATH, or points a variable elsewhere, changes nothing a trial runs.
+func trialEnv(extra map[string]string, home string, bins []string) ([]string, error) {
+	env := CleanEnv(extra, bins...)
+	var b strings.Builder
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		if _, ours := extra[k]; ours || k == "PATH" {
+			fmt.Fprintf(&b, "export %s='%s'\n", k, strings.ReplaceAll(v, "'", `'\''`))
+		}
+	}
+	file := filepath.Join(home, "env.sh")
+	if err := os.WriteFile(file, []byte(b.String()), 0o600); err != nil {
+		return nil, err
+	}
+	return append(env, "CLAUDE_ENV_FILE="+file), nil
+}
+
 // trialBins are the directories first on a trial's PATH: the evaluating binary's copy, then the runner's.
 func (e *Eval) trialBins() []string {
 	if e.bin == "" {
@@ -663,6 +678,10 @@ func (e *Eval) trialBins() []string {
 	return append([]string{e.bin}, e.Runner.Bins...)
 }
 
+// harnessHome is one evaluation run's own configuration and temporary directory for the harness (Claude Code's
+// CLAUDE_CONFIG_DIR, TMPDIR and CLAUDE_CODE_TMPDIR), outside the run's directory, which its file tools reach: what
+// the harness keeps of a session, its large tool outputs among them, goes there and is removed when the run ends,
+// so nothing of a trial stays in the user's.
 func (e *Eval) harnessHome(name string) (string, error) {
 	dir := filepath.Join(e.Dir, "harness", name)
 	// its temporary files too: Claude Code keeps a session's scratchpad and its background commands' output under
@@ -743,10 +762,13 @@ func (e *Eval) invokeTrial(ctx context.Context, t GoldenTask, c store.Case, dir,
 		return Result{}, err
 	}
 	defer os.RemoveAll(home)
-	agent := r.Agent
-	agent.Env = CleanEnv(map[string]string{"MOMENTUM_HOME": dir, "MOMENTUM_EVAL": e.ID, "MOMENTUM_NOW": t.Cutoff.Format(time.RFC3339Nano), "MOMENTUM_ACTOR": "eval:" + run.ID,
+	env := map[string]string{"MOMENTUM_HOME": dir, "MOMENTUM_EVAL": e.ID, "MOMENTUM_NOW": t.Cutoff.Format(time.RFC3339Nano), "MOMENTUM_ACTOR": "eval:" + run.ID,
 		"MOMENTUM_LOOP_RUN": run.ID, "MOMENTUM_LOOP_CASE": c.ID, "MOMENTUM_LOOP_DIR": dir, "CLAUDE_CONFIG_DIR": home,
-		"TMPDIR": filepath.Join(home, "tmp"), "CLAUDE_CODE_TMPDIR": filepath.Join(home, "tmp")}, e.trialBins()...)
+		"TMPDIR": filepath.Join(home, "tmp"), "CLAUDE_CODE_TMPDIR": filepath.Join(home, "tmp")}
+	agent := r.Agent
+	if agent.Env, err = trialEnv(env, home, e.trialBins()); err != nil {
+		return Result{}, err
+	}
 	if err := os.WriteFile(filepath.Join(dir, "prompt.txt"), []byte(inv.Prompt), 0o600); err != nil {
 		return Result{}, err
 	}
