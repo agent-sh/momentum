@@ -91,10 +91,13 @@ func Summarize(trials []Trial, requested ...int) []Summary {
 type ArmSummary struct {
 	Arm                                                                                                              string
 	K, Tasks, Planned, Ran, Graded, Reached, Partial, Missed, Wrong, Errors, CutShort, Flips, Skipped, ComparedTasks int
-	PassAtK, PassAllK                                                                                                float64
-	USD, JudgeUSD, Minutes                                                                                           float64
-	ComparedUSD, ComparedMinutes                                                                                     float64
-	USDPerTrial, MinutesPerTrial, USDPerReached, MinutesPerReached                                                   *float64
+	// Ungraded are the trials left out of the comparison because a judge could not grade them or their pair's other
+	// arm; ComparedReached the root causes reached among the trials compared, which the rates per cause divide by.
+	Ungraded, ComparedReached                                      int
+	PassAtK, PassAllK                                              float64
+	USD, JudgeUSD, Minutes                                         float64
+	ComparedUSD, ComparedMinutes                                   float64
+	USDPerTrial, MinutesPerTrial, USDPerReached, MinutesPerReached *float64
 }
 type TaskComparison struct {
 	Task                       string
@@ -152,24 +155,32 @@ func (e *Eval) Results(trials []Trial) EvaluationResults {
 		task string
 		n    int
 	}
-	ran := map[pairKey]map[string]bool{}
+	ran, graded := map[pairKey]map[string]bool{}, map[pairKey]map[string]bool{}
 	for _, tr := range trials {
 		k := pairKey{tr.Task, tr.N}
 		if ran[k] == nil {
-			ran[k] = map[string]bool{}
+			ran[k], graded[k] = map[string]bool{}, map[string]bool{}
 		}
 		if !tr.Run.Started.IsZero() && tr.Skipped == "" {
 			ran[k][tr.Arm] = true
+			graded[k][tr.Arm] = validVerdict(tr.Grade.Verdict)
 		}
 	}
 	accounted := append([]Trial(nil), trials...)
 	var compared []Trial
+	ungraded := map[string]int{}
 	for i := range accounted {
 		tr := &accounted[i]
-		arms := ran[pairKey{tr.Task, tr.N}]
-		if paired && (arms["loop"] != arms["native"]) {
+		k := pairKey{tr.Task, tr.N}
+		arms := ran[k]
+		switch {
+		case paired && (arms["loop"] != arms["native"]):
 			tr.Skipped = "both arms did not run this trial"
-		} else if tr.Skipped == "" && !tr.Run.Started.IsZero() {
+		case tr.Skipped != "" || tr.Run.Started.IsZero():
+		case !graded[k][tr.Arm] || paired && !(graded[k]["loop"] && graded[k]["native"]):
+			// a trial without a grade says nothing of its investigation: it leaves the comparison with its pair
+			ungraded[tr.Arm]++
+		default:
 			compared = append(compared, *tr)
 		}
 	}
@@ -198,11 +209,17 @@ func (e *Eval) Results(trials []Trial) EvaluationResults {
 		a.JudgeUSD += s.JudgeUSD
 		a.Minutes += s.TotalMinutes
 	}
+	for arm, n := range ungraded {
+		if by[arm] != nil {
+			by[arm].Ungraded = n
+		}
+	}
 	for _, s := range Summarize(compared, r.K) {
 		a := by[s.Arm]
 		a.ComparedTasks++
 		a.ComparedUSD += s.USD
 		a.ComparedMinutes += s.TotalMinutes
+		a.ComparedReached += s.Reached
 		if s.AnyReached {
 			a.PassAtK++
 		}
@@ -237,8 +254,8 @@ func (e *Eval) Results(trials []Trial) EvaluationResults {
 			}
 			a.USDPerTrial = ratio(a.USD, a.Ran)
 			a.MinutesPerTrial = ratio(a.Minutes, a.Ran)
-			a.USDPerReached = ratio(a.ComparedUSD, a.Reached)
-			a.MinutesPerReached = ratio(a.ComparedMinutes, a.Reached)
+			a.USDPerReached = ratio(a.ComparedUSD, a.ComparedReached)
+			a.MinutesPerReached = ratio(a.ComparedMinutes, a.ComparedReached)
 			r.Arms = append(r.Arms, *a)
 		}
 	}

@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -87,6 +89,12 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if off < 0 {
 		return usageError{"negative record offset"}
 	}
+	var magic [16]byte
+	if n, _ := f.ReadAt(magic[:], 0); n == len(magic) && string(magic[:]) == "SQLite format 3\x00" {
+		// a Hermes event's reference names its message row by the row's id, not a byte offset of the file
+		output.WriteString("  (its record is a row of the Hermes store, which evidence show does not read)\n")
+		return scrubbed(ctx, stdout, output.String())
+	}
 	if off > 0 {
 		var prev [1]byte
 		if _, err := f.ReadAt(prev[:], off-1); err != nil || prev[0] != '\n' {
@@ -101,6 +109,9 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		output.WriteString("  (oversized record withheld)\n")
 	} else if err != nil && err != io.EOF {
 		return err
+	} else if !ownRecord(e, line) {
+		// a log read again from its start after a rotation gives its rows new places: the old place names another row
+		output.WriteString("  (its record is gone: the line at its place is another's, the log was rewritten since)\n")
 	} else if os.Getenv("MOMENTUM_NOW") != "" {
 		end, err := commandNow()
 		if err != nil {
@@ -124,6 +135,17 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		output.Write(line)
 	}
 	return scrubbed(ctx, stdout, output.String())
+}
+
+// ownRecord says whether a line is the event's own record where the event says which line that is: a mistakes
+// row's key is the first 16 bytes of the SHA-256 of its line (source.Mistakes). Other sources' references name an
+// append-only file's place.
+func ownRecord(e store.Event, line []byte) bool {
+	if e.Source != "mistakes" {
+		return true
+	}
+	h := sha256.Sum256(line)
+	return hex.EncodeToString(h[:16]) == e.SourceKey
 }
 
 // scanPlace says whether a source's references name a scan's place in a transcript (how far it had read), whose

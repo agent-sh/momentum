@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/agent-sh/momentum/internal/paths"
+	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -93,6 +95,7 @@ type Eval struct {
 	Arms         []string
 	Repositories []string
 	GoldenHash   string
+	pair         string // the store as of the trial's end, made once for both arms of a trial; each arm runs on a copy
 }
 
 // Grade is the judge's reading of one investigation.
@@ -236,10 +239,18 @@ func (e *Eval) Run(ctx context.Context, tasks []GoldenTask) ([]Trial, error) {
 		go func(j job) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			for _, arm := range arms {
+			// both arms of a trial read one snapshot, made before either runs, and take turns going first
+			pair, done := e.pairStore(ctx, j.t, j.n)
+			defer done()
+			order := arms
+			if j.n%2 == 0 && len(arms) == 2 {
+				order = []string{arms[1], arms[0]}
+			}
+			for _, arm := range order {
 				copy := *e
 				copy.Native = arm == "native"
 				copy.Repositories = repositories
+				copy.pair = pair
 				tr := copy.trial(ctx, j.t, j.n)
 				mu.Lock()
 				reserved -= e.Runner.Budgets.Run + judgeBudget
@@ -273,6 +284,53 @@ func uniqueStrings(xs []string) []string {
 }
 func (e *Eval) newTrial(t GoldenTask, n int, arm string) Trial {
 	return Trial{Task: t.ID, Family: t.Family, N: n, Arm: arm, Key: digest(fmt.Sprintf("%s\x00%s\x00%d", e.ID, t.ID, n))[:16], Provenance: e.provenance(t.Family)}
+}
+
+// pairStore makes the store as of a trial's end once, for both its arms, and says how to remove it; with no store
+// (its end unreadable, the copy failed) each arm makes and reports its own.
+func (e *Eval) pairStore(ctx context.Context, t GoldenTask, n int) (string, func()) {
+	end, err := e.snapshotEnd(ctx, t)
+	if err != nil {
+		return "", func() {}
+	}
+	dir := filepath.Join(e.Dir, "pairs", digest(fmt.Sprintf("%s\x00%s\x00%d", e.ID, t.ID, n))[:16])
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", func() {}
+	}
+	done := func() { os.RemoveAll(dir) }
+	db := filepath.Join(dir, "momentum.db")
+	if err := store.AsOf(ctx, e.Source, db, end.Add(-store.CaseRetention), end); err != nil {
+		done()
+		return "", func() {}
+	}
+	return db, done
+}
+
+// copyStore copies a closed store, its write-ahead log with it when there is one.
+func copyStore(src, dst string) error {
+	for _, suffix := range []string{"", "-wal"} {
+		in, err := os.Open(src + suffix)
+		if os.IsNotExist(err) && suffix != "" {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		out, err := os.OpenFile(dst+suffix, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			in.Close()
+			return err
+		}
+		_, err = io.Copy(out, in)
+		in.Close()
+		if cerr := out.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // snapshotEnd is the earlier of the task's cutoff and one minute after its newest symptom.
@@ -349,7 +407,12 @@ func (e *Eval) trial(ctx context.Context, t GoldenTask, n int) (tr Trial) {
 	}
 	t.Cutoff = end
 	tr.EndOfStore = end
-	if err := store.AsOf(ctx, e.Source, db, end.Add(-store.CaseRetention), end); err != nil {
+	if e.pair != "" {
+		err = copyStore(e.pair, db)
+	} else {
+		err = store.AsOf(ctx, e.Source, db, end.Add(-store.CaseRetention), end)
+	}
+	if err != nil {
 		tr.Err = "the store as of the cutoff: " + err.Error()
 		return tr
 	}
@@ -453,7 +516,7 @@ func cloneAsOf(ctx context.Context, src, commit, dst string) error {
 	}
 	for _, s := range steps {
 		if out, err := evalGit(ctx, s...).CombinedOutput(); err != nil {
-			return fmt.Errorf("git %s: %v: %s", s[0], err, out)
+			return fmt.Errorf("git %s: %v: %s", subcommand(s), err, out)
 		}
 	}
 	refs, err := evalGit(ctx, "-C", dst, "for-each-ref", "--format=%(refname)").Output()
@@ -479,6 +542,18 @@ func cloneAsOf(ctx context.Context, src, commit, dst string) error {
 		return fmt.Errorf("clone retains unreachable objects: %s: %v", out, err)
 	}
 	return removeEscapingLinks(ctx, dst)
+}
+
+// subcommand is the git command of a call's arguments, past its -C DIR.
+func subcommand(args []string) string {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-C" {
+			i++
+			continue
+		}
+		return args[i]
+	}
+	return "?"
 }
 
 func evalGit(ctx context.Context, args ...string) *exec.Cmd {
@@ -550,7 +625,7 @@ const trialCommands = `
 ## Commands available in this trial
 Your working directory is . (the trial's isolated directory). File tools read its files and repository checkouts.
 - momentum evidence show ID: reads a stored event and the full transcript or log record it names.
-- momentum evidence search TEXT [--source SOURCE] [--since WHEN] [--until WHEN] [--kind K,K] [--actor ACTOR] [--session ID] [--limit N]: matches stored summaries of every source, newest first; --source narrows it. Sources: transcripts, incidents, mistakes, radar, sessions, supervise, capacity; --source must name one the store holds. Actors: owner, agent, tool, harness, detector, unknown.
+- momentum evidence search TEXT [--source SOURCE] [--since WHEN] [--until WHEN] [--kind K,K] [--actor ACTOR] [--session ID] [--limit N]: matches stored summaries of every source, newest first; --source narrows it. Sources: transcripts, incidents, mistakes, radar-feedback, sessions, supervise, capacity; --source must name one the store holds. Actors: owner, agent, tool, harness, detector, unknown.
 - momentum evidence events [--source SOURCE] [--kind K,K] [--since WHEN] [--until WHEN] [--harness NAME] [--session ID] [--limit N] [--json]: reads stored events, optionally one session.
 - momentum evidence status [--since WHEN]: counts stored events by source and kind.
 - momentum evidence git DIR CMD ...: reads a trial checkout's history with log, show, diff, blame, grep, ls-files, ls-tree, rev-parse, rev-list, merge-base, describe, status, shortlog, or listing forms of branch and tag. Use read options only; revisions are checked and paths follow --.
@@ -673,7 +748,13 @@ func judgeFinding(f finding) string {
 		}
 		return s
 	}
-	fields := struct{ Mechanism, Alternatives, Fix, Summary string }{clip(f.Mechanism), clip(strings.Join(f.Alternatives, " | ")), clip(f.Fix), clip(f.Report)}
+	// every field folded to one line, as the case store keeps the loop's, so the shape says nothing of the arm
+	fold := func(s string) string { return plain.Clip(plain.Line(s), 2000) }
+	var alternatives []string
+	for _, a := range f.Alternatives {
+		alternatives = append(alternatives, fold(a))
+	}
+	fields := struct{ Mechanism, Alternatives, Fix, Summary string }{clip(fold(f.Mechanism)), clip(strings.Join(alternatives, " | ")), clip(fold(f.Fix)), clip(fold(f.Report))}
 	raw, _ := json.MarshalIndent(fields, "", "  ")
 	// A JSON unicode escape cannot close the prompt's fence.
 	return "```json\n" + strings.ReplaceAll(string(raw), "`", `\u0060`) + "\n```\n"
@@ -721,22 +802,35 @@ func (e *Eval) grade(ctx context.Context, t GoldenTask, f finding, jdir string, 
 	judge := e.Judge
 	judge.Fallback = ""
 	judge.Env = CleanEnv(nil, e.Runner.Bins...)
-	jr, err := judge.Run(ctx, inv)
-	if !jr.CostKnown {
-		jr.USD = judgeBudget
+	// a judge that fails (an API error, an answer off its schema) is tried once more on the same model, its first
+	// stream kept beside it; a trial still without a grade is left out of the comparison with its pair (Results)
+	spent := 0.0
+	var last error
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			os.Rename(filepath.Join(jdir, "transcript.jsonl"), filepath.Join(jdir, "transcript.failed.jsonl"))
+		}
+		jr, err := judge.Run(ctx, inv)
+		if !jr.CostKnown {
+			jr.USD = judgeBudget
+		}
+		spent += jr.USD
+		jrun := store.LoopRun{ID: newRunID(time.Now()), Case: run.Case, Family: t.Family, Step: "judge", Started: time.Now().Add(-jr.Duration),
+			Ended: time.Now(), Status: jr.Status, Failure: jr.Failure, USD: jr.USD, Tokens: jr.Tokens, Turns: jr.Turns, Model: jr.Model, Dir: jdir,
+			Experiment: run.Experiment}
+		e.Runner.Store.PutLoopRun(ctx, jrun)
+		if err != nil {
+			last = err
+			continue
+		}
+		var g Grade
+		if jr.Status != store.RunOK || json.Unmarshal(jr.Report, &g) != nil || !validVerdict(g.Verdict) {
+			last = fmt.Errorf("no grade: %s %s", jr.Status, jr.Failure)
+			continue
+		}
+		return g, spent, nil
 	}
-	jrun := store.LoopRun{ID: newRunID(time.Now()), Case: run.Case, Family: t.Family, Step: "judge", Started: time.Now().Add(-jr.Duration),
-		Ended: time.Now(), Status: jr.Status, Failure: jr.Failure, USD: jr.USD, Tokens: jr.Tokens, Turns: jr.Turns, Model: jr.Model, Dir: jdir,
-		Experiment: run.Experiment}
-	e.Runner.Store.PutLoopRun(ctx, jrun)
-	if err != nil {
-		return Grade{}, jr.USD, err
-	}
-	var g Grade
-	if jr.Status != store.RunOK || json.Unmarshal(jr.Report, &g) != nil || !validVerdict(g.Verdict) {
-		return Grade{}, jr.USD, fmt.Errorf("no grade: %s %s", jr.Status, jr.Failure)
-	}
-	return g, jr.USD, nil
+	return Grade{}, spent, last
 }
 
 // branchAsOf prefers the branch's recorded position when its reflog covers the end.
@@ -752,9 +846,21 @@ func branchAsOf(ctx context.Context, src, branch string, end time.Time) ([]byte,
 			continue
 		}
 		at, err := time.Parse(time.RFC3339, strings.TrimSuffix(stamp, "}"))
-		if err == nil && !at.After(end) {
-			return evalGit(ctx, "-C", src, "rev-parse", "--verify", branch+"@{"+end.Format(time.RFC3339)+"}").Output()
+		if err != nil || at.After(end) {
+			continue
 		}
+		out, err := evalGit(ctx, "-C", src, "rev-parse", "--verify", branch+"@{"+end.Format(time.RFC3339)+"}").Output()
+		if err != nil {
+			return nil, err
+		}
+		// a clone carries what the source's branches and tags reach: a commit only the reflog holds (the branch reset
+		// or rebased after the end) is not in it, so the commit dates set the clone then
+		held, err := evalGit(ctx, "-C", src, "for-each-ref", "--contains", strings.TrimSpace(string(out)), "--count=1", "--format=%(refname)",
+			"refs/heads", "refs/tags").Output()
+		if err == nil && strings.TrimSpace(string(held)) != "" {
+			return out, nil
+		}
+		break
 	}
 	before := time.Unix(end.Add(-time.Nanosecond).Unix(), 0)
 	return evalGit(ctx, "-C", src, "rev-list", "-1", "--before="+before.Format(time.RFC3339), branch, "--").Output()
