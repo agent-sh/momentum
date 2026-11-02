@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -40,8 +42,8 @@ func scrubbed(ctx context.Context, w io.Writer, text string) error {
 }
 
 // evidenceShow prints an event of the store and, where its reference names a record of a transcript or a log
-// (path@offset), that record as the file holds it, scrubbed: what the event's summary cut. Only an event the store
-// holds is shown, so a store made as of a moment shows nothing after it.
+// (path@offset), that record as the file holds it, scrubbed. A scan place names the next record, not the event.
+// With MOMENTUM_NOW set, only a record whose own timestamp precedes that end is shown.
 func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
 		return usageError{"evidence show takes one event: its id, or ev:ID"}
@@ -99,6 +101,23 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		output.WriteString("  (oversized record withheld)\n")
 	} else if err != nil && err != io.EOF {
 		return err
+	} else if os.Getenv("MOMENTUM_NOW") != "" {
+		end, err := commandNow()
+		if err != nil {
+			return err
+		}
+		var record struct {
+			Timestamp string `json:"timestamp"`
+		}
+		_ = json.Unmarshal(line, &record)
+		at, err := time.Parse(time.RFC3339Nano, record.Timestamp)
+		if err != nil || at.IsZero() {
+			output.WriteString("  (record withheld: no valid timestamp)\n")
+		} else if !at.Before(end) {
+			output.WriteString("  (record withheld: timestamp is at or after the evaluation end)\n")
+		} else {
+			output.Write(line)
+		}
 	} else {
 		output.Write(line)
 	}
@@ -352,11 +371,6 @@ func evidenceSearch(ctx context.Context, args []string, stdout, stderr io.Writer
 	}
 	for _, k := range strings.Split(*kinds, ",") {
 		if k = strings.TrimSpace(k); k != "" {
-			switch k {
-			case "owner_text", "agent_text", "tool_call", "tool_result", "harness_text", "compaction", "unknown":
-			default:
-				return usageError{"unknown kind: " + k}
-			}
 			q.Kinds = append(q.Kinds, k)
 		}
 	}
@@ -365,6 +379,20 @@ func evidenceSearch(ctx context.Context, args []string, stdout, stderr io.Writer
 		return err
 	}
 	defer st.Close()
+	if *source != "" {
+		counts, err := st.Counts(ctx, time.Time{})
+		if err != nil {
+			return err
+		}
+		if _, ok := counts[*source]; !ok {
+			var sources []string
+			for name := range counts {
+				sources = append(sources, name)
+			}
+			sort.Strings(sources)
+			return usageError{fmt.Sprintf("unknown source %q; the store holds: %s", *source, strings.Join(sources, ", "))}
+		}
+	}
 	evs, err := st.Events(ctx, q)
 	if err != nil {
 		return err

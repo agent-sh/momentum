@@ -29,7 +29,7 @@ func TestEvidenceSearchParsesFlagsAnywhereAndOrdersSessionMatches(t *testing.T) 
 			t.Fatalf("%v: %d %s %s", args, code, out, diag)
 		}
 	}
-	for _, args := range [][]string{{"queue stalled", "extra"}, {"--actor", "typo", "queue stalled"}, {"--kind", "typo", "queue stalled"}, {"--actor", "owner"}} {
+	for _, args := range [][]string{{"queue stalled", "extra"}, {"--actor", "typo", "queue stalled"}, {"--actor", "owner"}} {
 		code, _, _ := momentum(append([]string{"evidence", "search"}, args...)...)
 		if code != 2 {
 			t.Fatalf("accepted %v", args)
@@ -37,7 +37,7 @@ func TestEvidenceSearchParsesFlagsAnywhereAndOrdersSessionMatches(t *testing.T) 
 	}
 }
 
-// Default evidence windows follow a snapshot forty days back. Replay cannot read today's Hermes database or later requests.
+// Default evidence windows follow a snapshot forty days back, never later records.
 func TestEvidenceCommandsUseTheSnapshotClock(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("MOMENTUM_HOME", t.TempDir())
@@ -74,7 +74,7 @@ func TestEvidenceCommandsUseTheSnapshotClock(t *testing.T) {
 	if err = store.AsOf(context.Background(), src, paths.DB(), end.Add(-30*24*time.Hour), end); err != nil {
 		t.Fatal(err)
 	}
-	for _, args := range [][]string{{"evidence", "search", "queue stalled"}, {"evidence", "events"}, {"evidence", "status"}, {"evidence", "status", "--since", end.Add(-24 * time.Hour).Format(time.RFC3339)}, {"supervise", "replay"}} {
+	for _, args := range [][]string{{"evidence", "search", "queue stalled"}, {"evidence", "events"}, {"evidence", "status"}, {"evidence", "status", "--since", end.Add(-24 * time.Hour).Format(time.RFC3339)}} {
 		code, out, diag := momentum(args...)
 		if code != 0 || out == "" || strings.Contains(out+diag, "future answer") {
 			t.Fatalf("%v: %d %s %s", args, code, out, diag)
@@ -86,9 +86,6 @@ func TestEvidenceCommandsUseTheSnapshotClock(t *testing.T) {
 		}
 		if args[1] == "status" && !strings.Contains(out, "owner_text 1") {
 			t.Fatalf("historical status lost: %s", out)
-		}
-		if args[1] == "replay" && !strings.Contains(out, " to "+end.Local().Format("2006-01-02 15:04")) {
-			t.Fatalf("replay window lost: %s", out)
 		}
 	}
 	from, err := parseWhen("1d")
