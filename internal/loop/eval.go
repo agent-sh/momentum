@@ -312,7 +312,7 @@ func (e *Eval) trial(ctx context.Context, t GoldenTask, n int) (tr Trial) {
 		arm = "native"
 	}
 	tr = e.newTrial(t, n, arm)
-	dir := filepath.Join(e.Dir, tr.Key, arm)
+	dir := filepath.Join(e.Dir, tr.Key, digest(tr.Key + "\x00" + arm)[:16])
 	// A repeated id must not wipe another evaluation's files.
 	if _, err := os.Stat(dir); err == nil {
 		tr.Err = "trial directory already exists"
@@ -478,7 +478,7 @@ func cloneAsOf(ctx context.Context, src, commit, dst string) error {
 	if err != nil || strings.Contains(string(out), "unreachable ") {
 		return fmt.Errorf("clone retains unreachable objects: %s: %v", out, err)
 	}
-	return nil
+	return removeEscapingLinks(ctx, dst)
 }
 
 func evalGit(ctx context.Context, args ...string) *exec.Cmd {
@@ -492,7 +492,7 @@ func evalGit(ctx context.Context, args ...string) *exec.Cmd {
 // its fix came after. A repository with no commit by then did not exist yet and is left out.
 func (e *Eval) cloneRepositories(ctx context.Context, t GoldenTask, dir string) ([]string, error) {
 	var out []string
-	for i, src := range e.Repositories {
+	for _, src := range e.Repositories {
 		ref, err := evalGit(ctx, "-C", src, "symbolic-ref", "refs/remotes/origin/HEAD").Output()
 		// origin/HEAD names the default branch, but only its local head is carried by --no-local.
 		if err == nil {
@@ -511,8 +511,7 @@ func (e *Eval) cloneRepositories(ctx context.Context, t GoldenTask, dir string) 
 		if err != nil {
 			return nil, fmt.Errorf("default branch: %w", err)
 		}
-		before := time.Unix(t.Cutoff.Add(-time.Nanosecond).Unix(), 0)
-		raw, err := evalGit(ctx, "-C", src, "rev-list", "-1", "--before="+before.Format(time.RFC3339), strings.TrimSpace(string(ref)), "--").Output()
+		raw, err := branchAsOf(ctx, src, strings.TrimSpace(string(ref)), t.Cutoff)
 		if err != nil {
 			return nil, fmt.Errorf("the default branch of %s: %w", src, err)
 		}
@@ -520,7 +519,7 @@ func (e *Eval) cloneRepositories(ctx context.Context, t GoldenTask, dir string) 
 		if commit == "" {
 			continue // no commit by then: the repository did not exist yet
 		}
-		dst := filepath.Join(dir, fmt.Sprintf("repo-%d", i+1))
+		dst := filepath.Join(dir, fmt.Sprintf("repo-%d", len(out)+1))
 		if err := cloneAsOf(ctx, src, commit, dst); err != nil {
 			return nil, err
 		}
@@ -550,21 +549,18 @@ const trialCommands = `
 
 ## Commands available in this trial
 Your working directory is . (the trial's isolated directory). File tools read its files and repository checkouts.
-Both arms may run the evidence and replay commands below. Case commands are available only to the loop arm.
-- momentum case ... (loop arm only): reads snapshot cases and changes only the assigned case; unavailable in the native arm.
 - momentum evidence show ID: reads a stored event and the full transcript or log record it names.
-- momentum evidence search TEXT [--source SOURCE] [--since WHEN] [--until WHEN] [--kind K,K] [--actor ACTOR] [--session ID] [--limit N]: matches stored summaries of every source, newest first; --source narrows it. Actors: owner, agent, tool, harness, detector, unknown.
+- momentum evidence search TEXT [--source SOURCE] [--since WHEN] [--until WHEN] [--kind K,K] [--actor ACTOR] [--session ID] [--limit N]: matches stored summaries of every source, newest first; --source narrows it. Sources: transcripts, incidents, mistakes, radar, sessions, supervise, capacity; --source must name one the store holds. Actors: owner, agent, tool, harness, detector, unknown.
 - momentum evidence events [--source SOURCE] [--kind K,K] [--since WHEN] [--until WHEN] [--harness NAME] [--session ID] [--limit N] [--json]: reads stored events, optionally one session.
-- momentum evidence status [--since WHEN]: counts stored events by source, actor and kind.
+- momentum evidence status [--since WHEN]: counts stored events by source and kind.
 - momentum evidence git DIR CMD ...: reads a trial checkout's history with log, show, diff, blame, grep, ls-files, ls-tree, rev-parse, rev-list, merge-base, describe, status, shortlog, or listing forms of branch and tag. Use read options only; revisions are checked and paths follow --.
-- momentum supervise replay [--since WHEN] [--until WHEN] [--anchor]: reads the snapshot's session events and bounded request records to replay supervision; prints decisions and anchors. No --points or --labels.
 No other shell commands are available.
 `
 
 func (e *Eval) system(arm, family string) (string, error) {
 	if arm == "loop" {
 		s, err := systemPrompt(StepInvestigate, family, nil, e.Runner.Constraints)
-		return s + "\nIn this evaluation, tacit, momentum evidence file, momentum evidence unit and momentum report are not available. Do not call them.\n", err
+		return s + "\nIn this evaluation, tacit, momentum evidence file, momentum evidence unit, momentum report and momentum supervise replay are not available. Do not call them.\n", err
 	}
 	s := nativeBrief + "\n"
 	for _, c := range e.Runner.Constraints {
@@ -578,7 +574,7 @@ func (e *Eval) evalPermissions(c store.Case, run store.LoopRun, native bool) Set
 	s := e.Runner.permissions(StepInvestigate, c, run)
 	var allow []string
 	for _, a := range s.Allow {
-		if strings.HasPrefix(a, "Bash(tacit ") || strings.HasPrefix(a, "Bash(momentum evidence file ") || strings.HasPrefix(a, "Bash(momentum evidence unit ") || strings.HasPrefix(a, "Bash(momentum report ") || strings.HasPrefix(a, "Bash(momentum ship ") || (native && strings.HasPrefix(a, "Bash(momentum case ")) {
+		if strings.HasPrefix(a, "Bash(momentum supervise replay ") || strings.HasPrefix(a, "Bash(tacit ") || strings.HasPrefix(a, "Bash(momentum evidence file ") || strings.HasPrefix(a, "Bash(momentum evidence unit ") || strings.HasPrefix(a, "Bash(momentum report ") || strings.HasPrefix(a, "Bash(momentum ship ") || (native && strings.HasPrefix(a, "Bash(momentum case ")) {
 			continue
 		}
 		allow = append(allow, a)
@@ -600,6 +596,7 @@ func (e *Eval) invokeTrial(ctx context.Context, t GoldenTask, c store.Case, dir,
 	inv := Invocation{Dir: dir, System: system, Schema: runSchema, MaxTurns: r.Budgets.MaxTurns, BudgetUSD: r.Budgets.Run, Timeout: r.Budgets.RunTime}
 	inv.Prompt = fmt.Sprintf("%s\nProblem: %s\nSymptom events: %s. The store ends at %s. Repository checkouts: %s.\n", investigationQuestion, c.Title, strings.Join(t.Symptom.Query.EventIDs, " "), t.Cutoff.Format(time.RFC3339Nano), firstOf(repo, "none"))
 	if arm == "loop" {
+		inv.Prompt += "momentum case ...: reads snapshot cases and changes only the assigned case.\n"
 		inv.Prompt += fmt.Sprintf("Read case %s with `momentum case show %s --json`. Follow the loop's procedure and the %s skill. Record findings as you go on the case, and the fix in its next test.", c.ID, c.ID, t.Family)
 	} else {
 		inv.Schema = nativeSchema
@@ -648,7 +645,7 @@ func nativeFinding(res Result) finding {
 	return finding{Mechanism: rep.Mechanism, Alternatives: rep.Alternatives, Fix: rep.Fix, Report: rep.Summary}
 }
 
-// findingsFile reads the native arm's running notes in the same fields as its report.
+// findingsFile reads only the three fields a case retains when neither arm has a report.
 func findingsFile(text string) finding {
 	fields := map[string]string{}
 	key := "summary"
@@ -662,7 +659,7 @@ func findingsFile(text string) finding {
 	for k, v := range fields {
 		fields[k] = strings.TrimSpace(v)
 	}
-	return finding{Mechanism: fields["mechanism"], Alternatives: []string{fields["alternatives ruled out"]}, Fix: fields["fix"], Report: fields["summary"]}
+	return finding{Mechanism: fields["mechanism"], Alternatives: []string{fields["alternatives ruled out"]}, Fix: fields["fix"]}
 }
 
 // judgeFinding caps each field equally and quotes the investigation as data, including any fence in its text.
@@ -740,4 +737,64 @@ func (e *Eval) grade(ctx context.Context, t GoldenTask, f finding, jdir string, 
 		return Grade{}, jr.USD, fmt.Errorf("no grade: %s %s", jr.Status, jr.Failure)
 	}
 	return g, jr.USD, nil
+}
+
+// branchAsOf prefers the branch's recorded position when its reflog covers the end.
+// Without that history, commit dates are the available approximation.
+func branchAsOf(ctx context.Context, src, branch string, end time.Time) ([]byte, error) {
+	log, err := evalGit(ctx, "-C", src, "reflog", "show", "--format=%gD", "--date=iso-strict", branch).Output()
+	if err != nil {
+		return nil, err
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(log)), "\n") {
+		_, stamp, ok := strings.Cut(line, "@{")
+		if !ok {
+			continue
+		}
+		at, err := time.Parse(time.RFC3339, strings.TrimSuffix(stamp, "}"))
+		if err == nil && !at.After(end) {
+			return evalGit(ctx, "-C", src, "rev-parse", "--verify", branch+"@{"+end.Format(time.RFC3339)+"}").Output()
+		}
+	}
+	before := time.Unix(end.Add(-time.Nanosecond).Unix(), 0)
+	return evalGit(ctx, "-C", src, "rev-list", "-1", "--before="+before.Format(time.RFC3339), branch, "--").Output()
+}
+
+// removeEscapingLinks leaves historical link blobs intact but removes unsafe work-tree links without following them.
+func removeEscapingLinks(ctx context.Context, dst string) error {
+	root, err := filepath.EvalSymlinks(dst)
+	if err != nil {
+		return err
+	}
+	root, err = filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	raw, err := evalGit(ctx, "-C", dst, "ls-files", "--stage", "-z").Output()
+	if err != nil {
+		return err
+	}
+	var remove []string
+	for _, entry := range strings.Split(string(raw), "\x00") {
+		if !strings.HasPrefix(entry, "120000 ") {
+			continue
+		}
+		_, name, ok := strings.Cut(entry, "\t")
+		if !ok {
+			return fmt.Errorf("malformed tracked link")
+		}
+		link := filepath.Join(root, name)
+		target, err := filepath.EvalSymlinks(link)
+		// Unresolvable links cannot prove containment either.
+		rel, relErr := filepath.Rel(root, target)
+		if err != nil || relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			remove = append(remove, link)
+		}
+	}
+	for _, link := range remove {
+		if err := os.Remove(link); err != nil {
+			return err
+		}
+	}
+	return nil
 }

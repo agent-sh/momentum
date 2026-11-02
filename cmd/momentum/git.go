@@ -77,10 +77,23 @@ func evidenceGit(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
 		return usageError{fmt.Sprintf("%s is no directory", dir)}
 	}
-	// an evaluation reads only the repositories made for it, as of its moment
+	// Resolve before checking a bound or asking Git which repository it opens.
+	dir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return usageError{err.Error()}
+	}
+	dir, err = filepath.Abs(dir)
+	if err != nil {
+		return usageError{err.Error()}
+	}
+	var trial string
 	if os.Getenv("MOMENTUM_EVAL") != "" {
-		if abs, err := filepath.Abs(dir); err != nil || !within(abs, os.Getenv("MOMENTUM_LOOP_DIR")) {
-			return usageError{"in an evaluation, evidence git reads only under " + os.Getenv("MOMENTUM_LOOP_DIR")}
+		trial, err = filepath.EvalSymlinks(os.Getenv("MOMENTUM_LOOP_DIR"))
+		if err == nil {
+			trial, err = filepath.Abs(trial)
+		}
+		if err != nil || !within(dir, trial) {
+			return usageError{"in an evaluation, evidence git reads only under the resolved trial directory"}
 		}
 	}
 	spec, ok := gitSpecs[sub]
@@ -89,6 +102,14 @@ func evidenceGit(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	}
 	if out, err := gitRead(ctx, dir, "rev-parse", "--is-inside-work-tree"); err != nil || strings.TrimSpace(out) != "true" {
 		return usageError{fmt.Sprintf("%s is not a git work tree", dir)}
+	}
+	top, err := gitRead(ctx, dir, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return usageError{"cannot resolve the repository's work tree"}
+	}
+	top, err = filepath.EvalSymlinks(strings.TrimSpace(top))
+	if err != nil || trial != "" && !within(top, trial) {
+		return usageError{"in an evaluation, the repository must be under the resolved trial directory"}
 	}
 	argv, err := gitArgs(ctx, dir, sub, spec, rest)
 	if err != nil {
@@ -134,6 +155,9 @@ func gitArgs(ctx context.Context, dir, sub string, spec gitSpec, rest []string) 
 		switch {
 		case afterDash:
 			if err := repoPath(a); err != nil {
+				return nil, refuse("%s", err)
+			}
+			if err := gitPathWithin(ctx, dir, a); err != nil {
 				return nil, refuse("%s", err)
 			}
 			pathArgs++
@@ -306,7 +330,15 @@ func gitRead(ctx context.Context, dir string, args ...string) (string, error) {
 // gitEnv is momentum's environment without git's own variables (a GIT_DIR would point it elsewhere), never
 // prompting, taking no optional lock and running no external diff.
 func gitEnv() []string {
-	return loop.GitEnv()
+	env := loop.GitEnv()
+	if os.Getenv("MOMENTUM_EVAL") != "" {
+		if trial, err := filepath.EvalSymlinks(os.Getenv("MOMENTUM_LOOP_DIR")); err == nil {
+			if trial, err = filepath.Abs(trial); err == nil {
+				env = append(env, "GIT_CEILING_DIRECTORIES="+filepath.Dir(trial))
+			}
+		}
+	}
+	return env
 }
 
 func gitNames() string {
@@ -336,4 +368,34 @@ func (c *capped) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	return len(p), nil
+}
+
+// gitPathWithin bounds live paths by the resolved work tree, including a missing path's existing parents.
+func gitPathWithin(ctx context.Context, dir, name string) error {
+	top, err := gitRead(ctx, dir, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return err
+	}
+	root, err := filepath.EvalSymlinks(strings.TrimSpace(top))
+	if err != nil {
+		return err
+	}
+	candidate := filepath.Join(dir, name)
+	for {
+		real, err := filepath.EvalSymlinks(candidate)
+		if err == nil {
+			if !within(real, root) {
+				return fmt.Errorf("path resolves outside the repository")
+			}
+			return nil
+		}
+		if !os.IsNotExist(err) {
+			return err
+		}
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			return err
+		}
+		candidate = parent
+	}
 }

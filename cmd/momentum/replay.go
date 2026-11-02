@@ -20,6 +20,9 @@ import (
 // replay runs the supervision rules over the store's history and prints how they would have done against the
 // owner's labelled steps: what each would have covered, how much earlier, and what it would have done unasked.
 func replay(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if os.Getenv("MOMENTUM_EVAL") != "" {
+		return usageError{"supervise replay is not available in an evaluation: it runs the rules compiled into this binary"}
+	}
 	fs := flag.NewFlagSet("supervise replay", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	since := fs.String("since", "30d", "the window's start: a duration ago or a time")

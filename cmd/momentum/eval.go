@@ -30,7 +30,7 @@ func loopEval(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	budget := fs.Float64("budget", 120, "the most the evaluation spends, in US dollars")
 	parallel := fs.Int("parallel", 3, "trials at once")
 	arms := fs.String("arms", "loop,native", "arms to compare: loop,native, or one alone")
-	asJSON := fs.Bool("json", false, "one JSON object per trial, then one per task")
+	asJSON := fs.Bool("json", false, "prints one results object")
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
 	}
@@ -133,5 +133,11 @@ func printEvaluation(out io.Writer, r loop.EvaluationResults) {
 		}
 		return fmt.Sprintf("[%.4f, %.4f]", x.Low, x.High)
 	}
-	fmt.Fprintf(out, "loop minus native, task bootstrap 90%% interval (%d resamples, seed %d): reached per dollar %s; reached per minute %s\n", r.Comparison.Resamples, r.Comparison.Seed, interval(r.Comparison.ReachedPerDollar), interval(r.Comparison.ReachedPerMinute))
+	compared := 0
+	for _, task := range r.Comparison.Tasks {
+		if task.MoreOften != "not compared" {
+			compared++
+		}
+	}
+	fmt.Fprintf(out, "loop minus native, task bootstrap 90%% interval (%d compared tasks; %d resamples, seed %d): reached per dollar %s; reached per minute %s\n", compared, r.Comparison.Resamples, r.Comparison.Seed, interval(r.Comparison.ReachedPerDollar), interval(r.Comparison.ReachedPerMinute))
 }

@@ -244,17 +244,31 @@ func TestPairedSummariesKeepTheSameK(t *testing.T) {
 
 // Evaluation permissions retain every live denial and permit no shell prefix that changes momentum's environment.
 func TestTrialPermissionsKeepLiveDenialsAndProgramWords(t *testing.T) {
-	e, _ := evalFixture(t)
-	run := store.LoopRun{Dir: t.TempDir()}
-	c := store.Case{}
-	live := e.Runner.permissions(StepInvestigate, c, run)
-	for _, native := range []bool{false, true} {
-		got := e.evalPermissions(c, run, native)
+	e, task := evalFixture(t)
+	trs, err := e.Run(context.Background(), []GoldenTask{task})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tr := range trs {
+		if tr.Err != "" {
+			t.Fatal(tr.Err)
+		}
+		live := e.Runner.permissions(StepInvestigate, store.Case{}, tr.Run)
+		raw, err := os.ReadFile(filepath.Join(tr.Run.Dir, "settings.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var settings struct{ Permissions Settings }
+		if err := json.Unmarshal(raw, &settings); err != nil {
+			t.Fatal(err)
+		}
+		got := settings.Permissions
+
 		if !reflect.DeepEqual(got.Deny, live.Deny) {
 			t.Fatalf("denials %v", got.Deny)
 		}
 		for _, a := range got.Allow {
-			if strings.Contains(a, "tacit ") || strings.Contains(a, "evidence file ") || strings.Contains(a, "evidence unit ") || strings.Contains(a, "momentum report ") {
+			if strings.Contains(a, "tacit ") || strings.Contains(a, "evidence file ") || strings.Contains(a, "evidence unit ") || strings.Contains(a, "momentum report ") || strings.Contains(a, "supervise replay ") {
 				t.Fatalf("current machine allowed: %s", a)
 			}
 			if strings.HasPrefix(a, "Bash(") {
@@ -531,7 +545,7 @@ func TestEvaluationJobsInterleaveTrialTaskAndArm(t *testing.T) {
 		for _, task := range []GoldenTask{a, b} {
 			for _, arm := range []string{"loop", "native"} {
 				tr := e.newTrial(task, n, arm)
-				want = append(want, filepath.Join(e.Dir, tr.Key, arm))
+				want = append(want, filepath.Join(e.Dir, tr.Key, digest(tr.Key + "\x00" + arm)[:16]))
 			}
 		}
 	}

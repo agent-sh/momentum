@@ -121,7 +121,7 @@ func TestTrialPromptsEndWithTheSameCommandReference(t *testing.T) {
 			t.Fatal("command reference absent")
 		}
 		blocks = append(blocks, prompt[start:])
-		for _, command := range []string{"momentum evidence git", "momentum supervise replay", "Your working directory is ."} {
+		for _, command := range []string{"momentum evidence git", "Your working directory is ."} {
 			if !strings.Contains(prompt, command) {
 				t.Fatalf("missing %s", command)
 			}
@@ -150,7 +150,7 @@ func TestTrialPromptsEndWithTheSameCommandReference(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !strings.Contains(string(raw), "tacit, momentum evidence file, momentum evidence unit and momentum report are not available") {
+			if !strings.Contains(string(raw), "tacit, momentum evidence file, momentum evidence unit, momentum report and momentum supervise replay are not available") {
 				t.Fatal("unavailable commands unmarked")
 			}
 		}
@@ -291,7 +291,8 @@ func TestTrialNeverReusesItsDirectory(t *testing.T) {
 	}
 }
 
-// The program word anchors the rule after harmless locale assignments; protected variables and wrappers stay visible.
+// trialBashRuleMatches models the harness's program-prefix matcher after TZ and LANG assignments.
+// It does not run the harness or model its full shell parser; the permission test applies it to actual settings.
 func trialBashRuleMatches(pattern, command string) bool {
 	words := strings.Fields(command)
 	for len(words) > 0 && (strings.HasPrefix(words[0], "TZ=") || strings.HasPrefix(words[0], "LANG=")) {
@@ -307,19 +308,6 @@ func trialBashRuleMatches(pattern, command string) bool {
 		}
 	}
 	return true
-}
-
-// Harmless assignments do not hide the program, while a protected assignment or env wrapper cannot match momentum.
-func TestTrialBashRulesStartAtTheProgramWord(t *testing.T) {
-	pattern := "momentum evidence events *"
-	if !trialBashRuleMatches(pattern, "TZ=UTC LANG=C momentum evidence events --json") {
-		t.Fatal("locale prefix hid the program")
-	}
-	for _, cmd := range []string{"TZ=UTC MOMENTUM_NOW=now momentum evidence events", "env MOMENTUM_NOW=now momentum evidence events", "sh -c momentum evidence events"} {
-		if trialBashRuleMatches(pattern, cmd) {
-			t.Fatalf("wrapper accepted: %s", cmd)
-		}
-	}
 }
 
 // TMPDIR reaches a run unchanged so its temporary files stay in the selected scratch directory.
