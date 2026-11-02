@@ -384,8 +384,8 @@ func TestAPublishIsDoneOnlyByItsReceipt(t *testing.T) {
 	if _, _, err := st.BeginLesson(ctx, c.ID, "a lesson"); err != nil {
 		t.Fatal(err)
 	}
-	if !r.published(ctx, c.ID) {
-		t.Fatal("a lesson reserved just now is tried again at once")
+	if r.published(ctx, c.ID) {
+		t.Fatal("a lesson reserved just now counted as a receipt")
 	}
 	r.Now = func() time.Time { return time.Now().Add(LessonRetry + time.Minute) }
 	if r.published(ctx, c.ID) {

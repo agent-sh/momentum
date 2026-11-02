@@ -1,11 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"fmt"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -159,6 +165,237 @@ func TestASecondLoopRunFailsAtOnce(t *testing.T) {
 	unlock()
 	if code, _, errOut := momentum("loop", "--dry"); code != 0 {
 		t.Fatalf("after the first ended: exit %d: %s", code, errOut)
+	}
+}
+
+// dryFiles records persistent contents, modes and file timestamps without opening a store for writing.
+func dryFiles(t *testing.T, root string) map[string]struct {
+	Body     string
+	Mode     fs.FileMode
+	Modified time.Time
+} {
+	t.Helper()
+	files := map[string]struct {
+		Body     string
+		Mode     fs.FileMode
+		Modified time.Time
+	}{}
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		var body []byte
+		var modified time.Time
+		if !entry.IsDir() {
+			body, err = os.ReadFile(path)
+			modified = info.ModTime()
+			if err != nil {
+				return err
+			}
+		}
+		files[path] = struct {
+			Body     string
+			Mode     fs.FileMode
+			Modified time.Time
+		}{string(body), info.Mode(), modified}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return files
+}
+
+// dryConfig gives the dry CLI tests a configuration with no source outside their own fixtures.
+func dryConfig(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("MOMENTUM_CONFIG", dir)
+	if err := os.WriteFile(filepath.Join(dir, "sources.json"), []byte(`{"loop":{"families":["failures"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A dry CLI call creates no store, schema, data directory or lock, and explains that no store exists.
+func TestADryLoopWithNoStoreCreatesNothing(t *testing.T) {
+	for _, directoryExists := range []bool{false, true} {
+		t.Run(fmt.Sprint(directoryExists), func(t *testing.T) {
+			isolatedHome(t)
+			root := t.TempDir()
+			data := filepath.Join(root, "state")
+			t.Setenv("MOMENTUM_HOME", data)
+			dryConfig(t)
+			if directoryExists {
+				if err := os.Mkdir(data, 0o750); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := dryFiles(t, root)
+			code, _, errOut := momentum("loop", "--dry")
+			if code != 3 || !strings.Contains(errOut, "no store to read") {
+				t.Errorf("missing store: exit %d: %s", code, errOut)
+			}
+			if after := dryFiles(t, root); !reflect.DeepEqual(before, after) {
+				t.Error("dry CLI created or changed persistent state")
+			}
+		})
+	}
+}
+
+// A dry CLI call refuses an older schema without migrating its tables or creating lock files.
+func TestADryLoopDoesNotMigrateAnOlderStore(t *testing.T) {
+	isolatedHome(t)
+	root := t.TempDir()
+	t.Setenv("MOMENTUM_HOME", root)
+	dryConfig(t)
+	db, err := sql.Open("sqlite", paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE marker (value TEXT);
+INSERT INTO marker VALUES ('marker-7f3a');
+PRAGMA user_version = 2;`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before := dryFiles(t, root)
+	code, _, errOut := momentum("loop", "--dry")
+	if code != 3 || !strings.Contains(errOut, "not this build's schema") {
+		t.Errorf("older store: exit %d: %s", code, errOut)
+	}
+	if after := dryFiles(t, root); !reflect.DeepEqual(before, after) {
+		t.Error("dry CLI changed the older store")
+	}
+	db, err = sql.Open("sqlite", "file:"+paths.DB()+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var version, tables int
+	var marker string
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table'`).Scan(&tables); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT value FROM marker`).Scan(&marker); err != nil {
+		t.Fatal(err)
+	}
+	if version != 2 || tables != 1 || marker != "marker-7f3a" {
+		t.Errorf("older schema changed: version %d, %d tables, marker %q", version, tables, marker)
+	}
+}
+
+// A dry CLI call reads a current store and an existing free lock without changing persistent state.
+func TestADryLoopDoesNotCreateOrRewriteItsLock(t *testing.T) {
+	for _, lockExists := range []bool{false, true} {
+		t.Run(fmt.Sprint(lockExists), func(t *testing.T) {
+			loopMachine(t, "", false)
+			root := paths.Data()
+			path := paths.DB() + ".loop-lock"
+			if lockExists {
+				if err := os.WriteFile(path, []byte("marker-7f3a"), 0o400); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := dryFiles(t, root)
+			if code, _, errOut := momentum("loop", "--dry"); code != 0 {
+				t.Errorf("current store: exit %d: %s", code, errOut)
+			}
+			if after := dryFiles(t, root); !reflect.DeepEqual(before, after) {
+				t.Error("dry CLI created or changed persistent state")
+			}
+		})
+	}
+}
+
+// A live SQLite transaction prevents the dry path from claiming a stable, sidecar-free view.
+func TestADryLoopRefusesALiveStoreWithoutChangingIt(t *testing.T) {
+	loopMachine(t, "", false)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDryStoreHolder$")
+	cmd.Env = append(os.Environ(), "MOMENTUM_TEST_STORE_HOLDER="+paths.DB())
+	input, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		input.Close()
+		if err := cmd.Wait(); err != nil {
+			t.Errorf("store holder: %v", err)
+		}
+	}()
+	scanner := bufio.NewScanner(output)
+	if !scanner.Scan() || scanner.Text() != "marker-7f3a" {
+		t.Fatalf("store holder did not become ready: %q %v", scanner.Text(), scanner.Err())
+	}
+	before := dryFiles(t, paths.Data())
+	code, _, errOut := momentum("loop", "--dry")
+	if code != 3 || !strings.Contains(errOut, "idle store") {
+		t.Errorf("live store: exit %d: %s", code, errOut)
+	}
+	if after := dryFiles(t, paths.Data()); !reflect.DeepEqual(before, after) {
+		t.Error("dry CLI changed a live store")
+	}
+}
+
+// TestDryStoreHolder holds a real SQLite read transaction only for its parent test's synthetic store.
+func TestDryStoreHolder(t *testing.T) {
+	path := os.Getenv("MOMENTUM_TEST_STORE_HOLDER")
+	if path == "" {
+		return
+	}
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	var cases int
+	if err := tx.QueryRow(`SELECT count(*) FROM cases`).Scan(&cases); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintln(os.Stdout, "marker-7f3a")
+	_, _ = os.Stdin.Read(make([]byte, 1)) // its parent closes stdin after checking the refusal
+}
+
+// Leftover journal data must be recovered by a writer, never silently ignored or changed by a dry selection.
+func TestADryLoopRefusesJournalDataWithoutChangingIt(t *testing.T) {
+	for _, suffix := range []string{"-wal", "-journal"} {
+		t.Run(suffix, func(t *testing.T) {
+			loopMachine(t, "", false)
+			if err := os.WriteFile(paths.DB()+suffix, []byte("marker-7f3a"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			before := dryFiles(t, paths.Data())
+			code, _, errOut := momentum("loop", "--dry")
+			if code != 3 || !strings.Contains(errOut, "checkpointed store") || !strings.Contains(errOut, suffix) {
+				t.Errorf("leftover journal data: exit %d: %s", code, errOut)
+			}
+			if after := dryFiles(t, paths.Data()); !reflect.DeepEqual(before, after) {
+				t.Error("dry CLI changed journal data")
+			}
+		})
 	}
 }
 

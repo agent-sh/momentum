@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -37,19 +38,28 @@ func TestTheWeeksSpendHoldsTheRuns(t *testing.T) {
 	}
 }
 
-// A run is stale, killed with the process that ran it, only past the time a run may last and a quarter of an hour
-// more: one that started less long ago may still be running.
+// localRunner exercises selection and accounting without starting an agent or requiring a sandbox.
+func localRunner(t *testing.T, st *store.Store) *Runner {
+	t.Helper()
+	dir := t.TempDir()
+	return &Runner{Store: st, Ship: &Ship{Store: st, Dir: dir}, Dir: dir,
+		Families: []string{"failures"}, Budgets: DefaultBudgets}
+}
+
+// A running reservation is stale only after its allowed duration, with no extra grace period.
 func TestARunIsStaleOnlyPastTheTimeARunMayLast(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
-	r := runnerFor(t, st, nil)
+	r := localRunner(t, st)
+	now := time.Now().Truncate(time.Millisecond)
+	r.Now = func() time.Time { return now }
 	r.Budgets.RunTime = 30 * time.Minute
-	young, old := openCase(t, st, "failures", "young", 1), openCase(t, st, "failures", "old", 1)
-	for id, run := range map[string]struct {
-		c       store.Case
-		started time.Duration
-	}{"young": {young, 44 * time.Minute}, "old": {old, 46 * time.Minute}} {
-		if err := st.PutLoopRun(ctx, store.LoopRun{ID: id, Case: run.c.ID, Family: "failures", Step: StepInvestigate, Started: time.Now().Add(-run.started),
+	for id, age := range map[string]time.Duration{
+		"young": 29 * time.Minute, "boundary": 30 * time.Minute,
+		"just stale": 30*time.Minute + time.Millisecond, "old": 40 * time.Minute,
+	} {
+		c := openCase(t, st, "failures", id, 1)
+		if err := st.PutLoopRun(ctx, store.LoopRun{ID: id, Case: c.ID, Family: "failures", Step: StepInvestigate, Started: now.Add(-age),
 			Status: store.RunRunning, USD: 4}); err != nil {
 			t.Fatal(err)
 		}
@@ -57,11 +67,15 @@ func TestARunIsStaleOnlyPastTheTimeARunMayLast(t *testing.T) {
 	if err := r.endStale(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := st.LoopRunByID(ctx, "young"); got.Status != store.RunRunning {
-		t.Errorf("a run that started 44 minutes ago, of 30 and 15 allowed, was ended: %+v", got)
+	for _, id := range []string{"young", "boundary"} {
+		if got, err := st.LoopRunByID(ctx, id); err != nil || got.Status != store.RunRunning {
+			t.Errorf("%s was ended within its duration: %+v %v", id, got, err)
+		}
 	}
-	if got, _ := st.LoopRunByID(ctx, "old"); got.Status != store.RunFailed || got.Failure != "killed" {
-		t.Errorf("a run that started 46 minutes ago was not ended: %+v", got)
+	for _, id := range []string{"just stale", "old"} {
+		if got, err := st.LoopRunByID(ctx, id); err != nil || got.Status != store.RunFailed || got.Failure != "killed" || got.USD != 4 {
+			t.Errorf("%s was not ended and charged past its duration: %+v %v", id, got, err)
+		}
 	}
 }
 
@@ -70,22 +84,38 @@ func TestARunIsStaleOnlyPastTheTimeARunMayLast(t *testing.T) {
 func TestTheStopRuleReadsOneStepAtATime(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
-	r := runnerFor(t, st, nil)
+	r := localRunner(t, st)
 	for _, c := range []struct {
 		name  string
 		steps [2]string
 		stop  bool
-	}{{"mixed", [2]string{StepBuild, StepReview}, false}, {"one step", [2]string{StepReview, StepReview}, true}} {
+		gap   int
+	}{{"mixed", [2]string{StepBuild, StepReview}, false, 0}, {"one step", [2]string{StepReview, StepReview}, true, 0},
+		{"history gap", [2]string{StepInvestigate, StepInvestigate}, true, 20}} {
 		cs := openCase(t, st, "failures", c.name, 1)
+		now := time.Now()
 		for i, step := range c.steps {
 			if err := st.PutLoopRun(ctx, store.LoopRun{ID: fmt.Sprint(c.name, i), Case: cs.ID, Family: "failures", Step: step,
-				Started: time.Now().Add(-time.Duration(3-i) * time.Minute), Ended: time.Now(), Status: store.RunTurns, Failure: "turns"}); err != nil {
+				Started: now.Add(-time.Duration(3-i) * time.Minute), Ended: now, Status: store.RunTurns, Failure: "turns"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for i := 0; i < c.gap; i++ {
+			if err := st.PutLoopRun(ctx, store.LoopRun{ID: fmt.Sprint(c.name, "-refused-", i), Case: cs.ID, Family: "failures",
+				Step: StepInvestigate, Started: now.Add(-3*time.Minute + time.Duration(i+1)*time.Second),
+				Ended: now, Status: store.RunRefused, Failure: "day budget"}); err != nil {
 				t.Fatal(err)
 			}
 		}
 		why, err := r.stopped(ctx, cs, true)
 		if err != nil || (why != "") != c.stop {
 			t.Errorf("%s: stopped %q %v, want %v", c.name, why, err, c.stop)
+		}
+		if c.gap > 0 {
+			got, _, why, err := r.pick(ctx, cs.Family, cs.ID, false)
+			if err != nil || got.ID != "" || !strings.Contains(why, "stopped") {
+				t.Errorf("history gap admitted a third run: %+v %q %v", got, why, err)
+			}
 		}
 	}
 }
@@ -135,7 +165,7 @@ func improvedCase(t *testing.T) (*store.Store, store.Case) {
 
 // A publish run that ends well but leaves no receipt did not publish: it is recorded as a failed run, with the
 // failure "no receipt", and two of them in a row stop the case, so the loop does not pick it again at every run until
-// a cap stops it. A run that left the receipt, or reserved the lesson for tacit's write, is done.
+// a cap stops it. Only a run that left the receipt is done.
 func TestAPublishThatLeavesNoReceiptIsAFailureThatStopsTheCase(t *testing.T) {
 	ctx := context.Background()
 	st, c := improvedCase(t)
@@ -156,7 +186,11 @@ func TestAPublishThatLeavesNoReceiptIsAFailureThatStopsTheCase(t *testing.T) {
 	if cs, _ := st.Cases(ctx, store.CaseFilter{Family: "component-health"}); len(cs) != 1 || !strings.Contains(cs[0].Title, "no receipt") {
 		t.Fatalf("the loop's own case: %+v", cs)
 	}
-	// the receipt, or a lesson reserved for the write, makes the run done
+}
+
+// A reservation is a retry cooldown, never the durable receipt required for a successful publish run.
+func TestAPublishFinishRequiresADurableReceipt(t *testing.T) {
+	ctx := context.Background()
 	for name, leave := range map[string]func(st *store.Store, c store.Case) error{
 		"receipt": func(st *store.Store, c store.Case) error {
 			return st.CaseNote(ctx, c.ID, store.LessonPublished, "projects/fake: a lesson", "test")
@@ -165,20 +199,64 @@ func TestAPublishThatLeavesNoReceiptIsAFailureThatStopsTheCase(t *testing.T) {
 			_, _, err := st.BeginLesson(ctx, c.ID, "a lesson")
 			return err
 		},
+		"neither": func(st *store.Store, c store.Case) error { return nil },
 	} {
-		st, c := improvedCase(t)
-		r := runnerFor(t, st, nil)
-		run, why := r.reserve(ctx, c.Family, c.ID, StepPublish)
-		if why != "" {
-			t.Fatal(why)
-		}
-		if err := leave(st, c); err != nil {
-			t.Fatal(err)
-		}
-		r.finish(ctx, c, &run, Result{Status: store.RunOK, CostKnown: true, USD: 1}, nil)
-		if got, _ := st.LoopRunByID(ctx, run.ID); got.Status != store.RunOK || got.Failure != "" {
-			t.Errorf("%s: %+v", name, got)
-		}
+		t.Run(name, func(t *testing.T) {
+			st, c := improvedCase(t)
+			r := localRunner(t, st)
+			run, why := r.reserve(ctx, c.Family, c.ID, StepPublish)
+			if why != "" {
+				t.Fatal(why)
+			}
+			if err := leave(st, c); err != nil {
+				t.Fatal(err)
+			}
+			r.finish(ctx, c, &run, Result{Status: store.RunOK, CostKnown: true, USD: 1}, nil)
+			wantStatus, wantFailure := store.RunFailed, "no receipt"
+			if name == "receipt" {
+				wantStatus, wantFailure = store.RunOK, ""
+			}
+			if got, err := st.LoopRunByID(ctx, run.ID); err != nil || got.Status != wantStatus || got.Failure != wantFailure || got.USD != 1 {
+				t.Errorf("%s: %+v %v", name, got, err)
+			}
+		})
+	}
+}
+
+// A reserved lesson waits a day before selection retries it. A receipt prevents every later retry.
+func TestALessonReservationHasASeparateRetryCooldown(t *testing.T) {
+	ctx := context.Background()
+	st, c := improvedCase(t)
+	r := localRunner(t, st)
+	if got, step, _, err := r.pick(ctx, c.Family, c.ID, true); err != nil || got.ID != c.ID || step != StepPublish {
+		t.Fatalf("unreserved lesson: %+v %s %v", got, step, err)
+	}
+	if _, _, err := st.BeginLesson(ctx, c.ID, "marker-7f3a"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _, err := r.pick(ctx, c.Family, c.ID, true); err != nil || got.ID != "" {
+		t.Fatalf("reservation was retried during cooldown: %+v %v", got, err)
+	}
+	r.Now = func() time.Time { return time.Now().Add(LessonRetry + time.Minute) }
+	if got, step, _, err := r.pick(ctx, c.Family, c.ID, true); err != nil || got.ID != c.ID || step != StepPublish {
+		t.Fatalf("reservation was not retried after cooldown: %+v %s %v", got, step, err)
+	}
+	if err := st.CaseNote(ctx, c.ID, store.LessonPublished, "marker-7f3a", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _, err := r.pick(ctx, c.Family, c.ID, true); err != nil || got.ID != "" {
+		t.Fatalf("durable receipt was retried: %+v %v", got, err)
+	}
+}
+
+// Selection finishes a change in flight before publishing another case's lesson.
+func TestATestingCaseComesBeforeAPublishInTheSameFamily(t *testing.T) {
+	ctx := context.Background()
+	st, improved := improvedCase(t)
+	r := localRunner(t, st)
+	testing := testingCase(t, st)
+	if got, step, _, err := r.pick(ctx, improved.Family, "", true); err != nil || got.ID != testing.ID || step != StepBuild {
+		t.Fatalf("testing case lost to publish: %+v %s %v", got, step, err)
 	}
 }
 
@@ -187,7 +265,7 @@ func TestAPublishThatLeavesNoReceiptIsAFailureThatStopsTheCase(t *testing.T) {
 func waitingFixture(t *testing.T) (*Runner, store.Case, Package) {
 	t.Helper()
 	st := testStore(t)
-	r := runnerFor(t, st, fakeAgent(t, okResult))
+	r := localRunner(t, st)
 	c := testingCase(t, st)
 	p := Package{Case: c.ID, Kind: "repo", Repo: "agent-sh/fake", Base: "main", State: Proposed, Head: "abc", PR: "https://example.invalid/pull/9"}
 	reviewRounds(&p, "abc", time.Now().Add(-time.Hour))
@@ -304,6 +382,51 @@ func TestOnlyAChangeWithNoRoundLeftIsWaiting(t *testing.T) {
 				t.Fatalf("a change that waits for nothing has %d notes", all)
 			}
 		})
+	}
+}
+
+// An unreadable package leaves its waiting note standing, reports the error and recovers when readable again.
+func TestAPackageReadErrorPreservesItsWaitingNote(t *testing.T) {
+	ctx := context.Background()
+	r, c, p := waitingFixture(t)
+	if err := r.noteWaiting(ctx); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(r.Ship.pkgDir(c.ID), "package.json")
+	if err := os.WriteFile(path, []byte("{marker-7f3a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logs []string
+	r.Log = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
+	// Narrowing case work must not lose another family's unreadable waiting package.
+	if _, err := r.Once(ctx, Options{Families: []string{"sessions"}}); err != nil {
+		t.Fatal(err)
+	}
+	if text := strings.Join(logs, "\n"); !strings.Contains(text, c.ID) || !strings.Contains(text, "package") {
+		t.Errorf("package read error was not reported: %q", text)
+	}
+	if standing, all := standingNotes(t, r.Store); len(standing) != 1 || all != 1 {
+		t.Errorf("package read error resolved its note: %+v", standing)
+	}
+	if err := r.Ship.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.noteWaiting(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if standing, all := standingNotes(t, r.Store); len(standing) != 1 || all != 1 {
+		t.Fatalf("unchanged package did not recover its note: %+v", standing)
+	}
+	// Only a known transition out of the waiting state resolves it.
+	p.Head = "def"
+	if err := r.Ship.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.noteWaiting(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if standing, all := standingNotes(t, r.Store); len(standing) != 0 || all != 1 {
+		t.Fatalf("revised package kept its old waiting note: %+v", standing)
 	}
 }
 

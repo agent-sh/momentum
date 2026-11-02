@@ -15,12 +15,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
+	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite"
 )
 
@@ -64,8 +66,9 @@ func (e Event) ID() string {
 }
 
 type Store struct {
-	db   *sql.DB
-	path string
+	db       *sql.DB
+	path     string
+	readLock *os.File
 }
 
 // Sessions is the source of the events `momentum sessions` writes: each phase change of a live session, as the
@@ -275,10 +278,57 @@ var ErrNotCurrent = errors.New("the store is not this build's schema")
 // removes them. A missing store is an error, and so is one that is not this build's schema (ErrNotCurrent), which
 // this build would misread.
 func OpenReadOnly(path string) (*Store, error) {
+	return openReadOnly(path, false)
+}
+
+// OpenReadOnlyExclusive reads an idle, checkpointed store without even creating SQLite's reader sidecars.
+// This is for a CLI process with no other open connection. Its open-file-description lock excludes other
+// processes' SQLite byte-range locks without creating a lock file.
+// While that lock is held, immutable is true: no writer can change the database beneath the read-only connection.
+// A nonempty WAL or rollback journal needs a writer's recovery first and is refused without changing it.
+func OpenReadOnlyExclusive(path string) (*Store, error) {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("no store to read: %w; a sessions run, an ingest or a note makes it", err)
+		}
+		return nil, err
+	}
+	locked := false
+	defer func() {
+		if !locked {
+			f.Close()
+		}
+	}()
+	if err := unix.FcntlFlock(f.Fd(), unix.F_OFD_SETLK, &unix.Flock_t{Type: unix.F_WRLCK, Whence: io.SeekStart}); err != nil {
+		return nil, fmt.Errorf("store is busy: dry selection needs an idle store: %w", err)
+	}
+	for _, suffix := range []string{"-wal", "-journal"} {
+		info, err := os.Stat(path + suffix)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		if err == nil && info.Size() > 0 {
+			return nil, fmt.Errorf("dry selection needs a checkpointed store: %s still holds data", suffix)
+		}
+	}
+	st, err := openReadOnly(path, true)
+	if err != nil {
+		return nil, err
+	}
+	st.readLock, locked = f, true
+	return st, nil
+}
+
+func openReadOnly(path string, immutable bool) (*Store, error) {
 	if _, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("no store to read: %w; a sessions run, an ingest or a note makes it", err)
 	}
-	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(%d)", path, BusyTimeout.Milliseconds()))
+	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(%d)", path, BusyTimeout.Milliseconds())
+	if immutable {
+		dsn += "&immutable=1"
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -514,7 +564,14 @@ func addColumns(tx *sql.Tx, table string, want [][2]string) error {
 	return nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	err := s.db.Close()
+	if s.readLock != nil {
+		err = errors.Join(err, s.readLock.Close())
+		s.readLock = nil
+	}
+	return err
+}
 
 // Put inserts events, or refreshes every derived column of an event already stored, in one transaction.
 // It returns how many were new.

@@ -116,6 +116,7 @@ type RunFilter struct {
 	Case       string
 	Since      time.Time
 	Experiment *string // nil: every run; "": the live ones
+	Ran        bool    // exclude refused and still-running rows before applying Limit
 	Limit      int
 }
 
@@ -127,6 +128,9 @@ func (s *Store) LoopRuns(ctx context.Context, f RunFilter) ([]LoopRun, error) {
 	}
 	if f.Experiment != nil {
 		where, args = append(where, "experiment = ?"), append(args, *f.Experiment)
+	}
+	if f.Ran {
+		where, args = append(where, "status NOT IN (?, ?)"), append(args, RunRefused, RunRunning)
 	}
 	q := `SELECT ` + loopColumns + ` FROM loop_runs WHERE ` + strings.Join(where, " AND ") + ` ORDER BY started DESC, id DESC`
 	if f.Limit > 0 {

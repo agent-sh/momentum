@@ -295,16 +295,28 @@ func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if err != nil {
 		return err
 	}
-	st, err := store.Open(paths.DB())
+	open := store.Open
+	var unlock func()
+	if *dry {
+		unlock, err = loopLock(paths.DB(), true)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+		open = store.OpenReadOnlyExclusive
+	}
+	st, err := open(paths.DB())
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	unlock, err := lockLoop(paths.DB())
-	if err != nil {
-		return err
+	if !*dry {
+		unlock, err = lockLoop(paths.DB())
+		if err != nil {
+			return err
+		}
+		defer unlock()
 	}
-	defer unlock()
 	r, _, err := setup(st, c.Loop)
 	if err != nil {
 		return err
@@ -352,7 +364,19 @@ func printDone(stdout io.Writer, enc *json.Encoder, d loop.Done, asJSON bool) {
 // lockLoop takes the loop's lock beside the store: one loop at a time, since runs of two would pick the same
 // cases and spend the same budget. A second one fails at once and says so.
 func lockLoop(db string) (func(), error) {
-	f, err := os.OpenFile(db+".loop-lock", os.O_CREATE|os.O_RDWR, 0o600)
+	return loopLock(db, false)
+}
+
+// A dry lock check reads an existing lock without creating one. No file means no loop holds it.
+func loopLock(db string, dry bool) (func(), error) {
+	flags := os.O_CREATE | os.O_RDWR
+	if dry {
+		flags = os.O_RDONLY
+	}
+	f, err := os.OpenFile(db+".loop-lock", flags, 0o600)
+	if dry && errors.Is(err, os.ErrNotExist) {
+		return func() {}, nil
+	}
 	if err != nil {
 		return nil, err
 	}

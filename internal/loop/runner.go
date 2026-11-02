@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -203,7 +204,7 @@ func (r *Runner) endStale(ctx context.Context) error {
 		return err
 	}
 	for _, run := range runs {
-		if run.Status == store.RunRunning && r.now().Sub(run.Started) > r.Budgets.RunTime+15*time.Minute {
+		if run.Status == store.RunRunning && r.now().Sub(run.Started) > r.Budgets.RunTime {
 			run.Status, run.Failure, run.Ended = store.RunFailed, "killed", r.now()
 			if run.USD == 0 {
 				run.USD = r.Budgets.Run
@@ -285,10 +286,17 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 		case store.CaseOpen:
 			step, rank = StepInvestigate, 1
 		case store.CaseClosed:
-			if c.Reason != store.Improved || r.published(ctx, c.ID) {
+			if c.Reason != store.Improved {
 				continue
 			}
-			step, rank = StepPublish, 4
+			published, cooling, err := r.lessonState(ctx, c.ID)
+			if err != nil {
+				return store.Case{}, "", "", err
+			}
+			if published || cooling {
+				continue
+			}
+			step, rank = StepPublish, 0
 		default:
 			continue // deployed or measuring: the measure tool's
 		}
@@ -327,20 +335,26 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 // LessonRetry is how long a lesson whose write left no receipt waits before a publish run tries it again.
 const LessonRetry = 24 * time.Hour
 
-// published says whether a case's publish step is done for now: the lesson command left its receipt on the case
-// (never the harness's outcome: a run that ended well may have published nothing), or it reserved the lesson
-// within the last LessonRetry and tacit's write did not go through, which waits that long before it is tried again.
-func (r *Runner) published(ctx context.Context, id string) bool {
+// lessonState separates the durable receipt from the cooldown after reserving a lesson whose write failed.
+func (r *Runner) lessonState(ctx context.Context, id string) (published, cooling bool, err error) {
 	entries, err := r.Store.CaseLog(ctx, id)
 	if err != nil {
-		return true // unread: do not publish twice
+		return false, false, err
 	}
 	for _, entry := range entries {
-		if entry.Action == store.LessonPublished || entry.Action == store.LessonReserved && r.now().Sub(entry.At) < LessonRetry {
-			return true
-		}
+		published = published || entry.Action == store.LessonPublished
+		cooling = cooling || entry.Action == store.LessonReserved && r.now().Sub(entry.At) < LessonRetry
 	}
-	return false
+	return published, cooling, nil
+}
+
+// published requires the lesson command's durable receipt. A reservation alone did not publish.
+func (r *Runner) published(ctx context.Context, id string) bool {
+	published, _, err := r.lessonState(ctx, id)
+	if err != nil {
+		r.logf("read lesson receipt of %s: %v", id, err)
+	}
+	return published
 }
 
 // stopped applies the stop rule: a case whose last two live runs that ran (a refusal of the budgets is no run)
@@ -348,15 +362,9 @@ func (r *Runner) published(ctx context.Context, id string) bool {
 // health, the first time, with both runs' transcripts as its evidence, and says why. A dry check opens nothing.
 func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, error) {
 	live := ""
-	all, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID, Experiment: &live, Limit: 20})
+	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID, Experiment: &live, Ran: true, Limit: 2})
 	if err != nil {
 		return "", err
-	}
-	var runs []store.LoopRun
-	for _, run := range all {
-		if run.Status != store.RunRefused && run.Status != store.RunRunning && len(runs) < 2 {
-			runs = append(runs, run)
-		}
 	}
 	if len(runs) < 2 {
 		return "", nil
@@ -854,12 +862,18 @@ func (r *Runner) noteWaiting(ctx context.Context) error {
 		have[n.ID] = n
 	}
 	waiting := map[string]bool{}
+	var unread []error
 	for _, c := range cs {
+		id := waitingPrefix + store.IDPart(c.ID)
 		p, ok, err := r.Ship.Load(c.ID)
-		if err != nil || !ok || !roundsUsed(p) {
+		if err != nil {
+			waiting[id] = true // unread is not proof that the case left its waiting state
+			unread = append(unread, fmt.Errorf("case %s package: %w", c.ID, err))
 			continue
 		}
-		id := waitingPrefix + store.IDPart(c.ID)
+		if !ok || !roundsUsed(p) {
+			continue
+		}
 		waiting[id] = true
 		at := p.Reviews[len(p.Reviews)-1].At
 		if n, ok := have[id]; ok && (n.Done.IsZero() || !n.At.Before(at.Truncate(time.Millisecond))) {
@@ -883,5 +897,5 @@ func (r *Runner) noteWaiting(ctx context.Context) error {
 			}
 		}
 	}
-	return nil
+	return errors.Join(unread...)
 }
