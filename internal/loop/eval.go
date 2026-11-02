@@ -95,7 +95,10 @@ type Eval struct {
 	Arms         []string
 	Repositories []string
 	GoldenHash   string
-	pair         string // the store as of the trial's end, made once for both arms of a trial; each arm runs on a copy
+	// Tacit is tacit's store, a git repository a trial reads as of its end (read-only, through tacit's own search),
+	// or none.
+	Tacit string
+	pair  pairInputs // the store as of the trial's end and tacit's, made once for both arms of a trial; each arm runs on a copy of the store
 }
 
 // Grade is the judge's reading of one investigation.
@@ -283,22 +286,36 @@ func (e *Eval) newTrial(t GoldenTask, n int, arm string) Trial {
 
 // pairStore makes the store as of a trial's end once, for both its arms, and says how to remove it; with no store
 // (its end unreadable, the copy failed) each arm makes and reports its own.
-func (e *Eval) pairStore(ctx context.Context, t GoldenTask, n int) (string, func()) {
+func (e *Eval) pairStore(ctx context.Context, t GoldenTask, n int) (pairInputs, func()) {
 	end, err := e.snapshotEnd(ctx, t)
 	if err != nil {
-		return "", func() {}
+		return pairInputs{}, func() {}
 	}
 	dir := filepath.Join(e.Dir, "pairs", digest(fmt.Sprintf("%s\x00%s\x00%d", e.ID, t.ID, n))[:16])
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", func() {}
+		return pairInputs{}, func() {}
 	}
 	done := func() { os.RemoveAll(dir) }
-	db := filepath.Join(dir, "momentum.db")
-	if err := store.AsOf(ctx, e.Source, db, end.Add(-store.CaseRetention), end); err != nil {
+	in := pairInputs{store: filepath.Join(dir, "momentum.db")}
+	if err := store.AsOf(ctx, e.Source, in.store, end.Add(-store.CaseRetention), end); err != nil {
 		done()
-		return "", func() {}
+		return pairInputs{}, func() {}
 	}
-	return db, done
+	// tacit's store is a git repository: the trial reads it as the machine held it at the end, outside the trial's
+	// directory, so its file tools cannot change it; both arms share it and the index the first search builds
+	if e.Tacit != "" {
+		clone := filepath.Join(dir, "tacit")
+		if made, err := repositoryAsOf(ctx, e.Tacit, end, clone); err == nil && made {
+			in.tacit, in.tacitIndex = clone, filepath.Join(dir, "tacit-index")
+			os.MkdirAll(in.tacitIndex, 0o700)
+		}
+	}
+	return in, done
+}
+
+// pairInputs are what both arms of a trial read, made once before either runs.
+type pairInputs struct {
+	store, tacit, tacitIndex string
 }
 
 // copyStore copies a closed store, its write-ahead log with it when there is one.
@@ -402,8 +419,8 @@ func (e *Eval) trial(ctx context.Context, t GoldenTask, n int) (tr Trial) {
 	}
 	t.Cutoff = end
 	tr.EndOfStore = end
-	if e.pair != "" {
-		err = copyStore(e.pair, db)
+	if e.pair.store != "" {
+		err = copyStore(e.pair.store, db)
 	} else {
 		err = store.AsOf(ctx, e.Source, db, end.Add(-store.CaseRetention), end)
 	}
@@ -571,39 +588,48 @@ func evalGit(ctx context.Context, args ...string) *exec.Cmd {
 func (e *Eval) cloneRepositories(ctx context.Context, t GoldenTask, dir string) ([]string, error) {
 	var out []string
 	for _, src := range e.Repositories {
-		ref, err := evalGit(ctx, "-C", src, "symbolic-ref", "refs/remotes/origin/HEAD").Output()
-		// origin/HEAD names the default branch, but only its local head is carried by --no-local.
-		if err == nil {
-			ref = []byte(strings.Replace(strings.TrimSpace(string(ref)), "refs/remotes/origin/", "refs/heads/", 1))
-			_, err = evalGit(ctx, "-C", src, "show-ref", "--verify", string(ref)).Output()
-		}
-		if err != nil {
-			for _, branch := range []string{"refs/heads/main", "refs/heads/master"} {
-				if _, checkErr := evalGit(ctx, "-C", src, "show-ref", "--verify", branch).Output(); checkErr == nil {
-					ref = []byte(branch)
-					err = nil
-					break
-				}
-			}
-		}
-		if err != nil {
-			return nil, fmt.Errorf("default branch: %w", err)
-		}
-		raw, err := branchAsOf(ctx, src, strings.TrimSpace(string(ref)), t.Cutoff)
-		if err != nil {
-			return nil, fmt.Errorf("the default branch of %s: %w", src, err)
-		}
-		commit := strings.TrimSpace(string(raw))
-		if commit == "" {
-			continue // no commit by then: the repository did not exist yet
-		}
 		dst := filepath.Join(dir, fmt.Sprintf("repo-%d", len(out)+1))
-		if err := cloneAsOf(ctx, src, commit, dst); err != nil {
+		made, err := repositoryAsOf(ctx, src, t.Cutoff, dst)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, dst)
+		if made {
+			out = append(out, dst)
+		}
 	}
 	return out, nil
+}
+
+// repositoryAsOf clones a repository as its default branch stood at the end, and says whether there was one: a
+// repository with no commit by then did not exist yet.
+func repositoryAsOf(ctx context.Context, src string, end time.Time, dst string) (bool, error) {
+	ref, err := evalGit(ctx, "-C", src, "symbolic-ref", "refs/remotes/origin/HEAD").Output()
+	// origin/HEAD names the default branch, but only its local head is carried by --no-local.
+	if err == nil {
+		ref = []byte(strings.Replace(strings.TrimSpace(string(ref)), "refs/remotes/origin/", "refs/heads/", 1))
+		_, err = evalGit(ctx, "-C", src, "show-ref", "--verify", string(ref)).Output()
+	}
+	if err != nil {
+		for _, branch := range []string{"refs/heads/main", "refs/heads/master"} {
+			if _, checkErr := evalGit(ctx, "-C", src, "show-ref", "--verify", branch).Output(); checkErr == nil {
+				ref = []byte(branch)
+				err = nil
+				break
+			}
+		}
+	}
+	if err != nil {
+		return false, fmt.Errorf("default branch: %w", err)
+	}
+	raw, err := branchAsOf(ctx, src, strings.TrimSpace(string(ref)), end)
+	if err != nil {
+		return false, fmt.Errorf("the default branch of %s: %w", src, err)
+	}
+	commit := strings.TrimSpace(string(raw))
+	if commit == "" {
+		return false, nil
+	}
+	return true, cloneAsOf(ctx, src, commit, dst)
 }
 
 // harnessHome is one evaluation run's own configuration directory for the harness (Claude Code's CLAUDE_CONFIG_DIR),
@@ -624,6 +650,34 @@ func (e *Eval) investigate(ctx context.Context, t GoldenTask, c store.Case, dir,
 
 const investigationQuestion = "This run evaluates the investigation. Find the root cause and the fix. State the mechanism, the alternatives ruled out, the fix, and a summary. Build no change."
 
+// trialReference is the command reference both arms of a trial end with, tacit's line in it when the trial reads
+// tacit's store as of its end.
+func trialReference(tacit bool) string {
+	if !tacit {
+		return trialCommands
+	}
+	last := "No other shell commands are available"
+	i := strings.LastIndex(trialCommands, last)
+	return trialCommands[:i] + tacitCommand + trialCommands[i:]
+}
+
+// tacitCommand is the reference's line for tacit, in a trial that reads tacit's store as of its end.
+const tacitCommand = `- tacit search WORDS [--limit N] | tacit fact NAME | tacit tree [--depth N]: the owner's rules, decisions and past mistakes, as tacit held them at the end of store.
+`
+
+// tacitAsOf is the environment of tacit's commands in a trial: the store cloned as of the end, the index both arms
+// share, and settings, state and a local layer of the run's own and empty, so no fact of the machine's comes in
+// beside the clone's.
+func tacitAsOf(in pairInputs, home string) map[string]string {
+	settings := filepath.Join(home, "tacit-settings.yaml")
+	os.WriteFile(settings, []byte("{}\n"), 0o600)
+	for _, d := range []string{"tacit-state", "tacit-local"} {
+		os.MkdirAll(filepath.Join(home, d), 0o700)
+	}
+	return map[string]string{"TACIT_STORE": in.tacit, "TACIT_INDEX": in.tacitIndex, "TACIT_SETTINGS": settings, "TACIT_STATE_DIR": filepath.Join(home, "tacit-state"),
+		"TACIT_LOCAL": filepath.Join(home, "tacit-local"), "TACIT_LOCAL_LAYER": "off"}
+}
+
 // trialCommands is the same final reference in both arms. Relative paths name each trial's own directory.
 const trialCommands = `
 
@@ -633,6 +687,7 @@ Your working directory is . (the trial's isolated directory). File tools read it
 - momentum evidence search TEXT [--source SOURCE] [--since WHEN] [--until WHEN] [--kind K,K] [--actor ACTOR] [--session ID] [--limit N]: matches stored summaries of every source, newest first; --source narrows it. Sources: transcripts, incidents, mistakes, radar-feedback, sessions, supervise, capacity; --source must name one the store holds. Actors: owner, agent, tool, harness, detector, unknown. A phrase that starts with a dash goes after --.
 - momentum evidence events [--source SOURCE] [--kind K,K] [--since WHEN] [--until WHEN] [--harness NAME] [--actor ACTOR] [--session ID] [--limit N] [--json]: reads stored events, optionally one session; each line names its event's ev:ID.
 - momentum evidence status [--since WHEN]: counts stored events by source and kind.
+- momentum evidence unit NAME [--lines N]: reads a user service's log up to the end of store.
 - momentum evidence git DIR CMD ...: reads a trial checkout's history with log, show, diff, blame, grep, ls-files, ls-tree, rev-parse, rev-list, merge-base, describe, status, shortlog, or listing forms of branch and tag. Use read options only (git's -N for a count; grep's first word is its pattern); revisions are checked and paths follow --. A grep with no match exits 1.
 No other shell commands are available: the harness refuses any other program, and a pipe, a loop, a substitution or a redirection.
 `
@@ -648,7 +703,7 @@ func (e *Eval) evalPermissions(c store.Case, run store.LoopRun, native bool) Set
 	s := e.Runner.permissions(StepInvestigate, c, run)
 	var allow []string
 	for _, a := range s.Allow {
-		if strings.HasPrefix(a, "Bash(momentum supervise replay ") || strings.HasPrefix(a, "Bash(tacit ") || strings.HasPrefix(a, "Bash(momentum evidence file ") || strings.HasPrefix(a, "Bash(momentum evidence unit ") || strings.HasPrefix(a, "Bash(momentum report ") || strings.HasPrefix(a, "Bash(momentum ship ") || strings.HasPrefix(a, "Bash(momentum case ") {
+		if strings.HasPrefix(a, "Bash(momentum supervise replay ") || strings.HasPrefix(a, "Bash(tacit ") && e.pair.tacit == "" || strings.HasPrefix(a, "Bash(momentum evidence file ") || strings.HasPrefix(a, "Bash(momentum report ") || strings.HasPrefix(a, "Bash(momentum ship ") || strings.HasPrefix(a, "Bash(momentum case ") {
 			continue
 		}
 		allow = append(allow, a)
@@ -677,7 +732,7 @@ func (e *Eval) invokeTrial(ctx context.Context, t GoldenTask, c store.Case, dir,
 		inv.Prompt += fmt.Sprintf("Symptom events: %s.\n", strings.Join(t.Symptom.Query.EventIDs, " "))
 	}
 	inv.Prompt += fmt.Sprintf("The store ends at %s. Repository checkouts: %s.\n%s", t.Cutoff.Format(time.RFC3339Nano), firstOf(repo, "none"), findingsInstruction)
-	inv.Prompt += trialCommands
+	inv.Prompt += trialReference(e.pair.tacit != "")
 	inv.Settings = e.evalPermissions(c, run, arm == "native")
 	if inv.Prompt, err = Redact(ctx, inv.Prompt); err != nil {
 		return Result{}, err
@@ -687,9 +742,15 @@ func (e *Eval) invokeTrial(ctx context.Context, t GoldenTask, c store.Case, dir,
 		return Result{}, err
 	}
 	defer os.RemoveAll(home)
+	env := map[string]string{"MOMENTUM_HOME": dir, "MOMENTUM_EVAL": e.ID, "MOMENTUM_NOW": t.Cutoff.Format(time.RFC3339Nano), "MOMENTUM_ACTOR": "eval:" + run.ID,
+		"MOMENTUM_LOOP_RUN": run.ID, "MOMENTUM_LOOP_CASE": c.ID, "MOMENTUM_LOOP_DIR": dir, "CLAUDE_CONFIG_DIR": home}
+	if e.pair.tacit != "" {
+		for k, v := range tacitAsOf(e.pair, home) {
+			env[k] = v
+		}
+	}
 	agent := r.Agent
-	agent.Env = CleanEnv(map[string]string{"MOMENTUM_HOME": dir, "MOMENTUM_EVAL": e.ID, "MOMENTUM_NOW": t.Cutoff.Format(time.RFC3339Nano), "MOMENTUM_ACTOR": "eval:" + run.ID,
-		"MOMENTUM_LOOP_RUN": run.ID, "MOMENTUM_LOOP_CASE": c.ID, "MOMENTUM_LOOP_DIR": dir, "CLAUDE_CONFIG_DIR": home}, r.Bins...)
+	agent.Env = CleanEnv(env, r.Bins...)
 	if err := os.WriteFile(filepath.Join(dir, "prompt.txt"), []byte(inv.Prompt), 0o600); err != nil {
 		return Result{}, err
 	}

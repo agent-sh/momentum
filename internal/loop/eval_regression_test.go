@@ -268,7 +268,9 @@ func TestTrialPermissionsKeepLiveDenialsAndProgramWords(t *testing.T) {
 			t.Fatalf("denials %v", got.Deny)
 		}
 		for _, a := range got.Allow {
-			if strings.Contains(a, "tacit ") || strings.Contains(a, "evidence file ") || strings.Contains(a, "evidence unit ") || strings.Contains(a, "momentum report ") || strings.Contains(a, "supervise replay ") {
+			// tacit (a clone as of the end, none in this fixture) and a unit's log up to the end read the past; a file,
+			// the report and replay read the machine as it is now
+			if strings.Contains(a, "tacit ") || strings.Contains(a, "evidence file ") || strings.Contains(a, "momentum report ") || strings.Contains(a, "supervise replay ") {
 				t.Fatalf("current machine allowed: %s", a)
 			}
 			if strings.HasPrefix(a, "Bash(") {
