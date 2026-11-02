@@ -168,15 +168,15 @@ A change goes in only through `momentum ship`, and only to a repository: a work 
 
 ```json
 {"loop": {
-  "runner": ["~/.local/bin/claude-bedrock"],
+  "runner": ["claude"],
   "live": false,
   "owners": ["your-github-user"],
   "exclude": ["your-github-user/do-not-touch"],
-  "repo_guard": ["~/.local/bin/scope-check"],
-  "rules": ["~/.config/agents/SHARED.md"],
+  "repo_guard": ["~/bin/repo-guard"],
+  "rules": ["~/.config/agent-rules.md"],
   "read_dirs": ["~/projects"],
   "constraints": ["never wake me"],
-  "capacity_gate": ["~/.local/bin/waitfor", "--capacity", "20,8", "--timeout", "10m"]
+  "capacity_gate": ["~/bin/capacity-gate"]
 }}
 ```
 
