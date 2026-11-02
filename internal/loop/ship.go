@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -642,12 +643,26 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 			return Plan{}, refused("the file the change is installed in, %s, is no file here", installed)
 		}
 	}
-	sources, err := s.Store.Sources(ctx, sig.Source, store.ActivityQuery{Since: at.Add(-4 * window), Until: at, ExcludeCwd: s.Dir})
+	// the sources recorded are those whose events the plan's units can count: a sessions' measurement counts no
+	// event without a session (a capacity run, an incident), so it waits on no reader of those
+	first, err := Count(ctx, s.Store, sig, at.Add(-window), at, s.Dir)
+	if err != nil {
+		return Plan{}, err
+	}
+	countable := func(units string, since, until time.Time) ([]string, error) {
+		q, err := activityQuery(sig, units, since, until, s.Dir)
+		if err != nil {
+			return nil, err
+		}
+		return s.Store.Sources(ctx, sig.Source, q)
+	}
+	units := unitsOf(first)
+	sources, err := countable(units, at.Add(-4*window), at)
 	if err != nil {
 		return Plan{}, err
 	}
 	var omitted []string
-	sources, omitted = s.liveSources(sources)
+	sources, omitted = s.liveSources(ctx, sources, window, s.now())
 	if !slices.Contains(sources, sig.Source) {
 		return Plan{}, refused("the signal's source stopped: %s", sig.Source)
 	}
@@ -670,11 +685,11 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 		if boundary.IsZero() || at.Sub(boundary) > window {
 			return Plan{Signal: sig, Window: window, Units: MachineHours, At: at, Sources: sources, Omitted: omitted}, &unreadPlan{sources: sources}
 		}
-		found, err := s.Store.Sources(ctx, sig.Source, store.ActivityQuery{Since: boundary.Add(-4 * window), Until: boundary, ExcludeCwd: s.Dir})
+		found, err := countable(units, boundary.Add(-4*window), boundary)
 		if err != nil {
 			return Plan{}, err
 		}
-		found, dropped := s.liveSources(found)
+		found, dropped := s.liveSources(ctx, found, window, s.now())
 		omitted = append(omitted, dropped...)
 		added := false
 		for _, source := range found {
@@ -688,6 +703,25 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 		}
 	}
 	at = boundary
+	// a reader that began inside the counted span (a source configured, supervision switched back on) adds activity
+	// the baseline held in part or not at all: it is left out of both sides, as a stopped one is
+	var begun []string
+	for _, source := range sources {
+		if source == sig.Source {
+			begun = append(begun, source)
+			continue
+		}
+		first, err := s.Store.FirstEvent(ctx, source)
+		if err != nil {
+			return Plan{}, err
+		}
+		if first.After(at.Add(-4 * window)) {
+			omitted = append(omitted, source)
+		} else {
+			begun = append(begun, source)
+		}
+	}
+	sources = begun
 	slices.Sort(sources)
 	slices.Sort(omitted)
 	omitted = slices.Compact(omitted)
@@ -695,7 +729,17 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 	if err != nil {
 		return Plan{}, err
 	}
-	plan := Plan{Signal: sig, Window: window, Units: unitsOf(got), At: at, Installed: installed, Sources: sources, Omitted: omitted}
+	if unitsOf(got) != units { // the boundary moved what the signal counts in: its units' sources then
+		units = unitsOf(got)
+		found, err := countable(units, at.Add(-4*window), at)
+		if err != nil {
+			return Plan{}, err
+		}
+		var dropped []string
+		sources, dropped = s.liveSources(ctx, found, window, s.now())
+		omitted = slices.Compact(append(omitted, dropped...))
+	}
+	plan := Plan{Signal: sig, Window: window, Units: units, At: at, Installed: installed, Sources: sources, Omitted: omitted}
 	before, err := tallySources(ctx, s.Store, sig, plan.Units, got, at.Add(-window), at, s.Dir, sources)
 	if err != nil {
 		return Plan{}, err
@@ -1091,11 +1135,16 @@ func (s *Ship) InEffect(ctx context.Context, p *Package) (time.Time, string, err
 				}
 			}
 			if revision != "" && modified != "" {
-				if modified != "false" {
-					return time.Time{}, "the installed Go binary was built from a modified tree", nil
-				}
 				if _, err := s.git(ctx, p.Dir, "merge-base", "--is-ancestor", p.Landed[len(p.Landed)-1], revision); err != nil {
 					return time.Time{}, "the installed Go binary's revision does not hold the change: " + err.Error(), nil
+				}
+				// Go counts any change to its tree as a modification, an untracked file too: a build from a modified
+				// tree holds the change when the change's own files are as the revision has them
+				if modified != "false" {
+					args := append([]string{"diff", "--quiet", revision, "--"}, p.Changed...)
+					if _, err := s.git(ctx, p.Dir, args...); len(p.Changed) == 0 || err != nil {
+						return time.Time{}, "the installed Go binary was built from a tree whose change's own files are modified", nil
+					}
 				}
 				return s.now(), "", nil
 			}
@@ -1131,7 +1180,16 @@ func (s *Ship) InEffect(ctx context.Context, p *Package) (time.Time, string, err
 	}
 	if p.Plan.Installed == "" || p.CheckoutAt.IsZero() || changed {
 		last := p.Landed[len(p.Landed)-1]
-		if _, err := s.git(ctx, p.Dir, "merge-base", "--is-ancestor", last, "HEAD"); err != nil {
+		// a changed installed file is checked against the checkout as it stood when the file was written (the commit
+		// its HEAD's reflog names then), not as it stands now: a build from an older tree does not count once the
+		// checkout is back on the change
+		head := "HEAD"
+		if changed {
+			if at, ok := s.headAt(ctx, p.Dir, installedAt); ok {
+				head = at
+			}
+		}
+		if _, err := s.git(ctx, p.Dir, "merge-base", "--is-ancestor", last, head); err != nil {
 			var exit *exec.ExitError
 			if errors.As(err, &exit) && exit.ExitCode() == 1 {
 				return time.Time{}, fmt.Sprintf("the repository's checkout does not hold %.12s yet", last), nil
@@ -1170,6 +1228,30 @@ func (s *Ship) InEffect(ctx context.Context, p *Package) (time.Time, string, err
 	}
 
 	return s.now(), "", nil
+}
+
+// headAt is the commit a checkout's HEAD named at a moment, by its reflog, and false when the reflog does not reach
+// back to it.
+func (s *Ship) headAt(ctx context.Context, dir string, at time.Time) (string, bool) {
+	out, err := s.git(ctx, dir, "reflog", "show", "--format=%H %gd", "--date=unix", "HEAD")
+	if err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") { // newest first
+		commit, place, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		stamp := strings.TrimSuffix(strings.TrimPrefix(place, "HEAD@{"), "}")
+		secs, err := strconv.ParseInt(stamp, 10, 64)
+		if err != nil {
+			continue
+		}
+		if !time.Unix(secs, 0).After(at) {
+			return commit, true
+		}
+	}
+	return "", false
 }
 
 // Keep records that a change's measurement kept it: its case closed as improved with the result.

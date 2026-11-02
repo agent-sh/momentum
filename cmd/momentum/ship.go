@@ -47,7 +47,7 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	signal := fs.String("signal", "", `propose: the measurement's signal, {"source","kinds","tool","harness","match"}`)
 	window := fs.String("window", "7d", "propose: the measurement's window (whole weeks: 7d, 14d and so on)")
 	lesson := fs.String("lesson", "", "propose: the lesson the case teaches, one sentence")
-	installed := fs.String("installed", "", "propose: the built or installed file the machine runs (a binary, an installed configuration): it is in effect once it changed after the checkout first held the change")
+	installed := fs.String("installed", "", "propose: the built or installed file the machine runs (a binary, an installed configuration): a Go binary is in effect when its revision holds the change; another file once it changed after the checkout first held the change, from a checkout that held it then")
 	why := fs.String("why", "", "rollback: why")
 	asJSON := fs.Bool("json", false, "status: the package as JSON")
 	rest := args[1:]

@@ -380,15 +380,16 @@ func TestOnlyACompleteSessionsScanAdvancesItsReadTime(t *testing.T) {
 	if _, scanErr, err := board(ctx, &sessions.World{Now: start}, nil, st, "test", []sessions.Source{fixed{}}); err != nil || scanErr != nil {
 		t.Fatal(scanErr, err)
 	}
+	// a session gone from a scan is written vanished up to state.Keep later: the scan has read up to that much before it
 	read, err := st.ReadThrough(ctx, store.Sessions)
-	if err != nil || !read.Equal(start) {
+	if err != nil || !read.Equal(start.Add(-state.Keep)) {
 		t.Fatalf("complete scan: %v %v", read, err)
 	}
 	if _, _, err := board(ctx, &sessions.World{Now: start.Add(time.Hour)}, errors.New("incomplete snapshot"), st, "test", []sessions.Source{fixed{}}); err != nil {
 		t.Fatal(err)
 	}
 	read, err = st.ReadThrough(ctx, store.Sessions)
-	if err != nil || !read.Equal(start) {
+	if err != nil || !read.Equal(start.Add(-state.Keep)) {
 		t.Fatalf("incomplete scan advanced: %v %v", read, err)
 	}
 }

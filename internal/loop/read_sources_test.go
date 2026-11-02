@@ -537,7 +537,7 @@ func TestAnInstalledGoRevisionMustHoldTheChange(t *testing.T) {
 	run(t, m.repo, "git", "add", "-A")
 	run(t, m.repo, "git", "commit", "-qm", "fix the tool")
 	landed := strings.TrimSpace(run(t, m.repo, "git", "rev-parse", "HEAD"))
-	p.Landed = []string{landed}
+	p.Landed, p.Changed = []string{landed}, []string{"main.go"}
 	p.Plan.Installed = filepath.Join(t.TempDir(), "tool")
 	build := func() { t.Helper(); run(t, m.repo, "go", "build", "-buildvcs=true", "-o", p.Plan.Installed, ".") }
 	check := func(want bool) {
@@ -558,9 +558,12 @@ func TestAnInstalledGoRevisionMustHoldTheChange(t *testing.T) {
 	run(t, m.repo, "git", "commit", "-q", "--allow-empty", "-m", "later change")
 	build()
 	check(true) // a descendant holds the landed commit
+	write(t, filepath.Join(m.repo, "notes.txt"), "an untracked note\n")
+	build()
+	check(true) // Go calls the tree modified for an untracked file; the change's own files are the revision's
 	write(t, filepath.Join(m.repo, "main.go"), "package main\nfunc main() { println(0) }\n")
 	build()
-	check(false) // modified trees cannot certify a build
+	check(false) // the change's own file modified: the build may not hold it
 }
 
 // Vanished loop runs carry the stamp's directory and cannot dilute an unchanged problem in the step.
@@ -627,18 +630,24 @@ func TestAPlanLeavesOutAnUnconfiguredSource(t *testing.T) {
 	}
 }
 
-// A plan records sources from its gate and baseline, including events outside its activity units.
+// A plan records the sources its units can count, from its gate and baseline: a sessions' measurement records a
+// source whose events hold sessions, and none whose events have no session (a capacity run, the scout's findings).
 func TestAPlanRecordsEverySourceInItsSpan(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	c := testingCase(t, st)
 	now := time.Now()
-	for i, source := range []string{store.Supervise, "radar"} {
-		at := now.Add(-time.Hour)
+	for i, source := range []string{store.Supervise, "radar", "capacity"} {
+		at, session := now.Add(-time.Hour), "s1"
 		if i == 1 {
 			at = now.Add(-10 * 24 * time.Hour)
 		}
-		if _, err := st.Put(ctx, []store.Event{{Source: source, SourceKey: "ordinary", TS: at, Actor: store.ActorDetector, Kind: "ordinary", Summary: "ordinary activity"}}); err != nil {
+		if i == 2 {
+			session = "" // the machine's, not a session's
+		}
+		// each reader ran before the span too: one that began inside it is left out (TestAReaderThatBeganInsideTheSpanIsLeftOut)
+		if _, err := st.Put(ctx, []store.Event{{Source: source, SourceKey: "ordinary", TS: at, Session: session, Actor: store.ActorDetector, Kind: "ordinary", Summary: "ordinary activity"},
+			{Source: source, SourceKey: "earlier", TS: now.Add(-40 * 24 * time.Hour), Session: session, Actor: store.ActorDetector, Kind: "ordinary", Summary: "earlier activity"}}); err != nil {
 			t.Fatal(err)
 		}
 		if err := st.MarkRead(ctx, source, now.Add(time.Minute)); err != nil {
@@ -647,7 +656,7 @@ func TestAPlanRecordsEverySourceInItsSpan(t *testing.T) {
 	}
 	s := Ship{Store: st}
 	plan, err := s.validPlan(ctx, c, goodSignal, 7*24*time.Hour, "", now)
-	if err != nil || strings.Join(plan.Sources, ",") != "radar,supervise,transcripts" {
+	if err != nil || plan.Units != SessionHours || strings.Join(plan.Sources, ",") != "radar,supervise,transcripts" {
 		t.Fatalf("recorded sources: %+v %v", plan, err)
 	}
 }
@@ -662,7 +671,7 @@ func TestAPlanRechecksPartialReadsAtItsNewBoundary(t *testing.T) {
 	if err := st.MarkPartialRead(ctx, store.Transcripts, now.Add(time.Minute), now.Add(-28*24*time.Hour-2*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.Put(ctx, []store.Event{{Source: "zz-reader", SourceKey: "activity", TS: now.Add(-2 * time.Hour), Actor: store.ActorDetector, Kind: "ordinary", Summary: "ordinary activity"}}); err != nil {
+	if _, err := st.Put(ctx, []store.Event{{Source: "zz-reader", SourceKey: "activity", TS: now.Add(-2 * time.Hour), Session: "s1", Actor: store.ActorDetector, Kind: "ordinary", Summary: "ordinary activity"}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.MarkRead(ctx, "zz-reader", now.Add(-5*time.Minute)); err != nil {

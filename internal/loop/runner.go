@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/detect"
+	"github.com/agent-sh/momentum/internal/measure"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -276,6 +277,16 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 					passed = append(passed, c.ID+" used its review rounds")
 				}
 				continue // its review or its landing comes next (reviews)
+			} else if ok && !p.ReadWait.IsZero() && p.Plan != nil {
+				// a proposal that waits on a source's read: a build now would be refused the same way, so it waits
+				// until the source reads past what the proposal needs
+				plan := *p.Plan
+				plan.Sources, _ = r.Ship.liveSources(ctx, plan.Sources, plan.Window, r.now()) // a stopped reader holds nothing
+				since := plan.At.Add(-time.Duration(measure.BaselineWindows+1) * plan.Window)
+				if unread, err := unreadWindow(ctx, r.Store, plan, since, p.ReadUntil, r.Dir); err == nil && len(unread) > 0 {
+					passed = append(passed, c.ID+"'s proposal waits on a read of "+strings.Join(unread, ", "))
+					continue
+				}
 			}
 		case store.CaseInvestigating:
 			step, rank = StepInvestigate, 2

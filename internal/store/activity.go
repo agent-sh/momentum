@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"strconv"
@@ -145,6 +146,15 @@ func (s *Store) UnreadSources(ctx context.Context, signal string, q ActivityQuer
 		}
 	}
 	return unread, nil
+}
+
+// FirstEvent is when a source's first event in the store happened, or zero when it has none.
+func (s *Store) FirstEvent(ctx context.Context, source string) (time.Time, error) {
+	var first sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT MIN(ts) FROM events WHERE source = ?`, source).Scan(&first); err != nil || !first.Valid {
+		return time.Time{}, err
+	}
+	return time.UnixMilli(first.Int64), nil
 }
 
 // ReadThrough reads only the complete run start, never a cursor update after the read.
