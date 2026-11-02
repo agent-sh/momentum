@@ -240,6 +240,21 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 			passed = append(passed, c.ID+" has a run in flight")
 			continue
 		}
+		if c.Status == store.CaseDeployed || c.Status == store.CaseMeasuring {
+			p, ok, err := r.Ship.Load(c.ID)
+			if err != nil {
+				return store.Case{}, "", "", err
+			}
+			if ok && (p.State == RolledBack || p.State == RollingBack) {
+				if !dry {
+					if _, err := r.Ship.RollBack(ctx, c.ID, "resume rollback"); err != nil {
+						return store.Case{}, "", "", err
+					}
+				}
+				passed = append(passed, c.ID+" has a rollback; its receipt precedes more work")
+				continue
+			}
+		}
 		step, rank := "", 0
 		switch c.Status {
 		case store.CaseTesting:

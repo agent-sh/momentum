@@ -46,13 +46,14 @@ type Ship struct {
 
 // Package states.
 const (
-	Prepared   = "prepared"
-	Checked    = "checked"
-	Proposed   = "proposed"
-	Landing    = "landing"
-	Revising   = "revising" // a review found something: back to its build, on the same branch and pull request
-	Landed     = "landed"
-	RolledBack = "rolled back"
+	Prepared    = "prepared"
+	Checked     = "checked"
+	Proposed    = "proposed"
+	Landing     = "landing"
+	Revising    = "revising" // a review found something: back to its build, on the same branch and pull request
+	Landed      = "landed"
+	RollingBack = "rolling back"
+	RolledBack  = "rolled back"
 )
 
 // MaxRounds is how many review rounds a package gets: prs.md's three.
@@ -60,29 +61,38 @@ const MaxRounds = 3
 
 // Package is a case's change: where it goes, what checks it, how it is measured and undone, and where it stands.
 type Package struct {
-	Case        string    `json:"case"`
-	Kind        string    `json:"kind"` // repo
-	Repo        string    `json:"repo,omitempty"`
-	Base        string    `json:"base,omitempty"`
-	Branch      string    `json:"branch,omitempty"`
-	Dir         string    `json:"dir"`  // the repository's main checkout
-	Work        string    `json:"work"` // the loop's work tree
-	State       string    `json:"state"`
-	Check       *Check    `json:"check,omitempty"`
-	Plan        *Plan     `json:"plan,omitempty"`
-	Rollback    string    `json:"rollback,omitempty"`
-	Title       string    `json:"title,omitempty"`
-	Body        string    `json:"body,omitempty"`
-	Lesson      string    `json:"lesson,omitempty"`
-	PR          string    `json:"pr,omitempty"`
-	LandingHead string    `json:"landing_head,omitempty"`
-	Head        string    `json:"head,omitempty"` // the commit proposed
-	Reviews     []Review  `json:"reviews,omitempty"`
-	Landed      []string  `json:"landed,omitempty"` // the commits that went in
-	LandedAt    time.Time `json:"landed_at,omitempty"`
-	Changed     []string  `json:"changed,omitempty"` // the paths the change touches
-	Created     time.Time `json:"created"`
-	Updated     time.Time `json:"updated"`
+	Case        string           `json:"case"`
+	Kind        string           `json:"kind"` // repo
+	Repo        string           `json:"repo,omitempty"`
+	Base        string           `json:"base,omitempty"`
+	Branch      string           `json:"branch,omitempty"`
+	Dir         string           `json:"dir"`  // the repository's main checkout
+	Work        string           `json:"work"` // the loop's work tree
+	State       string           `json:"state"`
+	Check       *Check           `json:"check,omitempty"`
+	Plan        *Plan            `json:"plan,omitempty"`
+	Rollback    string           `json:"rollback,omitempty"`
+	Title       string           `json:"title,omitempty"`
+	Body        string           `json:"body,omitempty"`
+	Lesson      string           `json:"lesson,omitempty"`
+	PR          string           `json:"pr,omitempty"`
+	LandingHead string           `json:"landing_head,omitempty"`
+	Head        string           `json:"head,omitempty"` // the commit proposed
+	Reviews     []Review         `json:"reviews,omitempty"`
+	Landed      []string         `json:"landed,omitempty"` // the commits that went in
+	LandedAt    time.Time        `json:"landed_at,omitempty"`
+	Undo        *RollbackJournal `json:"undo,omitempty"`
+	Changed     []string         `json:"changed,omitempty"` // the paths the change touches
+	Created     time.Time        `json:"created"`
+	Updated     time.Time        `json:"updated"`
+}
+
+// RollbackJournal keeps the exact revert candidate before any remote write. A retry checks this head on the
+// remote and finishes its receipt rather than reverting a second time.
+type RollbackJournal struct {
+	Head    string   `json:"head"`
+	Commits []string `json:"commits"`
+	Why     string   `json:"why"`
 }
 
 // Check is the evidence that a test discriminates the change: it fails on the code without the change (the
@@ -282,7 +292,12 @@ func (s *Ship) staged(ctx context.Context, p Package) (string, []string, error) 
 // ownTree refuses a work tree whose link to its repository is no longer the one git made: a .git that points
 // elsewhere would make the loop's own git calls read another repository's configuration.
 func (s *Ship) ownTree(p Package) error {
-	b, err := os.ReadFile(filepath.Join(p.Work, ".git"))
+	f, err := OpenFile(p.Work, ".git")
+	if err != nil {
+		return refused("%s's .git is not the link git made: %v", p.Work, err)
+	}
+	defer f.Close()
+	b, err := ReadFile(f, 64<<10)
 	if err != nil {
 		return refused("%s's .git is not the link git made: %v", p.Work, err)
 	}
@@ -490,12 +505,39 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal) (Package
 		return p, err
 	}
 	if p.PR == "" {
-		url, err := s.gh(ctx, p.Work, "pr", "create", "--repo", p.Repo, "--base", p.Base, "--head", p.Branch, "--title", title, "--body", body+"\n\n"+text)
-		if err != nil {
-			s.save(&p) // its commit and head: a retry takes it from there
+		if err := s.save(&p); err != nil {
 			return p, err
 		}
-		p.PR = strings.TrimSpace(lastOf(strings.Split(strings.TrimSpace(url), "\n")))
+		// Creation can succeed while its response is lost. Match the package's exact branch, base and commit
+		// before issuing another create, including a request that was closed or merged in the meantime.
+		list, err := s.gh(ctx, p.Work, "pr", "list", "--repo", p.Repo, "--head", p.Branch, "--base", p.Base, "--state", "all",
+			"--json", "number,url,headRefOid")
+		if err != nil {
+			return p, err
+		}
+		var prs []struct {
+			Number int    `json:"number"`
+			URL    string `json:"url"`
+			Head   string `json:"headRefOid"`
+		}
+		if err := json.Unmarshal([]byte(list), &prs); err != nil {
+			return p, fmt.Errorf("read existing pull requests: %w", err)
+		}
+		for _, pr := range prs {
+			if pr.Head == p.Head && pr.Number > 0 && pr.URL != "" {
+				if p.PR != "" {
+					return p, refused("multiple pull requests match the package's commit")
+				}
+				p.PR = pr.URL
+			}
+		}
+		if p.PR == "" {
+			url, err := s.gh(ctx, p.Work, "pr", "create", "--repo", p.Repo, "--base", p.Base, "--head", p.Branch, "--title", title, "--body", body+"\n\n"+text)
+			if err != nil {
+				return p, err
+			}
+			p.PR = strings.TrimSpace(lastOf(strings.Split(strings.TrimSpace(url), "\n")))
+		}
 	} else if _, err := s.gh(ctx, p.Work, "pr", "edit", p.PR, "--repo", p.Repo, "--title", title, "--body", body+"\n\n"+text); err != nil {
 		s.save(&p)
 		return p, err
@@ -829,8 +871,11 @@ func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error
 	if err != nil {
 		return Package{}, err
 	}
-	if !ok || p.State != Landed {
+	if !ok || (p.State != Landed && p.State != RollingBack && p.State != RolledBack) {
 		return p, refused("case %s has no landed package to roll back", caseID)
+	}
+	if p.State == RolledBack {
+		return p, s.rollbackReceipt(ctx, p, why)
 	}
 	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
 		return p, err
@@ -840,14 +885,42 @@ func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error
 	if _, err := s.git(ctx, p.Dir, "fetch", "--quiet", "origin", p.Base); err != nil {
 		return p, err
 	}
-	if _, err := s.git(ctx, p.Dir, "worktree", "add", "--detach", dir, "origin/"+p.Base); err != nil {
+	start := "origin/" + p.Base
+	if p.Undo != nil {
+		if _, err := s.git(ctx, p.Dir, "merge-base", "--is-ancestor", p.Undo.Head, start); err == nil {
+			p.State = RolledBack
+			if err := s.save(&p); err != nil {
+				return p, err
+			}
+			return p, s.rollbackReceipt(ctx, p, why)
+		}
+		start = p.Undo.Head
+	}
+	if _, err := s.git(ctx, p.Dir, "worktree", "add", "--detach", dir, start); err != nil {
 		return p, err
 	}
 	defer s.unexport(p, dir)
-	shas := append([]string{}, p.Landed...)
-	slices.Reverse(shas)
-	if _, err := s.git(ctx, dir, append([]string{"revert", "--no-edit"}, shas...)...); err != nil {
-		return p, err
+	if p.Undo == nil {
+		shas := append([]string{}, p.Landed...)
+		if len(shas) == 0 {
+			return p, refused("the landed package has no commits to revert")
+		}
+		slices.Reverse(shas)
+		if _, err := s.git(ctx, dir, append([]string{"revert", "--no-edit"}, shas...)...); err != nil {
+			return p, err
+		}
+		head, err := s.git(ctx, dir, "rev-parse", "HEAD")
+		if err != nil {
+			return p, err
+		}
+		commits, err := s.git(ctx, dir, "rev-list", "--reverse", "origin/"+p.Base+"..HEAD")
+		if err != nil {
+			return p, err
+		}
+		p.State, p.Undo = RollingBack, &RollbackJournal{Head: strings.TrimSpace(head), Commits: strings.Fields(commits), Why: why}
+		if err := s.save(&p); err != nil {
+			return p, err
+		}
 	}
 	if _, err := s.push(ctx, p, dir, "--no-verify", "origin", "HEAD:refs/heads/"+p.Base); err != nil {
 		return p, err
@@ -856,8 +929,23 @@ func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error
 	if err := s.save(&p); err != nil {
 		return p, err
 	}
-	_, err = s.Store.RollBackCase(ctx, caseID, why, s.Actor)
-	return p, err
+	return p, s.rollbackReceipt(ctx, p, why)
+}
+
+// rollbackReceipt finishes only a pending case transition. A receipt already written is idempotent.
+func (s *Ship) rollbackReceipt(ctx context.Context, p Package, why string) error {
+	c, err := s.Store.CaseByID(ctx, p.Case)
+	if err != nil {
+		return err
+	}
+	if c.Status == store.CaseTesting {
+		return nil
+	}
+	if p.Undo != nil {
+		why = p.Undo.Why
+	}
+	_, err = s.Store.RollBackCase(ctx, p.Case, why, s.Actor)
+	return err
 }
 
 // commit commits the work tree's staged change as the user.
@@ -885,7 +973,7 @@ func (s *Ship) git(ctx context.Context, dir string, args ...string) (string, err
 		"-c", "user.name=" + s.Identity[0], "-c", "user.email=" + s.Identity[1]}, GitSafety()...)
 	full = append(full, "-c", "credential.helper=",
 		"-c", "credential.https://github.com.helper=!"+shellQuote(firstOf(s.GH, "gh"))+" auth git-credential",
-		"-c", "protocol.ext.allow=never")
+		"-c", "protocol.ext.allow=never", "-c", "push.followTags=false")
 	full = append(full, args...)
 	cmd := exec.CommandContext(cctx, "git", full...)
 	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_AUTHOR_NAME="+s.Identity[0], "GIT_AUTHOR_EMAIL="+s.Identity[1],
@@ -1079,7 +1167,7 @@ func (s *Ship) push(ctx context.Context, p Package, dir string, args ...string) 
 	if !strings.EqualFold(t.Repo, p.Repo) {
 		return "", refused("the push destination is not the package's repository")
 	}
-	return s.git(ctx, dir, append([]string{"push"}, args...)...)
+	return s.git(ctx, dir, append([]string{"push", "--no-follow-tags"}, args...)...)
 }
 
 // shellQuote keeps a configured executable path one word in Git's credential helper.

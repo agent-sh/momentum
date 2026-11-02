@@ -17,8 +17,10 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // Where the sandbox's own things are, inside.
@@ -66,6 +68,10 @@ const maxPath = 4096
 type Mount struct {
 	Path  string
 	Write bool
+	// File, when set, pins the source of a read-only mount: Command duplicates it (the caller keeps its own, and
+	// closes it) and bubblewrap binds that descriptor instead of resolving Path, which the program could replace
+	// with a link between the caller's checks and the mount. A pinned mount is never writable.
+	File *os.File
 }
 
 // Spec is one sandbox.
@@ -115,7 +121,7 @@ func (s Spec) Command(ctx context.Context, argv ...string) (*exec.Cmd, error) {
 	if len(argv) == 0 {
 		return nil, errors.New("jail: no program")
 	}
-	home, mounts, err := s.check()
+	home, mounts, pins, err := s.check()
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +165,18 @@ func (s Spec) Command(ctx context.Context, argv ...string) (*exec.Cmd, error) {
 		args = append(args, "--ro-bind-data", strconv.Itoa(2+len(files)), f.path)
 	}
 	args = append(args, "--dir", home)
-	args = append(args, mounts...)
+	for _, a := range mounts {
+		if n, ok := pinned(a); ok {
+			fd, err := dupCloexec(pins[n])
+			if err != nil {
+				closeAll(files)
+				return nil, err
+			}
+			files = append(files, fd)
+			a = strconv.Itoa(2 + len(files))
+		}
+		args = append(args, a)
+	}
 	if s.Self != "" {
 		args = append(args, "--ro-bind", s.Self, BinDir+"/momentum", "--symlink", "momentum", BinDir+"/tacit")
 	}
@@ -184,40 +201,48 @@ func (s Spec) Command(ctx context.Context, argv ...string) (*exec.Cmd, error) {
 
 // check refuses a Spec that undoes the sandbox's guarantees or that bubblewrap would fail on later, and returns the
 // home (cleaned) and the bubblewrap arguments of the mounts.
-func (s Spec) check() (home string, mounts []string, err error) {
+func (s Spec) check() (home string, mounts []string, pins []*os.File, err error) {
 	if s.Home == "" || !filepath.IsAbs(s.Home) {
-		return "", nil, fmt.Errorf("jail: the home must be an absolute path, got %q", s.Home)
+		return "", nil, nil, fmt.Errorf("jail: the home must be an absolute path, got %q", s.Home)
 	}
 	home = filepath.Clean(s.Home)
 	if len(home) >= maxPath {
-		return "", nil, fmt.Errorf("jail: the home is %d bytes, and a path has at most %d", len(home), maxPath-1)
+		return "", nil, nil, fmt.Errorf("jail: the home is %d bytes, and a path has at most %d", len(home), maxPath-1)
 	}
 	if s.Route != "" && (s.RoutePort < MinRoutePort || s.RoutePort > 65535) {
-		return "", nil, fmt.Errorf("jail: a route needs a port from %d to 65535, got %d", MinRoutePort, s.RoutePort)
+		return "", nil, nil, fmt.Errorf("jail: a route needs a port from %d to 65535, got %d", MinRoutePort, s.RoutePort)
 	}
 	if (s.Route != "" || s.Door != "") && s.Self == "" {
-		return "", nil, errors.New("jail: a route or a door needs momentum's binary (Self)")
+		return "", nil, nil, errors.New("jail: a route or a door needs momentum's binary (Self)")
 	}
 	own := []struct{ path, name string }{{home, "the home"}, {"/etc", "/etc"}, {"/proc", "/proc"}, {"/dev", "/dev"}, {"/run", "/run"}}
 	for i, m := range s.Mounts {
 		switch {
 		case !filepath.IsAbs(m.Path):
-			return "", nil, fmt.Errorf("jail: a mount must be an absolute path, got %q", m.Path)
+			return "", nil, nil, fmt.Errorf("jail: a mount must be an absolute path, got %q", m.Path)
 		case filepath.Clean(m.Path) != m.Path:
-			return "", nil, fmt.Errorf("jail: a mount must be a clean path, got %q (%q)", m.Path, filepath.Clean(m.Path))
+			return "", nil, nil, fmt.Errorf("jail: a mount must be a clean path, got %q (%q)", m.Path, filepath.Clean(m.Path))
 		case m.Path == "/":
-			return "", nil, errors.New(`jail: a mount of "/" would put the whole machine inside`)
+			return "", nil, nil, errors.New(`jail: a mount of "/" would put the whole machine inside`)
 		}
 		for _, o := range own {
 			if holds(m.Path, o.path) {
-				return "", nil, fmt.Errorf("jail: the mount %q is or holds %s, which the sandbox makes itself", m.Path, o.name)
+				return "", nil, nil, fmt.Errorf("jail: the mount %q is or holds %s, which the sandbox makes itself", m.Path, o.name)
 			}
 		}
 		for _, before := range s.Mounts[:i] {
 			if holds(m.Path, before.Path) {
-				return "", nil, fmt.Errorf("jail: the mount %q is listed after %q, which it holds and would cover: a parent comes before what it holds",
+				return "", nil, nil, fmt.Errorf("jail: the mount %q is listed after %q, which it holds and would cover: a parent comes before what it holds",
 					m.Path, before.Path)
 			}
+		}
+		if m.File != nil {
+			if m.Write {
+				return "", nil, nil, fmt.Errorf("jail: the pinned mount %q cannot be writable", m.Path)
+			}
+			mounts = append(mounts, "--ro-bind-fd", pinMark+strconv.Itoa(len(pins)), m.Path)
+			pins = append(pins, m.File)
+			continue
 		}
 		if !m.Write {
 			mounts = append(mounts, "--ro-bind", m.Path, m.Path)
@@ -226,13 +251,63 @@ func (s Spec) check() (home string, mounts []string, err error) {
 		mounts = append(mounts, "--bind", m.Path, m.Path)
 		git, err := gitDir(m.Path)
 		if err != nil {
-			return "", nil, err
+			return "", nil, nil, err
 		}
 		if git != "" {
 			mounts = append(mounts, "--ro-bind", git, git)
 		}
 	}
-	return home, mounts, nil
+	return home, mounts, pins, nil
+}
+
+// Tidy returns mounts as Command needs them: a parent before what it holds, and each path once. Listings of one path
+// are merged: the mount is writable if any listing is, and pinned by the first listing that has a File. The caller
+// keeps (and closes) every File it gave, dropped listings included.
+func Tidy(mounts []Mount) []Mount {
+	sorted := append([]Mount(nil), mounts...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return strings.Count(sorted[i].Path, "/") < strings.Count(sorted[j].Path, "/")
+	})
+	var out []Mount
+	at := map[string]int{}
+	for _, m := range sorted {
+		if i, ok := at[m.Path]; ok {
+			out[i].Write = out[i].Write || m.Write
+			if out[i].File == nil {
+				out[i].File = m.File
+			}
+			continue
+		}
+		at[m.Path] = len(out)
+		out = append(out, m)
+	}
+	return out
+}
+
+// pinMark stands in the mount arguments for the descriptor number of a pinned mount, which Command knows only once
+// the data files before it have their numbers.
+const pinMark = "\x00pin:"
+
+// pinned reports whether a mount argument is a pin's stand-in, and which pin.
+func pinned(a string) (int, bool) {
+	rest, ok := strings.CutPrefix(a, pinMark)
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(rest)
+	return n, err == nil
+}
+
+// dupCloexec duplicates f for the command: the caller keeps and closes its own.
+func dupCloexec(f *os.File) (*os.File, error) {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	fd, err := syscall.Dup(int(f.Fd()))
+	if err != nil {
+		return nil, err
+	}
+	syscall.CloseOnExec(fd)
+	return os.NewFile(uintptr(fd), f.Name()), nil
 }
 
 // holds reports whether the clean path a is b or a directory above it.

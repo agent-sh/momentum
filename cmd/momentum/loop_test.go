@@ -31,6 +31,7 @@ func gitIn(t *testing.T, dir string, args ...string) string {
 // an argument before `--` is a revision of the repository, checked; a path comes after `--`, inside the
 // repository. The loop's agent reads history through it and runs no git of its own.
 func TestEvidenceGitOnlyReads(t *testing.T) {
+	needEvidenceBwrap(t)
 	fakeScrubber(t)
 	dir := t.TempDir()
 	gitIn(t, dir, "init", "-q", "-b", "main")
@@ -92,7 +93,7 @@ func fakeScrubber(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
 	p := filepath.Join(dir, "scrub")
-	os.WriteFile(p, []byte("#!/bin/sh\nsed 's/secret-value/************/g'\n"), 0o755)
+	os.WriteFile(p, []byte("#!/bin/sh\nsed -e 's/secret-value/************/g' -e 's/marker-7f3a/[masked]/g'\n"), 0o755)
 	was := loop.Scrubber
 	loop.Scrubber = []string{p}
 	t.Cleanup(func() { loop.Scrubber = was })
@@ -180,7 +181,7 @@ func TestALessonIsTheLoopsObservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, _, err := st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: "failures/v1:x", Title: "x keeps failing",
+	c, _, err := st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: "failures/v1:x", Title: "marker-7f3a keeps failing",
 		Evidence: []store.Evidence{{Ref: "file:/t/x", At: time.Now().Add(-time.Hour)}}}, "test")
 	if err != nil {
 		t.Fatal(err)
@@ -211,8 +212,11 @@ func TestALessonIsTheLoopsObservation(t *testing.T) {
 			t.Errorf("tacit add lacks %q:\n%s", want, got)
 		}
 	}
-	if strings.Contains(string(got), "secret-value") || strings.Contains(string(got), "@someone") {
+	if strings.Contains(string(got), "secret-value") || strings.Contains(string(got), "marker-7f3a") || strings.Contains(string(got), "@someone") {
 		t.Errorf("the lesson went unscrubbed:\n%s", got)
+	}
+	if !strings.Contains(string(got), "--body\nLearned by momentum's improvement loop") || !strings.Contains(string(got), "[masked] keeps failing") {
+		t.Errorf("the case title was not masked in the body:\n%s", got)
 	}
 }
 

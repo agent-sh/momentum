@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -67,7 +68,7 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	}
 	// opened without waiting on a writer, and read only when it is a regular file: a reference may now name a pipe or
 	// a device, which would hold the run
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	f, err := openRecord(path)
 	if err != nil {
 		output.WriteString("  (its record is gone)\n")
 		return scrubbed(ctx, stdout, output.String())
@@ -98,6 +99,24 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		output.Write(line)
 	}
 	return scrubbed(ctx, stdout, output.String())
+}
+
+// A record inside a run-writable tree is untrusted even though its reference came from the store. Resolve it
+// through that root. Other records also refuse a final symlink and are checked through their descriptor.
+func openRecord(path string) (*os.File, error) {
+	if os.Getenv("MOMENTUM_LOOP_RUN") != "" {
+		roots := append([]string{os.Getenv("MOMENTUM_LOOP_DIR")}, filepath.SplitList(os.Getenv("MOMENTUM_LOOP_READ"))...)
+		for _, dir := range roots {
+			if dir != "" && within(path, dir) {
+				name, err := filepath.Rel(dir, path)
+				if err != nil {
+					return nil, err
+				}
+				return loop.OpenFile(dir, name)
+			}
+		}
+	}
+	return os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 }
 
 // placeOf splits a reference (path@offset, with #index) into its file and the offset of its record.

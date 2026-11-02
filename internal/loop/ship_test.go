@@ -124,6 +124,7 @@ done
 echo '{"allowed": true, "disposition": "allowed_scope_only", "reasons": []}'`)
 	f.gh = script(t, dir, "gh", `if [ -e "`+filepath.Join(dir, "gh-fails")+`" ]; then rm "`+filepath.Join(dir, "gh-fails")+`"; echo "gh: network down" >&2; exit 1; fi
 echo "$@" >> "`+filepath.Join(dir, "gh-calls")+`"
+if [ "$2" = "list" ]; then echo '[]'; fi
 if [ "$2" = "create" ]; then echo "https://github.com/agent-sh/fake/pull/7"; fi`)
 	return f
 }
@@ -133,7 +134,10 @@ if [ "$2" = "create" ]; then echo "https://github.com/agent-sh/fake/pull/7"; fi`
 // neutral (no scrubber in a test).
 func shipFor(t *testing.T, st *store.Store, f repoFixture) *Ship {
 	t.Helper()
-	sb := testSandbox(t)
+	return shipWithSandbox(st, f, testSandbox(t))
+}
+
+func shipWithSandbox(st *store.Store, f repoFixture, sb Sandbox) *Ship {
 	return &Ship{Store: st, Dir: filepath.Join(f.dir, "loop"), Live: true, Actor: "loop:test", Identity: [2]string{"Owner Name", "owner@example.com"},
 		GH: f.gh, Sandbox: sb, Public: func(_ context.Context, s string) (string, error) { return Neutral(s), nil },
 		Gate: Gate{Owners: []string{"agent-sh"}, RepoGuard: []string{f.guard}, Home: sb.Home, Own: filepath.Join(f.dir, "loop"),
@@ -146,6 +150,9 @@ func testSandbox(t *testing.T) Sandbox {
 	bwrap, err := exec.LookPath("bwrap")
 	if err != nil {
 		t.Skip("no bubblewrap here")
+	}
+	if out, err := exec.Command(bwrap, "--unshare-all", "--ro-bind", "/", "/", "true").CombinedOutput(); err != nil {
+		t.Skipf("bubblewrap cannot make a sandbox here: %v: %s", err, out)
 	}
 	out, err := exec.Command("go", "env", "GOROOT", "GOMODCACHE").Output()
 	if err != nil {
@@ -464,7 +471,7 @@ func testingCase2(t *testing.T, st *store.Store) store.Case {
 func TestAChangeToTheLoopsOwnCodeIsRefusedHoweverItIsMade(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	f := newRepo(t, map[string]string{"internal/loop/gate.go": "package loop\n", "internal/supervise/rules.go": "package supervise\n", "docs/x.txt": "notes\n"})
+	f := newRepo(t, map[string]string{"internal/loop/gate.go": "package loop\n", "internal/jail/jail.go": "package jail\n", "internal/supervise/rules.go": "package supervise\n", "docs/x.txt": "notes\n"})
 	s := shipFor(t, st, f)
 	s.Gate.Resolve = func(context.Context, string) (string, error) { return SelfRepo, nil }
 	c := testingCase(t, st)
@@ -484,6 +491,23 @@ func TestAChangeToTheLoopsOwnCodeIsRefusedHoweverItIsMade(t *testing.T) {
 		t.Fatalf("a file moved into a protected path: %v", err)
 	}
 	run(t, p.Work, "git", "mv", "internal/loop/x.go", "docs/x.txt")
+	write(t, filepath.Join(p.Work, "internal/jail/jail.go"), "package jail\n// edited\n")
+	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/jail/") {
+		t.Fatalf("the sandbox edited: %v", err)
+	}
+	write(t, filepath.Join(p.Work, "internal/jail/jail.go"), "package jail\n")
+	for _, move := range [][2]string{{"internal/jail/jail.go", "jail.txt"}, {"docs/x.txt", "internal/jail/x.go"}} {
+		run(t, p.Work, "git", "mv", move[0], move[1])
+		if _, err := s.Check(ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/jail/") {
+			t.Fatalf("the sandbox path moved %v: %v", move, err)
+		}
+		run(t, p.Work, "git", "mv", move[1], move[0])
+	}
+	write(t, filepath.Join(p.Work, "internal/jail/new.go"), "package jail\n")
+	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/jail/") {
+		t.Fatalf("the sandbox path added: %v", err)
+	}
+	os.Remove(filepath.Join(p.Work, "internal/jail/new.go"))
 	write(t, filepath.Join(p.Work, "internal", "loop", "é.go"), "package loop\n")
 	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/loop/é.go") {
 		t.Fatalf("a new protected file with a quoted name: %v", err)
@@ -527,7 +551,7 @@ func TestTheGateKeepsTheLoopsAuthority(t *testing.T) {
 	if _, err := g.Repository(ctx, f.main); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "report_only") {
 		t.Errorf("the scope check's report only: %v", err)
 	}
-	for _, p := range []string{"internal/detect/failures.go", "internal/loop/gate.go", "internal/measure/x.go", "internal/store/events.go",
+	for _, p := range []string{"internal/detect/failures.go", "internal/loop/gate.go", "internal/jail/jail.go", "internal/jail/new.go", "internal/measure/x.go", "internal/store/events.go",
 		"internal/source/transcripts.go", "internal/plain/plain.go", "internal/config/config.go", "internal/paths/paths.go",
 		"cmd/momentum/git.go", "cmd/momentum/replay.go", "go.mod", "go.sum", ".github/workflows/ci.yml", "SPEC.md", "AGENTS.md"} {
 		if err := CheckPaths(Target{Repo: SelfRepo}, []string{"README.md", p}); !errors.Is(err, ErrRefused) {

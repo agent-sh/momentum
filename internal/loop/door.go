@@ -21,7 +21,7 @@ import (
 var (
 	// doorReads are what every step reads the machine with.
 	doorReads = [][]string{{"momentum", "evidence", "events"}, {"momentum", "evidence", "status"}, {"momentum", "evidence", "show"},
-		{"momentum", "evidence", "search"}, {"momentum", "evidence", "git"}, {"momentum", "evidence", "unit"}, {"momentum", "supervise", "replay"},
+		{"momentum", "evidence", "git"}, {"momentum", "evidence", "unit"}, {"momentum", "supervise", "replay"},
 		{"momentum", "report"}, {"momentum", "ship", "status"}, {"momentum", "case", "list"}, {"momentum", "case", "show"},
 		{"tacit", "search"}, {"tacit", "fact"}, {"tacit", "tree"}}
 	// doorCase are a step's changes to its own case.

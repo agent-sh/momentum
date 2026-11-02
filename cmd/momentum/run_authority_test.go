@@ -251,6 +251,7 @@ func TestALessonWhoseWriteLeftNoReceiptIsWrittenTheSame(t *testing.T) {
 
 // A path selector names a checked blob. A subtree cannot change the root of credential exclusions.
 func TestATreeSelectorIsRefused(t *testing.T) {
+	needEvidenceBwrap(t)
 	fakeScrubber(t)
 	dir := evidenceRepo(t)
 	if err := os.MkdirAll(filepath.Join(dir, "config"), 0700); err != nil {

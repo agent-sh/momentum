@@ -173,7 +173,7 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 		defer stop()
 	}
 	mounts := append([]jail.Mount{{Path: inv.Dir, Write: true}, {Path: harness}}, a.Mounts...)
-	spec := jail.Spec{Bwrap: a.Bwrap, Self: a.Self, Home: a.Home, Mounts: append(mounts, inv.Mounts...), Dir: inv.Dir,
+	spec := jail.Spec{Bwrap: a.Bwrap, Self: a.Self, Home: a.Home, Mounts: jail.Tidy(append(mounts, inv.Mounts...)), Dir: inv.Dir,
 		Env: sandboxEnv(a.Home, inv.Dir, routeEnv, a.Env, inv.Env), Route: filepath.Join(sockets, "route.sock"), RoutePort: RoutePort, Door: door}
 	cmd, err := spec.Command(context.Background(), append([]string{harness}, args...)...)
 	if err != nil {
@@ -181,12 +181,12 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	}
 	defer jail.Close(cmd)
 	transcript := filepath.Join(inv.Dir, "transcript.jsonl")
-	out, err := os.OpenFile(transcript, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	out, err := createOutput(inv.Dir, "transcript.jsonl")
 	if err != nil {
 		return Result{}, err
 	}
 	defer out.Close()
-	errLog, err := os.OpenFile(filepath.Join(inv.Dir, "stderr.txt"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	errLog, err := createOutput(inv.Dir, "stderr.txt")
 	if err != nil {
 		return Result{}, err
 	}
@@ -330,11 +330,14 @@ func (a Agent) RunOrFallback(ctx context.Context, inv Invocation) (Result, error
 // readStream reads the run's stream of events (Claude Code's stream-json): its last result says how the run
 // ended, what it cost and what it reported; a call the permissions refused is counted.
 func readStream(path string) (Result, error) {
-	f, err := os.Open(path)
+	f, err := OpenFile(filepath.Dir(path), filepath.Base(path))
 	if err != nil {
 		return Result{}, err
 	}
 	defer f.Close()
+	if _, err := regularOwned(f); err != nil {
+		return Result{}, err
+	}
 	var res Result
 	found := false
 	sc := bufio.NewScanner(f)
@@ -420,7 +423,13 @@ func errorKind(text string) string {
 
 // lastLine is a file's last non-empty line, clipped: what a failed command said last.
 func lastLine(path string) string {
-	raw, err := os.ReadFile(path)
+	f, err := OpenFile(filepath.Dir(path), filepath.Base(path))
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	// Diagnostics have the door's same whole-stream limit before selecting the last line.
+	raw, err := ReadFile(f, jail.MaxStream)
 	if err != nil {
 		return ""
 	}

@@ -11,6 +11,7 @@ import (
 // sets): one under a root, not one beside it, and not a directory under a root whose .git file names a repository
 // outside. Outside a run it reads any.
 func TestARunsGitReadsOnlyWhereTheLoopReads(t *testing.T) {
+	needEvidenceBwrap(t)
 	fakeScrubber(t)
 	root := t.TempDir()
 	inside := filepath.Join(root, "repo")

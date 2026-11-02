@@ -188,7 +188,7 @@ func defaultBranch(ctx context.Context, dir string) (string, error) {
 // evaluator's or its authority's, which only the owner or a session he directs makes. Each call returns a list
 // of its own: nothing a change compiles in can empty it.
 func Protected() []string {
-	return []string{"internal/detect/", "internal/loop/", "internal/measure/", "internal/store/", "internal/source/", "internal/plain/",
+	return []string{"internal/detect/", "internal/loop/", "internal/jail/", "internal/measure/", "internal/store/", "internal/source/", "internal/plain/",
 		"internal/config/", "internal/paths/", "cmd/momentum/", "go.mod", "go.sum", ".github/", "SPEC.md", "AGENTS.md"}
 }
 

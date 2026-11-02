@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/agent-sh/momentum/internal/config"
@@ -153,27 +154,31 @@ const bodyMax = 64 << 10
 // readBody reads a proposal's description. In a loop run it is a file of the run's own directory: a path
 // elsewhere would publish what the user can read.
 func readBody(path, run string) (string, error) {
+	var f *os.File
+	var err error
 	if run != "" {
-		real, err := filepath.EvalSymlinks(path)
-		if err != nil {
-			return "", usageError{err.Error()}
-		}
-		own, err := filepath.EvalSymlinks(os.Getenv("MOMENTUM_LOOP_DIR"))
-		if err != nil || os.Getenv("MOMENTUM_LOOP_DIR") == "" || !within(real, own) {
+		abs, e := filepath.Abs(path)
+		own := os.Getenv("MOMENTUM_LOOP_DIR")
+		if e != nil || own == "" || !within(abs, own) {
 			return "", usageError{fmt.Sprintf("in a loop run the body is a file of the run's own directory, not %s", path)}
 		}
-		path = real
+		name, e := filepath.Rel(own, abs)
+		if e != nil {
+			return "", usageError{e.Error()}
+		}
+		f, err = loop.OpenFile(own, name)
+	} else {
+		f, err = os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 	}
-	st, err := os.Stat(path)
-	switch {
-	case err != nil:
+	if err != nil {
 		return "", usageError{err.Error()}
-	case !st.Mode().IsRegular():
-		return "", usageError{fmt.Sprintf("%s is not a file", path)}
-	case st.Size() > bodyMax:
-		return "", usageError{fmt.Sprintf("%s holds %d bytes, more than a description's %d", path, st.Size(), bodyMax)}
 	}
-	b, err := os.ReadFile(path)
+	defer f.Close()
+	return readBodyFile(f)
+}
+
+func readBodyFile(f *os.File) (string, error) {
+	b, err := loop.ReadFile(f, bodyMax)
 	if err != nil {
 		return "", usageError{err.Error()}
 	}

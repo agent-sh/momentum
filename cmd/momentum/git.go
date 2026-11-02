@@ -10,8 +10,10 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/jail"
 	"github.com/agent-sh/momentum/internal/loop"
 	"github.com/agent-sh/momentum/internal/paths"
 )
@@ -84,7 +86,8 @@ func evidenceGit(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	if out, err := gitRead(ctx, dir, "rev-parse", "--is-inside-work-tree"); err != nil || strings.TrimSpace(out) != "true" {
 		return usageError{fmt.Sprintf("%s is not a git work tree", dir)}
 	}
-	if err := gitReadable(ctx, dir); err != nil {
+	places, err := gitReadable(ctx, dir)
+	if err != nil {
 		return usageError{err.Error()}
 	}
 	argv, err := gitArgs(ctx, dir, sub, spec, rest)
@@ -96,8 +99,28 @@ func evidenceGit(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	}
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, "git", append(append(append([]string{"-C", dir}, gitSafe...), loop.GitSafety()...), argv...)...)
-	cmd.Env = gitEnv()
+	// Only checked directories exist inside. Links in their object or ref storage cannot reach any other
+	// repository, even while the run replaces them. There is no route or door.
+	var mounts []jail.Mount
+	defer func() {
+		for _, m := range mounts {
+			m.File.Close()
+		}
+	}()
+	for _, p := range places {
+		f, err := openGitDirectory(p)
+		if err != nil {
+			return fmt.Errorf("evidence git cannot pin a checked sandbox directory: %w", err)
+		}
+		mounts = append(mounts, jail.Mount{Path: p, File: f})
+	}
+	const home = "/run/momentum/home"
+	cmd, err := (jail.Spec{Home: home, Dir: resolved(dir), Mounts: jail.Tidy(mounts), Env: append(gitEnv(), "HOME="+home)}).Command(cctx,
+		append([]string{"git", "-C", resolved(dir)}, append(append(append([]string{}, gitSafe...), loop.GitSafety()...), argv...)...)...)
+	if err != nil {
+		return fmt.Errorf("evidence git requires its filesystem sandbox: %w", err)
+	}
+	defer jail.Close(cmd)
 	var out bytes.Buffer
 	capture := &capped{w: &out, n: (1 << 20) + 1}
 	cmd.Stdout, cmd.Stderr = capture, capture
@@ -112,17 +135,48 @@ func evidenceGit(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	if _, writeErr := io.WriteString(stdout, clean); writeErr != nil {
 		return writeErr
 	}
-	return err
+	if err != nil {
+		return fmt.Errorf("evidence git sandbox or Git failed (no unsandboxed fallback): %w", err)
+	}
+	return nil
+}
+
+// Pin a checked directory through a read root before bubblewrap resolves any mount. The run can rename a
+// nested repository or its .git directory while the host prepares its sandbox.
+func openGitDirectory(p string) (*os.File, error) {
+	roots := []string{"/"} // outside a run, the caller may read any repository
+	if os.Getenv("MOMENTUM_LOOP_RUN") != "" {
+		roots = filepath.SplitList(os.Getenv("MOMENTUM_LOOP_READ"))
+	}
+	for _, dir := range roots {
+		if dir == "" {
+			continue
+		}
+		dir = resolved(dir)
+		if !within(p, dir) {
+			continue
+		}
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			return nil, err
+		}
+		name, err := filepath.Rel(dir, p)
+		if err != nil {
+			root.Close()
+			return nil, err
+		}
+		f, err := root.OpenFile(name, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+		root.Close()
+		return f, err
+	}
+	return nil, fmt.Errorf("%s is outside the run's repository read roots", p)
 }
 
 // gitReadable keeps a loop run's git to the repositories the loop reads (MOMENTUM_LOOP_READ, which the run's door
 // sets: loop.read_dirs and the run's own work tree): the directory, its repository's top-level work tree and its git
 // directories lie under one of them, so a .git file that names another repository reads nothing. Outside a run,
 // any repository.
-func gitReadable(ctx context.Context, dir string) error {
-	if os.Getenv("MOMENTUM_LOOP_RUN") == "" {
-		return nil
-	}
+func gitReadable(ctx context.Context, dir string) ([]string, error) {
 	var roots []string
 	for _, r := range filepath.SplitList(os.Getenv("MOMENTUM_LOOP_READ")) {
 		if r != "" {
@@ -133,7 +187,7 @@ func gitReadable(ctx context.Context, dir string) error {
 	for _, q := range []string{"--show-toplevel", "--absolute-git-dir", "--git-common-dir"} {
 		out, err := gitRead(ctx, dir, "rev-parse", q)
 		if err != nil {
-			return fmt.Errorf("%s: git rev-parse %s: %v", dir, q, err)
+			return nil, fmt.Errorf("%s: git rev-parse %s: %v", dir, q, err)
 		}
 		p := strings.TrimSpace(out)
 		if !filepath.IsAbs(p) {
@@ -141,16 +195,19 @@ func gitReadable(ctx context.Context, dir string) error {
 		}
 		places = append(places, resolved(p))
 	}
+	if os.Getenv("MOMENTUM_LOOP_RUN") == "" {
+		return places, nil
+	}
 	for _, p := range places {
 		ok := false
 		for _, r := range roots {
 			ok = ok || within(p, r)
 		}
 		if !ok {
-			return fmt.Errorf("%s is not where this run reads repositories: under loop.read_dirs, or its own work tree", dir)
+			return nil, fmt.Errorf("%s is not where this run reads repositories: under loop.read_dirs, or its own work tree", dir)
 		}
 	}
-	return nil
+	return places, nil
 }
 
 // resolved is a path made absolute with its links followed, as far as it exists.

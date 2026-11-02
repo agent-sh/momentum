@@ -837,3 +837,73 @@ func TestTheProgramGetsExactlyTheEnvironmentTheSpecGives(t *testing.T) {
 		})
 	}
 }
+
+func TestAPinnedMountUsesTheOpenedDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "mount")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	before, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd, err := (Spec{Home: "/fixture/home", Mounts: []Mount{{Path: dir, File: f}}}).Command(context.Background(), "true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer Close(cmd)
+	if err := os.Rename(dir, dir+".old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), dir); err != nil {
+		t.Fatal(err)
+	}
+	if len(cmd.ExtraFiles) != 4 || !strings.Contains(strings.Join(cmd.Args, "\n"), "--ro-bind-fd\n6\n"+dir) {
+		t.Fatalf("mount source is still a pathname: %v", cmd.Args)
+	}
+	pinned, err := cmd.ExtraFiles[3].Stat()
+	if err != nil || !os.SameFile(before, pinned) {
+		t.Fatalf("replacement changed the source descriptor: %v", err)
+	}
+	Close(cmd)
+	if _, err := f.Stat(); err != nil {
+		t.Fatalf("the caller lost ownership of its descriptor: %v", err)
+	}
+}
+
+func TestTidyOrdersAParentBeforeWhatItHoldsAndMergesRepeats(t *testing.T) {
+	f1, f2 := &os.File{}, &os.File{}
+	got := Tidy([]Mount{{Path: "/work/a/b"}, {Path: "/work/a", Write: true}, {Path: "/work/c"}, {Path: "/work/c", File: f1},
+		{Path: "/work/a/b", Write: true, File: f2}, {Path: "/x"}})
+	var paths []string
+	for _, m := range got {
+		paths = append(paths, m.Path)
+	}
+	if want := "/x /work/a /work/c /work/a/b"; strings.Join(paths, " ") != want {
+		t.Fatalf("order: got %v, want %s", paths, want)
+	}
+	for _, m := range got {
+		switch m.Path {
+		case "/work/c":
+			if m.File != f1 || m.Write {
+				t.Errorf("/work/c: pinned by the first listing that has a file, read-only: %+v", m)
+			}
+		case "/work/a/b":
+			if !m.Write || m.File != f2 {
+				t.Errorf("/work/a/b: writable if any listing is, pinned by its file: %+v", m)
+			}
+		}
+	}
+	// the mounts it returns pass Command's ordering rule, which the listing it was given does not
+	if _, _, _, err := (Spec{Home: "/fixture/home", Mounts: []Mount{{Path: "/work/a/b"}, {Path: "/work/a"}}}).check(); err == nil {
+		t.Errorf("a parent listed after its child is refused")
+	}
+	if _, _, _, err := (Spec{Home: "/fixture/home", Mounts: Tidy([]Mount{{Path: "/work/a/b"}, {Path: "/work/a"}, {Path: "/work/a"}})}).check(); err != nil {
+		t.Errorf("tidy mounts are accepted: %v", err)
+	}
+}

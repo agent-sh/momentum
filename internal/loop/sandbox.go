@@ -164,7 +164,7 @@ func (s Sandbox) Run(ctx context.Context, dir string, words []string, env []stri
 func (s Sandbox) env(scratch, cache string, extra []string) []string {
 	path := append(append([]string{}, s.Path...), "/usr/local/bin", "/usr/bin", "/bin")
 	env := []string{"HOME=" + firstOf(s.Home, scratch), "PATH=" + strings.Join(path, ":"), "TMPDIR=" + scratch, "LANG=C.UTF-8",
-		"GIT_TERMINAL_PROMPT=0", "GOTOOLCHAIN=local", "GOTELEMETRY=off", "GOPROXY=off", "CARGO_NET_OFFLINE=true"}
+		"GIT_TERMINAL_PROMPT=0", "GOTOOLCHAIN=local", "GOTELEMETRY=off", "GOPROXY=off", "GOFLAGS=-buildvcs=false", "CARGO_NET_OFFLINE=true"}
 	if cache != "" {
 		env = append(env, "GOCACHE="+filepath.Join(cache, "go-build"), "UV_CACHE_DIR="+filepath.Join(cache, "uv"),
 			"npm_config_cache="+filepath.Join(cache, "npm"))
