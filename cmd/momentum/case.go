@@ -15,6 +15,7 @@ import (
 
 	"github.com/agent-sh/momentum/internal/config"
 	"github.com/agent-sh/momentum/internal/detect"
+	"github.com/agent-sh/momentum/internal/loop"
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
@@ -34,6 +35,25 @@ func caseCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	if os.Getenv("MOMENTUM_LOOP_RUN") != "" && args[0] != "list" && args[0] != "show" {
 		ctx = store.WithCaseAuthority(ctx, os.Getenv("MOMENTUM_LOOP_CASE"))
+		ctx = store.WithTextCleaner(ctx, loop.Redact)
+		// Every value a run supplies is generated text. Clean before parsing,
+		// clipping or writing it. The case id has already passed ownCase.
+		args = append([]string(nil), args...)
+		for i := 2; i < len(args); i++ {
+			prefix, value := "", args[i]
+			if strings.HasPrefix(value, "--") {
+				key, v, joined := strings.Cut(value, "=")
+				if !joined {
+					continue
+				}
+				prefix, value = key+"=", v
+			}
+			cleaned, err := loop.Redact(ctx, value)
+			if err != nil {
+				return err
+			}
+			args[i] = prefix + cleaned
+		}
 	}
 	switch args[0] {
 	case "detect":

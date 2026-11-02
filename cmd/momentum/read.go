@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -70,7 +71,11 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	// a device, which would hold the run
 	f, err := openRecord(path)
 	if err != nil {
-		output.WriteString("  (its record is gone)\n")
+		if errors.Is(err, errWritableRecord) {
+			output.WriteString("  (record withheld: it lies where a run can write)\n")
+		} else {
+			output.WriteString("  (its record is gone)\n")
+		}
 		return scrubbed(ctx, stdout, output.String())
 	}
 	defer f.Close()
@@ -101,8 +106,10 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	return scrubbed(ctx, stdout, output.String())
 }
 
-// A record inside a run-writable tree is untrusted even though its reference came from the store. Resolve it
-// through that root. Other records also refuse a final symlink and are checked through their descriptor.
+var errWritableRecord = errors.New("record lies where a run can write")
+
+// A host event's reference does not authenticate a run-written file.
+// Refuse both its spelling and its resolved target before opening it.
 func openRecord(path string) (*os.File, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -110,12 +117,17 @@ func openRecord(path string) (*os.File, error) {
 	}
 	path = abs
 	real := resolved(path)
-	for _, name := range []string{"work", "cache", "exports"} {
-		if within(path, filepath.Join(loopDir(), name)) || within(real, filepath.Join(loopDir(), name)) {
-			return nil, fmt.Errorf("evidence never reads a writable clone, cache or test export")
+	for _, name := range []string{"runs", "work", "cache", "exports", "tmp"} {
+		root := filepath.Join(loopDir(), name)
+		if within(path, root) || within(real, resolved(root)) {
+			return nil, errWritableRecord
 		}
 	}
-	roots := []string{os.Getenv("MOMENTUM_LOOP_DIR"), filepath.Join(loopDir(), "runs")}
+	runDir := os.Getenv("MOMENTUM_LOOP_DIR")
+	if runDir != "" && (within(path, runDir) || within(real, resolved(runDir))) {
+		return nil, errWritableRecord
+	}
+	var roots []string
 	if os.Getenv("MOMENTUM_LOOP_RUN") != "" {
 		roots = append(roots, filepath.SplitList(os.Getenv("MOMENTUM_LOOP_READ"))...)
 	}

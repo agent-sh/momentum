@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -180,16 +179,16 @@ func TestEvidenceRecordInARunsTreeCannotFollowLinks(t *testing.T) {
 	}
 	ordinary := filepath.Join(dir, "ordinary.log")
 	os.WriteFile(ordinary, []byte("original-marker-31b8\n"), 0600)
-	f, err := openRecord(ordinary)
-	if err != nil {
-		t.Fatal(err)
+	e.SourceKey, e.Ref = "ordinary", ordinary+"@0"
+	putEvents(t, e)
+	os.WriteFile(ordinary, []byte("forged-marker-31b8\n"), 0600)
+	if code, out, diag := momentum("evidence", "show", e.ID()); code != 0 || strings.Contains(out+diag, "forged-marker") ||
+		!strings.Contains(out, "(record withheld: it lies where a run can write)") {
+		t.Fatalf("run-written ordinary file became evidence: %d %q %s", code, out, diag)
 	}
-	defer f.Close()
-	os.Rename(ordinary, ordinary+".old")
-	os.Symlink(denied, ordinary)
-	b, err := io.ReadAll(f)
-	if err != nil || string(b) != "original-marker-31b8\n" {
-		t.Fatalf("record descriptor was reopened: %q %v", b, err)
+	if f, err := openRecord(ordinary); err == nil {
+		f.Close()
+		t.Fatal("opened an ordinary run-written record")
 	}
 }
 

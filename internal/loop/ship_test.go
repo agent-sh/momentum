@@ -25,6 +25,9 @@ func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == jail.InitCommand {
 		os.Exit(jail.Init(os.Args[2:]))
 	}
+	if len(os.Args) == 3 && os.Args[1] == "fixture-model-result" {
+		os.Exit(sendFixtureResult(os.Args[2]))
+	}
 	if door := os.Getenv("MOMENTUM_DOOR"); door != "" {
 		name := "momentum"
 		if filepath.Base(os.Args[0]) == "tacit" {

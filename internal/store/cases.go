@@ -314,10 +314,14 @@ func live(ctx context.Context, q querier, id string) (Case, error) {
 
 // caseLog adds a line to a case's log.
 func caseLog(ctx context.Context, q querier, id, actor, action, detail string, at time.Time) error {
+	var err error
+	if detail, err = cleanText(ctx, detail); err != nil {
+		return err
+	}
 	if actor == "" {
 		actor = "unknown"
 	}
-	_, err := q.ExecContext(ctx, `INSERT INTO case_log (case_id, seq, at, actor, action, detail)
+	_, err = q.ExecContext(ctx, `INSERT INTO case_log (case_id, seq, at, actor, action, detail)
 	  VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM case_log WHERE case_id = ?), ?, ?, ?, ?)`,
 		id, id, at.UnixMilli(), caseText(actor, 80), action, caseText(detail, caseTextMax))
 	return err

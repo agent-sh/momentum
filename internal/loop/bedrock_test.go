@@ -2,6 +2,7 @@ package loop
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -42,6 +43,18 @@ func fakeBroker(t *testing.T) *broker {
 			http.Error(w, "no", http.StatusForbidden)
 			return
 		}
+		var fixture struct {
+			Report  json.RawMessage `json:"fixture_report"`
+			Refusal bool            `json:"fixture_refusal"`
+		}
+		json.NewDecoder(req.Body).Decode(&fixture)
+		if len(fixture.Report) == 0 {
+			var result struct {
+				Report json.RawMessage `json:"structured_output"`
+			}
+			json.Unmarshal([]byte(okResult), &result)
+			fixture.Report = result.Report
+		}
 		if strings.HasSuffix(req.URL.Path, "/invoke-with-response-stream") {
 			w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
 			if len(reply) > 0 {
@@ -49,9 +62,23 @@ func fakeBroker(t *testing.T) *broker {
 				return
 			}
 			w.Write(eventFrame([]byte(`{"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0}}}`)))
-			w.Write(eventFrame([]byte(`{"type":"message_delta","usage":{"output_tokens":0}}`)))
+			if string(fixture.Report) != "null" {
+				event, _ := json.Marshal(map[string]any{"type": "content_block_start", "index": 0,
+					"content_block": map[string]any{"type": "tool_use", "name": "StructuredOutput", "input": fixture.Report}})
+				w.Write(eventFrame(event))
+				w.Write(eventFrame([]byte(`{"type":"content_block_stop","index":0}`)))
+			}
+			reason := "tool_use"
+			if fixture.Refusal {
+				reason = "refusal"
+			}
+			w.Write(eventFrame([]byte(`{"type":"message_delta","delta":{"stop_reason":"` + reason + `"},"usage":{"output_tokens":0}}`)))
 		} else {
-			w.Write([]byte(`{"usage":{"input_tokens":0,"output_tokens":0}}`))
+			content := []any{}
+			if string(fixture.Report) != "null" {
+				content = append(content, map[string]any{"type": "tool_use", "name": "StructuredOutput", "input": fixture.Report})
+			}
+			json.NewEncoder(w).Encode(map[string]any{"usage": map[string]int{"input_tokens": 0, "output_tokens": 0}, "content": content})
 		}
 	}))
 	srv.Listener.Close()
@@ -93,7 +120,7 @@ func harnessOnRoute(t *testing.T, result string, requests ...string) []string {
 	body := "env > " + filepath.Join(dir, "env") + "\n"
 	for _, r := range requests {
 		method, path, _ := strings.Cut(r, " ")
-		body += `curl -s -o /dev/null -w '%{http_code}\n' -X ` + method + ` -d '{}' "$ANTHROPIC_BEDROCK_BASE_URL` + path + `" >> ` + filepath.Join(dir, "codes") + "\n"
+		body += `curl -s -o /dev/null -w '%{http_code}\n' -X ` + method + ` -d '{"max_tokens":1000}' "$ANTHROPIC_BEDROCK_BASE_URL` + path + `" >> ` + filepath.Join(dir, "codes") + "\n"
 	}
 	body += "echo '" + result + "'"
 	return []string{script(t, dir, "harness", body)}

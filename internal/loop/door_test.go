@@ -30,7 +30,7 @@ echo "a fact holding zz-private-value"`)
 	harness := script(t, dir, "harness", `momentum evidence show ev:1 >> `+out+` 2>&1
 momentum ship propose --title x >> `+out+` 2>&1; echo "propose=$?" >> `+out+`
 tacit search lock >> `+out+` 2>&1
-echo '`+okResult+`'`)
+`+modelResult(okResult))
 	r := runnerFor(t, st, []string{harness})
 	r.Momentum, r.Tacit = momentum, tacit
 	c := openCase(t, st, "failures", "a", 2)

@@ -69,7 +69,8 @@ func TestShipPushesPublishNoReachableTags(t *testing.T) {
 	ctx := context.Background()
 	run(t, f.main, "git", "config", "push.followTags", "true")
 	run(t, f.main, "git", "tag", "-a", "proposal-tag", "-m", "fixture")
-	c, _, pr := recoveryChecked(t, s, st, f)
+	c, prepared, pr := recoveryChecked(t, s, st, f)
+	run(t, prepared.Host, "git", "config", "push.followTags", "true")
 	checkTags := func(stage string) {
 		t.Helper()
 		if got := run(t, f.dir, "git", "--git-dir", f.origin, "for-each-ref", "refs/tags"); got != "" {

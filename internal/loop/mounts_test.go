@@ -33,7 +33,7 @@ func TestABuildSeesTheCompleteCloneBeforeItStarts(t *testing.T) {
  git -C '`+p.Work+`' diff --cached --binary '`+p.BaseCommit+`' > "$MOMENTUM_LOOP_DIR/change.patch" || exit 1
  test -z "$(git -C '`+p.Work+`' remote)" || exit 1
  test ! -e '`+p.Host+`' || exit 1
- echo '`+okResult+`'`)
+ `+modelResult(okResult))
 	r := runnerFor(t, st, []string{harness})
 	r.Ship = s
 	done, err := r.Once(ctx, Options{Families: []string{"failures"}})
@@ -107,8 +107,9 @@ func TestAMountThatIsMissingIsAClearErrorAndCostsNothing(t *testing.T) {
 		t.Fatalf("%+v %v", done, err)
 	}
 	run := done[0].Run
-	if run.Status != store.RunFailed || !strings.Contains(run.Failure, missing) || !strings.Contains(run.Failure, "does not exist") || strings.Contains(run.Failure, "bwrap") {
-		t.Fatalf("the failure does not name the mount: %+v", run)
+	// the failure is a short key the stop rule compares; the diagnostic that names the mount is the run's summary
+	if run.Status != store.RunFailed || !strings.Contains(run.Summary, missing) || !strings.Contains(run.Summary, "does not exist") || strings.Contains(run.Summary, "bwrap") {
+		t.Fatalf("the summary does not name the mount: %+v", run)
 	}
 	if got, _ := st.CaseByID(ctx, c.ID); run.USD != 0 || got.Cost.USD != 0 {
 		t.Fatalf("a run that never started was charged %v, its case %v", run.USD, got.Cost.USD)
@@ -161,7 +162,7 @@ momentum evidence git '`+toolchain+`' log > other-out 2>&1; echo "other-git=$?" 
 (cd '`+work+`' && momentum case show here > /dev/null); (cd /usr && momentum case show there > /dev/null)
 momentum ship prepare --repo /somewhere > prepare-out 2>&1; echo "prepare=$?" >> codes
 momentum loop lesson --text x > lesson-out 2>&1; echo "lesson=$?" >> codes
-echo '`+okResult+`'`)
+`+modelResult(okResult))
 	r := runnerFor(t, st, []string{harness})
 	r.Ship = s
 	r.ReadDirs = []string{f.main}
@@ -238,7 +239,7 @@ git -C '`+export+`' log > inner-git 2>&1; echo "inner-git=$?" >> codes
 momentum evidence git '`+f.main+`' log > git-out 2>&1; echo "tree-git=$?" >> codes
 momentum ship prepare --repo /somewhere > prepare-out 2>&1; echo "prepare=$?" >> codes
 momentum case set `+c.ID+` --status open > set-out 2>&1; echo "case-set=$?" >> codes
-echo '`+okResult+`'`)
+`+modelResult(okResult))
 	r := runnerFor(t, st, []string{harness})
 	r.Ship = s
 	r.ReadDirs = []string{f.main}

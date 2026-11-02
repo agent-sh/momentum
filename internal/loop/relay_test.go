@@ -24,7 +24,7 @@ func TestASafeguardsRefusalAfterARelayRefusalStillFallsBack(t *testing.T) {
 	dir := t.TempDir()
 	refused := `{"type":"result","subtype":"success","is_error":true,"num_turns":1,"total_cost_usd":0.25,"result":"the safeguards blocked it"}`
 	harness := script(t, dir, "harness", `curl -s -o /dev/null -X POST -d '{}' "$ANTHROPIC_BEDROCK_BASE_URL/model/us.anthropic.claude-haiku-4-5-20251001-v1:0/invoke"
-case "$*" in *"--model model-a"*) echo '`+refused+`' ;; *) echo '`+okResult+`' ;; esac`)
+case "$*" in *"--model model-a"*) `+modelResult(refused)+` ;; *) `+modelResult(okResult)+` ;; esac`)
 	a := testJail(t, Agent{Runner: []string{harness}, Model: "model-a", Fallback: "model-b", Bedrock: b.Bedrock})
 	res, err := a.RunOrFallback(context.Background(), Invocation{Dir: filepath.Join(t.TempDir(), "run"), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Minute})
 	if err != nil || res.Status != store.RunOK || res.Model != "model-b" || res.USD != 1 || res.Failure != "" {
@@ -47,7 +47,7 @@ func TestTwoRunsThatFailedAlikeStopACaseWhateverTheirRelayRefused(t *testing.T) 
 	dir := t.TempDir()
 	harness := script(t, dir, "harness", `n=$(cat '`+filepath.Join(dir, "count")+`' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '`+filepath.Join(dir, "count")+`'
 curl -s -o /dev/null -X POST -d '{}' "$ANTHROPIC_BEDROCK_BASE_URL/model/us.anthropic.claude-haiku-$n/invoke"
-echo '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":30,"total_cost_usd":1.5}'`)
+`+modelResult(`{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":30,"total_cost_usd":1.5}`)+``)
 	r := runnerFor(t, st, []string{harness})
 	r.Agent.Bedrock = b.Bedrock
 	c := openCase(t, st, "failures", "a", 3)
@@ -155,7 +155,7 @@ code -X GET "$base/inference-profiles"
 code -X POST -d '{}' "$base/inference-profiles"
 code -X POST -d '{}' "$root/model/global.anthropic.claude-opus-5-5/invoke"
 code -X POST -d '{}' "$base/model/global.anthropic.claude-opus-5-5%5B1m%5D/invoke"
-code -X POST -d '{}' "$base/model/global.anthropic.claude-opus-5-5/invoke"
+code -X POST -d '{"max_tokens":1000}' "$base/model/global.anthropic.claude-opus-5-5/invoke"
 echo '`+okResult+`'`)
 	a := testJail(t, Agent{Runner: []string{harness}, Model: "global.anthropic.claude-opus-5-5", Bedrock: b.Bedrock})
 	if _, err := a.Run(context.Background(), Invocation{Dir: filepath.Join(t.TempDir(), "run"), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Minute}); err != nil {

@@ -85,6 +85,7 @@ type Package struct {
 	Lesson        string           `json:"lesson,omitempty"`
 	PR            string           `json:"pr,omitempty"`
 	LandingHead   string           `json:"landing_head,omitempty"`
+	Cleanup       string           `json:"cleanup,omitempty"`
 	Head          string           `json:"head,omitempty"` // the commit proposed
 	Reviews       []Review         `json:"reviews,omitempty"`
 	Landed        []string         `json:"landed,omitempty"` // the commits that went in
@@ -414,7 +415,20 @@ func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []strin
 		if err != nil {
 			return p, err
 		}
-		if err := writeTest(before, f, []byte(b)); err != nil {
+		entry, err := s.git(ctx, p.Host, "ls-tree", tree, "--", f)
+		if err != nil {
+			return p, err
+		}
+		mode := os.FileMode(0o644)
+		switch fields := strings.Fields(entry); {
+		case len(fields) < 3 || fields[1] != "blob":
+			return p, refused("test file is not a regular blob: %s", f)
+		case fields[0] == "100755":
+			mode = 0o755
+		case fields[0] != "100644":
+			return p, refused("test file has no accepted mode: %s", f)
+		}
+		if err := writeTest(before, f, []byte(b), mode); err != nil {
 			return p, err
 		}
 	}
@@ -737,6 +751,22 @@ func (s *Ship) Reviewed(ctx context.Context, caseID string, r Review) (Package, 
 	if !ok || p.State != Proposed {
 		return p, refused("case %s has no proposed package to review", caseID)
 	}
+	// Persist only cleaned model text. Posting later must not be the first scrub.
+	clean, err := Redact(ctx, r.Text)
+	if err != nil {
+		return p, err
+	}
+	r.Text = clean
+	r.Findings = append([]Finding(nil), r.Findings...)
+	for i := range r.Findings {
+		for _, field := range []*string{&r.Findings[i].Where, &r.Findings[i].Problem, &r.Findings[i].Fix} {
+			clean, err := Redact(ctx, *field)
+			if err != nil {
+				return p, err
+			}
+			*field = clean
+		}
+	}
 	if len(r.Findings) > 0 || (r.High == 0 && r.Medium == 0 && r.Low == 0) {
 		h, m, l, err := countFindings(r.Findings)
 		if err != nil {
@@ -756,7 +786,7 @@ func (s *Ship) Reviewed(ctx context.Context, caseID string, r Review) (Package, 
 	if err := s.save(&p); err != nil {
 		return p, err
 	}
-	return p, s.Store.CaseNote(ctx, caseID, "reviewed", fmt.Sprintf("round %d: %d high, %d medium, %d low %s", r.Round, r.High, r.Medium,
+	return p, s.Store.CaseNote(store.WithTextCleaner(ctx, Redact), caseID, "reviewed", fmt.Sprintf("round %d: %d high, %d medium, %d low %s", r.Round, r.High, r.Medium,
 		r.Low, r.Comment), s.Actor)
 }
 
@@ -814,13 +844,28 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 		}
 		if p.LandingHead != "" {
 			if _, err := s.git(ctx, p.Host, "merge-base", "--is-ancestor", p.LandingHead, "origin/"+p.Base); err == nil {
-				p.Head, p.State, p.LandedAt = p.LandingHead, Landed, s.now()
-				if err := s.save(&p); err != nil {
+				return s.finishLanding(ctx, p)
+			}
+			// A lost publication response can leave the remote on this exact head.
+			// Keep and reconcile it before another rebase can produce a different one.
+			if p.PublishedHead != p.LandingHead {
+				if err := s.publish(ctx, &p, p.LandingHead); err != nil {
 					return p, err
 				}
-				_, err := s.Store.DeployCase(ctx, p.Case, s.pkgDir(p.Case), p.LandedAt, p.PR+": "+p.Title, s.Actor)
-				return p, err
 			}
+			_, relationErr := s.git(ctx, p.Host, "merge-base", "--is-ancestor", "origin/"+p.Base, p.LandingHead)
+			var exit *exec.ExitError
+			if relationErr != nil && (!errors.As(relationErr, &exit) || exit.ExitCode() != 1) {
+				return p, relationErr // an uncertain read must retain the journal
+			}
+			if relationErr == nil {
+				if _, err := s.push(ctx, p, p.Host, "--no-verify", "origin", p.LandingHead+":refs/heads/"+p.Base); err != nil {
+					return p, refused("the journaled push to %s did not go as a fast-forward: %v", p.Base, err)
+				}
+				return s.finishLanding(ctx, p)
+			}
+			// Publication is known, but the default branch moved. Its receipt
+			// now leases the next checked rebase; the reviewed head stays p.Head.
 		}
 		if _, err := s.git(ctx, p.Host, "reset", "--hard", p.Head); err != nil {
 			return p, err
@@ -842,8 +887,7 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	case p.Check == nil:
 		return p, refused("case %s's package has no check", caseID)
 	}
-	c, err := s.working(ctx, caseID)
-	if err != nil {
+	if _, err := s.working(ctx, caseID); err != nil {
 		return p, err
 	}
 	if head, err := s.git(ctx, p.Host, "rev-parse", "HEAD"); err != nil || strings.TrimSpace(head) != p.Head {
@@ -865,7 +909,7 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	basePush := false
 	complete := false
 	defer func() {
-		if complete || basePush {
+		if complete || basePush || p.LandingHead != "" {
 			return
 		}
 		if _, err := s.git(context.Background(), p.Host, "reset", "--hard", p.Head); err != nil {
@@ -914,6 +958,9 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	}
 	if head != p.Head { // the pull request's head is what reaches the base, so GitHub marks it merged
 		if err := s.publish(ctx, &p, head); err != nil {
+			if !errors.Is(err, errPublicationUncertain) {
+				p.LandingHead, p.Landed = "", nil // the remote was read and the push was not accepted: the reviewed head comes back
+			}
 			return p, err
 		}
 	}
@@ -921,16 +968,27 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	if _, err := s.push(ctx, p, p.Host, "--no-verify", "origin", head+":refs/heads/"+p.Base); err != nil {
 		return p, refused("the push to %s did not go as a fast-forward: %v", p.Base, err)
 	}
-	s.push(ctx, p, p.Host, "--no-verify", "--quiet", "origin", "--delete", p.Branch)
-	p.Landed, p.Head = strings.Fields(commits), head
-	p.State, p.LandedAt = Landed, s.now()
 	complete = true
+	return s.finishLanding(ctx, p)
+}
+
+func (s *Ship) finishLanding(ctx context.Context, p Package) (Package, error) {
+	p.Head, p.State, p.LandedAt = p.LandingHead, Landed, s.now()
 	if err := s.save(&p); err != nil {
 		return p, err
 	}
 	what := fmt.Sprintf("%s: %s", p.PR, p.Title)
-	if _, err := s.Store.DeployCase(ctx, c.ID, s.pkgDir(caseID), p.LandedAt, what, s.Actor); err != nil {
+	if _, err := s.Store.DeployCase(ctx, p.Case, s.pkgDir(p.Case), p.LandedAt, what, s.Actor); err != nil {
 		return p, err
+	}
+	_, cleanupErr := s.push(ctx, p, p.Host, "--no-verify", "--quiet",
+		"--force-with-lease=refs/heads/"+p.Branch+":"+p.LandingHead, "origin", "--delete", p.Branch)
+	if cleanupErr != nil {
+		p.Cleanup = "proposal branch cleanup refused: " + cleanupErr.Error()
+		if err := s.save(&p); err != nil {
+			return p, err
+		}
+		return p, refused("%s", p.Cleanup)
 	}
 	return p, nil
 }
@@ -1241,7 +1299,7 @@ func CheckGitConfig(ctx context.Context, dir string) error {
 }
 
 // writeTest refuses links in the base export. Root confines the write even if a component changes.
-func writeTest(dir, name string, data []byte) error {
+func writeTest(dir, name string, data []byte, mode os.FileMode) error {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return err
@@ -1263,12 +1321,12 @@ func writeTest(dir, name string, data []byte) error {
 			}
 		}
 	}
-	f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		return err
 	}
 	_, err = f.Write(data)
-	return errors.Join(err, f.Close())
+	return errors.Join(err, f.Chmod(mode), f.Close())
 }
 
 // push checks the actual work tree's destinations and current authority immediately before every push.

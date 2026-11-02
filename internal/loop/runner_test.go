@@ -24,7 +24,7 @@ func fakeAgent(t *testing.T, result string) []string {
 	p := script(t, dir, "agent", `printf '%s\n' "$@" > "`+filepath.Join(dir, "args")+`"
 env > "`+filepath.Join(dir, "env")+`"
 echo '{"type":"system","subtype":"init"}'
-echo '`+result+`'`)
+`+modelResult(result))
 	return []string{p}
 }
 
@@ -118,7 +118,7 @@ func TestTheLoopTakesEachFamilysCaseOneStep(t *testing.T) {
 		t.Fatalf("the case's cost %+v", got.Cost)
 	}
 	runs, _ := st.LoopRuns(ctx, store.RunFilter{})
-	if len(runs) != 1 || runs[0].Case != big.ID || runs[0].Summary != "investigated: looked at it" || runs[0].Turns != 4 {
+	if len(runs) != 1 || runs[0].Case != big.ID || !strings.HasPrefix(runs[0].Summary, "investigated: looked at it") || runs[0].Turns != 4 {
 		t.Fatalf("runs %+v", runs)
 	}
 	if _, err := st.UpdateCase(ctx, small.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "test"); err != nil {
@@ -284,7 +284,7 @@ func TestARunsResultSaysHowItEnded(t *testing.T) {
 func TestASafeguardsRefusalFallsBack(t *testing.T) {
 	dir := t.TempDir()
 	refused := `{"type":"result","subtype":"success","is_error":true,"num_turns":1,"total_cost_usd":0.25,"result":"the safeguards blocked it"}`
-	p := script(t, dir, "agent", `case "$*" in *"--model model-a"*) echo '`+refused+`' ;; *) echo '`+okResult+`' ;; esac`)
+	p := script(t, dir, "agent", `case "$*" in *"--model model-a"*) `+modelResult(refused)+` ;; *) `+modelResult(okResult)+` ;; esac`)
 	a := testJail(t, Agent{Runner: []string{p}, Model: "model-a", Fallback: "model-b"})
 	res, err := a.RunOrFallback(context.Background(), Invocation{Dir: filepath.Join(t.TempDir(), "run"), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Minute})
 	if err != nil || res.Status != store.RunOK || res.Model != "model-b" || res.USD != 1 {
@@ -350,7 +350,7 @@ func TestARunsProcessesEndWithIt(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "survived")
 	p := script(t, dir, "agent", `setsid sh -c 'sleep 3; touch "`+marker+`"' > /dev/null 2>&1 < /dev/null &
-echo '`+okResult+`'`)
+`+modelResult(okResult))
 	a := testJail(t, Agent{Runner: []string{p}, Model: "m"})
 	res, err := a.Run(context.Background(), Invocation{Dir: filepath.Join(t.TempDir(), "run-"+newRunID(time.Now())), Schema: runSchema, MaxTurns: 3,
 		BudgetUSD: 1, Timeout: time.Minute})
@@ -504,7 +504,7 @@ func TestAStaleRunCountsItsBudgetAndARefusalFallsBack(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	refused := `{"type":"result","subtype":"success","is_error":true,"num_turns":1,"total_cost_usd":0.25,"result":"the safeguards blocked it"}`
-	p := script(t, dir, "agent", `case "$*" in *"--model model-x"*) echo '`+refused+`' ;; *) echo '`+okResult+`' ;; esac`)
+	p := script(t, dir, "agent", `case "$*" in *"--model model-x"*) `+modelResult(refused)+` ;; *) `+modelResult(okResult)+` ;; esac`)
 	r := runnerFor(t, st, []string{p})
 	r.Agent.Fallback = "model-y"
 	c := openCase(t, st, "failures", "a", 2)
@@ -526,7 +526,7 @@ func TestAStaleRunCountsItsBudgetAndARefusalFallsBack(t *testing.T) {
 func TestAPickThatFailsWaitsForTheRunsItStarted(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	slow := script(t, t.TempDir(), "agent", "sleep 1\necho '{\"type\":\"system\",\"subtype\":\"init\"}'\necho '"+okResult+"'")
+	slow := script(t, t.TempDir(), "agent", "sleep 1\necho '{\"type\":\"system\",\"subtype\":\"init\"}'\n"+modelResult(okResult))
 	r := runnerFor(t, st, []string{slow})
 	openCase(t, st, "failures", "a", 1)
 	broken := openCase(t, st, "owner-burden", "b", 1)

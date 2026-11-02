@@ -121,6 +121,8 @@ type relay struct {
 	wg                            sync.WaitGroup
 	closed                        bool
 	stop                          sync.Once
+	reports                       []json.RawMessage
+	modelRefused                  bool
 }
 
 const relayBodyLimit = 8 << 20
@@ -202,7 +204,7 @@ func newRelay(target *url.URL, budget float64, transport http.RoundTripper) *rel
 		ModifyResponse: func(resp *http.Response) error {
 			if c, ok := resp.Request.Context().Value(relayChargeKey{}).(*relayCharge); ok {
 				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-					c.parser.bad = true
+					c.parser.bad, c.parser.errorResponse = true, true
 				}
 				resp.Body = &usageBody{ReadCloser: resp.Body, parser: c.parser}
 			}
@@ -270,15 +272,17 @@ func newRelay(target *url.URL, budget float64, transport http.RoundTripper) *rel
 				}
 				output = *input.MaxTokens
 			}
-			reserve := (float64(output)*rate.output + float64(len(body))*rate.input/4) / 1e6
+			// One input token per two body bytes covers dense input conservatively.
+			// Price every input token as a one-hour cache write when that costs more:
+			// the peer controls caching, so the ordinary input rate is no upper bound.
+			reserve := (float64(output)*rate.output + float64((len(body)+1)/2)*max(rate.input, rate.write1)) / 1e6
 			r.mu.Lock()
 			left := r.allowance - r.spent - r.reserved
-			if left <= 1e-12 {
+			if reserve > left {
 				r.mu.Unlock()
-				r.refuse(w, "run dollar allowance exhausted", 429)
+				r.refuse(w, "request maximum charge exceeds the remaining run dollar allowance", 429)
 				return
 			}
-			reserve = min(reserve, left)
 			r.reserved += reserve
 			r.admittedN++
 			r.mu.Unlock()
@@ -292,6 +296,10 @@ func newRelay(target *url.URL, budget float64, transport http.RoundTripper) *rel
 				r.reserved -= reserve
 				r.spent += cost
 				r.chargedN++
+				r.modelRefused = r.modelRefused || c.parser.refused
+				if ok {
+					r.reports = append(r.reports, c.parser.reports...)
+				}
 				r.mu.Unlock()
 			}()
 			req = req.WithContext(context.WithValue(req.Context(), relayChargeKey{}, c))
@@ -301,6 +309,13 @@ func newRelay(target *url.URL, budget float64, transport http.RoundTripper) *rel
 		proxy.ServeHTTP(w, req)
 	}), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second}
 	return r
+}
+
+// reportsObserved returns only inputs the host saw the model emit.
+func (r *relay) reportsObserved() ([]json.RawMessage, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]json.RawMessage(nil), r.reports...), r.modelRefused
 }
 
 // admit says why the relay refuses a request, or "": under the relay's own path, a POST to a Claude model on a

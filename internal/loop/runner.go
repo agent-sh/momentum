@@ -92,7 +92,9 @@ func (r *Runner) now() time.Time {
 
 func (r *Runner) logf(format string, args ...any) {
 	if r.Log != nil {
-		r.Log(format, args...)
+		if clean, err := Redact(context.Background(), fmt.Sprintf(format, args...)); err == nil {
+			r.Log("%s", clean)
+		}
 	}
 }
 
@@ -432,7 +434,7 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 	}
 	run.Ended = r.now()
 	if err != nil {
-		run.Status, run.Failure = store.RunFailed, err.Error()
+		run.Status, run.Failure, run.Summary = store.RunFailed, "run", err.Error()
 	} else {
 		run.Status, run.Failure, run.USD, run.Tokens, run.Turns = res.Status, res.Failure, res.USD, res.Tokens, res.Turns
 		run.Model = firstOf(res.Model, run.Model)
@@ -461,21 +463,38 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 		run.USD = reserved // what it spent is unknown: its whole budget
 	}
 	run.USD = max(run.USD, res.RelayUSD)
+	// Summaries and printable diagnostics are generated text. Failure is a
+	// normalized key, kept separate so cleaning cannot change the stop rule.
+	clean, cleanErr := Redact(ctx, run.Summary)
+	if cleanErr != nil {
+		run.Summary = "(summary withheld: the cleaner failed)"
+		run.Status, run.Failure = store.RunFailed, "scrub"
+	} else {
+		run.Summary = clean
+	}
+	root := ""
+	if err == nil && run.Status == store.RunOK && run.Step != StepReview {
+		var report struct {
+			Root string `json:"root"`
+		}
+		if json.Unmarshal(res.Report, &report) == nil && strings.HasPrefix(report.Root, "root:") {
+			root, cleanErr = Redact(ctx, report.Root)
+			if cleanErr != nil || !strings.HasPrefix(root, "root:") {
+				root, run.Summary = "", "(reported root withheld: the cleaner failed)"
+				run.Status, run.Failure = store.RunFailed, "scrub"
+			}
+		}
+	}
 	if err := r.Store.FinishLoopRun(ctx, *run); err != nil {
 		r.logf("record run %s: %v", run.ID, err)
 		return
 	}
 	// A report cannot choose another case to change. Its root is applied to this run's case, after it ends.
-	if err == nil && res.Status == store.RunOK && run.Step != StepReview {
-		var report struct {
-			Root string `json:"root"`
-		}
-		if json.Unmarshal(res.Report, &report) == nil && strings.HasPrefix(report.Root, "root:") {
-			if own, recorded, err := r.Store.RecordRoot(ctx, run.Case, report.Root, "loop"); err != nil {
-				r.logf("record root of %s: %v", run.Case, err)
-			} else if !recorded {
-				r.logf("root of %s ignored: its case went into %s", run.Case, own.Into)
-			}
+	if root != "" {
+		if own, recorded, err := r.Store.RecordRoot(ctx, run.Case, root, "loop"); err != nil {
+			r.logf("record root of %s: %v", run.Case, err)
+		} else if !recorded {
+			r.logf("root of %s ignored: its case went into %s", run.Case, own.Into)
 		}
 	}
 }
@@ -623,9 +642,13 @@ func (r *Runner) reviews(ctx context.Context, only string, families ...string) [
 			}
 		}
 		if p.Clean() {
-			if _, err := r.Ship.Land(ctx, c.ID); err != nil {
+			if landed, err := r.Ship.Land(ctx, c.ID); err != nil {
 				out = append(out, Done{Family: c.Family, Case: c.ID, Step: "land", Skipped: err.Error()})
-				r.Store.CaseNote(ctx, c.ID, "not landed", err.Error(), "loop")
+				action := "not landed"
+				if landed.State == Landed && landed.Cleanup != "" {
+					action = "cleanup refused"
+				}
+				r.Store.CaseNote(store.WithTextCleaner(ctx, Redact), c.ID, action, err.Error(), "loop")
 			} else {
 				out = append(out, Done{Family: c.Family, Case: c.ID, Step: "land"})
 			}
@@ -665,13 +688,13 @@ func (r *Runner) review(ctx context.Context, c store.Case, p Package, run store.
 		if json.Unmarshal(res.Report, &rep) != nil || rep.Summary == nil || rep.Findings == nil {
 			res.Status, res.Failure = store.RunFailed, "an unreadable review"
 		} else if h, m, l, cerr := countFindings(*rep.Findings); cerr != nil {
-			res.Status, res.Failure = store.RunFailed, cerr.Error()
+			res.Status, res.Failure = store.RunFailed, "report"
 		} else {
 			text := reviewText(len(p.Reviews)+1, h, m, l, *rep.Summary, *rep.Findings)
 			rev := Review{Findings: *rep.Findings, Text: text}
 			saved, saveErr := r.Ship.Reviewed(ctx, c.ID, rev)
 			if saveErr != nil {
-				res.Status, res.Failure = store.RunFailed, saveErr.Error()
+				res.Status, res.Failure = store.RunFailed, "review"
 			} else if _, postErr := r.postReview(ctx, saved); postErr != nil {
 				r.logf("post the review of %s: %v", c.ID, postErr)
 			}

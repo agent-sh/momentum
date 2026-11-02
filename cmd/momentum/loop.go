@@ -336,29 +336,47 @@ func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	done, err := r.Once(ctx, loop.Options{Dry: *dry, Families: fams, Case: *only})
 	enc := json.NewEncoder(stdout)
 	for _, d := range done {
-		printDone(stdout, enc, d, *asJSON)
+		if printErr := printDone(stdout, enc, d, *asJSON); printErr != nil {
+			return printErr
+		}
 	}
 	return err
 }
 
 // printDone prints one step the loop took, or why it took none: a line, or an object with --json. What the run's relay
 // refused comes after the line, apart from the failure the stop rule compares.
-func printDone(stdout io.Writer, enc *json.Encoder, d loop.Done, asJSON bool) {
+func printDone(stdout io.Writer, enc *json.Encoder, d loop.Done, asJSON bool) error {
+	// Clean fields separately so a cleaner cannot break JSON escaping or keys.
+	for _, text := range []*string{&d.Run.Summary, &d.Skipped, &d.Run.Failure} {
+		clean, err := loop.Redact(context.Background(), *text)
+		if err != nil {
+			return err
+		}
+		*text = clean
+	}
+	d.Refused = append([]string(nil), d.Refused...)
+	for i := range d.Refused {
+		clean, err := loop.Redact(context.Background(), d.Refused[i])
+		if err != nil {
+			return err
+		}
+		d.Refused[i] = clean
+	}
 	if asJSON {
-		enc.Encode(map[string]any{"family": d.Family, "case": d.Case, "step": d.Step, "run": d.Run.ID, "status": d.Run.Status,
+		return enc.Encode(map[string]any{"family": d.Family, "case": d.Case, "step": d.Step, "run": d.Run.ID, "status": d.Run.Status,
 			"failure": d.Run.Failure, "usd": d.Run.USD, "summary": d.Run.Summary, "skipped": d.Skipped, "relay_refused": d.Refused})
-		return
 	}
 	if d.Skipped != "" {
-		fmt.Fprintf(stdout, "%-14s %-10s %s\n", d.Family, firstText(d.Case, "-"), d.Skipped)
-		return
+		_, err := fmt.Fprintf(stdout, "%-14s %-10s %s\n", d.Family, firstText(d.Case, "-"), d.Skipped)
+		return err
 	}
 	line := fmt.Sprintf("%-14s %-10s %s %s: %s $%.2f %s", d.Family, d.Case, d.Step, d.Run.ID, d.Run.Status, d.Run.USD,
 		firstText(d.Run.Failure, d.Run.Summary))
 	if len(d.Refused) > 0 {
 		line += " (the relay refused " + strings.Join(d.Refused, "; ") + ")"
 	}
-	fmt.Fprintln(stdout, line)
+	_, err := fmt.Fprintln(stdout, line)
+	return err
 }
 
 // lockLoop takes the loop's lock beside the store: one loop at a time, since runs of two would pick the same
@@ -415,6 +433,15 @@ func loopRuns(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 	enc := json.NewEncoder(stdout)
 	for _, r := range runs {
+		// Older rows can predate summary cleaning. Clean the display copy only;
+		// the stored failure key remains the stop rule's own.
+		for _, text := range []*string{&r.Summary, &r.Failure} {
+			clean, err := loop.Redact(ctx, *text)
+			if err != nil {
+				return err
+			}
+			*text = clean
+		}
 		if *asJSON {
 			if err := enc.Encode(r); err != nil {
 				return err

@@ -1,6 +1,7 @@
 package loop
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -29,16 +30,66 @@ func (u relayUsage) valid() bool {
 }
 
 // usageParser receives unchanged wire bytes a piece at a time. It keeps one bounded
-// frame, or a bounded non-streaming response, and requires complete final usage.
+// frame, bounded report inputs, or a bounded non-streaming response, and requires
+// complete final usage.
 type usageParser struct {
-	stream                 bool
-	buf                    []byte
-	want                   int
-	bad, eof, start, final bool
-	usage                  relayUsage
+	stream                    bool
+	buf                       []byte
+	want                      int
+	bad, eof, start, final    bool
+	usage                     relayUsage
+	blocks                    map[int]*reportBlock
+	reports                   []json.RawMessage
+	reportBytes, pendingBytes int
+	refused                   bool
+	errorResponse, errorOver  bool
+}
+
+type reportBlock struct {
+	input json.RawMessage
+	delta []byte
+}
+
+// Canonical object JSON preserves number precision and ignores key order and whitespace.
+func canonicalReport(raw []byte) (json.RawMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var value map[string]any
+	if err := dec.Decode(&value); err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, io.ErrUnexpectedEOF
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return json.Marshal(value)
+}
+
+func (p *usageParser) report(raw []byte) {
+	canonical, err := canonicalReport(raw)
+	if err != nil || p.reportBytes+len(canonical) > relayBodyLimit {
+		p.bad = true
+		return
+	}
+	p.reportBytes += len(canonical)
+	p.reports = append(p.reports, canonical)
 }
 
 func (p *usageParser) feed(b []byte) {
+	if p.errorResponse {
+		if p.errorOver {
+			return
+		}
+		if len(p.buf)+len(b) > relayBodyLimit {
+			p.errorOver, p.buf = true, nil
+			return
+		}
+		p.buf = append(p.buf, b...)
+		return
+	}
 	if p.bad {
 		return
 	}
@@ -99,6 +150,17 @@ func (p *usageParser) feed(b []byte) {
 		}
 		var e struct {
 			Type    string `json:"type"`
+			Index   int    `json:"index"`
+			Content struct {
+				Type  string          `json:"type"`
+				Name  string          `json:"name"`
+				Input json.RawMessage `json:"input"`
+			} `json:"content_block"`
+			Delta struct {
+				Type       string `json:"type"`
+				Partial    string `json:"partial_json"`
+				StopReason string `json:"stop_reason"`
+			} `json:"delta"`
 			Message struct {
 				Usage relayUsage `json:"usage"`
 			} `json:"message"`
@@ -122,6 +184,38 @@ func (p *usageParser) feed(b []byte) {
 			} else {
 				p.usage.Output, p.final = e.Usage.Output, true
 			}
+			p.refused = p.refused || e.Delta.StopReason == "refusal"
+		case "content_block_start":
+			if e.Content.Type == "tool_use" && e.Content.Name == "StructuredOutput" {
+				if p.blocks == nil {
+					p.blocks = make(map[int]*reportBlock)
+				}
+				if !p.start || len(e.Content.Input) == 0 || p.blocks[e.Index] != nil || p.reportBytes+p.pendingBytes+len(e.Content.Input) > relayBodyLimit {
+					p.bad = true
+				} else {
+					p.blocks[e.Index] = &reportBlock{input: e.Content.Input}
+					p.pendingBytes += len(e.Content.Input)
+				}
+			}
+		case "content_block_delta":
+			if block := p.blocks[e.Index]; block != nil && e.Delta.Type == "input_json_delta" {
+				if p.reportBytes+p.pendingBytes+len(e.Delta.Partial) > relayBodyLimit {
+					p.bad = true
+				} else {
+					block.delta = append(block.delta, e.Delta.Partial...)
+					p.pendingBytes += len(e.Delta.Partial)
+				}
+			}
+		case "content_block_stop":
+			if block := p.blocks[e.Index]; block != nil {
+				raw := block.input
+				if len(block.delta) > 0 {
+					raw = block.delta
+				}
+				p.pendingBytes -= len(block.input) + len(block.delta)
+				p.report(raw)
+				delete(p.blocks, e.Index)
+			}
 		}
 		p.buf, p.want = p.buf[:0], 0
 		if p.bad {
@@ -132,21 +226,47 @@ func (p *usageParser) feed(b []byte) {
 }
 
 func (p *usageParser) cost(r relayRate) (float64, bool) {
+	if p.errorResponse && p.eof && !p.errorOver {
+		var response struct {
+			Message string `json:"message"`
+			Error   struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(p.buf, &response) == nil {
+			p.refused = errorKind(firstOf(response.Error.Message, response.Message)) == "the model's safeguards"
+		}
+	}
 	if p.bad || !p.eof {
 		return 0, false
 	}
 	if p.stream {
-		if len(p.buf) != 0 || !p.start || !p.final {
+		if len(p.buf) != 0 || !p.start || !p.final || len(p.blocks) != 0 {
 			return 0, false
 		}
 	} else {
 		var m struct {
-			Usage relayUsage `json:"usage"`
+			Usage      relayUsage `json:"usage"`
+			StopReason string     `json:"stop_reason"`
+			Content    []struct {
+				Type  string          `json:"type"`
+				Name  string          `json:"name"`
+				Input json.RawMessage `json:"input"`
+			} `json:"content"`
 		}
 		if json.Unmarshal(p.buf, &m) != nil || !m.Usage.valid() {
 			return 0, false
 		}
 		p.usage = m.Usage
+		p.refused = m.StopReason == "refusal"
+		for _, block := range m.Content {
+			if block.Type == "tool_use" && block.Name == "StructuredOutput" {
+				p.report(block.Input)
+			}
+		}
+		if p.bad {
+			return 0, false
+		}
 	}
 	u := p.usage
 	return (float64(*u.Input)*r.input + float64(*u.Output)*r.output +

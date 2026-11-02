@@ -265,6 +265,15 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	}
 	res, perr := readStream(transcript)
 	res.Duration, res.Transcript, res.Model = time.Since(start), transcript, firstOf(res.Model, a.Model)
+	route.close()
+	res.Refused = route.refusals()
+	res.RelayUSD, res.RelayAdmitted, res.RelayRefused, res.RelayCharged = route.accounting()
+	reports, refusal := route.reportsObserved()
+	hadReport := len(res.Report) > 0
+	authenticateReport(&res, reports, refusal)
+	res.Turns, res.TurnsKnown = res.RelayAdmitted, true
+	// Timeout, cancellation, archive limits and process exit are host observations.
+	// No stream record can overrule them, even an authenticated report.
 	switch {
 	case timedOut:
 		res.Status, res.Failure = store.RunTimeout, "timeout"
@@ -272,18 +281,37 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 		res.Status, res.Failure = store.RunFailed, "stopped"
 	case stream.over || diag.over:
 		res.Status, res.Failure = store.RunFailed, "stream limit"
-	case waitErr != nil && perr == nil && res.Status == store.RunOK:
+	case waitErr != nil && !refusal:
+		res.Status = store.RunOK // reconcileExit installs the host's exit key
 		reconcileExit(&res, waitErr)
-	case perr != nil:
-		res.Status, res.Failure = store.RunFailed, "no result: "+perr.Error()
-		if waitErr != nil {
-			res.Failure = fmt.Sprintf("exit %v: %s", waitErr, lastLine(filepath.Join(HostDir(inv.Dir), errName)))
+	case perr != nil && res.Status == store.RunOK:
+		res.Status, res.Failure = store.RunFailed, "stream"
+	case !hadReport && res.Failure == "report" && inv.MaxTurns > 0 && res.RelayAdmitted >= inv.MaxTurns:
+		res.Status, res.Failure = store.RunTurns, "turns"
+	}
+	return res, nil
+}
+
+func authenticateReport(res *Result, reports []json.RawMessage, refusal bool) {
+	res.Text = "" // stdout text has no authenticated producer
+	if refusal {
+		res.Report = nil
+		res.Status, res.Failure = store.RunFailed, "the model's safeguards"
+		return
+	}
+	candidate, err := canonicalReport(res.Report)
+	if err == nil {
+		// Prefer the last matching model input; any input it emitted is admissible.
+		for i := len(reports) - 1; i >= 0; i-- {
+			if bytes.Equal(candidate, reports[i]) {
+				res.Report = append(json.RawMessage(nil), reports[i]...)
+				res.Status, res.Failure = store.RunOK, ""
+				return
+			}
 		}
 	}
-	route.close()
-	res.Refused = route.refusals()
-	res.RelayUSD, res.RelayAdmitted, res.RelayRefused, res.RelayCharged = route.accounting()
-	return res, nil
+	res.Report = nil
+	res.Status, res.Failure = store.RunFailed, "report"
 }
 
 func reconcileExit(res *Result, waitErr error) {

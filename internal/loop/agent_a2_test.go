@@ -19,7 +19,7 @@ func TestRunCannotReplaceItsTrustedTranscript(t *testing.T) {
 			if attack == "link" {
 				plant = `ln -s /fixture/absent transcript.jsonl`
 			}
-			harness := script(t, progDir, "harness", plant+"\necho '"+okResult+"'\nexit 7")
+			harness := script(t, progDir, "harness", plant+"\n"+modelResult(okResult)+"\nexit 7")
 			a := testJail(t, Agent{Runner: []string{harness}, Model: "global.anthropic.claude-opus-5-5"})
 			dir := filepath.Join(t.TempDir(), "run")
 			res, err := a.Run(context.Background(), Invocation{Dir: dir, System: "marker-7f3a", Schema: runSchema, MaxTurns: 5, BudgetUSD: 1, Timeout: time.Minute})
@@ -49,10 +49,10 @@ while [ "$#" -gt 0 ]; do
 done
 if [ "$model" = "global.anthropic.claude-opus-5-5" ]; then
  ln -s '`+canary+`' '`+name+`'
- echo '{"type":"result","subtype":"success","is_error":true,"result":"API error: safeguards","total_cost_usd":0.1,"num_turns":1}'
+ `+modelResult(`{"type":"result","subtype":"success","is_error":true,"result":"API error: safeguards","total_cost_usd":0.1,"num_turns":1}`)+`
 else
  test "$(cat /run/momentum/input/system.md)" = "marker-7f3a" || exit 9
- echo '`+okResult+`'
+ `+modelResult(okResult)+`
 fi`)
 			a := testJail(t, Agent{Runner: []string{harness}, Model: "global.anthropic.claude-opus-5-5", Fallback: "global.anthropic.claude-sonnet-5-5"})
 			dir := filepath.Join(t.TempDir(), "run")

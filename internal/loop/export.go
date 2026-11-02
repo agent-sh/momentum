@@ -90,11 +90,17 @@ func extractTree(dir string, reader *tar.Reader) error {
 		case tar.TypeDir:
 			err = root.Mkdir(name, 0700)
 		case tar.TypeReg:
+			// Git regular blobs have only these two modes. Match the baseline
+			// copy, independent of the caller's umask or archive permission bits.
+			mode := os.FileMode(0o644)
+			if h.Mode&0100 != 0 {
+				mode = 0o755
+			}
 			var f *os.File
-			f, err = root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, os.FileMode(h.Mode)&0777)
+			f, err = root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
 			if err == nil {
 				_, err = io.Copy(f, reader)
-				err = errors.Join(err, f.Close())
+				err = errors.Join(err, f.Chmod(mode), f.Close())
 			}
 		case tar.TypeSymlink:
 			// Existing base symlinks are exported as links. Patches cannot add or change them.

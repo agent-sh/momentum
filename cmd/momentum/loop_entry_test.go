@@ -402,6 +402,7 @@ func TestADryLoopRefusesJournalDataWithoutChangingIt(t *testing.T) {
 // What a run's relay refused is printed after the line of its step, and is a field of the JSON, apart from the
 // failure the stop rule compares.
 func TestTheLoopPrintsWhatTheRelayRefusedApartFromTheFailure(t *testing.T) {
+	fakeScrubber(t)
 	d := loop.Done{Family: "failures", Case: "c1", Step: "build", Run: store.LoopRun{ID: "r1", Status: store.RunFailed, Failure: "the model's safeguards", USD: 1.5},
 		Refused: []string{`model "x" is no Claude model`}}
 	var out bytes.Buffer

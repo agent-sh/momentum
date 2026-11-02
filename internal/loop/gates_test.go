@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/jail"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -137,9 +138,10 @@ while [ "$#" -gt 0 ]; do
  case "$1" in --model) model="$2"; shift;; --max-budget-usd) budget="$2"; shift;; --max-turns) turns="$2"; shift;; esac
  shift
 done
-if [ "$model" = "primary" ]; then echo '`+primary+`'; else
+if [ "$model" = "primary" ]; then `+modelResult(primary)+`; else
  printf '%s %s\n' "$budget" "$turns" > '`+argsFile+`'
- printf '{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":%s,"structured_output":{"summary":"ok"}}\n' "$budget"
+ result=$(printf '{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":%s,"structured_output":{"summary":"ok"}}' "$budget")
+ GORACE=atexit_sleep_ms=0 `+jail.BinDir+`/momentum fixture-model-result "$result"
 fi`)
 			r := runnerFor(t, st, []string{fake})
 			r.Agent.Model, r.Agent.Fallback = "primary", "fallback"
@@ -171,7 +173,7 @@ fi`)
 	// a fresh 5 s even with the second added.
 	t.Run("deadline", func(t *testing.T) {
 		dir := t.TempDir()
-		fake := script(t, dir, "fixture", `case "$*" in *"--model primary"*) sleep 3; echo '{"type":"result","subtype":"success","is_error":true,"num_turns":1,"total_cost_usd":1,"result":"safeguards"}' ;; *) sleep 3; echo '`+okResult+`' ;; esac`)
+		fake := script(t, dir, "fixture", `case "$*" in *"--model primary"*) sleep 3; `+modelResult(`{"type":"result","subtype":"success","is_error":true,"num_turns":1,"total_cost_usd":1,"result":"safeguards"}`)+` ;; *) sleep 3; `+modelResult(okResult)+` ;; esac`)
 		res, err := testJail(t, Agent{Runner: []string{fake}, Model: "primary", Fallback: "fallback"}).RunOrFallback(context.Background(), Invocation{Dir: filepath.Join(t.TempDir(), "run"), BudgetUSD: 4, MaxTurns: 10, Timeout: 5 * time.Second})
 		if err != nil || res.Status != store.RunTimeout || res.USD != 4 || res.Model != "fallback" {
 			t.Fatalf("fallback restarted time or lost unknown cost: %+v %v", res, err)
@@ -667,7 +669,11 @@ func TestAReviewWithoutItsFindingsIsNoReview(t *testing.T) {
 		r.Ship.Gate = reviewGate(t)
 		done := r.reviews(ctx, "")
 		p, _, _ := r.Ship.Load(c.ID)
-		if len(done) != 1 || done[0].Run.Status != store.RunFailed || done[0].Run.Failure != "an unreadable review" || len(p.Reviews) != 0 {
+		failure := "an unreadable review"
+		if out == "null" {
+			failure = "report"
+		}
+		if len(done) != 1 || done[0].Run.Status != store.RunFailed || done[0].Run.Failure != failure || len(p.Reviews) != 0 {
 			t.Fatalf("%s: %+v %+v", out, done, p.Reviews)
 		}
 	}

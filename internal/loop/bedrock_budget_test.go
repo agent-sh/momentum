@@ -117,7 +117,7 @@ func TestRelayChargesReservationWhenUsageIsUnparseable(t *testing.T) {
 			r := budgetRelay(t, 1, func(req *http.Request) (*http.Response, error) { return brokerResponse(req, wire), nil })
 			relayRequest(r, strings.NewReader(body), "invoke-with-response-stream")
 			cost, _, _, charged := r.accounting()
-			want := .02 + float64(len(body))*4/4/1e6
+			want := .02 + float64((len(body)+1)/2)*8/1e6
 			if math.Abs(cost-want) > 1e-10 || charged != 1 {
 				t.Fatalf("uncertain request charged %f, want %f", cost, want)
 			}
