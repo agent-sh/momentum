@@ -313,16 +313,21 @@ func TestTheSandboxHoldsNoSocketOrVariableOfTheCallers(t *testing.T) {
 	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path="+bus)
 	t.Setenv("SSH_AUTH_SOCK", agent)
 	t.Setenv("PRIVATE_SETTING", marker)
-	script := fmt.Sprintf(`env; echo '== run time directory'; ls -A %[1]q 2>&1; echo '== sockets'; for p in %[2]q %[3]q; do test -S $p && echo "socket $p" || echo "no socket $p"; done; echo '== run'; ls -A /run`,
-		rt, bus, agent)
-	if out := outside(script); !strings.Contains(out, "socket "+bus) || !strings.Contains(out, "SSH_AUTH_SOCK=") {
+	// The variables are listed by name and never by value: the shell that runs this has the caller's own environment
+	// in it, and a failure message must not carry one. The synthetic value is looked for by a count.
+	script := fmt.Sprintf(`env | sed -n -E 's/^([A-Za-z_][A-Za-z0-9_]*)=.*/\1=/p'; echo '== value'; env | grep -c -F -- %[4]q; echo '== run time directory'; ls -A %[1]q 2>&1; echo '== sockets'; for p in %[2]q %[3]q; do test -S $p && echo "socket $p" || echo "no socket $p"; done; echo '== run'; ls -A /run`,
+		rt, bus, agent, marker)
+	if out := outside(script); !strings.Contains(out, "socket "+bus) || !strings.Contains(out, "SSH_AUTH_SOCK=") || !strings.Contains(out, "== value\n1\n") {
 		t.Fatalf("outside the sandbox the sockets and the variables are there: %s", out)
 	}
 	out, err := run(t, s, script)
 	if err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	for _, w := range []string{"DBUS_SESSION_BUS_ADDRESS", "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR", "PRIVATE_SETTING", marker, "socket " + bus, "socket " + agent} {
+	if !strings.Contains(out, "== value\n0\n") {
+		t.Fatalf("a variable of the caller's value is in the sandbox's environment:\n%s", out)
+	}
+	for _, w := range []string{"DBUS_SESSION_BUS_ADDRESS", "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR", "PRIVATE_SETTING", "socket " + bus, "socket " + agent} {
 		if strings.Contains(strings.ReplaceAll(out, "no socket", "none"), w) {
 			t.Fatalf("%q reached the sandbox:\n%s", w, out)
 		}

@@ -22,7 +22,7 @@ func fakeAgent(t *testing.T, result string) []string {
 	t.Helper()
 	dir := t.TempDir()
 	p := script(t, dir, "agent", `printf '%s\n' "$@" > "`+filepath.Join(dir, "args")+`"
-env > "`+filepath.Join(dir, "env")+`"
+`+maskedEnv("MOMENTUM_LOOP_CASE", "MOMENTUM_DOOR", "CLAUDE_CONFIG_DIR")+` > "`+filepath.Join(dir, "env")+`"
 echo '{"type":"system","subtype":"init"}'
 `+modelResult(result))
 	return []string{p}
@@ -95,14 +95,15 @@ func TestTheLoopTakesEachFamilysCaseOneStep(t *testing.T) {
 			t.Errorf("an investigation's arguments hold %q:\n%s", not, args)
 		}
 	}
+	// the listing names every variable and holds the values of the three the loop sets
 	for _, want := range []string{"MOMENTUM_LOOP_CASE=" + big.ID, "MOMENTUM_DOOR=/run/momentum/door.sock", "CLAUDE_CONFIG_DIR=" + filepath.Join(done[0].Run.Dir, "claude")} {
 		if !strings.Contains(env, want) {
-			t.Errorf("the agent's environment lacks %q:\n%s", want, env)
+			t.Errorf("the agent's environment lacks the line %q", want)
 		}
 	}
 	for _, not := range []string{"CLAUDE_CODE_PLUGIN_DIRS", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"} {
 		if strings.Contains(env, not) {
-			t.Errorf("the agent's environment holds %q:\n%s", not, env)
+			t.Errorf("the agent's environment holds the variable %s", not)
 		}
 	}
 	system, _ := os.ReadFile(filepath.Join(HostDir(done[0].Run.Dir), "primary", "system.md"))

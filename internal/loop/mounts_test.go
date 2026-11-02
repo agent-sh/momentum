@@ -292,7 +292,7 @@ func TestADoorRunsACommandInTheRunsRootsWithTheLoopsEnvironment(t *testing.T) {
 		}
 	}
 	t.Setenv("ZZ_HOST_ONLY", "marker-7f3a")
-	momentum := script(t, outside, "momentum", `echo "pwd=$PWD"; env`)
+	momentum := script(t, outside, "momentum", `echo "pwd=$PWD"; `+maskedEnv("MOMENTUM_LOOP_RUN", "MOMENTUM_LOOP_CASE", "MOMENTUM_LOOP_DIR", "MOMENTUM_LOOP_READ"))
 	r := &Runner{Momentum: momentum, Budgets: Budgets{RunTime: time.Minute}}
 	door := r.door(StepBuild, store.Case{ID: "c1"}, store.LoopRun{ID: "r1", Dir: runDir}, []string{runDir, work})
 	ask := func(dir string) string {
@@ -307,13 +307,14 @@ func TestADoorRunsACommandInTheRunsRootsWithTheLoopsEnvironment(t *testing.T) {
 			t.Errorf("a command typed in %q ran in:\n%s\nwant %s", dir, got, want)
 		}
 	}
+	// the listing names every variable and holds the values of the loop's own alone
 	env := ask(work)
 	if strings.Contains(env, "ZZ_HOST_ONLY") {
-		t.Errorf("the caller's environment reached the command:\n%s", env)
+		t.Error("the caller's variable ZZ_HOST_ONLY reached the command")
 	}
 	for _, want := range []string{"MOMENTUM_LOOP_RUN=r1\n", "MOMENTUM_LOOP_CASE=c1\n", "MOMENTUM_LOOP_DIR=" + runDir + "\n", "MOMENTUM_LOOP_READ=\n"} {
 		if !strings.Contains(env, want) {
-			t.Errorf("the command's environment lacks %q:\n%s", want, env)
+			t.Errorf("the command's environment lacks the line %q", want)
 		}
 	}
 }
