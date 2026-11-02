@@ -1,2 +1,4 @@
-# go build ./cmd/momentum at the root writes the binary here; build output never enters the repository
+# build output never enters the repository: what go build and go test -c write at the root
 /momentum
+/check
+*.test

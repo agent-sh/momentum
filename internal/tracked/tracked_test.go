@@ -142,6 +142,34 @@ func TestOnlyWhatTheRangeAddsIsRead(t *testing.T) {
 	wantOne(t, check(t, r, "HEAD"), "old/big.txt", "over")
 }
 
+// Every header Executable names is refused: each Mach-O magic (32 and 64 bit, either byte order, one architecture
+// or universal), ELF, PE, WebAssembly and an ar archive.
+func TestEveryHeaderItNamesIsRefused(t *testing.T) {
+	pad := func(b ...byte) []byte { return append(b, make([]byte, 64)...) }
+	pe := make([]byte, 0x80)
+	copy(pe, "MZ")
+	binary.LittleEndian.PutUint32(pe[0x3c:], 0x40)
+	copy(pe[0x40:], "PE\x00\x00")
+	for name, b := range map[string][]byte{
+		"ELF":               pad(0x7f, 'E', 'L', 'F'),
+		"Mach-O 32 BE":      pad(0xfe, 0xed, 0xfa, 0xce),
+		"Mach-O 64 BE":      pad(0xfe, 0xed, 0xfa, 0xcf),
+		"Mach-O 32 LE":      pad(0xce, 0xfa, 0xed, 0xfe),
+		"Mach-O 64 LE":      pad(0xcf, 0xfa, 0xed, 0xfe),
+		"universal":         pad(0xca, 0xfe, 0xba, 0xbe),
+		"universal LE":      pad(0xbe, 0xba, 0xfe, 0xca),
+		"universal 64":      pad(0xca, 0xfe, 0xba, 0xbf),
+		"universal 64 LE":   pad(0xbf, 0xba, 0xfe, 0xca),
+		"PE":                pe,
+		"WebAssembly":       []byte("\x00asm\x01\x00\x00\x00"),
+		"ar archive (a .a)": []byte("!<arch>\n__.PKGDEF        0           0     0     644     0         `\n"),
+	} {
+		if Executable(b) == "" {
+			t.Errorf("%s: not refused", name)
+		}
+	}
+}
+
 func TestExecutableNamesOnlyBinaries(t *testing.T) {
 	for _, b := range [][]byte{nil, []byte("MZ"), []byte("MZ" + strings.Repeat(" ", 100)), []byte("\x7fEL"), []byte("plain text")} {
 		if k := Executable(b); k != "" {

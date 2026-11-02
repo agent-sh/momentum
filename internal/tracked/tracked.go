@@ -20,7 +20,7 @@ const Limit = 1 << 20
 
 // Problem is a file a commit of the range added that the repository does not take.
 type Problem struct {
-	Path string // where the range first has it
+	Path string // a path the range has it at: the newest commit's that holds it
 	Size int64
 	Why  string
 }
@@ -28,8 +28,9 @@ type Problem struct {
 func (p Problem) String() string { return fmt.Sprintf("%s (%d bytes): %s", p.Path, p.Size, p.Why) }
 
 // Check reads every file the commits of revs add, in every commit: revs are git rev-list's arguments, BASE..HEAD
-// for what a pull request or a push adds, HEAD for the whole history. A file is refused when it is over Limit or
-// starts as an executable binary does (Executable).
+// for what a pull request adds, HEAD for the whole history. Every object the range reaches and its base does not
+// goes through one batch read; each blob is refused when it is over Limit or starts as an executable, object or
+// archive file does (Executable).
 func Check(ctx context.Context, dir string, revs ...string) ([]Problem, error) {
 	if len(revs) == 0 {
 		return nil, fmt.Errorf("no revisions to check")
@@ -107,9 +108,10 @@ func Check(ctx context.Context, dir string, revs ...string) ([]Problem, error) {
 	return problems, nil
 }
 
-// Executable names the executable or object format b starts as: ELF, Mach-O (one architecture or several), PE
-// or WebAssembly; "" for anything else. A PE file is told by its PE signature at the offset its MZ header names,
-// so a text that opens with "MZ" is not one.
+// Executable names the executable, object or archive format b starts as: ELF, Mach-O (one architecture or
+// several, 32 or 64 bit, either byte order), PE, WebAssembly, or an ar archive (a static library, a Go package's
+// archive); "" for anything else. A PE file is told by its PE signature at the offset its MZ header names, so a
+// text that opens with "MZ" is not one.
 func Executable(b []byte) string {
 	switch {
 	case bytes.HasPrefix(b, []byte("\x7fELF")):
@@ -117,10 +119,13 @@ func Executable(b []byte) string {
 	case bytes.HasPrefix(b, []byte{0xfe, 0xed, 0xfa, 0xce}), bytes.HasPrefix(b, []byte{0xfe, 0xed, 0xfa, 0xcf}),
 		bytes.HasPrefix(b, []byte{0xce, 0xfa, 0xed, 0xfe}), bytes.HasPrefix(b, []byte{0xcf, 0xfa, 0xed, 0xfe}):
 		return "Mach-O"
-	case bytes.HasPrefix(b, []byte{0xca, 0xfe, 0xba, 0xbe}), bytes.HasPrefix(b, []byte{0xbe, 0xba, 0xfe, 0xca}):
+	case bytes.HasPrefix(b, []byte{0xca, 0xfe, 0xba, 0xbe}), bytes.HasPrefix(b, []byte{0xbe, 0xba, 0xfe, 0xca}),
+		bytes.HasPrefix(b, []byte{0xca, 0xfe, 0xba, 0xbf}), bytes.HasPrefix(b, []byte{0xbf, 0xba, 0xfe, 0xca}):
 		return "Mach-O universal or Java class"
 	case bytes.HasPrefix(b, []byte("\x00asm")):
 		return "WebAssembly"
+	case bytes.HasPrefix(b, []byte("!<arch>\n")):
+		return "ar archive"
 	case bytes.HasPrefix(b, []byte("MZ")) && len(b) >= 0x40:
 		off := int64(binary.LittleEndian.Uint32(b[0x3c:0x40]))
 		if off >= 0x40 && off+4 <= int64(len(b)) && bytes.Equal(b[off:off+4], []byte("PE\x00\x00")) {

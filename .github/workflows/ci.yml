@@ -6,7 +6,9 @@ name: ci
 on:
   push:
     branches: [main]
+  # edited: a pull request whose base changes (a stacked one moved to main) is read again against its new base
   pull_request:
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
@@ -17,7 +19,9 @@ concurrency:
 
 jobs:
   # main keeps every commit of a pull request, so each one is read, not only the head: a file a commit adds and a
-  # later one deletes stays in main's history for good.
+  # later one deletes stays in main's history for good. A pull request reads what it adds to its base; a push to
+  # main reads main's whole history (a fraction of a second), so a push whose run was cancelled or replaced is
+  # read by the next.
   tracked:
     runs-on: ubuntu-24.04
     steps:
@@ -28,12 +32,12 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - name: no file over 1 MiB and no executable binary in any commit
+      - name: no file over 1 MiB and no executable, object or archive file in any commit
         env:
-          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: |
-          if [ -n "$BASE" ] && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
             go run ./internal/tracked/check "$BASE..$HEAD"
           else
             go run ./internal/tracked/check "$HEAD"
@@ -48,7 +52,7 @@ jobs:
           go-version-file: go.mod
       - name: gofmt
         run: |
-          out=$(gofmt -l $(git ls-files '*.go'))
+          out=$(gofmt -l .)
           if [ -n "$out" ]; then echo "not gofmt'd:"; echo "$out"; exit 1; fi
       - name: vet
         run: go vet ./...
