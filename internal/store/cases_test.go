@@ -768,3 +768,32 @@ func TestTheLastRulesOfACasesComeBack(t *testing.T) {
 		t.Fatalf("a comeback on its own evidence: %s back %v", obs, got.Back)
 	}
 }
+
+// Recording a root merges only the original case. Once it went into another case, a later report is a no-op
+// with an explicit result; it neither adds a signature nor merges the holder it never owned.
+func TestRecordRootKeepsTheAssignedCase(t *testing.T) {
+	ctx := context.Background()
+	st := caseStore(t)
+	makeCase := func(sig string) Case {
+		c, _ := observeOK(t, st, Finding{Family: "failures", Signature: sig, Title: sig, Evidence: refsAt(sig, 1, time.Now())})
+		return c
+	}
+	a, b, c := makeCase("a"), makeCase("b"), makeCase("c")
+	for _, v := range []struct{ id, sig string }{{b.ID, "root:b"}, {c.ID, "root:c"}} {
+		if _, recorded, err := st.RecordRoot(ctx, v.id, v.sig, "fixture"); err != nil || !recorded {
+			t.Fatalf("record root: %v %v", recorded, err)
+		}
+	}
+	if got, recorded, err := st.RecordRoot(ctx, a.ID, "root:b", "fixture"); err != nil || !recorded || got.ID != b.ID {
+		t.Fatalf("ordinary merge: %+v %v %v", got, recorded, err)
+	}
+	for _, sig := range []string{"root:c", "root:new"} {
+		if got, recorded, err := st.RecordRoot(ctx, a.ID, sig, "fixture"); err != nil || recorded || got.ID != a.ID || got.Into != b.ID {
+			t.Fatalf("stale root: %+v %v %v", got, recorded, err)
+		}
+	}
+	got, err := st.CaseLive(ctx, b.ID)
+	if err != nil || got.ID != b.ID || slices.Contains(got.Signatures, "root:c") || slices.Contains(got.Signatures, "root:new") {
+		t.Fatalf("alias target changed: %+v %v", got, err)
+	}
+}

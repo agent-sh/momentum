@@ -272,6 +272,9 @@ func scanCase(row interface{ Scan(...any) error }) (Case, error) {
 
 // getCase reads a case with its evidence count and signatures. A missing case is ErrNoCase.
 func getCase(ctx context.Context, q querier, id string) (Case, error) {
+	if own, ok := ctx.Value(caseAuthority{}).(string); ok && id != own {
+		return Case{}, badCase("this run changes only its own canonical case")
+	}
 	c, err := scanCase(q.QueryRowContext(ctx, `SELECT `+caseColumns+` FROM cases WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Case{}, fmt.Errorf("%w: %q", ErrNoCase, id)
@@ -1012,13 +1015,49 @@ func (s *Store) AddCaseSignature(ctx context.Context, id, sig, actor string) (Ca
 		return Case{}, false, err
 	}
 	defer tx.Rollback()
-	now := time.Now()
 	c, err := live(ctx, tx, id)
 	if err != nil {
 		return Case{}, false, err
 	}
+	c, merged, err := addCaseSignature(ctx, tx, c, sig, actor)
+	if err != nil {
+		return Case{}, false, err
+	}
+	return c, merged, tx.Commit()
+}
+
+// RecordRoot applies a run's root only while its assigned case has not gone into another case.
+// It reads that id and adds the signature in one transaction. The bool says whether the root was recorded.
+func (s *Store) RecordRoot(ctx context.Context, id, sig, actor string) (Case, bool, error) {
+	if !strings.HasPrefix(sig, "root:") {
+		return Case{}, false, badCase("a reported root starts with root:")
+	}
+	if err := checkSignature(sig); err != nil {
+		return Case{}, false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Case{}, false, err
+	}
+	defer tx.Rollback()
+	c, err := getCase(ctx, tx, id)
+	if err != nil {
+		return Case{}, false, err
+	}
+	if c.Into != "" {
+		return c, false, nil
+	}
+	c, _, err = addCaseSignature(ctx, tx, c, sig, actor)
+	if err != nil {
+		return Case{}, false, err
+	}
+	return c, true, tx.Commit()
+}
+
+func addCaseSignature(ctx context.Context, tx *sql.Tx, c Case, sig, actor string) (Case, bool, error) {
+	now := time.Now()
 	var holder string
-	err = tx.QueryRowContext(ctx, `SELECT case_id FROM case_signatures WHERE signature = ?`, sig).Scan(&holder)
+	err := tx.QueryRowContext(ctx, `SELECT case_id FROM case_signatures WHERE signature = ?`, sig).Scan(&holder)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		if _, err := tx.ExecContext(ctx, `INSERT INTO case_signatures (signature, case_id, at) VALUES (?,?,?)`, sig, c.ID,
@@ -1031,7 +1070,7 @@ func (s *Store) AddCaseSignature(ctx context.Context, id, sig, actor string) (Ca
 		if c, err = getCase(ctx, tx, c.ID); err != nil {
 			return Case{}, false, err
 		}
-		return c, false, tx.Commit()
+		return c, false, nil
 	case err != nil:
 		return Case{}, false, err
 	}
@@ -1040,7 +1079,7 @@ func (s *Store) AddCaseSignature(ctx context.Context, id, sig, actor string) (Ca
 		return Case{}, false, err
 	}
 	if h.ID == c.ID {
-		return c, false, tx.Commit()
+		return c, false, nil
 	}
 	if !slices.Contains(working, c.Status) {
 		return Case{}, false, badCase("case %s holds %q, and case %s is %s: only an open, investigating or testing case goes into another",
@@ -1054,7 +1093,7 @@ func (s *Store) AddCaseSignature(ctx context.Context, id, sig, actor string) (Ca
 	if c, err = merge(ctx, tx, c, h.ID, "the same signature "+sig, actor, now); err != nil {
 		return Case{}, false, err
 	}
-	return c, true, tx.Commit()
+	return c, true, nil
 }
 
 // AddCaseCost adds what a run spent on a case.
@@ -1141,4 +1180,80 @@ func (s *Store) SweepCases(ctx context.Context, now time.Time, retention time.Du
 		out = append(out, c)
 	}
 	return out, tx.Commit()
+}
+
+// DeployCase is the ship tool's: a case in testing goes to deployed, with its change package and the time its
+// change went in, from which its measurement counts. Nothing else deploys a case.
+func (s *Store) DeployCase(ctx context.Context, id, pkg string, at time.Time, what, actor string) (Case, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Case{}, err
+	}
+	defer tx.Rollback()
+	c, err := getCase(ctx, tx, id)
+	if err != nil {
+		return Case{}, err
+	}
+	if c.Status != CaseTesting {
+		return Case{}, badCase("case %s is %s: only a case in testing deploys", c.ID, c.Status)
+	}
+	if pkg == "" || at.IsZero() {
+		return Case{}, badCase("a deployed case names its package and when its change went in")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, package = ?, deployed = ?, updated = ? WHERE id = ?`,
+		CaseDeployed, pkg, at.UnixMilli(), time.Now().UnixMilli(), c.ID); err != nil {
+		return Case{}, err
+	}
+	if err := caseLog(ctx, tx, c.ID, actor, "deployed", what, time.Now()); err != nil {
+		return Case{}, err
+	}
+	if c, err = getCase(ctx, tx, c.ID); err != nil {
+		return Case{}, err
+	}
+	return c, tx.Commit()
+}
+
+// RollBackCase is the ship tool's: a deployed or measuring case whose change was undone goes back to testing,
+// with no measurement, since its change is gone.
+func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Case{}, err
+	}
+	defer tx.Rollback()
+	c, err := getCase(ctx, tx, id)
+	if err != nil {
+		return Case{}, err
+	}
+	if c.Status != CaseDeployed && c.Status != CaseMeasuring {
+		return Case{}, badCase("case %s is %s: only a deployed or measuring case rolls back", c.ID, c.Status)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, deployed = 0, window_ms = 0, before_n = 0, after_n = 0,
+	  effect = '', updated = ? WHERE id = ?`, CaseTesting, time.Now().UnixMilli(), c.ID); err != nil {
+		return Case{}, err
+	}
+	if err := caseLog(ctx, tx, c.ID, actor, "rolled back", why, time.Now()); err != nil {
+		return Case{}, err
+	}
+	if c, err = getCase(ctx, tx, c.ID); err != nil {
+		return Case{}, err
+	}
+	return c, tx.Commit()
+}
+
+// CaseNote logs a line on a case for a tool that changes nothing of its own: the ship tool's steps before it
+// deploys (prepared, checked, proposed, reviewed), the runner's runs.
+func (s *Store) CaseNote(ctx context.Context, id, action, detail, actor string) error {
+	c, err := live(ctx, s.db, id)
+	if err != nil {
+		return err
+	}
+	return caseLog(ctx, s.db, c.ID, actor, action, detail, time.Now())
+}
+
+type caseAuthority struct{}
+
+// WithCaseAuthority confines mutations to one canonical case. Alias resolution checks it in the transaction.
+func WithCaseAuthority(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, caseAuthority{}, id)
 }

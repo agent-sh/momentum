@@ -29,6 +29,12 @@ func caseCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if len(args) == 0 {
 		return usageError{"case needs detect, list, show, open, set, evidence, signature, close or reopen"}
 	}
+	if err := ownCase(args); err != nil {
+		return err
+	}
+	if os.Getenv("MOMENTUM_LOOP_RUN") != "" && args[0] != "list" && args[0] != "show" {
+		ctx = store.WithCaseAuthority(ctx, os.Getenv("MOMENTUM_LOOP_CASE"))
+	}
 	switch args[0] {
 	case "detect":
 		return caseDetect(ctx, args[1:], stdout, stderr)
@@ -50,6 +56,28 @@ func caseCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		return caseReopen(ctx, args[1:], stdout, stderr)
 	}
 	return usageError{fmt.Sprintf("unknown case command %q", args[0])}
+}
+
+// ownCase keeps a loop run to its own case: it reads any case, writes only its own, and opens or detects none
+// (the loop does both, outside its runs).
+func ownCase(args []string) error {
+	run, own := os.Getenv("MOMENTUM_LOOP_RUN"), os.Getenv("MOMENTUM_LOOP_CASE")
+	if run == "" {
+		return nil
+	}
+	switch args[0] {
+	case "open", "detect":
+		return usageError{fmt.Sprintf("a loop run works its own case; case %s is the loop's, outside its runs", args[0])}
+	case "set", "evidence", "signature", "close", "reopen":
+		id := ""
+		if len(args) > 1 && !strings.HasPrefix(args[1], "-") {
+			id = args[1]
+		}
+		if id != own {
+			return usageError{fmt.Sprintf("this loop run works case %s, not %q: it changes only its own", own, id)}
+		}
+	}
+	return nil
 }
 
 // caseActor is who a change is logged as: $MOMENTUM_ACTOR (the loop sets its run), else the command line.
