@@ -135,3 +135,69 @@ func TestEvaluationCLIWritesAnEmptyPairedResult(t *testing.T) {
 		}
 	}
 }
+
+// Search matches incident and mistakes summaries by default, and a source or recorded actor narrows the matches.
+func TestEvidenceSearchReadsEverySource(t *testing.T) {
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	fakeScrubber(t)
+	at := time.Now().Add(-time.Hour)
+	putEvents(t, store.Event{Source: "incidents", SourceKey: "seen", TS: at, Actor: store.ActorDetector, Kind: "incident-seen", Summary: "backup volume not mounted"},
+		store.Event{Source: "mistakes", SourceKey: "result", TS: at, Actor: store.ActorTool, Kind: "result", Summary: "lockfile busy"})
+	for _, phrase := range []string{"not mounted", "lockfile busy"} {
+		code, out, diag := momentum("evidence", "search", phrase)
+		if code != 0 || !strings.Contains(out, phrase) {
+			t.Fatalf("search %q: %d %s %s", phrase, code, out, diag)
+		}
+	}
+	for _, args := range [][]string{{"not mounted", "--source", "incidents", "--actor", "detector"}, {"--source=mistakes", "lockfile busy", "--actor", "tool"}} {
+		code, out, diag := momentum(append([]string{"evidence", "search"}, args...)...)
+		if code != 0 || out == "" {
+			t.Fatalf("filter %v: %d %s %s", args, code, out, diag)
+		}
+	}
+	code, out, diag := momentum("evidence", "search", "lockfile busy", "--source", "incidents")
+	if code != 0 || out != "" {
+		t.Fatalf("source ignored: %d %s %s", code, out, diag)
+	}
+	for _, actor := range []string{"owner", "agent", "tool", "harness", "detector", "unknown"} {
+		code, _, diag = momentum("evidence", "search", "lockfile busy", "--actor", actor)
+		if code != 0 {
+			t.Fatalf("recorded actor %s: %s", actor, diag)
+		}
+	}
+	code, _, _ = momentum("evidence", "search", "lockfile busy", "--actor", "invented")
+	if code != 2 {
+		t.Fatal("unknown actor accepted")
+	}
+}
+
+// An explicit upper bound cannot move search beyond the trial clock, even in a store with later rows.
+func TestEvidenceSearchClampsUntilToTheTrialClock(t *testing.T) {
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	fakeScrubber(t)
+	end := time.Now().Add(-40 * 24 * time.Hour).Truncate(time.Second)
+	t.Setenv("MOMENTUM_NOW", end.Format(time.RFC3339))
+	putEvents(t, store.Event{Source: store.Transcripts, SourceKey: "before", TS: end.Add(-time.Hour), Actor: store.ActorTool, Kind: "tool_result", Summary: "signal before"},
+		store.Event{Source: store.Transcripts, SourceKey: "later", TS: end.Add(time.Hour), Actor: store.ActorTool, Kind: "tool_result", Summary: "signal later"})
+	code, out, diag := momentum("evidence", "search", "signal", "--until", end.Add(2*time.Hour).Format(time.RFC3339))
+	if code != 0 || !strings.Contains(out, "signal before") || strings.Contains(out, "signal later") {
+		t.Fatalf("clock escaped: %d %s %s", code, out, diag)
+	}
+}
+
+// Live evidence windows stop at the wall clock, so future-dated rows do not appear or count by default.
+func TestLiveEvidenceStopsAtTheWallClock(t *testing.T) {
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	t.Setenv("MOMENTUM_NOW", "")
+	fakeScrubber(t)
+	putEvents(t, store.Event{Source: store.Transcripts, SourceKey: "future", TS: time.Now().Add(90 * time.Minute), Actor: store.ActorOwner, Kind: "owner_text", Summary: "future signal"})
+	for _, args := range [][]string{{"evidence", "events", "--since", "1d"}, {"evidence", "status", "--since", "1d"}, {"evidence", "search", "future signal"}} {
+		code, out, diag := momentum(args...)
+		if code != 0 || strings.Contains(out, "future signal") || strings.Contains(out, "owner_text 1") {
+			t.Fatalf("future row: %v %d %s %s", args, code, out, diag)
+		}
+	}
+}

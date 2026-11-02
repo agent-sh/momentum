@@ -12,12 +12,12 @@ import (
 
 // Summary counts every investigation, including one the judge could not grade.
 type Summary struct {
-	Task, Family, Arm                                 string
-	K, Ran, Reached, Partial, Missed, Wrong, CutShort int
-	Verdicts                                          []string
-	AnyReached, AllReached, Flipped                   bool
-	USD, JudgeUSD, Minutes, TotalMinutes, Turns       float64
-	Errors                                            []string
+	Task, Family, Arm                                          string
+	K, Ran, Reached, Partial, Missed, Wrong, CutShort, Skipped int
+	Verdicts                                                   []string
+	AnyReached, AllReached, Flipped                            bool
+	USD, JudgeUSD, Minutes, TotalMinutes, Turns                float64
+	Errors                                                     []string
 }
 
 func validVerdict(v string) bool {
@@ -37,7 +37,9 @@ func Summarize(trials []Trial, requested ...int) []Summary {
 			order = append(order, key)
 		}
 		s.K++
-		if tr.Err != "" {
+		if tr.Skipped != "" {
+			s.Skipped++
+		} else if tr.Err != "" {
 			s.Errors = append(s.Errors, tr.Err)
 		} else if tr.Run.Status == store.RunFailed {
 			s.Errors = append(s.Errors, tr.Run.Failure)
@@ -52,7 +54,7 @@ func Summarize(trials []Trial, requested ...int) []Summary {
 		if tr.CutShort {
 			s.CutShort++
 		}
-		if !validVerdict(tr.Grade.Verdict) {
+		if tr.Skipped != "" || !validVerdict(tr.Grade.Verdict) {
 			continue
 		}
 		s.Verdicts = append(s.Verdicts, tr.Grade.Verdict)
@@ -87,11 +89,12 @@ func Summarize(trials []Trial, requested ...int) []Summary {
 
 // ArmSummary reports the same denominators for each arm. An undefined rate is null in JSON.
 type ArmSummary struct {
-	Arm                                                                                      string
-	K, Tasks, Planned, Ran, Graded, Reached, Partial, Missed, Wrong, Errors, CutShort, Flips int
-	PassAtK, PassAllK                                                                        float64
-	USD, JudgeUSD, Minutes                                                                   float64
-	USDPerTrial, MinutesPerTrial, USDPerReached, MinutesPerReached                           *float64
+	Arm                                                                                                              string
+	K, Tasks, Planned, Ran, Graded, Reached, Partial, Missed, Wrong, Errors, CutShort, Flips, Skipped, ComparedTasks int
+	PassAtK, PassAllK                                                                                                float64
+	USD, JudgeUSD, Minutes                                                                                           float64
+	ComparedUSD, ComparedMinutes                                                                                     float64
+	USDPerTrial, MinutesPerTrial, USDPerReached, MinutesPerReached                                                   *float64
 }
 type TaskComparison struct {
 	Task                       string
@@ -143,7 +146,35 @@ func (e *Eval) Results(trials []Trial) EvaluationResults {
 			r.Provenance.Skills[name] = hash
 		}
 	}
-	r.Tasks = Summarize(trials, r.K)
+	// Keep accounting for every run, but grade comparisons only where both arms ran the same trial.
+	paired := len(e.Arms) > 1 || len(e.Arms) == 0 && !e.Native
+	type pairKey struct {
+		task string
+		n    int
+	}
+	ran := map[pairKey]map[string]bool{}
+	for _, tr := range trials {
+		k := pairKey{tr.Task, tr.N}
+		if ran[k] == nil {
+			ran[k] = map[string]bool{}
+		}
+		if !tr.Run.Started.IsZero() && tr.Skipped == "" {
+			ran[k][tr.Arm] = true
+		}
+	}
+	accounted := append([]Trial(nil), trials...)
+	var compared []Trial
+	for i := range accounted {
+		tr := &accounted[i]
+		arms := ran[pairKey{tr.Task, tr.N}]
+		if paired && (arms["loop"] != arms["native"]) {
+			tr.Skipped = "both arms did not run this trial"
+		} else if tr.Skipped == "" && !tr.Run.Started.IsZero() {
+			compared = append(compared, *tr)
+		}
+	}
+	r.Trials = accounted
+	r.Tasks = Summarize(accounted, r.K)
 	by := map[string]*ArmSummary{}
 	pairs := map[string]map[string]Summary{}
 	for _, s := range r.Tasks {
@@ -162,9 +193,16 @@ func (e *Eval) Results(trials []Trial) EvaluationResults {
 		a.Wrong += s.Wrong
 		a.Errors += len(s.Errors)
 		a.CutShort += s.CutShort
+		a.Skipped += s.Skipped
 		a.USD += s.USD
 		a.JudgeUSD += s.JudgeUSD
 		a.Minutes += s.TotalMinutes
+	}
+	for _, s := range Summarize(compared, r.K) {
+		a := by[s.Arm]
+		a.ComparedTasks++
+		a.ComparedUSD += s.USD
+		a.ComparedMinutes += s.TotalMinutes
 		if s.AnyReached {
 			a.PassAtK++
 		}
@@ -193,14 +231,14 @@ func (e *Eval) Results(trials []Trial) EvaluationResults {
 	}
 	for _, arm := range []string{"loop", "native"} {
 		if a := by[arm]; a != nil {
-			if a.Tasks > 0 {
-				a.PassAtK /= float64(a.Tasks)
-				a.PassAllK /= float64(a.Tasks)
+			if a.ComparedTasks > 0 {
+				a.PassAtK /= float64(a.ComparedTasks)
+				a.PassAllK /= float64(a.ComparedTasks)
 			}
 			a.USDPerTrial = ratio(a.USD, a.Ran)
 			a.MinutesPerTrial = ratio(a.Minutes, a.Ran)
-			a.USDPerReached = ratio(a.USD, a.Reached)
-			a.MinutesPerReached = ratio(a.Minutes, a.Reached)
+			a.USDPerReached = ratio(a.ComparedUSD, a.Reached)
+			a.MinutesPerReached = ratio(a.ComparedMinutes, a.Reached)
 			r.Arms = append(r.Arms, *a)
 		}
 	}

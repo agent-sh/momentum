@@ -70,6 +70,7 @@ type Settings struct {
 
 // Result is what a run came to.
 type Result struct {
+	promptHash string // the evaluation prompt as sent, before the run can change its files
 	Status     string // store.RunOK, RunFailed, RunBudget, RunTurns, RunTimeout
 	Failure    string // how it failed, when it did: a short key the stop rule compares
 	CostKnown  bool

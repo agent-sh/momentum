@@ -291,11 +291,12 @@ func evidenceSearch(ctx context.Context, args []string, stdout, stderr io.Writer
 	since := fs.String("since", "30d", "how far back: a duration or a time")
 	until := fs.String("until", "", "up to: a duration ago or a time (default now)")
 	kinds := fs.String("kind", "", "comma-separated kinds (owner_text, agent_text, tool_call, tool_result, ...)")
-	actor := fs.String("actor", "", "only one actor's: owner, agent, tool, harness")
+	actor := fs.String("actor", "", "only one actor: owner, agent, tool, harness, detector, unknown")
+	source := fs.String("source", "", "one source (default every source)")
 	session := fs.String("session", "", "one session's")
 	limit := fs.Int("limit", 50, "at most this many")
 	fs.Usage = func() {
-		fmt.Fprintln(stderr, "evidence search [flags] TEXT: stored summaries, newest first. Agent text: first 160 and last 80 bytes; calls and results: first 240 (errors keep 1,000). evidence show reads the whole record.")
+		fmt.Fprintln(stderr, "evidence search [flags] TEXT: stored summaries of every source, newest first; --source narrows it. Agent text: first 160 and last 80 bytes; calls and results: first 240 (errors keep 1,000). evidence show reads the whole record.")
 		fs.PrintDefaults()
 	}
 	// Consume each flag and its value before collecting positional arguments.
@@ -328,7 +329,7 @@ func evidenceSearch(ctx context.Context, args []string, stdout, stderr io.Writer
 	}
 	text := phrases[0]
 	switch *actor {
-	case "", "owner", "agent", "tool", "harness", "detector", "unknown":
+	case "", string(store.ActorOwner), string(store.ActorAgent), string(store.ActorTool), string(store.ActorHarness), string(store.ActorDetector), string(store.ActorUnknown):
 	default:
 		return usageError{"unknown actor: " + *actor}
 	}
@@ -340,7 +341,7 @@ func evidenceSearch(ctx context.Context, args []string, stdout, stderr io.Writer
 	if err != nil {
 		return err
 	}
-	q := store.Query{Until: now, Since: from, Text: text, Session: *session, Actor: store.Actor(*actor), Source: store.Transcripts, Limit: min(max(*limit, 1), 500)}
+	q := store.Query{Until: now, Since: from, Text: text, Session: *session, Actor: store.Actor(*actor), Source: *source, Limit: min(max(*limit, 1), 500)}
 	if *until != "" {
 		if q.Until, err = parseWhen(*until); err != nil {
 			return usageError{err.Error()}
