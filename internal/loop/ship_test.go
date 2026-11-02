@@ -69,10 +69,15 @@ func write(t *testing.T, path, text string) {
 	}
 }
 
+// bedrockCall is the model request a fake harness sends through the route a run gives it, as Claude Code does,
+// so its run counts as on Bedrock; outside a run the variable is unset and the line does nothing.
+const bedrockCall = `if [ -n "$ANTHROPIC_BEDROCK_BASE_URL" ]; then curl -s -o /dev/null -X POST -d '{}' "$ANTHROPIC_BEDROCK_BASE_URL/model/global.anthropic.claude-opus-5-5/invoke"; fi
+`
+
 func script(t *testing.T, dir, name, body string) string {
 	t.Helper()
 	p := filepath.Join(dir, name)
-	write(t, p, "#!/bin/sh\n"+body+"\n")
+	write(t, p, "#!/bin/sh\n"+bedrockCall+body+"\n")
 	if err := os.Chmod(p, 0o755); err != nil {
 		t.Fatal(err)
 	}

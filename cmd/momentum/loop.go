@@ -83,6 +83,11 @@ func setup(st *store.Store, c config.Loop) (*loop.Runner, *loop.Ship, error) {
 	if fallback == "" {
 		fallback = defaultFallback
 	}
+	for _, m := range []string{model, fallback} {
+		if !loop.BedrockModel(m) {
+			return nil, nil, fmt.Errorf("loop model %q is no Bedrock model: every headless run is on Bedrock (global.anthropic.claude-...)", m)
+		}
+	}
 	families := c.Families
 	if len(families) == 0 {
 		families = defaultFamilies
@@ -92,7 +97,7 @@ func setup(st *store.Store, c config.Loop) (*loop.Runner, *loop.Ship, error) {
 		return nil, nil, err
 	}
 	_, scope := exec.LookPath("systemd-run")
-	r := &loop.Runner{Store: st, Agent: loop.Agent{Runner: c.Runner, Model: model, Fallback: fallback, Scope: scope == nil}, Ship: ship,
+	r := &loop.Runner{Store: st, Agent: loop.Agent{Runner: c.Runner, Model: model, Fallback: fallback, Scope: scope == nil, Bedrock: &loop.Bedrock{File: c.BedrockEnv}}, Ship: ship,
 		Detectors: ds, Families: families, Budgets: b, Rules: c.Rules, Constraints: c.Constraints, MCP: c.MCP, ReadDirs: c.ReadDirs,
 		Dir: loopDir(), Home: home, Bins: bins,
 		Post: func(ctx context.Context, repo, pr, body string) (string, error) {
@@ -285,6 +290,11 @@ func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		return err
 	}
 	r.Log = func(format string, a ...any) { fmt.Fprintf(stderr, format+"\n", a...) }
+	if !*dry {
+		if err := r.Agent.Bedrock.Check(); err != nil {
+			return err // no route, no run: nothing is reserved or started
+		}
+	}
 	var fams []string
 	for _, f := range strings.Split(*families, ",") {
 		if f = strings.TrimSpace(f); f != "" {

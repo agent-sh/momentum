@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/capacity"
+	"github.com/agent-sh/momentum/internal/config"
 	"github.com/agent-sh/momentum/internal/loop"
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/store"
@@ -362,5 +363,29 @@ func TestEvidenceSearchFindsAPhrase(t *testing.T) {
 	}
 	if code, _, _ := momentum("evidence", "search", "n"); code != 2 {
 		t.Fatal("a one-letter phrase was searched")
+	}
+}
+
+// The loop's runs are on Bedrock: its models are Bedrock's, and its agent and judge take the broker's route.
+func TestTheLoopRunsOnBedrock(t *testing.T) {
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	route := filepath.Join(t.TempDir(), "bedrock.env")
+	r, _, err := setup(st, config.Loop{Runner: []string{"claude"}, BedrockEnv: route})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Agent.Bedrock == nil || r.Agent.Bedrock.File != route || !loop.BedrockModel(r.Agent.Model) || !loop.BedrockModel(r.Agent.Fallback) {
+		t.Fatalf("the loop's agent: %+v", r.Agent)
+	}
+	for _, c := range []config.Loop{{Runner: []string{"claude"}, Model: "claude-opus-5-5"}, {Runner: []string{"claude"}, FallbackModel: "us.anthropic.claude-sonnet-5-5"}} {
+		if _, _, err := setup(st, c); err == nil || !strings.Contains(err.Error(), "no Bedrock model") {
+			t.Errorf("%+v: %v", c, err)
+		}
 	}
 }

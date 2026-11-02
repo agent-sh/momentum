@@ -51,7 +51,7 @@ func runnerFor(t *testing.T, st *store.Store, agent []string) *Runner {
 	dir := t.TempDir()
 	rules := filepath.Join(dir, "rules.md")
 	write(t, rules, "Delete with literal paths.")
-	return &Runner{Store: st, Agent: Agent{Runner: agent, Model: "model-x"}, Ship: &Ship{Store: st, Dir: filepath.Join(dir, "loop")},
+	return &Runner{Store: st, Agent: Agent{Bedrock: testBedrock(t), Runner: agent, Model: "model-x"}, Ship: &Ship{Store: st, Dir: filepath.Join(dir, "loop")},
 		Families: []string{"failures", "owner-burden"}, Budgets: Budgets{Run: 4, Case: 20, Day: 40, Week: 200, RunTime: time.Minute, MaxTurns: 30},
 		Rules: []string{rules}, Constraints: []string{"never wake him"}, Dir: filepath.Join(dir, "loop"), Home: dir}
 }
@@ -296,7 +296,7 @@ func TestASafeguardsRefusalFallsBack(t *testing.T) {
 	dir := t.TempDir()
 	refused := `{"type":"result","subtype":"success","is_error":true,"num_turns":1,"total_cost_usd":0.25,"result":"the safeguards blocked it"}`
 	p := script(t, dir, "agent", `case "$*" in *"--model model-a"*) echo '`+refused+`' ;; *) echo '`+okResult+`' ;; esac`)
-	a := Agent{Runner: []string{p}, Model: "model-a", Fallback: "model-b"}
+	a := Agent{Bedrock: testBedrock(t), Runner: []string{p}, Model: "model-a", Fallback: "model-b"}
 	res, err := a.RunOrFallback(context.Background(), Invocation{Dir: filepath.Join(dir, "run"), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Minute})
 	if err != nil || res.Status != store.RunOK || res.Model != "model-b" || res.USD != 1 {
 		t.Fatalf("%+v %v", res, err)
@@ -328,7 +328,7 @@ func TestATimedOutRunLeavesNothingRunning(t *testing.T) {
 	p := script(t, dir, "agent", `trap '' TERM
 (trap '' TERM; sleep 3; touch "`+marker+`") &
 sleep 30`)
-	a := Agent{Runner: []string{p}, Model: "m"}
+	a := Agent{Bedrock: testBedrock(t), Runner: []string{p}, Model: "m"}
 	res, err := a.Run(context.Background(), Invocation{Dir: filepath.Join(dir, "run"), Schema: runSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Second})
 	if err != nil || res.Status != store.RunTimeout {
 		t.Fatalf("%+v %v", res, err)
@@ -341,7 +341,7 @@ sleep 30`)
 	marker2 := filepath.Join(dir, "survived2")
 	p2 := script(t, dir, "agent2", `(trap '' TERM; sleep 3; touch "`+marker2+`") &
 sleep 30`)
-	res, err = Agent{Runner: []string{p2}, Model: "m"}.Run(context.Background(), Invocation{Dir: filepath.Join(dir, "run2"), Schema: runSchema, MaxTurns: 3,
+	res, err = Agent{Bedrock: testBedrock(t), Runner: []string{p2}, Model: "m"}.Run(context.Background(), Invocation{Dir: filepath.Join(dir, "run2"), Schema: runSchema, MaxTurns: 3,
 		BudgetUSD: 1, Timeout: time.Second})
 	if err != nil || res.Status != store.RunTimeout {
 		t.Fatalf("%+v %v", res, err)
@@ -361,7 +361,7 @@ func TestARunsScopeTakesWhatLeftItsGroup(t *testing.T) {
 	marker := filepath.Join(dir, "survived")
 	p := script(t, dir, "agent", `setsid sh -c 'sleep 3; touch "`+marker+`"' > /dev/null 2>&1 < /dev/null &
 echo '`+okResult+`'`)
-	a := Agent{Runner: []string{p}, Model: "m", Scope: true}
+	a := Agent{Bedrock: testBedrock(t), Runner: []string{p}, Model: "m", Scope: true}
 	res, err := a.Run(context.Background(), Invocation{Dir: filepath.Join(dir, "run-"+newRunID(time.Now())), Schema: runSchema, MaxTurns: 3,
 		BudgetUSD: 1, Timeout: time.Minute})
 	if err != nil || res.Status != store.RunOK {

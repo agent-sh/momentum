@@ -161,7 +161,7 @@ fi`)
 	t.Run("deadline", func(t *testing.T) {
 		dir := t.TempDir()
 		fake := script(t, dir, "fixture", `case "$*" in *"--model primary"*) sleep 0.15; echo '{"type":"result","subtype":"success","is_error":true,"num_turns":1,"total_cost_usd":1,"result":"safeguards"}' ;; *) sleep 0.3; echo '`+okResult+`' ;; esac`)
-		res, err := (Agent{Runner: []string{fake}, Model: "primary", Fallback: "fallback"}).RunOrFallback(context.Background(), Invocation{Dir: filepath.Join(dir, "run"), BudgetUSD: 4, MaxTurns: 10, Timeout: 350 * time.Millisecond})
+		res, err := (Agent{Bedrock: testBedrock(t), Runner: []string{fake}, Model: "primary", Fallback: "fallback"}).RunOrFallback(context.Background(), Invocation{Dir: filepath.Join(dir, "run"), BudgetUSD: 4, MaxTurns: 10, Timeout: 350 * time.Millisecond})
 		if err != nil || res.Status != store.RunTimeout || res.USD != 4 {
 			t.Fatalf("fallback restarted time or lost unknown cost: %+v %v", res, err)
 		}

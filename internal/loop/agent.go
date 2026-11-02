@@ -39,6 +39,9 @@ type Agent struct {
 	// Scope runs each run in a systemd user scope of its own (systemd-run), so its stop reaches every process it
 	// started, those that left its process group too. Without it, the stop reaches its process group.
 	Scope bool
+	// Bedrock is the run's route: every run is on Bedrock, through the loopback broker, and one with no route does
+	// not start.
+	Bedrock *Bedrock
 }
 
 // DefaultTools are the harness's built-in tools a loop run has: the file tools (confined to its directories),
@@ -101,6 +104,9 @@ var stopGrace = 10 * time.Second
 func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	if len(a.Runner) == 0 {
 		return Result{}, errors.New("no runner: set loop.runner in sources.json")
+	}
+	if a.Bedrock == nil {
+		return Result{}, fmt.Errorf("%w: every headless run is on Bedrock, and none falls back to the direct API", ErrNoBedrock)
 	}
 	if err := os.MkdirAll(inv.Dir, 0o700); err != nil {
 		return Result{}, err
@@ -171,8 +177,14 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 		unit = ScopeUnit(inv.Dir)
 		prog, argv = "systemd-run", append([]string{"--user", "--scope", "--quiet", "--collect", "--unit", unit, "--", a.Runner[0]}, args...)
 	}
+	// the route is read now, at this launch: the broker writes its file again when it restarts
+	route, routeEnv, err := a.Bedrock.open()
+	if err != nil {
+		return Result{}, err
+	}
+	defer route.close()
 	cmd := exec.Command(prog, argv...)
-	cmd.Dir, cmd.Env, cmd.Stdout, cmd.Stderr = inv.Dir, a.Env, out, errLog
+	cmd.Dir, cmd.Env, cmd.Stdout, cmd.Stderr = inv.Dir, routed(a.Env, routeEnv), out, errLog
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // its own group: a stop reaches every process it started
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
@@ -211,6 +223,11 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 		if waitErr != nil {
 			res.Failure = fmt.Sprintf("exit %v: %s", waitErr, lastLine(filepath.Join(inv.Dir, "stderr.txt")))
 		}
+	}
+	// the proof a run was on Bedrock: the model ran, and its requests went through the run's relay to the broker
+	if modelRan(res) && route.models.Load() == 0 {
+		res.Status, res.Failure = store.RunFailed, "not on Bedrock"
+		return res, fmt.Errorf("%w: the run's model answered, but no request of it reached the Bedrock broker", ErrNoBedrock)
 	}
 	return res, nil
 }

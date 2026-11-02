@@ -68,6 +68,7 @@ type Sources struct {
 type Loop struct {
 	Live          bool     `json:"live"`
 	Runner        []string `json:"runner"`
+	BedrockEnv    string   `json:"bedrock_env,omitempty"` // the Bedrock broker's env file; default ~/.config/claude-code/bedrock.env
 	Model         string   `json:"model"`
 	FallbackModel string   `json:"fallback_model"`
 	Families      []string `json:"families"`

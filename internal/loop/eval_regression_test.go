@@ -37,8 +37,8 @@ printf '%s' "$MOMENTUM_NOW" > clock.txt
 printf '%s\n' '{"type":"assistant","message":{"model":"actual-model"}}' '{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":1,"structured_output":{"mechanism":"a mechanism","root":"root:cause","root_cause":"root:cause","fix":"a fix","summary":"a summary"}}'`)
 	judge := script(t, dir, "fixture-judge", `printf '%s\n' "$@" > args.txt
 printf '%s\n' '{"type":"assistant","message":{"model":"actual-judge"}}' '{"type":"result","subtype":"success","total_cost_usd":0.1,"structured_output":{"verdict":"reached","facts":[],"reason":"a reason"}}'`)
-	return &Eval{Runner: &Runner{Store: testStore(t), Agent: Agent{Runner: []string{agent}, Model: "requested-model"}, Budgets: Budgets{Run: 4, RunTime: time.Minute, MaxTurns: 10}},
-		Source: source, Dir: filepath.Join(dir, "evaluation"), ID: "synthetic-evaluation", Trials: 1, Budget: 50, Parallel: 1, Judge: Agent{Runner: []string{judge}, Model: "requested-judge", Fallback: "unused"}, GoldenHash: digest("synthetic golden file")}, task
+	return &Eval{Runner: &Runner{Store: testStore(t), Agent: Agent{Bedrock: testBedrock(t), Runner: []string{agent}, Model: "requested-model"}, Budgets: Budgets{Run: 4, RunTime: time.Minute, MaxTurns: 10}},
+		Source: source, Dir: filepath.Join(dir, "evaluation"), ID: "synthetic-evaluation", Trials: 1, Budget: 50, Parallel: 1, Judge: Agent{Bedrock: testBedrock(t), Runner: []string{judge}, Model: "requested-judge", Fallback: "unused"}, GoldenHash: digest("synthetic golden file")}, task
 }
 
 // The store ends at the symptom plus one minute, or at an earlier task cutoff, before later work on the cause.

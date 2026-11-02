@@ -98,12 +98,44 @@ func TestEvidenceCommandsUseTheSnapshotClock(t *testing.T) {
 	}
 }
 
+// fakeRoute writes a Bedrock broker's env file, as the broker writes it, for a test that starts no run, and
+// returns the loop configuration that names it.
+func fakeRoute(t *testing.T) string {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "bedrock.env")
+	if err := os.WriteFile(file, []byte("CLAUDE_CODE_USE_BEDROCK=\"1\"\nANTHROPIC_BEDROCK_BASE_URL=\"http://127.0.0.1:9/nonce\"\nCLAUDE_CODE_SKIP_BEDROCK_AUTH=\"1\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return `{"loop":{"bedrock_env":"` + file + `"}}`
+}
+
+// With no Bedrock route the evaluation does not start: no run, no directory.
+func TestAnEvaluationWithNoBedrockRouteDoesNotStart(t *testing.T) {
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	conf := `{"loop":{"bedrock_env":"` + filepath.Join(t.TempDir(), "absent.env") + `"}}`
+	if err := os.WriteFile(filepath.Join(os.Getenv("MOMENTUM_CONFIG"), "sources.json"), []byte(conf), 0600); err != nil {
+		t.Fatal(err)
+	}
+	golden := filepath.Join(t.TempDir(), "golden.jsonl")
+	if err := os.WriteFile(golden, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	code, _, diag := momentum("loop", "eval", "--golden", golden, "--budget", "0", "--json")
+	if code == 0 || !strings.Contains(diag, "no Bedrock route") {
+		t.Fatalf("exit %d %s", code, diag)
+	}
+	if _, err := os.Stat(filepath.Join(loopDir(), "eval")); err == nil {
+		t.Fatal("an evaluation directory was made")
+	}
+}
+
 // The CLI compares both arms by default and persists an empty synthetic evaluation without starting a runner.
 func TestEvaluationCLIWritesAnEmptyPairedResult(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("MOMENTUM_HOME", t.TempDir())
 	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
-	if err := os.WriteFile(filepath.Join(os.Getenv("MOMENTUM_CONFIG"), "sources.json"), []byte(`{"loop":{}}`), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(os.Getenv("MOMENTUM_CONFIG"), "sources.json"), []byte(fakeRoute(t)), 0600); err != nil {
 		t.Fatal(err)
 	}
 	golden := filepath.Join(t.TempDir(), "golden.jsonl")

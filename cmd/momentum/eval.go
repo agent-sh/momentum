@@ -82,6 +82,9 @@ func loopEval(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	if err != nil {
 		return err
 	}
+	if err := r.Agent.Bedrock.Check(); err != nil {
+		return err // every trial and judge is on Bedrock: with no route, the evaluation does not start
+	}
 	id := loop.NewEvalID()
 	raw, err := os.ReadFile(*golden)
 	if err != nil {
@@ -94,7 +97,7 @@ func loopEval(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		}
 	}
 	e := &loop.Eval{Runner: r, Source: paths.DB(), Dir: filepath.Join(loopDir(), "eval", id), Trials: *trials, Budget: *budget, Parallel: *parallel, ID: id,
-		Judge: loop.Agent{Runner: r.Agent.Runner, Model: r.Agent.Model}, Arms: selected, Repositories: repositories, GoldenHash: fmt.Sprintf("%x", sha256.Sum256(raw)),
+		Judge: loop.Agent{Runner: r.Agent.Runner, Model: r.Agent.Model, Bedrock: r.Agent.Bedrock}, Arms: selected, Repositories: repositories, GoldenHash: fmt.Sprintf("%x", sha256.Sum256(raw)),
 		Self: selfBinary(), Tacit: tacitStore()}
 	tacit := "no tacit (no store)"
 	if e.Tacit != "" {

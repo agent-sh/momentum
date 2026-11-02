@@ -94,7 +94,7 @@ func TestAJudgeGradesFromItsReport(t *testing.T) {
 	p := script(t, dir, "judge", `printf '%s\n' "$@" > "`+filepath.Join(dir, "args")+`"
 echo '`+grade+`'`)
 	st := testStore(t)
-	e := &Eval{Runner: &Runner{Store: st}, Judge: Agent{Runner: []string{p}, Model: "judge-model"}}
+	e := &Eval{Runner: &Runner{Store: st}, Judge: Agent{Bedrock: testBedrock(t), Runner: []string{p}, Model: "judge-model"}}
 	task := GoldenTask{ID: "a", Family: "failures", RootCause: "the guard matched its own shell", KeyFacts: []string{"it matched its own shell"}}
 	g, usd, err := e.grade(context.Background(), task, finding{Mechanism: "the guard matched its own shell"}, t.TempDir(),
 		store.LoopRun{Experiment: "eval:x:a:1"})
@@ -167,9 +167,9 @@ echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total
 			out = `{"mechanism":"the native mechanism","alternatives":["another"],"root_cause":"the native root","summary":"found it"}`
 		}
 		st := testStore(t)
-		e := &Eval{Runner: &Runner{Store: st, Agent: Agent{Runner: agent(name, out), Model: "m"}, Budgets: Budgets{Run: 4, RunTime: time.Minute, MaxTurns: 9},
+		e := &Eval{Runner: &Runner{Store: st, Agent: Agent{Bedrock: testBedrock(t), Runner: agent(name, out), Model: "m"}, Budgets: Budgets{Run: 4, RunTime: time.Minute, MaxTurns: 9},
 			Rules: []string{rules}, Constraints: []string{"never wake him"}}, Source: source, Dir: filepath.Join(dir, "out", name), Trials: 1, Budget: 10,
-			Parallel: 1, ID: name, Judge: Agent{Runner: []string{judge}, Model: "j"}, Native: native, Arms: []string{name}}
+			Parallel: 1, ID: name, Judge: Agent{Bedrock: testBedrock(t), Runner: []string{judge}, Model: "j"}, Native: native, Arms: []string{name}}
 		trs, err := e.Run(ctx, []GoldenTask{task})
 		if err != nil || len(trs) != 1 || trs[0].Err != "" || trs[0].Grade.Verdict != "partial" || trs[0].Run.USD != 0.5 {
 			t.Fatalf("%s: %+v %v", name, trs, err)
