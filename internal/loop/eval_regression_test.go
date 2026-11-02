@@ -543,7 +543,11 @@ func TestEvaluationJobsInterleaveTrialTaskAndArm(t *testing.T) {
 	var want []string
 	for n := 1; n <= 2; n++ {
 		for _, task := range []GoldenTask{a, b} {
-			for _, arm := range []string{"loop", "native"} {
+			arms := []string{"loop", "native"}
+			if n%2 == 0 { // the arms take turns going first
+				arms = []string{"native", "loop"}
+			}
+			for _, arm := range arms {
 				tr := e.newTrial(task, n, arm)
 				want = append(want, filepath.Join(e.Dir, tr.Key, digest(tr.Key + "\x00" + arm)[:16]))
 			}

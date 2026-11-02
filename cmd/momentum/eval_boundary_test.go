@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/paths"
+	"github.com/agent-sh/momentum/internal/source"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -112,8 +113,9 @@ func TestEvidenceShowKeepsAnEventsOwnRecordInAnEvaluation(t *testing.T) {
 	t.Setenv("MOMENTUM_EVAL", "fixture")
 	t.Setenv("MOMENTUM_LOOP_RUN", "fixture-run")
 	log := filepath.Join(t.TempDir(), "events.jsonl")
-	first := `{"ts":"2026-01-01T00:00:00","kind":"tool-error","session":"s1","cwd":"/w","model":"m"}` + "\n"
-	own := `{"ts":"2026-01-01T00:01:00","kind":"tool-error","session":"s1","cwd":"/w","model":"m","detail":"the lock was taken twice"}` + "\n"
+	stamp := func(d time.Duration) string { return end.Add(d).Local().Format("2006-01-02T15:04:05") }
+	first := `{"ts":"` + stamp(-2*time.Hour) + `","kind":"tool-error","session":"s1","cwd":"/w","model":"m"}` + "\n"
+	own := `{"ts":"` + stamp(-time.Hour) + `","kind":"tool-error","session":"s1","cwd":"/w","model":"m","detail":"the lock was taken twice"}` + "\n"
 	if err := os.WriteFile(log, []byte(first+own), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -122,10 +124,22 @@ func TestEvidenceShowKeepsAnEventsOwnRecordInAnEvaluation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ev := store.Event{Source: "mistakes", SourceKey: "events.jsonl@1", TS: end.Add(-time.Hour), Session: "s1", Harness: "claude",
-		Actor: store.ActorTool, Kind: "tool-error", Summary: "tool-error: the lock was taken twice", Ref: fmt.Sprintf("%s@%d", log, len(first))}
-	if _, err := st.Put(ctx, []store.Event{ev}); err != nil {
+	// the row's event as its adapter makes it, keyed by its line
+	if _, err := (source.Mistakes{Path: log}).Ingest(ctx, st); err != nil {
 		t.Fatal(err)
+	}
+	evs, err := st.Events(ctx, store.Query{Source: "mistakes", Until: time.Now(), Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ev store.Event
+	for _, e := range evs {
+		if e.Ref == fmt.Sprintf("%s@%d", log, len(first)) {
+			ev = e
+		}
+	}
+	if ev.Ref == "" {
+		t.Fatalf("the adapter did not store the row: %+v", evs)
 	}
 	st.Close()
 	if err := store.AsOf(ctx, src, paths.DB(), end.Add(-30*24*time.Hour), end); err != nil {

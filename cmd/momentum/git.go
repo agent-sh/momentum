@@ -111,6 +111,22 @@ func evidenceGit(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	if err != nil || trial != "" && !within(top, trial) {
 		return usageError{"in an evaluation, the repository must be under the resolved trial directory"}
 	}
+	if trial != "" {
+		// a .git file names the git directory a work tree reads, wherever it is: its objects and refs must be the trial's too
+		for _, which := range []string{"--absolute-git-dir", "--git-common-dir"} {
+			out, err := gitRead(ctx, dir, "rev-parse", which)
+			p := strings.TrimSpace(out)
+			if err == nil && !filepath.IsAbs(p) {
+				p = filepath.Join(dir, p)
+			}
+			if err == nil {
+				p, err = filepath.EvalSymlinks(p)
+			}
+			if err != nil || !within(p, trial) {
+				return usageError{"in an evaluation, the repository's git directory must be under the resolved trial directory"}
+			}
+		}
+	}
 	argv, err := gitArgs(ctx, dir, sub, spec, rest)
 	if err != nil {
 		return err

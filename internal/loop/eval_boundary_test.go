@@ -149,7 +149,10 @@ func TestTrialCommandsAndDirectoriesAreNeutral(t *testing.T) {
 				t.Errorf("shared reference exposes %q", forbidden)
 			}
 		}
-		for _, required := range []string{"source and kind", "transcripts", "incidents", "mistakes", "sessions", "supervise", "radar", "capacity"} {
+		if strings.Contains(shared, " radar,") {
+			t.Error("reference names radar, whose findings no snapshot holds")
+		}
+		for _, required := range []string{"source and kind", "transcripts", "incidents", "mistakes", "sessions", "supervise", "radar-feedback", "capacity"} {
 			if !strings.Contains(shared, required) {
 				t.Errorf("reference omits %q", required)
 			}
