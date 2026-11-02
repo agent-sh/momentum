@@ -624,12 +624,12 @@ const trialCommands = `
 
 ## Commands available in this trial
 Your working directory is . (the trial's isolated directory). File tools read its files and repository checkouts.
-- momentum evidence show ID: reads a stored event and the full transcript or log record it names.
-- momentum evidence search TEXT [--source SOURCE] [--since WHEN] [--until WHEN] [--kind K,K] [--actor ACTOR] [--session ID] [--limit N]: matches stored summaries of every source, newest first; --source narrows it. Sources: transcripts, incidents, mistakes, radar-feedback, sessions, supervise, capacity; --source must name one the store holds. Actors: owner, agent, tool, harness, detector, unknown.
-- momentum evidence events [--source SOURCE] [--kind K,K] [--since WHEN] [--until WHEN] [--harness NAME] [--session ID] [--limit N] [--json]: reads stored events, optionally one session.
+- momentum evidence show ID [ID...] [--bytes N]: reads up to ten stored events, each with the full transcript or log record it names; --bytes N prints each record's first N bytes.
+- momentum evidence search TEXT [--source SOURCE] [--since WHEN] [--until WHEN] [--kind K,K] [--actor ACTOR] [--session ID] [--limit N]: matches stored summaries of every source, newest first; --source narrows it. Sources: transcripts, incidents, mistakes, radar-feedback, sessions, supervise, capacity; --source must name one the store holds. Actors: owner, agent, tool, harness, detector, unknown. A phrase that starts with a dash goes after --.
+- momentum evidence events [--source SOURCE] [--kind K,K] [--since WHEN] [--until WHEN] [--harness NAME] [--actor ACTOR] [--session ID] [--limit N] [--json]: reads stored events, optionally one session; each line names its event's ev:ID.
 - momentum evidence status [--since WHEN]: counts stored events by source and kind.
-- momentum evidence git DIR CMD ...: reads a trial checkout's history with log, show, diff, blame, grep, ls-files, ls-tree, rev-parse, rev-list, merge-base, describe, status, shortlog, or listing forms of branch and tag. Use read options only; revisions are checked and paths follow --.
-No other shell commands are available.
+- momentum evidence git DIR CMD ...: reads a trial checkout's history with log, show, diff, blame, grep, ls-files, ls-tree, rev-parse, rev-list, merge-base, describe, status, shortlog, or listing forms of branch and tag. Use read options only (git's -N for a count; grep's first word is its pattern); revisions are checked and paths follow --. A grep with no match exits 1.
+No other shell commands are available: the harness refuses any other program, and a pipe, a loop, a substitution or a redirection.
 `
 
 func (e *Eval) system(arm, family string) (string, error) {

@@ -124,7 +124,8 @@ func TestEvidenceShowDoesNotReadAHermesStoreAsText(t *testing.T) {
 	}
 	for _, e := range evs {
 		code, out, diag := momentum("evidence", "show", e.ID())
-		if code != 0 || strings.Contains(out, "fix that") || !strings.Contains(out, "row of the Hermes store") {
+		// its row read by its id: later than the end, or not a row at all, never the file's bytes
+		if code != 0 || strings.Contains(out, "fix that") || !strings.Contains(out, "withheld") && !strings.Contains(out, "its record is gone") {
 			t.Fatalf("a Hermes reference at %s: exit %d %q %s", e.Ref, code, out, diag)
 		}
 	}

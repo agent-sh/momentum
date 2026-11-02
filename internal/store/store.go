@@ -1041,6 +1041,42 @@ func (s *Store) Before(ctx context.Context, session string, kinds []string, afte
 }
 
 // Counts returns events per source and kind since a time, for the status view.
+// UnknownKinds are the kinds of a list that no event of the store has, with the kinds its events do have, sorted;
+// a store with no events knows no kind, so it names none unknown.
+func (s *Store) UnknownKinds(ctx context.Context, kinds []string) (unknown, held []string, err error) {
+	for _, k := range kinds {
+		var one int
+		switch err := s.db.QueryRowContext(ctx, `SELECT 1 FROM events WHERE kind = ? LIMIT 1`, k).Scan(&one); {
+		case errors.Is(err, sql.ErrNoRows):
+			unknown = append(unknown, k)
+		case err != nil:
+			return nil, nil, err
+		}
+	}
+	if len(unknown) == 0 {
+		return nil, nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT kind FROM events ORDER BY kind`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, nil, err
+		}
+		held = append(held, k)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	if len(held) == 0 {
+		return nil, nil, nil
+	}
+	return unknown, held, nil
+}
+
 func (s *Store) Counts(ctx context.Context, since time.Time, until ...time.Time) (map[string]map[string]int, error) {
 	where := "ts >= ?"
 	args := []any{since.UnixMilli()}
