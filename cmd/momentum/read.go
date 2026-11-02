@@ -122,9 +122,6 @@ func placeOf(ref string) (string, int64, bool) {
 // secretDirs are where the user's credentials are kept, under his home: none of it is shown.
 var secretDirs = loop.CredentialDirs
 
-// secretName is a file's name that says it holds a secret.
-var secretName = regexp.MustCompile(`(?i)(^\.env($|\.)|\.pem$|\.key$|\.p12$|\.pfx$|^id_(rsa|dsa|ecdsa|ed25519)|credential|secret|token|\.kdbx$|\.keystore$)`)
-
 // secretPath says why a path is not shown, or "".
 func secretPath(p string) string {
 	abs, err := filepath.Abs(p)
@@ -140,7 +137,7 @@ func secretPath(p string) string {
 			return "it is where credentials are kept"
 		}
 	}
-	if secretName.MatchString(filepath.Base(abs)) {
+	if loop.CredentialName(filepath.Base(abs)) {
 		return "its name says it holds a secret"
 	}
 	return ""
@@ -171,18 +168,16 @@ func evidenceFile(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if why := secretPath(file); why != "" {
 		return usageError{fmt.Sprintf("%s is not shown: %s", file, why)}
 	}
-	st, err := os.Stat(file)
-	if err != nil {
-		return usageError{err.Error()}
-	}
-	if !st.Mode().IsRegular() {
-		return usageError{fmt.Sprintf("%s is not a file", file)}
-	}
-	f, err := os.Open(file)
+	// opened without waiting on a writer, and read only when what it opened is a regular file: the path may name a
+	// pipe by the time it is opened
+	f, err := os.OpenFile(file, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return usageError{err.Error()}
 	}
 	defer f.Close()
+	if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() {
+		return usageError{fmt.Sprintf("%s is not a file", file)}
+	}
 	text, err := scrubRecords(ctx, f, *tail)
 	if err != nil {
 		return err
