@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -30,6 +31,8 @@ const (
 	// A stop normally completes at once. Allow systemd's default 90-second
 	// stop timeout and some time for the client to observe unit deactivation.
 	stopTimeout = 2 * time.Minute
+	// killGrace is how long a queued stop has to end the client before the unit's processes are killed.
+	killGrace = 500 * time.Millisecond
 )
 
 var (
@@ -80,6 +83,7 @@ func (s Spec) Command(ctx context.Context) (*exec.Cmd, error) {
 		"--user", "--wait", "--pipe", "--collect", "--quiet",
 		"--expand-environment=no", "--unit=" + s.Unit,
 		"-p", "MemoryMax=" + l.Memory,
+		"-p", "MemorySwapMax=0",
 		"-p", "CPUQuota=" + l.CPUQuota,
 		"-p", "TasksMax=" + strconv.Itoa(l.Tasks),
 		"-p", "RuntimeMaxSec=" + strconv.Itoa(l.RuntimeSec),
@@ -161,8 +165,13 @@ func runCommand(ctx context.Context, unit string, cmd *exec.Cmd, stdout, stderr 
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	diagnostic := &failureWriter{dst: stderr}
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, stdout, diagnostic
+	// The first failing write by an output writer ends the run as a cancellation does, through the same stop path:
+	// a caller that bounds its writers by failing them expects the run to end, not to go on writing nowhere.
+	stopCtx, stopNow := context.WithCancel(ctx)
+	defer stopNow()
+	var writes writeFailure
+	diagnostic := &failureWriter{dst: &failSafeWriter{w: stderr, f: &writes, stop: stopNow}}
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, &failSafeWriter{w: stdout, f: &writes, stop: stopNow}, diagnostic
 	// Close inherited output pipes if a broken manager leaves descendants alive
 	// after the client exits. Normal unit cleanup finishes before this delay.
 	cmd.WaitDelay = stopTimeout
@@ -174,44 +183,55 @@ func runCommand(ctx context.Context, unit string, cmd *exec.Cmd, stdout, stderr 
 	var waitErr, cleanupErr error
 	select {
 	case waitErr = <-done:
-	case <-ctx.Done():
+	case <-stopCtx.Done():
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), stopTimeout)
-		// Cancellation can race service creation. A stop of a not-yet-loaded
-		// unit is retried until the client ends or the stop actually succeeds.
-		for {
-			err := stopUnit(cleanupCtx, unit)
-			if err == nil {
-				break
-			}
+		defer cancel()
+		// A stop can race the unit's creation. A SIGTERM that reaches bubblewrap while it is still setting up its
+		// namespaces can leave the program running (measured: a 30 s sleep ran to its end after a stop 20 ms in), and a
+		// blocking stop waits for that. So the stop is queued without waiting, and a SIGKILL to every process of the
+		// unit follows when the client has not ended within a short grace; both are issued again, every 100 ms, until
+		// the client has ended or the deadline passes.
+		for ended, stopErr := false, error(nil); !ended; {
+			stopErr = errors.Join(stopUnit(cleanupCtx, unit))
 			select {
 			case waitErr = <-done:
-				cancel()
-				return result(waitErr, diagnostic.failed), ctx.Err()
-			case <-cleanupCtx.Done():
-				cleanupErr = fmt.Errorf("sandbox: stop unit: %w", err)
-			case <-time.After(25 * time.Millisecond):
+				ended = true
 				continue
+			case <-cleanupCtx.Done():
+			case <-time.After(killGrace):
+				stopErr = errors.Join(stopErr, killUnit(cleanupCtx, unit))
+				select {
+				case waitErr = <-done:
+					ended = true
+					continue
+				case <-cleanupCtx.Done():
+				case <-time.After(100 * time.Millisecond):
+					continue
+				}
 			}
-			break
-		}
-		select {
-		case waitErr = <-done:
-		case <-cleanupCtx.Done():
-			// Do not leave a client or its output goroutines behind if the user
-			// manager is broken. Report cleanup failure; RuntimeMaxSec still applies.
-			cleanupErr = errors.Join(cleanupErr, errors.New("sandbox: unit cleanup timed out"))
+			// Do not leave a client or its output goroutines behind if the user manager is broken. Report the
+			// cleanup failure; RuntimeMaxSec still applies.
+			cleanupErr = errors.Join(stopErr, errors.New("sandbox: unit cleanup timed out"))
 			_ = cmd.Process.Kill()
 			waitErr = <-done
+			ended = true
 		}
-		cancel()
 		r := result(waitErr, diagnostic.failed)
-		r.Failed = cleanupErr != nil
-		return r, errors.Join(ctx.Err(), cleanupErr)
+		r.Failed = cleanupErr != nil || writes.err() != nil
+		reason := ctx.Err()
+		if werr := writes.err(); werr != nil {
+			reason = errors.Join(reason, fmt.Errorf("sandbox: write output: %w", werr))
+		}
+		return r, errors.Join(reason, cleanupErr)
 	}
 	r := result(waitErr, diagnostic.failed)
+	if werr := writes.err(); werr != nil {
+		r.Failed = true
+		return r, fmt.Errorf("sandbox: write output: %w", werr)
+	}
 	var exit *exec.ExitError
 	if waitErr != nil && !errors.As(waitErr, &exit) {
-		// An output writer can fail while the unit is alive. Stop before returning.
+		// The client itself failed (not the program): make sure no unit is left.
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), stopTimeout)
 		defer cancel()
 		cleanupErr = stopUnit(cleanupCtx, unit)
@@ -219,6 +239,42 @@ func runCommand(ctx context.Context, unit string, cmd *exec.Cmd, stdout, stderr 
 		return r, errors.Join(fmt.Errorf("sandbox: wait for launcher: %w", waitErr), cleanupErr)
 	}
 	return r, nil
+}
+
+// writeFailure keeps the first error an output writer returned.
+type writeFailure struct {
+	mu sync.Mutex
+	e  error
+}
+
+func (f *writeFailure) set(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.e == nil {
+		f.e = err
+	}
+}
+
+func (f *writeFailure) err() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.e
+}
+
+// failSafeWriter passes writes on, and on the first failure records it and stops the run.
+type failSafeWriter struct {
+	w    io.Writer
+	f    *writeFailure
+	stop func()
+}
+
+func (w *failSafeWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	if err != nil {
+		w.f.set(err)
+		w.stop()
+	}
+	return n, err
 }
 
 func result(err error, failed bool) Result {
@@ -239,8 +295,16 @@ func result(err error, failed bool) Result {
 	return r
 }
 
+// stopUnit queues the unit's stop (SIGTERM, then SIGKILL after systemd's own timeout) and returns without waiting.
 func stopUnit(ctx context.Context, unit string) error {
-	cmd := exec.CommandContext(ctx, "systemctl", "--user", "stop", unit+".service")
+	cmd := exec.CommandContext(ctx, "systemctl", "--user", "stop", "--no-block", unit+".service")
+	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
+	return cmd.Run()
+}
+
+// killUnit sends SIGKILL to every process of the unit, the namespace's init included.
+func killUnit(ctx context.Context, unit string) error {
+	cmd := exec.CommandContext(ctx, "systemctl", "--user", "kill", "--kill-whom=all", "--signal=SIGKILL", unit+".service")
 	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
 	return cmd.Run()
 }
@@ -422,6 +486,9 @@ func privateDirectory(path string) error {
 	if !cleanAbsolute(path) {
 		return errors.New("sandbox: Host must be absolute and clean")
 	}
+	if err := resolved(path); err != nil {
+		return fmt.Errorf("sandbox: Host: %w", err)
+	}
 	st, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("sandbox: Host: %w", err)
@@ -432,9 +499,25 @@ func privateDirectory(path string) error {
 	return nil
 }
 
+// resolved says a path goes through no link: its parents are as real as its last element. Callers pass paths they
+// resolved themselves (filepath.EvalSymlinks), so what a check saw is what bubblewrap mounts.
+func resolved(path string) error {
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return err
+	}
+	if real != path {
+		return errors.New("the path goes through a symbolic link")
+	}
+	return nil
+}
+
 func source(path string) error {
 	if !cleanAbsolute(path) {
 		return errors.New("sandbox: source must be absolute and clean")
+	}
+	if err := resolved(path); err != nil {
+		return fmt.Errorf("sandbox: source: %w", err)
 	}
 	st, err := os.Lstat(path)
 	if err != nil {

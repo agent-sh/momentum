@@ -51,7 +51,7 @@ func TestCommandGolden(t *testing.T) {
 	want := []string{
 		"systemd-run", "--user", "--wait", "--pipe", "--collect", "--quiet",
 		"--expand-environment=no", "--unit=momentum-run-golden-7f3a",
-		"-p", "MemoryMax=4G", "-p", "CPUQuota=400%", "-p", "TasksMax=512",
+		"-p", "MemoryMax=4G", "-p", "MemorySwapMax=0", "-p", "CPUQuota=400%", "-p", "TasksMax=512",
 		"-p", "RuntimeMaxSec=1800", "-p", "NoNewPrivileges=yes",
 		"-p", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK", "--",
 		"bwrap", "--unshare-all", "--unshare-user", "--disable-userns",
@@ -167,6 +167,35 @@ func TestSourceRules(t *testing.T) {
 		socketFixture(t, filepath.Join(child, "fixture.sock"))
 		if _, err := s.Command(context.Background()); err == nil {
 			t.Fatal("source holding a socket accepted")
+		}
+	})
+	t.Run("link-in-a-parent", func(t *testing.T) {
+		s := basicSpec(t)
+		parent := t.TempDir()
+		link := filepath.Join(t.TempDir(), "link")
+		if err := os.Symlink(parent, link); err != nil {
+			t.Fatal(err)
+		}
+		inner := filepath.Join(parent, "inner")
+		if err := os.Mkdir(inner, 0700); err != nil {
+			t.Fatal(err)
+		}
+		s.Binds[0].Src = filepath.Join(link, "inner")
+		if _, err := s.Command(context.Background()); err == nil {
+			t.Fatal("a source reached through a link in its parent was accepted")
+		}
+		s.Binds[0].Src = inner
+		if _, err := s.Command(context.Background()); err != nil {
+			t.Fatalf("the same directory by its real path was refused: %v", err)
+		}
+	})
+	t.Run("host-mode", func(t *testing.T) {
+		s := basicSpec(t)
+		if err := os.Chmod(s.Host, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Command(context.Background()); err == nil {
+			t.Fatal("a host directory of mode 0755 was accepted")
 		}
 	})
 	t.Run("unclean", func(t *testing.T) {

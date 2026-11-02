@@ -42,6 +42,11 @@ func shortTemp(t *testing.T) string {
 func needSandbox(t *testing.T, relay bool) {
 	t.Helper()
 	if err := Available(relay); err != nil {
+		// A skipped suite proves nothing about the boundary. A run that must prove it (a check before a release, a
+		// machine that is meant to have the sandbox) sets MOMENTUM_REQUIRE_SANDBOX, and a skip then fails.
+		if os.Getenv("MOMENTUM_REQUIRE_SANDBOX") != "" {
+			t.Fatalf("the real sandbox is required and unavailable: %v", err)
+		}
 		t.Skipf("real sandbox unavailable: %v", err)
 	}
 }
@@ -437,7 +442,7 @@ func TestLimitsAndCancellation(t *testing.T) {
 	showCtx, showCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer showCancel()
 	cmd := exec.CommandContext(showCtx, "systemctl", "--user", "show", s.Unit+".service",
-		"-p", "MemoryMax", "-p", "CPUQuotaPerSecUSec", "-p", "TasksMax", "-p", "RuntimeMaxUSec",
+		"-p", "MemoryMax", "-p", "MemorySwapMax", "-p", "CPUQuotaPerSecUSec", "-p", "TasksMax", "-p", "RuntimeMaxUSec",
 		"-p", "NoNewPrivileges", "-p", "RestrictAddressFamilies")
 	out, err := cmd.Output()
 	if err != nil {
@@ -449,7 +454,7 @@ func TestLimitsAndCancellation(t *testing.T) {
 		properties[name] = value
 	}
 	for name, want := range map[string]string{
-		"MemoryMax": "134217728", "CPUQuotaPerSecUSec": "500ms",
+		"MemoryMax": "134217728", "MemorySwapMax": "0", "CPUQuotaPerSecUSec": "500ms",
 		"TasksMax": "32", "RuntimeMaxUSec": "1min 30s", "NoNewPrivileges": "yes",
 	} {
 		if properties[name] != want {
@@ -623,5 +628,75 @@ func TestStopLeftover(t *testing.T) {
 	assertUnitGone(t, s.Unit)
 	if out, err := exec.Command("systemctl", "--user", "is-active", other.Unit+".service").Output(); err != nil || strings.TrimSpace(string(out)) != "active" {
 		t.Fatal("a unit of another prefix was stopped")
+	}
+}
+
+// A context cancelled right after the run starts ends it at once, whenever in the unit's creation the cancel lands:
+// a stop that systemctl accepts while the unit is still being made must not let the program run on.
+func TestCancelRightAfterStartEndsTheRun(t *testing.T) {
+	needSandbox(t, false)
+	for i, delay := range []time.Duration{0, 5, 10, 15, 20, 25, 30, 35, 40, 50, 60, 80} {
+		s := basicSpec(t)
+		s.Unit = fmt.Sprintf("momentum-run-early-cancel-%d-%s", i, filepath.Base(s.Host))
+		s.Argv = []string{"/bin/sh", "-c", "sleep 30"}
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(delay * time.Millisecond)
+			cancel()
+		}()
+		start := time.Now()
+		_, err := s.Run(ctx, io.Discard, io.Discard)
+		cancel()
+		if took := time.Since(start); took > 10*time.Second {
+			t.Fatalf("a cancel after %d ms left the program running for %s (err %v)", delay, took, err)
+		}
+		assertUnitGone(t, s.Unit)
+	}
+}
+
+// An output writer that fails ends the run: the program does not go on with its output going nowhere, and the
+// writer's error is returned whatever the program's own exit.
+func TestAFailingOutputWriterEndsTheRun(t *testing.T) {
+	needSandbox(t, false)
+	for name, argv := range map[string][]string{
+		"exit-nonzero": {"/bin/sh", "-c", "echo first; sleep 30; echo after > /work/after.txt; exit 3"},
+		"exit-zero":    {"/bin/sh", "-c", "trap '' PIPE; echo first; sleep 30; echo after > /work/after.txt"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := basicSpec(t)
+			s.Unit = "momentum-run-writer-" + name + "-" + filepath.Base(s.Host)
+			s.Argv = argv
+			start := time.Now()
+			r, err := s.Run(context.Background(), failingWriter{}, io.Discard)
+			if took := time.Since(start); took > 15*time.Second {
+				t.Fatalf("the run went on for %s after its writer failed", took)
+			}
+			if err == nil || !strings.Contains(err.Error(), "write output") || !r.Failed {
+				t.Fatalf("the writer's error was not returned: %+v %v", r, err)
+			}
+			if _, statErr := os.Stat(filepath.Join(s.Binds[0].Src, "after.txt")); statErr == nil {
+				t.Fatal("the program went on to write after its writer failed")
+			}
+			assertUnitGone(t, s.Unit)
+		})
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("the writer is full") }
+
+// Run removes the identity files it wrote into Host.
+func TestRunRemovesItsIdentityFiles(t *testing.T) {
+	needSandbox(t, false)
+	s := basicSpec(t)
+	s.Unit = "momentum-run-identity-" + filepath.Base(s.Host)
+	if r, err := s.Run(context.Background(), io.Discard, io.Discard); err != nil || r.Code != 0 {
+		t.Fatalf("%+v %v", r, err)
+	}
+	for _, name := range []string{"passwd", "group"} {
+		if _, err := os.Stat(filepath.Join(s.Host, name)); err == nil {
+			t.Fatalf("%s is still in Host after the run", name)
+		}
 	}
 }
