@@ -606,6 +606,14 @@ func (e *Eval) cloneRepositories(ctx context.Context, t GoldenTask, dir string) 
 	return out, nil
 }
 
+// harnessHome is one evaluation run's own configuration directory for the harness (Claude Code's CLAUDE_CONFIG_DIR),
+// outside the run's directory, which its file tools reach: what the harness keeps of a session, its large tool
+// outputs among them, goes there and is removed when the run ends, so nothing of a trial stays in the user's.
+func (e *Eval) harnessHome(name string) (string, error) {
+	dir := filepath.Join(e.Dir, "harness", name)
+	return dir, os.MkdirAll(dir, 0o700)
+}
+
 // investigate runs the investigation step of a trial as the loop runs it: the native path's brief, tools and report,
 // with the case's evidence in its prompt, under an evaluation's permissions: the trial's directory alone to read and
 // write, the store as of the cutoff through momentum, the records its events name (evidence show), the
@@ -674,9 +682,14 @@ func (e *Eval) invokeTrial(ctx context.Context, t GoldenTask, c store.Case, dir,
 	if inv.Prompt, err = Redact(ctx, inv.Prompt); err != nil {
 		return Result{}, err
 	}
+	home, err := e.harnessHome(filepath.Base(filepath.Dir(dir)) + "-" + filepath.Base(dir))
+	if err != nil {
+		return Result{}, err
+	}
+	defer os.RemoveAll(home)
 	agent := r.Agent
 	agent.Env = CleanEnv(map[string]string{"MOMENTUM_HOME": dir, "MOMENTUM_EVAL": e.ID, "MOMENTUM_NOW": t.Cutoff.Format(time.RFC3339Nano), "MOMENTUM_ACTOR": "eval:" + run.ID,
-		"MOMENTUM_LOOP_RUN": run.ID, "MOMENTUM_LOOP_CASE": c.ID, "MOMENTUM_LOOP_DIR": dir}, r.Bins...)
+		"MOMENTUM_LOOP_RUN": run.ID, "MOMENTUM_LOOP_CASE": c.ID, "MOMENTUM_LOOP_DIR": dir, "CLAUDE_CONFIG_DIR": home}, r.Bins...)
 	if err := os.WriteFile(filepath.Join(dir, "prompt.txt"), []byte(inv.Prompt), 0o600); err != nil {
 		return Result{}, err
 	}
@@ -799,9 +812,14 @@ func (e *Eval) grade(ctx context.Context, t GoldenTask, f finding, jdir string, 
 	if err := os.WriteFile(filepath.Join(jdir, "prompt.txt"), []byte(inv.Prompt), 0o600); err != nil {
 		return Grade{}, 0, err
 	}
+	home, err := e.harnessHome("judge-" + filepath.Base(jdir))
+	if err != nil {
+		return Grade{}, 0, err
+	}
+	defer os.RemoveAll(home)
 	judge := e.Judge
 	judge.Fallback = ""
-	judge.Env = CleanEnv(nil, e.Runner.Bins...)
+	judge.Env = CleanEnv(map[string]string{"CLAUDE_CONFIG_DIR": home}, e.Runner.Bins...)
 	// a judge that fails (an API error, an answer off its schema) is tried once more on the same model, its first
 	// stream kept beside it; a trial still without a grade is left out of the comparison with its pair (Results)
 	spent := 0.0

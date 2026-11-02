@@ -581,3 +581,52 @@ func TestResultProvenanceNamesEachFamily(t *testing.T) {
 		t.Fatalf("%+v", r.Provenance)
 	}
 }
+
+// A trial's harness keeps its session in a configuration directory of the evaluation's own, outside the trial's
+// directory and removed when the run ends: a large tool output it saves stays nowhere, the user's included.
+func TestATrialsHarnessKeepsNothing(t *testing.T) {
+	e, task := evalFixture(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := t.TempDir()
+	keep := func(name string) string {
+		return script(t, dir, name, `mkdir -p "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/p/s/tool-results"
+printf 'a large tool output' > "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/p/s/tool-results/out.txt"
+printf '%s\n' "${CLAUDE_CONFIG_DIR:-unset}" >> "`+filepath.Join(dir, name+".homes")+`"
+exec "$@"`)
+	}
+	e.Runner.Agent.Runner = append([]string{keep("trial")}, e.Runner.Agent.Runner...)
+	e.Judge.Runner = append([]string{keep("judge")}, e.Judge.Runner...)
+	trs, err := e.Run(context.Background(), []GoldenTask{task})
+	if err != nil || len(trs) != 2 {
+		t.Fatalf("%+v %v", trs, err)
+	}
+	for _, tr := range trs {
+		if tr.Err != "" {
+			t.Fatal(tr.Err)
+		}
+	}
+	for _, name := range []string{"trial", "judge"} {
+		raw, _ := os.ReadFile(filepath.Join(dir, name+".homes"))
+		homes := strings.Fields(string(raw))
+		if len(homes) != 2 {
+			t.Fatalf("%s: %q", name, raw)
+		}
+		for _, h := range homes {
+			if !strings.HasPrefix(h, filepath.Join(e.Dir, "harness")+"/") {
+				t.Errorf("%s: its harness kept its session in %s", name, h)
+			}
+			if _, err := os.Stat(h); err == nil {
+				t.Errorf("%s: %s outlived its run", name, h)
+			}
+		}
+	}
+	if _, err := os.Stat(filepath.Join(home, ".claude")); err == nil {
+		t.Error("a trial wrote under the user's own configuration")
+	}
+	for _, tr := range trs {
+		if rel, err := filepath.Rel(tr.Run.Dir, filepath.Join(e.Dir, "harness")); err != nil || !strings.HasPrefix(rel, "..") {
+			t.Errorf("the harness's directory is inside the trial's, which its file tools reach: %s", rel)
+		}
+	}
+}
