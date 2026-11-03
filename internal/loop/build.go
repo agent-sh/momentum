@@ -211,15 +211,20 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 // its target checked again before the clone is mounted.
 func (r *Runner) buildConfigPackage(ctx context.Context, c store.Case, run store.LoopRun, target string) (Package, error) {
 	// the run reads its target in /ro/config: a file the copy left out (its share of the cap, a skip) is not what the run saw
-	if r.pass == nil || !slices.ContainsFunc(r.pass.manifest.Configuration.Files, func(f ConfigFile) bool { return f.Path == target }) {
+	copied := -1
+	if r.pass != nil {
+		copied = slices.IndexFunc(r.pass.manifest.Configuration.Files, func(f ConfigFile) bool { return f.Path == target })
+	}
+	if copied < 0 {
 		return Package{}, refused("the run's configuration copy left out %s: the run could not read the file it would change", target)
 	}
+	copyHash := r.pass.manifest.Configuration.Files[copied].SHA256
 	p, had, err := r.Ship.Load(c.ID)
 	if err != nil {
 		return p, err
 	}
 	if !had || p.State == RolledBack || p.State == Kept {
-		if p, err = r.Ship.PrepareConfig(ctx, c.ID, target); err != nil {
+		if p, err = r.Ship.prepareConfig(ctx, c.ID, target, copyHash); err != nil {
 			return p, err
 		}
 	}
@@ -241,7 +246,14 @@ func (r *Runner) buildConfigPackage(ctx context.Context, c store.Case, run store
 	if p.RefreshBase {
 		p, err = r.Ship.refreshBaseLocked(r.Ship.gitContext(shipContext(ctx, p.Case)), p)
 	} else if err = r.Ship.packageAuthority(ctx, p); err == nil {
-		err = r.Ship.freshRunClone(shipContext(ctx, p.Case), p)
+		// one change per file: a package prepared earlier waits while another case's change on its file is not done
+		var other string
+		if other, err = r.Ship.targetBusy(ctx, p.Case, p.Target); err == nil && other != "" {
+			err = &shipHold{err: refused("%s is the target of case %s's change, which is not done: the loop leaves it alone", p.Target, other)}
+		}
+		if err == nil {
+			err = r.Ship.freshRunClone(shipContext(ctx, p.Case), p)
+		}
 	}
 	if err != nil {
 		return p, err

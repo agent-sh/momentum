@@ -93,6 +93,23 @@ type Loop struct {
 	ConfigTargets ConfigTargets `json:"config_targets"`
 }
 
+// Own are the loop's own configuration files and directories, as configured: its rules files, scope check,
+// capacity gate, relay environment, tacit store and runner. No configuration target is one of them.
+func (l Loop) Own() []string {
+	own := append([]string(nil), l.Rules...)
+	for _, cmd := range [][]string{l.RepoGuard, l.CapacityGate, l.Runner} {
+		if len(cmd) > 0 && cmd[0] != "" {
+			own = append(own, cmd[0])
+		}
+	}
+	for _, p := range []string{l.BedrockEnv, l.TacitStore} {
+		if p != "" {
+			own = append(own, p)
+		}
+	}
+	return own
+}
+
 // ConfigTargets is loop.config_targets.
 type ConfigTargets struct {
 	Enabled bool     `json:"enabled"`
@@ -133,6 +150,20 @@ func Load() (Sources, error) {
 		}
 		if err := cfgpaths.CheckAllow(l.ConfigTargets.Allow); err != nil {
 			return s, fmt.Errorf("%s: %w", SourcesPath(), err)
+		}
+		home := paths.Home()
+		for _, own := range l.Own() {
+			rel, err := filepath.Rel(home, paths.Expand(own))
+			if err != nil || !filepath.IsLocal(rel) {
+				continue
+			}
+			rel = filepath.ToSlash(rel)
+			for _, entry := range l.ConfigTargets.Allow {
+				e := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(entry), "~/"), "/**")
+				if e == rel || strings.HasPrefix(e, rel+"/") {
+					return s, fmt.Errorf("%s: loop.config_targets.allow entry %q is the loop's own configuration (%s)", SourcesPath(), entry, own)
+				}
+			}
 		}
 	}
 	s.Mistakes.Path = paths.Expand(s.Mistakes.Path)

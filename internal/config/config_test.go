@@ -188,3 +188,24 @@ func TestConfigTargetsAreOffByDefaultAndStrict(t *testing.T) {
 		t.Fatalf("%+v %v", s.Loop.ConfigTargets, err)
 	}
 }
+
+// An allow entry that names the loop's own configuration (a rules file the runs read) is refused at load.
+func TestConfigTargetsRefuseTheLoopsOwnFiles(t *testing.T) {
+	cfg, home := t.TempDir(), t.TempDir()
+	t.Setenv("MOMENTUM_CONFIG", cfg)
+	t.Setenv("HOME", home)
+	raw := `{"loop": {"rules": ["~/.config/agents/RULES.md"], "config_targets": {"enabled": true, "allow": [".config/agents/RULES.md"]}}}`
+	if err := os.WriteFile(filepath.Join(cfg, "sources.json"), []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "the loop's own configuration") {
+		t.Fatalf("a rules file in allow: %v", err)
+	}
+	raw = `{"loop": {"rules": ["~/.config/agents/RULES.md"], "config_targets": {"enabled": true, "allow": [".config/agents/OTHER.md"]}}}`
+	if err := os.WriteFile(filepath.Join(cfg, "sources.json"), []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(); err != nil {
+		t.Fatal(err)
+	}
+}

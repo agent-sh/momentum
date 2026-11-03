@@ -36,6 +36,33 @@ type ConfigTargets struct {
 	// Allow names the targets: exact home-relative files, or directories whose existing files they admit.
 	Allow []string
 	Home  string // the real home the targets resolve under
+	// Protected are the loop's own configuration files and directories (its rules files, scope check, capacity gate,
+	// relay environment, tacit store and runner), absolute or under ~/: no target is one of them or below one.
+	Protected []string
+}
+
+// protected says why a home-relative name is the loop's own configuration, or "".
+func (ct ConfigTargets) protected(name string) string {
+	for _, p := range ct.Protected {
+		p = strings.TrimSpace(p)
+		if rest, ok := strings.CutPrefix(p, "~/"); ok {
+			p = rest
+		} else if filepath.IsAbs(p) {
+			if ct.Home == "" {
+				continue
+			}
+			rel, err := filepath.Rel(ct.Home, filepath.Clean(p))
+			if err != nil || !filepath.IsLocal(rel) {
+				continue
+			}
+			p = rel
+		}
+		p = filepath.ToSlash(filepath.Clean(p))
+		if p != "" && p != "." && (name == p || strings.HasPrefix(name, p+"/")) {
+			return "the loop's own configuration (its rules, scope check, capacity gate, relay environment, tacit store or runner)"
+		}
+	}
+	return ""
 }
 
 func configTargetName(name string) (string, error) {
@@ -61,7 +88,7 @@ func dropIn(name string) bool {
 
 // admit says whether a file is a configuration target: its clean name, or the refusal.
 func (ct ConfigTargets) admit(name string) (string, error) {
-	name, err := admitStructural(name)
+	name, err := ct.admitStructural(name)
 	if err != nil {
 		return "", err
 	}
@@ -71,7 +98,7 @@ func (ct ConfigTargets) admit(name string) (string, error) {
 // admitStructural is a target's checks without the allowlist: its clean name, a root that holds targets, the
 // denylist and the copy's allowlist. A landed change's own target is read so, for the owner's rollback and its
 // in-effect check, after the owner narrowed allow.
-func admitStructural(name string) (string, error) {
+func (ct ConfigTargets) admitStructural(name string) (string, error) {
 	name, err := configTargetName(name)
 	if err != nil {
 		return "", err
@@ -85,6 +112,9 @@ func admitStructural(name string) (string, error) {
 	}
 	if !configPathAllowed(root, name, false) {
 		return "", refused("%s is no configuration target: not configuration", name)
+	}
+	if why := ct.protected(name); why != "" {
+		return "", refused("%s is no configuration target: %s", name, why)
 	}
 	return name, nil
 }
@@ -127,6 +157,12 @@ var errTargetDrift = errors.New("the target changed")
 
 // targetUID is the owner a target's file must have: the caller (a test names another).
 var targetUID = os.Getuid
+
+// targetGroups are the groups a target's file may have: the caller's, whose group a rewrite can keep (a test names others).
+var targetGroups = func() []int {
+	groups, _ := os.Getgroups()
+	return append(groups, os.Getgid())
+}
 
 func (c ConfigState) same(o ConfigState) bool { return c.Absent == o.Absent && c.SHA256 == o.SHA256 }
 
@@ -176,7 +212,7 @@ func (ct ConfigTargets) open(name string) (*targetDir, error) {
 
 // openStructural opens a landed change's own target without the allowlist (admitStructural).
 func (ct ConfigTargets) openStructural(name string) (*targetDir, error) {
-	name, err := admitStructural(name)
+	name, err := ct.admitStructural(name)
 	if err != nil {
 		return nil, err
 	}
@@ -226,6 +262,8 @@ func (d *targetDir) read(file string) (ConfigState, error) {
 		return ConfigState{}, refused("%s is no regular file", d.name)
 	case int(st.Uid) != targetUID():
 		return ConfigState{}, refused("%s is not owned by the caller", d.name)
+	case !slices.Contains(targetGroups(), int(st.Gid)):
+		return ConfigState{}, refused("%s has a group the caller is not in: a rewrite could not keep it", d.name)
 	case st.Nlink > 1:
 		return ConfigState{}, refused("%s has another hard link: a change to it would not be the file's alone", d.name)
 	case st.Size > MaxConfigFileBytes:
@@ -333,7 +371,7 @@ func (d *targetDir) replace(swap string, content []byte, mode uint32, expect Con
 		return errors.Join(err, cleanup)
 	}
 	displaced, err := d.read(swap)
-	if err != nil || displaced.Absent || displaced.SHA256 != expect.SHA256 {
+	if err != nil || displaced.Absent || displaced.SHA256 != expect.SHA256 || displaced.Mode != expect.Mode || displaced.Gid != expect.Gid {
 		if back := exchange(d.fd, swap, d.fd, d.base, unix.RENAME_EXCHANGE); back != nil {
 			// not a refusal: the file may hold the change while what it held sits at the swap name
 			return fmt.Errorf("%s changed while it was written, and the exchange back failed (%v): the journal stays, the owner decides", d.name, back)
@@ -464,6 +502,12 @@ func (s *Ship) mayApply(p Package) string {
 // host reads it now, and an independent run clone of it. The target must read through the
 // scrubber unchanged, so the run's /ro/config copy and its clone hold the bytes the host will patch.
 func (s *Ship) PrepareConfig(ctx context.Context, caseID, target string) (Package, error) {
+	return s.prepareConfig(ctx, caseID, target, "")
+}
+
+// prepareConfig prepares; copied, when set, is the SHA-256 of the run's /ro/config copy of the target, which the file
+// must still hold.
+func (s *Ship) prepareConfig(ctx context.Context, caseID, target, copied string) (Package, error) {
 	ctx = s.gitContext(shipContext(ctx, caseID))
 	unlock, err := s.lock(ctx, caseID)
 	if err != nil {
@@ -492,6 +536,9 @@ func (s *Ship) PrepareConfig(ctx context.Context, caseID, target string) (Packag
 	}
 	if base.Absent {
 		return Package{}, refused("%s is not there: a configuration change edits a file that exists", d.name)
+	}
+	if copied != "" && copied != base.SHA256 {
+		return Package{}, refused("%s changed since the run's configuration copy was made: the run did not read the file it would change", d.name)
 	}
 	unlockTarget, err := s.lockTarget(d.name)
 	if err != nil {
@@ -593,6 +640,16 @@ func (s *Ship) refreshConfigBase(ctx context.Context, p Package) (Package, error
 		return p, err
 	}
 	defer d.Close()
+	unlockTarget, err := s.lockTarget(p.Target)
+	if err != nil {
+		return p, err
+	}
+	defer unlockTarget()
+	if other, err := s.targetBusy(ctx, p.Case, p.Target); err != nil {
+		return p, err
+	} else if other != "" {
+		return p, &shipHold{err: refused("%s is the target of case %s's change, which is not done: the loop leaves it alone", p.Target, other)}
+	}
 	base, err := d.state()
 	if err != nil {
 		return p, err
@@ -735,6 +792,28 @@ func (s *Ship) landConfig(ctx context.Context, p Package) (Package, error) {
 	if err != nil {
 		return p, err
 	}
+	// one change per file: another case may have taken it since this one was prepared
+	unlockTarget, err := s.lockTarget(p.Target)
+	if err != nil {
+		return p, err
+	}
+	defer unlockTarget()
+	if other, err := s.targetBusy(ctx, p.Case, p.Target); err != nil {
+		return p, err
+	} else if other != "" {
+		return p, &shipHold{err: refused("%s is the target of case %s's change, which is not done: no landing", p.Target, other)}
+	}
+	// the test took a while: what the journal records is the file as it is now, and it must still be the base
+	if cur, err = d.state(); err != nil {
+		return p, err
+	}
+	if !cur.sameFile(*p.TargetBase) {
+		p.State, p.RefreshBase = Revising, true
+		if err := s.saveAuthorized(ctx, &p); err != nil {
+			return p, err
+		}
+		return p, refused("%s changed while the landing ran its test: the change is built again on what it holds now", p.Target)
+	}
 	j := ConfigJournal{Target: p.Target, Old: cur, New: ConfigState{SHA256: hashOf(content), Mode: mode, Content: content}, Head: p.Head}
 	if err := s.assignedAuthority(ctx); err != nil {
 		return p, err
@@ -784,9 +863,9 @@ func (s *Ship) landingRefused(ctx context.Context, p Package, cause error) (Pack
 	return p, errors.Join(cause, s.saveAuthorized(ctx, &p))
 }
 
-// AbandonLanding is the owner's way out of a landing that waits for him: one whose file holds neither its old nor its
-// new content. The file is left as it is; the journal goes and the package returns to its build on the file as it is
-// now. A file that holds the change is landed, not abandoned: land it, or roll it back once it is.
+// AbandonLanding is the owner's way out of an interrupted landing that the loop cannot finish (the file holds neither
+// content, or the switch is off or allow no longer names it): a file holding the change gets its journaled content
+// back, any other file is left as it is; the journal goes and the package returns to its build.
 func (s *Ship) AbandonLanding(ctx context.Context, caseID, why string) (Package, error) {
 	ctx = s.gitContext(shipContext(ctx, caseID))
 	unlock, err := s.lock(ctx, caseID)
@@ -805,20 +884,29 @@ func (s *Ship) AbandonLanding(ctx context.Context, caseID, why string) (Package,
 		return p, refused("abandoning a landing needs its why")
 	}
 	var j ConfigJournal
+	restored := ""
 	if ok, err := readRecord(s.pkgDir(p.Case), configJournal, &j); err != nil {
 		return p, err
 	} else if ok {
+		// the owner's own step: the landed target is read by the structural checks, whatever allow and the switches say
 		d, err := s.configTarget(p, true)
 		if err != nil {
 			return p, err
 		}
+		defer d.Close()
+		if err := d.settle(swapName(p.Case), j.New, j.Old); err != nil {
+			return p, fmt.Errorf("abandoning the landing: %w", err)
+		}
 		cur, err := d.state()
-		d.Close()
 		if err != nil {
 			return p, err
 		}
 		if cur.same(j.New) {
-			return p, refused("%s holds the change: land it (it finishes from its journal), then roll it back if it should go", p.Target)
+			// the write went in: put back the content from before it, in the file's mode now
+			if err := d.replace(swapName(p.Case), j.Old.Content, cur.Mode, cur); err != nil {
+				return p, err
+			}
+			restored = " The file held the change; its journaled content is back."
 		}
 	}
 	clean, err := Redact(ctx, why)
@@ -832,7 +920,7 @@ func (s *Ship) AbandonLanding(ctx context.Context, caseID, why string) (Package,
 	if err := s.saveAuthorized(ctx, &p); err != nil {
 		return p, err
 	}
-	return p, s.Store.CaseNote(cleanedNote(ctx), p.Case, "landing abandoned", clean, s.Actor)
+	return p, s.Store.CaseNote(cleanedNote(ctx), p.Case, "landing abandoned", clean+restored, s.Actor)
 }
 
 // resumeConfigLanding finishes a landing a crash interrupted, from its journal: the file holds the new content (done),

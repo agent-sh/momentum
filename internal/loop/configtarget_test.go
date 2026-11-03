@@ -632,7 +632,12 @@ func TestABuildForAConfigurationCaseMountsItsTargetsClone(t *testing.T) {
 	if _, err := r.buildPackage(ctx, c, run); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "left out") {
 		t.Fatalf("a target outside the copy: %v", err)
 	}
-	r.pass.manifest.Configuration.Files = []ConfigFile{{Path: ruleTarget, Root: ".config/agents"}}
+	// a copy of other content is not the file the run read
+	r.pass.manifest.Configuration.Files = []ConfigFile{{Path: ruleTarget, Root: ".config/agents", SHA256: hashOf([]byte("marker-c0ffee other\n"))}}
+	if _, err := r.buildPackage(ctx, c, run); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "since the run's configuration copy") {
+		t.Fatalf("a target changed since the copy: %v", err)
+	}
+	r.pass.manifest.Configuration.Files = []ConfigFile{{Path: ruleTarget, Root: ".config/agents", SHA256: hashOf([]byte(oldRule))}}
 	p, err := r.buildPackage(ctx, c, run)
 	if err != nil || p.Kind != KindConfig || p.Work != filepath.Join(run.Dir, "work") {
 		t.Fatalf("build package: %+v %v", p, err)
@@ -1000,5 +1005,136 @@ func TestALandingKeepsTheFilesGroup(t *testing.T) {
 	var st syscall.Stat_t
 	if err := syscall.Stat(filepath.Join(home, ruleTarget), &st); err != nil || int(st.Gid) != other {
 		t.Fatalf("the group became %d (%v), not %d", st.Gid, err, other)
+	}
+}
+
+// The loop's own configuration (its rules files among them) is no target, whatever allow names.
+func TestTheLoopsOwnConfigurationIsNoTarget(t *testing.T) {
+	home := fakeHome(t)
+	ct := ConfigTargets{Home: home, Allow: []string{".config/agents"}, Protected: []string{filepath.Join(home, ruleTarget), "~/.config/agents/procedures"}}
+	for _, name := range []string{ruleTarget, ".config/agents/procedures/x.md"} {
+		if _, err := ct.admit(name); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "the loop's own configuration") {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if _, err := ct.openStructural(name); !errors.Is(err, ErrRefused) {
+			t.Fatalf("%s structurally: %v", name, err)
+		}
+	}
+	if _, err := ct.admit(".config/agents/OTHER.md"); err != nil {
+		t.Fatal(err)
+	}
+	// systemd's drop-ins for many units are no target even when named exactly
+	for _, name := range []string{".config/systemd/user/service.d/x.conf", ".config/systemd/user/app-.service.d/x.conf", ".config/systemd/user/timer.d/x.conf"} {
+		if _, err := (ConfigTargets{Allow: []string{name}}).admit(name); !errors.Is(err, ErrRefused) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	// a file whose group the caller is not in cannot keep its group through a rewrite
+	targetGroups = func() []int { return nil }
+	d, err := (ConfigTargets{Home: home, Allow: []string{".config/agents"}}).open(ruleTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = d.state()
+	d.Close()
+	targetGroups = func() []int { groups, _ := os.Getgroups(); return append(groups, os.Getgid()) }
+	if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "group") {
+		t.Fatalf("a foreign group: %v", err)
+	}
+}
+
+// One change per file holds at landing too: a case closed by hand freed the file, another prepared it, and the first,
+// reopened, does not land over it.
+func TestAReopenedCaseDoesNotLandOverAnotherChange(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	home := fakeHome(t)
+	s := configShip(t, st, home)
+	c := testingCase(t, st)
+	reviewedConfig(t, s, st, c)
+	if _, err := st.CloseCase(ctx, c.ID, store.NotWorthIt, "", "marker-c0ffee", "test"); err != nil {
+		t.Fatal(err)
+	}
+	other := testingCase2(t, st)
+	if _, err := s.PrepareConfig(ctx, other.ID, ruleTarget); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ReopenCase(ctx, c.ID, []store.Evidence{{Ref: "file:/t/marker-c0ffee-back", At: time.Now()}}, "marker-c0ffee back", "test"); err != nil {
+		t.Fatal(err)
+	}
+	mech, next := "m", "n"
+	if _, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mech, NextTest: &next}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Land(ctx, c.ID); !held(err) || !strings.Contains(err.Error(), other.ID) {
+		t.Fatalf("landed over another live change: %v", err)
+	}
+	if got, _ := readTarget(t, home); got != oldRule {
+		t.Fatalf("the file became %q", got)
+	}
+}
+
+// A chmod while the landing runs is not reverted: the swap checks the displaced file's mode too.
+func TestAChmodDuringTheLandingIsNotReverted(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	home := fakeHome(t)
+	s := configShip(t, st, home)
+	c := testingCase(t, st)
+	reviewedConfig(t, s, st, c)
+	s.ConfigStage = func(stage string) error {
+		if stage == "journaled" {
+			return os.Chmod(filepath.Join(home, ruleTarget), 0o600)
+		}
+		return nil
+	}
+	p, err := s.Land(ctx, c.ID)
+	if !errors.Is(err, ErrRefused) || p.State != Revising {
+		t.Fatalf("land over a chmod: %v %v", p.State, err)
+	}
+	if got, mode := readTarget(t, home); got != oldRule || mode != 0o600 {
+		t.Fatalf("the file became %q %v", got, mode)
+	}
+}
+
+// An interrupted landing the loop may not finish (the switch off, or allow narrowed) is the owner's to abandon: a
+// file holding the change gets its journaled content back, and a leftover swap file is cleared.
+func TestTheOwnerAbandonsALandingTheLoopMayNotFinish(t *testing.T) {
+	for _, why := range []string{"switch off", "allow narrowed"} {
+		t.Run(why, func(t *testing.T) {
+			st := testStore(t)
+			ctx := context.Background()
+			home := fakeHome(t)
+			s := configShip(t, st, home)
+			c := testingCase(t, st)
+			reviewedConfig(t, s, st, c)
+			s.ConfigStage = func(stage string) error {
+				if stage == "written" {
+					return errors.New("crash")
+				}
+				return nil
+			}
+			s.Land(ctx, c.ID)
+			s.ConfigStage = nil
+			if why == "switch off" {
+				s.ConfigTargets.Enabled = false
+			} else {
+				s.ConfigTargets.Allow = nil
+			}
+			if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) {
+				t.Fatalf("the loop finished: %v", err)
+			}
+			write(t, filepath.Join(home, ".config/agents", swapName(c.ID)), oldRule)
+			p, err := s.AbandonLanding(ctx, c.ID, "marker-c0ffee not now")
+			if err != nil || p.State != Revising {
+				t.Fatalf("abandon: %v %v", p.State, err)
+			}
+			if got, mode := readTarget(t, home); got != oldRule || mode != 0o640 {
+				t.Fatalf("the file holds %q %v", got, mode)
+			}
+			if entries, _ := os.ReadDir(filepath.Join(home, ".config/agents")); len(entries) != 1 {
+				t.Fatalf("left beside it: %v", entries)
+			}
+		})
 	}
 }

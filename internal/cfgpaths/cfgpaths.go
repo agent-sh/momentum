@@ -109,6 +109,9 @@ var targetDenied = []string{"cred", "key", "broker", "auth", "secret", "token", 
 	"known_hosts", ".kube", ".docker", ".sqlite3", "-wal", "-shm", "-journal", ".p12", ".pfx", ".gpg", ".asc", "bedrock",
 	"models.json"}
 
+// unitTypes are systemd's unit types, whose top-level and prefix drop-in directories apply to many units.
+var unitTypes = []string{"service", "socket", "timer", "path", "target", "mount", "automount", "swap", "slice", "scope", "device"}
+
 // targetPrograms are the programs the loop and its units resolve at runtime: no target is named as one of them.
 var targetPrograms = []string{"git", "gh", "waitfor", "claude", "codex", "node", "python3", "go", "bwrap", "systemd-run", "sh", "bash"}
 
@@ -129,6 +132,14 @@ func TargetDenied(root, name string) string {
 		for _, denied := range targetDenied {
 			if strings.Contains(lower, denied) {
 				return "denied name"
+			}
+		}
+		// systemd's top-level drop-ins (service.d/, timer.d/) and prefix drop-ins (foo-.service.d/) reach many units
+		if dir, ok := strings.CutSuffix(lower, ".d"); ok {
+			for _, unit := range unitTypes {
+				if dir == unit || strings.HasSuffix(dir, "-."+unit) {
+					return "a drop-in directory for many units"
+				}
 			}
 		}
 		stem := strings.TrimSuffix(lower, pathpkg.Ext(lower))
