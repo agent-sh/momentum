@@ -56,6 +56,7 @@ type Runner struct {
 	Now                func() time.Time
 	Log                func(format string, args ...any)
 	pass               *passInputs
+	pickedSkips        []Done
 }
 
 // Options are what one run of the loop does.
@@ -148,6 +149,7 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 			continue
 		}
 		c, step, why, err := r.pick(ctx, fam, o.Case, o.Dry)
+		done = append(done, r.pickedSkips...)
 		if err != nil {
 			picked = err
 			break
@@ -272,6 +274,7 @@ func (r *Runner) endStale(ctx context.Context) error {
 
 // pick takes investigating cases before open cases, subject to reservations and budgets.
 func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store.Case, string, string, error) {
+	r.pickedSkips = nil
 	cs, err := r.Store.Cases(ctx, store.CaseFilter{Family: family, All: true})
 	if err != nil {
 		return store.Case{}, "", "", err
@@ -298,12 +301,25 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 		if r.Ship != nil && (c.Status == store.CaseDeployed || c.Status == store.CaseMeasuring) {
 			p, ok, err := r.Ship.Load(c.ID)
 			if err != nil {
-				return store.Case{}, "", "", err
+				if noteErr := r.packageProblem(ctx, c, err, dry); noteErr != nil {
+					return store.Case{}, "", "", noteErr
+				}
+				passed = append(passed, c.ID+" package: "+err.Error())
+				r.pickSkipped(c, "package", err)
+				continue
+			}
+			if ok && p.Cleanup != "" && !dry {
+				if _, err := r.Ship.retryCleanup(ctx, c.ID); err != nil {
+					passed = append(passed, c.ID+" cleanup: "+err.Error())
+					r.pickSkipped(c, "cleanup", err)
+				}
 			}
 			if ok && (p.State == RolledBack || p.State == RollingBack) {
 				if !dry {
 					if _, err := r.Ship.RollBack(ctx, c.ID, "resume rollback"); err != nil {
-						return store.Case{}, "", "", err
+						passed = append(passed, c.ID+" rollback: "+err.Error())
+						r.pickSkipped(c, "rollback", err)
+						continue
 					}
 				}
 				passed = append(passed, c.ID+" has a rollback; its receipt precedes more work")
@@ -319,11 +335,24 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 				continue
 			}
 			if p, ok, err := r.Ship.Load(c.ID); err != nil {
-				return store.Case{}, "", "", err
+				if noteErr := r.packageProblem(ctx, c, err, dry); noteErr != nil {
+					return store.Case{}, "", "", noteErr
+				}
+				passed = append(passed, c.ID+" package: "+err.Error())
+				r.pickSkipped(c, "package", err)
+				continue
 			} else if ok && p.State == Landed {
 				if !dry {
+					if p.Cleanup != "" {
+						if _, err := r.Ship.retryCleanup(ctx, c.ID); err != nil {
+							passed = append(passed, c.ID+" cleanup: "+err.Error())
+							r.pickSkipped(c, "cleanup", err)
+						}
+					}
 					if _, err := r.Store.DeployCase(ctx, c.ID, r.Ship.pkgDir(c.ID), p.LandedAt, p.PR+": "+p.Title, "loop"); err != nil {
-						return store.Case{}, "", "", err
+						passed = append(passed, c.ID+" deployment: "+err.Error())
+						r.pickSkipped(c, "deploy", err)
+						continue
 					}
 				}
 				passed = append(passed, c.ID+" has landed; deployment precedes more work")
@@ -385,6 +414,50 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 		return a.c.Seen.After(b.c.Seen)
 	})
 	return cands[0].c, cands[0].step, fmt.Sprintf("%s %s (%s, %d evidence)", cands[0].step, cands[0].c.ID, cands[0].c.Status, cands[0].c.Evidence), nil
+}
+
+func (r *Runner) pickSkipped(c store.Case, step string, cause error) {
+	r.pickedSkips = append(r.pickedSkips, Done{Family: c.Family, Case: c.ID, Step: step, Skipped: cause.Error()})
+}
+
+func (r *Runner) packageProblem(ctx context.Context, c store.Case, cause error, dry bool) error {
+	if dry {
+		return nil
+	}
+	notes, err := r.Store.Notes(ctx)
+	if err != nil {
+		return err
+	}
+	id := "loop-package:" + store.IDPart(c.ID)
+	for _, note := range notes {
+		if note.ID == id {
+			return nil
+		}
+	}
+	detail, err := Redact(ctx, cause.Error())
+	if err != nil {
+		return err
+	}
+	_, err = r.Store.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Importance: store.ImportanceLow, At: r.now(),
+		Title: "The loop cannot read the package for case " + c.ID, Detail: detail})
+	return err
+}
+
+func (r *Runner) caseNoteOnce(ctx context.Context, id, action, detail string) error {
+	clean, err := Redact(ctx, detail)
+	if err != nil {
+		return err
+	}
+	log, err := r.Store.CaseLog(ctx, id)
+	if err != nil {
+		return err
+	}
+	for _, entry := range log {
+		if entry.Action == action && entry.Detail == clean {
+			return nil
+		}
+	}
+	return r.Store.CaseNote(cleanedNote(ctx), id, action, clean, "loop")
 }
 
 // stopped applies the stop rule: a case whose last two live runs that ran (a refusal of the budgets is no run, and a run the

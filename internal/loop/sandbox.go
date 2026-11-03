@@ -77,7 +77,6 @@ type Outcome struct {
 // Sandbox runs a host export with the fixed launcher and no model relay.
 // Only /work, /out and tmpfs caches are writable.
 type Sandbox struct {
-	Home              string
 	ReadOnly          []string
 	Cache             string
 	Scratch           string

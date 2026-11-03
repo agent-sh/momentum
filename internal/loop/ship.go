@@ -336,6 +336,11 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	}
 	p := Package{Case: c.ID, Kind: "repo", Repo: t.Repo, Base: t.Base, BaseCommit: strings.TrimSpace(base), Dir: t.Dir, Branch: branch,
 		Work: work, Host: host, State: Prepared, Created: s.now()}
+	// A rolled-back package may still have a proposal branch after refused cleanup.
+	p.PublishedHead, err = s.remoteBranch(ctx, p)
+	if err != nil {
+		return Package{}, err
+	}
 	if err := s.freshRunClone(ctx, p); err != nil {
 		return Package{}, err
 	}
@@ -618,6 +623,15 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 	if err != nil {
 		return p, err
 	}
+	private, err := s.repositoryPrivate(ctx, p)
+	if err != nil {
+		return p, err
+	}
+	commitTitle, commitBody := title, body
+	if !private {
+		commitTitle = fmt.Sprintf("Change for case %s", p.Case)
+		commitBody = fmt.Sprintf("Base: %s\nChecked tree: %s", p.BaseCommit, tree)
+	}
 	p.Plan, p.Rollback, p.Title, p.Body, p.Lesson, p.Changed = &Plan{Signal: pr.Signal, Window: pr.Window, Before: before}, pr.Rollback,
 		title, body, pr.Lesson, paths
 	for _, field := range []*string{&p.Rollback, &p.Lesson} {
@@ -640,7 +654,7 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 		if s.BeforeCommit != nil {
 			s.BeforeCommit()
 		}
-		if err := s.commitTree(ctx, p, tree, parent, fmt.Sprintf("%s\n\n%s\n\nCase %s.", title, wrap(body), c.ID)); err != nil {
+		if err := s.commitTree(ctx, p, tree, parent, fmt.Sprintf("%s\n\n%s\n\nCase %s.", commitTitle, wrap(commitBody), c.ID)); err != nil {
 			return p, err
 		}
 	} else {
@@ -676,6 +690,18 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 	if err != nil {
 		return p, err
 	}
+	private, err = s.repositoryPrivate(ctx, p)
+	if err != nil {
+		return p, err
+	}
+	postTitle, postBody := title, body+"\n\n"+text
+	if !private {
+		postTitle = fmt.Sprintf("Change for case %s", p.Case)
+		postBody, err = s.hostPackageText(ctx, c, p)
+		if err != nil {
+			return p, err
+		}
+	}
 	if p.PR == "" {
 		if err := s.saveAuthorized(ctx, &p); err != nil {
 			return p, err
@@ -704,13 +730,13 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 			}
 		}
 		if p.PR == "" {
-			url, err := s.gh(ctx, p.Host, "pr", "create", "--repo", p.Repo, "--base", p.Base, "--head", p.Branch, "--title", title, "--body", body+"\n\n"+text)
+			url, err := s.gh(ctx, p.Host, "pr", "create", "--repo", p.Repo, "--base", p.Base, "--head", p.Branch, "--title", postTitle, "--body", postBody)
 			if err != nil {
 				return p, err
 			}
 			p.PR = strings.TrimSpace(lastOf(strings.Split(strings.TrimSpace(url), "\n")))
 		}
-	} else if _, err := s.gh(ctx, p.Host, "pr", "edit", p.PR, "--repo", p.Repo, "--title", title, "--body", body+"\n\n"+text); err != nil {
+	} else if _, err := s.gh(ctx, p.Host, "pr", "edit", p.PR, "--repo", p.Repo, "--title", postTitle, "--body", postBody); err != nil {
 		s.saveAuthorized(ctx, &p)
 		return p, err
 	}
@@ -840,12 +866,28 @@ func Count(ctx context.Context, st *store.Store, sig Signal, since, until time.T
 // package back to its build (revising), until its rounds are used.
 func (s *Ship) Reviewed(ctx context.Context, caseID string, r Review) (Package, error) {
 	ctx = s.gitContext(shipContext(ctx, caseID))
+	unlock, err := s.lock(ctx, caseID)
+	if err != nil {
+		return Package{}, err
+	}
+	defer unlock()
 	p, ok, err := s.Load(caseID)
 	if err != nil {
 		return Package{}, err
 	}
 	if !ok || p.State != Proposed {
 		return p, refused("case %s has no proposed package to review", caseID)
+	}
+	if len(p.Reviews) >= MaxRounds {
+		return p, refused("review rounds used; the change waits for a person")
+	}
+	for _, previous := range p.Reviews {
+		if previous.Head == p.Head {
+			return p, refused("this head has already been reviewed")
+		}
+	}
+	if strings.TrimSpace(r.Text) == "" {
+		return p, refused("a review needs a nonempty summary")
 	}
 	// Persist only cleaned model text. Posting later must not be the first scrub.
 	clean, err := Redact(ctx, r.Text)
@@ -959,6 +1001,9 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 				return p, relationErr // an uncertain read must retain the journal
 			}
 			if relationErr == nil {
+				if err := s.openPR(ctx, p); err != nil {
+					return p, err
+				}
 				if _, err := s.push(ctx, p, p.Host, "--no-verify", "origin", p.LandingHead+":refs/heads/"+p.Base); err != nil {
 					return p, refused("the journaled push to %s did not go as a fast-forward: %v", p.Base, err)
 				}
@@ -1069,6 +1114,9 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 			return p, err
 		}
 	}
+	if err := s.openPR(ctx, p); err != nil {
+		return p, err
+	}
 	basePush = true
 	if _, err := s.push(ctx, p, p.Host, "--no-verify", "origin", head+":refs/heads/"+p.Base); err != nil {
 		return p, refused("the push to %s did not go as a fast-forward: %v", p.Base, err)
@@ -1110,12 +1158,26 @@ func (s *Ship) checkCommand(p Package) ([]string, error) {
 
 func (s *Ship) finishLanding(ctx context.Context, p Package) (Package, error) {
 	p.Head, p.State, p.LandedAt = p.LandingHead, Landed, s.now()
+	// Deployment can fail or be interrupted. Keep deletion intent with the landing.
+	p.Cleanup = "proposal branch cleanup pending"
 	if err := s.saveAuthorized(ctx, &p); err != nil {
 		return p, err
 	}
 	what := fmt.Sprintf("%s: %s", p.PR, p.Title)
 	if _, err := s.Store.DeployCase(ctx, p.Case, s.pkgDir(p.Case), p.LandedAt, what, s.Actor); err != nil {
 		return p, err
+	}
+	return s.cleanupBranch(ctx, p)
+}
+
+func (s *Ship) cleanupBranch(ctx context.Context, p Package) (Package, error) {
+	remote, err := s.remoteBranch(ctx, p)
+	if err != nil {
+		return p, err
+	}
+	if remote == "" {
+		p.Cleanup = ""
+		return p, s.saveAuthorized(ctx, &p)
 	}
 	_, cleanupErr := s.push(ctx, p, p.Host, "--no-verify", "--quiet",
 		"--force-with-lease=refs/heads/"+p.Branch+":"+p.LandingHead, "origin", "--delete", p.Branch)
@@ -1126,7 +1188,25 @@ func (s *Ship) finishLanding(ctx context.Context, p Package) (Package, error) {
 		}
 		return p, refused("%s", p.Cleanup)
 	}
-	return p, nil
+	p.Cleanup = ""
+	return p, s.saveAuthorized(ctx, &p)
+}
+
+func (s *Ship) retryCleanup(ctx context.Context, caseID string) (Package, error) {
+	ctx = s.gitContext(shipContext(ctx, caseID))
+	unlock, err := s.lock(ctx, caseID)
+	if err != nil {
+		return Package{}, err
+	}
+	defer unlock()
+	p, ok, err := s.Load(caseID)
+	if err != nil || !ok || p.Cleanup == "" {
+		return p, err
+	}
+	if !s.Live {
+		return p, refused("resuming cleanup needs loop.live")
+	}
+	return s.cleanupBranch(ctx, p)
 }
 
 // RollBack undoes a landed change: a revert of its commits, by the user's identity, pushed to the default branch
@@ -1152,6 +1232,9 @@ func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error
 	}
 	if p.State == RolledBack {
 		return p, s.rollbackReceipt(ctx, p, why)
+	}
+	if p.State == RollingBack && !s.Live {
+		return p, refused("resuming rollback needs loop.live")
 	}
 	if p.Host == "" || p.BaseCommit == "" {
 		return p, refused("legacy package has no host clone; migrate its receipt before rollback")
@@ -1341,7 +1424,7 @@ func (s *Ship) gh(ctx context.Context, dir string, args ...string) (string, erro
 // packageText is what a proposal adds to its body: the case, its check, its measurement and its rollback.
 func (s *Ship) packageText(c store.Case, p Package) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "## Change package\n\n- Case: `%s` (%s), %d evidence. Mechanism: %s\n", c.ID, c.Family, c.Evidence, c.Mechanism)
+	fmt.Fprintf(&b, "## Change package\n\n- Case: `%s` (%s), %d evidence.\n", c.ID, c.Family, c.Evidence)
 	fmt.Fprintf(&b, "- Check: `%s` fails without the change (exit %d) and passes with it (%.0f s).\n", strings.Join(p.Check.Test, " "),
 		p.Check.Before.Exit, p.Check.After.Seconds)
 	sig, _ := json.Marshal(p.Plan.Signal)
@@ -1350,6 +1433,43 @@ func (s *Ship) packageText(c store.Case, p Package) string {
 	fmt.Fprintf(&b, "- Rollback: %s\n", p.Rollback)
 	b.WriteString("\nOpened by momentum's improvement loop. It lands by fast-forward only after a clean-context review finds nothing high or medium.\n")
 	return b.String()
+}
+
+func (s *Ship) repositoryPrivate(ctx context.Context, p Package) (bool, error) {
+	raw, err := s.gh(ctx, p.Host, "repo", "view", p.Repo, "--json", "isPrivate")
+	if err != nil {
+		return false, err
+	}
+	var visibility struct {
+		Private *bool `json:"isPrivate"`
+	}
+	if json.Unmarshal([]byte(raw), &visibility) != nil || visibility.Private == nil {
+		return false, refused("repository visibility is unknown")
+	}
+	return *visibility.Private, nil
+}
+
+func (s *Ship) hostPackageText(ctx context.Context, c store.Case, p Package) (string, error) {
+	stat, err := s.git(ctx, p.Host, "diff", "--shortstat", p.BaseCommit, p.Head, "--")
+	if err != nil {
+		return "", err
+	}
+	return s.public(ctx, fmt.Sprintf("Case: %s\nEvidence count: %d\nBase: %s\nHead: %s\nDiff: %s\nCheck: before exit %d; after exit %d.",
+		c.ID, c.Evidence, p.BaseCommit, p.Head, strings.TrimSpace(stat), p.Check.Before.Exit, p.Check.After.Exit))
+}
+
+func (s *Ship) openPR(ctx context.Context, p Package) error {
+	raw, err := s.gh(ctx, p.Host, "pr", "view", p.PR, "--repo", p.Repo, "--json", "state")
+	if err != nil {
+		return err
+	}
+	var pr struct {
+		State string `json:"state"`
+	}
+	if json.Unmarshal([]byte(raw), &pr) != nil || pr.State != "OPEN" {
+		return refused("the pull request is not open")
+	}
+	return nil
 }
 
 func writeJSON(path string, v any) error {

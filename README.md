@@ -188,6 +188,8 @@ momentum loop runs [--since WHEN] [--case ID] [--json]
 
 The loop investigates, builds and reviews through Claude Code's native agent in print mode. The host records investigation findings and an optional repository NAME under `/ro/repos`. A complete report moves the case to testing. A code fix needs an admitted repository; a case without one waits with a passive note. Two runs of the same step that fail the same way stop the case and open a component-health case.
 
+Run the loop tests with `go test -timeout 50m ./internal/loop`. Use `-run` for focused checks. The sandbox checks can exceed Go's default timeout.
+
 The host gates the source repository and prepares independent host and build clones at BASE. A build edits `/work`, runs its discriminating test and returns summary, test, title, body, rollback, signal, window and lesson. Toolchains and module caches are read-only, with build caches in tmpfs. A second sandbox job without a relay or harness exports the cumulative patch. The host reads that one confined file, validates it, applies it in its clone and checks that the test fails on BASE and passes on the change. It proposes exactly the checked tree.
 
 A review reads the proposed tree at `/ro/change` read-only and the patch at `/run/input/change.patch`. The host keeps and posts the findings. High and medium findings return to a build with `review.md`. A moved base supplies `previous.patch` for adaptation. Three rounds are allowed; exhausted changes wait with a passive note. A clean posted review can land when `loop.live` is true. Every push rechecks the repository gate. Landing and rollback use host journals and fast-forward pushes. An improved case's lesson is published by the host without another model run. Measurement is the next part.

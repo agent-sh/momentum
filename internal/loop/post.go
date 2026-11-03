@@ -56,8 +56,12 @@ var (
 	// mentionRe is a GitHub mention: an @ that opens a word, not one inside an address.
 	mentionRe = regexp.MustCompile(`(^|[^\w.@/-])@([A-Za-z0-9][\w-]*)`)
 	// refRe is a reference GitHub links and writes back into the issue it names: owner/repo#N, #N, GH-N.
-	urlRefRe = regexp.MustCompile(`(?i)(?:https?://|//)(?:www\.)?github\.com/[^\s<>"()]+`)
-	refRe    = regexp.MustCompile(`(?i)(^|[^\w/&])((?:[\w.-]+/[\w.-]+)?#|gh-)(\d+)`)
+	urlRefRe   = regexp.MustCompile(`(?i)(?:https?://|//)(?:www\.)?github\.com/[^\s<>"()]+`)
+	refRe      = regexp.MustCompile(`(?i)(^|[^\w/&])((?:[\w.-]+/[\w.-]+)?#|gh-)(\d+)`)
+	homePathRe = regexp.MustCompile(`(?i)(?:/(?:home|users)/|/root(?:/|\b)|~[/\\]|[a-z]:\\users\\)[^\s<>"'` + "`" + `)]*`)
+	addressRe  = regexp.MustCompile(`(?i)[a-z0-9.!#$%&'*+/=?^_` + "`" + `{|}~-]+@[a-z0-9.-]+`)
+	hostNameRe = regexp.MustCompile(`(?i)\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)+\b`)
+	ipv6Re     = regexp.MustCompile(`(?i)(?:[a-f0-9]{1,4}:){2,}[a-f0-9:]+(?:%[a-z0-9_-]+)?|::[a-f0-9:]+`)
 )
 
 // Neutral is a text in which no mention pages anyone and no reference writes into another issue: a zero-width
@@ -72,11 +76,16 @@ func Neutral(text string) string {
 	return refRe.ReplaceAllString(text, "$1$2\u200b$3")
 }
 
-// Public is a text the loop may post or show: scrubbed of secrets, its mentions and references neutral.
+// Public masks personal addresses and paths conservatively, without identifying their owner.
+// Dotted names may be file names as well as hosts; both are withheld.
 func Public(ctx context.Context, text string) (string, error) {
 	r, err := Redact(ctx, text)
 	if err != nil {
 		return "", err
 	}
+	r = homePathRe.ReplaceAllString(r, "[personal]")
+	r = addressRe.ReplaceAllString(r, "[personal]")
+	r = ipv6Re.ReplaceAllString(r, "[personal]")
+	r = hostNameRe.ReplaceAllString(r, "[personal]")
 	return Neutral(r), nil
 }

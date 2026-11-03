@@ -271,7 +271,7 @@ done
 case "$schema" in *findings*)
  grep -q 'return 42' /ro/change/fake.go || exit 7
  if printf x >> /ro/change/fake.go 2>/dev/null; then exit 8; fi
- `+fixtureResult(`{"type":"result","subtype":"success","structured_output":{"summary":"clean","findings":[]}}`)+`
+ `+fixtureResult(`{"type":"result","subtype":"success","structured_output":{"summary":"Checked fake.go and answer_test.go.","reviewed_files":["fake.go","answer_test.go"],"findings":[]}}`)+`
  ;;
 *)
  sed -i 's/return 41/return 42/' /work/fake.go

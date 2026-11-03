@@ -13,3 +13,7 @@ Design stage. SPEC.md is the contract: a change in behavior changes SPEC.md in t
 - No Co-Authored-By trailers or "Generated with" lines in commits or PRs.
 - No file over 1 MiB and no ELF, Mach-O, PE, WebAssembly or ar-archive file (a program, an object file or a static library, by its first bytes) enters the repository: main keeps every commit of a PR, so CI's tracked check (`go run ./internal/tracked/check HEAD`) reads the whole history of a PR's head and of each push to main, not only the head commit. CI builds the check from the checked-out tree, so review a change to `internal/tracked` or `.github/workflows` by hand.
 - After the first commit, changes reach main through a PR.
+
+## Tests
+
+Run the loop package with `go test -timeout 50m ./internal/loop`. Its sandbox checks can exceed Go's default timeout. Use `-run` for focused checks.

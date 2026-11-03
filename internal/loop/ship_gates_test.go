@@ -138,13 +138,14 @@ func TestABinaryDiffHidesNoSignalEdit(t *testing.T) {
 func reviewFixture(t *testing.T) (*Runner, store.Case, Package) {
 	t.Helper()
 	st := testStore(t)
-	r := runnerFor(t, st, fakeAgent(t, `{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":1,"structured_output":{"summary":"clean","findings":[]}}`))
+	r := runnerFor(t, st, fakeAgent(t, `{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":1,"structured_output":{"summary":"Checked x.go.","reviewed_files":["x.go"],"findings":[]}}`))
 	c := testingCase(t, st)
 	r.Ship = &Ship{Store: st, Dir: r.Dir}
 	// a review outside Once reads the inputs of a pass of its own
 	r.pass = &passInputs{}
 	t.Cleanup(r.pass.close)
 	p := reviewable(t, r.Ship, c.ID)
+	r.Ship.GH = script(t, t.TempDir(), "gh", `echo '{"isPrivate":true,"state":"OPEN"}'`)
 	r.Ship.Public = func(_ context.Context, s string) (string, error) { return Neutral(s), nil }
 	r.Ship.Gate = reviewGate(t)
 	if err := r.Ship.save(&p); err != nil {
@@ -380,7 +381,7 @@ func TestNoGitCallRecursesOrRunsMaintenance(t *testing.T) {
 }
 
 func TestAReviewWithoutItsFindingsIsNoReview(t *testing.T) {
-	for _, out := range []string{`null`, `{"summary":"fine"}`, `{"findings":[]}`} {
+	for _, out := range []string{`null`, `{"summary":"fine"}`, `{"findings":[]}`, `{"summary":"","findings":[],"reviewed_files":["x.go"]}`} {
 		ctx := context.Background()
 		r, c, _ := reviewFixture(t)
 		r.Agent = testSandboxAgent(t, Agent{Runner: fakeAgent(t, `{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":1,"structured_output":`+out+`}`), Model: r.Agent.Model})

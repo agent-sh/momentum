@@ -194,9 +194,10 @@ func defaultBranch(ctx context.Context, dir string) (string, error) {
 // evaluator's or its authority's, which only the owner or a session he directs makes. Each call returns a list
 // of its own: nothing a change compiles in can empty it.
 func Protected() []string {
-	return []string{"internal/detect/", "internal/loop/", "internal/sandbox/", "internal/measure/", "internal/store/", "internal/source/", "internal/plain/",
-		"internal/config/", "internal/paths/", "internal/tracked/", "cmd/momentum/", "go.mod", "go.sum", ".github/", "SPEC.md", "AGENTS.md"}
+	return []string{"internal/", "cmd/", "sessions/", ".github/"}
 }
+
+var selfChanges = []string{"internal/supervise/rules.go", "internal/capacity/rules.go"}
 
 // ciPaths are the CI configurations of the hosts the loop could push to.
 var ciPaths = []string{".github/", ".circleci/", ".buildkite/", ".gitlab-ci.yml", "Jenkinsfile", "azure-pipelines.yml", ".travis.yml"}
@@ -220,11 +221,18 @@ func CheckPaths(t Target, changed []string) error {
 		return nil
 	}
 	for _, c := range changed {
+		if slices.Contains(selfChanges, c) {
+			continue
+		}
+		if !strings.Contains(c, "/") {
+			return refused("%s is a root file of the loop's repository: never its to change", c)
+		}
 		for _, p := range Protected() {
 			if c == strings.TrimSuffix(p, "/") || strings.HasPrefix(c, p) {
 				return refused("%s is the loop's own (what its judgment or its authority rests on): never its to change", c)
 			}
 		}
+		return refused("%s is outside the loop's explicit self-change allow-list", c)
 	}
 	return nil
 }

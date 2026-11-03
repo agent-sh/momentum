@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -69,8 +70,10 @@ for wt in $(git -C "`+f.main+`" worktree list --porcelain | sed -n 's/^worktree 
   if [ -n "$(git -C "$wt" status --porcelain)" ]; then echo '{"allowed": false, "disposition": "report_only", "reasons": ["uncommitted or untracked work"]}'; exit 1; fi
 done
 echo '{"allowed": true, "disposition": "allowed_scope_only", "reasons": []}'`)
-	f.gh = script(t, dir, "gh", `if [ -e "`+filepath.Join(dir, "gh-fails")+`" ]; then rm "`+filepath.Join(dir, "gh-fails")+`"; echo "gh: network down" >&2; exit 1; fi
+	f.gh = script(t, dir, "gh", `if [ "$2" = "create" ] && [ -e "`+filepath.Join(dir, "gh-fails")+`" ]; then rm "`+filepath.Join(dir, "gh-fails")+`"; echo "gh: network down" >&2; exit 1; fi
 echo "$@" >> "`+filepath.Join(dir, "gh-calls")+`"
+if [ "$1 $2" = "repo view" ]; then echo '{"isPrivate":true}'; fi
+if [ "$1 $2" = "pr view" ]; then echo '{"state":"OPEN"}'; fi
 if [ "$2" = "list" ]; then echo '[]'; fi
 if [ "$2" = "create" ]; then echo "https://github.com/agent-sh/fake/pull/7"; fi`)
 	return f
@@ -87,7 +90,7 @@ func shipFor(t *testing.T, st *store.Store, f repoFixture) *Ship {
 func shipWithSandbox(st *store.Store, f repoFixture, sb Sandbox) *Ship {
 	return &Ship{Store: st, Dir: filepath.Join(f.dir, "loop"), Live: true, Actor: "loop:test", Identity: [2]string{"Owner Name", "owner@example.com"},
 		GH: f.gh, Sandbox: sb, Public: func(_ context.Context, s string) (string, error) { return Neutral(s), nil },
-		Gate: Gate{Owners: []string{"agent-sh"}, RepoGuard: []string{f.guard}, Home: sb.Home,
+		Gate: Gate{Owners: []string{"agent-sh"}, RepoGuard: []string{f.guard},
 			Resolve: func(context.Context, string) (string, error) { return "agent-sh/fake", nil },
 			Busy:    func(context.Context, string) (string, error) { return "", nil }}}
 }
@@ -102,8 +105,7 @@ func testSandbox(t *testing.T) Sandbox {
 		t.Skip("no go here")
 	}
 	env := strings.Fields(string(out))
-	home, _ := os.UserHomeDir()
-	return Sandbox{Home: home, ReadOnly: env, Cache: testCache, Scratch: filepath.Join(t.TempDir(), "tmp"),
+	return Sandbox{ReadOnly: env, Cache: testCache, Scratch: filepath.Join(t.TempDir(), "tmp"),
 		Path: []string{filepath.Join(env[0], "bin")}}
 }
 
@@ -222,12 +224,12 @@ func TestAChangeShipsOnlyThroughItsPackage(t *testing.T) {
 	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "review") {
 		t.Fatalf("landed unreviewed: %v", err)
 	}
-	if _, err := s.Reviewed(ctx, c.ID, Review{High: 1, Findings: []Finding{{Severity: "low", Where: "x", Problem: "y", Fix: "z"}}}); !errors.Is(err, ErrRefused) ||
+	if _, err := s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", High: 1, Findings: []Finding{{Severity: "low", Where: "x", Problem: "y", Fix: "z"}}}); !errors.Is(err, ErrRefused) ||
 		!strings.Contains(err.Error(), "the counts are the findings'") {
 		t.Fatalf("counts that are not the findings': %v", err)
 	}
 	// a review that finds a medium sends it back to its build, on the same branch and pull request
-	if p, err = s.Reviewed(ctx, c.ID, Review{Findings: []Finding{{Severity: "medium", Where: "fake.go", Problem: "no comment", Fix: "add one"}},
+	if p, err = s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", Findings: []Finding{{Severity: "medium", Where: "fake.go", Problem: "no comment", Fix: "add one"}},
 		Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || p.State != Revising || p.Reviews[0].Medium != 1 {
 		t.Fatalf("reviewed: %+v %v", p, err)
 	}
@@ -255,7 +257,7 @@ func TestAChangeShipsOnlyThroughItsPackage(t *testing.T) {
 		t.Fatalf("the revision did not update its pull request: %s", calls)
 	}
 	// a clean review that was not posted lands nothing
-	if p, err = s.Reviewed(ctx, c.ID, Review{Findings: []Finding{{Severity: "low", Where: "x", Problem: "y", Fix: "z"}}}); err != nil || p.Clean() {
+	if p, err = s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", Findings: []Finding{{Severity: "low", Where: "x", Problem: "y", Fix: "z"}}}); err != nil || p.Clean() {
 		t.Fatalf("an unposted review: %+v %v", p, err)
 	}
 	p.Reviews[len(p.Reviews)-1].Comment = "https://github.com/agent-sh/fake/pull/7#c2"
@@ -423,49 +425,55 @@ func TestAChangeToTheLoopsOwnCodeIsRefusedHoweverItIsMade(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 	f := newRepo(t, map[string]string{"internal/loop/gate.go": "package loop\n", "internal/sandbox/sandbox.go": "package sandbox\n", "internal/supervise/rules.go": "package supervise\n", "docs/x.txt": "notes\n"})
-	s := shipFor(t, st, f)
+	s := shipWithSandbox(st, f, Sandbox{})
 	s.Gate.Resolve = func(context.Context, string) (string, error) { return SelfRepo, nil }
 	c := testingCase(t, st)
 	p, err := s.Prepare(ctx, c.ID, f.main)
 	if err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(p.Work, "fake.go"), fixed("42"))
-	write(t, filepath.Join(p.Work, "fake_test.go"), answerTest)
-	run(t, p.Work, "git", "mv", "internal/loop/gate.go", "gate.go.txt")
-	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/loop/gate.go") {
-		t.Fatalf("a protected file moved away: %v", err)
+	// Check immutable intake paths directly. A moved root file may be refused before
+	// the protected source, and no test sandbox should start for either.
+	assertProtected := func(want string) {
+		t.Helper()
+		_, changed, err := s.applyPatch(ctx, p, []Patch{fixturePatch(t, s, c.ID)})
+		if err != nil || !slices.Contains(changed, want) {
+			t.Fatalf("intake omitted %s: %v", want, err)
+		}
+		if err := CheckPaths(Target{Repo: p.Repo}, changed); !errors.Is(err, ErrRefused) {
+			t.Fatalf("protected path %s shipped: %v", want, err)
+		}
 	}
+	run(t, p.Work, "git", "mv", "internal/loop/gate.go", "gate.go.txt")
+	assertProtected("internal/loop/gate.go")
 	run(t, p.Work, "git", "mv", "gate.go.txt", "internal/loop/gate.go")
 	run(t, p.Work, "git", "mv", "docs/x.txt", "internal/loop/x.go")
-	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/loop/x.go") {
-		t.Fatalf("a file moved into a protected path: %v", err)
-	}
+	assertProtected("internal/loop/x.go")
 	run(t, p.Work, "git", "mv", "internal/loop/x.go", "docs/x.txt")
 	write(t, filepath.Join(p.Work, "internal/sandbox/sandbox.go"), "package sandbox\n// edited\n")
-	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/sandbox/") {
-		t.Fatalf("the sandbox edited: %v", err)
-	}
+	assertProtected("internal/sandbox/sandbox.go")
 	write(t, filepath.Join(p.Work, "internal/sandbox/sandbox.go"), "package sandbox\n")
 	for _, move := range [][2]string{{"internal/sandbox/sandbox.go", "sandbox.txt"}, {"docs/x.txt", "internal/sandbox/x.go"}} {
 		run(t, p.Work, "git", "mv", move[0], move[1])
-		if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/sandbox/") {
-			t.Fatalf("the sandbox path moved %v: %v", move, err)
+		want := move[0]
+		if strings.HasPrefix(move[1], "internal/sandbox/") {
+			want = move[1]
 		}
+		assertProtected(want)
 		run(t, p.Work, "git", "mv", move[1], move[0])
 	}
 	write(t, filepath.Join(p.Work, "internal/sandbox/new.go"), "package sandbox\n")
-	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/sandbox/") {
-		t.Fatalf("the sandbox path added: %v", err)
-	}
+	assertProtected("internal/sandbox/new.go")
 	os.Remove(filepath.Join(p.Work, "internal/sandbox/new.go"))
 	write(t, filepath.Join(p.Work, "internal", "loop", "é.go"), "package loop\n")
-	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "internal/loop/é.go") {
-		t.Fatalf("a new protected file with a quoted name: %v", err)
-	}
+	assertProtected("internal/loop/é.go")
 	os.Remove(filepath.Join(p.Work, "internal", "loop", "é.go"))
 	write(t, filepath.Join(p.Work, "internal", "supervise", "rules.go"), "package supervise\n\n// a rule\n")
-	if _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); err != nil {
+	_, changed, err := s.applyPatch(ctx, p, []Patch{fixturePatch(t, s, c.ID)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckPaths(Target{Repo: p.Repo}, changed); err != nil {
 		t.Fatalf("supervision's rules are the system it improves: %v", err)
 	}
 }
@@ -504,12 +512,15 @@ func TestTheGateKeepsTheLoopsAuthority(t *testing.T) {
 	}
 	for _, p := range []string{"internal/detect/failures.go", "internal/loop/gate.go", "internal/sandbox/sandbox.go", "internal/sandbox/new.go", "internal/measure/x.go", "internal/store/events.go",
 		"internal/source/transcripts.go", "internal/plain/plain.go", "internal/config/config.go", "internal/paths/paths.go",
+		"internal/tracked/check/main.go", "internal/capacity/act.go", "internal/supervise/engine.go", "internal/toolresult/x.go",
+		"sessions/new/file.go", "cmd/new/file.go", "internal/new/file.go", "LICENSE", ".gitignore", "README.md", "new-root-file",
+		"scripts/new-guard.sh", "docs/new-policy.md", "internal/supervise/rules_test.go",
 		"cmd/momentum/git.go", "cmd/momentum/replay.go", "go.mod", "go.sum", ".github/workflows/ci.yml", "SPEC.md", "AGENTS.md"} {
-		if err := CheckPaths(Target{Repo: SelfRepo}, []string{"README.md", p}); !errors.Is(err, ErrRefused) {
+		if err := CheckPaths(Target{Repo: SelfRepo}, []string{p}); !errors.Is(err, ErrRefused) {
 			t.Errorf("momentum's own %s: %v", p, err)
 		}
 	}
-	if err := CheckPaths(Target{Repo: SelfRepo}, []string{"internal/supervise/rules.go", "internal/capacity/rules.go", "README.md"}); err != nil {
+	if err := CheckPaths(Target{Repo: SelfRepo}, []string{"internal/supervise/rules.go", "internal/capacity/rules.go"}); err != nil {
 		t.Errorf("supervision's and capacity's rules are no evaluator: %v", err)
 	}
 	if err := CheckPaths(Target{Repo: "agent-sh/fake"}, []string{"internal/loop/x.go"}); err != nil {
@@ -546,7 +557,6 @@ func TestTheSandboxKeepsATestInItsTree(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(home)
-	sb.Home = home
 	tree := t.TempDir()
 	outside := t.TempDir()
 	sock := filepath.Join(outside, "s.sock")
@@ -570,7 +580,7 @@ func TestTheSandboxKeepsATestInItsTree(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tcp.Close()
-	secret := filepath.Join(sb.Home, ".config", "x", "token")
+	secret := filepath.Join(home, ".config", "x", "token")
 	write(t, secret, "a secret")
 	probe := fmt.Sprintf(`
 import os, socket, sys
@@ -593,10 +603,10 @@ if os.path.lexists(".git"): bad.append("export has Git control files")
 open(".git", "w").write("gitdir: /elsewhere")
 for k in ("DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK"):
     if k in os.environ: bad.append(k)
-if os.environ.get("HOME") != %q: bad.append("HOME is " + os.environ.get("HOME", ""))
+if "HOME" not in os.environ: bad.append("HOME absent")
 open("inside.txt", "w").write("ok")
 print(" ".join(bad)); sys.exit(1 if bad else 0)
-`, outside, tcp.Addr().(*net.TCPAddr).Port, filepath.Join(outside, "x"), secret, "/home/agent")
+`, outside, tcp.Addr().(*net.TCPAddr).Port, filepath.Join(outside, "x"), secret)
 	t.Setenv("SSH_AUTH_SOCK", sock)
 	o, err := sb.Run(context.Background(), tree, []string{"python3", "-c", probe}, nil)
 	if err != nil || o.Exit != 0 {
@@ -644,7 +654,7 @@ func TestWhatTheLoopPostsIsScrubbedAndInert(t *testing.T) {
 		t.Fatal(err)
 	}
 	if strings.Contains(got, "hunter2") || strings.Contains(got, "@owner") || strings.Contains(got, "x#12") || strings.Contains(got, " #3") ||
-		!strings.Contains(got, "a@b.example") {
+		strings.Contains(got, "a@b.example") || !strings.Contains(got, "[personal]") {
 		t.Fatalf("%q", got)
 	}
 	Scrubber = []string{filepath.Join(dir, "none")}
@@ -693,7 +703,7 @@ func reviewedChange(t *testing.T, s *Ship, st *store.Store, f repoFixture) (stor
 	if _, err := proposePatch(t, s, ctx, c.ID, Proposal{Title: "Answer is 42", Body: "Off by one.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
 		t.Fatal(err)
 	}
-	if p, err = s.Reviewed(ctx, c.ID, Review{Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || !p.Clean() {
+	if p, err = s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || !p.Clean() {
 		t.Fatalf("a clean review: %+v %v", p, err)
 	}
 	return c, p
@@ -760,7 +770,7 @@ func TestEachStepChecksAgainWhatItRestsOn(t *testing.T) {
 	if _, err := proposePatch(t, s, ctx, c.ID, pr); err != nil {
 		t.Fatal(err)
 	}
-	if p, err = s.Reviewed(ctx, c.ID, Review{Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || !p.Clean() {
+	if p, err = s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || !p.Clean() {
 		t.Fatalf("a clean review: %+v %v", p, err)
 	}
 	write(t, stop, "")
@@ -858,7 +868,7 @@ func TestARevisionDoesNotOverwriteAnotherPushToItsBranch(t *testing.T) {
 	if p, err = proposePatch(t, s, ctx, c.ID, pr); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Reviewed(ctx, c.ID, Review{Findings: []Finding{{Severity: "medium", Where: "fake.go", Problem: "p", Fix: "f"}}, Comment: "c1"}); err != nil {
+	if _, err := s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", Findings: []Finding{{Severity: "medium", Where: "fake.go", Problem: "p", Fix: "f"}}, Comment: "c1"}); err != nil {
 		t.Fatal(err)
 	}
 	theirs := pushOther(t, f, p.Branch, map[string]string{"theirs.txt": "a fix of someone's\n"})
@@ -968,7 +978,7 @@ func TestBranchConditionalDriversAreRefused(t *testing.T) {
 					if _, err = proposePatch(t, s, ctx, c.ID, Proposal{Title: "Answer", Body: "Fix it.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
 						t.Fatal(err)
 					}
-					if _, err = s.Reviewed(ctx, c.ID, Review{Comment: "https://example.invalid/review"}); err != nil {
+					if _, err = s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", Comment: "https://example.invalid/review"}); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -1184,7 +1194,7 @@ func TestShipRefusesRepositoryTransport(t *testing.T) {
 					if _, err := proposePatch(t, s, ctx, c.ID, Proposal{Title: "Fixture", Body: "Synthetic change.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
 						t.Fatal(err)
 					}
-					if _, err := s.Reviewed(ctx, c.ID, Review{Comment: "https://example.invalid/review"}); err != nil {
+					if _, err := s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", Comment: "https://example.invalid/review"}); err != nil {
 						t.Fatal(err)
 					}
 				}

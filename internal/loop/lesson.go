@@ -107,7 +107,11 @@ func (r *Runner) lessons(ctx context.Context, only string, families []string) er
 		}
 		p, ok, err := r.Ship.Load(c.ID)
 		if err != nil {
-			return err
+			if noteErr := r.packageProblem(ctx, c, err, false); noteErr != nil {
+				return noteErr
+			}
+			r.logf("lesson package of %s: %v", c.ID, err)
+			continue
 		}
 		if !ok || p.Lesson == "" {
 			continue

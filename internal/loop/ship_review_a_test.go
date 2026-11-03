@@ -44,7 +44,7 @@ func recoveryReviewed(t *testing.T, s *Ship, st *store.Store, f repoFixture) (st
 	if _, err := proposePatch(t, s, context.Background(), c.ID, pr); err != nil {
 		t.Fatal(err)
 	}
-	p, err := s.Reviewed(context.Background(), c.ID, Review{Comment: "https://example.invalid/review/1"})
+	p, err := s.Reviewed(context.Background(), c.ID, Review{Text: "Checked every changed file.", Comment: "https://example.invalid/review/1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestShipPushesPublishNoReachableTags(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkTags("proposal")
-	p, err := s.Reviewed(ctx, c.ID, Review{Comment: "https://example.invalid/review/1"})
+	p, err := s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", Comment: "https://example.invalid/review/1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,8 @@ func TestProposalAdoptsACreatedPullRequestAfterALostResponse(t *testing.T) {
 	ctx := context.Background()
 	c, _, pr := recoveryChecked(t, s, st, f)
 	receipt, calls := filepath.Join(f.dir, "receipt"), filepath.Join(f.dir, "creates")
-	s.GH = script(t, f.dir, "lost-gh", `case "$2" in
+	s.GH = script(t, f.dir, "lost-gh", `if [ "$1 $2" = "repo view" ]; then echo '{"isPrivate":true}'; exit 0; fi
+case "$2" in
  list)
   if [ -f '`+receipt+`' ]; then cat '`+receipt+`'; else echo '[]'; fi ;;
  create)
@@ -127,7 +128,8 @@ func TestProposalDoesNotAdoptAHistoricalPullRequestAtAnotherHead(t *testing.T) {
 	s := recoveryShip(t, st, f)
 	c, _, pr := recoveryChecked(t, s, st, f)
 	calls := filepath.Join(f.dir, "creates")
-	s.GH = script(t, f.dir, "mismatched-gh", `if [ "$2" = list ]; then
+	s.GH = script(t, f.dir, "mismatched-gh", `if [ "$1 $2" = "repo view" ]; then echo '{"isPrivate":true}'; exit 0; fi
+if [ "$2" = list ]; then
  echo '[{"number":7,"url":"https://example.invalid/pull/7","headRefOid":"different"}]'
 else echo create > '`+calls+`'; echo 'https://example.invalid/pull/8'; fi`)
 	p, err := proposePatch(t, s, context.Background(), c.ID, pr)
