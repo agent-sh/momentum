@@ -36,7 +36,7 @@ const usage = `usage:
                                         H is claude, codex, pi, opencode or hermes
   momentum evidence status [--since DUR]   events per source and kind, and unparsed records
   momentum evidence show ID [ID...] [--bytes N]  up to ten events and their records, scrubbed whole before clipping
-  momentum evidence unit NAME [--lines N]  a user service's state and the end of its log, scrubbed
+  momentum evidence unit NAME [--lines N] [--bytes N]  a user service's state and the end of its log, scrubbed
   momentum evidence rebuild SOURCE [--force]
                                         drop what SOURCE contributed; the next ingest reads it from the start
                                         (not sessions; transcripts and incidents only with --force: it says how

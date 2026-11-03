@@ -261,6 +261,12 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	case perr != nil && res.Status == store.RunOK:
 		res.Status, res.Failure = store.RunFailed, "stream"
 	}
+	// A run that never got a model turn because the broker answered every request with an error says nothing of
+	// the agent: it has its own key, which the stop rule does not count.
+	if res.Status == store.RunFailed && res.RelayAdmitted == 0 && route.errorAnswers() > 0 &&
+		res.Failure != "stopped" && res.Failure != "stream limit" && res.Failure != "the model's safeguards" {
+		res.Failure = "broker"
+	}
 	_, overTurns := route.observedUsage()
 	if overTurns {
 		res.Report = nil

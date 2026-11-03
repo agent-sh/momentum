@@ -230,10 +230,13 @@ func newRelay(target *url.URL, budget float64, transport http.RoundTripper, turn
 			return nil
 		},
 		ErrorLog: log.New(io.Discard, "", 0),
-		ErrorHandler: func(w http.ResponseWriter, req *http.Request, _ error) {
-			// the broker never answered (refused, reset, timed out before a status): nothing ran and nothing is
-			// billed, so it is an error answer like any other: no charge, no turn, one toward the error limit
-			if c, ok := req.Context().Value(relayChargeKey{}).(*relayCharge); ok {
+		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
+			// A connection that could not be made (the dial failed) reached no broker: nothing ran and nothing is
+			// billed, so it is an error answer like any other: no charge, no turn, one toward the error limit. Any
+			// other failure (a reset or an abort after the request was sent) may have been billed, and the
+			// reservation is charged.
+			var op *net.OpError
+			if c, ok := req.Context().Value(relayChargeKey{}).(*relayCharge); ok && errors.As(err, &op) && op.Op == "dial" {
 				c.parser.bad, c.parser.errorResponse, c.parser.eof = true, true, true
 			}
 			http.Error(w, "the Bedrock broker did not answer", http.StatusBadGateway)
@@ -469,6 +472,13 @@ func (r *relay) refuse(w http.ResponseWriter, why string, code int) {
 	}
 	r.mu.Unlock()
 	http.Error(w, "momentum's relay refused the request: "+why, code)
+}
+
+// errorAnswers is how many requests got an error answer, or no connection, and so no turn.
+func (r *relay) errorAnswers() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.errorsN
 }
 
 func (r *relay) accounting() (float64, int, int, int) {

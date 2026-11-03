@@ -175,7 +175,7 @@ func evidenceUnit(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		cmd.Stdout, cmd.Stderr = capture, capture
 		_ = cmd.Run()
 	}
-	if output.Len() > readMax && *cut <= 0 {
+	if output.Len() > readMax {
 		return usageError{"unit output exceeds the record limit; narrow the command"}
 	}
 	clean, err := loop.Redact(ctx, strings.ToValidUTF8(output.String(), "?"))

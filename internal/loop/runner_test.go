@@ -425,6 +425,8 @@ func TestTheStopRuleSkipsTheRunsTheHostEnded(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	put("b1", "broker", -8*time.Minute)
+	put("b2", "broker", -7*time.Minute)
 	put("h1", "stopped", -6*time.Minute)
 	put("h2", "stopped", -5*time.Minute)
 	put("h3", "killed", -4*time.Minute)
@@ -437,5 +439,23 @@ func TestTheStopRuleSkipsTheRunsTheHostEnded(t *testing.T) {
 	put("h7", "timeout", -time.Minute)
 	if why, err := r.stopped(ctx, c, true); err != nil || !strings.Contains(why, "failed the same way: timeout") {
 		t.Fatalf("two timeouts around a stop did not stop the case: %q %v", why, err)
+	}
+}
+
+// Two runs that never got a model turn because the broker could not be reached say nothing of the agent: they fail as
+// "broker", which the stop rule does not count, and the case is run again.
+func TestARunWhoseBrokerIsUnreachableIsNotTheAgentsFailure(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := runnerFor(t, st, fakeAgent(t, okResult))
+	file := filepath.Join(t.TempDir(), "bedrock.env")
+	write(t, file, "CLAUDE_CODE_USE_BEDROCK=\"1\"\nANTHROPIC_BEDROCK_BASE_URL=\"http://127.0.0.1:1/unreachable\"\nCLAUDE_CODE_SKIP_BEDROCK_AUTH=\"1\"\n")
+	r.Agent.Bedrock = &Bedrock{File: file}
+	c := openCase(t, st, "failures", "no-broker", 2)
+	for i := 0; i < 3; i++ {
+		done, err := r.Once(ctx, Options{Families: []string{"failures"}})
+		if err != nil || len(done) != 1 || done[0].Case != c.ID || done[0].Run.Failure != "broker" || done[0].Run.Turns != 0 {
+			t.Fatalf("pass %d: %+v %v", i, done, err)
+		}
 	}
 }

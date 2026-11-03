@@ -303,7 +303,7 @@ func TestABrokerThatDoesNotAnswerIsAnErrorAnswerToo(t *testing.T) {
 	var calls atomic.Int64
 	r := budgetRelay(t, 1, func(req *http.Request) (*http.Response, error) {
 		calls.Add(1)
-		return nil, errors.New("connection refused")
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
 	})
 	r.turnLimit = 3
 	for i := 0; i < relayErrorLimit; i++ {
@@ -317,5 +317,20 @@ func TestABrokerThatDoesNotAnswerIsAnErrorAnswerToo(t *testing.T) {
 	}
 	if rec := relayRequest(r, strings.NewReader(textRequestBody(10, 1000)), "invoke-with-response-stream"); rec.Code != 429 || calls.Load() != relayErrorLimit {
 		t.Fatalf("a storm of failed transports went on to the broker: %d, %d calls", rec.Code, calls.Load())
+	}
+}
+
+// A reset after the request was sent may have been billed: the reservation is charged, and it is no free error answer.
+func TestAResetAfterTheRequestWasSentIsCharged(t *testing.T) {
+	r := budgetRelay(t, 1, func(req *http.Request) (*http.Response, error) {
+		return nil, &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")}
+	})
+	r.turnLimit = 3
+	if rec := relayRequest(r, strings.NewReader(textRequestBody(10, 1000)), "invoke-with-response-stream"); rec.Code != http.StatusBadGateway {
+		t.Fatalf("a reset answered %d", rec.Code)
+	}
+	spent, admitted, _, _ := r.accounting()
+	if spent <= 0 || admitted != 1 || r.errorAnswers() != 0 {
+		t.Fatalf("a reset was free: spent %v, admitted %d, error answers %d", spent, admitted, r.errorAnswers())
 	}
 }
