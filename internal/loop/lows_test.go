@@ -400,3 +400,25 @@ func TestTheEvaluationLockIsPerUnitPrefix(t *testing.T) {
 	}
 	other()
 }
+
+// A file replaced by a link between OpenFile's checks and its open is refused: a root follows a link that stays inside
+// it whatever the open's flags say, so the descriptor must be the file the last lstat saw.
+func TestOpenFileRefusesALinkSwappedInAfterItsChecks(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "record.txt"), "the record\n")
+	write(t, filepath.Join(dir, "other.txt"), "another file\n")
+	defer func() { openFileChecked = func() {} }()
+	openFileChecked = func() {
+		if err := os.Remove(filepath.Join(dir, "record.txt")); err != nil {
+			t.Error(err)
+		}
+		if err := os.Symlink("other.txt", filepath.Join(dir, "record.txt")); err != nil {
+			t.Error(err)
+		}
+	}
+	f, err := OpenFile(dir, "record.txt")
+	if err == nil {
+		f.Close()
+		t.Fatal("a link swapped in after the checks was followed")
+	}
+}
