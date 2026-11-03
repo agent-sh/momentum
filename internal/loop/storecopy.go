@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/agent-sh/momentum/internal/store"
@@ -74,7 +75,7 @@ func StoreCopy(ctx context.Context, o StoreCopyOptions) (m StoreManifest, err er
 		return m, err
 	}
 	defer os.RemoveAll(tmp)
-	var hits0, misses0, masked int
+	var masked, seen, cached int
 	snapshot := filepath.Join(tmp, "scratch.sqlite")
 	if o.Master {
 		if err = copyPlainFile(o.Source, snapshot); err != nil {
@@ -88,6 +89,12 @@ func StoreCopy(ctx context.Context, o StoreCopyOptions) (m StoreManifest, err er
 		return m, err
 	}
 	defer db.Close()
+	// The scratch file is removed before return and only VACUUM INTO's output is published, so its commits need not
+	// reach the disk: one connection, without a sync per page of scrubbed rows.
+	db.SetMaxOpenConns(1)
+	if _, err = db.ExecContext(ctx, "PRAGMA synchronous=OFF"); err != nil {
+		return m, err
+	}
 	if o.Master {
 		for _, q := range []string{"DELETE FROM events WHERE ts < ? OR ts >= ?", "DELETE FROM notes WHERE at >= ?"} {
 			args := []any{o.Until.UnixMilli()}
@@ -108,20 +115,20 @@ func StoreCopy(ctx context.Context, o StoreCopyOptions) (m StoreManifest, err er
 	if o.Master {
 		goto scrubbed
 	}
-	hits0, misses0 = o.Cache.Stats()
-	if masked, err = scrubTable(ctx, db, o.Cache, "events", []string{"source", "source_key", "session", "agent", "harness", "model", "cwd",
+	if masked, err = scrubTable(ctx, db, o.Cache, &seen, &cached, "events", []string{"source", "source_key", "session", "agent", "harness", "model", "cwd",
 		"actor", "kind", "tool", "summary", "meta", "ref", "experiment"}); err != nil {
 		return m, err
 	}
-	if n, err := scrubTable(ctx, db, o.Cache, "notes", []string{"kind", "title", "detail", "effect", "links", "source"}); err != nil {
+	if n, err := scrubTable(ctx, db, o.Cache, &seen, &cached, "notes", []string{"kind", "title", "detail", "effect", "links", "source"}); err != nil {
 		return m, err
 	} else {
 		masked += n
 	}
 scrubbed:
 	m = StoreManifest{Since: o.Since, Until: o.Until, Canary: true, Masked: masked}
-	if hits1, misses1 := o.Cache.Stats(); o.Cache != nil {
-		m.Cached, m.Scrubbed = hits1-hits0, misses1-misses0
+	if o.Cache != nil {
+		// counted here, not from the cache's totals: the pass's other copies use the cache at the same time
+		m.Cached, m.Scrubbed = cached, seen-cached
 	}
 	if err = db.QueryRowContext(ctx, "SELECT count(*) FROM events").Scan(&m.Events); err != nil {
 		return m, err
@@ -211,100 +218,151 @@ const (
 	scrubPageBytes = 4 << 20
 )
 
-// scrubTable keeps only one batch of rows in memory. Stable ids and numeric
-// columns stay intact; every other column is passed through the scrubber.
-func scrubTable(ctx context.Context, db *sql.DB, cache *ScrubCache, table string, cols []string) (masked int, err error) {
-	last := ""
+// scrubPagesAhead is how many pages are with the scrubber at once. A cold page is seconds of one core, and a month of
+// events is hundreds of pages: a cache that starts empty (the first pass, a new scrubber) waits for a quarter of them.
+const scrubPagesAhead = 4
+
+// scrubPage is one page of a table's rows, its texts and what the scrubber (or the cache) returned for them.
+type scrubPage struct {
+	ids, texts, clean []string
+	served            int
+	err               error
+	done              chan struct{}
+}
+
+// scrubTable keeps at most scrubPagesAhead pages of rows in memory. Stable ids and numeric columns stay intact; every
+// other column is passed through the scrubber. Pages are read in id order and scrubbed at the same time, and their
+// rows are written back in the order read. seen and cached count the rows it saw and the rows the cache served.
+func scrubTable(ctx context.Context, db *sql.DB, cache *ScrubCache, seen, cached *int, table string, cols []string) (masked int, err error) {
+	sctx, stop := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	// no scrubber call outlives the copy: the caller closes the cache after it
+	defer func() { stop(); wg.Wait() }()
+	stride := len(cols) + 1
+	var pending []*scrubPage
+	last, read := "", false
 	for {
-		rows, err := db.QueryContext(ctx, `SELECT id, `+strings.Join(cols, ",")+` FROM `+table+` WHERE id > ? ORDER BY id LIMIT ?`, last, scrubPageRows)
-		if err != nil {
-			return masked, err
-		}
-		var ids, texts []string
-		size := 0
-		for rows.Next() {
-			if size >= scrubPageBytes {
-				break // the page is full; the next starts after its last row
-			}
-			values := make([]string, len(cols)+1)
-			ptrs := make([]any, len(values))
-			for i := range values {
-				ptrs[i] = &values[i]
-			}
-			if err = rows.Scan(ptrs...); err != nil {
-				rows.Close()
+		if !read && len(pending) < scrubPagesAhead {
+			ids, texts, err := readScrubPage(ctx, db, table, cols, last)
+			if err != nil {
 				return masked, err
 			}
-			// the id goes through the scrubber too: a row whose id it would change is left out of the copy
-			ids, texts = append(ids, values[0]), append(append(texts, values[0]), values[1:]...)
-			for _, v := range values {
-				size += len(v)
-			}
-		}
-		err = rows.Err()
-		rows.Close()
-		if err != nil || len(ids) == 0 {
-			return masked, err
-		}
-		stride := len(cols) + 1
-		clean, err := redactGroups(ctx, cache, table, texts, stride)
-		if err != nil {
-			return masked, err
-		}
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
-			return masked, err
-		}
-		assign := make([]string, len(cols))
-		for i, col := range cols {
-			assign[i] = col + "=?"
-		}
-		for i, id := range ids {
-			changed := false
-			for j := 0; j < stride; j++ {
-				if clean[i*stride+j] != strings.ReplaceAll(texts[i*stride+j], "\x1e", " ") {
-					changed = true
-				}
-			}
-			if changed {
-				masked++
-			}
-			if clean[i*stride] != id {
-				if _, err = tx.ExecContext(ctx, "DELETE FROM "+table+" WHERE id=?", id); err != nil {
-					tx.Rollback()
-					return masked, err
-				}
+			if len(ids) == 0 {
+				read = true
 				continue
 			}
-			args := make([]any, len(cols)+1)
-			write := false
-			for j, col := range cols {
-				text := clean[i*stride+1+j]
-				if col == "meta" && !json.Valid([]byte(text)) {
-					text = "{}"
-				}
-				if col == "links" && !json.Valid([]byte(text)) {
-					text = "[]"
-				}
-				if text != texts[i*stride+1+j] {
-					write = true
-				}
-				args[j] = text
+			last = ids[len(ids)-1]
+			page := &scrubPage{ids: ids, texts: texts, done: make(chan struct{})}
+			pending = append(pending, page)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer close(page.done)
+				page.clean, page.served, page.err = cache.redactCounted(sctx, table, page.texts, stride)
+			}()
+			continue
+		}
+		if len(pending) == 0 {
+			return masked, nil
+		}
+		page := pending[0]
+		pending = pending[1:]
+		<-page.done
+		if page.err != nil {
+			return masked, page.err
+		}
+		*seen, *cached = *seen+len(page.ids), *cached+page.served
+		n, err := writeScrubPage(ctx, db, table, cols, page)
+		masked += n
+		if err != nil {
+			return masked, err
+		}
+	}
+}
+
+// readScrubPage reads the rows after last, in id order: at most scrubPageRows rows and about scrubPageBytes of text.
+func readScrubPage(ctx context.Context, db *sql.DB, table string, cols []string, last string) (ids, texts []string, err error) {
+	rows, err := db.QueryContext(ctx, `SELECT id, `+strings.Join(cols, ",")+` FROM `+table+` WHERE id > ? ORDER BY id LIMIT ?`, last, scrubPageRows)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	size := 0
+	for rows.Next() {
+		if size >= scrubPageBytes {
+			break // the page is full; the next starts after its last row
+		}
+		values := make([]string, len(cols)+1)
+		ptrs := make([]any, len(values))
+		for i := range values {
+			ptrs[i] = &values[i]
+		}
+		if err = rows.Scan(ptrs...); err != nil {
+			return nil, nil, err
+		}
+		// the id goes through the scrubber too: a row whose id it would change is left out of the copy
+		ids, texts = append(ids, values[0]), append(append(texts, values[0]), values[1:]...)
+		for _, v := range values {
+			size += len(v)
+		}
+	}
+	return ids, texts, rows.Err()
+}
+
+// writeScrubPage writes a page's scrubbed rows back in one transaction and counts the rows the scrubber changed.
+func writeScrubPage(ctx context.Context, db *sql.DB, table string, cols []string, page *scrubPage) (masked int, err error) {
+	stride := len(cols) + 1
+	ids, texts, clean := page.ids, page.texts, page.clean
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	assign := make([]string, len(cols))
+	for i, col := range cols {
+		assign[i] = col + "=?"
+	}
+	for i, id := range ids {
+		changed := false
+		for j := 0; j < stride; j++ {
+			if clean[i*stride+j] != strings.ReplaceAll(texts[i*stride+j], "\x1e", " ") {
+				changed = true
 			}
-			if !write {
-				continue // the row is already its own scrubbed copy
-			}
-			args[len(cols)] = id
-			if _, err = tx.ExecContext(ctx, "UPDATE "+table+" SET "+strings.Join(assign, ",")+" WHERE id=?", args...); err != nil {
+		}
+		if changed {
+			masked++
+		}
+		if clean[i*stride] != id {
+			if _, err = tx.ExecContext(ctx, "DELETE FROM "+table+" WHERE id=?", id); err != nil {
 				tx.Rollback()
 				return masked, err
 			}
+			continue
 		}
-		if err = tx.Commit(); err != nil {
+		args := make([]any, len(cols)+1)
+		write := false
+		for j, col := range cols {
+			text := clean[i*stride+1+j]
+			if col == "meta" && !json.Valid([]byte(text)) {
+				text = "{}"
+			}
+			if col == "links" && !json.Valid([]byte(text)) {
+				text = "[]"
+			}
+			if text != texts[i*stride+1+j] {
+				write = true
+			}
+			args[j] = text
+		}
+		if !write {
+			continue // the row is already its own scrubbed copy
+		}
+		args[len(cols)] = id
+		if _, err = tx.ExecContext(ctx, "UPDATE "+table+" SET "+strings.Join(assign, ",")+" WHERE id=?", args...); err != nil {
+			tx.Rollback()
 			return masked, err
 		}
-		last = ids[len(ids)-1]
 	}
+	return masked, tx.Commit()
 }
 
 // copyPlainFile copies a master into a new file of the caller's (the master is read-only).

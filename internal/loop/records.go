@@ -11,7 +11,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/agent-sh/momentum/internal/evidenceview"
 )
 
 // Records and unit logs share these limits. The total byte limit also applies
@@ -359,44 +362,29 @@ func writeRecords(ctx context.Context, o RecordsOptions, files []RecordFile, m R
 		limit = MaxRecordBytes
 	}
 	// The pinned children scrub each complete invocation once, before clipping.
-	// Their captured output needs no second scrub.
-	type fetched struct {
-		file RecordFile
-		text string
-	}
+	// Their captured output needs no second scrub. Only as many records are asked for as could still be written, so a
+	// withheld one is replaced from the next files, as one child per file in order would do.
 	var got []fetched
-	for i, file := range files {
-		if m.Written+len(got) >= MaxRecords {
+	for i := 0; i < len(files); {
+		need := MaxRecords - m.Written - len(got)
+		if need <= 0 {
 			m.Stopped = "record count"
 			m.Skipped += len(files) - i
 			break
 		}
-		// The child clips an event's record at --bytes and adds its header and a marker, and a unit's log is its state
-		// and the end of the log: both are asked for less than the bound and read with the slack the extras need.
-		args := []string{"evidence", "unit", file.Unit, "--lines", strconv.Itoa(unitLogLines), "--bytes", strconv.Itoa(limit)}
-		if file.Event != "" {
-			args = []string{"evidence", "show", "--bytes", strconv.Itoa(limit), file.Event}
+		round := files[i:min(len(files), i+need)]
+		results, err := fetchRecords(ctx, o, round, limit)
+		if err != nil {
+			return m, err
 		}
-		cctx, cancel := context.WithTimeout(ctx, time.Minute)
-		cmd := exec.CommandContext(cctx, o.Binary, args...)
-		cmd.Env = recordEnv(o)
-		out, stderr := Capture{Limit: limit + recordSlack}, Capture{Limit: limit}
-		cmd.Stdout, cmd.Stderr = &out, &stderr
-		runErr := cmd.Run()
-		cancel()
-		if ctx.Err() != nil {
-			return m, ctx.Err()
+		for _, g := range results {
+			if g.withheld {
+				m.Withheld++
+				continue
+			}
+			got = append(got, g)
 		}
-		if out.Over() || stderr.Over() {
-			// one record over its bound is withheld; the next may fit
-			m.Withheld++
-			continue
-		}
-		if runErr != nil || out.Len() == 0 || recordWithheld(out.String()) {
-			m.Withheld++
-			continue
-		}
-		got = append(got, fetched{file, out.String()})
+		i += len(round)
 	}
 	for i, g := range got {
 		file, clean := g.file, g.text
@@ -440,6 +428,113 @@ func writeRecords(ctx context.Context, o RecordsOptions, files []RecordFile, m R
 		return m, err
 	}
 	return m, nil
+}
+
+// recordWorkers is how many records children run at once. A child is one scrubber start, about half a second of one
+// core, and a run asks for up to 200 records.
+const recordWorkers = 4
+
+type fetched struct {
+	file     RecordFile
+	text     string
+	withheld bool
+}
+
+// fetchRecords runs the records children for files and returns each file's output in the files' order. Consecutive
+// events share a child, up to evidenceview.ShowMost (ten), whose events come back separated (--separate); a unit has a
+// child of its own. A shared child that fails, prints more than its bound or returns another number of events is run
+// again one event per child, so every record is withheld or kept exactly as its own child would decide.
+func fetchRecords(ctx context.Context, o RecordsOptions, files []RecordFile, limit int) ([]fetched, error) {
+	type job struct{ start, end int }
+	var jobs []job
+	for i := 0; i < len(files); {
+		end := i + 1
+		if files[i].Event != "" {
+			for end < len(files) && end-i < evidenceview.ShowMost && files[end].Event != "" {
+				end++
+			}
+		}
+		jobs = append(jobs, job{i, end})
+		i = end
+	}
+	out := make([]fetched, len(files))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, recordWorkers)
+	for _, j := range jobs {
+		if ctx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(j job) {
+			defer func() { <-sem; wg.Done() }()
+			if j.end-j.start > 1 && fetchShared(ctx, o, files[j.start:j.end], limit, out[j.start:j.end]) {
+				return
+			}
+			for k := j.start; k < j.end; k++ {
+				out[k] = fetchOne(ctx, o, files[k], limit)
+			}
+		}(j)
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return out, nil
+}
+
+// fetchOne is one record's own child: an event's record clipped at --bytes with its header and a marker, or a unit's
+// state and the end of its log. Both are asked for less than the bound and read with the slack the extras need; one
+// over its bound is withheld, and the next may fit.
+func fetchOne(ctx context.Context, o RecordsOptions, file RecordFile, limit int) fetched {
+	args := []string{"evidence", "unit", file.Unit, "--lines", strconv.Itoa(unitLogLines), "--bytes", strconv.Itoa(limit)}
+	if file.Event != "" {
+		args = []string{"evidence", "show", "--bytes", strconv.Itoa(limit), file.Event}
+	}
+	text, ok := recordChild(ctx, o, args, limit+recordSlack, limit)
+	if !ok || text == "" || recordWithheld(text) {
+		return fetched{file: file, withheld: true}
+	}
+	return fetched{file: file, text: text}
+}
+
+// fetchShared asks one child for several events and fills dst. It reports false, filling nothing, when the child's
+// answer cannot be split into its events.
+func fetchShared(ctx context.Context, o RecordsOptions, files []RecordFile, limit int, dst []fetched) bool {
+	args := []string{"evidence", "show", "--separate", "--bytes", strconv.Itoa(limit), "--"}
+	for _, f := range files {
+		args = append(args, f.Event)
+	}
+	text, ok := recordChild(ctx, o, args, len(files)*(limit+recordSlack+1), limit)
+	if !ok {
+		return false
+	}
+	parts := strings.Split(text, "\x1e")
+	if len(parts) != len(files) {
+		return false
+	}
+	for i, part := range parts {
+		dst[i] = fetched{file: files[i], text: part}
+		if part == "" || len(part) > limit+recordSlack || recordWithheld(part) {
+			dst[i] = fetched{file: files[i], withheld: true}
+		}
+	}
+	return true
+}
+
+// recordChild runs the pinned host binary with args and returns its output, or false when it failed or printed more
+// than its bounds.
+func recordChild(ctx context.Context, o RecordsOptions, args []string, outLimit, errLimit int) (string, bool) {
+	cctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, o.Binary, args...)
+	cmd.Env = recordEnv(o)
+	out, stderr := Capture{Limit: outLimit}, Capture{Limit: errLimit}
+	cmd.Stdout, cmd.Stderr = &out, &stderr
+	if err := cmd.Run(); err != nil || out.Over() || stderr.Over() {
+		return "", false
+	}
+	return out.String(), true
 }
 
 func recordFits(data, index, next, line int) bool {

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/agent-sh/momentum/internal/plain"
@@ -107,51 +108,104 @@ func (r *Runner) buildInputs(ctx context.Context, p *passInputs) error {
 		}
 	}
 	p.since = until.Add(-HistoryWindow)
-	dst := filepath.Join(dir, "store.sqlite")
-	p.manifest.Store, err = StoreCopy(ctx, StoreCopyOptions{Source: r.Store.Path(), Destination: dst, ScratchDir: dir, Since: until.Add(-window), Until: until, Cache: p.cache})
-	if err != nil {
-		return err
-	}
-	p.manifest.Store.CacheError = cacheErr
-	p.binds = append(p.binds, sandbox.Bind{Src: dst, Dst: "/ro/store.sqlite"})
-	dst = filepath.Join(dir, "config")
-	p.manifest.Configuration, err = ConfigCopy(ctx, ConfigCopyOptions{Home: r.Inputs.Home, Destination: dst})
-	if err != nil {
-		return err
-	}
-	p.binds = append(p.binds, sandbox.Bind{Src: dst, Dst: "/ro/config"})
 	logs := filepath.Join(dir, "history")
 	if err = os.Mkdir(logs, 0o700); err != nil {
 		return err
 	}
-	dst = filepath.Join(dir, "clone")
-	p.manifest.Tacit, err = SnapshotFacts(ctx, r.Inputs.TacitStore, dst, filepath.Join(logs, "facts.log"), p.cache, p.since)
-	switch {
-	case errors.Is(err, ErrNoScrubber), ctx.Err() != nil:
-		if ctx.Err() != nil {
-			return ctx.Err()
+	// The store copy, the configuration copy and the snapshots read different sources into different directories, so
+	// they run at the same time: the pass waits for the longest, not for their sum. The first that fails stops the
+	// others, and its error is the pass's.
+	storeDst, configDst, tacitDst, reposDst := filepath.Join(dir, "store.sqlite"), filepath.Join(dir, "config"), filepath.Join(dir, "clone"), filepath.Join(dir, "repos")
+	sctx, stop := context.WithCancel(ctx)
+	defer stop()
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		cause   error
+		tacitOK bool
+	)
+	fail := func(err error) {
+		mu.Lock()
+		if cause == nil {
+			cause = err
 		}
-		return err
-	case err != nil:
-		// tacit's facts are context, not a precondition: without them the run goes on, and the manifest says why
-		p.manifest.Tacit.Error = reason(err)
-	default:
-		p.binds = append(p.binds, sandbox.Bind{Src: dst, Dst: "/ro/clone"})
+		mu.Unlock()
+		stop()
 	}
-	dst = filepath.Join(dir, "repos")
-	p.manifest.Repositories, err = SnapshotRepos(ctx, SnapshotOptions{Sources: r.Inputs.ReadDirs, Destination: dst, LogDir: filepath.Join(logs, "repos"),
-		LoopDirs: []string{r.Dir}, Cache: p.cache, Since: p.since})
-	if err != nil {
-		return err
+	steps := []func(){
+		func() {
+			m, err := StoreCopy(sctx, StoreCopyOptions{Source: r.Store.Path(), Destination: storeDst, ScratchDir: dir, Since: until.Add(-window), Until: until, Cache: p.cache})
+			p.manifest.Store = m
+			if err != nil {
+				fail(err)
+			}
+		},
+		func() {
+			m, err := ConfigCopy(sctx, ConfigCopyOptions{Home: r.Inputs.Home, Destination: configDst})
+			p.manifest.Configuration = m
+			if err != nil {
+				fail(err)
+			}
+		},
+		func() {
+			m, err := SnapshotFacts(sctx, r.Inputs.TacitStore, tacitDst, filepath.Join(logs, "facts.log"), p.cache, p.since)
+			p.manifest.Tacit = m
+			switch {
+			case errors.Is(err, ErrNoScrubber):
+				fail(err)
+			case sctx.Err() != nil:
+				fail(sctx.Err()) // stopped: the step that failed, or the pass, gives the reason
+			case err != nil:
+				// tacit's facts are context, not a precondition: without them the run goes on, and the manifest says why
+				p.manifest.Tacit.Error = reason(err)
+			default:
+				tacitOK = true
+			}
+		},
+		func() {
+			// A repository that cannot be read (missing, not a work tree, no default branch) is left out and counted in the
+			// manifest's summary; the others and the investigation go on. What the scrubber changes in one is masked.
+			m, err := SnapshotRepos(sctx, SnapshotOptions{Sources: r.Inputs.ReadDirs, Destination: reposDst, LogDir: filepath.Join(logs, "repos"),
+				LoopDirs: []string{r.Dir}, Cache: p.cache, Since: p.since})
+			p.manifest.Repositories = m
+			if err != nil {
+				fail(err)
+			}
+		},
 	}
-	// A repository that cannot be read (missing, not a work tree, no default branch) is left out and counted in the
-	// manifest's summary; the others and the investigation go on. What the scrubber changes in one is masked.
-	p.binds = append(p.binds, sandbox.Bind{Src: dst, Dst: "/ro/repos"}, sandbox.Bind{Src: logs, Dst: "/ro/history"})
+	took := make([]time.Duration, len(steps))
+	start := time.Now()
+	for i, step := range steps {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			begin := time.Now()
+			step()
+			took[i] = time.Since(begin)
+		}()
+	}
+	wg.Wait()
+	r.logf("pass inputs: %s (store %s, configuration %s, tacit %s, repositories %s)", roundSecond(time.Since(start)), roundSecond(took[0]),
+		roundSecond(took[1]), roundSecond(took[2]), roundSecond(took[3]))
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if cause != nil {
+		return cause
+	}
+	p.manifest.Store.CacheError = cacheErr
+	p.binds = append(p.binds, sandbox.Bind{Src: storeDst, Dst: "/ro/store.sqlite"}, sandbox.Bind{Src: configDst, Dst: "/ro/config"})
+	if tacitOK {
+		p.binds = append(p.binds, sandbox.Bind{Src: tacitDst, Dst: "/ro/clone"})
+	}
+	p.binds = append(p.binds, sandbox.Bind{Src: reposDst, Dst: "/ro/repos"}, sandbox.Bind{Src: logs, Dst: "/ro/history"})
 	if f := p.cache.Failure(); f != "" && p.manifest.Store.CacheError == "" {
 		p.manifest.Store.CacheError = f // the cache failed during the pass: the rows after it were scrubbed without it
 	}
 	return nil
 }
+
+func roundSecond(d time.Duration) time.Duration { return d.Round(time.Second) }
 
 // inside reports whether path lies in dir or is it.
 func inside(dir, path string) bool {

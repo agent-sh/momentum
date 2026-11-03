@@ -58,3 +58,41 @@ func TestEvidenceShowScrubsWholeRecordBeforeBytesAndAcceptsTenIDs(t *testing.T) 
 		t.Fatal("accepted eleven IDs")
 	}
 }
+
+// The records pass asks one child for up to ten events: --separate prints each as its own child would (header and
+// clipped record), separated by the record separator, and an event that cannot be shown as an empty one.
+func TestEvidenceShowSeparatesEventsForTheRecordsPass(t *testing.T) {
+	fakeScrubber(t)
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	var ids []string
+	for _, name := range []string{"first", "second"} {
+		record := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(record, []byte("secret-value "+name+" tail\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		e := store.Event{Source: store.Transcripts, SourceKey: name, TS: time.Now().Add(-time.Minute), Actor: store.ActorTool, Kind: "tool_result", Summary: "fixture", Ref: record + "@0"}
+		if _, err := st.Put(context.Background(), []store.Event{e}); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, e.ID())
+	}
+	var own []string
+	for _, id := range ids {
+		code, out, diag := momentum("evidence", "show", "--bytes", "20", id)
+		if code != 0 {
+			t.Fatalf("own child: %d %s", code, diag)
+		}
+		own = append(own, out)
+	}
+	code, out, diag := momentum("evidence", "show", "--separate", "--bytes", "20", "--", ids[0], "0123456789abcdef01234567", ids[1])
+	parts := strings.Split(out, "\x1e")
+	if code != 0 || len(parts) != 3 || parts[0] != own[0] || parts[1] != "" || parts[2] != own[1] || strings.Contains(out, "secret-value") {
+		t.Fatalf("separated show: %d %q %s", code, out, diag)
+	}
+}

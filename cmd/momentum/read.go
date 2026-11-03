@@ -45,9 +45,19 @@ func scrubbed(ctx context.Context, w io.Writer, text string) error {
 // evidenceShow accepts up to ten live events. Each full referenced record is
 // scrubbed before --bytes selects its prefix. An as-of child withholds later
 // records and every Hermes row, whose earlier version cannot be reconstructed.
+// The loop's records pass adds --separate: the events are then separated by the record separator (U+001E), which no
+// scrubbed text holds, and an event that cannot be shown is an empty one, so one child serves up to ten records.
 func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if _, err := evidenceEnd(); err != nil {
 		return err
+	}
+	separate := false
+	for i := 0; i < len(args) && args[i] != "--"; i++ {
+		if args[i] == "--separate" {
+			separate = true
+			args = append(args[:i:i], args[i+1:]...)
+			i--
+		}
 	}
 	ids, cut, err := evidenceview.ParseShow(args, stderr)
 	if err != nil {
@@ -66,6 +76,8 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		switch {
 		case err == nil:
 			shown++
+		case errors.As(err, &ue) && len(ids) > 1 && separate:
+			text = eventText{} // an empty event: the records pass withholds it
 		case errors.As(err, &ue) && len(ids) > 1:
 			text.header = fmt.Sprintf("%s: %s\n", plain.Line(raw), ue.msg)
 		default:
@@ -80,7 +92,10 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	}
 	var output strings.Builder
 	for i := range ids {
-		if i > 0 {
+		switch {
+		case i > 0 && separate:
+			output.WriteString("\x1e")
+		case i > 0:
 			output.WriteString("\n")
 		}
 		output.WriteString(clean[2*i])

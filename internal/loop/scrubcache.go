@@ -210,11 +210,19 @@ func unpackGroup(b []byte, n int) ([]string, bool) {
 // cache after the scrubber's identity matched; the others go to the scrubber, in order, and are cached. The
 // result equals RedactAll's for the same texts. A nil cache scrubs everything.
 func (c *ScrubCache) RedactGroups(ctx context.Context, ns string, texts []string, stride int) ([]string, error) {
+	out, _, err := c.redactCounted(ctx, ns, texts, stride)
+	return out, err
+}
+
+// redactCounted is RedactGroups that also says how many of the groups came from the cache, so a caller counts its own
+// texts while others use the cache at the same time.
+func (c *ScrubCache) redactCounted(ctx context.Context, ns string, texts []string, stride int) ([]string, int, error) {
 	if stride <= 0 || len(texts)%stride != 0 {
-		return nil, fmt.Errorf("scrub groups need a stride that divides the texts")
+		return nil, 0, fmt.Errorf("scrub groups need a stride that divides the texts")
 	}
 	if c == nil {
-		return RedactAll(ctx, texts)
+		out, err := RedactAll(ctx, texts)
+		return out, 0, err
 	}
 	c.mu.Lock()
 	usable := c.db != nil && !c.broken
@@ -223,7 +231,8 @@ func (c *ScrubCache) RedactGroups(ctx context.Context, ns string, texts []string
 	}
 	c.mu.Unlock()
 	if !usable {
-		return RedactAll(ctx, texts)
+		out, err := RedactAll(ctx, texts)
+		return out, 0, err
 	}
 	groups := len(texts) / stride
 	out := make([]string, len(texts))
@@ -265,14 +274,15 @@ func (c *ScrubCache) RedactGroups(ctx context.Context, ns string, texts []string
 	}
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, ctx.Err() // a pass told to stop is not a failure of the cache
+			return nil, 0, ctx.Err() // a pass told to stop is not a failure of the cache
 		}
 		// a cache that fails is dropped: scrub without it
 		c.drop("the cache failed while reading")
 		c.mu.Lock()
 		c.misses += groups
 		c.mu.Unlock()
-		return RedactAll(ctx, texts)
+		out, err := RedactAll(ctx, texts)
+		return out, 0, err
 	}
 	if len(miss) > 0 {
 		send := make([]string, 0, len(miss)*stride)
@@ -281,7 +291,7 @@ func (c *ScrubCache) RedactGroups(ctx context.Context, ns string, texts []string
 		}
 		clean, err := RedactAll(ctx, send)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		for i, g := range miss {
 			copy(out[g*stride:], clean[i*stride:(i+1)*stride])
@@ -294,7 +304,7 @@ func (c *ScrubCache) RedactGroups(ctx context.Context, ns string, texts []string
 	c.hits += groups - len(miss)
 	c.misses += len(miss)
 	c.mu.Unlock()
-	return out, nil
+	return out, groups - len(miss), nil
 }
 
 func (c *ScrubCache) store(ctx context.Context, keys [][]byte, miss []int, out []string, stride int, today int64) error {
