@@ -53,7 +53,7 @@ const inputFiles = `
 sqlite3.connect("file:/ro/store.sqlite?mode=ro", uri=True). There is no sqlite3 command.
 The events columns are id (24 hex characters; write references as ev:ID), source, source_key, ts (milliseconds since the epoch), session, agent, harness, model, cwd, actor (owner, agent, tool, harness, detector, unknown), kind, tool, summary, meta, ref, heuristic, experiment, ingested.
 The notes columns are id, kind, title, detail, effect, links, source, importance, at, done.
-/ro/records/index.txt lists the case's evidence records and neighbours (ev-ID.txt), and unit logs (unit-NAME.txt).
+/ro/records/index.txt lists the case's evidence records and neighbours (ev-ID.txt), and unit logs (unit-NAME.txt); a record that was withheld has no file and a withheld line.
 Read the evidence with momentum-ro first; it reads this same store and these records and changes nothing. Start with momentum-ro case show, then momentum-ro evidence show ev:ID for each event: it prints the event and its record. momentum-ro evidence events --session SESSION reads a session in order; --since 3d, --kind tool_result and --source filter, and times count back from the end of the store. Use python3's sqlite3 on /ro/store.sqlite for what these do not answer.
 /ro/config/MANIFEST.txt lists the scrubbed point-in-time text configuration and withheld paths.`
 

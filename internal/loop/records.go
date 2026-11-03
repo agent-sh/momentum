@@ -62,8 +62,11 @@ type RecordsManifest struct {
 	Bytes    int          `json:"bytes"`
 	Stopped  string       `json:"stopped,omitempty"`
 	Files    []RecordFile `json:"files"`
+	// Held lists the withheld records the index names (`withheld` lines): no file holds them.
+	Held []RecordFile `json:"held,omitempty"`
 }
 
+var recordEventRE = regexp.MustCompile(`^[0-9a-f]{24}$`)
 var unitNameRE = regexp.MustCompile(`^[A-Za-z0-9@._-]+\.(service|timer)$`)
 var unitFinderRE = regexp.MustCompile(`[A-Za-z0-9@._-]+\.(?:service|timer)`)
 
@@ -354,9 +357,9 @@ func writeRecords(ctx context.Context, o RecordsOptions, files []RecordFile, m R
 			}
 		}
 	}
-	index := recordIndex(m.Files)
+	index, heldText := recordIndex(m.Files), heldIndex(m.Held)
 	// Bytes includes the existing index. Account for its replacement once.
-	dataBytes := m.Bytes - len(index)
+	dataBytes := m.Bytes - len(index) - len(heldText)
 	limit := o.Bytes
 	if limit == 0 {
 		limit = MaxRecordBytes
@@ -365,6 +368,15 @@ func writeRecords(ctx context.Context, o RecordsOptions, files []RecordFile, m R
 	// Their captured output needs no second scrub. Only as many records are asked for as could still be written, so a
 	// withheld one is replaced from the next files, as one child per file in order would do.
 	var got []fetched
+	// withhold counts a record that has no file and names it in the index while the bytes allow the line.
+	withhold := func(file RecordFile) {
+		m.Withheld++
+		file.Bytes = 0
+		if line := heldIndex([]RecordFile{file}); recordFits(dataBytes, len(index)+len(heldText), 0, len(line)) {
+			m.Held = append(m.Held, file)
+			heldText += line
+		}
+	}
 	for i := 0; i < len(files); {
 		need := MaxRecords - m.Written - len(got)
 		if need <= 0 {
@@ -379,7 +391,7 @@ func writeRecords(ctx context.Context, o RecordsOptions, files []RecordFile, m R
 		}
 		for _, g := range results {
 			if g.withheld {
-				m.Withheld++
+				withhold(g.file)
 				continue
 			}
 			got = append(got, g)
@@ -389,12 +401,12 @@ func writeRecords(ctx context.Context, o RecordsOptions, files []RecordFile, m R
 	for i, g := range got {
 		file, clean := g.file, g.text
 		if len(clean) > limit+recordSlack {
-			m.Withheld++
+			withhold(file)
 			continue
 		}
 		file.Bytes = len(clean)
 		line := recordIndex([]RecordFile{file})
-		if !recordFits(dataBytes, len(index), file.Bytes, len(line)) {
+		if !recordFits(dataBytes, len(index)+len(heldText), file.Bytes, len(line)) {
 			m.Stopped = "total bytes"
 			m.Skipped += len(got) - i
 			break
@@ -407,8 +419,8 @@ func writeRecords(ctx context.Context, o RecordsOptions, files []RecordFile, m R
 		dataBytes += file.Bytes
 		index += line
 	}
-	m.Bytes = dataBytes + len(index)
-	if err = writeReadonlyInput(filepath.Join(tmp, "index.txt"), []byte(index)); err != nil {
+	m.Bytes = dataBytes + len(index) + len(heldText)
+	if err = writeReadonlyInput(filepath.Join(tmp, "index.txt"), []byte(index+heldText)); err != nil {
 		return m, err
 	}
 	if appendOnly {
@@ -576,6 +588,19 @@ func recordIndex(files []RecordFile) string {
 	return b.String()
 }
 
+// heldIndex is the index's lines for withheld records: `withheld`, then the event and its time, or `unit` and its name.
+func heldIndex(files []RecordFile) string {
+	var b strings.Builder
+	for _, file := range files {
+		if file.Event != "" {
+			fmt.Fprintf(&b, "withheld\t%s\t%s\n", file.Event, file.At.UTC().Format(time.RFC3339Nano))
+		} else {
+			fmt.Fprintf(&b, "withheld\tunit\t%s\n", file.Unit)
+		}
+	}
+	return b.String()
+}
+
 func readRecordIndex(dir string) (RecordsManifest, error) {
 	m := RecordsManifest{}
 	f, err := OpenFile(dir, "index.txt")
@@ -594,6 +619,19 @@ func readRecordIndex(dir string) (RecordsManifest, error) {
 			continue
 		}
 		fields := strings.Split(line, "\t")
+		if len(fields) == 3 && fields[0] == "withheld" {
+			held := RecordFile{Unit: fields[2]}
+			if fields[1] != "unit" {
+				held = RecordFile{Event: fields[1]}
+				held.At, err = time.Parse(time.RFC3339Nano, fields[2])
+			}
+			if err != nil || held.Unit != "" && !unitNameRE.MatchString(held.Unit) || held.Event != "" && !recordEventRE.MatchString(held.Event) {
+				return m, fmt.Errorf("invalid withheld index entry")
+			}
+			m.Held = append(m.Held, held)
+			m.Withheld++
+			continue
+		}
 		if len(fields) != 3 || seen[fields[0]] {
 			return m, fmt.Errorf("invalid record index")
 		}

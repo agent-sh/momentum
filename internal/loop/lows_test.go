@@ -2,7 +2,11 @@ package loop
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -30,5 +34,46 @@ func TestAnInvisibleOnlyFindingIsUndecided(t *testing.T) {
 	got, _ := st.CaseByID(ctx, c.ID)
 	if got.Status != store.CaseClosed || got.Reason != store.Insufficient || got.NextTest != "take the lock first" {
 		t.Fatalf("the case: %s %s, mechanism %q, next test %q", got.Status, got.Reason, got.Mechanism, got.NextTest)
+	}
+}
+
+// index.txt lists a withheld record too, under the name `withheld`, so an investigation knows the record exists and why
+// it has no file; a later append of unit logs keeps the line, and the bytes count it.
+func TestTheRecordIndexListsWithheldRecords(t *testing.T) {
+	goodInputScrubber(t)
+	at := time.Date(2025, 4, 10, 12, 0, 0, 0, time.UTC)
+	events := []store.Event{{Source: "fixture", SourceKey: "kept", TS: at, Kind: "record"},
+		{Source: "fixture", SourceKey: "held", TS: at.Add(time.Second), Kind: "record"}}
+	o := recordFixture(t, events, `case "$5" in "`+events[1].ID()+`") printf '(record withheld: fixture)\n';; *) printf 'record\n';; esac`)
+	o.Neighbours = -1
+	o.IDs = []string{events[0].ID(), events[1].ID()}
+	m, err := Records(context.Background(), o)
+	if err != nil || m.Written != 1 || m.Withheld != 1 {
+		t.Fatalf("manifest %+v: %v", m, err)
+	}
+	line := "withheld\t" + events[1].ID() + "\t2025-04-10T12:00:01Z\n"
+	index, err := os.ReadFile(filepath.Join(o.Destination, "index.txt"))
+	if err != nil || !strings.Contains(string(index), line) {
+		t.Fatalf("the index does not list the withheld record: %q %v", index, err)
+	}
+	o.Units = []string{"fixture.service"}
+	again, err := UnitLogs(context.Background(), o)
+	if err != nil || again.Written != 2 {
+		t.Fatalf("unit append %+v: %v", again, err)
+	}
+	index, err = os.ReadFile(filepath.Join(o.Destination, "index.txt"))
+	if err != nil || !strings.Contains(string(index), line) {
+		t.Fatalf("an append dropped the withheld line: %q %v", index, err)
+	}
+	total := len(index)
+	for _, file := range again.Files {
+		info, err := os.Stat(filepath.Join(o.Destination, file.Name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		total += int(info.Size())
+	}
+	if again.Bytes != total {
+		t.Fatalf("bytes %d, on disk %d", again.Bytes, total)
 	}
 }
