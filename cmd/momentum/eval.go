@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/agent-sh/momentum/internal/config"
 	"github.com/agent-sh/momentum/internal/loop"
@@ -97,6 +99,12 @@ func loopEval(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	for t := range unknown {
 		return usageError{fmt.Sprintf("task %q is absent from the selected split in %s", t, *golden)}
 	}
+	// one evaluation at a time: its sweep of leftovers stops every unit of the evaluation prefix, a running one's too
+	unlock, err := lockEval(paths.DB())
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	c, err := config.Load()
 	if err != nil {
 		return err
@@ -209,4 +217,23 @@ func selfBinary() string {
 		return ""
 	}
 	return exe
+}
+
+// lockEval takes the evaluation's lock beside the store. A second evaluation fails at once and says so.
+func lockEval(db string) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(db), 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(db+".eval-lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, errors.New("another evaluation runs now")
+		}
+		return nil, err
+	}
+	return func() { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
 }
