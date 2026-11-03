@@ -73,9 +73,14 @@ func checkCloneObjects(ctx context.Context, dir string) error {
 
 // checkObjects is the scan of every object of the repository at dir (see checkCloneObjects), without its
 // configuration: a build mounts a clone of a work tree whose own configuration is not part of the clone.
-func checkObjects(ctx context.Context, dir string) error {
+func checkObjects(ctx context.Context, dir string) (result error) {
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
+	defer func() {
+		if result != nil && (ctx.Err() != nil || cctx.Err() == context.DeadlineExceeded) {
+			result = fmt.Errorf("the object scan ran out of time or was cancelled")
+		}
+	}()
 	cmd := exec.CommandContext(cctx, "git", append(append([]string{"-C", dir}, GitSafety()...),
 		"cat-file", "--batch-all-objects", "--batch")...)
 	cmd.Env = GitEnv()

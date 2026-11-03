@@ -423,6 +423,10 @@ func (s *Ship) freshRunClone(ctx context.Context, p Package) error {
 	if _, err := hostGit(ctx, staging, nil, "checkout", "--quiet", "--detach", p.BaseCommit); err != nil {
 		return err
 	}
+	// the reflog records this host's paths and generated identity; a run has no use for it
+	if err := removeAll(filepath.Join(staging, ".git", "logs")); err != nil {
+		return err
+	}
 	return os.Rename(staging, p.Work)
 }
 

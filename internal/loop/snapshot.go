@@ -273,7 +273,9 @@ func snapshotOne(ctx context.Context, source, dst, logPath string, maxBytes int6
 	if len(r.Skipped) == 0 {
 		r.Skipped = nil
 	}
-	r.History = snapshotLog(ctx, source, commit, logPath, since, cache)
+	if r.History, err = snapshotLog(ctx, source, commit, logPath, since, cache); err != nil {
+		return r, err
+	}
 	return r, nil
 }
 
@@ -345,12 +347,17 @@ type pendingFile struct{ path, text string }
 
 // writeSnapshot streams the blobs from one git process and scrubs and writes them in chunks, so memory stays at a
 // chunk whatever the repository's size.
-func writeSnapshot(ctx context.Context, source, tree string, entries []snapEntry, maxBytes int64, cache *ScrubCache, r *RepoInput) error {
+func writeSnapshot(ctx context.Context, source, tree string, entries []snapEntry, maxBytes int64, cache *ScrubCache, r *RepoInput) (result error) {
 	if len(entries) == 0 {
 		return nil
 	}
 	cctx, cancel := context.WithTimeout(ctx, 2*gitStepTimeout)
 	defer cancel()
+	defer func() {
+		if result != nil && (ctx.Err() != nil || cctx.Err() == context.DeadlineExceeded) {
+			result = fmt.Errorf("the repository read ran out of time or was cancelled")
+		}
+	}()
 	cmd := exec.CommandContext(cctx, "git", append(append([]string{"-C", source}, GitSafety()...), "cat-file", "--batch")...)
 	cmd.Env = GitEnv()
 	stderr := Capture{Limit: ScrubBatchBytes}
@@ -464,7 +471,7 @@ func writeSnapshotFile(tree, rel, text string) error {
 // snapshotLog writes the commit log of the window: one entry per commit with its date, author, subject and, per
 // file, the lines added and removed. Entries are scrubbed one by one. A log that cannot be made is reported in the
 // manifest and leaves the snapshot as it is.
-func snapshotLog(ctx context.Context, source, commit, logPath string, since time.Time, cache *ScrubCache) (h HistoryManifest) {
+func snapshotLog(ctx context.Context, source, commit, logPath string, since time.Time, cache *ScrubCache) (h HistoryManifest, scrubErr error) {
 	args := []string{"-c", "core.quotepath=false", "log", "-n", strconv.Itoa(HistoryCommits), "--no-renames", "--numstat", "--no-color",
 		"--no-ext-diff", "--no-textconv", "--date=iso-strict", "--format=%x01%H %aI %an%n%s"}
 	if !since.IsZero() {
@@ -473,8 +480,8 @@ func snapshotLog(ctx context.Context, source, commit, logPath string, since time
 	args = append(args, commit, "--")
 	out, over, err := hostInputGitCapped(ctx, source, logOutputMax, args...)
 	if err != nil {
-		h.Error = err.Error()
-		return h
+		h.Error = reason(err)
+		return h, nil
 	}
 	records := strings.Split(string(out), "\x01")[1:]
 	if over && len(records) > 0 {
@@ -486,8 +493,11 @@ func snapshotLog(ctx context.Context, source, commit, logPath string, since time
 	}
 	clean, err := redactGroups(ctx, cache, "log", texts, 1)
 	if err != nil {
-		h.Error = err.Error()
-		return h
+		if isScrubberError(err) {
+			return h, err // only a scrubber that does not run stops the pass
+		}
+		h.Error = reason(err)
+		return h, nil
 	}
 	var b strings.Builder
 	for i, t := range clean {
@@ -498,9 +508,9 @@ func snapshotLog(ctx context.Context, source, commit, logPath string, since time
 	}
 	h.Commits, h.Bytes = len(clean), int64(b.Len())
 	if err = writeLog(logPath, b.String()); err != nil {
-		return HistoryManifest{Error: err.Error()}
+		return HistoryManifest{Error: reason(err)}, nil
 	}
-	return h
+	return h, nil
 }
 
 func writeLog(logPath, text string) error {
@@ -673,7 +683,11 @@ func SnapshotDiffs(ctx context.Context, repos []RepoInput, texts []string, dst s
 			if len(t) <= DiffMax {
 				continue
 			}
-			t = t[:DiffMax]
+			cut := DiffMax
+			for cut > 0 && !utf8.RuneStart(t[cut]) {
+				cut--
+			}
+			t = t[:cut]
 			if j := strings.LastIndexByte(t, '\n'); j > 0 {
 				t = t[:j+1]
 			}

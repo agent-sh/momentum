@@ -384,4 +384,40 @@ func TestBuildRefusesARepositoryWhoseHistoryNeedsMasking(t *testing.T) {
 	if err == nil || !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "would mask") {
 		t.Fatalf("a build was prepared on a repository with unscrubbed history: %v", err)
 	}
+	// nothing of the refused clone stays where a run could be given it
+	p, _, _ := r.Ship.Load(c.ID)
+	if _, err := os.Stat(p.Work); !os.IsNotExist(err) {
+		t.Fatalf("the refused clone was kept: %v", err)
+	}
+}
+
+// The clone a build gets carries no reflog: it would name this host's paths and generated identity.
+func TestBuildCloneHasNoReflog(t *testing.T) {
+	ctx := context.Background()
+	r, c := inputRunner(t)
+	f := newRepo(t, nil)
+	r.Ship = shipWithSandbox(r.Store, f, Sandbox{})
+	r.Ship.Dir = r.Dir
+	r.Inputs.ReadDirs = []string{f.main}
+	mechanism, fix := "one cause", "one fix"
+	c, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setCaseRepo(t, r.Store, c, "main")
+	r.pass = &passInputs{}
+	t.Cleanup(r.pass.close)
+	if err := r.prepareInputs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.prepareRun(ctx, c, c.Family, StepBuild); err != nil {
+		t.Fatal(err)
+	}
+	p, _, err := r.Ship.Load(c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(p.Work, ".git", "logs")); !os.IsNotExist(err) {
+		t.Fatalf("the build clone kept its reflog: %v", err)
+	}
 }

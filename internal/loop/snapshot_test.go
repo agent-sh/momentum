@@ -328,6 +328,9 @@ func TestRefusalReasonsNameNoHostPath(t *testing.T) {
 	if err != nil || len(got) != 1 || got[0].Error == "" || strings.Contains(got[0].Error, parent) || strings.Contains(got[0].Error, "gone-repository") {
 		t.Fatalf("reason %+v: %v", got, err)
 	}
+	if !strings.Contains(got[0].Error, "source is not a plain work tree") {
+		t.Fatalf("the reason lost its context: %s", got[0].Error)
+	}
 	if text := (InputsManifest{Repositories: got}).Summary(); strings.Contains(text, parent) {
 		t.Fatalf("summary carries a host path: %s", text)
 	}
