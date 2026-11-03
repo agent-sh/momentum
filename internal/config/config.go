@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/agent-sh/momentum/internal/cfgpaths"
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/source"
 )
@@ -87,8 +88,8 @@ type Loop struct {
 	// CapacityGate is a command that waits until the machine has room for a check's test and exits 0, or fails.
 	CapacityGate []string `json:"capacity_gate"`
 	// ConfigTargets is the loop's authority to change configuration files in place, apart from Live (which governs
-	// repository landings): off unless Enabled. Allow narrows the files the configuration copy reads to these
-	// home-relative paths (path.Match patterns, or a directory and "/**"); empty admits all of them.
+	// repository landings): off unless Enabled, and then only the files Allow names (exact home-relative files, or
+	// directories whose existing files they admit, inside the files the configuration copy reads); empty admits none.
 	ConfigTargets ConfigTargets `json:"config_targets"`
 }
 
@@ -130,11 +131,8 @@ func Load() (Sources, error) {
 		if err := d.Decode(&l); err != nil {
 			return s, fmt.Errorf("%s: loop: %w", SourcesPath(), err)
 		}
-		for _, a := range l.ConfigTargets.Allow {
-			p := strings.TrimPrefix(a, "~/")
-			if p == "" || filepath.IsAbs(p) || filepath.Clean(p) != p || strings.HasPrefix(p, "../") || p == ".." {
-				return s, fmt.Errorf("%s: loop.config_targets.allow: %q is no clean home-relative path", SourcesPath(), a)
-			}
+		if err := cfgpaths.CheckAllow(l.ConfigTargets.Allow); err != nil {
+			return s, fmt.Errorf("%s: %w", SourcesPath(), err)
 		}
 	}
 	s.Mistakes.Path = paths.Expand(s.Mistakes.Path)

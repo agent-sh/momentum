@@ -176,7 +176,8 @@ func TestConfigTargetsAreOffByDefaultAndStrict(t *testing.T) {
 	if _, err := Load(); err == nil {
 		t.Fatal("a misspelt key of config_targets was taken")
 	}
-	for _, bad := range []string{`"/etc/x"`, `"../x"`, `"~/../x"`, `".config/./agents"`, `""`} {
+	for _, bad := range []string{`"/etc/x"`, `"../x"`, `"~/../x"`, `".config/./agents"`, `""`, `".bashrc"`, `".ssh/config"`, `".local/bin"`,
+		`".local/bin/tool"`, `".config/momentum/sources.json"`, `".claude/hooks/cred-get"`, `".config/agents/bedrock.env"`} {
 		write(`{"loop": {"config_targets": {"enabled": true, "allow": [` + bad + `]}}}`)
 		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "config_targets.allow") {
 			t.Fatalf("allow %s: %v", bad, err)

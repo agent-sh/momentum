@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/store"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -36,7 +37,7 @@ func configShip(t *testing.T, st *store.Store, home string) *Ship {
 	t.Helper()
 	return &Ship{Store: st, Dir: filepath.Join(t.TempDir(), "loop"), Live: true, Actor: "loop:test", Identity: [2]string{"Owner Name", "owner@example.com"},
 		Sandbox: testSandbox(t), Public: func(_ context.Context, s string) (string, error) { return Neutral(s), nil },
-		ConfigTargets: ConfigTargets{Enabled: true, Home: home}}
+		ConfigTargets: ConfigTargets{Enabled: true, Allow: []string{".config/agents"}, Home: home}}
 }
 
 var configProposal = Proposal{Title: "Rules say the new rule", Body: "The old rule caused the failure.", Rollback: "restore the journaled file",
@@ -89,12 +90,17 @@ func readTarget(t *testing.T, home string) (string, os.FileMode) {
 	return string(b), st.Mode().Perm()
 }
 
-// A target is a file the configuration copy reads, under the stricter target denylist, and Allow only narrows it.
+// targetRoots are allow entries for every root a target may lie in.
+var targetRoots = []string{".claude/mods", ".claude/hooks", ".claude/settings.json", ".codex", ".hermes", ".pi/agent", ".config/opencode",
+	".grok", ".config/agents", ".config/systemd/user"}
+
+// A target is a file the configuration copy reads, under the stricter target denylist, that allow names: an empty
+// allow admits nothing, and an entry cannot widen the copy's list.
 func TestConfigTargetsAreTheCopysFilesUnderAStricterDenylist(t *testing.T) {
-	ct := ConfigTargets{}
+	ct := ConfigTargets{Allow: targetRoots}
 	for _, ok := range []string{ruleTarget, "~/" + ruleTarget, "/ro/config/" + ruleTarget, ".config/agents/procedures/x.md", ".claude/settings.json",
 		".claude/hooks/guard.sh", ".claude/mods/m/index.js", ".codex/config.toml", ".codex/rules/r.rules", ".hermes/skills/s/SKILL.md",
-		".pi/agent/settings.json", ".config/opencode/opencode.json", ".grok/config.toml", ".config/systemd/user/tool.service", ".local/bin/tool"} {
+		".pi/agent/settings.json", ".config/opencode/opencode.json", ".grok/config.toml", ".config/systemd/user/tool.service"} {
 		if _, err := ct.admit(ok); err != nil {
 			t.Errorf("%s refused: %v", ok, err)
 		}
@@ -107,14 +113,27 @@ func TestConfigTargetsAreTheCopysFilesUnderAStricterDenylist(t *testing.T) {
 		".config/agents/bedrock.env", ".claude/hooks/.env", ".codex/auth.json", ".claude/hooks/keyring.py", ".claude/hooks/token.sh",
 		".claude/hooks/secret.sh", ".claude/hooks/id_rsa", ".claude/hooks/x.pem", ".claude/hooks/oauth.js", ".claude/hooks/vault.sh",
 		".config/agents/procedures/x.sqlite", ".claude/hooks/x.db", ".claude/hooks/events.jsonl", ".claude/hooks/run.log",
-		".claude/mods/node_modules/a.js", ".local/bin/sub/tool",
-		// the target's own: other key stores, database journals and the loop's own configuration, units and programs
-		".config/momentum/sources.json", ".config/systemd/user/momentum-loop.service", ".local/bin/momentum", ".claude/hooks/.netrc",
-		".claude/hooks/.npmrc", ".claude/hooks/known_hosts", ".claude/hooks/x.sqlite3", ".claude/hooks/x.db-wal", ".claude/hooks/key.gpg",
+		".claude/mods/node_modules/a.js",
+		// no target in .local/bin (the credential tools and the loop's programs are there) or the loop's own configuration
+		".local/bin/tool", ".local/bin/cred-get", ".local/bin/waitfor", ".config/momentum/sources.json",
+		// the target's own: credentials, keys, brokers and auth of any spelling, other key stores, journals, the loop's own
+		".claude/hooks/cred-exec.sh", ".claude/hooks/cred_set.py", ".claude/hooks/keys.json", ".claude/hooks/claude-broker.sh",
+		".claude/hooks/pre-auth.sh", ".claude/hooks/my-secrets.md", ".claude/hooks/tokens.md", ".claude/hooks/git", ".claude/hooks/waitfor.sh",
+		".config/systemd/user/momentum-loop.service", ".claude/hooks/.netrc", ".claude/hooks/.npmrc", ".claude/hooks/known_hosts",
+		".claude/hooks/x.sqlite3", ".claude/hooks/x.db-wal", ".claude/hooks/key.gpg",
+		// a drop-in directory's file, by a directory entry
+		".config/systemd/user/tool.service.d/override.conf",
 	} {
 		if _, err := ct.admit(bad); !errors.Is(err, ErrRefused) {
 			t.Errorf("%q admitted: %v", bad, err)
 		}
+	}
+	if _, err := (ConfigTargets{}).admit(ruleTarget); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "names no file") {
+		t.Fatalf("an empty allow: %v", err)
+	}
+	dropIn := ".config/systemd/user/tool.service.d/override.conf"
+	if _, err := (ConfigTargets{Allow: []string{dropIn}}).admit(dropIn); err != nil {
+		t.Fatalf("a drop-in named exactly: %v", err)
 	}
 	narrow := ConfigTargets{Allow: []string{"~/.config/agents/**", ".claude/settings.json"}}
 	if _, err := narrow.admit(ruleTarget); err != nil {
@@ -126,12 +145,12 @@ func TestConfigTargetsAreTheCopysFilesUnderAStricterDenylist(t *testing.T) {
 	if _, err := narrow.admit(".codex/config.toml"); !errors.Is(err, ErrRefused) {
 		t.Fatalf("outside allow: %v", err)
 	}
-	if _, err := (ConfigTargets{Allow: []string{".config/agents/*.md"}}).admit(".config/agents/procedures/x.md"); !errors.Is(err, ErrRefused) {
-		t.Fatalf("a pattern matched below its directory: %v", err)
+	if _, err := (ConfigTargets{Allow: []string{".config/agents/RULES.md"}}).admit(".config/agents/OTHER.md"); !errors.Is(err, ErrRefused) {
+		t.Fatalf("an exact entry admitted another file: %v", err)
 	}
 	// an allow entry cannot widen the copy's list: it refuses every target instead
-	for _, wide := range []string{".ssh/**", "/etc/**", ".bashrc"} {
-		if _, err := (ConfigTargets{Allow: []string{wide}}).admit(ruleTarget); !errors.Is(err, ErrRefused) {
+	for _, wide := range []string{".ssh/**", "/etc/**", ".bashrc", ".local/bin", ".config/momentum", ".claude/hooks/cred-get"} {
+		if _, err := (ConfigTargets{Allow: []string{wide, ".config/agents"}}).admit(ruleTarget); !errors.Is(err, ErrRefused) {
 			t.Fatalf("allow %s: %v", wide, err)
 		}
 	}
@@ -140,7 +159,7 @@ func TestConfigTargetsAreTheCopysFilesUnderAStricterDenylist(t *testing.T) {
 // The target is read under the real home without following a link, in any component, and within the copy's limits.
 func TestConfigTargetsAreReadWithoutLinksWithinLimits(t *testing.T) {
 	home := fakeHome(t)
-	ct := ConfigTargets{Home: home}
+	ct := ConfigTargets{Home: home, Allow: []string{".config/agents", ".claude/hooks"}}
 	read := func(name string) (ConfigState, error) {
 		d, err := ct.open(name)
 		if err != nil {
@@ -169,19 +188,29 @@ func TestConfigTargetsAreReadWithoutLinksWithinLimits(t *testing.T) {
 	write(t, filepath.Join(home, ".config/agents/BIG.md"), strings.Repeat("x", MaxConfigFileBytes+1))
 	write(t, filepath.Join(home, ".config/agents/BAD.md"), "marker-c0ffee \xff\n")
 	write(t, filepath.Join(home, ".config/agents/NUL.md"), strings.Repeat("x", 9<<10)+"\x00")
-	write(t, filepath.Join(home, ".local/bin/tool"), "marker-c0ffee no shebang\n")
+	write(t, filepath.Join(home, ".config/agents/SHARED.md"), "marker-c0ffee linked twice\n")
+	if err := os.Link(filepath.Join(home, ".config/agents/SHARED.md"), filepath.Join(home, ".config/agents/HARD.md")); err != nil {
+		t.Fatal(err)
+	}
 	for _, bad := range []string{".config/agents/LINK.md", ".config/agents/procedures/x.md", ".config/agents/DIR.md", ".config/agents/BIG.md",
-		".config/agents/BAD.md", ".config/agents/NUL.md", ".local/bin/tool", ".claude/hooks/x.sh"} {
+		".config/agents/BAD.md", ".config/agents/NUL.md", ".config/agents/HARD.md", ".config/agents/SHARED.md", ".claude/hooks/x.sh"} {
 		if _, err := read(bad); !errors.Is(err, ErrRefused) {
 			t.Errorf("%s read: %v", bad, err)
 		}
+	}
+	// a file of another owner is no target
+	targetUID = func() int { return os.Getuid() + 1 }
+	_, err := read(ruleTarget)
+	targetUID = os.Getuid
+	if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "not owned") {
+		t.Fatalf("another owner's file: %v", err)
 	}
 	// a home reached through a link is no home
 	linked := filepath.Join(t.TempDir(), "linked")
 	if err := os.Symlink(home, linked); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := (ConfigTargets{Home: linked}).open(ruleTarget); !errors.Is(err, ErrRefused) {
+	if _, err := (ConfigTargets{Home: linked, Allow: []string{".config/agents"}}).open(ruleTarget); !errors.Is(err, ErrRefused) {
 		t.Fatalf("linked home: %v", err)
 	}
 }
@@ -189,7 +218,7 @@ func TestConfigTargetsAreReadWithoutLinksWithinLimits(t *testing.T) {
 // The write is a compare-and-swap: a file that is not what the step read stays as it is, and nothing is left beside it.
 func TestConfigWritesOnlyOverTheContentExpected(t *testing.T) {
 	home := fakeHome(t)
-	d, err := (ConfigTargets{Home: home}).open(ruleTarget)
+	d, err := (ConfigTargets{Home: home, Allow: []string{".config/agents"}}).open(ruleTarget)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,10 +228,7 @@ func TestConfigWritesOnlyOverTheContentExpected(t *testing.T) {
 		t.Fatalf("replace over other content: %v", err)
 	}
 	if err := d.replace(".swap", []byte(newRule), 0o640, ConfigState{Absent: true}); !errors.Is(err, ErrRefused) {
-		t.Fatalf("a new file over an existing one: %v", err)
-	}
-	if err := d.remove(".swap", other); !errors.Is(err, ErrRefused) {
-		t.Fatalf("remove other content: %v", err)
+		t.Fatalf("a new file: %v", err)
 	}
 	if got, mode := readTarget(t, home); got != oldRule || mode != 0o640 {
 		t.Fatalf("the file became %q %v", got, mode)
@@ -210,6 +236,18 @@ func TestConfigWritesOnlyOverTheContentExpected(t *testing.T) {
 	if entries, _ := os.ReadDir(filepath.Join(home, ".config/agents")); len(entries) != 1 {
 		t.Fatalf("left beside it: %v", entries)
 	}
+	// a swap file that does not hold what the step put there stays, and that is no refusal
+	write(t, filepath.Join(home, ".config/agents/.swap"), "marker-c0ffee someone else's\n")
+	if err := d.unlinkIf(".swap", hashOf([]byte(newRule))); err == nil || errors.Is(err, ErrRefused) {
+		t.Fatalf("unlinked another's swap file: %v", err)
+	}
+	if err := d.settle(".swap", ConfigState{SHA256: hashOf([]byte(newRule))}, ConfigState{SHA256: hashOf([]byte(oldRule))}); !errors.Is(err, ErrRefused) {
+		t.Fatalf("settled over another's swap file: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(home, ".config/agents/.swap")); err != nil || string(b) != "marker-c0ffee someone else's\n" {
+		t.Fatalf("the swap file became %q %v", b, err)
+	}
+	os.Remove(filepath.Join(home, ".config/agents/.swap"))
 	if err := d.replace(".swap", []byte(newRule), 0o640, ConfigState{SHA256: hashOf([]byte(oldRule))}); err != nil {
 		t.Fatal(err)
 	}
@@ -483,13 +521,21 @@ func TestAConfigurationRollbackRefusesADriftedFileAndRecovers(t *testing.T) {
 	if ok, err := readRecord(s.pkgDir(c.ID), configRollback, &rb); !ok || err != nil || string(rb.From.Content) != drift || !rb.Force {
 		t.Fatalf("the rollback journal: %+v %v", rb, err)
 	}
+	// the loop resumes its rollback only while it may write; the owner's own rollback restores the file whatever the switch
 	s.Live = false
-	if _, err := s.RollBack(ctx, c.ID, "resume rollback"); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "loop.live") {
-		t.Fatalf("resumed while not live: %v", err)
+	if _, err := s.rollBack(ctx, c.ID, "resume rollback", false, false); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "waits") {
+		t.Fatalf("the loop resumed while not live: %v", err)
 	}
-	s.Live = true
+	s.Live, s.ConfigTargets.Enabled = true, false
+	if _, err := s.rollBack(ctx, c.ID, "resume rollback", false, false); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "config_targets") {
+		t.Fatalf("the loop resumed while the switch is off: %v", err)
+	}
+	if got, _ := readTarget(t, home); got != drift {
+		t.Fatalf("a held rollback wrote %q", got)
+	}
+	s.Live = false
 	// the journaled drift is what the resumed rollback may overwrite, with no second --force
-	p, err := s.RollBack(ctx, c.ID, "resume rollback")
+	p, err := s.RollBack(ctx, c.ID, "the owner resumes")
 	if err != nil || p.State != RolledBack {
 		t.Fatalf("resumed: %+v %v", p, err)
 	}
@@ -579,5 +625,117 @@ func TestABuildForAConfigurationCaseMountsItsTargetsClone(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(p.Work); len(entries) != 2 { // .config and .git
 		t.Fatalf("the clone holds more than its target: %v", entries)
+	}
+}
+
+// A configuration package edits a file that exists, its tests lie under tests/, and two cases never change one file
+// at once: a second preparation waits while the first package is not rolled back or kept.
+func TestAConfigurationTargetExistsHasOneChangeAndTestsUnderTests(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	home := fakeHome(t)
+	s := configShip(t, st, home)
+	c := testingCase(t, st)
+	if _, err := s.PrepareConfig(ctx, c.ID, ".config/agents/NEW.md"); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "not there") {
+		t.Fatalf("a new file: %v", err)
+	}
+	p, err := s.PrepareConfig(ctx, c.ID, ruleTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := testingCase2(t, st)
+	if _, err := s.PrepareConfig(ctx, other.ID, ruleTarget); !errors.Is(err, ErrRefused) || !held(err) || !strings.Contains(err.Error(), c.ID) {
+		t.Fatalf("a second change to the same file: %v", err)
+	}
+	write(t, filepath.Join(p.Work, ruleTarget), newRule)
+	write(t, filepath.Join(p.Work, "check_test.py"), ruleTest)
+	if _, err := checkPatch(t, s, ctx, c.ID, "python3 check_test.py", []string{"check_test.py"}); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "under tests/") {
+		t.Fatalf("a test outside tests/: %v", err)
+	}
+	if _, err := checkPatch(t, s, ctx, c.ID, "python3 check_test.py", nil); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "no test file") {
+		t.Fatalf("a test outside tests/ by its name: %v", err)
+	}
+	// once the first package is done, the file is free
+	p, _, _ = s.Load(c.ID)
+	p.State = RolledBack
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PrepareConfig(ctx, other.ID, ruleTarget); err != nil {
+		t.Fatalf("after the first is done: %v", err)
+	}
+}
+
+// When the exchange back after a mismatch fails, the landing is no refusal: its journal and its Landing state stay
+// for the owner, and nothing marks the change landed.
+func TestAFailedExchangeBackKeepsTheLandingsJournal(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	home := fakeHome(t)
+	s := configShip(t, st, home)
+	c := testingCase(t, st)
+	reviewedConfig(t, s, st, c)
+	calls := 0
+	exchange = func(olddirfd int, oldpath string, newdirfd int, newpath string, flags uint) error {
+		calls++
+		if calls == 1 {
+			// the owner edits the file just before the swap
+			write(t, filepath.Join(home, ruleTarget), "marker-c0ffee the owner's edit\n")
+			return unix.Renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
+		}
+		return unix.EIO
+	}
+	defer func() { exchange = unix.Renameat2 }()
+	_, err := s.Land(ctx, c.ID)
+	if err == nil || errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "exchange back failed") {
+		t.Fatalf("land: %v", err)
+	}
+	if p, _, _ := s.Load(c.ID); p.State != Landing || p.TargetLanded != "" {
+		t.Fatalf("after a failed exchange back: %s", p.State)
+	}
+	if _, err := os.Stat(filepath.Join(s.pkgDir(c.ID), configJournal)); err != nil {
+		t.Fatalf("the journal: %v", err)
+	}
+}
+
+// A configuration change with no measured effect is rolled back by the measure step only while configuration targets
+// are on: with the switch off the rollback is held and the file keeps the change.
+func TestTheMeasureStepHoldsAConfigurationRollbackWhileTheSwitchIsOff(t *testing.T) {
+	m := measuredCase(t)
+	home := fakeHome(t)
+	write(t, filepath.Join(home, ruleTarget), newRule)
+	p, _, _ := m.r.Ship.Load(m.c.ID)
+	p.Kind, p.Target, p.TargetLanded, p.Repo, p.Dir, p.PR = KindConfig, ruleTarget, hashOf([]byte(newRule)), "", "", ""
+	p.TargetBase = &ConfigState{SHA256: hashOf([]byte(oldRule)), Mode: 0o640}
+	if err := m.r.Ship.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	j := ConfigJournal{Target: ruleTarget, Old: ConfigState{SHA256: hashOf([]byte(oldRule)), Mode: 0o640, Content: []byte(oldRule)},
+		New: ConfigState{SHA256: hashOf([]byte(newRule)), Mode: 0o640}, Head: p.Landed[0]}
+	if err := writeDurable(m.r.Ship.pkgDir(m.c.ID), configJournal, j); err != nil {
+		t.Fatal(err)
+	}
+	m.r.Ship.Live, m.r.Ship.ConfigTargets = true, ConfigTargets{Enabled: false, Allow: []string{".config/agents"}, Home: home}
+	if got := m.measure(t, Options{}); got.Status != "measuring" {
+		t.Fatalf("in effect: %+v", got)
+	}
+	effect := m.clock
+	hours(t, m.st, "a", effect.Add(time.Minute), 23*time.Hour, 100, 6)
+	m.clock = effect.Add(25 * time.Hour)
+	if got := m.measure(t, Options{}); got.Status != "held" || !strings.Contains(got.Why, "config_targets") {
+		t.Fatalf("switch off: %+v", got)
+	}
+	if got, _ := readTarget(t, home); got != newRule {
+		t.Fatalf("a held rollback wrote %q", got)
+	}
+	if m.theCase(t).Status != store.CaseMeasuring {
+		t.Fatal("a held rollback moved the case")
+	}
+	m.r.Ship.ConfigTargets.Enabled = true
+	if got := m.measure(t, Options{}); got.Status != "rolled back" {
+		t.Fatalf("switch on: %+v", got)
+	}
+	if got, _ := readTarget(t, home); got != oldRule {
+		t.Fatalf("the rollback left %q", got)
 	}
 }

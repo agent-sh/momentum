@@ -294,6 +294,10 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		m.Status, m.Why = "rolled back", "its change was rolled back already; the case goes back to testing"
 		if p.State == RollingBack {
 			m.Why = "its rollback was begun already; it is finished before anything is measured"
+			if hold := r.Ship.mayApply(p); hold != "" {
+				m.Status, m.Why = "held", "its rollback was begun already and waits: "+hold
+				return m
+			}
 		}
 		if !dry {
 			if _, err := r.Ship.rollBackLocked(ctx, c.ID, "its change was rolled back"); err != nil {

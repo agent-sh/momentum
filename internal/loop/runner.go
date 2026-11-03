@@ -369,8 +369,12 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 				}
 			}
 			if ok && (p.State == RolledBack || p.State == RollingBack) {
+				if hold := r.Ship.mayApply(p); hold != "" && p.State == RollingBack {
+					passed = append(passed, c.ID+"'s rollback waits: "+hold)
+					continue
+				}
 				if !dry {
-					if _, err := r.Ship.RollBack(ctx, c.ID, "resume rollback"); err != nil {
+					if _, err := r.Ship.rollBack(ctx, c.ID, "resume rollback", false, false); err != nil {
 						passed = append(passed, c.ID+" rollback: "+err.Error())
 						r.pickSkipped(c, "rollback", err)
 						continue

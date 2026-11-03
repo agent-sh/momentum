@@ -526,7 +526,7 @@ func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []strin
 	}
 	if len(testFiles) == 0 {
 		for _, c := range paths {
-			if testFileRe.MatchString(c) && (p.Kind != KindConfig || c != p.Target) {
+			if p.Kind == KindConfig && strings.HasPrefix(c, "tests/") || p.Kind != KindConfig && testFileRe.MatchString(c) {
 				testFiles = append(testFiles, c)
 			}
 		}
@@ -1338,30 +1338,31 @@ func (s *Ship) retryCleanup(ctx context.Context, caseID string) (Package, error)
 // RollBack undoes a landed change: a revert of its commits, by the user's identity, pushed to the default branch
 // as a fast-forward; the case goes back to testing.
 func (s *Ship) RollBack(ctx context.Context, caseID, why string) (pkg Package, stepErr error) {
-	return s.rollBack(ctx, caseID, why, false)
+	return s.rollBack(ctx, caseID, why, false, true)
 }
 
 // RollBackForced is the owner's rollback of a configuration change whose file changed since it landed: what the file
 // holds then is journaled and overwritten with the content from before the change.
 func (s *Ship) RollBackForced(ctx context.Context, caseID, why string) (Package, error) {
-	return s.rollBack(ctx, caseID, why, true)
+	return s.rollBack(ctx, caseID, why, true, true)
 }
 
-func (s *Ship) rollBack(ctx context.Context, caseID, why string, force bool) (pkg Package, stepErr error) {
+// rollBack is a rollback by the owner (owner: ship rollback, case rollback) or by the loop (a resumed one).
+func (s *Ship) rollBack(ctx context.Context, caseID, why string, force, owner bool) (pkg Package, stepErr error) {
 	unlock, err := s.lock(ctx, caseID)
 	if err != nil {
 		return Package{}, err
 	}
 	defer unlock()
-	return s.rollBackWith(ctx, caseID, why, force)
+	return s.rollBackWith(ctx, caseID, why, force, owner)
 }
 
-// rollBackLocked reloads the package under the caller's case lock.
+// rollBackLocked is the measure step's rollback; it reloads the package under the caller's case lock.
 func (s *Ship) rollBackLocked(ctx context.Context, caseID, why string) (pkg Package, stepErr error) {
-	return s.rollBackWith(ctx, caseID, why, false)
+	return s.rollBackWith(ctx, caseID, why, false, false)
 }
 
-func (s *Ship) rollBackWith(ctx context.Context, caseID, why string, force bool) (pkg Package, stepErr error) {
+func (s *Ship) rollBackWith(ctx context.Context, caseID, why string, force, owner bool) (pkg Package, stepErr error) {
 	ctx = s.gitContext(shipContext(ctx, caseID))
 	cleanWhy, cleanErr := Redact(ctx, why)
 	if cleanErr != nil {
@@ -1379,7 +1380,7 @@ func (s *Ship) rollBackWith(ctx context.Context, caseID, why string, force bool)
 		return p, s.rollbackReceipt(ctx, p, why)
 	}
 	if p.Kind == KindConfig {
-		return s.rollBackConfig(ctx, p, why, force)
+		return s.rollBackConfig(ctx, p, why, force, owner)
 	}
 	if force {
 		return p, refused("a forced rollback is for a configuration change; a repository change is reverted by its commits")

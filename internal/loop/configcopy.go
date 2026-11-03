@@ -7,13 +7,14 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
 	"time"
 	"unicode/utf8"
+
+	"github.com/agent-sh/momentum/internal/cfgpaths"
 )
 
 const (
@@ -21,48 +22,20 @@ const (
 	MaxConfigBytes     = 8 << 20
 )
 
-// configRoots are where the agent system's own configuration lives, for every harness the machine runs: Claude Code,
-// Codex, Hermes, pi, opencode and grok (kimi has no directory of its own here: its launcher is a script in .local/bin),
-// the files agent-sync writes for all of them, the units that run them and momentum's own settings.
-var configRoots = []string{".claude/mods", ".claude/hooks", ".claude/settings.json",
-	".codex", ".hermes", ".pi/agent", ".config/opencode", ".grok",
-	".config/agents", ".config/systemd/user", ".config/momentum", ".local/bin"}
+// configRoots, configAllow and the copy's denylist are cfgpaths', the one list the configuration copy and the
+// configuration targets share.
+var (
+	configRoots = cfgpaths.Roots
+	configAllow = cfgpaths.Allow
+)
 
-// configAllow is the allowlist inside the roots that hold much besides configuration (sessions, logs, databases,
-// credentials, caches): only these relative paths are taken. A pattern is a path.Match pattern, or a directory and
-// "/**" for everything under it. A root not listed here is taken whole, under the denylist.
-var configAllow = map[string][]string{
-	".codex":           {"config.toml", "*.config.toml", "AGENTS.md", "hooks.json", "rules/**", "skills/**", "agents/**"},
-	".hermes":          {"config.yaml", "profile.yaml", "SOUL.md", "skills/**", "scripts/**", "plugins/**", "hooks/**", "cron/jobs.json"},
-	".pi/agent":        {"settings.json", "AGENTS.md", "extensions/**"},
-	".config/opencode": {"opencode.json", "cli.json", "service.json", "package.json", "plugins/**"},
-	".grok":            {"config.toml", "AGENTS.md", "sandbox.toml", "hooks-paths", "hooks/**", "skills/**"},
-	".config/agents":   {"*.md", "*.txt", "procedures/**"},
-}
-
-// configPathAllowed says whether a path under a root is taken (file) or walked (directory) by the root's allowlist.
 func configPathAllowed(root, path string, dir bool) bool {
-	patterns, ok := configAllow[root]
-	if !ok || path == root {
-		return true
-	}
-	rel := strings.TrimPrefix(filepath.ToSlash(path), root+"/")
-	for _, p := range patterns {
-		if base, tree := strings.CutSuffix(p, "/**"); tree {
-			if rel == base || strings.HasPrefix(rel, base+"/") || dir && strings.HasPrefix(base, rel+"/") {
-				return true
-			}
-			continue
-		}
-		if matched, _ := pathpkg.Match(p, rel); matched && !dir {
-			return true
-		}
-		if dir && strings.HasPrefix(p, rel+"/") {
-			return true
-		}
-	}
-	return false
+	return cfgpaths.PathAllowed(root, path, dir)
 }
+
+func deniedConfigPath(root, path string) string { return cfgpaths.Denied(root, path) }
+
+func excludedModDir(name string) bool { return cfgpaths.ExcludedDir(name) }
 
 type ConfigCopyOptions struct {
 	Home        string
@@ -313,40 +286,6 @@ func (m *ConfigManifest) skip(path, reason string) {
 		m.SkippedOmitted++
 	}
 	m.SkippedByReason[reason]++
-}
-
-func deniedConfigPath(root, path string) string {
-	parts := strings.Split(filepath.ToSlash(path), "/")
-	for i, part := range parts {
-		lower := strings.ToLower(part)
-		for _, denied := range []string{"credential", "secret", "token", "passwd", ".pem", ".key", "id_rsa", ".env", "keyring",
-			"oauth", "apikey", "api_key", "api-key", "google_", "vault", "pairing", ".sqlite", ".db", ".jsonl", ".log"} {
-			if strings.Contains(lower, denied) {
-				return "denied name"
-			}
-		}
-		if lower == "auth" || strings.HasPrefix(lower, "auth.") || strings.HasPrefix(lower, "auth-") || strings.HasPrefix(lower, "auth_") {
-			return "denied name"
-		}
-		if lower == ".ssh" || lower == ".aws" || lower == ".fireworks" || lower == ".claude.json" {
-			return "denied name"
-		}
-		if i < len(parts)-1 && excludedModDir(part) {
-			return "excluded directory"
-		}
-	}
-	if root == ".local/bin" && path != root && filepath.Dir(path) != root {
-		return "not a direct script"
-	}
-	return ""
-}
-
-func excludedModDir(name string) bool {
-	switch name {
-	case "node_modules", "dist", "build", "out", "target", ".next", "__pycache__", ".git":
-		return true
-	}
-	return false
 }
 
 func liveConfigNames(home *os.Root, root string, m *ConfigManifest) ([]string, error) {

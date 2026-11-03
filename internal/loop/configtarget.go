@@ -11,12 +11,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	pathpkg "path"
 	"path/filepath"
 	"slices"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/agent-sh/momentum/internal/cfgpaths"
 	"github.com/agent-sh/momentum/internal/store"
 	"golang.org/x/sys/unix"
 )
@@ -29,65 +29,34 @@ const (
 )
 
 // ConfigTargets is the loop's authority over configuration files: off unless the owner turns it on, and then only the
-// files the configuration copy reads (configRoots and configAllow, one list for both), under the stricter target
-// denylist, narrowed further by Allow when it names any.
+// files Allow names, each inside the files the configuration copy reads (cfgpaths, one list for both) and under the
+// stricter target denylist. An empty Allow admits nothing.
 type ConfigTargets struct {
 	Enabled bool
-	// Allow narrows the targets to these home-relative paths: a path.Match pattern, or a directory and "/**". Every
-	// entry lies inside the copy's allowlist; an entry outside it refuses every target.
+	// Allow names the targets: exact home-relative files, or directories whose existing files they admit.
 	Allow []string
 	Home  string // the real home the targets resolve under
 }
 
-// configTargetName is a target's clean home-relative name: a path under /ro/config, or under ~/, as a run names it.
 func configTargetName(name string) (string, error) {
-	name = strings.TrimSpace(name)
-	name = strings.TrimPrefix(name, "/ro/config/")
-	name = strings.TrimPrefix(name, "~/")
-	if name == "" || strings.ContainsAny(name, "\\\x00\r\n") || pathpkg.IsAbs(name) || pathpkg.Clean(name) != name {
-		return "", refused("a configuration target is a clean path under the home: %q", name)
+	n, err := cfgpaths.TargetName(name)
+	if err != nil {
+		return "", refused("%v", err)
 	}
-	for _, part := range strings.Split(name, "/") {
-		if part == "." || part == ".." {
-			return "", refused("a configuration target has a refused component: %q", name)
-		}
-	}
-	return name, nil
+	return n, nil
 }
 
-// targetDenied are names a configuration target never has, on top of the copy's denylist: credentials and key stores
-// the copy's list does not name, databases and their journals, and the loop's own configuration, units and programs.
-var targetDenied = []string{".netrc", ".npmrc", ".pypirc", ".gnupg", "known_hosts", "authorized_keys", ".kube", ".docker",
-	".sqlite3", "-wal", "-shm", "-journal", ".p12", ".pfx", ".gpg", ".asc", "bedrock", "models.json"}
+func configRootOf(name string) string { return cfgpaths.RootOf(name) }
 
-func deniedTargetPath(root, name string) string {
-	if reason := deniedConfigPath(root, name); reason != "" {
-		return reason
-	}
-	if root == ".config/momentum" {
-		return "the loop's own configuration"
-	}
-	for _, part := range strings.Split(name, "/") {
-		lower := strings.ToLower(part)
-		if strings.HasPrefix(lower, "momentum") {
-			return "the loop's own"
-		}
-		for _, denied := range targetDenied {
-			if strings.Contains(lower, denied) {
-				return "denied name"
-			}
+// dropIn says whether a path lies in a drop-in directory (NAME.d), whose files a program reads by their presence.
+func dropIn(name string) bool {
+	parts := strings.Split(name, "/")
+	for _, part := range parts[:len(parts)-1] {
+		if strings.HasSuffix(part, ".d") {
+			return true
 		}
 	}
-	return ""
-}
-
-func configRootOf(name string) string {
-	for _, root := range configRoots {
-		if name == root || strings.HasPrefix(name, root+"/") {
-			return root
-		}
-	}
-	return ""
+	return false
 }
 
 // admit says whether a file is a configuration target: its clean name, or the refusal.
@@ -100,33 +69,29 @@ func (ct ConfigTargets) admit(name string) (string, error) {
 	if root == "" {
 		return "", refused("%s lies outside the configuration the loop reads", name)
 	}
-	if reason := deniedTargetPath(root, name); reason != "" {
+	if reason := cfgpaths.TargetDenied(root, name); reason != "" {
 		return "", refused("%s is no configuration target: %s", name, reason)
 	}
 	if !configPathAllowed(root, name, false) {
 		return "", refused("%s is no configuration target: not configuration", name)
 	}
 	if len(ct.Allow) == 0 {
-		return name, nil
+		return "", refused("loop.config_targets.allow names no file: no configuration target is admitted")
 	}
-	matched := false
+	exact, below := false, false
 	for _, entry := range ct.Allow {
-		pattern := strings.TrimPrefix(strings.TrimSpace(entry), "~/")
-		literal, tree := strings.CutSuffix(pattern, "/**")
-		if _, err := configTargetName(literal); err != nil || configRootOf(literal) == "" && !slices.ContainsFunc(configRoots, func(r string) bool { return strings.HasPrefix(r, literal+"/") }) {
-			return "", refused("loop.config_targets.allow entry %q lies outside the configuration the loop reads: no target is admitted", entry)
+		path, tree, err := cfgpaths.AllowEntry(entry)
+		if err != nil {
+			return "", refused("%v: no target is admitted", err)
 		}
-		if _, err := pathpkg.Match(literal, ""); err != nil {
-			return "", refused("loop.config_targets.allow entry %q is no pattern: no target is admitted", entry)
-		}
-		if tree && (name == literal || strings.HasPrefix(name, literal+"/")) {
-			matched = true
-		} else if ok, _ := pathpkg.Match(literal, name); !tree && ok {
-			matched = true
-		}
+		exact = exact || !tree && name == path
+		below = below || strings.HasPrefix(name, path+"/")
 	}
-	if !matched {
+	switch {
+	case !exact && !below:
 		return "", refused("%s is outside loop.config_targets.allow", name)
+	case dropIn(name) && !exact:
+		return "", refused("%s is in a drop-in directory: a target there is one loop.config_targets.allow names exactly", name)
 	}
 	return name, nil
 }
@@ -139,6 +104,9 @@ type ConfigState struct {
 	Mode    uint32 `json:"mode,omitempty"`
 	Content []byte `json:"content,omitempty"`
 }
+
+// targetUID is the owner a target's file must have: the caller (a test names another).
+var targetUID = os.Getuid
 
 func (c ConfigState) same(o ConfigState) bool { return c.Absent == o.Absent && c.SHA256 == o.SHA256 }
 
@@ -220,8 +188,10 @@ func (d *targetDir) read(file string) (ConfigState, error) {
 		return ConfigState{}, refused("%s is a link", d.name)
 	case st.Mode&unix.S_IFMT != unix.S_IFREG:
 		return ConfigState{}, refused("%s is no regular file", d.name)
-	case int(st.Uid) != os.Getuid():
+	case int(st.Uid) != targetUID():
 		return ConfigState{}, refused("%s is not owned by the caller", d.name)
+	case st.Nlink > 1:
+		return ConfigState{}, refused("%s has another hard link: a change to it would not be the file's alone", d.name)
 	case st.Size > MaxConfigFileBytes:
 		return ConfigState{}, refused("%s exceeds the configuration file limit", d.name)
 	}
@@ -263,15 +233,15 @@ func (d *targetDir) settle(swap string, ours, expected ConfigState) error {
 	if left.Absent {
 		return nil
 	}
-	if left.SHA256 == ours.SHA256 || !expected.Absent && left.SHA256 == expected.SHA256 {
-		return errors.Join(unix.Unlinkat(d.fd, swap, 0), d.sync())
+	if left.SHA256 == ours.SHA256 || left.SHA256 == expected.SHA256 {
+		return d.unlinkIf(swap, left.SHA256)
 	}
 	cur, err := d.state()
 	if err == nil && !cur.Absent && cur.SHA256 == ours.SHA256 {
-		if err := unix.Renameat2(d.fd, swap, d.fd, d.base, unix.RENAME_EXCHANGE); err != nil {
-			return err
+		if err := exchange(d.fd, swap, d.fd, d.base, unix.RENAME_EXCHANGE); err != nil {
+			return fmt.Errorf("%s: the exchange back failed, the journal stays: %w", d.name, err)
 		}
-		if err := errors.Join(unix.Unlinkat(d.fd, swap, 0), d.sync()); err != nil {
+		if err := d.unlinkIf(swap, ours.SHA256); err != nil {
 			return err
 		}
 		return refused("%s had changed: its content is back and the change is not applied", d.name)
@@ -279,10 +249,26 @@ func (d *targetDir) settle(swap string, ours, expected ConfigState) error {
 	return refused("an interrupted write left %s beside %s: the owner decides", swap, d.name)
 }
 
-// replace puts content in place of the target atomically, only while the target is what expect says: a new file never
-// replaces one that appeared since, and an existing one is exchanged and checked, and exchanged back when it was not
-// the content expected.
+// unlinkIf removes the swap file only while it holds what the step knows it holds; anything else stays for the owner.
+// That is no refusal: the step's journal and state stay as they are.
+func (d *targetDir) unlinkIf(swap, hash string) error {
+	left, err := d.read(swap)
+	if err == nil && left.Absent {
+		return nil
+	}
+	if err != nil || left.SHA256 != hash {
+		return fmt.Errorf("%s beside %s does not hold what the step put there: it is left for the owner", swap, d.name)
+	}
+	return errors.Join(unix.Unlinkat(d.fd, swap, 0), d.sync())
+}
+
+// replace puts content in place of the target atomically, only while the target is what expect says: the target is
+// exchanged with the new file, the displaced file is checked, and it is exchanged back when it was not the content
+// expected. The file exists: a configuration change never creates or removes one.
 func (d *targetDir) replace(swap string, content []byte, mode uint32, expect ConfigState) error {
+	if expect.Absent {
+		return refused("%s: a configuration change edits a file that exists", d.name)
+	}
 	fd, err := unix.Openat(d.fd, swap, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {
 		return err
@@ -291,64 +277,33 @@ func (d *targetDir) replace(swap string, content []byte, mode uint32, expect Con
 	_, err = f.Write(content)
 	err = errors.Join(err, f.Chmod(os.FileMode(mode&0o777)), f.Sync(), f.Close())
 	if err != nil {
-		unix.Unlinkat(d.fd, swap, 0)
+		unix.Unlinkat(d.fd, swap, 0) // created exclusively by this step and never exchanged
 		return err
 	}
+	ours := hashOf(content)
 	drift := refused("%s changed since it was read: the change is not applied", d.name)
-	if expect.Absent {
-		if err := unix.Renameat2(d.fd, swap, d.fd, d.base, unix.RENAME_NOREPLACE); err != nil {
-			unix.Unlinkat(d.fd, swap, 0)
-			if err == unix.EEXIST {
-				return drift
-			}
-			return err
+	if err := exchange(d.fd, swap, d.fd, d.base, unix.RENAME_EXCHANGE); err != nil {
+		cleanup := d.unlinkIf(swap, ours)
+		switch err {
+		case unix.ENOENT:
+			return errors.Join(drift, cleanup)
+		case unix.EINVAL:
+			return errors.Join(refused("the file system of %s cannot exchange files atomically", d.name), cleanup)
 		}
-		return d.sync()
-	}
-	if err := unix.Renameat2(d.fd, swap, d.fd, d.base, unix.RENAME_EXCHANGE); err != nil {
-		unix.Unlinkat(d.fd, swap, 0)
-		if err == unix.ENOENT {
-			return drift
-		}
-		if err == unix.EINVAL {
-			return refused("the file system of %s cannot exchange files atomically", d.name)
-		}
-		return err
+		return errors.Join(err, cleanup)
 	}
 	displaced, err := d.read(swap)
 	if err != nil || displaced.Absent || displaced.SHA256 != expect.SHA256 {
-		if back := unix.Renameat2(d.fd, swap, d.fd, d.base, unix.RENAME_EXCHANGE); back != nil {
-			return errors.Join(drift, back)
+		if back := exchange(d.fd, swap, d.fd, d.base, unix.RENAME_EXCHANGE); back != nil {
+			// not a refusal: the file may hold the change while what it held sits at the swap name
+			return fmt.Errorf("%s changed while it was written, and the exchange back failed (%v): the journal stays, the owner decides", d.name, back)
 		}
-		return errors.Join(drift, unix.Unlinkat(d.fd, swap, 0), d.sync())
-	}
-	return errors.Join(unix.Unlinkat(d.fd, swap, 0), d.sync())
-}
-
-// remove takes the target away, only while it is what expect says.
-func (d *targetDir) remove(swap string, expect ConfigState) error {
-	if err := unix.Renameat2(d.fd, d.base, d.fd, swap, unix.RENAME_NOREPLACE); err != nil {
-		if err == unix.ENOENT {
-			return refused("%s changed since it was read: it is gone already", d.name)
+		if err := d.unlinkIf(swap, ours); err != nil {
+			return err
 		}
-		return err
+		return drift
 	}
-	moved, err := d.read(swap)
-	if err != nil || moved.Absent || moved.SHA256 != expect.SHA256 {
-		if back := unix.Renameat2(d.fd, swap, d.fd, d.base, unix.RENAME_NOREPLACE); back != nil {
-			return errors.Join(refused("%s changed since it was read and was left at %s", d.name, swap), back)
-		}
-		return errors.Join(refused("%s changed since it was read: the change is not applied", d.name), d.sync())
-	}
-	return errors.Join(unix.Unlinkat(d.fd, swap, 0), d.sync())
-}
-
-// put makes the target hold want (content, or absent) while it holds expect.
-func (d *targetDir) put(swap string, want, expect ConfigState) error {
-	if want.Absent {
-		return d.remove(swap, expect)
-	}
-	return d.replace(swap, want.Content, want.Mode, expect)
+	return d.unlinkIf(swap, expect.SHA256)
 }
 
 func swapName(caseID string) string { return ".momentum-" + caseID + ".swap" }
@@ -454,7 +409,7 @@ func (s *Ship) mayApply(p Package) string {
 }
 
 // PrepareConfig makes a configuration package: a host-only Git repository whose base commit holds the target as the
-// host reads it now (or no file, for a new one), and an independent run clone of it. The target must read through the
+// host reads it now, and an independent run clone of it. The target must read through the
 // scrubber unchanged, so the run's /ro/config copy and its clone hold the bytes the host will patch.
 func (s *Ship) PrepareConfig(ctx context.Context, caseID, target string) (Package, error) {
 	ctx = s.gitContext(shipContext(ctx, caseID))
@@ -482,6 +437,14 @@ func (s *Ship) PrepareConfig(ctx context.Context, caseID, target string) (Packag
 	base, err := d.state()
 	if err != nil {
 		return Package{}, err
+	}
+	if base.Absent {
+		return Package{}, refused("%s is not there: a configuration change edits a file that exists", d.name)
+	}
+	if other, err := s.targetBusy(c.ID, d.name); err != nil {
+		return Package{}, err
+	} else if other != "" {
+		return Package{}, &shipHold{err: refused("%s is the target of case %s's change, which is not done: the loop leaves it alone", d.name, other)}
 	}
 	clean, err := RedactAll(ctx, []string{d.name, string(base.Content)})
 	if err != nil {
@@ -532,18 +495,16 @@ func (s *Ship) configBase(ctx context.Context, p Package, base ConfigState, pare
 	if _, err := s.git(ctx, p.Host, args...); err != nil {
 		return "", err
 	}
-	if !base.Absent {
-		blob, err := s.gitInput(ctx, p.Host, base.Content, "hash-object", "-w", "--stdin")
-		if err != nil {
-			return "", err
-		}
-		mode := "100644"
-		if base.Mode&0o111 != 0 {
-			mode = "100755"
-		}
-		if _, err := s.git(ctx, p.Host, "update-index", "--add", "--cacheinfo", mode+","+strings.TrimSpace(blob)+","+p.Target); err != nil {
-			return "", err
-		}
+	blob, err := s.gitInput(ctx, p.Host, base.Content, "hash-object", "-w", "--stdin")
+	if err != nil {
+		return "", err
+	}
+	mode := "100644"
+	if base.Mode&0o111 != 0 {
+		mode = "100755"
+	}
+	if _, err := s.git(ctx, p.Host, "update-index", "--add", "--cacheinfo", mode+","+strings.TrimSpace(blob)+","+p.Target); err != nil {
+		return "", err
 	}
 	tree, err := s.git(ctx, p.Host, "write-tree")
 	if err != nil {
@@ -579,6 +540,9 @@ func (s *Ship) refreshConfigBase(ctx context.Context, p Package) (Package, error
 	if err != nil {
 		return p, err
 	}
+	if base.Absent {
+		return p, refused("%s is gone: a configuration change edits a file that exists", d.name)
+	}
 	clean, err := Redact(ctx, string(base.Content))
 	if err != nil {
 		return p, err
@@ -602,6 +566,11 @@ func (s *Ship) refreshConfigBase(ctx context.Context, p Package) (Package, error
 func (s *Ship) checkConfigChange(ctx context.Context, p Package, tree string, paths, testFiles []string) error {
 	if !slices.Contains(paths, p.Target) {
 		return refused("the change does not change its target %s", p.Target)
+	}
+	for _, f := range testFiles {
+		if !strings.HasPrefix(f, "tests/") {
+			return refused("%s: a configuration change's tests lie under tests/", f)
+		}
 	}
 	for _, f := range paths {
 		if f != p.Target && !slices.Contains(testFiles, f) {
@@ -632,7 +601,10 @@ func (s *Ship) configContent(ctx context.Context, p Package, treeish string) ([]
 	if fields[0] == "100755" {
 		mode = 0o755
 	}
-	if p.TargetBase != nil && !p.TargetBase.Absent {
+	if p.TargetBase == nil || p.TargetBase.Absent {
+		return nil, 0, refused("the configuration package has no base file")
+	}
+	{
 		if (p.TargetBase.Mode&0o111 != 0) != (mode == 0o755) {
 			return nil, 0, refused("the change changes its target's mode: a configuration change keeps it")
 		}
@@ -723,7 +695,7 @@ func (s *Ship) landConfig(ctx context.Context, p Package) (Package, error) {
 	if err := d.settle(swapName(p.Case), j.New, j.Old); err != nil {
 		return p, err
 	}
-	if err := d.put(swapName(p.Case), j.New, j.Old); err != nil {
+	if err := d.replace(swapName(p.Case), j.New.Content, j.New.Mode, j.Old); err != nil {
 		return s.landingRefused(ctx, p, err)
 	}
 	if err := s.configStage("written"); err != nil {
@@ -781,7 +753,7 @@ func (s *Ship) resumeConfigLanding(ctx context.Context, p Package) (Package, err
 	switch {
 	case cur.same(j.New):
 	case cur.same(j.Old):
-		if err := d.put(swapName(p.Case), j.New, j.Old); err != nil {
+		if err := d.replace(swapName(p.Case), j.New.Content, j.New.Mode, j.Old); err != nil {
 			return s.landingRefused(ctx, p, err)
 		}
 	default:
@@ -819,9 +791,10 @@ func deployWhat(p Package) string {
 // one changed since is refused unless the owner forces it, and what it held then is journaled too. A resumed
 // rollback reads its journal: the file holds the restored content (done), what the rollback overwrites (written
 // again), or neither (refused).
-func (s *Ship) rollBackConfig(ctx context.Context, p Package, why string, force bool) (Package, error) {
-	if p.State == RollingBack && !s.Live {
-		return p, refused("resuming rollback needs loop.live")
+func (s *Ship) rollBackConfig(ctx context.Context, p Package, why string, force, owner bool) (Package, error) {
+	if hold := s.mayApply(p); !owner && hold != "" {
+		// the loop's own rollbacks (the measure step's, a resumed one) write only while it may write
+		return p, refused("the rollback waits: %s", hold)
 	}
 	c, err := s.Store.CaseByID(ctx, p.Case)
 	if err != nil {
@@ -873,11 +846,7 @@ func (s *Ship) rollBackConfig(ctx context.Context, p Package, why string, force 
 		if err := writeDurable(s.pkgDir(p.Case), configRollback, rb); err != nil {
 			return p, err
 		}
-		to := j.Old.SHA256
-		if j.Old.Absent {
-			to = "absent"
-		}
-		p.State, p.Undo = RollingBack, &RollbackJournal{Head: to, Why: why}
+		p.State, p.Undo = RollingBack, &RollbackJournal{Head: j.Old.SHA256, Why: why}
 		if err := s.saveAuthorized(ctx, &p); err != nil {
 			return p, err
 		}
@@ -895,7 +864,7 @@ func (s *Ship) rollBackConfig(ctx context.Context, p Package, why string, force 
 	switch {
 	case cur.same(j.Old):
 	case cur.same(rb.From):
-		if err := d.put(swapName(p.Case), j.Old, rb.From); err != nil {
+		if err := d.replace(swapName(p.Case), j.Old.Content, j.Old.Mode, rb.From); err != nil {
 			return p, err
 		}
 	default:
@@ -941,3 +910,31 @@ func (s *Ship) configStage(stage string) error {
 	}
 	return nil
 }
+
+// targetBusy names another case whose configuration package targets the same file and is not done (rolled back or
+// kept): two changes to one file would overwrite each other and confound both measurements.
+func (s *Ship) targetBusy(self, target string) (string, error) {
+	entries, err := os.ReadDir(filepath.Join(s.Dir, "packages"))
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		if !e.IsDir() || e.Name() == self || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		p, ok, err := s.Load(e.Name())
+		if err != nil {
+			return "", err
+		}
+		if ok && p.Kind == KindConfig && p.Target == target && p.State != RolledBack && p.State != Kept {
+			return p.Case, nil
+		}
+	}
+	return "", nil
+}
+
+// exchange is renameat2; a test injects a failure of the exchange back.
+var exchange = unix.Renameat2
