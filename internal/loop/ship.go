@@ -62,37 +62,41 @@ const (
 // MaxRounds is how many review rounds a package gets: prs.md's three.
 const MaxRounds = 3
 
+// MaxClosedProposals bounds automatic retries of closed, unmerged requests.
+const MaxClosedProposals = 2
+
 // Package is a case's change: where it goes, what checks it, how it is measured and undone, and where it stands.
 type Package struct {
-	Case          string           `json:"case"`
-	Kind          string           `json:"kind"` // repo
-	Repo          string           `json:"repo,omitempty"`
-	Base          string           `json:"base,omitempty"`
-	Branch        string           `json:"branch,omitempty"`
-	Dir           string           `json:"dir"`         // the repository's main checkout
-	Work          string           `json:"work"`        // independent run clone, never read by host steps
-	Host          string           `json:"host"`        // host-only independent clone
-	BaseCommit    string           `json:"base_commit"` // immutable patch base
-	PublishedHead string           `json:"published_head,omitempty"`
-	RefreshBase   bool             `json:"refresh_base,omitempty"`
-	State         string           `json:"state"`
-	Check         *Check           `json:"check,omitempty"`
-	Plan          *Plan            `json:"plan,omitempty"`
-	Rollback      string           `json:"rollback,omitempty"`
-	Title         string           `json:"title,omitempty"`
-	Body          string           `json:"body,omitempty"`
-	Lesson        string           `json:"lesson,omitempty"`
-	PR            string           `json:"pr,omitempty"`
-	LandingHead   string           `json:"landing_head,omitempty"`
-	Cleanup       string           `json:"cleanup,omitempty"`
-	Head          string           `json:"head,omitempty"` // the commit proposed
-	Reviews       []Review         `json:"reviews,omitempty"`
-	Landed        []string         `json:"landed,omitempty"` // the commits that went in
-	LandedAt      time.Time        `json:"landed_at,omitempty"`
-	Undo          *RollbackJournal `json:"undo,omitempty"`
-	Changed       []string         `json:"changed,omitempty"` // the paths the change touches
-	Created       time.Time        `json:"created"`
-	Updated       time.Time        `json:"updated"`
+	Case            string           `json:"case"`
+	Kind            string           `json:"kind"` // repo
+	Repo            string           `json:"repo,omitempty"`
+	Base            string           `json:"base,omitempty"`
+	Branch          string           `json:"branch,omitempty"`
+	Dir             string           `json:"dir"`         // the repository's main checkout
+	Work            string           `json:"work"`        // independent run clone, never read by host steps
+	Host            string           `json:"host"`        // host-only independent clone
+	BaseCommit      string           `json:"base_commit"` // immutable patch base
+	PublishedHead   string           `json:"published_head,omitempty"`
+	RefreshBase     bool             `json:"refresh_base,omitempty"`
+	State           string           `json:"state"`
+	Check           *Check           `json:"check,omitempty"`
+	Plan            *Plan            `json:"plan,omitempty"`
+	Rollback        string           `json:"rollback,omitempty"`
+	Title           string           `json:"title,omitempty"`
+	Body            string           `json:"body,omitempty"`
+	Lesson          string           `json:"lesson,omitempty"`
+	PR              string           `json:"pr,omitempty"`
+	LandingHead     string           `json:"landing_head,omitempty"`
+	Cleanup         string           `json:"cleanup,omitempty"`
+	Head            string           `json:"head,omitempty"` // the commit proposed
+	Reviews         []Review         `json:"reviews,omitempty"`
+	ClosedProposals int              `json:"closed_proposals,omitempty"`
+	Landed          []string         `json:"landed,omitempty"` // the commits that went in
+	LandedAt        time.Time        `json:"landed_at,omitempty"`
+	Undo            *RollbackJournal `json:"undo,omitempty"`
+	Changed         []string         `json:"changed,omitempty"` // the paths the change touches
+	Created         time.Time        `json:"created"`
+	Updated         time.Time        `json:"updated"`
 }
 
 // RollbackJournal keeps the exact revert candidate before any remote write. A retry checks this head on the
@@ -1525,6 +1529,7 @@ func (s *Ship) closedProposal(ctx context.Context, p Package) (Package, error) {
 	if _, err := s.git(ctx, p.Host, "reset", "--hard", p.Head); err != nil {
 		return p, err
 	}
+	p.ClosedProposals++
 	p.State, p.PR, p.LandingHead, p.Landed, p.Reviews = Checked, "", "", nil, nil
 	if err := s.saveAuthorized(ctx, &p); err != nil {
 		return p, err
@@ -1687,7 +1692,9 @@ func (s *Ship) push(ctx context.Context, p Package, dir string, args ...string) 
 	}
 	for _, arg := range args {
 		candidate, ref, ok := strings.Cut(arg, ":")
-		if ok && (ref == "refs/heads/"+p.Branch || ref == "refs/heads/"+p.Base) {
+		// A journaled rollback restores commits already published by this
+		// repository. Its push still passes every repository gate above.
+		if p.State != RollingBack && ok && (ref == "refs/heads/"+p.Branch || ref == "refs/heads/"+p.Base) {
 			if err := s.checkPublicPatch(ctx, p, candidate); err != nil {
 				return "", err
 			}

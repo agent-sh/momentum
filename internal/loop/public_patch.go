@@ -13,7 +13,7 @@ func (s *Ship) checkPublicPatch(ctx context.Context, p Package, candidate string
 		return err
 	}
 	base := p.BaseCommit
-	if p.State == Landing || p.State == RollingBack {
+	if p.State == Landing {
 		base = "origin/" + p.Base
 	}
 	names, err := s.git(ctx, p.Host, "diff", "--no-ext-diff", "--no-textconv", "--no-renames",

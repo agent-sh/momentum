@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -62,7 +63,9 @@ var (
 	addressRe  = regexp.MustCompile(`(?i)[a-z0-9.!#$%&'*+/=?^_` + "`" + `{|}~-]+@[a-z0-9.-]+`)
 	hostNameRe = regexp.MustCompile(`(?i)\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)+\b`)
 	ipv4Re     = regexp.MustCompile(`\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b`)
-	ipv6Re     = regexp.MustCompile(`(?i)(?:[a-f0-9]{1,4}:){2,}[a-f0-9:]+(?:%[a-z0-9_-]+)?|::[a-f0-9:]+`)
+	// Take the whole token so an identifier path cannot yield a hex suffix.
+	ipv6Re        = regexp.MustCompile(`(?i)[a-z0-9_]*:[a-z0-9_:]+(?:%[a-z0-9_-]+)?`)
+	hostContextRe = regexp.MustCompile(`(?i)(?:\bhost:\s*|\bssh\s+)$`)
 )
 
 // Neutral is a text in which no mention pages anyone and no reference writes into another issue: a zero-width
@@ -97,7 +100,7 @@ var hostSuffixes = map[string]bool{
 func maskPersonal(text string) string {
 	text = homePathRe.ReplaceAllString(text, "[personal]")
 	text = addressRe.ReplaceAllString(text, "[personal]")
-	text = ipv6Re.ReplaceAllString(text, "[personal]")
+	text = maskIPv6(text)
 	text = ipv4Re.ReplaceAllString(text, "[personal]")
 	matches := hostNameRe.FindAllStringIndex(text, -1)
 	var out strings.Builder
@@ -106,8 +109,22 @@ func maskPersonal(text string) string {
 		host := text[span[0]:span[1]]
 		last := strings.LastIndexByte(host, '.')
 		prefix := text[:span[0]]
-		if !hostSuffixes[strings.ToLower(host[last+1:])] &&
-			!strings.HasSuffix(prefix, "://") && !strings.HasSuffix(prefix, "@") {
+		if !hostSuffixes[strings.ToLower(host[last+1:])] {
+			continue
+		}
+		explicit := strings.HasSuffix(prefix, "://") || strings.HasSuffix(prefix, "@") || hostContextRe.MatchString(prefix)
+		suffix := text[span[1]:]
+		labels := strings.Split(host, ".")
+		// Bare receiver paths and calls remain code. A URL or host command
+		// establishes address context even when its host resembles a receiver.
+		receiver := false
+		switch strings.ToLower(labels[0]) {
+		case "obj", "self", "this", "cfg", "config":
+			receiver = true
+		}
+		hostLike := len(labels) >= 3 && host == strings.ToLower(host) && !receiver &&
+			!strings.HasPrefix(suffix, "(")
+		if !explicit && !hostLike && !strings.HasPrefix(suffix, "/") {
 			continue
 		}
 		out.WriteString(text[end:span[0]])
@@ -116,4 +133,37 @@ func maskPersonal(text string) string {
 	}
 	out.WriteString(text[end:])
 	return out.String()
+}
+
+func maskIPv6(text string) string {
+	var out strings.Builder
+	end := 0
+	for _, span := range ipv6Re.FindAllStringIndex(text, -1) {
+		token := text[span[0]:span[1]]
+		address, _, _ := strings.Cut(token, "%")
+		groups := 0
+		for _, group := range strings.Split(address, ":") {
+			if group != "" {
+				groups++
+			}
+		}
+		if groups < 2 || (!strings.Contains(address, "::") && groups < 3) || net.ParseIP(address) == nil {
+			continue
+		}
+		// A dotted receiver or a call makes this an identifier path.
+		beforePath := span[0] >= 2 && text[span[0]-1] == '.' && identifierByte(text[span[0]-2])
+		afterPath := span[1]+1 < len(text) && text[span[1]] == '.' && identifierByte(text[span[1]+1])
+		if beforePath || afterPath || strings.HasPrefix(text[span[1]:], "(") {
+			continue
+		}
+		out.WriteString(text[end:span[0]])
+		out.WriteString("[personal]")
+		end = span[1]
+	}
+	out.WriteString(text[end:])
+	return out.String()
+}
+
+func identifierByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
 }

@@ -76,11 +76,19 @@ func (r *Runner) reviews(ctx context.Context, only string, families ...string) [
 			continue // reviewed on its head: its findings go back to the build, or its rounds are used
 		}
 		if spent+r.Budgets.Run > r.Budgets.Case {
-			out = append(out, Done{Family: c.Family, Case: c.ID, Step: StepReview, Skipped: fmt.Sprintf("spent $%.2f of its $%.0f, no room for a review", spent, r.Budgets.Case)})
+			why := fmt.Sprintf("spent $%.2f of its $%.0f, no room for a review", spent, r.Budgets.Case)
+			out = append(out, Done{Family: c.Family, Case: c.ID, Step: StepReview, Skipped: why})
+			if err := r.noteReviewSkip(ctx, c, "budget", why); err != nil {
+				r.logf("review waiting note: %v", err)
+			}
 			continue
 		}
 		if stop, err := r.stopped(ctx, c, false); err != nil || stop != "" {
-			out = append(out, Done{Family: c.Family, Case: c.ID, Step: StepReview, Skipped: firstOf(stop, fmt.Sprint(err))})
+			why := firstOf(stop, fmt.Sprint(err))
+			out = append(out, Done{Family: c.Family, Case: c.ID, Step: StepReview, Skipped: why})
+			if err := r.noteReviewSkip(ctx, c, "stopped", why); err != nil {
+				r.logf("review waiting note: %v", err)
+			}
 			continue
 		}
 		if err := r.prepareInputs(ctx); err != nil {
@@ -237,6 +245,31 @@ func roundsUsed(p Package) bool {
 	return false
 }
 
+func proposalsUsed(p Package) bool {
+	return p.ClosedProposals >= MaxClosedProposals && (p.State == Prepared || p.State == Checked || p.State == Revising)
+}
+
+func (r *Runner) noteReviewSkip(ctx context.Context, c store.Case, cause, why string) error {
+	detail, err := Redact(ctx, why)
+	if err != nil {
+		return err
+	}
+	detail = store.CaseNoteText(detail)
+	id := "loop-review:" + store.IDPart(c.ID) + ":" + cause
+	notes, err := r.Store.Notes(ctx)
+	if err != nil {
+		return err
+	}
+	for _, note := range notes {
+		if note.ID == id && note.Detail == detail {
+			return nil // the same cause stays resolved if its reader resolved it
+		}
+	}
+	_, err = r.Store.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Importance: store.ImportanceLow,
+		At: r.now(), Title: "The loop's review for case " + c.ID + " waits: " + cause, Detail: detail})
+	return err
+}
+
 const waitingPrefix = "loop-rounds:"
 
 func (r *Runner) noteWaiting(ctx context.Context) error {
@@ -265,11 +298,14 @@ func (r *Runner) noteWaiting(ctx context.Context) error {
 			unread = append(unread, fmt.Errorf("case %s package: %w", c.ID, err))
 			continue
 		}
-		if !ok || !roundsUsed(p) {
+		if !ok || (!roundsUsed(p) && !proposalsUsed(p)) {
 			continue
 		}
 		waiting[id] = true
-		at := p.Reviews[len(p.Reviews)-1].At
+		at := p.Updated
+		if !proposalsUsed(p) {
+			at = p.Reviews[len(p.Reviews)-1].At
+		}
 		if n, ok := have[id]; ok && (n.Done.IsZero() || !n.At.Before(at.Truncate(time.Millisecond))) {
 			continue // it stands, or it was resolved while this change waited
 		}
@@ -277,6 +313,10 @@ func (r *Runner) noteWaiting(ctx context.Context) error {
 			Title: fmt.Sprintf("The loop's change for case %s used its %d review rounds and waits for a person", c.ID, MaxRounds),
 			Detail: fmt.Sprintf("No review round remains for the current change in %s. The loop builds and reviews this change no more. "+
 				"Take it over in its pull request, or close the case.", firstOf(p.PR, "its change"))}
+		if proposalsUsed(p) {
+			note.Title = fmt.Sprintf("The loop's change for case %s used its %d closed proposals and waits for a person", c.ID, MaxClosedProposals)
+			note.Detail = "Two pull requests were closed without merging. The loop builds this case no more. Propose the checked package with ship propose, or close the case."
+		}
 		if u, err := url.Parse(p.PR); err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" {
 			note.Links = []store.Link{{Label: "pull request", URL: p.PR}}
 		}

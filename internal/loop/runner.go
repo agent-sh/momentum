@@ -357,6 +357,9 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 				}
 				passed = append(passed, c.ID+" has landed; deployment precedes more work")
 				continue
+			} else if ok && proposalsUsed(p) {
+				passed = append(passed, c.ID+" used its proposals")
+				continue
 			} else if ok && roundsUsed(p) {
 				passed = append(passed, c.ID+" used its review rounds")
 				continue

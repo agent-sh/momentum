@@ -365,5 +365,3 @@ func loopLesson(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	_, err = fmt.Fprintf(stdout, "%s: lesson publication recorded\n", *id)
 	return err
 }
-
-func lessonName(caseID string) string { return "momentum-lesson-" + strings.ToLower(caseID) }

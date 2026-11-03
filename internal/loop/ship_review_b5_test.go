@@ -28,6 +28,7 @@ func TestPublicPatchIsScannedBeforePublication(t *testing.T) {
 		{"filename", "alice@example.com.txt", "marker-7f3a\n", false, true},
 		{"private", "fake.go", "// /home/alice/work alice@example.com\n", true, false},
 		{"source-name", "main.go", "// marker-7f3a\n", false, false},
+		{"binary-home", "notes.bin", "\x00marker-7f3a /home/someone/notes.txt\n", false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, f, c, p, pr := b4Checked(t)
