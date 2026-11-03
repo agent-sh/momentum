@@ -117,3 +117,28 @@ func TestInputsMissingScrubberWritesNothing(t *testing.T) {
 		t.Fatalf("failed preparation wrote files: %d %v", len(entries), err)
 	}
 }
+
+// A host child that scrubs by itself finds the scrubber: its clean PATH includes the scrubber's own directory, which
+// a user's bin directory is not part of.
+func TestTheRecordsChildFindsTheScrubber(t *testing.T) {
+	was := Scrubber
+	t.Cleanup(func() { Scrubber = was })
+	dir := t.TempDir()
+	Scrubber = []string{script(t, dir, "scrub", "cat")}
+	if got := scrubberDir(); got != dir {
+		t.Fatalf("scrubber directory %q, want %q", got, dir)
+	}
+	found := false
+	for _, kv := range CleanEnv(nil, scrubberDir()) {
+		if strings.HasPrefix(kv, "PATH=") && strings.Contains(kv, dir) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the child's PATH lacks the scrubber's directory")
+	}
+	Scrubber = []string{"no-such-scrubber-marker-7f3a"}
+	if scrubberDir() != "" {
+		t.Fatal("a missing scrubber has a directory")
+	}
+}
