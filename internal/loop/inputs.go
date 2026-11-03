@@ -127,7 +127,10 @@ func (r *Runner) buildInputs(ctx context.Context, p *passInputs) error {
 	dst = filepath.Join(dir, "clone")
 	p.manifest.Tacit, err = SnapshotFacts(ctx, r.Inputs.TacitStore, dst, filepath.Join(logs, "facts.log"), p.cache, p.since)
 	switch {
-	case errors.Is(err, ErrNoScrubber):
+	case errors.Is(err, ErrNoScrubber), ctx.Err() != nil:
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return err
 	case err != nil:
 		// tacit's facts are context, not a precondition: without them the run goes on, and the manifest says why

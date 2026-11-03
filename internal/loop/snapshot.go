@@ -132,6 +132,9 @@ func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) 
 	}
 	var results []RepoInput
 	for _, source := range sources {
+		if err := ctx.Err(); err != nil {
+			return results, err // a pass told to stop leaves no refusals behind it
+		}
 		name := filepath.Base(source)
 		if counts[name] > 1 {
 			hash := sha256.Sum256([]byte(source))
@@ -650,7 +653,7 @@ func SnapshotDiffs(ctx context.Context, repos []RepoInput, texts []string, dst s
 		args = append(args, repo.Commit, "--")
 		listed, lerr := hostInputGit(ctx, repo.Source, append(args, paths[name]...)...)
 		if lerr != nil {
-			m.Error = lerr.Error()
+			m.Error = reason(lerr)
 			continue
 		}
 		var texts, labels []string
@@ -659,7 +662,7 @@ func SnapshotDiffs(ctx context.Context, repos []RepoInput, texts []string, dst s
 				"--format=commit %H%n%aI %an%n%s", hash, "--"}
 			diff, over, derr := hostInputGitCapped(ctx, repo.Source, DiffReadMax, append(show, paths[name]...)...)
 			if derr != nil {
-				m.Error = derr.Error()
+				m.Error = reason(derr)
 				continue
 			}
 			text := string(diff)

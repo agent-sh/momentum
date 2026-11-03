@@ -181,8 +181,8 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 	// scrubber has seen, and it may hold commits the source does not (a fetch of the remote brought them). Only a clone
 	// whose objects the scrubber would not change is mounted.
 	if err = checkCloneObjects(ctx, p.Work); err != nil {
+		removeInputTree(p.Work) // unscanned, it stays out of storage a later step might read
 		if errors.Is(err, errNeedsScrubbing) {
-			removeInputTree(p.Work)
 			return p, refused("the repository %s holds history the scrubber would mask, so a build clone of it cannot be mounted", name)
 		}
 		return p, err
