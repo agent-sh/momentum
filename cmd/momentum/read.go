@@ -51,15 +51,7 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if _, err := evidenceEnd(); err != nil {
 		return err
 	}
-	separate := false
-	for i := 0; i < len(args) && args[i] != "--"; i++ {
-		if args[i] == "--separate" {
-			separate = true
-			args = append(args[:i:i], args[i+1:]...)
-			i--
-		}
-	}
-	ids, cut, err := evidenceview.ParseShow(args, stderr)
+	ids, cut, separate, err := evidenceview.ParseHostShow(args, stderr)
 	if err != nil {
 		return usageError{err.Error()}
 	}

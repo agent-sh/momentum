@@ -95,4 +95,11 @@ func TestEvidenceShowSeparatesEventsForTheRecordsPass(t *testing.T) {
 	if code != 0 || len(parts) != 3 || parts[0] != own[0] || parts[1] != "" || parts[2] != own[1] || strings.Contains(out, "secret-value") {
 		t.Fatalf("separated show: %d %q %s", code, out, diag)
 	}
+	// --separate is a flag like the others: it takes no value, and it is no value of --bytes
+	if code, again, _ := momentum("evidence", "show", "--bytes=20", "--separate", ids[0], ids[1]); code != 0 || again != parts[0]+"\x1e"+parts[2] {
+		t.Fatalf("separate before the ids: %d %q", code, again)
+	}
+	if code, out, _ := momentum("evidence", "show", "--bytes", "--separate", "20", ids[0]); code != 2 || strings.Contains(out, "\x1e") {
+		t.Fatalf("--separate taken as the value of --bytes: %d %q", code, out)
+	}
 }

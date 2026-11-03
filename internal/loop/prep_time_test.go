@@ -2,8 +2,8 @@ package loop
 
 import (
 	"context"
+	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,7 +62,7 @@ func TestPassInputStepsOverlap(t *testing.T) {
 	r, _ := inputRunner(t)
 	r.Inputs.ReadDirs = []string{inputRepo(t, t.TempDir(), "example")}
 	write(t, filepath.Join(r.Inputs.Home, ".config", "agents", "rules.md"), "rule")
-	log := slowSpanScrubber(t)
+	log := meetingScrubber(t)
 	r.Inputs.ScrubCache = filepath.Join(t.TempDir(), "cache.sqlite")
 	r.pass = &passInputs{}
 	defer r.pass.close()
@@ -73,45 +73,45 @@ func TestPassInputStepsOverlap(t *testing.T) {
 	if s.Cached+s.Scrubbed != s.Events+s.Notes {
 		t.Fatalf("store counts hold other steps' texts: %+v", s)
 	}
-	if !callsOverlap(t, log) {
+	if !callsMet(log) {
 		t.Fatal("the steps' scrubber calls ran one after another")
 	}
 }
 
-// slowSpanScrubber is the good input scrubber, a quarter of a second slower per call, logging when each call started
-// and ended.
-func slowSpanScrubber(t *testing.T) string {
+// meetingScrubber is the good input scrubber whose calls (all but canaries) wait, up to three seconds, for another
+// call to be open at the same time. The first that finds one marks the meeting, and every call after it goes on at
+// once. It returns the mark's path.
+func meetingScrubber(t *testing.T) string {
 	t.Helper()
-	log := filepath.Join(t.TempDir(), "spans")
-	inputScrubber(t, `start=$(date +%s%N); out=$(sed -e 's/AKIA[A-Z0-9]*EXAMPLE/[masked]/g' -e 's/marker-7f3a/[masked]/g'; printf x); sleep 0.25
-printf '%s %s\n' "$start" "$(date +%s%N)" >> '`+log+`'; printf '%s' "${out%x}"`)
-	return log
+	dir := t.TempDir()
+	open, met := filepath.Join(dir, "open"), filepath.Join(dir, "met")
+	if err := os.Mkdir(open, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	inputScrubber(t, `in=$(cat; printf x); in=${in%x}
+case "$in" in *AKIA*) ;; *)
+	: > '`+open+`'/$$
+	n=0
+	while [ $n -lt 60 ] && [ ! -e '`+met+`' ]; do
+		if [ $(ls '`+open+`' | wc -l) -ge 2 ]; then : > '`+met+`'; break; fi
+		sleep 0.05; n=$((n+1))
+	done
+	rm -f '`+open+`'/$$;;
+esac
+printf '%s' "$in" | sed -e 's/AKIA[A-Z0-9]*EXAMPLE/[masked]/g' -e 's/marker-7f3a/[masked]/g'`)
+	return met
 }
 
-// callsOverlap reports whether two logged scrubber calls ran at the same time.
-func callsOverlap(t *testing.T, log string) bool {
-	t.Helper()
-	type span struct{ start, end int64 }
-	var spans []span
-	for _, line := range strings.Split(strings.TrimSpace(readText(t, log)), "\n") {
-		f := strings.Fields(line)
-		a, _ := strconv.ParseInt(f[0], 10, 64)
-		b, _ := strconv.ParseInt(f[1], 10, 64)
-		spans = append(spans, span{a, b})
-	}
-	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
-	for i := 1; i < len(spans); i++ {
-		if spans[i].start < spans[i-1].end {
-			return true
-		}
-	}
-	return false
+// callsMet reports whether two scrubber calls were open at the same time.
+func callsMet(met string) bool {
+	_, err := os.Stat(met)
+	return err == nil
 }
 
 // A cold store copy is hundreds of pages of seconds each: pages are with the scrubber at the same time, and every row
 // is still scrubbed and written back once.
 func TestStoreCopyScrubsPagesAtTheSameTime(t *testing.T) {
-	log := slowSpanScrubber(t)
+	log := meetingScrubber(t)
 	at := time.Now().Add(-time.Hour)
 	var events []store.Event
 	for i := range 3*scrubPageRows + 7 {
@@ -136,7 +136,7 @@ func TestStoreCopyScrubsPagesAtTheSameTime(t *testing.T) {
 	if err := db.QueryRow("SELECT count(*) FROM events WHERE summary NOT LIKE 'row [masked] %'").Scan(&left); err != nil || left != 0 {
 		t.Fatalf("%d rows were not scrubbed: %v", left, err)
 	}
-	if !callsOverlap(t, log) {
+	if !callsMet(log) {
 		t.Fatal("the store's pages were scrubbed one after another")
 	}
 }

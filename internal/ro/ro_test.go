@@ -193,7 +193,8 @@ func TestReadOnlyShowCapturedMissingNeighboursAndClip(t *testing.T) {
 	if code, _, _ := invoke(f, append(args, f.events[0].ID())...); code != 2 {
 		t.Fatal("accepted eleven IDs")
 	}
-	for _, args := range [][]string{{}, {"../escape"}, {f.events[0].ID(), "--bytes", "-1"}, {"000000000000000000000000"}} {
+	for _, args := range [][]string{{}, {"../escape"}, {f.events[0].ID(), "--bytes", "-1"}, {"000000000000000000000000"},
+		{"--separate", f.events[0].ID()}} { // --separate is the host's, for the records pass
 		if code, _, _ := invoke(f, append([]string{"evidence", "show"}, args...)...); code != 2 {
 			t.Fatal("accepted invalid or absent ID")
 		}
