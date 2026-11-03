@@ -79,9 +79,12 @@ func ParseGolden(raw []byte, path string) ([]GoldenTask, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%s:%d: %w", path, n, err)
 		}
-		symptom, err := exactObject(object["symptom"], "text", "query")
+		symptom, err := parseObject(object["symptom"], false, "text", "query")
 		if err != nil {
 			return nil, fmt.Errorf("%s:%d: symptom: %w", path, n, err)
+		}
+		if _, ok := symptom["query"]; !ok {
+			return nil, fmt.Errorf("%s:%d: symptom: missing member query", path, n)
 		}
 		if _, err := exactObject(symptom["query"], "event_ids"); err != nil {
 			return nil, fmt.Errorf("%s:%d: query: %w", path, n, err)

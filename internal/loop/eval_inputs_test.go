@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -235,7 +236,10 @@ func TestEvaluationRecordsRunThePinnedEvaluatingBinary(t *testing.T) {
 
 func TestEvaluationBoundedCaptureIsRecordedAndExcluded(t *testing.T) {
 	e, task := evalFixture(t)
-	e.Runner.Inputs.Momentum = script(t, t.TempDir(), "records", "python3 - <<'PY'\nprint('x'*16385)\nPY")
+	// a record over its bound (and the slack for the child's header and marker) is withheld and counted; the pair is
+	// still equal on both arms and is compared
+	over := strconv.Itoa(MaxRecordBytes + recordSlack + 1)
+	e.Runner.Inputs.Momentum = script(t, t.TempDir(), "records", "python3 - <<'PY'\nprint('x'*"+over+")\nPY")
 	if err := e.pinRecordsBinary(); err != nil {
 		t.Fatal(err)
 	}
@@ -245,8 +249,13 @@ func TestEvaluationBoundedCaptureIsRecordedAndExcluded(t *testing.T) {
 	if in.err != nil {
 		t.Fatal(in.err)
 	}
+	if in.manifest.Records.Withheld != 1 || in.manifest.Records.Stopped != "" {
+		t.Fatalf("an oversized record stopped the capture or was kept: %+v", in.manifest.Records)
+	}
+	// a capture that reached its count or byte bound lacks evidence the task may need: its pairs leave the comparison
+	in.manifest.Records.Stopped = "record count"
 	tr := e.trial(context.Background(), in, task, 1, "loop", 1)
-	if tr.Inputs.Records.Stopped != "record bytes" || tr.Inputs.Records.Withheld != 1 || tr.ComparisonExcluded == "" {
+	if tr.Inputs.Records.Stopped != "record count" || tr.ComparisonExcluded == "" {
 		t.Fatal("full capture was not recorded in the trial")
 	}
 	tr.Run.Started, tr.Run.Ended, tr.Run.USD, tr.Run.Status = time.Now(), time.Now().Add(time.Minute), 1, store.RunOK

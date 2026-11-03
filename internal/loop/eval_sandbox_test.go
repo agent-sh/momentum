@@ -230,7 +230,7 @@ func fakeEvalManager(t *testing.T) string {
 	dir := strings.Split(os.Getenv("PATH"), ":")[0]
 	path := filepath.Join(dir, "systemctl")
 	raw := readText(t, path)
-	if err := os.WriteFile(path, []byte(strings.ReplaceAll(raw, "momentum-run-loop-", "momentum-run-eval-")), 0700); err != nil {
+	if err := os.WriteFile(path, []byte(strings.ReplaceAll(raw, UnitPrefix, "momentum-run-eval-")), 0700); err != nil {
 		t.Fatal(err)
 	}
 	return log
