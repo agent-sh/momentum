@@ -587,7 +587,7 @@ Before a golden run, the operator freezes the procedure, holds out tasks from wr
 | `id` | Unique lowercase slug. |
 | `family` | One of the store's case families. |
 | `case_title` | The symptom title. |
-| `symptom` | An object with `query`, itself an object with `event_ids`, a nonempty array. |
+| `symptom` | An object with `query`, itself an object with `event_ids`, a nonempty array, and optional `text`, the owner's note on the symptom, which no trial sees. |
 | `cutoff` | A nonzero RFC3339 time. |
 | `root_cause` | The verified cause, given only to the judge. |
 | `key_facts` | A nonempty array of verified facts, given only to the judge. |
@@ -596,6 +596,8 @@ Before a golden run, the operator freezes the procedure, holds out tasks from wr
 | `repo` | Optional repository label; it requires `repo_path`. |
 | `pre_fix_commit` | Optional provenance. It does not select a checkout or enter an investigation. |
 | `title` | Optional descriptive metadata. It does not enter an investigation. |
+| `harness` | Optional label of the harness the cause involves. It does not enter an investigation. |
+| `difficulty`, `fix`, `verification`, `evidence`, `reach`, `reach_detail` | Optional notes the owner keeps beside a task. They are dropped before the task is read: the evaluator keeps none and no trial sees them. |
 
 Unknown, differently cased and repeated keys are refused, including nested symptom keys. The command reads the bytes once, parses them with `DisallowUnknownFields`, and hashes those same bytes. Blank lines are ignored. Duplicate ids and unknown selected ids are errors before setup.
 

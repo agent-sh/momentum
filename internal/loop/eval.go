@@ -49,6 +49,11 @@ type GoldenTask struct {
 // sees them; a key outside these and the task's own is a mistyped key and is refused.
 var goldenNotes = [...]string{"difficulty", "fix", "verification", "evidence", "reach", "reach_detail"}
 
+// goldenKeys are a task line's own keys, and goldenSymptomKeys its symptom's; SPEC's golden key table lists both.
+var goldenKeys = []string{"id", "harness", "family", "title", "case_title", "symptom", "cutoff",
+	"repo", "repo_path", "pre_fix_commit", "root_cause", "key_facts", "wrong_paths"}
+var goldenSymptomKeys = []string{"text", "query"}
+
 var slugRe = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
 // ReadGolden reads a golden set, one task per line.
@@ -71,15 +76,13 @@ func ParseGolden(raw []byte, path string) ([]GoldenTask, error) {
 			continue
 		}
 		var t GoldenTask
-		object, err := parseObject(sc.Bytes(), false, "id", "harness", "family", "title", "case_title", "symptom", "cutoff",
-			"repo", "repo_path", "pre_fix_commit", "root_cause", "key_facts", "wrong_paths",
-			// the golden file's own notes on a task (how hard, the fix, how it was verified, the evidence and the reach
-			// it was checked for): the owner keeps them beside the task; the evaluator reads none and no trial sees them
-			goldenNotes[0], goldenNotes[1], goldenNotes[2], goldenNotes[3], goldenNotes[4], goldenNotes[5])
+		// the golden file's own notes on a task (how hard, the fix, how it was verified, the evidence and the reach it
+		// was checked for): the owner keeps them beside the task; the evaluator reads none and no trial sees them
+		object, err := parseObject(sc.Bytes(), false, append(slices.Clone(goldenKeys), goldenNotes[:]...)...)
 		if err != nil {
 			return nil, fmt.Errorf("%s:%d: %w", path, n, err)
 		}
-		symptom, err := parseObject(object["symptom"], false, "text", "query")
+		symptom, err := parseObject(object["symptom"], false, goldenSymptomKeys...)
 		if err != nil {
 			return nil, fmt.Errorf("%s:%d: symptom: %w", path, n, err)
 		}
