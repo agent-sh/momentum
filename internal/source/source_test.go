@@ -421,6 +421,10 @@ func TestAnUnreadableIncidentFileLeavesTheRunNoCompleteRead(t *testing.T) {
 	if err != nil || complete.IsZero() {
 		t.Fatalf("the complete run is a read: %v %v", complete, err)
 	}
+	// reads are kept to the millisecond: the next run must start in a later one to be after this read
+	for time.Now().UnixMilli() <= complete.UnixMilli() {
+		time.Sleep(time.Millisecond)
+	}
 	modified := time.Now().Add(-3 * hour)
 	p := unreadableIncident(t, dir, "open", "inc-1", modified)
 	writeIncident(t, dir, "closed", "inc-3", "closed", "2026-01-02T10:00:00+02:00", time.Now().Add(-2*hour))
