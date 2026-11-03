@@ -83,7 +83,9 @@ func TestTheRecordIndexListsWithheldRecords(t *testing.T) {
 func TestAReviewUnderAHeldLockIsAHoldTheStopRuleDoesNotCount(t *testing.T) {
 	ctx := context.Background()
 	r, c, _ := reviewFixture(t)
-	r.Post = func(context.Context, string, string, string) (string, error) { return "https://example.invalid/c/1", nil }
+	r.Post = func(context.Context, string, string, string) (string, error) {
+		return "https://example.invalid/c/1", nil
+	}
 	unlock, err := r.Ship.lock(ctx, c.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -110,7 +112,9 @@ func TestAReviewUnderAHeldLockIsAHoldTheStopRuleDoesNotCount(t *testing.T) {
 func TestAHeadThatMovedDuringTheReviewIsAHold(t *testing.T) {
 	ctx := context.Background()
 	r, c, p := reviewFixture(t)
-	r.Post = func(context.Context, string, string, string) (string, error) { return "https://example.invalid/c/1", nil }
+	r.Post = func(context.Context, string, string, string) (string, error) {
+		return "https://example.invalid/c/1", nil
+	}
 	if err := r.prepareInputs(ctx); err != nil {
 		t.Fatal(err)
 	}
