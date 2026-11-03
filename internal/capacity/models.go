@@ -136,9 +136,11 @@ func (r *runner) models(ctx context.Context) ([]Finding, error) {
 	idle := time.Duration(r.cfg.Models.IdleDays * 24 * float64(time.Hour))
 	minBytes := int64(r.cfg.MinMiB * (1 << 20))
 	var out []Finding
+	var scanErr error
 	for _, x := range r.modelRoots {
 		ents, err := os.ReadDir(x.shown)
 		if err != nil {
+			scanErr = errors.Join(scanErr, err)
 			continue
 		}
 		var items []Finding
@@ -200,7 +202,7 @@ func (r *runner) models(ctx context.Context) ([]Finding, error) {
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Bytes > out[j].Bytes })
-	return out, nil
+	return out, scanErr
 }
 
 // kept reports whether an item is in keep, holds a path in keep, or is inside one.

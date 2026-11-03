@@ -147,6 +147,27 @@ func quote(t *testing.T, doc, what string, rate float64, decimals int, f figure)
 	}
 }
 
+func TestSpecIndependentFalseKeepRatesAndGridMaximum(t *testing.T) {
+	doc := spec(t)
+	const admitted = "false-keep rates are 36.8%, 14.4% and 6.7% at 50 units and shares of 1%, 2% and 3%, and 14.6% at 100 units and a 1% share"
+	for _, c := range []struct {
+		units, share int
+		printed      string
+	}{{50, 1, "36.8%"}, {50, 2, "14.4%"}, {50, 3, "6.7%"}, {100, 1, "14.6%"}} {
+		_, kept := independent(c.units, float64(c.share)/100, float64(c.share)/100).rates()
+		quote(t, doc, fmt.Sprintf("%d units, %d%% share among admitted plans", c.units, c.share), kept, 1, figure{c.printed, admitted})
+	}
+	maximum := 0.0
+	for _, units := range []int{50, 100, 200} {
+		for share := 1; share <= 12; share++ {
+			p := float64(share) / 100
+			admission, kept := independent(units, p, p).rates()
+			maximum = math.Max(maximum, admission*kept)
+		}
+	}
+	quote(t, doc, "maximum among gate-passing plans", maximum, 1, figure{"3.8%", "at most 3.8% on this grid"})
+}
+
 // The false-keep rates of a problem nothing changed, among the plans the baseline admits, when its hours hold it
 // independently, and when they cluster in sessions. A window is 10 sessions of 10 session hours and a 5% share; a session
 // is prone with probability pi and holds the problem in each hour with probability h, so that pi * h is the share. The

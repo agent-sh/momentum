@@ -266,13 +266,17 @@ func (r *Runner) buildSkipped(ctx context.Context, c store.Case, stage string, c
 }
 
 func (r *Runner) noteBuildSkip(ctx context.Context, c store.Case, stage, why string) error {
+	return r.noteStepSkip(ctx, c, "build", stage, why)
+}
+
+func (r *Runner) noteStepSkip(ctx context.Context, c store.Case, step, stage, why string) error {
 	detail, err := Redact(ctx, why)
 	if err != nil {
 		return err
 	}
 	detail = store.CaseNoteText(detail)
 	cause := sha256.Sum256([]byte(detail))
-	id := "loop-build:" + store.IDPart(c.ID) + ":" + stage + ":" + hex.EncodeToString(cause[:])
+	id := "loop-" + step + ":" + store.IDPart(c.ID) + ":" + stage + ":" + hex.EncodeToString(cause[:])
 	notes, err := r.Store.Notes(ctx)
 	if err != nil {
 		return err
@@ -283,7 +287,7 @@ func (r *Runner) noteBuildSkip(ctx context.Context, c store.Case, stage, why str
 		}
 	}
 	_, err = r.Store.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Importance: store.ImportanceLow,
-		At: r.now(), Title: "The loop's build for case " + c.ID + " waits: " + stage, Detail: detail})
+		At: r.now(), Title: "The loop's " + step + " for case " + c.ID + " waits: " + stage, Detail: detail})
 	return err
 }
 

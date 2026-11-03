@@ -48,7 +48,11 @@ func unitsOf(counted []store.Event) string {
 // Tally counts a signal over a span in its units: the units in which it counts an event, and the units of activity
 // they are among.
 func Tally(ctx context.Context, st *store.Store, sig Signal, units string, since, until time.Time, excludeCwd string) (measure.Counts, error) {
-	evs, err := Count(ctx, st, sig, since, until, excludeCwd)
+	q, err := activityQuery(sig, units, since, until, excludeCwd)
+	if err != nil {
+		return measure.Counts{}, err
+	}
+	evs, err := Count(ctx, st, sig, since, until, excludeCwd, q.Actor)
 	if err != nil {
 		return measure.Counts{}, err
 	}
@@ -72,6 +76,9 @@ func tallySources(ctx context.Context, st *store.Store, sig Signal, units string
 	}
 	hits := map[store.Unit]bool{}
 	for _, e := range evs {
+		if q.Actor != "" && e.Actor != q.Actor {
+			continue
+		}
 		if q.BySession && e.Session == "" {
 			continue // a sessions' measurement counts what sessions hold; the plan's units say its signal counts only that
 		}
@@ -185,6 +192,11 @@ func (r *Runner) Measure(ctx context.Context, o Options) ([]Measured, error) {
 				continue
 			}
 			cleanup := func() error {
+				unlock, err := r.Ship.lock(ctx, id)
+				if err != nil {
+					return err
+				}
+				defer unlock()
 				p, ok, err := r.Ship.Load(id)
 				if err != nil {
 					return err
@@ -202,7 +214,7 @@ func (r *Runner) Measure(ctx context.Context, o Options) ([]Measured, error) {
 				return nil
 			}
 			if err := cleanup(); err != nil {
-				out = append(out, Measured{Case: id, Title: c.Title, Status: "failed", Why: err.Error()})
+				out = append(out, r.measureFailure(ctx, c, err, false))
 				bad[id] = true
 				r.logf("note %s: %v", n.ID, err)
 			}
@@ -228,8 +240,43 @@ func (r *Runner) Measure(ctx context.Context, o Options) ([]Measured, error) {
 	return out, nil
 }
 
+// measureFailure treats a busy case as a passive hold. Measurement reserves no run.
+func (r *Runner) measureFailure(ctx context.Context, c store.Case, err error, dry bool) Measured {
+	m := Measured{Case: c.ID, Title: c.Title, Status: "failed", Why: err.Error()}
+	if held(err) {
+		m.Status = "held"
+		if !dry {
+			if err := r.noteStepSkip(ctx, c, "measure", "ship", m.Why); err != nil {
+				r.logf("measure waiting note: %v", err)
+			}
+		}
+	}
+	return m
+}
+
+func (r *Runner) legacyPlan(ctx context.Context, c store.Case, dry bool) Measured {
+	m := Measured{Case: c.ID, Title: c.Title, Status: "held",
+		Why: "its plan has no time it was counted at or no units: it must be measured by hand"}
+	if !dry {
+		if err := r.noteStepSkip(ctx, c, "measure", "plan", m.Why); err != nil {
+			r.logf("legacy measurement note: %v", err)
+		}
+	}
+	return m
+}
+
 // measureCase is the measure step for one deployed or measuring case.
 func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measured {
+	// Read the pass clock before loading the package. A ship operation that completed before the lock is taken
+	// must be visible in that load. Keep the lock through every package write and case decision.
+	now := r.now()
+	if !dry {
+		unlock, err := r.Ship.lock(ctx, c.ID)
+		if err != nil {
+			return r.measureFailure(ctx, c, err, dry)
+		}
+		defer unlock()
+	}
 	p, ok, err := r.Ship.Load(c.ID)
 	m := Measured{Case: c.ID, Title: c.Title, PR: p.PR}
 	failed := func(why string) Measured {
@@ -241,8 +288,6 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		return failed(err.Error())
 	case !ok || p.Plan == nil:
 		return failed("its package or plan is gone")
-	case p.Plan.At.IsZero() || p.Plan.Units == "":
-		return failed("its plan has no time it was counted at or no units: nothing bounds its window before")
 	case p.State == RolledBack || p.State == RollingBack:
 		// its revert went in, or is journaled to go in, and the case did not follow: finish that, whoever began it, before
 		// anything is measured - a change whose revert is on its way is not a change to keep
@@ -251,7 +296,10 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 			m.Why = "its rollback was begun already; it is finished before anything is measured"
 		}
 		if !dry {
-			if _, err := r.Ship.RollBack(ctx, c.ID, "its change was rolled back"); err != nil {
+			if _, err := r.Ship.rollBackLocked(ctx, c.ID, "its change was rolled back"); err != nil {
+				if held(err) {
+					return r.measureFailure(ctx, c, err, dry)
+				}
 				return failed(err.Error())
 			}
 			if p, _, err = r.Ship.Load(c.ID); err == nil {
@@ -259,6 +307,8 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 			}
 		}
 		return m
+	case p.Plan.At.IsZero() || p.Plan.Units == "":
+		return r.legacyPlan(ctx, c, dry)
 	}
 	plan, why, err := r.countingPlan(ctx, &p, dry)
 	if err != nil {
@@ -268,7 +318,6 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		m.Status, m.Why = "waiting", why
 		return m
 	}
-	now := r.now()
 	since, why, err := r.Ship.InEffect(ctx, &p)
 	if err != nil {
 		return failed(err.Error())
@@ -384,7 +433,7 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		if _, err := r.Store.CloseMeasured(ctx, c.ID, after.Hits, res.Effect, "loop:measure"); err != nil {
 			return failed(err.Error())
 		}
-		if p, err = r.Ship.Keep(c.ID, res); err != nil {
+		if p, err = r.Ship.keepLocked(c.ID, res); err != nil {
 			return failed(err.Error())
 		}
 		r.resolve(ctx, &p)
@@ -419,9 +468,11 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		}
 		return m
 	}
-	if _, err := r.Ship.RollBack(ctx, c.ID, why); err != nil {
+	if _, err := r.Ship.rollBackLocked(ctx, c.ID, why); err != nil {
+		if held(err) {
+			return r.measureFailure(ctx, c, err, dry)
+		}
 		m.Status, m.Why = "failed", "the rollback: "+err.Error()
-		r.Store.CaseNote(ctx, c.ID, "not rolled back", err.Error(), "loop:measure")
 		r.rollbackFailed(ctx, c, err)
 		return m
 	}
@@ -439,7 +490,23 @@ func (r *Runner) rollbackFailed(ctx context.Context, c store.Case, cause error) 
 		return
 	}
 	p.RollbackFailures++
-	r.Ship.save(&p)
+	clean, err := Redact(ctx, cause.Error())
+	if err != nil {
+		r.logf("rollback cause: %v", err)
+		return
+	}
+	clean = store.CaseNoteText(clean)
+	if p.RollbackProblem != clean {
+		if err := r.Store.CaseNote(ctx, c.ID, "not rolled back", clean, "loop:measure"); err != nil {
+			r.logf("rollback note: %v", err)
+			return
+		}
+		p.RollbackProblem = clean
+	}
+	if err := r.Ship.save(&p); err != nil {
+		r.logf("rollback failure record: %v", err)
+		return
+	}
 	if p.RollbackFailures >= 2 {
 		r.problem(ctx, &p, "momentum cannot roll back its change for: "+c.Title,
 			fmt.Sprintf("Its measurement showed no effect, and the rollback failed %d times in a row: %v. The next run tries again.", p.RollbackFailures, cause))
@@ -449,6 +516,14 @@ func (r *Runner) rollbackFailed(ctx context.Context, c store.Case, cause error) 
 // watch finishes an interrupted keep, then reads each ended window since the close once. The windows do not
 // overlap. Back needs three consecutive windows at the old share, so repeated runs cannot add windows.
 func (r *Runner) watch(ctx context.Context, c store.Case, dry bool) (Measured, bool) {
+	now := r.now()
+	if !dry {
+		unlock, err := r.Ship.lock(ctx, c.ID)
+		if err != nil {
+			return r.measureFailure(ctx, c, err, dry), true
+		}
+		defer unlock()
+	}
 	p, ok, err := r.Ship.Load(c.ID)
 	m := Measured{Case: c.ID, Title: c.Title, PR: p.PR}
 	failed := func(err error) (Measured, bool) { m.Status, m.Why = "failed", err.Error(); return m, true }
@@ -457,6 +532,9 @@ func (r *Runner) watch(ctx context.Context, c store.Case, dry bool) (Measured, b
 	}
 	if !ok || (p.State != Kept && p.State != Landed) || p.Plan == nil {
 		return Measured{}, false
+	}
+	if p.Plan.At.IsZero() || p.Plan.Units == "" {
+		return r.legacyPlan(ctx, c, dry), true
 	}
 	if p.Plan.Window <= 0 {
 		return failed(fmt.Errorf("its plan has no window"))
@@ -506,7 +584,7 @@ func (r *Runner) watch(ctx context.Context, c store.Case, dry bool) (Measured, b
 			p.Result = &res
 		}
 		if !dry {
-			p, err = r.Ship.Keep(c.ID, *p.Result)
+			p, err = r.Ship.keepLocked(c.ID, *p.Result)
 			if err != nil {
 				return failed(err)
 			}
@@ -515,7 +593,6 @@ func (r *Runner) watch(ctx context.Context, c store.Case, dry bool) (Measured, b
 	if p.Result == nil {
 		return failed(fmt.Errorf("its kept package has no measurement"))
 	}
-	now := r.now()
 	ended := int(now.Sub(c.Closed) / p.Plan.Window)
 	for j := p.WatchWindow + 1; j <= ended; j++ {
 		start := c.Closed.Add(time.Duration(j-1) * p.Plan.Window)
@@ -745,7 +822,11 @@ func (s *Ship) liveSources(ctx context.Context, sources []string, window time.Du
 }
 
 func tallyPlan(ctx context.Context, st *store.Store, plan Plan, since, until time.Time, dir string) (measure.Counts, error) {
-	evs, err := Count(ctx, st, plan.Signal, since, until, dir)
+	q, err := activityQuery(plan.Signal, plan.Units, since, until, dir)
+	if err != nil {
+		return measure.Counts{}, err
+	}
+	evs, err := Count(ctx, st, plan.Signal, since, until, dir, q.Actor)
 	if err != nil {
 		return measure.Counts{}, err
 	}

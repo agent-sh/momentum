@@ -253,8 +253,8 @@ func shownOf(rs []root) []string {
 }
 
 // Run is one capacity run: the sample of the processes, each disk's use, then each rule that is due. A run that
-// records and stops on an error is an incomplete run of the capacity source: the sample it should have taken is not
-// in the store, and no later run takes it.
+// stops on an error or cannot read a rule, root or disk is an incomplete run of the capacity source: its missing
+// observations are not in the store, and no later run takes them.
 func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result, error) {
 	start := time.Now
 	if opt.Clock != nil {
@@ -262,8 +262,24 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 	}
 	at := start()
 	res, err := runOnce(ctx, cfg, st, opt)
-	if err != nil && !opt.DryRun && st != nil {
-		err = errors.Join(err, st.MarkIncomplete(context.WithoutCancel(ctx), store.Capacity, "", at))
+	if !opt.DryRun && st != nil {
+		incomplete := err != nil || res == nil
+		if res != nil {
+			for _, rule := range res.Rules {
+				incomplete = incomplete || rule.Err != ""
+			}
+			for _, disk := range res.Disks {
+				incomplete = incomplete || disk.Err != ""
+			}
+		}
+		if incomplete {
+			err = errors.Join(err, st.MarkIncomplete(context.WithoutCancel(ctx), store.Capacity, "", at))
+		} else {
+			err = st.MarkRead(ctx, store.Capacity, res.At)
+			if err != nil {
+				err = errors.Join(err, st.MarkIncomplete(context.WithoutCancel(ctx), store.Capacity, "", at))
+			}
+		}
 	}
 	return res, err
 }
@@ -473,11 +489,6 @@ func runOnce(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Re
 			}
 		}
 		if err := r.record(ctx); err != nil {
-			return r.res, err
-		}
-	}
-	if !opt.DryRun {
-		if err := st.MarkRead(ctx, store.Capacity, r.now); err != nil {
 			return r.res, err
 		}
 	}

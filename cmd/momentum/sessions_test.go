@@ -18,6 +18,21 @@ import (
 	"github.com/agent-sh/momentum/sessions/state"
 )
 
+func TestPhaseEventsKeepTheStampedDirectory(t *testing.T) {
+	for _, cwd := range []string{"", "/w/new"} {
+		change := state.Change{Key: "synthetic", Cwd: "/w/loop/run", Tool: "claude", To: sessions.Idle}
+		live := &sessions.Session{Key: change.Key, Cwd: cwd, Model: "fixture-model"}
+		evs := phaseEvents([]state.Change{change}, []*sessions.Session{live}, time.Now())
+		want := change.Cwd
+		if cwd != "" {
+			want = cwd
+		}
+		if len(evs) != 1 || evs[0].Cwd != want || evs[0].Model != live.Model {
+			t.Fatalf("live cwd %q lost the stamp or model: %+v", cwd, evs)
+		}
+	}
+}
+
 // fixed is a source that reports the same sessions on every scan, as a harness would between two runs.
 type fixed []sessions.Session
 

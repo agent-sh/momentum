@@ -181,7 +181,7 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 		}
 	}
 	now := at // the proposal's own time: the readers that stopped are those that have not run for a window up to it, and the span is the four windows before it
-	first, err := Count(ctx, s.Store, sig, at.Add(-window), at, s.Dir)
+	first, err := Count(ctx, s.Store, sig, at.Add(-window), at, s.Dir, "")
 	if err != nil {
 		return Plan{}, err
 	}
@@ -285,7 +285,7 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 		}
 	}
 	at = boundary
-	got, err := Count(ctx, s.Store, sig, at.Add(-window), at, s.Dir)
+	got, err := Count(ctx, s.Store, sig, at.Add(-window), at, s.Dir, "")
 	if err != nil {
 		return Plan{}, err
 	}
@@ -372,9 +372,9 @@ func expandHome(p string) string {
 // more than countLimit events of its source, kinds and harness is an error, not a count of what fits.
 var countLimit = 1_000_000
 
-func Count(ctx context.Context, st *store.Store, sig Signal, since, until time.Time, excludeCwd string) ([]store.Event, error) {
+func Count(ctx context.Context, st *store.Store, sig Signal, since, until time.Time, excludeCwd string, actor store.Actor) ([]store.Event, error) {
 	evs, err := st.Events(ctx, store.Query{Since: since, Until: until, ExcludeCwd: excludeCwd, Source: sig.Source, Kinds: sig.Kinds, Harness: sig.Harness,
-		FailedResults: true, Limit: countLimit + 1})
+		Actor: actor, FailedResults: true, Limit: countLimit + 1})
 	if err != nil {
 		return nil, err
 	}
@@ -449,8 +449,6 @@ func (s *Ship) InEffect(ctx context.Context, p *Package) (time.Time, string, err
 				return time.Time{}, why, nil
 			}
 		}
-		// A rejected build stays rejected even if the checkout moves back before another build.
-		p.InstalledAt, p.InstalledHash, p.InstalledOK, p.InstalledGo, p.InstalledWhy = installedAt, installedHash, false, false, ""
 	}
 	if p.Plan.Installed == "" || p.CheckoutAt.IsZero() || changed {
 		last := p.Landed[len(p.Landed)-1]
@@ -467,6 +465,8 @@ func (s *Ship) InEffect(ctx context.Context, p *Package) (time.Time, string, err
 		if _, err := s.git(ctx, p.Dir, "merge-base", "--is-ancestor", last, head); err != nil {
 			var exit *exec.ExitError
 			if errors.As(err, &exit) && exit.ExitCode() == 1 {
+				// A definite rejection stands until the next build. A transient checkout error records no decision.
+				p.InstalledAt, p.InstalledHash, p.InstalledOK, p.InstalledGo, p.InstalledWhy = installedAt, installedHash, false, false, ""
 				if head != "HEAD" {
 					return time.Time{}, fmt.Sprintf("the checkout the installed file was built from did not hold %.12s", last), nil
 				}
@@ -499,6 +499,7 @@ func (s *Ship) InEffect(ctx context.Context, p *Package) (time.Time, string, err
 		if !changed {
 			return time.Time{}, "the installed file has not changed since a build from a checkout without the change", nil
 		}
+		p.InstalledAt, p.InstalledHash, p.InstalledOK, p.InstalledGo, p.InstalledWhy = installedAt, installedHash, false, false, ""
 		if !installedAt.After(p.CheckoutAt) {
 			return time.Time{}, fmt.Sprintf("%s, where it is installed, has not changed since the checkout held the change", filepath.Base(p.Plan.Installed)), nil
 		}
@@ -630,6 +631,16 @@ func (s *Ship) headAt(ctx context.Context, dir string, at time.Time) (string, bo
 
 // Keep records that a change's measurement kept it: its case closed as improved with the result.
 func (s *Ship) Keep(caseID string, res measure.Result) (Package, error) {
+	unlock, err := s.lock(context.Background(), caseID)
+	if err != nil {
+		return Package{}, err
+	}
+	defer unlock()
+	return s.keepLocked(caseID, res)
+}
+
+// keepLocked reloads the package under the caller's case lock.
+func (s *Ship) keepLocked(caseID string, res measure.Result) (Package, error) {
 	p, ok, err := s.Load(caseID)
 	switch {
 	case err != nil:

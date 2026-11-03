@@ -197,6 +197,10 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 }
 
 func stageFailure(res Result, key string, err error) (Result, error) {
+	var wait *waitingPlan
+	if errors.As(err, &wait) {
+		err = &shipHold{err: err}
+	}
 	if held(err) {
 		return res, &buildStageError{key: key, err: err}
 	}

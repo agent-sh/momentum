@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/measure"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -98,6 +99,7 @@ func TestEveryShipStepTakesTheCasesLock(t *testing.T) {
 		"check":   func() error { _, err := checkPatch(t, s, ctx, c.ID, "go test ./...", nil); return err },
 		"propose": func() error { _, err := proposePatch(t, s, ctx, c.ID, Proposal{}); return err },
 		"land":    func() error { _, err := s.Land(ctx, c.ID); return err },
+		"keep":    func() error { _, err := s.Keep(c.ID, measure.Result{}); return err },
 		"rollback": func() error {
 			_, err := s.RollBack(ctx, c.ID, "because")
 			return err

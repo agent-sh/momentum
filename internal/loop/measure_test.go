@@ -372,7 +372,7 @@ func TestAPlanWithoutItsTimeOrUnitsMeasuresNothing(t *testing.T) {
 		p, _, _ := m.r.Ship.Load(m.c.ID)
 		broken(p.Plan)
 		m.r.Ship.save(&p)
-		if got := m.measure(t, Options{}); got.Status != "failed" || m.theCase(t).Status != store.CaseDeployed {
+		if got := m.measure(t, Options{}); got.Status != "held" || m.theCase(t).Status != store.CaseDeployed {
 			t.Fatalf("a broken plan: %+v", got)
 		}
 	}
@@ -879,7 +879,7 @@ func TestACountOverMoreEventsThanItReadsFailsInsteadOfLosingTheOldest(t *testing
 		}
 	}
 	count := func(st *store.Store, sig Signal) ([]store.Event, error) {
-		return Count(ctx, st, sig, t0.Add(-time.Hour), time.Now(), "")
+		return Count(ctx, st, sig, t0.Add(-time.Hour), time.Now(), "", "")
 	}
 	t.Run("failed results", func(t *testing.T) {
 		st := testStore(t)

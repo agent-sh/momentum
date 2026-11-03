@@ -123,6 +123,7 @@ type Package struct {
 	WatchWindow      int              `json:"watch_window,omitempty"`  // last completed window read since the close
 	OutOfEffect      time.Time        `json:"out_of_effect,omitzero"`  // first run that found the measuring change absent
 	RollbackFailures int              `json:"rollback_failures,omitempty"`
+	RollbackProblem  string           `json:"rollback_problem,omitempty"` // cleaned cause of the last failed rollback
 }
 
 // RollbackJournal keeps the exact revert candidate before any remote write. A retry checks this head on the
@@ -1288,17 +1289,22 @@ func (s *Ship) retryCleanup(ctx context.Context, caseID string) (Package, error)
 // RollBack undoes a landed change: a revert of its commits, by the user's identity, pushed to the default branch
 // as a fast-forward; the case goes back to testing.
 func (s *Ship) RollBack(ctx context.Context, caseID, why string) (pkg Package, stepErr error) {
+	unlock, err := s.lock(ctx, caseID)
+	if err != nil {
+		return Package{}, err
+	}
+	defer unlock()
+	return s.rollBackLocked(ctx, caseID, why)
+}
+
+// rollBackLocked reloads the package under the caller's case lock.
+func (s *Ship) rollBackLocked(ctx context.Context, caseID, why string) (pkg Package, stepErr error) {
 	ctx = s.gitContext(shipContext(ctx, caseID))
 	cleanWhy, cleanErr := Redact(ctx, why)
 	if cleanErr != nil {
 		return Package{}, cleanErr
 	}
 	why = cleanWhy
-	unlock, err := s.lock(ctx, caseID)
-	if err != nil {
-		return Package{}, err
-	}
-	defer unlock()
 	p, ok, err := s.Load(caseID)
 	if err != nil {
 		return Package{}, err
