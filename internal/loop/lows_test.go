@@ -159,3 +159,39 @@ func TestRequestFieldsRefusesEachAmbiguousBody(t *testing.T) {
 		t.Fatalf("an honest body: %v %v", got.MaxTokens, err)
 	}
 }
+
+// An evaluation's unit set is the machine's units active in the three days before the task's end, never after it:
+// the journal is asked for that window.
+func TestEvaluationActiveUnitsReadTheJournalBeforeTheEnd(t *testing.T) {
+	e, task := evalFixture(t)
+	end, err := e.snapshotEnd(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(e.Runner.Inputs.Home, ".config/systemd/user", "busy.service"), "[Unit]\n")
+	bin := t.TempDir()
+	argsFile := filepath.Join(bin, "args")
+	script(t, bin, "journalctl", `printf '%s\n' "$@" > "`+argsFile+`"
+printf 'busy.service\n'`)
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	e.Runner.Inputs.Momentum = script(t, t.TempDir(), "records", "printf 'record\\n'")
+	if err := e.pinRecordsBinary(); err != nil {
+		t.Fatal(err)
+	}
+	in := &taskInputs{remaining: 1}
+	e.makeTask(context.Background(), in, task, nil)
+	defer in.close()
+	if in.err != nil {
+		t.Fatal(in.err)
+	}
+	raw, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal("the journal was not asked", err)
+	}
+	args := "\n" + string(raw)
+	format := "2006-01-02 15:04:05"
+	if !strings.Contains(args, "\n--until\n"+end.Local().Format(format)+"\n") ||
+		!strings.Contains(args, "\n--since\n"+end.Add(-ActiveUnitWindow).Local().Format(format)+"\n") {
+		t.Fatalf("the journal's window is not the end's: %q (end %s)", raw, end)
+	}
+}
