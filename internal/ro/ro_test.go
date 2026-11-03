@@ -382,3 +382,53 @@ func TestReadOnlyRecordsRefuseEscapesPipesAndOversize(t *testing.T) {
 		})
 	}
 }
+
+// A relative time counts back from the newest event of the copy, not from the machine's clock: a copy cut as of an
+// old end still answers the window the prompt suggests.
+func TestRelativeTimesCountBackFromTheCopysEnd(t *testing.T) {
+	f := inputs(t)
+	for _, args := range [][]string{{"evidence", "events", "--since", "30d", "--limit", "5"}, {"evidence", "status", "--since", "30d"}} {
+		code, out, diag := invoke(f, args...)
+		if code != 0 || strings.TrimSpace(out) == "" {
+			t.Fatalf("%v: %d %q %s", args, code, out, diag)
+		}
+	}
+	// the newest event is the anchor: a window of a second before it holds that event and no older one
+	newest := f.events[len(f.events)-1].TS
+	for _, e := range f.events {
+		if e.TS.After(newest) {
+			newest = e.TS
+		}
+	}
+	code, out, _ := invoke(f, "evidence", "events", "--since", "1s", "--limit", "500")
+	if code != 0 || strings.Count(out, "\n") < 1 || strings.Count(out, "\n") >= len(f.events) {
+		t.Fatalf("a window of one second before the copy's end: %d rows of %d (code %d)", strings.Count(out, "\n"), len(f.events), code)
+	}
+}
+
+// Ids and names are checked before they name a file, and a link in the records directory is not followed.
+func TestReadOnlyRefusesBadIDsAndLinkedRecords(t *testing.T) {
+	f := inputs(t)
+	for _, args := range [][]string{{"evidence", "show", "ev:ZZ"}, {"evidence", "show", "../x"}, {"evidence", "unit", "../x"}, {"evidence", "unit", "a/b"}} {
+		if code, out, _ := invoke(f, args...); code == 0 || out != "" {
+			t.Errorf("%v was accepted: %d %q", args, code, out)
+		}
+	}
+	id := f.events[0].ID()
+	dir := f.loc.records
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "elsewhere.txt")
+	if err := os.WriteFile(target, []byte("a linked record\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "ev-"+id+".txt")
+	os.Remove(link)
+	if err := os.Symlink(target, link); err != nil {
+		t.Skip("no symlinks here")
+	}
+	if _, out, _ := invoke(f, "evidence", "show", id); strings.Contains(out, "a linked record") {
+		t.Fatal("a linked record was followed")
+	}
+}

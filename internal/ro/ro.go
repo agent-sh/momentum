@@ -129,16 +129,27 @@ func openCopy(ctx context.Context, path string) (*sql.DB, error) {
 	return db, nil
 }
 
-func events(ctx context.Context, args []string, loc locations, stdout, stderr io.Writer) error {
-	opts, err := evidenceview.ParseEvents(args, stderr)
-	if err != nil {
-		return usageError{err}
+// anchor makes relative times ("3d") count back from the newest event of the copy: a copy cut as of a past end
+// would otherwise show nothing for the window the prompt suggests.
+func anchor(ctx context.Context, db *sql.DB) {
+	var ms sql.NullInt64
+	if err := db.QueryRowContext(ctx, `SELECT max(ts) FROM events`).Scan(&ms); err == nil && ms.Valid && ms.Int64 > 0 {
+		end := time.UnixMilli(ms.Int64)
+		evidenceview.Now = func() time.Time { return end }
 	}
+}
+
+func events(ctx context.Context, args []string, loc locations, stdout, stderr io.Writer) error {
 	db, err := openCopy(ctx, loc.store)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
+	anchor(ctx, db)
+	opts, err := evidenceview.ParseEvents(args, stderr)
+	if err != nil {
+		return usageError{err}
+	}
 	evs, err := store.ReadEvents(ctx, db, opts.Query)
 	if err != nil {
 		return err
@@ -169,7 +180,8 @@ func status(ctx context.Context, args []string, loc locations, stdout, stderr io
 		return err
 	}
 	defer db.Close()
-	counts, err := store.ReadCounts(ctx, db, time.Now().Add(-d))
+	anchor(ctx, db)
+	counts, err := store.ReadCounts(ctx, db, evidenceview.Now().Add(-d))
 	if err != nil {
 		return err
 	}

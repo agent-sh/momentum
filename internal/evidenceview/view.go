@@ -98,9 +98,13 @@ func Events(stdout io.Writer, evs []store.Event, asJSON bool) error {
 	return nil
 }
 
+// Now is the instant a relative time counts back from. The read-only binary of a run sets it to the end of the
+// store it reads, which for an as-of copy is the task's end, not the machine's clock.
+var Now = time.Now
+
 func ParseWhen(s string) (time.Time, error) {
 	if d, err := ParseSince(s); err == nil {
-		return time.Now().Add(-d), nil
+		return Now().Add(-d), nil
 	}
 	// a time with its offset keeps it: git's iso date puts it after a space
 	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05 -0700", "2006-01-02 15:04 -0700", "2006-01-02 15:04:05 -07:00", "2006-01-02 15:04:05Z07:00"} {
