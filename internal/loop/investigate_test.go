@@ -354,3 +354,35 @@ func nativeReport(record string) json.RawMessage {
 	json.Unmarshal([]byte(record), &r)
 	return r.Report
 }
+
+// Findings and the reason of an undecided run are scrubbed before the case stores them.
+func TestFindingsAreScrubbedBeforeTheCaseStoresThem(t *testing.T) {
+	goodInputScrubber(t)
+	st := testStore(t)
+	ctx := context.Background()
+	c := openCase(t, st, "failures", "scrub", 1)
+	got, recorded, err := recordFindings(ctx, st, c.ID, c.Episode, finding{Mechanism: "the key is marker-7f3a", Fix: "rotate marker-7f3a", Alternatives: []string{"marker-7f3a again"}}, true, "undecided: marker-7f3a", "loop:r")
+	if err != nil || !recorded {
+		t.Fatalf("not recorded: %v %v", recorded, err)
+	}
+	log, _ := st.CaseLog(ctx, c.ID)
+	text := got.Mechanism + got.NextTest + strings.Join(got.Alternatives, " ")
+	for _, e := range log {
+		text += e.Detail
+	}
+	if strings.Contains(text, "marker-7f3a") || !strings.Contains(got.Mechanism, "[masked]") {
+		t.Fatalf("a run's findings reached the case unscrubbed: %q", text)
+	}
+	d := openCase(t, st, "failures", "scrub-undecided", 1)
+	if got, recorded, err = recordFindings(ctx, st, d.ID, d.Episode, finding{Mechanism: "m"}, true, "reason marker-7f3a", "loop:r"); err != nil || !recorded {
+		t.Fatalf("undecided not recorded: %v %v", recorded, err)
+	}
+	log, _ = st.CaseLog(ctx, d.ID)
+	text = ""
+	for _, e := range log {
+		text += e.Detail
+	}
+	if strings.Contains(text, "marker-7f3a") {
+		t.Fatalf("the undecided reason reached the case unscrubbed: %q", text)
+	}
+}

@@ -160,17 +160,28 @@ func absentInput(path string) error {
 	return nil
 }
 
+// A scrubber start costs most of a second whatever it is given, so a page is as large as one start can take: many rows,
+// and some megabytes of text (RedactAll splits at its own limit).
+const (
+	scrubPageRows  = 5000
+	scrubPageBytes = 4 << 20
+)
+
 // scrubTable keeps only one batch of rows in memory. Stable ids and numeric
 // columns stay intact; every other column is passed through the scrubber.
 func scrubTable(ctx context.Context, db *sql.DB, table string, cols []string) error {
 	last := ""
 	for {
-		rows, err := db.QueryContext(ctx, `SELECT id, `+strings.Join(cols, ",")+` FROM `+table+` WHERE id > ? ORDER BY id LIMIT 128`, last)
+		rows, err := db.QueryContext(ctx, `SELECT id, `+strings.Join(cols, ",")+` FROM `+table+` WHERE id > ? ORDER BY id LIMIT ?`, last, scrubPageRows)
 		if err != nil {
 			return err
 		}
 		var ids, texts []string
+		size := 0
 		for rows.Next() {
+			if size >= scrubPageBytes {
+				break // the page is full; the next starts after its last row
+			}
 			values := make([]string, len(cols)+1)
 			ptrs := make([]any, len(values))
 			for i := range values {
@@ -180,7 +191,11 @@ func scrubTable(ctx context.Context, db *sql.DB, table string, cols []string) er
 				rows.Close()
 				return err
 			}
-			ids, texts = append(ids, values[0]), append(texts, values[1:]...)
+			// the id goes through the scrubber too: a row whose id it would change is left out of the copy
+			ids, texts = append(ids, values[0]), append(append(texts, values[0]), values[1:]...)
+			for _, v := range values {
+				size += len(v)
+			}
 		}
 		err = rows.Err()
 		rows.Close()
@@ -199,10 +214,18 @@ func scrubTable(ctx context.Context, db *sql.DB, table string, cols []string) er
 		for i, col := range cols {
 			assign[i] = col + "=?"
 		}
+		stride := len(cols) + 1
 		for i, id := range ids {
+			if clean[i*stride] != id {
+				if _, err = tx.ExecContext(ctx, "DELETE FROM "+table+" WHERE id=?", id); err != nil {
+					tx.Rollback()
+					return err
+				}
+				continue
+			}
 			args := make([]any, len(cols)+1)
 			for j, col := range cols {
-				text := clean[i*len(cols)+j]
+				text := clean[i*stride+1+j]
 				if col == "meta" && !json.Valid([]byte(text)) {
 					text = "{}"
 				}

@@ -172,7 +172,7 @@ momentum loop runs [--since WHEN] [--case ID] [--json]
 
 This build investigates one case per family with Claude Code's native agent in print mode. The host records its mechanism, alternatives, fix and summary. A complete report moves the case to testing; builds and later steps are outside this build. Two runs that fail the same way stop the case and open a component-health case.
 
-The host prepares scrubbed inputs before any model starts: the last 30 days of events and notes, evidence records and neighbours, named unit logs, text configuration, tacit's facts and full-history repository clones. Pass-level copies are made once, shared read-only and removed at the end. Each run gets its own records and case file. A missing or failed scrubber skips the step without charging the case. A dry pass prepares nothing and writes nothing.
+The host prepares scrubbed inputs before any model starts: the last 30 days of events and notes, evidence records and neighbours, unit logs, text configuration, tacit's facts and full-history repository clones. Pass-level copies are made once, shared read-only and removed at the end. Each run gets its own records and case file. A missing or failed scrubber skips the step without charging the case. A dry pass prepares nothing and writes nothing.
 
 The agent reads `/ro/store.sqlite` with python3's sqlite3, and reads `/ro/records`, `/ro/config`, `/ro/clone`, `/ro/repos` and `/run/input`. `/work` is scratch; `/out/findings.md` preserves partial findings. The host reads only that bounded regular file if the run returns no report. It treats all run output as untrusted, scrubs findings and never runs programs or git from writable run directories.
 

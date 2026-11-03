@@ -295,16 +295,21 @@ func writeRecords(ctx context.Context, o RecordsOptions, files []RecordFile, m R
 			seenUnits[file.Unit] = true
 		}
 	}
+	var names []string
 	for _, name := range o.Units {
 		if !unitNameRE.MatchString(name) {
 			m.Skipped++
 			continue
 		}
-		cleanName, err := RedactAll(ctx, []string{name})
-		if err != nil {
-			return m, err
-		}
-		if cleanName[0] != name {
+		names = append(names, name)
+	}
+	// one scrubber call for every name: a start costs most of a second
+	cleanNames, err := RedactAll(ctx, names)
+	if err != nil {
+		return m, err
+	}
+	for i, name := range names {
+		if cleanNames[i] != name {
 			m.Skipped++
 			continue
 		}
@@ -353,8 +358,15 @@ func writeRecords(ctx context.Context, o RecordsOptions, files []RecordFile, m R
 	if limit == 0 {
 		limit = MaxRecordBytes
 	}
+	// The children run one after the other and their outputs are scrubbed again in one batch afterwards: a scrubber
+	// start costs most of a second, and a record is at most the bound and its slack.
+	type fetched struct {
+		file RecordFile
+		text string
+	}
+	var got []fetched
 	for i, file := range files {
-		if m.Written >= MaxRecords {
+		if m.Written+len(got) >= MaxRecords {
 			m.Stopped = "record count"
 			m.Skipped += len(files) - i
 			break
@@ -384,22 +396,30 @@ func writeRecords(ctx context.Context, o RecordsOptions, files []RecordFile, m R
 			m.Withheld++
 			continue
 		}
-		clean, err := RedactAll(ctx, []string{out.String()})
-		if err != nil {
-			return m, err
-		}
-		if len(clean[0]) > limit+recordSlack {
+		got = append(got, fetched{file, out.String()})
+	}
+	texts := make([]string, len(got))
+	for i, g := range got {
+		texts[i] = g.text
+	}
+	cleaned, err := RedactAll(ctx, texts)
+	if err != nil {
+		return m, err
+	}
+	for i, g := range got {
+		file, clean := g.file, cleaned[i]
+		if len(clean) > limit+recordSlack {
 			m.Withheld++
 			continue
 		}
-		file.Bytes = len(clean[0])
+		file.Bytes = len(clean)
 		line := recordIndex([]RecordFile{file})
 		if !recordFits(dataBytes, len(index), file.Bytes, len(line)) {
 			m.Stopped = "total bytes"
-			m.Skipped += len(files) - i
+			m.Skipped += len(got) - i
 			break
 		}
-		if err = writeReadonlyInput(filepath.Join(tmp, file.Name), []byte(clean[0])); err != nil {
+		if err = writeReadonlyInput(filepath.Join(tmp, file.Name), []byte(clean)); err != nil {
 			return m, err
 		}
 		m.Files = append(m.Files, file)

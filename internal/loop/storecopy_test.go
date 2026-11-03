@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -176,5 +177,42 @@ func TestStoreCopyNotesUseTheSameThirtyDayWindow(t *testing.T) {
 	db := inputPlainDB(t, target)
 	if err := db.QueryRowContext(ctx, "SELECT id FROM notes").Scan(&id); err != nil || id != "inside" || manifest.Notes != 1 {
 		t.Fatalf("notes window: %s count %d %v", id, manifest.Notes, err)
+	}
+}
+
+// A scrubber start costs most of a second: a store of a thousand events is copied in a few starts, and a note whose
+// id the scrubber would change is left out of the copy.
+func TestStoreCopyScrubsInFewStartsAndScrubsNoteIds(t *testing.T) {
+	ctx := context.Background()
+	counter := filepath.Join(t.TempDir(), "starts")
+	inputScrubber(t, "echo x >> '"+counter+"'\nsed -e 's/AKIA[A-Z0-9]*EXAMPLE/[masked]/g' -e 's/marker-7f3a/[masked]/g'")
+	until := time.Date(2026, 1, 31, 12, 0, 0, 0, time.UTC)
+	var events []store.Event
+	for i := 0; i < 1000; i++ {
+		events = append(events, store.Event{Source: "fixture", SourceKey: "k" + strconv.Itoa(i), TS: until.Add(-time.Hour), Kind: "record", Summary: "neutral summary " + strconv.Itoa(i)})
+	}
+	source := inputStore(t, events)
+	st, err := store.Open(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []store.Note{{ID: "plain-id", Kind: store.NoteDecided, Title: "kept", At: until.Add(-time.Hour)},
+		{ID: "id-marker-7f3a", Kind: store.NoteDecided, Title: "left out", At: until.Add(-time.Hour)}} {
+		if _, err := st.PutNote(ctx, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.Close()
+	target := filepath.Join(t.TempDir(), "store.sqlite")
+	if _, err := StoreCopy(ctx, StoreCopyOptions{Source: source, Destination: target, Until: until}); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(counter)
+	if starts := strings.Count(string(b), "x"); starts > 8 {
+		t.Fatalf("%d scrubber starts for 1000 events", starts)
+	}
+	var notes int
+	if err := inputPlainDB(t, target).QueryRow("SELECT count(*) FROM notes").Scan(&notes); err != nil || notes != 1 {
+		t.Fatalf("notes in the copy: %d %v", notes, err)
 	}
 }
