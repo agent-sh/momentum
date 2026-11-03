@@ -7,6 +7,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/agent-sh/momentum/internal/loop"
 	"github.com/agent-sh/momentum/internal/paths"
 )
 
@@ -55,5 +56,26 @@ func TestASecondEvaluationFailsOnTheLock(t *testing.T) {
 	code, _, stderr := momentum("loop", "eval", "--golden", path)
 	if code == 0 || !strings.Contains(stderr, "another evaluation runs now") {
 		t.Fatalf("a second evaluation: %d %q", code, stderr)
+	}
+}
+
+// --split selects the held-out tasks, the others, or all of them, and --task narrows that selection.
+func TestTheSplitSelectsItsTasks(t *testing.T) {
+	all := []loop.GoldenTask{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	held := map[string]bool{"b": true}
+	ids := func(ts []loop.GoldenTask) string {
+		var out []string
+		for _, t := range ts {
+			out = append(out, t.ID)
+		}
+		return strings.Join(out, ",")
+	}
+	for split, want := range map[string]string{"all": "a,b,c", "held-out": "b", "development": "a,c"} {
+		if got, unknown := pickTasks(all, held, nil, split); ids(got) != want || len(unknown) != 0 {
+			t.Errorf("%s: %s %v", split, ids(got), unknown)
+		}
+	}
+	if got, unknown := pickTasks(all, held, map[string]bool{"a": true, "b": true}, "development"); ids(got) != "a" || !unknown["b"] {
+		t.Errorf("a named held-out task in the development split: %s %v", ids(got), unknown)
 	}
 }

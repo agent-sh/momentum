@@ -79,23 +79,13 @@ func loopEval(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	if *split != "all" && len(held) == 0 {
 		return usageError{"a selected split needs --held-out task ids"}
 	}
-	var picked []loop.GoldenTask
 	want := map[string]bool{}
 	for _, t := range strings.Split(*tasks, ",") {
 		if t = strings.TrimSpace(t); t != "" {
 			want[t] = true
 		}
 	}
-	allTasks, unknown := len(want) == 0, maps.Clone(want)
-	for _, t := range all {
-		if *split == "held-out" && !held[t.ID] || *split == "development" && held[t.ID] {
-			continue
-		}
-		if allTasks || want[t.ID] {
-			picked = append(picked, t)
-			delete(unknown, t.ID)
-		}
-	}
+	picked, unknown := pickTasks(all, held, want, *split)
 	for t := range unknown {
 		return usageError{fmt.Sprintf("task %q is absent from the selected split in %s", t, *golden)}
 	}
@@ -236,4 +226,20 @@ func lockEval(db string) (func(), error) {
 		return nil, err
 	}
 	return func() { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
+}
+
+// pickTasks is the evaluation's selection: the split's tasks (the held-out ones, the others, or all), narrowed to the
+// ids wanted when any are named. unknown holds the wanted ids the split does not have.
+func pickTasks(all []loop.GoldenTask, held, want map[string]bool, split string) (picked []loop.GoldenTask, unknown map[string]bool) {
+	unknown = maps.Clone(want)
+	for _, t := range all {
+		if split == "held-out" && !held[t.ID] || split == "development" && held[t.ID] {
+			continue
+		}
+		if len(want) == 0 || want[t.ID] {
+			picked = append(picked, t)
+			delete(unknown, t.ID)
+		}
+	}
+	return picked, unknown
 }
