@@ -309,7 +309,7 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 		if err := os.MkdirAll(filepath.Dir(d), 0700); err != nil {
 			return Package{}, err
 		}
-		if err := os.RemoveAll(d); err != nil {
+		if err := removeAll(d); err != nil {
 			return Package{}, err
 		}
 	}
@@ -354,15 +354,15 @@ func (s *Ship) freshRunClone(ctx context.Context, p Package) error {
 	if err := s.assignedAuthority(ctx); err != nil {
 		return err
 	}
-	if err := os.RemoveAll(p.Work); err != nil {
+	if err := removeAll(p.Work); err != nil {
 		return err
 	}
 	// Build a fresh clone in host-only storage, before exposing it to a run.
 	staging := filepath.Join(s.Dir, "host", "."+p.Case+"-build")
-	if err := os.RemoveAll(staging); err != nil {
+	if err := removeAll(staging); err != nil {
 		return err
 	}
-	defer os.RemoveAll(staging)
+	defer func() { _ = removeAll(staging) }()
 	if err := s.cloneConfined(ctx, p.Host, staging); err != nil {
 		return err
 	}

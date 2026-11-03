@@ -125,7 +125,7 @@ func (s Sandbox) Run(ctx context.Context, dir string, words []string, extra []st
 	if err != nil {
 		return Outcome{}, err
 	}
-	defer os.RemoveAll(scratch)
+	defer func() { _ = removeAll(scratch) }()
 	if err := os.Mkdir(filepath.Join(scratch, "out"), 0700); err != nil {
 		return Outcome{}, err
 	}

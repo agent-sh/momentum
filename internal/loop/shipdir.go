@@ -37,3 +37,15 @@ func (s *Ship) lock(ctx context.Context, caseID string) (func(), error) {
 	}
 	return func() { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
 }
+
+// removeAll removes a tree a sandboxed program may have written: it restores the owner's access to every directory
+// first (a test can leave a directory it made mode 000, which RemoveAll cannot enter) and never follows a link.
+func removeAll(path string) error {
+	_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
+		if d != nil && d.IsDir() {
+			_ = os.Chmod(p, 0o700)
+		}
+		return nil
+	})
+	return os.RemoveAll(path)
+}

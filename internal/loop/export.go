@@ -17,7 +17,9 @@ import (
 // Archive honors no repository or machine attributes: even export-ignore and export-subst are inert.
 func (s *Ship) export(ctx context.Context, p Package, name, treeish string) (string, error) {
 	dir := filepath.Join(s.Dir, "exports", "."+name+"-"+p.Case)
-	s.unexport(p, dir)
+	if err := removeAll(dir); err != nil {
+		return "", fmt.Errorf("a scratch tree of an earlier step cannot be removed: %w", err)
+	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", err
 	}
@@ -116,11 +118,11 @@ func extractTree(dir string, reader *tar.Reader) error {
 }
 
 func (s *Ship) unexport(p Package, dir string) {
-	_ = os.RemoveAll(dir)
+	_ = removeAll(dir)
 }
 
 func (s *Ship) dropRollback(p Package, dir string) {
 	_, _ = s.git(context.Background(), p.Host, "worktree", "remove", "--force", dir)
-	_ = os.RemoveAll(dir)
+	_ = removeAll(dir)
 	_, _ = s.git(context.Background(), p.Host, "worktree", "prune")
 }

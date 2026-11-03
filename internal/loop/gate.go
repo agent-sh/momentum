@@ -195,8 +195,11 @@ func defaultBranch(ctx context.Context, dir string) (string, error) {
 // of its own: nothing a change compiles in can empty it.
 func Protected() []string {
 	return []string{"internal/detect/", "internal/loop/", "internal/sandbox/", "internal/measure/", "internal/store/", "internal/source/", "internal/plain/",
-		"internal/config/", "internal/paths/", "cmd/momentum/", "go.mod", "go.sum", ".github/", "SPEC.md", "AGENTS.md"}
+		"internal/config/", "internal/paths/", "internal/tracked/", "cmd/momentum/", "go.mod", "go.sum", ".github/", "SPEC.md", "AGENTS.md"}
 }
+
+// ciPaths are the CI configurations of the hosts the loop could push to.
+var ciPaths = []string{".github/", ".circleci/", ".buildkite/", ".gitlab-ci.yml", "Jenkinsfile", "azure-pipelines.yml", ".travis.yml"}
 
 // SelfRepo is momentum's own repository, where Protected applies.
 const SelfRepo = "agent-sh/momentum"
@@ -204,6 +207,15 @@ const SelfRepo = "agent-sh/momentum"
 // CheckPaths refuses a change to a repository that touches what the loop may never change there: changed holds
 // every path a change adds, removes or edits (both sides of a move).
 func CheckPaths(t Target, changed []string) error {
+	// A repository's CI runs from the tree a pushed branch holds, with that repository's secrets, before anyone has
+	// reviewed the change: no repository's CI configuration is the loop's to change.
+	for _, c := range changed {
+		for _, p := range ciPaths {
+			if c == strings.TrimSuffix(p, "/") || strings.HasPrefix(c, p) {
+				return refused("%s is CI configuration: it runs on a pushed branch before review, never the loop's to change", c)
+			}
+		}
+	}
 	if !strings.EqualFold(t.Repo, SelfRepo) {
 		return nil
 	}
