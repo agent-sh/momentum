@@ -436,3 +436,18 @@ func TestAHistoricalCloneTheScrubberWouldChangeIsLeftOut(t *testing.T) {
 		t.Fatalf("the refused clone was left on disk: %d entries", len(entries))
 	}
 }
+
+// Only a refusal of the scrubber leaves a repository out: any other failure of a clone fails the task's inputs, and a
+// refusal is listed in the manifest.
+func TestOnlyAScrubberRefusalLeavesARepositoryOut(t *testing.T) {
+	e, task := evalFixture(t)
+	end, _ := e.snapshotEnd(context.Background(), task)
+	dir := t.TempDir()
+	broken := filepath.Join(dir, "broken") // not a repository at all
+	if err := os.MkdirAll(broken, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := cloneRepositoriesCounted(context.Background(), []string{broken}, end, filepath.Join(dir, "repos")); err == nil {
+		t.Fatal("a directory that is no repository was left out as a refusal")
+	}
+}

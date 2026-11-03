@@ -401,7 +401,7 @@ func (e *Eval) buildMaster(ctx context.Context, tasks []GoldenTask) (string, err
 	for _, t := range tasks {
 		end, err := e.snapshotEnd(ctx, t)
 		if err != nil {
-			return "", err
+			continue // that task fails alone, when its own inputs are built
 		}
 		if first.IsZero() || end.Before(first) {
 			first = end

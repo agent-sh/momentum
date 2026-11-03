@@ -1,11 +1,11 @@
 package loop
 
 import (
-	"errors"
 	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -33,7 +33,7 @@ type RepoClone struct {
 
 // errNeedsScrubbing says the scrubber would change something a clone holds (an object, a ref or its configuration):
 // such a repository is left out of the inputs and counted, never published.
-var errNeedsScrubbing = errors.New("the scrubber would change what the clone holds")
+var errNeedsScrubbing = errors.New("clone object needs scrubbing")
 
 // CloneRepos makes independent, history-preserving clones for /ro/repos/NAME.
 // Git's --no-local transport copies objects, so source maintenance cannot change

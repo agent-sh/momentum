@@ -1,10 +1,10 @@
 package loop
 
 import (
-	"errors"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"github.com/agent-sh/momentum/internal/store"
 	"io"

@@ -234,7 +234,9 @@ func TestStoreCopyFromAMasterEqualsTheDirectCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, n := range []store.Note{{ID: "early", Kind: store.NoteDecided, Title: "early", At: end.Add(-10 * 24 * time.Hour)},
-		{ID: "late", Kind: store.NoteDecided, Title: "late", At: end.Add(-7 * 24 * time.Hour), Done: end.Add(-6 * 24 * time.Hour)}} {
+		{ID: "late", Kind: store.NoteDecided, Title: "late", At: end.Add(-7 * 24 * time.Hour), Done: end.Add(-6 * 24 * time.Hour)},
+		{ID: "future", Kind: store.NoteDecided, Title: "future", At: end.Add(-2 * 24 * time.Hour)},
+		{ID: "doneafter", Kind: store.NoteDecided, Title: "done after the end", At: end.Add(-8 * 24 * time.Hour), Done: end.Add(-time.Hour)}} {
 		_ = i
 		if _, err := st.PutNote(ctx, n); err != nil {
 			t.Fatal(err)
@@ -288,7 +290,7 @@ func TestStoreCopyFromAMasterEqualsTheDirectCopy(t *testing.T) {
 		rows.Close()
 		return b.String()
 	}
-	if a, b := dump(direct), dump(cut); a != b || !strings.Contains(a, "n|late|") {
+	if a, b := dump(direct), dump(cut); a != b || !strings.Contains(a, "n|late|") || strings.Contains(a, "n|future|") || !strings.Contains(a, "n|doneafter|done after the end|0") {
 		t.Fatalf("the cut from a master differs from the direct copy:\n%s\n---\n%s", a, b)
 	}
 }
