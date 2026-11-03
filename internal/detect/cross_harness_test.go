@@ -21,9 +21,6 @@ func TestUnflaggedFailuresAcrossHarnesses(t *testing.T) {
 		{"hermes", "terminal", `{"status":"error","error":"marker-7f3a: permission denied"}`},
 		{"hermes", "terminal", `{"status":"error","error":{"message":"marker-7f3a: permission denied"}}`},
 		{"hermes", "terminal", `{"status":"error","message":"marker-7f3a: permission denied"}`},
-		{"opencode", "bash", "Exit code: 1 cat: neutral.txt: No such file or directory"},
-		{"grok", "bash", "Exit code: 1 cat: neutral.txt: No such file or directory"},
-		{"kimi", "Shell", "Exit code: 1 cat: neutral.txt: No such file or directory"},
 	} {
 		t.Run(tc.harness+"/"+tc.tool+"/"+tc.text[:8], func(t *testing.T) {
 			st := testStore(t)
@@ -37,6 +34,30 @@ func TestUnflaggedFailuresAcrossHarnesses(t *testing.T) {
 				t.Fatalf("unflagged failure missed: %d findings, %v", len(fs), err)
 			}
 		})
+	}
+}
+
+// OpenCode, Grok and Kimi readers set the flag from the harness's own status or exit code; their output text is
+// never read for one, so the same words in an unflagged result are no failure.
+func TestNativeFlagsDecideOpenCodeGrokAndKimi(t *testing.T) {
+	for _, tc := range []struct{ harness, tool string }{{"opencode", "bash"}, {"grok", "bash"}, {"kimi", "Bash"}} {
+		for _, flagged := range []bool{true, false} {
+			meta := `{"tool_id":"x"}`
+			if flagged {
+				meta = `{"is_error":true,"tool_id":"x"}`
+			}
+			st := testStore(t)
+			for i := range 3 {
+				e := ev(store.Transcripts, fmt.Sprintf("s%d", i%2), "tool_result", store.ActorTool, tc.tool,
+					"cat: neutral.txt: No such file or directory\nthe script returns exit code 1 when it is missing", meta, t0.Add(time.Duration(i)*time.Minute))
+				e.Harness = tc.harness
+				put(t, st, e)
+			}
+			fs, err := (Failures{}).Detect(context.Background(), st, week())
+			if err != nil || (len(fs) == 1) != flagged || len(fs) > 1 {
+				t.Fatalf("%s flagged=%v: %d findings, %v", tc.harness, flagged, len(fs), err)
+			}
+		}
 	}
 }
 
@@ -130,5 +151,20 @@ func TestJSONFileContentAndWorkFailuresExcluded(t *testing.T) {
 		if fs, err := (Failures{}).Detect(context.Background(), st, week()); err != nil || len(fs) != 0 {
 			t.Fatalf("ordinary content or work failure counted: %s %d %v", tc.harness, len(fs), err)
 		}
+	}
+}
+
+// A failed Grok search whose wrapper says nothing of what failed is not keyed by the wrapper's shape: unrelated
+// errors would merge into one case.
+func TestAWrapperWithoutAMessageIsNotKeyedByItsShape(t *testing.T) {
+	st := testStore(t)
+	for i, pattern := range []string{"marker-7f3a-one", "marker-7f3a-two", "marker-7f3a-three"} {
+		e := ev(store.Transcripts, fmt.Sprintf("s%d", i%2), "tool_result", store.ActorTool, "grep",
+			fmt.Sprintf(`{"type":"GrepSearch","exit_code":2,"match_count":0,"pattern":%q}`, pattern), `{"is_error":true,"tool_id":"x"}`, t0.Add(time.Duration(i)*time.Minute))
+		e.Harness = "grok"
+		put(t, st, e)
+	}
+	if fs, err := (Failures{}).Detect(context.Background(), st, week()); err != nil || len(fs) != 0 {
+		t.Fatalf("unrelated search errors merged into %d cases: %v", len(fs), err)
 	}
 }

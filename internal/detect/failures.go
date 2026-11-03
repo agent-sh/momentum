@@ -356,6 +356,10 @@ func FailureOf(harness, tool, text, call string) (FailureKey, bool) {
 			if output != "" && isShell(tool) {
 				return execKey(output, callPrograms(call))
 			}
+			// a wrapper with nothing in it that says what failed is not keyed by its shape: unrelated errors would merge
+			if message == "" && (result.Type != "" || result.Exit != nil || result.Matches != nil) {
+				return FailureKey{}, false
+			}
 		}
 	}
 	wrapped := strings.HasPrefix(text, "<tool_use_error>")

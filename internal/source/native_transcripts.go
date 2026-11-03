@@ -469,7 +469,7 @@ func nativePlace(e evidence.Event) string {
 }
 
 func readOnlyDSN(path string) string {
-	return (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro"}).String()
+	return (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&_pragma=busy_timeout(5000)"}).String()
 }
 
 func firstOf(texts ...string) string {

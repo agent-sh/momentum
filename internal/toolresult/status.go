@@ -38,8 +38,11 @@ var (
 func Cancelled(text string) bool { return cancelled.MatchString(strings.TrimSpace(text)) }
 
 // Each harness names its shell tools here. Claude Code and pi have native error
-// flags, so their output never supplies a missing flag. Other tools return data
-// and require native status. Codex's patch tool reports refusals in plain text.
+// flags, and so do the readers of OpenCode (its exit code and status), Grok (its
+// status and envelope) and Kimi (its error flag): their output never supplies a
+// missing flag. Codex and Hermes write a failure into the result's text, and
+// only theirs is read for it. Other tools return data and require native status.
+// Codex's patch tool reports refusals in plain text.
 var harnessTools = map[string]struct {
 	shells []string
 	infer  bool
@@ -49,9 +52,9 @@ var harnessTools = map[string]struct {
 	"pi":       {shells: []string{"bash"}},
 	"codex":    {shells: []string{"exec", "exec_command", "local_shell", "write_stdin"}, infer: true, plain: []string{"apply_patch"}},
 	"hermes":   {shells: []string{"terminal", "execute_code"}, infer: true},
-	"opencode": {shells: []string{"bash"}, infer: true},
-	"grok":     {shells: []string{"run_terminal_command", "bash"}, infer: true},
-	"kimi":     {shells: []string{"shell"}, infer: true},
+	"opencode": {shells: []string{"bash"}},
+	"grok":     {shells: []string{"run_terminal_command", "bash"}},
+	"kimi":     {shells: []string{"bash", "shell"}},
 }
 
 // Failed reads harness headers, tool JSON and explicit refusals. flagged is the
@@ -77,9 +80,12 @@ func Failed(harness, tool, text string, flagged bool) bool {
 	}
 	// Only a header before Output names the harness's exit, not a command's
 	// own output. Kimi and Grok may put the code first without Output.
+	// Without an Output marker the exit is read only when the text starts with it.
 	header := text
 	if i := strings.Index(strings.ToLower(header), "output:"); i >= 0 {
 		header = header[:i]
+	} else if loc := exit.FindStringIndex(header); loc != nil && strings.TrimSpace(header[:loc[0]]) != "" {
+		header = ""
 	}
 	if m := exit.FindStringSubmatch(header); m != nil {
 		n, _ := strconv.Atoi(m[1])

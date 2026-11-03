@@ -168,8 +168,9 @@ func (s Transcripts) readOpenCodeJob(ctx context.Context, j *job, t *tally, add 
 		}
 		var msg map[string]any
 		if json.Unmarshal([]byte(data), &msg) != nil {
-			t.fail(j.path, errors.New("invalid opencode message record"))
-			return
+			// one bad record is skipped and counted, as in the line formats; the rest of the session is stored
+			p.skips = append(p.skips, fmt.Sprintf("%s#message:%s", j.path, id))
+			continue
 		}
 		if !session.v2 {
 			parts, err := db.QueryContext(ctx, `SELECT data FROM part WHERE message_id=? ORDER BY time_created,id`, id)
@@ -187,9 +188,8 @@ func (s Transcripts) readOpenCodeJob(ctx context.Context, j *job, t *tally, add 
 				}
 				var part map[string]any
 				if json.Unmarshal([]byte(raw), &part) != nil {
-					parts.Close()
-					t.fail(j.path, errors.New("invalid opencode part"))
-					return
+					p.skips = append(p.skips, fmt.Sprintf("%s#part:%s", j.path, id))
+					continue
 				}
 				content = append(content, part)
 			}
@@ -294,6 +294,12 @@ func (s *nativeState) openCode(typ string, msg map[string]any, at time.Time, v2 
 					// native status sets its flag; shell output is checked
 					// by the shared writer before clipping.
 					e.IsError = status == "error"
+					// A shell tool's result is "completed" whatever the command's exit: the code is in the metadata.
+					if meta := object(st["metadata"]); meta != nil {
+						if _, has := meta["exit"]; has && number(meta, "exit") != 0 {
+							e.IsError = true
+						}
+					}
 					out = append(out, e)
 				}
 			}

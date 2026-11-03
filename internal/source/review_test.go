@@ -3,6 +3,7 @@ package source
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -327,5 +328,50 @@ func TestNativeCallNamesAndCompletedState(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A shell tool of OpenCode reports "completed" whatever the command's exit: the code is in the metadata. A success
+// whose output merely mentions an exit code is no failure.
+func TestOpenCodeShellExitComesFromItsMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		exit   int
+		output string
+		want   bool
+	}{{127, "bash: foo-1: command not found", true}, {0, "notes: the script returns exit code 1 when notes.txt is missing", false}} {
+		home := t.TempDir()
+		db, _ := openCodeFixture(t, home)
+		data := fmt.Sprintf(`{"content":[{"type":"tool","id":"call-1","name":"bash","state":{"status":"completed","input":{"command":"foo-1"},"output":%q,"metadata":{"exit":%d}}}]}`, tc.output, tc.exit)
+		if _, err := db.Exec(`UPDATE session_message SET data=? WHERE id='message-2'`, data); err != nil {
+			t.Fatal(err)
+		}
+		st := openStore(t)
+		ingest(t, transcripts(home), st)
+		found := false
+		for _, e := range all(t, st, store.Transcripts) {
+			if e.Kind == "tool_result" {
+				found = true
+				if got := strings.Contains(e.Meta, `"is_error":true`); got != tc.want {
+					t.Fatalf("exit %d: is_error=%v, want %v", tc.exit, got, tc.want)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("no result stored")
+		}
+	}
+}
+
+// One message with invalid JSON is skipped and counted; the rest of the session is stored.
+func TestOpenCodeInvalidRecordIsSkipped(t *testing.T) {
+	home := t.TempDir()
+	db, _ := openCodeFixture(t, home)
+	if _, err := db.Exec(`INSERT INTO session_message VALUES ('message-3','session-marker-7f3a','assistant',3,1780000002000,1780000002000,'{not json')`); err != nil {
+		t.Fatal(err)
+	}
+	st := openStore(t)
+	res := ingest(t, transcripts(home), st)
+	if len(all(t, st, store.Transcripts)) != 3 || res.Skipped != 1 {
+		t.Fatalf("a bad record stopped its session: %d events, %+v", len(all(t, st, store.Transcripts)), res)
 	}
 }

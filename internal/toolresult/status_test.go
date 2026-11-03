@@ -38,15 +38,32 @@ func TestHarnessShellTools(t *testing.T) {
 	for _, tc := range []struct{ harness, tool string }{
 		{"claude", "Bash"}, {"codex", "exec"}, {"codex", "exec_command"}, {"codex", "write_stdin"},
 		{"hermes", "terminal"}, {"hermes", "execute_code"}, {"pi", "bash"},
-		{"opencode", "bash"}, {"grok", "run_terminal_command"}, {"kimi", "Shell"},
+		{"opencode", "bash"}, {"grok", "run_terminal_command"}, {"kimi", "Bash"},
 	} {
 		t.Run(tc.harness+"/"+tc.tool, func(t *testing.T) {
 			if !IsShell(tc.tool) {
 				t.Fatal("shell is not recognized")
 			}
-			if tc.harness != "claude" && tc.harness != "pi" && !Failed(tc.harness, tc.tool, "Exit code: 1 cat: notes.txt: No such file or directory", false) {
-				t.Fatal("shell's exit not inferred")
+			inferred := Failed(tc.harness, tc.tool, "Exit code: 1 cat: notes.txt: No such file or directory", false)
+			if want := tc.harness == "codex" || tc.harness == "hermes"; inferred != want {
+				t.Fatalf("shell's exit inferred=%v, want %v", inferred, want)
+			}
+			// the same words inside a command's own output are no exit
+			if Failed(tc.harness, tc.tool, "the script returns exit code 1 when notes.txt is missing", false) || Failed(tc.harness, tc.tool, "error: marker-7f3a is in the log", false) && tc.harness != "codex" && tc.harness != "hermes" {
+				t.Fatalf("%s/%s read a command's own output as a failure", tc.harness, tc.tool)
 			}
 		})
+	}
+}
+
+func TestCancelledAndPatchRefusalsAreRead(t *testing.T) {
+	if Failed("codex", "exec_command", "Tool execution cancelled by user", true) {
+		t.Error("a flagged cancellation was a failure")
+	}
+	if !Failed("codex", "apply_patch", "apply_patch verification failed: invalid hunk", false) {
+		t.Error("a patch refusal in plain text was no failure")
+	}
+	if Failed("codex", "exec_command", "Exit code: 0\nOutput: the script returns exit code 1", false) {
+		t.Error("an exit of 0 with words in its output was a failure")
 	}
 }
