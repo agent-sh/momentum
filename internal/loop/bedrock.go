@@ -285,11 +285,9 @@ func newRelay(target *url.URL, budget float64, transport http.RoundTripper, turn
 				r.refuse(w, "no bounded price for this model", 403)
 				return
 			}
-			var input struct {
-				MaxTokens *int64 `json:"max_tokens"`
-			}
-			if json.Unmarshal(body, &input) != nil {
-				r.refuse(w, "invalid model request", 400)
+			input, err := requestFields(body)
+			if err != nil {
+				r.refuse(w, "invalid model request: "+err.Error(), 400)
 				return
 			}
 			if !textRequest(body) {
@@ -376,6 +374,54 @@ func newRelay(target *url.URL, budget float64, transport http.RoundTripper, turn
 		proxy.ServeHTTP(w, req)
 	}), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second}
 	return r
+}
+
+// requestFields reads the one field the reservation depends on the way the broker does: by its exact key. Go's decoder
+// matches keys without regard to case and lets the last of two equal keys win, so a body that holds "max_tokens"
+// twice, or in another case, would be priced at one value and forwarded with another. Such a body is refused.
+func requestFields(body []byte) (struct{ MaxTokens *int64 }, error) {
+	var out struct{ MaxTokens *int64 }
+	dec := json.NewDecoder(bytes.NewReader(body))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return out, errors.New("the body is not a JSON object")
+	}
+	seen := map[string]bool{}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return out, err
+		}
+		key, _ := keyTok.(string)
+		folded := strings.ToLower(key)
+		if seen[folded] {
+			return out, errors.New("a key appears twice, or in two cases")
+		}
+		seen[folded] = true
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return out, err
+		}
+		if folded == "max_tokens" {
+			if key != "max_tokens" {
+				return out, errors.New("max_tokens is read by its exact key")
+			}
+			var n int64
+			if string(value) != "null" {
+				if err := json.Unmarshal(value, &n); err != nil {
+					return out, errors.New("max_tokens is not an integer")
+				}
+				out.MaxTokens = &n
+			}
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return out, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return out, errors.New("data follows the JSON object")
+	}
+	return out, nil
 }
 
 // Text JSON is the premise of the byte-based input reservation. Tool inputs and

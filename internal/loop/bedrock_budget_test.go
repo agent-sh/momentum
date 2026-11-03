@@ -334,3 +334,30 @@ func TestAResetAfterTheRequestWasSentIsCharged(t *testing.T) {
 		t.Fatalf("a reset was free: spent %v, admitted %d, error answers %d", spent, admitted, r.errorAnswers())
 	}
 }
+
+// The reservation reads max_tokens by its exact key, once: a body that holds it twice, or in another case, would be
+// priced at one value and forwarded with another, so it is refused.
+func TestARequestWithAmbiguousMaxTokensIsRefused(t *testing.T) {
+	var calls atomic.Int64
+	r := budgetRelay(t, 1, func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return brokerResponse(req, []byte(`{}`)), nil
+	})
+	for _, body := range []string{
+		`{"max_tokens":128000,"Max_Tokens":1,"messages":[]}`,
+		`{"max_tokens":128000,"max_tokens":1,"messages":[]}`,
+		`{"MAX_TOKENS":1,"messages":[]}`,
+		`{"max_tokens":"1","messages":[]}`,
+		`{"max_tokens":1,"messages":[]} {"x":1}`,
+	} {
+		if rec := relayRequest(r, strings.NewReader(body), "invoke-with-response-stream"); rec.Code != 400 {
+			t.Errorf("%s answered %d", body, rec.Code)
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("an ambiguous body reached the broker %d times", calls.Load())
+	}
+	if rec := relayRequest(r, strings.NewReader(textRequestBody(10, 1000)), "invoke-with-response-stream"); rec.Code == 400 {
+		t.Fatalf("an honest body was refused: %d", rec.Code)
+	}
+}
