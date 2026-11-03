@@ -32,7 +32,8 @@ const (
 	HistoryCommits   = 500       // commits in a log
 	HistoryWindow    = StoreWindow
 	DiffCommits      = 30        // commits whose diffs a run gets, per repository
-	DiffMax          = 128 << 10 // bytes of one commit's diff
+	DiffMax          = 128 << 10 // bytes of one commit's diff a run gets
+	DiffReadMax      = 4 << 20   // a diff is scrubbed whole, so a larger one is left out
 	DiffsMax         = 2 << 20   // bytes of all diffs of a run
 	DiffPaths        = 25        // evidence paths followed, per repository
 	snapshotChunk    = 4 << 20   // bytes of files scrubbed in one call
@@ -148,7 +149,7 @@ func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) 
 			continue
 		}
 		if err := cloneSource(ctx, source, append(append([]string(nil), o.LoopDirs...), o.Destination, o.LogDir)); err != nil {
-			result.Error = err.Error()
+			result.Error = reason(err)
 			results = append(results, result)
 			continue
 		}
@@ -194,7 +195,7 @@ func SnapshotFacts(ctx context.Context, src, dst, logPath string, cache *ScrubCa
 		return result, fmt.Errorf("%s", result.Error)
 	}
 	if err := cloneSource(ctx, src, []string{dst, logPath}); err != nil {
-		result.Error = err.Error()
+		result.Error = reason(err)
 		return result, err
 	}
 	result, err = snapshotOne(ctx, src, dst, logPath, SnapshotRepoMax, cache, since)
@@ -646,22 +647,16 @@ func SnapshotDiffs(ctx context.Context, repos []RepoInput, texts []string, dst s
 		for _, hash := range strings.Fields(string(listed)) {
 			show := []string{"--literal-pathspecs", "-c", "core.quotepath=false", "show", "--no-ext-diff", "--no-textconv", "--no-color", "--patch", "--date=iso-strict",
 				"--format=commit %H%n%aI %an%n%s", hash, "--"}
-			diff, over, derr := hostInputGitCapped(ctx, repo.Source, DiffMax, append(show, paths[name]...)...)
+			diff, over, derr := hostInputGitCapped(ctx, repo.Source, DiffReadMax, append(show, paths[name]...)...)
 			if derr != nil {
 				m.Error = derr.Error()
 				continue
 			}
 			text := string(diff)
 			if over {
-				if i := strings.LastIndexByte(text, '\n'); i > 0 {
-					text = text[:i+1]
-				}
-				text += fmt.Sprintf("[cut: this diff is larger than %d KiB]\n", DiffMax>>10)
+				// scrubbed whole, never a cut piece: a secret that spans lines must reach the scrubber with its ends
+				text = fmt.Sprintf("commit %s\n[diff left out: larger than %d MiB]\n", hash, DiffReadMax>>20)
 			}
-			if total+int64(len(text)) > DiffsMax {
-				break
-			}
-			total += int64(len(text))
 			texts, labels = append(texts, text), append(labels, hash[:12])
 		}
 		if len(texts) == 0 {
@@ -671,11 +666,28 @@ func SnapshotDiffs(ctx context.Context, repos []RepoInput, texts []string, dst s
 		if cerr != nil {
 			return m, cerr
 		}
+		// the cut is made on the scrubbed text
+		changed := make([]bool, len(clean))
+		for i, t := range clean {
+			changed[i] = t != texts[i]
+			if len(t) <= DiffMax {
+				continue
+			}
+			t = t[:DiffMax]
+			if j := strings.LastIndexByte(t, '\n'); j > 0 {
+				t = t[:j+1]
+			}
+			clean[i] = t + fmt.Sprintf("[cut: this diff is larger than %d KiB]\n", DiffMax>>10)
+		}
 		if err = os.MkdirAll(filepath.Join(dst, name), 0o755); err != nil {
 			return m, err
 		}
 		for i, t := range clean {
-			if t != texts[i] {
+			if total+int64(len(t)) > DiffsMax {
+				break
+			}
+			total += int64(len(t))
+			if changed[i] {
 				m.Masked++
 			}
 			if err = writeLog(filepath.Join(dst, name, fmt.Sprintf("%03d-%s.diff", i+1, labels[i])), t); err != nil {
@@ -688,16 +700,17 @@ func SnapshotDiffs(ctx context.Context, repos []RepoInput, texts []string, dst s
 	return m, nil
 }
 
-// reason is an error's text for a manifest: an operating-system error names its operation and cause, never the host
-// path it failed on.
+// reason is an error's text for a manifest: the host path an operating-system error failed on is replaced, so the
+// operation and its cause remain without a path.
 func reason(err error) string {
+	text := err.Error()
 	var pe *fs.PathError
-	if errors.As(err, &pe) {
-		return pe.Op + ": " + pe.Err.Error()
+	if errors.As(err, &pe) && pe.Path != "" {
+		text = strings.ReplaceAll(text, pe.Path, "path")
 	}
 	var le *os.LinkError
 	if errors.As(err, &le) {
-		return le.Op + ": " + le.Err.Error()
+		text = strings.ReplaceAll(strings.ReplaceAll(text, le.Old, "path"), le.New, "path")
 	}
-	return err.Error()
+	return text
 }

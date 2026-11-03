@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -273,5 +274,61 @@ func TestSummaryNamesWhatEachRunGot(t *testing.T) {
 	}
 	if strings.ContainsAny(got, "\n\r") {
 		t.Fatal("summary spans lines")
+	}
+}
+
+// A diff is scrubbed whole and cut after: a block that spans the cut must reach the scrubber with both ends, or its
+// body would be published unmasked. A diff too large to scrub whole is left out with a note.
+func TestDiffsAreScrubbedWholeThenCutAndHugeOnesLeftOut(t *testing.T) {
+	// masks a block only when both of its ends are present, as a key scrubber does
+	inputScrubber(t, `sed -z -e 's/AKIA[A-Z0-9]*EXAMPLE/[masked]/g' -e 's/marker-7f3a/[masked]/g' -e 's/BEGIN-block.*END-block/[masked-block]/g'`)
+	parent := t.TempDir()
+	src := filepath.Join(parent, "sample")
+	if err := os.MkdirAll(src, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	inputTestGit(t, src, nil, "init", "-b", "main")
+	write(t, filepath.Join(src, "a.go"), "one\n")
+	inputTestGit(t, src, nil, "add", ".")
+	inputTestGit(t, src, nil, "commit", "-m", "first")
+	write(t, filepath.Join(src, "a.go"), "one\nBEGIN-block\n"+strings.Repeat("body line of the block\n", 20000)+"END-block\n")
+	inputTestGit(t, src, nil, "add", ".")
+	inputTestGit(t, src, nil, "commit", "-m", "second")
+	var names []string
+	for i := 0; i < 6; i++ {
+		name := fmt.Sprintf("big%d.txt", i)
+		names = append(names, name)
+		write(t, filepath.Join(src, name), strings.Repeat("a line of text for the big file\n", 27000))
+	}
+	inputTestGit(t, src, nil, "add", ".")
+	inputTestGit(t, src, nil, "commit", "-m", "third")
+	repos, err := SnapshotRepos(context.Background(), snapOptions(parent, src))
+	if err != nil || repos[0].Error != "" {
+		t.Fatalf("snapshot %v: %v", repos, err)
+	}
+	dst := filepath.Join(parent, "diffs")
+	m, err := SnapshotDiffs(context.Background(), repos, []string{"a.go and " + strings.Join(names, " ")}, dst, defaultSince(), nil)
+	if err != nil || m.Error != "" {
+		t.Fatalf("diffs %+v: %v", m, err)
+	}
+	all, _ := treeText(t, dst)
+	if strings.Contains(all, "BEGIN-block") || strings.Contains(all, "body line of the block") || !strings.Contains(all, "[masked-block]") {
+		t.Fatalf("a block spanning the cut reached a run:\n%.300s", all)
+	}
+	if !strings.Contains(all, "[diff left out: larger than 4 MiB]") {
+		t.Fatalf("a diff over the read limit was not left out:\n%.300s", all)
+	}
+}
+
+func TestRefusalReasonsNameNoHostPath(t *testing.T) {
+	goodInputScrubber(t)
+	parent := t.TempDir()
+	missing := filepath.Join(parent, "gone-repository")
+	got, err := SnapshotRepos(context.Background(), snapOptions(parent, missing))
+	if err != nil || len(got) != 1 || got[0].Error == "" || strings.Contains(got[0].Error, parent) || strings.Contains(got[0].Error, "gone-repository") {
+		t.Fatalf("reason %+v: %v", got, err)
+	}
+	if text := (InputsManifest{Repositories: got}).Summary(); strings.Contains(text, parent) {
+		t.Fatalf("summary carries a host path: %s", text)
 	}
 }

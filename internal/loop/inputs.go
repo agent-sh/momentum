@@ -34,26 +34,6 @@ type passInputs struct {
 	momentum  string
 	cache     *ScrubCache
 	since     time.Time
-	admitted  map[string]error // repositories a build may clone, by name
-}
-
-// buildAdmitted says whether the repository's objects pass the scrubber unchanged, once per pass: a build's clone keeps
-// them, unlike a run's snapshot.
-func (p *passInputs) buildAdmitted(ctx context.Context, name, source string) error {
-	if err, ok := p.admitted[name]; ok {
-		return err
-	}
-	err := checkObjects(ctx, source)
-	if errors.Is(err, errNeedsScrubbing) {
-		err = refused("the repository %s holds history the scrubber would mask, so a build clone of it cannot be mounted", name)
-	}
-	if p.admitted == nil {
-		p.admitted = map[string]error{}
-	}
-	if err == nil || errors.Is(err, ErrRefused) {
-		p.admitted[name] = err
-	}
-	return err
 }
 
 func (p *passInputs) close() {
@@ -337,7 +317,10 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 		return run, err
 	}
 	if err != nil {
-		manifest.Diffs.Error = err.Error()
+		manifest.Diffs.Error = reason(err)
+	}
+	if f := r.pass.cache.Failure(); f != "" && manifest.Store.CacheError == "" {
+		manifest.Store.CacheError = f
 	}
 	raw, err = json.MarshalIndent(manifest, "", "  ")
 	if err != nil {

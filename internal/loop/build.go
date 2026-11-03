@@ -141,13 +141,6 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 			source = repo.Source
 		}
 	}
-	if source != "" {
-		// A run reads a repository as a masked snapshot, but a build gets an independent clone with its history, which
-		// no scrubber has seen: only a repository whose objects the scrubber would not change is built on.
-		if err = r.pass.buildAdmitted(ctx, name, source); err != nil {
-			return Package{}, err
-		}
-	}
 	if name == "" || source == "" {
 		return Package{}, refused("the investigation's repository is not an admitted read_dirs repository")
 	}
@@ -182,6 +175,16 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 		err = r.Ship.freshRunClone(shipContext(ctx, p.Case), p)
 	}
 	if err != nil {
+		return p, err
+	}
+	// A run reads a repository as a masked snapshot, but a build gets this independent clone with its history, which no
+	// scrubber has seen, and it may hold commits the source does not (a fetch of the remote brought them). Only a clone
+	// whose objects the scrubber would not change is mounted.
+	if err = checkCloneObjects(ctx, p.Work); err != nil {
+		if errors.Is(err, errNeedsScrubbing) {
+			removeInputTree(p.Work)
+			return p, refused("the repository %s holds history the scrubber would mask, so a build clone of it cannot be mounted", name)
+		}
 		return p, err
 	}
 	if err = os.MkdirAll(run.Dir, 0700); err != nil {

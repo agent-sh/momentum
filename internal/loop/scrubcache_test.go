@@ -212,3 +212,27 @@ func TestScrubCacheFailureIsReportedAndRowsStillScrubbed(t *testing.T) {
 		t.Fatal("a failed cache file was kept")
 	}
 }
+
+func TestScrubCacheKeepsItsFileWhenAPassIsCancelled(t *testing.T) {
+	countingScrubber(t, "[masked]")
+	path := filepath.Join(t.TempDir(), "scrub-cache.sqlite")
+	cache, err := OpenScrubCache(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = cache.RedactGroups(context.Background(), "x", []string{"a marker-7f3a"}, 1); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err = cache.RedactGroups(ctx, "x", []string{"b", "c"}, 1); err == nil {
+		t.Fatal("a cancelled scrub succeeded")
+	}
+	if cache.Failure() != "" {
+		t.Fatalf("a cancelled pass counted as a cache failure: %s", cache.Failure())
+	}
+	cache.Close(context.Background(), time.Now())
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("a cancelled pass wiped the cache: %v", err)
+	}
+}

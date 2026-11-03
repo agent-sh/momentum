@@ -264,6 +264,9 @@ func (c *ScrubCache) RedactGroups(ctx context.Context, ns string, texts []string
 		}
 	}
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err() // a pass told to stop is not a failure of the cache
+		}
 		// a cache that fails is dropped: scrub without it
 		c.drop("the cache failed while reading")
 		c.mu.Lock()
@@ -283,7 +286,7 @@ func (c *ScrubCache) RedactGroups(ctx context.Context, ns string, texts []string
 		for i, g := range miss {
 			copy(out[g*stride:], clean[i*stride:(i+1)*stride])
 		}
-		if err = c.store(ctx, keys, miss, out, stride, today); err != nil {
+		if err = c.store(ctx, keys, miss, out, stride, today); err != nil && ctx.Err() == nil {
 			c.drop("the cache failed while writing")
 		}
 	}

@@ -96,6 +96,9 @@ func checkObjects(ctx context.Context, dir string) error {
 	flush := func() error {
 		clean, err := RedactAll(cctx, batch)
 		if err != nil {
+			if cctx.Err() != nil {
+				return fmt.Errorf("the object scan ran out of time or was cancelled")
+			}
 			return err
 		}
 		for i, text := range batch {
@@ -213,9 +216,9 @@ func hostInputGitCapped(ctx context.Context, dir string, limit int, args ...stri
 		// Git can print source configuration and object text in diagnostics.
 		// Return only the operation and status, never its raw stderr.
 		if cctx.Err() == context.DeadlineExceeded {
-			return nil, false, fmt.Errorf("input git %s timed out after %s", args[0], gitStepTimeout)
+			return nil, false, fmt.Errorf("input git %s timed out after %s", gitVerb(args), gitStepTimeout)
 		}
-		return nil, false, fmt.Errorf("input git %s failed: %w", args[0], err)
+		return nil, false, fmt.Errorf("input git %s failed: %w", gitVerb(args), err)
 	}
 	if stderr.Over() {
 		return nil, false, fmt.Errorf("input git output exceeds the input limit")
@@ -243,4 +246,17 @@ func noInputLinks(path string) error {
 			return nil
 		}
 	}
+}
+
+// gitVerb is the subcommand of an argument list, past the global options.
+func gitVerb(args []string) string {
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "-c":
+			i++
+		case !strings.HasPrefix(args[i], "-"):
+			return args[i]
+		}
+	}
+	return "command"
 }

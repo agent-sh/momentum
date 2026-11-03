@@ -196,7 +196,7 @@ func TestMovedBaseKeepsPreviousPatchAndScrubbedReview(t *testing.T) {
 	if err := r.Ship.save(&p); err != nil {
 		t.Fatal(err)
 	}
-	base := pushOther(t, f, "main", map[string]string{"notes.txt": "marker-7f3a\n"})
+	base := pushOther(t, f, "main", map[string]string{"notes.txt": "plain notes\n"})
 	second, err := r.prepareRun(ctx, c, c.Family, StepBuild)
 	if err != nil {
 		t.Fatal(err)
@@ -352,14 +352,14 @@ func TestPatchUnitDoesNotRunPlantedHooks(t *testing.T) {
 	}
 }
 
-// A run reads a masked snapshot of a repository whose history holds text the scrubber changes, but a build clones the
-// repository with its history, which nothing scrubbed: that repository is investigated, never built on.
+// A run reads a masked snapshot of a repository, but a build clones the repository with its history (and what a fetch
+// of the remote brought), which nothing scrubbed: a clone whose history holds text the scrubber changes is never mounted.
 func TestBuildRefusesARepositoryWhoseHistoryNeedsMasking(t *testing.T) {
 	ctx := context.Background()
 	r, c := inputRunner(t)
 	f := newRepo(t, nil)
+	// the text is only on the remote: the build's clone fetches it, the source checkout never held it
 	pushOther(t, f, "main", map[string]string{"notes.txt": "marker-7f3a\n"})
-	run(t, f.main, "git", "pull", "-q", "--ff-only")
 	r.Ship = shipWithSandbox(r.Store, f, Sandbox{})
 	r.Ship.Dir = r.Dir
 	r.Inputs.ReadDirs = []string{f.main}
