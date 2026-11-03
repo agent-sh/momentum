@@ -214,7 +214,8 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 		Limits: sandbox.Limits{RuntimeSec: max(1, int(inv.Timeout.Seconds())) + 60},
 		Argv:   append([]string{"/bin/sh", "-c", "printf '%s\\n' '" + witness + "' >&2; exec \"$@\"", "sh", "/opt/claude/claude"}, args...)}
 	if !inv.inputOnly {
-		spec.Env["PATH"] = "/opt/momentum:/usr/bin:/bin"
+		// the read-only binary first, then the PATH the run already has (a build's toolchains are on it)
+		spec.Env["PATH"] = "/opt/momentum:" + firstOf(spec.Env["PATH"], "/usr/bin:/bin")
 	}
 	transcript := filepath.Join(HostDir(inv.Dir), streamName)
 	out, err := exclusiveOutput(HostDir(inv.Dir), streamName)
