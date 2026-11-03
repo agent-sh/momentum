@@ -79,7 +79,7 @@ func TestAFailingLessonBodyCleanerCallsNoPublisher(t *testing.T) {
 	args := filepath.Join(bin, "args")
 	os.Remove(args)
 	scrub := filepath.Join(bin, "body-cleaner")
-	os.WriteFile(scrub, []byte("#!/bin/sh\ndata=$(cat)\ncase \"$data\" in Learned*) exit 1;; esac\nprintf '%s' \"$data\"\n"), 0700)
+	os.WriteFile(scrub, []byte("#!/bin/sh\ndata=$(cat)\ncase \"$data\" in Unverified*) exit 1;; esac\nprintf '%s' \"$data\"\n"), 0700)
 	loop.Scrubber = []string{scrub}
 	if code, _, _ := momentum("loop", "lesson", "--case", c.ID, "--text", "a clean lesson"); code == 0 {
 		t.Fatal("the fixture did not refuse the body cleaner")

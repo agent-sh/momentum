@@ -21,6 +21,18 @@ func refused(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrRefused, fmt.Sprintf(format, args...))
 }
 
+// shipHold distinguishes authority and lock holds from invalid agent output.
+// Both remain ErrRefused to callers of the ship tool.
+type shipHold struct{ err error }
+
+func (e *shipHold) Error() string { return e.err.Error() }
+func (e *shipHold) Unwrap() error { return e.err }
+
+func held(err error) bool {
+	var hold *shipHold
+	return errors.As(err, &hold)
+}
+
 // Gate holds the loop's authority, as the machine's configuration gives it. The loop never changes it: its
 // configuration lives outside every repository it may write, and its code is outside what the ship tool may
 // change (Protected).
@@ -89,14 +101,19 @@ func RepoOf(ctx context.Context, dir string) (string, error) {
 // Repository checks that the loop may change a repository now, and returns it as a target: an owner it may write
 // to, a repository it does not exclude, the machine's scope check allows it, and nothing else works in it (the
 // scheduled-AI policy leaves a repository another agent or a human works on alone).
-func (g Gate) Repository(ctx context.Context, dir string) (Target, error) {
+func (g Gate) Repository(ctx context.Context, dir string) (target Target, err error) {
+	defer func() {
+		if errors.Is(err, ErrRefused) && !held(err) {
+			err = &shipHold{err: err}
+		}
+	}()
 	if err := CheckHostStorage(ctx, dir); err != nil {
 		return Target{}, err
 	}
 	if err := CheckGitConfig(ctx, dir); err != nil {
 		return Target{}, err
 	}
-	dir, err := filepath.Abs(dir)
+	dir, err = filepath.Abs(dir)
 	if err != nil {
 		return Target{}, err
 	}
@@ -194,9 +211,13 @@ func defaultBranch(ctx context.Context, dir string) (string, error) {
 // evaluator's or its authority's, which only the owner or a session he directs makes. Each call returns a list
 // of its own: nothing a change compiles in can empty it.
 func Protected() []string {
-	return []string{"internal/detect/", "internal/loop/", "internal/sandbox/", "internal/measure/", "internal/store/", "internal/source/", "internal/plain/",
-		"internal/config/", "internal/paths/", "cmd/momentum/", "sessions/", "go.mod", "go.sum", ".github/", "SPEC.md", "AGENTS.md"}
+	return []string{"internal/", "cmd/", "sessions/", ".github/"}
 }
+
+var selfChanges = []string{"internal/supervise/rules.go", "internal/capacity/rules.go"}
+
+// ciPaths are the CI configurations of the hosts the loop could push to.
+var ciPaths = []string{".github/", ".circleci/", ".buildkite/", ".gitlab-ci.yml", "Jenkinsfile", "azure-pipelines.yml", ".travis.yml"}
 
 // SelfRepo is momentum's own repository, where Protected applies.
 const SelfRepo = "agent-sh/momentum"
@@ -204,15 +225,31 @@ const SelfRepo = "agent-sh/momentum"
 // CheckPaths refuses a change to a repository that touches what the loop may never change there: changed holds
 // every path a change adds, removes or edits (both sides of a move).
 func CheckPaths(t Target, changed []string) error {
+	// A repository's CI runs from the tree a pushed branch holds, with that repository's secrets, before anyone has
+	// reviewed the change: no repository's CI configuration is the loop's to change.
+	for _, c := range changed {
+		for _, p := range ciPaths {
+			if c == strings.TrimSuffix(p, "/") || strings.HasPrefix(c, p) {
+				return refused("%s is CI configuration: it runs on a pushed branch before review, never the loop's to change", c)
+			}
+		}
+	}
 	if !strings.EqualFold(t.Repo, SelfRepo) {
 		return nil
 	}
 	for _, c := range changed {
+		if slices.Contains(selfChanges, c) {
+			continue
+		}
+		if !strings.Contains(c, "/") {
+			return refused("%s is a root file of the loop's repository: never its to change", c)
+		}
 		for _, p := range Protected() {
 			if c == strings.TrimSuffix(p, "/") || strings.HasPrefix(c, p) {
 				return refused("%s is the loop's own (what its judgment or its authority rests on): never its to change", c)
 			}
 		}
+		return refused("%s is outside the loop's explicit self-change allow-list", c)
 	}
 	return nil
 }

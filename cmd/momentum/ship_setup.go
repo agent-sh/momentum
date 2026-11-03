@@ -151,7 +151,7 @@ func setupShip(st *store.Store, sources config.Sources) *loop.Ship {
 	c := sources.Loop
 	home := paths.Home()
 	ro, toolPath, goRoot, goModules := toolchains(home)
-	sb := loop.Sandbox{Home: home, ReadOnly: append(ro, expandAll(c.SandboxRead)...), Cache: filepath.Join(loopDir(), "cache"), Scratch: filepath.Join(loopDir(), "tmp"), Path: toolPath, GoRoot: goRoot, GoModules: goModules}
+	sb := loop.Sandbox{ReadOnly: append(ro, expandAll(c.SandboxRead)...), Cache: filepath.Join(loopDir(), "cache"), Scratch: filepath.Join(loopDir(), "tmp"), Path: toolPath, GoRoot: goRoot, GoModules: goModules}
 	if len(c.CapacityGate) > 0 {
 		sb.Gate = func(ctx context.Context) error {
 			cctx, cancel := context.WithTimeout(ctx, 10*time.Minute)

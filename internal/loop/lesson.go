@@ -48,7 +48,7 @@ func PublishLesson(ctx context.Context, st *store.Store, ship *Ship, id, text, t
 	if line == "" || strings.ContainsAny(line, "\r\n") || len(line) > 300 {
 		return refused("a lesson is one line of at most 300 characters")
 	}
-	clean, err := Redact(ctx, line)
+	clean, err := Public(ctx, line)
 	if err != nil {
 		return err
 	}
@@ -62,7 +62,13 @@ func PublishLesson(ctx context.Context, st *store.Store, ship *Ship, id, text, t
 	} else if ok && p.Repo != "" {
 		scope = "projects/" + p.Repo[strings.IndexByte(p.Repo, '/')+1:]
 	}
-	body, err := Public(ctx, fmt.Sprintf("Learned by momentum's improvement loop on case %s (%s): %s", c.ID, c.Family, c.Title))
+	// Reclean an older reservation too. Measurement validates the outcome,
+	// not the model's explanation or instructions.
+	desc, err := Public(ctx, "unverified lesson from a loop run: "+reserved)
+	if err != nil {
+		return err
+	}
+	body, err := Public(ctx, fmt.Sprintf("Unverified lesson from momentum's improvement loop on case %s (%s): %s", c.ID, c.Family, c.Title))
 	if err != nil {
 		return err
 	}
@@ -73,7 +79,7 @@ func PublishLesson(ctx context.Context, st *store.Store, ship *Ship, id, text, t
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, firstOf(tacit, "tacit"), "add", "--harness", "claude", "--kind", "observed",
-		"--scope", scope, "--desc", Neutral(reserved), "--body", body, "momentum-lesson-"+strings.ToLower(c.ID))
+		"--scope", scope, "--desc", desc, "--body", body, "momentum-lesson-"+strings.ToLower(c.ID))
 	cmd.Env = CleanEnv(nil)
 	out, diag := Capture{Limit: MaxStream}, Capture{Limit: MaxStream}
 	cmd.Stdout, cmd.Stderr = &out, &diag
@@ -83,7 +89,7 @@ func PublishLesson(ctx context.Context, st *store.Store, ship *Ship, id, text, t
 	if out.Over() || diag.Over() {
 		return errors.New("tacit output exceeds its limit")
 	}
-	return st.CaseNote(store.WithTextCleaner(ctx, Redact), c.ID, store.LessonPublished, scope+": "+Neutral(reserved), actor)
+	return st.CaseNote(store.WithTextCleaner(ctx, Redact), c.ID, store.LessonPublished, scope+": "+desc, actor)
 }
 
 func (r *Runner) lessons(ctx context.Context, only string, families []string) error {
@@ -107,7 +113,11 @@ func (r *Runner) lessons(ctx context.Context, only string, families []string) er
 		}
 		p, ok, err := r.Ship.Load(c.ID)
 		if err != nil {
-			return err
+			if noteErr := r.packageProblem(ctx, c, err, false); noteErr != nil {
+				return noteErr
+			}
+			r.logf("lesson package of %s: %v", c.ID, err)
+			continue
 		}
 		if !ok || p.Lesson == "" {
 			continue

@@ -316,14 +316,22 @@ func caseLog(ctx context.Context, q querier, id, actor, action, detail string, a
 	if detail, err = cleanText(ctx, detail); err != nil {
 		return err
 	}
+	return caseLogCleaned(ctx, q, id, actor, action, detail, at)
+}
+
+// caseLogCleaned writes text already cleaned before its transaction began.
+func caseLogCleaned(ctx context.Context, q querier, id, actor, action, detail string, at time.Time) error {
 	if actor == "" {
 		actor = "unknown"
 	}
-	_, err = q.ExecContext(ctx, `INSERT INTO case_log (case_id, seq, at, actor, action, detail)
+	_, err := q.ExecContext(ctx, `INSERT INTO case_log (case_id, seq, at, actor, action, detail)
 	  VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM case_log WHERE case_id = ?), ?, ?, ?, ?)`,
-		id, id, at.UnixMilli(), caseText(actor, 80), action, caseText(detail, caseTextMax))
+		id, id, at.UnixMilli(), caseText(actor, 80), action, CaseNoteText(detail))
 	return err
 }
+
+// CaseNoteText is the stored form of a case note after its caller cleans it.
+func CaseNoteText(text string) string { return caseText(text, caseTextMax) }
 
 // resolveEvidence checks a piece of evidence and fills it in. An event's reference (ev:ID) always takes the
 // event's own time, kind and summary, whatever the caller gave, and a note's (note:ID) the note's time, kind and
@@ -1246,6 +1254,10 @@ func (s *Store) SweepCases(ctx context.Context, now time.Time, retention time.Du
 // DeployCase is the ship tool's: a case in testing goes to deployed, with its change package and the time its
 // change went in, from which its measurement counts. Nothing else deploys a case.
 func (s *Store) DeployCase(ctx context.Context, id, pkg string, at time.Time, what, actor string) (Case, error) {
+	what, err := cleanText(ctx, what)
+	if err != nil {
+		return Case{}, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Case{}, err
@@ -1265,7 +1277,7 @@ func (s *Store) DeployCase(ctx context.Context, id, pkg string, at time.Time, wh
 		CaseDeployed, pkg, at.UnixMilli(), time.Now().UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
-	if err := caseLog(ctx, tx, c.ID, actor, "deployed", what, time.Now()); err != nil {
+	if err := caseLogCleaned(ctx, tx, c.ID, actor, "deployed", what, time.Now()); err != nil {
 		return Case{}, err
 	}
 	if c, err = getCase(ctx, tx, c.ID); err != nil {
@@ -1277,6 +1289,10 @@ func (s *Store) DeployCase(ctx context.Context, id, pkg string, at time.Time, wh
 // RollBackCase is the ship tool's: a deployed or measuring case whose change was undone goes back to testing,
 // with no measurement, since its change is gone.
 func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, error) {
+	why, err := cleanText(ctx, why)
+	if err != nil {
+		return Case{}, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Case{}, err
@@ -1293,7 +1309,7 @@ func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, 
 	  effect = '', updated = ? WHERE id = ?`, CaseTesting, time.Now().UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
-	if err := caseLog(ctx, tx, c.ID, actor, "rolled back", why, time.Now()); err != nil {
+	if err := caseLogCleaned(ctx, tx, c.ID, actor, "rolled back", why, time.Now()); err != nil {
 		return Case{}, err
 	}
 	if c, err = getCase(ctx, tx, c.ID); err != nil {

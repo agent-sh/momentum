@@ -11,11 +11,7 @@ import (
 )
 
 func TestProposalRefusesAProtectedEditDuringValidation(t *testing.T) {
-	st := testStore(t)
-	f := newRepo(t, nil)
-	s := recoveryShip(t, st, f)
-	s.Gate.Resolve = func(context.Context, string) (string, error) { return "agent-sh/momentum", nil }
-	c, p, pr := recoveryChecked(t, s, st, f)
+	s, _, c, p, pr := b4CheckedFor(t, SelfRepo)
 	s.Public = func(_ context.Context, text string) (string, error) {
 		write(t, filepath.Join(p.Work, "internal/sandbox/probe.go"), "package sandbox // marker-7f3a\n")
 		return text, nil
@@ -38,7 +34,13 @@ func TestFetchedBranchDoesNotWeakenProposalLease(t *testing.T) {
 	s := recoveryShip(t, st, f)
 	c, p := recoveryReviewed(t, s, st, f)
 	ctx := context.Background()
-	if _, err := s.Reviewed(ctx, c.ID, Review{Findings: []Finding{{Severity: "medium", Where: "fake.go", Problem: "p", Fix: "f"}}, Comment: "c1"}); err != nil {
+	// Replace the synthetic clean receipt with this round's blocking finding.
+	p.Reviews = nil
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.Reviewed(ctx, c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked every changed file.", Findings: []Finding{{Severity: "medium", Where: "fake.go", Problem: "p", Fix: "f"}}, Comment: "c1"}); err != nil {
 		t.Fatal(err)
 	}
 	theirs := pushOther(t, f, p.Branch, map[string]string{"theirs.txt": "marker-7f3a\n"})
@@ -57,11 +59,7 @@ func TestFetchedBranchDoesNotWeakenProposalLease(t *testing.T) {
 }
 
 func TestProposalHookRefusesAProtectedEditBeforeCommit(t *testing.T) {
-	st := testStore(t)
-	f := newRepo(t, nil)
-	s := recoveryShip(t, st, f)
-	s.Gate.Resolve = func(context.Context, string) (string, error) { return "agent-sh/momentum", nil }
-	c, p, pr := recoveryChecked(t, s, st, f)
+	s, _, c, p, pr := b4CheckedFor(t, SelfRepo)
 	s.BeforeCommit = func() {
 		write(t, filepath.Join(p.Work, "internal/sandbox/probe.go"), "package sandbox // marker-7f3a\n")
 	}

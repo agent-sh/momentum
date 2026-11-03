@@ -187,7 +187,7 @@ func TestReviewTextIsCleanedBeforePackageAndCaseLog(t *testing.T) {
 	old := Scrubber
 	t.Cleanup(func() { Scrubber = old })
 	Scrubber = []string{script(t, t.TempDir(), "cleaner", "sed 's/marker-7f3a/[masked]/g'")}
-	rev := Review{Text: "marker-7f3a", Findings: []Finding{{Severity: "medium", Where: "marker-7f3a", Problem: "marker-7f3a", Fix: "marker-7f3a"}}}
+	rev := Review{Head: currentReviewHead(t, s, c.ID), Text: "marker-7f3a", Findings: []Finding{{Severity: "medium", Where: "marker-7f3a", Problem: "marker-7f3a", Fix: "marker-7f3a"}}}
 	p, err := s.Reviewed(ctx, c.ID, rev)
 	if err != nil {
 		t.Fatal(err)

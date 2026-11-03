@@ -81,13 +81,8 @@ func (s *Ship) applyPatch(ctx context.Context, p Package, inputs []Patch) (strin
 	if err != nil {
 		return "", nil, err
 	}
-	for _, name := range names {
-		parts := strings.Split(name, "/")
-		for i := range parts {
-			if e := base[strings.Join(parts[:i+1], "/")]; e.mode == "120000" || e.mode == "160000" {
-				return "", nil, refused("patch path %s has a symlink or gitlink in the base", name)
-			}
-		}
+	if err := checkBasePaths(base, names); err != nil {
+		return "", nil, err
 	}
 	// Reset the index and files without moving the package's proposal branch.
 	if _, err := s.git(ctx, p.Host, "read-tree", "--reset", "-u", p.BaseCommit); err != nil {
@@ -116,31 +111,50 @@ func (s *Ship) applyPatch(ctx context.Context, p Package, inputs []Patch) (strin
 	if err != nil {
 		return "", nil, err
 	}
-	total := int64(0)
-	for _, name := range paths {
-		if err := patchPath(name); err != nil {
-			return "", nil, err
-		}
-		e, exists := result[name]
-		if !exists {
-			continue
-		}
-		if e.mode != "100644" && e.mode != "100755" {
-			return "", nil, refused("patch result %s has refused mode %s", name, e.mode)
-		}
-		if old, exists := base[name]; exists && old.mode != "100644" && old.mode != "100755" {
-			return "", nil, refused("patch changes a nonregular base file: %s", name)
-		}
-		total += e.size
-		if e.size > FileMax || total > TotalMax {
-			return "", nil, refused("patch result exceeds %d bytes per file or %d bytes total", FileMax, TotalMax)
-		}
+	if err := checkChangedFiles(base, result, paths); err != nil {
+		return "", nil, err
 	}
 	slices.Sort(paths)
 	if err := os.WriteFile(filepath.Join(s.pkgDir(p.Case), "candidate.patch"), data, 0600); err != nil {
 		return "", nil, err
 	}
 	return tree, paths, nil
+}
+
+func checkBasePaths(base map[string]treeEntry, names []string) error {
+	for _, name := range names {
+		parts := strings.Split(name, "/")
+		for i := range parts {
+			if e := base[strings.Join(parts[:i+1], "/")]; e.mode == "120000" || e.mode == "160000" {
+				return refused("patch path %s has a symlink or gitlink in the base", name)
+			}
+		}
+	}
+	return nil
+}
+
+func checkChangedFiles(base, result map[string]treeEntry, paths []string) error {
+	total := int64(0)
+	for _, name := range paths {
+		if err := patchPath(name); err != nil {
+			return err
+		}
+		e, exists := result[name]
+		if !exists {
+			continue
+		}
+		if e.mode != "100644" && e.mode != "100755" {
+			return refused("patch result %s has refused mode %s", name, e.mode)
+		}
+		if old, exists := base[name]; exists && old.mode != "100644" && old.mode != "100755" {
+			return refused("patch changes a nonregular base file: %s", name)
+		}
+		total += e.size
+		if e.size > FileMax || total > TotalMax {
+			return refused("patch result exceeds %d bytes per file or %d bytes total", FileMax, TotalMax)
+		}
+	}
+	return nil
 }
 
 func (s *Ship) keepPatch(p Package) error {

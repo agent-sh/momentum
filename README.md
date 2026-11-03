@@ -4,7 +4,7 @@ One tool that keeps improving an agent system: how agents behave during work, an
 
 It asks standing questions (what made the owner step in, what he keeps doing by hand, which sessions wait on him, what wastes load or money, what is running out of room, which component works poorly, which failures recur, what new work could replace a part of the setup), answers them with evidence, ships the improvements it is allowed to ship, and measures whether they helped.
 
-Status: design. Evidence, cases and the sandboxed loop are implemented. Measurement follows. See [SPEC.md](SPEC.md).
+Status: design. Evidence, cases, the sandboxed build loop and deterministic measurement are implemented. See [SPEC.md](SPEC.md).
 
 ## Sandbox
 
@@ -188,16 +188,17 @@ momentum loop runs [--since WHEN] [--case ID] [--json]
 
 The loop investigates, builds and reviews through Claude Code's native agent in print mode. The host records investigation findings and an optional repository NAME under `/ro/repos`. A complete report moves the case to testing. A code fix needs an admitted repository; a case without one waits with a passive note. Two runs of the same step that fail the same way stop the case and open a component-health case.
 
+Run the loop tests with `go test -timeout 50m ./internal/loop`. Use `-run` for focused checks. The sandbox checks can exceed Go's default timeout.
+
 The host gates the source repository and prepares independent host and build clones at BASE. A build edits `/work`, runs its discriminating test and returns summary, test, title, body, rollback, signal, window and lesson. Toolchains and module caches are read-only, with build caches in tmpfs. A second sandbox job without a relay or harness exports the cumulative patch. The host reads that one confined file, validates it, applies it in its clone and checks that the test fails on BASE and passes on the change. It proposes exactly the checked tree.
 
-A review reads the proposed tree at `/ro/change` read-only and the patch at `/run/input/change.patch`. The host keeps and posts the findings. High and medium findings return to a build with `review.md`. A moved base supplies `previous.patch` for adaptation. Three rounds are allowed; exhausted changes wait with a passive note. A clean posted review can land when `loop.live` is true. Every push rechecks the repository gate. Landing and rollback use host journals and fast-forward pushes. An improved case's lesson is published by the host without another model run. The host measures its deployed change and watches for regression.
+A review reads the proposed tree at `/ro/change` read-only and the patch at `/run/input/change.patch`. The host keeps the findings locally. A private repository receives the cleaned findings; a repository that is not private receives host-built text only. Before publishing a patch there, the host scans its added lines and file names for personal content and secrets and refuses a hit. High and medium findings return to a build with `review.md`. A moved base supplies `previous.patch` for adaptation. Three review rounds are allowed. Two closed, unmerged proposals stop automatic builds. Exhausted changes and reviews held by budget or the stop rule wait with passive notes. The owner can still propose a checked package. A clean posted review can land when `loop.live` is true. Every push rechecks the repository gate. Landing and rollback use host journals and fast-forward pushes. Rollback restores already published content and skips the public-patch scan. An improved case's lesson is published by the host without another model run, marked unverified. Measurement validates the outcome, not the model-written advice.
 
 The measure step runs on each loop pass, or with `momentum measure [--dry] [--family F,F] [--case ID] [--json]`. It uses no model. A plan counts the signal's share of active hours over whole weeks. Choose a week, or two for a rarer problem. At least five hit hours admit the gate. The three windows before that gate supply the independent baseline. Every counted source must have read past a window before it decides.
 
 Measurement starts once the repository checkout holds the landed change. For a binary or installed configuration, the build report names `installed` in an admitted `loop.read_dirs` directory. The owner can also use `momentum ship propose --installed FILE`. A Go revision must hold the change. Another installed file must be rebuilt after its checkout held it. Host code checks and records the installed file. No momentum command runs inside the sandbox.
 
 A lower share beyond chance closes the case as improved and leaves a shipped note with its measured effect. No measured effect rolls the change back while the loop is live. Otherwise a decided note holds the rollback and gives the command to do it by hand. A quiet window waits one more window. Three consecutive read watch windows at the old share, with five hits among them, reopen the case. Waiting and decision notes stay passive. SPEC's Measurement section states the assumptions and measured test rates.
-
 
 Read gaps do not count as a fix: a window in which a scan failed is never read whole. Its window after starts again once the source reads past the failure. A Go build from a modified checkout is judged once by the tree it was built from, while its hash and time stand. A build report names a file only where the loop reads, in loop.read_dirs.
 
@@ -235,6 +236,23 @@ momentum loop lesson --case ID --text TEXT
 ```
 
 Agent runs return reports. The host calls the ship tool's methods. Patch validation, export, publication leases, landing and rollback are specified in [The ship tool](SPEC.md#the-ship-tool).
+
+## Evaluation
+
+`momentum loop eval` compares the loop's investigation and the harness's native agent against verified past root causes. The golden JSONL and its answers stay on the machine. Tests use synthetic tasks.
+
+```text
+momentum loop eval --golden FILE --trials 3 --arms loop,native --budget 120 --parallel 3
+momentum loop eval --golden FILE --held-out ID1,ID2 --split held-out --task ID1 --json
+```
+
+The host prepares one as-of input set per task. Both arms and all its trials share the same read-only `/ro` store, records, configuration, repository histories and tacit clone. The end is the earlier of the task cutoff and one minute after its newest symptom. Later events, commits, refs, reflogs and unreachable objects are removed. No momentum or tacit program is mounted. Both prompts end with the live investigation's paths reference. The inputs go when the task ends.
+
+Historical Hermes message rows are withheld; their stored summaries remain. Configuration roots outside a repository are copied as they are now and listed as leaks. Missing transcripts and histories cannot be reconstructed. Commit dates approximate historical branch positions when a reflog is unavailable. See [SPEC.md](SPEC.md#evaluation) for exact keys and limits.
+
+Each slot reserves both arms, each investigation and two judge attempts, with the relay's 1.5 times budget allowance included. The default pair reserves $30 (a $3 judge: the relay reserves the largest charge a request could cost); `--budget` must hold that for every parallel slot plus what was spent. A failed start costs nothing and its pair is excluded. The clean-context judge has only its input directory and no tools or `/ro` mounts. Accounting comes from the relay's observed cost, tokens and turns.
+
+`results.json` records the build, exact golden-file hash, every prompt and system hash, pinned records binary hash, models, budgets, input manifests and hashes, selected and held-out tasks, errors and historical limitations. The summary reports reach, cost and time per reached cause, paired task bootstrap intervals, pass@k, pass^k and flips. Undefined rates print as undefined and serialize as null. The operator keeps the held-out split and checks a judge sample by hand before using the comparison to turn the loop on.
 
 Knowledge stays in [tacit](https://github.com/agent-sh/tacit). Cases, evidence and state stay on the machine, never in this repository.
 

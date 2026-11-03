@@ -5,11 +5,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -50,6 +52,8 @@ type Invocation struct {
 	Tools                  string
 	fallback               bool
 	requestLimit           int
+	unitPrefix             string
+	inputOnly              bool
 }
 
 // Result is what a run came to.
@@ -170,7 +174,10 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	if a.Fallback != "" {
 		args = append(args, "--fallback-model", a.Fallback)
 	}
-	args = append(args, "--no-session-persistence", "--add-dir", "/ro")
+	args = append(args, "--no-session-persistence")
+	if !inv.inputOnly {
+		args = append(args, "--add-dir", "/ro")
+	}
 	socket := filepath.Join(HostDir(inv.Dir), "relay.sock")
 	route, routeEnv, err := a.Bedrock.open(socket, inv.BudgetUSD, requestAllowance(inv))
 	if err != nil {
@@ -182,18 +189,30 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 		{Src: filepath.Join(inv.Dir, "out"), Dst: "/out", Write: true},
 		{Src: inputDir, Dst: "/run/input"}, {Src: harness, Dst: "/opt/claude/claude"},
 	}
+	dir := "/work"
+	if inv.inputOnly {
+		binds = binds[2:] // The judge binds only its input and the harness.
+		dir = "/home/agent"
+	}
 	binds = append(append(binds, a.Binds...), inv.Binds...)
 	for _, b := range binds {
 		if !((b.Src == inputDir && b.Dst == "/run/input" || b.Src == filepath.Join(HostDir(inv.Dir), "records") && b.Dst == "/ro/records") && !b.Write) && (within(HostDir(inv.Dir), b.Src) || within(b.Src, HostDir(inv.Dir))) {
 			return Result{}, errors.New("a run bind reaches its host-only directory")
 		}
 	}
-	spec := sandbox.Spec{Unit: runUnit(inv.ID, inv.Dir, attempt), Host: HostDir(inv.Dir), Binds: binds,
-		Relay: socket, Dir: "/work", Env: sandboxEnv(routeEnv, a.Env, inv.Env),
+	unit := runUnit(inv.ID, inv.Dir, attempt)
+	if inv.unitPrefix != "" {
+		unit = strings.Replace(unit, UnitPrefix, inv.unitPrefix, 1)
+	}
+	// Only the shell inside the fixed sandbox can emit this per-attempt
+	// witness. A started manager or bubblewrap process is not a started run.
+	witness := "momentum-harness-" + strings.ToLower(rand.Text())
+	spec := sandbox.Spec{Unit: unit, Host: HostDir(inv.Dir), Binds: binds,
+		Relay: socket, Dir: dir, Env: sandboxEnv(routeEnv, a.Env, inv.Env),
 		// The unit's own limit is a last bound a minute past the run's timeout, so the host's timeout is the one that fires
 		// and classifies the run (an expiry of the unit reads as an ordinary exit 1).
 		Limits: sandbox.Limits{RuntimeSec: max(1, int(inv.Timeout.Seconds())) + 60},
-		Argv:   append([]string{"/opt/claude/claude"}, args...)}
+		Argv:   append([]string{"/bin/sh", "-c", "printf '%s\\n' '" + witness + "' >&2; exec \"$@\"", "sh", "/opt/claude/claude"}, args...)}
 	transcript := filepath.Join(HostDir(inv.Dir), streamName)
 	out, err := exclusiveOutput(HostDir(inv.Dir), streamName)
 	if err != nil {
@@ -206,10 +225,11 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	}
 	defer errLog.Close()
 	stream, diag := &boundedFile{w: out, left: 64 << 20}, &boundedFile{w: errLog, left: MaxStream}
+	launch := &launchWitness{writer: diag, marker: []byte(witness + "\n")}
 	runCtx, cancel := context.WithTimeout(ctx, inv.Timeout)
 	defer cancel()
 	start := time.Now()
-	exit, waitErr := spec.Run(runCtx, stream, diag)
+	exit, waitErr := spec.Run(runCtx, stream, launch)
 	if exit.Code == -1 && waitErr != nil && runCtx.Err() == nil {
 		// the sandbox did not run the program to its end: what the relay saw still counts
 		failed := Result{Started: true, Model: a.Model}
@@ -231,7 +251,7 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	}
 	timedOut := runCtx.Err() == context.DeadlineExceeded
 	res, perr := readStream(transcript)
-	res.Started = true
+	res.Started = launch.seen
 	res.Duration, res.Transcript, res.Model = time.Since(start), transcript, a.Model
 	route.close()
 	res.Refused = route.refusals()
@@ -317,6 +337,10 @@ func readRunFile(dir, name string) ([]byte, error) {
 // it, so that test processes running side by side never stop each other's units.
 var UnitPrefix = "momentum-run-loop-"
 
+// EvalUnitPrefix names the units of an evaluation. Its sweep of leftovers stops only units that begin with it, and a
+// test process uses a prefix of its own (as for UnitPrefix), so a test run cannot stop a real evaluation.
+var EvalUnitPrefix = "momentum-run-eval-"
+
 func runUnit(id, dir, attempt string) string {
 	if id == "" {
 		sum := sha256.Sum256([]byte(dir))
@@ -349,7 +373,9 @@ func authenticateReport(res *Result, reports []json.RawMessage, refusal bool) {
 		if len(reports) > 0 {
 			terminal := reports[len(reports)-1]
 			if len(terminal) > 0 && bytes.Equal(candidate, terminal) {
-				res.Report = append(json.RawMessage(nil), terminal...)
+				// Keep the authenticated candidate's original member spelling.
+				// Schema checks must still see duplicate members.
+				res.Report = append(json.RawMessage(nil), res.Report...)
 				res.Status, res.Failure = store.RunOK, ""
 				return
 			}
@@ -410,7 +436,7 @@ func (a Agent) RunOrFallback(ctx context.Context, inv Invocation) (Result, error
 	started := time.Now()
 	res, err := a.Run(deadline, inv)
 	if err != nil || res.Failure != "the model's safeguards" || a.Fallback == "" || a.Fallback == a.Model {
-		if !res.CostKnown && res.Transcript != "" {
+		if res.Started && !res.CostKnown {
 			res.ReservationUSD = inv.BudgetUSD
 			res.USD = res.RelayUSD + res.ReservationUSD
 		}
@@ -432,12 +458,31 @@ func (a Agent) RunOrFallback(ctx context.Context, inv Invocation) (Result, error
 	b.Model, b.Fallback = a.Fallback, ""
 	inv.fallback = true
 	res, err = b.Run(deadline, inv)
-	if err != nil && res.Transcript == "" {
+	if !res.Started {
 		// A fallback that never started adds no spend to the completed first attempt.
 		first.USD = firstCharge
 		return first, err
 	}
 	return finishFallback(first, res, inv.BudgetUSD), err
+}
+
+// launchWitness observes a bounded diagnostic stream across write boundaries.
+// The marker adds no status pipe or host mount.
+type launchWitness struct {
+	writer io.Writer
+	marker []byte
+	tail   []byte
+	seen   bool
+}
+
+func (w *launchWitness) Write(p []byte) (int, error) {
+	data := append(w.tail, p...)
+	if bytes.Contains(data, w.marker) {
+		w.seen = true
+	}
+	n := min(len(data), len(w.marker)-1)
+	w.tail = append(w.tail[:0], data[len(data)-n:]...)
+	return w.writer.Write(p)
 }
 
 func fallbackInvocation(inv Invocation, first Result, elapsed time.Duration) Invocation {
@@ -450,6 +495,10 @@ func fallbackInvocation(inv Invocation, first Result, elapsed time.Duration) Inv
 
 // Each attempt's charge is observed by its relay. An unknown fallback holds its reservation.
 func finishFallback(first, res Result, remaining float64) Result {
+	if !res.Started {
+		return first
+	}
+	res.Started = first.Started || res.Started
 	if !res.CostKnown {
 		res.ReservationUSD += remaining
 	}

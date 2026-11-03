@@ -138,13 +138,14 @@ func TestABinaryDiffHidesNoSignalEdit(t *testing.T) {
 func reviewFixture(t *testing.T) (*Runner, store.Case, Package) {
 	t.Helper()
 	st := testStore(t)
-	r := runnerFor(t, st, fakeAgent(t, `{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":1,"structured_output":{"summary":"clean","findings":[]}}`))
+	r := runnerFor(t, st, fakeAgent(t, `{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":1,"structured_output":{"summary":"Checked x.go.","reviewed_files":["x.go"],"findings":[]}}`))
 	c := testingCase(t, st)
 	r.Ship = &Ship{Store: st, Dir: r.Dir}
 	// a review outside Once reads the inputs of a pass of its own
 	r.pass = &passInputs{}
 	t.Cleanup(r.pass.close)
 	p := reviewable(t, r.Ship, c.ID)
+	r.Ship.GH = script(t, t.TempDir(), "gh", `echo '{"isPrivate":true,"state":"OPEN"}'`)
 	r.Ship.Public = func(_ context.Context, s string) (string, error) { return Neutral(s), nil }
 	r.Ship.Gate = reviewGate(t)
 	if err := r.Ship.save(&p); err != nil {
@@ -380,7 +381,7 @@ func TestNoGitCallRecursesOrRunsMaintenance(t *testing.T) {
 }
 
 func TestAReviewWithoutItsFindingsIsNoReview(t *testing.T) {
-	for _, out := range []string{`null`, `{"summary":"fine"}`, `{"findings":[]}`} {
+	for _, out := range []string{`null`, `{"summary":"fine"}`, `{"findings":[]}`, `{"summary":"","findings":[],"reviewed_files":["x.go"]}`} {
 		ctx := context.Background()
 		r, c, _ := reviewFixture(t)
 		r.Agent = testSandboxAgent(t, Agent{Runner: fakeAgent(t, `{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":1,"structured_output":`+out+`}`), Model: r.Agent.Model})
@@ -397,5 +398,28 @@ func TestAReviewWithoutItsFindingsIsNoReview(t *testing.T) {
 		if len(done) != 1 || done[0].Run.Status != store.RunFailed || done[0].Run.Failure != failure || len(p.Reviews) != 0 {
 			t.Fatalf("%s: %+v %+v", out, done, p.Reviews)
 		}
+	}
+}
+
+// A landing resumed after a crash is a landing like a new one: a case that left testing meanwhile is not landed.
+func TestAResumedLandingNeedsTheCaseStillInTesting(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	f := newRepo(t, nil)
+	s := shipFor(t, st, f)
+	c, p := reviewedChange(t, s, st, f)
+	p.State, p.LandingHead = Landing, p.Head
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	was := strings.TrimSpace(run(t, f.dir, "git", "--git-dir", f.origin, "rev-parse", "main"))
+	if _, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Land(ctx, c.ID); err == nil || !strings.Contains(err.Error(), "investigating") {
+		t.Fatalf("a resumed landing of a case that left testing: %v", err)
+	}
+	if now := strings.TrimSpace(run(t, f.dir, "git", "--git-dir", f.origin, "rev-parse", "main")); now != was {
+		t.Fatalf("the default branch moved from %s to %s", was, now)
 	}
 }

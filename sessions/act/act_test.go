@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -423,27 +424,31 @@ func tmuxServer(t *testing.T) (sock string, run func(args ...string) string) {
 		t.Skip("no tmux")
 	}
 	dir := t.TempDir()
-	// a socket's path holds at most 107 bytes, which a deep temporary directory passes: the socket goes in the
-	// runtime directory, where sockets belong, when there is one
-	sockDir := dir
-	if rt := os.Getenv("XDG_RUNTIME_DIR"); rt != "" {
-		d, err := os.MkdirTemp(rt, "momentum-test-")
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { os.RemoveAll(d) })
-		sockDir = d
+	// Keep the socket in test scratch. A descriptor path stays within the Unix
+	// socket address limit even when TMPDIR is deep.
+	sockDir, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
 	}
-	sock = filepath.Join(sockDir, "tmux.sock")
+	t.Cleanup(func() { sockDir.Close() })
+	sock = filepath.Join("/proc", strconv.Itoa(os.Getpid()), "fd", strconv.Itoa(int(sockDir.Fd())), "tmux.sock")
+	listener, err := net.Listen("unix", sock)
+	if err != nil {
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+			t.Skip("Unix sockets unavailable:", err)
+		}
+		t.Fatal(err)
+	}
+	listener.Close()
 	// The server and its shells get a home of their own: an interactive shell saves its history there, not in
 	// the home of whoever runs the test.
 	env := append(os.Environ(), "HOME="+dir, "HISTFILE="+filepath.Join(dir, "history"))
 	run = func(args ...string) string {
 		cmd := exec.Command("tmux", append([]string{"-S", sock, "-f", "/dev/null"}, args...)...)
 		cmd.Env = env
-		out, err := cmd.Output()
+		out, err := cmd.CombinedOutput()
 		if err != nil {
-			t.Fatalf("tmux %v: %v", args, err)
+			t.Fatalf("tmux %v: %v: %s", args, err, out)
 		}
 		return strings.TrimSpace(string(out))
 	}

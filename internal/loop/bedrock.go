@@ -130,6 +130,7 @@ type relay struct {
 	turnLimit, turnRefused        int
 	errorsN                       int // error answers of the broker, which are neither charged nor turns
 	seen                          bool
+	socket                        string
 }
 
 const relayBodyLimit = 8 << 20
@@ -145,8 +146,8 @@ type relayRate struct {
 }
 
 // Bedrock global rates, per million tokens. Source: Amazon Bedrock pricing,
-// global cross-region inference, 2026-11-02. The evaluation's bedrockRates
-// table uses these same values and will replace this small relay table.
+// global cross-region inference, 2026-11-02. Evaluations use the relay's
+// observed accounting and keep no second pricing table.
 // The output ceiling is the models' 128K maximum:
 // https://platform.claude.com/docs/en/models/overview
 var relayRates = map[string]relayRate{
@@ -174,22 +175,22 @@ func (b *Bedrock) open(socket string, budget float64, turns ...int) (*relay, []s
 	if _, err := os.Lstat(socket); err == nil {
 		return nil, nil, fmt.Errorf("the relay socket already exists")
 	}
-	if len(socket) > 100 { // sockaddr_un takes 107 bytes of path
-		return nil, nil, fmt.Errorf("the run's relay socket path is %d bytes, over what a Unix socket takes: use a shorter data directory (%s)", len(socket), filepath.Base(filepath.Dir(socket)))
-	}
-	ln, err := net.Listen("unix", socket)
+	ln, err := listenRelaySocket(socket)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: the run's relay cannot listen: %v", ErrNoBedrock, err)
 	}
 	if err := os.Chmod(socket, 0o600); err != nil {
 		ln.Close()
+		os.Remove(socket)
 		return nil, nil, err
 	}
 	if budget <= 0 || budget > math.MaxFloat64/1.5 || math.IsNaN(budget) || math.IsInf(budget, 0) {
 		ln.Close()
+		os.Remove(socket)
 		return nil, nil, fmt.Errorf("invalid relay budget")
 	}
 	r := newRelay(target, budget, nil, turns...)
+	r.socket = socket
 	go r.srv.Serve(ln)
 	var env []string
 	for _, k := range bedrockKeys {
@@ -201,6 +202,26 @@ func (b *Bedrock) open(socket string, budget float64, turns ...int) (*relay, []s
 		}
 	}
 	return r, env, nil
+}
+
+// Linux's Unix socket address is short. Evaluation archives can have longer
+// paths. Bind through a descriptor of the same private directory, then mount
+// the socket at its ordinary path. No scratch directory or alias is created.
+func listenRelaySocket(socket string) (net.Listener, error) {
+	if len(socket) < 104 {
+		return net.Listen("unix", socket)
+	}
+	dir, err := os.Open(filepath.Dir(socket))
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	short := fmt.Sprintf("/proc/self/fd/%d/%s", dir.Fd(), filepath.Base(socket))
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: short, Net: "unix"})
+	if err == nil {
+		ln.SetUnlinkOnClose(false)
+	}
+	return ln, err
 }
 
 func newRelay(target *url.URL, budget float64, transport http.RoundTripper, turns ...int) *relay {
@@ -540,6 +561,9 @@ func (r *relay) close() {
 		r.mu.Unlock()
 		r.srv.Close()
 		r.wg.Wait()
+		if r.socket != "" {
+			os.Remove(r.socket)
+		}
 	})
 }
 

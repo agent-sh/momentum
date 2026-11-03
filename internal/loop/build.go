@@ -150,23 +150,29 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 	}
 	if !had || p.State == RolledBack || p.State == Kept {
 		p, err = r.Ship.Prepare(ctx, c.ID, source)
-	} else {
-		if roundsUsed(p) {
-			return p, refused("review rounds used; the change waits for a person")
-		}
-		if p.State != Prepared && p.State != Checked && p.State != Revising {
-			return p, refused("the package is not ready for a build")
-		}
-		if filepath.Clean(source) != p.Dir {
-			return p, refused("the case's repository changed after preparation")
-		}
-		if p.RefreshBase {
-			p, err = r.Ship.refreshBase(ctx, p)
-		} else {
-			if _, err = r.Ship.Gate.Repository(ctx, p.Dir); err == nil {
-				err = r.Ship.freshRunClone(shipContext(ctx, p.Case), p)
-			}
-		}
+	}
+	if err != nil {
+		return p, err
+	}
+	unlock, err := r.Ship.lock(ctx, c.ID)
+	if err != nil {
+		return p, err
+	}
+	defer unlock()
+	p, had, err = r.Ship.Load(c.ID)
+	if err != nil {
+		return p, err
+	}
+	if !had || (p.State != Prepared && p.State != Checked && p.State != Revising) {
+		return p, refused("the package is not ready for a build")
+	}
+	if filepath.Clean(source) != p.Dir {
+		return p, refused("the case's repository changed after preparation")
+	}
+	if p.RefreshBase {
+		p, err = r.Ship.refreshBaseLocked(r.Ship.gitContext(shipContext(ctx, p.Case)), p)
+	} else if _, err = r.Ship.Gate.Repository(ctx, p.Dir); err == nil {
+		err = r.Ship.freshRunClone(shipContext(ctx, p.Case), p)
 	}
 	if err != nil {
 		return p, err
@@ -191,6 +197,9 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 }
 
 func stageFailure(res Result, key string, err error) (Result, error) {
+	if held(err) {
+		return res, &buildStageError{key: key, err: err}
+	}
 	res.Status, res.Failure = store.RunFailed, key
 	res.Text = key + ": " + err.Error()
 	return res, nil

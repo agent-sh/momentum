@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/agent-sh/momentum/internal/sandbox"
 	"os"
 	"path/filepath"
@@ -77,7 +78,6 @@ type Outcome struct {
 // Sandbox runs a host export with the fixed launcher and no model relay.
 // Only /work, /out and tmpfs caches are writable.
 type Sandbox struct {
-	Home              string
 	ReadOnly          []string
 	Cache             string
 	Scratch           string
@@ -111,7 +111,7 @@ func (s Sandbox) spec(dir, scratch string, words, extra []string) (sandbox.Spec,
 		Limits: sandbox.Limits{RuntimeSec: int(timeout.Seconds()) + 60}, Argv: words}, nil
 }
 
-func (s Sandbox) Run(ctx context.Context, dir string, words []string, extra []string) (Outcome, error) {
+func (s Sandbox) Run(ctx context.Context, dir string, words []string, extra []string) (outcome Outcome, runErr error) {
 	if s.Gate != nil {
 		if err := s.Gate(ctx); err != nil {
 			return Outcome{}, err
@@ -125,7 +125,11 @@ func (s Sandbox) Run(ctx context.Context, dir string, words []string, extra []st
 	if err != nil {
 		return Outcome{}, err
 	}
-	defer os.RemoveAll(scratch)
+	defer func() {
+		if err := removeAll(scratch); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("test scratch tree cannot be removed: %w", err))
+		}
+	}()
 	if err := os.Mkdir(filepath.Join(scratch, "out"), 0700); err != nil {
 		return Outcome{}, err
 	}

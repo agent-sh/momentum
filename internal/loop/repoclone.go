@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,6 +30,10 @@ type RepoClone struct {
 	Commit string `json:"commit,omitempty"`
 	Error  string `json:"error,omitempty"`
 }
+
+// errNeedsScrubbing says the scrubber would change something a clone holds (an object, a ref or its configuration):
+// such a repository is left out of the inputs and counted, never published.
+var errNeedsScrubbing = errors.New("clone object needs scrubbing")
 
 // CloneRepos makes independent, history-preserving clones for /ro/repos/NAME.
 // Git's --no-local transport copies objects, so source maintenance cannot change
@@ -271,7 +276,7 @@ func checkCloneObjects(ctx context.Context, dir string) error {
 		}
 		for i, text := range batch {
 			if clean[i] != strings.ReplaceAll(text, "\x1e", " ") {
-				return fmt.Errorf("clone object needs scrubbing")
+				return errNeedsScrubbing
 			}
 		}
 		batch, size = nil, 0
@@ -291,7 +296,7 @@ func checkCloneObjects(ctx context.Context, dir string) error {
 		}
 		n, err := strconv.Atoi(fields[2])
 		if err != nil || n < 0 || n > ScrubBatchBytes {
-			return fmt.Errorf("a repository object over %d MiB cannot be scrubbed in one piece, so the repository is left out", ScrubBatchBytes>>20)
+			return fmt.Errorf("a repository object over %d MiB cannot be scrubbed in one piece, so the repository is left out: %w", ScrubBatchBytes>>20, errNeedsScrubbing)
 		}
 		data := make([]byte, n)
 		if _, err = io.ReadFull(reader, data); err != nil {
@@ -343,7 +348,7 @@ func checkCloneObjects(ctx context.Context, dir string) error {
 		return err
 	}
 	if clean[0] != string(refs) || clean[1] != string(config) {
-		return fmt.Errorf("clone metadata needs scrubbing")
+		return errNeedsScrubbing
 	}
 	return nil
 }

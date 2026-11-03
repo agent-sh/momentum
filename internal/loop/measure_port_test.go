@@ -89,8 +89,8 @@ func TestADeploymentNotePrecedesTheRecoveredCaseReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 	allow := refuseNotes(t, db)
-	if _, _, _, err := r.pick(ctx, c.Family, c.ID, false); err == nil {
-		t.Fatal("deployment recovered without its note")
+	if _, step, why, err := r.pick(ctx, c.Family, c.ID, false); err != nil || step != "" || !strings.Contains(why, "deployment:") {
+		t.Fatalf("failed deployment was not skipped with its cause: %q %q %v", step, why, err)
 	}
 	if got, _ := st.CaseByID(ctx, c.ID); got.Status != store.CaseTesting {
 		t.Fatalf("case left testing before its note: %s", got.Status)

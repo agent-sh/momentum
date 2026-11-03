@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -41,8 +44,12 @@ func scrubbed(ctx context.Context, w io.Writer, text string) error {
 }
 
 // evidenceShow accepts up to ten live events. Each full referenced record is
-// scrubbed before --bytes selects its prefix. No evaluation clock is used.
+// scrubbed before --bytes selects its prefix. An as-of child withholds later
+// records and every Hermes row, whose earlier version cannot be reconstructed.
 func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if _, err := evidenceEnd(); err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet("evidence show", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cut := fs.Int("bytes", 0, "each record's first N bytes, once it is scrubbed whole (default: all of it)")
@@ -167,10 +174,22 @@ func evidenceUnit(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	defer cancel()
 	var output bytes.Buffer
 	capture := &capped{w: &output, n: readMax + 1}
-	for _, args := range [][]string{
+	calls := [][]string{
 		{"systemctl", "--user", "status", "--no-pager", "--lines=0", "--", unit},
 		{"journalctl", "--user", "--no-pager", "-o", "short-iso", "-n", strconv.Itoa(n), "-u", unit},
-	} {
+	}
+	end, err := evidenceEnd()
+	if err != nil {
+		return err
+	}
+	if !end.IsZero() {
+		// Journald timestamps have microsecond precision and --until includes
+		// its bound. Use the last microsecond strictly before the end.
+		before := end.Add(-time.Nanosecond)
+		stamp := fmt.Sprintf("@%d.%06d", before.Unix(), before.Nanosecond()/1000)
+		calls = [][]string{{"journalctl", "--user", "--no-pager", "-o", "short-iso", "-n", strconv.Itoa(n), "--until", stamp, "-u", unit}}
+	}
+	for _, args := range calls {
 		cmd := exec.CommandContext(cctx, args[0], args[1:]...)
 		cmd.Stdout, cmd.Stderr = capture, capture
 		_ = cmd.Run()
@@ -196,6 +215,10 @@ func evidenceUnit(ctx context.Context, args []string, stdout, stderr io.Writer) 
 }
 
 func showEvent(ctx context.Context, st *store.Store, id string, n int) (string, error) {
+	end, err := evidenceEnd()
+	if err != nil {
+		return "", err
+	}
 	e, ok, err := st.EventByID(ctx, id)
 	if err != nil {
 		return "", err
@@ -206,6 +229,13 @@ func showEvent(ctx context.Context, st *store.Store, id string, n int) (string, 
 	var output strings.Builder
 	fmt.Fprintf(&output, "%s ev:%s %s %s %s %s %s\n  %s\n", e.TS.Local().Format("2006-01-02 15:04:05"), e.ID(), e.Source, e.Actor, e.Kind, e.Session,
 		plain.Line(e.Tool), plain.Line(e.Summary))
+	if !end.IsZero() && !e.TS.Before(end) {
+		return "  (record withheld: event is at or after the evaluation end)\n", nil
+	}
+	if !end.IsZero() && e.Harness == "hermes" {
+		output.WriteString("  (record withheld: historical Hermes message rows are unavailable)\n")
+		return loop.Redact(ctx, output.String())
+	}
 	path, off, ok := placeOf(e.Ref)
 	if !ok {
 		return loop.Redact(ctx, output.String())
@@ -226,6 +256,11 @@ func showEvent(ctx context.Context, st *store.Store, id string, n int) (string, 
 		output.WriteString("  (its record is not a regular file)\n")
 		return loop.Redact(ctx, output.String())
 	}
+	var magic [16]byte
+	if count, _ := f.ReadAt(magic[:], 0); count == len(magic) && string(magic[:]) == "SQLite format 3\x00" {
+		output.WriteString("  (record withheld: database rows cannot be read as transcript bytes)\n")
+		return loop.Redact(ctx, output.String())
+	}
 	if off < 0 {
 		return "", usageError{"negative record offset"}
 	}
@@ -244,6 +279,28 @@ func showEvent(ctx context.Context, st *store.Store, id string, n int) (string, 
 	} else if err != nil && err != io.EOF {
 		return "", err
 	} else {
+		if e.Source == "mistakes" {
+			sum := sha256.Sum256(line)
+			if hex.EncodeToString(sum[:16]) != e.SourceKey {
+				output.WriteString("  (record withheld: the line was rewritten since it was read)\n")
+				return loop.Redact(ctx, output.String())
+			}
+		}
+		if !end.IsZero() {
+			var dated struct {
+				Timestamp string `json:"timestamp"`
+			}
+			_ = json.Unmarshal(line, &dated)
+			at, stampErr := time.Parse(time.RFC3339Nano, dated.Timestamp)
+			if stampErr == nil && !at.Before(end) {
+				output.WriteString("  (record withheld: timestamp is at or after the evaluation end)\n")
+				return loop.Redact(ctx, output.String())
+			}
+			if stampErr != nil && (e.Source == store.Sessions || e.Source == store.Supervise) {
+				output.WriteString("  (record withheld: no valid timestamp at the scan's place)\n")
+				return loop.Redact(ctx, output.String())
+			}
+		}
 		clean, err := loop.Redact(ctx, string(line))
 		if err != nil {
 			return "", err
@@ -259,6 +316,17 @@ func showEvent(ctx context.Context, st *store.Store, id string, n int) (string, 
 		output.WriteString(clean)
 	}
 	return loop.Redact(ctx, output.String())
+}
+
+func evidenceEnd() (time.Time, error) {
+	if stamp := os.Getenv("MOMENTUM_NOW"); stamp != "" {
+		at, err := time.Parse(time.RFC3339Nano, stamp)
+		if err != nil || at.IsZero() {
+			return time.Time{}, usageError{"MOMENTUM_NOW must be a nonzero RFC3339 time"}
+		}
+		return at, nil
+	}
+	return time.Time{}, nil
 }
 
 // resolved is a path made absolute with its links followed, as far as it exists.

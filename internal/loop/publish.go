@@ -13,6 +13,21 @@ import (
 // the caller keeps the candidate it journaled and reconciles it before doing anything else.
 var errPublicationUncertain = errors.New("publication uncertain")
 
+func (s *Ship) remoteBranch(ctx context.Context, p Package) (string, error) {
+	out, err := s.git(ctx, p.Host, "ls-remote", "--refs", "origin", "refs/heads/"+p.Branch)
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		return "", nil
+	}
+	if len(fields) != 2 || fields[1] != "refs/heads/"+p.Branch {
+		return "", refused("unreadable proposal branch")
+	}
+	return fields[0], nil
+}
+
 func (s *Ship) publish(ctx context.Context, p *Package, candidate string) error {
 	args := []string{"--no-verify", "--force-with-lease=refs/heads/" + p.Branch + ":" + p.PublishedHead}
 	args = append(args, "origin", candidate+":refs/heads/"+p.Branch)

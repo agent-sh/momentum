@@ -224,7 +224,12 @@ func TestBuildPreparationFailuresUseStageKeyAndStopRule(t *testing.T) {
 	f := newRepo(t, nil)
 	r.Ship = shipWithSandbox(r.Store, f, Sandbox{})
 	r.Ship.Dir = r.Dir
-	r.Ship.Gate.Owners = nil
+	// The gate allows the repository, but host clone storage is unusable.
+	// Gate refusals have their own hold tests and are not agent failures.
+	r.Ship.Gate.Busy = func(context.Context, string) (string, error) {
+		write(t, filepath.Join(r.Dir, "host"), "marker-7f3a")
+		return "", nil
+	}
 	r.Inputs.ReadDirs = []string{f.main}
 	mechanism, fix := "one cause", "one fix"
 	var err error
@@ -271,7 +276,7 @@ done
 case "$schema" in *findings*)
  grep -q 'return 42' /ro/change/fake.go || exit 7
  if printf x >> /ro/change/fake.go 2>/dev/null; then exit 8; fi
- `+fixtureResult(`{"type":"result","subtype":"success","structured_output":{"summary":"clean","findings":[]}}`)+`
+ `+fixtureResult(`{"type":"result","subtype":"success","structured_output":{"summary":"Checked fake.go and answer_test.go.","reviewed_files":["fake.go","answer_test.go"],"findings":[]}}`)+`
  ;;
 *)
  sed -i 's/return 41/return 42/' /work/fake.go

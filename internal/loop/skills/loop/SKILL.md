@@ -2,6 +2,8 @@
 
 Use the case's mechanism and findings to fix one cause with one change and its test. Prefer a deterministic fix before another instruction. Keep every unrelated session's work intact.
 
+Keep real-store text, paths and names out of the title, body and findings.
+
 /work is an independent clone at BASE. Its files and Git history are yours to edit. /out is writable scratch. /ro and /run/input are read-only host inputs. Toolchains and module caches are read-only. Build caches are under /tmp.
 
 Prove the test fails without the change and passes with it. Use synthetic fixtures. Never edit the loop's detectors, measurement, gates, sandbox, skills, budgets or configuration. Never work in an external repository, use paid compute or reach the owner's phone or desktop.

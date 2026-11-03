@@ -45,7 +45,7 @@ func proposePatch(t *testing.T, s *Ship, ctx context.Context, id string, pr Prop
 func fixtureCandidate(t *testing.T, s *Ship, p Package) Package {
 	t.Helper()
 	ctx := context.Background()
-	tree, _, err := s.applyPatch(ctx, p, []Patch{fixturePatch(t, s, p.Case)})
+	tree, changed, err := s.applyPatch(ctx, p, []Patch{fixturePatch(t, s, p.Case)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,6 +53,7 @@ func fixtureCandidate(t *testing.T, s *Ship, p Package) Package {
 		t.Fatal(err)
 	}
 	p.Head, p.State = strings.TrimSpace(run(t, p.Host, "git", "rev-parse", "HEAD")), Proposed
+	p.Changed = changed
 	return p
 }
 
@@ -194,14 +195,14 @@ func TestPatchRejectsPathsModesAndBaseLinks(t *testing.T) {
 	run(t, f.main, "git", "add", "link")
 	run(t, f.main, "git", "commit", "-qm", "base link")
 	run(t, f.main, "git", "push", "-q", "origin", "main")
-	s := recoveryShip(t, st, f)
+	s := shipWithSandbox(st, f, Sandbox{})
 	p, err := s.Prepare(context.Background(), testingCase(t, st).ID, f.main)
 	if err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
 	write(t, filepath.Join(dir, "change.patch"), "diff --git a/link/child b/link/child\nnew file mode 100644\n--- /dev/null\n+++ b/link/child\n@@ -0,0 +1 @@\n+marker-7f3a\n")
-	if _, _, err := s.applyPatch(context.Background(), p, []Patch{{Dir: dir}}); err == nil || !strings.Contains(err.Error(), "base") {
+	if _, _, err := s.applyPatch(context.Background(), p, []Patch{{Dir: dir}}); err == nil || !strings.Contains(err.Error(), "has a symlink or gitlink in the base") {
 		t.Fatalf("accepted a base link component: %v", err)
 	}
 }
