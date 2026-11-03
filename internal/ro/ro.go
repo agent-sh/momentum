@@ -328,7 +328,13 @@ func readFile(dir, name string, limit int64) ([]byte, error) {
 		return nil, err
 	}
 	defer root.Close()
-	f, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	// A root follows a link that stays inside it whatever the open's flags say, so the descriptor opened must be the
+	// name itself, as lstat saw it: a link is another file than its target.
+	link, err := root.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	f, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -337,9 +343,10 @@ func readFile(dir, name string, limit int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() || info.Size() > limit {
-		return nil, errors.New("run input is not a bounded regular file")
+	if !os.SameFile(link, info) || !info.Mode().IsRegular() {
+		return nil, errors.New("run input is not a regular file")
 	}
+	// the bound is the read's: a file that grows after the stat is cut there too
 	raw, err := io.ReadAll(io.LimitReader(f, limit+1))
 	if int64(len(raw)) > limit {
 		return nil, errors.New("run input exceeds its limit")
