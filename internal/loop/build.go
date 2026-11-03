@@ -141,6 +141,13 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 			source = repo.Source
 		}
 	}
+	if source != "" {
+		// A run reads a repository as a masked snapshot, but a build gets an independent clone with its history, which
+		// no scrubber has seen: only a repository whose objects the scrubber would not change is built on.
+		if err = r.pass.buildAdmitted(ctx, name, source); err != nil {
+			return Package{}, err
+		}
+	}
 	if name == "" || source == "" {
 		return Package{}, refused("the investigation's repository is not an admitted read_dirs repository")
 	}

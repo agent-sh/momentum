@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -348,5 +349,39 @@ func TestPatchUnitDoesNotRunPlantedHooks(t *testing.T) {
 				t.Fatal("patch unit did not export the new file")
 			}
 		})
+	}
+}
+
+// A run reads a masked snapshot of a repository whose history holds text the scrubber changes, but a build clones the
+// repository with its history, which nothing scrubbed: that repository is investigated, never built on.
+func TestBuildRefusesARepositoryWhoseHistoryNeedsMasking(t *testing.T) {
+	ctx := context.Background()
+	r, c := inputRunner(t)
+	f := newRepo(t, nil)
+	pushOther(t, f, "main", map[string]string{"notes.txt": "marker-7f3a\n"})
+	run(t, f.main, "git", "pull", "-q", "--ff-only")
+	r.Ship = shipWithSandbox(r.Store, f, Sandbox{})
+	r.Ship.Dir = r.Dir
+	r.Inputs.ReadDirs = []string{f.main}
+	mechanism, fix := "one cause", "one fix"
+	c, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setCaseRepo(t, r.Store, c, "main")
+	r.pass = &passInputs{}
+	t.Cleanup(r.pass.close)
+	if err := r.prepareInputs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if repo := r.pass.manifest.Repositories[0]; repo.Error != "" || repo.Files == 0 {
+		t.Fatalf("the investigation's snapshot was refused: %+v", repo)
+	}
+	if _, err := r.prepareRun(ctx, c, c.Family, StepInvestigate); err != nil {
+		t.Fatalf("an investigation of the repository: %v", err)
+	}
+	_, err = r.prepareRun(ctx, c, c.Family, StepBuild)
+	if err == nil || !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "would mask") {
+		t.Fatalf("a build was prepared on a repository with unscrubbed history: %v", err)
 	}
 }

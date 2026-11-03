@@ -174,7 +174,7 @@ const resolveSlack = 5 * time.Minute
 // try 1 whose outcome says the turn it opened worked. The wait events of the stop (an access wait is renewed every
 // half hour) share its stop_at. Later tries and failed messages are not resolutions.
 func resolvedStops(ctx context.Context, st *store.Store, w Window) (resolutions, error) {
-	evs, err := st.Events(ctx, store.Query{Since: w.Since.Add(-historyLead), Until: w.Until, Source: store.Supervise,
+	evs, err := st.Events(ctx, store.Query{Since: w.Since.Add(-historyLead), Until: w.Until.Add(historyLead), Source: store.Supervise,
 		Kinds: []string{supervise.KindAct, supervise.KindOutcome}, Limit: maxRows})
 	if err != nil {
 		return nil, err
@@ -213,7 +213,8 @@ func resolvedStops(ctx context.Context, st *store.Store, w Window) (resolutions,
 	return out, nil
 }
 
-// historyLead reaches back far enough to see the act of a stop that began before the window.
+// historyLead reaches back far enough to see the act of a stop that began before the window, and on far enough to
+// see the outcome of a message sent inside it (the turn it opened stops later).
 const historyLead = 24 * time.Hour
 
 // covers reports whether the wait from start to end is part of a stop that supervision resolved on its first try.

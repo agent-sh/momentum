@@ -34,6 +34,26 @@ type passInputs struct {
 	momentum  string
 	cache     *ScrubCache
 	since     time.Time
+	admitted  map[string]error // repositories a build may clone, by name
+}
+
+// buildAdmitted says whether the repository's objects pass the scrubber unchanged, once per pass: a build's clone keeps
+// them, unlike a run's snapshot.
+func (p *passInputs) buildAdmitted(ctx context.Context, name, source string) error {
+	if err, ok := p.admitted[name]; ok {
+		return err
+	}
+	err := checkObjects(ctx, source)
+	if errors.Is(err, errNeedsScrubbing) {
+		err = refused("the repository %s holds history the scrubber would mask, so a build clone of it cannot be mounted", name)
+	}
+	if p.admitted == nil {
+		p.admitted = map[string]error{}
+	}
+	if err == nil || errors.Is(err, ErrRefused) {
+		p.admitted[name] = err
+	}
+	return err
 }
 
 func (p *passInputs) close() {
@@ -103,7 +123,7 @@ func (r *Runner) buildInputs(ctx context.Context, p *passInputs) error {
 			return err
 		}
 		if err != nil {
-			cacheErr = err.Error()
+			cacheErr = reason(err)
 		}
 	}
 	p.since = until.Add(-HistoryWindow)
@@ -131,7 +151,7 @@ func (r *Runner) buildInputs(ctx context.Context, p *passInputs) error {
 		return err
 	case err != nil:
 		// tacit's facts are context, not a precondition: without them the run goes on, and the manifest says why
-		p.manifest.Tacit.Error = err.Error()
+		p.manifest.Tacit.Error = reason(err)
 	default:
 		p.binds = append(p.binds, sandbox.Bind{Src: dst, Dst: "/ro/clone"})
 	}
@@ -144,6 +164,9 @@ func (r *Runner) buildInputs(ctx context.Context, p *passInputs) error {
 	// A repository that cannot be read (missing, not a work tree, no default branch) is left out and counted in the
 	// manifest's summary; the others and the investigation go on. What the scrubber changes in one is masked.
 	p.binds = append(p.binds, sandbox.Bind{Src: dst, Dst: "/ro/repos"}, sandbox.Bind{Src: logs, Dst: "/ro/history"})
+	if f := p.cache.Failure(); f != "" && p.manifest.Store.CacheError == "" {
+		p.manifest.Store.CacheError = f // the cache failed during the pass: the rows after it were scrubbed without it
+	}
 	return nil
 }
 

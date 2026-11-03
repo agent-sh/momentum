@@ -131,8 +131,11 @@ func TestScrubCacheKeysOnTheScrubber(t *testing.T) {
 	}
 	copyOnce(t, src, cache)
 	cache.Close(context.Background(), time.Now())
-	// another scrubber (other rules) must not be served what the first returned
-	countingScrubber(t, "[other]")
+	// another build of the same program at the same path (other rules) must not be served what the first returned
+	body := "#!/bin/sh\nsed -e 's/AKIA[A-Z0-9]*EXAMPLE/[masked]/g' -e 's/marker-7f3a/[other]/g'\n"
+	if err = os.WriteFile(Scrubber[0], []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	cache, err = OpenScrubCache(path)
 	if err != nil {
 		t.Fatal(err)
@@ -184,5 +187,28 @@ func TestScrubCachePrunesWhatNothingUsed(t *testing.T) {
 	var n int
 	if err = db.QueryRow("SELECT count(*) FROM scrubbed").Scan(&n); err != nil || n != 0 {
 		t.Fatalf("entries left after the retention: %d %v", n, err)
+	}
+}
+
+func TestScrubCacheFailureIsReportedAndRowsStillScrubbed(t *testing.T) {
+	countingScrubber(t, "[masked]")
+	src := inputStore(t, cacheEvents(4))
+	path := filepath.Join(t.TempDir(), "scrub-cache.sqlite")
+	cache, err := OpenScrubCache(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// the cache fails mid-pass
+	cache.db.Close()
+	m, rows := copyOnce(t, src, cache)
+	if m.Scrubbed != 4 || m.Cached != 0 || len(rows) != 4 || strings.Contains(strings.Join(rows, ""), "marker-7f3a") {
+		t.Fatalf("copy through a failed cache: %+v %v", m, rows)
+	}
+	if cache.Failure() == "" || strings.Contains(cache.Failure(), path) {
+		t.Fatalf("failure reason %q", cache.Failure())
+	}
+	cache.Close(context.Background(), time.Now())
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("a failed cache file was kept")
 	}
 }

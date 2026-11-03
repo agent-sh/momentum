@@ -29,6 +29,25 @@ type ScrubCache struct {
 	mu           sync.Mutex
 	hits, misses int
 	broken       bool
+	failure      string
+}
+
+// Failure is why the cache was dropped during the pass ("" while it works). Never a path or a text.
+func (c *ScrubCache) Failure() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.failure
+}
+
+func (c *ScrubCache) drop(why string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.broken {
+		c.broken, c.failure = true, why
+	}
 }
 
 // cacheRetention is how long an entry no pass used stays: rows leave the window and files leave the repository.
@@ -102,7 +121,10 @@ func (c *ScrubCache) open() error {
 	}
 	db.SetMaxOpenConns(1)
 	for _, q := range []string{"PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL",
-		"CREATE TABLE IF NOT EXISTS scrubbed(key BLOB PRIMARY KEY, val BLOB NOT NULL, used INTEGER NOT NULL) WITHOUT ROWID",
+		"CREATE TABLE IF NOT EXISTS scrubbed(key BLOB PRIMARY KEY, val BLOB NOT NULL) WITHOUT ROWID",
+		// the day an entry was last used lives apart from its value: a touch rewrites a small row, a prune reads an index
+		"CREATE TABLE IF NOT EXISTS used(key BLOB PRIMARY KEY, day INTEGER NOT NULL) WITHOUT ROWID",
+		"CREATE INDEX IF NOT EXISTS used_day ON used(day)",
 		"SELECT count(*) FROM (SELECT key FROM scrubbed LIMIT 1)"} {
 		if _, err = db.Exec(q); err != nil {
 			db.Close()
@@ -129,8 +151,12 @@ func (c *ScrubCache) Close(ctx context.Context, now time.Time) {
 		return
 	}
 	if !c.broken {
-		if _, err := c.db.ExecContext(ctx, "DELETE FROM scrubbed WHERE used < ?", day(now.Add(-cacheRetention))); err != nil {
-			c.broken = true
+		cutoff := day(now.Add(-cacheRetention))
+		for _, q := range []string{"DELETE FROM scrubbed WHERE key IN (SELECT key FROM used WHERE day < ?)", "DELETE FROM used WHERE day < ?"} {
+			if _, err := c.db.ExecContext(ctx, q, cutoff); err != nil {
+				c.broken, c.failure = true, "the cache could not be pruned"
+				break
+			}
 		}
 	}
 	c.db.Close()
@@ -210,7 +236,7 @@ func (c *ScrubCache) RedactGroups(ctx context.Context, ns string, texts []string
 		var sel, touch *sql.Stmt
 		sel, err = tx.PrepareContext(ctx, "SELECT val FROM scrubbed WHERE key=?")
 		if err == nil {
-			touch, err = tx.PrepareContext(ctx, "UPDATE scrubbed SET used=? WHERE key=? AND used<?")
+			touch, err = tx.PrepareContext(ctx, "UPDATE used SET day=? WHERE key=? AND day<?")
 		}
 		for g := 0; err == nil && g < groups; g++ {
 			group := texts[g*stride : (g+1)*stride]
@@ -239,8 +265,9 @@ func (c *ScrubCache) RedactGroups(ctx context.Context, ns string, texts []string
 	}
 	if err != nil {
 		// a cache that fails is dropped: scrub without it
+		c.drop("the cache failed while reading")
 		c.mu.Lock()
-		c.broken = true
+		c.misses += groups
 		c.mu.Unlock()
 		return RedactAll(ctx, texts)
 	}
@@ -257,9 +284,7 @@ func (c *ScrubCache) RedactGroups(ctx context.Context, ns string, texts []string
 			copy(out[g*stride:], clean[i*stride:(i+1)*stride])
 		}
 		if err = c.store(ctx, keys, miss, out, stride, today); err != nil {
-			c.mu.Lock()
-			c.broken = true
-			c.mu.Unlock()
+			c.drop("the cache failed while writing")
 		}
 	}
 	c.mu.Lock()
@@ -275,7 +300,11 @@ func (c *ScrubCache) store(ctx context.Context, keys [][]byte, miss []int, out [
 		return err
 	}
 	for _, g := range miss {
-		if _, err = tx.ExecContext(ctx, "INSERT OR REPLACE INTO scrubbed(key,val,used) VALUES(?,?,?)", keys[g], packGroup(out[g*stride:(g+1)*stride]), today); err != nil {
+		if _, err = tx.ExecContext(ctx, "INSERT OR REPLACE INTO scrubbed(key,val) VALUES(?,?)", keys[g], packGroup(out[g*stride:(g+1)*stride])); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, "INSERT OR REPLACE INTO used(key,day) VALUES(?,?)", keys[g], today); err != nil {
 			tx.Rollback()
 			return err
 		}

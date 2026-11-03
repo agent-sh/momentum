@@ -210,6 +210,7 @@ func TestEvidencePathsAndDiffsFollowOnlyNamedFiles(t *testing.T) {
 	inputTestGit(t, src, nil, "init", "-b", "main")
 	write(t, filepath.Join(src, "pkg", "a.go"), "one\n")
 	write(t, filepath.Join(src, "pkg", "b.go"), "x\n")
+	write(t, filepath.Join(src, ".github", "ci.yml"), "on: push\n")
 	inputTestGit(t, src, nil, "add", ".")
 	inputTestGit(t, src, nil, "commit", "-m", "add both")
 	write(t, filepath.Join(src, "pkg", "a.go"), "one\ntwo marker-7f3a\n")
@@ -228,6 +229,11 @@ func TestEvidencePathsAndDiffsFollowOnlyNamedFiles(t *testing.T) {
 	texts := []string{"panic at pkg/a.go:42", "unrelated words and a version 1.2.3 plus https://example.com/x.html"}
 	if got := EvidencePaths(repos, texts)["sample"]; len(got) != 1 || got[0] != "pkg/a.go" {
 		t.Fatalf("evidence paths %v", got)
+	}
+	// a path with a leading ./ or a leading dot
+	got := EvidencePaths(repos, []string{"in ./pkg/a.go and .github/ci.yml"})["sample"]
+	if len(got) != 2 || got[0] != "pkg/a.go" || got[1] != ".github/ci.yml" {
+		t.Fatalf("dot paths: %v", got)
 	}
 	// an absolute path under the repository, and a file name only one file has
 	if got := EvidencePaths(repos, []string{src + "/pkg/b.go", "see a.go"})["sample"]; len(got) != 2 {

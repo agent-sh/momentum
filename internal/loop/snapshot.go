@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path"
@@ -157,7 +158,7 @@ func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) 
 			if isScrubberError(err) {
 				return results, err
 			}
-			result.Error = err.Error()
+			result.Error = reason(err)
 		}
 		results = append(results, result)
 	}
@@ -198,7 +199,7 @@ func SnapshotFacts(ctx context.Context, src, dst, logPath string, cache *ScrubCa
 	}
 	result, err = snapshotOne(ctx, src, dst, logPath, SnapshotRepoMax, cache, since)
 	if err != nil {
-		result.Error = err.Error()
+		result.Error = reason(err)
 	}
 	return result, err
 }
@@ -581,8 +582,8 @@ func EvidencePaths(repos []RepoInput, texts []string) map[string][]string {
 		}
 		for _, text := range texts {
 			for _, tok := range pathToken.FindAllString(text, -1) {
-				tok = strings.Trim(tok, ".-")
 				tok = strings.TrimPrefix(tok, "./")
+				tok = strings.TrimRight(tok, ".-")
 				if rest, ok := strings.CutPrefix(tok, repo.Source+"/"); ok {
 					tok = rest
 				}
@@ -610,7 +611,7 @@ func EvidencePaths(repos []RepoInput, texts []string) map[string][]string {
 }
 
 // SnapshotDiffs writes, per repository, the diffs of the recent commits that touched the paths the case's texts name,
-// scrubbed, as dst/NAME/DATE-COMMIT.diff. A diff over DiffMax is cut. The host reads the source's Git objects with
+// scrubbed, as dst/NAME/NNN-COMMIT.diff (newest first). A diff over DiffMax is cut. The host reads the source's Git objects with
 // the program pins; the run gets only these files.
 func SnapshotDiffs(ctx context.Context, repos []RepoInput, texts []string, dst string, since time.Time, cache *ScrubCache) (m DiffsManifest, err error) {
 	if err = os.MkdirAll(dst, 0o755); err != nil {
@@ -631,7 +632,7 @@ func SnapshotDiffs(ctx context.Context, repos []RepoInput, texts []string, dst s
 			}
 		}
 		m.Paths += len(paths[name])
-		args := []string{"log", "-n", strconv.Itoa(DiffCommits), "--no-renames", "--format=%H"}
+		args := []string{"--literal-pathspecs", "log", "-n", strconv.Itoa(DiffCommits), "--no-renames", "--format=%H"}
 		if !since.IsZero() {
 			args = append(args, "--since="+since.UTC().Format(time.RFC3339))
 		}
@@ -643,10 +644,7 @@ func SnapshotDiffs(ctx context.Context, repos []RepoInput, texts []string, dst s
 		}
 		var texts, labels []string
 		for _, hash := range strings.Fields(string(listed)) {
-			if total >= DiffsMax {
-				break
-			}
-			show := []string{"-c", "core.quotepath=false", "show", "--no-ext-diff", "--no-textconv", "--no-color", "--patch", "--date=iso-strict",
+			show := []string{"--literal-pathspecs", "-c", "core.quotepath=false", "show", "--no-ext-diff", "--no-textconv", "--no-color", "--patch", "--date=iso-strict",
 				"--format=commit %H%n%aI %an%n%s", hash, "--"}
 			diff, over, derr := hostInputGitCapped(ctx, repo.Source, DiffMax, append(show, paths[name]...)...)
 			if derr != nil {
@@ -659,6 +657,9 @@ func SnapshotDiffs(ctx context.Context, repos []RepoInput, texts []string, dst s
 					text = text[:i+1]
 				}
 				text += fmt.Sprintf("[cut: this diff is larger than %d KiB]\n", DiffMax>>10)
+			}
+			if total+int64(len(text)) > DiffsMax {
+				break
 			}
 			total += int64(len(text))
 			texts, labels = append(texts, text), append(labels, hash[:12])
@@ -685,4 +686,18 @@ func SnapshotDiffs(ctx context.Context, repos []RepoInput, texts []string, dst s
 		}
 	}
 	return m, nil
+}
+
+// reason is an error's text for a manifest: an operating-system error names its operation and cause, never the host
+// path it failed on.
+func reason(err error) string {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return pe.Op + ": " + pe.Err.Error()
+	}
+	var le *os.LinkError
+	if errors.As(err, &le) {
+		return le.Op + ": " + le.Err.Error()
+	}
+	return err.Error()
 }

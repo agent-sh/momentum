@@ -49,6 +49,31 @@ func cloneSource(ctx context.Context, source string, own []string) error {
 // Trees expose names, not binary object ids. Other objects are scanned whole,
 // including binary blobs; an object too large to scrub is refused.
 func checkCloneObjects(ctx context.Context, dir string) error {
+	if err := checkObjects(ctx, dir); err != nil {
+		return err
+	}
+	// Names of refs and the generated Git configuration are exported too.
+	refs, err := hostInputGit(ctx, dir, "for-each-ref", "--format=%(refname)")
+	if err != nil {
+		return err
+	}
+	config, err := os.ReadFile(filepath.Join(dir, ".git", "config"))
+	if err != nil {
+		return err
+	}
+	clean, err := RedactAll(ctx, []string{string(refs), string(config)})
+	if err != nil {
+		return err
+	}
+	if clean[0] != string(refs) || clean[1] != string(config) {
+		return errNeedsScrubbing
+	}
+	return nil
+}
+
+// checkObjects is the scan of every object of the repository at dir (see checkCloneObjects), without its
+// configuration: a build mounts a clone of a work tree whose own configuration is not part of the clone.
+func checkObjects(ctx context.Context, dir string) error {
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "git", append(append([]string{"-C", dir}, GitSafety()...),
@@ -132,22 +157,6 @@ func checkCloneObjects(ctx context.Context, dir string) error {
 	}
 	if err = cmd.Wait(); err != nil || stderr.Over() {
 		return fmt.Errorf("clone object reader failed")
-	}
-	// Names of refs and the generated Git configuration are exported too.
-	refs, err := hostInputGit(ctx, dir, "for-each-ref", "--format=%(refname)")
-	if err != nil {
-		return err
-	}
-	config, err := os.ReadFile(filepath.Join(dir, ".git", "config"))
-	if err != nil {
-		return err
-	}
-	clean, err := RedactAll(ctx, []string{string(refs), string(config)})
-	if err != nil {
-		return err
-	}
-	if clean[0] != string(refs) || clean[1] != string(config) {
-		return errNeedsScrubbing
 	}
 	return nil
 }
