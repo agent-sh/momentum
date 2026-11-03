@@ -147,7 +147,7 @@ func TestInputsUnitFinderAndSharedUnitBudget(t *testing.T) {
 		text.WriteString("unit" + strconv.Itoa(i) + ".service ")
 	}
 	if len(FindUnits(text.String())) != MaxUnits {
-		t.Fatal("finder exceeded ten units")
+		t.Fatal("finder exceeded the unit limit")
 	}
 	at := time.Date(2025, 4, 10, 12, 0, 0, 0, time.UTC)
 	event := store.Event{Source: "fixture", SourceKey: "one", TS: at, Kind: "record"}
@@ -162,7 +162,8 @@ func TestInputsUnitFinderAndSharedUnitBudget(t *testing.T) {
 		t.Fatalf("unit manifest %+v: %v", m, err)
 	}
 	last := m.Files[len(m.Files)-1]
-	if last.Unit != "unit9.service" || last.Name != "unit-unit9.service.txt" {
+	lastUnit := "unit" + strconv.Itoa(MaxUnits-1) + ".service"
+	if last.Unit != lastUnit || last.Name != "unit-"+lastUnit+".txt" {
 		t.Fatal("unit filenames or order changed")
 	}
 	index, err := os.ReadFile(filepath.Join(o.Destination, "index.txt"))
@@ -191,5 +192,27 @@ func TestInputsUnitFinderAndSharedUnitBudget(t *testing.T) {
 	capped, err := UnitLogs(context.Background(), full)
 	if err != nil || capped.Written != MaxRecords || capped.Skipped != 1 || capped.Stopped != "record count" {
 		t.Fatalf("unit bypassed record bound: %+v %v", capped, err)
+	}
+}
+
+// A unit the machine runs of its own whose journal has entries in the window is rendered without being named in the
+// case: the run has no command to ask for a log, so the logs that might matter are there.
+func TestActiveUnitsAreTheMachinesOwnWithJournalEntries(t *testing.T) {
+	home := t.TempDir()
+	for _, name := range []string{"quiet.service", "busy.service", "other.timer", "template@.service"} {
+		write(t, filepath.Join(home, ".config/systemd/user", name), "[Unit]\n")
+	}
+	bin := t.TempDir()
+	script(t, bin, "journalctl", `printf 'busy.service\nbusy.service\nother.timer\nforeign.service\ninit.scope\n\nbusy.service\n'`)
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	got := ActiveUnits(context.Background(), home, time.Now().Add(-ActiveUnitWindow), time.Now())
+	if !reflect.DeepEqual(got, []string{"busy.service", "other.timer"}) {
+		t.Fatalf("active units %v", got)
+	}
+	if u := UnionUnits([]string{"named.service", "busy.service"}, got); !reflect.DeepEqual(u, []string{"named.service", "busy.service", "other.timer"}) {
+		t.Fatalf("union %v", u)
+	}
+	if none := ActiveUnits(context.Background(), t.TempDir(), time.Now().Add(-time.Hour), time.Now()); none != nil {
+		t.Fatalf("a home with no units gave %v", none)
 	}
 }

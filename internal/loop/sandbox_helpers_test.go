@@ -1,6 +1,7 @@
 package loop
 
 import (
+	"fmt"
 	"github.com/agent-sh/momentum/internal/sandbox"
 	"os"
 	"path/filepath"
@@ -29,6 +30,9 @@ func testSandboxAgent(t *testing.T, a Agent) Agent {
 	return a
 }
 func TestMain(m *testing.M) {
+	// test processes run side by side (reviews, a second checkout), and a live loop may run: each stops only its own
+	// leftover units, so the prefix of a test is not one that begins with the loop's
+	UnitPrefix = fmt.Sprintf("momentum-run-looptest%d-", os.Getpid())
 	Scrubber = []string{"sed", "-e", "s/AKIA[A-Z0-9]*EXAMPLE/[masked]/g", "-e", "s/password=marker-7f3a/password=[masked]/g"}
 	os.Exit(m.Run())
 }

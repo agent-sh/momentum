@@ -182,7 +182,7 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 		home = filepath.Dir(r.Store.Path())
 	}
 	manifest := r.pass.manifest
-	manifest.Records, err = Records(ctx, RecordsOptions{Store: filepath.Join(r.pass.dir, "store.sqlite"), IDs: ids, Units: FindUnits(texts...),
+	manifest.Records, err = Records(ctx, RecordsOptions{Store: filepath.Join(r.pass.dir, "store.sqlite"), IDs: ids, Units: UnionUnits(FindUnits(texts...), ActiveUnits(ctx, r.Inputs.Home, r.now().Add(-ActiveUnitWindow), r.now())),
 		Destination: filepath.Join(host, "records"), Binary: r.Inputs.Momentum, Home: home, Env: CleanEnv(nil)})
 	if err != nil {
 		return run, err

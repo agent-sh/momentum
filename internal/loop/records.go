@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -21,7 +22,9 @@ const (
 	MaxRecordsBytes = 8 << 20
 	MaxNeighbours   = 5
 	NeighbourWindow = 10 * time.Minute
-	MaxUnits        = 10
+	MaxUnits        = 25
+	// ActiveUnitWindow is how far back a unit's journal must have entries to be rendered without being named.
+	ActiveUnitWindow = 3 * 24 * time.Hour
 )
 
 type RecordsOptions struct {
@@ -57,7 +60,7 @@ type RecordsManifest struct {
 var unitNameRE = regexp.MustCompile(`^[A-Za-z0-9@._-]+\.(service|timer)$`)
 var unitFinderRE = regexp.MustCompile(`[A-Za-z0-9@._-]+\.(?:service|timer)`)
 
-// FindUnits finds up to ten unique unit names in text order. It refuses matches
+// FindUnits finds up to MaxUnits unique unit names in text order. It refuses matches
 // embedded in paths or larger names, rather than extracting a path's basename.
 func FindUnits(texts ...string) []string {
 	var names []string
@@ -78,6 +81,70 @@ func FindUnits(texts ...string) []string {
 		}
 	}
 	return names
+}
+
+// ActiveUnits are the user services the machine runs of its own (a unit file in Home/.config/systemd/user) whose journal
+// holds entries in the window, busiest first, at most MaxUnits: the logs a run might want without being able to name
+// them in advance, since it has no command to ask for one. journalctl cannot list a field's values inside a window,
+// so it prints the field of every entry of the window and the names are counted here. A journal that cannot be read
+// gives none.
+func ActiveUnits(ctx context.Context, home string, since, until time.Time) []string {
+	files, err := os.ReadDir(filepath.Join(home, ".config", "systemd", "user"))
+	if err != nil {
+		return nil
+	}
+	own := map[string]bool{}
+	for _, f := range files {
+		if f.Type().IsRegular() && unitNameRE.MatchString(f.Name()) && !strings.Contains(f.Name(), "@") {
+			own[f.Name()] = true
+		}
+	}
+	if len(own) == 0 {
+		return nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "journalctl", "--user", "--no-pager", "--since", since.Local().Format("2006-01-02 15:04:05"),
+		"--until", until.Local().Format("2006-01-02 15:04:05"), "-o", "cat", "--output-fields=_SYSTEMD_USER_UNIT")
+	cmd.Env = CleanEnv(nil)
+	out := Capture{Limit: 64 << 20}
+	cmd.Stdout = &out
+	if cmd.Run() != nil && out.Len() == 0 || out.Over() {
+		return nil
+	}
+	counts := map[string]int{}
+	for _, line := range strings.Split(out.String(), "\n") {
+		if own[line] {
+			counts[line]++
+		}
+	}
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if counts[names[i]] != counts[names[j]] {
+			return counts[names[i]] > counts[names[j]]
+		}
+		return names[i] < names[j]
+	})
+	if len(names) > MaxUnits {
+		names = names[:MaxUnits]
+	}
+	return names
+}
+
+// UnionUnits puts the first list's names first and adds the second's, without repeats, at most MaxUnits.
+func UnionUnits(first, second []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, name := range append(append([]string(nil), first...), second...) {
+		if !seen[name] && len(out) < MaxUnits {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 func unitBoundary(b byte) bool {

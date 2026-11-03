@@ -87,7 +87,7 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		if err := sandbox.Available(true); err != nil {
 			return nil, err
 		}
-		if err := sandbox.StopLeftover(ctx, "momentum-run-loop-"); err != nil {
+		if err := sandbox.StopLeftover(ctx, UnitPrefix); err != nil {
 			return nil, err
 		}
 		r.pass = &passInputs{}

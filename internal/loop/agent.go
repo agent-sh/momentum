@@ -295,6 +295,10 @@ func readRunFile(dir, name string) ([]byte, error) {
 	return ReadFile(f, runFileMax)
 }
 
+// UnitPrefix begins the name of every unit the loop starts, and is what a pass stops leftovers by. Only a test changes
+// it, so that test processes running side by side never stop each other's units.
+var UnitPrefix = "momentum-run-loop-"
+
 func runUnit(id, dir, attempt string) string {
 	if id == "" {
 		sum := sha256.Sum256([]byte(dir))
@@ -308,7 +312,7 @@ func runUnit(id, dir, attempt string) string {
 			b.WriteByte('-')
 		}
 	}
-	unit := "momentum-run-loop-" + b.String()
+	unit := UnitPrefix + b.String()
 	if attempt == "fallback" {
 		unit += "-fallback"
 	}

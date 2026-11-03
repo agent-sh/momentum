@@ -24,7 +24,7 @@ func fakeManager(t *testing.T) string {
 	log := filepath.Join(dir, "calls")
 	script(t, dir, "systemd-run", `printf 'probe\n' >> '`+log+`'`)
 	script(t, dir, "systemctl", `case "$2" in
- list-units) printf 'list\n' >> '`+log+`'; printf 'momentum-run-loop-old.service loaded failed failed fixture\n';;
+ list-units) printf 'list\n' >> '`+log+`'; printf '`+UnitPrefix+`old.service loaded failed failed fixture\n';;
  stop) printf 'stop %s\n' "$3" >> '`+log+`';;
  show) printf 'not-found\n';;
  *) exit 7;;
@@ -55,7 +55,7 @@ func TestPassStopsLeftoversBeforePreparingInputs(t *testing.T) {
 		t.Fatalf("pass: %+v %v", done, err)
 	}
 	calls, err := os.ReadFile(log)
-	if err != nil || string(calls) != "probe\nlist\nstop momentum-run-loop-old.service\n" {
+	if err != nil || string(calls) != "probe\nlist\nstop "+UnitPrefix+"old.service\n" {
 		t.Fatalf("startup order or scope: %q %v", calls, err)
 	}
 	runs, err := r.Store.LoopRuns(context.Background(), store.RunFilter{})
@@ -254,10 +254,10 @@ func TestFindingsFileRefusesLinksPipesAndOversize(t *testing.T) {
 }
 
 func TestSandboxRunUnitsAndConstants(t *testing.T) {
-	if got := runUnit("CASE_7.X", "", "primary"); got != "momentum-run-loop-case-7-x" {
+	if got := runUnit("CASE_7.X", "", "primary"); got != UnitPrefix+"case-7-x" {
 		t.Fatalf("unit: %s", got)
 	}
-	if got := runUnit("CASE_7.X", "", "fallback"); got != "momentum-run-loop-case-7-x-fallback" {
+	if got := runUnit("CASE_7.X", "", "fallback"); got != UnitPrefix+"case-7-x-fallback" {
 		t.Fatalf("fallback unit: %s", got)
 	}
 	if RoutePort != sandbox.RelayPort {
