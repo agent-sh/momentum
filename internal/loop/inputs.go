@@ -122,6 +122,14 @@ func (r *Runner) buildInputs(ctx context.Context, p *passInputs) error {
 // prepareRun creates the case and records before charging a reservation. These
 // files are host-owned. A failed preparation returns a skipped step.
 func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step string) (run store.LoopRun, err error) {
+	defer func() {
+		if err != nil && step == StepBuild {
+			var staged *buildStageError
+			if !errors.As(err, &staged) {
+				err = &buildStageError{key: "build inputs", err: err}
+			}
+		}
+	}()
 	run = store.LoopRun{ID: newRunID(r.now()), Case: c.ID, Family: family, Step: step, Model: r.Agent.Model, Started: r.now(), CaseEpisode: c.Episode}
 	run.Dir = filepath.Join(r.Dir, "runs", run.ID)
 	host := HostDir(run.Dir)
@@ -154,7 +162,7 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 	if err != nil {
 		return run, err
 	}
-	system, err := investigationSystem(r.Rules, r.Constraints)
+	system, err := stepSystem(step, r.Rules, r.Constraints)
 	if err != nil {
 		return run, err
 	}
@@ -163,6 +171,49 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 		return run, err
 	}
 	prompt := fmt.Sprintf("%s\nProblem: %s\n%s%s%s%s", liveQuestion, plain.Line(c.Title), evidenceText, caseHolds(c), findingsInstruction, inputReference())
+	schema := investigationSchema
+	extra := map[string]string{}
+	if step == StepBuild {
+		p, prepErr := r.buildPackage(ctx, c, run)
+		if prepErr != nil {
+			return run, &buildStageError{key: "build prepare", err: prepErr}
+		}
+		schema = buildSchema
+		prompt = fmt.Sprintf("Build case %s: %s. BASE is %s. /work is your independent clone at BASE, writable with its Git metadata. /out is writable. Read /run/input/case.json for the investigation and evidence. Make one cause's change and its discriminating test. End with the build report. The host produces the patch.\n%s", c.ID, c.Title, p.BaseCommit, inputReference())
+		prompt = strings.ReplaceAll(prompt, "/work is empty scratch and the working directory.", "/work is the independent clone at BASE and the working directory.")
+		prompt = strings.ReplaceAll(prompt, "Return a report with mechanism, alternatives ruled out, fix and summary. Build no change.", "Return summary, test, title, body, rollback, signal, window and lesson. window is a duration, such as 7d. signal names source, kinds, match and optional tool and harness.")
+		if n := len(p.Reviews); n > 0 {
+			extra["review.md"] = p.Reviews[n-1].Text
+		}
+		if f, e := OpenFile(r.Ship.pkgDir(c.ID), "change.patch"); e == nil {
+			b, e := ReadFile(f, PatchMax)
+			f.Close()
+			if e != nil {
+				return run, e
+			}
+			extra["previous.patch"] = string(b)
+		} else if !os.IsNotExist(e) {
+			return run, e
+		}
+
+	} else if step == StepReview {
+		p, ok, e := r.Ship.Load(c.ID)
+		if e != nil || !ok {
+			return run, firstError(e, "review package is absent")
+		}
+		schema = reviewSchema
+		prompt = fmt.Sprintf("Review case %s (%s): %s. Read /run/input/case.json, /run/input/change.patch and /run/input/package.json. The proposed tree is read-only at /ro/change with no .git. /ro holds the shared pass inputs. End with a nonempty summary, findings and reviewed_files naming every changed file once.", c.ID, c.Family, p.Title)
+		diff, e := r.reviewDiff(ctx, p)
+		if e != nil {
+			return run, e
+		}
+		extra["change.patch"] = diff
+		b, e := json.Marshal(freshReviewPackage(p))
+		if e != nil {
+			return run, e
+		}
+		extra["package.json"] = string(b)
+	}
 	clean, err := RedactAll(ctx, []string{string(raw), system, prompt})
 	if err != nil {
 		return run, err
@@ -170,8 +221,20 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 	if !json.Valid([]byte(clean[0])) {
 		return run, fmt.Errorf("scrubbed case is not JSON")
 	}
-	for name, text := range map[string]string{"case.json": clean[0], "system.md": clean[1], "schema.json": investigationSchema} {
+	for name, text := range map[string]string{"case.json": clean[0], "system.md": clean[1], "schema.json": schema} {
 		if err = writeExclusive(input, name, []byte(text)); err != nil {
+			return run, err
+		}
+	}
+	for name, text := range extra {
+		cleaned, e := Redact(ctx, text)
+		if e != nil {
+			return run, e
+		}
+		if name == "package.json" && !json.Valid([]byte(cleaned)) {
+			return run, fmt.Errorf("scrubbed package is not JSON")
+		}
+		if err = writeExclusive(input, name, []byte(cleaned)); err != nil {
 			return run, err
 		}
 	}

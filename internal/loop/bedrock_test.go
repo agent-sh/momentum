@@ -45,12 +45,14 @@ func fakeBroker(t *testing.T) *broker {
 			return
 		}
 		var fixture struct {
-			Report  json.RawMessage `json:"fixture_report"`
+			Text    string          `json:"fixture_report"`
+			Report  json.RawMessage `json:"-"`
 			Refusal bool            `json:"fixture_refusal"`
 			Output  int             `json:"fixture_output_tokens"`
 			NoUsage bool            `json:"fixture_no_usage"`
 		}
 		json.NewDecoder(req.Body).Decode(&fixture)
+		fixture.Report = json.RawMessage(fixture.Text)
 		if len(fixture.Report) == 0 {
 			var result struct {
 				Report json.RawMessage `json:"structured_output"`

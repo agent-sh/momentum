@@ -86,12 +86,16 @@ const usage = `usage:
   momentum case reopen ID --evidence REF... [--at WHEN] --why W
                                         a closed case comes back only on evidence it does not hold
   momentum loop [--dry] [--family F,F] [--case ID] [--json]
-                                        investigate each family's case once with the harness's native agent;
-                                        the host records the findings
+                                        investigate, build and review each family's case; the host checks and proposes
+                                        changes, lands them when live, and publishes unverified lessons
   momentum loop runs [--since WHEN] [--case ID] [--json]
   momentum loop eval [--golden FILE] [--task ID,...] [--trials K] [--arms loop,native]
                      [--budget USD] [--parallel N] [--held-out ID,...] [--split all|development|held-out] [--json]
                                         the loop's runs, and what the live ones spent in the last day and week
+  momentum loop lesson --case ID --text TEXT
+                                        publish an unverified lesson to tacit
+  momentum ship prepare|check|propose|status|land|rollback --case ID [OPTIONS]
+                                        the owner controls a host change package
   momentum version
 Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json), and the
 capacity rules in its capacity section.
@@ -152,6 +156,8 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		err = capacityCmd(ctx, args[1:], stdout, stderr)
 	case "case":
 		err = caseCmd(ctx, args[1:], stdout, stderr)
+	case "ship":
+		err = shipCmd(ctx, args[1:], stdout, stderr)
 	case "loop":
 		err = loopCmd(ctx, args[1:], stdout, stderr)
 	case "version":

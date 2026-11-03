@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,7 +22,11 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-const StepInvestigate = "investigate"
+const (
+	StepInvestigate = "investigate"
+	StepBuild       = "build"
+	StepReview      = "review"
+)
 
 // Budgets are the loop's limits, in US dollars and time. The defaults come from the Phase 0 baseline: what the
 // native path spent to answer a family once (kept on the machine). A case may not cost more than a native family
@@ -38,6 +43,10 @@ var DefaultBudgets = Budgets{Run: 4, Case: 20, Day: 40, Week: 200, RunTime: 30 *
 // Runner owns case changes and the pass's host inputs.
 type Runner struct {
 	Store              *store.Store
+	Ship               *Ship
+	Toolchains         Toolchains
+	Tacit              string
+	Post               func(context.Context, string, string, string) (string, error)
 	Agent              Agent
 	Detectors          []detect.Detector
 	Families           []string
@@ -48,6 +57,7 @@ type Runner struct {
 	Now                func() time.Time
 	Log                func(format string, args ...any)
 	pass               *passInputs
+	pickedSkips        []Done
 }
 
 // Options are what one run of the loop does.
@@ -133,12 +143,14 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		starts []reserved
 		picked error
 	)
+	building := false
 	for _, fam := range families {
 		if ctx.Err() != nil { // the pass was told to stop (a signal): no run starts
 			done = append(done, Done{Family: fam, Skipped: "stopped: " + ctx.Err().Error()})
 			continue
 		}
 		c, step, why, err := r.pick(ctx, fam, o.Case, o.Dry)
+		done = append(done, r.pickedSkips...)
 		if err != nil {
 			picked = err
 			break
@@ -149,6 +161,10 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 			continue
 		case o.Dry:
 			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Skipped: "dry: " + why})
+			continue
+		}
+		if step == StepBuild && building {
+			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Skipped: "another case builds in this pass"})
 			continue
 		}
 		if why, err := r.affordable(ctx); why != "" || err != nil {
@@ -162,13 +178,36 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		}
 		run, inputErr := r.prepareRun(ctx, c, fam, step)
 		if inputErr != nil {
-			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Skipped: "inputs: " + inputErr.Error()})
+			if step == StepBuild && held(inputErr) {
+				done = append(done, r.buildSkipped(ctx, c, "prepare", inputErr))
+				continue
+			}
+			if step == StepBuild {
+				run, refusal := r.reservePrepared(ctx, run)
+				if refusal != "" {
+					done = append(done, Done{Family: fam, Case: c.ID, Step: step, Run: run, Skipped: refusal})
+					continue
+				}
+				key := "build inputs"
+				var staged *buildStageError
+				if errors.As(inputErr, &staged) {
+					key = staged.key
+				}
+				res := Result{Started: true, CostKnown: true, Status: store.RunFailed, Failure: key, Text: inputErr.Error()}
+				r.finish(context.WithoutCancel(ctx), c, &run, res, nil)
+				done = append(done, Done{Family: fam, Case: c.ID, Step: step, Run: run})
+			} else {
+				done = append(done, Done{Family: fam, Case: c.ID, Step: step, Skipped: "inputs: " + inputErr.Error()})
+			}
 			continue
 		}
 		run, refusal := r.reservePrepared(ctx, run)
 		if refusal != "" {
 			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Run: run, Skipped: refusal})
 			continue
+		}
+		if step == StepBuild {
+			building = true
 		}
 		starts = append(starts, reserved{fam, step, c, run})
 	}
@@ -190,8 +229,46 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 	if picked != nil {
 		return done, picked
 	}
+	if !o.Dry {
+		done = append(done, r.reviews(ctx, o.Case, families...)...)
+		if err := r.noteWaiting(ctx); err != nil {
+			r.logf("waiting packages: %v", err)
+		}
+		if err := r.lessons(ctx, o.Case, families); err != nil {
+			return done, err
+		}
+	}
 	sort.Slice(done, func(i, j int) bool { return done[i].Family+done[i].Step < done[j].Family+done[j].Step })
 	return done, nil
+}
+
+func (r *Runner) buildSkipped(ctx context.Context, c store.Case, stage string, cause error) Done {
+	if err := r.noteBuildSkip(ctx, c, stage, cause.Error()); err != nil {
+		r.logf("build waiting note: %v", err)
+	}
+	return Done{Family: c.Family, Case: c.ID, Step: StepBuild, Skipped: cause.Error()}
+}
+
+func (r *Runner) noteBuildSkip(ctx context.Context, c store.Case, stage, why string) error {
+	detail, err := Redact(ctx, why)
+	if err != nil {
+		return err
+	}
+	detail = store.CaseNoteText(detail)
+	cause := sha256.Sum256([]byte(detail))
+	id := "loop-build:" + store.IDPart(c.ID) + ":" + stage + ":" + hex.EncodeToString(cause[:])
+	notes, err := r.Store.Notes(ctx)
+	if err != nil {
+		return err
+	}
+	for _, note := range notes {
+		if note.ID == id && note.Detail == detail {
+			return nil
+		}
+	}
+	_, err = r.Store.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Importance: store.ImportanceLow,
+		At: r.now(), Title: "The loop's build for case " + c.ID + " waits: " + stage, Detail: detail})
+	return err
 }
 
 // endStale ends the runs that started longer ago than any run may last and never ended: killed with the process
@@ -231,6 +308,7 @@ func (r *Runner) endStale(ctx context.Context) error {
 
 // pick takes investigating cases before open cases, subject to reservations and budgets.
 func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store.Case, string, string, error) {
+	r.pickedSkips = nil
 	cs, err := r.Store.Cases(ctx, store.CaseFilter{Family: family, All: true})
 	if err != nil {
 		return store.Case{}, "", "", err
@@ -254,15 +332,86 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 			passed = append(passed, c.ID+" has a run in flight")
 			continue
 		}
+		if r.Ship != nil && (c.Status == store.CaseDeployed || c.Status == store.CaseMeasuring) {
+			p, ok, err := r.Ship.Load(c.ID)
+			if err != nil {
+				if noteErr := r.packageProblem(ctx, c, err, dry); noteErr != nil {
+					return store.Case{}, "", "", noteErr
+				}
+				passed = append(passed, c.ID+" package: "+err.Error())
+				r.pickSkipped(c, "package", err)
+				continue
+			}
+			if ok && p.Cleanup != "" && !dry {
+				if _, err := r.Ship.retryCleanup(ctx, c.ID); err != nil {
+					passed = append(passed, c.ID+" cleanup: "+err.Error())
+					r.pickSkipped(c, "cleanup", err)
+				}
+			}
+			if ok && (p.State == RolledBack || p.State == RollingBack) {
+				if !dry {
+					if _, err := r.Ship.RollBack(ctx, c.ID, "resume rollback"); err != nil {
+						passed = append(passed, c.ID+" rollback: "+err.Error())
+						r.pickSkipped(c, "rollback", err)
+						continue
+					}
+				}
+				passed = append(passed, c.ID+" has a rollback; its receipt precedes more work")
+				continue
+			}
+		}
 		step, rank := "", 0
 		switch c.Status {
 		case store.CaseTesting:
-			passed = append(passed, c.ID+" builds are not in this build")
-			continue
-		case store.CaseClosed:
-			if c.Reason == store.Improved {
-				passed = append(passed, c.ID+" builds are not in this build")
+			step, rank = StepBuild, 3
+			if r.Ship == nil {
+				passed = append(passed, c.ID+" has no ship tool")
+				continue
 			}
+			if p, ok, err := r.Ship.Load(c.ID); err != nil {
+				if noteErr := r.packageProblem(ctx, c, err, dry); noteErr != nil {
+					return store.Case{}, "", "", noteErr
+				}
+				passed = append(passed, c.ID+" package: "+err.Error())
+				r.pickSkipped(c, "package", err)
+				continue
+			} else if ok && p.State == Landed {
+				if !dry {
+					if p.Cleanup != "" {
+						if _, err := r.Ship.retryCleanup(ctx, c.ID); err != nil {
+							passed = append(passed, c.ID+" cleanup: "+err.Error())
+							r.pickSkipped(c, "cleanup", err)
+						}
+					}
+					if _, err := r.Store.DeployCase(ctx, c.ID, r.Ship.pkgDir(c.ID), p.LandedAt, p.PR+": "+p.Title, "loop"); err != nil {
+						passed = append(passed, c.ID+" deployment: "+err.Error())
+						r.pickSkipped(c, "deploy", err)
+						continue
+					}
+				}
+				passed = append(passed, c.ID+" has landed; deployment precedes more work")
+				continue
+			} else if ok && proposalsUsed(p) {
+				passed = append(passed, c.ID+" used its proposals")
+				continue
+			} else if ok && roundsUsed(p) {
+				passed = append(passed, c.ID+" used its review rounds")
+				continue
+			} else if ok && (p.State == Proposed || p.State == Landing) {
+				continue // its review or its landing comes next (reviews)
+			}
+			if repo, err := r.caseRepo(ctx, c); err != nil {
+				return store.Case{}, "", "", err
+			} else if repo == "" {
+				if !dry {
+					if err := r.waitingRepo(ctx, c); err != nil {
+						return store.Case{}, "", "", err
+					}
+				}
+				passed = append(passed, c.ID+" waits for a repository")
+				continue
+			}
+		case store.CaseClosed:
 			continue
 		case store.CaseInvestigating:
 			step, rank = StepInvestigate, 2
@@ -302,6 +451,51 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 		return a.c.Seen.After(b.c.Seen)
 	})
 	return cands[0].c, cands[0].step, fmt.Sprintf("%s %s (%s, %d evidence)", cands[0].step, cands[0].c.ID, cands[0].c.Status, cands[0].c.Evidence), nil
+}
+
+func (r *Runner) pickSkipped(c store.Case, step string, cause error) {
+	r.pickedSkips = append(r.pickedSkips, Done{Family: c.Family, Case: c.ID, Step: step, Skipped: cause.Error()})
+}
+
+func (r *Runner) packageProblem(ctx context.Context, c store.Case, cause error, dry bool) error {
+	if dry {
+		return nil
+	}
+	notes, err := r.Store.Notes(ctx)
+	if err != nil {
+		return err
+	}
+	id := "loop-package:" + store.IDPart(c.ID)
+	for _, note := range notes {
+		if note.ID == id {
+			return nil
+		}
+	}
+	detail, err := Redact(ctx, cause.Error())
+	if err != nil {
+		return err
+	}
+	_, err = r.Store.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Importance: store.ImportanceLow, At: r.now(),
+		Title: "The loop cannot read the package for case " + c.ID, Detail: detail})
+	return err
+}
+
+func (r *Runner) caseNoteOnce(ctx context.Context, id, action, detail string) error {
+	clean, err := Redact(ctx, detail)
+	if err != nil {
+		return err
+	}
+	clean = store.CaseNoteText(clean)
+	log, err := r.Store.CaseLog(ctx, id)
+	if err != nil {
+		return err
+	}
+	for _, entry := range log {
+		if entry.Action == action && entry.Detail == clean {
+			return nil
+		}
+	}
+	return r.Store.CaseNote(cleanedNote(ctx), id, action, clean, "loop")
 }
 
 // stopped applies the stop rule: a case whose last two live runs that ran (a refusal of the budgets is no run, and a run the
@@ -377,11 +571,23 @@ func (r *Runner) reservePrepared(ctx context.Context, run store.LoopRun) (store.
 
 func (r *Runner) step(ctx context.Context, family string, c store.Case, step string, run store.LoopRun) Done {
 	res, err := r.invoke(ctx, family, c, step, run)
+	return r.completeStep(context.WithoutCancel(ctx), c, run, res, err)
+}
+
+func (r *Runner) completeStep(ctx context.Context, c store.Case, run store.LoopRun, res Result, err error) Done {
 	if res.InputSummary == "" {
 		res.InputSummary = run.Summary
 	}
-	r.finish(context.WithoutCancel(ctx), c, &run, res, err)
-	return Done{Family: family, Case: c.ID, Step: step, Run: run, Refused: res.Refused}
+	r.finish(ctx, c, &run, res, err)
+	if run.Step == StepBuild && held(err) {
+		stage := "ship"
+		var staged *buildStageError
+		if errors.As(err, &staged) {
+			stage = strings.TrimPrefix(staged.key, "build ")
+		}
+		return r.buildSkipped(ctx, c, stage, err)
+	}
+	return Done{Family: c.Family, Case: c.ID, Step: run.Step, Run: run, Refused: res.Refused}
 }
 
 // finish records how a run ended, on the run and on its case.
@@ -447,15 +653,25 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 		}
 	}
 
-	if err := r.Store.FinishLoopRun(ctx, *run); err != nil {
-		r.logf("record run %s: %v", run.ID, err)
+	var recordErr error
+	if run.Step == StepBuild && held(err) {
+		recordErr = r.Store.HoldLoopRun(ctx, *run)
+	} else {
+		recordErr = r.Store.FinishLoopRun(ctx, *run)
+	}
+	if recordErr != nil {
+		r.logf("record run %s: %v", run.ID, recordErr)
 		return
 	}
 }
 
 // keepFindings records an investigation's findings into its case, and logs why when it records nothing.
 func (r *Runner) keepFindings(ctx context.Context, run store.LoopRun, f finding, reported bool, undecided string) error {
+	if reported && f.Repo != "" && !repoName.MatchString(f.Repo) {
+		return fmt.Errorf("invalid investigation repository name")
+	}
 	own, recorded, err := recordFindings(ctx, r.Store, run.Case, run.CaseEpisode, f, reported, undecided, "loop:"+run.ID)
+
 	switch {
 	case err != nil:
 		r.logf("record the findings of %s: %v", run.Case, err)
@@ -490,13 +706,19 @@ func (r *Runner) affordable(ctx context.Context) (string, error) {
 }
 
 func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step string, run store.LoopRun) (Result, error) {
+	if step == StepBuild {
+		return r.build(ctx, c, run)
+	}
 	if step != StepInvestigate {
-		return Result{}, fmt.Errorf("builds are not in this build")
+		return Result{}, fmt.Errorf("unknown step %s", step)
 	}
 	return r.investigate(ctx, c, run)
 }
 
 func summaryOf(res Result) string {
+	if res.Failure != "" && res.Text != "" {
+		return res.Text
+	}
 	var rep struct {
 		Outcome   string `json:"outcome"`
 		Summary   string `json:"summary"`

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 
 	"path/filepath"
 
@@ -85,7 +86,7 @@ func selectionRunner(st *store.Store, c config.Loop) *loop.Runner {
 	if len(families) == 0 {
 		families = defaultFamilies
 	}
-	return &loop.Runner{Store: st,
+	return &loop.Runner{Store: st, Ship: &loop.Ship{Store: st, Dir: loopDir()},
 		Families: families, Budgets: b, Dir: loopDir()}
 }
 
@@ -109,6 +110,18 @@ func setup(st *store.Store, c config.Loop) (*loop.Runner, error) {
 		return nil, err
 	}
 	r.Agent = loop.Agent{Runner: c.Runner, Model: model, Fallback: fallback, Bedrock: &loop.Bedrock{File: c.BedrockEnv}}
+	r.Ship = setupShip(st, c)
+	r.Toolchains = loop.Toolchains{ReadOnly: r.Ship.Sandbox.ReadOnly, Path: r.Ship.Sandbox.Path, Cache: r.Ship.Sandbox.Cache,
+		GoRoot: r.Ship.Sandbox.GoRoot, GoModules: r.Ship.Sandbox.GoModules}
+	r.Tacit = "tacit"
+	r.Post = func(ctx context.Context, repo, pr, body string) (string, error) {
+		cctx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		cmd := exec.CommandContext(cctx, "gh", "pr", "comment", pr, "--repo", repo, "--body", body)
+		cmd.Env = loop.CleanEnv(nil)
+		out, e := commandOutput(cmd, false)
+		return strings.TrimSpace(string(out)), e
+	}
 	r.Detectors = ds
 	r.Rules, r.Constraints = c.Rules, c.Constraints
 	tacit := c.TacitStore
@@ -126,6 +139,9 @@ func within(p, dir string) bool {
 
 // loopCmd runs the improvement loop once, or lists its runs.
 func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) > 0 && args[0] == "lesson" {
+		return loopLesson(ctx, args[1:], stdout, stderr)
+	}
 	if len(args) > 0 && args[0] == "eval" {
 		return loopEval(ctx, args[1:], stdout, stderr)
 	}
@@ -322,4 +338,30 @@ func loopRuns(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		fmt.Fprintf(stdout, "spent by live runs: $%.2f in the last day, $%.2f in the last week\n", day, week)
 	}
 	return nil
+}
+
+func loopLesson(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("loop lesson", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	id := fs.String("case", "", "the case")
+	text := fs.String("text", "", "the lesson, one line")
+	if err := fs.Parse(args); err != nil {
+		return usageError{err.Error()}
+	}
+	if *id == "" || fs.NArg() != 0 {
+		return usageError{"loop lesson needs --case ID and --text TEXT"}
+	}
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	if err = loop.PublishLesson(ctx, st, &loop.Ship{Dir: loopDir()}, *id, *text, "tacit", caseActor()); err != nil {
+		if errors.Is(err, loop.ErrRefused) {
+			return usageError{err.Error()}
+		}
+		return err
+	}
+	_, err = fmt.Fprintf(stdout, "%s: lesson publication recorded\n", *id)
+	return err
 }

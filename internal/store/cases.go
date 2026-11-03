@@ -312,14 +312,26 @@ func live(ctx context.Context, q querier, id string) (Case, error) {
 
 // caseLog adds a line to a case's log.
 func caseLog(ctx context.Context, q querier, id, actor, action, detail string, at time.Time) error {
+	var err error
+	if detail, err = cleanText(ctx, detail); err != nil {
+		return err
+	}
+	return caseLogCleaned(ctx, q, id, actor, action, detail, at)
+}
+
+// caseLogCleaned writes text already cleaned before its transaction began.
+func caseLogCleaned(ctx context.Context, q querier, id, actor, action, detail string, at time.Time) error {
 	if actor == "" {
 		actor = "unknown"
 	}
 	_, err := q.ExecContext(ctx, `INSERT INTO case_log (case_id, seq, at, actor, action, detail)
 	  VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM case_log WHERE case_id = ?), ?, ?, ?, ?)`,
-		id, id, at.UnixMilli(), caseText(actor, 80), action, caseText(detail, caseTextMax))
+		id, id, at.UnixMilli(), caseText(actor, 80), action, CaseNoteText(detail))
 	return err
 }
+
+// CaseNoteText is the stored form of a case note after its caller cleans it.
+func CaseNoteText(text string) string { return caseText(text, caseTextMax) }
 
 // resolveEvidence checks a piece of evidence and fills it in. An event's reference (ev:ID) always takes the
 // event's own time, kind and summary, whatever the caller gave, and a note's (note:ID) the note's time, kind and
@@ -744,7 +756,7 @@ func (s *Store) UpdateCase(ctx context.Context, id string, u CaseUpdate, actor s
 // the run, in one transaction that reads the case by its own id without following a merge, only while that case
 // has not gone into another and is still open or investigating (a case moved on since the run started keeps what
 // it has). The bool says whether they were recorded.
-func (s *Store) RecordFindings(ctx context.Context, id string, episode int64, u CaseUpdate, actor string) (Case, bool, error) {
+func (s *Store) RecordFindings(ctx context.Context, id string, episode int64, u CaseUpdate, actor string, notes ...CaseEntry) (Case, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Case{}, false, err
@@ -759,6 +771,11 @@ func (s *Store) RecordFindings(ctx context.Context, id string, episode int64, u 
 	}
 	if c, err = updateCase(ctx, tx, c, u, actor, time.Now()); err != nil {
 		return Case{}, false, err
+	}
+	for _, note := range notes {
+		if err := caseLog(ctx, tx, c.ID, actor, note.Action, note.Detail, time.Now()); err != nil {
+			return Case{}, false, err
+		}
 	}
 	return c, true, tx.Commit()
 }
@@ -1250,6 +1267,10 @@ func (s *Store) SweepCases(ctx context.Context, now time.Time, retention time.Du
 // DeployCase is the ship tool's: a case in testing goes to deployed, with its change package and the time its
 // change went in, from which its measurement counts. Nothing else deploys a case.
 func (s *Store) DeployCase(ctx context.Context, id, pkg string, at time.Time, what, actor string) (Case, error) {
+	what, err := cleanText(ctx, what)
+	if err != nil {
+		return Case{}, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Case{}, err
@@ -1269,7 +1290,7 @@ func (s *Store) DeployCase(ctx context.Context, id, pkg string, at time.Time, wh
 		CaseDeployed, pkg, at.UnixMilli(), time.Now().UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
-	if err := caseLog(ctx, tx, c.ID, actor, "deployed", what, time.Now()); err != nil {
+	if err := caseLogCleaned(ctx, tx, c.ID, actor, "deployed", what, time.Now()); err != nil {
 		return Case{}, err
 	}
 	if c, err = getCase(ctx, tx, c.ID); err != nil {
@@ -1281,6 +1302,10 @@ func (s *Store) DeployCase(ctx context.Context, id, pkg string, at time.Time, wh
 // RollBackCase is the ship tool's: a deployed or measuring case whose change was undone goes back to testing,
 // with no measurement, since its change is gone.
 func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, error) {
+	why, err := cleanText(ctx, why)
+	if err != nil {
+		return Case{}, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Case{}, err
@@ -1297,7 +1322,7 @@ func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, 
 	  effect = '', updated = ? WHERE id = ?`, CaseTesting, time.Now().UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
-	if err := caseLog(ctx, tx, c.ID, actor, "rolled back", why, time.Now()); err != nil {
+	if err := caseLogCleaned(ctx, tx, c.ID, actor, "rolled back", why, time.Now()); err != nil {
 		return Case{}, err
 	}
 	if c, err = getCase(ctx, tx, c.ID); err != nil {

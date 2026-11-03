@@ -6,8 +6,6 @@ import (
 	"strings"
 )
 
-func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
-
 // fixtureResult posts each synthetic call and prints the harness's result line.
 func fixtureResult(result string) string {
 	var r struct {
@@ -24,7 +22,13 @@ func fixtureResult(result string) string {
 	if r.Output > 0 {
 		maximum = r.Output
 	}
-	body, _ := json.Marshal(map[string]any{"max_tokens": maximum, "messages": []any{map[string]string{"role": "user", "content": "marker-7f3a"}}, "fixture_report": r.Report, "fixture_refusal": strings.Contains(r.Text, "safeguards"), "fixture_output_tokens": r.Output, "fixture_no_usage": r.NoUsage})
+	// the report travels as text: a report is JSON data that may hold a "source" key, which the relay refuses outside
+	// a tool input
+	report := string(r.Report)
+	if report == "" {
+		report = "null"
+	}
+	body, _ := json.Marshal(map[string]any{"max_tokens": maximum, "messages": []any{map[string]string{"role": "user", "content": "marker-7f3a"}}, "fixture_report": report, "fixture_refusal": strings.Contains(r.Text, "safeguards"), "fixture_output_tokens": r.Output, "fixture_no_usage": r.NoUsage})
 	return fmt.Sprintf(`python3 - %s %d <<'PYFIXTURE'
 import sys, os, urllib.request, time
 body=sys.argv[1].encode()

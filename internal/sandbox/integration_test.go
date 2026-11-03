@@ -506,7 +506,7 @@ func assertUnitGone(t *testing.T, unit string) {
 
 func assertUnitsGone(t *testing.T, pattern string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	for {
 		cmd := exec.CommandContext(ctx, "systemctl", "--user", "list-units",

@@ -4,7 +4,7 @@ One tool that keeps improving an agent system: how agents behave during work, an
 
 It asks standing questions (what made the owner step in, what he keeps doing by hand, which sessions wait on him, what wastes load or money, what is running out of room, which component works poorly, which failures recur, what new work could replace a part of the setup), answers them with evidence, ships the improvements it is allowed to ship, and measures whether they helped.
 
-Status: milestone 1 (the evidence layer) in progress. See [SPEC.md](SPEC.md).
+Status: design. Evidence, cases and the sandboxed loop are implemented. Measurement follows. See [SPEC.md](SPEC.md).
 
 ## Sandbox
 
@@ -177,7 +177,7 @@ momentum case reopen ID --evidence REF... [--at WHEN] --why W
 
 `case detect` runs the detectors, deterministic reads with no model (of the store, and for sessions of what the replay of supervision reads): recurring tool and infrastructure failures (guard refusals, harness and tool errors, commands that fail the setup's way, model refusals, incidents), the owner's own turns that push back or repeat with the agent's last words before them, and what keeps sessions waiting on him (supervision's give-ups, nudges no rule covers, long waits). Each finding is a signature; a case opens for a new one, and the case that holds it takes the evidence.
 
-A case is one answer in progress to a standing question: its family, its evidence, the suspected mechanism and the alternatives, the next test that tells them apart, the expected benefit, what it cost so far, and its status (open, investigating, testing, deployed, measuring, closed with a reason). A symptom's signature opens a case, and the same signature finds it again; the root cause's signature merges the cases it explains. A closed case comes back on new evidence only: a recurrence after it was solved, its old rate after it improved, or as much again as it was dismissed on. Deployment, measurement and improved closure remain for later parts. This build investigates. A case unseen for 30 days closes by itself.
+A case is one answer in progress to a standing question: its family, its evidence, the suspected mechanism and the alternatives, the next test that tells them apart, the expected benefit, what it cost so far, and its status (open, investigating, testing, deployed, measuring, closed with a reason). A symptom's signature opens a case, and the same signature finds it again; the root cause's signature merges the cases it explains. A closed case comes back on new evidence only: a recurrence after it was solved, its old rate after it improved, or as much again as it was dismissed on. The host deploys checked and reviewed packages. Measurement and improved closure remain for the next part. A case unseen for 30 days closes by itself.
 
 ## Loop
 
@@ -186,11 +186,17 @@ momentum loop [--dry] [--family F,F] [--case ID] [--json]
 momentum loop runs [--since WHEN] [--case ID] [--json]
 ```
 
-This build investigates one case per family with Claude Code's native agent in print mode. The host records its mechanism, alternatives, fix and summary. A complete report moves the case to testing; builds and later steps are outside this build. Two runs that fail the same way stop the case and open a component-health case.
+The loop investigates, builds and reviews through Claude Code's native agent in print mode. The host records investigation findings and an optional repository NAME under `/ro/repos`. A complete report moves the case to testing. A code fix needs an admitted repository; a case without one waits with a passive note. Two runs of the same step that fail the same way stop the case and open a component-health case.
+
+Run the loop tests with `go test -timeout 50m ./internal/loop`. Use `-run` for focused checks. The sandbox checks can exceed Go's default timeout.
+
+The host gates the source repository and prepares independent host and build clones at BASE. A build edits `/work`, runs its discriminating test and returns summary, test, title, body, rollback, signal, window and lesson. Toolchains and module caches are read-only, with build caches in tmpfs. A second sandbox job without a relay or harness exports the cumulative patch. The host reads that one confined file, validates it, applies it in its clone and checks that the test fails on BASE and passes on the change. It proposes exactly the checked tree.
+
+A review reads the proposed tree at `/ro/change` read-only and the patch at `/run/input/change.patch`. The host keeps the findings locally. A private repository receives the cleaned findings; a repository that is not private receives host-built text only. Before publishing a patch there, the host scans its added lines and file names for personal content and secrets and refuses a hit. High and medium findings return to a build with `review.md`. A moved base supplies `previous.patch` for adaptation. Three review rounds are allowed. Two closed, unmerged proposals stop automatic builds. Exhausted changes and reviews held by budget or the stop rule wait with passive notes. The owner can still propose a checked package. A clean posted review can land when `loop.live` is true. Every push rechecks the repository gate. Landing and rollback use host journals and fast-forward pushes. Rollback restores already published content and skips the public-patch scan. An improved case's lesson is published by the host without another model run. Measurement is the next part.
 
 The host prepares scrubbed inputs before any model starts: the last 30 days of events and notes, evidence records and neighbours, unit logs, text configuration, tacit's facts and full-history repository clones. Pass-level copies are made once, shared read-only and removed at the end. Each run gets its own records and case file. A missing or failed scrubber skips the step without charging the case. A dry pass prepares nothing and writes nothing.
 
-The agent has `momentum-ro` on PATH at `/opt/momentum/momentum-ro`, bound read-only from the same pinned binary used by the host records child. It also reads `/ro/store.sqlite` with python3's sqlite3, and reads `/ro/records`, `/ro/config`, `/ro/clone`, `/ro/repos` and `/run/input`. `/work` is scratch; `/out/findings.md` preserves partial findings. The host reads only that bounded regular file if the run returns no report. It treats all run output as untrusted, scrubs findings and never runs programs or git from writable run directories.
+The agent has `momentum-ro` on PATH at `/opt/momentum/momentum-ro`, bound read-only from the same pinned binary used by the host records child. It also reads `/ro/store.sqlite` with python3's sqlite3, and reads `/ro/records`, `/ro/config`, `/ro/clone`, `/ro/repos` and `/run/input`. `/work` is scratch for investigations; `/out/findings.md` preserves partial findings. The host reads only that bounded regular file if the run returns no report. It treats all run output as untrusted, scrubs findings and never runs programs or Git on the host in writable run directories. The separate patch unit runs Git inside the fixed sandbox.
 
 `momentum-ro evidence events` uses the host's filters, ordering and limits; `evidence show ev:ID [ID...] [--bytes N]` reads up to ten events with their frozen records and lists indexed neighbours from the same session. `evidence status [--since DUR]` counts sources and kinds. `evidence unit NAME` reads a frozen unit log. `case show` prints the case, evidence and log; `case show --json` prints the input file. `--store`, `--records` and `--case` override the run paths for tests only.
 
@@ -212,7 +218,23 @@ Host `evidence show` scrubs all headers and whole records in one batch, then cli
 }}
 ```
 
-Existing build-related loop configuration keys still load. Run the pass from its own oneshot user unit after ingest.
+`loop.owners`, `loop.exclude`, `loop.repo_guard`, `loop.sandbox_read`, `loop.capacity_gate` and `loop.live` control host builds and landing. A missing repository guard refuses writes. Run the pass from its own oneshot user unit after ingest.
+
+## The ship tool
+
+The owner's CLI controls the same host package lifecycle:
+
+```
+momentum ship prepare --case ID --repo DIR
+momentum ship check --case ID --test "go test ./..." --patch FILE
+momentum ship propose --case ID --title TITLE --body-file FILE --rollback TEXT --signal JSON --window 7d --lesson TEXT --patch FILE
+momentum ship status --case ID [--json]
+momentum ship land --case ID
+momentum ship rollback --case ID --why TEXT
+momentum loop lesson --case ID --text TEXT
+```
+
+Agent runs return reports. The host calls the ship tool's methods. Patch validation, export, publication leases, landing and rollback are specified in [The ship tool](SPEC.md#the-ship-tool).
 
 ## Evaluation
 

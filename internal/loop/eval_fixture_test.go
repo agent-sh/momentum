@@ -34,7 +34,7 @@ func evalFixture(t *testing.T) (*Eval, GoldenTask) {
 		Budget: 50, Parallel: 1, GoldenHash: digest("fixture golden file")}, task
 }
 
-func run(t *testing.T, dir, program string, args ...string) string {
+func gitRun(t *testing.T, dir, program string, args ...string) string {
 	t.Helper()
 	if program != "git" {
 		t.Fatal("historical fixtures run only git")
