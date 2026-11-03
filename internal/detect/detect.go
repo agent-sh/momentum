@@ -22,7 +22,7 @@ import (
 
 // Versions name each family's signatures. A detector that keys a problem otherwise takes its family a new
 // version: its signatures are new, and the cases of the old version keep theirs. Another family's stay.
-var Versions = map[string]string{"failures": "v1", "owner-burden": "v1", "sessions": "v1", "component-health": "v1"}
+var Versions = map[string]string{"failures": "v2", "owner-burden": "v1", "sessions": "v1", "component-health": "v1"}
 
 // Window is the span a detector reads.
 type Window struct{ Since, Until time.Time }

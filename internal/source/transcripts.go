@@ -17,11 +17,13 @@ import (
 	"github.com/agent-sh/tacit/client/pkg/evidence"
 
 	"github.com/agent-sh/momentum/internal/store"
+	"github.com/agent-sh/momentum/internal/toolresult"
 )
 
-// Transcripts reads the agents' session history through tacit's reader (tacit's pkg/evidence): Claude Code
-// with its subagents, Codex with its compressed rollouts, pi with its tasks, and the Hermes store, where tacit
-// finds them under each home. Who wrote each item is tacit's call, never a copy of its rules.
+// Transcripts reuses tacit's Claude Code, Codex, pi and Hermes readers and native
+// adapters for OpenCode, Grok and Kimi. They share redaction and the event writer.
+// Native provenance gates ownership before tacit's attribution primitives split
+// a turn; a user role alone is not ownership.
 //
 // Each transcript has a file cursor: the offset after the last line stored and the reader's saved State, so
 // a growing session costs only what was added to it. The file is told from a new one by its inode and a
@@ -35,8 +37,9 @@ import (
 // with the cursor, holds transcript lines unredacted (tacit's rules need them whole): it is as private as the
 // transcript, and is never printed or sent.
 type Transcripts struct {
-	Homes   []string // home directories to find sessions under
-	Workers int      // files read at once; 0 is DefaultWorkers()
+	Homes   []string           // home directories to find sessions under
+	Sources []TranscriptSource // additional locations in sources.json
+	Workers int                // files read at once; 0 is DefaultWorkers()
 
 	// records, redact and ready are tacit's redaction (evidence.RedactRecordsContext, evidence.RedactEvents,
 	// evidence.RedactionReady); tests replace them. A source given redact and no records has no records mode:
@@ -101,6 +104,7 @@ type job struct {
 	// a Hermes session
 	db      *evidence.HermesDB
 	session evidence.HermesSession
+	native  *nativeJob
 }
 
 // part is a piece of a job read and not yet stored: its items, the cursor after them, and the places of the
@@ -207,6 +211,14 @@ func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error
 			}
 		}
 	}
+	extra, closers, extraListed := s.nativeJobs(ctx, cursors, seen, t)
+	jobs = append(jobs, extra...)
+	listed = listed && extraListed
+	defer func() {
+		for _, close := range closers {
+			close()
+		}
+	}()
 	// The largest first, so the workers end together.
 	sort.SliceStable(jobs, func(a, b int) bool { return jobs[a].size() > jobs[b].size() })
 
@@ -274,7 +286,7 @@ func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error
 		return t.res, err
 	}
 	if len(t.failed) > 0 {
-		return t.res, fmt.Errorf("%d of %d files not stored past their cursor", len(t.failed), len(jobs))
+		return t.res, fmt.Errorf("%d transcript inputs not read or stored past their cursor", len(t.failed))
 	}
 	return t.res, nil
 }
@@ -398,6 +410,10 @@ func hermesJobs(ctx context.Context, src evidence.Source, cursors map[string]sto
 // readJob reads what is new in one transcript or Hermes session, a part at a time, and hands each part to
 // add, which says whether to go on.
 func (s Transcripts) readJob(ctx context.Context, j *job, t *tally, add func(part) bool) {
+	if j.native != nil {
+		s.readNativeJob(ctx, j, t, add)
+		return
+	}
 	from, restart := j.from()
 	retried := false
 	for {
@@ -762,6 +778,7 @@ func toPending(e evidence.Event) (pending, bool) {
 	case evidence.KindToolCall:
 		p.texts, p.keep = cutHead(e.ToolInput, textChars)
 	case evidence.KindToolResult:
+		e.IsError = toolresult.Failed(e.Harness, e.ToolName, e.ToolOutput, e.IsError)
 		n := textChars
 		if e.IsError {
 			n = errorChars
@@ -834,6 +851,12 @@ func oneLine(s string, cut bool) string {
 // after the transcript's file name, which is its session's own, so its events keep their keys when the harness
 // moves or compresses the file, or after the Hermes store. An item's key is its place and its index in the record.
 func place(e evidence.Event) string {
+	if e.Harness == "opencode" {
+		return fmt.Sprintf("opencode:%s@%012d#", e.Path, e.Offset)
+	}
+	if e.Harness == "grok" || e.Harness == "kimi" {
+		return nativePlace(e)
+	}
 	name := e.Path
 	if e.Harness != "hermes" {
 		name = evidence.Name(e.Path)

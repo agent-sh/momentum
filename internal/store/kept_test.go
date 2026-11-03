@@ -58,7 +58,7 @@ func rawQuery(t *testing.T, path, q string, dest any) {
 }
 
 // A store as the build before the events were kept left it migrates in place: every event stays, Claude Code's
-// gets the name the transcripts give it, nothing is read again (the cursors stay), and user_version stays at 3,
+// gets the name the transcripts give it, step 5 drops cursors to reread failure status, and user_version stays at 3,
 // the version that build checks before it drops anything.
 func TestAStoreFromBeforeKeptEventsMigratesInPlace(t *testing.T) {
 	ctx, path := context.Background(), filepath.Join(t.TempDir(), "m.db")
@@ -100,8 +100,8 @@ func TestAStoreFromBeforeKeptEventsMigratesInPlace(t *testing.T) {
 	if strings.Join(claude, " ") != "mistakes sessions transcripts" {
 		t.Fatalf("Claude Code's events: %v", claude)
 	}
-	if cs, _ := st.FileCursors(ctx, "transcripts"); len(cs) != 1 {
-		t.Fatalf("the cursors were not kept: %+v", cs)
+	if cs, _ := st.FileCursors(ctx, "transcripts"); len(cs) != 0 {
+		t.Fatalf("step 5 kept stale failure cursors: %+v", cs)
 	}
 	if got, err := st.SessionStamps(ctx); err != nil || len(got) != 1 {
 		t.Fatalf("the stamps: %+v %v", got, err)

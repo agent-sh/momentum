@@ -15,6 +15,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -87,7 +88,7 @@ const Incidents = "incidents"
 
 // Harnesses are the names events give the harnesses, one spelling in every source and in the sessions layer:
 // tacit's reader's (claude, codex, pi, hermes), and opencode, which only the sessions layer reads.
-var Harnesses = []string{"claude", "codex", "pi", "opencode", "hermes"}
+var Harnesses = []string{"claude", "codex", "pi", "opencode", "hermes", "grok", "kimi"}
 
 // querier is what a statement runs on: the database, or one transaction.
 type querier interface {
@@ -209,6 +210,8 @@ var steps = []step{
 	// which serves what events_source served). Nothing is read again. Every harness has one name, tacit's
 	// reader's: Claude Code's events are renamed claude, and keptTriggers name those written later.
 	{version: 4, sql: `UPDATE events SET harness = 'claude' WHERE harness = 'claude-code'`},
+	// Infer failure signals before clipping tool output. Kept events remain.
+	{version: 5, reread: true},
 }
 
 // repairs run in every migration, after the steps. They put right what a build from before the events were kept
@@ -247,8 +250,11 @@ func Open(path string) (*Store, error) {
 	if err := os.Chmod(path, 0o600); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=journal_mode(WAL)&_txlock=immediate",
-		path, BusyTimeout.Milliseconds()))
+	dsn, err := fileURI(path, fmt.Sprintf("_pragma=busy_timeout(%d)&_pragma=journal_mode(WAL)&_txlock=immediate", BusyTimeout.Milliseconds()))
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -278,7 +284,11 @@ func OpenReadOnly(path string) (*Store, error) {
 	if _, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("no store to read: %w; a sessions run, an ingest or a note makes it", err)
 	}
-	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(%d)", path, BusyTimeout.Milliseconds()))
+	dsn, err := fileURI(path, fmt.Sprintf("mode=ro&_pragma=busy_timeout(%d)", BusyTimeout.Milliseconds()))
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -298,6 +308,18 @@ func OpenReadOnly(path string) (*Store, error) {
 		return nil, fmt.Errorf("store %s: %w", path, err)
 	}
 	return &Store{db: db, path: path}, nil
+}
+
+func fileURI(path, query string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	name := filepath.ToSlash(abs)
+	if filepath.VolumeName(abs) != "" && !strings.HasPrefix(name, "/") {
+		name = "/" + name
+	}
+	return (&url.URL{Scheme: "file", Path: name, RawQuery: query}).String(), nil
 }
 
 // busy reports SQLITE_BUSY, or one of its extended codes.
@@ -930,6 +952,7 @@ type Query struct {
 	Actor   Actor  // when set, only its events
 	Main    bool   // only a session's own events, not its subagents'
 	MetaHas string // when set, only events whose meta holds it, e.g. `"is_error":true`
+	Before  *Event // exclusive (time, source key) cursor for descending pagination
 }
 
 func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
@@ -957,6 +980,10 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 	}
 	if q.MetaHas != "" {
 		where, args = append(where, "instr(meta, ?) > 0"), append(args, q.MetaHas)
+	}
+	if q.Before != nil {
+		where = append(where, "(ts < ? OR (ts = ? AND source_key < ?))")
+		args = append(args, q.Before.TS.UnixMilli(), q.Before.TS.UnixMilli(), q.Before.SourceKey)
 	}
 	order := "ts DESC, source_key DESC"
 	if q.Session != "" {

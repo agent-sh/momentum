@@ -1,5 +1,6 @@
 // Package config reads where this machine's signal stores are. The locations are machine-specific, so they
-// live in the configuration directory, never in the code: momentum ships no defaults for them.
+// live in the configuration directory. Opted-in transcript homes use harness
+// directory conventions; additional locations remain in sources.json.
 package config
 
 import (
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 
 	"github.com/agent-sh/momentum/internal/paths"
+	"github.com/agent-sh/momentum/internal/source"
 )
 
 // Sources lists the signal stores to ingest. An empty entry is not ingested.
@@ -24,12 +26,12 @@ type Sources struct {
 	Incidents struct {
 		Dir string `json:"dir"`
 	} `json:"incidents"`
-	// Transcripts are the agents' session histories, read with tacit's reader under each home: Claude Code,
-	// Codex, pi and Hermes, where tacit finds them (the harnesses' own variables apply). Workers is how many
-	// files an ingest reads at once; 0 is the default.
+	// Transcripts read tacit's four harnesses and the native OpenCode, Grok and
+	// Kimi adapters. Sources adds native locations; Workers controls concurrency.
 	Transcripts struct {
-		Homes   []string `json:"homes"`
-		Workers int      `json:"workers"`
+		Homes   []string                  `json:"homes"`
+		Workers int                       `json:"workers"`
+		Sources []source.TranscriptSource `json:"sources"`
 	} `json:"transcripts"`
 	// Sessions configures the live session board. Harness locations come from the harnesses' own variables
 	// (CLAUDE_CONFIG_DIR, CODEX_HOME, XDG_DATA_HOME, HERMES_HOME, PI_CODING_AGENT_DIR), not from here.
@@ -76,6 +78,10 @@ func Load() (Sources, error) {
 	s.Incidents.Dir = paths.Expand(s.Incidents.Dir)
 	for i, p := range s.Transcripts.Homes {
 		s.Transcripts.Homes[i] = paths.Expand(p)
+	}
+	for i := range s.Transcripts.Sources {
+		src := &s.Transcripts.Sources[i]
+		src.Glob, src.DB = paths.Expand(src.Glob), paths.Expand(src.DB)
 	}
 	for i, p := range s.Sessions.Projects {
 		s.Sessions.Projects[i] = paths.Expand(p)

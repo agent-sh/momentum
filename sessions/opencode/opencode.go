@@ -32,10 +32,12 @@ const childWindow = 6 * time.Hour
 // from a cursor in another process would not be what the database holds. The Source keeps no checkpoints: each
 // process reads every message once.
 type Source struct {
-	Env  sessions.Env
-	db   *sql.DB
-	logs map[string]*dbLog
-	seen map[string]time.Time
+	Env    sessions.Env
+	db     *sql.DB
+	logs   map[string]*dbLog
+	seen   map[string]time.Time
+	v2     bool
+	legacy bool
 }
 
 // dbLog is a session's activity log and how far into its messages it has read.
@@ -63,6 +65,13 @@ func (src *Source) open() *sql.DB {
 		path := filepath.Join(src.Env.DataHome, "opencode", "opencode.db")
 		if _, err := os.Stat(path); err == nil {
 			src.db, _ = sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(500)")
+			if src.db != nil {
+				var count int
+				src.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='session_message'`).Scan(&count)
+				src.v2 = count > 0
+				src.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='session'`).Scan(&count)
+				src.legacy = count > 0
+			}
 		}
 	}
 	return src.db
@@ -141,7 +150,7 @@ func (src *Source) Scan(ctx context.Context, w *sessions.World) ([]*sessions.Ses
 func (src *Source) session(ctx context.Context, slot proc.Slot, used map[string]bool, w *sessions.World) (*sessions.Session, error) {
 	p, db := slot.Proc, src.db
 	start := p.Start.UnixMilli() - 1000
-	rows, err := db.QueryContext(ctx, `select id, title, time_created, time_updated from session where directory = ? and parent_id is null
+	rows, err := db.QueryContext(ctx, `select id, title, time_created, time_updated from `+src.sessionRows()+` where directory = ? and parent_id is null
 		and time_archived is null and time_updated >= ? order by time_updated desc limit 20`, slot.Cwd, start)
 	if err != nil {
 		return nil, fmt.Errorf("sessions: %w", err)
@@ -182,7 +191,7 @@ func (src *Source) session(ctx context.Context, slot proc.Slot, used map[string]
 	s.Log = &l.log
 	s.Size = updated
 	// subagents are child sessions with a turn still open
-	crs, err := db.QueryContext(ctx, `select id, title, time_created, time_updated from session where parent_id = ? and time_updated > ?`,
+	crs, err := db.QueryContext(ctx, `select id, title, time_created, time_updated from `+src.sessionRows()+` where parent_id = ? and time_updated > ?`,
 		id, w.Now.Add(-childWindow).UnixMilli())
 	if err != nil {
 		s.Partial = true
@@ -228,7 +237,7 @@ func (src *Source) logOf(key string) *dbLog {
 func (src *Source) facts(ctx context.Context, id string, s *sessions.Session) (bool, error) {
 	db := src.db
 	var data string
-	switch err := db.QueryRowContext(ctx, `select data from message where session_id = ? order by time_created desc limit 1`, id).Scan(&data); {
+	switch err := db.QueryRowContext(ctx, `select data from `+src.messageRows()+` where session_id = ? order by time_created desc limit 1`, id).Scan(&data); {
 	case errors.Is(err, sql.ErrNoRows):
 		return false, nil
 	case err != nil:
@@ -241,7 +250,7 @@ func (src *Source) facts(ctx context.Context, id string, s *sessions.Session) (b
 		s.Ask, s.AskKind = "stopped on an error: "+text.OneLine(text.FirstNonEmpty(last.Error.Data.Message, last.Error.Name), 200), sessions.AskError
 	}
 	s.Model = last.ModelID
-	rows, err := db.QueryContext(ctx, `select p.data, coalesce(m.data, '') from part p left join message m on m.id = p.message_id
+	rows, err := db.QueryContext(ctx, `select p.data, coalesce(m.data, '') from `+src.partRows()+` p left join `+src.messageRows()+` m on m.id = p.message_id
 		where p.session_id = ? order by p.time_created desc limit 40`, id)
 	if err != nil {
 		return open, fmt.Errorf("parts: %w", err)
@@ -284,7 +293,7 @@ func (src *Source) readLog(ctx context.Context, id string, l *dbLog) error {
 // readPage reads one page of messages. more is false when it stopped at a message still streaming, or when the
 // page brought nothing new.
 func (src *Source) readPage(ctx context.Context, id string, l *dbLog) (n int, more bool, err error) {
-	rows, err := src.db.QueryContext(ctx, `select id, time_created, data from message where session_id = ? and time_created >= ?
+	rows, err := src.db.QueryContext(ctx, `select id, time_created, data from `+src.messageRows()+` where session_id = ? and time_created >= ?
 		order by time_created, id limit ?`, id, l.cursor, pageMessages)
 	if err != nil {
 		return 0, false, fmt.Errorf("log: %w", err)
@@ -316,7 +325,7 @@ func (src *Source) readPage(ctx context.Context, id string, l *dbLog) (n int, mo
 		if x.m.Role == "assistant" && x.m.Time.Completed == 0 && x.m.Error == nil {
 			return len(ms), false, nil // still streaming: read it once it is done
 		}
-		prs, err := src.db.QueryContext(ctx, `select data from part where message_id = ? order by time_created`, x.id)
+		prs, err := src.db.QueryContext(ctx, `select data from `+src.partRows()+` where message_id = ? order by time_created,id`, x.id)
 		if err != nil {
 			return len(ms), false, fmt.Errorf("log parts: %w", err)
 		}

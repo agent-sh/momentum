@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/agent-sh/tacit/client/pkg/evidence"
 
@@ -47,8 +48,63 @@ func (s Transcripts) Gone(ctx context.Context, st *store.Store) (int, error) {
 		}
 	}
 	held := map[string]map[string]bool{} // a Hermes store's sessions, by the store
+	nativeFiles := map[string]bool{}
+	nativeStores := map[string]map[string]bool{}
+	for _, src := range s.nativeSources() {
+		if src.Harness == "opencode" {
+			db, err := openOpenCode(src.DB)
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return 0, err
+			}
+			ss, err := db.sessions(ctx)
+			db.Close()
+			if err != nil {
+				return 0, err
+			}
+			abs, err := filepath.Abs(src.DB)
+			if err != nil {
+				return 0, err
+			}
+			ids := map[string]bool{}
+			for _, session := range ss {
+				ids[session.id] = true
+			}
+			nativeStores[abs] = ids
+		} else {
+			files, err := evidence.Glob(src.Glob)
+			if err != nil {
+				return 0, err
+			}
+			for _, path := range files {
+				nativeFiles[evidence.Plain(path)] = true
+			}
+		}
+	}
 	gone := 0
 	for o, n := range origins {
+		if o.Harness == "grok" || o.Harness == "kimi" {
+			if !nativeFiles[evidence.Plain(o.Path)] {
+				gone += n
+			}
+			continue
+		}
+		if o.Harness == "opencode" {
+			path := o.Path
+			if i := strings.LastIndexByte(path, '#'); i >= 0 {
+				path = path[:i]
+			}
+			id := o.Session
+			if o.Agent != "" {
+				id = o.Agent
+			}
+			if !nativeStores[path][id] {
+				gone += n
+			}
+			continue
+		}
 		if o.Harness != "hermes" {
 			if !found[evidence.Name(o.Path)] {
 				gone += n

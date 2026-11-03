@@ -11,8 +11,26 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/source"
+
 	_ "modernc.org/sqlite"
 )
+
+func TestConfiguredNativeTranscriptsWithoutHomes(t *testing.T) {
+	cfg := t.TempDir()
+	t.Setenv("MOMENTUM_CONFIG", cfg)
+	if err := os.WriteFile(filepath.Join(cfg, "sources.json"), []byte(`{"transcripts":{"sources":[{"harness":"kimi","glob":"neutral/*/wire.jsonl"}]}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	sources, err := configured()
+	if err != nil || len(sources) != 1 {
+		t.Fatalf("native-only configuration: %d sources, %v", len(sources), err)
+	}
+	transcripts, ok := sources[0].(source.Transcripts)
+	if !ok || len(transcripts.Sources) != 1 || transcripts.Sources[0].Harness != "kimi" {
+		t.Fatalf("native source not forwarded: %+v", sources)
+	}
+}
 
 func TestIngestRunsEverySourceAndExits3WhenOneFails(t *testing.T) {
 	home, cfg, src := t.TempDir(), t.TempDir(), t.TempDir()
