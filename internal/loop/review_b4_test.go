@@ -140,6 +140,9 @@ func TestPublicReviewUsesOnlyHostText(t *testing.T) {
 	s, f, c, p := b4Reviewed(t)
 	s.GH = b4GH(t, f, "false", "OPEN")
 	p.Reviews[0].Comment, p.Reviews[0].Text = "", "marker-7f3a /home/alice/x alice@example.com"
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
 	r := &Runner{Ship: s, Store: s.Store}
 	r.Post = func(_ context.Context, _, _, body string) (string, error) {
 		if strings.Contains(body, "marker-7f3a") || !strings.Contains(body, p.Head) {

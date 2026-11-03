@@ -61,6 +61,7 @@ var (
 	homePathRe = regexp.MustCompile(`(?i)(?:/(?:home|users)/|/root(?:/|\b)|~[/\\]|[a-z]:\\users\\)[^\s<>"'` + "`" + `)]*`)
 	addressRe  = regexp.MustCompile(`(?i)[a-z0-9.!#$%&'*+/=?^_` + "`" + `{|}~-]+@[a-z0-9.-]+`)
 	hostNameRe = regexp.MustCompile(`(?i)\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)+\b`)
+	ipv4Re     = regexp.MustCompile(`\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b`)
 	ipv6Re     = regexp.MustCompile(`(?i)(?:[a-f0-9]{1,4}:){2,}[a-f0-9:]+(?:%[a-z0-9_-]+)?|::[a-f0-9:]+`)
 )
 
@@ -76,16 +77,43 @@ func Neutral(text string) string {
 	return refRe.ReplaceAllString(text, "$1$2\u200b$3")
 }
 
-// Public masks personal addresses and paths conservatively, without identifying their owner.
-// Dotted names may be file names as well as hosts; both are withheld.
+// Public masks personal addresses, paths and domain-shaped hosts without identifying their owner.
 func Public(ctx context.Context, text string) (string, error) {
 	r, err := Redact(ctx, text)
 	if err != nil {
 		return "", err
 	}
-	r = homePathRe.ReplaceAllString(r, "[personal]")
-	r = addressRe.ReplaceAllString(r, "[personal]")
-	r = ipv6Re.ReplaceAllString(r, "[personal]")
-	r = hostNameRe.ReplaceAllString(r, "[personal]")
-	return Neutral(r), nil
+	return Neutral(maskPersonal(r)), nil
+}
+
+// Source names and versions are dotted too. A short domain suffix list keeps
+// main.go, notes.txt, config.json and go1.22.3 useful in review locations.
+var hostSuffixes = map[string]bool{
+	"com": true, "org": true, "net": true, "edu": true, "gov": true, "mil": true,
+	"io": true, "ai": true, "app": true, "dev": true, "co": true, "uk": true,
+	"example": true, "invalid": true, "test": true, "local": true, "internal": true,
+}
+
+func maskPersonal(text string) string {
+	text = homePathRe.ReplaceAllString(text, "[personal]")
+	text = addressRe.ReplaceAllString(text, "[personal]")
+	text = ipv6Re.ReplaceAllString(text, "[personal]")
+	text = ipv4Re.ReplaceAllString(text, "[personal]")
+	matches := hostNameRe.FindAllStringIndex(text, -1)
+	var out strings.Builder
+	end := 0
+	for _, span := range matches {
+		host := text[span[0]:span[1]]
+		last := strings.LastIndexByte(host, '.')
+		prefix := text[:span[0]]
+		if !hostSuffixes[strings.ToLower(host[last+1:])] &&
+			!strings.HasSuffix(prefix, "://") && !strings.HasSuffix(prefix, "@") {
+			continue
+		}
+		out.WriteString(text[end:span[0]])
+		out.WriteString("[personal]")
+		end = span[1]
+	}
+	out.WriteString(text[end:])
+	return out.String()
 }

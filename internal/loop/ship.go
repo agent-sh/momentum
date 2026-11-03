@@ -383,14 +383,18 @@ func (s *Ship) freshRunClone(ctx context.Context, p Package) error {
 // refreshBase runs before a replacement build is mounted. The old patch is kept in host package data.
 func (s *Ship) refreshBase(ctx context.Context, p Package) (Package, error) {
 	ctx = s.gitContext(shipContext(ctx, p.Case))
-	if roundsUsed(p) {
-		return p, refused("review rounds used; the change waits for a person")
-	}
 	unlock, err := s.lock(ctx, p.Case)
 	if err != nil {
 		return p, err
 	}
 	defer unlock()
+	return s.refreshBaseLocked(ctx, p)
+}
+
+func (s *Ship) refreshBaseLocked(ctx context.Context, p Package) (Package, error) {
+	if roundsUsed(p) {
+		return p, refused("review rounds used; the change waits for a person")
+	}
 	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
 		return p, err
 	}
@@ -419,7 +423,7 @@ var testFileRe = regexp.MustCompile(`(_test\.go|\.test\.[cm]?[jt]sx?|\.spec\.[cm
 // ignored file of the work tree in it): the default branch with only the test's own files of the change (it must
 // fail), and the change (it must pass). The test's files are those the change touches that are named as tests, or
 // the ones named. A check that does not come out so is recorded as it came out, and the package stays unchecked.
-func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []string, patch ...Patch) (Package, error) {
+func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []string, patch ...Patch) (pkg Package, stepErr error) {
 	ctx = s.gitContext(shipContext(ctx, caseID))
 	unlock, err := s.lock(ctx, caseID)
 	if err != nil {
@@ -475,7 +479,17 @@ func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []strin
 	if err != nil {
 		return p, err
 	}
-	defer s.unexport(p, before)
+	exports := []string{before}
+	cleanup := func() error {
+		pending := exports
+		exports = nil
+		var err error
+		for _, dir := range pending {
+			err = errors.Join(err, s.unexport(p, dir))
+		}
+		return err
+	}
+	defer func() { stepErr = errors.Join(stepErr, cleanup()) }()
 	for _, f := range testFiles {
 		b, err := s.git(ctx, p.Host, "show", tree+":"+f)
 		if err != nil {
@@ -502,7 +516,7 @@ func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []strin
 	if err != nil {
 		return p, err
 	}
-	defer s.unexport(p, after)
+	exports = append(exports, after)
 	b, err := s.Sandbox.Run(ctx, before, words, s.Env)
 	if err != nil {
 		return p, err
@@ -512,6 +526,9 @@ func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []strin
 	}
 	a, err := s.Sandbox.Run(ctx, after, words, s.Env)
 	if err != nil {
+		return p, err
+	}
+	if err := cleanup(); err != nil {
 		return p, err
 	}
 	// Execute the original words. Persist only their cleaned display form.
@@ -707,9 +724,9 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 			return p, err
 		}
 		// Creation can succeed while its response is lost. Match the package's exact branch, base and commit
-		// before issuing another create, including a request that was closed or merged in the meantime.
+		// before issuing another create. A closed request does not reclaim a new proposal.
 		list, err := s.gh(ctx, p.Host, "pr", "list", "--repo", p.Repo, "--head", p.Branch, "--base", p.Base, "--state", "all",
-			"--json", "number,url,headRefOid")
+			"--json", "number,url,headRefOid,state")
 		if err != nil {
 			return p, err
 		}
@@ -717,12 +734,13 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 			Number int    `json:"number"`
 			URL    string `json:"url"`
 			Head   string `json:"headRefOid"`
+			State  string `json:"state"`
 		}
 		if err := json.Unmarshal([]byte(list), &prs); err != nil {
 			return p, fmt.Errorf("read existing pull requests: %w", err)
 		}
 		for _, pr := range prs {
-			if pr.Head == p.Head && pr.Number > 0 && pr.URL != "" {
+			if pr.State != "CLOSED" && pr.Head == p.Head && pr.Number > 0 && pr.URL != "" {
 				if p.PR != "" {
 					return p, refused("multiple pull requests match the package's commit")
 				}
@@ -1002,6 +1020,9 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 			}
 			if relationErr == nil {
 				if err := s.openPR(ctx, p); err != nil {
+					if errors.Is(err, errPRClosed) {
+						return s.closedProposal(ctx, p)
+					}
 					return p, err
 				}
 				if _, err := s.push(ctx, p, p.Host, "--no-verify", "origin", p.LandingHead+":refs/heads/"+p.Base); err != nil {
@@ -1083,11 +1104,10 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	}
 	command, err := s.checkCommand(p)
 	if err != nil {
-		s.unexport(p, tree)
-		return p, err
+		return p, errors.Join(err, s.unexport(p, tree))
 	}
 	a, err := s.Sandbox.Run(ctx, tree, command, s.Env)
-	s.unexport(p, tree)
+	err = errors.Join(err, s.unexport(p, tree))
 	if err != nil {
 		return p, err
 	}
@@ -1115,6 +1135,10 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 		}
 	}
 	if err := s.openPR(ctx, p); err != nil {
+		if errors.Is(err, errPRClosed) {
+			complete = true
+			return s.closedProposal(ctx, p)
+		}
 		return p, err
 	}
 	basePush = true
@@ -1211,7 +1235,7 @@ func (s *Ship) retryCleanup(ctx context.Context, caseID string) (Package, error)
 
 // RollBack undoes a landed change: a revert of its commits, by the user's identity, pushed to the default branch
 // as a fast-forward; the case goes back to testing.
-func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error) {
+func (s *Ship) RollBack(ctx context.Context, caseID, why string) (pkg Package, stepErr error) {
 	ctx = s.gitContext(shipContext(ctx, caseID))
 	cleanWhy, cleanErr := Redact(ctx, why)
 	if cleanErr != nil {
@@ -1243,7 +1267,9 @@ func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error
 		return p, err
 	}
 	dir := filepath.Join(s.Dir, "rollback", caseID)
-	s.dropRollback(p, dir)
+	if err := s.dropRollback(p, dir); err != nil {
+		return p, err
+	}
 	if err := os.MkdirAll(filepath.Dir(dir), 0700); err != nil {
 		return p, err
 	}
@@ -1252,19 +1278,34 @@ func (s *Ship) RollBack(ctx context.Context, caseID, why string) (Package, error
 	}
 	start := "origin/" + p.Base
 	if p.Undo != nil {
-		if _, err := s.git(ctx, p.Host, "merge-base", "--is-ancestor", p.Undo.Head, start); err == nil {
+		_, ancestorErr := s.git(ctx, p.Host, "merge-base", "--is-ancestor", p.Undo.Head, start)
+		if ancestorErr == nil {
 			p.State = RolledBack
 			if err := s.saveAuthorized(ctx, &p); err != nil {
 				return p, err
 			}
 			return p, s.rollbackReceipt(ctx, p, why)
 		}
-		start = p.Undo.Head
+		var exit *exec.ExitError
+		if !errors.As(ancestorErr, &exit) || exit.ExitCode() != 1 {
+			return p, ancestorErr
+		}
+		_, relationErr := s.git(ctx, p.Host, "merge-base", "--is-ancestor", start, p.Undo.Head)
+		switch {
+		case relationErr == nil:
+			start = p.Undo.Head
+		case !errors.As(relationErr, &exit) || exit.ExitCode() != 1:
+			return p, relationErr
+		default:
+			// The default branch moved without accepting this revert. Keep the
+			// old journal on disk until its replacement is ready.
+			why, p.Undo = p.Undo.Why, nil
+		}
 	}
 	if _, err := s.git(ctx, p.Host, "worktree", "add", "--detach", dir, start); err != nil {
 		return p, err
 	}
-	defer s.dropRollback(p, dir)
+	defer func() { stepErr = errors.Join(stepErr, s.dropRollback(p, dir)) }()
 	if p.Undo == nil {
 		shas := append([]string{}, p.Landed...)
 		if len(shas) == 0 {
@@ -1466,10 +1507,33 @@ func (s *Ship) openPR(ctx context.Context, p Package) error {
 	var pr struct {
 		State string `json:"state"`
 	}
-	if json.Unmarshal([]byte(raw), &pr) != nil || pr.State != "OPEN" {
+	if json.Unmarshal([]byte(raw), &pr) != nil {
+		return refused("the pull request is not open")
+	}
+	if pr.State == "CLOSED" {
+		return errors.Join(refused("the pull request is closed"), errPRClosed)
+	}
+	if pr.State != "OPEN" {
 		return refused("the pull request is not open")
 	}
 	return nil
+}
+
+var errPRClosed = errors.New("pull request closed")
+
+func (s *Ship) closedProposal(ctx context.Context, p Package) (Package, error) {
+	if _, err := s.git(ctx, p.Host, "reset", "--hard", p.Head); err != nil {
+		return p, err
+	}
+	p.State, p.PR, p.LandingHead, p.Landed, p.Reviews = Checked, "", "", nil, nil
+	if err := s.saveAuthorized(ctx, &p); err != nil {
+		return p, err
+	}
+	if err := s.Store.CaseNote(ctx, p.Case, "proposal closed",
+		"The pull request was closed without merging. The checked package can be proposed again.", s.Actor); err != nil {
+		return p, err
+	}
+	return p, refused("the pull request was closed; the checked package can be proposed again")
 }
 
 func writeJSON(path string, v any) error {
@@ -1620,6 +1684,14 @@ func (s *Ship) push(ctx context.Context, p Package, dir string, args ...string) 
 	source, err := originRepository(ctx, p.Dir)
 	if err != nil || actual != source {
 		return "", refused("the host clone's destination changed")
+	}
+	for _, arg := range args {
+		candidate, ref, ok := strings.Cut(arg, ":")
+		if ok && (ref == "refs/heads/"+p.Branch || ref == "refs/heads/"+p.Base) {
+			if err := s.checkPublicPatch(ctx, p, candidate); err != nil {
+				return "", err
+			}
+		}
 	}
 	return s.git(ctx, dir, append([]string{"push", "--no-follow-tags"}, args...)...)
 }

@@ -321,9 +321,12 @@ func caseLog(ctx context.Context, q querier, id, actor, action, detail string, a
 	}
 	_, err = q.ExecContext(ctx, `INSERT INTO case_log (case_id, seq, at, actor, action, detail)
 	  VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM case_log WHERE case_id = ?), ?, ?, ?, ?)`,
-		id, id, at.UnixMilli(), caseText(actor, 80), action, caseText(detail, caseTextMax))
+		id, id, at.UnixMilli(), caseText(actor, 80), action, CaseNoteText(detail))
 	return err
 }
+
+// CaseNoteText is the stored form of a case note after its caller cleans it.
+func CaseNoteText(text string) string { return caseText(text, caseTextMax) }
 
 // resolveEvidence checks a piece of evidence and fills it in. An event's reference (ev:ID) always takes the
 // event's own time, kind and summary, whatever the caller gave, and a note's (note:ID) the note's time, kind and

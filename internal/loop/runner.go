@@ -448,6 +448,7 @@ func (r *Runner) caseNoteOnce(ctx context.Context, id, action, detail string) er
 	if err != nil {
 		return err
 	}
+	clean = store.CaseNoteText(clean)
 	log, err := r.Store.CaseLog(ctx, id)
 	if err != nil {
 		return err

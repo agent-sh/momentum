@@ -155,6 +155,19 @@ func reviewText(round, high, medium, low int, summary string, findings []Finding
 }
 
 func (r *Runner) postReview(ctx context.Context, p Package) (Package, error) {
+	unlock, err := r.Ship.lock(ctx, p.Case)
+	if err != nil {
+		return p, err
+	}
+	defer unlock()
+	current, ok, err := r.Ship.Load(p.Case)
+	if err != nil {
+		return p, err
+	}
+	if !ok {
+		return p, refused("the review package is missing")
+	}
+	p = current
 	if err := r.Ship.authority(ctx, p.Case); err != nil {
 		return p, err
 	}

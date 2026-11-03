@@ -54,8 +54,7 @@ func (s *Ship) export(ctx context.Context, p Package, name, treeish string) (str
 	}
 	waitErr := cmd.Wait()
 	if err != nil || waitErr != nil || diag.Over() {
-		s.unexport(p, dir)
-		return "", fmt.Errorf("export tree: %w: %s", errors.Join(err, waitErr), diag.String())
+		return "", errors.Join(fmt.Errorf("export tree: %w: %s", errors.Join(err, waitErr), diag.String()), s.unexport(p, dir))
 	}
 	return dir, nil
 }
@@ -117,12 +116,19 @@ func extractTree(dir string, reader *tar.Reader) error {
 	}
 }
 
-func (s *Ship) unexport(p Package, dir string) {
-	_ = removeAll(dir)
+func (s *Ship) unexport(p Package, dir string) error {
+	if err := removeAll(dir); err != nil {
+		return fmt.Errorf("export scratch tree cannot be removed: %w", err)
+	}
+	return nil
 }
 
-func (s *Ship) dropRollback(p Package, dir string) {
+func (s *Ship) dropRollback(p Package, dir string) error {
 	_, _ = s.git(context.Background(), p.Host, "worktree", "remove", "--force", dir)
-	_ = removeAll(dir)
-	_, _ = s.git(context.Background(), p.Host, "worktree", "prune")
+	err := removeAll(dir)
+	_, pruneErr := s.git(context.Background(), p.Host, "worktree", "prune")
+	if err != nil {
+		err = fmt.Errorf("rollback scratch tree cannot be removed: %w", err)
+	}
+	return errors.Join(err, pruneErr)
 }

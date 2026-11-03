@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -81,7 +82,7 @@ func (r *Runner) preparedInvocation(run store.LoopRun, schema string) (Invocatio
 		MaxTurns: r.Budgets.MaxTurns, BudgetUSD: r.Budgets.Run, Timeout: r.Budgets.RunTime, Binds: binds}, manifest, err
 }
 
-func (r *Runner) invokeReview(ctx context.Context, c store.Case, p Package, run store.LoopRun) (Result, error) {
+func (r *Runner) invokeReview(ctx context.Context, c store.Case, p Package, run store.LoopRun) (result Result, runErr error) {
 	inv, manifest, err := r.preparedInvocation(run, reviewSchema)
 	if err != nil {
 		return Result{}, err
@@ -90,7 +91,7 @@ func (r *Runner) invokeReview(ctx context.Context, c store.Case, p Package, run 
 	if err != nil {
 		return Result{}, err
 	}
-	defer r.Ship.unexport(p, export)
+	defer func() { runErr = errors.Join(runErr, r.Ship.unexport(p, export)) }()
 	// This plain export belongs to the host and is stable for both attempts.
 	inv.Binds = append(inv.Binds, sandbox.Bind{Src: export, Dst: "/ro/change"})
 	res, err := r.Agent.RunOrFallback(ctx, inv)
