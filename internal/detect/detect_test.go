@@ -395,7 +395,7 @@ func TestFailuresAreFoundWhenTheyRecur(t *testing.T) {
 		toolError("s5", "Bash", "<tool_use_error>fence-guard: a private link in a commit message", t0),
 		// the work failing, not the setup
 		toolError("s4", "Bash", "Exit code 1 --- FAIL: TestX", t0), toolError("s5", "Bash", "Exit code 1 --- FAIL: TestX", t0), toolError("s6", "Bash", "Exit code 1 --- FAIL: TestX", t0),
-		// an explicit refusal without an error flag still counts
+		// a result that is no error
 		ev(store.Transcripts, "s6", "tool_result", store.ActorTool, "Bash", deny, `{"tool_id":"y"}`, t0.Add(3*time.Hour)),
 		// curl's failures, keyed with the calls they answer; a call of the same id past a day before its result is
 		// another's
@@ -435,7 +435,7 @@ func TestFailuresAreFoundWhenTheyRecur(t *testing.T) {
 	}
 	want := []string{
 		"failures/v2:exec:curl: (N) failed to connect to localhost port N after N ms: connection refused 4",
-		"failures/v2:guard:fence-guard:a process match on Q takes its own shell too 4",
+		"failures/v2:guard:fence-guard:a process match on Q takes its own shell too 3",
 		"failures/v2:guard:ledger:this note names no source 3",
 		"failures/v2:guard:load-gate:held Q: the machine is busy 3",
 		"failures/v2:model:refusal:the model declined this request as written 3",
@@ -450,7 +450,7 @@ func TestFailuresAreFoundWhenTheyRecur(t *testing.T) {
 	if fs[5].Title != "Claude Code's turns keep failing: api error: N overloaded" {
 		t.Fatalf("a turn's error: %q", fs[5].Title)
 	}
-	if !strings.HasPrefix(fs[1].Evidence[0].Ref, "ev:") || !fs[1].Evidence[0].At.Equal(t0.Add(3*time.Hour)) {
+	if !strings.HasPrefix(fs[1].Evidence[0].Ref, "ev:") || !fs[1].Evidence[0].At.Equal(t0.Add(2*time.Hour)) {
 		t.Fatalf("evidence, newest first: %+v", fs[1].Evidence)
 	}
 }

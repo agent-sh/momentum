@@ -81,6 +81,18 @@ func Load() (Sources, error) {
 	}
 	for i := range s.Transcripts.Sources {
 		src := &s.Transcripts.Sources[i]
+		switch src.Harness {
+		case "opencode":
+			if src.DB == "" || src.Glob != "" {
+				return s, fmt.Errorf("transcripts.sources[%d]: opencode requires db only; known source harnesses: opencode, grok, kimi", i)
+			}
+		case "grok", "kimi":
+			if src.Glob == "" || src.DB != "" {
+				return s, fmt.Errorf("transcripts.sources[%d]: %s requires glob only; known source harnesses: opencode, grok, kimi", i, src.Harness)
+			}
+		default:
+			return s, fmt.Errorf("transcripts.sources[%d]: unsupported harness; known source harnesses: opencode, grok, kimi", i)
+		}
 		src.Glob, src.DB = paths.Expand(src.Glob), paths.Expand(src.DB)
 	}
 	for i, p := range s.Sessions.Projects {

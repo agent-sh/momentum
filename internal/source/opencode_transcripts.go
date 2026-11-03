@@ -17,7 +17,6 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/agent-sh/momentum/internal/store"
-	"github.com/agent-sh/momentum/internal/toolresult"
 )
 
 type openCodeDB struct {
@@ -81,14 +80,14 @@ func openOpenCode(path string) (*openCodeDB, error) {
 }
 
 // Updated rows are mutable, including tool states. A changed session is read
-// again by stable message ids. Count, update time and size tell a changed session
+// again by stable message ids. Counts and update times tell a changed session
 // from the last read. V2 wins over the legacy copy for the same session.
 func (db *openCodeDB) sessions(ctx context.Context) ([]openCodeSession, error) {
 	var out []openCodeSession
 	held := map[string]bool{}
 	read := func(table, messages string, v2 bool) error {
 		query := `SELECT s.id,COALESCE(s.parent_id,''),COALESCE(s.directory,''),COALESCE(s.time_updated,0),
-COUNT(m.id),COALESCE(SUM(m.time_updated),0),COALESCE(SUM(length(m.data)),0)
+COUNT(m.id),COALESCE(SUM(m.time_updated),0)
 FROM ` + table + ` s JOIN ` + messages + ` m ON m.session_id=s.id GROUP BY s.id`
 		rows, err := db.QueryContext(ctx, query)
 		if err != nil {
@@ -97,8 +96,8 @@ FROM ` + table + ` s JOIN ` + messages + ` m ON m.session_id=s.id GROUP BY s.id`
 		defer rows.Close()
 		for rows.Next() {
 			var s openCodeSession
-			var updated, count, sum, size int64
-			if err := rows.Scan(&s.id, &s.parent, &s.cwd, &updated, &count, &sum, &size); err != nil {
+			var updated, count, sum int64
+			if err := rows.Scan(&s.id, &s.parent, &s.cwd, &updated, &count, &sum); err != nil {
 				return err
 			}
 			if held[s.id] {
@@ -106,15 +105,15 @@ FROM ` + table + ` s JOIN ` + messages + ` m ON m.session_id=s.id GROUP BY s.id`
 			}
 			held[s.id], s.v2 = true, v2
 			// Legacy tool states live in part, not message.
-			var partCount, partSum, partSize int64
+			var partCount, partSum int64
 			if !v2 {
-				if err := db.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(time_updated),0),COALESCE(SUM(length(data)),0)
-FROM part WHERE session_id=?`, s.id).Scan(&partCount, &partSum, &partSize); err != nil {
+				if err := db.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(time_updated),0)
+FROM part WHERE session_id=?`, s.id).Scan(&partCount, &partSum); err != nil {
 					return err
 				}
 			}
-			hash := sha256.Sum256([]byte(fmt.Sprintf("%t:%s:%s:%d:%d:%d:%d:%d:%d:%d",
-				v2, s.parent, s.cwd, updated, count, sum, size, partCount, partSum, partSize)))
+			hash := sha256.Sum256([]byte(fmt.Sprintf("%t:%s:%s:%d:%d:%d:%d:%d",
+				v2, s.parent, s.cwd, updated, count, sum, partCount, partSum)))
 			s.fingerprint = hex.EncodeToString(hash[:])
 			out = append(out, s)
 		}
@@ -291,7 +290,10 @@ func (s *nativeState) openCode(typ string, msg map[string]any, at time.Time, v2 
 					if status == "error" {
 						e.ToolOutput = errorText(st["error"])
 					}
-					e.IsError = status == "error" || toolresult.EnvelopeFailed(encoded(st))
+					// The state contains input and file content too. Only
+					// native status sets its flag; shell output is checked
+					// by the shared writer before clipping.
+					e.IsError = status == "error"
 					out = append(out, e)
 				}
 			}

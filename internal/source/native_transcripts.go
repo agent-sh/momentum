@@ -224,18 +224,18 @@ func (s Transcripts) readNativeJob(ctx context.Context, j *job, t *tally, add fu
 			t.fail(j.path, errors.New("cannot read native transcript"))
 			return
 		}
-		if len(line) == 0 || errors.Is(err, io.EOF) && !json.Valid(line) {
+		if len(line) == 0 || errors.Is(err, io.EOF) && strings.TrimSpace(string(line)) != "" && !json.Valid(line) {
 			// A partially written last line stays before the cursor.
 			flush(true)
 			return
 		}
 		var record map[string]any
-		if json.Unmarshal(line, &record) != nil {
-			t.fail(j.path, errors.New("invalid native transcript record"))
-			return
-		}
 		var evs []evidence.Event
-		if harness == "grok" {
+		if json.Unmarshal(line, &record) != nil || record == nil {
+			// Complete malformed lines are counted by the writer. A partial
+			// final line was left before the cursor above.
+			p.skips = append(p.skips, fmt.Sprintf("%s@%d", j.path, offset))
+		} else if harness == "grok" {
 			evs = state.grok(record)
 		} else {
 			evs = state.kimi(record)
@@ -373,7 +373,8 @@ func (s *nativeState) grok(o map[string]any) []evidence.Event {
 	case "tool_call", "tool_call_update":
 		id := str(u, "toolCallId")
 		metadata := object(object(u["_meta"])["x.ai/tool"])
-		name := firstOf(str(metadata, "name"), str(metadata, "tool_name"), s.Calls[id])
+		r := object(u["rawOutput"])
+		name := firstOf(str(metadata, "name"), str(metadata, "tool_name"), str(r, "name"), s.Calls[id])
 		if name == "" {
 			// A title can be a command; it is never a tool name.
 			name = "unknown"
@@ -389,13 +390,15 @@ func (s *nativeState) grok(o map[string]any) []evidence.Event {
 		if status == "completed" || status == "failed" || status == "cancelled" {
 			e := s.event("grok", evidence.KindToolResult, "", at)
 			e.ToolID, e.ToolName = id, name
-			r := object(u["rawOutput"])
-			e.ToolOutput = firstOf(str(r, "content"), nativeText(u["content"]), encoded(u["rawOutput"]))
-			e.IsError = status == "failed" || toolresult.EnvelopeFailed(encoded(u["rawOutput"]))
+			e.ToolOutput = firstOf(str(r, "content"), str(r, "output"), nativeText(u["content"]), encoded(u["rawOutput"]))
+			// Search exit 1 means no matches. Its ACP status decides failure.
+			// Bash's exit code belongs to its native command envelope.
+			e.IsError = status == "failed" || str(r, "type") == "Bash" && toolresult.EnvelopeFailed(encoded(r))
 			if status == "cancelled" {
 				e.ToolOutput = "Tool execution cancelled by user"
 			}
 			out = append(out, e)
+			delete(s.Calls, id)
 		}
 		return out
 	case "turn_completed":
@@ -445,6 +448,7 @@ func (s *nativeState) kimi(o map[string]any) []evidence.Event {
 			e.ToolID, e.ToolName = id, s.Calls[id]
 			e.ToolOutput = firstOf(str(result, "output"), encoded(result))
 			e.IsError = toolresult.EnvelopeFailed(encoded(result))
+			delete(s.Calls, id)
 			return []evidence.Event{e}
 		}
 	case "turn.ended":

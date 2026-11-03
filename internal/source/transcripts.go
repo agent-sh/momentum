@@ -115,6 +115,7 @@ type part struct {
 	read   int
 	cur    store.FileCursor
 	places []string
+	skips  []string // complete malformed native records, named by offset
 }
 
 // pending is an item to store: its event with the texts taken out (a batch holds only what it stores), the
@@ -554,14 +555,30 @@ func (w *writer) flush(ctx context.Context, b *batch) {
 	}
 	ws := make([]store.FileWrite, 0, len(parts))
 	read := 0
+	skipped := 0
 	for i, p := range parts {
 		if w.t.isFailed(p.j.path) {
 			continue // a part after one that failed would move the cursor past it
 		}
 		ws = append(ws, store.FileWrite{Events: evs[i], Cursor: p.cur, Places: p.places})
 		read += p.read
+		skipped += len(p.skips)
 	}
 	w.mu.Lock()
+	for _, p := range parts {
+		if w.t.isFailed(p.j.path) {
+			continue
+		}
+		for _, ref := range p.skips {
+			if err := w.st.Skip(ctx, w.source, ref, "invalid native transcript object"); err != nil {
+				w.mu.Unlock()
+				for _, x := range ws {
+					w.t.fail(x.Cursor.Path, err)
+				}
+				return
+			}
+		}
+	}
 	n, dropped, err := w.st.PutFiles(ctx, ws)
 	w.mu.Unlock()
 	if err != nil {
@@ -573,6 +590,7 @@ func (w *writer) flush(ctx context.Context, b *batch) {
 	w.t.Lock()
 	w.t.res.New += n
 	w.t.res.Read += read
+	w.t.res.Skipped += skipped
 	w.t.unknown += unknown
 	w.t.dropped += dropped
 	w.t.Unlock()

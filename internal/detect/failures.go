@@ -303,6 +303,8 @@ func FailureOf(harness, tool, text, call string) (FailureKey, bool) {
 			Error    json.RawMessage `json:"error"`
 			Status   string          `json:"status"`
 			Message  string          `json:"message"`
+			Type     string          `json:"type"`
+			Matches  *int            `json:"match_count"`
 			Exit     *int            `json:"exit_code"`
 			Metadata struct {
 				Exit *int `json:"exit_code"`
@@ -310,8 +312,16 @@ func FailureOf(harness, tool, text, call string) (FailureKey, bool) {
 		}
 		if json.Unmarshal([]byte(text), &result) == nil {
 			raw := string(result.Error)
+			emptyError := raw == "" || raw == "null" || raw == `""` || raw == "false" || raw == "{}" || raw == "[]"
+			// A native search uses exit 1 for an empty result. Its wrapper
+			// can be kept as JSON when there is no text content.
+			if result.Type == "GrepSearch" && result.Exit != nil && *result.Exit == 1 &&
+				result.Matches != nil && *result.Matches == 0 && result.Stderr == "" &&
+				emptyError && result.Status != "failed" && result.Status != "error" {
+				return FailureKey{}, false
+			}
 			var message string
-			if raw != "" && raw != "null" && raw != `""` && raw != "false" && raw != "{}" && raw != "[]" {
+			if !emptyError {
 				if json.Unmarshal(result.Error, &message) != nil {
 					var obj struct {
 						Message string `json:"message"`

@@ -42,6 +42,22 @@ Source locations are machine-specific, so momentum ships none. List them in `~/.
 
 `transcripts` reads the agents' session history with [tacit](https://github.com/agent-sh/tacit)'s reader: Claude Code with its subagents, Codex with its compressed rollouts, pi with its tasks, and the Hermes store, where tacit finds them under each home (pi's variables and `TACIT_HERMES_DB` apply). Each item is one event, credited by tacit's attribution. Events hold only redacted text, so [scrump](https://github.com/avifenesh/scrump) with its text profile must be on `PATH`; without it the source stores nothing and fails. scrump 0.2.0 or later masks each text on its own as a record; with an older one each call is padded with about 1 KB of boundary per text, which a first ingest pays for. The reader's saved position in each transcript keeps some of its lines unredacted, in the same private store. `"workers"` sets how many files an ingest reads at once (default: a third of the cores). Claude Code deletes a transcript after about 30 days, so its events can be all that is left of it: `evidence rebuild transcripts` needs `--force`, and then says how many events have no source left.
 
+Native readers also discover OpenCode's `opencode/opencode.db` under `XDG_DATA_HOME` (else `~/.local/share`), Grok's session `updates.jsonl` under `GROK_HOME` (else `~/.grok`), and Kimi's main and child `wire.jsonl` under `KIMI_CODE_HOME` (else `~/.kimi-code`). Additional locations use `transcripts.sources`, with or without `homes`:
+
+```json
+{
+  "transcripts": {
+    "sources": [
+      {"harness": "opencode", "db": "~/history/opencode.db"},
+      {"harness": "grok", "glob": "~/history/grok/*/updates.jsonl"},
+      {"harness": "kimi", "glob": "~/history/kimi/*/agents/*/wire.jsonl"}
+    ]
+  }
+}
+```
+
+Source harnesses are `opencode`, `grok` and `kimi`. OpenCode requires `db` only; Grok and Kimi require `glob` only. Configuration load refuses other harnesses and missing or wrong location fields. A leading `~` is expanded. OpenCode prefers V2 over its migrated legacy copy and rereads changed sessions. Grok and Kimi resume by offset and count malformed complete lines as skipped. Unknown input provenance stays unknown.
+
 ## Sessions
 
 ```

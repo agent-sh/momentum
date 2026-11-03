@@ -5,6 +5,7 @@ package toolresult
 import (
 	"encoding/json"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -36,6 +37,23 @@ var (
 
 func Cancelled(text string) bool { return cancelled.MatchString(strings.TrimSpace(text)) }
 
+// Each harness names its shell tools here. Claude Code and pi have native error
+// flags, so their output never supplies a missing flag. Other tools return data
+// and require native status. Codex's patch tool reports refusals in plain text.
+var harnessTools = map[string]struct {
+	shells []string
+	infer  bool
+	plain  []string
+}{
+	"claude":   {shells: []string{"bash", "bash_output", "powershell"}},
+	"pi":       {shells: []string{"bash"}},
+	"codex":    {shells: []string{"exec", "exec_command", "local_shell", "write_stdin"}, infer: true, plain: []string{"apply_patch"}},
+	"hermes":   {shells: []string{"terminal", "execute_code"}, infer: true},
+	"opencode": {shells: []string{"bash"}, infer: true},
+	"grok":     {shells: []string{"run_terminal_command", "bash"}, infer: true},
+	"kimi":     {shells: []string{"shell"}, infer: true},
+}
+
 // Failed reads harness headers, tool JSON and explicit refusals. flagged is the
 // native reader's error flag. A cancellation is excluded even when flagged.
 func Failed(harness, tool, text string, flagged bool) bool {
@@ -46,7 +64,15 @@ func Failed(harness, tool, text string, flagged bool) bool {
 	if flagged {
 		return true
 	}
-	if (harness == "hermes" || IsShell(tool)) && strings.HasPrefix(text, "{") {
+	rules := harnessTools[harness]
+	tool = strings.ToLower(tool)
+	if slices.Contains(rules.plain, tool) {
+		return refusal.MatchString(text)
+	}
+	if !rules.infer || !slices.Contains(rules.shells, tool) {
+		return false
+	}
+	if strings.HasPrefix(text, "{") {
 		return EnvelopeFailed(text)
 	}
 	// Only a header before Output names the harness's exit, not a command's
@@ -97,9 +123,10 @@ func EnvelopeFailed(text string) bool {
 }
 
 func IsShell(tool string) bool {
-	switch strings.ToLower(tool) {
-	case "bash", "bash_output", "powershell", "exec", "exec_command", "shell", "local_shell", "write_stdin", "terminal", "execute_code":
-		return true
+	for _, rules := range harnessTools {
+		if slices.Contains(rules.shells, strings.ToLower(tool)) {
+			return true
+		}
 	}
 	return false
 }
