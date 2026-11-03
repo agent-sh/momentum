@@ -452,8 +452,11 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 	if dry {
 		return m
 	}
-	if !r.Ship.Live {
+	if hold := r.Ship.mayApply(p); !r.Ship.Live || hold != "" {
 		m.Status, m.Why = "held", why+"; the loop is not live, so it rolls nothing back"
+		if hold != "" {
+			m.Why = why + "; " + hold + ", so it rolls nothing back"
+		}
 		if !p.Held {
 			// the note before the flag that says it was written, under an id of its own, so it is written once
 			if err := r.noteOnce(ctx, store.Note{ID: noteID("held", p), Kind: store.NoteDecided, Title: plainClip("momentum holds the rollback of its change for: "+c.Title, store.TitleMax),

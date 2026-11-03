@@ -155,3 +155,35 @@ func TestANativeTranscriptReaderIsLiveWithoutAHarnessHome(t *testing.T) {
 		t.Fatal("a configured native reader was omitted from measurement")
 	}
 }
+
+// Configuration targets are off unless the owner turns them on, take only known keys, and an allow entry must be a
+// clean path under the home.
+func TestConfigTargetsAreOffByDefaultAndStrict(t *testing.T) {
+	cfg, home := t.TempDir(), t.TempDir()
+	t.Setenv("MOMENTUM_CONFIG", cfg)
+	t.Setenv("HOME", home)
+	write := func(s string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(cfg, "sources.json"), []byte(s), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(`{"loop": {"live": true}}`)
+	if s, err := Load(); err != nil || s.Loop.ConfigTargets.Enabled {
+		t.Fatalf("default: %+v %v", s.Loop.ConfigTargets, err)
+	}
+	write(`{"loop": {"config_targets": {"enabled": true, "alow": []}}}`)
+	if _, err := Load(); err == nil {
+		t.Fatal("a misspelt key of config_targets was taken")
+	}
+	for _, bad := range []string{`"/etc/x"`, `"../x"`, `"~/../x"`, `".config/./agents"`, `""`} {
+		write(`{"loop": {"config_targets": {"enabled": true, "allow": [` + bad + `]}}}`)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "config_targets.allow") {
+			t.Fatalf("allow %s: %v", bad, err)
+		}
+	}
+	write(`{"loop": {"config_targets": {"enabled": true, "allow": ["~/.config/agents/**"]}}}`)
+	if s, err := Load(); err != nil || !s.Loop.ConfigTargets.Enabled || s.Loop.ConfigTargets.Allow[0] != "~/.config/agents/**" {
+		t.Fatalf("%+v %v", s.Loop.ConfigTargets, err)
+	}
+}

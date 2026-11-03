@@ -164,6 +164,7 @@ func setupShip(st *store.Store, sources config.Sources) *loop.Ship {
 			return nil
 		}
 	}
-	return &loop.Ship{Store: st, SourceLive: sources.SourceLive, Dir: loopDir(), InstalledRoots: expandAll(c.ReadDirs), Live: c.Live, Actor: caseActor(), Identity: [2]string{gitGlobal("user.name"), gitGlobal("user.email")}, Sandbox: sb,
+	return &loop.Ship{Store: st, SourceLive: sources.SourceLive, Dir: loopDir(), InstalledRoots: expandAll(c.ReadDirs), Live: c.Live, Actor: caseActor(),
+		ConfigTargets: loop.ConfigTargets{Enabled: c.ConfigTargets.Enabled, Allow: c.ConfigTargets.Allow, Home: home}, Identity: [2]string{gitGlobal("user.name"), gitGlobal("user.email")}, Sandbox: sb,
 		Gate: loop.Gate{Owners: c.Owners, Exclude: c.Exclude, RepoGuard: c.RepoGuard, Home: home, Busy: func(ctx context.Context, dir string) (string, error) { return repoBusy(ctx, st, dir) }}}
 }

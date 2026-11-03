@@ -86,6 +86,16 @@ type Loop struct {
 	Constraints []string `json:"constraints"`
 	// CapacityGate is a command that waits until the machine has room for a check's test and exits 0, or fails.
 	CapacityGate []string `json:"capacity_gate"`
+	// ConfigTargets is the loop's authority to change configuration files in place, apart from Live (which governs
+	// repository landings): off unless Enabled. Allow narrows the files the configuration copy reads to these
+	// home-relative paths (path.Match patterns, or a directory and "/**"); empty admits all of them.
+	ConfigTargets ConfigTargets `json:"config_targets"`
+}
+
+// ConfigTargets is loop.config_targets.
+type ConfigTargets struct {
+	Enabled bool     `json:"enabled"`
+	Allow   []string `json:"allow"`
 }
 
 // ErrNoSources means no sources file exists yet.
@@ -119,6 +129,12 @@ func Load() (Sources, error) {
 		var l Loop
 		if err := d.Decode(&l); err != nil {
 			return s, fmt.Errorf("%s: loop: %w", SourcesPath(), err)
+		}
+		for _, a := range l.ConfigTargets.Allow {
+			p := strings.TrimPrefix(a, "~/")
+			if p == "" || filepath.IsAbs(p) || filepath.Clean(p) != p || strings.HasPrefix(p, "../") || p == ".." {
+				return s, fmt.Errorf("%s: loop.config_targets.allow: %q is no clean home-relative path", SourcesPath(), a)
+			}
 		}
 	}
 	s.Mistakes.Path = paths.Expand(s.Mistakes.Path)

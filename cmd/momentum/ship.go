@@ -35,6 +35,8 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	fs.SetOutput(stderr)
 	caseID := fs.String("case", "", "the case")
 	repo := fs.String("repo", "", "prepare: a checkout of the repository the change goes to")
+	target := fs.String("config", "", "prepare: instead of --repo, the configuration file the change goes to, by its path under the home")
+	force := fs.Bool("force", false, "rollback: overwrite a configuration file that changed since its change landed (what it holds is journaled)")
 	test := fs.String("test", "", "check: the test command, one program and its arguments, run without a shell")
 	testFiles := fs.String("test-files", "", "check: comma-separated files of the change that hold the test (default: by their names)")
 	patchFile := fs.String("patch", "change.patch", "check, propose: cumulative patch against the package base")
@@ -91,7 +93,14 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		}
 		p = pk
 	case "prepare":
-		p, err = ship.Prepare(ctx, *caseID, *repo)
+		switch {
+		case *target != "" && *repo != "":
+			return usageError{"ship prepare takes --repo or --config, not both"}
+		case *target != "":
+			p, err = ship.PrepareConfig(ctx, *caseID, *target)
+		default:
+			p, err = ship.Prepare(ctx, *caseID, *repo)
+		}
 	case "check":
 		var files []string
 		for _, f := range strings.Split(*testFiles, ",") {
@@ -123,7 +132,11 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		if strings.TrimSpace(*why) == "" {
 			return usageError{"ship rollback needs --why"}
 		}
-		p, err = ship.RollBack(ctx, *caseID, *why)
+		if *force {
+			p, err = ship.RollBackForced(ctx, *caseID, *why)
+		} else {
+			p, err = ship.RollBack(ctx, *caseID, *why)
+		}
 	}
 	if errors.Is(err, loop.ErrRefused) || errors.Is(err, store.ErrBadCase) || errors.Is(err, store.ErrNoCase) {
 		return usageError{err.Error()}

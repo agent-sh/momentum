@@ -15,3 +15,5 @@ Read review.md when present. Adapt previous.patch to BASE when present. Finish w
 Choose a week, or two for a rarer problem. A window is whole weeks. The signal must hold the case's problem in at least five active hours in the gate. The host compares the three independent windows before that gate with the window after the change is in effect.
 
 When the machine runs a binary or an installed configuration, return its host file as installed. It must name a regular file without links in a directory admitted by loop.read_dirs, outside run storage. The host checks its revision or rebuild before measuring. Otherwise the repository checkout is what takes effect.
+
+When the case's target is a configuration file, /work holds only that file at its path under the home. Change only it, keep its mode, and put the test under tests/. The test reads the file at that path. Name no installed file: the target is what takes effect. The run never writes the real file; the host writes it after review, journaled, only when configuration targets are on.

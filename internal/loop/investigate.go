@@ -21,13 +21,13 @@ The owner's words are only what his own turns say (actor owner); never credit hi
 // investigationSchema is an investigation's report.
 const investigationSchema = `{"type":"object","additionalProperties":false,"required":["mechanism","fix","summary"],
 "properties":{"mechanism":{"type":"string"},"alternatives":{"type":"array","items":{"type":"string"}},
-"fix":{"type":"string"},"summary":{"type":"string"},"repo":{"type":"string"}}}`
+"fix":{"type":"string"},"summary":{"type":"string"},"repo":{"type":"string"},"config":{"type":"string"}}}`
 
 // findingsInstruction keeps what a run cut short found: the runner reads the file when the run has no report.
 const findingsInstruction = "Keep findings as you go in /out/findings.md. Use the headings ## Mechanism, ## Alternatives ruled out, ## Fix, and ## Summary. End with your report of the same fields."
 
 // liveQuestion is what a live investigation is asked.
-const liveQuestion = "Find the root cause of this problem and the fix. State the mechanism, the alternatives ruled out, the fix, and a summary. If the fix is code in a repository under /ro/repos, also report repo as its NAME. Build no change."
+const liveQuestion = "Find the root cause of this problem and the fix. State the mechanism, the alternatives ruled out, the fix, and a summary. If the fix is code in a repository under /ro/repos, also report repo as its NAME. If it is one configuration file under /ro/config instead, report config as its path there (such as .config/agents/NAME.md). Build no change."
 
 // inputReference describes the host-created files. All /ro inputs are read-only.
 func inputReference(snapshots bool) string {
@@ -224,10 +224,20 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 		if f.Repo != "" && !repoName.MatchString(f.Repo) {
 			return store.Case{}, false, fmt.Errorf("invalid investigation repository name")
 		}
+		if f.Config != "" {
+			if f.Config, err = configTargetName(f.Config); err != nil {
+				return store.Case{}, false, fmt.Errorf("invalid investigation configuration path")
+			}
+		}
+		if f.Repo != "" && f.Config != "" {
+			// one change has one target: a report naming both names neither, and the case waits for one
+			f.Repo, f.Config = "", ""
+		}
 		raw, err := json.Marshal(struct {
 			Repo    string `json:"repo"`
+			Config  string `json:"config,omitempty"`
 			Episode int64  `json:"episode"`
-		}{f.Repo, episode})
+		}{f.Repo, f.Config, episode})
 		if err != nil {
 			return store.Case{}, false, err
 		}
@@ -239,7 +249,7 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 // cleanFinding cleans whole fields before the case store clips them.
 func cleanFinding(ctx context.Context, f finding) (finding, error) {
 	f.Alternatives = append([]string(nil), f.Alternatives...)
-	texts := []*string{&f.Mechanism, &f.Fix, &f.Report, &f.Repo}
+	texts := []*string{&f.Mechanism, &f.Fix, &f.Report, &f.Repo, &f.Config}
 	for i := range f.Alternatives {
 		texts = append(texts, &f.Alternatives[i])
 	}
@@ -282,6 +292,7 @@ type finding struct {
 	Fix          string   `json:"fix"`
 	Report       string   `json:"summary"`
 	Repo         string   `json:"repo,omitempty"`
+	Config       string   `json:"config,omitempty"`
 }
 
 // nativeFinding reads an investigation's report; alternatives given as one text, not the schema's list, are kept.
@@ -290,11 +301,12 @@ func nativeFinding(res Result) finding {
 		Mechanism          string
 		Alternatives       json.RawMessage
 		Fix, Summary, Repo string
+		Config             string
 	}
 	if json.Unmarshal(res.Report, &rep) != nil {
 		return finding{}
 	}
-	f := finding{Mechanism: rep.Mechanism, Fix: rep.Fix, Report: rep.Summary, Repo: rep.Repo}
+	f := finding{Mechanism: rep.Mechanism, Fix: rep.Fix, Report: rep.Summary, Repo: rep.Repo, Config: rep.Config}
 	if json.Unmarshal(rep.Alternatives, &f.Alternatives) != nil {
 		var one string
 		if json.Unmarshal(rep.Alternatives, &one) == nil && strings.TrimSpace(one) != "" {

@@ -173,6 +173,7 @@ momentum case signature ID root:KEY     the root cause; a case that names one an
                                         (a closed one comes back first: case reopen)
 momentum case close ID --reason not-worth-it|insufficient-evidence|already-solved|duplicate [--into ID] --why W
 momentum case reopen ID --evidence REF... [--at WHEN] --why W
+momentum case rollback ID --why W [--force]  undo a deployed change (a configuration file from its journal)
 ```
 
 `case detect` runs the detectors, deterministic reads with no model (of the store, and for sessions of what the replay of supervision reads): recurring tool and infrastructure failures (guard refusals, harness and tool errors, commands that fail the setup's way, model refusals, incidents), the owner's own turns that push back or repeat with the agent's last words before them, and what keeps sessions waiting on him (supervision's give-ups, nudges no rule covers, long waits). Each finding is a signature; a case opens for a new one, and the case that holds it takes the evidence.
@@ -197,6 +198,12 @@ A review reads the proposed tree at `/ro/change` read-only and the patch at `/ru
 The measure step runs on each loop pass, or with `momentum measure [--dry] [--family F,F] [--case ID] [--json]`. It uses no model. A plan counts the signal's share of active hours over whole weeks. Choose a week, or two for a rarer problem. At least five hit hours admit the gate. The three windows before that gate supply the independent baseline. Every counted source must have read past a window before it decides.
 
 Measurement starts once the repository checkout holds the landed change. For a binary or installed configuration, the build report names `installed` in an admitted `loop.read_dirs` directory. The owner can also use `momentum ship propose --installed FILE`. A Go revision must hold the change. Another installed file must be rebuilt after its checkout held it. Host code checks and records the installed file. No momentum command runs inside the sandbox.
+
+A fix that belongs in one configuration file instead (an investigation's `config`, a path under `/ro/config`) builds a configuration package: the host makes a one-file Git repository from the real file, the build edits it and adds its test under `tests/`, and the same check, proposal and review gates apply, with the review posted to the case's log. The host writes the real file only while `loop.config_targets.enabled` and `loop.live` are on, after journaling its previous content, and only over the content it was built on. Targets are the files the configuration copy reads, under a stricter denylist; `loop.config_targets.allow` can narrow them. The change is in effect while the file holds what landed. `momentum case rollback ID --why W` restores the journaled content and refuses a file changed since, unless `--force`. The switch is off by default:
+
+```json
+{"loop": {"config_targets": {"enabled": false, "allow": [".config/agents/**"]}}}
+```
 
 A lower share beyond chance closes the case as improved and leaves a shipped note with its measured effect. No measured effect rolls the change back while the loop is live. Otherwise a decided note holds the rollback and gives the command to do it by hand. A quiet window waits one more window. Three consecutive read watch windows at the old share, with five hits among them, reopen the case. Waiting and decision notes stay passive. SPEC's Measurement section states the assumptions and measured test rates.
 

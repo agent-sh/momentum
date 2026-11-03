@@ -54,6 +54,10 @@ func (r *Runner) reviews(ctx context.Context, only string, families ...string) [
 			}
 		}
 		if p.Clean() {
+			if why := r.Ship.mayApply(p); why != "" {
+				out = append(out, Done{Family: c.Family, Case: c.ID, Step: "land", Skipped: why})
+				continue
+			}
 			if !r.Ship.Live {
 				out = append(out, Done{Family: c.Family, Case: c.ID, Step: "land", Skipped: "the loop is not live"})
 				continue
@@ -187,6 +191,21 @@ func (r *Runner) postReview(ctx context.Context, p Package) (Package, error) {
 	n := len(p.Reviews) - 1
 	if n < 0 || p.Reviews[n].Comment != "" {
 		return p, nil
+	}
+	if p.Kind == KindConfig {
+		// a configuration change has no pull request: its review is posted to its case's log, after the target's
+		// authority is checked again as a repository's is before a post
+		if err := r.Ship.packageAuthority(ctx, p); err != nil {
+			return p, err
+		}
+		if err := r.Store.CaseNote(ctx, p.Case, "review posted", p.Reviews[n].Text, "loop"); err != nil {
+			return p, err
+		}
+		p.Reviews[n].Comment = fmt.Sprintf("case log: review round %d", p.Reviews[n].Round)
+		if (p.Reviews[n].High > 0 || p.Reviews[n].Medium > 0) && len(p.Reviews) < MaxRounds {
+			p.State = Revising
+		}
+		return p, r.Ship.saveAuthorized(ctx, &p)
 	}
 	if r.Post == nil || p.PR == "" {
 		return p, fmt.Errorf("review posting is unavailable")

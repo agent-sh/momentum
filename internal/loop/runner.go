@@ -408,7 +408,7 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 						r.pickSkipped(c, "deploy", err)
 						continue
 					}
-					if _, err := r.Store.DeployCase(ctx, c.ID, r.Ship.pkgDir(c.ID), p.LandedAt, p.PR+": "+p.Title, "loop"); err != nil {
+					if _, err := r.Store.DeployCase(ctx, c.ID, r.Ship.pkgDir(c.ID), p.LandedAt, deployWhat(p), "loop"); err != nil {
 						passed = append(passed, c.ID+" deployment: "+err.Error())
 						r.pickSkipped(c, "deploy", err)
 						continue
@@ -430,9 +430,9 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 					continue
 				}
 			}
-			if repo, err := r.caseRepo(ctx, c); err != nil {
+			if repo, target, err := r.caseTarget(ctx, c); err != nil {
 				return store.Case{}, "", "", err
-			} else if repo == "" {
+			} else if repo == "" && target == "" {
 				if !dry {
 					if err := r.waitingRepo(ctx, c); err != nil {
 						return store.Case{}, "", "", err
