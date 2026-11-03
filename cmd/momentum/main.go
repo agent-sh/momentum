@@ -91,6 +91,8 @@ const usage = `usage:
                                         investigate, build and review each family's case; the host checks and proposes
                                         changes, lands them when live, and publishes validated lessons
   momentum loop runs [--since WHEN] [--case ID] [--json]
+  momentum loop eval [--golden FILE] [--task ID,...] [--trials K] [--arms loop,native]
+                     [--budget USD] [--parallel N] [--held-out ID,...] [--split all|development|held-out] [--json]
                                         the loop's runs, and what the live ones spent in the last day and week
   momentum loop lesson --case ID --text TEXT
                                         publish a validated lesson to tacit

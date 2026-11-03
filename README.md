@@ -229,6 +229,23 @@ momentum loop lesson --case ID --text TEXT
 
 Agent runs return reports. The host calls the ship tool's methods. Patch validation, export, publication leases, landing and rollback are specified in [The ship tool](SPEC.md#the-ship-tool).
 
+## Evaluation
+
+`momentum loop eval` compares the loop's investigation and the harness's native agent against verified past root causes. The golden JSONL and its answers stay on the machine. Tests use synthetic tasks.
+
+```text
+momentum loop eval --golden FILE --trials 3 --arms loop,native --budget 120 --parallel 3
+momentum loop eval --golden FILE --held-out ID1,ID2 --split held-out --task ID1 --json
+```
+
+The host prepares one as-of input set per task. Both arms and all its trials share the same read-only `/ro` store, records, configuration, repository histories and tacit clone. The end is the earlier of the task cutoff and one minute after its newest symptom. Later events, commits, refs, reflogs and unreachable objects are removed. No momentum or tacit program is mounted. Both prompts end with the live investigation's paths reference. The inputs go when the task ends.
+
+Historical Hermes message rows are withheld; their stored summaries remain. Configuration roots outside a repository are copied as they are now and listed as leaks. Missing transcripts and histories cannot be reconstructed. Commit dates approximate historical branch positions when a reflog is unavailable. See [SPEC.md](SPEC.md#evaluation) for exact keys and limits.
+
+Each slot reserves both arms, each investigation and two judge attempts, with the relay's 1.5 times budget allowance included. The default pair reserves $30 (a $3 judge: the relay reserves the largest charge a request could cost); `--budget` must hold that for every parallel slot plus what was spent. A failed start costs nothing and its pair is excluded. The clean-context judge has only its input directory and no tools or `/ro` mounts. Accounting comes from the relay's observed cost, tokens and turns.
+
+`results.json` records the build, exact golden-file hash, every prompt and system hash, pinned records binary hash, models, budgets, input manifests and hashes, selected and held-out tasks, errors and historical limitations. The summary reports reach, cost and time per reached cause, paired task bootstrap intervals, pass@k, pass^k and flips. Undefined rates print as undefined and serialize as null. The operator keeps the held-out split and checks a judge sample by hand before using the comparison to turn the loop on.
+
 Knowledge stays in [tacit](https://github.com/agent-sh/tacit). Cases, evidence and state stay on the machine, never in this repository.
 
 MIT licensed.

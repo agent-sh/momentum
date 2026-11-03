@@ -512,7 +512,7 @@ func configAsOf(ctx context.Context, o ConfigCopyOptions, root string) ([]string
 	if err != nil || relHome != "." && !filepath.IsLocal(relHome) {
 		return nil, "", "", false, fmt.Errorf("as-of configuration repository lies outside Home")
 	}
-	head, err := hostInputGit(ctx, repo, "rev-list", "-1", "--before="+o.AsOf.UTC().Format(time.RFC3339Nano), "HEAD")
+	head, err := branchAsOf(ctx, repo, "HEAD", o.AsOf)
 	if err != nil {
 		return nil, "", "", false, err
 	}

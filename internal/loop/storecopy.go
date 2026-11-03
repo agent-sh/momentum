@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -23,6 +24,10 @@ type StoreCopyOptions struct {
 	Since       time.Time
 	Until       time.Time
 	OmitInPlace bool
+	// Master says Source is a copy this function made for a wider window (scrubbed already): the rows of this
+	// window are taken from it and are not scrubbed again. A scrubber start costs most of a second and a month of
+	// events is a gigabyte of text, so an evaluation scrubs it once for all its tasks.
+	Master bool
 }
 
 type StoreManifest struct {
@@ -60,7 +65,11 @@ func StoreCopy(ctx context.Context, o StoreCopyOptions) (m StoreManifest, err er
 	}
 	defer os.RemoveAll(tmp)
 	snapshot := filepath.Join(tmp, "scratch.sqlite")
-	if err = store.AsOf(ctx, o.Source, snapshot, o.Since, o.Until, o.OmitInPlace); err != nil {
+	if o.Master {
+		if err = copyPlainFile(o.Source, snapshot); err != nil {
+			return m, err
+		}
+	} else if err = store.AsOf(ctx, o.Source, snapshot, o.Since, o.Until, o.OmitInPlace); err != nil {
 		return m, err
 	}
 	db, err := sql.Open("sqlite", sqliteInputURI(snapshot, false))
@@ -68,8 +77,25 @@ func StoreCopy(ctx context.Context, o StoreCopyOptions) (m StoreManifest, err er
 		return m, err
 	}
 	defer db.Close()
+	if o.Master {
+		for _, q := range []string{"DELETE FROM events WHERE ts < ? OR ts >= ?", "DELETE FROM notes WHERE at >= ?"} {
+			args := []any{o.Until.UnixMilli()}
+			if strings.Contains(q, "events") {
+				args = []any{o.Since.UnixMilli(), o.Until.UnixMilli()}
+			}
+			if _, err = db.ExecContext(ctx, q, args...); err != nil {
+				return m, err
+			}
+		}
+		if _, err = db.ExecContext(ctx, "UPDATE notes SET done = 0 WHERE done >= ?", o.Until.UnixMilli()); err != nil {
+			return m, err
+		}
+	}
 	if _, err = db.ExecContext(ctx, "DELETE FROM notes WHERE at < ?", o.Since.UnixMilli()); err != nil {
 		return m, err
+	}
+	if o.Master {
+		goto scrubbed
 	}
 	if err = scrubTable(ctx, db, "events", []string{"source", "source_key", "session", "agent", "harness", "model", "cwd",
 		"actor", "kind", "tool", "summary", "meta", "ref", "experiment"}); err != nil {
@@ -78,6 +104,7 @@ func StoreCopy(ctx context.Context, o StoreCopyOptions) (m StoreManifest, err er
 	if err = scrubTable(ctx, db, "notes", []string{"kind", "title", "detail", "effect", "links", "source"}); err != nil {
 		return m, err
 	}
+scrubbed:
 	m = StoreManifest{Since: o.Since, Until: o.Until, Canary: true}
 	if err = db.QueryRowContext(ctx, "SELECT count(*) FROM events").Scan(&m.Events); err != nil {
 		return m, err
@@ -245,4 +272,22 @@ func scrubTable(ctx context.Context, db *sql.DB, table string, cols []string) er
 		}
 		last = ids[len(ids)-1]
 	}
+}
+
+// copyPlainFile copies a master into a new file of the caller's (the master is read-only).
+func copyPlainFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err = io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }

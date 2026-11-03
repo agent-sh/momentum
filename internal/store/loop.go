@@ -156,7 +156,7 @@ type RunFilter struct {
 
 // LoopRuns lists runs, the newest first.
 func (s *Store) LoopRuns(ctx context.Context, f RunFilter) ([]LoopRun, error) {
-	where, args := []string{"started >= ?"}, []any{f.Since.UnixMilli()}
+	where, args := []string{"COALESCE(NULLIF(started, 0), ended) >= ?"}, []any{f.Since.UnixMilli()}
 	if f.Case != "" {
 		where, args = append(where, "case_id = ?"), append(args, f.Case)
 	}
@@ -169,7 +169,7 @@ func (s *Store) LoopRuns(ctx context.Context, f RunFilter) ([]LoopRun, error) {
 	if f.Judged {
 		where = append(where, "failure NOT IN ('stopped', 'killed', 'broker')")
 	}
-	q := `SELECT ` + loopColumns + ` FROM loop_runs WHERE ` + strings.Join(where, " AND ") + ` ORDER BY started DESC, id DESC`
+	q := `SELECT ` + loopColumns + ` FROM loop_runs WHERE ` + strings.Join(where, " AND ") + ` ORDER BY COALESCE(NULLIF(started, 0), ended) DESC, id DESC`
 	if f.Limit > 0 {
 		q, args = q+` LIMIT ?`, append(args, f.Limit)
 	}
@@ -211,8 +211,12 @@ func (s *Store) FinishLoopRun(ctx context.Context, r LoopRun) error {
 	if r.Started.IsZero() {
 		started, duration = 0, 0
 	}
+	runs := 1
+	if r.Started.IsZero() {
+		runs = 0
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE cases SET cost_usd = cost_usd + ?, cost_tokens = cost_tokens + ?, cost_ms = cost_ms + ?,
- runs = runs + 1, updated = ? WHERE id = ?`, r.USD, r.Tokens, duration, r.Ended.UnixMilli(), c.ID); err != nil {
+ runs = runs + ?, updated = ? WHERE id = ?`, r.USD, r.Tokens, duration, runs, r.Ended.UnixMilli(), c.ID); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE loop_runs SET started = ?, ended = ?, status = ?, failure = ?, cost_usd = ?, tokens = ?, turns = ?, model = ?, summary = ?,

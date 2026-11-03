@@ -205,8 +205,8 @@ func TestUnknownFallbackReservationSurvivesRunnerAccounting(t *testing.T) {
 	if why != "" {
 		t.Fatal(why)
 	}
-	primary := Result{USD: .00204, RelayUSD: .00204, CostKnown: true, RelayAdmitted: 1, RelayCharged: 1}
-	combined := finishFallback(primary, Result{Status: store.RunTimeout, Failure: "timeout"}, r.Budgets.Run-primary.USD)
+	primary := Result{Started: true, USD: .00204, RelayUSD: .00204, CostKnown: true, RelayAdmitted: 1, RelayCharged: 1}
+	combined := finishFallback(primary, Result{Started: true, Status: store.RunTimeout, Failure: "timeout"}, r.Budgets.Run-primary.USD)
 	r.finish(ctx, c, &row, combined, nil)
 	saved, err := st.LoopRunByID(ctx, row.ID)
 	if err != nil || saved.USD != r.Budgets.Run || combined.ReservationUSD != r.Budgets.Run-primary.USD {
