@@ -1,6 +1,7 @@
 package loop
 
 import (
+	"errors"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -79,8 +80,12 @@ func (e *Eval) buildTask(ctx context.Context, in *taskInputs, t GoldenTask, repo
 		return err
 	}
 	in.store = filepath.Join(in.dir, "store.sqlite")
-	in.manifest.Store, err = StoreCopy(ctx, StoreCopyOptions{Source: e.Source, Destination: in.store, ScratchDir: in.dir,
-		Since: end.Add(-StoreWindow), Until: end, OmitInPlace: true})
+	source, fromMaster := e.Source, false
+	if e.master != "" {
+		source, fromMaster = e.master, true
+	}
+	in.manifest.Store, err = StoreCopy(ctx, StoreCopyOptions{Source: source, Destination: in.store, ScratchDir: in.dir,
+		Since: end.Add(-StoreWindow), Until: end, OmitInPlace: true, Master: fromMaster})
 	if err != nil {
 		return err
 	}
@@ -98,9 +103,12 @@ func (e *Eval) buildTask(ctx context.Context, in *taskInputs, t GoldenTask, repo
 	if err := os.Mkdir(repos, 0700); err != nil {
 		return err
 	}
-	clones, err := cloneRepositories(ctx, repositories, end, repos)
+	clones, refused, err := cloneRepositoriesCounted(ctx, repositories, end, repos)
 	if err != nil {
 		return err
+	}
+	for i := 0; i < refused; i++ {
+		in.manifest.Repositories = append(in.manifest.Repositories, RepoClone{Name: fmt.Sprintf("refused-%d", i+1), Error: "left out: the scrubber would change what it holds"})
 	}
 	for _, clone := range clones {
 		head, err := hostInputGit(ctx, clone, "rev-parse", "HEAD")
@@ -120,6 +128,11 @@ func (e *Eval) buildTask(ctx context.Context, in *taskInputs, t GoldenTask, repo
 		}
 		clone := filepath.Join(in.dir, "clone")
 		made, err := repositoryAsOf(ctx, tacit, end, clone)
+		if errors.Is(err, errNeedsScrubbing) {
+			removeInputTree(clone)
+			in.manifest.Tacit.Error = "tacit clone left out: the scrubber would change what it holds"
+			return nil
+		}
 		if err != nil {
 			return fmt.Errorf("tacit clone: %w", err)
 		}

@@ -1,6 +1,7 @@
 package loop
 
 import (
+	"errors"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -75,24 +76,37 @@ func (e *Eval) snapshotEnd(ctx context.Context, t GoldenTask) (time.Time, error)
 // as its default branch stood at the end of store, the fix's own repository too, since its fix came after. A
 // repository with no commit by then did not exist yet and is left out, and the rest are numbered from repo-1.
 func cloneRepositories(ctx context.Context, sources []string, end time.Time, dir string) ([]string, error) {
+	out, _, err := cloneRepositoriesCounted(ctx, sources, end, dir)
+	return out, err
+}
+
+// cloneRepositoriesCounted also returns how many repositories the scrubber refused (what it would change in them):
+// they are left out and counted, as the loop's own pass does, not a failure of the task's inputs.
+func cloneRepositoriesCounted(ctx context.Context, sources []string, end time.Time, dir string) ([]string, int, error) {
 	if len(sources) == 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var out []string
+	refused := 0
 	for _, src := range sources {
 		dst := filepath.Join(dir, fmt.Sprintf("repo-%d", len(out)+1))
 		made, err := repositoryAsOf(ctx, src, end, dst)
+		if errors.Is(err, errNeedsScrubbing) {
+			refused++
+			removeInputTree(dst)
+			continue
+		}
 		if err != nil {
-			return nil, err
+			return nil, refused, err
 		}
 		if made {
 			out = append(out, dst)
 		}
 	}
-	return out, nil
+	return out, refused, nil
 }
 
 // cloneAsOf clones a repository at a commit with nothing after it: every other ref deleted and what only they

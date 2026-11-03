@@ -415,3 +415,24 @@ func TestAGoldenTaskMayNameItsHarness(t *testing.T) {
 		t.Fatal("a mistyped key was read")
 	}
 }
+
+// A repository whose objects the scrubber would change is left out of a task's inputs and counted: the task goes on
+// without it, as the loop's own pass does, instead of failing both arms of every trial.
+func TestAHistoricalCloneTheScrubberWouldChangeIsLeftOut(t *testing.T) {
+	goodInputScrubber(t)
+	e, task := evalFixture(t)
+	end, _ := e.snapshotEnd(context.Background(), task)
+	dir := t.TempDir()
+	clean, secret := filepath.Join(dir, "clean"), filepath.Join(dir, "secret")
+	run(t, dir, "git", "init", "-q", "-b", "main", clean)
+	commitAt(t, clean, end.Add(-3*time.Hour), "job", "neutral text", "neutral")
+	run(t, dir, "git", "init", "-q", "-b", "main", secret)
+	commitAt(t, secret, end.Add(-3*time.Hour), "job", "password=marker-7f3a", "holds a password")
+	repos, refused, err := cloneRepositoriesCounted(context.Background(), []string{secret, clean}, end, filepath.Join(dir, "repos"))
+	if err != nil || len(repos) != 1 || refused != 1 {
+		t.Fatalf("clones %v refused %d: %v", repos, refused, err)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(dir, "repos")); len(entries) != 1 {
+		t.Fatalf("the refused clone was left on disk: %d entries", len(entries))
+	}
+}

@@ -87,7 +87,7 @@ PY
 	e.Runner.Inputs.ReadDirs = nil
 	repo, _, _ := evalRepository(t, end, "example")
 	tacit, _, _ := evalRepository(t, end, "facts")
-	e.Repositories, e.Tacit, e.Trials, e.Parallel = []string{repo}, tacit, 2, 2
+	e.Repositories, e.Tacit, e.Trials, e.Parallel, e.Budget = []string{repo}, tacit, 2, 2, 120
 	src, err := store.Open(e.Source)
 	if err != nil {
 		t.Fatal(err)
@@ -186,7 +186,7 @@ func TestEvaluationBudgetReservesRelayMarginAndBothArms(t *testing.T) {
 	route := filepath.Join(t.TempDir(), "route.env")
 	write(t, route, "CLAUDE_CODE_USE_BEDROCK=1\nANTHROPIC_BEDROCK_BASE_URL=http://127.0.0.1:9/fixture\nCLAUDE_CODE_SKIP_BEDROCK_AUTH=1\n")
 	e.Runner.Agent.Bedrock, e.Judge.Bedrock = &Bedrock{File: route}, &Bedrock{File: route}
-	e.Budget, e.Trials, e.Parallel = 17.99, 3, 3
+	e.Budget, e.Trials, e.Parallel = 29.99, 3, 3
 	trials, err := e.Run(context.Background(), []GoldenTask{task})
 	if err != nil || len(trials) != 6 {
 		t.Fatalf("budget: %v %d", err, len(trials))

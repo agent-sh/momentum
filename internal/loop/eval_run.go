@@ -50,6 +50,13 @@ func (e *Eval) Run(ctx context.Context, tasks []GoldenTask) ([]Trial, error) {
 	if err := e.pinRecordsBinary(); err != nil {
 		return nil, fmt.Errorf("pin the records binary: %w", err)
 	}
+	masterDir, err := e.buildMaster(ctx, tasks)
+	if err != nil {
+		return nil, fmt.Errorf("the scrubbed store of the tasks' windows: %w", err)
+	}
+	if masterDir != "" {
+		defer removeInputTree(masterDir)
+	}
 	repositories := append([]string(nil), e.Repositories...)
 	for _, t := range tasks {
 		if t.RepoPath != "" {
@@ -385,4 +392,37 @@ func (e *Eval) grade(ctx context.Context, t GoldenTask, f finding, jdir string, 
 func storedUsage(u Usage) store.Usage {
 	return store.Usage{Input: u.Input, Output: u.Output, CacheRead: u.CacheRead,
 		CacheWrite: u.CacheWrite5 + u.CacheWrite1, CacheWrite1h: u.CacheWrite1}
+}
+
+// buildMaster scrubs the store once for the widest window the tasks need: each task's copy is then cut from it by
+// time. It returns the directory holding the master, to remove when the evaluation ends.
+func (e *Eval) buildMaster(ctx context.Context, tasks []GoldenTask) (string, error) {
+	var first, last time.Time
+	for _, t := range tasks {
+		end, err := e.snapshotEnd(ctx, t)
+		if err != nil {
+			return "", err
+		}
+		if first.IsZero() || end.Before(first) {
+			first = end
+		}
+		if end.After(last) {
+			last = end
+		}
+	}
+	if first.IsZero() {
+		return "", nil
+	}
+	dir := filepath.Join(e.Dir, "master")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	master := filepath.Join(dir, "store.sqlite")
+	if _, err := StoreCopy(ctx, StoreCopyOptions{Source: e.Source, Destination: master, ScratchDir: dir,
+		Since: first.Add(-StoreWindow), Until: last, OmitInPlace: true}); err != nil {
+		removeInputTree(dir)
+		return "", err
+	}
+	e.master = master
+	return dir, nil
 }

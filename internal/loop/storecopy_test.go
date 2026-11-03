@@ -216,3 +216,79 @@ func TestStoreCopyScrubsInFewStartsAndScrubsNoteIds(t *testing.T) {
 		t.Fatalf("notes in the copy: %d %v", notes, err)
 	}
 }
+
+// A master made once for the widest window gives each task the rows of its own window, scrubbed already, with the
+// same notes rule, without another pass of the scrubber.
+func TestStoreCopyFromAMasterEqualsTheDirectCopy(t *testing.T) {
+	ctx := context.Background()
+	counter := filepath.Join(t.TempDir(), "starts")
+	inputScrubber(t, "echo x >> '"+counter+"'\nsed -e 's/AKIA[A-Z0-9]*EXAMPLE/[masked]/g' -e 's/marker-7f3a/[masked]/g'")
+	end := time.Date(2026, 2, 20, 12, 0, 0, 0, time.UTC)
+	var events []store.Event
+	for d := 0; d < 45; d++ {
+		events = append(events, store.Event{Source: "fixture", SourceKey: "k" + strconv.Itoa(d), TS: end.Add(-time.Duration(d) * 24 * time.Hour), Kind: "record", Summary: "marker-7f3a " + strconv.Itoa(d)})
+	}
+	source := inputStore(t, events)
+	st, err := store.Open(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, n := range []store.Note{{ID: "early", Kind: store.NoteDecided, Title: "early", At: end.Add(-10 * 24 * time.Hour)},
+		{ID: "late", Kind: store.NoteDecided, Title: "late", At: end.Add(-7 * 24 * time.Hour), Done: end.Add(-6 * 24 * time.Hour)}} {
+		_ = i
+		if _, err := st.PutNote(ctx, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.Close()
+	dir := t.TempDir()
+	master := filepath.Join(dir, "master.sqlite")
+	if _, err := StoreCopy(ctx, StoreCopyOptions{Source: source, Destination: master, Since: end.Add(-40 * 24 * time.Hour), Until: end, OmitInPlace: true}); err != nil {
+		t.Fatal(err)
+	}
+	starts := func() int { b, _ := os.ReadFile(counter); return strings.Count(string(b), "x") }
+	before := starts()
+	taskEnd := end.Add(-5 * 24 * time.Hour)
+	direct := filepath.Join(dir, "direct.sqlite")
+	if _, err := StoreCopy(ctx, StoreCopyOptions{Source: source, Destination: direct, Since: taskEnd.Add(-StoreWindow), Until: taskEnd, OmitInPlace: true}); err != nil {
+		t.Fatal(err)
+	}
+	mid := starts()
+	cut := filepath.Join(dir, "cut.sqlite")
+	if _, err := StoreCopy(ctx, StoreCopyOptions{Source: master, Destination: cut, Since: taskEnd.Add(-StoreWindow), Until: taskEnd, OmitInPlace: true, Master: true}); err != nil {
+		t.Fatal(err)
+	}
+	if starts()-mid > 2 || mid-before < 1 {
+		t.Fatalf("starts: direct %d, from the master %d", mid-before, starts()-mid)
+	}
+	dump := func(path string) string {
+		var b strings.Builder
+		db := inputPlainDB(t, path)
+		rows, err := db.Query("SELECT id,summary,ts FROM events ORDER BY id")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var id, s string
+			var ts int64
+			rows.Scan(&id, &s, &ts)
+			b.WriteString(id + "|" + s + "|" + strconv.FormatInt(ts, 10) + "\n")
+		}
+		rows.Close()
+		rows, err = db.Query("SELECT id,title,done FROM notes ORDER BY id")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var id, s string
+			var d int64
+			rows.Scan(&id, &s, &d)
+			b.WriteString("n|" + id + "|" + s + "|" + strconv.FormatInt(d, 10) + "\n")
+		}
+		rows.Close()
+		return b.String()
+	}
+	if a, b := dump(direct), dump(cut); a != b || !strings.Contains(a, "n|late|") {
+		t.Fatalf("the cut from a master differs from the direct copy:\n%s\n---\n%s", a, b)
+	}
+}

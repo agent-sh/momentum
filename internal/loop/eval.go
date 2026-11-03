@@ -136,6 +136,7 @@ type Eval struct {
 	Split              string
 	HeldOut, Selected  []string
 	programs           programs
+	master             string // the scrubbed store of every task's window, made once (see StoreCopyOptions.Master)
 }
 
 // Grade is the judge's reading of one investigation.
@@ -246,9 +247,12 @@ func (e *Eval) provenance() Provenance {
 }
 
 // judgeBudget is what one run of the judge may cost, and judgeAttempts how many runs a trial's judge may take: a
-// judge that fails (an API error, an answer off its schema) is tried once more.
+// judge that fails (an API error, an answer off its schema) is tried once more. The relay reserves the largest charge
+// a request could cost (its output ceiling and a token for every byte of a body that holds both investigations), and
+// refuses a request that does not fit the run's allowance of 1.5 times its budget: a judge needs room for that, not
+// the 1 USD an answer costs a few cents of.
 const (
-	judgeBudget   = 1.0
+	judgeBudget   = 3.0
 	judgeAttempts = 2
 )
 
