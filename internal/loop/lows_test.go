@@ -195,3 +195,16 @@ printf 'busy.service\n'`)
 		t.Fatalf("the journal's window is not the end's: %q (end %s)", raw, end)
 	}
 }
+
+// A split signal joined by a + whose line alone changed is a changed literal: the operator joins the fragments, and
+// editing it touches the sequence even when neither fragment's line changed.
+func TestChangedLiteralsJoinsAcrossAnEditedPlus(t *testing.T) {
+	lines := []string{`msg := "permission "`, `+`, `"denied"`}
+	got := changedLiterals(lines, []bool{false, true, false})
+	if len(got) != 1 || got[0] != "permission denied" {
+		t.Fatalf("an edited + between unchanged fragments: %q", got)
+	}
+	if got := changedLiterals(lines, []bool{false, false, false}); len(got) != 0 {
+		t.Fatalf("an unchanged sequence: %q", got)
+	}
+}
