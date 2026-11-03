@@ -15,6 +15,7 @@ import (
 
 	"github.com/agent-sh/momentum/internal/config"
 	"github.com/agent-sh/momentum/internal/detect"
+
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
@@ -198,6 +199,10 @@ func caseList(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	if err != nil {
 		return err
 	}
+	if f.Limit > 0 && len(cs) > 200 {
+		cs = cs[:200]
+		defer fmt.Fprintln(stderr, "momentum: more cases; narrow with --family or --status")
+	}
 	enc := json.NewEncoder(stdout)
 	width := 14
 	for _, c := range cs {
@@ -267,11 +272,14 @@ func caseShow(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	if err != nil {
 		return err
 	}
-	log, err := st.CaseLog(ctx, c.ID)
+	log, err := st.CaseLogLimit(ctx, c.ID, *logN)
 	if err != nil {
 		return err
 	}
-	logged := len(log)
+	logged, err := st.CaseLogCount(ctx, c.ID)
+	if err != nil {
+		return err
+	}
 	if *logN > 0 && len(log) > *logN {
 		log = log[len(log)-*logN:]
 	}

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/config"
+
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/source"
@@ -32,6 +33,8 @@ const usage = `usage:
                                         events, newest first; one session's (an id or its start) oldest first;
                                         H is claude, codex, pi, opencode or hermes
   momentum evidence status [--since DUR]   events per source and kind, and unparsed records
+  momentum evidence show ID [ID...] [--bytes N]  up to ten events and their records, scrubbed whole before clipping
+  momentum evidence unit NAME [--lines N]  a user service's state and the end of its log, scrubbed
   momentum evidence rebuild SOURCE [--force]
                                         drop what SOURCE contributed; the next ingest reads it from the start
                                         (not sessions; transcripts and incidents only with --force: it says how
@@ -82,6 +85,11 @@ const usage = `usage:
                                         R is not-worth-it, insufficient-evidence, already-solved or duplicate
   momentum case reopen ID --evidence REF... [--at WHEN] --why W
                                         a closed case comes back only on evidence it does not hold
+  momentum loop [--dry] [--family F,F] [--case ID] [--json]
+                                        investigate each family's case once with the harness's native agent;
+                                        the host records the findings
+  momentum loop runs [--since WHEN] [--case ID] [--json]
+                                        the loop's runs, and what the live ones spent in the last day and week
   momentum version
 Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json), and the
 capacity rules in its capacity section.
@@ -103,6 +111,10 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	return runCommand(ctx, args, stdout, stderr)
+}
+
+func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, usage)
 		return 2
@@ -123,6 +135,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		err = capacityCmd(ctx, args[1:], stdout, stderr)
 	case "case":
 		err = caseCmd(ctx, args[1:], stdout, stderr)
+	case "loop":
+		err = loopCmd(ctx, args[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintln(stdout, "momentum", version)
 	case "-h", "--help", "help":
@@ -153,9 +167,13 @@ func evidence(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	case "events":
 		return events(ctx, args[1:], stdout, stderr)
 	case "status":
-		return status(ctx, args[1:], stdout)
+		return status(ctx, args[1:], stdout, stderr)
 	case "rebuild":
 		return rebuild(ctx, args[1:], stdout, stderr)
+	case "show":
+		return evidenceShow(ctx, args[1:], stdout, stderr)
+	case "unit":
+		return evidenceUnit(ctx, args[1:], stdout, stderr)
 	}
 	return usageError{fmt.Sprintf("unknown evidence command %q", args[0])}
 }
@@ -215,6 +233,7 @@ func ingest(ctx context.Context, stdout, stderr io.Writer) error {
 
 func events(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("events", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	since := fs.String("since", "1d", "how far back, or from when (one session: its start)")
 	until := fs.String("until", "", "until when")
 	kinds := fs.String("kind", "", "comma-separated kinds")
@@ -296,8 +315,9 @@ func events(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	return nil
 }
 
-func status(ctx context.Context, args []string, stdout io.Writer) error {
+func status(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	since := fs.String("since", "7d", "how far back")
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}

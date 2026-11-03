@@ -15,12 +15,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
+	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite"
 )
 
@@ -64,8 +66,9 @@ func (e Event) ID() string {
 }
 
 type Store struct {
-	db   *sql.DB
-	path string
+	db       *sql.DB
+	path     string
+	readLock *os.File
 }
 
 // Sessions is the source of the events `momentum sessions` writes: each phase change of a live session, as the
@@ -100,7 +103,7 @@ type querier interface {
 // The store's tables are of two kinds.
 //
 // Kept tables hold what cannot be read again: every event, when each live session entered its phase, the notes
-// (notes.go), what the capacity runs observed (capacity.go), and the cases (cases.go). A schema change migrates them and never drops
+// (notes.go), what the capacity runs observed (capacity.go), the cases (cases.go), and the loop's runs (loop.go). A schema change migrates them and never drops
 // them. A kept table that is missing is made with the columns it was first made with (keptTables), it gains each
 // later column it lacks (keptColumns), and its rows change only in a step or by its triggers (keptTriggers).
 //
@@ -122,7 +125,7 @@ CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, kind TEXT NOT NULL, title
   detail TEXT NOT NULL DEFAULT '', effect TEXT NOT NULL DEFAULT '', links TEXT NOT NULL DEFAULT '[]',
   source TEXT NOT NULL DEFAULT '', importance INTEGER NOT NULL DEFAULT 0, at INTEGER NOT NULL,
   done INTEGER NOT NULL DEFAULT 0);
-` + capacityTables + caseTables
+` + capacityTables + caseTables + loopTables
 
 // keptColumns are the columns each kept table gained after it was first made, in order. A table that lacks one
 // gains it and keeps its rows: SQLite's ADD COLUMN writes no row, so it costs the same on any table. The next
@@ -140,6 +143,8 @@ var keptColumns = []struct {
 		{"experiment", "TEXT NOT NULL DEFAULT ''"}, {"ingested", "INTEGER NOT NULL DEFAULT 0"}}},
 	{"session_stamps", [][2]string{{"tool", "TEXT NOT NULL DEFAULT ''"}, {"name", "TEXT NOT NULL DEFAULT ''"},
 		{"auto", "INTEGER NOT NULL DEFAULT 0"}, {"ask", "TEXT NOT NULL DEFAULT ''"}, {"ask_kind", "TEXT NOT NULL DEFAULT ''"}}},
+	{"loop_runs", loopRunColumns},
+	{"cases", [][2]string{{"episode", "INTEGER NOT NULL DEFAULT 1"}}},
 	{"capacity_runs", [][2]string{{"blind", "INTEGER NOT NULL DEFAULT 0"}}},
 }
 
@@ -152,7 +157,7 @@ CREATE INDEX IF NOT EXISTS events_session ON events(session, ts);
 CREATE INDEX IF NOT EXISTS events_key ON events(source, source_key);
 `
 
-var keptIndexNames = append([]string{"events_ts", "events_kind", "events_session", "events_key"}, caseIndexNames...)
+var keptIndexNames = slices.Concat([]string{"events_ts", "events_kind", "events_session", "events_key"}, caseIndexNames, loopIndexNames)
 
 // keptTriggers give Claude Code its one name as an event is written, by whatever build writes it: a build from
 // before the events were kept writes claude-code, also while this build has the store open.
@@ -275,10 +280,57 @@ var ErrNotCurrent = errors.New("the store is not this build's schema")
 // removes them. A missing store is an error, and so is one that is not this build's schema (ErrNotCurrent), which
 // this build would misread.
 func OpenReadOnly(path string) (*Store, error) {
+	return openReadOnly(path, false)
+}
+
+// OpenReadOnlyExclusive reads an idle, checkpointed store without even creating SQLite's reader sidecars.
+// This is for a CLI process with no other open connection. Its open-file-description lock excludes other
+// processes' SQLite byte-range locks without creating a lock file.
+// While that lock is held, immutable is true: no writer can change the database beneath the read-only connection.
+// A nonempty WAL or rollback journal needs a writer's recovery first and is refused without changing it.
+func OpenReadOnlyExclusive(path string) (*Store, error) {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("no store to read: %w; a sessions run, an ingest or a note makes it", err)
+		}
+		return nil, err
+	}
+	locked := false
+	defer func() {
+		if !locked {
+			f.Close()
+		}
+	}()
+	if err := unix.FcntlFlock(f.Fd(), unix.F_OFD_SETLK, &unix.Flock_t{Type: unix.F_WRLCK, Whence: io.SeekStart}); err != nil {
+		return nil, fmt.Errorf("store is busy: dry selection needs an idle store: %w", err)
+	}
+	for _, suffix := range []string{"-wal", "-journal"} {
+		info, err := os.Stat(path + suffix)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		if err == nil && info.Size() > 0 {
+			return nil, fmt.Errorf("dry selection needs a checkpointed store: %s still holds data", suffix)
+		}
+	}
+	st, err := openReadOnly(path, true)
+	if err != nil {
+		return nil, err
+	}
+	st.readLock, locked = f, true
+	return st, nil
+}
+
+func openReadOnly(path string, immutable bool) (*Store, error) {
 	if _, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("no store to read: %w; a sessions run, an ingest or a note makes it", err)
 	}
-	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(%d)", path, BusyTimeout.Milliseconds()))
+	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(%d)", path, BusyTimeout.Milliseconds())
+	if immutable {
+		dsn += "&immutable=1"
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -307,7 +359,8 @@ func busy(err error) bool {
 }
 
 // keptTableNames are the tables keptTables makes.
-var keptTableNames = slices.Concat([]string{"events", "session_stamps", "schema_steps", "notes"}, capacityTableNames, caseTableNames)
+var keptTableNames = slices.Concat([]string{"events", "session_stamps", "schema_steps", "notes"}, capacityTableNames, caseTableNames,
+	loopTableNames)
 
 // checkpointColumns are the columns the schema gives the checkpoint tables. They are a cache of what transcripts
 // hold, so tables with other columns (a build before this one made them) are dropped and made again, and the next
@@ -369,7 +422,7 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
-	if _, err := tx.Exec(keptIndexes + caseIndexes + keptTriggers); err != nil {
+	if _, err := tx.Exec(keptIndexes + caseIndexes + loopIndexes + keptTriggers); err != nil {
 		return err
 	}
 	var pending []step
@@ -513,7 +566,14 @@ func addColumns(tx *sql.Tx, table string, want [][2]string) error {
 	return nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	err := s.db.Close()
+	if s.readLock != nil {
+		err = errors.Join(err, s.readLock.Close())
+		s.readLock = nil
+	}
+	return err
+}
 
 // Put inserts events, or refreshes every derived column of an event already stored, in one transaction.
 // It returns how many were new.
@@ -876,6 +936,16 @@ func toolID(meta string) string {
 		return rest[:j]
 	}
 	return ""
+}
+
+// EventByID reads an event by its id; ok is false when the store holds none.
+func (s *Store) EventByID(ctx context.Context, id string) (Event, bool, error) {
+	evs, err := scanEvents(s.db.QueryContext(ctx, `SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
+	  tool, summary, meta, ref, heuristic, experiment FROM events WHERE id = ?`, id))
+	if err != nil || len(evs) == 0 {
+		return Event{}, false, err
+	}
+	return evs[0], true, nil
 }
 
 // EventByKey reads a source's event by its key; ok is false when the store holds none.

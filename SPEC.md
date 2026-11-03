@@ -46,22 +46,18 @@ Session supervision is core, not a later extra. In Phase 0, most of the owner's 
 
 ## Architecture
 
-- **One agent loop with skills and tools, not an orchestrator of roles.** The harness's own main agent runs the loop.
-  - Each question family is a skill: its procedure, rules and judgment calls.
-  - Hard limits live in the tools, not in prompts: authority and write gates, the spend gate, budgets, validation.
-  - Subagents are used only where they earn their own context: parallel investigations that need fresh, disposable context, and clean-context verification.
-  - Splitting work by problem type turns handoffs into a telephone game. An earlier orchestrator in this setup, split by role, cost hundreds of times the tokens of the native path per merged task.
-  - Prior art: Anthropic, ["When to fold subagents into your main agent loop"](https://claude.com/resources/articles/building-agents-when-to-fold-subagents-into-your-main-agent-loop) (2026-10-22), and [`anthropics/single-agent-loop-kit`](https://github.com/anthropics/single-agent-loop-kit). [arXiv 2601.04748](https://arxiv.org/abs/2601.04748) finds that skill selection holds up to a critical library size and then drops sharply, driven by how alike the skills are. So the skill set stays small and distinct, and selection is measured.
-- **Go.** tacit's client is Go, and the readers this tool needs are Go packages there: transcript discovery, the Hermes database reader, owner attribution, redaction, the model runner and the note reviewer. Milestone 1 moves them out of `internal/` so both tools import them. The CLI exposes a few tools grouped by intent (evidence, case, measure, ship), not one per function.
-- **A CLI and systemd timers, no daemon** until a measured need shows up.
-- **No app or dashboard of its own.** Views in surfaces the owner already uses read `momentum report --json` (Report).
-- **SQLite** for events, cases and experiments; artifacts (patches, reports, rollback manifests) as files next to it.
-- **Thin harness adapters:** a Claude Code mod, a Hermes general plugin (next to tacit's memory provider, not in its place), Codex hooks. Observation reads transcripts as the source of truth. Hooks add live signals but miss things: a call to a tool that does not exist never reaches Claude Code's tool hook.
-- **A fixed sandbox launcher** (`internal/sandbox`) uses bubblewrap in a transient systemd user service (Sandbox). A run sees only the fixed system mounts, caller binds and an optional relay socket. The package knows nothing about the harness, loop or store.
+- **One native investigation per case.** The harness's main agent finds the mechanism, alternatives and fix from host-prepared evidence. It has a native brief and the owner's standing constraints. The host records its report. No family procedure is appended.
+  - Prior art: Anthropic, ["When to fold subagents into your main agent loop"](https://claude.com/resources/articles/building-agents-when-to-fold-subagents-into-your-main-agent-loop) (2026-10-22), and [`anthropics/single-agent-loop-kit`](https://github.com/anthropics/single-agent-loop-kit). Investigations use the harness's native agent and host bookkeeping.
+- **Go.** tacit's shared readers supply transcript discovery, owner attribution and redaction. Host CLI commands ingest and inspect evidence and cases.
+- **A CLI and systemd timers.** There is no daemon until a measured need appears.
+- **No app or dashboard of its own.** Existing surfaces read `momentum report --json` (Report).
+- **SQLite.** Events, cases and runs are kept locally. Reports and streams live beside the store.
+- **Thin harness adapters.** Observation reads transcripts as the source of truth. Hooks add live signals but miss calls to absent tools.
+- **A fixed sandbox launcher.** `internal/sandbox` uses bubblewrap in a transient systemd user service (Sandbox). The loop supplies the harness, relay and scrubbed read-only inputs. The launcher knows nothing about the harness, loop or store.
 
 ## Sandbox
 
-`internal/sandbox` reuses bubblewrap, systemd and socat. It supplies one fixed argv, with no host shell. Anthropic's guidance puts the whole permission-free agent process in a container, VM or sandbox runtime, as a non-root user. Claude Code's shell sandbox alone does not cover the whole agent. OpenAI's guidance keeps keys behind a proxy and applies the diff in a separate job. The launcher is generic; the loop supplies the harness, relay, inputs and toolchains.
+`internal/sandbox` reuses bubblewrap, systemd and socat. It supplies one fixed argv, with no host shell. Anthropic's guidance puts the whole permission-free agent process in a container, VM or sandbox runtime, as a non-root user. Claude Code's shell sandbox alone does not cover the whole agent. OpenAI's guidance keeps keys behind a proxy and applies the diff in a separate job. The launcher is generic; the loop supplies the harness, relay and inputs.
 
 ```text
 systemd-run --user --wait --pipe --collect --quiet --expand-environment=no --unit=momentum-run-ID
@@ -80,7 +76,7 @@ bwrap --unshare-all --unshare-user --disable-userns --die-with-parent --new-sess
 
 With no relay the program runs directly. There is no socat or relay mount. `--expand-environment=no` preserves dollar expressions in program arguments and environment values for bubblewrap. The only network interface is private loopback. A relay run can reach its relay and anything the caller binds. It cannot reach host listeners, the host bus, an external address or DNS. The address-family filter also blocks AF_VSOCK, which a network namespace does not isolate. The relay owns authentication and request policy outside the sandbox.
 
-**Layout.** The caller creates a private run directory (0700) with `work`, `out` and `ro`, and a private host-only sibling (0700) with inputs and the relay socket. Writable trees hold no sockets. A run's work tree is its own clone. The host treats its files and output as untrusted data; it validates a patch and applies it in a separate clone. It never runs programs or git in the run's clone. Store inputs are scrubbed copies; SQLite copies use `VACUUM INTO` so they need no writable WAL. These are caller responsibilities, not launcher behavior.
+**Layout.** The caller creates a private run directory (0700) with `work`, `out` and `ro`, and a private host-only sibling (0700) with inputs and the relay socket. Writable trees hold no sockets. An investigation's work tree is empty scratch. The host treats its files and output as untrusted data. It reads only report text and never runs programs or git in the run's directories. Store inputs are scrubbed copies; SQLite copies use `VACUUM INTO` so they need no writable WAL. These are caller responsibilities, not launcher behavior.
 
 A bind destination is exactly `/work`, `/out`, `/run/input`, or a path under `/ro/` or `/opt/`. Destinations are absolute and clean. None equals or contains another bind destination. No mount goes inside an untrusted mounted tree. A source is absolute, clean, exists, and is a regular file or directory, never a symbolic link, and none of its parents is one: callers pass paths they resolved (`filepath.EvalSymlinks`), so what the check saw is what bubblewrap mounts. A file with other hard links is bound as it is; the caller makes its sources. A directory is walked with `lstat`; a socket or an inspection error refuses the run. Internal symbolic links are not followed. The caller creates and keeps sources stable through launch; the launcher does not pin descriptors or protect against a host racing those checks. The relay is checked separately with `lstat`: it is a socket, owned by the caller, mode 0600 (ownership is checked in code; a test cannot make a socket of another user without privilege).
 
@@ -220,7 +216,7 @@ The incidents source keeps one event per incident, rewritten as its file changes
 
 One SQLite file, `~/.local/share/momentum/momentum.db`, mode 0600.
 
-- **Kept tables** hold what cannot be read again: every event, when each session entered its phase, the notes (Report), what the capacity runs observed (Capacity), and the cases with their evidence, signatures and logs (Cases). A schema change migrates them and never drops them.
+- **Kept tables** hold what cannot be read again: every event, when each session entered its phase, the notes (Report), what the capacity runs observed (Capacity), the cases with their evidence, signatures and logs (Cases), and the loop's runs with what each spent (The loop, Record). A schema change migrates them and never drops them.
   - A kept table gains a column it lacks, with the column's default, and keeps its rows. SQLite's ADD COLUMN writes no row, so it costs the same on any table. The next column is one more entry in the store's list of columns: a NOT NULL column needs a default, and an added column cannot be a key.
   - A new kept table takes no step: it changes no row. A store from before it gains it at its next open, and a build from before it, which never reads it, keeps working on the store.
   - A change to their rows is a step: numbered, run once and in order in the transaction that opens a store from before it, and recorded in `schema_steps`. A step that changes what the sources derive (a column they fill, a fix in how they read) reads again.
@@ -358,16 +354,16 @@ Phase 0 showed that each family needs history the machine does not keep today. T
 
 ## Cases
 
-`momentum case` keeps the cases, in kept tables of the store (Store). A case is one answer in progress to one of the standing questions. It holds its family, evidence references, the suspected mechanism, alternatives, the next discriminating test, the expected benefit, the cost spent so far (the model's money and tokens, the time, the runs), its signatures, its status, and a log of every change with who made it (`MOMENTUM_ACTOR`, which the loop sets to its run), one line for each change or observation.
+`momentum case` keeps the cases, in kept tables of the store (Store). A case is one answer in progress to one of the standing questions. It holds its family, evidence references, the suspected mechanism, alternatives, the next discriminating test, the expected benefit, the cost spent so far (the model's money and tokens, the time, the runs), its signatures, its status, and a log of every change with who made it (`MOMENTUM_ACTOR` for host commands, `loop:ID` for runner changes), one line for each change or observation.
 
 - **Signatures.** A case is found by its signatures. A detector's names a symptom, a deterministic key of what it saw (Detectors). A finding whose signature no case holds opens a case; one a case holds gives that case the evidence it lacks, and the case keeps its own title. The same evidence twice changes nothing.
-- **Cases dedupe by root cause, not by symptom.** The investigation names the root cause as a signature of its own (`root:` and a key). A case that names a root another case holds goes into that case: its evidence, signatures and cost move there (it keeps no cost, so a sum over cases counts each run once), and so does what its investigation found (mechanism, alternatives, next test, benefit) where that case has none. It closes as a duplicate that points there (every case that went into it before points there too, one hop away), and what its symptom brings later lands there too. Any signature merges so, a symptom's as well as a root's. A root links symptoms and never opens a case: a stated cause is a guess until a test tells it from the alternatives, so only a symptom's signature opens one.
+- **Cases dedupe by root cause, not by symptom.** A host case command names a root signature (`root:` and a key). Investigation reports add no root signature; validation belongs to a later build. A case that names a root another case holds goes into that case: its evidence, signatures and cost move there (it keeps no cost, so a sum over cases counts each run once), and so does what its investigation found (mechanism, alternatives, next test, benefit) where that case has none. It closes as a duplicate that points there (every case that went into it before points there too, one hop away), and what its symptom brings later lands there too. Any signature merges so, a symptom's as well as a root's. A root links symptoms and never opens a case: a stated cause is a guess until a test tells it from the alternatives, so only a symptom's signature opens one.
   - A case goes into a closed one only when its closer names it (`case close --reason duplicate --into`), never by a signature: the closed case comes back first (`case reopen`, with evidence it does not hold), then takes the other in.
   - A duplicate's own id closes and reopens nothing: the case it went into holds its evidence. Evidence, a change, a signature or a cost given by its id go to that case.
 - **Evidence** is a reference: an event (`ev:ID`), a note (`note:ID`), a commit (`git:OWNER/REPO@SHA`), a file (`file:PATH`, absolute or under `~/`, with an optional `@OFFSET`), or an http or https address; anything else is refused. An event's reference always takes the event's own time, kind and summary, and a note's the note's, whatever the caller gives; either must be in the store. Evidence is of what happened: none is dated after now. The material stays where the reference points.
 - **Status** runs open, investigating, testing, deployed, measuring, then closed with a reason: improved (with the measurement), not worth it, insufficient evidence, already solved, or duplicate (of the case it went into).
-  - An investigation moves a case among open, investigating and testing. A case is in testing only with a mechanism and the next discriminating test on record: a change that would leave a testing case without either is refused.
-  - Only the ship tool deploys a case, with its change package, and only its rollback takes a deployed case back (The loop). Only the measure tool moves a case to measuring and closes it as improved, with the measurement.
+  - An investigation moves a case among open, investigating and testing. A case is in testing only with a mechanism and a fix (its next test) on record: a change that would leave a testing case without either is refused.
+  - Deployment, measuring and improved closure are retained states for later parts. This part reaches testing only.
   - A case closes by hand from open, investigating or testing, with a reason and why, never as improved.
 - **A dismissed case does not come back unless its evidence changes.** Evidence dated before the close changes nothing.
   - A case closed as already solved comes back on any evidence after the close.
@@ -408,18 +404,77 @@ Phase 0 showed that each family needs history the machine does not keep today. T
 
 ## The loop
 
-1. Detect, then open or update a case.
-2. Investigate.
-3. Build a change package.
-4. Deploy within authority.
-5. Measure.
-6. Close, and publish the validated lesson to tacit.
+This build investigates. Builds, reviews, landing, rollback, lessons and measurement belong to later parts. A case in testing or closed as improved is passed over with the reason "builds are not in this build". Existing configuration keys for those parts still load.
 
-**Prior art comes before building.** Any case that would add a new component, workflow or architecture starts with a search of current primary sources (labs' engineering posts, papers, released kits) for the same problem. It states what they found and why this design follows or departs from it. The earlier orchestrator was built while published guidance and results against its design already existed.
+Prior art comes before a new component, workflow or architecture. An investigation weighs a deterministic fix, a tool or interface change, and an architecture change before recommending another instruction.
 
-**A change package** holds the patch or configuration change, where it applies (model, harness, task family, tool version), the evaluation plan, the baseline and candidate results, and the rollback.
-- Prompt changes are one option among several. A substantial case must weigh a deterministic fix, a tool or interface change, or an architecture change before adding another instruction.
-- Instructions the tool injects are checked against the live harness: the tools they name exist, and the command forms they recommend pass the harness's own checks.
+### A run's inputs
+
+The host prepares the inputs before a run. Host paths are caller arguments. The run reads a store at `/ro/store.sqlite`, records and unit logs at `/ro/records`, a configuration copy at `/ro/config`, a tacit clone at `/ro/clone`, and repository clones at `/ro/repos/NAME`. Preparation runs no model.
+
+Every copy fails closed on scrubbing. The scrubber must first mask a canary containing the AWS documentation example access key id and a fake password assignment. Texts go through records mode in batches of at most 8 MiB. A record separator in a text becomes a space. A changed record count, missing scrubber or failed scrubber publishes no copy. Names and manifest text are scrubbed too; a path needing masking is withheld. Git history stays intact: all clone objects and their names pass the scrubber before publication, and a clone needing masking is refused instead of changing its commits. An object over the scrub limit is refused.
+
+The store holds events and notes from the last 30 days of the live store. It holds no case, run, package or derived table. Incident and radar rows rewritten in place remain. Every text column is scrubbed. Invalid scrubbed event meta becomes `{}`. `VACUUM INTO` produces one read-only SQLite file in DELETE journal mode, with no WAL.
+
+Records use the host's `momentum evidence show --bytes N ID` and `momentum evidence unit NAME`, then scrub their output again. Evidence IDs keep priority. Neighbours come from exactly the same session, at most five on each side within ten minutes. The shared directory holds at most 200 records, 16 KiB per record and 8 MiB including its index. The first reached bound stops collection and the manifest says why. Withheld records and skipped records have separate counts. A second scrubber pass masking text does not count as withholding. Unit discovery takes at most ten unique names of the form `[A-Za-z0-9@._-]+\.(service|timer)`. The index names each file and its event and time, or its unit.
+
+Configuration comes only from `.claude/mods`, `.claude/hooks`, `.claude/settings.json`, `.config/agents`, `.config/systemd/user`, `.config/momentum`, and direct shell, Python or Node scripts in `.local/bin`. Mod sources omit `node_modules`, `dist`, `build`, `out`, `target`, `.next`, `__pycache__` and `.git` directories. No link is followed. A file must be regular, at most 256 KiB, valid UTF-8 and without NUL in its first 8 KiB. Credential and keyring stores and names containing `credential`, `secret`, `token`, `passwd`, `.pem`, `.key`, `id_rsa` or `.env` are refused, case-insensitively. The copy admits no other home root, including `.claude.json`, `.fireworks`, `.ssh`, `.aws` or the broker's environment file. Roots follow the order above and paths are sorted within each root. The 8 MiB cap includes `MANIFEST.txt`; the copy retains a prefix and lists skips by reason. Files have mode 0444, directories 0555. This pass copies live configuration. It sets no evaluation clock.
+
+Repository clones use `--no-local`, so their objects stay independent of source maintenance. Tacit uses `--local`, sharing immutable objects by hardlink, with the clone mounted read-only. Both keep history and check out the default branch, remove origin and hooks, and use the host Git environment and execution pins. A link, non-work-tree source or source inside the caller's loop storage is refused. Duplicate sources are cloned once. Colliding basenames get a short path hash. The clone API records individual repository refusals. The investigation runner skips the step if any configured repository could not be prepared.
+
+The runner writes `manifest.json` in the run's host-only directory. It records the store window and counts, canary result, records and their bounds, configuration files and skips, leaks, clone commits and refusals. The run's record keeps the manifest's one-line summary.
+
+Prior art: SQLite's [VACUUM INTO](https://www.sqlite.org/lang_vacuum.html) creates a compact database copy. Go's [root-confined file APIs](https://go.dev/blog/osroot) bound file reads. Git's [clone](https://git-scm.com/docs/git-clone) and [cat-file](https://git-scm.com/docs/git-cat-file) interfaces provide independent clones and a stream of their objects.
+
+The pass-level store, configuration, tacit clone and repository clones are prepared lazily when the first investigation is about to start. They are shared read-only by the pass's runs and removed when the pass ends. A dry pass prepares nothing. Records and `case.json` are prepared per run. A missing scrubber, failed canary or failed copy skips the step before reservation. No model starts and no run is charged to the case.
+
+Inside the sandbox:
+
+| Path | Contents |
+|---|---|
+| `/ro/store.sqlite` | One plain scrubbed SQLite file. Read it with `python3` and `sqlite3.connect("file:/ro/store.sqlite?mode=ro", uri=True)`. The SQLite CLI is absent. |
+| `/ro/records/` | Evidence events and neighbours as `ev-ID.txt`, named unit logs as `unit-NAME.txt`, and `index.txt`. |
+| `/ro/config/` | Scrubbed text configuration and `MANIFEST.txt`. |
+| `/ro/clone` | tacit's facts, full history and the default branch, read-only. The default source is `~/.local/share/tacit/store`; `loop.tacit_store` overrides it. |
+| `/ro/repos/NAME` | Read-only clones of `loop.read_dirs`, with full history and the default branch checked out. |
+| `/run/input/` | Read-only `system.md`, `schema.json` and scrubbed `case.json`: the case, evidence references and log. |
+| `/work` | Empty writable scratch and the working directory. |
+| `/out` | Writable findings, including `/out/findings.md`. |
+
+The store's `events` columns are `id` (24 hex characters, referenced as `ev:ID`), `source`, `source_key`, `ts` (milliseconds since the epoch), `session`, `agent`, `harness`, `model`, `cwd`, `actor` (owner, agent, tool, harness, detector, unknown), `kind`, `tool`, `summary`, `meta`, `ref` and `experiment`. `notes` holds `id`, `kind`, `title`, `detail`, `effect`, `links`, `source`, `importance`, `at` and `done`. The owner's words are only his own turns, with actor owner. Python3, git, jq, rg, grep, sed and awk are in `/usr`.
+
+### The runner
+
+`momentum loop` runs one pass. A second pass fails at once on `momentum.db.loop-lock`. A live pass checks `sandbox.Available(true)` once and stops leftover `momentum-run-loop-` units before any investigation starts. It then:
+
+1. Ends stale running rows after the allowed run time. Their original reservations are charged once. The host's authenticated saved report, or a killed investigation's findings file, is recorded first.
+2. Runs the detectors and sweep (Detectors).
+3. Selects one case per family, investigating before open, then by evidence count. Running reservations, case budgets and the stop rule hold selection. It prepares inputs, reserves each run in turn and runs the reserved investigations in parallel. A selection error still waits for already-reserved runs to end.
+4. Records each investigation's findings and relay-observed accounting.
+
+`momentum loop --dry` selects without writing, recovering runs, building inputs or discovering programs. It opens the store read-only, migrates nothing and creates no SQLite sidecars. An exclusive byte-range lock keeps the immutable view stable. A busy store, nonempty WAL or rollback journal is refused. A missing store is absent; an older schema needs migration by a writing command. An existing pass lock is checked without creating one. `--family` and `--case` narrow selection. `momentum loop runs` lists runs and live spend in the last day and week.
+
+### The investigation
+
+The investigation is the harness's native agent, with the native brief, standing constraints and machine rules. It receives no family skill or case bookkeeping procedure. It keeps findings as it goes in `/out/findings.md`, with Mechanism, Alternatives ruled out, Fix and Summary headings. Its schema report has `mechanism`, `alternatives`, `fix` and `summary`.
+
+The reservation keeps the case episode used to prepare the brief. The host records the report only in that episode. A report replaces the mechanism, alternatives and next test. A mechanism and fix move the case to testing. A successful incomplete report closes it as insufficient evidence. New evidence can reopen it in a new episode. A findings file updates only the fields it contains and leaves the case investigating. A case that merged, advanced or reopened while the run ran rejects stale findings.
+
+When a run has no report, the host reads only `/out/findings.md` from the writable directories. It opens that one regular owned file through a confined root, refuses symlinks and pipes, and reads at most 1 MiB from the same descriptor. It scrubs the text before persistence. Everything the run writes is untrusted data. The host never runs a program or git in a run's directories.
+
+The harness binary is resolved and bound read-only at `/opt/claude/claude`. It runs bare, in print mode, with the named built-in tools, strict MCP configuration, permission prompts disabled and session persistence disabled. The host archive is its transcript. The harness reads the system prompt from `/run/input/system.md` and gets `--add-dir /ro`, the report schema, model, turn cap and spend cap.
+
+The environment contains the relay's Bedrock variables and `CLAUDE_CONFIG_DIR=/home/agent/.claude`, `DISABLE_AUTOUPDATER=1`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. `ANTHROPIC_BEDROCK_BASE_URL` uses private loopback at `sandbox.RelayPort` (8787) and the relay's path prefix. No inherited environment enters. Checks assert variable names only. Each unit is `momentum-run-loop-` plus the cleaned lowercase run id. A fallback appends `-fallback`. Its relay socket and trusted inputs live in `HostDir(run)`. Streams stay there too: 64 MiB for the transcript and 8 MiB for diagnostics.
+
+### Authority
+
+- **The relay.** Every model request uses the Bedrock relay. It admits only allowed global Claude profiles, bounds request turns and reserves the maximum charge before forwarding. Usage by token kind and cost come from responses the relay observed. Harness claims are diagnostics. A terminal report must match the terminal structured output the relay observed. Refusal, fallback allowance and accounting use those observations.
+- **Budgets.** Defaults remain $4 per run, 30 minutes and 120 turns; $20 per case, $40 per day and $200 per week. All reservations precede their runs and count at their whole budget. A fallback shares the primary's remaining spend, turns and time. A fallback that never starts adds no charge. A run without an observed request holds its reservation; a response of unknown usage holds its request reservation. Timeout and cancellation stop the whole unit. `Result.Failed` is diagnostic only.
+- **The stop rule.** Two completed live runs of the same step with the same failure stop the case. Refused, running, never-started and experiment-tagged runs do not count. Only runs of the current case episode count. The loop files a component-health case with the two archived transcripts and proceeds to the next case.
+- **Trust and scrubbing.** The host accepts only report text in this part. Generated summaries, findings and printable diagnostics are scrubbed whole before clipping, persistence or display. A failed cleaner withholds the text. Normalized failure keys remain separate from printable diagnostics. The run's end, cost and log entry are one transaction, applied once. Token columns record the relay's usage by kind. Legacy case and run columns remain.
+- **The owner's attention.** Investigations page nobody and change no external system. Their passive record is the case and run report. Configuration remains the owner's and rejects unknown keys. `owners`, `exclude`, `repo_guard`, `sandbox_read`, `capacity_gate`, `live` and `fallback_model` remain accepted for later parts.
+
+Prior art: Claude Code's [print mode](https://code.claude.com/docs/en/headless) supplies native agents, schema output and turn and spend caps. The loop adds host reservations, a stop rule, a whole-process sandbox and a relay that keeps credentials outside it. The maintained sandbox's prior art is listed in Sandbox.
 
 ## Evaluation
 

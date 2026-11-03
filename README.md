@@ -159,8 +159,32 @@ momentum case reopen ID --evidence REF... [--at WHEN] --why W
 
 `case detect` runs the detectors, deterministic reads with no model (of the store, and for sessions of what the replay of supervision reads): recurring tool and infrastructure failures (guard refusals, harness and tool errors, commands that fail the setup's way, model refusals, incidents), the owner's own turns that push back or repeat with the agent's last words before them, and what keeps sessions waiting on him (supervision's give-ups, nudges no rule covers, long waits). Each finding is a signature; a case opens for a new one, and the case that holds it takes the evidence.
 
-A case is one answer in progress to a standing question: its family, its evidence, the suspected mechanism and the alternatives, the next test that tells them apart, the expected benefit, what it cost so far, and its status (open, investigating, testing, deployed, measuring, closed with a reason). A symptom's signature opens a case, and the same signature finds it again; the root cause's signature merges the cases it explains. A closed case comes back on new evidence only: a recurrence after it was solved, its old rate after it improved, or as much again as it was dismissed on. Only the ship tool deploys a case and only the measure tool closes one as improved. A case unseen for 30 days closes by itself.
+A case is one answer in progress to a standing question: its family, its evidence, the suspected mechanism and the alternatives, the next test that tells them apart, the expected benefit, what it cost so far, and its status (open, investigating, testing, deployed, measuring, closed with a reason). A symptom's signature opens a case, and the same signature finds it again; the root cause's signature merges the cases it explains. A closed case comes back on new evidence only: a recurrence after it was solved, its old rate after it improved, or as much again as it was dismissed on. Deployment, measurement and improved closure remain for later parts. This build investigates. A case unseen for 30 days closes by itself.
 
-Knowledge stays in [tacit](https://github.com/agent-sh/tacit). Cases, evidence and state stay on the machine, never in this repository.
+## Loop
 
-MIT licensed.
+```
+momentum loop [--dry] [--family F,F] [--case ID] [--json]
+momentum loop runs [--since WHEN] [--case ID] [--json]
+```
+
+This build investigates one case per family with Claude Code's native agent in print mode. The host records its mechanism, alternatives, fix and summary. A complete report moves the case to testing; builds and later steps are outside this build. Two runs that fail the same way stop the case and open a component-health case.
+
+The host prepares scrubbed inputs before any model starts: the last 30 days of events and notes, evidence records and neighbours, named unit logs, text configuration, tacit's facts and full-history repository clones. Pass-level copies are made once, shared read-only and removed at the end. Each run gets its own records and case file. A missing or failed scrubber skips the step without charging the case. A dry pass prepares nothing and writes nothing.
+
+The agent reads `/ro/store.sqlite` with python3's sqlite3, and reads `/ro/records`, `/ro/config`, `/ro/clone`, `/ro/repos` and `/run/input`. `/work` is scratch; `/out/findings.md` preserves partial findings. The host reads only that bounded regular file if the run returns no report. It treats all run output as untrusted, scrubs findings and never runs programs or git from writable run directories.
+
+`internal/sandbox` runs the whole harness under a transient systemd user service. The Bedrock relay is its only network route. The relay enforces model policy, spend reservations and request turns, observes token usage and authenticates the terminal report. Model refusal can use the fallback within the primary's remaining budget and time. Session persistence is disabled; the host archive is the transcript.
+
+```json
+{"loop": {
+  "runner": ["~/.local/bin/claude"],
+  "bedrock_env": "~/.config/claude-code/bedrock.env",
+  "rules": ["~/.config/agent-rules.md"],
+  "read_dirs": ["~/projects/example"],
+  "tacit_store": "~/.local/share/tacit/store",
+  "constraints": ["never wake me"]
+}}
+```
+
+Existing build-related loop configuration keys still load. Run the pass from its own oneshot user unit after ingest.

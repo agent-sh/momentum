@@ -3,6 +3,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,6 +51,38 @@ type Sources struct {
 	Detect struct {
 		ProgramPrefixes []string `json:"program_prefixes"`
 	} `json:"detect"`
+	// Loop configures investigations. Build-related keys remain accepted for later parts.
+	Loop Loop `json:"loop"`
+}
+
+// Loop configures the native agent, read sources, rules, constraints and budgets.
+// Model and FallbackModel name one model each. Build-related keys remain inert.
+type Loop struct {
+	Live          bool     `json:"live"`
+	Runner        []string `json:"runner"`
+	Model         string   `json:"model"`
+	FallbackModel string   `json:"fallback_model"`
+	Families      []string `json:"families"`
+	Owners        []string `json:"owners"`
+	Exclude       []string `json:"exclude"`
+	// ReadDirs are the repositories cloned read-only for investigations.
+	ReadDirs   []string `json:"read_dirs"`
+	TacitStore string   `json:"tacit_store"`
+	// SandboxRead remains accepted for later build checks.
+	SandboxRead []string `json:"sandbox_read"`
+	Rules       []string `json:"rules"`
+	RepoGuard   []string `json:"repo_guard"`
+	BedrockEnv  string   `json:"bedrock_env"`
+	RunUSD      float64  `json:"run_usd"`
+	CaseUSD     float64  `json:"case_usd"`
+	DayUSD      float64  `json:"day_usd"`
+	WeekUSD     float64  `json:"week_usd"`
+	RunMinutes  int      `json:"run_minutes"`
+	MaxTurns    int      `json:"max_turns"`
+	// Constraints are the owner's standing constraints every run reads, in his words.
+	Constraints []string `json:"constraints"`
+	// CapacityGate is a command that waits until the machine has room for a check's test and exits 0, or fails.
+	CapacityGate []string `json:"capacity_gate"`
 }
 
 // ErrNoSources means no sources file exists yet.
@@ -71,6 +104,20 @@ func Load() (Sources, error) {
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return s, fmt.Errorf("%s: %w", SourcesPath(), err)
 	}
+	// the loop's section holds its authority: a key it does not know (a typo of exclude) is an error, not a
+	// protection silently gone
+	var sections struct {
+		Loop json.RawMessage `json:"loop"`
+	}
+	json.Unmarshal(raw, &sections)
+	if len(sections.Loop) > 0 {
+		d := json.NewDecoder(bytes.NewReader(sections.Loop))
+		d.DisallowUnknownFields()
+		var l Loop
+		if err := d.Decode(&l); err != nil {
+			return s, fmt.Errorf("%s: loop: %w", SourcesPath(), err)
+		}
+	}
 	s.Mistakes.Path = paths.Expand(s.Mistakes.Path)
 	s.Radar.Path = paths.Expand(s.Radar.Path)
 	s.Incidents.Dir = paths.Expand(s.Incidents.Dir)
@@ -83,5 +130,21 @@ func Load() (Sources, error) {
 	if len(s.Supervise.Notice) > 0 {
 		s.Supervise.Notice[0] = paths.Expand(s.Supervise.Notice[0])
 	}
+	if len(s.Loop.Runner) > 0 {
+		s.Loop.Runner[0] = paths.Expand(s.Loop.Runner[0])
+	}
+	if len(s.Loop.RepoGuard) > 0 {
+		s.Loop.RepoGuard[0] = paths.Expand(s.Loop.RepoGuard[0])
+	}
+	if len(s.Loop.CapacityGate) > 0 {
+		s.Loop.CapacityGate[0] = paths.Expand(s.Loop.CapacityGate[0])
+	}
+	for _, l := range [][]string{s.Loop.ReadDirs, s.Loop.SandboxRead, s.Loop.Rules} {
+		for i, p := range l {
+			l[i] = paths.Expand(p)
+		}
+	}
+	s.Loop.BedrockEnv = paths.Expand(s.Loop.BedrockEnv)
+	s.Loop.TacitStore = paths.Expand(s.Loop.TacitStore)
 	return s, nil
 }
