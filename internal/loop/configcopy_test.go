@@ -50,7 +50,7 @@ func TestInputsConfigurationExactRootsAndGuards(t *testing.T) {
 	goodInputScrubber(t)
 	home := t.TempDir()
 	allowed := []string{".claude/mods/source.js", ".claude/mods/flat/build", ".claude/hooks/check", ".claude/settings.json",
-		".config/agents/rules", ".config/systemd/user/demo.service", ".config/systemd/user/demo.service.d/check.conf",
+		".config/agents/rules.md", ".config/agents/notes.txt", ".config/agents/procedures/gpu.md", ".config/systemd/user/demo.service", ".config/systemd/user/demo.service.d/check.conf",
 		".config/momentum/settings", ".local/bin/sh-script", ".local/bin/python-script", ".local/bin/node-script"}
 	for _, name := range allowed {
 		text := "marker-7f3a\n"
@@ -69,10 +69,32 @@ func TestInputsConfigurationExactRootsAndGuards(t *testing.T) {
 		".config/agents/a.passwd", ".config/agents/a.pem", ".config/agents/a.key", ".config/agents/id_rsa", ".config/agents/a.env",
 		".claude/mods/node_modules/pkg/index.js", ".claude/mods/dist/main.js", ".claude/mods/build/file", ".claude/mods/out/file",
 		".claude/mods/target/file", ".claude/mods/.next/file", ".claude/mods/__pycache__/file", ".claude/mods/.git/file",
-		".local/bin/data", ".local/bin/subdir/script", ".config/unrelated/file"}
+		".local/bin/data", ".local/bin/subdir/script", ".config/unrelated/file",
+		".config/agents/backups/old.md", ".config/agents/receipts/r.md", ".config/agents/rules"}
 	for _, name := range denied {
 		write(t, filepath.Join(home, name), "do not copy\n")
 	}
+	// every harness's own configuration is taken by the allowlist, and what else its directory holds is not
+	harnessAllowed := []string{".codex/config.toml", ".codex/work.config.toml", ".codex/AGENTS.md", ".codex/hooks.json", ".codex/rules/x.rules",
+		".codex/skills/s/SKILL.md", ".codex/agents/a.toml", ".hermes/config.yaml", ".hermes/profile.yaml", ".hermes/SOUL.md",
+		".hermes/skills/a/SKILL.md", ".hermes/scripts/x.py", ".hermes/plugins/p/index.js", ".hermes/hooks/h.sh", ".hermes/cron/jobs.json",
+		".pi/agent/settings.json", ".pi/agent/AGENTS.md", ".pi/agent/extensions/e.ts", ".config/opencode/opencode.json",
+		".config/opencode/cli.json", ".config/opencode/plugins/p.js", ".grok/config.toml", ".grok/AGENTS.md", ".grok/sandbox.toml",
+		".grok/hooks/h.sh", ".grok/skills/s/SKILL.md"}
+	harnessDenied := []string{".codex/auth.json", ".codex/auth.json.bak-1", ".codex/auth-profiles/a", ".codex/sessions/2026/rollout.jsonl",
+		".codex/history.jsonl", ".codex/state_5.sqlite", ".codex/memories/m.md", ".codex/log/x", ".codex/config.toml.bak-1",
+		".hermes/.env", ".hermes/auth.json", ".hermes/google_token.json", ".hermes/mcp-tokens/t", ".hermes/state.db", ".hermes/sessions/s.json",
+		".hermes/plugins/p/node_modules/x.js", ".hermes/vault/v", ".hermes/mobile/m", ".pi/agent/auth.json", ".pi/agent/models.json",
+		".pi/agent/sessions/s.jsonl", ".pi/agent/extensions/node_modules/x/index.js", ".config/opencode/auth.json",
+		".config/opencode/node_modules/x/index.js", ".grok/auth.json", ".grok/sessions/s", ".grok/projects/p", ".grok/logs/l"}
+	for _, name := range harnessAllowed {
+		write(t, filepath.Join(home, name), "marker-7f3a\n")
+	}
+	for _, name := range harnessDenied {
+		write(t, filepath.Join(home, name), "do not copy\n")
+	}
+	allowed = append(allowed, harnessAllowed...)
+	denied = append(denied, harnessDenied...)
 	write(t, filepath.Join(home, ".claude/hooks/binary"), "text\x00binary")
 	write(t, filepath.Join(home, ".claude/hooks/invalid"), string([]byte{0xff, 0xfe}))
 	write(t, filepath.Join(home, ".claude/hooks/oversized"), strings.Repeat("x", MaxConfigFileBytes+1))
@@ -195,18 +217,18 @@ func TestInputsConfigurationAsOfTrackedFilesAndLeaks(t *testing.T) {
 		t.Fatal(err)
 	}
 	inputTestGit(t, repo, nil, "init", "-b", "main")
-	file := filepath.Join(repo, "rules")
+	file := filepath.Join(repo, "rules.md")
 	write(t, file, "before marker-7f3a\n")
-	write(t, filepath.Join(repo, "deleted"), "before deletion\n")
+	write(t, filepath.Join(repo, "deleted.md"), "before deletion\n")
 	inputTestGit(t, repo, nil, "add", ".")
 	inputTestGit(t, repo, []string{"GIT_AUTHOR_DATE=2025-04-10T10:00:00Z", "GIT_COMMITTER_DATE=2025-04-10T10:00:00Z"}, "commit", "-m", "before")
 	write(t, file, "after\n")
-	if err := os.Remove(filepath.Join(repo, "deleted")); err != nil {
+	if err := os.Remove(filepath.Join(repo, "deleted.md")); err != nil {
 		t.Fatal(err)
 	}
 	inputTestGit(t, repo, nil, "add", ".")
 	inputTestGit(t, repo, []string{"GIT_AUTHOR_DATE=2025-04-10T14:00:00Z", "GIT_COMMITTER_DATE=2025-04-10T14:00:00Z"}, "commit", "-m", "after")
-	write(t, filepath.Join(repo, "untracked"), "not in the commit")
+	write(t, filepath.Join(repo, "untracked.md"), "not in the commit")
 	write(t, filepath.Join(home, ".claude/hooks/live"), "live\n")
 	dest := filepath.Join(t.TempDir(), "copy")
 	m, err := ConfigCopy(context.Background(), ConfigCopyOptions{Home: home, Destination: dest, AsOf: time.Date(2025, 4, 10, 12, 0, 0, 0, time.UTC)})
@@ -215,10 +237,10 @@ func TestInputsConfigurationAsOfTrackedFilesAndLeaks(t *testing.T) {
 	}
 	t.Cleanup(func() { removeInputTree(dest) })
 	tree := configTree(t, dest)
-	if tree[".config/agents/rules"] != "before [masked]\n" || tree[".config/agents/deleted"] != "before deletion\n" {
+	if tree[".config/agents/rules.md"] != "before [masked]\n" || tree[".config/agents/deleted.md"] != "before deletion\n" {
 		t.Fatal("as-of copy read current files")
 	}
-	if _, ok := tree[".config/agents/untracked"]; ok {
+	if _, ok := tree[".config/agents/untracked.md"]; ok {
 		t.Fatal("as-of copy admitted untracked file")
 	}
 	if tree[".claude/hooks/live"] != "live\n" || !containsInputString(m.Leaks, ".claude/hooks") || containsInputString(m.Leaks, ".config/agents") {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -20,8 +21,48 @@ const (
 	MaxConfigBytes     = 8 << 20
 )
 
-var configRoots = []string{".claude/mods", ".claude/hooks", ".claude/settings.json", ".config/agents",
-	".config/systemd/user", ".config/momentum", ".local/bin"}
+// configRoots are where the agent system's own configuration lives, for every harness the machine runs: Claude Code,
+// Codex, Hermes, pi, opencode and grok (kimi has no directory of its own here: its launcher is a script in .local/bin),
+// the files agent-sync writes for all of them, the units that run them and momentum's own settings.
+var configRoots = []string{".claude/mods", ".claude/hooks", ".claude/settings.json",
+	".codex", ".hermes", ".pi/agent", ".config/opencode", ".grok",
+	".config/agents", ".config/systemd/user", ".config/momentum", ".local/bin"}
+
+// configAllow is the allowlist inside the roots that hold much besides configuration (sessions, logs, databases,
+// credentials, caches): only these relative paths are taken. A pattern is a path.Match pattern, or a directory and
+// "/**" for everything under it. A root not listed here is taken whole, under the denylist.
+var configAllow = map[string][]string{
+	".codex":           {"config.toml", "*.config.toml", "AGENTS.md", "hooks.json", "rules/**", "skills/**", "agents/**"},
+	".hermes":          {"config.yaml", "profile.yaml", "SOUL.md", "skills/**", "scripts/**", "plugins/**", "hooks/**", "cron/jobs.json"},
+	".pi/agent":        {"settings.json", "AGENTS.md", "extensions/**"},
+	".config/opencode": {"opencode.json", "cli.json", "service.json", "package.json", "plugins/**"},
+	".grok":            {"config.toml", "AGENTS.md", "sandbox.toml", "hooks-paths", "hooks/**", "skills/**"},
+	".config/agents":   {"*.md", "*.txt", "procedures/**"},
+}
+
+// configPathAllowed says whether a path under a root is taken (file) or walked (directory) by the root's allowlist.
+func configPathAllowed(root, path string, dir bool) bool {
+	patterns, ok := configAllow[root]
+	if !ok || path == root {
+		return true
+	}
+	rel := strings.TrimPrefix(filepath.ToSlash(path), root+"/")
+	for _, p := range patterns {
+		if base, tree := strings.CutSuffix(p, "/**"); tree {
+			if rel == base || strings.HasPrefix(rel, base+"/") || dir && strings.HasPrefix(base, rel+"/") {
+				return true
+			}
+			continue
+		}
+		if matched, _ := pathpkg.Match(p, rel); matched && !dir {
+			return true
+		}
+		if dir && strings.HasPrefix(p, rel+"/") {
+			return true
+		}
+	}
+	return false
+}
 
 type ConfigCopyOptions struct {
 	Home        string
@@ -122,6 +163,10 @@ func ConfigCopy(ctx context.Context, o ConfigCopyOptions) (m ConfigManifest, err
 			}
 			if reason := deniedConfigPath(root, name); reason != "" {
 				m.skip(name, reason)
+				continue
+			}
+			if !configPathAllowed(root, name, false) {
+				m.skip(name, "not configuration")
 				continue
 			}
 			if capped {
@@ -257,15 +302,19 @@ func deniedConfigPath(root, path string) string {
 	parts := strings.Split(filepath.ToSlash(path), "/")
 	for i, part := range parts {
 		lower := strings.ToLower(part)
-		for _, denied := range []string{"credential", "secret", "token", "passwd", ".pem", ".key", "id_rsa", ".env", "keyring"} {
+		for _, denied := range []string{"credential", "secret", "token", "passwd", ".pem", ".key", "id_rsa", ".env", "keyring",
+			"oauth", "apikey", "api_key", "api-key", "google_", "vault", "pairing", ".sqlite", ".db", ".jsonl", ".log"} {
 			if strings.Contains(lower, denied) {
 				return "denied name"
 			}
 		}
+		if lower == "auth" || strings.HasPrefix(lower, "auth.") || strings.HasPrefix(lower, "auth-") || strings.HasPrefix(lower, "auth_") {
+			return "denied name"
+		}
 		if lower == ".ssh" || lower == ".aws" || lower == ".fireworks" || lower == ".claude.json" {
 			return "denied name"
 		}
-		if root == ".claude/mods" && i < len(parts)-1 && excludedModDir(part) {
+		if i < len(parts)-1 && excludedModDir(part) {
 			return "excluded directory"
 		}
 	}
@@ -296,7 +345,7 @@ func liveConfigNames(home *os.Root, root string, m *ConfigManifest) ([]string, e
 			m.skip(path, "link")
 			return nil
 		}
-		if root == ".claude/mods" && entry.IsDir() && excludedModDir(entry.Name()) {
+		if entry.IsDir() && excludedModDir(entry.Name()) {
 			m.skip(path, "excluded directory")
 			return fs.SkipDir
 		}
@@ -305,6 +354,14 @@ func liveConfigNames(home *os.Root, root string, m *ConfigManifest) ([]string, e
 			if entry.IsDir() {
 				return fs.SkipDir
 			}
+			return nil
+		}
+		if !configPathAllowed(root, path, entry.IsDir()) {
+			// not skipped by name one by one: a harness's sessions and logs are thousands of files
+			if entry.IsDir() {
+				return fs.SkipDir
+			}
+			m.skip(path, "not configuration")
 			return nil
 		}
 		if entry.IsDir() {
