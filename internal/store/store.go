@@ -962,7 +962,12 @@ func toolID(meta string) string {
 
 // EventByID reads an event by its id; ok is false when the store holds none.
 func (s *Store) EventByID(ctx context.Context, id string) (Event, bool, error) {
-	evs, err := scanEvents(s.db.QueryContext(ctx, `SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
+	return ReadEventByID(ctx, s.db, id)
+}
+
+// ReadEventByID queries an already-open database without migrations or writes.
+func ReadEventByID(ctx context.Context, db *sql.DB, id string) (Event, bool, error) {
+	evs, err := scanEvents(db.QueryContext(ctx, `SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
 	  tool, summary, meta, ref, heuristic, experiment FROM events WHERE id = ?`, id))
 	if err != nil || len(evs) == 0 {
 		return Event{}, false, err
@@ -1026,6 +1031,11 @@ type Query struct {
 }
 
 func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
+	return ReadEvents(ctx, s.db, q)
+}
+
+// ReadEvents queries an already-open database without migrations or writes.
+func ReadEvents(ctx context.Context, db *sql.DB, q Query) ([]Event, error) {
 	where, args := []string{"ts >= ?"}, []any{q.Since.UnixMilli()}
 	if len(q.Kinds) > 0 {
 		where = append(where, "kind IN (?"+strings.Repeat(",?", len(q.Kinds)-1)+")")
@@ -1071,7 +1081,7 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 	if limit <= 0 {
 		limit = 200
 	}
-	return scanEvents(s.db.QueryContext(ctx, `SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
+	return scanEvents(db.QueryContext(ctx, `SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
 	  tool, summary, meta, ref, heuristic, experiment FROM events WHERE `+strings.Join(where, " AND ")+` ORDER BY `+order+` LIMIT ?`,
 		append(args, limit)...))
 }
@@ -1115,7 +1125,12 @@ func (s *Store) Before(ctx context.Context, session string, kinds []string, afte
 
 // Counts returns events per source and kind since a time, for the status view.
 func (s *Store) Counts(ctx context.Context, since time.Time) (map[string]map[string]int, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT source, kind, COUNT(*) FROM events WHERE ts >= ? GROUP BY source, kind`, since.UnixMilli())
+	return ReadCounts(ctx, s.db, since)
+}
+
+// ReadCounts queries an already-open database without migrations or writes.
+func ReadCounts(ctx context.Context, db *sql.DB, since time.Time) (map[string]map[string]int, error) {
+	rows, err := db.QueryContext(ctx, `SELECT source, kind, COUNT(*) FROM events WHERE ts >= ? GROUP BY source, kind`, since.UnixMilli())
 	if err != nil {
 		return nil, err
 	}

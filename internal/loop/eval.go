@@ -184,7 +184,7 @@ type Provenance struct {
 	Dirty                              bool              `json:"dirty"`
 	GoldenHash                         string            `json:"golden_hash"`
 	Systems                            map[string]string `json:"system_hashes"`
-	Programs                           map[string]string `json:"program_hashes,omitempty"` // the SHA-256 of the host records binary
+	Programs                           map[string]string `json:"program_hashes,omitempty"` // the SHA-256 of the pinned records binary and run reader
 	RunBudget, JudgeBudget, EvalBudget float64
 	MaxTurns                           int
 	RunTime                            time.Duration

@@ -156,8 +156,8 @@ func unitBoundary(b byte) bool {
 }
 
 // Records writes /ro/records from host evidence commands. Evidence IDs retain
-// priority over neighbours. Every output is scrubbed a second time, and a
-// second-pass change is never counted as a withheld record.
+// priority over neighbours. The pinned host children scrub output once, before
+// clipping. Their already-scrubbed captures are published without another pass.
 func Records(ctx context.Context, o RecordsOptions) (RecordsManifest, error) {
 	if err := CheckScrubber(ctx); err != nil {
 		return RecordsManifest{}, err
@@ -358,8 +358,8 @@ func writeRecords(ctx context.Context, o RecordsOptions, files []RecordFile, m R
 	if limit == 0 {
 		limit = MaxRecordBytes
 	}
-	// The children run one after the other and their outputs are scrubbed again in one batch afterwards: a scrubber
-	// start costs most of a second, and a record is at most the bound and its slack.
+	// The pinned children scrub each complete invocation once, before clipping.
+	// Their captured output needs no second scrub.
 	type fetched struct {
 		file RecordFile
 		text string
@@ -398,16 +398,8 @@ func writeRecords(ctx context.Context, o RecordsOptions, files []RecordFile, m R
 		}
 		got = append(got, fetched{file, out.String()})
 	}
-	texts := make([]string, len(got))
 	for i, g := range got {
-		texts[i] = g.text
-	}
-	cleaned, err := RedactAll(ctx, texts)
-	if err != nil {
-		return m, err
-	}
-	for i, g := range got {
-		file, clean := g.file, cleaned[i]
+		file, clean := g.file, g.text
 		if len(clean) > limit+recordSlack {
 			m.Withheld++
 			continue

@@ -22,10 +22,10 @@ func TestInputsManifestJSONAndSummary(t *testing.T) {
 		t.Fatal(err)
 	}
 	var fields map[string]json.RawMessage
-	if err = json.Unmarshal(b, &fields); err != nil || len(fields) != 5 {
-		t.Fatal("manifest is not one JSON object with five inputs")
+	if err = json.Unmarshal(b, &fields); err != nil || len(fields) != 6 {
+		t.Fatal("manifest is not one JSON object with six inputs")
 	}
-	for _, key := range []string{"store", "records", "configuration", "repositories", "tacit"} {
+	for _, key := range []string{"store", "records", "configuration", "repositories", "tacit", "programs"} {
 		if _, ok := fields[key]; !ok {
 			t.Fatalf("manifest omitted %s", key)
 		}

@@ -29,6 +29,7 @@ type passInputs struct {
 	binds     []sandbox.Bind
 	err       error
 	attempted bool
+	momentum  string
 }
 
 func (p *passInputs) close() {
@@ -66,6 +67,14 @@ func (r *Runner) buildInputs(ctx context.Context, p *passInputs) error {
 		return err
 	}
 	p.dir = dir
+	// Freeze the same program used by host records children and run readers.
+	var hash string
+	p.momentum, hash, err = copyRecordsProgram(r.Inputs.Momentum, dir, "momentum")
+	if err != nil {
+		return err
+	}
+	p.manifest.Programs = map[string]string{"/opt/momentum/momentum-ro": hash}
+	p.binds = append(p.binds, sandbox.Bind{Src: p.momentum, Dst: "/opt/momentum/momentum-ro"})
 	until, window := r.now(), r.Inputs.Window
 	if window == 0 {
 		window = StoreWindow
@@ -190,7 +199,7 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 	}
 	manifest := r.pass.manifest
 	manifest.Records, err = Records(ctx, RecordsOptions{Store: filepath.Join(r.pass.dir, "store.sqlite"), IDs: ids, Units: UnionUnits(FindUnits(texts...), ActiveUnits(ctx, r.Inputs.Home, r.now().Add(-ActiveUnitWindow), r.now())),
-		Destination: filepath.Join(host, "records"), Binary: r.Inputs.Momentum, Home: home, Env: CleanEnv(nil, scrubberDir())})
+		Destination: filepath.Join(host, "records"), Binary: r.pass.momentum, Home: home, Env: CleanEnv(nil, scrubberDir())})
 	if err != nil {
 		return run, err
 	}

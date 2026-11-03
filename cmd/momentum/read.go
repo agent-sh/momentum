@@ -19,8 +19,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
-	"unicode/utf8"
 
+	"github.com/agent-sh/momentum/internal/evidenceview"
 	"github.com/agent-sh/momentum/internal/loop"
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/plain"
@@ -31,7 +31,6 @@ import (
 
 // readMax bounds a complete record and the retained output. Oversized records are withheld.
 const readMax = 256 << 10
-const showMost = 10
 
 // scrubbed writes a text through the secret scrubber, or refuses to write it.
 func scrubbed(ctx context.Context, w io.Writer, text string) error {
@@ -50,59 +49,44 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if _, err := evidenceEnd(); err != nil {
 		return err
 	}
-	fs := flag.NewFlagSet("evidence show", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	cut := fs.Int("bytes", 0, "each record's first N bytes, once it is scrubbed whole (default: all of it)")
-	var flags, ids []string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if a == "--" { // the end of the flags: every word after it is an id
-			ids = append(ids, args[i+1:]...)
-			break
-		}
-		if !strings.HasPrefix(a, "-") || a == "-" {
-			ids = append(ids, a)
-			continue
-		}
-		flags = append(flags, a)
-		if !strings.Contains(a, "=") && a != "-h" && a != "--help" && i+1 < len(args) {
-			i++
-			flags = append(flags, args[i])
-		}
-	}
-	if err := fs.Parse(flags); err != nil {
+	ids, cut, err := evidenceview.ParseShow(args, stderr)
+	if err != nil {
 		return usageError{err.Error()}
-	}
-	if fs.NArg() > 0 { // a flag's value that is no value: nothing given is left unread
-		return usageError{fmt.Sprintf("evidence show: %q is no flag's value: give each event's id, flags as --bytes N", fs.Arg(0))}
-	}
-	if len(ids) == 0 || len(ids) > showMost || *cut < 0 {
-		return usageError{fmt.Sprintf("evidence show takes 1 to %d events, each its id or ev:ID, and --bytes N", showMost)}
 	}
 	st, err := store.Open(paths.DB())
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	var output strings.Builder
+	var texts []string
 	shown := 0
-	for i, raw := range ids {
-		text, err := showEvent(ctx, st, strings.TrimPrefix(raw, "ev:"), *cut)
+	for _, raw := range ids {
+		text, err := showEvent(ctx, st, strings.TrimPrefix(raw, "ev:"))
 		var ue usageError
 		switch {
 		case err == nil:
 			shown++
 		case errors.As(err, &ue) && len(ids) > 1:
-			text = fmt.Sprintf("%s: %s\n", plain.Line(raw), ue.msg)
+			text.header = fmt.Sprintf("%s: %s\n", plain.Line(raw), ue.msg)
 		default:
 			return err
 		}
+		texts = append(texts, text.header, text.record)
+	}
+	// All full records and headers fit in one bounded scrub batch (ten records).
+	clean, err := loop.RedactAll(ctx, texts)
+	if err != nil {
+		return err
+	}
+	var output strings.Builder
+	for i := range ids {
 		if i > 0 {
 			output.WriteString("\n")
 		}
-		output.WriteString(text)
+		output.WriteString(clean[2*i])
+		output.WriteString(evidenceview.RecordPrefix(clean[2*i+1], cut))
 	}
-	if err := scrubbed(ctx, stdout, output.String()); err != nil {
+	if _, err := io.WriteString(stdout, output.String()); err != nil {
 		return err
 	}
 	if shown == 0 {
@@ -197,10 +181,11 @@ func evidenceUnit(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if output.Len() > readMax {
 		return usageError{"unit output exceeds the record limit; narrow the command"}
 	}
-	clean, err := loop.Redact(ctx, strings.ToValidUTF8(output.String(), "?"))
+	cleaned, err := loop.RedactAll(ctx, []string{strings.ToValidUTF8(output.String(), "?")})
 	if err != nil {
 		return err
 	}
+	clean := cleaned[0]
 	if *cut > 0 && len(clean) > *cut {
 		// the end of the log is what a reader wants: drop from the front, at a line start
 		whole := len(clean)
@@ -214,31 +199,32 @@ func evidenceUnit(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	return err
 }
 
-func showEvent(ctx context.Context, st *store.Store, id string, n int) (string, error) {
+type eventText struct{ header, record string }
+
+func showEvent(ctx context.Context, st *store.Store, id string) (eventText, error) {
 	end, err := evidenceEnd()
 	if err != nil {
-		return "", err
+		return eventText{}, err
 	}
 	e, ok, err := st.EventByID(ctx, id)
 	if err != nil {
-		return "", err
+		return eventText{}, err
 	}
 	if !ok {
-		return "", usageError{fmt.Sprintf("the store holds no event %s", id)}
+		return eventText{}, usageError{fmt.Sprintf("the store holds no event %s", id)}
 	}
 	var output strings.Builder
-	fmt.Fprintf(&output, "%s ev:%s %s %s %s %s %s\n  %s\n", e.TS.Local().Format("2006-01-02 15:04:05"), e.ID(), e.Source, e.Actor, e.Kind, e.Session,
-		plain.Line(e.Tool), plain.Line(e.Summary))
+	output.WriteString(evidenceview.EventHeader(e))
 	if !end.IsZero() && !e.TS.Before(end) {
-		return "  (record withheld: event is at or after the evaluation end)\n", nil
+		return eventText{header: "  (record withheld: event is at or after the evaluation end)\n"}, nil
 	}
 	if !end.IsZero() && e.Harness == "hermes" {
 		output.WriteString("  (record withheld: historical Hermes message rows are unavailable)\n")
-		return loop.Redact(ctx, output.String())
+		return eventText{header: output.String()}, nil
 	}
 	path, off, ok := placeOf(e.Ref)
 	if !ok {
-		return loop.Redact(ctx, output.String())
+		return eventText{header: output.String()}, nil
 	}
 	// opened without waiting on a writer, and read only when it is a regular file: a reference may now name a pipe or
 	// a device, which would hold the run
@@ -249,41 +235,41 @@ func showEvent(ctx context.Context, st *store.Store, id string, n int) (string, 
 		} else {
 			output.WriteString("  (its record is gone)\n")
 		}
-		return loop.Redact(ctx, output.String())
+		return eventText{header: output.String()}, nil
 	}
 	defer f.Close()
 	if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() {
 		output.WriteString("  (its record is not a regular file)\n")
-		return loop.Redact(ctx, output.String())
+		return eventText{header: output.String()}, nil
 	}
 	var magic [16]byte
 	if count, _ := f.ReadAt(magic[:], 0); count == len(magic) && string(magic[:]) == "SQLite format 3\x00" {
 		output.WriteString("  (record withheld: database rows cannot be read as transcript bytes)\n")
-		return loop.Redact(ctx, output.String())
+		return eventText{header: output.String()}, nil
 	}
 	if off < 0 {
-		return "", usageError{"negative record offset"}
+		return eventText{}, usageError{"negative record offset"}
 	}
 	if off > 0 {
 		var prev [1]byte
 		if _, err := f.ReadAt(prev[:], off-1); err != nil || prev[0] != '\n' {
-			return "", usageError{"offset is not a record boundary"}
+			return eventText{}, usageError{"offset is not a record boundary"}
 		}
 	}
 	if _, err := f.Seek(off, io.SeekStart); err != nil {
-		return "", err
+		return eventText{}, err
 	}
 	line, err := bufio.NewReaderSize(f, readMax+1).ReadSlice('\n')
 	if err == bufio.ErrBufferFull || len(line) > readMax {
 		output.WriteString("  (oversized record withheld)\n")
 	} else if err != nil && err != io.EOF {
-		return "", err
+		return eventText{}, err
 	} else {
 		if e.Source == "mistakes" {
 			sum := sha256.Sum256(line)
 			if hex.EncodeToString(sum[:16]) != e.SourceKey {
 				output.WriteString("  (record withheld: the line was rewritten since it was read)\n")
-				return loop.Redact(ctx, output.String())
+				return eventText{header: output.String()}, nil
 			}
 		}
 		if !end.IsZero() {
@@ -294,28 +280,16 @@ func showEvent(ctx context.Context, st *store.Store, id string, n int) (string, 
 			at, stampErr := time.Parse(time.RFC3339Nano, dated.Timestamp)
 			if stampErr == nil && !at.Before(end) {
 				output.WriteString("  (record withheld: timestamp is at or after the evaluation end)\n")
-				return loop.Redact(ctx, output.String())
+				return eventText{header: output.String()}, nil
 			}
 			if stampErr != nil && (e.Source == store.Sessions || e.Source == store.Supervise) {
 				output.WriteString("  (record withheld: no valid timestamp at the scan's place)\n")
-				return loop.Redact(ctx, output.String())
+				return eventText{header: output.String()}, nil
 			}
 		}
-		clean, err := loop.Redact(ctx, string(line))
-		if err != nil {
-			return "", err
-		}
-		if n > 0 && len(clean) > n {
-			whole := len(clean)
-			clean = clean[:n]
-			for !utf8.ValidString(clean) && len(clean) > 0 {
-				clean = clean[:len(clean)-1]
-			}
-			clean += fmt.Sprintf("\n  (its first %d of %d bytes)\n", len(clean), whole)
-		}
-		output.WriteString(clean)
+		return eventText{header: output.String(), record: string(line)}, nil
 	}
-	return loop.Redact(ctx, output.String())
+	return eventText{header: output.String()}, nil
 }
 
 func evidenceEnd() (time.Time, error) {

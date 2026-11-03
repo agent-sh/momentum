@@ -117,7 +117,9 @@ func (e *Eval) buildTask(ctx context.Context, in *taskInputs, t GoldenTask, repo
 		}
 		in.manifest.Repositories = append(in.manifest.Repositories, RepoClone{Name: filepath.Base(clone), Commit: strings.TrimSpace(string(head)), Branch: "main"})
 	}
-	in.binds = []sandbox.Bind{{Src: in.store, Dst: "/ro/store.sqlite"}, {Src: config, Dst: "/ro/config"}, {Src: repos, Dst: "/ro/repos"}}
+	in.manifest.Programs = map[string]string{"/opt/momentum/momentum-ro": e.programs.hashes["momentum-ro"]}
+	in.binds = []sandbox.Bind{{Src: in.store, Dst: "/ro/store.sqlite"}, {Src: config, Dst: "/ro/config"}, {Src: repos, Dst: "/ro/repos"},
+		{Src: e.programs.momentum, Dst: "/opt/momentum/momentum-ro"}}
 	tacit := e.Tacit
 	if tacit == "" {
 		tacit = e.Runner.Inputs.TacitStore
