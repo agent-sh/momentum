@@ -427,6 +427,8 @@ func TestAProposalOnAStoppedSignalSourceWaitsAndIsPassedOver(t *testing.T) {
 	checked(t, s, c, f)
 	r := measurementRunner(t, st)
 	r.Ship = s
+	r.Inputs.ReadDirs = []string{f.main}
+	setCaseRepo(t, st, c, filepath.Base(f.main))
 	for i := 0; i < 2; i++ {
 		p, err := proposePatch(t, s, ctx, c.ID, wavesProposal)
 		if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "the signal's source stopped: sessions") || p.State != Checked ||

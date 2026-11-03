@@ -77,7 +77,7 @@ func TestACurrentReadAdmitsAProposalAndItsRevision(t *testing.T) {
 	if err != nil || p.State != Proposed {
 		t.Fatalf("first proposal: %+v %v", p, err)
 	}
-	if p, err = s.Reviewed(ctx, c.ID, Review{Findings: []Finding{{Severity: "medium", Where: "fake.go", Problem: "no comment", Fix: "add one"}},
+	if p, err = s.Reviewed(ctx, c.ID, Review{Head: p.Head, Text: "Round 1: one medium finding.", Findings: []Finding{{Severity: "medium", Where: "fake.go", Problem: "no comment", Fix: "add one"}},
 		Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || p.State != Revising {
 		t.Fatalf("reviewed: %+v %v", p, err)
 	}
