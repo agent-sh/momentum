@@ -744,6 +744,51 @@ func TestSessionsAreFoundInSupervisionsOwnRecord(t *testing.T) {
 	}
 }
 
+// An access wait (a usage limit with a stated reset) that supervision held and resumed on its first try is not a
+// case, though the phase scan kept the session in needs_you for hours. A stop its rule resumed on a later try, or
+// whose message did not work, still is one.
+func TestSessionsWaitResolvedOnFirstTryIsNotACase(t *testing.T) {
+	st := testStore(t)
+	stopAt := t0
+	wait := func(session string, start time.Time, mins int) store.Event {
+		return ev(store.Sessions, session, "phase", store.ActorHarness, "", "x",
+			fmt.Sprintf(`{"from":"needs_you","to":"needs_you","for_ms":%d,"from_ask_kind":"error","auto":false}`, mins*60_000), start.Add(time.Duration(mins)*time.Minute))
+	}
+	act := func(session string, try int, at time.Time) store.Event {
+		e := ev(store.Supervise, session, "act", store.ActorAgent, "", "x",
+			fmt.Sprintf(`{"rule":"access","try":%d,"stop_at":%d}`, try, stopAt.UnixMilli()), at)
+		return e
+	}
+	outcome := func(of store.Event, result string, at time.Time) store.Event {
+		return ev(store.Supervise, of.Session, "outcome", store.ActorDetector, "", "x",
+			fmt.Sprintf(`{"of":%q,"rule":"access","result":%q}`, of.SourceKey, result), at)
+	}
+	var evs []store.Event
+	for _, s := range []string{"a", "b", "c"} {
+		for i := 0; i < 6; i++ {
+			evs = append(evs, wait(s, stopAt.Add(time.Duration(i)*30*time.Minute), 30))
+		}
+	}
+	sent := stopAt.Add(3 * time.Hour)
+	aa, ab, ac := act("a", 1, sent), act("b", 1, sent), act("c", 2, sent)
+	evs = append(evs, aa, ab, ac, outcome(aa, "worked", sent.Add(time.Minute)), outcome(ab, "failed again", sent.Add(time.Minute)),
+		outcome(ac, "worked", sent.Add(time.Minute)))
+	put(t, st, evs...)
+	fs, err := Sessions{}.Detect(context.Background(), st, week())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// only b (its first try failed) and c (resolved on the second try) count: 6 waits each, in two sessions
+	for _, f := range fs {
+		if f.Signature != "sessions/v1:waited:error" || len(f.Evidence) != 12 {
+			t.Fatalf("unexpected finding %s with %d events", f.Signature, len(f.Evidence))
+		}
+	}
+	if len(fs) != 1 {
+		t.Fatalf("found %d findings, want the one for b and c", len(fs))
+	}
+}
+
 // stopped puts a session that stopped on asking the owner, and his nudge an hour on.
 func stopped(t *testing.T, st *store.Store, harness, session string, at time.Time) {
 	t.Helper()

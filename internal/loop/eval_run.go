@@ -304,7 +304,7 @@ func (e *Eval) trialInvocation(ctx context.Context, in *taskInputs, t GoldenTask
 	} else {
 		evidence = fmt.Sprintf("Symptom events: %s.\n", strings.Join(t.Symptom.Query.EventIDs, " "))
 	}
-	prompt := fmt.Sprintf("%s\nProblem: %s\n%s%s%s", liveQuestion, c.Title, evidence, findingsInstruction, inputReference())
+	prompt := fmt.Sprintf("%s\nProblem: %s\n%s%s%s", liveQuestion, c.Title, evidence, findingsInstruction, inputReference(false))
 	clean, err := RedactAll(ctx, []string{system, prompt})
 	if err != nil {
 		return Invocation{}, err

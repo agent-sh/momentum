@@ -65,7 +65,7 @@ func TestEvaluationReadOnlyProgramSamePinBothArmsAndHashes(t *testing.T) {
 func TestInvestigationPromptIncludesReadOnlyFormsAndPython(t *testing.T) {
 	for _, text := range []string{"momentum-ro evidence events --session SESSION", "--since 3d, --kind tool_result", "momentum-ro evidence show ev:ID",
 		"momentum-ro case show", "changes nothing", "python3's sqlite3 on /ro/store.sqlite for what these do not answer"} {
-		if !strings.Contains(inputReference(), text) {
+		if !strings.Contains(inputReference(true), text) || !strings.Contains(inputReference(false), text) {
 			t.Fatalf("shared reference omits %s", text)
 		}
 	}

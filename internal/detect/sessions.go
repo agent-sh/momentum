@@ -132,6 +132,10 @@ func waits(ctx context.Context, st *store.Store, w Window) ([]occurrence, error)
 	if err != nil {
 		return nil, err
 	}
+	resolved, err := resolvedStops(ctx, st, w)
+	if err != nil {
+		return nil, err
+	}
 	var occ []occurrence
 	for _, e := range evs {
 		var m struct {
@@ -143,6 +147,9 @@ func waits(ctx context.Context, st *store.Store, w Window) ([]occurrence, error)
 		if json.Unmarshal([]byte(e.Meta), &m) != nil || m.From != "needs_you" || m.Auto || time.Duration(m.ForMS)*time.Millisecond < LongWait {
 			continue
 		}
+		if resolved.covers(e.Session, e.TS.Add(-time.Duration(m.ForMS)*time.Millisecond), e.TS) {
+			continue // a live supervise rule held this stop and resolved it on its first try: nothing waited on him
+		}
 		kind := m.FromAskKind
 		if kind == "" {
 			kind = "unknown"
@@ -151,4 +158,70 @@ func waits(ctx context.Context, st *store.Store, w Window) ([]occurrence, error)
 			title: fmt.Sprintf("Sessions wait on the owner past %s (%s)", LongWait, kind)})
 	}
 	return occ, nil
+}
+
+// resolution is one stop a supervise rule resolved on its first try: its message (try 1) opened a turn that worked.
+// The stop lasted from stopAt to sentAt, when the message was typed.
+type resolution struct{ stopAt, sentAt time.Time }
+
+type resolutions map[string][]resolution
+
+// resolveSlack is how far before the stop a phase wait may begin and still belong to it (the phase scan and the
+// transcript's stop time differ by a scan or two), and how long after the message the wait may still end.
+const resolveSlack = 5 * time.Minute
+
+// resolvedStops reads supervision's own record for the stops one of its rules resolved on the first try: an act of
+// try 1 whose outcome says the turn it opened worked. The wait events of the stop (an access wait is renewed every
+// half hour) share its stop_at. Later tries and failed messages are not resolutions.
+func resolvedStops(ctx context.Context, st *store.Store, w Window) (resolutions, error) {
+	evs, err := st.Events(ctx, store.Query{Since: w.Since.Add(-historyLead), Until: w.Until, Source: store.Supervise,
+		Kinds: []string{supervise.KindAct, supervise.KindOutcome}, Limit: maxRows})
+	if err != nil {
+		return nil, err
+	}
+	type act struct {
+		session        string
+		stopAt, sentAt time.Time
+	}
+	acts := map[string]act{}
+	for _, e := range evs {
+		if e.Kind != supervise.KindAct {
+			continue
+		}
+		var m struct {
+			Try    int
+			StopAt int64 `json:"stop_at"`
+		}
+		if json.Unmarshal([]byte(e.Meta), &m) != nil || m.Try != 1 || m.StopAt == 0 {
+			continue
+		}
+		acts[e.SourceKey] = act{e.Session, time.UnixMilli(m.StopAt), e.TS}
+	}
+	out := resolutions{}
+	for _, e := range evs {
+		if e.Kind != supervise.KindOutcome {
+			continue
+		}
+		var m struct{ Of, Result string }
+		if json.Unmarshal([]byte(e.Meta), &m) != nil || m.Result != supervise.Worked {
+			continue
+		}
+		if a, ok := acts[m.Of]; ok && a.session == e.Session {
+			out[a.session] = append(out[a.session], resolution{a.stopAt, a.sentAt})
+		}
+	}
+	return out, nil
+}
+
+// historyLead reaches back far enough to see the act of a stop that began before the window.
+const historyLead = 24 * time.Hour
+
+// covers reports whether the wait from start to end is part of a stop that supervision resolved on its first try.
+func (r resolutions) covers(session string, start, end time.Time) bool {
+	for _, x := range r[session] {
+		if !start.Before(x.stopAt.Add(-resolveSlack)) && start.Before(x.sentAt) && !end.After(x.sentAt.Add(resolveSlack)) {
+			return true
+		}
+	}
+	return false
 }

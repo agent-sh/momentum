@@ -196,7 +196,8 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	}
 	binds = append(append(binds, a.Binds...), inv.Binds...)
 	for _, b := range binds {
-		if !((b.Src == inputDir && b.Dst == "/run/input" || b.Src == filepath.Join(HostDir(inv.Dir), "records") && b.Dst == "/ro/records") && !b.Write) && (within(HostDir(inv.Dir), b.Src) || within(b.Src, HostDir(inv.Dir))) {
+		if !((b.Src == inputDir && b.Dst == "/run/input" || b.Src == filepath.Join(HostDir(inv.Dir), "records") && b.Dst == "/ro/records" ||
+			b.Src == filepath.Join(HostDir(inv.Dir), "diffs") && b.Dst == "/ro/diffs") && !b.Write) && (within(HostDir(inv.Dir), b.Src) || within(b.Src, HostDir(inv.Dir))) {
 			return Result{}, errors.New("a run bind reaches its host-only directory")
 		}
 	}

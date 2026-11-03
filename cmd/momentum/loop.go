@@ -129,7 +129,7 @@ func setup(st *store.Store, sources config.Sources) (*loop.Runner, error) {
 	if tacit == "" {
 		tacit = filepath.Join(home, ".local", "share", "tacit", "store")
 	}
-	r.Inputs = loop.InputOptions{Momentum: exe, Home: home, StoreHome: paths.Data(), TacitStore: tacit, ReadDirs: expandAll(c.ReadDirs), Window: loop.StoreWindow}
+	r.Inputs = loop.InputOptions{Momentum: exe, Home: home, StoreHome: paths.Data(), TacitStore: tacit, ReadDirs: expandAll(c.ReadDirs), Window: loop.StoreWindow, ScrubCache: filepath.Join(paths.Data(), "scrub-cache.sqlite")}
 	return r, nil
 }
 

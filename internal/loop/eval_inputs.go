@@ -108,14 +108,14 @@ func (e *Eval) buildTask(ctx context.Context, in *taskInputs, t GoldenTask, repo
 		return err
 	}
 	for i := 0; i < refused; i++ {
-		in.manifest.Repositories = append(in.manifest.Repositories, RepoClone{Name: fmt.Sprintf("refused-%d", i+1), Error: "left out: the scrubber would change what it holds"})
+		in.manifest.Repositories = append(in.manifest.Repositories, RepoInput{Name: fmt.Sprintf("refused-%d", i+1), Error: "left out: the scrubber would change what it holds"})
 	}
 	for _, clone := range clones {
 		head, err := hostInputGit(ctx, clone, "rev-parse", "HEAD")
 		if err != nil {
 			return err
 		}
-		in.manifest.Repositories = append(in.manifest.Repositories, RepoClone{Name: filepath.Base(clone), Commit: strings.TrimSpace(string(head)), Branch: "main"})
+		in.manifest.Repositories = append(in.manifest.Repositories, RepoInput{Name: filepath.Base(clone), Commit: strings.TrimSpace(string(head)), Branch: "main"})
 	}
 	in.manifest.Programs = map[string]string{"/opt/momentum/momentum-ro": e.programs.hashes["momentum-ro"]}
 	in.binds = []sandbox.Bind{{Src: in.store, Dst: "/ro/store.sqlite"}, {Src: config, Dst: "/ro/config"}, {Src: repos, Dst: "/ro/repos"},
@@ -143,7 +143,7 @@ func (e *Eval) buildTask(ctx context.Context, in *taskInputs, t GoldenTask, repo
 			if err != nil {
 				return err
 			}
-			in.manifest.Tacit = RepoClone{Name: "clone", Branch: "main", Commit: strings.TrimSpace(string(head))}
+			in.manifest.Tacit = RepoInput{Name: "clone", Branch: "main", Commit: strings.TrimSpace(string(head))}
 			in.binds = append(in.binds, sandbox.Bind{Src: clone, Dst: "/ro/clone"})
 		} else {
 			in.manifest.Tacit.Error = "tacit's store held no commit before the end"

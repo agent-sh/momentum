@@ -46,7 +46,7 @@ func TestInputsManifestNamesCannotLeakMarkers(t *testing.T) {
 		t.Fatal("unit name bypassed scrubbing")
 	}
 	src := inputRepo(t, t.TempDir(), "repo-marker-7f3a")
-	clones, err := CloneRepos(context.Background(), RepoCloneOptions{Sources: []string{src}, Destination: filepath.Join(t.TempDir(), "clones")})
+	clones, err := SnapshotRepos(context.Background(), snapOptions(t.TempDir(), src))
 	b, marshalErr := json.Marshal(clones)
 	if err != nil || marshalErr != nil || len(clones) != 1 || clones[0].Error == "" || strings.Contains(string(b), "marker-7f3a") {
 		t.Fatal("repository name bypassed scrubbing")
@@ -67,12 +67,12 @@ func TestInputsDefaultBranchOnlyInRemoteTrackingRefs(t *testing.T) {
 	inputTestGit(t, src, nil, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/stable")
 	inputTestGit(t, src, nil, "checkout", "feature")
 	inputTestGit(t, src, nil, "branch", "-D", "stable")
-	got, err := CloneRepos(context.Background(), RepoCloneOptions{Sources: []string{src}, Destination: filepath.Join(parent, "copies")})
+	got, err := SnapshotRepos(context.Background(), snapOptions(parent, src))
 	if err != nil || len(got) != 1 || got[0].Error != "" || got[0].Branch != "stable" || got[0].Commit != commit {
 		t.Fatalf("remote default branch metadata: %v %v", got, err)
 	}
 	text, err := os.ReadFile(filepath.Join(got[0].Path, "file"))
 	if err != nil || string(text) != "remote branch\n" {
-		t.Fatal("clone omitted the remote default branch's objects")
+		t.Fatal("snapshot omitted the remote default branch's files")
 	}
 }

@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -16,139 +15,10 @@ import (
 	"time"
 )
 
-type RepoCloneOptions struct {
-	Sources     []string
-	Destination string
-	LoopDirs    []string // caller's host-only loop storage roots
-}
-
-type RepoClone struct {
-	Name   string `json:"name"`
-	Source string `json:"source"`
-	Path   string `json:"path,omitempty"`
-	Branch string `json:"branch,omitempty"`
-	Commit string `json:"commit,omitempty"`
-	Error  string `json:"error,omitempty"`
-}
-
-// errNeedsScrubbing says the scrubber would change something a clone holds (an object, a ref or its configuration):
-// such a repository is left out of the inputs and counted, never published.
+// errNeedsScrubbing says the scrubber would change something a clone holds (an object, a ref or its configuration).
+// An evaluation's as-of clones keep history, so it still leaves such a repository out; a live run gets a scrubbed
+// snapshot of files and history as text instead (snapshot.go) and masks what the scrubber changes.
 var errNeedsScrubbing = errors.New("clone object needs scrubbing")
-
-// CloneRepos makes independent, history-preserving clones for /ro/repos/NAME.
-// Git's --no-local transport copies objects, so source maintenance cannot change
-// a run's objects. Each distinct source is attempted once; a refusal is a result.
-// LoopDirs must contain the caller's loop storage roots. Objects are checked
-// before publication; a scrubber hit refuses the clone, preserving commits.
-func CloneRepos(ctx context.Context, o RepoCloneOptions) ([]RepoClone, error) {
-	if err := CheckScrubber(ctx); err != nil {
-		return nil, err
-	}
-	if o.Destination == "" {
-		return nil, fmt.Errorf("repository destination is empty")
-	}
-	cleanDestination, err := RedactAll(ctx, []string{o.Destination})
-	if err != nil {
-		return nil, err
-	}
-	if cleanDestination[0] != o.Destination {
-		return nil, fmt.Errorf("repository destination needs scrubbing")
-	}
-	if err := noInputLinks(filepath.Dir(o.Destination)); err != nil {
-		return nil, err
-	}
-	if info, err := os.Lstat(o.Destination); err == nil && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0) {
-		return nil, fmt.Errorf("repository destination is not a plain directory")
-	} else if err != nil && !os.IsNotExist(err) {
-		return nil, err
-	}
-	var sources []string
-	seen, counts := map[string]bool{}, map[string]int{}
-	for _, source := range o.Sources {
-		path, err := filepath.Abs(source)
-		if err != nil {
-			return nil, err
-		}
-		if !seen[path] {
-			seen[path] = true
-			sources = append(sources, path)
-			counts[filepath.Base(path)]++
-		}
-	}
-	var results []RepoClone
-	for _, source := range sources {
-		name := filepath.Base(source)
-		if counts[name] > 1 {
-			hash := sha256.Sum256([]byte(source))
-			name += fmt.Sprintf("-%x", hash[:4])
-		}
-		result := RepoClone{Name: name, Source: source}
-		cleanPaths, err := RedactAll(ctx, []string{name, source})
-		if err != nil {
-			return results, err
-		}
-		if cleanPaths[0] != name || cleanPaths[1] != source {
-			result.Name, result.Source = cleanPaths[0], cleanPaths[1]
-			result.Error = "repository paths need scrubbing"
-			results = append(results, result)
-			continue
-		}
-		if err := cloneSource(ctx, source, append(append([]string(nil), o.LoopDirs...), o.Destination)); err != nil {
-			result.Error = err.Error()
-			results = append(results, result)
-			continue
-		}
-		if err := os.MkdirAll(o.Destination, 0o700); err != nil {
-			return results, err
-		}
-		result, err = cloneInput(ctx, source, filepath.Join(o.Destination, name), "--no-local")
-		result.Name = name
-		if err != nil {
-			result.Error = err.Error()
-		}
-		results = append(results, result)
-	}
-	return results, nil
-}
-
-// CloneTacit makes the host-owned tacit fact clone at /ro/clone. Local cloning
-// shares immutable Git objects by hardlink; the caller mounts it read-only.
-func CloneTacit(ctx context.Context, src, dst string) (RepoClone, error) {
-	result := RepoClone{Source: src, Name: filepath.Base(src)}
-	if err := CheckScrubber(ctx); err != nil {
-		return result, err
-	}
-	if src == "" || dst == "" {
-		return result, fmt.Errorf("tacit clone needs source and destination paths")
-	}
-	src, err := filepath.Abs(src)
-	if err != nil {
-		return result, err
-	}
-	dst, err = filepath.Abs(dst)
-	if err != nil {
-		return result, err
-	}
-	result.Source, result.Name = src, filepath.Base(src)
-	cleanPaths, err := RedactAll(ctx, []string{src, dst})
-	if err != nil {
-		return result, err
-	}
-	if cleanPaths[0] != src || cleanPaths[1] != dst {
-		result.Source = cleanPaths[0]
-		result.Name = filepath.Base(cleanPaths[0])
-		result.Error = "tacit paths need scrubbing"
-		return result, fmt.Errorf("%s", result.Error)
-	}
-	if err := cloneSource(ctx, src, []string{dst}); err != nil {
-		return result, err
-	}
-	result, err = cloneInput(ctx, src, dst, "--local")
-	if err != nil {
-		result.Error = err.Error()
-	}
-	return result, err
-}
 
 func cloneSource(ctx context.Context, source string, own []string) error {
 	if err := noInputLinks(source); err != nil {
@@ -172,77 +42,6 @@ func cloneSource(ctx context.Context, source string, own []string) error {
 		return fmt.Errorf("source is not a git work tree")
 	}
 	return nil
-}
-
-func cloneInput(ctx context.Context, source, destination, mode string) (r RepoClone, err error) {
-	r = RepoClone{Source: source, Name: filepath.Base(destination)}
-	if err = absentInput(destination); err != nil {
-		return r, err
-	}
-	if err = noInputLinks(filepath.Dir(destination)); err != nil {
-		return r, err
-	}
-	branch, err := cloneDefaultBranch(ctx, source)
-	if err != nil {
-		return r, err
-	}
-	tmp, err := os.MkdirTemp(filepath.Dir(destination), ".repo-input-")
-	if err != nil {
-		return r, err
-	}
-	defer os.RemoveAll(tmp)
-	clone := filepath.Join(tmp, "clone")
-	if _, err = hostInputGit(ctx, "", "clone", mode, "--no-checkout", "--", source, clone); err != nil {
-		return r, err
-	}
-	// Remove inherited remote reach and sample hooks before checkout.
-	if _, err = hostInputGit(ctx, clone, "remote", "remove", "origin"); err != nil {
-		return r, err
-	}
-	if err = os.RemoveAll(filepath.Join(clone, ".git", "hooks")); err != nil {
-		return r, err
-	}
-	// --no-checkout may have made a local branch only for the source's HEAD.
-	// Resolve the default branch in the source and detach at that immutable id,
-	// then name it locally without depending on removed remote-tracking refs.
-	ref := "refs/heads/" + branch
-	commit, err := hostInputGit(ctx, source, "rev-parse", "--verify", ref+"^{commit}")
-	if err != nil {
-		ref = "refs/remotes/origin/" + branch
-		commit, err = hostInputGit(ctx, source, "rev-parse", "--verify", ref+"^{commit}")
-	}
-	if err != nil {
-		return r, err
-	}
-	r.Commit = strings.TrimSpace(string(commit))
-	if _, err = hostInputGit(ctx, clone, "cat-file", "-e", r.Commit+"^{commit}"); err != nil {
-		// A remote-tracking default absent from local heads may not have been
-		// transferred. Fetch that ref from the same local source, with no remote.
-		if _, err = hostInputGit(ctx, clone, "fetch", "--no-tags", "--no-write-fetch-head", "--", source, ref); err != nil {
-			return r, err
-		}
-	}
-	if _, err = hostInputGit(ctx, clone, "checkout", "-B", branch, r.Commit, "--"); err != nil {
-		return r, err
-	}
-	got, err := hostInputGit(ctx, clone, "rev-parse", "HEAD")
-	if err != nil || strings.TrimSpace(string(got)) != r.Commit {
-		return r, fmt.Errorf("clone commit changed during preparation")
-	}
-	r.Branch = branch
-	// Reflogs are local bookkeeping, not repository history. Do not export
-	// identities that Git generated on this host while preparing the clone.
-	if err = os.RemoveAll(filepath.Join(clone, ".git", "logs")); err != nil {
-		return r, err
-	}
-	if err = checkCloneObjects(ctx, clone); err != nil {
-		return r, err
-	}
-	if err = os.Rename(clone, destination); err != nil {
-		return r, err
-	}
-	r.Path = destination
-	return r, nil
 }
 
 // checkCloneObjects preserves commits by refusing an object that needs masking.
@@ -377,6 +176,20 @@ func cloneDefaultBranch(ctx context.Context, source string) (string, error) {
 const gitStepTimeout = 5 * time.Minute
 
 func hostInputGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	return hostInputGitLimit(ctx, dir, ScrubBatchBytes, args...)
+}
+
+// hostInputGitLimit is hostInputGit for output that may exceed one scrub batch (a listing of a large tree).
+func hostInputGitLimit(ctx context.Context, dir string, limit int, args ...string) ([]byte, error) {
+	out, over, err := hostInputGitCapped(ctx, dir, limit, args...)
+	if err == nil && over {
+		return nil, fmt.Errorf("input git output exceeds the input limit")
+	}
+	return out, err
+}
+
+// hostInputGitCapped returns at most limit bytes of output and says whether there was more.
+func hostInputGitCapped(ctx context.Context, dir string, limit int, args ...string) ([]byte, bool, error) {
 	cctx, cancel := context.WithTimeout(ctx, gitStepTimeout)
 	defer cancel()
 	pins := append(append([]string(nil), GitSafety()...), "-c", "uploadpack.packObjectsHook=", "-c", "protocol.file.allow=always")
@@ -385,20 +198,23 @@ func hostInputGit(ctx context.Context, dir string, args ...string) ([]byte, erro
 	}
 	cmd := exec.CommandContext(cctx, "git", append(pins, args...)...)
 	cmd.Env = GitEnv()
-	out, stderr := Capture{Limit: ScrubBatchBytes}, Capture{Limit: ScrubBatchBytes}
+	out, stderr := Capture{Limit: limit}, Capture{Limit: ScrubBatchBytes}
 	cmd.Stdout, cmd.Stderr = &out, &stderr
 	if err := cmd.Run(); err != nil {
 		// Git can print source configuration and object text in diagnostics.
 		// Return only the operation and status, never its raw stderr.
 		if cctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("input git %s timed out after %s", args[0], gitStepTimeout)
+			return nil, false, fmt.Errorf("input git %s timed out after %s", args[0], gitStepTimeout)
 		}
-		return nil, fmt.Errorf("input git %s failed: %w", args[0], err)
+		return nil, false, fmt.Errorf("input git %s failed: %w", args[0], err)
 	}
-	if out.Over() || stderr.Over() {
-		return nil, fmt.Errorf("input git output exceeds the input limit")
+	if stderr.Over() {
+		return nil, false, fmt.Errorf("input git output exceeds the input limit")
 	}
-	return out.Bytes(), nil
+	if out.Over() {
+		return out.Bytes()[:limit], true, nil
+	}
+	return out.Bytes(), false, nil
 }
 
 func noInputLinks(path string) error {

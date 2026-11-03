@@ -189,9 +189,9 @@ func TestInvestigationOnSandboxReadsOnlyPreparedInputs(t *testing.T) {
 	write(t, filepath.Join(r.Inputs.Home, ".config", "agents", "rules.md"), "marker-7f3a rule")
 	body := `python3 - <<'PYCHECK'
 import sqlite3, pathlib, os
-for name in ['/ro/store.sqlite','/ro/records/index.txt','/ro/config/MANIFEST.txt','/ro/clone','/ro/repos/example','/run/input/case.json','/run/input/system.md','/run/input/schema.json']:
+for name in ['/ro/store.sqlite','/ro/records/index.txt','/ro/config/MANIFEST.txt','/ro/clone','/ro/repos/example','/ro/history/facts.log','/ro/history/repos/example.log','/ro/diffs','/run/input/case.json','/run/input/system.md','/run/input/schema.json']:
     assert pathlib.Path(name).exists(), name
-for name in ['/ro/store.sqlite','/ro/records/index.txt','/ro/config/MANIFEST.txt','/ro/clone/file','/ro/repos/example/file']:
+for name in ['/ro/store.sqlite','/ro/records/index.txt','/ro/config/MANIFEST.txt','/ro/clone/file','/ro/repos/example/file','/ro/history/facts.log']:
     try:
         with open(name,'a') as output: output.write('changed')
     except OSError: pass
@@ -304,7 +304,7 @@ func TestARefusedRepositoryIsLeftOutAndNoted(t *testing.T) {
 		t.Fatalf("a missing repository stopped the inputs: %v", err)
 	}
 	m := r.pass.manifest
-	if len(m.Repositories) != 1 || m.Repositories[0].Error == "" || !strings.Contains(m.Summary(), "(1 refused)") {
+	if len(m.Repositories) != 1 || m.Repositories[0].Error == "" || !strings.Contains(m.Summary(), "absent: ") {
 		t.Fatalf("the refusal is not in the manifest: %+v %s", m.Repositories, m.Summary())
 	}
 }
@@ -480,5 +480,75 @@ func TestAHarnessesOwnClaimsDecideNothing(t *testing.T) {
 				t.Fatalf("a report after a refusal was kept: %q", run.Failure)
 			}
 		})
+	}
+}
+
+// A repository and a fact store whose history holds the scrubber's marker reach the run, masked: the pass does not
+// leave them out, and the manifest says what each run got.
+func TestPassGivesMaskedSnapshotsOfMarkedRepositoriesAndFacts(t *testing.T) {
+	r, c := inputRunner(t)
+	ctx := context.Background()
+	parent := t.TempDir()
+	repo := markedRepo(t, parent, "example")
+	r.Inputs.ReadDirs = []string{repo}
+	r.Inputs.TacitStore = markedRepo(t, parent, "facts")
+	r.Inputs.ScrubCache = filepath.Join(filepath.Dir(r.Dir), "scrub-cache.sqlite")
+	r.pass = &passInputs{}
+	defer r.pass.close()
+	if err := r.prepareInputs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	m := r.pass.manifest
+	if len(m.Repositories) != 1 || m.Repositories[0].Error != "" || m.Repositories[0].Files != 3 || m.Tacit.Error != "" || m.Tacit.Files != 3 {
+		t.Fatalf("snapshots: %+v tacit %+v", m.Repositories, m.Tacit)
+	}
+	for _, want := range []string{"/ro/repos", "/ro/clone", "/ro/history", "/ro/store.sqlite"} {
+		found := false
+		for _, b := range r.pass.binds {
+			found = found || b.Dst == want
+		}
+		if !found {
+			t.Fatalf("no bind for %s", want)
+		}
+	}
+	evidence := "failure in sub/inner.go"
+	if _, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Mechanism: &evidence}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	c, _ = r.Store.CaseByID(ctx, c.ID)
+	run, err := r.prepareRun(ctx, c, c.Family, StepInvestigate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(run.Summary, "absent") || !strings.Contains(run.Summary, "example 3 files") || !strings.Contains(run.Summary, "tacit 3 files") ||
+		!strings.Contains(run.Summary, "1 masked") || strings.Contains(run.Summary, "marker-7f3a") {
+		t.Fatalf("summary: %s", run.Summary)
+	}
+	// what a run can read of them: the snapshots, their logs and the case's diffs
+	for _, dir := range []string{filepath.Join(r.pass.dir, "repos"), filepath.Join(r.pass.dir, "clone"), filepath.Join(r.pass.dir, "history"), filepath.Join(HostDir(run.Dir), "diffs")} {
+		if tree, _ := treeText(t, dir); strings.Contains(tree, "marker-7f3a") {
+			t.Fatalf("a marker reached a run input under %s", filepath.Base(dir))
+		}
+	}
+	if _, err := os.Stat(filepath.Join(r.pass.dir, "history", "facts.log")); err != nil {
+		t.Fatalf("facts log: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(r.pass.dir, "history", "repos", "example.log")); err != nil {
+		t.Fatalf("repo log: %v", err)
+	}
+	info, err := os.Stat(r.Inputs.ScrubCache)
+	if err != nil || info.Mode().Perm() != 0o600 || strings.HasPrefix(r.Inputs.ScrubCache, r.Dir) {
+		t.Fatalf("scrub cache: %v %v", info, err)
+	}
+}
+
+// The scrub cache is host state: a path inside the loop storage (where a run could reach) is refused.
+func TestScrubCacheInsideLoopStorageIsRefused(t *testing.T) {
+	r, _ := inputRunner(t)
+	r.Inputs.ScrubCache = filepath.Join(r.Dir, "runs", "cache.sqlite")
+	r.pass = &passInputs{}
+	defer r.pass.close()
+	if err := r.prepareInputs(context.Background()); err == nil || !strings.Contains(err.Error(), "scrub cache") {
+		t.Fatalf("a cache inside the loop storage was accepted: %v", err)
 	}
 }

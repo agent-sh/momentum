@@ -21,6 +21,8 @@ type InputOptions struct {
 	Momentum, Home, StoreHome, TacitStore string
 	ReadDirs                              []string
 	Window                                time.Duration
+	// ScrubCache is the host file of the persistent scrub cache (empty: none). It must lie outside the loop storage.
+	ScrubCache string
 }
 
 type passInputs struct {
@@ -30,10 +32,17 @@ type passInputs struct {
 	err       error
 	attempted bool
 	momentum  string
+	cache     *ScrubCache
+	since     time.Time
 }
 
 func (p *passInputs) close() {
-	if p != nil && p.dir != "" {
+	if p == nil {
+		return
+	}
+	p.cache.Close(context.Background(), time.Now())
+	p.cache = nil
+	if p.dir != "" {
 		removeInputTree(p.dir)
 	}
 }
@@ -82,11 +91,28 @@ func (r *Runner) buildInputs(ctx context.Context, p *passInputs) error {
 	if window != StoreWindow {
 		return fmt.Errorf("investigations read the last 30 days")
 	}
+	// The persistent scrub cache is host state outside every run: a cache that cannot be opened is not a reason to
+	// stop (the pass scrubs without it); a scrubber that does not run is.
+	cacheErr := ""
+	if r.Inputs.ScrubCache != "" {
+		if inside(r.Dir, r.Inputs.ScrubCache) || inside(dir, r.Inputs.ScrubCache) {
+			return fmt.Errorf("the scrub cache must lie outside the loop storage")
+		}
+		p.cache, err = OpenScrubCache(r.Inputs.ScrubCache)
+		if errors.Is(err, ErrNoScrubber) {
+			return err
+		}
+		if err != nil {
+			cacheErr = err.Error()
+		}
+	}
+	p.since = until.Add(-HistoryWindow)
 	dst := filepath.Join(dir, "store.sqlite")
-	p.manifest.Store, err = StoreCopy(ctx, StoreCopyOptions{Source: r.Store.Path(), Destination: dst, ScratchDir: dir, Since: until.Add(-window), Until: until})
+	p.manifest.Store, err = StoreCopy(ctx, StoreCopyOptions{Source: r.Store.Path(), Destination: dst, ScratchDir: dir, Since: until.Add(-window), Until: until, Cache: p.cache})
 	if err != nil {
 		return err
 	}
+	p.manifest.Store.CacheError = cacheErr
 	p.binds = append(p.binds, sandbox.Bind{Src: dst, Dst: "/ro/store.sqlite"})
 	dst = filepath.Join(dir, "config")
 	p.manifest.Configuration, err = ConfigCopy(ctx, ConfigCopyOptions{Home: r.Inputs.Home, Destination: dst})
@@ -94,29 +120,45 @@ func (r *Runner) buildInputs(ctx context.Context, p *passInputs) error {
 		return err
 	}
 	p.binds = append(p.binds, sandbox.Bind{Src: dst, Dst: "/ro/config"})
+	logs := filepath.Join(dir, "history")
+	if err = os.Mkdir(logs, 0o700); err != nil {
+		return err
+	}
 	dst = filepath.Join(dir, "clone")
-	p.manifest.Tacit, err = CloneTacit(ctx, r.Inputs.TacitStore, dst)
+	p.manifest.Tacit, err = SnapshotFacts(ctx, r.Inputs.TacitStore, dst, filepath.Join(logs, "facts.log"), p.cache, p.since)
 	switch {
 	case errors.Is(err, ErrNoScrubber):
 		return err
 	case err != nil:
-		// tacit's facts are context, not a precondition: without them the run goes on, and the manifest says "tacit absent"
+		// tacit's facts are context, not a precondition: without them the run goes on, and the manifest says why
 		p.manifest.Tacit.Error = err.Error()
 	default:
 		p.binds = append(p.binds, sandbox.Bind{Src: dst, Dst: "/ro/clone"})
 	}
 	dst = filepath.Join(dir, "repos")
-	if err = os.Mkdir(dst, 0700); err != nil {
-		return err
-	}
-	p.manifest.Repositories, err = CloneRepos(ctx, RepoCloneOptions{Sources: r.Inputs.ReadDirs, Destination: dst, LoopDirs: []string{r.Dir}})
+	p.manifest.Repositories, err = SnapshotRepos(ctx, SnapshotOptions{Sources: r.Inputs.ReadDirs, Destination: dst, LogDir: filepath.Join(logs, "repos"),
+		LoopDirs: []string{r.Dir}, Cache: p.cache, Since: p.since})
 	if err != nil {
 		return err
 	}
-	// A repository that cannot be cloned (missing, not a work tree, a secret in its history the scrubber refuses) is
-	// left out and counted in the manifest's summary; the other repositories and the investigation go on.
-	p.binds = append(p.binds, sandbox.Bind{Src: dst, Dst: "/ro/repos"})
+	// A repository that cannot be read (missing, not a work tree, no default branch) is left out and counted in the
+	// manifest's summary; the others and the investigation go on. What the scrubber changes in one is masked.
+	p.binds = append(p.binds, sandbox.Bind{Src: dst, Dst: "/ro/repos"}, sandbox.Bind{Src: logs, Dst: "/ro/history"})
 	return nil
+}
+
+// inside reports whether path lies in dir or is it.
+func inside(dir, path string) bool {
+	a, err := filepath.Abs(dir)
+	if err != nil {
+		return true
+	}
+	b, err := filepath.Abs(path)
+	if err != nil {
+		return true
+	}
+	rel, err := filepath.Rel(a, b)
+	return err != nil || rel == "." || filepath.IsLocal(rel)
 }
 
 // prepareRun creates the case and records before charging a reservation. These
@@ -170,7 +212,7 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 	if err != nil {
 		return run, err
 	}
-	prompt := fmt.Sprintf("%s\nProblem: %s\n%s%s%s%s", liveQuestion, plain.Line(c.Title), evidenceText, caseHolds(c), findingsInstruction, inputReference())
+	prompt := fmt.Sprintf("%s\nProblem: %s\n%s%s%s%s", liveQuestion, plain.Line(c.Title), evidenceText, caseHolds(c), findingsInstruction, inputReference(true))
 	schema := investigationSchema
 	extra := map[string]string{}
 	if step == StepBuild {
@@ -179,7 +221,7 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 			return run, &buildStageError{key: "build prepare", err: prepErr}
 		}
 		schema = buildSchema
-		prompt = fmt.Sprintf("Build case %s: %s. BASE is %s. /work is your independent clone at BASE, writable with its Git metadata. /out is writable. Read /run/input/case.json for the investigation and evidence. Make one cause's change and its discriminating test. End with the build report. The host produces the patch.\n%s", c.ID, c.Title, p.BaseCommit, inputReference())
+		prompt = fmt.Sprintf("Build case %s: %s. BASE is %s. /work is your independent clone at BASE, writable with its Git metadata. /out is writable. Read /run/input/case.json for the investigation and evidence. Make one cause's change and its discriminating test. End with the build report. The host produces the patch.\n%s", c.ID, c.Title, p.BaseCommit, inputReference(true))
 		prompt = strings.ReplaceAll(prompt, "/work is empty scratch and the working directory.", "/work is the independent clone at BASE and the working directory.")
 		prompt = strings.ReplaceAll(prompt, "Return a report with mechanism, alternatives ruled out, fix and summary. Build no change.", "Return summary, test, title, body, rollback, signal, window and lesson. window is a duration, such as 7d. signal names source, kinds, match and optional tool and harness.")
 		if n := len(p.Reviews); n > 0 {
@@ -266,6 +308,14 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 	if err != nil {
 		return run, err
 	}
+	// The diffs of the commits that touched the paths this case's evidence names: host-read, scrubbed, text only.
+	manifest.Diffs, err = SnapshotDiffs(ctx, manifest.Repositories, texts, filepath.Join(host, "diffs"), r.pass.since, r.pass.cache)
+	if errors.Is(err, ErrNoScrubber) {
+		return run, err
+	}
+	if err != nil {
+		manifest.Diffs.Error = err.Error()
+	}
 	raw, err = json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return run, err
@@ -296,7 +346,8 @@ func (r *Runner) runInputs(run store.LoopRun) ([]sandbox.Bind, InputsManifest, e
 		return nil, manifest, err
 	}
 	binds := append([]sandbox.Bind(nil), r.pass.binds...)
-	binds = append(binds, sandbox.Bind{Src: filepath.Join(HostDir(run.Dir), "records"), Dst: "/ro/records"})
+	binds = append(binds, sandbox.Bind{Src: filepath.Join(HostDir(run.Dir), "records"), Dst: "/ro/records"},
+		sandbox.Bind{Src: filepath.Join(HostDir(run.Dir), "diffs"), Dst: "/ro/diffs"})
 	return binds, manifest, nil
 }
 

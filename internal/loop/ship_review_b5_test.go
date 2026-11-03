@@ -232,7 +232,7 @@ func TestBuildPreparationTakesTheCaseLock(t *testing.T) {
 	s, f, c, p, _ := b4Checked(t)
 	setCaseRepo(t, s.Store, c, "fixture")
 	r := &Runner{Ship: s, Store: s.Store, pass: &passInputs{manifest: InputsManifest{
-		Repositories: []RepoClone{{Name: "fixture", Source: f.main}},
+		Repositories: []RepoInput{{Name: "fixture", Source: f.main}},
 	}}}
 	before, err := os.ReadFile(filepath.Join(s.pkgDir(c.ID), "package.json"))
 	if err != nil {
