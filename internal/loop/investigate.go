@@ -197,7 +197,14 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 			alternatives = append(alternatives, a)
 		}
 	}
+	// The case keeps a plain line: a field of spaces and invisible characters alone names nothing.
 	mechanism, fix := strings.TrimSpace(f.Mechanism), strings.TrimSpace(f.Fix)
+	if !holdsText(mechanism) {
+		mechanism = ""
+	}
+	if !holdsText(fix) {
+		fix = ""
+	}
 	u := store.CaseUpdate{Status: store.CaseInvestigating}
 	if reported {
 		u.Mechanism, u.NextTest, u.Alternatives = &mechanism, &fix, alternatives
@@ -260,14 +267,14 @@ func undecided(res Result, err error) string {
 		return ""
 	}
 	f := nativeFinding(res)
-	if strings.TrimSpace(f.Mechanism) != "" && strings.TrimSpace(f.Fix) != "" {
+	if holdsText(f.Mechanism) && holdsText(f.Fix) {
 		return ""
 	}
 	why := "the investigation named no mechanism and fix"
 	switch {
-	case strings.TrimSpace(f.Mechanism) != "":
+	case holdsText(f.Mechanism):
 		why = "the investigation named a mechanism and no fix"
-	case strings.TrimSpace(f.Fix) != "":
+	case holdsText(f.Fix):
 		why = "the investigation named a fix and no mechanism"
 	}
 	if s := strings.TrimSpace(f.Report); s != "" {
@@ -275,6 +282,9 @@ func undecided(res Result, err error) string {
 	}
 	return why
 }
+
+// holdsText says whether a finding's field names anything once the case store keeps it as a plain line.
+func holdsText(s string) bool { return plain.Line(s) != "" }
 
 type finding struct {
 	Mechanism    string   `json:"mechanism"`
