@@ -141,6 +141,9 @@ func reviewFixture(t *testing.T) (*Runner, store.Case, Package) {
 	r := runnerFor(t, st, fakeAgent(t, `{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":1,"structured_output":{"summary":"clean","findings":[]}}`))
 	c := testingCase(t, st)
 	r.Ship = &Ship{Store: st, Dir: r.Dir}
+	// a review outside Once reads the inputs of a pass of its own
+	r.pass = &passInputs{}
+	t.Cleanup(r.pass.close)
 	p := reviewable(t, r.Ship, c.ID)
 	r.Ship.Public = func(_ context.Context, s string) (string, error) { return Neutral(s), nil }
 	r.Ship.Gate = reviewGate(t)

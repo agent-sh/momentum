@@ -596,7 +596,7 @@ for k in ("DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK"):
 if os.environ.get("HOME") != %q: bad.append("HOME is " + os.environ.get("HOME", ""))
 open("inside.txt", "w").write("ok")
 print(" ".join(bad)); sys.exit(1 if bad else 0)
-`, outside, tcp.Addr().(*net.TCPAddr).Port, filepath.Join(outside, "x"), secret, sb.Home)
+`, outside, tcp.Addr().(*net.TCPAddr).Port, filepath.Join(outside, "x"), secret, "/home/agent")
 	t.Setenv("SSH_AUTH_SOCK", sock)
 	o, err := sb.Run(context.Background(), tree, []string{"python3", "-c", probe}, nil)
 	if err != nil || o.Exit != 0 {
