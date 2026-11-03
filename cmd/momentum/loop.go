@@ -126,6 +126,9 @@ func within(p, dir string) bool {
 
 // loopCmd runs the improvement loop once, or lists its runs.
 func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) > 0 && args[0] == "eval" {
+		return loopEval(ctx, args[1:], stdout, stderr)
+	}
 	if len(args) > 0 && args[0] == "runs" {
 		return loopRuns(ctx, args[1:], stdout, stderr)
 	}
@@ -305,7 +308,12 @@ func loopRuns(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		if r.Experiment != "" {
 			tag = " [" + r.Experiment + "]"
 		}
-		fmt.Fprintf(stdout, "%s  %-10s %-14s %-11s %-8s $%5.2f %3d turns %s%s\n", r.Started.Local().Format("01-02 15:04"), r.Case, r.Family,
+		at := r.Started
+		if at.IsZero() {
+			at = r.Ended
+			tag += " [never started]"
+		}
+		fmt.Fprintf(stdout, "%s  %-10s %-14s %-11s %-8s $%5.2f %3d turns %s%s\n", at.Local().Format("01-02 15:04"), r.Case, r.Family,
 			r.Step, r.Status, r.USD, r.Turns, firstText(r.Failure, r.Summary), tag)
 	}
 	if !*asJSON {

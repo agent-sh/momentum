@@ -412,7 +412,7 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 	switch {
 	case res.CostKnown && res.RelayAdmitted+res.RelayRefused+res.RelayCharged > 0:
 		run.USD = res.RelayUSD + res.ReservationUSD
-	case !res.Started && res.Transcript == "":
+	case !res.Started:
 		run.Started = time.Time{}
 		run.USD = 0 // it never started (its prompt could not be scrubbed, the harness did not start): it spent nothing
 	case !res.CostKnown:

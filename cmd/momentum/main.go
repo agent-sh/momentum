@@ -91,6 +91,8 @@ const usage = `usage:
                                         investigate each family's case once with the harness's native agent;
                                         the host records the findings
   momentum loop runs [--since WHEN] [--case ID] [--json]
+  momentum loop eval [--golden FILE] [--task ID,...] [--trials K] [--arms loop,native]
+                     [--budget USD] [--parallel N] [--held-out ID,...] [--split all|development|held-out] [--json]
                                         the loop's runs, and what the live ones spent in the last day and week
   momentum version
 Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json), and the
