@@ -6,8 +6,6 @@ import (
 	"strings"
 )
 
-func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
-
 // fixtureResult posts each synthetic call and prints the harness's result line.
 func fixtureResult(result string) string {
 	var r struct {

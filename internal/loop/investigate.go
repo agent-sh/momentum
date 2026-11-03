@@ -21,13 +21,13 @@ The owner's words are only what his own turns say (actor owner); never credit hi
 // investigationSchema is an investigation's report.
 const investigationSchema = `{"type":"object","additionalProperties":false,"required":["mechanism","fix","summary"],
 "properties":{"mechanism":{"type":"string"},"alternatives":{"type":"array","items":{"type":"string"}},
-"fix":{"type":"string"},"summary":{"type":"string"}}}`
+"fix":{"type":"string"},"summary":{"type":"string"},"repo":{"type":"string"}}}`
 
 // findingsInstruction keeps what a run cut short found: the runner reads the file when the run has no report.
 const findingsInstruction = "Keep findings as you go in /out/findings.md. Use the headings ## Mechanism, ## Alternatives ruled out, ## Fix, and ## Summary. End with your report of the same fields."
 
 // liveQuestion is what a live investigation is asked.
-const liveQuestion = "Find the root cause of this problem and the fix. State the mechanism, the alternatives ruled out, the fix, and a summary. Build no change."
+const liveQuestion = "Find the root cause of this problem and the fix. State the mechanism, the alternatives ruled out, the fix, and a summary. If the fix is code in a repository under /ro/repos, also report repo as its NAME. Build no change."
 
 // inputReference describes the host-created files. All /ro inputs are read-only.
 func inputReference() string {
@@ -205,13 +205,27 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 	if undecided != "" && u.Status != store.CaseTesting {
 		return st.RecordUndecided(ctx, caseID, episode, u, undecided, actor)
 	}
-	return st.RecordFindings(ctx, caseID, episode, u, actor)
+	var notes []store.CaseEntry
+	if reported {
+		if f.Repo != "" && !repoName.MatchString(f.Repo) {
+			return store.Case{}, false, fmt.Errorf("invalid investigation repository name")
+		}
+		raw, err := json.Marshal(struct {
+			Repo    string `json:"repo"`
+			Episode int64  `json:"episode"`
+		}{f.Repo, episode})
+		if err != nil {
+			return store.Case{}, false, err
+		}
+		notes = append(notes, store.CaseEntry{Action: repoAction, Detail: string(raw)})
+	}
+	return st.RecordFindings(ctx, caseID, episode, u, actor, notes...)
 }
 
 // cleanFinding cleans whole fields before the case store clips them.
 func cleanFinding(ctx context.Context, f finding) (finding, error) {
 	f.Alternatives = append([]string(nil), f.Alternatives...)
-	texts := []*string{&f.Mechanism, &f.Fix, &f.Report}
+	texts := []*string{&f.Mechanism, &f.Fix, &f.Report, &f.Repo}
 	for i := range f.Alternatives {
 		texts = append(texts, &f.Alternatives[i])
 	}
@@ -253,19 +267,20 @@ type finding struct {
 	Alternatives []string `json:"alternatives_ruled_out"`
 	Fix          string   `json:"fix"`
 	Report       string   `json:"summary"`
+	Repo         string   `json:"repo,omitempty"`
 }
 
 // nativeFinding reads an investigation's report; alternatives given as one text, not the schema's list, are kept.
 func nativeFinding(res Result) finding {
 	var rep struct {
-		Mechanism    string
-		Alternatives json.RawMessage
-		Fix, Summary string
+		Mechanism          string
+		Alternatives       json.RawMessage
+		Fix, Summary, Repo string
 	}
 	if json.Unmarshal(res.Report, &rep) != nil {
 		return finding{}
 	}
-	f := finding{Mechanism: rep.Mechanism, Fix: rep.Fix, Report: rep.Summary}
+	f := finding{Mechanism: rep.Mechanism, Fix: rep.Fix, Report: rep.Summary, Repo: rep.Repo}
 	if json.Unmarshal(rep.Alternatives, &f.Alternatives) != nil {
 		var one string
 		if json.Unmarshal(rep.Alternatives, &one) == nil && strings.TrimSpace(one) != "" {

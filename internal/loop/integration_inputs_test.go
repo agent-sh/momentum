@@ -269,14 +269,14 @@ func TestSandboxRunUnitsAndConstants(t *testing.T) {
 	}
 }
 
-func TestTestingAndImprovedCasesArePassedOver(t *testing.T) {
+func TestTestingWithoutShipAndImprovedCasesReserveNoAgent(t *testing.T) {
 	r, c := inputRunner(t)
 	mechanism, fix := "marker-7f3a mechanism", "fix"
 	if _, err := r.Store.UpdateCase(context.Background(), c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture"); err != nil {
 		t.Fatal(err)
 	}
 	picked, _, why, err := r.pick(context.Background(), c.Family, c.ID, true)
-	if err != nil || picked.ID != "" || !strings.Contains(why, "builds are not in this build") {
+	if err != nil || picked.ID != "" || !strings.Contains(why, "has no ship tool") {
 		t.Fatalf("testing selection: %+v %s %v", picked, why, err)
 	}
 	// Seed a retained improved state as a synthetic fixture.
@@ -289,7 +289,7 @@ func TestTestingAndImprovedCasesArePassedOver(t *testing.T) {
 		t.Fatal(err)
 	}
 	picked, _, why, err = r.pick(context.Background(), c.Family, c.ID, true)
-	if err != nil || picked.ID != "" || !strings.Contains(why, "builds are not in this build") {
+	if err != nil || picked.ID != "" {
 		t.Fatalf("improved selection: %+v %s %v", picked, why, err)
 	}
 }

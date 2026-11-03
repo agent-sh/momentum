@@ -744,7 +744,7 @@ func (s *Store) UpdateCase(ctx context.Context, id string, u CaseUpdate, actor s
 // the run, in one transaction that reads the case by its own id without following a merge, only while that case
 // has not gone into another and is still open or investigating (a case moved on since the run started keeps what
 // it has). The bool says whether they were recorded.
-func (s *Store) RecordFindings(ctx context.Context, id string, episode int64, u CaseUpdate, actor string) (Case, bool, error) {
+func (s *Store) RecordFindings(ctx context.Context, id string, episode int64, u CaseUpdate, actor string, notes ...CaseEntry) (Case, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Case{}, false, err
@@ -759,6 +759,11 @@ func (s *Store) RecordFindings(ctx context.Context, id string, episode int64, u 
 	}
 	if c, err = updateCase(ctx, tx, c, u, actor, time.Now()); err != nil {
 		return Case{}, false, err
+	}
+	for _, note := range notes {
+		if err := caseLog(ctx, tx, c.ID, actor, note.Action, note.Detail, time.Now()); err != nil {
+			return Case{}, false, err
+		}
 	}
 	return c, true, tx.Commit()
 }
