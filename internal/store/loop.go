@@ -168,7 +168,7 @@ func (s *Store) LoopRuns(ctx context.Context, f RunFilter) ([]LoopRun, error) {
 		where, args = append(where, "started > 0 AND status NOT IN (?, ?) AND failure <> ?"), append(args, RunRefused, RunRunning, "sandbox")
 	}
 	if f.Judged {
-		where = append(where, "failure NOT IN ('stopped', 'killed', 'broker')")
+		where = append(where, "failure NOT IN ('stopped', 'killed', 'broker', 'hold')")
 	}
 	q := `SELECT ` + loopColumns + ` FROM loop_runs WHERE ` + strings.Join(where, " AND ") + ` ORDER BY COALESCE(NULLIF(started, 0), ended) DESC, id DESC`
 	if f.Limit > 0 {

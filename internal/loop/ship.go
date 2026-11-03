@@ -1062,6 +1062,10 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 		if !s.Live {
 			return p, refused("the loop is not live")
 		}
+		// a landing resumed after a crash is still a landing of a case in testing, as a new one is
+		if _, err := s.working(ctx, caseID); err != nil {
+			return p, err
+		}
 		// Restore only this package's interrupted operation before the clean-tree scope check.
 		_, _ = s.git(ctx, p.Host, "rebase", "--abort")
 		if _, err := s.git(ctx, p.Host, "reset", "--hard", p.Head); err != nil {

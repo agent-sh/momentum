@@ -73,7 +73,7 @@ func TestALessonIsTheLoopsObservation(t *testing.T) {
 	if strings.Contains(string(got), "secret-value") || strings.Contains(string(got), "marker-7f3a") || strings.Contains(string(got), "@someone") {
 		t.Errorf("the lesson went unscrubbed:\n%s", got)
 	}
-	if !strings.Contains(string(got), "--body\nLearned by momentum's improvement loop") || !strings.Contains(string(got), "[masked] keeps failing") {
+	if !strings.Contains(string(got), "--body\nUnverified lesson from momentum's improvement loop") || !strings.Contains(string(got), "[masked] keeps failing") {
 		t.Errorf("the case title was not masked in the body:\n%s", got)
 	}
 }

@@ -130,7 +130,12 @@ func (r *Runner) review(ctx context.Context, c store.Case, p Package, run store.
 			text := reviewText(len(p.Reviews)+1, h, m, l, *rep.Summary, *rep.Findings)
 			rev := Review{Head: p.Head, Findings: *rep.Findings, Text: text}
 			saved, saveErr := r.Ship.Reviewed(ctx, c.ID, rev)
-			if saveErr != nil {
+			if saveErr != nil && held(saveErr) {
+				// a lock held by a person's step is a hold, not a failure of the reviewer: the run is not counted
+				// by the stop rule and the review is made again on the next pass
+				res.Status, res.Failure = store.RunFailed, "hold"
+				r.logf("review of %s not recorded: %v", c.ID, saveErr)
+			} else if saveErr != nil {
 				res.Status, res.Failure = store.RunFailed, "review"
 			} else if _, postErr := r.postReview(ctx, saved); postErr != nil {
 				r.logf("post the review of %s: %v", c.ID, postErr)

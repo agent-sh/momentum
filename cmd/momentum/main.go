@@ -89,13 +89,13 @@ const usage = `usage:
                                         a closed case comes back only on evidence it does not hold
   momentum loop [--dry] [--family F,F] [--case ID] [--json]
                                         investigate, build and review each family's case; the host checks and proposes
-                                        changes, lands them when live, and publishes validated lessons
+                                        changes, lands them when live, and publishes unverified lessons
   momentum loop runs [--since WHEN] [--case ID] [--json]
   momentum loop eval [--golden FILE] [--task ID,...] [--trials K] [--arms loop,native]
                      [--budget USD] [--parallel N] [--held-out ID,...] [--split all|development|held-out] [--json]
                                         the loop's runs, and what the live ones spent in the last day and week
   momentum loop lesson --case ID --text TEXT
-                                        publish a validated lesson to tacit
+                                        publish an unverified lesson to tacit
   momentum ship prepare|check|propose|status|land|rollback --case ID [OPTIONS]
                                         the owner controls a host change package
   momentum version

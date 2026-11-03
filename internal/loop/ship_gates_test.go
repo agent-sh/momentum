@@ -400,3 +400,26 @@ func TestAReviewWithoutItsFindingsIsNoReview(t *testing.T) {
 		}
 	}
 }
+
+// A landing resumed after a crash is a landing like a new one: a case that left testing meanwhile is not landed.
+func TestAResumedLandingNeedsTheCaseStillInTesting(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	f := newRepo(t, nil)
+	s := shipFor(t, st, f)
+	c, p := reviewedChange(t, s, st, f)
+	p.State, p.LandingHead = Landing, p.Head
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	was := strings.TrimSpace(run(t, f.dir, "git", "--git-dir", f.origin, "rev-parse", "main"))
+	if _, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Land(ctx, c.ID); err == nil || !strings.Contains(err.Error(), "investigating") {
+		t.Fatalf("a resumed landing of a case that left testing: %v", err)
+	}
+	if now := strings.TrimSpace(run(t, f.dir, "git", "--git-dir", f.origin, "rev-parse", "main")); now != was {
+		t.Fatalf("the default branch moved from %s to %s", was, now)
+	}
+}
