@@ -940,8 +940,12 @@ func (s *Ship) Reviewed(ctx context.Context, caseID string, r Review) (Package, 
 	if !ok || p.State != Proposed {
 		return p, refused("case %s has no proposed package to review", caseID)
 	}
-	if r.Head == "" || r.Head != p.Head {
+	if r.Head == "" {
 		return p, refused("the review head differs from the proposed head")
+	}
+	if r.Head != p.Head {
+		// the package moved on while the review ran: no fault of the reviewer's, and the next pass reviews the new head
+		return p, &shipHold{err: refused("the review head differs from the proposed head")}
 	}
 	if len(p.Reviews) >= MaxRounds {
 		return p, refused("review rounds used; the change waits for a person")

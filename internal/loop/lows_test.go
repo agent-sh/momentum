@@ -77,3 +77,59 @@ func TestTheRecordIndexListsWithheldRecords(t *testing.T) {
 		t.Fatalf("bytes %d, on disk %d", again.Bytes, total)
 	}
 }
+
+// A review whose recording meets the case lock a person's step holds is a hold, not the reviewer's failure: the stop
+// rule does not count it, so two of them leave the case reviewable, and the next pass reviews it again.
+func TestAReviewUnderAHeldLockIsAHoldTheStopRuleDoesNotCount(t *testing.T) {
+	ctx := context.Background()
+	r, c, _ := reviewFixture(t)
+	r.Post = func(context.Context, string, string, string) (string, error) { return "https://example.invalid/c/1", nil }
+	unlock, err := r.Ship.lock(ctx, c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		done := r.reviews(ctx, "")
+		if len(done) != 1 || done[0].Run.Status != store.RunFailed || done[0].Run.Failure != "hold" {
+			t.Fatalf("review %d under a held lock: %+v", i, done)
+		}
+	}
+	if stop, err := r.stopped(ctx, c, true); err != nil || stop != "" {
+		t.Fatalf("two holds stopped the case: %q %v", stop, err)
+	}
+	unlock()
+	done := r.reviews(ctx, "")
+	p, _, _ := r.Ship.Load(c.ID)
+	if len(done) != 1 || done[0].Run.Status != store.RunOK || len(p.Reviews) != 1 {
+		t.Fatalf("the review after the hold: %+v, %d reviews", done, len(p.Reviews))
+	}
+}
+
+// A package head that moved while the review ran (a revision, or the owner's proposal) refuses the verdict, and that
+// is a hold too: the reviewer read what it was given, and the next pass reviews the new head.
+func TestAHeadThatMovedDuringTheReviewIsAHold(t *testing.T) {
+	ctx := context.Background()
+	r, c, p := reviewFixture(t)
+	r.Post = func(context.Context, string, string, string) (string, error) { return "https://example.invalid/c/1", nil }
+	if err := r.prepareInputs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	run, err := r.prepareRun(ctx, c, c.Family, StepReview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, refusal := r.reservePrepared(ctx, run)
+	if refusal != "" {
+		t.Fatal(refusal)
+	}
+	moved := p
+	moved.Head = p.BaseCommit
+	if err := r.Ship.save(&moved); err != nil {
+		t.Fatal(err)
+	}
+	d := r.review(ctx, c, p, run)
+	got, _, _ := r.Ship.Load(c.ID)
+	if d.Run.Status != store.RunFailed || d.Run.Failure != "hold" || len(got.Reviews) != 0 {
+		t.Fatalf("a moved head: %s %q, %d reviews", d.Run.Status, d.Run.Failure, len(got.Reviews))
+	}
+}
