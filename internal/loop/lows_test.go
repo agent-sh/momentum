@@ -293,3 +293,29 @@ func TestAMasterCutClearsADoneAfterTheEnd(t *testing.T) {
 		}
 	}
 }
+
+// A task whose end cannot be found (its symptom is not in the store) is left out of the master's window and fails
+// alone: the master is still made for the others, and their inputs are built from it.
+func TestATaskWithoutAnEndFailsAlone(t *testing.T) {
+	ctx := context.Background()
+	e, good := evalFixture(t)
+	if err := e.pinRecordsBinary(); err != nil {
+		t.Fatal(err)
+	}
+	bad := good
+	bad.ID = "end-not-found"
+	bad.Symptom.Query.EventIDs = []string{strings.Repeat("0", 24)}
+	dir, err := e.buildMaster(ctx, []GoldenTask{bad, good})
+	if err != nil || dir == "" || e.master == "" {
+		t.Fatalf("the master for the other tasks: %q %v", dir, err)
+	}
+	defer removeInputTree(dir)
+	for _, task := range []GoldenTask{bad, good} {
+		in := &taskInputs{remaining: 1}
+		e.makeTask(ctx, in, task, nil)
+		in.close()
+		if (in.err != nil) != (task.ID == bad.ID) {
+			t.Errorf("%s: %v", task.ID, in.err)
+		}
+	}
+}
