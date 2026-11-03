@@ -19,20 +19,20 @@ import (
 func TestARepositoryAsOfItsFixHoldsNothingAfter(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src")
-	run(t, dir, "git", "init", "-q", "-b", "main", src)
+	gitRun(t, dir, "git", "init", "-q", "-b", "main", src)
 	write(t, filepath.Join(src, "a.go"), "package a\n")
-	run(t, src, "git", "add", "-A")
-	run(t, src, "git", "commit", "-q", "-m", "before")
-	before := strings.TrimSpace(run(t, src, "git", "rev-parse", "HEAD"))
+	gitRun(t, src, "git", "add", "-A")
+	gitRun(t, src, "git", "commit", "-q", "-m", "before")
+	before := strings.TrimSpace(gitRun(t, src, "git", "rev-parse", "HEAD"))
 	write(t, filepath.Join(src, "a.go"), "package a\n\n// the fix\n")
-	run(t, src, "git", "commit", "-q", "-am", "the fix")
-	fix := strings.TrimSpace(run(t, src, "git", "rev-parse", "HEAD"))
-	run(t, src, "git", "branch", "later")
+	gitRun(t, src, "git", "commit", "-q", "-am", "the fix")
+	fix := strings.TrimSpace(gitRun(t, src, "git", "rev-parse", "HEAD"))
+	gitRun(t, src, "git", "branch", "later")
 	dst := filepath.Join(dir, "as-of")
 	if err := cloneAsOf(context.Background(), src, before, dst); err != nil {
 		t.Fatal(err)
 	}
-	if log := run(t, dst, "git", "log", "--all", "--format=%s"); strings.TrimSpace(log) != "before" {
+	if log := gitRun(t, dst, "git", "log", "--all", "--format=%s"); strings.TrimSpace(log) != "before" {
 		t.Fatalf("the clone's history: %q", log)
 	}
 	if err := exec.Command("git", "-C", dst, "cat-file", "-e", fix).Run(); err == nil {
@@ -169,21 +169,21 @@ func TestGoldenAndEvaluationIDsAreUnambiguous(t *testing.T) {
 func TestHistoricalClonesDropAlternatesAndKeptPacks(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "source")
-	run(t, dir, "git", "init", "-q", "-b", "main", src)
+	gitRun(t, dir, "git", "init", "-q", "-b", "main", src)
 	write(t, filepath.Join(src, "file"), "before")
-	run(t, src, "git", "add", "file")
-	run(t, src, "git", "commit", "-qm", "before")
-	before := strings.TrimSpace(run(t, src, "git", "rev-parse", "HEAD"))
+	gitRun(t, src, "git", "add", "file")
+	gitRun(t, src, "git", "commit", "-qm", "before")
+	before := strings.TrimSpace(gitRun(t, src, "git", "rev-parse", "HEAD"))
 	write(t, filepath.Join(src, "file"), "after")
-	run(t, src, "git", "commit", "-qam", "after")
-	after := strings.TrimSpace(run(t, src, "git", "rev-parse", "HEAD"))
-	run(t, src, "git", "gc")
+	gitRun(t, src, "git", "commit", "-qam", "after")
+	after := strings.TrimSpace(gitRun(t, src, "git", "rev-parse", "HEAD"))
+	gitRun(t, src, "git", "gc")
 	packs, _ := filepath.Glob(filepath.Join(src, ".git", "objects", "pack", "*.pack"))
 	for _, p := range packs {
 		write(t, strings.TrimSuffix(p, ".pack")+".keep", "")
 	}
 	shared := filepath.Join(dir, "shared")
-	run(t, dir, "git", "clone", "-q", "--shared", src, shared)
+	gitRun(t, dir, "git", "clone", "-q", "--shared", src, shared)
 	hooks := filepath.Join(dir, "hooks")
 	os.Mkdir(hooks, 0700)
 	marker := filepath.Join(dir, "hook-ran")
@@ -244,19 +244,19 @@ func TestHistoricalCloneUsesTheLocalDefaultBranch(t *testing.T) {
 		t.Run(branch, func(t *testing.T) {
 			dir := t.TempDir()
 			src := filepath.Join(dir, "source")
-			run(t, dir, "git", "init", "-q", "-b", branch, src)
+			gitRun(t, dir, "git", "init", "-q", "-b", branch, src)
 			local := commitAt(t, src, end.Add(-3*time.Hour), "job", "local", "local")
-			run(t, src, "git", "checkout", "-qb", "upstream")
+			gitRun(t, src, "git", "checkout", "-qb", "upstream")
 			remote := commitAt(t, src, end.Add(-2*time.Hour), "job", "upstream", "fetched but not pulled")
-			run(t, src, "git", "checkout", "-q", branch)
-			run(t, src, "git", "update-ref", "refs/remotes/origin/"+branch, remote)
-			run(t, src, "git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/"+branch)
-			run(t, src, "git", "branch", "-D", "upstream")
+			gitRun(t, src, "git", "checkout", "-q", branch)
+			gitRun(t, src, "git", "update-ref", "refs/remotes/origin/"+branch, remote)
+			gitRun(t, src, "git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/"+branch)
+			gitRun(t, src, "git", "branch", "-D", "upstream")
 			repos, err := cloneRepositories(context.Background(), []string{src}, end, filepath.Join(dir, "repos"))
 			if err != nil || len(repos) != 1 {
 				t.Fatalf("%v %v", repos, err)
 			}
-			if got := strings.TrimSpace(run(t, repos[0], "git", "rev-parse", "HEAD")); got != local {
+			if got := strings.TrimSpace(gitRun(t, repos[0], "git", "rev-parse", "HEAD")); got != local {
 				t.Fatalf("head %s want local %s", got, local)
 			}
 			if exec.Command("git", "-C", repos[0], "cat-file", "-e", remote).Run() == nil {
@@ -269,7 +269,7 @@ func TestHistoricalCloneUsesTheLocalDefaultBranch(t *testing.T) {
 func TestHistoricalCloneClearsGitEnvironment(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "source")
-	run(t, dir, "git", "init", "-q", "-b", "main", src)
+	gitRun(t, dir, "git", "init", "-q", "-b", "main", src)
 	head := commitAt(t, src, time.Now().Add(-time.Hour), "job", "before", "before")
 	t.Setenv("GIT_DIR", filepath.Join(dir, "absent.git"))
 	t.Setenv("GIT_WORK_TREE", filepath.Join(dir, "wrong-tree"))
@@ -424,9 +424,9 @@ func TestAHistoricalCloneTheScrubberWouldChangeIsLeftOut(t *testing.T) {
 	end, _ := e.snapshotEnd(context.Background(), task)
 	dir := t.TempDir()
 	clean, secret := filepath.Join(dir, "clean"), filepath.Join(dir, "secret")
-	run(t, dir, "git", "init", "-q", "-b", "main", clean)
+	gitRun(t, dir, "git", "init", "-q", "-b", "main", clean)
 	commitAt(t, clean, end.Add(-3*time.Hour), "job", "neutral text", "neutral")
-	run(t, dir, "git", "init", "-q", "-b", "main", secret)
+	gitRun(t, dir, "git", "init", "-q", "-b", "main", secret)
 	commitAt(t, secret, end.Add(-3*time.Hour), "job", "password=marker-7f3a", "holds a password")
 	repos, refused, err := cloneRepositoriesCounted(context.Background(), []string{secret, clean}, end, filepath.Join(dir, "repos"))
 	if err != nil || len(repos) != 1 || refused != 1 {

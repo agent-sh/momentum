@@ -143,7 +143,7 @@ func TestEvaluationCloneExcludesTheEndsSecondWithAndWithoutReflog(t *testing.T) 
 		if err != nil || !made {
 			t.Fatalf("clone: %v %v", made, err)
 		}
-		if got := run(t, dst, "git", "rev-parse", "HEAD"); got != before {
+		if got := gitRun(t, dst, "git", "rev-parse", "HEAD"); got != before {
 			t.Fatal("commit at the end leaked through a reflog or date")
 		}
 		absentObject(t, dst, atEnd)
