@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -209,6 +210,10 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 // buildConfigPackage readies a configuration package's run clone: prepared from the target as the host reads it now,
 // its target checked again before the clone is mounted.
 func (r *Runner) buildConfigPackage(ctx context.Context, c store.Case, run store.LoopRun, target string) (Package, error) {
+	// the run reads its target in /ro/config: a file the copy left out (its share of the cap, a skip) is not what the run saw
+	if r.pass == nil || !slices.ContainsFunc(r.pass.manifest.Configuration.Files, func(f ConfigFile) bool { return f.Path == target }) {
+		return Package{}, refused("the run's configuration copy left out %s: the run could not read the file it would change", target)
+	}
 	p, had, err := r.Ship.Load(c.ID)
 	if err != nil {
 		return p, err

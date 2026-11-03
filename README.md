@@ -240,12 +240,13 @@ Host `evidence show` scrubs all headers and whole records in one batch, then cli
 The owner's CLI controls the same host package lifecycle:
 
 ```
-momentum ship prepare --case ID --repo DIR
+momentum ship prepare --case ID --repo DIR | --config PATH
 momentum ship check --case ID --test "go test ./..." --patch FILE
 momentum ship propose --case ID --title TITLE --body-file FILE --rollback TEXT --signal JSON --window 7d --lesson TEXT --patch FILE [--installed FILE]
 momentum ship status --case ID [--json]
 momentum ship land --case ID
-momentum ship rollback --case ID --why TEXT
+momentum ship rollback --case ID --why TEXT [--force]
+momentum ship abandon --case ID --why TEXT    leave a configuration landing whose file holds neither its old nor its new content
 momentum loop lesson --case ID --text TEXT
 ```
 

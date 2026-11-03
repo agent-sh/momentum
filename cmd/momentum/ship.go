@@ -22,11 +22,11 @@ import (
 // shipCmd is the owner's interface to the host ship tool.
 func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usageError{"ship needs prepare, check, propose, status, land or rollback"}
+		return usageError{"ship needs prepare, check, propose, status, land, rollback or abandon"}
 	}
 	switch args[0] {
 	case "prepare", "check", "propose", "status":
-	case "land", "rollback":
+	case "land", "rollback", "abandon":
 
 	default:
 		return usageError{fmt.Sprintf("unknown ship command %q", args[0])}
@@ -47,10 +47,10 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	window := fs.String("window", "7d", "propose: the measurement's window (whole weeks: 7d, 14d and so on)")
 	lesson := fs.String("lesson", "", "propose: the lesson the case teaches, one sentence")
 	installed := fs.String("installed", "", "propose: the binary or installed configuration the machine runs; measured after the checkout first held the change and the file was rebuilt")
-	why := fs.String("why", "", "rollback: why")
+	why := fs.String("why", "", "rollback, abandon: why")
 	asJSON := fs.Bool("json", false, "status: the package as JSON")
 	rest := args[1:]
-	if (args[0] == "land" || args[0] == "rollback") && len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+	if (args[0] == "land" || args[0] == "rollback" || args[0] == "abandon") && len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
 		*caseID, rest = rest[0], rest[1:]
 	}
 	if err := fs.Parse(rest); err != nil {
@@ -128,6 +128,11 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		p, err = ship.Propose(ctx, *caseID, pr, patch)
 	case "land":
 		p, err = ship.Land(ctx, *caseID)
+	case "abandon":
+		if strings.TrimSpace(*why) == "" {
+			return usageError{"ship abandon needs --why"}
+		}
+		p, err = ship.AbandonLanding(ctx, *caseID, *why)
 	case "rollback":
 		if strings.TrimSpace(*why) == "" {
 			return usageError{"ship rollback needs --why"}

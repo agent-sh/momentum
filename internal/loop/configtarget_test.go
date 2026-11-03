@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -128,6 +129,11 @@ func TestConfigTargetsAreTheCopysFilesUnderAStricterDenylist(t *testing.T) {
 			t.Errorf("%q admitted: %v", bad, err)
 		}
 	}
+	for name, why := range map[string]string{".local/bin/tool": "a program on PATH", ".config/momentum/sources.json": "the loop's own configuration"} {
+		if _, err := ct.admit(name); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), why) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
 	if _, err := (ConfigTargets{}).admit(ruleTarget); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "names no file") {
 		t.Fatalf("an empty allow: %v", err)
 	}
@@ -149,7 +155,7 @@ func TestConfigTargetsAreTheCopysFilesUnderAStricterDenylist(t *testing.T) {
 		t.Fatalf("an exact entry admitted another file: %v", err)
 	}
 	// an allow entry cannot widen the copy's list: it refuses every target instead
-	for _, wide := range []string{".ssh/**", "/etc/**", ".bashrc", ".local/bin", ".config/momentum", ".claude/hooks/cred-get"} {
+	for _, wide := range []string{".ssh/**", "/etc/**", ".bashrc", ".local/bin", ".config/momentum", ".claude/hooks/cred-get", ".config/agents/*.md", ".config/agents/R?LES.md", ".config/agents/[R]ULES.md"} {
 		if _, err := (ConfigTargets{Allow: []string{wide, ".config/agents"}}).admit(ruleTarget); !errors.Is(err, ErrRefused) {
 			t.Fatalf("allow %s: %v", wide, err)
 		}
@@ -223,7 +229,12 @@ func TestConfigWritesOnlyOverTheContentExpected(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	other := ConfigState{SHA256: hashOf([]byte("marker-c0ffee other\n"))}
+	read, err := d.state()
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := *read.bare()
+	other.SHA256 = hashOf([]byte("marker-c0ffee other\n"))
 	if err := d.replace(".swap", []byte(newRule), 0o640, other); !errors.Is(err, ErrRefused) {
 		t.Fatalf("replace over other content: %v", err)
 	}
@@ -248,7 +259,7 @@ func TestConfigWritesOnlyOverTheContentExpected(t *testing.T) {
 		t.Fatalf("the swap file became %q %v", b, err)
 	}
 	os.Remove(filepath.Join(home, ".config/agents/.swap"))
-	if err := d.replace(".swap", []byte(newRule), 0o640, ConfigState{SHA256: hashOf([]byte(oldRule))}); err != nil {
+	if err := d.replace(".swap", []byte(newRule), 0o640, *read.bare()); err != nil {
 		t.Fatal(err)
 	}
 	if got, mode := readTarget(t, home); got != newRule || mode != 0o640 {
@@ -607,6 +618,7 @@ func TestABuildForAConfigurationCaseMountsItsTargetsClone(t *testing.T) {
 	r := localRunner(t, st)
 	r.Ship = configShip(t, st, home)
 	r.Ship.Dir, r.Ship.ConfigTargets.Enabled = r.Dir, false
+	r.pass = &passInputs{}
 	c := testingCase(t, st)
 	raw, _ := json.Marshal(map[string]any{"repo": "", "config": ruleTarget, "episode": c.Episode})
 	if err := st.CaseNote(ctx, c.ID, repoAction, string(raw), "fixture"); err != nil {
@@ -616,6 +628,11 @@ func TestABuildForAConfigurationCaseMountsItsTargetsClone(t *testing.T) {
 		t.Fatalf("pick: %q %v", step, err)
 	}
 	run := store.LoopRun{ID: "fixture-build", Case: c.ID, Dir: filepath.Join(r.Dir, "runs", "fixture-build"), CaseEpisode: c.Episode}
+	// a target the run's copy left out is not what the run saw
+	if _, err := r.buildPackage(ctx, c, run); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "left out") {
+		t.Fatalf("a target outside the copy: %v", err)
+	}
+	r.pass.manifest.Configuration.Files = []ConfigFile{{Path: ruleTarget, Root: ".config/agents"}}
 	p, err := r.buildPackage(ctx, c, run)
 	if err != nil || p.Kind != KindConfig || p.Work != filepath.Join(run.Dir, "work") {
 		t.Fatalf("build package: %+v %v", p, err)
@@ -737,5 +754,251 @@ func TestTheMeasureStepHoldsAConfigurationRollbackWhileTheSwitchIsOff(t *testing
 	}
 	if got, _ := readTarget(t, home); got != oldRule {
 		t.Fatalf("the rollback left %q", got)
+	}
+}
+
+// A chmod by the owner after review is a change of the file: the landing does not undo it, it builds again on the file
+// as it is now.
+func TestALandingNeverRevertsTheOwnersChmod(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	home := fakeHome(t)
+	s := configShip(t, st, home)
+	c := testingCase(t, st)
+	reviewedConfig(t, s, st, c)
+	if err := os.Chmod(filepath.Join(home, ruleTarget), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, err := s.Land(ctx, c.ID)
+	if !errors.Is(err, ErrRefused) || p.State != Revising || !p.RefreshBase {
+		t.Fatalf("land after a chmod: %+v %v", p.State, err)
+	}
+	if got, mode := readTarget(t, home); got != oldRule || mode != 0o600 {
+		t.Fatalf("the file became %q %v", got, mode)
+	}
+}
+
+// The owner's rollback and the in-effect check read a landed change's own target after the owner narrowed allow; the
+// loop's own rollback holds then.
+func TestANarrowedAllowLeavesTheOwnersRollback(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	home := fakeHome(t)
+	s := configShip(t, st, home)
+	c := testingCase(t, st)
+	reviewedConfig(t, s, st, c)
+	p, err := s.Land(ctx, c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.ConfigTargets.Allow = nil
+	if _, why, err := s.InEffect(ctx, &p); err != nil || why != "" {
+		t.Fatalf("in effect after allow narrowed: %q %v", why, err)
+	}
+	if hold := s.mayApply(p); !strings.Contains(hold, "not admitted") {
+		t.Fatalf("the loop's hold: %q", hold)
+	}
+	if _, err := s.rollBackLocked(ctx, c.ID, "no effect"); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "waits") {
+		t.Fatalf("the loop rolled back after allow narrowed: %v", err)
+	}
+	if p, err = s.RollBack(ctx, c.ID, "the owner undoes it"); err != nil || p.State != RolledBack {
+		t.Fatalf("the owner's rollback: %+v %v", p.State, err)
+	}
+	if got, _ := readTarget(t, home); got != oldRule {
+		t.Fatalf("restored %q", got)
+	}
+}
+
+// A file whose case was closed by hand frees its target; one being prepared holds it.
+func TestAClosedCaseFreesItsTargetAndPreparationsAreSerialized(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	home := fakeHome(t)
+	s := configShip(t, st, home)
+	c := testingCase(t, st)
+	if _, err := s.PrepareConfig(ctx, c.ID, ruleTarget); err != nil {
+		t.Fatal(err)
+	}
+	other := testingCase2(t, st)
+	unlock, err := s.lockTarget(ruleTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PrepareConfig(ctx, other.ID, ruleTarget); !held(err) || !strings.Contains(err.Error(), "another preparation") {
+		t.Fatalf("a concurrent preparation: %v", err)
+	}
+	unlock()
+	if _, err := s.PrepareConfig(ctx, other.ID, ruleTarget); !held(err) {
+		t.Fatalf("a live case's package: %v", err)
+	}
+	if _, err := st.CloseCase(ctx, c.ID, store.NotWorthIt, "", "marker-c0ffee", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PrepareConfig(ctx, other.ID, ruleTarget); err != nil {
+		t.Fatalf("after the case closed by hand: %v", err)
+	}
+}
+
+// A landing whose exchange fails for want of support, or whose file went away, holds as proposed and spends no
+// review round; a stuck landing the owner abandons returns to its build.
+func TestALandingHoldsOrIsAbandonedWithoutAReviewRound(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	home := fakeHome(t)
+	s := configShip(t, st, home)
+	c := testingCase(t, st)
+	reviewedConfig(t, s, st, c)
+	exchange = func(int, string, int, string, uint) error { return unix.EINVAL }
+	p, err := s.Land(ctx, c.ID)
+	exchange = unix.Renameat2
+	if !held(err) || p.State != Proposed || p.RefreshBase || !p.Clean() {
+		t.Fatalf("no exchange support: %+v %v", p.State, err)
+	}
+	// a crash after the journal, then the owner's edit: the landing waits for him, and he abandons it
+	s.ConfigStage = func(stage string) error {
+		if stage == "journaled" {
+			return errors.New("crash")
+		}
+		return nil
+	}
+	s.Land(ctx, c.ID)
+	s.ConfigStage = nil
+	write(t, filepath.Join(home, ruleTarget), "marker-c0ffee the owner's edit\n")
+	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "abandon") {
+		t.Fatalf("stuck: %v", err)
+	}
+	if p, err = s.AbandonLanding(ctx, c.ID, "marker-c0ffee keep my edit"); err != nil || p.State != Revising || !p.RefreshBase {
+		t.Fatalf("abandon: %+v %v", p.State, err)
+	}
+	if got, _ := readTarget(t, home); got != "marker-c0ffee the owner's edit\n" {
+		t.Fatalf("abandon wrote %q", got)
+	}
+}
+
+// A forced rollback of a landed change whose file was deleted is refused before its journal.
+func TestAForcedRollbackOfAGoneFileIsRefused(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	c2 := testingCase(t, st)
+	home2 := fakeHome(t)
+	s2 := configShip(t, st, home2)
+	reviewedConfig(t, s2, st, c2)
+	if _, err := s2.Land(ctx, c2.ID); err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(filepath.Join(home2, ruleTarget))
+	if _, err := s2.RollBackForced(ctx, c2.ID, "gone"); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "gone") {
+		t.Fatalf("forced over a gone file: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(s2.pkgDir(c2.ID), configRollback)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("journaled before refusing: %v", err)
+	}
+}
+
+// A swap file left by an interrupted exchange that holds someone else's edit, while the target holds the change, is
+// exchanged back: the edit is the file's again, and the landing goes back to its build.
+func TestSettleExchangesBackADisplacedEdit(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	home := fakeHome(t)
+	s := configShip(t, st, home)
+	c := testingCase(t, st)
+	reviewedConfig(t, s, st, c)
+	s.ConfigStage = func(stage string) error {
+		if stage == "written" {
+			return errors.New("crash")
+		}
+		return nil
+	}
+	s.Land(ctx, c.ID)
+	s.ConfigStage = nil
+	edit := "marker-c0ffee an edit the exchange displaced\n"
+	write(t, filepath.Join(home, ".config/agents", swapName(c.ID)), edit)
+	p, err := s.Land(ctx, c.ID)
+	if !errors.Is(err, ErrRefused) || p.State != Revising || !p.RefreshBase {
+		t.Fatalf("resume over a displaced edit: %+v %v", p.State, err)
+	}
+	if got, _ := readTarget(t, home); got != edit {
+		t.Fatalf("the file holds %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config/agents", swapName(c.ID))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the swap file stays: %v", err)
+	}
+}
+
+// The loop's resumed rollback waits while it may not write: at a pass's selection and in the measure step.
+func TestAResumedConfigurationRollbackWaitsForTheSwitch(t *testing.T) {
+	m := measuredCase(t)
+	home := fakeHome(t)
+	write(t, filepath.Join(home, ruleTarget), newRule)
+	p, _, _ := m.r.Ship.Load(m.c.ID)
+	p.Kind, p.Target, p.TargetLanded, p.Repo, p.Dir, p.PR, p.State = KindConfig, ruleTarget, hashOf([]byte(newRule)), "", "", "", RollingBack
+	if err := m.r.Ship.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	m.r.Ship.Live, m.r.Ship.ConfigTargets = true, ConfigTargets{Enabled: false, Allow: []string{".config/agents"}, Home: home}
+	m.r.Families = []string{"failures"}
+	if got := m.measure(t, Options{}); got.Status != "held" || !strings.Contains(got.Why, "waits") {
+		t.Fatalf("the measure step: %+v", got)
+	}
+	if _, _, why, err := m.r.pick(context.Background(), "failures", m.c.ID, false); err != nil || !strings.Contains(why, m.c.ID+"'s rollback waits") {
+		t.Fatalf("the pick: %q %v", why, err)
+	}
+	if got, _ := readTarget(t, home); got != newRule {
+		t.Fatalf("a held rollback wrote %q", got)
+	}
+}
+
+// A target with extended attributes (an ACL, a label) is refused: a rewrite would drop them.
+func TestATargetWithExtendedAttributesIsRefused(t *testing.T) {
+	home := fakeHome(t)
+	if err := syscall.Setxattr(filepath.Join(home, ruleTarget), "user.marker", []byte("c0ffee"), 0); err != nil {
+		t.Skipf("no user extended attributes here: %v", err)
+	}
+	d, err := (ConfigTargets{Home: home, Allow: []string{".config/agents"}}).open(ruleTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.state(); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "extended attributes") {
+		t.Fatalf("a target with an attribute: %v", err)
+	}
+}
+
+// The rewritten file keeps the group the file had, not the caller's primary one.
+func TestALandingKeepsTheFilesGroup(t *testing.T) {
+	groups, err := os.Getgroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := -1
+	for _, g := range groups {
+		if g != os.Getgid() {
+			other = g
+			break
+		}
+	}
+	if other < 0 {
+		t.Skip("the caller has no second group")
+	}
+	home := fakeHome(t)
+	if err := os.Chown(filepath.Join(home, ruleTarget), -1, other); err != nil {
+		t.Skip(err)
+	}
+	d, err := (ConfigTargets{Home: home, Allow: []string{".config/agents"}}).open(ruleTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	cur, err := d.state()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.replace(".swap", []byte(newRule), cur.Mode, cur); err != nil {
+		t.Fatal(err)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Stat(filepath.Join(home, ruleTarget), &st); err != nil || int(st.Gid) != other {
+		t.Fatalf("the group became %d (%v), not %d", st.Gid, err, other)
 	}
 }

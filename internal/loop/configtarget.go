@@ -61,6 +61,17 @@ func dropIn(name string) bool {
 
 // admit says whether a file is a configuration target: its clean name, or the refusal.
 func (ct ConfigTargets) admit(name string) (string, error) {
+	name, err := admitStructural(name)
+	if err != nil {
+		return "", err
+	}
+	return ct.allowed(name)
+}
+
+// admitStructural is a target's checks without the allowlist: its clean name, a root that holds targets, the
+// denylist and the copy's allowlist. A landed change's own target is read so, for the owner's rollback and its
+// in-effect check, after the owner narrowed allow.
+func admitStructural(name string) (string, error) {
 	name, err := configTargetName(name)
 	if err != nil {
 		return "", err
@@ -75,6 +86,11 @@ func (ct ConfigTargets) admit(name string) (string, error) {
 	if !configPathAllowed(root, name, false) {
 		return "", refused("%s is no configuration target: not configuration", name)
 	}
+	return name, nil
+}
+
+// allowed says whether allow names a structurally admitted target.
+func (ct ConfigTargets) allowed(name string) (string, error) {
 	if len(ct.Allow) == 0 {
 		return "", refused("loop.config_targets.allow names no file: no configuration target is admitted")
 	}
@@ -102,16 +118,23 @@ type ConfigState struct {
 	Absent  bool   `json:"absent,omitempty"`
 	SHA256  string `json:"sha256,omitempty"`
 	Mode    uint32 `json:"mode,omitempty"`
+	Gid     uint32 `json:"gid,omitempty"`
 	Content []byte `json:"content,omitempty"`
 }
+
+// errTargetDrift marks a refusal because the target's content or mode is not what the step read.
+var errTargetDrift = errors.New("the target changed")
 
 // targetUID is the owner a target's file must have: the caller (a test names another).
 var targetUID = os.Getuid
 
 func (c ConfigState) same(o ConfigState) bool { return c.Absent == o.Absent && c.SHA256 == o.SHA256 }
 
+// sameFile is same with the mode too: a chmod by the owner is a change the loop does not undo.
+func (c ConfigState) sameFile(o ConfigState) bool { return c.same(o) && c.Mode == o.Mode }
+
 func (c ConfigState) bare() *ConfigState {
-	return &ConfigState{Absent: c.Absent, SHA256: c.SHA256, Mode: c.Mode}
+	return &ConfigState{Absent: c.Absent, SHA256: c.SHA256, Mode: c.Mode, Gid: c.Gid}
 }
 
 func hashOf(b []byte) string {
@@ -148,6 +171,19 @@ func (ct ConfigTargets) open(name string) (*targetDir, error) {
 	if err != nil {
 		return nil, err
 	}
+	return ct.openAdmitted(name)
+}
+
+// openStructural opens a landed change's own target without the allowlist (admitStructural).
+func (ct ConfigTargets) openStructural(name string) (*targetDir, error) {
+	name, err := admitStructural(name)
+	if err != nil {
+		return nil, err
+	}
+	return ct.openAdmitted(name)
+}
+
+func (ct ConfigTargets) openAdmitted(name string) (*targetDir, error) {
 	if ct.Home == "" || !filepath.IsAbs(ct.Home) {
 		return nil, refused("configuration targets need the real home")
 	}
@@ -208,6 +244,10 @@ func (d *targetDir) read(file string) (ConfigState, error) {
 	if again.Ino != st.Ino || again.Dev != st.Dev || again.Mode&unix.S_IFMT != unix.S_IFREG {
 		return ConfigState{}, refused("%s changed while it was read", d.name)
 	}
+	// a rewrite keeps the mode and the group, not an ACL, a label or other extended attributes: such a file is no target
+	if n, err := unix.Flistxattr(fd, nil); err == nil && n > 0 {
+		return ConfigState{}, refused("%s carries extended attributes (an ACL, a label or other metadata) a rewrite would drop", d.name)
+	}
 	b, err := io.ReadAll(io.LimitReader(f, MaxConfigFileBytes+1))
 	if err != nil {
 		return ConfigState{}, err
@@ -215,7 +255,7 @@ func (d *targetDir) read(file string) (ConfigState, error) {
 	if reason := targetText(d.root, b); reason != "" {
 		return ConfigState{}, refused("%s is no configuration text: %s", d.name, reason)
 	}
-	return ConfigState{SHA256: hashOf(b), Mode: uint32(again.Mode & 0o777), Content: b}, nil
+	return ConfigState{SHA256: hashOf(b), Mode: uint32(again.Mode & 0o777), Gid: again.Gid, Content: b}, nil
 }
 
 func (d *targetDir) state() (ConfigState, error) { return d.read(d.base) }
@@ -244,7 +284,7 @@ func (d *targetDir) settle(swap string, ours, expected ConfigState) error {
 		if err := d.unlinkIf(swap, ours.SHA256); err != nil {
 			return err
 		}
-		return refused("%s had changed: its content is back and the change is not applied", d.name)
+		return errors.Join(refused("%s had changed: its content is back and the change is not applied", d.name), errTargetDrift)
 	}
 	return refused("an interrupted write left %s beside %s: the owner decides", swap, d.name)
 }
@@ -275,18 +315,18 @@ func (d *targetDir) replace(swap string, content []byte, mode uint32, expect Con
 	}
 	f := os.NewFile(uintptr(fd), swap)
 	_, err = f.Write(content)
-	err = errors.Join(err, f.Chmod(os.FileMode(mode&0o777)), f.Sync(), f.Close())
+	err = errors.Join(err, f.Chown(-1, int(expect.Gid)), f.Chmod(os.FileMode(mode&0o777)), f.Sync(), f.Close())
 	if err != nil {
 		unix.Unlinkat(d.fd, swap, 0) // created exclusively by this step and never exchanged
 		return err
 	}
 	ours := hashOf(content)
-	drift := refused("%s changed since it was read: the change is not applied", d.name)
+	drift := errors.Join(refused("%s changed since it was read: the change is not applied", d.name), errTargetDrift)
 	if err := exchange(d.fd, swap, d.fd, d.base, unix.RENAME_EXCHANGE); err != nil {
 		cleanup := d.unlinkIf(swap, ours)
 		switch err {
 		case unix.ENOENT:
-			return errors.Join(drift, cleanup)
+			return errors.Join(refused("%s is gone: the change is not applied", d.name), cleanup)
 		case unix.EINVAL:
 			return errors.Join(refused("the file system of %s cannot exchange files atomically", d.name), cleanup)
 		}
@@ -382,10 +422,19 @@ func readRecord(dir, name string, v any) (bool, error) {
 // configAuthority checks a configuration package's target again: admitted now, and readable under the home without a
 // link.
 func (s *Ship) configAuthority(p Package) (*targetDir, error) {
+	return s.configTarget(p, false)
+}
+
+// configTarget opens a package's target: admitted by allow, or, structural, by the checks without it.
+func (s *Ship) configTarget(p Package, structural bool) (*targetDir, error) {
 	if p.Target == "" {
 		return nil, refused("the configuration package names no target")
 	}
-	d, err := s.ConfigTargets.open(p.Target)
+	open := s.ConfigTargets.open
+	if structural {
+		open = s.ConfigTargets.openStructural
+	}
+	d, err := open(p.Target)
 	if err != nil {
 		if errors.Is(err, ErrRefused) {
 			return nil, &shipHold{err: err}
@@ -404,6 +453,9 @@ func (s *Ship) mayApply(p Package) string {
 		return "configuration targets are off (loop.config_targets.enabled): the loop proposes and reviews configuration changes and applies none"
 	case !s.Live:
 		return "the loop is not live (loop.live): it proposes and does not land"
+	}
+	if _, err := s.ConfigTargets.admit(p.Target); err != nil {
+		return "its target is not admitted now: " + strings.TrimPrefix(err.Error(), ErrRefused.Error()+": ")
 	}
 	return ""
 }
@@ -441,7 +493,12 @@ func (s *Ship) PrepareConfig(ctx context.Context, caseID, target string) (Packag
 	if base.Absent {
 		return Package{}, refused("%s is not there: a configuration change edits a file that exists", d.name)
 	}
-	if other, err := s.targetBusy(c.ID, d.name); err != nil {
+	unlockTarget, err := s.lockTarget(d.name)
+	if err != nil {
+		return Package{}, err
+	}
+	defer unlockTarget()
+	if other, err := s.targetBusy(ctx, c.ID, d.name); err != nil {
 		return Package{}, err
 	} else if other != "" {
 		return Package{}, &shipHold{err: refused("%s is the target of case %s's change, which is not done: the loop leaves it alone", d.name, other)}
@@ -593,7 +650,7 @@ func (s *Ship) configContent(ctx context.Context, p Package, treeish string) ([]
 	fields := strings.Fields(entry)
 	switch {
 	case len(fields) < 3:
-		return nil, 0, refused("the change deletes its target: a configuration change edits or creates it")
+		return nil, 0, refused("the change deletes its target: a configuration change edits it")
 	case fields[1] != "blob" || fields[0] != "100644" && fields[0] != "100755":
 		return nil, 0, refused("the target is no regular file in the change")
 	}
@@ -652,7 +709,7 @@ func (s *Ship) landConfig(ctx context.Context, p Package) (Package, error) {
 	if err != nil {
 		return p, err
 	}
-	if p.TargetBase == nil || !cur.same(*p.TargetBase) {
+	if p.TargetBase == nil || !cur.sameFile(*p.TargetBase) {
 		p.State, p.RefreshBase = Revising, true
 		if err := s.saveAuthorized(ctx, &p); err != nil {
 			return p, err
@@ -693,7 +750,7 @@ func (s *Ship) landConfig(ctx context.Context, p Package) (Package, error) {
 		return p, err
 	}
 	if err := d.settle(swapName(p.Case), j.New, j.Old); err != nil {
-		return p, err
+		return s.landingRefused(ctx, p, err)
 	}
 	if err := d.replace(swapName(p.Case), j.New.Content, j.New.Mode, j.Old); err != nil {
 		return s.landingRefused(ctx, p, err)
@@ -704,16 +761,78 @@ func (s *Ship) landConfig(ctx context.Context, p Package) (Package, error) {
 	return s.finishConfigLanding(ctx, p, j)
 }
 
-// landingRefused takes a landing the file refused (it changed under the step) back to its proposal, journal and all.
+// landingRefused takes a landing the file refused, with nothing written, out of Landing and drops its journal: a file
+// whose content or mode changed (drift) sends the package back to its build on the file as it is now; any other
+// refusal (no atomic exchange here, the file gone, a leftover beside it) holds it as proposed, with a case note, and
+// spends no review round. An error that is no refusal keeps the journal and the Landing state.
 func (s *Ship) landingRefused(ctx context.Context, p Package, cause error) (Package, error) {
 	if !errors.Is(cause, ErrRefused) {
 		return p, cause
 	}
-	p.State, p.LandingHead, p.RefreshBase = Revising, "", true
+	if errors.Is(cause, errTargetDrift) {
+		p.State, p.LandingHead, p.RefreshBase = Revising, "", true
+	} else {
+		p.State, p.LandingHead = Proposed, ""
+		cause = &shipHold{err: cause}
+		if err := s.runner().caseNoteOnce(ctx, p.Case, "not landed", cause.Error()); err != nil {
+			return p, errors.Join(cause, err)
+		}
+	}
 	if err := os.Remove(filepath.Join(s.pkgDir(p.Case), configJournal)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return p, errors.Join(cause, err)
 	}
 	return p, errors.Join(cause, s.saveAuthorized(ctx, &p))
+}
+
+// AbandonLanding is the owner's way out of a landing that waits for him: one whose file holds neither its old nor its
+// new content. The file is left as it is; the journal goes and the package returns to its build on the file as it is
+// now. A file that holds the change is landed, not abandoned: land it, or roll it back once it is.
+func (s *Ship) AbandonLanding(ctx context.Context, caseID, why string) (Package, error) {
+	ctx = s.gitContext(shipContext(ctx, caseID))
+	unlock, err := s.lock(ctx, caseID)
+	if err != nil {
+		return Package{}, err
+	}
+	defer unlock()
+	p, ok, err := s.Load(caseID)
+	if err != nil {
+		return p, err
+	}
+	if !ok || p.Kind != KindConfig || p.State != Landing {
+		return p, refused("case %s has no configuration landing to abandon", caseID)
+	}
+	if strings.TrimSpace(why) == "" {
+		return p, refused("abandoning a landing needs its why")
+	}
+	var j ConfigJournal
+	if ok, err := readRecord(s.pkgDir(p.Case), configJournal, &j); err != nil {
+		return p, err
+	} else if ok {
+		d, err := s.configTarget(p, true)
+		if err != nil {
+			return p, err
+		}
+		cur, err := d.state()
+		d.Close()
+		if err != nil {
+			return p, err
+		}
+		if cur.same(j.New) {
+			return p, refused("%s holds the change: land it (it finishes from its journal), then roll it back if it should go", p.Target)
+		}
+	}
+	clean, err := Redact(ctx, why)
+	if err != nil {
+		return p, err
+	}
+	p.State, p.LandingHead, p.RefreshBase = Revising, "", true
+	if err := os.Remove(filepath.Join(s.pkgDir(p.Case), configJournal)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return p, err
+	}
+	if err := s.saveAuthorized(ctx, &p); err != nil {
+		return p, err
+	}
+	return p, s.Store.CaseNote(cleanedNote(ctx), p.Case, "landing abandoned", clean, s.Actor)
 }
 
 // resumeConfigLanding finishes a landing a crash interrupted, from its journal: the file holds the new content (done),
@@ -744,6 +863,9 @@ func (s *Ship) resumeConfigLanding(ctx context.Context, p Package) (Package, err
 	}
 	defer d.Close()
 	if err := d.settle(swapName(p.Case), j.New, j.Old); err != nil {
+		if errors.Is(err, errTargetDrift) {
+			return s.landingRefused(ctx, p, err)
+		}
 		return p, err
 	}
 	cur, err := d.state()
@@ -752,12 +874,12 @@ func (s *Ship) resumeConfigLanding(ctx context.Context, p Package) (Package, err
 	}
 	switch {
 	case cur.same(j.New):
-	case cur.same(j.Old):
+	case cur.sameFile(j.Old):
 		if err := d.replace(swapName(p.Case), j.New.Content, j.New.Mode, j.Old); err != nil {
 			return s.landingRefused(ctx, p, err)
 		}
 	default:
-		return p, refused("%s holds neither its old nor its new content: the interrupted landing waits for the owner", p.Target)
+		return p, refused("%s holds neither its old nor its new content: the interrupted landing waits for the owner (momentum ship abandon --case %s --why ...)", p.Target, p.Case)
 	}
 	return s.finishConfigLanding(ctx, p, j)
 }
@@ -811,7 +933,8 @@ func (s *Ship) rollBackConfig(ctx context.Context, p Package, why string, force,
 	if !ok || j.Target != p.Target || p.TargetLanded == "" || j.New.SHA256 != p.TargetLanded {
 		return p, refused("the landing's journal of %s is missing or does not match its package: restore it by hand", p.Target)
 	}
-	d, err := s.configAuthority(p)
+	// the owner's rollback reads its own landed target without allow, which he may have narrowed since
+	d, err := s.configTarget(p, owner)
 	if err != nil {
 		return p, err
 	}
@@ -830,6 +953,9 @@ func (s *Ship) rollBackConfig(ctx context.Context, p Package, why string, force,
 		cur, err := d.state()
 		if err != nil {
 			return p, err
+		}
+		if cur.Absent {
+			return p, refused("%s is gone: the rollback restores a file that exists; restore it by hand from the journal", p.Target)
 		}
 		if cur.same(j.Old) {
 			// restored already, by hand or by an earlier step
@@ -864,7 +990,8 @@ func (s *Ship) rollBackConfig(ctx context.Context, p Package, why string, force,
 	switch {
 	case cur.same(j.Old):
 	case cur.same(rb.From):
-		if err := d.replace(swapName(p.Case), j.Old.Content, j.Old.Mode, rb.From); err != nil {
+		// the content from before the change, in the mode the file has now: a rollback never widens it
+		if err := d.replace(swapName(p.Case), j.Old.Content, rb.From.Mode, rb.From); err != nil {
 			return p, err
 		}
 	default:
@@ -882,7 +1009,7 @@ func (s *Ship) rollBackConfig(ctx context.Context, p Package, why string, force,
 
 // configInEffect: a configuration change is in effect while its target holds the landed content.
 func (s *Ship) configInEffect(p *Package) (string, error) {
-	d, err := s.ConfigTargets.open(p.Target)
+	d, err := s.ConfigTargets.openStructural(p.Target)
 	if errors.Is(err, ErrRefused) {
 		return err.Error(), nil
 	}
@@ -911,9 +1038,10 @@ func (s *Ship) configStage(stage string) error {
 	return nil
 }
 
-// targetBusy names another case whose configuration package targets the same file and is not done (rolled back or
-// kept): two changes to one file would overwrite each other and confound both measurements.
-func (s *Ship) targetBusy(self, target string) (string, error) {
+// targetBusy names another case whose configuration package on the same file is not done: one whose change is in the
+// file or on its way (landing, landed, rolling back), or one of a live case (not closed, not merged) that is neither
+// rolled back nor kept. Two changes to one file would overwrite each other and confound both measurements.
+func (s *Ship) targetBusy(ctx context.Context, self, target string) (string, error) {
 	entries, err := os.ReadDir(filepath.Join(s.Dir, "packages"))
 	if errors.Is(err, os.ErrNotExist) {
 		return "", nil
@@ -929,11 +1057,48 @@ func (s *Ship) targetBusy(self, target string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if ok && p.Kind == KindConfig && p.Target == target && p.State != RolledBack && p.State != Kept {
+		if !ok || p.Kind != KindConfig || p.Target != target {
+			continue
+		}
+		switch p.State {
+		case Landing, Landed, RollingBack:
+			return p.Case, nil
+		case RolledBack, Kept:
+			continue
+		}
+		c, err := s.Store.CaseByID(ctx, p.Case)
+		if errors.Is(err, store.ErrNoCase) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		if c.Status != store.CaseClosed && c.Into == "" {
 			return p.Case, nil
 		}
 	}
 	return "", nil
+}
+
+// lockTarget serializes the preparations of one file's packages, the loop's and the owner's: its busy check and the
+// package it saves are one step.
+func (s *Ship) lockTarget(target string) (func(), error) {
+	dir := filepath.Join(s.Dir, "targets")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, hashOf([]byte(target))+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		f.Close()
+		if err == unix.EWOULDBLOCK {
+			return nil, &shipHold{err: refused("another preparation of %s is running: the loop leaves it alone", target)}
+		}
+		return nil, err
+	}
+	return func() { unix.Flock(int(f.Fd()), unix.LOCK_UN); f.Close() }, nil
 }
 
 // exchange is renameat2; a test injects a failure of the exchange back.

@@ -166,6 +166,9 @@ func AllowEntry(entry string) (string, bool, error) {
 	if err != nil {
 		return "", false, fmt.Errorf("loop.config_targets.allow entry %q: %v", entry, err)
 	}
+	if strings.ContainsAny(name, "*?[") {
+		return "", false, fmt.Errorf("loop.config_targets.allow entry %q is a pattern: name exact files or directories (a trailing /** is the directory)", entry)
+	}
 	root := RootOf(name)
 	switch {
 	case root == "":
