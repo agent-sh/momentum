@@ -394,3 +394,24 @@ func TestTheRatesPerCauseDivideByTheComparedCauses(t *testing.T) {
 		t.Fatalf("the rate per cause reached divides by %d causes: $%v", loop.ComparedReached, loop.USDPerReached)
 	}
 }
+
+// A task may name the harness its cause involves; a mistyped key is still refused.
+func TestAGoldenTaskMayNameItsHarness(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "golden.jsonl")
+	line := func(extra string) string {
+		return `{"id":"a","family":"failures","case_title":"x keeps failing","cutoff":"2026-03-02T10:00:00Z","symptom":{"query":{"event_ids":["e1"]}},"root_cause":"a cause","key_facts":["f"]` + extra + "}\n"
+	}
+	write(t, p, line(`,"harness":"codex"`))
+	ts, err := ReadGolden(p)
+	if err != nil || len(ts) != 1 || ts[0].Harness != "codex" {
+		t.Fatalf("a task with a harness: %+v %v", ts, err)
+	}
+	write(t, p, line(`,"difficulty":"hard","fix":"x","verification":"y","evidence":["z"],"reach":"store","reach_detail":{}`))
+	if ts, err = ReadGolden(p); err != nil || len(ts) != 1 {
+		t.Fatalf("a task with the golden file's own notes: %v", err)
+	}
+	write(t, p, line(`,"harnes":"codex"`))
+	if _, err := ReadGolden(p); err == nil {
+		t.Fatal("a mistyped key was read")
+	}
+}

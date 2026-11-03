@@ -25,10 +25,12 @@ import (
 // GoldenTask is one problem of the golden set, as the machine keeps it (never in a repository).
 type GoldenTask struct {
 	ID        string `json:"id"`
+	Harness   string `json:"harness"` // the harness the cause involves (claude, codex, hermes, ...): a label, not an input
 	Family    string `json:"family"`
 	Title     string `json:"title"`
 	CaseTitle string `json:"case_title"` // the symptom alone, as a detector would title it
 	Symptom   struct {
+		Text  string `json:"text"` // the owner's note on the symptom: no trial sees it
 		Query struct {
 			EventIDs []string `json:"event_ids"`
 		} `json:"query"`
@@ -41,6 +43,11 @@ type GoldenTask struct {
 	KeyFacts   []string  `json:"key_facts"`
 	WrongPaths []string  `json:"wrong_paths"`
 }
+
+// goldenNotes are the golden file's own notes on a task (how hard it is, its fix, how the cause was verified, the evidence
+// and the reach it was checked for), kept beside the task by the owner. The evaluator reads none of them and no trial
+// sees them; a key outside these and the task's own is a mistyped key and is refused.
+var goldenNotes = [...]string{"difficulty", "fix", "verification", "evidence", "reach", "reach_detail"}
 
 var slugRe = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
@@ -64,19 +71,30 @@ func ParseGolden(raw []byte, path string) ([]GoldenTask, error) {
 			continue
 		}
 		var t GoldenTask
-		object, err := parseObject(sc.Bytes(), false, "id", "family", "title", "case_title", "symptom", "cutoff",
-			"repo", "repo_path", "pre_fix_commit", "root_cause", "key_facts", "wrong_paths")
+		object, err := parseObject(sc.Bytes(), false, "id", "harness", "family", "title", "case_title", "symptom", "cutoff",
+			"repo", "repo_path", "pre_fix_commit", "root_cause", "key_facts", "wrong_paths",
+			// the golden file's own notes on a task (how hard, the fix, how it was verified, the evidence and the reach
+			// it was checked for): the owner keeps them beside the task; the evaluator reads none and no trial sees them
+			goldenNotes[0], goldenNotes[1], goldenNotes[2], goldenNotes[3], goldenNotes[4], goldenNotes[5])
 		if err != nil {
 			return nil, fmt.Errorf("%s:%d: %w", path, n, err)
 		}
-		symptom, err := exactObject(object["symptom"], "query")
+		symptom, err := exactObject(object["symptom"], "text", "query")
 		if err != nil {
 			return nil, fmt.Errorf("%s:%d: symptom: %w", path, n, err)
 		}
 		if _, err := exactObject(symptom["query"], "event_ids"); err != nil {
 			return nil, fmt.Errorf("%s:%d: query: %w", path, n, err)
 		}
-		decoder := json.NewDecoder(bytes.NewReader(sc.Bytes()))
+		// the owner's notes beside a task are dropped before the task is read: nothing of them is kept
+		for _, note := range goldenNotes {
+			delete(object, note)
+		}
+		kept, err := json.Marshal(object)
+		if err != nil {
+			return nil, fmt.Errorf("%s:%d: %w", path, n, err)
+		}
+		decoder := json.NewDecoder(bytes.NewReader(kept))
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&t); err != nil {
 			return nil, fmt.Errorf("%s:%d: %w", path, n, err)

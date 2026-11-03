@@ -165,8 +165,9 @@ func (e *Eval) buildTask(ctx context.Context, in *taskInputs, t GoldenTask, repo
 		return err
 	}
 	records := filepath.Join(in.dir, "records")
-	in.manifest.Records, err = Records(ctx, RecordsOptions{Store: in.store, IDs: t.Symptom.Query.EventIDs, Units: FindUnits(texts...),
-		Destination: records, Binary: e.programs.momentum, Home: home, AsOf: end, Env: CleanEnv(nil)})
+	in.manifest.Records, err = Records(ctx, RecordsOptions{Store: in.store, IDs: t.Symptom.Query.EventIDs,
+		Units:       UnionUnits(FindUnits(texts...), ActiveUnits(ctx, e.Runner.Inputs.Home, end.Add(-ActiveUnitWindow), end)),
+		Destination: records, Binary: e.programs.momentum, Home: home, AsOf: end, Env: CleanEnv(nil, scrubberDir())})
 	if err != nil {
 		return err
 	}
