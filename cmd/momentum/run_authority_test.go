@@ -110,3 +110,26 @@ func TestAnEventsRecordIsReadOnlyFromAFile(t *testing.T) {
 		t.Fatal("evidence show waited on a pipe")
 	}
 }
+
+// --bytes keeps the end of a unit's log, scrubbed whole first and cut at a line start, with the bound named.
+func TestAUnitsLogIsClippedToItsEnd(t *testing.T) {
+	fakeScrubber(t)
+	bin := t.TempDir()
+	log := filepath.Join(t.TempDir(), "log.txt")
+	var b strings.Builder
+	for i := 0; i < 400; i++ {
+		b.WriteString("2026-01-01T00:00:00 line-" + strings.Repeat("x", 20) + " n" + strings.Repeat("9", i%5) + "\n")
+	}
+	b.WriteString("LAST-LINE-marker-7f3a\n")
+	os.WriteFile(log, []byte(b.String()), 0600)
+	os.WriteFile(filepath.Join(bin, "systemctl"), []byte("#!/bin/sh\necho state-header\n"), 0700)
+	os.WriteFile(filepath.Join(bin, "journalctl"), []byte("#!/bin/sh\ncat '"+log+"'\n"), 0700)
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	code, out, errOut := momentum("evidence", "unit", "fixture.service", "--bytes", "2000")
+	if code != 0 || !strings.Contains(out, "LAST-LINE-[masked]") || strings.Contains(out, "state-header") || len(out) > 2100 || !strings.HasPrefix(out, "(the last ") {
+		t.Fatalf("clipped unit log: %d len=%d %q %s", code, len(out), out[:min(len(out), 80)], errOut)
+	}
+	if code, out, _ := momentum("evidence", "unit", "fixture.service"); code != 0 || !strings.Contains(out, "state-header") {
+		t.Fatalf("unclipped unit log: %d", code)
+	}
+}

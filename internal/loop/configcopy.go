@@ -86,6 +86,7 @@ type ConfigManifest struct {
 	CountsByRoot    map[string]int `json:"counts_by_root"`
 	Bytes           int            `json:"bytes"` // includes MANIFEST.txt
 	Skipped         []ConfigSkip   `json:"skipped"`
+	SkippedOmitted  int            `json:"skipped_omitted,omitempty"` // skipped paths beyond the listed ones
 	SkippedByReason map[string]int `json:"skipped_by_reason"`
 	Leaks           []string       `json:"leaks,omitempty"`
 	Canary          bool           `json:"canary"`
@@ -122,9 +123,10 @@ func ConfigCopy(ctx context.Context, o ConfigCopyOptions) (m ConfigManifest, err
 	defer home.Close()
 	m = ConfigManifest{CountsByRoot: map[string]int{}, SkippedByReason: map[string]int{}, Canary: true}
 	var candidates []configCandidate
-	budget, capped := 0, false
+	capped := false
 	for _, root := range configRoots {
 		m.CountsByRoot[root] = 0
+		rootBytes := 0 // what this root has collected: a root cannot fill memory, whatever it holds
 		// Validate every live path component before Git may enter the root.
 		link := false
 		for p := root; p != "."; p = filepath.Dir(p) {
@@ -204,15 +206,18 @@ func ConfigCopy(ctx context.Context, o ConfigCopyOptions) (m ConfigManifest, err
 				m.skip(name, reason)
 				continue
 			}
-			if budget+len(b) > MaxConfigBytes {
-				capped = true
+			if rootBytes+len(b) > MaxConfigBytes {
 				m.skip(name, "total bytes")
 				continue
 			}
-			budget += len(b)
+			rootBytes += len(b)
 			candidates = append(candidates, configCandidate{name, root, string(b)})
 		}
 	}
+	// The cap is shared by the roots, not taken by the first: a root that wants less than its equal share keeps all it
+	// wants and the rest is divided among the others, smallest demand first (a prefix in the fixed order would let one
+	// big tree, a harness's skills, leave the later roots, the agent-sync rules among them, with nothing).
+	candidates = shareConfigCap(candidates, &m)
 	texts := make([]string, len(candidates))
 	for i, candidate := range candidates {
 		texts[i] = candidate.text
@@ -297,8 +302,16 @@ func ConfigCopy(ctx context.Context, o ConfigCopyOptions) (m ConfigManifest, err
 	return m, nil
 }
 
+// MaxConfigSkips is how many skipped paths the manifest lists; the counts by reason cover all of them. A tree of
+// hundreds of thousands of skipped files (logs, caches) would otherwise make the manifest larger than the cap.
+const MaxConfigSkips = 500
+
 func (m *ConfigManifest) skip(path, reason string) {
-	m.Skipped = append(m.Skipped, ConfigSkip{path, reason})
+	if len(m.Skipped) < MaxConfigSkips {
+		m.Skipped = append(m.Skipped, ConfigSkip{path, reason})
+	} else {
+		m.SkippedOmitted++
+	}
 	m.SkippedByReason[reason]++
 }
 
@@ -538,6 +551,17 @@ func configIndex(m ConfigManifest) string {
 	for _, skip := range m.Skipped {
 		fmt.Fprintf(&b, "skip\t%s\t%s\n", skip.Path, skip.Reason)
 	}
+	if m.SkippedOmitted > 0 {
+		fmt.Fprintf(&b, "skip\t(%d more paths, not listed)\t-\n", m.SkippedOmitted)
+	}
+	reasons := make([]string, 0, len(m.SkippedByReason))
+	for reason := range m.SkippedByReason {
+		reasons = append(reasons, reason)
+	}
+	sort.Strings(reasons)
+	for _, reason := range reasons {
+		fmt.Fprintf(&b, "skipped\t%s\t%d\n", reason, m.SkippedByReason[reason])
+	}
 	for _, root := range m.Leaks {
 		fmt.Fprintf(&b, "leak\t%s\n", root)
 	}
@@ -587,4 +611,41 @@ func removeInputTree(dir string) {
 		return err
 	})
 	os.RemoveAll(dir)
+}
+
+// configManifestReserve is set aside of the cap for MANIFEST.txt.
+const configManifestReserve = 256 << 10
+
+// shareConfigCap keeps, per root, the prefix of its candidates (paths sorted) that fits its share of the cap, and counts the
+// rest as skipped for "total bytes". The order of the kept candidates is the fixed root and path order.
+func shareConfigCap(candidates []configCandidate, m *ConfigManifest) []configCandidate {
+	demand := map[string]int{}
+	for _, c := range candidates {
+		demand[c.root] += len(c.text)
+	}
+	var roots []string
+	for _, root := range configRoots {
+		if demand[root] > 0 {
+			roots = append(roots, root)
+		}
+	}
+	sort.SliceStable(roots, func(i, j int) bool { return demand[roots[i]] < demand[roots[j]] })
+	remaining := MaxConfigBytes - configManifestReserve
+	allowed := map[string]int{}
+	for i, root := range roots {
+		share := remaining / (len(roots) - i)
+		allowed[root] = min(demand[root], share)
+		remaining -= allowed[root]
+	}
+	used := map[string]int{}
+	var kept []configCandidate
+	for _, c := range candidates {
+		if used[c.root]+len(c.text) <= allowed[c.root] {
+			used[c.root] += len(c.text)
+			kept = append(kept, c)
+			continue
+		}
+		m.skip(c.path, "total bytes")
+	}
+	return kept
 }

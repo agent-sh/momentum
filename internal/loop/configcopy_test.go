@@ -168,10 +168,11 @@ func TestInputsConfigurationCapOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { removeInputTree(dest) })
-	if m.Bytes > MaxConfigBytes || len(m.Files) != 31 || m.CountsByRoot[".claude/hooks"] != 0 || m.SkippedByReason["total bytes"] != 4 {
-		t.Fatalf("cap/order manifest: files %d bytes %d skipped %v", len(m.Files), m.Bytes, m.SkippedByReason)
+	// the later root keeps its small file; the big root keeps the sorted prefix that fits what is left
+	if m.Bytes > MaxConfigBytes || len(m.Files) != 31 || m.CountsByRoot[".claude/hooks"] != 1 || m.CountsByRoot[".claude/mods"] != 30 || m.SkippedByReason["total bytes"] != 4 {
+		t.Fatalf("cap/order manifest: files %d bytes %d counts %v skipped %v", len(m.Files), m.Bytes, m.CountsByRoot, m.SkippedByReason)
 	}
-	for i, file := range m.Files {
+	for i, file := range m.Files[:30] {
 		if file.Path != filepath.Join(".claude/mods", "file"+strconv.Itoa(100+i)) {
 			t.Fatal("configuration cap did not retain sorted prefix")
 		}
@@ -255,4 +256,70 @@ func containsInputString(items []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// The cap is shared by the roots: a big tree does not leave the later roots with nothing.
+func TestInputsConfigurationCapIsSharedByTheRoots(t *testing.T) {
+	goodInputScrubber(t)
+	home := t.TempDir()
+	for i := range 60 {
+		write(t, filepath.Join(home, ".hermes/skills", "skill"+strconv.Itoa(100+i), "SKILL.md"), strings.Repeat("x", MaxConfigFileBytes-1))
+	}
+	write(t, filepath.Join(home, ".config/agents/rules.md"), "marker-7f3a rules")
+	write(t, filepath.Join(home, ".config/systemd/user/demo.service"), "[Unit]\n")
+	dest := filepath.Join(t.TempDir(), "copy")
+	m, err := ConfigCopy(context.Background(), ConfigCopyOptions{Home: home, Destination: dest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { removeInputTree(dest) })
+	if m.CountsByRoot[".config/agents"] != 1 || m.CountsByRoot[".config/systemd/user"] != 1 || m.CountsByRoot[".hermes"] == 0 ||
+		m.CountsByRoot[".hermes"] >= 60 || m.Bytes > MaxConfigBytes {
+		t.Fatalf("the cap was not shared: %v bytes %d", m.CountsByRoot, m.Bytes)
+	}
+}
+
+// Hundreds of thousands of skipped files do not make the manifest larger than the cap: the listing is bounded and the
+// counts by reason cover them all.
+func TestInputsConfigurationSkipListIsBounded(t *testing.T) {
+	goodInputScrubber(t)
+	home := t.TempDir()
+	for i := range 3 * MaxConfigSkips {
+		write(t, filepath.Join(home, ".claude/hooks", "log"+strconv.Itoa(i)+".log"), "x")
+	}
+	write(t, filepath.Join(home, ".claude/hooks/keep"), "marker-7f3a")
+	dest := filepath.Join(t.TempDir(), "copy")
+	m, err := ConfigCopy(context.Background(), ConfigCopyOptions{Home: home, Destination: dest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { removeInputTree(dest) })
+	if len(m.Skipped) != MaxConfigSkips || m.SkippedOmitted != 2*MaxConfigSkips || m.SkippedByReason["denied name"] != 3*MaxConfigSkips || len(m.Files) != 1 {
+		t.Fatalf("skip list: %d listed, %d omitted, %v, %d files", len(m.Skipped), m.SkippedOmitted, m.SkippedByReason, len(m.Files))
+	}
+}
+
+// A file that cannot be read does not end the copy.
+func TestInputsConfigurationAnUnreadableFileIsSkipped(t *testing.T) {
+	goodInputScrubber(t)
+	home := t.TempDir()
+	write(t, filepath.Join(home, ".claude/hooks/readable"), "marker-7f3a")
+	write(t, filepath.Join(home, ".claude/hooks/locked"), "marker-7f3a")
+	if err := os.Chmod(filepath.Join(home, ".claude/hooks/locked"), 0); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(home, ".claude/hooks/dir/inner"), "marker-7f3a")
+	if err := os.Chmod(filepath.Join(home, ".claude/hooks/dir"), 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(filepath.Join(home, ".claude/hooks/dir"), 0o700) })
+	dest := filepath.Join(t.TempDir(), "copy")
+	m, err := ConfigCopy(context.Background(), ConfigCopyOptions{Home: home, Destination: dest})
+	if err != nil {
+		t.Fatalf("an unreadable file ended the copy: %v", err)
+	}
+	t.Cleanup(func() { removeInputTree(dest) })
+	if len(m.Files) != 1 || m.SkippedByReason["unreadable"] < 2 {
+		t.Fatalf("unreadable files: %v, %d files", m.SkippedByReason, len(m.Files))
+	}
 }

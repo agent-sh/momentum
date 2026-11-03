@@ -412,3 +412,30 @@ func TestTheStopRuleComparesTheFailures(t *testing.T) {
 		t.Fatalf("two alike did not stop it: %q %v", why, err)
 	}
 }
+
+func TestTheStopRuleSkipsTheRunsTheHostEnded(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := runnerFor(t, st, nil)
+	c := openCase(t, st, "failures", "stop-rule-host", 2)
+	put := func(id, failure string, started time.Duration) {
+		t.Helper()
+		if err := st.PutLoopRun(ctx, store.LoopRun{ID: id, Case: c.ID, Family: "failures", Step: StepInvestigate, Started: time.Now().Add(started),
+			Ended: time.Now().Add(started + time.Second), Status: store.RunFailed, Failure: failure}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("h1", "stopped", -6*time.Minute)
+	put("h2", "stopped", -5*time.Minute)
+	put("h3", "killed", -4*time.Minute)
+	put("h4", "killed", -3*time.Minute)
+	if why, err := r.stopped(ctx, c, true); err != nil || why != "" {
+		t.Fatalf("runs the host ended stopped the case: %q %v", why, err)
+	}
+	put("h5", "timeout", -2*time.Minute)
+	put("h6", "stopped", -90*time.Second)
+	put("h7", "timeout", -time.Minute)
+	if why, err := r.stopped(ctx, c, true); err != nil || !strings.Contains(why, "failed the same way: timeout") {
+		t.Fatalf("two timeouts around a stop did not stop the case: %q %v", why, err)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -295,5 +296,26 @@ func TestBrokerErrorAnswersAreNeitherChargedNorTurns(t *testing.T) {
 	}
 	if rec := relayRequest(r, strings.NewReader(textRequestBody(10, 1000)), "invoke-with-response-stream"); rec.Code != 429 || calls.Load() != relayErrorLimit {
 		t.Fatalf("a storm of errors went on to the broker: %d, %d calls", rec.Code, calls.Load())
+	}
+}
+
+func TestABrokerThatDoesNotAnswerIsAnErrorAnswerToo(t *testing.T) {
+	var calls atomic.Int64
+	r := budgetRelay(t, 1, func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return nil, errors.New("connection refused")
+	})
+	r.turnLimit = 3
+	for i := 0; i < relayErrorLimit; i++ {
+		if rec := relayRequest(r, strings.NewReader(textRequestBody(10, 1000)), "invoke-with-response-stream"); rec.Code != http.StatusBadGateway {
+			t.Fatalf("attempt %d: %d", i, rec.Code)
+		}
+	}
+	spent, admitted, _, _ := r.accounting()
+	if spent != 0 || admitted != 0 || calls.Load() != relayErrorLimit {
+		t.Fatalf("failed transports were charged or counted as turns: spent %v, admitted %d, calls %d", spent, admitted, calls.Load())
+	}
+	if rec := relayRequest(r, strings.NewReader(textRequestBody(10, 1000)), "invoke-with-response-stream"); rec.Code != 429 || calls.Load() != relayErrorLimit {
+		t.Fatalf("a storm of failed transports went on to the broker: %d, %d calls", rec.Code, calls.Load())
 	}
 }

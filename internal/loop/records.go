@@ -361,7 +361,7 @@ func writeRecords(ctx context.Context, o RecordsOptions, files []RecordFile, m R
 		}
 		// The child clips an event's record at --bytes and adds its header and a marker, and a unit's log is its state
 		// and the end of the log: both are asked for less than the bound and read with the slack the extras need.
-		args := []string{"evidence", "unit", file.Unit, "--lines", strconv.Itoa(unitLogLines)}
+		args := []string{"evidence", "unit", file.Unit, "--lines", strconv.Itoa(unitLogLines), "--bytes", strconv.Itoa(limit)}
 		if file.Event != "" {
 			args = []string{"evidence", "show", "--bytes", strconv.Itoa(limit), file.Event}
 		}

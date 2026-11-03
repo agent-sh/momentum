@@ -23,6 +23,8 @@ momentum evidence ingest              read what is new in every configured sourc
 momentum evidence events --since 1d   events, newest first (--kind, --source, --harness, --until, --json)
 momentum evidence events --session ID one session's events, its subagents' among them, oldest first
 momentum evidence status              events per source and kind, and unparsed records
+momentum evidence show [--bytes N] ID...  one to ten events with their records, scrubbed (what a loop run reads under /ro/records)
+momentum evidence unit NAME [--lines N] [--bytes N]  a user service's state and the end of its log, scrubbed
 momentum evidence rebuild SOURCE      drop a source's events; the next ingest reads it again
                                       (not sessions; transcripts only with --force)
 ```

@@ -112,6 +112,8 @@ func main() {
 	// A signal ends the command's context: a loop pass stops its runs' units (their sandboxes die with it) instead of
 	// leaving them running for the rest of their time.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// the first signal asks the pass to stop; a second takes its default action
+	go func() { <-ctx.Done(); stop() }()
 	code := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
 	stop()
 	os.Exit(code)

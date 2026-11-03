@@ -146,6 +146,7 @@ func evidenceUnit(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	fs := flag.NewFlagSet("evidence unit", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	lines := fs.Int("lines", 200, "how many of its log's last lines")
+	cut := fs.Int("bytes", 0, "the last N bytes of the scrubbed output, at a line start (default: all of it)")
 	var unit string
 	var rest []string
 	for _, a := range args {
@@ -174,10 +175,24 @@ func evidenceUnit(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		cmd.Stdout, cmd.Stderr = capture, capture
 		_ = cmd.Run()
 	}
-	if output.Len() > readMax {
+	if output.Len() > readMax && *cut <= 0 {
 		return usageError{"unit output exceeds the record limit; narrow the command"}
 	}
-	return scrubbed(ctx, stdout, strings.ToValidUTF8(output.String(), "?"))
+	clean, err := loop.Redact(ctx, strings.ToValidUTF8(output.String(), "?"))
+	if err != nil {
+		return err
+	}
+	if *cut > 0 && len(clean) > *cut {
+		// the end of the log is what a reader wants: drop from the front, at a line start
+		whole := len(clean)
+		tail := clean[whole-*cut:]
+		if i := strings.IndexByte(tail, '\n'); i >= 0 && i+1 < len(tail) {
+			tail = tail[i+1:]
+		}
+		clean = fmt.Sprintf("(the last %d of %d bytes)\n", len(tail), whole) + tail
+	}
+	_, err = io.WriteString(stdout, clean)
+	return err
 }
 
 func showEvent(ctx context.Context, st *store.Store, id string, n int) (string, error) {

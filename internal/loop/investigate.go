@@ -113,7 +113,7 @@ func caseEvidence(ctx context.Context, st *store.Store, c store.Case) (string, e
 				return "", err
 			}
 			if found {
-				fmt.Fprintf(&b, "- %s ev:%s %s %s %s %s\n  %s\n", e.TS.Local().Format("2006-01-02 15:04:05"), e.ID(), e.Session, e.Actor, e.Kind,
+				fmt.Fprintf(&b, "- %s ev:%s %s %s %s %s\n  %s\n", e.TS.Local().Format("2006-01-02 15:04:05"), e.ID(), plain.Line(e.Session), plain.Line(string(e.Actor)), plain.Line(e.Kind),
 					plain.Line(e.Tool), plain.Line(e.Summary))
 				continue
 			}

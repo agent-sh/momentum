@@ -150,6 +150,7 @@ type RunFilter struct {
 	Since      time.Time
 	Experiment *string // nil: every run; "": the live ones
 	Ran        bool    // only started, completed runs; exclude refusals and sandbox failures before applying Limit
+	Judged     bool    // not the runs the host ended (stopped by a signal, killed by a restart): they say nothing of the agent
 	Limit      int
 }
 
@@ -164,6 +165,9 @@ func (s *Store) LoopRuns(ctx context.Context, f RunFilter) ([]LoopRun, error) {
 	}
 	if f.Ran {
 		where, args = append(where, "started > 0 AND status NOT IN (?, ?) AND failure <> ?"), append(args, RunRefused, RunRunning, "sandbox")
+	}
+	if f.Judged {
+		where = append(where, "failure NOT IN ('stopped', 'killed')")
 	}
 	q := `SELECT ` + loopColumns + ` FROM loop_runs WHERE ` + strings.Join(where, " AND ") + ` ORDER BY started DESC, id DESC`
 	if f.Limit > 0 {

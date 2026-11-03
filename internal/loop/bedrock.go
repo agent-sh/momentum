@@ -216,6 +216,8 @@ func newRelay(target *url.URL, budget float64, transport http.RoundTripper, turn
 			pr.Out.URL.Scheme, pr.Out.URL.Host, pr.Out.Host = target.Scheme, target.Host, target.Host
 			pr.Out.URL.RawPath = strings.TrimSuffix(target.EscapedPath(), "/") + rest
 			pr.Out.URL.Path, _ = url.PathUnescape(pr.Out.URL.RawPath)
+			pr.Out.URL.RawQuery = "" // the broker's API takes none; a run's query is not forwarded
+			pr.Out.Header.Del("Cookie")
 		},
 		FlushInterval: -1, // a streamed answer streams on
 		ModifyResponse: func(resp *http.Response) error {
@@ -228,7 +230,12 @@ func newRelay(target *url.URL, budget float64, transport http.RoundTripper, turn
 			return nil
 		},
 		ErrorLog: log.New(io.Discard, "", 0),
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
+		ErrorHandler: func(w http.ResponseWriter, req *http.Request, _ error) {
+			// the broker never answered (refused, reset, timed out before a status): nothing ran and nothing is
+			// billed, so it is an error answer like any other: no charge, no turn, one toward the error limit
+			if c, ok := req.Context().Value(relayChargeKey{}).(*relayCharge); ok {
+				c.parser.bad, c.parser.errorResponse, c.parser.eof = true, true, true
+			}
 			http.Error(w, "the Bedrock broker did not answer", http.StatusBadGateway)
 		},
 	}

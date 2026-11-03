@@ -304,7 +304,8 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 	return cands[0].c, cands[0].step, fmt.Sprintf("%s %s (%s, %d evidence)", cands[0].step, cands[0].c.ID, cands[0].c.Status, cands[0].c.Evidence), nil
 }
 
-// stopped applies the stop rule: a case whose last two live runs that ran (a refusal of the budgets is no run)
+// stopped applies the stop rule: a case whose last two live runs that ran (a refusal of the budgets is no run, and a run the
+// host ended, stopped or killed, says nothing of the agent)
 // failed the same way, in the same step, is not run a third time. It opens a case of the loop's own, in component
 // health, the first time, with both runs' transcripts as its evidence, and says why. A dry check opens nothing.
 func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, error) {
@@ -313,7 +314,7 @@ func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, e
 	if !since.IsZero() {
 		since = since.Add(time.Millisecond) // the kept clock is in milliseconds; only runs after the return count
 	}
-	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID, Experiment: &live, Ran: true, Since: since, Limit: 2})
+	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID, Experiment: &live, Ran: true, Judged: true, Since: since, Limit: 2})
 	if err != nil {
 		return "", err
 	}

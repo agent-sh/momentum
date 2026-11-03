@@ -368,8 +368,11 @@ func cloneDefaultBranch(ctx context.Context, source string) (string, error) {
 	return strings.TrimPrefix(strings.TrimSpace(string(head)), "refs/heads/"), nil
 }
 
+// gitStepTimeout bounds one git step of an input copy: a large repository's clone takes minutes.
+const gitStepTimeout = 5 * time.Minute
+
 func hostInputGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
-	cctx, cancel := context.WithTimeout(ctx, time.Minute)
+	cctx, cancel := context.WithTimeout(ctx, gitStepTimeout)
 	defer cancel()
 	pins := append(append([]string(nil), GitSafety()...), "-c", "uploadpack.packObjectsHook=", "-c", "protocol.file.allow=always")
 	if dir != "" {
@@ -382,6 +385,9 @@ func hostInputGit(ctx context.Context, dir string, args ...string) ([]byte, erro
 	if err := cmd.Run(); err != nil {
 		// Git can print source configuration and object text in diagnostics.
 		// Return only the operation and status, never its raw stderr.
+		if cctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("input git %s timed out after %s", args[0], gitStepTimeout)
+		}
 		return nil, fmt.Errorf("input git %s failed: %w", args[0], err)
 	}
 	if out.Over() || stderr.Over() {
