@@ -2,6 +2,8 @@ package loop
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -206,5 +208,88 @@ func TestChangedLiteralsJoinsAcrossAnEditedPlus(t *testing.T) {
 	}
 	if got := changedLiterals(lines, []bool{false, false, false}); len(got) != 0 {
 		t.Fatalf("an unchanged sequence: %q", got)
+	}
+}
+
+// A resumed landing whose head already reached the default branch finishes its record without a push, so the gate
+// call at the top of the resume is what keeps a repository the gate now refuses (busy, excluded) from being recorded
+// as landed and deployed.
+func TestAResumedLandingChecksTheGateBeforeFinishing(t *testing.T) {
+	fakeManager(t)
+	s, f, c, p := b4Reviewed(t)
+	run(t, p.Host, "git", "push", "--quiet", "origin", p.Head+":refs/heads/"+p.Base)
+	p.State, p.LandingHead, p.PublishedHead = Landing, p.Head, p.Head
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	s.Gate.Busy = func(context.Context, string) (string, error) { return "a session works here", nil }
+	if _, err := s.Land(context.Background(), c.ID); !errors.Is(err, ErrRefused) {
+		t.Fatalf("a resumed landing crossed the gate: %v", err)
+	}
+	got, _, err := s.Load(c.ID)
+	if err != nil || got.State != Landing {
+		t.Fatalf("the resumed landing finished past the gate: %s %v", got.State, err)
+	}
+	if head := originHead(t, f, p.Base); head != p.Head {
+		t.Fatalf("the default branch is %s", head)
+	}
+}
+
+// A note marked done after a task's end is not done in that task's copy, whether the copy is direct or cut from the
+// master; one done before the end stays done. PutNote clears done, so the times are set in the store itself.
+func TestAMasterCutClearsADoneAfterTheEnd(t *testing.T) {
+	ctx := context.Background()
+	goodInputScrubber(t)
+	end := time.Date(2026, 2, 20, 12, 0, 0, 0, time.UTC)
+	source := inputStore(t, []store.Event{{Source: "fixture", SourceKey: "k", TS: end.Add(-6 * 24 * time.Hour), Kind: "record", Summary: "marker-7f3a"}})
+	st, err := store.Open(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskEnd := end.Add(-5 * 24 * time.Hour)
+	done := map[string]time.Time{"before": taskEnd.Add(-24 * time.Hour), "after": end.Add(-time.Hour)}
+	for id := range done {
+		if _, err := st.PutNote(ctx, store.Note{ID: id, Kind: store.NoteDecided, Title: id, At: taskEnd.Add(-2 * 24 * time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.Close()
+	db, err := sql.Open("sqlite", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, at := range done {
+		if _, err := db.Exec("UPDATE notes SET done = ? WHERE id = ?", at.UnixMilli(), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+	dir := t.TempDir()
+	master, direct, cut := filepath.Join(dir, "master.sqlite"), filepath.Join(dir, "direct.sqlite"), filepath.Join(dir, "cut.sqlite")
+	for _, o := range []StoreCopyOptions{
+		{Source: source, Destination: master, Since: end.Add(-40 * 24 * time.Hour), Until: end, OmitInPlace: true},
+		{Source: source, Destination: direct, Since: taskEnd.Add(-StoreWindow), Until: taskEnd, OmitInPlace: true},
+		{Source: master, Destination: cut, Since: taskEnd.Add(-StoreWindow), Until: taskEnd, OmitInPlace: true, Master: true},
+	} {
+		if _, err := StoreCopy(ctx, o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{direct, cut} {
+		got := map[string]int64{}
+		rows, err := inputPlainDB(t, path).Query("SELECT id, done FROM notes")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var id string
+			var d int64
+			rows.Scan(&id, &d)
+			got[id] = d
+		}
+		rows.Close()
+		if got["after"] != 0 || got["before"] != done["before"].UnixMilli() {
+			t.Errorf("%s: done %v", filepath.Base(path), got)
+		}
 	}
 }
