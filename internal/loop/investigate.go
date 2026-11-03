@@ -40,7 +40,7 @@ sqlite3.connect("file:/ro/store.sqlite?mode=ro", uri=True). There is no sqlite3 
 The events columns are id (24 hex characters; write references as ev:ID), source, source_key, ts (milliseconds since the epoch), session, agent, harness, model, cwd, actor (owner, agent, tool, harness, detector, unknown), kind, tool, summary, meta, ref, heuristic, experiment, ingested.
 The notes columns are id, kind, title, detail, effect, links, source, importance, at, done.
 /ro/records/index.txt lists the case's evidence records and neighbours (ev-ID.txt), and unit logs (unit-NAME.txt).
-momentum-ro reads this same store and these records and changes nothing. Use momentum-ro evidence events --since 3d --kind tool_result, momentum-ro evidence show ev:ID, or momentum-ro case show. Python3's sqlite3 on /ro/store.sqlite still works.
+Read the evidence with momentum-ro first; it reads this same store and these records and changes nothing. Start with momentum-ro case show, then momentum-ro evidence show ev:ID for each event: it prints the event and its record. momentum-ro evidence events --session SESSION reads a session in order; --since 3d, --kind tool_result and --source filter, and times count back from the end of the store. Use python3's sqlite3 on /ro/store.sqlite for what these do not answer.
 /ro/config/MANIFEST.txt lists the scrubbed point-in-time text configuration and withheld paths.
 /ro/clone is a read-only clone of tacit's facts: the owner's rules, decisions and past mistakes. Grep it. If /ro/clone does not exist, tacit was not available for this run.
 /ro/repos/NAME are read-only repository clones with full history and their default branch checked out. Read their files and history.
