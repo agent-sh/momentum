@@ -20,7 +20,7 @@ func recordFixture(t *testing.T, events []store.Event, body string) RecordsOptio
 		Home: dir, Binary: script(t, dir, "momentum-fixture", body), Env: []string{"PATH=/usr/bin:/bin"}}
 }
 
-func TestInputsRecordsPriorityNeighboursIndexAndSecondPass(t *testing.T) {
+func TestInputsRecordsPriorityNeighboursIndexAndScrubbedChild(t *testing.T) {
 	goodInputScrubber(t)
 	at := time.Date(2025, 4, 10, 12, 0, 0, 0, time.UTC)
 	var events []store.Event
@@ -33,7 +33,7 @@ func TestInputsRecordsPriorityNeighboursIndexAndSecondPass(t *testing.T) {
 		store.Event{Source: "fixture", SourceKey: "outside", Session: "same", TS: at.Add(11 * time.Minute), Kind: "record"})
 	o := recordFixture(t, events, `test "${MOMENTUM_HOME+x}" = x && test "${MOMENTUM_NOW+x}" = x || exit 7
 test "$1" = evidence && test "$2" = show && test "$3" = --bytes && test "$4" = 16384 || exit 8
-printf 'record %s marker-7f3a\n' "$5"`)
+printf 'record %s [masked]\n' "$5"`)
 	o.AsOf = at.Add(time.Hour)
 	o.IDs = []string{events[7].ID(), events[0].ID(), events[7].ID(), "absent"}
 	m, err := Records(context.Background(), o)
@@ -58,7 +58,7 @@ printf 'record %s marker-7f3a\n' "$5"`)
 	for _, file := range m.Files {
 		text, err := os.ReadFile(filepath.Join(o.Destination, file.Name))
 		if err != nil || !strings.Contains(string(text), "[masked]") || strings.Contains(string(text), "marker-7f3a") {
-			t.Fatalf("record did not receive second pass: %v", err)
+			t.Fatalf("scrubbed child output changed: %v", err)
 		}
 		if file.Event == events[15].ID() || file.Event == events[16].ID() {
 			t.Fatal("neighbour came from another session or outside window")
@@ -67,6 +67,38 @@ printf 'record %s marker-7f3a\n' "$5"`)
 	}
 	if total != m.Bytes {
 		t.Fatal("record byte accounting differs")
+	}
+}
+
+func TestInputsRecordsNeverScrubTheChildCaptureAgain(t *testing.T) {
+	count := filepath.Join(t.TempDir(), "starts")
+	inputScrubber(t, "printf 'start\\n' >> '"+count+"'\nsed -e 's/AKIA[A-Z0-9]*EXAMPLE/[masked]/g' -e 's/marker-7f3a/[masked]/g'")
+	event := store.Event{Source: "fixture", SourceKey: "one", TS: time.Now(), Kind: "record"}
+	// A trusted child's synthetic output stands in for its scrubbed capture.
+	// Keeping the marker here distinguishes publication from a second pass.
+	o := recordFixture(t, []store.Event{event}, "printf 'marker-7f3a capture\\n'")
+	o.IDs = []string{event.ID()}
+	m, err := Records(context.Background(), o)
+	if err != nil || m.Written != 1 {
+		t.Fatalf("capture: %+v %v", m, err)
+	}
+	if got := readText(t, filepath.Join(o.Destination, m.Files[0].Name)); got != "marker-7f3a capture\n" {
+		t.Fatal("child capture was scrubbed again")
+	}
+	starts := readText(t, count)
+	if starts != "start\n" {
+		t.Fatalf("only the canary should start a parent scrubber: %q", starts)
+	}
+	o.Units = []string{"fixture.service"}
+	m, err = UnitLogs(context.Background(), o)
+	if err != nil || m.Written != 2 {
+		t.Fatalf("unit capture: %+v %v", m, err)
+	}
+	if got := readText(t, filepath.Join(o.Destination, "unit-fixture.service.txt")); got != "marker-7f3a capture\n" {
+		t.Fatal("unit capture was scrubbed again")
+	}
+	if starts := readText(t, count); starts != "start\nstart\nstart\n" {
+		t.Fatalf("only canaries and unit names should start parent scrubbers: %q", starts)
 	}
 }
 

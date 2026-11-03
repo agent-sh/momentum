@@ -285,7 +285,7 @@ func removeEscapingLinks(ctx context.Context, dst string) error {
 	return nil
 }
 
-// programs contains only the host records child's pinned evaluating binary.
+// programs pins the same evaluating binary for host records and run readers.
 type programs struct {
 	momentum string
 	hashes   map[string]string
@@ -304,7 +304,7 @@ func (e *Eval) pinRecordsBinary() error {
 	if err != nil {
 		return err
 	}
-	e.programs = programs{momentum: path, hashes: map[string]string{"momentum": hash}}
+	e.programs = programs{momentum: path, hashes: map[string]string{"momentum": hash, "momentum-ro": hash}}
 	return nil
 }
 

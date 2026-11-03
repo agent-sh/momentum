@@ -9,11 +9,12 @@ import (
 // InputsManifest is the caller's manifest.json next to the run's inputs. The
 // caller keeps Summary in the run's record. Paths name host-created inputs.
 type InputsManifest struct {
-	Store         StoreManifest   `json:"store"`
-	Records       RecordsManifest `json:"records"`
-	Configuration ConfigManifest  `json:"configuration"`
-	Repositories  []RepoClone     `json:"repositories"`
-	Tacit         RepoClone       `json:"tacit"`
+	Store         StoreManifest     `json:"store"`
+	Records       RecordsManifest   `json:"records"`
+	Configuration ConfigManifest    `json:"configuration"`
+	Repositories  []RepoClone       `json:"repositories"`
+	Tacit         RepoClone         `json:"tacit"`
+	Programs      map[string]string `json:"programs"`
 }
 
 func (m InputsManifest) Summary() string {

@@ -16,6 +16,7 @@ import (
 	"github.com/agent-sh/momentum/internal/config"
 	"github.com/agent-sh/momentum/internal/detect"
 
+	"github.com/agent-sh/momentum/internal/evidenceview"
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
@@ -154,15 +155,7 @@ func caseJSON(c store.Case) listedCase {
 }
 
 // statusLine is a case's status for a terminal: closed ones with their reason.
-func statusLine(c store.Case) string {
-	switch {
-	case c.Status != store.CaseClosed:
-		return string(c.Status)
-	case c.Reason == store.Duplicate:
-		return "closed: duplicate of " + c.Into
-	}
-	return "closed: " + string(c.Reason)
-}
+func statusLine(c store.Case) string { return evidenceview.StatusLine(c) }
 
 func caseList(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("case list", flag.ContinueOnError)
@@ -293,38 +286,7 @@ func caseShow(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		}
 		return json.NewEncoder(stdout).Encode(out)
 	}
-	fmt.Fprintf(stdout, "%s  %s  [%s, %s]\n", c.ID, c.Title, c.Family, statusLine(c))
-	field := func(name, v string) {
-		if v != "" {
-			fmt.Fprintf(stdout, "  %-13s %s\n", name+":", v)
-		}
-	}
-	field("mechanism", c.Mechanism)
-	for i, a := range c.Alternatives {
-		field(fmt.Sprintf("alternative %d", i+1), a)
-	}
-	field("next test", c.NextTest)
-	field("benefit", c.Benefit)
-	field("cost", fmt.Sprintf("$%.2f, %d tokens, %s over %d runs", c.Cost.USD, c.Cost.Tokens, c.Cost.Duration.Round(time.Second), c.Cost.Runs))
-	field("signatures", strings.Join(c.Signatures, " | "))
-	if !c.Back.IsZero() {
-		field("came back", c.Back.Local().Format("2006-01-02 15:04"))
-	}
-	if !c.Deployed.IsZero() {
-		field("deployed", c.Deployed.Local().Format("2006-01-02 15:04")+" "+c.Package)
-	}
-	if m := c.Measurement; m.Window > 0 || m.Effect != "" {
-		field("measured", fmt.Sprintf("%d before, %d after over %s each: %s", m.Before, m.After, m.Window, m.Effect))
-	}
-	fmt.Fprintf(stdout, "  evidence: %d, newest first\n", c.Evidence)
-	for _, e := range evs {
-		fmt.Fprintf(stdout, "    %s  %-14s %s  %s\n", e.At.Local().Format("01-02 15:04"), e.Kind, e.Ref, plain.Clip(e.Summary, 120))
-	}
-	fmt.Fprintf(stdout, "  log: %d lines, the last %d\n", logged, len(log))
-	for _, e := range log {
-		fmt.Fprintf(stdout, "    %s  %-10s %-12s %s\n", e.At.Local().Format("01-02 15:04"), e.Actor, e.Action, e.Detail)
-	}
-	return nil
+	return evidenceview.Case(stdout, c, evs, log, logged)
 }
 
 // printCase prints what a change left: the case's id, status and title, and what happened.

@@ -4,24 +4,22 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
-	"slices"
-	"sort"
-	"strconv"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/agent-sh/momentum/internal/config"
+	"github.com/agent-sh/momentum/internal/evidenceview"
+	"github.com/agent-sh/momentum/internal/ro"
 
 	"github.com/agent-sh/momentum/internal/paths"
-	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/source"
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -133,6 +131,14 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	executable, err := os.Executable()
+	if err != nil {
+		fmt.Fprintln(stderr, ro.Refusal)
+		return 2
+	}
+	if filepath.Base(executable) == "momentum-ro" {
+		return ro.Run(ctx, args, stdout, stderr)
+	}
 	return runCommand(ctx, args, stdout, stderr)
 }
 
@@ -263,87 +269,24 @@ func ingest(ctx context.Context, stdout, stderr io.Writer) error {
 }
 
 func events(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("events", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	since := fs.String("since", "1d", "how far back, or from when (one session: its start)")
-	until := fs.String("until", "", "until when")
-	kinds := fs.String("kind", "", "comma-separated kinds")
-	src := fs.String("source", "", "one source")
-	harness := fs.String("harness", "", "one harness's events, from every source: "+strings.Join(store.Harnesses, ", "))
-	session := fs.String("session", "", "one session, by its id or its start; oldest first")
-	limit := fs.Int("limit", 50, "most events to print (0: 200)")
-	asJSON := fs.Bool("json", false, "one JSON object per line")
-	if err := fs.Parse(args); err != nil {
+	opts, err := evidenceview.ParseEvents(args, stderr)
+	if err != nil {
 		return usageError{err.Error()}
-	}
-	if fs.NArg() > 0 {
-		return usageError{strayArgs("evidence events", fs.Arg(0))}
-	}
-	if *limit <= 0 {
-		*limit = 200
-	}
-	sinceSet := false
-	fs.Visit(func(f *flag.Flag) { sinceSet = sinceSet || f.Name == "since" })
-	var from time.Time // one session reads from its start, unless --since says otherwise
-	if *session == "" || sinceSet {
-		var err error
-		if from, err = parseWhen(*since); err != nil {
-			return usageError{err.Error()}
-		}
-	}
-	if *harness != "" && !slices.Contains(store.Harnesses, *harness) {
-		return usageError{fmt.Sprintf("unknown harness %q: one of %s", *harness, strings.Join(store.Harnesses, ", "))}
-	}
-	var err error
-	q := store.Query{Since: from, Source: *src, Harness: *harness, Session: *session, Limit: *limit + 1}
-	if *until != "" {
-		if q.Until, err = parseWhen(*until); err != nil {
-			return usageError{err.Error()}
-		}
 	}
 	st, err := store.Open(paths.DB())
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	if *kinds != "" {
-		q.Kinds = strings.Split(*kinds, ",")
-	}
-	evs, err := st.Events(ctx, q)
+	evs, err := st.Events(ctx, opts.Query)
 	if err != nil {
 		return err
 	}
-	if len(evs) > *limit {
-		evs = evs[:*limit]
-		defer fmt.Fprintf(stderr, "momentum: more events than --limit %d; raise it, or narrow with --since and --until\n", *limit)
+	if len(evs) > opts.Limit {
+		evs = evs[:opts.Limit]
+		defer fmt.Fprintf(stderr, "momentum: more events than --limit %d; raise it, or narrow with --since and --until\n", opts.Limit)
 	}
-	enc := json.NewEncoder(stdout)
-	for _, e := range evs {
-		if *asJSON {
-			if err := enc.Encode(e); err != nil {
-				return err
-			}
-			continue
-		}
-		tag := ""
-		if e.Experiment != "" {
-			tag = " [experiment " + e.Experiment + "]"
-		}
-		what := e.Kind
-		if e.Tool != "" {
-			what += " " + e.Tool
-		}
-		if strings.Contains(e.Meta, `"is_error":true`) {
-			what += " (error)"
-		}
-		if e.Agent != "" {
-			tag += " [subagent " + e.Agent + "]"
-		}
-		// Plain text: a summary holds what agents and tools wrote, which must not act on the terminal.
-		fmt.Fprintf(stdout, "%s  %-15s %-8s %-16s %s%s\n", e.TS.Local().Format("01-02 15:04:05"), e.Source, e.Actor, plain.Line(what),
-			plain.Line(e.Summary), plain.Line(tag))
-	}
-	return nil
+	return evidenceview.Events(stdout, evs, opts.JSON)
 }
 
 func status(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -366,28 +309,15 @@ func status(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	if err != nil {
 		return err
 	}
-	var srcs []string
+	skipped := map[string]int{}
 	for s := range counts {
-		srcs = append(srcs, s)
-	}
-	sort.Strings(srcs)
-	for _, s := range srcs {
-		var parts []string
-		for k, n := range counts[s] {
-			parts = append(parts, fmt.Sprintf("%s %d", k, n))
-		}
-		sort.Strings(parts)
-		skipped, err := st.Skipped(ctx, s)
+		n, err := st.Skipped(ctx, s)
 		if err != nil {
 			return err
 		}
-		line := fmt.Sprintf("%-15s %s", s, strings.Join(parts, ", "))
-		if skipped > 0 {
-			line += fmt.Sprintf("  (%d unparsed)", skipped)
-		}
-		fmt.Fprintln(stdout, line)
+		skipped[s] = n
 	}
-	return nil
+	return evidenceview.Status(stdout, counts, skipped)
 }
 
 // rebuild drops what a source contributed. The transcripts' events can be all that is left of transcripts their
@@ -467,24 +397,7 @@ func rebuild(ctx context.Context, args []string, stdout, stderr io.Writer) error
 
 // parseWhen is a time: a duration ago (parseSince), a local time ("2006-01-02T15:04" or "2006-01-02 15:04",
 // seconds optional; a date), or one with its offset (RFC 3339, or git's iso date: "2006-01-02 15:04:05 -0700").
-func parseWhen(s string) (time.Time, error) {
-	if d, err := parseSince(s); err == nil {
-		return time.Now().Add(-d), nil
-	}
-	// a time with its offset keeps it: git's iso date puts it after a space
-	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05 -0700", "2006-01-02 15:04 -0700", "2006-01-02 15:04:05 -07:00", "2006-01-02 15:04:05Z07:00"} {
-		if t, err := time.Parse(layout, s); err == nil {
-			return t, nil
-		}
-	}
-	// agents write a local time with a T or with a space, as momentum and many logs print it
-	for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02T15:04", "2006-01-02 15:04:05", "2006-01-02 15:04", "2006-01-02"} {
-		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
-			return t, nil
-		}
-	}
-	return time.Time{}, fmt.Errorf(`bad time %q: a duration (36h, 7d), a local time (2006-01-02T15:04 or "2006-01-02 15:04") or one with its offset (2006-01-02T15:04:05+03:00 or "2006-01-02 15:04:05 +0300")`, s)
-}
+func parseWhen(s string) (time.Time, error) { return evidenceview.ParseWhen(s) }
 
 // strayArgs is the refusal of a command that takes no arguments: most often a time with a space, unquoted, which
 // the shell split.
@@ -493,17 +406,4 @@ func strayArgs(cmd, arg string) string {
 }
 
 // parseSince accepts a Go duration or a whole number of days ("7d").
-func parseSince(s string) (time.Duration, error) {
-	if strings.HasSuffix(s, "d") {
-		n, err := strconv.Atoi(strings.TrimSuffix(s, "d"))
-		if err != nil || n < 0 {
-			return 0, fmt.Errorf("bad --since %q", s)
-		}
-		return time.Duration(n) * 24 * time.Hour, nil
-	}
-	d, err := time.ParseDuration(s)
-	if err != nil || d < 0 {
-		return 0, fmt.Errorf("bad --since %q", s)
-	}
-	return d, nil
-}
+func parseSince(s string) (time.Duration, error) { return evidenceview.ParseSince(s) }
