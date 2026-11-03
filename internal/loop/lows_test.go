@@ -133,3 +133,25 @@ func TestAHeadThatMovedDuringTheReviewIsAHold(t *testing.T) {
 		t.Fatalf("a moved head: %s %q, %d reviews", d.Run.Status, d.Run.Failure, len(got.Reviews))
 	}
 }
+
+// requestFields refuses each ambiguous body by itself: the relay's later JSON check would refuse some of them too,
+// which hides a guard removed here.
+func TestRequestFieldsRefusesEachAmbiguousBody(t *testing.T) {
+	for _, body := range []string{
+		`{"max_tokens":1,"messages":[]} {"x":1}`,
+		`{"max_tokens":1,"messages":[]} 1`,
+		`{"messages":[],"Messages":[]}`,
+		`{"max_tokens":1,"max_tokens":1}`,
+		`{"Max_tokens":1}`,
+		`{"max_tokens":1.5}`,
+		`[1]`,
+	} {
+		if _, err := requestFields([]byte(body)); err == nil {
+			t.Errorf("%s was read", body)
+		}
+	}
+	got, err := requestFields([]byte(`{"max_tokens":7,"messages":[]}`))
+	if err != nil || got.MaxTokens == nil || *got.MaxTokens != 7 {
+		t.Fatalf("an honest body: %v %v", got.MaxTokens, err)
+	}
+}
