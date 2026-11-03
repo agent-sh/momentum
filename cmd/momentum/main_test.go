@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/source"
+	"github.com/agent-sh/momentum/internal/store"
 
 	_ "modernc.org/sqlite"
 )
@@ -204,5 +206,47 @@ func TestASplitTimeIsRefused(t *testing.T) {
 		if code != 2 || !strings.Contains(diag, `got "10:00"`) || !strings.Contains(diag, "in quotes") {
 			t.Errorf("%v: exit %d %s", args, code, diag)
 		}
+	}
+}
+
+func TestAnIngestAndARebuildTakeTurns(t *testing.T) {
+	home, cfg, src := t.TempDir(), t.TempDir(), t.TempDir()
+	t.Setenv("MOMENTUM_HOME", home)
+	t.Setenv("MOMENTUM_CONFIG", cfg)
+	log := filepath.Join(src, "events.jsonl")
+	if err := os.WriteFile(log, []byte(`{"ts":"2026-01-02T10:00:00","kind":"deny","tool":"Bash","detail":"no"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg, "sources.json"), []byte(`{"mistakes": {"path": "`+log+`"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	var out, errOut bytes.Buffer
+	if code := run(ctx, []string{"evidence", "ingest"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	unlock, err := st.LockIngest() // a run holds the store
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"evidence", "ingest"}, {"evidence", "rebuild", "mistakes"}} {
+		out.Reset()
+		errOut.Reset()
+		if code := run(ctx, args, &out, &errOut); code == 0 || !strings.Contains(errOut.String(), "holds the store") {
+			t.Errorf("%v while another holds the store: exit %d %s", args, code, errOut.String())
+		}
+	}
+	if read, err := st.ReadThrough(ctx, "mistakes"); err != nil || read.IsZero() {
+		t.Fatalf("a refused rebuild dropped the read: %v %v", read, err)
+	}
+	unlock()
+	out.Reset()
+	if code := run(ctx, []string{"evidence", "rebuild", "mistakes"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
 	}
 }

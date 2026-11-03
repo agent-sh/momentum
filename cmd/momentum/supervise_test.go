@@ -70,6 +70,13 @@ func TestSuperviseDecidesNothingOnAShortScan(t *testing.T) {
 	if len(evs) != 2 || kinds[supervise.KindWait] != 1 || kinds[supervise.KindSkip] != 1 {
 		t.Fatalf("supervise events %+v", evs)
 	}
+	// and it is an incomplete run of supervision, as of the scan: what the run should have decided is not in the store
+	shortAt := t0.Add(11 * time.Minute).Truncate(time.Millisecond)
+	for _, source := range []string{store.Supervise, store.Sessions} {
+		if gap, err := st.Incomplete(ctx, source, "test", t0, t0.Add(time.Hour)); err != nil || !gap.Equal(shortAt) {
+			t.Fatalf("%s: incomplete at %v %v, want %v", source, gap, err, shortAt)
+		}
+	}
 	// The next whole scan acts.
 	if err := pass(t0.Add(12*time.Minute), nil); err != nil || len(ty.sent) != 1 || !strings.HasPrefix(ty.sent[0], supervise.Marker) {
 		t.Fatalf("err %v, sent %q", err, ty.sent)

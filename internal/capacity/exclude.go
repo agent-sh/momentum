@@ -138,7 +138,14 @@ func newGitInfo() *gitInfo { return &gitInfo{byTop: map[string]*repo{}} }
 func (g *gitInfo) repoOf(ctx context.Context, p string) *repo {
 	top := ""
 	for cur := p; ; {
-		if _, err := os.Lstat(filepath.Join(cur, ".git")); err == nil {
+		gitdir := filepath.Join(cur, ".git")
+		info, err := os.Lstat(gitdir)
+		empty := false
+		if err == nil && info.IsDir() {
+			entries, readErr := os.ReadDir(gitdir)
+			empty = readErr == nil && len(entries) == 0
+		}
+		if err == nil && !empty {
 			top = cur
 			break
 		}

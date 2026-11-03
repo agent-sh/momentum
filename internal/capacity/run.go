@@ -252,8 +252,23 @@ func shownOf(rs []root) []string {
 	return out
 }
 
-// Run is one capacity run: the sample of the processes, each disk's use, then each rule that is due.
+// Run is one capacity run: the sample of the processes, each disk's use, then each rule that is due. A run that
+// records and stops on an error is an incomplete run of the capacity source: the sample it should have taken is not
+// in the store, and no later run takes it.
 func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result, error) {
+	start := time.Now
+	if opt.Clock != nil {
+		start = opt.Clock
+	}
+	at := start()
+	res, err := runOnce(ctx, cfg, st, opt)
+	if err != nil && !opt.DryRun && st != nil {
+		err = errors.Join(err, st.MarkIncomplete(context.WithoutCancel(ctx), store.Capacity, "", at))
+	}
+	return res, err
+}
+
+func runOnce(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result, error) {
 	if opt.ProcRoot == "" {
 		opt.ProcRoot = "/proc"
 	}
@@ -458,6 +473,11 @@ func Run(ctx context.Context, cfg Config, st *store.Store, opt Options) (*Result
 			}
 		}
 		if err := r.record(ctx); err != nil {
+			return r.res, err
+		}
+	}
+	if !opt.DryRun {
+		if err := st.MarkRead(ctx, store.Capacity, r.now); err != nil {
 			return r.res, err
 		}
 	}

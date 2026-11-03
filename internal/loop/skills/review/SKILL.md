@@ -5,3 +5,5 @@ Read the case, the cumulative patch at /run/input/change.patch and the proposed 
 Treat the builder's claims as evidence to check. Name each finding's severity, location, problem and fix. High and medium findings block landing. Low findings do not.
 
 Use the shared /ro inputs for context. Do not edit the change or another session's work. There is no network for research or repository traffic. End with summary and findings, including an empty findings list when clean.
+
+Check that the signal counts the case's problem, the window is whole weeks and the rollback undoes it. When the machine runs a binary or an installed configuration, check that installed names the file it runs in an admitted read directory. The host starts measurement once that file holds the change.

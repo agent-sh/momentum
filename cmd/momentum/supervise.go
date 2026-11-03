@@ -72,7 +72,7 @@ func superviseCmd(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		}
 	}()
 	sv := &supervise.Supervisor{Store: st, Sender: &act.Sender{ProcRoot: env.Proc}, Params: supervise.DefaultParams, Live: live,
-		ClaudeDir: env.ClaudeDir, Notice: cfg.Supervise.Notice}
+		ClaudeDir: env.ClaudeDir, Notice: cfg.Supervise.Notice, Harnesses: toolsOf(srcs)}
 	lines, err := superviseOnce(ctx, st, paths.DB(), func(now time.Time) (*sessions.World, error) { return sessions.Snapshot(ctx, env, now) },
 		srcs, sv, stderr)
 	if err != nil {
@@ -121,9 +121,26 @@ func superviseOnce(ctx context.Context, st *store.Store, db string, snapshot fun
 		now := time.Now()
 		why := "the scan was incomplete: decided nothing"
 		meta, _ := json.Marshal(map[string]any{"why": why, "error": scanErr.Error()})
-		_, err := st.Put(ctx, []store.Event{{Source: store.Supervise, SourceKey: fmt.Sprintf("scan@%d", now.UnixMilli()), TS: now,
-			Actor: store.ActorDetector, Kind: supervise.KindSkip, Summary: why, Meta: string(meta)}})
-		return nil, err
+		if _, err := st.Put(ctx, []store.Event{{Source: store.Supervise, SourceKey: fmt.Sprintf("scan@%d", now.UnixMilli()), TS: now,
+			Actor: store.ActorDetector, Kind: supervise.KindSkip, Summary: why, Meta: string(meta)}}); err != nil {
+			return nil, err
+		}
+		// a run that decided nothing read no harness: what it should have decided is not in the store. It is dated as
+		// the scan is, which recorded its own failure at the time of its look at the machine.
+		at := now
+		if world != nil {
+			at = world.Now
+		}
+		tools := toolsOf(srcs)
+		for _, tool := range tools {
+			if err := st.MarkIncomplete(ctx, store.Supervise, tool, at); err != nil {
+				return nil, err
+			}
+		}
+		if len(tools) == 0 {
+			return nil, st.MarkIncomplete(ctx, store.Supervise, "", at)
+		}
+		return nil, nil
 	}
 	unlock, err := lockSupervise(db)
 	if err != nil {
@@ -138,6 +155,15 @@ func superviseOnce(ctx context.Context, st *store.Store, db string, snapshot fun
 		}
 	}
 	return sv.Run(ctx, ss, starts)
+}
+
+// toolsOf are the harnesses of a scan's sources.
+func toolsOf(srcs []sessions.Source) []string {
+	var tools []string
+	for _, src := range srcs {
+		tools = append(tools, src.Tool())
+	}
+	return tools
 }
 
 // lockSupervise makes supervise runs on one store take turns from deciding to recording, so two never send the

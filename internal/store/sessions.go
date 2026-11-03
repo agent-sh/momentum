@@ -37,7 +37,7 @@ func (s *Store) SaveSessionStamps(ctx context.Context, st state.Stamps) error {
 }
 
 func loadStamps(ctx context.Context, q querier) (state.Stamps, error) {
-	rows, err := q.QueryContext(ctx, `SELECT key, phase, since, seq, seen, tool, name, auto, ask, ask_kind FROM session_stamps`)
+	rows, err := q.QueryContext(ctx, `SELECT key, phase, since, seq, seen, tool, name, auto, ask, ask_kind, cwd FROM session_stamps`)
 	if err != nil {
 		return nil, err
 	}
@@ -47,7 +47,7 @@ func loadStamps(ctx context.Context, q querier) (state.Stamps, error) {
 		var key, phase, askKind string
 		var since, seen int64
 		var r state.Stamp
-		if err := rows.Scan(&key, &phase, &since, &r.Seq, &seen, &r.Tool, &r.Name, &r.Auto, &r.Ask, &askKind); err != nil {
+		if err := rows.Scan(&key, &phase, &since, &r.Seq, &seen, &r.Tool, &r.Name, &r.Auto, &r.Ask, &askKind, &r.Cwd); err != nil {
 			return nil, err
 		}
 		r.Phase, r.AskKind, r.Since, r.Seen = sessions.Phase(phase), sessions.AskKind(askKind), time.UnixMilli(since), time.UnixMilli(seen)
@@ -61,9 +61,9 @@ func saveStamps(ctx context.Context, q querier, st state.Stamps) error {
 		return err
 	}
 	for k, r := range st {
-		if _, err := q.ExecContext(ctx, `INSERT INTO session_stamps (key, phase, since, seq, seen, tool, name, auto, ask, ask_kind)
-		  VALUES (?,?,?,?,?,?,?,?,?,?)`, k, string(r.Phase), r.Since.UnixMilli(), r.Seq, r.Seen.UnixMilli(), r.Tool, r.Name, r.Auto,
-			r.Ask, string(r.AskKind)); err != nil {
+		if _, err := q.ExecContext(ctx, `INSERT INTO session_stamps (key, phase, since, seq, seen, tool, name, auto, ask, ask_kind, cwd)
+		  VALUES (?,?,?,?,?,?,?,?,?,?,?)`, k, string(r.Phase), r.Since.UnixMilli(), r.Seq, r.Seen.UnixMilli(), r.Tool, r.Name, r.Auto,
+			r.Ask, string(r.AskKind), r.Cwd); err != nil {
 			return err
 		}
 	}
@@ -138,6 +138,24 @@ func (r *Run) SaveStamps(st state.Stamps) error { return saveStamps(r.ctx, r.tx,
 
 // Put stores events, as Store.Put does, and returns how many were new.
 func (r *Run) Put(evs []Event) (int, error) { return put(r.ctx, r.tx, evs) }
+
+// MarkRead, MarkHarnessRead and MarkIncomplete record what the run read, as the Store's do, in the run's transaction:
+// the events and stamps it saves and the record of what they cover land together, or none does.
+func (r *Run) MarkRead(source string, at time.Time) error { return markReadIn(r.ctx, r.tx, source, at) }
+
+func (r *Run) MarkHarnessRead(source, harness string, at time.Time) error {
+	return markHarnessReadIn(r.ctx, r.tx, source, harness, at)
+}
+
+func (r *Run) MarkIncomplete(source, harness string, at time.Time) error {
+	return markIncompleteIn(r.ctx, r.tx, source, harness, at)
+}
+
+// MarkRunRead records a complete run of a harness, and the stretch before it when the run before is further back than
+// RunGap, as Store.MarkRunRead does, in the run's transaction.
+func (r *Run) MarkRunRead(source, harness string, start time.Time, lag time.Duration) error {
+	return markRunReadIn(r.ctx, r.tx, source, harness, start, lag)
+}
 
 // Trackers is the store's side of the session trackers' checkpoints for one build of momentum. It hands a
 // source the checkpoint an earlier run of the same build saved; a checkpoint of another build is not handed out,

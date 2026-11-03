@@ -90,6 +90,13 @@ const usage = `usage:
   momentum loop [--dry] [--family F,F] [--case ID] [--json]
                                         investigate, build and review each family's case; the host checks and proposes
                                         changes, lands them when live, and publishes validated lessons
+  momentum measure [--dry] [--family F,F] [--case ID] [--json]
+                                        the measure step: a deployed change, once in effect, measured over its
+                                        whole-week window after against the three windows before the gate, once
+                                        their sources have read them, by its signal's share of the
+                                        active hours; improved closes its case and keeps the change, no measured effect
+                                        rolls it back while the loop is live (else it holds the rollback, with a
+                                        note); three consecutive read windows at its old share with five hits among them bring it back
   momentum loop runs [--since WHEN] [--case ID] [--json]
                                         the loop's runs, and what the live ones spent in the last day and week
   momentum loop lesson --case ID --text TEXT
@@ -148,6 +155,8 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		err = capacityCmd(ctx, args[1:], stdout, stderr)
 	case "case":
 		err = caseCmd(ctx, args[1:], stdout, stderr)
+	case "measure":
+		err = measureCmd(ctx, args[1:], stdout, stderr)
 	case "ship":
 		err = shipCmd(ctx, args[1:], stdout, stderr)
 	case "loop":
@@ -228,6 +237,11 @@ func ingest(ctx context.Context, stdout, stderr io.Writer) error {
 		return err
 	}
 	defer st.Close()
+	unlock, err := st.LockIngest()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	failed := 0
 	for _, o := range source.RunAll(ctx, st, sources) {
 		if o.Err != nil {
@@ -402,6 +416,11 @@ func rebuild(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		return err
 	}
 	defer st.Close()
+	unlock, err := st.LockIngest()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	gone := 0
 	if name == store.Transcripts && *force {
 		// The homes the ingest reads, where a transcript moved since is found again by its name.

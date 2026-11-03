@@ -15,7 +15,10 @@ import (
 // Incidents reads an incident detector's case files: one JSON file per incident under open/ and closed/.
 // Each file is recorded with the modification time and size it had when parsed; a file is parsed again when
 // either changes, and a file never seen is parsed whatever its time says (a move, cp -p, rsync -a or a
-// restore keeps an old mtime). A file that cannot be read is reported and retried on the next run.
+// restore keeps an old mtime). A file that cannot be read is reported and retried on the next run, and the run is not a
+// complete read: it fails, and records itself as a partial one with the newest modification time among the files it
+// could not read (store.MarkPartialRead, as the transcripts do), so a window that holds an incident it failed to read
+// is never read, and one that starts after those files were last modified is.
 //
 // An incident is one event, rewritten as its file changes: its status, its last sighting and its running count of
 // repeats. Each change of the last sighting or the count is also an event of its own, a sighting (kind
@@ -49,8 +52,11 @@ func (i Incidents) Ingest(ctx context.Context, st *store.Store) (Result, error) 
 		path        string
 		mtime, size int64
 	}
+	started := time.Now()
 	var evs []store.Event
 	var marks []parsed
+	var unread int
+	var newest time.Time // the last modification of the files that could not be read
 	for _, sub := range []string{"open", "closed"} {
 		paths, err := filepath.Glob(filepath.Join(i.Dir, sub, "*.json"))
 		if err != nil {
@@ -70,6 +76,10 @@ func (i Incidents) Ingest(ctx context.Context, st *store.Store) (Result, error) 
 			raw, err := os.ReadFile(p)
 			if err != nil {
 				res.Notes = append(res.Notes, fmt.Sprintf("unreadable, retried next run: %s: %v", p, err))
+				unread++
+				if info.ModTime().After(newest) {
+					newest = info.ModTime()
+				}
 				continue
 			}
 			res.Read++
@@ -150,6 +160,12 @@ func (i Incidents) Ingest(ctx context.Context, st *store.Store) (Result, error) 
 		if err := st.MarkFile(ctx, i.Name(), m.path, m.mtime, m.size); err != nil {
 			return res, err
 		}
+	}
+	if unread > 0 { // what the run stored stands; it read less than it should have, so it is no complete read
+		if err := st.MarkPartialRead(ctx, i.Name(), started, newest); err != nil {
+			return res, err
+		}
+		return res, fmt.Errorf("%d incident files could not be read, retried next run", unread)
 	}
 	return res, nil
 }

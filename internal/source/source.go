@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -39,11 +40,30 @@ type Outcome struct {
 	Err error
 }
 
-// RunAll ingests every source. A failing source is reported and never stops the others.
+// Subsourced is a source whose ingest stores events under sources of its own too, named by its name and a dash (the
+// radar's feedback is radar-feedback, and Rebuild drops it with the radar). A complete run reads each of them.
+type Subsourced interface {
+	Subsources() []string
+}
+
+// RunAll ingests every source. A failing source is reported and never stops the others. A complete run records the
+// read of the source and of each source it stores events under: a measurement that counts an event of one waits
+// for its read.
 func RunAll(ctx context.Context, st *store.Store, sources []Source) []Outcome {
 	out := make([]Outcome, 0, len(sources))
 	for _, s := range sources {
+		started := time.Now()
 		r, err := s.Ingest(ctx, st)
+		if err == nil {
+			err = st.MarkRead(ctx, s.Name(), started)
+		}
+		if sub, ok := s.(Subsourced); ok {
+			for _, name := range sub.Subsources() {
+				if err == nil {
+					err = st.MarkRead(ctx, name, started)
+				}
+			}
+		}
 		out = append(out, Outcome{Name: s.Name(), Result: r, Err: err})
 	}
 	return out

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -103,6 +104,12 @@ func observe(ctx context.Context, st *store.Store, wait time.Duration, snapshot 
 func board(ctx context.Context, w *sessions.World, snapErr error, st *store.Store, build string, srcs []sessions.Source) (ss []*sessions.Session, scanErr, err error) {
 	trackers := st.Trackers(build)
 	ss, failed, scanErr, _ := scanAll(ctx, w, snapErr, trackers, srcs, time.Time{})
+	partial := map[string]bool{} // the harnesses of the sessions a source read only in part
+	for _, s := range ss {
+		if s.Partial {
+			partial[s.Tool] = true
+		}
+	}
 	var cps []sessions.Checkpoint
 	for _, src := range srcs {
 		if r, ok := src.(sessions.Resumable); ok {
@@ -123,7 +130,10 @@ func board(ctx context.Context, w *sessions.World, snapErr error, st *store.Stor
 		if err := r.SaveCheckpoints(trackers, cps, w.Now); err != nil {
 			return err
 		}
-		return r.DropCheckpoints(w.Now.Add(-state.Keep))
+		if err := r.DropCheckpoints(w.Now.Add(-state.Keep)); err != nil {
+			return err
+		}
+		return markScan(r, srcs, failed, partial, w.Now, scanErr == nil && snapErr == nil)
 	})
 	if err != nil {
 		return nil, nil, err
@@ -135,6 +145,42 @@ func board(ctx context.Context, w *sessions.World, snapErr error, st *store.Stor
 		return ss[i].Since.Before(ss[j].Since)
 	})
 	return ss, scanErr, nil
+}
+
+// markScan records what a scan read, for the measurement's read checks. A harness whose scan completed is read up to
+// state.Keep before the scan's time: a session gone from a scan is written vanished up to that much later, dated
+// when it was last seen. One whose scan failed (every one, when the snapshot did) has an incomplete run at the scan's
+// time: the sessions it should have seen, and what they did meanwhile, are not in the store and no later scan puts
+// them there. So has one with a session its source read only in part (partial names the harnesses): the session's
+// stamp is left as it was, and a wait that began and ended while it was read short leaves no event. A complete scan
+// that starts more than store.RunGap after the harness's last one also records the stretch between them as an
+// incomplete run (store.MarkRunRead). The source as a whole is read only when no harness failed or was read in part.
+// They are recorded in the run's transaction, with the stamps and events they cover: a run cut short between them
+// cannot leave a failure unrecorded.
+func markScan(r *store.Run, srcs []sessions.Source, failed []string, partial map[string]bool, now time.Time, whole bool) error {
+	read, named := now.Add(-state.Keep), false
+	short := func(tool string) bool { return slices.Contains(failed, tool) || partial[tool] }
+	for _, src := range srcs {
+		if short(src.Tool()) {
+			named = true
+			if err := r.MarkIncomplete(store.Sessions, src.Tool(), now); err != nil {
+				return err
+			}
+		} else if err := r.MarkRunRead(store.Sessions, src.Tool(), now, state.Keep); err != nil {
+			return err
+		}
+	}
+	unnamed := false // a session read in part whose harness is no source of this scan
+	for tool := range partial {
+		unnamed = unnamed || !slices.ContainsFunc(srcs, func(src sessions.Source) bool { return src.Tool() == tool })
+	}
+	switch {
+	case whole && len(partial) == 0:
+		return r.MarkRead(store.Sessions, read)
+	case unnamed || !whole && !named: // a scan that read less, with no harness of the scan's to name
+		return r.MarkIncomplete(store.Sessions, "", now)
+	}
+	return nil
 }
 
 // scanAll is the scan every look at the sessions makes, a sessions run's and a report's: each source over one
@@ -270,7 +316,7 @@ func phaseEvents(changes []state.Change, ss []*sessions.Session, now time.Time) 
 		meta, _ := json.Marshal(m)
 		// A session's tool is its harness, by the name every source gives it (store.Harnesses).
 		e := store.Event{Source: store.Sessions, SourceKey: c.Key + "@" + strconv.FormatInt(now.UnixMilli(), 10), TS: c.At,
-			Session: c.Key, Harness: c.Tool, Actor: store.ActorHarness, Kind: kind, Summary: oneLine(changeSummary(c), 240), Meta: string(meta)}
+			Cwd: c.Cwd, Session: c.Key, Harness: c.Tool, Actor: store.ActorHarness, Kind: kind, Summary: oneLine(changeSummary(c), 240), Meta: string(meta)}
 		if s := byKey[c.Key]; s != nil {
 			e.Model, e.Cwd = s.Model, s.Cwd
 			if s.Transcript != "" && s.Size >= 0 {

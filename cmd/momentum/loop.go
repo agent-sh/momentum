@@ -91,7 +91,8 @@ func selectionRunner(st *store.Store, c config.Loop) *loop.Runner {
 }
 
 // setup configures the live investigation runner and its trusted input sources.
-func setup(st *store.Store, c config.Loop) (*loop.Runner, error) {
+func setup(st *store.Store, sources config.Sources) (*loop.Runner, error) {
+	c := sources.Loop
 	r := selectionRunner(st, c)
 	home := paths.Home()
 	exe, err := os.Executable()
@@ -110,7 +111,7 @@ func setup(st *store.Store, c config.Loop) (*loop.Runner, error) {
 		return nil, err
 	}
 	r.Agent = loop.Agent{Runner: c.Runner, Model: model, Fallback: fallback, Bedrock: &loop.Bedrock{File: c.BedrockEnv}}
-	r.Ship = setupShip(st, c)
+	r.Ship = setupShip(st, sources)
 	r.Toolchains = loop.Toolchains{ReadOnly: r.Ship.Sandbox.ReadOnly, Path: r.Ship.Sandbox.Path, Cache: r.Ship.Sandbox.Cache,
 		GoRoot: r.Ship.Sandbox.GoRoot, GoModules: r.Ship.Sandbox.GoModules}
 	r.Tacit = "tacit"
@@ -185,11 +186,12 @@ func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	r := selectionRunner(st, c.Loop)
 	if !*dry {
-		r, err = setup(st, c.Loop)
+		r, err = setup(st, c)
 		if err != nil {
 			return err
 		}
 	}
+	r.Ship.SourceLive = c.SourceLive
 	r.Log = func(format string, a ...any) { fmt.Fprintf(stderr, format+"\n", a...) }
 	if !*dry {
 		if err := onBedrock(r.Agent); err != nil {
@@ -216,7 +218,7 @@ func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 // refused comes after the line, apart from the failure the stop rule compares.
 func printDone(stdout io.Writer, enc *json.Encoder, d loop.Done, asJSON bool) error {
 	// Clean fields separately so a cleaner cannot break JSON escaping or keys.
-	for _, text := range []*string{&d.Run.Summary, &d.Skipped, &d.Run.Failure} {
+	for _, text := range []*string{&d.Run.Summary, &d.Skipped, &d.Run.Failure, &d.Did} {
 		clean, err := loop.Redact(context.Background(), *text)
 		if err != nil {
 			return err
@@ -233,7 +235,11 @@ func printDone(stdout io.Writer, enc *json.Encoder, d loop.Done, asJSON bool) er
 	}
 	if asJSON {
 		return enc.Encode(map[string]any{"family": d.Family, "case": d.Case, "step": d.Step, "run": d.Run.ID, "status": d.Run.Status,
-			"failure": d.Run.Failure, "usd": d.Run.USD, "summary": d.Run.Summary, "skipped": d.Skipped, "relay_refused": d.Refused})
+			"failure": d.Run.Failure, "usd": d.Run.USD, "summary": d.Run.Summary, "skipped": d.Skipped, "did": d.Did, "relay_refused": d.Refused})
+	}
+	if d.Did != "" {
+		_, err := fmt.Fprintf(stdout, "%-14s %-10s %s %s\n", firstText(d.Family, "-"), d.Case, d.Step, d.Did)
+		return err
 	}
 	if d.Skipped != "" {
 		_, err := fmt.Fprintf(stdout, "%-14s %-10s %s\n", d.Family, firstText(d.Case, "-"), d.Skipped)

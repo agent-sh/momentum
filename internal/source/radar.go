@@ -33,6 +33,12 @@ type Radar struct {
 
 func (r Radar) Name() string { return "radar" }
 
+// feedbackSource is the source of the scout's feedback events, which the same ingest stores.
+func (r Radar) feedbackSource() string { return r.Name() + "-feedback" }
+
+// Subsources are the other sources a radar ingest stores events under.
+func (r Radar) Subsources() []string { return []string{r.feedbackSource()} }
+
 // radarMargin is twice the scout's busy timeout.
 const radarMargin = 30.0
 
@@ -104,7 +110,7 @@ func (r Radar) feedback(ctx context.Context, db *sql.DB, st *store.Store, res *R
 	if has == 0 {
 		return nil // an older scout without a feedback table
 	}
-	name := r.Name() + "-feedback"
+	name := r.feedbackSource()
 	cur, err := st.Cursor(ctx, name)
 	if err != nil {
 		return err

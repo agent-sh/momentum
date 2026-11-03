@@ -147,7 +147,8 @@ func busyIn(ctx context.Context, st *store.Store, dir string, ss map[int]capacit
 	return "", nil
 }
 
-func setupShip(st *store.Store, c config.Loop) *loop.Ship {
+func setupShip(st *store.Store, sources config.Sources) *loop.Ship {
+	c := sources.Loop
 	home := paths.Home()
 	ro, toolPath, goRoot, goModules := toolchains(home)
 	sb := loop.Sandbox{Home: home, ReadOnly: append(ro, expandAll(c.SandboxRead)...), Cache: filepath.Join(loopDir(), "cache"), Scratch: filepath.Join(loopDir(), "tmp"), Path: toolPath, GoRoot: goRoot, GoModules: goModules}
@@ -163,6 +164,6 @@ func setupShip(st *store.Store, c config.Loop) *loop.Ship {
 			return nil
 		}
 	}
-	return &loop.Ship{Store: st, Dir: loopDir(), Live: c.Live, Actor: caseActor(), Identity: [2]string{gitGlobal("user.name"), gitGlobal("user.email")}, Sandbox: sb,
+	return &loop.Ship{Store: st, SourceLive: sources.SourceLive, Dir: loopDir(), InstalledRoots: expandAll(c.ReadDirs), Live: c.Live, Actor: caseActor(), Identity: [2]string{gitGlobal("user.name"), gitGlobal("user.email")}, Sandbox: sb,
 		Gate: loop.Gate{Owners: c.Owners, Exclude: c.Exclude, RepoGuard: c.RepoGuard, Home: home, Busy: func(ctx context.Context, dir string) (string, error) { return repoBusy(ctx, st, dir) }}}
 }

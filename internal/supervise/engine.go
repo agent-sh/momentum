@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -105,6 +106,9 @@ type Supervisor struct {
 	// Answered tells whether the session's transcript shows, since the scan, a record that answers a request sent
 	// at sent; nil reads the transcript (claude.Answered).
 	Answered func(s *sessions.Session, sent time.Time) (bool, error)
+	// Harnesses are the harnesses a run decides for, those of the scan's sources; nil takes those of the sessions the
+	// run is given. Each is read or not by itself (markRun).
+	Harnesses []string
 }
 
 // Line is one decision of a run, for the command's output.
@@ -125,15 +129,20 @@ func (sv *Supervisor) now() time.Time {
 // Run decides for each session and acts. starts maps a session's pid to its process's start ticks, from the
 // scan's snapshot, and ss must be the whole of a scan that worked: a session missing from it has ended. A
 // session the scan read only in part is left alone. Then it keeps the report's notes about the sessions in step
-// (notes). It returns the run's decisions.
-func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts map[int]uint64) ([]Line, error) {
-	var lines []Line
+// (notes). It returns the run's decisions, and records what it read (markRun).
+func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts map[int]uint64) (lines []Line, err error) {
+	readAt := sv.now()
+	partial := map[string]bool{} // the harnesses of the sessions the scan read in part
+	defer func() {
+		err = errors.Join(err, sv.markRun(context.WithoutCancel(ctx), readAt, ss, partial, err != nil))
+	}()
 	probe := sv.Probe
 	seen := map[string]*seenSession{}
 	var sleep *[2]time.Time // asked once per run, and only when a session waits on a request or a run of its own
 	for _, s := range ss {
 		now := sv.now()
 		if s.Partial {
+			partial[s.Tool] = true
 			seen[s.Key] = nil // its facts may be short: decide on the next scan, and keep its notes as they are
 			if err := sv.put(ctx, []store.Event{sv.note(s, KindSkip, "partial", now, "the scan read it only in part: decided on the next scan")}); err != nil {
 				return lines, err
@@ -274,6 +283,42 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 		lines = append(lines, line)
 	}
 	return lines, sv.notes(ctx, seen)
+}
+
+// markRun records what a run read, for the measurement's read checks. A harness is read when the run decided for all
+// its sessions; a session the scan read in part is left for the next scan, which leaves its harness's run incomplete,
+// and so does a run that stopped on an error, for every harness. What a run that decided nothing should have decided
+// is not in the store, and no later run decides it: nor one a stopped timer never started, so a run that starts more
+// than store.RunGap after the harness's last complete one also records the stretch between them as incomplete. The
+// source as a whole is read when every harness was.
+func (sv *Supervisor) markRun(ctx context.Context, at time.Time, ss []*sessions.Session, partial map[string]bool, failed bool) error {
+	harnesses := slices.Clone(sv.Harnesses)
+	if harnesses == nil {
+		for _, s := range ss {
+			harnesses = append(harnesses, s.Tool)
+		}
+		slices.Sort(harnesses)
+		harnesses = slices.Compact(harnesses)
+	}
+	var errs []error
+	for _, h := range harnesses {
+		if failed || partial[h] {
+			errs = append(errs, sv.Store.MarkIncomplete(ctx, store.Supervise, h, at))
+		} else {
+			errs = append(errs, sv.Store.MarkRunRead(ctx, store.Supervise, h, at, 0))
+		}
+	}
+	unnamed := failed && len(harnesses) == 0
+	for h := range partial {
+		unnamed = unnamed || !slices.Contains(harnesses, h)
+	}
+	switch {
+	case !failed && len(partial) == 0:
+		errs = append(errs, sv.Store.MarkRead(ctx, store.Supervise, at))
+	case unnamed: // a run that read less, with no harness of the run's to name
+		errs = append(errs, sv.Store.MarkIncomplete(ctx, store.Supervise, "", at))
+	}
+	return errors.Join(errs...)
 }
 
 // note is a supervise event about a session that is no rule's decision: a session left for the next scan, a

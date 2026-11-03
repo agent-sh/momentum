@@ -18,20 +18,21 @@ import (
 const buildSchema = `{"type":"object","additionalProperties":false,
 "required":["summary","test","title","body","rollback","signal","window","lesson"],
 "properties":{"summary":{"type":"string"},"test":{"type":"string"},"title":{"type":"string"},
-"body":{"type":"string"},"rollback":{"type":"string"},"window":{"type":"string"},"lesson":{"type":"string"},
+"body":{"type":"string"},"rollback":{"type":"string"},"window":{"type":"string"},"lesson":{"type":"string"},"installed":{"type":"string"},
 "signal":{"type":"object","additionalProperties":false,"required":["source","kinds","match"],
 "properties":{"source":{"type":"string"},"kinds":{"type":"array","items":{"type":"string"}},
 "tool":{"type":"string"},"harness":{"type":"string"},"match":{"type":"array","items":{"type":"string"}}}}}}`
 
 type BuildReport struct {
-	Summary  string `json:"summary"`
-	Test     string `json:"test"`
-	Title    string `json:"title"`
-	Body     string `json:"body"`
-	Rollback string `json:"rollback"`
-	Window   string `json:"window"`
-	Lesson   string `json:"lesson"`
-	Signal   Signal `json:"signal"`
+	Summary   string `json:"summary"`
+	Test      string `json:"test"`
+	Title     string `json:"title"`
+	Body      string `json:"body"`
+	Rollback  string `json:"rollback"`
+	Window    string `json:"window"`
+	Lesson    string `json:"lesson"`
+	Signal    Signal `json:"signal"`
+	Installed string `json:"installed,omitempty"`
 }
 
 func buildReport(raw []byte) (BuildReport, error) {
@@ -147,7 +148,7 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 	if err != nil {
 		return p, err
 	}
-	if !had || p.State == RolledBack {
+	if !had || p.State == RolledBack || p.State == Kept {
 		p, err = r.Ship.Prepare(ctx, c.ID, source)
 	} else {
 		if roundsUsed(p) {
@@ -225,6 +226,9 @@ func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Re
 	if err != nil {
 		return stageFailure(res, "build report", err)
 	}
+	if err := r.Ship.installedReadable(report.Installed); err != nil {
+		return stageFailure(res, "build report", err)
+	}
 	p, ok, err := r.Ship.Load(c.ID)
 	if err != nil || !ok {
 		return stageFailure(res, "build package", firstError(err, "package is absent"))
@@ -252,7 +256,7 @@ func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Re
 		return stageFailure(res, "build propose", err)
 	}
 	_, err = r.Ship.Propose(ctx, c.ID, Proposal{Title: report.Title, Body: report.Body, Rollback: report.Rollback,
-		Lesson: report.Lesson, Signal: report.Signal, Window: window}, snapshot)
+		Lesson: report.Lesson, Signal: report.Signal, Window: window, Installed: report.Installed}, snapshot)
 	if err != nil {
 		return stageFailure(res, "build propose", err)
 	}

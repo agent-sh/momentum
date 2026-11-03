@@ -348,3 +348,61 @@ func TestASlowCreepIsNoFastFill(t *testing.T) {
 		t.Fatalf("0.2 GiB an hour is no fast fill, even with the line due in %s: %+v", d.FullIn, d)
 	}
 }
+
+// A recorded capacity run is a complete observation of its generated events. A dry run advances no source read.
+func TestOnlyARecordedCapacityRunAdvancesItsReadTime(t *testing.T) {
+	ctx := context.Background()
+	f := newModels(t)
+	st := openStore(t)
+	opt := options(t, procRoot(t), f.now, nil)
+	opt.DryRun = true
+	if _, err := Run(ctx, f.cfg, st, opt); err != nil {
+		t.Fatal(err)
+	}
+	read, err := st.ReadThrough(ctx, store.Capacity)
+	if err != nil || !read.IsZero() {
+		t.Fatalf("dry: %v %v", read, err)
+	}
+	opt.DryRun = false
+	if _, err := Run(ctx, f.cfg, st, opt); err != nil {
+		t.Fatal(err)
+	}
+	read, err = st.ReadThrough(ctx, store.Capacity)
+	if err != nil || !read.Equal(f.now.Truncate(time.Millisecond)) {
+		t.Fatalf("recorded: %v %v", read, err)
+	}
+}
+
+// A recorded capacity run that stops on an error is an incomplete run of the capacity source: the sample it should
+// have taken is not in the store and no later run takes it, so a window that holds it is never read. A dry run, which
+// records nothing, leaves none.
+func TestARecordedCapacityRunThatStoppedIsAnIncompleteRun(t *testing.T) {
+	ctx := context.Background()
+	f := newModels(t)
+	st := openStore(t)
+	opt := options(t, procRoot(t), f.now, nil)
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	gap := func() time.Time {
+		t.Helper()
+		at, err := st.Incomplete(ctx, store.Capacity, "", f.now.Add(-time.Hour), f.now.Add(time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return at
+	}
+	opt.DryRun = true
+	if _, err := Run(cancelled, f.cfg, st, opt); err == nil || !gap().IsZero() {
+		t.Fatalf("a dry run that stopped: %v, incomplete at %v", err, gap())
+	}
+	opt.DryRun = false
+	if _, err := Run(cancelled, f.cfg, st, opt); err == nil {
+		t.Fatal("a recorded run on a cancelled context did not fail")
+	}
+	if !gap().Equal(f.now.Truncate(time.Millisecond)) {
+		t.Fatalf("incomplete at %v, want the run's time %v", gap(), f.now)
+	}
+	if read, err := st.ReadThrough(ctx, store.Capacity); err != nil || !read.IsZero() {
+		t.Fatalf("the failed run advanced the read: %v %v", read, err)
+	}
+}

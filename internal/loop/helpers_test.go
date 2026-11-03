@@ -11,12 +11,19 @@ import (
 
 func testStore(t *testing.T) *store.Store {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "m.db"))
+	st, _ := testStoreAt(t)
+	return st
+}
+
+func testStoreAt(t *testing.T) (*store.Store, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "m.db")
+	st, err := store.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	return st
+	return st, path
 }
 
 func write(t *testing.T, path, text string) {

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/agent-sh/momentum/internal/source"
 )
 
 // The transcripts source's homes come from sources.json, ~ alone and ~/ expanded to the home directory.
@@ -107,5 +109,49 @@ func TestExtraTranscriptLocationsAreExpanded(t *testing.T) {
 	}
 	if len(s.Transcripts.Sources) != 2 || s.Transcripts.Sources[0].DB != filepath.Join(home, "neutral.db") || s.Transcripts.Sources[1].Glob != filepath.Join(home, "neutral", "*", "wire.jsonl") {
 		t.Fatalf("locations %+v", s.Transcripts.Sources)
+	}
+}
+
+func TestASubSourceIsLiveAsItsReaderIs(t *testing.T) {
+	var s Sources
+	for _, source := range []string{"radar", "radar-feedback", "mistakes", "incidents", "transcripts"} {
+		if s.SourceLive(source) {
+			t.Errorf("%s is live with nothing configured", source)
+		}
+	}
+	s.Radar.Path = "/synthetic/radar.db"
+	if !s.SourceLive("radar") || !s.SourceLive("radar-feedback") || s.SourceLive("mistakes") {
+		t.Errorf("a configured radar: radar %v, its feedback %v, mistakes %v", s.SourceLive("radar"), s.SourceLive("radar-feedback"), s.SourceLive("mistakes"))
+	}
+	if !s.SourceLive("sessions") || !s.SourceLive("capacity") || !s.SourceLive("zz-reader") {
+		t.Error("commands and unknown readers are live")
+	}
+}
+
+func TestASourceIsLiveWhenItsReaderIsConfigured(t *testing.T) {
+	var s Sources
+	s.Mistakes.Path = "/synthetic/mistakes.jsonl"
+	s.Incidents.Dir = "/synthetic/incidents"
+	s.Transcripts.Homes = []string{"/synthetic"}
+	for source, want := range map[string]bool{"mistakes": true, "incidents": true, "transcripts": true, "radar": false, "radar-feedback": false, "supervise": true} {
+		if got := s.SourceLive(source); got != want {
+			t.Errorf("%s: live %v, want %v", source, got, want)
+		}
+	}
+	s.Supervise.Off = true
+	if s.SourceLive("supervise") {
+		t.Error("supervision is switched off")
+	}
+	var none Sources
+	if none.SourceLive("mistakes") || none.SourceLive("incidents") || none.SourceLive("transcripts") {
+		t.Error("readers nothing names are live")
+	}
+}
+
+func TestANativeTranscriptReaderIsLiveWithoutAHarnessHome(t *testing.T) {
+	var s Sources
+	s.Transcripts.Sources = []source.TranscriptSource{{Harness: "kimi", Glob: "marker-7f3a/*.jsonl"}}
+	if !s.SourceLive("transcripts") {
+		t.Fatal("a configured native reader was omitted from measurement")
 	}
 }

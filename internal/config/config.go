@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/source"
@@ -53,12 +54,12 @@ type Sources struct {
 	Detect struct {
 		ProgramPrefixes []string `json:"program_prefixes"`
 	} `json:"detect"`
-	// Loop configures investigations. Build-related keys remain accepted for later parts.
+	// Loop configures investigations, builds and measurement.
 	Loop Loop `json:"loop"`
 }
 
 // Loop configures the native agent, read sources, rules, constraints and budgets.
-// Model and FallbackModel name one model each. Build-related keys remain inert.
+// Model and FallbackModel name one model each.
 type Loop struct {
 	Live          bool     `json:"live"`
 	Runner        []string `json:"runner"`
@@ -67,10 +68,10 @@ type Loop struct {
 	Families      []string `json:"families"`
 	Owners        []string `json:"owners"`
 	Exclude       []string `json:"exclude"`
-	// ReadDirs are the repositories cloned read-only for investigations.
+	// ReadDirs are repositories cloned read-only for investigations and host directories that admit a build report's installed file.
 	ReadDirs   []string `json:"read_dirs"`
 	TacitStore string   `json:"tacit_store"`
-	// SandboxRead remains accepted for later build checks.
+	// SandboxRead adds read-only inputs for build checks.
 	SandboxRead []string `json:"sandbox_read"`
 	Rules       []string `json:"rules"`
 	RepoGuard   []string `json:"repo_guard"`
@@ -165,4 +166,29 @@ func Load() (Sources, error) {
 	s.Loop.BedrockEnv = paths.Expand(s.Loop.BedrockEnv)
 	s.Loop.TacitStore = paths.Expand(s.Loop.TacitStore)
 	return s, nil
+}
+
+// SourceLive reports which configured readers can still contribute to a measurement. A source that carries a reader's
+// name and a dash (radar-feedback, which Rebuild drops with the radar) is that reader's.
+func (s Sources) SourceLive(source string) bool {
+	for _, reader := range []string{"mistakes", "radar", "incidents", "transcripts"} {
+		if strings.HasPrefix(source, reader+"-") {
+			source = reader
+			break
+		}
+	}
+	switch source {
+	case "mistakes":
+		return s.Mistakes.Path != ""
+	case "radar":
+		return s.Radar.Path != ""
+	case "incidents":
+		return s.Incidents.Dir != ""
+	case "transcripts":
+		return len(s.Transcripts.Homes) > 0 || len(s.Transcripts.Sources) > 0
+	case "supervise":
+		return !s.Supervise.Off
+	default:
+		return true // sessions and capacity are commands, not configured ingest paths
+	}
 }

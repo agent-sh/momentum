@@ -25,6 +25,7 @@ const (
 	StepInvestigate = "investigate"
 	StepBuild       = "build"
 	StepReview      = "review"
+	StepMeasure     = "measure"
 )
 
 // Budgets are the loop's limits, in US dollars and time. The defaults come from the Phase 0 baseline: what the
@@ -71,6 +72,7 @@ type Done struct {
 	Run                store.LoopRun
 	Skipped            string   // why no step ran
 	Refused            []string // what the run's relay refused to forward (also in the run's summary)
+	Did                string   // outcome of a host step with no agent run
 }
 
 func (r *Runner) now() time.Time {
@@ -125,6 +127,10 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 			r.logf("swept %s: %s", c.ID, c.Title)
 		}
 	}
+	measured, err := r.Measure(ctx, o)
+	if err != nil {
+		return nil, err
+	}
 	families := r.Families
 	if len(o.Families) > 0 {
 		families = o.Families
@@ -141,6 +147,16 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		starts []reserved
 		picked error
 	)
+	for _, m := range measured {
+		did := m.Status
+		if m.Result != nil && m.Result.Effect != "" {
+			did += ": " + m.Result.Effect
+		}
+		if m.Why != "" && !strings.Contains(did, m.Why) {
+			did += ": " + m.Why
+		}
+		done = append(done, Done{Case: m.Case, Step: StepMeasure, Did: did})
+	}
 	building := false
 	for _, fam := range families {
 		if ctx.Err() != nil { // the pass was told to stop (a signal): no run starts
@@ -322,6 +338,9 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 				return store.Case{}, "", "", err
 			} else if ok && p.State == Landed {
 				if !dry {
+					if err := r.Ship.deploymentReceipt(ctx, p); err != nil {
+						return store.Case{}, "", "", err
+					}
 					if _, err := r.Store.DeployCase(ctx, c.ID, r.Ship.pkgDir(c.ID), p.LandedAt, p.PR+": "+p.Title, "loop"); err != nil {
 						return store.Case{}, "", "", err
 					}
@@ -333,6 +352,11 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 				continue
 			} else if ok && (p.State == Proposed || p.State == Landing) {
 				continue // its review or its landing comes next (reviews)
+			} else if ok && !p.ProposalAt.IsZero() && p.Plan != nil {
+				if wait := r.Ship.waiting(ctx, c, *p.Plan, r.now()); wait != nil {
+					passed = append(passed, c.ID+"'s proposal waits on "+wait.what())
+					continue
+				}
 			}
 			if repo, err := r.caseRepo(ctx, c); err != nil {
 				return store.Case{}, "", "", err

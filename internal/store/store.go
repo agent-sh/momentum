@@ -143,7 +143,7 @@ var keptColumns = []struct {
 		{"ref", "TEXT NOT NULL DEFAULT ''"}, {"heuristic", "INTEGER NOT NULL DEFAULT 0"},
 		{"experiment", "TEXT NOT NULL DEFAULT ''"}, {"ingested", "INTEGER NOT NULL DEFAULT 0"}}},
 	{"session_stamps", [][2]string{{"tool", "TEXT NOT NULL DEFAULT ''"}, {"name", "TEXT NOT NULL DEFAULT ''"},
-		{"auto", "INTEGER NOT NULL DEFAULT 0"}, {"ask", "TEXT NOT NULL DEFAULT ''"}, {"ask_kind", "TEXT NOT NULL DEFAULT ''"}}},
+		{"cwd", "TEXT NOT NULL DEFAULT ''"}, {"auto", "INTEGER NOT NULL DEFAULT 0"}, {"ask", "TEXT NOT NULL DEFAULT ''"}, {"ask_kind", "TEXT NOT NULL DEFAULT ''"}}},
 	{"loop_runs", loopRunColumns},
 	{"cases", [][2]string{{"episode", "INTEGER NOT NULL DEFAULT 1"}}},
 	{"capacity_runs", [][2]string{{"blind", "INTEGER NOT NULL DEFAULT 0"}}},
@@ -882,12 +882,16 @@ func (s *Store) Rebuild(ctx context.Context, source string, force bool) (int, er
 		return 0, err
 	}
 	for _, q := range []string{
-		`DELETE FROM cursors WHERE source=? OR source LIKE ?`,
+		`DELETE FROM cursors WHERE source=? OR source LIKE ? OR source = ? || ':read' OR source LIKE ? || ':read:%'`,
 		`DELETE FROM seen_files WHERE source=? OR source LIKE ?`,
 		`DELETE FROM skipped WHERE source=? OR source LIKE ?`,
 		`DELETE FROM file_cursors WHERE source=? OR source LIKE ?`,
 	} {
-		if _, err := tx.ExecContext(ctx, q, source, like); err != nil {
+		args := []any{source, like}
+		if strings.Contains(q, "DELETE FROM cursors") {
+			args = append(args, source, source)
+		}
+		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
 			return 0, err
 		}
 	}
@@ -1012,17 +1016,21 @@ func (s *Store) Origins(ctx context.Context, source string) (map[Origin]int, err
 // moment keep their order in the source (SourceKey). Until, when set, is the end of the window. Harness, when
 // set, is one of Harnesses: its events from every source.
 type Query struct {
-	Since   time.Time
-	Kinds   []string
-	Source  string
-	Session string
-	Until   time.Time
-	Limit   int
-	Harness string
-	Actor   Actor  // when set, only its events
-	Main    bool   // only a session's own events, not its subagents'
-	MetaHas string // when set, only events whose meta holds it, e.g. `"is_error":true`
-	Before  *Event // exclusive (time, source key) cursor for descending pagination
+	Since      time.Time
+	Kinds      []string
+	Source     string
+	Session    string
+	Until      time.Time
+	Limit      int
+	Harness    string
+	Actor      Actor  // when set, only its events
+	ExcludeCwd string // exclude this directory and its descendants
+	Main       bool   // only a session's own events, not its subagents'
+	MetaHas    string // when set, only events whose meta holds it, e.g. `"is_error":true`
+	// FailedResults leaves out the tool results whose meta does not say `"is_error":true`: a successful result that quotes
+	// an error is no failure. Events of any other kind are all there.
+	FailedResults bool
+	Before        *Event // exclusive (time, source key) cursor for descending pagination
 }
 
 func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
@@ -1036,6 +1044,7 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 	if q.Source != "" {
 		where, args = append(where, "source = ?"), append(args, q.Source)
 	}
+	where, args = excludeDirectory(where, args, q.ExcludeCwd)
 	if q.Harness != "" {
 		where, args = append(where, "harness = ?"), append(args, q.Harness)
 	}
@@ -1054,6 +1063,9 @@ func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
 	if q.Before != nil {
 		where = append(where, "(ts < ? OR (ts = ? AND source_key < ?))")
 		args = append(args, q.Before.TS.UnixMilli(), q.Before.TS.UnixMilli(), q.Before.SourceKey)
+	}
+	if q.FailedResults {
+		where, args = append(where, "(kind != 'tool_result' OR instr(meta, ?) > 0)"), append(args, `"is_error":true`)
 	}
 	order := "ts DESC, source_key DESC"
 	if q.Session != "" {

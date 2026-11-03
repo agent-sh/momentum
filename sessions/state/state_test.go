@@ -166,3 +166,36 @@ func TestAPartialReadChangesNothing(t *testing.T) {
 		t.Fatalf("a first sighting read in part gets no stamp: %+v %v", got, st)
 	}
 }
+
+// A session's stamp keeps the directory it worked in, so a change reported later - a new stretch, or the session gone -
+// carries it, though a scan that lost it says none: the loop's own runs are left out of a measurement by their
+// directory, and a vanished run is reported long after its last scan.
+func TestAStampKeepsTheDirectoryASessionWorkedIn(t *testing.T) {
+	st := Stamps{}
+	a := sess("a", sessions.Working, 3, t0)
+	a.Cwd = "/w/parser"
+	if changes := st.Apply([]*sessions.Session{a}, t0); len(changes) != 1 || changes[0].Cwd != "/w/parser" {
+		t.Fatalf("the sighting: %+v", changes)
+	}
+	lost := sess("a", sessions.Idle, 4, t0.Add(time.Minute)) // a scan that lost the directory
+	if changes := st.Apply([]*sessions.Session{lost}, t0.Add(time.Minute)); len(changes) != 1 || changes[0].Cwd != "/w/parser" {
+		t.Fatalf("a new stretch of a scan that lost the directory: %+v", changes)
+	}
+	if st["a"].Cwd != "/w/parser" {
+		t.Fatalf("the stamp: %+v", st["a"])
+	}
+	gone := st.Apply(nil, t0.Add(Keep+time.Hour))
+	if len(gone) != 1 || gone[0].To != "" || gone[0].Cwd != "/w/parser" {
+		t.Fatalf("the session gone: %+v", gone)
+	}
+	// a scan that names another directory moves the stamp
+	b := sess("b", sessions.Working, 1, t0)
+	b.Cwd = "/w/one"
+	st.Apply([]*sessions.Session{b}, t0)
+	b2 := sess("b", sessions.Working, 2, t0.Add(time.Minute))
+	b2.Cwd = "/w/two"
+	st.Apply([]*sessions.Session{b2}, t0.Add(time.Minute))
+	if st["b"].Cwd != "/w/two" {
+		t.Fatalf("the stamp of b: %+v", st["b"])
+	}
+}

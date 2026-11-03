@@ -177,7 +177,7 @@ momentum case reopen ID --evidence REF... [--at WHEN] --why W
 
 `case detect` runs the detectors, deterministic reads with no model (of the store, and for sessions of what the replay of supervision reads): recurring tool and infrastructure failures (guard refusals, harness and tool errors, commands that fail the setup's way, model refusals, incidents), the owner's own turns that push back or repeat with the agent's last words before them, and what keeps sessions waiting on him (supervision's give-ups, nudges no rule covers, long waits). Each finding is a signature; a case opens for a new one, and the case that holds it takes the evidence.
 
-A case is one answer in progress to a standing question: its family, its evidence, the suspected mechanism and the alternatives, the next test that tells them apart, the expected benefit, what it cost so far, and its status (open, investigating, testing, deployed, measuring, closed with a reason). A symptom's signature opens a case, and the same signature finds it again; the root cause's signature merges the cases it explains. A closed case comes back on new evidence only: a recurrence after it was solved, its old rate after it improved, or as much again as it was dismissed on. The host deploys checked and reviewed packages. Measurement and improved closure remain for the next part. A case unseen for 30 days closes by itself.
+A case is one answer in progress to a standing question: its family, its evidence, the suspected mechanism and the alternatives, the next test that tells them apart, the expected benefit, what it cost so far, and its status (open, investigating, testing, deployed, measuring, closed with a reason). A symptom's signature opens a case, and the same signature finds it again; the root cause's signature merges the cases it explains. A closed case comes back on new evidence only: a recurrence after it was solved, its old rate after it improved, or as much again as it was dismissed on. The host deploys checked and reviewed packages. The measure step starts once the change is in effect and closes an improved case with its measured effect. A case unseen for 30 days closes by itself.
 
 ## Loop
 
@@ -190,7 +190,16 @@ The loop investigates, builds and reviews through Claude Code's native agent in 
 
 The host gates the source repository and prepares independent host and build clones at BASE. A build edits `/work`, runs its discriminating test and returns summary, test, title, body, rollback, signal, window and lesson. Toolchains and module caches are read-only, with build caches in tmpfs. A second sandbox job without a relay or harness exports the cumulative patch. The host reads that one confined file, validates it, applies it in its clone and checks that the test fails on BASE and passes on the change. It proposes exactly the checked tree.
 
-A review reads the proposed tree at `/ro/change` read-only and the patch at `/run/input/change.patch`. The host keeps and posts the findings. High and medium findings return to a build with `review.md`. A moved base supplies `previous.patch` for adaptation. Three rounds are allowed; exhausted changes wait with a passive note. A clean posted review can land when `loop.live` is true. Every push rechecks the repository gate. Landing and rollback use host journals and fast-forward pushes. An improved case's lesson is published by the host without another model run. Measurement is the next part.
+A review reads the proposed tree at `/ro/change` read-only and the patch at `/run/input/change.patch`. The host keeps and posts the findings. High and medium findings return to a build with `review.md`. A moved base supplies `previous.patch` for adaptation. Three rounds are allowed; exhausted changes wait with a passive note. A clean posted review can land when `loop.live` is true. Every push rechecks the repository gate. Landing and rollback use host journals and fast-forward pushes. An improved case's lesson is published by the host without another model run. The host measures its deployed change and watches for regression.
+
+The measure step runs on each loop pass, or with `momentum measure [--dry] [--family F,F] [--case ID] [--json]`. It uses no model. A plan counts the signal's share of active hours over whole weeks. Choose a week, or two for a rarer problem. At least five hit hours admit the gate. The three windows before that gate supply the independent baseline. Every counted source must have read past a window before it decides.
+
+Measurement starts once the repository checkout holds the landed change. For a binary or installed configuration, the build report names `installed` in an admitted `loop.read_dirs` directory. The owner can also use `momentum ship propose --installed FILE`. A Go revision must hold the change. Another installed file must be rebuilt after its checkout held it. Host code checks and records the installed file. No momentum command runs inside the sandbox.
+
+A lower share beyond chance closes the case as improved and leaves a shipped note with its measured effect. No measured effect rolls the change back while the loop is live. Otherwise a decided note holds the rollback and gives the command to do it by hand. A quiet window waits one more window. Three consecutive read watch windows at the old share, with five hits among them, reopen the case. Waiting and decision notes stay passive. SPEC's Measurement section states the assumptions and measured test rates.
+
+
+Read gaps do not count as a fix: a window in which a scan failed is never read whole. Its window after starts again once the source reads past the failure. A Go build from a modified checkout is judged once by the tree it was built from, while its hash and time stand. A build report names a file only where the loop reads, in loop.read_dirs.
 
 The host prepares scrubbed inputs before any model starts: the last 30 days of events and notes, evidence records and neighbours, unit logs, text configuration, tacit's facts and full-history repository clones. Pass-level copies are made once, shared read-only and removed at the end. Each run gets its own records and case file. A missing or failed scrubber skips the step without charging the case. A dry pass prepares nothing and writes nothing.
 
@@ -218,7 +227,7 @@ The owner's CLI controls the same host package lifecycle:
 ```
 momentum ship prepare --case ID --repo DIR
 momentum ship check --case ID --test "go test ./..." --patch FILE
-momentum ship propose --case ID --title TITLE --body-file FILE --rollback TEXT --signal JSON --window 7d --lesson TEXT --patch FILE
+momentum ship propose --case ID --title TITLE --body-file FILE --rollback TEXT --signal JSON --window 7d --lesson TEXT --patch FILE [--installed FILE]
 momentum ship status --case ID [--json]
 momentum ship land --case ID
 momentum ship rollback --case ID --why TEXT

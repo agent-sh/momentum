@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -356,5 +357,44 @@ func TestASessionHoldsItsThreadsAtAnyDepth(t *testing.T) {
 	}
 	if fmt.Sprint(keys) != "[r@1 c@1 g@1]" {
 		t.Fatalf("the root session lists %v", keys)
+	}
+}
+
+// FailedResults leaves out the tool results that did not fail, and only those: a successful result that quotes an error
+// is no failure, and an event of any other kind has no such meta to hold.
+func TestFailedResultsLeaveOutOnlyTheResultsThatDidNotFail(t *testing.T) {
+	st, _ := open(t)
+	ctx := context.Background()
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	evs := []Event{
+		{Source: Transcripts, SourceKey: "failed", Session: "s", TS: t0, Actor: ActorTool, Kind: "tool_result", Meta: `{"is_error":true}`},
+		{Source: Transcripts, SourceKey: "quoted", Session: "s", TS: t0.Add(time.Second), Actor: ActorTool, Kind: "tool_result", Meta: `{"is_error":false}`},
+		{Source: Transcripts, SourceKey: "bare", Session: "s", TS: t0.Add(2 * time.Second), Actor: ActorTool, Kind: "tool_result"},
+		{Source: Transcripts, SourceKey: "text", Session: "s", TS: t0.Add(3 * time.Second), Actor: ActorAgent, Kind: "text"},
+	}
+	if _, err := st.Put(ctx, evs); err != nil {
+		t.Fatal(err)
+	}
+	keys := func(q Query) string {
+		t.Helper()
+		q.Since = t0.Add(-time.Hour)
+		got, err := st.Events(ctx, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, e := range got {
+			out = append(out, e.SourceKey)
+		}
+		return strings.Join(out, ",")
+	}
+	if got := keys(Query{Kinds: []string{"tool_result"}, FailedResults: true}); got != "failed" {
+		t.Errorf("failed results of the tool results: %q", got)
+	}
+	if got := keys(Query{Kinds: []string{"tool_result", "text"}, FailedResults: true}); got != "text,failed" {
+		t.Errorf("failed results and the text events: %q", got)
+	}
+	if got := keys(Query{Kinds: []string{"tool_result", "text"}}); got != "text,bare,quoted,failed" {
+		t.Errorf("no filter: %q", got)
 	}
 }

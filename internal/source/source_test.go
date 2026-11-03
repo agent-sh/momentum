@@ -368,14 +368,91 @@ func TestIncidentsRetryAFileThatWasUnreadable(t *testing.T) {
 		t.Fatal(err)
 	}
 	inc := Incidents{Dir: dir}
-	if r := ingest(t, inc, st); r.Read != 0 || len(r.Notes) != 1 {
-		t.Fatalf("an unreadable file must be reported: %+v", r)
+	if r, err := inc.Ingest(context.Background(), st); err == nil || r.Read != 0 || len(r.Notes) != 1 {
+		t.Fatalf("an unreadable file must be reported, and the run fail: %+v %v", r, err)
 	}
 	if err := os.Chmod(p, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if r := ingest(t, inc, st); r.New != 2 || r.Read != 1 { // the incident and its first sighting
 		t.Fatalf("the file was not retried: %+v", r)
+	}
+}
+
+// unreadableIncident writes an incident file the process cannot read: one with no permission at all, or, for a user who
+// reads those, a directory in its place.
+func unreadableIncident(t *testing.T, dir, sub, id string, mtime time.Time) string {
+	t.Helper()
+	p := writeIncident(t, dir, sub, id, "new", "2026-01-02T10:00:00+02:00", mtime)
+	if os.Geteuid() != 0 {
+		if err := os.Chmod(p, 0); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(p, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(p, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// An incident file the ingest could not read is reported and retried, and the run is no complete read: it fails, so the
+// incidents source is not recorded as read through its start, and a measurement that counts an incident does not decide
+// a window that lacks it. The run records itself as a partial one, as the transcripts do, with the newest modification
+// among the files it could not read: a window that starts after they were last modified is read all the same. What the
+// run could read is stored.
+func TestAnUnreadableIncidentFileLeavesTheRunNoCompleteRead(t *testing.T) {
+	ctx := context.Background()
+	st := openStore(t)
+	dir := t.TempDir()
+	inc := Incidents{Dir: dir}
+	hour := time.Hour
+	writeIncident(t, dir, "open", "inc-2", "new", "2026-01-02T10:00:00+02:00", time.Now().Add(-5*hour))
+	if out := RunAll(ctx, st, []Source{inc}); out[0].Err != nil {
+		t.Fatalf("a complete run: %v", out[0].Err)
+	}
+	complete, err := st.ReadThrough(ctx, store.Incidents)
+	if err != nil || complete.IsZero() {
+		t.Fatalf("the complete run is a read: %v %v", complete, err)
+	}
+	modified := time.Now().Add(-3 * hour)
+	p := unreadableIncident(t, dir, "open", "inc-1", modified)
+	writeIncident(t, dir, "closed", "inc-3", "closed", "2026-01-02T10:00:00+02:00", time.Now().Add(-2*hour))
+	out := RunAll(ctx, st, []Source{inc})
+	if out[0].Err == nil || !strings.Contains(out[0].Err.Error(), "could not be read") || len(out[0].Notes) != 1 || !strings.Contains(out[0].Notes[0], p) {
+		t.Fatalf("a run that could not read a file: %+v", out[0])
+	}
+	if out[0].New != 2 { // the readable file's incident and its first sighting
+		t.Fatalf("what the run could read is stored: %+v", out[0])
+	}
+	if read, err := st.ReadThrough(ctx, store.Incidents); err != nil || !read.Equal(complete) {
+		t.Fatalf("the run that failed advanced the read: %v, was %v %v", read, complete, err)
+	}
+	// the file's own time and before it are not certified; a window that starts after the file was last modified is
+	before, err := st.ReadWindowThrough(ctx, store.Incidents, modified.Add(-hour))
+	if err != nil || !before.Equal(complete) {
+		t.Fatalf("a window that starts before the unreadable file's time: read through %v, want %v %v", before, complete, err)
+	}
+	after, err := st.ReadWindowThrough(ctx, store.Incidents, modified.Add(hour))
+	if err != nil || !after.After(complete) {
+		t.Fatalf("a window that starts after it: read through %v, not past the last complete read %v %v", after, complete, err)
+	}
+	// readable again: the next run is a complete read, and nothing of the partial one is left to hold a window
+	if err := os.RemoveAll(p); err != nil {
+		t.Fatal(err)
+	}
+	writeIncident(t, dir, "open", "inc-1", "new", "2026-01-02T10:00:00+02:00", modified)
+	if out := RunAll(ctx, st, []Source{inc}); out[0].Err != nil || out[0].New != 2 {
+		t.Fatalf("the file read at last: %+v", out[0])
+	}
+	if read, err := st.ReadWindowThrough(ctx, store.Incidents, modified.Add(-hour)); err != nil || !read.After(complete) {
+		t.Fatalf("a complete run reads the window the failed one held: %v %v", read, err)
 	}
 }
 
@@ -478,5 +555,90 @@ func TestAnIncidentsSightingsAreEvents(t *testing.T) {
 	ingest(t, Incidents{Dir: dir2}, st2)
 	if e := all(t, st2, "incidents")["inc-1@2026-01-02T10:00:00Z#0"]; !strings.Contains(e.Meta, `"new":1`) || !strings.Contains(e.Meta, `"first_seen":"2026-01-01T09:00:00Z"`) {
 		t.Fatalf("a first sighting of none: %+v", e)
+	}
+}
+
+// A source-wide successful read is saved even with no events. A failed read cannot advance it.
+func TestOnlyACompleteIngestAdvancesItsReadTime(t *testing.T) {
+	st := openStore(t)
+	ctx := context.Background()
+	src := readFixture{}
+	before := time.Now().Add(-time.Hour)
+	if err := st.MarkRead(ctx, src.Name(), before); err != nil {
+		t.Fatal(err)
+	}
+	out := RunAll(ctx, st, []Source{src})
+	if len(out) != 1 || out[0].Err != nil {
+		t.Fatalf("complete: %+v", out)
+	}
+	read, err := st.ReadThrough(ctx, src.Name())
+	if err != nil || !read.After(before) {
+		t.Fatalf("read time: %v %v", read, err)
+	}
+	src.fail = true
+	out = RunAll(ctx, st, []Source{src})
+	if len(out) != 1 || out[0].Err == nil {
+		t.Fatalf("failed: %+v", out)
+	}
+	after, err := st.ReadThrough(ctx, src.Name())
+	if err != nil || !after.Equal(read) {
+		t.Fatalf("failed read advanced: %v %v", after, err)
+	}
+}
+
+type readFixture struct{ fail bool }
+
+func (readFixture) Name() string { return "synthetic" }
+func (r readFixture) Ingest(context.Context, *store.Store) (Result, error) {
+	if r.fail {
+		return Result{}, fmt.Errorf("read failed")
+	}
+	return Result{}, nil
+}
+
+// A radar ingest stores the scout's feedback under a source of its own (radar-feedback), so a complete run records the
+// read of that source too: a measurement that counts one of its events waits for the read of the source it counts, and
+// no run would ever record this one under the radar's name only.
+func TestACompleteRadarRunRecordsTheReadOfItsFeedbackToo(t *testing.T) {
+	ctx := context.Background()
+	st := openStore(t)
+	path, db := radarDB(t, true)
+	if _, err := db.Exec(`INSERT INTO findings (id, ts, type, key, title, updated) VALUES ('f-1', 100, 'infra', 'infra:a', 'disk', 100);
+	  INSERT INTO feedback (finding_id, ts, kind, text, meta) VALUES ('f-1', 200, 'feedback', 'too generic', '{"device": "phone"}')`); err != nil {
+		t.Fatal(err)
+	}
+	before := time.Now()
+	if out := RunAll(ctx, st, []Source{Radar{Path: path}}); len(out) != 1 || out[0].Err != nil {
+		t.Fatalf("%+v", out)
+	}
+	for _, name := range []string{"radar", "radar-feedback"} {
+		if read, err := st.ReadThrough(ctx, name); err != nil || read.Before(before.Truncate(time.Millisecond)) {
+			t.Errorf("%s: read through %v %v", name, read, err)
+		}
+	}
+	// a feedback event is activity of a source the store has read: nothing of it is unread
+	at := time.Unix(200, 0)
+	unread, err := st.UnreadSources(ctx, "incidents", store.ActivityQuery{Since: at.Add(-time.Hour), Until: at.Add(time.Hour)})
+	if err != nil || len(unread) != 1 || unread[0] != "incidents" { // the signal's own source, which never ran here
+		t.Fatalf("unread: %v %v", unread, err)
+	}
+	// a failed run (a radar store without its findings table) records neither
+	st2 := openStore(t)
+	broken := filepath.Join(t.TempDir(), "broken.db")
+	bdb, err := sql.Open("sqlite", "file:"+broken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bdb.Exec(`CREATE TABLE other (x)`); err != nil {
+		t.Fatal(err)
+	}
+	bdb.Close()
+	if out := RunAll(ctx, st2, []Source{Radar{Path: broken}}); out[0].Err == nil {
+		t.Fatal("a radar store without findings must be reported")
+	}
+	for _, name := range []string{"radar", "radar-feedback"} {
+		if read, err := st2.ReadThrough(ctx, name); err != nil || !read.IsZero() {
+			t.Errorf("a failed run recorded %s: %v %v", name, read, err)
+		}
 	}
 }

@@ -195,6 +195,40 @@ func (s *Store) PutNote(ctx context.Context, n Note) (Note, error) {
 	return n, tx.Commit()
 }
 
+// PutNoteOnce stores a note unless its id is stored already, done or not, and says whether it stored it. A writer that
+// records a decision and then its note, and that a stopped or failed run does again, gives the note an id of its own: the
+// note is written once however many times the writer runs, and one the owner took out of the report stays out. The id is
+// the note's; a note without one is ErrBadNote.
+func (s *Store) PutNoteOnce(ctx context.Context, n Note) (bool, error) {
+	if n.ID == "" {
+		return false, fmt.Errorf("%w: a note written once has an id", ErrBadNote)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	n, err = clean(n, time.Now())
+	if err != nil {
+		return false, err
+	}
+	links, err := json.Marshal(n.Links)
+	if err != nil {
+		return false, err
+	}
+	res, err := tx.ExecContext(ctx, `INSERT INTO notes (id, kind, title, detail, effect, links, source, importance, at, done)
+	  VALUES (?,?,?,?,?,?,?,?,?,0) ON CONFLICT(id) DO NOTHING`,
+		n.ID, string(n.Kind), n.Title, n.Detail, n.Effect, string(links), n.Source, n.Importance, n.At.UnixMilli())
+	if err != nil {
+		return false, err
+	}
+	stored, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return stored > 0, tx.Commit()
+}
+
 // PutWithNote stores events, as Put does, and a note, as PutNote does, in one transaction: a note that sums the
 // events up holds what they hold, however the writer stops.
 func (s *Store) PutWithNote(ctx context.Context, evs []Event, n Note) (Note, error) {

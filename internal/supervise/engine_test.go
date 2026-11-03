@@ -889,3 +889,123 @@ func TestNeedsNotesForWhatOnlyTheOwnerCanAnswer(t *testing.T) {
 		}
 	}
 }
+
+// A complete supervision run records its read time even with no events; a partial session keeps the last
+// complete time, so it cannot turn a missing decision into a measured improvement.
+func TestOnlyACompleteSupervisionRunAdvancesItsReadTime(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	now := t0.Add(time.Hour)
+	sv := supervisor(st, &fakeSender{}, &now)
+	run(t, sv)
+	read, err := st.ReadThrough(ctx, store.Supervise)
+	if err != nil || !read.Equal(now) {
+		t.Fatalf("complete: %v %v", read, err)
+	}
+	now = now.Add(time.Hour)
+	part := erroring()
+	part.Partial = true
+	run(t, sv, part)
+	after, err := st.ReadThrough(ctx, store.Supervise)
+	if err != nil || !after.Equal(read) {
+		t.Fatalf("partial advanced: %v %v", after, err)
+	}
+}
+
+// A run reads each harness on its own: a session the scan read in part leaves its harness's run incomplete and the
+// others' complete, and the source as a whole is read only when every harness was. A run that stopped on an error
+// read none of them. Each run's incomplete record is at its time.
+func TestASupervisionRunIsReadHarnessByHarness(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	now := t0.Add(time.Hour)
+	sv := supervisor(st, &fakeSender{}, &now)
+	sv.Harnesses = []string{"claude", "codex"}
+	readAt := func(harness string) time.Time {
+		t.Helper()
+		at, err := st.HarnessReadThrough(ctx, store.Supervise, harness)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return at
+	}
+	gap := func(harness string) time.Time {
+		t.Helper()
+		at, err := st.Incomplete(ctx, store.Supervise, harness, t0, t0.Add(100*time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return at
+	}
+	run(t, sv) // no session to decide for: every harness is read
+	if first := now; !readAt("claude").Equal(first) || !readAt("codex").Equal(first) || !readAt("").Equal(first) {
+		t.Fatalf("a run with nothing to decide: claude %v codex %v whole %v", readAt("claude"), readAt("codex"), readAt(""))
+	}
+	now = now.Add(5 * time.Minute) // the timer's step: runs further apart than store.RunGap leave a stretch behind them
+	part := erroring()
+	part.Partial = true // a claude session read in part
+	run(t, sv, part)
+	if !readAt("codex").Equal(now) || !readAt("claude").Equal(now.Add(-5*time.Minute)) || !readAt("").Equal(now.Add(-5*time.Minute)) {
+		t.Fatalf("a claude session read in part: claude %v codex %v whole %v", readAt("claude"), readAt("codex"), readAt(""))
+	}
+	if !gap("claude").Equal(now) || !gap("codex").IsZero() {
+		t.Fatalf("incomplete runs: claude %v codex %v", gap("claude"), gap("codex"))
+	}
+	// a run that stops on an error read no harness, though its context is gone
+	now = now.Add(5 * time.Minute)
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := sv.Run(cancelled, []*sessions.Session{erroring()}, nil); err == nil {
+		t.Fatal("a run on a cancelled context did not fail")
+	}
+	if !gap("claude").Equal(now) || !gap("codex").Equal(now) || readAt("codex").Equal(now) {
+		t.Fatalf("a run that stopped: claude %v codex %v, codex read %v", gap("claude"), gap("codex"), readAt("codex"))
+	}
+}
+
+// A run that starts further from the harness's last complete one than store.RunGap has no run between: the timer
+// stopped, or a run gave up before it recorded anything. What it should have decided in between is not in the store, and
+// the runs after it do not decide it, so the run records the stretch as incomplete: a window that holds it is never read.
+func TestASupervisionRunFarFromTheOneBeforeLeavesItsStretchUnread(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	now := t0
+	sv := supervisor(st, &fakeSender{}, &now)
+	sv.Harnesses = []string{"claude", "codex"}
+	gap := func(harness string) time.Time {
+		t.Helper()
+		at, err := st.Incomplete(ctx, store.Supervise, harness, t0, t0.Add(100*time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return at
+	}
+	for _, step := range []time.Duration{0, 5 * time.Minute, 5 * time.Minute, 5 * time.Minute} { // the timer's runs
+		now = now.Add(step)
+		run(t, sv)
+	}
+	if !gap("claude").IsZero() || !gap("").IsZero() {
+		t.Fatalf("runs %v apart left a stretch: %v", 5*time.Minute, gap(""))
+	}
+	last := now
+	now = now.Add(3 * time.Hour) // the timer stopped
+	run(t, sv)
+	for _, harness := range []string{"claude", "codex", ""} {
+		if got := gap(harness); !got.Equal(now.Add(-time.Millisecond)) {
+			t.Errorf("harness %q: the stretch ends just before the run that found it: %v, want %v", harness, got, now.Add(-time.Millisecond))
+		}
+	}
+	// a window over the stretch is unread, though every run after it is complete; one that ended at the last run before it is not
+	for i := 0; i < 4; i++ {
+		now = now.Add(5 * time.Minute)
+		run(t, sv)
+	}
+	q := store.ActivityQuery{Since: t0, Until: last, BySession: true, Harness: "claude", Sources: []string{store.Supervise}}
+	if got, err := st.UnreadSources(ctx, store.Transcripts, q); err != nil || len(got) != 0 {
+		t.Fatalf("the window before the stretch: unread %v %v", got, err)
+	}
+	q.Until = last.Add(time.Hour)
+	if got, err := st.UnreadSources(ctx, store.Transcripts, q); err != nil || len(got) != 1 {
+		t.Fatalf("the window over the stretch: unread %v %v", got, err)
+	}
+}
