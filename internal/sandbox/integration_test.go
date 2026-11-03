@@ -479,7 +479,7 @@ func TestLimitsAndCancellation(t *testing.T) {
 		t.Fatalf("cancel returned error %v, sandbox failure %v", runErr, r.Failed)
 	}
 	assertUnitGone(t, s.Unit)
-	assertUnitsGone(t, "momentum-run-*.service")
+	assertUnitsGone(t, s.Unit+"*.service") // this test's units only: a live loop or evaluation has others
 }
 
 type readyWriter struct {
