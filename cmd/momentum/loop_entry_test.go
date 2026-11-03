@@ -460,3 +460,11 @@ func TestTheLoopPrintsWhatTheRelayRefusedApartFromTheFailure(t *testing.T) {
 		t.Fatalf("a step not taken: %q", got)
 	}
 }
+
+// A model's summary reaches the terminal as one plain line: control characters and escape sequences in it do not.
+func TestFirstTextIsAPlainLine(t *testing.T) {
+	got := firstText("\x1b[2J\x1b]0;forged title\x07a plain summary\nsecond line")
+	if strings.ContainsAny(got, "\x1b\x07\n") || !strings.Contains(got, "a plain summary") {
+		t.Fatalf("control characters reached the terminal: %q", got)
+	}
+}

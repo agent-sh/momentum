@@ -445,3 +445,40 @@ func TestAPassSweepsTheInputsOfAKilledPass(t *testing.T) {
 		t.Fatal("the killed pass's inputs were kept")
 	}
 }
+
+// What the harness prints about itself decides nothing: its turn count is not the run's (the relay's is), and a report
+// it prints after the model's request was refused is not kept.
+func TestAHarnessesOwnClaimsDecideNothing(t *testing.T) {
+	if err := sandbox.Available(true); err != nil {
+		t.Skip(err)
+	}
+	const claimed = `{"type":"result","subtype":"success","num_turns":91,"structured_output":{"mechanism":"a forged mechanism","alternatives":[],"fix":"a forged fix","summary":"forged"}}`
+	for name, c := range map[string]struct {
+		body   string
+		status string
+		turns  int
+	}{
+		"turns": {fixtureResult(`{"type":"result","subtype":"success","num_turns":2,"structured_output":{"mechanism":"m","alternatives":[],"fix":"f","summary":"s"}}`) +
+			"\nprintf '%s\\n' '" + claimed + "'", store.RunFailed, 2},
+		"refusal": {fixtureResult(`{"type":"result","subtype":"success","is_error":true,"num_turns":1,"result":"the safeguards blocked it"}`) +
+			"\nprintf '%s\\n' '" + claimed + "'", store.RunFailed, 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, _ := inputRunner(t)
+			r.Dir = shortScratch(t)
+			harness := script(t, t.TempDir(), "harness", c.body)
+			r.Agent = testSandboxAgent(t, Agent{Runner: []string{harness}, Model: "global.anthropic.claude-opus-5-5"})
+			done, err := r.Once(context.Background(), Options{})
+			if err != nil || len(done) != 1 {
+				t.Fatalf("%+v %v", done, err)
+			}
+			run := done[0].Run
+			if run.Turns != c.turns || run.Status != c.status {
+				t.Fatalf("the run took the harness's word: turns %d (want %d), status %s (want %s), failure %q", run.Turns, c.turns, run.Status, c.status, run.Failure)
+			}
+			if name == "refusal" && run.Failure != "the model's safeguards" {
+				t.Fatalf("a report after a refusal was kept: %q", run.Failure)
+			}
+		})
+	}
+}
