@@ -96,9 +96,11 @@ const usage = `usage:
                                         rolls it back while the loop is live (else it holds the rollback, with a
                                         note); three consecutive read windows at its old share with five hits among them bring it back
   momentum loop runs [--since WHEN] [--case ID] [--json]
+                                        the loop's runs, and what the live ones spent in the last day and week
   momentum loop eval [--golden FILE] [--task ID,...] [--trials K] [--arms loop,native]
                      [--budget USD] [--parallel N] [--held-out ID,...] [--split all|development|held-out] [--json]
-                                        the loop's runs, and what the live ones spent in the last day and week
+                                        the golden evaluation: the loop's investigation against the harness's
+                                        native agent on the same past problems, graded by a clean-context judge
   momentum loop lesson --case ID --text TEXT
                                         publish an unverified lesson to tacit
   momentum ship prepare|check|propose|status|land|rollback --case ID [OPTIONS]
