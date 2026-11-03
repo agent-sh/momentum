@@ -200,7 +200,7 @@ func TestEvaluationBudgetReservesRelayMarginAndBothArms(t *testing.T) {
 	if err != nil || len(runs) != 0 {
 		t.Fatal("budget skipped pair left reservations")
 	}
-	if got := readText(t, log); got != "probe\nlist\nstop momentum-run-eval-old.service\n" {
+	if got := readText(t, log); got != "probe\nlist\nstop "+EvalUnitPrefix+"old.service\n" {
 		t.Fatal("evaluation probed or stopped the wrong unit scope")
 	}
 }
@@ -230,7 +230,7 @@ func fakeEvalManager(t *testing.T) string {
 	dir := strings.Split(os.Getenv("PATH"), ":")[0]
 	path := filepath.Join(dir, "systemctl")
 	raw := readText(t, path)
-	if err := os.WriteFile(path, []byte(strings.ReplaceAll(raw, UnitPrefix, "momentum-run-eval-")), 0700); err != nil {
+	if err := os.WriteFile(path, []byte(strings.ReplaceAll(raw, UnitPrefix, EvalUnitPrefix)), 0700); err != nil {
 		t.Fatal(err)
 	}
 	return log

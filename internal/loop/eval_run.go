@@ -41,7 +41,7 @@ func (e *Eval) Run(ctx context.Context, tasks []GoldenTask) ([]Trial, error) {
 	if err := sandbox.Available(true); err != nil {
 		return nil, err
 	}
-	if err := sandbox.StopLeftover(ctx, "momentum-run-eval-"); err != nil {
+	if err := sandbox.StopLeftover(ctx, EvalUnitPrefix); err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(e.Dir, 0700); err != nil {
@@ -342,13 +342,13 @@ func (e *Eval) trialInvocation(ctx context.Context, in *taskInputs, t GoldenTask
 	}
 	return Invocation{ID: newRunID(time.Now()), Dir: dir, System: clean[0], Prompt: clean[1], Schema: investigationSchema,
 		MaxTurns: e.Runner.Budgets.MaxTurns, BudgetUSD: e.Runner.Budgets.Run, Timeout: e.Runner.Budgets.RunTime,
-		Binds: append([]sandbox.Bind(nil), in.binds...), unitPrefix: "momentum-run-eval-"}, nil
+		Binds: append([]sandbox.Bind(nil), in.binds...), unitPrefix: EvalUnitPrefix}, nil
 }
 
 func (e *Eval) grade(ctx context.Context, t GoldenTask, f finding, jdir string, run store.LoopRun) (Grade, float64, string, error) {
 	inv := Invocation{ID: newRunID(time.Now()), Dir: jdir, System: judgeSystem, Schema: gradeSchema, MaxTurns: 3,
 		BudgetUSD: judgeBudget, Timeout: 5 * time.Minute, Prompt: judgePrompt(t, f), Tools: "none",
-		unitPrefix: "momentum-run-eval-", inputOnly: true}
+		unitPrefix: EvalUnitPrefix, inputOnly: true}
 	if err := hostDir(HostDir(jdir)); err != nil {
 		return Grade{}, 0, "", err
 	}

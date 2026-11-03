@@ -202,7 +202,7 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	}
 	unit := runUnit(inv.ID, inv.Dir, attempt)
 	if inv.unitPrefix != "" {
-		unit = strings.Replace(unit, "momentum-run-loop-", inv.unitPrefix, 1)
+		unit = strings.Replace(unit, UnitPrefix, inv.unitPrefix, 1)
 	}
 	// Only the shell inside the fixed sandbox can emit this per-attempt
 	// witness. A started manager or bubblewrap process is not a started run.
@@ -336,6 +336,10 @@ func readRunFile(dir, name string) ([]byte, error) {
 // UnitPrefix begins the name of every unit the loop starts, and is what a pass stops leftovers by. Only a test changes
 // it, so that test processes running side by side never stop each other's units.
 var UnitPrefix = "momentum-run-loop-"
+
+// EvalUnitPrefix names the units of an evaluation. Its sweep of leftovers stops only units that begin with it, and a
+// test process uses a prefix of its own (as for UnitPrefix), so a test run cannot stop a real evaluation.
+var EvalUnitPrefix = "momentum-run-eval-"
 
 func runUnit(id, dir, attempt string) string {
 	if id == "" {

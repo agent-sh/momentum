@@ -130,7 +130,7 @@ func TestEvaluationPromptsUseTheLiveQuestionAndSharedPaths(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if inv.unitPrefix != "momentum-run-eval-" || !strings.HasPrefix(inv.Prompt, liveQuestion) || !strings.HasSuffix(inv.Prompt, inputReference()) ||
+		if inv.unitPrefix != EvalUnitPrefix || !strings.HasPrefix(inv.Prompt, liveQuestion) || !strings.HasSuffix(inv.Prompt, inputReference()) ||
 			strings.Contains(inv.Prompt, task.RootCause) || strings.Contains(inv.Prompt, task.ID) {
 			t.Fatal("trial question, reference or answer isolation differs")
 		}
