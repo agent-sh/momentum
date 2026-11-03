@@ -350,3 +350,31 @@ func TestALivePassRunsItsPinnedRecordsChild(t *testing.T) {
 		t.Fatalf("the records child was not the pass's copy: %q %v", raw, err)
 	}
 }
+
+// The measure step holds the case lock from its load of the package through its writes: a ship step that respects
+// the lock, probing at each clock read after the first (which the step takes before the lock), never gets in while
+// the case is measured. Without the lock it would, and the step's save of what it loaded would overwrite the step's
+// own write.
+func TestTheMeasureStepHoldsTheLockAgainstAShipStep(t *testing.T) {
+	m := measuredCase(t)
+	ctx := context.Background()
+	var calls, entered int
+	m.r.Now = func() time.Time {
+		calls++
+		if calls > 1 {
+			if unlock, err := m.r.Ship.lock(ctx, m.c.ID); err == nil {
+				entered++
+				unlock()
+			}
+		}
+		return m.clock
+	}
+	m.r.Ship.Now = m.r.Now
+	got := m.measure(t, Options{})
+	if calls < 2 || entered != 0 {
+		t.Fatalf("a ship step got the lock during the measure step: %d of %d clock reads (%s)", entered, calls-1, got.Status)
+	}
+	if m.theCase(t).Status != store.CaseMeasuring {
+		t.Fatalf("the case was not measured: %s %s", got.Status, got.Why)
+	}
+}
