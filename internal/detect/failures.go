@@ -13,6 +13,7 @@ import (
 
 	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
+	"github.com/agent-sh/momentum/internal/toolresult"
 )
 
 // Failures finds the tool and infrastructure failures that recur: a guard that keeps refusing the same form of a
@@ -39,16 +40,6 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 	if r == (Recur{}) {
 		r = FailuresRecur
 	}
-	results, err := st.Events(ctx, store.Query{Since: w.Since, Until: w.Until, Kinds: []string{"tool_result"}, Source: store.Transcripts,
-		MetaHas: `"is_error":true`, Limit: maxRows})
-	if err != nil {
-		return nil, err
-	}
-	// a failed command is known by the programs its call ran: without the calls, its keys would be other ones
-	calls, err := st.CallsOf(ctx, results, callReach)
-	if err != nil {
-		return nil, err
-	}
 	var occ []occurrence
 	// the transcript's failed results by session and tool, in time: a mistakes row is the same sighting as one of
 	// them of its session and tool within a few seconds, whatever the text each keeps of it
@@ -57,13 +48,39 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 		at            time.Time
 	}
 	var failed []seen
-	for _, e := range results {
-		failed = append(failed, seen{e.Session, e.Tool, e.TS})
-		k, ok := FailureOf(e.Harness, e.Tool, e.Summary, calls[e.ID()])
-		if !ok {
-			continue
+	// Successful results must not displace older unflagged failures at maxRows.
+	var before *store.Event
+	for {
+		results, err := st.Events(ctx, store.Query{Since: w.Since, Until: w.Until, Kinds: []string{"tool_result"},
+			Source: store.Transcripts, Limit: resultPage, Before: before})
+		if err != nil {
+			return gather("failures", occ, r), err
 		}
-		occ = append(occ, occurrence{sig: signature("failures", k.String()), title: k.Title(), ev: e})
+		var candidates []store.Event
+		for _, e := range results {
+			var m struct {
+				IsError bool `json:"is_error"`
+			}
+			json.Unmarshal([]byte(e.Meta), &m)
+			if toolresult.Failed(e.Harness, e.Tool, e.Summary, m.IsError) {
+				candidates = append(candidates, e)
+			}
+		}
+		calls, err := st.CallsOf(ctx, candidates, callReach)
+		if err != nil {
+			return gather("failures", occ, r), err
+		}
+		for _, e := range candidates {
+			failed = append(failed, seen{e.Session, e.Tool, e.TS})
+			if k, ok := FailureOf(e.Harness, e.Tool, e.Summary, calls[e.ID()]); ok {
+				occ = append(occ, occurrence{sig: signature("failures", k.String()), title: k.Title(), ev: e})
+			}
+		}
+		if len(results) < resultPage {
+			break
+		}
+		last := results[len(results)-1]
+		before = &last
 	}
 	sort.Slice(failed, func(i, j int) bool { return failed[i].at.Before(failed[j].at) })
 	same := func(session, tool string, at time.Time) bool {
@@ -98,6 +115,8 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 // callReach is how long before its result a call may have started: a command runs for minutes, a background one for
 // hours.
 const callReach = 24 * time.Hour
+
+const resultPage = 4000
 
 // incidentSightings are the sightings of the incidents still open, each counting the repeats it saw. An incident
 // is closed or resolved by its own event (its file now), which a sighting carries only when the count or the time
@@ -222,14 +241,16 @@ var (
 	// modes, its classifier, its holds, its blocks.
 	harnessRe = regexp.MustCompile(`(?i)^(this agent is isolated in the worktree|permission for this command was denied|claude code holds|blocked:|` +
 		`permission to use \S+ (?:with command .*? )?has been denied|permission for this (?:action|tool use) (?:has been|was) denied|` +
-		`this action was denied by the claude code auto mode classifier)`)
+		`this action was denied by the claude code auto mode classifier|` +
+		`command failed due to container (?:sandboxdenied|sandboxerror)|sandbox(?:denied|error):|` +
+		`patch rejected:|approval policy is |the (?:command|tool call|action) (?:was |is )?(?:rejected|denied|blocked) by (?:the )?(?:sandbox|policy|hook))`)
 	// deniedCmdRe is Claude Code's deny of a command by a rule: what it ran stays out of the key but its programs.
 	deniedCmdRe = regexp.MustCompile(`(?i)^permission to use (\S+) with command (.*?) has been denied`)
 	// ansiRe is a terminal's escape sequence, which colours a line and is no part of its words.
 	ansiRe = regexp.MustCompile("\x1b\\[[0-9;?]*[A-Za-z]|\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)")
 	// headerRe is what a harness prints before a failed command's output: Claude Code's exit code; Codex's exit code
 	// and wall time, or its chunk, wall time, exit code and token count, up to its output.
-	headerRe = regexp.MustCompile(`(?is)^(?:exit code:? -?\d+\s*(?:wall time:.*?output:\s*)?|chunk id:.*?output:\s*)`)
+	headerRe = regexp.MustCompile(`(?is)^(?:exit code:? -?\d+\s*(?:wall time:.*?(?:final )?output:\s*)?|chunk id:.*?(?:final )?output:\s*|(?:wall time:.*?)?process exited with code -?\d+\s*(?:final )?output:\s*)`)
 	// codexRe is Codex's failed script: what its error said.
 	codexRe = regexp.MustCompile(`(?is)script error:\s*(.*)`)
 	// hermesRe are the error, output and status of a Hermes tool's JSON result.
@@ -253,6 +274,7 @@ var (
 		`couldn'?t connect to server|could not resolve host|temporary failure in name resolution|name or service not known|address already in use|` +
 		`\b(?:etimedout|enotfound|econnrefused|econnreset|eai_again|ehostunreach|enetunreach|eaddrinuse)\b|cannot allocate memory|out of memory|` +
 		`no module named|error obtaining vcs status|rate limit|too many requests|http [45]\d\d\b|` +
+		`(?:command|tool|execution|request) (?:execution )?timed out|context deadline exceeded|` +
 		`certificate (?:has )?expired|certificate verify failed|\bunauthorized\b|\bforbidden\b|authentication (?:failed|required)|not logged in|` +
 		`(?:token|login|session|credentials?) (?:has |have )?expired|option used in invalid context|cannot open display|\benoent\b|spawn failed|` +
 		`\bfile exists\b|database is locked|could not (?:get )?lock|could not acquire|resource temporarily unavailable|lock .{0,40}held by)`)
@@ -271,9 +293,78 @@ var (
 // another one beside it failed.
 func FailureOf(harness, tool, text, call string) (FailureKey, bool) {
 	text = strings.TrimSpace(ansiRe.ReplaceAllString(text, ""))
+	// Native command results can carry their output in JSON rather than a
+	// textual header. Read the output, not quoted JSON values as log words.
+	if strings.HasPrefix(text, "{") {
+		var result struct {
+			Output   string          `json:"output"`
+			Stdout   string          `json:"stdout"`
+			Stderr   string          `json:"stderr"`
+			Error    json.RawMessage `json:"error"`
+			Status   string          `json:"status"`
+			Message  string          `json:"message"`
+			Type     string          `json:"type"`
+			Matches  *int            `json:"match_count"`
+			Exit     *int            `json:"exit_code"`
+			Metadata struct {
+				Exit *int `json:"exit_code"`
+			} `json:"metadata"`
+		}
+		if json.Unmarshal([]byte(text), &result) == nil {
+			raw := string(result.Error)
+			emptyError := raw == "" || raw == "null" || raw == `""` || raw == "false" || raw == "{}" || raw == "[]"
+			// A native search uses exit 1 for an empty result. Its wrapper
+			// can be kept as JSON when there is no text content.
+			if result.Type == "GrepSearch" && result.Exit != nil && *result.Exit == 1 &&
+				result.Matches != nil && *result.Matches == 0 && result.Stderr == "" &&
+				emptyError && result.Status != "failed" && result.Status != "error" {
+				return FailureKey{}, false
+			}
+			var message string
+			if !emptyError {
+				if json.Unmarshal(result.Error, &message) != nil {
+					var obj struct {
+						Message string `json:"message"`
+					}
+					json.Unmarshal(result.Error, &obj)
+					message = obj.Message
+				}
+			}
+			if message == "" && (result.Status == "error" || result.Status == "failed") {
+				message = result.Message
+			}
+			if message != "" {
+				if toolresult.Cancelled(message) {
+					return FailureKey{}, false
+				}
+				if isShell(tool) && workRe.MatchString(message) {
+					return FailureKey{}, false
+				}
+				if g := guardRe.FindStringSubmatch(message); g != nil {
+					return FailureKey{Origin: "guard:" + slug(g[1], 30), Text: Norm(firstClause(g[2]), keyChars)}, true
+				}
+				return FailureKey{Origin: toolOrigin(tool), Text: Norm(firstClause(message), keyChars)}, true
+			}
+			code := result.Exit
+			if code == nil {
+				code = result.Metadata.Exit
+			}
+			if code != nil && *code == 0 {
+				return FailureKey{}, false
+			}
+			output := strings.TrimSpace(strings.Join([]string{result.Stdout, result.Stderr, result.Output}, "\n"))
+			if output != "" && isShell(tool) {
+				return execKey(output, callPrograms(call))
+			}
+			// a wrapper with nothing in it that says what failed is not keyed by its shape: unrelated errors would merge
+			if message == "" && (result.Type != "" || result.Exit != nil || result.Matches != nil) {
+				return FailureKey{}, false
+			}
+		}
+	}
 	wrapped := strings.HasPrefix(text, "<tool_use_error>")
 	text = strings.TrimSpace(strings.TrimPrefix(text, "<tool_use_error>"))
-	if text == "" || ownerNoRe.MatchString(text) {
+	if text == "" || ownerNoRe.MatchString(text) || toolresult.Cancelled(text) {
 		return FailureKey{}, false
 	}
 	if m := hookRe.FindStringSubmatch(text); m != nil {
@@ -312,8 +403,7 @@ func FailureOf(harness, tool, text, call string) (FailureKey, bool) {
 	}
 	switch {
 	case strings.HasPrefix(tool, "mcp__"):
-		server := strings.SplitN(strings.TrimPrefix(tool, "mcp__"), "__", 2)[0]
-		return FailureKey{Origin: "mcp:" + slug(server, 30), Text: Norm(firstClause(text), keyChars)}, true
+		return FailureKey{Origin: toolOrigin(tool), Text: Norm(firstClause(text), keyChars)}, true
 	case harness == "hermes" && strings.HasPrefix(text, "{"):
 		if m := hermesErrRe.FindStringSubmatch(text); m != nil && m[1] != "" {
 			msg := unescape(m[1])
@@ -339,6 +429,14 @@ func FailureOf(harness, tool, text, call string) (FailureKey, bool) {
 	}
 	// A tool's error in its own words (a read, an edit, a write the harness refused).
 	return FailureKey{Origin: "tool:" + slug(tool, 30), Text: Norm(firstClause(text), keyChars)}, true
+}
+
+func toolOrigin(tool string) string {
+	if strings.HasPrefix(tool, "mcp__") {
+		server := strings.SplitN(strings.TrimPrefix(tool, "mcp__"), "__", 2)[0]
+		return "mcp:" + slug(server, 30)
+	}
+	return "tool:" + slug(tool, 30)
 }
 
 // MistakeKey keys a row of the mistakes log as FailureOf keys a result: its summary is the tool, a colon and the
@@ -602,11 +700,7 @@ func firstClause(s string) string {
 // isShell says a tool runs shell commands: Claude Code's Bash and PowerShell, pi's bash and its output, Codex's
 // commands and the stdin it writes to them, Hermes's terminal and code.
 func isShell(tool string) bool {
-	switch strings.ToLower(tool) {
-	case "bash", "bash_output", "powershell", "exec", "exec_command", "shell", "local_shell", "write_stdin", "terminal", "execute_code":
-		return true
-	}
-	return false
+	return toolresult.IsShell(tool)
 }
 
 // unescape reads a JSON string's body; one cut short reads as it is.

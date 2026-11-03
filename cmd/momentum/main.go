@@ -203,8 +203,8 @@ func configured() ([]source.Source, error) {
 	if c.Incidents.Dir != "" {
 		out = append(out, source.Incidents{Dir: c.Incidents.Dir})
 	}
-	if len(c.Transcripts.Homes) > 0 {
-		out = append(out, source.Transcripts{Homes: c.Transcripts.Homes, Workers: c.Transcripts.Workers})
+	if len(c.Transcripts.Homes) > 0 || len(c.Transcripts.Sources) > 0 {
+		out = append(out, source.Transcripts{Homes: c.Transcripts.Homes, Workers: c.Transcripts.Workers, Sources: c.Transcripts.Sources})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("%w: %s lists none", config.ErrNoSources, config.SourcesPath())
@@ -400,13 +400,15 @@ func rebuild(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if name == store.Transcripts && *force {
 		// The homes the ingest reads, where a transcript moved since is found again by its name.
 		var homes []string
+		var transcriptSources []source.TranscriptSource
 		switch c, err := config.Load(); {
 		case err == nil:
 			homes = c.Transcripts.Homes
+			transcriptSources = c.Transcripts.Sources
 		case !errors.Is(err, config.ErrNoSources):
 			return err
 		}
-		if gone, err = (source.Transcripts{Homes: homes}).Gone(ctx, st); err != nil {
+		if gone, err = (source.Transcripts{Homes: homes, Sources: transcriptSources}).Gone(ctx, st); err != nil {
 			return err
 		}
 	}

@@ -24,6 +24,35 @@ func open(t *testing.T) (*Store, string) {
 	return st, path
 }
 
+func TestStoreURIPathsAreLiteral(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	paths := []string{filepath.Join(dir, "marker#one.db"), filepath.Join(dir, "marker#two.db")}
+	for i, path := range paths {
+		st, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = st.Put(ctx, []Event{{Source: Transcripts, SourceKey: fmt.Sprintf("marker-%d", i),
+			TS: time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC), Actor: ActorTool, Kind: "tool_result", Summary: "marker-7f3a"}})
+		st.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range paths {
+		st, err := OpenReadOnly(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		evs, err := st.Events(ctx, Query{Since: time.Unix(0, 0), Limit: 10})
+		st.Close()
+		if err != nil || len(evs) != 1 {
+			t.Fatalf("separate literal paths shared rows: %d %v", len(evs), err)
+		}
+	}
+}
+
 func TestPutCountsNewRowsAndRefreshesEveryDerivedColumn(t *testing.T) {
 	ctx := context.Background()
 	st, _ := open(t)

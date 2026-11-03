@@ -113,7 +113,7 @@ func TestASignatureFitsTheStore(t *testing.T) {
 	if len(a) > signatureMax || len(b) > signatureMax || a == b || !utf8.ValidString(a) {
 		t.Fatalf("%d %d bytes, equal %v", len(a), len(b), a == b)
 	}
-	if s := signature("failures", "guard:x:short"); s != "failures/v1:guard:x:short" {
+	if s := signature("failures", "guard:x:short"); s != "failures/v2:guard:x:short" {
 		t.Fatalf("a short key: %q", s)
 	}
 }
@@ -434,12 +434,12 @@ func TestFailuresAreFoundWhenTheyRecur(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
-		"failures/v1:exec:curl: (N) failed to connect to localhost port N after N ms: connection refused 4",
-		"failures/v1:guard:fence-guard:a process match on Q takes its own shell too 3",
-		"failures/v1:guard:ledger:this note names no source 3",
-		"failures/v1:guard:load-gate:held Q: the machine is busy 3",
-		"failures/v1:model:refusal:the model declined this request as written 3",
-		"failures/v1:turn:claude:api error: N overloaded 3",
+		"failures/v2:exec:curl: (N) failed to connect to localhost port N after N ms: connection refused 4",
+		"failures/v2:guard:fence-guard:a process match on Q takes its own shell too 3",
+		"failures/v2:guard:ledger:this note names no source 3",
+		"failures/v2:guard:load-gate:held Q: the machine is busy 3",
+		"failures/v2:model:refusal:the model declined this request as written 3",
+		"failures/v2:turn:claude:api error: N overloaded 3",
 	}
 	if got := signatures(fs); !slices.Equal(got, want) {
 		t.Fatalf("found\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
@@ -501,7 +501,7 @@ func TestIncidentsCountTheirSightings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := signatures(fs); !slices.Equal(got, []string{"failures/v1:incident:httpx.connecterror: [errno -N] temporary failure in name resolution 2"}) {
+	if got := signatures(fs); !slices.Equal(got, []string{"failures/v2:incident:httpx.connecterror: [errno -N] temporary failure in name resolution 2"}) {
 		t.Fatalf("found %v", got)
 	}
 }
