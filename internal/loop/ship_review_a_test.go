@@ -44,7 +44,7 @@ func recoveryReviewed(t *testing.T, s *Ship, st *store.Store, f repoFixture) (st
 	if _, err := proposePatch(t, s, context.Background(), c.ID, pr); err != nil {
 		t.Fatal(err)
 	}
-	p, err := s.Reviewed(context.Background(), c.ID, Review{Text: "Checked every changed file.", Comment: "https://example.invalid/review/1"})
+	p, err := s.Reviewed(context.Background(), c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked every changed file.", Comment: "https://example.invalid/review/1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestShipPushesPublishNoReachableTags(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkTags("proposal")
-	p, err := s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", Comment: "https://example.invalid/review/1"})
+	p, err := s.Reviewed(ctx, c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked every changed file.", Comment: "https://example.invalid/review/1"})
 	if err != nil {
 		t.Fatal(err)
 	}

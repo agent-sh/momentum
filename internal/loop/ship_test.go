@@ -224,19 +224,19 @@ func TestAChangeShipsOnlyThroughItsPackage(t *testing.T) {
 	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "review") {
 		t.Fatalf("landed unreviewed: %v", err)
 	}
-	if _, err := s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", High: 1, Findings: []Finding{{Severity: "low", Where: "x", Problem: "y", Fix: "z"}}}); !errors.Is(err, ErrRefused) ||
+	if _, err := s.Reviewed(ctx, c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked every changed file.", High: 1, Findings: []Finding{{Severity: "low", Where: "x", Problem: "y", Fix: "z"}}}); !errors.Is(err, ErrRefused) ||
 		!strings.Contains(err.Error(), "the counts are the findings'") {
 		t.Fatalf("counts that are not the findings': %v", err)
 	}
 	// a review that finds a medium sends it back to its build, on the same branch and pull request
-	if p, err = s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", Findings: []Finding{{Severity: "medium", Where: "fake.go", Problem: "no comment", Fix: "add one"}},
+	if p, err = s.Reviewed(ctx, c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked every changed file.", Findings: []Finding{{Severity: "medium", Where: "fake.go", Problem: "no comment", Fix: "add one"}},
 		Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || p.State != Revising || p.Reviews[0].Medium != 1 {
 		t.Fatalf("reviewed: %+v %v", p, err)
 	}
 	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) {
 		t.Fatalf("landed on a medium: %v", err)
 	}
-	if _, err := s.Reviewed(ctx, c.ID, Review{Medium: 0, High: 1, Findings: []Finding{{Severity: "low"}}}); !errors.Is(err, ErrRefused) {
+	if _, err := s.Reviewed(ctx, c.ID, Review{Head: currentReviewHead(t, s, c.ID), Medium: 0, High: 1, Findings: []Finding{{Severity: "low"}}}); !errors.Is(err, ErrRefused) {
 		t.Fatalf("a review of a package back at its build: %v", err)
 	}
 	first := p.Head
@@ -257,7 +257,7 @@ func TestAChangeShipsOnlyThroughItsPackage(t *testing.T) {
 		t.Fatalf("the revision did not update its pull request: %s", calls)
 	}
 	// a clean review that was not posted lands nothing
-	if p, err = s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", Findings: []Finding{{Severity: "low", Where: "x", Problem: "y", Fix: "z"}}}); err != nil || p.Clean() {
+	if p, err = s.Reviewed(ctx, c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked every changed file.", Findings: []Finding{{Severity: "low", Where: "x", Problem: "y", Fix: "z"}}}); err != nil || p.Clean() {
 		t.Fatalf("an unposted review: %+v %v", p, err)
 	}
 	p.Reviews[len(p.Reviews)-1].Comment = "https://github.com/agent-sh/fake/pull/7#c2"
@@ -703,7 +703,7 @@ func reviewedChange(t *testing.T, s *Ship, st *store.Store, f repoFixture) (stor
 	if _, err := proposePatch(t, s, ctx, c.ID, Proposal{Title: "Answer is 42", Body: "Off by one.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
 		t.Fatal(err)
 	}
-	if p, err = s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || !p.Clean() {
+	if p, err = s.Reviewed(ctx, c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked every changed file.", Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || !p.Clean() {
 		t.Fatalf("a clean review: %+v %v", p, err)
 	}
 	return c, p
@@ -770,7 +770,7 @@ func TestEachStepChecksAgainWhatItRestsOn(t *testing.T) {
 	if _, err := proposePatch(t, s, ctx, c.ID, pr); err != nil {
 		t.Fatal(err)
 	}
-	if p, err = s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || !p.Clean() {
+	if p, err = s.Reviewed(ctx, c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked every changed file.", Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || !p.Clean() {
 		t.Fatalf("a clean review: %+v %v", p, err)
 	}
 	write(t, stop, "")
@@ -868,7 +868,7 @@ func TestARevisionDoesNotOverwriteAnotherPushToItsBranch(t *testing.T) {
 	if p, err = proposePatch(t, s, ctx, c.ID, pr); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", Findings: []Finding{{Severity: "medium", Where: "fake.go", Problem: "p", Fix: "f"}}, Comment: "c1"}); err != nil {
+	if _, err := s.Reviewed(ctx, c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked every changed file.", Findings: []Finding{{Severity: "medium", Where: "fake.go", Problem: "p", Fix: "f"}}, Comment: "c1"}); err != nil {
 		t.Fatal(err)
 	}
 	theirs := pushOther(t, f, p.Branch, map[string]string{"theirs.txt": "a fix of someone's\n"})
@@ -978,7 +978,7 @@ func TestBranchConditionalDriversAreRefused(t *testing.T) {
 					if _, err = proposePatch(t, s, ctx, c.ID, Proposal{Title: "Answer", Body: "Fix it.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
 						t.Fatal(err)
 					}
-					if _, err = s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", Comment: "https://example.invalid/review"}); err != nil {
+					if _, err = s.Reviewed(ctx, c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked every changed file.", Comment: "https://example.invalid/review"}); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -1194,7 +1194,7 @@ func TestShipRefusesRepositoryTransport(t *testing.T) {
 					if _, err := proposePatch(t, s, ctx, c.ID, Proposal{Title: "Fixture", Body: "Synthetic change.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
 						t.Fatal(err)
 					}
-					if _, err := s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", Comment: "https://example.invalid/review"}); err != nil {
+					if _, err := s.Reviewed(ctx, c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked every changed file.", Comment: "https://example.invalid/review"}); err != nil {
 						t.Fatal(err)
 					}
 				}

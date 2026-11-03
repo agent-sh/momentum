@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -180,9 +181,71 @@ func (s *Store) LoopRuns(ctx context.Context, f RunFilter) ([]LoopRun, error) {
 // budget in full (reserved), since what it spends is known only when it ends.
 func (s *Store) LoopSpend(ctx context.Context, since time.Time, reserved float64) (float64, error) {
 	var spent float64
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN status = ? AND cost_usd = 0 THEN ? ELSE cost_usd END), 0)
- FROM loop_runs WHERE experiment = '' AND started >= ?`, RunRunning, reserved, since.UnixMilli()).Scan(&spent)
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount), 0) FROM (
+ SELECT CASE WHEN status = ? AND cost_usd = 0 THEN ? ELSE cost_usd END AS amount
+ FROM loop_runs WHERE experiment = '' AND started >= ?
+ UNION ALL
+ SELECT json_extract(detail, '$.usd') AS amount FROM case_log
+ WHERE action = ? AND at >= ? AND json_extract(detail, '$.started') >= ?
+ AND json_extract(detail, '$.experiment') = '')`,
+		RunRunning, reserved, since.UnixMilli(), loopHoldAction, since.UnixMilli(), since.UnixMilli()).Scan(&spent)
 	return spent, err
+}
+
+const loopHoldAction = "loop hold"
+
+// HoldLoopRun removes a held build's reservation without counting an agent run.
+// Any model work already done remains a charge receipt in the case log. The
+// removal, charge and receipt share one transaction, so budgets lose no spend.
+func (s *Store) HoldLoopRun(ctx context.Context, r LoopRun) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var id, status, experiment string
+	var started int64
+	err = tx.QueryRowContext(ctx, `SELECT case_id, status, started, experiment FROM loop_runs WHERE id = ?`, r.ID).
+		Scan(&id, &status, &started, &experiment)
+	if errors.Is(err, sql.ErrNoRows) || err == nil && status != RunRunning {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if r.Ended.IsZero() || r.USD < 0 {
+		return fmt.Errorf("invalid hold completion")
+	}
+	c, err := live(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	duration := max(int64(0), r.Ended.UnixMilli()-started)
+	if r.Started.IsZero() {
+		started, duration = 0, 0
+	}
+	receipt, err := json.Marshal(struct {
+		USD        float64 `json:"usd"`
+		Started    int64   `json:"started"`
+		Experiment string  `json:"experiment"`
+		Tokens     int64   `json:"tokens"`
+		Turns      int     `json:"turns"`
+		Usage      Usage   `json:"usage"`
+	}{r.USD, started, experiment, r.Tokens, r.Turns, r.Usage})
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET cost_usd = cost_usd + ?, cost_tokens = cost_tokens + ?,
+ cost_ms = cost_ms + ?, updated = ? WHERE id = ?`, r.USD, r.Tokens, duration, r.Ended.UnixMilli(), c.ID); err != nil {
+		return err
+	}
+	if err := caseLog(ctx, tx, c.ID, "loop:"+r.ID, loopHoldAction, string(receipt), r.Ended); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM loop_runs WHERE id = ?`, r.ID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // FinishLoopRun ends a reservation and charges its canonical case in one transaction, exactly once.

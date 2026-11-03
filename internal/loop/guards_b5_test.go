@@ -147,7 +147,7 @@ func TestCheckAndLandingReportExportCleanupFailure(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				p, err = s.Reviewed(ctx, c.ID, Review{Text: "One review.", Comment: "https://example.com/review/1"})
+				p, err = s.Reviewed(ctx, c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "One review.", Comment: "https://example.com/review/1"})
 				if err != nil {
 					t.Fatal(err)
 				}

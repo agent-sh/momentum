@@ -34,7 +34,7 @@ func (s *Ship) lock(ctx context.Context, caseID string) (func(), error) {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return nil, refused("another ship step is running on case %s: wait for it to end, then run this step again", caseID)
+			return nil, &shipHold{err: refused("another ship step is running on case %s: wait for it to end, then run this step again", caseID)}
 		}
 		return nil, err
 	}

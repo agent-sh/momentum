@@ -97,7 +97,7 @@ func TestRollbackRestoresPreviouslyPublishedPersonalShapes(t *testing.T) {
 	if _, err := proposePatch(t, s, ctx, c.ID, pr); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Reviewed(ctx, c.ID, Review{Text: "Checked.", Comment: "https://example.com/review/1"}); err != nil {
+	if _, err := s.Reviewed(ctx, c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked.", Comment: "https://example.com/review/1"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Land(ctx, c.ID); err != nil {
@@ -151,7 +151,7 @@ func TestTwoClosedProposalsStopAutomaticBuilds(t *testing.T) {
 			if _, err := proposePatch(t, s, ctx, c.ID, pr); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := s.Reviewed(ctx, c.ID, Review{Text: "Checked.", Comment: "https://example.com/review/2"}); err != nil {
+			if _, err := s.Reviewed(ctx, c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked.", Comment: "https://example.com/review/2"}); err != nil {
 				t.Fatal(err)
 			}
 		} else if got.ID != "" || !strings.Contains(why, "proposals") {

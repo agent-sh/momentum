@@ -12,7 +12,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
+	"text/scanner"
 	"time"
 
 	"github.com/agent-sh/momentum/internal/store"
@@ -831,24 +833,39 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 }
 
 // editsSignal refuses a change that edits the texts its own measurement counts: a change of words that only stops
-// the signal from matching would measure as a fix. It reads the lines the change removes, hunk by hunk.
+// the signal from matching would measure as a fix. It also reads neighboring
+// literals, since a removed fragment can belong to a split signal.
 func (s *Ship) editsSignal(ctx context.Context, p Package, sig Signal) error {
-	diff, err := s.git(ctx, p.Host, "diff", "--no-renames", "--no-ext-diff", "--no-textconv", "--text", "-U0", p.BaseCommit, p.Check.Tree)
+	// Git's maximum context includes the whole old file, even when only one
+	// fragment changes. The host's normal output bound still applies.
+	diff, err := s.git(ctx, p.Host, "diff", "--no-renames", "--no-ext-diff", "--no-textconv", "--text", "-U2147483647", p.BaseCommit, p.Check.Tree)
 	if err != nil {
 		return err
 	}
 	var removed []string
+	var old []string
+	var changed []bool
+	flush := func() {
+		removed = append(removed, changedLiterals(old, changed)...)
+		old, changed = nil, nil
+	}
 	inHunk := false
 	for _, l := range strings.Split(diff, "\n") {
 		switch {
 		case strings.HasPrefix(l, "diff --git "):
+			flush()
 			inHunk = false
 		case strings.HasPrefix(l, "@@"):
+			flush()
 			inHunk = true
 		case inHunk && strings.HasPrefix(l, "-"):
 			removed = append(removed, strings.ToLower(l[1:]))
+			old, changed = append(old, l[1:]), append(changed, true)
+		case inHunk && strings.HasPrefix(l, " "):
+			old, changed = append(old, l[1:]), append(changed, false)
 		}
 	}
+	flush()
 	for _, m := range sig.Match {
 		m = strings.ToLower(m)
 		for _, l := range removed {
@@ -858,6 +875,53 @@ func (s *Ship) editsSignal(ctx context.Context, p Package, sig Signal) error {
 		}
 	}
 	return nil
+}
+
+// changedLiterals joins adjacent quoted literals, with an optional + between
+// them. It returns only sequences with an edited literal or joining operator.
+// This is a source-text guard, not evaluation of arbitrary program expressions.
+func changedLiterals(lines []string, changed []bool) []string {
+	var scan scanner.Scanner
+	scan.Init(strings.NewReader(strings.Join(lines, "\n")))
+	scan.Mode = scanner.ScanStrings | scanner.ScanRawStrings | scanner.ScanComments | scanner.SkipComments
+	scan.Error = func(*scanner.Scanner, string) {} // arbitrary repository text is not necessarily Go
+	var joined strings.Builder
+	var out []string
+	touched := false
+	flush := func() {
+		if touched {
+			out = append(out, strings.ToLower(joined.String()))
+		}
+		joined.Reset()
+		touched = false
+	}
+	mark := func(first, last int) {
+		for line := first; line <= last && line <= len(changed); line++ {
+			if line > 0 && changed[line-1] {
+				touched = true
+			}
+		}
+	}
+	for token := scan.Scan(); token != scanner.EOF; token = scan.Scan() {
+		switch token {
+		case scanner.String, scanner.RawString:
+			text, err := strconv.Unquote(scan.TokenText())
+			if err != nil {
+				flush()
+				continue
+			}
+			joined.WriteString(text)
+			mark(scan.Position.Line, scan.Pos().Line)
+		case '+':
+			if joined.Len() > 0 {
+				mark(scan.Position.Line, scan.Position.Line)
+			}
+		default:
+			flush()
+		}
+	}
+	flush()
+	return out
 }
 
 // Count is the events a signal counts over a span.
@@ -900,6 +964,9 @@ func (s *Ship) Reviewed(ctx context.Context, caseID string, r Review) (Package, 
 	if !ok || p.State != Proposed {
 		return p, refused("case %s has no proposed package to review", caseID)
 	}
+	if r.Head == "" || r.Head != p.Head {
+		return p, refused("the review head differs from the proposed head")
+	}
 	if len(p.Reviews) >= MaxRounds {
 		return p, refused("review rounds used; the change waits for a person")
 	}
@@ -938,7 +1005,7 @@ func (s *Ship) Reviewed(ctx context.Context, caseID string, r Review) (Package, 
 		}
 		r.High, r.Medium, r.Low = h, m, l
 	}
-	r.Round, r.At, r.Head = len(p.Reviews)+1, s.now(), p.Head
+	r.Round, r.At = len(p.Reviews)+1, s.now()
 	note, err := Redact(ctx, fmt.Sprintf("round %d: %d high, %d medium, %d low %s", r.Round, r.High, r.Medium, r.Low, r.Comment))
 	if err != nil {
 		return p, err

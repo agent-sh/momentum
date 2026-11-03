@@ -196,6 +196,9 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 }
 
 func stageFailure(res Result, key string, err error) (Result, error) {
+	if held(err) {
+		return res, &buildStageError{key: key, err: err}
+	}
 	res.Status, res.Failure = store.RunFailed, key
 	res.Text = key + ": " + err.Error()
 	return res, nil

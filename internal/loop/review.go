@@ -128,7 +128,7 @@ func (r *Runner) review(ctx context.Context, c store.Case, p Package, run store.
 			res.Status, res.Failure = store.RunFailed, "report"
 		} else {
 			text := reviewText(len(p.Reviews)+1, h, m, l, *rep.Summary, *rep.Findings)
-			rev := Review{Findings: *rep.Findings, Text: text}
+			rev := Review{Head: p.Head, Findings: *rep.Findings, Text: text}
 			saved, saveErr := r.Ship.Reviewed(ctx, c.ID, rev)
 			if saveErr != nil {
 				res.Status, res.Failure = store.RunFailed, "review"

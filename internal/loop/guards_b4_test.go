@@ -237,7 +237,7 @@ func TestTheLastBlockingReviewCannotStartAnotherBuild(t *testing.T) {
 	if err := s.save(&p); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.Reviewed(context.Background(), c.ID, Review{Text: "One finding.", Comment: "posted",
+	got, err := s.Reviewed(context.Background(), c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "One finding.", Comment: "posted",
 		Findings: []Finding{{Severity: "medium", Where: "fake.go", Problem: "marker-7f3a", Fix: "one fix"}}})
 	if err != nil || got.State != Proposed || len(got.Reviews) != MaxRounds {
 		t.Fatalf("last blocking review became a revision: %s %v", got.State, err)

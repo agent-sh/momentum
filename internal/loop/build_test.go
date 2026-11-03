@@ -224,7 +224,12 @@ func TestBuildPreparationFailuresUseStageKeyAndStopRule(t *testing.T) {
 	f := newRepo(t, nil)
 	r.Ship = shipWithSandbox(r.Store, f, Sandbox{})
 	r.Ship.Dir = r.Dir
-	r.Ship.Gate.Owners = nil
+	// The gate allows the repository, but host clone storage is unusable.
+	// Gate refusals have their own hold tests and are not agent failures.
+	r.Ship.Gate.Busy = func(context.Context, string) (string, error) {
+		write(t, filepath.Join(r.Dir, "host"), "marker-7f3a")
+		return "", nil
+	}
 	r.Inputs.ReadDirs = []string{f.main}
 	mechanism, fix := "one cause", "one fix"
 	var err error

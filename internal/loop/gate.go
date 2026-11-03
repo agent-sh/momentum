@@ -21,6 +21,18 @@ func refused(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrRefused, fmt.Sprintf(format, args...))
 }
 
+// shipHold distinguishes authority and lock holds from invalid agent output.
+// Both remain ErrRefused to callers of the ship tool.
+type shipHold struct{ err error }
+
+func (e *shipHold) Error() string { return e.err.Error() }
+func (e *shipHold) Unwrap() error { return e.err }
+
+func held(err error) bool {
+	var hold *shipHold
+	return errors.As(err, &hold)
+}
+
 // Gate holds the loop's authority, as the machine's configuration gives it. The loop never changes it: its
 // configuration lives outside every repository it may write, and its code is outside what the ship tool may
 // change (Protected).
@@ -89,14 +101,19 @@ func RepoOf(ctx context.Context, dir string) (string, error) {
 // Repository checks that the loop may change a repository now, and returns it as a target: an owner it may write
 // to, a repository it does not exclude, the machine's scope check allows it, and nothing else works in it (the
 // scheduled-AI policy leaves a repository another agent or a human works on alone).
-func (g Gate) Repository(ctx context.Context, dir string) (Target, error) {
+func (g Gate) Repository(ctx context.Context, dir string) (target Target, err error) {
+	defer func() {
+		if errors.Is(err, ErrRefused) && !held(err) {
+			err = &shipHold{err: err}
+		}
+	}()
 	if err := CheckHostStorage(ctx, dir); err != nil {
 		return Target{}, err
 	}
 	if err := CheckGitConfig(ctx, dir); err != nil {
 		return Target{}, err
 	}
-	dir, err := filepath.Abs(dir)
+	dir, err = filepath.Abs(dir)
 	if err != nil {
 		return Target{}, err
 	}

@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -177,6 +178,10 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		}
 		run, inputErr := r.prepareRun(ctx, c, fam, step)
 		if inputErr != nil {
+			if step == StepBuild && held(inputErr) {
+				done = append(done, r.buildSkipped(ctx, c, "prepare", inputErr))
+				continue
+			}
 			if step == StepBuild {
 				run, refusal := r.reservePrepared(ctx, run)
 				if refusal != "" {
@@ -235,6 +240,35 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 	}
 	sort.Slice(done, func(i, j int) bool { return done[i].Family+done[i].Step < done[j].Family+done[j].Step })
 	return done, nil
+}
+
+func (r *Runner) buildSkipped(ctx context.Context, c store.Case, stage string, cause error) Done {
+	if err := r.noteBuildSkip(ctx, c, stage, cause.Error()); err != nil {
+		r.logf("build waiting note: %v", err)
+	}
+	return Done{Family: c.Family, Case: c.ID, Step: StepBuild, Skipped: cause.Error()}
+}
+
+func (r *Runner) noteBuildSkip(ctx context.Context, c store.Case, stage, why string) error {
+	detail, err := Redact(ctx, why)
+	if err != nil {
+		return err
+	}
+	detail = store.CaseNoteText(detail)
+	cause := sha256.Sum256([]byte(detail))
+	id := "loop-build:" + store.IDPart(c.ID) + ":" + stage + ":" + hex.EncodeToString(cause[:])
+	notes, err := r.Store.Notes(ctx)
+	if err != nil {
+		return err
+	}
+	for _, note := range notes {
+		if note.ID == id && note.Detail == detail {
+			return nil
+		}
+	}
+	_, err = r.Store.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Importance: store.ImportanceLow,
+		At: r.now(), Title: "The loop's build for case " + c.ID + " waits: " + stage, Detail: detail})
+	return err
 }
 
 // endStale ends the runs that started longer ago than any run may last and never ended: killed with the process
@@ -537,11 +571,23 @@ func (r *Runner) reservePrepared(ctx context.Context, run store.LoopRun) (store.
 
 func (r *Runner) step(ctx context.Context, family string, c store.Case, step string, run store.LoopRun) Done {
 	res, err := r.invoke(ctx, family, c, step, run)
+	return r.completeStep(context.WithoutCancel(ctx), c, run, res, err)
+}
+
+func (r *Runner) completeStep(ctx context.Context, c store.Case, run store.LoopRun, res Result, err error) Done {
 	if res.InputSummary == "" {
 		res.InputSummary = run.Summary
 	}
-	r.finish(context.WithoutCancel(ctx), c, &run, res, err)
-	return Done{Family: family, Case: c.ID, Step: step, Run: run, Refused: res.Refused}
+	r.finish(ctx, c, &run, res, err)
+	if run.Step == StepBuild && held(err) {
+		stage := "ship"
+		var staged *buildStageError
+		if errors.As(err, &staged) {
+			stage = strings.TrimPrefix(staged.key, "build ")
+		}
+		return r.buildSkipped(ctx, c, stage, err)
+	}
+	return Done{Family: c.Family, Case: c.ID, Step: run.Step, Run: run, Refused: res.Refused}
 }
 
 // finish records how a run ended, on the run and on its case.
@@ -607,8 +653,14 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 		}
 	}
 
-	if err := r.Store.FinishLoopRun(ctx, *run); err != nil {
-		r.logf("record run %s: %v", run.ID, err)
+	var recordErr error
+	if run.Step == StepBuild && held(err) {
+		recordErr = r.Store.HoldLoopRun(ctx, *run)
+	} else {
+		recordErr = r.Store.FinishLoopRun(ctx, *run)
+	}
+	if recordErr != nil {
+		r.logf("record run %s: %v", run.ID, recordErr)
 		return
 	}
 }

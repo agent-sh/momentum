@@ -117,12 +117,15 @@ func maskPersonal(text string) string {
 		labels := strings.Split(host, ".")
 		// Bare receiver paths and calls remain code. A URL or host command
 		// establishes address context even when its host resembles a receiver.
-		receiver := false
+		receiver := len(labels[0]) <= 3 && identifierLabel(labels[0])
 		switch strings.ToLower(labels[0]) {
 		case "obj", "self", "this", "cfg", "config":
 			receiver = true
 		}
-		hostLike := len(labels) >= 3 && host == strings.ToLower(host) && !receiver &&
+		beforePath := span[0] >= 2 && text[span[0]-1] == '.' && identifierByte(text[span[0]-2])
+		// The regexp may start inside a receiver containing an underscore.
+		insideIdentifier := span[0] > 0 && identifierByte(text[span[0]-1])
+		hostLike := len(labels) >= 3 && host == strings.ToLower(host) && !receiver && !beforePath && !insideIdentifier &&
 			!strings.HasPrefix(suffix, "(")
 		if !explicit && !hostLike && !strings.HasPrefix(suffix, "/") {
 			continue
@@ -141,13 +144,26 @@ func maskIPv6(text string) string {
 	for _, span := range ipv6Re.FindAllStringIndex(text, -1) {
 		token := text[span[0]:span[1]]
 		address, _, _ := strings.Cut(token, "%")
+		start := span[0]
+		if label, rest, ok := strings.Cut(address, ":"); ok && label != "" && !hexLabel(label) {
+			start += len(label) + 1
+			address = rest
+		}
 		groups := 0
+		lowerLettersOnly := true
 		for _, group := range strings.Split(address, ":") {
 			if group != "" {
 				groups++
 			}
+			for i := range group {
+				if group[i] < 'a' || group[i] > 'f' {
+					lowerLettersOnly = false
+				}
+			}
 		}
-		if groups < 2 || (!strings.Contains(address, "::") && groups < 3) || net.ParseIP(address) == nil {
+		// Two lowercase hex-letter identifiers also parse as compressed IPs.
+		// Digits, uppercase hex or a third group establish address context.
+		if groups < 2 || (groups < 3 && lowerLettersOnly) || net.ParseIP(address) == nil {
 			continue
 		}
 		// A dotted receiver or a call makes this an identifier path.
@@ -156,12 +172,34 @@ func maskIPv6(text string) string {
 		if beforePath || afterPath || strings.HasPrefix(text[span[1]:], "(") {
 			continue
 		}
-		out.WriteString(text[end:span[0]])
+		out.WriteString(text[end:start])
 		out.WriteString("[personal]")
 		end = span[1]
 	}
 	out.WriteString(text[end:])
 	return out.String()
+}
+
+func hexLabel(label string) bool {
+	for i := range label {
+		c := label[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+func identifierLabel(label string) bool {
+	if label == "" || !identifierByte(label[0]) || label[0] >= '0' && label[0] <= '9' {
+		return false
+	}
+	for i := range label {
+		if !identifierByte(label[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func identifierByte(c byte) bool {

@@ -40,7 +40,7 @@ func TestFetchedBranchDoesNotWeakenProposalLease(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := s.Reviewed(ctx, c.ID, Review{Text: "Checked every changed file.", Findings: []Finding{{Severity: "medium", Where: "fake.go", Problem: "p", Fix: "f"}}, Comment: "c1"}); err != nil {
+	if _, err := s.Reviewed(ctx, c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked every changed file.", Findings: []Finding{{Severity: "medium", Where: "fake.go", Problem: "p", Fix: "f"}}, Comment: "c1"}); err != nil {
 		t.Fatal(err)
 	}
 	theirs := pushOther(t, f, p.Branch, map[string]string{"theirs.txt": "marker-7f3a\n"})

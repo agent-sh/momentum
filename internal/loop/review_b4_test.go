@@ -61,7 +61,7 @@ func b4Reviewed(t *testing.T) (*Ship, repoFixture, store.Case, Package) {
 	if _, err := proposePatch(t, s, context.Background(), c.ID, pr); err != nil {
 		t.Fatal(err)
 	}
-	p, err := s.Reviewed(context.Background(), c.ID, Review{Text: "Checked every changed file.", Comment: "https://example.com/review/1"})
+	p, err := s.Reviewed(context.Background(), c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked every changed file.", Comment: "https://example.com/review/1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +200,7 @@ func TestReviewedOwnsTheLockAndRoundBoundary(t *testing.T) {
 			if err := s.save(&p); err != nil {
 				t.Fatal(err)
 			}
-			rev := Review{Text: "Checked every changed file.", Comment: "posted"}
+			rev := Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked every changed file.", Comment: "posted"}
 			if boundary == "empty text" {
 				rev.Text = " \n "
 			}
