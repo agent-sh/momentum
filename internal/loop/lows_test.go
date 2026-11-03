@@ -319,3 +319,34 @@ func TestATaskWithoutAnEndFailsAlone(t *testing.T) {
 		}
 	}
 }
+
+// A pass freezes the host binary once: the records child of every run in it is that copy, so an install or rebuild
+// during the pass changes no run's records.
+func TestALivePassRunsItsPinnedRecordsChild(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	r := runnerFor(t, st, fakeAgent(t, `{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":1}`))
+	ev := store.Event{Source: "fixture", SourceKey: "pinned", Kind: "tool_result", Actor: store.ActorTool, TS: time.Now().Add(-time.Hour), Session: "s", Summary: "a failure"}
+	if _, err := st.Put(ctx, []store.Event{ev}); err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: "pinned", Title: "case pinned",
+		Evidence: []store.Evidence{{Ref: "ev:" + ev.ID(), At: ev.TS}}}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.pass = &passInputs{}
+	defer r.pass.close()
+	if err := r.prepareInputs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	script(t, filepath.Dir(r.Inputs.Momentum), filepath.Base(r.Inputs.Momentum), "printf 'changed program\\n'")
+	run, err := r.prepareRun(ctx, c, c.Family, StepInvestigate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(HostDir(run.Dir), "records", "ev-"+ev.ID()+".txt"))
+	if err != nil || !strings.Contains(string(raw), "record") || strings.Contains(string(raw), "changed program") {
+		t.Fatalf("the records child was not the pass's copy: %q %v", raw, err)
+	}
+}
