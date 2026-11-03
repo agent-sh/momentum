@@ -112,8 +112,9 @@ func StoreCopy(ctx context.Context, o StoreCopyOptions) (m StoreManifest, err er
 	if _, err = db.ExecContext(ctx, `VACUUM INTO ?`, plain); err != nil {
 		return m, err
 	}
-	// VACUUM keeps the source's WAL mode. Change the new file to DELETE mode
-	// while it is writable so a read-only connection needs no sidecar.
+	// VACUUM INTO writes a file in rollback-journal mode already (measured: the header says so), so this pragma is a
+	// guard that changes nothing today: whatever mode the file has, it ends in DELETE before it is made read-only, so
+	// a read-only connection needs no sidecar.
 	final, err := sql.Open("sqlite", sqliteInputURI(plain, false))
 	if err != nil {
 		return m, err

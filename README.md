@@ -188,3 +188,7 @@ The agent reads `/ro/store.sqlite` with python3's sqlite3, and reads `/ro/record
 ```
 
 Existing build-related loop configuration keys still load. Run the pass from its own oneshot user unit after ingest.
+
+Knowledge stays in [tacit](https://github.com/agent-sh/tacit). Cases, evidence and state stay on the machine, never in this repository.
+
+MIT licensed.

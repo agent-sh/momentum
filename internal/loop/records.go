@@ -23,6 +23,10 @@ const (
 	MaxNeighbours   = 5
 	NeighbourWindow = 10 * time.Minute
 	MaxUnits        = 25
+	// recordSlack is what the child's header and clip marker add to a record clipped at the bound.
+	recordSlack = 4 << 10
+	// unitLogLines is how much of a unit's log is asked for: its end.
+	unitLogLines = 120
 	// ActiveUnitWindow is how far back a unit's journal must have entries to be rendered without being named.
 	ActiveUnitWindow = 3 * 24 * time.Hour
 )
@@ -355,14 +359,16 @@ func writeRecords(ctx context.Context, o RecordsOptions, files []RecordFile, m R
 			m.Skipped += len(files) - i
 			break
 		}
-		args := []string{"evidence", "unit", file.Unit}
+		// The child clips an event's record at --bytes and adds its header and a marker, and a unit's log is its state
+		// and the end of the log: both are asked for less than the bound and read with the slack the extras need.
+		args := []string{"evidence", "unit", file.Unit, "--lines", strconv.Itoa(unitLogLines)}
 		if file.Event != "" {
 			args = []string{"evidence", "show", "--bytes", strconv.Itoa(limit), file.Event}
 		}
 		cctx, cancel := context.WithTimeout(ctx, time.Minute)
 		cmd := exec.CommandContext(cctx, o.Binary, args...)
 		cmd.Env = recordEnv(o)
-		out, stderr := Capture{Limit: limit}, Capture{Limit: limit}
+		out, stderr := Capture{Limit: limit + recordSlack}, Capture{Limit: limit}
 		cmd.Stdout, cmd.Stderr = &out, &stderr
 		runErr := cmd.Run()
 		cancel()
@@ -370,10 +376,9 @@ func writeRecords(ctx context.Context, o RecordsOptions, files []RecordFile, m R
 			return m, ctx.Err()
 		}
 		if out.Over() || stderr.Over() {
+			// one record over its bound is withheld; the next may fit
 			m.Withheld++
-			m.Stopped = "record bytes"
-			m.Skipped += len(files) - i - 1
-			break
+			continue
 		}
 		if runErr != nil || out.Len() == 0 || recordWithheld(out.String()) {
 			m.Withheld++
@@ -383,11 +388,9 @@ func writeRecords(ctx context.Context, o RecordsOptions, files []RecordFile, m R
 		if err != nil {
 			return m, err
 		}
-		if len(clean[0]) > limit {
+		if len(clean[0]) > limit+recordSlack {
 			m.Withheld++
-			m.Stopped = "record bytes"
-			m.Skipped += len(files) - i - 1
-			break
+			continue
 		}
 		file.Bytes = len(clean[0])
 		line := recordIndex([]RecordFile{file})

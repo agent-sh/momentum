@@ -291,7 +291,7 @@ func checkCloneObjects(ctx context.Context, dir string) error {
 		}
 		n, err := strconv.Atoi(fields[2])
 		if err != nil || n < 0 || n > ScrubBatchBytes {
-			return fmt.Errorf("clone object exceeds the scrub limit")
+			return fmt.Errorf("a repository object over %d MiB cannot be scrubbed in one piece, so the repository is left out", ScrubBatchBytes>>20)
 		}
 		data := make([]byte, n)
 		if _, err = io.ReadFull(reader, data); err != nil {

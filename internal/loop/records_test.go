@@ -104,20 +104,22 @@ func TestInputsRecordBoundsAndWithheld(t *testing.T) {
 			t.Fatalf("count bound: %+v %v", m, err)
 		}
 	})
-	for _, size := range []int{MaxRecordBytes, MaxRecordBytes + 1} {
+	// The child clips a record at the bound and adds a header and a marker: output up to the bound and that slack is
+	// a record; more is withheld, and the next record is still read.
+	for _, size := range []int{MaxRecordBytes, MaxRecordBytes + recordSlack, MaxRecordBytes + recordSlack + 1} {
 		t.Run(strconv.Itoa(size), func(t *testing.T) {
-			o := recordFixture(t, events[:2], `head -c `+strconv.Itoa(size)+` /dev/zero | tr '\000' x`)
+			o := recordFixture(t, events[:2], `case "$5" in "`+events[0].ID()+`") head -c `+strconv.Itoa(size)+` /dev/zero | tr '\000' x;; *) printf 'next record\n';; esac`)
 			o.Neighbours = -1
 			o.IDs = []string{events[0].ID(), events[1].ID()}
 			m, err := Records(context.Background(), o)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if size == MaxRecordBytes && (m.Written != 2 || m.Withheld != 0) {
-				t.Fatalf("exact boundary refused: %+v", m)
+			if size <= MaxRecordBytes+recordSlack && (m.Written != 2 || m.Withheld != 0) {
+				t.Fatalf("a record within its bound and slack was refused: %+v", m)
 			}
-			if size > MaxRecordBytes && (m.Written != 0 || m.Withheld != 1 || m.Skipped != 1 || m.Stopped != "record bytes") {
-				t.Fatalf("oversized record accepted: %+v", m)
+			if size > MaxRecordBytes+recordSlack && (m.Written != 1 || m.Withheld != 1 || m.Skipped != 0 || m.Stopped != "") {
+				t.Fatalf("an oversized record stopped the others or was accepted: %+v", m)
 			}
 		})
 	}

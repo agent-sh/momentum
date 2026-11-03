@@ -3,12 +3,14 @@ package loop
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/sandbox"
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -85,10 +87,15 @@ func (r *Runner) buildInputs(ctx context.Context, p *passInputs) error {
 	p.binds = append(p.binds, sandbox.Bind{Src: dst, Dst: "/ro/config"})
 	dst = filepath.Join(dir, "clone")
 	p.manifest.Tacit, err = CloneTacit(ctx, r.Inputs.TacitStore, dst)
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrNoScrubber):
 		return err
+	case err != nil:
+		// tacit's facts are context, not a precondition: without them the run goes on, and the manifest says "tacit absent"
+		p.manifest.Tacit.Error = err.Error()
+	default:
+		p.binds = append(p.binds, sandbox.Bind{Src: dst, Dst: "/ro/clone"})
 	}
-	p.binds = append(p.binds, sandbox.Bind{Src: dst, Dst: "/ro/clone"})
 	dst = filepath.Join(dir, "repos")
 	if err = os.Mkdir(dst, 0700); err != nil {
 		return err
@@ -146,7 +153,7 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 	if err != nil {
 		return run, err
 	}
-	prompt := fmt.Sprintf("%s\nProblem: %s\n%s%s%s%s", liveQuestion, c.Title, evidenceText, caseHolds(c), findingsInstruction, inputReference())
+	prompt := fmt.Sprintf("%s\nProblem: %s\n%s%s%s%s", liveQuestion, plain.Line(c.Title), evidenceText, caseHolds(c), findingsInstruction, inputReference())
 	clean, err := RedactAll(ctx, []string{string(raw), system, prompt})
 	if err != nil {
 		return run, err
@@ -183,7 +190,7 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 	}
 	manifest := r.pass.manifest
 	manifest.Records, err = Records(ctx, RecordsOptions{Store: filepath.Join(r.pass.dir, "store.sqlite"), IDs: ids, Units: UnionUnits(FindUnits(texts...), ActiveUnits(ctx, r.Inputs.Home, r.now().Add(-ActiveUnitWindow), r.now())),
-		Destination: filepath.Join(host, "records"), Binary: r.Inputs.Momentum, Home: home, Env: CleanEnv(nil)})
+		Destination: filepath.Join(host, "records"), Binary: r.Inputs.Momentum, Home: home, Env: CleanEnv(nil, scrubberDir())})
 	if err != nil {
 		return run, err
 	}

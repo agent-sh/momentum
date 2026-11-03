@@ -187,7 +187,11 @@ func ConfigCopy(ctx context.Context, o ConfigCopyOptions) (m ConfigManifest, err
 			} else {
 				b, reason, err = readConfigText(home, name)
 				if err != nil {
-					return m, err
+					if ctx.Err() != nil {
+						return m, ctx.Err()
+					}
+					m.skip(name, "unreadable")
+					continue
 				}
 			}
 			if reason == "" {
@@ -339,7 +343,13 @@ func liveConfigNames(home *os.Root, root string, m *ConfigManifest) ([]string, e
 			return nil
 		}
 		if err != nil {
-			return err
+			// a directory or file that cannot be read now (a permission, a file removed since the listing) is left out
+			// and counted; the copy goes on
+			m.skip(path, "unreadable")
+			if entry != nil && entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
 			m.skip(path, "link")

@@ -89,3 +89,16 @@ func CheckScrubber(ctx context.Context) error {
 	}
 	return nil
 }
+
+// scrubberDir is the directory of the configured scrubber's program, for the PATH of a host child that scrubs by
+// itself (the records command): a scrubber in a user's bin directory is on no clean PATH.
+func scrubberDir() string {
+	if len(Scrubber) == 0 {
+		return ""
+	}
+	path, err := exec.LookPath(Scrubber[0])
+	if err != nil {
+		return ""
+	}
+	return filepath.Dir(path)
+}
