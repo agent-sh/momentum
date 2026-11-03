@@ -378,3 +378,25 @@ func TestTheMeasureStepHoldsTheLockAgainstAShipStep(t *testing.T) {
 		t.Fatalf("the case was not measured: %s %s", got.Status, got.Why)
 	}
 }
+
+// The evaluation lock is keyed by the unit prefix it guards: a second holder of the same prefix fails at once, and a
+// test process's own prefix is not blocked by another prefix's lock.
+func TestTheEvaluationLockIsPerUnitPrefix(t *testing.T) {
+	was := EvalUnitPrefix
+	defer func() { EvalUnitPrefix = was }()
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	unlock, err := LockEval()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	if _, err := LockEval(); err == nil || !strings.Contains(err.Error(), "another evaluation") {
+		t.Fatalf("a second evaluation of the prefix: %v", err)
+	}
+	EvalUnitPrefix = was + "other-"
+	other, err := LockEval()
+	if err != nil {
+		t.Fatalf("another prefix was blocked: %v", err)
+	}
+	other()
+}
