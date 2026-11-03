@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -370,5 +371,77 @@ func TestPreparedInputsKeepTheirOriginalCaseEpisode(t *testing.T) {
 	got, err := r.Store.CaseByID(ctx, c.ID)
 	if err != nil || got.Mechanism != "" || got.Status != store.CaseOpen {
 		t.Fatalf("old brief changed reopened case: %+v %v", got, err)
+	}
+}
+
+// A pass told to stop (a signal ends the command's context) stops its runs' units, records the run as stopped, removes
+// its inputs and starts no other run.
+func TestAPassToldToStopStopsItsRunsAndCleansUp(t *testing.T) {
+	if err := sandbox.Available(true); err != nil {
+		t.Skip(err)
+	}
+	r, c := inputRunner(t)
+	r.Dir = shortScratch(t)
+	readyDir := t.TempDir()
+	ready := filepath.Join(readyDir, "ready")
+	harness := script(t, t.TempDir(), "harness", "echo started > /opt/ready/ready\nsleep 60\n")
+	r.Agent = testSandboxAgent(t, Agent{Runner: []string{harness}, Model: "global.anthropic.claude-opus-5-5"})
+	r.Agent.Binds = append(r.Agent.Binds, sandbox.Bind{Src: readyDir, Dst: "/opt/ready", Write: true})
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	go func() {
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(ready); err == nil {
+				stop()
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		stop()
+	}()
+	start := time.Now()
+	done, err := r.Once(ctx, Options{})
+	if err != nil || len(done) != 1 || done[0].Run.Failure != "stopped" || time.Since(start) > 40*time.Second {
+		t.Fatalf("a stopped pass: %+v %v after %s", done, err, time.Since(start))
+	}
+	out, _ := exec.Command("systemctl", "--user", "list-units", "--all", "--no-legend", "--plain", UnitPrefix+"*.service").Output()
+	if strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("a unit outlived its stopped pass: %s", out)
+	}
+	entries, _ := os.ReadDir(r.Dir)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".pass-") {
+			t.Fatal("the stopped pass kept its inputs")
+		}
+	}
+	got, _ := r.Store.CaseByID(context.Background(), c.ID)
+	if got.Cost.Runs != 1 {
+		t.Fatalf("the stopped run was not recorded once: %+v", got.Cost)
+	}
+	// a second pass with the context already ended starts nothing
+	done, err = r.Once(ctx, Options{})
+	if err == nil || len(done) != 0 {
+		t.Fatalf("a pass started on an ended context: %+v %v", done, err)
+	}
+}
+
+// Input directories of a pass that never finished are swept when the next pass starts.
+func TestAPassSweepsTheInputsOfAKilledPass(t *testing.T) {
+	fakeManager(t)
+	r, _ := inputRunner(t)
+	stale := filepath.Join(r.Dir, ".pass-stale")
+	if err := os.MkdirAll(filepath.Join(stale, "config", "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(stale, "config", "sub", "file"), "marker-7f3a")
+	if err := os.Chmod(filepath.Join(stale, "config", "sub"), 0o555); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Once(context.Background(), Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); err == nil {
+		t.Fatal("the killed pass's inputs were kept")
 	}
 }

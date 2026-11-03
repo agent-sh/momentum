@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -127,11 +128,15 @@ type relay struct {
 	modelRefused                  bool
 	usage                         Usage
 	turnLimit, turnRefused        int
+	errorsN                       int // error answers of the broker, which are neither charged nor turns
 	seen                          bool
 }
 
 const relayBodyLimit = 8 << 20
 const relayInFlight = 8
+
+// relayErrorLimit is how many error answers of the broker a run may meet before its requests are refused.
+const relayErrorLimit = 40
 const relayWait = 3 * time.Second
 
 type relayRate struct {
@@ -168,6 +173,9 @@ func (b *Bedrock) open(socket string, budget float64, turns ...int) (*relay, []s
 	// A socket directory belongs to the host, never a run's writable mount.
 	if _, err := os.Lstat(socket); err == nil {
 		return nil, nil, fmt.Errorf("the relay socket already exists")
+	}
+	if len(socket) > 100 { // sockaddr_un takes 107 bytes of path
+		return nil, nil, fmt.Errorf("the run's relay socket path is %d bytes, over what a Unix socket takes: use a shorter data directory (%s)", len(socket), filepath.Base(filepath.Dir(socket)))
 	}
 	ln, err := net.Listen("unix", socket)
 	if err != nil {
@@ -297,6 +305,11 @@ func newRelay(target *url.URL, budget float64, transport http.RoundTripper, turn
 				r.refuse(w, "the run's model request turn allowance is exhausted", 429)
 				return
 			}
+			if r.errorsN >= relayErrorLimit {
+				r.mu.Unlock()
+				r.refuse(w, "the broker answered the run's requests with errors too often", 429)
+				return
+			}
 			left := r.allowance - r.spent - r.reserved
 			if reserve > left {
 				r.mu.Unlock()
@@ -311,10 +324,22 @@ func newRelay(target *url.URL, budget float64, transport http.RoundTripper, turn
 			c.finish = func() {
 				completed.Do(func() {
 					cost, ok := c.parser.cost(rate)
+					r.mu.Lock()
+					if c.parser.errorResponse && c.parser.eof {
+						// The broker answered with an error status (throttling, a refusal, a malformed request): no
+						// model ran for it, nothing is billed, it is no turn of the run's, and it is no report either
+						// (an earlier report stays the latest). What bounds a storm of them is the error count, not
+						// the spend.
+						r.reserved -= reserve
+						r.admittedN--
+						r.errorsN++
+						r.modelRefused = r.modelRefused || c.parser.refused
+						r.mu.Unlock()
+						return
+					}
 					if !ok {
 						cost = reserve
 					}
-					r.mu.Lock()
 					r.reserved -= reserve
 					r.spent += cost
 					r.chargedN++
@@ -460,4 +485,21 @@ func (r *relay) close() {
 // the loop's configuration is checked by it too, so a model that could never run says so before any run starts.
 func BedrockModel(m string) bool {
 	return strings.HasPrefix(strings.TrimSuffix(m, "[1m]"), "global.anthropic.claude-")
+}
+
+// RelayPriced says whether the relay has rates for a model: it refuses the requests of one it cannot price.
+// A configured name may carry the one-million-context suffix, which the harness takes off before it sends the request.
+func RelayPriced(model string) bool {
+	_, ok := relayRates[strings.TrimSuffix(model, "[1m]")]
+	return ok
+}
+
+// RelayModels are the models the relay prices, sorted.
+func RelayModels() []string {
+	var names []string
+	for name := range relayRates {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }

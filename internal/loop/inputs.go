@@ -227,3 +227,17 @@ func (r *Runner) runInputs(run store.LoopRun) ([]sandbox.Bind, InputsManifest, e
 	binds = append(binds, sandbox.Bind{Src: filepath.Join(HostDir(run.Dir), "records"), Dst: "/ro/records"})
 	return binds, manifest, nil
 }
+
+// sweepPasses removes the input directories of passes that never finished (a killed process leaves its own): the loop
+// runs one pass at a time, so any that exists when a pass starts is stale.
+func (r *Runner) sweepPasses() {
+	entries, err := os.ReadDir(r.Dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() && strings.HasPrefix(e.Name(), ".pass-") {
+			removeInputTree(filepath.Join(r.Dir, e.Name()))
+		}
+	}
+}

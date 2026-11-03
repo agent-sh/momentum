@@ -272,3 +272,28 @@ func textRequestBody(input, output int) string {
 		"messages": []any{map[string]any{"role": "user", "content": []any{map[string]string{"type": "text", "text": strings.Repeat("x ", input)}}}}})
 	return string(body)
 }
+
+// An error answer of the broker (throttling) is neither charged nor a turn of the run's; a storm of them is bounded by
+// their count.
+func TestBrokerErrorAnswersAreNeitherChargedNorTurns(t *testing.T) {
+	var calls atomic.Int64
+	r := budgetRelay(t, 1, func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		resp := brokerResponse(req, []byte(`{"message":"Too many requests"}`))
+		resp.StatusCode = 429
+		return resp, nil
+	})
+	r.turnLimit = 3
+	for i := 0; i < relayErrorLimit; i++ {
+		if rec := relayRequest(r, strings.NewReader(textRequestBody(10, 1000)), "invoke-with-response-stream"); rec.Code != 429 {
+			t.Fatalf("answer %d: %d", i, rec.Code)
+		}
+	}
+	spent, admitted, _, _ := r.accounting()
+	if spent != 0 || admitted != 0 || calls.Load() != relayErrorLimit {
+		t.Fatalf("error answers were charged or counted as turns: spent %v, admitted %d, calls %d", spent, admitted, calls.Load())
+	}
+	if rec := relayRequest(r, strings.NewReader(textRequestBody(10, 1000)), "invoke-with-response-stream"); rec.Code != 429 || calls.Load() != relayErrorLimit {
+		t.Fatalf("a storm of errors went on to the broker: %d, %d calls", rec.Code, calls.Load())
+	}
+}

@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/agent-sh/momentum/internal/config"
@@ -107,7 +109,12 @@ type usageError struct{ msg string }
 func (u usageError) Error() string { return u.msg }
 
 func main() {
-	os.Exit(run(context.Background(), os.Args[1:], os.Stdout, os.Stderr))
+	// A signal ends the command's context: a loop pass stops its runs' units (their sandboxes die with it) instead of
+	// leaving them running for the rest of their time.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	code := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
+	stop()
+	os.Exit(code)
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {

@@ -312,14 +312,10 @@ func live(ctx context.Context, q querier, id string) (Case, error) {
 
 // caseLog adds a line to a case's log.
 func caseLog(ctx context.Context, q querier, id, actor, action, detail string, at time.Time) error {
-	var err error
-	if detail, err = cleanText(ctx, detail); err != nil {
-		return err
-	}
 	if actor == "" {
 		actor = "unknown"
 	}
-	_, err = q.ExecContext(ctx, `INSERT INTO case_log (case_id, seq, at, actor, action, detail)
+	_, err := q.ExecContext(ctx, `INSERT INTO case_log (case_id, seq, at, actor, action, detail)
 	  VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM case_log WHERE case_id = ?), ?, ?, ?, ?)`,
 		id, id, at.UnixMilli(), caseText(actor, 80), action, caseText(detail, caseTextMax))
 	return err
@@ -1121,34 +1117,6 @@ func (s *Store) AddCaseSignature(ctx context.Context, id, sig, actor string) (Ca
 		return Case{}, false, err
 	}
 	return c, merged, tx.Commit()
-}
-
-// RecordRoot applies a run's root only while its assigned case has not gone into another case.
-// It reads that id and adds the signature in one transaction. The bool says whether the root was recorded.
-func (s *Store) RecordRoot(ctx context.Context, id, sig, actor string) (Case, bool, error) {
-	if !strings.HasPrefix(sig, "root:") {
-		return Case{}, false, badCase("a reported root starts with root:")
-	}
-	if err := checkSignature(sig); err != nil {
-		return Case{}, false, err
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return Case{}, false, err
-	}
-	defer tx.Rollback()
-	c, err := getCase(ctx, tx, id)
-	if err != nil {
-		return Case{}, false, err
-	}
-	if c.Into != "" {
-		return c, false, nil
-	}
-	c, _, err = addCaseSignature(ctx, tx, c, sig, actor)
-	if err != nil {
-		return Case{}, false, err
-	}
-	return c, true, tx.Commit()
 }
 
 func addCaseSignature(ctx context.Context, tx *sql.Tx, c Case, sig, actor string) (Case, bool, error) {

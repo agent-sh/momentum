@@ -90,6 +90,7 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		if err := sandbox.StopLeftover(ctx, UnitPrefix); err != nil {
 			return nil, err
 		}
+		r.sweepPasses()
 		r.pass = &passInputs{}
 		defer func() { r.pass.close(); r.pass = nil }()
 		if err := r.endStale(ctx); err != nil {
@@ -133,6 +134,10 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		picked error
 	)
 	for _, fam := range families {
+		if ctx.Err() != nil { // the pass was told to stop (a signal): no run starts
+			done = append(done, Done{Family: fam, Skipped: "stopped: " + ctx.Err().Error()})
+			continue
+		}
 		c, step, why, err := r.pick(ctx, fam, o.Case, o.Dry)
 		if err != nil {
 			picked = err

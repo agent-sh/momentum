@@ -48,6 +48,8 @@ func onBedrock(a loop.Agent) error {
 			return fmt.Errorf("loop %s %q is a list: the loop takes one model, and one fallback model", c.name, m)
 		case m != "" && !loop.BedrockModel(m):
 			return fmt.Errorf("loop %s %q is no Bedrock model: every headless run is on Bedrock, on a global inference profile (global.anthropic.claude-...)", c.name, m)
+		case m != "" && !loop.RelayPriced(m):
+			return fmt.Errorf("loop %s %q has no rate in the relay, which prices only %s: every request would be refused", c.name, m, strings.Join(loop.RelayModels(), " and "))
 		}
 	}
 	return nil

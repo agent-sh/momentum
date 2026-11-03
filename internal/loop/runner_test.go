@@ -388,3 +388,27 @@ func TestARunningHoldIsIndependentOfBudgets(t *testing.T) {
 }
 
 const okResult = `{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":0.75,"session_id":"s1","structured_output":{"mechanism":"lockfile read before lock","fix":"take the lock first","summary":"looked at it"},"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}`
+
+// Two runs that failed differently do not stop a case; two that failed alike do.
+func TestTheStopRuleComparesTheFailures(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := runnerFor(t, st, nil)
+	c := openCase(t, st, "failures", "stop-rule", 2)
+	put := func(id, failure string, started time.Duration) {
+		t.Helper()
+		if err := st.PutLoopRun(ctx, store.LoopRun{ID: id, Case: c.ID, Family: "failures", Step: StepInvestigate, Started: time.Now().Add(started),
+			Ended: time.Now().Add(started + time.Second), Status: store.RunFailed, Failure: failure}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("r1", "turns", -3*time.Minute)
+	put("r2", "timeout", -2*time.Minute)
+	if why, err := r.stopped(ctx, c, true); err != nil || why != "" {
+		t.Fatalf("two different failures stopped the case: %q %v", why, err)
+	}
+	put("r3", "timeout", -time.Minute)
+	if why, err := r.stopped(ctx, c, true); err != nil || !strings.Contains(why, "failed the same way: timeout") {
+		t.Fatalf("two alike did not stop it: %q %v", why, err)
+	}
+}

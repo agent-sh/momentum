@@ -118,6 +118,7 @@ func TestALoopRunChecksItsModelsBeforeItStartsAnything(t *testing.T) {
 		"regional model":    {`, "model": "us.anthropic.claude-opus-5-5"`, `loop model "us.anthropic.claude-opus-5-5" is no Bedrock model`},
 		"alias model":       {`, "model": "sonnet"`, `is no Bedrock model`},
 		"regional fallback": {`, "fallback_model": "us.anthropic.claude-sonnet-5-5"`, `loop fallback_model "us.anthropic.claude-sonnet-5-5" is no Bedrock model`},
+		"unpriced fallback": {`, "fallback_model": "global.anthropic.claude-haiku-4-5"`, `has no rate in the relay`},
 		"a list":            {`, "fallback_model": "global.anthropic.claude-sonnet-5-5,global.anthropic.claude-haiku-4-5"`, `is a list: the loop takes one model`},
 		"a list with space": {`, "fallback_model": "global.anthropic.claude-sonnet-5-5 global.anthropic.claude-haiku-4-5"`, `is a list: the loop takes one model`},
 	} {

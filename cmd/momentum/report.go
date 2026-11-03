@@ -370,8 +370,8 @@ func taskCounts(ts []sessions.Task) string {
 // firstText is the first of texts that has something to show as plain text.
 func firstText(texts ...string) string {
 	for _, s := range texts {
-		if plain.Line(s) != "" {
-			return s
+		if line := plain.Line(s); line != "" {
+			return line
 		}
 	}
 	return ""

@@ -211,7 +211,19 @@ func (a Agent) Run(ctx context.Context, inv Invocation) (Result, error) {
 	start := time.Now()
 	exit, waitErr := spec.Run(runCtx, stream, diag)
 	if exit.Code == -1 && waitErr != nil && runCtx.Err() == nil {
-		return Result{}, waitErr
+		// the sandbox did not run the program to its end: what the relay saw still counts
+		failed := Result{Started: true, Model: a.Model}
+		route.close()
+		failed.Refused = route.refusals()
+		failed.RelayUSD, failed.RelayAdmitted, failed.RelayRefused, failed.RelayCharged = route.accounting()
+		failed.Usage, _ = route.observedUsage()
+		failed.Tokens = failed.Usage.tokens()
+		failed.USD, failed.CostKnown = failed.RelayUSD, route.accountingKnown()
+		failed.Turns, failed.TurnsKnown = failed.RelayAdmitted, true
+		if failed.RelayAdmitted+failed.RelayRefused+failed.RelayCharged == 0 {
+			return Result{}, waitErr // the program never reached the relay: nothing started, nothing to charge
+		}
+		return failed, waitErr
 	}
 	// Failed is a diagnostic only. The authenticated report and host observations decide.
 	if waitErr == nil && exit.Code != 0 {
