@@ -316,14 +316,19 @@ func compareTasks(pairs map[string]map[string]Summary) Comparison {
 			minuteOK = false
 		}
 	}
-	interval := func(xs []float64) *Interval { sort.Float64s(xs); return &Interval{xs[499], xs[9499]} }
 	if dollarOK {
-		c.ReachedPerDollar = interval(dollars)
+		c.ReachedPerDollar = nearestRankInterval(dollars)
 	}
 	if minuteOK {
-		c.ReachedPerMinute = interval(minutes)
+		c.ReachedPerMinute = nearestRankInterval(minutes)
 	}
 	return c
+}
+
+// nearestRankInterval is the nearest-rank 5th and 95th percentiles of 10,000 draws: the 500th and the 9,500th.
+func nearestRankInterval(xs []float64) *Interval {
+	sort.Float64s(xs)
+	return &Interval{xs[499], xs[9499]}
 }
 
 // WriteResults also writes an empty evaluation and returns a failed write to the caller.
