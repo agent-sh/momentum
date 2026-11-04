@@ -65,7 +65,15 @@ func expandAll(ps []string) []string {
 	return out
 }
 
-// selectionRunner reads only the store. It discovers no programs, toolchains or live sources.
+// configGate is the loop's authority as the configuration gives it: owners, exclusions and the scope check's command.
+// It has no busy check. Selection reads only its policy (heldBuild); the scope check and the busy check run when a
+// step prepares a repository write, which a dry pass never reaches.
+func configGate(c config.Loop) loop.Gate {
+	return loop.Gate{Owners: c.Owners, Exclude: c.Exclude, RepoGuard: c.RepoGuard, Home: paths.Home()}
+}
+
+// selectionRunner reads only the store, the configuration and the origin of each loop.read_dirs checkout a held
+// build names. It discovers no programs, toolchains or live sources, and runs no scope or busy check.
 func selectionRunner(st *store.Store, c config.Loop) *loop.Runner {
 	b := loop.DefaultBudgets
 	for _, v := range []struct {
@@ -86,8 +94,8 @@ func selectionRunner(st *store.Store, c config.Loop) *loop.Runner {
 	if len(families) == 0 {
 		families = defaultFamilies
 	}
-	return &loop.Runner{Store: st, Ship: &loop.Ship{Store: st, Dir: loopDir()},
-		Families: families, Budgets: b, Dir: loopDir()}
+	return &loop.Runner{Store: st, Ship: &loop.Ship{Store: st, Dir: loopDir(), Gate: configGate(c)},
+		Families: families, Budgets: b, Dir: loopDir(), Inputs: loop.InputOptions{ReadDirs: expandAll(c.ReadDirs)}}
 }
 
 // setup configures the live investigation runner and its trusted input sources.

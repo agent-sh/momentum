@@ -255,6 +255,78 @@ func TestADryLoopRunsNoToolchainDiscovery(t *testing.T) {
 	}
 }
 
+// A dry pick holds a build by the configured gate, as a live pass does: loop.owners set is no "builds are off", an
+// excluded repository is held as excluded, and one the gate allows is picked. It runs neither the scope check nor
+// any write: the store and the checkout keep every file as it was.
+func TestADryPickHoldsBuildsByTheConfiguredGate(t *testing.T) {
+	for name, c := range map[string]struct{ exclude, want string }{
+		"allowed":  {``, `"step":"build"`},
+		"excluded": {`"fixture-owner/fixture-repo"`, `fixture-owner/fixture-repo is excluded (loop.exclude)`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			isolatedHome(t)
+			t.Setenv("MOMENTUM_HOME", t.TempDir())
+			dir := t.TempDir()
+			checkout := filepath.Join(dir, "fixture-repo")
+			for _, args := range [][]string{{"init", "-q", checkout}, {"-C", checkout, "remote", "add", "origin", "https://github.com/fixture-owner/fixture-repo.git"}} {
+				if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+					t.Fatalf("git %v: %v %s", args, err, out)
+				}
+			}
+			marker := filepath.Join(dir, "guard-ran")
+			guard := filepath.Join(dir, "guard")
+			if err := os.WriteFile(guard, []byte("#!/bin/sh\ntouch '"+marker+"'\necho '{\"allowed\":true,\"disposition\":\"act\"}'\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			conf := fmt.Sprintf(`{"loop":{"families":["failures"],"owners":["fixture-owner"],"exclude":[%s],"repo_guard":[%q],"read_dirs":[%q]}}`,
+				c.exclude, guard, checkout)
+			cfg := t.TempDir()
+			t.Setenv("MOMENTUM_CONFIG", cfg)
+			if err := os.WriteFile(filepath.Join(cfg, "sources.json"), []byte(conf), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			st, err := store.Open(paths.DB())
+			if err != nil {
+				t.Fatal(err)
+			}
+			kase, _, err := st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: "failures/v1:marker-7f3a",
+				Title: "marker-7f3a", Evidence: []store.Evidence{{Ref: "file:/fixture/marker-7f3a", At: time.Now()}}}, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			mechanism, next := "one cause", "one fix"
+			if kase, err = st.UpdateCase(ctx, kase.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &next}, "fixture"); err != nil {
+				t.Fatal(err)
+			}
+			raw, _ := json.Marshal(struct {
+				Repo    string `json:"repo"`
+				Episode int64  `json:"episode"`
+			}{"fixture-repo", kase.Episode})
+			if err := st.CaseNote(ctx, kase.ID, "build repository", string(raw), "fixture"); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.Close(); err != nil {
+				t.Fatal(err)
+			}
+			before, beforeRepo := dryFiles(t, paths.Data()), dryFiles(t, checkout)
+			code, out, errOut := momentum("loop", "--dry", "--json")
+			if code != 0 || strings.Contains(out, "builds are off") || !strings.Contains(out, c.want) {
+				t.Errorf("dry pick: exit %d, want %q: %s %s", code, c.want, out, errOut)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Errorf("a dry pick ran the scope check: %v", err)
+			}
+			if after := dryFiles(t, paths.Data()); !reflect.DeepEqual(before, after) {
+				t.Error("a dry pick changed the store")
+			}
+			if after := dryFiles(t, checkout); !reflect.DeepEqual(beforeRepo, after) {
+				t.Error("a dry pick changed the checkout")
+			}
+		})
+	}
+}
+
 // A dry CLI call creates no store, schema, data directory or lock, and explains that no store exists.
 func TestADryLoopWithNoStoreCreatesNothing(t *testing.T) {
 	for _, directoryExists := range []bool{false, true} {
