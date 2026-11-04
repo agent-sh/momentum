@@ -14,8 +14,9 @@ import (
 // heldBuild says why the configuration holds a case's build, or "" when it does not. It runs no model and writes
 // nothing: builds are off while loop.owners is empty, the repository the investigation named must be a
 // loop.read_dirs checkout whose origin the loop may push to, and it must pass the gate's policy (owner, exclusion,
-// scope check configured). known is false when the checkout cannot be read now: the case takes no slot this pass,
-// and a recorded hold stays as it is. Busy work, scope verdicts and locks change from minute to minute; preparation still checks them,
+// scope check configured). A checkout whose repository cannot be read (missing, not git, no origin) holds with
+// that reason too. known is false only when the pass itself is stopping: the case takes no slot, and nothing is
+// recorded. Busy work, scope verdicts and locks change from minute to minute; preparation still checks them,
 // and everything here again.
 func (r *Runner) heldBuild(ctx context.Context, repo string) (why string, known bool) {
 	g := r.Ship.Gate
@@ -34,7 +35,10 @@ func (r *Runner) heldBuild(ctx context.Context, repo string) (why string, known 
 	if errors.Is(err, ErrRefused) { // an origin the loop may not push to stays so until someone changes it
 		return err.Error(), true
 	} else if err != nil {
-		return "the checkout of " + repo + " cannot be read now: " + err.Error(), false
+		if ctx.Err() != nil {
+			return "the pass is stopping: " + ctx.Err().Error(), false
+		}
+		return "the checkout of " + repo + " cannot be read: " + err.Error() + ": report only", true
 	}
 	if err := g.policy(full); err != nil {
 		return err.Error(), true
@@ -65,13 +69,16 @@ func (r *Runner) readDirSource(name string) string {
 
 const holdReasonMax = 1500
 
+// repoNoteID is the note of a case waiting for a repository (waitingRepo): it goes with the hold.
+func repoNoteID(caseID string) string { return "loop-repo:" + store.IDPart(caseID) }
+
 func holdNotePrefix(caseID string) string { return "loop-build:" + store.IDPart(caseID) + ":held:" }
 
 // markHold records a case's hold when it changes: a hold with its reason and the case's episode, or the hold's
 // end. An unchanged hold writes nothing, so a held case adds no line pass after pass, and its report note stays
-// as its reader left it. A new or changed hold puts its low problem note when note is set (a case waiting for a
-// repository has its own), standing again if it was done; a lifted hold resolves its notes.
-func (r *Runner) markHold(ctx context.Context, c store.Case, why string, note bool) error {
+// as its reader left it. A new or changed hold puts its low problem note (a case waiting for a repository has its
+// own, waitingRepoNote), standing again if it was done; a lifted hold resolves its notes.
+func (r *Runner) markHold(ctx context.Context, c store.Case, why string, waiting bool) error {
 	log, err := r.Store.CaseLog(ctx, c.ID)
 	if err != nil {
 		return err
@@ -98,12 +105,14 @@ func (r *Runner) markHold(ctx context.Context, c store.Case, why string, note bo
 	if err := r.doneHoldNotes(ctx, c.ID); err != nil { // a changed reason's old note goes with it
 		return err
 	}
-	if note {
-		sum := sha256.Sum256([]byte(clean))
-		if _, err := r.Store.PutNote(ctx, store.Note{ID: holdNotePrefix(c.ID) + hex.EncodeToString(sum[:]), Kind: store.NoteProblem,
-			Importance: store.ImportanceLow, At: r.now(), Title: "The loop's build for case " + c.ID + " is held", Detail: clean}); err != nil {
-			return err
-		}
+	sum := sha256.Sum256([]byte(clean))
+	n := store.Note{ID: holdNotePrefix(c.ID) + hex.EncodeToString(sum[:]), Kind: store.NoteProblem,
+		Importance: store.ImportanceLow, At: r.now(), Title: "The loop's build for case " + c.ID + " is held", Detail: clean}
+	if waiting {
+		n = waitingRepoNote(c, r.now())
+	}
+	if _, err := r.Store.PutNote(ctx, n); err != nil {
+		return err
 	}
 	return r.Store.CaseNote(cleanedNote(ctx), c.ID, store.ActionHeld, store.HoldDetail(clean, c.Episode), "loop")
 }
@@ -115,7 +124,7 @@ func (r *Runner) doneHoldNotes(ctx context.Context, caseID string) error {
 		return err
 	}
 	for _, n := range notes {
-		if n.Done.IsZero() && (strings.HasPrefix(n.ID, holdNotePrefix(caseID)) || policyPrepareNote(caseID, n)) {
+		if n.Done.IsZero() && (strings.HasPrefix(n.ID, holdNotePrefix(caseID)) || n.ID == repoNoteID(caseID) || policyPrepareNote(caseID, n)) {
 			if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
 				return err
 			}
@@ -149,7 +158,7 @@ func (r *Runner) releaseHolds(ctx context.Context, cs []store.Case) error {
 	}
 	standing := map[string]bool{}
 	for _, n := range notes {
-		if strings.HasPrefix(n.ID, "loop-build:") && strings.Contains(n.ID, ":held:") && n.Done.IsZero() {
+		if n.Done.IsZero() && (strings.HasPrefix(n.ID, "loop-repo:") || strings.HasPrefix(n.ID, "loop-build:") && strings.Contains(n.ID, ":held:")) {
 			standing[n.ID] = true
 		}
 	}
@@ -171,7 +180,7 @@ func (r *Runner) releaseHolds(ctx context.Context, cs []store.Case) error {
 			}
 		}
 		for id := range standing {
-			if strings.HasPrefix(id, holdNotePrefix(c.ID)) {
+			if strings.HasPrefix(id, holdNotePrefix(c.ID)) || id == repoNoteID(c.ID) {
 				if _, _, err := r.Store.DoneNote(ctx, id, r.now()); err != nil {
 					return err
 				}

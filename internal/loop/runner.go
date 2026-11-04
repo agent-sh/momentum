@@ -444,17 +444,14 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 				return store.Case{}, "", "", err
 			} else if repo == "" {
 				if !dry {
-					if err := r.waitingRepo(ctx, c); err != nil {
-						return store.Case{}, "", "", err
-					}
-					r.keepHold(ctx, c, "waits for a repository: the investigation named none", false)
+					r.keepHold(ctx, c, "waits for a repository: the investigation named none", true)
 				}
 				passed = append(passed, c.ID+" waits for a repository")
 				continue
 			} else if why, known := r.heldBuild(ctx, repo); why != "" {
 				// a hold of the configuration takes no slot: the family's next workable case runs instead
 				if known && !dry {
-					r.keepHold(ctx, c, why, true)
+					r.keepHold(ctx, c, why, false)
 				}
 				passed = append(passed, c.ID+" held: "+why)
 				continue
@@ -511,8 +508,8 @@ func (r *Runner) liftHold(ctx context.Context, c store.Case, dry bool) {
 	}
 }
 
-func (r *Runner) keepHold(ctx context.Context, c store.Case, why string, note bool) {
-	if err := r.markHold(ctx, c, why, note); err != nil {
+func (r *Runner) keepHold(ctx context.Context, c store.Case, why string, waiting bool) {
+	if err := r.markHold(ctx, c, why, waiting); err != nil {
 		r.logf("hold of %s: %v", c.ID, err)
 	}
 }

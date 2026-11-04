@@ -110,21 +110,11 @@ func (r *Runner) caseRepo(ctx context.Context, c store.Case) (string, error) {
 	return "", nil
 }
 
-func (r *Runner) waitingRepo(ctx context.Context, c store.Case) error {
-	id := "loop-repo:" + store.IDPart(c.ID)
-	notes, err := r.Store.Notes(ctx)
-	if err != nil {
-		return err
-	}
-	for _, note := range notes {
-		if note.ID == id {
-			return nil
-		}
-	}
-	_, err = r.Store.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Importance: store.ImportanceLow,
+// waitingRepoNote is the report's note of a case in testing whose investigation named no repository.
+func waitingRepoNote(c store.Case, at time.Time) store.Note {
+	return store.Note{ID: repoNoteID(c.ID), Kind: store.NoteProblem, Importance: store.ImportanceLow,
 		Title:  "The loop's case " + c.ID + " waits for a repository",
-		Detail: "The investigation named no code repository. The case stays in testing without a build run.", At: r.now()})
-	return err
+		Detail: "The investigation named no code repository. The case stays in testing without a build run.", At: at}
 }
 
 func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopRun) (Package, error) {

@@ -233,12 +233,12 @@ func TestAHoldFollowsItsReasonAndItsCase(t *testing.T) {
 	if why := holdNow(); !strings.Contains(why, "loop.owners") || standing(t, st, held.ID) != 1 {
 		t.Fatalf("a changed reason: %q, %d standing", why, standing(t, st, held.ID))
 	}
-	resolveErr = errors.New("the checkout is gone")
+	resolveErr = errors.New("not a git checkout")
 	if picked, _, _, err := r.pick(ctx, "failures", "", false); err != nil || picked.ID == held.ID {
 		t.Fatalf("an unreadable checkout took the slot: %s %v", picked.ID, err)
 	}
-	if why := holdNow(); !strings.Contains(why, "loop.owners") || standing(t, st, held.ID) != 1 {
-		t.Fatalf("an unreadable checkout changed the hold: %q", why)
+	if why := holdNow(); !strings.Contains(why, "cannot be read: not a git checkout") || standing(t, st, held.ID) != 1 {
+		t.Fatalf("an unreadable checkout is no hold: %q, %d standing", why, standing(t, st, held.ID))
 	}
 	resolveErr = refused("origin is not a GitHub repository")
 	if why := holdNow(); !strings.Contains(why, "not a GitHub repository") || standing(t, st, held.ID) != 1 {
@@ -256,5 +256,60 @@ func TestAHoldFollowsItsReasonAndItsCase(t *testing.T) {
 	}
 	if why := holdNow(); !strings.Contains(why, "loop.owners") || standing(t, st, held.ID) != 1 {
 		t.Fatalf("the return to testing: %q, %d standing", why, standing(t, st, held.ID))
+	}
+}
+
+// A case waiting for a repository is held with its own note, which goes when the hold lifts (its investigation
+// names a repository the configuration allows) and when the case leaves testing.
+func TestTheWaitingNoteGoesWithItsHold(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	r.Ship = &Ship{Store: st, Dir: r.Dir}
+	admitBuilds(t, r, "momentum")
+	c := openCase(t, st, "failures", "waiting", 1)
+	mechanism, fix := "one cause", "one fix"
+	c, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting := func() (string, bool) {
+		t.Helper()
+		if _, _, _, err := r.pick(ctx, "failures", "", false); err != nil {
+			t.Fatal(err)
+		}
+		got, _ := st.CaseByID(ctx, c.ID)
+		log, _ := st.CaseLog(ctx, c.ID)
+		notes, _ := st.Notes(ctx)
+		for _, n := range notes {
+			if n.ID == repoNoteID(c.ID) {
+				return store.HoldOf(got, log), n.Done.IsZero()
+			}
+		}
+		return store.HoldOf(got, log), false
+	}
+	if why, stands := waiting(); !strings.Contains(why, "waits for a repository") || !stands {
+		t.Fatalf("waiting: %q, note standing %v", why, stands)
+	}
+	setCaseRepo(t, st, c, "momentum")
+	if why, stands := waiting(); why != "" || stands {
+		t.Fatalf("a repository named: %q, note standing %v", why, stands)
+	}
+	// waiting again, then out of testing: the note goes with the case
+	if _, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	setCaseRepo(t, st, c, "")
+	if why, stands := waiting(); !strings.Contains(why, "waits for a repository") || !stands {
+		t.Fatalf("waiting again: %q, note standing %v", why, stands)
+	}
+	if _, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if _, stands := waiting(); stands {
+		t.Fatal("the waiting note stands after the case left testing")
 	}
 }
