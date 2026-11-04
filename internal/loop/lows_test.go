@@ -422,3 +422,28 @@ func TestOpenFileRefusesALinkSwappedInAfterItsChecks(t *testing.T) {
 		t.Fatal("a link swapped in after the checks was followed")
 	}
 }
+
+// Written and withheld index lines take an event id by one rule, the one selection admits, so an index the records
+// pass wrote is always one an append can read back.
+func TestAWithheldLineOfAnyAdmittedIDSurvivesAnAppend(t *testing.T) {
+	goodInputScrubber(t)
+	at := time.Date(2025, 4, 10, 12, 0, 0, 0, time.UTC)
+	o := recordFixture(t, []store.Event{{Source: "fixture", SourceKey: "held", TS: at, Kind: "record"}}, `printf '(record withheld: fixture)\n'`)
+	db, err := sql.Open("sqlite", o.Store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE events SET id = 'Fixture_ID-1'"); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	o.Neighbours, o.IDs = -1, []string{"ev:Fixture_ID-1"}
+	m, err := Records(context.Background(), o)
+	if err != nil || m.Withheld != 1 || len(m.Held) != 1 {
+		t.Fatalf("records: %+v %v", m, err)
+	}
+	o.Units = []string{"fixture.service"}
+	if _, err := UnitLogs(context.Background(), o); err != nil {
+		t.Fatalf("the append could not read the index it wrote: %v", err)
+	}
+}

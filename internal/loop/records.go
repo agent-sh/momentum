@@ -66,7 +66,9 @@ type RecordsManifest struct {
 	Held []RecordFile `json:"held,omitempty"`
 }
 
-var recordEventRE = regexp.MustCompile(`^[0-9a-f]{24}$`)
+// recordEventRE is the one rule for an event id in the records: selection admits it, and both kinds of index line
+// are read back by it.
+var recordEventRE = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 var unitNameRE = regexp.MustCompile(`^[A-Za-z0-9@._-]+\.(service|timer)$`)
 var unitFinderRE = regexp.MustCompile(`[A-Za-z0-9@._-]+\.(?:service|timer)`)
 
@@ -230,7 +232,7 @@ func recordSelection(ctx context.Context, db *sql.DB, o RecordsOptions) ([]Recor
 			continue
 		}
 		seen[id] = true
-		if !regexp.MustCompile(`^[A-Za-z0-9_-]+$`).MatchString(id) {
+		if !recordEventRE.MatchString(id) {
 			return nil, 0, fmt.Errorf("invalid evidence id")
 		}
 		var ts int64
@@ -279,7 +281,7 @@ func recordSelection(ctx context.Context, db *sql.DB, o RecordsOptions) ([]Recor
 					rows.Close()
 					return nil, 0, err
 				}
-				if !seen[id] {
+				if !seen[id] && recordEventRE.MatchString(id) {
 					seen[id] = true
 					files = append(files, RecordFile{Name: "ev-" + id + ".txt", Event: id, At: time.UnixMilli(ts).UTC()})
 				}
@@ -645,7 +647,7 @@ func readRecordIndex(dir string) (RecordsManifest, error) {
 		} else {
 			file.Event = fields[1]
 			file.At, err = time.Parse(time.RFC3339Nano, fields[2])
-			if err != nil || file.Name != "ev-"+file.Event+".txt" {
+			if err != nil || !recordEventRE.MatchString(file.Event) || file.Name != "ev-"+file.Event+".txt" {
 				return m, fmt.Errorf("invalid event index entry")
 			}
 		}
