@@ -73,7 +73,9 @@ done
 echo '{"allowed": true, "disposition": "allowed_scope_only", "reasons": []}'`)
 	f.gh = script(t, dir, "gh", `if [ "$2" = "create" ] && [ -e "`+filepath.Join(dir, "gh-fails")+`" ]; then rm "`+filepath.Join(dir, "gh-fails")+`"; echo "gh: network down" >&2; exit 1; fi
 echo "$@" >> "`+filepath.Join(dir, "gh-calls")+`"
-if [ "$1 $2" = "repo view" ]; then echo '{"isPrivate":true}'; fi
+if [ "$1 $2" = "repo view" ] && [ -e "`+filepath.Join(dir, "view-fails")+`" ]; then echo "gh: network down" >&2; exit 1; fi
+if [ "$1 $2" = "repo view" ] && [ -e "`+filepath.Join(dir, "public")+`" ]; then echo '{"isPrivate":false,"visibility":"PUBLIC"}'
+elif [ "$1 $2" = "repo view" ]; then echo '{"isPrivate":true,"visibility":"PRIVATE"}'; fi
 if [ "$1 $2" = "pr view" ]; then echo '{"state":"OPEN"}'; fi
 if [ "$2" = "list" ]; then echo '[]'; fi
 if [ "$2" = "create" ]; then echo "https://github.com/agent-sh/fake/pull/7"; fi`)

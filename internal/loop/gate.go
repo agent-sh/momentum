@@ -86,6 +86,14 @@ func originRepository(ctx context.Context, dir string) (string, error) {
 	return repo, nil
 }
 
+// repo names the checkout's repository (OWNER/REPO) with the gate's resolver.
+func (g Gate) repo(ctx context.Context, dir string) (string, error) {
+	if g.Resolve != nil {
+		return g.Resolve(ctx, dir)
+	}
+	return RepoOf(ctx, dir)
+}
+
 // RepoOf is a checkout's repository on GitHub, shared by its fetch and all push destinations.
 func RepoOf(ctx context.Context, dir string) (string, error) {
 	repo, err := originRepository(ctx, dir)
@@ -138,14 +146,10 @@ func (g Gate) Repository(ctx context.Context, dir string) (target Target, err er
 		return Target{}, refused("%s is not a git checkout", dir)
 	}
 	main := filepath.Dir(strings.TrimSpace(top)) // the main checkout of a linked worktree too
-	resolve := g.Resolve
-	if resolve == nil {
-		resolve = RepoOf
-	}
 	if _, err := originRepository(ctx, dir); err != nil {
 		return Target{}, err
 	}
-	repo, err := resolve(ctx, dir)
+	repo, err := g.repo(ctx, dir)
 	if err != nil {
 		return Target{}, err
 	}

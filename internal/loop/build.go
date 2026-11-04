@@ -162,20 +162,28 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 	if p.RefreshBase {
 		p, err = r.Ship.refreshBaseLocked(r.Ship.gitContext(shipContext(ctx, p.Case)), p)
 	} else if _, err = r.Ship.Gate.Repository(ctx, p.Dir); err == nil {
-		err = r.Ship.freshRunClone(shipContext(ctx, p.Case), p)
+		err = r.Ship.freshRunClone(shipContext(ctx, p.Case), &p)
 	}
 	if err != nil {
 		return p, err
 	}
-	// A run reads a repository as a masked snapshot, but a build gets this independent clone with its history, which no
-	// scrubber has seen, and it may hold commits the source does not (a fetch of the remote brought them). Only a clone
-	// whose objects the scrubber would not change is mounted.
-	if err = checkCloneObjects(ctx, p.Work); err != nil {
-		removeInputTree(p.Work) // unscanned, it stays out of storage a later step might read
-		if errors.Is(err, errNeedsScrubbing) {
-			return p, refused("the repository %s holds history the scrubber would mask, so a build clone of it cannot be mounted", name)
-		}
+	// The build tree holds the base commit's tree and one commit, no history. A public repository's base commit is
+	// the default branch its remote serves to anyone, so the scrubber has nothing to keep from the run there, and
+	// masking would break the build. Any other tree (its objects, refs and configuration) is scanned before it is
+	// mounted: one the scrubber would change is never mounted.
+	public, err := r.Ship.publicBase(r.Ship.gitContext(shipContext(ctx, p.Case)), p)
+	if err != nil {
+		removeInputTree(p.Work)
 		return p, err
+	}
+	if !public {
+		if err = checkCloneObjects(ctx, p.Work); err != nil {
+			removeInputTree(p.Work) // unscanned, it stays out of storage a later step might read
+			if errors.Is(err, errNeedsScrubbing) {
+				return p, refused("the repository %s is not public and its base holds text the scrubber would mask, so its build tree cannot be mounted", name)
+			}
+			return p, err
+		}
 	}
 	if err = os.MkdirAll(run.Dir, 0700); err != nil {
 		return p, err
@@ -285,7 +293,9 @@ func firstError(err error, message string) error {
 
 // patchSpec is a fixed data-export job. It has no harness, relay or host input.
 func patchSpec(run store.LoopRun, p Package, host string) (sandbox.Spec, error) {
-	if !regexp.MustCompile(`^(?:[a-f0-9]{40}|[a-f0-9]{64})$`).MatchString(p.BaseCommit) {
+	// The run clone is a build tree: its one commit, WorkBase, holds BaseCommit's tree, so a diff against it applies
+	// to BaseCommit on the host.
+	if !regexp.MustCompile(`^(?:[a-f0-9]{40}|[a-f0-9]{64})$`).MatchString(p.WorkBase) {
 		return sandbox.Spec{}, errors.New("patch base is not a commit id")
 	}
 	env := map[string]string{"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
@@ -293,7 +303,7 @@ func patchSpec(run store.LoopRun, p Package, host string) (sandbox.Spec, error) 
 	pins := strings.Join(GitSafety(), " ")
 	script := "git -C /work " + pins + " add -A && git -C /work " + pins +
 		" diff --cached --binary --no-ext-diff --no-textconv --no-renames --src-prefix=a/ --dst-prefix=b/ " +
-		p.BaseCommit + " -- > /out/change.patch"
+		p.WorkBase + " -- > /out/change.patch"
 	return sandbox.Spec{Unit: "momentum-run-loop-patch-" + strings.TrimPrefix(runUnit(run.ID, run.Dir, ""), "momentum-run-loop-"),
 		Host: host, Binds: []sandbox.Bind{{Src: p.Work, Dst: "/work", Write: true},
 			{Src: filepath.Join(run.Dir, "out"), Dst: "/out", Write: true}},

@@ -73,7 +73,7 @@ func TestTestingWithoutRepositoryWaitsPassively(t *testing.T) {
 
 func TestPatchSpecHasNoRelayOrHarnessAndPinsHooks(t *testing.T) {
 	run := store.LoopRun{ID: "fixture", Dir: t.TempDir()}
-	p := Package{Work: filepath.Join(run.Dir, "work"), BaseCommit: strings.Repeat("a", 40)}
+	p := Package{Work: filepath.Join(run.Dir, "work"), WorkBase: strings.Repeat("a", 40)}
 	spec, err := patchSpec(run, p, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -352,14 +352,12 @@ func TestPatchUnitDoesNotRunPlantedHooks(t *testing.T) {
 	}
 }
 
-// A run reads a masked snapshot of a repository, but a build clones the repository with its history (and what a fetch
-// of the remote brought), which nothing scrubbed: a clone whose history holds text the scrubber changes is never mounted.
-func TestBuildRefusesARepositoryWhoseHistoryNeedsMasking(t *testing.T) {
+// buildPrepared prepares a build of f's main repository in a fresh runner, as a live pass does after an
+// investigation that named it, and returns the step's error, the package and its case.
+func buildPrepared(t *testing.T, f repoFixture) (*Runner, Package, string, error) {
+	t.Helper()
 	ctx := context.Background()
 	r, c := inputRunner(t)
-	f := newRepo(t, nil)
-	// the text is only on the remote: the build's clone fetches it, the source checkout never held it
-	pushOther(t, f, "main", map[string]string{"notes.txt": "marker-7f3a\n"})
 	r.Ship = shipWithSandbox(r.Store, f, Sandbox{})
 	r.Ship.Dir = r.Dir
 	r.Inputs.ReadDirs = []string{f.main}
@@ -377,17 +375,190 @@ func TestBuildRefusesARepositoryWhoseHistoryNeedsMasking(t *testing.T) {
 	if repo := r.pass.manifest.Repositories[0]; repo.Error != "" || repo.Files == 0 {
 		t.Fatalf("the investigation's snapshot was refused: %+v", repo)
 	}
-	if _, err := r.prepareRun(ctx, c, c.Family, StepInvestigate); err != nil {
-		t.Fatalf("an investigation of the repository: %v", err)
-	}
 	_, err = r.prepareRun(ctx, c, c.Family, StepBuild)
-	if err == nil || !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "would mask") {
-		t.Fatalf("a build was prepared on a repository with unscrubbed history: %v", err)
+	p, _, lerr := r.Ship.Load(c.ID)
+	if lerr != nil {
+		t.Fatal(lerr)
 	}
-	// nothing of the refused clone stays where a run could be given it
-	p, _, _ := r.Ship.Load(c.ID)
-	if _, err := os.Stat(p.Work); !os.IsNotExist(err) {
-		t.Fatalf("the refused clone was kept: %v", err)
+	return r, p, c.ID, err
+}
+
+// objectsHold says whether any object of the repository at dir holds text.
+func objectsHold(t *testing.T, dir, text string) bool {
+	t.Helper()
+	return strings.Contains(run(t, dir, "git", "cat-file", "--batch-all-objects", "--batch"), text)
+}
+
+// A build gets a build tree: one commit of the base's tree, without its history. Text the scrubber masks that only
+// the history holds (here on the remote only, so the source checkout never held it) never reaches the tree, and the
+// build of a repository that is not public goes on. The run's patch is cut against that one commit and applies to
+// the base on the host.
+func TestBuildTreeLeavesOutHistoryTheScrubberWouldMask(t *testing.T) {
+	f := newRepo(t, nil)
+	pushOther(t, f, "main", map[string]string{"notes.txt": "marker-7f3a\n"})
+	pushOther(t, f, "main", map[string]string{"notes.txt": "clean\n"})
+	r, p, _, err := buildPrepared(t, f)
+	if err != nil {
+		t.Fatalf("a build was refused for its history: %v", err)
+	}
+	if objectsHold(t, p.Work, "marker-7f3a") {
+		t.Fatal("the build tree holds the history's masked text")
+	}
+	if n := strings.TrimSpace(run(t, p.Work, "git", "rev-list", "--all", "--count")); n != "1" {
+		t.Fatalf("the build tree holds %s commits", n)
+	}
+	if head := strings.TrimSpace(run(t, p.Work, "git", "rev-parse", "HEAD")); head != p.WorkBase || head == p.BaseCommit {
+		t.Fatalf("the build tree's commit %s is not its own base %s", head, p.WorkBase)
+	}
+	if tree := strings.TrimSpace(run(t, p.Work, "git", "rev-parse", "HEAD^{tree}")); tree != strings.TrimSpace(run(t, p.Host, "git", "rev-parse", p.BaseCommit+"^{tree}")) {
+		t.Fatal("the build tree does not hold the base's tree")
+	}
+	if refs := run(t, p.Work, "git", "for-each-ref"); refs != "" {
+		t.Fatalf("the build tree has refs: %q", refs)
+	}
+	// a change cut against the build tree's commit applies to the base on the host
+	write(t, filepath.Join(p.Work, "fake.go"), strings.Replace(fakeGo, "41", "42", 1))
+	run(t, p.Work, "git", "add", "-A")
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "change.patch"), run(t, p.Work, "git", "diff", "--cached", "--binary", p.WorkBase, "--"))
+	tree, paths, err := r.Ship.applyPatch(r.Ship.gitContext(context.Background()), p, []Patch{{Dir: dir, File: "change.patch"}})
+	if err != nil || len(paths) != 1 || paths[0] != "fake.go" || tree == "" {
+		t.Fatalf("the build tree's patch did not apply to the base: %v %q", err, paths)
+	}
+}
+
+// A public repository's base commit is what its remote serves to anyone: its build tree holds it as it is, every
+// path, link, executable bit and byte, even text the scrubber would mask, which a build could not test masked.
+func TestBuildTreeOfAPublicRepositoryIsItsBase(t *testing.T) {
+	f := newRepo(t, map[string]string{"notes.txt": "head\nmarker-7f3a\n", "odd \"name\"\t.txt": "x\n", "bin/blob": "\x00\x01marker-7f3a",
+		"large.txt": strings.Repeat("0123456789abcdef", 1<<14)})
+	if err := os.Symlink("notes.txt", filepath.Join(f.main, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(f.main, "fake.go"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(t, f.main, "git", "add", "-A")
+	run(t, f.main, "git", "update-index", "--add", "--cacheinfo", "160000,"+strings.Repeat("ab", 20)+",sub")
+	run(t, f.main, "git", "commit", "-q", "-m", "more")
+	if err := os.Mkdir(filepath.Join(f.main, "sub"), 0o700); err != nil { // an unpopulated submodule
+		t.Fatal(err)
+	}
+	run(t, f.main, "git", "push", "-q", "origin", "HEAD:main")
+	write(t, filepath.Join(f.dir, "public"), "")
+	_, p, _, err := buildPrepared(t, f)
+	if err != nil {
+		t.Fatalf("a public repository's build was refused: %v", err)
+	}
+	if tree := strings.TrimSpace(run(t, p.Work, "git", "rev-parse", "HEAD^{tree}")); tree != strings.TrimSpace(run(t, p.Host, "git", "rev-parse", p.BaseCommit+"^{tree}")) {
+		t.Fatal("the build tree does not hold the base's tree")
+	}
+	if entry := run(t, p.Work, "git", "ls-tree", "HEAD", "sub"); !strings.HasPrefix(entry, "160000 commit ") {
+		t.Fatalf("the build tree lost its gitlink: %q", entry)
+	}
+	if b, err := os.ReadFile(filepath.Join(p.Work, "notes.txt")); err != nil || string(b) != "head\nmarker-7f3a\n" {
+		t.Fatalf("the public base's file was changed: %q %v", b, err)
+	}
+	if n := strings.TrimSpace(run(t, p.Work, "git", "rev-list", "--all", "--count")); n != "1" || run(t, p.Work, "git", "status", "--porcelain") != "" {
+		t.Fatalf("the build tree holds %s commits or a changed work tree", n)
+	}
+	if remotes := run(t, p.Work, "git", "remote"); remotes != "" {
+		t.Fatalf("the build tree has remotes: %q", remotes)
+	}
+	for _, name := range []string{"hooks", "logs"} {
+		if _, err := os.Stat(filepath.Join(p.Work, ".git", name)); !os.IsNotExist(err) {
+			t.Fatalf("the build tree has .git/%s: %v", name, err)
+		}
+	}
+}
+
+// Visibility that cannot be read now holds the build for the pass: no refusal on record for a cause it lacks, and
+// no tree is kept.
+func TestBuildHoldsWhenVisibilityCannotBeRead(t *testing.T) {
+	f := newRepo(t, map[string]string{"notes.txt": "marker-7f3a\n"})
+	write(t, filepath.Join(f.dir, "view-fails"), "")
+	r, p, id, err := buildPrepared(t, f)
+	if err == nil || !held(err) || !strings.Contains(err.Error(), "visibility") {
+		t.Fatalf("an unreadable visibility did not hold the build: %v", err)
+	}
+	for _, dir := range []string{p.Work, r.Ship.workDir(id)} {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("the held tree was kept at %s: %v", dir, err)
+		}
+	}
+}
+
+// A public repository whose default branch no longer holds the base (a force-push purged it) is scanned like a
+// private one.
+func TestBuildScansAPublicBaseTheBranchNoLongerHolds(t *testing.T) {
+	f := newRepo(t, map[string]string{"notes.txt": "marker-7f3a\n"})
+	write(t, filepath.Join(f.dir, "public"), "")
+	r, c := inputRunner(t)
+	r.Ship = shipWithSandbox(r.Store, f, Sandbox{})
+	r.Ship.Dir = r.Dir
+	ctx := r.Ship.gitContext(shipContext(context.Background(), c.ID))
+	mechanism, fix := "one cause", "one fix"
+	c, err := r.Store.UpdateCase(context.Background(), c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := r.Ship.Prepare(context.Background(), c.ID, f.main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if public, err := r.Ship.publicBase(ctx, p); !public || err != nil {
+		t.Fatalf("the public base was not public: %v %v", public, err)
+	}
+	other := t.TempDir()
+	run(t, f.dir, "git", "clone", "-q", f.origin, other)
+	run(t, other, "git", "checkout", "-q", "--orphan", "purged")
+	write(t, filepath.Join(other, "notes.txt"), "clean\n")
+	run(t, other, "git", "add", "-A")
+	run(t, other, "git", "commit", "-q", "-m", "purged")
+	run(t, other, "git", "push", "-q", "--force", "origin", "HEAD:main")
+	if public, err := r.Ship.publicBase(ctx, p); public || err != nil {
+		t.Fatalf("a purged base counted as public: %v %v", public, err)
+	}
+	// so its build scans the tree and refuses it
+	r.Inputs.ReadDirs = []string{f.main}
+	setCaseRepo(t, r.Store, c, "main")
+	r.pass = &passInputs{}
+	t.Cleanup(r.pass.close)
+	if err := r.prepareInputs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.prepareRun(context.Background(), c, c.Family, StepBuild)
+	if err == nil || !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "is not public and its base holds text the scrubber would mask") {
+		t.Fatalf("a purged public base was mounted unscanned: %v", err)
+	}
+	if _, err := os.Stat(r.Ship.workDir(c.ID)); !os.IsNotExist(err) {
+		t.Fatalf("the refused tree was kept: %v", err)
+	}
+}
+
+// A base the scrubber would change, in a repository that is not public, is never mounted: the build is refused and
+// nothing of the tree is kept, while the repository is still investigated from its masked snapshot.
+func TestBuildRefusesAPrivateBaseTheScrubberWouldMask(t *testing.T) {
+	for name, files := range map[string]map[string]string{
+		"text":   {"notes.txt": "marker-7f3a\n"},
+		"path":   {"marker-7f3a.txt": "clean\n"},
+		"binary": {"blob.bin": "\x00marker-7f3a\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRepo(t, files)
+			r, p, id, err := buildPrepared(t, f)
+			if err == nil || !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "is not public and its base holds text the scrubber would mask") {
+				t.Fatalf("a build was prepared on a private base that needs masking: %v", err)
+			}
+			if p.Work == "" {
+				t.Fatal("the package names no build tree")
+			}
+			for _, dir := range []string{p.Work, r.Ship.workDir(id), filepath.Join(r.Ship.Dir, "host", "."+id+"-build")} {
+				if _, err := os.Stat(dir); !os.IsNotExist(err) {
+					t.Fatalf("the refused tree was kept at %s: %v", dir, err)
+				}
+			}
+		})
 	}
 }
 

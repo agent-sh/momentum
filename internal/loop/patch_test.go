@@ -24,7 +24,7 @@ func fixturePatch(t *testing.T, s *Ship, id string) Patch {
 		return Patch{}
 	}
 	run(t, p.Work, "git", "add", "-A")
-	data := run(t, p.Work, "git", "diff", "--cached", "--binary", p.BaseCommit)
+	data := run(t, p.Work, "git", "diff", "--cached", "--binary", p.WorkBase)
 	dir := filepath.Join(s.Dir, "runs", "fixture-"+id)
 	write(t, filepath.Join(dir, "change.patch"), data)
 	return Patch{Dir: dir}
@@ -534,7 +534,7 @@ func TestConflictingLandingPreparesANewBaseWithoutReadingTheRunClone(t *testing.
 	if err != nil || p.BaseCommit != newBase || p.State != Prepared || p.Check != nil {
 		t.Fatalf("fresh preparation: %+v %v", p, err)
 	}
-	if got := strings.TrimSpace(run(t, p.Work, "git", "rev-parse", "HEAD")); got != newBase {
+	if got := strings.TrimSpace(run(t, p.Work, "git", "rev-parse", "HEAD^{tree}")); got != strings.TrimSpace(run(t, p.Host, "git", "rev-parse", newBase+"^{tree}")) || p.WorkBase == "" {
 		t.Fatal("replacement run clone starts on the old base")
 	}
 	if got := run(t, p.Work, "git", "remote"); got != "" {

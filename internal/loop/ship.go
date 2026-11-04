@@ -78,10 +78,11 @@ type Package struct {
 	Repo            string           `json:"repo,omitempty"`
 	Base            string           `json:"base,omitempty"`
 	Branch          string           `json:"branch,omitempty"`
-	Dir             string           `json:"dir"`         // the repository's main checkout
-	Work            string           `json:"work"`        // independent run clone, never read by host steps
-	Host            string           `json:"host"`        // host-only independent clone
-	BaseCommit      string           `json:"base_commit"` // immutable patch base
+	Dir             string           `json:"dir"`                 // the repository's main checkout
+	Work            string           `json:"work"`                // the run's build tree, never read by host steps
+	Host            string           `json:"host"`                // host-only independent clone
+	BaseCommit      string           `json:"base_commit"`         // immutable patch base
+	WorkBase        string           `json:"work_base,omitempty"` // the run clone's one commit, of BaseCommit's tree
 	PublishedHead   string           `json:"published_head,omitempty"`
 	RefreshBase     bool             `json:"refresh_base,omitempty"`
 	State           string           `json:"state"`
@@ -387,7 +388,7 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	if err != nil {
 		return Package{}, err
 	}
-	if err := s.freshRunClone(ctx, p); err != nil {
+	if err := s.freshRunClone(ctx, &p); err != nil {
 		return Package{}, err
 	}
 	note, err := Redact(ctx, fmt.Sprintf("%s at %s", p.Repo, p.BaseCommit))
@@ -400,34 +401,44 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	return p, s.Store.CaseNote(cleanedNote(ctx), c.ID, "prepared", note, s.Actor)
 }
 
-// freshRunClone is used only before a run starts. No later host operation inspects this clone.
-func (s *Ship) freshRunClone(ctx context.Context, p Package) error {
+// freshRunClone is used only before a run starts. No later host operation inspects this clone. It is a build tree
+// (writeBuildTree): one commit of the base commit's tree, never the host clone's history. It sets the package's
+// WorkBase. The build scans the tree before it mounts it (buildPackage).
+func (s *Ship) freshRunClone(ctx context.Context, p *Package) error {
 	if err := s.assignedAuthority(ctx); err != nil {
 		return err
 	}
 	if err := removeAll(p.Work); err != nil {
 		return err
 	}
-	// Build a fresh clone in host-only storage, before exposing it to a run.
+	// Build the tree in host-only storage, before exposing it to a run.
 	staging := filepath.Join(s.Dir, "host", "."+p.Case+"-build")
 	if err := removeAll(staging); err != nil {
 		return err
 	}
 	defer func() { _ = removeAll(staging) }()
-	if err := s.cloneConfined(ctx, p.Host, staging); err != nil {
+	if err := CheckHostStorage(s.gitContext(ctx), p.Host); err != nil {
 		return err
 	}
-	if _, err := hostGit(ctx, staging, nil, "remote", "remove", "origin"); err != nil {
+	if err := CheckGitConfig(ctx, p.Host); err != nil {
 		return err
 	}
-	if _, err := hostGit(ctx, staging, nil, "checkout", "--quiet", "--detach", p.BaseCommit); err != nil {
+	if err := os.Mkdir(staging, 0700); err != nil {
+		return err
+	}
+	base, err := writeBuildTree(ctx, p.Host, p.BaseCommit, staging)
+	if err != nil {
 		return err
 	}
 	// the reflog records this host's paths and generated identity; a run has no use for it
 	if err := removeAll(filepath.Join(staging, ".git", "logs")); err != nil {
 		return err
 	}
-	return os.Rename(staging, p.Work)
+	if err := os.Rename(staging, p.Work); err != nil {
+		return err
+	}
+	p.WorkBase = base
+	return nil
 }
 
 // refreshBase runs before a replacement build is mounted. The old patch is kept in host package data.
@@ -459,7 +470,7 @@ func (s *Ship) refreshBaseLocked(ctx context.Context, p Package) (Package, error
 	if _, err := s.git(ctx, p.Host, "reset", "--hard", p.BaseCommit); err != nil {
 		return p, err
 	}
-	if err := s.freshRunClone(ctx, p); err != nil {
+	if err := s.freshRunClone(ctx, &p); err != nil {
 		return p, err
 	}
 	p.Check, p.Head, p.RefreshBase, p.State = nil, "", false, Prepared
@@ -1556,6 +1567,32 @@ func (s *Ship) packageText(c store.Case, p Package) string {
 	fmt.Fprintf(&b, "- Rollback: %s\n", p.Rollback)
 	b.WriteString("\nOpened by momentum's improvement loop. It lands by fast-forward only after a clean-context review finds nothing high or medium.\n")
 	return b.String()
+}
+
+// publicBase says whether the package's base commit is on the default branch of a repository GitHub reports public,
+// which anyone can clone. The host clone must name the package's repository, and the base must still be on the
+// branch the remote serves (a force-push that purged it leaves it to the scan). Any other answer is false; a
+// visibility or fetch that cannot be read now is a hold, so a passing outage refuses no build for a cause it lacks.
+func (s *Ship) publicBase(ctx context.Context, p Package) (bool, error) {
+	repo, err := s.Gate.repo(ctx, p.Host)
+	if err != nil || !strings.EqualFold(repo, p.Repo) {
+		return false, nil
+	}
+	raw, err := s.gh(ctx, p.Host, "repo", "view", "github.com/"+p.Repo, "--json", "visibility")
+	var visibility struct {
+		Visibility string `json:"visibility"`
+	}
+	if err != nil || json.Unmarshal([]byte(raw), &visibility) != nil || visibility.Visibility == "" {
+		return false, &shipHold{err: refused("the visibility of %s cannot be read now", p.Repo)}
+	}
+	if visibility.Visibility != "PUBLIC" {
+		return false, nil
+	}
+	if _, err := s.git(ctx, p.Host, "fetch", "--quiet", "origin", p.Base); err != nil {
+		return false, &shipHold{err: refused("the default branch of %s cannot be fetched now", p.Repo)}
+	}
+	_, err = s.git(ctx, p.Host, "merge-base", "--is-ancestor", p.BaseCommit, "FETCH_HEAD")
+	return err == nil, nil
 }
 
 func (s *Ship) repositoryPrivate(ctx context.Context, p Package) (bool, error) {

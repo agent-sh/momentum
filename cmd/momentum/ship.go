@@ -37,7 +37,7 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	repo := fs.String("repo", "", "prepare: a checkout of the repository the change goes to")
 	test := fs.String("test", "", "check: the test command, one program and its arguments, run without a shell")
 	testFiles := fs.String("test-files", "", "check: comma-separated files of the change that hold the test (default: by their names)")
-	patchFile := fs.String("patch", "change.patch", "check, propose: cumulative patch against the package base")
+	patchFile := fs.String("patch", "change.patch", "check, propose: cumulative patch against the package base (in a build tree, its one commit, as prepare prints it)")
 	title := fs.String("title", "", "propose: the change's title")
 	bodyFile := fs.String("body-file", "", "propose: a file with the change description")
 	rollback := fs.String("rollback", "", "propose: how the change is undone")
@@ -133,7 +133,7 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	fmt.Fprintf(stdout, "%s: %s %s, %s\n", p.Case, p.Kind, p.State, firstText(p.PR, p.Work))
 	if args[0] == "prepare" {
-		fmt.Fprintf(stdout, "  base: %s; run clone: %s; ready for the next build run\n", p.BaseCommit, p.Work)
+		fmt.Fprintf(stdout, "  base: %s; build tree: %s (one commit, %s); ready for the next build run\n", p.BaseCommit, p.Work, p.WorkBase)
 	}
 	if p.Check != nil {
 		fmt.Fprintf(stdout, "  check: %s: exit %d without the change, %d with it\n", strings.Join(p.Check.Test, " "), p.Check.Before.Exit, p.Check.After.Exit)
