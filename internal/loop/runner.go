@@ -401,6 +401,7 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 				r.pickSkipped(c, "package", err)
 				continue
 			} else if ok && p.State == Landed {
+				r.liftHold(ctx, c, dry)
 				if !dry {
 					if p.Cleanup != "" {
 						if _, err := r.Ship.retryCleanup(ctx, c.ID); err != nil {
@@ -420,7 +421,6 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 					}
 				}
 				passed = append(passed, c.ID+" has landed; deployment precedes more work")
-				r.liftHold(ctx, c, dry)
 				continue
 			} else if ok && proposalsUsed(p) {
 				passed = append(passed, c.ID+" used its proposals")
@@ -453,12 +453,12 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 				continue
 			} else if why, known := r.heldBuild(ctx, repo); why != "" {
 				// a hold of the configuration takes no slot: the family's next workable case runs instead
-				if !dry {
+				if known && !dry {
 					r.keepHold(ctx, c, why, true)
 				}
 				passed = append(passed, c.ID+" held: "+why)
 				continue
-			} else if known && !dry {
+			} else if !dry {
 				r.keepHold(ctx, c, "", false)
 			}
 		case store.CaseClosed:

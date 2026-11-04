@@ -2,6 +2,7 @@ package loop
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -232,9 +233,16 @@ func TestAHoldFollowsItsReasonAndItsCase(t *testing.T) {
 	if why := holdNow(); !strings.Contains(why, "loop.owners") || standing(t, st, held.ID) != 1 {
 		t.Fatalf("a changed reason: %q, %d standing", why, standing(t, st, held.ID))
 	}
-	resolveErr = refused("cannot read origin")
+	resolveErr = errors.New("the checkout is gone")
+	if picked, _, _, err := r.pick(ctx, "failures", "", false); err != nil || picked.ID == held.ID {
+		t.Fatalf("an unreadable checkout took the slot: %s %v", picked.ID, err)
+	}
 	if why := holdNow(); !strings.Contains(why, "loop.owners") || standing(t, st, held.ID) != 1 {
 		t.Fatalf("an unreadable checkout changed the hold: %q", why)
+	}
+	resolveErr = refused("origin is not a GitHub repository")
+	if why := holdNow(); !strings.Contains(why, "not a GitHub repository") || standing(t, st, held.ID) != 1 {
+		t.Fatalf("a refused origin: %q", why)
 	}
 	resolveErr = nil
 	if _, err := st.UpdateCase(ctx, held.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "fixture"); err != nil {
