@@ -69,7 +69,7 @@ func (r *Runner) readDirSource(name string) string {
 
 const holdReasonMax = 1500
 
-// repoNoteID is the note of a case waiting for a repository (waitingRepo): it goes with the hold.
+// repoNoteID is the note of a case waiting for a repository (waitingRepoNote): it goes with the hold.
 func repoNoteID(caseID string) string { return "loop-repo:" + store.IDPart(caseID) }
 
 func holdNotePrefix(caseID string) string { return "loop-build:" + store.IDPart(caseID) + ":held:" }

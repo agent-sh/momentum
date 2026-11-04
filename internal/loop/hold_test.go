@@ -206,7 +206,7 @@ func admitBuilds(t *testing.T, r *Runner, name string) {
 	r.Inputs.ReadDirs = append(r.Inputs.ReadDirs, filepath.Join(t.TempDir(), name))
 }
 
-// A changed reason replaces the hold and its note; a checkout that cannot be read leaves the hold as it is; a case
+// A changed reason replaces the hold and its note; a checkout that cannot be read holds with its reason; a case
 // that leaves testing ends its hold, and its return records the hold again with a standing note.
 func TestAHoldFollowsItsReasonAndItsCase(t *testing.T) {
 	ctx := context.Background()
