@@ -135,11 +135,7 @@ func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) 
 		if err := ctx.Err(); err != nil {
 			return results, err // a pass told to stop leaves no refusals behind it
 		}
-		name := filepath.Base(source)
-		if counts[name] > 1 {
-			hash := sha256.Sum256([]byte(source))
-			name += fmt.Sprintf("-%x", hash[:4])
-		}
+		name := snapshotName(source, counts)
 		result := RepoInput{Name: name, Source: source}
 		cleanPaths, err := RedactAll(ctx, []string{name, source})
 		if err != nil {
@@ -167,6 +163,17 @@ func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) 
 		results = append(results, result)
 	}
 	return results, nil
+}
+
+// snapshotName is a repository's name in the inputs: its checkout's base name, with a short hash of its path when
+// another checkout shares the base name (counts holds each base name's count).
+func snapshotName(source string, counts map[string]int) string {
+	name := filepath.Base(source)
+	if counts[name] > 1 {
+		hash := sha256.Sum256([]byte(source))
+		name += fmt.Sprintf("-%x", hash[:4])
+	}
+	return name
 }
 
 // SnapshotFacts is SnapshotRepos for tacit's store: one source, at dst, its log at logPath.

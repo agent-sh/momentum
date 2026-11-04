@@ -4,26 +4,26 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"path/filepath"
 	"strings"
 
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// heldBuild says why the configuration holds a case's build, or "" when only the build's own preparation can
-// tell. It runs no model and writes nothing: builds are off while loop.owners is empty, the repository the
-// investigation named must be a loop.read_dirs checkout, and it must pass the gate's policy (owner, exclusion,
-// scope check configured). Busy work, scope verdicts and locks change from minute to minute; preparation still
-// checks them, and everything here again.
-func (r *Runner) heldBuild(ctx context.Context, repo string) string {
+// heldBuild says why the configuration holds a case's build, or "" when it does not. It runs no model and writes
+// nothing: builds are off while loop.owners is empty, the repository the investigation named must be a
+// loop.read_dirs checkout, and it must pass the gate's policy (owner, exclusion, scope check configured). known is
+// false when the checkout's repository cannot be read now: preparation names what is wrong, and a recorded hold
+// stays as it is. Busy work, scope verdicts and locks change from minute to minute; preparation still checks them,
+// and everything here again.
+func (r *Runner) heldBuild(ctx context.Context, repo string) (why string, known bool) {
 	g := r.Ship.Gate
 	if len(g.Owners) == 0 {
-		return "builds are off (loop.owners is empty): report only"
+		return "builds are off (loop.owners is empty): report only", true
 	}
 	source := r.readDirSource(repo)
 	if source == "" {
-		return "the investigation's repository " + repo + " is not a loop.read_dirs repository: report only"
+		return "the investigation's repository " + repo + " is not a loop.read_dirs repository: report only", true
 	}
 	resolve := g.Resolve
 	if resolve == nil {
@@ -31,16 +31,15 @@ func (r *Runner) heldBuild(ctx context.Context, repo string) string {
 	}
 	full, err := resolve(ctx, source)
 	if err != nil {
-		return "" // preparation names what is wrong with the checkout
+		return "", false
 	}
 	if err := g.policy(full); err != nil {
-		return err.Error()
+		return err.Error(), true
 	}
-	return ""
+	return "", true
 }
 
-// readDirSource maps a repository name to its loop.read_dirs checkout, named as the snapshot names it (the base
-// name, with a short hash of the path when two share it).
+// readDirSource maps a repository name to its loop.read_dirs checkout, named as the snapshot names it.
 func (r *Runner) readDirSource(name string) string {
 	var sources []string
 	seen, counts := map[string]bool{}, map[string]int{}
@@ -54,17 +53,14 @@ func (r *Runner) readDirSource(name string) string {
 		counts[filepath.Base(p)]++
 	}
 	for _, source := range sources {
-		n := filepath.Base(source)
-		if counts[n] > 1 {
-			hash := sha256.Sum256([]byte(source))
-			n += fmt.Sprintf("-%x", hash[:4])
-		}
-		if n == name {
+		if snapshotName(source, counts) == name {
 			return source
 		}
 	}
 	return ""
 }
+
+const holdReasonMax = 1500
 
 func holdNotePrefix(caseID string) string { return "loop-build:" + store.IDPart(caseID) + ":held:" }
 
@@ -91,11 +87,14 @@ func (r *Runner) markHold(ctx context.Context, c store.Case, why string, note bo
 	if err != nil {
 		return err
 	}
-	clean = store.CaseNoteText(clean)
+	clean = plainClip(store.CaseNoteText(clean), holdReasonMax) // the held line's record fits a case log line
 	if clean == current {
 		return nil
 	}
 	if err := r.Store.CaseNote(cleanedNote(ctx), c.ID, store.ActionHeld, store.HoldDetail(clean, c.Episode), "loop"); err != nil {
+		return err
+	}
+	if err := r.doneHoldNotes(ctx, c.ID); err != nil { // a changed reason's old note goes with it
 		return err
 	}
 	if !note {
@@ -123,20 +122,41 @@ func (r *Runner) doneHoldNotes(ctx context.Context, caseID string) error {
 	return nil
 }
 
-// releaseHolds resolves the standing hold notes of cases that are no longer in testing (closed, merged, deployed
-// or back to investigating): their hold ended with the step it held.
+// releaseHolds ends the holds of cases that are no longer in testing (closed, merged, deployed or back to
+// investigating): their hold ended with the step it held. A case not closed whose log still holds a hold gets the
+// hold's end, so a return to testing in the same episode records its hold again; every such case's standing notes
+// resolve.
 func (r *Runner) releaseHolds(ctx context.Context, cs []store.Case) error {
 	notes, err := r.Store.Notes(ctx)
 	if err != nil {
 		return err
 	}
+	standing := map[string]bool{}
+	for _, n := range notes {
+		if strings.HasPrefix(n.ID, "loop-build:") && strings.Contains(n.ID, ":held:") && n.Done.IsZero() {
+			standing[n.ID] = true
+		}
+	}
 	for _, c := range cs {
 		if c.Status == store.CaseTesting {
 			continue
 		}
-		for _, n := range notes {
-			if strings.HasPrefix(n.ID, holdNotePrefix(c.ID)) && n.Done.IsZero() {
-				if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
+		if c.Status != store.CaseClosed {
+			log, err := r.Store.CaseLog(ctx, c.ID)
+			if err != nil {
+				return err
+			}
+			as := c
+			as.Status = store.CaseTesting
+			if store.HoldOf(as, log) != "" {
+				if err := r.Store.CaseNote(cleanedNote(ctx), c.ID, store.ActionUnheld, "the case left testing", "loop"); err != nil {
+					return err
+				}
+			}
+		}
+		for id := range standing {
+			if strings.HasPrefix(id, holdNotePrefix(c.ID)) {
+				if _, _, err := r.Store.DoneNote(ctx, id, r.now()); err != nil {
 					return err
 				}
 			}

@@ -204,3 +204,49 @@ func admitBuilds(t *testing.T, r *Runner, name string) {
 	r.Ship.Gate.Resolve = func(context.Context, string) (string, error) { return "agent-sh/" + name, nil }
 	r.Inputs.ReadDirs = append(r.Inputs.ReadDirs, filepath.Join(t.TempDir(), name))
 }
+
+// A changed reason replaces the hold and its note; a checkout that cannot be read leaves the hold as it is; a case
+// that leaves testing ends its hold, and its return records the hold again with a standing note.
+func TestAHoldFollowsItsReasonAndItsCase(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	r.Inputs.ReadDirs = []string{filepath.Join(t.TempDir(), "momentum")}
+	resolveErr := error(nil)
+	r.Ship = &Ship{Store: st, Dir: r.Dir, Gate: Gate{RepoGuard: []string{"true"},
+		Resolve: func(context.Context, string) (string, error) { return "agent-sh/momentum", resolveErr }}}
+	held := heldTestingCase(t, st, "held", "momentum")
+	holdNow := func() string {
+		t.Helper()
+		if _, _, _, err := r.pick(ctx, "failures", "", false); err != nil {
+			t.Fatal(err)
+		}
+		c, _ := st.CaseByID(ctx, held.ID)
+		log, _ := st.CaseLog(ctx, held.ID)
+		return store.HoldOf(c, log)
+	}
+	if why := holdNow(); !strings.Contains(why, "builds are off") || standing(t, st, held.ID) != 1 {
+		t.Fatalf("builds off: %q", why)
+	}
+	r.Ship.Gate.Owners = []string{"someone"}
+	if why := holdNow(); !strings.Contains(why, "loop.owners") || standing(t, st, held.ID) != 1 {
+		t.Fatalf("a changed reason: %q, %d standing", why, standing(t, st, held.ID))
+	}
+	resolveErr = refused("cannot read origin")
+	if why := holdNow(); !strings.Contains(why, "loop.owners") || standing(t, st, held.ID) != 1 {
+		t.Fatalf("an unreadable checkout changed the hold: %q", why)
+	}
+	resolveErr = nil
+	if _, err := st.UpdateCase(ctx, held.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if why := holdNow(); why != "" || standing(t, st, held.ID) != 0 {
+		t.Fatalf("a case out of testing kept its hold: %q, %d standing", why, standing(t, st, held.ID))
+	}
+	if _, err := st.UpdateCase(ctx, held.ID, store.CaseUpdate{Status: store.CaseTesting}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if why := holdNow(); !strings.Contains(why, "loop.owners") || standing(t, st, held.ID) != 1 {
+		t.Fatalf("the return to testing: %q, %d standing", why, standing(t, st, held.ID))
+	}
+}

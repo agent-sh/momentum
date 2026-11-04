@@ -420,18 +420,23 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 					}
 				}
 				passed = append(passed, c.ID+" has landed; deployment precedes more work")
+				r.liftHold(ctx, c, dry)
 				continue
 			} else if ok && proposalsUsed(p) {
 				passed = append(passed, c.ID+" used its proposals")
+				r.liftHold(ctx, c, dry)
 				continue
 			} else if ok && roundsUsed(p) {
 				passed = append(passed, c.ID+" used its review rounds")
+				r.liftHold(ctx, c, dry)
 				continue
 			} else if ok && (p.State == Proposed || p.State == Landing) {
+				r.liftHold(ctx, c, dry)
 				continue // its review or its landing comes next (reviews)
 			} else if ok && !p.ProposalAt.IsZero() && p.Plan != nil {
 				if wait := r.Ship.waiting(ctx, c, *p.Plan, r.now()); wait != nil {
 					passed = append(passed, c.ID+"'s proposal waits on "+wait.what())
+					r.liftHold(ctx, c, dry)
 					continue
 				}
 			}
@@ -446,14 +451,14 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 				}
 				passed = append(passed, c.ID+" waits for a repository")
 				continue
-			} else if why := r.heldBuild(ctx, repo); why != "" {
+			} else if why, known := r.heldBuild(ctx, repo); why != "" {
 				// a hold of the configuration takes no slot: the family's next workable case runs instead
 				if !dry {
 					r.keepHold(ctx, c, why, true)
 				}
 				passed = append(passed, c.ID+" held: "+why)
 				continue
-			} else if !dry {
+			} else if known && !dry {
 				r.keepHold(ctx, c, "", false)
 			}
 		case store.CaseClosed:
@@ -499,6 +504,13 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 }
 
 // keepHold records a hold's change. A failure to record it holds no selection: the hold still takes no slot.
+// liftHold ends a testing case's hold when its next step is no build: a proposal, a landing or a person.
+func (r *Runner) liftHold(ctx context.Context, c store.Case, dry bool) {
+	if !dry {
+		r.keepHold(ctx, c, "", false)
+	}
+}
+
 func (r *Runner) keepHold(ctx context.Context, c store.Case, why string, note bool) {
 	if err := r.markHold(ctx, c, why, note); err != nil {
 		r.logf("hold of %s: %v", c.ID, err)

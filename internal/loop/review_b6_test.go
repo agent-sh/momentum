@@ -129,10 +129,10 @@ func TestLandingScansOnlyTheChange(t *testing.T) {
 
 func TestTwoClosedProposalsStopAutomaticBuilds(t *testing.T) {
 	fakeManager(t)
-	s, f, c, _ := b4Reviewed(t)
+	s, f, c, p := b4Reviewed(t)
 	ctx := context.Background()
-	setCaseRepo(t, s.Store, c, "fixture")
-	r := &Runner{Store: s.Store, Ship: s, Dir: s.Dir, Budgets: DefaultBudgets}
+	setCaseRepo(t, s.Store, c, filepath.Base(p.Dir))
+	r := &Runner{Store: s.Store, Ship: s, Dir: s.Dir, Budgets: DefaultBudgets, Inputs: InputOptions{ReadDirs: []string{p.Dir}}}
 	for i := 1; i <= 2; i++ {
 		s.GH = b4GH(t, f, "true", "CLOSED")
 		if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) {
