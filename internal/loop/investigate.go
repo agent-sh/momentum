@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"unicode"
 
 	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
@@ -193,7 +194,7 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 	}
 	var alternatives []string
 	for _, a := range f.Alternatives {
-		if a = strings.TrimSpace(a); a != "" {
+		if a = strings.TrimSpace(a); holdsText(a) {
 			alternatives = append(alternatives, a)
 		}
 	}
@@ -283,8 +284,21 @@ func undecided(res Result, err error) string {
 	return why
 }
 
-// holdsText says whether a finding's field names anything once the case store keeps it as a plain line.
-func holdsText(s string) bool { return plain.Line(s) != "" }
+// holdsText says whether a finding's field names anything: it holds a letter, digit, symbol or punctuation that is
+// not a blank filler. Spaces, joiners and other format characters, the Hangul fillers and the blank braille pattern
+// alone render as nothing.
+func holdsText(s string) bool {
+	for _, r := range s {
+		switch r {
+		case '\u115f', '\u1160', '\u3164', '\uffa0', '\u2800':
+			continue
+		}
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.IsSymbol(r) || unicode.IsPunct(r) {
+			return true
+		}
+	}
+	return false
+}
 
 type finding struct {
 	Mechanism    string   `json:"mechanism"`

@@ -447,3 +447,26 @@ func TestAWithheldLineOfAnyAdmittedIDSurvivesAnAppend(t *testing.T) {
 		t.Fatalf("the append could not read the index it wrote: %v", err)
 	}
 }
+
+// A field with no letter, digit, symbol or punctuation names nothing: joiners, Hangul fillers and the blank braille
+// pattern alone are empty, for the mechanism, the fix and each alternative.
+func TestFieldsOfFillersAloneAreEmpty(t *testing.T) {
+	for _, s := range []string{"\u200c", "\u200d", "\u3164", "\u2800", " \u200b\u3164 \u2800 "} {
+		if holdsText(s) {
+			t.Errorf("%q holds text", s)
+		}
+	}
+	for _, s := range []string{"a", "7", "→", "!", "\u3164x"} {
+		if !holdsText(s) {
+			t.Errorf("%q holds no text", s)
+		}
+	}
+	st := testStore(t)
+	ctx := context.Background()
+	c := openCase(t, st, "failures", "fillers", 1)
+	got, recorded, err := recordFindings(ctx, st, c.ID, c.Episode, finding{Mechanism: "\u3164", Fix: "\u2800",
+		Alternatives: []string{"\u200d", "a real alternative"}}, true, "the investigation named no mechanism and fix", "loop:r")
+	if err != nil || !recorded || got.Status != store.CaseClosed || len(got.Alternatives) != 1 {
+		t.Fatalf("fillers: %v %v, %s, alternatives %q", recorded, err, got.Status, got.Alternatives)
+	}
+}
