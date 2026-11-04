@@ -85,6 +85,7 @@ func TestAProposalWaitingOnAReadIsPassedOver(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	r := measurementRunner(t, st)
+	admitBuilds(t, r, "main")
 	c := testingCase(t, st)
 	now := time.Now()
 	r.Now = func() time.Time { return now }

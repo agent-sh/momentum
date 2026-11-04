@@ -179,6 +179,7 @@ func TestAMeasurementsWaitDoesNotHoldACaseRolledBackByHand(t *testing.T) {
 	if _, err := m.st.RollBackCase(ctx, m.c.ID, "by hand", "owner"); err != nil {
 		t.Fatal(err)
 	}
+	admitBuilds(t, m.r, "repo")
 	picked, step, why, err := m.r.pick(ctx, "failures", "", false)
 	if err != nil || picked.ID != m.c.ID || step != StepBuild {
 		t.Fatalf("picked %q %s: %s %v", picked.ID, step, why, err)
@@ -191,6 +192,7 @@ func TestAWaitingProposalIsPassedOverOnlyForWhatItWaitsOnNow(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	r := measurementRunner(t, st)
+	admitBuilds(t, r, "main")
 	c := testingCase(t, st)
 	now := time.Now()
 	r.Now = func() time.Time { return now }

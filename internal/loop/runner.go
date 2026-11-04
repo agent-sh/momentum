@@ -340,6 +340,11 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 	}
 	var cands []cand
 	var passed []string
+	if !dry {
+		if err := r.releaseHolds(ctx, cs); err != nil {
+			r.logf("hold notes: %v", err)
+		}
+	}
 	for _, c := range cs {
 		if only != "" && c.ID != only {
 			continue
@@ -437,28 +442,19 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 					if err := r.waitingRepo(ctx, c); err != nil {
 						return store.Case{}, "", "", err
 					}
-					if err := r.markHold(ctx, c, "waits for a repository: the investigation named none"); err != nil {
-						return store.Case{}, "", "", err
-					}
+					r.keepHold(ctx, c, "waits for a repository: the investigation named none", false)
 				}
 				passed = append(passed, c.ID+" waits for a repository")
 				continue
 			} else if why := r.heldBuild(ctx, repo); why != "" {
 				// a hold of the configuration takes no slot: the family's next workable case runs instead
 				if !dry {
-					if err := r.markHold(ctx, c, why); err != nil {
-						return store.Case{}, "", "", err
-					}
-					if err := r.noteBuildSkip(ctx, c, "held", why); err != nil {
-						return store.Case{}, "", "", err
-					}
+					r.keepHold(ctx, c, why, true)
 				}
 				passed = append(passed, c.ID+" held: "+why)
 				continue
 			} else if !dry {
-				if err := r.markHold(ctx, c, ""); err != nil {
-					return store.Case{}, "", "", err
-				}
+				r.keepHold(ctx, c, "", false)
 			}
 		case store.CaseClosed:
 			continue
@@ -500,6 +496,13 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 		return a.c.Seen.After(b.c.Seen)
 	})
 	return cands[0].c, cands[0].step, fmt.Sprintf("%s %s (%s, %d evidence)", cands[0].step, cands[0].c.ID, cands[0].c.Status, cands[0].c.Evidence), nil
+}
+
+// keepHold records a hold's change. A failure to record it holds no selection: the hold still takes no slot.
+func (r *Runner) keepHold(ctx context.Context, c store.Case, why string, note bool) {
+	if err := r.markHold(ctx, c, why, note); err != nil {
+		r.logf("hold of %s: %v", c.ID, err)
+	}
 }
 
 func (r *Runner) pickSkipped(c store.Case, step string, cause error) {

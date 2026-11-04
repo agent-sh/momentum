@@ -45,6 +45,7 @@ func TestACaseWhoseChangeWaitsOnItsReviewIsNotBuilt(t *testing.T) {
 	}
 	c, _ = st.CaseByID(ctx, c.ID)
 	r.Ship = &Ship{Store: st, Dir: r.Dir}
+	admitBuilds(t, r, "main")
 	setCaseRepo(t, st, c, "main")
 	p := Package{Case: c.ID, Kind: "repo", State: Proposed, Head: "abc123"}
 	if err := r.Ship.save(&p); err != nil {

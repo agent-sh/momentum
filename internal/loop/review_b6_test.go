@@ -220,6 +220,7 @@ func TestTestingCasesRankBeforeInvestigations(t *testing.T) {
 	st := testStore(t)
 	r := localRunner(t, st)
 	r.Ship = &Ship{Store: st, Dir: r.Dir}
+	admitBuilds(t, r, "fixture")
 	c := testingCase(t, st)
 	setCaseRepo(t, st, c, "fixture")
 	other := openCase(t, st, c.Family, "marker-7f3a-investigating", 9)

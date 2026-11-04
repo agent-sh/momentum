@@ -29,7 +29,8 @@ func TestAHeldBuildLeavesItsFamilysSlotToAnOpenCase(t *testing.T) {
 	r := runnerFor(t, st, fakeAgent(t, investigatedResult))
 	r.Ship = &Ship{Store: st, Dir: r.Dir} // loop.owners is empty
 	held := heldTestingCase(t, st, "held", "momentum")
-	open := openCase(t, st, "failures", "open", 1)
+	open := openCase(t, st, "failures", "open", 2)
+	next := openCase(t, st, "failures", "next", 1)
 
 	done, err := r.Once(ctx, Options{Families: []string{"failures"}})
 	if err != nil {
@@ -61,8 +62,21 @@ func TestAHeldBuildLeavesItsFamilysSlotToAnOpenCase(t *testing.T) {
 	lines := len(log)
 
 	// the next pass works the family's next case and leaves the held one as it was
-	if _, err := r.Once(ctx, Options{Families: []string{"failures"}}); err != nil {
+	done, err = r.Once(ctx, Options{Families: []string{"failures"}})
+	if err != nil {
 		t.Fatal(err)
+	}
+	ran = false
+	for _, d := range done {
+		if d.Case == held.ID && (d.Run.ID != "" || strings.Contains(d.Skipped, "refused")) {
+			t.Fatalf("the held case took a turn in the next pass: %+v", d)
+		}
+		if d.Case == next.ID && d.Step == StepInvestigate && d.Run.ID != "" {
+			ran = true
+		}
+	}
+	if !ran {
+		t.Fatalf("the next pass did not investigate the next case: %+v", done)
 	}
 	if log, _ := st.CaseLog(ctx, held.ID); len(log) != lines {
 		t.Fatalf("an unchanged hold wrote again: %+v", log[lines:])
@@ -70,7 +84,7 @@ func TestAHeldBuildLeavesItsFamilysSlotToAnOpenCase(t *testing.T) {
 	notes, _ := st.Notes(ctx)
 	holds := 0
 	for _, n := range notes {
-		if strings.HasPrefix(n.ID, "loop-build:"+held.ID+":held:") {
+		if strings.HasPrefix(n.ID, holdNotePrefix(held.ID)) {
 			holds++
 		}
 	}
@@ -100,6 +114,7 @@ func TestAnOwnerNotAdmittedHoldsTheBuildUntilTheConfigurationChanges(t *testing.
 		t.Fatalf("hold: %q", why)
 	}
 	r.Ship.Gate.Owners = []string{"other"}
+	held, _ = st.CaseByID(ctx, held.ID)
 	picked, step, _, err = r.pick(ctx, "failures", "", false)
 	if err != nil || picked.ID != held.ID || step != StepBuild {
 		t.Fatalf("picked %s %s %v, want the build once its owner is admitted", picked.ID, step, err)
@@ -108,10 +123,84 @@ func TestAnOwnerNotAdmittedHoldsTheBuildUntilTheConfigurationChanges(t *testing.
 	if why := store.HoldOf(c, log); why != "" {
 		t.Fatalf("the hold did not lift: %q", why)
 	}
-	notes, _ := st.Notes(ctx)
-	for _, n := range notes {
-		if strings.HasPrefix(n.ID, "loop-build:"+held.ID+":held:") && n.Done.IsZero() {
-			t.Fatalf("the hold's note still stands: %s", n.ID)
+	if standing(t, st, held.ID) != 0 {
+		t.Fatal("the hold's note still stands after the hold lifted")
+	}
+	// the same hold again: the case is held again and its note stands again
+	r.Ship.Gate.Owners = []string{"someone"}
+	if picked, _, _, err = r.pick(ctx, "failures", "", false); err != nil || picked.ID != open.ID {
+		t.Fatalf("held again: picked %s %v", picked.ID, err)
+	}
+	log, _ = st.CaseLog(ctx, held.ID)
+	if why := store.HoldOf(c, log); !strings.Contains(why, "loop.owners") || standing(t, st, held.ID) != 1 {
+		t.Fatalf("held again: %q, %d standing notes", why, standing(t, st, held.ID))
+	}
+}
+
+func standing(t *testing.T, st *store.Store, caseID string) int {
+	t.Helper()
+	notes, err := st.Notes(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, note := range notes {
+		if strings.HasPrefix(note.ID, holdNotePrefix(caseID)) && note.Done.IsZero() {
+			n++
 		}
 	}
+	return n
+}
+
+// Each reason the configuration gives holds the build, with that reason; a case in testing it does not hold is the
+// family's build.
+func TestThePolicyReasonsThatHoldABuild(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+		gate       Gate
+		readDir    string
+	}{
+		{"builds off", "builds are off", Gate{}, "momentum"},
+		{"owner", "loop.owners", Gate{Owners: []string{"someone"}, RepoGuard: []string{"true"}}, "momentum"},
+		{"excluded", "loop.exclude", Gate{Owners: []string{"agent-sh"}, Exclude: []string{"agent-sh/momentum"}, RepoGuard: []string{"true"}}, "momentum"},
+		{"no scope check", "loop.repo_guard", Gate{Owners: []string{"agent-sh"}}, "momentum"},
+		{"not a read dir", "loop.read_dirs", Gate{Owners: []string{"agent-sh"}, RepoGuard: []string{"true"}}, "elsewhere"},
+		{"allowed", "", Gate{Owners: []string{"agent-sh"}, RepoGuard: []string{"true"}}, "momentum"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := testStore(t)
+			r := localRunner(t, st)
+			r.Inputs.ReadDirs = []string{filepath.Join(t.TempDir(), tc.readDir)}
+			tc.gate.Resolve = func(context.Context, string) (string, error) { return "agent-sh/momentum", nil }
+			r.Ship = &Ship{Store: st, Dir: r.Dir, Gate: tc.gate}
+			held := heldTestingCase(t, st, "held", "momentum")
+			openCase(t, st, "failures", "open", 1)
+			picked, step, why, err := r.pick(ctx, "failures", "", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			log, _ := st.CaseLog(ctx, held.ID)
+			hold := store.HoldOf(held, log)
+			if tc.want == "" {
+				if picked.ID != held.ID || step != StepBuild || hold != "" {
+					t.Fatalf("an allowed build was held: %s %s %q", picked.ID, why, hold)
+				}
+				return
+			}
+			if picked.ID == held.ID || !strings.Contains(hold, tc.want) || standing(t, st, held.ID) != 1 {
+				t.Fatalf("picked %s (%s), hold %q, want %q", picked.ID, why, hold, tc.want)
+			}
+		})
+	}
+}
+
+// admitBuilds lets a fixture's builds through the configuration's policy: an admitted owner, a scope check, and a
+// loop.read_dirs checkout of the name the case's investigation gives.
+func admitBuilds(t *testing.T, r *Runner, name string) {
+	t.Helper()
+	r.Ship.Gate.Owners = []string{"agent-sh"}
+	r.Ship.Gate.RepoGuard = []string{"true"}
+	r.Ship.Gate.Resolve = func(context.Context, string) (string, error) { return "agent-sh/" + name, nil }
+	r.Inputs.ReadDirs = append(r.Inputs.ReadDirs, filepath.Join(t.TempDir(), name))
 }
