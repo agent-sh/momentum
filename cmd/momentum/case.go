@@ -113,6 +113,7 @@ type listedCase struct {
 	Deployed       string   `json:"deployed,omitempty"`
 	Back           string   `json:"back,omitempty"`
 	Package        string   `json:"package,omitempty"`
+	Held           string   `json:"held,omitempty"` // why the configuration holds its build (store.HoldOf)
 	Measurement    *struct {
 		WindowHours float64 `json:"window_hours"`
 		Before      int     `json:"before"`
@@ -157,6 +158,25 @@ func caseJSON(c store.Case) listedCase {
 // statusLine is a case's status for a terminal: closed ones with their reason.
 func statusLine(c store.Case) string { return evidenceview.StatusLine(c) }
 
+// caseHold is why the configuration holds a case in testing, from its log, or "".
+func caseHold(ctx context.Context, st *store.Store, c store.Case) (string, error) {
+	if c.Status != store.CaseTesting {
+		return "", nil
+	}
+	log, err := st.CaseLog(ctx, c.ID)
+	if err != nil {
+		return "", err
+	}
+	return store.HoldOf(c, log), nil
+}
+
+func listStatus(c store.Case, hold string) string {
+	if hold != "" {
+		return statusLine(c) + " (held)"
+	}
+	return statusLine(c)
+}
+
 func caseList(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("case list", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -197,19 +217,29 @@ func caseList(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		defer fmt.Fprintln(stderr, "momentum: more cases; narrow with --family or --status")
 	}
 	enc := json.NewEncoder(stdout)
+	holds := make([]string, len(cs))
 	width := 14
-	for _, c := range cs {
-		width = max(width, len(statusLine(c)))
+	for i, c := range cs {
+		if holds[i], err = caseHold(ctx, st, c); err != nil {
+			return err
+		}
+		width = max(width, len(listStatus(c, holds[i])))
 	}
-	for _, c := range cs {
+	for i, c := range cs {
 		if *asJSON {
-			if err := enc.Encode(caseJSON(c)); err != nil {
+			l := caseJSON(c)
+			l.Held = holds[i]
+			if err := enc.Encode(l); err != nil {
 				return err
 			}
 			continue
 		}
-		fmt.Fprintf(stdout, "%-9s %-16s %-*s %4d ev  $%6.2f  %s  %s\n", c.ID, c.Family, width, statusLine(c), c.Evidence, c.Cost.USD,
-			c.Updated.Local().Format("01-02 15:04"), c.Title)
+		title := c.Title
+		if holds[i] != "" {
+			title += "  [held: " + holds[i] + "]"
+		}
+		fmt.Fprintf(stdout, "%-9s %-16s %-*s %4d ev  $%6.2f  %s  %s\n", c.ID, c.Family, width, listStatus(c, holds[i]), c.Evidence, c.Cost.USD,
+			c.Updated.Local().Format("01-02 15:04"), title)
 	}
 	return nil
 }
@@ -278,6 +308,9 @@ func caseShow(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 	if *asJSON {
 		out := shownCase{listedCase: caseJSON(c), Recent: []shownEvidence{}, Log: []shownEntry{}, LogLines: logged}
+		if out.Held, err = caseHold(ctx, st, c); err != nil {
+			return err
+		}
 		for _, e := range evs {
 			out.Recent = append(out.Recent, shownEvidence{Ref: e.Ref, At: rfc3339(e.At), Kind: e.Kind, Summary: e.Summary})
 		}

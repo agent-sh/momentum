@@ -98,6 +98,22 @@ func RepoOf(ctx context.Context, dir string) (string, error) {
 	return repo, nil
 }
 
+// policy is the part of Repository that only the configuration decides: an owner the loop may write to, a
+// repository it does not exclude, a scope check to run. What it refuses stays refused until the configuration
+// changes, so the runner checks it before it picks a build (heldBuild).
+func (g Gate) policy(repo string) error {
+	owner := strings.SplitN(repo, "/", 2)[0]
+	switch {
+	case !slices.ContainsFunc(g.Owners, func(o string) bool { return strings.EqualFold(o, owner) }):
+		return refused("%s is not of an owner the loop may write to (loop.owners): report only", repo)
+	case slices.ContainsFunc(g.Exclude, func(x string) bool { return strings.EqualFold(x, repo) }):
+		return refused("%s is excluded (loop.exclude): report only", repo)
+	case len(g.RepoGuard) == 0:
+		return refused("no scope check is configured (loop.repo_guard): no repository write")
+	}
+	return nil
+}
+
 // Repository checks that the loop may change a repository now, and returns it as a target: an owner it may write
 // to, a repository it does not exclude, the machine's scope check allows it, and nothing else works in it (the
 // scheduled-AI policy leaves a repository another agent or a human works on alone).
@@ -134,13 +150,8 @@ func (g Gate) Repository(ctx context.Context, dir string) (target Target, err er
 		return Target{}, err
 	}
 	owner := strings.SplitN(repo, "/", 2)[0]
-	switch {
-	case !slices.ContainsFunc(g.Owners, func(o string) bool { return strings.EqualFold(o, owner) }):
-		return Target{}, refused("%s is not of an owner the loop may write to (loop.owners): report only", repo)
-	case slices.ContainsFunc(g.Exclude, func(x string) bool { return strings.EqualFold(x, repo) }):
-		return Target{}, refused("%s is excluded (loop.exclude): report only", repo)
-	case len(g.RepoGuard) == 0:
-		return Target{}, refused("no scope check is configured (loop.repo_guard): no repository write")
+	if err := g.policy(repo); err != nil {
+		return Target{}, err
 	}
 	if err := g.scope(ctx, repo, main); err != nil {
 		return Target{}, err

@@ -304,3 +304,41 @@ func TestCaseDetectNamesWhatItRefusedAndSwept(t *testing.T) {
 		t.Fatalf("a dry run migrated the store: %d %v", n, err)
 	}
 }
+
+// A case the loop's configuration holds shows its hold, with the reason, in case list and case show --json.
+func TestCaseListShowsAHeldCase(t *testing.T) {
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	ctx := context.Background()
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: "held", Title: "a held case",
+		Evidence: []store.Evidence{{Ref: "file:/a@1", At: time.Now()}}}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mechanism, fix := "one cause", "one fix"
+	if _, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CaseNote(ctx, c.ID, store.ActionHeld, "builds are off (loop.owners is empty): report only", "loop"); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	if code, out, _ := momentum("case", "list"); code != 0 || !strings.Contains(out, "testing (held)") ||
+		!strings.Contains(out, "[held: builds are off (loop.owners is empty): report only]") {
+		t.Fatalf("list: exit %d %q", code, out)
+	}
+	var shown struct {
+		Held string `json:"held"`
+	}
+	code, out, _ := momentum("case", "show", c.ID, "--json")
+	if err := json.Unmarshal([]byte(out), &shown); code != 0 || err != nil || !strings.Contains(shown.Held, "loop.owners") {
+		t.Fatalf("show: exit %d %q %v", code, out, err)
+	}
+	if code, out, _ := momentum("case", "list", "--json"); code != 0 || !strings.Contains(out, `"held":"builds are off`) {
+		t.Fatalf("list --json: exit %d %q", code, out)
+	}
+}
