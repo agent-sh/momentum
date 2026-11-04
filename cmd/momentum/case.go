@@ -30,7 +30,7 @@ import (
 // ship and measure tools move it through deployed and measuring; it closes with a reason.
 func caseCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usageError{"case needs detect, list, show, open, set, evidence, signature, close or reopen"}
+		return usageError{"case needs detect, list, show, open, set, evidence, signature, close, reopen or rollback"}
 	}
 	switch args[0] {
 	case "detect":
@@ -51,6 +51,8 @@ func caseCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		return caseClose(ctx, args[1:], stdout, stderr)
 	case "reopen":
 		return caseReopen(ctx, args[1:], stdout, stderr)
+	case "rollback":
+		return caseRollback(ctx, args[1:], stdout, stderr)
 	}
 	return usageError{fmt.Sprintf("unknown case command %q", args[0])}
 }
@@ -748,4 +750,44 @@ func caseDetect(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		errs = append(errs, fmt.Errorf("the case store refused %d findings", refused))
 	}
 	return errors.Join(errs...)
+}
+
+// caseRollback undoes a deployed or measuring case's change through the ship tool, as the owner: a repository's by a
+// revert, a configuration file's from its journal. A configuration file changed since its change landed is held, never
+// overwritten.
+func caseRollback(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	id, rest, err := idThenFlags("case rollback", args)
+	if err != nil {
+		return err
+	}
+	fs := flag.NewFlagSet("case rollback", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	why := fs.String("why", "", "why the change is undone, in a short line")
+	if err := fs.Parse(rest); err != nil {
+		return usageError{err.Error()}
+	}
+	if fs.NArg() > 0 {
+		return usageError{fmt.Sprintf("case rollback takes one case's id, got %q too", fs.Arg(0))}
+	}
+	if strings.TrimSpace(*why) == "" {
+		return usageError{"case rollback needs --why"}
+	}
+	c, err := config.Load()
+	if err != nil {
+		return err
+	}
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	p, err := setupShip(st, c).RollBack(ctx, id, *why)
+	if errors.Is(err, loop.ErrRefused) || errors.Is(err, store.ErrBadCase) || errors.Is(err, store.ErrNoCase) {
+		return usageError{err.Error()}
+	}
+	if err != nil {
+		return caseErr(err)
+	}
+	fmt.Fprintf(stdout, "%s: %s %s\n", p.Case, p.Kind, p.State)
+	return nil
 }

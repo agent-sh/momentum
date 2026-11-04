@@ -94,7 +94,8 @@ func selectionRunner(st *store.Store, c config.Loop) *loop.Runner {
 	if len(families) == 0 {
 		families = defaultFamilies
 	}
-	return &loop.Runner{Store: st, Ship: &loop.Ship{Store: st, Dir: loopDir(), Gate: configGate(c)},
+	// a dry pass reads the configuration targets' switch and list as a live one does, and writes nothing
+	return &loop.Runner{Store: st, Ship: &loop.Ship{Store: st, Dir: loopDir(), Gate: configGate(c), Live: c.Live, ConfigTargets: configTargets(c)},
 		Families: families, Budgets: b, Dir: loopDir(), Inputs: loop.InputOptions{ReadDirs: expandAll(c.ReadDirs)}}
 }
 

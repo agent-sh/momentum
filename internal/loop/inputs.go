@@ -277,8 +277,12 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 	if err != nil {
 		return run, err
 	}
-	prompt := fmt.Sprintf("%s\nProblem: %s\n%s%s%s%s", liveQuestion, plain.Line(c.Title), evidenceText, caseHolds(c), findingsInstruction, inputReference(true))
-	schema := investigationSchema
+	question := liveQuestion
+	if r.Ship != nil && r.Ship.ConfigTargets.Enabled {
+		question += configQuestion
+	}
+	prompt := fmt.Sprintf("%s\nProblem: %s\n%s%s%s%s", question, plain.Line(c.Title), evidenceText, caseHolds(c), findingsInstruction, inputReference(true))
+	schema := r.investigationSchemaFor()
 	extra := map[string]string{}
 	if step == StepBuild {
 		p, prepErr := r.buildPackage(ctx, c, run)
@@ -294,6 +298,9 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 			}
 		}
 		prompt = fmt.Sprintf("Build case %s: %s. BASE is %s. /work is your build tree at BASE, writable with its Git metadata: one commit that holds the tree of the default branch's commit %s, without its history (that is in /ro/history and /ro/diffs).%s /out is writable. Read /run/input/case.json for the investigation and evidence. Make one cause's change and its discriminating test. End with the build report. The host produces the patch.\n%s\n%s", c.ID, c.Title, p.WorkBase, p.BaseCommit, history, buildScope(p.Repo), inputReference(true))
+		if p.Kind == KindConfig {
+			prompt = fmt.Sprintf("Build case %s: %s. BASE is %s. /work is a Git work tree at BASE that holds one configuration file, %s, as the host reads it now (the text of /ro/config/%s). Change only that file's content: keep its mode, do not delete, rename or create a file outside tests/. Put its discriminating test under tests/ in /work. The test runs from /work as one program and its arguments, no shell, and reads the file at that path; the host runs it without the change (it must fail) and with it (it must pass), then writes the reviewed content in place. Read /run/input/case.json for the investigation and evidence. End with the build report and name no installed file. The host produces the patch.\n%s", c.ID, c.Title, p.WorkBase, p.Target, p.Target, inputReference(true))
+		}
 		prompt = strings.ReplaceAll(prompt, "/work is empty scratch and the working directory.", "/work is the build tree at BASE and the working directory.")
 		prompt = strings.ReplaceAll(prompt, "Return a report with mechanism, alternatives ruled out, fix and summary. Build no change.", "Return summary, test_command, title, body, rollback, signal, window and lesson. test_command is the program and its arguments, such as [\"go\", \"test\", \"./...\"], which the host runs in the sandbox. window is a duration, such as 7d. signal names source, kinds, match and optional tool and harness.")
 		if n := len(p.Reviews); n > 0 {

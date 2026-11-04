@@ -155,3 +155,46 @@ func TestANativeTranscriptReaderIsLiveWithoutAHarnessHome(t *testing.T) {
 		t.Fatal("a configured native reader was omitted from measurement")
 	}
 }
+
+// Configuration targets are off unless the owner turns them on, take only known keys, and an allow entry names one
+// exact file under the home: no pattern, no directory form, nothing outside the home.
+func TestConfigTargetsAreOffByDefaultAndExact(t *testing.T) {
+	cfg, home := t.TempDir(), t.TempDir()
+	t.Setenv("MOMENTUM_CONFIG", cfg)
+	t.Setenv("HOME", home)
+	write := func(s string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(cfg, "sources.json"), []byte(s), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(`{"loop": {"live": true}}`)
+	if s, err := Load(); err != nil || s.Loop.ConfigTargets.Enabled || len(s.Loop.ConfigTargets.Allow) != 0 {
+		t.Fatalf("default: %+v %v", s.Loop.ConfigTargets, err)
+	}
+	write(`{"loop": {"config_targets": {"enabled": true, "alow": []}}}`)
+	if _, err := Load(); err == nil {
+		t.Fatal("a misspelt key of config_targets was taken")
+	}
+	for _, bad := range []string{`"/etc/marker-c0ffee"`, `"../x"`, `"~/../x"`, `".config/./agents/X.md"`, `""`, `".config/agents/"`,
+		`".config/agents/*.md"`, `".config/agents/**"`, `".config/agents/R?LES.md"`, `".config/agents/[R]ULES.md"`} {
+		write(`{"loop": {"config_targets": {"enabled": true, "allow": [` + bad + `]}}}`)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "config_targets.allow") {
+			t.Fatalf("allow %s: %v", bad, err)
+		}
+	}
+	write(`{"loop": {"config_targets": {"enabled": true, "allow": ["~/.config/agents/RULES.md", ".config/agents/OTHER.md"]}}}`)
+	if s, err := Load(); err != nil || !s.Loop.ConfigTargets.Enabled || len(s.Loop.ConfigTargets.Allow) != 2 {
+		t.Fatalf("%+v %v", s.Loop.ConfigTargets, err)
+	}
+}
+
+// The loop's own files, as configured, are what Own names: rules, programs and the files they name as arguments, the
+// relay environment and the tacit store.
+func TestTheLoopsOwnFilesAreItsConfiguredOnes(t *testing.T) {
+	l := Loop{Rules: []string{"/r/RULES.md"}, RepoGuard: []string{"python3", "~/g/guard.py", "x"}, CapacityGate: []string{"/b/gate", "--config", "/c/gate.toml"},
+		Runner: []string{"/b/run"}, BedrockEnv: "/e/relay.env", TacitStore: "/s/store"}
+	if got := strings.Join(l.Own(), " "); got != "/r/RULES.md python3 ~/g/guard.py /b/gate /c/gate.toml /b/run /e/relay.env /s/store" {
+		t.Fatalf("own: %s", got)
+	}
+}

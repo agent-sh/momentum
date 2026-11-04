@@ -554,3 +554,25 @@ func TestNamingTheFixOfAComponentHealthCaseClosedBeforeItResumesTheCasesItStoppe
 		t.Fatalf("a fix named on a case closed another way: exit %d %s", code, errOut)
 	}
 }
+
+// case rollback is the ship tool's rollback: it needs a why, and a case with nothing landed is refused with exit 2.
+func TestCaseRollbackGoesThroughTheShipTool(t *testing.T) {
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	cfg := t.TempDir()
+	t.Setenv("MOMENTUM_CONFIG", cfg)
+	if err := os.WriteFile(filepath.Join(cfg, "sources.json"), []byte(`{"loop": {"config_targets": {"enabled": false}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errOut := momentum("case", "open", "--family", "failures", "--signature", "failures:marker-c0ffee", "--title", "marker-c0ffee",
+		"--evidence", "file:/a@1")
+	m := regexp.MustCompile(`^(c[0-9a-f]{8}): opened`).FindStringSubmatch(out)
+	if code != 0 || m == nil {
+		t.Fatalf("open: exit %d %q %s", code, out, errOut)
+	}
+	if code, _, errOut := momentum("case", "rollback", m[1]); code != 2 || !strings.Contains(errOut, "--why") {
+		t.Fatalf("no why: exit %d %s", code, errOut)
+	}
+	if code, _, errOut := momentum("case", "rollback", m[1], "--why", "marker-c0ffee"); code != 2 || !strings.Contains(errOut, "no landed package") {
+		t.Fatalf("nothing landed: exit %d %s", code, errOut)
+	}
+}

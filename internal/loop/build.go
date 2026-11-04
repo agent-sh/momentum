@@ -119,9 +119,16 @@ const repoAction = "build repository"
 var repoName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 func (r *Runner) caseRepo(ctx context.Context, c store.Case) (string, error) {
+	repo, _, err := r.caseTarget(ctx, c)
+	return repo, err
+}
+
+// caseTarget is where the investigation of the case's episode put its fix: a repository's name, or a configuration
+// file's home-relative path.
+func (r *Runner) caseTarget(ctx context.Context, c store.Case) (string, string, error) {
 	entries, err := r.Store.CaseLog(ctx, c.ID)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	for i := len(entries) - 1; i >= 0; i-- {
 		if entries[i].Action != repoAction {
@@ -129,36 +136,45 @@ func (r *Runner) caseRepo(ctx context.Context, c store.Case) (string, error) {
 		}
 		var record struct {
 			Repo    string `json:"repo"`
+			Config  string `json:"config"`
 			Episode int64  `json:"episode"`
 		}
 		if err := json.Unmarshal([]byte(entries[i].Detail), &record); err != nil {
-			return "", err
+			return "", "", err
 		}
 		if record.Episode != c.Episode {
-			return "", nil
+			return "", "", nil
 		}
 		if record.Repo != "" && !repoName.MatchString(record.Repo) {
-			return "", errors.New("invalid investigation repository name")
+			return "", "", errors.New("invalid investigation repository name")
 		}
-		return record.Repo, nil
+		if record.Config != "" {
+			if _, err := configTargetName(record.Config); err != nil || record.Repo != "" {
+				return "", "", errors.New("invalid investigation configuration path")
+			}
+		}
+		return record.Repo, record.Config, nil
 	}
-	return "", nil
+	return "", "", nil
 }
 
 // waitingRepoNote is the report's note of a case in testing whose investigation named no repository.
 func waitingRepoNote(c store.Case, at time.Time) store.Note {
 	return store.Note{ID: repoNoteID(c.ID), Kind: store.NoteProblem, Importance: store.ImportanceLow,
 		Title:  "The loop's case " + c.ID + " waits for a repository",
-		Detail: "The investigation named no code repository. The case stays in testing without a build run.", At: at}
+		Detail: "The investigation named no code repository or configuration file. The case stays in testing without a build run.", At: at}
 }
 
 func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopRun) (Package, error) {
 	if r.Ship == nil {
 		return Package{}, errors.New("build needs the host ship tool")
 	}
-	name, err := r.caseRepo(ctx, c)
+	name, target, err := r.caseTarget(ctx, c)
 	if err != nil {
 		return Package{}, err
+	}
+	if target != "" {
+		return r.buildConfigPackage(ctx, c, run, target)
 	}
 	var source, snapshot string
 	for _, repo := range r.pass.manifest.Repositories {
@@ -220,19 +236,91 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 			return p, err
 		}
 	}
-	if err = os.MkdirAll(run.Dir, 0700); err != nil {
+	return r.mountBuild(ctx, c, run, p)
+}
+
+// buildConfigPackage readies a configuration package's run clone: prepared from the target as the host reads it now,
+// which must be the text the run's /ro/config copy holds, and checked again before the clone is mounted.
+func (r *Runner) buildConfigPackage(ctx context.Context, c store.Case, run store.LoopRun, target string) (Package, error) {
+	name, err := configTargetName(target)
+	if err != nil {
+		return Package{}, err
+	}
+	copied := ""
+	if r.pass != nil {
+		for _, f := range r.pass.manifest.Configuration.Files {
+			if f.Path == name {
+				copied = f.SHA256
+			}
+		}
+	}
+	if copied == "" {
+		return Package{}, &shipHold{err: refused("the run's configuration copy left out %s: the run could not read the file it would change", name)}
+	}
+	p, had, err := r.Ship.Load(c.ID)
+	if err != nil {
+		return p, err
+	}
+	if !had || p.State == RolledBack || p.State == Kept || p.State == Withdrawn {
+		if p, err = r.Ship.PrepareConfig(ctx, c.ID, name, copied); err != nil {
+			return p, err
+		}
+	}
+	unlock, err := r.Ship.lock(ctx, c.ID)
+	if err != nil {
+		return p, err
+	}
+	defer unlock()
+	p, had, err = r.Ship.Load(c.ID)
+	if err != nil {
+		return p, err
+	}
+	if !had || p.Kind != KindConfig || (p.State != Prepared && p.State != Checked && p.State != Revising) {
+		return p, refused("the package is not ready for a build")
+	}
+	if name != p.Target || p.TargetBase == nil {
+		return p, refused("the case's configuration target changed after preparation")
+	}
+	d, err := r.Ship.configTarget(p.Target, false)
+	if err != nil {
+		return p, err
+	}
+	cur, err := d.state()
+	d.Close()
+	switch {
+	case err != nil:
+		return p, &shipHold{err: err}
+	case cur.SHA256 != p.TargetBase.SHA256 || copied != cur.SHA256:
+		return p, &shipHold{err: refused("%s changed since the package was prepared: the loop does not build over it, and the change waits for the owner", p.Target)}
+	}
+	if err = r.Ship.freshRunClone(shipContext(ctx, p.Case), &p); err != nil {
+		return p, err
+	}
+	if err = checkCloneObjects(ctx, p.Work); err != nil {
+		removeInputTree(p.Work)
+		if errors.Is(err, errNeedsScrubbing) {
+			return p, &shipHold{err: refused("the configuration file %s holds text the scrubber would mask", p.Target)}
+		}
+		return p, err
+	}
+	return r.mountBuild(ctx, c, run, p)
+}
+
+// mountBuild moves a scanned run clone into the run's storage, where it is mounted at /work.
+func (r *Runner) mountBuild(ctx context.Context, c store.Case, run store.LoopRun, p Package) (Package, error) {
+	if err := os.MkdirAll(run.Dir, 0700); err != nil {
 		return p, err
 	}
 	work := filepath.Join(run.Dir, "work")
 	// run.Dir is newly generated host storage and has not been mounted.
-	if err = os.Rename(p.Work, work); err != nil {
+	if err := os.Rename(p.Work, work); err != nil {
 		return p, err
 	}
 	p.Work, p.Check, p.State = work, nil, Prepared
-	if err = r.Ship.saveAuthorized(ctx, &p); err != nil {
+	if err := r.Ship.saveAuthorized(ctx, &p); err != nil {
 		return p, err
 	}
-	_, _, err = r.Store.DoneNote(ctx, "loop-repo:"+store.IDPart(c.ID), r.now())
+	_, _, err := r.Store.DoneNote(ctx, "loop-repo:"+store.IDPart(c.ID), r.now())
 	if errors.Is(err, store.ErrNoNote) {
 		err = nil
 	}
@@ -285,12 +373,14 @@ func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Re
 	if report.Lesson == "" && lessonGiven(res.Report) {
 		r.logf("build %s: its lesson is over 300 characters, so the proposal has none", c.ID)
 	}
-	if err := r.Ship.installedReadable(report.Installed); err != nil {
-		return stageFailure(res, "build report", err)
-	}
 	p, ok, err := r.Ship.Load(c.ID)
 	if err != nil || !ok {
 		return stageFailure(res, "build package", firstError(err, "package is absent"))
+	}
+	if p.Kind == KindConfig && report.Installed != "" {
+		return stageFailure(res, "build report", refused("a configuration change is in effect in its target: it names no installed file"))
+	} else if err := r.Ship.installedReadable(report.Installed); err != nil {
+		return stageFailure(res, "build report", err)
 	}
 	// Reject stale or merged case reports before any host side effect.
 	current, err := r.Store.CaseByID(ctx, c.ID)

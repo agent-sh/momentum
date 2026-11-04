@@ -25,8 +25,8 @@ import (
 // and imported as a patch into the host clone, checked by a test that fails without the change and passes with
 // it, proposed as a pull request with a rollback and a measurement plan, reviewed in a clean context, revised for
 // what a review finds (three rounds at most), and landed only when the loop is live and the last review found
-// nothing high or medium. Every step checks the authority again (Gate). A configuration directory is no target:
-// the loop changes only repositories, through pull requests.
+// nothing high or medium. Every step checks the authority again (Gate). A repository changes through a pull request;
+// one configuration file (loop.config_targets, off by default) is changed in place by the host, journaled first.
 type Ship struct {
 	SourceLive     func(string) bool // nil means every recorded source is live
 	InstalledRoots []string          // admitted host read directories for a build report's installed file
@@ -50,6 +50,10 @@ type Ship struct {
 	BeforeCommit func()
 	// AfterPatchRead is a test hook after the one confined read.
 	AfterPatchRead func()
+	// ConfigTargets is the loop's authority over configuration files (loop.config_targets): off by default.
+	ConfigTargets ConfigTargets
+	// ConfigStage is a test hook between a configuration write's steps (configStage).
+	ConfigStage func(stage string) error
 }
 
 // Package states.
@@ -77,7 +81,7 @@ const MaxClosedProposals = 2
 // Package is a case's change: where it goes, what checks it, how it is measured and undone, and where it stands.
 type Package struct {
 	Case            string           `json:"case"`
-	Kind            string           `json:"kind"` // repo
+	Kind            string           `json:"kind"` // repo or config
 	Repo            string           `json:"repo,omitempty"`
 	Base            string           `json:"base,omitempty"`
 	Branch          string           `json:"branch,omitempty"`
@@ -133,6 +137,11 @@ type Package struct {
 	OutOfEffect      time.Time        `json:"out_of_effect,omitzero"`  // first run that found the measuring change absent
 	RollbackFailures int              `json:"rollback_failures,omitempty"`
 	RollbackProblem  string           `json:"rollback_problem,omitempty"` // cleaned cause of the last failed rollback
+	// A configuration package's target: its home-relative path, what it held at preparation (no content) and the
+	// hash of what landed.
+	Target       string       `json:"target,omitempty"`
+	TargetBase   *ConfigState `json:"target_base,omitempty"`
+	TargetLanded string       `json:"target_landed,omitempty"`
 }
 
 // RollbackJournal keeps the exact revert candidate before any remote write. A retry checks this head on the
@@ -387,7 +396,7 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	if err != nil {
 		return Package{}, err
 	}
-	p := Package{Case: c.ID, Kind: "repo", Repo: t.Repo, Base: t.Base, BaseCommit: strings.TrimSpace(base), Dir: t.Dir, Branch: branch,
+	p := Package{Case: c.ID, Kind: KindRepo, Repo: t.Repo, Base: t.Base, BaseCommit: strings.TrimSpace(base), Dir: t.Dir, Branch: branch,
 		Work: work, Host: host, State: Prepared, Created: s.now()}
 	if had && old.State == Withdrawn {
 		p.ClosedProposals = old.ClosedProposals // a closed hand landing proposal counts toward the case's two
@@ -571,7 +580,7 @@ func (s *Ship) check(ctx context.Context, caseID string, test testCommand, testF
 	if p.Host == "" || p.BaseCommit == "" {
 		return p, refused("legacy package has no host clone and patch base; prepare a fresh package")
 	}
-	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
+	if err := s.packageAuthority(ctx, p); err != nil {
 		return p, err
 	}
 	words, err := test.words()
@@ -588,16 +597,18 @@ func (s *Ship) check(ctx context.Context, caseID string, test testCommand, testF
 	if len(paths) == 0 {
 		return p, refused("the patch is empty: produce a cumulative diff against %s", p.BaseCommit)
 	}
-	hand, err := PathScope(Target{Repo: p.Repo}, paths)
-	if err != nil {
-		return p, err
-	}
-	if err := handStays(p, hand); err != nil {
-		return p, err
+	var hand []string
+	if p.Kind != KindConfig {
+		if hand, err = PathScope(Target{Repo: p.Repo}, paths); err != nil {
+			return p, err
+		}
+		if err := handStays(p, hand); err != nil {
+			return p, err
+		}
 	}
 	if len(testFiles) == 0 {
 		for _, c := range paths {
-			if testFileRe.MatchString(c) {
+			if p.Kind == KindConfig && strings.HasPrefix(c, "tests/") || p.Kind != KindConfig && testFileRe.MatchString(c) {
 				testFiles = append(testFiles, c)
 			}
 		}
@@ -608,6 +619,11 @@ func (s *Ship) check(ctx context.Context, caseID string, test testCommand, testF
 	for _, f := range testFiles {
 		if !slices.Contains(paths, f) {
 			return p, refused("%s is not a file the change touches", f)
+		}
+	}
+	if p.Kind == KindConfig {
+		if err := s.checkConfigChange(ctx, p, tree, paths, testFiles); err != nil {
+			return p, err
 		}
 	}
 	before, err := s.export(ctx, p, "before", p.BaseCommit)
@@ -748,11 +764,17 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 		return p, err
 	}
 	parent = strings.TrimSpace(parent)
-	hand, err := PathScope(Target{Repo: p.Repo}, paths)
-	if err != nil {
+	var hand []string
+	if p.Kind == KindConfig {
+		if err := s.checkConfigChange(ctx, p, tree, paths, p.Check.TestFiles); err != nil {
+			return p, err
+		}
+		if pr.Installed != "" {
+			return p, refused("a configuration change is in effect in its target: it names no installed file")
+		}
+	} else if hand, err = PathScope(Target{Repo: p.Repo}, paths); err != nil {
 		return p, err
-	}
-	if err := handStays(p, hand); err != nil {
+	} else if err := handStays(p, hand); err != nil {
 		return p, err
 	}
 	p.Hand = hand
@@ -788,9 +810,11 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 	if err != nil {
 		return p, err
 	}
-	private, err := s.repositoryPrivate(ctx, p)
-	if err != nil {
-		return p, err
+	private := true // a configuration change never leaves the machine
+	if p.Kind != KindConfig {
+		if private, err = s.repositoryPrivate(ctx, p); err != nil {
+			return p, err
+		}
 	}
 	commitTitle, commitBody := title, body
 	if !private {
@@ -845,6 +869,21 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 	}
 	if err := s.saveAuthorized(ctx, &p); err != nil {
 		return p, err
+	}
+	if p.Kind == KindConfig {
+		// nothing leaves the machine: the proposal is the host commit, reviewed and landed by the host
+		if err := s.packageAuthority(ctx, p); err != nil {
+			return p, err
+		}
+		p.State = Proposed
+		if err := s.saveAuthorized(ctx, &p); err != nil {
+			return p, err
+		}
+		note, err := Redact(ctx, fmt.Sprintf("configuration %s %s; measured in %s: %d of %d in the baseline; gate %d of %d", p.Target, title, plan.Units, plan.Before, plan.BeforeBase, plan.Gate, plan.GateBase))
+		if err != nil {
+			return p, err
+		}
+		return p, s.Store.CaseNote(cleanedNote(ctx), caseID, "proposed", note, s.Actor)
 	}
 	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
 		return p, err
@@ -1144,6 +1183,9 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	}
 	defer unlock()
 	p, ok, err := s.Load(caseID)
+	if err == nil && ok && p.Kind == KindConfig {
+		return s.landConfig(ctx, p)
+	}
 	if err == nil && ok && p.State == Landing && len(p.Hand) == 0 {
 		if err := CheckPaths(Target{Repo: p.Repo}, p.Changed); err != nil {
 			return p, err
@@ -1362,8 +1404,7 @@ func (s *Ship) finishLanding(ctx context.Context, p Package) (Package, error) {
 	if err := s.deploymentReceipt(ctx, p); err != nil {
 		return p, err
 	}
-	what := fmt.Sprintf("%s: %s", p.PR, p.Title)
-	if _, err := s.Store.DeployCase(ctx, p.Case, s.pkgDir(p.Case), p.LandedAt, what, s.Actor); err != nil {
+	if _, err := s.Store.DeployCase(ctx, p.Case, s.pkgDir(p.Case), p.LandedAt, deployWhat(p), s.Actor); err != nil {
 		return p, err
 	}
 	return s.cleanupBranch(ctx, p)
@@ -1408,19 +1449,29 @@ func (s *Ship) retryCleanup(ctx context.Context, caseID string) (Package, error)
 	return s.cleanupBranch(ctx, p)
 }
 
-// RollBack undoes a landed change: a revert of its commits, by the user's identity, pushed to the default branch
-// as a fast-forward; the case goes back to testing.
+// RollBack is the owner's rollback of a landed change: a repository's by a revert of its commits, by the user's
+// identity, pushed to the default branch as a fast-forward; a configuration file's from its journal. The case goes
+// back to testing.
 func (s *Ship) RollBack(ctx context.Context, caseID, why string) (pkg Package, stepErr error) {
+	return s.rollBack(ctx, caseID, why, true)
+}
+
+// rollBack is a rollback by the owner (ship rollback, case rollback) or by the loop (a resumed one).
+func (s *Ship) rollBack(ctx context.Context, caseID, why string, owner bool) (pkg Package, stepErr error) {
 	unlock, err := s.lock(ctx, caseID)
 	if err != nil {
 		return Package{}, err
 	}
 	defer unlock()
-	return s.rollBackLocked(ctx, caseID, why)
+	return s.rollBackWith(ctx, caseID, why, owner)
 }
 
-// rollBackLocked reloads the package under the caller's case lock.
+// rollBackLocked is the measure step's rollback; it reloads the package under the caller's case lock.
 func (s *Ship) rollBackLocked(ctx context.Context, caseID, why string) (pkg Package, stepErr error) {
+	return s.rollBackWith(ctx, caseID, why, false)
+}
+
+func (s *Ship) rollBackWith(ctx context.Context, caseID, why string, owner bool) (pkg Package, stepErr error) {
 	ctx = s.gitContext(shipContext(ctx, caseID))
 	cleanWhy, cleanErr := Redact(ctx, why)
 	if cleanErr != nil {
@@ -1431,6 +1482,9 @@ func (s *Ship) rollBackLocked(ctx context.Context, caseID, why string) (pkg Pack
 	if err != nil {
 		return Package{}, err
 	}
+	if ok && owner && p.Kind == KindConfig && (p.State == Landing || p.State == RollingBack && s.landingRollback(p)) {
+		return s.abandonConfigLanding(ctx, p, why)
+	}
 	if !ok || (p.State != Landed && p.State != RollingBack && p.State != RolledBack) {
 		return p, refused("case %s has no landed package to roll back", caseID)
 	}
@@ -1439,6 +1493,9 @@ func (s *Ship) rollBackLocked(ctx context.Context, caseID, why string) (pkg Pack
 	}
 	if p.State == RolledBack {
 		return p, s.rollbackReceipt(ctx, p, why)
+	}
+	if p.Kind == KindConfig {
+		return s.rollBackConfig(ctx, p, why, owner)
 	}
 	if p.State == RollingBack && !s.Live {
 		return p, refused("resuming rollback needs loop.live")
@@ -1540,9 +1597,13 @@ func (s *Ship) rollbackReceipt(ctx context.Context, p Package, why string) error
 	if p.Undo != nil {
 		why = p.Undo.Why
 	}
+	keep := "revert the revert on the default branch"
+	if p.Kind == KindConfig {
+		keep = "put the change back in " + p.Target + " (it is the package's change.patch)"
+	}
 	if err := s.runner().noteOnce(ctx, store.Note{ID: noteID("rolled-back", p), Kind: store.NoteDecided,
 		Title: plainClip("momentum rolled back its change for: "+c.Title, store.TitleMax),
-		Detail: why + ". To keep the change after all: revert the revert on the default branch, then momentum case close " + c.ID +
+		Detail: why + ". To keep the change after all: " + keep + ", then momentum case close " + c.ID +
 			" --reason already-solved --why ..., or the loop builds another change for the problem.", Links: prLinks(p.PR)}); err != nil {
 		return err
 	}
@@ -1941,4 +2002,19 @@ func (s *Ship) push(ctx context.Context, p Package, dir string, args ...string) 
 // shellQuote keeps a configured executable path one word in Git's credential helper.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+// packageAuthority checks again what a package rests on: its repository's gate, or its configuration target (with
+// configuration targets on, allow naming it and every refusal passed).
+func (s *Ship) packageAuthority(ctx context.Context, p Package) error {
+	if p.Kind == KindConfig {
+		d, err := s.configTarget(p.Target, false)
+		if err != nil {
+			return err
+		}
+		d.Close()
+		return nil
+	}
+	_, err := s.Gate.Repository(ctx, p.Dir)
+	return err
 }

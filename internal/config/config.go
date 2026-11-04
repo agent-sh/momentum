@@ -86,6 +86,52 @@ type Loop struct {
 	Constraints []string `json:"constraints"`
 	// CapacityGate is a command that waits until the machine has room for a check's test and exits 0, or fails.
 	CapacityGate []string `json:"capacity_gate"`
+	// ConfigTargets is the loop's authority to change configuration files in place: off unless Enabled, and then
+	// only the existing files Allow names exactly (home-relative or under ~/); an empty Allow admits none. Landing
+	// also needs Live.
+	ConfigTargets ConfigTargets `json:"config_targets"`
+}
+
+// ConfigTargets is loop.config_targets.
+type ConfigTargets struct {
+	Enabled bool     `json:"enabled"`
+	Allow   []string `json:"allow"`
+}
+
+// Own are the loop's own files as configured: its rules files, the programs of its scope check, capacity gate and
+// runner with every file they name as an argument, its relay environment and tacit store. No configuration target is
+// one of them.
+func (l Loop) Own() []string {
+	own := append([]string(nil), l.Rules...)
+	for _, cmd := range [][]string{l.RepoGuard, l.CapacityGate, l.Runner} {
+		for i, arg := range cmd {
+			// the program, and every argument that names a file (a script it runs, a configuration it reads)
+			if i == 0 && arg != "" || filepath.IsAbs(arg) || strings.HasPrefix(arg, "~/") {
+				own = append(own, arg)
+			}
+		}
+	}
+	for _, p := range []string{l.BedrockEnv, l.TacitStore} {
+		if p != "" {
+			own = append(own, p)
+		}
+	}
+	return own
+}
+
+// checkAllow refuses an allow entry that is not one exact file: a clean path under the home, relative or under ~/,
+// with no pattern and no trailing slash.
+func checkAllow(allow []string) error {
+	for _, entry := range allow {
+		n := strings.TrimSpace(entry)
+		if rest, ok := strings.CutPrefix(n, "~/"); ok {
+			n = rest
+		}
+		if n == "" || strings.ContainsAny(n, "\\\x00\r\n*?[") || filepath.IsAbs(n) || !filepath.IsLocal(n) || filepath.Clean(n) != n {
+			return fmt.Errorf("loop.config_targets.allow entry %q is not one file under the home (an exact path, no pattern or directory)", entry)
+		}
+	}
+	return nil
 }
 
 // ErrNoSources means no sources file exists yet.
@@ -119,6 +165,9 @@ func Load() (Sources, error) {
 		var l Loop
 		if err := d.Decode(&l); err != nil {
 			return s, fmt.Errorf("%s: loop: %w", SourcesPath(), err)
+		}
+		if err := checkAllow(l.ConfigTargets.Allow); err != nil {
+			return s, fmt.Errorf("%s: %w", SourcesPath(), err)
 		}
 	}
 	s.Mistakes.Path = paths.Expand(s.Mistakes.Path)

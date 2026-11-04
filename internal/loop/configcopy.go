@@ -71,9 +71,10 @@ type ConfigCopyOptions struct {
 }
 
 type ConfigFile struct {
-	Path  string `json:"path"`
-	Bytes int    `json:"bytes"`
-	Root  string `json:"root"`
+	Path   string `json:"path"`
+	Bytes  int    `json:"bytes"`
+	Root   string `json:"root"`
+	SHA256 string `json:"sha256,omitempty"` // of the text the run reads
 }
 
 type ConfigSkip struct {
@@ -249,7 +250,7 @@ func ConfigCopy(ctx context.Context, o ConfigCopyOptions) (m ConfigManifest, err
 			}
 			break
 		}
-		m.Files = append(m.Files, ConfigFile{candidate.path, size, candidate.root})
+		m.Files = append(m.Files, ConfigFile{candidate.path, size, candidate.root, hashOf([]byte(clean[i]))})
 		m.CountsByRoot[candidate.root]++
 		dataBytes += size
 		keep++

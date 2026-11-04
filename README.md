@@ -228,6 +228,12 @@ Host `evidence show` scrubs all headers and whole records in one batch, then cli
 
 `loop.owners`, `loop.exclude`, `loop.repo_guard`, `loop.sandbox_read`, `loop.capacity_gate` and `loop.live` control host builds and landing. A missing repository guard refuses writes. Run the pass from its own oneshot user unit after ingest.
 
+`loop.config_targets` lets the loop change the content of a configuration file in place. It is off by default and admits only the existing files `allow` names exactly; an empty list admits none. Landing also needs `loop.live`. The loop's own rules, policy and configuration, credential files, `bin` directories, databases, programs and links are refused in code, whatever the list says:
+
+```json
+{"loop": {"config_targets": {"enabled": true, "allow": ["~/.config/agents/procedures/example.md"]}}}
+```
+
 ## The ship tool
 
 The owner's CLI controls the same host package lifecycle:
@@ -239,6 +245,7 @@ momentum ship propose --case ID --title TITLE --body-file FILE --rollback TEXT -
 momentum ship status --case ID [--json]
 momentum ship land --case ID
 momentum ship rollback --case ID --why TEXT
+momentum case rollback ID --why TEXT
 momentum loop lesson --case ID --text TEXT
 ```
 

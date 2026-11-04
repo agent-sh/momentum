@@ -294,6 +294,10 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		m.Status, m.Why = "rolled back", "its change was rolled back already; the case goes back to testing"
 		if p.State == RollingBack {
 			m.Why = "its rollback was begun already; it is finished before anything is measured"
+			if hold := r.Ship.mayApply(p); hold != "" {
+				m.Status, m.Why = "held", "its rollback was begun already and waits: "+hold
+				return m
+			}
 		}
 		if !dry {
 			if _, err := r.Ship.rollBackLocked(ctx, c.ID, "its change was rolled back"); err != nil {
@@ -455,13 +459,17 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 	if dry {
 		return m
 	}
-	if !r.Ship.Live || len(p.Hand) > 0 {
+	if hold := r.Ship.mayApply(p); !r.Ship.Live || len(p.Hand) > 0 || hold != "" {
 		m.Status, m.Why = "held", why+"; the loop is not live, so it rolls nothing back"
 		detail := why + ". The loop is not live, so it rolls nothing back. To roll it back: momentum ship rollback " + c.ID + " --why ..."
 		if len(p.Hand) > 0 {
 			// a change landed by hand is undone by hand: the loop never pushes to paths it may not land
 			m.Why = why + "; it was landed by hand, so the loop rolls nothing back"
 			detail = why + ". It was landed by hand, so the loop rolls nothing back. To roll it back, revert it through a pull request; the case keeps measuring with its rollback held."
+		}
+		if hold != "" {
+			m.Why = why + "; " + hold + ", so it rolls nothing back"
+			detail = why + "; " + hold + ", so it rolls nothing back. To roll it back: momentum case rollback " + c.ID + " --why ..."
 		}
 		if !p.Held {
 			// the note before the flag that says it was written, under an id of its own, so it is written once

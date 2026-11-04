@@ -40,7 +40,7 @@ func (s *Ship) archive(p Package) error {
 			return err
 		}
 	}
-	for _, name := range []string{"check.json", "test-command.json", "change.patch"} {
+	for _, name := range []string{"check.json", "test-command.json", "change.patch", configJournal, configRollback} {
 		if err := os.Rename(filepath.Join(dir, name), filepath.Join(past, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
@@ -92,9 +92,14 @@ func (s *Ship) deploymentReceipt(ctx context.Context, p Package) error {
 			Detail: "Landed by hand from its proposal." + window + " The loop rolls nothing back that it did not land: to undo it, revert it through a pull request.",
 			Links:  prLinks(p.PR)})
 	}
+	detail := "Reviewed clean and landed." + window + " To undo it: momentum ship rollback " + c.ID + " --why ..."
+	if p.Kind == KindConfig {
+		detail = "Reviewed clean and written to " + p.Target + ", its previous content journaled." + window +
+			" To undo it: momentum case rollback " + c.ID + " --why ... (it holds a file changed since)"
+	}
 	return s.runner().noteOnce(ctx, store.Note{ID: noteID("landed", p), Kind: store.NoteDecided,
 		Title:  plainClip("momentum landed a change for: "+c.Title, store.TitleMax),
-		Detail: "Reviewed clean and landed." + window + " To undo it: momentum ship rollback " + c.ID + " --why ...",
+		Detail: detail,
 		Links:  prLinks(p.PR)})
 }
 
@@ -427,6 +432,14 @@ func (s *Ship) InEffect(ctx context.Context, p *Package) (time.Time, string, err
 		return time.Time{}, "", fmt.Errorf("case %s's package holds no landed commit", p.Case)
 	case p.Plan == nil:
 		return time.Time{}, "", fmt.Errorf("case %s's package has no plan", p.Case)
+	}
+	if p.Kind == KindConfig {
+		// the installed file is the target itself: in effect while it holds what landed
+		why, err := s.configInEffect(p)
+		if err != nil || why != "" {
+			return time.Time{}, why, err
+		}
+		return s.now(), "", nil
 	}
 	var installedAt time.Time
 	var installedHash string

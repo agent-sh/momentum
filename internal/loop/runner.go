@@ -377,8 +377,12 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 				}
 			}
 			if ok && (p.State == RolledBack || p.State == RollingBack) {
+				if hold := r.Ship.mayApply(p); hold != "" && p.State == RollingBack {
+					passed = append(passed, c.ID+"'s rollback waits: "+hold)
+					continue
+				}
 				if !dry {
-					if _, err := r.Ship.RollBack(ctx, c.ID, "resume rollback"); err != nil {
+					if _, err := r.Ship.rollBack(ctx, c.ID, "resume rollback", false); err != nil {
 						passed = append(passed, c.ID+" rollback: "+err.Error())
 						r.pickSkipped(c, "rollback", err)
 						continue
@@ -464,7 +468,7 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 						r.pickSkipped(c, "deploy", err)
 						continue
 					}
-					if _, err := r.Store.DeployCase(ctx, c.ID, r.Ship.pkgDir(c.ID), p.LandedAt, p.PR+": "+p.Title, "loop"); err != nil {
+					if _, err := r.Store.DeployCase(ctx, c.ID, r.Ship.pkgDir(c.ID), p.LandedAt, deployWhat(p), "loop"); err != nil {
 						passed = append(passed, c.ID+" deployment: "+err.Error())
 						r.pickSkipped(c, "deploy", err)
 						continue
@@ -480,6 +484,9 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 				passed = append(passed, c.ID+" used its review rounds")
 				r.liftHold(ctx, c, dry)
 				continue
+			} else if ok && p.State == RollingBack {
+				passed = append(passed, c.ID+"'s interrupted landing is rolling back: it waits for momentum case rollback "+c.ID)
+				continue
 			} else if ok && (p.State == Proposed || p.State == Landing) {
 				r.liftHold(ctx, c, dry)
 				continue // its review or its landing comes next (reviews)
@@ -490,15 +497,21 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 					continue
 				}
 			}
-			if repo, err := r.caseRepo(ctx, c); err != nil {
+			if repo, target, err := r.caseTarget(ctx, c); err != nil {
 				return store.Case{}, "", "", err
-			} else if repo == "" {
+			} else if target != "" && !r.Ship.ConfigTargets.Enabled {
+				if !dry {
+					r.keepHold(ctx, c, "configuration targets are off (loop.config_targets.enabled): report only", false)
+				}
+				passed = append(passed, c.ID+" names a configuration file, and configuration targets are off")
+				continue
+			} else if repo == "" && target == "" {
 				if !dry {
 					r.keepHold(ctx, c, "waits for a repository: the investigation named none", true)
 				}
 				passed = append(passed, c.ID+" waits for a repository")
 				continue
-			} else if why, known := r.heldBuild(ctx, repo); why != "" {
+			} else if why, known := r.heldTarget(ctx, repo, target); why != "" {
 				// a hold of the configuration takes no slot: the family's next workable case runs instead
 				if known && !dry {
 					r.keepHold(ctx, c, why, false)
@@ -833,6 +846,9 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 func (r *Runner) keepFindings(ctx context.Context, run store.LoopRun, f finding, reported bool, undecided string) error {
 	if reported && f.Repo != "" && !repoName.MatchString(f.Repo) {
 		return fmt.Errorf("invalid investigation repository name")
+	}
+	if r.Ship == nil || !r.Ship.ConfigTargets.Enabled {
+		f.Config = "" // configuration targets are off: a report's config names nothing, and its repo stands
 	}
 	own, recorded, err := recordFindings(ctx, r.Store, run.Case, run.CaseEpisode, f, reported, undecided, "loop:"+run.ID)
 

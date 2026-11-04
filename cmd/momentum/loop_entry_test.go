@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/config"
 	"github.com/agent-sh/momentum/internal/loop"
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/store"
@@ -538,5 +539,17 @@ func TestFirstTextIsAPlainLine(t *testing.T) {
 	got := firstText("\x1b[2J\x1b]0;forged title\x07a plain summary\nsecond line")
 	if strings.ContainsAny(got, "\x1b\x07\n") || !strings.Contains(got, "a plain summary") {
 		t.Fatalf("control characters reached the terminal: %q", got)
+	}
+}
+
+// A dry pass reads the configuration targets' switch, list and loop.live as a live one does.
+func TestADryPassReadsTheConfigurationTargets(t *testing.T) {
+	c := config.Loop{Live: true, ConfigTargets: config.ConfigTargets{Enabled: true, Allow: []string{".config/agents/RULES.md"}}}
+	r := selectionRunner(nil, c)
+	if !r.Ship.Live || !r.Ship.ConfigTargets.Enabled || len(r.Ship.ConfigTargets.Allow) != 1 || r.Ship.ConfigTargets.Home == "" {
+		t.Fatalf("dry ship: %+v", r.Ship.ConfigTargets)
+	}
+	if r = selectionRunner(nil, config.Loop{}); r.Ship.ConfigTargets.Enabled || r.Ship.Live {
+		t.Fatalf("off: %+v", r.Ship.ConfigTargets)
 	}
 }
