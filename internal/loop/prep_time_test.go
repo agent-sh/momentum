@@ -33,7 +33,7 @@ if test "$3" = --separate; then
 	for id in "$@"; do printf "$sep"; show "$id"; sep='\036'; done
 	exit 0
 fi
-show "$5"`)
+show "$6"`)
 	o.Neighbours = -1
 	for _, e := range events {
 		o.IDs = append(o.IDs, e.ID())

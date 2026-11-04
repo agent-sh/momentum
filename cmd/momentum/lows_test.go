@@ -40,6 +40,7 @@ func TestASecondEvaluationFailsOnTheLockFromAnotherHome(t *testing.T) {
 	was := loop.EvalUnitPrefix
 	loop.EvalUnitPrefix = fmt.Sprintf("momentum-run-evalclitest%d-", os.Getpid())
 	defer func() { loop.EvalUnitPrefix = was }()
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir()) // no lock file is left in the real runtime directory
 	t.Setenv("MOMENTUM_HOME", t.TempDir())
 	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
 	unlock, err := loop.LockEval() // an evaluation running under the first home

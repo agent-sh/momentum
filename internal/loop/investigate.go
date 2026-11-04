@@ -284,7 +284,7 @@ func undecided(res Result, err error) string {
 	return why
 }
 
-// holdsText says whether a finding's field names anything: it holds a letter, digit, symbol or punctuation that is
+// holdsText says whether a finding's field names anything: it holds a letter, number, symbol or punctuation that is
 // not a blank filler. Spaces, joiners and other format characters, the Hangul fillers and the blank braille pattern
 // alone render as nothing.
 func holdsText(s string) bool {
@@ -293,7 +293,7 @@ func holdsText(s string) bool {
 		case '\u115f', '\u1160', '\u3164', '\uffa0', '\u2800':
 			continue
 		}
-		if unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.IsSymbol(r) || unicode.IsPunct(r) {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) || unicode.IsSymbol(r) || unicode.IsPunct(r) {
 			return true
 		}
 	}

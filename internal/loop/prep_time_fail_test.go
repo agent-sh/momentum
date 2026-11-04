@@ -113,7 +113,7 @@ func TestRecordsSharedChildThatCannotBeSplit(t *testing.T) {
 	`+tc.shared+`
 	exit 0
 fi
-printf 'record %s\n' "$5"`)
+printf 'record %s\n' "$6"`)
 			o.Neighbours = -1
 			for _, e := range events {
 				o.IDs = append(o.IDs, e.ID())

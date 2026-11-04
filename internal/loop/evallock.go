@@ -2,6 +2,7 @@ package loop
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,12 +10,16 @@ import (
 )
 
 // LockEval takes the lock of the evaluations whose units begin with EvalUnitPrefix. It lives where that unit
-// namespace does, the user's service manager: $XDG_RUNTIME_DIR, else the user's cache directory, never one data home,
-// since an evaluation's sweep of leftovers stops every unit of its prefix whatever home started it. A test process
-// has a prefix of its own, so it neither holds nor waits on a live evaluation's lock. A second evaluation fails at once.
+// namespace does, the user's service manager: $XDG_RUNTIME_DIR, else /run/user/UID, else the user's cache directory.
+// It is never one data home, since an evaluation's sweep of leftovers stops every unit of its prefix whatever home
+// started it. A test process has a prefix of its own, so it neither holds nor waits on a live evaluation's lock. A
+// second evaluation fails at once.
 func LockEval() (func(), error) {
 	dir := os.Getenv("XDG_RUNTIME_DIR")
 	if st, err := os.Stat(dir); dir == "" || err != nil || !st.IsDir() {
+		dir = fmt.Sprintf("/run/user/%d", os.Getuid()) // the user manager's own runtime directory
+	}
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
 		cache, err := os.UserCacheDir()
 		if err != nil {
 			return nil, err

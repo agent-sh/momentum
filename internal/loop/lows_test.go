@@ -46,7 +46,7 @@ func TestTheRecordIndexListsWithheldRecords(t *testing.T) {
 	at := time.Date(2025, 4, 10, 12, 0, 0, 0, time.UTC)
 	events := []store.Event{{Source: "fixture", SourceKey: "kept", TS: at, Kind: "record"},
 		{Source: "fixture", SourceKey: "held", TS: at.Add(time.Second), Kind: "record"}}
-	o := recordFixture(t, events, `case "$5" in "`+events[1].ID()+`") printf '(record withheld: fixture)\n';; *) printf 'record\n';; esac`)
+	o := recordFixture(t, events, `case "$6" in "`+events[1].ID()+`") printf '(record withheld: fixture)\n';; *) printf 'record\n';; esac`)
 	o.Neighbours = -1
 	o.IDs = []string{events[0].ID(), events[1].ID()}
 	m, err := Records(context.Background(), o)

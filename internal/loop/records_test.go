@@ -32,8 +32,8 @@ func TestInputsRecordsPriorityNeighboursIndexAndScrubbedChild(t *testing.T) {
 		store.Event{Source: "fixture", SourceKey: "other", Session: "same-child", TS: at, Kind: "record"},
 		store.Event{Source: "fixture", SourceKey: "outside", Session: "same", TS: at.Add(11 * time.Minute), Kind: "record"})
 	o := recordFixture(t, events, `test "${MOMENTUM_HOME+x}" = x && test "${MOMENTUM_NOW+x}" = x || exit 7
-test "$1" = evidence && test "$2" = show && test "$3" = --bytes && test "$4" = 16384 || exit 8
-printf 'record %s [masked]\n' "$5"`)
+test "$1" = evidence && test "$2" = show && test "$3" = --bytes && test "$4" = 16384 && test "$5" = -- || exit 8
+printf 'record %s [masked]\n' "$6"`)
 	o.AsOf = at.Add(time.Hour)
 	o.IDs = []string{events[7].ID(), events[0].ID(), events[7].ID(), "absent"}
 	m, err := Records(context.Background(), o)
@@ -140,7 +140,7 @@ func TestInputsRecordBoundsAndWithheld(t *testing.T) {
 	// a record; more is withheld, and the next record is still read.
 	for _, size := range []int{MaxRecordBytes, MaxRecordBytes + recordSlack, MaxRecordBytes + recordSlack + 1} {
 		t.Run(strconv.Itoa(size), func(t *testing.T) {
-			o := recordFixture(t, events[:2], `case "$5" in "`+events[0].ID()+`") head -c `+strconv.Itoa(size)+` /dev/zero | tr '\000' x;; *) printf 'next record\n';; esac`)
+			o := recordFixture(t, events[:2], `case "$6" in "`+events[0].ID()+`") head -c `+strconv.Itoa(size)+` /dev/zero | tr '\000' x;; *) printf 'next record\n';; esac`)
 			o.Neighbours = -1
 			o.IDs = []string{events[0].ID(), events[1].ID()}
 			m, err := Records(context.Background(), o)

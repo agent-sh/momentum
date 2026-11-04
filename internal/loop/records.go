@@ -67,9 +67,13 @@ type RecordsManifest struct {
 }
 
 // recordEventRE is the one rule for an event id in the records: selection admits it, and both kinds of index line
-// are read back by it.
-var recordEventRE = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
-var unitNameRE = regexp.MustCompile(`^[A-Za-z0-9@._-]+\.(service|timer)$`)
+// are read back by it. It starts with a letter or digit, so no id reads as a flag, and `unit`, the tag of the unit
+// lines, is no id (validRecordEvent).
+var recordEventRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
+
+func validRecordEvent(id string) bool { return id != "unit" && recordEventRE.MatchString(id) }
+
+var unitNameRE = regexp.MustCompile(`^[A-Za-z0-9@._][A-Za-z0-9@._-]*\.(service|timer)$`)
 var unitFinderRE = regexp.MustCompile(`[A-Za-z0-9@._-]+\.(?:service|timer)`)
 
 // FindUnits finds up to MaxUnits unique unit names in text order. It refuses matches
@@ -232,7 +236,7 @@ func recordSelection(ctx context.Context, db *sql.DB, o RecordsOptions) ([]Recor
 			continue
 		}
 		seen[id] = true
-		if !recordEventRE.MatchString(id) {
+		if !validRecordEvent(id) {
 			return nil, 0, fmt.Errorf("invalid evidence id")
 		}
 		var ts int64
@@ -281,7 +285,7 @@ func recordSelection(ctx context.Context, db *sql.DB, o RecordsOptions) ([]Recor
 					rows.Close()
 					return nil, 0, err
 				}
-				if !seen[id] && recordEventRE.MatchString(id) {
+				if !seen[id] && validRecordEvent(id) {
 					seen[id] = true
 					files = append(files, RecordFile{Name: "ev-" + id + ".txt", Event: id, At: time.UnixMilli(ts).UTC()})
 				}
@@ -298,9 +302,9 @@ func recordSelection(ctx context.Context, db *sql.DB, o RecordsOptions) ([]Recor
 
 func writeRecords(ctx context.Context, o RecordsOptions, files []RecordFile, m RecordsManifest, appendOnly bool) (RecordsManifest, error) {
 	seenUnits := map[string]bool{}
-	for _, file := range m.Files {
+	for _, file := range append(append([]RecordFile(nil), m.Files...), m.Held...) {
 		if file.Unit != "" {
-			seenUnits[file.Unit] = true
+			seenUnits[file.Unit] = true // written or withheld already: an append does not ask for it again
 		}
 	}
 	var names []string
@@ -503,7 +507,7 @@ func fetchRecords(ctx context.Context, o RecordsOptions, files []RecordFile, lim
 func fetchOne(ctx context.Context, o RecordsOptions, file RecordFile, limit int) fetched {
 	args := []string{"evidence", "unit", file.Unit, "--lines", strconv.Itoa(unitLogLines), "--bytes", strconv.Itoa(limit)}
 	if file.Event != "" {
-		args = []string{"evidence", "show", "--bytes", strconv.Itoa(limit), file.Event}
+		args = []string{"evidence", "show", "--bytes", strconv.Itoa(limit), "--", file.Event}
 	}
 	text, ok := recordChild(ctx, o, args, limit+recordSlack, limit)
 	if !ok || text == "" || recordWithheld(text) {
@@ -627,7 +631,7 @@ func readRecordIndex(dir string) (RecordsManifest, error) {
 				held = RecordFile{Event: fields[1]}
 				held.At, err = time.Parse(time.RFC3339Nano, fields[2])
 			}
-			if err != nil || held.Unit != "" && !unitNameRE.MatchString(held.Unit) || held.Event != "" && !recordEventRE.MatchString(held.Event) {
+			if err != nil || held.Unit != "" && !unitNameRE.MatchString(held.Unit) || held.Event != "" && !validRecordEvent(held.Event) {
 				return m, fmt.Errorf("invalid withheld index entry")
 			}
 			m.Held = append(m.Held, held)
@@ -647,7 +651,7 @@ func readRecordIndex(dir string) (RecordsManifest, error) {
 		} else {
 			file.Event = fields[1]
 			file.At, err = time.Parse(time.RFC3339Nano, fields[2])
-			if err != nil || !recordEventRE.MatchString(file.Event) || file.Name != "ev-"+file.Event+".txt" {
+			if err != nil || !validRecordEvent(file.Event) || file.Name != "ev-"+file.Event+".txt" {
 				return m, fmt.Errorf("invalid event index entry")
 			}
 		}
