@@ -323,7 +323,7 @@ func TestCaseListShowsAHeldCase(t *testing.T) {
 	if _, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "test"); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.CaseNote(ctx, c.ID, store.ActionHeld, "builds are off (loop.owners is empty): report only", "loop"); err != nil {
+	if err := st.CaseNote(ctx, c.ID, store.ActionHeld, store.HoldDetail("builds are off (loop.owners is empty): report only", c.Episode), "loop"); err != nil {
 		t.Fatal(err)
 	}
 	st.Close()
