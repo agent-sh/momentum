@@ -1125,3 +1125,36 @@ func TestTheShipsCaseLogLinesAreCleaned(t *testing.T) {
 		t.Fatalf("%d taken over lines", n)
 	}
 }
+
+// A lesson that breaks its form drops alone: a multi-line lesson is joined into one line, a longer one is dropped,
+// and the report, with its change, still stands. The schema tells the agent the form.
+func TestALessonOutOfFormDoesNotFailTheBuild(t *testing.T) {
+	report := func(lesson string) []byte {
+		raw, err := json.Marshal(map[string]any{"summary": "s", "test_command": []string{"go", "test", "./..."}, "title": "t", "body": "b",
+			"rollback": "r", "window": "7d", "lesson": lesson, "signal": goodSignal})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	got, err := buildReport(report("Read MCP configs\nbefore deleting a target."))
+	if err != nil || got.Lesson != "Read MCP configs before deleting a target." {
+		t.Fatalf("a multi-line lesson: %q %v", got.Lesson, err)
+	}
+	got, err = buildReport(report(strings.Repeat("word ", 70)))
+	if err != nil || got.Lesson != "" || got.Title != "t" {
+		t.Fatalf("a lesson over 300 characters: %q %v", got.Lesson, err)
+	}
+	got, err = buildReport(report(""))
+	if err != nil || got.Lesson != "" {
+		t.Fatalf("no lesson: %q %v", got.Lesson, err)
+	}
+	var schema struct {
+		Properties map[string]struct {
+			Description string `json:"description"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(buildSchema), &schema); err != nil || !strings.Contains(schema.Properties["lesson"].Description, "300 characters") {
+		t.Fatalf("the schema does not give the lesson's form: %+v %v", schema.Properties["lesson"], err)
+	}
+}

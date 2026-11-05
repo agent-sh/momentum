@@ -21,7 +21,7 @@ const buildSchema = `{"type":"object","additionalProperties":false,
 "properties":{"summary":{"type":"string"},
 "test_command":{"type":"array","minItems":1,"items":{"type":"string"},"description":"The program and its arguments, one word each, such as [\"go\", \"test\", \"./internal/x\", \"-run\", \"TestY\"]. The host runs it in the sandbox without a shell, on BASE with only the change's test files (it must fail) and on the change (it must pass). Not a description of the test."},
 "title":{"type":"string"},
-"body":{"type":"string"},"rollback":{"type":"string"},"window":{"type":"string"},"lesson":{"type":"string"},"installed":{"type":"string"},
+"body":{"type":"string"},"rollback":{"type":"string"},"window":{"type":"string"},"lesson":{"type":"string","description":"One line of at most 300 characters: what a later agent should know from this case, or empty. A longer or multi-line lesson is dropped."},"installed":{"type":"string"},
 "signal":{"type":"object","additionalProperties":false,"required":["source","kinds","match"],
 "properties":{"source":{"type":"string"},"kinds":{"type":"array","items":{"type":"string"}},
 "tool":{"type":"string"},"harness":{"type":"string"},"match":{"type":"array","items":{"type":"string"}}}}}}`
@@ -75,10 +75,19 @@ func buildReport(raw []byte) (BuildReport, error) {
 	if len(report.Body) > 64<<10 {
 		return report, errors.New("proposal body exceeds its limit")
 	}
-	if strings.ContainsAny(report.Lesson, "\r\n") || len(report.Lesson) > 300 {
-		return report, errors.New("a lesson is one line of at most 300 characters")
-	}
+	report.Lesson = lessonLine(report.Lesson)
 	return report, nil
+}
+
+// lessonLine is a report's lesson as the proposal keeps it: its lines joined into one, or nothing when that is longer
+// than 300 characters. The lesson is advice the case may publish when it closes as improved, not part of the change, so
+// one that breaks its form drops alone and the build goes on.
+func lessonLine(text string) string {
+	line := strings.Join(strings.Fields(text), " ")
+	if len(line) > 300 {
+		return ""
+	}
+	return line
 }
 
 func planWindow(text string) (time.Duration, error) {
