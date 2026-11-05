@@ -191,9 +191,12 @@ func TestANextBuildReadsWhyTheLastWasRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	setCaseRepo(t, r.Store, c, "main")
+	if _, err := r.Ship.Prepare(ctx, c.ID, f.main); err != nil { // the package the refused build had
+		t.Fatal(err)
+	}
 	why := `build check: refused: the test command "New file names_test.go" holds '~', which only a shell reads: give one program and its arguments`
 	if err := r.Store.PutLoopRun(ctx, store.LoopRun{ID: "20261105-063759-0000aaaa", Case: c.ID, Family: c.Family, Step: StepBuild,
-		Started: time.Now().Add(-time.Hour), Ended: time.Now().Add(-50 * time.Minute), Status: store.RunFailed, Failure: "build check",
+		Started: time.Now(), Ended: time.Now(), Status: store.RunFailed, Failure: "build check",
 		Summary: "store copy 30 days\n" + why + " (relay: 26 admitted, 0 refused, 26 charged, $1.049046)", CaseEpisode: c.Episode}); err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +225,7 @@ func TestANextBuildReadsWhyTheLastWasRefused(t *testing.T) {
 		t.Fatalf("another episode's refusal: %q %v", text, err)
 	}
 	if err := r.Store.PutLoopRun(ctx, store.LoopRun{ID: "20261105-073759-0000bbbb", Case: c.ID, Family: c.Family, Step: StepBuild,
-		Started: time.Now().Add(-time.Minute), Ended: time.Now(), Status: store.RunFailed, Failure: "build prepare",
+		Started: time.Now(), Ended: time.Now(), Status: store.RunFailed, Failure: "build prepare",
 		Summary: "build prepare: the clone failed", CaseEpisode: c.Episode}); err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +233,7 @@ func TestANextBuildReadsWhyTheLastWasRefused(t *testing.T) {
 		t.Fatalf("a host failure read as the build's refusal: %q %v", text, err)
 	}
 	if err := r.Store.PutLoopRun(ctx, store.LoopRun{ID: "20261105-083759-0000cccc", Case: c.ID, Family: c.Family, Step: StepBuild,
-		Started: time.Now().Add(-time.Second), Ended: time.Now(), Status: store.RunFailed, Failure: "build propose",
+		Started: time.Now().Add(time.Millisecond), Ended: time.Now(), Status: store.RunFailed, Failure: "build propose",
 		Summary: "build propose: gh: network down", CaseEpisode: c.Episode}); err != nil {
 		t.Fatal(err)
 	}
@@ -930,5 +933,80 @@ func TestAClosedRequestOfACaseInANewEpisodeDoesNotReopenIt(t *testing.T) {
 	}
 	if got, _ := s.Store.CaseByID(ctx, c.ID); got.Status != store.CaseTesting {
 		t.Fatalf("the case was reopened again: %s", got.Status)
+	}
+}
+
+// A late hand landing whose recount still waits a window after the merge lands, to be measured by hand: a wait that
+// never clears holds no merged change for good.
+func TestALateHandLandingThatStillWaitsAWindowLaterLands(t *testing.T) {
+	ctx := context.Background()
+	s, c, _, p := proposedHand(t)
+	run(t, p.Host, "git", "push", "-q", "origin", p.Head+":refs/heads/main")
+	p.Plan.At = time.Now().Add(-23 * 24 * time.Hour)
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	s.SourceLive = func(string) bool { return false } // the signal's reader stopped: the count waits
+	merged := time.Now().Add(-8 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"MERGED","mergedAt":"`+merged+`","headRefOid":"`+p.Head+`","mergeCommit":{"oid":"`+p.Head+`"}}'`)
+	got, err := s.reconcileHand(ctx, c.ID)
+	if err != nil || got.State != Landed || got.Plan.Units != "" {
+		t.Fatalf("a landing whose recount still waits: %+v %v", got.Plan, err)
+	}
+	log, _ := s.Store.CaseLog(ctx, c.ID)
+	if !slices.ContainsFunc(log, func(e store.CaseEntry) bool { return e.Action == "measured by hand" }) {
+		t.Fatal("no log line says the change is measured by hand")
+	}
+}
+
+// A request whose head a person moved, or that a person retargeted, is theirs: the loop neither revises nor reviews it.
+func TestAHandLandingAPersonTookOverIsLeftToThem(t *testing.T) {
+	ctx := context.Background()
+	s, c, _, _ := proposedHand(t)
+	other := strings.Repeat("b", 40)
+	s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"OPEN","headRefOid":"`+other+`","baseRefName":"main"}'`)
+	if _, err := s.reconcileHand(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "a person's now") {
+		t.Fatalf("a request whose head moved: %v", err)
+	}
+	log, _ := s.Store.CaseLog(ctx, c.ID)
+	if !slices.ContainsFunc(log, func(e store.CaseEntry) bool { return e.Action == "hand landing taken over" }) {
+		t.Fatal("no log line says a person has the request")
+	}
+	s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"MERGED","baseRefName":"release"}'`)
+	if _, err := s.reconcileHand(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "targets release") {
+		t.Fatalf("a retargeted request: %v", err)
+	}
+}
+
+// A refusal of a package a withdrawal replaced tells the new package's build nothing, and an unfinished withdrawal
+// is not prepared over.
+func TestAWithdrawnPackagesRefusalStaysWithIt(t *testing.T) {
+	ctx := context.Background()
+	s, c, f, p := proposedHand(t)
+	if err := s.Store.PutLoopRun(ctx, store.LoopRun{ID: "20261105-063759-0000dddd", Case: c.ID, Family: c.Family, Step: StepBuild,
+		Started: time.Now(), Ended: time.Now(), Status: store.RunFailed, Failure: "build check",
+		Summary: "build check: refused: the old package's test", CaseEpisode: c.Episode}); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Store: s.Store, Ship: s, Dir: s.Dir, Budgets: DefaultBudgets}
+	if text, err := r.lastBuildRefusal(ctx, c); err != nil || text == "" {
+		t.Fatalf("the package's own refusal: %q %v", text, err)
+	}
+	p.State, p.ClosedProposals = Withdrawn, 1
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Prepare(ctx, c.ID, f.main); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "not finished") {
+		t.Fatalf("prepared over an unfinished withdrawal: %v", err)
+	}
+	p.PR = ""
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Prepare(ctx, c.ID, f.main); err != nil {
+		t.Fatal(err)
+	}
+	if text, err := r.lastBuildRefusal(ctx, c); err != nil || text != "" {
+		t.Fatalf("a replaced package's refusal reached the new one: %q %v", text, err)
 	}
 }

@@ -332,6 +332,9 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	if had && old.State != RolledBack && old.State != Kept && old.State != Withdrawn {
 		return old, refused("case %s has a package already (in %s)", c.ID, old.State)
 	}
+	if had && old.State == Withdrawn && old.PR != "" {
+		return old, refused("case %s's hand landing withdrawal is not finished yet: the next selection finishes it", c.ID)
+	}
 	if repoDir == "" {
 		return Package{}, refused("prepare needs --repo, a host repository")
 	}

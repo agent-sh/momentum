@@ -371,11 +371,17 @@ func (r *Runner) lastBuildRefusal(ctx context.Context, c store.Case) (string, er
 	if err != nil {
 		return "", err
 	}
+	var since time.Time // a refusal of a package this one replaced (a withdrawn hand landing) tells it nothing
+	if r.Ship != nil {
+		if p, ok, err := r.Ship.Load(c.ID); err == nil && ok {
+			since = p.Created
+		}
+	}
 	for _, run := range runs { // newest first
 		if run.Step != StepBuild || run.Status == store.RunRunning {
 			continue
 		}
-		if run.CaseEpisode != c.Episode || run.Status != store.RunFailed || !slices.Contains(refusalKeys, run.Failure) {
+		if run.CaseEpisode != c.Episode || run.Started.Before(since) || run.Status != store.RunFailed || !slices.Contains(refusalKeys, run.Failure) {
 			return "", nil
 		}
 		text := run.Summary

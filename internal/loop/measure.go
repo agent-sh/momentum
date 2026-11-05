@@ -461,7 +461,7 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		if len(p.Hand) > 0 {
 			// a change landed by hand is undone by hand: the loop never pushes to paths it may not land
 			m.Why = why + "; it was landed by hand, so the loop rolls nothing back"
-			detail = why + ". It was landed by hand, so the loop rolls nothing back. To roll it back, revert it through a pull request."
+			detail = why + ". It was landed by hand, so the loop rolls nothing back. To roll it back, revert it through a pull request; the case keeps measuring with its rollback held."
 		}
 		if !p.Held {
 			// the note before the flag that says it was written, under an id of its own, so it is written once

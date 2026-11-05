@@ -29,7 +29,18 @@ func (s *Ship) archive(p Package) error {
 	if err := os.MkdirAll(past, 0700); err != nil {
 		return err
 	}
-	for _, name := range []string{"package.json", "check.json", "test-command.json", "change.patch"} {
+	// package.json is copied, not moved: the new package replaces it, so a preparation whose save fails keeps the old
+	// one and what it counts
+	raw, err := os.ReadFile(filepath.Join(dir, "package.json"))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if err == nil {
+		if err := os.WriteFile(filepath.Join(past, "package.json"), raw, 0o600); err != nil {
+			return err
+		}
+	}
+	for _, name := range []string{"check.json", "test-command.json", "change.patch"} {
 		if err := os.Rename(filepath.Join(dir, name), filepath.Join(past, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}

@@ -142,7 +142,7 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 	if p.PR == "" {
 		return p, nil
 	}
-	raw, err := s.gh(ctx, p.Host, "pr", "view", p.PR, "--repo", p.Repo, "--json", "state,mergedAt,mergeCommit,headRefOid")
+	raw, err := s.gh(ctx, p.Host, "pr", "view", p.PR, "--repo", p.Repo, "--json", "state,mergedAt,mergeCommit,headRefOid,baseRefName")
 	if err != nil {
 		return p, err
 	}
@@ -150,12 +150,20 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 		State       string    `json:"state"`
 		MergedAt    time.Time `json:"mergedAt"`
 		Head        string    `json:"headRefOid"`
+		Base        string    `json:"baseRefName"`
 		MergeCommit *struct {
 			OID string `json:"oid"`
 		} `json:"mergeCommit"`
 	}
 	if err := json.Unmarshal([]byte(raw), &pr); err != nil {
 		return p, fmt.Errorf("read the hand landing's pull request: %w", err)
+	}
+	if pr.Base != "" && pr.Base != p.Base {
+		// retargeted by a person: its merge would never reach the branch the loop measures from
+		if err := s.caseNoteOnce(ctx, caseID, "hand landing retargeted", fmt.Sprintf("%s targets %s, not %s: the loop waits for it on %s", p.PR, pr.Base, p.Base, p.Base)); err != nil {
+			return p, err
+		}
+		return p, refused("the hand landing's pull request %s targets %s, not %s", p.PR, pr.Base, p.Base)
 	}
 	switch pr.State {
 	case "OPEN":
@@ -164,7 +172,17 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 			return p, err
 		}
 		if store.HandOf(c, log) != p.PR {
-			return p, s.handProposed(ctx, c, p)
+			if err := s.handProposed(ctx, c, p); err != nil {
+				return p, err
+			}
+		}
+		if ours := firstOf(p.PublishedHead, p.Head); pr.Head != "" && ours != "" && pr.Head != ours {
+			// a person works the request now (a rebase, a push of their own): the loop neither revises nor reviews it,
+			// and reads it until it is merged or closed
+			if err := s.caseNoteOnce(ctx, caseID, "hand landing taken over", fmt.Sprintf("%s holds %s, not the loop's %s: a person has it", p.PR, pr.Head, ours)); err != nil {
+				return p, err
+			}
+			return p, refused("the hand landing's pull request %s is a person's now (its head moved)", p.PR)
 		}
 		return p, nil
 	case "MERGED":
@@ -249,6 +267,11 @@ func (s *Ship) withdrawHand(ctx context.Context, c store.Case, p Package) (Packa
 			break
 		}
 	}
+	for i, e := range log { // a proposal whose record was never written still has its proposal line
+		if first < 0 && e.Action == "proposed" && strings.Contains(e.Detail, pr) {
+			first, episode = i, c.Episode
+		}
+	}
 	left := c.Status != store.CaseTesting || first >= 0 && c.Episode > episode
 	for i := first + 1; first >= 0 && i < len(log); i++ {
 		left = left || log[i].Action == "set" && strings.Contains(log[i].Detail, "status testing -> ") || log[i].Action == "closed"
@@ -296,8 +319,15 @@ func (s *Ship) landHand(ctx context.Context, c store.Case, p *Package, commit st
 		plan, err := s.validPlan(ctx, c, p.Plan.Signal, p.Plan.Window, p.Plan.Installed, at)
 		var wait *waitingPlan
 		switch {
-		case errors.As(err, &wait):
+		case errors.As(err, &wait) && s.now().Sub(at) < p.Plan.Window:
 			return &shipHold{err: fmt.Errorf("the hand landing's plan is counted again at its landing, which waits: %w", err)}
+		case errors.As(err, &wait):
+			// a window after the landing the count still waits (an incomplete run inside its span never clears, and a
+			// stopped reader may not run again): the change lands, to be measured by hand
+			p.Plan.Units = ""
+			if err := s.caseNoteOnce(ctx, c.ID, "measured by hand", "landed by hand more than a window after its plan, and the count at its landing still waits a window later: "+err.Error()); err != nil {
+				return err
+			}
 		case err != nil && !errors.Is(err, ErrRefused):
 			return err // a store that could not be read decides nothing: the landing is read again next pass
 		case err != nil:
