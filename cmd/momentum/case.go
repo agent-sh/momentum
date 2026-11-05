@@ -502,8 +502,8 @@ func caseClose(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if strings.TrimSpace(*why) == "" {
 		return usageError{"case close needs --why"}
 	}
-	if *fix != "" && store.CloseReason(*reason) != store.Solved {
-		return usageError{"--fix names what fixed a component-health case closed as already-solved"}
+	if *fix != "" && (store.CloseReason(*reason) != store.Solved || *into != "") {
+		return usageError{"--fix names what fixed a component-health case closed as already-solved, with no --into"}
 	}
 	st, err := store.Open(paths.DB())
 	if err != nil {
@@ -528,6 +528,9 @@ func caseClose(ctx context.Context, args []string, stdout, stderr io.Writer) err
 // closeFixed closes a component-health case as already solved by what fixed it, and resumes the cases the stop rule
 // holds on its signatures: the stop rule then counts only their runs after the close.
 func closeFixed(ctx context.Context, st *store.Store, id, fix, why string, stdout io.Writer) error {
+	if err := st.Fixable(ctx, id); err != nil {
+		return caseErr(err)
+	}
 	c, err := st.CaseByID(ctx, id)
 	if err != nil {
 		return caseErr(err)

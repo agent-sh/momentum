@@ -270,7 +270,7 @@ func (r *Runner) noteReviewSkip(ctx context.Context, c store.Case, cause, why st
 		return err
 	}
 	detail = store.CaseNoteText(detail)
-	id := "loop-review:" + store.IDPart(c.ID) + ":" + cause
+	id := store.ReviewNoteID(c.ID, cause)
 	notes, err := r.Store.Notes(ctx)
 	if err != nil {
 		return err

@@ -79,6 +79,14 @@ func TestAFixOfTheStopResumesTheCasesItHeld(t *testing.T) {
 	if _, _, err := st.CloseFixed(ctx, turns.ID, "commit 4814cc4", stopped, "the cap was raised", "cli"); !errors.Is(err, store.ErrBadCase) {
 		t.Fatalf("a fix that is no reference: %v", err)
 	}
+	if _, err := st.PutNote(ctx, store.Note{ID: store.ReviewNoteID(a.ID, "stopped"), Kind: store.NoteProblem, Importance: store.ImportanceLow,
+		At: time.Now(), Title: "The loop's review for case " + a.ID + " waits: stopped"}); err != nil {
+		t.Fatal(err)
+	}
+	// late has failed once, and its second run is still running at the close: the close does not see it held
+	late := openCase(t, st, "failures", "late", 2)
+	fail(late, StepInvestigate, "turns", 3*time.Minute)
+	running := time.Now().Add(-time.Minute)
 	time.Sleep(5 * time.Millisecond)
 	closed, resumed, err := st.CloseFixed(ctx, turns.ID, "git:agent-sh/momentum@4814cc4", stopped, "the cap was raised", "cli")
 	if err != nil || closed.Status != store.CaseClosed || closed.Reason != store.Solved || len(resumed) != 2 {
@@ -103,6 +111,32 @@ func TestAFixOfTheStopResumesTheCasesItHeld(t *testing.T) {
 	}
 	if why, err := r.stopped(ctx, other, true); err != nil || why == "" {
 		t.Fatalf("the case stopped another way resumed: %v", err)
+	}
+	if n, ok, _ := st.Note(ctx, store.ReviewNoteID(a.ID, "stopped")); !ok || n.Done.IsZero() {
+		t.Fatalf("the resumed case's review note stays: %+v", n)
+	}
+	// its run started before the close and ends after it, failing the same way: the case resumes as of the close
+	time.Sleep(5 * time.Millisecond)
+	n++
+	if err := st.PutLoopRun(ctx, store.LoopRun{ID: "run-late", Case: late.ID, Family: late.Family, Step: StepInvestigate,
+		Started: running, Ended: time.Now(), Status: store.RunFailed, Failure: "turns"}); err != nil {
+		t.Fatal(err)
+	}
+	if why, err := r.stopped(ctx, late, true); err != nil || why != "" {
+		t.Fatalf("a dry check holds the late stop: %q %v", why, err)
+	}
+	if why, err := r.stopped(ctx, late, false); err != nil || why != "" {
+		t.Fatalf("the late stop held its case: %q %v", why, err)
+	}
+	log, _ = st.CaseLog(ctx, late.ID)
+	if last := log[len(log)-1]; last.Action != store.ActionResumed || !strings.Contains(last.Detail, "fixed by git:agent-sh/momentum@4814cc4, before this stop's first run started") {
+		t.Fatalf("the late case's resume line: %+v", last)
+	}
+	if h, _ := st.CaseByID(ctx, turns.ID); h.Status != store.CaseClosed || h.Evidence != turns.Evidence {
+		t.Fatalf("the late stop changed the closed case: %s, %d evidence", h.Status, h.Evidence)
+	}
+	if why, err := r.stopped(ctx, late, false); err != nil || why != "" {
+		t.Fatalf("the late case is held after its resume: %q %v", why, err)
 	}
 	if got, step, why, err := r.pick(ctx, "failures", "", true); err != nil || got.ID != a.ID || step != StepInvestigate {
 		t.Fatalf("the next pass: %s %s: %s %v", got.ID, step, why, err)

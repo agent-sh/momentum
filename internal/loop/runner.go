@@ -667,18 +667,27 @@ func StoppedOn(ctx context.Context, st *store.Store, health store.Case) ([]strin
 
 // stopped applies the stop rule (stopRuns): a case whose last two runs failed the same way, in the same step, is not
 // run a third time. It opens a case of the loop's own, in component health, the first time, with both runs'
-// transcripts as its evidence, and says why. A dry check opens nothing.
+// transcripts as its evidence, and says why. A stop whose older run began before that case closed as fixed resumes
+// the case instead (store.ResumeLate). A dry check writes nothing.
 func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, error) {
 	runs, ok, err := stopRuns(ctx, r.Store, c)
 	if err != nil || !ok {
 		return "", err
 	}
-	a := runs[0]
-	why := fmt.Sprintf("its last two %s runs failed the same way: %s", a.Step, a.Failure)
+	a, sig := runs[0], stopSignature(runs[0].Step, runs[0].Failure)
+	// a stop whose older run began before its component-health case closed as fixed came too late for the close:
+	// the case resumes as the close would have resumed it
 	if dry {
-		return why, nil
+		if _, _, late, err := r.Store.FixedStop(ctx, sig, runs[1].Started); err != nil || late {
+			return "", err
+		}
+		return fmt.Sprintf("its last two %s runs failed the same way: %s", a.Step, a.Failure), nil
 	}
-	f := store.Finding{Family: store.HealthFamily, Signature: stopSignature(a.Step, a.Failure),
+	if late, err := r.Store.ResumeLate(ctx, c.ID, sig, runs[1].Started, "loop"); err != nil || late {
+		return "", err
+	}
+	why := fmt.Sprintf("its last two %s runs failed the same way: %s", a.Step, a.Failure)
+	f := store.Finding{Family: store.HealthFamily, Signature: sig,
 		Title: plainClip("The loop fails the same way twice: "+a.Failure, store.TitleMax)}
 	for _, run := range runs {
 		ref := "file:" + filepath.Join(r.Dir, "runs", run.ID)
