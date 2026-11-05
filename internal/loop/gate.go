@@ -268,7 +268,8 @@ func PathScope(t Target, changed []string) (hand []string, err error) {
 	// reviewed the change: no repository's CI configuration is the loop's to change.
 	for _, c := range changed {
 		for _, p := range ciPaths {
-			if inPathFold(c, p) {
+			// by prefix, without case: a Jenkinsfile.release or a .gitlab-ci.yml.example may be what a host runs
+			if inPathFold(c, p) || strings.HasPrefix(strings.ToLower(c), strings.ToLower(p)) {
 				return nil, refused("%s is CI configuration: it runs on a pushed branch before review, never the loop's to change", c)
 			}
 		}

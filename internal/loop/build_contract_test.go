@@ -165,6 +165,18 @@ func TestPathScopeSortsHandLandingPaths(t *testing.T) {
 			t.Fatalf("%s may be proposed: %v", p, err)
 		}
 	}
+	// a protected file is that file: a neighbour that only begins with its name is a hand landing path
+	if hand, err := PathScope(self, []string{"go.mod.orig", "internal/capacity/run.go.bak"}); err != nil || len(hand) != 2 {
+		t.Fatalf("files that only begin with a protected name: %v %v", hand, err)
+	}
+	if _, err := PathScope(self, []string{"Internal/Capacity/RUN.go"}); !errors.Is(err, ErrRefused) {
+		t.Fatalf("a protected file in other case: %v", err)
+	}
+	for _, p := range []string{"Jenkinsfile.release", ".gitlab-ci.yml.example"} {
+		if _, err := PathScope(Target{Repo: "agent-sh/fake"}, []string{p}); !errors.Is(err, ErrRefused) {
+			t.Fatalf("%s is CI configuration a host may run: %v", p, err)
+		}
+	}
 	if _, err := PathScope(self, []string{"internal/supervise/new.go"}); !errors.Is(err, ErrRefused) {
 		t.Fatalf("a new supervision file may be proposed: %v", err)
 	}
@@ -885,7 +897,7 @@ func TestAPublicHandLandingBodyNamesItsPaths(t *testing.T) {
 	}
 	calls, _ := os.ReadFile(filepath.Join(f.dir, "gh-calls"))
 	if !strings.Contains(string(calls), "--body "+HandLine) || !strings.Contains(string(calls), "Hand landing paths: internal/capacity/names.go, internal/capacity/names_test.go") ||
-		!strings.Contains(string(calls), "momentum ship status --case "+c.ID) {
+		!strings.Contains(string(calls), "momentum ship status --case "+c.ID+" --json") {
 		t.Fatalf("the public body:\n%s", calls)
 	}
 }
@@ -1086,5 +1098,30 @@ func TestAClosedRequestWhosePersonsVersionIsOnMainIsALanding(t *testing.T) {
 	got, err := s.reconcileHand(ctx, c.ID)
 	if err != nil || got.State != Landed || !slices.Equal(got.Landed, []string{theirs}) {
 		t.Fatalf("a closed request whose person's version is on main: %+v %v", got, err)
+	}
+}
+
+// What the ship writes into a case's log is cleaned first, and written once.
+func TestTheShipsCaseLogLinesAreCleaned(t *testing.T) {
+	ctx := context.Background()
+	s, c, _, _ := proposedHand(t)
+	s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"OPEN","headRefOid":"password=marker-7f3a","baseRefName":"main"}'`)
+	for i := 0; i < 2; i++ {
+		if _, err := s.reconcileHand(ctx, c.ID); !errors.Is(err, ErrRefused) {
+			t.Fatalf("a request a person took over: %v", err)
+		}
+	}
+	log, _ := s.Store.CaseLog(ctx, c.ID)
+	n := 0
+	for _, e := range log {
+		if e.Action == "hand landing taken over" {
+			n++
+			if strings.Contains(e.Detail, "marker-7f3a") || !strings.Contains(e.Detail, "[masked]") {
+				t.Fatalf("an uncleaned log line: %q", e.Detail)
+			}
+		}
+	}
+	if n != 1 {
+		t.Fatalf("%d taken over lines", n)
 	}
 }

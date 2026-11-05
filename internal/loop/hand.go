@@ -204,6 +204,12 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 		}
 		return p, nil
 	case "MERGED":
+		if pr.Base != "" && pr.Base != p.Base {
+			// merged into another branch: it counts once its merge commit reaches p.Base; until then a person has it
+			if err := s.caseNoteOnce(ctx, caseID, "hand landing retargeted", fmt.Sprintf("%s was merged into %s, not %s: the loop measures it once it is on %s", p.PR, pr.Base, p.Base, p.Base)); err != nil {
+				return p, err
+			}
+		}
 		if pr.MergeCommit == nil || !commitRe.MatchString(pr.MergeCommit.OID) {
 			return p, refused("the merged pull request %s names no merge commit", p.PR)
 		}
