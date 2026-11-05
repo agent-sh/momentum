@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -21,7 +22,7 @@ func ActsIn(tool, input, cwd, tree, home string) bool {
 	}
 	text := unescapeJSON(input)
 	mentions := namesPath(text, treeSpellings(tree, home))
-	if readTools[tool] {
+	if readTools[tool] || slices.ContainsFunc(readToolFamilies, func(f string) bool { return strings.HasPrefix(tool, f) }) {
 		return false
 	}
 	if m := workdirKey.FindStringSubmatch(input); m != nil { // the directory the call's tool runs it in
@@ -162,8 +163,14 @@ var readTools = map[string]bool{
 	"read_file": true, "search_files": true, "web_search": true, "web_extract": true, "skill_view": true,
 	"read": true, "grep": true, "glob": true, "list": true, "webfetch": true, "websearch": true, "todowrite": true,
 	"todoread": true, "task": true, "ReadFile": true, "ReadMediaFile": true, "FetchURL": true, "SearchWeb": true,
-	"TodoList": true, "view_image": true,
+	"TodoList": true, "view_image": true, "CronCreate": true, "CronDelete": true, "CronList": true, "TaskList": true,
+	"TaskGet": true, "TaskUpdate": true, "TaskCreate": true, "AskUserQuestion": true, "ListMcpResourcesTool": true,
+	"ReadMcpResourceTool": true, "SubagentHandback": true,
 }
+
+// readToolFamilies are tool name prefixes of MCP servers that search the web, drive a browser or keep facts: none
+// of them touches a work tree.
+var readToolFamilies = []string{"mcp__harness-web__", "mcp__tacit__", "mcp__agent-chrome-bridge__", "mcp__playwright__"}
 
 // editTools write or edit a file at the path they are given.
 var editTools = map[string]bool{
@@ -176,7 +183,7 @@ var (
 	// pathKey is a write tool's path field, in the call's JSON.
 	pathKey = regexp.MustCompile(`"(?:file_path|filePath|notebook_path|path|filename)"\s*:\s*"((?:[^"\\]|\\.)*)"`)
 	// patchFile is a file a patch changes: apply_patch's headers and a unified diff's target.
-	patchFile = regexp.MustCompile(`(?m)(?:\*\*\* (?:Add|Update|Delete) File: |^\+\+\+ (?:b/)?)([^\s"]+)`)
+	patchFile = regexp.MustCompile(`(?m)(?:\*\*\* (?:Add|Update|Delete) File: |\*\*\* Move to: |^\+\+\+ (?:b/)?)([^\s"]+)`)
 )
 
 // pathArg is the path a write tool's call names, unescaped.
@@ -260,9 +267,21 @@ func readOnly(prog string, args []string) bool {
 	case "awk", "gawk":
 		return !has(func(a string) bool { return a == "-i" || strings.HasPrefix(a, "--include") })
 	case "find":
-		return !has(func(a string) bool {
-			return a == "-delete" || a == "-exec" || a == "-execdir" || a == "-ok" || a == "-okdir" || strings.HasPrefix(a, "-fprint") || a == "-fls"
-		})
+		for i, a := range args {
+			switch {
+			case a == "-delete" || strings.HasPrefix(a, "-fprint") || a == "-fls":
+				return false
+			case a == "-exec" || a == "-execdir" || a == "-ok" || a == "-okdir": // what it runs must read only too
+				end := i + 1
+				for end < len(args) && args[end] != ";" && args[end] != "\\;" && args[end] != "+" {
+					end++
+				}
+				if i+1 >= len(args) || filepath.Base(args[i+1]) == "find" || !readOnly(filepath.Base(args[i+1]), args[i+2:end]) {
+					return false
+				}
+			}
+		}
+		return true
 	case "curl":
 		return !has(func(a string) bool {
 			return a == "--output" || a == "--remote-name" || a == "--remote-name-all" || a == "--dump-header" || strings.HasPrefix(a, "--output=") || short(a, "oOD")
@@ -475,6 +494,21 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 	if namesPath(script, treeSpellings(tree, home)) { // a script a program reads from a heredoc, naming the tree
 		return true
 	}
+	// a substitution runs its own command, and hands its output to the command around it: one that names the tree
+	// hands it the tree
+	cmd, inner := substitutions(cmd)
+	for _, c := range inner {
+		if commandActs(c, dir, tree, home, false, depth+1) {
+			return true
+		}
+	}
+	cmd = substMark.ReplaceAllStringFunc(cmd, func(m string) string {
+		i, _ := strconv.Atoi(strings.Trim(m, "\x00"))
+		if c := inner[i]; namesPath(c, treeSpellings(tree, home)) || namesIn(wordsOf(c), dir, tree, home) || listsAbove(firstProg(c), wordsOf(c), dir, tree, home) {
+			return tree
+		}
+		return "_"
+	})
 	cmd = spaceRedirects(cmd)
 	segs, seps, balanced := shellSegments(cmd)
 	if !balanced { // a quote it cannot pair (a heredoc's text, a cut): read it as separators split it, too
@@ -487,8 +521,8 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 		seps = append(seps, "")
 	}
 	spellings := treeSpellings(tree, home)
-	piped := false            // an earlier command of this pipeline named the tree
-	vars := map[string]bool{} // variables a loop or a read sets to what names the tree
+	piped, prev, gitEnv := false, "", false // an earlier command of this pipeline named the tree; the directory before the last cd
+	vars := map[string]bool{}               // variables a loop or a read sets to what names the tree
 	for i, seg := range segs {
 		if i == 0 || seps[i-1] != "|" {
 			piped = false
@@ -554,6 +588,13 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 				break
 			}
 		}
+		if k == len(words) { // assignments alone set the shell's variables for what follows
+			for _, w := range words {
+				if name, v, ok := strings.Cut(w, "="); ok && (name == "GIT_DIR" || name == "GIT_WORK_TREE") && underTree(v, at, tree, home) {
+					gitEnv = true
+				}
+			}
+		}
 		if k < len(words) {
 			prog, args := filepath.Base(words[k]), words[k+1:]
 			// a program of the tree's, run by its path; a writer told by its environment to write in the tree
@@ -564,6 +605,16 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 				if (filepath.IsAbs(v) || strings.HasPrefix(v, "~") || strings.HasPrefix(v, "$HOME")) && underTree(v, at, tree, home) && writes(prog, args) {
 					return true
 				}
+			}
+			if prog == "export" { // git's repository for the commands after it
+				for _, a := range args {
+					if name, v, ok := strings.Cut(a, "="); ok && (name == "GIT_DIR" || name == "GIT_WORK_TREE") && underTree(v, at, tree, home) {
+						gitEnv = true
+					}
+				}
+			}
+			if prog == "git" && gitEnv && gitWrites(args) {
+				return true
 			}
 			// what an earlier command of the pipeline named reaches a writer that takes its input as arguments or as a script
 			if piped && (feeds || prog == "parallel" || shells[prog] && !hasScriptFlag(args)) && writes(prog, args) {
@@ -583,8 +634,11 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 			if progActs(prog, args, &d, tree, home, depth) {
 				return true
 			}
-			if prog == "cd" || prog == "pushd" {
-				dir = d
+			switch {
+			case (prog == "cd" || prog == "pushd") && len(args) > 0 && args[0] == "-" || prog == "popd":
+				dir, prev = firstText(prev, dir), dir
+			case prog == "cd" || prog == "pushd":
+				dir, prev = d, dir
 				if usesVar(args, vars) { // a loop's directory that holds the tree
 					dir = tree
 				}
@@ -599,6 +653,16 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 		}
 	}
 	return false
+}
+
+// firstText is the first of its texts that is not empty.
+func firstText(xs ...string) string {
+	for _, x := range xs {
+		if x != "" {
+			return x
+		}
+	}
+	return ""
 }
 
 // usesVar reports whether an argument uses one of the variables.
@@ -619,11 +683,12 @@ func underTree(w, dir, tree, home string) bool {
 	return p != "" && under(p, tree)
 }
 
-// heredocStart is a heredoc's operator and its word: <<EOF, <<-'EOF', << "EOF".
-var heredocStart = regexp.MustCompile(`<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)['"]?`)
+// heredocStart is a heredoc's operator and its word: <<EOF, <<-'END-BRIEF', << "EOF".
+var heredocStart = regexp.MustCompile(`<<-?\s*(?:(['"])([^'"\n]+)['"]|([^\s;&|<>()'"]+))`)
 
-// heredocs takes the heredocs' text out of a command line: the lines a shell reads as its script stay commands, any
-// other program's are its data, or a script it runs (script). A heredoc the store cut runs to the line's end.
+// heredocs takes the heredocs' text out of a command line. A shell's text, on its own line or down the pipeline
+// (cat <<EOF | bash), stays commands; an interpreter's is a script it runs (script); any other program's is its data.
+// A heredoc whose end is not there (the store cut it) runs to the line's end.
 func heredocs(cmd string) (string, string) {
 	var script strings.Builder
 	for from := 0; from < len(cmd); {
@@ -635,7 +700,12 @@ func heredocs(cmd string) (string, string) {
 			from = at + 2
 			continue
 		}
-		word := cmd[from+m[4] : from+m[5]]
+		word := ""
+		if m[4] >= 0 {
+			word = cmd[from+m[4] : from+m[5]]
+		} else {
+			word = cmd[from+m[6] : from+m[7]]
+		}
 		nl := strings.IndexByte(cmd[from+m[1]:], '\n')
 		if nl < 0 {
 			break
@@ -654,19 +724,20 @@ func heredocs(cmd string) (string, string) {
 			}
 			pos = lineEnd + 1
 		}
-		line := cmd[strings.LastIndexAny(cmd[:from+m[0]], "\n;&|(")+1 : from+m[0]]
-		prog := ""
-		for _, w := range shellWords(line) {
-			if !wrappers[w.text] && !strings.HasPrefix(w.text, "-") && !envAssign.MatchString(w.text) {
-				prog = filepath.Base(w.text)
-				break
-			}
+		// the programs that read it: the one on its line, then the pipeline after it
+		progs := []string{firstProg(cmd[strings.LastIndexAny(cmd[:from+m[0]], "\n;&|(")+1 : from+m[0]])}
+		for _, part := range strings.Split(cmd[from+m[1]:from+m[1]+nl], "|")[1:] {
+			progs = append(progs, firstProg(part))
 		}
-		if shells[prog] {
+		shell, interp := false, false
+		for _, p := range progs {
+			shell, interp = shell || shells[p], interp || interpreters[p]
+		}
+		if shell {
 			from = next
 			continue
 		}
-		if interpreters[prog] {
+		if interp {
 			script.WriteString(cmd[bodyAt:end] + "\n")
 		}
 		cmd = cmd[:bodyAt] + cmd[next:]
@@ -674,6 +745,87 @@ func heredocs(cmd string) (string, string) {
 	}
 	return cmd, script.String()
 }
+
+// wordsOf are a command line's words, unquoted.
+func wordsOf(cmd string) []string {
+	var out []string
+	for _, w := range shellWords(cmd) {
+		out = append(out, w.text)
+	}
+	return out
+}
+
+// firstProg is the program a simple command runs, past its wrappers, options and assignments.
+func firstProg(line string) string {
+	for _, w := range shellWords(line) {
+		if !wrappers[w.text] && !strings.HasPrefix(w.text, "-") && !envAssign.MatchString(w.text) && !duration.MatchString(w.text) {
+			return filepath.Base(w.text)
+		}
+	}
+	return ""
+}
+
+// substitutions takes the command substitutions ($(...) and backquotes) out of a command line, outermost first,
+// with what each holds. Single quotes hold none. One the store cut runs to the line's end.
+func substitutions(cmd string) (string, []string) {
+	var out strings.Builder
+	var inner []string
+	in := byte(0)
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		switch {
+		case in == '\'':
+			if c == '\'' {
+				in = 0
+			}
+		case c == '\\' && i+1 < len(cmd):
+			out.WriteByte(c)
+			i++
+			c = cmd[i]
+		case in == 0 && c == '\'':
+			in = c
+		case c == '"':
+			if in == '"' {
+				in = 0
+			} else {
+				in = c
+			}
+		case c == '$' && i+1 < len(cmd) && cmd[i+1] == '(' && !(i+2 < len(cmd) && cmd[i+2] == '('):
+			depth, j := 1, i+2
+			for ; j < len(cmd) && depth > 0; j++ {
+				switch cmd[j] {
+				case '(':
+					depth++
+				case ')':
+					depth--
+				}
+			}
+			stop := j
+			if depth == 0 {
+				stop = j - 1
+			}
+			inner = append(inner, cmd[i+2:stop])
+			out.WriteString("\x00" + strconv.Itoa(len(inner)-1) + "\x00")
+			i = j - 1
+			continue
+		case c == '`':
+			j := strings.IndexByte(cmd[i+1:], '`')
+			stop, next := len(cmd), len(cmd)
+			if j >= 0 {
+				stop, next = i+1+j, i+2+j
+			}
+			inner = append(inner, cmd[i+1:stop])
+			out.WriteString("\x00" + strconv.Itoa(len(inner)-1) + "\x00")
+			i = next - 1
+			continue
+		}
+		out.WriteByte(c)
+	}
+	return out.String(), inner
+}
+
+// substMark is where substitutions put what a substitution held.
+var substMark = regexp.MustCompile("\x00([0-9]+)\x00")
 
 // interpreters run the script a heredoc hands them; any other program's heredoc is its data.
 var interpreters = map[string]bool{"python": true, "python3": true, "python2": true, "node": true, "perl": true, "ruby": true,
@@ -993,6 +1145,13 @@ func destActs(args []string, dir, tree, home string) bool {
 			return under(resolvePath(strings.TrimPrefix(a, "--target-directory="), dir, home), tree)
 		case !strings.HasPrefix(a, "-"):
 			dest = a
+		}
+	}
+	if slices.Contains(args, "--remove-source-files") { // its sources go: one in the tree is a change there
+		for _, a := range args {
+			if !strings.HasPrefix(a, "-") && a != dest && underTree(a, dir, tree, home) {
+				return true
+			}
 		}
 	}
 	p := resolvePath(dest, dir, home)
