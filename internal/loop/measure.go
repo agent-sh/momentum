@@ -449,6 +449,9 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		why = "nothing could show it helped: two windows after it were too quiet to tell (" + res.Effect + ")"
 	}
 	m.Status, m.Why = "rolled back", why
+	if dry && len(p.Hand) > 0 {
+		m.Status, m.Why = "held", why+"; it was landed by hand, so the loop rolls nothing back"
+	}
 	if dry {
 		return m
 	}

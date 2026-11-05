@@ -393,7 +393,11 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 				passed = append(passed, c.ID+" has no ship tool")
 				continue
 			}
-			if p, ok, err := r.Ship.Load(c.ID); !dry && err == nil && ok && len(p.Hand) > 0 && p.PR != "" {
+			if p, ok, err := r.Ship.Load(c.ID); dry && err == nil && ok && p.State == Withdrawn && p.PR != "" {
+				// as a live pass would: it finishes the withdrawal and builds nothing
+				passed = append(passed, c.ID+"'s hand landing withdrawal finishes")
+				continue
+			} else if !dry && err == nil && ok && len(p.Hand) > 0 && p.PR != "" {
 				// a proposal for a hand landing is a person's to land or close: read which before more work
 				p, err := r.Ship.reconcileHand(ctx, c.ID)
 				switch {
@@ -452,7 +456,7 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 			} else if ok && (p.State == Proposed || p.State == Landing) {
 				r.liftHold(ctx, c, dry)
 				continue // its review or its landing comes next (reviews)
-			} else if ok && !p.ProposalAt.IsZero() && p.Plan != nil {
+			} else if ok && p.State != Withdrawn && !p.ProposalAt.IsZero() && p.Plan != nil {
 				if wait := r.Ship.waiting(ctx, c, *p.Plan, r.now()); wait != nil {
 					passed = append(passed, c.ID+"'s proposal waits on "+wait.what())
 					r.liftHold(ctx, c, dry)

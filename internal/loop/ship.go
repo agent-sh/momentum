@@ -1704,8 +1704,12 @@ func (s *Ship) hostPackageText(ctx context.Context, c store.Case, p Package) (st
 	if err != nil {
 		return "", err
 	}
-	return s.public(ctx, fmt.Sprintf("Case: %s\nEvidence count: %d\nBase: %s\nHead: %s\nDiff: %s\nCheck: before exit %d; after exit %d.",
-		c.ID, c.Evidence, p.BaseCommit, p.Head, strings.TrimSpace(stat), p.Check.Before.Exit, p.Check.After.Exit))
+	text := fmt.Sprintf("Case: %s\nEvidence count: %d\nBase: %s\nHead: %s\nDiff: %s\nCheck: before exit %d; after exit %d.",
+		c.ID, c.Evidence, p.BaseCommit, p.Head, strings.TrimSpace(stat), p.Check.Before.Exit, p.Check.After.Exit)
+	if len(p.Hand) > 0 {
+		text += fmt.Sprintf("\nHand landing paths: %s.\nThe package, its check and its measurement plan: momentum ship status --case %s.", strings.Join(p.Hand, ", "), c.ID)
+	}
+	return s.public(ctx, text)
 }
 
 func (s *Ship) openPR(ctx context.Context, p Package) error {

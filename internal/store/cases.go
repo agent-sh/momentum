@@ -840,7 +840,7 @@ func updateCase(ctx context.Context, tx *sql.Tx, c Case, u CaseUpdate, actor str
 		v         *string
 		n         int
 	}{{"title", "title", u.Title, TitleMax}, {"mechanism", "mechanism", u.Mechanism, caseTextMax},
-		{"next_test", "next test", u.NextTest, caseTextMax}, {"benefit", "benefit", u.Benefit, caseTextMax}} {
+		{"next_test", "fix", u.NextTest, caseTextMax}, {"benefit", "benefit", u.Benefit, caseTextMax}} { // next_test holds the investigation's fix
 		if err := text(f.col, f.name, f.v, f.n); err != nil {
 			return Case{}, err
 		}

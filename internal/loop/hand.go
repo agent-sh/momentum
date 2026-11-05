@@ -169,16 +169,22 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 				return p, err
 			}
 		}
-		p.State, p.LandingHead, p.Landed, p.Cleanup = Landed, pr.MergeCommit.OID, []string{pr.MergeCommit.OID}, ""
-		p.LandedAt = pr.MergedAt
-		if p.LandedAt.IsZero() {
-			p.LandedAt = s.now()
+		at := pr.MergedAt
+		if at.IsZero() {
+			at = s.now()
 		}
-		if err := s.saveAuthorized(ctx, &p); err != nil {
-			return p, err
-		}
-		return p, s.finishHand(ctx, p)
+		return p, s.landHand(ctx, c, &p, pr.MergeCommit.OID, at)
 	case "CLOSED":
+		// a person who lands a rebased head by a push to the default branch and then closes the request landed it all
+		// the same: the change's files on the default branch as the proposal has them say so
+		if commit, at, landed, err := s.landedByContent(ctx, p); err != nil {
+			return p, err
+		} else if landed {
+			if err := s.caseNoteOnce(ctx, caseID, "landed by content", fmt.Sprintf("%s was closed, and %s holds its change's files as proposed at %s", p.PR, p.Base, commit)); err != nil {
+				return p, err
+			}
+			return p, s.landHand(ctx, c, &p, commit, at)
+		}
 		p.State = Withdrawn
 		p.ClosedProposals++
 		if err := s.saveAuthorized(ctx, &p); err != nil {
@@ -232,8 +238,8 @@ func (s *Ship) withdrawHand(ctx context.Context, p Package) (Package, error) {
 			"Its hand landing proposal "+pr+" was closed without merging. The case is investigated again.", s.Actor); err != nil {
 			return p, err
 		}
-	} else if err := s.Store.CaseNote(cleanedNote(ctx), p.Case, "proposal closed",
-		"Its hand landing proposal "+pr+" was closed without merging, its second closed proposal. The loop builds this case no more.", s.Actor); err != nil {
+	} else if err := s.caseNoteOnce(ctx, p.Case, "proposal closed",
+		"Its hand landing proposal "+pr+" was closed without merging, its second closed proposal. The loop builds this case no more."); err != nil {
 		return p, err
 	}
 	p.PR = ""
@@ -253,4 +259,67 @@ func (s *Ship) caseNoteOnce(ctx context.Context, id, action, detail string) erro
 		}
 	}
 	return s.Store.CaseNote(cleanedNote(ctx), id, action, detail, s.Actor)
+}
+
+// landHand records a hand landing at commit, a commit of the default branch, landed at at. A plan counted more than a
+// window before the landing no longer stands for the windows before the change: it is counted again as of the
+// landing. A count that waits on a reader holds the landing for the next pass; one refused leaves the change to be
+// measured by hand (a plan without units), with a case log line that says why.
+func (s *Ship) landHand(ctx context.Context, c store.Case, p *Package, commit string, at time.Time) error {
+	if p.Plan != nil && at.Sub(p.Plan.At) > p.Plan.Window {
+		plan, err := s.validPlan(ctx, c, p.Plan.Signal, p.Plan.Window, p.Plan.Installed, at)
+		var wait *waitingPlan
+		switch {
+		case errors.As(err, &wait):
+			return &shipHold{err: fmt.Errorf("the hand landing's plan is counted again at its landing, which waits: %w", err)}
+		case err != nil:
+			p.Plan.Units = ""
+			if err := s.caseNoteOnce(ctx, c.ID, "measured by hand", "landed by hand more than a window after its plan, and the count at its landing was refused: "+err.Error()); err != nil {
+				return err
+			}
+		default:
+			p.Plan = &plan
+			if err := s.caseNoteOnce(ctx, c.ID, "plan counted again", fmt.Sprintf("landed by hand more than a window after its plan: counted again at %s, %d of %d in the baseline, gate %d of %d",
+				at.UTC().Format(time.RFC3339), plan.Before, plan.BeforeBase, plan.Gate, plan.GateBase)); err != nil {
+				return err
+			}
+		}
+	}
+	p.State, p.LandingHead, p.Landed, p.Cleanup, p.LandedAt = Landed, commit, []string{commit}, "", at
+	if err := s.saveAuthorized(ctx, p); err != nil {
+		return err
+	}
+	return s.finishHand(ctx, *p)
+}
+
+// landedByContent says whether the fetched default branch holds every file the change touches as the proposal's head
+// has it (a deleted file deleted), and if so the newest commit of the branch that touched them and its time.
+func (s *Ship) landedByContent(ctx context.Context, p Package) (string, time.Time, bool, error) {
+	if p.Head == "" || len(p.Changed) == 0 {
+		return "", time.Time{}, false, nil
+	}
+	if _, err := s.git(ctx, p.Host, "fetch", "--quiet", "origin", p.Base); err != nil {
+		return "", time.Time{}, false, err
+	}
+	base := "origin/" + p.Base
+	for _, path := range p.Changed {
+		want, werr := s.git(ctx, p.Host, "rev-parse", "--verify", "--quiet", p.Head+":"+path)
+		got, gerr := s.git(ctx, p.Host, "rev-parse", "--verify", "--quiet", base+":"+path)
+		if (werr == nil) != (gerr == nil) || strings.TrimSpace(want) != strings.TrimSpace(got) {
+			return "", time.Time{}, false, nil
+		}
+	}
+	out, err := s.git(ctx, p.Host, append([]string{"log", "-1", "--format=%H %cI", base, "--"}, p.Changed...)...)
+	if err != nil {
+		return "", time.Time{}, false, err
+	}
+	fields := strings.Fields(out)
+	if len(fields) != 2 || !commitRe.MatchString(fields[0]) {
+		return "", time.Time{}, false, nil
+	}
+	at, err := time.Parse(time.RFC3339, fields[1])
+	if err != nil {
+		return "", time.Time{}, false, err
+	}
+	return fields[0], at, true, nil
 }

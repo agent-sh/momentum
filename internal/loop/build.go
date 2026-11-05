@@ -43,6 +43,12 @@ func buildReport(raw []byte) (BuildReport, error) {
 	if len(raw) > runFileMax {
 		return report, errors.New("build report exceeds the report limit")
 	}
+	var probe struct {
+		Test json.RawMessage `json:"test_command"`
+	}
+	if json.Unmarshal(raw, &probe) == nil && bytes.HasPrefix(bytes.TrimSpace(probe.Test), []byte(`"`)) {
+		return report, refused(`the test command is a text: give the program and its arguments as a list of words, such as ["go", "test", "./..."], which the host runs in the sandbox`)
+	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&report); err != nil {

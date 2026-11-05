@@ -268,7 +268,7 @@ func PathScope(t Target, changed []string) (hand []string, err error) {
 	// reviewed the change: no repository's CI configuration is the loop's to change.
 	for _, c := range changed {
 		for _, p := range ciPaths {
-			if inPath(c, p) {
+			if inPathFold(c, p) {
 				return nil, refused("%s is CI configuration: it runs on a pushed branch before review, never the loop's to change", c)
 			}
 		}
@@ -290,6 +290,10 @@ func PathScope(t Target, changed []string) (hand []string, err error) {
 // inPath says whether a changed path is p, a directory p names with its final slash, or under it.
 func inPath(c, p string) bool { return c == strings.TrimSuffix(p, "/") || strings.HasPrefix(c, p) }
 
+// inPathFold is inPath without case: a checkout on a case-insensitive disk writes Internal/loop/x.go into
+// internal/loop/.
+func inPathFold(c, p string) bool { return inPath(strings.ToLower(c), strings.ToLower(p)) }
+
 // SelfLandable are the paths of the loop's own repository it may land itself.
 func SelfLandable() []string { return slices.Clone(selfChanges) }
 
@@ -298,7 +302,8 @@ func SelfLandable() []string { return slices.Clone(selfChanges) }
 // and the run's read-only reader with its case view, its configuration and paths, its commands), the scanners,
 // sources and detectors that write and judge the events it counts and the text normalization they share (sessions,
 // sources, the store, tool results, plain text, detectors, internal/supervise/ but its rules and their tests
-// (proposalProtected), and the capacity run's files that record its events and reads), its build (go.mod, go.sum) and
+// (proposalProtected), and the capacity run's files that record its events and reads), its build (go.mod, go.sum,
+// go.work, go.work.sum, vendor/) and
 // the check CI builds from the tree (internal/tracked). The capacity rules a capacity run applies and the supervision
 // rules stay outside it: they are what the loop fixes. CI configuration is refused in every repository besides
 // (ciPaths). Each call returns a list of its own.
@@ -306,7 +311,7 @@ func ProposalProtected() []string {
 	return []string{"cmd/", "sessions/", "internal/loop/", "internal/measure/", "internal/sandbox/", "internal/ro/",
 		"internal/evidenceview/", "internal/config/", "internal/paths/", "internal/detect/", "internal/source/", "internal/store/",
 		"internal/toolresult/", "internal/plain/", "internal/tracked/", "internal/capacity/run.go", "internal/capacity/record.go",
-		"internal/supervise/", "go.mod", "go.sum"}
+		"internal/supervise/", "go.mod", "go.sum", "go.work", "go.work.sum", "vendor/"}
 }
 
 // proposalProtected says whether a path of momentum's own repository is in ProposalProtected. Of internal/supervise/
@@ -314,11 +319,11 @@ func ProposalProtected() []string {
 // beside them, while every other file there, a new one too, feeds the supervision run's events or the sessions
 // detector.
 func proposalProtected(c string) bool {
-	if strings.HasPrefix(c, "internal/supervise/") && (c == "internal/supervise/rules.go" || strings.HasSuffix(c, "_test.go")) {
+	if lower := strings.ToLower(c); strings.HasPrefix(lower, "internal/supervise/") && (c == "internal/supervise/rules.go" || strings.HasSuffix(c, "_test.go")) {
 		return false
 	}
 	for _, p := range ProposalProtected() {
-		if inPath(c, p) {
+		if inPathFold(c, p) {
 			return true
 		}
 	}

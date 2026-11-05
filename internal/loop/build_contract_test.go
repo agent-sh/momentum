@@ -30,8 +30,8 @@ func TestABuildReportsTestCommandIsItsWords(t *testing.T) {
 		t.Fatalf("a command as its words: %v %v", got.Test, err)
 	}
 	prose := "New file internal/x/names_test.go, all fixtures synthetic, HOME set to a temp dir."
-	if _, err := buildReport(report(prose)); err == nil {
-		t.Fatal("accepted a prose test command")
+	if _, err := buildReport(report(prose)); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), `as a list of words, such as ["go", "test", "./..."]`) {
+		t.Fatalf("a prose test command: %v", err)
 	}
 	for _, words := range [][]string{{}, strings.Fields(prose), {"go test ./..."}, {"go", ""}, {"/usr/bin/go", "test"}} {
 		_, err := buildReport(report(words))
@@ -136,6 +136,11 @@ func TestPathScopeSortsHandLandingPaths(t *testing.T) {
 	}
 	if hand, err := PathScope(self, []string{"internal/supervise/rules_test.go"}); err != nil || len(hand) != 1 {
 		t.Fatalf("the supervision rules' test: %v %v", hand, err)
+	}
+	for _, p := range []string{"go.work", "go.work.sum", "vendor/modules.txt", "Internal/Loop/gate.go", "GO.MOD", ".GitHub/workflows/x.yml"} {
+		if _, err := PathScope(self, []string{p}); !errors.Is(err, ErrRefused) {
+			t.Fatalf("%s may be proposed: %v", p, err)
+		}
 	}
 	if _, err := PathScope(self, []string{"internal/supervise/new.go"}); !errors.Is(err, ErrRefused) {
 		t.Fatalf("a new supervision file may be proposed: %v", err)
@@ -425,8 +430,126 @@ func TestAMergeNotOnTheDefaultBranchLandsNothing(t *testing.T) {
 		t.Fatalf("the package after an early read: %+v", got)
 	}
 	run(t, p.Host, "git", "push", "-q", "origin", p.Head+":refs/heads/main")
+	other := strings.Repeat("a", 40)
+	s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"MERGED","mergedAt":"`+time.Now().UTC().Format(time.RFC3339)+`","headRefOid":"`+other+`","mergeCommit":{"oid":"`+p.Head+`"}}'`)
 	if got, err := s.reconcileHand(ctx, c.ID); err != nil || got.State != Landed {
 		t.Fatalf("the retry: %+v %v", got, err)
+	}
+	log, _ := s.Store.CaseLog(ctx, c.ID)
+	if !slices.ContainsFunc(log, func(e store.CaseEntry) bool {
+		return e.Action == "landed head differs" && strings.Contains(e.Detail, other)
+	}) {
+		t.Fatal("a merged head other than the checked one was not noted")
+	}
+}
+
+// A request closed after a person pushed its change to the default branch by hand (a rebased head) is a landing, not
+// a withdrawal: the default branch holds the change's files as proposed.
+func TestAClosedRequestWhoseChangeIsOnMainIsALanding(t *testing.T) {
+	ctx := context.Background()
+	s, c, f, p := proposedHand(t)
+	pushed := pushOther(t, f, "main", map[string]string{
+		"internal/capacity/names.go":      "package capacity\n\n// Named is the count.\nfunc Named() int { return 42 }\n",
+		"internal/capacity/names_test.go": "package capacity\n\nimport \"testing\"\n\nfunc TestNamed(t *testing.T) {\n\tif Named() != 42 {\n\t\tt.Fatal(Named())\n\t}\n}\n",
+	})
+	s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"CLOSED"}'`)
+	got, err := s.reconcileHand(ctx, c.ID)
+	if err != nil || got.State != Landed || !slices.Equal(got.Landed, []string{pushed}) || got.ClosedProposals != 0 {
+		t.Fatalf("a closed request whose change is on main: %+v %v (pushed %s, head %s)", got, err, pushed, p.Head)
+	}
+	if cur, _ := s.Store.CaseByID(ctx, c.ID); cur.Status != store.CaseDeployed {
+		t.Fatalf("the case: %s", cur.Status)
+	}
+}
+
+// A hand landing more than a window after its plan is counted again as of its landing.
+func TestALateHandLandingIsCountedAgain(t *testing.T) {
+	ctx := context.Background()
+	s, c, _, p := proposedHand(t)
+	run(t, p.Host, "git", "push", "-q", "origin", p.Head+":refs/heads/main")
+	p.Plan.At = p.Plan.At.Add(-15 * 24 * time.Hour)
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"MERGED","mergedAt":"`+time.Now().UTC().Format(time.RFC3339)+`","headRefOid":"`+p.Head+`","mergeCommit":{"oid":"`+p.Head+`"}}'`)
+	got, err := s.reconcileHand(ctx, c.ID)
+	if err != nil || got.State != Landed || got.Plan == nil || got.Plan.At.Before(time.Now().Add(-time.Hour)) {
+		t.Fatalf("a late hand landing's plan: %+v %v", got.Plan, err)
+	}
+	log, _ := s.Store.CaseLog(ctx, c.ID)
+	if !slices.ContainsFunc(log, func(e store.CaseEntry) bool {
+		return e.Action == "plan counted again" || e.Action == "measured by hand"
+	}) {
+		t.Fatal("the late landing's plan was not counted again")
+	}
+}
+
+// A revision of a hand landing proposal stays one; a revision that stays one updates its request with the label and
+// the first line again.
+func TestAHandLandingRevisionStaysOne(t *testing.T) {
+	ctx := context.Background()
+	s, c, f, p := proposedHand(t)
+	p.Reviews = []Review{{Round: 1, Head: p.Head, Medium: 1, Text: "fix the comment", Comment: "https://example.invalid/review/1", At: time.Now(),
+		Findings: []Finding{{Severity: "medium", Where: "names.go", Problem: "p", Fix: "f"}}}}
+	p.State = Revising
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(p.Work, "internal/capacity/names.go"), "package capacity\n\n// Named is the count, 42.\nfunc Named() int { return 42 }\n")
+	if _, err := s.CheckArgs(ctx, c.ID, []string{"go", "test", "./..."}, nil, fixturePatch(t, s, c.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := proposePatch(t, s, ctx, c.ID, Proposal{Title: "t", Body: "b2", Rollback: "r", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	calls, _ := os.ReadFile(filepath.Join(f.dir, "gh-calls"))
+	if !strings.Contains(string(calls), "pr edit") || !strings.Contains(string(calls), "--add-label "+HandLabel) {
+		t.Fatalf("the revision did not keep its request marked:\n%s", calls)
+	}
+	// a checked tree inside the landable paths would make the hand landing a landing of the loop's: refused
+	p, _, _ = s.Load(c.ID)
+	write(t, filepath.Join(p.Work, "internal/capacity/names.go"), "package capacity\n\n// Named is the count.\nfunc Named() int { return 41 }\n")
+	if err := os.Remove(filepath.Join(p.Work, "internal/capacity/names_test.go")); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(p.Work, "internal/capacity/rules.go"), "package capacity\n")
+	in := fixturePatch(t, s, c.ID)
+	tree, paths, err := s.applyPatch(ctx, p, []Patch{in})
+	if err != nil || !slices.Equal(paths, []string{"internal/capacity/rules.go"}) {
+		t.Fatalf("the landable revision's patch: %v %v", paths, err)
+	}
+	p.State, p.Check = Checked, &Check{Test: []string{"go", "test", "./..."}, Tree: tree, At: time.Now()}
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Propose(ctx, c.ID, Proposal{Title: "t", Body: "b3", Rollback: "r", Signal: goodSignal, Window: 7 * 24 * time.Hour}, in); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "stays one") {
+		t.Fatalf("a hand landing revised into a landable change: %v", err)
+	}
+}
+
+// A case that leaves testing while its hand landing request is open ends the record and resolves the note.
+func TestAHandLandingRecordEndsWhenItsCaseLeavesTesting(t *testing.T) {
+	ctx := context.Background()
+	s, c, _, _ := proposedHand(t)
+	if _, err := s.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "owner"); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Store: s.Store, Ship: s, Dir: s.Dir, Budgets: DefaultBudgets}
+	cs, err := s.Store.Cases(ctx, store.CaseFilter{All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.releaseHolds(ctx, cs); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := handNote(t, s.Store, c.ID); n.Done.IsZero() {
+		t.Fatal("the hand landing note stands after its case left testing")
+	}
+	log, _ := s.Store.CaseLog(ctx, c.ID)
+	as, _ := s.Store.CaseByID(ctx, c.ID)
+	as.Status = store.CaseTesting
+	if store.HandOf(as, log) != "" {
+		t.Fatal("the hand landing record stands after its case left testing")
 	}
 }
 

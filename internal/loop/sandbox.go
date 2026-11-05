@@ -114,7 +114,11 @@ func (s Sandbox) resolve(program string) error {
 		return false
 	}
 	for _, dir := range append(append([]string(nil), s.Path...), systemPath...) {
-		// the program as the sandbox would reach it: its directory and, through any link, the file itself in a mount
+		// the program as the sandbox would reach it: its directory and, through any link, the file itself in a mount; an
+		// absolute link outside /usr names a host path, which the sandbox mounts elsewhere or not at all
+		if target, err := os.Readlink(filepath.Join(dir, program)); err == nil && filepath.IsAbs(target) && !under(target, "/usr") {
+			continue
+		}
 		real, err := filepath.EvalSymlinks(filepath.Join(dir, program))
 		if err != nil || !inMount(real) {
 			continue

@@ -158,7 +158,8 @@ func (r *Runner) releaseHolds(ctx context.Context, cs []store.Case) error {
 	}
 	standing := map[string]bool{}
 	for _, n := range notes {
-		if n.Done.IsZero() && (strings.HasPrefix(n.ID, "loop-repo:") || strings.HasPrefix(n.ID, "loop-build:") && strings.Contains(n.ID, ":held:")) {
+		if n.Done.IsZero() && (strings.HasPrefix(n.ID, "loop-repo:") || strings.HasPrefix(n.ID, "loop-hand:") ||
+			strings.HasPrefix(n.ID, "loop-build:") && strings.Contains(n.ID, ":held:")) {
 			standing[n.ID] = true
 		}
 	}
@@ -178,9 +179,14 @@ func (r *Runner) releaseHolds(ctx context.Context, cs []store.Case) error {
 					return err
 				}
 			}
+			if store.HandOf(as, log) != "" { // its pull request is read again if the case comes back to testing
+				if err := r.Store.CaseNote(cleanedNote(ctx), c.ID, store.ActionHandEnded, "the case left testing", "loop"); err != nil {
+					return err
+				}
+			}
 		}
 		for id := range standing {
-			if strings.HasPrefix(id, holdNotePrefix(c.ID)) || id == repoNoteID(c.ID) {
+			if strings.HasPrefix(id, holdNotePrefix(c.ID)) || id == repoNoteID(c.ID) || id == handNoteID(c.ID) {
 				if _, _, err := r.Store.DoneNote(ctx, id, r.now()); err != nil {
 					return err
 				}
