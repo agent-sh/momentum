@@ -145,6 +145,18 @@ func commandArrays(input string) []string {
 // shells are the programs that run a script.
 var shells = map[string]bool{"sh": true, "bash": true, "zsh": true, "dash": true}
 
+// relSpelling is the tree's path from dir, when dir is above it.
+func relSpelling(dir, tree string) []string {
+	if dir == "" || dir == tree || !under(tree, dir) {
+		return nil
+	}
+	rel, err := filepath.Rel(dir, tree)
+	if err != nil {
+		return nil
+	}
+	return []string{rel}
+}
+
 // treeSpellings are the ways a call names the tree by its path: in full, and from home.
 func treeSpellings(tree, home string) []string {
 	out := []string{tree}
@@ -306,16 +318,12 @@ func readOnly(prog string, args []string) bool {
 	case "sort":
 		return !has(func(a string) bool { return a == "--output" || strings.HasPrefix(a, "--output=") || short(a, "o") })
 	case "go":
+		for len(args) > 1 && args[0] == "-C" {
+			args = args[2:]
+		}
 		return len(args) > 0 && (args[0] == "doc" || args[0] == "env" || args[0] == "list" || args[0] == "version" || args[0] == "help")
 	}
 	return true
-}
-
-// writeProgs change the paths they are given: a bare relative name in their arguments counts too.
-var writeProgs = map[string]bool{
-	"rm": true, "rmdir": true, "mv": true, "cp": true, "rsync": true, "install": true, "mkdir": true, "touch": true,
-	"ln": true, "chmod": true, "chown": true, "truncate": true, "tee": true, "patch": true, "tar": true, "unzip": true,
-	"gofmt": true, "goimports": true, "shred": true, "dd": true,
 }
 
 // gitReads are git's subcommands that change nothing in a work tree, its index or HEAD. A fetch writes only remote
@@ -478,7 +486,16 @@ func ghActs(args []string, dir, tree, home string) bool {
 	for i := 0; i+1 < len(plain); i++ {
 		switch plain[i] + " " + plain[i+1] {
 		case "pr checkout", "pr merge", "repo sync", "release download", "run download":
-			return dir != "" && under(dir, tree)
+			to := dir
+			for j, a := range args {
+				switch {
+				case (a == "-D" || a == "--dir") && j+1 < len(args):
+					to = resolvePath(args[j+1], dir, home)
+				case strings.HasPrefix(a, "--dir="):
+					to = resolvePath(strings.TrimPrefix(a, "--dir="), dir, home)
+				}
+			}
+			return to != "" && under(to, tree)
 		case "repo clone":
 			dest := ""
 			if len(plain) > i+3 {
@@ -506,7 +523,7 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 	}
 	cmd = expandVars(strings.ReplaceAll(cmd, "${HOME}", "$HOME")) // its braces are no group
 	cmd, script := heredocs(cmd, cut)
-	if namesPath(script, treeSpellings(tree, home)) { // a script a program reads from a heredoc, naming the tree
+	if namesPath(script, append(treeSpellings(tree, home), relSpelling(dir, tree)...)) { // a script a program reads from a heredoc, naming the tree
 		return true
 	}
 	// a substitution runs its own command, and hands its output to the command around it: one that names the tree
@@ -539,8 +556,9 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 		seps = append(seps, "")
 	}
 	spellings := treeSpellings(tree, home)
-	piped, prev, gitEnv := false, "", false // an earlier command of this pipeline named the tree; the directory before the last cd
-	vars := map[string]bool{}               // variables a loop or a read sets to what names the tree
+	piped, prev, gitEnv := false, "", false
+	fedLoop := inputFrom(segs, dir, tree, home) // a loop reads lines that come from the tree // an earlier command of this pipeline named the tree; the directory before the last cd
+	vars := map[string]bool{}                   // variables a loop or a read sets to what names the tree
 	for i, seg := range segs {
 		if i == 0 || seps[i-1] != "|" {
 			piped = false
@@ -598,8 +616,7 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 				continue
 			}
 			if envAssign.MatchString(w) {
-				_, v, _ := strings.Cut(w, "=")
-				assigned = append(assigned, v)
+				assigned = append(assigned, w)
 				continue
 			}
 			if !duration.MatchString(w) {
@@ -619,8 +636,11 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 			if strings.ContainsAny(words[k], "/~") && underTree(words[k], at, tree, home) {
 				return true
 			}
-			for _, v := range assigned {
-				if (filepath.IsAbs(v) || strings.HasPrefix(v, "~") || strings.HasPrefix(v, "$HOME")) && underTree(v, at, tree, home) && writes(prog, args) {
+			for _, w := range assigned {
+				name, v, _ := strings.Cut(w, "=")
+				// git's repository names a path, as any absolute value does; another relative value may be a name
+				path := name == "GIT_DIR" || name == "GIT_WORK_TREE" || filepath.IsAbs(v) || strings.HasPrefix(v, "~") || strings.HasPrefix(v, "$HOME")
+				if path && underTree(v, at, tree, home) && writes(prog, args) {
 					return true
 				}
 			}
@@ -639,7 +659,7 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 			if piped && (feeds || prog == "parallel" || takesStdin) && writes(prog, args) && (!copyProgs[prog] || destActs(args, at, tree, home) || len(args) > 0 && strings.Contains(args[len(args)-1], "{}")) {
 				return true
 			}
-			if prog == "read" && piped {
+			if prog == "read" && (piped || fedLoop) {
 				for _, a := range args {
 					if !strings.HasPrefix(a, "-") {
 						vars[a] = true
@@ -682,6 +702,27 @@ func firstText(xs ...string) string {
 		}
 	}
 	return ""
+}
+
+// inputFrom reports whether a command line's input redirection (< file) reads from the tree, or from what a process
+// substitution that named it gave.
+func inputFrom(segs []string, dir, tree, home string) bool {
+	for _, seg := range segs {
+		ws := wordsOf(seg)
+		for j, w := range ws {
+			target := ""
+			switch {
+			case w == "<" && j+1 < len(ws):
+				target = ws[j+1]
+			case strings.HasPrefix(w, "<") && !strings.HasPrefix(w, "<<"):
+				target = w[1:]
+			}
+			if target != "" && underTree(target, dir, tree, home) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // usesVar reports whether an argument uses one of the variables.
@@ -981,7 +1022,13 @@ func namesIn(words []string, dir, tree, home string) bool {
 // listsAbove reports whether a program lists what is under a directory above the tree, the tree among it: a walk
 // over it, or ls of it.
 func listsAbove(prog string, args []string, dir, tree, home string) bool {
-	return (walks(prog, args) || prog == "ls") && aboveIn(args, dir, tree, home)
+	if !walks(prog, args) && prog != "ls" {
+		return false
+	}
+	if len(plainArgs(args)) == 0 { // it lists where it runs
+		return dir != "" && dir != tree && under(tree, dir)
+	}
+	return aboveIn(args, dir, tree, home)
 }
 
 // globReaches reports whether a pattern's matches can be the tree or inside it: its first words, as many as the
@@ -1128,11 +1175,14 @@ func progActs(prog string, args []string, dir *string, tree, home string, depth 
 		return false
 	}
 	if prog == "awk" || prog == "gawk" || prog == "sed" { // a script's own output file: awk's print > "f", sed's w f
+		var quoted []string
+		for _, sp := range treeSpellings(tree, home) {
+			quoted = append(quoted, regexp.QuoteMeta(sp))
+		}
+		target := regexp.MustCompile(`(?:\bw\s+|>>?\s*["']?)(?:` + strings.Join(quoted, "|") + `)`)
 		for _, a := range args {
-			for _, sp := range treeSpellings(tree, home) {
-				if regexp.MustCompile(`(?:\bw\s+|>>?\s*["']?)` + regexp.QuoteMeta(sp)).MatchString(a) {
-					return true
-				}
+			if target.MatchString(a) {
+				return true
 			}
 		}
 	}
@@ -1145,6 +1195,11 @@ func progActs(prog string, args []string, dir *string, tree, home string, depth 
 	}
 	if prog != "cp" && walks(prog, args) && aboveIn(args, *dir, tree, home) { // a recursive writer over a directory above the tree
 		return true
+	}
+	if prog == "mv" {
+		if pl := plainArgs(args, "-t", "--target-directory"); len(pl) > 1 && intoParent(args, pl[len(pl)-1], *dir, tree, home) {
+			return true
+		}
 	}
 	switch prog {
 	case "cp", "rsync", "scp", "install", "ln": // a copy writes its destination; its sources it reads
@@ -1165,6 +1220,9 @@ func progActs(prog string, args []string, dir *string, tree, home string, depth 
 		if inline && !strings.ContainsAny(a, " \t\n") {
 			a = v
 		}
+		if interpreters[prog] && namesPath(a, relSpelling(*dir, tree)) { // a script naming the tree from where it runs
+			return true
+		}
 		if strings.ContainsAny(a, " \t\n;|&") {
 			continue
 		}
@@ -1181,6 +1239,20 @@ func progActs(prog string, args []string, dir *string, tree, home string, depth 
 		// or the program takes names
 		named := inline && contains(nameOpts, name) || i > 0 && contains(nameOpts, args[i-1])
 		if !bare || !named && !nameProgs[prog] {
+			return true
+		}
+	}
+	return false
+}
+
+// intoParent reports whether a copy or a move puts something of the tree's name into the tree's parent: the tree
+// made again, or written over.
+func intoParent(args []string, dest, dir, tree, home string) bool {
+	if dest == "" || resolvePath(dest, dir, home) != filepath.Dir(tree) {
+		return false
+	}
+	for _, a := range args {
+		if a != dest && !strings.HasPrefix(a, "-") && filepath.Base(strings.TrimSuffix(a, "/")) == filepath.Base(tree) {
 			return true
 		}
 	}
@@ -1209,6 +1281,9 @@ func destActs(args []string, dir, tree, home string) bool {
 				return true
 			}
 		}
+	}
+	if intoParent(args, dest, dir, tree, home) {
+		return true
 	}
 	p := resolvePath(dest, dir, home)
 	deletes := slices.ContainsFunc(args, func(a string) bool { return strings.HasPrefix(a, "--delete") })
