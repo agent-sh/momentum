@@ -132,7 +132,7 @@ func TestAFixOfTheStopResumesTheCasesItHeld(t *testing.T) {
 		t.Fatalf("the late stop held its case: %q %v", why, err)
 	}
 	log, _ = st.CaseLog(ctx, late.ID)
-	if last := log[len(log)-1]; last.Action != store.ActionResumed || !strings.Contains(last.Detail, "fixed by git:agent-sh/momentum@4814cc4, while this stop's runs were under way") ||
+	if last := log[len(log)-1]; last.Action != store.ActionResumed || !strings.Contains(last.Detail, "fixed by git:agent-sh/momentum@4814cc4, after this stop's first run started") ||
 		last.At.UnixMilli() != closed.Closed.UnixMilli() {
 		t.Fatalf("the late case's resume line, as of the close at %v: %+v", closed.Closed, last)
 	}
@@ -178,5 +178,20 @@ func TestAFixOfTheStopResumesTheCasesItHeld(t *testing.T) {
 	}
 	if n, ok, _ := st.Note(ctx, store.ReviewNoteID(a.ID, "stopped")); !ok || !n.Done.IsZero() {
 		t.Fatalf("a stop after the resume left the review note done: %+v", n)
+	}
+	// a resume brings back only the stopped note: a budget note its reader resolved before the resume stays resolved
+	budget := "its review is past the round budget: report"
+	if _, err := st.PutNote(ctx, store.Note{ID: store.ReviewNoteID(a.ID, "budget"), Kind: store.NoteProblem, Importance: store.ImportanceLow,
+		At: time.Now().Add(-time.Hour), Title: "budget", Detail: budget}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.DoneNote(ctx, store.ReviewNoteID(a.ID, "budget"), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.noteReviewSkip(ctx, a, "budget", budget); err != nil {
+		t.Fatal(err)
+	}
+	if n, ok, _ := st.Note(ctx, store.ReviewNoteID(a.ID, "budget")); !ok || n.Done.IsZero() {
+		t.Fatalf("a resume put back a resolved budget note: %+v", n)
 	}
 }

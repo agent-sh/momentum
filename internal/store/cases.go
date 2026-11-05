@@ -1154,7 +1154,7 @@ func fixedStop(ctx context.Context, q querier, signature string, first time.Time
 // ResumeLate resumes a case the stop rule would hold now when the component-health case of its stop closed as fixed
 // after the stop's older run started (FixedStop): its second failure was still running at the close, or ended after
 // the close read which cases were held. The resumed line is dated at the close, as the close would have written it,
-// so a run that failed after the fix counts toward the case's next stop. It reports whether it resumed the case.
+// so a run that started after the fix counts toward the case's next stop. It reports whether it resumed the case.
 func (s *Store) ResumeLate(ctx context.Context, id, signature string, first time.Time, actor string) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1172,8 +1172,8 @@ func (s *Store) ResumeLate(ctx context.Context, id, signature string, first time
 	if c.Into != "" || !slices.Contains(working, c.Status) {
 		return false, nil
 	}
-	// as of the close, as the close would have resumed it: a failure after the fix still counts toward the next stop
-	if err := resume(ctx, tx, c.ID, h.ID, fix, ", while this stop's runs were under way", actor, h.Closed); err != nil {
+	// as of the close, as the close would have resumed it: a run started after the fix still counts toward the next stop
+	if err := resume(ctx, tx, c.ID, h.ID, fix, ", after this stop's first run started", actor, h.Closed); err != nil {
 		return false, err
 	}
 	return true, tx.Commit()
