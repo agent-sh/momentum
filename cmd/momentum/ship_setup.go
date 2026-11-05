@@ -8,6 +8,7 @@ import (
 	"github.com/agent-sh/momentum/internal/loop"
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/store"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,7 +93,7 @@ func busyIn(ctx context.Context, st *store.Store, dir string, ss map[int]capacit
 				// a session above the tree works in it when a call of its last hour acts there; one that only reads
 				// it, or names the repository, does not
 				calls, err := st.Events(ctx, store.Query{Since: time.Now().Add(-time.Hour), Session: s.ID, Kinds: []string{"tool_call"},
-					Source: store.Transcripts, Limit: 2000})
+					Source: store.Transcripts, Limit: math.MaxInt32}) // every call of the hour: the newest matter most
 				if err != nil {
 					return "", err
 				}

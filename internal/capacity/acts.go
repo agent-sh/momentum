@@ -360,6 +360,28 @@ func gitActs(args []string, dir, tree, home string) bool {
 		return false
 	}
 	name, rest := sub[0], sub[1:]
+	for i, a := range rest { // a file a git command writes: diff --output, archive -o, format-patch -o, bundle create
+		v, ok := "", false
+		switch {
+		case strings.HasPrefix(a, "--output=") || strings.HasPrefix(a, "--output-directory="):
+			_, v, ok = strings.Cut(a, "=")
+		case (a == "-o" || a == "--output" || a == "--output-directory") && i+1 < len(rest):
+			v, ok = rest[i+1], true
+		}
+		if ok && underTree(v, gdir, tree, home) {
+			return true
+		}
+	}
+	switch name {
+	case "format-patch": // it writes its patches where -o says, else where it runs
+		if contains(rest, "-o") || contains(rest, "--output-directory") || slices.ContainsFunc(rest, func(a string) bool { return strings.HasPrefix(a, "--output-directory=") }) || contains(rest, "--stdout") {
+			return false
+		}
+		return gdir != "" && under(gdir, tree)
+	case "bundle":
+		pl := plainArgs(rest)
+		return len(pl) > 1 && pl[0] == "create" && underTree(pl[1], gdir, tree, home)
+	}
 	if gitRead(name, rest) {
 		return false
 	}
@@ -563,10 +585,14 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 			}
 			if prog == "cd" || prog == "pushd" {
 				dir = d
+				if usesVar(args, vars) { // a loop's directory that holds the tree
+					dir = tree
+				}
 			}
 		}
 		if !piped {
-			piped = namesPath(seg, spellings) || namesIn(words, dir, tree, home)
+			piped = namesPath(seg, spellings) || namesIn(words, dir, tree, home) ||
+				k < len(words) && listsAbove(filepath.Base(words[k]), words[k+1:], dir, tree, home)
 		}
 		if cut && i == len(segs)-1 && dir != "" && under(dir, tree) {
 			return true
@@ -742,7 +768,63 @@ func writes(prog string, args []string) bool {
 // namesIn reports whether a command's words name a path in the tree, the tree itself by a relative name too.
 func namesIn(words []string, dir, tree, home string) bool {
 	for _, w := range words {
-		if p := resolvePath(w, dir, home); p != "" && under(p, tree) {
+		if p := resolvePath(w, dir, home); p != "" && (under(p, tree) || globReaches(p, tree)) {
+			return true
+		}
+	}
+	return false
+}
+
+// listsAbove reports whether a program lists what is under a directory above the tree, the tree among it: a walk
+// over it, or ls of it.
+func listsAbove(prog string, args []string, dir, tree, home string) bool {
+	return (walks(prog, args) || prog == "ls") && aboveIn(args, dir, tree, home)
+}
+
+// globReaches reports whether a pattern's matches can be the tree or inside it: its first words, as many as the
+// tree has, match the tree's (** matches any).
+func globReaches(pattern, tree string) bool {
+	if !strings.ContainsAny(pattern, "*?[") {
+		return false
+	}
+	ps, ts := strings.Split(strings.Trim(pattern, "/"), "/"), strings.Split(strings.Trim(tree, "/"), "/")
+	for i, t := range ts {
+		if i == len(ps) {
+			return false // the pattern stops above the tree
+		}
+		if ps[i] == "**" {
+			return true
+		}
+		if ok, err := filepath.Match(ps[i], t); err != nil || !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// walks reports whether a program given a directory works through everything under it: find, a recursive search,
+// deletion, copy or mode change.
+func walks(prog string, args []string) bool {
+	switch prog {
+	case "find", "fd", "rg", "du", "tree":
+		return true
+	case "rm", "chmod", "chown", "chgrp", "grep", "cp", "ls":
+		for _, a := range args {
+			if a == "--recursive" || strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsAny(a, "rR") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// aboveIn reports whether a program is given a directory above the tree: its parent or higher.
+func aboveIn(args []string, dir, tree, home string) bool {
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			continue
+		}
+		if p := resolvePath(a, dir, home); p != "" && p != tree && under(tree, p) {
 			return true
 		}
 	}
@@ -751,6 +833,12 @@ func namesIn(words []string, dir, tree, home string) bool {
 
 // sepAt is a separator at the start of a text: shellSep's but braces, which group only as words of their own.
 var sepAt = regexp.MustCompile("^(?:&&|\\|\\||[;|\n()`]|\\$\\()")
+
+// loneAmp reports whether an & at i sends its command to the background and ends it: not && and not part of a
+// redirection (&>, >&, 2>&1).
+func loneAmp(cmd string, i int) bool {
+	return cmd[i] == '&' && (i+1 == len(cmd) || cmd[i+1] != '&' && cmd[i+1] != '>') && (i == 0 || cmd[i-1] != '&' && cmd[i-1] != '>')
+}
 
 // braceAt reports whether a brace at i is a word of its own, a group's start or end ({ a; b; }), not a part of a
 // word (xargs -I{}, ${x}).
@@ -781,7 +869,7 @@ func shellSegments(cmd string) (segs, seps []string, balanced bool) {
 		case c == '\\' && i+1 < len(cmd):
 			i++
 		default:
-			if braceAt(cmd, i) {
+			if loneAmp(cmd, i) || braceAt(cmd, i) {
 				segs, seps = append(segs, cmd[start:i]), append(seps, cmd[i:i+1])
 				start = i + 1
 			} else if m := sepAt.FindStringIndex(cmd[i:]); m != nil {
@@ -836,11 +924,21 @@ func progActs(prog string, args []string, dir *string, tree, home string, depth 
 		}
 		return false
 	}
+	if prog == "awk" || prog == "gawk" || prog == "sed" { // a script's own output file: awk's print > "f", sed's w f
+		for _, a := range args {
+			if strings.ContainsAny(a, ">w") && namesPath(a, treeSpellings(tree, home)) {
+				return true
+			}
+		}
+	}
 	if readOnly(prog, args) {
 		return false
 	}
 	// anything else may write: it acts when it runs in the tree or is given a path in it
 	if *dir != "" && under(*dir, tree) {
+		return true
+	}
+	if prog != "cp" && walks(prog, args) && aboveIn(args, *dir, tree, home) { // a recursive writer over a directory above the tree
 		return true
 	}
 	switch prog {
@@ -866,6 +964,9 @@ func progActs(prog string, args []string, dir *string, tree, home string, depth 
 			continue
 		}
 		p := resolvePath(a, *dir, home)
+		if p != "" && globReaches(p, tree) {
+			return true
+		}
 		if p == "" || !under(p, tree) {
 			continue
 		}
@@ -895,7 +996,8 @@ func destActs(args []string, dir, tree, home string) bool {
 		}
 	}
 	p := resolvePath(dest, dir, home)
-	return dest != "" && p != "" && under(p, tree)
+	deletes := slices.ContainsFunc(args, func(a string) bool { return strings.HasPrefix(a, "--delete") })
+	return dest != "" && p != "" && (under(p, tree) || globReaches(p, tree) || deletes && under(tree, p))
 }
 
 // tarActs reports whether tar writes in the tree: an extraction into it, or an archive made in it. known is false

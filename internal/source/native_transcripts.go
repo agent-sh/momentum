@@ -336,16 +336,15 @@ func encoded(v any) string {
 }
 
 // whereFirst is a tool call's input with the fields that say where the call acts (its path, its directory, its
-// command) first, so the store's cut of a long input keeps them; the rest follow by name. An input that is not one
-// JSON object stays as it is.
+// command) first, so the store's cut of a long input keeps them; the rest follow by name, each value as it was. An
+// input the cut keeps whole, or one that is not one JSON object, stays as it is.
 func whereFirst(in string) string {
 	t := strings.TrimSpace(in)
-	if !strings.HasPrefix(t, "{") {
+	if len(t) <= textChars || !strings.HasPrefix(t, "{") {
 		return in
 	}
 	d := json.NewDecoder(strings.NewReader(t))
-	d.UseNumber()
-	var m map[string]any
+	var m map[string]json.RawMessage
 	if d.Decode(&m) != nil {
 		return in
 	}
@@ -369,28 +368,23 @@ func whereFirst(in string) string {
 		return keys[i] < keys[j]
 	})
 	var b strings.Builder
-	enc := json.NewEncoder(&b)
-	enc.SetEscapeHTML(false) // a command's && stays two bytes of the cut
 	b.WriteByte('{')
 	for i, k := range keys {
 		if i > 0 {
 			b.WriteByte(',')
 		}
-		if enc.Encode(k) != nil {
-			return in
-		}
+		kb, _ := json.Marshal(k)
+		b.Write(kb)
 		b.WriteByte(':')
-		if enc.Encode(m[k]) != nil {
-			return in
-		}
+		b.Write(m[k])
 	}
 	b.WriteByte('}')
-	// Encode ends each value with a newline: key and value are joined by a colon, values by the commas above
-	return strings.ReplaceAll(b.String(), "\n", "")
+	return b.String()
 }
 
 // whereKeys are the input fields that say where a tool acts, in the order a stored input keeps them.
-var whereKeys = []string{"filePath", "file_path", "notebook_path", "path", "filename", "workdir", "cwd", "directory", "dir", "command", "cmd"}
+var whereKeys = []string{"filePath", "file_path", "notebook_path", "path", "filename", "workdir", "cwd", "working_directory",
+	"workingDirectory", "directory", "dir", "command", "cmd", "argv"}
 
 // nativeText takes only text content, never reasoning, images or attachments.
 func nativeText(v any) string {
