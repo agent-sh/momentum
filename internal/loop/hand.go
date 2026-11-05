@@ -315,7 +315,11 @@ func (s *Ship) withdrawHand(ctx context.Context, c store.Case, p Package) (Packa
 
 // caseNoteOnce writes a case log line unless the log holds the same one.
 func (s *Ship) caseNoteOnce(ctx context.Context, id, action, detail string) error {
-	detail = store.CaseNoteText(detail)
+	clean, err := Redact(ctx, detail) // details quote what builds and people wrote
+	if err != nil {
+		return err
+	}
+	detail = store.CaseNoteText(clean)
 	log, err := s.Store.CaseLog(ctx, id)
 	if err != nil {
 		return err

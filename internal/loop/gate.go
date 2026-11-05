@@ -287,8 +287,14 @@ func PathScope(t Target, changed []string) (hand []string, err error) {
 	return hand, nil
 }
 
-// inPath says whether a changed path is p, a directory p names with its final slash, or under it.
-func inPath(c, p string) bool { return c == strings.TrimSuffix(p, "/") || strings.HasPrefix(c, p) }
+// inPath says whether a changed path is p, or, for a directory p names with its final slash, the directory or a path
+// under it.
+func inPath(c, p string) bool {
+	if !strings.HasSuffix(p, "/") {
+		return c == p
+	}
+	return c == strings.TrimSuffix(p, "/") || strings.HasPrefix(c, p)
+}
 
 // inPathFold is inPath without case: a checkout on a case-insensitive disk writes Internal/loop/x.go into
 // internal/loop/.

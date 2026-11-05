@@ -229,8 +229,9 @@ func TestANextBuildReadsWhyTheLastWasRefused(t *testing.T) {
 		Summary: "build prepare: the clone failed", CaseEpisode: c.Episode}); err != nil {
 		t.Fatal(err)
 	}
-	if text, err := r.lastBuildRefusal(ctx, c); err != nil || text != "" {
-		t.Fatalf("a host failure read as the build's refusal: %q %v", text, err)
+	// a newer failure of a host stage is read past: the build's own last refusal still reaches the next build
+	if text, err := r.lastBuildRefusal(ctx, c); err != nil || !strings.Contains(text, "only a shell reads") || strings.Contains(text, "clone failed") {
+		t.Fatalf("a host failure hid or replaced the build's refusal: %q %v", text, err)
 	}
 	if err := r.Store.PutLoopRun(ctx, store.LoopRun{ID: "20261105-083759-0000cccc", Case: c.ID, Family: c.Family, Step: StepBuild,
 		Started: time.Now().Add(time.Millisecond), Ended: time.Now(), Status: store.RunFailed, Failure: "build propose",
@@ -1056,5 +1057,34 @@ func TestARefusedReservationKeepsTheLastRefusal(t *testing.T) {
 	r := &Runner{Store: s.Store, Ship: s, Dir: s.Dir, Budgets: DefaultBudgets}
 	if text, err := r.lastBuildRefusal(ctx, c); err != nil || !strings.Contains(text, "no list of words") {
 		t.Fatalf("a refused reservation hid the last refusal: %q %v", text, err)
+	}
+}
+
+// A window that is no duration is a refusal of the build's output, with what to give instead.
+func TestAnInvalidWindowIsARefusal(t *testing.T) {
+	for _, w := range []string{"1 week", "7 days", "fortnight"} {
+		if _, err := planWindow(w); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "7d or 14d") {
+			t.Fatalf("the window %q: %v", w, err)
+		}
+	}
+	if d, err := planWindow("14d"); err != nil || d != 14*24*time.Hour {
+		t.Fatalf("a window of two weeks: %v %v", d, err)
+	}
+}
+
+// A request a person changed, pushed to main as their own version and then closed is a landing: main holds the files
+// as the request's own head has them.
+func TestAClosedRequestWhosePersonsVersionIsOnMainIsALanding(t *testing.T) {
+	ctx := context.Background()
+	s, c, f, _ := proposedHand(t)
+	theirs := pushOther(t, f, "main", map[string]string{
+		"internal/capacity/names.go":      "package capacity\n\n// Named is the count, as a person wrote it.\nfunc Named() int { return 42 }\n",
+		"internal/capacity/names_test.go": "package capacity\n\nimport \"testing\"\n\nfunc TestNamed(t *testing.T) {\n\tif Named() != 42 {\n\t\tt.Fatal(Named())\n\t}\n}\n",
+	})
+	run(t, f.dir, "git", "--git-dir", f.origin, "update-ref", "refs/pull/7/head", theirs)
+	s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"CLOSED","headRefOid":"`+theirs+`"}'`)
+	got, err := s.reconcileHand(ctx, c.ID)
+	if err != nil || got.State != Landed || !slices.Equal(got.Landed, []string{theirs}) {
+		t.Fatalf("a closed request whose person's version is on main: %+v %v", got, err)
 	}
 }

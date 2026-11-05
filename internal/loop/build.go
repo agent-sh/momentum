@@ -364,6 +364,10 @@ func buildScope(repo string) string {
 // proposal. Preparation, inputs, toolchains and authority are the host's and tell a build nothing to change.
 var refusalKeys = []string{"build report", "build patch", "build check", "build propose"}
 
+// hostStages are the build stages whose failure is the host's or the harness's, not the build's output: the next
+// build reads past them to the last refusal of its output.
+var hostStages = []string{"build prepare", "build inputs", "build toolchains", "build run", "build package", "build authority"}
+
 // lastBuildRefusal is why the host refused the case's newest build of this episode, for the next build's inputs
 // (refusal.md), or "" when the newest build was not refused for its own output.
 func (r *Runner) lastBuildRefusal(ctx context.Context, c store.Case) (string, error) {
@@ -382,6 +386,9 @@ func (r *Runner) lastBuildRefusal(ctx context.Context, c store.Case) (string, er
 	for _, run := range runs { // newest first
 		if run.Step != StepBuild || run.Status == store.RunRunning {
 			continue
+		}
+		if run.CaseEpisode == c.Episode && !run.Started.Before(since) && slices.Contains(hostStages, run.Failure) {
+			continue // the host's own stage failed: it says nothing of what the build wrote
 		}
 		if run.CaseEpisode != c.Episode || run.Started.Before(since) || run.Status != store.RunFailed || !slices.Contains(refusalKeys, run.Failure) {
 			return "", nil
