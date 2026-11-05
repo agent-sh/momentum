@@ -110,6 +110,26 @@ func TestACheckResolvesItsProgramOnTheSandboxPath(t *testing.T) {
 	if err := (Sandbox{ReadOnly: []string{tools}, Path: []string{tools}}).resolve("uv"); !errors.Is(err, ErrRefused) {
 		t.Fatalf("a link out of the sandbox's mounts: %v", err)
 	}
+	// inside a mounted root, an absolute link names the host path, which the sandbox mounts at /opt/toolchain-N
+	script(t, tools, "real-npm", "exit 0")
+	if err := os.Symlink(filepath.Join(tools, "real-npm"), filepath.Join(tools, "npm")); err != nil {
+		t.Fatal(err)
+	}
+	if err := (Sandbox{ReadOnly: []string{tools}, Path: []string{tools}}).resolve("npm"); !errors.Is(err, ErrRefused) {
+		t.Fatalf("an absolute link inside a toolchain root: %v", err)
+	}
+	if err := os.Symlink("real-npm", filepath.Join(tools, "npx")); err != nil {
+		t.Fatal(err)
+	}
+	if err := (Sandbox{ReadOnly: []string{tools}, Path: []string{tools}}).resolve("npx"); err != nil {
+		t.Fatalf("a relative link inside a toolchain root: %v", err)
+	}
+	if err := os.Symlink("/usr/bin/env", filepath.Join(tools, "node")); err != nil {
+		t.Fatal(err)
+	}
+	if err := (Sandbox{ReadOnly: []string{tools}, Path: []string{tools}}).resolve("node"); err != nil {
+		t.Fatalf("an absolute link into /usr: %v", err)
+	}
 	write(t, filepath.Join(empty, "bats"), "not executable")
 	if err := (Sandbox{}).resolve("bats"); !errors.Is(err, ErrRefused) {
 		t.Fatalf("a file that cannot run: %v", err)
@@ -778,8 +798,8 @@ func TestAReturnedCaseReadsItsHandLandingAgain(t *testing.T) {
 		t.Fatal("the returned case's hand landing note was not raised again")
 	}
 	s.GH = script(t, t.TempDir(), "gh", `echo "gh: network down" >&2; exit 1`)
-	if _, _, _, err := r.pick(ctx, c.Family, c.ID, false); err != nil {
-		t.Fatal(err)
+	if got, _, why, err := r.pick(ctx, c.Family, c.ID, false); err != nil || got.ID != "" || !strings.Contains(why, "hand landing") {
+		t.Fatalf("an unread hand landing took a slot: %q %q %v", got.ID, why, err)
 	}
 	done := r.reviews(ctx, c.ID, c.Family)
 	if len(done) != 1 || !strings.Contains(done[0].Skipped, "could not be read") {
@@ -849,5 +869,66 @@ func TestAPublicHandLandingBodyNamesItsPaths(t *testing.T) {
 	if !strings.Contains(string(calls), "--body "+HandLine) || !strings.Contains(string(calls), "Hand landing paths: internal/capacity/names.go, internal/capacity/names_test.go") ||
 		!strings.Contains(string(calls), "momentum ship status --case "+c.ID) {
 		t.Fatalf("the public body:\n%s", calls)
+	}
+}
+
+// A preparation that fails after a hand landing withdrawal keeps the withdrawn package and what it counts.
+func TestAFailedPreparationKeepsTheClosedProposalCount(t *testing.T) {
+	ctx := context.Background()
+	s, c, f, p := proposedHand(t)
+	p.State, p.ClosedProposals, p.PR, p.Withdrew = Withdrawn, 1, "", p.PR
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	run(t, f.main, "git", "remote", "set-url", "origin", filepath.Join(f.dir, "gone.git"))
+	if _, err := s.Prepare(ctx, c.ID, f.main); err == nil {
+		t.Fatal("a preparation whose fetch fails went through")
+	}
+	if kept, had, err := s.Load(c.ID); err != nil || !had || kept.State != Withdrawn || kept.ClosedProposals != 1 {
+		t.Fatalf("the failed preparation lost the withdrawn package: %+v %v %v", kept, had, err)
+	}
+	run(t, f.main, "git", "remote", "set-url", "origin", f.origin)
+	if got, err := s.Prepare(ctx, c.ID, f.main); err != nil || got.ClosedProposals != 1 {
+		t.Fatalf("the next preparation: %+v %v", got, err)
+	}
+}
+
+// A late recount that cannot read the store decides nothing: the landing is read again, and the plan keeps its units.
+func TestALateRecountThatCannotReadTheStoreDecidesNothing(t *testing.T) {
+	ctx := context.Background()
+	s, c, _, p := proposedHand(t)
+	p.Plan.At = p.Plan.At.Add(-15 * 24 * time.Hour)
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	s.Store.Close()
+	if err := s.landHand(ctx, c, &p, p.Head, time.Now()); err == nil || errors.Is(err, ErrRefused) {
+		t.Fatalf("a recount over a closed store: %v", err)
+	}
+	if got, _, _ := s.Load(c.ID); got.State != Proposed || got.Plan.Units == "" {
+		t.Fatalf("a failed recount changed the package: %s %q", got.State, got.Plan.Units)
+	}
+}
+
+// A request closed after its case was closed and came back in a new episode does not reopen the case.
+func TestAClosedRequestOfACaseInANewEpisodeDoesNotReopenIt(t *testing.T) {
+	ctx := context.Background()
+	s, c, _, _ := proposedHand(t)
+	if _, err := s.Store.CloseCase(ctx, c.ID, store.NotWorthIt, "", "closed by hand", "owner"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Store.ReopenCase(ctx, c.ID, []store.Evidence{{Ref: "file:/new-evidence@1", At: time.Now()}}, "new evidence", "owner"); err != nil {
+		t.Fatal(err)
+	}
+	mech, next := "Named is off by one", "return 42"
+	if _, err := s.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mech, NextTest: &next}, "investigation"); err != nil {
+		t.Fatal(err)
+	}
+	s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"CLOSED"}'`)
+	if got, err := s.reconcileHand(ctx, c.ID); err != nil || got.State != Withdrawn {
+		t.Fatalf("the close: %+v %v", got, err)
+	}
+	if got, _ := s.Store.CaseByID(ctx, c.ID); got.Status != store.CaseTesting {
+		t.Fatalf("the case was reopened again: %s", got.Status)
 	}
 }

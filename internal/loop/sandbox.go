@@ -99,7 +99,7 @@ func (s Sandbox) resolve(program string) error {
 	if err != nil {
 		return err
 	}
-	mounted := append([]string{"/usr"}, roots...)
+	mounted := append([]string{"/usr", "/etc/alternatives"}, roots...) // both bound at their host paths
 	for _, dir := range systemPath {
 		if real, err := filepath.EvalSymlinks(dir); err == nil {
 			mounted = append(mounted, real)
@@ -116,7 +116,7 @@ func (s Sandbox) resolve(program string) error {
 	for _, dir := range append(append([]string(nil), s.Path...), systemPath...) {
 		// the program as the sandbox would reach it: its directory and, through any link, the file itself in a mount; an
 		// absolute link outside /usr names a host path, which the sandbox mounts elsewhere or not at all
-		if !relativeLinks(filepath.Join(dir, program)) {
+		if !relativeLinks(filepath.Join(dir, program), inMount) {
 			continue
 		}
 		real, err := filepath.EvalSymlinks(filepath.Join(dir, program))
@@ -134,10 +134,14 @@ func (s Sandbox) resolve(program string) error {
 	return refused("the test program %q is not on the sandbox's PATH (its toolchains, /usr/bin and /bin): use a test runner the sandbox has", program)
 }
 
-// relativeLinks follows a program's chain of links and says whether every link in it is relative or names a path
-// under /usr: an absolute link elsewhere names a host path, which the sandbox mounts at another place or not at all.
-func relativeLinks(path string) bool {
+// relativeLinks follows a program's chain of links and says whether every hop stays in a mount the sandbox has and
+// every absolute link names a path under /usr or /etc/alternatives: an absolute link elsewhere names a host path, which
+// the sandbox mounts at another place or not at all.
+func relativeLinks(path string, inMount func(string) bool) bool {
 	for range 40 {
+		if dir, err := filepath.EvalSymlinks(filepath.Dir(path)); err != nil || !inMount(dir) {
+			return false
+		}
 		st, err := os.Lstat(path)
 		if err != nil {
 			return false

@@ -121,17 +121,20 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 	if err != nil {
 		return p, err
 	}
-	if c.Status != store.CaseTesting || c.Into != "" {
+	if c.Into != "" {
+		return p, nil
+	}
+	if p.State == Withdrawn && p.PR != "" && c.Status != store.CaseClosed {
+		return s.withdrawHand(ctx, c, p) // a withdrawal that stopped partway, whatever the case did since
+	}
+	if c.Status != store.CaseTesting {
 		return p, nil
 	}
 	switch p.State {
 	case Landed:
 		return p, s.finishHand(ctx, p)
 	case Withdrawn:
-		if p.PR == "" {
-			return p, nil // withdrawn and recorded; a new build prepares a new package
-		}
-		return s.withdrawHand(ctx, p)
+		return p, nil // withdrawn and recorded; a new build prepares a new package
 	case Prepared, Checked, Proposed, Revising: // a revision's build puts it back to Prepared, its request still open
 	default:
 		return p, nil
@@ -174,10 +177,10 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 		if _, err := s.git(ctx, p.Host, "merge-base", "--is-ancestor", pr.MergeCommit.OID, "origin/"+p.Base); err != nil {
 			return p, refused("the merge commit of %s is not on %s yet", p.PR, p.Base)
 		}
-		if pr.Head != "" && pr.Head != p.Head {
+		if pr.Head != "" && pr.Head != firstOf(p.Head, p.PublishedHead) {
 			// a person may change a proposal before landing it: what is measured is what landed
 			if err := s.caseNoteOnce(ctx, caseID, "landed head differs",
-				fmt.Sprintf("%s landed head %s, not the checked %s; the landing at %s is measured", p.PR, pr.Head, p.Head, pr.MergeCommit.OID)); err != nil {
+				fmt.Sprintf("%s landed head %s, not the checked %s; the landing at %s is measured", p.PR, pr.Head, firstOf(p.Head, p.PublishedHead), pr.MergeCommit.OID)); err != nil {
 				return p, err
 			}
 		}
@@ -202,7 +205,7 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 		if err := s.saveAuthorized(ctx, &p); err != nil {
 			return p, err
 		}
-		return s.withdrawHand(ctx, p)
+		return s.withdrawHand(ctx, c, p)
 	}
 	return p, refused("the hand landing's pull request %s is %q", p.PR, pr.State)
 }
@@ -223,7 +226,7 @@ func (s *Ship) finishHand(ctx context.Context, p Package) error {
 // second closed proposal, stays in testing for a person. Its pull request is cleared last, so a withdrawal that stopped
 // partway is finished at the next call; the case log's ended line journals it, so a case that already left testing
 // after it is not reopened again.
-func (s *Ship) withdrawHand(ctx context.Context, p Package) (Package, error) {
+func (s *Ship) withdrawHand(ctx context.Context, c store.Case, p Package) (Package, error) {
 	pr := p.PR
 	ended := "closed without merging: " + pr
 	if err := s.caseNoteOnce(ctx, p.Case, store.ActionHandEnded, ended); err != nil {
@@ -236,28 +239,29 @@ func (s *Ship) withdrawHand(ctx context.Context, p Package) (Package, error) {
 	if err != nil {
 		return p, err
 	}
-	// The case left testing since this request was first proposed (it reopened after the close and came back, or a
-	// person moved it while the request was open and an investigation brought it back): what it holds now is newer
-	// than the closed request, so it is not reopened again.
-	first := -1
+	// The case left testing since this request was first proposed (the reopen went in and it came back, a person
+	// moved or closed it while the request was open, or a new episode began): what it holds now is newer than the
+	// closed request, so it is not reopened again.
+	first, episode := -1, int64(0)
 	for i, e := range log {
-		if e.Action == store.ActionHandProposed && strings.Contains(e.Detail, pr) {
-			first = i
+		if pr0, ep, ok := store.HandRecordOf(e); ok && pr0 == pr {
+			first, episode = i, ep
 			break
 		}
 	}
-	reopened := false
+	left := c.Status != store.CaseTesting || first >= 0 && c.Episode > episode
 	for i := first + 1; first >= 0 && i < len(log); i++ {
-		reopened = reopened || log[i].Action == "set" && strings.Contains(log[i].Detail, "status testing -> ")
+		left = left || log[i].Action == "set" && strings.Contains(log[i].Detail, "status testing -> ") || log[i].Action == "closed"
 	}
-	if reopened {
-		// it left testing after the close: the reopen went in, and the case came back since
+	if left {
+		// nothing to reopen
 	} else if p.ClosedProposals < MaxClosedProposals {
-		if _, err := s.Store.UpdateCase(ctx, p.Case, store.CaseUpdate{Status: store.CaseOpen}, s.Actor); err != nil {
+		// the line goes first, so a reopen that stopped before its status change is finished, not lost
+		if err := s.caseNoteOnce(ctx, p.Case, "hand landing withdrawn",
+			"Its hand landing proposal "+pr+" was closed without merging. The case reopens and is investigated again."); err != nil {
 			return p, err
 		}
-		if err := s.Store.CaseNote(cleanedNote(ctx), p.Case, "reopened",
-			"Its hand landing proposal "+pr+" was closed without merging. The case is investigated again.", s.Actor); err != nil {
+		if _, err := s.Store.UpdateCase(ctx, p.Case, store.CaseUpdate{Status: store.CaseOpen}, s.Actor); err != nil {
 			return p, err
 		}
 	} else if err := s.caseNoteOnce(ctx, p.Case, "proposal closed",
@@ -294,6 +298,8 @@ func (s *Ship) landHand(ctx context.Context, c store.Case, p *Package, commit st
 		switch {
 		case errors.As(err, &wait):
 			return &shipHold{err: fmt.Errorf("the hand landing's plan is counted again at its landing, which waits: %w", err)}
+		case err != nil && !errors.Is(err, ErrRefused):
+			return err // a store that could not be read decides nothing: the landing is read again next pass
 		case err != nil:
 			p.Plan.Units = ""
 			if err := s.caseNoteOnce(ctx, c.ID, "measured by hand", "landed by hand more than a window after its plan, and the count at its landing was refused: "+err.Error()); err != nil {
@@ -317,7 +323,7 @@ func (s *Ship) landHand(ctx context.Context, c store.Case, p *Package, commit st
 // landedByContent says whether the fetched default branch holds every file the change touches as the proposal's head
 // has it (a deleted file deleted), and if so the newest commit of the branch that touched them and its time.
 func (s *Ship) landedByContent(ctx context.Context, p Package) (string, time.Time, bool, error) {
-	if p.Head == "" || len(p.Changed) == 0 {
+	if firstOf(p.Head, p.PublishedHead) == "" || len(p.Changed) == 0 {
 		return "", time.Time{}, false, nil
 	}
 	if _, err := s.git(ctx, p.Host, "fetch", "--quiet", "origin", p.Base); err != nil {
@@ -336,7 +342,7 @@ func (s *Ship) landedByContent(ctx context.Context, p Package) (string, time.Tim
 		return "", false, err // a read that failed decides nothing: a close is never withdrawn on it
 	}
 	for _, path := range p.Changed {
-		want, wok, err := blob(p.Head, path)
+		want, wok, err := blob(firstOf(p.Head, p.PublishedHead), path)
 		if err != nil {
 			return "", time.Time{}, false, err
 		}

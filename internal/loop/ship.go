@@ -351,11 +351,6 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	if err != nil {
 		return Package{}, err
 	}
-	if had {
-		if err := s.archive(old); err != nil {
-			return Package{}, err
-		}
-	}
 	host, work := filepath.Join(s.Dir, "host", c.ID), s.workDir(c.ID)
 	if err := s.authority(ctx, c.ID); err != nil {
 		return Package{}, err
@@ -405,6 +400,13 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	note, err := Redact(ctx, fmt.Sprintf("%s at %s", p.Repo, p.BaseCommit))
 	if err != nil {
 		return Package{}, err
+	}
+	// the old package is archived only once its replacement is ready: a preparation that fails keeps it, and what it
+	// counts (a withdrawn package's closed proposals)
+	if had {
+		if err := s.archive(old); err != nil {
+			return Package{}, err
+		}
 	}
 	if err := s.saveAuthorized(ctx, &p); err != nil {
 		return Package{}, err

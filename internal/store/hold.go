@@ -84,3 +84,15 @@ func HandOf(c Case, log []CaseEntry) string {
 	}
 	return ""
 }
+
+// HandRecordOf reads a "proposed for a hand landing" line: its pull request and episode.
+func HandRecordOf(e CaseEntry) (string, int64, bool) {
+	if e.Action != ActionHandProposed {
+		return "", 0, false
+	}
+	var h handRecord
+	if json.Unmarshal([]byte(e.Detail), &h) != nil || h.PR == "" {
+		return "", 0, false
+	}
+	return h.PR, h.Episode, true
+}

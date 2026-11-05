@@ -387,6 +387,14 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 				continue
 			}
 		}
+		if !dry && r.Ship != nil && (c.Status == store.CaseOpen || c.Status == store.CaseInvestigating) {
+			// a hand landing withdrawal that stopped after its case reopened is finished here
+			if p, ok, err := r.Ship.Load(c.ID); err == nil && ok && p.State == Withdrawn && p.PR != "" {
+				if _, err := r.Ship.reconcileHand(ctx, c.ID); err != nil {
+					r.logf("finish the withdrawal of %s: %v", c.ID, err)
+				}
+			}
+		}
 		step, rank := "", 0
 		switch c.Status {
 		case store.CaseTesting:
@@ -423,8 +431,10 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 					passed = append(passed, c.ID+" used its proposals")
 					continue
 				case p.State == Withdrawn:
-					passed = append(passed, c.ID+"'s hand landing proposal was closed; the case reopens")
-					continue
+					if cur, err := r.Store.CaseByID(ctx, c.ID); err != nil || cur.Status != store.CaseTesting {
+						passed = append(passed, c.ID+"'s hand landing proposal was closed; the case reopens")
+						continue
+					} // still in testing, with what it holds now newer than the request: it builds a new package
 				}
 			}
 			if p, ok, err := r.Ship.Load(c.ID); err != nil {
