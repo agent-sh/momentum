@@ -375,3 +375,20 @@ func TestOpenCodeInvalidRecordIsSkipped(t *testing.T) {
 		t.Fatalf("a bad record stopped its session: %d events, %+v", len(all(t, st, store.Transcripts)), res)
 	}
 }
+
+// A write's path comes before its content, so the store's cut of a long input keeps where the call wrote.
+func TestOpenCodeWriteKeepsItsPathInTheStoredCall(t *testing.T) {
+	home := t.TempDir()
+	db, _ := openCodeFixture(t, home)
+	content := strings.Repeat("neutral text ", 60)
+	if _, err := db.Exec(`UPDATE session_message SET data=? WHERE id='message-2'`, `{"content":[{"type":"tool","id":"call-1","name":"write","state":{"status":"completed","input":{"content":"`+content+`","filePath":"/w/tree/a.go"},"output":"ok"}}]}`); err != nil {
+		t.Fatal(err)
+	}
+	st := openStore(t)
+	ingest(t, transcripts(home), st)
+	for _, e := range all(t, st, store.Transcripts) {
+		if e.Kind == "tool_call" && !strings.HasPrefix(e.Summary, `{"filePath":"/w/tree/a.go","content":"neutral`) {
+			t.Fatalf("the stored call lost its path: %q", e.Summary)
+		}
+	}
+}

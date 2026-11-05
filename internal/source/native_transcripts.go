@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -333,6 +335,48 @@ func encoded(v any) string {
 	return string(b)
 }
 
+// toolInput is a tool call's input as JSON. An object puts first what says where the call acts (its path, its
+// directory, its command), so the store's cut of a long input keeps them; the rest follow by name.
+func toolInput(v any) string {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return encoded(v)
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	rank := func(k string) int {
+		if i := slices.Index(whereKeys, k); i >= 0 {
+			return i
+		}
+		return len(whereKeys)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if a, b := rank(keys[i]), rank(keys[j]); a != b {
+			return a < b
+		}
+		return keys[i] < keys[j]
+	})
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		kb, _ := json.Marshal(k)
+		vb, _ := json.Marshal(m[k])
+		b.Write(kb)
+		b.WriteByte(':')
+		b.Write(vb)
+	}
+	b.WriteByte('}')
+	return b.String()
+}
+
+// whereKeys are the input fields that say where a tool acts, in the order a stored input keeps them.
+var whereKeys = []string{"filePath", "file_path", "path", "notebook_path", "filename", "workdir", "cwd", "directory", "dir", "command", "cmd"}
+
 // nativeText takes only text content, never reasoning, images or attachments.
 func nativeText(v any) string {
 	switch x := v.(type) {
@@ -383,7 +427,7 @@ func (s *nativeState) grok(o map[string]any) []evidence.Event {
 		if typ == "tool_call" {
 			s.Calls[id] = name
 			e := s.event("grok", evidence.KindToolCall, "", at)
-			e.ToolID, e.ToolName, e.ToolInput = id, name, encoded(u["rawInput"])
+			e.ToolID, e.ToolName, e.ToolInput = id, name, toolInput(u["rawInput"])
 			out = append(out, e)
 		}
 		status := str(u, "status")
@@ -439,7 +483,7 @@ func (s *nativeState) kimi(o map[string]any) []evidence.Event {
 			id, name := str(event, "toolCallId"), str(event, "name")
 			s.Calls[id] = name
 			e := s.event("kimi", evidence.KindToolCall, "", at)
-			e.ToolID, e.ToolName, e.ToolInput = id, name, encoded(event["args"])
+			e.ToolID, e.ToolName, e.ToolInput = id, name, toolInput(event["args"])
 			return []evidence.Event{e}
 		case "tool.result":
 			id := str(event, "toolCallId")

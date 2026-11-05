@@ -240,6 +240,8 @@ func readOnly(prog string, args []string) bool {
 		return !has(func(a string) bool {
 			return a == "--output" || a == "--remote-name" || a == "--remote-name-all" || a == "--dump-header" || strings.HasPrefix(a, "--output=") || short(a, "oOD")
 		})
+	case "yq":
+		return !has(func(a string) bool { return a == "--inplace" || strings.HasPrefix(a, "--inplace=") || short(a, "i") })
 	case "sort":
 		return !has(func(a string) bool { return a == "--output" || strings.HasPrefix(a, "--output=") || short(a, "o") })
 	case "go":
@@ -263,7 +265,7 @@ var gitReads = map[string]bool{
 	"shortlog": true, "cat-file": true, "for-each-ref": true, "merge-base": true, "name-rev": true, "whatchanged": true,
 	"help": true, "version": true, "count-objects": true, "fsck": true, "check-ignore": true, "check-attr": true,
 	"show-ref": true, "var": true, "range-diff": true, "cherry": true, "verify-commit": true, "verify-tag": true,
-	"fetch": true, "diff-tree": true, "diff-files": true, "diff-index": true, "show-branch": true, "archive": true,
+	"diff-tree": true, "diff-files": true, "diff-index": true, "show-branch": true, "archive": true,
 }
 
 // gitRead reports whether a git subcommand with its arguments reads only. One it does not know writes.
@@ -274,7 +276,8 @@ func gitRead(sub string, rest []string) bool {
 	var plain []string
 	opt := func(names ...string) bool {
 		for _, a := range rest {
-			if contains(names, a) {
+			name, _, _ := strings.Cut(a, "=")
+			if contains(names, name) {
 				return true
 			}
 		}
@@ -290,6 +293,13 @@ func gitRead(sub string, rest []string) bool {
 		first = plain[0]
 	}
 	switch sub {
+	case "fetch": // it writes remote refs, unless a refspec moves a local branch (main:main)
+		for _, a := range plain {
+			if _, dst, ok := strings.Cut(a, ":"); ok && dst != "" && !strings.HasPrefix(dst, "refs/remotes/") && !strings.Contains(a, "://") {
+				return false
+			}
+		}
+		return true
 	case "stash", "notes":
 		return first == "list" || first == "show"
 	case "worktree":
@@ -299,7 +309,7 @@ func gitRead(sub string, rest []string) bool {
 	case "remote":
 		return first == "" || first == "show" || first == "get-url"
 	case "branch":
-		return len(plain) == 0 && !opt("-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy", "-f", "--force", "-u", "--unset-upstream") ||
+		return len(plain) == 0 && !opt("-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy", "-f", "--force", "-u", "--set-upstream-to", "--unset-upstream", "--edit-description") ||
 			opt("-l", "--list", "--contains", "--no-contains", "--merged", "--no-merged", "--show-current")
 	case "tag":
 		return len(plain) == 0 || opt("-l", "--list", "-v", "--verify", "--contains")
@@ -383,7 +393,7 @@ func ghActs(args []string, dir, tree, home string) bool {
 	plain := plainArgs(args, "-R", "--repo", "-b", "--branch", "--json", "-q", "--jq", "-t", "--template", "-p", "--pattern", "-D", "--dir")
 	for i := 0; i+1 < len(plain); i++ {
 		switch plain[i] + " " + plain[i+1] {
-		case "pr checkout", "repo sync", "release download", "run download":
+		case "pr checkout", "pr merge", "repo sync", "release download", "run download":
 			return dir != "" && under(dir, tree)
 		case "repo clone":
 			dest := ""
@@ -411,6 +421,11 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 		return namesPath(cmd, treeSpellings(tree, home))
 	}
 	cmd = expandVars(strings.ReplaceAll(cmd, "${HOME}", "$HOME")) // its braces are no group
+	cmd, script := heredocs(cmd)
+	if namesPath(script, treeSpellings(tree, home)) { // a script a program reads from a heredoc, naming the tree
+		return true
+	}
+	cmd = spaceRedirects(cmd)
 	segs, seps, balanced := shellSegments(cmd)
 	if !balanced { // a quote it cannot pair (a heredoc's text, a cut): read it as separators split it, too
 		start := 0
@@ -451,6 +466,7 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 			words = append(words, w)
 		}
 		at, k, feeds := dir, 0, false
+		var assigned []string // the values of the assignments before the program
 		for wrap := ""; k < len(words); k++ {
 			w := words[k]
 			if wrappers[w] {
@@ -470,12 +486,26 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 				}
 				continue
 			}
-			if !duration.MatchString(w) && !envAssign.MatchString(w) {
+			if envAssign.MatchString(w) {
+				_, v, _ := strings.Cut(w, "=")
+				assigned = append(assigned, v)
+				continue
+			}
+			if !duration.MatchString(w) {
 				break
 			}
 		}
 		if k < len(words) {
 			prog, args := filepath.Base(words[k]), words[k+1:]
+			// a program of the tree's, run by its path; a writer told by its environment to write in the tree
+			if strings.ContainsAny(words[k], "/~") && underTree(words[k], at, tree, home) {
+				return true
+			}
+			for _, v := range assigned {
+				if (filepath.IsAbs(v) || strings.HasPrefix(v, "~") || strings.HasPrefix(v, "$HOME")) && underTree(v, at, tree, home) && writes(prog, args) {
+					return true
+				}
+			}
 			// what an earlier command of the pipeline named reaches a writer that takes its input as arguments or as a script
 			if piped && (feeds || prog == "parallel" || shells[prog] && !hasScriptFlag(args)) && writes(prog, args) {
 				return true
@@ -496,6 +526,101 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 		}
 	}
 	return false
+}
+
+// underTree reports whether a word names a path in the tree, resolved in dir.
+func underTree(w, dir, tree, home string) bool {
+	p := resolvePath(w, dir, home)
+	return p != "" && under(p, tree)
+}
+
+// heredocStart is a heredoc's operator and its word: <<EOF, <<-'EOF', << "EOF".
+var heredocStart = regexp.MustCompile(`<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)['"]?`)
+
+// heredocs takes the heredocs' text out of a command line: the lines a shell reads as its script stay commands, any
+// other program's are its data, or a script it runs (script). A heredoc the store cut runs to the line's end.
+func heredocs(cmd string) (string, string) {
+	var script strings.Builder
+	for from := 0; from < len(cmd); {
+		m := heredocStart.FindStringSubmatchIndex(cmd[from:])
+		if m == nil {
+			break
+		}
+		if at := from + m[0]; at > 0 && cmd[at-1] == '<' { // a here-string, <<<word
+			from = at + 2
+			continue
+		}
+		word := cmd[from+m[4] : from+m[5]]
+		nl := strings.IndexByte(cmd[from+m[1]:], '\n')
+		if nl < 0 {
+			break
+		}
+		bodyAt := from + m[1] + nl + 1
+		end, next := len(cmd), len(cmd)
+		if i := strings.Index("\n"+cmd[bodyAt:]+"\n", "\n"+word+"\n"); i >= 0 {
+			end, next = bodyAt+max(0, i-1), min(len(cmd), bodyAt+i+len(word))
+		}
+		line := cmd[strings.LastIndexAny(cmd[:from+m[0]], "\n;&|(")+1 : from+m[0]]
+		prog := ""
+		for _, w := range shellWords(line) {
+			if !wrappers[w.text] && !strings.HasPrefix(w.text, "-") && !envAssign.MatchString(w.text) {
+				prog = filepath.Base(w.text)
+				break
+			}
+		}
+		if shells[prog] {
+			from = next
+			continue
+		}
+		if !readProgs[prog] && !writeProgs[prog] {
+			script.WriteString(cmd[bodyAt:end] + "\n")
+		}
+		cmd = cmd[:bodyAt] + cmd[next:]
+		from = bodyAt
+	}
+	return cmd, script.String()
+}
+
+// spaceRedirects puts spaces around the redirections no quote holds, so a target written onto its word
+// (echo x>file) is a word of its own.
+func spaceRedirects(cmd string) string {
+	var b strings.Builder
+	in := byte(0)
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		switch {
+		case in != 0:
+			if c == in {
+				in = 0
+			} else if c == '\\' && in == '"' && i+1 < len(cmd) {
+				b.WriteByte(c)
+				i++
+				c = cmd[i]
+			}
+		case c == '\'' || c == '"':
+			in = c
+		case c == '\\' && i+1 < len(cmd):
+			b.WriteByte(c)
+			i++
+			c = cmd[i]
+		case c == '>':
+			j := i + 1
+			for j < len(cmd) && (cmd[j] == '>' || cmd[j] == '|' || cmd[j] == '&') {
+				j++
+			}
+			if p := b.String(); p != "" && strings.IndexByte(" \t0123456789&", p[len(p)-1]) < 0 {
+				b.WriteByte(' ')
+			}
+			b.WriteString(cmd[i:j])
+			if j == len(cmd) || cmd[j-1] != '&' { // >&2 names no file
+				b.WriteByte(' ')
+			}
+			i = j - 1
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
 }
 
 // wrapperValued are the options of a wrapper that take a value; wrapperDirs those that set the directory the command
@@ -597,8 +722,13 @@ func shellSegments(cmd string) (segs, seps []string, balanced bool) {
 	return append(segs, cmd[start:]), append(seps, ""), in == 0
 }
 
-// dirOpts are options whose value is the directory a program works in, or the tree it writes to.
-var dirOpts = []string{"-C", "--directory", "--prefix", "--cwd", "--dir", "--chdir", "--manifest-path", "--working-directory", "--project", "--root"}
+// nameOpts are options whose value is a name, not a path: a repository's, a unit's, a container's. nameProgs take
+// names as their arguments.
+var (
+	nameOpts  = []string{"-R", "--repo", "--repository", "-u", "--unit", "--user-unit", "--name", "--container", "--service", "--label", "--tag"}
+	nameProgs = map[string]bool{"journalctl": true, "systemctl": true, "docker": true, "podman": true, "kill": true, "pkill": true,
+		"killall": true, "tacit": true, "momentum": true, "tmux": true}
+)
 
 // progActs reports whether one program run in *dir with its arguments acts in the tree; a cd moves *dir.
 func progActs(prog string, args []string, dir *string, tree, home string, depth int) bool {
@@ -669,10 +799,10 @@ func progActs(prog string, args []string, dir *string, tree, home string, depth 
 		}
 		bare := !filepath.IsAbs(a) && !strings.HasPrefix(a, "~") && !strings.HasPrefix(a, "$HOME") &&
 			!strings.HasPrefix(a, "./") && !strings.HasPrefix(a, "../") && p == tree
-		// a bare name is the repository's name as often as a path, unless the program writes what it is given or
-		// an option says it is a directory
-		opt := inline && (contains(dirOpts, name) || outputOpt(name)) || i > 0 && (contains(dirOpts, args[i-1]) || outputOpt(args[i-1]))
-		if !bare || writeProgs[prog] || readProgs[prog] || opt {
+		// a bare name is a path to a program that may write, unless an option says it is a name (--repo, --unit)
+		// or the program takes names
+		named := inline && contains(nameOpts, name) || i > 0 && contains(nameOpts, args[i-1])
+		if !bare || !named && !nameProgs[prog] {
 			return true
 		}
 	}
