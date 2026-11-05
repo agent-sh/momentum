@@ -99,21 +99,30 @@ func (s Sandbox) resolve(program string) error {
 	if err != nil {
 		return err
 	}
-	var dirs []string
-	for _, dir := range s.Path {
+	mounted := append([]string{"/usr"}, roots...)
+	for _, dir := range systemPath {
 		if real, err := filepath.EvalSymlinks(dir); err == nil {
-			dir = real
-		}
-		mounted := under(dir, "/usr")
-		for _, root := range roots {
-			mounted = mounted || under(dir, root)
-		}
-		if mounted {
-			dirs = append(dirs, dir)
+			mounted = append(mounted, real)
 		}
 	}
-	for _, dir := range append(dirs, systemPath...) {
-		st, err := os.Stat(filepath.Join(dir, program))
+	inMount := func(p string) bool {
+		for _, root := range mounted {
+			if under(p, root) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, dir := range append(append([]string(nil), s.Path...), systemPath...) {
+		// the program as the sandbox would reach it: its directory and, through any link, the file itself in a mount
+		real, err := filepath.EvalSymlinks(filepath.Join(dir, program))
+		if err != nil || !inMount(real) {
+			continue
+		}
+		if d, err := filepath.EvalSymlinks(dir); err != nil || !inMount(d) {
+			continue
+		}
+		st, err := os.Stat(real)
 		if err == nil && st.Mode().IsRegular() && st.Mode()&0o111 != 0 {
 			return nil
 		}

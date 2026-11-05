@@ -75,7 +75,7 @@ const usage = `usage:
                                         open a case, or give the case that holds S the evidence
   momentum case set ID [--status open|investigating|testing] [--title T] [--mechanism M] [--alternative A]...
                        [--next-test T] [--benefit B]
-                                        record the investigation; testing needs a mechanism and a next test
+                                        record the investigation; testing needs a mechanism and a fix (--next-test)
   momentum case evidence ID [--at WHEN] [--kind K] [--summary S] REF...
                                         more evidence: ev:EVENT, note:ID, git:OWNER/REPO@SHA, file:PATH[@OFFSET],
                                         an address; an event or a note takes its own time, kind and summary

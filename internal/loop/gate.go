@@ -277,10 +277,8 @@ func PathScope(t Target, changed []string) (hand []string, err error) {
 		return nil, nil
 	}
 	for _, c := range changed {
-		for _, p := range ProposalProtected() {
-			if inPath(c, p) {
-				return nil, refused("%s is what the loop's measurement or its event scanners rest on: never its to change, not even for a hand landing", c)
-			}
+		if proposalProtected(c) {
+			return nil, refused("%s is what the loop's measurement or its event scanners rest on: never its to change, not even for a hand landing", c)
 		}
 		if !slices.Contains(selfChanges, c) {
 			hand = append(hand, c)
@@ -299,8 +297,8 @@ func SelfLandable() []string { return slices.Clone(selfChanges) }
 // proposal a person lands by hand: what its measurement reads and decides with (the loop, its measurement, its sandbox
 // and the run's read-only reader with its case view, its configuration and paths, its commands), the scanners,
 // sources and detectors that write and judge the events it counts and the text normalization they share (sessions,
-// sources, the store, tool results, plain text, detectors, every supervision file the sessions detector or the
-// supervision run use, and the capacity run's files that record its events and reads), its build (go.mod, go.sum) and
+// sources, the store, tool results, plain text, detectors, internal/supervise/ but its rules and their tests
+// (proposalProtected), and the capacity run's files that record its events and reads), its build (go.mod, go.sum) and
 // the check CI builds from the tree (internal/tracked). The capacity rules a capacity run applies and the supervision
 // rules stay outside it: they are what the loop fixes. CI configuration is refused in every repository besides
 // (ciPaths). Each call returns a list of its own.
@@ -308,8 +306,23 @@ func ProposalProtected() []string {
 	return []string{"cmd/", "sessions/", "internal/loop/", "internal/measure/", "internal/sandbox/", "internal/ro/",
 		"internal/evidenceview/", "internal/config/", "internal/paths/", "internal/detect/", "internal/source/", "internal/store/",
 		"internal/toolresult/", "internal/plain/", "internal/tracked/", "internal/capacity/run.go", "internal/capacity/record.go",
-		"internal/supervise/engine.go", "internal/supervise/notes.go", "internal/supervise/history.go", "internal/supervise/replay.go",
-		"internal/supervise/words.go", "go.mod", "go.sum"}
+		"internal/supervise/", "go.mod", "go.sum"}
+}
+
+// proposalProtected says whether a path of momentum's own repository is in ProposalProtected. Of internal/supervise/
+// only rules.go and test files stay outside it: supervision's rules are what the loop fixes, and their test lives
+// beside them, while every other file there, a new one too, feeds the supervision run's events or the sessions
+// detector.
+func proposalProtected(c string) bool {
+	if strings.HasPrefix(c, "internal/supervise/") && (c == "internal/supervise/rules.go" || strings.HasSuffix(c, "_test.go")) {
+		return false
+	}
+	for _, p := range ProposalProtected() {
+		if inPath(c, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // under reports whether p is dir or inside it.

@@ -381,12 +381,12 @@ func caseSet(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	fs := flag.NewFlagSet("case set", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	status := fs.String("status", "", "open, investigating or testing (testing needs a mechanism and a next test)")
+	status := fs.String("status", "", "open, investigating or testing (testing needs a mechanism and a fix, --next-test)")
 	var alts refs
 	fs.Var(&alts, "alternative", "another mechanism that could explain the evidence; repeat for more (replaces the list)")
 	texts := map[string]*string{}
 	for name, usage := range map[string]string{"title": "its title", "mechanism": "the suspected mechanism",
-		"next-test": "the next test that tells the mechanism from the alternatives", "benefit": "the expected benefit"} {
+		"next-test": "the fix the investigation found, in prose: a build makes it and writes its own test command", "benefit": "the expected benefit"} {
 		texts[name] = fs.String(name, "", usage)
 	}
 	if err := fs.Parse(rest); err != nil {

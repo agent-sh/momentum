@@ -51,6 +51,15 @@ func (s *Ship) handProposed(ctx context.Context, c store.Case, p Package) error 
 	detail := fmt.Sprintf("Its fix changes paths the loop may not land itself: %s. The loop checks and reviews it and never lands it. "+
 		"A session lands %s by the normal pull request rules, or closes it. Its measurement starts once it is on the default branch; "+
 		"closed without merging, the case reopens.", strings.Join(p.Hand, ", "), p.PR)
+	notes, err := s.Store.Notes(ctx)
+	if err != nil {
+		return err
+	}
+	for _, n := range notes {
+		if n.ID == handNoteID(c.ID) && n.Detail == detail {
+			return nil // the same proposal stays as its reader left it, resolved or not
+		}
+	}
 	_, err = s.Store.PutNote(ctx, store.Note{ID: handNoteID(c.ID), Kind: store.NoteProblem, Importance: store.ImportanceLow,
 		Source: "momentum", At: s.now(), Title: plainClip("The loop's change for case "+c.ID+" is "+store.HandStage+": "+c.Title, store.TitleMax),
 		Detail: detail, Links: prLinks(p.PR)})
@@ -153,10 +162,10 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 		if _, err := s.git(ctx, p.Host, "merge-base", "--is-ancestor", pr.MergeCommit.OID, "origin/"+p.Base); err != nil {
 			return p, refused("the merge commit of %s is not on %s yet", p.PR, p.Base)
 		}
-		if pr.Head != p.Head {
+		if pr.Head != "" && pr.Head != p.Head {
 			// a person may change a proposal before landing it: what is measured is what landed
-			if err := s.Store.CaseNote(cleanedNote(ctx), caseID, "landed head differs",
-				fmt.Sprintf("%s landed head %s, not the checked %s; the landing at %s is measured", p.PR, pr.Head, p.Head, pr.MergeCommit.OID), s.Actor); err != nil {
+			if err := s.caseNoteOnce(ctx, caseID, "landed head differs",
+				fmt.Sprintf("%s landed head %s, not the checked %s; the landing at %s is measured", p.PR, pr.Head, p.Head, pr.MergeCommit.OID)); err != nil {
 				return p, err
 			}
 		}
@@ -194,13 +203,28 @@ func (s *Ship) finishHand(ctx context.Context, p Package) error {
 
 // withdrawHand records a closed hand landing proposal: its record ends and the case reopens, or, after the package's
 // second closed proposal, stays in testing for a person. Its pull request is cleared last, so a withdrawal that stopped
-// partway is finished at the next call.
+// partway is finished at the next call; the case log's ended line journals it, so a case that already left testing
+// after it is not reopened again.
 func (s *Ship) withdrawHand(ctx context.Context, p Package) (Package, error) {
 	pr := p.PR
-	if err := s.handEnded(ctx, p.Case, "closed without merging: "+pr); err != nil {
+	ended := "closed without merging: " + pr
+	if err := s.caseNoteOnce(ctx, p.Case, store.ActionHandEnded, ended); err != nil {
 		return p, err
 	}
-	if p.ClosedProposals < MaxClosedProposals {
+	if err := s.handEnded(ctx, p.Case, ended); err != nil {
+		return p, err
+	}
+	log, err := s.Store.CaseLog(ctx, p.Case)
+	if err != nil {
+		return p, err
+	}
+	reopened := false
+	for i := len(log) - 1; i >= 0 && !(log[i].Action == store.ActionHandEnded && log[i].Detail == store.CaseNoteText(ended)); i-- {
+		reopened = reopened || log[i].Action == "set" && strings.Contains(log[i].Detail, "status testing -> ")
+	}
+	if reopened {
+		// it left testing after the close: the reopen went in, and the case came back since
+	} else if p.ClosedProposals < MaxClosedProposals {
 		if _, err := s.Store.UpdateCase(ctx, p.Case, store.CaseUpdate{Status: store.CaseOpen}, s.Actor); err != nil {
 			return p, err
 		}
@@ -214,4 +238,19 @@ func (s *Ship) withdrawHand(ctx context.Context, p Package) (Package, error) {
 	}
 	p.PR = ""
 	return p, s.saveAuthorized(ctx, &p)
+}
+
+// caseNoteOnce writes a case log line unless the log holds the same one.
+func (s *Ship) caseNoteOnce(ctx context.Context, id, action, detail string) error {
+	detail = store.CaseNoteText(detail)
+	log, err := s.Store.CaseLog(ctx, id)
+	if err != nil {
+		return err
+	}
+	for _, entry := range log {
+		if entry.Action == action && entry.Detail == detail {
+			return nil
+		}
+	}
+	return s.Store.CaseNote(cleanedNote(ctx), id, action, detail, s.Actor)
 }

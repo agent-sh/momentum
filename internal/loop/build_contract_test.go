@@ -99,6 +99,14 @@ func TestACheckResolvesItsProgramOnTheSandboxPath(t *testing.T) {
 	if err := (Sandbox{Path: []string{empty}}).resolve("pytest"); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "not on the sandbox's PATH") {
 		t.Fatalf("a program the sandbox lacks: %v", err)
 	}
+	outside := t.TempDir()
+	script(t, outside, "uv", "exit 0")
+	if err := os.Symlink(filepath.Join(outside, "uv"), filepath.Join(tools, "uv")); err != nil {
+		t.Fatal(err)
+	}
+	if err := (Sandbox{ReadOnly: []string{tools}, Path: []string{tools}}).resolve("uv"); !errors.Is(err, ErrRefused) {
+		t.Fatalf("a link out of the sandbox's mounts: %v", err)
+	}
 	write(t, filepath.Join(empty, "bats"), "not executable")
 	if err := (Sandbox{}).resolve("bats"); !errors.Is(err, ErrRefused) {
 		t.Fatalf("a file that cannot run: %v", err)
@@ -125,6 +133,12 @@ func TestPathScopeSortsHandLandingPaths(t *testing.T) {
 		if _, err := PathScope(self, []string{"internal/capacity/names.go", p}); !errors.Is(err, ErrRefused) {
 			t.Fatalf("%s may be proposed: %v", p, err)
 		}
+	}
+	if hand, err := PathScope(self, []string{"internal/supervise/rules_test.go"}); err != nil || len(hand) != 1 {
+		t.Fatalf("the supervision rules' test: %v %v", hand, err)
+	}
+	if _, err := PathScope(self, []string{"internal/supervise/new.go"}); !errors.Is(err, ErrRefused) {
+		t.Fatalf("a new supervision file may be proposed: %v", err)
 	}
 	if hand, err := PathScope(Target{Repo: "agent-sh/fake"}, []string{"internal/loop/gate.go", "go.mod"}); err != nil || len(hand) != 0 {
 		t.Fatalf("another repository's paths: %v %v", hand, err)
@@ -186,6 +200,14 @@ func TestANextBuildReadsWhyTheLastWasRefused(t *testing.T) {
 	}
 	if text, err := r.lastBuildRefusal(ctx, c); err != nil || text != "" {
 		t.Fatalf("a host failure read as the build's refusal: %q %v", text, err)
+	}
+	if err := r.Store.PutLoopRun(ctx, store.LoopRun{ID: "20261105-083759-0000cccc", Case: c.ID, Family: c.Family, Step: StepBuild,
+		Started: time.Now().Add(-time.Second), Ended: time.Now(), Status: store.RunFailed, Failure: "build propose",
+		Summary: "build propose: gh: network down", CaseEpisode: c.Episode}); err != nil {
+		t.Fatal(err)
+	}
+	if text, err := r.lastBuildRefusal(ctx, c); err != nil || text != "" {
+		t.Fatalf("a gh failure at the proposal read as the build's refusal: %q %v", text, err)
 	}
 }
 
@@ -283,6 +305,9 @@ func TestAHandLandingProposalIsReviewedAndNeverLanded(t *testing.T) {
 	}
 	if n, _ := handNote(t, s.Store, c.ID); n.Done.IsZero() {
 		t.Fatal("the hand landing note stands after the landing")
+	}
+	if log, _ := s.Store.CaseLog(ctx, c.ID); slices.ContainsFunc(log, func(e store.CaseEntry) bool { return e.Action == "landed head differs" }) {
+		t.Fatal("a pull request that named no head was noted as a different head")
 	}
 	if pushes, _ := os.ReadFile(filepath.Join(f.dir, "pushes")); strings.Count(string(pushes), "refs/heads/main") != 1 {
 		t.Fatalf("the loop pushed to the default branch:\n%s", pushes)
@@ -475,6 +500,43 @@ func TestTwoClosedHandLandingsStopTheCase(t *testing.T) {
 	if err != nil || got.ID != "" || !strings.Contains(why, "used its proposals") {
 		t.Fatalf("the case was picked after two closed proposals: %q %q %v", got.ID, why, err)
 	}
+	if err := r.noteWaiting(ctx); err != nil {
+		t.Fatal(err)
+	}
+	notes, err := s.Store.Notes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(notes, func(n store.Note) bool {
+		return n.ID == waitingPrefix+store.IDPart(c.ID) && strings.Contains(n.Detail, "Take the change over by hand")
+	}) {
+		t.Fatalf("no note asks a person to take the change over: %+v", notes)
+	}
+}
+
+// A withdrawal that stopped after its case reopened does not reopen it again once the case is back in testing.
+func TestAWithdrawalAfterItsReopenIsNotRepeated(t *testing.T) {
+	ctx := context.Background()
+	s, c, _, p := proposedHand(t)
+	p.State, p.ClosedProposals = Withdrawn, 1
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Store.CaseNote(ctx, c.ID, store.ActionHandEnded, "closed without merging: "+p.PR, "loop"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseOpen}, "loop"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting}, "investigation"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.reconcileHand(ctx, c.ID); err != nil || got.PR != "" {
+		t.Fatalf("the finished withdrawal: %+v %v", got, err)
+	}
+	if got, _ := s.Store.CaseByID(ctx, c.ID); got.Status != store.CaseTesting {
+		t.Fatalf("the case was reopened again: %s", got.Status)
+	}
 }
 
 // Land rechecks a package's changed paths: a package that lost its hand landing mark still does not land them.
@@ -488,6 +550,13 @@ func TestLandRechecksTheChangedPaths(t *testing.T) {
 	}
 	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "never its to land") {
 		t.Fatalf("landed a path outside the allow-list: %v", err)
+	}
+	p.State, p.LandingHead = Landing, p.Head
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "never its to land") {
+		t.Fatalf("resumed the landing of a path outside the allow-list: %v", err)
 	}
 }
 

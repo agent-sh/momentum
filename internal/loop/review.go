@@ -327,6 +327,9 @@ func (r *Runner) noteWaiting(ctx context.Context) error {
 		if proposalsUsed(p) {
 			note.Title = fmt.Sprintf("The loop's change for case %s used its %d closed proposals and waits for a person", c.ID, MaxClosedProposals)
 			note.Detail = "Two pull requests were closed without merging. The loop builds this case no more. Propose the checked package with ship propose, or close the case."
+			if p.State == Withdrawn {
+				note.Detail = "Two pull requests were closed without merging, the last a hand landing proposal. The loop builds this case no more. Take the change over by hand, or close the case."
+			}
 		}
 		if u, err := url.Parse(p.PR); err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" {
 			note.Links = []store.Link{{Label: "pull request", URL: p.PR}}

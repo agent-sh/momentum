@@ -345,7 +345,8 @@ func buildScope(repo string) string {
 	return "Paths: this is the loop's own repository. The loop lands a change only when every path it touches is one of " +
 		strings.Join(SelfLandable(), ", ") + ": prefer a fix inside them. A fix that needs other paths is still checked and reviewed, " +
 		"then proposed for a person to land by hand; the loop never lands it. No change touches CI configuration (" + ci +
-		") or these, which the loop's measurement and its event scanners rest on: " + strings.Join(ProposalProtected(), ", ") + "."
+		") or these, which the loop's measurement and its event scanners rest on: " + strings.Join(ProposalProtected(), ", ") +
+		" (of internal/supervise/, rules.go and test files may change)."
 }
 
 // refusalKeys are the build stages whose failure is the run's own output: its report, its patch, its check or its
@@ -367,8 +368,13 @@ func (r *Runner) lastBuildRefusal(ctx context.Context, c store.Case) (string, er
 			return "", nil
 		}
 		text := run.Summary
-		if i := strings.Index(text, run.Failure+": "); i >= 0 {
-			text = text[i:]
+		i := strings.Index(text, run.Failure+": ")
+		if i < 0 {
+			return "", nil
+		}
+		text = text[i:]
+		if run.Failure != "build report" && !strings.HasPrefix(text[len(run.Failure)+2:], "refused") {
+			return "", nil // a host error of the stage (a network, a git or a gh failure) is no refusal of the build's output
 		}
 		for _, tail := range []string{" (relay: ", " (the relay refused ", " (untrusted harness diagnostics"} {
 			if i := strings.Index(text, tail); i >= 0 {

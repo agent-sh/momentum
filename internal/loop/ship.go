@@ -728,7 +728,13 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 	if err != nil {
 		return p, err
 	}
-	wasHand := len(p.Hand) > 0 && p.PR != ""
+	log, err := s.Store.CaseLog(ctx, caseID)
+	if err != nil {
+		return p, err
+	}
+	if store.HandOf(c, log) != "" && len(hand) == 0 {
+		return p, refused("case %s's proposal is a hand landing: a revision of it stays one; close it to propose a change the loop lands", caseID)
+	}
 	p.Hand = hand
 	switch {
 	case strings.TrimSpace(pr.Title) == "" || strings.TrimSpace(pr.Body) == "":
@@ -853,9 +859,6 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 		labels = []string{"--label", HandLabel}
 	}
 	edits := addLabels(labels)
-	if wasHand && len(p.Hand) == 0 {
-		edits = []string{"--remove-label", HandLabel} // a revision inside the landable paths is the loop's to land again
-	}
 	if p.PR == "" {
 		if err := s.saveAuthorized(ctx, &p); err != nil {
 			return p, err
@@ -909,9 +912,6 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 	}
 	if len(p.Hand) > 0 {
 		return p, s.handProposed(ctx, c, p)
-	}
-	if wasHand {
-		return p, s.handEnded(ctx, caseID, "the revision changes only paths the loop lands: "+p.PR)
 	}
 	return p, nil
 }
@@ -1124,6 +1124,9 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	defer unlock()
 	p, ok, err := s.Load(caseID)
 	if err == nil && ok && p.State == Landing && len(p.Hand) == 0 {
+		if err := CheckPaths(Target{Repo: p.Repo}, p.Changed); err != nil {
+			return p, err
+		}
 		if !s.Live {
 			return p, refused("the loop is not live")
 		}
