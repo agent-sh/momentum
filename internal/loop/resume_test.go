@@ -80,12 +80,15 @@ func TestAFixOfTheStopResumesTheCasesItHeld(t *testing.T) {
 		t.Fatalf("a fix that is no reference: %v", err)
 	}
 	if _, err := st.PutNote(ctx, store.Note{ID: store.ReviewNoteID(a.ID, "stopped"), Kind: store.NoteProblem, Importance: store.ImportanceLow,
-		At: time.Now(), Title: "The loop's review for case " + a.ID + " waits: stopped"}); err != nil {
+		At: time.Now(), Title: "The loop's review for case " + a.ID + " waits: stopped", Detail: "its last two review runs failed the same way: report"}); err != nil {
 		t.Fatal(err)
 	}
 	// late has failed once, and its second run is still running at the close: the close does not see it held
 	late := openCase(t, st, "failures", "late", 2)
 	fail(late, StepInvestigate, "turns", 3*time.Minute)
+	// mixed has failed once before the close, and fails again after it
+	mixed := openCase(t, st, "failures", "mixed", 2)
+	fail(mixed, StepInvestigate, "turns", 3*time.Minute)
 	running := time.Now().Add(-time.Minute)
 	time.Sleep(5 * time.Millisecond)
 	closed, resumed, err := st.CloseFixed(ctx, turns.ID, "git:agent-sh/momentum@4814cc4", stopped, "the cap was raised", "cli")
@@ -129,8 +132,9 @@ func TestAFixOfTheStopResumesTheCasesItHeld(t *testing.T) {
 		t.Fatalf("the late stop held its case: %q %v", why, err)
 	}
 	log, _ = st.CaseLog(ctx, late.ID)
-	if last := log[len(log)-1]; last.Action != store.ActionResumed || !strings.Contains(last.Detail, "fixed by git:agent-sh/momentum@4814cc4, before this stop's first run started") {
-		t.Fatalf("the late case's resume line: %+v", last)
+	if last := log[len(log)-1]; last.Action != store.ActionResumed || !strings.Contains(last.Detail, "fixed by git:agent-sh/momentum@4814cc4, while this stop's runs were under way") ||
+		last.At.UnixMilli() != closed.Closed.UnixMilli() {
+		t.Fatalf("the late case's resume line, as of the close at %v: %+v", closed.Closed, last)
 	}
 	if h, _ := st.CaseByID(ctx, turns.ID); h.Status != store.CaseClosed || h.Evidence != turns.Evidence {
 		t.Fatalf("the late stop changed the closed case: %s, %d evidence", h.Status, h.Evidence)
@@ -145,20 +149,34 @@ func TestAFixOfTheStopResumesTheCasesItHeld(t *testing.T) {
 		t.Fatalf("a closed case closed again: %v", err)
 	}
 
-	// the fix did not hold: the case fails twice again, and the component-health case comes back
+	// a resumed case's next failure does not stop it
 	time.Sleep(5 * time.Millisecond)
 	fail(a, StepInvestigate, "turns", 0)
 	if why, err := r.stopped(ctx, a, true); err != nil || why != "" {
 		t.Fatalf("one failure after the resume stopped it: %q %v", why, err)
 	}
+	// the fix did not hold: mixed fails after the close, resumes as of it, and its next failure is the second after
+	// the fix, which stops it and brings the component-health case back
 	time.Sleep(5 * time.Millisecond)
-	fail(a, StepInvestigate, "turns", 0)
-	if why, err := r.stopped(ctx, a, false); err != nil || why == "" {
-		t.Fatalf("two failures after the resume did not stop it: %v", err)
+	fail(mixed, StepInvestigate, "turns", 0)
+	if why, err := r.stopped(ctx, mixed, false); err != nil || why != "" {
+		t.Fatalf("one failure after the fix stopped mixed: %q %v", why, err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	fail(mixed, StepInvestigate, "turns", 0)
+	if why, err := r.stopped(ctx, mixed, false); err != nil || why == "" {
+		t.Fatalf("two failures after the fix did not stop mixed: %v", err)
 	}
 	back, _ := st.CaseByID(ctx, turns.ID)
 	log, _ = st.CaseLog(ctx, turns.ID)
 	if back.Status != store.CaseOpen || log[len(log)-1].Action != "regressed" {
 		t.Fatalf("the fix that did not hold: %s, %+v", back.Status, log[len(log)-1])
+	}
+	// a stop after the resume puts the review's stopped note again
+	if err := r.noteReviewSkip(ctx, a, "stopped", "its last two review runs failed the same way: report"); err != nil {
+		t.Fatal(err)
+	}
+	if n, ok, _ := st.Note(ctx, store.ReviewNoteID(a.ID, "stopped")); !ok || !n.Done.IsZero() {
+		t.Fatalf("a stop after the resume left the review note done: %+v", n)
 	}
 }

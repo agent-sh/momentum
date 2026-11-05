@@ -1107,8 +1107,8 @@ func fixable(c Case) error {
 	return nil
 }
 
-// resume writes a case's resumed line, naming the component-health case and its fix, and marks its review's stopped
-// note done.
+// resume writes a case's resumed line at a time, naming the component-health case and its fix, and marks its
+// review's stopped note done: a stop after the resume puts it again (the runner's noteReviewSkip).
 func resume(ctx context.Context, q querier, id, health, fix, late, actor string, now time.Time) error {
 	detail := fmt.Sprintf("the stop rule's hold ended: %s, the loop's case of its stop, closed as fixed by %s%s", health, fix, late)
 	if err := caseLog(ctx, q, id, actor, ActionResumed, detail, now); err != nil {
@@ -1153,7 +1153,8 @@ func fixedStop(ctx context.Context, q querier, signature string, first time.Time
 
 // ResumeLate resumes a case the stop rule would hold now when the component-health case of its stop closed as fixed
 // after the stop's older run started (FixedStop): its second failure was still running at the close, or ended after
-// the close read which cases were held. It reports whether it resumed the case.
+// the close read which cases were held. The resumed line is dated at the close, as the close would have written it,
+// so a run that failed after the fix counts toward the case's next stop. It reports whether it resumed the case.
 func (s *Store) ResumeLate(ctx context.Context, id, signature string, first time.Time, actor string) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1171,7 +1172,8 @@ func (s *Store) ResumeLate(ctx context.Context, id, signature string, first time
 	if c.Into != "" || !slices.Contains(working, c.Status) {
 		return false, nil
 	}
-	if err := resume(ctx, tx, c.ID, h.ID, fix, ", before this stop's first run started", actor, time.Now()); err != nil {
+	// as of the close, as the close would have resumed it: a failure after the fix still counts toward the next stop
+	if err := resume(ctx, tx, c.ID, h.ID, fix, ", while this stop's runs were under way", actor, h.Closed); err != nil {
 		return false, err
 	}
 	return true, tx.Commit()

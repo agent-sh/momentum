@@ -275,9 +275,13 @@ func (r *Runner) noteReviewSkip(ctx context.Context, c store.Case, cause, why st
 	if err != nil {
 		return err
 	}
+	resumed, err := r.Store.ResumedAt(ctx, c.ID)
+	if err != nil {
+		return err
+	}
 	for _, note := range notes {
-		if note.ID == id && note.Detail == detail {
-			return nil // the same cause stays resolved if its reader resolved it
+		if note.ID == id && note.Detail == detail && (note.Done.IsZero() || !resumed.After(note.At)) {
+			return nil // the same cause stays resolved if its reader resolved it, until the case resumes past it
 		}
 	}
 	_, err = r.Store.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Importance: store.ImportanceLow,
