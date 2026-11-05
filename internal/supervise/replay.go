@@ -158,9 +158,22 @@ func Replay(points []Point, labels []Label, p Params, probe Probe, until time.Ti
 	resynced := map[string]bool{} // a session's wakeups and runs the overdue rule acted on: one resync for each
 	for _, pt := range points {
 		pt.Stop.Choose(func(k string) bool { return resynced[pt.Session+" "+k] }, pt.Stop.At, p)
-		d := Plan(pt.Stop, Tries{}, p, probe)
-		if pt.Waiting {
-			d = PlanOnly(RuleStalled, pt.Stop, Tries{}, p, probe)
+		plan := func() Decision {
+			if pt.Waiting {
+				return PlanOnly(RuleStalled, pt.Stop, Tries{}, p, probe)
+			}
+			return Plan(pt.Stop, Tries{}, p, probe)
+		}
+		d := plan()
+		// a local command shows the owner at the session from then: it holds a rule that had not acted yet
+		for _, at := range pt.Controls {
+			if d.Verdict != Wait && d.Verdict != Hold || d.At.IsZero() || !at.Before(d.At) {
+				break
+			}
+			if at.After(pt.Stop.OwnerAt) {
+				pt.Stop.OwnerAt = at
+				d = plan()
+			}
 		}
 		r := Result{Point: pt, Decision: d, Label: labelOf(pt)}
 		end := pt.Next.At
