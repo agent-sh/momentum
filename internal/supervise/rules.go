@@ -45,6 +45,7 @@ type Stop struct {
 	Key, Tool, Name string
 	Where           string // a tmux target, tty, bg, or a Hermes platform
 	Auto            bool   // an automated run
+	Exited          bool   // its process exited at the stop (/exit): nothing runs there to act on until it is opened again
 	Phase           sessions.Phase
 	At              time.Time        // when the session stopped: its last turn ended
 	Error           string           // the API error the turn ended on
@@ -211,6 +212,8 @@ func guard(s Stop) (Decision, bool) {
 	switch {
 	case s.Auto:
 		return Decision{Verdict: Skip, Why: "an automated run"}, true
+	case s.Exited:
+		return Decision{Verdict: Skip, Why: "its process exited"}, true
 	case s.Ask == sessions.AskQuestion || s.Ask == sessions.AskPlan || s.Ask == sessions.AskPermission:
 		return Decision{Verdict: Skip, Why: "it asks its owner (" + string(s.Ask) + ")"}, true
 	case s.Tool == "hermes" && s.Where != "cli" && s.Where != "tui":

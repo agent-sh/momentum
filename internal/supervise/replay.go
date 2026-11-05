@@ -140,19 +140,31 @@ func Replay(points []Point, labels []Label, p Params, probe Probe, until time.Ti
 		bySession[l.Session] = append(bySession[l.Session], l)
 	}
 	taken := map[*Label]bool{}
-	labelOf := func(pt Point) *Label {
-		if pt.Next.Kind != "owner" {
-			return nil
-		}
+	labelAt := func(pt Point, at time.Time) *Label {
 		for _, id := range []string{pt.Session, strings.TrimPrefix(pt.Session, "hermes:")} { // a Hermes id without its prefix
 			for _, l := range bySession[id] {
-				if d := l.At.Sub(pt.Next.At); !taken[l] && d > -labelSlack && d < labelSlack {
+				if d := l.At.Sub(at); !taken[l] && d > -labelSlack && d < labelSlack {
 					taken[l] = true // a label ends one stop: two inputs in the same second share one
 					return l
 				}
 			}
 		}
 		return nil
+	}
+	// labelOf is the owner's labelled step at a stop, and when he took it: on its next input, else on one of his
+	// local commands after it (a restart step such as /login), which ends no stop of its own
+	labelOf := func(pt Point) (*Label, time.Time) {
+		if pt.Next.Kind == "owner" {
+			if l := labelAt(pt, pt.Next.At); l != nil {
+				return l, pt.Next.At
+			}
+		}
+		for _, at := range pt.Controls {
+			if l := labelAt(pt, at); l != nil {
+				return l, at
+			}
+		}
+		return nil, time.Time{}
 	}
 	var out []Result
 	resynced := map[string]bool{} // a session's wakeups and runs the overdue rule acted on: one resync for each
@@ -175,7 +187,9 @@ func Replay(points []Point, labels []Label, p Params, probe Probe, until time.Ti
 				d = plan()
 			}
 		}
-		r := Result{Point: pt, Decision: d, Label: labelOf(pt)}
+		r := Result{Point: pt, Decision: d}
+		var stepAt time.Time
+		r.Label, stepAt = labelOf(pt)
 		end := pt.Next.At
 		if pt.Next.Kind == "none" {
 			end = until
@@ -187,8 +201,8 @@ func Replay(points []Point, labels []Label, p Params, probe Probe, until time.Ti
 			}
 		}
 		switch {
-		case r.Label != nil && r.Fired:
-			r.Outcome, r.Earlier = Covered, pt.Next.At.Sub(d.At)
+		case r.Label != nil && (d.Verdict == Wait || d.Verdict == Hold) && !d.At.IsZero() && d.At.Before(stepAt):
+			r.Outcome, r.Earlier = Covered, stepAt.Sub(d.At)
 		case r.Label != nil && d.Rule != "" && (d.Verdict == Wait || d.Verdict == Hold):
 			r.Outcome = OwnerFirst
 		case r.Label != nil:

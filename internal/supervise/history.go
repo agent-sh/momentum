@@ -45,7 +45,7 @@ const stallFloor = time.Minute
 type Next struct {
 	At        time.Time
 	Kind      string // owner, self, momentum, none
-	InputKind string // the owner's: typed, queued, slash, shell, answer, interrupt
+	InputKind string // the owner's: typed, queued, slash, shell, answer, interrupt, exit; restart for a reopening
 	Text      string
 }
 
@@ -380,7 +380,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		for _, c := range crons {
 			s.Loop = c.expr
 		}
-		s.TurnBegan, s.IdleAt = turnBegan, prevAt
+		s.TurnBegan, s.IdleAt, s.Exited = turnBegan, prevAt, prevRole == "exit"
 		// Its own runs its harness should start, as the session layer lists them, a reopening for a restart.
 		if !wake.at.IsZero() && wake.seen {
 			s.Runs = append(s.Runs, claude.WakeRun(wake.at, wake.set, wake.what, wake.sign, time.Time{}))
@@ -431,6 +431,11 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			waitedThrough("the conversation was compacted while it waited", e.TS)
 		}
 		if r == "" || r == "compaction" { // a compaction runs as a turn starts or mid-turn: no stop of its own
+			// the store puts the record of a turn's end on the first record after the turn, which may be one passed
+			// over (a local command's caveat, a meta line): the next input's point reads it
+			if prior, _ := m["prior"].(string); carried == "" && turnOver(harness, prior) {
+				carried = prior
+			}
 			continue
 		}
 		switch r {
@@ -445,24 +450,26 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			}
 			continue
 		case "aborted":
-			// Codex ended the turn on its user's interruption, as its live tracker reads turn_aborted: the stop before
-			// it goes on to his next input, which reads the turn as over
+			// Codex ended the turn on its user's interruption, as its live tracker reads turn_aborted, with no call
+			// running: the stop before it goes on to the next input, which reads the turn as over. Like the live
+			// tracker, the replay does not count it as his presence.
 			if carried == "" {
 				carried = "turn_aborted"
 			}
+			pending = map[string]bool{}
 			continue
 		case "exit":
-			// /exit or /quit: the process ends, and what ran dies with it. The stop before it ends here, and none
-			// follows until the session's next record.
+			// /exit or /quit: the process ends, and what ran dies with it. The stop before it ends here; the stop after
+			// it is one no rule acts on (Stop.Exited) until the session's next record.
 			if !prevAt.IsZero() {
 				prevPrior = priorOf(m, carried)
 				out = append(out, Point{Session: id, Stop: stopOf(e.TS, e.Ref), Next: Next{At: e.TS, Kind: "owner", InputKind: "exit", Text: e.Summary},
 					Entry: entry, Controls: controls})
 			}
-			ownerAt, controls, carried = e.TS, nil, ""
+			ownerAt, controls, carried, words = e.TS, nil, "", ""
 			tasks, pending = map[string]replayTask{}, map[string]bool{}
 			restart(e.TS)
-			prevAt, prevRole, prevPrior, owes, owesRef = time.Time{}, "", "", time.Time{}, ""
+			prevAt, prevRole, prevPrior, owes, owesRef = e.TS, "exit", "", time.Time{}, ""
 			continue
 		}
 		if r == "self" && strings.HasPrefix(e.Summary, "<task-notification>") && !strings.Contains(e.Summary, "</task-notification>") {
@@ -493,7 +500,9 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 				next = Next{At: e.TS, Kind: "owner", InputKind: "restart", Text: "the session was reopened"}
 			}
 			if r != "synthetic" || !st.RequestAt.IsZero() {
-				out = append(out, Point{Session: id, Stop: st, Next: next, Entry: entry, Waiting: true, Controls: controls})
+				// no Controls: a local command during the wait is a user record, which ends the wait on its request
+				// here as in the live layer, so no stalled rule reads such a wait
+				out = append(out, Point{Session: id, Stop: st, Next: next, Entry: entry, Waiting: true})
 			}
 		}
 		why, _ := m["why"].(string)

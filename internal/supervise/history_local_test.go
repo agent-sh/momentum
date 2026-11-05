@@ -24,6 +24,15 @@ func (b *timelineBuilder) localCommand(after time.Duration, name, prior string) 
 		`{"prior":"informational","why":"meta line"}`)
 }
 
+// caveatFirst is a local command as Claude Code may also write it: the caveat first, carrying the system record before
+// it, then the command's echo.
+func (b *timelineBuilder) caveatFirst(after time.Duration, name, prior string) *timelineBuilder {
+	b.add(after, "harness_text", store.ActorHarness, "", "<local-command-caveat>The command below was run directly in Claude Code, not sent to you as a request.</local-command-caveat>",
+		`{"prior":"`+prior+`","why":"meta line"}`)
+	return b.add(time.Millisecond, "harness_text", store.ActorHarness, "", "<command-name>/"+name+"</command-name> <command-message>"+name+"</command-message> <command-args></command-args>",
+		`{"input_kind":"slash","why":"local command"}`)
+}
+
 // codex makes the session's events Codex's.
 func (b *timelineBuilder) codex() *timelineBuilder {
 	for i := range b.evs {
@@ -80,6 +89,15 @@ func TestALocalCommandIsTheOwnersPresenceAndOpensNoTurn(t *testing.T) {
 	hook.localCommand(5*time.Minute, "effort", "stop_hook_summary").owner(time.Minute, "continue", "")
 	hookNext := hook.at
 	hook.put(st)
+	// the same with the caveat first, and a session whose last record is a local command after its hook ended the turn
+	caveat := newTimeline(t, "caveat").owner(0, "lint it", "").call(time.Second, "Bash", "t1", `{"command":"make lint"}`).
+		result(time.Second, "Bash", "t1", "ok")
+	caveat.caveatFirst(5*time.Minute, "effort", "stop_hook_summary").owner(time.Minute, "continue", "")
+	caveatNext := caveat.at
+	caveat.put(st)
+	ends := newTimeline(t, "ends").owner(0, "lint it", "").call(time.Second, "Bash", "t1", `{"command":"make lint"}`).
+		result(time.Second, "Bash", "t1", "ok").localCommand(5*time.Minute, "effort", "stop_hook_summary")
+	ends.put(st)
 	// a prompt slash command, and a prompt the store marks as a local command, do open turns
 	skill := newTimeline(t, "skill").owner(0, "watch the run", "").say(10*time.Second, "Watching.").
 		add(time.Minute, "harness_text", store.ActorHarness, "", "<command-message>loop</command-message> <command-name>/loop</command-name>",
@@ -99,6 +117,12 @@ func TestALocalCommandIsTheOwnersPresenceAndOpensNoTurn(t *testing.T) {
 	}
 	if r := replayed(t, st, "hook", hookNext); r.Point.Stop.Working || Why(r) == owedReply {
 		t.Fatalf("a turn its hook ended: working %v, %q", r.Point.Stop.Working, Why(r))
+	}
+	if r := replayed(t, st, "caveat", caveatNext); r.Point.Stop.Working || Why(r) == owedReply {
+		t.Fatalf("a turn its hook ended, the caveat first: working %v, %q", r.Point.Stop.Working, Why(r))
+	}
+	if r := replayed(t, st, "ends", time.Time{}); r.Point.Stop.Working || r.Point.Next.Kind != "none" {
+		t.Fatalf("the last stop, its turn ended by its hook: working %v, next %+v", r.Point.Stop.Working, r.Point.Next)
 	}
 	points, _ := replayAll(t, st)
 	opened := 0
@@ -127,42 +151,71 @@ func TestALocalCommandHoldsOnlyARuleThatHadNotActed(t *testing.T) {
 	early := newTimeline(t, "early").owner(0, "deploy it", "turn_duration").say(10*time.Second, "Deploying.").apiError(time.Minute, err503)
 	early.localCommand(5*time.Minute, "model", "")
 	command := early.at.Add(-time.Millisecond)
-	early.owner(7*time.Minute, ".", "")
+	early.owner(12*time.Minute, ".", "")
 	earlyNext := early.at
 	early.put(st)
+	// a restart step the owner took with /login, after the rule's time: measured at the command, which ends no stop
+	step := newTimeline(t, "step").owner(0, "deploy it", "turn_duration").say(10*time.Second, "Deploying.").apiError(time.Minute, err503)
+	step.localCommand(20*time.Minute, "login", "")
+	stepAt := step.at.Add(-time.Millisecond)
+	step.owner(time.Minute, "deploy it again", "")
+	stepNext := step.at
+	step.put(st)
 
 	r := replayed(t, st, "late", lateNext)
 	if r.Decision.Rule != RuleTransient || !r.Fired || r.Outcome != Unlabelled || !r.Decision.At.Before(errAt.Add(30*time.Minute)) {
 		t.Fatalf("a command after the rule's time: %s %v %q at %v", r.Decision.Rule, r.Fired, r.Outcome, r.Decision.At)
 	}
 	r = replayed(t, st, "early", earlyNext)
-	if r.Decision.Rule != RuleTransient || r.Fired || !r.Point.Stop.OwnerAt.Equal(command) || Why(r) != "transient: the owner came first" {
-		t.Fatalf("a command before the rule's time: %s %v owner at %v, %q", r.Decision.Rule, r.Fired, r.Point.Stop.OwnerAt, Why(r))
+	if r.Decision.Rule != RuleTransient || r.Decision.Verdict != Hold || !r.Decision.At.Equal(command.Add(DefaultParams.OwnerWindow)) || r.Fired ||
+		!r.Point.Stop.OwnerAt.Equal(command) || Why(r) != "transient: the owner came first" {
+		t.Fatalf("a command before the rule's time: %s %s until %v, fired %v, owner at %v, %q", r.Decision.Rule, r.Decision.Verdict, r.Decision.At,
+			r.Fired, r.Point.Stop.OwnerAt, Why(r))
 	}
+	until := t0.Add(6 * time.Hour)
+	points, err := History(context.Background(), st, t0.Add(-time.Hour), until)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels := []Label{{Session: "step", At: stepAt, Kind: "restart"}}
+	for _, r := range Replay(points, labels, DefaultParams, probeAt(time.Time{}), until) {
+		if r.Point.Session == "step" && r.Point.Next.At.Equal(stepNext) {
+			if r.Label == nil || r.Outcome != Covered || r.Earlier != stepAt.Sub(r.Decision.At) {
+				t.Fatalf("a restart step on a local command: label %v, %q, %v earlier", r.Label, r.Outcome, r.Earlier)
+			}
+			return
+		}
+	}
+	t.Fatal("no stop ends on the step's next input")
 }
 
-// /exit ends the process: the stop before it ends there, and no stop follows it, so no rule acts on a session that
-// is gone.
+// /exit ends the process: the stop before it ends there, reading the turn's end recorded on the command, and the
+// stop after it is one no rule acts on, so no rule acts on a session that is gone.
 func TestAnExitEndsTheStop(t *testing.T) {
 	st := testStore(t)
 	b := newTimeline(t, "exit").owner(0, "run the suite", "turn_duration").say(10*time.Second, "The suite is running. I'll report when it finishes.")
 	stoppedAt := b.at
 	b.localCommand(5*time.Minute, "exit", "")
 	b.put(st)
-	points, rs := replayAll(t, st)
-	var last Point
-	for _, p := range points {
-		if p.Session == "exit" {
-			last = p
-		}
-	}
-	if !last.Stop.At.Equal(stoppedAt) || last.Next.InputKind != "exit" {
-		t.Fatalf("the session's last stop: at %v, next %+v", last.Stop.At, last.Next)
-	}
+	hook := newTimeline(t, "exit-hook").owner(0, "lint it", "").call(time.Second, "Bash", "t1", `{"command":"make lint"}`).
+		result(time.Second, "Bash", "t1", "ok").localCommand(5*time.Minute, "exit", "stop_hook_summary")
+	hook.put(st)
+	_, rs := replayAll(t, st)
+	var stops []Result
 	for _, r := range rs {
-		if r.Point.Session == "exit" && r.Outcome == Left {
+		if r.Point.Session == "exit" {
+			stops = append(stops, r)
+		}
+		if r.Point.Session == "exit-hook" && r.Point.Next.InputKind == "exit" && r.Point.Stop.Working {
+			t.Fatalf("a turn its hook ended reads as working at its exit: %+v", r.Point.Stop)
+		}
+		if r.Outcome == Left {
 			t.Fatalf("a rule acted on an exited session: %+v", r)
 		}
+	}
+	if len(stops) != 2 || !stops[0].Point.Stop.At.Equal(stoppedAt) || stops[0].Point.Next.InputKind != "exit" ||
+		!stops[1].Point.Stop.Exited || stops[1].Decision.Verdict != Skip || Why(stops[1]) != "skipped: its process exited" {
+		t.Fatalf("the session's stops: %+v", stops)
 	}
 }
 
@@ -182,11 +235,15 @@ func TestACodexAbortedTurnIsAnInterruption(t *testing.T) {
 		stopAt, nudgedAt time.Time
 	}
 	var shapes []shape
-	for _, name := range []string{"record", "marked", "both"} {
-		b := newTimeline(t, name).owner(0, "watch the checks", "").call(time.Second, "exec", "c1", `{"cmd":"gh pr checks 9"}`).
-			result(12*time.Second, "exec", "c1", "aborted by user after 12.5s")
+	for _, name := range []string{"record", "marked", "both", "silent"} {
+		b := newTimeline(t, name).owner(0, "watch the checks", "").call(time.Second, "exec", "c1", `{"cmd":"gh pr checks 9"}`)
+		if name != "silent" { // a call aborted before it wrote anything has no result
+			b.result(12*time.Second, "exec", "c1", "aborted by user after 12.5s")
+		}
 		stopAt := b.at
 		switch name {
+		case "silent":
+			abort(b)
 		case "record":
 			abort(b).add(20*time.Minute, "compaction", store.ActorHarness, "", "", `{"why":"compacted"}`)
 		case "marked":
@@ -201,7 +258,7 @@ func TestACodexAbortedTurnIsAnInterruption(t *testing.T) {
 	points, _ := replayAll(t, st)
 	for _, c := range shapes {
 		r := replayed(t, st, c.session, c.nudgedAt)
-		if r.Point.Stop.Working || !r.Point.Stop.At.Equal(c.stopAt) || Why(r) == owedReply {
+		if r.Point.Stop.Working || r.Point.Stop.Busy || !r.Point.Stop.At.Equal(c.stopAt) || Why(r) == owedReply {
 			t.Fatalf("%s: the stop before the owner's nudge: working %v, at %v (the aborted result at %v), %q", c.session,
 				r.Point.Stop.Working, r.Point.Stop.At, c.stopAt, Why(r))
 		}
