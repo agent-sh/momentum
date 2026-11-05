@@ -404,6 +404,9 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 				case p.State == Landed:
 					passed = append(passed, c.ID+" was landed by hand; its measurement starts")
 					continue
+				case p.State == Withdrawn && proposalsUsed(p):
+					passed = append(passed, c.ID+" used its proposals")
+					continue
 				case p.State == Withdrawn:
 					passed = append(passed, c.ID+"'s hand landing proposal was closed; the case reopens")
 					continue

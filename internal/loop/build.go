@@ -144,7 +144,7 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 	if err != nil {
 		return p, err
 	}
-	if !had || p.State == RolledBack || p.State == Kept {
+	if !had || p.State == RolledBack || p.State == Kept || p.State == Withdrawn {
 		p, err = r.Ship.Prepare(ctx, c.ID, source)
 	}
 	if err != nil {

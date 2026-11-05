@@ -327,7 +327,7 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	if err != nil {
 		return Package{}, err
 	}
-	if had && old.State != RolledBack && old.State != Kept {
+	if had && old.State != RolledBack && old.State != Kept && old.State != Withdrawn {
 		return old, refused("case %s has a package already (in %s)", c.ID, old.State)
 	}
 	if repoDir == "" {
@@ -389,6 +389,9 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	}
 	p := Package{Case: c.ID, Kind: "repo", Repo: t.Repo, Base: t.Base, BaseCommit: strings.TrimSpace(base), Dir: t.Dir, Branch: branch,
 		Work: work, Host: host, State: Prepared, Created: s.now()}
+	if had && old.State == Withdrawn {
+		p.ClosedProposals = old.ClosedProposals // a closed hand landing proposal counts toward the case's two
+	}
 	// A rolled-back package may still have a proposal branch after refused cleanup.
 	p.PublishedHead, err = s.remoteBranch(ctx, p)
 	if err != nil {
@@ -725,6 +728,7 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 	if err != nil {
 		return p, err
 	}
+	wasHand := len(p.Hand) > 0 && p.PR != ""
 	p.Hand = hand
 	switch {
 	case strings.TrimSpace(pr.Title) == "" || strings.TrimSpace(pr.Body) == "":
@@ -848,6 +852,10 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 		}
 		labels = []string{"--label", HandLabel}
 	}
+	edits := addLabels(labels)
+	if wasHand && len(p.Hand) == 0 {
+		edits = []string{"--remove-label", HandLabel} // a revision inside the landable paths is the loop's to land again
+	}
 	if p.PR == "" {
 		if err := s.saveAuthorized(ctx, &p); err != nil {
 			return p, err
@@ -884,7 +892,7 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 			p.PR = strings.TrimSpace(lastOf(strings.Split(strings.TrimSpace(url), "\n")))
 		}
 	} else if _, err := s.gh(ctx, p.Host, append([]string{"pr", "edit", p.PR, "--repo", p.Repo, "--title", postTitle, "--body", postBody},
-		addLabels(labels)...)...); err != nil {
+		edits...)...); err != nil {
 		s.saveAuthorized(ctx, &p)
 		return p, err
 	}
@@ -901,6 +909,9 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 	}
 	if len(p.Hand) > 0 {
 		return p, s.handProposed(ctx, c, p)
+	}
+	if wasHand {
+		return p, s.handEnded(ctx, caseID, "the revision changes only paths the loop lands: "+p.PR)
 	}
 	return p, nil
 }
@@ -1170,6 +1181,7 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 			return p, err
 		}
 	}
+	pathErr := CheckPaths(Target{Repo: p.Repo}, p.Changed)
 	switch {
 	case err != nil:
 		return Package{}, err
@@ -1177,8 +1189,8 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 		return p, refused("case %s has no proposed package to land", caseID)
 	case len(p.Hand) > 0:
 		return p, refused("case %s's change is proposed for a hand landing (%s): the loop never lands it", caseID, strings.Join(p.Hand, ", "))
-	case CheckPaths(Target{Repo: p.Repo}, p.Changed) != nil:
-		return p, CheckPaths(Target{Repo: p.Repo}, p.Changed)
+	case pathErr != nil:
+		return p, pathErr
 	case !s.Live:
 		return p, refused("the loop is not live (loop.live): it proposes and does not land")
 	case !p.Clean():
@@ -1397,6 +1409,9 @@ func (s *Ship) rollBackLocked(ctx context.Context, caseID, why string) (pkg Pack
 	}
 	if !ok || (p.State != Landed && p.State != RollingBack && p.State != RolledBack) {
 		return p, refused("case %s has no landed package to roll back", caseID)
+	}
+	if len(p.Hand) > 0 && p.State == Landed {
+		return p, refused("case %s's change was landed by hand (%s): revert it through a pull request; the loop pushes nothing to those paths", caseID, strings.Join(p.Hand, ", "))
 	}
 	if p.State == RolledBack {
 		return p, s.rollbackReceipt(ctx, p, why)

@@ -297,15 +297,19 @@ func SelfLandable() []string { return slices.Clone(selfChanges) }
 
 // ProposalProtected are the paths of momentum's own repository that no change of the loop's touches, not even a
 // proposal a person lands by hand: what its measurement reads and decides with (the loop, its measurement, its sandbox
-// and read-only reader, its configuration and paths, its commands), the scanners and detectors that write and judge
-// the events it counts (sessions, sources, the store, tool results, the capacity and supervision runs that record
-// their reads), its build (go.mod, go.sum) and the check CI builds from the tree (internal/tracked). CI configuration
-// is refused in every repository besides (ciPaths). Each call returns a list of its own.
+// and the run's read-only reader with its case view, its configuration and paths, its commands), the scanners,
+// sources and detectors that write and judge the events it counts and the text normalization they share (sessions,
+// sources, the store, tool results, plain text, detectors, every supervision file the sessions detector or the
+// supervision run use, and the capacity run's files that record its events and reads), its build (go.mod, go.sum) and
+// the check CI builds from the tree (internal/tracked). The capacity rules a capacity run applies and the supervision
+// rules stay outside it: they are what the loop fixes. CI configuration is refused in every repository besides
+// (ciPaths). Each call returns a list of its own.
 func ProposalProtected() []string {
 	return []string{"cmd/", "sessions/", "internal/loop/", "internal/measure/", "internal/sandbox/", "internal/ro/",
-		"internal/config/", "internal/paths/", "internal/detect/", "internal/source/", "internal/store/", "internal/toolresult/",
-		"internal/tracked/", "internal/capacity/run.go", "internal/capacity/record.go", "internal/supervise/engine.go",
-		"internal/supervise/notes.go", "go.mod", "go.sum"}
+		"internal/evidenceview/", "internal/config/", "internal/paths/", "internal/detect/", "internal/source/", "internal/store/",
+		"internal/toolresult/", "internal/plain/", "internal/tracked/", "internal/capacity/run.go", "internal/capacity/record.go",
+		"internal/supervise/engine.go", "internal/supervise/notes.go", "internal/supervise/history.go", "internal/supervise/replay.go",
+		"internal/supervise/words.go", "go.mod", "go.sum"}
 }
 
 // under reports whether p is dir or inside it.

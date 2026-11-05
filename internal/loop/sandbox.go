@@ -91,13 +91,28 @@ func Argv(args []string) ([]string, error) {
 // systemPath are the directories of the sandbox's PATH after the toolchains' (Toolchains.inputs).
 var systemPath = []string{"/usr/bin", "/bin"}
 
-// resolve finds a check's program as the sandbox's PATH would: in a toolchain directory of the sandbox, then in
-// /usr/bin and /bin. A program on none of them would not start there, so the check refuses it before it runs.
+// resolve finds a check's program as the sandbox's PATH would: in a toolchain directory the sandbox mounts (under one
+// of its read-only roots, or /usr), then in /usr/bin and /bin. A program on none of them would not start there, so the
+// check refuses it before it runs.
 func (s Sandbox) resolve(program string) error {
-	for _, dir := range append(append([]string(nil), s.Path...), systemPath...) {
+	roots, err := (Toolchains{ReadOnly: s.ReadOnly}).roots()
+	if err != nil {
+		return err
+	}
+	var dirs []string
+	for _, dir := range s.Path {
 		if real, err := filepath.EvalSymlinks(dir); err == nil {
 			dir = real
 		}
+		mounted := under(dir, "/usr")
+		for _, root := range roots {
+			mounted = mounted || under(dir, root)
+		}
+		if mounted {
+			dirs = append(dirs, dir)
+		}
+	}
+	for _, dir := range append(dirs, systemPath...) {
 		st, err := os.Stat(filepath.Join(dir, program))
 		if err == nil && st.Mode().IsRegular() && st.Mode()&0o111 != 0 {
 			return nil

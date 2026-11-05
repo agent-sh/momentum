@@ -257,7 +257,7 @@ func roundsUsed(p Package) bool {
 }
 
 func proposalsUsed(p Package) bool {
-	return p.ClosedProposals >= MaxClosedProposals && (p.State == Prepared || p.State == Checked || p.State == Revising)
+	return p.ClosedProposals >= MaxClosedProposals && (p.State == Prepared || p.State == Checked || p.State == Revising || p.State == Withdrawn)
 }
 
 func (r *Runner) noteReviewSkip(ctx context.Context, c store.Case, cause, why string) error {

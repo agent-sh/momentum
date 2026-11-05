@@ -90,8 +90,11 @@ func TestACheckResolvesItsProgramOnTheSandboxPath(t *testing.T) {
 	saved := systemPath
 	systemPath = []string{empty}
 	t.Cleanup(func() { systemPath = saved })
-	if err := (Sandbox{Path: []string{tools}}).resolve("pytest"); err != nil {
+	if err := (Sandbox{ReadOnly: []string{tools}, Path: []string{tools}}).resolve("pytest"); err != nil {
 		t.Fatalf("a program on the toolchain path: %v", err)
+	}
+	if err := (Sandbox{Path: []string{tools}}).resolve("pytest"); !errors.Is(err, ErrRefused) {
+		t.Fatalf("a program in a directory the sandbox does not mount: %v", err)
 	}
 	if err := (Sandbox{Path: []string{empty}}).resolve("pytest"); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "not on the sandbox's PATH") {
 		t.Fatalf("a program the sandbox lacks: %v", err)
@@ -169,6 +172,20 @@ func TestANextBuildReadsWhyTheLastWasRefused(t *testing.T) {
 	prompt, err := readHostInput(HostDir(run.Dir), "prompt.json")
 	if err != nil || !strings.Contains(string(prompt), "test_command") || !strings.Contains(string(prompt), "CI configuration") {
 		t.Fatalf("the build prompt lacks the command or the paths: %q %v", prompt, err)
+	}
+	// a refusal of another episode, or a newer failure of the host's own, tells a build nothing
+	later := c
+	later.Episode++
+	if text, err := r.lastBuildRefusal(ctx, later); err != nil || text != "" {
+		t.Fatalf("another episode's refusal: %q %v", text, err)
+	}
+	if err := r.Store.PutLoopRun(ctx, store.LoopRun{ID: "20261105-073759-0000bbbb", Case: c.ID, Family: c.Family, Step: StepBuild,
+		Started: time.Now().Add(-time.Minute), Ended: time.Now(), Status: store.RunFailed, Failure: "build prepare",
+		Summary: "build prepare: the clone failed", CaseEpisode: c.Episode}); err != nil {
+		t.Fatal(err)
+	}
+	if text, err := r.lastBuildRefusal(ctx, c); err != nil || text != "" {
+		t.Fatalf("a host failure read as the build's refusal: %q %v", text, err)
 	}
 }
 
@@ -272,7 +289,7 @@ func TestAHandLandingProposalIsReviewedAndNeverLanded(t *testing.T) {
 	}
 }
 
-// A hand landing proposal closed without merging reopens its case, and a new build prepares a new package.
+// A hand landing proposal closed without merging reopens its case; its package is withdrawn, and a later build prepares a new one.
 func TestAClosedHandLandingReopensItsCase(t *testing.T) {
 	ctx := context.Background()
 	s, c, _, _ := handFixture(t)
@@ -287,8 +304,8 @@ func TestAClosedHandLandingReopensItsCase(t *testing.T) {
 	if got, _ := s.Store.CaseByID(ctx, c.ID); got.Status != store.CaseOpen {
 		t.Fatalf("the case after its proposal closed: %s", got.Status)
 	}
-	if _, had, err := s.Load(c.ID); had || err != nil {
-		t.Fatalf("the withdrawn package stays current: %v %v", had, err)
+	if p, had, err := s.Load(c.ID); !had || err != nil || p.State != Withdrawn || p.PR != "" || p.ClosedProposals != 1 {
+		t.Fatalf("the withdrawn package: %+v %v", p, err)
 	}
 	if n, _ := handNote(t, s.Store, c.ID); n.Done.IsZero() {
 		t.Fatal("the hand landing note stands after the close")
@@ -301,7 +318,11 @@ func TestAHandLandingNeverTouchesMeasurementOrCI(t *testing.T) {
 	for _, path := range []string{"internal/loop/gate.go", ".github/workflows/ci.yml", "internal/tracked/check.go"} {
 		s, c, _, p := handFixture(t)
 		write(t, filepath.Join(p.Work, path), "package x\n")
-		if _, err := s.CheckArgs(ctx, c.ID, []string{"go", "test", "./..."}, nil, fixturePatch(t, s, c.ID)); !errors.Is(err, ErrRefused) {
+		want := "measurement or its event scanners"
+		if strings.HasPrefix(path, ".github/") {
+			want = "is CI configuration"
+		}
+		if _, err := s.CheckArgs(ctx, c.ID, []string{"go", "test", "./..."}, nil, fixturePatch(t, s, c.ID)); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), want) {
 			t.Fatalf("%s was checked: %v", path, err)
 		}
 	}
@@ -332,5 +353,153 @@ func TestAHandLandedChangeIsNotRolledBackByTheLoop(t *testing.T) {
 	}
 	if m.theCase(t).Status != store.CaseMeasuring {
 		t.Fatal("a held rollback moved the case")
+	}
+}
+
+// proposedHand is a hand landing proposal of handFixture's change.
+func proposedHand(t *testing.T) (*Ship, store.Case, repoFixture, Package) {
+	t.Helper()
+	s, c, f, _ := handFixture(t)
+	p, err := proposePatch(t, s, context.Background(), c.ID, Proposal{Title: "t", Body: "b", Rollback: "r", Signal: goodSignal, Window: 7 * 24 * time.Hour})
+	if err != nil || p.State != Proposed || p.PR == "" {
+		t.Fatalf("propose: %+v %v", p, err)
+	}
+	return s, c, f, p
+}
+
+// A hand landing recorded as landed whose deployment did not finish is deployed at the next selection.
+func TestAHandLandingThatStoppedBeforeItsDeploymentIsDeployed(t *testing.T) {
+	ctx := context.Background()
+	s, c, _, p := proposedHand(t)
+	run(t, p.Host, "git", "push", "-q", "origin", p.Head+":refs/heads/main")
+	p.State, p.Landed, p.LandingHead, p.LandedAt = Landed, []string{p.Head}, p.Head, time.Now()
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Store: s.Store, Ship: s, Dir: s.Dir, Budgets: DefaultBudgets}
+	if _, _, _, err := r.pick(ctx, c.Family, c.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.Store.CaseByID(ctx, c.ID); got.Status != store.CaseDeployed {
+		t.Fatalf("the case after a stopped hand landing: %s", got.Status)
+	}
+	if n, _ := handNote(t, s.Store, c.ID); n.Done.IsZero() {
+		t.Fatal("the hand landing note stands after its deployment")
+	}
+}
+
+// A merged pull request whose merge commit the default branch does not hold yet lands nothing; the next read retries.
+func TestAMergeNotOnTheDefaultBranchLandsNothing(t *testing.T) {
+	ctx := context.Background()
+	s, c, _, p := proposedHand(t)
+	s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"MERGED","mergedAt":"2026-11-05T06:00:00Z","headRefOid":"`+p.Head+`","mergeCommit":{"oid":"`+p.Head+`"}}'`)
+	if _, err := s.reconcileHand(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "not on main yet") {
+		t.Fatalf("a merge commit off the default branch: %v", err)
+	}
+	if got, _, _ := s.Load(c.ID); got.State != Proposed || len(got.Landed) != 0 {
+		t.Fatalf("the package after an early read: %+v", got)
+	}
+	run(t, p.Host, "git", "push", "-q", "origin", p.Head+":refs/heads/main")
+	if got, err := s.reconcileHand(ctx, c.ID); err != nil || got.State != Landed {
+		t.Fatalf("the retry: %+v %v", got, err)
+	}
+}
+
+// A dry pass reads no pull request.
+func TestADryPassReadsNoHandLanding(t *testing.T) {
+	ctx := context.Background()
+	s, c, _, _ := proposedHand(t)
+	calls := filepath.Join(t.TempDir(), "calls")
+	s.GH = script(t, t.TempDir(), "gh", `echo "$@" >> `+calls+`; echo '{"state":"CLOSED"}'`)
+	r := &Runner{Store: s.Store, Ship: s, Dir: s.Dir, Budgets: DefaultBudgets}
+	if _, _, _, err := r.pick(ctx, c.Family, c.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(calls); len(b) != 0 {
+		t.Fatalf("a dry pass called gh: %s", b)
+	}
+	if got, _ := s.Store.CaseByID(ctx, c.ID); got.Status != store.CaseTesting {
+		t.Fatalf("a dry pass moved the case: %s", got.Status)
+	}
+}
+
+// A withdrawal that stopped before the case reopened is finished at the next read, once.
+func TestAWithdrawalThatStoppedIsFinished(t *testing.T) {
+	ctx := context.Background()
+	s, c, _, p := proposedHand(t)
+	p.State, p.ClosedProposals = Withdrawn, 1
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.reconcileHand(ctx, c.ID); err != nil || got.PR != "" {
+		t.Fatalf("the resumed withdrawal: %+v %v", got, err)
+	}
+	if got, _ := s.Store.CaseByID(ctx, c.ID); got.Status != store.CaseOpen {
+		t.Fatalf("the case after the resumed withdrawal: %s", got.Status)
+	}
+}
+
+// Closed hand landing proposals count toward the case's two: after the second, the case waits for a person.
+func TestTwoClosedHandLandingsStopTheCase(t *testing.T) {
+	ctx := context.Background()
+	s, c, f, _ := proposedHand(t)
+	s.GH = script(t, t.TempDir(), "gh", `if [ "$1 $2" = "pr view" ]; then echo '{"state":"CLOSED"}'; else exec `+f.gh+` "$@"; fi`)
+	if p, err := s.reconcileHand(ctx, c.ID); err != nil || p.State != Withdrawn || p.ClosedProposals != 1 {
+		t.Fatalf("the first close: %+v %v", p, err)
+	}
+	mech, next := "Named is off by one", "return 42"
+	if _, err := s.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mech, NextTest: &next}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	p, err := s.Prepare(ctx, c.ID, f.main)
+	if err != nil || p.ClosedProposals != 1 {
+		t.Fatalf("a new package after the close: %+v %v", p, err)
+	}
+	write(t, filepath.Join(p.Work, "internal/capacity/names.go"), "package capacity\n\n// Named is the count.\nfunc Named() int { return 42 }\n")
+	write(t, filepath.Join(p.Work, "internal/capacity/names_test.go"),
+		"package capacity\n\nimport \"testing\"\n\nfunc TestNamed(t *testing.T) {\n\tif Named() != 42 {\n\t\tt.Fatal(Named())\n\t}\n}\n")
+	if _, err := s.CheckArgs(ctx, c.ID, []string{"go", "test", "./..."}, nil, fixturePatch(t, s, c.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if p, err = proposePatch(t, s, ctx, c.ID, Proposal{Title: "t2", Body: "b2", Rollback: "r", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if p, err = s.reconcileHand(ctx, c.ID); err != nil || p.State != Withdrawn || p.ClosedProposals != 2 {
+		t.Fatalf("the second close: %+v %v", p, err)
+	}
+	if got, _ := s.Store.CaseByID(ctx, c.ID); got.Status != store.CaseTesting {
+		t.Fatalf("the case after its second closed proposal: %s", got.Status)
+	}
+	r := &Runner{Store: s.Store, Ship: s, Dir: s.Dir, Budgets: DefaultBudgets}
+	got, _, why, err := r.pick(ctx, c.Family, c.ID, false)
+	if err != nil || got.ID != "" || !strings.Contains(why, "used its proposals") {
+		t.Fatalf("the case was picked after two closed proposals: %q %q %v", got.ID, why, err)
+	}
+}
+
+// Land rechecks a package's changed paths: a package that lost its hand landing mark still does not land them.
+func TestLandRechecksTheChangedPaths(t *testing.T) {
+	ctx := context.Background()
+	s, c, _, p := proposedHand(t)
+	p.Hand = nil
+	p.Reviews = []Review{{Round: 1, Head: p.Head, Text: "clean", Comment: "https://example.invalid/review/1", At: time.Now()}}
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "never its to land") {
+		t.Fatalf("landed a path outside the allow-list: %v", err)
+	}
+}
+
+// The owner's rollback of a change landed by hand is refused: it is reverted through a pull request.
+func TestARollbackOfAHandLandingIsRefused(t *testing.T) {
+	ctx := context.Background()
+	s, c, _, p := proposedHand(t)
+	p.State, p.Landed, p.LandedAt = Landed, []string{p.Head}, time.Now()
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RollBack(ctx, c.ID, "no effect"); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "revert it through a pull request") {
+		t.Fatalf("rolled back a hand landing: %v", err)
 	}
 }

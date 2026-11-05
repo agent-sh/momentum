@@ -57,10 +57,20 @@ func (s *Ship) handProposed(ctx context.Context, c store.Case, p Package) error 
 	return err
 }
 
-// handEnded closes a hand landing's record: its log line and its note.
+// handEnded closes a hand landing's record, once: its log line while the case still shows the stage, and its note.
 func (s *Ship) handEnded(ctx context.Context, caseID, why string) error {
-	if err := s.Store.CaseNote(cleanedNote(ctx), caseID, store.ActionHandEnded, why, s.Actor); err != nil {
+	c, err := s.Store.CaseByID(ctx, caseID)
+	if err != nil {
 		return err
+	}
+	log, err := s.Store.CaseLog(ctx, caseID)
+	if err != nil {
+		return err
+	}
+	if store.HandOf(c, log) != "" {
+		if err := s.Store.CaseNote(cleanedNote(ctx), caseID, store.ActionHandEnded, why, s.Actor); err != nil {
+			return err
+		}
 	}
 	if _, _, err := s.Store.DoneNote(ctx, handNoteID(caseID), s.now()); err != nil && !errors.Is(err, store.ErrNoNote) {
 		return err
@@ -68,10 +78,13 @@ func (s *Ship) handEnded(ctx context.Context, caseID, why string) error {
 	return nil
 }
 
-// reconcileHand reads a hand landing proposal's pull request. Open, nothing changes. Merged, with its merge commit on
-// the fetched default branch, the package is landed at that commit and the case deployed: the measure step reads the
-// change from the default branch from then on, as it reads a landing of its own. Closed without merging, the package is
-// withdrawn (archived; a new build prepares a new one) and the case reopens for a new investigation. Nothing is pushed.
+// reconcileHand reads a hand landing proposal's pull request. Open, nothing changes (a proposal whose record was not
+// written writes it). Merged, with its merge commit on the fetched default branch, the package is landed at that commit
+// and the case deployed: the measure step reads the change from the default branch from then on, as it reads a landing
+// of its own. Closed without merging, the package is withdrawn and counts as a closed proposal; the case reopens for a
+// new investigation, and the next build prepares a new package, unless this was the package's second closed proposal:
+// then the case waits for a person, as any package does after two (proposalsUsed). Nothing is pushed. A landing or a
+// withdrawal that stopped partway is finished at the next call.
 func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error) {
 	ctx = s.gitContext(shipContext(ctx, caseID))
 	unlock, err := s.lock(ctx, caseID)
@@ -80,11 +93,8 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 	}
 	defer unlock()
 	p, ok, err := s.Load(caseID)
-	if err != nil || !ok {
+	if err != nil || !ok || len(p.Hand) == 0 {
 		return p, err
-	}
-	if len(p.Hand) == 0 || p.PR == "" || (p.State != Proposed && p.State != Revising && p.State != Checked) {
-		return p, nil
 	}
 	c, err := s.Store.CaseByID(ctx, caseID)
 	if err != nil {
@@ -93,13 +103,29 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 	if c.Status != store.CaseTesting || c.Into != "" {
 		return p, nil
 	}
-	raw, err := s.gh(ctx, p.Host, "pr", "view", p.PR, "--repo", p.Repo, "--json", "state,mergedAt,mergeCommit")
+	switch p.State {
+	case Landed:
+		return p, s.finishHand(ctx, p)
+	case Withdrawn:
+		if p.PR == "" {
+			return p, nil // withdrawn and recorded; a new build prepares a new package
+		}
+		return s.withdrawHand(ctx, p)
+	case Proposed, Revising, Checked:
+	default:
+		return p, nil
+	}
+	if p.PR == "" {
+		return p, nil
+	}
+	raw, err := s.gh(ctx, p.Host, "pr", "view", p.PR, "--repo", p.Repo, "--json", "state,mergedAt,mergeCommit,headRefOid")
 	if err != nil {
 		return p, err
 	}
 	var pr struct {
 		State       string    `json:"state"`
 		MergedAt    time.Time `json:"mergedAt"`
+		Head        string    `json:"headRefOid"`
 		MergeCommit *struct {
 			OID string `json:"oid"`
 		} `json:"mergeCommit"`
@@ -109,6 +135,13 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 	}
 	switch pr.State {
 	case "OPEN":
+		log, err := s.Store.CaseLog(ctx, caseID)
+		if err != nil {
+			return p, err
+		}
+		if store.HandOf(c, log) != p.PR {
+			return p, s.handProposed(ctx, c, p)
+		}
 		return p, nil
 	case "MERGED":
 		if pr.MergeCommit == nil || !commitRe.MatchString(pr.MergeCommit.OID) {
@@ -120,6 +153,13 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 		if _, err := s.git(ctx, p.Host, "merge-base", "--is-ancestor", pr.MergeCommit.OID, "origin/"+p.Base); err != nil {
 			return p, refused("the merge commit of %s is not on %s yet", p.PR, p.Base)
 		}
+		if pr.Head != p.Head {
+			// a person may change a proposal before landing it: what is measured is what landed
+			if err := s.Store.CaseNote(cleanedNote(ctx), caseID, "landed head differs",
+				fmt.Sprintf("%s landed head %s, not the checked %s; the landing at %s is measured", p.PR, pr.Head, p.Head, pr.MergeCommit.OID), s.Actor); err != nil {
+				return p, err
+			}
+		}
 		p.State, p.LandingHead, p.Landed, p.Cleanup = Landed, pr.MergeCommit.OID, []string{pr.MergeCommit.OID}, ""
 		p.LandedAt = pr.MergedAt
 		if p.LandedAt.IsZero() {
@@ -128,31 +168,50 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 		if err := s.saveAuthorized(ctx, &p); err != nil {
 			return p, err
 		}
-		if err := s.handEnded(ctx, caseID, "landed by hand: "+p.PR+" at "+pr.MergeCommit.OID); err != nil {
-			return p, err
-		}
-		if err := s.deploymentReceipt(ctx, p); err != nil {
-			return p, err
-		}
-		_, err = s.Store.DeployCase(ctx, p.Case, s.pkgDir(p.Case), p.LandedAt, p.PR+": "+p.Title, s.Actor)
-		return p, err
+		return p, s.finishHand(ctx, p)
 	case "CLOSED":
 		p.State = Withdrawn
+		p.ClosedProposals++
 		if err := s.saveAuthorized(ctx, &p); err != nil {
 			return p, err
 		}
-		if err := s.archive(p); err != nil {
-			return p, err
-		}
-		if err := s.handEnded(ctx, caseID, "closed without merging: "+p.PR); err != nil {
-			return p, err
-		}
-		_, err = s.Store.UpdateCase(ctx, caseID, store.CaseUpdate{Status: store.CaseOpen}, s.Actor)
-		if err != nil {
-			return p, err
-		}
-		return p, s.Store.CaseNote(ctx, caseID, "reopened",
-			"Its hand landing proposal "+p.PR+" was closed without merging. The case is investigated again.", s.Actor)
+		return s.withdrawHand(ctx, p)
 	}
 	return p, refused("the hand landing's pull request %s is %q", p.PR, pr.State)
+}
+
+// finishHand deploys a package landed by hand whose case is still in testing; each step is safe to repeat.
+func (s *Ship) finishHand(ctx context.Context, p Package) error {
+	if err := s.handEnded(ctx, p.Case, "landed by hand: "+p.PR+" at "+lastOf(p.Landed)); err != nil {
+		return err
+	}
+	if err := s.deploymentReceipt(ctx, p); err != nil {
+		return err
+	}
+	_, err := s.Store.DeployCase(ctx, p.Case, s.pkgDir(p.Case), p.LandedAt, p.PR+": "+p.Title, s.Actor)
+	return err
+}
+
+// withdrawHand records a closed hand landing proposal: its record ends and the case reopens, or, after the package's
+// second closed proposal, stays in testing for a person. Its pull request is cleared last, so a withdrawal that stopped
+// partway is finished at the next call.
+func (s *Ship) withdrawHand(ctx context.Context, p Package) (Package, error) {
+	pr := p.PR
+	if err := s.handEnded(ctx, p.Case, "closed without merging: "+pr); err != nil {
+		return p, err
+	}
+	if p.ClosedProposals < MaxClosedProposals {
+		if _, err := s.Store.UpdateCase(ctx, p.Case, store.CaseUpdate{Status: store.CaseOpen}, s.Actor); err != nil {
+			return p, err
+		}
+		if err := s.Store.CaseNote(cleanedNote(ctx), p.Case, "reopened",
+			"Its hand landing proposal "+pr+" was closed without merging. The case is investigated again.", s.Actor); err != nil {
+			return p, err
+		}
+	} else if err := s.Store.CaseNote(cleanedNote(ctx), p.Case, "proposal closed",
+		"Its hand landing proposal "+pr+" was closed without merging, its second closed proposal. The loop builds this case no more.", s.Actor); err != nil {
+		return p, err
+	}
+	p.PR = ""
+	return p, s.saveAuthorized(ctx, &p)
 }
