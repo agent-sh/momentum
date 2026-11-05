@@ -23,6 +23,11 @@ func ActsIn(tool, input, cwd, tree, home string) bool {
 	if readTools[tool] {
 		return false
 	}
+	if m := workdirKey.FindStringSubmatch(input); m != nil { // the directory the call's tool runs it in
+		if cwd = resolvePath(unescapeJSON(m[1]), cwd, home); cwd != "" && under(cwd, tree) {
+			return true
+		}
+	}
 	if patchActs(text, cwd, tree, home) {
 		return true
 	}
@@ -32,7 +37,7 @@ func ActsIn(tool, input, cwd, tree, home string) bool {
 		}
 		return mentions // its path was cut off
 	}
-	cmds := commandsIn(input)
+	cmds := append(commandsIn(input), commandArrays(input)...)
 	if len(cmds) == 0 {
 		return mentions // a call it cannot read
 	}
@@ -42,8 +47,61 @@ func ActsIn(tool, input, cwd, tree, home string) bool {
 			return true
 		}
 	}
-	return false
+	return !shellTools[tool] && mentions // a tool that is no shell may run its command elsewhere, as its other fields say
 }
+
+// shellTools run the command they are given in the call's directory, or in the one its workdir names.
+var shellTools = map[string]bool{
+	"Bash": true, "bash": true, "shell": true, "Shell": true, "exec": true, "exec_command": true, "shell_command": true,
+	"local_shell": true, "terminal": true, "run_terminal_command": true,
+}
+
+var (
+	// workdirKey is the directory a call's tool runs its command in, in the call's JSON.
+	workdirKey = regexp.MustCompile(`"(?:workdir|cwd|working_directory|workingDirectory|dir|directory)"\s*:\s*"((?:[^"\\]|\\.)*)"`)
+	// commandArray is the start of a command given as its words: "command":["bash","-lc","..."].
+	commandArray = regexp.MustCompile(`"(?:command|cmd|argv)"\s*:\s*\[`)
+)
+
+// commandArrays are the commands a call gives as arrays of words, each as a command line; a shell's -c script is
+// the line itself.
+func commandArrays(input string) []string {
+	var out []string
+	for _, m := range commandArray.FindAllStringIndex(input, -1) {
+		var words []string
+		for i := m[1]; i < len(input) && input[i] != ']'; i++ {
+			if input[i] != '"' {
+				continue
+			}
+			var b strings.Builder
+			for i++; i < len(input) && input[i] != '"'; i++ {
+				if input[i] == '\\' && i+1 < len(input) {
+					b.WriteByte(input[i])
+					i++
+				}
+				b.WriteByte(input[i])
+			}
+			words = append(words, unescapeJSON(b.String()))
+		}
+		if len(words) == 0 {
+			continue
+		}
+		if n := len(words); n >= 3 && shells[filepath.Base(words[0])] && strings.HasPrefix(words[n-2], "-") && strings.Contains(words[n-2], "c") {
+			out = append(out, words[n-1])
+			continue
+		}
+		for i, w := range words {
+			if strings.ContainsAny(w, " \t'\"") {
+				words[i] = "'" + strings.ReplaceAll(w, "'", "") + "'"
+			}
+		}
+		out = append(out, strings.Join(words, " "))
+	}
+	return out
+}
+
+// shells are the programs that run a script.
+var shells = map[string]bool{"sh": true, "bash": true, "zsh": true, "dash": true}
 
 // treeSpellings are the ways a call names the tree by its path: in full, and from home.
 func treeSpellings(tree, home string) []string {
@@ -205,7 +263,7 @@ var gitReads = map[string]bool{
 	"shortlog": true, "cat-file": true, "for-each-ref": true, "merge-base": true, "name-rev": true, "whatchanged": true,
 	"help": true, "version": true, "count-objects": true, "fsck": true, "check-ignore": true, "check-attr": true,
 	"show-ref": true, "var": true, "range-diff": true, "cherry": true, "verify-commit": true, "verify-tag": true,
-	"fetch": true, "diff-tree": true, "diff-files": true, "diff-index": true, "show-branch": true,
+	"fetch": true, "diff-tree": true, "diff-files": true, "diff-index": true, "show-branch": true, "archive": true,
 }
 
 // gitRead reports whether a git subcommand with its arguments reads only. One it does not know writes.
@@ -246,7 +304,7 @@ func gitRead(sub string, rest []string) bool {
 	case "tag":
 		return len(plain) == 0 || opt("-l", "--list", "-v", "--verify", "--contains")
 	case "config":
-		return len(plain) <= 1 && !opt("--unset", "--unset-all", "--add", "--replace-all", "--rename-section", "--remove-section", "-e", "--edit") ||
+		return opt("--global", "--system") || len(plain) <= 1 && !opt("--unset", "--unset-all", "--add", "--replace-all", "--rename-section", "--remove-section", "-e", "--edit") ||
 			opt("--get", "--get-all", "--get-regexp", "-l", "--list")
 	case "submodule":
 		return first == "status" || first == "summary"
@@ -260,27 +318,7 @@ func gitRead(sub string, rest []string) bool {
 
 // gitActs reports whether a git command (its arguments after git) acts in the tree, run in dir.
 func gitActs(args []string, dir, tree, home string) bool {
-	gdir := dir
-	var sub []string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		switch {
-		case (a == "-C" || a == "--git-dir" || a == "--work-tree") && i+1 < len(args):
-			gdir = resolvePath(args[i+1], gdir, home)
-			i++
-		case strings.HasPrefix(a, "--git-dir=") || strings.HasPrefix(a, "--work-tree="):
-			_, v, _ := strings.Cut(a, "=")
-			gdir = resolvePath(v, gdir, home)
-		case (a == "-c" || a == "--namespace" || a == "--exec-path") && i+1 < len(args):
-			i++
-		case strings.HasPrefix(a, "-"):
-		default:
-			sub = args[i:]
-		}
-		if sub != nil {
-			break
-		}
-	}
+	gdir, sub := gitSub(args, dir, home)
 	if len(sub) == 0 {
 		return false
 	}
@@ -305,6 +343,39 @@ func gitActs(args []string, dir, tree, home string) bool {
 		}
 	}
 	return gdir != "" && under(gdir, tree)
+}
+
+// gitWrites reports whether a git command writes wherever it runs.
+func gitWrites(args []string) bool {
+	_, sub := gitSub(args, "", "")
+	return len(sub) > 0 && !gitRead(sub[0], sub[1:])
+}
+
+// gitSub is the directory a git command runs in (dir, or where -C, --git-dir or --work-tree point) and its
+// subcommand with the subcommand's arguments.
+func gitSub(args []string, dir, home string) (string, []string) {
+	gdir := dir
+	var sub []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case (a == "-C" || a == "--git-dir" || a == "--work-tree") && i+1 < len(args):
+			gdir = resolvePath(args[i+1], gdir, home)
+			i++
+		case strings.HasPrefix(a, "--git-dir=") || strings.HasPrefix(a, "--work-tree="):
+			_, v, _ := strings.Cut(a, "=")
+			gdir = resolvePath(v, gdir, home)
+		case (a == "-c" || a == "--namespace" || a == "--exec-path") && i+1 < len(args):
+			i++
+		case strings.HasPrefix(a, "-"):
+		default:
+			sub = args[i:]
+		}
+		if sub != nil {
+			break
+		}
+	}
+	return gdir, sub
 }
 
 // ghActs reports whether a gh command changes files where it runs: a checkout, a clone, a sync, a download.
@@ -337,20 +408,25 @@ var redirect = regexp.MustCompile(`^(?:[0-9]*|&)>>?\|?`)
 // store cut the line: when it ends in the tree, what it ran next there is unknown, so it acts.
 func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 	if depth > 4 {
-		return namesPath(cmd, []string{tree})
+		return namesPath(cmd, treeSpellings(tree, home))
 	}
 	cmd = expandVars(strings.ReplaceAll(cmd, "${HOME}", "$HOME")) // its braces are no group
-	segs, balanced := shellSegments(cmd)
+	segs, seps, balanced := shellSegments(cmd)
 	if !balanced { // a quote it cannot pair (a heredoc's text, a cut): read it as separators split it, too
-		var plain []string
 		start := 0
 		for _, m := range shellSep.FindAllStringIndex(cmd, -1) {
-			plain = append(plain, cmd[start:m[0]])
+			segs, seps = append(segs, cmd[start:m[0]]), append(seps, cmd[m[0]:m[1]])
 			start = m[1]
 		}
-		segs = append(segs, append(plain, cmd[start:])...)
+		segs = append(segs, cmd[start:])
+		seps = append(seps, "")
 	}
+	spellings := treeSpellings(tree, home)
+	piped := false // an earlier command of this pipeline named the tree
 	for i, seg := range segs {
+		if i == 0 || seps[i-1] != "|" {
+			piped = false
+		}
 		var words []string
 		all := shellWords(seg)
 		for j := 0; j < len(all); j++ {
@@ -374,15 +450,46 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 			}
 			words = append(words, w)
 		}
-		k := 0
-		for k < len(words) && (wrappers[words[k]] || strings.HasPrefix(words[k], "-") || duration.MatchString(words[k]) || envAssign.MatchString(words[k])) {
-			k++
+		at, k, feeds := dir, 0, false
+		for wrap := ""; k < len(words); k++ {
+			w := words[k]
+			if wrappers[w] {
+				wrap, feeds = w, feeds || w == "xargs"
+				continue
+			}
+			if strings.HasPrefix(w, "-") {
+				name, val, inline := strings.Cut(w, "=")
+				switch {
+				case contains(wrapperDirs[wrap], name) && inline:
+					at = resolvePath(val, at, home)
+				case contains(wrapperDirs[wrap], name) && k+1 < len(words):
+					k++
+					at = resolvePath(words[k], at, home)
+				case !inline && contains(wrapperValued[wrap], name):
+					k++
+				}
+				continue
+			}
+			if !duration.MatchString(w) && !envAssign.MatchString(w) {
+				break
+			}
 		}
 		if k < len(words) {
 			prog, args := filepath.Base(words[k]), words[k+1:]
-			if progActs(prog, args, &dir, tree, home, depth) {
+			// what an earlier command of the pipeline named reaches a writer that takes its input as arguments or as a script
+			if piped && (feeds || prog == "parallel" || shells[prog] && !hasScriptFlag(args)) && writes(prog, args) {
 				return true
 			}
+			d := at
+			if progActs(prog, args, &d, tree, home, depth) {
+				return true
+			}
+			if prog == "cd" || prog == "pushd" {
+				dir = d
+			}
+		}
+		if !piped {
+			piped = namesPath(seg, spellings) || namesIn(words, dir, tree, home)
 		}
 		if cut && i == len(segs)-1 && dir != "" && under(dir, tree) {
 			return true
@@ -391,12 +498,77 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 	return false
 }
 
-// sepAt is shellSep at the start of a text.
-var sepAt = regexp.MustCompile("^(?:" + shellSep.String() + ")")
+// wrapperValued are the options of a wrapper that take a value; wrapperDirs those that set the directory the command
+// runs in.
+var (
+	wrapperValued = map[string][]string{
+		"env":         {"-u", "--unset", "-S", "--split-string"},
+		"timeout":     {"-s", "--signal", "-k", "--kill-after"},
+		"sudo":        {"-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-U", "--other-user", "-C", "--close-from", "-r", "--role", "-t", "--type"},
+		"nice":        {"-n", "--adjustment"},
+		"ionice":      {"-c", "--class", "-n", "--classdata", "-p", "--pid"},
+		"systemd-run": {"-p", "--property", "-u", "--unit", "-E", "--setenv", "--slice", "-M", "--machine", "--uid", "--gid", "--nice", "--description"},
+		"xargs":       {"-I", "-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-d", "--delimiter", "-s", "--max-chars", "-a", "--arg-file", "-E"},
+		"stdbuf":      {"-i", "-o", "-e"},
+	}
+	wrapperDirs = map[string][]string{"env": {"-C", "--chdir"}, "sudo": {"-D", "--chdir"}, "systemd-run": {"--working-directory"}}
+)
+
+// hasScriptFlag reports whether a shell's arguments give it its script with -c.
+func hasScriptFlag(args []string) bool {
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.Contains(a, "c") {
+			return true
+		}
+	}
+	return false
+}
+
+// writes reports whether a program may write wherever it runs: git with a subcommand that writes, any program that
+// does not only read.
+func writes(prog string, args []string) bool {
+	if prog == "git" {
+		return gitWrites(args)
+	}
+	switch prog {
+	case "gh":
+		return ghActs(args, "/", "/", "")
+	case "cd", "pushd", "waitfor":
+		return false
+	}
+	if prog == "parallel" && len(args) > 0 {
+		return writes(filepath.Base(args[0]), args[1:])
+	}
+	return !readOnly(prog, args)
+}
+
+// namesIn reports whether a command's words name a path in the tree, the tree itself by a relative name too.
+func namesIn(words []string, dir, tree, home string) bool {
+	for _, w := range words {
+		if p := resolvePath(w, dir, home); p != "" && under(p, tree) {
+			return true
+		}
+	}
+	return false
+}
+
+// sepAt is a separator at the start of a text: shellSep's but braces, which group only as words of their own.
+var sepAt = regexp.MustCompile("^(?:&&|\\|\\||[;|\n()`]|\\$\\()")
+
+// braceAt reports whether a brace at i is a word of its own, a group's start or end ({ a; b; }), not a part of a
+// word (xargs -I{}, ${x}).
+func braceAt(cmd string, i int) bool {
+	if cmd[i] != '{' && cmd[i] != '}' {
+		return false
+	}
+	before := i == 0 || strings.IndexByte(" \t\n;&|", cmd[i-1]) >= 0
+	after := i+1 == len(cmd) || strings.IndexByte(" \t\n;", cmd[i+1]) >= 0
+	return before && after
+}
 
 // shellSegments splits a command line into its simple commands at the separators shellSep names that no quote
-// holds. balanced is false when a quote is left open.
-func shellSegments(cmd string) (segs []string, balanced bool) {
+// holds, and names the separator after each ("" after the last). balanced is false when a quote is left open.
+func shellSegments(cmd string) (segs, seps []string, balanced bool) {
 	start, in := 0, byte(0)
 	for i := 0; i < len(cmd); i++ {
 		c := cmd[i]
@@ -412,20 +584,29 @@ func shellSegments(cmd string) (segs []string, balanced bool) {
 		case c == '\\' && i+1 < len(cmd):
 			i++
 		default:
-			if m := sepAt.FindStringIndex(cmd[i:]); m != nil {
-				segs = append(segs, cmd[start:i])
+			if braceAt(cmd, i) {
+				segs, seps = append(segs, cmd[start:i]), append(seps, cmd[i:i+1])
+				start = i + 1
+			} else if m := sepAt.FindStringIndex(cmd[i:]); m != nil {
+				segs, seps = append(segs, cmd[start:i]), append(seps, cmd[i:i+m[1]])
 				i += m[1] - 1
 				start = i + 1
 			}
 		}
 	}
-	return append(segs, cmd[start:]), in == 0
+	return append(segs, cmd[start:]), append(seps, ""), in == 0
 }
+
+// dirOpts are options whose value is the directory a program works in, or the tree it writes to.
+var dirOpts = []string{"-C", "--directory", "--prefix", "--cwd", "--dir", "--chdir", "--manifest-path", "--working-directory", "--project", "--root"}
 
 // progActs reports whether one program run in *dir with its arguments acts in the tree; a cd moves *dir.
 func progActs(prog string, args []string, dir *string, tree, home string, depth int) bool {
 	switch prog {
 	case "cd", "pushd":
+		if len(args) > 0 && args[0] == "--" {
+			args = args[1:]
+		}
 		switch {
 		case len(args) == 0:
 			*dir = home
@@ -460,26 +641,99 @@ func progActs(prog string, args []string, dir *string, tree, home string, depth 
 	if *dir != "" && under(*dir, tree) {
 		return true
 	}
+	switch prog {
+	case "cp", "rsync", "scp", "install", "ln": // a copy writes its destination; its sources it reads
+		if prog != "install" || !contains(args, "-d") && !contains(args, "--directory") {
+			return destActs(args, *dir, tree, home)
+		}
+	case "tar":
+		if acts, known := tarActs(args, *dir, tree, home); known {
+			return acts
+		}
+	}
 	spellings := treeSpellings(tree, home)
-	for _, a := range args {
-		if _, v, ok := strings.Cut(a, "="); ok && !strings.ContainsAny(a, " \t\n") {
+	for i, a := range args {
+		if namesPath(a, spellings) { // the tree's path, as a word or inside one (a script, an option's value)
+			return true
+		}
+		name, v, inline := strings.Cut(a, "=")
+		if inline && !strings.ContainsAny(a, " \t\n") {
 			a = v
 		}
-		if strings.ContainsAny(a, " \t\n;|&") { // a script or command in an argument: its paths by name
-			if namesPath(a, spellings) {
-				return true
-			}
+		if strings.ContainsAny(a, " \t\n;|&") {
 			continue
 		}
 		p := resolvePath(a, *dir, home)
 		if p == "" || !under(p, tree) {
 			continue
 		}
-		bare := !filepath.IsAbs(a) && !strings.HasPrefix(a, "~") && !strings.HasPrefix(a, "$HOME") && !strings.HasPrefix(a, "${HOME}") &&
+		bare := !filepath.IsAbs(a) && !strings.HasPrefix(a, "~") && !strings.HasPrefix(a, "$HOME") &&
 			!strings.HasPrefix(a, "./") && !strings.HasPrefix(a, "../") && p == tree
-		if !bare || writeProgs[prog] { // a bare name is the repository's name as often as a path, for a program that need not write
+		// a bare name is the repository's name as often as a path, unless the program writes what it is given or
+		// an option says it is a directory
+		opt := inline && (contains(dirOpts, name) || outputOpt(name)) || i > 0 && (contains(dirOpts, args[i-1]) || outputOpt(args[i-1]))
+		if !bare || writeProgs[prog] || readProgs[prog] || opt {
 			return true
 		}
 	}
 	return false
+}
+
+// destActs reports whether a copy's destination is in the tree: -t's directory, else its last argument.
+func destActs(args []string, dir, tree, home string) bool {
+	dest := ""
+	for i, a := range args {
+		switch {
+		case (a == "-t" || a == "--target-directory") && i+1 < len(args):
+			return under(resolvePath(args[i+1], dir, home), tree)
+		case strings.HasPrefix(a, "--target-directory="):
+			return under(resolvePath(strings.TrimPrefix(a, "--target-directory="), dir, home), tree)
+		case !strings.HasPrefix(a, "-"):
+			dest = a
+		}
+	}
+	p := resolvePath(dest, dir, home)
+	return dest != "" && p != "" && under(p, tree)
+}
+
+// tarActs reports whether tar writes in the tree: an extraction into it, or an archive made in it. known is false
+// when tar's mode is not one of the two.
+func tarActs(args []string, dir, tree, home string) (acts, known bool) {
+	var create, extract bool
+	file, into := "", dir
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--create":
+			create = true
+		case a == "--extract" || a == "--get":
+			extract = true
+		case (a == "-C" || a == "--directory") && i+1 < len(args):
+			i++
+			into = resolvePath(args[i], into, home)
+		case strings.HasPrefix(a, "--directory="):
+			into = resolvePath(strings.TrimPrefix(a, "--directory="), into, home)
+		case (a == "-f" || a == "--file") && i+1 < len(args):
+			i++
+			file = args[i]
+		case strings.HasPrefix(a, "--file="):
+			file = strings.TrimPrefix(a, "--file=")
+		case i == 0 && !strings.HasPrefix(a, "-") || strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--"):
+			flags := strings.TrimPrefix(a, "-")
+			create = create || strings.Contains(flags, "c")
+			extract = extract || strings.Contains(flags, "x")
+			if strings.HasSuffix(flags, "f") && i+1 < len(args) {
+				i++
+				file = args[i]
+			}
+		}
+	}
+	switch {
+	case extract:
+		return into != "" && under(into, tree), true
+	case create:
+		p := resolvePath(file, dir, home)
+		return file != "" && p != "" && under(p, tree), true
+	}
+	return false, false
 }
