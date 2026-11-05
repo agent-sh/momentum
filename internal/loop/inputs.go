@@ -281,11 +281,18 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 			return run, &buildStageError{key: "build prepare", err: prepErr}
 		}
 		schema = buildSchema
-		prompt = fmt.Sprintf("Build case %s: %s. BASE is %s. /work is your build tree at BASE, writable with its Git metadata: one commit that holds the tree of the default branch's commit %s, without its history (that is in /ro/history and /ro/diffs). /out is writable. Read /run/input/case.json for the investigation and evidence. Make one cause's change and its discriminating test. End with the build report. The host produces the patch.\n%s", c.ID, c.Title, p.WorkBase, p.BaseCommit, inputReference(true))
+		prompt = fmt.Sprintf("Build case %s: %s. BASE is %s. /work is your build tree at BASE, writable with its Git metadata: one commit that holds the tree of the default branch's commit %s, without its history (that is in /ro/history and /ro/diffs). /out is writable. Read /run/input/case.json for the investigation and evidence. Make one cause's change and its discriminating test. End with the build report. The host produces the patch.\n%s\n%s", c.ID, c.Title, p.WorkBase, p.BaseCommit, buildScope(p.Repo), inputReference(true))
 		prompt = strings.ReplaceAll(prompt, "/work is empty scratch and the working directory.", "/work is the build tree at BASE and the working directory.")
-		prompt = strings.ReplaceAll(prompt, "Return a report with mechanism, alternatives ruled out, fix and summary. Build no change.", "Return summary, test, title, body, rollback, signal, window and lesson. window is a duration, such as 7d. signal names source, kinds, match and optional tool and harness.")
+		prompt = strings.ReplaceAll(prompt, "Return a report with mechanism, alternatives ruled out, fix and summary. Build no change.", "Return summary, test_command, title, body, rollback, signal, window and lesson. test_command is the program and its arguments, such as [\"go\", \"test\", \"./...\"], which the host runs in the sandbox. window is a duration, such as 7d. signal names source, kinds, match and optional tool and harness.")
 		if n := len(p.Reviews); n > 0 {
 			extra["review.md"] = p.Reviews[n-1].Text
+		}
+		refusal, e := r.lastBuildRefusal(ctx, c)
+		if e != nil {
+			return run, e
+		}
+		if refusal != "" {
+			extra["refusal.md"] = refusal
 		}
 		if f, e := OpenFile(r.Ship.pkgDir(c.ID), "change.patch"); e == nil {
 			b, e := ReadFile(f, PatchMax)

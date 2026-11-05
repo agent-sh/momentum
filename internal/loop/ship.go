@@ -63,6 +63,9 @@ const (
 	RollingBack = "rolling back"
 	RolledBack  = "rolled back"
 	Kept        = "kept"
+	// Withdrawn is a proposal for a hand landing whose pull request was closed without merging: its case reopened,
+	// and a new build prepares a new package.
+	Withdrawn = "withdrawn"
 )
 
 // MaxRounds is how many review rounds a package gets: prs.md's three.
@@ -102,8 +105,11 @@ type Package struct {
 	LandedAt        time.Time        `json:"landed_at,omitempty"`
 	Undo            *RollbackJournal `json:"undo,omitempty"`
 	Changed         []string         `json:"changed,omitempty"` // the paths the change touches
-	Created         time.Time        `json:"created"`
-	Updated         time.Time        `json:"updated"`
+	// Hand names the changed paths the loop may not land itself (PathScope): the change is proposed for a person to
+	// land by hand, and the loop never lands it.
+	Hand    []string  `json:"hand,omitempty"`
+	Created time.Time `json:"created"`
+	Updated time.Time `json:"updated"`
 	// What the measure step found and did: the measurement that kept the change, the problem note it stands for
 	// now (measure:CASE), the rollback it holds while the loop is not live, and its rollbacks that failed in a row.
 	Result           *measure.Result  `json:"result,omitempty"`
@@ -485,6 +491,43 @@ var testFileRe = regexp.MustCompile(`(_test\.go|\.test\.[cm]?[jt]sx?|\.spec\.[cm
 // fail), and the change (it must pass). The test's files are those the change touches that are named as tests, or
 // the ones named. A check that does not come out so is recorded as it came out, and the package stays unchecked.
 func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []string, patch ...Patch) (pkg Package, stepErr error) {
+	return s.check(ctx, caseID, testCommand{text: test}, testFiles, patch...)
+}
+
+// CheckArgs is Check for a test command given as its program and arguments, as a build report gives it: the words
+// run as they are, without a shell.
+func (s *Ship) CheckArgs(ctx context.Context, caseID string, args []string, testFiles []string, patch ...Patch) (Package, error) {
+	return s.check(ctx, caseID, testCommand{args: args, given: true}, testFiles, patch...)
+}
+
+// testCommand is a check's command: the owner's text, split as a shell splits plain and quoted words, or a build
+// report's words.
+type testCommand struct {
+	text  string
+	args  []string
+	given bool
+}
+
+func (c testCommand) words() ([]string, error) {
+	if c.given {
+		return Argv(c.args)
+	}
+	return Words(c.text)
+}
+
+// display is the command as the package shows it, cleaned word by word.
+func (c testCommand) display(ctx context.Context) ([]string, error) {
+	if !c.given {
+		text, err := Redact(ctx, c.text)
+		if err != nil {
+			return nil, err
+		}
+		return commandWords(text, false)
+	}
+	return RedactAll(ctx, c.args)
+}
+
+func (s *Ship) check(ctx context.Context, caseID string, test testCommand, testFiles []string, patch ...Patch) (pkg Package, stepErr error) {
 	ctx = s.gitContext(shipContext(ctx, caseID))
 	unlock, err := s.lock(ctx, caseID)
 	if err != nil {
@@ -507,8 +550,11 @@ func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []strin
 	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
 		return p, err
 	}
-	words, err := Words(test)
+	words, err := test.words()
 	if err != nil {
+		return p, err
+	}
+	if err := s.Sandbox.resolve(words[0]); err != nil {
 		return p, err
 	}
 	tree, paths, err := s.applyPatch(ctx, p, patch)
@@ -518,7 +564,8 @@ func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []strin
 	if len(paths) == 0 {
 		return p, refused("the patch is empty: produce a cumulative diff against %s", p.BaseCommit)
 	}
-	if err := CheckPaths(Target{Repo: p.Repo}, paths); err != nil {
+	hand, err := PathScope(Target{Repo: p.Repo}, paths)
+	if err != nil {
 		return p, err
 	}
 	if len(testFiles) == 0 {
@@ -593,11 +640,7 @@ func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []strin
 		return p, err
 	}
 	// Execute the original words. Persist only their cleaned display form.
-	displayText, err := Redact(ctx, test)
-	if err != nil {
-		return p, err
-	}
-	display, err := commandWords(displayText, false)
+	display, err := test.display(ctx)
 	if err != nil {
 		return p, err
 	}
@@ -622,7 +665,7 @@ func (s *Ship) Check(ctx context.Context, caseID, test string, testFiles []strin
 	case a.Exit != 0:
 		return p, refused("the test fails with the change (exit %d): the change does not pass its own test; the check is in check.json", a.Exit)
 	}
-	p.Check, p.State, p.Changed = ck, Checked, paths
+	p.Check, p.State, p.Changed, p.Hand = ck, Checked, paths, hand
 	if err := s.keepPatch(p); err != nil {
 		return p, err
 	}
@@ -678,9 +721,11 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 		return p, err
 	}
 	parent = strings.TrimSpace(parent)
-	if err := CheckPaths(Target{Repo: p.Repo}, paths); err != nil {
+	hand, err := PathScope(Target{Repo: p.Repo}, paths)
+	if err != nil {
 		return p, err
 	}
+	p.Hand = hand
 	switch {
 	case strings.TrimSpace(pr.Title) == "" || strings.TrimSpace(pr.Body) == "":
 		return p, refused("a proposal needs a title and a body (what changes, why, the evidence, the prior art)")
@@ -792,6 +837,17 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 			return p, err
 		}
 	}
+	var labels []string
+	if len(p.Hand) > 0 {
+		// a proposal for a hand landing says so first, and carries its label, so a reader of the pull request list
+		// knows the loop will not land it
+		postBody = HandLine + "\n\n" + postBody
+		if _, err := s.gh(ctx, p.Host, "label", "create", HandLabel, "--repo", p.Repo, "--force", "--color", "FBCA04",
+			"--description", "A change momentum's loop checked and reviews but never lands: land it by hand or close it"); err != nil {
+			return p, err
+		}
+		labels = []string{"--label", HandLabel}
+	}
 	if p.PR == "" {
 		if err := s.saveAuthorized(ctx, &p); err != nil {
 			return p, err
@@ -821,13 +877,14 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 			}
 		}
 		if p.PR == "" {
-			url, err := s.gh(ctx, p.Host, "pr", "create", "--repo", p.Repo, "--base", p.Base, "--head", p.Branch, "--title", postTitle, "--body", postBody)
+			url, err := s.gh(ctx, p.Host, append([]string{"pr", "create", "--repo", p.Repo, "--base", p.Base, "--head", p.Branch, "--title", postTitle, "--body", postBody}, labels...)...)
 			if err != nil {
 				return p, err
 			}
 			p.PR = strings.TrimSpace(lastOf(strings.Split(strings.TrimSpace(url), "\n")))
 		}
-	} else if _, err := s.gh(ctx, p.Host, "pr", "edit", p.PR, "--repo", p.Repo, "--title", postTitle, "--body", postBody); err != nil {
+	} else if _, err := s.gh(ctx, p.Host, append([]string{"pr", "edit", p.PR, "--repo", p.Repo, "--title", postTitle, "--body", postBody},
+		addLabels(labels)...)...); err != nil {
 		s.saveAuthorized(ctx, &p)
 		return p, err
 	}
@@ -839,7 +896,13 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 	if err := s.saveAuthorized(ctx, &p); err != nil {
 		return p, err
 	}
-	return p, s.Store.CaseNote(cleanedNote(ctx), caseID, "proposed", note, s.Actor)
+	if err := s.Store.CaseNote(cleanedNote(ctx), caseID, "proposed", note, s.Actor); err != nil {
+		return p, err
+	}
+	if len(p.Hand) > 0 {
+		return p, s.handProposed(ctx, c, p)
+	}
+	return p, nil
 }
 
 // editsSignal refuses a change that edits the texts its own measurement counts: a change of words that only stops
@@ -1049,7 +1112,7 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	}
 	defer unlock()
 	p, ok, err := s.Load(caseID)
-	if err == nil && ok && p.State == Landing {
+	if err == nil && ok && p.State == Landing && len(p.Hand) == 0 {
 		if !s.Live {
 			return p, refused("the loop is not live")
 		}
@@ -1112,6 +1175,10 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 		return Package{}, err
 	case !ok || p.State != Proposed:
 		return p, refused("case %s has no proposed package to land", caseID)
+	case len(p.Hand) > 0:
+		return p, refused("case %s's change is proposed for a hand landing (%s): the loop never lands it", caseID, strings.Join(p.Hand, ", "))
+	case CheckPaths(Target{Repo: p.Repo}, p.Changed) != nil:
+		return p, CheckPaths(Target{Repo: p.Repo}, p.Changed)
 	case !s.Live:
 		return p, refused("the loop is not live (loop.live): it proposes and does not land")
 	case !p.Clean():
@@ -1565,6 +1632,11 @@ func (s *Ship) packageText(c store.Case, p Package) string {
 		fmt.Fprintf(&b, "- In effect once `%s`, where it is installed, changed after the checkout took the change.\n", filepath.Base(p.Plan.Installed))
 	}
 	fmt.Fprintf(&b, "- Rollback: %s\n", p.Rollback)
+	if len(p.Hand) > 0 {
+		fmt.Fprintf(&b, "- Hand landing: it changes paths the loop may not land itself (%s). The loop checks and reviews it and never lands it; a session lands it or closes it. Its measurement starts once it is on the default branch; a close without merging reopens the case.\n", strings.Join(p.Hand, ", "))
+		b.WriteString("\nOpened by momentum's improvement loop for a hand landing.\n")
+		return b.String()
+	}
 	b.WriteString("\nOpened by momentum's improvement loop. It lands by fast-forward only after a clean-context review finds nothing high or medium.\n")
 	return b.String()
 }

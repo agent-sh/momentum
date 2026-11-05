@@ -127,7 +127,7 @@ func TestPatchOutputConfinesSymlinksAndSize(t *testing.T) {
 }
 
 func TestBuildReportRejectsMissingFields(t *testing.T) {
-	valid := BuildReport{Summary: "marker-7f3a", Test: "go test ./...", Title: "Fix one cause", Body: "One change.",
+	valid := BuildReport{Summary: "marker-7f3a", Test: []string{"go", "test", "./..."}, Title: "Fix one cause", Body: "One change.",
 		Rollback: "Revert it.", Window: "7d", Lesson: "Test the boundary.", Signal: goodSignal}
 	raw, err := json.Marshal(valid)
 	if err != nil {
@@ -262,7 +262,7 @@ func TestBuildOnSandboxChecksAndProposes(t *testing.T) {
 	st := testStore(t)
 	f := newRepo(t, nil)
 	c := testingCase(t, st)
-	raw, err := json.Marshal(BuildReport{Summary: "The answer is corrected.", Test: "go test ./...", Title: "Correct the answer",
+	raw, err := json.Marshal(BuildReport{Summary: "The answer is corrected.", Test: []string{"go", "test", "./..."}, Title: "Correct the answer",
 		Body:     "Fix one cause with a discriminating test. Prior art needs a network search, which this run cannot perform.",
 		Rollback: "Revert the change.", Window: "7d", Lesson: "Test the answer at its boundary.", Signal: goodSignal})
 	if err != nil {

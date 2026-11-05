@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -16,23 +17,25 @@ import (
 )
 
 const buildSchema = `{"type":"object","additionalProperties":false,
-"required":["summary","test","title","body","rollback","signal","window","lesson"],
-"properties":{"summary":{"type":"string"},"test":{"type":"string"},"title":{"type":"string"},
+"required":["summary","test_command","title","body","rollback","signal","window","lesson"],
+"properties":{"summary":{"type":"string"},
+"test_command":{"type":"array","minItems":1,"items":{"type":"string"},"description":"The program and its arguments, one word each, such as [\"go\", \"test\", \"./internal/x\", \"-run\", \"TestY\"]. The host runs it in the sandbox without a shell, on BASE with only the change's test files (it must fail) and on the change (it must pass). Not a description of the test."},
+"title":{"type":"string"},
 "body":{"type":"string"},"rollback":{"type":"string"},"window":{"type":"string"},"lesson":{"type":"string"},"installed":{"type":"string"},
 "signal":{"type":"object","additionalProperties":false,"required":["source","kinds","match"],
 "properties":{"source":{"type":"string"},"kinds":{"type":"array","items":{"type":"string"}},
 "tool":{"type":"string"},"harness":{"type":"string"},"match":{"type":"array","items":{"type":"string"}}}}}}`
 
 type BuildReport struct {
-	Summary   string `json:"summary"`
-	Test      string `json:"test"`
-	Title     string `json:"title"`
-	Body      string `json:"body"`
-	Rollback  string `json:"rollback"`
-	Window    string `json:"window"`
-	Lesson    string `json:"lesson"`
-	Signal    Signal `json:"signal"`
-	Installed string `json:"installed,omitempty"`
+	Summary   string   `json:"summary"`
+	Test      []string `json:"test_command"` // the program and its arguments; the host runs them without a shell
+	Title     string   `json:"title"`
+	Body      string   `json:"body"`
+	Rollback  string   `json:"rollback"`
+	Window    string   `json:"window"`
+	Lesson    string   `json:"lesson"`
+	Signal    Signal   `json:"signal"`
+	Installed string   `json:"installed,omitempty"`
 }
 
 func buildReport(raw []byte) (BuildReport, error) {
@@ -49,15 +52,18 @@ func buildReport(raw []byte) (BuildReport, error) {
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return report, err
 	}
-	for _, name := range []string{"summary", "test", "title", "body", "rollback", "signal", "window", "lesson"} {
+	for _, name := range []string{"summary", "test_command", "title", "body", "rollback", "signal", "window", "lesson"} {
 		if value, ok := fields[name]; !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
 			return report, errors.New("build report has a missing required field")
 		}
 	}
-	for _, text := range []string{report.Summary, report.Test, report.Title, report.Body, report.Rollback, report.Window} {
+	for _, text := range []string{report.Summary, report.Title, report.Body, report.Rollback, report.Window} {
 		if strings.TrimSpace(text) == "" {
 			return report, errors.New("build report has an empty required field")
 		}
+	}
+	if _, err := Argv(report.Test); err != nil {
+		return report, err
 	}
 	if len(report.Body) > 64<<10 {
 		return report, errors.New("proposal body exceeds its limit")
@@ -269,7 +275,7 @@ func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Re
 		return stageFailure(res, "build patch", err)
 	}
 	snapshot := Patch{data: data}
-	if _, err := r.Ship.Check(ctx, c.ID, report.Test, nil, snapshot); err != nil {
+	if _, err := r.Ship.CheckArgs(ctx, c.ID, report.Test, nil, snapshot); err != nil {
 		return stageFailure(res, "build check", err)
 	}
 	window, err := planWindow(report.Window)
@@ -327,4 +333,50 @@ func (r *Runner) patchUnit(ctx context.Context, run store.LoopRun, p Package) (P
 		return Patch{}, firstError(err, "patch unit did not export a patch")
 	}
 	return Patch{Dir: run.Dir, File: "out/change.patch"}, nil
+}
+
+// buildScope tells a build, before it starts, which paths of its repository the loop may land, which it may only
+// propose for a person to land by hand, and which no change may touch (PathScope).
+func buildScope(repo string) string {
+	ci := strings.Join(ciPaths, ", ")
+	if !strings.EqualFold(repo, SelfRepo) {
+		return "Paths: the loop lands a change to any path of this repository except CI configuration (" + ci + "), which no change touches."
+	}
+	return "Paths: this is the loop's own repository. The loop lands a change only when every path it touches is one of " +
+		strings.Join(SelfLandable(), ", ") + ": prefer a fix inside them. A fix that needs other paths is still checked and reviewed, " +
+		"then proposed for a person to land by hand; the loop never lands it. No change touches CI configuration (" + ci +
+		") or these, which the loop's measurement and its event scanners rest on: " + strings.Join(ProposalProtected(), ", ") + "."
+}
+
+// refusalKeys are the build stages whose failure is the run's own output: its report, its patch, its check or its
+// proposal. Preparation, inputs, toolchains and authority are the host's and tell a build nothing to change.
+var refusalKeys = []string{"build report", "build patch", "build check", "build propose"}
+
+// lastBuildRefusal is why the host refused the case's newest build of this episode, for the next build's inputs
+// (refusal.md), or "" when the newest build was not refused for its own output.
+func (r *Runner) lastBuildRefusal(ctx context.Context, c store.Case) (string, error) {
+	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID})
+	if err != nil {
+		return "", err
+	}
+	for _, run := range runs { // newest first
+		if run.Step != StepBuild || run.Status == store.RunRunning {
+			continue
+		}
+		if run.CaseEpisode != c.Episode || run.Status != store.RunFailed || !slices.Contains(refusalKeys, run.Failure) {
+			return "", nil
+		}
+		text := run.Summary
+		if i := strings.Index(text, run.Failure+": "); i >= 0 {
+			text = text[i:]
+		}
+		for _, tail := range []string{" (relay: ", " (the relay refused ", " (untrusted harness diagnostics"} {
+			if i := strings.Index(text, tail); i >= 0 {
+				text = text[:i]
+			}
+		}
+		return "# Why the host refused this case's last build\n\nRun " + run.ID + " failed at " + run.Failure + ":\n\n" +
+			strings.TrimSpace(text) + "\n\nFix that cause in this build.\n", nil
+	}
+	return "", nil
 }

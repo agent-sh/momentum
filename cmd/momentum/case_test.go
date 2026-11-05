@@ -342,3 +342,50 @@ func TestCaseListShowsAHeldCase(t *testing.T) {
 		t.Fatalf("list --json: exit %d %q", code, out)
 	}
 }
+
+// A case whose change waits for a hand landing shows that stage and its pull request in case list and show --json.
+func TestCaseListShowsAHandLanding(t *testing.T) {
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	ctx := context.Background()
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: "hand", Title: "a hand case",
+		Evidence: []store.Evidence{{Ref: "file:/a@1", At: time.Now()}}}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mechanism, fix := "one cause", "one fix"
+	if _, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	pr := "https://github.com/agent-sh/fake/pull/9"
+	if err := st.CaseNote(ctx, c.ID, store.ActionHandProposed, store.HandDetail(pr, c.Episode), "loop"); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	if code, out, _ := momentum("case", "list"); code != 0 || !strings.Contains(out, "proposed (hand landing)") || !strings.Contains(out, "["+pr+"]") {
+		t.Fatalf("list: exit %d %q", code, out)
+	}
+	var shown struct {
+		Stage string `json:"stage"`
+		Hand  string `json:"hand_landing"`
+	}
+	code, out, _ := momentum("case", "show", c.ID, "--json")
+	if err := json.Unmarshal([]byte(out), &shown); code != 0 || err != nil || shown.Stage != "proposed (hand landing)" || shown.Hand != pr {
+		t.Fatalf("show: exit %d %q %v", code, out, err)
+	}
+	st, err = store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CaseNote(ctx, c.ID, store.ActionHandEnded, "closed without merging: "+pr, "loop"); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	if code, out, _ := momentum("case", "list"); code != 0 || strings.Contains(out, "hand landing") {
+		t.Fatalf("list after the end: exit %d %q", code, out)
+	}
+}

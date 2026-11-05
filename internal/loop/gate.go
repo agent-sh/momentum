@@ -240,33 +240,72 @@ const SelfRepo = "agent-sh/momentum"
 // CheckPaths refuses a change to a repository that touches what the loop may never change there: changed holds
 // every path a change adds, removes or edits (both sides of a move).
 func CheckPaths(t Target, changed []string) error {
-	// A repository's CI runs from the tree a pushed branch holds, with that repository's secrets, before anyone has
-	// reviewed the change: no repository's CI configuration is the loop's to change.
-	for _, c := range changed {
-		for _, p := range ciPaths {
-			if c == strings.TrimSuffix(p, "/") || strings.HasPrefix(c, p) {
-				return refused("%s is CI configuration: it runs on a pushed branch before review, never the loop's to change", c)
-			}
-		}
+	hand, err := PathScope(t, changed)
+	if err != nil {
+		return err
 	}
-	if !strings.EqualFold(t.Repo, SelfRepo) {
-		return nil
-	}
-	for _, c := range changed {
-		if slices.Contains(selfChanges, c) {
-			continue
-		}
+	for _, c := range hand {
 		if !strings.Contains(c, "/") {
-			return refused("%s is a root file of the loop's repository: never its to change", c)
+			return refused("%s is a root file of the loop's repository: never its to land", c)
 		}
 		for _, p := range Protected() {
-			if c == strings.TrimSuffix(p, "/") || strings.HasPrefix(c, p) {
-				return refused("%s is the loop's own (what its judgment or its authority rests on): never its to change", c)
+			if inPath(c, p) {
+				return refused("%s is the loop's own (what its judgment or its authority rests on): never its to land", c)
 			}
 		}
 		return refused("%s is outside the loop's explicit self-change allow-list", c)
 	}
 	return nil
+}
+
+// PathScope sorts a change's paths by what the loop may do with them. A CI configuration, in any repository, and in
+// its own repository what its measurement and the scanners that write its events rest on (ProposalProtected), refuse
+// the change outright. In its own repository a path outside the paths it may land (SelfLandable) is returned: such a
+// change may still be checked, reviewed and proposed, but only for a person to land by hand. In any other repository
+// every path but CI configuration lands.
+func PathScope(t Target, changed []string) (hand []string, err error) {
+	// A repository's CI runs from the tree a pushed branch holds, with that repository's secrets, before anyone has
+	// reviewed the change: no repository's CI configuration is the loop's to change.
+	for _, c := range changed {
+		for _, p := range ciPaths {
+			if inPath(c, p) {
+				return nil, refused("%s is CI configuration: it runs on a pushed branch before review, never the loop's to change", c)
+			}
+		}
+	}
+	if !strings.EqualFold(t.Repo, SelfRepo) {
+		return nil, nil
+	}
+	for _, c := range changed {
+		for _, p := range ProposalProtected() {
+			if inPath(c, p) {
+				return nil, refused("%s is what the loop's measurement or its event scanners rest on: never its to change, not even for a hand landing", c)
+			}
+		}
+		if !slices.Contains(selfChanges, c) {
+			hand = append(hand, c)
+		}
+	}
+	return hand, nil
+}
+
+// inPath says whether a changed path is p, a directory p names with its final slash, or under it.
+func inPath(c, p string) bool { return c == strings.TrimSuffix(p, "/") || strings.HasPrefix(c, p) }
+
+// SelfLandable are the paths of the loop's own repository it may land itself.
+func SelfLandable() []string { return slices.Clone(selfChanges) }
+
+// ProposalProtected are the paths of momentum's own repository that no change of the loop's touches, not even a
+// proposal a person lands by hand: what its measurement reads and decides with (the loop, its measurement, its sandbox
+// and read-only reader, its configuration and paths, its commands), the scanners and detectors that write and judge
+// the events it counts (sessions, sources, the store, tool results, the capacity and supervision runs that record
+// their reads), its build (go.mod, go.sum) and the check CI builds from the tree (internal/tracked). CI configuration
+// is refused in every repository besides (ciPaths). Each call returns a list of its own.
+func ProposalProtected() []string {
+	return []string{"cmd/", "sessions/", "internal/loop/", "internal/measure/", "internal/sandbox/", "internal/ro/",
+		"internal/config/", "internal/paths/", "internal/detect/", "internal/source/", "internal/store/", "internal/toolresult/",
+		"internal/tracked/", "internal/capacity/run.go", "internal/capacity/record.go", "internal/supervise/engine.go",
+		"internal/supervise/notes.go", "go.mod", "go.sum"}
 }
 
 // under reports whether p is dir or inside it.

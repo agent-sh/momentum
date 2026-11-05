@@ -41,3 +41,46 @@ func HoldOf(c Case, log []CaseEntry) string {
 	}
 	return ""
 }
+
+// A proposal for a hand landing is kept in the case's log too: a "proposed for a hand landing" line with its pull
+// request and the case's episode when the loop proposes a change it may not land itself, and a "hand landing ended"
+// line when that pull request is merged or closed. A case in testing waits for a hand landing while its newest such
+// line is a proposal of its current episode.
+const (
+	ActionHandProposed = "proposed for a hand landing"
+	ActionHandEnded    = "hand landing ended"
+)
+
+// HandStage is how a case waiting for a hand landing shows its stage.
+const HandStage = "proposed (hand landing)"
+
+type handRecord struct {
+	PR      string `json:"pr"`
+	Episode int64  `json:"episode"`
+}
+
+// HandDetail is the detail of a "proposed for a hand landing" line.
+func HandDetail(pr string, episode int64) string {
+	raw, _ := json.Marshal(handRecord{pr, episode})
+	return string(raw)
+}
+
+// HandOf returns the pull request a case in testing waits on for a hand landing, from its log, or "".
+func HandOf(c Case, log []CaseEntry) string {
+	if c.Status != CaseTesting {
+		return ""
+	}
+	for i := len(log) - 1; i >= 0; i-- {
+		switch log[i].Action {
+		case ActionHandProposed:
+			var h handRecord
+			if json.Unmarshal([]byte(log[i].Detail), &h) != nil || h.Episode != c.Episode || h.PR == "" {
+				return ""
+			}
+			return h.PR
+		case ActionHandEnded:
+			return ""
+		}
+	}
+	return ""
+}

@@ -393,6 +393,22 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 				passed = append(passed, c.ID+" has no ship tool")
 				continue
 			}
+			if p, ok, err := r.Ship.Load(c.ID); !dry && err == nil && ok && len(p.Hand) > 0 && p.PR != "" {
+				// a proposal for a hand landing is a person's to land or close: read which before more work
+				p, err := r.Ship.reconcileHand(ctx, c.ID)
+				switch {
+				case err != nil:
+					passed = append(passed, c.ID+" hand landing: "+err.Error())
+					r.pickSkipped(c, "hand", err)
+					continue
+				case p.State == Landed:
+					passed = append(passed, c.ID+" was landed by hand; its measurement starts")
+					continue
+				case p.State == Withdrawn:
+					passed = append(passed, c.ID+"'s hand landing proposal was closed; the case reopens")
+					continue
+				}
+			}
 			if p, ok, err := r.Ship.Load(c.ID); err != nil {
 				if noteErr := r.packageProblem(ctx, c, err, dry); noteErr != nil {
 					return store.Case{}, "", "", noteErr

@@ -75,6 +75,12 @@ func (s *Ship) deploymentReceipt(ctx context.Context, p Package) error {
 	if p.Plan != nil {
 		window = " Measured over the " + days(p.Plan.Window) + " after it is in effect."
 	}
+	if len(p.Hand) > 0 {
+		return s.runner().noteOnce(ctx, store.Note{ID: noteID("landed", p), Kind: store.NoteDecided,
+			Title:  plainClip("A session landed momentum's proposal for: "+c.Title, store.TitleMax),
+			Detail: "Landed by hand from its proposal." + window + " The loop rolls nothing back that it did not land: to undo it, revert it through a pull request.",
+			Links:  prLinks(p.PR)})
+	}
 	return s.runner().noteOnce(ctx, store.Note{ID: noteID("landed", p), Kind: store.NoteDecided,
 		Title:  plainClip("momentum landed a change for: "+c.Title, store.TitleMax),
 		Detail: "Reviewed clean and landed." + window + " To undo it: momentum ship rollback " + c.ID + " --why ...",

@@ -53,6 +53,11 @@ func (r *Runner) reviews(ctx context.Context, only string, families ...string) [
 				continue
 			}
 		}
+		if p.Clean() && len(p.Hand) > 0 {
+			// reviewed clean, it still waits for a person: the loop never lands a hand landing proposal
+			out = append(out, Done{Family: c.Family, Case: c.ID, Step: "land", Skipped: store.HandStage + ": a session lands " + p.PR + " or closes it"})
+			continue
+		}
 		if p.Clean() {
 			if !r.Ship.Live {
 				out = append(out, Done{Family: c.Family, Case: c.ID, Step: "land", Skipped: "the loop is not live"})

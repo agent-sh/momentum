@@ -17,7 +17,7 @@ func TestBuildReportsNameInstalledFilesInAdmittedHostDirectories(t *testing.T) {
 	file := filepath.Join(root, "tool")
 	write(t, file, "marker-7f3a")
 	ship := &Ship{Dir: filepath.Join(root, "loop"), InstalledRoots: []string{root}}
-	raw := `{"summary":"marker-7f3a","test":"go test ./...","title":"Fix the result","body":"Return the expected result.","rollback":"revert","signal":{"source":"transcripts","kinds":["tool_result"],"match":["marker-7f3a"]},"window":"7d","lesson":""}`
+	raw := `{"summary":"marker-7f3a","test_command":["go","test","./..."],"title":"Fix the result","body":"Return the expected result.","rollback":"revert","signal":{"source":"transcripts","kinds":["tool_result"],"match":["marker-7f3a"]},"window":"7d","lesson":""}`
 	var fields map[string]any
 	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
 		t.Fatal(err)

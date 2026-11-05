@@ -63,9 +63,47 @@ func commandWords(cmd string, execute bool) ([]string, error) {
 		return nil, refused("an empty test command")
 	}
 	if execute && !testPrograms[out[0]] {
-		return nil, refused("%q is not a test runner a check may run (go, cargo, npm, pnpm, bun, npx, node, python3, pytest, uv, make, bats, claude)", out[0])
+		return nil, refused("%q is not a test runner a check may run (%s)", out[0], testProgramList)
 	}
 	return out, nil
+}
+
+// testProgramList names the test runners for a refusal's text.
+const testProgramList = "go, cargo, npm, pnpm, bun, npx, node, python3, pytest, uv, make, bats, claude"
+
+// Argv checks a test command given as its words, as a build report gives it: a program and its arguments, run as they
+// are, without a shell. The program is one of the test runners by its bare name; no word is empty or holds a NUL.
+func Argv(args []string) ([]string, error) {
+	if len(args) == 0 {
+		return nil, refused("an empty test command: give the program and its arguments, such as [\"go\", \"test\", \"./...\"]")
+	}
+	for _, a := range args {
+		if a == "" || strings.ContainsRune(a, 0) {
+			return nil, refused("the test command %q has an empty word or a NUL: give the program and its arguments", args)
+		}
+	}
+	if !testPrograms[args[0]] {
+		return nil, refused("the test command starts with %q, which is no test runner a check may run (%s): its first word is the program, such as [\"go\", \"test\", \"./...\"], and the host runs it, never a description of the test", plainClip(args[0], 120), testProgramList)
+	}
+	return append([]string(nil), args...), nil
+}
+
+// systemPath are the directories of the sandbox's PATH after the toolchains' (Toolchains.inputs).
+var systemPath = []string{"/usr/bin", "/bin"}
+
+// resolve finds a check's program as the sandbox's PATH would: in a toolchain directory of the sandbox, then in
+// /usr/bin and /bin. A program on none of them would not start there, so the check refuses it before it runs.
+func (s Sandbox) resolve(program string) error {
+	for _, dir := range append(append([]string(nil), s.Path...), systemPath...) {
+		if real, err := filepath.EvalSymlinks(dir); err == nil {
+			dir = real
+		}
+		st, err := os.Stat(filepath.Join(dir, program))
+		if err == nil && st.Mode().IsRegular() && st.Mode()&0o111 != 0 {
+			return nil
+		}
+	}
+	return refused("the test program %q is not on the sandbox's PATH (its toolchains, /usr/bin and /bin): use a test runner the sandbox has", program)
 }
 
 // Outcome is one run of a check's test.

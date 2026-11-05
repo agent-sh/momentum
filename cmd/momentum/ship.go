@@ -138,6 +138,9 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if p.Check != nil {
 		fmt.Fprintf(stdout, "  check: %s: exit %d without the change, %d with it\n", strings.Join(p.Check.Test, " "), p.Check.Before.Exit, p.Check.After.Exit)
 	}
+	if len(p.Hand) > 0 {
+		fmt.Fprintf(stdout, "  %s: the loop never lands it (%s)\n", store.HandStage, strings.Join(p.Hand, ", "))
+	}
 	for _, r := range p.Reviews {
 		fmt.Fprintf(stdout, "  review %d: %d high, %d medium, %d low %s\n", r.Round, r.High, r.Medium, r.Low, r.Comment)
 	}

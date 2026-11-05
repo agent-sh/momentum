@@ -452,12 +452,18 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 	if dry {
 		return m
 	}
-	if !r.Ship.Live {
+	if !r.Ship.Live || len(p.Hand) > 0 {
 		m.Status, m.Why = "held", why+"; the loop is not live, so it rolls nothing back"
+		detail := why + ". The loop is not live, so it rolls nothing back. To roll it back: momentum ship rollback " + c.ID + " --why ..."
+		if len(p.Hand) > 0 {
+			// a change landed by hand is undone by hand: the loop never pushes to paths it may not land
+			m.Why = why + "; it was landed by hand, so the loop rolls nothing back"
+			detail = why + ". It was landed by hand, so the loop rolls nothing back. To roll it back, revert it through a pull request."
+		}
 		if !p.Held {
 			// the note before the flag that says it was written, under an id of its own, so it is written once
 			if err := r.noteOnce(ctx, store.Note{ID: noteID("held", p), Kind: store.NoteDecided, Title: plainClip("momentum holds the rollback of its change for: "+c.Title, store.TitleMax),
-				Detail: why + ". The loop is not live, so it rolls nothing back. To roll it back: momentum ship rollback " + c.ID + " --why ...",
+				Detail: detail,
 				Links:  prLinks(p.PR)}); err != nil {
 				return failed("the note: " + err.Error())
 			}

@@ -240,10 +240,14 @@ func TestReadOnlyStatusUnitAndCaseForms(t *testing.T) {
 		t.Fatalf("unit: %d %q %s", code, out, diag)
 	}
 	code, out, diag = invoke(f, "case", "show")
-	for _, text := range []string{"cfixture  marker-7f3a failure  [failures, investigating]", "mechanism:", "alternative 1:", "next test:", "evidence: 2", "marker-7f3a evidence", "log: 1 lines", "marker-7f3a opened"} {
+	for _, text := range []string{"cfixture  marker-7f3a failure  [failures, investigating]", "mechanism:", "alternative 1:", "\n  fix:   ", "evidence: 2", "marker-7f3a evidence", "log: 1 lines", "marker-7f3a opened"} {
 		if code != 0 || !strings.Contains(out, text) {
 			t.Fatalf("case: %d %q %s; missing %s", code, out, diag, text)
 		}
+	}
+	// the investigation's fix is prose: a build that read it as "next test" put it in its test command
+	if strings.Contains(out, "next test") {
+		t.Fatalf("case shows the investigation's fix as a next test: %q", out)
 	}
 	code, out, diag = invoke(f, "case", "show", "--json")
 	if code != 0 || out != string(f.raw) {

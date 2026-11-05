@@ -191,7 +191,7 @@ func Case(stdout io.Writer, c store.Case, evs []store.Evidence, log []store.Case
 	for i, a := range c.Alternatives {
 		field(fmt.Sprintf("alternative %d", i+1), a)
 	}
-	field("next test", c.NextTest)
+	field("fix", c.NextTest) // the investigation's proposed fix, in prose: no test command
 	field("benefit", c.Benefit)
 	field("cost", fmt.Sprintf("$%.2f, %d tokens, %s over %d runs", c.Cost.USD, c.Cost.Tokens, c.Cost.Duration.Round(time.Second), c.Cost.Runs))
 	field("signatures", strings.Join(c.Signatures, " | "))
