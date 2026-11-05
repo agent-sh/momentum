@@ -571,6 +571,9 @@ func (s *Ship) check(ctx context.Context, caseID string, test testCommand, testF
 	if err != nil {
 		return p, err
 	}
+	if err := handStays(p, hand); err != nil {
+		return p, err
+	}
 	if len(testFiles) == 0 {
 		for _, c := range paths {
 			if testFileRe.MatchString(c) {
@@ -728,12 +731,8 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 	if err != nil {
 		return p, err
 	}
-	log, err := s.Store.CaseLog(ctx, caseID)
-	if err != nil {
+	if err := handStays(p, hand); err != nil {
 		return p, err
-	}
-	if store.HandOf(c, log) != "" && len(hand) == 0 {
-		return p, refused("case %s's proposal is a hand landing: a revision of it stays one; close it to propose a change the loop lands", caseID)
 	}
 	p.Hand = hand
 	switch {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os/exec"
 	"regexp"
 	"strings"
 	"time"
@@ -34,6 +35,16 @@ func addLabels(labels []string) []string {
 	return out
 }
 
+// handStays refuses a revision of a hand landing proposal that would make it a landing of the loop's: while the package's
+// request is a hand landing one (its paths recorded and its request open), every check and proposal of it keeps hand
+// paths, so the record, the label and the loop's watch of the request stay true.
+func handStays(p Package, hand []string) error {
+	if len(p.Hand) > 0 && p.PR != "" && len(hand) == 0 {
+		return refused("case %s's proposal %s is a hand landing: a revision of it stays one; close it to propose a change the loop lands", p.Case, p.PR)
+	}
+	return nil
+}
+
 func handNoteID(caseID string) string { return "loop-hand:" + store.IDPart(caseID) }
 
 // handProposed records a hand landing proposal: a line in the case's log, which case list and the report read, and a
@@ -43,7 +54,8 @@ func (s *Ship) handProposed(ctx context.Context, c store.Case, p Package) error 
 	if err != nil {
 		return err
 	}
-	if store.HandOf(c, log) != p.PR {
+	missing := store.HandOf(c, log) != p.PR
+	if missing {
 		if err := s.Store.CaseNote(cleanedNote(ctx), c.ID, store.ActionHandProposed, store.HandDetail(p.PR, c.Episode), s.Actor); err != nil {
 			return err
 		}
@@ -56,8 +68,8 @@ func (s *Ship) handProposed(ctx context.Context, c store.Case, p Package) error 
 		return err
 	}
 	for _, n := range notes {
-		if n.ID == handNoteID(c.ID) && n.Detail == detail {
-			return nil // the same proposal stays as its reader left it, resolved or not
+		if !missing && n.ID == handNoteID(c.ID) && n.Detail == detail {
+			return nil // the same proposal stays as its reader left it, resolved or not; a record written again raises it again
 		}
 	}
 	_, err = s.Store.PutNote(ctx, store.Note{ID: handNoteID(c.ID), Kind: store.NoteProblem, Importance: store.ImportanceLow,
@@ -302,10 +314,27 @@ func (s *Ship) landedByContent(ctx context.Context, p Package) (string, time.Tim
 		return "", time.Time{}, false, err
 	}
 	base := "origin/" + p.Base
+	blob := func(rev, path string) (string, bool, error) {
+		out, err := s.git(ctx, p.Host, "rev-parse", "--verify", "--quiet", rev+":"+path)
+		var exit *exec.ExitError
+		switch {
+		case err == nil:
+			return strings.TrimSpace(out), true, nil
+		case errors.As(err, &exit) && exit.ExitCode() == 1:
+			return "", false, nil // no such path there
+		}
+		return "", false, err // a read that failed decides nothing: a close is never withdrawn on it
+	}
 	for _, path := range p.Changed {
-		want, werr := s.git(ctx, p.Host, "rev-parse", "--verify", "--quiet", p.Head+":"+path)
-		got, gerr := s.git(ctx, p.Host, "rev-parse", "--verify", "--quiet", base+":"+path)
-		if (werr == nil) != (gerr == nil) || strings.TrimSpace(want) != strings.TrimSpace(got) {
+		want, wok, err := blob(p.Head, path)
+		if err != nil {
+			return "", time.Time{}, false, err
+		}
+		got, gok, err := blob(base, path)
+		if err != nil {
+			return "", time.Time{}, false, err
+		}
+		if wok != gok || want != got {
 			return "", time.Time{}, false, nil
 		}
 	}

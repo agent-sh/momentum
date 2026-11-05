@@ -30,8 +30,11 @@ func TestABuildReportsTestCommandIsItsWords(t *testing.T) {
 		t.Fatalf("a command as its words: %v %v", got.Test, err)
 	}
 	prose := "New file internal/x/names_test.go, all fixtures synthetic, HOME set to a temp dir."
-	if _, err := buildReport(report(prose)); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), `as a list of words, such as ["go", "test", "./..."]`) {
+	if _, err := buildReport(report(prose)); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), `as a list, such as ["go", "test", "./..."]`) {
 		t.Fatalf("a prose test command: %v", err)
+	}
+	if _, err := buildReport(report(map[string]string{"run": "go test"})); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "no list of words") {
+		t.Fatalf("an object as the test command: %v", err)
 	}
 	for _, words := range [][]string{{}, strings.Fields(prose), {"go test ./..."}, {"go", ""}, {"/usr/bin/go", "test"}} {
 		_, err := buildReport(report(words))
@@ -506,7 +509,8 @@ func TestAHandLandingRevisionStaysOne(t *testing.T) {
 	if !strings.Contains(string(calls), "pr edit") || !strings.Contains(string(calls), "--add-label "+HandLabel) {
 		t.Fatalf("the revision did not keep its request marked:\n%s", calls)
 	}
-	// a checked tree inside the landable paths would make the hand landing a landing of the loop's: refused
+	// a revision inside the landable paths would make the hand landing a landing of the loop's: its check is refused
+	// and the package keeps its hand paths
 	p, _, _ = s.Load(c.ID)
 	write(t, filepath.Join(p.Work, "internal/capacity/names.go"), "package capacity\n\n// Named is the count.\nfunc Named() int { return 41 }\n")
 	if err := os.Remove(filepath.Join(p.Work, "internal/capacity/names_test.go")); err != nil {
@@ -514,6 +518,17 @@ func TestAHandLandingRevisionStaysOne(t *testing.T) {
 	}
 	write(t, filepath.Join(p.Work, "internal/capacity/rules.go"), "package capacity\n")
 	in := fixturePatch(t, s, c.ID)
+	p.State = Revising
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CheckArgs(ctx, c.ID, []string{"go", "test", "./..."}, []string{"internal/capacity/rules.go"}, in); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "stays one") {
+		t.Fatalf("a hand landing checked into a landable change: %v", err)
+	}
+	if kept, _, _ := s.Load(c.ID); len(kept.Hand) == 0 {
+		t.Fatal("a refused revision dropped the package's hand paths")
+	}
+	// and so is a proposal of such a tree
 	tree, paths, err := s.applyPatch(ctx, p, []Patch{in})
 	if err != nil || !slices.Equal(paths, []string{"internal/capacity/rules.go"}) {
 		t.Fatalf("the landable revision's patch: %v %v", paths, err)
@@ -693,5 +708,81 @@ func TestARollbackOfAHandLandingIsRefused(t *testing.T) {
 	}
 	if _, err := s.RollBack(ctx, c.ID, "no effect"); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "revert it through a pull request") {
 		t.Fatalf("rolled back a hand landing: %v", err)
+	}
+}
+
+// A late hand landing whose recount waits on a reader holds the landing; one whose recount is refused lands and waits
+// to be measured by hand.
+func TestALateHandLandingsRecountWaitsOrLeavesItToAPerson(t *testing.T) {
+	ctx := context.Background()
+	t.Run("waits", func(t *testing.T) {
+		s, c, _, p := proposedHand(t)
+		run(t, p.Host, "git", "push", "-q", "origin", p.Head+":refs/heads/main")
+		p.Plan.At = p.Plan.At.Add(-15 * 24 * time.Hour)
+		if err := s.save(&p); err != nil {
+			t.Fatal(err)
+		}
+		later := time.Now().Add(10 * 24 * time.Hour).UTC().Format(time.RFC3339) // more than a window past what the store has read
+		s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"MERGED","mergedAt":"`+later+`","headRefOid":"`+p.Head+`","mergeCommit":{"oid":"`+p.Head+`"}}'`)
+		if _, err := s.reconcileHand(ctx, c.ID); !held(err) {
+			t.Fatalf("a recount that waits: %v", err)
+		}
+		if got, _, _ := s.Load(c.ID); got.State != Proposed {
+			t.Fatalf("a waiting recount landed: %s", got.State)
+		}
+	})
+	t.Run("refused", func(t *testing.T) {
+		s, c, _, p := proposedHand(t)
+		run(t, p.Host, "git", "push", "-q", "origin", p.Head+":refs/heads/main")
+		p.Plan.At = p.Plan.At.Add(-15 * 24 * time.Hour)
+		p.Plan.Signal.Match = []string{"nothing counts this text"}
+		if err := s.save(&p); err != nil {
+			t.Fatal(err)
+		}
+		s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"MERGED","mergedAt":"`+time.Now().UTC().Format(time.RFC3339)+`","headRefOid":"`+p.Head+`","mergeCommit":{"oid":"`+p.Head+`"}}'`)
+		got, err := s.reconcileHand(ctx, c.ID)
+		if err != nil || got.State != Landed || got.Plan.Units != "" {
+			t.Fatalf("a refused recount: %+v %v", got.Plan, err)
+		}
+		log, _ := s.Store.CaseLog(ctx, c.ID)
+		if !slices.ContainsFunc(log, func(e store.CaseEntry) bool { return e.Action == "measured by hand" }) {
+			t.Fatal("no log line says the change is measured by hand")
+		}
+	})
+}
+
+// A case that comes back to testing reads its open request again and writes its record and note again; a request that
+// cannot be read holds its review for the pass, with a note.
+func TestAReturnedCaseReadsItsHandLandingAgain(t *testing.T) {
+	ctx := context.Background()
+	s, c, _, p := proposedHand(t)
+	if _, err := s.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "owner"); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Store: s.Store, Ship: s, Dir: s.Dir, Budgets: DefaultBudgets}
+	if _, _, _, err := r.pick(ctx, c.Family, c.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting}, "investigation"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := r.pick(ctx, c.Family, c.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	log, _ := s.Store.CaseLog(ctx, c.ID)
+	cur, _ := s.Store.CaseByID(ctx, c.ID)
+	if store.HandOf(cur, log) != p.PR {
+		t.Fatal("the returned case does not wait on its request again")
+	}
+	if n, _ := handNote(t, s.Store, c.ID); !n.Done.IsZero() {
+		t.Fatal("the returned case's hand landing note was not raised again")
+	}
+	s.GH = script(t, t.TempDir(), "gh", `echo "gh: network down" >&2; exit 1`)
+	if _, _, _, err := r.pick(ctx, c.Family, c.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	done := r.reviews(ctx, c.ID, c.Family)
+	if len(done) != 1 || !strings.Contains(done[0].Skipped, "could not be read") {
+		t.Fatalf("a review of an unread hand landing: %+v", done)
 	}
 }

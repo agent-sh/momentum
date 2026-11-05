@@ -1054,7 +1054,7 @@ func merge(ctx context.Context, q querier, c Case, into, why, actor string, now 
 	var took []string
 	sets, args := []string{}, []any{}
 	for _, f := range []struct{ col, name, from, to string }{{"mechanism", "mechanism", c.Mechanism, dst.Mechanism},
-		{"next_test", "next test", c.NextTest, dst.NextTest}, {"benefit", "benefit", c.Benefit, dst.Benefit}} {
+		{"next_test", "fix", c.NextTest, dst.NextTest}, {"benefit", "benefit", c.Benefit, dst.Benefit}} {
 		if f.from != "" && f.to == "" {
 			sets, args, took = append(sets, f.col+" = ?"), append(args, f.from), append(took, f.name)
 		}

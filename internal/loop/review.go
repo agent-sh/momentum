@@ -45,6 +45,10 @@ func (r *Runner) reviews(ctx context.Context, only string, families ...string) [
 		if !ok || (p.State != Proposed && p.State != Landing) {
 			continue
 		}
+		if r.handUnread[c.ID] {
+			out = append(out, Done{Family: c.Family, Case: c.ID, Step: StepReview, Skipped: "its hand landing request could not be read in this pass"})
+			continue
+		}
 		if n := len(p.Reviews); n > 0 && p.Reviews[n-1].Head == p.Head && p.Reviews[n-1].Comment == "" {
 			var err error
 			p, err = r.postReview(ctx, p)

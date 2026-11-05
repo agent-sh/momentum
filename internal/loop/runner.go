@@ -59,6 +59,7 @@ type Runner struct {
 	Log                func(format string, args ...any)
 	pass               *passInputs
 	pickedSkips        []Done
+	handUnread         map[string]bool // cases whose hand landing request could not be read in this pass
 }
 
 // Options are what one run of the loop does.
@@ -95,6 +96,7 @@ func (r *Runner) logf(format string, args ...any) {
 // Once runs the loop once. A dry run picks each family's case and step and says what it would run: it writes
 // nothing, ends no run and files no finding.
 func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
+	r.handUnread = nil
 	if !o.Dry {
 		if err := sandbox.Available(true); err != nil {
 			return nil, err
@@ -404,6 +406,13 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 				case err != nil:
 					passed = append(passed, c.ID+" hand landing: "+err.Error())
 					r.pickSkipped(c, "hand", err)
+					if r.handUnread == nil {
+						r.handUnread = map[string]bool{}
+					}
+					r.handUnread[c.ID] = true // its review waits too: the request may be merged or closed already
+					if noteErr := r.noteStepSkip(ctx, c, "hand", "read", err.Error()); noteErr != nil {
+						r.logf("hand landing note: %v", noteErr)
+					}
 					continue
 				case p.State == Landed:
 					passed = append(passed, c.ID+" was landed by hand; its measurement starts")

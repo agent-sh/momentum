@@ -79,7 +79,7 @@ func Argv(args []string) ([]string, error) {
 	}
 	for _, a := range args {
 		if a == "" || strings.ContainsRune(a, 0) {
-			return nil, refused("the test command %q has an empty word or a NUL: give the program and its arguments", args)
+			return nil, refused("the test command %s has an empty word or a NUL: give the program and its arguments", plainClip(fmt.Sprintf("%q", args), 200))
 		}
 	}
 	if !testPrograms[args[0]] {
@@ -116,7 +116,7 @@ func (s Sandbox) resolve(program string) error {
 	for _, dir := range append(append([]string(nil), s.Path...), systemPath...) {
 		// the program as the sandbox would reach it: its directory and, through any link, the file itself in a mount; an
 		// absolute link outside /usr names a host path, which the sandbox mounts elsewhere or not at all
-		if target, err := os.Readlink(filepath.Join(dir, program)); err == nil && filepath.IsAbs(target) && !under(target, "/usr") {
+		if !relativeLinks(filepath.Join(dir, program)) {
 			continue
 		}
 		real, err := filepath.EvalSymlinks(filepath.Join(dir, program))
@@ -132,6 +132,33 @@ func (s Sandbox) resolve(program string) error {
 		}
 	}
 	return refused("the test program %q is not on the sandbox's PATH (its toolchains, /usr/bin and /bin): use a test runner the sandbox has", program)
+}
+
+// relativeLinks follows a program's chain of links and says whether every link in it is relative or names a path
+// under /usr: an absolute link elsewhere names a host path, which the sandbox mounts at another place or not at all.
+func relativeLinks(path string) bool {
+	for range 40 {
+		st, err := os.Lstat(path)
+		if err != nil {
+			return false
+		}
+		if st.Mode()&os.ModeSymlink == 0 {
+			return true
+		}
+		target, err := os.Readlink(path)
+		if err != nil {
+			return false
+		}
+		if filepath.IsAbs(target) {
+			if !under(target, "/usr") {
+				return false
+			}
+			path = target
+			continue
+		}
+		path = filepath.Join(filepath.Dir(path), target)
+	}
+	return false
 }
 
 // Outcome is one run of a check's test.

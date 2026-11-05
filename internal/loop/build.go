@@ -46,8 +46,9 @@ func buildReport(raw []byte) (BuildReport, error) {
 	var probe struct {
 		Test json.RawMessage `json:"test_command"`
 	}
-	if json.Unmarshal(raw, &probe) == nil && bytes.HasPrefix(bytes.TrimSpace(probe.Test), []byte(`"`)) {
-		return report, refused(`the test command is a text: give the program and its arguments as a list of words, such as ["go", "test", "./..."], which the host runs in the sandbox`)
+	if json.Unmarshal(raw, &probe) == nil && len(probe.Test) > 0 && !bytes.HasPrefix(bytes.TrimSpace(probe.Test), []byte("[")) &&
+		!bytes.Equal(bytes.TrimSpace(probe.Test), []byte("null")) {
+		return report, refused(`the test command is no list of words: give the program and its arguments as a list, such as ["go", "test", "./..."], which the host runs in the sandbox`)
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
@@ -84,11 +85,15 @@ func planWindow(text string) (time.Duration, error) {
 	if strings.HasSuffix(text, "d") {
 		n, err := time.ParseDuration(strings.TrimSuffix(text, "d") + "h")
 		if err != nil || n > time.Duration(1<<63-1)/24 {
-			return 0, errors.New("invalid measurement window")
+			return 0, refused("invalid measurement window %q: give whole weeks, such as 7d or 14d", plainClip(text, 40))
 		}
 		return n * 24, nil
 	}
-	return time.ParseDuration(text)
+	d, err := time.ParseDuration(text)
+	if err != nil {
+		return 0, refused("invalid measurement window %q: give whole weeks, such as 7d or 14d", plainClip(text, 40))
+	}
+	return d, nil
 }
 
 const repoAction = "build repository"
