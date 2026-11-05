@@ -354,3 +354,31 @@ func TestFailureStatusBeforeSummaryCut(t *testing.T) {
 		t.Fatal("no result")
 	}
 }
+
+// A long command keeps the directory it runs in: where a call acts goes first in the stored cut, for every harness.
+func TestALongCommandKeepsItsWorkdirInTheStoredCall(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".codex", "sessions", "2026", "05", "29", "marker-7f3a.jsonl")
+	record := func(kind string, payload map[string]any) map[string]any {
+		return map[string]any{"timestamp": "2026-05-29T10:00:00Z", "type": kind, "payload": payload}
+	}
+	cmd := "go test ./... -run " + strings.Repeat("Neutral", 40) + " && echo ok"
+	writeJSONLines(t, path,
+		record("session_meta", map[string]any{"id": "marker-7f3a", "originator": "codex-tui", "source": "cli", "thread_source": "user"}),
+		record("response_item", map[string]any{"type": "function_call", "name": "exec_command", "call_id": "call-1",
+			"arguments": `{"cmd":"` + cmd + `","workdir":"/w/tree","yield_time_ms":1000}`}))
+	st := openStore(t)
+	ingest(t, transcripts(home), st)
+	found := false
+	for _, e := range all(t, st, "transcripts") {
+		if e.Kind == "tool_call" {
+			found = true
+			if !strings.HasPrefix(e.Summary, `{"workdir":"/w/tree","cmd":"go test ./... -run Neutral`) || !strings.HasSuffix(e.Summary, "…") {
+				t.Fatalf("the stored call lost its workdir: %q", e.Summary)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no call")
+	}
+}

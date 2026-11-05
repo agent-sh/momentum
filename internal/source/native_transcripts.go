@@ -335,12 +335,22 @@ func encoded(v any) string {
 	return string(b)
 }
 
-// toolInput is a tool call's input as JSON. An object puts first what says where the call acts (its path, its
-// directory, its command), so the store's cut of a long input keeps them; the rest follow by name.
-func toolInput(v any) string {
-	m, ok := v.(map[string]any)
-	if !ok {
-		return encoded(v)
+// whereFirst is a tool call's input with the fields that say where the call acts (its path, its directory, its
+// command) first, so the store's cut of a long input keeps them; the rest follow by name. An input that is not one
+// JSON object stays as it is.
+func whereFirst(in string) string {
+	t := strings.TrimSpace(in)
+	if !strings.HasPrefix(t, "{") {
+		return in
+	}
+	d := json.NewDecoder(strings.NewReader(t))
+	d.UseNumber()
+	var m map[string]any
+	if d.Decode(&m) != nil {
+		return in
+	}
+	if _, err := d.Token(); err != io.EOF {
+		return in
 	}
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -359,23 +369,28 @@ func toolInput(v any) string {
 		return keys[i] < keys[j]
 	})
 	var b strings.Builder
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false) // a command's && stays two bytes of the cut
 	b.WriteByte('{')
 	for i, k := range keys {
 		if i > 0 {
 			b.WriteByte(',')
 		}
-		kb, _ := json.Marshal(k)
-		vb, _ := json.Marshal(m[k])
-		b.Write(kb)
+		if enc.Encode(k) != nil {
+			return in
+		}
 		b.WriteByte(':')
-		b.Write(vb)
+		if enc.Encode(m[k]) != nil {
+			return in
+		}
 	}
 	b.WriteByte('}')
-	return b.String()
+	// Encode ends each value with a newline: key and value are joined by a colon, values by the commas above
+	return strings.ReplaceAll(b.String(), "\n", "")
 }
 
 // whereKeys are the input fields that say where a tool acts, in the order a stored input keeps them.
-var whereKeys = []string{"filePath", "file_path", "path", "notebook_path", "filename", "workdir", "cwd", "directory", "dir", "command", "cmd"}
+var whereKeys = []string{"filePath", "file_path", "notebook_path", "path", "filename", "workdir", "cwd", "directory", "dir", "command", "cmd"}
 
 // nativeText takes only text content, never reasoning, images or attachments.
 func nativeText(v any) string {
@@ -427,7 +442,7 @@ func (s *nativeState) grok(o map[string]any) []evidence.Event {
 		if typ == "tool_call" {
 			s.Calls[id] = name
 			e := s.event("grok", evidence.KindToolCall, "", at)
-			e.ToolID, e.ToolName, e.ToolInput = id, name, toolInput(u["rawInput"])
+			e.ToolID, e.ToolName, e.ToolInput = id, name, encoded(u["rawInput"])
 			out = append(out, e)
 		}
 		status := str(u, "status")
@@ -483,7 +498,7 @@ func (s *nativeState) kimi(o map[string]any) []evidence.Event {
 			id, name := str(event, "toolCallId"), str(event, "name")
 			s.Calls[id] = name
 			e := s.event("kimi", evidence.KindToolCall, "", at)
-			e.ToolID, e.ToolName, e.ToolInput = id, name, toolInput(event["args"])
+			e.ToolID, e.ToolName, e.ToolInput = id, name, encoded(event["args"])
 			return []evidence.Event{e}
 		case "tool.result":
 			id := str(event, "toolCallId")

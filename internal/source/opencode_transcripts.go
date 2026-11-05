@@ -280,7 +280,7 @@ func (s *nativeState) openCode(typ string, msg map[string]any, at time.Time, v2 
 					startKey, endKey = "start", "end"
 				}
 				e := s.event(harness, evidence.KindToolCall, "", nativeAt(times, startKey, at))
-				e.ToolID, e.ToolName, e.ToolInput = id, name, toolInput(st["input"])
+				e.ToolID, e.ToolName, e.ToolInput = id, name, encoded(st["input"])
 				out = append(out, e)
 				status := str(st, "status")
 				if status == "completed" || status == "error" {

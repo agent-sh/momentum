@@ -818,7 +818,7 @@ func toPending(e evidence.Event) (pending, bool) {
 	case evidence.KindAgentText:
 		p.texts, p.keep = cutEnds(e.Text, headChars, tailChars)
 	case evidence.KindToolCall:
-		p.texts, p.keep = cutHead(e.ToolInput, textChars)
+		p.texts, p.keep = cutHead(whereFirst(e.ToolInput), textChars)
 	case evidence.KindToolResult:
 		e.IsError = toolresult.Failed(e.Harness, e.ToolName, e.ToolOutput, e.IsError)
 		n := textChars

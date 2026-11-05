@@ -3,6 +3,7 @@ package capacity
 import (
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -38,16 +39,42 @@ func ActsIn(tool, input, cwd, tree, home string) bool {
 		return mentions // its path was cut off
 	}
 	cmds := append(commandsIn(input), commandArrays(input)...)
-	if len(cmds) == 0 {
-		return mentions // a call it cannot read
+	if len(cmds) == 0 { // a call it cannot read: the tree's path, or a path field in it
+		for _, m := range pathKey.FindAllStringSubmatch(input, -1) {
+			if underTree(unescapeJSON(m[1]), cwd, tree, home) {
+				return true
+			}
+		}
+		return mentions
 	}
-	cut := strings.HasSuffix(strings.TrimSpace(input), "…")
+	cut := strings.HasSuffix(strings.TrimSpace(input), "…") && commandOpen(input)
 	for i, c := range cmds {
 		if commandActs(c, cwd, tree, home, cut && i == len(cmds)-1, 0) {
 			return true
 		}
 	}
 	return !shellTools[tool] && mentions // a tool that is no shell may run its command elsewhere, as its other fields say
+}
+
+// commandOpen reports whether a call's last command runs to the input's end, its closing quote or bracket cut off.
+func commandOpen(input string) bool {
+	if ms := commandKey.FindAllStringIndex(input, -1); len(ms) > 0 {
+		m := ms[len(ms)-1]
+		closing := input[m[1]-1]
+		for i := m[1]; i < len(input); i++ {
+			switch input[i] {
+			case '\\':
+				i++
+			case closing:
+				return false
+			}
+		}
+		return true
+	}
+	if ms := commandArray.FindAllStringIndex(input, -1); len(ms) > 0 {
+		return !strings.Contains(input[ms[len(ms)-1][1]:], "]")
+	}
+	return true
 }
 
 // shellTools run the command they are given in the call's directory, or in the one its workdir names.
@@ -347,8 +374,9 @@ func gitActs(args []string, dir, tree, home string) bool {
 			dest = strings.TrimSuffix(filepath.Base(strings.TrimSuffix(plain[0], "/")), ".git")
 		}
 		return dest != "" && under(resolvePath(dest, gdir, home), tree)
-	case "worktree":
-		if len(plain) > 1 && plain[0] == "add" && under(resolvePath(plain[1], gdir, home), tree) {
+	case "worktree": // a worktree made, removed or moved in the tree, from any repository
+		if len(plain) > 1 && (plain[0] == "add" || plain[0] == "remove" || plain[0] == "move") && underTree(plain[1], gdir, tree, home) ||
+			len(plain) > 2 && plain[0] == "move" && underTree(plain[2], gdir, tree, home) {
 			return true
 		}
 	}
@@ -437,7 +465,8 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 		seps = append(seps, "")
 	}
 	spellings := treeSpellings(tree, home)
-	piped := false // an earlier command of this pipeline named the tree
+	piped := false            // an earlier command of this pipeline named the tree
+	vars := map[string]bool{} // variables a loop or a read sets to what names the tree
 	for i, seg := range segs {
 		if i == 0 || seps[i-1] != "|" {
 			piped = false
@@ -464,6 +493,14 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 				continue
 			}
 			words = append(words, w)
+		}
+		if len(words) > 0 && (words[0] == "for" || words[0] == "select" || words[0] == "case") {
+			// a loop's head runs nothing: its variable holds the tree when its list names it
+			if in := slices.Index(words, "in"); words[0] != "case" && len(words) > 1 && in > 0 &&
+				(namesPath(seg, spellings) || namesIn(words[in+1:], dir, tree, home)) {
+				vars[words[1]] = true
+			}
+			continue
 		}
 		at, k, feeds := dir, 0, false
 		var assigned []string // the values of the assignments before the program
@@ -510,6 +547,16 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 			if piped && (feeds || prog == "parallel" || shells[prog] && !hasScriptFlag(args)) && writes(prog, args) {
 				return true
 			}
+			if prog == "read" && piped {
+				for _, a := range args {
+					if !strings.HasPrefix(a, "-") {
+						vars[a] = true
+					}
+				}
+			}
+			if usesVar(args, vars) && writes(prog, args) {
+				return true
+			}
 			d := at
 			if progActs(prog, args, &d, tree, home, depth) {
 				return true
@@ -523,6 +570,18 @@ func commandActs(cmd, dir, tree, home string, cut bool, depth int) bool {
 		}
 		if cut && i == len(segs)-1 && dir != "" && under(dir, tree) {
 			return true
+		}
+	}
+	return false
+}
+
+// usesVar reports whether an argument uses one of the variables.
+func usesVar(args []string, vars map[string]bool) bool {
+	for v := range vars {
+		for _, a := range args {
+			if strings.Contains(a, "$"+v) || strings.Contains(a, "${"+v) {
+				return true
+			}
 		}
 	}
 	return false
@@ -556,9 +615,18 @@ func heredocs(cmd string) (string, string) {
 			break
 		}
 		bodyAt := from + m[1] + nl + 1
+		dash := strings.HasPrefix(cmd[from+m[0]:], "<<-") // its lines, the last too, may start with tabs
 		end, next := len(cmd), len(cmd)
-		if i := strings.Index("\n"+cmd[bodyAt:]+"\n", "\n"+word+"\n"); i >= 0 {
-			end, next = bodyAt+max(0, i-1), min(len(cmd), bodyAt+i+len(word))
+		for pos := bodyAt; pos < len(cmd); {
+			lineEnd := len(cmd)
+			if j := strings.IndexByte(cmd[pos:], '\n'); j >= 0 {
+				lineEnd = pos + j
+			}
+			if line := cmd[pos:lineEnd]; line == word || dash && strings.TrimLeft(line, "\t") == word {
+				end, next = pos, lineEnd
+				break
+			}
+			pos = lineEnd + 1
 		}
 		line := cmd[strings.LastIndexAny(cmd[:from+m[0]], "\n;&|(")+1 : from+m[0]]
 		prog := ""
@@ -572,7 +640,7 @@ func heredocs(cmd string) (string, string) {
 			from = next
 			continue
 		}
-		if !readProgs[prog] && !writeProgs[prog] {
+		if interpreters[prog] {
 			script.WriteString(cmd[bodyAt:end] + "\n")
 		}
 		cmd = cmd[:bodyAt] + cmd[next:]
@@ -580,6 +648,10 @@ func heredocs(cmd string) (string, string) {
 	}
 	return cmd, script.String()
 }
+
+// interpreters run the script a heredoc hands them; any other program's heredoc is its data.
+var interpreters = map[string]bool{"python": true, "python3": true, "python2": true, "node": true, "perl": true, "ruby": true,
+	"php": true, "deno": true, "bun": true, "lua": true, "julia": true, "Rscript": true, "uv": true, "osascript": true}
 
 // spaceRedirects puts spaces around the redirections no quote holds, so a target written onto its word
 // (echo x>file) is a word of its own.

@@ -1,6 +1,9 @@
 package capacity
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestWhatACallDoesInATree(t *testing.T) {
 	const home, tree, above = "/h", "/h/p/shop", "/h/p"
@@ -77,6 +80,15 @@ func TestWhatACallDoesInATree(t *testing.T) {
 		{"Bash", `{"command":"git -C shop fetch origin main:main"}`, above, true},
 		{"Bash", `{"command":"bash <<'EOF'\ncd /h/p/shop\nmake\nEOF"}`, above, true},
 		{"Bash", `{"command":"python3 - <<'EOF'\nopen('/h/p/shop/a', 'w').write('x')\nEOF"}`, above, true},
+		{"Bash", `{"command":"for f in shop/*.go; do wc -l $f; done"}`, above, false},
+		{"Bash", `{"command":"for f in /h/p/shop/*.go; do grep -c x $f; done"}`, above, false},
+		{"Bash", `{"command":"gh pr create --body-file - <<'EOF'\nchanged /h/p/shop/a.go\nEOF"}`, above, false},
+		{"Bash", `{"command":"cd /h/p/shop && git log -1","description":"` + strings.Repeat("x", 200) + `…`, above, false},
+		{"Bash", `{"command":"for f in /h/p/shop/*.orig; do rm $f; done"}`, above, true},
+		{"Bash", `{"command":"find /h/p/shop -name '*.orig' | while read f; do rm \"$f\"; done"}`, above, true},
+		{"Bash", `{"command":"git -C /h/p/main worktree remove --force /h/p/shop"}`, above, true},
+		{"Bash", `{"command":"cat <<-EOF > /h/.cache/x\n\tdata\n\tEOF\nmake -C shop"}`, above, true},
+		{"edit_file", `{"path":"shop/a.go","old":"a","new":"b"}`, above, true},
 		// fail safe: a call it cannot read, or one the store cut in the tree
 		{"mcp__x__y", `{"target":"/h/p/shop/a.go"}`, above, true},
 		{"Write", `{"content":"long text that the store cut before its pa…`, above, false},
