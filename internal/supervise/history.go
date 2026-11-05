@@ -105,10 +105,16 @@ func role(e store.Event, m map[string]any) string {
 		if strings.Contains(why, "notification") || strings.Contains(why, "complete") {
 			return "self"
 		}
+	case why == "local command":
+		// a Claude Code local command (/login, /model): its user was at the session, and no turn opened, since a
+		// local command never reaches the model (the live layer's ControlAt)
+		return "control"
 	case ik == "slash", ik == "shell":
 		return "owner"
 	case strings.HasPrefix(s, "[Request interrupted"):
 		return "interrupt"
+	case e.Harness == "codex" && strings.HasPrefix(s, "<turn_aborted>"):
+		return "interrupt" // Codex's record that its user interrupted the turn on purpose
 	}
 	return ""
 }
@@ -339,6 +345,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 	}
 	version := "" // the Claude Code version of the last record read: a new one is a new process
 	var words, entry, harness, prevRole, prevPrior string
+	var carried string // a turn's end the harness recorded on a local command since the last stop
 	var prevAt time.Time
 	var owes time.Time           // the model owes its reply since: an input, or the result of a turn's last call
 	var owesRef string           // where the transcript is read from for its request: the event before the one that owes
@@ -397,6 +404,9 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			harness = e.Harness
 		}
 		r := role(e, m)
+		if r == "" && e.Harness == "codex" && m["prior"] == "turn_aborted" && prevRole != "interrupt" {
+			r = "interrupt" // the store marked Codex's abort of the turn on the record after it, with no record of its own
+		}
 		if v := versionAt(e.Ref); v != "" {
 			if version != "" && v != version {
 				restart(e.TS)
@@ -407,6 +417,16 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			waitedThrough("the conversation was compacted while it waited", e.TS)
 		}
 		if r == "" || r == "compaction" { // a compaction runs as a turn starts or mid-turn: no stop of its own
+			continue
+		}
+		if r == "control" {
+			// its user was there, and the stop before it goes on to the next input: no turn opened, and nothing
+			// the model owes, its words or its error changes. The harness's record that the turn was over sits on the
+			// first record after it, this one, so the next input's point reads it.
+			ownerAt = e.TS
+			if prior, _ := m["prior"].(string); carried == "" && turnOver(harness, prior) {
+				carried = prior
+			}
 			continue
 		}
 		if r == "self" && strings.HasPrefix(e.Summary, "<task-notification>") && !strings.Contains(e.Summary, "</task-notification>") {
@@ -423,6 +443,9 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			}
 			if !prevAt.IsZero() {
 				prior, _ := m["prior"].(string)
+				if !turnOver(harness, prior) && carried != "" {
+					prior = carried // a local command came between: the record before it said the turn was over
+				}
 				prevPrior = prior
 				out = append(out, Point{Session: id, Stop: stopOf(e.TS, e.Ref), Next: next, Entry: entry})
 			}
@@ -577,7 +600,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			}
 			lastMainUser = false
 		}
-		prevRole, prevAt = r, e.TS
+		prevRole, prevAt, carried = r, e.TS, ""
 		if r == "owner" || r == "self" || r == "interrupt" || r == "momentum" {
 			prevPrior = ""
 		}
@@ -594,6 +617,9 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		lastRef = e.Ref
 	}
 	if !prevAt.IsZero() {
+		if carried != "" {
+			prevPrior = carried // a local command after the last stop read that its turn was over
+		}
 		out = append(out, Point{Session: id, Stop: stopOf(until, ""), Next: Next{Kind: "none"}, Entry: entry})
 	}
 	return out
