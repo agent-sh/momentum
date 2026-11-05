@@ -433,6 +433,9 @@ func TestClosingAComponentHealthCaseAsFixedResumesTheCasesItStopped(t *testing.T
 	if code, _, errOut := momentum("case", "close", held, "--reason", "already-solved", "--fix", "git:agent-sh/momentum@4814cc4", "--why", "x"); code != 2 || !strings.Contains(errOut, "only a component-health case") {
 		t.Fatalf("--fix on a failures case: exit %d %s", code, errOut)
 	}
+	if code, _, errOut := momentum("case", "close", health, "--reason", "already-solved", "--fix", "git:agent-sh/momentum@4814cc4", "--into", held, "--why", "x"); code != 2 || !strings.Contains(errOut, "--into") {
+		t.Fatalf("--fix with --into: exit %d %s", code, errOut)
+	}
 	code, out, errOut = momentum("case", "close", health, "--reason", "already-solved", "--fix", "git:agent-sh/momentum@4814cc4", "--why", "the turn cap was raised")
 	if code != 0 || !strings.Contains(out, "[closed: already-solved]") || !strings.Contains(out, "resumed "+held+":") || strings.Contains(out, free) {
 		t.Fatalf("close as fixed: exit %d %q %s", code, out, errOut)
