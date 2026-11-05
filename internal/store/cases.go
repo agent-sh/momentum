@@ -401,7 +401,8 @@ func addEvidence(ctx context.Context, q querier, id string, evs []Evidence, now 
 // comesBack decides whether a closed case comes back on the evidence it holds now, and says why either way.
 //   - A case closed as improved does not come back on its evidence: the measure step watches its signal, in the
 //     units its measurement counted, and brings it back at its old rate (RegressCase).
-//   - A case closed as already solved comes back on any evidence after the close.
+//   - A case closed as already solved comes back on any evidence after the close, or after its fix was named when
+//     that came after the close (CloseFixed on a case closed before a close named its fix).
 //   - A dismissed case (not worth it, insufficient evidence) comes back only once the evidence after the close
 //     reaches what it held when it closed: the problem has happened as often again.
 func comesBack(ctx context.Context, q querier, c Case, now time.Time) (bool, string, error) {
@@ -410,7 +411,17 @@ func comesBack(ctx context.Context, q querier, c Case, now time.Time) (bool, str
 		err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM case_evidence WHERE case_id = ? AND at > ?`, c.ID, from.UnixMilli()).Scan(&n)
 		return n, err
 	}
-	after, err := count(c.Closed)
+	from, since := c.Closed, "it closed as already solved"
+	if c.Reason == Solved {
+		_, at, named, err := fixedOf(ctx, q, c)
+		if err != nil {
+			return false, "", err
+		}
+		if named && at.After(from) {
+			from, since = at, "its fix was named"
+		}
+	}
+	after, err := count(from)
 	if err != nil {
 		return false, "", err
 	}
@@ -418,7 +429,7 @@ func comesBack(ctx context.Context, q querier, c Case, now time.Time) (bool, str
 	case Improved:
 		return false, fmt.Sprintf("%d new since it closed as improved; the measure step brings it back at its old rate", after), nil
 	case Solved:
-		return after > 0, fmt.Sprintf("%d new since it closed as already solved", after), nil
+		return after > 0, fmt.Sprintf("%d new since %s", after, since), nil
 	case NotWorthIt, Insufficient:
 		need := max(c.ClosedEvidence, 1)
 		return after >= need, fmt.Sprintf("%d new since it closed as %s; it comes back at %d", after, c.Reason, need), nil
@@ -984,7 +995,7 @@ func (s *Store) CloseCase(ctx context.Context, id string, reason CloseReason, in
 		return Case{}, badCase("reason %q is not one of not-worth-it, insufficient-evidence, already-solved, duplicate", reason)
 	case reason == Improved:
 		return Case{}, badCase("only the measure tool closes a case as improved, with its measurement")
-	case c.Status == CaseClosed && c.Family == HealthFamily && c.Reason == Solved:
+	case c.Status == CaseClosed && c.Family == HealthFamily && c.Reason == Solved && reason == Solved:
 		hint := ""
 		if _, _, named, err := fixedOf(ctx, tx, c); err != nil {
 			return Case{}, err
@@ -1024,10 +1035,12 @@ const HealthFamily = "component-health"
 
 // ActionResumed is the line a case the stop rule held gets when the component-health case of its stop closes as fixed:
 // the stop rule counts only the case's runs after the newest such line. ActionFixed is the line that names the fix
-// on the component-health case, as it was given.
+// on the component-health case, as it was given. ActionFixNamed is the line a case closed as already solved before a
+// close named its fix gets when its fix is named after the close, with the cases it resumed and why.
 const (
-	ActionResumed = "resumed"
-	ActionFixed   = "fixed"
+	ActionResumed  = "resumed"
+	ActionFixed    = "fixed"
+	ActionFixNamed = "fix named"
 )
 
 // ReviewNoteID is the id of the note the loop keeps when a case's review waits for a cause (budget, stopped).
@@ -1037,29 +1050,29 @@ func ReviewNoteID(caseID, cause string) string { return "loop-review:" + IDPart(
 // or another reference), and resumes the cases its stop held: each case of stopped still open, investigating or
 // testing gets a resumed line naming the fix, in the same transaction, and keeps its episode, status and
 // investigation; its review's stopped note is done. A case closed, deployed or measuring, or one that went into
-// another, is not resumed. It returns the closed case and the cases it resumed. A case whose stop comes after the
-// close resumes then (ResumeLate). A case closed as already solved before a close named its fix gets its fix named
-// the same way and stays closed: no reopen, no new episode, no evidence; the naming counts as its close for a stop
-// that comes after it.
-func (s *Store) CloseFixed(ctx context.Context, id, fix string, stopped []string, why, actor string) (Case, []string, error) {
+// another, is not resumed. It returns the closed case, the cases it resumed, and whether it only named the fix. A
+// case whose stop comes after the close resumes then (ResumeLate). A case closed as already solved before a close
+// named its fix gets its fix named the same way and stays closed: no reopen, no new episode, no evidence; the
+// naming counts as its close for a stop that comes after it.
+func (s *Store) CloseFixed(ctx context.Context, id, fix string, stopped []string, why, actor string) (Case, []string, bool, error) {
 	if strings.TrimSpace(why) == "" {
-		return Case{}, nil, badCase("a close says why")
+		return Case{}, nil, false, badCase("a close says why")
 	}
 	if err := checkRef(fix); err != nil {
-		return Case{}, nil, badCase("what fixed it: %v", err)
+		return Case{}, nil, false, badCase("what fixed it: %v", err)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return Case{}, nil, err
+		return Case{}, nil, false, err
 	}
 	defer tx.Rollback()
 	now := time.Now()
 	c, err := getCase(ctx, tx, id)
 	if err != nil {
-		return Case{}, nil, err
+		return Case{}, nil, false, err
 	}
 	if err := fixable(ctx, tx, c); err != nil {
-		return Case{}, nil, err
+		return Case{}, nil, false, err
 	}
 	var resumed []string
 	for _, sid := range stopped {
@@ -1067,38 +1080,39 @@ func (s *Store) CloseFixed(ctx context.Context, id, fix string, stopped []string
 		if errors.Is(err, ErrNoCase) {
 			continue
 		} else if err != nil {
-			return Case{}, nil, err
+			return Case{}, nil, false, err
 		}
 		if sc.ID == c.ID || sc.Into != "" || !slices.Contains(working, sc.Status) || slices.Contains(resumed, sc.ID) {
 			continue
 		}
 		if err := resume(ctx, tx, sc.ID, c.ID, fix, "", actor, now); err != nil {
-			return Case{}, nil, err
+			return Case{}, nil, false, err
 		}
 		resumed = append(resumed, sc.ID)
 	}
 	if err := caseLog(ctx, tx, c.ID, actor, ActionFixed, fix, now); err != nil {
-		return Case{}, nil, err
+		return Case{}, nil, false, err
 	}
 	what := "fixed by " + fix
 	if len(resumed) > 0 {
 		what += "; resumes " + strings.Join(resumed, ", ")
 	}
-	if c.Status == CaseClosed {
+	named := c.Status == CaseClosed
+	if named {
 		// closed as already solved before a close named its fix: the close stands, and only its fix is named
 		if _, err := tx.ExecContext(ctx, `UPDATE cases SET updated = ? WHERE id = ?`, now.UnixMilli(), c.ID); err != nil {
-			return Case{}, nil, err
+			return Case{}, nil, false, err
 		}
-		if err := caseLog(ctx, tx, c.ID, actor, "fix named", "closed as already-solved before its fix was named; "+what+": "+why, now); err != nil {
-			return Case{}, nil, err
+		if err := caseLog(ctx, tx, c.ID, actor, ActionFixNamed, "closed as already-solved before its fix was named; "+what+": "+why, now); err != nil {
+			return Case{}, nil, false, err
 		}
 	} else if err := closeAs(ctx, tx, c.ID, Solved, what+": "+why, actor, now); err != nil {
-		return Case{}, nil, err
+		return Case{}, nil, false, err
 	}
 	if c, err = getCase(ctx, tx, c.ID); err != nil {
-		return Case{}, nil, err
+		return Case{}, nil, false, err
 	}
-	return c, resumed, tx.Commit()
+	return c, resumed, named, tx.Commit()
 }
 
 // Fixable refuses a case CloseFixed would refuse: one of another family, one closed for another reason or closed
@@ -1125,7 +1139,7 @@ func fixable(ctx context.Context, q querier, c Case) error {
 			return err
 		}
 		if named {
-			return badCase("case %s is closed already (already-solved), and its close named its fix: %s", c.ID, fix)
+			return badCase("case %s is closed already (already-solved), and its fix is named already: %s", c.ID, fix)
 		}
 	case !slices.Contains(working, c.Status):
 		return badCase("case %s is %s: its change is in place, so only the ship tool's rollback or the measure tool closes it", c.ID, c.Status)

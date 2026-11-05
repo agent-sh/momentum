@@ -232,6 +232,40 @@ func TestASolvedCaseComesBackWhenItRecurs(t *testing.T) {
 	}
 }
 
+// A component-health case closed as already solved before a close named its fix comes back only on evidence after
+// the naming: evidence dated between the close and the naming is of runs that began before the fix was named, as a
+// close that named its fix would have kept it closed. Evidence after the naming brings it back, regressed.
+func TestAFixNamedAfterTheCloseIsWhatItsEvidenceIsMeasuredFrom(t *testing.T) {
+	st := caseStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	sig := HealthFamily + "/v1:loop:investigate:turns"
+	h, _ := observeOK(t, st, Finding{Family: HealthFamily, Signature: sig, Title: "t", Evidence: refsAt("a", 2, now.Add(-time.Hour))})
+	// closed as already solved by a version before a close named its fix
+	if _, err := st.db.ExecContext(ctx, `UPDATE cases SET status = 'closed', reason = 'already-solved', closed = ?, closed_evidence = 2 WHERE id = ?`,
+		now.Add(-30*time.Minute).UnixMilli(), h.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _, named, err := st.CloseFixed(ctx, h.ID, "git:agent-sh/momentum@4814cc4", nil, "the cap was raised", "cli")
+	if err != nil || !named || got.Status != CaseClosed {
+		t.Fatalf("naming the fix: %+v %v %v", got, named, err)
+	}
+	if got, obs := observeOK(t, st, Finding{Family: HealthFamily, Signature: sig, Evidence: refsAt("b", 2, now.Add(-20*time.Minute))}); obs != KeptShut || got.Status != CaseClosed {
+		t.Fatalf("evidence between the close and the naming %s: %+v", obs, got)
+	}
+	if log, _ := st.CaseLog(ctx, h.ID); !strings.Contains(log[len(log)-1].Detail, "0 new since its fix was named") {
+		t.Fatalf("the kept-closed line: %+v", log[len(log)-1])
+	}
+	if got, obs := observeOK(t, st, Finding{Family: HealthFamily, Signature: sig, Evidence: refsAt("c", 1, time.Now().Add(time.Second))}); obs != Reopened || got.Status != CaseOpen {
+		t.Fatalf("evidence after the naming %s: %+v", obs, got)
+	}
+	// a close that names its fix is a close, not a naming
+	other, _ := observeOK(t, st, Finding{Family: HealthFamily, Signature: HealthFamily + "/v1:loop:investigate:timeout", Title: "t", Evidence: refsAt("d", 1, now.Add(-time.Hour))})
+	if _, _, named, err := st.CloseFixed(ctx, other.ID, "git:agent-sh/momentum@4814cc4", nil, "raised", "cli"); err != nil || named {
+		t.Fatalf("a close that names its fix: %v %v", named, err)
+	}
+}
+
 // Cases dedupe by root cause: the investigation names it as a signature, and a case that names one another case
 // holds goes into that case, its evidence, signatures and cost with it. What its own symptom brings later lands in
 // the case it went into, and a merge that brings a closed case's problem back reopens it.

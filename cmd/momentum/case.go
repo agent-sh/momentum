@@ -536,17 +536,17 @@ func closeFixed(ctx context.Context, st *store.Store, id, fix, why string, stdou
 	if err != nil {
 		return caseErr(err)
 	}
-	what := "closed"
-	if c.Status == store.CaseClosed {
-		what = "its fix named"
-	}
 	stopped, err := loop.StoppedOn(ctx, st, c)
 	if err != nil {
 		return err
 	}
-	c, resumed, err := st.CloseFixed(ctx, id, fix, stopped, why, caseActor())
+	c, resumed, named, err := st.CloseFixed(ctx, id, fix, stopped, why, caseActor())
 	if err != nil {
 		return caseErr(err)
+	}
+	what := "closed"
+	if named {
+		what = "its fix named"
 	}
 	printCase(stdout, c, what)
 	for _, r := range resumed {

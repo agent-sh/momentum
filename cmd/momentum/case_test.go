@@ -507,6 +507,9 @@ func TestNamingTheFixOfAComponentHealthCaseClosedBeforeItResumesTheCasesItStoppe
 		!strings.Contains(errOut, "before its fix was named: case close "+health+" --reason already-solved --fix REF") {
 		t.Fatalf("closed again without its fix: exit %d %s", code, errOut)
 	}
+	if code, _, errOut := momentum("case", "close", health, "--reason", "not-worth-it", "--why", "rare"); code != 2 || strings.Contains(errOut, "--fix") {
+		t.Fatalf("closed again for another reason: exit %d %s", code, errOut)
+	}
 	code, out, errOut = momentum("case", "close", health, "--reason", "already-solved", "--fix", "git:agent-sh/momentum@4814cc4", "--why", "the turn cap was raised")
 	if code != 0 || !strings.Contains(out, health+": its fix named [closed: already-solved]") || !strings.Contains(out, "resumed "+held+":") {
 		t.Fatalf("name the fix: exit %d %q %s", code, out, errOut)
@@ -540,8 +543,11 @@ func TestNamingTheFixOfAComponentHealthCaseClosedBeforeItResumesTheCasesItStoppe
 	}
 	st.Close()
 	if code, _, errOut := momentum("case", "close", health, "--reason", "already-solved", "--fix", "git:agent-sh/momentum@4814cc4", "--why", "again"); code != 2 ||
-		!strings.Contains(errOut, "its close named its fix: git:agent-sh/momentum@4814cc4") {
+		!strings.Contains(errOut, "its fix is named already: git:agent-sh/momentum@4814cc4") {
 		t.Fatalf("named twice: exit %d %s", code, errOut)
+	}
+	if code, _, errOut := momentum("case", "close", health, "--reason", "already-solved", "--why", "again"); code != 2 || strings.Contains(errOut, "--fix") {
+		t.Fatalf("closed again once its fix is named: exit %d %s", code, errOut)
 	}
 	if code, _, errOut := momentum("case", "close", dismissed, "--reason", "already-solved", "--fix", "git:agent-sh/momentum@4814cc4", "--why", "x"); code != 2 ||
 		!strings.Contains(errOut, "closed already (not-worth-it), not as already solved") {

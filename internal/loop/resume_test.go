@@ -75,10 +75,10 @@ func TestAFixOfTheStopResumesTheCasesItHeld(t *testing.T) {
 	if err != nil || len(stopped) != 2 || !slices.Contains(stopped, a.ID) || !slices.Contains(stopped, b.ID) {
 		t.Fatalf("the cases the stop on turns holds: %v %v", stopped, err)
 	}
-	if _, _, err := st.CloseFixed(ctx, a.ID, "git:agent-sh/momentum@4814cc4", stopped, "the cap was raised", "cli"); !errors.Is(err, store.ErrBadCase) {
+	if _, _, _, err := st.CloseFixed(ctx, a.ID, "git:agent-sh/momentum@4814cc4", stopped, "the cap was raised", "cli"); !errors.Is(err, store.ErrBadCase) {
 		t.Fatalf("a failures case named a fix: %v", err)
 	}
-	if _, _, err := st.CloseFixed(ctx, turns.ID, "commit 4814cc4", stopped, "the cap was raised", "cli"); !errors.Is(err, store.ErrBadCase) {
+	if _, _, _, err := st.CloseFixed(ctx, turns.ID, "commit 4814cc4", stopped, "the cap was raised", "cli"); !errors.Is(err, store.ErrBadCase) {
 		t.Fatalf("a fix that is no reference: %v", err)
 	}
 	if _, err := st.PutNote(ctx, store.Note{ID: store.ReviewNoteID(a.ID, "stopped"), Kind: store.NoteProblem, Importance: store.ImportanceLow,
@@ -93,7 +93,7 @@ func TestAFixOfTheStopResumesTheCasesItHeld(t *testing.T) {
 	fail(mixed, StepInvestigate, "turns", 3*time.Minute)
 	running := time.Now().Add(-time.Minute)
 	time.Sleep(5 * time.Millisecond)
-	closed, resumed, err := st.CloseFixed(ctx, turns.ID, "git:agent-sh/momentum@4814cc4", stopped, "the cap was raised", "cli")
+	closed, resumed, _, err := st.CloseFixed(ctx, turns.ID, "git:agent-sh/momentum@4814cc4", stopped, "the cap was raised", "cli")
 	if err != nil || closed.Status != store.CaseClosed || closed.Reason != store.Solved || len(resumed) != 2 {
 		t.Fatalf("the close: %+v %v %v", closed, resumed, err)
 	}
@@ -147,7 +147,7 @@ func TestAFixOfTheStopResumesTheCasesItHeld(t *testing.T) {
 	if got, step, why, err := r.pick(ctx, "failures", "", true); err != nil || got.ID != a.ID || step != StepInvestigate {
 		t.Fatalf("the next pass: %s %s: %s %v", got.ID, step, why, err)
 	}
-	if _, _, err := st.CloseFixed(ctx, turns.ID, "git:agent-sh/momentum@4814cc4", nil, "again", "cli"); !errors.Is(err, store.ErrBadCase) {
+	if _, _, _, err := st.CloseFixed(ctx, turns.ID, "git:agent-sh/momentum@4814cc4", nil, "again", "cli"); !errors.Is(err, store.ErrBadCase) {
 		t.Fatalf("a closed case closed again: %v", err)
 	}
 
@@ -245,7 +245,7 @@ func TestAStopAfterAResumePutsTheReviewNoteAgain(t *testing.T) {
 	if err != nil || len(stopped) != 1 || stopped[0] != c.ID {
 		t.Fatalf("the cases the stop holds: %v %v", stopped, err)
 	}
-	if _, resumed, err := s.Store.CloseFixed(ctx, health[0].ID, "git:agent-sh/momentum@4814cc4", stopped, "the report was fixed", "cli"); err != nil || len(resumed) != 1 {
+	if _, resumed, _, err := s.Store.CloseFixed(ctx, health[0].ID, "git:agent-sh/momentum@4814cc4", stopped, "the report was fixed", "cli"); err != nil || len(resumed) != 1 {
 		t.Fatalf("the fix: %v %v", resumed, err)
 	}
 	if note().Done.IsZero() {
@@ -314,9 +314,9 @@ func TestNamingTheFixOfAStopClosedBeforeItResumesWithoutAReopen(t *testing.T) {
 	if err != nil || len(stopped) != 1 || stopped[0] != held.ID {
 		t.Fatalf("the cases the stop holds: %v %v", stopped, err)
 	}
-	named, resumed, err := st.CloseFixed(ctx, h.ID, "git:agent-sh/momentum@4814cc4", stopped, "the cap was raised", "cli")
-	if err != nil || len(resumed) != 1 || resumed[0] != held.ID {
-		t.Fatalf("naming the fix: %v %v", resumed, err)
+	named, resumed, onlyNamed, err := st.CloseFixed(ctx, h.ID, "git:agent-sh/momentum@4814cc4", stopped, "the cap was raised", "cli")
+	if err != nil || len(resumed) != 1 || resumed[0] != held.ID || !onlyNamed {
+		t.Fatalf("naming the fix: %v %v %v", resumed, onlyNamed, err)
 	}
 	if named.Status != store.CaseClosed || named.Reason != store.Solved || named.Episode != h.Episode || !named.Closed.Equal(h.Closed) || named.Evidence != h.Evidence {
 		t.Fatalf("naming the fix changed the close: %+v, was %+v", named, h)
@@ -341,7 +341,7 @@ func TestNamingTheFixOfAStopClosedBeforeItResumesWithoutAReopen(t *testing.T) {
 	if why, err := r.stopped(ctx, held, true); err != nil || why != "" {
 		t.Fatalf("held is still stopped: %q %v", why, err)
 	}
-	if _, _, err := st.CloseFixed(ctx, h.ID, "git:agent-sh/momentum@5925dd5", nil, "again", "cli"); !errors.Is(err, store.ErrBadCase) || !strings.Contains(err.Error(), "named its fix") {
+	if _, _, _, err := st.CloseFixed(ctx, h.ID, "git:agent-sh/momentum@5925dd5", nil, "again", "cli"); !errors.Is(err, store.ErrBadCase) || !strings.Contains(err.Error(), "its fix is named already") {
 		t.Fatalf("a fix named twice: %v", err)
 	}
 	// late's second run began before the naming and fails after it: late resumes as of the naming
