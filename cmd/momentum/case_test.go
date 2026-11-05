@@ -449,3 +449,102 @@ func TestClosingAComponentHealthCaseAsFixedResumesTheCasesItStopped(t *testing.T
 		t.Fatalf("the close's line: %s", out)
 	}
 }
+
+// A component-health case closed as already solved before a close named its fix takes the same command: it stays
+// closed, in its episode and with its evidence, gets a fixed line, and the cases its stop held resume. A case whose
+// fix is named already, or one closed for another reason, is refused with why.
+func TestNamingTheFixOfAComponentHealthCaseClosedBeforeItResumesTheCasesItStopped(t *testing.T) {
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	t.Setenv("MOMENTUM_ACTOR", "cli")
+	ctx := context.Background()
+	_, out, _ := momentum("case", "open", "--family", "failures", "--signature", "failures:held", "--title", "a held case", "--evidence", "file:/h@1")
+	held := strings.SplitN(out, ":", 2)[0]
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, at := range []time.Time{time.Now().Add(-3 * time.Minute), time.Now().Add(-2 * time.Minute)} {
+		if err := st.PutLoopRun(ctx, store.LoopRun{ID: fmt.Sprintf("%s-%d", held, i), Case: held, Family: "failures", Step: "investigate",
+			Started: at, Ended: at.Add(time.Second), Status: store.RunFailed, Failure: "turns"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.Close()
+	code, out, errOut := momentum("case", "open", "--family", "component-health", "--signature", "component-health/v1:loop:investigate:turns",
+		"--title", "The loop fails the same way twice: turns", "--evidence", "file:/runs/one", "--evidence", "file:/runs/two")
+	if code != 0 {
+		t.Fatalf("open the loop's case: exit %d %s", code, errOut)
+	}
+	health := strings.SplitN(out, ":", 2)[0]
+	_, out, _ = momentum("case", "open", "--family", "component-health", "--signature", "component-health/v1:loop:investigate:timeout",
+		"--title", "The loop fails the same way twice: timeout", "--evidence", "file:/runs/three")
+	dismissed := strings.SplitN(out, ":", 2)[0]
+	if code, _, errOut := momentum("case", "close", dismissed, "--reason", "not-worth-it", "--why", "rare"); code != 0 {
+		t.Fatalf("dismiss the other: exit %d %s", code, errOut)
+	}
+	// closed as already solved by a version before a close named its fix
+	db, err := sql.Open("sqlite", "file:"+paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedAt := time.Now().Add(-time.Minute).UnixMilli()
+	if _, err := db.Exec(`UPDATE cases SET status = 'closed', reason = 'already-solved', closed = ?, updated = ?, closed_evidence = 2 WHERE id = ?`,
+		closedAt, closedAt, health); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	st, err = store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := st.CaseByID(ctx, health)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	if code, _, errOut := momentum("case", "close", health, "--reason", "already-solved", "--why", "fixed"); code != 2 ||
+		!strings.Contains(errOut, "before its fix was named: case close "+health+" --reason already-solved --fix REF") {
+		t.Fatalf("closed again without its fix: exit %d %s", code, errOut)
+	}
+	code, out, errOut = momentum("case", "close", health, "--reason", "already-solved", "--fix", "git:agent-sh/momentum@4814cc4", "--why", "the turn cap was raised")
+	if code != 0 || !strings.Contains(out, health+": its fix named [closed: already-solved]") || !strings.Contains(out, "resumed "+held+":") {
+		t.Fatalf("name the fix: exit %d %q %s", code, out, errOut)
+	}
+	st, err = store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := st.CaseByID(ctx, health)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != store.CaseClosed || after.Reason != store.Solved || after.Episode != before.Episode || !after.Closed.Equal(before.Closed) ||
+		after.Evidence != before.Evidence || after.ClosedEvidence != before.ClosedEvidence {
+		t.Fatalf("naming the fix changed the close: %+v, was %+v", after, before)
+	}
+	log, _ := st.CaseLog(ctx, health)
+	var fixed bool
+	for _, e := range log {
+		if e.Action == "regressed" || e.Action == "reopened" {
+			t.Fatalf("naming the fix reopened the case: %+v", e)
+		}
+		fixed = fixed || e.Action == store.ActionFixed && e.Detail == "git:agent-sh/momentum@4814cc4"
+	}
+	if last := log[len(log)-1]; !fixed || last.Detail != "closed as already-solved before its fix was named; fixed by git:agent-sh/momentum@4814cc4; resumes "+held+": the turn cap was raised" {
+		t.Fatalf("the naming's lines: %+v", log)
+	}
+	hl, _ := st.CaseLog(ctx, held)
+	if last := hl[len(hl)-1]; last.Action != store.ActionResumed || !strings.Contains(last.Detail, health+", the loop's case of its stop, closed as fixed by git:agent-sh/momentum@4814cc4") {
+		t.Fatalf("the resumed case's log: %+v", hl)
+	}
+	st.Close()
+	if code, _, errOut := momentum("case", "close", health, "--reason", "already-solved", "--fix", "git:agent-sh/momentum@4814cc4", "--why", "again"); code != 2 ||
+		!strings.Contains(errOut, "its close named its fix: git:agent-sh/momentum@4814cc4") {
+		t.Fatalf("named twice: exit %d %s", code, errOut)
+	}
+	if code, _, errOut := momentum("case", "close", dismissed, "--reason", "already-solved", "--fix", "git:agent-sh/momentum@4814cc4", "--why", "x"); code != 2 ||
+		!strings.Contains(errOut, "closed already (not-worth-it), not as already solved") {
+		t.Fatalf("a fix named on a case closed another way: exit %d %s", code, errOut)
+	}
+}

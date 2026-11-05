@@ -491,7 +491,7 @@ func caseClose(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	fs.SetOutput(stderr)
 	reason := fs.String("reason", "", "not-worth-it, insufficient-evidence, already-solved or duplicate (improved is the measure tool's)")
 	into := fs.String("into", "", "for a duplicate: the case with the same root cause")
-	fix := fs.String("fix", "", "for a component-health case closed as already-solved: what fixed it, its commit (git:OWNER/REPO@SHA) or another reference; the cases its stop held resume")
+	fix := fs.String("fix", "", "for a component-health case closed as already-solved, now or before a close named its fix: what fixed it, its commit (git:OWNER/REPO@SHA) or another reference; the cases its stop held resume")
 	why := fs.String("why", "", "why, in a short line")
 	if err := fs.Parse(rest); err != nil {
 		return usageError{err.Error()}
@@ -526,7 +526,8 @@ func caseClose(ctx context.Context, args []string, stdout, stderr io.Writer) err
 }
 
 // closeFixed closes a component-health case as already solved by what fixed it, and resumes the cases the stop rule
-// holds on its signatures: the stop rule then counts only their runs after the close.
+// holds on its signatures: the stop rule then counts only their runs after the close. One closed as already solved
+// before a close named its fix stays closed and gets its fix named.
 func closeFixed(ctx context.Context, st *store.Store, id, fix, why string, stdout io.Writer) error {
 	if err := st.Fixable(ctx, id); err != nil {
 		return caseErr(err)
@@ -534,6 +535,10 @@ func closeFixed(ctx context.Context, st *store.Store, id, fix, why string, stdou
 	c, err := st.CaseByID(ctx, id)
 	if err != nil {
 		return caseErr(err)
+	}
+	what := "closed"
+	if c.Status == store.CaseClosed {
+		what = "its fix named"
 	}
 	stopped, err := loop.StoppedOn(ctx, st, c)
 	if err != nil {
@@ -543,7 +548,7 @@ func closeFixed(ctx context.Context, st *store.Store, id, fix, why string, stdou
 	if err != nil {
 		return caseErr(err)
 	}
-	printCase(stdout, c, "closed")
+	printCase(stdout, c, what)
 	for _, r := range resumed {
 		fmt.Fprintf(stdout, "resumed %s: the stop rule counts only its runs from now\n", r)
 	}

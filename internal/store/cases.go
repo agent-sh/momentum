@@ -984,6 +984,14 @@ func (s *Store) CloseCase(ctx context.Context, id string, reason CloseReason, in
 		return Case{}, badCase("reason %q is not one of not-worth-it, insufficient-evidence, already-solved, duplicate", reason)
 	case reason == Improved:
 		return Case{}, badCase("only the measure tool closes a case as improved, with its measurement")
+	case c.Status == CaseClosed && c.Family == HealthFamily && c.Reason == Solved:
+		hint := ""
+		if _, _, named, err := fixedOf(ctx, tx, c); err != nil {
+			return Case{}, err
+		} else if !named {
+			hint = fmt.Sprintf(" before its fix was named: case close %s --reason already-solved --fix REF --why WHY names it, which resumes the cases its stop held", c.ID)
+		}
+		return Case{}, badCase("case %s is closed already (%s)%s", c.ID, c.Reason, hint)
 	case c.Status == CaseClosed:
 		return Case{}, badCase("case %s is closed already (%s)", c.ID, c.Reason)
 	case !slices.Contains(working, c.Status):
@@ -1030,7 +1038,9 @@ func ReviewNoteID(caseID, cause string) string { return "loop-review:" + IDPart(
 // testing gets a resumed line naming the fix, in the same transaction, and keeps its episode, status and
 // investigation; its review's stopped note is done. A case closed, deployed or measuring, or one that went into
 // another, is not resumed. It returns the closed case and the cases it resumed. A case whose stop comes after the
-// close resumes then (ResumeLate).
+// close resumes then (ResumeLate). A case closed as already solved before a close named its fix gets its fix named
+// the same way and stays closed: no reopen, no new episode, no evidence; the naming counts as its close for a stop
+// that comes after it.
 func (s *Store) CloseFixed(ctx context.Context, id, fix string, stopped []string, why, actor string) (Case, []string, error) {
 	if strings.TrimSpace(why) == "" {
 		return Case{}, nil, badCase("a close says why")
@@ -1048,7 +1058,7 @@ func (s *Store) CloseFixed(ctx context.Context, id, fix string, stopped []string
 	if err != nil {
 		return Case{}, nil, err
 	}
-	if err := fixable(c); err != nil {
+	if err := fixable(ctx, tx, c); err != nil {
 		return Case{}, nil, err
 	}
 	var resumed []string
@@ -1074,7 +1084,15 @@ func (s *Store) CloseFixed(ctx context.Context, id, fix string, stopped []string
 	if len(resumed) > 0 {
 		what += "; resumes " + strings.Join(resumed, ", ")
 	}
-	if err := closeAs(ctx, tx, c.ID, Solved, what+": "+why, actor, now); err != nil {
+	if c.Status == CaseClosed {
+		// closed as already solved before a close named its fix: the close stands, and only its fix is named
+		if _, err := tx.ExecContext(ctx, `UPDATE cases SET updated = ? WHERE id = ?`, now.UnixMilli(), c.ID); err != nil {
+			return Case{}, nil, err
+		}
+		if err := caseLog(ctx, tx, c.ID, actor, "fix named", "closed as already-solved before its fix was named; "+what+": "+why, now); err != nil {
+			return Case{}, nil, err
+		}
+	} else if err := closeAs(ctx, tx, c.ID, Solved, what+": "+why, actor, now); err != nil {
 		return Case{}, nil, err
 	}
 	if c, err = getCase(ctx, tx, c.ID); err != nil {
@@ -1083,28 +1101,52 @@ func (s *Store) CloseFixed(ctx context.Context, id, fix string, stopped []string
 	return c, resumed, tx.Commit()
 }
 
-// Fixable refuses a case CloseFixed would refuse: one of another family, or one that is not open, investigating or
-// testing.
+// Fixable refuses a case CloseFixed would refuse: one of another family, one closed for another reason or closed
+// with its fix named, or one deployed or measuring.
 func (s *Store) Fixable(ctx context.Context, id string) error {
 	c, err := getCase(ctx, s.db, id)
 	if err != nil {
 		return err
 	}
-	return fixable(c)
+	return fixable(ctx, s.db, c)
 }
 
-func fixable(c Case) error {
+func fixable(ctx context.Context, q querier, c Case) error {
 	switch {
 	case c.Status == CaseClosed && c.Reason == Duplicate:
 		return badCase("case %s is closed already: a duplicate of %s", c.ID, c.Into)
 	case c.Family != HealthFamily:
 		return badCase("case %s is %s: only a %s case names what fixed it, to resume the cases its stop held", c.ID, c.Family, HealthFamily)
+	case c.Status == CaseClosed && c.Reason != Solved:
+		return badCase("case %s is closed already (%s), not as already solved: only a case closed as already-solved names its fix after its close", c.ID, c.Reason)
 	case c.Status == CaseClosed:
-		return badCase("case %s is closed already (%s)", c.ID, c.Reason)
+		fix, _, named, err := fixedOf(ctx, q, c)
+		if err != nil {
+			return err
+		}
+		if named {
+			return badCase("case %s is closed already (already-solved), and its close named its fix: %s", c.ID, fix)
+		}
 	case !slices.Contains(working, c.Status):
 		return badCase("case %s is %s: its change is in place, so only the ship tool's rollback or the measure tool closes it", c.ID, c.Status)
 	}
 	return nil
+}
+
+// fixedOf reads the fix named for a component-health case closed as already solved, and when it was named: its
+// newest fixed line from its close on, written by the close or, for a case closed before a close named its fix, by
+// the naming after it. The naming is the close a late stop is measured against (ResumeLate).
+func fixedOf(ctx context.Context, q querier, h Case) (string, time.Time, bool, error) {
+	var fix string
+	var at int64
+	err := q.QueryRowContext(ctx, `SELECT detail, at FROM case_log WHERE case_id = ? AND action = ? AND at >= ? ORDER BY seq DESC LIMIT 1`,
+		h.ID, ActionFixed, h.Closed.UnixMilli()).Scan(&fix, &at)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", time.Time{}, false, nil
+	} else if err != nil {
+		return "", time.Time{}, false, err
+	}
+	return fix, time.UnixMilli(at), true, nil
 }
 
 // resume writes a case's resumed line at a time, naming the component-health case and its fix, and marks its
@@ -1119,49 +1161,49 @@ func resume(ctx context.Context, q querier, id, health, fix, late, actor string,
 }
 
 // FixedStop finds the component-health case that holds a stop's signature when it closed as fixed after first, the
-// start of the stop's older run: the close would have resumed the case had its stop come in time. It returns that
-// case and what fixed it.
+// start of the stop's older run: the close would have resumed the case had its stop come in time. For a case closed
+// as already solved before a close named its fix, the naming counts as its close. It returns that case and what
+// fixed it.
 func (s *Store) FixedStop(ctx context.Context, signature string, first time.Time) (Case, string, bool, error) {
-	return fixedStop(ctx, s.db, signature, first)
+	h, fix, _, ok, err := fixedStop(ctx, s.db, signature, first)
+	return h, fix, ok, err
 }
 
-func fixedStop(ctx context.Context, q querier, signature string, first time.Time) (Case, string, bool, error) {
+// fixedStop is FixedStop, with the time of the close that named the fix.
+func fixedStop(ctx context.Context, q querier, signature string, first time.Time) (Case, string, time.Time, bool, error) {
 	var id string
 	err := q.QueryRowContext(ctx, `SELECT case_id FROM case_signatures WHERE signature = ?`, signature).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Case{}, "", false, nil
+		return Case{}, "", time.Time{}, false, nil
 	} else if err != nil {
-		return Case{}, "", false, err
+		return Case{}, "", time.Time{}, false, err
 	}
 	h, err := getCase(ctx, q, id)
 	if err != nil {
-		return Case{}, "", false, err
+		return Case{}, "", time.Time{}, false, err
 	}
-	if h.Family != HealthFamily || h.Status != CaseClosed || h.Reason != Solved || !h.Closed.After(first) {
-		return Case{}, "", false, nil
+	if h.Family != HealthFamily || h.Status != CaseClosed || h.Reason != Solved {
+		return Case{}, "", time.Time{}, false, nil
 	}
-	var fix string
-	err = q.QueryRowContext(ctx, `SELECT detail FROM case_log WHERE case_id = ? AND action = ? AND at <= ? ORDER BY seq DESC LIMIT 1`,
-		h.ID, ActionFixed, h.Closed.UnixMilli()).Scan(&fix)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Case{}, "", false, nil // closed as solved before a close named its fix
-	} else if err != nil {
-		return Case{}, "", false, err
+	fix, at, named, err := fixedOf(ctx, q, h)
+	if err != nil || !named || !at.After(first) {
+		return Case{}, "", time.Time{}, false, err // no fix named yet, or named before the stop's older run began
 	}
-	return h, fix, true, nil
+	return h, fix, at, true, nil
 }
 
 // ResumeLate resumes a case the stop rule would hold now when the component-health case of its stop closed as fixed
 // after the stop's older run started (FixedStop): its second failure was still running at the close, or ended after
-// the close read which cases were held. The resumed line is dated at the close, as the close would have written it,
-// so a run that started after the fix counts toward the case's next stop. It reports whether it resumed the case.
+// the close read which cases were held. The resumed line is dated at the close (for a case closed before a close
+// named its fix, at the naming), as the close would have written it, so a run that started after the fix counts
+// toward the case's next stop. It reports whether it resumed the case.
 func (s *Store) ResumeLate(ctx context.Context, id, signature string, first time.Time, actor string) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
-	h, fix, ok, err := fixedStop(ctx, tx, signature, first)
+	h, fix, closed, ok, err := fixedStop(ctx, tx, signature, first)
 	if err != nil || !ok {
 		return false, err
 	}
@@ -1173,7 +1215,7 @@ func (s *Store) ResumeLate(ctx context.Context, id, signature string, first time
 		return false, nil
 	}
 	// as of the close, as the close would have resumed it: a run started after the fix still counts toward the next stop
-	if err := resume(ctx, tx, c.ID, h.ID, fix, ", after this stop's first run started", actor, h.Closed); err != nil {
+	if err := resume(ctx, tx, c.ID, h.ID, fix, ", after this stop's first run started", actor, closed); err != nil {
 		return false, err
 	}
 	return true, tx.Commit()

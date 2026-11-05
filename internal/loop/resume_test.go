@@ -2,7 +2,9 @@ package loop
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -149,11 +151,15 @@ func TestAFixOfTheStopResumesTheCasesItHeld(t *testing.T) {
 		t.Fatalf("a closed case closed again: %v", err)
 	}
 
-	// a resumed case's next failure does not stop it
+	// a resumed case's next failure does not stop it, nor a late-resumed one's: its second run started before the fix
 	time.Sleep(5 * time.Millisecond)
 	fail(a, StepInvestigate, "turns", 0)
 	if why, err := r.stopped(ctx, a, true); err != nil || why != "" {
 		t.Fatalf("one failure after the resume stopped it: %q %v", why, err)
+	}
+	fail(late, StepInvestigate, "turns", 0)
+	if _, held, err := stopRuns(ctx, st, late); err != nil || held {
+		t.Fatalf("one failure after the late resume stopped it: %v", err)
 	}
 	// the fix did not hold: mixed fails after the close, resumes as of it, and its next failure is the second after
 	// the fix, which stops it and brings the component-health case back
@@ -172,13 +178,6 @@ func TestAFixOfTheStopResumesTheCasesItHeld(t *testing.T) {
 	if back.Status != store.CaseOpen || log[len(log)-1].Action != "regressed" {
 		t.Fatalf("the fix that did not hold: %s, %+v", back.Status, log[len(log)-1])
 	}
-	// a stop after the resume puts the review's stopped note again
-	if err := r.noteReviewSkip(ctx, a, "stopped", "its last two review runs failed the same way: report"); err != nil {
-		t.Fatal(err)
-	}
-	if n, ok, _ := st.Note(ctx, store.ReviewNoteID(a.ID, "stopped")); !ok || !n.Done.IsZero() {
-		t.Fatalf("a stop after the resume left the review note done: %+v", n)
-	}
 	// a resume brings back only the stopped note: a budget note its reader resolved before the resume stays resolved
 	budget := "its review is past the round budget: report"
 	if _, err := st.PutNote(ctx, store.Note{ID: store.ReviewNoteID(a.ID, "budget"), Kind: store.NoteProblem, Importance: store.ImportanceLow,
@@ -193,5 +192,182 @@ func TestAFixOfTheStopResumesTheCasesItHeld(t *testing.T) {
 	}
 	if n, ok, _ := st.Note(ctx, store.ReviewNoteID(a.ID, "budget")); !ok || n.Done.IsZero() {
 		t.Fatalf("a resume put back a resolved budget note: %+v", n)
+	}
+}
+
+// A stop after a resume puts the review's stopped note again, through the review pass: the resume makes the first
+// stop's note done, the resumed case's review goes on, and its next two failures stop it and put the note again.
+func TestAStopAfterAResumePutsTheReviewNoteAgain(t *testing.T) {
+	s, _, c, p := b4Reviewed(t)
+	p.Reviews = nil
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	r := &Runner{Store: s.Store, Ship: s, Dir: s.Dir, Budgets: DefaultBudgets,
+		pass: &passInputs{attempted: true, err: errors.New("marker-7f3a inputs reached")}}
+	n := 0
+	fail := func() {
+		t.Helper()
+		n++
+		at := time.Now()
+		if err := s.Store.PutLoopRun(ctx, store.LoopRun{ID: fmt.Sprint("review-", n), Case: c.ID, Step: StepReview, Family: c.Family,
+			Started: at, Ended: at.Add(time.Millisecond), Status: store.RunFailed, Failure: "marker-7f3a"}); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	review := func(want string) {
+		t.Helper()
+		if done := r.reviews(ctx, c.ID); len(done) != 1 || !strings.Contains(done[0].Skipped, want) {
+			t.Fatalf("the review, wanting %q: %+v", want, done)
+		}
+	}
+	note := func() store.Note {
+		t.Helper()
+		n, ok, err := s.Store.Note(ctx, store.ReviewNoteID(c.ID, "stopped"))
+		if err != nil || !ok {
+			t.Fatalf("the review's stopped note: %v", err)
+		}
+		return n
+	}
+	fail()
+	fail()
+	review("last two review runs failed")
+	if !note().Done.IsZero() {
+		t.Fatal("the stop put no standing note")
+	}
+	health, err := s.Store.Cases(ctx, store.CaseFilter{Family: store.HealthFamily})
+	if err != nil || len(health) != 1 {
+		t.Fatalf("the stop's component-health case: %+v %v", health, err)
+	}
+	stopped, err := StoppedOn(ctx, s.Store, health[0])
+	if err != nil || len(stopped) != 1 || stopped[0] != c.ID {
+		t.Fatalf("the cases the stop holds: %v %v", stopped, err)
+	}
+	if _, resumed, err := s.Store.CloseFixed(ctx, health[0].ID, "git:agent-sh/momentum@4814cc4", stopped, "the report was fixed", "cli"); err != nil || len(resumed) != 1 {
+		t.Fatalf("the fix: %v %v", resumed, err)
+	}
+	if note().Done.IsZero() {
+		t.Fatal("the resume left the stopped note standing")
+	}
+	time.Sleep(5 * time.Millisecond)
+	review("inputs: marker-7f3a inputs reached")
+	fail()
+	fail()
+	review("last two review runs failed")
+	if !note().Done.IsZero() {
+		t.Fatal("a stop after the resume left the review's stopped note done")
+	}
+}
+
+// A component-health case closed as already solved before a close named its fix gets its fix named after its close:
+// the cases its stop held resume in the same transaction, and it stays closed, in its episode, with its evidence and
+// no regressed line. The naming counts as its close: a stop whose older run began before it resumes as of it, and
+// two failures after it bring the case back.
+func TestNamingTheFixOfAStopClosedBeforeItResumesWithoutAReopen(t *testing.T) {
+	ctx := context.Background()
+	st, path := testStoreAt(t)
+	r := runnerFor(t, st, nil)
+	n := 0
+	fail := func(c store.Case, started, ended time.Time) {
+		t.Helper()
+		n++
+		if err := st.PutLoopRun(ctx, store.LoopRun{ID: fmt.Sprint("run-", n), Case: c.ID, Family: c.Family, Step: StepInvestigate,
+			Started: started, Ended: ended, Status: store.RunFailed, Failure: "turns"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now()
+	held := openCase(t, st, "failures", "held", 2)
+	fail(held, now.Add(-5*time.Minute), now.Add(-5*time.Minute+time.Second))
+	fail(held, now.Add(-4*time.Minute), now.Add(-4*time.Minute+time.Second))
+	if why, err := r.stopped(ctx, held, false); err != nil || why == "" {
+		t.Fatalf("held is not stopped: %q %v", why, err)
+	}
+	health, err := st.Cases(ctx, store.CaseFilter{Family: store.HealthFamily})
+	if err != nil || len(health) != 1 {
+		t.Fatalf("the stop's component-health case: %+v %v", health, err)
+	}
+	h := health[0]
+	// closed as already solved by a version before a close named its fix: the stop holds on
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedAt := now.Add(-3 * time.Minute).UnixMilli()
+	if _, err := db.Exec(`UPDATE cases SET status = 'closed', reason = 'already-solved', closed = ?, updated = ?, closed_evidence = (SELECT COUNT(*) FROM case_evidence WHERE case_id = cases.id) WHERE id = ?`,
+		closedAt, closedAt, h.ID); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if h, err = st.CaseByID(ctx, h.ID); err != nil {
+		t.Fatal(err)
+	}
+	if why, err := r.stopped(ctx, held, false); err != nil || why == "" {
+		t.Fatalf("held resumed before its fix was named: %v", err)
+	}
+	// late failed once after the close, and its second run is still running when the fix is named
+	late := openCase(t, st, "failures", "late", 2)
+	fail(late, now.Add(-2*time.Minute), now.Add(-2*time.Minute+time.Second))
+	stopped, err := StoppedOn(ctx, st, h)
+	if err != nil || len(stopped) != 1 || stopped[0] != held.ID {
+		t.Fatalf("the cases the stop holds: %v %v", stopped, err)
+	}
+	named, resumed, err := st.CloseFixed(ctx, h.ID, "git:agent-sh/momentum@4814cc4", stopped, "the cap was raised", "cli")
+	if err != nil || len(resumed) != 1 || resumed[0] != held.ID {
+		t.Fatalf("naming the fix: %v %v", resumed, err)
+	}
+	if named.Status != store.CaseClosed || named.Reason != store.Solved || named.Episode != h.Episode || !named.Closed.Equal(h.Closed) || named.Evidence != h.Evidence {
+		t.Fatalf("naming the fix changed the close: %+v, was %+v", named, h)
+	}
+	log, _ := st.CaseLog(ctx, h.ID)
+	var at time.Time
+	for _, e := range log {
+		if e.Action == "regressed" || e.Action == "reopened" {
+			t.Fatalf("naming the fix reopened the case: %+v", e)
+		}
+		if e.Action == store.ActionFixed {
+			at = e.At
+		}
+	}
+	if last := log[len(log)-1]; at.IsZero() || !strings.Contains(last.Detail, "fixed by git:agent-sh/momentum@4814cc4; resumes "+held.ID+": the cap was raised") {
+		t.Fatalf("the naming's lines: %+v", log)
+	}
+	hl, _ := st.CaseLog(ctx, held.ID)
+	if last := hl[len(hl)-1]; last.Action != store.ActionResumed || !strings.Contains(last.Detail, h.ID) || !strings.Contains(last.Detail, "4814cc4") {
+		t.Fatalf("held's resume line: %+v", last)
+	}
+	if why, err := r.stopped(ctx, held, true); err != nil || why != "" {
+		t.Fatalf("held is still stopped: %q %v", why, err)
+	}
+	if _, _, err := st.CloseFixed(ctx, h.ID, "git:agent-sh/momentum@5925dd5", nil, "again", "cli"); !errors.Is(err, store.ErrBadCase) || !strings.Contains(err.Error(), "named its fix") {
+		t.Fatalf("a fix named twice: %v", err)
+	}
+	// late's second run began before the naming and fails after it: late resumes as of the naming
+	time.Sleep(5 * time.Millisecond)
+	fail(late, now.Add(-time.Minute), time.Now())
+	if why, err := r.stopped(ctx, late, false); err != nil || why != "" {
+		t.Fatalf("the late stop held its case: %q %v", why, err)
+	}
+	ll, _ := st.CaseLog(ctx, late.ID)
+	if last := ll[len(ll)-1]; last.Action != store.ActionResumed || last.At.UnixMilli() != at.UnixMilli() {
+		t.Fatalf("late's resume line, as of the naming at %v: %+v", at, last)
+	}
+	if got, _ := st.CaseByID(ctx, h.ID); got.Status != store.CaseClosed || got.Evidence != h.Evidence {
+		t.Fatalf("the late stop changed the closed case: %s, %d evidence", got.Status, got.Evidence)
+	}
+	// the fix did not hold: two failures after the naming stop held and bring the case back
+	time.Sleep(5 * time.Millisecond)
+	fail(held, time.Now(), time.Now())
+	time.Sleep(5 * time.Millisecond)
+	fail(held, time.Now(), time.Now())
+	if why, err := r.stopped(ctx, held, false); err != nil || why == "" {
+		t.Fatalf("two failures after the naming did not stop held: %v", err)
+	}
+	back, _ := st.CaseByID(ctx, h.ID)
+	log, _ = st.CaseLog(ctx, h.ID)
+	if back.Status != store.CaseOpen || back.Episode != h.Episode+1 || log[len(log)-1].Action != "regressed" {
+		t.Fatalf("the fix that did not hold: %+v, %+v", back, log[len(log)-1])
 	}
 }
