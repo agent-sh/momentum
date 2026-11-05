@@ -57,7 +57,7 @@ func gitGlobal(key string) string {
 }
 
 // repoBusy names what works in a repository now, or "": a live agent session (any phase but done) in one of its
-// work trees, or above one whose calls of the last hour name it; a process with its working directory in one; a
+// work trees, or above one whose calls of the last hour act in it (capacity.ActsIn); a process with its working directory in one; a
 // change to its tracked files not committed; or a commit, a checkout or a staging in one in the last hour. The
 // loop's own trees and processes are its own.
 func repoBusy(ctx context.Context, st *store.Store, dir string) (string, error) {
@@ -89,19 +89,16 @@ func busyIn(ctx context.Context, st *store.Store, dir string, ss map[int]capacit
 			case within(s.Cwd, t):
 				return fmt.Sprintf("session %s (%s) works in %s", firstText(s.Name, s.Key), s.Tool, t), nil
 			case within(t, s.Cwd) && s.ID != "":
-				// a session above the tree: its last hour's calls say whether it works in it
+				// a session above the tree works in it when a call of its last hour acts there; one that only reads
+				// it, or names the repository, does not
 				calls, err := st.Events(ctx, store.Query{Since: time.Now().Add(-time.Hour), Session: s.ID, Kinds: []string{"tool_call"},
 					Source: store.Transcripts, Limit: 2000})
 				if err != nil {
 					return "", err
 				}
-				rel, _ := filepath.Rel(s.Cwd, t)
-				names := []string{t, "~/" + strings.TrimPrefix(strings.TrimPrefix(t, home), "/"), rel}
 				for _, e := range calls {
-					for _, n := range names {
-						if n != "" && n != "." && strings.Contains(e.Summary, n) {
-							return fmt.Sprintf("session %s (%s) works in %s from %s", firstText(s.Name, s.Key), s.Tool, t, s.Cwd), nil
-						}
+					if capacity.ActsIn(e.Tool, e.Summary, firstText(e.Cwd, s.Cwd), t, home) {
+						return fmt.Sprintf("session %s (%s) works in %s from %s", firstText(s.Name, s.Key), s.Tool, t, s.Cwd), nil
 					}
 				}
 			}

@@ -98,12 +98,27 @@ func TestARepositoryIsBusyWhenSomeoneWorksInIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	call := func(session, text string) store.Event {
+	call := func(session, tool, text string) store.Event {
 		return store.Event{Source: store.Transcripts, SourceKey: session + "@" + text, TS: time.Now().Add(-10 * time.Minute), Session: session,
-			Harness: "claude", Actor: store.ActorAgent, Kind: "tool_call", Tool: "Bash", Summary: text}
+			Harness: "claude", Cwd: projects, Actor: store.ActorAgent, Kind: "tool_call", Tool: tool, Summary: text}
 	}
-	if _, err := st.Put(ctx, []store.Event{call("s-above", `{"command":"cd shop && go test ./..."}`), call("s-other", `{"command":"cd garden && ls"}`)}); err != nil {
+	if _, err := st.Put(ctx, []store.Event{call("s-above", "Bash", `{"command":"cd shop && go test ./..."}`),
+		call("s-other", "Bash", `{"command":"cd garden && ls"}`),
+		// the repository's name, a read of its files and a brief that names its path are no work in it
+		call("s-gh", "Bash", `{"command":"gh pr view 5 --repo owner/shop --json state"}`),
+		call("s-reads", "Bash", `{"command":"grep -n first `+repo+`/a.txt; git -C `+repo+` log --oneline -3; journalctl --user -u shop"}`),
+		call("s-reads", "Read", `{"file_path":"`+repo+`/a.txt"}`),
+		call("s-reads", "Agent", `{"prompt":"review the change in `+repo+`"}`),
+		call("s-commit", "Bash", `{"command":"git -C `+repo+` commit -qm fix"}`),
+		call("s-edit", "Edit", `{"file_path":"`+repo+`/a.txt","old_string":"a","new_string":"b"}`),
+		// a call it cannot read counts when it names the tree's path, not when it names the repository
+		call("s-unread", "mcp__tool__run", `{"target":"`+repo+`/a.txt"}`),
+		call("s-unread-name", "mcp__tool__run", `{"repo":"owner/shop"}`),
+	}); err != nil {
 		t.Fatal(err)
+	}
+	above := func(id string) map[int]capacity.Session {
+		return map[int]capacity.Session{1: {Key: "k", Tool: "claude", ID: id, Cwd: projects}}
 	}
 	for _, c := range []struct {
 		ss   map[int]capacity.Session
@@ -113,6 +128,12 @@ func TestARepositoryIsBusyWhenSomeoneWorksInIt(t *testing.T) {
 		{map[int]capacity.Session{1: {Key: "k", Tool: "claude", ID: "s-in", Cwd: filepath.Join(repo, "sub")}}, "works in"},
 		{map[int]capacity.Session{1: {Key: "k", Tool: "claude", ID: "s-above", Cwd: projects}}, "works in " + repo + " from"},
 		{map[int]capacity.Session{1: {Key: "k", Tool: "claude", ID: "s-other", Cwd: projects}}, ""},
+		{above("s-gh"), ""},
+		{above("s-reads"), ""},
+		{above("s-commit"), "works in " + repo + " from"},
+		{above("s-edit"), "works in " + repo + " from"},
+		{above("s-unread"), "works in " + repo + " from"},
+		{above("s-unread-name"), ""},
 	} {
 		if got, err := busyIn(ctx, st, repo, c.ss); err != nil || (c.want == "") != (got == "") || !strings.Contains(got, c.want) {
 			t.Errorf("%+v: %q %v", c.ss, got, err)

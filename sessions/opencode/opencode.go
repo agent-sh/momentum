@@ -250,8 +250,11 @@ func (src *Source) facts(ctx context.Context, id string, s *sessions.Session) (b
 		s.Ask, s.AskKind = "stopped on an error: "+text.OneLine(text.FirstNonEmpty(last.Error.Data.Message, last.Error.Name), 200), sessions.AskError
 	}
 	s.Model = last.ModelID
-	rows, err := db.QueryContext(ctx, `select p.data, coalesce(m.data, '') from `+src.partRows()+` p left join `+src.messageRows()+` m on m.id = p.message_id
-		where p.session_id = ? order by p.time_created desc limit 40`, id)
+	// the join reads this session's messages only: a join on the whole message view would read every session the
+	// database holds, a scan of the whole store for each process
+	rows, err := db.QueryContext(ctx, `select p.data, coalesce(m.data, '') from `+src.partRows()+` p
+		left join (select id, data from `+src.messageRows()+` where session_id = ?1) m on m.id = p.message_id
+		where p.session_id = ?1 order by p.time_created desc limit 40`, id)
 	if err != nil {
 		return open, fmt.Errorf("parts: %w", err)
 	}
