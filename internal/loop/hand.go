@@ -96,6 +96,23 @@ func (s *Ship) handEnded(ctx context.Context, caseID, why string) error {
 	if _, _, err := s.Store.DoneNote(ctx, handNoteID(caseID), s.now()); err != nil && !errors.Is(err, store.ErrNoNote) {
 		return err
 	}
+	return s.doneHandReadNotes(ctx, caseID)
+}
+
+// doneHandReadNotes resolves the notes of the case's hand landing reads that failed: a read that went through, or the
+// record's end, is past them.
+func (s *Ship) doneHandReadNotes(ctx context.Context, caseID string) error {
+	notes, err := s.Store.Notes(ctx)
+	if err != nil {
+		return err
+	}
+	for _, n := range notes {
+		if n.Done.IsZero() && strings.HasPrefix(n.ID, handNoteID(caseID)+":read:") {
+			if _, _, err := s.Store.DoneNote(ctx, n.ID, s.now()); err != nil && !errors.Is(err, store.ErrNoNote) {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -158,13 +175,6 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 	if err := json.Unmarshal([]byte(raw), &pr); err != nil {
 		return p, fmt.Errorf("read the hand landing's pull request: %w", err)
 	}
-	if pr.Base != "" && pr.Base != p.Base {
-		// retargeted by a person: its merge would never reach the branch the loop measures from
-		if err := s.caseNoteOnce(ctx, caseID, "hand landing retargeted", fmt.Sprintf("%s targets %s, not %s: the loop waits for it on %s", p.PR, pr.Base, p.Base, p.Base)); err != nil {
-			return p, err
-		}
-		return p, refused("the hand landing's pull request %s targets %s, not %s", p.PR, pr.Base, p.Base)
-	}
 	switch pr.State {
 	case "OPEN":
 		log, err := s.Store.CaseLog(ctx, caseID)
@@ -176,7 +186,15 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 				return p, err
 			}
 		}
-		if ours := firstOf(p.PublishedHead, p.Head); pr.Head != "" && ours != "" && pr.Head != ours {
+		if pr.Base != "" && pr.Base != p.Base {
+			// retargeted by a person: the loop waits for it to be merged or closed, and its merge counts once on p.Base
+			if err := s.caseNoteOnce(ctx, caseID, "hand landing retargeted", fmt.Sprintf("%s targets %s, not %s: a person has it", p.PR, pr.Base, p.Base)); err != nil {
+				return p, err
+			}
+			return p, refused("the hand landing's pull request %s targets %s, not %s", p.PR, pr.Base, p.Base)
+		}
+		ours := firstOf(p.PublishedHead, p.Head)
+		if pr.Head != "" && ours != "" && pr.Head != p.PublishedHead && pr.Head != p.Head {
 			// a person works the request now (a rebase, a push of their own): the loop neither revises nor reviews it,
 			// and reads it until it is merged or closed
 			if err := s.caseNoteOnce(ctx, caseID, "hand landing taken over", fmt.Sprintf("%s holds %s, not the loop's %s: a person has it", p.PR, pr.Head, ours)); err != nil {
@@ -210,7 +228,7 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 	case "CLOSED":
 		// a person who lands a rebased head by a push to the default branch and then closes the request landed it all
 		// the same: the change's files on the default branch as the proposal has them say so
-		if commit, at, landed, err := s.landedByContent(ctx, p); err != nil {
+		if commit, at, landed, err := s.landedByContent(ctx, p, pr.Head); err != nil {
 			return p, err
 		} else if landed {
 			if err := s.caseNoteOnce(ctx, caseID, "landed by content", fmt.Sprintf("%s was closed, and %s holds its change's files as proposed at %s", p.PR, p.Base, commit)); err != nil {
@@ -268,7 +286,7 @@ func (s *Ship) withdrawHand(ctx context.Context, c store.Case, p Package) (Packa
 		}
 	}
 	for i, e := range log { // a proposal whose record was never written still has its proposal line
-		if first < 0 && e.Action == "proposed" && strings.Contains(e.Detail, pr) {
+		if first < 0 && e.Action == "proposed" && strings.HasPrefix(e.Detail, pr+" ") {
 			first, episode = i, c.Episode
 		}
 	}
@@ -352,13 +370,47 @@ func (s *Ship) landHand(ctx context.Context, c store.Case, p *Package, commit st
 
 // landedByContent says whether the fetched default branch holds every file the change touches as the proposal's head
 // has it (a deleted file deleted), and if so the newest commit of the branch that touched them and its time.
-func (s *Ship) landedByContent(ctx context.Context, p Package) (string, time.Time, bool, error) {
+func (s *Ship) landedByContent(ctx context.Context, p Package, requestHead string) (string, time.Time, bool, error) {
 	if firstOf(p.Head, p.PublishedHead) == "" || len(p.Changed) == 0 {
 		return "", time.Time{}, false, nil
 	}
 	if _, err := s.git(ctx, p.Host, "fetch", "--quiet", "origin", p.Base); err != nil {
 		return "", time.Time{}, false, err
 	}
+	heads := []string{firstOf(p.Head, p.PublishedHead)}
+	if n := prNumber(p.PR); commitRe.MatchString(requestHead) && requestHead != heads[0] && n != "" {
+		// a person's own version of the request, which they may have pushed instead
+		if _, err := s.git(ctx, p.Host, "fetch", "--quiet", "origin", "refs/pull/"+n+"/head"); err == nil {
+			heads = append(heads, requestHead)
+		}
+	}
+	for _, head := range heads {
+		commit, at, landed, err := s.holdsFiles(ctx, p, head)
+		if err != nil || landed {
+			return commit, at, landed, err
+		}
+	}
+	return "", time.Time{}, false, nil
+}
+
+// prNumber is a pull request URL's number, or "".
+func prNumber(url string) string {
+	i := strings.LastIndex(url, "/pull/")
+	if i < 0 {
+		return ""
+	}
+	n := url[i+len("/pull/"):]
+	for _, r := range n {
+		if r < '0' || r > '9' {
+			return ""
+		}
+	}
+	return n
+}
+
+// holdsFiles says whether the fetched default branch holds every file the change touches as head has it, and if so
+// the newest commit of the branch that touched them and its time.
+func (s *Ship) holdsFiles(ctx context.Context, p Package, head string) (string, time.Time, bool, error) {
 	base := "origin/" + p.Base
 	blob := func(rev, path string) (string, bool, error) {
 		out, err := s.git(ctx, p.Host, "rev-parse", "--verify", "--quiet", rev+":"+path)
@@ -372,7 +424,7 @@ func (s *Ship) landedByContent(ctx context.Context, p Package) (string, time.Tim
 		return "", false, err // a read that failed decides nothing: a close is never withdrawn on it
 	}
 	for _, path := range p.Changed {
-		want, wok, err := blob(firstOf(p.Head, p.PublishedHead), path)
+		want, wok, err := blob(head, path)
 		if err != nil {
 			return "", time.Time{}, false, err
 		}

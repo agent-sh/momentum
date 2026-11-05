@@ -367,7 +367,9 @@ var refusalKeys = []string{"build report", "build patch", "build check", "build 
 // lastBuildRefusal is why the host refused the case's newest build of this episode, for the next build's inputs
 // (refusal.md), or "" when the newest build was not refused for its own output.
 func (r *Runner) lastBuildRefusal(ctx context.Context, c store.Case) (string, error) {
-	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID})
+	// only runs that ran and ended on their own: a reservation the budgets refused, or a run the host ended, says
+	// nothing of a build's output
+	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID, Ran: true, Judged: true})
 	if err != nil {
 		return "", err
 	}

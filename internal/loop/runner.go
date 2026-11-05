@@ -410,6 +410,11 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 			} else if !dry && err == nil && ok && len(p.Hand) > 0 && p.PR != "" {
 				// a proposal for a hand landing is a person's to land or close: read which before more work
 				p, err := r.Ship.reconcileHand(ctx, c.ID)
+				if err == nil {
+					if noteErr := r.Ship.doneHandReadNotes(ctx, c.ID); noteErr != nil {
+						r.logf("hand landing notes: %v", noteErr)
+					}
+				}
 				switch {
 				case err != nil:
 					passed = append(passed, c.ID+" hand landing: "+err.Error())

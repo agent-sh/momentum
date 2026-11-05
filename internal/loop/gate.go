@@ -311,7 +311,7 @@ func SelfLandable() []string { return slices.Clone(selfChanges) }
 func ProposalProtected() []string {
 	return []string{"cmd/", "sessions/", "internal/loop/", "internal/measure/", "internal/sandbox/", "internal/ro/",
 		"internal/evidenceview/", "internal/config/", "internal/paths/", "internal/detect/", "internal/source/", "internal/store/",
-		"internal/toolresult/", "internal/plain/", "internal/tracked/", "internal/capacity/run.go", "internal/capacity/record.go", "internal/capacity/acts.go",
+		"internal/toolresult/", "internal/plain/", "internal/tracked/", "internal/capacity/run.go", "internal/capacity/record.go", "internal/capacity/acts.go", "internal/capacity/scratch_made.go", "internal/capacity/fsid.go",
 		"internal/supervise/", "go.mod", "go.sum", "go.work", "go.work.sum", "vendor/"}
 }
 

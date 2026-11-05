@@ -186,7 +186,7 @@ func (r *Runner) releaseHolds(ctx context.Context, cs []store.Case) error {
 			}
 		}
 		for id := range standing {
-			if strings.HasPrefix(id, holdNotePrefix(c.ID)) || id == repoNoteID(c.ID) || id == handNoteID(c.ID) {
+			if strings.HasPrefix(id, holdNotePrefix(c.ID)) || id == repoNoteID(c.ID) || id == handNoteID(c.ID) || strings.HasPrefix(id, handNoteID(c.ID)+":") {
 				if _, _, err := r.Store.DoneNote(ctx, id, r.now()); err != nil {
 					return err
 				}

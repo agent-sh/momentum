@@ -808,6 +808,20 @@ func TestAReturnedCaseReadsItsHandLandingAgain(t *testing.T) {
 	if len(done) != 1 || !strings.Contains(done[0].Skipped, "could not be read") {
 		t.Fatalf("a review of an unread hand landing: %+v", done)
 	}
+	// a read that goes through resolves the failed read's note
+	s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"OPEN"}'`)
+	if _, _, _, err := r.pick(ctx, c.Family, c.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	notes, err := s.Store.Notes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range notes {
+		if strings.HasPrefix(n.ID, handNoteID(c.ID)+":read:") && n.Done.IsZero() {
+			t.Fatalf("a failed read's note stands after a good read: %+v", n)
+		}
+	}
 }
 
 // A revision's build puts a hand landing package back to Prepared with its request open: the request is still read,
@@ -972,9 +986,24 @@ func TestAHandLandingAPersonTookOverIsLeftToThem(t *testing.T) {
 	if !slices.ContainsFunc(log, func(e store.CaseEntry) bool { return e.Action == "hand landing taken over" }) {
 		t.Fatal("no log line says a person has the request")
 	}
-	s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"MERGED","baseRefName":"release"}'`)
+	// the loop's own heads are not a person's: a published head that was not saved leaves the proposed one
+	p, _, _ := s.Load(c.ID)
+	p.PublishedHead = other
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"OPEN","headRefOid":"`+p.Head+`","baseRefName":"main"}'`)
+	if _, err := s.reconcileHand(ctx, c.ID); err != nil {
+		t.Fatalf("a request at the loop's own head: %v", err)
+	}
+	s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"OPEN","headRefOid":"`+p.Head+`","baseRefName":"release"}'`)
 	if _, err := s.reconcileHand(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "targets release") {
 		t.Fatalf("a retargeted request: %v", err)
+	}
+	// closed, a retargeted request is withdrawn as any other
+	s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"CLOSED","baseRefName":"release"}'`)
+	if got, err := s.reconcileHand(ctx, c.ID); err != nil || got.State != Withdrawn {
+		t.Fatalf("a closed retargeted request: %+v %v", got, err)
 	}
 }
 
@@ -1008,5 +1037,24 @@ func TestAWithdrawnPackagesRefusalStaysWithIt(t *testing.T) {
 	}
 	if text, err := r.lastBuildRefusal(ctx, c); err != nil || text != "" {
 		t.Fatalf("a replaced package's refusal reached the new one: %q %v", text, err)
+	}
+}
+
+// A reservation the budgets refused between two builds hides nothing: the next build still reads the last refusal.
+func TestARefusedReservationKeepsTheLastRefusal(t *testing.T) {
+	ctx := context.Background()
+	s, c, _, _ := proposedHand(t)
+	if err := s.Store.PutLoopRun(ctx, store.LoopRun{ID: "20261105-063759-0000eeee", Case: c.ID, Family: c.Family, Step: StepBuild,
+		Started: time.Now(), Ended: time.Now(), Status: store.RunFailed, Failure: "build check",
+		Summary: "build check: refused: the test command is no list of words", CaseEpisode: c.Episode}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Store.PutLoopRun(ctx, store.LoopRun{ID: "20261105-073759-0000ffff", Case: c.ID, Family: c.Family, Step: StepBuild,
+		Ended: time.Now().Add(time.Second), Status: store.RunRefused, Summary: "the loop's day budget"}); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Store: s.Store, Ship: s, Dir: s.Dir, Budgets: DefaultBudgets}
+	if text, err := r.lastBuildRefusal(ctx, c); err != nil || !strings.Contains(text, "no list of words") {
+		t.Fatalf("a refused reservation hid the last refusal: %q %v", text, err)
 	}
 }
