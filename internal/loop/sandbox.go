@@ -150,7 +150,7 @@ func relativeLinks(path string) bool {
 			return false
 		}
 		if filepath.IsAbs(target) {
-			if !under(target, "/usr") {
+			if !under(target, "/usr") && !under(target, "/etc/alternatives") { // both bound at their host paths
 				return false
 			}
 			path = target

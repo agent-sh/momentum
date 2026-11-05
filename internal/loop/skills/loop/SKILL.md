@@ -12,7 +12,7 @@ There is no network for research or repository traffic. If prior art needs a sea
 
 Read review.md when present, and refusal.md, which says why the host refused this case's last build. Adapt previous.patch to BASE when present. Finish with summary, test_command, title, body, rollback, signal, window and lesson. The host makes the patch, checks it and proposes the change.
 
-test_command is a command, not a description: the program and its arguments, one word each, for example `["go", "test", "./internal/capacity", "-run", "TestNamedTargetIsKept"]`. The host runs it twice in the sandbox, without a shell, from the tree's root: on BASE with only your test files (it must fail) and on your change (it must pass). Its first word is a test runner on the sandbox's PATH (go, cargo, npm, pnpm, bun, npx, node, python3, pytest, uv, make, bats). No pipes, redirections, variables or `~`. Say what the test proves in the body.
+test_command is a command, not a description: the program and its arguments, one word each, for example `["go", "test", "./internal/capacity", "-run", "TestNamedTargetIsKept"]`. The host runs it twice in the sandbox, without a shell, from the tree's root: on BASE with only your test files (it must fail) and on your change (it must pass). Its first word is a test runner on the sandbox's PATH (go, cargo, npm, pnpm, bun, npx, node, python3, pytest, uv, make, bats, claude). No pipes, redirections, variables or `~`. Say what the test proves in the body.
 
 The case's `NextTest` is the investigation's proposed fix, in prose. Build that fix; it is not the test command.
 

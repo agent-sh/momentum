@@ -409,9 +409,11 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 					if r.handUnread == nil {
 						r.handUnread = map[string]bool{}
 					}
-					r.handUnread[c.ID] = true // its review waits too: the request may be merged or closed already
-					if noteErr := r.noteStepSkip(ctx, c, "hand", "read", err.Error()); noteErr != nil {
-						r.logf("hand landing note: %v", noteErr)
+					r.handUnread[c.ID] = true        // its review waits too: the request may be merged or closed already
+					if !errors.Is(err, ErrRefused) { // a gh or git failure; a wait or an early merge is read again without a note
+						if noteErr := r.noteStepSkip(ctx, c, "hand", "read", err.Error()); noteErr != nil {
+							r.logf("hand landing note: %v", noteErr)
+						}
 					}
 					continue
 				case p.State == Landed:

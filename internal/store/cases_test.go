@@ -814,3 +814,30 @@ func TestOnlyTheMeasureToolMeasuresAndClosesAsImproved(t *testing.T) {
 		t.Fatalf("its log %+v", log[len(log)-1])
 	}
 }
+
+// The case log calls the investigation's fix a fix: a build that read "next test" took it for its test command.
+func TestTheCaseLogLabelsTheFixAFix(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "m.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	c, _, err := st.ObserveCase(ctx, Finding{Family: "failures", Signature: "label", Title: "a case",
+		Evidence: []Evidence{{Ref: "file:/a@1", At: time.Now()}}}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fix := "keep the named directory"
+	if _, err := st.UpdateCase(ctx, c.ID, CaseUpdate{NextTest: &fix}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	log, err := st.CaseLog(ctx, c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := log[len(log)-1].Detail
+	if !strings.Contains(last, "fix: "+fix) || strings.Contains(last, "next test") {
+		t.Fatalf("the log line: %q", last)
+	}
+}

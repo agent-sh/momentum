@@ -481,7 +481,7 @@ func TestALateHandLandingIsCountedAgain(t *testing.T) {
 	}
 	log, _ := s.Store.CaseLog(ctx, c.ID)
 	if !slices.ContainsFunc(log, func(e store.CaseEntry) bool {
-		return e.Action == "plan counted again" || e.Action == "measured by hand"
+		return e.Action == "plan counted again"
 	}) {
 		t.Fatal("the late landing's plan was not counted again")
 	}
@@ -784,5 +784,70 @@ func TestAReturnedCaseReadsItsHandLandingAgain(t *testing.T) {
 	done := r.reviews(ctx, c.ID, c.Family)
 	if len(done) != 1 || !strings.Contains(done[0].Skipped, "could not be read") {
 		t.Fatalf("a review of an unread hand landing: %+v", done)
+	}
+}
+
+// A revision's build puts a hand landing package back to Prepared with its request open: the request is still read,
+// and a merge meanwhile lands it.
+func TestAPreparedRevisionStillReadsItsHandLanding(t *testing.T) {
+	ctx := context.Background()
+	s, c, _, p := proposedHand(t)
+	run(t, p.Host, "git", "push", "-q", "origin", p.Head+":refs/heads/main")
+	p.State = Prepared
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"MERGED","mergedAt":"`+time.Now().UTC().Format(time.RFC3339)+`","headRefOid":"`+p.Head+`","mergeCommit":{"oid":"`+p.Head+`"}}'`)
+	r := &Runner{Store: s.Store, Ship: s, Dir: s.Dir, Budgets: DefaultBudgets}
+	if got, _, _, err := r.pick(ctx, c.Family, c.ID, false); err != nil || got.ID != "" {
+		t.Fatalf("pick: %q %v", got.ID, err)
+	}
+	if got, _, _ := s.Load(c.ID); got.State != Landed {
+		t.Fatalf("a prepared revision's merged request: %s", got.State)
+	}
+}
+
+// A request closed while main holds only part of the change is withdrawn, not landed.
+func TestAClosedRequestWithPartOfItsChangeOnMainIsWithdrawn(t *testing.T) {
+	ctx := context.Background()
+	s, c, f, _ := proposedHand(t)
+	pushOther(t, f, "main", map[string]string{"internal/capacity/names.go": "package capacity\n\n// Named is the count.\nfunc Named() int { return 42 }\n"})
+	s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"CLOSED"}'`)
+	if got, err := s.reconcileHand(ctx, c.ID); err != nil || got.State != Withdrawn || got.Withdrew == "" {
+		t.Fatalf("a closed request with part of its change on main: %+v %v", got, err)
+	}
+}
+
+// A request closed after its case left testing and came back is withdrawn without reopening the case again: what the
+// case holds now is newer than the request.
+func TestAClosedRequestOfACaseThatCameBackDoesNotReopenIt(t *testing.T) {
+	ctx := context.Background()
+	s, c, _, _ := proposedHand(t)
+	if _, err := s.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "owner"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting}, "investigation"); err != nil {
+		t.Fatal(err)
+	}
+	s.GH = script(t, t.TempDir(), "gh", `echo '{"state":"CLOSED"}'`)
+	if got, err := s.reconcileHand(ctx, c.ID); err != nil || got.State != Withdrawn {
+		t.Fatalf("the close: %+v %v", got, err)
+	}
+	if got, _ := s.Store.CaseByID(ctx, c.ID); got.Status != store.CaseTesting {
+		t.Fatalf("the case was reopened again: %s", got.Status)
+	}
+}
+
+// On a public repository, whose request carries host-built text, the body names the hand landing paths.
+func TestAPublicHandLandingBodyNamesItsPaths(t *testing.T) {
+	s, c, f, _ := handFixture(t)
+	write(t, filepath.Join(f.dir, "public"), "")
+	if _, err := proposePatch(t, s, context.Background(), c.ID, Proposal{Title: "t", Body: "b", Rollback: "r", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	calls, _ := os.ReadFile(filepath.Join(f.dir, "gh-calls"))
+	if !strings.Contains(string(calls), "--body "+HandLine) || !strings.Contains(string(calls), "Hand landing paths: internal/capacity/names.go, internal/capacity/names_test.go") ||
+		!strings.Contains(string(calls), "momentum ship status --case "+c.ID) {
+		t.Fatalf("the public body:\n%s", calls)
 	}
 }

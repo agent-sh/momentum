@@ -335,8 +335,8 @@ func (r *Runner) noteWaiting(ctx context.Context) error {
 				note.Detail = "Two pull requests were closed without merging, the last a hand landing proposal. The loop builds this case no more. Take the change over by hand, or close the case."
 			}
 		}
-		if u, err := url.Parse(p.PR); err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" {
-			note.Links = []store.Link{{Label: "pull request", URL: p.PR}}
+		if u, err := url.Parse(firstOf(p.PR, p.Withdrew)); err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" {
+			note.Links = []store.Link{{Label: "pull request", URL: firstOf(p.PR, p.Withdrew)}}
 		}
 		if _, err := r.Store.PutNote(ctx, note); err != nil {
 			return err

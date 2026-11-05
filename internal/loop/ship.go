@@ -107,9 +107,11 @@ type Package struct {
 	Changed         []string         `json:"changed,omitempty"` // the paths the change touches
 	// Hand names the changed paths the loop may not land itself (PathScope): the change is proposed for a person to
 	// land by hand, and the loop never lands it.
-	Hand    []string  `json:"hand,omitempty"`
-	Created time.Time `json:"created"`
-	Updated time.Time `json:"updated"`
+	Hand []string `json:"hand,omitempty"`
+	// Withdrew is the hand landing request a withdrawal closed, kept for the notes that point at it.
+	Withdrew string    `json:"withdrew,omitempty"`
+	Created  time.Time `json:"created"`
+	Updated  time.Time `json:"updated"`
 	// What the measure step found and did: the measurement that kept the change, the problem note it stands for
 	// now (measure:CASE), the rollback it holds while the loop is not live, and its rollbacks that failed in a row.
 	Result           *measure.Result  `json:"result,omitempty"`

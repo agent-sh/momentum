@@ -132,7 +132,7 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 			return p, nil // withdrawn and recorded; a new build prepares a new package
 		}
 		return s.withdrawHand(ctx, p)
-	case Proposed, Revising, Checked:
+	case Prepared, Checked, Proposed, Revising: // a revision's build puts it back to Prepared, its request still open
 	default:
 		return p, nil
 	}
@@ -236,8 +236,18 @@ func (s *Ship) withdrawHand(ctx context.Context, p Package) (Package, error) {
 	if err != nil {
 		return p, err
 	}
+	// The case left testing since this request was first proposed (it reopened after the close and came back, or a
+	// person moved it while the request was open and an investigation brought it back): what it holds now is newer
+	// than the closed request, so it is not reopened again.
+	first := -1
+	for i, e := range log {
+		if e.Action == store.ActionHandProposed && strings.Contains(e.Detail, pr) {
+			first = i
+			break
+		}
+	}
 	reopened := false
-	for i := len(log) - 1; i >= 0 && !(log[i].Action == store.ActionHandEnded && log[i].Detail == store.CaseNoteText(ended)); i-- {
+	for i := first + 1; first >= 0 && i < len(log); i++ {
 		reopened = reopened || log[i].Action == "set" && strings.Contains(log[i].Detail, "status testing -> ")
 	}
 	if reopened {
@@ -254,7 +264,7 @@ func (s *Ship) withdrawHand(ctx context.Context, p Package) (Package, error) {
 		"Its hand landing proposal "+pr+" was closed without merging, its second closed proposal. The loop builds this case no more."); err != nil {
 		return p, err
 	}
-	p.PR = ""
+	p.PR, p.Withdrew = "", pr
 	return p, s.saveAuthorized(ctx, &p)
 }
 
