@@ -124,7 +124,9 @@ type Result struct {
 	Decision Decision
 	Fired    bool          // the rule would have acted before what came next
 	Outcome  string        // "" for a stop no rule acted on that no label marks
-	Label    *Label        // the owner's labelled step that ended the stop
+	Label    *Label        // the owner's labelled step at the stop: the earliest, on a local command or on what came next
+	StepAt   time.Time     // when he took it
+	Also     []*Label      // his later labelled steps at the stop, measured by the first
 	Earlier  time.Duration // covered: how much before the owner it would have acted
 }
 
@@ -151,20 +153,19 @@ func Replay(points []Point, labels []Label, p Params, probe Probe, until time.Ti
 		}
 		return nil
 	}
-	// labelOf is the owner's labelled step at a stop, and when he took it: on its next input, else on one of his
-	// local commands after it (a restart step such as /login), which ends no stop of its own
-	labelOf := func(pt Point) (*Label, time.Time) {
+	// labelsOf are the owner's labelled steps at a stop, the earliest first: on his local commands after it (a
+	// restart step such as /login), which end no stop of their own, then on its next input
+	labelsOf := func(pt Point) (ls []*Label, at []time.Time) {
+		steps := append([]time.Time(nil), pt.Controls...)
 		if pt.Next.Kind == "owner" {
-			if l := labelAt(pt, pt.Next.At); l != nil {
-				return l, pt.Next.At
+			steps = append(steps, pt.Next.At)
+		}
+		for _, s := range steps {
+			if l := labelAt(pt, s); l != nil {
+				ls, at = append(ls, l), append(at, s)
 			}
 		}
-		for _, at := range pt.Controls {
-			if l := labelAt(pt, at); l != nil {
-				return l, at
-			}
-		}
-		return nil, time.Time{}
+		return ls, at
 	}
 	var out []Result
 	resynced := map[string]bool{} // a session's wakeups and runs the overdue rule acted on: one resync for each
@@ -188,8 +189,10 @@ func Replay(points []Point, labels []Label, p Params, probe Probe, until time.Ti
 			}
 		}
 		r := Result{Point: pt, Decision: d}
-		var stepAt time.Time
-		r.Label, stepAt = labelOf(pt)
+		if ls, at := labelsOf(pt); len(ls) > 0 {
+			r.Label, r.StepAt, r.Also = ls[0], at[0], ls[1:]
+		}
+		stepAt := r.StepAt
 		end := pt.Next.At
 		if pt.Next.Kind == "none" {
 			end = until

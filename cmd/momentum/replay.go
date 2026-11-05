@@ -117,7 +117,7 @@ func writePoints(path string, rs []supervise.Result) error {
 			"error": r.Point.Stop.Error, "words": r.Point.Stop.Words, "tasks": r.Point.Stop.Tasks, "owner_at": r.Point.Stop.OwnerAt,
 			"resumed_at": r.Point.Stop.ResumedAt, "request_at": r.Point.Stop.RequestAt, "waiting": r.Point.Waiting,
 			"wake_due": r.Point.Stop.WakeDue, "wake_for": r.Point.Stop.WakeFor, "wake_key": r.Point.Stop.WakeKey,
-			"next": r.Point.Next, "entry": r.Point.Entry, "rule": r.Decision.Rule,
+			"next": r.Point.Next, "entry": r.Point.Entry, "rule": r.Decision.Rule, "step_at": r.StepAt,
 			"verdict": r.Decision.Verdict, "at": r.Decision.At, "why": r.Decision.Why, "fired": r.Fired, "outcome": r.Outcome}
 		if r.Label != nil {
 			v["label"] = r.Label.Kind
@@ -173,6 +173,9 @@ func printReplay(out io.Writer, rs []supervise.Result, labels []supervise.Label,
 	for _, r := range rs {
 		if r.Label != nil {
 			matched[r.Label] = r
+		}
+		for _, l := range r.Also { // a later step at the same stop, measured by the first
+			matched[l] = r
 		}
 	}
 	for _, kind := range []string{"nudge", "restart"} {
@@ -249,9 +252,12 @@ func printAnchors(out io.Writer, rs []supervise.Result) {
 			next = "owner other"
 		}
 		var g time.Duration
-		if next == "none" {
+		switch {
+		case r.Label != nil:
+			g = r.StepAt.Sub(r.Decision.At) // the labelled step may be a local command before what came next
+		case next == "none":
 			g = -1
-		} else {
+		default:
 			g = r.Point.Next.At.Sub(r.Decision.At)
 		}
 		gaps[key{r.Decision.Rule, next}] = append(gaps[key{r.Decision.Rule, next}], g)

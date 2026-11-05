@@ -71,9 +71,10 @@ var (
 	terminalSt = map[string]bool{"completed": true, "failed": true, "killed": true, "stopped": true, "error": true, "timeout": true, "cancelled": true}
 )
 
-// A Claude Code local command's echo is its command tags and nothing else; a prompt it expands to has text of its own.
+// A Claude Code local command's echo is its command tags and nothing else, with the tags the live tracker strips
+// (sessions/claude); a prompt it expands to has text of its own.
 var (
-	hCommandTag  = regexp.MustCompile(`(?s)<(?:command-name|command-message|command-args)>.*?</(?:command-name|command-message|command-args)>`)
+	hCommandTag  = regexp.MustCompile(`(?s)<(?:system-reminder|local-command-stdout|local-command-caveat|command-name|command-message|command-args)>.*?</(?:system-reminder|local-command-stdout|local-command-caveat|command-name|command-message|command-args)>`)
 	hCommandName = regexp.MustCompile(`<command-name>([^<]*)</command-name>`)
 )
 
@@ -360,6 +361,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 	var words, entry, harness, prevRole, prevPrior string
 	var carried string       // a turn's end recorded on a record passed over since the last stop: a local command's, an abort
 	var controls []time.Time // the owner's local commands since the last stop
+	exited := false          // an /exit ended the process: the next record the replay reads is a new one
 	var prevAt time.Time
 	var owes time.Time           // the model owes its reply since: an input, or the result of a turn's last call
 	var owesRef string           // where the transcript is read from for its request: the event before the one that owes
@@ -418,8 +420,11 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			harness = e.Harness
 		}
 		r := role(e, m)
-		if r == "" && e.Harness == "codex" && m["prior"] == "turn_aborted" {
-			r = "aborted" // the store marked Codex's abort of the turn on the record after it
+		if e.Harness == "codex" && m["prior"] == "turn_aborted" {
+			pending = map[string]bool{} // the abort ended the turn and its calls, whatever record the store marked it on
+			if r == "" {
+				r = "aborted" // the store marked Codex's abort of the turn on the record after it
+			}
 		}
 		if v := versionAt(e.Ref); v != "" {
 			if version != "" && v != version {
@@ -456,7 +461,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			if carried == "" {
 				carried = "turn_aborted"
 			}
-			pending = map[string]bool{}
+			pending, owes, owesRef = map[string]bool{}, time.Time{}, ""
 			continue
 		case "exit":
 			// /exit or /quit: the process ends, and what ran dies with it. The stop before it ends here; the stop after
@@ -467,10 +472,13 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 					Entry: entry, Controls: controls})
 			}
 			ownerAt, controls, carried, words = e.TS, nil, "", ""
-			tasks, pending = map[string]replayTask{}, map[string]bool{}
-			restart(e.TS)
-			prevAt, prevRole, prevPrior, owes, owesRef = e.TS, "exit", "", time.Time{}, ""
+			tasks, pending, wake = map[string]replayTask{}, map[string]bool{}, replayWake{}
+			prevAt, prevRole, prevPrior, owes, owesRef, exited = e.TS, "exit", "", time.Time{}, "", true
 			continue
+		}
+		if exited { // the process that reads this record started now: its jobs run from their first run after it
+			restart(e.TS)
+			exited = false
 		}
 		if r == "self" && strings.HasPrefix(e.Summary, "<task-notification>") && !strings.Contains(e.Summary, "</task-notification>") {
 			e.Summary = whole(e) // the store cut it: read what it says from the transcript, while it is there
