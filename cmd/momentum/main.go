@@ -81,8 +81,10 @@ const usage = `usage:
                                         an address; an event or a note takes its own time, kind and summary
   momentum case signature ID SIG        another signature (the root cause's: root:KEY); one another open case
                                         holds merges this case into that one (a closed one comes back first)
-  momentum case close ID --reason R [--into ID] --why W
-                                        R is not-worth-it, insufficient-evidence, already-solved or duplicate
+  momentum case close ID --reason R [--into ID] [--fix REF] --why W
+                                        R is not-worth-it, insufficient-evidence, already-solved or duplicate;
+                                        a component-health case closes as already-solved with --fix, what fixed
+                                        it (git:OWNER/REPO@SHA), and the cases its stop held resume
   momentum case reopen ID --evidence REF... [--at WHEN] --why W
                                         a closed case comes back only on evidence it does not hold
   momentum loop [--dry] [--family F,F] [--case ID] [--json]

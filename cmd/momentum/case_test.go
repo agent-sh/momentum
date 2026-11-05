@@ -389,3 +389,60 @@ func TestCaseListShowsAHandLanding(t *testing.T) {
 		t.Fatalf("list after the end: exit %d %q", code, out)
 	}
 }
+
+// A component-health case closes as already solved only naming what fixed it, and that close resumes the cases the
+// stop rule held on its signature: each gets a resumed line, and the stop rule no longer holds it.
+func TestClosingAComponentHealthCaseAsFixedResumesTheCasesItStopped(t *testing.T) {
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	t.Setenv("MOMENTUM_ACTOR", "cli")
+	ctx := context.Background()
+	_, out, _ := momentum("case", "open", "--family", "failures", "--signature", "failures:held", "--title", "a held case", "--evidence", "file:/h@1")
+	held := strings.SplitN(out, ":", 2)[0]
+	_, out, _ = momentum("case", "open", "--family", "failures", "--signature", "failures:free", "--title", "a free case", "--evidence", "file:/f@1")
+	free := strings.SplitN(out, ":", 2)[0]
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, at := range []time.Time{time.Now().Add(-2 * time.Minute), time.Now().Add(-time.Minute)} {
+		for _, c := range []string{held, free} {
+			failure := "turns"
+			if c == free {
+				failure = []string{"turns", "timeout"}[i]
+			}
+			if err := st.PutLoopRun(ctx, store.LoopRun{ID: fmt.Sprintf("%s-%d", c, i), Case: c, Family: "failures", Step: "investigate",
+				Started: at, Ended: at.Add(time.Second), Status: store.RunFailed, Failure: failure}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	st.Close()
+	code, out, errOut := momentum("case", "open", "--family", "component-health", "--signature", "component-health/v1:loop:investigate:turns",
+		"--title", "The loop fails the same way twice: turns", "--evidence", "file:/runs/one", "--evidence", "file:/runs/two")
+	if code != 0 {
+		t.Fatalf("open the loop's case: exit %d %s", code, errOut)
+	}
+	health := strings.SplitN(out, ":", 2)[0]
+	if code, _, errOut := momentum("case", "close", health, "--reason", "already-solved", "--why", "fixed"); code != 2 || !strings.Contains(errOut, "--fix") {
+		t.Fatalf("closed as solved without its fix: exit %d %s", code, errOut)
+	}
+	if code, _, errOut := momentum("case", "close", held, "--reason", "not-worth-it", "--fix", "git:agent-sh/momentum@4814cc4", "--why", "x"); code != 2 || !strings.Contains(errOut, "--fix") {
+		t.Fatalf("--fix with another reason: exit %d %s", code, errOut)
+	}
+	if code, _, errOut := momentum("case", "close", held, "--reason", "already-solved", "--fix", "git:agent-sh/momentum@4814cc4", "--why", "x"); code != 2 || !strings.Contains(errOut, "only a component-health case") {
+		t.Fatalf("--fix on a failures case: exit %d %s", code, errOut)
+	}
+	code, out, errOut = momentum("case", "close", health, "--reason", "already-solved", "--fix", "git:agent-sh/momentum@4814cc4", "--why", "the turn cap was raised")
+	if code != 0 || !strings.Contains(out, "[closed: already-solved]") || !strings.Contains(out, "resumed "+held+":") || strings.Contains(out, free) {
+		t.Fatalf("close as fixed: exit %d %q %s", code, out, errOut)
+	}
+	_, out, _ = momentum("case", "show", held, "--json")
+	if !strings.Contains(out, `"action":"resumed"`) || !strings.Contains(out, health+", the loop's case of its stop, closed as fixed by git:agent-sh/momentum@4814cc4") {
+		t.Fatalf("the resumed case's log: %s", out)
+	}
+	_, out, _ = momentum("case", "show", health, "--json")
+	if !strings.Contains(out, "fixed by git:agent-sh/momentum@4814cc4; resumes "+held+": the turn cap was raised") {
+		t.Fatalf("the close's line: %s", out)
+	}
+}

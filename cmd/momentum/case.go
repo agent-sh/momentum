@@ -17,6 +17,7 @@ import (
 	"github.com/agent-sh/momentum/internal/detect"
 
 	"github.com/agent-sh/momentum/internal/evidenceview"
+	"github.com/agent-sh/momentum/internal/loop"
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
@@ -490,6 +491,7 @@ func caseClose(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	fs.SetOutput(stderr)
 	reason := fs.String("reason", "", "not-worth-it, insufficient-evidence, already-solved or duplicate (improved is the measure tool's)")
 	into := fs.String("into", "", "for a duplicate: the case with the same root cause")
+	fix := fs.String("fix", "", "for a component-health case closed as already-solved: what fixed it, its commit (git:OWNER/REPO@SHA) or another reference; the cases its stop held resume")
 	why := fs.String("why", "", "why, in a short line")
 	if err := fs.Parse(rest); err != nil {
 		return usageError{err.Error()}
@@ -500,11 +502,17 @@ func caseClose(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if strings.TrimSpace(*why) == "" {
 		return usageError{"case close needs --why"}
 	}
+	if *fix != "" && store.CloseReason(*reason) != store.Solved {
+		return usageError{"--fix names what fixed a component-health case closed as already-solved"}
+	}
 	st, err := store.Open(paths.DB())
 	if err != nil {
 		return err
 	}
 	defer st.Close()
+	if *fix != "" {
+		return closeFixed(ctx, st, id, *fix, *why, stdout)
+	}
 	c, err := st.CloseCase(ctx, id, store.CloseReason(*reason), *into, *why, caseActor())
 	if err != nil {
 		return caseErr(err)
@@ -514,6 +522,31 @@ func caseClose(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		what = id + " went into this case"
 	}
 	printCase(stdout, c, what)
+	return nil
+}
+
+// closeFixed closes a component-health case as already solved by what fixed it, and resumes the cases the stop rule
+// holds on its signatures: the stop rule then counts only their runs after the close.
+func closeFixed(ctx context.Context, st *store.Store, id, fix, why string, stdout io.Writer) error {
+	c, err := st.CaseByID(ctx, id)
+	if err != nil {
+		return caseErr(err)
+	}
+	stopped, err := loop.StoppedOn(ctx, st, c)
+	if err != nil {
+		return err
+	}
+	c, resumed, err := st.CloseFixed(ctx, id, fix, stopped, why, caseActor())
+	if err != nil {
+		return caseErr(err)
+	}
+	printCase(stdout, c, "closed")
+	for _, r := range resumed {
+		fmt.Fprintf(stdout, "resumed %s: the stop rule counts only its runs from now\n", r)
+	}
+	if len(resumed) == 0 {
+		fmt.Fprintln(stdout, "no case was held by its stop")
+	}
 	return nil
 }
 

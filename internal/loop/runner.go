@@ -11,6 +11,7 @@ import (
 
 	"os"
 	"path/filepath"
+	"slices"
 
 	"sort"
 	"strings"
@@ -608,32 +609,76 @@ func (r *Runner) caseNoteOnce(ctx context.Context, id, action, detail string) er
 	return r.Store.CaseNote(cleanedNote(ctx), id, action, clean, "loop")
 }
 
-// stopped applies the stop rule: a case whose last two live runs that ran (a refusal of the budgets is no run, and a run the
-// host ended, stopped or killed, says nothing of the agent)
-// failed the same way, in the same step, is not run a third time. It opens a case of the loop's own, in component
-// health, the first time, with both runs' transcripts as its evidence, and says why. A dry check opens nothing.
-func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, error) {
+// stopRuns reads the stop rule for a case: its last two live runs that ran (a refusal of the budgets is no run, and a
+// run the host ended, stopped or killed, says nothing of the agent), since it last came back after a close or
+// resumed after a fix of its stop, when both failed the same way in the same step. ok is false when the rule does
+// not hold.
+func stopRuns(ctx context.Context, st *store.Store, c store.Case) (runs []store.LoopRun, ok bool, err error) {
 	live := ""
 	since := c.Back
+	resumed, err := st.ResumedAt(ctx, c.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	if resumed.After(since) {
+		since = resumed
+	}
 	if !since.IsZero() {
 		since = since.Add(time.Millisecond) // the kept clock is in milliseconds; only runs after the return count
 	}
-	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID, Experiment: &live, Ran: true, Judged: true, Since: since, Limit: 2})
-	if err != nil {
-		return "", err
-	}
-	if len(runs) < 2 {
-		return "", nil
+	runs, err = st.LoopRuns(ctx, store.RunFilter{Case: c.ID, Experiment: &live, Ran: true, Judged: true, Since: since, Limit: 2})
+	if err != nil || len(runs) < 2 {
+		return nil, false, err
 	}
 	a, b := runs[0], runs[1]
 	if a.Status == store.RunOK || b.Status == store.RunOK || a.Failure == "" || a.Failure != b.Failure || a.Step != b.Step {
-		return "", nil
+		return nil, false, nil
 	}
+	return runs, true, nil
+}
+
+// stopSignature is the signature of the component-health case a stop files: by its step and its failure.
+func stopSignature(step, failure string) string {
+	return store.HealthFamily + "/" + detect.Versions[store.HealthFamily] + ":loop:" + step + ":" + slugOf(failure)
+}
+
+// StoppedOn lists the cases the stop rule holds now on one of a component-health case's signatures: the working
+// cases whose stop that case filed. Closing it as fixed resumes them (store.CloseFixed).
+func StoppedOn(ctx context.Context, st *store.Store, health store.Case) ([]string, error) {
+	cs, err := st.Cases(ctx, store.CaseFilter{Statuses: []store.CaseStatus{store.CaseOpen, store.CaseInvestigating, store.CaseTesting}})
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, c := range cs {
+		if c.ID == health.ID {
+			continue
+		}
+		runs, ok, err := stopRuns(ctx, st, c)
+		if err != nil {
+			return nil, err
+		}
+		if ok && slices.Contains(health.Signatures, stopSignature(runs[0].Step, runs[0].Failure)) {
+			out = append(out, c.ID)
+		}
+	}
+	return out, nil
+}
+
+// stopped applies the stop rule (stopRuns): a case whose last two runs failed the same way, in the same step, is not
+// run a third time. It opens a case of the loop's own, in component health, the first time, with both runs'
+// transcripts as its evidence, and says why. A dry check opens nothing.
+func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, error) {
+	runs, ok, err := stopRuns(ctx, r.Store, c)
+	if err != nil || !ok {
+		return "", err
+	}
+	a := runs[0]
 	why := fmt.Sprintf("its last two %s runs failed the same way: %s", a.Step, a.Failure)
 	if dry {
 		return why, nil
 	}
-	f := store.Finding{Family: "component-health", Signature: "component-health/" + detect.Versions["component-health"] + ":loop:" + a.Step + ":" + slugOf(a.Failure),
+	f := store.Finding{Family: store.HealthFamily, Signature: stopSignature(a.Step, a.Failure),
 		Title: plainClip("The loop fails the same way twice: "+a.Failure, store.TitleMax)}
 	for _, run := range runs {
 		ref := "file:" + filepath.Join(r.Dir, "runs", run.ID)

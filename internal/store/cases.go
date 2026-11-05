@@ -992,6 +992,8 @@ func (s *Store) CloseCase(ctx context.Context, id string, reason CloseReason, in
 		return Case{}, badCase("a duplicate names the case it goes into")
 	case reason != Duplicate && into != "":
 		return Case{}, badCase("only a duplicate goes into another case")
+	case reason == Solved && c.Family == HealthFamily:
+		return Case{}, badCase("a %s case closes as already solved naming what fixed it (case close %s --reason already-solved --fix REF --why WHY), which resumes the cases its stop held", HealthFamily, c.ID)
 	}
 	if reason == Duplicate {
 		if c, err = merge(ctx, tx, c, into, why, actor, now); err != nil {
@@ -1006,6 +1008,88 @@ func (s *Store) CloseCase(ctx context.Context, id string, reason CloseReason, in
 		return Case{}, err
 	}
 	return c, tx.Commit()
+}
+
+// HealthFamily is the family of the cases the loop files about itself: its stop rule opens one when a case's last two
+// runs failed the same way, and a fix of it resumes the cases it stopped (CloseFixed).
+const HealthFamily = "component-health"
+
+// ActionResumed is the line a case the stop rule held gets when the component-health case of its stop closes as fixed:
+// the stop rule counts only the case's runs after the newest such line.
+const ActionResumed = "resumed"
+
+// CloseFixed closes a component-health case as already solved by what fixed it (fix: its commit, git:OWNER/REPO@SHA,
+// or another reference), and resumes the cases its stop held: each case of stopped still open, investigating or
+// testing gets a resumed line naming the fix, in the same transaction, and keeps its episode, status and
+// investigation. A case closed, deployed or measuring, or one that went into another, is not resumed. It returns
+// the closed case and the cases it resumed.
+func (s *Store) CloseFixed(ctx context.Context, id, fix string, stopped []string, why, actor string) (Case, []string, error) {
+	if strings.TrimSpace(why) == "" {
+		return Case{}, nil, badCase("a close says why")
+	}
+	if err := checkRef(fix); err != nil {
+		return Case{}, nil, badCase("what fixed it: %v", err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Case{}, nil, err
+	}
+	defer tx.Rollback()
+	now := time.Now()
+	c, err := getCase(ctx, tx, id)
+	if err != nil {
+		return Case{}, nil, err
+	}
+	switch {
+	case c.Status == CaseClosed && c.Reason == Duplicate:
+		return Case{}, nil, badCase("case %s is closed already: a duplicate of %s", c.ID, c.Into)
+	case c.Family != HealthFamily:
+		return Case{}, nil, badCase("case %s is %s: only a %s case names what fixed it, to resume the cases its stop held", c.ID, c.Family, HealthFamily)
+	case c.Status == CaseClosed:
+		return Case{}, nil, badCase("case %s is closed already (%s)", c.ID, c.Reason)
+	case !slices.Contains(working, c.Status):
+		return Case{}, nil, badCase("case %s is %s: its change is in place, so only the ship tool's rollback or the measure tool closes it", c.ID, c.Status)
+	}
+	var resumed []string
+	for _, sid := range stopped {
+		sc, err := getCase(ctx, tx, sid)
+		if errors.Is(err, ErrNoCase) {
+			continue
+		} else if err != nil {
+			return Case{}, nil, err
+		}
+		if sc.ID == c.ID || sc.Into != "" || !slices.Contains(working, sc.Status) || slices.Contains(resumed, sc.ID) {
+			continue
+		}
+		detail := fmt.Sprintf("the stop rule's hold ended: %s, the loop's case of its stop, closed as fixed by %s", c.ID, fix)
+		if err := caseLog(ctx, tx, sc.ID, actor, ActionResumed, detail, now); err != nil {
+			return Case{}, nil, err
+		}
+		resumed = append(resumed, sc.ID)
+	}
+	what := "fixed by " + fix
+	if len(resumed) > 0 {
+		what += "; resumes " + strings.Join(resumed, ", ")
+	}
+	if err := closeAs(ctx, tx, c.ID, Solved, what+": "+why, actor, now); err != nil {
+		return Case{}, nil, err
+	}
+	if c, err = getCase(ctx, tx, c.ID); err != nil {
+		return Case{}, nil, err
+	}
+	return c, resumed, tx.Commit()
+}
+
+// ResumedAt is when a case last resumed (its newest resumed line), or zero when it never did.
+func (s *Store) ResumedAt(ctx context.Context, id string) (time.Time, error) {
+	var at sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT MAX(at) FROM case_log WHERE case_id = ? AND action = ?`, id, ActionResumed).Scan(&at); err != nil {
+		return time.Time{}, err
+	}
+	if !at.Valid {
+		return time.Time{}, nil
+	}
+	return time.UnixMilli(at.Int64), nil
 }
 
 // closeAs closes a case with a reason other than a duplicate's, keeping how much evidence it held, and logs why.

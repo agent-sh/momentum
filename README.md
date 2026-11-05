@@ -171,7 +171,7 @@ momentum case evidence ID [--at WHEN] [--kind K] [--summary S] REF...
                                         ev:EVENT, note:ID, git:OWNER/REPO@SHA, file:PATH[@OFFSET], or an address
 momentum case signature ID root:KEY     the root cause; a case that names one another open case holds goes into it
                                         (a closed one comes back first: case reopen)
-momentum case close ID --reason not-worth-it|insufficient-evidence|already-solved|duplicate [--into ID] --why W
+momentum case close ID --reason not-worth-it|insufficient-evidence|already-solved|duplicate [--into ID] [--fix REF] --why W
 momentum case reopen ID --evidence REF... [--at WHEN] --why W
 ```
 
@@ -186,7 +186,7 @@ momentum loop [--dry] [--family F,F] [--case ID] [--json]
 momentum loop runs [--since WHEN] [--case ID] [--json]
 ```
 
-The loop investigates, builds and reviews through Claude Code's native agent in print mode. The host records investigation findings and an optional repository NAME under `/ro/repos`. A complete report moves the case to testing. A code fix needs an admitted repository; a case without one waits with a passive note. Two runs of the same step that fail the same way stop the case and open a component-health case.
+The loop investigates, builds and reviews through Claude Code's native agent in print mode. The host records investigation findings and an optional repository NAME under `/ro/repos`. A complete report moves the case to testing. A code fix needs an admitted repository; a case without one waits with a passive note. Two runs of the same step that fail the same way stop the case and open a component-health case. Once its cause is fixed, `case close ID --reason already-solved --fix git:OWNER/REPO@SHA --why W` on that component-health case resumes the cases it stopped: the stop rule counts only their runs after the close.
 
 Run the loop tests with `go test -timeout 50m ./internal/loop`. Use `-run` for focused checks. The sandbox checks can exceed Go's default timeout.
 
