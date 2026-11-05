@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -45,7 +46,7 @@ func PublishLesson(ctx context.Context, st *store.Store, ship *Ship, id, text, t
 		return refused("a lesson is published only for a case closed as improved")
 	}
 	line := strings.TrimSpace(text)
-	if line == "" || strings.ContainsAny(line, "\r\n") || len(line) > 300 {
+	if line == "" || strings.ContainsAny(line, "\r\n") || utf8.RuneCountInString(line) > 300 {
 		return refused("a lesson is one line of at most 300 characters")
 	}
 	clean, err := Public(ctx, line)

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agent-sh/momentum/internal/sandbox"
 	"github.com/agent-sh/momentum/internal/store"
@@ -21,7 +22,7 @@ const buildSchema = `{"type":"object","additionalProperties":false,
 "properties":{"summary":{"type":"string"},
 "test_command":{"type":"array","minItems":1,"items":{"type":"string"},"description":"The program and its arguments, one word each, such as [\"go\", \"test\", \"./internal/x\", \"-run\", \"TestY\"]. The host runs it in the sandbox without a shell, on BASE with only the change's test files (it must fail) and on the change (it must pass). Not a description of the test."},
 "title":{"type":"string"},
-"body":{"type":"string"},"rollback":{"type":"string"},"window":{"type":"string"},"lesson":{"type":"string","description":"One line of at most 300 characters: what a later agent should know from this case, or empty. A longer or multi-line lesson is dropped."},"installed":{"type":"string"},
+"body":{"type":"string"},"rollback":{"type":"string"},"window":{"type":"string"},"lesson":{"type":"string","description":"One line of at most 300 characters: what a later agent should know from this case, or empty. A multi-line lesson is joined into one line; one longer than 300 characters is dropped."},"installed":{"type":"string"},
 "signal":{"type":"object","additionalProperties":false,"required":["source","kinds","match"],
 "properties":{"source":{"type":"string"},"kinds":{"type":"array","items":{"type":"string"}},
 "tool":{"type":"string"},"harness":{"type":"string"},"match":{"type":"array","items":{"type":"string"}}}}}}`
@@ -79,12 +80,20 @@ func buildReport(raw []byte) (BuildReport, error) {
 	return report, nil
 }
 
+// lessonGiven reports whether a raw build report gave a lesson with text in it.
+func lessonGiven(raw []byte) bool {
+	var v struct {
+		Lesson string `json:"lesson"`
+	}
+	return json.Unmarshal(raw, &v) == nil && strings.TrimSpace(v.Lesson) != ""
+}
+
 // lessonLine is a report's lesson as the proposal keeps it: its lines joined into one, or nothing when that is longer
 // than 300 characters. The lesson is advice the case may publish when it closes as improved, not part of the change, so
 // one that breaks its form drops alone and the build goes on.
 func lessonLine(text string) string {
 	line := strings.Join(strings.Fields(text), " ")
-	if len(line) > 300 {
+	if utf8.RuneCountInString(line) > 300 {
 		return ""
 	}
 	return line
@@ -272,6 +281,9 @@ func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Re
 	report, err := buildReport(res.Report)
 	if err != nil {
 		return stageFailure(res, "build report", err)
+	}
+	if report.Lesson == "" && lessonGiven(res.Report) {
+		r.logf("build %s: its lesson is over 300 characters, so the proposal has none", c.ID)
 	}
 	if err := r.Ship.installedReadable(report.Installed); err != nil {
 		return stageFailure(res, "build report", err)

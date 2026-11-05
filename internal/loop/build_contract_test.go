@@ -1149,12 +1149,23 @@ func TestALessonOutOfFormDoesNotFailTheBuild(t *testing.T) {
 	if err != nil || got.Lesson != "" {
 		t.Fatalf("no lesson: %q %v", got.Lesson, err)
 	}
+	// 300 characters is the limit, counted as characters, not bytes
+	if got, err = buildReport(report(strings.Repeat("a", 300))); err != nil || len(got.Lesson) != 300 {
+		t.Fatalf("a lesson of exactly 300 characters: %d %v", len(got.Lesson), err)
+	}
+	hebrew := strings.Repeat("ש", 300)
+	if got, err = buildReport(report(hebrew)); err != nil || got.Lesson != hebrew {
+		t.Fatalf("300 characters in more than 300 bytes: %d bytes kept, %v", len(got.Lesson), err)
+	}
+	if got, err = buildReport(report(strings.Repeat("a", 301))); err != nil || got.Lesson != "" {
+		t.Fatalf("a lesson of 301 characters: %d %v", len(got.Lesson), err)
+	}
 	var schema struct {
 		Properties map[string]struct {
 			Description string `json:"description"`
 		} `json:"properties"`
 	}
-	if err := json.Unmarshal([]byte(buildSchema), &schema); err != nil || !strings.Contains(schema.Properties["lesson"].Description, "300 characters") {
+	if err := json.Unmarshal([]byte(buildSchema), &schema); err != nil || !strings.Contains(schema.Properties["lesson"].Description, "joined into one line; one longer than 300 characters is dropped") {
 		t.Fatalf("the schema does not give the lesson's form: %+v %v", schema.Properties["lesson"], err)
 	}
 }

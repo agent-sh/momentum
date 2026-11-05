@@ -791,6 +791,7 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 			return p, err
 		}
 	}
+	p.Lesson = lessonLine(p.Lesson) // a redaction marker can make it longer than the report's check allowed
 	// A review cannot be satisfied by a new commit with the same tree.
 	if n := len(p.Reviews); n > 0 {
 		reviewed, err := s.git(ctx, p.Host, "rev-parse", p.Reviews[n-1].Head+"^{tree}")
