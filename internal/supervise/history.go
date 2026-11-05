@@ -83,25 +83,26 @@ var (
 // store keeps 240 bytes of a record (a caveat or a reminder alone can be longer) and marks a cut one with "…":
 // then the record is read whole from its transcript while it is there, else a cut that ends inside one of the tags
 // still reads as an echo.
-func localEcho(e store.Event) bool {
+// It returns the text it judged: the record whole when it read it, else the summary, cut or not.
+func localEcho(e store.Event) (string, bool) {
 	cut, ok := strings.CutSuffix(e.Summary, "…")
 	if !ok {
-		return echoOnly(e.Summary)
+		return e.Summary, echoOnly(e.Summary)
 	}
 	if text, ok := recordText(e.Ref); ok {
-		return echoOnly(text)
+		return text, echoOnly(text)
 	}
 	rest := strings.TrimSpace(hCommandTag.ReplaceAllString(cut, ""))
 	if rest == "" {
-		return true // the cut came between two of the tags
+		return cut, true // the cut came between two of the tags
 	}
 	for _, tag := range echoTags {
 		open := "<" + tag + ">"
 		if strings.HasPrefix(rest, open) && !strings.Contains(rest, "</"+tag+">") || strings.HasPrefix(open, rest) {
-			return true // the cut came inside the tag, or inside its name
+			return cut, true // the cut came inside the tag, or inside its name
 		}
 	}
-	return false
+	return cut, false
 }
 
 // echoOnly reports a text that holds a command's name and nothing but the echo's tags.
@@ -181,10 +182,18 @@ func role(e store.Event, m map[string]any) string {
 		if strings.Contains(why, "notification") || strings.Contains(why, "complete") {
 			return "self"
 		}
-	case why == "local command" && localEcho(e):
+	case why == "local command":
 		// a Claude Code local command's echo (/login, /model), which never reaches the model: its user was at the
-		// session, and no turn opened (the live layer's ControlAt). /exit and /quit end the process.
-		if g := hCommandName.FindStringSubmatch(s); g != nil && (g[1] == "/exit" || g[1] == "/quit") {
+		// session, and no turn opened (the live layer's ControlAt). /exit and /quit end the process. Its name is read
+		// from the text the echo was judged by, the record whole when the store cut it.
+		text, echo := localEcho(e)
+		if !echo {
+			if ik == "slash" || ik == "shell" {
+				return "owner"
+			}
+			return ""
+		}
+		if g := hCommandName.FindStringSubmatch(text); g != nil && (g[1] == "/exit" || g[1] == "/quit") {
 			return "exit"
 		}
 		return "control"
@@ -518,9 +527,9 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			if prior, _ := m["prior"].(string); carried == "" && turnOver(harness, prior) {
 				carried = prior
 			}
-			if exited { // a local command after /exit: the session was opened again, and its jobs run from here
+			if exited { // a local command after /exit: the session was opened again, and its jobs and rules run from here
 				restart(e.TS)
-				exited, prevRole = false, "reopened"
+				exited, prevRole, prevAt = false, "reopened", e.TS
 			}
 			continue
 		case "aborted":
@@ -542,7 +551,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 				out = append(out, Point{Session: id, Stop: stopOf(e.TS, e.Ref), Next: Next{At: e.TS, Kind: "owner", InputKind: "exit", Text: e.Summary},
 					Entry: entry, Controls: controls})
 			}
-			ownerAt, controls, carried, words = e.TS, nil, "", ""
+			ownerAt, controls, carried, words, resumed = e.TS, nil, "", "", time.Time{}
 			tasks, pending, wake = map[string]replayTask{}, map[string]bool{}, replayWake{}
 			prevAt, prevRole, prevPrior, owes, owesRef, exited = e.TS, "exit", "", time.Time{}, "", true
 			continue

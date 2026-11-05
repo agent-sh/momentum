@@ -448,3 +448,67 @@ func TestALabelledLocalCommandIsMeasuredAgainstTheRuleItDidNotMove(t *testing.T)
 	}
 	t.Fatal("no stop ends on the step's next input")
 }
+
+// A /exit the store cut inside the caveat before it is still an exit, by its record read whole: the stop ends there
+// and the stop after it is the exited one.
+func TestACutExitIsStillAnExit(t *testing.T) {
+	st := testStore(t)
+	r := newRecorded(t, "cut-exit").owner(0, "run the suite").say(10*time.Second, "The suite is running. I'll report when it finishes.")
+	text := caveat + " <command-name>/exit</command-name> <command-message>exit</command-message> <command-args></command-args>"
+	r.event(5*time.Minute, map[string]any{"type": "user", "message": map[string]any{"content": text}}, "harness_text", store.ActorHarness, "",
+		storeCut(text), `{"input_kind":"slash","why":"local command"}`)
+	r.put(st)
+	if strings.Contains(storeCut(text), "/exit") {
+		t.Fatal("the cut kept the command's name")
+	}
+	_, rs := replayAll(t, st)
+	var stops []Result
+	for _, res := range rs {
+		if res.Point.Session == "cut-exit" {
+			stops = append(stops, res)
+		}
+	}
+	if len(stops) != 2 || stops[0].Point.Next.InputKind != "exit" || !stops[1].Point.Stop.Exited || stops[1].Fired {
+		t.Fatalf("the cut exit's stops: %+v", stops)
+	}
+}
+
+// After /exit no rule acts until the session is opened again, and a reopening local command counts the rules
+// from itself: a reopening before the exit is forgotten, and a job's runs due while the process was gone are not
+// missed.
+func TestRulesCountFromAReopeningCommand(t *testing.T) {
+	inUTCHere(t)
+	st := testStore(t)
+	b := newTimeline(t, "orphan").owner(0, "run the soak", "turn_duration").say(10*time.Second, "Running.")
+	b.add(time.Minute, "harness_text", store.ActorHarness, "", "<task-notification><task-id>__orphan_summary__</task-id> didn't finish before the previous session ended</task-notification>", `{"why":"meta line"}`)
+	b.localCommand(time.Minute, "exit", "").localCommand(40*time.Minute, "model", "")
+	reopened := b.at.Add(-time.Millisecond)
+	b.put(st)
+	_, rs := replayAll(t, st)
+	var last Result
+	for _, r := range rs {
+		if r.Point.Session == "orphan" && r.Fired && r.Decision.At.Before(reopened) {
+			t.Fatalf("%s acted at %v, before the reopening at %v", r.Decision.Rule, r.Decision.At, reopened)
+		}
+		if r.Point.Session == "orphan" {
+			last = r
+		}
+	}
+	if !last.Point.Stop.At.Equal(reopened) {
+		t.Fatalf("the stop after the reopening counts from %v, not from the reopening at %v", last.Point.Stop.At, reopened)
+	}
+	st = testStore(t)
+	j := newTimeline(t, "job").owner(0, "check the deploy every 10 minutes", "turn_duration").
+		call(time.Second, "CronCreate", "tc1", `{"cron":"*/10 * * * *","prompt":"check the deploy","durable":true}`).
+		result(time.Second, "CronCreate", "tc1", "Scheduled recurring job j1 (Every 10 minutes). Next run: 10:10. Persisted to .claude/scheduled_tasks.json.").
+		say(time.Second, "Checking.")
+	j.localCommand(time.Minute, "exit", "").localCommand(40*time.Minute, "model", "")
+	model := j.at.Add(-time.Millisecond)
+	j.owner(10*time.Minute, "status?", "").say(time.Second, "Back.").owner(time.Hour, "and now?", "turn_duration")
+	j.put(st)
+	for _, r := range overdueActs(t, st, t0.Add(3*time.Hour)) {
+		if !r.Point.Stop.WakeDue.After(model) {
+			t.Fatalf("a run due while the process was gone read as missed: due %v, reopened %v", r.Point.Stop.WakeDue, model)
+		}
+	}
+}
