@@ -122,6 +122,13 @@ func writePoints(path string, rs []supervise.Result) error {
 		if r.Label != nil {
 			v["label"] = r.Label.Kind
 		}
+		if len(r.Also) > 0 {
+			var also []string
+			for _, l := range r.Also {
+				also = append(also, l.Kind)
+			}
+			v["also"] = also // later labelled steps at the stop, measured by the first
+		}
 		if r.Outcome == "" && r.Label == nil && r.Decision.Rule == "" {
 			continue
 		}
@@ -222,13 +229,19 @@ func printReplay(out io.Writer, rs []supervise.Result, labels []supervise.Label,
 func printRedundant(out io.Writer, rs []supervise.Result) {
 	var n, by int
 	for _, r := range rs {
-		if r.Label == nil || r.Label.Kind != "nudge" {
+		if r.Label == nil {
 			continue
 		}
-		n++
 		s := r.Point.Stop
-		if s.RequestAt.IsZero() && (s.Busy || s.Tasks > 0 || !s.WakeAt.IsZero() || s.Loop != "") {
-			by++
+		redundant := s.RequestAt.IsZero() && (s.Busy || s.Tasks > 0 || !s.WakeAt.IsZero() || s.Loop != "")
+		for _, l := range append([]*supervise.Label{r.Label}, r.Also...) { // every nudge at the stop, a later one too
+			if l.Kind != "nudge" {
+				continue
+			}
+			n++
+			if redundant {
+				by++
+			}
 		}
 	}
 	if n > 0 {

@@ -178,9 +178,14 @@ func Replay(points []Point, labels []Label, p Params, probe Probe, until time.Ti
 			return Plan(pt.Stop, Tries{}, p, probe)
 		}
 		d := plan()
-		// a local command shows the owner at the session from then: it holds a rule that had not acted yet
+		var r Result
+		if ls, at := labelsOf(pt); len(ls) > 0 {
+			r.Label, r.StepAt, r.Also = ls[0], at[0], ls[1:]
+		}
+		// a local command shows the owner at the session from then: it holds a rule that had not acted yet. The
+		// labelled step is measured against the decision it did not move, so the loop stops before it.
 		for _, at := range pt.Controls {
-			if d.Verdict != Wait && d.Verdict != Hold || d.At.IsZero() || !at.Before(d.At) {
+			if d.Verdict != Wait && d.Verdict != Hold || d.At.IsZero() || !at.Before(d.At) || r.Label != nil && !at.Before(r.StepAt) {
 				break
 			}
 			if at.After(pt.Stop.OwnerAt) {
@@ -188,10 +193,7 @@ func Replay(points []Point, labels []Label, p Params, probe Probe, until time.Ti
 				d = plan()
 			}
 		}
-		r := Result{Point: pt, Decision: d}
-		if ls, at := labelsOf(pt); len(ls) > 0 {
-			r.Label, r.StepAt, r.Also = ls[0], at[0], ls[1:]
-		}
+		r.Point, r.Decision = pt, d
 		stepAt := r.StepAt
 		end := pt.Next.At
 		if pt.Next.Kind == "none" {

@@ -74,9 +74,74 @@ var (
 // A Claude Code local command's echo is its command tags and nothing else, with the tags the live tracker strips
 // (sessions/claude); a prompt it expands to has text of its own.
 var (
-	hCommandTag  = regexp.MustCompile(`(?s)<(?:system-reminder|local-command-stdout|local-command-caveat|command-name|command-message|command-args)>.*?</(?:system-reminder|local-command-stdout|local-command-caveat|command-name|command-message|command-args)>`)
+	echoTags     = []string{"system-reminder", "local-command-stdout", "local-command-caveat", "command-name", "command-message", "command-args"}
+	hCommandTag  = regexp.MustCompile(`(?s)<(?:` + strings.Join(echoTags, "|") + `)>.*?</(?:` + strings.Join(echoTags, "|") + `)>`)
 	hCommandName = regexp.MustCompile(`<command-name>([^<]*)</command-name>`)
 )
+
+// localEcho reports a local command's echo: a record the store marks so whose text is only the command's tags. The
+// store keeps 240 bytes of a record (a caveat or a reminder alone can be longer) and marks a cut one with "…":
+// then the record is read whole from its transcript while it is there, else a cut that ends inside one of the tags
+// still reads as an echo.
+func localEcho(e store.Event) bool {
+	cut, ok := strings.CutSuffix(e.Summary, "…")
+	if !ok {
+		return echoOnly(e.Summary)
+	}
+	if text, ok := recordText(e.Ref); ok {
+		return echoOnly(text)
+	}
+	rest := strings.TrimSpace(hCommandTag.ReplaceAllString(cut, ""))
+	if rest == "" {
+		return true // the cut came between two of the tags
+	}
+	for _, tag := range echoTags {
+		open := "<" + tag + ">"
+		if strings.HasPrefix(rest, open) && !strings.Contains(rest, "</"+tag+">") || strings.HasPrefix(open, rest) {
+			return true // the cut came inside the tag, or inside its name
+		}
+	}
+	return false
+}
+
+// echoOnly reports a text that holds a command's name and nothing but the echo's tags.
+func echoOnly(s string) bool {
+	return strings.Contains(s, "<command-name>") && strings.TrimSpace(hCommandTag.ReplaceAllString(s, "")) == ""
+}
+
+// recordText is the text of a user record in its transcript (Ref: path@offset#index): its message's content, a
+// string or text blocks. False when the transcript is gone or the record holds no text.
+func recordText(ref string) (string, bool) {
+	line := recordAt(ref)
+	if line == nil {
+		return "", false
+	}
+	var r struct {
+		Message struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(line, &r) != nil || len(r.Message.Content) == 0 {
+		return "", false
+	}
+	var text string
+	if json.Unmarshal(r.Message.Content, &text) == nil {
+		return text, text != ""
+	}
+	var blocks []struct {
+		Type, Text string
+	}
+	if json.Unmarshal(r.Message.Content, &blocks) != nil {
+		return "", false
+	}
+	var parts []string
+	for _, b := range blocks {
+		if b.Type == "text" {
+			parts = append(parts, b.Text)
+		}
+	}
+	return strings.Join(parts, "\n"), len(parts) > 0
+}
 
 // role is what one event is in a session's turns.
 func role(e store.Event, m map[string]any) string {
@@ -116,7 +181,7 @@ func role(e store.Event, m map[string]any) string {
 		if strings.Contains(why, "notification") || strings.Contains(why, "complete") {
 			return "self"
 		}
-	case why == "local command" && strings.Contains(s, "<command-name>") && strings.TrimSpace(hCommandTag.ReplaceAllString(s, "")) == "":
+	case why == "local command" && localEcho(e):
 		// a Claude Code local command's echo (/login, /model), which never reaches the model: its user was at the
 		// session, and no turn opened (the live layer's ControlAt). /exit and /quit end the process.
 		if g := hCommandName.FindStringSubmatch(s); g != nil && (g[1] == "/exit" || g[1] == "/quit") {
@@ -453,6 +518,10 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			if prior, _ := m["prior"].(string); carried == "" && turnOver(harness, prior) {
 				carried = prior
 			}
+			if exited { // a local command after /exit: the session was opened again, and its jobs run from here
+				restart(e.TS)
+				exited, prevRole = false, "reopened"
+			}
 			continue
 		case "aborted":
 			// Codex ended the turn on its user's interruption, as its live tracker reads turn_aborted, with no call
@@ -465,7 +534,9 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			continue
 		case "exit":
 			// /exit or /quit: the process ends, and what ran dies with it. The stop before it ends here; the stop after
-			// it is one no rule acts on (Stop.Exited) until the session's next record.
+			// it is one no rule acts on (Stop.Exited) until the session runs again: its next input, turn or local
+			// command, from which its jobs run again. The records the exit itself writes after it (its output, its
+			// caveat) and other records the replay passes over do not end it.
 			if !prevAt.IsZero() {
 				prevPrior = priorOf(m, carried)
 				out = append(out, Point{Session: id, Stop: stopOf(e.TS, e.Ref), Next: Next{At: e.TS, Kind: "owner", InputKind: "exit", Text: e.Summary},
@@ -476,7 +547,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			prevAt, prevRole, prevPrior, owes, owesRef, exited = e.TS, "exit", "", time.Time{}, "", true
 			continue
 		}
-		if exited { // the process that reads this record started now: its jobs run from their first run after it
+		if exited { // the session runs again from this record: its jobs run from their first run after it
 			restart(e.TS)
 			exited = false
 		}
