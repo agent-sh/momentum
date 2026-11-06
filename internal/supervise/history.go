@@ -70,7 +70,6 @@ var (
 	hReason    = regexp.MustCompile(`"reason":"((?:[^"\\]|\\.)*)`)
 	hPrompt    = regexp.MustCompile(`"prompt":"((?:[^"\\]|\\.)*)`)
 	hCutCall   = regexp.MustCompile(`^\[Tool call interrupted: the session ended before`)
-	hOrphan    = regexp.MustCompile(`didn't finish before|__orphan_summary__`)
 	terminalSt = map[string]bool{"completed": true, "failed": true, "killed": true, "stopped": true, "error": true, "timeout": true, "cancelled": true}
 )
 
@@ -729,7 +728,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		if enqueued[e.SourceKey] {
 			// a notification at the time it was queued, delivered as an input later: it closes its task now, as the
 			// live tracker reads the queue
-			if r == "self" {
+			if r == "self" && !peerMessage(e.Summary) { // another session's message is no notification of its own tasks
 				if strings.HasPrefix(e.Summary, "<task-notification>") && !strings.Contains(e.Summary, "</task-notification>") {
 					e.Summary = whole(e)
 				}
@@ -902,9 +901,13 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 					wake = replayWake{}
 				}
 			}
-			notified(e.Summary, e.TS)
-			if hOrphan.MatchString(e.Summary) { // reopened: what ran died with the process
-				reopened(e.TS)
+			// another session's message is an input, not a notice of this session's tasks or of its reopening, as the
+			// live tracker reads it
+			if !peerMessage(e.Summary) {
+				notified(e.Summary, e.TS)
+				if claude.Orphaned(e.Summary) { // reopened: what ran died with the process
+					reopened(e.TS)
+				}
 			}
 			lastMainUser = true
 		case "momentum": // a message momentum typed: it opens a turn, and is not the owner's
