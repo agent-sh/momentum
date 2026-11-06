@@ -112,9 +112,8 @@ func echoOnly(s string) bool {
 	return strings.Contains(s, "<command-name>") && !hSkillRunning.MatchString(s) && strings.TrimSpace(hCommandTag.ReplaceAllString(s, "")) == ""
 }
 
-// recordText is the text of a user record in its transcript (Ref: path@offset#index): its message's content, or a
-// queued command's prompt (an attachment keeps its text there), a string or text blocks. False when the transcript
-// is gone or the record holds no text.
+// recordText is the text of a user record in its transcript (Ref: path@offset#index): its message's content, a
+// string or text blocks. False when the transcript is gone or the record holds no text.
 func recordText(ref string) (string, bool) {
 	line := recordAt(ref)
 	if line == nil {
@@ -124,17 +123,11 @@ func recordText(ref string) (string, bool) {
 		Message struct {
 			Content json.RawMessage `json:"content"`
 		} `json:"message"`
-		Attachment struct {
-			Prompt json.RawMessage `json:"prompt"`
-		} `json:"attachment"`
 	}
 	if json.Unmarshal(line, &r) != nil {
 		return "", false
 	}
 	content := r.Message.Content
-	if len(content) == 0 {
-		content = r.Attachment.Prompt
-	}
 	if len(content) == 0 {
 		return "", false
 	}
@@ -185,6 +178,11 @@ func role(e store.Event, m map[string]any) string {
 	case "owner_text":
 		return "owner"
 	case "agent_text":
+		if why == "harness line" && peerMessage(e.Summary) {
+			// another session's message Claude Code queued, which tacit credits to an agent when it does not know the
+			// tag: an input of the session's own that the model answers, not the model's words
+			return "self"
+		}
 		return "agent"
 	case "tool_call":
 		return "call"
@@ -206,7 +204,7 @@ func role(e store.Event, m map[string]any) string {
 		return "self"
 	case strings.HasPrefix(s, "# Autonomous loop tick"), m["prior"] == "scheduled_task_fire":
 		return "self"
-	case strings.HasPrefix(s, "<agent-message from="), strings.HasPrefix(s, "Another Claude session sent a message"):
+	case peerMessage(s):
 		return "self"
 	case strings.HasPrefix(why, "hermes notice "):
 		if strings.Contains(why, "steer") {
@@ -241,6 +239,12 @@ func role(e store.Event, m map[string]any) string {
 		return "aborted" // Codex's record that its user interrupted the turn: it is over, and no input came yet
 	}
 	return ""
+}
+
+// peerMessage reports another session's message, as Claude Code writes it into the session.
+func peerMessage(s string) bool {
+	return strings.HasPrefix(s, "<agent-message from=") || strings.HasPrefix(s, "<cross-session-message from=") ||
+		strings.HasPrefix(s, "Another Claude session sent a message")
 }
 
 type replayTask struct {
@@ -950,33 +954,59 @@ func requestBetween(from, to string, until time.Time) time.Time {
 	}
 }
 
-// queuedCommand reports a Claude Code notification its harness queued while a turn ran and delivered into the turn
-// later, as the store marks it (by its command mode: a task's notification). A message its user typed meanwhile is
+// queuedCommand reports what Claude Code queued while a turn ran and delivered into the turn later, not its user's: a
+// task's notification, which the store marks by its command mode, and another session's message, which is meta and
+// so a harness line in the store, as the harness's text or an agent's. A harness line can also be a record shown in
+// the transcript only, so while the transcript is there its record says: a queued command is an attachment of type
+// queued_command with its command mode. Without the transcript the store's mark stands: a record shown only in the
+// transcript is dated where it sits, so reading it there changes nothing. A message its user typed meanwhile is
 // queued too, but its record's time is when he typed it, which his labelled steps and his turns are found by.
 func queuedCommand(e store.Event) bool {
-	if e.Harness != "claude" || e.Kind != "harness_text" {
+	if e.Harness != "claude" || e.Kind != "harness_text" && e.Kind != "agent_text" {
 		return false
 	}
 	var m struct {
 		Why string `json:"why"`
 	}
 	json.Unmarshal([]byte(e.Meta), &m)
-	return strings.HasPrefix(m.Why, "commandMode ")
+	switch {
+	case strings.HasPrefix(m.Why, "commandMode "):
+		return e.Kind == "harness_text"
+	case m.Why != "harness line":
+		return false
+	}
+	line := recordAt(e.Ref)
+	if line == nil {
+		return true
+	}
+	var r struct {
+		Type       string `json:"type"`
+		Attachment struct {
+			Type        string `json:"type"`
+			CommandMode string `json:"commandMode"`
+		} `json:"attachment"`
+	}
+	return json.Unmarshal(line, &r) == nil && r.Type == "attachment" && r.Attachment.Type == "queued_command" && r.Attachment.CommandMode != ""
 }
 
 // placeQueued reads each queued command where it sits in its transcript. Claude Code writes one as an attachment
 // that carries the time it was queued, not the time it was delivered, so by its time it would come before the
 // records it followed (the result or the input it rode in with) and read as an input of its own. It is delivered at
-// the event before it in its transcript (by Ref) when that is later, and an event of the same time sits by its place
-// in the transcript. What its queueing did stays at its own time, as the live tracker reads the queue: a copy there,
-// under its key with enqueuedKey after it, closes the task a notification reports. It returns the events in that
-// order, the queued commands and the copies, by source key.
+// the event before it in its transcript (by Ref) when that is later. Anchoring steps back over the queued commands
+// before it: each is already placed where it was delivered, so a run of them is read at the record they followed,
+// and one queued after that record was written keeps its own time, before which nothing after it was delivered. A
+// prompt its user typed meanwhile keeps the time he typed it, so what follows it is delivered with it. Events are
+// read in the store's order: by time, then transcript, offset and index. What its queueing did stays at its own
+// time, as the live tracker reads the queue: a copy there, under its key with enqueuedKey after it and read after
+// an event of its place and time, closes the task a notification reports. It returns the events in that order, the
+// queued commands and the copies, by source key.
 func placeQueued(evs []store.Event) ([]store.Event, map[string]bool, map[string]bool) {
 	type place struct {
 		path string
 		off  int64
 		idx  int
 		ok   bool
+		copy bool
 	}
 	before := func(a, b place) bool {
 		if a.path != b.path {
@@ -992,22 +1022,25 @@ func placeQueued(evs []store.Event) ([]store.Event, map[string]bool, map[string]
 	var order []int // the events with a place, in transcript order
 	for i, e := range out {
 		if path, off, ok := refPlace(e.Ref); ok && e.Harness == "claude" {
-			places[i], order = place{path, off, blockIndex(e.Ref), true}, append(order, i)
+			places[i], order = place{path: path, off: off, idx: blockIndex(e.Ref), ok: true}, append(order, i)
 		}
 	}
 	sort.SliceStable(order, func(a, b int) bool { return before(places[order[a]], places[order[b]]) })
 	queued, enqueued := map[string]bool{}, map[string]bool{}
 	var copies []store.Event
+	var copyPlaces []place
 	for k, i := range order {
 		if !queuedCommand(out[i]) {
 			continue
 		}
 		queued[out[i].SourceKey] = true
 		if k > 0 && places[order[k-1]].path == places[i].path {
-			if prev := out[order[k-1]].TS; prev.After(out[i].TS) { // itself placed, when it was one too
-				c := out[i]
+			// the event before it as placed: a queued command before it was delivered at its own anchor
+			if prev := out[order[k-1]].TS; prev.After(out[i].TS) {
+				c, p := out[i], places[i]
 				c.SourceKey += enqueuedKey
-				copies, enqueued[c.SourceKey] = append(copies, c), true
+				p.copy = true
+				copies, copyPlaces, enqueued[c.SourceKey] = append(copies, c), append(copyPlaces, p), true
 				out[i].TS = prev
 			}
 		}
@@ -1015,22 +1048,26 @@ func placeQueued(evs []store.Event) ([]store.Event, map[string]bool, map[string]
 	if len(copies) == 0 {
 		return evs, queued, enqueued
 	}
-	out = append(out, copies...)
-	places = append(places, make([]place, len(copies))...)
+	out, places = append(out, copies...), append(places, copyPlaces...)
 	idx := make([]int, len(out))
 	for i := range idx {
 		idx[i] = i
 	}
+	// a total order, so that a moved event never lands before its anchor: time, transcript, offset, index, the copy
+	// after the event of its place, then the source key (an event with no place sorts first among its time)
 	sort.SliceStable(idx, func(a, b int) bool {
 		ea, eb := out[idx[a]], out[idx[b]]
 		if !ea.TS.Equal(eb.TS) {
 			return ea.TS.Before(eb.TS)
 		}
 		pa, pb := places[idx[a]], places[idx[b]]
-		if pa.ok && pb.ok && pa.path == pb.path {
+		if pa.path != pb.path || pa.off != pb.off || pa.idx != pb.idx {
 			return before(pa, pb)
 		}
-		return false
+		if pa.copy != pb.copy {
+			return pb.copy
+		}
+		return ea.SourceKey < eb.SourceKey
 	})
 	sorted := make([]store.Event, len(out))
 	for k, i := range idx {

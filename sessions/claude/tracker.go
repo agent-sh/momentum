@@ -723,8 +723,9 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 		}
 		if m := reCommandName.FindStringSubmatch(s); m != nil && (m[1] == "/exit" || m[1] == "/quit") {
 			// the process ends, and the turn it ran with it: a "No response requested." the next process writes
-			// closes no turn, so it is no reopening
+			// closes no turn, so it is no reopening; a reopening before the exit is over with the process it opened
 			st.LastMain, st.Group, st.Request, st.QueuedPrompt = "ended", st.Group[:0], time.Time{}, time.Time{}
+			st.Resumed = time.Time{}
 		}
 		return
 	}
