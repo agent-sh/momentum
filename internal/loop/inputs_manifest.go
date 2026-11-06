@@ -52,6 +52,20 @@ func (m InputsManifest) Summary() string {
 		store, m.Records.Written, len(m.Configuration.Files), float64(m.Configuration.Bytes)/(1<<20), repositories, tacit, diffs)
 }
 
+// Stale tells a run which repositories it reads are not origin's default branch as its pass fetched it, and what they
+// are instead, with why: the branch as its mirror last fetched it, or the checkout's own (RepoInput.Fallback,
+// scrubbed). It is empty when every repository was fetched.
+func (m InputsManifest) Stale() string {
+	var b strings.Builder
+	for _, repo := range m.Repositories {
+		if repo.Error == "" && repo.Commit != "" && repo.Fallback != "" {
+			fmt.Fprintf(&b, "\n/ro/repos/%s, its log and its diffs are not origin's default branch as this pass fetched it (%s).",
+				plain.Line(repo.Name), plain.Line(repo.Fallback))
+		}
+	}
+	return b.String()
+}
+
 // describe is one repository in a summary: its snapshot, or why it is absent.
 func (r RepoInput) describe() string {
 	name := plain.Line(r.Name)

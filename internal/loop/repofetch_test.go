@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -260,65 +263,110 @@ func TestABuildBaseThatCannotBeFetchedHoldsTheBuild(t *testing.T) {
 }
 
 // stalledListener accepts connections and never answers on them, as a server that hangs does; it lets each go after
-// hold, so a call that never ends by itself still ends.
-func stalledListener(t *testing.T, hold time.Duration) int {
+// hold, so a call that never ends by itself still ends. count says how many it accepted and how many of them their
+// client still holds open: a process that holds one is still running.
+func stalledListener(t *testing.T, hold time.Duration) (port int, count func() (accepted, held int)) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close() })
+	var mu sync.Mutex
+	accepted, held := 0, 0
 	go func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			go func() { time.Sleep(hold); conn.Close() }()
+			mu.Lock()
+			accepted, held = accepted+1, held+1
+			mu.Unlock()
+			release := time.AfterFunc(hold, func() { conn.Close() })
+			go func() {
+				buf := make([]byte, 4096)
+				for {
+					if _, err := conn.Read(buf); err != nil {
+						break
+					}
+				}
+				if release.Stop() { // the client closed it before hold let it go
+					mu.Lock()
+					held--
+					mu.Unlock()
+					conn.Close()
+				}
+			}()
 		}
 	}()
-	return ln.Addr().(*net.TCPAddr).Port
+	return ln.Addr().(*net.TCPAddr).Port, func() (int, int) { mu.Lock(); defer mu.Unlock(); return accepted, held }
 }
 
-// A remote call ends at its deadline, though its ssh or https helper waits on a server that never answers: the whole
-// process group goes, and the error says which deadline ended it.
+// comesTrue says whether ok comes true within d.
+func comesTrue(d time.Duration, ok func() bool) bool {
+	for end := time.Now().Add(d); time.Now().Before(end); time.Sleep(50 * time.Millisecond) {
+		if ok() {
+			return true
+		}
+	}
+	return ok()
+}
+
+// A remote call ends at its deadline, though its ssh or https helper waits on a server that never answers, or ignores
+// SIGTERM: the whole process group goes, the helper with it, and the error says which deadline ended the call.
 func TestARemoteCallEndsAtItsDeadline(t *testing.T) {
 	if _, err := exec.LookPath("ssh"); err != nil {
 		t.Skip("no ssh here")
 	}
-	port := stalledListener(t, 20*time.Second)
 	const deadline = 3 * time.Second
-	bound := deadline + gitWaitDelay + 2*time.Second
+	bound := deadline + 2*gitWaitDelay + 2*time.Second
 	mirror := filepath.Join(t.TempDir(), "mirror.git")
 	inputTestGit(t, filepath.Dir(mirror), nil, "init", "-q", "--bare", mirror)
-	ssh := fmt.Sprintf("ssh://git@127.0.0.1:%d/x.git", port)
 	f := newRepo(t, nil)
 	ship := shipWithSandbox(testStore(t), f, Sandbox{})
-	calls := map[string]func(context.Context) error{
-		"ssh fetch": func(ctx context.Context) error {
-			_, err := fetchGit(ctx, mirror, "", "ls-remote", ssh, "HEAD")
-			return err
-		},
-		"https fetch": func(ctx context.Context) error {
-			_, err := fetchGit(ctx, mirror, "", "ls-remote", fmt.Sprintf("https://127.0.0.1:%d/x.git", port), "HEAD")
-			return err
-		},
-		"ship": func(ctx context.Context) error {
-			_, err := ship.git(ctx, f.main, "ls-remote", ssh, "HEAD")
-			return err
-		},
-	}
-	for name, call := range calls {
+	for _, name := range []string{"ssh fetch", "https fetch", "ship", "an ssh that ignores SIGTERM"} {
 		t.Run(name, func(t *testing.T) {
+			port, count := stalledListener(t, 20*time.Second)
+			url := fmt.Sprintf("ssh://git@127.0.0.1:%d/x.git", port)
+			pidFile := filepath.Join(t.TempDir(), "pid")
+			switch name {
+			case "https fetch":
+				url = fmt.Sprintf("https://127.0.0.1:%d/x.git", port)
+			case "an ssh that ignores SIGTERM":
+				bin := t.TempDir()
+				script(t, bin, "ssh", "trap '' TERM\necho $$ > '"+pidFile+"'\nexec sleep 60")
+				t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), deadline)
 			defer cancel()
 			start := time.Now()
-			err := call(ctx)
+			var err error
+			if name == "ship" {
+				_, err = ship.git(ctx, f.main, "ls-remote", url, "HEAD")
+			} else {
+				_, err = fetchGit(ctx, mirror, "", "ls-remote", url, "HEAD")
+			}
 			if took := time.Since(start); took > bound {
 				t.Fatalf("the call returned %s after its %s deadline", took.Round(time.Second), deadline)
 			}
 			if err == nil || !strings.Contains(err.Error(), "the caller's deadline passed") {
 				t.Fatalf("the error does not say which deadline ended it: %v", err)
+			}
+			if name == "an ssh that ignores SIGTERM" {
+				raw, err := os.ReadFile(pidFile)
+				pid, perr := strconv.Atoi(strings.TrimSpace(string(raw)))
+				if err != nil || perr != nil {
+					t.Fatalf("the helper did not start: %v %v", err, perr)
+				}
+				if !comesTrue(2*time.Second, func() bool { return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) }) {
+					t.Fatal("the helper that ignores SIGTERM outlived the call")
+				}
+				return
+			}
+			if !comesTrue(2*time.Second, func() bool { accepted, held := count(); return accepted > 0 && held == 0 }) {
+				accepted, held := count()
+				t.Fatalf("the helper outlived the call: it holds %d of the %d connections it made", held, accepted)
 			}
 		})
 	}
@@ -345,6 +393,8 @@ func TestARefusedFetchSaysWhyWithoutAURL(t *testing.T) {
 		{"rewrite", "fetch refused: the checkout's Git configuration rewrites remote URLs (its url section)"},
 		{"push elsewhere", "fetch refused: origin's fetch and push destinations differ"},
 		{"protocol", "fetch refused: origin's URL is not https, ssh or a local path"},
+		{"https credentials", "fetch refused: origin's URL holds credentials"},
+		{"ssh password", "fetch refused: origin's URL holds credentials"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			r, _ := inputRunner(t)
@@ -358,6 +408,10 @@ func TestARefusedFetchSaysWhyWithoutAURL(t *testing.T) {
 				run(t, f.main, "git", "config", "remote.origin.pushurl", "https://fixture:tok3n-7f3a@example.com/elsewhere.git")
 			case "protocol":
 				run(t, f.main, "git", "remote", "set-url", "origin", "http://fixture:tok3n-7f3a@127.0.0.1:1/fake.git")
+			case "https credentials":
+				run(t, f.main, "git", "remote", "set-url", "origin", "https://tok3n-7f3a@127.0.0.1:1/fake.git")
+			case "ssh password":
+				run(t, f.main, "git", "remote", "set-url", "origin", "ssh://fixture:tok3n-7f3a@127.0.0.1:1/fake.git")
 			}
 			repo, summary := passRepository(t, r, f.main)
 			if repo.Commit != local || !strings.Contains(summary, "(checkout's main: "+c.want) {
@@ -489,80 +543,6 @@ func TestAMirrorThatIsNotAsTheHostMadeItIsMadeAgain(t *testing.T) {
 	}
 }
 
-// datedCommit commits files in dir at a time in the past.
-func datedCommit(t *testing.T, dir string, ago time.Duration, files map[string]string) string {
-	t.Helper()
-	for p, body := range files {
-		write(t, filepath.Join(dir, p), body)
-	}
-	when := "@" + strconv.FormatInt(time.Now().Add(-ago).Unix(), 10) + " +0000"
-	inputTestGit(t, dir, nil, "add", "-A")
-	inputTestGit(t, dir, []string{"GIT_AUTHOR_DATE=" + when, "GIT_COMMITTER_DATE=" + when}, "commit", "-q", "-m", fmt.Sprintf("%s ago", ago))
-	return inputTestGit(t, dir, nil, "rev-parse", "HEAD")
-}
-
-// A fetch takes the history window the log and the diffs read, with the parents of its oldest commits, so their
-// changes are their own: none of the older history. A branch without a commit in the window comes as its tip alone.
-func TestAFetchTakesOnlyTheHistoryWindow(t *testing.T) {
-	const day = 24 * time.Hour
-	for _, recent := range []bool{true, false} {
-		t.Run(fmt.Sprintf("recent commits %v", recent), func(t *testing.T) {
-			r, _ := inputRunner(t)
-			parent := t.TempDir()
-			origin, work := filepath.Join(parent, "origin.git"), filepath.Join(parent, "work")
-			inputTestGit(t, parent, nil, "init", "-q", "--bare", "-b", "main", origin)
-			inputTestGit(t, parent, nil, "clone", "-q", origin, work)
-			oldest := datedCommit(t, work, 90*day, map[string]string{"a.txt": "1\n", "b.txt": "1\n"})
-			tip := datedCommit(t, work, 60*day, map[string]string{"a.txt": "2\n"})
-			if recent {
-				datedCommit(t, work, 10*day, map[string]string{"a.txt": "3\n"})
-				tip = datedCommit(t, work, day, map[string]string{"b.txt": "2\n"})
-			}
-			inputTestGit(t, work, nil, "push", "-q", "origin", "HEAD:main")
-			repo, summary := passRepository(t, r, work)
-			if repo.Commit != tip || repo.Fallback != "" {
-				t.Fatalf("the window's tip was not read: %s", summary)
-			}
-			if _, err := hostInputGit(context.Background(), "", "--git-dir="+repo.objects, "cat-file", "-e", oldest+"^{commit}"); err == nil {
-				t.Fatal("the mirror holds history older than the window")
-			}
-			log, err := os.ReadFile(filepath.Join(r.pass.dir, "history", "repos", repo.Name+".log"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			want := 0
-			if recent {
-				want = 2
-			}
-			if repo.History.Commits != want || recent && strings.Count(string(log), "  1 files changed") != 2 {
-				t.Fatalf("the window's log has %d commits, want %d, each with its own change:\n%s", repo.History.Commits, want, log)
-			}
-		})
-	}
-}
-
-// A mirror over mirrorMax after its fetch is dropped, and the pass reads the checkout and says why.
-func TestAMirrorOverItsCapIsDropped(t *testing.T) {
-	was := mirrorMax
-	t.Cleanup(func() { mirrorMax = was })
-	mirrorMax = 1 << 20
-	r, _ := inputRunner(t)
-	noise := make([]byte, 2<<20)
-	if _, err := rand.Read(noise); err != nil {
-		t.Fatal(err)
-	}
-	f := newRepo(t, map[string]string{"noise.bin": string(noise)})
-	pushOther(t, f, "main", map[string]string{"later.txt": "merged later\n"})
-	local := strings.TrimSpace(run(t, f.main, "git", "rev-parse", "HEAD"))
-	repo, summary := passRepository(t, r, f.main)
-	if repo.Commit != local || !strings.Contains(summary, "(checkout's main: fetch refused: the mirror passed 1 MiB, so it was dropped") {
-		t.Fatalf("an oversized mirror was read: %s", summary)
-	}
-	if _, err := os.Stat(identityMirror(r, "url:"+f.origin)); !os.IsNotExist(err) {
-		t.Fatalf("the oversized mirror remains: %v", err)
-	}
-}
-
 // A pass removes the mirrors of repositories no longer in read_dirs, and keeps one whose checkout is still read though
 // its origin could not be read this pass.
 func TestMirrorsOfRepositoriesNoLongerReadAreRemoved(t *testing.T) {
@@ -611,5 +591,182 @@ func TestAFailedFetchReadsTheMirrorsLastFetch(t *testing.T) {
 	}
 	if text, err := os.ReadFile(filepath.Join(repo.Path, "later.txt")); err != nil || string(text) != "merged later\n" {
 		t.Fatalf("the snapshot is not the mirror's: %v", err)
+	}
+}
+
+// snapshotPass is SnapshotRepos over one checkout as a pass runs it, into inputs of its own under parent.
+func snapshotPass(ctx context.Context, parent, name, source string) ([]RepoInput, error) {
+	dir := filepath.Join(parent, name)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	return SnapshotRepos(ctx, SnapshotOptions{Sources: []string{source}, Destination: filepath.Join(dir, "repos"),
+		LogDir: filepath.Join(dir, "logs"), Mirrors: filepath.Join(parent, "mirrors"), Since: time.Now().Add(-HistoryWindow)})
+}
+
+// A fetch its deadline ends in the middle of the transfer leaves a mirror the next pass fetches into: the group gets
+// SIGTERM, on which git removes its locks, and the next pass removes what a fetch killed outright left.
+func TestAFetchEndedMidTransferLeavesAMirrorTheNextPassFetches(t *testing.T) {
+	goodInputScrubber(t)
+	noise := make([]byte, 4<<20)
+	if _, err := rand.Read(noise); err != nil {
+		t.Fatal(err)
+	}
+	f := newRepo(t, map[string]string{"noise.bin": string(noise)})
+	tip := pushOther(t, f, "main", map[string]string{"later.txt": "merged later\n"})
+	// an ssh that runs the origin's upload-pack here, and stalls the first pass's fetch after 64 KiB of its pack
+	bin := t.TempDir()
+	count := filepath.Join(bin, "count")
+	script(t, bin, "ssh", `for last; do :; done
+n=$(cat '`+count+`' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '`+count+`'
+case "$last" in git-upload-pack*) ;; *) exit 255;; esac
+if [ "$n" = 2 ]; then sh -c "$last" | { head -c 65536; exec sleep 60; }; else exec sh -c "$last"; fi`)
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	run(t, f.main, "git", "remote", "set-url", "origin", "ssh://git@fixture.invalid"+f.origin)
+	parent := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := snapshotPass(ctx, parent, "first", f.main); !errors.Is(err, context.DeadlineExceeded) && err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := os.ReadFile(count); strings.TrimSpace(string(n)) != "2" {
+		t.Fatalf("the first pass's fetch did not start its transfer: %q", n)
+	}
+	got, err := snapshotPass(context.Background(), parent, "second", f.main)
+	if err != nil || len(got) != 1 || got[0].Commit != tip || got[0].Fallback != "" {
+		t.Fatalf("the next pass did not fetch into the mirror: %+v %v", got, err)
+	}
+}
+
+// A mirror holding the locks and temporary packs of a fetch killed outright is fetched into all the same.
+func TestStaleLocksOfAKilledFetchAreRemoved(t *testing.T) {
+	goodInputScrubber(t)
+	f := newRepo(t, nil)
+	parent := t.TempDir()
+	if got, err := snapshotPass(context.Background(), parent, "first", f.main); err != nil || got[0].Fallback != "" {
+		t.Fatalf("the first fetch failed: %+v %v", got, err)
+	}
+	mirror := filepath.Join(parent, "mirrors", filepath.Base(mirrorPath("", "url:"+f.origin)))
+	stale := []string{"refs/heads/main.lock", "HEAD.lock", "config.lock", "packed-refs.lock", "shallow.lock", "objects/pack/tmp_pack_x1"}
+	for _, p := range stale {
+		write(t, filepath.Join(mirror, p), "")
+	}
+	tip := pushOther(t, f, "main", map[string]string{"later.txt": "merged later\n"})
+	got, err := snapshotPass(context.Background(), parent, "second", f.main)
+	if err != nil || got[0].Commit != tip || got[0].Fallback != "" {
+		t.Fatalf("a killed fetch's leftovers stopped the next fetch: %+v %v", got, err)
+	}
+	for _, p := range stale {
+		if _, err := os.Lstat(filepath.Join(mirror, p)); !os.IsNotExist(err) {
+			t.Errorf("%s remains", p)
+		}
+	}
+}
+
+// Every run is told which of its repositories are not origin's default branch as its pass fetched it, and what they
+// are instead: an investigation and a review alike.
+func TestARunIsToldWhichRepositoriesAreNotFetched(t *testing.T) {
+	const note = "/ro/repos/main, its log and its diffs are not origin's default branch as this pass fetched it (checkout's main: "
+	t.Run("investigation", func(t *testing.T) {
+		r, c := inputRunner(t)
+		f, fetched := newRepo(t, nil), newRepo(t, nil)
+		run(t, f.main, "git", "remote", "remove", "origin")
+		r.Inputs.ReadDirs = []string{f.main, fetched.main}
+		newPass(t, r)
+		prepared, err := r.prepareRun(context.Background(), c, c.Family, StepInvestigate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prompt, err := readHostInput(HostDir(prepared.Dir), "prompt.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		stale := strings.Replace(note, "/ro/repos/main,", "/ro/repos/"+r.pass.manifest.Repositories[0].Name+",", 1)
+		if !strings.Contains(string(prompt), stale+"no origin).") || strings.Count(string(prompt), "are not origin's default branch") != 1 {
+			t.Fatalf("the investigation is not told which repository is the checkout's own:\n%s", prompt)
+		}
+	})
+	t.Run("review", func(t *testing.T) {
+		ctx := context.Background()
+		r, c := inputRunner(t)
+		mechanism, next := "one cause", "one test"
+		c, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &next}, "fixture")
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := newRepo(t, nil)
+		r.Ship = shipWithSandbox(r.Store, f, Sandbox{})
+		r.Ship.Dir = r.Dir
+		p, err := r.Ship.Prepare(ctx, c.ID, f.main)
+		if err != nil {
+			t.Fatal(err)
+		}
+		write(t, filepath.Join(p.Work, "notes.txt"), "One change\n")
+		p = fixtureCandidate(t, r.Ship, p)
+		p.Title, p.Body, p.Rollback = "One change", "One cause", "Revert"
+		p.Check = &Check{Tree: strings.Repeat("a", 40), CommandInput: "host-only", Before: Outcome{Exit: 1}}
+		if err := r.Ship.save(&p); err != nil {
+			t.Fatal(err)
+		}
+		run(t, f.main, "git", "config", "url.https://example.com/.insteadOf", "https://example.org/")
+		r.Inputs.ReadDirs = []string{f.main}
+		newPass(t, r)
+		prepared, err := r.prepareRun(ctx, c, c.Family, StepReview)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prompt, err := readHostInput(HostDir(prepared.Dir), "prompt.json")
+		if err != nil || !strings.Contains(string(prompt), note+"fetch refused: the checkout's Git configuration rewrites remote URLs") {
+			t.Fatalf("the review is not told its repository is the checkout's own: %v\n%s", err, prompt)
+		}
+	})
+}
+
+// A pass removes only mirrors: not what else lies in its mirrors directory, and nothing at all when that directory is
+// a link to somewhere else.
+func TestMirrorPruningRemovesOnlyMirrors(t *testing.T) {
+	for _, kind := range []string{"a linked directory", "other names"} {
+		t.Run(kind, func(t *testing.T) {
+			r, _ := inputRunner(t)
+			f := newRepo(t, nil)
+			mirrors := filepath.Join(r.Dir, "mirrors")
+			kept := mirrors
+			if kind == "a linked directory" {
+				kept = t.TempDir()
+				if err := os.Symlink(kept, mirrors); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write(t, filepath.Join(kept, "notes.txt"), "keep\n")
+			write(t, filepath.Join(kept, "other", "file"), "keep\n")
+			if kind == "a linked directory" {
+				write(t, filepath.Join(kept, "0123456789abcdef.git", "HEAD"), "keep\n")
+			}
+			passRepository(t, r, f.main)
+			for _, p := range []string{"notes.txt", "other/file", "0123456789abcdef.git/HEAD"} {
+				if _, err := os.Stat(filepath.Join(kept, p)); err != nil && (kind == "a linked directory" || p != "0123456789abcdef.git/HEAD") {
+					t.Errorf("the pass removed %s: %v", p, err)
+				}
+			}
+		})
+	}
+}
+
+// A build whose host clone the host refuses fails as the build's own, and is not held as an outage.
+func TestABuildBaseRefusalIsNotAHold(t *testing.T) {
+	ctx := context.Background()
+	r, c, _ := buildCase(t)
+	newPass(t, r)
+	if _, err := r.prepareRun(ctx, c, c.Family, StepBuild); err != nil {
+		t.Fatal(err)
+	}
+	p, _, err := r.Ship.Load(c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run(t, p.Host, "git", "config", "core.sshCommand", "false")
+	_, err = r.prepareRun(ctx, c, c.Family, StepBuild)
+	if !errors.Is(err, ErrRefused) || held(err) || !strings.Contains(err.Error(), "names a program") {
+		t.Fatalf("a refused host clone: %v (held %v)", err, held(err))
 	}
 }

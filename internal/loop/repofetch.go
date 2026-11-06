@@ -23,24 +23,26 @@ import (
 // work tree, index, HEAD, refs and objects are not written, so the busy check, which reads a change there as someone
 // at work, finds it as it was. Of the checkout the host reads only its storage (CheckHostStorage) and its origin's
 // URLs, from its own configuration file without includes (readOrigin); no setting of the checkout's applies to the
-// fetch. A GitHub repository is fetched over https by its name, with the GitHub CLI's credentials. The fetch takes the
-// history window the log and the diffs read, and every call has the input pins and ends with its context, whatever
-// its ssh or https helper does (endWithContext). When the fetch fails, the run reads the branch as the mirror last
-// fetched it, and without a mirror, or an origin to read, the checkout's own default branch; the input summary says
-// which and why.
+// fetch. A GitHub repository is fetched over https by its name, with the GitHub CLI's credentials. A mirror holds the
+// default branch's whole history: its first fetch carries all of it, a later one only what is new, and the log and
+// the diffs read the window from it. Every call has the input pins and ends with its context, whatever its ssh or
+// https helper does (endWithContext). When the fetch fails, the run reads the branch as the mirror last fetched it,
+// and without a mirror, or an origin to read, the checkout's own default branch; the input summary and the run's
+// prompt say which and why.
 
-// mirrorMax bounds a mirror's size on disk after a fetch. A mirror holds the tree at the branch's tip and the history
-// window's commits. A snapshot reads at most SnapshotRepoMax of that tree's text; the binaries and large files it
-// leaves out are fetched all the same, and a mirror never collects garbage (gc.auto=0), so the objects of earlier
-// windows stay in it. Four times what a snapshot can read leaves room for both; past it the mirror holds mostly what
-// no run reads, so it is dropped and the next pass fetches the window into an empty one.
-var mirrorMax int64 = 4 * SnapshotRepoMax
-
-// fetchLimit bounds the whole fetch of one repository (origin's HEAD, the window and its parents): an input step's
-// limit, since a large repository's first fetch takes minutes.
+// fetchLimit bounds a repository's fetch (origin's HEAD and the branch's new objects) once its mirror holds a complete
+// fetch: an input step's limit, as a local read of a large repository has.
 const fetchLimit = gitStepTimeout
 
-// gitWaitDelay bounds the wait for a Git call's output once its context ended and its process group was killed.
+// firstFetchLimit bounds a mirror's first fetch, which carries the branch's whole history, once. The low-speed limit
+// (remotePins) already ends a transfer that stalls, so this bounds only a slow live one. 30 minutes carries about
+// 1 GiB at 600 KiB/s, well past the history of the repositories a pass reads; the pass waits for it once per
+// repository. A first fetch that does not finish leaves no complete record, so the next pass's fetch is a first one
+// again.
+const firstFetchLimit = 30 * time.Minute
+
+// gitWaitDelay is how long a Git call's process group has to end once its context ended and it was sent SIGTERM
+// (which lets git remove its lock files) before SIGKILL, and then how long the wait for its output may last.
 const gitWaitDelay = 5 * time.Second
 
 // remoteSSH is the ssh every Git call of the host's that reaches a remote runs: it never prompts, gives up on a server
@@ -83,13 +85,13 @@ type origin struct{ identity, url string }
 // read): origin's default branch fetched now; when the fetch fails, the branch as the mirror last fetched it; when
 // there is no such mirror, or no origin to read, the checkout's own default branch. A fallback says which and why. An
 // error is a checkout without a default branch, or a pass told to stop.
-func sourceTip(ctx context.Context, source, mirrors, gh string, since time.Time) (repoTip, string, error) {
+func sourceTip(ctx context.Context, source, mirrors, gh string) (repoTip, string, error) {
 	org, why := readOrigin(ctx, source)
 	mirror := ""
 	if why == "" {
 		mirror = mirrorPath(mirrors, org.identity)
 		var tip repoTip
-		if tip, why = fetchTip(ctx, source, mirror, org.url, gh, since); why == "" {
+		if tip, why = fetchTip(ctx, source, mirror, org.url, gh); why == "" {
 			return tip, mirror, nil
 		}
 		if err := ctx.Err(); err != nil {
@@ -192,12 +194,19 @@ func fetchURL(source, url string) (string, error) {
 	if i := strings.Index(url, "::"); i > 0 && !strings.ContainsAny(url[:i], ":/[@") {
 		return "", refused("origin's URL names a remote helper, which the host does not run")
 	}
-	if scheme, _, ok := strings.Cut(url, "://"); ok {
-		switch strings.ToLower(scheme) {
+	if scheme, rest, ok := strings.Cut(url, "://"); ok {
+		switch scheme = strings.ToLower(scheme); scheme {
 		case "https", "ssh", "file":
-			return url, nil
+		default:
+			return "", refused("origin's URL is not https, ssh or a local path, all the host fetches")
 		}
-		return "", refused("origin's URL is not https, ssh or a local path, all the host fetches")
+		// a user or token in an https URL, or a password in an ssh one, would stand on the helper's command line,
+		// which every account on the machine can read
+		authority, _, _ := strings.Cut(rest, "/")
+		if user, _, ok := strings.Cut(authority, "@"); ok && (scheme == "https" || strings.Contains(user, ":")) {
+			return "", refused("origin's URL holds credentials, which the host never puts on a command line")
+		}
+		return url, nil
 	}
 	if localURL(url) && !filepath.IsAbs(url) {
 		url = filepath.Join(source, url)
@@ -222,15 +231,19 @@ func mirrorPath(mirrors, identity string) string {
 	return filepath.Join(mirrors, fmt.Sprintf("%x.git", sum[:8]))
 }
 
-// fetchTip fetches the default branch of source's origin into its mirror, within fetchLimit, and returns its tip, or
-// why it could not (a text without a host path or a URL).
-func fetchTip(ctx context.Context, source, mirror, url, gh string, since time.Time) (repoTip, string) {
+// fetchTip fetches the default branch of source's origin into its mirror, within fetchLimit (firstFetchLimit when the
+// mirror holds no complete fetch yet), and returns its tip, or why it could not (a text without a host path or a URL).
+func fetchTip(ctx context.Context, source, mirror, url, gh string) (repoTip, string) {
 	failure := func(err error) string { return "fetch failed: " + reason(err) }
-	fctx, cancel := withLimit(ctx, "fetch", fetchLimit)
-	defer cancel()
-	if err := openMirror(fctx, mirror, source); err != nil {
+	if err := openMirror(ctx, mirror, source); err != nil {
 		return repoTip{}, failure(err)
 	}
+	what, limit := "fetch", fetchLimit
+	if m, err := readMirrorMeta(mirror); err != nil || m.Commit == "" {
+		what, limit = "first fetch", firstFetchLimit
+	}
+	fctx, cancel := withLimit(ctx, what, limit)
+	defer cancel()
 	branch, err := originBranch(fctx, mirror, url, gh)
 	if err != nil {
 		return repoTip{}, failure(err)
@@ -245,17 +258,8 @@ func fetchTip(ctx context.Context, source, mirror, url, gh string, since time.Ti
 		return repoTip{}, "fetch refused: origin's default branch has no valid name"
 	}
 	ref := "refs/heads/" + branch
-	if err := fetchWindow(fctx, mirror, url, gh, ref, since); err != nil {
-		return repoTip{}, failure(err)
-	}
-	size, err := treeSize(mirror)
-	if err == nil && size > mirrorMax {
-		err = removeAll(mirror)
-		if err == nil {
-			return repoTip{}, fmt.Sprintf("fetch refused: the mirror passed %d MiB, so it was dropped; the next pass fetches into an empty one", mirrorMax>>20)
-		}
-	}
-	if err != nil {
+	if _, err := fetchGit(fctx, mirror, gh, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
+		url, "+"+ref+":"+ref); err != nil {
 		return repoTip{}, failure(err)
 	}
 	out, err := hostInputGit(fctx, "", "--git-dir="+mirror, "rev-parse", "--verify", ref+"^{commit}")
@@ -269,30 +273,9 @@ func fetchTip(ctx context.Context, source, mirror, url, gh string, since time.Ti
 	return repoTip{dir: mirror, branch: branch, commit: commit}, ""
 }
 
-// fetchWindow fetches ref of url into the mirror with the history the log and the diffs read: the commits since the
-// window's start, and the parents of its oldest, so their changes are their own and not a whole tree's. A branch
-// without a commit in the window comes as its tip alone. Without a window start the whole history comes.
-func fetchWindow(ctx context.Context, mirror, url, gh, ref string, since time.Time) error {
-	fetch := []string{"fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules"}
-	spec := "+" + ref + ":" + ref
-	if since.IsZero() {
-		_, err := fetchGit(ctx, mirror, gh, append(fetch, url, spec)...)
-		return err
-	}
-	if _, err := fetchGit(ctx, mirror, gh, append(fetch, "--shallow-since="+since.UTC().Format(time.RFC3339), url, spec)...); err != nil {
-		if ctx.Err() != nil {
-			return err
-		}
-		// no commit since the window's start: Git selects none, so the tip alone
-		_, err = fetchGit(ctx, mirror, gh, append(fetch, "--depth=1", url, spec)...)
-		return err
-	}
-	_, err := fetchGit(ctx, mirror, gh, append(fetch, "--deepen=1", url, spec)...)
-	return err
-}
-
 // openMirror makes sure dir is a usable mirror (usableMirror), making it again without a template (no hooks, no
-// sample files) when it is not, and records source among the checkouts that read it.
+// sample files) when it is not, removes what a fetch the system ended left behind (clearStale), and records source
+// among the checkouts that read it.
 func openMirror(ctx context.Context, dir, source string) error {
 	mirrors := filepath.Dir(dir)
 	if err := os.MkdirAll(mirrors, 0o700); err != nil {
@@ -301,7 +284,11 @@ func openMirror(ctx context.Context, dir, source string) error {
 	if err := noInputLinks(mirrors); err != nil {
 		return err
 	}
-	if !usableMirror(ctx, dir) {
+	if usableMirror(ctx, dir) {
+		if err := clearStale(dir); err != nil {
+			return err
+		}
+	} else {
 		if err := removeAll(dir); err != nil {
 			return err
 		}
@@ -326,10 +313,43 @@ func openMirror(ctx context.Context, dir, source string) error {
 	})
 }
 
-// usableMirror says whether dir is a mirror as the host makes it: a bare repository of plain files and directories,
-// whose configuration names no program, rewrite or include (CheckGitConfigWith, on its own file).
+// clearStale removes the lock files and temporary packs a fetch leaves when it is killed before it can remove them
+// itself. Nothing else holds them: the loop runs one pass at a time (its lock), and only a pass fetches into a mirror.
+func clearStale(dir string) error {
+	var stale []string
+	for _, name := range []string{"HEAD.lock", "config.lock", "packed-refs.lock", "shallow.lock", "FETCH_HEAD.lock"} {
+		stale = append(stale, filepath.Join(dir, name))
+	}
+	if err := filepath.WalkDir(filepath.Join(dir, "refs"), func(p string, e fs.DirEntry, err error) error {
+		if err == nil && !e.IsDir() && strings.HasSuffix(e.Name(), ".lock") {
+			stale = append(stale, p)
+		}
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}); err != nil {
+		return err
+	}
+	packs, err := filepath.Glob(filepath.Join(dir, "objects", "pack", "tmp_*"))
+	if err != nil {
+		return err
+	}
+	for _, p := range append(stale, packs...) {
+		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+// usableMirror says whether dir is a mirror as the host makes it: a bare repository that is not shallow, of plain files
+// and directories, whose configuration names no program, rewrite or include (CheckGitConfigWith, on its own file).
 func usableMirror(ctx context.Context, dir string) bool {
 	if info, err := os.Lstat(dir); err != nil || !info.IsDir() {
+		return false
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "shallow")); !errors.Is(err, fs.ErrNotExist) {
 		return false
 	}
 	if filepath.WalkDir(dir, func(_ string, e fs.DirEntry, err error) error {
@@ -379,7 +399,10 @@ func lastFetch(ctx context.Context, mirror string) (repoTip, time.Time, bool) {
 	return repoTip{dir: mirror, branch: m.Branch, commit: m.Commit}, m.Fetched, true
 }
 
-var commitName = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
+var (
+	commitName = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
+	mirrorName = regexp.MustCompile(`^[0-9a-f]{16}\.git$`)
+)
 
 func readMirrorMeta(mirror string) (mirrorMeta, error) {
 	var m mirrorMeta
@@ -409,16 +432,20 @@ func updateMirrorMeta(mirror string, change func(*mirrorMeta)) error {
 }
 
 // pruneMirrors removes the mirrors that no checkout of the pass reads: a mirror a source's origin named this pass
-// stays (used), and so does one that records a source whose origin could not be read this pass (unread). Any other
-// mirror, and anything under mirrors that is not one, goes.
+// stays (used), and so does one that records a source whose origin could not be read this pass (unread). Only a
+// mirror's name (mirrorPath) or a mirror being made (.new-) is removed, and nothing when the path to mirrors holds a
+// link.
 func pruneMirrors(mirrors string, used map[string]bool, unread []string) {
+	if noInputLinks(mirrors) != nil {
+		return // none yet, or not the loop's own: the next pass looks again
+	}
 	entries, err := os.ReadDir(mirrors)
 	if err != nil {
-		return // none yet; or unreadable, and the next pass tries again
+		return
 	}
 	for _, e := range entries {
 		dir := filepath.Join(mirrors, e.Name())
-		if used[dir] {
+		if used[dir] || !mirrorName.MatchString(e.Name()) && !strings.HasPrefix(e.Name(), ".new-") {
 			continue
 		}
 		if m, err := readMirrorMeta(dir); err == nil && slices.ContainsFunc(m.Sources, func(s string) bool { return slices.Contains(unread, s) }) {
@@ -426,22 +453,6 @@ func pruneMirrors(mirrors string, used map[string]bool, unread []string) {
 		}
 		_ = removeAll(dir) // what cannot be removed now is tried again by the next pass
 	}
-}
-
-// treeSize is the bytes of the regular files under dir.
-func treeSize(dir string) (int64, error) {
-	var n int64
-	err := filepath.WalkDir(dir, func(_ string, e fs.DirEntry, err error) error {
-		if err != nil || !e.Type().IsRegular() {
-			return err
-		}
-		info, err := e.Info()
-		if err == nil {
-			n += info.Size()
-		}
-		return err
-	})
-	return n, err
 }
 
 // originBranch is the branch origin's HEAD names, or "" when origin does not say.
@@ -508,16 +519,28 @@ func remoteFailure(ctx context.Context, verb string, err error, stderr []byte) e
 }
 
 // endWithContext makes a Git call end with its context, whatever its children do: git starts in a process group of
-// its own, the context's end kills the whole group (git and the ssh or https helper it started, which would hold its
-// output open past git's own end), and the wait for that output is bounded.
+// its own, and the context's end stops the whole group (git and the ssh or https helper it started, which would hold
+// its output open past git's own end). The group gets SIGTERM, on which git removes its lock files and temporary
+// packs, and SIGKILL when it has not ended after gitWaitDelay; the wait for its output is bounded the same.
 func endWithContext(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
-		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		if errors.Is(err, syscall.ESRCH) {
+		group := -cmd.Process.Pid
+		if err := syscall.Kill(group, syscall.SIGTERM); errors.Is(err, syscall.ESRCH) {
 			return os.ErrProcessDone
+		} else if err != nil {
+			return err
 		}
-		return err
+		// the group's number is not reused while any member lives, so the probe and the kill reach only this group
+		for end := time.Now().Add(gitWaitDelay); time.Now().Before(end); time.Sleep(50 * time.Millisecond) {
+			if errors.Is(syscall.Kill(group, 0), syscall.ESRCH) {
+				return nil
+			}
+		}
+		if err := syscall.Kill(group, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return err
+		}
+		return nil
 	}
 	cmd.WaitDelay = gitWaitDelay
 }

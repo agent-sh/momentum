@@ -463,7 +463,8 @@ func (s *Ship) freshRunClone(ctx context.Context, p *Package) error {
 // landing found no longer rebases (RefreshBase), the fetched tip. When that is the package's base, the tree is made
 // again from it. When it moved, or for RefreshBase, the host clone is reset to it and the build reworks the change
 // there: the cumulative patch stays in the package's data and reaches the run as previous.patch, and the old build
-// tree is never read. A fetch that cannot be made now holds the build, without a run or a charge.
+// tree is never read. A fetch the transport or a deadline ends holds the build, without a run or a charge; a refusal
+// of the host clone is the build's own failure.
 func (s *Ship) buildBase(ctx context.Context, p Package, snapshot string) (Package, error) {
 	if p.RefreshBase && roundsUsed(p) {
 		return p, refused("review rounds used; the change waits for a person")
@@ -472,6 +473,10 @@ func (s *Ship) buildBase(ctx context.Context, p Package, snapshot string) (Packa
 		return p, err
 	}
 	if _, err := s.git(ctx, p.Host, "fetch", "--quiet", "origin", p.Base); err != nil {
+		if errors.Is(err, ErrRefused) {
+			return p, err // the host clone itself is refused: no outage, so no hold
+		}
+		// the transport failed or a deadline ended it: an outage, which holds the build for the pass
 		return p, &shipHold{err: refused("the default branch of %s cannot be fetched now", p.Repo)}
 	}
 	base, err := s.git(ctx, p.Host, "rev-parse", "--verify", "refs/remotes/origin/"+p.Base+"^{commit}")

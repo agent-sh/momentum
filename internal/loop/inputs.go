@@ -165,8 +165,7 @@ func (r *Runner) buildInputs(ctx context.Context, p *passInputs) error {
 		func() {
 			// A repository that cannot be read (missing, not a work tree, no default branch) is left out and counted in the
 			// manifest's summary; the others and the investigation go on. What the scrubber changes in one is masked.
-			// Each is read at its origin's default branch, fetched into a mirror of the loop's own, never into the checkout,
-			// with the history window the log and the diffs read.
+			// Each is read at its origin's default branch, fetched into a mirror of the loop's own, never into the checkout.
 			gh := ""
 			if r.Ship != nil {
 				gh = r.Ship.GH
@@ -336,6 +335,8 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 		}
 		extra["package.json"] = string(b)
 	}
+	// every run, investigation, build or review, is told which of its repositories are not origin's branch fetched now
+	prompt += r.pass.manifest.Stale()
 	clean, err := RedactAll(ctx, []string{string(raw), system, prompt})
 	if err != nil {
 		return run, err

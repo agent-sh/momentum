@@ -169,7 +169,7 @@ func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) 
 			unread = append(unread, source)
 			continue
 		}
-		tip, mirror, err := sourceTip(ctx, source, o.Mirrors, o.GH, o.Since)
+		tip, mirror, err := sourceTip(ctx, source, o.Mirrors, o.GH)
 		if mirror != "" {
 			used[mirror] = true
 		} else {
