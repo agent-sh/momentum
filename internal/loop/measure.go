@@ -323,7 +323,7 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 	if plan.Guard != nil && c.Status == store.CaseMeasuring {
 		// a guard's recurrence counts from its watch's first start, before any wait or restart
 		from := guardStart(c, &p)
-		if back, err := recurrences(ctx, r.Store, plan, from, now.Add(time.Minute), r.Dir); err != nil {
+		if back, err := recurrences(ctx, r.Store, plan, from, time.Time{}, r.Dir); err != nil {
 			return failed(err.Error())
 		} else if len(back) > 0 {
 			return r.guardRegressed(ctx, c, &p, plan, m, back, from, now, dry)

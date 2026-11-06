@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, source TEXT NOT NULL, so
 CREATE TABLE IF NOT EXISTS session_stamps (key TEXT PRIMARY KEY, phase TEXT NOT NULL, since INTEGER NOT NULL,
   seq INTEGER NOT NULL, seen INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS schema_steps (version INTEGER PRIMARY KEY, at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS event_seq (id INTEGER PRIMARY KEY, n INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL,
   detail TEXT NOT NULL DEFAULT '', effect TEXT NOT NULL DEFAULT '', links TEXT NOT NULL DEFAULT '[]',
   source TEXT NOT NULL DEFAULT '', importance INTEGER NOT NULL DEFAULT 0, at INTEGER NOT NULL,
@@ -165,14 +166,26 @@ var keptIndexNames = slices.Concat([]string{"events_seq", "events_ts", "events_k
 
 // keptTriggers give Claude Code its one name as an event is written, by whatever build writes it: a build from
 // before the events were kept writes claude-code, also while this build has the store open.
+//
+// The seq triggers stamp a write sequence (Seq) on a row a write stored or rewrote without one: a build from before the
+// sequence writes none, and its rewrite of a row keeps the row's old one.
 const keptTriggers = `
 CREATE TRIGGER IF NOT EXISTS events_harness_insert AFTER INSERT ON events WHEN NEW.harness = 'claude-code'
 BEGIN UPDATE events SET harness = 'claude' WHERE rowid = NEW.rowid; END;
 CREATE TRIGGER IF NOT EXISTS events_harness_update AFTER UPDATE OF harness ON events WHEN NEW.harness = 'claude-code'
 BEGIN UPDATE events SET harness = 'claude' WHERE rowid = NEW.rowid; END;
+INSERT OR IGNORE INTO event_seq (id, n) VALUES (1, 0);
+CREATE TRIGGER IF NOT EXISTS events_seq_insert AFTER INSERT ON events WHEN NEW.seq = 0
+BEGIN ` + bumpSeq + ` UPDATE events SET seq = (SELECT n FROM event_seq WHERE id = 1) WHERE rowid = NEW.rowid; END;
+CREATE TRIGGER IF NOT EXISTS events_seq_update AFTER UPDATE ON events WHEN NEW.seq = OLD.seq
+BEGIN ` + bumpSeq + ` UPDATE events SET seq = (SELECT n FROM event_seq WHERE id = 1) WHERE rowid = NEW.rowid; END;
 `
 
-var keptTriggerNames = []string{"events_harness_insert", "events_harness_update"}
+// bumpSeq moves the write sequence one past the higher of its counter and the events' highest: it never goes down, a
+// rebuild's or a stale file's deleted rows notwithstanding.
+const bumpSeq = `UPDATE event_seq SET n = MAX(n, COALESCE((SELECT MAX(seq) FROM events), 0)) + 1 WHERE id = 1;`
+
+var keptTriggerNames = []string{"events_harness_insert", "events_harness_update", "events_seq_insert", "events_seq_update"}
 
 // derivedSchema makes the derived tables that are missing.
 const derivedSchema = `
@@ -384,7 +397,7 @@ func busy(err error) bool {
 }
 
 // keptTableNames are the tables keptTables makes.
-var keptTableNames = slices.Concat([]string{"events", "session_stamps", "schema_steps", "notes"}, capacityTableNames, caseTableNames,
+var keptTableNames = slices.Concat([]string{"events", "session_stamps", "schema_steps", "event_seq", "notes"}, capacityTableNames, caseTableNames,
 	loopTableNames)
 
 // checkpointColumns are the columns the schema gives the checkpoint tables. They are a cache of what transcripts
@@ -625,10 +638,14 @@ func put(ctx context.Context, tx querier, evs []Event) (int, error) {
 		return 0, err
 	}
 	defer seenStmt.Close()
-	// Every row this write stores or rewrites takes the write's sequence number, one past the store's highest: SQLite
-	// writes one transaction at a time, so a reader that read the highest sees every later write above it (Seq).
+	// Every row this write stores or rewrites takes the write's sequence number, one past the counter's (bumpSeq), which
+	// never goes down. The bump is the transaction's first write, so it holds SQLite's one writer's lock from then: a
+	// reader that read the sequence sees every later write above it (Seq).
+	if _, err := tx.ExecContext(ctx, bumpSeq); err != nil {
+		return 0, err
+	}
 	var seq int64
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) + 1 FROM events`).Scan(&seq); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT n FROM event_seq WHERE id = 1`).Scan(&seq); err != nil {
 		return 0, err
 	}
 	putStmt, err := tx.PrepareContext(ctx, `INSERT INTO events (id, source, source_key, ts, session, agent, harness, model,
@@ -665,10 +682,11 @@ func put(ctx context.Context, tx querier, evs []Event) (int, error) {
 }
 
 // Seq is the sequence number of the store's last write of events: every event a later write stores or rewrites has
-// a higher one.
+// a higher one. The counter never goes down, whatever rows a rebuild or a stale file's drop deletes, and a row an older
+// build writes takes a number from it too (the seq triggers).
 func (s *Store) Seq(ctx context.Context) (int64, error) {
 	var seq int64
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM events`).Scan(&seq)
+	err := s.db.QueryRowContext(ctx, `SELECT MAX(COALESCE((SELECT n FROM event_seq WHERE id = 1), 0), COALESCE((SELECT MAX(seq) FROM events), 0))`).Scan(&seq)
 	return seq, err
 }
 

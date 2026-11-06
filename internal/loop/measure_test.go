@@ -478,6 +478,26 @@ func TestTheLoopsOwnRunsCannotMakeAnUnchangedProblemImprove(t *testing.T) {
 	if got := w.measure(t, Options{}); got.Status != "held" || !strings.Contains(got.Why, "not in use") {
 		t.Fatalf("a watch only the loop's own runs touched: %+v", got)
 	}
+
+	// Nor does a run of the loop's that fails more than a week from the history's incidents add one (the history is
+	// counted again through the change's effect, ten days after its plan), or one that fails after a guarded close bring
+	// the case back.
+	h := guarded(t, 10*aDay, toolSignal.Source, nil)
+	loopRun := toolResult("loop-history", h.planAt.Add(6*aDay), "loop-history", true)
+	loopRun.Cwd = filepath.Join(h.r.Dir, "runs", "history")
+	put(t, h.st, []store.Event{loopRun})
+	closeGuarded(t, h)
+	if p, _, _ := h.r.Ship.Load(h.c.ID); p.Plan == nil || p.Plan.Guard == nil || p.Plan.Guard.Incidents != 4 || h.theCase(t).Measurement.Before != 4 {
+		t.Fatalf("a loop run's failure in a guard's history: %+v", p.Plan)
+	}
+	closed := h.theCase(t).Closed
+	loopRun = toolResult("loop-after", closed.Add(time.Hour), "loop-after", true)
+	loopRun.Cwd = filepath.Join(h.r.Dir, "work", "case")
+	put(t, h.st, []store.Event{loopRun})
+	h.clock = closed.Add(2 * time.Hour)
+	if ms, err := h.r.Measure(ctx, Options{}); err != nil || len(ms) != 0 || h.theCase(t).Reason != guardedReason {
+		t.Fatalf("a loop run's failure after a guarded close: %+v %v", ms, err)
+	}
 }
 
 // An installed file built after landing but before the checkout took the change still holds the old code. The

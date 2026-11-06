@@ -201,7 +201,7 @@ func Case(stdout io.Writer, c store.Case, evs []store.Evidence, log []store.Case
 	if !c.Deployed.IsZero() {
 		field("deployed", c.Deployed.Local().Format("2006-01-02 15:04")+" "+c.Package)
 	}
-	if m := c.Measurement; m.Guarded() {
+	if m := c.Measurement; m.Guarded() && (c.Status == store.CaseDeployed || c.Status == store.CaseMeasuring || c.Reason == store.Guarded) {
 		// a guard measures no rate: it watches for a problem that had stopped to come back
 		text := fmt.Sprintf("watching %dd for a recurrence, after %d incidents in %d units of exposure before the change; a problem that stopped by itself shows the same",
 			int(m.Window.Hours()/24), m.Before, m.Exposure)

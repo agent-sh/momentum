@@ -193,9 +193,10 @@ func recurrences(ctx context.Context, st *store.Store, plan Plan, since, until t
 }
 
 // recurrencesWritten is recurrences of the events whose last write came after the store's write sequence after and at
-// or before through (store.Seq; either 0 for no bound).
+// or before through (store.Seq; either 0 for no bound). A zero until bounds no date: a watch's recurrence is any event
+// of its signal from its start on, however it is dated.
 func recurrencesWritten(ctx context.Context, st *store.Store, plan Plan, since, until time.Time, dir string, after, through int64) ([]store.Event, error) {
-	if !until.After(since) {
+	if !until.IsZero() && !until.After(since) {
 		return nil, nil
 	}
 	q, err := activityQuery(plan.Signal, plan.Units, since, until, dir)
@@ -339,7 +340,9 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 	if err != nil {
 		return failed(err)
 	}
-	if back, err := recurrences(ctx, r.Store, plan, from, now.Add(time.Minute), r.Dir); err != nil {
+	// no date bounds it: an event stored by now and dated past the pass's clock is one too, and the next pass reads
+	// what is stored after the sequence
+	if back, err := recurrences(ctx, r.Store, plan, from, time.Time{}, r.Dir); err != nil {
 		return failed(err)
 	} else if len(back) > 0 {
 		return r.guardRegressed(ctx, c, p, plan, m, back, from, now, dry)
@@ -456,12 +459,7 @@ func (r *Runner) guardBack(ctx context.Context, c store.Case, p *Package, plan P
 	if seq <= p.GuardSeq {
 		return Measured{}, false
 	}
-	from := guardStart(c, p)
-	until := now
-	if wall := time.Now(); wall.After(until) {
-		until = wall
-	}
-	back, err := recurrencesWritten(ctx, r.Store, plan, from, until.Add(time.Minute), r.Dir, p.GuardSeq, seq)
+	back, err := recurrencesWritten(ctx, r.Store, plan, guardStart(c, p), time.Time{}, r.Dir, p.GuardSeq, seq)
 	if err != nil {
 		return failed(err)
 	}

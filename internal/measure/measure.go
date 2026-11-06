@@ -57,6 +57,10 @@ type Result struct {
 	Guarded bool    `json:"guarded,omitempty"`
 	Recur   float64 `json:"recur,omitempty"`
 	NoRate  bool    `json:"no_rate,omitempty"`
+	// Exposure and Watched are a guard's: the units of exposure its history's incidents came in, and those its watch
+	// saw.
+	Exposure int `json:"exposure,omitempty"`
+	Watched  int `json:"watched,omitempty"`
 }
 
 // Compare decides whether the share fell from before to after. With no activity in either window there is nothing
@@ -180,7 +184,8 @@ func GuardCount(incidents []Incident, units []int64, since time.Time, gap time.D
 // recurrence its effect says it was guarded, with the exposure watched and P (Recur), had the problem kept happening,
 // or that there is no rate to compare, and that a problem that stopped by itself shows the same.
 func Guarded(incidents, exposure, recurrences, watched int, units string) Result {
-	r := Result{Before: Counts{Hits: incidents, Base: exposure}, After: Counts{Hits: recurrences, Base: watched}, Guarded: true}
+	r := Result{Before: Counts{Hits: incidents, Base: exposure}, After: Counts{Hits: recurrences, Base: watched}, Guarded: true, Exposure: exposure,
+		Watched: watched}
 	if recurrences > 0 {
 		r.Effect = fmt.Sprintf("guarded: its problem came back after the change (%d of %d %s watched); %d incidents in %d %s before it",
 			recurrences, watched, units, incidents, exposure, units)

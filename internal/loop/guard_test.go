@@ -445,6 +445,7 @@ func TestAGuardedWatchClosesAsGuardedNeverImproved(t *testing.T) {
 	got = m.measure(t, Options{})
 	recur := 1 - math.Pow(684.0/809, 4.5)
 	if got.Status != "guarded" || got.Result == nil || got.Result.Improved || got.Result.P != 0 || !jsonHas(t, got.Result, fmt.Sprintf(`"recur":%v`, recur)) ||
+		!jsonHas(t, got.Result, `"exposure":684`) || !jsonHas(t, got.Result, `"watched":125`) ||
 		!strings.Contains(got.Result.Effect, "no recurrence in 125 session hours watched") || !strings.Contains(got.Result.Effect, fmt.Sprintf("P=%.2f%%", 100*recur)) {
 		t.Fatalf("the watch ended: %+v %+v", got, got.Result)
 	}
@@ -769,5 +770,113 @@ func TestAGuardedChangeIsProposedLandedAndRolledBackOnARecurrence(t *testing.T) 
 	}
 	if body := run(t, f.dir, "git", "--git-dir", f.origin, "show", "main:fake.go"); !strings.Contains(body, "return 41") {
 		t.Fatal("origin did not roll back")
+	}
+}
+
+// backWithin runs passes of the measure step at the clocks given and says whether one of them brought the guarded
+// case back or found its problem back during the watch, and the case after them.
+func backWithin(t *testing.T, m *measured, clocks ...time.Time) (bool, store.Case) {
+	t.Helper()
+	found := false
+	for _, at := range clocks {
+		m.clock = at
+		ms, err := m.r.Measure(context.Background(), Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, x := range ms {
+			found = found || x.Status == "back" || strings.Contains(x.Why, "regressed")
+		}
+	}
+	return found, m.theCase(t)
+}
+
+// The write sequence a guarded close reads by never goes down: a forced rebuild of the signal's source after a pass
+// deletes the rows that held the highest, and a recurrence written then is still read.
+func TestARebuildDoesNotHideARecurrenceAfterAGuardedClose(t *testing.T) {
+	ctx := context.Background()
+	m := guarded(t, time.Hour, toolSignal.Source, nil)
+	closeGuarded(t, m)
+	closed := m.theCase(t).Closed
+	if back, _ := backWithin(t, m, closed.Add(time.Hour)); back {
+		t.Fatal("a quiet pass brought the case back")
+	}
+	if _, err := m.st.Rebuild(ctx, toolSignal.Source, true); err != nil {
+		t.Fatal(err)
+	}
+	put(t, m.st, []store.Event{toolResult("back", closed.Add(time.Hour), "back", true)})
+	if back, c := backWithin(t, m, closed.Add(2*time.Hour)); !back || c.Status != store.CaseOpen {
+		t.Fatalf("a recurrence written after a rebuild: %+v", c)
+	}
+}
+
+// A recurrence a build from before the write sequence writes, with none of its own, is still read after a guarded
+// close.
+func TestARecurrenceAnOlderBuildWroteBringsAGuardedCaseBack(t *testing.T) {
+	m := guarded(t, time.Hour, toolSignal.Source, nil)
+	closeGuarded(t, m)
+	closed := m.theCase(t).Closed
+	if back, _ := backWithin(t, m, closed.Add(time.Hour)); back {
+		t.Fatal("a quiet pass brought the case back")
+	}
+	db, err := sql.Open("sqlite", m.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	e := toolResult("old-build", closed.Add(90*time.Minute), "old-build", true)
+	if _, err := db.Exec(`INSERT INTO events (id, source, source_key, ts, session, agent, harness, model, cwd, actor, kind, tool, summary, meta, ref, heuristic, experiment, ingested)
+	  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, e.ID(), e.Source, e.SourceKey, e.TS.UnixMilli(), e.Session, "", e.Harness, "", "", string(e.Actor), e.Kind, e.Tool,
+		e.Summary, e.Meta, "", 0, "", time.Now().UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	put(t, m.st, []store.Event{toolResult("ok-after", closed.Add(100*time.Minute), "ok-after", false)})
+	if back, c := backWithin(t, m, closed.Add(2*time.Hour)); !back || c.Status != store.CaseOpen {
+		t.Fatalf("a recurrence an older build wrote: %+v", c)
+	}
+}
+
+// No date bounds a recurrence: one dated ahead of the pass that reads it after a guarded close, and one stored before
+// the closing pass but dated past its clock, each bring the case back.
+func TestARecurrenceIsReadHoweverItIsDated(t *testing.T) {
+	t.Run("ahead of the pass after the close", func(t *testing.T) {
+		m := guarded(t, time.Hour, toolSignal.Source, nil)
+		closeGuarded(t, m)
+		closed := m.theCase(t).Closed
+		put(t, m.st, []store.Event{toolResult("ahead", time.Now().Add(3*time.Hour), "ahead", true)})
+		if back, c := backWithin(t, m, closed.Add(time.Hour), time.Now().Add(4*time.Hour)); !back || c.Status != store.CaseOpen {
+			t.Fatalf("a recurrence dated ahead of its pass: %+v", c)
+		}
+	})
+	t.Run("past the closing pass's clock", func(t *testing.T) {
+		m := guarded(t, time.Hour, toolSignal.Source, nil)
+		m.measure(t, Options{})
+		weekly(t, m.st, toolSignal.Source, "w", m.clock)
+		closing := m.clock.Add(30*aDay + time.Hour)
+		put(t, m.st, []store.Event{toolResult("late-dated", closing.Add(2*time.Minute), "late-dated", true)})
+		if back, c := backWithin(t, m, closing, closing.Add(time.Hour)); !back || c.Reason == guardedReason && c.Status == store.CaseClosed {
+			t.Fatalf("a recurrence dated past the closing pass: %+v", c)
+		}
+	})
+}
+
+// A guarded case that comes back on new evidence names the reason it closed with, and shows no watch of its last
+// episode as a measurement.
+func TestAGuardedComebackShowsNoOldWatch(t *testing.T) {
+	ctx := context.Background()
+	m := guarded(t, time.Hour, toolSignal.Source, nil)
+	closeGuarded(t, m)
+	c := m.theCase(t)
+	later := toolResult("evidence", c.Closed.Add(time.Minute), "evidence", true)
+	put(t, m.st, []store.Event{later})
+	f := store.Finding{Family: c.Family, Signature: c.Signatures[0], Title: c.Title, Evidence: []store.Evidence{{Ref: "ev:" + later.ID()}}}
+	if _, _, err := m.st.ObserveCase(ctx, f, "test"); err != nil {
+		t.Fatal(err)
+	}
+	c = m.theCase(t)
+	l := lastLog(t, m.st, c.ID)
+	if s := shown(t, c); strings.Contains(l.Detail, "already solved") || !strings.Contains(l.Detail, "since it closed as guarded") || strings.Contains(s, "measured:") ||
+		strings.Contains(s, "guarded:") {
+		t.Fatalf("a guarded comeback: %s: %s\n%s", l.Action, l.Detail, s)
 	}
 }

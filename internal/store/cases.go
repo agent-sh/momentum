@@ -425,7 +425,7 @@ func comesBack(ctx context.Context, q querier, c Case, now time.Time) (bool, str
 		err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM case_evidence WHERE case_id = ? AND at > ?`, c.ID, from.UnixMilli()).Scan(&n)
 		return n, err
 	}
-	from, since := c.Closed, "it closed as already solved"
+	from, since := c.Closed, "it closed as "+strings.ReplaceAll(string(c.Reason), "-", " ")
 	if c.Reason == Solved {
 		_, at, named, err := fixedOf(ctx, q, c)
 		if err != nil {
@@ -1560,8 +1560,8 @@ func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, 
 	if c.Status != CaseDeployed && c.Status != CaseMeasuring {
 		return Case{}, badCase("case %s is %s: only a deployed or measuring case rolls back", c.ID, c.Status)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, deployed = 0, window_ms = 0, before_n = 0, after_n = 0,
-	  effect = '', `+clearGuard+`, updated = ? WHERE id = ?`, CaseTesting, time.Now().UnixMilli(), c.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, deployed = 0, `+clearGuard+`, updated = ? WHERE id = ?`,
+		CaseTesting, time.Now().UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
 	if err := caseLogCleaned(ctx, tx, c.ID, actor, "rolled back", why, time.Now()); err != nil {
@@ -1691,9 +1691,9 @@ func (s *Store) CloseMeasured(ctx context.Context, id string, after int, effect,
 	return c, tx.Commit()
 }
 
-// clearGuard empties a case's guard columns: a case that comes back, by regression, reopening, a close by hand or a
-// rollback, keeps no guard of its last episode.
-const clearGuard = `guard_exposure = 0, guard_watched = 0, guard_recur = 0`
+// clearGuard empties a case's guard and measurement columns: a case that comes back, by regression, reopening, a close
+// by hand or a rollback, keeps no watch or measurement of its last episode to show as its own.
+const clearGuard = `guard_exposure = 0, guard_watched = 0, guard_recur = 0, window_ms = 0, before_n = 0, after_n = 0, effect = ''`
 
 // CloseGuarded is the measure tool's: a measuring case whose guard's watch ended in use with no recurrence closes as
 // guarded, never as improved, with its history's incidents and exposure as counted when its change first took
