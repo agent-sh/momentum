@@ -13,14 +13,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
 // A path that a systemd unit (enabled, loaded in any state, or started by an enabled timer, path or socket), a
-// crontab line or an enabled Hermes job names is never deleted: the job would fail the next time it runs. Nor is
-// what an installed command's symlink points into. A unit names what its files say (its fragment and drop-ins)
+// crontab line, an enabled Hermes job or an MCP server a harness starts names is never deleted: the job would fail
+// the next time it runs. Nor is what an installed command's symlink points into. An MCP server names what its
+// configuration says (its command, arguments, working directory and environment) and, one level deep, what the
+// script it runs says: a server that starts a short-lived program for each call is never seen by the sampler. A unit names what its files say (its fragment and drop-ins)
 // and what systemd expands from them (its commands, environment and working directory), and what it hands its
 // program, one level deep: its EnvironmentFiles, and a script its commands run. A word relative to a unit's
 // working directory, or to a `cd` before it on a crontab line, names the path it resolves to. A file of the user's
@@ -68,7 +71,8 @@ type Jobs interface {
 	Crontab(ctx context.Context) (string, error)
 }
 
-// LoadNamed gathers the names from the jobs, from Hermes's enabled jobs and from the links directories. A source or
+// LoadNamed gathers the names from the jobs, from Hermes's enabled jobs, from the links directories and from the
+// harnesses' MCP server configurations. A source or
 // a file that cannot be read is an error, and the names it would have given are missing: the caller deletes
 // nothing.
 func LoadNamed(ctx context.Context, jobs Jobs, cfg NamesConfig, m *Mounts) (*Named, error) {
@@ -174,6 +178,16 @@ func LoadNamed(ctx context.Context, jobs Jobs, cfg NamesConfig, m *Mounts) (*Nam
 		}
 		for _, j := range texts {
 			addText("hermes job "+j.Name, j.Text, j.Dir, false) // its script is in its text; its prompt's words only name
+		}
+	}
+	for _, f := range cfg.MCP {
+		servers, err := mcpServers(f)
+		if err != nil {
+			errs = append(errs, "mcp "+f+": "+err.Error())
+		}
+		for _, s := range servers {
+			// a server is a job a harness starts: its command, and the script it runs, one level deep
+			addText("mcp "+s.Name, s.Text, s.Dir, true)
 		}
 	}
 	if len(errs) > 0 {
@@ -299,6 +313,185 @@ func hermesJobs(path, scripts string) ([]JobText, error) {
 		return out, fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
 	return out, nil
+}
+
+// mcpServers is the text of each MCP server a harness's configuration file starts: its command, arguments, working
+// directory and environment, each string on a line of its own, quoted, so a path keeps its spaces. A JSON file holds
+// mcpServers at its top and in each of its projects (Claude Code's ~/.claude.json), and each project's .mcp.json
+// holds more; a TOML file holds [mcp_servers.NAME] tables (Codex); a YAML file an mcp_servers map (Hermes). A
+// missing file is no servers.
+func mcpServers(path string) ([]JobText, error) {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".toml":
+		return mcpSections(string(b), tomlServer), nil
+	case ".yaml", ".yml":
+		return mcpSections(string(b), yamlServer()), nil
+	}
+	var f struct {
+		Servers  map[string]any `json:"mcpServers"`
+		Projects map[string]struct {
+			Servers map[string]any `json:"mcpServers"`
+		} `json:"projects"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil {
+		return nil, err
+	}
+	out := jsonServers(f.Servers, "")
+	var errs []string
+	projects := make([]string, 0, len(f.Projects))
+	for p := range f.Projects {
+		projects = append(projects, p)
+	}
+	sort.Strings(projects)
+	for _, p := range projects {
+		out = append(out, jsonServers(f.Projects[p].Servers, p)...)
+		if !filepath.IsAbs(p) || filepath.Clean(p) == filepath.Clean(filepath.Dir(path)) {
+			continue
+		}
+		more, err := mcpServers(filepath.Join(p, ".mcp.json"))
+		if err != nil && !errors.Is(err, syscall.ENOTDIR) {
+			errs = append(errs, p+"/.mcp.json: "+err.Error())
+		}
+		for _, s := range more {
+			if s.Dir == "" {
+				s.Dir = p
+			}
+			out = append(out, s)
+		}
+	}
+	if len(errs) > 0 {
+		return out, fmt.Errorf("%s", strings.Join(errs[:min(len(errs), 5)], "; "))
+	}
+	return out, nil
+}
+
+// jsonServers is the text of each server of a JSON mcpServers object; a server runs in its cwd, else in dir.
+func jsonServers(servers map[string]any, dir string) []JobText {
+	names := make([]string, 0, len(servers))
+	for k := range servers {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	var out []JobText
+	for _, name := range names {
+		var text strings.Builder
+		var strs func(v any)
+		strs = func(v any) {
+			switch x := v.(type) {
+			case string:
+				text.WriteString(strconv.Quote(x) + "\n")
+			case []any:
+				for _, e := range x {
+					strs(e)
+				}
+			case map[string]any:
+				for _, e := range x {
+					strs(e)
+				}
+			}
+		}
+		strs(servers[name])
+		d := dir
+		if m, ok := servers[name].(map[string]any); ok {
+			if c, ok := m["cwd"].(string); ok && filepath.IsAbs(expandHome(c)) {
+				d = expandHome(c)
+			}
+		}
+		out = append(out, JobText{Name: name, Text: text.String(), Dir: d})
+	}
+	return out
+}
+
+// mcpSections splits a configuration file's text into its MCP servers' texts: server says, for each line, the
+// server it begins (a name), whether it is the server's (in), or whether it ends the servers' part (out).
+func mcpSections(text string, server func(line string) (name string, in bool)) []JobText {
+	var out []JobText
+	at := map[string]int{}
+	cur := ""
+	for _, l := range strings.Split(text, "\n") {
+		name, in := server(l)
+		switch {
+		case name != "":
+			cur = name
+			if _, ok := at[cur]; !ok {
+				at[cur] = len(out)
+				out = append(out, JobText{Name: cur})
+			}
+		case !in:
+			cur = ""
+		}
+		if cur == "" {
+			continue
+		}
+		j := &out[at[cur]]
+		j.Text += l + "\n"
+		for _, sep := range []string{"=", ":"} {
+			if k, v, ok := strings.Cut(strings.TrimSpace(l), sep); ok && strings.TrimSpace(k) == "cwd" {
+				if d := expandHome(strings.Trim(strings.TrimSpace(v), `"'`)); filepath.IsAbs(d) {
+					j.Dir = d
+				}
+			}
+		}
+	}
+	return out
+}
+
+// tomlServer reads a TOML line: a table header [mcp_servers.NAME] or [mcp_servers.NAME.sub] begins or continues
+// NAME, any other header ends it, and every other line is the current table's.
+func tomlServer(l string) (string, bool) {
+	t := strings.TrimSpace(l)
+	if !strings.HasPrefix(t, "[") {
+		return "", true
+	}
+	h := strings.TrimSpace(strings.Trim(t, "[] "))
+	rest, ok := strings.CutPrefix(h, "mcp_servers.")
+	if !ok {
+		return "", false
+	}
+	if strings.HasPrefix(rest, `"`) {
+		if name, _, ok := strings.Cut(rest[1:], `"`); ok {
+			return name, true
+		}
+	}
+	name, _, _ := strings.Cut(rest, ".")
+	return strings.TrimSpace(name), true
+}
+
+// yamlServer reads a YAML file's lines: the keys of the top-level mcp_servers map begin its servers, the lines
+// indented under one are that server's, and the next top-level key ends them.
+func yamlServer() func(string) (string, bool) {
+	inMap, indent := false, -1
+	return func(l string) (string, bool) {
+		t := strings.TrimSpace(l)
+		if t == "" || strings.HasPrefix(t, "#") {
+			return "", true
+		}
+		lead := len(l) - len(strings.TrimLeft(l, " \t"))
+		if lead == 0 {
+			inMap = strings.HasPrefix(t, "mcp_servers:")
+			indent = -1
+			return "", false
+		}
+		if !inMap {
+			return "", false
+		}
+		if indent < 0 {
+			indent = lead
+		}
+		if lead == indent {
+			if k, _, ok := strings.Cut(t, ":"); ok {
+				return strings.Trim(strings.TrimSpace(k), `"'`), true
+			}
+		}
+		return "", true
+	}
 }
 
 // SystemJobs reads the machine's jobs with systemctl and crontab.
