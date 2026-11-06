@@ -30,6 +30,14 @@ func TestReplayOutputsCountEveryLabelledStepAtAStop(t *testing.T) {
 	if !strings.Contains(out.String(), ": 1 of 1 (100%)") {
 		t.Fatalf("the nudge after a labelled restart is not counted: %q", out.String())
 	}
+	// an exited stop: the process was gone, so the owner's input that reopens it is no redundant nudge
+	exited := []supervise.Result{{Point: supervise.Point{Session: "x", Stop: supervise.Stop{Exited: true, Loop: "*/10 * * * *"},
+		Next: supervise.Next{At: labels[1].At, Kind: "owner"}}, Label: &labels[1], StepAt: labels[1].At}}
+	out.Reset()
+	printRedundant(&out, append(exited, rs...))
+	if !strings.Contains(out.String(), ": 1 of 1 (100%)") {
+		t.Fatalf("a nudge on an exited stop counted: %q", out.String())
+	}
 	out.Reset()
 	printReplay(&out, rs, labels, at.Add(-time.Hour), at.Add(time.Hour))
 	if !strings.Contains(out.String(), "nudge steps: 1 (0 not in the store)") || !strings.Contains(out.String(), "restart steps: 2 (0 not in the store)") {

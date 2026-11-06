@@ -107,8 +107,8 @@ func (d Sessions) nudged(ctx context.Context, st *store.Store, w Window) ([]occu
 	var occ []occurrence
 	for _, res := range supervise.Replay(points, nil, supervise.DefaultParams, probe, w.Until) {
 		next := res.Point.Next
-		if next.Kind != "owner" || !supervise.Nudge(next.Text) || res.Fired {
-			continue
+		if next.Kind != "owner" || !supervise.Nudge(next.Text) || res.Fired || res.Point.Stop.Exited {
+			continue // an exited stop is one no rule can continue: the owner's input reopens it
 		}
 		why := supervise.Why(res)
 		turn, err := st.Before(ctx, res.Point.Session, []string{"owner_text"}, next.At.Add(-time.Second), next.At.Add(time.Second), 1)

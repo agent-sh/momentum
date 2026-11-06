@@ -233,6 +233,9 @@ func printRedundant(out io.Writer, rs []supervise.Result) {
 			continue
 		}
 		s := r.Point.Stop
+		if s.Exited {
+			continue // the process was gone: nothing would have gone on by itself, and no rule acts there
+		}
 		redundant := s.RequestAt.IsZero() && (s.Busy || s.Tasks > 0 || !s.WakeAt.IsZero() || s.Loop != "")
 		for _, l := range append([]*supervise.Label{r.Label}, r.Also...) { // every nudge at the stop, a later one too
 			if l.Kind != "nudge" {

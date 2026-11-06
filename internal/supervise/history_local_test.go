@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/store"
+	"github.com/agent-sh/momentum/sessions"
 )
 
 const owedReply = "working: the model owed its reply"
@@ -510,5 +511,24 @@ func TestRulesCountFromAReopeningCommand(t *testing.T) {
 		if !r.Point.Stop.WakeDue.After(model) {
 			t.Fatalf("a run due while the process was gone read as missed: due %v, reopened %v", r.Point.Stop.WakeDue, model)
 		}
+	}
+}
+
+// Nothing runs while the process is gone: the stop an /exit ends has no schedule, so the owner's input that reopens
+// it is no nudge to a session that would have gone on by itself.
+func TestAnExitedStopHasNoSchedule(t *testing.T) {
+	inUTCHere(t)
+	st := testStore(t)
+	j := newTimeline(t, "gone").owner(0, "check the deploy every 10 minutes", "turn_duration").
+		call(time.Second, "CronCreate", "tc1", `{"cron":"*/10 * * * *","prompt":"check the deploy","durable":true}`).
+		result(time.Second, "CronCreate", "tc1", "Scheduled recurring job j1 (Every 10 minutes). Next run: 10:10. Persisted to .claude/scheduled_tasks.json.").
+		say(time.Second, "Checking.")
+	j.localCommand(time.Minute, "exit", "").owner(40*time.Minute, "continue", "")
+	next := j.at
+	j.put(st)
+	r := replayed(t, st, "gone", next)
+	s := r.Point.Stop
+	if !s.Exited || s.Loop != "" || len(s.Runs) != 0 || phaseOf(s) == sessions.Scheduled {
+		t.Fatalf("the exited stop: exited %v, loop %q, %d runs, phase %v", s.Exited, s.Loop, len(s.Runs), phaseOf(s))
 	}
 }

@@ -998,3 +998,25 @@ func TestTheSweepTakesOnlyTheFamiliesItLookedAt(t *testing.T) {
 		t.Fatalf("a week's look: %v %v", swept, err)
 	}
 }
+
+// An /exit ends its session's stop: the owner's input that reopens it is no nudge a rule could have spared him.
+func TestANudgeThatReopensAnExitedSessionIsNoFinding(t *testing.T) {
+	st := testStore(t)
+	for si, s := range []string{"e1", "e2", "e3"} {
+		at := t0.Add(time.Duration(si) * 10 * time.Minute)
+		put(t, st, ownerTurn(s, "build the release", at), agentSays(s, "The release is built. Do you want me to publish it now?", at.Add(time.Minute)),
+			ev(store.Transcripts, s, "harness_text", store.ActorHarness, "", "<command-name>/exit</command-name> <command-message>exit</command-message> <command-args></command-args>",
+				`{"input_kind":"slash","why":"local command"}`, at.Add(2*time.Minute)),
+			ev(store.Transcripts, s, "harness_text", store.ActorHarness, "", "<local-command-stdout>Bye!</local-command-stdout>", `{"input_kind":"typed","why":"harness text"}`, at.Add(2*time.Minute)),
+			ownerTurn(s, "continue", at.Add(2*time.Hour)))
+	}
+	fs, err := Sessions{}.Detect(context.Background(), st, week())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range signatures(fs) {
+		if strings.Contains(s, "nudged") {
+			t.Fatalf("a reopening after /exit read as a nudge: %v", signatures(fs))
+		}
+	}
+}

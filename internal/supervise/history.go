@@ -453,17 +453,19 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		if !wake.at.IsZero() && wake.at.After(prevAt.Add(-sessions.WakeGrace)) {
 			s.WakeAt = wake.at
 		}
-		for _, c := range crons {
-			s.Loop = c.expr
-		}
 		s.TurnBegan, s.IdleAt, s.Exited = turnBegan, prevAt, prevRole == "exit"
-		// Its own runs its harness should start, as the session layer lists them, a reopening for a restart.
-		if !wake.at.IsZero() && wake.seen {
-			s.Runs = append(s.Runs, claude.WakeRun(wake.at, wake.set, wake.what, wake.sign, time.Time{}))
-		}
-		for id, c := range crons {
-			if c.seen {
-				s.Runs = append(s.Runs, claude.JobRuns(id, c.expr, c.oneShot, c.what, c.at, c.fired, restarted, at)...)
+		if !s.Exited { // nothing runs while the process is gone: an exited stop has no schedule
+			for _, c := range crons {
+				s.Loop = c.expr
+			}
+			// Its own runs its harness should start, as the session layer lists them, a reopening for a restart.
+			if !wake.at.IsZero() && wake.seen {
+				s.Runs = append(s.Runs, claude.WakeRun(wake.at, wake.set, wake.what, wake.sign, time.Time{}))
+			}
+			for id, c := range crons {
+				if c.seen {
+					s.Runs = append(s.Runs, claude.JobRuns(id, c.expr, c.oneShot, c.what, c.at, c.fired, restarted, at)...)
+				}
 			}
 		}
 		claude.SortRuns(s.Runs)
