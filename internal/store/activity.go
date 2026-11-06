@@ -40,6 +40,7 @@ type ActivityQuery struct {
 	Harness      string   // when set, only that harness's events
 	Actor        Actor    // when set, only the hours in which it did something (the owner's turns, say)
 	Tool         string   // when set, only the hours in which that tool was called or answered: a guard's exposure
+	Cwd          string   // when set, only the hours of events in this directory or below it: a guard's exposure
 }
 
 // Activity returns the units of activity over a span: the hours in which the sessions picked (an event of a
@@ -77,6 +78,10 @@ func activityWhere(q ActivityQuery) ([]string, []any, string) {
 	}
 	if q.Tool != "" {
 		where, args = append(where, "tool = ?"), append(args, q.Tool)
+	}
+	if q.Cwd != "" {
+		dir := filepath.Clean(q.Cwd)
+		where, args = append(where, "(cwd = ? OR instr(cwd, ?) = 1)"), append(args, dir, strings.TrimRight(dir, "/")+"/")
 	}
 	if q.Sources != nil {
 		marks := make([]string, len(q.Sources))

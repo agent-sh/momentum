@@ -86,7 +86,8 @@ func (s *Ship) deploymentReceipt(ctx context.Context, p Package) error {
 	if p.Plan != nil {
 		window = " Measured over the " + days(p.Plan.Window) + " after it is in effect."
 		if p.Plan.Guard != nil {
-			window = " Guarded, not measured: watched for a recurrence over at least the " + days(p.Plan.Guard.Watch) + " after it is in effect; one fails it."
+			window = fmt.Sprintf(" Guarded, not measured: watched for a recurrence until %d %s of exposure after it is in effect, about %s; one fails it.",
+				p.Plan.Guard.Need, p.Plan.Units, days(p.Plan.Guard.Watch))
 		}
 	}
 	if len(p.Hand) > 0 {
@@ -178,10 +179,11 @@ func harnessFor(sig Signal, units string) string {
 // over the window before, and a signal that counts the case's own problem: the case holds events, and at least half
 // of those in that window are among what it counts. A file the change is installed in must be one there is.
 // A plan that cannot be counted yet comes back with a *waitingPlan: the store has not read the span whole, or the
-// signal's source stopped. A plan refused as too new (its signal's source began inside the span), too rare (fewer
-// than MinSignal units in the gate, or a baseline no drop could pass) or with no recent event (no evidence of the case
-// in the gated window) comes back as a guard when one can stand in for it (guardPlan), and refused with both reasons
-// when none can.
+// signal's source stopped. A plan refused as too new (its signal's source began inside the span) or too rare (fewer
+// than MinSignal units in the gate, or a baseline no drop could pass) comes back as a guard when one can stand in for
+// it (guardPlan), and refused with both reasons when none can. A signal that counts less than half of the case's
+// evidence in the gate is refused before any guard is tried, and so is a gate that holds the problem and none of the
+// case's evidence.
 func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window time.Duration, installed string, at time.Time) (Plan, error) {
 	switch {
 	case sig.Source == "" || len(sig.Kinds) == 0 || len(sig.Match) == 0:
@@ -346,23 +348,9 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 			return found, slices.Compact(left), nil
 		})
 	}
-	if tooNew != nil {
-		return guard(tooNew)
-	}
-	before, err := tallySources(ctx, s.Store, sig, plan.Units, got, at.Add(-window), at, s.Dir, sources)
-	if err != nil {
-		return Plan{}, err
-	}
-	if unread, err := unreadWindow(ctx, s.Store, plan, at.Add(-(measure.BaselineWindows+1)*window), at, s.Dir); err != nil {
-		return Plan{}, err
-	} else if len(unread) > 0 {
-		return plan, &waitingPlan{sources: unread}
-	}
-	plan.Gate, plan.GateBase = before.Hits, before.Base
-	if before.Hits < MinSignal {
-		return guard(refused("the signal counts events in %d %s of the %s before, fewer than %d: no window could show an effect", before.Hits,
-			plan.Units, days(window), MinSignal))
-	}
+	// The case's evidence in the gate, and how much of it the signal counts. Where the case has evidence there, a signal
+	// that counts less than half of it does not measure the case's problem as it is now (its form may have changed):
+	// that refuses a measured plan and a guard alike, so it is checked before any guard stands in.
 	evs, err := s.Store.CaseEvidence(ctx, c.ID, 0)
 	if err != nil {
 		return Plan{}, err
@@ -385,13 +373,47 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 			hit++
 		}
 	}
+	notIts := func(also error) error {
+		why := fmt.Sprintf("the signal counts %d of the case's %d events in the window: it does not measure the case's problem", hit, in)
+		if also == nil {
+			return refused("%s", why)
+		}
+		return refused("%s; and %s", strings.TrimPrefix(also.Error(), ErrRefused.Error()+": "), why)
+	}
+	mismatch := in > 0 && hit*2 < in
+	if tooNew != nil {
+		if mismatch {
+			return Plan{}, notIts(tooNew)
+		}
+		return guard(tooNew)
+	}
+	before, err := tallySources(ctx, s.Store, sig, plan.Units, got, at.Add(-window), at, s.Dir, sources)
+	if err != nil {
+		return Plan{}, err
+	}
+	if unread, err := unreadWindow(ctx, s.Store, plan, at.Add(-(measure.BaselineWindows+1)*window), at, s.Dir); err != nil {
+		return Plan{}, err
+	} else if len(unread) > 0 {
+		return plan, &waitingPlan{sources: unread}
+	}
+	plan.Gate, plan.GateBase = before.Hits, before.Base
+	if before.Hits < MinSignal {
+		few := refused("the signal counts events in %d %s of the %s before, fewer than %d: no window could show an effect", before.Hits,
+			plan.Units, days(window), MinSignal)
+		if mismatch {
+			return Plan{}, notIts(few)
+		}
+		return guard(few)
+	}
 	switch {
 	case events == 0:
 		return Plan{}, refused("the case holds no event of the store: its measurement has nothing of its own problem to count")
 	case in == 0:
-		return guard(refused("the case has no evidence in the window: measure over a window that holds it"))
-	case hit*2 < in:
-		return Plan{}, refused("the signal counts %d of the case's %d events in the window: it does not measure the case's problem", hit, in)
+		// the gate holds the problem in five units or more, and none of the case's evidence: the problem is active, so no
+		// guard stands in; a window that holds the evidence measures it
+		return Plan{}, refused("the case has no evidence in the window: measure over a window that holds it")
+	case mismatch:
+		return Plan{}, notIts(nil)
 	}
 	baseline, err := tallyPlan(ctx, s.Store, plan, at.Add(-(measure.BaselineWindows+1)*window), at.Add(-window), s.Dir)
 	if err != nil {

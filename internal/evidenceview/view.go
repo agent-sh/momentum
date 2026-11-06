@@ -201,7 +201,14 @@ func Case(stdout io.Writer, c store.Case, evs []store.Evidence, log []store.Case
 	if !c.Deployed.IsZero() {
 		field("deployed", c.Deployed.Local().Format("2006-01-02 15:04")+" "+c.Package)
 	}
-	if m := c.Measurement; m.Window > 0 || m.Effect != "" {
+	if m := c.Measurement; m.Guarded() {
+		// a guard measures no rate: it watched for a recurrence of a problem that had stopped
+		text := fmt.Sprintf("not measured: %d incidents in %d units of exposure before the change; %d recurrences over a watch of %s", m.Before, m.Exposure, m.After, m.Window)
+		if m.Effect != "" {
+			text += ": " + m.Effect
+		}
+		field("guarded", text)
+	} else if m.Window > 0 || m.Effect != "" {
 		field("measured", fmt.Sprintf("%d before, %d after over %s each: %s", m.Before, m.After, m.Window, m.Effect))
 	}
 	fmt.Fprintf(stdout, "  evidence: %d, newest first\n", c.Evidence)

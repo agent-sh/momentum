@@ -349,6 +349,27 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		}
 		return m
 	}
+	if c.Status == store.CaseDeployed && plan.Guard != nil {
+		// the watch starts only on a history counted through the change's effect: the problem must still have been
+		// happening then for a watch to tell the change from its own end
+		g, why, hold, err := r.guardAtEffect(ctx, &p, plan, since, dry)
+		switch {
+		case err != nil:
+			return failed(err.Error())
+		case hold:
+			m.Status, m.Why, m.Guarded = "held", why, true
+			if !dry {
+				if err := r.noteStepSkip(ctx, c, "measure", "guard", why); err != nil {
+					r.logf("guard hold note: %v", err)
+				}
+			}
+			return m
+		case why != "":
+			m.Status, m.Why, m.Guarded = "waiting", why, true
+			return m
+		}
+		plan.Guard, p.Plan.Guard = g, g
+	}
 	if c.Status == store.CaseDeployed || !p.OutOfEffect.IsZero() {
 		m.Status, m.Due = "measuring", since.Add(plan.Window)
 		if plan.Guard != nil {
@@ -358,7 +379,7 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		if !dry {
 			switch {
 			case c.Status == store.CaseDeployed && plan.Guard != nil:
-				_, err = r.Store.StartGuarding(ctx, c.ID, plan.Guard.Watch, since, guardDetail(plan), "loop:measure")
+				_, err = r.Store.StartGuarding(ctx, c.ID, plan.Guard.Watch, plan.Guard.Incidents, plan.Guard.Exposure, since, guardDetail(plan), "loop:measure")
 			case c.Status == store.CaseDeployed:
 				_, err = r.Store.StartMeasuring(ctx, c.ID, plan.Window, plan.Before, since, "loop:measure")
 			default:
@@ -915,13 +936,22 @@ func (r *Runner) countingPlan(ctx context.Context, p *Package, dry bool) (Plan, 
 		if why, err := r.readWindow(ctx, p, plan, g.Since, plan.At, dry); err != nil || why != "" {
 			return plan, why, err
 		}
-		h, err := guardHistory(ctx, r.Store, plan, g.Since, plan.At, r.Dir)
+		h, err := guardHistory(ctx, r.Store, plan, g.Since, plan.At, r.Dir, false)
 		if err != nil {
 			return plan, "", err
 		}
-		if len(h.incidents) > 0 && h.exposure > 0 {
-			g.Incidents, g.Exposure, g.Quiet, g.Need = len(h.incidents), h.exposure, h.quiet, measure.GuardNeed(len(h.incidents), h.exposure)
+		// the same rule the proposal admitted it by: a thin history or a watch past the retention no longer stands
+		need, expected, reason := measure.GuardAdmit(h, guardRetention)
+		if reason != "" {
+			why := "its guard no longer stands over its live sources: " + reason
+			if !dry {
+				r.problem(ctx, p, why, "There is no decision while its guard does not stand.")
+			}
+			return plan, why, nil
 		}
+		watch := g.Watch
+		setGuard(&g, h, need, expected)
+		g.Watch = watch // the watch already set out keeps its window
 		plan.Guard = &g
 	} else if len(omitted) > 0 {
 		if why, err := r.readWindow(ctx, p, plan, plan.At.Add(-4*plan.Window), plan.At.Add(-plan.Window), dry); err != nil || why != "" {

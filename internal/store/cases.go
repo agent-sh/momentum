@@ -147,7 +147,13 @@ type Measurement struct {
 	Window        time.Duration
 	Before, After int
 	Effect        string
+	// Exposure is a guard's, and marks one (Guarded): the units of exposure its incidents (Before) came in before the
+	// change. A guard measures no rate: its watch asks whether the problem comes back, and After counts recurrences.
+	Exposure int
 }
+
+// Guarded says the measurement is a guard's watch, not a measured drop.
+func (m Measurement) Guarded() bool { return m.Exposure > 0 }
 
 // Evidence is one reference behind a case: an event (ev:ID), a note (note:ID), a commit (git:OWNER/REPO@SHA), a
 // file (file:PATH, with @OFFSET), or an address. At is when it happened.
@@ -242,7 +248,7 @@ func newCaseID() string {
 
 const caseColumns = `id, family, title, status, reason, merged_into, mechanism, alternatives, next_test, benefit, cost_usd,
   cost_tokens, cost_ms, runs, closed_evidence, opened, updated, seen, closed, deployed, package, window_ms, before_n,
-  after_n, effect, back, episode`
+  after_n, effect, back, episode, guard_exposure`
 
 func scanCase(row interface{ Scan(...any) error }) (Case, error) {
 	var c Case
@@ -250,7 +256,7 @@ func scanCase(row interface{ Scan(...any) error }) (Case, error) {
 	var costMS, opened, updated, seen, closed, deployed, window, back int64
 	if err := row.Scan(&c.ID, &c.Family, &c.Title, &status, &reason, &c.Into, &c.Mechanism, &alts, &c.NextTest, &c.Benefit,
 		&c.Cost.USD, &c.Cost.Tokens, &costMS, &c.Cost.Runs, &c.ClosedEvidence, &opened, &updated, &seen, &closed, &deployed,
-		&c.Package, &window, &c.Measurement.Before, &c.Measurement.After, &c.Measurement.Effect, &back, &c.Episode); err != nil {
+		&c.Package, &window, &c.Measurement.Before, &c.Measurement.After, &c.Measurement.Effect, &back, &c.Episode, &c.Measurement.Exposure); err != nil {
 		return Case{}, err
 	}
 	c.Status, c.Reason = CaseStatus(status), CloseReason(reason)
@@ -1545,7 +1551,7 @@ func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, 
 		return Case{}, badCase("case %s is %s: only a deployed or measuring case rolls back", c.ID, c.Status)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, deployed = 0, window_ms = 0, before_n = 0, after_n = 0,
-	  effect = '', updated = ? WHERE id = ?`, CaseTesting, time.Now().UnixMilli(), c.ID); err != nil {
+	  effect = '', guard_exposure = 0, updated = ? WHERE id = ?`, CaseTesting, time.Now().UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
 	if err := caseLogCleaned(ctx, tx, c.ID, actor, "rolled back", why, time.Now()); err != nil {
@@ -1561,22 +1567,26 @@ func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, 
 // its measurement's window and the signal's count over the window before its change, which the window after it is
 // compared with. The window after counts from then: the case's deployed time becomes it.
 func (s *Store) StartMeasuring(ctx context.Context, id string, window time.Duration, before int, from time.Time, actor string) (Case, error) {
-	return s.startMeasuring(ctx, id, window, before, from, actor, "measuring", func() string {
+	return s.startMeasuring(ctx, id, window, before, 0, from, actor, "measuring", func() string {
 		return fmt.Sprintf("in effect from %s; %d in its baseline; the %s after it is due %s",
 			from.Format(time.DateTime), before, days(window), from.Add(window).Format(time.DateTime))
 	})
 }
 
-// StartGuarding is StartMeasuring for a change whose plan is a guard: no baseline count, since a guard compares no
-// rates; its log line says it is guarded, with what the guard watches for (detail), and when its watch is due.
-func (s *Store) StartGuarding(ctx context.Context, id string, watch time.Duration, from time.Time, detail, actor string) (Case, error) {
-	return s.startMeasuring(ctx, id, watch, 0, from, actor, "guarding", func() string {
+// StartGuarding is StartMeasuring for a change whose plan is a guard: it keeps the guard's incidents and the units of
+// exposure they came in (Measurement.Exposure marks the case guarded), and compares no rates; its log line says it is
+// guarded, with what the guard watches for (detail), and when its watch is due.
+func (s *Store) StartGuarding(ctx context.Context, id string, watch time.Duration, incidents, exposure int, from time.Time, detail, actor string) (Case, error) {
+	if exposure <= 0 {
+		return Case{}, badCase("a guard keeps the exposure its incidents came in")
+	}
+	return s.startMeasuring(ctx, id, watch, incidents, exposure, from, actor, "guarding", func() string {
 		return fmt.Sprintf("in effect from %s; guarded, not measured: %s; its watch is due %s", from.Format(time.DateTime), detail,
 			from.Add(watch).Format(time.DateTime))
 	})
 }
 
-func (s *Store) startMeasuring(ctx context.Context, id string, window time.Duration, before int, from time.Time, actor, action string, line func() string) (Case, error) {
+func (s *Store) startMeasuring(ctx context.Context, id string, window time.Duration, before, exposure int, from time.Time, actor, action string, line func() string) (Case, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Case{}, err
@@ -1595,8 +1605,8 @@ func (s *Store) startMeasuring(ctx context.Context, id string, window time.Durat
 		return Case{}, badCase("case %s's change went in %s: its measurement counts from then or later", c.ID, c.Deployed.Format(time.DateTime))
 	}
 	now := time.Now()
-	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, window_ms = ?, before_n = ?, deployed = ?, updated = ? WHERE id = ?`,
-		CaseMeasuring, window.Milliseconds(), before, from.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, window_ms = ?, before_n = ?, guard_exposure = ?, deployed = ?, updated = ? WHERE id = ?`,
+		CaseMeasuring, window.Milliseconds(), before, exposure, from.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
 	if err := caseLog(ctx, tx, c.ID, actor, action, line(), now); err != nil {

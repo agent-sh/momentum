@@ -122,6 +122,10 @@ type listedCase struct {
 		Before      int     `json:"before"`
 		After       int     `json:"after"`
 		Effect      string  `json:"effect"`
+		// Guarded marks a guard's watch, not a measured drop: before is its incidents, exposure the units they came in,
+		// after its recurrences.
+		Guarded  bool `json:"guarded,omitempty"`
+		Exposure int  `json:"exposure,omitempty"`
 	} `json:"measurement,omitempty"`
 	Signatures []string `json:"signatures"`
 }
@@ -153,7 +157,9 @@ func caseJSON(c store.Case) listedCase {
 			Before      int     `json:"before"`
 			After       int     `json:"after"`
 			Effect      string  `json:"effect"`
-		}{m.Window.Hours(), m.Before, m.After, m.Effect}
+			Guarded     bool    `json:"guarded,omitempty"`
+			Exposure    int     `json:"exposure,omitempty"`
+		}{m.Window.Hours(), m.Before, m.After, m.Effect, m.Guarded(), m.Exposure}
 	}
 	return l
 }

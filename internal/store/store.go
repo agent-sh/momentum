@@ -145,7 +145,7 @@ var keptColumns = []struct {
 	{"session_stamps", [][2]string{{"tool", "TEXT NOT NULL DEFAULT ''"}, {"name", "TEXT NOT NULL DEFAULT ''"},
 		{"cwd", "TEXT NOT NULL DEFAULT ''"}, {"auto", "INTEGER NOT NULL DEFAULT 0"}, {"ask", "TEXT NOT NULL DEFAULT ''"}, {"ask_kind", "TEXT NOT NULL DEFAULT ''"}}},
 	{"loop_runs", loopRunColumns},
-	{"cases", [][2]string{{"episode", "INTEGER NOT NULL DEFAULT 1"}}},
+	{"cases", [][2]string{{"episode", "INTEGER NOT NULL DEFAULT 1"}, {"guard_exposure", "INTEGER NOT NULL DEFAULT 0"}}},
 	{"capacity_runs", [][2]string{{"blind", "INTEGER NOT NULL DEFAULT 0"}}},
 }
 
