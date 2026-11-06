@@ -377,6 +377,28 @@ func (s *Store) ReadWindowThrough(ctx context.Context, source string, since time
 // HarnessReadWindowThrough is ReadWindowThrough for the harness a signal counts: a failure of another harness's
 // scan neither stops nor holds it.
 func (s *Store) HarnessReadWindowThrough(ctx context.Context, source, harness string, since time.Time) (time.Time, error) {
+	at, err := s.HarnessReadPast(ctx, source, harness, since)
+	if err != nil {
+		return at, err
+	}
+	// a run that read less than it should have, in or after the window: the window reads through the first of them
+	where, args := incompleteRows(source, harness)
+	var first sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT MIN(MAX(updated, ?)) FROM cursors WHERE (`+where+`) AND CAST(position AS INTEGER) >= ?`,
+		append([]any{since.UnixMilli()}, append(args, since.UnixMilli())...)...).Scan(&first); err != nil {
+		return at, err
+	}
+	if first.Valid && !at.IsZero() && time.UnixMilli(first.Int64).Before(at) {
+		at = time.UnixMilli(first.Int64)
+	}
+	return at, nil
+}
+
+// HarnessReadPast is the start of the newest read of a source's harness that read all it reads, or, for an ingest
+// source, that read in part with every failed file older than since. Unlike HarnessReadWindowThrough it does not stop
+// at an incomplete run: a watch that asks only whether the store has read past a moment, and loses nothing it waits on
+// to a stretch a failed run lost, reads by it.
+func (s *Store) HarnessReadPast(ctx context.Context, source, harness string, since time.Time) (time.Time, error) {
 	at, err := s.HarnessReadThrough(ctx, source, harness)
 	if err != nil {
 		return at, err
@@ -400,20 +422,7 @@ func (s *Store) HarnessReadWindowThrough(ctx context.Context, source, harness st
 			at = time.UnixMilli(started)
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return at, err
-	}
-	// a run that read less than it should have, in or after the window: the window reads through the first of them
-	where, args := incompleteRows(source, harness)
-	var first sql.NullInt64
-	if err := s.db.QueryRowContext(ctx, `SELECT MIN(MAX(updated, ?)) FROM cursors WHERE (`+where+`) AND CAST(position AS INTEGER) >= ?`,
-		append([]any{since.UnixMilli()}, append(args, since.UnixMilli())...)...).Scan(&first); err != nil {
-		return at, err
-	}
-	if first.Valid && !at.IsZero() && time.UnixMilli(first.Int64).Before(at) {
-		at = time.UnixMilli(first.Int64)
-	}
-	return at, nil
+	return at, rows.Err()
 }
 
 // MarkPartialRead records a listed run and the newest modification among files it failed to read.

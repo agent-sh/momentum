@@ -450,7 +450,7 @@ func closeGuarded(t *testing.T, m *measured) Measured {
 func TestAGuardedWatchClosesAsGuardedNeverImproved(t *testing.T) {
 	m := guarded(t, time.Hour, toolSignal.Source, nil)
 	got := m.pass(t, Options{})
-	if got.Status != "measuring" || !jsonHas(t, got, `"guarded":true`) || !got.Due.Equal(m.deployed.Add(30*aDay)) { // from the change's first in-effect time
+	if got.Status != "measuring" || !jsonHas(t, got, `"guarded":true`) || !got.Due.Equal(m.clock.Add(30*aDay)) { // from its sighting: no file of the change dates its checkout
 		t.Fatalf("the watch starts: %+v", got)
 	}
 	if l := lastLog(t, m.st, m.c.ID); l.Action != "guarding" || !strings.Contains(l.Detail, "guarded, not measured") ||

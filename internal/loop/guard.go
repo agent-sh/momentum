@@ -112,7 +112,7 @@ func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead e
 	if !ok {
 		return refuse("its events share no tool or directory, so absence cannot be counted only while the problem's unit was in use")
 	}
-	g.Guard = &Guard{Instead: why, Gap: measure.GuardGap, Units: units, Tool: tool, Cwd: cwd}
+	g.Guard = &Guard{Instead: why, Gap: measure.GuardGap, Units: units, Tool: tool, Cwd: cwd, Begun: since, Anchored: anchored}
 	h, err := guardHistory(ctx, s.Store, g, since, at, s.Dir, anchored)
 	if err != nil {
 		return Plan{}, err
@@ -277,10 +277,14 @@ func guardDetail(plan Plan) string {
 }
 
 // guardEffectTime is when a guard's change first took effect, as the measure step sees it in effect at seen: the
-// installed file's time when the plan names one, else the time the checkout first held the change, when that is known
-// and falls between the landing and seen; else seen.
+// installed file's time when the plan names one, else the newest time of the change's own files in the checkout
+// (CheckoutAt), when it has some and that falls between the landing and seen; else seen. A change with none of its files
+// left (it only deletes) has its checkout time at the landing, which says nothing of when the checkout took it.
 func guardEffectTime(c store.Case, p *Package, seen time.Time) time.Time {
 	at := p.CheckoutAt
+	if at.Equal(p.LandedAt) {
+		at = time.Time{}
+	}
 	if p.Plan != nil && p.Plan.Installed != "" {
 		at = p.InstalledAt
 	}
@@ -293,12 +297,33 @@ func guardEffectTime(c store.Case, p *Package, seen time.Time) time.Time {
 	return at
 }
 
+// guardBehind names the sources of a guard's plan whose newest read did not start after the end of its watch:
+// for an ingest source a complete read, or one that read in part with every failed file older than its start.
+func (r *Runner) guardBehind(ctx context.Context, plan Plan, from, end time.Time) ([]string, error) {
+	var behind []string
+	for _, source := range plan.Sources {
+		read, err := r.Store.HarnessReadPast(ctx, source, planHarness(plan), from)
+		if err != nil {
+			return nil, err
+		}
+		if !read.After(end) {
+			behind = append(behind, source)
+		}
+	}
+	return behind, nil
+}
+
 // guardRecount counts a guard's history again through its watch's start: the plan was counted at the proposal, and
-// the change may take effect much later. From the start on, an event is a recurrence, never history. The caller has
-// seen every source read past the start.
+// the change may take effect much later. From the start on, an event is a recurrence, never history. It starts where
+// the proposal's count did and drops the incident the source began with as that count did, so an event of that
+// incident stored since does not count as another. The caller has seen every source read past the start.
 func (r *Runner) guardRecount(ctx context.Context, plan Plan, from time.Time) (*Guard, error) {
 	g := *plan.Guard
-	h, err := guardHistory(ctx, r.Store, plan, g.Since, from, r.Dir, false)
+	begun, anchored := g.Since, false
+	if !g.Begun.IsZero() {
+		begun, anchored = g.Begun, g.Anchored
+	}
+	h, err := guardHistory(ctx, r.Store, plan, begun, from, r.Dir, anchored)
 	if err != nil {
 		return nil, err
 	}
@@ -368,29 +393,20 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 	} else if len(back) > 0 {
 		return r.guardRegressed(ctx, c, p, plan, m, back, from, now, dry)
 	}
-	if gap, sources, err := r.gapIn(ctx, plan, from, earlier(now, end)); err != nil {
-		return failed(err)
-	} else if !gap.IsZero() {
-		for _, source := range sources {
-			read, err := r.Store.HarnessReadThrough(ctx, source, planHarness(plan))
-			if err != nil {
-				return failed(err)
-			}
-			if !read.After(gap) {
-				m.Status, m.Why = "waiting", fmt.Sprintf("guarded: a run of %s did not read at %s, inside its watch: the watch goes on, from where it began, once it reads past it",
-					source, gap.UTC().Format(time.DateTime))
-				return m
-			}
-		}
-	}
 	if now.Before(end) {
 		m.Status, m.Why = "waiting", fmt.Sprintf("guarded: watching for a recurrence until %s", end.UTC().Format(time.DateTime))
 		return m
 	}
-	if why, err := r.readWindow(ctx, p, plan, from, end, dry); err != nil {
+	// each live source must have read past the end: its newest read, never a stretch read whole, which one failed run
+	// would make a wait for good
+	if behind, err := r.guardBehind(ctx, plan, from, end); err != nil {
 		return failed(err)
-	} else if why != "" {
-		m.Status, m.Why = "waiting", why
+	} else if len(behind) > 0 {
+		m.Status = "waiting"
+		m.Why = "guarded: its watch has ended; it closes once the store has read past its end: " + strings.Join(behind, ", ")
+		if !dry && !now.Before(end.Add(guardWeek)) {
+			r.problem(ctx, p, "the store is behind on "+strings.Join(behind, ", "), m.Why)
+		}
 		return m
 	}
 	// every source has read past the watch's end, and so past its start: its history is counted through the start

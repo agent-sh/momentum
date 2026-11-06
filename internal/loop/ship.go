@@ -188,9 +188,13 @@ type Plan struct {
 // proof. It holds the incidents of its signal in the history the plan reads and the exposure they came in, which its
 // report's P rests on, and the unit its exposure is narrowed to.
 type Guard struct {
-	Instead string        `json:"instead"` // why a measured plan could not stand
-	Since   time.Time     `json:"since"`   // the history's start: the span's, or past the incident the signal's source began with
-	Gap     time.Duration `json:"gap"`     // a longer quiet stretch between two events starts a new incident: measure.GuardGap
+	Instead string    `json:"instead"` // why a measured plan could not stand
+	Since   time.Time `json:"since"`   // the history's start: the span's, or past the incident the signal's source began with
+	// Begun is where the proposal's count began (the span's start, or the signal's source's first event), and Anchored
+	// whether it began at that first event, dropping the incident that holds it: the close counts again from there.
+	Begun    time.Time     `json:"begun,omitzero"`
+	Anchored bool          `json:"anchored,omitempty"`
+	Gap      time.Duration `json:"gap"` // a longer quiet stretch between two events starts a new incident: measure.GuardGap
 	// Units are the plan's, kept here: the plan's own are left empty in its JSON (Plan.MarshalJSON).
 	Units string `json:"units,omitempty"`
 	// Tool and Cwd narrow its exposure to the hours in which the problem's unit was in use: the signal's tool, else the

@@ -312,6 +312,16 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 	case p.Plan.At.IsZero() || p.Plan.Units == "":
 		return r.legacyPlan(ctx, c, dry)
 	}
+	if p.Plan.Guard != nil && c.Status == store.CaseMeasuring {
+		// a guard's recurrence counts from its watch's first start, from the plan the proposal recorded, before any
+		// wait for a source or for its change to be in effect: it needs only the signal
+		from := guardStart(c, &p)
+		if back, err := recurrences(ctx, r.Store, *p.Plan, from, time.Time{}, r.Dir); err != nil {
+			return failed(err.Error())
+		} else if len(back) > 0 {
+			return r.guardRegressed(ctx, c, &p, *p.Plan, m, back, from, now, dry)
+		}
+	}
 	plan, why, err := r.countingPlan(ctx, &p, dry)
 	if err != nil {
 		return failed(err.Error())
@@ -319,15 +329,6 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 	if why != "" {
 		m.Status, m.Why = "waiting", why
 		return m
-	}
-	if plan.Guard != nil && c.Status == store.CaseMeasuring {
-		// a guard's recurrence counts from its watch's first start, before any wait or restart
-		from := guardStart(c, &p)
-		if back, err := recurrences(ctx, r.Store, plan, from, time.Time{}, r.Dir); err != nil {
-			return failed(err.Error())
-		} else if len(back) > 0 {
-			return r.guardRegressed(ctx, c, &p, plan, m, back, from, now, dry)
-		}
 	}
 	since, why, err := r.Ship.InEffect(ctx, &p)
 	if err != nil {
@@ -899,9 +900,9 @@ func tallyPlan(ctx context.Context, st *store.Store, plan Plan, since, until tim
 	return tallySources(ctx, st, plan.Signal, plan.Units, evs, since, until, dir, plan.Sources)
 }
 
-// countingPlan recounts the original baseline when a recorded reader stopped. Its sources stay recorded. A guard's
-// history is recounted through its change's first in-effect time when it has one (else through the plan), and the
-// package keeps that count.
+// countingPlan recounts the original baseline when a recorded reader stopped. Its sources stay recorded. A guard has
+// no baseline to recount: its watch counts its history again, over the live sources, when it ends (guardCase), and
+// nothing here waits for a read of it.
 func (r *Runner) countingPlan(ctx context.Context, p *Package, dry bool) (Plan, string, error) {
 	plan := *p.Plan
 	if p.Result != nil {
@@ -940,34 +941,7 @@ func (r *Runner) countingPlan(ctx context.Context, p *Package, dry bool) (Plan, 
 	if !dry && strings.HasPrefix(p.Problem, "the signal's source stopped:") {
 		r.resolve(ctx, p)
 	}
-	if len(omitted) > 0 && plan.Guard != nil {
-		// a guard's history is recounted over the live sources as a baseline is, through the change's effect: its
-		// exposure, and the exposure its watch runs to
-		g := *plan.Guard
-		through := plan.At
-		if !p.GuardFrom.IsZero() {
-			through = p.GuardFrom
-		}
-		if why, err := r.readWindow(ctx, p, plan, g.Since, through, dry); err != nil || why != "" {
-			return plan, why, err
-		}
-		h, err := guardHistory(ctx, r.Store, plan, g.Since, through, r.Dir, false)
-		if err != nil {
-			return plan, "", err
-		}
-		if h.Exposure > 0 {
-			setGuard(&g, h)
-		}
-		plan.Guard = &g
-		if !dry && (g.Incidents != p.Plan.Guard.Incidents || g.Exposure != p.Plan.Guard.Exposure) {
-			// the recount stands for its report: the guard keeps what it counted
-			kept := g
-			p.Plan.Guard = &kept
-			if err := r.Ship.save(p); err != nil {
-				return plan, "", err
-			}
-		}
-	} else if len(omitted) > 0 {
+	if len(omitted) > 0 && plan.Guard == nil {
 		if why, err := r.readWindow(ctx, p, plan, plan.At.Add(-4*plan.Window), plan.At.Add(-plan.Window), dry); err != nil || why != "" {
 			return plan, why, err
 		}
