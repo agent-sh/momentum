@@ -52,6 +52,9 @@ type RepoInput struct {
 	Branch string `json:"branch,omitempty"`
 	Commit string `json:"commit,omitempty"`
 	Error  string `json:"error,omitempty"`
+	// Fallback says why a repository was read at its checkout's own default branch, not at origin's as the host
+	// fetched it: no origin, or a fetch the host refused or that failed.
+	Fallback string `json:"fallback,omitempty"`
 
 	Files  int   `json:"files,omitempty"`  // tracked files in the snapshot
 	Bytes  int64 `json:"bytes,omitempty"`  // their size after scrubbing
@@ -61,6 +64,7 @@ type RepoInput struct {
 	History HistoryManifest `json:"history"`
 
 	tracked []string // the snapshot's paths, to match a case's evidence paths against
+	objects string   // the Git directory the snapshot read (origin's mirror, or the checkout), for the case's diffs
 }
 
 // HistoryManifest says what the commit log gave a run: the commits, its size, and how many entries the scrubber changed.
@@ -83,24 +87,33 @@ type DiffsManifest struct {
 
 // SnapshotOptions names the host sources of a repository snapshot. Destination holds one directory per repository
 // and LogDir one NAME.log; both must be absent or empty. LoopDirs are the caller's host-only loop storage roots.
+// Mirrors is the host-only directory, in the loop's own storage, of the bare mirrors origins are fetched into; GH is
+// the GitHub CLI that gives a fetch its credentials.
 type SnapshotOptions struct {
 	Sources     []string
 	Destination string
 	LogDir      string
 	LoopDirs    []string
+	Mirrors     string
+	GH          string
 	Cache       *ScrubCache
 	Since       time.Time // the log's window starts here
 }
 
 // SnapshotRepos makes the scrubbed snapshot of each distinct source for /ro/repos/NAME and its log for
-// /ro/history/repos/NAME.log. A source that cannot be read (missing, no work tree, a link, inside loop storage, no
-// default branch) is a result with its reason, not a failure. Only a scrubber that does not run stops the pass.
+// /ro/history/repos/NAME.log, at its origin's default branch as the host fetches it now (repofetch.go), or at the
+// checkout's own default branch, with the reason, when it cannot. A source that cannot be read (missing, no work
+// tree, a link, inside loop storage, no default branch) is a result with its reason, not a failure. Only a scrubber
+// that does not run stops the pass.
 func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) {
 	if err := CheckScrubber(ctx); err != nil {
 		return nil, err
 	}
 	if o.Destination == "" || o.LogDir == "" {
 		return nil, fmt.Errorf("repository destination is empty")
+	}
+	if o.Mirrors == "" {
+		return nil, fmt.Errorf("repository mirror storage is empty")
 	}
 	clean, err := RedactAll(ctx, []string{o.Destination})
 	if err != nil {
@@ -152,7 +165,10 @@ func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) 
 			results = append(results, result)
 			continue
 		}
-		result, err = snapshotOne(ctx, source, filepath.Join(o.Destination, name), filepath.Join(o.LogDir, name+".log"), SnapshotRepoMax, o.Cache, o.Since)
+		tip, err := sourceTip(ctx, source, o.Mirrors, o.GH)
+		if err == nil {
+			result, err = snapshotOne(ctx, source, tip, filepath.Join(o.Destination, name), filepath.Join(o.LogDir, name+".log"), SnapshotRepoMax, o.Cache, o.Since)
+		}
 		result.Name = name
 		if err != nil {
 			if isScrubberError(err) {
@@ -208,7 +224,11 @@ func SnapshotFacts(ctx context.Context, src, dst, logPath string, cache *ScrubCa
 		result.Error = reason(err)
 		return result, err
 	}
-	result, err = snapshotOne(ctx, src, dst, logPath, SnapshotRepoMax, cache, since)
+	// tacit's store is written on this machine: its own default branch is its latest
+	branch, commit, err := defaultCommit(ctx, src)
+	if err == nil {
+		result, err = snapshotOne(ctx, src, repoTip{dir: src, branch: branch, commit: commit}, dst, logPath, SnapshotRepoMax, cache, since)
+	}
 	if err != nil {
 		result.Error = reason(err)
 	}
@@ -240,22 +260,20 @@ type snapEntry struct {
 	size      int64
 }
 
-// snapshotOne writes the snapshot of source's default branch at dst (published at the end, in one rename) and its
-// log at logPath. Files are counted as they are written; r describes what was written even when err is not nil.
-func snapshotOne(ctx context.Context, source, dst, logPath string, maxBytes int64, cache *ScrubCache, since time.Time) (r RepoInput, err error) {
-	r = RepoInput{Source: source, Name: filepath.Base(dst), Skipped: map[string]int{}}
+// snapshotOne writes the snapshot of source at tip at dst (published at the end, in one rename) and its log at
+// logPath, read from tip's Git directory. Files are counted as they are written; r describes what was written even
+// when err is not nil.
+func snapshotOne(ctx context.Context, source string, tip repoTip, dst, logPath string, maxBytes int64, cache *ScrubCache, since time.Time) (r RepoInput, err error) {
+	r = RepoInput{Source: source, Name: filepath.Base(dst), Skipped: map[string]int{}, Branch: tip.branch, Commit: tip.commit,
+		Fallback: tip.fallback, objects: tip.dir}
 	if err = absentInput(dst); err != nil {
 		return r, err
 	}
 	if err = noInputLinks(filepath.Dir(dst)); err != nil {
 		return r, err
 	}
-	branch, commit, err := defaultCommit(ctx, source)
-	if err != nil {
-		return r, err
-	}
-	r.Branch, r.Commit = branch, commit
-	entries, err := listTree(ctx, source, commit, cache, &r)
+	git, commit := tip.dir, tip.commit
+	entries, err := listTree(ctx, git, commit, cache, &r)
 	if err != nil {
 		return r, err
 	}
@@ -268,7 +286,7 @@ func snapshotOne(ctx context.Context, source, dst, logPath string, maxBytes int6
 	if err = os.Mkdir(tree, 0o755); err != nil {
 		return r, err
 	}
-	if err = writeSnapshot(ctx, source, tree, entries, maxBytes, cache, &r); err != nil {
+	if err = writeSnapshot(ctx, git, tree, entries, maxBytes, cache, &r); err != nil {
 		return r, err
 	}
 	if err = os.Rename(tree, dst); err != nil {
@@ -283,7 +301,7 @@ func snapshotOne(ctx context.Context, source, dst, logPath string, maxBytes int6
 	if len(r.Skipped) == 0 {
 		r.Skipped = nil
 	}
-	if r.History, err = snapshotLog(ctx, source, commit, logPath, since, cache); err != nil {
+	if r.History, err = snapshotLog(ctx, git, commit, logPath, since, cache); err != nil {
 		return r, err
 	}
 	return r, nil
@@ -658,7 +676,8 @@ func SnapshotDiffs(ctx context.Context, repos []RepoInput, texts []string, dst s
 			args = append(args, "--since="+since.UTC().Format(time.RFC3339))
 		}
 		args = append(args, repo.Commit, "--")
-		listed, lerr := hostInputGit(ctx, repo.Source, append(args, paths[name]...)...)
+		git := firstOf(repo.objects, repo.Source)
+		listed, lerr := hostInputGit(ctx, git, append(args, paths[name]...)...)
 		if lerr != nil {
 			m.Error = reason(lerr)
 			continue
@@ -667,7 +686,7 @@ func SnapshotDiffs(ctx context.Context, repos []RepoInput, texts []string, dst s
 		for _, hash := range strings.Fields(string(listed)) {
 			show := []string{"--literal-pathspecs", "-c", "core.quotepath=false", "show", "--no-ext-diff", "--no-textconv", "--no-color", "--patch", "--date=iso-strict",
 				"--format=commit %H%n%aI %an%n%s", hash, "--"}
-			diff, over, derr := hostInputGitCapped(ctx, repo.Source, DiffReadMax, append(show, paths[name]...)...)
+			diff, over, derr := hostInputGitCapped(ctx, git, DiffReadMax, append(show, paths[name]...)...)
 			if derr != nil {
 				m.Error = reason(derr)
 				continue

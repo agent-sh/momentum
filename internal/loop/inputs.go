@@ -165,8 +165,13 @@ func (r *Runner) buildInputs(ctx context.Context, p *passInputs) error {
 		func() {
 			// A repository that cannot be read (missing, not a work tree, no default branch) is left out and counted in the
 			// manifest's summary; the others and the investigation go on. What the scrubber changes in one is masked.
+			// Each is read at its origin's default branch, fetched into a mirror of the loop's own, never into the checkout.
+			gh := ""
+			if r.Ship != nil {
+				gh = r.Ship.GH
+			}
 			m, err := SnapshotRepos(sctx, SnapshotOptions{Sources: r.Inputs.ReadDirs, Destination: reposDst, LogDir: filepath.Join(logs, "repos"),
-				LoopDirs: []string{r.Dir}, Cache: p.cache, Since: p.since})
+				LoopDirs: []string{r.Dir}, Mirrors: filepath.Join(r.Dir, "mirrors"), GH: gh, Cache: p.cache, Since: p.since})
 			p.manifest.Repositories = m
 			if err != nil {
 				fail(err)

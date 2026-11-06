@@ -469,27 +469,45 @@ func (s *Ship) refreshBase(ctx context.Context, p Package) (Package, error) {
 }
 
 func (s *Ship) refreshBaseLocked(ctx context.Context, p Package) (Package, error) {
-	if roundsUsed(p) {
+	p.RefreshBase = true
+	return s.buildBase(ctx, p)
+}
+
+// buildBase readies the package's build tree at the default branch as the host fetches it now, before a build is
+// mounted: a base the episode prepared earlier never pins an old tree. When the fetched tip is the package's base, the
+// tree is made again from it. When the tip moved (or a landing found the change no longer rebases), the host clone is
+// reset to the new tip and the build reworks the change there: the cumulative patch stays in the package's data and
+// reaches the run as previous.patch, and the old build tree is never read. A fetch that cannot be made now holds the
+// build, without a run or a charge.
+func (s *Ship) buildBase(ctx context.Context, p Package) (Package, error) {
+	if p.RefreshBase && roundsUsed(p) {
 		return p, refused("review rounds used; the change waits for a person")
 	}
 	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
 		return p, err
 	}
 	if _, err := s.git(ctx, p.Host, "fetch", "--quiet", "origin", p.Base); err != nil {
-		return p, err
+		return p, &shipHold{err: refused("the default branch of %s cannot be fetched now", p.Repo)}
 	}
-	base, err := s.git(ctx, p.Host, "rev-parse", "origin/"+p.Base)
+	base, err := s.git(ctx, p.Host, "rev-parse", "--verify", "refs/remotes/origin/"+p.Base+"^{commit}")
 	if err != nil {
 		return p, err
 	}
-	p.BaseCommit = strings.TrimSpace(base)
-	if _, err := s.git(ctx, p.Host, "reset", "--hard", p.BaseCommit); err != nil {
+	tip := strings.TrimSpace(base)
+	moved := tip != p.BaseCommit || p.RefreshBase
+	if moved {
+		if roundsUsed(p) {
+			return p, refused("review rounds used; the change waits for a person")
+		}
+		p.BaseCommit = tip
+		if _, err := s.git(ctx, p.Host, "reset", "--hard", p.BaseCommit); err != nil {
+			return p, err
+		}
+		p.Check, p.Head, p.RefreshBase, p.State = nil, "", false, Prepared
+	}
+	if err := s.freshRunClone(ctx, &p); err != nil || !moved {
 		return p, err
 	}
-	if err := s.freshRunClone(ctx, &p); err != nil {
-		return p, err
-	}
-	p.Check, p.Head, p.RefreshBase, p.State = nil, "", false, Prepared
 	return p, s.saveAuthorized(ctx, &p)
 }
 

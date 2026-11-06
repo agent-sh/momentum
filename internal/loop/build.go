@@ -194,12 +194,8 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 	if filepath.Clean(source) != p.Dir {
 		return p, refused("the case's repository changed after preparation")
 	}
-	if p.RefreshBase {
-		p, err = r.Ship.refreshBaseLocked(r.Ship.gitContext(shipContext(ctx, p.Case)), p)
-	} else if _, err = r.Ship.Gate.Repository(ctx, p.Dir); err == nil {
-		err = r.Ship.freshRunClone(shipContext(ctx, p.Case), &p)
-	}
-	if err != nil {
+	// The build's base is the default branch as the host fetches it now, not the one the package was prepared at.
+	if p, err = r.Ship.buildBase(r.Ship.gitContext(shipContext(ctx, p.Case)), p); err != nil {
 		return p, err
 	}
 	// The build tree holds the base commit's tree and one commit, no history. A public repository's base commit is

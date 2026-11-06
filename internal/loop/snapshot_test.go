@@ -12,7 +12,7 @@ import (
 )
 
 func snapOptions(parent string, sources ...string) SnapshotOptions {
-	return SnapshotOptions{Sources: sources, Destination: filepath.Join(parent, "snap"), LogDir: filepath.Join(parent, "logs")}
+	return SnapshotOptions{Sources: sources, Destination: filepath.Join(parent, "snap"), LogDir: filepath.Join(parent, "logs"), Mirrors: filepath.Join(parent, "mirrors")}
 }
 
 // treeText is every file under dir with its path and mode, to look for a marker anywhere in what a run could read.
