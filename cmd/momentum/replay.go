@@ -201,9 +201,9 @@ func printReplay(out io.Writer, rs []supervise.Result, labels []supervise.Label,
 			}
 			switch r.Outcome {
 			case supervise.Covered:
-				by["covered by "+r.Decision.Rule]++
+				by["covered by "+r.Measured.Rule]++
 			case supervise.OwnerFirst:
-				by["owner first, "+r.Decision.Rule]++
+				by["owner first, "+r.Measured.Rule]++
 			default:
 				by["missed: "+supervise.Why(r)]++
 			}
@@ -233,8 +233,8 @@ func printRedundant(out io.Writer, rs []supervise.Result) {
 			continue
 		}
 		s := r.Point.Stop
-		if s.Exited {
-			continue // the process was gone: nothing would have gone on by itself, and no rule acts there
+		if s.Exited || s.Reopened {
+			continue // the process was gone, or just opened again: nothing would have gone on by itself
 		}
 		redundant := s.RequestAt.IsZero() && (s.Busy || s.Tasks > 0 || !s.WakeAt.IsZero() || s.Loop != "")
 		for _, l := range append([]*supervise.Label{r.Label}, r.Also...) { // every nudge at the stop, a later one too
@@ -258,7 +258,11 @@ func printAnchors(out io.Writer, rs []supervise.Result) {
 	type key struct{ rule, next string }
 	gaps := map[key][]time.Duration{}
 	for _, r := range rs {
-		if r.Decision.Rule == "" || r.Decision.At.IsZero() {
+		d := r.Decision
+		if r.Label != nil {
+			d = r.Measured // a labelled step is measured against the decision it did not move
+		}
+		if d.Rule == "" || d.At.IsZero() {
 			continue
 		}
 		next := r.Point.Next.Kind
@@ -270,13 +274,13 @@ func printAnchors(out io.Writer, rs []supervise.Result) {
 		var g time.Duration
 		switch {
 		case r.Label != nil:
-			g = r.StepAt.Sub(r.Decision.At) // the labelled step may be a local command before what came next
+			g = r.StepAt.Sub(d.At) // the labelled step may be a local command before what came next
 		case next == "none":
 			g = -1
 		default:
-			g = r.Point.Next.At.Sub(r.Decision.At)
+			g = r.Point.Next.At.Sub(d.At)
 		}
-		gaps[key{r.Decision.Rule, next}] = append(gaps[key{r.Decision.Rule, next}], g)
+		gaps[key{d.Rule, next}] = append(gaps[key{d.Rule, next}], g)
 	}
 	fmt.Fprintf(out, "%-10s %-14s %5s %7s %7s %7s %7s %7s\n", "rule", "next", "n", "p10", "p25", "p50", "p75", "p90")
 	for _, rule := range supervise.Rules {

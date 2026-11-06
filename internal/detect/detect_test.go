@@ -1010,6 +1010,16 @@ func TestANudgeThatReopensAnExitedSessionIsNoFinding(t *testing.T) {
 			ev(store.Transcripts, s, "harness_text", store.ActorHarness, "", "<local-command-stdout>Bye!</local-command-stdout>", `{"input_kind":"typed","why":"harness text"}`, at.Add(2*time.Minute)),
 			ownerTurn(s, "continue", at.Add(2*time.Hour)))
 	}
+	// opened again with a local command first (claude -c, then /model), then the owner's "continue"
+	for si, s := range []string{"m1", "m2", "m3"} {
+		at := t0.Add(time.Duration(si)*10*time.Minute + 5*time.Minute)
+		put(t, st, ownerTurn(s, "build the release", at), agentSays(s, "The release is built. Do you want me to publish it now?", at.Add(time.Minute)),
+			ev(store.Transcripts, s, "harness_text", store.ActorHarness, "", "<command-name>/exit</command-name> <command-message>exit</command-message> <command-args></command-args>",
+				`{"input_kind":"slash","why":"local command"}`, at.Add(2*time.Minute)),
+			ev(store.Transcripts, s, "harness_text", store.ActorHarness, "", "<command-name>/model</command-name> <command-message>model</command-message> <command-args></command-args>",
+				`{"input_kind":"slash","why":"local command"}`, at.Add(2*time.Hour)),
+			ownerTurn(s, "continue", at.Add(2*time.Hour+time.Minute)))
+	}
 	fs, err := Sessions{}.Detect(context.Background(), st, week())
 	if err != nil {
 		t.Fatal(err)

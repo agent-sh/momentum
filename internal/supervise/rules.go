@@ -46,6 +46,7 @@ type Stop struct {
 	Where           string // a tmux target, tty, bg, or a Hermes platform
 	Auto            bool   // an automated run
 	Exited          bool   // its process exited at the stop (/exit): nothing runs there to act on until it is opened again
+	Reopened        bool   // a local command opened the session again after /exit: the next input is the owner coming back, no nudge
 	Phase           sessions.Phase
 	At              time.Time        // when the session stopped: its last turn ended
 	Error           string           // the API error the turn ended on

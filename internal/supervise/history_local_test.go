@@ -254,8 +254,8 @@ func TestAnExitEndsTheStop(t *testing.T) {
 }
 
 // Codex records its user's interruption of a turn as a turn_aborted record, or marks it on the record after it:
-// either ends the turn, so the stop from the aborted call's result to his next input owes no reply, and it stays
-// one stop.
+// either ends the turn, so the stop to his next input owes no reply, and it stays one stop. It starts at the abort,
+// as Codex's live tracker keeps the turn open until then: at its own record, else at the first record marked.
 func TestACodexAbortedTurnIsAnInterruption(t *testing.T) {
 	st := testStore(t)
 	abort := func(b *timelineBuilder) *timelineBuilder {
@@ -274,19 +274,21 @@ func TestACodexAbortedTurnIsAnInterruption(t *testing.T) {
 		if name != "silent" && name != "on-input" { // a call aborted before it wrote anything has no result
 			b.result(12*time.Second, "exec", "c1", "aborted by user after 12.5s")
 		}
-		stopAt := b.at
+		var stopAt time.Time
 		switch name {
 		case "silent":
-			abort(b)
+			stopAt = abort(b).at
 		case "record":
-			abort(b).add(20*time.Minute, "compaction", store.ActorHarness, "", "", `{"why":"compacted"}`)
+			stopAt = abort(b).at
+			b.add(20*time.Minute, "compaction", store.ActorHarness, "", "", `{"why":"compacted"}`)
 		case "marked":
-			mark(b, 10*time.Minute)
+			stopAt = mark(b, 10*time.Minute).at
 		case "both":
-			mark(abort(b), 10*time.Minute)
+			stopAt = abort(b).at
+			mark(b, 10*time.Minute)
 		}
 		if name == "on-input" {
-			b.owner(10*time.Minute, ".", "turn_aborted") // the abort marked on the owner's own text
+			stopAt = b.owner(10*time.Minute, ".", "turn_aborted").at // the abort marked on the owner's own text
 		} else {
 			b.owner(time.Second, ".", "")
 		}
@@ -297,7 +299,7 @@ func TestACodexAbortedTurnIsAnInterruption(t *testing.T) {
 	for _, c := range shapes {
 		r := replayed(t, st, c.session, c.nudgedAt)
 		if r.Point.Stop.Working || r.Point.Stop.Busy || !r.Point.Stop.At.Equal(c.stopAt) || Why(r) == owedReply || !r.Point.Stop.OwnerAt.Equal(t0) {
-			t.Fatalf("%s: the stop before the owner's nudge: working %v, at %v (the aborted result at %v), %q", c.session,
+			t.Fatalf("%s: the stop before the owner's nudge: working %v, at %v (the abort at %v), %q", c.session,
 				r.Point.Stop.Working, r.Point.Stop.At, c.stopAt, Why(r))
 		}
 		n := 0
@@ -439,8 +441,11 @@ func TestALabelledLocalCommandIsMeasuredAgainstTheRuleItDidNotMove(t *testing.T)
 			continue
 		}
 		rule := t0.Add(DefaultParams.OwnerWindow) // held by the owner's own prompt, not by the command
-		if r.Label == nil || r.Outcome != OwnerFirst || !r.Decision.At.Equal(rule) || r.StepAt.Sub(r.Decision.At) != stepAt.Sub(rule) {
-			t.Fatalf("the labelled step: %v %q, rule at %v, gap %v", r.Label, r.Outcome, r.Decision.At, r.StepAt.Sub(r.Decision.At))
+		if r.Label == nil || r.Outcome != OwnerFirst || !r.Measured.At.Equal(rule) || r.StepAt.Sub(r.Measured.At) != stepAt.Sub(rule) {
+			t.Fatalf("the labelled step: %v %q, rule at %v, gap %v", r.Label, r.Outcome, r.Measured.At, r.StepAt.Sub(r.Measured.At))
+		}
+		if !r.Decision.At.Equal(stepAt.Add(DefaultParams.OwnerWindow)) {
+			t.Fatalf("a live run would hold the rule from the command: %v", r.Decision.At)
 		}
 		if !unlabelled.Decision.At.Equal(stepAt.Add(DefaultParams.OwnerWindow)) {
 			t.Fatalf("unlabelled, the command holds the rule: %v", unlabelled.Decision.At)
@@ -531,4 +536,104 @@ func TestAnExitedStopHasNoSchedule(t *testing.T) {
 	if !s.Exited || s.Loop != "" || len(s.Runs) != 0 || phaseOf(s) == sessions.Scheduled {
 		t.Fatalf("the exited stop: exited %v, loop %q, %d runs, phase %v", s.Exited, s.Loop, len(s.Runs), phaseOf(s))
 	}
+}
+
+// A Codex turn that hung, then was aborted, ran until the abort, as Codex's live tracker keeps it open: rule waits
+// count from the abort, not from its last record, so a promise before the hang gets no act while it ran.
+func TestAHungCodexTurnRunsUntilItsAbort(t *testing.T) {
+	st := testStore(t)
+	aborts := map[string]time.Time{}
+	nexts := map[string]time.Time{}
+	for _, name := range []string{"hung-record", "hung-marked"} {
+		b := newTimeline(t, name).owner(0, "run the suite", "").say(5*time.Second, "I'll run the suite and report when it finishes.").
+			call(time.Second, "exec", "c1", `{"cmd":"make test"}`)
+		if name == "hung-record" {
+			b.add(30*time.Minute, "harness_text", store.ActorHarness, "", "<turn_aborted> The user interrupted the previous turn on purpose.", `{"why":"developer message"}`)
+		} else {
+			b.add(30*time.Minute, "harness_text", store.ActorHarness, "", "# AGENTS.md instructions", `{"input_kind":"typed","prior":"turn_aborted","why":"harness text"}`)
+		}
+		aborts[name] = b.at
+		b.owner(time.Minute, ".", "")
+		nexts[name] = b.at
+		b.codex().put(st)
+	}
+	for name, next := range nexts {
+		r := replayed(t, st, name, next)
+		if !r.Point.Stop.At.Equal(aborts[name]) || r.Fired || !r.Decision.At.IsZero() && r.Decision.At.Before(aborts[name]) {
+			t.Errorf("%s: the stop at %v (the abort at %v), %s at %v, fired %v", name, r.Point.Stop.At, aborts[name], r.Decision.Rule, r.Decision.At, r.Fired)
+		}
+	}
+}
+
+// The first input after a local command reopened an exited session is the owner coming back, not a nudge: the stop
+// it ends is marked reopened, while rules count from the command.
+func TestTheInputAfterAReopeningCommandIsMarked(t *testing.T) {
+	st := testStore(t)
+	b := newTimeline(t, "back").owner(0, "run the suite", "turn_duration").say(10*time.Second, "Running.")
+	b.localCommand(time.Minute, "exit", "").localCommand(40*time.Minute, "model", "")
+	model := b.at.Add(-time.Millisecond)
+	b.owner(time.Minute, "continue", "")
+	next := b.at
+	b.say(time.Second, "Continuing.").owner(time.Hour, "continue", "")
+	later := b.at
+	b.put(st)
+	if r := replayed(t, st, "back", next); !r.Point.Stop.Reopened || r.Point.Stop.Exited || !r.Point.Stop.At.Equal(model) {
+		t.Fatalf("the stop the reopening ends: reopened %v, exited %v, at %v (the command at %v)", r.Point.Stop.Reopened, r.Point.Stop.Exited, r.Point.Stop.At, model)
+	}
+	if r := replayed(t, st, "back", later); r.Point.Stop.Reopened {
+		t.Fatal("a later stop reads as reopened")
+	}
+}
+
+// Each labelled step takes its nearest free label, whatever order the labels came in.
+func TestAStepTakesItsNearestLabel(t *testing.T) {
+	st := testStore(t)
+	b := newTimeline(t, "near").owner(0, "deploy it", "turn_duration").say(10*time.Second, "Deploying.").apiError(time.Minute, err503)
+	b.localCommand(20*time.Minute, "login", "")
+	login := b.at.Add(-time.Millisecond)
+	b.owner(2*time.Second, "continue", "")
+	next := b.at
+	b.put(st)
+	until := t0.Add(6 * time.Hour)
+	points, err := History(context.Background(), st, t0.Add(-time.Hour), until)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels := []Label{{Session: "near", At: next.Add(-100 * time.Millisecond), Kind: "nudge"}, {Session: "near", At: login, Kind: "restart"}}
+	for _, r := range Replay(points, labels, DefaultParams, probeAt(time.Time{}), until) {
+		if r.Point.Session == "near" && r.Point.Next.At.Equal(next) {
+			if r.Label != &labels[1] || len(r.Also) != 1 || r.Also[0] != &labels[0] {
+				t.Fatalf("the steps' labels: %v, also %v", r.Label, r.Also)
+			}
+			return
+		}
+	}
+	t.Fatal("no stop ends on the step's next input")
+}
+
+// Whether a rule would have acted is read with every earlier command's hold, as a live run would go, while a
+// labelled step is still measured against the decision it did not move.
+func TestFiredCountsEveryEarlierHold(t *testing.T) {
+	st := testStore(t)
+	b := newTimeline(t, "held").owner(0, "deploy it", "turn_duration").say(10*time.Second, "Deploying.").apiError(time.Minute, err503)
+	b.localCommand(3*time.Minute, "login", "")
+	login := b.at.Add(-time.Millisecond)
+	b.owner(12*time.Minute, "continue", "") // after the rule's own time, before the command's hold ends
+	next := b.at
+	b.put(st)
+	until := t0.Add(6 * time.Hour)
+	points, err := History(context.Background(), st, t0.Add(-time.Hour), until)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels := []Label{{Session: "held", At: login, Kind: "restart"}}
+	for _, r := range Replay(points, labels, DefaultParams, probeAt(time.Time{}), until) {
+		if r.Point.Session == "held" && r.Point.Next.At.Equal(next) {
+			if r.Fired || !r.Decision.At.Equal(login.Add(DefaultParams.OwnerWindow)) || !r.Measured.At.Equal(t0.Add(DefaultParams.OwnerWindow)) || r.Outcome != OwnerFirst {
+				t.Fatalf("fired %v, decision at %v, measured at %v, %q", r.Fired, r.Decision.At, r.Measured.At, r.Outcome)
+			}
+			return
+		}
+	}
+	t.Fatal("no stop ends on the step's next input")
 }

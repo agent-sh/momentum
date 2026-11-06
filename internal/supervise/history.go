@@ -435,6 +435,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 	var words, entry, harness, prevRole, prevPrior string
 	var carried string       // a turn's end recorded on a record passed over since the last stop: a local command's, an abort
 	var controls []time.Time // the owner's local commands since the last stop
+	aborted := false         // a Codex abort ended the turn since the last stop, and dated its stop
 	exited := false          // an /exit ended the process: the next record the replay reads is a new one
 	var prevAt time.Time
 	var owes time.Time           // the model owes its reply since: an input, or the result of a turn's last call
@@ -453,7 +454,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		if !wake.at.IsZero() && wake.at.After(prevAt.Add(-sessions.WakeGrace)) {
 			s.WakeAt = wake.at
 		}
-		s.TurnBegan, s.IdleAt, s.Exited = turnBegan, prevAt, prevRole == "exit"
+		s.TurnBegan, s.IdleAt, s.Exited, s.Reopened = turnBegan, prevAt, prevRole == "exit", prevRole == "reopened"
 		if !s.Exited { // nothing runs while the process is gone: an exited stop has no schedule
 			for _, c := range crons {
 				s.Loop = c.expr
@@ -500,6 +501,10 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			pending = map[string]bool{} // the abort ended the turn and its calls, whatever record the store marked it on
 			if r == "" {
 				r = "aborted" // the store marked Codex's abort of the turn on the record after it
+			} else if !aborted && !prevAt.IsZero() {
+				// marked on an input with no record of its own: the turn ran until then at the latest, as Codex's
+				// live tracker keeps a turn open until its abort
+				prevAt, aborted = e.TS, true
 			}
 		}
 		if v := versionAt(e.Ref); v != "" {
@@ -536,10 +541,15 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			continue
 		case "aborted":
 			// Codex ended the turn on its user's interruption, as its live tracker reads turn_aborted, with no call
-			// running: the stop before it goes on to the next input, which reads the turn as over. Like the live
-			// tracker, the replay does not count it as his presence.
+			// running: the stop before it goes on to the next input, which reads the turn as over. The live tracker
+			// keeps the turn open until the abort, so the stop starts there: at the abort's own record, else at the
+			// first record the store marked it on, the latest it can have come. Like the live tracker, the replay
+			// does not count it as his presence.
 			if carried == "" {
 				carried = "turn_aborted"
+			}
+			if !aborted && !prevAt.IsZero() {
+				prevAt, aborted = e.TS, true
 			}
 			pending, owes, owesRef = map[string]bool{}, time.Time{}, ""
 			continue
@@ -731,7 +741,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			}
 			lastMainUser = false
 		}
-		prevRole, prevAt, carried = r, e.TS, ""
+		prevRole, prevAt, carried, aborted = r, e.TS, "", false
 		for _, at := range controls { // the stop they came after is over: they show him at the session before the next
 			if at.After(ownerAt) {
 				ownerAt = at

@@ -121,7 +121,8 @@ func Nudge(text string) bool {
 // Result is one replayed stop.
 type Result struct {
 	Point    Point
-	Decision Decision
+	Decision Decision      // with every local command's hold that came before it would have acted, as a live run would go
+	Measured Decision      // a labelled step's: with only the holds of the commands before the step, which it did not move
 	Fired    bool          // the rule would have acted before what came next
 	Outcome  string        // "" for a stop no rule acted on that no label marks
 	Label    *Label        // the owner's labelled step at the stop: the earliest, on a local command or on what came next
@@ -142,16 +143,23 @@ func Replay(points []Point, labels []Label, p Params, probe Probe, until time.Ti
 		bySession[l.Session] = append(bySession[l.Session], l)
 	}
 	taken := map[*Label]bool{}
+	// labelAt is the free label nearest a step, within labelSlack: a label ends one stop, so two inputs in the same
+	// second share one
 	labelAt := func(pt Point, at time.Time) *Label {
+		var best *Label
+		var gap time.Duration
 		for _, id := range []string{pt.Session, strings.TrimPrefix(pt.Session, "hermes:")} { // a Hermes id without its prefix
 			for _, l := range bySession[id] {
-				if d := l.At.Sub(at); !taken[l] && d > -labelSlack && d < labelSlack {
-					taken[l] = true // a label ends one stop: two inputs in the same second share one
-					return l
+				d := l.At.Sub(at).Abs()
+				if !taken[l] && d < labelSlack && (best == nil || d < gap) {
+					best, gap = l, d
 				}
 			}
 		}
-		return nil
+		if best != nil {
+			taken[best] = true
+		}
+		return best
 	}
 	// labelsOf are the owner's labelled steps at a stop, the earliest first: on his local commands after it (a
 	// restart step such as /login), which end no stop of their own, then on its next input
@@ -171,30 +179,40 @@ func Replay(points []Point, labels []Label, p Params, probe Probe, until time.Ti
 	resynced := map[string]bool{} // a session's wakeups and runs the overdue rule acted on: one resync for each
 	for _, pt := range points {
 		pt.Stop.Choose(func(k string) bool { return resynced[pt.Session+" "+k] }, pt.Stop.At, p)
-		plan := func() Decision {
+		plan := func(s Stop) Decision {
 			if pt.Waiting {
-				return PlanOnly(RuleStalled, pt.Stop, Tries{}, p, probe)
+				return PlanOnly(RuleStalled, s, Tries{}, p, probe)
 			}
-			return Plan(pt.Stop, Tries{}, p, probe)
+			return Plan(s, Tries{}, p, probe)
 		}
-		d := plan()
+		// a local command shows the owner at the session from then: it holds a rule that had not acted yet. held
+		// applies the holds of the commands before a time (zero: all of them).
+		held := func(before time.Time) (Decision, Stop) {
+			s := pt.Stop
+			d := plan(s)
+			for _, at := range pt.Controls {
+				if d.Verdict != Wait && d.Verdict != Hold || d.At.IsZero() || !at.Before(d.At) || !before.IsZero() && !at.Before(before) {
+					break
+				}
+				if at.After(s.OwnerAt) {
+					s.OwnerAt = at
+					d = plan(s)
+				}
+			}
+			return d, s
+		}
 		var r Result
 		if ls, at := labelsOf(pt); len(ls) > 0 {
 			r.Label, r.StepAt, r.Also = ls[0], at[0], ls[1:]
 		}
-		// a local command shows the owner at the session from then: it holds a rule that had not acted yet. The
-		// labelled step is measured against the decision it did not move, so the loop stops before it.
-		for _, at := range pt.Controls {
-			if d.Verdict != Wait && d.Verdict != Hold || d.At.IsZero() || !at.Before(d.At) || r.Label != nil && !at.Before(r.StepAt) {
-				break
-			}
-			if at.After(pt.Stop.OwnerAt) {
-				pt.Stop.OwnerAt = at
-				d = plan()
-			}
+		d, s := held(time.Time{})
+		r.Decision, r.Measured = d, d
+		if r.Label != nil {
+			r.Measured, _ = held(r.StepAt) // the labelled step is measured against the decision it did not move
 		}
-		r.Point, r.Decision = pt, d
-		stepAt := r.StepAt
+		pt.Stop = s
+		r.Point = pt
+		m, stepAt := r.Measured, r.StepAt
 		end := pt.Next.At
 		if pt.Next.Kind == "none" {
 			end = until
@@ -206,9 +224,9 @@ func Replay(points []Point, labels []Label, p Params, probe Probe, until time.Ti
 			}
 		}
 		switch {
-		case r.Label != nil && (d.Verdict == Wait || d.Verdict == Hold) && !d.At.IsZero() && d.At.Before(stepAt):
-			r.Outcome, r.Earlier = Covered, stepAt.Sub(d.At)
-		case r.Label != nil && d.Rule != "" && (d.Verdict == Wait || d.Verdict == Hold):
+		case r.Label != nil && (m.Verdict == Wait || m.Verdict == Hold) && !m.At.IsZero() && m.At.Before(stepAt):
+			r.Outcome, r.Earlier = Covered, stepAt.Sub(m.At)
+		case r.Label != nil && m.Rule != "" && (m.Verdict == Wait || m.Verdict == Hold):
 			r.Outcome = OwnerFirst
 		case r.Label != nil:
 			r.Outcome = Missed

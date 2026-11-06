@@ -21,9 +21,9 @@ func TestReplayOutputsCountEveryLabelledStepAtAStop(t *testing.T) {
 	decision := supervise.Decision{Rule: supervise.RuleTransient, Verdict: supervise.Hold, At: at.Add(10 * time.Minute)}
 	rs := []supervise.Result{
 		{Point: supervise.Point{Session: "s", Stop: supervise.Stop{Tasks: 1}, Next: supervise.Next{At: labels[1].At, Kind: "owner"}},
-			Decision: decision, Label: &labels[0], StepAt: labels[0].At, Also: []*supervise.Label{&labels[1]}, Outcome: supervise.OwnerFirst},
+			Decision: decision, Measured: decision, Label: &labels[0], StepAt: labels[0].At, Also: []*supervise.Label{&labels[1]}, Outcome: supervise.OwnerFirst},
 		{Point: supervise.Point{Session: "t", Next: supervise.Next{Kind: "none"}},
-			Decision: decision, Label: &labels[2], StepAt: labels[2].At, Outcome: supervise.OwnerFirst},
+			Decision: decision, Measured: decision, Label: &labels[2], StepAt: labels[2].At, Outcome: supervise.OwnerFirst},
 	}
 	var out bytes.Buffer
 	printRedundant(&out, rs)
@@ -37,6 +37,14 @@ func TestReplayOutputsCountEveryLabelledStepAtAStop(t *testing.T) {
 	printRedundant(&out, append(exited, rs...))
 	if !strings.Contains(out.String(), ": 1 of 1 (100%)") {
 		t.Fatalf("a nudge on an exited stop counted: %q", out.String())
+	}
+	// nor the first input after a local command opened it again
+	reopened := []supervise.Result{{Point: supervise.Point{Session: "y", Stop: supervise.Stop{Reopened: true, Loop: "*/10 * * * *"},
+		Next: supervise.Next{At: labels[1].At, Kind: "owner"}}, Label: &labels[1], StepAt: labels[1].At}}
+	out.Reset()
+	printRedundant(&out, append(reopened, rs...))
+	if !strings.Contains(out.String(), ": 1 of 1 (100%)") {
+		t.Fatalf("a nudge on a reopened stop counted: %q", out.String())
 	}
 	out.Reset()
 	printReplay(&out, rs, labels, at.Add(-time.Hour), at.Add(time.Hour))
