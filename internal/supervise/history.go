@@ -112,8 +112,9 @@ func echoOnly(s string) bool {
 	return strings.Contains(s, "<command-name>") && !hSkillRunning.MatchString(s) && strings.TrimSpace(hCommandTag.ReplaceAllString(s, "")) == ""
 }
 
-// recordText is the text of a user record in its transcript (Ref: path@offset#index): its message's content, a
-// string or text blocks. False when the transcript is gone or the record holds no text.
+// recordText is the text of a user record in its transcript (Ref: path@offset#index): its message's content, or a
+// queued command's prompt (an attachment keeps its text there), a string or text blocks. False when the transcript
+// is gone or the record holds no text.
 func recordText(ref string) (string, bool) {
 	line := recordAt(ref)
 	if line == nil {
@@ -123,18 +124,28 @@ func recordText(ref string) (string, bool) {
 		Message struct {
 			Content json.RawMessage `json:"content"`
 		} `json:"message"`
+		Attachment struct {
+			Prompt json.RawMessage `json:"prompt"`
+		} `json:"attachment"`
 	}
-	if json.Unmarshal(line, &r) != nil || len(r.Message.Content) == 0 {
+	if json.Unmarshal(line, &r) != nil {
+		return "", false
+	}
+	content := r.Message.Content
+	if len(content) == 0 {
+		content = r.Attachment.Prompt
+	}
+	if len(content) == 0 {
 		return "", false
 	}
 	var text string
-	if json.Unmarshal(r.Message.Content, &text) == nil {
+	if json.Unmarshal(content, &text) == nil {
 		return text, text != ""
 	}
 	var blocks []struct {
 		Type, Text string
 	}
-	if json.Unmarshal(r.Message.Content, &blocks) != nil {
+	if json.Unmarshal(content, &blocks) != nil {
 		return "", false
 	}
 	// the event is one block of the record (Ref's #index): judged by its own text, not the record's joined
@@ -555,6 +566,28 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		s.Phase = phaseOf(s)
 		return s
 	}
+	// notified follows a task's notification: a wakeup it says was lost, a sign for a pending one, the tasks it
+	// closes
+	notified := func(summary string, at time.Time) {
+		if strings.HasPrefix(summary, "<task-notification>") {
+			if hWakeGone.MatchString(summary) {
+				wake = replayWake{}
+			} else {
+				waitedThrough("a task's notification came in while it waited", at)
+			}
+		}
+		st := hStatus.FindStringSubmatch(summary)
+		for _, tm := range hTaskID.FindAllStringSubmatch(summary, -1) {
+			t, ok := tasks[tm[1]]
+			if !ok {
+				continue
+			}
+			if t.kind != "monitor" || st != nil && terminalSt[st[1]] {
+				delete(tasks, tm[1])
+			}
+		}
+	}
+	evs, queued, enqueued := placeQueued(evs)
 	for _, e := range evs {
 		m := map[string]any{}
 		if e.Meta != "" {
@@ -564,6 +597,21 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			harness = e.Harness
 		}
 		r := role(e, m)
+		if enqueued[e.SourceKey] {
+			// a notification at the time it was queued, delivered as an input later: it closes its task now, as the
+			// live tracker reads the queue
+			if r == "self" {
+				if strings.HasPrefix(e.Summary, "<task-notification>") && !strings.Contains(e.Summary, "</task-notification>") {
+					e.Summary = whole(e)
+				}
+				notified(e.Summary, e.TS)
+			}
+			continue
+		}
+		// a queued command delivered with the input before it, before anything of that input's turn, is part of that
+		// input: the turn it opens is the one the input opened
+		input := r == "owner" || r == "self" || r == "momentum"
+		merged := input && queued[e.SourceKey] && (prevRole == "owner" || prevRole == "self" || prevRole == "momentum")
 		if e.Harness == "codex" && m["prior"] == "turn_aborted" {
 			pending = map[string]bool{} // the abort ended the turn and its calls, whatever record the store marked it on
 			if r == "" {
@@ -641,6 +689,9 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			ownerAt, controls, controlRef, carried, words, resumed = e.TS, nil, "", "", "", time.Time{}
 			tasks, pending, wake = map[string]replayTask{}, map[string]bool{}, replayWake{}
 			prevAt, prevRole, prevPrior, owes, owesRef, exited = e.TS, "exit", "", time.Time{}, "", true
+			// the old process's turn ended with it, as the live tracker reads the exit: a "No response requested." the
+			// next one writes is no sign that the session ended mid-task
+			lastMainUser = false
 			continue
 		}
 		if exited { // the session runs again from this record: its jobs run from their first run after it
@@ -659,7 +710,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			if r == "interrupt" {
 				next.InputKind = "interrupt"
 			}
-			if !prevAt.IsZero() {
+			if !prevAt.IsZero() && !merged {
 				prevPrior = priorOf(m, carried)
 				// the request the stop waited on is read up to the first local command: its echo answers it from then on,
 				// as the live tracker reads it, and Replay drops a stalled decision a command came before
@@ -720,23 +771,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 					wake = replayWake{}
 				}
 			}
-			if strings.HasPrefix(e.Summary, "<task-notification>") {
-				if hWakeGone.MatchString(e.Summary) {
-					wake = replayWake{}
-				} else {
-					waitedThrough("a task's notification came in while it waited", e.TS)
-				}
-			}
-			st := hStatus.FindStringSubmatch(e.Summary)
-			for _, tm := range hTaskID.FindAllStringSubmatch(e.Summary, -1) {
-				t, ok := tasks[tm[1]]
-				if !ok {
-					continue
-				}
-				if t.kind != "monitor" || st != nil && terminalSt[st[1]] {
-					delete(tasks, tm[1])
-				}
-			}
+			notified(e.Summary, e.TS)
 			if hOrphan.MatchString(e.Summary) { // reopened: what ran died with the process
 				reopened(e.TS)
 			}
@@ -828,11 +863,12 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		if r == "owner" || r == "self" || r == "interrupt" || r == "momentum" {
 			prevPrior = ""
 		}
-		if r == "owner" || r == "self" || r == "momentum" {
+		if input && !merged {
 			turnBegan = e.TS // an input opens the turn the next stop ends
 		}
 		switch {
-		case r == "owner" || r == "self" || r == "momentum", r == "result" && len(pending) == 0:
+		case merged: // the model owes its reply from the input it came with
+		case input, r == "result" && len(pending) == 0:
 			// Claude Code may write the request before the record of the input it carries, dated before it
 			owes, owesRef = e.TS, firstNonEmpty(lastRef, e.Ref)
 		case r == "agent" || r == "call" || r == "apierr" || r == "interrupt" || r == "synthetic":
@@ -913,6 +949,98 @@ func requestBetween(from, to string, until time.Time) time.Time {
 		}
 	}
 }
+
+// queuedCommand reports a Claude Code notification its harness queued while a turn ran and delivered into the turn
+// later, as the store marks it (by its command mode: a task's notification). A message its user typed meanwhile is
+// queued too, but its record's time is when he typed it, which his labelled steps and his turns are found by.
+func queuedCommand(e store.Event) bool {
+	if e.Harness != "claude" || e.Kind != "harness_text" {
+		return false
+	}
+	var m struct {
+		Why string `json:"why"`
+	}
+	json.Unmarshal([]byte(e.Meta), &m)
+	return strings.HasPrefix(m.Why, "commandMode ")
+}
+
+// placeQueued reads each queued command where it sits in its transcript. Claude Code writes one as an attachment
+// that carries the time it was queued, not the time it was delivered, so by its time it would come before the
+// records it followed (the result or the input it rode in with) and read as an input of its own. It is delivered at
+// the event before it in its transcript (by Ref) when that is later, and an event of the same time sits by its place
+// in the transcript. What its queueing did stays at its own time, as the live tracker reads the queue: a copy there,
+// under its key with enqueuedKey after it, closes the task a notification reports. It returns the events in that
+// order, the queued commands and the copies, by source key.
+func placeQueued(evs []store.Event) ([]store.Event, map[string]bool, map[string]bool) {
+	type place struct {
+		path string
+		off  int64
+		idx  int
+		ok   bool
+	}
+	before := func(a, b place) bool {
+		if a.path != b.path {
+			return a.path < b.path
+		}
+		if a.off != b.off {
+			return a.off < b.off
+		}
+		return a.idx < b.idx
+	}
+	out := append([]store.Event(nil), evs...)
+	places := make([]place, len(out))
+	var order []int // the events with a place, in transcript order
+	for i, e := range out {
+		if path, off, ok := refPlace(e.Ref); ok && e.Harness == "claude" {
+			places[i], order = place{path, off, blockIndex(e.Ref), true}, append(order, i)
+		}
+	}
+	sort.SliceStable(order, func(a, b int) bool { return before(places[order[a]], places[order[b]]) })
+	queued, enqueued := map[string]bool{}, map[string]bool{}
+	var copies []store.Event
+	for k, i := range order {
+		if !queuedCommand(out[i]) {
+			continue
+		}
+		queued[out[i].SourceKey] = true
+		if k > 0 && places[order[k-1]].path == places[i].path {
+			if prev := out[order[k-1]].TS; prev.After(out[i].TS) { // itself placed, when it was one too
+				c := out[i]
+				c.SourceKey += enqueuedKey
+				copies, enqueued[c.SourceKey] = append(copies, c), true
+				out[i].TS = prev
+			}
+		}
+	}
+	if len(copies) == 0 {
+		return evs, queued, enqueued
+	}
+	out = append(out, copies...)
+	places = append(places, make([]place, len(copies))...)
+	idx := make([]int, len(out))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool {
+		ea, eb := out[idx[a]], out[idx[b]]
+		if !ea.TS.Equal(eb.TS) {
+			return ea.TS.Before(eb.TS)
+		}
+		pa, pb := places[idx[a]], places[idx[b]]
+		if pa.ok && pb.ok && pa.path == pb.path {
+			return before(pa, pb)
+		}
+		return false
+	})
+	sorted := make([]store.Event, len(out))
+	for k, i := range idx {
+		sorted[k] = out[i]
+	}
+	return sorted, queued, enqueued
+}
+
+// enqueuedKey marks the copy of a queued command at the time it was queued (placeQueued).
+const enqueuedKey = "~enqueued"
 
 // refPlace splits an event's Ref (path@offset#index) into its transcript and the offset of its record.
 func refPlace(ref string) (string, int64, bool) {

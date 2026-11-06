@@ -39,6 +39,9 @@ var (
 	reSystemTag = regexp.MustCompile(`(?s)<(system-reminder|local-command-stdout|local-command-caveat|command-name|command-message|command-args)>.*?</(system-reminder|local-command-stdout|local-command-caveat|command-name|command-message|command-args)>`)
 )
 
+// reCommandName is the name a local command's echo carries.
+var reCommandName = regexp.MustCompile(`<command-name>\s*([^<\s]*)\s*</command-name>`)
+
 // What Claude Code writes as it reopens a session that ended mid-task: a background task's notice that it did not
 // finish before the previous session ended, and the result of a call that the end cut off.
 var (
@@ -717,6 +720,11 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 	if clean == "" {
 		if strings.Contains(s, "<command-name>") {
 			st.Control = at // the echo of a local command its user ran: /login, /model
+		}
+		if m := reCommandName.FindStringSubmatch(s); m != nil && (m[1] == "/exit" || m[1] == "/quit") {
+			// the process ends, and the turn it ran with it: a "No response requested." the next process writes
+			// closes no turn, so it is no reopening
+			st.LastMain, st.Group, st.Request, st.QueuedPrompt = "ended", st.Group[:0], time.Time{}, time.Time{}
 		}
 		return
 	}

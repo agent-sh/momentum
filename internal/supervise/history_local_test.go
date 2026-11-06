@@ -3,6 +3,7 @@ package supervise
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -513,10 +514,172 @@ func TestRulesCountFromAReopeningCommand(t *testing.T) {
 	model := j.at.Add(-time.Millisecond)
 	j.owner(10*time.Minute, "status?", "").say(time.Second, "Back.").owner(time.Hour, "and now?", "turn_duration")
 	j.put(st)
-	for _, r := range overdueActs(t, st, t0.Add(3*time.Hour)) {
+	acted := overdueActs(t, st, t0.Add(3*time.Hour))
+	if len(acted) == 0 {
+		t.Fatal("no run after the reopening was missed")
+	}
+	for _, r := range acted {
 		if !r.Point.Stop.WakeDue.After(model) {
 			t.Fatalf("a run due while the process was gone read as missed: due %v, reopened %v", r.Point.Stop.WakeDue, model)
 		}
+	}
+}
+
+// watchNotice is Claude Code's notice that a session's artifact watches stopped, as it sends it to the model: a task
+// notification with a type and no task, longer than the store keeps.
+const watchNotice = "<task-notification>\n<task-type>artifact-watch-lifecycle</task-type>\n<summary>Artifact watches stopped</summary>\n" +
+	"<event>This session no longer watches the artifacts it published, because the signed-in account changed. Publish an artifact again " +
+	"to watch it. Nothing here needs a reply.</event>\n</task-notification>"
+
+// weeklyLimit is the error a turn stops on when the account's weekly usage is spent.
+const weeklyLimit = "You've hit your weekly limit · resets Mar 9, 9am (Europe/Lisbon)"
+
+func (r *recorded) apiError(after time.Duration, text string) *recorded {
+	return r.event(after, map[string]any{"type": "assistant", "isApiErrorMessage": true, "error": "rate_limit",
+		"message": map[string]any{"model": "<synthetic>", "content": []any{map[string]any{"type": "text", "text": text}}}},
+		"harness_text", store.ActorHarness, "", text, `{"is_error":true,"why":"api error"}`)
+}
+
+func (r *recorded) login(after time.Duration) *recorded {
+	echo := "<command-name>/login</command-name> <command-message>login</command-message> <command-args></command-args>"
+	return r.event(after, map[string]any{"type": "user", "message": map[string]any{"content": echo}}, "harness_text", store.ActorHarness, "",
+		echo, `{"input_kind":"slash","why":"local command"}`)
+}
+
+// queued is a notification Claude Code queued at queuedAt and delivered after the records before it: its attachment
+// sits where it was delivered and carries the time it was queued, as the store keeps it.
+func (r *recorded) queued(after time.Duration, queuedAt time.Time, text string) *recorded {
+	off, _ := r.line(after, map[string]any{"type": "attachment", "timestamp": queuedAt.Format(time.RFC3339Nano),
+		"attachment": map[string]any{"type": "queued_command", "commandMode": "task-notification", "prompt": text}})
+	r.evs = append(r.evs, store.Event{Source: store.Transcripts, SourceKey: fmt.Sprintf("%s@%d", r.session, off), TS: queuedAt, Session: r.session,
+		Harness: "claude", Actor: store.ActorHarness, Kind: "harness_text", Summary: storeCut(text), Meta: `{"why":"commandMode task-notification"}`,
+		Ref: fmt.Sprintf("%s@%d#0", r.path, off)})
+	return r
+}
+
+// Claude Code's notice that the artifact watches stopped is a notification the model answers: while the session is
+// idle it opens a turn, so the stop before it ends there, and delivered alone after a usage limit it ends the limit's
+// stop.
+func TestAnAnsweredNoticeIsAnInput(t *testing.T) {
+	st := testStore(t)
+	idle := newTimeline(t, "idle").owner(0, "run the suite", "").say(10*time.Second, "The suite is running. I'll report when it finishes.")
+	promised := idle.at
+	idle.add(10*time.Second, "harness_text", store.ActorHarness, "", storeCut(watchNotice), `{"why":"origin task-notification"}`)
+	noticed := idle.at
+	idle.say(5*time.Second, "Noted: the watches stopped.").put(st)
+	limit := newRecorded(t, "limit").owner(0, "run the soak").say(10*time.Second, "Running the soak.").apiError(time.Minute, weeklyLimit)
+	stoppedAt := limit.at
+	limit.queued(5*time.Minute, stoppedAt.Add(5*time.Minute), watchNotice)
+	delivered := limit.at
+	limit.login(15*time.Minute).say(5*time.Second, "Noted: the watches stopped.").put(st)
+
+	_, rs := replayAll(t, st)
+	ended := func(session string, next time.Time) (Result, bool) {
+		for _, r := range rs {
+			if r.Point.Session == session && r.Point.Next.At.Equal(next) {
+				return r, true
+			}
+		}
+		return Result{}, false
+	}
+	if r, ok := ended("idle", noticed); !ok || !r.Point.Stop.At.Equal(promised) || r.Point.Next.Kind != "self" {
+		t.Errorf("the idle notice ended no stop at the promise (%v): found %v, %+v", promised, ok, r.Point)
+	}
+	r, ok := ended("limit", delivered)
+	if s := r.Point.Stop; !ok || !s.At.Equal(stoppedAt) || s.Error == "" || r.Point.Next.Kind != "self" || r.Decision.Rule != RuleAccess {
+		t.Errorf("the notice after the limit ended no access stop (stopped at %v): found %v, at %v, error %q, next %+v, %s", stoppedAt, ok,
+			s.At, s.Error, r.Point.Next, r.Decision.Rule)
+	}
+}
+
+// A queued command's attachment carries the time Claude Code queued it, before the records it was delivered after:
+// it is read where it sits, and delivered with an input, before anything of that input's turn, it is part of that
+// input. A notification queued after a usage limit and delivered with the owner's "resume" after /login leaves the
+// limit's stop to the access rule, a task's notification as the watches' notice, with its transcript or without.
+func TestAQueuedCommandIsReadWhereItSits(t *testing.T) {
+	st := testStore(t)
+	type shape struct {
+		stoppedAt, login, resume time.Time
+	}
+	shapes := map[string]shape{}
+	task := "<task-notification>\n<task-id>b1</task-id>\n<tool-use-id>toolu_1</tool-use-id>\n<status>completed</status>\n<summary>Background command \"soak\" completed (exit code 0)</summary>\n</task-notification>"
+	for name, text := range map[string]string{"notice": watchNotice, "task": task} {
+		for _, gone := range []bool{false, true} {
+			session := name
+			if gone {
+				session += "-gone"
+			}
+			b := newRecorded(t, session).owner(0, "run the soak").say(10*time.Second, "Running the soak.").apiError(time.Minute, weeklyLimit)
+			stoppedAt := b.at
+			b.login(20 * time.Minute)
+			login := b.at
+			b.owner(2*time.Second, "resume")
+			resume := b.at
+			b.queued(0, stoppedAt.Add(5*time.Minute), text).say(10*time.Second, "Resuming the soak.")
+			if gone {
+				if err := os.Remove(b.path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			b.put(st)
+			shapes[session] = shape{stoppedAt, login, resume}
+		}
+	}
+	points, _ := replayAll(t, st)
+	for _, p := range points {
+		if strings.Contains(p.Next.Text, "<task-notification>") {
+			t.Errorf("%s: the queued notification ended a stop: %+v", p.Session, p.Next)
+		}
+	}
+	for session, c := range shapes {
+		r := replayed(t, st, session, c.resume)
+		if s := r.Point.Stop; s.Working || !s.At.Equal(c.stoppedAt) || s.Error == "" || !s.OwnerAt.Equal(c.login) {
+			t.Errorf("%s: the stop before the resume: working %v, at %v (stopped at %v), error %q, owner at %v (login at %v)", session,
+				s.Working, s.At, c.stoppedAt, s.Error, s.OwnerAt, c.login)
+		}
+		if r.Decision.Rule != RuleAccess || Why(r) == owedReply {
+			t.Errorf("%s: the stop before the resume: %s, %q", session, r.Decision.Rule, Why(r))
+		}
+	}
+}
+
+// A background command that finishes at once is queued as done before the result that launched it is recorded:
+// read where it was delivered, after that result, its notification closes the task, so the session is not left
+// with work in flight.
+func TestANotificationQueuedBeforeItsLaunchClosesItsTask(t *testing.T) {
+	st := testStore(t)
+	b := newRecorded(t, "quick").owner(0, "build it").call(time.Second, "t1")
+	b.event(time.Second, map[string]any{"type": "user", "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "t1"}}}},
+		"tool_result", store.ActorTool, "Bash", "Command running in background with ID: b9. Output is being written to: /work/b9.output", `{"tool_id":"t1"}`)
+	launched := b.at
+	b.queued(0, launched.Add(-23*time.Millisecond), "<task-notification>\n<task-id>b9</task-id>\n<status>completed</status>\n<summary>Background command \"build\" completed (exit code 0)</summary>\n</task-notification>").
+		say(5*time.Second, "The build passed.").owner(10*time.Minute, "status?")
+	asked := b.at
+	b.put(st)
+	if r := replayed(t, st, "quick", asked); r.Point.Stop.Tasks != 0 || r.Point.Stop.Phase == sessions.Background {
+		t.Fatalf("the stop after the build: %d tasks, phase %s", r.Point.Stop.Tasks, r.Point.Stop.Phase)
+	}
+}
+
+// /exit ends the process and the turn it ran: a "No response requested." Claude Code writes as it opens the session
+// again is no sign that it ended mid-task, so the reopened rule leaves a deliberate exit alone. The same record after
+// a process that died with its turn open is one.
+func TestAnExitEndsTheTurnItsProcessRan(t *testing.T) {
+	st := testStore(t)
+	for _, name := range []string{"exited", "died"} {
+		b := newTimeline(t, name).owner(0, "run the suite", "").call(time.Second, "Bash", "t1", `{"command":"make test"}`).
+			result(time.Second, "Bash", "t1", "ok") // the model owes its reply
+		if name == "exited" {
+			b.localCommand(time.Minute, "exit", "")
+		}
+		b.add(40*time.Minute, "harness_text", store.ActorHarness, "", "No response requested.", `{"why":"synthetic message"}`)
+		b.put(st)
+	}
+	if r := replayed(t, st, "exited", time.Time{}); !r.Point.Stop.ResumedAt.IsZero() || r.Decision.Rule == RuleReopened {
+		t.Fatalf("a session reopened after /exit: resumed at %v, %s %s, %q", r.Point.Stop.ResumedAt, r.Decision.Rule, r.Decision.Verdict, Why(r))
+	}
+	if r := replayed(t, st, "died", time.Time{}); r.Point.Stop.ResumedAt.IsZero() || r.Decision.Rule != RuleReopened {
+		t.Fatalf("a session reopened after its process died mid-task: resumed at %v, %s", r.Point.Stop.ResumedAt, r.Decision.Rule)
 	}
 }
 
