@@ -57,6 +57,8 @@ type Result struct {
 	Guarded bool    `json:"guarded,omitempty"`
 	Recur   float64 `json:"recur,omitempty"`
 	NoRate  bool    `json:"no_rate,omitempty"`
+	// Unwatched says its unit was not used in the watch at all: it watched nothing, and gives no P.
+	Unwatched bool `json:"unwatched,omitempty"`
 	// Exposure and Watched are a guard's: the units of exposure its history's incidents came in, and those its watch
 	// saw.
 	Exposure int `json:"exposure,omitempty"`
@@ -189,6 +191,12 @@ func Guarded(incidents, exposure, recurrences, watched int, units string) Result
 	if recurrences > 0 {
 		r.Effect = fmt.Sprintf("guarded: its problem came back after the change (%d of %d %s watched); %d incidents in %d %s before it",
 			recurrences, watched, units, incidents, exposure, units)
+		return r
+	}
+	if watched == 0 {
+		r.Unwatched, r.NoRate = true, true
+		r.Effect = fmt.Sprintf("guarded, not watched: the unit was not used in the 30 days after the change (%d incidents in %d %s before it); there is no P",
+			incidents, exposure, units)
 		return r
 	}
 	chance := "no rate to compare: the history holds no incident after its first"

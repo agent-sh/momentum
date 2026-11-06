@@ -463,8 +463,8 @@ func TestTheLoopsOwnRunsCannotMakeAnUnchangedProblemImprove(t *testing.T) {
 		t.Fatalf("unchanged problem: %+v", got)
 	}
 
-	// A guard's watch: the loop's own runs that use the tool during it, or fail it, neither keep it in use nor recur. A
-	// watch only they touched is held as not in use, never closed as guarded.
+	// A guard's watch: the loop's own runs that use the tool during it, or fail it, neither count as exposure watched
+	// nor recur. A watch only they touched closes as not watched, with no recurrence and no P.
 	w := guarded(t, time.Hour, toolSignal.Source, nil)
 	w.pass(t, Options{})
 	var runs []store.Event
@@ -475,7 +475,7 @@ func TestTheLoopsOwnRunsCannotMakeAnUnchangedProblemImprove(t *testing.T) {
 	}
 	put(t, w.st, runs)
 	w.clock = w.clock.Add(30*aDay + time.Hour)
-	if got := w.pass(t, Options{}); got.Status != "held" || !strings.Contains(got.Why, "not in use") {
+	if got := w.pass(t, Options{}); got.Status != "guarded" || got.Result == nil || !jsonHas(t, got.Result, `"unwatched":true`) {
 		t.Fatalf("a watch only the loop's own runs touched: %+v", got)
 	}
 

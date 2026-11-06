@@ -214,6 +214,9 @@ func Case(stdout io.Writer, c store.Case, evs []store.Evidence, log []store.Case
 		if c.Status == store.CaseClosed && c.Reason == store.Guarded {
 			text = fmt.Sprintf("no recurrence in %d units of exposure watched, after %d incidents in %d before the change; %s; a problem that stopped by itself shows the same: %s",
 				m.Watched, m.Before, m.Exposure, guardChance(m, "%.1f"), m.Effect)
+			if m.Watched == 0 {
+				text = fmt.Sprintf("%s, after %d incidents in %d units of exposure before the change: %s", guardChance(m, "%.1f"), m.Before, m.Exposure, m.Effect)
+			}
 		}
 		field("guarded", text)
 	} else if m.Window > 0 || m.Effect != "" {
@@ -241,6 +244,9 @@ func StatusLine(c store.Case) string {
 	case c.Reason == store.Duplicate:
 		return "closed: duplicate of " + c.Into
 	case c.Reason == store.Guarded:
+		if c.Measurement.Watched == 0 {
+			return "closed: guarded, " + guardChance(c.Measurement, "%.0f")
+		}
 		return fmt.Sprintf("closed: guarded, %d watched, %s; or it stopped by itself", c.Measurement.Watched, guardChance(c.Measurement, "%.0f"))
 	}
 	return "closed: " + string(c.Reason)
@@ -249,6 +255,9 @@ func StatusLine(c store.Case) string {
 // guardChance is a guarded close's P in words, with its precision: the probability that the problem, had it kept
 // happening, would have recurred in its watch, or that its history gives no rate.
 func guardChance(m store.Measurement, precision string) string {
+	if m.Watched == 0 {
+		return "not watched: the unit was not used in the 30 days"
+	}
 	if m.Before == 0 {
 		return "no rate to compare: the history holds no incident after its first"
 	}

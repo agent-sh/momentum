@@ -135,11 +135,12 @@ type Package struct {
 	RollbackProblem  string           `json:"rollback_problem,omitempty"` // cleaned cause of the last failed rollback
 	// GuardFrom is when a guard's change first took effect: its watch runs, and its recurrences count, from then,
 	// whatever wait or restart came after. GuardSeq is the store's write sequence (store.Seq) the watch after a
-	// guarded close has read to: each pass reads only the rows written or rewritten since. GuardIdle says the watch
-	// ended with a week its unit was not in use, which it noted once.
-	GuardFrom time.Time `json:"guard_from,omitzero"`
-	GuardSeq  int64     `json:"guard_seq,omitempty"`
-	GuardIdle bool      `json:"guard_idle,omitempty"`
+	// guarded close has read to: each pass reads only the rows written or rewritten since. GuardAway are the
+	// stretches its change was out of effect inside the watch, as the passes saw them: its exposure watched leaves
+	// them out.
+	GuardFrom time.Time      `json:"guard_from,omitzero"`
+	GuardSeq  int64          `json:"guard_seq,omitempty"`
+	GuardAway [][2]time.Time `json:"guard_away,omitempty"`
 }
 
 // RollbackJournal keeps the exact revert candidate before any remote write. A retry checks this head on the
@@ -1739,7 +1740,7 @@ func (s *Ship) packageText(c store.Case, p Package) string {
 			chance = fmt.Sprintf("its report gives P, the probability that the problem, had it kept happening, would have recurred within the exposure watched (%.0f%% at %d units)",
 				100*measure.GuardRecur(g.Incidents, g.Exposure, g.Exposure), g.Exposure)
 		}
-		fmt.Fprintf(&b, "- Guarded, not measured: no rate can be compared for it (%s). The signal `%s` counted %d incidents (runs of events no more than %s apart) in %d %s of exposure since %s%s. The watch starts when the change first takes effect and lasts %s, while its unit is in use every week. One recurrence brings the case back. No recurrence closes it as guarded, a close that claims nothing for the change; %s. A problem that stopped by itself gives the same result.\n",
+		fmt.Fprintf(&b, "- Guarded, not measured: no rate can be compared for it (%s). The signal `%s` counted %d incidents (runs of events no more than %s apart) in %d %s of exposure since %s%s. The watch starts when the change first takes effect and lasts %s; it reports the exposure watched while the change was in effect. One recurrence, of the signal or of the case's own evidence, brings the case back. No recurrence closes it as guarded, a close that claims nothing for the change; %s. A problem that stopped by itself gives the same result.\n",
 			g.Instead, sig, g.Incidents, days(g.Gap), g.Exposure, p.Plan.Units, g.Since.UTC().Format(time.DateOnly), guardUnitText(*g), days(guardRetention), chance)
 	} else {
 		fmt.Fprintf(&b, "- Measurement: the signal `%s` counted events in %d of %d %s in the %s baseline before the gated window; the gate counted %d of %d in its last %s. The %s after the change is in effect is compared with the baseline (Fisher's exact test, one-sided, p below 0.05).\n",

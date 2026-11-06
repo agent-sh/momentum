@@ -316,7 +316,7 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		// a guard's recurrence counts from its watch's first start, from the plan the proposal recorded, before any
 		// wait for a source or for its change to be in effect: it needs only the signal
 		from := guardStart(c, &p)
-		if back, err := recurrences(ctx, r.Store, *p.Plan, from, time.Time{}, r.Dir); err != nil {
+		if back, err := r.guardRecurrences(ctx, c, *p.Plan, from); err != nil {
 			return failed(err.Error())
 		} else if len(back) > 0 {
 			return r.guardRegressed(ctx, c, &p, *p.Plan, m, back, from, now, dry)
@@ -365,8 +365,9 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		p.GuardFrom = guardEffectTime(c, &p, since)
 	}
 	if plan.Guard != nil && c.Status == store.CaseMeasuring && !p.OutOfEffect.IsZero() {
-		// in effect again: the watch goes on from its first start
+		// in effect again: the watch goes on from its first start, and the stretch away is left out of its exposure
 		if !dry {
+			p.GuardAway = append(p.GuardAway, [2]time.Time{p.OutOfEffect, since})
 			p.OutOfEffect = time.Time{}
 			if err := r.Ship.save(&p); err != nil {
 				return failed(err.Error())
@@ -378,7 +379,7 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		m.Status, m.Due = "measuring", since.Add(plan.Window)
 		if plan.Guard != nil {
 			m.Due, m.Guarded = p.GuardFrom.Add(guardRetention), true
-			m.Why = fmt.Sprintf("guarded, not measured: it watches %s for a recurrence while its unit is in use every week", days(guardRetention))
+			m.Why = fmt.Sprintf("guarded, not measured: it watches %s for a recurrence", days(guardRetention))
 		}
 		if !dry {
 			switch {
@@ -397,6 +398,14 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 				return failed(err.Error())
 			}
 			r.resolve(ctx, &p)
+		}
+		if plan.Guard != nil {
+			// the watch may start before this pass (its change's file dates it): a recurrence from then is acted on now
+			if back, err := r.guardRecurrences(ctx, c, plan, p.GuardFrom); err != nil {
+				return failed(err.Error())
+			} else if len(back) > 0 {
+				return r.guardRegressed(ctx, c, &p, plan, m, back, p.GuardFrom, now, dry)
+			}
 		}
 		return m
 	}

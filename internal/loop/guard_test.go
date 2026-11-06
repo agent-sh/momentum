@@ -517,20 +517,35 @@ func TestAGuardWithNoIncidentAfterItsFirstReportsNoRate(t *testing.T) {
 	}
 }
 
-// A watch is something only while the problem's unit was in use: one whose last two weeks saw no use of the tool is
-// held as not in use, never passed, and the case keeps watching.
-func TestAGuardsWatchWithAWeekOutOfUseIsHeld(t *testing.T) {
+// Nothing holds a guard's close for its unit's use: a watch whose tool was used in two of its weeks, and idle for the
+// rest as on a holiday, closes as guarded with the 50 hours it watched; one whose tool was not used at all closes as
+// guarded too, not watched, with no P.
+func TestAGuardsWatchClosesWhateverItsUnitsUse(t *testing.T) {
 	m := guarded(t, time.Hour, toolSignal.Source, nil)
 	m.pass(t, Options{})
 	effect := m.clock
 	usesIn(t, m.st, toolSignal.Source, "w", effect.Add(time.Hour), 25, 5)
 	usesIn(t, m.st, toolSignal.Source, "x", effect.Add(8*aDay), 25, 5)
 	m.clock = effect.Add(30*aDay + time.Hour)
-	if got := m.pass(t, Options{}); got.Status != "held" || !strings.Contains(got.Why, "not in use") {
+	if got := m.pass(t, Options{}); got.Status != "guarded" || got.Result == nil || !strings.Contains(got.Result.Effect, "no recurrence in 50 session hours watched") {
 		t.Fatalf("a watch with weeks out of use: %+v", got)
 	}
-	if c := m.theCase(t); c.Status != store.CaseMeasuring {
-		t.Fatalf("the case: %+v", c)
+
+	m = guarded(t, time.Hour, toolSignal.Source, nil)
+	m.pass(t, Options{})
+	m.clock = m.clock.Add(30*aDay + time.Hour)
+	got := m.pass(t, Options{})
+	if got.Status != "guarded" || got.Result == nil || !strings.Contains(got.Result.Effect, "not watched: the unit was not used in the 30 days") || strings.Contains(got.Result.Effect, "P=") ||
+		!jsonHas(t, got.Result, `"unwatched":true`) {
+		t.Fatalf("a watch whose tool was not used: %+v %+v", got, got.Result)
+	}
+	c := m.theCase(t)
+	if s := evidenceview.StatusLine(c); s != "closed: guarded, not watched: the unit was not used in the 30 days" || !strings.Contains(shown(t, c), "not watched") || strings.Contains(shown(t, c), "P=") {
+		t.Fatalf("an unwatched close's views: %q %s", s, shown(t, c))
+	}
+	ns := m.notes(t)
+	if len(ns) != 1 || !strings.Contains(ns[0].Detail, "It was not watched") || strings.Contains(ns[0].Detail, "P=") {
+		t.Fatalf("an unwatched close's note: %+v", ns)
 	}
 }
 
@@ -953,7 +968,7 @@ func TestAGuardedComebackShowsNoOldWatch(t *testing.T) {
 	}
 	c = m.theCase(t)
 	l := lastLog(t, m.st, c.ID)
-	if s := shown(t, c); strings.Contains(l.Detail, "already solved") || !strings.Contains(l.Detail, "since it closed as guarded") || strings.Contains(s, "measured:") ||
+	if s := shown(t, c); strings.Contains(l.Detail, "already solved") || !strings.Contains(l.Detail, "since its guard's watch began") || strings.Contains(s, "measured:") ||
 		strings.Contains(s, "guarded:") {
 		t.Fatalf("a guarded comeback: %s: %s\n%s", l.Action, l.Detail, s)
 	}

@@ -426,6 +426,10 @@ func comesBack(ctx context.Context, q querier, c Case, now time.Time) (bool, str
 		return n, err
 	}
 	from, since := c.Closed, "it closed as "+strings.ReplaceAll(string(c.Reason), "-", " ")
+	if c.Reason == Guarded && !c.Deployed.IsZero() {
+		// a guard watched from its change's start: evidence dated from then is its problem back
+		from, since = c.Deployed.Add(-time.Millisecond), "its guard's watch began"
+	}
 	if c.Reason == Solved {
 		_, at, named, err := fixedOf(ctx, q, c)
 		if err != nil {
