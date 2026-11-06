@@ -85,9 +85,9 @@ func (s *Ship) deploymentReceipt(ctx context.Context, p Package) error {
 	window := ""
 	if p.Plan != nil {
 		window = " Measured over the " + days(p.Plan.Window) + " after it is in effect."
-		if p.Plan.Guard != nil {
-			window = fmt.Sprintf(" Guarded, not measured: watched for a recurrence until %d %s of exposure after it is in effect, about %s; one fails it.",
-				p.Plan.Guard.Need, p.Plan.Units, days(p.Plan.Guard.Watch))
+		if g := p.Plan.Guard; g != nil && p.Plan.Units != "" {
+			window = fmt.Sprintf(" Guarded, not measured: it watches for a recurrence from when it is in effect until %d %s of exposure or %s, whichever comes first; P=%.0f%% at %d, the probability that the problem, had it kept happening, would recur within it. One recurrence brings the case back.",
+				g.Need, p.Plan.Units, days(guardRetention), 100*measure.GuardRecur(g.Incidents, g.Exposure, g.Need), g.Need)
 		}
 	}
 	if len(p.Hand) > 0 {
@@ -442,8 +442,13 @@ func expandHome(p string) string {
 var countLimit = 1_000_000
 
 func Count(ctx context.Context, st *store.Store, sig Signal, since, until time.Time, excludeCwd string, actor store.Actor) ([]store.Event, error) {
+	return countStored(ctx, st, sig, since, until, excludeCwd, actor, time.Time{})
+}
+
+// countStored is Count of the events the store took in at or after stored (all of them, for zero).
+func countStored(ctx context.Context, st *store.Store, sig Signal, since, until time.Time, excludeCwd string, actor store.Actor, stored time.Time) ([]store.Event, error) {
 	evs, err := st.Events(ctx, store.Query{Since: since, Until: until, ExcludeCwd: excludeCwd, Source: sig.Source, Kinds: sig.Kinds, Harness: sig.Harness,
-		Actor: actor, FailedResults: true, Limit: countLimit + 1})
+		Actor: actor, FailedResults: true, Limit: countLimit + 1, StoredSince: stored})
 	if err != nil {
 		return nil, err
 	}

@@ -50,9 +50,11 @@ type Result struct {
 	P        float64 `json:"p"` // the chance, under no change, of an after count this low or lower
 	Improved bool    `json:"improved"`
 	Effect   string  `json:"effect"` // the effect in words
-	// Guarded marks a guard's watch (Guard), not a measured drop: Before holds the history's incidents and its
-	// exposure, After the watch's recurrences and its exposure.
-	Guarded bool `json:"guarded,omitempty"`
+	// Guarded marks a guard's watch, not a measurement: Before holds the history's incidents and its exposure, After
+	// the watch's recurrences and its exposure, and Improved is never set. Recur is the predictive probability that
+	// the problem, had it kept happening, would have recurred within the exposure watched (GuardRecur).
+	Guarded bool    `json:"guarded,omitempty"`
+	Recur   float64 `json:"recur,omitempty"`
 }
 
 // Compare decides whether the share fell from before to after. With no activity in either window there is nothing
@@ -100,13 +102,12 @@ func Back(before Counts, windows []Counts) bool {
 	return hits >= MinBefore
 }
 
-// A guard stands in for a measured plan when the problem has stopped, or is too rare for a share to fall: it asks
-// whether the problem comes back. Its incidents are taken as a Poisson process in units of exposure, at a rate λ the
-// history estimates from k incidents in T units. A watch of E units with no recurrence passes. Sized by the plug-in
-// rate (E = ln(1/Alpha)·T/k), a change that did nothing passes far more often than Alpha when k is small, since the
-// rate is uncertain. A guard sizes E from the posterior predictive with Jeffreys' prior instead: with λ ~ Gamma(k+½, T),
-// a watch of E units holds no recurrence with probability (T/(T+E))^(k+½), which is Alpha at
-// E = T·((1/Alpha)^(1/(k+½)) − 1).
+// A guard stands in for a measured plan when the problem has stopped, or is too rare for a share to fall. It is a
+// watch, not a proof: it watches for the problem to come back. Its incidents are taken as a Poisson process in units
+// of exposure, at a rate λ its history knows from k incidents in T units. With Jeffreys' prior, λ ~ Gamma(k+½, T), and
+// a watch of W units holds no recurrence with predictive probability (T/(T+W))^(k+½). The watch runs to the E at which
+// that is Alpha, E = T·((1/Alpha)^(1/(k+½)) − 1), or to the store's retention, whichever comes first, and reports
+// the probability that the problem, had it kept happening, would have recurred within what it watched.
 
 // Incident is a run of a signal's events with no gap longer than the guard's gap between two of them: events close
 // together share a cause, so one burst of hundreds is one incident.
@@ -114,6 +115,10 @@ type Incident struct {
 	First, Last time.Time
 	Events      int
 }
+
+// GuardGap is the longest quiet stretch inside one incident: a week, the weekly cycle the whole-weeks rule exists for.
+// A shorter one can be its lull (a night, a weekend) rather than the end of a cause.
+const GuardGap = 7 * 24 * time.Hour
 
 // Incidents groups events by their times: a gap longer than gap between two of them starts a new incident.
 func Incidents(at []time.Time, gap time.Duration) []Incident {
@@ -131,9 +136,9 @@ func Incidents(at []time.Time, gap time.Duration) []Incident {
 	return out
 }
 
-// GuardNeed is the exposure a guard's watch must reach with no recurrence: the E at which the posterior predictive
-// chance of a watch that quiet, under no change, is Alpha, E = T·((1/Alpha)^(1/(k+½)) − 1), rounded up to a whole
-// unit. With no exposure there is no history, and it is 0.
+// GuardNeed is the exposure a guard's watch runs to: the E at which the posterior predictive chance of a watch that
+// quiet, under no change, is Alpha, E = T·((1/Alpha)^(1/(k+½)) − 1), rounded up to a whole unit. With no exposure
+// there is no history, and it is 0.
 func GuardNeed(incidents, exposure int) int {
 	if incidents < 0 || exposure <= 0 {
 		return 0
@@ -150,16 +155,21 @@ func GuardP(incidents, exposure, watched int) float64 {
 	return math.Pow(float64(exposure)/float64(exposure+watched), float64(incidents)+0.5)
 }
 
+// GuardRecur is the predictive probability that the problem, had it kept happening, would have recurred within
+// watched units: 1 − GuardP. It assumes the problem was still happening when the change took effect; a problem
+// that stopped by itself shows the same quiet.
+func GuardRecur(incidents, exposure, watched int) float64 {
+	return 1 - GuardP(incidents, exposure, watched)
+}
+
 // GuardHistory is what a guard knows of its problem before the change: from Since, over Span, its incidents in its
-// units of exposure, the units up to the end of its last incident (Before: the rest is the quiet stretch since), and
-// the units outside every incident (Quiet).
+// units of exposure, and the units up to the end of its last incident (Before: the rest is the quiet stretch since).
 type GuardHistory struct {
 	Since     time.Time
 	Span      time.Duration
 	Incidents int
 	Exposure  int
 	Before    int
-	Quiet     int
 }
 
 // GuardCount is a guard's history over [since, until) from its incidents and the hours of its units of exposure (one
@@ -171,10 +181,7 @@ func GuardCount(incidents []Incident, units []int64, since, until time.Time, gap
 		since = incidents[0].Last.Truncate(time.Hour).Add(time.Hour)
 		incidents = incidents[1:]
 	}
-	h := GuardHistory{Since: since, Span: until.Sub(since), Incidents: len(incidents)}
-	if h.Span < 0 {
-		h.Span = 0
-	}
+	h := GuardHistory{Since: since, Span: max(until.Sub(since), 0), Incidents: len(incidents)}
 	from := since.UnixMilli() / 3_600_000
 	var lastHour int64 = -1
 	if n := len(incidents); n > 0 {
@@ -188,64 +195,35 @@ func GuardCount(incidents []Incident, units []int64, since, until time.Time, gap
 		if u <= lastHour {
 			h.Before++
 		}
-		inside := slices.ContainsFunc(incidents, func(in Incident) bool {
-			return u >= in.First.UnixMilli()/3_600_000 && u <= in.Last.UnixMilli()/3_600_000
-		})
-		if !inside {
-			h.Quiet++
-		}
 	}
 	return h
 }
 
-// GuardAdmit decides whether a guard can stand on its history, and its watch: the exposure it needs and the time the
-// history took to hold that much. why says what refuses it: a history that never saw the unit in use without the
-// problem (too thin to estimate a rate); a quiet stretch since the last incident that the history before it would
-// make unlikely had the problem gone on (it had likely stopped before the change, so a watch could not tell the
-// change from that); or a watch longer than retention, the span the store is sure to read again when it ends.
-func GuardAdmit(h GuardHistory, retention time.Duration) (need int, expected time.Duration, why string) {
-	switch {
-	case h.Exposure == 0 || h.Quiet == 0:
-		return 0, 0, fmt.Sprintf("its history is too thin to tell how often the problem starts: of its %d units of exposure none lies outside its incidents, so the unit was never seen in use without the problem", h.Exposure)
-	case h.Incidents == 0:
-		return 0, 0, "its problem has not come back since the incident its source began with, so nothing tells how often it starts"
-	}
-	if p := GuardP(h.Incidents, h.Before, h.Exposure-h.Before); p < Alpha {
-		return 0, 0, fmt.Sprintf("its problem had likely stopped before the change: had it gone on as its %d incidents in %d units of exposure show, %d quiet units since its last had a chance of %s, below %.2f, so a watch could not tell the change from that",
-			h.Incidents, h.Before, h.Exposure-h.Before, percent(p), Alpha)
-	}
-	need = GuardNeed(h.Incidents, h.Exposure)
-	expected = time.Duration(float64(h.Span) * float64(need) / float64(h.Exposure))
-	if expected > retention {
-		return need, expected, fmt.Sprintf("too rare to prove by recurrence within the store's history: %d incidents in %d units of exposure over %s ask a watch of %d units with no recurrence, about %s, past the %s the store is sure to read again",
-			h.Incidents, h.Exposure, days(h.Span), need, days(expected), days(retention))
-	}
-	return need, expected, ""
-}
-
-// GuardWatch is a guard's window: the expected time to its need in whole weeks, at least one, at most retention.
-func GuardWatch(expected, retention time.Duration) time.Duration {
+// GuardWatch is a guard's expected window: the time its history took to hold E units of exposure, in whole weeks, at
+// least one and at most retention.
+func GuardWatch(h GuardHistory, retention time.Duration) time.Duration {
 	const week = 7 * 24 * time.Hour
+	if h.Exposure <= 0 {
+		return retention
+	}
+	expected := time.Duration(float64(h.Span) * float64(GuardNeed(h.Incidents, h.Exposure)) / float64(h.Exposure))
 	return min(max(week, (expected+week-1)/week*week), retention)
 }
 
 // Guarded is a guard's watch as a result: incidents in a history of exposure units before the change, recurrences in
-// watched units after it, counted in units. It is improved only with no recurrence and the exposure GuardNeed asks
-// for. Its p is GuardP, the predictive chance under no change of a watch this quiet; its effect says it was guarded,
-// never that a rate fell.
+// watched units after it, counted in units. It is never improved: a guard makes no claim. Its Recur is GuardRecur, and
+// its effect says it was guarded, with the exposure watched and that probability, never a drop or a rate.
 func Guarded(incidents, exposure, recurrences, watched int, units string) Result {
 	r := Result{Before: Counts{Hits: incidents, Base: exposure}, After: Counts{Hits: recurrences, Base: watched}, Guarded: true,
-		P: GuardP(incidents, exposure, watched)}
-	need := GuardNeed(incidents, exposure)
-	r.Improved = recurrences == 0 && need > 0 && watched >= need
+		P: GuardP(incidents, exposure, watched), Recur: GuardRecur(incidents, exposure, watched)}
 	if recurrences > 0 {
-		r.P = 1
-		r.Effect = fmt.Sprintf("guarded, not a measured drop: its problem came back after the change (%d of %d %s watched); %d incidents in %d %s before it",
+		r.P, r.Recur = 1, 0
+		r.Effect = fmt.Sprintf("guarded: its problem came back after the change (%d of %d %s watched); %d incidents in %d %s before it",
 			recurrences, watched, units, incidents, exposure, units)
 		return r
 	}
-	r.Effect = fmt.Sprintf("guarded, not a measured drop: no recurrence in %d %s after the change, of the %d its watch needs (%d incidents in %d %s before it); a change that did nothing would have met one with predictive probability %s, p=%.3f",
-		watched, units, need, incidents, exposure, units, percent(1-r.P), r.P)
+	r.Effect = fmt.Sprintf("guarded, not measured: no recurrence in %d %s watched after the change (it runs to %d; %d incidents in %d %s before it); P=%s that the problem, had it kept happening, would have recurred within them; a problem that stopped by itself shows the same",
+		watched, units, GuardNeed(incidents, exposure), incidents, exposure, units, percent(r.Recur))
 	return r
 }
 

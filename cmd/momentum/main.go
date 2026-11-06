@@ -96,7 +96,10 @@ const usage = `usage:
                                         their sources have read them, by its signal's share of the
                                         active hours; improved closes its case and keeps the change, no measured effect
                                         rolls it back while the loop is live (else it holds the rollback, with a
-                                        note); three consecutive read windows at its old share with five hits among them bring it back
+                                        note); three consecutive read windows at its old share with five hits among them bring it back;
+                                        a guard watches a change too new or too rare to measure for a recurrence, closes
+                                        it as guarded with the probability it would have recurred had nothing changed, and
+                                        brings it back at a recurrence
   momentum loop runs [--since WHEN] [--case ID] [--json]
                                         the loop's runs, and what the live ones spent in the last day and week
   momentum loop eval [--golden FILE] [--task ID,...] [--trials K] [--arms loop,native]

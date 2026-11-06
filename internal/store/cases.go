@@ -78,6 +78,7 @@ type CloseReason string
 
 const (
 	Improved     CloseReason = "improved"              // its change measurably helped: only the measure tool closes so
+	Guarded      CloseReason = "guarded"               // a guard's watch ended with no recurrence: no measurement, only the measure tool closes so
 	NotWorthIt   CloseReason = "not-worth-it"          // a fix would cost more than it saves, or the change did nothing
 	Insufficient CloseReason = "insufficient-evidence" // the evidence cannot decide it; also a case unseen past its retention
 	Solved       CloseReason = "already-solved"        // something else fixed it already
@@ -85,7 +86,7 @@ const (
 )
 
 // CloseReasons are the reasons a case can close with.
-var CloseReasons = []CloseReason{Improved, NotWorthIt, Insufficient, Solved, Duplicate}
+var CloseReasons = []CloseReason{Improved, Guarded, NotWorthIt, Insufficient, Solved, Duplicate}
 
 // CaseRetention is how long a case may go unseen before it closes by itself: about as long as Claude Code keeps a
 // transcript, past which the evidence behind it is gone from its source.
@@ -150,6 +151,10 @@ type Measurement struct {
 	// Exposure is a guard's, and marks one (Guarded): the units of exposure its incidents (Before) came in before the
 	// change. A guard measures no rate: its watch asks whether the problem comes back, and After counts recurrences.
 	Exposure int
+	// Watched and Recur are a guard's at its close: the units of exposure its watch saw with no recurrence, and the
+	// predictive probability that the problem, had it kept happening, would have recurred within them.
+	Watched int
+	Recur   float64
 }
 
 // Guarded says the measurement is a guard's watch, not a measured drop.
@@ -248,7 +253,7 @@ func newCaseID() string {
 
 const caseColumns = `id, family, title, status, reason, merged_into, mechanism, alternatives, next_test, benefit, cost_usd,
   cost_tokens, cost_ms, runs, closed_evidence, opened, updated, seen, closed, deployed, package, window_ms, before_n,
-  after_n, effect, back, episode, guard_exposure`
+  after_n, effect, back, episode, guard_exposure, guard_watched, guard_recur`
 
 func scanCase(row interface{ Scan(...any) error }) (Case, error) {
 	var c Case
@@ -256,7 +261,8 @@ func scanCase(row interface{ Scan(...any) error }) (Case, error) {
 	var costMS, opened, updated, seen, closed, deployed, window, back int64
 	if err := row.Scan(&c.ID, &c.Family, &c.Title, &status, &reason, &c.Into, &c.Mechanism, &alts, &c.NextTest, &c.Benefit,
 		&c.Cost.USD, &c.Cost.Tokens, &costMS, &c.Cost.Runs, &c.ClosedEvidence, &opened, &updated, &seen, &closed, &deployed,
-		&c.Package, &window, &c.Measurement.Before, &c.Measurement.After, &c.Measurement.Effect, &back, &c.Episode, &c.Measurement.Exposure); err != nil {
+		&c.Package, &window, &c.Measurement.Before, &c.Measurement.After, &c.Measurement.Effect, &back, &c.Episode, &c.Measurement.Exposure,
+		&c.Measurement.Watched, &c.Measurement.Recur); err != nil {
 		return Case{}, err
 	}
 	c.Status, c.Reason = CaseStatus(status), CloseReason(reason)
@@ -407,6 +413,8 @@ func addEvidence(ctx context.Context, q querier, id string, evs []Evidence, now 
 // comesBack decides whether a closed case comes back on the evidence it holds now, and says why either way.
 //   - A case closed as improved does not come back on its evidence: the measure step watches its signal, in the
 //     units its measurement counted, and brings it back at its old rate (RegressCase).
+//   - Nor does one closed as guarded: the measure step watches its signal and brings it back at its first event
+//     after the change (RegressCase).
 //   - A case closed as already solved comes back on any evidence after the close, or after its fix was named when
 //     that came after the close (CloseFixed on a case closed before a close named its fix).
 //   - A dismissed case (not worth it, insufficient evidence) comes back only once the evidence after the close
@@ -434,6 +442,8 @@ func comesBack(ctx context.Context, q querier, c Case, now time.Time) (bool, str
 	switch c.Reason {
 	case Improved:
 		return false, fmt.Sprintf("%d new since it closed as improved; the measure step brings it back at its old rate", after), nil
+	case Guarded:
+		return false, fmt.Sprintf("%d new since it closed as guarded; the measure step brings it back at its signal's first event after the change", after), nil
 	case Solved:
 		return after > 0, fmt.Sprintf("%d new since %s", after, since), nil
 	case NotWorthIt, Insufficient:
@@ -467,7 +477,7 @@ func reopenIfBack(ctx context.Context, q querier, c Case, added, actor string, n
 		return false, err
 	}
 	action := "reopened"
-	if c.Reason == Improved || c.Reason == Solved {
+	if c.Reason == Improved || c.Reason == Guarded || c.Reason == Solved {
 		action = "regressed"
 	}
 	return true, caseLog(ctx, q, c.ID, actor, action, fmt.Sprintf("%s; closed as %s; %s", added, c.Reason, why), now)
@@ -965,7 +975,7 @@ func (s *Store) ReopenCase(ctx context.Context, id string, evs []Evidence, why, 
 		return Case{}, err
 	}
 	action := "reopened"
-	if c.Reason == Improved || c.Reason == Solved {
+	if c.Reason == Improved || c.Reason == Guarded || c.Reason == Solved {
 		action = "regressed" // its fix did not hold
 	}
 	if err := caseLog(ctx, tx, c.ID, actor, action, fmt.Sprintf("closed as %s; %d new evidence: %s", c.Reason, added, why), now); err != nil {
@@ -1001,6 +1011,8 @@ func (s *Store) CloseCase(ctx context.Context, id string, reason CloseReason, in
 		return Case{}, badCase("reason %q is not one of not-worth-it, insufficient-evidence, already-solved, duplicate", reason)
 	case reason == Improved:
 		return Case{}, badCase("only the measure tool closes a case as improved, with its measurement")
+	case reason == Guarded:
+		return Case{}, badCase("only the measure tool closes a case as guarded, with its watch")
 	case c.Status == CaseClosed && c.Family == HealthFamily && c.Reason == Solved && reason == Solved:
 		hint := ""
 		if _, _, named, err := fixedOf(ctx, tx, c); err != nil {
@@ -1551,7 +1563,7 @@ func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, 
 		return Case{}, badCase("case %s is %s: only a deployed or measuring case rolls back", c.ID, c.Status)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, deployed = 0, window_ms = 0, before_n = 0, after_n = 0,
-	  effect = '', guard_exposure = 0, updated = ? WHERE id = ?`, CaseTesting, time.Now().UnixMilli(), c.ID); err != nil {
+	  effect = '', guard_exposure = 0, guard_watched = 0, guard_recur = 0, updated = ? WHERE id = ?`, CaseTesting, time.Now().UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
 	if err := caseLogCleaned(ctx, tx, c.ID, actor, "rolled back", why, time.Now()); err != nil {
@@ -1681,6 +1693,41 @@ func (s *Store) CloseMeasured(ctx context.Context, id string, after int, effect,
 	return c, tx.Commit()
 }
 
+// CloseGuarded is the measure tool's: a measuring case whose guard's watch ended with no recurrence closes as guarded,
+// never as improved, with the units of exposure watched, the predictive probability that the problem, had it kept
+// happening, would have recurred within them, and the watch in words. Its first recurrence brings it back
+// (RegressCase).
+func (s *Store) CloseGuarded(ctx context.Context, id string, watched int, recur float64, effect, actor string) (Case, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Case{}, err
+	}
+	defer tx.Rollback()
+	c, err := getCase(ctx, tx, id)
+	if err != nil {
+		return Case{}, err
+	}
+	switch {
+	case c.Status != CaseMeasuring || !c.Measurement.Guarded():
+		return Case{}, badCase("case %s is %s: only a guarded measuring case closes as guarded", c.ID, c.Status)
+	case strings.TrimSpace(effect) == "" || watched < 0 || recur < 0 || recur > 1:
+		return Case{}, badCase("a guarded close records its exposure watched, its probability and its watch")
+	}
+	now := time.Now()
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, reason = ?, closed = ?, updated = ?, after_n = 0, effect = ?, guard_watched = ?,
+	  guard_recur = ?, closed_evidence = (SELECT COUNT(*) FROM case_evidence WHERE case_id = ?) WHERE id = ?`,
+		CaseClosed, string(Guarded), now.UnixMilli(), now.UnixMilli(), caseText(effect, caseTextMax), watched, recur, c.ID, c.ID); err != nil {
+		return Case{}, err
+	}
+	if err := caseLog(ctx, tx, c.ID, actor, "closed", string(Guarded)+": "+effect, now); err != nil {
+		return Case{}, err
+	}
+	if c, err = getCase(ctx, tx, c.ID); err != nil {
+		return Case{}, err
+	}
+	return c, tx.Commit()
+}
+
 // RegressCase is the measure tool's: a case closed as improved whose problem is back at its old rate comes back,
 // open, the same case with its history, its log saying it regressed and why.
 func (s *Store) RegressCase(ctx context.Context, id, why, actor string) (Case, error) {
@@ -1693,15 +1740,15 @@ func (s *Store) RegressCase(ctx context.Context, id, why, actor string) (Case, e
 	if err != nil {
 		return Case{}, err
 	}
-	if c.Status != CaseClosed || c.Reason != Improved {
-		return Case{}, badCase("case %s is %s %s: only a case closed as improved regresses", c.ID, c.Status, c.Reason)
+	if c.Status != CaseClosed || c.Reason != Improved && c.Reason != Guarded {
+		return Case{}, badCase("case %s is %s %s: only a case closed as improved or guarded regresses", c.ID, c.Status, c.Reason)
 	}
 	now := time.Now()
 	if _, err := tx.ExecContext(ctx, `UPDATE cases SET episode = episode + 1, status = ?, reason = '', closed = 0, closed_evidence = 0, updated = ?, back = ?
 	  WHERE id = ?`, CaseOpen, now.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
-	if err := caseLog(ctx, tx, c.ID, actor, "regressed", "closed as improved; "+why, now); err != nil {
+	if err := caseLog(ctx, tx, c.ID, actor, "regressed", "closed as "+string(c.Reason)+"; "+why, now); err != nil {
 		return Case{}, err
 	}
 	if c, err = getCase(ctx, tx, c.ID); err != nil {

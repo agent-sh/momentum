@@ -145,7 +145,8 @@ var keptColumns = []struct {
 	{"session_stamps", [][2]string{{"tool", "TEXT NOT NULL DEFAULT ''"}, {"name", "TEXT NOT NULL DEFAULT ''"},
 		{"cwd", "TEXT NOT NULL DEFAULT ''"}, {"auto", "INTEGER NOT NULL DEFAULT 0"}, {"ask", "TEXT NOT NULL DEFAULT ''"}, {"ask_kind", "TEXT NOT NULL DEFAULT ''"}}},
 	{"loop_runs", loopRunColumns},
-	{"cases", [][2]string{{"episode", "INTEGER NOT NULL DEFAULT 1"}, {"guard_exposure", "INTEGER NOT NULL DEFAULT 0"}}},
+	{"cases", [][2]string{{"episode", "INTEGER NOT NULL DEFAULT 1"}, {"guard_exposure", "INTEGER NOT NULL DEFAULT 0"}, {"guard_watched", "INTEGER NOT NULL DEFAULT 0"},
+		{"guard_recur", "REAL NOT NULL DEFAULT 0"}}},
 	{"capacity_runs", [][2]string{{"blind", "INTEGER NOT NULL DEFAULT 0"}}},
 }
 
@@ -1036,6 +1037,9 @@ type Query struct {
 	// an error is no failure. Events of any other kind are all there.
 	FailedResults bool
 	Before        *Event // exclusive (time, source key) cursor for descending pagination
+	// StoredSince, when set, keeps the events the store took in at or after it (their ingested time, the wall clock's
+	// when first stored), whatever they are dated: a watch that reads only what came in since its last pass.
+	StoredSince time.Time
 }
 
 func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
@@ -1076,6 +1080,9 @@ func ReadEvents(ctx context.Context, db *sql.DB, q Query) ([]Event, error) {
 	}
 	if q.FailedResults {
 		where, args = append(where, "(kind != 'tool_result' OR instr(meta, ?) > 0)"), append(args, `"is_error":true`)
+	}
+	if !q.StoredSince.IsZero() {
+		where, args = append(where, "ingested >= ?"), append(args, q.StoredSince.UnixMilli())
 	}
 	order := "ts DESC, source_key DESC"
 	if q.Session != "" {

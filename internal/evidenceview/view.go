@@ -202,10 +202,12 @@ func Case(stdout io.Writer, c store.Case, evs []store.Evidence, log []store.Case
 		field("deployed", c.Deployed.Local().Format("2006-01-02 15:04")+" "+c.Package)
 	}
 	if m := c.Measurement; m.Guarded() {
-		// a guard measures no rate: it watched for a recurrence of a problem that had stopped
-		text := fmt.Sprintf("not measured: %d incidents in %d units of exposure before the change; %d recurrences over a watch of %s", m.Before, m.Exposure, m.After, m.Window)
-		if m.Effect != "" {
-			text += ": " + m.Effect
+		// a guard measures no rate: it watches for a problem that had stopped to come back
+		text := fmt.Sprintf("watching for a recurrence after %d incidents in %d units of exposure before the change, until its exposure or 30 days end it (expected in %dd)",
+			m.Before, m.Exposure, int(m.Window.Hours()/24))
+		if c.Status == store.CaseClosed && c.Reason == store.Guarded {
+			text = fmt.Sprintf("no recurrence in %d units of exposure watched after %d incidents in %d before the change; P=%.1f%% that the problem, had it kept happening, would have recurred within them (a problem that stopped by itself shows the same): %s",
+				m.Watched, m.Before, m.Exposure, 100*m.Recur, m.Effect)
 		}
 		field("guarded", text)
 	} else if m.Window > 0 || m.Effect != "" {
@@ -224,10 +226,14 @@ func Case(stdout io.Writer, c store.Case, evs []store.Evidence, log []store.Case
 
 func StatusLine(c store.Case) string {
 	switch {
+	case c.Status == store.CaseMeasuring && c.Measurement.Guarded():
+		return "measuring (guarded)"
 	case c.Status != store.CaseClosed:
 		return string(c.Status)
 	case c.Reason == store.Duplicate:
 		return "closed: duplicate of " + c.Into
+	case c.Reason == store.Guarded:
+		return fmt.Sprintf("closed: guarded, %d watched, P=%.0f%%", c.Measurement.Watched, 100*c.Measurement.Recur)
 	}
 	return "closed: " + string(c.Reason)
 }

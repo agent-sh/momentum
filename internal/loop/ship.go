@@ -133,8 +133,8 @@ type Package struct {
 	OutOfEffect      time.Time        `json:"out_of_effect,omitzero"`  // first run that found the measuring change absent
 	RollbackFailures int              `json:"rollback_failures,omitempty"`
 	RollbackProblem  string           `json:"rollback_problem,omitempty"` // cleaned cause of the last failed rollback
-	// GuardRead is how far a guarded change's watch has read its signal's source for a recurrence, after its close:
-	// each pass reads only what the source read since.
+	// GuardRead is when the last pass of a guarded case's watch after its close began, by the wall clock the store
+	// dates what it stores by: each pass reads only the events stored since.
 	GuardRead time.Time `json:"guard_read,omitzero"`
 }
 
@@ -180,12 +180,13 @@ type Plan struct {
 	Guard *Guard `json:"guard,omitempty"`
 }
 
-// Guard is a plan's watch for a problem that has stopped (SPEC, Measurement, Guards): the incidents of its signal in
-// the history the plan reads, the exposure they came in, and the exposure a watch with no recurrence must reach.
+// Guard is a plan's watch for a problem that has stopped (SPEC, Measurement, Guards): a watch, not a proof. It holds
+// the incidents of its signal in the history the plan reads, the exposure they came in, and the exposure its watch
+// runs to.
 type Guard struct {
 	Instead string        `json:"instead"` // why a measured plan could not stand
 	Since   time.Time     `json:"since"`   // the history's start: the span's, or past the incident the signal's source began with
-	Gap     time.Duration `json:"gap"`     // a longer quiet stretch between two events starts a new incident: the plan's window
+	Gap     time.Duration `json:"gap"`     // a longer quiet stretch between two events starts a new incident: measure.GuardGap
 	// Units are the plan's, kept here: the plan's own are left empty in its JSON (Plan.MarshalJSON).
 	Units string `json:"units,omitempty"`
 	// Tool and Cwd narrow its exposure to the hours in which the problem's unit was in use: the signal's tool, else the
@@ -195,8 +196,7 @@ type Guard struct {
 	Incidents int           `json:"incidents"` // in the history
 	Exposure  int           `json:"exposure"`  // units of exposure in the history
 	Before    int           `json:"before"`    // of those, the units up to the end of its last incident
-	Quiet     int           `json:"quiet"`     // of those, the units outside every incident
-	Need      int           `json:"need"`      // the exposure a watch with no recurrence must reach (measure.GuardNeed)
+	Need      int           `json:"need"`      // the exposure its watch runs to, unless the retention ends it first (measure.GuardNeed)
 	Watch     time.Duration `json:"watch"`     // the whole weeks the history's exposure took to reach Need, at most the retention
 }
 
@@ -974,7 +974,12 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 		return p, err
 	}
 	p.State = Proposed
-	note, err := Redact(ctx, fmt.Sprintf("%s %s; measured in %s: %d of %d in the baseline; gate %d of %d", p.PR, title, plan.Units, plan.Before, plan.BeforeBase, plan.Gate, plan.GateBase))
+	line := fmt.Sprintf("%s %s; measured in %s: %d of %d in the baseline; gate %d of %d", p.PR, title, plan.Units, plan.Before, plan.BeforeBase, plan.Gate, plan.GateBase)
+	if g := plan.Guard; g != nil {
+		line = fmt.Sprintf("%s %s; guarded in %s: %d incidents in %d of exposure; it watches until %d or %s", p.PR, title, plan.Units, g.Incidents, g.Exposure, g.Need,
+			days(guardRetention))
+	}
+	note, err := Redact(ctx, line)
 	if err != nil {
 		return p, err
 	}
@@ -1724,9 +1729,9 @@ func (s *Ship) packageText(c store.Case, p Package) string {
 		p.Check.Before.Exit, p.Check.After.Seconds)
 	sig, _ := json.Marshal(p.Plan.Signal)
 	if g := p.Plan.Guard; g != nil {
-		fmt.Fprintf(&b, "- Guarded, not measured: a measured plan was refused (%s). The signal `%s` counted %d incidents (runs of events no more than %s apart) in %d %s of exposure since %s%s. The watch starts when the change is in effect and needs %d %s of exposure with no recurrence, about %s, within the %s the store is sure to read again: had the change done nothing, the problem would come back within it with predictive probability %.0f%% (Jeffreys). One recurrence fails it. A guard measures no drop.\n",
-			g.Instead, sig, g.Incidents, days(g.Gap), g.Exposure, p.Plan.Units, g.Since.UTC().Format(time.DateOnly), guardUnitText(*g), g.Need, p.Plan.Units, days(g.Watch),
-			days(guardRetention), 100*(1-measure.Alpha))
+		fmt.Fprintf(&b, "- Guarded, not measured: no rate can be compared for it (%s). The signal `%s` counted %d incidents (runs of events no more than %s apart) in %d %s of exposure since %s%s. The watch starts when the change is in effect and runs until %d %s of exposure or %s, whichever comes first. One recurrence brings the case back. No recurrence closes it as guarded, a close that claims nothing for the change, with P: the probability that the problem, had it kept happening, would have recurred within the exposure watched (%.0f%% at %d units; lower if the %s end it first). A problem that stopped by itself gives the same result.\n",
+			g.Instead, sig, g.Incidents, days(g.Gap), g.Exposure, p.Plan.Units, g.Since.UTC().Format(time.DateOnly), guardUnitText(*g), g.Need, p.Plan.Units,
+			days(guardRetention), 100*measure.GuardRecur(g.Incidents, g.Exposure, g.Need), g.Need, days(guardRetention))
 	} else {
 		fmt.Fprintf(&b, "- Measurement: the signal `%s` counted events in %d of %d %s in the %s baseline before the gated window; the gate counted %d of %d in its last %s. The %s after the change is in effect is compared with the baseline (Fisher's exact test, one-sided, p below 0.05).\n",
 			sig, p.Plan.Before, p.Plan.BeforeBase, p.Plan.Units, days(measure.BaselineWindows*p.Plan.Window), p.Plan.Gate, p.Plan.GateBase, days(p.Plan.Window), days(p.Plan.Window))

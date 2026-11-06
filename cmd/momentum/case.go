@@ -124,8 +124,10 @@ type listedCase struct {
 		Effect      string  `json:"effect"`
 		// Guarded marks a guard's watch, not a measured drop: before is its incidents, exposure the units they came in,
 		// after its recurrences.
-		Guarded  bool `json:"guarded,omitempty"`
-		Exposure int  `json:"exposure,omitempty"`
+		Guarded  bool    `json:"guarded,omitempty"`
+		Exposure int     `json:"exposure,omitempty"`
+		Watched  int     `json:"watched,omitempty"`
+		Recur    float64 `json:"recur,omitempty"`
 	} `json:"measurement,omitempty"`
 	Signatures []string `json:"signatures"`
 }
@@ -159,7 +161,9 @@ func caseJSON(c store.Case) listedCase {
 			Effect      string  `json:"effect"`
 			Guarded     bool    `json:"guarded,omitempty"`
 			Exposure    int     `json:"exposure,omitempty"`
-		}{m.Window.Hours(), m.Before, m.After, m.Effect, m.Guarded(), m.Exposure}
+			Watched     int     `json:"watched,omitempty"`
+			Recur       float64 `json:"recur,omitempty"`
+		}{m.Window.Hours(), m.Before, m.After, m.Effect, m.Guarded(), m.Exposure, m.Watched, m.Recur}
 	}
 	return l
 }
@@ -495,7 +499,7 @@ func caseClose(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	}
 	fs := flag.NewFlagSet("case close", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	reason := fs.String("reason", "", "not-worth-it, insufficient-evidence, already-solved or duplicate (improved is the measure tool's)")
+	reason := fs.String("reason", "", "not-worth-it, insufficient-evidence, already-solved or duplicate (improved and guarded are the measure tool's)")
 	into := fs.String("into", "", "for a duplicate: the case with the same root cause")
 	fix := fs.String("fix", "", "for a component-health case closed as already-solved, now or before a close named its fix: what fixed it, its commit (git:OWNER/REPO@SHA) or another reference; the cases its stop held resume")
 	why := fs.String("why", "", "why, in a short line")

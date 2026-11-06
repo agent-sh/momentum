@@ -20,20 +20,18 @@ const week = 7 * 24 * time.Hour
 // days in its harness, which is why the store's evidence retention is 30 days.
 const guardRetention = store.CaseRetention
 
-// guardPlan stands in for a measured plan refused as too new, too rare or with no recent event (instead), when the
-// case's own store evidence shows its problem happened before (SPEC, Measurement, Guards). A preventive fix for a
-// problem that has stopped has no rate to drop; a guard asks whether the problem comes back.
+// guardPlan stands in for a measured plan refused as too new or too rare (instead), when the case's own store evidence
+// shows its problem happened before (SPEC, Measurement, Guards). A guard is a watch, not a proof: it watches for the
+// problem to come back after a preventive fix, and never closes a case as improved.
 //
 // It reads the plan's span, the four windows before the boundary, from the signal's source's first event when that
 // came inside it, with the sources the plan would count for the units its history counts in, read whole. The
-// signal's events there fall into incidents (no gap longer than the plan's window between two of them: a stretch
-// shorter than a whole week can be the weekly cycle's lull, a night or a weekend, rather than the end of a cause). An
+// signal's events there fall into incidents (no gap longer than measure.GuardGap between two of them), and an
 // incident the source began with is dropped (measure.GuardCount). Its exposure is the plan's units of activity in
-// which the problem's unit was in use: the signal's tool, else the tool or directory all its events share; with none
-// shared, it is refused. measure.GuardAdmit sizes the watch from the posterior predictive and refuses a thin history,
-// a problem whose quiet stretch says it had already stopped, and a watch past guardRetention. A refusal names the
-// measured plan's beside the guard's. sourcesFor gives the sources and the omitted ones for a count in units, or a
-// *waitingPlan.
+// which the problem's unit was in use: the signal's tool, else the tool or directory all its events share. It is
+// refused only where no watch could be kept: the case's evidence is not the signal's, its events share no unit, or
+// its history holds no exposure. A refusal names the measured plan's beside the guard's. sourcesFor gives the
+// sources and the omitted ones for a count in units, or a *waitingPlan.
 func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead error, sourcesFor func(units string) ([]string, []string, error)) (Plan, error) {
 	why := strings.TrimPrefix(instead.Error(), ErrRefused.Error()+": ")
 	refuse := func(format string, a ...any) (Plan, error) {
@@ -113,24 +111,23 @@ func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead e
 	if !ok {
 		return refuse("its events share no tool or directory, so absence cannot be counted only while the problem's unit was in use")
 	}
-	g.Guard = &Guard{Instead: why, Gap: window, Units: units, Tool: tool, Cwd: cwd}
+	g.Guard = &Guard{Instead: why, Gap: measure.GuardGap, Units: units, Tool: tool, Cwd: cwd}
 	h, err := guardHistory(ctx, s.Store, g, since, at, s.Dir, anchored)
 	if err != nil {
 		return Plan{}, err
 	}
-	need, expected, reason := measure.GuardAdmit(h, guardRetention)
-	if reason != "" {
-		return refuse("%s", reason)
+	if h.Exposure == 0 {
+		return refuse("its history holds no exposure to count the problem's rate by")
 	}
-	setGuard(g.Guard, h, need, expected)
+	setGuard(g.Guard, h)
 	return g, nil
 }
 
-// setGuard records a counted history on a guard: its incidents, exposure and need, and its watch in whole weeks, at
-// least one and at most the retention.
-func setGuard(g *Guard, h measure.GuardHistory, need int, expected time.Duration) {
-	g.Since, g.Incidents, g.Exposure, g.Before, g.Quiet, g.Need = h.Since, h.Incidents, h.Exposure, h.Before, h.Quiet, need
-	g.Watch = measure.GuardWatch(expected, guardRetention)
+// setGuard records a counted history on a guard: its incidents, exposure and the exposure its watch runs to, and the
+// whole weeks the history took to hold that much, at most the retention.
+func setGuard(g *Guard, h measure.GuardHistory) {
+	g.Since, g.Incidents, g.Exposure, g.Before = h.Since, h.Incidents, h.Exposure, h.Before
+	g.Need, g.Watch = measure.GuardNeed(h.Incidents, h.Exposure), measure.GuardWatch(h, guardRetention)
 }
 
 // sharedUnit is what a guard's exposure is narrowed to: the signal's tool; else the tool every event of its history
@@ -193,6 +190,11 @@ func guardHistory(ctx context.Context, st *store.Store, plan Plan, since, until 
 // recurrences are the events a plan's signal counts over a span in its units: of the owner alone for his hours, of a
 // session for the sessions' hours.
 func recurrences(ctx context.Context, st *store.Store, plan Plan, since, until time.Time, dir string) ([]store.Event, error) {
+	return recurrencesStored(ctx, st, plan, since, until, dir, time.Time{})
+}
+
+// recurrencesStored is recurrences of the events the store took in at or after stored.
+func recurrencesStored(ctx context.Context, st *store.Store, plan Plan, since, until time.Time, dir string, stored time.Time) ([]store.Event, error) {
 	if !until.After(since) {
 		return nil, nil
 	}
@@ -200,7 +202,7 @@ func recurrences(ctx context.Context, st *store.Store, plan Plan, since, until t
 	if err != nil {
 		return nil, err
 	}
-	evs, err := Count(ctx, st, plan.Signal, since, until, dir, q.Actor)
+	evs, err := countStored(ctx, st, plan.Signal, since, until, dir, q.Actor, stored)
 	if err != nil {
 		return nil, err
 	}
@@ -269,61 +271,54 @@ func earliest(evs []store.Event) time.Time {
 // guardDetail is what a guarded case's log says when its watch starts, with the assumption it rests on.
 func guardDetail(plan Plan) string {
 	g := plan.Guard
-	return fmt.Sprintf("%d incidents of its problem in %d %s of exposure since %s; one recurrence fails it, %d %s of exposure with none close it as improved; it assumes the problem was still happening when the change took effect",
-		g.Incidents, g.Exposure, plan.Units, g.Since.UTC().Format(time.DateTime), g.Need, plan.Units)
+	return fmt.Sprintf("%d incidents of its problem in %d %s of exposure since %s; it watches until %d %s of exposure or %s, whichever comes first; one recurrence brings the case back; no recurrence closes it as guarded, with the probability that the problem, had it kept happening, would have recurred: it assumes the problem was still happening when the change took effect",
+		g.Incidents, g.Exposure, plan.Units, g.Since.UTC().Format(time.DateTime), g.Need, plan.Units, days(guardRetention))
 }
 
 // guardAtEffect counts a guard's history again through the moment its change took effect: the plan was counted at the
-// proposal, and the change may take effect much later. A watch tells the change from the problem's own end only when
-// the problem was still happening then, so the stretch since the last incident is checked again, as are the need and
-// the retention (measure.GuardAdmit). It returns the guard as counted then, or why its watch cannot start; dry
-// changes nothing.
-func (r *Runner) guardAtEffect(ctx context.Context, p *Package, plan Plan, effect time.Time, dry bool) (*Guard, string, bool, error) {
+// proposal, and the change may take effect much later. The watch is sized from that count. why says what it waits on
+// (a source behind); dry changes nothing.
+func (r *Runner) guardAtEffect(ctx context.Context, p *Package, plan Plan, effect time.Time, dry bool) (*Guard, string, error) {
 	g := *plan.Guard
 	if why, err := r.readWindow(ctx, p, plan, g.Since, effect, dry); err != nil || why != "" {
-		return nil, why, false, err
+		return nil, why, err
 	}
 	h, err := guardHistory(ctx, r.Store, plan, g.Since, effect, r.Dir, false)
 	if err != nil {
-		return nil, "", false, err
+		return nil, "", err
 	}
-	need, expected, reason := measure.GuardAdmit(h, guardRetention)
-	if reason != "" {
-		return nil, "its guard cannot stand at its change: " + reason + "; it must be judged by hand", true, nil
+	if h.Exposure > 0 {
+		setGuard(&g, h)
 	}
-	setGuard(&g, h, need, expected)
-	return &g, "", false, nil
+	return &g, "", nil
+}
+
+// guardThrough is how far a guard's watch has been read since from: the earliest moment every source it counts has
+// read the window from since through, at most until.
+func (r *Runner) guardThrough(ctx context.Context, plan Plan, since, until time.Time) (time.Time, error) {
+	through := until
+	for _, source := range plan.Sources {
+		read, err := r.Store.HarnessReadWindowThrough(ctx, source, planHarness(plan), since)
+		if err != nil {
+			return time.Time{}, err
+		}
+		through = earlier(through, read)
+	}
+	return through, nil
 }
 
 // guardCase is the measure step for a measuring case whose plan is a guard. Any event its signal counts since the
-// change was in effect is a recurrence: the watch fails at once, and the change goes as one with no measured effect
-// does (noEffect). A failed read inside the watch starts it again after the failure (afterGap). From the watch's end,
-// once read, and once the recurrences are counted again through it (an event read late is still one), exposure that
-// reached the guard's need with no recurrence closes the case as improved, guarded; short of it, the watch goes on a
-// week at a time up to guardRetention after the change, then the change goes, since nothing could show it helped.
+// change was in effect is a recurrence: the case comes back regressed, and the change goes as one with no measured
+// effect does (noEffect). A failed read inside the watch starts it again after the failure (afterGap). The watch ends
+// on read exposure: when it reached the guard's need, or 30 days after the change (guardRetention), whichever comes
+// first. With no recurrence it closes the case as guarded, never improved, with the exposure watched and the
+// predictive probability that the problem, had it kept happening, would have recurred within it.
 func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan Plan, m Measured, now time.Time, dry bool) Measured {
 	g := *plan.Guard
 	m.Guarded = true
 	failed := func(err error) Measured {
 		m.Status, m.Why = "failed", err.Error()
 		return m
-	}
-	recurred := func(back []store.Event) Measured {
-		watched, err := guardExposure(ctx, r.Store, plan, back, c.Deployed, now, r.Dir)
-		if err != nil {
-			return failed(err)
-		}
-		res := measure.Guarded(g.Incidents, g.Exposure, hitUnits(back, plan.Units), len(watched), plan.Units)
-		m.Result = &res
-		return r.noEffect(ctx, c, p, m, fmt.Sprintf("its guard failed: its problem came back after its change was in effect, first at %s (%s)",
-			earliest(back).UTC().Format(time.DateTime), res.Effect), dry)
-	}
-	back, err := recurrences(ctx, r.Store, plan, c.Deployed, now, r.Dir)
-	if err != nil {
-		return failed(err)
-	}
-	if len(back) > 0 {
-		return recurred(back)
 	}
 	last := c.Deployed.Add(guardRetention)
 	m.Due = c.Deployed.Add(g.Watch)
@@ -334,99 +329,91 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 	} else if done {
 		return restarted
 	}
-	if now.Before(m.Due) {
-		m.Status, m.Why = "waiting", fmt.Sprintf("guarded: it watches for a recurrence until %s, when its exposure should reach the %d %s it needs",
-			m.Due.UTC().Format(time.DateTime), g.Need, plan.Units)
-		return m
-	}
-	end := m.Due
-	for end.Before(last) {
-		next := earlier(end.Add(week), last)
-		if next.After(now) {
-			break
-		}
-		end = next
-	}
-	if why, err := r.readWindow(ctx, p, plan, c.Deployed, end, dry); err != nil {
-		return failed(err)
-	} else if why != "" {
-		m.Status, m.Why = "waiting", why
-		return m
-	}
-	// every source has read past the watch's end now: an event of it read late is counted with the rest
-	if back, err = recurrences(ctx, r.Store, plan, c.Deployed, end, r.Dir); err != nil {
-		return failed(err)
-	} else if len(back) > 0 {
-		return recurred(back)
-	}
-	watched, err := guardExposure(ctx, r.Store, plan, nil, c.Deployed, end, r.Dir)
+	through, err := r.guardThrough(ctx, plan, c.Deployed, earlier(now, last))
 	if err != nil {
 		return failed(err)
 	}
-	res := measure.Guarded(g.Incidents, g.Exposure, 0, len(watched), plan.Units)
-	m.Result = &res
-	if res.Improved {
-		m.Status = "improved"
-		if dry {
-			return m
-		}
-		p.Result, p.GuardRead = &res, end
-		if err := r.Ship.save(p); err != nil {
-			return failed(err)
-		}
-		// the note before the close, as for a measured change: written once, under an id of its own for the change
-		if err := r.noteOnce(ctx, store.Note{ID: noteID("shipped", *p), Kind: store.NoteShipped, Title: plainClip("momentum guarded: "+c.Title, store.TitleMax),
-			Detail: fmt.Sprintf("Its change (%s) was guarded, not measured: its problem did not come back in the %s after the change was in effect, %d %s of exposure. That is no measured drop; a change that did nothing would have met a recurrence there with predictive probability %.1f%%, had the problem still been happening when the change took effect.",
-				firstOf(p.PR, "a package"), days(end.Sub(c.Deployed)), len(watched), plan.Units, 100*(1-res.P)),
-			Effect: res.Effect, Links: prLinks(p.PR)}); err != nil {
-			return failed(fmt.Errorf("the note: %w", err))
-		}
-		if _, err := r.Store.CloseMeasured(ctx, c.ID, 0, res.Effect, "loop:measure"); err != nil {
-			return failed(err)
-		}
-		kept, err := r.Ship.keepLocked(c.ID, res)
+	// read after the sources' reads: an event stored late is counted with the rest
+	back, err := recurrences(ctx, r.Store, plan, c.Deployed, now, r.Dir)
+	if err != nil {
+		return failed(err)
+	}
+	if len(back) > 0 {
+		watched, err := guardExposure(ctx, r.Store, plan, back, c.Deployed, now, r.Dir)
 		if err != nil {
 			return failed(err)
 		}
-		r.resolve(ctx, &kept)
-		return m
+		res := measure.Guarded(g.Incidents, g.Exposure, hitUnits(back, plan.Units), len(watched), plan.Units)
+		m.Result = &res
+		return r.noEffect(ctx, c, p, m, fmt.Sprintf("regressed: its problem came back during its guard's watch, first at %s (%s)",
+			earliest(back).UTC().Format(time.DateTime), res.Effect), dry)
 	}
-	if end.Before(last) {
-		m.Status, m.Due = "waiting", earlier(end.Add(week), last)
-		m.Why = fmt.Sprintf("guarded: no recurrence, and %d of the %d %s of exposure its watch needs; it watches on a week at a time, until %s at the latest",
-			len(watched), g.Need, plan.Units, last.UTC().Format(time.DateTime))
-		return m
-	}
-	return r.noEffect(ctx, c, p, m, fmt.Sprintf("nothing could show it helped: its guard watched the %s it may and reached %d of the %d %s of exposure it needs, with no recurrence",
-		days(last.Sub(c.Deployed)), len(watched), g.Need, plan.Units), dry)
-}
-
-// guardBack is the watch of a case a guard closed as improved: the guard said its problem would not come back, so the
-// first event its signal counts after the change brings the case back, regressed, with a decided note. Each pass reads
-// only the span its signal's source has read since the last (Package.GuardRead, from the watch's end), so an event
-// read late is still read, and no pass counts the whole span since the change again.
-func (r *Runner) guardBack(ctx context.Context, c store.Case, p *Package, plan Plan, m Measured, now time.Time, dry bool) (Measured, bool) {
-	m.Guarded = true
-	failed := func(err error) (Measured, bool) { m.Status, m.Why = "failed", err.Error(); return m, true }
-	from := p.GuardRead
-	if from.IsZero() {
-		from = c.Deployed
-	}
-	through, err := r.Store.HarnessReadThrough(ctx, plan.Signal.Source, planHarness(plan))
+	watched, err := guardExposure(ctx, r.Store, plan, nil, c.Deployed, through, r.Dir)
 	if err != nil {
 		return failed(err)
 	}
-	through = earlier(through, now)
-	if !through.After(from) {
-		return Measured{}, false
+	if len(watched) < g.Need && through.Before(last) {
+		if !now.Before(last) {
+			if why, err := r.readWindow(ctx, p, plan, c.Deployed, last, dry); err != nil {
+				return failed(err)
+			} else if why != "" {
+				m.Status, m.Why = "waiting", why
+				return m
+			}
+		}
+		m.Status, m.Due = "waiting", earlier(m.Due, last)
+		m.Why = fmt.Sprintf("guarded: watching for a recurrence; %d of the %d %s of exposure it runs to, until %s at the latest",
+			len(watched), g.Need, plan.Units, last.UTC().Format(time.DateTime))
+		return m
 	}
-	back, err := recurrences(ctx, r.Store, plan, from, through, r.Dir)
+	res := measure.Guarded(g.Incidents, g.Exposure, 0, len(watched), plan.Units)
+	m.Result, m.Status = &res, "guarded"
+	if dry {
+		return m
+	}
+	p.Result = &res
+	if err := r.Ship.save(p); err != nil {
+		return failed(err)
+	}
+	// the note before the close, under an id of its own for the change: written once. A decided note, not a shipped
+	// one: a guard is no measured improvement.
+	if err := r.noteOnce(ctx, store.Note{ID: noteID("guarded", *p), Kind: store.NoteDecided, Title: plainClip("momentum guarded: "+c.Title, store.TitleMax),
+		Detail: fmt.Sprintf("Its change (%s) was guarded, not measured: its problem did not come back in %d %s of exposure over the %s after the change took effect. Had it kept happening, it would have recurred within that with probability P=%.1f%%. That rests on the problem still happening when the change took effect: a problem that stopped by itself shows the same. One recurrence brings the case back.",
+			firstOf(p.PR, "a package"), len(watched), plan.Units, days(through.Sub(c.Deployed)), 100*res.Recur),
+		Effect: res.Effect, Links: prLinks(p.PR)}); err != nil {
+		return failed(fmt.Errorf("the note: %w", err))
+	}
+	if _, err := r.Store.CloseGuarded(ctx, c.ID, len(watched), res.Recur, res.Effect, "loop:measure"); err != nil {
+		return failed(err)
+	}
+	kept, err := r.Ship.keepLocked(c.ID, res)
+	if err != nil {
+		return failed(err)
+	}
+	r.resolve(ctx, &kept)
+	return m
+}
+
+// guardBack is the watch of a case closed as guarded: the guard said its problem would not come back, so the first
+// event its signal counts after the change brings the case back, regressed, with a decided note. It needs only the
+// signal. Each pass reads the events dated from the change's in-effect time that the store took in since the last
+// pass began (Package.GuardRead, by the wall clock the store dates what it stores by): an event dated inside the watch
+// and stored only after the close still counts, and no pass reads the whole span again.
+func (r *Runner) guardBack(ctx context.Context, c store.Case, p *Package, plan Plan, m Measured, now time.Time, dry bool) (Measured, bool) {
+	m.Guarded = true
+	failed := func(err error) (Measured, bool) { m.Status, m.Why = "failed", err.Error(); return m, true }
+	scan := time.Now()
+	until := now
+	if scan.After(until) {
+		until = scan
+	}
+	back, err := recurrencesStored(ctx, r.Store, plan, c.Deployed, until.Add(time.Minute), r.Dir, p.GuardRead)
 	if err != nil {
 		return failed(err)
 	}
 	if len(back) == 0 {
 		if !dry {
-			p.GuardRead = through
+			p.GuardRead = scan
 			if err := r.Ship.save(p); err != nil {
 				return failed(err)
 			}
@@ -434,19 +421,19 @@ func (r *Runner) guardBack(ctx context.Context, c store.Case, p *Package, plan P
 		return Measured{}, false
 	}
 	m.Status = "back"
-	m.Why = fmt.Sprintf("the problem its guard closed came back: %d events after its change, the first at %s", len(back), earliest(back).UTC().Format(time.DateTime))
+	m.Why = fmt.Sprintf("the problem it guarded against came back: %d events after its change, the first at %s", len(back), earliest(back).UTC().Format(time.DateTime))
 	if dry {
 		return m, true
 	}
 	if err := r.noteOnce(ctx, store.Note{ID: noteID("back", *p), Kind: store.NoteDecided,
 		Title:  plainClip("momentum: a problem it guarded against is back: "+c.Title, store.TitleMax),
-		Detail: "It came back after its guard closed the case (" + m.Why + "): the case is open again. Its lesson in tacit is not withdrawn.", Links: prLinks(p.PR)}); err != nil {
+		Detail: "It came back after its guard's watch closed the case (" + m.Why + "): the case is open again. Its lesson in tacit is not withdrawn.", Links: prLinks(p.PR)}); err != nil {
 		return failed(fmt.Errorf("the note: %w", err))
 	}
 	if _, err := r.Store.RegressCase(ctx, c.ID, m.Why, "loop:measure"); err != nil {
 		return failed(err)
 	}
-	p.GuardRead = through
+	p.GuardRead = scan
 	if err := r.Ship.save(p); err != nil {
 		return failed(err)
 	}

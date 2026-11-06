@@ -42,8 +42,8 @@ func PublishLesson(ctx context.Context, st *store.Store, ship *Ship, id, text, t
 	if err != nil {
 		return err
 	}
-	if c.Into != "" || c.Status != store.CaseClosed || c.Reason != store.Improved {
-		return refused("a lesson is published only for a case closed as improved")
+	if c.Into != "" || c.Status != store.CaseClosed || c.Reason != store.Improved && c.Reason != store.Guarded {
+		return refused("a lesson is published only for a case closed as improved or guarded")
 	}
 	line := strings.TrimSpace(text)
 	if line == "" || strings.ContainsAny(line, "\r\n") || utf8.RuneCountInString(line) > 300 {
@@ -64,17 +64,27 @@ func PublishLesson(ctx context.Context, st *store.Store, ship *Ship, id, text, t
 		scope = "projects/" + p.Repo[strings.IndexByte(p.Repo, '/')+1:]
 	}
 	// Reclean an older reservation too. Measurement validates the outcome,
-	// not the model's explanation or instructions.
-	desc, err := Public(ctx, "unverified lesson from a loop run: "+reserved)
+	// not the model's explanation or instructions. A guard validates neither: its
+	// lesson says so, with the probability its watch reports.
+	prefix := "unverified lesson from a loop run: "
+	if c.Reason == store.Guarded {
+		prefix = fmt.Sprintf("unverified lesson from a loop run, guarded, not measured (P=%.0f%% that the problem, had it kept happening, would have recurred in its watch): ",
+			100*c.Measurement.Recur)
+	}
+	desc, err := Public(ctx, prefix+reserved)
 	if err != nil {
 		return err
 	}
-	body, err := Public(ctx, fmt.Sprintf("Unverified lesson from momentum's improvement loop on case %s (%s): %s", c.ID, c.Family, c.Title))
+	kind := ""
+	if c.Reason == store.Guarded {
+		kind = ", guarded, not measured: its problem did not come back in its watch, which a problem that stopped by itself shows too"
+	}
+	body, err := Public(ctx, fmt.Sprintf("Unverified lesson from momentum's improvement loop on case %s (%s)%s: %s", c.ID, c.Family, kind, c.Title))
 	if err != nil {
 		return err
 	}
 	current, err := st.CaseByID(ctx, id)
-	if err != nil || current.Into != "" || current.Episode != c.Episode || current.Status != store.CaseClosed || current.Reason != store.Improved {
+	if err != nil || current.Into != "" || current.Episode != c.Episode || current.Status != store.CaseClosed || current.Reason != c.Reason {
 		return firstError(err, "case changed before lesson publication")
 	}
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
@@ -102,7 +112,7 @@ func (r *Runner) lessons(ctx context.Context, only string, families []string) er
 		return err
 	}
 	for _, c := range cases {
-		if c.Reason != store.Improved || only != "" && only != c.ID || !slices.Contains(families, c.Family) {
+		if c.Reason != store.Improved && c.Reason != store.Guarded || only != "" && only != c.ID || !slices.Contains(families, c.Family) {
 			continue
 		}
 		done, cooling, err := r.lessonState(ctx, c.ID)

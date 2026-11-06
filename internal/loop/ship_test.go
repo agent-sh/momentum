@@ -966,8 +966,12 @@ func TestAPlanMeasuresTheCasesOwnProblem(t *testing.T) {
 	if _, err := s.validPlan(ctx, c, burst, week, "", now); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "in 1 session hours") {
 		t.Fatalf("ten events in one session's hour: %v", err)
 	}
-	// four units are fewer than five, whatever else the signal counts
-	if _, err := s.validPlan(ctx, c, goodSignal, week, "", now.Add(-2*time.Hour-time.Minute)); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "fewer than 5") {
+	// four units are fewer than five, whatever else the signal counts: no measured plan, a guard's watch at most
+	if plan, err := s.validPlan(ctx, c, goodSignal, week, "", now.Add(-2*time.Hour-time.Minute)); err == nil {
+		if g, _ := guardOf(t, plan); g == nil || !strings.Contains(g.Instead, "fewer than 5") {
+			t.Fatalf("four units: a measured plan %+v", plan)
+		}
+	} else if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "fewer than 5") {
 		t.Fatalf("four units: %v", err)
 	}
 	if units := unitsOf(evs[1:2]); units != OwnerHours {
@@ -1554,12 +1558,18 @@ func TestAPlanNeedsAMeasurableIndependentBaseline(t *testing.T) {
 			if err := st.MarkRead(ctx, goodSignal.Source, at.Add(time.Second)); err != nil {
 				t.Fatal(err)
 			}
-			_, err = s.validPlan(ctx, c, goodSignal, 7*w, "", at)
-			if oldHits == 4 {
-				if err != nil {
-					t.Fatalf("baseline measurable over two windows: %v", err)
+			long, err := s.validPlan(ctx, c, goodSignal, 7*w, "", at)
+			g, _ := guardOf(t, long)
+			switch {
+			case oldHits == 4:
+				if err != nil || g != nil {
+					t.Fatalf("baseline measurable over two windows: %+v %v", long, err)
 				}
-			} else if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "too new or too rare") || !strings.Contains(err.Error(), "use a week, or two for a rarer problem") {
+			case err == nil: // no measured plan: a guard's watch stands in, carrying the measured refusal
+				if g == nil || !strings.Contains(g.Instead, "too new or too rare") || !strings.Contains(g.Instead, "use a week, or two for a rarer problem") {
+					t.Fatalf("unmeasurable longer baseline, measured: %+v", long)
+				}
+			case !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "too new or too rare") || !strings.Contains(err.Error(), "use a week, or two for a rarer problem"):
 				t.Fatalf("unmeasurable longer baseline: %v", err)
 			}
 			p, err := s.validPlan(ctx, c, goodSignal, w, "", at)

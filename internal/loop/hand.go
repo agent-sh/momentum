@@ -352,14 +352,14 @@ func (s *Ship) landHand(ctx context.Context, c store.Case, p *Package, commit st
 		case errors.As(err, &wait):
 			// a window after the landing the count still waits (an incomplete run inside its span never clears, and a
 			// stopped reader may not run again): the change lands, to be measured by hand
-			p.Plan.Units = ""
+			p.Plan.Units, p.Plan.Guard = "", nil
 			if err := s.caseNoteOnce(ctx, c.ID, "measured by hand", "landed by hand more than a window after its plan, and the count at its landing still waits a window later: "+err.Error()); err != nil {
 				return err
 			}
 		case err != nil && !errors.Is(err, ErrRefused):
 			return err // a store that could not be read decides nothing: the landing is read again next pass
 		case err != nil:
-			p.Plan.Units = ""
+			p.Plan.Units, p.Plan.Guard = "", nil
 			if err := s.caseNoteOnce(ctx, c.ID, "measured by hand", "landed by hand more than a window after its plan, and the count at its landing was refused: "+err.Error()); err != nil {
 				return err
 			}
@@ -368,8 +368,8 @@ func (s *Ship) landHand(ctx context.Context, c store.Case, p *Package, commit st
 			detail := fmt.Sprintf("landed by hand more than a window after its plan: counted again at %s, %d of %d in the baseline, gate %d of %d",
 				at.UTC().Format(time.RFC3339), plan.Before, plan.BeforeBase, plan.Gate, plan.GateBase)
 			if g := plan.Guard; g != nil {
-				detail = fmt.Sprintf("landed by hand more than a window after its plan: counted again at %s as a guard, %d incidents in %d %s of exposure, a watch of %d %s with no recurrence",
-					at.UTC().Format(time.RFC3339), g.Incidents, g.Exposure, plan.Units, g.Need, plan.Units)
+				detail = fmt.Sprintf("landed by hand more than a window after its plan: counted again at %s as a guard, %d incidents in %d %s of exposure, a watch until %d %s or %s",
+					at.UTC().Format(time.RFC3339), g.Incidents, g.Exposure, plan.Units, g.Need, plan.Units, days(guardRetention))
 			}
 			if err := s.caseNoteOnce(ctx, c.ID, "plan counted again", detail); err != nil {
 				return err
