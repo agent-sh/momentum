@@ -76,3 +76,52 @@ func TestTheWriteSequenceNeverGoesDown(t *testing.T) {
 		t.Fatalf("the sequence %d is not the last write's %d", seq, seqOf(next.ID()))
 	}
 }
+
+// The write sequence's counter row comes back if it is gone, above the events' highest: a write after it is deleted
+// still goes through, and above every number before.
+func TestTheWriteSequenceSurvivesItsCounterRowGoing(t *testing.T) {
+	ctx := context.Background()
+	st, _ := open(t)
+	at := time.Date(2026, 1, 5, 9, 0, 0, 0, time.UTC)
+	if _, err := st.Put(ctx, []Event{{Source: "zz", SourceKey: "1", TS: at, Actor: ActorTool, Kind: "tool_result", Summary: "ok"}}); err != nil {
+		t.Fatal(err)
+	}
+	top, _ := st.Seq(ctx)
+	if _, err := st.db.ExecContext(ctx, `DELETE FROM event_seq`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Put(ctx, []Event{{Source: "zz", SourceKey: "2", TS: at, Actor: ActorTool, Kind: "tool_result", Summary: "ok"}}); err != nil {
+		t.Fatalf("a write after the counter's row went: %v", err)
+	}
+	if seq, _ := st.Seq(ctx); seq <= top {
+		t.Fatalf("the sequence after the counter's row went: %d, at or below %d", seq, top)
+	}
+}
+
+// A guarded measurement never closes as improved: the store refuses it.
+func TestAGuardedMeasurementNeverClosesAsImproved(t *testing.T) {
+	ctx := context.Background()
+	st, _ := open(t)
+	at := time.Date(2026, 1, 5, 9, 0, 0, 0, time.UTC)
+	e := Event{Source: "zz", SourceKey: "1", TS: at, Actor: ActorTool, Kind: "tool_result", Summary: "failed"}
+	if _, err := st.Put(ctx, []Event{e}); err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := st.ObserveCase(ctx, Finding{Family: "failures", Signature: "failures/v2:zz", Title: "it fails", Evidence: []Evidence{{Ref: "ev:" + e.ID()}}}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mech, next := "m", "n"
+	if _, err := st.UpdateCase(ctx, c.ID, CaseUpdate{Status: CaseTesting, Mechanism: &mech, NextTest: &next}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DeployCase(ctx, c.ID, t.TempDir(), at, "landed", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.StartGuarding(ctx, c.ID, 30*24*time.Hour, 4, 684, at, "a guard", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CloseMeasured(ctx, c.ID, 0, "a drop", "test"); err == nil {
+		t.Fatal("a guarded measurement closed as improved")
+	}
+}

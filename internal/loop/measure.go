@@ -358,21 +358,10 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		}
 		return m
 	}
-	if c.Status == store.CaseDeployed && plan.Guard != nil {
-		// the watch's report rests on its history counted through the change's first effect: the plan was counted at
-		// the proposal
-		g, why, err := r.guardAtEffect(ctx, &p, plan, since, dry)
-		switch {
-		case err != nil:
-			return failed(err.Error())
-		case why != "":
-			m.Status, m.Why, m.Guarded = "waiting", why, true
-			return m
-		}
-		plan.Guard, p.Plan.Guard = g, g
-		if p.GuardFrom.IsZero() {
-			p.GuardFrom = since
-		}
+	if c.Status == store.CaseDeployed && plan.Guard != nil && p.GuardFrom.IsZero() {
+		// the watch starts at once, from the change's first in-effect time: no read of the moment it is seen in effect
+		// can be done yet, so its history is counted again through that start at its close (guardCase)
+		p.GuardFrom = guardEffectTime(c, &p, since)
 	}
 	if plan.Guard != nil && c.Status == store.CaseMeasuring && !p.OutOfEffect.IsZero() {
 		// in effect again: the watch goes on from its first start
@@ -387,13 +376,13 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 	if c.Status == store.CaseDeployed || plan.Guard == nil && !p.OutOfEffect.IsZero() {
 		m.Status, m.Due = "measuring", since.Add(plan.Window)
 		if plan.Guard != nil {
-			m.Due, m.Guarded = since.Add(guardRetention), true
+			m.Due, m.Guarded = p.GuardFrom.Add(guardRetention), true
 			m.Why = fmt.Sprintf("guarded, not measured: it watches %s for a recurrence while its unit is in use every week", days(guardRetention))
 		}
 		if !dry {
 			switch {
 			case c.Status == store.CaseDeployed && plan.Guard != nil:
-				_, err = r.Store.StartGuarding(ctx, c.ID, guardRetention, plan.Guard.Incidents, plan.Guard.Exposure, since, guardDetail(plan), "loop:measure")
+				_, err = r.Store.StartGuarding(ctx, c.ID, guardRetention, plan.Guard.Incidents, plan.Guard.Exposure, p.GuardFrom, guardDetail(plan), "loop:measure")
 			case c.Status == store.CaseDeployed:
 				_, err = r.Store.StartMeasuring(ctx, c.ID, plan.Window, plan.Before, since, "loop:measure")
 			default:

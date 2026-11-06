@@ -466,7 +466,7 @@ func TestTheLoopsOwnRunsCannotMakeAnUnchangedProblemImprove(t *testing.T) {
 	// A guard's watch: the loop's own runs that use the tool during it, or fail it, neither keep it in use nor recur. A
 	// watch only they touched is held as not in use, never closed as guarded.
 	w := guarded(t, time.Hour, toolSignal.Source, nil)
-	w.measure(t, Options{})
+	w.pass(t, Options{})
 	var runs []store.Event
 	for i := 0; i < 5; i++ {
 		e := toolResult(fmt.Sprint("loop-", i), w.clock.Add(time.Duration(i)*7*aDay+time.Hour), fmt.Sprint("loop-", i), i == 2)
@@ -475,7 +475,7 @@ func TestTheLoopsOwnRunsCannotMakeAnUnchangedProblemImprove(t *testing.T) {
 	}
 	put(t, w.st, runs)
 	w.clock = w.clock.Add(30*aDay + time.Hour)
-	if got := w.measure(t, Options{}); got.Status != "held" || !strings.Contains(got.Why, "not in use") {
+	if got := w.pass(t, Options{}); got.Status != "held" || !strings.Contains(got.Why, "not in use") {
 		t.Fatalf("a watch only the loop's own runs touched: %+v", got)
 	}
 
@@ -495,7 +495,7 @@ func TestTheLoopsOwnRunsCannotMakeAnUnchangedProblemImprove(t *testing.T) {
 	loopRun.Cwd = filepath.Join(h.r.Dir, "work", "case")
 	put(t, h.st, []store.Event{loopRun})
 	h.clock = closed.Add(2 * time.Hour)
-	if ms, err := h.r.Measure(ctx, Options{}); err != nil || len(ms) != 0 || h.theCase(t).Reason != guardedReason {
+	if ms, err := h.passes(t, Options{}); err != nil || len(ms) != 0 || h.theCase(t).Reason != guardedReason {
 		t.Fatalf("a loop run's failure after a guarded close: %+v %v", ms, err)
 	}
 }

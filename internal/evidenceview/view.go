@@ -6,6 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -201,10 +203,14 @@ func Case(stdout io.Writer, c store.Case, evs []store.Evidence, log []store.Case
 	if !c.Deployed.IsZero() {
 		field("deployed", c.Deployed.Local().Format("2006-01-02 15:04")+" "+c.Package)
 	}
-	if m := c.Measurement; m.Guarded() && (c.Status == store.CaseDeployed || c.Status == store.CaseMeasuring || c.Reason == store.Guarded) {
+	if m := c.Measurement; Guarded(c) {
 		// a guard measures no rate: it watches for a problem that had stopped to come back
 		text := fmt.Sprintf("watching %dd for a recurrence, after %d incidents in %d units of exposure before the change; a problem that stopped by itself shows the same",
 			int(m.Window.Hours()/24), m.Before, m.Exposure)
+		if c.Status == store.CaseMeasuring && m.After > 0 {
+			text = fmt.Sprintf("recurred: %d units of its problem came back after the change; its rollback is held; %d incidents in %d units of exposure before it",
+				m.After, m.Before, m.Exposure)
+		}
 		if c.Status == store.CaseClosed && c.Reason == store.Guarded {
 			text = fmt.Sprintf("no recurrence in %d units of exposure watched, after %d incidents in %d before the change; %s; a problem that stopped by itself shows the same: %s",
 				m.Watched, m.Before, m.Exposure, guardChance(m, "%.1f"), m.Effect)
@@ -226,7 +232,9 @@ func Case(stdout io.Writer, c store.Case, evs []store.Evidence, log []store.Case
 
 func StatusLine(c store.Case) string {
 	switch {
-	case c.Status == store.CaseMeasuring && c.Measurement.Guarded():
+	case c.Status == store.CaseMeasuring && Guarded(c) && c.Measurement.After > 0:
+		return "measuring (guarded: recurred, rollback held)"
+	case c.Status == store.CaseMeasuring && Guarded(c):
 		return "measuring (guarded)"
 	case c.Status != store.CaseClosed:
 		return string(c.Status)
@@ -245,4 +253,26 @@ func guardChance(m store.Measurement, precision string) string {
 		return "no rate to compare: the history holds no incident after its first"
 	}
 	return fmt.Sprintf("P="+precision+"%% had it kept happening", 100*m.Recur)
+}
+
+// Guarded says a case's measurement is a guard's watch: a case deployed, measuring or closed as guarded whose
+// package's plan has a guard, when the package is there to read (a column an older build left behind says nothing
+// then), else whose guard columns say so.
+func Guarded(c store.Case) bool {
+	if c.Status != store.CaseDeployed && c.Status != store.CaseMeasuring && c.Reason != store.Guarded {
+		return false
+	}
+	if c.Package != "" {
+		if raw, err := os.ReadFile(filepath.Join(c.Package, "package.json")); err == nil {
+			var p struct {
+				Plan *struct {
+					Guard *json.RawMessage `json:"guard"`
+				} `json:"plan"`
+			}
+			if json.Unmarshal(raw, &p) == nil {
+				return p.Plan != nil && p.Plan.Guard != nil
+			}
+		}
+	}
+	return c.Measurement.Guarded()
 }

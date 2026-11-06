@@ -183,7 +183,9 @@ BEGIN ` + bumpSeq + ` UPDATE events SET seq = (SELECT n FROM event_seq WHERE id 
 
 // bumpSeq moves the write sequence one past the higher of its counter and the events' highest: it never goes down, a
 // rebuild's or a stale file's deleted rows notwithstanding.
-const bumpSeq = `UPDATE event_seq SET n = MAX(n, COALESCE((SELECT MAX(seq) FROM events), 0)) + 1 WHERE id = 1;`
+// It is an upsert, so a counter row gone missing comes back, above the events' highest.
+const bumpSeq = `INSERT INTO event_seq (id, n) VALUES (1, COALESCE((SELECT MAX(seq) FROM events), 0) + 1)
+  ON CONFLICT(id) DO UPDATE SET n = MAX(n, COALESCE((SELECT MAX(seq) FROM events), 0)) + 1;`
 
 var keptTriggerNames = []string{"events_harness_insert", "events_harness_update", "events_seq_insert", "events_seq_update"}
 

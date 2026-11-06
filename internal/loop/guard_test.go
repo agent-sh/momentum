@@ -94,8 +94,9 @@ func stoppedProblem(t *testing.T, st *store.Store, from time.Time, hours int, qu
 
 // recurring is a tool's store that began 60 days before at: one successful result an hour from 28 days before at
 // until useUntil (in source use), and bursts of three failed results in three hours, each in a session of its own, at
-// the times given (before at). It returns a case in testing whose evidence is every failure, and the failures.
-func recurring(t *testing.T, st *store.Store, use string, at, useUntil time.Time, bursts ...time.Time) (store.Case, []store.Event) {
+// the times given (before at). Its sources' last complete scans started at read, as a real scan records them. It
+// returns a case in testing whose evidence is every failure, and the failures.
+func recurring(t *testing.T, st *store.Store, use string, at, useUntil, read time.Time, bursts ...time.Time) (store.Case, []store.Event) {
 	t.Helper()
 	evs := []store.Event{toolResult("began", at.Add(-60*aDay), "began", false)}
 	for i, u := 0, at.Add(-28*aDay); u.Before(useUntil); i, u = i+1, u.Add(time.Hour) {
@@ -112,7 +113,7 @@ func recurring(t *testing.T, st *store.Store, use string, at, useUntil time.Time
 	}
 	put(t, st, append(evs, append(failures, toolResult("tool-began", at.Add(-60*aDay), "tool-began", false))...))
 	for _, source := range []string{toolSignal.Source, use} {
-		if err := st.MarkRead(context.Background(), source, time.Now().Add(365*aDay)); err != nil {
+		if err := st.MarkRead(context.Background(), source, read); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -163,7 +164,7 @@ func TestAGuardStandsInWhereAMeasuredPlanIsRefused(t *testing.T) {
 	t.Run("a problem that stopped", func(t *testing.T) {
 		st := testStore(t)
 		from := now.Add(-8 * aDay)
-		c := stoppedProblem(t, st, from, 60, now, now.Add(time.Hour))
+		c := stoppedProblem(t, st, from, 60, now, now)
 		plan, err := (&Ship{Store: st}).validPlan(ctx, c, toolSignal, 7*aDay, "", now)
 		g, _ := guardOf(t, plan)
 		if err != nil || g == nil || g.Incidents != 0 || g.Exposure != 132 || g.Gap != 7*aDay || !g.Since.Equal(from.Add(60*time.Hour)) ||
@@ -173,7 +174,7 @@ func TestAGuardStandsInWhereAMeasuredPlanIsRefused(t *testing.T) {
 	})
 	t.Run("a rare problem", func(t *testing.T) {
 		st := testStore(t)
-		c, _ := recurring(t, st, toolSignal.Source, now, now, fourBursts(now)...)
+		c, _ := recurring(t, st, toolSignal.Source, now, now, now, fourBursts(now)...)
 		plan, err := (&Ship{Store: st}).validPlan(ctx, c, toolSignal, 7*aDay, "", now)
 		g, units := guardOf(t, plan)
 		if err != nil || g == nil || g.Incidents != 4 || g.Exposure != 684 || g.Gap != 7*aDay || g.Tool != "Bash" || units != "" || g.Units != SessionHours ||
@@ -183,7 +184,7 @@ func TestAGuardStandsInWhereAMeasuredPlanIsRefused(t *testing.T) {
 	})
 	t.Run("a two-week window", func(t *testing.T) { // four bursts nine to twelve days apart, none in the gate's two weeks
 		st := testStore(t)
-		c, _ := recurring(t, st, toolSignal.Source, now, now, now.Add(-50*aDay), now.Add(-41*aDay), now.Add(-32*aDay), now.Add(-20*aDay))
+		c, _ := recurring(t, st, toolSignal.Source, now, now, now, now.Add(-50*aDay), now.Add(-41*aDay), now.Add(-32*aDay), now.Add(-20*aDay))
 		plan, err := (&Ship{Store: st}).validPlan(ctx, c, toolSignal, 14*aDay, "", now)
 		g, _ := guardOf(t, plan)
 		if err != nil || g == nil || g.Gap != 7*aDay || g.Incidents != 4 || plan.Window != 14*aDay {
@@ -223,13 +224,13 @@ func TestAGuardIsRefusedOnlyWhereNoWatchCouldBeKept(t *testing.T) {
 	t.Run("no exposure", func(t *testing.T) {
 		st := testStore(t)
 		from := now.Add(-61 * time.Hour)
-		refusedWith(t, st, stoppedProblem(t, st, from, 60, from.Add(60*time.Hour), now.Add(time.Hour)), toolSignal, "began inside the 28d before",
+		refusedWith(t, st, stoppedProblem(t, st, from, 60, from.Add(60*time.Hour), now), toolSignal, "began inside the 28d before",
 			"holds no exposure")
 	})
 	t.Run("an active gate on the too-new path", func(t *testing.T) {
 		st := testStore(t)
-		c := stoppedProblem(t, st, now.Add(-20*aDay), 10, now, now.Add(time.Hour)) // its evidence is the burst 20 days back
-		var active []store.Event                                                   // the problem in the gate, none of it the case's
+		c := stoppedProblem(t, st, now.Add(-20*aDay), 10, now, now) // its evidence is the burst 20 days back
+		var active []store.Event                                    // the problem in the gate, none of it the case's
 		for i := 0; i < 6; i++ {
 			active = append(active, toolResult(fmt.Sprint("active-", i), now.Add(-time.Duration(i+1)*time.Hour+10*time.Minute), fmt.Sprint("active-", i), true))
 		}
@@ -238,7 +239,7 @@ func TestAGuardIsRefusedOnlyWhereNoWatchCouldBeKept(t *testing.T) {
 	})
 	t.Run("the gate's evidence is not counted", func(t *testing.T) {
 		st := testStore(t)
-		_, failures := recurring(t, st, toolSignal.Source, now, now, fourBursts(now)[:3]...)
+		_, failures := recurring(t, st, toolSignal.Source, now, now, now, fourBursts(now)[:3]...)
 		var changed []store.Event // the problem's new form in the gate, which the signal does not count, is the case's evidence there
 		for j := 0; j < 3; j++ {
 			e := toolResult(fmt.Sprint("new-", j), now.Add(-2*aDay+time.Duration(j)*time.Hour), fmt.Sprint("new-", j), true)
@@ -252,7 +253,7 @@ func TestAGuardIsRefusedOnlyWhereNoWatchCouldBeKept(t *testing.T) {
 	noTool := Signal{Source: toolSignal.Source, Kinds: toolSignal.Kinds, Match: toolSignal.Match}
 	t.Run("no shared unit", func(t *testing.T) {
 		st := testStore(t)
-		_, failures := recurring(t, st, toolSignal.Source, now, now, fourBursts(now)...)
+		_, failures := recurring(t, st, toolSignal.Source, now, now, now, fourBursts(now)...)
 		for i := range failures { // half the failures are of another tool, in another directory
 			failures[i].SourceKey += "-moved"
 			if i%2 == 0 {
@@ -266,7 +267,7 @@ func TestAGuardIsRefusedOnlyWhereNoWatchCouldBeKept(t *testing.T) {
 	})
 	t.Run("a shared tool", func(t *testing.T) {
 		st := testStore(t)
-		c, _ := recurring(t, st, toolSignal.Source, now, now, fourBursts(now)...)
+		c, _ := recurring(t, st, toolSignal.Source, now, now, now, fourBursts(now)...)
 		var other []store.Event // another tool, used every hour in sessions of its own: not the problem's unit
 		for i, u := 0, now.Add(-28*aDay); u.Before(now); i, u = i+1, u.Add(time.Hour) {
 			e := toolResult(fmt.Sprint("read-", i), u.Add(10*time.Minute), fmt.Sprint("read-", i), false)
@@ -288,7 +289,7 @@ func TestAHandLandingsRecountOfAProblemThatWentQuietIsAGuardWatch(t *testing.T) 
 	st := testStore(t)
 	plannedAt := time.Now().Truncate(time.Hour).Add(-8 * aDay)
 	landed := plannedAt.Add(8 * aDay)
-	_, failures := recurring(t, st, toolSignal.Source, plannedAt, landed, plannedAt.Add(-27*aDay), plannedAt.Add(-19*aDay-12*time.Hour), plannedAt.Add(-12*aDay))
+	_, failures := recurring(t, st, toolSignal.Source, plannedAt, landed, landed, plannedAt.Add(-27*aDay), plannedAt.Add(-19*aDay-12*time.Hour), plannedAt.Add(-12*aDay))
 	var active []store.Event // the problem every hour for the three days before the plan
 	for i, u := 0, plannedAt.Add(-3*aDay); u.Before(plannedAt); i, u = i+1, u.Add(time.Hour) {
 		active = append(active, toolResult(fmt.Sprint("active-", i), u.Add(20*time.Minute), fmt.Sprint("active-", i), true))
@@ -325,7 +326,7 @@ func guarded(t *testing.T, effectAfter time.Duration, use string, problem func(s
 	m.clock = m.deployed.Add(10 * time.Minute)
 	if problem == nil {
 		problem = func(st *store.Store, planAt, useUntil time.Time) store.Case {
-			c, _ := recurring(t, st, use, planAt, useUntil, fourBursts(planAt)...)
+			c, _ := recurring(t, st, use, planAt, useUntil, planAt, fourBursts(planAt)...)
 			return c
 		}
 	}
@@ -351,6 +352,31 @@ func guarded(t *testing.T, effectAfter time.Duration, use string, problem func(s
 		t.Fatal(err)
 	}
 	return m
+}
+
+// scanned marks the fixture's sources read as a real scan does: its last complete run started ten minutes before the
+// pass's clock.
+func (m *measured) scanned(t *testing.T) {
+	t.Helper()
+	for _, source := range []string{toolSignal.Source, "zz-use"} {
+		if err := m.st.MarkRead(context.Background(), source, m.r.now().Add(-10*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// pass is a pass of the measure step as production runs one, its sources' scans started before it.
+func (m *measured) pass(t *testing.T, o Options) Measured {
+	t.Helper()
+	m.scanned(t)
+	return m.measure(t, o)
+}
+
+// passes is a pass of the measure step over every case, its sources' scans started before it.
+func (m *measured) passes(t *testing.T, o Options) ([]Measured, error) {
+	t.Helper()
+	m.scanned(t)
+	return m.r.Measure(context.Background(), o)
 }
 
 // usesIn puts n units of the tool's successful use in a source from a time, perHour sessions of their own an hour.
@@ -405,10 +431,10 @@ func shown(t *testing.T, c store.Case) string {
 // closeGuarded runs a guarded case's watch to its end, the tool in use every week, and returns the pass that closed it.
 func closeGuarded(t *testing.T, m *measured) Measured {
 	t.Helper()
-	m.measure(t, Options{})
+	m.pass(t, Options{})
 	weekly(t, m.st, toolSignal.Source, "w", m.clock)
 	m.clock = m.clock.Add(30*aDay + time.Hour)
-	got := m.measure(t, Options{})
+	got := m.pass(t, Options{})
 	if got.Status != "guarded" {
 		t.Fatalf("the guard's close: %+v", got)
 	}
@@ -423,8 +449,8 @@ func closeGuarded(t *testing.T, m *measured) Measured {
 // its place in the store's writes.
 func TestAGuardedWatchClosesAsGuardedNeverImproved(t *testing.T) {
 	m := guarded(t, time.Hour, toolSignal.Source, nil)
-	got := m.measure(t, Options{})
-	if got.Status != "measuring" || !jsonHas(t, got, `"guarded":true`) || !got.Due.Equal(m.clock.Add(30*aDay)) {
+	got := m.pass(t, Options{})
+	if got.Status != "measuring" || !jsonHas(t, got, `"guarded":true`) || !got.Due.Equal(m.deployed.Add(30*aDay)) { // from the change's first in-effect time
 		t.Fatalf("the watch starts: %+v", got)
 	}
 	if l := lastLog(t, m.st, m.c.ID); l.Action != "guarding" || !strings.Contains(l.Detail, "guarded, not measured") ||
@@ -438,11 +464,11 @@ func TestAGuardedWatchClosesAsGuardedNeverImproved(t *testing.T) {
 	effect := m.clock
 	weekly(t, m.st, toolSignal.Source, "w", effect)
 	m.clock = effect.Add(29 * aDay)
-	if got := m.measure(t, Options{}); got.Status != "waiting" {
+	if got := m.pass(t, Options{}); got.Status != "waiting" {
 		t.Fatalf("inside its watch: %+v", got)
 	}
 	m.clock = effect.Add(30*aDay + time.Hour)
-	got = m.measure(t, Options{})
+	got = m.pass(t, Options{})
 	recur := 1 - math.Pow(684.0/809, 4.5)
 	if got.Status != "guarded" || got.Result == nil || got.Result.Improved || got.Result.P != 0 || !jsonHas(t, got.Result, fmt.Sprintf(`"recur":%v`, recur)) ||
 		!jsonHas(t, got.Result, `"exposure":684`) || !jsonHas(t, got.Result, `"watched":125`) ||
@@ -467,7 +493,7 @@ func TestAGuardedWatchClosesAsGuardedNeverImproved(t *testing.T) {
 		t.Fatalf("its note: %+v", ns)
 	}
 	m.clock = c.Closed.Add(time.Hour)
-	if ms, err := m.r.Measure(context.Background(), Options{}); err != nil || len(ms) != 0 {
+	if ms, err := m.passes(t, Options{}); err != nil || len(ms) != 0 {
 		t.Fatalf("a quiet close: %+v %v", ms, err)
 	}
 	if p, _, _ := m.r.Ship.Load(c.ID); !jsonHas(t, p, `"guard_seq":`) {
@@ -479,7 +505,7 @@ func TestAGuardedWatchClosesAsGuardedNeverImproved(t *testing.T) {
 // with the exposure watched, says there is no rate to compare, and gives no P.
 func TestAGuardWithNoIncidentAfterItsFirstReportsNoRate(t *testing.T) {
 	m := guarded(t, time.Hour, toolSignal.Source, func(st *store.Store, planAt, useUntil time.Time) store.Case {
-		return stoppedProblem(t, st, planAt.Add(-8*aDay), 60, useUntil, time.Now().Add(365*aDay))
+		return stoppedProblem(t, st, planAt.Add(-8*aDay), 60, useUntil, planAt)
 	})
 	got := closeGuarded(t, m)
 	if got.Result == nil || !strings.Contains(got.Result.Effect, "no rate to compare: the history holds no incident after its first") || strings.Contains(got.Result.Effect, "P=") ||
@@ -495,12 +521,12 @@ func TestAGuardWithNoIncidentAfterItsFirstReportsNoRate(t *testing.T) {
 // held as not in use, never passed, and the case keeps watching.
 func TestAGuardsWatchWithAWeekOutOfUseIsHeld(t *testing.T) {
 	m := guarded(t, time.Hour, toolSignal.Source, nil)
-	m.measure(t, Options{})
+	m.pass(t, Options{})
 	effect := m.clock
 	usesIn(t, m.st, toolSignal.Source, "w", effect.Add(time.Hour), 25, 5)
 	usesIn(t, m.st, toolSignal.Source, "x", effect.Add(8*aDay), 25, 5)
 	m.clock = effect.Add(30*aDay + time.Hour)
-	if got := m.measure(t, Options{}); got.Status != "held" || !strings.Contains(got.Why, "not in use") {
+	if got := m.pass(t, Options{}); got.Status != "held" || !strings.Contains(got.Why, "not in use") {
 		t.Fatalf("a watch with weeks out of use: %+v", got)
 	}
 	if c := m.theCase(t); c.Status != store.CaseMeasuring {
@@ -513,19 +539,19 @@ func TestAGuardsWatchWithAWeekOutOfUseIsHeld(t *testing.T) {
 // never to a guarded close.
 func TestARecurrenceBeforeARestartStillRegressesTheGuard(t *testing.T) {
 	m := guarded(t, time.Hour, toolSignal.Source, nil)
-	m.measure(t, Options{})
+	m.pass(t, Options{})
 	effect := m.clock
 	weekly(t, m.st, toolSignal.Source, "w", effect)
 	put(t, m.st, []store.Event{toolResult("again", effect.Add(2*time.Hour), "again", true)})
 	run(t, m.repo, "git", "checkout", "-q", "HEAD~1") // out of effect
 	m.clock = effect.Add(3 * time.Hour)
 	var says []string
-	says = append(says, m.measure(t, Options{}).Why)
+	says = append(says, m.pass(t, Options{}).Why)
 	run(t, m.repo, "git", "checkout", "-q", "main") // in effect again
 	m.clock = effect.Add(5 * time.Hour)
-	says = append(says, m.measure(t, Options{}).Why)
+	says = append(says, m.pass(t, Options{}).Why)
 	m.clock = effect.Add(31 * aDay)
-	says = append(says, m.measure(t, Options{}).Why)
+	says = append(says, m.pass(t, Options{}).Why)
 	if c := m.theCase(t); c.Reason == guardedReason || !strings.Contains(strings.Join(says, " | "), "regressed: its problem came back during its guard's watch") {
 		t.Fatalf("a recurrence before a restart: %s %v", c.Reason, says)
 	}
@@ -539,21 +565,26 @@ func TestARecurrenceBringsAGuardedCaseBackRegressed(t *testing.T) {
 	ctx := context.Background()
 	t.Run("during the watch", func(t *testing.T) {
 		m := guarded(t, time.Hour, toolSignal.Source, nil)
-		m.measure(t, Options{})
+		m.pass(t, Options{})
 		effect := m.clock
 		put(t, m.st, []store.Event{toolResult("again", effect.Add(2*time.Hour), "again", true)})
 		m.clock = effect.Add(3 * time.Hour)
-		got := m.measure(t, Options{})
+		got := m.pass(t, Options{})
 		if got.Status != "held" || !strings.Contains(got.Why, "regressed: its problem came back during its guard's watch") || !strings.Contains(got.Why, "not live") {
 			t.Fatalf("a recurrence inside the watch: %+v", got)
 		}
 		if ns := m.notes(t); len(ns) != 1 || ns[0].Kind != store.NoteDecided || !strings.Contains(ns[0].Detail, "momentum ship rollback "+m.c.ID) {
 			t.Fatalf("the held rollback's note: %+v", ns)
 		}
+		// its rollback held, it keeps measuring, and says it recurred
+		c := m.theCase(t)
+		if evidenceview.StatusLine(c) != "measuring (guarded: recurred, rollback held)" || !strings.Contains(shown(t, c), "recurred: 1 units of its problem came back") {
+			t.Fatalf("a held recurrence: %q %s", evidenceview.StatusLine(c), shown(t, c))
+		}
 	})
 	back := func(t *testing.T, m *measured) {
 		t.Helper()
-		if got := m.measure(t, Options{}); got.Status != "back" || !strings.Contains(got.Why, "came back") {
+		if got := m.pass(t, Options{}); got.Status != "back" || !strings.Contains(got.Why, "came back") {
 			t.Fatalf("a recurrence after the close: %+v", got)
 		}
 		c := m.theCase(t)
@@ -568,7 +599,7 @@ func TestARecurrenceBringsAGuardedCaseBackRegressed(t *testing.T) {
 		closeGuarded(t, m)
 		put(t, m.st, []store.Event{toolResult("late", effect.Add(5*aDay), "late", true)}) // dated inside the watch
 		m.clock = m.theCase(t).Closed.Add(2 * time.Hour)
-		if got := m.measure(t, Options{Dry: true}); got.Status != "back" || m.theCase(t).Status != store.CaseClosed {
+		if got := m.pass(t, Options{Dry: true}); got.Status != "back" || m.theCase(t).Status != store.CaseClosed {
 			t.Fatalf("a dry watch: %+v", got)
 		}
 		back(t, m)
@@ -577,7 +608,7 @@ func TestARecurrenceBringsAGuardedCaseBackRegressed(t *testing.T) {
 		m := guarded(t, time.Hour, toolSignal.Source, nil)
 		closeGuarded(t, m)
 		m.clock = m.theCase(t).Closed.Add(time.Hour)
-		if ms, err := m.r.Measure(ctx, Options{}); err != nil || len(ms) != 0 {
+		if ms, err := m.passes(t, Options{}); err != nil || len(ms) != 0 {
 			t.Fatalf("a quiet pass: %+v %v", ms, err)
 		}
 		// a use inside the watch read again as the failure it was
@@ -620,16 +651,16 @@ func TestARecurrenceBringsAGuardedCaseBackRegressed(t *testing.T) {
 // can be seen.
 func TestAClosedGuardIsWatchedByItsSignalAlone(t *testing.T) {
 	m := guarded(t, time.Hour, "zz-use", nil)
-	m.measure(t, Options{})
+	m.pass(t, Options{})
 	weekly(t, m.st, "zz-use", "w", m.clock)
 	m.clock = m.clock.Add(30*aDay + time.Hour)
-	if got := m.measure(t, Options{}); got.Status != "guarded" {
+	if got := m.pass(t, Options{}); got.Status != "guarded" {
 		t.Fatalf("the guard's close: %+v", got)
 	}
 	closed := m.theCase(t).Closed
 	m.r.Ship.SourceLive = func(source string) bool { return source != toolSignal.Source }
 	m.clock = closed.Add(time.Hour)
-	if ms, err := m.r.Measure(context.Background(), Options{}); err != nil || len(ms) != 0 {
+	if ms, err := m.passes(t, Options{}); err != nil || len(ms) != 0 {
 		t.Fatalf("a pass with the signal's source stopped: %+v %v", ms, err)
 	}
 	stopped := false
@@ -642,22 +673,69 @@ func TestAClosedGuardIsWatchedByItsSignalAlone(t *testing.T) {
 	m.r.Ship.SourceLive = func(source string) bool { return source != "zz-use" }
 	put(t, m.st, []store.Event{toolResult("back", closed.Add(time.Hour), "back", true)})
 	m.clock = closed.Add(2 * time.Hour)
-	if got := m.measure(t, Options{}); got.Status != "back" {
+	if got := m.pass(t, Options{}); got.Status != "back" {
 		t.Fatalf("a recurrence with another source stopped: %+v", got)
 	}
 }
 
-// A guard's history is counted again when its change first takes effect, and its report rests on that count: a change
-// that takes effect 25 days after its plan, the tool used every hour since and the problem quiet, starts its watch with
-// the 1283 hours of exposure through that moment.
-func TestAGuardIsCountedAgainWhenItsChangeTakesEffect(t *testing.T) {
+// A guard's watch starts at once when its change is first seen in effect, from that first in-effect time, and its
+// history is counted again through that start when the watch ends: a change that takes effect 25 days after its plan,
+// the tool used every hour since and the problem quiet, closes with the 1283 hours of exposure through its start.
+func TestAGuardIsCountedAgainThroughItsStartWhenItsWatchEnds(t *testing.T) {
 	m := guarded(t, 25*aDay, toolSignal.Source, nil)
-	if got := m.measure(t, Options{}); got.Status != "measuring" || !jsonHas(t, got, `"guarded":true`) {
+	if got := m.pass(t, Options{}); got.Status != "measuring" || !jsonHas(t, got, `"guarded":true`) {
 		t.Fatalf("a change in effect long after its problem went quiet: %+v", got)
 	}
 	p, _, _ := m.r.Ship.Load(m.c.ID)
+	if g, _ := guardOf(t, p.Plan); g == nil || g.Exposure != 684 || !jsonHas(t, p, `"guard_from":"`) {
+		t.Fatalf("its watch starts with the guard as proposed: %+v", g)
+	}
+	weekly(t, m.st, toolSignal.Source, "w", m.clock)
+	m.clock = m.clock.Add(30*aDay + time.Hour)
+	if got := m.pass(t, Options{}); got.Status != "guarded" {
+		t.Fatalf("the watch's end: %+v", got)
+	}
+	p, _, _ = m.r.Ship.Load(m.c.ID)
 	if g, _ := guardOf(t, p.Plan); g == nil || g.Exposure != 1283 || g.Incidents != 4 || m.theCase(t).Measurement.Exposure != 1283 {
-		t.Fatalf("its guard counted through the change's effect: %+v", g)
+		t.Fatalf("its guard counted through its start: %+v %+v", g, m.theCase(t).Measurement)
+	}
+}
+
+// A guard's watch starts with reads as a real scan records them, the newest complete scan started before the pass:
+// nothing holds it for a read past the moment its change is seen in effect, and a recurrence in its first hour is
+// acted on.
+func TestAGuardsWatchStartsWithReadsBeforeThePass(t *testing.T) {
+	m := guarded(t, time.Hour, toolSignal.Source, nil)
+	var says []string
+	for i := 0; i < 4; i++ {
+		if i == 1 {
+			put(t, m.st, []store.Event{toolResult("again", m.clock.Add(-time.Minute), "again", true)})
+		}
+		got := m.pass(t, Options{})
+		says = append(says, got.Status+": "+got.Why)
+		m.clock = m.clock.Add(10 * time.Minute)
+	}
+	if c := m.theCase(t); c.Status == store.CaseDeployed || !strings.Contains(strings.Join(says, " | "), "regressed") {
+		t.Fatalf("the watch never started, or the recurrence was not acted on: %q; case %s", says, c.Status)
+	}
+}
+
+// A case is guarded by its package's plan, not by guard columns an older build left behind: a measured plan's case
+// that carries them shows as measured.
+func TestACaseIsGuardedByItsPlan(t *testing.T) {
+	m := measuredCase(t)
+	m.measure(t, Options{})
+	db, err := sql.Open("sqlite", m.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE cases SET guard_exposure = 684 WHERE id = ?`, m.c.ID); err != nil {
+		t.Fatal(err)
+	}
+	c := m.theCase(t)
+	if s := shown(t, c); evidenceview.StatusLine(c) != "measuring" || strings.Contains(s, "guarded:") || !strings.Contains(s, "measured:") {
+		t.Fatalf("a measured plan's case with stale guard columns: %q %s", evidenceview.StatusLine(c), s)
 	}
 }
 
@@ -711,7 +789,7 @@ func TestAGuardedChangeIsProposedLandedAndRolledBackOnARecurrence(t *testing.T) 
 	f := newRepo(t, nil)
 	s := shipFor(t, st, f)
 	now := time.Now().Truncate(time.Hour)
-	c, _ := recurring(t, st, toolSignal.Source, now, now, fourBursts(now)...)
+	c, _ := recurring(t, st, toolSignal.Source, now, now, now, fourBursts(now)...)
 	p, err := s.Prepare(ctx, c.ID, f.main)
 	if err != nil {
 		t.Fatal(err)
@@ -757,12 +835,12 @@ func TestAGuardedChangeIsProposedLandedAndRolledBackOnARecurrence(t *testing.T) 
 	}
 	run(t, f.main, "git", "fetch", "origin", "main")
 	run(t, f.main, "git", "merge", "--ff-only", "origin/main")
-	if got := m.measure(t, Options{}); got.Status != "measuring" || !jsonHas(t, got, `"guarded":true`) {
+	if got := m.pass(t, Options{}); got.Status != "measuring" || !jsonHas(t, got, `"guarded":true`) {
 		t.Fatalf("the watch starts: %+v", got)
 	}
 	put(t, st, []store.Event{toolResult("again", clock.Add(time.Hour), "again", true)})
 	clock = clock.Add(2 * time.Hour)
-	if got := m.measure(t, Options{}); got.Status != "rolled back" || !strings.Contains(got.Why, "regressed") {
+	if got := m.pass(t, Options{}); got.Status != "rolled back" || !strings.Contains(got.Why, "regressed") {
 		t.Fatalf("a recurrence: %+v", got)
 	}
 	if m.theCase(t).Status != store.CaseTesting {
@@ -780,7 +858,7 @@ func backWithin(t *testing.T, m *measured, clocks ...time.Time) (bool, store.Cas
 	found := false
 	for _, at := range clocks {
 		m.clock = at
-		ms, err := m.r.Measure(context.Background(), Options{})
+		ms, err := m.passes(t, Options{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -850,7 +928,7 @@ func TestARecurrenceIsReadHoweverItIsDated(t *testing.T) {
 	})
 	t.Run("past the closing pass's clock", func(t *testing.T) {
 		m := guarded(t, time.Hour, toolSignal.Source, nil)
-		m.measure(t, Options{})
+		m.pass(t, Options{})
 		weekly(t, m.st, toolSignal.Source, "w", m.clock)
 		closing := m.clock.Add(30*aDay + time.Hour)
 		put(t, m.st, []store.Event{toolResult("late-dated", closing.Add(2*time.Minute), "late-dated", true)})

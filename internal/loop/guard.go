@@ -276,22 +276,36 @@ func guardDetail(plan Plan) string {
 		g.Incidents, g.Exposure, plan.Units, g.Since.UTC().Format(time.DateTime), days(guardRetention))
 }
 
-// guardAtEffect counts a guard's history again through the moment its change first took effect: the plan was counted
-// at the proposal, and the change may take effect much later. That count stands for the watch's report. why says what
-// it waits on (a source behind); dry changes nothing.
-func (r *Runner) guardAtEffect(ctx context.Context, p *Package, plan Plan, effect time.Time, dry bool) (*Guard, string, error) {
-	g := *plan.Guard
-	if why, err := r.readWindow(ctx, p, plan, g.Since, effect, dry); err != nil || why != "" {
-		return nil, why, err
+// guardEffectTime is when a guard's change first took effect, as the measure step sees it in effect at seen: the
+// installed file's time when the plan names one, else the time the checkout first held the change, when that is known
+// and falls between the landing and seen; else seen.
+func guardEffectTime(c store.Case, p *Package, seen time.Time) time.Time {
+	at := p.CheckoutAt
+	if p.Plan != nil && p.Plan.Installed != "" {
+		at = p.InstalledAt
 	}
-	h, err := guardHistory(ctx, r.Store, plan, g.Since, effect, r.Dir, false)
+	switch {
+	case at.IsZero() || at.After(seen):
+		return seen
+	case at.Before(c.Deployed):
+		return c.Deployed
+	}
+	return at
+}
+
+// guardRecount counts a guard's history again through its watch's start: the plan was counted at the proposal, and
+// the change may take effect much later. From the start on, an event is a recurrence, never history. The caller has
+// seen every source read past the start.
+func (r *Runner) guardRecount(ctx context.Context, plan Plan, from time.Time) (*Guard, error) {
+	g := *plan.Guard
+	h, err := guardHistory(ctx, r.Store, plan, g.Since, from, r.Dir, false)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	if h.Exposure > 0 {
 		setGuard(&g, h)
 	}
-	return &g, "", nil
+	return &g, nil
 }
 
 // guardStart is where a guard's watch runs from: its change's first in-effect time, kept on the package, or the
@@ -314,8 +328,15 @@ func (r *Runner) guardRegressed(ctx context.Context, c store.Case, p *Package, p
 	}
 	res := measure.Guarded(g.Incidents, g.Exposure, hitUnits(back, plan.Units), len(watched), plan.Units)
 	m.Result, m.Guarded = &res, true
-	return r.noEffect(ctx, c, p, m, fmt.Sprintf("regressed: its problem came back during its guard's watch, first at %s (%s)",
+	m = r.noEffect(ctx, c, p, m, fmt.Sprintf("regressed: its problem came back during its guard's watch, first at %s (%s)",
 		earliest(back).UTC().Format(time.DateTime), res.Effect), dry)
+	if m.Status == "held" && !dry {
+		// its rollback held, the case keeps measuring: its status says it recurred
+		if err := r.Store.GuardRecurred(ctx, c.ID, res.After.Hits); err != nil {
+			r.logf("guard recurrence on %s: %v", c.ID, err)
+		}
+	}
+	return m
 }
 
 // guardCase is the measure step for a measuring case whose plan is a guard, once its change is in effect. Any event
@@ -372,6 +393,12 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 		m.Status, m.Why = "waiting", why
 		return m
 	}
+	// every source has read past the watch's end, and so past its start: its history is counted through the start
+	counted, err := r.guardRecount(ctx, plan, from)
+	if err != nil {
+		return failed(err)
+	}
+	g, plan.Guard = *counted, counted
 	watched, err := guardExposure(ctx, r.Store, plan, nil, from, end, r.Dir)
 	if err != nil {
 		return failed(err)
@@ -409,7 +436,7 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 	if dry {
 		return m
 	}
-	p.Result, p.GuardSeq = &res, seq
+	p.Result, p.GuardSeq, p.Plan.Guard = &res, seq, counted
 	if err := r.Ship.save(p); err != nil {
 		return failed(err)
 	}

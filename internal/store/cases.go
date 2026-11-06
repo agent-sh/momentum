@@ -1673,6 +1673,8 @@ func (s *Store) CloseMeasured(ctx context.Context, id string, after int, effect,
 	switch {
 	case c.Status != CaseMeasuring:
 		return Case{}, badCase("case %s is %s: only a measuring case closes as improved", c.ID, c.Status)
+	case c.Measurement.Guarded():
+		return Case{}, badCase("case %s is guarded: a guard's watch closes as guarded, never as improved", c.ID)
 	case strings.TrimSpace(effect) == "" || after < 0:
 		return Case{}, badCase("an improvement closes with its count after the change and its effect")
 	}
@@ -1729,6 +1731,14 @@ func (s *Store) CloseGuarded(ctx context.Context, id string, incidents, exposure
 		return Case{}, err
 	}
 	return c, tx.Commit()
+}
+
+// GuardRecurred is the measure tool's: a guarded measuring case whose problem came back while its rollback is held
+// keeps how many units of it came back, so its status and view say it recurred.
+func (s *Store) GuardRecurred(ctx context.Context, id string, units int) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE cases SET after_n = ?, updated = ? WHERE id = ? AND status = ? AND guard_exposure > 0`,
+		units, time.Now().UnixMilli(), id, CaseMeasuring)
+	return err
 }
 
 // RegressCase is the measure tool's: a case closed as improved whose problem is back at its old rate comes back,
