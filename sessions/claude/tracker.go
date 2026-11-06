@@ -656,6 +656,10 @@ func (t *Tracker) user(e line, at time.Time, open bool) {
 	}
 }
 
+// Orphaned reports what Claude Code writes as it reopens a session that ended mid-task (reOrphan): the replay reads
+// a reopening as this tracker does.
+func Orphaned(s string) bool { return reOrphan.MatchString(s) }
+
 // originLabel is Claude Code's own record of where user-role text came from: the origin kind (human, peer, ...)
 // and the prompt source (typed, queued, sdk, ...). A program typing into the terminal also records as typed, so
 // this labels the text; it does not attribute it.
@@ -723,8 +727,9 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 		}
 		if m := reCommandName.FindStringSubmatch(s); m != nil && (m[1] == "/exit" || m[1] == "/quit") {
 			// the process ends, and the turn it ran with it: a "No response requested." the next process writes
-			// closes no turn, so it is no reopening
+			// closes no turn, so it is no reopening; a reopening before the exit is over with the process it opened
 			st.LastMain, st.Group, st.Request, st.QueuedPrompt = "ended", st.Group[:0], time.Time{}, time.Time{}
+			st.Resumed = time.Time{}
 		}
 		return
 	}

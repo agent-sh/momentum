@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -923,5 +924,180 @@ func TestAnOlderCodexAbortIsDatedByItsEvent(t *testing.T) {
 	r.put(st)
 	if res := replayed(t, st, "old-abort", next); !res.Point.Stop.At.Equal(abortAt) {
 		t.Fatalf("the stop at %v, not at the abort event at %v", res.Point.Stop.At, abortAt)
+	}
+}
+
+// queuedInputs are what Claude Code queues while a turn runs and delivers into it after the record it waited for,
+// dating each record when it was queued: a task's notification, which the store marks by its command mode, and
+// another session's message (meta, from a peer), which the store keeps as a harness line, as the harness's text or,
+// for a tag tacit does not know, an agent's.
+var queuedInputs = []struct {
+	name, kind, text string
+	actor            store.Actor
+}{
+	{"notification", "harness_text", "<task-notification>\n<task-id>b0</task-id>\n<status>completed</status>\n<summary>Background command \"lint\" completed (exit code 0)</summary>\n</task-notification>", store.ActorHarness},
+	{"agent-message", "harness_text", `<agent-message from="worker">The build is green.</agent-message>`, store.ActorHarness},
+	{"cross-session", "agent_text", `<cross-session-message from="s2" from-name="reviewer" from-mode="default">Review done, two nits.</cross-session-message>`, store.ActorAgent},
+}
+
+// queuedInput is one of queuedInputs, queued at queuedAt and delivered after the records before it.
+func (r *recorded) queuedInput(after time.Duration, queuedAt time.Time, name string) *recorded {
+	for _, q := range queuedInputs {
+		switch {
+		case q.name != name:
+			continue
+		case name == "notification":
+			return r.queued(after, queuedAt, q.text)
+		}
+		off, _ := r.line(after, map[string]any{"type": "attachment", "timestamp": queuedAt.Format(time.RFC3339Nano),
+			"attachment": map[string]any{"type": "queued_command", "commandMode": "prompt", "isMeta": true, "origin": map[string]any{"kind": "peer"}, "prompt": q.text}})
+		r.evs = append(r.evs, store.Event{Source: store.Transcripts, SourceKey: fmt.Sprintf("%s@%d", r.session, off), TS: queuedAt, Session: r.session,
+			Harness: "claude", Actor: q.actor, Kind: q.kind, Summary: storeCut(q.text), Meta: `{"why":"harness line"}`, Ref: fmt.Sprintf("%s@%d#0", r.path, off)})
+		return r
+	}
+	r.t.Fatalf("no queued input %q", name)
+	return r
+}
+
+// ownerQueued is a prompt the owner typed at typedAt while the turn ran, delivered after the records before it.
+func (r *recorded) ownerQueued(after time.Duration, typedAt time.Time, text string) *recorded {
+	off, _ := r.line(after, map[string]any{"type": "attachment", "timestamp": typedAt.Format(time.RFC3339Nano),
+		"attachment": map[string]any{"type": "queued_command", "commandMode": "prompt", "origin": map[string]any{"kind": "human"}, "prompt": text}})
+	r.evs = append(r.evs, store.Event{Source: store.Transcripts, SourceKey: fmt.Sprintf("%s@%d", r.session, off), TS: typedAt, Session: r.session,
+		Harness: "claude", Actor: store.ActorOwner, Kind: "owner_text", Summary: text, Meta: `{"input_kind":"queued"}`, Ref: fmt.Sprintf("%s@%d#0", r.path, off)})
+	return r
+}
+
+// pointOf is the point of a session whose next input is text, as the store keeps it.
+func pointOf(points []Point, session, text string) (Point, bool) {
+	for _, p := range points {
+		if p.Session == session && p.Next.Text == storeCut(text) {
+			return p, true
+		}
+	}
+	return Point{}, false
+}
+
+// heldAsWords reports a point of a session whose stop reads text as the model's words.
+func heldAsWords(points []Point, session, text string) bool {
+	for _, p := range points {
+		if p.Session == session && p.Stop.Words == storeCut(text) {
+			return true
+		}
+	}
+	return false
+}
+
+// Another session's message Claude Code queued during a call is delivered after the call's result, and its record is
+// dated when it was queued, before that result. It is read where it was delivered: the stop before it is the
+// result's, with no call running, and it is an input of the session's own, not the model's words, whichever way the
+// store keeps it, with its transcript or without.
+func TestAQueuedPeerMessageIsReadAfterTheResultItFollows(t *testing.T) {
+	st := testStore(t)
+	results := map[string]time.Time{}
+	texts := map[string]string{}
+	for _, q := range queuedInputs[1:] {
+		for _, gone := range []bool{false, true} {
+			session := q.name
+			if gone {
+				session += "-gone"
+			}
+			b := newRecorded(t, session).owner(0, "run the suite").call(time.Second, "t1")
+			called := b.at
+			b.result(time.Minute, "t1")
+			results[session], texts[session] = b.at, q.text
+			b.queuedInput(0, called.Add(30*time.Second), q.name).say(5*time.Second, "Noted. The suite passed.")
+			if gone {
+				if err := os.Remove(b.path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			b.put(st)
+		}
+	}
+	points, _ := replayAll(t, st)
+	for session, result := range results {
+		p, ok := pointOf(points, session, texts[session])
+		if s := p.Stop; !ok || !s.At.Equal(result) || s.Busy || p.Next.Kind != "self" {
+			t.Errorf("%s: the stop before the message: found %v, at %v (the result at %v), busy %v, next %q", session, ok, s.At, result, s.Busy, p.Next.Kind)
+		}
+		if heldAsWords(points, session, texts[session]) {
+			t.Errorf("%s: a stop reads the message as the model's words", session)
+		}
+	}
+}
+
+// Claude Code delivers what it queued during a call together, after the call's result: the first is read after the
+// result, and what follows it is delivered with it, not pulled back to the time it was queued.
+func TestBackToBackQueuedInputsAreDeliveredTogether(t *testing.T) {
+	st := testStore(t)
+	results := map[string]time.Time{}
+	second := "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n<summary>Background command \"build\" completed (exit code 0)</summary>\n</task-notification>"
+	for _, q := range queuedInputs {
+		b := newRecorded(t, q.name).owner(0, "run the suite").call(time.Second, "t1")
+		called := b.at
+		b.result(time.Minute, "t1")
+		results[q.name] = b.at
+		b.queuedInput(0, called.Add(30*time.Second), q.name).queued(0, called.Add(40*time.Second), second).say(5*time.Second, "Both done.")
+		b.put(st)
+	}
+	points, _ := replayAll(t, st)
+	for _, q := range queuedInputs {
+		p, ok := pointOf(points, q.name, q.text)
+		if s := p.Stop; !ok || !s.At.Equal(results[q.name]) || s.Busy {
+			t.Errorf("%s: the stop before the first: found %v, at %v (the result at %v), busy %v", q.name, ok, s.At, results[q.name], s.Busy)
+		}
+		if p, ok := pointOf(points, q.name, second); ok {
+			t.Errorf("%s: the second ended a stop of its own at %v, after %v", q.name, p.Next.At, p.Stop.At)
+		}
+	}
+}
+
+// A prompt the owner typed during a call keeps the time he typed it. What Claude Code queued after it is delivered
+// with it: part of his input, neither an input of its own nor the model's words.
+func TestAQueuedInputAfterTheOwnersQueuedPromptIsPartOfIt(t *testing.T) {
+	st := testStore(t)
+	typed := map[string]time.Time{}
+	for _, q := range queuedInputs {
+		b := newRecorded(t, q.name).owner(0, "run the suite").call(time.Second, "t1")
+		called := b.at
+		typed[q.name] = called.Add(20 * time.Second)
+		b.result(time.Minute, "t1").ownerQueued(0, typed[q.name], "and lint it").queuedInput(0, called.Add(25*time.Second), q.name).
+			say(5*time.Second, "Linting too.")
+		b.put(st)
+	}
+	points, _ := replayAll(t, st)
+	for _, q := range queuedInputs {
+		if p, ok := pointOf(points, q.name, "and lint it"); !ok || !p.Next.At.Equal(typed[q.name]) {
+			t.Errorf("%s: no stop ends at the owner's prompt, typed at %v: found %v, %+v", q.name, typed[q.name], ok, p.Next)
+		}
+		if p, ok := pointOf(points, q.name, q.text); ok {
+			t.Errorf("%s: what came after his prompt ended a stop of its own at %v", q.name, p.Next.At)
+		}
+		if heldAsWords(points, q.name, q.text) {
+			t.Errorf("%s: a stop reads what came after his prompt as the model's words", q.name)
+		}
+	}
+}
+
+// The events of a session are read in the store's order: by time, then transcript, offset and index. A notification
+// delivered after a call's result is read after it, also when another transcript of the session has a record at the
+// result's time.
+func TestANotificationAfterAResultFollowsItWhateverElseSharesItsTime(t *testing.T) {
+	st := testStore(t)
+	b := newRecorded(t, "tied").owner(0, "run the suite").call(time.Second, "t1")
+	called := b.at
+	b.result(time.Minute, "t1")
+	result := b.at
+	other := filepath.Join(filepath.Dir(b.path), "other.jsonl")
+	b.evs = append(b.evs, store.Event{Source: store.Transcripts, SourceKey: "tied-other@0", TS: result, Session: "tied", Harness: "claude",
+		Actor: store.ActorHarness, Kind: "harness_text", Summary: "<system-reminder>a note</system-reminder>", Meta: `{"why":"meta line"}`,
+		Ref: other + "@0#0"})
+	text := queuedInputs[0].text
+	b.queued(0, called.Add(30*time.Second), text).say(5*time.Second, "Linted.")
+	b.put(st)
+	points, _ := replayAll(t, st)
+	if p, ok := pointOf(points, "tied", text); !ok || !p.Stop.At.Equal(result) || p.Stop.Busy {
+		t.Fatalf("the stop before the notification: found %v, at %v (the result at %v), busy %v", ok, p.Stop.At, result, p.Stop.Busy)
 	}
 }
