@@ -1023,8 +1023,8 @@ func (s *Ship) landingHeld(ctx context.Context, p Package, cause error) error {
 }
 
 // abandonConfigLanding is the owner's rollback of an interrupted landing: the file gets its journaled content back
-// when it holds the change, is left when it holds its old content, and is held otherwise. The package is then rolled
-// back and the case, still in testing, builds again.
+// when it holds the change, and is left when it holds its old content or neither (his edit, kept, with the journal
+// named in the case log). The package is then rolled back and the case, still in testing, builds again.
 func (s *Ship) abandonConfigLanding(ctx context.Context, p Package, why string) (Package, error) {
 	var j ConfigJournal
 	ok, err := readRecord(s.pkgDir(p.Case), configJournal, &j)
@@ -1092,8 +1092,11 @@ func (s *Ship) abandonConfigLanding(ctx context.Context, p Package, why string) 
 				return p, err
 			}
 		default:
-			return p, &shipHold{err: refused("%s holds neither its old nor its new content: restore it by hand from %s, then roll back again",
-				p.Target, filepath.Join(s.pkgDir(p.Case), configJournal))}
+			// the owner's content: an edit the crashed write displaced to the swap name, which settle put back, or one
+			// he made in the file. His rollback writes nothing over it: the file keeps it, the journal stays, and the
+			// package is rolled back, so the file is free and the case builds again against the file as it is.
+			why += fmt.Sprintf("; %s holds neither its old nor its new content, so it keeps what it holds; its content from before the change is in %s",
+				p.Target, filepath.Join(s.pkgDir(p.Case), configJournal))
 		}
 	}
 	p.State, p.LandingHead = RolledBack, ""

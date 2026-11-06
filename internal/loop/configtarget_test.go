@@ -541,7 +541,7 @@ func TestAnInterruptedConfigurationLandingRecovers(t *testing.T) {
 			}
 			if stage == "drifted" {
 				// the change went in and the owner edited it after: the landing holds with its journal, and the owner's
-				// rollback names the journal until the file holds the change or its old content again
+				// rollback keeps his edit, names the journal and frees the file
 				edit := "marker-c0ffee the owner's edit\n"
 				write(t, filepath.Join(home, ruleTarget), edit)
 				if _, err := s.Land(ctx, c.ID); !held(err) || !strings.Contains(err.Error(), "neither") || !strings.Contains(err.Error(), configJournal) {
@@ -556,17 +556,7 @@ func TestAnInterruptedConfigurationLandingRecovers(t *testing.T) {
 				if _, err := os.Stat(filepath.Join(s.pkgDir(c.ID), configJournal)); err != nil {
 					t.Fatalf("the held landing's journal: %v", err)
 				}
-				if _, err := s.RollBack(ctx, c.ID, "the owner undoes it"); !held(err) || !strings.Contains(err.Error(), "by hand") {
-					t.Fatalf("rolled back over the owner's edit: %v", err)
-				}
-				write(t, filepath.Join(home, ruleTarget), newRule)
-				s.ConfigTargets.Enabled, s.Live = false, false
-				if p, err := s.RollBack(ctx, c.ID, "the owner undoes it"); err != nil || p.State != RolledBack {
-					t.Fatalf("the owner's rollback of the landing: %+v %v", p, err)
-				}
-				if got, mode := readTarget(t, home); got != oldRule || mode != 0o640 {
-					t.Fatalf("the owner's rollback left %q %v", got, mode)
-				}
+				keptOwnersEdit(t, s, st, c, home, edit)
 				return
 			}
 			if stage == "written" {
@@ -953,37 +943,89 @@ func TestALandedChangeBeforeDeploymentKeepsItsFileBusy(t *testing.T) {
 	}
 }
 
-// The owner's rollback of a landing a crash cut short, with the owner's edit displaced to the swap name, puts the
-// edit back in the file and holds: nothing of his is left at the swap name.
-func TestTheOwnersRollbackOfALandingPutsADisplacedEditBack(t *testing.T) {
-	st := testStore(t)
+// keptOwnersEdit asserts the owner's rollback of an interrupted landing over his edit: the file keeps the edit, the
+// journal stays and the case log names it, the package is rolled back with its case in testing, and the file is
+// free: a later case prepares against it as it is.
+func keptOwnersEdit(t *testing.T, s *Ship, st *store.Store, c store.Case, home, edit string) {
+	t.Helper()
 	ctx := context.Background()
-	home := fakeHome(t)
-	s := configShip(t, st, home)
-	c := testingCase(t, st)
-	reviewedConfig(t, s, st, c)
-	crash := errors.New("crash")
-	s.ConfigStage = func(got string) error {
-		if got == "written" {
-			return crash
-		}
-		return nil
-	}
-	if _, err := s.Land(ctx, c.ID); !errors.Is(err, crash) {
-		t.Fatalf("land: %v", err)
-	}
-	s.ConfigStage = nil
-	edit := "marker-c0ffee the owner's edit\n"
-	swap := filepath.Join(home, ".config/agents", swapName(c.ID))
-	write(t, swap, edit) // the exchange displaced his edit there, and the crash came before the compare
-	if _, err := s.RollBack(ctx, c.ID, "the owner undoes it"); !held(err) || !strings.Contains(err.Error(), "by hand") {
-		t.Fatalf("rollback: %v", err)
+	p, err := s.RollBack(ctx, c.ID, "the owner undoes it")
+	if err != nil || p.State != RolledBack {
+		t.Fatalf("the owner's rollback over his edit: %+v %v", p, err)
 	}
 	if got, _ := readTarget(t, home); got != edit {
 		t.Fatalf("the file holds %q, not the owner's edit", got)
 	}
-	if _, err := os.Lstat(swap); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("left at the swap name: %v", err)
+	if _, err := os.Stat(filepath.Join(s.pkgDir(c.ID), configJournal)); err != nil {
+		t.Fatalf("the journal: %v", err)
+	}
+	log, err := st.CaseLog(ctx, c.ID)
+	if err != nil || len(log) == 0 {
+		t.Fatalf("the case log: %v", err)
+	}
+	if last := log[len(log)-1]; last.Action != "landing rolled back" || !strings.Contains(last.Detail, "keeps what it holds") || !strings.Contains(last.Detail, configJournal) {
+		t.Fatalf("the case log's last line: %+v", last)
+	}
+	if got, _ := st.CaseByID(ctx, c.ID); got.Status != store.CaseTesting {
+		t.Fatalf("the case: %s", got.Status)
+	}
+	second := sameEvidenceCase(t, st, c)
+	if q, err := s.PrepareConfig(ctx, second.ID, ruleTarget, ""); err != nil || q.TargetBase.SHA256 != hashOf([]byte(edit)) {
+		t.Fatalf("a later case on the file: %+v %v", q, err)
+	}
+	if got, _ := readTarget(t, home); got != edit {
+		t.Fatalf("the later case's preparation changed the file to %q", got)
+	}
+}
+
+// The owner's rollback of a landing a crash cut short, with the owner's edit displaced to the swap name (by the
+// landing's exchange, or by his rollback's own), puts the edit back in the file and keeps it there: nothing of his
+// is left at the swap name, the package is rolled back and the file is free.
+func TestTheOwnersRollbackOfALandingPutsADisplacedEditBack(t *testing.T) {
+	for _, stage := range []string{"written", "rollback journaled"} {
+		t.Run(stage, func(t *testing.T) {
+			st := testStore(t)
+			ctx := context.Background()
+			home := fakeHome(t)
+			s := configShip(t, st, home)
+			c := testingCase(t, st)
+			reviewedConfig(t, s, st, c)
+			crash := errors.New("crash")
+			s.ConfigStage = func(got string) error {
+				if got == "written" {
+					return crash
+				}
+				return nil
+			}
+			if _, err := s.Land(ctx, c.ID); !errors.Is(err, crash) {
+				t.Fatalf("land: %v", err)
+			}
+			edit := "marker-c0ffee the owner's edit\n"
+			swap := filepath.Join(home, ".config/agents", swapName(c.ID))
+			if stage == "rollback journaled" {
+				// his rollback recorded itself, then its exchange put the old content in and displaced his edit, made
+				// over the change, to the swap name; the crash came before the compare
+				s.ConfigStage = func(got string) error {
+					if got == stage {
+						return crash
+					}
+					return nil
+				}
+				if _, err := s.RollBack(ctx, c.ID, "the owner undoes it"); !errors.Is(err, crash) {
+					t.Fatalf("rollback: %v", err)
+				}
+				if p, _, _ := s.Load(c.ID); p.State != RollingBack {
+					t.Fatalf("after the rollback's crash: %s", p.State)
+				}
+				write(t, filepath.Join(home, ruleTarget), oldRule)
+			}
+			s.ConfigStage = nil
+			write(t, swap, edit) // the exchange displaced his edit there, and the crash came before the compare
+			keptOwnersEdit(t, s, st, c, home, edit)
+			if _, err := os.Lstat(swap); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("left at the swap name: %v", err)
+			}
+		})
 	}
 }
 
