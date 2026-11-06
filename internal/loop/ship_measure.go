@@ -40,7 +40,8 @@ func (s *Ship) archive(p Package) error {
 			return err
 		}
 	}
-	for _, name := range []string{"check.json", "test-command.json", "change.patch", configJournal, configRollback} {
+	// a configuration package's records stay where they are (Package.Records)
+	for _, name := range []string{"check.json", "test-command.json", "change.patch"} {
 		if err := os.Rename(filepath.Join(dir, name), filepath.Join(past, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}

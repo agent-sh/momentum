@@ -346,8 +346,11 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 			from = p.OutOfEffect
 		}
 		if !dry && !now.Before(from.Add(plan.Window)) {
-			r.problem(ctx, &p, "momentum's change is not in effect: "+c.Title,
-				fmt.Sprintf("It has waited %s and %s. Its window after starts again when it is in effect.", days(now.Sub(from)), why))
+			detail := fmt.Sprintf("It has waited %s and %s. Its window after starts again when it is in effect.", days(now.Sub(from)), why)
+			if p.Kind == KindConfig {
+				detail += " To give the case back to testing with the file as it is: momentum case rollback " + c.ID + " --why ..."
+			}
+			r.problem(ctx, &p, "momentum's change is not in effect: "+c.Title, detail)
 		}
 		return m
 	}

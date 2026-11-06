@@ -290,8 +290,13 @@ func (r *Runner) buildConfigPackage(ctx context.Context, c store.Case, run store
 	switch {
 	case err != nil:
 		return p, &shipHold{err: err}
-	case cur.SHA256 != p.TargetBase.SHA256 || copied != cur.SHA256:
-		return p, &shipHold{err: refused("%s changed since the package was prepared: the loop does not build over it, and the change waits for the owner", p.Target)}
+	case copied != cur.SHA256:
+		return p, &shipHold{err: refused("%s changed since the run's configuration copy was made: the next pass builds on it", p.Target)}
+	case cur.SHA256 != p.TargetBase.SHA256:
+		// the owner changed the file before the change went in: the build is on the file as it is
+		if p, err = r.Ship.refreshConfigBase(ctx, p, cur); err != nil {
+			return p, err
+		}
 	}
 	if err = r.Ship.freshRunClone(shipContext(ctx, p.Case), &p); err != nil {
 		return p, err

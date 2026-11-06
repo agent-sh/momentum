@@ -142,6 +142,10 @@ type Package struct {
 	Target       string       `json:"target,omitempty"`
 	TargetBase   *ConfigState `json:"target_base,omitempty"`
 	TargetLanded string       `json:"target_landed,omitempty"`
+	// Records is a configuration package's own directory, under the package directory, for its landing's journal,
+	// its rollback's record and what an interrupted write displaced. A later package of the case leaves it, so a path
+	// the case log names stays.
+	Records string `json:"records,omitempty"`
 }
 
 // RollbackJournal keeps the exact revert candidate before any remote write. A retry checks this head on the
@@ -253,11 +257,25 @@ func (s *Ship) save(p *Package) error {
 	if err != nil {
 		return err
 	}
+	// synced, file and directory: a step that writes outside the package (a push, a configuration file) after its
+	// state is saved finds that state after a power loss
 	tmp := filepath.Join(dir, ".package.json.new")
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(dir, "package.json"))
+	_, err = f.Write(raw)
+	if err = errors.Join(err, f.Sync(), f.Close()); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, filepath.Join(dir, "package.json")); err != nil {
+		return err
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	return errors.Join(d.Sync(), d.Close())
 }
 
 type shipCaseKey struct{}

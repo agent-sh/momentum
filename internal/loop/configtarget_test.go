@@ -77,6 +77,22 @@ func reviewedConfig(t *testing.T, s *Ship, st *store.Store, c store.Case) Packag
 	return p
 }
 
+// recordsOf is where a case's configuration package keeps its journal and records.
+func recordsOf(t *testing.T, s *Ship, id string) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(s.pkgDir(id), "package.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p struct {
+		Records string `json:"records"`
+	}
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(s.pkgDir(id), p.Records)
+}
+
 func readTarget(t *testing.T, home string) (string, os.FileMode) {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join(home, ruleTarget))
@@ -288,7 +304,7 @@ func TestAConfigurationChangeShipsCheckedJournaledAndRolledBack(t *testing.T) {
 	if got, mode := readTarget(t, home); got != oldRule || mode.Perm() != 0o640 {
 		t.Fatalf("a refused landing wrote the file: %q %v", got, mode)
 	}
-	if _, err := os.Stat(filepath.Join(s.pkgDir(c.ID), configJournal)); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(recordsOf(t, s, c.ID), configJournal)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("a refused landing journaled: %v", err)
 	}
 	s.Live = true
@@ -305,12 +321,12 @@ func TestAConfigurationChangeShipsCheckedJournaledAndRolledBack(t *testing.T) {
 	if got, _ := st.CaseByID(ctx, c.ID); got.Status != store.CaseDeployed {
 		t.Fatalf("the case after landing: %s", got.Status)
 	}
-	info, err := os.Stat(filepath.Join(s.pkgDir(c.ID), configJournal))
+	info, err := os.Stat(filepath.Join(recordsOf(t, s, c.ID), configJournal))
 	if err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("journal: %v %v", info, err)
 	}
 	var j ConfigJournal
-	if ok, err := readRecord(s.pkgDir(c.ID), configJournal, &j); !ok || err != nil || string(j.Old.Content) != oldRule ||
+	if ok, err := readRecord(recordsOf(t, s, c.ID), configJournal, &j); !ok || err != nil || string(j.Old.Content) != oldRule ||
 		j.Old.SHA256 != hashOf([]byte(oldRule)) || j.Old.Mode != 0o640 || j.Old.UID != uint32(os.Getuid()) {
 		t.Fatalf("journal: %+v %v", j, err)
 	}
@@ -336,41 +352,69 @@ func TestAConfigurationChangeShipsCheckedJournaledAndRolledBack(t *testing.T) {
 	}
 }
 
-// A file changed since the proposal is a hold, not an overwrite: the landing writes nothing and journals nothing, and
-// the package waits. A file changed since its change landed holds the rollback the same way.
-func TestAFileChangedSinceTheProposalIsAHold(t *testing.T) {
-	st := testStore(t)
+// A file changed since the proposal is never overwritten: the landing writes and journals nothing, and the change
+// goes back to its build, on the file as it is, with its patch to adapt and its review rounds counted on.
+func TestAFileChangedSinceTheProposalGoesBackToItsBuild(t *testing.T) {
+	w := newWriteWorld(t)
 	ctx := context.Background()
-	home := fakeHome(t)
-	s := configShip(t, st, home)
-	c := testingCase(t, st)
-	reviewedConfig(t, s, st, c)
-	edit := "# Rules\n\nmarker-c0ffee the owner's edit\n"
-	write(t, filepath.Join(home, ruleTarget), edit)
-	p, err := s.Land(ctx, c.ID)
-	if !held(err) || !strings.Contains(err.Error(), "changed since the proposal") {
-		t.Fatalf("landed over the owner's edit: %v", err)
+	reviewedConfig(t, w.s, w.st, w.c) // checked in the sandbox, so its patch is kept
+	w.edit(ownerEdit)
+	if _, err := w.s.Land(ctx, w.c.ID); !held(err) || !strings.Contains(err.Error(), "changed since the proposal") || !strings.Contains(err.Error(), "builds the change again") {
+		w.fail("landed over the owner's edit: %v", err)
 	}
-	if got, _ := readTarget(t, home); got != edit {
-		t.Fatalf("the owner's edit became %q", got)
+	w.content("after the landing")
+	if p, _, _ := w.s.Load(w.c.ID); p.State != Revising {
+		w.fail("the package over the owner's edit: %s", p.State)
 	}
-	if p, _, _ = s.Load(c.ID); p.State != Proposed {
-		t.Fatalf("the held package: %s", p.State)
+	if _, err := os.Stat(filepath.Join(recordsOf(t, w.s, w.c.ID), configJournal)); !errors.Is(err, os.ErrNotExist) {
+		w.fail("a landing over the owner's edit journaled: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(s.pkgDir(c.ID), configJournal)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("a held landing journaled: %v", err)
+	w.nextPass()
+	p, _, _ := w.s.Load(w.c.ID)
+	if p.State != Prepared || p.TargetBase.SHA256 != hashOf([]byte(ownerEdit)) || len(p.Reviews) != 1 || p.Check != nil {
+		w.fail("the next build's package: %+v", p)
 	}
-	// the owner puts the file back: the change lands, and a later edit holds its rollback
-	write(t, filepath.Join(home, ruleTarget), oldRule)
-	if p, err = s.Land(ctx, c.ID); err != nil || p.State != Landed {
-		t.Fatalf("land: %+v %v", p, err)
+	if b, err := os.ReadFile(filepath.Join(p.Work, ruleTarget)); err != nil || string(b) != ownerEdit {
+		w.fail("the next build's tree holds %q %v", b, err)
 	}
-	write(t, filepath.Join(home, ruleTarget), edit)
-	if _, err := s.RollBack(ctx, c.ID, "no effect"); !held(err) || !strings.Contains(err.Error(), "changed since its change landed") {
-		t.Fatalf("rolled back over a changed file: %v", err)
+	if _, err := os.Stat(filepath.Join(w.s.pkgDir(w.c.ID), "change.patch")); err != nil {
+		w.fail("the change's patch, for the next build to adapt: %v", err)
 	}
-	if got, _ := readTarget(t, home); got != edit {
-		t.Fatalf("the held rollback wrote %q", got)
+	w.content("after the next build")
+}
+
+// A landed change the owner edited since is not overwritten by any rollback: the package is rolled back with his
+// content kept and the journal named, and the case goes back to testing, where the loop builds again on his file.
+func TestARollbackOverTheOwnersEditKeepsIt(t *testing.T) {
+	for _, owner := range []bool{true, false} {
+		t.Run(fmt.Sprint("owner ", owner), func(t *testing.T) {
+			w := newWriteWorld(t)
+			ctx := context.Background()
+			w.reviewed()
+			if err := w.land(); err != nil {
+				w.fail("land: %v", err)
+			}
+			w.edit(ownerEdit)
+			rollBack := w.loopRollBack
+			if owner {
+				rollBack = w.ownerRollBack
+			}
+			if err := rollBack(); err != nil {
+				w.fail("the rollback over the owner's edit: %v", err)
+			}
+			w.content("after the rollback")
+			if p, _, _ := w.s.Load(w.c.ID); p.State != RolledBack {
+				w.fail("the package: %s", p.State)
+			}
+			c, _ := w.st.CaseByID(ctx, w.c.ID)
+			log, _ := w.st.CaseLog(ctx, w.c.ID)
+			if last := log[len(log)-1]; c.Status != store.CaseTesting || last.Action != "rolled back" || !strings.Contains(last.Detail, "leaves it as it is") {
+				w.fail("the case %s, its last line %+v", c.Status, last)
+			}
+			w.nextPass()
+			w.settled("after the next pass")
+			w.done()
+		})
 	}
 }
 
@@ -418,7 +462,7 @@ func TestALandingChecksEveryRefusalAgain(t *testing.T) {
 			if b, _ := os.ReadFile(path(home)); string(b) != oldRule {
 				t.Fatalf("a refused landing wrote %q", b)
 			}
-			if _, err := os.Stat(filepath.Join(s.pkgDir(c.ID), configJournal)); !errors.Is(err, os.ErrNotExist) {
+			if _, err := os.Stat(filepath.Join(recordsOf(t, s, c.ID), configJournal)); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("a refused landing journaled: %v", err)
 			}
 			tc.restore(t, s, home)
@@ -523,7 +567,7 @@ func TestAnInterruptedConfigurationLandingRecovers(t *testing.T) {
 				}
 				if got == "journaled" {
 					var j ConfigJournal
-					if ok, err := readRecord(s.pkgDir(c.ID), configJournal, &j); !ok || err != nil || string(j.Old.Content) != oldRule {
+					if ok, err := readRecord(recordsOf(t, s, c.ID), configJournal, &j); !ok || err != nil || string(j.Old.Content) != oldRule {
 						t.Fatalf("journal before the write: %+v %v", j, err)
 					}
 					if got, _ := readTarget(t, home); got != oldRule {
@@ -550,10 +594,10 @@ func TestAnInterruptedConfigurationLandingRecovers(t *testing.T) {
 				if got, _ := readTarget(t, home); got != edit {
 					t.Fatalf("the owner's edit became %q", got)
 				}
-				if p, _, _ := s.Load(c.ID); p.State != Landing {
-					t.Fatalf("after the hold: %s", p.State)
+				if p, _, _ := s.Load(c.ID); p.State != RolledBack {
+					t.Fatalf("the landing over the owner's edit: %s", p.State)
 				}
-				if _, err := os.Stat(filepath.Join(s.pkgDir(c.ID), configJournal)); err != nil {
+				if _, err := os.Stat(filepath.Join(recordsOf(t, s, c.ID), configJournal)); err != nil {
 					t.Fatalf("the held landing's journal: %v", err)
 				}
 				keptOwnersEdit(t, s, st, c, home, edit)
@@ -834,8 +878,12 @@ func TestALaterCaseLandsOverAnEditedLandedFile(t *testing.T) {
 	if got, _ := readTarget(t, home); got != edit+"marker-c0ffee new rule\n" {
 		t.Fatalf("landed %q", got)
 	}
-	if _, err := s.RollBack(ctx, first.ID, "no effect"); !held(err) || !strings.Contains(err.Error(), "changed since its change landed") {
-		t.Fatalf("the first rollback over the second change: %v", err)
+	// the first case's rollback finds the second change in the file: it writes nothing over it
+	if p, err := s.RollBack(ctx, first.ID, "no effect"); err != nil || p.State != RolledBack {
+		t.Fatalf("the first rollback over the second change: %+v %v", p, err)
+	}
+	if got, _ := readTarget(t, home); got != edit+"marker-c0ffee new rule\n" {
+		t.Fatalf("the first rollback wrote %q over the second change", got)
 	}
 	if p, err := s.RollBack(ctx, second.ID, "no effect"); err != nil || p.State != RolledBack {
 		t.Fatalf("the second rollback: %+v %v", p, err)
@@ -956,14 +1004,14 @@ func keptOwnersEdit(t *testing.T, s *Ship, st *store.Store, c store.Case, home, 
 	if got, _ := readTarget(t, home); got != edit {
 		t.Fatalf("the file holds %q, not the owner's edit", got)
 	}
-	if _, err := os.Stat(filepath.Join(s.pkgDir(c.ID), configJournal)); err != nil {
+	if _, err := os.Stat(filepath.Join(recordsOf(t, s, c.ID), configJournal)); err != nil {
 		t.Fatalf("the journal: %v", err)
 	}
 	log, err := st.CaseLog(ctx, c.ID)
 	if err != nil || len(log) == 0 {
 		t.Fatalf("the case log: %v", err)
 	}
-	if last := log[len(log)-1]; last.Action != "landing rolled back" || !strings.Contains(last.Detail, "keeps what it holds") || !strings.Contains(last.Detail, configJournal) {
+	if last := log[len(log)-1]; last.Action != "landing rolled back" || !strings.Contains(last.Detail, "leaves it as it is") || !strings.Contains(last.Detail, configJournal) {
 		t.Fatalf("the case log's last line: %+v", last)
 	}
 	if got, _ := st.CaseByID(ctx, c.ID); got.Status != store.CaseTesting {
@@ -1049,7 +1097,7 @@ func TestALandingHoldsOnTheOwnersRollbackRecord(t *testing.T) {
 	}
 	s.ConfigStage = nil
 	rb := ConfigRollback{From: ConfigState{SHA256: hashOf([]byte(newRule))}, To: hashOf([]byte(oldRule)), Why: "the owner undoes it", Landing: true}
-	if err := writeDurable(s.pkgDir(c.ID), configRollback, rb); err != nil {
+	if err := writeDurable(recordsOf(t, s, c.ID), configRollback, rb); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Land(ctx, c.ID); !held(err) || !strings.Contains(err.Error(), "rolling back") {
