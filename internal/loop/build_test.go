@@ -489,7 +489,8 @@ func TestBuildHoldsWhenVisibilityCannotBeRead(t *testing.T) {
 }
 
 // A public repository whose default branch no longer holds the base (a force-push purged it) is scanned like a
-// private one.
+// private one. A build fetches its base first, so the purge it meets is one that lands between that fetch and the
+// visibility check.
 func TestBuildScansAPublicBaseTheBranchNoLongerHolds(t *testing.T) {
 	f := newRepo(t, map[string]string{"notes.txt": "marker-7f3a\n"})
 	write(t, filepath.Join(f.dir, "public"), "")
@@ -519,7 +520,18 @@ func TestBuildScansAPublicBaseTheBranchNoLongerHolds(t *testing.T) {
 	if public, err := r.Ship.publicBase(ctx, p); public || err != nil {
 		t.Fatalf("a purged base counted as public: %v %v", public, err)
 	}
-	// so its build scans the tree and refuses it
+	// so a build whose fetched base is purged before the visibility check scans the tree and refuses it
+	marked := pushOther(t, f, "main", map[string]string{"notes.txt": "marker-7f3a again\n"})
+	resolve, purged := r.Ship.Gate.Resolve, false
+	r.Ship.Gate.Resolve = func(ctx context.Context, dir string) (string, error) {
+		if dir == p.Host && !purged {
+			purged = true
+			write(t, filepath.Join(other, "notes.txt"), "clean again\n")
+			run(t, other, "git", "commit", "-q", "-am", "purged again")
+			run(t, other, "git", "push", "-q", "--force", "origin", "HEAD:main")
+		}
+		return resolve(ctx, dir)
+	}
 	r.Inputs.ReadDirs = []string{f.main}
 	setCaseRepo(t, r.Store, c, "main")
 	r.pass = &passInputs{}
@@ -530,6 +542,9 @@ func TestBuildScansAPublicBaseTheBranchNoLongerHolds(t *testing.T) {
 	_, err = r.prepareRun(context.Background(), c, c.Family, StepBuild)
 	if err == nil || !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "is not public and its base holds text the scrubber would mask") {
 		t.Fatalf("a purged public base was mounted unscanned: %v", err)
+	}
+	if p, _, err = r.Ship.Load(c.ID); err != nil || !purged || p.BaseCommit != marked {
+		t.Fatalf("the build did not take the base it fetched: %s %v", p.BaseCommit, err)
 	}
 	if _, err := os.Stat(r.Ship.workDir(c.ID)); !os.IsNotExist(err) {
 		t.Fatalf("the refused tree was kept: %v", err)
