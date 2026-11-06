@@ -203,11 +203,11 @@ func Case(stdout io.Writer, c store.Case, evs []store.Evidence, log []store.Case
 	}
 	if m := c.Measurement; m.Guarded() {
 		// a guard measures no rate: it watches for a problem that had stopped to come back
-		text := fmt.Sprintf("watching for a recurrence after %d incidents in %d units of exposure before the change, until its exposure or 30 days end it (expected in %dd)",
-			m.Before, m.Exposure, int(m.Window.Hours()/24))
+		text := fmt.Sprintf("watching %dd for a recurrence, after %d incidents in %d units of exposure before the change; a problem that stopped by itself shows the same",
+			int(m.Window.Hours()/24), m.Before, m.Exposure)
 		if c.Status == store.CaseClosed && c.Reason == store.Guarded {
-			text = fmt.Sprintf("no recurrence in %d units of exposure watched after %d incidents in %d before the change; P=%.1f%% that the problem, had it kept happening, would have recurred within them (a problem that stopped by itself shows the same): %s",
-				m.Watched, m.Before, m.Exposure, 100*m.Recur, m.Effect)
+			text = fmt.Sprintf("no recurrence in %d units of exposure watched, after %d incidents in %d before the change; %s; a problem that stopped by itself shows the same: %s",
+				m.Watched, m.Before, m.Exposure, guardChance(m, "%.1f"), m.Effect)
 		}
 		field("guarded", text)
 	} else if m.Window > 0 || m.Effect != "" {
@@ -233,7 +233,16 @@ func StatusLine(c store.Case) string {
 	case c.Reason == store.Duplicate:
 		return "closed: duplicate of " + c.Into
 	case c.Reason == store.Guarded:
-		return fmt.Sprintf("closed: guarded, %d watched, P=%.0f%%", c.Measurement.Watched, 100*c.Measurement.Recur)
+		return fmt.Sprintf("closed: guarded, %d watched, %s; or it stopped by itself", c.Measurement.Watched, guardChance(c.Measurement, "%.0f"))
 	}
 	return "closed: " + string(c.Reason)
+}
+
+// guardChance is a guarded close's P in words, with its precision: the probability that the problem, had it kept
+// happening, would have recurred in its watch, or that its history gives no rate.
+func guardChance(m store.Measurement, precision string) string {
+	if m.Before == 0 {
+		return "no rate to compare: the history holds no incident after its first"
+	}
+	return fmt.Sprintf("P="+precision+"%% had it kept happening", 100*m.Recur)
 }

@@ -413,8 +413,8 @@ func addEvidence(ctx context.Context, q querier, id string, evs []Evidence, now 
 // comesBack decides whether a closed case comes back on the evidence it holds now, and says why either way.
 //   - A case closed as improved does not come back on its evidence: the measure step watches its signal, in the
 //     units its measurement counted, and brings it back at its old rate (RegressCase).
-//   - Nor does one closed as guarded: the measure step watches its signal and brings it back at its first event
-//     after the change (RegressCase).
+//   - A case closed as guarded comes back as one closed as already solved does, on any evidence after the close; the
+//     measure step also brings it back at its signal's first event after its watch began (RegressCase).
 //   - A case closed as already solved comes back on any evidence after the close, or after its fix was named when
 //     that came after the close (CloseFixed on a case closed before a close named its fix).
 //   - A dismissed case (not worth it, insufficient evidence) comes back only once the evidence after the close
@@ -442,9 +442,7 @@ func comesBack(ctx context.Context, q querier, c Case, now time.Time) (bool, str
 	switch c.Reason {
 	case Improved:
 		return false, fmt.Sprintf("%d new since it closed as improved; the measure step brings it back at its old rate", after), nil
-	case Guarded:
-		return false, fmt.Sprintf("%d new since it closed as guarded; the measure step brings it back at its signal's first event after the change", after), nil
-	case Solved:
+	case Solved, Guarded:
 		return after > 0, fmt.Sprintf("%d new since %s", after, since), nil
 	case NotWorthIt, Insufficient:
 		need := max(c.ClosedEvidence, 1)
@@ -472,8 +470,8 @@ func reopenIfBack(ctx context.Context, q querier, c Case, added, actor string, n
 	if !back {
 		return false, caseLog(ctx, q, c.ID, actor, "kept closed", added+"; "+why, now)
 	}
-	if _, err := q.ExecContext(ctx, `UPDATE cases SET episode = episode + 1, status = ?, reason = '', closed = 0, closed_evidence = 0, updated = ?, back = ?
-	  WHERE id = ?`, CaseOpen, now.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
+	if _, err := q.ExecContext(ctx, `UPDATE cases SET episode = episode + 1, status = ?, reason = '', closed = 0, closed_evidence = 0, updated = ?, back = ?,
+	  `+clearGuard+` WHERE id = ?`, CaseOpen, now.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
 		return false, err
 	}
 	action := "reopened"
@@ -971,7 +969,7 @@ func (s *Store) ReopenCase(ctx context.Context, id string, evs []Evidence, why, 
 		return Case{}, badCase("case %s comes back only on evidence it does not hold", c.ID)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE cases SET episode = episode + 1, status = ?, reason = '', closed = 0, closed_evidence = 0, updated = ?,
-	  seen = MAX(seen, ?), back = ? WHERE id = ?`, CaseOpen, now.UnixMilli(), newest.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
+	  seen = MAX(seen, ?), back = ?, `+clearGuard+` WHERE id = ?`, CaseOpen, now.UnixMilli(), newest.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
 	action := "reopened"
@@ -1267,7 +1265,7 @@ func (s *Store) ResumedAt(ctx context.Context, id string) (time.Time, error) {
 
 // closeAs closes a case with a reason other than a duplicate's, keeping how much evidence it held, and logs why.
 func closeAs(ctx context.Context, q querier, id string, reason CloseReason, why, actor string, now time.Time) error {
-	if _, err := q.ExecContext(ctx, `UPDATE cases SET status = ?, reason = ?, closed = ?, updated = ?,
+	if _, err := q.ExecContext(ctx, `UPDATE cases SET status = ?, reason = ?, closed = ?, updated = ?, `+clearGuard+`,
 	  closed_evidence = (SELECT COUNT(*) FROM case_evidence WHERE case_id = ?) WHERE id = ?`,
 		CaseClosed, string(reason), now.UnixMilli(), now.UnixMilli(), id, id); err != nil {
 		return err
@@ -1563,7 +1561,7 @@ func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, 
 		return Case{}, badCase("case %s is %s: only a deployed or measuring case rolls back", c.ID, c.Status)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, deployed = 0, window_ms = 0, before_n = 0, after_n = 0,
-	  effect = '', guard_exposure = 0, guard_watched = 0, guard_recur = 0, updated = ? WHERE id = ?`, CaseTesting, time.Now().UnixMilli(), c.ID); err != nil {
+	  effect = '', `+clearGuard+`, updated = ? WHERE id = ?`, CaseTesting, time.Now().UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
 	if err := caseLogCleaned(ctx, tx, c.ID, actor, "rolled back", why, time.Now()); err != nil {
@@ -1693,11 +1691,16 @@ func (s *Store) CloseMeasured(ctx context.Context, id string, after int, effect,
 	return c, tx.Commit()
 }
 
-// CloseGuarded is the measure tool's: a measuring case whose guard's watch ended with no recurrence closes as guarded,
-// never as improved, with the units of exposure watched, the predictive probability that the problem, had it kept
-// happening, would have recurred within them, and the watch in words. Its first recurrence brings it back
-// (RegressCase).
-func (s *Store) CloseGuarded(ctx context.Context, id string, watched int, recur float64, effect, actor string) (Case, error) {
+// clearGuard empties a case's guard columns: a case that comes back, by regression, reopening, a close by hand or a
+// rollback, keeps no guard of its last episode.
+const clearGuard = `guard_exposure = 0, guard_watched = 0, guard_recur = 0`
+
+// CloseGuarded is the measure tool's: a measuring case whose guard's watch ended in use with no recurrence closes as
+// guarded, never as improved, with its history's incidents and exposure as counted when its change first took
+// effect, the units of exposure watched, the predictive probability that the problem, had it kept happening, would
+// have recurred within them (0 when the history gives no rate), and the watch in words. Its first recurrence, or any
+// evidence after the close, brings it back (RegressCase, ObserveCase).
+func (s *Store) CloseGuarded(ctx context.Context, id string, incidents, exposure, watched int, recur float64, effect, actor string) (Case, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Case{}, err
@@ -1710,13 +1713,13 @@ func (s *Store) CloseGuarded(ctx context.Context, id string, watched int, recur 
 	switch {
 	case c.Status != CaseMeasuring || !c.Measurement.Guarded():
 		return Case{}, badCase("case %s is %s: only a guarded measuring case closes as guarded", c.ID, c.Status)
-	case strings.TrimSpace(effect) == "" || watched < 0 || recur < 0 || recur > 1:
-		return Case{}, badCase("a guarded close records its exposure watched, its probability and its watch")
+	case strings.TrimSpace(effect) == "" || incidents < 0 || exposure <= 0 || watched < 0 || recur < 0 || recur > 1:
+		return Case{}, badCase("a guarded close records its history, its exposure watched, its probability and its watch")
 	}
 	now := time.Now()
-	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, reason = ?, closed = ?, updated = ?, after_n = 0, effect = ?, guard_watched = ?,
-	  guard_recur = ?, closed_evidence = (SELECT COUNT(*) FROM case_evidence WHERE case_id = ?) WHERE id = ?`,
-		CaseClosed, string(Guarded), now.UnixMilli(), now.UnixMilli(), caseText(effect, caseTextMax), watched, recur, c.ID, c.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, reason = ?, closed = ?, updated = ?, after_n = 0, effect = ?, before_n = ?,
+	  guard_exposure = ?, guard_watched = ?, guard_recur = ?, closed_evidence = (SELECT COUNT(*) FROM case_evidence WHERE case_id = ?) WHERE id = ?`,
+		CaseClosed, string(Guarded), now.UnixMilli(), now.UnixMilli(), caseText(effect, caseTextMax), incidents, exposure, watched, recur, c.ID, c.ID); err != nil {
 		return Case{}, err
 	}
 	if err := caseLog(ctx, tx, c.ID, actor, "closed", string(Guarded)+": "+effect, now); err != nil {
@@ -1744,8 +1747,8 @@ func (s *Store) RegressCase(ctx context.Context, id, why, actor string) (Case, e
 		return Case{}, badCase("case %s is %s %s: only a case closed as improved or guarded regresses", c.ID, c.Status, c.Reason)
 	}
 	now := time.Now()
-	if _, err := tx.ExecContext(ctx, `UPDATE cases SET episode = episode + 1, status = ?, reason = '', closed = 0, closed_evidence = 0, updated = ?, back = ?
-	  WHERE id = ?`, CaseOpen, now.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET episode = episode + 1, status = ?, reason = '', closed = 0, closed_evidence = 0, updated = ?, back = ?,
+	  `+clearGuard+` WHERE id = ?`, CaseOpen, now.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
 	if err := caseLog(ctx, tx, c.ID, actor, "regressed", "closed as "+string(c.Reason)+"; "+why, now); err != nil {

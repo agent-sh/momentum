@@ -312,17 +312,22 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 	case p.Plan.At.IsZero() || p.Plan.Units == "":
 		return r.legacyPlan(ctx, c, dry)
 	}
-	effect := time.Time{}
-	if c.Status == store.CaseMeasuring {
-		effect = c.Deployed
-	}
-	plan, why, err := r.countingPlan(ctx, &p, effect, dry)
+	plan, why, err := r.countingPlan(ctx, &p, dry)
 	if err != nil {
 		return failed(err.Error())
 	}
 	if why != "" {
 		m.Status, m.Why = "waiting", why
 		return m
+	}
+	if plan.Guard != nil && c.Status == store.CaseMeasuring {
+		// a guard's recurrence counts from its watch's first start, before any wait or restart
+		from := guardStart(c, &p)
+		if back, err := recurrences(ctx, r.Store, plan, from, now.Add(time.Minute), r.Dir); err != nil {
+			return failed(err.Error())
+		} else if len(back) > 0 {
+			return r.guardRegressed(ctx, c, &p, plan, m, back, from, now, dry)
+		}
 	}
 	since, why, err := r.Ship.InEffect(ctx, &p)
 	if err != nil {
@@ -354,7 +359,8 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		return m
 	}
 	if c.Status == store.CaseDeployed && plan.Guard != nil {
-		// the watch is sized from its history counted through the change's effect: the plan was counted at the proposal
+		// the watch's report rests on its history counted through the change's first effect: the plan was counted at
+		// the proposal
 		g, why, err := r.guardAtEffect(ctx, &p, plan, since, dry)
 		switch {
 		case err != nil:
@@ -364,17 +370,30 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 			return m
 		}
 		plan.Guard, p.Plan.Guard = g, g
+		if p.GuardFrom.IsZero() {
+			p.GuardFrom = since
+		}
 	}
-	if c.Status == store.CaseDeployed || !p.OutOfEffect.IsZero() {
+	if plan.Guard != nil && c.Status == store.CaseMeasuring && !p.OutOfEffect.IsZero() {
+		// in effect again: the watch goes on from its first start
+		if !dry {
+			p.OutOfEffect = time.Time{}
+			if err := r.Ship.save(&p); err != nil {
+				return failed(err.Error())
+			}
+			r.resolve(ctx, &p)
+		}
+	}
+	if c.Status == store.CaseDeployed || plan.Guard == nil && !p.OutOfEffect.IsZero() {
 		m.Status, m.Due = "measuring", since.Add(plan.Window)
 		if plan.Guard != nil {
-			m.Due, m.Guarded = since.Add(plan.Guard.Watch), true
-			m.Why = fmt.Sprintf("guarded, not measured: it watches for a recurrence until %d %s of exposure or %s", plan.Guard.Need, plan.Units, days(guardRetention))
+			m.Due, m.Guarded = since.Add(guardRetention), true
+			m.Why = fmt.Sprintf("guarded, not measured: it watches %s for a recurrence while its unit is in use every week", days(guardRetention))
 		}
 		if !dry {
 			switch {
 			case c.Status == store.CaseDeployed && plan.Guard != nil:
-				_, err = r.Store.StartGuarding(ctx, c.ID, plan.Guard.Watch, plan.Guard.Incidents, plan.Guard.Exposure, since, guardDetail(plan), "loop:measure")
+				_, err = r.Store.StartGuarding(ctx, c.ID, guardRetention, plan.Guard.Incidents, plan.Guard.Exposure, since, guardDetail(plan), "loop:measure")
 			case c.Status == store.CaseDeployed:
 				_, err = r.Store.StartMeasuring(ctx, c.ID, plan.Window, plan.Before, since, "loop:measure")
 			default:
@@ -597,7 +616,7 @@ func (r *Runner) watch(ctx context.Context, c store.Case, dry bool) (Measured, b
 		}
 		return r.guardBack(ctx, c, &p, *p.Plan, m, now, dry)
 	}
-	plan, why, err := r.countingPlan(ctx, &p, time.Time{}, dry)
+	plan, why, err := r.countingPlan(ctx, &p, dry)
 	if err != nil {
 		return failed(err)
 	}
@@ -892,8 +911,9 @@ func tallyPlan(ctx context.Context, st *store.Store, plan Plan, since, until tim
 }
 
 // countingPlan recounts the original baseline when a recorded reader stopped. Its sources stay recorded. A guard's
-// history is recounted through effect, the change's in-effect time, when it has one (else through the plan).
-func (r *Runner) countingPlan(ctx context.Context, p *Package, effect time.Time, dry bool) (Plan, string, error) {
+// history is recounted through its change's first in-effect time when it has one (else through the plan), and the
+// package keeps that count.
+func (r *Runner) countingPlan(ctx context.Context, p *Package, dry bool) (Plan, string, error) {
 	plan := *p.Plan
 	if p.Result != nil {
 		plan.Before, plan.BeforeBase = p.Result.Before.Hits, p.Result.Before.Base
@@ -936,8 +956,8 @@ func (r *Runner) countingPlan(ctx context.Context, p *Package, effect time.Time,
 		// exposure, and the exposure its watch runs to
 		g := *plan.Guard
 		through := plan.At
-		if !effect.IsZero() {
-			through = effect
+		if !p.GuardFrom.IsZero() {
+			through = p.GuardFrom
 		}
 		if why, err := r.readWindow(ctx, p, plan, g.Since, through, dry); err != nil || why != "" {
 			return plan, why, err
@@ -947,11 +967,17 @@ func (r *Runner) countingPlan(ctx context.Context, p *Package, effect time.Time,
 			return plan, "", err
 		}
 		if h.Exposure > 0 {
-			watch := g.Watch
 			setGuard(&g, h)
-			g.Watch = watch // the watch already set out keeps its window
 		}
 		plan.Guard = &g
+		if !dry && (g.Incidents != p.Plan.Guard.Incidents || g.Exposure != p.Plan.Guard.Exposure) {
+			// the recount stands for its report: the guard keeps what it counted
+			kept := g
+			p.Plan.Guard = &kept
+			if err := r.Ship.save(p); err != nil {
+				return plan, "", err
+			}
+		}
 	} else if len(omitted) > 0 {
 		if why, err := r.readWindow(ctx, p, plan, plan.At.Add(-4*plan.Window), plan.At.Add(-plan.Window), dry); err != nil || why != "" {
 			return plan, why, err

@@ -68,8 +68,11 @@ func PublishLesson(ctx context.Context, st *store.Store, ship *Ship, id, text, t
 	// lesson says so, with the probability its watch reports.
 	prefix := "unverified lesson from a loop run: "
 	if c.Reason == store.Guarded {
-		prefix = fmt.Sprintf("unverified lesson from a loop run, guarded, not measured (P=%.0f%% that the problem, had it kept happening, would have recurred in its watch): ",
-			100*c.Measurement.Recur)
+		chance := "no rate to compare"
+		if c.Measurement.Before > 0 {
+			chance = fmt.Sprintf("P=%.0f%% that the problem, had it kept happening, would have recurred in its watch", 100*c.Measurement.Recur)
+		}
+		prefix = "unverified lesson from a loop run, guarded, not measured (" + chance + "; a problem that stopped by itself shows the same): "
 	}
 	desc, err := Public(ctx, prefix+reserved)
 	if err != nil {

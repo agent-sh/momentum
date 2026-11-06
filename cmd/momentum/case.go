@@ -128,6 +128,7 @@ type listedCase struct {
 		Exposure int     `json:"exposure,omitempty"`
 		Watched  int     `json:"watched,omitempty"`
 		Recur    float64 `json:"recur,omitempty"`
+		NoRate   bool    `json:"no_rate,omitempty"`
 	} `json:"measurement,omitempty"`
 	Signatures []string `json:"signatures"`
 }
@@ -163,7 +164,8 @@ func caseJSON(c store.Case) listedCase {
 			Exposure    int     `json:"exposure,omitempty"`
 			Watched     int     `json:"watched,omitempty"`
 			Recur       float64 `json:"recur,omitempty"`
-		}{m.Window.Hours(), m.Before, m.After, m.Effect, m.Guarded(), m.Exposure, m.Watched, m.Recur}
+			NoRate      bool    `json:"no_rate,omitempty"`
+		}{m.Window.Hours(), m.Before, m.After, m.Effect, m.Guarded(), m.Exposure, m.Watched, m.Recur, m.Guarded() && m.Before == 0}
 	}
 	return l
 }

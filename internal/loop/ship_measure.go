@@ -86,8 +86,8 @@ func (s *Ship) deploymentReceipt(ctx context.Context, p Package) error {
 	if p.Plan != nil {
 		window = " Measured over the " + days(p.Plan.Window) + " after it is in effect."
 		if g := p.Plan.Guard; g != nil && p.Plan.Units != "" {
-			window = fmt.Sprintf(" Guarded, not measured: it watches for a recurrence from when it is in effect until %d %s of exposure or %s, whichever comes first; P=%.0f%% at %d, the probability that the problem, had it kept happening, would recur within it. One recurrence brings the case back.",
-				g.Need, p.Plan.Units, days(guardRetention), 100*measure.GuardRecur(g.Incidents, g.Exposure, g.Need), g.Need)
+			window = fmt.Sprintf(" Guarded, not measured: it watches %s for a recurrence from when it first takes effect; %d incidents in %d %s before it. One recurrence brings the case back; no recurrence closes it as guarded, with P, had the problem kept happening. A problem that stopped by itself shows the same.",
+				days(guardRetention), g.Incidents, g.Exposure, p.Plan.Units)
 		}
 	}
 	if len(p.Hand) > 0 {
@@ -240,7 +240,7 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 	// tooNew is the measured plan's refusal when the signal's source began inside the span: no measured plan can stand,
 	// but a guard, which reads the history from the source's first event, may (guardPlan). The source is kept for it.
 	var tooNew error
-	begun := func(list []string) ([]string, error) {
+	begun := func(units string, list []string) ([]string, error) {
 		var kept []string
 		for _, source := range list {
 			began, err := s.Store.FirstHarnessEvent(ctx, source, harnessFor(sig, units))
@@ -265,7 +265,7 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 	if sources, err = live(units, at); err != nil {
 		return waits(err)
 	}
-	if sources, err = begun(sources); err != nil {
+	if sources, err = begun(units, sources); err != nil {
 		return Plan{}, err
 	}
 	boundary := at
@@ -299,7 +299,7 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 		if err != nil {
 			return waits(err)
 		}
-		if found, err = begun(found); err != nil {
+		if found, err = begun(units, found); err != nil {
 			return Plan{}, err
 		}
 		added := false
@@ -323,7 +323,7 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 		if sources, err = live(units, at); err != nil {
 			return waits(err)
 		}
-		if sources, err = begun(sources); err != nil {
+		if sources, err = begun(units, sources); err != nil {
 			return Plan{}, err
 		}
 	}
@@ -339,7 +339,7 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 			if err != nil {
 				return found, nil, err
 			}
-			if found, err = begun(found); err != nil {
+			if found, err = begun(units, found); err != nil {
 				return nil, nil, err
 			}
 			slices.Sort(found)
@@ -381,12 +381,6 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 		return refused("%s; and %s", strings.TrimPrefix(also.Error(), ErrRefused.Error()+": "), why)
 	}
 	mismatch := in > 0 && hit*2 < in
-	if tooNew != nil {
-		if mismatch {
-			return Plan{}, notIts(tooNew)
-		}
-		return guard(tooNew)
-	}
 	before, err := tallySources(ctx, s.Store, sig, plan.Units, got, at.Add(-window), at, s.Dir, sources)
 	if err != nil {
 		return Plan{}, err
@@ -395,6 +389,18 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 		return Plan{}, err
 	} else if len(unread) > 0 {
 		return plan, &waitingPlan{sources: unread}
+	}
+	if tooNew != nil {
+		// the gate is tallied on the too-new path too: an active problem with none of the case's evidence there gets no
+		// guard, and a signal that does not count the case's evidence there gets none either
+		switch {
+		case mismatch:
+			return Plan{}, notIts(tooNew)
+		case before.Hits >= MinSignal && in == 0:
+			return Plan{}, refused("%s; and the case has no evidence in the window, which holds its problem in %d %s: measure over a window that holds it",
+				strings.TrimPrefix(tooNew.Error(), ErrRefused.Error()+": "), before.Hits, plan.Units)
+		}
+		return guard(tooNew)
 	}
 	plan.Gate, plan.GateBase = before.Hits, before.Base
 	if before.Hits < MinSignal {
@@ -442,13 +448,14 @@ func expandHome(p string) string {
 var countLimit = 1_000_000
 
 func Count(ctx context.Context, st *store.Store, sig Signal, since, until time.Time, excludeCwd string, actor store.Actor) ([]store.Event, error) {
-	return countStored(ctx, st, sig, since, until, excludeCwd, actor, time.Time{})
+	return countWritten(ctx, st, sig, since, until, excludeCwd, actor, 0, 0)
 }
 
-// countStored is Count of the events the store took in at or after stored (all of them, for zero).
-func countStored(ctx context.Context, st *store.Store, sig Signal, since, until time.Time, excludeCwd string, actor store.Actor, stored time.Time) ([]store.Event, error) {
+// countWritten is Count of the events whose last write came after the store's write sequence after and at or before
+// through (store.Seq; either 0 for no bound).
+func countWritten(ctx context.Context, st *store.Store, sig Signal, since, until time.Time, excludeCwd string, actor store.Actor, after, through int64) ([]store.Event, error) {
 	evs, err := st.Events(ctx, store.Query{Since: since, Until: until, ExcludeCwd: excludeCwd, Source: sig.Source, Kinds: sig.Kinds, Harness: sig.Harness,
-		Actor: actor, FailedResults: true, Limit: countLimit + 1, StoredSince: stored})
+		Actor: actor, FailedResults: true, Limit: countLimit + 1, SeqAfter: after, SeqThrough: through})
 	if err != nil {
 		return nil, err
 	}

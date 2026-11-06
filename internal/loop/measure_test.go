@@ -421,7 +421,15 @@ func TestTheLoopsOwnRunsCannotMakeAnUnchangedProblemImprove(t *testing.T) {
 		if _, err := m.st.Put(ctx, evs); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := m.r.Ship.validPlan(ctx, c, goodSignal, 7*24*time.Hour, "", m.planAt); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "in 1 session hours") {
+		// no measured plan: a guard's watch at most, whose history and exposure hold none of the loop's own runs
+		plan, err := m.r.Ship.validPlan(ctx, c, goodSignal, 7*24*time.Hour, "", m.planAt)
+		g, _ := guardOf(t, plan)
+		switch {
+		case err == nil && g == nil:
+			t.Fatalf("the loop passed the gate: %+v", plan)
+		case err == nil && (g.Incidents != 1 || g.Exposure != 100 || !strings.Contains(g.Instead, "in 1 session hours")):
+			t.Fatalf("the loop's own runs in a guard's history: %+v", g)
+		case err != nil && (!errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "in 1 session hours")):
 			t.Fatalf("the loop passed the gate: %v", err)
 		}
 		got, err := Tally(ctx, m.st, goodSignal, SessionHours, m.planAt.Add(-24*time.Hour), m.planAt, m.r.Dir)
@@ -453,6 +461,22 @@ func TestTheLoopsOwnRunsCannotMakeAnUnchangedProblemImprove(t *testing.T) {
 	m.clock = effect.Add(49 * time.Hour)
 	if got := m.measure(t, Options{}); got.Status != "held" {
 		t.Fatalf("unchanged problem: %+v", got)
+	}
+
+	// A guard's watch: the loop's own runs that use the tool during it, or fail it, neither keep it in use nor recur. A
+	// watch only they touched is held as not in use, never closed as guarded.
+	w := guarded(t, time.Hour, toolSignal.Source, nil)
+	w.measure(t, Options{})
+	var runs []store.Event
+	for i := 0; i < 5; i++ {
+		e := toolResult(fmt.Sprint("loop-", i), w.clock.Add(time.Duration(i)*7*aDay+time.Hour), fmt.Sprint("loop-", i), i == 2)
+		e.Cwd = filepath.Join(w.r.Dir, "runs", fmt.Sprint("r", i))
+		runs = append(runs, e)
+	}
+	put(t, w.st, runs)
+	w.clock = w.clock.Add(30*aDay + time.Hour)
+	if got := w.measure(t, Options{}); got.Status != "held" || !strings.Contains(got.Why, "not in use") {
+		t.Fatalf("a watch only the loop's own runs touched: %+v", got)
 	}
 }
 

@@ -141,7 +141,7 @@ var keptColumns = []struct {
 		{"harness", "TEXT NOT NULL DEFAULT ''"}, {"model", "TEXT NOT NULL DEFAULT ''"}, {"cwd", "TEXT NOT NULL DEFAULT ''"},
 		{"tool", "TEXT NOT NULL DEFAULT ''"}, {"summary", "TEXT NOT NULL DEFAULT ''"}, {"meta", "TEXT NOT NULL DEFAULT ''"},
 		{"ref", "TEXT NOT NULL DEFAULT ''"}, {"heuristic", "INTEGER NOT NULL DEFAULT 0"},
-		{"experiment", "TEXT NOT NULL DEFAULT ''"}, {"ingested", "INTEGER NOT NULL DEFAULT 0"}}},
+		{"experiment", "TEXT NOT NULL DEFAULT ''"}, {"ingested", "INTEGER NOT NULL DEFAULT 0"}, {"seq", "INTEGER NOT NULL DEFAULT 0"}}},
 	{"session_stamps", [][2]string{{"tool", "TEXT NOT NULL DEFAULT ''"}, {"name", "TEXT NOT NULL DEFAULT ''"},
 		{"cwd", "TEXT NOT NULL DEFAULT ''"}, {"auto", "INTEGER NOT NULL DEFAULT 0"}, {"ask", "TEXT NOT NULL DEFAULT ''"}, {"ask_kind", "TEXT NOT NULL DEFAULT ''"}}},
 	{"loop_runs", loopRunColumns},
@@ -151,15 +151,17 @@ var keptColumns = []struct {
 }
 
 // keptIndexes are the events' indexes. events_key finds a record's events by the prefix of their keys (PutFiles)
-// and a source's events, as events_source did.
+// and a source's events, as events_source did. events_seq orders the events by the write that stored or last
+// rewrote them (Seq).
 const keptIndexes = `
+CREATE INDEX IF NOT EXISTS events_seq ON events(seq);
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS events_kind ON events(kind, ts);
 CREATE INDEX IF NOT EXISTS events_session ON events(session, ts);
 CREATE INDEX IF NOT EXISTS events_key ON events(source, source_key);
 `
 
-var keptIndexNames = slices.Concat([]string{"events_ts", "events_kind", "events_session", "events_key"}, caseIndexNames, loopIndexNames)
+var keptIndexNames = slices.Concat([]string{"events_seq", "events_ts", "events_kind", "events_session", "events_key"}, caseIndexNames, loopIndexNames)
 
 // keptTriggers give Claude Code its one name as an event is written, by whatever build writes it: a build from
 // before the events were kept writes claude-code, also while this build has the store open.
@@ -623,13 +625,19 @@ func put(ctx context.Context, tx querier, evs []Event) (int, error) {
 		return 0, err
 	}
 	defer seenStmt.Close()
+	// Every row this write stores or rewrites takes the write's sequence number, one past the store's highest: SQLite
+	// writes one transaction at a time, so a reader that read the highest sees every later write above it (Seq).
+	var seq int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) + 1 FROM events`).Scan(&seq); err != nil {
+		return 0, err
+	}
 	putStmt, err := tx.PrepareContext(ctx, `INSERT INTO events (id, source, source_key, ts, session, agent, harness, model,
-	  cwd, actor, kind, tool, summary, meta, ref, heuristic, experiment, ingested)
-	  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	  cwd, actor, kind, tool, summary, meta, ref, heuristic, experiment, ingested, seq)
+	  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 	  ON CONFLICT(id) DO UPDATE SET ts=excluded.ts, session=excluded.session, agent=excluded.agent,
 	    harness=excluded.harness, model=excluded.model, cwd=excluded.cwd, actor=excluded.actor, kind=excluded.kind,
 	    tool=excluded.tool, summary=excluded.summary, meta=excluded.meta, ref=excluded.ref,
-	    heuristic=excluded.heuristic, experiment=excluded.experiment`)
+	    heuristic=excluded.heuristic, experiment=excluded.experiment, seq=excluded.seq`)
 	if err != nil {
 		return 0, err
 	}
@@ -646,7 +654,7 @@ func put(ctx context.Context, tx querier, evs []Event) (int, error) {
 			return 0, err
 		}
 		if _, err := putStmt.ExecContext(ctx, id, e.Source, e.SourceKey, e.TS.UnixMilli(), e.Session, e.Agent, e.Harness,
-			e.Model, e.Cwd, string(e.Actor), e.Kind, e.Tool, e.Summary, e.Meta, e.Ref, e.Heuristic, e.Experiment, now); err != nil {
+			e.Model, e.Cwd, string(e.Actor), e.Kind, e.Tool, e.Summary, e.Meta, e.Ref, e.Heuristic, e.Experiment, now, seq); err != nil {
 			return 0, err
 		}
 		if seen == 0 {
@@ -654,6 +662,14 @@ func put(ctx context.Context, tx querier, evs []Event) (int, error) {
 		}
 	}
 	return added, nil
+}
+
+// Seq is the sequence number of the store's last write of events: every event a later write stores or rewrites has
+// a higher one.
+func (s *Store) Seq(ctx context.Context) (int64, error) {
+	var seq int64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM events`).Scan(&seq)
+	return seq, err
 }
 
 // FileCursor is where a source stopped in one file of many, and what it needs to tell the same file from a
@@ -1037,9 +1053,9 @@ type Query struct {
 	// an error is no failure. Events of any other kind are all there.
 	FailedResults bool
 	Before        *Event // exclusive (time, source key) cursor for descending pagination
-	// StoredSince, when set, keeps the events the store took in at or after it (their ingested time, the wall clock's
-	// when first stored), whatever they are dated: a watch that reads only what came in since its last pass.
-	StoredSince time.Time
+	// SeqAfter and SeqThrough, when set, keep the events whose last write (Seq) came after the one and at or before
+	// the other, whatever they are dated: a watch that reads only what was stored or rewritten since its last pass.
+	SeqAfter, SeqThrough int64
 }
 
 func (s *Store) Events(ctx context.Context, q Query) ([]Event, error) {
@@ -1081,8 +1097,11 @@ func ReadEvents(ctx context.Context, db *sql.DB, q Query) ([]Event, error) {
 	if q.FailedResults {
 		where, args = append(where, "(kind != 'tool_result' OR instr(meta, ?) > 0)"), append(args, `"is_error":true`)
 	}
-	if !q.StoredSince.IsZero() {
-		where, args = append(where, "ingested >= ?"), append(args, q.StoredSince.UnixMilli())
+	if q.SeqAfter > 0 {
+		where, args = append(where, "seq > ?"), append(args, q.SeqAfter)
+	}
+	if q.SeqThrough > 0 {
+		where, args = append(where, "seq <= ?"), append(args, q.SeqThrough)
 	}
 	order := "ts DESC, source_key DESC"
 	if q.Session != "" {
