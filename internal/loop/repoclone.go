@@ -215,6 +215,7 @@ func hostInputGitCapped(ctx context.Context, dir string, limit int, args ...stri
 	}
 	cmd := exec.CommandContext(cctx, "git", append(pins, args...)...)
 	cmd.Env = GitEnv()
+	endWithContext(cmd)
 	out, stderr := Capture{Limit: limit}, Capture{Limit: ScrubBatchBytes}
 	cmd.Stdout, cmd.Stderr = &out, &stderr
 	if err := cmd.Run(); err != nil {

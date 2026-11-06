@@ -160,10 +160,13 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 	if err != nil {
 		return Package{}, err
 	}
-	var source string
+	var source, snapshot string
 	for _, repo := range r.pass.manifest.Repositories {
 		if repo.Name == name && repo.Error == "" {
 			source = repo.Source
+			if repo.Fallback == "" {
+				snapshot = repo.Commit // origin's branch as this pass fetched it
+			}
 		}
 	}
 	if name == "" || source == "" {
@@ -194,8 +197,9 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 	if filepath.Clean(source) != p.Dir {
 		return p, refused("the case's repository changed after preparation")
 	}
-	// The build's base is the default branch as the host fetches it now, not the one the package was prepared at.
-	if p, err = r.Ship.buildBase(r.Ship.gitContext(shipContext(ctx, p.Case)), p); err != nil {
+	// The build's base is the default branch as the host fetches it now, at the pass's snapshot while the branch holds
+	// it, not the one the package was prepared at.
+	if p, err = r.Ship.buildBase(r.Ship.gitContext(shipContext(ctx, p.Case)), p, snapshot); err != nil {
 		return p, err
 	}
 	// The build tree holds the base commit's tree and one commit, no history. A public repository's base commit is

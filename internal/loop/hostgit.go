@@ -124,6 +124,7 @@ func hostGit(ctx context.Context, dir string, input []byte, args ...string) (str
 		"-c", "diff.external=", "-c", "protocol.ext.allow=never", "-c", "uploadpack.packObjectsHook=")
 	cmd := exec.CommandContext(cctx, "git", append(pins, args...)...)
 	cmd.Env = GitEnv()
+	endWithContext(cmd) // a local clone's upload-pack would hold the output open too
 	cmd.Stdin = bytes.NewReader(input)
 	out, diag := Capture{Limit: MaxStream}, Capture{Limit: MaxStream}
 	cmd.Stdout, cmd.Stderr = &out, &diag

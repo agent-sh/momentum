@@ -52,8 +52,9 @@ type RepoInput struct {
 	Branch string `json:"branch,omitempty"`
 	Commit string `json:"commit,omitempty"`
 	Error  string `json:"error,omitempty"`
-	// Fallback says why a repository was read at its checkout's own default branch, not at origin's as the host
-	// fetched it: no origin, or a fetch the host refused or that failed.
+	// Fallback says what a repository was read at when not at origin's default branch as the host fetched it now (the
+	// branch as its mirror last fetched it, or the checkout's own), and why: no origin, or a fetch the host refused or
+	// that failed.
 	Fallback string `json:"fallback,omitempty"`
 
 	Files  int   `json:"files,omitempty"`  // tracked files in the snapshot
@@ -101,10 +102,10 @@ type SnapshotOptions struct {
 }
 
 // SnapshotRepos makes the scrubbed snapshot of each distinct source for /ro/repos/NAME and its log for
-// /ro/history/repos/NAME.log, at its origin's default branch as the host fetches it now (repofetch.go), or at the
-// checkout's own default branch, with the reason, when it cannot. A source that cannot be read (missing, no work
-// tree, a link, inside loop storage, no default branch) is a result with its reason, not a failure. Only a scrubber
-// that does not run stops the pass.
+// /ro/history/repos/NAME.log, at its origin's default branch as the host fetches it now (repofetch.go), or, with the
+// reason, as its mirror last fetched it or at the checkout's own default branch when it cannot. Mirrors no source of
+// the pass reads are removed. A source that cannot be read (missing, no work tree, a link, inside loop storage, no
+// default branch) is a result with its reason, not a failure. Only a scrubber that does not run stops the pass.
 func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) {
 	if err := CheckScrubber(ctx); err != nil {
 		return nil, err
@@ -144,6 +145,7 @@ func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) 
 		}
 	}
 	var results []RepoInput
+	used, unread := map[string]bool{}, []string(nil) // the mirrors this pass's sources name, and the sources it could not map
 	for _, source := range sources {
 		if err := ctx.Err(); err != nil {
 			return results, err // a pass told to stop leaves no refusals behind it
@@ -158,14 +160,29 @@ func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) 
 			result.Name, result.Source = cleanPaths[0], cleanPaths[1]
 			result.Error = "repository paths need scrubbing"
 			results = append(results, result)
+			unread = append(unread, source)
 			continue
 		}
 		if err := cloneSource(ctx, source, append(append([]string(nil), o.LoopDirs...), o.Destination, o.LogDir)); err != nil {
 			result.Error = reason(err)
 			results = append(results, result)
+			unread = append(unread, source)
 			continue
 		}
-		tip, err := sourceTip(ctx, source, o.Mirrors, o.GH)
+		tip, mirror, err := sourceTip(ctx, source, o.Mirrors, o.GH, o.Since)
+		if mirror != "" {
+			used[mirror] = true
+		} else {
+			unread = append(unread, source)
+		}
+		if err == nil && tip.fallback != "" {
+			// the host's own text, without a URL or a path, scrubbed all the same: it reaches the run's summary
+			clean, cerr := RedactAll(ctx, []string{tip.fallback})
+			if cerr != nil {
+				return results, cerr
+			}
+			tip.fallback = clean[0]
+		}
 		if err == nil {
 			result, err = snapshotOne(ctx, source, tip, filepath.Join(o.Destination, name), filepath.Join(o.LogDir, name+".log"), SnapshotRepoMax, o.Cache, o.Since)
 		}
@@ -178,6 +195,7 @@ func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) 
 		}
 		results = append(results, result)
 	}
+	pruneMirrors(o.Mirrors, used, unread)
 	return results, nil
 }
 

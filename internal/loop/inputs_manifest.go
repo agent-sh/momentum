@@ -84,8 +84,8 @@ func (r RepoInput) snapshotText() string {
 	}
 	text := fmt.Sprintf("%s files, %.1f MiB at %s", commaCount(r.Files), float64(r.Bytes)/(1<<20), commit)
 	if r.Fallback != "" {
-		// origin's default branch could not be fetched: the run read the checkout's own, which can lag it
-		text += fmt.Sprintf(" (checkout's %s: %s)", plain.Line(r.Branch), plain.Line(r.Fallback))
+		// origin's default branch could not be fetched now: the run read it as last fetched, or the checkout's own
+		text += " (" + plain.Line(r.Fallback) + ")"
 	}
 	if r.Masked > 0 {
 		text += fmt.Sprintf(", %d masked", r.Masked)

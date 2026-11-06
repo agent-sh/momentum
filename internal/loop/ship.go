@@ -457,29 +457,14 @@ func (s *Ship) freshRunClone(ctx context.Context, p *Package) error {
 	return nil
 }
 
-// refreshBase runs before a replacement build is mounted. The old patch is kept in host package data.
-func (s *Ship) refreshBase(ctx context.Context, p Package) (Package, error) {
-	ctx = s.gitContext(shipContext(ctx, p.Case))
-	unlock, err := s.lock(ctx, p.Case)
-	if err != nil {
-		return p, err
-	}
-	defer unlock()
-	return s.refreshBaseLocked(ctx, p)
-}
-
-func (s *Ship) refreshBaseLocked(ctx context.Context, p Package) (Package, error) {
-	p.RefreshBase = true
-	return s.buildBase(ctx, p)
-}
-
-// buildBase readies the package's build tree at the default branch as the host fetches it now, before a build is
-// mounted: a base the episode prepared earlier never pins an old tree. When the fetched tip is the package's base, the
-// tree is made again from it. When the tip moved (or a landing found the change no longer rebases), the host clone is
-// reset to the new tip and the build reworks the change there: the cumulative patch stays in the package's data and
-// reaches the run as previous.patch, and the old build tree is never read. A fetch that cannot be made now holds the
-// build, without a run or a charge.
-func (s *Ship) buildBase(ctx context.Context, p Package) (Package, error) {
+// buildBase readies the package's build tree before a build is mounted, at the default branch as the host fetches it
+// now, so a base the episode prepared earlier never pins an old tree. The base is the pass's snapshot commit while the
+// fetched branch still holds it, so /ro/history, /ro/diffs and BASE show the same history; else, and for a change a
+// landing found no longer rebases (RefreshBase), the fetched tip. When that is the package's base, the tree is made
+// again from it. When it moved, or for RefreshBase, the host clone is reset to it and the build reworks the change
+// there: the cumulative patch stays in the package's data and reaches the run as previous.patch, and the old build
+// tree is never read. A fetch that cannot be made now holds the build, without a run or a charge.
+func (s *Ship) buildBase(ctx context.Context, p Package, snapshot string) (Package, error) {
 	if p.RefreshBase && roundsUsed(p) {
 		return p, refused("review rounds used; the change waits for a person")
 	}
@@ -493,13 +478,19 @@ func (s *Ship) buildBase(ctx context.Context, p Package) (Package, error) {
 	if err != nil {
 		return p, err
 	}
-	tip := strings.TrimSpace(base)
-	moved := tip != p.BaseCommit || p.RefreshBase
+	target := strings.TrimSpace(base)
+	// a change that no longer rebases goes to the tip it failed on, or a later one, never back to the pass's snapshot
+	if snapshot != "" && snapshot != target && !p.RefreshBase {
+		if _, err := s.git(ctx, p.Host, "merge-base", "--is-ancestor", snapshot, target); err == nil {
+			target = snapshot
+		}
+	}
+	moved := target != p.BaseCommit || p.RefreshBase
 	if moved {
 		if roundsUsed(p) {
 			return p, refused("review rounds used; the change waits for a person")
 		}
-		p.BaseCommit = tip
+		p.BaseCommit = target
 		if _, err := s.git(ctx, p.Host, "reset", "--hard", p.BaseCommit); err != nil {
 			return p, err
 		}
@@ -1598,7 +1589,7 @@ func (s *Ship) gitInput(ctx context.Context, dir string, input []byte, args ...s
 	if err := CheckGitConfig(ctx, dir); err != nil {
 		return "", err
 	}
-	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	cctx, cancel := withLimit(ctx, "git call", 2*time.Minute)
 	defer cancel()
 	full := append([]string{"-C", dir}, []string{"-c", "diff.external=", "-c", "commit.gpgsign=false",
 		"-c", "user.name=" + s.Identity[0], "-c", "user.email=" + s.Identity[1]}...)
@@ -1606,8 +1597,10 @@ func (s *Ship) gitInput(ctx context.Context, dir string, input []byte, args ...s
 	full = append(full, "-c", "credential.helper=",
 		"-c", "credential.https://github.com.helper=!"+shellQuote(firstOf(s.GH, "gh"))+" auth git-credential",
 		"-c", "protocol.ext.allow=never", "-c", "push.followTags=false")
+	full = append(full, remotePins()...) // a fetch or push never prompts and gives up on a silent remote
 	full = append(full, args...)
 	cmd := exec.CommandContext(cctx, "git", full...)
+	endWithContext(cmd)
 	cmd.Stdin = bytes.NewReader(input)
 	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_AUTHOR_NAME="+s.Identity[0], "GIT_AUTHOR_EMAIL="+s.Identity[1],
 		"GIT_COMMITTER_NAME="+s.Identity[0], "GIT_COMMITTER_EMAIL="+s.Identity[1])
@@ -1619,6 +1612,9 @@ func (s *Ship) gitInput(ctx context.Context, dir string, input []byte, args ...s
 	err := cmd.Run()
 	if out.Over() || errOut.Over() {
 		return "", refused("Git output exceeds the whole-stream limit")
+	}
+	if err != nil && cctx.Err() != nil {
+		return out.String(), fmt.Errorf("git %s: %s: %s", strings.Join(args, " "), endedBy(cctx), strings.TrimSpace(errOut.String()))
 	}
 	if err != nil {
 		return out.String(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(errOut.String()))

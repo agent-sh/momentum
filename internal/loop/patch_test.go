@@ -530,7 +530,7 @@ func TestConflictingLandingPreparesANewBaseWithoutReadingTheRunClone(t *testing.
 		t.Fatal(err)
 	}
 	write(t, filepath.Join(p.Work, ".git"), "untrusted")
-	p, err = s.refreshBase(ctx, p)
+	p, err = s.buildBase(s.gitContext(shipContext(ctx, p.Case)), p, "") // RefreshBase is set: the landing found a conflict
 	if err != nil || p.BaseCommit != newBase || p.State != Prepared || p.Check != nil {
 		t.Fatalf("fresh preparation: %+v %v", p, err)
 	}

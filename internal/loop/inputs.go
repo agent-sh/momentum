@@ -165,7 +165,8 @@ func (r *Runner) buildInputs(ctx context.Context, p *passInputs) error {
 		func() {
 			// A repository that cannot be read (missing, not a work tree, no default branch) is left out and counted in the
 			// manifest's summary; the others and the investigation go on. What the scrubber changes in one is masked.
-			// Each is read at its origin's default branch, fetched into a mirror of the loop's own, never into the checkout.
+			// Each is read at its origin's default branch, fetched into a mirror of the loop's own, never into the checkout,
+			// with the history window the log and the diffs read.
 			gh := ""
 			if r.Ship != nil {
 				gh = r.Ship.GH
@@ -286,7 +287,14 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 			return run, &buildStageError{key: "build prepare", err: prepErr}
 		}
 		schema = buildSchema
-		prompt = fmt.Sprintf("Build case %s: %s. BASE is %s. /work is your build tree at BASE, writable with its Git metadata: one commit that holds the tree of the default branch's commit %s, without its history (that is in /ro/history and /ro/diffs). /out is writable. Read /run/input/case.json for the investigation and evidence. Make one cause's change and its discriminating test. End with the build report. The host produces the patch.\n%s\n%s", c.ID, c.Title, p.WorkBase, p.BaseCommit, buildScope(p.Repo), inputReference(true))
+		history := ""
+		for _, repo := range r.pass.manifest.Repositories {
+			if repo.Error == "" && repo.Source == p.Dir && repo.Commit != p.BaseCommit {
+				// the branch no longer holds the snapshot's commit, or the pass could not fetch it
+				history = fmt.Sprintf(" The snapshot in /ro/repos and the history in /ro/history and /ro/diffs stop at commit %s, not at BASE's commit %s: what differs between the two is not in them.", repo.Commit, p.BaseCommit)
+			}
+		}
+		prompt = fmt.Sprintf("Build case %s: %s. BASE is %s. /work is your build tree at BASE, writable with its Git metadata: one commit that holds the tree of the default branch's commit %s, without its history (that is in /ro/history and /ro/diffs).%s /out is writable. Read /run/input/case.json for the investigation and evidence. Make one cause's change and its discriminating test. End with the build report. The host produces the patch.\n%s\n%s", c.ID, c.Title, p.WorkBase, p.BaseCommit, history, buildScope(p.Repo), inputReference(true))
 		prompt = strings.ReplaceAll(prompt, "/work is empty scratch and the working directory.", "/work is the build tree at BASE and the working directory.")
 		prompt = strings.ReplaceAll(prompt, "Return a report with mechanism, alternatives ruled out, fix and summary. Build no change.", "Return summary, test_command, title, body, rollback, signal, window and lesson. test_command is the program and its arguments, such as [\"go\", \"test\", \"./...\"], which the host runs in the sandbox. window is a duration, such as 7d. signal names source, kinds, match and optional tool and harness.")
 		if n := len(p.Reviews); n > 0 {

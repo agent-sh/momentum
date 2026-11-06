@@ -69,21 +69,24 @@ func originRepository(ctx context.Context, dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	identity := func(url string) string {
-		url = strings.TrimSpace(url)
-		if m := remoteRe.FindStringSubmatch(url); m != nil {
-			return strings.ToLower(m[1] + "/" + m[2])
-		}
-		return "url:" + url
-	}
-	repo := identity(fetch)
+	repo := remoteIdentity(fetch)
 	urls := strings.Split(strings.TrimSpace(pushes), "\n")
 	for _, url := range urls {
-		if url == "" || identity(url) != repo {
+		if url == "" || remoteIdentity(url) != repo {
 			return "", refused("origin's fetch and push destinations differ")
 		}
 	}
 	return repo, nil
+}
+
+// remoteIdentity is the repository a remote URL names: OWNER/REPO, in lower case, for GitHub's https and ssh forms,
+// and url: with the URL for any other.
+func remoteIdentity(url string) string {
+	url = strings.TrimSpace(url)
+	if m := remoteRe.FindStringSubmatch(url); m != nil {
+		return strings.ToLower(m[1] + "/" + m[2])
+	}
+	return "url:" + url
 }
 
 // repo names the checkout's repository (OWNER/REPO) with the gate's resolver.
