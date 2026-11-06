@@ -1561,6 +1561,22 @@ func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, 
 // its measurement's window and the signal's count over the window before its change, which the window after it is
 // compared with. The window after counts from then: the case's deployed time becomes it.
 func (s *Store) StartMeasuring(ctx context.Context, id string, window time.Duration, before int, from time.Time, actor string) (Case, error) {
+	return s.startMeasuring(ctx, id, window, before, from, actor, "measuring", func() string {
+		return fmt.Sprintf("in effect from %s; %d in its baseline; the %s after it is due %s",
+			from.Format(time.DateTime), before, days(window), from.Add(window).Format(time.DateTime))
+	})
+}
+
+// StartGuarding is StartMeasuring for a change whose plan is a guard: no baseline count, since a guard compares no
+// rates; its log line says it is guarded, with what the guard watches for (detail), and when its watch is due.
+func (s *Store) StartGuarding(ctx context.Context, id string, watch time.Duration, from time.Time, detail, actor string) (Case, error) {
+	return s.startMeasuring(ctx, id, watch, 0, from, actor, "guarding", func() string {
+		return fmt.Sprintf("in effect from %s; guarded, not measured: %s; its watch is due %s", from.Format(time.DateTime), detail,
+			from.Add(watch).Format(time.DateTime))
+	})
+}
+
+func (s *Store) startMeasuring(ctx context.Context, id string, window time.Duration, before int, from time.Time, actor, action string, line func() string) (Case, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Case{}, err
@@ -1583,8 +1599,7 @@ func (s *Store) StartMeasuring(ctx context.Context, id string, window time.Durat
 		CaseMeasuring, window.Milliseconds(), before, from.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
-	if err := caseLog(ctx, tx, c.ID, actor, "measuring", fmt.Sprintf("in effect from %s; %d in its baseline; the %s after it is due %s",
-		from.Format(time.DateTime), before, days(window), from.Add(window).Format(time.DateTime)), now); err != nil {
+	if err := caseLog(ctx, tx, c.ID, actor, action, line(), now); err != nil {
 		return Case{}, err
 	}
 	if c, err = getCase(ctx, tx, c.ID); err != nil {

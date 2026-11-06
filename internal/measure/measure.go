@@ -13,6 +13,7 @@ package measure
 import (
 	"fmt"
 	"math"
+	"slices"
 	"time"
 )
 
@@ -49,6 +50,9 @@ type Result struct {
 	P        float64 `json:"p"` // the chance, under no change, of an after count this low or lower
 	Improved bool    `json:"improved"`
 	Effect   string  `json:"effect"` // the effect in words
+	// Guarded marks a guard's watch (Guard), not a measured drop: Before holds the history's incidents and its
+	// exposure, After the watch's recurrences and its exposure.
+	Guarded bool `json:"guarded,omitempty"`
 }
 
 // Compare decides whether the share fell from before to after. With no activity in either window there is nothing
@@ -94,6 +98,77 @@ func Back(before Counts, windows []Counts) bool {
 		hits += recent.Hits
 	}
 	return hits >= MinBefore
+}
+
+// A guard stands in for a measured plan when the problem has stopped, or is too rare for a share to fall: it asks
+// whether the problem comes back. This is the zero-failure test of an exponential (Poisson) process: with incidents
+// at a rate λ per unit of exposure, a watch of E = ln(1/Alpha)/λ units holds none with probability Alpha, so a change
+// that did nothing would meet a recurrence within E with probability 1-Alpha.
+
+// LongestWindow is the longest window the build step chooses for a measured plan: two weeks, for a rarer problem.
+const LongestWindow = 14 * 24 * time.Hour
+
+// MaxWatch is the longest a guard watches after its change: the longest span a measured plan counts after one, two
+// of its longest windows (the window after, and the one more it waits when that was too quiet).
+const MaxWatch = 2 * LongestWindow
+
+// Incident is a run of a signal's events with no gap longer than the guard's gap between two of them: events close
+// together share a cause, so one burst of hundreds is one incident.
+type Incident struct {
+	First, Last time.Time
+	Events      int
+}
+
+// Incidents groups events by their times: a gap longer than gap between two of them starts a new incident.
+func Incidents(at []time.Time, gap time.Duration) []Incident {
+	sorted := slices.Clone(at)
+	slices.SortFunc(sorted, func(a, b time.Time) int { return a.Compare(b) })
+	var out []Incident
+	for _, t := range sorted {
+		if n := len(out); n > 0 && t.Sub(out[n-1].Last) <= gap {
+			out[n-1].Last = t
+			out[n-1].Events++
+			continue
+		}
+		out = append(out, Incident{First: t, Last: t, Events: 1})
+	}
+	return out
+}
+
+// GuardNeed is the exposure a guard's watch must reach with no recurrence: E = ln(1/Alpha)/λ, with λ the incidents
+// per unit of exposure, rounded up to a whole unit. With no incident or no exposure there is no rate, and it is 0.
+func GuardNeed(incidents, exposure int) int {
+	if incidents <= 0 || exposure <= 0 {
+		return 0
+	}
+	return int(math.Ceil(math.Log(1/Alpha) * float64(exposure) / float64(incidents)))
+}
+
+// GuardP is the chance, under no change, that a watch of watched units of exposure holds no recurrence: exp(-λ watched).
+func GuardP(incidents, exposure, watched int) float64 {
+	if incidents <= 0 || exposure <= 0 {
+		return 1
+	}
+	return math.Exp(-float64(incidents) / float64(exposure) * float64(watched))
+}
+
+// Guarded is a guard's watch as a result: incidents in a history of exposure units before the change, recurrences
+// in watched units after it. It is improved only with no recurrence and the exposure GuardNeed asks for. Its p is
+// GuardP, the chance under no change of a watch this quiet; its effect says it was guarded, never that a rate fell.
+func Guarded(incidents, exposure, recurrences, watched int) Result {
+	r := Result{Before: Counts{Hits: incidents, Base: exposure}, After: Counts{Hits: recurrences, Base: watched}, Guarded: true,
+		P: GuardP(incidents, exposure, watched)}
+	need := GuardNeed(incidents, exposure)
+	r.Improved = recurrences == 0 && need > 0 && watched >= need
+	if recurrences > 0 {
+		r.P = 1
+		r.Effect = fmt.Sprintf("guarded, not a measured drop: its problem came back after the change (%d of %d active hours watched); %d incidents in %d active hours before it",
+			recurrences, watched, incidents, exposure)
+		return r
+	}
+	r.Effect = fmt.Sprintf("guarded, not a measured drop: no recurrence in %d active hours after the change, of the %d its watch needs (%d incidents in %d active hours before it); a change that did nothing would have met one with probability %s, p=%.3f",
+		watched, need, incidents, exposure, percent(1-r.P), r.P)
+	return r
 }
 
 func percent(x float64) string { return fmt.Sprintf("%.2f%%", 100*x) }

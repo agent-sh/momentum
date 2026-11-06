@@ -365,8 +365,13 @@ func (s *Ship) landHand(ctx context.Context, c store.Case, p *Package, commit st
 			}
 		default:
 			p.Plan = &plan
-			if err := s.caseNoteOnce(ctx, c.ID, "plan counted again", fmt.Sprintf("landed by hand more than a window after its plan: counted again at %s, %d of %d in the baseline, gate %d of %d",
-				at.UTC().Format(time.RFC3339), plan.Before, plan.BeforeBase, plan.Gate, plan.GateBase)); err != nil {
+			detail := fmt.Sprintf("landed by hand more than a window after its plan: counted again at %s, %d of %d in the baseline, gate %d of %d",
+				at.UTC().Format(time.RFC3339), plan.Before, plan.BeforeBase, plan.Gate, plan.GateBase)
+			if g := plan.Guard; g != nil {
+				detail = fmt.Sprintf("landed by hand more than a window after its plan: counted again at %s as a guard, %d incidents in %d %s of exposure, a watch of %d with no recurrence",
+					at.UTC().Format(time.RFC3339), g.Incidents, g.Exposure, plan.Units, g.Need)
+			}
+			if err := s.caseNoteOnce(ctx, c.ID, "plan counted again", detail); err != nil {
 				return err
 			}
 		}

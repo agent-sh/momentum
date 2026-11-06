@@ -21,6 +21,8 @@ type Measured struct {
 	Result *measure.Result `json:"result,omitempty"`
 	Due    time.Time       `json:"due,omitzero"` // when its window after the change ends
 	Why    string          `json:"why,omitempty"`
+	// Guarded says its plan is a guard: it watches for a recurrence of a problem that had stopped, and measures no drop.
+	Guarded bool `json:"guarded,omitempty"`
 }
 
 // The units a plan's measurement counts in (internal/measure): the hours of the sessions (of the signal's harness,
@@ -349,10 +351,17 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 	}
 	if c.Status == store.CaseDeployed || !p.OutOfEffect.IsZero() {
 		m.Status, m.Due = "measuring", since.Add(plan.Window)
+		if plan.Guard != nil {
+			m.Due, m.Guarded = since.Add(plan.Guard.Watch), true
+			m.Why = fmt.Sprintf("guarded, not measured: it watches for a recurrence; %d %s of exposure with none close it as improved", plan.Guard.Need, plan.Units)
+		}
 		if !dry {
-			if c.Status == store.CaseDeployed {
+			switch {
+			case c.Status == store.CaseDeployed && plan.Guard != nil:
+				_, err = r.Store.StartGuarding(ctx, c.ID, plan.Guard.Watch, since, guardDetail(plan), "loop:measure")
+			case c.Status == store.CaseDeployed:
 				_, err = r.Store.StartMeasuring(ctx, c.ID, plan.Window, plan.Before, since, "loop:measure")
-			} else {
+			default:
 				_, err = r.Store.RestartMeasuring(ctx, c.ID, since, "in effect again from", "loop:measure")
 			}
 			if err != nil {
@@ -365,6 +374,9 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 			r.resolve(ctx, &p)
 		}
 		return m
+	}
+	if plan.Guard != nil {
+		return r.guardCase(ctx, c, &p, plan, m, now, dry)
 	}
 	m.Due = c.Deployed.Add(plan.Window)
 	if restarted, done, err := r.afterGap(ctx, c, &p, plan, m, m.Due, dry); err != nil {
@@ -448,6 +460,17 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 	case !measure.Measurable(before, after.Base):
 		why = "nothing could show it helped: two windows after it were too quiet to tell (" + res.Effect + ")"
 	}
+	return r.noEffect(ctx, c, &p, m, why, dry)
+}
+
+// noEffect is what the measure step does with a change that showed no effect, why: the ship tool rolls it back, only
+// while the loop is live and never for a change a person landed by hand; otherwise the rollback is held with a decided
+// note, once, and the case keeps measuring.
+func (r *Runner) noEffect(ctx context.Context, c store.Case, p *Package, m Measured, why string, dry bool) Measured {
+	failed := func(why string) Measured {
+		m.Status, m.Why = "failed", why
+		return m
+	}
 	m.Status, m.Why = "rolled back", why
 	if dry && len(p.Hand) > 0 {
 		m.Status, m.Why = "held", why+"; it was landed by hand, so the loop rolls nothing back"
@@ -465,13 +488,13 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		}
 		if !p.Held {
 			// the note before the flag that says it was written, under an id of its own, so it is written once
-			if err := r.noteOnce(ctx, store.Note{ID: noteID("held", p), Kind: store.NoteDecided, Title: plainClip("momentum holds the rollback of its change for: "+c.Title, store.TitleMax),
+			if err := r.noteOnce(ctx, store.Note{ID: noteID("held", *p), Kind: store.NoteDecided, Title: plainClip("momentum holds the rollback of its change for: "+c.Title, store.TitleMax),
 				Detail: detail,
 				Links:  prLinks(p.PR)}); err != nil {
 				return failed("the note: " + err.Error())
 			}
 			p.Held = true
-			if err := r.Ship.save(&p); err != nil {
+			if err := r.Ship.save(p); err != nil {
 				return failed(err.Error())
 			}
 		}
@@ -485,8 +508,9 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		r.rollbackFailed(ctx, c, err)
 		return m
 	}
-	if p, _, err = r.Ship.Load(c.ID); err == nil {
-		r.resolve(ctx, &p)
+	if loaded, _, err := r.Ship.Load(c.ID); err == nil {
+		*p = loaded
+		r.resolve(ctx, p)
 	}
 	return m // the rollback's receipt put its note
 }
@@ -563,8 +587,9 @@ func (r *Runner) watch(ctx context.Context, c store.Case, dry bool) (Measured, b
 		p.WatchWindow = 0
 	}
 	if p.State == Landed {
-		if p.Result == nil {
-			// A close from before results were saved ahead of it: recover the window's activity.
+		if p.Result == nil && p.Plan.Guard == nil {
+			// A close from before results were saved ahead of it: recover the window's activity. (A guard saves its
+			// result before its close, always.)
 			if why, err := r.readWindow(ctx, &p, plan, c.Deployed, c.Deployed.Add(p.Plan.Window), dry); err != nil {
 				return failed(err)
 			} else if why != "" {
@@ -592,7 +617,7 @@ func (r *Runner) watch(ctx context.Context, c store.Case, dry bool) (Measured, b
 			res, _ := measure.Compare(before, after)
 			p.Result = &res
 		}
-		if !dry {
+		if !dry && p.Result != nil {
 			p, err = r.Ship.keepLocked(c.ID, *p.Result)
 			if err != nil {
 				return failed(err)
@@ -601,6 +626,9 @@ func (r *Runner) watch(ctx context.Context, c store.Case, dry bool) (Measured, b
 	}
 	if p.Result == nil {
 		return failed(fmt.Errorf("its kept package has no measurement"))
+	}
+	if p.Plan.Guard != nil {
+		return r.guardBack(ctx, c, &p, plan, m, now, dry)
 	}
 	ended := int(now.Sub(c.Closed) / p.Plan.Window)
 	for j := p.WatchWindow + 1; j <= ended; j++ {
@@ -881,7 +909,21 @@ func (r *Runner) countingPlan(ctx context.Context, p *Package, dry bool) (Plan, 
 	if !dry && strings.HasPrefix(p.Problem, "the signal's source stopped:") {
 		r.resolve(ctx, p)
 	}
-	if len(omitted) > 0 {
+	if len(omitted) > 0 && plan.Guard != nil {
+		// a guard's history is recounted over the live sources as a baseline is: its exposure, and the watch's need
+		g := *plan.Guard
+		if why, err := r.readWindow(ctx, p, plan, g.Since, plan.At, dry); err != nil || why != "" {
+			return plan, why, err
+		}
+		h, err := guardHistory(ctx, r.Store, plan, g.Since, plan.At, r.Dir)
+		if err != nil {
+			return plan, "", err
+		}
+		if len(h.incidents) > 0 && h.exposure > 0 {
+			g.Incidents, g.Exposure, g.Quiet, g.Need = len(h.incidents), h.exposure, h.quiet, measure.GuardNeed(len(h.incidents), h.exposure)
+		}
+		plan.Guard = &g
+	} else if len(omitted) > 0 {
 		if why, err := r.readWindow(ctx, p, plan, plan.At.Add(-4*plan.Window), plan.At.Add(-plan.Window), dry); err != nil || why != "" {
 			return plan, why, err
 		}

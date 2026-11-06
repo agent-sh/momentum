@@ -39,6 +39,7 @@ type ActivityQuery struct {
 	BySession    bool     // the sessions' hours; otherwise the machine's
 	Harness      string   // when set, only that harness's events
 	Actor        Actor    // when set, only the hours in which it did something (the owner's turns, say)
+	Tool         string   // when set, only the hours in which that tool was called or answered: a guard's exposure
 }
 
 // Activity returns the units of activity over a span: the hours in which the sessions picked (an event of a
@@ -73,6 +74,9 @@ func activityWhere(q ActivityQuery) ([]string, []any, string) {
 	}
 	if q.Actor != "" {
 		where, args = append(where, "actor = ?"), append(args, string(q.Actor))
+	}
+	if q.Tool != "" {
+		where, args = append(where, "tool = ?"), append(args, q.Tool)
 	}
 	if q.Sources != nil {
 		marks := make([]string, len(q.Sources))

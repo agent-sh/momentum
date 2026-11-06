@@ -172,6 +172,22 @@ type Plan struct {
 	// Installed is the built or installed file the machine runs (a binary, an installed configuration):
 	// a recorded Go revision must hold the change; other files are checked by their hash and time.
 	Installed string `json:"installed,omitempty"`
+	// Guard, when set, makes the plan a guard rather than a measurement: the problem is too new or too rare for a
+	// share to fall, or no recent event reaches it, and the watch asks only whether it comes back (guardPlan).
+	Guard *Guard `json:"guard,omitempty"`
+}
+
+// Guard is a plan's watch for a problem that has stopped (SPEC, Measurement, Guards): the incidents of its signal in
+// the history the plan reads, the exposure they came in, and the exposure a watch with no recurrence must reach.
+type Guard struct {
+	Instead   string        `json:"instead"`   // why a measured plan could not stand
+	Since     time.Time     `json:"since"`     // the history's start: the span's, or the signal's source's first event in it
+	Gap       time.Duration `json:"gap"`       // a longer quiet stretch between two events starts a new incident: the plan's window
+	Incidents int           `json:"incidents"` // in the history
+	Exposure  int           `json:"exposure"`  // units of exposure in the history: the plan's units, of the signal's tool when it names one
+	Quiet     int           `json:"quiet"`     // of those, the units outside every incident
+	Need      int           `json:"need"`      // the exposure a watch with no recurrence must reach (measure.GuardNeed)
+	Watch     time.Duration `json:"watch"`     // the whole weeks the history's exposure took to reach Need
 }
 
 // Signal is a deterministic filter of the store's events: of a source and kinds, of a tool and a harness when
@@ -1670,8 +1686,14 @@ func (s *Ship) packageText(c store.Case, p Package) string {
 	fmt.Fprintf(&b, "- Check: `%s` fails without the change (exit %d) and passes with it (%.0f s).\n", strings.Join(p.Check.Test, " "),
 		p.Check.Before.Exit, p.Check.After.Seconds)
 	sig, _ := json.Marshal(p.Plan.Signal)
-	fmt.Fprintf(&b, "- Measurement: the signal `%s` counted events in %d of %d %s in the %s baseline before the gated window; the gate counted %d of %d in its last %s. The %s after the change is in effect is compared with the baseline (Fisher's exact test, one-sided, p below 0.05).\n",
-		sig, p.Plan.Before, p.Plan.BeforeBase, p.Plan.Units, days(measure.BaselineWindows*p.Plan.Window), p.Plan.Gate, p.Plan.GateBase, days(p.Plan.Window), days(p.Plan.Window))
+	if g := p.Plan.Guard; g != nil {
+		fmt.Fprintf(&b, "- Guarded, not measured: a measured plan was refused (%s). The signal `%s` counted %d incidents (runs of events no more than %s apart) in %d %s of exposure since %s. The watch starts when the change is in effect and needs %d %s of exposure with no recurrence, about %s and at most %s: had the change done nothing, the problem would come back within it with probability at least %.0f%%. One recurrence fails it. A guard measures no drop.\n",
+			g.Instead, sig, g.Incidents, days(g.Gap), g.Exposure, p.Plan.Units, g.Since.UTC().Format(time.DateOnly), g.Need, p.Plan.Units, days(g.Watch),
+			days(measure.MaxWatch), 100*(1-measure.Alpha))
+	} else {
+		fmt.Fprintf(&b, "- Measurement: the signal `%s` counted events in %d of %d %s in the %s baseline before the gated window; the gate counted %d of %d in its last %s. The %s after the change is in effect is compared with the baseline (Fisher's exact test, one-sided, p below 0.05).\n",
+			sig, p.Plan.Before, p.Plan.BeforeBase, p.Plan.Units, days(measure.BaselineWindows*p.Plan.Window), p.Plan.Gate, p.Plan.GateBase, days(p.Plan.Window), days(p.Plan.Window))
+	}
 	if p.Plan.Installed != "" {
 		fmt.Fprintf(&b, "- In effect once `%s`, where it is installed, changed after the checkout took the change.\n", filepath.Base(p.Plan.Installed))
 	}

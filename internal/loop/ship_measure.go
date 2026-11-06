@@ -85,6 +85,9 @@ func (s *Ship) deploymentReceipt(ctx context.Context, p Package) error {
 	window := ""
 	if p.Plan != nil {
 		window = " Measured over the " + days(p.Plan.Window) + " after it is in effect."
+		if p.Plan.Guard != nil {
+			window = " Guarded, not measured: watched for a recurrence over at least the " + days(p.Plan.Guard.Watch) + " after it is in effect; one fails it."
+		}
 	}
 	if len(p.Hand) > 0 {
 		return s.runner().noteOnce(ctx, store.Note{ID: noteID("landed", p), Kind: store.NoteDecided,
@@ -175,7 +178,10 @@ func harnessFor(sig Signal, units string) string {
 // over the window before, and a signal that counts the case's own problem: the case holds events, and at least half
 // of those in that window are among what it counts. A file the change is installed in must be one there is.
 // A plan that cannot be counted yet comes back with a *waitingPlan: the store has not read the span whole, or the
-// signal's source stopped.
+// signal's source stopped. A plan refused as too new (its signal's source began inside the span), too rare (fewer
+// than MinSignal units in the gate, or a baseline no drop could pass) or with no recent event (no evidence of the case
+// in the gated window) comes back as a guard when one can stand in for it (guardPlan), and refused with both reasons
+// when none can.
 func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window time.Duration, installed string, at time.Time) (Plan, error) {
 	switch {
 	case sig.Source == "" || len(sig.Kinds) == 0 || len(sig.Match) == 0:
@@ -229,6 +235,9 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 		}
 		return kept, nil
 	}
+	// tooNew is the measured plan's refusal when the signal's source began inside the span: no measured plan can stand,
+	// but a guard, which reads the history from the source's first event, may (guardPlan). The source is kept for it.
+	var tooNew error
 	begun := func(list []string) ([]string, error) {
 		var kept []string
 		for _, source := range list {
@@ -240,7 +249,8 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 			case !began.After(now.Add(-span)):
 				kept = append(kept, source)
 			case source == sig.Source:
-				return nil, refused("the signal's source began inside the %s before: the problem is too new to measure with that window", days(span))
+				tooNew = refused("the signal's source began inside the %s before: the problem is too new to measure with that window", days(span))
+				kept = append(kept, source)
 			default:
 				omitted = append(omitted, source)
 			}
@@ -319,6 +329,26 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 	slices.Sort(omitted)
 	omitted = slices.Compact(omitted)
 	plan := Plan{Signal: sig, Window: window, Units: units, At: at, Installed: installed, Sources: sources, Omitted: omitted}
+	// guard stands in for a measured plan refused as too new, too rare or with no recent event, at the same boundary:
+	// the sources it counts are those this plan's would be, for the units its history counts in.
+	guard := func(why error) (Plan, error) {
+		return s.guardPlan(ctx, c, plan, why, func(units string) ([]string, []string, error) {
+			found, err := live(units, at)
+			if err != nil {
+				return found, nil, err
+			}
+			if found, err = begun(found); err != nil {
+				return nil, nil, err
+			}
+			slices.Sort(found)
+			left := slices.Clone(omitted)
+			slices.Sort(left)
+			return found, slices.Compact(left), nil
+		})
+	}
+	if tooNew != nil {
+		return guard(tooNew)
+	}
 	before, err := tallySources(ctx, s.Store, sig, plan.Units, got, at.Add(-window), at, s.Dir, sources)
 	if err != nil {
 		return Plan{}, err
@@ -330,8 +360,8 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 	}
 	plan.Gate, plan.GateBase = before.Hits, before.Base
 	if before.Hits < MinSignal {
-		return Plan{}, refused("the signal counts events in %d %s of the %s before, fewer than %d: no window could show an effect", before.Hits,
-			plan.Units, days(window), MinSignal)
+		return guard(refused("the signal counts events in %d %s of the %s before, fewer than %d: no window could show an effect", before.Hits,
+			plan.Units, days(window), MinSignal))
 	}
 	evs, err := s.Store.CaseEvidence(ctx, c.ID, 0)
 	if err != nil {
@@ -359,7 +389,7 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 	case events == 0:
 		return Plan{}, refused("the case holds no event of the store: its measurement has nothing of its own problem to count")
 	case in == 0:
-		return Plan{}, refused("the case has no evidence in the window: measure over a window that holds it")
+		return guard(refused("the case has no evidence in the window: measure over a window that holds it"))
 	case hit*2 < in:
 		return Plan{}, refused("the signal counts %d of the case's %d events in the window: it does not measure the case's problem", hit, in)
 	}
@@ -368,7 +398,7 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 		return Plan{}, err
 	}
 	if !measure.Measurable(baseline, 2*plan.GateBase) {
-		return Plan{}, refused("the problem is too new or too rare to measure with that window: use a week, or two for a rarer problem, once enough history is read")
+		return guard(refused("the problem is too new or too rare to measure with that window: use a week, or two for a rarer problem, once enough history is read"))
 	}
 	plan.Before, plan.BeforeBase = baseline.Hits, baseline.Base
 	return plan, nil
