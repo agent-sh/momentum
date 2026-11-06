@@ -74,9 +74,10 @@ var (
 // A Claude Code local command's echo is its command tags and nothing else, with the tags the live tracker strips
 // (sessions/claude); a prompt it expands to has text of its own.
 var (
-	echoTags     = []string{"system-reminder", "local-command-stdout", "local-command-caveat", "command-name", "command-message", "command-args"}
-	hCommandTag  = regexp.MustCompile(`(?s)<(?:` + strings.Join(echoTags, "|") + `)>.*?</(?:` + strings.Join(echoTags, "|") + `)>`)
-	hCommandName = regexp.MustCompile(`<command-name>([^<]*)</command-name>`)
+	echoTags      = []string{"system-reminder", "local-command-stdout", "local-command-caveat", "command-name", "command-message", "command-args"}
+	hCommandTag   = regexp.MustCompile(`(?s)<(?:` + strings.Join(echoTags, "|") + `)>.*?</(?:` + strings.Join(echoTags, "|") + `)>`)
+	hCommandName  = regexp.MustCompile(`<command-name>([^<]*)</command-name>`)
+	hSkillRunning = regexp.MustCompile(`<command-message>[^<]*\bis running`)
 )
 
 // localEcho reports a local command's echo: a record the store marks so whose text is only the command's tags. The
@@ -105,9 +106,10 @@ func localEcho(e store.Event) (string, bool) {
 	return cut, false
 }
 
-// echoOnly reports a text that holds a command's name and nothing but the echo's tags.
+// echoOnly reports a text that holds a command's name and nothing but the echo's tags. A skill's echo ("<command-
+// message>NAME is running…") is its prompt's, which opens a turn, whatever the record next to it.
 func echoOnly(s string) bool {
-	return strings.Contains(s, "<command-name>") && strings.TrimSpace(hCommandTag.ReplaceAllString(s, "")) == ""
+	return strings.Contains(s, "<command-name>") && !hSkillRunning.MatchString(s) && strings.TrimSpace(hCommandTag.ReplaceAllString(s, "")) == ""
 }
 
 // recordText is the text of a user record in its transcript (Ref: path@offset#index): its message's content, a
@@ -135,13 +137,33 @@ func recordText(ref string) (string, bool) {
 	if json.Unmarshal(r.Message.Content, &blocks) != nil {
 		return "", false
 	}
+	// the event is one block of the record (Ref's #index): judged by its own text, not the record's joined
+	if i := blockIndex(ref); i >= 0 && i < len(blocks) && blocks[i].Type == "text" {
+		return blocks[i].Text, blocks[i].Text != ""
+	}
 	var parts []string
 	for _, b := range blocks {
 		if b.Type == "text" {
 			parts = append(parts, b.Text)
 		}
 	}
+	if i := blockIndex(ref); i >= 0 && i < len(parts) {
+		return parts[i], parts[i] != ""
+	}
 	return strings.Join(parts, "\n"), len(parts) > 0
+}
+
+// blockIndex is the index of an event's item in its record (Ref: path@offset#index), or -1.
+func blockIndex(ref string) int {
+	i := strings.LastIndexByte(ref, '#')
+	if i < 0 {
+		return -1
+	}
+	n, err := strconv.Atoi(ref[i+1:])
+	if err != nil {
+		return -1
+	}
+	return n
 }
 
 // role is what one event is in a session's turns.
@@ -188,6 +210,9 @@ func role(e store.Event, m map[string]any) string {
 		// from the text the echo was judged by, the record whole when the store cut it.
 		text, echo := localEcho(e)
 		if !echo {
+			if !strings.Contains(text, "<command-name>") && strings.TrimSpace(hCommandTag.ReplaceAllString(text, "")) == "" {
+				return "" // a block of the record that is only a reminder or a caveat: no command, and no prompt
+			}
 			if ik == "slash" || ik == "shell" {
 				return "owner"
 			}
@@ -330,6 +355,47 @@ func fireBetween(from, to string) (replayFire, bool) {
 	}
 }
 
+// abortedBy is when a Codex turn the store marked turn_aborted on a later record (to) was aborted: the rollout's
+// event_msg turn_aborted between the record before it (from) and that record, read forward while the transcript is
+// there, else the marked record's own time, the latest the abort can have come. A time outside the two records' is
+// not taken.
+func abortedBy(from, to string, after, latest time.Time) time.Time {
+	path, off, ok := refPlace(from)
+	p2, end, ok2 := refPlace(to)
+	if !ok || !ok2 || p2 != path || end < off {
+		return latest
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return latest
+	}
+	defer f.Close()
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
+		return latest
+	}
+	rd := bufio.NewReaderSize(io.LimitReader(f, min(end-off, requestLimit)), 1<<16)
+	for {
+		raw, err := rd.ReadBytes('\n')
+		if len(raw) > 0 && strings.Contains(string(raw), "turn_aborted") {
+			var e struct {
+				Timestamp string `json:"timestamp"`
+				Type      string `json:"type"`
+				Payload   struct {
+					Type string `json:"type"`
+				} `json:"payload"`
+			}
+			if json.Unmarshal(raw, &e) == nil && e.Type == "event_msg" && e.Payload.Type == "turn_aborted" {
+				if at, perr := time.Parse(time.RFC3339Nano, e.Timestamp); perr == nil && !at.Before(after) && !at.After(latest) {
+					return at
+				}
+			}
+		}
+		if err != nil {
+			return latest
+		}
+	}
+}
+
 // replayWake is a self-paced loop's pending wakeup, as the session layer reads it.
 type replayWake struct {
 	at, set time.Time
@@ -435,6 +501,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 	var words, entry, harness, prevRole, prevPrior string
 	var carried string       // a turn's end recorded on a record passed over since the last stop: a local command's, an abort
 	var controls []time.Time // the owner's local commands since the last stop
+	controlRef := ""         // the place of the first of them: its echo is a user record, which answers a request from then on
 	aborted := false         // a Codex abort ended the turn since the last stop, and dated its stop
 	exited := false          // an /exit ended the process: the next record the replay reads is a new one
 	var prevAt time.Time
@@ -502,9 +569,10 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			if r == "" {
 				r = "aborted" // the store marked Codex's abort of the turn on the record after it
 			} else if !aborted && !prevAt.IsZero() {
-				// marked on an input with no record of its own: the turn ran until then at the latest, as Codex's
-				// live tracker keeps a turn open until its abort
-				prevAt, aborted = e.TS, true
+				// marked on an input with no record of its own: the turn ran until the rollout's turn_aborted event
+				// while the transcript is there, else until then at the latest, as Codex's live tracker keeps a turn
+				// open until its abort
+				prevAt, aborted = abortedBy(lastRef, e.Ref, prevAt, e.TS), true
 			}
 		}
 		if v := versionAt(e.Ref); v != "" {
@@ -531,6 +599,9 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			// The harness's record that the turn was over sits on the first record after the turn, maybe this one,
 			// so the next input's point reads it.
 			controls = append(controls, e.TS)
+			if controlRef == "" {
+				controlRef = e.Ref
+			}
 			if prior, _ := m["prior"].(string); carried == "" && turnOver(harness, prior) {
 				carried = prior
 			}
@@ -549,7 +620,11 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 				carried = "turn_aborted"
 			}
 			if !aborted && !prevAt.IsZero() {
-				prevAt, aborted = e.TS, true
+				at := e.TS
+				if !strings.HasPrefix(e.Summary, "<turn_aborted>") { // only marked: the rollout's own event, while it is there
+					at = abortedBy(lastRef, e.Ref, prevAt, e.TS)
+				}
+				prevAt, aborted = at, true
 			}
 			pending, owes, owesRef = map[string]bool{}, time.Time{}, ""
 			continue
@@ -560,10 +635,10 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			// caveat) and other records the replay passes over do not end it.
 			if !prevAt.IsZero() {
 				prevPrior = priorOf(m, carried)
-				out = append(out, Point{Session: id, Stop: stopOf(e.TS, e.Ref), Next: Next{At: e.TS, Kind: "owner", InputKind: "exit", Text: e.Summary},
+				out = append(out, Point{Session: id, Stop: stopOf(e.TS, firstNonEmpty(controlRef, e.Ref)), Next: Next{At: e.TS, Kind: "owner", InputKind: "exit", Text: e.Summary},
 					Entry: entry, Controls: controls})
 			}
-			ownerAt, controls, carried, words, resumed = e.TS, nil, "", "", time.Time{}
+			ownerAt, controls, controlRef, carried, words, resumed = e.TS, nil, "", "", "", time.Time{}
 			tasks, pending, wake = map[string]replayTask{}, map[string]bool{}, replayWake{}
 			prevAt, prevRole, prevPrior, owes, owesRef, exited = e.TS, "exit", "", time.Time{}, "", true
 			continue
@@ -586,13 +661,15 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			}
 			if !prevAt.IsZero() {
 				prevPrior = priorOf(m, carried)
-				out = append(out, Point{Session: id, Stop: stopOf(e.TS, e.Ref), Next: next, Entry: entry, Controls: controls})
+				// the request the stop waited on is read up to the first local command: its echo answers it from then on,
+				// as the live tracker reads it, and Replay drops a stalled decision a command came before
+				out = append(out, Point{Session: id, Stop: stopOf(e.TS, firstNonEmpty(controlRef, e.Ref)), Next: next, Entry: entry, Controls: controls})
 			}
 		}
 		if (r == "agent" || r == "call" || r == "apierr" || r == "synthetic") && !owes.IsZero() && e.TS.Sub(owes) >= stallFloor {
 			// the wait ended after a long time without an input: the model's reply, or a reopening that closed the
 			// turn. What the stalled rule would have done is the point.
-			st := stopOf(e.TS, e.Ref)
+			st := stopOf(e.TS, firstNonEmpty(controlRef, e.Ref))
 			st.Working, st.Busy, st.Error = true, false, ""
 			st.Phase = phaseOf(st)
 			next := Next{At: e.TS, Kind: "self", Text: "the model's reply"}
@@ -600,9 +677,9 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 				next = Next{At: e.TS, Kind: "owner", InputKind: "restart", Text: "the session was reopened"}
 			}
 			if r != "synthetic" || !st.RequestAt.IsZero() {
-				// no Controls: a local command during the wait is a user record, which ends the wait on its request
-				// here as in the live layer, so no stalled rule reads such a wait
-				out = append(out, Point{Session: id, Stop: st, Next: next, Entry: entry, Waiting: true})
+				// a local command during the wait answers its request from then on, as in the live layer: Replay drops
+				// the stalled decision it came before
+				out = append(out, Point{Session: id, Stop: st, Next: next, Entry: entry, Waiting: true, Controls: controls})
 			}
 		}
 		why, _ := m["why"].(string)
@@ -741,7 +818,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			}
 			lastMainUser = false
 		}
-		prevRole, prevAt, carried, aborted = r, e.TS, "", false
+		prevRole, prevAt, carried, aborted, controlRef = r, e.TS, "", false, ""
 		for _, at := range controls { // the stop they came after is over: they show him at the session before the next
 			if at.After(ownerAt) {
 				ownerAt = at
@@ -767,7 +844,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		if carried != "" {
 			prevPrior = carried // a record passed over after the last stop said its turn was over
 		}
-		out = append(out, Point{Session: id, Stop: stopOf(until, ""), Next: Next{Kind: "none"}, Entry: entry, Controls: controls})
+		out = append(out, Point{Session: id, Stop: stopOf(until, controlRef), Next: Next{Kind: "none"}, Entry: entry, Controls: controls})
 	}
 	return out
 }

@@ -113,14 +113,21 @@ func writePoints(path string, rs []supervise.Result) error {
 	}
 	enc := json.NewEncoder(f)
 	for _, r := range rs {
+		d := r.Decision
+		if r.Label != nil {
+			d = r.Measured // the decision the labelled step's outcome was measured against
+		}
 		v := map[string]any{"session": r.Point.Session, "tool": r.Point.Stop.Tool, "stop_at": r.Point.Stop.At, "phase": r.Point.Stop.Phase,
 			"error": r.Point.Stop.Error, "words": r.Point.Stop.Words, "tasks": r.Point.Stop.Tasks, "owner_at": r.Point.Stop.OwnerAt,
 			"resumed_at": r.Point.Stop.ResumedAt, "request_at": r.Point.Stop.RequestAt, "waiting": r.Point.Waiting,
 			"wake_due": r.Point.Stop.WakeDue, "wake_for": r.Point.Stop.WakeFor, "wake_key": r.Point.Stop.WakeKey,
-			"next": r.Point.Next, "entry": r.Point.Entry, "rule": r.Decision.Rule, "step_at": r.StepAt,
-			"verdict": r.Decision.Verdict, "at": r.Decision.At, "why": r.Decision.Why, "fired": r.Fired, "outcome": r.Outcome}
+			"next": r.Point.Next, "entry": r.Point.Entry, "rule": d.Rule,
+			"verdict": d.Verdict, "at": d.At, "why": d.Why, "fired": r.Fired, "outcome": r.Outcome}
 		if r.Label != nil {
 			v["label"] = r.Label.Kind
+		}
+		if !r.StepAt.IsZero() {
+			v["step_at"] = r.StepAt
 		}
 		if len(r.Also) > 0 {
 			var also []string

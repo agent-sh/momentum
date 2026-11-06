@@ -65,3 +65,25 @@ func TestReplayOutputsCountEveryLabelledStepAtAStop(t *testing.T) {
 		t.Fatalf("the points: %s %v", raw, err)
 	}
 }
+
+// The points file gives a labelled step's rule and time from the decision its outcome was measured against, and
+// a step time only where there is a step.
+func TestThePointsGiveTheMeasuredDecision(t *testing.T) {
+	at := time.Date(2026, 3, 4, 10, 0, 0, 0, time.UTC)
+	label := &supervise.Label{Session: "s", At: at.Add(4 * time.Minute), Kind: "restart"}
+	rs := []supervise.Result{
+		{Point: supervise.Point{Session: "s"}, Decision: supervise.Decision{Rule: supervise.RuleTransient, Verdict: supervise.Hold, At: at.Add(19 * time.Minute)},
+			Measured: supervise.Decision{Rule: supervise.RuleTransient, Verdict: supervise.Hold, At: at.Add(15 * time.Minute)}, Label: label, StepAt: label.At,
+			Outcome: supervise.OwnerFirst},
+		{Point: supervise.Point{Session: "u"}, Decision: supervise.Decision{Rule: supervise.RulePromise, Verdict: supervise.Wait, At: at}, Fired: true, Outcome: supervise.Left},
+	}
+	path := filepath.Join(t.TempDir(), "points.jsonl")
+	if err := writePoints(path, rs); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if err != nil || len(lines) != 2 || !strings.Contains(lines[0], `"at":"2026-03-04T10:15:00Z"`) || strings.Contains(lines[1], "step_at") {
+		t.Fatalf("the points: %s %v", raw, err)
+	}
+}

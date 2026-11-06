@@ -2,6 +2,7 @@ package supervise
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -636,4 +637,128 @@ func TestFiredCountsEveryEarlierHold(t *testing.T) {
 		}
 	}
 	t.Fatal("no stop ends on the step's next input")
+}
+
+// A local command during a wait on the model answers its request from then on, as the live tracker reads the
+// echo: before it, the request still stands. The stalled rule acts when its time came before the command, and has
+// nothing to act on when the command came first.
+func TestALocalCommandAnswersTheRequestOnlyFromThen(t *testing.T) {
+	st := testStore(t)
+	local := `{"input_kind":"slash","why":"local command"}`
+	echo := "<command-name>/model</command-name> <command-message>model</command-message> <command-args></command-args>"
+	nexts := map[string]time.Time{}
+	for name, after := range map[string]time.Duration{"late": 45 * time.Minute, "early": 20 * time.Minute} {
+		r := newRecorded(t, name).owner(0, "prove it").request(time.Second)
+		r.event(after, map[string]any{"type": "user", "message": map[string]any{"content": echo}}, "harness_text", store.ActorHarness, "", echo, local)
+		r.owner(time.Minute, "continue")
+		nexts[name] = r.at
+		r.put(st)
+	}
+	late := replayed(t, st, "late", nexts["late"])
+	if late.Point.Stop.RequestAt.IsZero() || late.Decision.Rule != RuleStalled || !late.Fired {
+		t.Fatalf("a command after the stalled rule's time: request at %v, %s, fired %v, %q", late.Point.Stop.RequestAt, late.Decision.Rule, late.Fired, Why(late))
+	}
+	if early := replayed(t, st, "early", nexts["early"]); early.Decision.Rule == RuleStalled || early.Fired {
+		t.Fatalf("a command before the stalled rule's time: %s %s at %v, fired %v", early.Decision.Rule, early.Decision.Verdict, early.Decision.At, early.Fired)
+	}
+}
+
+// One record of a local command with several text blocks is several events: a block that is only a reminder or a
+// caveat opens no turn, and a cut block is judged by its own text, so an /exit's reminder is no second exit.
+func TestALocalCommandRecordsBlocksAreJudgedAlone(t *testing.T) {
+	st := testStore(t)
+	local := `{"input_kind":"slash","why":"local command"}`
+	reminder := "<system-reminder>" + strings.Repeat("A plugin reloaded and its tools changed. ", 8) + "</system-reminder>"
+	shapes := map[string][2]string{
+		"model": {"<command-name>/model</command-name> <command-args></command-args>", "<system-reminder>a plugin reloaded</system-reminder>"},
+		"exit":  {"<command-name>/exit</command-name> <command-args></command-args>", reminder},
+	}
+	for name, blocks := range shapes {
+		r := newRecorded(t, name).owner(0, "plan the cleanup").say(10*time.Second, "Should I start on items 1 to 4?")
+		off, at := r.line(time.Minute, map[string]any{"type": "user", "message": map[string]any{"content": []any{
+			map[string]any{"type": "text", "text": blocks[0]}, map[string]any{"type": "text", "text": blocks[1]}}}})
+		for i, b := range blocks {
+			r.evs = append(r.evs, store.Event{Source: store.Transcripts, SourceKey: fmt.Sprintf("%s@%d#%d", name, off, i), TS: at, Session: name,
+				Harness: "claude", Actor: store.ActorHarness, Kind: "harness_text", Summary: storeCut(b), Meta: local, Ref: fmt.Sprintf("%s@%d#%d", r.path, off, i)})
+		}
+		if name == "model" {
+			r.owner(time.Minute, "resume")
+		}
+		r.put(st)
+	}
+	points, _ := replayAll(t, st)
+	exits := 0
+	for _, p := range points {
+		if p.Session == "model" && p.Next.InputKind == "slash" {
+			t.Fatalf("a reminder block opened a turn: %+v", p.Next)
+		}
+		if p.Session == "exit" && p.Next.InputKind == "exit" {
+			exits++
+		}
+	}
+	if exits != 1 {
+		t.Fatalf("an /exit record with a cut reminder ended %d stops", exits)
+	}
+}
+
+// A label goes to the stop's step nearest it: a nudge on "continue" two seconds after /model is the nudge's.
+func TestALabelGoesToItsNearestStep(t *testing.T) {
+	st := testStore(t)
+	b := newTimeline(t, "pair").owner(0, "deploy it", "turn_duration").say(10*time.Second, "Deploying.").apiError(time.Minute, err503)
+	b.localCommand(20*time.Minute, "model", "")
+	b.owner(2*time.Second, "continue", "")
+	next := b.at
+	b.put(st)
+	until := t0.Add(6 * time.Hour)
+	points, err := History(context.Background(), st, t0.Add(-time.Hour), until)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels := []Label{{Session: "pair", At: next, Kind: "nudge"}}
+	for _, r := range Replay(points, labels, DefaultParams, probeAt(time.Time{}), until) {
+		if r.Point.Session == "pair" && r.Point.Next.At.Equal(next) {
+			if r.Label != &labels[0] || !r.StepAt.Equal(next) {
+				t.Fatalf("the nudge went to the step at %v, not to continue at %v", r.StepAt, next)
+			}
+			return
+		}
+	}
+	t.Fatal("no stop ends on continue")
+}
+
+// A skill's echo is its prompt's, even marked as a local command next to /model: it opens a turn.
+func TestASkillsEchoIsNoLocalCommand(t *testing.T) {
+	st := testStore(t)
+	b := newTimeline(t, "skill-run").owner(0, "watch the run", "").say(10*time.Second, "Watching.")
+	b.localCommand(time.Minute, "model", "").add(time.Second, "harness_text", store.ActorHarness, "",
+		"<command-message>loop is running…</command-message> <command-name>/loop</command-name>", `{"input_kind":"slash","why":"local command"}`)
+	skill := b.at
+	b.put(st)
+	points, _ := replayAll(t, st)
+	for _, p := range points {
+		if p.Session == "skill-run" && p.Next.At.Equal(skill) && p.Next.InputKind == "slash" {
+			return
+		}
+	}
+	t.Fatal("a skill's echo opened no turn")
+}
+
+// An older Codex rollout writes no turn_aborted record, only its event: the stop starts at that event, read from
+// the rollout while it is there, not at the later record the store marked.
+func TestAnOlderCodexAbortIsDatedByItsEvent(t *testing.T) {
+	st := testStore(t)
+	r := newRecorded(t, "old-abort").owner(0, "run the suite").say(5*time.Second, "I'll run the suite and report when it finishes.")
+	r.line(10*time.Minute, map[string]any{"type": "event_msg", "payload": map[string]any{"type": "turn_aborted", "reason": "interrupted"}})
+	abortAt := r.at
+	r.event(20*time.Minute, map[string]any{"type": "response_item", "payload": map[string]any{"type": "message"}}, "harness_text", store.ActorHarness, "",
+		"# AGENTS.md instructions", `{"input_kind":"typed","prior":"turn_aborted","why":"harness text"}`)
+	r.owner(time.Second, ".")
+	next := r.at
+	for i := range r.evs {
+		r.evs[i].Harness = "codex"
+	}
+	r.put(st)
+	if res := replayed(t, st, "old-abort", next); !res.Point.Stop.At.Equal(abortAt) {
+		t.Fatalf("the stop at %v, not at the abort event at %v", res.Point.Stop.At, abortAt)
+	}
 }

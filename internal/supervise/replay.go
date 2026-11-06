@@ -143,34 +143,40 @@ func Replay(points []Point, labels []Label, p Params, probe Probe, until time.Ti
 		bySession[l.Session] = append(bySession[l.Session], l)
 	}
 	taken := map[*Label]bool{}
-	// labelAt is the free label nearest a step, within labelSlack: a label ends one stop, so two inputs in the same
-	// second share one
-	labelAt := func(pt Point, at time.Time) *Label {
-		var best *Label
-		var gap time.Duration
-		for _, id := range []string{pt.Session, strings.TrimPrefix(pt.Session, "hermes:")} { // a Hermes id without its prefix
-			for _, l := range bySession[id] {
-				d := l.At.Sub(at).Abs()
-				if !taken[l] && d < labelSlack && (best == nil || d < gap) {
-					best, gap = l, d
-				}
-			}
-		}
-		if best != nil {
-			taken[best] = true
-		}
-		return best
-	}
 	// labelsOf are the owner's labelled steps at a stop, the earliest first: on his local commands after it (a
-	// restart step such as /login), which end no stop of their own, then on its next input
+	// restart step such as /login), which end no stop of their own, then on its next input. Each free label within
+	// labelSlack of one of them goes to its nearest step, and a step keeps the nearest label that came to it: a label
+	// ends one stop, so two inputs in the same second share one.
 	labelsOf := func(pt Point) (ls []*Label, at []time.Time) {
 		steps := append([]time.Time(nil), pt.Controls...)
 		if pt.Next.Kind == "owner" {
 			steps = append(steps, pt.Next.At)
 		}
-		for _, s := range steps {
-			if l := labelAt(pt, s); l != nil {
-				ls, at = append(ls, l), append(at, s)
+		type pick struct {
+			l   *Label
+			gap time.Duration
+		}
+		best := make([]pick, len(steps))
+		for _, id := range []string{pt.Session, strings.TrimPrefix(pt.Session, "hermes:")} { // a Hermes id without its prefix
+			for _, l := range bySession[id] {
+				if taken[l] {
+					continue
+				}
+				near, gap := -1, time.Duration(0)
+				for i, s := range steps {
+					if g := l.At.Sub(s).Abs(); g < labelSlack && (near < 0 || g < gap) {
+						near, gap = i, g
+					}
+				}
+				if near >= 0 && (best[near].l == nil || gap < best[near].gap) {
+					best[near] = pick{l, gap}
+				}
+			}
+		}
+		for i, b := range best {
+			if b.l != nil {
+				taken[b.l] = true
+				ls, at = append(ls, b.l), append(at, steps[i])
 			}
 		}
 		return ls, at
@@ -194,8 +200,15 @@ func Replay(points []Point, labels []Label, p Params, probe Probe, until time.Ti
 				if d.Verdict != Wait && d.Verdict != Hold || d.At.IsZero() || !at.Before(d.At) || !before.IsZero() && !at.Before(before) {
 					break
 				}
+				changed := false
+				if d.Rule == RuleStalled {
+					// the command's echo answers the request the turn waited on: the stalled rule has nothing to act on
+					s.RequestAt, changed = time.Time{}, true
+				}
 				if at.After(s.OwnerAt) {
-					s.OwnerAt = at
+					s.OwnerAt, changed = at, true
+				}
+				if changed {
 					d = plan(s)
 				}
 			}
