@@ -31,10 +31,10 @@ const guardWeek = 7 * 24 * time.Hour
 // came inside it, with the sources the plan would count for the units its history counts in, read whole. The
 // signal's events there fall into incidents (no gap longer than measure.GuardGap between two of them), and an
 // incident the source began with is dropped (measure.GuardCount). Its exposure is the plan's units of activity in
-// which the problem's unit was in use: the signal's tool, else the small set of tools or directories its events fall
-// in (guardUnit). It is refused only where no watch could be kept: the case's evidence is not the signal's, its events
-// fall in no such set, or its history holds no exposure. A refusal names the measured plan's beside the guard's.
-// sourcesFor gives the sources and the omitted ones for a count in units, or a *waitingPlan.
+// which the problem's unit was in use: of the units that hold every event of the history (guardCandidates), the one
+// with the least exposure there. It is refused only where no watch could be kept: the case's evidence is not the
+// signal's, no unit holds its events, or its history holds no exposure. A refusal names the measured plan's beside
+// the guard's. sourcesFor gives the sources and the omitted ones for a count in units, or a *waitingPlan.
 func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead error, sourcesFor func(units string) ([]string, []string, error)) (Plan, error) {
 	why := strings.TrimPrefix(instead.Error(), ErrRefused.Error()+": ")
 	refuse := func(format string, a ...any) (Plan, error) {
@@ -118,22 +118,34 @@ func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead e
 	}
 	cut := measure.GuardCount(measure.Incidents(times, measure.GuardGap), nil, since, measure.GuardGap, anchored).Since
 	later := slices.DeleteFunc(slices.Clone(hits), func(e store.Event) bool { return e.TS.Before(cut) })
-	tools, cwds, none := guardUnit(sig, units, later, true)
+	cands, none := guardCandidates(units, later)
 	if len(later) == 0 {
-		tools, cwds, none = guardUnit(sig, units, hits, false)
+		cands, none = guardCandidates(units, hits)
 	}
-	if none != "" {
+	if len(cands) == 0 {
 		return refuse("%s", none)
 	}
-	g.Guard = &Guard{Instead: why, Gap: measure.GuardGap, Units: units, Tools: tools, Cwds: cwds, Begun: since, Anchored: anchored}
-	h, err := guardHistory(ctx, s.Store, g, since, at, s.Dir, anchored)
-	if err != nil {
-		return Plan{}, err
+	// of the units that hold every event, the one with the least exposure in the history: the narrowest that holds
+	// the problem, so the watch's P is never more than its unit's use says (a broader unit would count hours in which
+	// the problem could not have come back); on a tie, the one of fewer members, then the first
+	var best *Guard
+	var bestH measure.GuardHistory
+	for _, cand := range cands {
+		g.Guard = &Guard{Instead: why, Gap: measure.GuardGap, Units: units, Unit: cand.unit, Tools: cand.tools, Cwds: cand.cwds, Begun: since, Anchored: anchored}
+		h, err := guardHistory(ctx, s.Store, g, since, at, s.Dir, anchored)
+		if err != nil {
+			return Plan{}, err
+		}
+		members := func(g *Guard) int { return len(g.Tools) + len(g.Cwds) }
+		if h.Exposure > 0 && (best == nil || h.Exposure < bestH.Exposure || h.Exposure == bestH.Exposure && members(g.Guard) < members(best)) {
+			best, bestH = g.Guard, h
+		}
 	}
-	if h.Exposure == 0 {
+	if best == nil {
 		return refuse("its history holds no exposure to count the problem's rate by")
 	}
-	setGuard(g.Guard, h)
+	g.Guard = best
+	setGuard(g.Guard, bestH)
 	return g, nil
 }
 
@@ -142,103 +154,120 @@ func setGuard(g *Guard, h measure.GuardHistory) {
 	g.Since, g.Incidents, g.Exposure = h.Since, h.Incidents, h.Exposure
 }
 
-// guardUnit is what a guard's exposure is narrowed to, the problem's unit: the signal's tool; else, tools before
-// directories, the one tool every event of its history was of (never for the owner's hours: his turns are of none),
-// else the set of tools they were of, when every one was of a tool and the set is small (smallSet); else the one
-// directory every event ran in, else the set of directories they ran in, when every one ran in one and the set is
-// small. A directory is compared as the store keeps it now (store.CleanCwd), since a row stored before the store
-// cleaned working directories keeps its form until its source is read again; one directory is the unit only when it
-// is every event's own, never a parent that covers theirs (a home or a projects directory would cover nearly all
-// work). With sets false only a unit of one is chosen: the events are those of an incident the history dropped, which
-// shows where the problem happened but holds no draw of its rate to size a set by. none says why there is no unit,
-// when there is none: then every activity would count as the problem's unit in use.
-func guardUnit(sig Signal, units string, hits []store.Event, sets bool) (tools, cwds []string, none string) {
-	if sig.Tool != "" && units != OwnerHours {
-		return []string{sig.Tool}, nil, ""
+// guardCandidate is a unit a guard's exposure may be narrowed to: what it is, and its tools and directory.
+type guardCandidate struct {
+	unit        string
+	tools, cwds []string
+}
+
+// guardCandidates are the units that hold every one of a history's events, which guardPlan picks the one of least
+// exposure from: the one tool every event was of (the signal's own, when it names one); the set of the tools they were
+// of, when every one was of a tool and each tool is in two or more of the history's incidents; the one directory every
+// event ran in; and each of the tools' units within that directory. The owner's hours take no tool: his turns are of
+// none. A directory is compared as the store keeps it now (store.CleanCwd), since a row stored before the store
+// cleaned working directories keeps its form until its source is read again; it is a unit only when it is every
+// event's own, and there is no set of directories, since one directory can be another's parent and cover nearly all
+// work. A set's member must be in two incidents because the incidents are the history's independent draws: events of
+// one incident share a cause (measure.Incidents), so a tool one incident alone holds may be where that cause happened
+// to surface, and its hours would count activity in general as the problem's unit in use. none says why there is no
+// candidate, when there is none: then every activity would count as the problem's unit in use.
+func guardCandidates(units string, hits []store.Event) (cands []guardCandidate, none string) {
+	// of is the members events are of, and the incidents each is in, or nil when one event is of none
+	times := make([]time.Time, len(hits))
+	for i, e := range hits {
+		times[i] = e.TS
 	}
-	// set is the members events are of, with the hours each holds them in, or nil when one is of none
-	set := func(of func(store.Event) string) ([]string, map[string]map[int64]bool) {
-		hours := map[string]map[int64]bool{}
-		for _, e := range hits {
-			v := of(e)
-			if v == "" {
-				return nil, nil // an event outside every member: no set holds them all
+	incidents := measure.Incidents(times, measure.GuardGap)
+	incidentOf := func(at time.Time) int {
+		for i, inc := range incidents {
+			if !at.Before(inc.First) && !at.After(inc.Last) {
+				return i
 			}
-			if hours[v] == nil {
-				hours[v] = map[int64]bool{}
-			}
-			hours[v][e.TS.UnixMilli()/3_600_000] = true
 		}
-		out := slices.Sorted(maps.Keys(hours))
-		return out, hours
+		return -1
 	}
-	var toolHours map[string]map[int64]bool
+	of := func(member func(store.Event) string) ([]string, map[string]map[int]bool) {
+		in := map[string]map[int]bool{}
+		for _, e := range hits {
+			v := member(e)
+			if v == "" {
+				return nil, nil // an event outside every member: no unit of them holds them all
+			}
+			if in[v] == nil {
+				in[v] = map[int]bool{}
+			}
+			in[v][incidentOf(e.TS)] = true
+		}
+		return slices.Sorted(maps.Keys(in)), in
+	}
+	var tools []string
+	var toolIncidents map[string]map[int]bool
 	if units != OwnerHours {
-		tools, toolHours = set(func(e store.Event) string { return e.Tool })
+		tools, toolIncidents = of(func(e store.Event) string { return e.Tool })
 	}
-	cwds, dirHours := set(func(e store.Event) string { return store.CleanCwd(e.Cwd) })
+	cwds, _ := of(func(e store.Event) string { return store.CleanCwd(e.Cwd) })
+	var toolUnits []guardCandidate
+	thin := 0
+	for _, in := range toolIncidents {
+		if len(in) < 2 {
+			thin++
+		}
+	}
 	switch {
 	case len(tools) == 1:
-		return tools, nil, ""
-	case sets && smallSet(tools, toolHours):
-		return tools, nil, ""
-	case len(cwds) == 1:
-		return nil, cwds, ""
-	case sets && smallSet(cwds, dirHours):
-		return nil, cwds, ""
+		toolUnits = append(toolUnits, guardCandidate{unit: "tool", tools: tools})
+	case len(tools) > 1 && thin == 0:
+		toolUnits = append(toolUnits, guardCandidate{unit: "tools", tools: tools})
 	}
-	if !sets {
-		return nil, nil, "its events share no tool or directory, and the history holds no incident after the one its source began with to find a set of them in, so absence cannot be counted only while the problem's unit was in use"
+	cands = append(cands, toolUnits...)
+	if len(cwds) == 1 {
+		cands = append(cands, guardCandidate{unit: "directory", cwds: cwds})
+		for _, t := range toolUnits {
+			cands = append(cands, guardCandidate{unit: t.unit + " in its directory", tools: t.tools, cwds: cwds})
+		}
 	}
-	toolsWhy := fmt.Sprintf("%d tools, %d of them in one hour alone", len(tools), thin(toolHours))
+	if len(cands) > 0 {
+		return cands, ""
+	}
+	toolsWhy := fmt.Sprintf("%d tools, %d of them in fewer than two of its %d incidents", len(tools), thin, len(incidents))
 	switch {
 	case units == OwnerHours:
 		toolsWhy = "the owner's turns are of no tool"
 	case tools == nil:
 		toolsWhy = "some of no tool"
 	}
-	dirsWhy := fmt.Sprintf("%d directories, %d of them in one hour alone", len(cwds), thin(dirHours))
+	dirsWhy := fmt.Sprintf("in %d directories", len(cwds))
 	if cwds == nil {
 		dirsWhy = "some in no directory"
 	}
-	return nil, nil, fmt.Sprintf("its events fall in no small set of tools or directories (%s; %s: each member of a set holds its events in two hours or more), so absence cannot be counted only while the problem's unit was in use",
+	return nil, fmt.Sprintf("no unit holds all its events (%s; %s: a set of tools holds each in two incidents or more, and a directory is every event's own), so absence cannot be counted only while the problem's unit was in use",
 		toolsWhy, dirsWhy)
 }
 
-// smallSet says whether a set of more than one tool or directory a problem's events are of is small enough to be its
-// unit: each member holds them in two distinct hours or more, by the clock, whatever the sessions (a burst across
-// parallel sessions in one hour is one). A member that holds one hour alone may be the tool or directory a failure
-// happened to surface in, and counting all its hours would count activity in general as the problem's unit in use,
-// which a guard with no unit is refused for: a busy member does not carry it.
-func smallSet(set []string, hours map[string]map[int64]bool) bool {
-	return len(set) > 1 && thin(hours) == 0
-}
-
-// thin is how many members of a set hold their events in fewer than two hours.
-func thin(hours map[string]map[int64]bool) int {
-	n := 0
-	for _, h := range hours {
-		if len(h) < 2 {
-			n++
-		}
-	}
-	return n
-}
-
-// guardUnitText says what a guard's exposure is narrowed to, for its proposal: the tools by name, the directories by
-// how many there are (a path is the machine's own).
+// guardUnitText says what a guard's exposure is narrowed to, for its proposal: the tools by name, the directory as
+// its directory (a path is the machine's own), and that it is, of the units that hold every event, the one with the
+// least exposure.
 func guardUnitText(g Guard) string {
+	var on string
 	switch {
 	case len(g.Tools) == 1:
-		return ", counting the hours in which " + g.Tools[0] + " was used"
+		on = "in which " + g.Tools[0] + " was used"
 	case len(g.Tools) > 1:
-		return fmt.Sprintf(", counting the hours in which any of the %d tools its events were of was used (%s)", len(g.Tools), strings.Join(g.Tools, ", "))
-	case len(g.Cwds) == 1:
-		return ", counting the hours of work in its directory"
-	case len(g.Cwds) > 1:
-		return fmt.Sprintf(", counting the hours of work in any of the %d directories its events ran in", len(g.Cwds))
+		on = fmt.Sprintf("in which any of the %d tools its events were of was used (%s)", len(g.Tools), strings.Join(g.Tools, ", "))
 	}
-	return ""
+	switch {
+	case len(g.Cwds) > 0 && on != "":
+		on += " in its directory"
+	case len(g.Cwds) > 0:
+		on = "of work in its directory"
+	case on == "":
+		return ""
+	}
+	unit := ""
+	if g.Unit != "" {
+		unit = " (its unit: the " + g.Unit + ", of the units that hold every event the one with the least exposure)"
+	}
+	return ", counting the hours " + on + unit
 }
 
 // guardHistory counts a guard's history over [since, until) by its plan's signal, units, sources, narrowing and gap.
@@ -511,9 +540,10 @@ func guardOutText(plan Plan, out []string) string {
 // incident stored since does not count as another. The caller gives the plan with the sources its close left out
 // taken out (guardCounted), and has seen each of the others read past the end, so past the start; the signal's own
 // source may have read past it only in part. A recount with no exposure keeps the proposal's count (a rebuild may have
-// dropped what the store read of the history), but where sources were dropped (dropped): the proposal's count holds
-// theirs, so the recount's stands, and the close says its history held no exposure in the sources it kept.
-func (r *Runner) guardRecount(ctx context.Context, plan Plan, from time.Time, dropped bool) (*Guard, error) {
+// dropped what the store read of the history), but where sources were dropped and a recount over every recorded
+// source (recorded, given only then) holds exposure: then the sources dropped held all of it, the proposal's count
+// holds theirs, so the recount's stands, and the close says its history held no exposure in the sources it kept.
+func (r *Runner) guardRecount(ctx context.Context, plan Plan, from time.Time, recorded []string) (*Guard, error) {
 	g := *plan.Guard
 	begun, anchored := g.Since, false
 	if !g.Begun.IsZero() {
@@ -523,7 +553,16 @@ func (r *Runner) guardRecount(ctx context.Context, plan Plan, from time.Time, dr
 	if err != nil {
 		return nil, err
 	}
-	if h.Exposure > 0 || dropped {
+	if h.Exposure == 0 && recorded != nil {
+		all := plan
+		all.Sources = recorded
+		if whole, err := guardHistory(ctx, r.Store, all, begun, from, r.Dir, anchored); err != nil {
+			return nil, err
+		} else if whole.Exposure == 0 {
+			return &g, nil // none in any recorded source either: what the store read of the history is gone
+		}
+	}
+	if h.Exposure > 0 || recorded != nil {
 		setGuard(&g, h)
 	}
 	return &g, nil
@@ -614,7 +653,11 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 	}
 	plan = guardCounted(plan, out)
 	dropped := slices.DeleteFunc(slices.Clone(recorded), func(source string) bool { return slices.Contains(plan.Sources, source) })
-	counted, err := r.guardRecount(ctx, plan, from, len(dropped) > 0)
+	var all []string // every recorded source, where the close dropped some
+	if len(dropped) > 0 {
+		all = recorded
+	}
+	counted, err := r.guardRecount(ctx, plan, from, all)
 	if err != nil {
 		return failed(err)
 	}

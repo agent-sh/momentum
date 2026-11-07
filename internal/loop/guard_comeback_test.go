@@ -409,3 +409,37 @@ func TestAGuardsRecountWithNoExposureInTheSourcesItKeptSaysSo(t *testing.T) {
 		t.Fatalf("the case back keeps its guard's columns: %+v\n%s", c.Measurement, shown(t, c))
 	}
 }
+
+// A recount with no exposure in the sources a close kept stands only where a recount over every recorded source holds
+// some: then the sources dropped held it all. Where none holds any, what the store read of the history is gone (zz-more's
+// events dropped by a rebuild before the close), and the close keeps the proposal's count, 132 hours, as a recount with
+// no source dropped does.
+func TestAGuardsRecountWithNoExposureAnywhereKeepsTheProposals(t *testing.T) {
+	ctx := context.Background()
+	m := guarded(t, time.Hour, toolSignal.Source, func(st *store.Store, planAt, useUntil time.Time) store.Case {
+		from := planAt.Add(-8 * aDay)
+		c := stoppedProblem(t, st, from, 60, from.Add(60*time.Hour), planAt)
+		moreUse(t, st, planAt, useUntil)
+		return c
+	})
+	markAll(t, m, toolSignal.Source, "zz-more")
+	m.measure(t, Options{})
+	start := m.clock
+	weekly(t, m.st, toolSignal.Source, "w", start)
+	m.clock = start.Add(10 * aDay)
+	markAll(t, m, toolSignal.Source, "zz-more")
+	m.measure(t, Options{})
+	if _, err := m.st.Rebuild(ctx, "zz-more", true); err != nil {
+		t.Fatal(err)
+	}
+	m.clock = start.Add(37*aDay + time.Hour)
+	markAll(t, m, toolSignal.Source)
+	got := m.measure(t, Options{})
+	if got.Status != "guarded" || got.Result == nil || got.Result.Watched != 125 || got.Result.Exposure != 132 ||
+		strings.Contains(got.Result.Effect, "no exposure") || !strings.Contains(got.Result.Effect, "0 incidents in 132 session hours") {
+		t.Fatalf("the close, no exposure in any recorded source: %+v %+v", got, got.Result)
+	}
+	if c := m.theCase(t); c.Measurement.Exposure != 132 {
+		t.Fatalf("the case's guard columns: %+v", c.Measurement)
+	}
+}

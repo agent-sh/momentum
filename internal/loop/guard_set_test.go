@@ -38,8 +38,9 @@ func serverStore(t *testing.T, st *store.Store, at, useUntil time.Time) store.Ca
 	return serverStoreIn(t, st, at, useUntil, "")
 }
 
-// serverStoreIn is serverStore with every failure in one directory, when cwd names one, and a failure of the second
-// tool beside the first's in the first burst's first unit: one unit of its problem holds both tools.
+// serverStoreIn is serverStore with the server's work in one directory, when cwd names one: its two tools' use and
+// every failure there (Read's use in none), and a failure of the second tool beside the first's in the first burst's
+// first unit, so one unit of its problem holds both tools.
 func serverStoreIn(t *testing.T, st *store.Store, at, useUntil time.Time, cwd string) store.Case {
 	t.Helper()
 	evs := []store.Event{serverUse("began", at.Add(-60*aDay), serverA)}
@@ -48,7 +49,9 @@ func serverStoreIn(t *testing.T, st *store.Store, at, useUntil time.Time, cwd st
 		if i%2 == 1 {
 			tool = serverB
 		}
-		evs = append(evs, serverUse(fmt.Sprint("use-", i), u, tool), serverUse(fmt.Sprint("read-", i), u.Add(10*time.Minute), "Read"))
+		use := serverUse(fmt.Sprint("use-", i), u, tool)
+		use.Cwd = cwd
+		evs = append(evs, use, serverUse(fmt.Sprint("read-", i), u.Add(10*time.Minute), "Read"))
 	}
 	var failures []store.Event
 	for b, from := range fourBursts(at) {
@@ -94,12 +97,13 @@ func TestAGuardOverTheToolsOfOneServer(t *testing.T) {
 		t.Fatalf("the proposal does not name the guard's tools: %s", text)
 	}
 	t.Run("in one directory, both tools in one unit", func(t *testing.T) {
-		// every failure in the server's own directory, and one unit holding a failure of each tool: the tools are its
-		// unit before the directory, and that unit counts once
+		// the server's work all in its own directory, one unit holding a failure of each tool: the tools, the directory
+		// and the tools within it hold the same 684 hours, that unit counted once, and the directory, of one member,
+		// is the guard's
 		st := testStore(t)
 		c := serverStoreIn(t, st, now, now, "/work/server")
 		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, serverSignal, 7*aDay, "", now)
-		if g, _ := guardOf(t, plan); err != nil || g == nil || strings.Join(g.Tools, " ") != serverA+" "+serverB || g.Cwd != "" || len(g.Cwds) != 0 || g.Exposure != 336+336+12 {
+		if g, _ := guardOf(t, plan); err != nil || g == nil || g.Unit != "directory" || g.Cwd != "/work/server" || g.Tool != "" || len(g.Tools) != 0 || g.Exposure != 336+336+12 {
 			t.Fatalf("a server's failures in one directory: %+v %v", g, err)
 		}
 	})
@@ -170,7 +174,7 @@ func anchoredServer(t *testing.T, st *store.Store, at time.Time, first []string,
 }
 
 // A guard's set is found in the incidents its history counts: the incident its source began with is dropped from them
-// (it is no draw of the problem's rate), so its tools choose no member of the set and count toward no member's hours.
+// (it is no draw of the problem's rate), so its tools choose no member of the set and count toward no member's incidents.
 func TestAGuardsSetIsFoundAfterTheIncidentItsSourceBeganWith(t *testing.T) {
 	now := time.Now().Truncate(time.Hour)
 	t.Run("it chooses no member", func(t *testing.T) {
@@ -181,7 +185,7 @@ func TestAGuardsSetIsFoundAfterTheIncidentItsSourceBeganWith(t *testing.T) {
 			t.Fatalf("the set after the first burst: %+v %v", g, err)
 		}
 	})
-	t.Run("it holds no member's hour", func(t *testing.T) {
+	t.Run("it holds no member's incident", func(t *testing.T) {
 		st := testStore(t) // the second tool fails once after the first burst, and in that burst once more
 		c := anchoredServer(t, st, now, []string{serverA, serverB, serverA}, func(b, j int) string {
 			if b == 3 && j == 1 {
@@ -190,8 +194,8 @@ func TestAGuardsSetIsFoundAfterTheIncidentItsSourceBeganWith(t *testing.T) {
 			return serverA
 		})
 		_, err := (&Ship{Store: st}).validPlan(t.Context(), c, serverSignal, 7*aDay, "", now)
-		if err == nil || !strings.Contains(err.Error(), "(2 tools, 1 of them in one hour alone") {
-			t.Fatalf("a member of one hour after the first burst: %v", err)
+		if err == nil || !strings.Contains(err.Error(), "(2 tools, 1 of them in fewer than two of its 3 incidents") {
+			t.Fatalf("a member of one incident after the first burst: %v", err)
 		}
 	})
 }

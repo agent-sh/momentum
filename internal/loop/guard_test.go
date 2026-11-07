@@ -131,6 +131,7 @@ type guardJSON struct {
 	Since     time.Time     `json:"since"`
 	Gap       time.Duration `json:"gap"`
 	Units     string        `json:"units"`
+	Unit      string        `json:"unit"`
 	Tool      string        `json:"tool"`
 	Cwd       string        `json:"cwd"`
 	Tools     []string      `json:"tools"`
@@ -205,14 +206,13 @@ func TestAGuardStandsInWhereAMeasuredPlanIsRefused(t *testing.T) {
 }
 
 // A guard is refused only where no watch could be kept: a history with no exposure; a signal that counts none of the
-// case's evidence in the gate, the problem's form there having changed; a signal with no tool whose events fall in no
-// small set of tools or directories (a member that holds them in one hour alone, however busy the others or however
-// many sessions that hour had, a parent directory a member of its own, or events of no tool and in no directory); and,
-// on the too-new path too, a gate that holds an active problem and none of the case's evidence. A signal with no tool
-// whose events all share one counts its exposure in that tool's hours; one whose events are of two tools counts it in
-// theirs, before any directory; one whose events of no tool ran in two sibling directories counts it in both; and one
-// whose events share a directory in that directory's: its rows stored before the store cleaned working directories,
-// in any form of it (`/work//a`, `/work/./a/x`), count as the rows stored after.
+// case's evidence in the gate, the problem's form there having changed; a signal with no tool whose events no unit
+// holds (a tool in one incident alone, however many hours or sessions it filled or however busy the others, events in
+// two directories, a parent or a sibling, or events of no tool and in no directory); and, on the too-new path too, a gate
+// that holds an active problem and none of the case's evidence. Of the units that hold every event the one with the
+// least exposure is the guard's: two tools within the one directory of their failures, before either alone; one tool
+// every event shares; and one directory: its rows stored before the store cleaned working directories, in any form of
+// it (`/work//a`, `/work/./a/x`), count as the rows stored after.
 func TestAGuardIsRefusedOnlyWhereNoWatchCouldBeKept(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().Truncate(time.Hour)
@@ -276,21 +276,50 @@ func TestAGuardIsRefusedOnlyWhereNoWatchCouldBeKept(t *testing.T) {
 		e.Tool, e.Cwd = tool, cwd
 		return e
 	}
-	t.Run("a member in one hour", func(t *testing.T) {
-		st := testStore(t) // seven tools and seven directories for twelve failures: two of each in one hour alone
+	t.Run("a tool in one incident", func(t *testing.T) {
+		st := testStore(t) // seven tools and seven directories for twelve failures: two tools in one incident alone
 		c := spread(t, st, func(i int) (string, string) { return fmt.Sprint("tool-", i%7), fmt.Sprint("/work/", i%7) })
-		refusedWith(t, st, c, noTool, "no small set of tools or directories (7 tools, 2 of them in one hour alone; 7 directories, 2 of them in one hour alone")
+		refusedWith(t, st, c, noTool, "no unit holds all its events (7 tools, 2 of them in fewer than two of its 4 incidents; in 7 directories")
 	})
-	t.Run("each member in two hours", func(t *testing.T) {
-		st := testStore(t) // six tools for twelve failures: each in two hours
+	t.Run("each tool in two incidents", func(t *testing.T) {
+		st := testStore(t) // six tools for twelve failures: each in two incidents
 		c := spread(t, st, func(i int) (string, string) { return fmt.Sprint("tool-", i%6), fmt.Sprint("/work/", i%7) })
 		plan, err := (&Ship{Store: st}).validPlan(ctx, c, noTool, 7*aDay, "", now)
-		if g, _ := guardOf(t, plan); err != nil || g == nil || len(g.Tools) != 6 || g.Tool != "" || g.Cwd != "" || len(g.Cwds) != 0 {
-			t.Fatalf("six tools, each in two hours: %+v %v", g, err)
+		if g, _ := guardOf(t, plan); err != nil || g == nil || len(g.Tools) != 6 || g.Unit != "tools" || g.Tool != "" || g.Cwd != "" || len(g.Cwds) != 0 {
+			t.Fatalf("six tools, each in two incidents: %+v %v", g, err)
 		}
 	})
-	t.Run("a busy member carries no tool of one hour", func(t *testing.T) {
-		st := testStore(t) // the server's tool fails in 20 hours, and five broad tools once each: 6 members over 25 units
+	t.Run("a tool in one burst is no member", func(t *testing.T) {
+		// the server's tool fails in every burst, and Bash beside it in one burst over three hours: one draw of its cause,
+		// so Bash, used in nearly every hour, is no member of a set, and the server's tool alone holds not all the events
+		st := testStore(t)
+		_, failures := recurring(t, st, toolSignal.Source, now, now, now, fourBursts(now)...)
+		for i := range failures {
+			failures[i].Tool = "mcp__zz_srv__q"
+		}
+		for j := 0; j < 3; j++ {
+			failures = append(failures, failed(fmt.Sprint("bash-", j), fourBursts(now)[1].Add(time.Duration(j)*time.Hour+40*time.Minute), "Bash", ""))
+		}
+		put(t, st, failures)
+		refusedWith(t, st, testingCaseOf(t, st, "failures/v2:zz-burst", failures), noTool, "(2 tools, 1 of them in fewer than two of its 4 incidents; some in no directory")
+	})
+	t.Run("broad tools each in one incident", func(t *testing.T) {
+		// six common tools, each in two hours or more of one burst and in no other
+		st := testStore(t)
+		_, failures := recurring(t, st, toolSignal.Source, now, now, now, fourBursts(now)...)
+		groups := [][]string{{"Bash", "Read"}, {"Edit", "Write"}, {"Grep"}, {"Glob"}}
+		for i := range failures {
+			b, j := i/3, i%3
+			failures[i].Tool = groups[b][j%len(groups[b])]
+		}
+		for b, tool := range []string{"Read", "Write"} {
+			failures = append(failures, failed(fmt.Sprint("more-", b), fourBursts(now)[b].Add(3*time.Hour+30*time.Minute), tool, ""))
+		}
+		put(t, st, failures)
+		refusedWith(t, st, testingCaseOf(t, st, "failures/v2:zz-broad", failures), noTool, "(6 tools, 6 of them in fewer than two of its 4 incidents; some in no directory")
+	})
+	t.Run("a busy member carries no tool of one incident", func(t *testing.T) {
+		st := testStore(t) // the server's tool fails in 20 hours, and five broad tools once each
 		_, failures := recurring(t, st, toolSignal.Source, now, now, now, fourBursts(now)...)
 		for i := range failures {
 			failures[i].Tool = "mcp__zz_srv__q"
@@ -302,10 +331,10 @@ func TestAGuardIsRefusedOnlyWhereNoWatchCouldBeKept(t *testing.T) {
 			failures = append(failures, failed(fmt.Sprint("once-", i), now.Add(-16*aDay+time.Duration(i)*7*time.Hour), tool, ""))
 		}
 		put(t, st, failures)
-		refusedWith(t, st, testingCaseOf(t, st, "failures/v2:zz-busy", failures), noTool, "(6 tools, 5 of them in one hour alone; some in no directory")
+		refusedWith(t, st, testingCaseOf(t, st, "failures/v2:zz-busy", failures), noTool, "(6 tools, 5 of them in fewer than two of its")
 	})
-	t.Run("a burst across parallel sessions is one hour", func(t *testing.T) {
-		st := testStore(t) // one tool in twelve hours, another in five sessions of one hour
+	t.Run("a burst across parallel sessions is one incident", func(t *testing.T) {
+		st := testStore(t) // one tool in every burst, another in five sessions of one hour
 		_, failures := recurring(t, st, toolSignal.Source, now, now, now, fourBursts(now)...)
 		for i := range failures {
 			failures[i].Tool = "mcp__zz_srv__a"
@@ -314,20 +343,28 @@ func TestAGuardIsRefusedOnlyWhereNoWatchCouldBeKept(t *testing.T) {
 			failures = append(failures, failed(fmt.Sprint("parallel-", k), now.Add(-16*aDay+time.Duration(k)*time.Minute), "mcp__zz_srv__b", ""))
 		}
 		put(t, st, failures)
-		refusedWith(t, st, testingCaseOf(t, st, "failures/v2:zz-parallel", failures), noTool, "(2 tools, 1 of them in one hour alone; some in no directory")
+		refusedWith(t, st, testingCaseOf(t, st, "failures/v2:zz-parallel", failures), noTool, "(2 tools, 1 of them in fewer than two of its")
 	})
-	t.Run("a parent directory is a member of its own", func(t *testing.T) {
-		st := testStore(t) // of no tool: eleven failures in a repository, one in the directory above it
-		c := spread(t, st, func(i int) (string, string) {
-			if i == 0 {
-				return "", "/work"
+	for _, tc := range []struct {
+		name string
+		cwd  func(i int) string
+	}{
+		{"no set of directories, one the other's parent", func(i int) string {
+			if i%3 == 0 {
+				return "/work"
 			}
-			return "", "/work/repo"
+			return "/work/repo"
+		}},
+		{"no set of directories, two siblings", func(i int) string { return []string{"/work/a", "/work/b"}[i%2] }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testStore(t) // of no tool, each directory in two incidents or more
+			c := spread(t, st, func(i int) (string, string) { return "", tc.cwd(i) })
+			refusedWith(t, st, c, noTool, "(some of no tool; in 2 directories")
 		})
-		refusedWith(t, st, c, noTool, "(some of no tool; 2 directories, 1 of them in one hour alone")
-	})
-	t.Run("a set of tools before a directory", func(t *testing.T) {
-		st := testStore(t) // two tools, in a repository and in the directory above it
+	}
+	t.Run("two tools in two directories", func(t *testing.T) {
+		st := testStore(t) // two tools, in a repository and in the directory above it: no directory is all their own
 		c := spread(t, st, func(i int) (string, string) {
 			cwd := "/work/repo"
 			if i%3 == 0 {
@@ -340,27 +377,42 @@ func TestAGuardIsRefusedOnlyWhereNoWatchCouldBeKept(t *testing.T) {
 			t.Fatalf("two tools, in a directory and its parent: %+v %v", g, err)
 		}
 	})
-	t.Run("two sibling directories", func(t *testing.T) {
-		st := testStore(t) // of no tool, in two sibling directories; the tool's use in each, and in a third
-		c := spread(t, st, func(i int) (string, string) { return "", []string{"/work/a", "/work/b"}[i%2] })
+	t.Run("the tools within their directory", func(t *testing.T) {
+		// two tools, every failure in one directory; the tools used every hour elsewhere, and in the directory in 24
+		// hours beside 100 of another tool's: the tools within the directory hold the least exposure, 24 and the 12
+		// failures' own, of the tools' 708 and the directory's 136
+		st := testStore(t)
+		tools := []string{"mcp__zz_srv__a", "mcp__zz_srv__b"}
+		c := spread(t, st, func(i int) (string, string) { return tools[i%2], "/work/srv" })
 		var use []store.Event
-		for i, cwd := range []string{"/work/a", "/work/b", "/work/c"} {
-			for h := 0; h < 24; h++ {
-				e := toolResult(fmt.Sprintf("use-%d-%d", i, h), now.Add(-time.Duration(26-i)*aDay+time.Duration(h)*time.Hour), fmt.Sprintf("use-%d-%d", i, h), false)
-				e.Cwd = cwd
-				use = append(use, e)
-			}
+		add := func(key string, at time.Time, tool, cwd string) {
+			e := toolResult(key, at, key, false)
+			e.Tool, e.Cwd = tool, cwd
+			use = append(use, e)
+		}
+		for i, u := 0, now.Add(-28*aDay); u.Before(now); i, u = i+1, u.Add(time.Hour) {
+			add(fmt.Sprint("away-", i), u.Add(20*time.Minute), tools[i%2], "/work/other")
+		}
+		for h := 0; h < 24; h++ {
+			add(fmt.Sprint("in-", h), now.Add(-22*aDay+time.Duration(h)*time.Hour+40*time.Minute), tools[h%2], "/work/srv")
+		}
+		for h := 0; h < 100; h++ {
+			add(fmt.Sprint("read-", h), now.Add(-10*aDay+time.Duration(h)*time.Hour+40*time.Minute), "Read", "/work/srv")
 		}
 		put(t, st, use)
 		plan, err := (&Ship{Store: st}).validPlan(ctx, c, noTool, 7*aDay, "", now)
-		if g, _ := guardOf(t, plan); err != nil || g == nil || strings.Join(g.Cwds, " ") != "/work/a /work/b" || g.Cwd != "" || len(g.Tools) != 0 || g.Exposure != 12+2*24 {
-			t.Fatalf("two sibling directories: %+v %v", g, err)
+		g, _ := guardOf(t, plan)
+		if err != nil || g == nil || g.Unit != "tools in its directory" || strings.Join(g.Tools, " ") != strings.Join(tools, " ") || g.Cwd != "/work/srv" || g.Exposure != 36 {
+			t.Fatalf("two tools in one directory: %+v %v", g, err)
+		}
+		if text := (&Ship{}).packageText(c, Package{Plan: &plan, Check: &Check{}}); !strings.Contains(text, "was used ("+strings.Join(tools, ", ")+") in its directory (its unit: the tools in its directory") {
+			t.Fatalf("the proposal does not name the unit: %s", text)
 		}
 	})
-	t.Run("no set", func(t *testing.T) {
+	t.Run("no unit", func(t *testing.T) {
 		st := testStore(t) // of no tool, in no directory
 		c := spread(t, st, func(int) (string, string) { return "", "" })
-		refusedWith(t, st, c, noTool, "no small set of tools or directories (some of no tool; some in no directory")
+		refusedWith(t, st, c, noTool, "no unit holds all its events (some of no tool; some in no directory")
 	})
 	t.Run("a shared tool", func(t *testing.T) {
 		st := testStore(t)

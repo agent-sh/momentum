@@ -200,9 +200,11 @@ type Guard struct {
 	Gap      time.Duration `json:"gap"` // a longer quiet stretch between two events starts a new incident: measure.GuardGap
 	// Units are the plan's, kept here: the plan's own are left empty in its JSON (Plan.MarshalJSON).
 	Units string `json:"units,omitempty"`
-	// Tools and Cwds narrow its exposure to the hours in which the problem's unit was in use: the signal's tool, else
-	// the set of tools its history's events used, else the set of directories they ran in (guardUnit). Its JSON keeps a
-	// set of one as tool or cwd, as the builds before sets wrote and read it (Guard.MarshalJSON).
+	// Tools and Cwds narrow its exposure to the hours in which the problem's unit was in use: of the units that hold
+	// every event of its history, the one with the least exposure there (guardCandidates), named by Unit: a tool, a set
+	// of tools, a directory, or a tool or set of tools within it (both apply). Its JSON keeps one tool or directory as
+	// tool or cwd, as the builds before sets wrote and read it (Guard.MarshalJSON).
+	Unit      string   `json:"unit,omitempty"`
 	Tools     []string `json:"-"`
 	Cwds      []string `json:"-"`
 	Incidents int      `json:"incidents"` // in the history
