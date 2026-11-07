@@ -718,10 +718,10 @@ func TestARejectedFirstBuildNeedsAnotherFileChange(t *testing.T) {
 	}
 }
 
-// An installed file written in the second its checkout moved between a commit with the change and one without it is
-// not ordered against the move by the reflog, which dates the move to the second while the file's time is finer. The
-// change's own files order them at the file's resolution, since a move writes each that the commit it moves to has
-// and the other has not as it has it: a move that only deletes them, or rewrites a link, is no exception.
+// HEAD's reflog dates a move to the whole second, after git writes the tree, and an installed file's time is finer: a
+// move dated in the file's second or the next cannot be ordered against it. When it moved between a commit with the
+// change and one without it, the file is out of effect with that reason, kept while it stands, until an install in a
+// later second. A move that leaves every commit holding the change, or a build a clear second away, is decided as before.
 func TestAnInstalledFileWrittenInTheSecondItsCheckoutMoved(t *testing.T) {
 	ms := time.Millisecond
 	aBefore := func(t *testing.T, repo string) { write(t, filepath.Join(repo, "a.txt"), "a, before the change\n") }
@@ -734,47 +734,52 @@ func TestAnInstalledFileWrittenInTheSecondItsCheckoutMoved(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	a := []string{"a.txt"}
 	for _, tc := range []struct {
 		name            string
 		changed         []string                        // the change's own files
 		change, without func(t *testing.T, repo string) // the landed commit's edits on the case's, and the tree without the change's
+		first           bool                            // no run saw the checkout hold the change before (no CheckoutAt)
 		moves           func(s *sameSecond)             // the checkout's moves from the commit without the change, and their files' times
-		built           time.Duration                   // the installed file's time, into the moves' second
+		built           time.Duration                   // the installed file's time, into the second
 		why             string                          // a part of the reason it is out of effect; empty when in effect
+		again           time.Duration                   // an install after it, into the second, which is in effect; 0 for none
 	}{
-		{name: "built before a move onto the change", changed: []string{"a.txt"}, without: aBefore,
-			moves: func(s *sameSecond) { s.move(s.landed, 0); s.date("a.txt", 600*ms) }, built: 300 * ms, why: "a file of the change was modified after it"},
-		{name: "built after a move onto the change", changed: []string{"a.txt"}, without: aBefore,
-			moves: func(s *sameSecond) { s.move(s.landed, 0); s.date("a.txt", 300*ms) }, built: 600 * ms},
-		{name: "built before a move off the change that writes no file", changed: []string{"a.txt"},
-			moves: func(s *sameSecond) { s.move(s.landed, -59*time.Minute); s.move(s.without, 0) }, built: 300 * ms},
-		{name: "built after a move off the change", changed: []string{"a.txt"}, without: aBefore,
-			moves: func(s *sameSecond) { s.move(s.landed, -59*time.Minute); s.move(s.without, 0); s.date("a.txt", 300*ms) }, built: 600 * ms,
-			why: "the change's own files do not match it"},
-		{name: "built in that second by a change that names no file",
-			moves: func(s *sameSecond) { s.move(s.landed, -59*time.Minute); s.move(s.without, 0) }, built: 300 * ms, why: "no file of the change is there"},
-		{name: "built before a move onto the change that only deletes its file", changed: []string{"a.txt", "d.txt"},
-			without: func(t *testing.T, repo string) { write(t, filepath.Join(repo, "d.txt"), "d\n") },
-			moves:   func(s *sameSecond) { s.move(s.landed, 0) }, built: 300 * ms, why: "the move wrote no file of the change to order it by"},
-		{name: "built before a move onto the change that rewrites its link", changed: []string{"l"},
+		{name: "built in the second of a move onto the change", changed: a, without: aBefore,
+			moves: func(s *sameSecond) { s.move(s.landed, 0); s.date("a.txt", 200*ms) }, built: 600 * ms, why: movedInItsSecond, again: 5 * time.Second},
+		{name: "built in the second of a move off the change", changed: a, without: aBefore,
+			moves: func(s *sameSecond) { s.move(s.landed, -59*time.Minute); s.move(s.without, 0) }, built: 300 * ms, why: movedInItsSecond},
+		{name: "built in the second of several moves", changed: a, without: aBefore,
+			moves: func(s *sameSecond) {
+				s.move(s.landed, -59*time.Minute)
+				s.move(s.without, 0)
+				s.move(s.landed, 0)
+				s.date("a.txt", 700*ms)
+			}, built: 900 * ms, why: movedInItsSecond},
+		{name: "built in the second before a move off the change", changed: a, without: aBefore,
+			moves: func(s *sameSecond) { s.move(s.landed, -59*time.Minute); s.move(s.without, time.Second) }, built: 900 * ms, why: movedInItsSecond},
+		{name: "built in the second before a move onto the change", changed: a, without: aBefore,
+			moves: func(s *sameSecond) { s.move(s.landed, time.Second); s.date("a.txt", time.Second) }, built: 900 * ms, why: movedInItsSecond},
+		{name: "built in the second of a move onto the change, at its first sighting", changed: a, without: aBefore, first: true,
+			moves: func(s *sameSecond) { s.move(s.landed, 0); s.date("a.txt", 200*ms) }, built: 600 * ms, why: movedInItsSecond, again: 5 * time.Second},
+		{name: "built in the second of a commit on the change", changed: a, without: aBefore,
+			moves: func(s *sameSecond) { s.move(s.landed, -59*time.Minute); s.commit(0) }, built: 300 * ms},
+		{name: "built a second after a move onto the change", changed: a, without: aBefore,
+			moves: func(s *sameSecond) { s.move(s.landed, 0); s.date("a.txt", 200*ms) }, built: 2300 * ms},
+		{name: "built a second after a move onto the change, at its first sighting", changed: a, without: aBefore, first: true,
+			moves: func(s *sameSecond) { s.move(s.landed, 0); s.date("a.txt", 200*ms) }, built: 2300 * ms},
+		{name: "built a second before a move onto the change", changed: a, without: aBefore,
+			moves: func(s *sameSecond) { s.move(s.landed, 2*time.Second); s.date("a.txt", 2*time.Second) }, built: 300 * ms,
+			why: "the checkout the installed file was built from did not hold"},
+		{name: "built before its link of the change was written, at its first sighting", changed: []string{"l"}, first: true,
 			change: func(t *testing.T, repo string) {
 				write(t, filepath.Join(repo, "b.txt"), "b\n")
 				link(t, repo, "a.txt")
 			},
 			without: func(t *testing.T, repo string) { link(t, repo, "b.txt") },
-			// the move writes the link now, after the build; its target keeps an older time
-			moves: func(s *sameSecond) { s.move(s.landed, 0) }, built: 300 * ms, why: "a file of the change was modified after it"},
-		{name: "built before the only move in that second, off the change, which writes its file", changed: []string{"a.txt"}, without: aBefore,
-			moves: func(s *sameSecond) { s.move(s.landed, -59*time.Minute); s.move(s.without, 0); s.date("a.txt", 600*ms) }, built: 300 * ms},
-		{name: "built between several moves in that second, the last off the change", changed: []string{"a.txt"}, without: aBefore,
-			moves: func(s *sameSecond) {
-				s.move(s.landed, -59*time.Minute)
-				s.move(s.without, 0) // the build is from this tree
-				s.move(s.landed, 0)
-				s.move(s.without, 0)
-				s.date("a.txt", 700*ms)
-			}, built: 300 * ms, why: "a file of the change was modified after it"},
-		{name: "built after a move onto a change that turns a directory into a file", changed: []string{"a.txt", "x", "x/y"},
+			// the checkout writes the link now, after the build; its target keeps an older time
+			moves: func(s *sameSecond) { s.move(s.landed, -59*time.Minute) }, built: 300 * ms, why: "has not changed since the checkout held the change"},
+		{name: "built from a change that turns a directory into a file, at its first sighting", changed: []string{"a.txt", "x", "x/y"}, first: true,
 			change: func(t *testing.T, repo string) { write(t, filepath.Join(repo, "x"), "x is a file\n") },
 			without: func(t *testing.T, repo string) {
 				aBefore(t, repo)
@@ -783,27 +788,35 @@ func TestAnInstalledFileWrittenInTheSecondItsCheckoutMoved(t *testing.T) {
 				}
 				write(t, filepath.Join(repo, "x", "y"), "y\n")
 			},
-			moves: func(s *sameSecond) { s.move(s.landed, 0); s.date("a.txt", 200*ms); s.date("x", 200*ms) }, built: 500 * ms},
-		{name: "built before a move onto the change, with the move before it dated later by a clock stepped back", changed: []string{"a.txt"}, without: aBefore,
 			moves: func(s *sameSecond) {
 				s.move(s.landed, -59*time.Minute)
-				s.move(s.without, 2*time.Second) // the clock then steps back
-				s.move(s.landed, 0)
-				s.date("a.txt", 600*ms)
-			}, built: 300 * ms, why: "a file of the change was modified after it"},
+				s.date("a.txt", -30*time.Minute)
+				s.date("x", -30*time.Minute)
+			}, built: 300 * ms},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newSameSecond(t, tc.changed, tc.change, tc.without)
+			if tc.first {
+				s.p.CheckoutAt = time.Time{}
+			}
 			tc.moves(s)
-			why := s.judge(tc.built)
+			why := s.install(tc.built)
 			if (why == "") != (tc.why == "") || !strings.Contains(why, tc.why) {
 				t.Fatalf("in effect %v, want %v: %q", why == "", tc.why == "", why)
+			}
+			if again := s.judge(); again != why {
+				t.Fatalf("the next run, with the file unchanged: %q, want %q", again, why)
+			}
+			if tc.again != 0 {
+				if why := s.install(tc.again); why != "" {
+					t.Fatalf("an install in a later second: %q", why)
+				}
 			}
 		})
 	}
 }
 
-// sameSecond is a measured case whose checkout moves within one second of the test's clock (second), an hour after
+// sameSecond is a measured case whose checkout moves around one second of the test's clock (second), an hour after
 // its base. The landed commit holds the change, with the case's edits on the measured case's commit; without is a root
 // commit that does not, made at base from the landed tree with the case's edits, and the checkout is on it. Every
 // regular file of the work tree is dated base.
@@ -866,10 +879,22 @@ func (s *sameSecond) date(name string, at time.Duration) {
 	dated(s.t, filepath.Join(s.m.repo, name), s.second.Add(at))
 }
 
-// judge installs a build dated at an offset into the second and says why it is out of effect, or nothing.
-func (s *sameSecond) judge(built time.Duration) string {
+// commit commits on the checkout's HEAD, its reflog entry dated at an offset into the second.
+func (s *sameSecond) commit(at time.Duration) {
 	s.t.Helper()
-	writeDated(s.t, s.p.Plan.Installed, "a build", s.second.Add(built))
+	datedGitIn(s.t, s.m.repo, s.second.Add(at), "commit", "-q", "--allow-empty", "-m", "more work on the change")
+}
+
+// install installs a build dated at an offset into the second and says why it is out of effect, or nothing.
+func (s *sameSecond) install(built time.Duration) string {
+	s.t.Helper()
+	writeDated(s.t, s.p.Plan.Installed, fmt.Sprintf("a build at %v", built), s.second.Add(built))
+	return s.judge()
+}
+
+// judge says why the installed file is out of effect, or nothing.
+func (s *sameSecond) judge() string {
+	s.t.Helper()
 	_, why, err := s.m.r.Ship.InEffect(context.Background(), &s.p)
 	if err != nil {
 		s.t.Fatal(err)
