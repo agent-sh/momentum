@@ -56,7 +56,8 @@ func TestTheGuardsArithmeticIsSPECs(t *testing.T) {
 		GuardNotWatched(Guarded(4, 684, 0, 0, "session hours").Effect) != GuardUnused {
 		t.Fatalf("a watch out of effect through its use: %+v", r)
 	}
-	if r := GuardedLeftOut(4, 684, "session hours"); !r.Unwatched || strings.Contains(r.Effect, "P=") || GuardNotWatched(r.Effect) != GuardLeftOut {
+	if r := GuardedLeftOut(4, 684, "session hours"); !r.Unwatched || strings.Contains(r.Effect, "P=") || GuardNotWatched(r.Effect) != GuardLeftOut ||
+		!strings.Contains(r.Effect, "guarded, not watched: its unit was used only in sources left out at the watch's end, in the 30 days after the change") {
 		t.Fatalf("a watch whose unit was used only in sources left out: %+v", r)
 	}
 	if r := Guarded(4, 684, 1, 900, "session hours"); r.Improved || !strings.Contains(r.Effect, "came back") {

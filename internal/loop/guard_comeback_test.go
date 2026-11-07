@@ -142,8 +142,9 @@ func TestTheLoopsOwnEvidenceIsLeftOutOfAPlansAdmission(t *testing.T) {
 // An ingest source of a guard's plan that has not read at all since its watch's end, other than the signal's own, is
 // left out a window (the plan's) after the end, as a stopped command source is: a reader that no longer runs does not
 // hold the close for good. Within the window the watch waits for it; past it the watch closes, and with the tool's use
-// all in the source left out, it says that it watched nothing for that reason. The signal's own source with no read
-// since the end holds the close past the window, and a week past the end its problem note says so.
+// all in the source left out, it says that it watched nothing for that reason, as it does when that source was
+// switched off before the close. The signal's own source with no read since the end holds the close past the window,
+// and a week past the end its problem note says so.
 func TestAGuardLeavesOutAnIngestSourceWithNoReadAWindowAfterItsEnd(t *testing.T) {
 	watch := func(t *testing.T) (*measured, time.Time) {
 		t.Helper()
@@ -172,6 +173,16 @@ func TestAGuardLeavesOutAnIngestSourceWithNoReadAWindowAfterItsEnd(t *testing.T)
 		}
 		if c := m.theCase(t); !strings.Contains(evidenceview.StatusLine(c), measure.GuardLeftOut) {
 			t.Fatalf("its status: %q", evidenceview.StatusLine(c))
+		}
+	})
+	t.Run("another ingest source switched off", func(t *testing.T) {
+		m, end := watch(t)
+		m.r.Ship.SourceLive = func(source string) bool { return source != "zz-use" }
+		m.clock = end.Add(2 * time.Hour)
+		markAll(t, m, toolSignal.Source)
+		// switched off, it is left out before the close looks for its sources: its use is still the unit's
+		if got := m.measure(t, Options{}); got.Status != "guarded" || got.Result == nil || got.Result.Watched != 0 || !strings.Contains(got.Result.Effect, measure.GuardLeftOut) {
+			t.Fatalf("its use all in a source switched off: %+v %+v", got, got.Result)
 		}
 	})
 	t.Run("the signal's own source", func(t *testing.T) {
@@ -217,7 +228,7 @@ func TestAGuardsStretchOutOfEffectStartsAtTheLastPassThatSawItInEffect(t *testin
 // A source a guard leaves out at its watch's end counts in neither the history's recount nor the exposure watched, as
 // a stopped source counts on neither side of a measured plan: with the tool used as often in another ingest source,
 // which stops reading on day ten, the close a window past the end counts the 684 hours of history and the 125 watched
-// of the signal's source alone, not the other source's 672 and 125 beside them.
+// of the signal's source alone, not the other source's 672 and 125 beside them, and the case's log names it once.
 func TestASourceAGuardLeavesOutAtItsEndCountsInNeitherItsHistoryNorItsWatch(t *testing.T) {
 	ctx := context.Background()
 	m := guarded(t, time.Hour, toolSignal.Source, func(st *store.Store, planAt, useUntil time.Time) store.Case {
@@ -256,5 +267,18 @@ func TestASourceAGuardLeavesOutAtItsEndCountsInNeitherItsHistoryNorItsWatch(t *t
 	}
 	if c := m.theCase(t); c.Measurement.Exposure != 684 || c.Measurement.Watched != 125 {
 		t.Fatalf("the case's guard columns: %+v", c.Measurement)
+	}
+	log, err := m.st.CaseLog(ctx, m.c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	named := 0
+	for _, l := range log {
+		if l.Action == "measurement sources" && strings.Contains(l.Detail, "zz-more") {
+			named++
+		}
+	}
+	if named != 1 {
+		t.Fatalf("the case's log names the source left out %d times: %+v", named, log)
 	}
 }

@@ -186,7 +186,7 @@ func GuardCount(incidents []Incident, units []int64, since time.Time, gap time.D
 const (
 	GuardUnused  = "not watched: the unit was not used in the 30 days"
 	GuardAway    = "not watched: the change was out of effect while its unit was used in the 30 days"
-	GuardLeftOut = "not watched: its unit was used in the 30 days only in sources left out at the watch's end"
+	GuardLeftOut = "not watched: its unit was used only in sources left out at the watch's end, in the 30 days"
 )
 
 // GuardedAway is Guarded for a watch whose unit was used only while its change was out of effect: it watched nothing,

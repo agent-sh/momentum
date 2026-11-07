@@ -517,8 +517,12 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 	}
 	// every source it keeps has read past the watch's end, and so past its start (the signal's own perhaps only in
 	// part): its history is counted through the start, and its exposure watched, over those sources alone
-	all := plan
+	recorded, err := r.recordedSources(ctx, *p.Plan)
+	if err != nil {
+		return failed(err)
+	}
 	plan = guardCounted(plan, out)
+	dropped := slices.DeleteFunc(slices.Clone(recorded), func(source string) bool { return slices.Contains(plan.Sources, source) })
 	counted, err := r.guardRecount(ctx, plan, from)
 	if err != nil {
 		return failed(err)
@@ -538,10 +542,14 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 			res = measure.GuardedAway(g.Incidents, g.Exposure, plan.Units)
 		}
 	}
-	if res.Unwatched && measure.GuardNotWatched(res.Effect) == measure.GuardUnused && len(plan.Sources) < len(all.Sources) {
+	if res.Unwatched && measure.GuardNotWatched(res.Effect) == measure.GuardUnused && len(dropped) > 0 {
+		// every recorded source, the ones switched off or stopped before the close (countingPlan) as well as the ones it
+		// left out: was the unit used only in those?
+		all := plan
+		all.Sources = recorded
 		if used, err := guardExposure(ctx, r.Store, all, nil, from, end, r.Dir); err != nil {
 			return failed(err)
-		} else if len(used) > 0 { // used, but only in the sources left out
+		} else if len(used) > 0 {
 			res = measure.GuardedLeftOut(g.Incidents, g.Exposure, plan.Units)
 		}
 	}
@@ -570,6 +578,14 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 	}
 	if _, err := r.Store.CloseGuarded(ctx, c.ID, g.Incidents, g.Exposure, len(watched), res.Recur, res.Effect, "loop:measure"); err != nil {
 		return failed(err)
+	}
+	// the sources the close left out of its counts, which no record names otherwise (a source switched off or stopped
+	// is named by countingPlan's note): after the close, so a close that failed and is tried again names them once
+	if left := slices.DeleteFunc(slices.Clone(out), func(source string) bool { return source == plan.Signal.Source }); len(left) > 0 {
+		if err := r.Store.CaseNote(ctx, c.ID, "measurement sources", "sources left out of the guard's history and exposure watched at its watch's end, read in part or not at all since it: "+
+			strings.Join(left, ", "), "loop:measure"); err != nil {
+			r.logf("note on %s: %v", c.ID, err)
+		}
 	}
 	kept, err := r.Ship.keepLocked(c.ID, res)
 	if err != nil {

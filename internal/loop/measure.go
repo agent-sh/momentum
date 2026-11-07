@@ -919,6 +919,15 @@ func tallyPlan(ctx context.Context, st *store.Store, plan Plan, since, until tim
 	return tallySources(ctx, st, plan.Signal, plan.Units, evs, since, until, dir, plan.Sources)
 }
 
+// recordedSources are the sources a plan recorded, or, for a package counted before sources were recorded, every
+// source with an event in its four windows, the loop's own left out.
+func (r *Runner) recordedSources(ctx context.Context, plan Plan) ([]string, error) {
+	if len(plan.Sources) > 0 {
+		return plan.Sources, nil
+	}
+	return r.Store.Sources(ctx, plan.Signal.Source, store.ActivityQuery{Since: plan.At.Add(-4 * plan.Window), Until: plan.At, ExcludeCwd: r.Dir})
+}
+
 // countingPlan recounts the original baseline when a recorded reader stopped. Its sources stay recorded. A guard has
 // no baseline to recount: its watch counts its history again, over the live sources, when it ends (guardCase), and
 // nothing here waits for a read of it.
@@ -927,13 +936,9 @@ func (r *Runner) countingPlan(ctx context.Context, p *Package, dry bool) (Plan, 
 	if p.Result != nil {
 		plan.Before, plan.BeforeBase = p.Result.Before.Hits, p.Result.Before.Base
 	}
-	sources := plan.Sources
-	if len(sources) == 0 { // packages counted before sources were recorded
-		var err error
-		sources, err = r.Store.Sources(ctx, plan.Signal.Source, store.ActivityQuery{Since: plan.At.Add(-4 * plan.Window), Until: plan.At, ExcludeCwd: r.Dir})
-		if err != nil {
-			return plan, "", err
-		}
+	sources, err := r.recordedSources(ctx, plan)
+	if err != nil {
+		return plan, "", err
 	}
 	live, omitted := r.Ship.liveSources(ctx, sources, plan.Window, r.now(), planHarness(plan))
 	plan.Sources = live
