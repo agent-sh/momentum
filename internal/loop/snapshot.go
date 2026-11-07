@@ -98,7 +98,8 @@ type SnapshotOptions struct {
 	Mirrors     string
 	GH          string
 	Cache       *ScrubCache
-	Since       time.Time // the log's window starts here
+	Since       time.Time                        // the log's window starts here
+	Logf        func(format string, args ...any) // the pass's log, for what fails on the side (a mirror's repack)
 }
 
 // SnapshotRepos makes the scrubbed snapshot of each distinct source for /ro/repos/NAME and its log for
@@ -170,6 +171,9 @@ func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) 
 			continue
 		}
 		tip, mirror, err := sourceTip(ctx, source, o.Mirrors, o.GH)
+		if tip.repack != "" && o.Logf != nil {
+			o.Logf("repository %s: %s", name, tip.repack)
+		}
 		if mirror != "" {
 			used[mirror] = true
 		} else {

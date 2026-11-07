@@ -171,7 +171,7 @@ func (r *Runner) buildInputs(ctx context.Context, p *passInputs) error {
 				gh = r.Ship.GH
 			}
 			m, err := SnapshotRepos(sctx, SnapshotOptions{Sources: r.Inputs.ReadDirs, Destination: reposDst, LogDir: filepath.Join(logs, "repos"),
-				LoopDirs: []string{r.Dir}, Mirrors: filepath.Join(r.Dir, "mirrors"), GH: gh, Cache: p.cache, Since: p.since})
+				LoopDirs: []string{r.Dir}, Mirrors: filepath.Join(r.Dir, "mirrors"), GH: gh, Cache: p.cache, Since: p.since, Logf: r.logf})
 			p.manifest.Repositories = m
 			if err != nil {
 				fail(err)

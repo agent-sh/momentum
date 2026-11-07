@@ -123,8 +123,8 @@ func TestFetchInAnotherProcess(t *testing.T) {
 }
 
 // A pass's fetch whose process group outlives the pass (killed outright, its loop lock gone with it) still writes the
-// mirror: the next pass neither removes its files nor fetches beside it. Once the group ends, a pass removes what it
-// left and fetches.
+// mirror: the next pass neither removes its files nor fetches beside it. Once the group has held the mirror's lock
+// longer than any call of a live pass lasts, a pass ends the group, removes what it left and fetches.
 func TestAFetchThatOutlivesItsPassKeepsItsFiles(t *testing.T) {
 	files := map[string]string{"noise.txt": randomText(t, 4<<20)}
 	for i := range 150 { // more objects than a fetch unpacks loose: index-pack writes a temporary pack
@@ -185,14 +185,17 @@ if [ "$n" = 2 ]; then echo $$ > '`+pidFile+`'; sh -c "$last" | { head -c 65536; 
 	if _, err := os.Stat(live[0]); err != nil {
 		t.Fatalf("a pass pruned the mirror of a live fetch: %v", err)
 	}
-	// the group ends: a pass removes what it left and fetches
-	_ = syscall.Kill(-group, syscall.SIGKILL)
-	if !comesTrue(10*time.Second, func() bool { return errors.Is(syscall.Kill(-group, 0), syscall.ESRCH) }) {
-		t.Fatal("the fetch's process group did not end")
-	}
+	// once the group has held the lock longer than a live pass's call lasts, a pass ends it, takes the lock, removes
+	// what it left and fetches
+	was := orphanAfter
+	t.Cleanup(func() { orphanAfter = was })
+	orphanAfter = 0
 	tip, why := fetchTip(context.Background(), f.main, mirror, url, "")
 	if why != "" || tip.commit != originHead(t, f, "main") || len(tmpPacks()) != 0 {
-		t.Fatalf("the pass after the group ended did not clear and fetch: %q %+v %v", why, tip, tmpPacks())
+		t.Fatalf("the pass did not take the lock from the orphaned fetch, clear and fetch: %q %+v %v", why, tip, tmpPacks())
+	}
+	if !comesTrue(10*time.Second, func() bool { return errors.Is(syscall.Kill(-group, 0), syscall.ESRCH) }) {
+		t.Fatal("the orphaned fetch's process group outlived the pass that took its lock")
 	}
 }
 

@@ -1,6 +1,7 @@
 package loop
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -63,9 +65,12 @@ const remoteSSH = "ssh -o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInter
 // remotePins are the transfer limits of every Git call of the host's that reaches a remote: remoteSSH, and an https
 // transfer that moves under 1 byte a second for 60 seconds ends. The limit is 1, not more: a quiet fetch (--quiet)
 // gets no progress while the server counts and compresses objects, only its keepalive, about 1 byte a second, and a
-// higher limit would end such a healthy transfer of a large repository.
-func remotePins() []string {
-	return []string{"-c", "core.sshCommand=" + remoteSSH, "-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=60"}
+// higher limit would end such a healthy transfer of a large repository. A mirror's first fetch has none (mirrorCall).
+func remotePins() []string { return transferPins(1) }
+
+// transferPins are remotePins with an https low-speed limit of lowSpeed bytes a second, or none at 0.
+func transferPins(lowSpeed int) []string {
+	return []string{"-c", "core.sshCommand=" + remoteSSH, "-c", "http.lowSpeedLimit=" + strconv.Itoa(lowSpeed), "-c", "http.lowSpeedTime=60"}
 }
 
 // githubURL is where a GitHub repository is fetched from: over https with the GitHub CLI's credentials, never over
@@ -90,10 +95,12 @@ type mirrorMeta struct {
 }
 
 // repoTip is where a snapshot reads a repository: the Git directory that holds its objects (origin's mirror, or the
-// checkout), the branch and its commit, and, when that is not origin's branch fetched now, which it is and why.
+// checkout), the branch and its commit, and, when that is not origin's branch fetched now, which it is and why. repack
+// is why the mirror's repack after the fetch failed, for the pass's log.
 type repoTip struct {
 	dir, branch, commit string
 	fallback            string
+	repack              string
 }
 
 // origin is the repository a checkout's origin names, by its identity (OWNER/REPO on GitHub, else url: and its URL),
@@ -262,7 +269,8 @@ func fetchTip(ctx context.Context, source, mirror, url, gh string) (repoTip, str
 	what, limit := fetchBudget(mirror)
 	fctx, cancel := withLimit(ctx, what, limit)
 	defer cancel()
-	branch, err := originBranch(fctx, mirror, url, gh, lock)
+	call := mirrorCall{mirror: mirror, gh: gh, lock: lock}
+	branch, err := originBranch(fctx, call, url)
 	if err != nil {
 		return repoTip{}, failure(err)
 	}
@@ -276,7 +284,9 @@ func fetchTip(ctx context.Context, source, mirror, url, gh string) (repoTip, str
 		return repoTip{}, "fetch refused: origin's default branch has no valid name"
 	}
 	ref := "refs/heads/" + branch
-	if _, err := fetchGit(fctx, mirror, gh, lock, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
+	fetch := call
+	fetch.first = what == "first fetch"
+	if _, err := fetchGit(fctx, fetch, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
 		url, "+"+ref+":"+ref); err != nil {
 		return repoTip{}, failure(err)
 	}
@@ -288,15 +298,29 @@ func fetchTip(ctx context.Context, source, mirror, url, gh string) (repoTip, str
 	if err := updateMirrorMeta(mirror, func(m *mirrorMeta) { m.Branch, m.Commit, m.Fetched = branch, commit, time.Now() }); err != nil {
 		return repoTip{}, failure(err)
 	}
-	packMirror(ctx, mirror, lock)
-	return repoTip{dir: mirror, branch: branch, commit: commit}, ""
+	tip := repoTip{dir: mirror, branch: branch, commit: commit}
+	if err := packMirror(ctx, mirror, lock); err != nil {
+		tip.repack = "the mirror's repack failed: " + reason(err)
+	}
+	return tip, ""
+}
+
+// mirrorCall is a remote Git call in a mirror: the mirror, the GitHub CLI for GitHub's credentials, the mirror's lock,
+// which the call inherits, and whether it is a first fetch. A first fetch has no low-speed limit: its 30 minutes bound
+// it (firstFetchLimit), and a large repository's quiet first fetch can stay under any rate while the server compresses.
+type mirrorCall struct {
+	mirror, gh string
+	lock       *os.File
+	first      bool
 }
 
 // openMirror takes the mirror's lock (lockMirror) and makes sure dir is a usable mirror (usableMirror), making it again
 // without a template (no hooks, no sample files) when it is not, removes what a fetch the system ended left behind
 // (clearStale), and records source among the checkouts that read it. It returns the lock, which the caller holds, and
-// passes to every Git call that writes the mirror, until its fetch ends. A mirror whose lock a fetch still holds is
-// neither cleared nor made again: errFetchRunning.
+// passes to every Git call that writes the mirror, until its fetch ends. A mirror is made again only when it is
+// definitely not one the host made: none yet, something else in its place, a link where its lock is, or a usable
+// check that came out no. A lock a fetch still holds (errFetchRunning), any other error and a pass told to stop leave
+// it as it is.
 func openMirror(ctx context.Context, dir, source string) (*os.File, error) {
 	mirrors := filepath.Dir(dir)
 	if err := os.MkdirAll(mirrors, 0o700); err != nil {
@@ -306,31 +330,48 @@ func openMirror(ctx context.Context, dir, source string) (*os.File, error) {
 		return nil, err
 	}
 	lock, err := lockMirror(dir)
-	if errors.Is(err, errFetchRunning) {
-		return nil, err
-	}
-	// a mirror whose lock cannot be taken (none yet, or a link where the lock is) is not one the host made
-	if err != nil || !usableMirror(ctx, dir) {
-		if lock != nil {
-			lock.Close()
+	switch {
+	case err == nil:
+		usable, err := usableMirror(ctx, dir)
+		if err == nil && usable {
+			err = clearStale(dir)
 		}
-		if lock, err = makeMirror(ctx, dir); err != nil {
-			return nil, err
+		if err != nil || usable {
+			if err == nil {
+				err = recordSource(dir, source)
+			}
+			if err != nil {
+				lock.Close()
+				return nil, err
+			}
+			return lock, nil
 		}
-	} else if err := clearStale(dir); err != nil {
 		lock.Close()
+	case errors.Is(err, fs.ErrNotExist), errors.Is(err, syscall.ENOTDIR), errors.Is(err, syscall.ELOOP):
+	default:
 		return nil, err
 	}
-	if err := updateMirrorMeta(dir, func(m *mirrorMeta) {
-		if !slices.Contains(m.Sources, source) {
-			m.Sources = append(m.Sources, source)
-			slices.Sort(m.Sources)
-		}
-	}); err != nil {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if lock, err = makeMirror(ctx, dir); err != nil {
+		return nil, err
+	}
+	if err := recordSource(dir, source); err != nil {
 		lock.Close()
 		return nil, err
 	}
 	return lock, nil
+}
+
+// recordSource records source among the checkouts that read the mirror.
+func recordSource(dir, source string) error {
+	return updateMirrorMeta(dir, func(m *mirrorMeta) {
+		if !slices.Contains(m.Sources, source) {
+			m.Sources = append(m.Sources, source)
+			slices.Sort(m.Sources)
+		}
+	})
 }
 
 // makeMirror makes dir again: a bare repository without a template, with the files ref format, whatever Git's default
@@ -363,18 +404,26 @@ func makeMirror(ctx context.Context, dir string) (*os.File, error) {
 // lockMirror takes the mirror's lock: a flock on mirrorLockFile, held on a descriptor every Git call that writes the
 // mirror inherits (fetchGit, mirrorGit). The lock lasts as long as any process holds that descriptor: a fetch's process
 // group that outlives the pass that started it (the loop's own lock goes with its process) still holds it, and git
-// never removes the file. errFetchRunning is a lock a fetch holds. A dir that is no directory has no lock to take.
+// never removes the file. A lock a group has held past orphanAfter is taken from it (takeOrphan); errFetchRunning is
+// one a fetch holds. A dir that is no directory has no lock to take (ENOTDIR), and neither has a link where the lock
+// is (ELOOP).
 func lockMirror(dir string) (*os.File, error) {
-	if info, err := os.Lstat(dir); err != nil {
+	info, err := os.Lstat(dir)
+	if err != nil {
 		return nil, err
-	} else if !info.IsDir() {
-		return nil, errors.New("the mirror is not a directory")
+	}
+	if !info.IsDir() {
+		return nil, &fs.PathError{Op: "lock", Path: dir, Err: syscall.ENOTDIR}
 	}
 	f, err := os.OpenFile(filepath.Join(dir, mirrorLockFile), os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if errors.Is(err, syscall.EWOULDBLOCK) && takeOrphan(f) {
+		err = nil
+	}
+	if err != nil {
 		f.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) {
 			return nil, errFetchRunning
@@ -382,6 +431,99 @@ func lockMirror(dir string) (*os.File, error) {
 		return nil, err
 	}
 	return f, nil
+}
+
+// orphanAfter is how long one Git call's process group may hold a mirror's lock before a pass takes the lock from it:
+// the longest a call of a live pass lasts (a first fetch, then SIGTERM and the wait for its output). A group that holds
+// it longer is one whose pass is gone (the loop's lock went with it), which nothing else ends. A test shortens it.
+var orphanAfter = firstFetchLimit + 2*gitWaitDelay
+
+// recordHolder writes into the mirror's lock file the process group of a Git call that inherited the lock: its number
+// and its leader's start time (procStat), for takeOrphan. A call that already ended leaves the record as it was.
+func recordHolder(lock *os.File, pid int) {
+	_, start, err := procStat(pid)
+	if err != nil {
+		return
+	}
+	if lock.Truncate(0) == nil {
+		_, _ = lock.WriteAt([]byte(fmt.Sprintf("%d %d\n", pid, start)), 0)
+	}
+}
+
+// takeOrphan ends the process group the lock's record names and takes the lock, when that group has held it past
+// orphanAfter. The record's leader must still run, lead its group and have the start time the record gives, so a
+// number another process took since is never signalled; a group whose leader is gone is left alone. The group gets
+// SIGTERM, then SIGKILL after gitWaitDelay, as a deadline ends a call (endWithContext). It says whether f holds the
+// lock now.
+func takeOrphan(f *os.File) bool {
+	raw := make([]byte, 64)
+	n, _ := f.ReadAt(raw, 0)
+	var pgid int
+	var start uint64
+	if _, err := fmt.Sscanf(string(raw[:n]), "%d %d", &pgid, &start); err != nil || pgid <= 1 {
+		return false
+	}
+	group, started, err := procStat(pgid)
+	if err != nil || group != pgid || started != start {
+		return false
+	}
+	if age, err := procAge(started); err != nil || age <= orphanAfter {
+		return false
+	}
+	for _, sig := range []syscall.Signal{syscall.SIGTERM, syscall.SIGKILL} {
+		if err := syscall.Kill(-pgid, sig); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return false
+		}
+		for end := time.Now().Add(gitWaitDelay); time.Now().Before(end); time.Sleep(50 * time.Millisecond) {
+			if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// procStat is a process's group and its start time, in clock ticks after boot: fields 5 and 22 of /proc/PID/stat,
+// counted after the command's name, which can hold spaces and parentheses.
+func procStat(pid int) (int, uint64, error) {
+	raw, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return 0, 0, err
+	}
+	i := bytes.LastIndexByte(raw, ')')
+	if i < 0 {
+		return 0, 0, errors.New("unreadable process status")
+	}
+	fields := strings.Fields(string(raw[i+1:])) // from field 3
+	if len(fields) < 20 {
+		return 0, 0, errors.New("unreadable process status")
+	}
+	group, err := strconv.Atoi(fields[2])
+	if err != nil {
+		return 0, 0, err
+	}
+	start, err := strconv.ParseUint(fields[19], 10, 64)
+	return group, start, err
+}
+
+// userHZ is the clock tick /proc counts in (USER_HZ): 100 on Linux, whatever the kernel's own rate.
+const userHZ = 100
+
+// procAge is how long ago a process that started at start (procStat) did, by the system's uptime.
+func procAge(start uint64) (time.Duration, error) {
+	raw, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return 0, err
+	}
+	fields := strings.Fields(string(raw))
+	if len(fields) == 0 {
+		return 0, errors.New("unreadable uptime")
+	}
+	up, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration((up - float64(start)/userHZ) * float64(time.Second)), nil
 }
 
 // fetchRuns says whether a fetch holds the mirror's lock, without making the lock.
@@ -394,10 +536,11 @@ func fetchRuns(dir string) bool {
 	return errors.Is(syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB), syscall.EWOULDBLOCK)
 }
 
-// clearStale removes the lock files and temporary packs a fetch leaves when it is killed before it can remove them
-// itself (SIGTERM lets git remove its lock files, never index-pack's temporary pack). It runs only under the mirror's
-// lock (openMirror), so no fetch that could still write them runs: not this pass's (the loop runs one pass at a time),
-// and not one an earlier pass started whose process group outlived it.
+// clearStale removes the lock files and temporary files a fetch or a repack leaves when it is killed before it can
+// remove them itself (SIGTERM lets git remove its lock files, never index-pack's temporary pack, a loose object half
+// written or a repack's new pack). It runs only under the mirror's lock (openMirror), so no call that could still
+// write them runs: not this pass's (the loop runs one pass at a time), and not one an earlier pass started whose
+// process group outlived it.
 func clearStale(dir string) error {
 	var stale []string
 	for _, name := range []string{"HEAD.lock", "config.lock", "packed-refs.lock", "shallow.lock", "FETCH_HEAD.lock"} {
@@ -414,11 +557,15 @@ func clearStale(dir string) error {
 	}); err != nil {
 		return err
 	}
-	packs, err := filepath.Glob(filepath.Join(dir, "objects", "pack", "tmp_*"))
-	if err != nil {
-		return err
+	// index-pack's temporary pack, a repack's new pack before its rename, a loose object before its rename
+	for _, pattern := range []string{filepath.Join("pack", "tmp_*"), filepath.Join("pack", ".tmp-*"), filepath.Join("[0-9a-f][0-9a-f]", "tmp_obj_*")} {
+		found, err := filepath.Glob(filepath.Join(dir, "objects", pattern))
+		if err != nil {
+			return err
+		}
+		stale = append(stale, found...)
 	}
-	for _, p := range append(stale, packs...) {
+	for _, p := range stale {
 		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
@@ -428,27 +575,63 @@ func clearStale(dir string) error {
 
 // usableMirror says whether dir is a mirror as the host makes it: a bare repository with the files ref format that is
 // not shallow, of plain files and directories, whose configuration names no program, rewrite or include
-// (CheckGitConfigWith, on its own file).
-func usableMirror(ctx context.Context, dir string) bool {
-	if info, err := os.Lstat(dir); err != nil || !info.IsDir() {
-		return false
+// (CheckGitConfigWith, on its own file). An error is a check that could not come out: a pass told to stop, a read
+// that failed, a Git call that did not end by itself.
+func usableMirror(ctx context.Context, dir string) (bool, error) {
+	info, err := os.Lstat(dir)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return false, nil
+	case err != nil:
+		return false, err
+	case !info.IsDir():
+		return false, nil
 	}
-	if _, err := os.Lstat(filepath.Join(dir, "shallow")); !errors.Is(err, fs.ErrNotExist) {
-		return false
+	if _, err := os.Lstat(filepath.Join(dir, "shallow")); err == nil {
+		return false, nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return false, err
 	}
-	if filepath.WalkDir(dir, func(_ string, e fs.DirEntry, err error) error {
+	plain := true
+	if err := filepath.WalkDir(dir, func(_ string, e fs.DirEntry, err error) error {
 		if err == nil && !e.IsDir() && !e.Type().IsRegular() {
-			err = errors.New("not a plain file")
+			plain = false
+			return fs.SkipAll
 		}
 		return err
-	}) != nil {
-		return false
+	}); err != nil {
+		return false, err
+	}
+	if !plain {
+		return false, nil
 	}
 	out, err := hostInputGit(ctx, "", "--git-dir="+dir, "rev-parse", "--is-bare-repository", "--show-ref-format")
-	if err != nil || strings.TrimSpace(string(out)) != "true\nfiles" {
-		return false
+	switch {
+	case ctx.Err() != nil:
+		return false, ctx.Err()
+	case gitSaidNo(err):
+		return false, nil // git read it and found no repository it can use
+	case err != nil:
+		return false, err
+	case strings.TrimSpace(string(out)) != "true\nfiles":
+		return false, nil
 	}
-	return CheckGitConfigWith(func(args ...string) ([]byte, error) { return mirrorConfig(ctx, dir, args...) }) == nil
+	err = CheckGitConfigWith(func(args ...string) ([]byte, error) { return mirrorConfig(ctx, dir, args...) })
+	switch {
+	case ctx.Err() != nil:
+		return false, ctx.Err()
+	case err == nil:
+		return true, nil
+	case errors.Is(err, ErrRefused) || gitSaidNo(err):
+		return false, nil // a setting the host never makes, or a configuration git cannot read
+	}
+	return false, err
+}
+
+// gitSaidNo says whether a Git call failed by exiting with an error of its own, not by a signal or before it ran.
+func gitSaidNo(err error) bool {
+	var exit *exec.ExitError
+	return errors.As(err, &exit) && exit.Exited()
 }
 
 // mirrorPackLimit and mirrorLooseLimit are the counts of packs and of loose objects past which a mirror is repacked
@@ -460,6 +643,12 @@ const (
 	mirrorPackLimit  = 50
 	mirrorLooseLimit = 6700
 )
+
+// repackLimit bounds each of a mirror's repack and prune. A repack copies every object once, reusing its delta, so it
+// costs about the mirror's size in disk reads and writes: 10 minutes moves the 1 GiB a first fetch is sized for
+// (firstFetchLimit) at under 2 MiB/s each way, far below any disk's rate. It stays under orphanAfter, so a pass never
+// takes the lock from a live repack.
+const repackLimit = 10 * time.Minute
 
 var looseObject = regexp.MustCompile(`^[0-9a-f]{38}([0-9a-f]{24})?$`)
 
@@ -489,21 +678,22 @@ func mirrorObjects(mirror string) (packs, loose int) {
 // that was pushed over) are pruned at once, so they do not keep the mirror past its limit. Git's own prune waits two
 // weeks for an object a concurrent writer may still be about to name; here none writes: it runs after a complete
 // fetch, under the pass's lock and the mirror's, which every call holds. A repack that fails leaves the mirror as it
-// was, and the next pass tries again.
-func packMirror(ctx context.Context, mirror string, lock *os.File) {
+// was, says why, and the next pass tries again.
+func packMirror(ctx context.Context, mirror string, lock *os.File) error {
 	if packs, loose := mirrorObjects(mirror); packs <= mirrorPackLimit && loose <= mirrorLooseLimit {
-		return
+		return nil
 	}
 	// the mirror serves no fetch, so a bitmap would only cost the repack time
 	if _, err := mirrorGit(ctx, mirror, lock, "-c", "repack.writeBitmaps=false", "repack", "-a", "-d", "-l", "-q"); err != nil {
-		return
+		return err
 	}
-	_, _ = mirrorGit(ctx, mirror, lock, "prune", "--expire=now")
+	_, err := mirrorGit(ctx, mirror, lock, "prune", "--expire=now")
+	return err
 }
 
-// mirrorGit runs a local Git call that writes the mirror, as hostInputGit does, holding the mirror's lock.
+// mirrorGit runs a mirror's repack or prune, as hostInputGit does, within repackLimit, holding the mirror's lock.
 func mirrorGit(ctx context.Context, mirror string, lock *os.File, args ...string) ([]byte, error) {
-	out, _, err := hostInputGitFiles(ctx, "", ScrubBatchBytes, []*os.File{lock}, append([]string{"--git-dir=" + mirror}, args...)...)
+	out, _, err := hostInputGitHolding(ctx, "", ScrubBatchBytes, repackLimit, lock, append([]string{"--git-dir=" + mirror}, args...)...)
 	return out, err
 }
 
@@ -526,7 +716,10 @@ func mirrorConfig(ctx context.Context, dir string, args ...string) ([]byte, erro
 // may have moved the branch's ref, never the record. A mirror is never read through a link in the path to the mirrors,
 // which would make it some other directory's.
 func lastFetch(ctx context.Context, mirror string) (repoTip, time.Time, bool) {
-	if noInputLinks(filepath.Dir(mirror)) != nil || !usableMirror(ctx, mirror) {
+	if noInputLinks(filepath.Dir(mirror)) != nil {
+		return repoTip{}, time.Time{}, false
+	}
+	if usable, err := usableMirror(ctx, mirror); err != nil || !usable {
 		return repoTip{}, time.Time{}, false
 	}
 	m, err := readMirrorMeta(mirror)
@@ -600,8 +793,8 @@ func pruneMirrors(mirrors string, used map[string]bool, unread []string) {
 }
 
 // originBranch is the branch origin's HEAD names, or "" when origin does not say.
-func originBranch(ctx context.Context, mirror, url, gh string, lock *os.File) (string, error) {
-	out, err := fetchGit(ctx, mirror, gh, lock, "ls-remote", "--symref", url, "HEAD")
+func originBranch(ctx context.Context, call mirrorCall, url string) (string, error) {
+	out, err := fetchGit(ctx, call, "ls-remote", "--symref", url, "HEAD")
 	if err != nil {
 		return "", err
 	}
@@ -623,15 +816,20 @@ func symrefBranch(out string) string {
 // fetchGit runs a Git call that reads a remote, in the mirror, with the input pins, the remote limits (remotePins) and
 // no prompt of any kind: no terminal, no stdin, no askpass program, ssh in batch mode. Only https, ssh and local paths
 // are fetched, and GitHub's credentials come from the GitHub CLI, as the ship tool's do. The call ends with ctx
-// (endWithContext). The call inherits the mirror's lock (lockMirror), when there is one, so a fetch whose process group
-// outlives the pass still holds it. Its error names the operation and which limit ended it, never Git's diagnostics,
-// which can print a URL or a host path.
-func fetchGit(ctx context.Context, mirror, gh string, lock *os.File, args ...string) ([]byte, error) {
-	pins := append([]string{"--git-dir=" + mirror}, GitSafety()...)
+// (endWithContext). The call inherits the mirror's lock (lockMirror), when there is one, and records its process group
+// there (recordHolder), so a fetch whose process group outlives the pass still holds it, and a later pass can tell
+// that group. Its error names the operation and which limit ended it, never Git's diagnostics, which can print a URL
+// or a host path.
+func fetchGit(ctx context.Context, call mirrorCall, args ...string) ([]byte, error) {
+	lowSpeed := 1
+	if call.first {
+		lowSpeed = 0
+	}
+	pins := append([]string{"--git-dir=" + call.mirror}, GitSafety()...)
 	pins = append(pins, "-c", "uploadpack.packObjectsHook=",
 		"-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always", "-c", "protocol.file.allow=always",
-		"-c", "credential.helper=", "-c", "credential.https://github.com.helper=!"+shellQuote(firstOf(gh, "gh"))+" auth git-credential")
-	pins = append(pins, remotePins()...)
+		"-c", "credential.helper=", "-c", "credential.https://github.com.helper=!"+shellQuote(firstOf(call.gh, "gh"))+" auth git-credential")
+	pins = append(pins, transferPins(lowSpeed)...)
 	cmd := exec.CommandContext(ctx, "git", append(pins, args...)...)
 	for _, kv := range GitEnv() {
 		if !strings.HasPrefix(kv, "SSH_ASKPASS") {
@@ -639,13 +837,20 @@ func fetchGit(ctx context.Context, mirror, gh string, lock *os.File, args ...str
 		}
 	}
 	cmd.Env = append(cmd.Env, "SSH_ASKPASS_REQUIRE=never")
-	if lock != nil {
-		cmd.ExtraFiles = []*os.File{lock}
+	if call.lock != nil {
+		cmd.ExtraFiles = []*os.File{call.lock}
 	}
 	endWithContext(cmd)
 	out, stderr := Capture{Limit: ScrubBatchBytes}, Capture{Limit: ScrubBatchBytes}
 	cmd.Stdout, cmd.Stderr = &out, &stderr
-	if err := cmd.Run(); err != nil {
+	err := cmd.Start()
+	if err == nil {
+		if call.lock != nil {
+			recordHolder(call.lock, cmd.Process.Pid)
+		}
+		err = cmd.Wait()
+	}
+	if err != nil {
 		return nil, remoteFailure(ctx, gitVerb(args), err, stderr.Bytes())
 	}
 	if out.Over() || stderr.Over() {
@@ -666,9 +871,9 @@ func remoteFailure(ctx context.Context, verb string, err error, stderr []byte) e
 	return fmt.Errorf("input git %s failed: %w", verb, err)
 }
 
-// transportCauses are the transport's own failures, as git, curl and ssh word them, each with the fixed text the host
-// gives for it: a transfer limit (remotePins), a server that cannot be reached, a connection that broke off, a server
-// that failed. A repository the server does not have, or a branch it does not hold, is an answer, not one of them.
+// transportCauses are the transport's own failures, as git, curl (OpenSSL or GnuTLS) and ssh word them, each with the
+// fixed text the host gives for it: a transfer limit (remotePins), a server that cannot be reached, a connection that
+// broke off, a server that failed. They only name a failure; whether a build waits is decided by remoteAnswered.
 var transportCauses = []struct {
 	words []string
 	cause string
@@ -679,7 +884,10 @@ var transportCauses = []struct {
 	{[]string{"could not resolve host"}, "the server's name did not resolve"},
 	{[]string{"connection refused", "could not connect to server", "couldn't connect to server", "failed to connect to",
 		"network is unreachable", "no route to host"}, "no connection to the server could be made"},
-	{[]string{"connection reset", "early eof", "unexpected disconnect", "not closed cleanly", "ssl_error_syscall"}, "the connection broke off"},
+	{[]string{"connection reset", "connection closed by", "early eof", "unexpected disconnect", "not closed cleanly",
+		"transfer closed with outstanding read data", "empty reply from server", "framing layer", "handshake failed",
+		"recv error", "send error", "non-properly terminated", "ssl_read", "ssl_write", "ssl_connect", "ssl_error_syscall"},
+		"the connection broke off"},
 	{[]string{"the requested url returned error: 5"}, "the server failed (an HTTP 5xx answer)"},
 }
 
@@ -694,6 +902,29 @@ func transportCause(stderr []byte) string {
 		}
 	}
 	return ""
+}
+
+// remoteAnswers are what a remote that answered says, as git, curl and ssh word it: a repository it does not have, a
+// branch it does not hold, access it does not grant, an HTTP 4xx answer.
+var remoteAnswers = []string{"repository not found", "does not appear to be a git repository", "couldn't find remote ref",
+	"authentication failed", "permission denied", "the requested url returned error: 4"}
+
+// remoteAnswered says whether Git's diagnostics are a remote's answer (remoteAnswers), which the next try would get
+// again. Anything else is a failure on the way to the remote (a network, a TLS session, a server that failed), and
+// so are a 408 and a 429, which ask the client to try again later.
+func remoteAnswered(stderr []byte) bool {
+	text := strings.ToLower(string(stderr))
+	for _, later := range []string{"returned error: 408", "returned error: 429"} {
+		if strings.Contains(text, later) {
+			return false
+		}
+	}
+	for _, answer := range remoteAnswers {
+		if strings.Contains(text, answer) {
+			return true
+		}
+	}
+	return false
 }
 
 // endWithContext makes a Git call end with its context, whatever its children do: git starts in a process group of

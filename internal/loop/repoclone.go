@@ -207,12 +207,13 @@ func hostInputGitLimit(ctx context.Context, dir string, limit int, args ...strin
 
 // hostInputGitCapped returns at most limit bytes of output and says whether there was more.
 func hostInputGitCapped(ctx context.Context, dir string, limit int, args ...string) ([]byte, bool, error) {
-	return hostInputGitFiles(ctx, dir, limit, nil, args...)
+	return hostInputGitHolding(ctx, dir, limit, gitStepTimeout, nil, args...)
 }
 
-// hostInputGitFiles is hostInputGitCapped whose call inherits files, from descriptor 3 on (a mirror's lock).
-func hostInputGitFiles(ctx context.Context, dir string, limit int, files []*os.File, args ...string) ([]byte, bool, error) {
-	cctx, cancel := context.WithTimeout(ctx, gitStepTimeout)
+// hostInputGitHolding is hostInputGitCapped within step, whose call, when lock is a mirror's lock, inherits it (as
+// descriptor 3) and records its process group there (recordHolder).
+func hostInputGitHolding(ctx context.Context, dir string, limit int, step time.Duration, lock *os.File, args ...string) ([]byte, bool, error) {
+	cctx, cancel := context.WithTimeout(ctx, step)
 	defer cancel()
 	pins := append(append([]string(nil), GitSafety()...), "-c", "uploadpack.packObjectsHook=", "-c", "protocol.file.allow=always")
 	if dir != "" {
@@ -220,15 +221,24 @@ func hostInputGitFiles(ctx context.Context, dir string, limit int, files []*os.F
 	}
 	cmd := exec.CommandContext(cctx, "git", append(pins, args...)...)
 	cmd.Env = GitEnv()
-	cmd.ExtraFiles = files
+	if lock != nil {
+		cmd.ExtraFiles = []*os.File{lock}
+	}
 	endWithContext(cmd)
 	out, stderr := Capture{Limit: limit}, Capture{Limit: ScrubBatchBytes}
 	cmd.Stdout, cmd.Stderr = &out, &stderr
-	if err := cmd.Run(); err != nil {
+	err := cmd.Start()
+	if err == nil {
+		if lock != nil {
+			recordHolder(lock, cmd.Process.Pid)
+		}
+		err = cmd.Wait()
+	}
+	if err != nil {
 		// Git can print source configuration and object text in diagnostics.
 		// Return only the operation and status, never its raw stderr.
 		if cctx.Err() == context.DeadlineExceeded {
-			return nil, false, fmt.Errorf("input git %s timed out after %s", gitVerb(args), gitStepTimeout)
+			return nil, false, fmt.Errorf("input git %s timed out after %s", gitVerb(args), step)
 		}
 		return nil, false, fmt.Errorf("input git %s failed: %w", gitVerb(args), err)
 	}

@@ -1665,8 +1665,14 @@ func (s *Ship) gitInput(ctx context.Context, dir string, input []byte, args ...s
 	cmd := exec.CommandContext(cctx, "git", full...)
 	endWithContext(cmd)
 	cmd.Stdin = bytes.NewReader(input)
-	cmd.Env = append(noGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_AUTHOR_NAME="+s.Identity[0], "GIT_AUTHOR_EMAIL="+s.Identity[1],
-		"GIT_COMMITTER_NAME="+s.Identity[0], "GIT_COMMITTER_EMAIL="+s.Identity[1])
+	// no askpass program: a remote call never prompts, as the mirror's fetch never does (fetchGit)
+	for _, kv := range noGitEnv() {
+		if !strings.HasPrefix(kv, "SSH_ASKPASS") {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	cmd.Env = append(cmd.Env, "SSH_ASKPASS_REQUIRE=never", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0",
+		"GIT_AUTHOR_NAME="+s.Identity[0], "GIT_AUTHOR_EMAIL="+s.Identity[1], "GIT_COMMITTER_NAME="+s.Identity[0], "GIT_COMMITTER_EMAIL="+s.Identity[1])
 	out, errOut := Capture{Limit: MaxStream}, Capture{Limit: MaxStream}
 	cmd.Stdout, cmd.Stderr = &out, &errOut
 	if err := s.assignedAuthority(ctx); err != nil {
@@ -1676,53 +1682,60 @@ func (s *Ship) gitInput(ctx context.Context, dir string, input []byte, args ...s
 	if out.Over() || errOut.Over() {
 		return "", refused("Git output exceeds the whole-stream limit")
 	}
-	if err != nil && cctx.Err() != nil {
-		err = fmt.Errorf("git %s: %s: %s", strings.Join(args, " "), endedBy(cctx), strings.TrimSpace(errOut.String()))
-		return out.String(), &remoteOutage{err: err, cause: endedBy(cctx)}
-	}
 	if err != nil {
-		err = fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(errOut.String()))
-		if cause := transportCause(errOut.Bytes()); cause != "" {
-			return out.String(), &remoteOutage{err: err, cause: cause}
+		diag := strings.TrimSpace(errOut.String())
+		if cctx.Err() != nil {
+			return out.String(), &shipGitError{text: fmt.Sprintf("git %s: %s: %s", strings.Join(args, " "), endedBy(cctx), diag), diag: diag, ended: true}
 		}
-		return out.String(), err
+		return out.String(), &shipGitError{text: fmt.Sprintf("git %s: %v: %s", strings.Join(args, " "), err, diag), diag: diag, err: err}
 	}
 	return out.String(), nil
 }
 
-// remoteOutage is a ship Git call a deadline or the transport ended (transportCause), not one whose remote answered:
-// cause is its fixed text, without a URL or a host path.
-type remoteOutage struct {
-	err   error
-	cause string
+// shipGitError is a ship Git call that ran and failed: its text (the call, how it ended and Git's diagnostics), whether
+// a deadline ended it, and the diagnostics, which say whether a remote answered (fetchBase).
+type shipGitError struct {
+	text, diag string
+	ended      bool
+	err        error
 }
 
-func (e *remoteOutage) Error() string { return e.err.Error() }
-func (e *remoteOutage) Unwrap() error { return e.err }
+func (e *shipGitError) Error() string { return e.text }
+func (e *shipGitError) Unwrap() error { return e.err }
 
 // fetchBase fetches the default branch of the host clone's origin into its remote-tracking branch and returns the
 // branch and its commit. The branch is the one origin's HEAD names now (ls-remote --symref, as the mirror reads it),
 // not the one the checkout's origin/HEAD names, which nothing updates: a renamed default branch is followed. known is
-// the branch when origin does not name its HEAD. A call a deadline or the transport ended holds the build for the pass
-// (an outage, without a run or a charge); any other failure (a repository or a branch origin does not have) is
-// returned as it is, the build's own.
+// the branch when origin does not name its HEAD. A GitHub origin is read as the mirror reads it, over https by its
+// name with the GitHub CLI's credentials (githubURL), so no ssh agent is asked for a key. A call the remote answered
+// (remoteAnswered: a repository, a branch or access it does not have) fails as the build's own, and so does a refusal
+// of the host clone; any other failure, a deadline's among them, is an outage, which holds the build for the pass,
+// without a run or a charge. The hold names no cause: its note stays one note, whatever the network did.
 func (s *Ship) fetchBase(ctx context.Context, host, repo, known string) (string, string, error) {
 	hold := func(err error) error {
-		var outage *remoteOutage
-		if errors.As(err, &outage) {
-			return &shipHold{err: refused("the default branch of %s cannot be fetched now (%s)", repo, outage.cause)}
+		var failed *shipGitError
+		if errors.As(err, &failed) && (failed.ended || !remoteAnswered([]byte(failed.diag))) {
+			return &shipHold{err: refused("the default branch of %s cannot be fetched now", repo)}
 		}
 		return err
 	}
-	out, err := s.git(ctx, host, "ls-remote", "--symref", "origin", "HEAD")
+	url, err := s.git(ctx, host, "config", "--get", "remote.origin.url")
+	if err != nil {
+		return "", "", err
+	}
+	remote := "origin"
+	if identity := remoteIdentity(url); !strings.HasPrefix(identity, "url:") {
+		remote = githubURL(identity)
+	}
+	out, err := s.git(ctx, host, "ls-remote", "--symref", remote, "HEAD")
 	if err != nil {
 		return "", "", hold(err)
 	}
 	branch := firstOf(symrefBranch(out), known)
-	if _, err := s.git(ctx, host, "check-ref-format", "refs/heads/"+branch); err != nil {
+	if _, err := hostInputGit(ctx, "", "check-ref-format", "refs/heads/"+branch); err != nil {
 		return "", "", refused("origin's default branch has no valid name")
 	}
-	if _, err := s.git(ctx, host, "fetch", "--quiet", "origin", "+refs/heads/"+branch+":refs/remotes/origin/"+branch); err != nil {
+	if _, err := s.git(ctx, host, "fetch", "--quiet", remote, "+refs/heads/"+branch+":refs/remotes/origin/"+branch); err != nil {
 		return "", "", hold(err)
 	}
 	commit, err := s.git(ctx, host, "rev-parse", "--verify", "refs/remotes/origin/"+branch+"^{commit}")
@@ -1819,10 +1832,14 @@ func (s *Ship) publicBase(ctx context.Context, p Package) (bool, error) {
 	if visibility.Visibility != "PUBLIC" {
 		return false, nil
 	}
-	if _, err := s.git(ctx, p.Host, "fetch", "--quiet", "origin", p.Base); err != nil {
-		return false, &shipHold{err: refused("the default branch of %s cannot be fetched now", p.Repo)}
+	_, tip, err := s.fetchBase(ctx, p.Host, p.Repo, p.Base)
+	if held(err) {
+		return false, err
 	}
-	_, err = s.git(ctx, p.Host, "merge-base", "--is-ancestor", p.BaseCommit, "FETCH_HEAD")
+	if err != nil {
+		return false, nil
+	}
+	_, err = s.git(ctx, p.Host, "merge-base", "--is-ancestor", p.BaseCommit, tip)
 	return err == nil, nil
 }
 

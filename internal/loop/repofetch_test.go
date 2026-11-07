@@ -326,7 +326,7 @@ func TestARemoteCallEndsAtItsDeadline(t *testing.T) {
 			if name == "ship" {
 				_, err = ship.git(ctx, f.main, "ls-remote", url, "HEAD")
 			} else {
-				_, err = fetchGit(ctx, mirror, "", nil, "ls-remote", url, "HEAD")
+				_, err = fetchGit(ctx, mirrorCall{mirror: mirror}, "ls-remote", url, "HEAD")
 			}
 			if took := time.Since(start); took > bound {
 				t.Fatalf("the call returned %s after its %s deadline", took.Round(time.Second), deadline)
@@ -619,7 +619,7 @@ if [ "$n" = 2 ]; then sh -c "$last" | { head -c 65536; exec sleep 60; }; else ex
 	}
 }
 
-// A mirror holding the locks and temporary packs of a fetch killed outright is fetched into all the same.
+// A mirror holding the locks and temporary files of a fetch or a repack killed outright is fetched into all the same.
 func TestStaleLocksOfAKilledFetchAreRemoved(t *testing.T) {
 	goodInputScrubber(t)
 	f := newRepo(t, nil)
@@ -628,7 +628,8 @@ func TestStaleLocksOfAKilledFetchAreRemoved(t *testing.T) {
 		t.Fatalf("the first fetch failed: %+v %v", got, err)
 	}
 	mirror := filepath.Join(parent, "mirrors", filepath.Base(mirrorPath("", "url:"+f.origin)))
-	stale := []string{"refs/heads/main.lock", "HEAD.lock", "config.lock", "packed-refs.lock", "shallow.lock", "objects/pack/tmp_pack_x1"}
+	stale := []string{"refs/heads/main.lock", "HEAD.lock", "config.lock", "packed-refs.lock", "shallow.lock", "objects/pack/tmp_pack_x1",
+		"objects/pack/.tmp-123-pack-x1.pack", "objects/ab/tmp_obj_x1"}
 	for _, p := range stale {
 		write(t, filepath.Join(mirror, p), "")
 	}
