@@ -25,40 +25,6 @@ const (
 // the reader holds one at a time.
 const recordMax = 16 << 20
 
-// wholeText is a call's input and its result's output read whole from their transcript; ok is false, with why,
-// when it read neither.
-type wholeText struct {
-	input, output string
-	ok            bool
-	why           string
-}
-
-// whole reads a call's input and its result's output whole from their transcript, where the store cut them: by
-// the events' references (the transcript's path and the record's offset; a Hermes store and the message's id),
-// while the record is there. A record is read once per run. Claude Code, Codex and pi records are opened with
-// tacit's reader (evidence.OpenAt, which reads a compressed copy too), Hermes rows with tacit's Hermes store; the
-// call's block is the one with the call's tool id, as the replay reads a record (supervise). The text read is raw:
-// the caller redacts it before it reads anything off it.
-func (r *reader) whole(ctx context.Context, call, res store.Event) wholeText {
-	id := metaOf(call.Meta).ToolID
-	in, okIn, whyIn := r.record(ctx, call, id, false)
-	out, okOut, whyOut := r.record(ctx, res, id, true)
-	w := wholeText{input: call.Summary, output: res.Summary, ok: okIn || okOut}
-	if okIn {
-		w.input = in
-	}
-	if okOut {
-		w.output = out
-	}
-	switch {
-	case !w.ok && whyIn == cutUnread || !w.ok && whyOut == cutUnread:
-		w.why = cutUnread
-	case !w.ok:
-		w.why = cutGone
-	}
-	return w
-}
-
 // record is one event's text in its record: a call's input or a result's output.
 func (r *reader) record(ctx context.Context, e store.Event, id string, output bool) (string, bool, string) {
 	key := e.Ref + "\x00" + id
@@ -237,7 +203,7 @@ func (r *reader) hermesRecord(ctx context.Context, e store.Event, path string, m
 	if e.Agent != "" && e.Agent != e.Session {
 		sid = e.Agent // a delegation's rows are its own session's
 	}
-	rows, err := db.Messages(ctx, sid, msg-1, recordMax)
+	rows, err := db.Messages(ctx, sid, msg-1, 1) // the row itself: Messages reads at least one, here no more
 	if err != nil || len(rows) == 0 || rows[0].ID != msg {
 		return "", false, cutGone
 	}
@@ -295,26 +261,27 @@ type need struct {
 	key    string
 }
 
-// prefetch reads the records the pairs want from their transcript files, each file once, in the order of its
-// records' offsets: one pass forward, so a compressed rollout is decompressed once, not once per record.
-func (r *reader) prefetch(pairs []pair) {
+// fetch is a record a read wants: an event's, by the call's tool id; output is true for a result.
+type fetch struct {
+	e      store.Event
+	id     string
+	output bool
+}
+
+// prefetch reads the records wanted from transcript files, each file once, in the order of its records' offsets:
+// one pass forward, so a compressed rollout is decompressed once, not once per record.
+func (r *reader) prefetch(fs []fetch) {
 	byFile := map[string][]need{}
-	for _, p := range pairs {
-		id := metaOf(p.call.Meta).ToolID
-		for _, x := range []struct {
-			e      store.Event
-			output bool
-		}{{p.call, false}, {p.res, true}} {
-			key := x.e.Ref + "\x00" + id
-			if _, ok := r.records[key]; ok || id == "" {
-				continue
-			}
-			path, off, ok := refPlace(x.e.Ref)
-			if !ok || x.e.Harness != "claude" && x.e.Harness != "codex" && x.e.Harness != "pi" {
-				continue // read one by one (Hermes), or unread
-			}
-			byFile[path] = append(byFile[path], need{off: off, id: id, output: x.output, key: key})
+	for _, f := range fs {
+		key := f.e.Ref + "\x00" + f.id
+		if _, ok := r.records[key]; ok || f.id == "" {
+			continue
 		}
+		path, off, ok := refPlace(f.e.Ref)
+		if !ok || f.e.Harness != "claude" && f.e.Harness != "codex" && f.e.Harness != "pi" {
+			continue // read one by one (Hermes), or unread
+		}
+		byFile[path] = append(byFile[path], need{off: off, id: f.id, output: f.output, key: key})
 	}
 	for path, ns := range byFile {
 		sort.Slice(ns, func(i, j int) bool { return ns[i].off < ns[j].off })
@@ -371,36 +338,80 @@ func (r *reader) readFile(path string, ns []need) {
 	}
 }
 
-// resolve reads whole the calls the store cut that the requests hold, each once per run: the records first, then
-// their texts redacted in one call, then what each made. A call whose record is not read is read as the store holds
-// it, and counted on its request.
+// resolve reads whole the calls the store cut that the requests hold, each once per run. It reads a call's input
+// where the store cut it, then its output where the store cut it and the command makes something (a commit, a
+// push, a pull request); a writer's input only. What each made is taken off the text read, and only that (each
+// artifact's text and key) is masked, with tacit's redaction in one call, before it is kept: the raw text is read
+// for its artifacts and dropped. A call whose record is not read, or whose artifacts cannot be masked, is read as
+// the store holds it, and counted on its request.
 func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 	key := func(p pair) string { return p.call.Ref + "\x00" + p.res.Ref }
+	cut := func(s string) bool { return strings.HasSuffix(s, "…") }
 	var todo []pair
 	for _, rq := range reqs {
 		for _, p := range rq.pending {
 			if _, ok := r.resolved[key(p)]; !ok {
+				r.resolved[key(p)] = resolvedPair{} // claimed: a pair two requests hold is read once
 				todo = append(todo, p)
 			}
 		}
 	}
-	r.prefetch(todo)
 	type job struct {
-		p pair
-		w wholeText
+		p             pair
+		input, output string
+		raw           bool // a text read whole
+		why           string
 	}
-	var jobs []job
-	var texts []string
-	for _, rq := range reqs {
-		for _, p := range rq.pending {
-			if _, ok := r.resolved[key(p)]; ok {
-				continue
+	jobs := make([]job, len(todo))
+	var ins []fetch
+	for i, p := range todo {
+		jobs[i] = job{p: p, input: p.call.Summary, output: p.res.Summary}
+		if cut(p.call.Summary) {
+			ins = append(ins, fetch{p.call, metaOf(p.call.Meta).ToolID, false})
+		}
+	}
+	r.prefetch(ins)
+	var outs []fetch
+	for i := range jobs {
+		j := &jobs[i]
+		id := metaOf(j.p.call.Meta).ToolID
+		if cut(j.p.call.Summary) {
+			if text, ok, why := r.record(ctx, j.p.call, id, false); ok {
+				j.input, j.raw = text, true
+			} else {
+				j.why = why
 			}
-			r.resolved[key(p)] = resolvedPair{} // claimed: a pair two requests hold is read once
-			w := r.whole(ctx, p.call, p.res)
-			jobs = append(jobs, job{p, w})
-			if w.ok {
-				texts = append(texts, w.input, w.output)
+		}
+		tool := strings.ToLower(j.p.call.Tool)
+		if writers[tool] || !cut(j.p.res.Summary) {
+			continue
+		}
+		if mk := made(Decode(j.p.call.Harness, tool, j.input, "").Commands); mk.commits || mk.pushes || mk.prs {
+			outs = append(outs, fetch{j.p.res, id, true})
+		}
+	}
+	r.prefetch(outs)
+	wanted := map[string]bool{}
+	for _, f := range outs {
+		wanted[f.e.Ref] = true
+	}
+	results := make([][]Result, len(jobs))
+	var texts []string
+	for i := range jobs {
+		j := &jobs[i]
+		if wanted[j.p.res.Ref] {
+			if text, ok, why := r.record(ctx, j.p.res, metaOf(j.p.call.Meta).ToolID, true); ok {
+				j.output, j.raw = text, true
+			} else if j.why == "" {
+				j.why = why
+			}
+		}
+		call, res := j.p.call, j.p.res
+		call.Summary, res.Summary = j.input, j.output
+		results[i] = Artifacts(call, res)
+		if j.raw {
+			for _, x := range results[i] {
+				texts = append(texts, x.Text, x.Key)
 			}
 		}
 	}
@@ -412,25 +423,27 @@ func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 	if len(texts) > 0 {
 		var err error
 		if masked, err = redact(ctx, texts); err != nil || len(masked) != len(texts) {
-			masked = nil // nothing raw is read off: the calls are read as the store holds them
+			masked = nil
 		}
 	}
-	i := 0
-	for _, j := range jobs {
-		call, res, why := j.p.call, j.p.res, j.w.why
-		if j.w.ok {
-			if masked != nil {
-				call.Summary, res.Summary = masked[i], masked[i+1]
+	k := 0
+	for i := range jobs {
+		j := &jobs[i]
+		if j.raw {
+			if masked == nil && len(texts) > 0 {
+				// nothing read off the raw text is kept unmasked: the call is read as the store holds it
+				results[i], j.why = Artifacts(j.p.call, j.p.res), cutUnread
 			} else {
-				why = cutUnread
+				for x := range results[i] {
+					results[i][x].Text, results[i][x].Key = masked[k], masked[k+1]
+					k += 2
+				}
 			}
-			i += 2
 		}
-		out := Artifacts(call, res)
-		for k := range out {
-			out[k].Thread = j.p.res.Session
+		for x := range results[i] {
+			results[i][x].Thread = j.p.res.Session
 		}
-		r.resolved[key(j.p)] = resolvedPair{results: out, why: why}
+		r.resolved[key(j.p)] = resolvedPair{results: results[i], why: j.why}
 	}
 	for _, rq := range reqs {
 		for _, p := range rq.pending {
