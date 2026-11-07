@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -274,28 +275,68 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 // returnWork moves the case's build tree back to the case's work directory when it is in runDir, a prepared build's
 // run directory about to be removed because the build was never reserved, and saves the package naming it there. It
 // takes the case's lock, so no ship step reads the package between the move and the save. A tree elsewhere stays.
-func (s *Ship) returnWork(ctx context.Context, caseID, runDir string) error {
+// stays says the tree is still in runDir (the lock was held, the package could not be read, the move failed), so
+// runDir must stay too; an error then or after the move says where the tree is.
+func (s *Ship) returnWork(ctx context.Context, caseID, runDir string) (stays bool, err error) {
 	unlock, err := s.lock(ctx, caseID)
 	if err != nil {
-		return err
+		return true, fmt.Errorf("its tree stays in %s: %w", runDir, err)
 	}
 	defer unlock()
 	p, had, err := s.Load(caseID)
-	if err != nil || !had || p.Work == "" || !within(runDir, p.Work) {
-		return err
+	if err != nil {
+		return true, fmt.Errorf("its tree stays in %s: %w", runDir, err)
 	}
-	work := s.workDir(caseID)
+	if !had || p.Work == "" || !within(runDir, p.Work) {
+		return false, nil
+	}
+	work, named := s.workDir(caseID), p.Work
 	if err := os.MkdirAll(filepath.Dir(work), 0o700); err != nil {
-		return err
+		return true, fmt.Errorf("its tree stays in %s: %w", named, err)
 	}
 	if err := removeAll(work); err != nil {
-		return err
+		return true, fmt.Errorf("its tree stays in %s: %w", named, err)
 	}
-	if err := os.Rename(p.Work, work); err != nil {
-		return err
+	if err := os.Rename(named, work); err != nil {
+		return true, fmt.Errorf("its tree stays in %s: %w", named, err)
 	}
 	p.Work = work
-	return s.saveAuthorized(ctx, &p)
+	if err := s.saveAuthorized(ctx, &p); err != nil {
+		return false, fmt.Errorf("its tree is in %s, but its package, which names %s, was not saved: %w", work, named, err)
+	}
+	return false, nil
+}
+
+// returnTrees gives back, with returnWork, every case's build tree that is in dir. It fails when a package cannot be
+// read, or a tree cannot go back, so dir stays.
+func (s *Ship) returnTrees(ctx context.Context, dir string) error {
+	entries, err := os.ReadDir(filepath.Join(s.Dir, "packages"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		p, had, err := s.Load(e.Name())
+		if err != nil {
+			return err
+		}
+		if !had || p.Work == "" || !within(dir, p.Work) {
+			continue
+		}
+		stays, err := s.returnWork(ctx, p.Case, dir)
+		if stays {
+			return err
+		}
+		if err != nil {
+			s.logf("build tree of %s: %v", p.Case, err)
+		}
+	}
+	return nil
 }
 
 func stageFailure(res Result, key string, err error) (Result, error) {

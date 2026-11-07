@@ -507,10 +507,14 @@ func TestABuildPastTheBudgetsRoomIsNotPrepared(t *testing.T) {
 
 // The room the budgets leave is the number of runs their check lets through, one reservation after another, also
 // where dividing what is left by the run's budget rounds to one run more (0.63 into 1.89) or one fewer (0.39 into
-// 1.17).
+// 1.17). A run that brings the spend to the limit exactly fits.
 func TestTheRoomIsTheRunsTheBudgetsLetThrough(t *testing.T) {
-	for _, b := range []Budgets{{Run: 0.63, Day: 1.89, Week: 200}, {Run: 0.39, Day: 1.17, Week: 200}, {Run: 0.63, Day: 200, Week: 1.89},
-		{Run: 4, Day: 40, Week: 200}} {
+	for _, tc := range []struct {
+		b    Budgets
+		want int
+	}{{Budgets{Run: 0.63, Day: 1.89, Week: 200}, 3}, {Budgets{Run: 0.39, Day: 1.17, Week: 200}, 3}, {Budgets{Run: 0.63, Day: 200, Week: 1.89}, 3},
+		{Budgets{Run: 4, Day: 40, Week: 200}, 10}} {
+		b := tc.b
 		ctx := context.Background()
 		st := testStore(t)
 		c := openCase(t, st, "failures", "marker-7f3a", 1)
@@ -525,8 +529,9 @@ func TestTheRoomIsTheRunsTheBudgetsLetThrough(t *testing.T) {
 				break
 			}
 		}
-		if room != through {
-			t.Errorf("run $%v, day $%v, week $%v: the room is %d runs, the budgets let %d through", b.Run, b.Day, b.Week, room, through)
+		if room != through || through != tc.want {
+			t.Errorf("run $%v, day $%v, week $%v: the room is %d runs, the budgets let %d through, want %d", b.Run, b.Day, b.Week, room,
+				through, tc.want)
 		}
 	}
 }

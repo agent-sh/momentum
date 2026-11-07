@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 )
@@ -196,19 +197,61 @@ func (s *Store) LoopRuns(ctx context.Context, f RunFilter) ([]LoopRun, error) {
 	return scanRuns(s.db.QueryContext(ctx, q, args...))
 }
 
-// LoopSpend is what the live runs that started since a time spent, in US dollars. A run still running counts its
-// budget in full (reserved), since what it spends is known only when it ends.
+// LoopSpend is what the live runs that started since a time spent, in US dollars, as LoopSpendMicros counts it.
 func (s *Store) LoopSpend(ctx context.Context, since time.Time, reserved float64) (float64, error) {
-	var spent float64
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount), 0) FROM (
- SELECT CASE WHEN status = ? AND cost_usd = 0 THEN ? ELSE cost_usd END AS amount
+	spent, err := s.LoopSpendMicros(ctx, since, reserved)
+	return float64(spent) / 1e6, err
+}
+
+// LoopSpendMicros is what the live runs that started since a time spent, in whole micro-dollars: each run's or hold's
+// amount is rounded once (Micros) and the amounts add exactly, so the spend is the same in any order and grows by a
+// run's budget exactly when a run is reserved. A run still running counts its budget in full (reserved), since what
+// it spends is known only when it ends.
+func (s *Store) LoopSpendMicros(ctx context.Context, since time.Time, reserved float64) (int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT CASE WHEN status = ? AND cost_usd = 0 THEN ? ELSE cost_usd END
  FROM loop_runs WHERE experiment = '' AND started >= ?
  UNION ALL
- SELECT json_extract(detail, '$.usd') AS amount FROM case_log
+ SELECT COALESCE(json_extract(detail, '$.usd'), 0) FROM case_log
  WHERE action = ? AND at >= ? AND json_extract(detail, '$.started') >= ?
- AND json_extract(detail, '$.experiment') = '')`,
-		RunRunning, reserved, since.UnixMilli(), loopHoldAction, since.UnixMilli(), since.UnixMilli()).Scan(&spent)
-	return spent, err
+ AND json_extract(detail, '$.experiment') = ''`,
+		RunRunning, reserved, since.UnixMilli(), loopHoldAction, since.UnixMilli(), since.UnixMilli())
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var spent int64
+	for rows.Next() {
+		var amount float64
+		if err := rows.Scan(&amount); err != nil {
+			return 0, err
+		}
+		spent = AddMicros(spent, Micros(amount))
+	}
+	return spent, rows.Err()
+}
+
+// MaxMicros bounds an amount in micro-dollars (about nine billion dollars), so a budget of any size counts runs
+// without overflow.
+const MaxMicros = 1 << 53
+
+// Micros is an amount in US dollars in whole micro-dollars, rounded to the nearest once and held within MaxMicros
+// either way. NaN is none.
+func Micros(usd float64) int64 {
+	switch {
+	case math.IsNaN(usd):
+		return 0
+	case usd*1e6 >= MaxMicros:
+		return MaxMicros
+	case usd*1e6 <= -MaxMicros:
+		return -MaxMicros
+	}
+	return int64(math.Round(usd * 1e6))
+}
+
+// AddMicros adds two amounts in micro-dollars, held within 1<<60 either way, so a sum of amounts within MaxMicros
+// never overflows.
+func AddMicros(a, b int64) int64 {
+	return min(max(a+b, -1<<60), 1<<60)
 }
 
 const loopHoldAction = "loop hold"
@@ -265,6 +308,15 @@ func (s *Store) HoldLoopRun(ctx context.Context, r LoopRun) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// LoopRunKnown says whether the store keeps a record of a run by its id: its row, or the receipt a hold left in its
+// stead (HoldLoopRun).
+func (s *Store) LoopRunKnown(ctx context.Context, id string) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM loop_runs WHERE id = ?) +
+ (SELECT COUNT(*) FROM case_log WHERE action = ? AND actor = ?)`, id, loopHoldAction, "loop:"+id).Scan(&n)
+	return n > 0, err
 }
 
 // FinishLoopRun ends a reservation and charges its canonical case in one transaction, exactly once.

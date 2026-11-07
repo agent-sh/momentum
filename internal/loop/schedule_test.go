@@ -133,10 +133,13 @@ func randomFamilies(rng *rand.Rand) []simFamily {
 //     nothing else in the pass, and no other build is reserved;
 //  8. a family with a buildable case goes at most b-1 passes without its build when the room reaches every one of the m
 //     families with a case, and at most the larger of m-1 and 2(b-1) when it does not, b the families with a buildable
-//     case.
+//     case;
+//  9. a family records or reserves at most one run in a pass.
 //
-// In a quarter of the trials a ready build's reservation fails at random; 3 and 8 are claimed only while every one goes
-// through.
+// The room is the budget check's own count (runsThatFit) of a random run budget, earlier spend and limit, in whole
+// micro-dollars, and the model's check of each reservation is that count too. In a quarter of the trials a ready
+// build's reservation fails at random, and an investigation's records a run and ends (its reservation could not be
+// read back); 3 and 8 are claimed only while every reservation goes through.
 func TestPassPlansAreFairOverRandomFamilies(t *testing.T) {
 	rng := rand.New(rand.NewPCG(102, 4))
 	for trial := range 4000 {
@@ -161,9 +164,13 @@ func TestPassPlansAreFairOverRandomFamilies(t *testing.T) {
 		if rng.IntN(5) == 0 { // a family named twice
 			names = append(names, names[rng.IntN(n)])
 		}
-		room := 1 + rng.IntN(3)
-		faults := rng.IntN(4) == 0 // a ready build's reservation may fail
-		gap := b - 1               // the most passes a family with a buildable case goes without its build (8)
+		run := int64(1 + rng.IntN(5_000_000))                                 // a run's budget
+		spent := int64(rng.IntN(20_000_000))                                  // what the day has spent
+		limit := spent + int64(1+rng.IntN(3))*run + int64(rng.IntN(int(run))) // room for 1 to 3 runs
+		room := runsThatFit(spent, run, limit, len(uniqueFamilies(names)))    // as the runner counts it
+		faults := rng.IntN(4) == 0                                            // a reservation may fail
+		// the most passes a family with a buildable case goes without its build (8)
+		gap := b - 1
 		if room < m {
 			gap = max(m-1, 2*(b-1))
 		}
@@ -187,15 +194,25 @@ func TestPassPlansAreFairOverRandomFamilies(t *testing.T) {
 					}
 				}
 			}
-			left, builds, builder := room, 0, ""
+			counted, builds, builder := spent, 0, ""
+			fits := func() bool { return runsThatFit(counted, run, limit, 1) == 1 } // the budget check
 			prepared, reserved, ran := map[string]bool{}, map[string]bool{}, map[string]bool{}
 			refused := map[string]bool{} // by family: its ready build's reservation failed
+			runs := map[string]int{}     // by family: the runs it recorded or reserved
+			once := func(fam string, out outcome) outcome {
+				if out == runReserved || out == runRecorded {
+					if runs[fam]++; runs[fam] > 1 {
+						fail("%s recorded or reserved %d runs", fam, runs[fam])
+					}
+				}
+				return out
+			}
 			prepare := func(fam string, c candidate) outcome {
 				sc := cases[c.c.ID]
 				switch {
 				case c.step != StepBuild:
 					fail("%s prepared as a build", c.c.ID)
-				case left == 0:
+				case !fits():
 					fail("%s prepared with no room left", c.c.ID)
 				case family[fam].failing || sc.held:
 					return runNone
@@ -215,7 +232,7 @@ func TestPassPlansAreFairOverRandomFamilies(t *testing.T) {
 					return runNone
 				case c.step == StepBuild && !prepared[c.c.ID]:
 					fail("%s reserved unprepared", c.c.ID)
-				case left == 0:
+				case !fits():
 					return runRecorded // the budgets refuse it
 				case reserved[c.c.ID]:
 					fail("%s reserved twice", c.c.ID)
@@ -226,16 +243,20 @@ func TestPassPlansAreFairOverRandomFamilies(t *testing.T) {
 					}
 					ran[fam] = true
 					return runRecorded
+				case c.step != StepBuild && faults && rng.IntN(6) == 0: // its row ends unstarted and uncharged
+					ran[fam] = true
+					return runRecorded
 				}
 				reserved[c.c.ID], ran[fam] = true, true
-				left--
+				counted = store.AddMicros(counted, run)
 				if c.step == StepBuild {
 					builds++
 					builder = fam
 				}
 				return runReserved
 			}
-			steps, after := schedule(names, cands, turns, room, prepare, reserve)
+			steps, after := schedule(names, cands, turns, room, func(fam string, c candidate) outcome { return once(fam, prepare(fam, c)) },
+				func(fam string, c candidate) outcome { return once(fam, reserve(fam, c)) })
 			history = append(history, fmt.Sprintf("pass %d (turns %v): %s", pass, turns, plan(steps)))
 			turns = after
 			if builds > 1 || builds > 0 && len(refused) > 0 {
@@ -252,7 +273,7 @@ func TestPassPlansAreFairOverRandomFamilies(t *testing.T) {
 				case ran[f.name]:
 					last[f.name] = pass
 				case refused[f.name]:
-				case left > 0 && (f.canInvestigate() || !taken && f.canBuild()):
+				case fits() && (f.canInvestigate() || !taken && f.canBuild()):
 					fail("%s ran nothing with room left", f.name)
 				case !faults && (f.canInvestigate() || f.canBuild()) && pass-last[f.name] >= n:
 					fail("%s ran nothing for %d passes", f.name, pass-last[f.name])
@@ -265,5 +286,64 @@ func TestPassPlansAreFairOverRandomFamilies(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// probeCands are a family's candidates, best first, one case a step.
+func probeCands(fam string, steps ...string) []candidate {
+	var cs []candidate
+	for i, s := range steps {
+		status := store.CaseOpen
+		if s == StepBuild {
+			status = store.CaseTesting
+		}
+		cs = append(cs, candidate{c: store.Case{ID: fam + "-" + string(rune('a'+i)), Family: fam, Status: status}, step: s})
+	}
+	return cs
+}
+
+// A family whose build's preparation records a run runs nothing else in the pass, whether its place came before any
+// run (room 2: prepared up front) or after (room 1: its build waits for its place): one run a family.
+func TestAFailedPreparationIsTheFamilysOneRun(t *testing.T) {
+	for _, room := range []int{1, 2} {
+		cands := map[string][]candidate{"f0": probeCands("f0", StepInvestigate), "f1": probeCands("f1", StepBuild, StepInvestigate)}
+		left := room
+		prepare := func(fam string, c candidate) outcome { return runRecorded }
+		reserve := func(fam string, c candidate) outcome {
+			if fam == "f0" {
+				return runNone // f0's investigation cannot be made: the room stays for f1
+			}
+			if left == 0 {
+				return runRecorded
+			}
+			left--
+			return runReserved
+		}
+		steps, _ := schedule([]string{"f0", "f1"}, cands, map[string]string{}, room, prepare, reserve)
+		runs := 0
+		for _, s := range steps {
+			if s.fam == "f1" && s.skipped == "" && (s.out == runReserved || s.out == runRecorded) {
+				runs++
+			}
+		}
+		if runs != 1 {
+			t.Errorf("room %d: f1 recorded or reserved %d runs, want 1: %s", room, runs, plan(steps))
+		}
+	}
+}
+
+// A ready build whose reservation the budgets refuse takes no build turn.
+func TestARefusedReadyBuildTakesNoTurn(t *testing.T) {
+	cands := map[string][]candidate{"f0": probeCands("f0", StepBuild), "f1": probeCands("f1", StepInvestigate)}
+	prepare := func(fam string, c candidate) outcome { return runReady }
+	reserve := func(fam string, c candidate) outcome {
+		if c.step == StepBuild {
+			return runRecorded // refused
+		}
+		return runReserved
+	}
+	_, after := schedule([]string{"f0", "f1"}, cands, map[string]string{turnBuild: "f1"}, 2, prepare, reserve)
+	if after[turnBuild] != "f1" {
+		t.Fatalf("a refused ready build moved the build turn to %q", after[turnBuild])
 	}
 }

@@ -68,6 +68,7 @@ type Runner struct {
 	pass               *passInputs
 	pickedSkips        []Done
 	handUnread         map[string]bool // cases whose hand landing request could not be read in this pass
+	budgetAt           time.Time       // the pass's one clock reading for its budgets (budgetNow)
 }
 
 // Options are what one run of the loop does.
@@ -84,6 +85,15 @@ type Done struct {
 	Skipped            string   // why no step ran
 	Refused            []string // what the run's relay refused to forward (also in the run's summary)
 	Did                string   // outcome of a host step with no agent run
+}
+
+// budgetNow is the moment the budgets count back from: the pass's one reading while a pass runs, so its room and every
+// budget check in it see the same day and week, and the clock now otherwise.
+func (r *Runner) budgetNow() time.Time {
+	if !r.budgetAt.IsZero() {
+		return r.budgetAt
+	}
+	return r.now()
 }
 
 func (r *Runner) now() time.Time {
@@ -119,6 +129,7 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		if err := r.endStale(ctx); err != nil {
 			return nil, err
 		}
+		r.sweepRuns(ctx)
 		outs, swept, err := detect.Run(ctx, r.Store, r.Detectors, detect.Window{Since: r.now().Add(-detect.DefaultWindow), Until: r.now()},
 			"loop:detect", false)
 		if err != nil {
@@ -263,16 +274,12 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 	// unready removes what a prepared build left on the host when it ends unreserved (refused, or the pass stopped).
 	// The package's build tree is in the run directory by then (buildPackage), so it goes back to the case's work
 	// directory first, and the case's next build finds the tree its package names; a stopping pass still moves it.
-	// A tree that cannot go back (another ship step holds the case's lock) keeps its run directory.
+	// Then the host and run directories go. A tree that cannot go back (another ship step holds the case's lock)
+	// keeps its run directory.
 	unready := func(id string) {
 		if run, ok := prepared[id]; ok {
 			delete(prepared, id)
-			removeInputTree(HostDir(run.Dir))
-			if err := r.Ship.returnWork(context.WithoutCancel(ctx), id, run.Dir); err != nil {
-				r.logf("build tree of %s stays in %s: %v", id, run.Dir, err)
-				return
-			}
-			removeInputTree(run.Dir)
+			r.removeRunDirs(context.WithoutCancel(ctx), id, run.Dir, true)
 		}
 	}
 	prepare := func(fam string, c candidate) outcome {
@@ -298,10 +305,13 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 			}
 		}
 		out := reserveReady(fam, c.c, c.step, run)
-		if out == runReserved {
+		switch {
+		case out == runReserved:
 			delete(prepared, c.c.ID)
-		} else {
+		case ok:
 			unready(c.c.ID)
+		default: // prepared here and not reserved: what it prepared goes
+			r.removeRunDirs(context.WithoutCancel(ctx), c.c.ID, run.Dir, c.step == StepBuild)
 		}
 		return out
 	}
@@ -309,6 +319,8 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 	// they had room, so affordable refuses what they do not
 	room, roomWhy := len(families), ""
 	if !o.Dry {
+		r.budgetAt = r.now() // one reading for the pass's budgets: the room and every check after it
+		defer func() { r.budgetAt = time.Time{} }()
 		var err error
 		if room, roomWhy, err = r.room(ctx, len(families)); err != nil {
 			r.logf("the loop's budgets: %v", err)
@@ -373,6 +385,59 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 	}
 	sort.Slice(done, func(i, j int) bool { return done[i].Family+done[i].Step < done[j].Family+done[j].Step })
 	return done, picked
+}
+
+// removeRunDirs removes a prepared run's host and run directories once nothing its case needs is in them: a
+// build's tree goes back to the case first (returnWork), and a tree that cannot go back keeps its run directory.
+func (r *Runner) removeRunDirs(ctx context.Context, caseID, dir string, build bool) {
+	stays := false
+	if build && r.Ship != nil {
+		var err error
+		if stays, err = r.Ship.returnWork(ctx, caseID, dir); err != nil {
+			r.logf("build tree of %s: %v", caseID, err)
+		}
+	}
+	removeInputTree(HostDir(dir))
+	if !stays {
+		removeInputTree(dir)
+	}
+}
+
+// sweepRuns removes the run directories that neither a run nor a hold's receipt names (store.LoopRunKnown), which a
+// pass that ended between a build's preparation and its reservation (a crash) leaves: a build tree a package names in one goes back to its case first, and a directory
+// whose tree cannot go back stays. A pass sweeps when it starts, under the loop's lock, before it prepares any run of
+// its own, so every run directory then is an earlier pass's.
+func (r *Runner) sweepRuns(ctx context.Context) {
+	runs := filepath.Join(r.Dir, "runs")
+	entries, err := os.ReadDir(runs)
+	if err != nil {
+		return
+	}
+	ids := map[string]bool{}
+	for _, e := range entries {
+		id := e.Name()
+		if host, ok := strings.CutPrefix(id, "."); ok {
+			if id, ok = strings.CutSuffix(host, "-host"); !ok {
+				continue
+			}
+		}
+		ids[id] = true
+	}
+	for id := range ids {
+		if known, err := r.Store.LoopRunKnown(ctx, id); known || err != nil {
+			continue // a run or a hold's receipt names it, or the store cannot say
+		}
+		dir := filepath.Join(runs, id)
+		if r.Ship != nil {
+			if err := r.Ship.returnTrees(ctx, dir); err != nil {
+				r.logf("run directory %s, which no run names: %v", id, err)
+				continue
+			}
+		}
+		removeInputTree(HostDir(dir))
+		removeInputTree(dir)
+		r.logf("removed run directory %s, which no run names", id)
+	}
 }
 
 // inTurn is a turn's order of the families: as given, starting after the family the turn names (schedule), so the one
@@ -1012,7 +1077,15 @@ func (r *Runner) reservePrepared(ctx context.Context, run store.LoopRun) (store.
 	}
 	stored, err := r.Store.LoopRunByID(ctx, run.ID)
 	if err != nil {
-		return run, err.Error()
+		// the run never starts: its row ends unstarted and uncharged, naming no directory, before the caller removes
+		// what it prepared
+		ended := run
+		ended.Started, ended.Ended, ended.Status, ended.Failure, ended.USD, ended.Dir = time.Time{}, r.now(), store.RunFailed,
+			"reservation: "+err.Error(), 0, ""
+		if endErr := r.Store.PutLoopRun(context.WithoutCancel(ctx), ended); endErr != nil {
+			r.logf("run %s: its reservation could not be read (%v) or ended: %v", run.ID, err, endErr)
+		}
+		return ended, ended.Failure
 	}
 	run.CaseEpisode = stored.CaseEpisode
 	return run, ""
@@ -1135,49 +1208,46 @@ func (r *Runner) keepFindings(ctx context.Context, run store.LoopRun, f finding,
 }
 
 // affordable says why no run may start now: the day's or the week's spend, with the runs in flight counted at
-// their whole budget, would pass its limit.
+// their whole budget, would pass its limit. It is room for one run.
 func (r *Runner) affordable(ctx context.Context) (string, error) {
-	now := r.now()
-	for _, lim := range []struct {
-		name  string
-		since time.Time
-		usd   float64
-	}{{"day", now.Add(-24 * time.Hour), r.Budgets.Day}, {"week", now.Add(-7 * 24 * time.Hour), r.Budgets.Week}} {
-		spent, err := r.Store.LoopSpend(ctx, lim.since, r.Budgets.Run)
-		if err != nil {
-			return "", err
-		}
-		if spent+r.Budgets.Run > lim.usd {
-			return fmt.Sprintf("the loop's %s budget: $%.2f spent of $%.0f", lim.name, spent, lim.usd), nil
-		}
+	n, why, err := r.room(ctx, 1)
+	if err != nil || n > 0 {
+		return "", err
 	}
-	return "", nil
+	return why, nil
 }
 
-// room is how many runs, up to most, the day's and the week's budgets leave now, the smaller, and the budget that
-// binds it, as affordable names it. It counts the runs one by one with affordable's own test, each counted at its
-// whole budget as a reservation would be, so the room is the number of reservations affordable lets through.
+// room is how many runs, up to most, the day's and the week's budgets leave now (budgetNow), the smaller, and the
+// budget that binds it, as affordable names it. Spend, the run's budget and each limit count in whole micro-dollars
+// (runsThatFit), so the room is the number of reservations affordable lets through, one after another.
 func (r *Runner) room(ctx context.Context, most int) (int, string, error) {
-	now := r.now()
+	now := r.budgetNow()
 	n, why := -1, ""
 	for _, lim := range []struct {
 		name  string
 		since time.Time
 		usd   float64
 	}{{"day", now.Add(-24 * time.Hour), r.Budgets.Day}, {"week", now.Add(-7 * 24 * time.Hour), r.Budgets.Week}} {
-		spent, err := r.Store.LoopSpend(ctx, lim.since, r.Budgets.Run)
+		spent, err := r.Store.LoopSpendMicros(ctx, lim.since, r.Budgets.Run)
 		if err != nil {
 			return 0, "", err
 		}
-		left := 0
-		for counted := spent; left < most && !(counted+r.Budgets.Run > lim.usd); left++ {
-			counted += r.Budgets.Run
-		}
-		if n < 0 || left < n {
-			n, why = left, fmt.Sprintf("the loop's %s budget: $%.2f spent of $%.0f", lim.name, spent, lim.usd)
+		if left := runsThatFit(spent, store.Micros(r.Budgets.Run), store.Micros(lim.usd), most); n < 0 || left < n {
+			n, why = left, fmt.Sprintf("the loop's %s budget: $%.2f spent of $%.0f", lim.name, float64(spent)/1e6, lim.usd)
 		}
 	}
 	return n, why, nil
+}
+
+// runsThatFit is how many runs fit, up to most, when spent is spent of limit and each run counts run, all in whole
+// micro-dollars (store.Micros): a run fits while the spend with it stays within the limit. The budget check and the
+// room both count with it.
+func runsThatFit(spent, run, limit int64, most int) int {
+	n := 0
+	for ; n < most && store.AddMicros(spent, run) <= limit; n++ {
+		spent = store.AddMicros(spent, run)
+	}
+	return n
 }
 
 func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step string, run store.LoopRun) (Result, error) {

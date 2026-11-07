@@ -8,7 +8,7 @@ type outcome int
 const (
 	runReserved outcome = iota // a run was reserved: it starts with the pass
 	runReady                   // a build was prepared: it is reserved in its family's place
-	runRecorded                // a run was recorded and ended unstarted (a refusal of the budgets, a failed preparation)
+	runRecorded                // a run was recorded and ended unstarted (a refusal of the budgets, a failed preparation, an unreadable reservation)
 	// no run was recorded (a hold, inputs that could not be made, a pass that stops): the family's next case may run,
 	// but none after its ready build
 	runNone
