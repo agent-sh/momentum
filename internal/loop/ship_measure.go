@@ -750,8 +750,13 @@ const reflogPage = 1000
 // reflog, dated at or before the moment's second. The reflog dates a move to the whole second and the moment is
 // finer, so a move dated in the moment's own second is read as before it: a script that moves the checkout and then
 // installs is the common case, and an install followed by a move in the same second is read as if the move came first.
-// found is false when no entry is dated then (an empty reflog, one expired or cut by a new clone): HEAD as it stands is
-// all there is.
+// When HEAD's own reflog is empty or missing and HEAD names a branch, git lists the branch's reflog instead. That one
+// records the branch's own updates (a commit, a reset, a merge) and no checkout, so the commit read is the one the
+// branch named at the moment, whichever branch the checkout was on. The entry read is the move before the moment only
+// while the reflog's dates follow its order and it holds every move: a clock step between two moves dates one on the
+// wrong side of the moment, and gc.reflogExpireUnreachable removes, from the middle of the reflog, older entries that
+// move to or from a commit HEAD no longer reaches. found is false when no entry is dated then (an empty reflog, one
+// expired or cut by a new clone): HEAD as it stands is all there is.
 func (s *Ship) headAt(ctx context.Context, dir string, at time.Time) (commit string, found bool, err error) {
 	second := at.Unix()
 	for skip := 0; ; skip += reflogPage {

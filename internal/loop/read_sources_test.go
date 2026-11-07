@@ -692,10 +692,12 @@ func TestAPlanRechecksPartialReadsAtItsNewBoundary(t *testing.T) {
 	}
 }
 
-// A build first seen without the change stays rejected when the checkout moves back, until the file changes. The test
-// keeps a clock of its own, with each build seconds after the move before it: the reflog dates a move to the second
+// A build first seen without the change stays rejected when the checkout moves back, until the file changes, and the
+// run that sees the checkout hold the change gives the reason kept for the file. The test keeps a clock of its own,
+// with each build seconds after the move before it: the reflog dates a move to the second
 // (TestAnInstalledFileWrittenInTheSecondItsCheckoutMoved).
 func TestARejectedFirstBuildNeedsAnotherFileChange(t *testing.T) {
+	const didNotHold = "the checkout the installed file was built from did not hold"
 	m := measuredCase(t)
 	p, _, _ := m.r.Ship.Load(m.c.ID)
 	p.Plan.Installed = filepath.Join(t.TempDir(), "tool")
@@ -704,12 +706,12 @@ func TestARejectedFirstBuildNeedsAnotherFileChange(t *testing.T) {
 	datedGitIn(t, m.repo, base, "commit", "-qm", "before the change")
 	writeDated(t, p.Plan.Installed, "old build", base.Add(2500*time.Millisecond))
 	ctx := context.Background()
-	if _, why, err := m.r.Ship.InEffect(ctx, &p); err != nil || why == "" {
+	if _, why, err := m.r.Ship.InEffect(ctx, &p); err != nil || !strings.Contains(why, didNotHold) {
 		t.Fatalf("first absent build: %s %v", why, err)
 	}
 	datedGitIn(t, m.repo, base.Add(5*time.Second), "checkout", "-q", p.Landed[0])
-	if _, why, err := m.r.Ship.InEffect(ctx, &p); err != nil || why == "" {
-		t.Fatalf("checkout alone accepted the old build: %s %v", why, err)
+	if _, why, err := m.r.Ship.InEffect(ctx, &p); err != nil || !strings.Contains(why, didNotHold) {
+		t.Fatalf("checkout alone accepted the old build, or lost its reason: %s %v", why, err)
 	}
 	if p.CheckoutAt.IsZero() {
 		t.Fatal("waiting build lost the first checkout time")
@@ -831,26 +833,49 @@ func TestAnInstalledFileWrittenInTheSecondItsCheckoutMoved(t *testing.T) {
 	}
 }
 
-// HEAD's reflog is read newest first, a page at a time: one whose listing is longer than a whole stream still names
-// the commit HEAD named at the file's time.
+// HEAD's reflog is read newest first, a page at a time. One whose listing is longer than a whole stream still names
+// the commit HEAD named at the file's time, from its second page when a whole page of moves after the file comes
+// first. One whose every move is after the file names none, and HEAD as it stands is checked. A page read again
+// (a skip that does not move) never ends the walk, so the run's context ends: a minute is far above the few reads
+// a correct walk makes, which take milliseconds.
 func TestAReflogLongerThanAStreamIsReadInPages(t *testing.T) {
-	s := newSameSecond(t, []string{"a.txt"}, nil, func(t *testing.T, repo string) {
-		write(t, filepath.Join(repo, "a.txt"), "a, before the change\n")
-	})
-	s.move(s.landed, -59*time.Minute) // HEAD as it stands holds the change
-	var log strings.Builder
-	entry := func(from, to string, at time.Time) {
-		fmt.Fprintf(&log, "%s %s r <r@example.com> %d +0000\tcheckout: moving\n", from, to, at.Unix())
-	}
-	// each entry lists as a commit and its date, about 58 bytes: enough of them to pass the stream limit
-	for i := range MaxStream/50 + 1 {
-		entry(s.without, s.landed, s.base.Add(-time.Duration(MaxStream/50+1-i)*time.Second))
-	}
-	entry(s.landed, s.without, s.second)                  // off the change before the build
-	entry(s.without, s.landed, s.second.Add(time.Minute)) // and back onto it after
-	write(t, filepath.Join(s.m.repo, ".git", "logs", "HEAD"), log.String())
-	if why := s.install(300 * time.Millisecond); !strings.Contains(why, "the checkout the installed file was built from did not hold") {
-		t.Fatalf("a long reflog: %q", why)
+	for _, tc := range []struct {
+		name   string
+		before bool   // the reflog holds a stream's worth of moves onto the change, then one off it at the file's second
+		why    string // a part of the reason the file is out of effect
+	}{
+		{name: "the move before the file on the second page", before: true, why: "the checkout the installed file was built from did not hold"},
+		// HEAD stays on the commit without the change, and every move names the landed one
+		{name: "every move after the file", why: "the repository's checkout does not hold"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSameSecond(t, []string{"a.txt"}, nil, func(t *testing.T, repo string) {
+				write(t, filepath.Join(repo, "a.txt"), "a, before the change\n")
+			})
+			var log strings.Builder
+			entry := func(from, to string, at time.Time) {
+				fmt.Fprintf(&log, "%s %s r <r@example.com> %d +0000\tcheckout: moving\n", from, to, at.Unix())
+			}
+			if tc.before {
+				s.move(s.landed, -59*time.Minute) // HEAD as it stands holds the change
+				// each entry lists as a commit and its date, about 58 bytes: enough of them to pass the stream limit
+				for i := range MaxStream/50 + 1 {
+					entry(s.without, s.landed, s.base.Add(-time.Duration(MaxStream/50+1-i)*time.Second))
+				}
+				entry(s.landed, s.without, s.second) // off the change before the build
+			}
+			// a whole page of moves onto the change after the build, listed before any other
+			for i := range reflogPage {
+				entry(s.without, s.landed, s.second.Add(time.Duration(i+1)*time.Second))
+			}
+			write(t, filepath.Join(s.m.repo, ".git", "logs", "HEAD"), log.String())
+			writeDated(t, s.p.Plan.Installed, "a build", s.second.Add(300*time.Millisecond))
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			if _, why, err := s.m.r.Ship.InEffect(ctx, &s.p); err != nil || !strings.Contains(why, tc.why) {
+				t.Fatalf("a reflog read in pages: %q %v", why, err)
+			}
+		})
 	}
 }
 
