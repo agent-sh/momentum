@@ -86,6 +86,18 @@ func TestABuildIsToldItsPathsUpFront(t *testing.T) {
 	}
 }
 
+// A review is given the paths its build was given, so it does not ask a change for a fix in a path no change touches.
+func TestAReviewIsToldTheBuildsPaths(t *testing.T) {
+	for _, repo := range []string{SelfRepo, "agent-sh/fake"} {
+		prompt := reviewPrompt(store.Case{ID: "c1", Family: "sessions"}, Package{Repo: repo, Title: "a change"})
+		for _, want := range []string{"Review case c1 (sessions): a change.", "reviewed_files", buildScope(repo), "follow-up for a person"} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("the review prompt for %s lacks %q: %s", repo, want, prompt)
+			}
+		}
+	}
+}
+
 // A check's program must be one the sandbox can start: on a toolchain directory of its PATH or in /usr/bin and /bin.
 func TestACheckResolvesItsProgramOnTheSandboxPath(t *testing.T) {
 	tools, empty := t.TempDir(), t.TempDir()

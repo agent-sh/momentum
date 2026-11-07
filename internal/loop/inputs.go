@@ -323,7 +323,7 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 			return run, firstError(e, "review package is absent")
 		}
 		schema = reviewSchema
-		prompt = fmt.Sprintf("Review case %s (%s): %s. Read /run/input/case.json, /run/input/change.patch and /run/input/package.json. The proposed tree is read-only at /ro/change with no .git. /ro holds the shared pass inputs. End with a nonempty summary, findings and reviewed_files naming every changed file once.", c.ID, c.Family, p.Title)
+		prompt = reviewPrompt(c, p)
 		diff, e := r.reviewDiff(ctx, p)
 		if e != nil {
 			return run, e
