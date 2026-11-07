@@ -469,17 +469,19 @@ func TestAToolFoundByItsEventsNeedsTwoIncidents(t *testing.T) {
 // The signal's own tool is exempt from the two incidents only on the case's evidence, which its detector filed, never
 // on the plan's word, which a build writes (#101). A signal that names Bash, over one incident of Bash failures from six
 // directories, is refused where the case's evidence holds Edit failures beside them, and admitted with Bash as its unit
-// (224 hours of its use, and the failures' own 6) where every event of the evidence is of Bash; the refusal says whose
-// evidence over what span. Only the evidence in the 30 days before the proposal counts, the store's case retention,
-// whatever the window makes the history (#109): an Edit failure 29 days before, outside a one-week window's 28-day
-// history, refuses Bash under a window of one week as of two, and one 35 days before, inside a two-week window's 56-day
-// history, leaves Bash admitted under both. Evidence with no event in those 30 days leaves only the plan's word, so Bash
-// is refused: failures 40 days before under a two-week window, with an Edit failure a day before them or without one.
-// An event of the evidence the store no longer holds is of no tool, so Bash is refused.
+// (224 hours of its use, and the failures' own 6) where every event of the evidence is of Bash; the refusal says so.
+// The evidence is read whole, whenever dated, so no window decides (#109): an Edit failure 35 or 70 days before
+// refuses Bash under a window of one week (a 28-day history) as of two (56 days). Failures 40 days before admit Bash
+// under a two-week window (424 hours of its use, and the failures' 6), and an Edit failure a day before them refuses
+// it. A plan counted again 15 days later, as a hand landing counts it, keeps the guard the proposal had; once the
+// detector files an Edit failure dated after the proposal (and after the later count's boundary), the later count
+// refuses it, as intended: the problem is then not Bash's alone. An event of the evidence the store no longer holds is
+// of no tool, so Bash is refused.
 func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
 	now := time.Now().Truncate(time.Hour)
 	bash := serverSignal
 	bash.Tool = "Bash"
+	alone := "(1 tool in one incident alone; in 6 directories; of no MCP server"
 	t.Run("evidence of another tool beside it", func(t *testing.T) {
 		st := testStore(t)
 		var edits []store.Event
@@ -491,8 +493,8 @@ func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
 		}
 		c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" }, edits...)
 		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 7*aDay, "", now)
-		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), "(1 tool in one incident alone; in 6 directories; of no MCP server") ||
-			!strings.Contains(err.Error(), "the signal's own too unless the case's evidence in the 30d before holds an event and every one is of it;") {
+		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), alone) ||
+			!strings.Contains(err.Error(), "the signal's own too unless every event of the case's evidence is of it;") {
 			t.Fatalf("a named tool over evidence of two tools: %+v %v", g, err)
 		}
 	})
@@ -504,29 +506,22 @@ func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
 			t.Fatalf("a named tool over evidence all of it: %+v %v", g, err)
 		}
 	})
-	for _, tc := range []struct {
-		before   time.Duration // how long before the proposal the Edit failure is
-		admitted bool
-	}{{29 * aDay, false}, {35 * aDay, true}} {
+	for _, before := range []time.Duration{35 * aDay, 70 * aDay} {
 		for _, window := range []time.Duration{7 * aDay, 14 * aDay} {
-			t.Run(fmt.Sprintf("evidence of another tool %s before, a window of %s", days(tc.before), days(window)), func(t *testing.T) {
+			t.Run(fmt.Sprintf("evidence of another tool %s before, a window of %s", days(before), days(window)), func(t *testing.T) {
 				st := testStore(t)
-				edit := toolResult("edit-before", now.Add(-tc.before), "edit-before", true)
+				edit := toolResult("edit-before", now.Add(-before), "edit-before", true)
 				edit.Tool, edit.Cwd = "Edit", "/work/e"
 				c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" }, edit)
 				plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, window, "", now)
-				g, _ := guardOf(t, plan)
-				switch {
-				case tc.admitted && (err != nil || g == nil || g.Unit != "tool" || g.Tool != "Bash" || g.Exposure != 224+6):
-					t.Fatalf("a named tool over evidence of another tool before the case retention: %+v %v", g, err)
-				case !tc.admitted && (err == nil || !strings.Contains(err.Error(), "(1 tool in one incident alone; in 6 directories; of no MCP server")):
-					t.Fatalf("a named tool over evidence of another tool in the case retention: %+v %v", g, err)
+				if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), alone) {
+					t.Fatalf("a named tool over evidence of another tool before its history: %+v %v", g, err)
 				}
 			})
 		}
 	}
 	for _, withEdit := range []bool{true, false} {
-		t.Run(fmt.Sprint("no evidence in the 30 days before, an Edit failure beside it: ", withEdit), func(t *testing.T) {
+		t.Run(fmt.Sprint("evidence 40 days before, an Edit failure beside it: ", withEdit), func(t *testing.T) {
 			st := testStore(t)
 			var extra []store.Event
 			if withEdit {
@@ -540,11 +535,58 @@ func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
 				t.Fatal(err)
 			}
 			plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 14*aDay, "", now)
-			if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), "(1 tool in one incident alone; in 6 directories; of no MCP server") {
-				t.Fatalf("a named tool over evidence with none in the case retention: %+v %v", g, err)
+			g, _ := guardOf(t, plan)
+			switch {
+			case withEdit && (err == nil || !strings.Contains(err.Error(), alone)):
+				t.Fatalf("a named tool over old evidence of two tools: %+v %v", g, err)
+			case !withEdit && (err != nil || g == nil || g.Unit != "tool" || g.Tool != "Bash" || g.Exposure != 424+6):
+				t.Fatalf("a named tool over old evidence all of it: %+v %v", g, err)
 			}
 		})
 	}
+	// laterCount is a case whose evidence, all of Bash, is 20 days before a proposal 15 days ago, the source read
+	// through read, and its guard as proposed then: admitted with Bash as its unit.
+	laterCount := func(t *testing.T, read time.Time) (*store.Store, store.Case) {
+		t.Helper()
+		st := testStore(t)
+		proposed := now.Add(-15 * aDay)
+		c := oneIncidentOf(t, st, proposed.Add(-5*aDay), now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" })
+		if err := st.MarkRead(t.Context(), toolSignal.Source, read); err != nil {
+			t.Fatal(err)
+		}
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 14*aDay, "", proposed)
+		if g, _ := guardOf(t, plan); err != nil || g == nil || g.Unit != "tool" || g.Tool != "Bash" {
+			t.Fatalf("at the proposal: %+v %v", g, err)
+		}
+		return st, c
+	}
+	t.Run("counted again 15 days later", func(t *testing.T) {
+		st, c := laterCount(t, now)
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 14*aDay, "", now)
+		if g, _ := guardOf(t, plan); err != nil || g == nil || g.Unit != "tool" || g.Tool != "Bash" {
+			t.Fatalf("counted again 15 days after the proposal: %+v %v", g, err)
+		}
+	})
+	t.Run("evidence of another tool filed after the proposal", func(t *testing.T) {
+		st, c := laterCount(t, now.Add(-2*aDay))
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 14*aDay, "", now)
+		if g, _ := guardOf(t, plan); err != nil || g == nil || g.Unit != "tool" || g.Tool != "Bash" {
+			t.Fatalf("counted again before the detector filed more: %+v %v", g, err)
+		}
+		// the detector files an Edit failure of the case's problem, dated after the proposal and after the later
+		// count's boundary (the source read two days ago)
+		edit := toolResult("edit-after", now.Add(-aDay), "edit-after", true)
+		edit.Tool, edit.Cwd = "Edit", "/work/e"
+		put(t, st, []store.Event{edit})
+		f := store.Finding{Family: "failures", Signature: "failures/v2:zz-one-incident", Title: "the tool fails", Evidence: []store.Evidence{{Ref: "ev:" + edit.ID()}}}
+		if _, _, err := st.ObserveCase(t.Context(), f, "detector"); err != nil {
+			t.Fatal(err)
+		}
+		plan, err = (&Ship{Store: st}).validPlan(t.Context(), c, bash, 14*aDay, "", now)
+		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), alone) {
+			t.Fatalf("counted again after the detector filed evidence of another tool: %+v %v", g, err)
+		}
+	})
 	t.Run("evidence the store no longer holds", func(t *testing.T) {
 		st, path := testStoreAt(t)
 		c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" })
