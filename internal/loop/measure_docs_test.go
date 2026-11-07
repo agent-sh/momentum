@@ -29,7 +29,7 @@ func TestMeasurementDocsStateTheReadAndInEffectRules(t *testing.T) {
 		"A clock set back between a move and the file (either way round) dates that move on the wrong side of the file",
 		"Git's `gc.reflogExpire` (90 days by default) removes every entry older than that",
 		"`gc.reflogExpireUnreachable` (30 days by default) removes older entries that move to or from a commit no ref reaches (in a branch's own reflog, one the branch does not reach), the newest one too",
-		"Git 2.50.0 through 2.56.0 swap the two defaults, so on those releases every entry older than 30 days goes unless `gc.reflogExpire` is set, or a `gc.<pattern>.reflogExpire*` entry whose pattern matches the reflog read (`HEAD` for HEAD's own reflog; the branch only when git falls back to its reflog); a matching pattern entry sets both limits, and the one it leaves unset never expires",
+		"Git 2.50.0 through 2.56.0 swap the two defaults, so on those releases every entry older than 30 days goes unless `gc.reflogExpire` is set, or a `gc.<pattern>.reflogExpire*` entry whose pattern matches the reflog read (`HEAD` for HEAD's own reflog; the branch's full ref name, such as `refs/heads/main`, only when git falls back to its reflog); the first matching pattern entry, in config order, sets both limits, and the one it leaves unset never expires",
 		"one expired after 90 days without a move, or 30 on git 2.50.0 through 2.56.0",
 		"later runs give that reason while the file stands",
 		"is not the file's and is not kept",
