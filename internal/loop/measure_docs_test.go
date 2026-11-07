@@ -26,6 +26,8 @@ func TestMeasurementDocsStateTheReadAndInEffectRules(t *testing.T) {
 		"the reflog's next entry by its place, not by its time",
 		"`the checkout moved in the second the file was installed: install again to measure`",
 		"later runs give that reason while the file stands",
+		"While the reflog reaches back to the file, a false in effect cannot come of it",
+		"is not the file's and is not kept",
 		"lies in a directory of `loop.read_dirs`, which a run cannot write, and not in the build's work tree",
 		"The step opens the file once, without following a last link and without waiting on a pipe",
 		"the session scanners that write the sessions events",
