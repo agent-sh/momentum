@@ -227,6 +227,10 @@ type Guard struct {
 	Cwds      []string `json:"-"`
 	Incidents int      `json:"incidents"` // in the history
 	Exposure  int      `json:"exposure"`  // units of exposure in the history
+	// Counted is when its plan was counted: the proposal's own time, or a hand landing's recount as of the landing. The
+	// count weighed the case's evidence dated before it (the own-tool check), and the watch reads the rest
+	// (guardEvidenceFrom), so each piece is weighed by one of the two.
+	Counted time.Time `json:"counted,omitzero"`
 }
 
 // guardFields is a Guard without its JSON methods.
