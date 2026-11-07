@@ -128,7 +128,7 @@ CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, kind TEXT NOT NULL, title
   detail TEXT NOT NULL DEFAULT '', effect TEXT NOT NULL DEFAULT '', links TEXT NOT NULL DEFAULT '[]',
   source TEXT NOT NULL DEFAULT '', importance INTEGER NOT NULL DEFAULT 0, at INTEGER NOT NULL,
   done INTEGER NOT NULL DEFAULT 0);
-` + capacityTables + caseTables + loopTables
+` + capacityTables + caseTables + loopTables + requestTables
 
 // keptColumns are the columns each kept table gained after it was first made, in order. A table that lacks one
 // gains it and keeps its rows: SQLite's ADD COLUMN writes no row, so it costs the same on any table. The next
@@ -439,7 +439,7 @@ func busy(err error) bool {
 
 // keptTableNames are the tables keptTables makes.
 var keptTableNames = slices.Concat([]string{"events", "session_stamps", "schema_steps", "event_seq", "notes"}, capacityTableNames, caseTableNames,
-	loopTableNames)
+	loopTableNames, requestTableNames)
 
 // checkpointColumns are the columns the schema gives the checkpoint tables. They are a cache of what transcripts
 // hold, so tables with other columns (a build before this one made them) are dropped and made again, and the next

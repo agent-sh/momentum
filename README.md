@@ -123,6 +123,21 @@ Four sections are notes: needs you (each title is the question, or what momentum
 
 `running` is computed live, by the scan `momentum sessions` makes: the sessions that are working, and the workflows, agents, background jobs and monitors in any session. The report resumes that scan from the checkpoints the last `momentum sessions` run saved, so with the sessions timer running it costs about what that run costs. It opens the store read-only and writes nothing; with no store, or one that is not this build's schema (the next `momentum sessions` of this build migrates it), it prints nothing and exits 3. Its scan has 3 seconds and reads the harnesses at once: a harness that fails is named on stderr and running keeps what it read, one not done by then is named and left out, and the report still prints.
 
+## Requests
+
+```
+momentum request list [--since WHEN] [--json]   the owner's requests with events since WHEN (default 7d), newest first
+momentum request handoff ID                     the text to paste into another session to continue a request
+momentum request check ID                       check the request's newest result; a newer result reopens it
+momentum request uncheck ID                     undo the check
+```
+
+A request is a piece of work the owner asked for, across the sessions it ran in. momentum groups it from the store's events by rules, with no model: the owner's turn opens it, his later turns in the same conversation follow it up, and links join other sessions to it: a subagent, a session that names it as its parent, a fork or resume that carries its turns over (the same words at the same millisecond), and a handoff's id pasted into a turn. One conversation is one request until a pasted handoff names another; splitting the asks inside one conversation would need a model's guess, which this version does not make.
+
+Its results are what its tools printed: commits, pushes, pull requests from `gh pr create`, and files its write tools changed. The agent's last reply is its claim, shown apart. The state comes from observations only: `needs_you` or `working` from the last sessions run that saw a session of it, `checked` while the owner's check holds the newest result, `unknown` when no sessions run recorded the latest session's phase, `ready` when a result came after the last turn, else `open`. Nothing says done.
+
+`handoff` takes a request's id, or a session's id or its start. Its text opens and closes with the line `momentum request ID`, so the session it is pasted into links back. `list` and `handoff` open the store read-only; checks are kept in it like notes. See [Requests](SPEC.md#requests).
+
 ## Capacity
 
 ```

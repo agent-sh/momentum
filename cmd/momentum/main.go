@@ -51,6 +51,13 @@ const usage = `usage:
   momentum note done ID                 take a note out of the report: resolve a needs or problem note,
                                         withdraw a decided or shipped one
   momentum note list [--json]           every note, newest first, and whether the report shows it
+  momentum request list [--since WHEN] [--json]
+                                        the owner's requests across their sessions, newest first, with their
+                                        state from what was observed; changes nothing
+  momentum request handoff ID           the text to paste into another session to continue a request; ID is a
+                                        request's id, or a session's id or its start; changes nothing
+  momentum request check ID | uncheck ID
+                                        check a request's newest result (a newer one reopens it), or undo the check
   momentum supervise [--dry] [--json]   scan the sessions, then continue the ones that stopped where a rule says
                                         it may: every decision is an event of source supervise
   momentum supervise replay [--since WHEN] [--until WHEN] [--labels FILE] [--anchor] [--points FILE]
@@ -165,6 +172,8 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		err = reportCmd(ctx, args[1:], stdout, stderr)
 	case "note":
 		err = noteCmd(ctx, args[1:], stdout, stderr)
+	case "request":
+		err = requestCmd(ctx, args[1:], stdout, stderr)
 	case "supervise":
 		err = superviseCmd(ctx, args[1:], stdout, stderr)
 	case "capacity":
