@@ -371,3 +371,41 @@ func TestNamingTheFixOfAStopClosedBeforeItResumesWithoutAReopen(t *testing.T) {
 		t.Fatalf("the fix that did not hold: %+v, %+v", back, log[len(log)-1])
 	}
 }
+
+// A stopped note dated in the millisecond of its case's resume came before the resume: the stop rule counts runs from
+// the millisecond after it, so a stop after the resume puts the note again, as one a millisecond older.
+func TestAStopNoteInTheResumesMillisecondStandsAgain(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "marker-7f3a-resumed", 1)
+	why := "its last two review runs failed the same way: marker-7f3a"
+	if err := r.noteReviewSkip(ctx, c, "stopped", why); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CaseNote(ctx, c.ID, store.ActionResumed, "fixture", "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := st.ResumedAt(ctx, c.ID)
+	if err != nil || resumed.IsZero() {
+		t.Fatalf("the resume: %v %v", resumed, err)
+	}
+	id := store.ReviewNoteID(c.ID, "stopped")
+	n, ok, err := st.Note(ctx, id)
+	if err != nil || !ok {
+		t.Fatalf("the stopped note: %v", err)
+	}
+	n.At = resumed // the stop's note and the resume in one millisecond
+	if _, err := st.PutNote(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.DoneNote(ctx, id, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.noteReviewSkip(ctx, c, "stopped", why); err != nil {
+		t.Fatal(err)
+	}
+	if n, _, _ := st.Note(ctx, id); !n.Done.IsZero() {
+		t.Fatalf("a stop after a resume in its note's millisecond left the note done: %+v", n)
+	}
+}

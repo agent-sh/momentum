@@ -290,8 +290,10 @@ func (r *Runner) noteReviewSkip(ctx context.Context, c store.Case, cause, why st
 		return err
 	}
 	for _, note := range notes {
-		if note.ID == id && note.Detail == detail && (note.Done.IsZero() || cause != "stopped" || !resumed.After(note.At)) {
-			return nil // the same cause stays resolved if its reader resolved it; a stopped note, until the case resumes past it
+		// the same cause stays resolved if its reader resolved it; a stopped note, until the case resumes past it. A note in
+		// the resume's millisecond came before it: the stop rule counts runs from the millisecond after the resume.
+		if note.ID == id && note.Detail == detail && (note.Done.IsZero() || cause != "stopped" || note.At.After(resumed)) {
+			return nil
 		}
 	}
 	_, err = r.Store.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Importance: store.ImportanceLow,
