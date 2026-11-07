@@ -422,9 +422,6 @@ func TestARemoteCallEndsAtItsDeadline(t *testing.T) {
 			pidFile := filepath.Join(t.TempDir(), "pid")
 			switch name {
 			case "https fetch":
-				if why := noHTTPS(t); why != "" {
-					t.Skip(why)
-				}
 				url = fmt.Sprintf("https://127.0.0.1:%d/x.git", port)
 			case "an ssh that ignores SIGTERM":
 				bin := t.TempDir()
@@ -439,6 +436,12 @@ func TestARemoteCallEndsAtItsDeadline(t *testing.T) {
 				_, err = ship.git(ctx, f.main, "ls-remote", url, "HEAD")
 			} else {
 				_, err = fetchGit(ctx, mirrorCall{mirror: mirror}, "ls-remote", url, "HEAD")
+			}
+			if name == "https fetch" && (err == nil || !strings.Contains(err.Error(), "the caller's deadline passed")) {
+				// the call ended before its deadline: the probe, run only then, says whether Git can make one here
+				if why := noHTTPS(t); why != "" {
+					t.Skip(why)
+				}
 			}
 			if took := time.Since(start); took > bound {
 				t.Fatalf("the call returned %s after its %s deadline", took.Round(time.Second), deadline)
