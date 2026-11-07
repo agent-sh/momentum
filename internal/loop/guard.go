@@ -131,8 +131,9 @@ func setGuard(g *Guard, h measure.GuardHistory) {
 }
 
 // sharedUnit is what a guard's exposure is narrowed to: the signal's tool; else the tool every event of its history
-// was of; else the directory they all ran in. ok is false when they share none: then every activity would count as
-// the problem's unit in use.
+// was of; else the directory they all ran in, compared as the store keeps it now (store.CleanCwd), since a row stored
+// before the store cleaned working directories keeps its form until its source is read again. ok is false when they
+// share none: then every activity would count as the problem's unit in use.
 func sharedUnit(sig Signal, units string, hits []store.Event) (tool, cwd string, ok bool) {
 	if sig.Tool != "" && units != OwnerHours {
 		return sig.Tool, "", true
@@ -149,7 +150,7 @@ func sharedUnit(sig Signal, units string, hits []store.Event) (tool, cwd string,
 	if t := same(func(e store.Event) string { return e.Tool }); t != "" && units != OwnerHours {
 		return t, "", true
 	}
-	if d := same(func(e store.Event) string { return e.Cwd }); d != "" {
+	if d := same(func(e store.Event) string { return store.CleanCwd(e.Cwd) }); d != "" {
 		return "", d, true
 	}
 	return "", "", false
@@ -371,42 +372,56 @@ func guardEffectTime(c store.Case, p *Package, seen time.Time) time.Time {
 	return at
 }
 
-// guardBehind names the sources of a guard's plan whose newest read did not start after the end of its watch:
-// for an ingest source a complete read, or one that read in part with every failed file older than its start.
+// guardBehind names the sources of a guard's plan whose newest read did not start after the end of its watch (for an
+// ingest source a complete read, or one that read in part with every failed file older than its start), and the ones
+// it leaves out.
 //
 // An ingest source that has read only in part since the end is left out a window (the plan's) after the end, as a
 // stopped command source is (liveSources): a file it fails on for good would otherwise hold the close for good. So is
 // one with no read at all since the end, but the signal's own source: a reader that no longer runs would hold it for
 // good, and the signal's source is the one whose recurrences the watch reads, so it holds the close, with its note.
-func (r *Runner) guardBehind(ctx context.Context, plan Plan, from, end, now time.Time) ([]string, error) {
-	var behind []string
+func (r *Runner) guardBehind(ctx context.Context, plan Plan, from, end, now time.Time) (behind, out []string, err error) {
 	for _, source := range plan.Sources {
 		read, err := r.Store.HarnessReadPast(ctx, source, planHarness(plan), from)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if read.After(end) {
 			continue
 		}
 		if !slices.Contains(commandSources, source) && now.Sub(end) > plan.Window {
-			if partial, err := r.Store.PartialReadAfter(ctx, source, end); err != nil {
-				return nil, err
-			} else if !partial.IsZero() {
-				continue // it reads, in part only, past the end: left out
+			partial, err := r.Store.PartialReadAfter(ctx, source, end)
+			if err != nil {
+				return nil, nil, err
 			}
-			if source != plan.Signal.Source {
-				continue // no read since the end, a window after it: left out
+			// it reads, in part only, past the end; or it has not read since the end, and is not the signal's: left out
+			if !partial.IsZero() || source != plan.Signal.Source {
+				out = append(out, source)
+				continue
 			}
 		}
 		behind = append(behind, source)
 	}
-	return behind, nil
+	return behind, out, nil
+}
+
+// guardCounted is a guard's plan with the sources its close leaves out (guardBehind) taken out of its sources, so they
+// count in neither its history's recount nor its exposure watched, as a stopped source counts on neither side of a
+// measured plan (countingPlan). The signal's own source stays: no plan counts without it, and its recurrences are what
+// the watch reads.
+func guardCounted(plan Plan, out []string) Plan {
+	plan.Sources = slices.DeleteFunc(slices.Clone(plan.Sources), func(source string) bool {
+		return source != plan.Signal.Source && slices.Contains(out, source)
+	})
+	return plan
 }
 
 // guardRecount counts a guard's history again through its watch's start: the plan was counted at the proposal, and
 // the change may take effect much later. From the start on, an event is a recurrence, never history. It starts where
 // the proposal's count did and drops the incident the source began with as that count did, so an event of that
-// incident stored since does not count as another. The caller has seen every source read past the start.
+// incident stored since does not count as another. The caller gives the plan with the sources its close left out
+// taken out (guardCounted), and has seen each of the others read past the end, so past the start; the signal's own
+// source may have read past it only in part.
 func (r *Runner) guardRecount(ctx context.Context, plan Plan, from time.Time) (*Guard, error) {
 	g := *plan.Guard
 	begun, anchored := g.Since, false
@@ -457,9 +472,10 @@ func (r *Runner) guardRegressed(ctx context.Context, c store.Case, p *Package, p
 // guardCase is the measure step for a measuring case whose plan is a guard, once its change is in effect. Any event
 // its signal counts, or of the case's own evidence, from the watch's first start is a recurrence (guardRegressed): that
 // is counted before any wait. The watch ends 30 days (guardRetention) after its first start, on the first pass after
-// each live source of its plan has read past that (guardBehind); then, with no recurrence, it closes the case as
-// guarded, never improved, with the exposure watched (its stretches out of effect left out) and P, had the problem
-// kept happening, or that it was not watched at all.
+// each live source of its plan has read past that, or is left out (guardBehind); then, with no recurrence, it closes
+// the case as guarded, never improved, with its history counted again and the exposure watched (its stretches out of
+// effect left out), both over the sources it kept (guardCounted), and P, had the problem kept happening, or that it
+// was not watched at all, and why.
 func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan Plan, m Measured, now time.Time, dry bool) Measured {
 	g := *plan.Guard
 	m.Guarded = true
@@ -488,7 +504,8 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 	}
 	// each live source must have read past the end: its newest read, never a stretch read whole, which one failed run
 	// would make a wait for good
-	if behind, err := r.guardBehind(ctx, plan, from, end, now); err != nil {
+	behind, out, err := r.guardBehind(ctx, plan, from, end, now)
+	if err != nil {
 		return failed(err)
 	} else if len(behind) > 0 {
 		m.Status = "waiting"
@@ -498,7 +515,10 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 		}
 		return m
 	}
-	// every source has read past the watch's end, and so past its start: its history is counted through the start
+	// every source it keeps has read past the watch's end, and so past its start (the signal's own perhaps only in
+	// part): its history is counted through the start, and its exposure watched, over those sources alone
+	all := plan
+	plan = guardCounted(plan, out)
 	counted, err := r.guardRecount(ctx, plan, from)
 	if err != nil {
 		return failed(err)
@@ -516,6 +536,13 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 			return failed(err)
 		} else if len(used) > 0 { // used, but only while the change was out of effect
 			res = measure.GuardedAway(g.Incidents, g.Exposure, plan.Units)
+		}
+	}
+	if res.Unwatched && measure.GuardNotWatched(res.Effect) == measure.GuardUnused && len(plan.Sources) < len(all.Sources) {
+		if used, err := guardExposure(ctx, r.Store, all, nil, from, end, r.Dir); err != nil {
+			return failed(err)
+		} else if len(used) > 0 { // used, but only in the sources left out
+			res = measure.GuardedLeftOut(g.Incidents, g.Exposure, plan.Units)
 		}
 	}
 	m.Result, m.Status = &res, "guarded"

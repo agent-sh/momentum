@@ -1548,8 +1548,10 @@ func (s *Store) DeployCase(ctx context.Context, id, pkg string, at time.Time, wh
 	return c, tx.Commit()
 }
 
-// RollBackCase is the ship tool's: a deployed or measuring case whose change was undone goes back to testing,
-// with no measurement, since its change is gone.
+// RollBackCase is the ship tool's: a deployed or measuring case whose change was undone goes back to testing. A
+// measuring one loses every measurement column, since they are its change's and its change is gone. A deployed one's
+// change was never measured, so its columns hold the last measurement of a change before it, which it keeps
+// (clearGuard), as a case that comes back does.
 func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, error) {
 	why, err := cleanText(ctx, why)
 	if err != nil {
@@ -1567,7 +1569,11 @@ func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, 
 	if c.Status != CaseDeployed && c.Status != CaseMeasuring {
 		return Case{}, badCase("case %s is %s: only a deployed or measuring case rolls back", c.ID, c.Status)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, deployed = 0, `+clearMeasurement+`, updated = ? WHERE id = ?`,
+	columns := clearMeasurement
+	if c.Status == CaseDeployed {
+		columns = clearGuard
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, deployed = 0, `+columns+`, updated = ? WHERE id = ?`,
 		CaseTesting, time.Now().UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
@@ -1712,8 +1718,8 @@ const clearGuard = `window_ms = CASE WHEN guard_exposure > 0 THEN 0 ELSE window_
   after_n = CASE WHEN guard_exposure > 0 THEN 0 ELSE after_n END, effect = CASE WHEN guard_exposure > 0 THEN '' ELSE effect END,
   guard_exposure = 0, guard_watched = 0, guard_recur = 0`
 
-// clearMeasurement empties every measurement and guard column: a rollback takes the change away, and with it what was
-// measured of it.
+// clearMeasurement empties every measurement and guard column: a rollback of a measuring change takes the change
+// away, and with it what was measured of it.
 const clearMeasurement = `guard_exposure = 0, guard_watched = 0, guard_recur = 0, window_ms = 0, before_n = 0, after_n = 0, effect = ''`
 
 // CloseGuarded is the measure tool's: a measuring case whose guard's watch ended with no recurrence closes as guarded,

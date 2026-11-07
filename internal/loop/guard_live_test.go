@@ -153,7 +153,8 @@ func TestTheClosesRecountDropsTheIncidentItsSourceBeganWith(t *testing.T) {
 // guard plan of four bursts, lands its change within three days (its file dated between the landing and the first pass
 // that sees it), and runs the measure step every three hours while the machine is awake. Its sources: the signal's (an
 // ingest source, whose scans now and then read in part, which a rebuild may drop and read again, to which an older
-// build writes some events without a write sequence, and which may be switched off for days), the sessions scan (a
+// build writes some events without a write sequence, which may be switched off for days, and which may read only in
+// part from the watch's end on, its failed files newer than the watch's start), the sessions scan (a
 // command source, read every twelve minutes while awake: a night or days asleep leave one incomplete run, and it may
 // stop for good), one switched off at some point, and one that began inside the plan's span. The change may go out of
 // effect for a while; the unit may go unused for two weeks, or the whole watch; the loop may be live. A recurrence, in
@@ -173,7 +174,7 @@ func TestTheGuardsLivenessOverSimulatedHistories(t *testing.T) {
 		{}, {signalStop: true}, {idle: true}, {unused: true}, {},
 		{recur: "during"}, {recur: "during", live: true}, {recur: "during", signalStop: true},
 		{recur: "after"}, {recur: "after", live: true}, {recur: "after", signalStop: true},
-		{recur: "evidence"}, {recur: "evidence", live: true}, {recur: "sighting"},
+		{recur: "evidence"}, {recur: "evidence", live: true}, {recur: "sighting"}, {partial: true},
 	}
 	for i, h := range histories {
 		h.seed = uint64(8000 + i)
@@ -192,11 +193,12 @@ type simHistory struct {
 	idle       bool   // the unit unused for two weeks inside the watch
 	unused     bool   // the unit unused from the landing on
 	signalStop bool   // the signal's own source switched off for one to six days
+	partial    bool   // the signal's own source reads only in part from the watch's end on, its failed files in the watch
 }
 
 func (h simHistory) String() string {
 	name := fmt.Sprint(h.seed, "-", map[string]string{"": "quiet"}[h.recur], h.recur)
-	for flag, on := range map[string]bool{"live": h.live, "idle": h.idle, "unused": h.unused, "signal-stop": h.signalStop} {
+	for flag, on := range map[string]bool{"live": h.live, "idle": h.idle, "unused": h.unused, "signal-stop": h.signalStop, "partial": h.partial} {
 		if on {
 			name += "-" + flag
 		}
@@ -423,9 +425,10 @@ func simulateGuard(t *testing.T, h simHistory) {
 				delete(shown, toolSignal.Source) // its events must be read again
 				partialAfterEnd = time.Time{}    // and its partial runs go with its reads
 			}
-			if rng.IntN(100) < 8 { // a scan of the signal's source that read in part
+			partialOnly := h.partial && !end.IsZero() && at.After(end)
+			if partialOnly || rng.IntN(100) < 8 { // a scan of the signal's source that read in part
 				failed := at.Add(-time.Hour)
-				if rng.IntN(2) == 0 {
+				if !partialOnly && rng.IntN(2) == 0 {
 					failed = landed.Add(-aDay)
 				}
 				if err := st.MarkPartialRead(ctx, toolSignal.Source, at, failed); err != nil {
@@ -682,7 +685,8 @@ func TestAGuardedCloseReadsAStoreWhoseSequenceWentBelowItsCursor(t *testing.T) {
 
 // A guard's exposure watched leaves out the stretches its change was out of effect: seen in effect after its first
 // week's use, then out of effect for the rest of its 30 days, it closes as guarded with only the 25 hours it watched
-// before that.
+// before that. The closing pass is the first to see the change in effect again, and a dry one says the same: the
+// stretch that pass ends is left out of its copy of the package too.
 func TestAGuardsExposureWatchedLeavesOutItsStretchesOutOfEffect(t *testing.T) {
 	m := guarded(t, time.Hour, toolSignal.Source, nil)
 	m.pass(t, Options{})
@@ -697,8 +701,10 @@ func TestAGuardsExposureWatchedLeavesOutItsStretchesOutOfEffect(t *testing.T) {
 	}
 	run(t, m.repo, "git", "checkout", "-q", "main")
 	m.clock = start.Add(30*aDay + time.Hour)
-	if got := m.pass(t, Options{}); got.Status != "guarded" || got.Result == nil || !strings.Contains(got.Result.Effect, "no recurrence in 25 session hours watched") {
-		t.Fatalf("a watch out of effect for 28 of its days: %+v %+v", got, got.Result)
+	for _, o := range []Options{{Dry: true}, {}} {
+		if got := m.pass(t, o); got.Status != "guarded" || got.Result == nil || !strings.Contains(got.Result.Effect, "no recurrence in 25 session hours watched") {
+			t.Fatalf("a watch out of effect for 28 of its days, dry %v: %+v %+v", o.Dry, got, got.Result)
+		}
 	}
 }
 
@@ -894,8 +900,9 @@ func TestAGuardsEvidenceIsDecidedByOneRule(t *testing.T) {
 }
 
 // An ingest source that has read only in part since a watch's end, its failed files newer than the watch's start, is
-// left out a window (the plan's) after the end: before that the watch waits for it, after it the watch closes. A pass
-// after the 30 days whose signal's newest complete read started before the end waits.
+// left out a window (the plan's) after the end: before that the watch waits for it, after it the watch closes, the
+// signal's source still in its counts. A pass after the 30 days whose signal's newest complete read started before the
+// end waits.
 func TestAGuardWaitsForItsSignalsReadPastTheEndForAWindow(t *testing.T) {
 	ctx := context.Background()
 	m := guarded(t, time.Hour, toolSignal.Source, nil)
@@ -924,16 +931,23 @@ func TestAGuardWaitsForItsSignalsReadPastTheEndForAWindow(t *testing.T) {
 	}
 	m.clock = end.Add(7*aDay + time.Hour)
 	partial(m.clock.Add(-10 * time.Minute))
-	if got := m.measure(t, Options{}); got.Status != "guarded" {
-		t.Fatalf("a window past the end, read only in part since it: %+v", got)
+	// left out of the close, the signal's source stays in its counts: its 125 hours of use are watched
+	if got := m.measure(t, Options{}); got.Status != "guarded" || got.Result == nil || got.Result.Watched != 125 {
+		t.Fatalf("a window past the end, read only in part since it: %+v %+v", got, got.Result)
 	}
 }
 
-// A guard's recurrence stored while its change is out of effect is acted on at the next pass, still out of effect.
+// A guard's recurrence stored while its change is out of effect is acted on at the next pass, still out of effect. Its
+// exposure watched leaves out the stretch still out of effect, from the last pass that saw the change in effect: of
+// 25 hours of use before that pass, 10 after it and the recurrence's own hour, it watched 25.
 func TestAGuardsRecurrenceWhileOutOfEffectIsActedOnAtTheNextPass(t *testing.T) {
 	m := guarded(t, time.Hour, toolSignal.Source, nil)
 	m.pass(t, Options{})
 	start := m.clock
+	usesIn(t, m.st, toolSignal.Source, "in-", start.Add(time.Hour), 25, 5)
+	m.clock = start.Add(aDay)
+	m.pass(t, Options{}) // the last pass that sees it in effect
+	usesIn(t, m.st, toolSignal.Source, "away-", start.Add(aDay+time.Hour), 10, 5)
 	run(t, m.repo, "git", "checkout", "-q", "HEAD~1")
 	m.clock = start.Add(2 * aDay)
 	if got := m.pass(t, Options{}); got.Status != "waiting" {
@@ -941,8 +955,8 @@ func TestAGuardsRecurrenceWhileOutOfEffectIsActedOnAtTheNextPass(t *testing.T) {
 	}
 	put(t, m.st, []store.Event{toolResult("again", start.Add(2*aDay+time.Hour), "again", true)})
 	m.clock = start.Add(2*aDay + 2*time.Hour)
-	if got := m.pass(t, Options{}); got.Status != "held" {
-		t.Fatalf("a recurrence while out of effect was not acted on at the next pass: %+v", got)
+	if got := m.pass(t, Options{}); got.Status != "held" || got.Result == nil || got.Result.Watched != 25 || !strings.Contains(got.Why, "1 of 25 session hours watched") {
+		t.Fatalf("a recurrence while out of effect, at the next pass: %+v %+v", got, got.Result)
 	}
 }
 

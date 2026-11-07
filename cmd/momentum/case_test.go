@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/detect"
+	"github.com/agent-sh/momentum/internal/evidenceview"
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -604,6 +605,77 @@ func TestCaseJSONSaysWhatAGuardWatched(t *testing.T) {
 			if strings.Contains(string(raw), w) {
 				t.Errorf("%+v: %s in %s", tc, w, raw)
 			}
+		}
+	}
+}
+
+// A measurement a case keeps from an earlier episode is labelled its last: case show prints it as last measured and
+// case show --json marks it last, once the case has come back and on through its next change, while deployed. Its own
+// close as improved prints it as measured, unmarked.
+func TestCaseShowLabelsAKeptMeasurementAsTheLast(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "m.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	e := store.Event{Source: "zz", SourceKey: "1", TS: time.Now().Add(-48 * time.Hour), Actor: store.ActorTool, Kind: "tool_result", Summary: "failed"}
+	if _, err := st.Put(ctx, []store.Event{e}); err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: "failures/v2:zz-last", Title: "it fails", Evidence: []store.Evidence{{Ref: "ev:" + e.ID()}}}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mech, next := "m", "n"
+	toTesting := func() {
+		t.Helper()
+		if _, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mech, NextTest: &next}, "agent"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	toTesting()
+	deployed := time.Now().Add(-40 * 24 * time.Hour)
+	if _, err := st.DeployCase(ctx, c.ID, filepath.Join(t.TempDir(), "p1"), deployed, "landed", "loop:ship"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.StartMeasuring(ctx, c.ID, 7*24*time.Hour, 6, deployed, "loop:measure"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CloseMeasured(ctx, c.ID, 1, "6 of 100 before, 1 of 100 after", "loop:measure"); err != nil {
+		t.Fatal(err)
+	}
+	views := func(t *testing.T) (string, string) {
+		t.Helper()
+		got, err := st.CaseByID(ctx, c.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var b strings.Builder
+		if err := evidenceview.Case(&b, got, nil, nil, 0); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(caseJSON(got))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b.String(), string(raw)
+	}
+	if text, raw := views(t); !strings.Contains(text, "  measured:") || strings.Contains(text, "last measured") || strings.Contains(raw, `"last"`) {
+		t.Fatalf("its own close as improved:\n%s\n%s", text, raw)
+	}
+	if _, err := st.RegressCase(ctx, c.ID, "back at its old share", "loop:measure"); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []string{"regressed", "deployed"} {
+		if step == "deployed" {
+			toTesting()
+			if _, err := st.DeployCase(ctx, c.ID, filepath.Join(t.TempDir(), "p2"), time.Now().Add(-time.Hour), "landed", "loop:ship"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if text, raw := views(t); !strings.Contains(text, "last measured: 6 before, 1 after") || strings.Contains(text, "  measured:") || !strings.Contains(raw, `"last":true`) {
+			t.Fatalf("%s, its last measurement kept:\n%s\n%s", step, text, raw)
 		}
 	}
 }

@@ -226,7 +226,11 @@ func Case(stdout io.Writer, c store.Case, evs []store.Evidence, log []store.Case
 		}
 		field("guarded", text)
 	} else if m.Window > 0 || m.Effect != "" {
-		field("measured", fmt.Sprintf("%d before, %d after over %s each: %s", m.Before, m.After, m.Window, m.Effect))
+		name := "measured"
+		if LastMeasurement(c) {
+			name = "last measured"
+		}
+		field(name, fmt.Sprintf("%d before, %d after over %s each: %s", m.Before, m.After, m.Window, m.Effect))
 	}
 	fmt.Fprintf(stdout, "  evidence: %d, newest first\n", c.Evidence)
 	for _, e := range evs {
@@ -268,6 +272,18 @@ func guardChance(m store.Measurement, precision string) string {
 		return "no rate to compare: the history holds no incident after its first"
 	}
 	return fmt.Sprintf("P="+precision+"%% had it kept happening", 100*m.Recur)
+}
+
+// LastMeasurement says a case's measurement columns hold the last measurement of an earlier change, not one of its
+// own now: a measured case that came back keeps it (a guard's goes) until its next change's measurement or watch
+// starts. Only a measuring case and one closed as improved hold a measurement of their own; a guard's columns are its
+// own watch's.
+func LastMeasurement(c store.Case) bool {
+	m := c.Measurement
+	if m.Guarded() || m.Window <= 0 && m.Effect == "" {
+		return false
+	}
+	return c.Status != store.CaseMeasuring && (c.Status != store.CaseClosed || c.Reason != store.Improved)
 }
 
 // Guarded says a case's measurement is a guard's watch: a case deployed, measuring or closed as guarded whose

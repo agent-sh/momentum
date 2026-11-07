@@ -95,9 +95,10 @@ func TestAGuardedCaseSaysOnlyEventsBringItBack(t *testing.T) {
 }
 
 // A case closed as improved that comes back keeps its last measurement, which case show shows: regressed by the
-// measure tool, closed by hand, then reopened by hand. A guarded case that comes back loses its guard's columns, and
-// its incidents, watch and words with them, which would read as a measurement; a rollback takes every measurement
-// column, as it always did.
+// measure tool, closed by hand, then reopened by hand, and through a next change rolled back while it was deployed,
+// before its own measurement started. A guarded case that comes back loses its guard's columns, and its incidents,
+// watch and words with them, which would read as a measurement; a rollback of a measuring change takes every
+// measurement column, its own.
 func TestAComebackKeepsTheLastMeasurementButNoGuard(t *testing.T) {
 	ctx := context.Background()
 	st := caseStore(t)
@@ -119,11 +120,18 @@ func TestAComebackKeepsTheLastMeasurementButNoGuard(t *testing.T) {
 	if got, err = st.ReopenCase(ctx, c.ID, refsAt("again", 1, time.Now().Add(-time.Minute)), "it happened again", "agent"); err != nil || got.Measurement != want {
 		t.Fatalf("reopened: %+v %v", got.Measurement, err)
 	}
-	// its next change's watch starts a measurement of its own: nothing of the last one reads as a recurrence
+	// its next change, rolled back before its measurement starts, takes nothing of the last one with it
 	if _, err := st.UpdateCase(ctx, c.ID, CaseUpdate{Status: CaseTesting, Mechanism: ptr("m"), NextTest: ptr("n")}, "agent"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.DeployCase(ctx, c.ID, "/l/packages/i2", time.Now().Add(-time.Hour), "landed", "loop:ship"); err != nil {
+	if _, err := st.DeployCase(ctx, c.ID, "/l/packages/i2", time.Now().Add(-2*time.Hour), "landed", "loop:ship"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = st.RollBackCase(ctx, c.ID, "its revert went in", "loop:ship"); err != nil || got.Measurement != want {
+		t.Fatalf("its next change rolled back while deployed: %+v %v", got.Measurement, err)
+	}
+	// the change after that starts a watch of its own: nothing of the last measurement reads as a recurrence
+	if _, err := st.DeployCase(ctx, c.ID, "/l/packages/i3", time.Now().Add(-time.Hour), "landed", "loop:ship"); err != nil {
 		t.Fatal(err)
 	}
 	if got, err = st.StartGuarding(ctx, c.ID, 30*24*time.Hour, 4, 684, time.Now().Add(-time.Hour), "a watch", "loop:measure"); err != nil ||

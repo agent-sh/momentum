@@ -182,25 +182,39 @@ func GuardCount(incidents []Incident, units []int64, since time.Time, gap time.D
 	return h
 }
 
-// The two reasons a guard watched nothing, as its close and every view say them.
+// The reasons a guard watched nothing, as its close and every view say them.
 const (
-	GuardUnused = "not watched: the unit was not used in the 30 days"
-	GuardAway   = "not watched: the change was out of effect while its unit was used in the 30 days"
+	GuardUnused  = "not watched: the unit was not used in the 30 days"
+	GuardAway    = "not watched: the change was out of effect while its unit was used in the 30 days"
+	GuardLeftOut = "not watched: its unit was used in the 30 days only in sources left out at the watch's end"
 )
 
 // GuardedAway is Guarded for a watch whose unit was used only while its change was out of effect: it watched nothing,
 // and says why.
 func GuardedAway(incidents, exposure int, units string) Result {
+	return unwatched(incidents, exposure, units, GuardAway)
+}
+
+// GuardedLeftOut is Guarded for a watch whose unit was used only in sources it left out at its end (a reader that
+// stopped, or read only in part): it watched nothing it counts, and says why.
+func GuardedLeftOut(incidents, exposure int, units string) Result {
+	return unwatched(incidents, exposure, units, GuardLeftOut)
+}
+
+// unwatched is Guarded for a watch that watched nothing, saying why.
+func unwatched(incidents, exposure int, units, why string) Result {
 	r := Guarded(incidents, exposure, 0, 0, units)
-	r.Effect = strings.Replace(r.Effect, GuardUnused, GuardAway, 1)
+	r.Effect = strings.Replace(r.Effect, GuardUnused, why, 1)
 	return r
 }
 
 // GuardNotWatched is why a guard that watched nothing did, from its effect: the change out of effect while its unit
-// was used, or the unit not used.
+// was used, its unit used only in sources left out, or the unit not used.
 func GuardNotWatched(effect string) string {
-	if strings.Contains(effect, GuardAway) {
-		return GuardAway
+	for _, why := range []string{GuardAway, GuardLeftOut} {
+		if strings.Contains(effect, why) {
+			return why
+		}
 	}
 	return GuardUnused
 }

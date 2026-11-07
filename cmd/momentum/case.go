@@ -132,6 +132,8 @@ type listedCase struct {
 		Recur     float64 `json:"recur,omitempty"`
 		NoRate    bool    `json:"no_rate,omitempty"`
 		Unwatched bool    `json:"unwatched,omitempty"`
+		// Last marks the last measurement of an earlier change, which a case that came back keeps, not one of its own now.
+		Last bool `json:"last,omitempty"`
 	} `json:"measurement,omitempty"`
 	Signatures []string `json:"signatures"`
 }
@@ -169,7 +171,9 @@ func caseJSON(c store.Case) listedCase {
 			Recur       float64 `json:"recur,omitempty"`
 			NoRate      bool    `json:"no_rate,omitempty"`
 			Unwatched   bool    `json:"unwatched,omitempty"`
-		}{WindowHours: m.Window.Hours(), Before: m.Before, After: m.After, Effect: m.Effect, Guarded: m.Guarded(), Exposure: m.Exposure, Recur: m.Recur}
+			Last        bool    `json:"last,omitempty"`
+		}{WindowHours: m.Window.Hours(), Before: m.Before, After: m.After, Effect: m.Effect, Guarded: m.Guarded(), Exposure: m.Exposure, Recur: m.Recur,
+			Last: evidenceview.LastMeasurement(c)}
 		if closed := c.Status == store.CaseClosed && c.Reason == store.Guarded; m.Guarded() {
 			l.Measurement.NoRate = m.Before == 0 || closed && m.Watched == 0
 			if closed {

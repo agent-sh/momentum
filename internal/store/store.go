@@ -673,7 +673,7 @@ func put(ctx context.Context, tx querier, evs []Event) (int, error) {
 			return 0, err
 		}
 		if _, err := putStmt.ExecContext(ctx, id, e.Source, e.SourceKey, e.TS.UnixMilli(), e.Session, e.Agent, e.Harness,
-			e.Model, cleanCwd(e.Cwd), string(e.Actor), e.Kind, e.Tool, e.Summary, e.Meta, e.Ref, e.Heuristic, e.Experiment, now, seq); err != nil {
+			e.Model, CleanCwd(e.Cwd), string(e.Actor), e.Kind, e.Tool, e.Summary, e.Meta, e.Ref, e.Heuristic, e.Experiment, now, seq); err != nil {
 			return 0, err
 		}
 		if seen == 0 {
@@ -683,9 +683,9 @@ func put(ctx context.Context, tx querier, evs []Event) (int, error) {
 	return added, nil
 }
 
-// cleanCwd is a working directory as the store keeps it: cleaned (filepath.Clean), so the counts' SQL compares the
+// CleanCwd is a working directory as the store keeps it: cleaned (filepath.Clean), so the counts' SQL compares the
 // form InDir compares, and an empty one stays empty.
-func cleanCwd(cwd string) string {
+func CleanCwd(cwd string) string {
 	if cwd == "" {
 		return ""
 	}

@@ -132,6 +132,7 @@ type guardJSON struct {
 	Gap       time.Duration `json:"gap"`
 	Units     string        `json:"units"`
 	Tool      string        `json:"tool"`
+	Cwd       string        `json:"cwd"`
 	Incidents int           `json:"incidents"`
 	Exposure  int           `json:"exposure"`
 }
@@ -204,7 +205,8 @@ func TestAGuardStandsInWhereAMeasuredPlanIsRefused(t *testing.T) {
 // A guard is refused only where no watch could be kept: a history with no exposure; a signal that counts none of the
 // case's evidence in the gate, the problem's form there having changed; a signal with no tool whose events share no
 // tool or directory; and, on the too-new path too, a gate that holds an active problem and none of the case's evidence.
-// A signal with no tool whose events all share one counts its exposure in that tool's hours.
+// A signal with no tool whose events all share one counts its exposure in that tool's hours, and one whose events share
+// a directory, some of them stored before the store cleaned working directories, in that directory's.
 func TestAGuardIsRefusedOnlyWhereNoWatchCouldBeKept(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().Truncate(time.Hour)
@@ -278,6 +280,42 @@ func TestAGuardIsRefusedOnlyWhereNoWatchCouldBeKept(t *testing.T) {
 		plan, err := (&Ship{Store: st}).validPlan(ctx, c, noTool, 7*aDay, "", now)
 		if g, _ := guardOf(t, plan); err != nil || g == nil || g.Tool != "Bash" || g.Exposure != 684 {
 			t.Fatalf("a signal with no tool whose events share one: %+v %v", g, err)
+		}
+	})
+	t.Run("a shared directory stored before and after cleaning", func(t *testing.T) {
+		st, path := testStoreAt(t)
+		put(t, st, []store.Event{toolResult("began", now.Add(-60*aDay), "began", false)})
+		if err := st.MarkRead(ctx, toolSignal.Source, now); err != nil {
+			t.Fatal(err)
+		}
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		var failures []store.Event // of two tools, all in one directory: half stored as a build from before cleaning left them
+		for b, from := range fourBursts(now) {
+			for j := 0; j < 3; j++ {
+				e := toolResult(fmt.Sprintf("dir-%d-%d", b, j), from.Add(time.Duration(j)*time.Hour+30*time.Minute), fmt.Sprintf("dir-%d-%d", b, j), true)
+				e.Cwd = "/work/a"
+				if j%2 == 0 {
+					e.Tool = "Read"
+				}
+				failures = append(failures, e)
+				if (b+j)%2 == 0 {
+					put(t, st, []store.Event{e})
+					continue
+				}
+				if _, err := db.Exec(`INSERT INTO events (id, source, source_key, ts, session, agent, harness, model, cwd, actor, kind, tool, summary, meta, ref, heuristic, experiment, ingested)
+				  VALUES (?,?,?,?,?,'',?,'',?,?,?,?,?,?,'',0,'',?)`, e.ID(), e.Source, e.SourceKey, e.TS.UnixMilli(), e.Session, e.Harness, "/work/a/", string(e.Actor), e.Kind,
+					e.Tool, e.Summary, e.Meta, time.Now().UnixMilli()); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		plan, err := (&Ship{Store: st}).validPlan(ctx, testingCaseOf(t, st, "failures/v2:zz-dirs", failures), noTool, 7*aDay, "", now)
+		if g, _ := guardOf(t, plan); err != nil || g == nil || g.Tool != "" || g.Cwd != "/work/a" || g.Incidents != 4 {
+			t.Fatalf("a signal with no tool whose events share a directory, in two forms: %+v %v", g, err)
 		}
 	})
 }
