@@ -40,6 +40,9 @@ type ActivityQuery struct {
 	Harness      string   // when set, only that harness's events
 	Actor        Actor    // when set, only the hours in which it did something (the owner's turns, say)
 	Tools        []string // when set, only the hours in which one of these tools was called or answered: a guard's exposure
+	// Server, when set, keeps only the hours in which a tool of this MCP server (MCPServer) was called or answered,
+	// whichever of its tools: a guard's exposure.
+	Server string
 	// Cwds, when set, keeps only the hours of events in one of these directories or below it: a guard's exposure. Each
 	// row's directory is compared cleaned (CleanCwd), so a row stored before the store cleaned working directories
 	// (`/a//b`, `/a/./b`) is in its directory as one stored after is. Activity alone narrows by it.
@@ -77,6 +80,26 @@ func (s *Store) Activity(ctx context.Context, q ActivityQuery) (map[Unit]bool, e
 	return out, rows.Err()
 }
 
+// MCPServer is the MCP server a tool is of, by the harness's name for an MCP tool, mcp__SERVER__TOOL, as Claude Code
+// names one: its server is what comes between the first two separators. A tool named otherwise (Bash, Read, any other
+// built-in) is of none, and gives "".
+func MCPServer(tool string) string {
+	rest, ok := strings.CutPrefix(tool, "mcp__")
+	if !ok {
+		return ""
+	}
+	server, name, ok := strings.Cut(rest, "__")
+	if !ok || server == "" || name == "" {
+		return ""
+	}
+	return server
+}
+
+// mcpPrefix is what every tool of an MCP server is named from (MCPServer).
+func mcpPrefix(server string) string {
+	return "mcp__" + server + "__"
+}
+
 // InAnyDir says whether a working directory, cleaned (CleanCwd), is one of dirs or below one of them. An empty one is
 // in none.
 func InAnyDir(cwd string, dirs []string) bool {
@@ -110,6 +133,10 @@ func activityWhere(q ActivityQuery) ([]string, []any, string) {
 			args = append(args, tool)
 		}
 		where = append(where, "tool IN ("+strings.Join(marks, ",")+")")
+	}
+	if q.Server != "" {
+		// instr, not LIKE: a server's name may hold an underscore, which LIKE reads as any character
+		where, args = append(where, "instr(tool, ?) = 1"), append(args, mcpPrefix(q.Server))
 	}
 	if q.Sources != nil {
 		marks := make([]string, len(q.Sources))

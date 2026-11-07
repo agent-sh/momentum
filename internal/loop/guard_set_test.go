@@ -15,10 +15,12 @@ import (
 // surface in either of its two tools.
 var serverSignal = Signal{Source: toolSignal.Source, Kinds: toolSignal.Kinds, Match: toolSignal.Match}
 
-// The server's two tools, and a tool of another kind beside them.
+// The server's two tools that fail, a third of its own that never does, and a tool of another server.
 const (
-	serverA = "mcp__zz_server__fetch"
-	serverB = "mcp__zz_server__list"
+	serverA     = "mcp__zz_server__fetch"
+	serverB     = "mcp__zz_server__list"
+	serverC     = "mcp__zz_server__ping"
+	otherServer = "mcp__zz_other__list"
 )
 
 // serverUse is a successful result of a tool in a session of its own.
@@ -96,14 +98,15 @@ func TestAGuardOverTheToolsOfOneServer(t *testing.T) {
 	if text := (&Ship{}).packageText(c, Package{Plan: &plan, Check: &Check{}}); !strings.Contains(text, "any of the 2 tools its events were of was used ("+serverA+", "+serverB+")") {
 		t.Fatalf("the proposal does not name the guard's tools: %s", text)
 	}
-	t.Run("in one directory, both tools in one unit", func(t *testing.T) {
-		// the server's work all in its own directory, one unit holding a failure of each tool: the tools, the directory
-		// and the tools within it hold the same 684 hours, that unit counted once, and the directory, of one member,
-		// is the guard's
+	t.Run("in one directory, the tools within it", func(t *testing.T) {
+		// the server's work all in its own directory, one unit holding a failure of each tool: the tools, the server,
+		// the directory and the tools or server within it hold the same 684 hours, that unit counted once, and the
+		// tools within the directory, which each of the others holds by construction, are the guard's (#98)
 		st := testStore(t)
 		c := serverStoreIn(t, st, now, now, "/work/server")
 		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, serverSignal, 7*aDay, "", now)
-		if g, _ := guardOf(t, plan); err != nil || g == nil || g.Unit != "directory" || g.Cwd != "/work/server" || g.Tool != "" || len(g.Tools) != 0 || g.Exposure != 336+336+12 {
+		if g, _ := guardOf(t, plan); err != nil || g == nil || g.Unit != "tools in its directory" || g.Cwd != "/work/server" || strings.Join(g.Tools, " ") != serverA+" "+serverB ||
+			g.Server != "" || g.Exposure != 336+336+12 {
 			t.Fatalf("a server's failures in one directory: %+v %v", g, err)
 		}
 	})
@@ -186,10 +189,10 @@ func TestAGuardsSetIsFoundAfterTheIncidentItsSourceBeganWith(t *testing.T) {
 		}
 	})
 	t.Run("it holds no member's incident", func(t *testing.T) {
-		st := testStore(t) // the second tool fails once after the first burst, and in that burst once more
-		c := anchoredServer(t, st, now, []string{serverA, serverB, serverA}, func(b, j int) string {
+		st := testStore(t) // another server's tool fails once after the first burst, and in that burst once more
+		c := anchoredServer(t, st, now, []string{serverA, otherServer, serverA}, func(b, j int) string {
 			if b == 3 && j == 1 {
-				return serverB
+				return otherServer
 			}
 			return serverA
 		})
@@ -220,4 +223,126 @@ func TestAGuardsSetReadsBackFromItsJSON(t *testing.T) {
 			t.Fatalf("%+v read back as %+v from %s", g, back.Guard, raw)
 		}
 	}
+}
+
+// oneIncident is the store of a server whose failures fall in one incident: from 28 days before at until useUntil its
+// three tools answer in turn, one an hour, each call in a session of its own (224 hours of each over four weeks), and
+// Read beside them every hour; 15 days before at, six failures an hour apart, of the tool tool gives each, each in a
+// session and a directory of its own. The source began 60 days before at and was read at it. It returns a case in
+// testing whose evidence is every failure.
+func oneIncident(t *testing.T, st *store.Store, at, useUntil time.Time, tool func(j int) string) store.Case {
+	t.Helper()
+	evs := []store.Event{serverUse("began", at.Add(-60*aDay), serverA)}
+	for i, u := 0, at.Add(-28*aDay); u.Before(useUntil); i, u = i+1, u.Add(time.Hour) {
+		evs = append(evs, serverUse(fmt.Sprint("use-", i), u, []string{serverA, serverB, serverC}[i%3]), serverUse(fmt.Sprint("read-", i), u.Add(10*time.Minute), "Read"))
+	}
+	var failures []store.Event
+	for j := 0; j < 6; j++ {
+		key := fmt.Sprint("f-", j)
+		e := toolResult(key, at.Add(-15*aDay+time.Duration(j)*time.Hour+30*time.Minute), key, true)
+		e.Tool, e.Cwd = tool(j), fmt.Sprint("/work/d", j)
+		failures = append(failures, e)
+	}
+	put(t, st, append(evs, failures...))
+	if err := st.MarkRead(t.Context(), toolSignal.Source, at); err != nil {
+		t.Fatal(err)
+	}
+	return testingCaseOf(t, st, "failures/v2:zz-one-incident", failures)
+}
+
+// alternate gives the failures of oneIncident to the server's two tools in turn.
+func alternate(j int) string { return []string{serverA, serverB}[j%2] }
+
+// A history of one incident spread across two tools of one MCP server, from six directories, holds no tool, set or
+// directory every event shares, but its server holds them all (#98): the guard's unit is the server, and its exposure
+// counts the hours with a call to any of its tools, its third that never failed too (224 hours of each, and the
+// failures' own 6), never Read's. Once its change is in effect, its watch counts any of the server's tools, and a
+// recurrence on either tool that failed brings the case back regressed. A history that mixes the server's tools with
+// Bash gets no server: Bash is of none.
+func TestAGuardOverAnMCPServer(t *testing.T) {
+	now := time.Now().Truncate(time.Hour)
+	t.Run("its unit is the server", func(t *testing.T) {
+		st := testStore(t)
+		c := oneIncident(t, st, now, now, alternate)
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, serverSignal, 7*aDay, "", now)
+		g, _ := guardOf(t, plan)
+		if err != nil || g == nil || g.Unit != "server" || g.Server != "zz_server" || g.Tool != "" || len(g.Tools) != 0 || g.Cwd != "" || g.Incidents != 1 || g.Exposure != 3*224+6 {
+			t.Fatalf("one incident across a server's two tools: %+v %v", g, err)
+		}
+		if text := (&Ship{}).packageText(c, Package{Plan: &plan, Check: &Check{}}); !strings.Contains(text, "in which any tool of the MCP server zz_server was used (its unit: the server") {
+			t.Fatalf("the proposal does not name the guard's server: %s", text)
+		}
+	})
+	t.Run("a history with Bash beside the server's tools", func(t *testing.T) {
+		st := testStore(t)
+		c := oneIncident(t, st, now, now, func(j int) string {
+			if j == 3 {
+				return "Bash"
+			}
+			return alternate(j)
+		})
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, serverSignal, 7*aDay, "", now)
+		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), "(3 tools, 3 of them in fewer than two of its 1 incidents; in 6 directories; some of no MCP server") {
+			t.Fatalf("a server's tools and Bash: %+v %v", g, err)
+		}
+	})
+	guardedServer := func(t *testing.T) *measured {
+		return guardedBy(t, serverSignal, time.Hour, toolSignal.Source, func(st *store.Store, planAt, useUntil time.Time) store.Case {
+			return oneIncident(t, st, planAt, useUntil, alternate)
+		})
+	}
+	t.Run("the watch counts any of the server's tools", func(t *testing.T) {
+		m := guardedServer(t)
+		m.pass(t, Options{})
+		start := m.clock
+		var evs []store.Event
+		for i := 0; i < 25; i++ {
+			at := start.Add(time.Duration(i+1) * 20 * time.Hour)
+			evs = append(evs, serverUse(fmt.Sprint("wa-", i), at, serverA), serverUse(fmt.Sprint("wb-", i), at.Add(5*time.Hour), serverB),
+				serverUse(fmt.Sprint("wc-", i), at.Add(10*time.Hour), serverC), serverUse(fmt.Sprint("wr-", i), at.Add(15*time.Hour), "Read"))
+		}
+		put(t, m.st, evs)
+		m.clock = start.Add(30*aDay + time.Hour)
+		if got := m.pass(t, Options{}); got.Status != "guarded" || got.Result == nil || got.Result.Watched != 75 {
+			t.Fatalf("a watch of the server's use: %+v %+v", got, got.Result)
+		}
+	})
+	for _, tool := range []string{serverA, serverB} {
+		t.Run("a recurrence on "+tool, func(t *testing.T) {
+			m := guardedServer(t)
+			m.pass(t, Options{})
+			effect := m.clock
+			again := toolResult("again", effect.Add(2*time.Hour), "again", true)
+			again.Tool, again.Cwd = tool, "/work/elsewhere"
+			put(t, m.st, []store.Event{again})
+			m.clock = effect.Add(3 * time.Hour)
+			if got := m.pass(t, Options{}); got.Status != "held" || !strings.Contains(got.Why, "regressed: its problem came back during its guard's watch") {
+				t.Fatalf("a recurrence on %s: %+v", tool, got)
+			}
+		})
+	}
+}
+
+// A tool found by its events, not named by the signal, is a unit only in two incidents or more, as a set's member is
+// (#98): one incident's cause may surface in any tool. A built-in tool in one incident from six directories leaves no
+// unit; an MCP server's one tool there leaves its server. The signal's own tool keeps its exemption: every event is of
+// it by the signal's definition (a guard of a problem that stopped, TestAGuardStandsInWhereAMeasuredPlanIsRefused).
+func TestAToolFoundByItsEventsNeedsTwoIncidents(t *testing.T) {
+	now := time.Now().Truncate(time.Hour)
+	t.Run("a built-in tool", func(t *testing.T) {
+		st := testStore(t)
+		c := oneIncident(t, st, now, now, func(int) string { return "Edit" })
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, serverSignal, 7*aDay, "", now)
+		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), "(1 tool, not the signal's own, in one incident alone; in 6 directories; of no MCP server") {
+			t.Fatalf("a built-in tool in one incident: %+v %v", g, err)
+		}
+	})
+	t.Run("an MCP server's tool", func(t *testing.T) {
+		st := testStore(t)
+		c := oneIncident(t, st, now, now, func(int) string { return serverA })
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, serverSignal, 7*aDay, "", now)
+		if g, _ := guardOf(t, plan); err != nil || g == nil || g.Unit != "server" || g.Server != "zz_server" || g.Tool != "" || g.Exposure != 3*224+6 {
+			t.Fatalf("an MCP tool in one incident: %+v %v", g, err)
+		}
+	})
 }

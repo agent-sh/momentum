@@ -135,6 +135,7 @@ type guardJSON struct {
 	Tool      string        `json:"tool"`
 	Cwd       string        `json:"cwd"`
 	Tools     []string      `json:"tools"`
+	Server    string        `json:"server"`
 	Cwds      []string      `json:"cwds"`
 	Incidents int           `json:"incidents"`
 	Exposure  int           `json:"exposure"`
@@ -334,13 +335,13 @@ func TestAGuardIsRefusedOnlyWhereNoWatchCouldBeKept(t *testing.T) {
 		refusedWith(t, st, testingCaseOf(t, st, "failures/v2:zz-busy", failures), noTool, "(6 tools, 5 of them in fewer than two of its")
 	})
 	t.Run("a burst across parallel sessions is one incident", func(t *testing.T) {
-		st := testStore(t) // one tool in every burst, another in five sessions of one hour
+		st := testStore(t) // one tool in every burst, another server's in five sessions of one hour
 		_, failures := recurring(t, st, toolSignal.Source, now, now, now, fourBursts(now)...)
 		for i := range failures {
 			failures[i].Tool = "mcp__zz_srv__a"
 		}
 		for k := 0; k < 5; k++ {
-			failures = append(failures, failed(fmt.Sprint("parallel-", k), now.Add(-16*aDay+time.Duration(k)*time.Minute), "mcp__zz_srv__b", ""))
+			failures = append(failures, failed(fmt.Sprint("parallel-", k), now.Add(-16*aDay+time.Duration(k)*time.Minute), "mcp__zz_other__b", ""))
 		}
 		put(t, st, failures)
 		refusedWith(t, st, testingCaseOf(t, st, "failures/v2:zz-parallel", failures), noTool, "(2 tools, 1 of them in fewer than two of its")
