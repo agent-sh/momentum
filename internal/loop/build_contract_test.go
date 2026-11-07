@@ -115,7 +115,7 @@ func TestAReviewIsToldTheBuildsPaths(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, want := range []string{"reviewed_files", buildScope(p.Repo), "follow-up for a person: file it as a low finding",
-				"It lowers no finding on what this change does", "file a high finding"} {
+				"in person_path", "It lowers no finding on what this change does", "file a high finding"} {
 				if !strings.Contains(prompt, want) {
 					t.Fatalf("the prepared review prompt for %q lacks %q: %s", p.Repo, want, prompt)
 				}
@@ -127,46 +127,70 @@ func TestAReviewIsToldTheBuildsPaths(t *testing.T) {
 	}
 }
 
-// A review's low finding whose fix needs a path no change of the loop's may touch reaches a person as a note; one in
-// a path the loop may change does not.
+// A finding whose person_path no change of the loop's may touch reaches a person as a note, of any severity, once per
+// case and path; a path the loop may change, in that repository, gives none.
 func TestAnOutOfReachFollowUpBecomesANote(t *testing.T) {
-	for _, c := range []struct {
-		repo, where string
-		want        []string
-	}{
-		{SelfRepo, "sessions/codex/tracker.go:118-123", []string{"sessions/codex/tracker.go"}},
-		{SelfRepo, "`internal/supervise/history.go` timeline", []string{"internal/supervise/history.go"}},
-		{SelfRepo, "internal/supervise/rules.go:40", nil},
-		{SelfRepo, "README.md", nil}, // a hand landing may change it
-		{"agent-sh/fake", ".github/workflows/ci.yml:3", []string{".github/workflows/ci.yml"}},
-		{"agent-sh/fake", "sessions/codex/tracker.go:118", nil},
-		{"agent-sh/fake", "../x and /etc/passwd", nil},
+	for _, c := range []struct{ repo, path, want string }{
+		{SelfRepo, "sessions/codex/tracker.go", "sessions/codex/tracker.go"},
+		{SelfRepo, "sessions/codex/tracker.go:118-123", "sessions/codex/tracker.go"},
+		{SelfRepo, "/ro/change/internal/supervise/history.go", "internal/supervise/history.go"},
+		{SelfRepo, "b/internal/supervise/history.go#L40", "internal/supervise/history.go"},
+		{SelfRepo, " go.mod ", "go.mod"},
+		{SelfRepo, "internal/supervise/rules.go", ""},
+		{SelfRepo, "internal/supervise/rules_test.go", ""},
+		{SelfRepo, "README.md", ""}, // a hand landing may change it
+		{"agent-sh/fake", ".github/workflows/ci.yml:3", ".github/workflows/ci.yml"},
+		{"agent-sh/fake", "sessions/codex/tracker.go", ""},
+		{"agent-sh/fake", "../x", ""},
+		{"agent-sh/fake", "/etc/passwd", ""},
+		{"agent-sh/fake", "a path with spaces", ""},
+		{"agent-sh/fake", "", ""},
 	} {
-		if got := outOfReach(c.repo, c.where); !slices.Equal(got, c.want) {
-			t.Fatalf("outOfReach(%q, %q) = %q, want %q", c.repo, c.where, got, c.want)
+		if got := personPath(c.repo, c.path); got != c.want {
+			t.Fatalf("personPath(%q, %q) = %q, want %q", c.repo, c.path, got, c.want)
 		}
 	}
 	ctx := context.Background()
 	r, c, p := reviewFixture(t)
 	review := Review{Head: p.Head, Text: "Checked.", Comment: "https://example.invalid/c/1", Findings: []Finding{
-		{Severity: "low", Where: ".github/workflows/ci.yml:3", Problem: "The cause is in CI.", Fix: "Change the job."},
-		{Severity: "low", Where: "x.go:1", Problem: "A name.", Fix: "Rename it."},
+		{Severity: "high", Where: "x.go:1", Problem: "It only hides the signal.", Fix: "Change the job.", PersonPath: ".github/workflows/ci.yml"},
+		{Severity: "low", Where: "x.go:2", Problem: "The scanner's cause.", Fix: "Change the tracker.", PersonPath: "sessions/codex/tracker.go"},
+		{Severity: "low", Where: "x.go:3", Problem: "A name.", Fix: "Rename it."},
 	}}
 	if _, err := r.Ship.Reviewed(ctx, c.ID, review); err != nil {
 		t.Fatal(err)
 	}
-	notes, err := r.Store.Notes(ctx)
-	if err != nil {
+	reach := func() map[string]store.Note {
+		notes, err := r.Store.Notes(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]store.Note{}
+		for _, n := range notes {
+			if strings.HasPrefix(n.ID, reachPrefix) {
+				out[n.ID] = n
+			}
+		}
+		return out
+	}
+	ci := reachPrefix + store.IDPart(c.ID) + ":" + store.IDPart(".github/workflows/ci.yml")
+	got := reach()
+	if len(got) != 1 || !strings.Contains(got[ci].Detail, "x.go:1: It only hides the signal. Fix: Change the job.") {
+		t.Fatalf("the follow-up notes: %+v", got)
+	}
+	// resolved, it stays resolved when a later round names the same path again; a new path adds a note beside it
+	if _, _, err := r.Store.DoneNote(ctx, ci, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	var found *store.Note
-	for i := range notes {
-		if notes[i].ID == reachPrefix+store.IDPart(c.ID) {
-			found = &notes[i]
-		}
+	if err := r.Ship.reachNotes(ctx, c.ID, p.Repo, []Finding{
+		{Severity: "low", Where: "y.go", Problem: "Worded again.", Fix: "Change the job.", PersonPath: ".github/workflows/ci.yml:9"},
+		{Severity: "low", Where: "z.go", Problem: "Another cause.", Fix: "Change Jenkinsfile.", PersonPath: "Jenkinsfile"},
+	}); err != nil {
+		t.Fatal(err)
 	}
-	if found == nil || !strings.Contains(found.Detail, ".github/workflows/ci.yml:3: The cause is in CI. Fix: Change the job.") || strings.Contains(found.Detail, "x.go") {
-		t.Fatalf("the follow-up note: %+v (of %d notes)", found, len(notes))
+	got = reach()
+	if len(got) != 2 || got[ci].Done.IsZero() || !strings.Contains(got[ci].Detail, "It only hides the signal") {
+		t.Fatalf("after a resolve and a later round: %+v", got)
 	}
 }
 

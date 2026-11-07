@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -466,60 +467,47 @@ func (s *Ship) holdsFiles(ctx context.Context, p Package, head string) (string, 
 	return fields[0], at, true, nil
 }
 
-// reachPrefix starts the id of the note that names a case's causes whose fix needs a path no change of the loop's may
-// touch: a follow-up only a person can make.
+// reachPrefix starts the id of a note that names a path a case's fix needs and no change of the loop's may touch: a
+// follow-up only a person can make. There is one note per case and path.
 const reachPrefix = "loop-reach:"
 
-// outOfReach returns the paths a finding names that no change of the loop's may touch in repo (PathScope refuses
-// them): its CI configuration, and in the loop's own repository the paths its measurement and scanners rest on.
-func outOfReach(repo, where string) []string {
-	var out []string
-	for _, w := range strings.Fields(where) {
-		w = strings.Trim(w, "`'\"()[],;")
-		if i := strings.IndexByte(w, ':'); i >= 0 {
-			w = w[:i]
-		}
-		w = strings.TrimPrefix(w, "./")
-		if w == "" || strings.HasPrefix(w, "/") || strings.Contains(w, "..") {
-			continue
-		}
-		if _, err := PathScope(Target{Repo: repo}, []string{w}); err != nil && errors.Is(err, ErrRefused) {
-			out = append(out, w)
-		}
+// personPath is a finding's person_path as a path of the repository, when no change of the loop's may touch it there
+// (PathScope refuses it): its CI configuration, and in the loop's own repository the paths its measurement and
+// scanners rest on. A path the loop may change, or one outside the repository, gives "".
+func personPath(repo, path string) string {
+	path = strings.TrimSpace(path)
+	for _, prefix := range []string{"/ro/change/", "a/", "b/", "./"} {
+		path = strings.TrimPrefix(path, prefix)
 	}
-	return out
+	if i := strings.IndexAny(path, ":#"); i >= 0 {
+		path = path[:i] // a line or anchor the reviewer added
+	}
+	if path == "" || strings.HasPrefix(path, "/") || strings.ContainsAny(path, " \t\n") || slices.Contains(strings.Split(path, "/"), "..") {
+		return ""
+	}
+	if _, err := PathScope(Target{Repo: repo}, []string{path}); errors.Is(err, ErrRefused) {
+		return path
+	}
+	return ""
 }
 
-// reachNote opens, or brings up to date, the note that lists a review's low findings whose fix needs a path no
-// change of the loop's may touch, so the follow-up reaches a person whether or not the change lands. The same list
-// stays as its reader left it.
-func (s *Ship) reachNote(ctx context.Context, caseID, repo string, fs []Finding) error {
-	var lines []string
+// reachNotes writes, once per case and path, the note for each finding whose person_path no change of the loop's may
+// touch, of any severity, so the follow-up reaches a person whether or not the change lands. A note its reader
+// resolved stays resolved, and a later round's path adds its own note beside the earlier ones.
+func (s *Ship) reachNotes(ctx context.Context, caseID, repo string, fs []Finding) error {
 	for _, f := range fs {
-		if !strings.EqualFold(f.Severity, "low") {
+		path := personPath(repo, f.PersonPath)
+		if path == "" {
 			continue
 		}
-		if paths := outOfReach(repo, f.Where); len(paths) > 0 {
-			lines = append(lines, fmt.Sprintf("- %s: %s Fix: %s", f.Where, f.Problem, f.Fix))
+		_, err := s.Store.PutNoteOnce(ctx, store.Note{ID: reachPrefix + store.IDPart(caseID) + ":" + store.IDPart(path),
+			Kind: store.NoteProblem, Importance: store.ImportanceLow, Source: "momentum", At: s.now(),
+			Title: plainClip("Case "+caseID+" needs a fix only a person can make, in "+path, store.TitleMax),
+			Detail: fmt.Sprintf("A review of the loop's change found a cause whose fix needs %s, which no change of the loop's may touch. "+
+				"%s: %s Fix: %s", path, f.Where, f.Problem, f.Fix)})
+		if err != nil {
+			return err
 		}
 	}
-	if len(lines) == 0 {
-		return nil
-	}
-	detail := "A review of the loop's change found a cause whose fix needs a path no change of the loop's may touch, " +
-		"so a person makes it:\n" + strings.Join(lines, "\n")
-	id := reachPrefix + store.IDPart(caseID)
-	notes, err := s.Store.Notes(ctx)
-	if err != nil {
-		return err
-	}
-	for _, n := range notes {
-		if n.ID == id && n.Detail == detail {
-			return nil
-		}
-	}
-	_, err = s.Store.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Importance: store.ImportanceLow, Source: "momentum",
-		At: s.now(), Title: plainClip("Case "+caseID+" has a cause only a person can fix, in a path the loop never changes", store.TitleMax),
-		Detail: detail})
-	return err
+	return nil
 }

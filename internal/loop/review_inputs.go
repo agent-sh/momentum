@@ -18,7 +18,7 @@ const reviewSchema = `{"type":"object","additionalProperties":false,"required":[
 "properties":{"summary":{"type":"string","minLength":1},"reviewed_files":{"type":"array","items":{"type":"string"},"uniqueItems":true},"findings":{"type":"array","items":{"type":"object",
 "additionalProperties":false,"required":["severity","where","problem","fix"],
 "properties":{"severity":{"type":"string","enum":["high","medium","low"]},"where":{"type":"string"},
-"problem":{"type":"string"},"fix":{"type":"string"}}}}}}`
+"problem":{"type":"string"},"fix":{"type":"string"},"person_path":{"type":"string"}}}}}}`
 
 type reviewReport struct {
 	Summary       *string    `json:"summary"`

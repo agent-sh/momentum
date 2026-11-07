@@ -406,18 +406,19 @@ func buildScope(repo string) string {
 }
 
 // reviewPrompt is a review's task. It carries the paths the build was given (buildScope), so a reviewer knows what the
-// build could change. A cause whose fix needs a path no change may touch is a low finding, a follow-up for a person; it
-// lowers no other finding, and a change that is not worth landing without that fix is a high one. A fix a hand landing
-// may make is the build's to make.
+// build could change. A cause whose fix needs a path no change may touch is a low finding with that path in
+// person_path, a follow-up for a person (reachNotes); it lowers no other finding, and a change that is not worth landing
+// without that fix is a high one. A fix a hand landing may make is the build's to make.
 func reviewPrompt(c store.Case, p Package) string {
 	return fmt.Sprintf("Review case %s (%s): %s. Read /run/input/case.json, /run/input/change.patch and /run/input/package.json. "+
 		"The proposed tree is read-only at /ro/change with no .git. /ro holds the shared pass inputs. "+
 		"End with a nonempty summary, findings and reviewed_files naming every changed file once.\n"+
 		"The build was given these paths. %s "+
 		"A cause whose fix needs a path no change may touch, as named above, is a follow-up for a person: file it as a low "+
-		"finding that names the path and the fix. It lowers no finding on what this change does. When this change is not "+
-		"worth landing without that fix, because it only hides the case's signal or is wrong without it, file a high finding "+
-		"that says so.", c.ID, c.Family, p.Title, buildScope(p.Repo)) + handReach(p.Repo)
+		"finding with that path, relative to the repository root, in person_path, and the fix in fix. It lowers no finding on "+
+		"what this change does. When this change is not worth landing without that fix, because it only hides the case's "+
+		"signal or it is wrong on its own, file a high finding that says so, with the same person_path. Leave person_path "+
+		"empty on every other finding.", c.ID, c.Family, p.Title, buildScope(p.Repo)) + handReach(p.Repo)
 }
 
 // handReach is the review's sentence on the paths only a hand landing may change, which only the loop's own
