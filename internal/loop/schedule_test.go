@@ -122,11 +122,10 @@ func randomFamilies(rng *rand.Rand) []simFamily {
 // The pass's plan over random families, with a fixed seed. On every pass:
 //  1. no case is reserved twice;
 //  2. at most one build is reserved;
-//  3. a family with a case that can run runs within as many passes as there are families, while the budget has
-//     room for two runs a pass (or for one, when no family has a buildable case), through held builds, failed
-//     preparations, investigations whose inputs fail, unreadable records and families whose every attempt fails;
-//     with room for one run, a buildable case takes it (8), and the other families run only in a pass that builds
-//     nothing;
+//  3. a family with a case that can run runs within n passes, n the families, while the budget has room for two runs
+//     a pass, and within 2n with room for one (when a family has a buildable case, the build and the run turn take
+//     the passes in turn), through held builds, failed preparations, investigations whose inputs fail, unreadable
+//     records and families whose every attempt fails;
 //  4. a family whose every attempt fails, though the scheduler sees its cases, stops no other family's runs (3 and 5
 //     hold for the others);
 //  5. when room is left after the pass, every family that ran nothing had nothing it could run;
@@ -134,7 +133,7 @@ func randomFamilies(rng *rand.Rand) []simFamily {
 //  7. a family whose ready build's reservation fails (none, as in a pass that stops, or a run recorded) reserves
 //     nothing else in the pass, and no other build is reserved;
 //  8. a family with a buildable case goes at most b-1 passes without its build, b the families with a buildable case,
-//     whatever the room;
+//     with room for two runs a pass, and at most 2b-1 with room for one;
 //  9. a family records or reserves at most one run in a pass.
 //
 // The room is the budget check's own count (runsThatFit) of a random run budget, earlier spend and limit, in whole
@@ -168,10 +167,16 @@ func TestPassPlansAreFairOverRandomFamilies(t *testing.T) {
 		run := int64(1 + rng.IntN(5_000_000))                                 // a run's budget
 		spent := int64(rng.IntN(20_000_000))                                  // what the day has spent
 		limit := spent + int64(1+rng.IntN(3))*run + int64(rng.IntN(int(run))) // room for 1 to 3 runs
-		room := runsThatFit(spent, run, limit, len(uniqueFamilies(names)))    // as the runner counts it
+		room := runsThatFit(spent, run, limit, 2)                             // no run, one or more, as the runner counts it
 		faults := rng.IntN(4) == 0                                            // a reservation may fail
-		gap := b - 1                                                          // the most passes a family with a buildable case goes without its build (8)
-		turns := map[string]string{}                                          // the turns a store with none starts at, or any two families'
+		// the most passes a family with a buildable case goes without its build (8), and one with a case that can run
+		// goes without a run (3)
+		gap, runGap := b-1, n
+		if room == 1 && b > 0 {
+			gap, runGap = 2*b-1, 2*n
+		}
+		clock, tookAt := 0, map[string]int{} // when a pass last took each turn
+		turns := map[string]string{}         // the turns a store with none starts at, or any two families'
 		if rng.IntN(2) == 0 {
 			turns = map[string]string{turnBuild: names[rng.IntN(n)], turnRun: names[rng.IntN(n)]}
 		}
@@ -255,10 +260,18 @@ func TestPassPlansAreFairOverRandomFamilies(t *testing.T) {
 				}
 				return runReserved
 			}
-			steps, after := schedule(names, cands, turns, room, func(fam string, c candidate) outcome { return once(fam, prepare(fam, c)) },
+			runsFirst := tookAt[turnBuild] > tookAt[turnRun]
+			steps, after, took := schedule(names, cands, turns, room, runsFirst,
+				func(fam string, c candidate) outcome { return once(fam, prepare(fam, c)) },
 				func(fam string, c candidate) outcome { return once(fam, reserve(fam, c)) })
-			history = append(history, fmt.Sprintf("pass %d (turns %v): %s", pass, turns, plan(steps)))
+			history = append(history, fmt.Sprintf("pass %d (turns %v, runs first %v): %s", pass, turns, runsFirst, plan(steps)))
 			turns = after
+			for _, kind := range []string{turnBuild, turnRun} { // as the runner writes them, the build's first
+				if took[kind] {
+					clock++
+					tookAt[kind] = clock
+				}
+			}
 			if builds > 1 || builds > 0 && len(refused) > 0 {
 				fail("%d builds, %d ready builds refused", builds, len(refused))
 			}
@@ -275,7 +288,7 @@ func TestPassPlansAreFairOverRandomFamilies(t *testing.T) {
 				case refused[f.name]:
 				case fits() && (f.canInvestigate() || !taken && f.canBuild()):
 					fail("%s ran nothing with room left", f.name)
-				case !faults && (room >= 2 || b == 0) && (f.canInvestigate() || f.canBuild()) && pass-last[f.name] >= n:
+				case !faults && (f.canInvestigate() || f.canBuild()) && pass-last[f.name] >= runGap:
 					fail("%s ran nothing for %d passes", f.name, pass-last[f.name])
 				}
 				switch {
@@ -319,7 +332,7 @@ func TestAFailedPreparationIsTheFamilysOneRun(t *testing.T) {
 			left--
 			return runReserved
 		}
-		steps, _ := schedule([]string{"f0", "f1"}, cands, map[string]string{}, room, prepare, reserve)
+		steps, _, _ := schedule([]string{"f0", "f1"}, cands, map[string]string{}, room, false, prepare, reserve)
 		runs := 0
 		for _, s := range steps {
 			if s.fam == "f1" && s.skipped == "" && (s.out == runReserved || s.out == runRecorded) {
@@ -342,7 +355,7 @@ func TestARefusedReadyBuildTakesNoTurn(t *testing.T) {
 		}
 		return runReserved
 	}
-	_, after := schedule([]string{"f0", "f1"}, cands, map[string]string{turnBuild: "f1"}, 2, prepare, reserve)
+	_, after, _ := schedule([]string{"f0", "f1"}, cands, map[string]string{turnBuild: "f1"}, 2, false, prepare, reserve)
 	if after[turnBuild] != "f1" {
 		t.Fatalf("a refused ready build moved the build turn to %q", after[turnBuild])
 	}
@@ -372,7 +385,7 @@ func TestAFailedBuildYieldsWhateverTheRoom(t *testing.T) {
 				}
 				return runReserved
 			}
-			steps, after := schedule([]string{"A", "B", "C", "D"}, cands, turns, room, prepare, reserve)
+			steps, after, _ := schedule([]string{"A", "B", "C", "D"}, cands, turns, room, false, prepare, reserve)
 			if builder == "" || builder == last {
 				t.Fatalf("room %d pass %d: %q built after %q (turns %v): %s", room, pass, builder, last, turns, plan(steps))
 			}

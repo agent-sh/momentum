@@ -488,3 +488,46 @@ func TestReturnWorkOnlySavesWhenTheTreeAlreadyWentBack(t *testing.T) {
 		t.Fatalf("the tree in the case's work directory is gone: %v", err)
 	}
 }
+
+// When the tree a package names in a run directory is gone and the case's work directory holds none either, returnWork
+// leaves the package as it is: there is no tree to name.
+func TestReturnWorkNamesNoTreeThatIsNotThere(t *testing.T) {
+	r, cs := turnRunner(t, "sessions")
+	ctx := context.Background()
+	id := cs[0].ID
+	runDir := filepath.Join(r.Dir, "runs", newRunID(time.Now()))
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	named := filepath.Join(runDir, "work")
+	if err := r.Ship.save(&Package{Case: id, Work: named, State: Prepared}); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeAll(r.Ship.workDir(id)); err != nil {
+		t.Fatal(err)
+	}
+	if stays, err := r.Ship.returnWork(ctx, id, runDir); stays || err != nil {
+		t.Fatalf("returnWork: stays %v, %v", stays, err)
+	}
+	if p, _, _ := r.Ship.Load(id); p.Work != named {
+		t.Fatalf("the package names %s, a tree that is not there", p.Work)
+	}
+}
+
+// A hidden entry among the packages is no case's: the sweep still gives back the tree a package names and removes
+// the run directory.
+func TestTheSweepPassesOverHiddenPackageEntries(t *testing.T) {
+	r, _, in, id := sweepFixture(t)
+	if err := os.MkdirAll(filepath.Join(r.Ship.Dir, "packages", ".marker-7f3a"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	orphan := in(newRunID(time.Now()))
+	treeIn(t, r, id, orphan)
+	r.sweepRuns(context.Background())
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("the sweep kept the run directory no run names: %v", err)
+	}
+	if p, _, _ := r.Ship.Load(id); p.Work != r.Ship.workDir(id) {
+		t.Fatalf("the package names %s, not the case's work directory", p.Work)
+	}
+}

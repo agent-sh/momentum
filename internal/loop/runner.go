@@ -161,14 +161,14 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		families = o.Families
 	}
 	// the turns: a turn the store cannot read leaves its order as configured
-	turns := map[string]string{}
+	turns, taken := map[string]string{}, map[string]time.Time{}
 	for _, kind := range []string{turnBuild, turnRun} {
-		turn, err := r.Store.LoopTurn(ctx, kind)
+		turn, at, err := r.Store.LoopTurnAt(ctx, kind)
 		if err != nil {
 			r.logf("the loop's %s turn: %v; the pass takes the families in their configured order", kind, err)
 			continue
 		}
-		turns[kind] = turn
+		turns[kind], taken[kind] = turn, at
 	}
 	// every family's run is reserved before any starts, so the budgets count each in flight at its whole budget
 	// whatever the others spend meanwhile
@@ -316,19 +316,21 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		}
 		return out
 	}
-	// the room the budgets leave: a dry pass ignores the budgets, and one that cannot read them prepares as if
-	// they had room, so affordable refuses what they do not
-	room, roomWhy := len(families), ""
+	// the room the budgets leave, no run, one or more: a dry pass ignores the budgets, and one that cannot read them
+	// prepares as if they had room, so affordable refuses what they do not
+	room, roomWhy := 2, ""
 	if !o.Dry {
 		r.budgetAt = r.now() // one reading for the pass's budgets: the room and every check after it
 		defer func() { r.budgetAt = time.Time{} }()
 		var err error
-		if room, roomWhy, err = r.room(ctx, len(families)); err != nil {
+		if room, roomWhy, err = r.room(ctx, 2); err != nil {
 			r.logf("the loop's budgets: %v", err)
-			room, roomWhy = len(families), ""
+			room, roomWhy = 2, ""
 		}
 	}
-	steps, next := schedule(families, cands, turns, room, prepare, reserve)
+	// with room for one run, the build and the run turn take the pass in turn: the run turn's when the last pass that
+	// took one turn and not the other took the build's
+	steps, next, took := schedule(families, cands, turns, room, taken[turnBuild].After(taken[turnRun]), prepare, reserve)
 	for id := range prepared { // cannot happen: schedule reserves every build it readies
 		unready(id)
 	}
@@ -344,8 +346,8 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		// a turn the store cannot write keeps its old family: the pass counts it among its steps
 		failed, changed := 0, 0
 		var writeErr error
-		for _, kind := range []string{turnBuild, turnRun} {
-			if next[kind] == turns[kind] {
+		for _, kind := range []string{turnBuild, turnRun} { // a turn a run took is written again, so its time says so
+			if !took[kind] {
 				continue
 			}
 			changed++
@@ -380,8 +382,11 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		if err := r.noteWaiting(ctx); err != nil {
 			r.logf("waiting packages: %v", err)
 		}
-		if err := r.lessons(ctx, o.Case, clean); err != nil && picked == nil {
-			picked = err
+		if err := r.lessons(ctx, o.Case, clean); err != nil {
+			r.logf("lessons: %v", err)
+			if picked == nil {
+				picked = err
+			}
 		}
 	}
 	sort.Slice(done, func(i, j int) bool { return done[i].Family+done[i].Step < done[j].Family+done[j].Step })

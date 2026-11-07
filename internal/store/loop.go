@@ -28,15 +28,25 @@ var loopTableNames = []string{"loop_runs", "loop_turns"}
 
 // LoopTurn is the family a turn names, "" before any.
 func (s *Store) LoopTurn(ctx context.Context, step string) (string, error) {
-	var family string
-	err := s.db.QueryRowContext(ctx, `SELECT family FROM loop_turns WHERE step = ?`, step).Scan(&family)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
-	}
+	family, _, err := s.LoopTurnAt(ctx, step)
 	return family, err
 }
 
-// SetLoopTurn records the family a turn names.
+// LoopTurnAt is the family a turn names and when a pass last took it, "" and the zero time before any.
+func (s *Store) LoopTurnAt(ctx context.Context, step string) (string, time.Time, error) {
+	var family string
+	var at int64
+	err := s.db.QueryRowContext(ctx, `SELECT family, at FROM loop_turns WHERE step = ?`, step).Scan(&family, &at)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", time.Time{}, nil
+	}
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return family, time.UnixMilli(at), nil
+}
+
+// SetLoopTurn records the family a turn names and when a pass took it.
 func (s *Store) SetLoopTurn(ctx context.Context, step, family string, at time.Time) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO loop_turns (step, family, at) VALUES (?, ?, ?)
 	  ON CONFLICT(step) DO UPDATE SET family = excluded.family, at = excluded.at`, step, family, at.UnixMilli())

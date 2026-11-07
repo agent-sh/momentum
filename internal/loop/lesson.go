@@ -1,11 +1,11 @@
 package loop
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"os/exec"
-	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -114,12 +114,26 @@ func (r *Runner) lessons(ctx context.Context, only string, families []string) er
 	if r.Ship == nil {
 		return nil
 	}
-	cases, err := r.Store.Cases(ctx, store.CaseFilter{Statuses: []store.CaseStatus{store.CaseClosed}})
+	// each family's closed cases are read on their own, so a row of one family that cannot be read stops no other
+	// family's lessons; the pass returns the first error after them
+	var first error
+	for _, fam := range families {
+		if err := r.familyLessons(ctx, only, fam); err != nil {
+			r.logf("lessons of %s: %v", fam, err)
+			first = cmp.Or(first, err)
+		}
+	}
+	return first
+}
+
+// familyLessons publishes the lessons of one family's cases closed as improved or guarded.
+func (r *Runner) familyLessons(ctx context.Context, only, family string) error {
+	cases, err := r.Store.Cases(ctx, store.CaseFilter{Family: family, Statuses: []store.CaseStatus{store.CaseClosed}})
 	if err != nil {
 		return err
 	}
 	for _, c := range cases {
-		if c.Reason != store.Improved && c.Reason != store.Guarded || only != "" && only != c.ID || !slices.Contains(families, c.Family) {
+		if c.Reason != store.Improved && c.Reason != store.Guarded || only != "" && only != c.ID {
 			continue
 		}
 		done, cooling, err := r.lessonState(ctx, c.ID)
