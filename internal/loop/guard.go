@@ -34,8 +34,10 @@ const guardWeek = 7 * 24 * time.Hour
 // which the problem's unit was in use: of the units that hold every event of the history (guardCandidates), the one
 // with the least exposure there. It is refused only where no watch could be kept: the case's evidence is not the
 // signal's, no unit holds its events, or its history holds no exposure. A refusal names the measured plan's beside
-// the guard's. sourcesFor gives the sources and the omitted ones for a count in units, or a *waitingPlan.
-func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead error, sourcesFor func(units string) ([]string, []string, error)) (Plan, error) {
+// the guard's. countedAt is the count's own time, which the plan's boundary (plan.At) may be before, and evidence the
+// case's evidence (caseEvents) as the count read it. sourcesFor gives the sources and the omitted ones for a count in
+// units, or a *waitingPlan.
+func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead error, countedAt time.Time, evidence []caseEvent, sourcesFor func(units string) ([]string, []string, error)) (Plan, error) {
 	why := strings.TrimPrefix(instead.Error(), ErrRefused.Error()+": ")
 	refuse := func(format string, a ...any) (Plan, error) {
 		return Plan{}, refused("%s; nor can a guard stand in for it: %s", why, fmt.Sprintf(format, a...))
@@ -80,39 +82,29 @@ func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead e
 	if len(hits) == 0 {
 		return refuse("the signal counts no event of %s in the %s before", units, history)
 	}
-	evidence, err := caseEvents(ctx, s.Store, c.ID, s.Dir)
-	if err != nil {
-		return Plan{}, err
-	}
 	counted := map[string]bool{}
 	for _, e := range hits {
 		counted["ev:"+e.ID()] = true
 	}
-	// own is the signal's tool when every event of the case's evidence in the history is of it: its detector filed
-	// them, and no plan words them, so naming a tool in the signal takes no tool past the two incidents
-	// (guardCandidates). An event the store no longer holds is of no tool.
+	// own is the signal's tool when every event of the case's evidence dated before the count (countedAt) is of it:
+	// its detector filed them, and no plan words them, so naming a tool in the signal takes no tool past the two
+	// incidents (guardCandidates). It is read over no span back from the count: the history is four of the build's
+	// windows, so evidence of another tool outside it would drop out under a shorter one, and a span would lose, at a
+	// later recount (a hand landing's), the evidence the proposal saw. Evidence dated from the count on is not read: at
+	// a hand landing's recount, which counts at the landing, it is a recurrence the watch reads. A case with no event
+	// of the store gets no guard (events, below). An event the store no longer holds is of no tool.
 	events, in, hit, own := 0, 0, 0, sig.Tool
 	for _, e := range evidence {
-		id, ok := strings.CutPrefix(e.Ref, "ev:")
-		if !ok {
-			continue
-		}
 		events++
+		if own != "" && e.At.Before(countedAt) && (!e.Found || e.Event.Tool != own) {
+			own = ""
+		}
 		if e.At.Before(since) || !e.At.Before(at) {
 			continue
 		}
 		in++
 		if counted[e.Ref] {
 			hit++
-		}
-		if own != "" {
-			ev, found, err := s.Store.EventByID(ctx, id)
-			if err != nil {
-				return Plan{}, err
-			}
-			if !found || ev.Tool != own {
-				own = ""
-			}
 		}
 	}
 	switch {
@@ -312,9 +304,12 @@ func guardCandidates(units, own string, hits []store.Event) (cands []guardCandid
 		whys = append(whys, "some of no MCP server")
 	case fields[store.CodexApps]:
 		named := len(connectors)
-		w := fmt.Sprintf("of %d MCP servers, %s's tools of %d connector%s", len(fields), store.CodexApps, named, plural(named))
 		if connectors[""] {
-			w = fmt.Sprintf("of %d MCP servers, %s's tools of %d connector%s and some of none", len(fields), store.CodexApps, named-1, plural(named-1))
+			named--
+		}
+		w := fmt.Sprintf("of %d MCP servers, %s's tools of %s", len(fields), store.CodexApps, connectorsText(named))
+		if connectors[""] && named > 0 {
+			w += " and some of none"
 		}
 		whys = append(whys, w)
 	default:
@@ -322,6 +317,14 @@ func guardCandidates(units, own string, hits []store.Event) (cands []guardCandid
 	}
 	return nil, fmt.Sprintf("no unit holds all its events (%s: a tool, alone or in a set, is in two incidents or more, the signal's own too unless every event of the case's evidence is of it; a directory is every event's own; an MCP server is the one every event's tool is of, a connector of codex_apps where one holds them all), so absence cannot be counted only while the problem's unit was in use",
 		strings.Join(whys, "; "))
+}
+
+// connectorsText counts codex_apps's connectors for a refusal: "no connector" for none.
+func connectorsText(n int) string {
+	if n == 0 {
+		return "no connector"
+	}
+	return fmt.Sprintf("%d connector%s", n, plural(n))
 }
 
 // plural is "s" but for one.
