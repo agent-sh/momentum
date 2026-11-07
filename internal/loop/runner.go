@@ -289,10 +289,11 @@ func baseNotePrefix(caseID string) string { return "loop-build:" + store.IDPart(
 // not trust) needs a person.
 const baseHoldRaise = 24 * time.Hour
 
-// noteBaseHold notes a build held because its base cannot be fetched now: one note per class of cause (holdClass),
-// open until the hold ends (endBaseNotes). Once the case's builds have waited baseHoldRaise since its oldest open such
-// note, the note is raised to normal importance. A note a person took out of the report stays out while its hold
-// lasts; one whose hold ended (it says so) opens again with the next hold of its class.
+// noteBaseHold notes a build held because its repository's mirror has no usable fetch: one note per class of cause
+// (holdClass), open until the hold ends (endBaseNotes). Once the case's builds have waited baseHoldRaise since the
+// oldest note of the hold, the note is raised to normal importance. A note a person took out of the report stays out
+// while its hold lasts at the importance it was taken out at, and comes back once when that rises; one whose hold
+// ended (it says so) opens again with the next hold of its class.
 func (r *Runner) noteBaseHold(ctx context.Context, c store.Case, why string) error {
 	detail, err := Redact(ctx, why)
 	if err != nil {
@@ -314,23 +315,26 @@ func (r *Runner) noteBaseHold(ctx context.Context, c store.Case, why string) err
 		if n.ID == id {
 			current = &notes[i]
 		}
-		if n.Done.IsZero() && n.At.Before(since) {
+		if !baseNoteEnded(n) && n.At.Before(since) { // a note of this hold, one a person took out of the report too
 			since = n.At
 		}
-	}
-	if current != nil && !current.Done.IsZero() {
-		if !baseNoteEnded(*current) {
-			return nil // a person took it out of the report while this hold lasts
-		}
-		current = nil // its hold ended: this is a new one
 	}
 	importance := store.ImportanceLow
 	if r.now().Sub(since) >= baseHoldRaise {
 		importance = store.ImportanceNormal
 	}
+	if current != nil && !current.Done.IsZero() {
+		switch {
+		case baseNoteEnded(*current):
+			current = nil // its hold ended: this is a new one
+		case importance <= current.Importance:
+			return nil // a person took it out of the report at this importance, while this hold lasts
+		}
+		// a dismissal covers the importance it was made at: the note comes back, once, when its importance rises
+	}
 	at := r.now()
 	if current != nil {
-		if current.Importance >= importance {
+		if current.Importance >= importance && current.Done.IsZero() {
 			return nil
 		}
 		at = current.At
@@ -365,12 +369,18 @@ func (r *Runner) endBaseNotes(ctx context.Context, caseID, why string) error {
 // endBaseNotesIn is endBaseNotes over notes read already.
 func (r *Runner) endBaseNotesIn(ctx context.Context, notes []store.Note, caseID, why string) error {
 	for _, n := range notes {
-		if !strings.HasPrefix(n.ID, baseNotePrefix(caseID)) || baseNoteEnded(n) {
+		if !strings.HasPrefix(n.ID, baseNotePrefix(caseID)) {
 			continue
 		}
-		n.Detail = n.Detail + " " + why
-		if _, err := r.Store.PutNote(ctx, n); err != nil {
-			return err
+		ended := baseNoteEnded(n)
+		if ended && !n.Done.IsZero() {
+			continue
+		}
+		if !ended { // a note that says its hold ended but stands (a pass stopped between the writes) is only resolved
+			n.Detail = n.Detail + " " + why
+			if _, err := r.Store.PutNote(ctx, n); err != nil {
+				return err
+			}
 		}
 		if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
 			return err

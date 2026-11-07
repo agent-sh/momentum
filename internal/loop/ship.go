@@ -374,8 +374,16 @@ func (s *Ship) public(ctx context.Context, text string) (string, error) {
 	return s.Public(ctx, text)
 }
 
-// Prepare creates a host-only clone and an independent run clone before any writable mount uses it.
+// Prepare creates a host-only clone and an independent run clone before any writable mount uses it. The host clone is
+// made from origin's mirror, which Prepare fetches as a pass does (mirrorTip); a build passes its pass's own (prepare).
 func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, error) {
+	return s.prepare(ctx, caseID, repoDir, nil)
+}
+
+// prepare is Prepare from origin's branch as the mirror holds it (tip), or as Prepare fetches it into the mirror when
+// tip is nil. The host clone is a local clone of the mirror, whose origin then names the checkout's origin, for the
+// pushes a proposal and a landing make; nothing it holds came from the network itself.
+func (s *Ship) prepare(ctx context.Context, caseID, repoDir string, tip *repoTip) (Package, error) {
 	ctx = s.gitContext(shipContext(ctx, caseID))
 	unlock, err := s.lock(ctx, caseID)
 	if err != nil {
@@ -424,50 +432,35 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 		return Package{}, err
 	}
 	origin = strings.TrimSpace(origin)
+	if tip == nil {
+		got, err := s.mirrorTip(ctx, t.Repo, t.Dir)
+		if err != nil {
+			return Package{}, err
+		}
+		tip = &got
+	}
 	for _, d := range []string{host, work} {
 		if err := os.MkdirAll(filepath.Dir(d), 0700); err != nil {
 			return Package{}, err
 		}
-	}
-	// A clone a held preparation of this source left is fetched into again, not made again: a hold lasts pass after
-	// pass, and each would clone the whole repository. Any other host clone (an earlier package's) goes, but only once
-	// the remote answers: an outage holds the build and leaves it.
-	marker := filepath.Join(host, ".git", heldCloneFile)
-	if kept, err := os.ReadFile(marker); err != nil || string(kept) != t.Dir {
-		if _, err := os.Lstat(filepath.Join(host, ".git")); err == nil {
-			if _, err := s.git(ctx, host, "remote", "set-url", "origin", origin); err == nil {
-				if _, err := s.baseBranch(ctx, host, t.Repo, t.Base); held(err) {
-					return Package{}, err
-				}
-			}
-		}
-		if err := removeAll(host); err != nil {
-			return Package{}, err
-		}
-		if err := s.cloneConfined(ctx, t.Dir, host); err != nil {
+		if err := removeAll(d); err != nil {
 			return Package{}, err
 		}
 	}
-	if err := removeAll(work); err != nil {
+	// a local clone of the mirror, the loop's own storage that usableMirror checked (a bare repository of plain files
+	// whose configuration names no program), with the input pins: no network, no hook, no template
+	if _, err := hostInputGit(ctx, "", "clone", "--quiet", "--no-local", "--no-checkout", "--template=", "--", tip.dir, host); err != nil {
 		return Package{}, err
 	}
 	if _, err := s.git(ctx, host, "remote", "set-url", "origin", origin); err != nil {
 		return Package{}, err
 	}
-	defaultBranch, base, err := s.fetchBase(ctx, host, t.Repo, t.Base)
-	if held(err) {
-		// the next pass fetches into this clone (a write that fails only clones again)
-		_ = os.WriteFile(marker, []byte(t.Dir), 0o600)
-		return Package{}, err
-	}
+	defaultBranch, base, err := s.mirrorBase(ctx, host, *tip, false)
 	if err != nil {
 		return Package{}, err
 	}
-	if err := os.Remove(marker); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return Package{}, err
-	}
 	branch := "momentum/" + c.ID
-	if _, err := s.git(ctx, host, "checkout", "--quiet", "-B", branch, "origin/"+defaultBranch); err != nil {
+	if _, err := s.git(ctx, host, "checkout", "--quiet", "-B", branch, base); err != nil {
 		return Package{}, err
 	}
 	p := Package{Case: c.ID, Kind: "repo", Repo: t.Repo, Base: defaultBranch, BaseCommit: base, Dir: t.Dir, Branch: branch,
@@ -475,10 +468,15 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	if had && old.State == Withdrawn {
 		p.ClosedProposals = old.ClosedProposals // a closed hand landing proposal counts toward the case's two
 	}
-	// A rolled-back package may still have a proposal branch after refused cleanup.
+	// A rolled-back package may still have a proposal branch after refused cleanup. Reading it is the one call of a
+	// preparation's that reaches the network: one that cannot be made now holds the build for the pass, as a mirror
+	// with no usable fetch does; an answer the host cannot read is the build's own.
 	p.PublishedHead, err = s.remoteBranch(ctx, p)
-	if err != nil {
+	if errors.Is(err, ErrRefused) {
 		return Package{}, err
+	}
+	if err != nil {
+		return Package{}, &shipHold{err: refused("the proposal branch of %s cannot be read now", p.Repo)}
 	}
 	if err := s.freshRunClone(ctx, &p); err != nil {
 		return Package{}, err
@@ -540,34 +538,28 @@ func (s *Ship) freshRunClone(ctx context.Context, p *Package) error {
 	return nil
 }
 
-// buildBase readies the package's build tree before a build is mounted, at the default branch as the host fetches it
-// now, so a base the episode prepared earlier never pins an old tree. The base is the pass's snapshot commit while the
-// fetched branch still holds it, so /ro/history, /ro/diffs and BASE show the same history; else, and for a change a
-// landing found no longer rebases (RefreshBase), the fetched tip. When that is the package's base, the tree is made
+// buildBase readies the package's build tree before a build is mounted, at the default branch as origin's mirror holds
+// it for the build's pass (tip), so a base the episode prepared earlier never pins an old tree. The host clone is
+// refreshed from the mirror, never from the network (mirrorBase): the base is the pass's snapshot commit while the
+// mirror's branch still holds it, so /ro/history, /ro/diffs and BASE show the same history; else, and for a change a
+// landing found no longer rebases (RefreshBase), the mirror's tip. When that is the package's base, the tree is made
 // again from it. When it moved, or for RefreshBase, the host clone is reset to it and the build reworks the change
 // there: the cumulative patch stays in the package's data and reaches the run as previous.patch, and the old build
-// tree is never read. The default branch is the one origin's HEAD names now (fetchBase), so a branch origin renamed is
-// followed, and the package's base branch with it. A fetch the transport or a deadline ends holds the build, without a
-// run or a charge; any other failure (a repository or a branch origin does not have, a refusal of the host clone) is
-// the build's own.
-func (s *Ship) buildBase(ctx context.Context, p Package, snapshot string) (Package, error) {
+// tree is never read. The default branch is the one the mirror's record names origin's HEAD, so a branch origin
+// renamed is followed, and the package's base branch with it. A failure here is the build's own: a build waits only
+// for a mirror with no usable fetch, before it starts (mirrorHold).
+func (s *Ship) buildBase(ctx context.Context, p Package, tip repoTip) (Package, error) {
 	if p.RefreshBase && roundsUsed(p) {
 		return p, refused("review rounds used; the change waits for a person")
 	}
 	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
 		return p, err
 	}
-	branch, target, err := s.fetchBase(ctx, p.Host, p.Repo, p.Base)
+	branch, target, err := s.mirrorBase(ctx, p.Host, tip, p.RefreshBase)
 	if err != nil {
 		return p, err
 	}
 	p.Base = branch // the caller saves it with the build tree
-	// a change that no longer rebases goes to the tip it failed on, or a later one, never back to the pass's snapshot
-	if snapshot != "" && snapshot != target && !p.RefreshBase {
-		if _, err := s.git(ctx, p.Host, "merge-base", "--is-ancestor", snapshot, target); err == nil {
-			target = snapshot
-		}
-	}
 	moved := target != p.BaseCommit || p.RefreshBase
 	if moved {
 		if roundsUsed(p) {
@@ -1707,61 +1699,14 @@ func (s *Ship) gitInput(ctx context.Context, dir string, input []byte, args ...s
 	if out.Over() || errOut.Over() {
 		return "", refused("Git output exceeds the whole-stream limit")
 	}
+	if err != nil && cctx.Err() != nil {
+		return out.String(), fmt.Errorf("git %s: %s: %s", strings.Join(args, " "), endedBy(cctx), strings.TrimSpace(errOut.String()))
+	}
 	if err != nil {
-		diag := strings.TrimSpace(errOut.String())
-		if cctx.Err() != nil {
-			return out.String(), &shipGitError{text: fmt.Sprintf("git %s: %s: %s", strings.Join(args, " "), endedBy(cctx), diag), diag: diag, ended: endedBy(cctx)}
-		}
-		return out.String(), &shipGitError{text: fmt.Sprintf("git %s: %v: %s", strings.Join(args, " "), err, diag), diag: diag, err: err}
+		return out.String(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(errOut.String()))
 	}
 	return out.String(), nil
 }
-
-// baseHold is a ship Git call of a base's fetch as fetchBase returns it: a hold (baseOutage) unless the remote answered
-// or the host refused the call before it ran.
-func baseHold(err error, repo string) error {
-	var failed *shipGitError
-	if errors.As(err, &failed) && (failed.ended != "" || !remoteAnswered([]byte(failed.diag))) {
-		class, line := holdClass([]byte(failed.diag), failed.ended)
-		return &shipHold{err: &baseOutage{repo: repo, class: class, line: line}}
-	}
-	return err
-}
-
-// baseRemote is where the host clone's base is read: a GitHub origin over https by its name (githubURL), with the
-// GitHub CLI's credentials, as the mirror reads it, so no ssh agent is asked for a key; any other origin as it is.
-func (s *Ship) baseRemote(ctx context.Context, host string) (string, error) {
-	url, err := s.git(ctx, host, "config", "--get", "remote.origin.url")
-	if err != nil {
-		return "", err
-	}
-	if identity := remoteIdentity(url); !strings.HasPrefix(identity, "url:") {
-		return githubURL(identity), nil
-	}
-	return "origin", nil
-}
-
-// baseBranch is the branch the host clone's origin names as its HEAD now (ls-remote --symref), or known when it names
-// none; a failure is fetchBase's (baseHold).
-func (s *Ship) baseBranch(ctx context.Context, host, repo, known string) (string, error) {
-	remote, err := s.baseRemote(ctx, host)
-	if err != nil {
-		return "", err
-	}
-	out, err := s.git(ctx, host, "ls-remote", "--symref", remote, "HEAD")
-	if err != nil {
-		return "", baseHold(err, repo)
-	}
-	branch := firstOf(symrefBranch(out), known)
-	if _, err := hostInputGit(ctx, "", "check-ref-format", "refs/heads/"+branch); err != nil {
-		return "", refused("origin's default branch has no valid name")
-	}
-	return branch, nil
-}
-
-// heldCloneFile, in a host clone's Git directory, names the source of a preparation a hold stopped: the next
-// preparation of that source fetches into the clone.
-const heldCloneFile = "momentum-held"
 
 // baseOutage is a build whose base cannot be fetched now, held for the pass (shipHold): its repository and its class,
 // which its note names, and the line of Git's diagnostics that shows it (holdClass), which only the pass's log gets,
@@ -1773,42 +1718,53 @@ func (e *baseOutage) Error() string {
 }
 func (e *baseOutage) Unwrap() error { return ErrRefused }
 
-// shipGitError is a ship Git call that ran and failed: its text (the call, how it ended and Git's diagnostics), the
-// deadline that ended it, if one did (endedBy), and the diagnostics, which say whether a remote answered (fetchBase).
-type shipGitError struct {
-	text, diag, ended string
-	err               error
+// mirrorTip is origin's branch as the repository's mirror holds it (sourceTip, as a pass reads it): fetched now, or as
+// it was last fetched when the fetch fails. A mirror with no usable fetch holds the build (mirrorHold).
+func (s *Ship) mirrorTip(ctx context.Context, repo, dir string) (repoTip, error) {
+	tip, _, err := sourceTip(ctx, dir, filepath.Join(s.Dir, "mirrors"), s.GH)
+	if err != nil {
+		return repoTip{}, err
+	}
+	if tip.dir == dir {
+		return repoTip{}, mirrorHold(repo, tip.class, tip.line)
+	}
+	return tip, nil
 }
 
-func (e *shipGitError) Error() string { return e.text }
-func (e *shipGitError) Unwrap() error { return e.err }
+// mirrorHold holds a build whose repository's mirror has no usable fetch, by the fetch's class (holdClass) and the
+// line of Git's that shows it.
+func mirrorHold(repo, class, line string) error {
+	return &shipHold{err: &baseOutage{repo: repo, class: class, line: line}}
+}
 
-// fetchBase fetches the default branch of the host clone's origin into its remote-tracking branch and returns the
-// branch and its commit. The branch is the one origin's HEAD names now (ls-remote --symref, as the mirror reads it),
-// not the one the checkout's origin/HEAD names, which nothing updates: a renamed default branch is followed. known is
-// the branch when origin does not name its HEAD. A GitHub origin is read as the mirror reads it, over https by its
-// name with the GitHub CLI's credentials (githubURL), so no ssh agent is asked for a key. A call the remote answered
-// (remoteAnswered: a repository, a branch or access it does not have) fails as the build's own, and so does a refusal
-// of the host clone; any other failure, a deadline's among them, is an outage, which holds the build for the pass,
-// without a run or a charge. The hold names the failure's class (holdClass), not Git's text, so its note stays one
-// note per class whatever the network printed; the line that shows it goes to the pass's log (baseOutage).
-func (s *Ship) fetchBase(ctx context.Context, host, repo, known string) (string, string, error) {
-	remote, err := s.baseRemote(ctx, host)
+// mirrorBase refreshes the host clone's remote-tracking branch from origin's mirror (tip.dir), never from the network:
+// the mirror is what the pass fetched and its snapshot read, kept usable by its own checks (clearStale, takeOrphan,
+// makeMirror, packMirror). It returns the branch, the one the mirror's record names origin's HEAD (tip.branch), and
+// the base: the snapshot's commit (tip.commit) while the mirror's branch holds it, so /ro/history, /ro/diffs and BASE
+// show the same history; else, and for a change a landing found no longer rebases (refresh), the mirror's tip.
+func (s *Ship) mirrorBase(ctx context.Context, host string, tip repoTip, refresh bool) (string, string, error) {
+	if tip.dir == "" || tip.branch == "" {
+		return "", "", refused("no mirror holds origin's default branch")
+	}
+	if _, err := hostInputGit(ctx, "", "check-ref-format", "refs/heads/"+tip.branch); err != nil {
+		return "", "", refused("origin's default branch has no valid name")
+	}
+	ref := "refs/remotes/origin/" + tip.branch
+	if _, err := s.git(ctx, host, "fetch", "--quiet", "--no-tags", tip.dir, "+refs/heads/"+tip.branch+":"+ref); err != nil {
+		return "", "", err
+	}
+	out, err := s.git(ctx, host, "rev-parse", "--verify", ref+"^{commit}")
 	if err != nil {
 		return "", "", err
 	}
-	branch, err := s.baseBranch(ctx, host, repo, known)
-	if err != nil {
-		return "", "", err
+	target := strings.TrimSpace(out)
+	// a change that no longer rebases goes to the tip it failed on, or a later one, never back to the pass's snapshot
+	if !refresh && tip.commit != "" && tip.commit != target {
+		if _, err := s.git(ctx, host, "merge-base", "--is-ancestor", tip.commit, target); err == nil {
+			target = tip.commit
+		}
 	}
-	if _, err := s.git(ctx, host, "fetch", "--quiet", remote, "+refs/heads/"+branch+":refs/remotes/origin/"+branch); err != nil {
-		return "", "", baseHold(err, repo)
-	}
-	commit, err := s.git(ctx, host, "rev-parse", "--verify", "refs/remotes/origin/"+branch+"^{commit}")
-	if err != nil {
-		return "", "", err
-	}
-	return branch, strings.TrimSpace(commit), nil
+	return tip.branch, target, nil
 }
 
 func (s *Ship) gh(ctx context.Context, dir string, args ...string) (string, error) {
@@ -1881,8 +1837,9 @@ func (s *Ship) packageText(c store.Case, p Package) string {
 
 // publicBase says whether the package's base commit is on the default branch of a repository GitHub reports public,
 // which anyone can clone. The host clone must name the package's repository, and the base must still be on the
-// branch the remote serves (a force-push that purged it leaves it to the scan). Any other answer is false; a
-// visibility or fetch that cannot be read now is a hold, so a passing outage refuses no build for a cause it lacks.
+// branch as origin's mirror holds it, which the build's base just refreshed from (mirrorBase): a force-push that
+// purged it leaves it to the scan. Any other answer is false; a visibility that cannot be read now is a hold, so a
+// passing outage refuses no build for a cause it lacks.
 func (s *Ship) publicBase(ctx context.Context, p Package) (bool, error) {
 	repo, err := s.Gate.repo(ctx, p.Host)
 	if err != nil || !strings.EqualFold(repo, p.Repo) {
@@ -1898,14 +1855,7 @@ func (s *Ship) publicBase(ctx context.Context, p Package) (bool, error) {
 	if visibility.Visibility != "PUBLIC" {
 		return false, nil
 	}
-	_, tip, err := s.fetchBase(ctx, p.Host, p.Repo, p.Base)
-	if held(err) {
-		return false, err
-	}
-	if err != nil {
-		return false, nil
-	}
-	_, err = s.git(ctx, p.Host, "merge-base", "--is-ancestor", p.BaseCommit, tip)
+	_, err = s.git(ctx, p.Host, "merge-base", "--is-ancestor", p.BaseCommit, "refs/remotes/origin/"+p.Base)
 	return err == nil, nil
 }
 

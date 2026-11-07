@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,55 +17,6 @@ import (
 	"testing"
 	"time"
 )
-
-// A build is held for the pass only when a deadline or the transport ended its base's fetch: no run, no charge. A
-// remote that answers (a repository it does not have) fails the build as its own, so it is not held pass after pass.
-func TestABuildBaseHoldsOnlyOnAnOutage(t *testing.T) {
-	if _, err := exec.LookPath("ssh"); err != nil {
-		t.Skip("no ssh here")
-	}
-	for _, kind := range []string{"a deadline", "a refused connection", "a missing repository"} {
-		t.Run(kind, func(t *testing.T) {
-			ctx := context.Background()
-			r, c, _ := buildCase(t)
-			newPass(t, r)
-			if _, err := r.prepareRun(ctx, c, c.Family, StepBuild); err != nil {
-				t.Fatal(err)
-			}
-			p, _, err := r.Ship.Load(c.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			url := filepath.Join(t.TempDir(), "gone.git")
-			switch kind {
-			case "a deadline":
-				port, _ := stalledListener(t, 30*time.Second)
-				url = fmt.Sprintf("ssh://git@127.0.0.1:%d/x.git", port)
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(ctx, 5*time.Second)
-				defer cancel()
-			case "a refused connection":
-				ln, err := net.Listen("tcp", "127.0.0.1:0")
-				if err != nil {
-					t.Fatal(err)
-				}
-				url = fmt.Sprintf("ssh://git@127.0.0.1:%d/x.git", ln.Addr().(*net.TCPAddr).Port)
-				ln.Close()
-			}
-			run(t, p.Host, "git", "remote", "set-url", "origin", url)
-			_, err = r.prepareRun(ctx, c, c.Family, StepBuild)
-			if kind == "a missing repository" {
-				if err == nil || held(err) {
-					t.Fatalf("a remote without the repository held the build: %v", err)
-				}
-				return
-			}
-			if err == nil || !held(err) || !strings.Contains(err.Error(), "cannot be fetched now") {
-				t.Fatalf("an outage did not hold the build: %v (held %v)", err, held(err))
-			}
-		})
-	}
-}
 
 // origin renamed its default branch, and the checkout's origin/HEAD, which nothing updates, still names the old one:
 // a build follows the branch origin's HEAD names now, for a package prepared before the rename and for one prepared

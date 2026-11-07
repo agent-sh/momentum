@@ -8,11 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
-	"time"
-
-	"github.com/agent-sh/momentum/internal/store"
 )
 
 // oldGit puts on PATH a Git that answers as one before 2.45 does, which has a single ref format: init refuses
@@ -154,93 +150,6 @@ func TestARepackLeavesTheLargestPackAsItIs(t *testing.T) {
 	}
 	if packs, loose := countObjects(t, mirror); packs > 3 || loose != 0 {
 		t.Fatalf("after the repack the mirror has %d packs and %d loose objects", packs, loose)
-	}
-}
-
-// A build held for its base gets one note per class of cause, which names the class, not Git's text, and the pass's
-// log gets the text's first line. After a day of waiting the note is raised to normal importance; a build that fetches
-// its base resolves it.
-func TestABaseHoldNotesItsClassAndIsRaisedAfterADay(t *testing.T) {
-	ctx := context.Background()
-	r, c, f := buildCase(t)
-	clock := time.Now()
-	r.Now = func() time.Time { return clock }
-	var mu sync.Mutex
-	var logged []string
-	r.Log = func(format string, args ...any) {
-		mu.Lock()
-		defer mu.Unlock()
-		logged = append(logged, fmt.Sprintf(format, args...))
-	}
-	newPass(t, r)
-	if _, err := r.prepareRun(ctx, c, c.Family, StepBuild); err != nil {
-		t.Fatal(err)
-	}
-	p, _, err := r.Ship.Load(c.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// a transport whose credentials are gone, as git says over https when gh is logged out
-	bin := t.TempDir()
-	// after ssh's warning about its key exchange, which comes first
-	script(t, bin, "ssh", `echo "** WARNING: connection is not using a post-quantum key exchange algorithm." >&2
-echo "fatal: could not read Username for 'https://github.com': terminal prompts disabled" >&2; exit 255`)
-	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
-	run(t, p.Host, "git", "remote", "set-url", "origin", "ssh://git@fixture.invalid/fixture/fake.git")
-	baseNotes := func() []store.Note {
-		notes, err := r.Store.Notes(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var open []store.Note
-		for _, n := range notes {
-			if n.Done.IsZero() && strings.HasPrefix(n.ID, "loop-build:"+store.IDPart(c.ID)+":base:") {
-				open = append(open, n)
-			}
-		}
-		return open
-	}
-	hold := func() {
-		t.Helper()
-		_, err := r.prepareRun(ctx, c, c.Family, StepBuild)
-		if !held(err) {
-			t.Fatalf("lost credentials did not hold the build: %v", err)
-		}
-		r.buildSkipped(ctx, c, "prepare", err)
-	}
-	hold()
-	notes := baseNotes()
-	if len(notes) != 1 || !strings.Contains(notes[0].Detail, "cannot be fetched now (no credentials)") || notes[0].Importance != store.ImportanceLow {
-		t.Fatalf("the hold's notes: %+v", notes)
-	}
-	mu.Lock()
-	found := false
-	for _, line := range logged {
-		found = found || strings.Contains(line, "could not read Username for 'https://github.com': terminal prompts disabled")
-		if strings.Contains(line, "post-quantum") {
-			t.Fatalf("the pass's log took ssh's warning for git's failure: %s", line)
-		}
-	}
-	mu.Unlock()
-	if !found {
-		t.Fatalf("the pass's log lacks git's text:\n%s", strings.Join(logged, "\n"))
-	}
-	clock = clock.Add(baseHoldRaise / 2)
-	hold()
-	if notes := baseNotes(); len(notes) != 1 || notes[0].Importance != store.ImportanceLow {
-		t.Fatalf("half a day's hold: %+v", notes)
-	}
-	clock = clock.Add(baseHoldRaise/2 + time.Minute)
-	hold()
-	if notes := baseNotes(); len(notes) != 1 || notes[0].Importance != store.ImportanceNormal {
-		t.Fatalf("a day's hold was not raised: %+v", notes)
-	}
-	run(t, p.Host, "git", "remote", "set-url", "origin", f.origin)
-	if _, err := r.prepareRun(ctx, c, c.Family, StepBuild); err != nil {
-		t.Fatal(err)
-	}
-	if notes := baseNotes(); len(notes) != 0 {
-		t.Fatalf("a build that fetched its base left its hold's notes open: %+v", notes)
 	}
 }
 

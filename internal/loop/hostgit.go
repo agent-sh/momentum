@@ -138,18 +138,6 @@ func hostGit(ctx context.Context, dir string, input []byte, args ...string) (str
 	return out.String(), nil
 }
 
-// cloneConfined reads a checked host source into fresh host-owned storage.
-func (s *Ship) cloneConfined(ctx context.Context, source, dest string) error {
-	if err := CheckHostStorage(s.gitContext(ctx), source); err != nil {
-		return err
-	}
-	if err := CheckGitConfig(ctx, source); err != nil {
-		return err
-	}
-	_, err := hostGit(ctx, source, nil, "clone", "--quiet", "--no-local", "--no-checkout", "--template=", "--", source, dest)
-	return err
-}
-
 // Configuration inspection names includes without loading them. It carries no
 // execution overrides, so a pinned false cannot hide a repository's program.
 func hostConfig(ctx context.Context, dir string, args ...string) (string, error) {

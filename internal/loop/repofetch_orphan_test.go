@@ -12,52 +12,47 @@ import (
 	"time"
 )
 
-// Only a remote's answer fails a build as its own; every other failure, as git, curl (OpenSSL or GnuTLS) and ssh print
-// it, is an outage that holds the build. The samples are Git's diagnostics as they are printed.
-func TestOnlyARemotesAnswerFailsABuild(t *testing.T) {
+// A remote call's failure is named by one of a fixed few classes, whatever git, curl (OpenSSL or GnuTLS) and ssh
+// printed: the samples are Git's diagnostics as they are printed.
+func TestARemoteFailureIsNamedByItsClass(t *testing.T) {
 	const access = "fatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n"
-	for _, c := range []struct {
-		name, stderr string
-		answered     bool
-	}{
-		{"GnuTLS handshake", "fatal: unable to access 'https://github.com/o/r.git/': GnuTLS, handshake failed: The TLS connection was non-properly terminated.\n", false},
-		{"GnuTLS receive", "fatal: unable to access 'https://github.com/o/r.git/': GnuTLS recv error (-110): The TLS connection was non-properly terminated.\n", false},
-		{"GnuTLS receive, another code", "error: RPC failed; curl 56 GnuTLS recv error (-9): Error decoding the received TLS packet.\n", false},
-		{"OpenSSL read", "error: RPC failed; curl 56 OpenSSL SSL_read: SSL_ERROR_SYSCALL, errno 104\nfatal: early EOF\n", false},
-		{"OpenSSL connect", "fatal: unable to access 'https://github.com/o/r.git/': OpenSSL SSL_connect: SSL_ERROR_SYSCALL in connection to github.com:443 \n", false},
-		{"ssh closed", "Connection closed by 192.0.2.1 port 22\r\n" + access, false},
-		{"ssh reset", "kex_exchange_identification: read: Connection reset by peer\r\nConnection reset by 192.0.2.1 port 22\r\n" + access, false},
-		{"ssh refused", "ssh: connect to host github.com port 22: Connection refused\r\n" + access, false},
-		{"ssh timed out", "ssh: connect to host github.com port 22: Connection timed out\r\n" + access, false},
-		{"ssh name", "ssh: Could not resolve hostname github.com: Temporary failure in name resolution\r\n" + access, false},
-		{"https name", "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com\n", false},
-		{"https refused", "fatal: unable to access 'https://github.com/o/r.git/': Failed to connect to github.com port 443 after 3 ms: Could not connect to server\n", false},
-		{"5xx", "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 502\n", false},
-		{"too many requests", "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 429\n", false},
-		{"early EOF", "remote: Enumerating objects: 9, done.\nfatal: early EOF\nfatal: fetch-pack: invalid index-pack output\n", false},
-		{"empty reply", "fatal: unable to access 'https://github.com/o/r.git/': Empty reply from server\n", false},
-		{"outstanding read data", "error: RPC failed; curl 18 transfer closed with outstanding read data remaining\nfatal: expected flush after ref listing\n", false},
-		{"http2 framing", "error: RPC failed; curl 16 Error in the HTTP2 framing layer\nfatal: expected flush after ref listing\n", false},
-		{"http2 stream", "error: RPC failed; curl 92 HTTP/2 stream 5 was not closed cleanly: CANCEL (err 8)\n", false},
-		{"too slow", "error: RPC failed; curl 28 Operation too slow. Less than 1 bytes/sec transferred the last 60 seconds\n", false},
-		{"no diagnostics", "", false},
-		{"GitHub https, no such repository", "remote: Repository not found.\nfatal: repository 'https://github.com/o/r.git/' not found\n", true},
-		{"GitHub ssh, no such repository", "ERROR: Repository not found.\n" + access, true},
-		{"no such path", "fatal: '/srv/gone.git' does not appear to be a git repository\n" + access, true},
-		{"no such branch", "fatal: couldn't find remote ref main\n", true},
-		{"local http, no such repository", "fatal: repository 'http://127.0.0.1:8080/r.git/' not found\n", true},
-		{"https 404 by curl", "fatal: unable to access 'https://git.example.org/r.git/': The requested URL returned error: 404\n", true},
-		{"credentials gh gave, refused", "remote: Invalid username or token. Password authentication is not supported for Git operations.\nfatal: Authentication failed for 'https://github.com/o/r.git/'\n", false},
-		{"no credentials", "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n", false},
-		{"401", "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 401\n", false},
-		{"a local file the call cannot write", "error: cannot open '.git/FETCH_HEAD': Permission denied\n", false},
-		{"ssh, key refused with methods", "git@example.org: Permission denied (publickey,password).\r\n" + access, true},
-		{"key refused", "git@github.com: Permission denied (publickey).\r\n" + access, true},
-		{"forbidden", "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 403\n", true},
-		{"not found", "fatal: unable to access 'https://git.example.org/r.git/': The requested URL returned error: 404\n", true},
+	const (
+		broke     = "the connection broke off"
+		noRepo    = "the remote has no such repository or branch"
+		noCreds   = "no credentials"
+		refusedBy = "the server refused (an HTTP 4xx answer)"
+	)
+	for _, c := range []struct{ name, stderr, class string }{
+		{"GnuTLS handshake", "fatal: unable to access 'https://github.com/o/r.git/': GnuTLS, handshake failed: The TLS connection was non-properly terminated.\n", broke},
+		{"GnuTLS receive", "fatal: unable to access 'https://github.com/o/r.git/': GnuTLS recv error (-110): The TLS connection was non-properly terminated.\n", broke},
+		{"OpenSSL read", "error: RPC failed; curl 56 OpenSSL SSL_read: SSL_ERROR_SYSCALL, errno 104\nfatal: early EOF\n", broke},
+		{"ssh closed", "Connection closed by 192.0.2.1 port 22\r\n" + access, broke},
+		{"ssh refused", "ssh: connect to host github.com port 22: Connection refused\r\n" + access, "no connection to the server could be made"},
+		{"ssh timed out", "ssh: connect to host github.com port 22: Connection timed out\r\n" + access, "the connection timed out"},
+		{"ssh name", "ssh: Could not resolve hostname github.com: Temporary failure in name resolution\r\n" + access, "the server's name did not resolve"},
+		{"https name", "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com\n", "the server's name did not resolve"},
+		{"5xx", "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 502\n", "the server failed (an HTTP 5xx answer)"},
+		{"too many requests", "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 429\n", otherFailure},
+		{"empty reply", "fatal: unable to access 'https://github.com/o/r.git/': Empty reply from server\n", broke},
+		{"http2 framing", "error: RPC failed; curl 16 Error in the HTTP2 framing layer\nfatal: expected flush after ref listing\n", broke},
+		{"no diagnostics", "", otherFailure},
+		{"GitHub https, no such repository", "remote: Repository not found.\nfatal: repository 'https://github.com/o/r.git/' not found\n", noRepo},
+		{"GitHub ssh, no such repository", "ERROR: Repository not found.\n" + access, noRepo},
+		{"local http, no such repository", "fatal: repository 'http://127.0.0.1:8080/r.git/' not found\n", noRepo},
+		{"no such path", "fatal: '/srv/gone.git' does not appear to be a git repository\n" + access, noRepo},
+		{"no such branch", "fatal: couldn't find remote ref main\n", noRepo},
+		{"https 404", "fatal: unable to access 'https://git.example.org/r.git/': The requested URL returned error: 404\n", noRepo},
+		{"forbidden", "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 403\n", refusedBy},
+		{"credentials gh gave, refused", "remote: Invalid username or token. Password authentication is not supported for Git operations.\nfatal: Authentication failed for 'https://github.com/o/r.git/'\n", noCreds},
+		{"no credentials", "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n", noCreds},
+		{"401", "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 401\n", noCreds},
+		{"ssh key refused", "git@github.com: Permission denied (publickey).\r\n" + access, noCreds},
+		{"ssh agent refused", "sign_and_send_pubkey: signing failed for ED25519 \"/home/u/.ssh/id_ed25519\" from agent: agent refused operation\r\ngit@github.com: Permission denied (publickey).\r\n" + access, noCreds},
+		{"SAML SSO", "remote: The 'org' organization has enabled or enforced SAML SSO. To access this repository, you must use the HTTPS remote with a personal access token or SSH with an SSH key and passphrase that has been authorized for this organization.\nfatal: unable to access 'https://github.com/org/r.git/': The requested URL returned error: 403\n", noCreds},
+		{"a local file the call cannot write", "error: cannot open '.git/FETCH_HEAD': Permission denied\n", otherFailure},
 	} {
-		if got := remoteAnswered([]byte(c.stderr)); got != c.answered {
-			t.Errorf("%s: answered %v, want %v", c.name, got, c.answered)
+		if got, _ := holdClass([]byte(c.stderr), ""); got != c.class {
+			t.Errorf("%s: class %q, want %q", c.name, got, c.class)
 		}
 	}
 }

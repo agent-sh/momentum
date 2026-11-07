@@ -36,11 +36,11 @@ import (
 // fetch: an input step's limit, as a local read of a large repository has.
 const fetchLimit = gitStepTimeout
 
-// firstFetchLimit bounds a mirror's first fetch, which carries the branch's whole history, once. The low-speed limit
-// (remotePins) already ends a transfer that stalls, so this bounds only a slow live one. 30 minutes carries about
-// 1 GiB at 600 KiB/s, well past the history of the repositories a pass reads; the pass waits for it once per
-// repository. A first fetch that does not finish leaves no complete record, so the next pass's fetch is a first one
-// again.
+// firstFetchLimit bounds a mirror's first fetch, which carries the branch's whole history, once, and a stalled one
+// too: no low-speed limit ends a transfer (remotePins), and ssh's keepalive ends only a server gone silent. 30 minutes
+// carries about 1 GiB at 600 KiB/s, well past the history of the repositories a pass reads; the pass waits for it
+// once per repository. A first fetch that does not finish leaves no complete record, so the next pass's fetch is a
+// first one again.
 const firstFetchLimit = 30 * time.Minute
 
 // fetchBudget is what a mirror's next fetch is and its limit: a first fetch with firstFetchLimit while the mirror holds
@@ -62,15 +62,12 @@ const gitWaitDelay = 5 * time.Second
 // seconds apart).
 const remoteSSH = "ssh -o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
 
-// remotePins are the transfer limits of every Git call of the host's that reaches a remote: remoteSSH, and an https
-// transfer that moves under 1 byte a second for 60 seconds ends. The limit is 1, not more: a quiet fetch (--quiet)
-// gets no progress while the server counts and compresses objects, only its keepalive, about 1 byte a second, and a
-// higher limit would end such a healthy transfer of a large repository. A mirror's first fetch has none (mirrorCall).
-func remotePins() []string { return transferPins(1) }
-
-// transferPins are remotePins with an https low-speed limit of lowSpeed bytes a second, or none at 0.
-func transferPins(lowSpeed int) []string {
-	return []string{"-c", "core.sshCommand=" + remoteSSH, "-c", "http.lowSpeedLimit=" + strconv.Itoa(lowSpeed), "-c", "http.lowSpeedTime=60"}
+// remotePins are the transfer limits of every Git call of the host's that reaches a remote: remoteSSH, and no https
+// low-speed limit. A quiet fetch (--quiet) gets no progress while the server counts and compresses objects, only its
+// keepalive, about 1 byte a second, so any rate a limit names can end a healthy transfer of a large repository; each
+// call's own deadline bounds it instead (fetchBudget, the ship's git call limit).
+func remotePins() []string {
+	return []string{"-c", "core.sshCommand=" + remoteSSH, "-c", "http.lowSpeedLimit=0"}
 }
 
 // githubURL is where a GitHub repository is fetched from: over https with the GitHub CLI's credentials, never over
@@ -96,11 +93,12 @@ type mirrorMeta struct {
 
 // repoTip is where a snapshot reads a repository: the Git directory that holds its objects (origin's mirror, or the
 // checkout), the branch and its commit, and, when that is not origin's branch fetched now, which it is and why. repack
-// is why the mirror's repack after the fetch failed, for the pass's log.
+// is why the mirror's repack after the fetch failed, for the pass's log; class and line name a fetch that failed.
 type repoTip struct {
 	dir, branch, commit string
 	fallback            string
 	repack              string
+	class, line         string // a failed fetch's class (holdClass) and the line of Git's that shows it
 }
 
 // origin is the repository a checkout's origin names, by its identity (OWNER/REPO on GitHub, else url: and its URL),
@@ -113,18 +111,20 @@ type origin struct{ identity, url string }
 // error is a checkout without a default branch, or a pass told to stop.
 func sourceTip(ctx context.Context, source, mirrors, gh string) (repoTip, string, error) {
 	org, why := readOrigin(ctx, source)
-	mirror := ""
+	mirror, class, line := "", "", ""
 	if why == "" {
 		mirror = mirrorPath(mirrors, org.identity)
 		var tip repoTip
 		if tip, why = fetchTip(ctx, source, mirror, org.url, gh); why == "" {
 			return tip, mirror, nil
 		}
+		class, line = tip.class, tip.line
 		if err := ctx.Err(); err != nil {
 			return repoTip{}, mirror, err
 		}
 		if last, at, ok := lastFetch(ctx, mirror); ok {
 			last.fallback = fmt.Sprintf("origin's %s as fetched at %s: %s", last.branch, at.UTC().Format("2006-01-02 15:04Z"), why)
+			last.class, last.line = class, line
 			return last, mirror, nil
 		}
 	}
@@ -135,7 +135,8 @@ func sourceTip(ctx context.Context, source, mirrors, gh string) (repoTip, string
 	if err != nil {
 		return repoTip{}, mirror, err
 	}
-	return repoTip{dir: source, branch: branch, commit: commit, fallback: fmt.Sprintf("checkout's %s: %s", branch, why)}, mirror, nil
+	return repoTip{dir: source, branch: branch, commit: commit, fallback: fmt.Sprintf("checkout's %s: %s", branch, why),
+		class: firstOf(class, why), line: line}, mirror, nil
 }
 
 // readOrigin reads the checkout's origin from its own configuration file, without includes: no setting of the
@@ -259,8 +260,20 @@ func mirrorPath(mirrors, identity string) string {
 
 // fetchTip fetches the default branch of source's origin into its mirror, within fetchLimit (firstFetchLimit when the
 // mirror holds no complete fetch yet), and returns its tip, or why it could not (a text without a host path or a URL).
-func fetchTip(ctx context.Context, source, mirror, url, gh string) (repoTip, string) {
-	failure := func(err error) string { return "fetch failed: " + reason(err) }
+func fetchTip(ctx context.Context, source, mirror, url, gh string) (tip repoTip, why string) {
+	var class, line string // a failed call's, for the tip a failure returns
+	defer func() {
+		if why != "" {
+			tip = repoTip{class: firstOf(class, why), line: line}
+		}
+	}()
+	failure := func(err error) string {
+		var failed *remoteError
+		if errors.As(err, &failed) {
+			class, line = failed.class, failed.line
+		}
+		return "fetch failed: " + reason(err)
+	}
 	lock, err := openMirror(ctx, mirror, source)
 	if err != nil {
 		return repoTip{}, failure(err)
@@ -284,9 +297,7 @@ func fetchTip(ctx context.Context, source, mirror, url, gh string) (repoTip, str
 		return repoTip{}, "fetch refused: origin's default branch has no valid name"
 	}
 	ref := "refs/heads/" + branch
-	fetch := call
-	fetch.first = what == "first fetch"
-	if _, err := fetchGit(fctx, fetch, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
+	if _, err := fetchGit(fctx, call, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
 		url, "+"+ref+":"+ref); err != nil {
 		return repoTip{}, failure(err)
 	}
@@ -298,20 +309,18 @@ func fetchTip(ctx context.Context, source, mirror, url, gh string) (repoTip, str
 	if err := updateMirrorMeta(mirror, func(m *mirrorMeta) { m.Branch, m.Commit, m.Fetched = branch, commit, time.Now() }); err != nil {
 		return repoTip{}, failure(err)
 	}
-	tip := repoTip{dir: mirror, branch: branch, commit: commit}
+	tip = repoTip{dir: mirror, branch: branch, commit: commit}
 	if err := packMirror(ctx, mirror, lock); err != nil {
 		tip.repack = "the mirror's repack failed: " + reason(err)
 	}
 	return tip, ""
 }
 
-// mirrorCall is a remote Git call in a mirror: the mirror, the GitHub CLI for GitHub's credentials, the mirror's lock,
-// which the call inherits, and whether it is a first fetch. A first fetch has no low-speed limit: its 30 minutes bound
-// it (firstFetchLimit), and a large repository's quiet first fetch can stay under any rate while the server compresses.
+// mirrorCall is a remote Git call in a mirror: the mirror, the GitHub CLI for GitHub's credentials, and the mirror's
+// lock, which the call inherits.
 type mirrorCall struct {
 	mirror, gh string
 	lock       *os.File
-	first      bool
 }
 
 // openMirror takes the mirror's lock (lockMirror) and makes sure dir is a usable mirror (usableMirror), making it again
@@ -880,15 +889,11 @@ func symrefBranch(out string) string {
 // that group. Its error names the operation and which limit ended it, never Git's diagnostics, which can print a URL
 // or a host path.
 func fetchGit(ctx context.Context, call mirrorCall, args ...string) ([]byte, error) {
-	lowSpeed := 1
-	if call.first {
-		lowSpeed = 0
-	}
 	pins := append([]string{"--git-dir=" + call.mirror}, GitSafety()...)
 	pins = append(pins, "-c", "uploadpack.packObjectsHook=",
 		"-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always", "-c", "protocol.file.allow=always",
 		"-c", "credential.helper=", "-c", "credential.https://github.com.helper=!"+shellQuote(firstOf(call.gh, "gh"))+" auth git-credential")
-	pins = append(pins, transferPins(lowSpeed)...)
+	pins = append(pins, remotePins()...)
 	cmd := exec.CommandContext(ctx, "git", append(pins, args...)...)
 	for _, kv := range GitEnv() {
 		if !strings.HasPrefix(kv, "SSH_ASKPASS") {
@@ -918,26 +923,32 @@ func fetchGit(ctx context.Context, call mirrorCall, args ...string) ([]byte, err
 	return out.Bytes(), nil
 }
 
-// remoteFailure is a failed remote call's cause as a fixed text: the deadline that ended it, or what of the transport
-// did (transportCause). Git's diagnostics are matched, never shown.
+// remoteFailure is a failed remote call's cause as a fixed text: the deadline that ended it, or its class (holdClass).
+// Git's diagnostics are matched, never shown; the line that shows the class goes, scrubbed, only to the pass's log.
 func remoteFailure(ctx context.Context, verb string, err error, stderr []byte) error {
 	if ctx.Err() != nil {
-		return fmt.Errorf("input git %s: %s", verb, endedBy(ctx))
+		cause := endedBy(ctx)
+		return &remoteError{text: fmt.Sprintf("input git %s: %s", verb, cause), class: cause}
 	}
-	if cause := transportCause(stderr); cause != "" {
-		return fmt.Errorf("input git %s: %s", verb, cause)
+	class, line := holdClass(stderr, "")
+	if class == otherFailure {
+		return &remoteError{text: fmt.Sprintf("input git %s failed: %v", verb, err), class: class, line: line}
 	}
-	return fmt.Errorf("input git %s failed: %w", verb, err)
+	return &remoteError{text: fmt.Sprintf("input git %s: %s", verb, class), class: class, line: line}
 }
 
+// remoteError is a remote call that failed: its text, its class (holdClass) and the line of Git's that shows it.
+type remoteError struct{ text, class, line string }
+
+func (e *remoteError) Error() string { return e.text }
+
 // transportCauses are the transport's own failures, as git, curl (OpenSSL or GnuTLS) and ssh word them, each with the
-// fixed text the host gives for it: a transfer limit (remotePins), a server that cannot be reached, a connection that
-// broke off, a server that failed. They only name a failure; whether a build waits is decided by remoteAnswered.
+// fixed text the host gives for it: an ssh server gone silent (remoteSSH), a server that cannot be reached, a connection
+// that broke off, a server that failed.
 var transportCauses = []struct {
 	words []string
 	cause string
 }{
-	{[]string{"operation too slow"}, "the transfer moved under 1 byte a second for 60s"},
 	{[]string{"not responding"}, "the ssh server was silent for 45s"},
 	{[]string{"timed out"}, "the connection timed out"},
 	{[]string{"could not resolve host"}, "the server's name did not resolve"},
@@ -963,12 +974,12 @@ func transportCause(stderr []byte) string {
 	return ""
 }
 
-// holdClass is the class of a failure that holds a build, as its note names it, and the line of Git's diagnostics
-// that shows it, for the pass's log. The class is one of a fixed few, so a note stands for a class, not for each text
-// Git printed: a deadline (ended, its limit); no credentials (none Git can get, gh logged out, so it would prompt, or
-// ones the machine's own gh helper gave that the server refused); a certificate or ssh host key it does not trust; a
-// transport cause (transportCauses); another failure. The line is the one that matched, else Git's last fatal: or
-// error: line: warnings (ssh's about its key exchange, a redirect) come before what failed.
+// holdClass is the class of a remote call's failure, as the pass's summary and a held build's note name it, and the
+// line of Git's diagnostics that shows it, for the pass's log. The class is one of a fixed few, so a note stands for
+// a class, not for each text Git printed: a deadline (ended, its limit); no credentials (credentialFailure); a
+// certificate or ssh host key not trusted; a transport cause (transportCauses); a remote that has no such repository
+// or branch; a server's refusal (another 4xx); another failure. The line is the one that matched, else Git's last
+// fatal: or error: line: warnings (ssh's about its key exchange, a redirect) come before what failed.
 func holdClass(diag []byte, ended string) (string, string) {
 	var lines []string
 	for _, l := range strings.Split(string(diag), "\n") {
@@ -985,52 +996,58 @@ func holdClass(diag []byte, ended string) (string, string) {
 	if ended != "" {
 		return ended, last
 	}
-	for _, class := range []struct {
-		name  string
-		match func(string) bool
-	}{
-		{"no credentials", func(l string) bool { return credentialFailure.MatchString(l) }},
-		{"a certificate or host key not trusted", func(l string) bool {
-			return strings.Contains(l, "certificate") || strings.Contains(l, "host key verification failed")
-		}},
-	} {
+	match := func(f func(string) bool) (string, bool) {
 		for _, l := range lines {
-			if class.match(strings.ToLower(l)) {
-				return class.name, l
+			if f(strings.ToLower(l)) {
+				return l, true
 			}
 		}
+		return "", false
+	}
+	if l, ok := match(credentialFailure.MatchString); ok {
+		return "no credentials", l
+	}
+	if l, ok := match(func(l string) bool {
+		return strings.Contains(l, "certificate") || strings.Contains(l, "host key verification failed")
+	}); ok {
+		return "a certificate or host key not trusted", l
 	}
 	for _, l := range lines {
 		if cause := transportCause([]byte(l)); cause != "" {
 			return cause, l
 		}
 	}
-	return "another failure", last
+	if l, ok := match(noSuchRepository.MatchString); ok {
+		return "the remote has no such repository or branch", l
+	}
+	if l, ok := match(serverRefused); ok {
+		return "the server refused (an HTTP 4xx answer)", l
+	}
+	return otherFailure, last
 }
 
+// otherFailure is the class of a failure no other class names.
+const otherFailure = "another failure"
+
 // credentialFailure is Git with no credentials it can use: none it can get without a prompt, which the host never
-// allows, or ones the server refused. The only credentials a host call has are GitHub's, from the machine's own gh,
-// so a refusal of them (a token gh holds that expired) is the machine's to fix, not an answer about the repository.
+// allows; ones the server refused (the only credentials a host call has are the machine's own: gh's token, an ssh key
+// it offers, a token an organization's SAML SSO has not authorized); a key the ssh agent would not sign with.
 var credentialFailure = regexp.MustCompile(`could not read (username|password)|terminal prompts disabled|authentication failed|` +
-	`invalid username or (password|token)|returned error: 401`)
+	`invalid username or (password|token)|returned error: 401|permission denied \(publickey|agent refused operation|` +
+	`signing failed|saml sso`)
 
-// remoteAnswers are what a remote that answered says, as git, curl and ssh word it: a repository it does not have
-// (GitHub's "Repository not found", git's "repository 'URL' not found" for an https 404, a path that is no
-// repository), a branch it does not hold, an ssh key it refuses (ssh's "Permission denied (publickey...)"), an HTTP
-// 4xx answer.
-var remoteAnswers = regexp.MustCompile(`repository not found|repository '[^']*' not found|does not appear to be a git repository|` +
-	`couldn't find remote ref|permission denied \(publickey|the requested url returned error: 4[0-9][0-9]`)
+// noSuchRepository is a remote that has no such repository or branch: GitHub's "Repository not found", git's
+// "repository 'URL' not found" for an https 404, a path that is no repository, a branch it does not hold, a 404.
+var noSuchRepository = regexp.MustCompile(`repository not found|repository '[^']*' not found|does not appear to be a git repository|` +
+	`couldn't find remote ref|returned error: 404`)
 
-// remoteAnswered says whether Git's diagnostics are a remote's answer (remoteAnswers), which the next try would get
-// again. Anything else is a failure on the way to the remote (a network, a TLS session, a server that failed), and so
-// are credentials the machine has not got or the server refused (credentialFailure, a 401 among them), and a 408 and a
-// 429, which ask the client to try again later.
-func remoteAnswered(stderr []byte) bool {
-	text := strings.ToLower(string(stderr))
-	if credentialFailure.MatchString(text) || strings.Contains(text, "returned error: 408") || strings.Contains(text, "returned error: 429") {
-		return false
-	}
-	return remoteAnswers.MatchString(text)
+var httpAnswer = regexp.MustCompile(`returned error: (4[0-9][0-9])`)
+
+// serverRefused is any other HTTP 4xx answer but a 408 and a 429, which ask the client to try again later (another
+// failure, then).
+func serverRefused(l string) bool {
+	m := httpAnswer.FindStringSubmatch(l)
+	return m != nil && m[1] != "408" && m[1] != "429"
 }
 
 // endWithContext makes a Git call end with its context, whatever its children do: git starts in a process group of

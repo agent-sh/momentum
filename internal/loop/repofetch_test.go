@@ -201,9 +201,10 @@ func TestABuildBaseFollowsTheFetchedTip(t *testing.T) {
 	}
 }
 
-// A build's base is the commit the pass's snapshot read while the fetched branch still holds it, so the run's
-// history and BASE agree. When the branch no longer holds it, the base is the fetched tip and the prompt says the
-// history stops at the snapshot's commit.
+// A build's base is the commit the pass's snapshot read while the mirror's branch still holds it, so the run's history
+// and BASE agree. When the branch no longer holds it (a later fetch into the mirror moved it, as another checkout's of
+// the same repository does in the pass), the base is the mirror's tip and the prompt says the history stops at the
+// snapshot's commit.
 func TestABuildBaseIsThePassesSnapshotWhileTheBranchHoldsIt(t *testing.T) {
 	for _, kind := range []string{"on the branch", "purged"} {
 		t.Run(kind, func(t *testing.T) {
@@ -223,6 +224,10 @@ func TestABuildBaseIsThePassesSnapshotWhileTheBranchHoldsIt(t *testing.T) {
 				run(t, other, "git", "commit", "-q", "-m", "purged")
 				run(t, other, "git", "push", "-q", "--force", "origin", "HEAD:main")
 				want = strings.TrimSpace(run(t, other, "git", "rev-parse", "HEAD"))
+			}
+			// a later fetch into the mirror, after the pass's snapshot read it
+			if _, why := fetchTip(ctx, f.main, identityMirror(r, "url:"+f.origin), f.origin, ""); why != "" {
+				t.Fatal(why)
 			}
 			built, err := r.prepareRun(ctx, c, c.Family, StepBuild)
 			if err != nil {

@@ -160,24 +160,28 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 	if err != nil {
 		return Package{}, err
 	}
-	var source, snapshot string
+	var source string
+	var read RepoInput
 	for _, repo := range r.pass.manifest.Repositories {
 		if repo.Name == name && repo.Error == "" {
-			source = repo.Source
-			if repo.Fallback == "" {
-				snapshot = repo.Commit // origin's branch as this pass fetched it
-			}
+			source, read = repo.Source, repo
 		}
 	}
 	if name == "" || source == "" {
 		return Package{}, refused("the investigation's repository is not an admitted read_dirs repository")
 	}
+	// The build's host clone is made from, and refreshed from, origin's mirror as this pass read it: fetched now, or as
+	// it was last fetched. Without such a mirror (no fetch ever completed, or no origin to fetch) the build waits.
+	if read.mirror == "" {
+		return Package{}, mirrorHold(name, read.class, read.line)
+	}
+	tip := repoTip{dir: read.mirror, branch: read.Branch, commit: read.Commit}
 	p, had, err := r.Ship.Load(c.ID)
 	if err != nil {
 		return p, err
 	}
 	if !had || p.State == RolledBack || p.State == Kept || p.State == Withdrawn {
-		p, err = r.Ship.Prepare(ctx, c.ID, source)
+		p, err = r.Ship.prepare(ctx, c.ID, source, &tip)
 	}
 	if err != nil {
 		return p, err
@@ -197,9 +201,9 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 	if filepath.Clean(source) != p.Dir {
 		return p, refused("the case's repository changed after preparation")
 	}
-	// The build's base is the default branch as the host fetches it now, at the pass's snapshot while the branch holds
-	// it, not the one the package was prepared at.
-	if p, err = r.Ship.buildBase(r.Ship.gitContext(shipContext(ctx, p.Case)), p, snapshot); err != nil {
+	// The build's base is the default branch as the pass's mirror holds it, at the pass's snapshot while the branch
+	// holds it, not the one the package was prepared at.
+	if p, err = r.Ship.buildBase(r.Ship.gitContext(shipContext(ctx, p.Case)), p, tip); err != nil {
 		return p, err
 	}
 	if err := r.endBaseNotes(ctx, c.ID, baseFetched); err != nil { // the base was fetched: what held it is over

@@ -66,6 +66,9 @@ type RepoInput struct {
 
 	tracked []string // the snapshot's paths, to match a case's evidence paths against
 	objects string   // the Git directory the snapshot read (origin's mirror, or the checkout), for the case's diffs
+	// mirror is origin's mirror when the snapshot read it (this pass's fetch, or its last), the one a build's host clone
+	// is made from; "" when it read the checkout. class and line name the fetch that failed, if one did (holdClass).
+	mirror, class, line string
 }
 
 // HistoryManifest says what the commit log gave a run: the commits, its size, and how many entries the scrubber changed.
@@ -99,7 +102,7 @@ type SnapshotOptions struct {
 	GH          string
 	Cache       *ScrubCache
 	Since       time.Time                        // the log's window starts here
-	Logf        func(format string, args ...any) // the pass's log, for what fails on the side (a mirror's repack)
+	Logf        func(format string, args ...any) // the pass's log: a mirror's repack that failed, Git's line for a fetch that did
 }
 
 // SnapshotRepos makes the scrubbed snapshot of each distinct source for /ro/repos/NAME and its log for
@@ -173,6 +176,9 @@ func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) 
 		tip, mirror, err := sourceTip(ctx, source, o.Mirrors, o.GH)
 		if tip.repack != "" && o.Logf != nil {
 			o.Logf("repository %s: %s", name, tip.repack)
+		}
+		if tip.line != "" && o.Logf != nil {
+			o.Logf("repository %s: its fetch failed (%s): %s", name, tip.class, tip.line)
 		}
 		if mirror != "" {
 			used[mirror] = true
@@ -287,7 +293,10 @@ type snapEntry struct {
 // when err is not nil.
 func snapshotOne(ctx context.Context, source string, tip repoTip, dst, logPath string, maxBytes int64, cache *ScrubCache, since time.Time) (r RepoInput, err error) {
 	r = RepoInput{Source: source, Name: filepath.Base(dst), Skipped: map[string]int{}, Branch: tip.branch, Commit: tip.commit,
-		Fallback: tip.fallback, objects: tip.dir}
+		Fallback: tip.fallback, objects: tip.dir, class: tip.class, line: tip.line}
+	if tip.dir != source {
+		r.mirror = tip.dir
+	}
 	if err = absentInput(dst); err != nil {
 		return r, err
 	}

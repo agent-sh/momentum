@@ -158,7 +158,7 @@ func TestConflictAfterTheThirdCleanReviewWaitsThroughSelection(t *testing.T) {
 		t.Fatalf("no passive conflict note: %+v", standing)
 	}
 	before, _ := json.Marshal(p)
-	if _, err := s.buildBase(s.gitContext(shipContext(ctx, p.Case)), p, ""); err == nil { // RefreshBase is set
+	if _, err := s.buildBase(s.gitContext(shipContext(ctx, p.Case)), p, repoTip{}); err == nil { // RefreshBase is set
 		t.Fatal("exhausted conflict refreshed automatically")
 	}
 	after, _, _ := s.Load(c.ID)
