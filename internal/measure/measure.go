@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -181,6 +182,29 @@ func GuardCount(incidents []Incident, units []int64, since time.Time, gap time.D
 	return h
 }
 
+// The two reasons a guard watched nothing, as its close and every view say them.
+const (
+	GuardUnused = "not watched: the unit was not used in the 30 days"
+	GuardAway   = "not watched: the change was out of effect while its unit was used in the 30 days"
+)
+
+// GuardedAway is Guarded for a watch whose unit was used only while its change was out of effect: it watched nothing,
+// and says why.
+func GuardedAway(incidents, exposure int, units string) Result {
+	r := Guarded(incidents, exposure, 0, 0, units)
+	r.Effect = strings.Replace(r.Effect, GuardUnused, GuardAway, 1)
+	return r
+}
+
+// GuardNotWatched is why a guard that watched nothing did, from its effect: the change out of effect while its unit
+// was used, or the unit not used.
+func GuardNotWatched(effect string) string {
+	if strings.Contains(effect, GuardAway) {
+		return GuardAway
+	}
+	return GuardUnused
+}
+
 // Guarded is a guard's watch as a result: incidents in a history of exposure units before the change, recurrences in
 // watched units after it, counted in units. It is never improved: a guard makes no claim, and its p stays 0. With no
 // recurrence its effect says it was guarded, with the exposure watched and P (Recur), had the problem kept happening,
@@ -195,8 +219,7 @@ func Guarded(incidents, exposure, recurrences, watched int, units string) Result
 	}
 	if watched == 0 {
 		r.Unwatched, r.NoRate = true, true
-		r.Effect = fmt.Sprintf("guarded, not watched: the unit was not used in the 30 days after the change (%d incidents in %d %s before it); there is no P",
-			incidents, exposure, units)
+		r.Effect = fmt.Sprintf("guarded, %s after the change (%d incidents in %d %s before it); there is no P", GuardUnused, incidents, exposure, units)
 		return r
 	}
 	chance := "no rate to compare: the history holds no incident after its first"

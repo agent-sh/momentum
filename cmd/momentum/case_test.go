@@ -554,3 +554,56 @@ func TestNamingTheFixOfAComponentHealthCaseClosedBeforeItResumesTheCasesItStoppe
 		t.Fatalf("a fix named on a case closed another way: exit %d %s", code, errOut)
 	}
 }
+
+// case show --json says what a guarded close watched: watched (0 too), unwatched when it watched nothing, and no_rate
+// when there is no P, because its history held no incident after its first or because it watched nothing.
+func TestCaseJSONSaysWhatAGuardWatched(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "m.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	at := time.Now().Add(-time.Hour)
+	e := store.Event{Source: "zz", SourceKey: "1", TS: at, Actor: store.ActorTool, Kind: "tool_result", Summary: "failed"}
+	if _, err := st.Put(ctx, []store.Event{e}); err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: "failures/v2:zz-json", Title: "it fails", Evidence: []store.Evidence{{Ref: "ev:" + e.ID()}}}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", st.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, tc := range []struct {
+		before, watched int
+		want, not       []string
+	}{
+		{4, 0, []string{`"watched":0`, `"unwatched":true`, `"no_rate":true`}, nil},
+		{0, 120, []string{`"watched":120`, `"no_rate":true`}, []string{`"unwatched"`}},
+		{4, 120, []string{`"watched":120`}, []string{`"unwatched"`, `"no_rate"`}},
+	} {
+		if _, err := db.Exec(`UPDATE cases SET status = 'closed', reason = 'guarded', before_n = ?, guard_exposure = 684, guard_watched = ?, effect = 'guarded' WHERE id = ?`,
+			tc.before, tc.watched, c.ID); err != nil {
+			t.Fatal(err)
+		}
+		got, err := st.CaseByID(ctx, c.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := json.Marshal(caseJSON(got))
+		for _, w := range tc.want {
+			if !strings.Contains(string(raw), w) {
+				t.Errorf("%+v: no %s in %s", tc, w, raw)
+			}
+		}
+		for _, w := range tc.not {
+			if strings.Contains(string(raw), w) {
+				t.Errorf("%+v: %s in %s", tc, w, raw)
+			}
+		}
+	}
+}

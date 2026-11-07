@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/evidenceview"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -733,8 +734,243 @@ func TestTheCasesOwnEvidenceInTheWatchIsARecurrence(t *testing.T) {
 		start := m.clock
 		closeGuarded(t, m)
 		file(t, m, newForm(start))
+		m.clock = m.theCase(t).Closed.Add(time.Hour)
+		if _, err := m.passes(t, Options{}); err != nil {
+			t.Fatal(err)
+		}
 		if c := m.theCase(t); c.Status != store.CaseOpen || lastLog(t, m.st, c.ID).Action != "regressed" {
 			t.Fatalf("the case's evidence dated in the watch, filed after its close: %+v", c)
 		}
 	})
+}
+
+// loopRun is a failure of the tool in a run of the loop's own, under dir; with form, in a form the signal does not count.
+func loopRun(key string, at time.Time, dir string, form bool) store.Event {
+	e := toolResult(key, at, key, true)
+	e.Cwd = filepath.Join(dir, "runs", key)
+	if form {
+		e.Summary = "Exit code 1 zz-tool-crashed: the tool failed"
+	}
+	return e
+}
+
+// fileEvidence files events as the case's evidence, as the detector does by its signature.
+func fileEvidence(t *testing.T, m *measured, evs ...store.Event) {
+	t.Helper()
+	put(t, m.st, evs)
+	c := m.theCase(t)
+	f := store.Finding{Family: c.Family, Signature: c.Signatures[0], Title: c.Title}
+	for _, e := range evs {
+		f.Evidence = append(f.Evidence, store.Evidence{Ref: "ev:" + e.ID()})
+	}
+	if _, _, err := m.st.ObserveCase(context.Background(), f, "detector"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// One rule leaves the loop's own activity out of a guard, its directory known by its path as given and as its link
+// resolves: the loop configured at a link, its runs recording the resolved path. Its runs' use is no exposure, its
+// failures of the signal's form and of another, filed as the case's evidence too, are no recurrence during the watch,
+// and after a guarded close neither its failures nor its evidence bring the case back.
+func TestTheLoopsOwnActivityIsLeftOutOfAGuardByOneRule(t *testing.T) {
+	m := guarded(t, time.Hour, toolSignal.Source, nil)
+	real := m.r.Dir
+	link := filepath.Join(t.TempDir(), "state")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	m.r.Dir, m.r.Ship.Dir = link, link
+	m.pass(t, Options{})
+	start := m.clock
+	weekly(t, m.st, toolSignal.Source, "w", start)
+	var uses []store.Event // the loop's runs using the tool: no exposure
+	for i := 0; i < 40; i++ {
+		e := toolResult(fmt.Sprint("loop-use-", i), start.Add(time.Duration(i)*7*time.Hour), fmt.Sprint("loop-use-", i), false)
+		e.Cwd = filepath.Join(real, "runs", fmt.Sprint("u", i))
+		uses = append(uses, e)
+	}
+	put(t, m.st, uses)
+	put(t, m.st, []store.Event{loopRun("loop-signal", start.Add(3*aDay), real, false)})
+	fileEvidence(t, m, loopRun("loop-form", start.Add(4*aDay), real, true))
+	m.clock = start.Add(4*aDay + 2*time.Hour)
+	if got := m.pass(t, Options{}); got.Status == "held" || got.Status == "rolled back" {
+		t.Fatalf("the loop's own runs recurred during the watch: %s", got.Why)
+	}
+	m.clock = start.Add(30*aDay + time.Hour)
+	got := m.pass(t, Options{})
+	if got.Status != "guarded" || got.Result == nil || !strings.Contains(got.Result.Effect, "no recurrence in 125 session hours watched") {
+		t.Fatalf("the close, its exposure without the loop's runs: %+v %+v", got, got.Result)
+	}
+	put(t, m.st, []store.Event{loopRun("loop-after", m.clock.Add(time.Hour), real, false)})
+	fileEvidence(t, m, loopRun("loop-after-form", m.clock.Add(2*time.Hour), real, true))
+	if c := m.theCase(t); c.Status != store.CaseClosed {
+		t.Fatalf("the loop's evidence filed after the close brought the case back: %s", lastLog(t, m.st, c.ID).Detail)
+	}
+	m.clock = m.clock.Add(3 * time.Hour)
+	if ms, err := m.passes(t, Options{}); err != nil || len(ms) != 0 || m.theCase(t).Status != store.CaseClosed {
+		t.Fatalf("the watch after the close counted the loop's own runs: %+v %v", ms, err)
+	}
+}
+
+// One evidence rule for a guard: the case's own evidence of a loop run, filed after the close, does not bring it back
+// (the reviewer's scenario A); filed during the watch, it is no recurrence, and when an old event, from before the
+// watch, is filed after the close, the case stays closed: nothing counts the loop's evidence then either (scenario B). And the watch after the close reads the case's evidence on every
+// pass: evidence filed after the closing pass read the store, its write sequence already at the cursor, is read on the
+// next pass and brings the case back.
+func TestAGuardsEvidenceIsDecidedByOneRule(t *testing.T) {
+	t.Run("the loop's evidence after the close", func(t *testing.T) { // the reviewer's scenario A
+		m := guarded(t, time.Hour, toolSignal.Source, nil)
+		closeGuarded(t, m)
+		fileEvidence(t, m, loopRun("loop-run", m.clock.Add(time.Hour), m.r.Dir, false))
+		m.clock = m.clock.Add(2 * time.Hour)
+		if _, err := m.passes(t, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		if c := m.theCase(t); c.Status != store.CaseClosed {
+			t.Fatalf("a loop run's failure filed after a guarded close brought the case back: %s", lastLog(t, m.st, c.ID).Detail)
+		}
+	})
+	t.Run("the loop's evidence, then an old event after the close", func(t *testing.T) {
+		m := guarded(t, time.Hour, toolSignal.Source, nil)
+		m.pass(t, Options{})
+		start := m.clock
+		fileEvidence(t, m, loopRun("loop-run", start.Add(3*aDay), m.r.Dir, false))
+		weekly(t, m.st, toolSignal.Source, "w", start)
+		m.clock = start.Add(30*aDay + time.Hour)
+		if got := m.pass(t, Options{}); got.Status != "guarded" {
+			t.Fatalf("the close: %+v", got)
+		}
+		fileEvidence(t, m, toolResult("old", m.planAt.Add(-2*aDay), "old", true))
+		m.clock = m.clock.Add(time.Hour)
+		if _, err := m.passes(t, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		if c := m.theCase(t); c.Status != store.CaseClosed {
+			t.Fatalf("an old event filed after the close brought the case back: %s", lastLog(t, m.st, c.ID).Detail)
+		}
+	})
+	t.Run("between the closing read and the close", func(t *testing.T) {
+		m := guarded(t, time.Hour, toolSignal.Source, nil)
+		start := m.clock
+		closeGuarded(t, m)
+		c := m.theCase(t)
+		late := toolResult("late-form", start.Add(12*aDay), "late-form", true)
+		late.Summary = "Exit code 1 zz-tool-crashed: the tool failed"
+		put(t, m.st, []store.Event{late})
+		// the evidence row as a filing between the closing pass's read and its close leaves it: on the case, with no
+		// comeback decided, since the case still measured then
+		db, err := sql.Open("sqlite", m.db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if _, err := db.Exec(`INSERT INTO case_evidence (case_id, ref, at, kind, summary, added) VALUES (?, ?, ?, 'tool_result', ?, ?)`, c.ID, "ev:"+late.ID(),
+			late.TS.UnixMilli(), late.Summary, c.Closed.Add(-time.Second).UnixMilli()); err != nil {
+			t.Fatal(err)
+		}
+		p, _, _ := m.r.Ship.Load(c.ID)
+		seq, _ := m.st.Seq(context.Background())
+		p.GuardSeq = seq // the closing pass read the sequence after this evidence was written
+		if err := m.r.Ship.save(&p); err != nil {
+			t.Fatal(err)
+		}
+		m.clock = c.Closed.Add(time.Hour)
+		if _, err := m.passes(t, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		if got := m.theCase(t); got.Status != store.CaseOpen {
+			t.Fatalf("evidence filed between the closing read and the close: case %s %s", got.Status, got.Reason)
+		}
+	})
+}
+
+// An ingest source that has read only in part since a watch's end, its failed files newer than the watch's start, is
+// left out a window (the plan's) after the end: before that the watch waits for it, after it the watch closes. A pass
+// after the 30 days whose signal's newest complete read started before the end waits.
+func TestAGuardWaitsForItsSignalsReadPastTheEndForAWindow(t *testing.T) {
+	ctx := context.Background()
+	m := guarded(t, time.Hour, toolSignal.Source, nil)
+	m.pass(t, Options{})
+	start := m.clock
+	weekly(t, m.st, toolSignal.Source, "w", start)
+	end := start.Add(30 * aDay)
+	if err := m.st.MarkRead(ctx, toolSignal.Source, end.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	partial := func(at time.Time) {
+		t.Helper()
+		if err := m.st.MarkPartialRead(ctx, toolSignal.Source, at, start.Add(5*aDay)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.clock = end.Add(2 * time.Hour)
+	partial(m.clock.Add(-10 * time.Minute))
+	if got := m.measure(t, Options{}); got.Status != "waiting" || !strings.Contains(got.Why, toolSignal.Source) {
+		t.Fatalf("a pass after the end, the signal's newest complete read before it: %+v", got)
+	}
+	m.clock = end.Add(6 * aDay)
+	partial(m.clock.Add(-10 * time.Minute))
+	if got := m.measure(t, Options{}); got.Status != "waiting" {
+		t.Fatalf("within a window of the end, read only in part: %+v", got)
+	}
+	m.clock = end.Add(7*aDay + time.Hour)
+	partial(m.clock.Add(-10 * time.Minute))
+	if got := m.measure(t, Options{}); got.Status != "guarded" {
+		t.Fatalf("a window past the end, read only in part since it: %+v", got)
+	}
+}
+
+// A recurrence stored while the change is out of effect is acted on at the next pass, still out of effect.
+func TestProbe80hRecurrenceOutOfEffectActedOnAtOnce(t *testing.T) {
+	m := guarded(t, time.Hour, toolSignal.Source, nil)
+	m.pass(t, Options{})
+	start := m.clock
+	run(t, m.repo, "git", "checkout", "-q", "HEAD~1")
+	m.clock = start.Add(2 * aDay)
+	if got := m.pass(t, Options{}); got.Status != "waiting" {
+		t.Fatalf("out of effect: %+v", got)
+	}
+	put(t, m.st, []store.Event{toolResult("again", start.Add(2*aDay+time.Hour), "again", true)})
+	m.clock = start.Add(2*aDay + 2*time.Hour)
+	if got := m.pass(t, Options{}); got.Status != "held" {
+		t.Fatalf("a recurrence while out of effect was not acted on at the next pass: %+v", got)
+	}
+}
+
+// A deployed guard's change not in effect yet: case show says its watch starts once it is, with the incidents and
+// exposure its plan was proposed with.
+func TestADeployedGuardShowsTheWatchItWillStart(t *testing.T) {
+	m := guarded(t, time.Hour, toolSignal.Source, nil)
+	run(t, m.repo, "git", "checkout", "-q", "HEAD~1")
+	m.clock = m.deployed.Add(time.Hour)
+	if got := m.pass(t, Options{}); got.Status != "waiting" {
+		t.Fatalf("before it is in effect: %+v", got)
+	}
+	if out := shown(t, m.theCase(t)); !strings.Contains(out, "its watch starts once its change is in effect") || !strings.Contains(out, "after 4 incidents in 684 units") {
+		t.Fatalf("a deployed guard's case show:\n%s", out)
+	}
+}
+
+// A watch whose change was out of effect through all of its unit's use says so: it watched nothing because the change
+// was out of effect, not because the unit was not used.
+func TestAWatchOutOfEffectThroughItsUseSaysWhy(t *testing.T) {
+	m := guarded(t, time.Hour, toolSignal.Source, nil)
+	m.pass(t, Options{})
+	start := m.clock
+	run(t, m.repo, "git", "checkout", "-q", "HEAD~1")
+	m.clock = start.Add(time.Hour)
+	m.pass(t, Options{})
+	weekly(t, m.st, toolSignal.Source, "w", start.Add(2*time.Hour))
+	m.clock = start.Add(29 * aDay)
+	m.pass(t, Options{})
+	run(t, m.repo, "git", "checkout", "-q", "main")
+	m.clock = start.Add(30*aDay + time.Hour)
+	got := m.pass(t, Options{})
+	if got.Status != "guarded" || got.Result == nil || !strings.Contains(got.Result.Effect, "not watched: the change was out of effect while its unit was used") {
+		t.Fatalf("a watch out of effect through its use: %+v %+v", got, got.Result)
+	}
+	c := m.theCase(t)
+	if s := evidenceview.StatusLine(c); !strings.Contains(s, "out of effect") || !strings.Contains(shown(t, c), "out of effect") {
+		t.Fatalf("its views: %q %s", s, shown(t, c))
+	}
 }

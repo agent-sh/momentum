@@ -413,8 +413,8 @@ func addEvidence(ctx context.Context, q querier, id string, evs []Evidence, now 
 // comesBack decides whether a closed case comes back on the evidence it holds now, and says why either way.
 //   - A case closed as improved does not come back on its evidence: the measure step watches its signal, in the
 //     units its measurement counted, and brings it back at its old rate (RegressCase).
-//   - A case closed as guarded comes back as one closed as already solved does, on any evidence after the close; the
-//     measure step also brings it back at its signal's first event after its watch began (RegressCase).
+//   - Nor does one closed as guarded: the measure step's watch reads its signal and its evidence from the watch's start
+//     on every pass, by the rule the watch used, and brings it back (RegressCase).
 //   - A case closed as already solved comes back on any evidence after the close, or after its fix was named when
 //     that came after the close (CloseFixed on a case closed before a close named its fix).
 //   - A dismissed case (not worth it, insufficient evidence) comes back only once the evidence after the close
@@ -425,11 +425,12 @@ func comesBack(ctx context.Context, q querier, c Case, now time.Time) (bool, str
 		err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM case_evidence WHERE case_id = ? AND at > ?`, c.ID, from.UnixMilli()).Scan(&n)
 		return n, err
 	}
-	from, since := c.Closed, "it closed as "+strings.ReplaceAll(string(c.Reason), "-", " ")
-	if c.Reason == Guarded && !c.Deployed.IsZero() {
-		// a guard watched from its change's start: evidence dated from then is its problem back
-		from, since = c.Deployed.Add(-time.Millisecond), "its guard's watch began"
+	if c.Reason == Guarded {
+		// one rule decides a guarded case's evidence: the measure step's watch after the close, which reads it on every
+		// pass from the watch's start and leaves the loop's own out, as the watch did
+		return false, "a guarded case's evidence is the measure step's watch to read: it brings the case back", nil
 	}
+	from, since := c.Closed, "it closed as "+strings.ReplaceAll(string(c.Reason), "-", " ")
 	if c.Reason == Solved {
 		_, at, named, err := fixedOf(ctx, q, c)
 		if err != nil {
@@ -446,7 +447,7 @@ func comesBack(ctx context.Context, q querier, c Case, now time.Time) (bool, str
 	switch c.Reason {
 	case Improved:
 		return false, fmt.Sprintf("%d new since it closed as improved; the measure step brings it back at its old rate", after), nil
-	case Solved, Guarded:
+	case Solved:
 		return after > 0, fmt.Sprintf("%d new since %s", after, since), nil
 	case NotWorthIt, Insufficient:
 		need := max(c.ClosedEvidence, 1)

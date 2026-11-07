@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/agent-sh/momentum/internal/measure"
 	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -207,6 +208,11 @@ func Case(stdout io.Writer, c store.Case, evs []store.Evidence, log []store.Case
 		// a guard measures no rate: it watches for a problem that had stopped to come back
 		text := fmt.Sprintf("watching %dd for a recurrence, after %d incidents in %d units of exposure before the change; a problem that stopped by itself shows the same",
 			int(m.Window.Hours()/24), m.Before, m.Exposure)
+		if c.Status == store.CaseDeployed {
+			incidents, exposure := planGuard(c)
+			text = fmt.Sprintf("its watch starts once its change is in effect: 30 days of watching for a recurrence, after %d incidents in %d units of exposure before it, as proposed; a problem that stopped by itself shows the same",
+				incidents, exposure)
+		}
 		if c.Status == store.CaseMeasuring && m.After > 0 {
 			text = fmt.Sprintf("recurred: %d units of its problem came back after the change; its rollback is held; %d incidents in %d units of exposure before it",
 				m.After, m.Before, m.Exposure)
@@ -256,7 +262,7 @@ func StatusLine(c store.Case) string {
 // happening, would have recurred in its watch, or that its history gives no rate.
 func guardChance(m store.Measurement, precision string) string {
 	if m.Watched == 0 {
-		return "not watched: the unit was not used in the 30 days"
+		return measure.GuardNotWatched(m.Effect)
 	}
 	if m.Before == 0 {
 		return "no rate to compare: the history holds no incident after its first"
@@ -271,17 +277,46 @@ func Guarded(c store.Case) bool {
 	if c.Status != store.CaseDeployed && c.Status != store.CaseMeasuring && c.Reason != store.Guarded {
 		return false
 	}
-	if c.Package != "" {
-		if raw, err := os.ReadFile(filepath.Join(c.Package, "package.json")); err == nil {
-			var p struct {
-				Plan *struct {
-					Guard *json.RawMessage `json:"guard"`
-				} `json:"plan"`
-			}
-			if json.Unmarshal(raw, &p) == nil {
-				return p.Plan != nil && p.Plan.Guard != nil
-			}
-		}
+	if g, ok := packageGuard(c); ok {
+		return g != nil
 	}
 	return c.Measurement.Guarded()
+}
+
+// guardOfPlan is what a view reads of a package's guard.
+type guardOfPlan struct {
+	Incidents int `json:"incidents"`
+	Exposure  int `json:"exposure"`
+}
+
+// packageGuard reads the guard of a case's package's plan: nil for a plan with none; ok is false when the package
+// cannot be read.
+func packageGuard(c store.Case) (*guardOfPlan, bool) {
+	if c.Package == "" {
+		return nil, false
+	}
+	raw, err := os.ReadFile(filepath.Join(c.Package, "package.json"))
+	if err != nil {
+		return nil, false
+	}
+	var p struct {
+		Plan *struct {
+			Guard *guardOfPlan `json:"guard"`
+		} `json:"plan"`
+	}
+	if json.Unmarshal(raw, &p) != nil {
+		return nil, false
+	}
+	if p.Plan == nil {
+		return nil, true
+	}
+	return p.Plan.Guard, true
+}
+
+// planGuard is the incidents and exposure its plan's guard was proposed with, for a case whose watch has not started.
+func planGuard(c store.Case) (incidents, exposure int) {
+	if g, ok := packageGuard(c); ok && g != nil {
+		return g.Incidents, g.Exposure
+	}
+	return c.Measurement.Before, c.Measurement.Exposure
 }

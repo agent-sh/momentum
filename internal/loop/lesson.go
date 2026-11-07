@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/agent-sh/momentum/internal/measure"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -71,7 +72,7 @@ func PublishLesson(ctx context.Context, st *store.Store, ship *Ship, id, text, t
 		chance := "no rate to compare"
 		switch {
 		case c.Measurement.Watched == 0:
-			chance = "not watched: the unit was not used in the 30 days"
+			chance = measure.GuardNotWatched(c.Measurement.Effect)
 		case c.Measurement.Before > 0:
 			chance = fmt.Sprintf("P=%.0f%% that the problem, had it kept happening, would have recurred in its watch", 100*c.Measurement.Recur)
 		}

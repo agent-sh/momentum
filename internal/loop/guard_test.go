@@ -654,6 +654,10 @@ func TestARecurrenceBringsAGuardedCaseBackRegressed(t *testing.T) {
 		if _, _, err := m.st.ObserveCase(ctx, f, "test"); err != nil {
 			t.Fatal(err)
 		}
+		m.clock = c.Closed.Add(time.Hour) // the measure step's watch after the close reads it
+		if _, err := m.passes(t, Options{}); err != nil {
+			t.Fatal(err)
+		}
 		c = m.theCase(t)
 		if l := lastLog(t, m.st, c.ID); c.Status != store.CaseOpen || l.Action != "regressed" || c.Measurement.Exposure != 0 {
 			t.Fatalf("new evidence after a guarded close: %+v %+v", c, l)
@@ -966,9 +970,13 @@ func TestAGuardedComebackShowsNoOldWatch(t *testing.T) {
 	if _, _, err := m.st.ObserveCase(ctx, f, "test"); err != nil {
 		t.Fatal(err)
 	}
+	m.clock = c.Closed.Add(2 * time.Minute)
+	if _, err := m.passes(t, Options{}); err != nil {
+		t.Fatal(err)
+	}
 	c = m.theCase(t)
 	l := lastLog(t, m.st, c.ID)
-	if s := shown(t, c); strings.Contains(l.Detail, "already solved") || !strings.Contains(l.Detail, "since its guard's watch began") || strings.Contains(s, "measured:") ||
+	if s := shown(t, c); strings.Contains(l.Detail, "already solved") || !strings.Contains(l.Detail, "closed as guarded") || strings.Contains(s, "measured:") ||
 		strings.Contains(s, "guarded:") {
 		t.Fatalf("a guarded comeback: %s: %s\n%s", l.Action, l.Detail, s)
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -242,13 +243,19 @@ func guardExposure(ctx context.Context, st *store.Store, plan Plan, hits []store
 }
 
 // guardRecurrences are a guard's recurrences from its watch's start: the events its signal counts, and the events of
-// the case's own evidence dated from then (the detector may file the problem by the case's signature in a form the
-// signal does not count), the loop's own excepted. They need only the signal and the case, never a read.
+// the case's own evidence dated from then (guardEvidence), the loop's own left out of both by one rule (store.InDir,
+// the counts' ExcludeCwd). They need only the signal and the case, never a read.
 func (r *Runner) guardRecurrences(ctx context.Context, c store.Case, plan Plan, from time.Time) ([]store.Event, error) {
 	back, err := recurrences(ctx, r.Store, plan, from, time.Time{}, r.Dir)
 	if err != nil {
 		return nil, err
 	}
+	return r.guardEvidence(ctx, c, from, back)
+}
+
+// guardEvidence adds to back the events of the case's own evidence dated from a watch's start (the detector may file
+// the problem by the case's signature in a form the signal does not count), but those back holds and the loop's own.
+func (r *Runner) guardEvidence(ctx context.Context, c store.Case, from time.Time, back []store.Event) ([]store.Event, error) {
 	evidence, err := r.Store.CaseEvidence(ctx, c.ID, 0)
 	if err != nil {
 		return nil, err
@@ -266,7 +273,7 @@ func (r *Runner) guardRecurrences(ctx context.Context, c store.Case, plan Plan, 
 		if err != nil {
 			return nil, err
 		}
-		if !found || e.TS.Before(from) || r.Dir != "" && e.Cwd != "" && (e.Cwd == r.Dir || under(e.Cwd, r.Dir)) {
+		if !found || e.TS.Before(from) || store.InDir(e.Cwd, r.Dir) {
 			continue
 		}
 		seen[id] = true
@@ -352,16 +359,27 @@ func guardEffectTime(c store.Case, p *Package, seen time.Time) time.Time {
 
 // guardBehind names the sources of a guard's plan whose newest read did not start after the end of its watch:
 // for an ingest source a complete read, or one that read in part with every failed file older than its start.
-func (r *Runner) guardBehind(ctx context.Context, plan Plan, from, end time.Time) ([]string, error) {
+//
+// An ingest source that has read only in part since the end is left out a window (the plan's) after the end, as a
+// stopped command source is (liveSources): a file it fails on for good would otherwise hold the close for good.
+func (r *Runner) guardBehind(ctx context.Context, plan Plan, from, end, now time.Time) ([]string, error) {
 	var behind []string
 	for _, source := range plan.Sources {
 		read, err := r.Store.HarnessReadPast(ctx, source, planHarness(plan), from)
 		if err != nil {
 			return nil, err
 		}
-		if !read.After(end) {
-			behind = append(behind, source)
+		if read.After(end) {
+			continue
 		}
+		if !slices.Contains(commandSources, source) && now.Sub(end) > plan.Window {
+			if partial, err := r.Store.PartialReadAfter(ctx, source, end); err != nil {
+				return nil, err
+			} else if !partial.IsZero() {
+				continue // it reads, in part only, past the end: left out
+			}
+		}
+		behind = append(behind, source)
 	}
 	return behind, nil
 }
@@ -451,7 +469,7 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 	}
 	// each live source must have read past the end: its newest read, never a stretch read whole, which one failed run
 	// would make a wait for good
-	if behind, err := r.guardBehind(ctx, plan, from, end); err != nil {
+	if behind, err := r.guardBehind(ctx, plan, from, end, now); err != nil {
 		return failed(err)
 	} else if len(behind) > 0 {
 		m.Status = "waiting"
@@ -474,6 +492,13 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 		return failed(err)
 	}
 	res := measure.Guarded(g.Incidents, g.Exposure, 0, len(watched), plan.Units)
+	if res.Unwatched && len(p.GuardAway) > 0 {
+		if used, err := guardExposure(ctx, r.Store, plan, nil, from, end, r.Dir); err != nil {
+			return failed(err)
+		} else if len(used) > 0 { // used, but only while the change was out of effect
+			res = measure.GuardedAway(g.Incidents, g.Exposure, plan.Units)
+		}
+	}
 	m.Result, m.Status = &res, "guarded"
 	if dry {
 		return m
@@ -485,7 +510,7 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 	chance := "The history holds no incident after its first, so there is no rate to compare."
 	switch {
 	case res.Unwatched:
-		chance = "It was not watched: the unit was not used in the 30 days, so there is no P."
+		chance = "It was " + measure.GuardNotWatched(res.Effect) + ", so there is no P."
 	case !res.NoRate:
 		chance = fmt.Sprintf("Had it kept happening, it would have recurred within that with probability P=%.1f%%.", 100*res.Recur)
 	}
@@ -509,8 +534,9 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 }
 
 // guardBack is the watch of a case closed as guarded: the guard said its problem would not come back, so the first
-// event its signal counts from the watch's first start brings the case back, regressed, with a decided note. It needs
-// only the signal. Each pass reads the rows the store wrote or rewrote since the last (Package.GuardSeq, the store's
+// event its signal counts from the watch's first start, or of the case's own evidence dated from then, brings the case
+// back, regressed, with a decided note. The case store leaves a guarded case's evidence to it. It reads the case's
+// evidence on every pass, and the signal's rows the store wrote or rewrote since the last (Package.GuardSeq, the store's
 // write sequence): an event dated inside the watch and stored after the close counts, and so does a row rewritten
 // into a form the signal counts. While the signal's source is stopped, a problem note says no recurrence can be seen.
 func (r *Runner) guardBack(ctx context.Context, c store.Case, p *Package, plan Plan, m Measured, now time.Time, dry bool) (Measured, bool) {
@@ -528,16 +554,24 @@ func (r *Runner) guardBack(ctx context.Context, c store.Case, p *Package, plan P
 	if err != nil {
 		return failed(err)
 	}
+	// the case's own evidence on every pass, whatever the sequence says: evidence filed between the closing pass's
+	// read and its close is read now
+	back, err := r.guardEvidence(ctx, c, guardStart(c, p), nil)
+	if err != nil {
+		return failed(err)
+	}
 	after := p.GuardSeq
 	switch {
+	case len(back) > 0:
 	case seq == p.GuardSeq:
 		return Measured{}, false
 	case seq < p.GuardSeq:
 		after = 0 // a store whose sequence went below the cursor (restored, or made anew): read it once from the start
 	}
-	back, err := recurrencesWritten(ctx, r.Store, plan, guardStart(c, p), time.Time{}, r.Dir, after, seq)
-	if err != nil {
-		return failed(err)
+	if len(back) == 0 {
+		if back, err = recurrencesWritten(ctx, r.Store, plan, guardStart(c, p), time.Time{}, r.Dir, after, seq); err != nil {
+			return failed(err)
+		}
 	}
 	if len(back) == 0 {
 		if !dry {

@@ -124,11 +124,14 @@ type listedCase struct {
 		Effect      string  `json:"effect"`
 		// Guarded marks a guard's watch, not a measured drop: before is its incidents, exposure the units they came in,
 		// after its recurrences.
-		Guarded  bool    `json:"guarded,omitempty"`
-		Exposure int     `json:"exposure,omitempty"`
-		Watched  int     `json:"watched,omitempty"`
-		Recur    float64 `json:"recur,omitempty"`
-		NoRate   bool    `json:"no_rate,omitempty"`
+		Guarded  bool `json:"guarded,omitempty"`
+		Exposure int  `json:"exposure,omitempty"`
+		// Watched is a guarded close's exposure watched, 0 too; Unwatched says it watched nothing, and NoRate that it
+		// gives no P (no incident after its history's first, or nothing watched).
+		Watched   *int    `json:"watched,omitempty"`
+		Recur     float64 `json:"recur,omitempty"`
+		NoRate    bool    `json:"no_rate,omitempty"`
+		Unwatched bool    `json:"unwatched,omitempty"`
 	} `json:"measurement,omitempty"`
 	Signatures []string `json:"signatures"`
 }
@@ -162,10 +165,18 @@ func caseJSON(c store.Case) listedCase {
 			Effect      string  `json:"effect"`
 			Guarded     bool    `json:"guarded,omitempty"`
 			Exposure    int     `json:"exposure,omitempty"`
-			Watched     int     `json:"watched,omitempty"`
+			Watched     *int    `json:"watched,omitempty"`
 			Recur       float64 `json:"recur,omitempty"`
 			NoRate      bool    `json:"no_rate,omitempty"`
-		}{m.Window.Hours(), m.Before, m.After, m.Effect, m.Guarded(), m.Exposure, m.Watched, m.Recur, m.Guarded() && m.Before == 0}
+			Unwatched   bool    `json:"unwatched,omitempty"`
+		}{WindowHours: m.Window.Hours(), Before: m.Before, After: m.After, Effect: m.Effect, Guarded: m.Guarded(), Exposure: m.Exposure, Recur: m.Recur}
+		if closed := c.Status == store.CaseClosed && c.Reason == store.Guarded; m.Guarded() {
+			l.Measurement.NoRate = m.Before == 0 || closed && m.Watched == 0
+			if closed {
+				watched := m.Watched
+				l.Measurement.Watched, l.Measurement.Unwatched = &watched, m.Watched == 0
+			}
+		}
 	}
 	return l
 }

@@ -52,6 +52,10 @@ func TestTheGuardsArithmeticIsSPECs(t *testing.T) {
 		!strings.Contains(r.Effect, "not watched: the unit was not used in the 30 days") {
 		t.Fatalf("a watch whose unit was not used: %+v", r)
 	}
+	if r := GuardedAway(4, 684, "session hours"); !r.Unwatched || strings.Contains(r.Effect, "P=") || GuardNotWatched(r.Effect) != GuardAway ||
+		GuardNotWatched(Guarded(4, 684, 0, 0, "session hours").Effect) != GuardUnused {
+		t.Fatalf("a watch out of effect through its use: %+v", r)
+	}
 	if r := Guarded(4, 684, 1, 900, "session hours"); r.Improved || !strings.Contains(r.Effect, "came back") {
 		t.Fatalf("a watch with a recurrence: %+v", r)
 	}
@@ -79,8 +83,9 @@ func TestTheGuardsArithmeticIsSPECs(t *testing.T) {
 		"A guard is a recurrence watch, not a proof",
 		"runs with no gap longer than a week between two of them, whatever the plan's window",
 		"It lasts 30 days of wall time from it",
-		"A watch whose unit was not used at all in its 30 days closes as guarded with W = 0",
-		"\"not watched: the unit was not used in the 30 days\" and give no P",
+		"A watch with W = 0 closes as guarded, and its close, its note and every view say why and give no P",
+		"\"not watched: the unit was not used in the 30 days\"",
+		"\"not watched: the change was out of effect while its unit was used in the 30 days\"",
 		"P = 1 - (T/(T+W))^(k+½), had the problem kept happening",
 		"\"no rate to compare: the history holds no incident after its first\"",
 		"**P** is for the report alone: nothing decides on it",

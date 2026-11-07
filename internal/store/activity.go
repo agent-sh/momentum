@@ -99,16 +99,37 @@ func activityWhere(q ActivityQuery) ([]string, []any, string) {
 	return where, args, session
 }
 
-// excludeDirectory leaves out both the configured directory and its resolved path.
-func excludeDirectory(where []string, args []any, dir string) ([]string, []any) {
+// DirPaths are the paths a directory is known by: as given, and as its links resolve. The loop's own activity is
+// what ran in its directory by either (InDir, and every count's ExcludeCwd).
+func DirPaths(dir string) []string {
 	if dir == "" {
-		return where, args
+		return nil
 	}
 	paths := []string{filepath.Clean(dir)}
 	if resolved, err := filepath.EvalSymlinks(dir); err == nil && resolved != paths[0] {
 		paths = append(paths, resolved)
 	}
-	for _, path := range paths {
+	return paths
+}
+
+// InDir says whether a working directory is dir or below it, by either of its paths (DirPaths): the one rule that
+// tells the loop's own activity from the rest, which the store's counts apply in SQL (excludeDirectory).
+func InDir(cwd, dir string) bool {
+	if cwd == "" {
+		return false
+	}
+	cwd = filepath.Clean(cwd)
+	for _, path := range DirPaths(dir) {
+		if cwd == path || strings.HasPrefix(cwd, strings.TrimRight(path, "/")+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// excludeDirectory leaves out a directory by both its paths (DirPaths), as InDir tells them.
+func excludeDirectory(where []string, args []any, dir string) ([]string, []any) {
+	for _, path := range DirPaths(dir) {
 		where = append(where, "cwd != ? AND instr(cwd, ?) != 1")
 		args = append(args, path, strings.TrimRight(path, "/")+"/")
 	}
@@ -423,6 +444,17 @@ func (s *Store) HarnessReadPast(ctx context.Context, source, harness string, sin
 		}
 	}
 	return at, rows.Err()
+}
+
+// PartialReadAfter is the start of the newest run of an ingest source that read in part and started after since, or
+// zero when none did since its newest complete read (a complete read drops the partial runs before it).
+func (s *Store) PartialReadAfter(ctx context.Context, source string, since time.Time) (time.Time, error) {
+	var started sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT MAX(updated) FROM cursors WHERE source LIKE ? AND updated > ?`, source+":read:run:%",
+		since.UnixMilli()).Scan(&started); err != nil || !started.Valid {
+		return time.Time{}, err
+	}
+	return time.UnixMilli(started.Int64), nil
 }
 
 // MarkPartialRead records a listed run and the newest modification among files it failed to read.
