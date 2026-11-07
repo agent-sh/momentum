@@ -243,25 +243,6 @@ func TestABuildBaseIsThePassesSnapshotWhileTheBranchHoldsIt(t *testing.T) {
 	}
 }
 
-// A build whose base cannot be fetched now is held for the pass: no run, no charge.
-func TestABuildBaseThatCannotBeFetchedHoldsTheBuild(t *testing.T) {
-	ctx := context.Background()
-	r, c, _ := buildCase(t)
-	newPass(t, r)
-	if _, err := r.prepareRun(ctx, c, c.Family, StepBuild); err != nil {
-		t.Fatal(err)
-	}
-	p, _, err := r.Ship.Load(c.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	run(t, p.Host, "git", "remote", "set-url", "origin", filepath.Join(t.TempDir(), "gone.git"))
-	_, err = r.prepareRun(ctx, c, c.Family, StepBuild)
-	if err == nil || !held(err) || !strings.Contains(err.Error(), "cannot be fetched now") {
-		t.Fatalf("an unfetchable base was not a hold: %v", err)
-	}
-}
-
 // stalledListener accepts connections and never answers on them, as a server that hangs does; it lets each go after
 // hold, so a call that never ends by itself still ends. count says how many it accepted and how many of them their
 // client still holds open: a process that holds one is still running.
@@ -345,7 +326,7 @@ func TestARemoteCallEndsAtItsDeadline(t *testing.T) {
 			if name == "ship" {
 				_, err = ship.git(ctx, f.main, "ls-remote", url, "HEAD")
 			} else {
-				_, err = fetchGit(ctx, mirror, "", "ls-remote", url, "HEAD")
+				_, err = fetchGit(ctx, mirror, "", nil, "ls-remote", url, "HEAD")
 			}
 			if took := time.Since(start); took > bound {
 				t.Fatalf("the call returned %s after its %s deadline", took.Round(time.Second), deadline)
@@ -769,4 +750,29 @@ func TestABuildBaseRefusalIsNotAHold(t *testing.T) {
 	if !errors.Is(err, ErrRefused) || held(err) || !strings.Contains(err.Error(), "names a program") {
 		t.Fatalf("a refused host clone: %v (held %v)", err, held(err))
 	}
+}
+
+// A mirror's fetch has 30 minutes while the mirror holds no complete fetch (none yet, or a first one that did not
+// finish, whose record names the checkout and no commit), and 5 once it does.
+func TestAMirrorsFirstFetchHas30MinutesAndALaterOne5(t *testing.T) {
+	ctx := context.Background()
+	f := newRepo(t, nil)
+	mirror := filepath.Join(t.TempDir(), "mirrors", "0123456789abcdef.git")
+	budget := func(want string, limit time.Duration) {
+		t.Helper()
+		if what, got := fetchBudget(mirror); what != want || got != limit {
+			t.Fatalf("the fetch is a %s with %s, want a %s with %s", what, got, want, limit)
+		}
+	}
+	budget("first fetch", 30*time.Minute)
+	lock, err := openMirror(ctx, mirror, f.main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock.Close()
+	budget("first fetch", 30*time.Minute)
+	if _, why := fetchTip(ctx, f.main, mirror, f.origin, ""); why != "" {
+		t.Fatal(why)
+	}
+	budget("fetch", 5*time.Minute)
 }

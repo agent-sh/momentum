@@ -437,18 +437,15 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	if _, err := s.git(ctx, host, "remote", "set-url", "origin", strings.TrimSpace(origin)); err != nil {
 		return Package{}, err
 	}
-	if _, err := s.git(ctx, host, "fetch", "--quiet", "origin", t.Base); err != nil {
-		return Package{}, err
-	}
-	branch := "momentum/" + c.ID
-	if _, err := s.git(ctx, host, "checkout", "--quiet", "-B", branch, "origin/"+t.Base); err != nil {
-		return Package{}, err
-	}
-	base, err := s.git(ctx, host, "rev-parse", "HEAD")
+	defaultBranch, base, err := s.fetchBase(ctx, host, t.Repo, t.Base)
 	if err != nil {
 		return Package{}, err
 	}
-	p := Package{Case: c.ID, Kind: "repo", Repo: t.Repo, Base: t.Base, BaseCommit: strings.TrimSpace(base), Dir: t.Dir, Branch: branch,
+	branch := "momentum/" + c.ID
+	if _, err := s.git(ctx, host, "checkout", "--quiet", "-B", branch, "origin/"+defaultBranch); err != nil {
+		return Package{}, err
+	}
+	p := Package{Case: c.ID, Kind: "repo", Repo: t.Repo, Base: defaultBranch, BaseCommit: base, Dir: t.Dir, Branch: branch,
 		Work: work, Host: host, State: Prepared, Created: s.now()}
 	if had && old.State == Withdrawn {
 		p.ClosedProposals = old.ClosedProposals // a closed hand landing proposal counts toward the case's two
@@ -524,8 +521,10 @@ func (s *Ship) freshRunClone(ctx context.Context, p *Package) error {
 // landing found no longer rebases (RefreshBase), the fetched tip. When that is the package's base, the tree is made
 // again from it. When it moved, or for RefreshBase, the host clone is reset to it and the build reworks the change
 // there: the cumulative patch stays in the package's data and reaches the run as previous.patch, and the old build
-// tree is never read. A fetch the transport or a deadline ends holds the build, without a run or a charge; a refusal
-// of the host clone is the build's own failure.
+// tree is never read. The default branch is the one origin's HEAD names now (fetchBase), so a branch origin renamed is
+// followed, and the package's base branch with it. A fetch the transport or a deadline ends holds the build, without a
+// run or a charge; any other failure (a repository or a branch origin does not have, a refusal of the host clone) is
+// the build's own.
 func (s *Ship) buildBase(ctx context.Context, p Package, snapshot string) (Package, error) {
 	if p.RefreshBase && roundsUsed(p) {
 		return p, refused("review rounds used; the change waits for a person")
@@ -533,18 +532,11 @@ func (s *Ship) buildBase(ctx context.Context, p Package, snapshot string) (Packa
 	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
 		return p, err
 	}
-	if _, err := s.git(ctx, p.Host, "fetch", "--quiet", "origin", p.Base); err != nil {
-		if errors.Is(err, ErrRefused) {
-			return p, err // the host clone itself is refused: no outage, so no hold
-		}
-		// the transport failed or a deadline ended it: an outage, which holds the build for the pass
-		return p, &shipHold{err: refused("the default branch of %s cannot be fetched now", p.Repo)}
-	}
-	base, err := s.git(ctx, p.Host, "rev-parse", "--verify", "refs/remotes/origin/"+p.Base+"^{commit}")
+	branch, target, err := s.fetchBase(ctx, p.Host, p.Repo, p.Base)
 	if err != nil {
 		return p, err
 	}
-	target := strings.TrimSpace(base)
+	p.Base = branch // the caller saves it with the build tree
 	// a change that no longer rebases goes to the tip it failed on, or a later one, never back to the pass's snapshot
 	if snapshot != "" && snapshot != target && !p.RefreshBase {
 		if _, err := s.git(ctx, p.Host, "merge-base", "--is-ancestor", snapshot, target); err == nil {
@@ -1685,12 +1677,59 @@ func (s *Ship) gitInput(ctx context.Context, dir string, input []byte, args ...s
 		return "", refused("Git output exceeds the whole-stream limit")
 	}
 	if err != nil && cctx.Err() != nil {
-		return out.String(), fmt.Errorf("git %s: %s: %s", strings.Join(args, " "), endedBy(cctx), strings.TrimSpace(errOut.String()))
+		err = fmt.Errorf("git %s: %s: %s", strings.Join(args, " "), endedBy(cctx), strings.TrimSpace(errOut.String()))
+		return out.String(), &remoteOutage{err: err, cause: endedBy(cctx)}
 	}
 	if err != nil {
-		return out.String(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(errOut.String()))
+		err = fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(errOut.String()))
+		if cause := transportCause(errOut.Bytes()); cause != "" {
+			return out.String(), &remoteOutage{err: err, cause: cause}
+		}
+		return out.String(), err
 	}
 	return out.String(), nil
+}
+
+// remoteOutage is a ship Git call a deadline or the transport ended (transportCause), not one whose remote answered:
+// cause is its fixed text, without a URL or a host path.
+type remoteOutage struct {
+	err   error
+	cause string
+}
+
+func (e *remoteOutage) Error() string { return e.err.Error() }
+func (e *remoteOutage) Unwrap() error { return e.err }
+
+// fetchBase fetches the default branch of the host clone's origin into its remote-tracking branch and returns the
+// branch and its commit. The branch is the one origin's HEAD names now (ls-remote --symref, as the mirror reads it),
+// not the one the checkout's origin/HEAD names, which nothing updates: a renamed default branch is followed. known is
+// the branch when origin does not name its HEAD. A call a deadline or the transport ended holds the build for the pass
+// (an outage, without a run or a charge); any other failure (a repository or a branch origin does not have) is
+// returned as it is, the build's own.
+func (s *Ship) fetchBase(ctx context.Context, host, repo, known string) (string, string, error) {
+	hold := func(err error) error {
+		var outage *remoteOutage
+		if errors.As(err, &outage) {
+			return &shipHold{err: refused("the default branch of %s cannot be fetched now (%s)", repo, outage.cause)}
+		}
+		return err
+	}
+	out, err := s.git(ctx, host, "ls-remote", "--symref", "origin", "HEAD")
+	if err != nil {
+		return "", "", hold(err)
+	}
+	branch := firstOf(symrefBranch(out), known)
+	if _, err := s.git(ctx, host, "check-ref-format", "refs/heads/"+branch); err != nil {
+		return "", "", refused("origin's default branch has no valid name")
+	}
+	if _, err := s.git(ctx, host, "fetch", "--quiet", "origin", "+refs/heads/"+branch+":refs/remotes/origin/"+branch); err != nil {
+		return "", "", hold(err)
+	}
+	commit, err := s.git(ctx, host, "rev-parse", "--verify", "refs/remotes/origin/"+branch+"^{commit}")
+	if err != nil {
+		return "", "", err
+	}
+	return branch, strings.TrimSpace(commit), nil
 }
 
 func (s *Ship) gh(ctx context.Context, dir string, args ...string) (string, error) {

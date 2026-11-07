@@ -207,6 +207,11 @@ func hostInputGitLimit(ctx context.Context, dir string, limit int, args ...strin
 
 // hostInputGitCapped returns at most limit bytes of output and says whether there was more.
 func hostInputGitCapped(ctx context.Context, dir string, limit int, args ...string) ([]byte, bool, error) {
+	return hostInputGitFiles(ctx, dir, limit, nil, args...)
+}
+
+// hostInputGitFiles is hostInputGitCapped whose call inherits files, from descriptor 3 on (a mirror's lock).
+func hostInputGitFiles(ctx context.Context, dir string, limit int, files []*os.File, args ...string) ([]byte, bool, error) {
 	cctx, cancel := context.WithTimeout(ctx, gitStepTimeout)
 	defer cancel()
 	pins := append(append([]string(nil), GitSafety()...), "-c", "uploadpack.packObjectsHook=", "-c", "protocol.file.allow=always")
@@ -215,6 +220,7 @@ func hostInputGitCapped(ctx context.Context, dir string, limit int, args ...stri
 	}
 	cmd := exec.CommandContext(cctx, "git", append(pins, args...)...)
 	cmd.Env = GitEnv()
+	cmd.ExtraFiles = files
 	endWithContext(cmd)
 	out, stderr := Capture{Limit: limit}, Capture{Limit: ScrubBatchBytes}
 	cmd.Stdout, cmd.Stderr = &out, &stderr
