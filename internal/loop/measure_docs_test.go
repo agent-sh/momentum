@@ -23,6 +23,8 @@ func TestMeasurementDocsStateTheReadAndInEffectRules(t *testing.T) {
 		"judged once, at the first run that sees it",
 		"That check reads only the commits the reflog names, so a build from uncommitted edits",
 		"a move in the file's own second may have come before or after it",
+		"a move that only deletes them leaves no time to order it by",
+		"the reflog's next entry by its place, not by its time",
 		"lies in a directory of `loop.read_dirs`, which a run cannot write, and not in the build's work tree",
 		"The step opens the file once, without following a last link and without waiting on a pipe",
 		"the session scanners that write the sessions events",
