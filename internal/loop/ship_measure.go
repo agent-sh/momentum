@@ -754,11 +754,12 @@ const reflogPage = 1000
 // records the branch's own updates (a commit, a reset, a merge) and no checkout, so the commit read is the one the
 // branch named at the moment, whichever branch the checkout was on. The moment is an installed file's time: a clock
 // set back between a move and the file (either way round) dates that move on the wrong side of the file, so the entry
-// read can be a move made after the file, or one older than the move the file followed. git's
-// gc.reflogExpireUnreachable (30 days by default) removes older entries that move to or from a commit no ref reaches
-// (in a branch's own reflog, one the branch does not reach), the newest one too, and the entry read is then an
-// earlier move. found is false when no entry is dated then (an empty reflog, one expired or cut by a new clone): HEAD
-// as it stands is all there is.
+// read can be a move made after the file, or one older than the move the file followed. git's gc.reflogExpire (90
+// days by default) removes every entry older than that. gc.reflogExpireUnreachable (30 days by default) removes older
+// entries that move to or from a commit no ref reaches (in a branch's own reflog, one the branch does not reach), the
+// newest one too, and the entry read is then an earlier move. Git 2.50 through 2.56 swap the two defaults, so on
+// those releases every entry older than 30 days goes unless gc.reflogExpire is set. found is false when no entry is
+// dated then (an empty reflog, one expired or cut by a new clone): HEAD as it stands is all there is.
 func (s *Ship) headAt(ctx context.Context, dir string, at time.Time) (commit string, found bool, err error) {
 	second := at.Unix()
 	for skip := 0; ; skip += reflogPage {

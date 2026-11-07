@@ -794,6 +794,13 @@ func TestAnInstalledFileWrittenInTheSecondItsCheckoutMoved(t *testing.T) {
 		// the file's (HEAD as it stands would give "the repository's checkout does not hold")
 		{name: "built with HEAD's reflog empty, on a branch whose reflog dates a commit before the file", changed: a, without: aBefore,
 			moves: func(s *sameSecond) { s.emptyHeadLog() }, built: 300 * ms, why: didNotHold},
+		// the branch moves onto the change after the file, and HEAD as it stands holds it: only the branch's entry dated
+		// before the file gives the reason
+		{name: "built with HEAD's reflog empty, before its branch moved onto the change", changed: a, without: aBefore,
+			moves: func(s *sameSecond) {
+				datedGitIn(s.t, s.m.repo, s.second.Add(2*time.Second), "reset", "-q", "--hard", s.landed)
+				s.emptyHeadLog()
+			}, built: 300 * ms, why: didNotHold},
 		{name: "built before its link of the change was written, at its first sighting", changed: []string{"l"}, first: true,
 			change: func(t *testing.T, repo string) {
 				write(t, filepath.Join(repo, "b.txt"), "b\n")
