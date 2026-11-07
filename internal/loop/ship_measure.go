@@ -559,48 +559,36 @@ func (s *Ship) InEffect(ctx context.Context, p *Package) (time.Time, string, err
 	}
 	if p.Plan.Installed == "" || p.CheckoutAt.IsZero() || changed {
 		last := p.Landed[len(p.Landed)-1]
-		// a changed installed file is checked against the checkout as it stood when the file was written (the commits
-		// its HEAD's reflog names then), not as it stands now: a build from an older tree does not count once the
-		// checkout is back on the change. The reflog's commits are all that is read: a build from uncommitted edits, or
-		// from another work tree or clone, is not checked.
-		heads, reflog, why := []string{"HEAD"}, false, ""
+		// a changed installed file is checked against the checkout as it stood when the file was written (the commit its
+		// HEAD's reflog names then), not as it stands now: a build from an older tree does not count once the checkout
+		// is back on the change. The reflog's commit is all that is read: a build from uncommitted edits, or from another
+		// work tree or clone, is not checked, and neither is a move while a longer build ran.
+		head, reflog := "HEAD", false
 		if changed {
-			at, unknown, read, err := s.headsAt(ctx, p.Dir, installedAt)
+			at, found, err := s.headAt(ctx, p.Dir, installedAt)
 			if err != nil {
 				return time.Time{}, fmt.Sprintf("cannot check the repository's checkout: %v", err), nil
 			}
-			if read {
-				heads, reflog, why = at, true, unknown
+			if found {
+				head, reflog = at, true
 			}
 		}
-		held, lacking := 0, 0
-		for _, head := range heads {
-			_, err := s.git(ctx, p.Dir, "merge-base", "--is-ancestor", last, head)
+		why := ""
+		if _, err := s.git(ctx, p.Dir, "merge-base", "--is-ancestor", last, head); err != nil {
 			var exit *exec.ExitError
 			switch {
-			case err == nil:
-				held++
-			case errors.As(err, &exit) && exit.ExitCode() == 1:
-				lacking++
-			default:
+			case !errors.As(err, &exit) || exit.ExitCode() != 1:
 				return time.Time{}, fmt.Sprintf("cannot check the repository's checkout: %v", err), nil
+			case reflog:
+				why = fmt.Sprintf("the checkout the installed file was built from did not hold %.12s", last)
+			default:
+				why = fmt.Sprintf("the repository's checkout does not hold %.12s yet", last)
 			}
-		}
-		switch {
-		case why != "":
-		case held == 0 && reflog:
-			why = fmt.Sprintf("the checkout the installed file was built from did not hold %.12s", last)
-		case held == 0:
-			why = fmt.Sprintf("the repository's checkout does not hold %.12s yet", last)
-		case lacking > 0:
-			// the checkout moved between a commit with the change and one without it when the file was written, and the
-			// reflog cannot say which came first
-			why = movedInItsSecond
 		}
 		if why != "" {
 			// A definite rejection stands, with its reason, until the next build. A transient checkout error records no
 			// decision, and an unchanged file keeps the one it has, with its reason. A reason about the checkout as it
-			// stands, read when the reflog is empty, is not the file's and is not kept.
+			// stands, read when the reflog has no entry dated at the file's time, is not the file's and is not kept.
 			if p.Plan.Installed != "" && !changed {
 				return time.Time{}, firstOf(p.InstalledWhy, why), nil
 			}
@@ -754,60 +742,40 @@ func absent(err error) bool {
 	return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
 }
 
-// movedInItsSecond is the reason an installed file is out of effect when HEAD's reflog moved between a commit with the
-// change and one without it in the file's second or the next (headsAt), or moved then with nothing older to say what it
-// named before: the reflog cannot order the move and the file. reflogShort is the reason when the reflog holds entries
-// and none reaches back to the file's time. While the reflog reaches back to the file, a false in effect cannot come of
-// either, and a false out of effect costs one install, in a later second.
-const (
-	movedInItsSecond = "the checkout moved in the second the file was installed: install again to measure"
-	reflogShort      = "the checkout's reflog does not reach back to when the file was installed: install again to measure"
-)
+// reflogPage is how many of HEAD's reflog entries headAt reads at a time, newest first: a page stays far under
+// MaxStream however long the reflog grows.
+const reflogPage = 1000
 
-// headsAt is the commits a checkout's HEAD may have named at a moment, by its reflog. The reflog dates a move to the
-// whole second, and git dates it after it writes the tree, while the moment is finer: a move dated in the moment's
-// second or the next may have come before it or after it. The commits are each HEAD moved to then, and the one it named
-// before them, which is the reflog's next entry by its place, not by its time: a clock stepped back can date it later
-// than they are. unknown says why the reflog cannot name them: it moved then with no older entry (expiry ends a reflog
-// too), or none of its entries reaches back to the moment. read is false for an empty reflog, which says nothing: HEAD
-// as it stands is all there is.
-func (s *Ship) headsAt(ctx context.Context, dir string, at time.Time) (heads []string, unknown string, read bool, err error) {
-	out, err := s.git(ctx, dir, "reflog", "show", "--format=%H %gd", "--date=unix", "HEAD")
-	if err != nil {
-		return nil, "", false, err
-	}
+// headAt is the commit a checkout's HEAD named at a moment, by its reflog: the newest entry, by its place in the
+// reflog, dated at or before the moment's second. The reflog dates a move to the whole second and the moment is
+// finer, so a move dated in the moment's own second is read as before it: a script that moves the checkout and then
+// installs is the common case, and an install followed by a move in the same second is read as if the move came first.
+// found is false when no entry is dated then (an empty reflog, one expired or cut by a new clone): HEAD as it stands is
+// all there is.
+func (s *Ship) headAt(ctx context.Context, dir string, at time.Time) (commit string, found bool, err error) {
 	second := at.Unix()
-	entries, moved := 0, false
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") { // newest first
-		commit, place, ok := strings.Cut(line, " ")
-		if !ok {
-			continue
-		}
-		stamp := strings.TrimSuffix(strings.TrimPrefix(place, "HEAD@{"), "}")
-		secs, err := strconv.ParseInt(stamp, 10, 64)
+	for skip := 0; ; skip += reflogPage {
+		out, err := s.git(ctx, dir, "reflog", "show", "--format=%H %gd", "--date=unix", "-n", strconv.Itoa(reflogPage),
+			"--skip="+strconv.Itoa(skip), "HEAD")
 		if err != nil {
-			continue
+			return "", false, err
 		}
-		entries++
-		within := secs == second || secs == second+1
-		if !moved && secs > second+1 {
-			continue
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		for _, line := range lines { // newest first
+			commit, place, ok := strings.Cut(line, " ")
+			if !ok {
+				continue
+			}
+			stamp := strings.TrimSuffix(strings.TrimPrefix(place, "HEAD@{"), "}")
+			secs, err := strconv.ParseInt(stamp, 10, 64)
+			if err == nil && secs <= second {
+				return commit, true, nil
+			}
 		}
-		if !slices.Contains(heads, commit) {
-			heads = append(heads, commit)
+		if len(lines) < reflogPage {
+			return "", false, nil
 		}
-		if !within {
-			return heads, "", true, nil
-		}
-		moved = true
 	}
-	switch {
-	case moved:
-		return nil, movedInItsSecond, true, nil
-	case entries > 0:
-		return nil, reflogShort, true, nil
-	}
-	return nil, "", false, nil
 }
 
 // Keep records that a change's measurement kept it: its case closed as improved with the result.

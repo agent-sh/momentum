@@ -251,19 +251,20 @@ func TestAChangedInstalledFileChecksItsBuildCheckout(t *testing.T) {
 				t.Fatalf("start: %+v", got)
 			}
 			start := m.clock
-			// the checkout moves to a branch cut before the change, and the tool is rebuilt from it; the moves are dated on
-			// the case's clock, as its builds are
-			datedGitIn(t, m.repo, start, "checkout", "-q", "--orphan", "older")
-			run(t, m.repo, "git", "rm", "-rqf", ".")
-			write(t, filepath.Join(m.repo, "a.txt"), "the old code\n")
-			run(t, m.repo, "git", "add", "-A")
-			datedGitIn(t, m.repo, start, "commit", "-q", "-m", "before the change")
-			if change != "time" {
-				write(t, bin, "build without the change")
-			}
 			rebuilt := start.Add(2 * time.Hour)
 			if change == "hash" {
 				rebuilt = start
+			}
+			// the checkout moves to a branch cut before the change, and the tool is rebuilt from it two seconds later; the
+			// moves are dated on the case's clock, as its builds are
+			moved := rebuilt.Add(-2 * time.Second)
+			datedGitIn(t, m.repo, moved, "checkout", "-q", "--orphan", "older")
+			run(t, m.repo, "git", "rm", "-rqf", ".")
+			write(t, filepath.Join(m.repo, "a.txt"), "the old code\n")
+			run(t, m.repo, "git", "add", "-A")
+			datedGitIn(t, m.repo, moved, "commit", "-q", "-m", "before the change")
+			if change != "time" {
+				write(t, bin, "build without the change")
 			}
 			if err := os.Chtimes(bin, rebuilt, rebuilt); err != nil {
 				t.Fatal(err)
@@ -271,7 +272,7 @@ func TestAChangedInstalledFileChecksItsBuildCheckout(t *testing.T) {
 			p, _, _ = m.r.Ship.Load(m.c.ID)
 			since, why, err := m.r.Ship.InEffect(context.Background(), &p)
 			t.Logf("in effect after the rebuild: since=%v why=%q err=%v", since, why, err)
-			if why == "" || err != nil {
+			if !strings.Contains(why, "the checkout the installed file was built from did not hold") || err != nil {
 				t.Fatalf("in effect: %q %v", why, err)
 			}
 			hours(t, m.st, "after", start.Add(time.Minute), 23*time.Hour, 100, 6) // the old build's share, unchanged
@@ -719,12 +720,11 @@ func TestARejectedFirstBuildNeedsAnotherFileChange(t *testing.T) {
 	}
 }
 
-// HEAD's reflog dates a move to the whole second, after git writes the tree, and an installed file's time is finer: a
-// move dated in the file's second or the next cannot be ordered against it. When it moved between a commit with the
-// change and one without it, the file is out of effect with that reason, kept while it stands, until an install in a
-// later second. A move that leaves every commit holding the change, or a build a clear second away, is decided as before.
-// A reflog that ends in that window, or after the file, cannot say what HEAD named then; an empty one leaves HEAD as it
-// stands, and that reason, about the checkout, is not kept for the file.
+// HEAD's reflog dates a move to the whole second and an installed file's time is finer. A move dated in the file's own
+// second is read as before it: a script that moves the checkout and then installs is the common case. A move dated in
+// a later second comes after it. A reflog with no entry dated by then (empty, expired, a new clone) leaves HEAD as it
+// stands, whose reason is about the checkout and is not kept for the file; at a first sighting the change's files still
+// date the checkout. A first sighting of an unchanged file gives the reason kept for it.
 func TestAnInstalledFileWrittenInTheSecondItsCheckoutMoved(t *testing.T) {
 	ms := time.Millisecond
 	aBefore := func(t *testing.T, repo string) { write(t, filepath.Join(repo, "a.txt"), "a, before the change\n") }
@@ -738,6 +738,7 @@ func TestAnInstalledFileWrittenInTheSecondItsCheckoutMoved(t *testing.T) {
 		}
 	}
 	a := []string{"a.txt"}
+	const didNotHold = "the checkout the installed file was built from did not hold"
 	for _, tc := range []struct {
 		name            string
 		changed         []string                        // the change's own files
@@ -748,36 +749,26 @@ func TestAnInstalledFileWrittenInTheSecondItsCheckoutMoved(t *testing.T) {
 		why             string                          // a part of the reason it is out of effect; empty when in effect
 		after           func(s *sameSecond)             // what the checkout does before the next run, with the file unchanged
 		next            string                          // a part of the next run's reason, when it is not why's
-		again           time.Duration                   // an install after it, into the second, which is in effect; 0 for none
 	}{
 		{name: "built in the second of a move onto the change", changed: a, without: aBefore,
-			moves: func(s *sameSecond) { s.move(s.landed, 0); s.date("a.txt", 200*ms) }, built: 600 * ms, why: movedInItsSecond, again: 5 * time.Second},
-		{name: "built in the second of a move off the change, at its first sighting", changed: a, without: aBefore, first: true,
-			moves: func(s *sameSecond) { s.move(s.landed, -59*time.Minute); s.move(s.without, 0) }, built: 300 * ms, why: movedInItsSecond},
-		{name: "built in the second of the reflog's oldest move", changed: a, without: aBefore,
-			moves: func(s *sameSecond) { s.expire(); s.move(s.landed, 0); s.date("a.txt", 200*ms) }, built: 600 * ms, why: movedInItsSecond},
-		{name: "built before the reflog's oldest move", changed: a, without: aBefore,
-			moves: func(s *sameSecond) { s.expire(); s.move(s.landed, 5*time.Second) }, built: 300 * ms, why: reflogShort},
-		{name: "built with an empty reflog on the change", changed: a, without: aBefore,
-			moves: func(s *sameSecond) { s.move(s.landed, -59*time.Minute); s.expire() }, built: 300 * ms},
-		{name: "built with an empty reflog off the change, and the checkout moves onto it", changed: a, without: aBefore,
-			moves: func(s *sameSecond) { s.expire() }, built: 300 * ms, why: "the repository's checkout does not hold",
-			after: func(s *sameSecond) { s.move(s.landed, 5*time.Second) }, next: "has not changed since a build from a checkout without the change"},
+			moves: func(s *sameSecond) { s.move(s.landed, 0); s.date("a.txt", 200*ms) }, built: 600 * ms},
+		{name: "built in the second of a move onto the change, at its first sighting", changed: a, without: aBefore, first: true,
+			moves: func(s *sameSecond) { s.move(s.landed, 0); s.date("a.txt", 200*ms) }, built: 600 * ms},
 		{name: "built in the second of a move off the change", changed: a, without: aBefore,
-			moves: func(s *sameSecond) { s.move(s.landed, -59*time.Minute); s.move(s.without, 0) }, built: 300 * ms, why: movedInItsSecond},
-		{name: "built in the second of several moves", changed: a, without: aBefore,
+			moves: func(s *sameSecond) { s.move(s.landed, -59*time.Minute); s.move(s.without, 0) }, built: 300 * ms, why: didNotHold},
+		{name: "built in the second of a move off the change, at its first sighting", changed: a, without: aBefore, first: true,
+			moves: func(s *sameSecond) { s.move(s.landed, -59*time.Minute); s.move(s.without, 0) }, built: 300 * ms, why: didNotHold},
+		{name: "built in the second of several moves, the last onto the change", changed: a, without: aBefore,
 			moves: func(s *sameSecond) {
 				s.move(s.landed, -59*time.Minute)
 				s.move(s.without, 0)
 				s.move(s.landed, 0)
 				s.date("a.txt", 700*ms)
-			}, built: 900 * ms, why: movedInItsSecond},
+			}, built: 900 * ms},
 		{name: "built in the second before a move off the change", changed: a, without: aBefore,
-			moves: func(s *sameSecond) { s.move(s.landed, -59*time.Minute); s.move(s.without, time.Second) }, built: 900 * ms, why: movedInItsSecond},
+			moves: func(s *sameSecond) { s.move(s.landed, -59*time.Minute); s.move(s.without, time.Second) }, built: 900 * ms},
 		{name: "built in the second before a move onto the change", changed: a, without: aBefore,
-			moves: func(s *sameSecond) { s.move(s.landed, time.Second); s.date("a.txt", time.Second) }, built: 900 * ms, why: movedInItsSecond},
-		{name: "built in the second of a move onto the change, at its first sighting", changed: a, without: aBefore, first: true,
-			moves: func(s *sameSecond) { s.move(s.landed, 0); s.date("a.txt", 200*ms) }, built: 600 * ms, why: movedInItsSecond, again: 5 * time.Second},
+			moves: func(s *sameSecond) { s.move(s.landed, time.Second); s.date("a.txt", time.Second) }, built: 900 * ms, why: didNotHold},
 		{name: "built in the second of a commit on the change", changed: a, without: aBefore,
 			moves: func(s *sameSecond) { s.move(s.landed, -59*time.Minute); s.commit(0) }, built: 300 * ms},
 		{name: "built a second after a move onto the change", changed: a, without: aBefore,
@@ -785,8 +776,17 @@ func TestAnInstalledFileWrittenInTheSecondItsCheckoutMoved(t *testing.T) {
 		{name: "built a second after a move onto the change, at its first sighting", changed: a, without: aBefore, first: true,
 			moves: func(s *sameSecond) { s.move(s.landed, 0); s.date("a.txt", 200*ms) }, built: 2300 * ms},
 		{name: "built a second before a move onto the change", changed: a, without: aBefore,
-			moves: func(s *sameSecond) { s.move(s.landed, 2*time.Second); s.date("a.txt", 2*time.Second) }, built: 300 * ms,
-			why: "the checkout the installed file was built from did not hold"},
+			moves: func(s *sameSecond) { s.move(s.landed, 2*time.Second); s.date("a.txt", 2*time.Second) }, built: 300 * ms, why: didNotHold},
+		{name: "built in the second of the reflog's oldest move", changed: a, without: aBefore,
+			moves: func(s *sameSecond) { s.expire(); s.move(s.landed, 0); s.date("a.txt", 200*ms) }, built: 600 * ms},
+		{name: "built before the reflog's oldest move, at its first sighting", changed: a, without: aBefore, first: true,
+			moves: func(s *sameSecond) { s.expire(); s.move(s.landed, 5*time.Second); s.date("a.txt", 5*time.Second) }, built: 300 * ms,
+			why: "has not changed since the checkout held the change"},
+		{name: "built with an empty reflog on the change", changed: a, without: aBefore,
+			moves: func(s *sameSecond) { s.move(s.landed, -59*time.Minute); s.expire() }, built: 300 * ms},
+		{name: "built with an empty reflog off the change, and the checkout moves onto it", changed: a, without: aBefore,
+			moves: func(s *sameSecond) { s.expire() }, built: 300 * ms, why: "the repository's checkout does not hold",
+			after: func(s *sameSecond) { s.move(s.landed, 5*time.Second) }, next: "has not changed since a build from a checkout without the change"},
 		{name: "built before its link of the change was written, at its first sighting", changed: []string{"l"}, first: true,
 			change: func(t *testing.T, repo string) {
 				write(t, filepath.Join(repo, "b.txt"), "b\n")
@@ -827,12 +827,30 @@ func TestAnInstalledFileWrittenInTheSecondItsCheckoutMoved(t *testing.T) {
 			if next := s.judge(); (next == "") != (want == "") || !strings.Contains(next, want) || tc.next == "" && next != why {
 				t.Fatalf("the next run, with the file unchanged: %q, want %q", next, want)
 			}
-			if tc.again != 0 {
-				if why := s.install(tc.again); why != "" {
-					t.Fatalf("an install in a later second: %q", why)
-				}
-			}
 		})
+	}
+}
+
+// HEAD's reflog is read newest first, a page at a time: one whose listing is longer than a whole stream still names
+// the commit HEAD named at the file's time.
+func TestAReflogLongerThanAStreamIsReadInPages(t *testing.T) {
+	s := newSameSecond(t, []string{"a.txt"}, nil, func(t *testing.T, repo string) {
+		write(t, filepath.Join(repo, "a.txt"), "a, before the change\n")
+	})
+	s.move(s.landed, -59*time.Minute) // HEAD as it stands holds the change
+	var log strings.Builder
+	entry := func(from, to string, at time.Time) {
+		fmt.Fprintf(&log, "%s %s r <r@example.com> %d +0000\tcheckout: moving\n", from, to, at.Unix())
+	}
+	// each entry lists as a commit and its date, about 58 bytes: enough of them to pass the stream limit
+	for i := range MaxStream/50 + 1 {
+		entry(s.without, s.landed, s.base.Add(-time.Duration(MaxStream/50+1-i)*time.Second))
+	}
+	entry(s.landed, s.without, s.second)                  // off the change before the build
+	entry(s.without, s.landed, s.second.Add(time.Minute)) // and back onto it after
+	write(t, filepath.Join(s.m.repo, ".git", "logs", "HEAD"), log.String())
+	if why := s.install(300 * time.Millisecond); !strings.Contains(why, "the checkout the installed file was built from did not hold") {
+		t.Fatalf("a long reflog: %q", why)
 	}
 }
 
