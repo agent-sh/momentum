@@ -265,11 +265,12 @@ func (r *Runner) buildSkipped(ctx context.Context, c store.Case, stage string, c
 	var outage *baseOutage
 	switch {
 	case errors.As(cause, &outage):
-		if outage.line != "" {
-			r.logf("build of %s waits for its base: %s", c.ID, outage.line)
+		// a mirror's hold has Git's line in the pass's log already, from the pass's fetch; a proposal read's is new
+		if outage.proposal && outage.line != "" {
+			r.logf("build of %s waits to read its proposal branch: %s", c.ID, outage.line)
 		}
 		if ctx.Err() == nil { // a pass told to stop ended the fetch: no note names the stop as the remote's
-			if err := r.noteBaseHold(ctx, c, cause.Error()); err != nil {
+			if err := r.noteBaseHold(ctx, c, cause.Error(), outage.proposal); err != nil {
 				r.logf("build waiting note: %v", err)
 			}
 		}
@@ -284,24 +285,36 @@ func (r *Runner) buildSkipped(ctx context.Context, c store.Case, stage string, c
 // baseNotePrefix begins the ids of a case's notes of builds held because their base cannot be fetched (noteBaseHold).
 func baseNotePrefix(caseID string) string { return "loop-build:" + store.IDPart(caseID) + ":base:" }
 
-// baseHoldRaise is how long a case's builds may wait for their base before the wait's note is raised from low to normal
-// importance: a passing outage ends within it, and one that lasts a day (gh logged out, a certificate the machine does
-// not trust) needs a person.
+// proposalNotePrefix begins the ids of a case's notes of builds held because their proposal branch cannot be read now
+// (noteBaseHold): a hold of its own, which a fetch of the base does not end, only a read of the branch that goes
+// through (Ship.prepare) or the case leaving testing.
+func proposalNotePrefix(caseID string) string {
+	return "loop-build:" + store.IDPart(caseID) + ":proposal:"
+}
+
+// baseHoldRaise is how long a case's builds may wait for their base, or to read their proposal branch, before the
+// wait's note is raised from low to normal importance: a passing outage ends within it, and one that lasts a day (gh
+// logged out, a certificate the machine does not trust) needs a person.
 const baseHoldRaise = 24 * time.Hour
 
-// noteBaseHold notes a build held because its repository's mirror has no usable fetch: one note per class of cause
-// (holdClass), open until the hold ends (endBaseNotes). Once the case's builds have waited baseHoldRaise since the
-// oldest note of the hold, the note is raised to normal importance. A note a person took out of the report stays out
-// while its hold lasts at the importance it was taken out at, and comes back once when that rises; one whose hold
-// ended (it says so) opens again with the next hold of its class.
-func (r *Runner) noteBaseHold(ctx context.Context, c store.Case, why string) error {
+// noteBaseHold notes a build held because its repository's mirror has no usable fetch, or, for proposal, because its
+// proposal branch cannot be read now: one note per hold and class of cause (holdClass), open until the hold ends
+// (endHoldNotes). Once the case's builds have waited baseHoldRaise since the oldest note of the hold, the note is
+// raised to normal importance. A note a person took out of the report stays out while its hold lasts at the importance
+// it was taken out at, and comes back once when that rises; one whose hold ended (it says so) opens again with the
+// next hold of its class.
+func (r *Runner) noteBaseHold(ctx context.Context, c store.Case, why string, proposal bool) error {
+	prefix, title := baseNotePrefix(c.ID), "The loop's build for case "+c.ID+" waits for its base"
+	if proposal {
+		prefix, title = proposalNotePrefix(c.ID), "The loop's build for case "+c.ID+" waits to read its proposal branch"
+	}
 	detail, err := Redact(ctx, why)
 	if err != nil {
 		return err
 	}
 	detail = store.CaseNoteText(detail)
 	sum := sha256.Sum256([]byte(detail))
-	id := baseNotePrefix(c.ID) + hex.EncodeToString(sum[:])
+	id := prefix + hex.EncodeToString(sum[:])
 	notes, err := r.Store.Notes(ctx)
 	if err != nil {
 		return err
@@ -309,13 +322,13 @@ func (r *Runner) noteBaseHold(ctx context.Context, c store.Case, why string) err
 	since := r.now()
 	var current *store.Note
 	for i, n := range notes {
-		if !strings.HasPrefix(n.ID, baseNotePrefix(c.ID)) {
+		if !strings.HasPrefix(n.ID, prefix) {
 			continue
 		}
 		if n.ID == id {
 			current = &notes[i]
 		}
-		if !baseNoteEnded(n) && n.At.Before(since) { // a note of this hold, one a person took out of the report too
+		if !holdNoteEnded(n) && n.At.Before(since) { // a note of this hold, one a person took out of the report too
 			since = n.At
 		}
 	}
@@ -324,7 +337,7 @@ func (r *Runner) noteBaseHold(ctx context.Context, c store.Case, why string) err
 		importance = store.ImportanceNormal
 	}
 	switch {
-	case current != nil && baseNoteEnded(*current):
+	case current != nil && holdNoteEnded(*current):
 		current = nil // its hold ended (the note may still stand, if a pass stopped between its writes): this is a new one
 	case current != nil && !current.Done.IsZero() && importance <= current.Importance:
 		return nil // a person took it out of the report at this importance, while this hold lasts
@@ -338,49 +351,51 @@ func (r *Runner) noteBaseHold(ctx context.Context, c store.Case, why string) err
 		at = current.At
 	}
 	_, err = r.Store.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Importance: importance, At: at,
-		Title: "The loop's build for case " + c.ID + " waits for its base", Detail: detail})
+		Title: title, Detail: detail})
 	return err
 }
 
-// The ends of a base note's hold, which endBaseNotes adds to the note it resolves.
+// The ends of a base or proposal note's hold, which endHoldNotes adds to the note it resolves.
 const (
 	baseFetched     = "It ended: a build of the case fetched its base."
+	proposalRead    = "It ended: its proposal branch was read."
 	caseLeftTesting = "It ended: the case left testing."
 )
 
-// baseNoteEnded says whether a base note says its hold ended (endBaseNotes).
-func baseNoteEnded(n store.Note) bool {
-	return strings.HasSuffix(n.Detail, baseFetched) || strings.HasSuffix(n.Detail, caseLeftTesting)
+// holdNoteEnded says whether a base or proposal note says its hold ended (endHoldNotes).
+func holdNoteEnded(n store.Note) bool {
+	return strings.HasSuffix(n.Detail, baseFetched) || strings.HasSuffix(n.Detail, proposalRead) || strings.HasSuffix(n.Detail, caseLeftTesting)
 }
 
-// endBaseNotes ends a case's notes of builds held for their base, once their hold ended (why: a build fetched its base,
-// or the case left testing): each says so and is resolved, a note a person took out of the report too, so the next
-// hold of its class opens it again.
+// endBaseNotes ends a case's notes of builds held for their base, once their hold ended (why: a build fetched its
+// base, or the case left testing).
 func (r *Runner) endBaseNotes(ctx context.Context, caseID, why string) error {
 	notes, err := r.Store.Notes(ctx)
 	if err != nil {
 		return err
 	}
-	return r.endBaseNotesIn(ctx, notes, caseID, why)
+	return endHoldNotes(ctx, r.Store, r.now(), notes, baseNotePrefix(caseID), why)
 }
 
-// endBaseNotesIn is endBaseNotes over notes read already.
-func (r *Runner) endBaseNotesIn(ctx context.Context, notes []store.Note, caseID, why string) error {
+// endHoldNotes ends the notes among notes whose ids begin with prefix (a case's base or proposal notes), once their
+// hold ended (why says how): each says so and is resolved, a note a person took out of the report too, so the next
+// hold of its class opens it again.
+func endHoldNotes(ctx context.Context, st *store.Store, now time.Time, notes []store.Note, prefix, why string) error {
 	for _, n := range notes {
-		if !strings.HasPrefix(n.ID, baseNotePrefix(caseID)) {
+		if !strings.HasPrefix(n.ID, prefix) {
 			continue
 		}
-		ended := baseNoteEnded(n)
+		ended := holdNoteEnded(n)
 		if ended && !n.Done.IsZero() {
 			continue
 		}
 		if !ended { // a note that says its hold ended but stands (a pass stopped between the writes) is only resolved
 			n.Detail = n.Detail + " " + why
-			if _, err := r.Store.PutNote(ctx, n); err != nil {
+			if _, err := st.PutNote(ctx, n); err != nil {
 				return err
 			}
 		}
-		if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
+		if _, _, err := st.DoneNote(ctx, n.ID, now); err != nil {
 			return err
 		}
 	}

@@ -67,9 +67,9 @@ type RepoInput struct {
 	tracked []string // the snapshot's paths, to match a case's evidence paths against
 	objects string   // the Git directory the snapshot read (origin's mirror, or the checkout), for the case's diffs
 	// mirror is origin's mirror when the snapshot read it (this pass's fetch, or its last), the one a build's host clone
-	// is made from, and identity the repository it holds; both "" when it read the checkout. class and line name the
-	// fetch that failed, if one did (holdClass).
-	mirror, identity, class, line string
+	// is made from, and identity the repository it holds; both "" when it read the checkout. class names the fetch that
+	// failed, if one did (holdClass): the pass's log has Git's line for it already.
+	mirror, identity, class string
 }
 
 // HistoryManifest says what the commit log gave a run: the commits, its size, and how many entries the scrubber changed.
@@ -104,12 +104,15 @@ type SnapshotOptions struct {
 	Cache       *ScrubCache
 	Since       time.Time                        // the log's window starts here
 	Logf        func(format string, args ...any) // the pass's log: a mirror's repack that failed, Git's line for a fetch that did
+	// Keep are checkouts whose mirrors stay though no source of the pass reads them: those the cases' packages name (a
+	// repository the owner prepared outside loop.read_dirs).
+	Keep []string
 }
 
 // SnapshotRepos makes the scrubbed snapshot of each distinct source for /ro/repos/NAME and its log for
 // /ro/history/repos/NAME.log, at its origin's default branch as the host fetches it now (repofetch.go), or, with the
 // reason, as its mirror last fetched it or at the checkout's own default branch when it cannot. Mirrors no source of
-// the pass reads are removed. A source that cannot be read (missing, no work tree, a link, inside loop storage, no
+// the pass reads, and no checkout of o.Keep, are removed. A source that cannot be read (missing, no work tree, a link, inside loop storage, no
 // default branch) is a result with its reason, not a failure. Only a scrubber that does not run stops the pass.
 func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) {
 	if err := CheckScrubber(ctx); err != nil {
@@ -206,7 +209,7 @@ func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) 
 		}
 		results = append(results, result)
 	}
-	pruneMirrors(o.Mirrors, used, unread)
+	pruneMirrors(o.Mirrors, used, append(unread, o.Keep...))
 	return results, nil
 }
 
@@ -294,7 +297,7 @@ type snapEntry struct {
 // when err is not nil.
 func snapshotOne(ctx context.Context, source string, tip repoTip, dst, logPath string, maxBytes int64, cache *ScrubCache, since time.Time) (r RepoInput, err error) {
 	r = RepoInput{Source: source, Name: filepath.Base(dst), Skipped: map[string]int{}, Branch: tip.branch, Commit: tip.commit,
-		Fallback: tip.fallback, objects: tip.dir, class: tip.class, line: tip.line}
+		Fallback: tip.fallback, objects: tip.dir, class: tip.class}
 	if tip.dir != source {
 		r.mirror, r.identity = tip.dir, tip.identity
 	}

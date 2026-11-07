@@ -150,17 +150,35 @@ func policyPrepareNote(caseID string, n store.Note) bool {
 // releaseHolds ends the holds of cases that are no longer in testing (closed, merged, deployed or back to
 // investigating): their hold ended with the step it held. A case not closed whose log still holds a hold gets the
 // hold's end, so a return to testing in the same episode records its hold again; every such case's standing notes
-// resolve.
+// resolve, and its base and proposal notes end. The notes are read and scanned once, whatever the count of cases.
 func (r *Runner) releaseHolds(ctx context.Context, cs []store.Case) error {
+	gone := map[string]string{} // the cases out of testing, by their part of a note's id
+	for _, c := range cs {
+		if c.Status != store.CaseTesting {
+			gone[store.IDPart(c.ID)] = c.ID
+		}
+	}
+	if len(gone) == 0 {
+		return nil
+	}
 	notes, err := r.Store.Notes(ctx)
 	if err != nil {
 		return err
 	}
-	standing := map[string]bool{}
+	held := map[string][]store.Note{} // each such case's notes of its holds, from the one scan
 	for _, n := range notes {
-		if n.Done.IsZero() && (strings.HasPrefix(n.ID, "loop-repo:") || strings.HasPrefix(n.ID, "loop-hand:") ||
-			strings.HasPrefix(n.ID, "loop-build:") && strings.Contains(n.ID, ":held:")) {
-			standing[n.ID] = true
+		for _, kind := range []string{"loop-build:", "loop-repo:", "loop-hand:"} {
+			rest, ok := strings.CutPrefix(n.ID, kind)
+			if !ok {
+				continue
+			}
+			for i := 0; i <= len(rest); i++ { // the case's part ends at a colon or at the id's end
+				if i == len(rest) || rest[i] == ':' {
+					if id, ok := gone[rest[:i]]; ok {
+						held[id] = append(held[id], n)
+					}
+				}
+			}
 		}
 	}
 	for _, c := range cs {
@@ -185,13 +203,16 @@ func (r *Runner) releaseHolds(ctx context.Context, cs []store.Case) error {
 				}
 			}
 		}
-		if err := r.endBaseNotesIn(ctx, notes, c.ID, caseLeftTesting); err != nil {
-			return err
+		mine := held[c.ID]
+		for _, prefix := range []string{baseNotePrefix(c.ID), proposalNotePrefix(c.ID)} {
+			if err := endHoldNotes(ctx, r.Store, r.now(), mine, prefix, caseLeftTesting); err != nil {
+				return err
+			}
 		}
-		for id := range standing {
-			if strings.HasPrefix(id, holdNotePrefix(c.ID)) || id == repoNoteID(c.ID) ||
-				id == handNoteID(c.ID) || strings.HasPrefix(id, handNoteID(c.ID)+":") {
-				if _, _, err := r.Store.DoneNote(ctx, id, r.now()); err != nil {
+		hold, repo, hand := holdNotePrefix(c.ID), repoNoteID(c.ID), handNoteID(c.ID)
+		for _, n := range mine {
+			if n.Done.IsZero() && (strings.HasPrefix(n.ID, hold) || n.ID == repo || n.ID == hand || strings.HasPrefix(n.ID, hand+":")) {
+				if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
 					return err
 				}
 			}

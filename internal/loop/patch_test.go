@@ -530,9 +530,12 @@ func TestConflictingLandingPreparesANewBaseWithoutReadingTheRunClone(t *testing.
 		t.Fatal(err)
 	}
 	write(t, filepath.Join(p.Work, ".git"), "untrusted")
-	tip, err := s.mirrorTip(ctx, p.Repo, p.Dir) // origin's branch as the mirror holds it, which the conflict moved
+	tip, lock, err := s.mirrorTip(ctx, p.Repo, p.Dir) // origin's branch as the mirror holds it, which the conflict moved
 	if err != nil {
 		t.Fatal(err)
+	}
+	if lock != nil {
+		lock.Close()
 	}
 	p, err = s.buildBase(s.gitContext(shipContext(ctx, p.Case)), p, tip) // RefreshBase is set: the landing found a conflict
 	if err != nil || p.BaseCommit != newBase || p.State != Prepared || p.Check != nil {

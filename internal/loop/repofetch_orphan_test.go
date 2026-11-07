@@ -51,7 +51,7 @@ func TestARemoteFailureIsNamedByItsClass(t *testing.T) {
 		{"SAML SSO", "remote: The 'org' organization has enabled or enforced SAML SSO. To access this repository, you must use the HTTPS remote with a personal access token or SSH with an SSH key and passphrase that has been authorized for this organization.\nfatal: unable to access 'https://github.com/org/r.git/': The requested URL returned error: 403\n", noCreds},
 		{"a local file the call cannot write", "error: cannot open '.git/FETCH_HEAD': Permission denied\n", otherFailure},
 	} {
-		if got, _ := holdClass([]byte(c.stderr), ""); got != c.class {
+		if got, _ := holdClass([]byte(c.stderr)); got != c.class {
 			t.Errorf("%s: class %q, want %q", c.name, got, c.class)
 		}
 	}

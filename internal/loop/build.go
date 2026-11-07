@@ -173,7 +173,7 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 	// The build's host clone is made from, and refreshed from, origin's mirror as this pass read it: fetched now, or as
 	// it was last fetched. Without such a mirror (no fetch ever completed, or no origin to fetch) the build waits.
 	if read.mirror == "" {
-		return Package{}, mirrorHold(name, read.class, read.line)
+		return Package{}, mirrorHold(name, read.class)
 	}
 	tip := repoTip{dir: read.mirror, branch: read.Branch, commit: read.Commit, identity: read.identity}
 	// a mirror that holds this pass's fetch ends what held the case's builds for their base, whatever the build does
@@ -227,7 +227,7 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 	// mirror's last fetch alone, a public base (one a force-push may have purged since) waits for the pass.
 	if public && !fresh {
 		removeInputTree(p.Work)
-		return p, mirrorHold(name, read.class, read.line)
+		return p, mirrorHold(name, read.class)
 	}
 	if !fresh {
 		if err := r.endBaseNotes(ctx, c.ID, baseFetched); err != nil {

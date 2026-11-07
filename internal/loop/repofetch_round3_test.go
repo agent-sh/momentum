@@ -157,20 +157,19 @@ func TestARepackLeavesTheLargestPackAsItIs(t *testing.T) {
 // last fatal: or error: line: warnings come first.
 func TestABaseHoldNamesItsClass(t *testing.T) {
 	const pq = "** WARNING: connection is not using a post-quantum key exchange algorithm.\r\n** This session may be vulnerable to \"store now, decrypt later\" attacks.\r\n** The server may need to be upgraded. See https://openssh.com/pq.html\r\n"
-	for _, c := range []struct{ stderr, ended, class, line string }{
-		{"fatal: could not read Username for 'https://github.com': terminal prompts disabled\n", "", "no credentials", "fatal: could not read Username for 'https://github.com': terminal prompts disabled"},
-		{"warning: redirecting to https://github.com/o/r.git/\nfatal: could not read Password for 'https://x@github.com': terminal prompts disabled\n", "", "no credentials", "fatal: could not read Password for 'https://x@github.com': terminal prompts disabled"},
-		{"remote: Invalid username or token. Password authentication is not supported for Git operations.\nfatal: Authentication failed for 'https://github.com/o/r.git/'\n", "", "no credentials", "remote: Invalid username or token. Password authentication is not supported for Git operations."},
-		{"fatal: unable to access 'https://github.com/o/r.git/': server certificate verification failed. CAfile: none CRLfile: none\n", "", "a certificate or host key not trusted", "fatal: unable to access 'https://github.com/o/r.git/': server certificate verification failed. CAfile: none CRLfile: none"},
-		{"fatal: unable to access 'https://github.com/o/r.git/': SSL certificate problem: unable to get local issuer certificate\n", "", "a certificate or host key not trusted", "fatal: unable to access 'https://github.com/o/r.git/': SSL certificate problem: unable to get local issuer certificate"},
-		{"Host key verification failed.\r\nfatal: Could not read from remote repository.\n", "", "a certificate or host key not trusted", "Host key verification failed."},
-		{pq + "Connection closed by 192.0.2.1 port 22\r\nfatal: Could not read from remote repository.\n", "", "the connection broke off", "Connection closed by 192.0.2.1 port 22"},
-		{"fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com\n", "", "the server's name did not resolve", "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com"},
-		{"fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 503\n", "", "the server failed (an HTTP 5xx answer)", "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 503"},
-		{"", "the git call's 2m0s limit passed", "the git call's 2m0s limit passed", ""},
-		{pq + "error: something git has never said\nfatal: and then this\n", "", "another failure", "fatal: and then this"},
+	for _, c := range []struct{ stderr, class, line string }{
+		{"fatal: could not read Username for 'https://github.com': terminal prompts disabled\n", "no credentials", "fatal: could not read Username for 'https://github.com': terminal prompts disabled"},
+		{"warning: redirecting to https://github.com/o/r.git/\nfatal: could not read Password for 'https://x@github.com': terminal prompts disabled\n", "no credentials", "fatal: could not read Password for 'https://x@github.com': terminal prompts disabled"},
+		{"remote: Invalid username or token. Password authentication is not supported for Git operations.\nfatal: Authentication failed for 'https://github.com/o/r.git/'\n", "no credentials", "remote: Invalid username or token. Password authentication is not supported for Git operations."},
+		{"fatal: unable to access 'https://github.com/o/r.git/': server certificate verification failed. CAfile: none CRLfile: none\n", "a certificate or host key not trusted", "fatal: unable to access 'https://github.com/o/r.git/': server certificate verification failed. CAfile: none CRLfile: none"},
+		{"fatal: unable to access 'https://github.com/o/r.git/': SSL certificate problem: unable to get local issuer certificate\n", "a certificate or host key not trusted", "fatal: unable to access 'https://github.com/o/r.git/': SSL certificate problem: unable to get local issuer certificate"},
+		{"Host key verification failed.\r\nfatal: Could not read from remote repository.\n", "a certificate or host key not trusted", "Host key verification failed."},
+		{pq + "Connection closed by 192.0.2.1 port 22\r\nfatal: Could not read from remote repository.\n", "the connection broke off", "Connection closed by 192.0.2.1 port 22"},
+		{"fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com\n", "the server's name did not resolve", "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com"},
+		{"fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 503\n", "the server failed (an HTTP 5xx answer)", "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 503"},
+		{pq + "error: something git has never said\nfatal: and then this\n", "another failure", "fatal: and then this"},
 	} {
-		if class, line := holdClass([]byte(c.stderr), c.ended); class != c.class || line != c.line {
+		if class, line := holdClass([]byte(c.stderr)); class != c.class || line != c.line {
 			t.Errorf("%q: class %q, line %q; want %q, %q", c.stderr, class, line, c.class, c.line)
 		}
 	}

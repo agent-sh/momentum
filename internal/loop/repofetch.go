@@ -111,34 +111,52 @@ type origin struct{ identity, url string }
 // there is no such mirror, or no origin to read, the checkout's own default branch. A fallback says which and why. An
 // error is a checkout without a default branch, or a pass told to stop.
 func sourceTip(ctx context.Context, source, mirrors, gh string) (repoTip, string, error) {
+	tip, mirror, lock, err := lockedSourceTip(ctx, source, mirrors, gh)
+	if lock != nil {
+		lock.Close()
+	}
+	return tip, mirror, err
+}
+
+// lockedSourceTip is sourceTip that returns the mirror's lock, still held, when the tip is in the mirror and the fetch
+// took the lock, the fetch done or not; else nil (a fetch an earlier pass started holds it, the tip is the checkout's,
+// or an error). The caller reads the mirror under it and closes it.
+func lockedSourceTip(ctx context.Context, source, mirrors, gh string) (repoTip, string, *os.File, error) {
 	org, why := readOrigin(ctx, source)
 	mirror, class, line := "", "", ""
+	var lock *os.File
+	noMirror := func(tip repoTip, err error) (repoTip, string, *os.File, error) {
+		if lock != nil {
+			lock.Close() // the caller reads no mirror
+		}
+		return tip, mirror, nil, err
+	}
 	if why == "" {
 		mirror = mirrorPath(mirrors, org.identity)
 		var tip repoTip
-		if tip, why = fetchTip(ctx, source, mirror, org.url, gh); why == "" {
+		if tip, lock, why = lockedFetchTip(ctx, source, mirror, org.url, gh); why == "" {
 			tip.identity = org.identity
-			return tip, mirror, nil
+			return tip, mirror, lock, nil
 		}
 		class, line = tip.class, tip.line
 		if err := ctx.Err(); err != nil {
-			return repoTip{}, mirror, err
+			return noMirror(repoTip{}, err)
 		}
 		if last, at, ok := lastFetch(ctx, mirror); ok {
 			last.fallback = fmt.Sprintf("origin's %s as fetched at %s: %s", last.branch, at.UTC().Format("2006-01-02 15:04Z"), why)
 			last.class, last.line, last.identity = class, line, org.identity
-			return last, mirror, nil
+			return last, mirror, lock, nil
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return repoTip{}, mirror, err
+		return noMirror(repoTip{}, err)
 	}
 	branch, commit, err := defaultCommit(ctx, source)
 	if err != nil {
-		return repoTip{}, mirror, err
+		return noMirror(repoTip{}, err)
 	}
-	return repoTip{dir: source, branch: branch, commit: commit, fallback: fmt.Sprintf("checkout's %s: %s", branch, why),
-		class: firstOf(class, why), line: line}, mirror, nil
+	return noMirror(repoTip{dir: source, branch: branch, commit: commit, fallback: fmt.Sprintf("checkout's %s: %s", branch, why),
+		class: firstOf(class, why), line: line}, nil)
 }
 
 // readOrigin reads the checkout's origin from its own configuration file, without includes: no setting of the
@@ -262,7 +280,17 @@ func mirrorPath(mirrors, identity string) string {
 
 // fetchTip fetches the default branch of source's origin into its mirror, within fetchLimit (firstFetchLimit when the
 // mirror holds no complete fetch yet), and returns its tip, or why it could not (a text without a host path or a URL).
-func fetchTip(ctx context.Context, source, mirror, url, gh string) (tip repoTip, why string) {
+func fetchTip(ctx context.Context, source, mirror, url, gh string) (repoTip, string) {
+	tip, lock, why := lockedFetchTip(ctx, source, mirror, url, gh)
+	if lock != nil {
+		lock.Close()
+	}
+	return tip, why
+}
+
+// lockedFetchTip is fetchTip that returns the mirror's lock, still held, whenever it took it, the fetch done or not:
+// the caller reads the mirror under it and closes it.
+func lockedFetchTip(ctx context.Context, source, mirror, url, gh string) (tip repoTip, lock *os.File, why string) {
 	var class, line string // a failed call's, for the tip a failure returns
 	defer func() {
 		if why != "" {
@@ -278,44 +306,43 @@ func fetchTip(ctx context.Context, source, mirror, url, gh string) (tip repoTip,
 	}
 	lock, err := openMirror(ctx, mirror, source)
 	if err != nil {
-		return repoTip{}, failure(err)
+		return repoTip{}, nil, failure(err)
 	}
-	defer lock.Close()
 	what, limit := fetchBudget(mirror)
 	fctx, cancel := withLimit(ctx, what, limit)
 	defer cancel()
 	call := mirrorCall{mirror: mirror, gh: gh, lock: lock}
 	branch, err := originBranch(fctx, call, url)
 	if err != nil {
-		return repoTip{}, failure(err)
+		return repoTip{}, lock, failure(err)
 	}
 	if branch == "" {
 		// a remote that does not name its HEAD: the branch the checkout takes for origin's default
 		if branch, err = cloneDefaultBranch(fctx, source); err != nil {
-			return repoTip{}, failure(err)
+			return repoTip{}, lock, failure(err)
 		}
 	}
 	if _, err := hostInputGit(fctx, "", "check-ref-format", "refs/heads/"+branch); err != nil {
-		return repoTip{}, "fetch refused: origin's default branch has no valid name"
+		return repoTip{}, lock, "fetch refused: origin's default branch has no valid name"
 	}
 	ref := "refs/heads/" + branch
 	if _, err := fetchGit(fctx, call, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
 		url, "+"+ref+":"+ref); err != nil {
-		return repoTip{}, failure(err)
+		return repoTip{}, lock, failure(err)
 	}
 	out, err := hostInputGit(fctx, "", "--git-dir="+mirror, "rev-parse", "--verify", ref+"^{commit}")
 	if err != nil {
-		return repoTip{}, failure(err)
+		return repoTip{}, lock, failure(err)
 	}
 	commit := strings.TrimSpace(string(out))
 	if err := updateMirrorMeta(mirror, func(m *mirrorMeta) { m.Branch, m.Commit, m.Fetched = branch, commit, time.Now() }); err != nil {
-		return repoTip{}, failure(err)
+		return repoTip{}, lock, failure(err)
 	}
 	tip = repoTip{dir: mirror, branch: branch, commit: commit}
 	if err := packMirror(ctx, mirror, lock); err != nil {
 		tip.repack = "the mirror's repack failed: " + reason(err)
 	}
-	return tip, ""
+	return tip, lock, ""
 }
 
 // mirrorCall is a remote Git call in a mirror: the mirror, the GitHub CLI for GitHub's credentials, and the mirror's
@@ -545,14 +572,21 @@ func procAge(start uint64) (time.Duration, error) {
 	return time.Duration((up - float64(start)/userHZ) * float64(time.Second)), nil
 }
 
-// fetchRuns says whether a fetch holds the mirror's lock, without making the lock.
-func fetchRuns(dir string) bool {
+// lockForRemoval takes the mirror's lock for its removal (pruneMirrors), without making the lock, without waiting, and
+// never from an orphaned fetch: ok is false while anything else holds it, a fetch's process group (a pass's, or one an
+// earlier pass started) or the owner's preparation, from its fetch until its clone has read the mirror. A mirror
+// removed under its lock is never one a preparation fetches into or clones from. A directory without a lock file has
+// none to take.
+func lockForRemoval(dir string) (release func(), ok bool) {
 	f, err := os.OpenFile(filepath.Join(dir, mirrorLockFile), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		return false
+		return func() {}, true
 	}
-	defer f.Close()
-	return errors.Is(syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB), syscall.EWOULDBLOCK)
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, false
+	}
+	return func() { f.Close() }, true
 }
 
 // clearStale removes the lock files, temporary files and keep files a fetch or a repack leaves when it is killed before
@@ -750,8 +784,9 @@ func mirrorObjects(mirror string) (packs, loose int) {
 // go into the new pack whether a ref reaches them or not, so the count of loose objects is 0 after it. A geometric
 // repack rewrites only what it rolls up, not the whole history, as repack -a does: so a repack that fails costs little
 // when the next pass tries it again, and needs no record of its own or a wait. It runs after a complete fetch, under
-// the pass's lock and the mirror's, which the call holds. A repack that fails leaves the mirror as it was, says why,
-// and the next pass tries again.
+// the mirror's lock, which the call holds: a pass's fetch holds the pass's lock too, the owner's preparation
+// (Ship.Prepare) only the mirror's. A repack that fails leaves the mirror as it was, says why, and the next fetch
+// tries again.
 func packMirror(ctx context.Context, mirror string, lock *os.File) error {
 	if packs, loose := mirrorObjects(mirror); packs <= mirrorPackLimit && loose <= mirrorLooseLimit {
 		return nil
@@ -836,10 +871,11 @@ func updateMirrorMeta(mirror string, change func(*mirrorMeta)) error {
 }
 
 // pruneMirrors removes the mirrors that no checkout of the pass reads: a mirror a source's origin named this pass
-// stays (used), and so does one that records a source whose origin could not be read this pass (unread). Only a
-// mirror's name (mirrorPath) or a mirror being made (.new-) is removed, never one a fetch still writes (fetchRuns), and
-// nothing when the path to mirrors holds a link.
-func pruneMirrors(mirrors string, used map[string]bool, unread []string) {
+// stays (used), and so does one whose record names a checkout in keep: a source whose origin could not be read this
+// pass, or a package's (Ship.packageDirs). Only a mirror's name (mirrorPath) or a mirror being made (.new-) is
+// removed, under its lock, never one whose lock is held (lockForRemoval), and nothing when the path to mirrors holds
+// a link.
+func pruneMirrors(mirrors string, used map[string]bool, keep []string) {
 	if noInputLinks(mirrors) != nil {
 		return // none yet, or not the loop's own: the next pass looks again
 	}
@@ -852,13 +888,15 @@ func pruneMirrors(mirrors string, used map[string]bool, unread []string) {
 		if used[dir] || !mirrorName.MatchString(e.Name()) && !strings.HasPrefix(e.Name(), ".new-") {
 			continue
 		}
-		if m, err := readMirrorMeta(dir); err == nil && slices.ContainsFunc(m.Sources, func(s string) bool { return slices.Contains(unread, s) }) {
+		if m, err := readMirrorMeta(dir); err == nil && slices.ContainsFunc(m.Sources, func(s string) bool { return slices.Contains(keep, s) }) {
 			continue
 		}
-		if fetchRuns(dir) {
-			continue // a fetch an earlier pass started still writes it: the next pass looks again
+		release, ok := lockForRemoval(dir)
+		if !ok {
+			continue // a fetch or a preparation still holds it: the next pass looks again
 		}
 		_ = removeAll(dir) // what cannot be removed now is tried again by the next pass
+		release()
 	}
 }
 
@@ -932,7 +970,7 @@ func remoteFailure(ctx context.Context, verb string, err error, stderr []byte) e
 		cause := endedBy(ctx)
 		return &remoteError{text: fmt.Sprintf("input git %s: %s", verb, cause), class: cause}
 	}
-	class, line := holdClass(stderr, "")
+	class, line := holdClass(stderr)
 	if class == otherFailure {
 		return &remoteError{text: fmt.Sprintf("input git %s failed: %v", verb, err), class: class, line: line}
 	}
@@ -978,11 +1016,12 @@ func transportCause(stderr []byte) string {
 
 // holdClass is the class of a remote call's failure, as the pass's summary and a held build's note name it, and the
 // line of Git's diagnostics that shows it, for the pass's log. The class is one of a fixed few, so a note stands for
-// a class, not for each text Git printed: a deadline (ended, its limit); no credentials (credentialFailure); a
-// certificate or ssh host key not trusted; a transport cause (transportCauses); a remote that has no such repository
-// or branch; a server's refusal (another 4xx); another failure. The line is the one that matched, else Git's last
-// fatal: or error: line: warnings (ssh's about its key exchange, a redirect) come before what failed.
-func holdClass(diag []byte, ended string) (string, string) {
+// a class, not for each text Git printed: no credentials (credentialFailure); a certificate or ssh host key not
+// trusted; a transport cause (transportCauses); a remote that has no such repository or branch; a server's refusal
+// (another 4xx); another failure. A call its deadline ended has that deadline for its class instead (remoteFailure).
+// The line is the one that matched, else Git's last fatal: or error: line: warnings (ssh's about its key exchange, a
+// redirect) come before what failed.
+func holdClass(diag []byte) (string, string) {
 	var lines []string
 	for _, l := range strings.Split(string(diag), "\n") {
 		if l = strings.TrimSpace(l); l != "" {
@@ -994,9 +1033,6 @@ func holdClass(diag []byte, ended string) (string, string) {
 		if lower := strings.ToLower(l); strings.HasPrefix(lower, "fatal:") || strings.HasPrefix(lower, "error:") || last == "" {
 			last = l
 		}
-	}
-	if ended != "" {
-		return ended, last
 	}
 	match := func(f func(string) bool) (string, bool) {
 		for _, l := range lines {

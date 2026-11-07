@@ -109,7 +109,7 @@ func TestAHeldProposalReadClonesNothing(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	for _, line := range logged {
-		if strings.Contains(line, "waits for its base") && strings.Contains(line, "does not appear to be a git repository") {
+		if strings.Contains(line, "waits to read its proposal branch") && strings.Contains(line, "does not appear to be a git repository") {
 			return
 		}
 	}

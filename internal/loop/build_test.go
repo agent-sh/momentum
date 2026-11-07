@@ -524,9 +524,12 @@ func TestBuildScansAPublicBaseTheBranchNoLongerHolds(t *testing.T) {
 	run(t, other, "git", "commit", "-q", "-m", "purged")
 	run(t, other, "git", "push", "-q", "--force", "origin", "HEAD:main")
 	// the mirror fetches the purge, and the host clone is refreshed from it
-	tip, err := r.Ship.mirrorTip(ctx, p.Repo, p.Dir)
+	tip, lock, err := r.Ship.mirrorTip(ctx, p.Repo, p.Dir)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if lock != nil {
+		lock.Close()
 	}
 	if _, _, err := r.Ship.mirrorBase(ctx, p.Host, tip, true); err != nil {
 		t.Fatal(err)
