@@ -227,10 +227,10 @@ type Guard struct {
 	Cwds      []string `json:"-"`
 	Incidents int      `json:"incidents"` // in the history
 	Exposure  int      `json:"exposure"`  // units of exposure in the history
-	// Counted is when its plan was counted: the proposal's own time, or a hand landing's recount as of the landing. The
-	// count weighed the case's evidence dated before it (the own-tool check), and the watch reads the rest
-	// (guardEvidenceFrom), so each piece is weighed by one of the two.
-	Counted time.Time `json:"counted,omitzero"`
+	// Filed is the newest filing (store.Evidence.Added) of the case's evidence the count's rule has read: the count's,
+	// then each pass's of the watch (guardJudged), which judges by that rule what the detector filed since and dated
+	// before the landing. A package from before it was kept holds none, and its first pass judges all of its history.
+	Filed time.Time `json:"filed,omitzero"`
 }
 
 // guardFields is a Guard without its JSON methods.

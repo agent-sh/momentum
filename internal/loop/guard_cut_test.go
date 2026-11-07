@@ -12,66 +12,121 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// A guard's count and its watch weigh the case's evidence in turn, and each piece is weighed by exactly one of the
-// two (#110): the count weighs what is dated before it, here a hand landing's recount as of the landing, and the watch
-// the rest, from the landing on, through the stretch before the change took effect, and after its close. One incident
-// of Bash failures 20 days before a proposal admits a signal naming Bash with Bash as its unit; the change lands by
-// hand 20 days after the proposal, more than its 14-day window, so the landing counts the plan again, on a pass a day
-// and a half later; the change is first seen in effect two days after the landing. One more failure, of Bash or of
-// Edit, is filed as the case's evidence at each position, its event kept or lost from the store:
+// One instant, the change's landing, sorts a guard's case's evidence, and each piece is judged by exactly one rule,
+// whenever the detector filed it (#110). Dated before the landing, it is history: the count's rule judges it, at the
+// count when it was filed before, else on the watch's next pass; it never brings a recurrence or a rollback. Dated
+// from the landing on, it is a recurrence, the watch's, during the watch and after its close.
 //
-//   - before the landing (before the history, in it before the proposal, between the proposal and the landing), the
-//     recount weighs it: Bash kept leaves the guard, which closes as guarded after its watch; Edit, or an event lost,
-//     refuses it, and the change is measured by hand;
-//   - between the landing and the effect, and after the effect, the watch weighs it: kept, it is a recurrence and the
-//     case's rollback is held; lost, the watch passes over it (it cannot tell it from the loop's own), and the guard
-//     closes as guarded;
-//   - after the close, the watch after the close weighs it: kept, the case comes back; lost, it stays closed.
+// One incident of Bash failures 20 days before a proposal admits a signal naming Bash on its own-tool exemption, the
+// signal's source read two days short of the proposal (its boundary). The change lands three days after the proposal
+// as the loop lands one, or twenty days after it by hand, which counts the plan again as of the landing on a pass a day
+// and a half later; it is first seen in effect two days after the landing. One more failure, of Bash or of Edit, its
+// event kept or lost from the store, is dated before the boundary, between it and the proposal, between the proposal
+// and the landing, between the landing and the effect, after the effect, or after the close, and filed before the
+// count, after it before the watch, during the watch, or after the close, wherever its date allows:
 //
-// The piece between the landing and the effect was weighed by neither before (the recount cut at the landing, the
-// watch read from the effect).
-func TestEachPieceOfACasesEvidenceIsWeighedOnce(t *testing.T) {
+//   - dated before the landing: Bash kept leaves the guard, which closes as guarded; Edit, or an event lost, breaks the
+//     exemption, so the proposal's count refuses it, or the change is measured by hand (a recount's refusal, or the
+//     watch's judgment of what was filed after the count);
+//   - dated from the landing on: kept, it is a recurrence, its rollback held, or after the close the case comes back;
+//     lost, the watch passes over it (it cannot tell it from the loop's own) and the guard closes as guarded.
+//
+// History filed after the close is not judged: the close claimed nothing.
+func TestEachPieceOfACasesEvidenceIsJudgedByOneRule(t *testing.T) {
 	positions := []struct {
-		name string
-		at   func(proposed, landed, effect time.Time) time.Time
-		side string // the count's, the watch's, or the watch's after the close
+		name    string
+		at      func(c cutTimes) time.Time
+		history bool
 	}{
-		{"before the history", func(p, _, _ time.Time) time.Time { return p.Add(-60 * aDay) }, "count"},
-		{"in the history before the proposal", func(p, _, _ time.Time) time.Time { return p.Add(-10 * aDay) }, "count"},
-		{"between the proposal and the landing", func(p, _, _ time.Time) time.Time { return p.Add(10 * aDay) }, "count"},
-		{"between the landing and the effect", func(_, l, _ time.Time) time.Time { return l.Add(aDay) }, "landing"},
-		{"after the effect", func(_, _, e time.Time) time.Time { return e.Add(10 * aDay) }, "watch"},
-		{"after the close", func(_, _, e time.Time) time.Time { return e.Add(35 * aDay) }, "closed"},
+		{"before the boundary", func(c cutTimes) time.Time { return c.proposed.Add(-10 * aDay) }, true},
+		{"between the boundary and the proposal", func(c cutTimes) time.Time { return c.proposed.Add(-aDay) }, true},
+		{"between the proposal and the landing", func(c cutTimes) time.Time { return c.proposed.Add(c.landed.Sub(c.proposed) / 3) }, true},
+		{"between the landing and the effect", func(c cutTimes) time.Time { return c.landed.Add(aDay) }, false},
+		{"after the effect", func(c cutTimes) time.Time { return c.effect.Add(10 * aDay) }, false},
+		{"after the close", func(c cutTimes) time.Time { return c.effect.Add(35 * aDay) }, false},
 	}
-	for _, pos := range positions {
-		for _, tool := range []string{"Bash", "Edit"} {
-			for _, lost := range []bool{false, true} {
-				var want string
-				switch {
-				case pos.side == "count" && (tool == "Edit" || lost):
-					want = "measured by hand"
-				case pos.side == "count", lost:
-					want = "guarded"
-				case pos.side == "closed":
-					want = "back"
-				default:
-					want = "held"
+	for _, hand := range []bool{false, true} {
+		for _, pos := range positions {
+			for _, filing := range []string{cutBeforeCount, cutBeforeWatch, cutDuringWatch, cutAfterClose} {
+				times := cutTimesOf(hand)
+				dated := pos.at(times)
+				if !times.files(filing, dated, pos.history) {
+					continue
 				}
-				t.Run(fmt.Sprintf("%s, %s, lost %t", pos.name, tool, lost), func(t *testing.T) {
-					if got := weighedOnce(t, pos.at, pos.side, tool, lost); got != want {
-						t.Fatalf("its verdict: %s, want %s", got, want)
+				for _, tool := range []string{"Bash", "Edit"} {
+					for _, lost := range []bool{false, true} {
+						var want string
+						switch {
+						case pos.history && tool == "Bash" && !lost, !pos.history && lost:
+							want = "guarded"
+						case pos.history && !hand && filing == cutBeforeCount:
+							want = "refused"
+						case pos.history:
+							want = "measured by hand"
+						case filing == cutAfterClose:
+							want = "back"
+						default:
+							want = "held"
+						}
+						landing := map[bool]string{false: "landed by the loop", true: "landed by hand"}[hand]
+						t.Run(fmt.Sprintf("%s, dated %s, filed %s, %s, lost %t", landing, pos.name, filing, tool, lost), func(t *testing.T) {
+							if got := judgedOnce(t, times, dated, filing, tool, lost); got != want {
+								t.Fatalf("its verdict: %s, want %s", got, want)
+							}
+						})
 					}
-				})
+				}
 			}
 		}
 	}
 }
 
-// weighedOnce runs TestEachPieceOfACasesEvidenceIsWeighedOnce's case with one more failure of tool dated by at, filed
-// on the side's pass (before the proposal's count is read again for count and landing), its event lost from the store
-// when lost, and says what came of it: "measured by hand" (the recount refused the guard), "held" (a recurrence in the
-// watch), "back" (a recurrence after its close) or "guarded" (its close, and nothing after).
-func weighedOnce(t *testing.T, at func(proposed, landed, effect time.Time) time.Time, side, tool string, lost bool) string {
+// The filings of TestEachPieceOfACasesEvidenceIsJudgedByOneRule.
+const (
+	cutBeforeCount = "before the count"
+	cutBeforeWatch = "after the count, before the watch"
+	cutDuringWatch = "during the watch"
+	cutAfterClose  = "after the close"
+)
+
+// cutTimes are the instants of TestEachPieceOfACasesEvidenceIsJudgedByOneRule's change: its proposal, its landing, the
+// pass that counts a hand landing's plan again (count), and its first pass in effect, which starts its watch.
+type cutTimes struct {
+	hand                                 bool
+	proposed, landed, count, effect, end time.Time
+}
+
+func cutTimesOf(hand bool) cutTimes {
+	c := cutTimes{hand: hand, proposed: time.Now().Add(-365 * aDay).Truncate(time.Hour)}
+	c.landed, c.count = c.proposed.Add(3*aDay), c.proposed
+	if hand {
+		c.landed = c.proposed.Add(20 * aDay)
+		c.count = c.landed.Add(36 * time.Hour)
+	}
+	c.effect = c.landed.Add(2 * aDay)
+	c.end = c.effect.Add(guardRetention + time.Hour)
+	return c
+}
+
+// files says whether a piece of evidence so dated can be filed so: after its date, in that stretch, and history only
+// while the guard stands.
+func (c cutTimes) files(filing string, dated time.Time, history bool) bool {
+	switch filing {
+	case cutBeforeCount:
+		return dated.Before(c.count)
+	case cutBeforeWatch:
+		return dated.Before(c.effect)
+	case cutDuringWatch:
+		return dated.Before(c.end.Add(-time.Hour))
+	}
+	return !history
+}
+
+// judgedOnce runs a case of TestEachPieceOfACasesEvidenceIsJudgedByOneRule and says what came of it: "refused" (the
+// proposal's count refused the guard), "measured by hand" (a recount refused it, or the watch's judgment of what was
+// filed after the count ended it), "held" (a recurrence in the watch, its rollback held), "back" (a recurrence after the
+// close) or "guarded" (its close, and nothing after).
+func judgedOnce(t *testing.T, at cutTimes, dated time.Time, filing, tool string, lost bool) string {
 	t.Helper()
 	ctx := context.Background()
 	st, db := testStoreAt(t)
@@ -80,34 +135,13 @@ func weighedOnce(t *testing.T, at func(proposed, landed, effect time.Time) time.
 		Ship: &Ship{Store: st, Dir: dir, Identity: [2]string{"Owner Name", "owner@example.com"}}}}
 	m.r.Now = func() time.Time { return m.clock }
 	m.r.Ship.Now = m.r.Now
-	proposed := time.Now().Add(-365 * aDay).Truncate(time.Hour)
-	landed, effect := proposed.Add(20*aDay), proposed.Add(22*aDay)
+	m.planAt, m.deployed = at.proposed, at.landed
 	bash := serverSignal
 	bash.Tool = "Bash"
-	c := oneIncidentOf(t, st, proposed.Add(-5*aDay), proposed, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" })
+	c := oneIncidentOf(t, st, at.proposed.Add(-5*aDay), at.proposed, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" })
 	m.c = c
-	if err := st.MarkRead(ctx, toolSignal.Source, proposed); err != nil {
-		t.Fatal(err)
-	}
-	plan, err := m.r.Ship.validPlan(ctx, c, bash, 14*aDay, "", proposed)
-	if g, _ := guardOf(t, plan); err != nil || g == nil || g.Tool != "Bash" {
-		t.Fatalf("the proposal: %+v %v", g, err)
-	}
-	m.repo = filepath.Join(t.TempDir(), "repo")
-	run(t, t.TempDir(), "git", "init", "-q", "-b", "main", m.repo)
-	write(t, filepath.Join(m.repo, "a.txt"), "a\n")
-	run(t, m.repo, "git", "add", "-A")
-	run(t, m.repo, "git", "commit", "-q", "-m", "before the change")
-	write(t, filepath.Join(m.repo, "a.txt"), "b\n")
-	run(t, m.repo, "git", "commit", "-q", "-am", "the change")
-	head := strings.TrimSpace(run(t, m.repo, "git", "rev-parse", "HEAD"))
-	p := Package{Case: c.ID, Kind: "repo", Repo: "agent-sh/fake", Dir: m.repo, PR: "https://github.com/agent-sh/fake/pull/7", State: Proposed,
-		Head: head, Hand: []string{"a.txt"}, Plan: &plan}
-	if err := m.r.Ship.save(&p); err != nil {
-		t.Fatal(err)
-	}
 	// file is the detector filing the failure as the case's evidence, then, when lost, the store losing its event
-	ev := toolResult("cell", at(proposed, landed, effect), "cell", true)
+	ev := toolResult("cell", dated, "cell", true)
 	ev.Tool, ev.Cwd = tool, "/work/cell"
 	file := func() {
 		t.Helper()
@@ -130,45 +164,104 @@ func weighedOnce(t *testing.T, at func(proposed, landed, effect time.Time) time.
 			t.Fatalf("deleted %d events", n)
 		}
 	}
-	if side == "count" || side == "landing" {
+	// the proposal, its signal's source read through two days before it (its boundary)
+	if err := st.MarkRead(ctx, toolSignal.Source, at.proposed.Add(-2*aDay)); err != nil {
+		t.Fatal(err)
+	}
+	if !at.hand && filing == cutBeforeCount {
 		file()
 	}
-	// the landing's pass, a day and a half after it: the plan is counted again as of the landing
-	m.clock = landed.Add(36 * time.Hour)
-	m.scanned(t)
-	if c, err = st.CaseByID(ctx, c.ID); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.r.Ship.landHand(ctx, c, &p, head, landed); err != nil {
-		t.Fatal(err)
-	}
-	if p, _, err = m.r.Ship.Load(c.ID); err != nil {
-		t.Fatal(err)
-	} else if p.Plan.Guard == nil {
-		if p.Plan.Units != "" {
-			t.Fatalf("a recount with no guard measures: %+v", p.Plan)
+	plan, err := m.r.Ship.validPlan(ctx, c, bash, 14*aDay, "", at.proposed)
+	if g, _ := guardOf(t, plan); err != nil || g == nil {
+		if !at.hand && filing == cutBeforeCount {
+			return "refused"
 		}
-		return "measured by hand"
+		t.Fatalf("the proposal: %+v %v", g, err)
+	} else if g.Tool != "Bash" {
+		t.Fatalf("the proposal's guard: %+v", g)
 	}
-	// the first pass that sees the change in effect starts the watch
-	m.clock = effect
-	if got := m.pass(t, Options{}); got.Status != "measuring" {
-		return got.Status
+	m.repo = filepath.Join(t.TempDir(), "repo")
+	run(t, t.TempDir(), "git", "init", "-q", "-b", "main", m.repo)
+	write(t, filepath.Join(m.repo, "a.txt"), "a\n")
+	run(t, m.repo, "git", "add", "-A")
+	run(t, m.repo, "git", "commit", "-q", "-m", "before the change")
+	write(t, filepath.Join(m.repo, "a.txt"), "b\n")
+	run(t, m.repo, "git", "commit", "-q", "-am", "the change")
+	head := strings.TrimSpace(run(t, m.repo, "git", "rev-parse", "HEAD"))
+	p := Package{Case: c.ID, Kind: "repo", Repo: "agent-sh/fake", Dir: m.repo, PR: "https://github.com/agent-sh/fake/pull/7", Plan: &plan}
+	byHand := func() bool {
+		t.Helper()
+		got, _, err := m.r.Ship.Load(c.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Plan.Guard == nil && got.Plan.Units != "" {
+			t.Fatalf("a plan with no guard measures: %+v", got.Plan)
+		}
+		return got.Plan.Guard == nil
 	}
-	if side == "watch" {
+	if at.hand {
+		// landed by hand: the landing's pass counts the plan again as of the landing
+		p.State, p.Head, p.Hand = Proposed, head, []string{"a.txt"}
+		if err := m.r.Ship.save(&p); err != nil {
+			t.Fatal(err)
+		}
+		if filing == cutBeforeCount {
+			file()
+		}
+		m.clock = at.count
+		m.scanned(t)
+		if c, err = st.CaseByID(ctx, c.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.r.Ship.landHand(ctx, c, &p, head, at.landed); err != nil {
+			t.Fatal(err)
+		}
+		if byHand() {
+			return "measured by hand"
+		}
+	} else {
+		// landed by the loop, with the plan its proposal counted
+		p.State, p.Landed, p.LandedAt = Landed, []string{head}, at.landed
+		if err := m.r.Ship.save(&p); err != nil {
+			t.Fatal(err)
+		}
+		if m.c, err = st.DeployCase(ctx, c.ID, m.r.Ship.pkgDir(c.ID), at.landed, "landed", "test"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if filing == cutBeforeWatch {
 		file()
-		m.clock = ev.TS.Add(time.Hour)
-		if got := m.pass(t, Options{}); got.Status != "waiting" {
+	}
+	// pass is a pass of the measure step at a time, and what came of it when it decided something
+	pass := func(clock time.Time, quiet string) string {
+		t.Helper()
+		m.clock = clock
+		got := m.pass(t, Options{})
+		switch {
+		case byHand():
+			return "measured by hand"
+		case got.Status != quiet:
 			return got.Status
 		}
+		return ""
 	}
-	m.clock = effect.Add(guardRetention + time.Hour)
-	if got := m.pass(t, Options{}); got.Status != "guarded" {
-		return got.Status + ": " + got.Why
+	// the first pass that sees the change in effect starts the watch
+	if got := pass(at.effect, "measuring"); got != "" {
+		return got
 	}
-	if side == "closed" {
+	if filing == cutDuringWatch {
 		file()
-		m.clock = ev.TS.Add(time.Hour)
+		if got := pass(latest(dated, at.effect).Add(time.Hour), "waiting"); got != "" {
+			return got
+		}
+	}
+	if got := pass(at.end, "guarded"); got != "" {
+		return got
+	}
+	if filing == cutAfterClose {
+		file()
+		m.clock = latest(dated, at.end).Add(time.Hour)
 		ms, err := m.passes(t, Options{})
 		if err != nil {
 			t.Fatal(err)
@@ -185,15 +278,65 @@ func weighedOnce(t *testing.T, at func(proposed, landed, effect time.Time) time.
 	return "guarded"
 }
 
-// A guard's count and its watch meet where its plan was counted, for a change the loop landed too, with no recount at
-// its landing: an Edit failure dated a day after the proposal's count, the day before the landing, is the watch's, a
-// recurrence (#110). The count never saw it, and a watch from the landing or from the effect would not either.
-func TestALoopLandedGuardWeighsEvidenceAfterItsCount(t *testing.T) {
-	m := guarded(t, 2*aDay, toolSignal.Source, nil)
-	edit := toolResult("edit-after-count", m.planAt.Add(aDay), "edit-after-count", true)
-	edit.Tool, edit.Cwd = "Edit", "/work/e"
-	fileEvidence(t, m, edit)
-	if got := m.pass(t, Options{}); got.Status != "held" || !strings.Contains(got.Why, "regressed: its problem came back") {
-		t.Fatalf("evidence between the count and the landing: %+v", got)
+// The exposure watched of a guard whose case's evidence dated between its landing and its watch's start brings it back
+// leaves that recurrence's hour out: the change was not in effect then (guardWatched). Its use in the watch, Bash an
+// hour for a day, is the exposure watched, and nothing else.
+func TestAWatchLeavesOutTheHourOfARecurrenceBeforeItsStart(t *testing.T) {
+	ctx := context.Background()
+	at := cutTimesOf(false)
+	st, db := testStoreAt(t)
+	dir := t.TempDir()
+	m := &measured{st: st, db: db, r: &Runner{Store: st, Dir: dir, Budgets: DefaultBudgets,
+		Ship: &Ship{Store: st, Dir: dir, Identity: [2]string{"Owner Name", "owner@example.com"}}}}
+	m.r.Now = func() time.Time { return m.clock }
+	m.r.Ship.Now = m.r.Now
+	bash := serverSignal
+	bash.Tool = "Bash"
+	c := oneIncidentOf(t, st, at.proposed.Add(-5*aDay), at.proposed, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" })
+	m.c = c
+	if err := st.MarkRead(ctx, toolSignal.Source, at.proposed); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := m.r.Ship.validPlan(ctx, c, bash, 14*aDay, "", at.proposed)
+	if g, _ := guardOf(t, plan); err != nil || g == nil {
+		t.Fatalf("the proposal: %+v %v", g, err)
+	}
+	m.repo = filepath.Join(t.TempDir(), "repo")
+	run(t, t.TempDir(), "git", "init", "-q", "-b", "main", m.repo)
+	write(t, filepath.Join(m.repo, "a.txt"), "a\n")
+	run(t, m.repo, "git", "add", "-A")
+	run(t, m.repo, "git", "commit", "-q", "-m", "the change")
+	head := strings.TrimSpace(run(t, m.repo, "git", "rev-parse", "HEAD"))
+	p := Package{Case: c.ID, Kind: "repo", Repo: "agent-sh/fake", Dir: m.repo, PR: "https://github.com/agent-sh/fake/pull/7", State: Landed,
+		Landed: []string{head}, LandedAt: at.landed, Plan: &plan}
+	if err := m.r.Ship.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	if m.c, err = st.DeployCase(ctx, c.ID, m.r.Ship.pkgDir(c.ID), at.landed, "landed", "test"); err != nil {
+		t.Fatal(err)
+	}
+	m.clock = at.effect
+	if got := m.pass(t, Options{}); got.Status != "measuring" {
+		t.Fatalf("the first pass: %+v", got)
+	}
+	var uses []store.Event
+	for i := 0; i < 24; i++ {
+		uses = append(uses, serverUse(fmt.Sprint("w-", i), at.effect.Add(aDay+time.Duration(i)*time.Hour), "Bash"))
+	}
+	put(t, st, uses)
+	before := toolResult("before-start", at.landed.Add(aDay), "before-start", true)
+	before.Cwd = "/work/b"
+	fileEvidence(t, m, before)
+	m.clock = at.effect.Add(5 * aDay)
+	if p, _, err = m.r.Ship.Load(c.ID); err != nil {
+		t.Fatal(err)
+	}
+	want, err := guardExposure(ctx, st, *p.Plan, nil, p.GuardFrom, m.clock, m.r.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := m.pass(t, Options{})
+	if got.Status != "held" || got.Result == nil || got.Result.After.Base != len(want) || len(want) != 24 {
+		t.Fatalf("a recurrence before the watch's start: %+v, watched %+v, want %d", got, got.Result, len(want))
 	}
 }

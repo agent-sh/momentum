@@ -86,17 +86,22 @@ func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead e
 	for _, e := range hits {
 		counted["ev:"+e.ID()] = true
 	}
-	// own is the signal's tool when every event of the case's evidence dated before the count (countedAt) and still in
-	// the store is of it, the loop's own left out (caseEvents): its detector filed them, and no plan words them, so
+	// own is the signal's tool when every event of the case's evidence dated before the count (countedAt) is still in
+	// the store and of it, the loop's own left out (caseEvents): its detector filed them, and no plan words them, so
 	// naming a tool in the signal takes no tool past the two incidents (guardCandidates). It is read over no span back
 	// from the count: the history is four of the build's windows, so evidence of another tool outside it would drop out
 	// under a shorter one, and a span would lose, at a later recount (a hand landing's), the evidence the proposal saw.
-	// Evidence dated from the count on is the watch's (guardEvidenceFrom, from Guard.Counted): a hand landing's recount
-	// runs on a later pass, as of the landing. A case with no event of the store gets no guard (events, below). An
-	// event the store no longer holds is of no tool.
-	events, in, hit, own := 0, 0, 0, sig.Tool
+	// The case's evidence is history dated before the change's landing and a recurrence from it on (guardLanded): the
+	// proposal's count, before the landing, reads history alone, and a hand landing's recount runs on a later pass, as
+	// of the landing. What the detector files after the count and dates before the landing the watch judges by this
+	// rule on every pass (guardJudged), from the newest filing the count read (Guard.Filed). A case with no event of the
+	// store gets no guard (events, below). An event the store no longer holds is of no tool.
+	events, in, hit, own, filed := 0, 0, 0, sig.Tool, time.Time{}
 	for _, e := range evidence {
 		events++
+		if e.Added.After(filed) {
+			filed = e.Added
+		}
 		if own != "" && e.At.Before(countedAt) && (!e.Found || e.Event.Tool != own) {
 			own = ""
 		}
@@ -139,7 +144,7 @@ func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead e
 	var bestC guardCandidate
 	var bestH measure.GuardHistory
 	for _, cand := range cands {
-		g.Guard = &Guard{Instead: why, Gap: measure.GuardGap, Units: units, Unit: cand.unit, Tools: cand.tools, Server: cand.server, Cwds: cand.cwds, Begun: since, Anchored: anchored, Counted: countedAt}
+		g.Guard = &Guard{Instead: why, Gap: measure.GuardGap, Units: units, Unit: cand.unit, Tools: cand.tools, Server: cand.server, Cwds: cand.cwds, Begun: since, Anchored: anchored, Filed: filed}
 		h, err := guardHistoryOf(ctx, s.Store, g, hits, since, at, s.Dir, anchored)
 		if err != nil {
 			return Plan{}, err
@@ -199,13 +204,12 @@ func (c guardCandidate) holds(o guardCandidate) bool {
 //
 // A tool found by its events, alone or in a set, must be in two or more of the history's incidents, but the signal's
 // own (own), which every event is of by the signal's definition, and which guardPlan passes only when every event of
-// the case's evidence dated before the count and still in the store is of it too: the plan's word alone would take any
-// tool past. The incidents are the history's
-// independent draws: events of one incident share a cause (measure.Incidents), so a tool one incident alone holds may
-// be where that cause happened to surface, and its hours would count activity in general as the problem's unit in
-// use. A server takes no such bound: it is defined by the server, not by which of its tools failed, and holds no
-// built-in tool. none says why there is no candidate, when there is none: then every activity would count as the
-// problem's unit in use.
+// the case's evidence dated before the count is still in the store and of it too: the plan's word alone would take any
+// tool past. The incidents are the history's independent draws: events of one incident share a cause
+// (measure.Incidents), so a tool one incident alone holds may be where that cause happened to surface, and its hours
+// would count activity in general as the problem's unit in use. A server takes no such bound: it is defined by the
+// server, not by which of its tools failed, and holds no built-in tool. none says why there is no candidate, when
+// there is none: then every activity would count as the problem's unit in use.
 func guardCandidates(units, own string, hits []store.Event) (cands []guardCandidate, none string) {
 	// of is the members events are of, and the incidents each is in, or nil when one event is of none
 	times := make([]time.Time, len(hits))
@@ -317,7 +321,7 @@ func guardCandidates(units, own string, hits []store.Event) (cands []guardCandid
 	default:
 		whys = append(whys, fmt.Sprintf("of %d MCP servers", len(fields)))
 	}
-	return nil, fmt.Sprintf("no unit holds all its events (%s: a tool, alone or in a set, is in two incidents or more, the signal's own too unless every event of the case's evidence dated before the count and still in the store is of it; a directory is every event's own; an MCP server is the one every event's tool is of, a connector of codex_apps where one holds them all), so absence cannot be counted only while the problem's unit was in use",
+	return nil, fmt.Sprintf("no unit holds all its events (%s: a tool, alone or in a set, is in two incidents or more, the signal's own too unless every event of the case's evidence dated before the count is still in the store and of it; a directory is every event's own; an MCP server is the one every event's tool is of, a connector of codex_apps where one holds them all), so absence cannot be counted only while the problem's unit was in use",
 		strings.Join(whys, "; "))
 }
 
@@ -449,36 +453,99 @@ func guardExposure(ctx context.Context, st *store.Store, plan Plan, hits []store
 }
 
 // guardRecurrences are a guard's recurrences: the events its signal counts from its watch's start (from), and the
-// events of the case's own evidence dated from when its plan was counted (guardEvidenceFrom, guardEvidence), the
-// loop's own left out of both by one rule (store.InDir, the counts' ExcludeCwd). They need only the signal and the
-// case, never a read.
-func (r *Runner) guardRecurrences(ctx context.Context, c store.Case, plan Plan, from time.Time) ([]store.Event, error) {
+// events of the case's own evidence dated from its change's landing (guardLanded, guardEvidence), the loop's own left
+// out of both by one rule (store.InDir, the counts' ExcludeCwd). They need only the signal and the case, never a read.
+func (r *Runner) guardRecurrences(ctx context.Context, c store.Case, p *Package, plan Plan, from time.Time) ([]store.Event, error) {
 	back, err := recurrences(ctx, r.Store, plan, from, time.Time{}, r.Dir)
 	if err != nil {
 		return nil, err
 	}
-	return r.guardEvidence(ctx, c, guardEvidenceFrom(c, plan, from), back)
+	return r.guardEvidence(ctx, c, guardLanded(p, from), back)
 }
 
-// guardEvidenceFrom is where a guard's watch reads the case's own evidence from: when its plan was counted
-// (Guard.Counted), since the count weighed the evidence dated before then (the own-tool check, guardPlan), so each
-// piece is weighed by one of the two; for a plan from before that was kept, the landing (the case's Deployed), where a
-// hand landing's recount counts; never after the watch's start. A recurrence before the watch's start is one while the
-// change is out of effect, which counts too, and its hours are no exposure watched (guardWatched).
-func guardEvidenceFrom(c store.Case, plan Plan, start time.Time) time.Time {
-	from := c.Deployed
-	if plan.Guard != nil && !plan.Guard.Counted.IsZero() {
-		from = plan.Guard.Counted
-	}
-	if from.IsZero() {
+// guardLanded is the one instant that sorts a guard's case's evidence: its change's landing (Package.LandedAt), which
+// never moves. Dated before it, a piece is history, judged by the count's rule (guardPlan at the count, guardJudged on
+// every pass of the watch for what is filed later), never a recurrence. Dated from it on, it is a recurrence, the
+// watch's, under the out-of-effect rule until the watch's start (from): it counts, and its hours are no exposure
+// watched (guardWatched). A package with no landing time reads from the watch's start.
+func guardLanded(p *Package, start time.Time) time.Time {
+	if p == nil || p.LandedAt.IsZero() {
 		return start
 	}
-	return earlier(from, start)
+	return earlier(p.LandedAt, start)
 }
 
-// guardEvidence adds to back the events of the case's own evidence dated from from (guardEvidenceFrom: the detector
-// may file the problem by the case's signature in a form the signal does not count), but those back holds and the
-// loop's own. An event the store no longer holds is passed over: the watch cannot tell it from the loop's own, and a
+// guardJudged applies a guard's count rule again, on a pass of its watch, to the case's evidence the detector filed
+// since the rule last read it (Guard.Filed) and dated before the change's landing (guardLanded): history, whenever it
+// was filed, so never a recurrence. Where the guard's unit is its signal's own tool, which stood on the exemption (in
+// fewer than two incidents, guardCandidates), a piece of another tool, or one the store no longer holds, ends it as a
+// refused count would: why says so. filed is the newest filing it read.
+func guardJudged(ctx context.Context, st *store.Store, c store.Case, p *Package, dir string) (why string, filed time.Time, err error) {
+	g := p.Plan.Guard
+	evidence, err := caseEvents(ctx, st, c.ID, dir)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	own := p.Plan.Signal.Tool
+	exempt := own != "" && slices.Equal(g.Tools, []string{own}) && g.Incidents < 2
+	filed = g.Filed
+	for _, e := range evidence {
+		if !e.Added.After(g.Filed) {
+			continue
+		}
+		if e.Added.After(filed) {
+			filed = e.Added
+		}
+		if !exempt || why != "" || !p.LandedAt.IsZero() && !e.At.Before(p.LandedAt) {
+			continue // no exemption to break, broken already, or a recurrence, the watch's
+		}
+		at := e.At.UTC().Format(time.DateTime)
+		switch {
+		case !e.Found:
+			why = fmt.Sprintf("an event of the case's evidence dated %s, before the landing and filed after its count, is no longer in the store", at)
+		case e.Event.Tool != own:
+			why = fmt.Sprintf("the case's evidence holds an event of %s dated %s, before the landing and filed after its count", firstOf(e.Event.Tool, "no tool"), at)
+		}
+	}
+	return why, filed, nil
+}
+
+// guardByHand is the measure step's judgment, on every pass of a guard's watch, of the case's evidence filed late
+// (guardJudged): when the count's rule no longer admits the guard, the change is left to be measured by hand, as a
+// refused count leaves it (landHand), never as a recurrence, never with a rollback; the case goes back to deployed from
+// its landing, its guard's columns gone. Else the rule's filing cursor moves on. done says the pass ends here.
+func (r *Runner) guardByHand(ctx context.Context, c store.Case, p *Package, m Measured, dry bool) (Measured, bool) {
+	failed := func(err error) (Measured, bool) { m.Status, m.Why = "failed", err.Error(); return m, true }
+	why, filed, err := guardJudged(ctx, r.Store, c, p, r.Dir)
+	if err != nil {
+		return failed(err)
+	}
+	if why == "" {
+		if !dry && filed.After(p.Plan.Guard.Filed) {
+			p.Plan.Guard.Filed = filed
+			if err := r.Ship.save(p); err != nil {
+				return failed(err)
+			}
+		}
+		return m, false
+	}
+	why = "its guard's own-tool exemption no longer holds, as a count now would refuse it: " + why
+	m.Status, m.Why = "held", why+"; it is measured by hand"
+	if dry {
+		return m, true
+	}
+	if _, err := r.Store.MeasureByHand(ctx, c.ID, p.LandedAt, why, "loop:measure"); err != nil {
+		return failed(err)
+	}
+	p.Plan.Units, p.Plan.Guard = "", nil
+	if err := r.Ship.save(p); err != nil {
+		return failed(err)
+	}
+	return m, true
+}
+
+// guardEvidence adds to back the events of the case's own evidence dated from from (guardLanded: the detector may file
+// the problem by the case's signature in a form the signal does not count), but those back holds and the loop's own. An event the store no longer holds is passed over: the watch cannot tell it from the loop's own, and a
 // recurrence rolls a landed change back, where the count, for which a refusal costs only the guard, takes it as of no
 // tool.
 func (r *Runner) guardEvidence(ctx context.Context, c store.Case, from time.Time, back []store.Event) ([]store.Event, error) {
@@ -511,7 +578,7 @@ func (r *Runner) guardEvidence(ctx context.Context, c store.Case, from time.Time
 // guardWatched is a guard's exposure watched over a span: its exposure, less the units in the stretches its change
 // was out of effect (Package.GuardAway), and in the one it is out of effect now, to the span's end.
 func guardWatched(ctx context.Context, st *store.Store, p *Package, plan Plan, hits []store.Event, since, until time.Time, dir string) (map[store.Unit]bool, error) {
-	// a recurrence before the watch's start (guardEvidenceFrom) came while the change was out of effect: no hour watched
+	// a recurrence before the watch's start (guardLanded) came while the change was out of effect: no hour watched
 	hits = slices.DeleteFunc(slices.Clone(hits), func(e store.Event) bool { return e.TS.Before(since) })
 	units, err := guardExposure(ctx, st, plan, hits, since, until, dir)
 	if err != nil {
@@ -723,8 +790,8 @@ func (r *Runner) guardRegressed(ctx context.Context, c store.Case, p *Package, p
 }
 
 // guardCase is the measure step for a measuring case whose plan is a guard, once its change is in effect. Any event
-// its signal counts, or of the case's own evidence, from the watch's first start is a recurrence (guardRegressed): that
-// is counted before any wait. The watch ends 30 days (guardRetention) after its first start, on the first pass after
+// its signal counts from the watch's first start, or of the case's own evidence dated from the landing (guardLanded),
+// is a recurrence (guardRegressed): that is counted before any wait. The watch ends 30 days (guardRetention) after its first start, on the first pass after
 // each live source of its plan has read past that, or is left out (guardBehind); then, with no recurrence, it closes
 // the case as guarded, never improved, with its history counted again and the exposure watched (its stretches out of
 // effect left out), both over the sources it kept (guardCounted), and P, had the problem kept happening, or that it
@@ -746,7 +813,7 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 	}
 	// no date bounds it: an event stored by now and dated past the pass's clock is one too, and the next pass reads
 	// what is stored after the sequence
-	if back, err := r.guardRecurrences(ctx, c, plan, from); err != nil {
+	if back, err := r.guardRecurrences(ctx, c, p, plan, from); err != nil {
 		return failed(err)
 	} else if len(back) > 0 {
 		return r.guardRegressed(ctx, c, p, plan, m, back, from, now, dry)
@@ -861,8 +928,8 @@ const guardLostTitle = "momentum cannot watch a guarded case's signal: "
 
 // guardLost is the watch of a case closed as guarded whose package is gone, or holds no plan or guard (a build from
 // before guards saved it, and wrote its plan back without one): with no plan its signal cannot be read, so the case's
-// own evidence alone is, from its watch's start (the case's in-effect time, where the watch started), by the rule
-// guardEvidence keeps, the loop's own left out. An event of it brings the case back regressed, with a decided note.
+// own evidence alone is, from its change's landing when its package keeps it (guardLanded), else from its watch's
+// start (the case's in-effect time, the one instant left), by the rule guardEvidence keeps, the loop's own left out. An event of it brings the case back regressed, with a decided note.
 // While there is none, a problem note says its signal is not watched, and that case reopen brings it back by hand.
 func (r *Runner) guardLost(ctx context.Context, c store.Case, p Package, has, dry bool) (Measured, bool) {
 	m := Measured{Case: c.ID, Title: c.Title, PR: p.PR, Guarded: true}
@@ -874,15 +941,19 @@ func (r *Runner) guardLost(ctx context.Context, c store.Case, p Package, has, dr
 	case has:
 		lost = "its package's plan holds no guard (a build from before guards saved it)"
 	}
-	back, err := r.guardEvidence(ctx, c, c.Deployed, nil)
+	from := c.Deployed
+	if has {
+		from = guardLanded(&p, c.Deployed)
+	}
+	back, err := r.guardEvidence(ctx, c, from, nil)
 	if err != nil {
 		return failed(err)
 	}
 	if len(back) == 0 {
 		if !dry {
 			title := guardLostTitle + c.Title
-			detail := fmt.Sprintf("The case closed as guarded, and %s, so its signal is not read: only an event of the case's own evidence from its watch's start, %s, brings it back. "+
-				"To bring it back on other evidence: momentum case reopen %s --evidence REF --why WHY.", lost, c.Deployed.UTC().Format(time.DateTime), c.ID)
+			detail := fmt.Sprintf("The case closed as guarded, and %s, so its signal is not read: only an event of the case's own evidence dated from %s brings it back. "+
+				"To bring it back on other evidence: momentum case reopen %s --evidence REF --why WHY.", lost, from.UTC().Format(time.DateTime), c.ID)
 			if has {
 				p.Case = c.ID
 				r.problem(ctx, &p, title, detail)
@@ -930,8 +1001,8 @@ func (r *Runner) guardLostNote(ctx context.Context, caseID, title, detail string
 }
 
 // guardBack is the watch of a case closed as guarded: the guard said its problem would not come back, so the first
-// event its signal counts from the watch's first start, or of the case's own evidence dated from then, brings the case
-// back, regressed, with a decided note. The case store leaves a guarded case's evidence to it. It reads the case's
+// event its signal counts from the watch's first start, or of the case's own evidence dated from the landing
+// (guardLanded), brings the case back, regressed, with a decided note. The case store leaves a guarded case's evidence to it. It reads the case's
 // evidence on every pass, and the signal's rows the store wrote or rewrote since the last (Package.GuardSeq, the store's
 // write sequence): an event dated inside the watch and stored after the close counts, and so does a row rewritten
 // into a form the signal counts. While the signal's source is stopped, a problem note says no recurrence can be seen.
@@ -952,7 +1023,7 @@ func (r *Runner) guardBack(ctx context.Context, c store.Case, p *Package, plan P
 	}
 	// the case's own evidence on every pass, whatever the sequence says: evidence filed between the closing pass's
 	// read and its close is read now
-	back, err := r.guardEvidence(ctx, c, guardEvidenceFrom(c, plan, guardStart(c, p)), nil)
+	back, err := r.guardEvidence(ctx, c, guardLanded(p, guardStart(c, p)), nil)
 	if err != nil {
 		return failed(err)
 	}

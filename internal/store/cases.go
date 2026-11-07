@@ -417,8 +417,9 @@ func addEvidence(ctx context.Context, q querier, id string, evs []Evidence, now 
 // comesBack decides whether a closed case comes back on the evidence it holds now, and says why either way.
 //   - A case closed as improved does not come back on its evidence: the measure step watches its signal, in the
 //     units its measurement counted, and brings it back at its old rate (RegressCase).
-//   - Nor does one closed as guarded: the measure step's watch reads its signal and its evidence from the watch's start
-//     on every pass, by the rule the watch used, and brings it back (RegressCase). Only an event counts there: evidence
+//   - Nor does one closed as guarded: the measure step's watch reads its signal from the watch's start and its
+//     evidence dated from its change's landing on every pass, by the rule the watch used, and brings it back
+//     (RegressCase); its evidence dated before the landing is history, never a recurrence. Only an event counts there: evidence
 //     of another kind (a note, a commit, a file, an address) brings it back only by hand (ReopenCase).
 //   - A case closed as already solved comes back on any evidence after the close, or after its fix was named when
 //     that came after the close (CloseFixed on a case closed before a close named its fix).
@@ -431,9 +432,10 @@ func comesBack(ctx context.Context, q querier, c Case, now time.Time) (bool, str
 		return n, err
 	}
 	if c.Reason == Guarded {
-		// one rule decides a guarded case's evidence: the measure step's watch after the close, which reads its events on
-		// every pass from the watch's start and leaves the loop's own out, as the watch did; it reads no other evidence
-		return false, "a guarded case's evidence is the measure step's watch to read: an event of it from the watch's start brings the case back, " +
+		// one rule decides a guarded case's evidence: the measure step's watch after the close, which reads its events
+		// dated from the change's landing on every pass and leaves the loop's own out, as the watch did; it reads no other
+		// evidence, and an event dated before the landing is history
+		return false, "a guarded case's evidence is the measure step's watch to read: an event of it dated from its change's landing brings the case back, " +
 			"and evidence that is no event does not (case reopen brings the case back by hand)", nil
 	}
 	from, since := c.Closed, "it closed as "+strings.ReplaceAll(string(c.Reason), "-", " ")
@@ -1590,6 +1592,47 @@ func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, 
 	return c, tx.Commit()
 }
 
+// MeasureByHand is the measure tool's: a deployed or measuring case whose guard no longer stands (evidence filed after
+// its count and dated before its landing breaks the count's rule) is left to be measured by hand, as a refused count
+// leaves one: a measuring one goes back to deployed, from its landing (landed, or its deployed time when none), with no
+// measurement or guard column, since they were its guard's; a deployed one keeps its columns, of a change before it.
+// Its log line says why, under "measured by hand".
+func (s *Store) MeasureByHand(ctx context.Context, id string, landed time.Time, why, actor string) (Case, error) {
+	why, err := cleanText(ctx, why)
+	if err != nil {
+		return Case{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Case{}, err
+	}
+	defer tx.Rollback()
+	c, err := getCase(ctx, tx, id)
+	if err != nil {
+		return Case{}, err
+	}
+	if c.Status != CaseDeployed && c.Status != CaseMeasuring {
+		return Case{}, badCase("case %s is %s: only a deployed or measuring case is left to be measured by hand", c.ID, c.Status)
+	}
+	now := time.Now()
+	if c.Status == CaseMeasuring {
+		if landed.IsZero() {
+			landed = c.Deployed
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, deployed = ?, `+clearMeasurement+`, updated = ? WHERE id = ?`,
+			CaseDeployed, landed.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
+			return Case{}, err
+		}
+	}
+	if err := caseLogCleaned(ctx, tx, c.ID, actor, "measured by hand", why, now); err != nil {
+		return Case{}, err
+	}
+	if c, err = getCase(ctx, tx, c.ID); err != nil {
+		return Case{}, err
+	}
+	return c, tx.Commit()
+}
+
 // StartMeasuring is the measure tool's: a deployed case goes to measuring once its change is in effect, from, with
 // its measurement's window and the signal's count over the window before its change, which the window after it is
 // compared with. The window after counts from then: the case's deployed time becomes it.
@@ -1736,8 +1779,8 @@ const clearMeasurement = `guard_exposure = 0, guard_watched = 0, guard_recur = 0
 // exposure watched, the predictive probability that the problem, had it kept happening, would have recurred within
 // them (0 when the history gives no rate or nothing was watched), and the watch in words. Its log line adds sources,
 // when given: the sources it left out of its counts, which no other record names. The case store leaves its evidence
-// to the measure step: the watch after the close brings it back (RegressCase) at the first event of its signal, or of
-// its own evidence, from the watch's start.
+// to the measure step: the watch after the close brings it back (RegressCase) at the first event of its signal from
+// the watch's start, or of its own evidence dated from its change's landing.
 func (s *Store) CloseGuarded(ctx context.Context, id string, incidents, exposure, watched int, recur float64, effect, sources, actor string) (Case, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

@@ -175,6 +175,7 @@ func TestTheGuardsLivenessOverSimulatedHistories(t *testing.T) {
 		{recur: "during"}, {recur: "during", live: true}, {recur: "during", signalStop: true},
 		{recur: "after"}, {recur: "after", live: true}, {recur: "after", signalStop: true},
 		{recur: "evidence"}, {recur: "evidence", live: true}, {recur: "sighting"}, {partial: true},
+		{late: true}, {recur: "evidence", late: true}, {recur: "during", late: true},
 	}
 	for i, h := range histories {
 		h.seed = uint64(8000 + i)
@@ -194,11 +195,14 @@ type simHistory struct {
 	unused     bool   // the unit unused from the landing on
 	signalStop bool   // the signal's own source switched off for one to six days
 	partial    bool   // the signal's own source reads only in part from the watch's end on, its failed files in the watch
+	late       bool   // the detector files late: an "evidence" recurrence up to three days after it is stored, and a failure
+	// dated between the plan and the landing, of the signal's tool or another, as the case's evidence inside the watch,
+	// which is history and no recurrence
 }
 
 func (h simHistory) String() string {
 	name := fmt.Sprint(h.seed, "-", map[string]string{"": "quiet"}[h.recur], h.recur)
-	for flag, on := range map[string]bool{"live": h.live, "idle": h.idle, "unused": h.unused, "signal-stop": h.signalStop, "partial": h.partial} {
+	for flag, on := range map[string]bool{"live": h.live, "idle": h.idle, "unused": h.unused, "signal-stop": h.signalStop, "partial": h.partial, "late": h.late} {
 		if on {
 			name += "-" + flag
 		}
@@ -306,6 +310,16 @@ func simulateGuard(t *testing.T, h simHistory) {
 	if !slices.Contains(plan.Sources, store.Sessions) || !slices.Contains(plan.Sources, "zz-other") || slices.Contains(plan.Sources, "zz-late") {
 		t.Fatalf("the plan's sources: %v, left out %v", plan.Sources, plan.Omitted)
 	}
+	// a failure dated between the plan and the landing, stored then: history, which the detector files inside the watch
+	var historyLate store.Event
+	if h.late {
+		historyLate = toolResult("history-late", plan0.Add(between(time.Hour, landed.Sub(plan0)-time.Hour)), "history-late", true)
+		if rng.IntN(2) == 0 {
+			historyLate.Tool = "Edit"
+		}
+		put(t, st, []store.Event{historyLate})
+		signalStored = append(signalStored, historyLate)
+	}
 	pkg := Package{Case: c.ID, Kind: "repo", Repo: "agent-sh/fake", Base: "main", Dir: repo, Host: host, BaseCommit: base, PR: "https://github.com/agent-sh/fake/pull/7",
 		State: Landed, Landed: []string{head}, LandedAt: landed, Changed: []string{"a.txt"}, Plan: &plan}
 	if err := ship.save(&pkg); err != nil {
@@ -360,7 +374,9 @@ func simulateGuard(t *testing.T, h simHistory) {
 	shown := map[string]time.Time{}
 	var pending, deferred []store.Event
 	raw, evidence := map[string]bool{}, map[string]bool{}
-	var guardFrom, end, closedAt, recurDated, recurStoreAt, recurStored, took, partialAfterEnd time.Time
+	var guardFrom, end, closedAt, recurDated, recurStoreAt, recurStored, took, partialAfterEnd, recurFileAt, historyFileAt time.Time
+	var lateRecur store.Event // an "evidence" recurrence stored and not yet filed
+	recurMade := false        // the recurrence is stored
 	recurRaw, deployed, effect, woke, closed := false, false, true, false, false
 	acted := "" // the case's status on the first pass after its recurrence was stored
 	// scanned records a scan of a source that read all it reads, at the time it shows everything dated before (for the
@@ -373,13 +389,18 @@ func simulateGuard(t *testing.T, h simHistory) {
 	}
 	storeEvents := func(at time.Time) {
 		t.Helper()
-		if !recurStoreAt.IsZero() && recurStored.IsZero() && !at.Before(recurStoreAt) && !signalOff {
+		if !recurStoreAt.IsZero() && !recurMade && !at.Before(recurStoreAt) && !signalOff {
+			recurMade = true
 			e := toolResult("recurrence", recurDated, "recurrence", true)
+			late := h.recur == "evidence" && h.late
 			if h.recur == "evidence" {
 				e.Summary = "Exit code 1 zz-tool-crashed: the tool failed" // a form the signal does not count
-				evidence[e.ID()] = true
+				evidence[e.ID()] = !late
 			}
 			pending, raw[e.ID()], recurStored = append(pending, e), recurRaw, at
+			if late { // filed later: what the watch acts on is the filing
+				lateRecur, recurStored, recurFileAt = e, time.Time{}, at.Add(between(0, 3*aDay))
+			}
 			t.Logf("a recurrence dated +%s stored at +%s", recurDated.Sub(plan0), at.Sub(plan0))
 		}
 		var evs []store.Event
@@ -407,6 +428,16 @@ func simulateGuard(t *testing.T, h simHistory) {
 		}
 		put(t, st, evs)
 		pending = nil
+		if lateRecur.Source != "" && !at.Before(recurFileAt) { // the detector files the recurrence late
+			filed, recurStored = append(filed, store.Evidence{Ref: "ev:" + lateRecur.ID()}), at
+			t.Logf("the recurrence filed at +%s", at.Sub(plan0))
+			lateRecur = store.Event{}
+		}
+		if historyLate.Source != "" && !historyFileAt.IsZero() && !at.Before(historyFileAt) { // and history late
+			filed = append(filed, store.Evidence{Ref: "ev:" + historyLate.ID()})
+			t.Logf("history of %s dated +%s filed at +%s", historyLate.Tool, historyLate.TS.Sub(plan0), at.Sub(plan0))
+			historyLate = store.Event{}
+		}
 		if len(filed) > 0 { // the detector files it by the case's signature
 			if _, _, err := st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: signature, Title: "the tool fails", Evidence: filed}, "detector"); err != nil {
 				t.Fatal(err)
@@ -572,6 +603,9 @@ func simulateGuard(t *testing.T, h simHistory) {
 			case "during", "evidence":
 				recurDated = guardFrom.Add(between(time.Hour, 29*aDay))
 				recurStoreAt, recurRaw = recurDated.Add(between(0, 2*aDay)), h.recur == "during" && rng.IntN(10) < 3
+			}
+			if h.late {
+				historyFileAt = guardFrom.Add(between(aDay, 25*aDay))
 			}
 		}
 		switch {
