@@ -1685,19 +1685,28 @@ func (s *Ship) gitInput(ctx context.Context, dir string, input []byte, args ...s
 	if err != nil {
 		diag := strings.TrimSpace(errOut.String())
 		if cctx.Err() != nil {
-			return out.String(), &shipGitError{text: fmt.Sprintf("git %s: %s: %s", strings.Join(args, " "), endedBy(cctx), diag), diag: diag, ended: true}
+			return out.String(), &shipGitError{text: fmt.Sprintf("git %s: %s: %s", strings.Join(args, " "), endedBy(cctx), diag), diag: diag, ended: endedBy(cctx)}
 		}
 		return out.String(), &shipGitError{text: fmt.Sprintf("git %s: %v: %s", strings.Join(args, " "), err, diag), diag: diag, err: err}
 	}
 	return out.String(), nil
 }
 
-// shipGitError is a ship Git call that ran and failed: its text (the call, how it ended and Git's diagnostics), whether
-// a deadline ended it, and the diagnostics, which say whether a remote answered (fetchBase).
+// baseOutage is a build whose base cannot be fetched now, held for the pass (shipHold): its repository and its class,
+// which its note names, and the first line of Git's diagnostics, which only the pass's log gets, scrubbed. It is a
+// refusal to the ship tool's callers, as every hold is.
+type baseOutage struct{ repo, class, first string }
+
+func (e *baseOutage) Error() string {
+	return fmt.Sprintf("%v: the default branch of %s cannot be fetched now (%s)", ErrRefused, e.repo, e.class)
+}
+func (e *baseOutage) Unwrap() error { return ErrRefused }
+
+// shipGitError is a ship Git call that ran and failed: its text (the call, how it ended and Git's diagnostics), the
+// deadline that ended it, if one did (endedBy), and the diagnostics, which say whether a remote answered (fetchBase).
 type shipGitError struct {
-	text, diag string
-	ended      bool
-	err        error
+	text, diag, ended string
+	err               error
 }
 
 func (e *shipGitError) Error() string { return e.text }
@@ -1710,12 +1719,14 @@ func (e *shipGitError) Unwrap() error { return e.err }
 // name with the GitHub CLI's credentials (githubURL), so no ssh agent is asked for a key. A call the remote answered
 // (remoteAnswered: a repository, a branch or access it does not have) fails as the build's own, and so does a refusal
 // of the host clone; any other failure, a deadline's among them, is an outage, which holds the build for the pass,
-// without a run or a charge. The hold names no cause: its note stays one note, whatever the network did.
+// without a run or a charge. The hold names the failure's class (holdClass), not Git's text, so its note stays one
+// note per class whatever the network printed; the text's first line goes to the pass's log (baseOutage).
 func (s *Ship) fetchBase(ctx context.Context, host, repo, known string) (string, string, error) {
 	hold := func(err error) error {
 		var failed *shipGitError
-		if errors.As(err, &failed) && (failed.ended || !remoteAnswered([]byte(failed.diag))) {
-			return &shipHold{err: refused("the default branch of %s cannot be fetched now", repo)}
+		if errors.As(err, &failed) && (failed.ended != "" || !remoteAnswered([]byte(failed.diag))) {
+			first, _, _ := strings.Cut(strings.TrimSpace(failed.diag), "\n")
+			return &shipHold{err: &baseOutage{repo: repo, class: holdClass([]byte(failed.diag), failed.ended), first: strings.TrimSpace(first)}}
 		}
 		return err
 	}

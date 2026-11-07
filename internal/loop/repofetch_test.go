@@ -619,7 +619,8 @@ if [ "$n" = 2 ]; then sh -c "$last" | { head -c 65536; exec sleep 60; }; else ex
 	}
 }
 
-// A mirror holding the locks and temporary files of a fetch or a repack killed outright is fetched into all the same.
+// A mirror holding the locks, temporary files and keep file of a fetch or a repack killed outright is fetched into all
+// the same, and loses them; a keep file of anyone else's stays.
 func TestStaleLocksOfAKilledFetchAreRemoved(t *testing.T) {
 	goodInputScrubber(t)
 	f := newRepo(t, nil)
@@ -633,6 +634,10 @@ func TestStaleLocksOfAKilledFetchAreRemoved(t *testing.T) {
 	for _, p := range stale {
 		write(t, filepath.Join(mirror, p), "")
 	}
+	// index-pack's keep file for a fetch that never named its pack, and a keep file a person wrote
+	stale = append(stale, "objects/pack/pack-1234.keep")
+	write(t, filepath.Join(mirror, "objects/pack/pack-1234.keep"), "fetch-pack 4242 on fixture\n")
+	write(t, filepath.Join(mirror, "objects/pack/pack-5678.keep"), "kept by hand\n")
 	tip := pushOther(t, f, "main", map[string]string{"later.txt": "merged later\n"})
 	got, err := snapshotPass(context.Background(), parent, "second", f.main)
 	if err != nil || got[0].Commit != tip || got[0].Fallback != "" {
@@ -642,6 +647,9 @@ func TestStaleLocksOfAKilledFetchAreRemoved(t *testing.T) {
 		if _, err := os.Lstat(filepath.Join(mirror, p)); !os.IsNotExist(err) {
 			t.Errorf("%s remains", p)
 		}
+	}
+	if _, err := os.Stat(filepath.Join(mirror, "objects/pack/pack-5678.keep")); err != nil {
+		t.Errorf("a keep file a person wrote was removed: %v", err)
 	}
 }
 

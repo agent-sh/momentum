@@ -131,18 +131,26 @@ func TestAFetchThatOutlivesItsPassKeepsItsFiles(t *testing.T) {
 		files[fmt.Sprintf("f%03d.txt", i)] = randomText(t, 200)
 	}
 	f := newRepo(t, files)
-	// an ssh that runs the origin's upload-pack here, and stalls the first fetch after 64 KiB of its pack
+	// an ssh that runs the origin's upload-pack here, and stalls the first fetch after 64 KiB of its pack; dd passes each
+	// byte on as it reads it, where GNU head holds what it read in its own buffer
 	bin := t.TempDir()
 	count, pidFile := filepath.Join(bin, "count"), filepath.Join(bin, "pid")
 	script(t, bin, "ssh", `for last; do :; done
 n=$(cat '`+count+`' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '`+count+`'
 case "$last" in git-upload-pack*) ;; *) exit 255;; esac
-if [ "$n" = 2 ]; then echo $$ > '`+pidFile+`'; sh -c "$last" | { head -c 65536; exec sleep 60; }; else exec sh -c "$last"; fi`)
+if [ "$n" = 2 ]; then echo $$ > '`+pidFile+`'; sh -c "$last" | { dd bs=1 count=65536 2>/dev/null; exec sleep 60; }; else exec sh -c "$last"; fi`)
 	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
 	url := "ssh://git@fixture.invalid" + f.origin
 	mirror := filepath.Join(t.TempDir(), "mirrors", "0123456789abcdef.git")
 	pass := exec.Command(os.Args[0], "-test.run=^TestFetchInAnotherProcess$")
 	pass.Env = append(os.Environ(), "MOMENTUM_TEST_FETCH_MIRROR="+mirror, "MOMENTUM_TEST_FETCH_SOURCE="+f.main, "MOMENTUM_TEST_FETCH_URL="+url)
+	passLog := filepath.Join(bin, "pass.log")
+	out, err := os.Create(passLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	pass.Stdout, pass.Stderr = out, out
 	if err := pass.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +160,9 @@ if [ "$n" = 2 ]; then echo $$ > '`+pidFile+`'; sh -c "$last" | { head -c 65536; 
 		return found
 	}
 	if !comesTrue(30*time.Second, func() bool { return len(tmpPacks()) > 0 }) {
-		t.Fatal("the pass's fetch did not start its transfer")
+		calls, _ := os.ReadFile(count)
+		said, _ := os.ReadFile(passLog)
+		t.Fatalf("the pass's fetch did not start its transfer: %q ssh calls; the pass said:\n%s", strings.TrimSpace(string(calls)), said)
 	}
 	// the pass is killed outright; its fetch's process group goes on
 	_ = pass.Process.Kill()
@@ -300,6 +310,9 @@ func TestAMirrorHasTheFilesRefFormat(t *testing.T) {
 	if err != nil {
 		t.Skip("no git here")
 	}
+	if exec.Command("git", "init", "-q", "--bare", "--ref-format=reftable", filepath.Join(t.TempDir(), "probe.git")).Run() != nil {
+		t.Skip("this Git has one ref format (before 2.45)")
+	}
 	for _, kind := range []string{"a new mirror", "a reftable mirror"} {
 		t.Run(kind, func(t *testing.T) {
 			r, _ := inputRunner(t)
@@ -321,6 +334,9 @@ func TestAMirrorHasTheFilesRefFormat(t *testing.T) {
 			}
 			if format := inputTestGit(t, mirror, nil, "rev-parse", "--show-ref-format"); format != "files" {
 				t.Fatalf("the mirror's ref format is %s", format)
+			}
+			if raw, _ := os.ReadFile(filepath.Join(mirror, "config")); strings.Contains(strings.ToLower(string(raw)), "refstorage") {
+				t.Fatalf("the mirror's configuration names a ref storage:\n%s", raw)
 			}
 		})
 	}

@@ -202,6 +202,9 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 	if p, err = r.Ship.buildBase(r.Ship.gitContext(shipContext(ctx, p.Case)), p, snapshot); err != nil {
 		return p, err
 	}
+	if err := r.doneBaseNotes(ctx, c.ID); err != nil { // the base was fetched: what held it is over
+		r.logf("base notes of %s: %v", c.ID, err)
+	}
 	// The build tree holds the base commit's tree and one commit, no history. A public repository's base commit is
 	// the default branch its remote serves to anyone, so the scrubber has nothing to keep from the run there, and
 	// masking would break the build. Any other tree (its objects, refs and configuration) is scanned before it is

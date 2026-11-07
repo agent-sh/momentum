@@ -375,21 +375,25 @@ func recordSource(dir, source string) error {
 }
 
 // makeMirror makes dir again: a bare repository without a template, with the files ref format, whatever Git's default
-// is (clearStale and the record read refs as files), made under a name of its own and locked before it takes dir's.
+// is (clearStale and the record read refs as files). The format is set by init.defaultRefFormat, which a Git before
+// 2.45, that has no other format and no --ref-format option, ignores. The new mirror is made and locked under a name of
+// its own and takes dir's place only once it exists, so an init that fails leaves dir as it was.
 func makeMirror(ctx context.Context, dir string) (*os.File, error) {
-	if err := removeAll(dir); err != nil {
-		return nil, err
-	}
 	tmp, err := os.MkdirTemp(filepath.Dir(dir), ".new-")
 	if err != nil {
 		return nil, err
 	}
-	if _, err := hostInputGit(ctx, "", "init", "--quiet", "--bare", "--template=", "--ref-format=files", tmp); err != nil {
+	if _, err := hostInputGit(ctx, "", "-c", "init.defaultRefFormat=files", "init", "--quiet", "--bare", "--template=", tmp); err != nil {
 		_ = removeAll(tmp)
 		return nil, err
 	}
 	lock, err := lockMirror(tmp)
 	if err != nil {
+		_ = removeAll(tmp)
+		return nil, err
+	}
+	if err := removeAll(dir); err != nil {
+		lock.Close()
 		_ = removeAll(tmp)
 		return nil, err
 	}
@@ -471,6 +475,10 @@ func takeOrphan(f *os.File) bool {
 		return false
 	}
 	for _, sig := range []syscall.Signal{syscall.SIGTERM, syscall.SIGKILL} {
+		// the leader is read again before each signal: one that ended on SIGTERM leaves a group that cannot be told
+		if group, now, err := procStat(pgid); err != nil || group != pgid || now != start {
+			return false
+		}
 		if err := syscall.Kill(-pgid, sig); err != nil && !errors.Is(err, syscall.ESRCH) {
 			return false
 		}
@@ -536,9 +544,9 @@ func fetchRuns(dir string) bool {
 	return errors.Is(syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB), syscall.EWOULDBLOCK)
 }
 
-// clearStale removes the lock files and temporary files a fetch or a repack leaves when it is killed before it can
-// remove them itself (SIGTERM lets git remove its lock files, never index-pack's temporary pack, a loose object half
-// written or a repack's new pack). It runs only under the mirror's lock (openMirror), so no call that could still
+// clearStale removes the lock files, temporary files and keep files a fetch or a repack leaves when it is killed before
+// it can remove them itself (SIGTERM lets git remove its lock files, never index-pack's temporary pack or its keep
+// file, a loose object half written or a repack's new pack). It runs only under the mirror's lock (openMirror), so no call that could still
 // write them runs: not this pass's (the loop runs one pass at a time), and not one an earlier pass started whose
 // process group outlived it.
 func clearStale(dir string) error {
@@ -565,6 +573,22 @@ func clearStale(dir string) error {
 		}
 		stale = append(stale, found...)
 	}
+	// the keep file index-pack writes for fetch-pack, which the fetch removes once its refs name the pack: one a killed
+	// fetch left would keep its pack out of every repack
+	keeps, err := filepath.Glob(filepath.Join(dir, "objects", "pack", "pack-*.keep"))
+	if err != nil {
+		return err
+	}
+	for _, k := range keeps {
+		if f, err := os.Open(k); err == nil {
+			head := make([]byte, len("fetch-pack "))
+			n, _ := f.Read(head)
+			f.Close()
+			if string(head[:n]) == "fetch-pack " {
+				stale = append(stale, k)
+			}
+		}
+	}
 	for _, p := range stale {
 		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
@@ -575,8 +599,10 @@ func clearStale(dir string) error {
 
 // usableMirror says whether dir is a mirror as the host makes it: a bare repository with the files ref format that is
 // not shallow, of plain files and directories, whose configuration names no program, rewrite or include
-// (CheckGitConfigWith, on its own file). An error is a check that could not come out: a pass told to stop, a read
-// that failed, a Git call that did not end by itself.
+// (CheckGitConfigWith, on its own file). It answers no only on a definite answer: nothing there, a shallow mirror or a
+// file that is not plain, git saying the directory is no repository (bareMirror), another ref format in the mirror's
+// own configuration, a setting the host never makes. Every other failure (a pass told to stop, a read that failed, a
+// Git that ran out of memory or descriptors) is an error, and a mirror is never made again on one.
 func usableMirror(ctx context.Context, dir string) (bool, error) {
 	info, err := os.Lstat(dir)
 	switch {
@@ -605,15 +631,20 @@ func usableMirror(ctx context.Context, dir string) (bool, error) {
 	if !plain {
 		return false, nil
 	}
-	out, err := hostInputGit(ctx, "", "--git-dir="+dir, "rev-parse", "--is-bare-repository", "--show-ref-format")
+	if bare, err := bareMirror(ctx, dir); err != nil || !bare {
+		return false, err
+	}
+	// the ref format, from the mirror's own configuration: a Git before 2.45 has no --show-ref-format, and its rev-parse
+	// prints the flag back
+	format, err := mirrorConfig(ctx, dir, "--get", "extensions.refStorage")
+	var exit *exec.ExitError
 	switch {
 	case ctx.Err() != nil:
 		return false, ctx.Err()
-	case gitSaidNo(err):
-		return false, nil // git read it and found no repository it can use
+	case errors.As(err, &exit) && exit.Exited() && exit.ExitCode() == 1: // not set: files
 	case err != nil:
 		return false, err
-	case strings.TrimSpace(string(out)) != "true\nfiles":
+	case !strings.EqualFold(strings.TrimSpace(string(format)), "files"):
 		return false, nil
 	}
 	err = CheckGitConfigWith(func(args ...string) ([]byte, error) { return mirrorConfig(ctx, dir, args...) })
@@ -622,10 +653,39 @@ func usableMirror(ctx context.Context, dir string) (bool, error) {
 		return false, ctx.Err()
 	case err == nil:
 		return true, nil
-	case errors.Is(err, ErrRefused) || gitSaidNo(err):
-		return false, nil // a setting the host never makes, or a configuration git cannot read
+	case errors.Is(err, ErrRefused):
+		return false, nil // a setting the host never makes
 	}
 	return false, err
+}
+
+// bareMirror is git's answer to whether dir is a bare repository: true; false, for one with a work tree; or no
+// repository at all, as git says when the directory is none, its configuration cannot be read, or it needs a
+// repository extension this Git does not have (one a later Git made). Any other failure is an error.
+func bareMirror(ctx context.Context, dir string) (bool, error) {
+	cctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "git", append(append([]string{"--git-dir=" + dir}, GitSafety()...), "rev-parse", "--is-bare-repository")...)
+	cmd.Env = GitEnv()
+	out, diag := Capture{Limit: MaxStream}, Capture{Limit: MaxStream}
+	cmd.Stdout, cmd.Stderr = &out, &diag
+	err := cmd.Run()
+	answer := strings.TrimSpace(out.String())
+	text := strings.ToLower(diag.String())
+	switch {
+	case ctx.Err() != nil:
+		return false, ctx.Err()
+	case err == nil && answer == "true":
+		return true, nil
+	case err == nil && answer == "false":
+		return false, nil
+	case gitSaidNo(err) && (strings.Contains(text, "not a git repository") || strings.Contains(text, "bad config") ||
+		strings.Contains(text, "unknown repository extension")):
+		return false, nil
+	case err == nil:
+		return false, errors.New("input git rev-parse gave no answer")
+	}
+	return false, fmt.Errorf("input git rev-parse failed: %w", err)
 }
 
 // gitSaidNo says whether a Git call failed by exiting with an error of its own, not by a signal or before it ran.
@@ -644,10 +704,10 @@ const (
 	mirrorLooseLimit = 6700
 )
 
-// repackLimit bounds each of a mirror's repack and prune. A repack copies every object once, reusing its delta, so it
-// costs about the mirror's size in disk reads and writes: 10 minutes moves the 1 GiB a first fetch is sized for
-// (firstFetchLimit) at under 2 MiB/s each way, far below any disk's rate. It stays under orphanAfter, so a pass never
-// takes the lock from a live repack.
+// repackLimit bounds a mirror's repack. A geometric repack (packMirror) rewrites only the packs and loose objects it rolls
+// up, never the largest pack while the others stay under half its size, so it costs about what came since the last
+// one. 10 minutes would still move the 1 GiB a first fetch is sized for (firstFetchLimit) at under 2 MiB/s each way,
+// far below any disk's rate, and it stays under orphanAfter, so a pass never takes the lock from a live repack.
 const repackLimit = 10 * time.Minute
 
 var looseObject = regexp.MustCompile(`^[0-9a-f]{38}([0-9a-f]{24})?$`)
@@ -673,25 +733,24 @@ func mirrorObjects(mirror string) (packs, loose int) {
 	return packs, loose
 }
 
-// packMirror repacks the mirror once it holds more than mirrorPackLimit packs or mirrorLooseLimit loose objects:
-// every object the branch reaches goes into one pack (repack -a -d -l), and the loose objects no ref reaches (a branch
-// that was pushed over) are pruned at once, so they do not keep the mirror past its limit. Git's own prune waits two
-// weeks for an object a concurrent writer may still be about to name; here none writes: it runs after a complete
-// fetch, under the pass's lock and the mirror's, which every call holds. A repack that fails leaves the mirror as it
-// was, says why, and the next pass tries again.
+// packMirror repacks the mirror once it holds more than mirrorPackLimit packs or mirrorLooseLimit loose objects, into
+// a geometric progression (repack -d -l --geometric=2): each pack holds at least twice the objects of the next smaller,
+// so a mirror keeps at most about log2 of its object count in packs, well under mirrorPackLimit. Its loose objects
+// go into the new pack whether a ref reaches them or not, so the count of loose objects is 0 after it. A geometric
+// repack rewrites only what it rolls up, not the whole history, as repack -a does: so a repack that fails costs little
+// when the next pass tries it again, and needs no record of its own or a wait. It runs after a complete fetch, under
+// the pass's lock and the mirror's, which the call holds. A repack that fails leaves the mirror as it was, says why,
+// and the next pass tries again.
 func packMirror(ctx context.Context, mirror string, lock *os.File) error {
 	if packs, loose := mirrorObjects(mirror); packs <= mirrorPackLimit && loose <= mirrorLooseLimit {
 		return nil
 	}
 	// the mirror serves no fetch, so a bitmap would only cost the repack time
-	if _, err := mirrorGit(ctx, mirror, lock, "-c", "repack.writeBitmaps=false", "repack", "-a", "-d", "-l", "-q"); err != nil {
-		return err
-	}
-	_, err := mirrorGit(ctx, mirror, lock, "prune", "--expire=now")
+	_, err := mirrorGit(ctx, mirror, lock, "-c", "repack.writeBitmaps=false", "repack", "-d", "-l", "--geometric=2", "-q")
 	return err
 }
 
-// mirrorGit runs a mirror's repack or prune, as hostInputGit does, within repackLimit, holding the mirror's lock.
+// mirrorGit runs a mirror's repack, as hostInputGit does, within repackLimit, holding the mirror's lock.
 func mirrorGit(ctx context.Context, mirror string, lock *os.File, args ...string) ([]byte, error) {
 	out, _, err := hostInputGitHolding(ctx, "", ScrubBatchBytes, repackLimit, lock, append([]string{"--git-dir=" + mirror}, args...)...)
 	return out, err
@@ -902,6 +961,27 @@ func transportCause(stderr []byte) string {
 		}
 	}
 	return ""
+}
+
+// holdClass is the class of a failure that holds a build, as its note names it: one of a fixed few, so a note stands
+// for a class, not for each text Git printed. A deadline is its limit (ended); credentials Git cannot get (gh logged
+// out, so it would prompt), a certificate or ssh host key it does not trust, a transport cause (transportCauses), or
+// another failure.
+func holdClass(diag []byte, ended string) string {
+	text := strings.ToLower(string(diag))
+	switch {
+	case ended != "":
+		return ended
+	case strings.Contains(text, "could not read username") || strings.Contains(text, "could not read password") ||
+		strings.Contains(text, "terminal prompts disabled"):
+		return "no credentials"
+	case strings.Contains(text, "certificate") || strings.Contains(text, "host key verification failed"):
+		return "a certificate or host key not trusted"
+	}
+	if cause := transportCause(diag); cause != "" {
+		return cause
+	}
+	return "another failure"
 }
 
 // remoteAnswers are what a remote that answered says, as git, curl and ssh word it: a repository it does not have, a

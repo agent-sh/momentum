@@ -262,10 +262,91 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 }
 
 func (r *Runner) buildSkipped(ctx context.Context, c store.Case, stage string, cause error) Done {
-	if err := r.noteBuildSkip(ctx, c, stage, cause.Error()); err != nil {
-		r.logf("build waiting note: %v", err)
+	var outage *baseOutage
+	switch {
+	case errors.As(cause, &outage):
+		if outage.first != "" {
+			r.logf("build of %s waits for its base: %s", c.ID, outage.first)
+		}
+		if ctx.Err() == nil { // a pass told to stop ended the fetch: no note names the stop as the remote's
+			if err := r.noteBaseHold(ctx, c, cause.Error()); err != nil {
+				r.logf("build waiting note: %v", err)
+			}
+		}
+	default:
+		if err := r.noteBuildSkip(ctx, c, stage, cause.Error()); err != nil {
+			r.logf("build waiting note: %v", err)
+		}
 	}
 	return Done{Family: c.Family, Case: c.ID, Step: StepBuild, Skipped: cause.Error()}
+}
+
+// baseNotePrefix begins the ids of a case's notes of builds held because their base cannot be fetched (noteBaseHold).
+func baseNotePrefix(caseID string) string { return "loop-build:" + store.IDPart(caseID) + ":base:" }
+
+// baseHoldRaise is how long a case's builds may wait for their base before the wait's note is raised from low to normal
+// importance: a passing outage ends within it, and one that lasts a day (gh logged out, a certificate the machine does
+// not trust) needs a person.
+const baseHoldRaise = 24 * time.Hour
+
+// noteBaseHold notes a build held because its base cannot be fetched now: one note per class of cause (holdClass),
+// open until a build of the case fetches its base (doneBaseNotes). Once the case's builds have waited baseHoldRaise
+// since its oldest open such note, the note is raised to normal importance.
+func (r *Runner) noteBaseHold(ctx context.Context, c store.Case, why string) error {
+	detail, err := Redact(ctx, why)
+	if err != nil {
+		return err
+	}
+	detail = store.CaseNoteText(detail)
+	sum := sha256.Sum256([]byte(detail))
+	id := baseNotePrefix(c.ID) + hex.EncodeToString(sum[:])
+	notes, err := r.Store.Notes(ctx)
+	if err != nil {
+		return err
+	}
+	since := r.now()
+	var current *store.Note
+	for i, n := range notes {
+		if !n.Done.IsZero() || !strings.HasPrefix(n.ID, baseNotePrefix(c.ID)) {
+			continue
+		}
+		if n.At.Before(since) {
+			since = n.At
+		}
+		if n.ID == id {
+			current = &notes[i]
+		}
+	}
+	importance := store.ImportanceLow
+	if r.now().Sub(since) >= baseHoldRaise {
+		importance = store.ImportanceNormal
+	}
+	at := r.now()
+	if current != nil {
+		if current.Importance >= importance {
+			return nil
+		}
+		at = current.At
+	}
+	_, err = r.Store.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Importance: importance, At: at,
+		Title: "The loop's build for case " + c.ID + " waits for its base", Detail: detail})
+	return err
+}
+
+// doneBaseNotes resolves a case's notes of builds held for their base, once a build of it has fetched its base.
+func (r *Runner) doneBaseNotes(ctx context.Context, caseID string) error {
+	notes, err := r.Store.Notes(ctx)
+	if err != nil {
+		return err
+	}
+	for _, n := range notes {
+		if n.Done.IsZero() && strings.HasPrefix(n.ID, baseNotePrefix(caseID)) {
+			if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (r *Runner) noteBuildSkip(ctx context.Context, c store.Case, stage, why string) error {

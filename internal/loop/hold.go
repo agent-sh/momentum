@@ -159,7 +159,7 @@ func (r *Runner) releaseHolds(ctx context.Context, cs []store.Case) error {
 	standing := map[string]bool{}
 	for _, n := range notes {
 		if n.Done.IsZero() && (strings.HasPrefix(n.ID, "loop-repo:") || strings.HasPrefix(n.ID, "loop-hand:") ||
-			strings.HasPrefix(n.ID, "loop-build:") && strings.Contains(n.ID, ":held:")) {
+			strings.HasPrefix(n.ID, "loop-build:") && (strings.Contains(n.ID, ":held:") || strings.Contains(n.ID, ":base:"))) {
 			standing[n.ID] = true
 		}
 	}
@@ -186,7 +186,8 @@ func (r *Runner) releaseHolds(ctx context.Context, cs []store.Case) error {
 			}
 		}
 		for id := range standing {
-			if strings.HasPrefix(id, holdNotePrefix(c.ID)) || id == repoNoteID(c.ID) || id == handNoteID(c.ID) || strings.HasPrefix(id, handNoteID(c.ID)+":") {
+			if strings.HasPrefix(id, holdNotePrefix(c.ID)) || strings.HasPrefix(id, baseNotePrefix(c.ID)) || id == repoNoteID(c.ID) ||
+				id == handNoteID(c.ID) || strings.HasPrefix(id, handNoteID(c.ID)+":") {
 				if _, _, err := r.Store.DoneNote(ctx, id, r.now()); err != nil {
 					return err
 				}
