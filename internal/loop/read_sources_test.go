@@ -726,7 +726,8 @@ func TestARejectedFirstBuildNeedsAnotherFileChange(t *testing.T) {
 // second is read as before it: a script that moves the checkout and then installs is the common case. A move dated in
 // a later second comes after it. A reflog with no entry dated by then (empty, expired, a new clone) leaves HEAD as it
 // stands, whose reason is about the checkout and is not kept for the file; at a first sighting the change's files still
-// date the checkout. A first sighting of an unchanged file gives the reason kept for it.
+// date the checkout. With HEAD's own reflog empty and HEAD on a branch, git lists the branch's reflog, and its commit
+// at the file's time decides. A first sighting of an unchanged file gives the reason kept for it.
 func TestAnInstalledFileWrittenInTheSecondItsCheckoutMoved(t *testing.T) {
 	ms := time.Millisecond
 	aBefore := func(t *testing.T, repo string) { write(t, filepath.Join(repo, "a.txt"), "a, before the change\n") }
@@ -789,6 +790,10 @@ func TestAnInstalledFileWrittenInTheSecondItsCheckoutMoved(t *testing.T) {
 		{name: "built with an empty reflog off the change, and the checkout moves onto it", changed: a, without: aBefore,
 			moves: func(s *sameSecond) { s.expire() }, built: 300 * ms, why: "the repository's checkout does not hold",
 			after: func(s *sameSecond) { s.move(s.landed, 5*time.Second) }, next: "has not changed since a build from a checkout without the change"},
+		// git lists the branch's reflog: its commit without the change, dated before the file, decides, and the reason is
+		// the file's (HEAD as it stands would give "the repository's checkout does not hold")
+		{name: "built with HEAD's reflog empty, on a branch whose reflog dates a commit before the file", changed: a, without: aBefore,
+			moves: func(s *sameSecond) { s.emptyHeadLog() }, built: 300 * ms, why: didNotHold},
 		{name: "built before its link of the change was written, at its first sighting", changed: []string{"l"}, first: true,
 			change: func(t *testing.T, repo string) {
 				write(t, filepath.Join(repo, "b.txt"), "b\n")
@@ -946,6 +951,12 @@ func (s *sameSecond) date(name string, at time.Duration) {
 func (s *sameSecond) expire() {
 	s.t.Helper()
 	run(s.t, s.m.repo, "git", "reflog", "expire", "--expire=now", "--all")
+}
+
+// emptyHeadLog empties HEAD's own reflog and leaves the branches' reflogs whole.
+func (s *sameSecond) emptyHeadLog() {
+	s.t.Helper()
+	write(s.t, filepath.Join(s.m.repo, ".git", "logs", "HEAD"), "")
 }
 
 // commit commits on the checkout's HEAD, its reflog entry dated at an offset into the second.
