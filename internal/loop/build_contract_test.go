@@ -86,14 +86,30 @@ func TestABuildIsToldItsPathsUpFront(t *testing.T) {
 	}
 }
 
-// A review is given the paths its build was given, so it does not ask a change for a fix in a path no change touches.
+// A review run is given the paths its build was given. A fix in a path no change may touch is a low finding for a
+// person, it lowers no other finding, and a change not worth landing without it is a high one.
 func TestAReviewIsToldTheBuildsPaths(t *testing.T) {
-	for _, repo := range []string{SelfRepo, "agent-sh/fake"} {
-		prompt := reviewPrompt(store.Case{ID: "c1", Family: "sessions"}, Package{Repo: repo, Title: "a change"})
-		for _, want := range []string{"Review case c1 (sessions): a change.", "reviewed_files", buildScope(repo), "follow-up for a person"} {
-			if !strings.Contains(prompt, want) {
-				t.Fatalf("the review prompt for %s lacks %q: %s", repo, want, prompt)
-			}
+	ctx := context.Background()
+	r, c, p := reviewFixture(t)
+	if err := r.prepareInputs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	run, err := r.prepareRun(ctx, c, c.Family, StepReview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := readHostInput(HostDir(run.Dir), "prompt.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prompt string
+	if err := json.Unmarshal(raw, &prompt); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"reviewed_files", buildScope(p.Repo), "follow-up for a person: file it as a low finding",
+		"It lowers no finding on what this change does", "file a high finding", "is the build's to make"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("the prepared review prompt lacks %q: %s", want, prompt)
 		}
 	}
 }
