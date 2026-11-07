@@ -166,13 +166,19 @@ func (r *Runner) buildInputs(ctx context.Context, p *passInputs) error {
 			// A repository that cannot be read (missing, not a work tree, no default branch) is left out and counted in the
 			// manifest's summary; the others and the investigation go on. What the scrubber changes in one is masked.
 			// Each is read at its origin's default branch, fetched into a mirror of the loop's own, never into the checkout.
-			// The mirror of a repository a package names stays, though no read_dirs checkout reads it.
-			gh, keep := "", []string(nil)
+			// The mirror of a repository a package can still prepare or build from stays, though no read_dirs checkout
+			// reads it, and so does one a preparation of a case in testing fetched.
+			o := SnapshotOptions{Sources: r.Inputs.ReadDirs, Destination: reposDst, LogDir: filepath.Join(logs, "repos"),
+				LoopDirs: []string{r.Dir}, Mirrors: filepath.Join(r.Dir, "mirrors"), Cache: p.cache, Since: p.since, Logf: r.logf}
 			if r.Ship != nil {
-				gh, keep = r.Ship.GH, r.Ship.packageDirs()
+				var err error
+				o.GH = r.Ship.GH
+				if o.Keep, o.Testing, err = r.Ship.mirrorKeep(sctx); err != nil {
+					r.logf("repository mirrors: none is removed this pass: %v", err)
+					o.NoPrune = true
+				}
 			}
-			m, err := SnapshotRepos(sctx, SnapshotOptions{Sources: r.Inputs.ReadDirs, Destination: reposDst, LogDir: filepath.Join(logs, "repos"),
-				LoopDirs: []string{r.Dir}, Mirrors: filepath.Join(r.Dir, "mirrors"), GH: gh, Cache: p.cache, Since: p.since, Logf: r.logf, Keep: keep})
+			m, err := SnapshotRepos(sctx, o)
 			p.manifest.Repositories = m
 			if err != nil {
 				fail(err)

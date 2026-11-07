@@ -266,36 +266,40 @@ func TestABuildRefusesACheckoutThatNowNamesAnotherRepository(t *testing.T) {
 	}
 }
 
-// The owner's preparation holds its mirror from the fetch through the clone: a pass that prunes the mirrors in between
-// leaves it.
-func TestTheOwnersPreparationHoldsItsMirrorThroughTheClone(t *testing.T) {
+// The owner's preparation holds its mirror from the fetch until its package is saved: a pass that prunes the mirrors
+// at its clone, or after it, before the package names the checkout, leaves it.
+func TestTheOwnersPreparationHoldsItsMirrorUntilItsPackageIsSaved(t *testing.T) {
 	real, err := exec.LookPath("git")
 	if err != nil {
 		t.Skip("no git here")
 	}
-	ctx := context.Background()
-	r, c, _ := buildCase(t)
-	g := newRepo(t, nil) // a repository outside loop.read_dirs
-	bin := t.TempDir()
-	cloning, resume := filepath.Join(bin, "cloning"), filepath.Join(bin, "resume")
-	script(t, bin, "git", `case " $* " in *" clone "*) : > '`+cloning+`'; i=0; while [ ! -e '`+resume+`' ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done;; esac
+	for _, at := range []struct{ name, call string }{{"at its clone", "clone"}, {"after its clone", "checkout"}} {
+		t.Run(at.name, func(t *testing.T) {
+			ctx := context.Background()
+			r, c, _ := buildCase(t)
+			g := newRepo(t, nil) // a repository outside loop.read_dirs
+			bin := t.TempDir()
+			paused, resume := filepath.Join(bin, "paused"), filepath.Join(bin, "resume")
+			script(t, bin, "git", `case " $* " in *" `+at.call+` "*) : > '`+paused+`'; i=0; while [ ! -e '`+resume+`' ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done;; esac
 exec '`+real+`' "$@"`)
-	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
-	prepared := make(chan error, 1)
-	go func() {
-		_, err := r.Ship.Prepare(ctx, c.ID, g.main)
-		prepared <- err
-	}()
-	if !comesTrue(2*time.Minute, func() bool { _, err := os.Stat(cloning); return err == nil }) {
-		t.Fatal("the preparation never cloned")
-	}
-	pruneMirrors(filepath.Join(r.Dir, "mirrors"), nil, nil) // a pass that reads no checkout of the repository
-	write(t, resume, "")
-	if err := <-prepared; err != nil {
-		t.Fatalf("a pass's prune between the preparation's fetch and its clone: %v", err)
-	}
-	if _, err := os.Stat(identityMirror(r, "url:"+g.origin)); err != nil {
-		t.Fatalf("a pass pruned the mirror the preparation held: %v", err)
+			t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+			prepared := make(chan error, 1)
+			go func() {
+				_, err := r.Ship.Prepare(ctx, c.ID, g.main)
+				prepared <- err
+			}()
+			if !comesTrue(2*time.Minute, func() bool { _, err := os.Stat(paused); return err == nil }) {
+				t.Fatal("the preparation never reached its " + at.call)
+			}
+			pruneMirrors(filepath.Join(r.Dir, "mirrors"), nil, nil, nil) // a pass that reads no checkout of the repository
+			write(t, resume, "")
+			if err := <-prepared; err != nil {
+				t.Fatalf("a pass's prune during the preparation: %v", err)
+			}
+			if _, err := os.Stat(identityMirror(r, "url:"+g.origin)); err != nil {
+				t.Fatalf("a pass pruned the mirror the preparation held: %v", err)
+			}
+		})
 	}
 }
 

@@ -80,15 +80,42 @@ const mirrorMetaFile = "momentum-mirror.json"
 // mirrorLockFile, in a mirror, is the lock of the fetch that writes it (lockMirror).
 const mirrorLockFile = "momentum-mirror.lock"
 
-// errFetchRunning is a mirror whose lock a fetch still holds: one an earlier pass started, whose process group outlived
-// it.
-var errFetchRunning = errors.New("a fetch an earlier pass started still runs in the mirror")
+// mirrorTombstone begins the name a prune gives a mirror it removes (pruneMirrors): renamed under its lock, the mirror
+// is out of every reader's way before any of it goes, and a prune stopped midway leaves only a tombstone, which the
+// next prune removes.
+const mirrorTombstone = ".gone-"
+
+// errFetchRunning is a mirror whose lock another holds: a fetch (one an earlier pass started, whose process group
+// outlived it), or the owner's preparation, from its fetch until its package is saved.
+var errFetchRunning = errors.New("another fetch, or the owner's preparation, holds the mirror")
 
 type mirrorMeta struct {
 	Sources []string  `json:"sources"`
 	Branch  string    `json:"branch,omitempty"` // origin's default branch at the last complete fetch
 	Commit  string    `json:"commit,omitempty"` // its tip then
 	Fetched time.Time `json:"fetched,omitzero"`
+	// Cases are the cases whose preparation (Ship.Prepare) fetched the mirror and has not saved its package: one that
+	// failed, or still runs. A pass keeps the mirror while one of them is in testing (pruneMirrors).
+	Cases []string `json:"cases,omitempty"`
+}
+
+// recordAttempt records a case's preparation in the mirror's record, under the mirror's lock, which the preparation
+// holds.
+func recordAttempt(dir, caseID string) error {
+	return updateMirrorMeta(dir, func(m *mirrorMeta) {
+		if !slices.Contains(m.Cases, caseID) {
+			m.Cases = append(m.Cases, caseID)
+			slices.Sort(m.Cases)
+		}
+	})
+}
+
+// endAttempt takes a case's preparation out of the mirror's record once its package is saved: the package keeps the
+// mirror from then on, while it can still prepare or build (Ship.mirrorKeep).
+func endAttempt(dir, caseID string) error {
+	return updateMirrorMeta(dir, func(m *mirrorMeta) {
+		m.Cases = slices.DeleteFunc(m.Cases, func(c string) bool { return c == caseID })
+	})
 }
 
 // repoTip is where a snapshot reads a repository: the Git directory that holds its objects (origin's mirror, or the
@@ -100,6 +127,7 @@ type repoTip struct {
 	repack              string
 	class, line         string // a failed fetch's class (holdClass) and the line of Git's that shows it
 	identity            string // the repository the mirror holds (origin's identity), for a tip in the mirror
+	busy                bool   // the fetch found the mirror's lock held by another (errFetchRunning)
 }
 
 // origin is the repository a checkout's origin names, by its identity (OWNER/REPO on GitHub, else url: and its URL),
@@ -144,7 +172,7 @@ func lockedSourceTip(ctx context.Context, source, mirrors, gh string) (repoTip, 
 		}
 		if last, at, ok := lastFetch(ctx, mirror); ok {
 			last.fallback = fmt.Sprintf("origin's %s as fetched at %s: %s", last.branch, at.UTC().Format("2006-01-02 15:04Z"), why)
-			last.class, last.line, last.identity = class, line, org.identity
+			last.class, last.line, last.identity, last.busy = class, line, org.identity, tip.busy
 			return last, mirror, lock, nil
 		}
 	}
@@ -292,9 +320,10 @@ func fetchTip(ctx context.Context, source, mirror, url, gh string) (repoTip, str
 // the caller reads the mirror under it and closes it.
 func lockedFetchTip(ctx context.Context, source, mirror, url, gh string) (tip repoTip, lock *os.File, why string) {
 	var class, line string // a failed call's, for the tip a failure returns
+	busy := false
 	defer func() {
 		if why != "" {
-			tip = repoTip{class: firstOf(class, why), line: line}
+			tip = repoTip{class: firstOf(class, why), line: line, busy: busy}
 		}
 	}()
 	failure := func(err error) string {
@@ -306,6 +335,7 @@ func lockedFetchTip(ctx context.Context, source, mirror, url, gh string) (tip re
 	}
 	lock, err := openMirror(ctx, mirror, source)
 	if err != nil {
+		busy = errors.Is(err, errFetchRunning)
 		return repoTip{}, nil, failure(err)
 	}
 	what, limit := fetchBudget(mirror)
@@ -357,8 +387,8 @@ type mirrorCall struct {
 // (clearStale), and records source among the checkouts that read it. It returns the lock, which the caller holds, and
 // passes to every Git call that writes the mirror, until its fetch ends. A mirror is made again only when it is
 // definitely not one the host made: none yet, something else in its place, a link where its lock is, or a usable
-// check that came out no. A lock a fetch still holds (errFetchRunning), any other error and a pass told to stop leave
-// it as it is.
+// check that came out no. A lock another holds (errFetchRunning: a fetch, or the owner's preparation), any other error
+// and a pass told to stop leave it as it is.
 func openMirror(ctx context.Context, dir, source string) (*os.File, error) {
 	mirrors := filepath.Dir(dir)
 	if err := os.MkdirAll(mirrors, 0o700); err != nil {
@@ -414,19 +444,21 @@ func recordSource(dir, source string) error {
 
 // makeMirror makes dir again: a bare repository without a template, with the files ref format, whatever Git's default
 // is (clearStale and the record read refs as files). The format is set by init.defaultRefFormat, which a Git before
-// 2.45, that has no other format and no --ref-format option, ignores. The new mirror is made and locked under a name of
-// its own and takes dir's place only once it exists, so an init that fails leaves dir as it was.
+// 2.45, that has no other format and no --ref-format option, ignores. The new mirror is made under a name of its own,
+// locked before Git initializes it, so a prune never takes it for one nothing holds (lockForRemoval), and takes dir's
+// place only once it exists, so an init that fails leaves dir as it was.
 func makeMirror(ctx context.Context, dir string) (*os.File, error) {
 	tmp, err := os.MkdirTemp(filepath.Dir(dir), ".new-")
 	if err != nil {
 		return nil, err
 	}
-	if _, err := hostInputGit(ctx, "", "-c", "init.defaultRefFormat=files", "init", "--quiet", "--bare", "--template=", tmp); err != nil {
+	lock, err := lockMirror(tmp)
+	if err != nil {
 		_ = removeAll(tmp)
 		return nil, err
 	}
-	lock, err := lockMirror(tmp)
-	if err != nil {
+	if _, err := hostInputGit(ctx, "", "-c", "init.defaultRefFormat=files", "init", "--quiet", "--bare", "--template=", tmp); err != nil {
+		lock.Close()
 		_ = removeAll(tmp)
 		return nil, err
 	}
@@ -447,7 +479,7 @@ func makeMirror(ctx context.Context, dir string) (*os.File, error) {
 // mirror inherits (fetchGit, mirrorGit). The lock lasts as long as any process holds that descriptor: a fetch's process
 // group that outlives the pass that started it (the loop's own lock goes with its process) still holds it, and git
 // never removes the file. A lock a group has held past orphanAfter is taken from it (takeOrphan); errFetchRunning is
-// one a fetch holds. A dir that is no directory has no lock to take (ENOTDIR), and neither has a link where the lock
+// one another holds: a fetch, or the owner's preparation, until its package is saved. A dir that is no directory has no lock to take (ENOTDIR), and neither has a link where the lock
 // is (ELOOP).
 func lockMirror(dir string) (*os.File, error) {
 	info, err := os.Lstat(dir)
@@ -574,13 +606,16 @@ func procAge(start uint64) (time.Duration, error) {
 
 // lockForRemoval takes the mirror's lock for its removal (pruneMirrors), without making the lock, without waiting, and
 // never from an orphaned fetch: ok is false while anything else holds it, a fetch's process group (a pass's, or one an
-// earlier pass started) or the owner's preparation, from its fetch until its clone has read the mirror. A mirror
-// removed under its lock is never one a preparation fetches into or clones from. A directory without a lock file has
-// none to take.
+// earlier pass started) or the owner's preparation, from its fetch until its package is saved. A directory without a
+// lock file has none to take; a lock file that cannot be opened for any other reason (a link, no access) counts as
+// held, and the next pass looks again.
 func lockForRemoval(dir string) (release func(), ok bool) {
 	f, err := os.OpenFile(filepath.Join(dir, mirrorLockFile), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
+	if errors.Is(err, fs.ErrNotExist) {
 		return func() {}, true
+	}
+	if err != nil {
+		return nil, false
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
@@ -871,11 +906,13 @@ func updateMirrorMeta(mirror string, change func(*mirrorMeta)) error {
 }
 
 // pruneMirrors removes the mirrors that no checkout of the pass reads: a mirror a source's origin named this pass
-// stays (used), and so does one whose record names a checkout in keep: a source whose origin could not be read this
-// pass, or a package's (Ship.packageDirs). Only a mirror's name (mirrorPath) or a mirror being made (.new-) is
-// removed, under its lock, never one whose lock is held (lockForRemoval), and nothing when the path to mirrors holds
-// a link.
-func pruneMirrors(mirrors string, used map[string]bool, keep []string) {
+// stays (used: the pass's sources, and the checkouts of packages that can still prepare or build, by their origin's
+// identity now), and so does one whose record names a source whose origin could not be read this pass (unread), or a
+// case in testing whose preparation fetched it (testing, recordAttempt). Only a mirror's name (mirrorPath) or a mirror
+// being made (.new-) is removed, never one whose lock is held (lockForRemoval), and nothing when the path to mirrors
+// holds a link. Under its lock a mirror is renamed to a tombstone (mirrorTombstone) and only then removed, so a prune
+// stopped midway leaves no half mirror at the mirror's name; a tombstone a stopped prune left is removed.
+func pruneMirrors(mirrors string, used map[string]bool, unread, testing []string) {
 	if noInputLinks(mirrors) != nil {
 		return // none yet, or not the loop's own: the next pass looks again
 	}
@@ -885,18 +922,32 @@ func pruneMirrors(mirrors string, used map[string]bool, keep []string) {
 	}
 	for _, e := range entries {
 		dir := filepath.Join(mirrors, e.Name())
+		if strings.HasPrefix(e.Name(), mirrorTombstone) {
+			_ = removeAll(dir) // a mirror a prune took out of the way: nothing reads it
+			continue
+		}
 		if used[dir] || !mirrorName.MatchString(e.Name()) && !strings.HasPrefix(e.Name(), ".new-") {
 			continue
 		}
-		if m, err := readMirrorMeta(dir); err == nil && slices.ContainsFunc(m.Sources, func(s string) bool { return slices.Contains(keep, s) }) {
+		if m, err := readMirrorMeta(dir); err == nil && (slices.ContainsFunc(m.Sources, func(s string) bool { return slices.Contains(unread, s) }) ||
+			slices.ContainsFunc(m.Cases, func(c string) bool { return slices.Contains(testing, c) })) {
 			continue
 		}
 		release, ok := lockForRemoval(dir)
 		if !ok {
 			continue // a fetch or a preparation still holds it: the next pass looks again
 		}
-		_ = removeAll(dir) // what cannot be removed now is tried again by the next pass
+		tomb, err := os.MkdirTemp(mirrors, mirrorTombstone)
+		if err == nil {
+			// rename(2) replaces the empty directory, where os.Rename refuses any directory in its way
+			if err = syscall.Rename(dir, tomb); err != nil {
+				_ = os.Remove(tomb)
+			}
+		}
 		release()
+		if err == nil {
+			_ = removeAll(tomb) // what cannot be removed now the next pass removes
+		}
 	}
 }
 

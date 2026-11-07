@@ -204,6 +204,7 @@ func loopCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	r.Ship.SourceLive = c.SourceLive
 	r.Log = func(format string, a ...any) { fmt.Fprintf(stderr, format+"\n", a...) }
+	r.Ship.Log = r.Log // a ship step's problem that does not stop it goes to the pass's log
 	if !*dry {
 		if err := onBedrock(r.Agent); err != nil {
 			return err // no route, no run: nothing is recovered, detected, reserved or started
