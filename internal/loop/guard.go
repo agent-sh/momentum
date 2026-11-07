@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -109,7 +110,18 @@ func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead e
 	case hit*2 < in:
 		return refuse("the signal counts %d of the case's %d events in its history: it does not measure the case's problem", hit, in)
 	}
-	tools, cwds, none := guardUnit(sig, units, hits)
+	// the unit is found in the incidents the history counts: an incident the source began with is dropped from them
+	// (measure.GuardCount), so it chooses no member of a set; with none after it, it gives a unit of one alone
+	times := make([]time.Time, len(hits))
+	for i, e := range hits {
+		times[i] = e.TS
+	}
+	cut := measure.GuardCount(measure.Incidents(times, measure.GuardGap), nil, since, measure.GuardGap, anchored).Since
+	later := slices.DeleteFunc(slices.Clone(hits), func(e store.Event) bool { return e.TS.Before(cut) })
+	tools, cwds, none := guardUnit(sig, units, later, true)
+	if len(later) == 0 {
+		tools, cwds, none = guardUnit(sig, units, hits, false)
+	}
 	if none != "" {
 		return refuse("%s", none)
 	}
@@ -130,72 +142,87 @@ func setGuard(g *Guard, h measure.GuardHistory) {
 	g.Since, g.Incidents, g.Exposure = h.Since, h.Incidents, h.Exposure
 }
 
-// guardUnit is what a guard's exposure is narrowed to, the problem's unit: the signal's tool; else the tools its
-// history's events were of, when every one was of a tool (never for the owner's hours: his turns are of none); else
-// the directories they ran in, when every one ran in one, compared as the store keeps them now (store.CleanCwd), since
-// a row stored before the store cleaned working directories keeps its form until its source is read again, and a
-// directory below another of them left to the one that covers it. A unit of one comes first: the one tool every event
-// was of, else the one directory that holds them all. Else the set of tools, else the set of directories, when it is
-// small (smallSet). none says why there is no unit, when there is none: then every activity would count as the
-// problem's unit in use.
-func guardUnit(sig Signal, units string, hits []store.Event) (tools, cwds []string, none string) {
+// guardUnit is what a guard's exposure is narrowed to, the problem's unit: the signal's tool; else, tools before
+// directories, the one tool every event of its history was of (never for the owner's hours: his turns are of none),
+// else the set of tools they were of, when every one was of a tool and the set is small (smallSet); else the one
+// directory every event ran in, else the set of directories they ran in, when every one ran in one and the set is
+// small. A directory is compared as the store keeps it now (store.CleanCwd), since a row stored before the store
+// cleaned working directories keeps its form until its source is read again; one directory is the unit only when it
+// is every event's own, never a parent that covers theirs (a home or a projects directory would cover nearly all
+// work). With sets false only a unit of one is chosen: the events are those of an incident the history dropped, which
+// shows where the problem happened but holds no draw of its rate to size a set by. none says why there is no unit,
+// when there is none: then every activity would count as the problem's unit in use.
+func guardUnit(sig Signal, units string, hits []store.Event, sets bool) (tools, cwds []string, none string) {
 	if sig.Tool != "" && units != OwnerHours {
 		return []string{sig.Tool}, nil, ""
 	}
-	set := func(of func(store.Event) string) []string {
-		var out []string
+	// set is the members events are of, with the hours each holds them in, or nil when one is of none
+	set := func(of func(store.Event) string) ([]string, map[string]map[int64]bool) {
+		hours := map[string]map[int64]bool{}
 		for _, e := range hits {
 			v := of(e)
 			if v == "" {
-				return nil // an event outside every member: no set holds them all
+				return nil, nil // an event outside every member: no set holds them all
 			}
-			if !slices.Contains(out, v) {
-				out = append(out, v)
+			if hours[v] == nil {
+				hours[v] = map[int64]bool{}
 			}
+			hours[v][e.TS.UnixMilli()/3_600_000] = true
 		}
-		slices.Sort(out)
-		return out
+		out := slices.Sorted(maps.Keys(hours))
+		return out, hours
 	}
+	var toolHours map[string]map[int64]bool
 	if units != OwnerHours {
-		tools = set(func(e store.Event) string { return e.Tool })
+		tools, toolHours = set(func(e store.Event) string { return e.Tool })
 	}
-	all := set(func(e store.Event) string { return store.CleanCwd(e.Cwd) })
-	cwds = slices.DeleteFunc(slices.Clone(all), func(dir string) bool { // one below another of them: the other covers it
-		return slices.ContainsFunc(all, func(above string) bool { return above != dir && store.InAnyDir(dir, []string{above}) })
-	})
-	n := hitUnits(hits, units)
+	cwds, dirHours := set(func(e store.Event) string { return store.CleanCwd(e.Cwd) })
 	switch {
 	case len(tools) == 1:
 		return tools, nil, ""
+	case sets && smallSet(tools, toolHours):
+		return tools, nil, ""
 	case len(cwds) == 1:
 		return nil, cwds, ""
-	case smallSet(tools, n):
-		return tools, nil, ""
-	case smallSet(cwds, n):
+	case sets && smallSet(cwds, dirHours):
 		return nil, cwds, ""
 	}
-	toolsWhy := fmt.Sprintf("%d tools", len(tools))
+	if !sets {
+		return nil, nil, "its events share no tool or directory, and the history holds no incident after the one its source began with to find a set of them in, so absence cannot be counted only while the problem's unit was in use"
+	}
+	toolsWhy := fmt.Sprintf("%d tools, %d of them in one hour alone", len(tools), thin(toolHours))
 	switch {
 	case units == OwnerHours:
 		toolsWhy = "the owner's turns are of no tool"
 	case tools == nil:
 		toolsWhy = "some of no tool"
 	}
-	dirsWhy := fmt.Sprintf("%d directories", len(cwds))
-	if all == nil {
+	dirsWhy := fmt.Sprintf("%d directories, %d of them in one hour alone", len(cwds), thin(dirHours))
+	if cwds == nil {
 		dirsWhy = "some in no directory"
 	}
-	return nil, nil, fmt.Sprintf("its events fall in no small set of tools or directories (%s, %s, in %d units of its problem: a set of more than one has at most half as many members as those units), so absence cannot be counted only while the problem's unit was in use",
-		toolsWhy, dirsWhy, n)
+	return nil, nil, fmt.Sprintf("its events fall in no small set of tools or directories (%s; %s: each member of a set holds its events in two hours or more), so absence cannot be counted only while the problem's unit was in use",
+		toolsWhy, dirsWhy)
 }
 
-// smallSet says whether a set of more than one tool or directory, which a problem's events fall in in n units, is
-// small enough to be its unit: at most half as many members as the units, so that on average each member holds two of
-// them. A member that holds one unit alone may be the tool or directory a failure happened to surface in; a set that
-// grows as fast as its units do is that for every failure, not where the problem happens, and counting the hours of
-// all its members would count activity in general, which a guard with no unit is refused for.
-func smallSet(set []string, n int) bool {
-	return len(set) > 1 && 2*len(set) <= n
+// smallSet says whether a set of more than one tool or directory a problem's events are of is small enough to be its
+// unit: each member holds them in two distinct hours or more, by the clock, whatever the sessions (a burst across
+// parallel sessions in one hour is one). A member that holds one hour alone may be the tool or directory a failure
+// happened to surface in, and counting all its hours would count activity in general as the problem's unit in use,
+// which a guard with no unit is refused for: a busy member does not carry it.
+func smallSet(set []string, hours map[string]map[int64]bool) bool {
+	return len(set) > 1 && thin(hours) == 0
+}
+
+// thin is how many members of a set hold their events in fewer than two hours.
+func thin(hours map[string]map[int64]bool) int {
+	n := 0
+	for _, h := range hours {
+		if len(h) < 2 {
+			n++
+		}
+	}
+	return n
 }
 
 // guardUnitText says what a guard's exposure is narrowed to, for its proposal: the tools by name, the directories by

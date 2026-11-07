@@ -98,7 +98,7 @@ func TestTheGuardsArithmeticIsSPECs(t *testing.T) {
 		"P = 1 - (T/(T+W))^(k+½), had the problem kept happening",
 		"\"no rate to compare: the history holds no incident after its first\"",
 		"\"no rate to compare: the history holds no exposure in the sources kept at the watch's end\"",
-		"at most half as many members as the units its events fall in",
+		"each member holds the history's events in two distinct hours or more, by the clock, whatever the sessions",
 		"**P** is for the report alone: nothing decides on it",
 		"a problem that stopped by itself gives the same result",
 		"closes the case as `guarded`, a close reason of its own, never `improved`",

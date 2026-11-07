@@ -206,11 +206,13 @@ func TestAGuardStandsInWhereAMeasuredPlanIsRefused(t *testing.T) {
 
 // A guard is refused only where no watch could be kept: a history with no exposure; a signal that counts none of the
 // case's evidence in the gate, the problem's form there having changed; a signal with no tool whose events fall in no
-// small set of tools or directories (more members than half the 12 units they fall in, or some of no tool and in no
-// directory); and, on the too-new path too, a gate that holds an active problem and none of the case's evidence. A
-// signal with no tool whose events all share one counts its exposure in that tool's hours, and one whose events share a
-// directory in that directory's: its rows stored before the store cleaned working directories, in any form of it
-// (`/work//a`, `/work/./a/x`), count as the rows stored after.
+// small set of tools or directories (a member that holds them in one hour alone, however busy the others or however
+// many sessions that hour had, a parent directory a member of its own, or events of no tool and in no directory); and,
+// on the too-new path too, a gate that holds an active problem and none of the case's evidence. A signal with no tool
+// whose events all share one counts its exposure in that tool's hours; one whose events are of two tools counts it in
+// theirs, before any directory; one whose events of no tool ran in two sibling directories counts it in both; and one
+// whose events share a directory in that directory's: its rows stored before the store cleaned working directories,
+// in any form of it (`/work//a`, `/work/./a/x`), count as the rows stored after.
 func TestAGuardIsRefusedOnlyWhereNoWatchCouldBeKept(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().Truncate(time.Hour)
@@ -268,23 +270,97 @@ func TestAGuardIsRefusedOnlyWhereNoWatchCouldBeKept(t *testing.T) {
 		put(t, st, failures)
 		return testingCaseOf(t, st, "failures/v2:zz-spread", failures)
 	}
-	t.Run("a set over its bound", func(t *testing.T) {
-		st := testStore(t) // seven tools and seven directories for twelve units: more than half of them
+	// failed is a failure of a tool, in a directory, in a session of its own
+	failed := func(key string, at time.Time, tool, cwd string) store.Event {
+		e := toolResult(key, at, key, true)
+		e.Tool, e.Cwd = tool, cwd
+		return e
+	}
+	t.Run("a member in one hour", func(t *testing.T) {
+		st := testStore(t) // seven tools and seven directories for twelve failures: two of each in one hour alone
 		c := spread(t, st, func(i int) (string, string) { return fmt.Sprint("tool-", i%7), fmt.Sprint("/work/", i%7) })
-		refusedWith(t, st, c, noTool, "no small set of tools or directories (7 tools, 7 directories, in 12 units")
+		refusedWith(t, st, c, noTool, "no small set of tools or directories (7 tools, 2 of them in one hour alone; 7 directories, 2 of them in one hour alone")
 	})
-	t.Run("a set at its bound", func(t *testing.T) {
-		st := testStore(t) // six tools for twelve units: half of them
+	t.Run("each member in two hours", func(t *testing.T) {
+		st := testStore(t) // six tools for twelve failures: each in two hours
 		c := spread(t, st, func(i int) (string, string) { return fmt.Sprint("tool-", i%6), fmt.Sprint("/work/", i%7) })
 		plan, err := (&Ship{Store: st}).validPlan(ctx, c, noTool, 7*aDay, "", now)
 		if g, _ := guardOf(t, plan); err != nil || g == nil || len(g.Tools) != 6 || g.Tool != "" || g.Cwd != "" || len(g.Cwds) != 0 {
-			t.Fatalf("six tools for twelve units: %+v %v", g, err)
+			t.Fatalf("six tools, each in two hours: %+v %v", g, err)
+		}
+	})
+	t.Run("a busy member carries no tool of one hour", func(t *testing.T) {
+		st := testStore(t) // the server's tool fails in 20 hours, and five broad tools once each: 6 members over 25 units
+		_, failures := recurring(t, st, toolSignal.Source, now, now, now, fourBursts(now)...)
+		for i := range failures {
+			failures[i].Tool = "mcp__zz_srv__q"
+		}
+		for i := 0; i < 8; i++ {
+			failures = append(failures, failed(fmt.Sprint("q-", i), now.Add(-26*aDay+time.Duration(i)*5*time.Hour), "mcp__zz_srv__q", ""))
+		}
+		for i, tool := range []string{"Bash", "Read", "Edit", "Write", "Grep"} {
+			failures = append(failures, failed(fmt.Sprint("once-", i), now.Add(-16*aDay+time.Duration(i)*7*time.Hour), tool, ""))
+		}
+		put(t, st, failures)
+		refusedWith(t, st, testingCaseOf(t, st, "failures/v2:zz-busy", failures), noTool, "(6 tools, 5 of them in one hour alone; some in no directory")
+	})
+	t.Run("a burst across parallel sessions is one hour", func(t *testing.T) {
+		st := testStore(t) // one tool in twelve hours, another in five sessions of one hour
+		_, failures := recurring(t, st, toolSignal.Source, now, now, now, fourBursts(now)...)
+		for i := range failures {
+			failures[i].Tool = "mcp__zz_srv__a"
+		}
+		for k := 0; k < 5; k++ {
+			failures = append(failures, failed(fmt.Sprint("parallel-", k), now.Add(-16*aDay+time.Duration(k)*time.Minute), "mcp__zz_srv__b", ""))
+		}
+		put(t, st, failures)
+		refusedWith(t, st, testingCaseOf(t, st, "failures/v2:zz-parallel", failures), noTool, "(2 tools, 1 of them in one hour alone; some in no directory")
+	})
+	t.Run("a parent directory is a member of its own", func(t *testing.T) {
+		st := testStore(t) // of no tool: eleven failures in a repository, one in the directory above it
+		c := spread(t, st, func(i int) (string, string) {
+			if i == 0 {
+				return "", "/work"
+			}
+			return "", "/work/repo"
+		})
+		refusedWith(t, st, c, noTool, "(some of no tool; 2 directories, 1 of them in one hour alone")
+	})
+	t.Run("a set of tools before a directory", func(t *testing.T) {
+		st := testStore(t) // two tools, in a repository and in the directory above it
+		c := spread(t, st, func(i int) (string, string) {
+			cwd := "/work/repo"
+			if i%3 == 0 {
+				cwd = "/work"
+			}
+			return []string{"mcp__zz_srv__a", "mcp__zz_srv__b"}[i%2], cwd
+		})
+		plan, err := (&Ship{Store: st}).validPlan(ctx, c, noTool, 7*aDay, "", now)
+		if g, _ := guardOf(t, plan); err != nil || g == nil || strings.Join(g.Tools, " ") != "mcp__zz_srv__a mcp__zz_srv__b" || g.Cwd != "" || len(g.Cwds) != 0 {
+			t.Fatalf("two tools, in a directory and its parent: %+v %v", g, err)
+		}
+	})
+	t.Run("two sibling directories", func(t *testing.T) {
+		st := testStore(t) // of no tool, in two sibling directories; the tool's use in each, and in a third
+		c := spread(t, st, func(i int) (string, string) { return "", []string{"/work/a", "/work/b"}[i%2] })
+		var use []store.Event
+		for i, cwd := range []string{"/work/a", "/work/b", "/work/c"} {
+			for h := 0; h < 24; h++ {
+				e := toolResult(fmt.Sprintf("use-%d-%d", i, h), now.Add(-time.Duration(26-i)*aDay+time.Duration(h)*time.Hour), fmt.Sprintf("use-%d-%d", i, h), false)
+				e.Cwd = cwd
+				use = append(use, e)
+			}
+		}
+		put(t, st, use)
+		plan, err := (&Ship{Store: st}).validPlan(ctx, c, noTool, 7*aDay, "", now)
+		if g, _ := guardOf(t, plan); err != nil || g == nil || strings.Join(g.Cwds, " ") != "/work/a /work/b" || g.Cwd != "" || len(g.Tools) != 0 || g.Exposure != 12+2*24 {
+			t.Fatalf("two sibling directories: %+v %v", g, err)
 		}
 	})
 	t.Run("no set", func(t *testing.T) {
 		st := testStore(t) // of no tool, in no directory
 		c := spread(t, st, func(int) (string, string) { return "", "" })
-		refusedWith(t, st, c, noTool, "no small set of tools or directories (some of no tool, some in no directory")
+		refusedWith(t, st, c, noTool, "no small set of tools or directories (some of no tool; some in no directory")
 	})
 	t.Run("a shared tool", func(t *testing.T) {
 		st := testStore(t)
@@ -312,14 +388,11 @@ func TestAGuardIsRefusedOnlyWhereNoWatchCouldBeKept(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer db.Close()
-		var failures []store.Event // of two tools, all in one directory: half stored as a build from before cleaning left them
+		var failures []store.Event // of no tool, all in one directory: half stored as a build from before cleaning left them
 		for b, from := range fourBursts(now) {
 			for j := 0; j < 3; j++ {
 				e := toolResult(fmt.Sprintf("dir-%d-%d", b, j), from.Add(time.Duration(j)*time.Hour+30*time.Minute), fmt.Sprintf("dir-%d-%d", b, j), true)
-				e.Cwd = "/work/a"
-				if j%2 == 0 {
-					e.Tool = "Read"
-				}
+				e.Cwd, e.Tool = "/work/a", ""
 				failures = append(failures, e)
 				if (b+j)%2 == 0 {
 					put(t, st, []store.Event{e})
