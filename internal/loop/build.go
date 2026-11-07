@@ -3,10 +3,13 @@ package loop
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -367,9 +370,7 @@ func stageFailure(res Result, key string, err error) (Result, error) {
 	}
 	res.Status, res.Failure = store.RunFailed, key
 	res.Text = key + ": " + err.Error()
-	if slices.Contains(refusalKeys, key) {
-		res.Cause = err.Error()
-	}
+	res.Cause = stageCause(key, err)
 	return res, nil
 }
 
@@ -534,17 +535,57 @@ func handReach(repo string) string {
 // proposal. Preparation, inputs, toolchains and authority are the host's and tell a build nothing to change.
 var refusalKeys = []string{"build report", "build patch", "build check", "build propose"}
 
-// causeMax is how many characters of a refusal's cause a run keeps: its stop's signature names the cause too.
-const causeMax = 200
+// hostCause is the cause a run keeps for a failure of the host's own at a refusal stage: a network, git or gh error,
+// a full disk. It is one fixed key, so the stop rule stops on the stage alone there, as for a host stage, and the
+// stop keeps the stage's signature.
+const hostCause = "host"
 
-// refusalCause is the cause a run refused at a refusal stage keeps for the stop rule: the stage's error text, with
+// stageCause is the one decision of whether a build's failure at a stage refused its own output, kept as the run's
+// cause for the stop rule and for the next build's refusal.md (lastBuildRefusal). At a refusal stage, an unreadable
+// report or the host's refusal (ErrRefused) keeps its error's text, and any other error there is the host's
+// (hostCause). Another stage keeps none.
+func stageCause(key string, err error) string {
+	switch {
+	case !slices.Contains(refusalKeys, key):
+		return ""
+	case key == "build report" || errors.Is(err, ErrRefused):
+		return err.Error()
+	}
+	return hostCause
+}
+
+// causeMax is how many characters of a refusal's masked cause a run keeps whole. A longer one keeps its start and a
+// short hash of the whole, so two causes that differ past it stay two.
+const causeMax = 400
+
+var (
+	runIDText = regexp.MustCompile(`\b\d{8}-\d{6}-[0-9a-f]{8}\b`) // newRunID's form
+	starRun   = regexp.MustCompile(`\*+`)                         // a value the scrubber masked, star by star
+)
+
+// refusalCause is the cause a run refused for its own output keeps for the stop rule: its cleaned error text, with
 // what varies between two sightings of one cause masked as the detectors mask it (numbers, paths, hashes, quoted
-// values), so two refusals for one cause compare equal and two for different causes do not.
-func refusalCause(text string) string { return detect.Norm(text, causeMax) }
+// values), a run id as one id however many of its letters are digits, and a value the scrubber masked as one S
+// however long it was. Two refusals for one cause compare equal, and two for different causes do not. hostCause and
+// no cause stay as they are.
+func refusalCause(text string) string {
+	if text == "" || text == hostCause {
+		return text
+	}
+	// 0x0 masks as an id (H), as a run id whose random part has a letter does
+	m := starRun.ReplaceAllString(detect.Norm(runIDText.ReplaceAllString(text, "0x0"), math.MaxInt), "S")
+	if utf8.RuneCountInString(m) <= causeMax {
+		return m
+	}
+	sum := sha256.Sum256([]byte(m))
+	tag := "~" + hex.EncodeToString(sum[:4])
+	return string([]rune(m)[:causeMax-len(tag)]) + tag
+}
 
-// refusalStop says a run failed at a refusal stage: the stop rule holds it only when the cause is the same too.
+// refusalStop says a run's build was refused for its own output at a refusal stage: the stop rule holds it only on
+// an earlier refusal there for the same cause. A host error there (hostCause) is not one.
 func refusalStop(run store.LoopRun) bool {
-	return run.Step == StepBuild && slices.Contains(refusalKeys, run.Failure)
+	return run.Step == StepBuild && slices.Contains(refusalKeys, run.Failure) && run.Cause != hostCause
 }
 
 // hostStages are the build stages whose failure is the host's or the harness's, not the build's output: the next
@@ -582,8 +623,10 @@ func (r *Runner) lastBuildRefusal(ctx context.Context, c store.Case) (string, er
 			return "", nil
 		}
 		text = text[i:]
-		if run.Failure != "build report" && !strings.HasPrefix(text[len(run.Failure)+2:], "refused") {
-			return "", nil // a host error of the stage (a network, a git or a gh failure) is no refusal of the build's output
+		// a host error of the stage (a network, a git or a gh failure) is no refusal of the build's output: the run's
+		// cause says so (stageCause), and a run kept before causes were tells by its text
+		if run.Cause == hostCause || run.Cause == "" && run.Failure != "build report" && !strings.HasPrefix(text[len(run.Failure)+2:], "refused") {
+			return "", nil
 		}
 		for _, tail := range []string{" (relay: ", " (the relay refused ", " (untrusted harness diagnostics"} {
 			if i := strings.Index(text, tail); i >= 0 {

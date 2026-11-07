@@ -110,6 +110,9 @@ func (r *Runner) reviews(ctx context.Context, only string, families ...string) [
 			}
 			continue
 		}
+		if err := r.endStoppedNote(ctx, c); err != nil {
+			r.logf("review stopped note: %v", err)
+		}
 		if err := r.prepareInputs(ctx); err != nil {
 			out = append(out, Done{Family: c.Family, Case: c.ID, Step: StepReview, Skipped: "inputs: " + err.Error()})
 			continue
@@ -298,6 +301,23 @@ func (r *Runner) noteReviewSkip(ctx context.Context, c store.Case, cause, why st
 	}
 	_, err = r.Store.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Importance: store.ImportanceLow,
 		At: r.now(), Title: "The loop's review for case " + c.ID + " waits: " + cause, Detail: detail})
+	return err
+}
+
+// endStoppedNote marks done a standing stopped note of a case's review once the stop rule holds the case no more
+// without a resume (a new episode, or a stop the rule no longer counts, such as two refusals a build kept before
+// causes were). Its detail says so first, so a later stop, whatever its why, puts the note again (noteReviewSkip).
+func (r *Runner) endStoppedNote(ctx context.Context, c store.Case) error {
+	id := store.ReviewNoteID(c.ID, "stopped")
+	n, ok, err := r.Store.Note(ctx, id)
+	if err != nil || !ok || !n.Done.IsZero() {
+		return err
+	}
+	n.Detail = "the stop rule no longer holds the case"
+	if _, err := r.Store.PutNote(ctx, n); err != nil {
+		return err
+	}
+	_, _, err = r.Store.DoneNote(ctx, id, r.now())
 	return err
 }
 

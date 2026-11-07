@@ -1047,11 +1047,13 @@ func (r *Runner) caseNoteOnce(ctx context.Context, id, action, detail string) er
 
 // stopRuns reads the stop rule for a case: its last two live runs that ran (a refusal of the budgets is no run, and a
 // run the host ended, stopped or killed, says nothing of the agent), since it last came back after a close or
-// resumed after a fix of its stop, when both failed the same way in the same step. Two builds refused for their own
-// output at one refusal stage failed the same way only for the same cause: each refusal's reason reaches the next
-// build (refusal.md), so two for different causes are a build making progress. A run kept before causes were has
-// none, and a missing cause matches nothing, so such a run never starts a stop. A host stage stops on its key alone.
-// ok is false when the rule does not hold.
+// resumed after a fix of its stop, when both failed the same way in the same step. A build refused for its own output
+// at a refusal stage fails the same way only for the same cause: each refusal's reason reaches the next build
+// (refusal.md), so refusals for different causes are a build making progress. The newest such refusal stops the case
+// on any earlier one there for its cause in that span, however many for other causes came between, so causes that
+// take turns stop too. A run kept before causes were has none, and a missing cause matches nothing, so such a run
+// never starts a stop. A host stage, and a host error at a refusal stage (hostCause), stops on its key alone. The
+// runs are the newest and the earlier one it matched; ok is false when the rule does not hold.
 func stopRuns(ctx context.Context, st *store.Store, c store.Case) (runs []store.LoopRun, ok bool, err error) {
 	live := ""
 	since := c.Back
@@ -1065,27 +1067,40 @@ func stopRuns(ctx context.Context, st *store.Store, c store.Case) (runs []store.
 	if !since.IsZero() {
 		since = since.Add(time.Millisecond) // the kept clock is in milliseconds; only runs after the return count
 	}
-	runs, err = st.LoopRuns(ctx, store.RunFilter{Case: c.ID, Experiment: &live, Ran: true, Judged: true, Since: since, Limit: 2})
+	runs, err = st.LoopRuns(ctx, store.RunFilter{Case: c.ID, Experiment: &live, Ran: true, Judged: true, Since: since})
 	if err != nil || len(runs) < 2 {
 		return nil, false, err
 	}
-	a, b := runs[0], runs[1]
-	if a.Status == store.RunOK || b.Status == store.RunOK || a.Failure == "" || a.Failure != b.Failure || a.Step != b.Step {
+	a := runs[0]
+	if a.Status == store.RunOK || a.Failure == "" {
 		return nil, false, nil
 	}
-	if refusalStop(a) && (a.Cause == "" || a.Cause != b.Cause) {
+	if refusalStop(a) {
+		if a.Cause == "" {
+			return nil, false, nil
+		}
+		for _, e := range runs[1:] {
+			if e.Step == a.Step && e.Failure == a.Failure && e.Cause == a.Cause {
+				return []store.LoopRun{a, e}, true, nil
+			}
+		}
 		return nil, false, nil
 	}
-	return runs, true, nil
+	b := runs[1]
+	if b.Status == store.RunOK || a.Failure != b.Failure || a.Step != b.Step || a.Cause != b.Cause {
+		return nil, false, nil
+	}
+	return runs[:2], true, nil
 }
 
 // stopSignature is the signature of the component-health case a stop files: by its step and its failure, and for a
-// refusal stage by its cause too, so the case names the refusal that repeated. A host stage's is its key alone, as
-// every stop's was before causes were kept, so a case filed then still holds the stops it names.
+// build refused for its own output by its cause too (causeKey), so the case names the refusal that repeated. A host
+// stage's, and a host error's at a refusal stage, is its key alone, as every stop's was before causes were kept, so a
+// case filed then still holds the stops it names.
 func stopSignature(run store.LoopRun) string {
 	sig := store.HealthFamily + "/" + detect.Versions[store.HealthFamily] + ":loop:" + run.Step + ":" + slugOf(run.Failure)
 	if refusalStop(run) {
-		sig += ":" + causeSlug(run.Cause)
+		sig += ":" + causeKey(run.Cause)
 	}
 	return sig
 }
@@ -1121,8 +1136,8 @@ func StoppedOn(ctx context.Context, st *store.Store, health store.Case) ([]strin
 	return out, nil
 }
 
-// stopped applies the stop rule (stopRuns): a case whose last two runs failed the same way, in the same step, is not
-// run a third time. It opens a case of the loop's own, in component health, the first time, with both runs'
+// stopped applies the stop rule (stopRuns): a case whose last two runs failed the same way, in the same step, or whose
+// build was refused twice for one cause, is not run again. It opens a case of the loop's own, in component health, the first time, with both runs'
 // transcripts as its evidence, and says why. A stop whose older run began before that case closed as fixed resumes
 // the case instead (store.ResumeLate). A dry check writes nothing.
 func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, error) {
@@ -1132,6 +1147,9 @@ func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, e
 	}
 	a, sig := runs[0], stopSignature(runs[0])
 	why := fmt.Sprintf("its last two %s runs failed the same way: %s", a.Step, stopFailure(a))
+	if refusalStop(a) {
+		why = fmt.Sprintf("two of its %s runs were refused for one cause: %s", a.Step, stopFailure(a))
+	}
 	// a stop whose older run began before its component-health case closed as fixed came too late for the close:
 	// the case resumes as the close would have resumed it
 	if dry {
@@ -1274,7 +1292,7 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 	// A refusal's cause is text too: it is cleaned, then masked into the key
 	// the stop rule compares beside the failure.
 	clean, cleanErr := Redact(ctx, run.Summary)
-	if cleanErr == nil {
+	if cleanErr == nil && cause != hostCause {
 		cause, cleanErr = Redact(ctx, cause)
 	}
 	if cleanErr != nil {
@@ -1417,9 +1435,21 @@ func slugOf(s string) string {
 	return strings.Join(w, "-")
 }
 
-// causeSlug is a refusal's cause as its stop's signature names it: all its words, lower case, joined by dashes. A
-// kept cause is at most causeMax characters, so its slug fits a signature with its step and failure.
-func causeSlug(cause string) string { return strings.Join(slugWords(cause), "-") }
+// causeKey is a refusal's cause as its stop's signature names it: its words, lower case, joined by dashes and cut at
+// a word to fit the case store's signature with the step and the failure, then a short hash of the whole kept cause,
+// so two causes whose words are the same ("refused: a: b", "refused a b") or that differ past the cut stay two.
+func causeKey(cause string) string {
+	const room = 200
+	slug := strings.Join(slugWords(cause), "-")
+	if len(slug) > room {
+		slug = slug[:room]
+		if i := strings.LastIndexByte(slug, '-'); i > room/2 {
+			slug = slug[:i]
+		}
+	}
+	sum := sha256.Sum256([]byte(cause))
+	return slug + "~" + hex.EncodeToString(sum[:4])
+}
 
 func slugWords(s string) []string {
 	return strings.FieldsFunc(strings.ToLower(s), func(r rune) bool { return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9') })
