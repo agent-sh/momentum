@@ -316,8 +316,6 @@ type Finding struct {
 	Where    string `json:"where"`
 	Problem  string `json:"problem"`
 	Fix      string `json:"fix"`
-	// PersonPath is set only when the fix needs a path no change of the loop's may touch: that path, for a person.
-	PersonPath string `json:"person_path,omitempty"`
 }
 
 // Review is one round of the clean-context review.
@@ -1244,7 +1242,7 @@ func (s *Ship) Reviewed(ctx context.Context, caseID string, r Review) (Package, 
 	r.Text = clean
 	r.Findings = append([]Finding(nil), r.Findings...)
 	for i := range r.Findings {
-		for _, field := range []*string{&r.Findings[i].Where, &r.Findings[i].Problem, &r.Findings[i].Fix, &r.Findings[i].PersonPath} {
+		for _, field := range []*string{&r.Findings[i].Where, &r.Findings[i].Problem, &r.Findings[i].Fix} {
 			clean, err := Redact(ctx, *field)
 			if err != nil {
 				return p, err
@@ -1266,13 +1264,6 @@ func (s *Ship) Reviewed(ctx context.Context, caseID string, r Review) (Package, 
 	r.Round, r.At = len(p.Reviews)+1, s.now()
 	note, err := Redact(ctx, fmt.Sprintf("round %d: %d high, %d medium, %d low %s", r.Round, r.High, r.Medium, r.Low, r.Comment))
 	if err != nil {
-		return p, err
-	}
-	// the notes go in before the package is saved: a failed save is retried, a note missed after it would not be
-	if err := s.authority(ctx, caseID); err != nil {
-		return p, err
-	}
-	if err := s.reachNotes(ctx, caseID, p.Repo, r.Findings); err != nil {
 		return p, err
 	}
 	p.Reviews = append(p.Reviews, r)
