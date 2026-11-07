@@ -564,19 +564,22 @@ func (s *Ship) InEffect(ctx context.Context, p *Package) (time.Time, string, err
 		// checkout is back on the change. The reflog's commits are all that is read: a build from uncommitted edits, or
 		// from another work tree or clone, is not checked.
 		heads, reflog := []string{"HEAD"}, false
+		var moves headMoves
 		if changed {
-			if at, ok := s.headsAt(ctx, p.Dir, installedAt); ok {
-				heads, reflog = at, true
+			if at, ok := s.movesAt(ctx, p.Dir, installedAt); ok {
+				moves, heads, reflog = at, at.heads(), true
 			}
 		}
-		var held []string
+		var held, lacking []string
 		for _, head := range heads {
 			_, err := s.git(ctx, p.Dir, "merge-base", "--is-ancestor", last, head)
 			var exit *exec.ExitError
 			switch {
 			case err == nil:
 				held = append(held, head)
-			case !errors.As(err, &exit) || exit.ExitCode() != 1:
+			case errors.As(err, &exit) && exit.ExitCode() == 1:
+				lacking = append(lacking, head)
+			default:
 				return time.Time{}, fmt.Sprintf("cannot check the repository's checkout: %v", err), nil
 			}
 		}
@@ -586,9 +589,9 @@ func (s *Ship) InEffect(ctx context.Context, p *Package) (time.Time, string, err
 			why = fmt.Sprintf("the checkout the installed file was built from did not hold %.12s", last)
 		case len(held) == 0:
 			why = fmt.Sprintf("the repository's checkout does not hold %.12s yet", last)
-		case len(held) < len(heads):
+		case len(lacking) > 0:
 			// the checkout moved between a commit with the change and one without it in the second the file was written
-			w, decided, err := s.changeFilesHeld(ctx, p, last, held, installedAt)
+			w, decided, err := s.changeFilesHeld(ctx, p, last, moves, held, lacking, installedAt)
 			if err != nil {
 				return time.Time{}, "", err
 			}
@@ -714,12 +717,13 @@ func (s *Ship) goBuildHolds(ctx context.Context, p *Package, bin io.ReaderAt, bu
 }
 
 // newestChange is the newest modification time among the change's own files in its checkout, and zero when none of
-// them is there.
+// them is there. A link is dated by its own time, which a checkout sets when it writes the link, not by its target's.
+// A file under a path that is no directory now (the change turned a directory into a file) is not there.
 func newestChange(p *Package) (time.Time, error) {
 	var newest time.Time
 	for _, name := range p.Changed {
-		st, err := os.Stat(filepath.Join(p.Dir, name))
-		if errors.Is(err, os.ErrNotExist) {
+		st, err := os.Lstat(filepath.Join(p.Dir, name))
+		if absent(err) {
 			continue
 		}
 		if err != nil {
@@ -730,6 +734,11 @@ func newestChange(p *Package) (time.Time, error) {
 		}
 	}
 	return newest, nil
+}
+
+// absent says whether a stat's error says the file is not there.
+func absent(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
 }
 
 // changeFilesMatch says whether the change's own files, as the working tree has them, match a revision's. A change
@@ -750,13 +759,43 @@ func (s *Ship) changeFilesMatch(ctx context.Context, p *Package, revision string
 	return true, nil
 }
 
+// moveWrites is what a checkout's move from one commit to another does to the change's own files: whether the two
+// differ on them, and which of them the move writes (those the commit moved to has and the other has not as it has
+// them). A file the move deletes is not written, so it dates nothing.
+func (s *Ship) moveWrites(ctx context.Context, p *Package, from, to string) (differ bool, writes []string, err error) {
+	if len(p.Changed) == 0 {
+		return false, nil, nil
+	}
+	args := append([]string{"--literal-pathspecs", "diff", "--no-renames", "--name-status", "-z", from, to, "--"}, p.Changed...)
+	out, err := s.git(ctx, p.Dir, args...)
+	if err != nil {
+		return false, nil, err
+	}
+	fields := strings.Split(strings.TrimSuffix(out, "\x00"), "\x00")
+	for i := 0; i+1 < len(fields); i += 2 {
+		differ = true
+		if fields[i] != "D" {
+			writes = append(writes, fields[i+1])
+		}
+	}
+	return differ, writes, nil
+}
+
 // changeFilesHeld decides whether an installed file written at writtenAt came from a tree that held the change, when
-// its checkout moved in that second between a commit that holds the change (one of held) and one that does not. The
-// reflog cannot order the move and the file then; the change's own files can, at the file's resolution: a move between
-// the two writes each file that differs. The tree held the change when one of them is there, none was modified after
-// the installed file, and they match a commit of held. why is empty then; decided is false when git could not tell.
-func (s *Ship) changeFilesHeld(ctx context.Context, p *Package, last string, held []string, writtenAt time.Time) (why string, decided bool, err error) {
+// its checkout moved in that second between a commit that holds the change (one of held) and one that does not (one
+// of lacking). The reflog cannot order the move and the file then; the change's own files can, at the file's
+// resolution, since a move writes each of them that the commit it moves to has and the other has not as it has it.
+// The tree held the change when one of them is there, none was modified after the installed file, they match a
+// commit of held, and the move to that commit from each of lacking that differs from it on them writes one of them.
+// A file written in the second of the reflog's only move in it, off the change, came before the move when the tree
+// matches the commit moved to and each file of the change the move writes is there, dated after the file and inside
+// that second. why is empty when the tree held the change; decided is false when git could not tell.
+func (s *Ship) changeFilesHeld(ctx context.Context, p *Package, last string, moves headMoves, held, lacking []string,
+	writtenAt time.Time) (why string, decided bool, err error) {
 	moved := fmt.Sprintf("the checkout moved to or from %.12s in the second the installed file was written", last)
+	cannot := func(err error) (string, bool, error) {
+		return fmt.Sprintf("cannot check the repository's checkout: %v", err), false, nil
+	}
 	newest, err := newestChange(p)
 	switch {
 	case err != nil:
@@ -764,31 +803,98 @@ func (s *Ship) changeFilesHeld(ctx context.Context, p *Package, last string, hel
 	case newest.IsZero():
 		return moved + ", and no file of the change is there to say which came first", true, nil
 	case newest.After(writtenAt):
+		before, gerr := s.builtBeforeMoveOff(ctx, p, moves, held, writtenAt)
+		if gerr != nil {
+			return cannot(gerr)
+		}
+		if before {
+			return "", true, nil
+		}
 		return moved + ", and a file of the change was modified after it", true, nil
 	}
 	for _, head := range held {
 		match, gerr := s.changeFilesMatch(ctx, p, head)
 		if gerr != nil {
-			return fmt.Sprintf("cannot check the repository's checkout: %v", gerr), false, nil
+			return cannot(gerr)
 		}
-		if match {
-			return "", true, nil
+		if !match {
+			continue
 		}
+		for _, from := range lacking {
+			differ, writes, gerr := s.moveWrites(ctx, p, from, head)
+			if gerr != nil {
+				return cannot(gerr)
+			}
+			if differ && len(writes) == 0 {
+				return moved + ", and the move wrote no file of the change to order it by", true, nil
+			}
+		}
+		return "", true, nil
 	}
 	return moved + ", and the change's own files do not match it", true, nil
 }
 
-// headsAt is the commits a checkout's HEAD may have named at a moment, by its reflog, and false when the reflog does
-// not reach back to it. The reflog dates a move to the whole second and the moment is finer, so a move in the
-// moment's own second may have come before it or after it: the commits are the one HEAD named before that second,
-// when the reflog reaches back that far, and each it moved to within it.
-func (s *Ship) headsAt(ctx context.Context, dir string, at time.Time) ([]string, bool) {
+// builtBeforeMoveOff says whether a file written at writtenAt came before the reflog's only move in that second, when
+// the move left a commit that holds the change for one that does not: the tree matches the commit moved to, and each
+// file of the change the move writes (one at least) is there, dated after the file and inside that second. With more
+// moves in the second, a file's time names only the last that wrote it.
+func (s *Ship) builtBeforeMoveOff(ctx context.Context, p *Package, moves headMoves, held []string, writtenAt time.Time) (bool, error) {
+	if len(moves.within) != 1 || moves.before == "" || !slices.Contains(held, moves.before) || slices.Contains(held, moves.within[0]) {
+		return false, nil
+	}
+	to := moves.within[0]
+	if match, err := s.changeFilesMatch(ctx, p, to); err != nil || !match {
+		return false, err
+	}
+	_, writes, err := s.moveWrites(ctx, p, moves.before, to)
+	if err != nil || len(writes) == 0 {
+		return false, err
+	}
+	for _, name := range writes {
+		st, err := os.Lstat(filepath.Join(p.Dir, name))
+		if absent(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if at := st.ModTime(); !at.After(writtenAt) || at.Unix() != writtenAt.Unix() {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// headMoves is what HEAD's reflog says of a moment: the commits HEAD moved to within the moment's whole second, newest
+// first, and the one it named before them (empty when the reflog does not reach back that far).
+type headMoves struct {
+	within []string
+	before string
+}
+
+// heads is the commits HEAD may have named at the moment, each once.
+func (m headMoves) heads() []string {
+	var heads []string
+	for _, commit := range append(slices.Clip(m.within), m.before) {
+		if commit != "" && !slices.Contains(heads, commit) {
+			heads = append(heads, commit)
+		}
+	}
+	return heads
+}
+
+// movesAt is what a checkout's HEAD's reflog says of a moment, and false when it does not reach back to it. The reflog
+// dates a move to the whole second and the moment is finer, so a move in the moment's own second may have come before
+// it or after it: HEAD may have named the commit it named before that second, or any it moved to within it. The one
+// before is the reflog's next entry after those moves, by its place in the reflog, not by its time: a clock stepped
+// back can date it later than they are.
+func (s *Ship) movesAt(ctx context.Context, dir string, at time.Time) (headMoves, bool) {
 	out, err := s.git(ctx, dir, "reflog", "show", "--format=%H %gd", "--date=unix", "HEAD")
 	if err != nil {
-		return nil, false
+		return headMoves{}, false
 	}
 	second := at.Unix()
-	var heads []string
+	var m headMoves
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") { // newest first
 		commit, place, ok := strings.Cut(line, " ")
 		if !ok {
@@ -796,17 +902,20 @@ func (s *Ship) headsAt(ctx context.Context, dir string, at time.Time) ([]string,
 		}
 		stamp := strings.TrimSuffix(strings.TrimPrefix(place, "HEAD@{"), "}")
 		secs, err := strconv.ParseInt(stamp, 10, 64)
-		if err != nil || secs > second {
+		if err != nil {
 			continue
 		}
-		if !slices.Contains(heads, commit) {
-			heads = append(heads, commit)
+		if secs == second {
+			m.within = append(m.within, commit)
+			continue
 		}
-		if secs < second {
-			break
+		if len(m.within) == 0 && secs > second {
+			continue
 		}
+		m.before = commit
+		break
 	}
-	return heads, len(heads) > 0
+	return m, len(m.within) > 0 || m.before != ""
 }
 
 // Keep records that a change's measurement kept it: its case closed as improved with the result.
