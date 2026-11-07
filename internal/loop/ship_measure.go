@@ -331,10 +331,16 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 	slices.Sort(omitted)
 	omitted = slices.Compact(omitted)
 	plan := Plan{Signal: sig, Window: window, Units: units, At: at, Installed: installed, Sources: sources, Omitted: omitted}
+	// The case's evidence, each event read once: the gate weighs it below, and a guard weighs it again.
+	evs, err := caseEvents(ctx, s.Store, c.ID, s.Dir)
+	if err != nil {
+		return Plan{}, err
+	}
 	// guard stands in for a measured plan refused as too new, too rare or with no recent event, at the same boundary:
-	// the sources it counts are those this plan's would be, for the units its history counts in.
+	// the sources it counts are those this plan's would be, for the units its history counts in. It weighs the case's
+	// evidence dated before the count's own time (now), never the boundary's: a later count's recurrences are the watch's.
 	guard := func(why error) (Plan, error) {
-		return s.guardPlan(ctx, c, plan, why, func(units string) ([]string, []string, error) {
+		return s.guardPlan(ctx, c, plan, why, now, evs, func(units string) ([]string, []string, error) {
 			found, err := live(units, at)
 			if err != nil {
 				return found, nil, err
@@ -351,10 +357,6 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 	// The case's evidence in the gate, and how much of it the signal counts. Where the case has evidence there, a signal
 	// that counts less than half of it does not measure the case's problem as it is now (its form may have changed):
 	// that refuses a measured plan and a guard alike, so it is checked before any guard stands in.
-	evs, err := caseEvents(ctx, s.Store, c.ID, s.Dir)
-	if err != nil {
-		return Plan{}, err
-	}
 	counted := map[string]bool{}
 	for _, e := range got {
 		counted["ev:"+e.ID()] = true
@@ -432,15 +434,24 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 	return plan, nil
 }
 
-// caseEvents is a case's evidence of events (ev:ID), the loop's own left out by the one rule every count of a plan
-// keeps (store.InDir): the counts never count an event of the loop's own runs, so the evidence their admission weighs
-// them against holds none either. An event the store no longer holds stays, by its evidence's time.
-func caseEvents(ctx context.Context, st *store.Store, caseID, dir string) ([]store.Evidence, error) {
+// caseEvent is a piece of a case's evidence of an event (ev:ID), with the event the store holds for it, when it still
+// holds one (Found).
+type caseEvent struct {
+	store.Evidence
+	Event store.Event
+	Found bool
+}
+
+// caseEvents is a case's evidence of events (ev:ID), each with the event it resolved to, the loop's own left out by the
+// one rule every count of a plan keeps (store.InDir): the counts never count an event of the loop's own runs, so the
+// evidence their admission weighs them against holds none either. An event the store no longer holds stays, by its
+// evidence's time, not Found.
+func caseEvents(ctx context.Context, st *store.Store, caseID, dir string) ([]caseEvent, error) {
 	evidence, err := st.CaseEvidence(ctx, caseID, 0)
 	if err != nil {
 		return nil, err
 	}
-	var out []store.Evidence
+	var out []caseEvent
 	for _, ev := range evidence {
 		id, ok := strings.CutPrefix(ev.Ref, "ev:")
 		if !ok {
@@ -453,7 +464,7 @@ func caseEvents(ctx context.Context, st *store.Store, caseID, dir string) ([]sto
 		if found && store.InDir(e.Cwd, dir) {
 			continue
 		}
-		out = append(out, ev)
+		out = append(out, caseEvent{Evidence: ev, Event: e, Found: found})
 	}
 	return out, nil
 }
