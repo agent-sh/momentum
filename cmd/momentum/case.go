@@ -175,7 +175,7 @@ func caseJSON(c store.Case) listedCase {
 		}{WindowHours: m.Window.Hours(), Before: m.Before, After: m.After, Effect: m.Effect, Guarded: m.Guarded(), Exposure: m.Exposure, Recur: m.Recur,
 			Last: evidenceview.LastMeasurement(c)}
 		if closed := c.Status == store.CaseClosed && c.Reason == store.Guarded; m.Guarded() {
-			l.Measurement.NoRate = m.Before == 0 || closed && m.Watched == 0
+			l.Measurement.NoRate = m.Before == 0 || m.Exposure == 0 || closed && m.Watched == 0
 			if closed {
 				watched := m.Watched
 				l.Measurement.Watched, l.Measurement.Unwatched = &watched, m.Watched == 0

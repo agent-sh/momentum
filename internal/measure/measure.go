@@ -189,6 +189,14 @@ const (
 	GuardLeftOut = "not watched: its unit was used only in sources left out at the watch's end, in the 30 days"
 )
 
+// The reasons a guard's history gives no rate, as its close and every view say them. A history recounted at the
+// watch's end over the sources it kept holds no exposure only when the ones it left out held all of it: the
+// proposal's figure counted those, so it is not the close's.
+const (
+	GuardNoIncident = "no rate to compare: the history holds no incident after its first"
+	GuardNoExposure = "no rate to compare: the history holds no exposure in the sources kept at the watch's end"
+)
+
 // GuardedAway is Guarded for a watch whose unit was used only while its change was out of effect: it watched nothing,
 // and says why.
 func GuardedAway(incidents, exposure int, units string) Result {
@@ -234,13 +242,19 @@ func Guarded(incidents, exposure, recurrences, watched int, units string) Result
 	if watched == 0 {
 		r.Unwatched, r.NoRate = true, true
 		r.Effect = fmt.Sprintf("guarded, %s after the change (%d incidents in %d %s before it); there is no P", GuardUnused, incidents, exposure, units)
+		if exposure == 0 {
+			r.Effect += "; " + GuardNoExposure
+		}
 		return r
 	}
-	chance := "no rate to compare: the history holds no incident after its first"
-	if r.Recur = GuardRecur(incidents, exposure, watched); incidents > 0 && exposure > 0 {
-		chance = fmt.Sprintf("P=%s that the problem, had it kept happening, would have recurred within them", percent(r.Recur))
-	} else {
+	chance := GuardNoIncident
+	switch r.Recur = GuardRecur(incidents, exposure, watched); {
+	case exposure == 0:
+		chance, r.NoRate = GuardNoExposure, true
+	case incidents == 0:
 		r.NoRate = true
+	default:
+		chance = fmt.Sprintf("P=%s that the problem, had it kept happening, would have recurred within them", percent(r.Recur))
 	}
 	r.Effect = fmt.Sprintf("guarded, not measured: no recurrence in %d %s watched after the change (%d incidents in %d %s before it); %s; a problem that stopped by itself shows the same",
 		watched, units, incidents, exposure, units, chance)

@@ -265,11 +265,13 @@ func StatusLine(c store.Case) string {
 // guardChance is a guarded close's P in words, with its precision: the probability that the problem, had it kept
 // happening, would have recurred in its watch, or that its history gives no rate.
 func guardChance(m store.Measurement, precision string) string {
-	if m.Watched == 0 {
+	switch {
+	case m.Watched == 0:
 		return measure.GuardNotWatched(m.Effect)
-	}
-	if m.Before == 0 {
-		return "no rate to compare: the history holds no incident after its first"
+	case m.Exposure == 0: // its history held no exposure in the sources its close kept
+		return measure.GuardNoExposure
+	case m.Before == 0:
+		return measure.GuardNoIncident
 	}
 	return fmt.Sprintf("P="+precision+"%% had it kept happening", 100*m.Recur)
 }

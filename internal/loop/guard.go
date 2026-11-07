@@ -30,10 +30,10 @@ const guardWeek = 7 * 24 * time.Hour
 // came inside it, with the sources the plan would count for the units its history counts in, read whole. The
 // signal's events there fall into incidents (no gap longer than measure.GuardGap between two of them), and an
 // incident the source began with is dropped (measure.GuardCount). Its exposure is the plan's units of activity in
-// which the problem's unit was in use: the signal's tool, else the tool or directory all its events share. It is
-// refused only where no watch could be kept: the case's evidence is not the signal's, its events share no unit, or
-// its history holds no exposure. A refusal names the measured plan's beside the guard's. sourcesFor gives the
-// sources and the omitted ones for a count in units, or a *waitingPlan.
+// which the problem's unit was in use: the signal's tool, else the small set of tools or directories its events fall
+// in (guardUnit). It is refused only where no watch could be kept: the case's evidence is not the signal's, its events
+// fall in no such set, or its history holds no exposure. A refusal names the measured plan's beside the guard's.
+// sourcesFor gives the sources and the omitted ones for a count in units, or a *waitingPlan.
 func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead error, sourcesFor func(units string) ([]string, []string, error)) (Plan, error) {
 	why := strings.TrimPrefix(instead.Error(), ErrRefused.Error()+": ")
 	refuse := func(format string, a ...any) (Plan, error) {
@@ -109,11 +109,11 @@ func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead e
 	case hit*2 < in:
 		return refuse("the signal counts %d of the case's %d events in its history: it does not measure the case's problem", hit, in)
 	}
-	tool, cwd, ok := sharedUnit(sig, units, hits)
-	if !ok {
-		return refuse("its events share no tool or directory, so absence cannot be counted only while the problem's unit was in use")
+	tools, cwds, none := guardUnit(sig, units, hits)
+	if none != "" {
+		return refuse("%s", none)
 	}
-	g.Guard = &Guard{Instead: why, Gap: measure.GuardGap, Units: units, Tool: tool, Cwd: cwd, Begun: since, Anchored: anchored}
+	g.Guard = &Guard{Instead: why, Gap: measure.GuardGap, Units: units, Tools: tools, Cwds: cwds, Begun: since, Anchored: anchored}
 	h, err := guardHistory(ctx, s.Store, g, since, at, s.Dir, anchored)
 	if err != nil {
 		return Plan{}, err
@@ -130,39 +130,86 @@ func setGuard(g *Guard, h measure.GuardHistory) {
 	g.Since, g.Incidents, g.Exposure = h.Since, h.Incidents, h.Exposure
 }
 
-// sharedUnit is what a guard's exposure is narrowed to: the signal's tool; else the tool every event of its history
-// was of; else the directory they all ran in, compared as the store keeps it now (store.CleanCwd), since a row stored
-// before the store cleaned working directories keeps its form until its source is read again. ok is false when they
-// share none: then every activity would count as the problem's unit in use.
-func sharedUnit(sig Signal, units string, hits []store.Event) (tool, cwd string, ok bool) {
+// guardUnit is what a guard's exposure is narrowed to, the problem's unit: the signal's tool; else the tools its
+// history's events were of, when every one was of a tool (never for the owner's hours: his turns are of none); else
+// the directories they ran in, when every one ran in one, compared as the store keeps them now (store.CleanCwd), since
+// a row stored before the store cleaned working directories keeps its form until its source is read again, and a
+// directory below another of them left to the one that covers it. A unit of one comes first: the one tool every event
+// was of, else the one directory that holds them all. Else the set of tools, else the set of directories, when it is
+// small (smallSet). none says why there is no unit, when there is none: then every activity would count as the
+// problem's unit in use.
+func guardUnit(sig Signal, units string, hits []store.Event) (tools, cwds []string, none string) {
 	if sig.Tool != "" && units != OwnerHours {
-		return sig.Tool, "", true
+		return []string{sig.Tool}, nil, ""
 	}
-	same := func(of func(store.Event) string) string {
-		v := of(hits[0])
-		for _, e := range hits[1:] {
-			if of(e) != v {
-				return ""
+	set := func(of func(store.Event) string) []string {
+		var out []string
+		for _, e := range hits {
+			v := of(e)
+			if v == "" {
+				return nil // an event outside every member: no set holds them all
+			}
+			if !slices.Contains(out, v) {
+				out = append(out, v)
 			}
 		}
-		return v
+		slices.Sort(out)
+		return out
 	}
-	if t := same(func(e store.Event) string { return e.Tool }); t != "" && units != OwnerHours {
-		return t, "", true
+	if units != OwnerHours {
+		tools = set(func(e store.Event) string { return e.Tool })
 	}
-	if d := same(func(e store.Event) string { return store.CleanCwd(e.Cwd) }); d != "" {
-		return "", d, true
+	all := set(func(e store.Event) string { return store.CleanCwd(e.Cwd) })
+	cwds = slices.DeleteFunc(slices.Clone(all), func(dir string) bool { // one below another of them: the other covers it
+		return slices.ContainsFunc(all, func(above string) bool { return above != dir && store.InAnyDir(dir, []string{above}) })
+	})
+	n := hitUnits(hits, units)
+	switch {
+	case len(tools) == 1:
+		return tools, nil, ""
+	case len(cwds) == 1:
+		return nil, cwds, ""
+	case smallSet(tools, n):
+		return tools, nil, ""
+	case smallSet(cwds, n):
+		return nil, cwds, ""
 	}
-	return "", "", false
+	toolsWhy := fmt.Sprintf("%d tools", len(tools))
+	switch {
+	case units == OwnerHours:
+		toolsWhy = "the owner's turns are of no tool"
+	case tools == nil:
+		toolsWhy = "some of no tool"
+	}
+	dirsWhy := fmt.Sprintf("%d directories", len(cwds))
+	if all == nil {
+		dirsWhy = "some in no directory"
+	}
+	return nil, nil, fmt.Sprintf("its events fall in no small set of tools or directories (%s, %s, in %d units of its problem: a set of more than one has at most half as many members as those units), so absence cannot be counted only while the problem's unit was in use",
+		toolsWhy, dirsWhy, n)
 }
 
-// guardUnitText says what a guard's exposure is narrowed to, for its proposal.
+// smallSet says whether a set of more than one tool or directory, which a problem's events fall in in n units, is
+// small enough to be its unit: at most half as many members as the units, so that on average each member holds two of
+// them. A member that holds one unit alone may be the tool or directory a failure happened to surface in; a set that
+// grows as fast as its units do is that for every failure, not where the problem happens, and counting the hours of
+// all its members would count activity in general, which a guard with no unit is refused for.
+func smallSet(set []string, n int) bool {
+	return len(set) > 1 && 2*len(set) <= n
+}
+
+// guardUnitText says what a guard's exposure is narrowed to, for its proposal: the tools by name, the directories by
+// how many there are (a path is the machine's own).
 func guardUnitText(g Guard) string {
 	switch {
-	case g.Tool != "":
-		return ", counting the hours in which " + g.Tool + " was used"
-	case g.Cwd != "":
+	case len(g.Tools) == 1:
+		return ", counting the hours in which " + g.Tools[0] + " was used"
+	case len(g.Tools) > 1:
+		return fmt.Sprintf(", counting the hours in which any of the %d tools its events were of was used (%s)", len(g.Tools), strings.Join(g.Tools, ", "))
+	case len(g.Cwds) == 1:
 		return ", counting the hours of work in its directory"
+	case len(g.Cwds) > 1:
+		return fmt.Sprintf(", counting the hours of work in any of the %d directories its events ran in", len(g.Cwds))
 	}
 	return ""
 }
@@ -220,7 +267,8 @@ func recurrencesWritten(ctx context.Context, st *store.Store, plan Plan, since, 
 }
 
 // guardExposure is a guard's exposure over a span: the plan's units of activity among its sources in which the
-// problem's unit was in use (its guard's tool or directory), with the units of its hits.
+// problem's unit was in use (a call to one of its guard's tools, or work in one of its directories), with the units of
+// its hits.
 func guardExposure(ctx context.Context, st *store.Store, plan Plan, hits []store.Event, since, until time.Time, dir string) (map[store.Unit]bool, error) {
 	if !until.After(since) {
 		return map[store.Unit]bool{}, nil
@@ -231,7 +279,7 @@ func guardExposure(ctx context.Context, st *store.Store, plan Plan, hits []store
 	}
 	q.Sources = plan.Sources
 	if plan.Guard != nil {
-		q.Tool, q.Cwd = plan.Guard.Tool, plan.Guard.Cwd
+		q.Tools, q.Cwds = plan.Guard.Tools, plan.Guard.Cwds
 	}
 	base, err := st.Activity(ctx, q)
 	if err != nil {
@@ -416,13 +464,29 @@ func guardCounted(plan Plan, out []string) Plan {
 	return plan
 }
 
+// guardOutText names, for the close's own log line, the sources its close left out (guardBehind), which no other
+// record names (a source switched off or stopped is named by countingPlan's note): the ones left out of its counts,
+// and the signal's own, kept in them, when it read only in part since the watch's end.
+func guardOutText(plan Plan, out []string) string {
+	var says []string
+	if left := slices.DeleteFunc(slices.Clone(out), func(source string) bool { return source == plan.Signal.Source }); len(left) > 0 {
+		says = append(says, "sources left out of the guard's history and exposure watched at its watch's end, read in part or not at all since it: "+strings.Join(left, ", "))
+	}
+	if slices.Contains(out, plan.Signal.Source) {
+		says = append(says, plan.Signal.Source+", the signal's own source, kept in the counts, read only in part since the watch's end")
+	}
+	return strings.Join(says, "; ")
+}
+
 // guardRecount counts a guard's history again through its watch's start: the plan was counted at the proposal, and
 // the change may take effect much later. From the start on, an event is a recurrence, never history. It starts where
 // the proposal's count did and drops the incident the source began with as that count did, so an event of that
 // incident stored since does not count as another. The caller gives the plan with the sources its close left out
 // taken out (guardCounted), and has seen each of the others read past the end, so past the start; the signal's own
-// source may have read past it only in part.
-func (r *Runner) guardRecount(ctx context.Context, plan Plan, from time.Time) (*Guard, error) {
+// source may have read past it only in part. A recount with no exposure keeps the proposal's count (a rebuild may have
+// dropped what the store read of the history), but where sources were dropped (dropped): the proposal's count holds
+// theirs, so the recount's stands, and the close says its history held no exposure in the sources it kept.
+func (r *Runner) guardRecount(ctx context.Context, plan Plan, from time.Time, dropped bool) (*Guard, error) {
 	g := *plan.Guard
 	begun, anchored := g.Since, false
 	if !g.Begun.IsZero() {
@@ -432,7 +496,7 @@ func (r *Runner) guardRecount(ctx context.Context, plan Plan, from time.Time) (*
 	if err != nil {
 		return nil, err
 	}
-	if h.Exposure > 0 {
+	if h.Exposure > 0 || dropped {
 		setGuard(&g, h)
 	}
 	return &g, nil
@@ -523,7 +587,7 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 	}
 	plan = guardCounted(plan, out)
 	dropped := slices.DeleteFunc(slices.Clone(recorded), func(source string) bool { return slices.Contains(plan.Sources, source) })
-	counted, err := r.guardRecount(ctx, plan, from)
+	counted, err := r.guardRecount(ctx, plan, from, len(dropped) > 0)
 	if err != nil {
 		return failed(err)
 	}
@@ -535,22 +599,32 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 		return failed(err)
 	}
 	res := measure.Guarded(g.Incidents, g.Exposure, 0, len(watched), plan.Units)
-	if res.Unwatched && len(p.GuardAway) > 0 {
-		if used, err := guardExposure(ctx, r.Store, plan, nil, from, end, r.Dir); err != nil {
-			return failed(err)
-		} else if len(used) > 0 { // used, but only while the change was out of effect
-			res = measure.GuardedAway(g.Incidents, g.Exposure, plan.Units)
-		}
-	}
-	if res.Unwatched && measure.GuardNotWatched(res.Effect) == measure.GuardUnused && len(dropped) > 0 {
-		// every recorded source, the ones switched off or stopped before the close (countingPlan) as well as the ones it
-		// left out: was the unit used only in those?
+	if res.Unwatched {
+		// why it watched nothing, read over every recorded source: the ones switched off or stopped before the close
+		// (countingPlan) and the ones it left out, as well as the ones it kept. Its unit used while the change was in
+		// effect, in a source left out; else used only while the change was out of effect; else not used.
 		all := plan
 		all.Sources = recorded
-		if used, err := guardExposure(ctx, r.Store, all, nil, from, end, r.Dir); err != nil {
-			return failed(err)
-		} else if len(used) > 0 {
+		why := measure.GuardUnused
+		if len(dropped) > 0 {
+			if seen, err := guardWatched(ctx, r.Store, p, all, nil, from, end, r.Dir); err != nil {
+				return failed(err)
+			} else if len(seen) > 0 {
+				why = measure.GuardLeftOut
+			}
+		}
+		if why == measure.GuardUnused && len(p.GuardAway) > 0 {
+			if used, err := guardExposure(ctx, r.Store, all, nil, from, end, r.Dir); err != nil {
+				return failed(err)
+			} else if len(used) > 0 { // used, but only while the change was out of effect
+				why = measure.GuardAway
+			}
+		}
+		switch why {
+		case measure.GuardLeftOut:
 			res = measure.GuardedLeftOut(g.Incidents, g.Exposure, plan.Units)
+		case measure.GuardAway:
+			res = measure.GuardedAway(g.Incidents, g.Exposure, plan.Units)
 		}
 	}
 	m.Result, m.Status = &res, "guarded"
@@ -565,6 +639,8 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 	switch {
 	case res.Unwatched:
 		chance = "It was " + measure.GuardNotWatched(res.Effect) + ", so there is no P."
+	case g.Exposure == 0:
+		chance = "The history holds no exposure in the sources kept at the watch's end, so there is no rate to compare."
 	case !res.NoRate:
 		chance = fmt.Sprintf("Had it kept happening, it would have recurred within that with probability P=%.1f%%.", 100*res.Recur)
 	}
@@ -576,16 +652,8 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 		Effect: res.Effect, Links: prLinks(p.PR)}); err != nil {
 		return failed(fmt.Errorf("the note: %w", err))
 	}
-	if _, err := r.Store.CloseGuarded(ctx, c.ID, g.Incidents, g.Exposure, len(watched), res.Recur, res.Effect, "loop:measure"); err != nil {
+	if _, err := r.Store.CloseGuarded(ctx, c.ID, g.Incidents, g.Exposure, len(watched), res.Recur, res.Effect, guardOutText(plan, out), "loop:measure"); err != nil {
 		return failed(err)
-	}
-	// the sources the close left out of its counts, which no record names otherwise (a source switched off or stopped
-	// is named by countingPlan's note): after the close, so a close that failed and is tried again names them once
-	if left := slices.DeleteFunc(slices.Clone(out), func(source string) bool { return source == plan.Signal.Source }); len(left) > 0 {
-		if err := r.Store.CaseNote(ctx, c.ID, "measurement sources", "sources left out of the guard's history and exposure watched at its watch's end, read in part or not at all since it: "+
-			strings.Join(left, ", "), "loop:measure"); err != nil {
-			r.logf("note on %s: %v", c.ID, err)
-		}
 	}
 	kept, err := r.Ship.keepLocked(c.ID, res)
 	if err != nil {

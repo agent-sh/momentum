@@ -48,6 +48,11 @@ func TestTheGuardsArithmeticIsSPECs(t *testing.T) {
 		!strings.Contains(r.Effect, "no rate to compare: the history holds no incident after its first") {
 		t.Fatalf("a watch whose history holds no incident after its first: %+v", r)
 	}
+	// a close that dropped sources and recounted no exposure in the ones it kept: no rate, and it says why
+	if r := Guarded(0, 0, 0, 125, "session hours"); !r.NoRate || r.Recur != 0 || strings.Contains(r.Effect, "P=") || strings.Contains(r.Effect, "no incident") ||
+		!strings.Contains(r.Effect, "(0 incidents in 0 session hours before it); no rate to compare: the history holds no exposure in the sources kept at the watch's end") {
+		t.Fatalf("a watch whose history holds no exposure in the sources it kept: %+v", r)
+	}
 	if r := Guarded(4, 684, 0, 0, "session hours"); r.Improved || !r.Unwatched || !r.NoRate || r.Recur != 0 || strings.Contains(r.Effect, "P=") ||
 		!strings.Contains(r.Effect, "not watched: the unit was not used in the 30 days") {
 		t.Fatalf("a watch whose unit was not used: %+v", r)
@@ -92,6 +97,8 @@ func TestTheGuardsArithmeticIsSPECs(t *testing.T) {
 		"\"not watched: the change was out of effect while its unit was used in the 30 days\"",
 		"P = 1 - (T/(T+W))^(k+½), had the problem kept happening",
 		"\"no rate to compare: the history holds no incident after its first\"",
+		"\"no rate to compare: the history holds no exposure in the sources kept at the watch's end\"",
+		"at most half as many members as the units its events fall in",
 		"**P** is for the report alone: nothing decides on it",
 		"a problem that stopped by itself gives the same result",
 		"closes the case as `guarded`, a close reason of its own, never `improved`",

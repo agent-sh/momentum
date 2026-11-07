@@ -39,8 +39,11 @@ type ActivityQuery struct {
 	BySession    bool     // the sessions' hours; otherwise the machine's
 	Harness      string   // when set, only that harness's events
 	Actor        Actor    // when set, only the hours in which it did something (the owner's turns, say)
-	Tool         string   // when set, only the hours in which that tool was called or answered: a guard's exposure
-	Cwd          string   // when set, only the hours of events in this directory or below it: a guard's exposure
+	Tools        []string // when set, only the hours in which one of these tools was called or answered: a guard's exposure
+	// Cwds, when set, keeps only the hours of events in one of these directories or below it: a guard's exposure. Each
+	// row's directory is compared cleaned (CleanCwd), so a row stored before the store cleaned working directories
+	// (`/a//b`, `/a/./b`) is in its directory as one stored after is. Activity alone narrows by it.
+	Cwds []string
 }
 
 // Activity returns the units of activity over a span: the hours in which the sessions picked (an event of a
@@ -50,7 +53,11 @@ func (s *Store) Activity(ctx context.Context, q ActivityQuery) (map[Unit]bool, e
 		return nil, errors.New("an activity span ends after it starts")
 	}
 	where, args, session := activityWhere(q)
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT `+session+`, ts / 3600000 FROM events WHERE `+strings.Join(where, " AND "), args...)
+	cwd := "''"
+	if len(q.Cwds) > 0 {
+		cwd = "cwd" // compared in Go, cleaned: SQL would miss a row stored in another form of its directory
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT `+session+`, ts / 3600000, `+cwd+` FROM events WHERE `+strings.Join(where, " AND "), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -58,12 +65,32 @@ func (s *Store) Activity(ctx context.Context, q ActivityQuery) (map[Unit]bool, e
 	out := map[Unit]bool{}
 	for rows.Next() {
 		var u Unit
-		if err := rows.Scan(&u.Session, &u.Hour); err != nil {
+		var dir string
+		if err := rows.Scan(&u.Session, &u.Hour, &dir); err != nil {
 			return nil, err
+		}
+		if len(q.Cwds) > 0 && !InAnyDir(dir, q.Cwds) {
+			continue
 		}
 		out[u] = true
 	}
 	return out, rows.Err()
+}
+
+// InAnyDir says whether a working directory, cleaned (CleanCwd), is one of dirs or below one of them. An empty one is
+// in none.
+func InAnyDir(cwd string, dirs []string) bool {
+	if cwd == "" {
+		return false
+	}
+	cwd = CleanCwd(cwd)
+	for _, dir := range dirs {
+		dir = CleanCwd(dir)
+		if dir != "" && (cwd == dir || strings.HasPrefix(cwd, strings.TrimRight(dir, "/")+"/")) {
+			return true
+		}
+	}
+	return false
 }
 
 // activityWhere gives activity and its sources the same bounds.
@@ -76,12 +103,13 @@ func activityWhere(q ActivityQuery) ([]string, []any, string) {
 	if q.Actor != "" {
 		where, args = append(where, "actor = ?"), append(args, string(q.Actor))
 	}
-	if q.Tool != "" {
-		where, args = append(where, "tool = ?"), append(args, q.Tool)
-	}
-	if q.Cwd != "" {
-		dir := filepath.Clean(q.Cwd)
-		where, args = append(where, "(cwd = ? OR instr(cwd, ?) = 1)"), append(args, dir, strings.TrimRight(dir, "/")+"/")
+	if len(q.Tools) > 0 {
+		marks := make([]string, len(q.Tools))
+		for i, tool := range q.Tools {
+			marks[i] = "?"
+			args = append(args, tool)
+		}
+		where = append(where, "tool IN ("+strings.Join(marks, ",")+")")
 	}
 	if q.Sources != nil {
 		marks := make([]string, len(q.Sources))

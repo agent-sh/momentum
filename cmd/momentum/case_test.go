@@ -611,7 +611,8 @@ func TestCaseJSONSaysWhatAGuardWatched(t *testing.T) {
 
 // A measurement a case keeps from an earlier episode is labelled its last: case show prints it as last measured and
 // case show --json marks it last, once the case has come back and on through its next change, while deployed. Its own
-// close as improved prints it as measured, unmarked.
+// measurement, while it measures and at its close as improved, prints as measured, unmarked, and so does the next
+// change's once it measures.
 func TestCaseShowLabelsAKeptMeasurementAsTheLast(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(filepath.Join(t.TempDir(), "m.db"))
@@ -642,9 +643,6 @@ func TestCaseShowLabelsAKeptMeasurementAsTheLast(t *testing.T) {
 	if _, err := st.StartMeasuring(ctx, c.ID, 7*24*time.Hour, 6, deployed, "loop:measure"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.CloseMeasured(ctx, c.ID, 1, "6 of 100 before, 1 of 100 after", "loop:measure"); err != nil {
-		t.Fatal(err)
-	}
 	views := func(t *testing.T) (string, string) {
 		t.Helper()
 		got, err := st.CaseByID(ctx, c.ID)
@@ -661,9 +659,17 @@ func TestCaseShowLabelsAKeptMeasurementAsTheLast(t *testing.T) {
 		}
 		return b.String(), string(raw)
 	}
-	if text, raw := views(t); !strings.Contains(text, "  measured:") || strings.Contains(text, "last measured") || strings.Contains(raw, `"last"`) {
-		t.Fatalf("its own close as improved:\n%s\n%s", text, raw)
+	own := func(t *testing.T, when string) {
+		t.Helper()
+		if text, raw := views(t); !strings.Contains(text, "  measured:") || strings.Contains(text, "last measured") || strings.Contains(raw, `"last"`) {
+			t.Fatalf("%s:\n%s\n%s", when, text, raw)
+		}
 	}
+	own(t, "measuring")
+	if _, err := st.CloseMeasured(ctx, c.ID, 1, "6 of 100 before, 1 of 100 after", "loop:measure"); err != nil {
+		t.Fatal(err)
+	}
+	own(t, "its own close as improved")
 	if _, err := st.RegressCase(ctx, c.ID, "back at its old share", "loop:measure"); err != nil {
 		t.Fatal(err)
 	}
@@ -678,4 +684,8 @@ func TestCaseShowLabelsAKeptMeasurementAsTheLast(t *testing.T) {
 			t.Fatalf("%s, its last measurement kept:\n%s\n%s", step, text, raw)
 		}
 	}
+	if _, err := st.StartMeasuring(ctx, c.ID, 7*24*time.Hour, 4, time.Now().Add(-time.Hour), "loop:measure"); err != nil {
+		t.Fatal(err)
+	}
+	own(t, "the next change measuring")
 }

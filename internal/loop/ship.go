@@ -200,12 +200,57 @@ type Guard struct {
 	Gap      time.Duration `json:"gap"` // a longer quiet stretch between two events starts a new incident: measure.GuardGap
 	// Units are the plan's, kept here: the plan's own are left empty in its JSON (Plan.MarshalJSON).
 	Units string `json:"units,omitempty"`
-	// Tool and Cwd narrow its exposure to the hours in which the problem's unit was in use: the signal's tool, else the
-	// tool or the directory every event of its history shares.
-	Tool      string `json:"tool,omitempty"`
-	Cwd       string `json:"cwd,omitempty"`
-	Incidents int    `json:"incidents"` // in the history
-	Exposure  int    `json:"exposure"`  // units of exposure in the history
+	// Tools and Cwds narrow its exposure to the hours in which the problem's unit was in use: the signal's tool, else
+	// the set of tools its history's events used, else the set of directories they ran in (guardUnit). Its JSON keeps a
+	// set of one as tool or cwd, as the builds before sets wrote and read it (Guard.MarshalJSON).
+	Tools     []string `json:"-"`
+	Cwds      []string `json:"-"`
+	Incidents int      `json:"incidents"` // in the history
+	Exposure  int      `json:"exposure"`  // units of exposure in the history
+}
+
+// guardFields is a Guard without its JSON methods.
+type guardFields Guard
+
+// guardWire is a guard as its plan's JSON keeps it: a unit of one tool or directory as tool or cwd, as the builds
+// before sets wrote and read it, so a guard of one reads the same in either; a set of more as tools or cwds.
+type guardWire struct {
+	guardFields
+	Tool  string   `json:"tool,omitempty"`
+	Cwd   string   `json:"cwd,omitempty"`
+	Tools []string `json:"tools,omitempty"`
+	Cwds  []string `json:"cwds,omitempty"`
+}
+
+// MarshalJSON writes a guard with its unit in the form guardWire keeps.
+func (g Guard) MarshalJSON() ([]byte, error) {
+	w := guardWire{guardFields: guardFields(g)}
+	one := func(set []string) (string, []string) {
+		if len(set) == 1 {
+			return set[0], nil
+		}
+		return "", set
+	}
+	w.Tool, w.Tools = one(g.Tools)
+	w.Cwd, w.Cwds = one(g.Cwds)
+	return json.Marshal(w)
+}
+
+// UnmarshalJSON reads a guard back in either form of its unit.
+func (g *Guard) UnmarshalJSON(raw []byte) error {
+	var w guardWire
+	if err := json.Unmarshal(raw, &w); err != nil {
+		return err
+	}
+	*g = Guard(w.guardFields)
+	g.Tools, g.Cwds = w.Tools, w.Cwds
+	if w.Tool != "" && len(g.Tools) == 0 {
+		g.Tools = []string{w.Tool}
+	}
+	if w.Cwd != "" && len(g.Cwds) == 0 {
+		g.Cwds = []string{w.Cwd}
+	}
+	return nil
 }
 
 // planFields is a Plan without its JSON methods.

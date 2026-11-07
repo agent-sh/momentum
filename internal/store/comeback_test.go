@@ -78,7 +78,7 @@ func TestAGuardedCaseSaysOnlyEventsBringItBack(t *testing.T) {
 	if _, err := st.StartGuarding(ctx, c.ID, 30*24*time.Hour, 4, 684, c.Deployed, "a watch", "loop:measure"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.CloseGuarded(ctx, c.ID, 4, 684, 125, 0.5, "guarded, not measured", "loop:measure"); err != nil {
+	if _, err := st.CloseGuarded(ctx, c.ID, 4, 684, 125, 0.5, "guarded, not measured", "", "loop:measure"); err != nil {
 		t.Fatal(err)
 	}
 	got, obs, err := st.AddCaseEvidence(ctx, c.ID, refsAt("later", 1, time.Now().Add(-time.Minute)), "agent")
@@ -143,7 +143,7 @@ func TestAComebackKeepsTheLastMeasurementButNoGuard(t *testing.T) {
 	if _, err := st.StartGuarding(ctx, g.ID, 30*24*time.Hour, 4, 684, g.Deployed, "a watch", "loop:measure"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.CloseGuarded(ctx, g.ID, 4, 684, 125, 0.5, "guarded, not measured", "loop:measure"); err != nil {
+	if _, err := st.CloseGuarded(ctx, g.ID, 4, 684, 125, 0.5, "guarded, not measured", "", "loop:measure"); err != nil {
 		t.Fatal(err)
 	}
 	if got, err = st.RegressCase(ctx, g.ID, "its problem came back", "loop:measure"); err != nil || got.Measurement != (Measurement{}) {

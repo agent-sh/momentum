@@ -901,8 +901,8 @@ func TestAGuardsEvidenceIsDecidedByOneRule(t *testing.T) {
 
 // An ingest source that has read only in part since a watch's end, its failed files newer than the watch's start, is
 // left out a window (the plan's) after the end: before that the watch waits for it, after it the watch closes, the
-// signal's source still in its counts. A pass after the 30 days whose signal's newest complete read started before the
-// end waits.
+// signal's source still in its counts, and the close's own log line names it so. A pass after the 30 days whose
+// signal's newest complete read started before the end waits.
 func TestAGuardWaitsForItsSignalsReadPastTheEndForAWindow(t *testing.T) {
 	ctx := context.Background()
 	m := guarded(t, time.Hour, toolSignal.Source, nil)
@@ -934,6 +934,22 @@ func TestAGuardWaitsForItsSignalsReadPastTheEndForAWindow(t *testing.T) {
 	// left out of the close, the signal's source stays in its counts: its 125 hours of use are watched
 	if got := m.measure(t, Options{}); got.Status != "guarded" || got.Result == nil || got.Result.Watched != 125 {
 		t.Fatalf("a window past the end, read only in part since it: %+v %+v", got, got.Result)
+	}
+	log, err := m.st.CaseLog(ctx, m.c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	named := 0
+	for _, l := range log {
+		if strings.Contains(l.Detail, toolSignal.Source+", the signal's own source, kept in the counts, read only in part since the watch's end") {
+			named++
+			if l.Action != "closed" {
+				t.Fatalf("named in a line other than the close's: %+v", l)
+			}
+		}
+	}
+	if named != 1 {
+		t.Fatalf("the close's line does not name the signal's source read in part: %+v", log)
 	}
 }
 

@@ -225,27 +225,49 @@ func TestAGuardsStretchOutOfEffectStartsAtTheLastPassThatSawItInEffect(t *testin
 	}
 }
 
+// moreUse puts the tool's use in another ingest source, zz-more, every hour from 28 days before planAt until useUntil,
+// in sessions of their own; the source began 60 days before planAt and was read at it.
+func moreUse(t *testing.T, st *store.Store, planAt, useUntil time.Time) {
+	t.Helper()
+	more := []store.Event{toolResult("more-began", planAt.Add(-60*aDay), "more-began", false)}
+	for i, u := 0, planAt.Add(-28*aDay); u.Before(useUntil); i, u = i+1, u.Add(time.Hour) {
+		more = append(more, toolResult(fmt.Sprint("more-", i), u.Add(10*time.Minute), fmt.Sprint("more-", i), false))
+	}
+	for i := range more {
+		more[i].Source = "zz-more"
+	}
+	put(t, st, more)
+	if err := st.MarkRead(context.Background(), "zz-more", planAt); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // A source a guard leaves out at its watch's end counts in neither the history's recount nor the exposure watched, as
 // a stopped source counts on neither side of a measured plan: with the tool used as often in another ingest source,
 // which stops reading on day ten, the close a window past the end counts the 684 hours of history and the 125 watched
-// of the signal's source alone, not the other source's 672 and 125 beside them, and the case's log names it once.
+// of the signal's source alone, not the other source's 672 and 125 beside them. The close's own log line names it,
+// once: a dry pass at the close names it nowhere.
 func TestASourceAGuardLeavesOutAtItsEndCountsInNeitherItsHistoryNorItsWatch(t *testing.T) {
 	ctx := context.Background()
 	m := guarded(t, time.Hour, toolSignal.Source, func(st *store.Store, planAt, useUntil time.Time) store.Case {
 		c, _ := recurring(t, st, toolSignal.Source, planAt, useUntil, planAt, fourBursts(planAt)...)
-		more := []store.Event{toolResult("more-began", planAt.Add(-60*aDay), "more-began", false)}
-		for i, u := 0, planAt.Add(-28*aDay); u.Before(useUntil); i, u = i+1, u.Add(time.Hour) {
-			more = append(more, toolResult(fmt.Sprint("more-", i), u.Add(10*time.Minute), fmt.Sprint("more-", i), false))
-		}
-		for i := range more {
-			more[i].Source = "zz-more"
-		}
-		put(t, st, more)
-		if err := st.MarkRead(ctx, "zz-more", planAt); err != nil {
-			t.Fatal(err)
-		}
+		moreUse(t, st, planAt, useUntil)
 		return c
 	})
+	named := func(t *testing.T) []store.CaseEntry {
+		t.Helper()
+		log, err := m.st.CaseLog(ctx, m.c.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var lines []store.CaseEntry
+		for _, l := range log {
+			if strings.Contains(l.Detail, "zz-more") {
+				lines = append(lines, l)
+			}
+		}
+		return lines
+	}
 	if p, _, _ := m.r.Ship.Load(m.c.ID); p.Plan == nil {
 		t.Fatal("no plan")
 	} else if g, _ := guardOf(t, *p.Plan); g == nil || g.Exposure != 684+672 {
@@ -261,6 +283,9 @@ func TestASourceAGuardLeavesOutAtItsEndCountsInNeitherItsHistoryNorItsWatch(t *t
 	m.measure(t, Options{})
 	m.clock = start.Add(37*aDay + time.Hour)
 	markAll(t, m, toolSignal.Source) // zz-more reads no more
+	if got := m.measure(t, Options{Dry: true}); got.Status != "guarded" || len(named(t)) != 0 {
+		t.Fatalf("a dry pass at the close: %+v %+v", got, named(t))
+	}
 	got := m.measure(t, Options{})
 	if got.Status != "guarded" || got.Result == nil || got.Result.Watched != 125 || got.Result.Exposure != 684 {
 		t.Fatalf("the close, zz-more left out: %+v %+v", got, got.Result)
@@ -268,17 +293,119 @@ func TestASourceAGuardLeavesOutAtItsEndCountsInNeitherItsHistoryNorItsWatch(t *t
 	if c := m.theCase(t); c.Measurement.Exposure != 684 || c.Measurement.Watched != 125 {
 		t.Fatalf("the case's guard columns: %+v", c.Measurement)
 	}
-	log, err := m.st.CaseLog(ctx, m.c.ID)
-	if err != nil {
-		t.Fatal(err)
+	if lines := named(t); len(lines) != 1 || lines[0].Action != "closed" || !strings.HasPrefix(lines[0].Detail, "guarded: ") ||
+		!strings.Contains(lines[0].Detail, "left out of the guard's history and exposure watched at its watch's end, read in part or not at all since it: zz-more") {
+		t.Fatalf("the case's log names the source left out other than in its close's own line, once: %+v", lines)
 	}
-	named := 0
-	for _, l := range log {
-		if l.Action == "measurement sources" && strings.Contains(l.Detail, "zz-more") {
-			named++
+}
+
+// A guard that watched nothing in the sources it kept says why from every recorded source, in this order: its unit
+// was used while the change was in effect in a source left out at the end; else it was used only while the change was
+// out of effect; else it was not used. The change is in effect at the first pass and a day on, out of effect from then
+// to day three, and zz-more is left out at the end, having read no more since day ten. Its use in effect only in
+// zz-more, and in the signal's source only out of effect, is left out, not out of effect; its use only in zz-more and
+// only out of effect is out of effect, not left out.
+func TestAnUnwatchedGuardSaysWhyFromEveryRecordedSource(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		use  func(t *testing.T, m *measured, start time.Time)
+		why  string
+	}{
+		{"used in effect only in a source left out", func(t *testing.T, m *measured, start time.Time) {
+			usesIn(t, m.st, "zz-more", "in-", start.Add(time.Hour), 25, 5)
+			usesIn(t, m.st, toolSignal.Source, "away-", start.Add(aDay+time.Hour), 25, 5)
+		}, measure.GuardLeftOut},
+		{"used only out of effect, in a source left out", func(t *testing.T, m *measured, start time.Time) {
+			usesIn(t, m.st, "zz-more", "away-", start.Add(aDay+time.Hour), 25, 5)
+		}, measure.GuardAway},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := guarded(t, time.Hour, toolSignal.Source, func(st *store.Store, planAt, useUntil time.Time) store.Case {
+				c, _ := recurring(t, st, toolSignal.Source, planAt, useUntil, planAt, fourBursts(planAt)...)
+				moreUse(t, st, planAt, useUntil)
+				return c
+			})
+			at := func(clock time.Time) Measured {
+				t.Helper()
+				m.clock = clock
+				markAll(t, m, toolSignal.Source, "zz-more")
+				return m.measure(t, Options{})
+			}
+			start := m.clock
+			at(start)
+			tc.use(t, m, start)
+			at(start.Add(aDay)) // the last pass that sees it in effect
+			run(t, m.repo, "git", "checkout", "-q", "HEAD~1")
+			if got := at(start.Add(2 * aDay)); got.Status != "waiting" {
+				t.Fatalf("out of effect: %+v", got)
+			}
+			run(t, m.repo, "git", "checkout", "-q", "main")
+			at(start.Add(3 * aDay))
+			at(start.Add(10 * aDay))
+			m.clock = start.Add(37*aDay + time.Hour)
+			markAll(t, m, toolSignal.Source) // zz-more reads no more
+			got := m.measure(t, Options{})
+			if got.Status != "guarded" || got.Result == nil || got.Result.Watched != 0 || measure.GuardNotWatched(got.Result.Effect) != tc.why || !strings.Contains(got.Result.Effect, tc.why) {
+				t.Fatalf("its close says %q: %+v %+v", tc.why, got, got.Result)
+			}
+		})
+	}
+}
+
+// A close that drops sources counts its history again without them, and when that recount holds no exposure, the
+// close says so and reports no figure the proposal counted in the sources it dropped. The signal's source began with a
+// burst of failures and holds nothing more until the watch; the tool's 132 quiet hours after the burst are all in
+// zz-more, which reads no more from day ten and is left out at the end. The close reports no exposure in the history
+// and no rate, with the 125 hours it watched; it is still a guarded close, and a recurrence after it takes its guard's
+// columns with it.
+func TestAGuardsRecountWithNoExposureInTheSourcesItKeptSaysSo(t *testing.T) {
+	m := guarded(t, time.Hour, toolSignal.Source, func(st *store.Store, planAt, useUntil time.Time) store.Case {
+		from := planAt.Add(-8 * aDay)
+		c := stoppedProblem(t, st, from, 60, from.Add(60*time.Hour), planAt)
+		moreUse(t, st, planAt, useUntil)
+		return c
+	})
+	if p, _, _ := m.r.Ship.Load(m.c.ID); p.Plan == nil {
+		t.Fatal("no plan")
+	} else if g, _ := guardOf(t, *p.Plan); g == nil || g.Exposure != 132 || g.Incidents != 0 {
+		t.Fatalf("the proposal's guard, its exposure all in zz-more: %+v", g)
+	}
+	markAll(t, m, toolSignal.Source, "zz-more")
+	m.measure(t, Options{})
+	start := m.clock
+	weekly(t, m.st, toolSignal.Source, "w", start)
+	m.clock = start.Add(10 * aDay)
+	markAll(t, m, toolSignal.Source, "zz-more")
+	m.measure(t, Options{})
+	m.clock = start.Add(37*aDay + time.Hour)
+	markAll(t, m, toolSignal.Source) // zz-more reads no more
+	got := m.measure(t, Options{})
+	if got.Status != "guarded" || got.Result == nil || got.Result.Watched != 125 || got.Result.Exposure != 0 || !got.Result.NoRate ||
+		!strings.Contains(got.Result.Effect, "no rate to compare: the history holds no exposure in the sources kept at the watch's end") ||
+		!strings.Contains(got.Result.Effect, "0 incidents in 0 session hours") || strings.Contains(got.Result.Effect, "132") {
+		t.Fatalf("the close, its history's exposure all in the source it dropped: %+v %+v", got, got.Result)
+	}
+	c := m.theCase(t)
+	if s := shown(t, c); c.Status != store.CaseClosed || c.Reason != guardedReason || c.Measurement.Exposure != 0 || c.Measurement.Watched != 125 ||
+		evidenceview.StatusLine(c) != "closed: guarded, 125 watched, no rate to compare: the history holds no exposure in the sources kept at the watch's end; or it stopped by itself" ||
+		!strings.Contains(s, "  guarded:") || strings.Contains(s, "  measured:") || strings.Contains(s, "last measured") || strings.Contains(s, "132") {
+		t.Fatalf("the case closed with no exposure: %+v %q\n%s", c.Measurement, evidenceview.StatusLine(c), shown(t, c))
+	}
+	said := false
+	for _, n := range m.notes(t) {
+		if strings.HasPrefix(n.Title, "momentum guarded: ") {
+			said = strings.Contains(n.Detail, "The history holds no exposure in the sources kept at the watch's end") && !strings.Contains(n.Detail, "132")
 		}
 	}
-	if named != 1 {
-		t.Fatalf("the case's log names the source left out %d times: %+v", named, log)
+	if !said {
+		t.Fatalf("its note: %+v", m.notes(t))
+	}
+	put(t, m.st, []store.Event{toolResult("back", c.Closed.Add(time.Hour), "back", true)})
+	m.clock = c.Closed.Add(2 * time.Hour)
+	if got := m.pass(t, Options{}); got.Status != "back" {
+		t.Fatalf("a recurrence after the close: %+v", got)
+	}
+	if c := m.theCase(t); c.Status != store.CaseOpen || c.Measurement != (store.Measurement{}) || strings.Contains(shown(t, c), "  measured:") || strings.Contains(shown(t, c), "last measured") {
+		t.Fatalf("the case back keeps its guard's columns: %+v\n%s", c.Measurement, shown(t, c))
 	}
 }

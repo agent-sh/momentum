@@ -133,6 +133,8 @@ type guardJSON struct {
 	Units     string        `json:"units"`
 	Tool      string        `json:"tool"`
 	Cwd       string        `json:"cwd"`
+	Tools     []string      `json:"tools"`
+	Cwds      []string      `json:"cwds"`
 	Incidents int           `json:"incidents"`
 	Exposure  int           `json:"exposure"`
 }
@@ -203,10 +205,12 @@ func TestAGuardStandsInWhereAMeasuredPlanIsRefused(t *testing.T) {
 }
 
 // A guard is refused only where no watch could be kept: a history with no exposure; a signal that counts none of the
-// case's evidence in the gate, the problem's form there having changed; a signal with no tool whose events share no
-// tool or directory; and, on the too-new path too, a gate that holds an active problem and none of the case's evidence.
-// A signal with no tool whose events all share one counts its exposure in that tool's hours, and one whose events share
-// a directory, some of them stored before the store cleaned working directories, in that directory's.
+// case's evidence in the gate, the problem's form there having changed; a signal with no tool whose events fall in no
+// small set of tools or directories (more members than half the 12 units they fall in, or some of no tool and in no
+// directory); and, on the too-new path too, a gate that holds an active problem and none of the case's evidence. A
+// signal with no tool whose events all share one counts its exposure in that tool's hours, and one whose events share a
+// directory in that directory's: its rows stored before the store cleaned working directories, in any form of it
+// (`/work//a`, `/work/./a/x`), count as the rows stored after.
 func TestAGuardIsRefusedOnlyWhereNoWatchCouldBeKept(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().Truncate(time.Hour)
@@ -253,19 +257,34 @@ func TestAGuardIsRefusedOnlyWhereNoWatchCouldBeKept(t *testing.T) {
 		refusedWith(t, st, c, toolSignal, "fewer than 5", "the signal counts 0 of the case's 3 events in the window: it does not measure the case's problem")
 	})
 	noTool := Signal{Source: toolSignal.Source, Kinds: toolSignal.Kinds, Match: toolSignal.Match}
-	t.Run("no shared unit", func(t *testing.T) {
-		st := testStore(t)
+	// spread is the four bursts' twelve failures, each in a session of its own, rewritten into the tools and directories
+	// given for each: the guard reads them as the store holds them now
+	spread := func(t *testing.T, st *store.Store, unit func(i int) (tool, cwd string)) store.Case {
+		t.Helper()
 		_, failures := recurring(t, st, toolSignal.Source, now, now, now, fourBursts(now)...)
-		for i := range failures { // half the failures are of another tool, in another directory
-			failures[i].SourceKey += "-moved"
-			if i%2 == 0 {
-				failures[i].Tool, failures[i].Cwd = "Read", "/work/a"
-			} else {
-				failures[i].Cwd = "/work/b"
-			}
+		for i := range failures {
+			failures[i].Tool, failures[i].Cwd = unit(i)
 		}
 		put(t, st, failures)
-		refusedWith(t, st, testingCaseOf(t, st, "failures/v2:zz-moved", failures), noTool, "share no tool or directory")
+		return testingCaseOf(t, st, "failures/v2:zz-spread", failures)
+	}
+	t.Run("a set over its bound", func(t *testing.T) {
+		st := testStore(t) // seven tools and seven directories for twelve units: more than half of them
+		c := spread(t, st, func(i int) (string, string) { return fmt.Sprint("tool-", i%7), fmt.Sprint("/work/", i%7) })
+		refusedWith(t, st, c, noTool, "no small set of tools or directories (7 tools, 7 directories, in 12 units")
+	})
+	t.Run("a set at its bound", func(t *testing.T) {
+		st := testStore(t) // six tools for twelve units: half of them
+		c := spread(t, st, func(i int) (string, string) { return fmt.Sprint("tool-", i%6), fmt.Sprint("/work/", i%7) })
+		plan, err := (&Ship{Store: st}).validPlan(ctx, c, noTool, 7*aDay, "", now)
+		if g, _ := guardOf(t, plan); err != nil || g == nil || len(g.Tools) != 6 || g.Tool != "" || g.Cwd != "" || len(g.Cwds) != 0 {
+			t.Fatalf("six tools for twelve units: %+v %v", g, err)
+		}
+	})
+	t.Run("no set", func(t *testing.T) {
+		st := testStore(t) // of no tool, in no directory
+		c := spread(t, st, func(int) (string, string) { return "", "" })
+		refusedWith(t, st, c, noTool, "no small set of tools or directories (some of no tool, some in no directory")
 	})
 	t.Run("a shared tool", func(t *testing.T) {
 		st := testStore(t)
@@ -313,9 +332,21 @@ func TestAGuardIsRefusedOnlyWhereNoWatchCouldBeKept(t *testing.T) {
 				}
 			}
 		}
+		// the tool's use in sessions of its own, every hour of four days: in the directory as cleaned, in two forms of it
+		// a build from before cleaning stored, and in another directory, which is not the problem's
+		for i, cwd := range []string{"/work/a", "/work//a", "/work/./a/x", "/work/b"} {
+			for h := 0; h < 24; h++ {
+				e := toolResult(fmt.Sprintf("use-%d-%d", i, h), now.Add(-time.Duration(26-i)*aDay+time.Duration(h)*time.Hour), fmt.Sprintf("use-%d-%d", i, h), false)
+				if _, err := db.Exec(`INSERT INTO events (id, source, source_key, ts, session, agent, harness, model, cwd, actor, kind, tool, summary, meta, ref, heuristic, experiment, ingested)
+				  VALUES (?,?,?,?,?,'',?,'',?,?,?,?,?,?,'',0,'',?)`, e.ID(), e.Source, e.SourceKey, e.TS.UnixMilli(), e.Session, e.Harness, cwd, string(e.Actor), e.Kind,
+					e.Tool, e.Summary, e.Meta, time.Now().UnixMilli()); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
 		plan, err := (&Ship{Store: st}).validPlan(ctx, testingCaseOf(t, st, "failures/v2:zz-dirs", failures), noTool, 7*aDay, "", now)
-		if g, _ := guardOf(t, plan); err != nil || g == nil || g.Tool != "" || g.Cwd != "/work/a" || g.Incidents != 4 {
-			t.Fatalf("a signal with no tool whose events share a directory, in two forms: %+v %v", g, err)
+		if g, _ := guardOf(t, plan); err != nil || g == nil || g.Tool != "" || g.Cwd != "/work/a" || g.Incidents != 4 || g.Exposure != 12+3*24 {
+			t.Fatalf("a signal with no tool whose events share a directory, in three forms: %+v %v", g, err)
 		}
 	})
 }
@@ -352,6 +383,12 @@ func TestAHandLandingsRecountOfAProblemThatWentQuietIsAGuardWatch(t *testing.T) 
 // live.
 func guarded(t *testing.T, effectAfter time.Duration, use string, problem func(st *store.Store, planAt, useUntil time.Time) store.Case) *measured {
 	t.Helper()
+	return guardedBy(t, toolSignal, effectAfter, use, problem)
+}
+
+// guardedBy is guarded with the proposal's plan counted by a signal of the test's own.
+func guardedBy(t *testing.T, sig Signal, effectAfter time.Duration, use string, problem func(st *store.Store, planAt, useUntil time.Time) store.Case) *measured {
+	t.Helper()
 	ctx := context.Background()
 	st, db := testStoreAt(t)
 	dir := t.TempDir()
@@ -369,7 +406,7 @@ func guarded(t *testing.T, effectAfter time.Duration, use string, problem func(s
 		}
 	}
 	c := problem(st, m.planAt, m.deployed.Add(-time.Hour))
-	plan, err := m.r.Ship.validPlan(ctx, c, toolSignal, 7*aDay, "", m.planAt)
+	plan, err := m.r.Ship.validPlan(ctx, c, sig, 7*aDay, "", m.planAt)
 	if g, _ := guardOf(t, plan); err != nil || g == nil {
 		t.Fatalf("the proposal's plan: %+v %v", plan, err)
 	}
