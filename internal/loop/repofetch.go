@@ -16,7 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -632,15 +632,25 @@ type lockHolder struct {
 // and the process group of the last Git call that inherited it, by its leader (recordHolder).
 type lockRecord struct{ taker, group lockHolder }
 
-// thisTaker is this process as a lock's taker, read once from /proc: the zero one when it cannot be read, and a lock
-// whose record names no taker is never taken from its group (takeOrphan).
-var thisTaker = sync.OnceValue(func() lockHolder {
-	pid := os.Getpid()
-	if _, start, err := procStat(pid); err == nil {
-		return lockHolder{pid, start}
+// taker is this process as a lock's taker, once a read of /proc has found it (thisTaker).
+var taker atomic.Pointer[lockHolder]
+
+// thisTaker is this process as a lock's taker, from /proc: the zero one while it cannot be read, and a lock whose
+// record names no taker is never taken from its group (takeOrphan). Only a read that succeeds is kept: one that fails
+// (no descriptor free, say) is tried again at the next lock taken.
+func thisTaker() lockHolder {
+	if h := taker.Load(); h != nil {
+		return *h
 	}
-	return lockHolder{}
-})
+	pid := os.Getpid()
+	_, start, err := procStat(pid)
+	if err != nil {
+		return lockHolder{}
+	}
+	h := lockHolder{pid, start}
+	taker.Store(&h)
+	return h
+}
 
 // writeLockRecord writes r over the lock file's record, as one line per holder it names (`taker PID START`, then
 // `group PID START`). The text is written first and the file then cut to its length, never emptied first: the taker's
@@ -812,8 +822,7 @@ func procAge(start uint64) (time.Duration, error) {
 // file taken is no longer the one at the mirror's path (sameLock); when nothing, or no directory, is at dir; and when
 // the lock file cannot be opened for another reason (no access): the next pass looks again. A link where the lock is
 // has no lock to take. A mirror there is one only a maker touches, to make it again (openMirror), and a maker swaps
-// only under the makers' lock, so a prune holds that lock instead, without waiting, and looks at the mirror's lock
-// again under it.
+// only under the makers' lock, so a prune holds that lock instead (lockLinkedForRemoval).
 func lockForRemoval(dir string) (release func(), ok bool) {
 	lock, err := lockMirror(dir)
 	if err == nil {
@@ -822,6 +831,15 @@ func lockForRemoval(dir string) (release func(), ok bool) {
 	if !errors.Is(err, syscall.ELOOP) {
 		return nil, false
 	}
+	return lockLinkedForRemoval(dir)
+}
+
+// lockLinkedForRemoval takes, for its removal, a mirror whose lock path held a link (lockForRemoval): the makers' lock,
+// tried once, and under it the mirror's lock again, since a maker may have swapped a mirror in before the prune took
+// the makers' lock. A link still there is held by the makers' lock alone; a mirror swapped in is held by its own lock
+// as well. ok is false while a maker holds the makers' lock, while another holds the mirror's, and when no mirror can
+// be locked at dir.
+func lockLinkedForRemoval(dir string) (release func(), ok bool) {
 	unlock, err := lockMakers(context.Background(), filepath.Dir(dir), 0)
 	if err != nil {
 		return nil, false
