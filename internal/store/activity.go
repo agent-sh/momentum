@@ -88,7 +88,9 @@ func (s *Store) Activity(ctx context.Context, q ActivityQuery) (map[Unit]bool, e
 // codex_apps__CONNECTOR, so its tools are mcp__codex_apps__CONNECTOR__TOOL; where a tool's name began with its
 // connector's, Codex cut that off, and TOOL begins with _ (mcp__codex_apps__gmail___search). A tool of codex_apps is
 // of its connector, codex_apps__CONNECTOR, the field before the first __ of what follows the server: the whole server
-// would count every connector's hours as the problem's unit in use. It is still of codex_apps as a whole (OfServer).
+// would count every connector's hours as the problem's unit in use. It is still of codex_apps as a whole (OfServer). A
+// tool Codex serves with no connector is in the server's own namespace, mcp__codex_apps__TOOL: it is of no connector,
+// so MCPServer gives "", and of codex_apps as a whole alone.
 func MCPServer(tool string) string {
 	rest, ok := strings.CutPrefix(tool, "mcp__")
 	if !ok {
