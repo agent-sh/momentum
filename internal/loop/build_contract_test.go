@@ -115,12 +115,12 @@ func TestAReviewIsToldTheBuildsPaths(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, want := range []string{"reviewed_files", buildScope(p.Repo), "follow-up for a person: file it as a low finding",
-				"whose where is that path", "It lowers no finding on what this change does", "file a high finding"} {
+				"or anything outside this repository", "The follow-up lowers no finding on what this change does", "file a high finding"} {
 				if !strings.Contains(prompt, want) {
 					t.Fatalf("the prepared review prompt for %q lacks %q: %s", p.Repo, want, prompt)
 				}
 			}
-			if hand := strings.Contains(prompt, "a hand landing may change is the build's to make"); hand != strings.EqualFold(p.Repo, SelfRepo) {
+			if hand := strings.Contains(prompt, "a hand landing may change is the build's to make, not a follow-up"); hand != strings.EqualFold(p.Repo, SelfRepo) {
 				t.Fatalf("the prompt for %q names hand landing paths: %v", p.Repo, hand)
 			}
 		})

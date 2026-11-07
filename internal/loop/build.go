@@ -414,8 +414,9 @@ func reviewPrompt(c store.Case, p Package) string {
 		"The proposed tree is read-only at /ro/change with no .git. /ro holds the shared pass inputs. "+
 		"End with a nonempty summary, findings and reviewed_files naming every changed file once.\n"+
 		"The build was given these paths. %s "+
-		"A cause whose fix needs a path no change may touch, as named above, is a follow-up for a person: file it as a low "+
-		"finding whose where is that path and whose fix is the change a person makes there. It lowers no finding on what "+
+		"A cause whose fix needs a path no change may touch, as named above, or anything outside this repository, is a "+
+		"follow-up for a person: file it as a low finding whose where names it and whose fix is the change a person makes "+
+		"there. The follow-up lowers no finding on what "+
 		"this change does. When this change is not worth landing without that fix, because it only hides the case's signal "+
 		"or it is wrong on its own, file a high finding that says so.", c.ID, c.Family, p.Title, buildScope(p.Repo)) + handReach(p.Repo)
 }
@@ -426,7 +427,7 @@ func handReach(repo string) string {
 	if !strings.EqualFold(repo, SelfRepo) {
 		return ""
 	}
-	return " A fix in a path a hand landing may change is the build's to make: a change that leaves it out gets the finding it would get anyway."
+	return " A fix in a path a hand landing may change is the build's to make, not a follow-up: rate a change that leaves it out as any change that misses part of its fix."
 }
 
 // refusalKeys are the build stages whose failure is the run's own output: its report, its patch, its check or its
