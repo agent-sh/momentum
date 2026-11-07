@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -402,6 +403,18 @@ func buildScope(repo string) string {
 		"then proposed for a person to land by hand; the loop never lands it. No change touches CI configuration (" + ci +
 		") or these, which the loop's measurement and its event scanners rest on: " + strings.Join(ProposalProtected(), ", ") +
 		" (of internal/supervise/, rules.go and test files may change)."
+}
+
+// reviewPrompt is a review's task. It carries the paths the build was given (buildScope), so a reviewer judges a
+// change against what the build could change: a cause whose fix needs a path no change touches is a follow-up for a
+// person, and the change is judged on whether it is worth landing without that fix.
+func reviewPrompt(c store.Case, p Package) string {
+	return fmt.Sprintf("Review case %s (%s): %s. Read /run/input/case.json, /run/input/change.patch and /run/input/package.json. "+
+		"The proposed tree is read-only at /ro/change with no .git. /ro holds the shared pass inputs. "+
+		"End with a nonempty summary, findings and reviewed_files naming every changed file once.\n"+
+		"The build was given these paths. %s A fix the build could not make because it needs a path no change touches is "+
+		"not this change's to make: name it in the summary as a follow-up for a person, and judge whether this change is "+
+		"worth landing without it.", c.ID, c.Family, p.Title, buildScope(p.Repo))
 }
 
 // refusalKeys are the build stages whose failure is the run's own output: its report, its patch, its check or its
