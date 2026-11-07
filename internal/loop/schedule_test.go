@@ -3,6 +3,7 @@ package loop
 import (
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"strings"
 	"testing"
 
@@ -41,6 +42,17 @@ func (f simFamily) canBuild() bool {
 	for _, c := range f.cases {
 		if !f.failing && c.cand.step == StepBuild && !c.unread && !c.held {
 			return true
+		}
+	}
+	return false
+}
+
+// buildable says whether the family's builds come to a reserved build: the first one not held prepares (a build
+// whose preparation fails ends the family's builds for the pass).
+func (f simFamily) buildable() bool {
+	for _, c := range f.cases {
+		if !f.failing && c.cand.step == StepBuild && !c.unread && !c.held {
+			return !c.failsPrep
 		}
 	}
 	return false
@@ -116,7 +128,15 @@ func randomFamilies(rng *rand.Rand) []simFamily {
 //  4. a family whose every attempt fails, though the scheduler sees its cases, stops no other family's runs (3 and 5
 //     hold for the others);
 //  5. when room is left after the pass, every family that ran nothing had nothing it could run;
-//  6. no build is prepared without room for it or left unreserved, and none is reserved unprepared.
+//  6. no build is prepared without room for it or left unreserved, and none is reserved unprepared;
+//  7. a family whose ready build's reservation fails (none, as in a pass that stops, or a run recorded) reserves
+//     nothing else in the pass, and no other build is reserved;
+//  8. a family with a buildable case goes at most b-1 passes without its build when the room reaches every one of the m
+//     families with a case, and at most the larger of m-1 and 2(b-1) when it does not, b the families with a buildable
+//     case.
+//
+// In a quarter of the trials a ready build's reservation fails at random; 3 and 8 are claimed only while every one goes
+// through.
 func TestPassPlansAreFairOverRandomFamilies(t *testing.T) {
 	rng := rand.New(rand.NewPCG(102, 4))
 	for trial := range 4000 {
@@ -124,21 +144,33 @@ func TestPassPlansAreFairOverRandomFamilies(t *testing.T) {
 		n := len(fams)
 		names := make([]string, 0, n+1)
 		cases, family := map[string]simCase{}, map[string]simFamily{}
+		m, b := 0, 0 // the families with a case, and those with a buildable one
 		for _, f := range fams {
 			names = append(names, f.name)
 			family[f.name] = f
 			for _, c := range f.cases {
 				cases[c.cand.c.ID] = c
 			}
+			if slices.ContainsFunc(f.cases, func(c simCase) bool { return !c.unread }) {
+				m++
+			}
+			if f.buildable() {
+				b++
+			}
 		}
 		if rng.IntN(5) == 0 { // a family named twice
 			names = append(names, names[rng.IntN(n)])
 		}
 		room := 1 + rng.IntN(3)
+		faults := rng.IntN(4) == 0 // a ready build's reservation may fail
+		gap := b - 1               // the most passes a family with a buildable case goes without its build (8)
+		if room < m {
+			gap = max(m-1, 2*(b-1))
+		}
 		turns := map[string]string{}
-		last := map[string]int{}
+		last, built := map[string]int{}, map[string]int{}
 		for _, f := range fams {
-			last[f.name] = -1
+			last[f.name], built[f.name] = -1, -1
 		}
 		var history []string // each pass's plan, for a failure's message
 		for pass := range 4 * n {
@@ -155,8 +187,9 @@ func TestPassPlansAreFairOverRandomFamilies(t *testing.T) {
 					}
 				}
 			}
-			left, builds := room, 0
+			left, builds, builder := room, 0, ""
 			prepared, reserved, ran := map[string]bool{}, map[string]bool{}, map[string]bool{}
+			refused := map[string]bool{} // by family: its ready build's reservation failed
 			prepare := func(fam string, c candidate) outcome {
 				sc := cases[c.c.ID]
 				switch {
@@ -176,6 +209,8 @@ func TestPassPlansAreFairOverRandomFamilies(t *testing.T) {
 			reserve := func(fam string, c candidate) outcome {
 				sc := cases[c.c.ID]
 				switch {
+				case refused[fam]:
+					fail("%s reserved after its ready build's reservation failed", c.c.ID)
 				case family[fam].failing || c.step != StepBuild && sc.noInputs:
 					return runNone
 				case c.step == StepBuild && !prepared[c.c.ID]:
@@ -184,33 +219,49 @@ func TestPassPlansAreFairOverRandomFamilies(t *testing.T) {
 					return runRecorded // the budgets refuse it
 				case reserved[c.c.ID]:
 					fail("%s reserved twice", c.c.ID)
+				case c.step == StepBuild && faults && rng.IntN(3) == 0:
+					refused[fam] = true
+					if rng.IntN(2) == 0 {
+						return runNone
+					}
+					ran[fam] = true
+					return runRecorded
 				}
 				reserved[c.c.ID], ran[fam] = true, true
 				left--
 				if c.step == StepBuild {
 					builds++
+					builder = fam
 				}
 				return runReserved
 			}
 			steps, after := schedule(names, cands, turns, room, prepare, reserve)
 			history = append(history, fmt.Sprintf("pass %d (turns %v): %s", pass, turns, plan(steps)))
 			turns = after
-			if builds > 1 {
-				fail("%d builds", builds)
+			if builds > 1 || builds > 0 && len(refused) > 0 {
+				fail("%d builds, %d ready builds refused", builds, len(refused))
 			}
 			for id := range prepared {
-				if !reserved[id] {
+				if !reserved[id] && !refused[cases[id].cand.c.Family] {
 					fail("%s prepared and left unreserved", id)
 				}
 			}
+			taken := builds > 0 || len(refused) > 0 // the pass's build went to a family
 			for _, f := range fams {
 				switch {
 				case ran[f.name]:
 					last[f.name] = pass
-				case left > 0 && (f.canInvestigate() || builds == 0 && f.canBuild()):
+				case refused[f.name]:
+				case left > 0 && (f.canInvestigate() || !taken && f.canBuild()):
 					fail("%s ran nothing with room left", f.name)
-				case (f.canInvestigate() || f.canBuild()) && pass-last[f.name] >= n:
+				case !faults && (f.canInvestigate() || f.canBuild()) && pass-last[f.name] >= n:
 					fail("%s ran nothing for %d passes", f.name, pass-last[f.name])
+				}
+				switch {
+				case builder == f.name:
+					built[f.name] = pass
+				case !faults && f.buildable() && pass-built[f.name] > gap:
+					fail("%s did not build for %d passes (%d families with a case, %d with a buildable one)", f.name, pass-built[f.name], m, b)
 				}
 			}
 		}

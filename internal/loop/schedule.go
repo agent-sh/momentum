@@ -9,7 +9,9 @@ const (
 	runReserved outcome = iota // a run was reserved: it starts with the pass
 	runReady                   // a build was prepared: it is reserved in its family's place
 	runRecorded                // a run was recorded and ended unstarted (a refusal of the budgets, a failed preparation)
-	runNone                    // no run was recorded (a hold, inputs that could not be made): the family's next case may run
+	// no run was recorded (a hold, inputs that could not be made, a pass that stops): the family's next case may run,
+	// but none after its ready build
+	runNone
 )
 
 // Why a family's build waits.
@@ -32,13 +34,19 @@ type planned struct {
 // runs take their turn. room is how many runs the budgets leave the pass.
 //
 // It is round-robin. Each family runs one case in its own place, in the run turn's order, so a pass with room for
-// fewer runs than families starts after the family whose run the last pass reserved first. The pass's one build is
-// settled before any run is reserved: the families whose best case builds, and whose place the room reaches, prepare
-// their builds in the build turn's order until one is ready; a family whose build is held tries its next build. A
-// family whose place the room may not reach prepares nothing then: in its place, if no build is ready and room is
-// left, it prepares its builds there. A family whose build waits for another's, or whose builds came to no run (a
-// hold), runs its best case that builds nothing instead, and its next one when that comes to no run. No case is
-// reserved twice, no ready build is left unreserved while room is left, and a family named twice is one family.
+// fewer runs than families starts after the family whose run the last pass reserved first. Before any run is reserved,
+// the families whose best case builds, and whose place the room reaches, prepare their builds in the build turn's
+// order until one is ready; a family whose build is held tries its next build. A family whose place the room may not
+// reach prepares nothing then: in its place, if no build is ready and room is left, it prepares its builds there. A
+// family whose build waits for another's, or whose builds came to no run (a hold), runs its best case that builds
+// nothing instead, and its next one when that comes to no run. A family whose ready build is not reserved runs nothing
+// else, and no other case builds in the pass. No case is reserved twice, no ready build is left unreserved while room
+// is left, and a family named twice is one family.
+//
+// With the same room each pass and every ready build reserved, a family with a buildable case goes at most b-1 passes
+// without its build when the room reaches all m families with a case, b being the families with a buildable case, and
+// at most the larger of m-1 and 2(b-1) when it does not: a family the room does not reach when the build turn comes
+// to it loses that turn to the next family's build (TestPassPlansAreFairOverRandomFamilies).
 //
 // It returns the steps, in the order taken, and the turns after the pass.
 func schedule(families []string, cands map[string][]candidate, turns map[string]string, room int, prepare, reserve func(fam string, c candidate) outcome) ([]planned, map[string]string) {

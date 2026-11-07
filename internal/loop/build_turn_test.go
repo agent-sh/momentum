@@ -505,9 +505,50 @@ func TestABuildPastTheBudgetsRoomIsNotPrepared(t *testing.T) {
 	}
 }
 
-// A build prepared and then not reserved leaves nothing on disk: its host and run directories go with it.
+// The room the budgets leave is the number of runs their check lets through, one reservation after another, also
+// where dividing what is left by the run's budget rounds to one run more (0.63 into 1.89) or one fewer (0.39 into
+// 1.17).
+func TestTheRoomIsTheRunsTheBudgetsLetThrough(t *testing.T) {
+	for _, b := range []Budgets{{Run: 0.63, Day: 1.89, Week: 200}, {Run: 0.39, Day: 1.17, Week: 200}, {Run: 0.63, Day: 200, Week: 1.89},
+		{Run: 4, Day: 40, Week: 200}} {
+		ctx := context.Background()
+		st := testStore(t)
+		c := openCase(t, st, "failures", "marker-7f3a", 1)
+		r := &Runner{Store: st, Budgets: b, Dir: t.TempDir()}
+		room, _, err := r.room(ctx, 20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		through := 0
+		for ; through < 20; through++ {
+			if _, why := r.reserve(ctx, c.Family, c.ID, StepInvestigate); why != "" {
+				break
+			}
+		}
+		if room != through {
+			t.Errorf("run $%v, day $%v, week $%v: the room is %d runs, the budgets let %d through", b.Run, b.Day, b.Week, room, through)
+		}
+	}
+}
+
+// A budget too large to count in runs still leaves room for the pass's build.
+func TestAHugeBudgetLeavesRoomForTheBuild(t *testing.T) {
+	r, cs := turnRunner(t, "sessions")
+	r.Budgets.Day, r.Budgets.Week = 1e20, 1e20
+	done, err := r.Once(context.Background(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if built, why := turnStep(done, cs[0].ID, StepBuild); !built {
+		t.Fatalf("the build did not run: %q: %+v", why, done)
+	}
+}
+
+// A build prepared and then not reserved leaves no run on disk: its host and run directories go, and its build tree
+// goes back to the case's work directory first, so the case's next pass builds.
 func TestAReadyBuildLeftUnreservedLeavesNothingOnDisk(t *testing.T) {
 	r, cs := turnRunner(t, "sessions")
+	ctx := context.Background()
 	db, err := sql.Open("sqlite", r.Store.Path())
 	if err != nil {
 		t.Fatal(err)
@@ -517,7 +558,7 @@ func TestAReadyBuildLeftUnreservedLeavesNothingOnDisk(t *testing.T) {
 	  BEGIN SELECT RAISE(ABORT, 'marker-7f3a refused'); END`); err != nil {
 		t.Fatal(err)
 	}
-	done, err := r.Once(context.Background(), Options{})
+	done, err := r.Once(ctx, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -527,6 +568,62 @@ func TestAReadyBuildLeftUnreservedLeavesNothingOnDisk(t *testing.T) {
 	if left := runDirs(t, r); len(left) != 0 {
 		t.Fatalf("the unreserved build left %v on disk", left)
 	}
+	p, ok, err := r.Ship.Load(cs[0].ID)
+	if err != nil || !ok {
+		t.Fatalf("the package: %v %v", ok, err)
+	}
+	if _, err := os.Stat(p.Work); err != nil {
+		t.Fatalf("the package names a build tree that is gone: %v", err)
+	}
+	if _, err := db.Exec(`DROP TRIGGER refuse_reservation`); err != nil {
+		t.Fatal(err)
+	}
+	done, err = r.Once(ctx, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range done {
+		if d.Case == cs[0].ID && d.Step == StepBuild && d.Run.ID != "" {
+			if d.Run.Failure == "build prepare" {
+				t.Fatalf("the next pass's build failed to prepare: %s", d.Run.Summary)
+			}
+			return
+		}
+	}
+	t.Fatalf("the next pass did not build: %+v", done)
+}
+
+// A package whose build tree went with its run directory gets its tree made again in the case's work directory, so
+// the case's build prepares.
+func TestABuildWhoseTreeWentWithItsRunDirectoryPrepares(t *testing.T) {
+	r, cs := turnRunner(t, "sessions")
+	ctx := context.Background()
+	if _, err := r.Once(ctx, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	p, ok, err := r.Ship.Load(cs[0].ID)
+	if err != nil || !ok {
+		t.Fatalf("the package: %v %v", ok, err)
+	}
+	if !within(filepath.Join(r.Dir, "runs"), p.Work) {
+		t.Fatalf("the first build's tree is not in its run directory: %s", p.Work)
+	}
+	if err := removeAll(filepath.Dir(p.Work)); err != nil {
+		t.Fatal(err)
+	}
+	done, err := r.Once(ctx, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range done {
+		if d.Case == cs[0].ID && d.Step == StepBuild && d.Run.ID != "" {
+			if d.Run.Failure == "build prepare" {
+				t.Fatalf("the build failed to prepare: %s", d.Run.Summary)
+			}
+			return
+		}
+	}
+	t.Fatalf("the second pass did not build: %+v", done)
 }
 
 // A family whose best build is held at its preparation tries its next testing case before anything else.

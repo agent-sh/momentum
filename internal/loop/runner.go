@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 
 	"os"
 	"path/filepath"
@@ -261,11 +260,18 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		starts = append(starts, reserved{fam, step, c, run})
 		return runReserved
 	}
-	// unready removes what a prepared build left on the host when it ends unreserved (refused, or the pass stopped)
+	// unready removes what a prepared build left on the host when it ends unreserved (refused, or the pass stopped).
+	// The package's build tree is in the run directory by then (buildPackage), so it goes back to the case's work
+	// directory first, and the case's next build finds the tree its package names; a stopping pass still moves it.
+	// A tree that cannot go back (another ship step holds the case's lock) keeps its run directory.
 	unready := func(id string) {
 		if run, ok := prepared[id]; ok {
 			delete(prepared, id)
 			removeInputTree(HostDir(run.Dir))
+			if err := r.Ship.returnWork(context.WithoutCancel(ctx), id, run.Dir); err != nil {
+				r.logf("build tree of %s stays in %s: %v", id, run.Dir, err)
+				return
+			}
 			removeInputTree(run.Dir)
 		}
 	}
@@ -304,7 +310,7 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 	room, roomWhy := len(families), ""
 	if !o.Dry {
 		var err error
-		if room, roomWhy, err = r.room(ctx); err != nil {
+		if room, roomWhy, err = r.room(ctx, len(families)); err != nil {
 			r.logf("the loop's budgets: %v", err)
 			room, roomWhy = len(families), ""
 		}
@@ -1148,12 +1154,10 @@ func (r *Runner) affordable(ctx context.Context) (string, error) {
 	return "", nil
 }
 
-// room is how many runs the day's and the week's budgets leave now, the smaller, and the budget that binds it, as
-// affordable names it.
-func (r *Runner) room(ctx context.Context) (int, string, error) {
-	if r.Budgets.Run <= 0 { // a run reserves nothing: the budgets never refuse one (affordable)
-		return math.MaxInt, "", nil
-	}
+// room is how many runs, up to most, the day's and the week's budgets leave now, the smaller, and the budget that
+// binds it, as affordable names it. It counts the runs one by one with affordable's own test, each counted at its
+// whole budget as a reservation would be, so the room is the number of reservations affordable lets through.
+func (r *Runner) room(ctx context.Context, most int) (int, string, error) {
 	now := r.now()
 	n, why := -1, ""
 	for _, lim := range []struct {
@@ -1166,8 +1170,8 @@ func (r *Runner) room(ctx context.Context) (int, string, error) {
 			return 0, "", err
 		}
 		left := 0
-		if lim.usd >= spent+r.Budgets.Run {
-			left = int((lim.usd - spent) / r.Budgets.Run)
+		for counted := spent; left < most && !(counted+r.Budgets.Run > lim.usd); left++ {
+			counted += r.Budgets.Run
 		}
 		if n < 0 || left < n {
 			n, why = left, fmt.Sprintf("the loop's %s budget: $%.2f spent of $%.0f", lim.name, spent, lim.usd)

@@ -581,10 +581,17 @@ func (s *Ship) prepare(ctx context.Context, caseID, repoDir string, tip *repoTip
 
 // freshRunClone is used only before a run starts. No later host operation inspects this clone. It is a build tree
 // (writeBuildTree): one commit of the base commit's tree, never the host clone's history. It sets the package's
-// WorkBase. The build scans the tree before it mounts it (buildPackage).
+// WorkBase. The build scans the tree before it mounts it (buildPackage). A package whose tree's directory is gone (a
+// run directory removed with its tree in it) gets its tree in the case's work directory.
 func (s *Ship) freshRunClone(ctx context.Context, p *Package) error {
 	if err := s.assignedAuthority(ctx); err != nil {
 		return err
+	}
+	if _, err := os.Lstat(filepath.Dir(p.Work)); errors.Is(err, fs.ErrNotExist) {
+		p.Work = s.workDir(p.Case)
+		if err := os.MkdirAll(filepath.Dir(p.Work), 0o700); err != nil {
+			return err
+		}
 	}
 	if err := removeAll(p.Work); err != nil {
 		return err

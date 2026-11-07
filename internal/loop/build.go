@@ -271,6 +271,33 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 	return p, err
 }
 
+// returnWork moves the case's build tree back to the case's work directory when it is in runDir, a prepared build's
+// run directory about to be removed because the build was never reserved, and saves the package naming it there. It
+// takes the case's lock, so no ship step reads the package between the move and the save. A tree elsewhere stays.
+func (s *Ship) returnWork(ctx context.Context, caseID, runDir string) error {
+	unlock, err := s.lock(ctx, caseID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	p, had, err := s.Load(caseID)
+	if err != nil || !had || p.Work == "" || !within(runDir, p.Work) {
+		return err
+	}
+	work := s.workDir(caseID)
+	if err := os.MkdirAll(filepath.Dir(work), 0o700); err != nil {
+		return err
+	}
+	if err := removeAll(work); err != nil {
+		return err
+	}
+	if err := os.Rename(p.Work, work); err != nil {
+		return err
+	}
+	p.Work = work
+	return s.saveAuthorized(ctx, &p)
+}
+
 func stageFailure(res Result, key string, err error) (Result, error) {
 	var wait *waitingPlan
 	if errors.As(err, &wait) {
