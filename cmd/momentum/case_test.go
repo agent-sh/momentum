@@ -576,3 +576,39 @@ func TestCaseRollbackGoesThroughTheShipTool(t *testing.T) {
 		t.Fatalf("nothing landed: exit %d %s", code, errOut)
 	}
 }
+
+// A case whose configuration change is landing or rolling back is neither closed nor merged into another: case
+// rollback finishes the change first, and is named.
+func TestCaseCloseRefusesAConfigurationChangeInTransit(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MOMENTUM_HOME", home)
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	code, out, errOut := momentum("case", "open", "--family", "failures", "--signature", "failures:marker-c0ffee", "--title", "marker-c0ffee",
+		"--evidence", "file:/a@1")
+	m := regexp.MustCompile(`^(c[0-9a-f]{8}): opened`).FindStringSubmatch(out)
+	if code != 0 || m == nil {
+		t.Fatalf("open: exit %d %q %s", code, out, errOut)
+	}
+	for _, state := range []string{"landing", "rolling back"} {
+		pkg := filepath.Join(loopDir(), "packages", m[1])
+		if err := os.MkdirAll(pkg, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		raw := `{"case": "` + m[1] + `", "kind": "config", "state": "` + state + `", "target": ".config/agents/RULES.md"}`
+		if err := os.WriteFile(filepath.Join(pkg, "package.json"), []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{
+			{"case", "close", m[1], "--reason", "not-worth-it", "--why", "marker-c0ffee"},
+			{"case", "signature", m[1], "failures:marker-other"},
+		} {
+			if code, _, errOut := momentum(args...); code != 2 || !strings.Contains(errOut, "momentum case rollback "+m[1]) {
+				t.Fatalf("%s with the change %s: exit %d %s", args[1], state, code, errOut)
+			}
+		}
+	}
+	code, out, _ = momentum("case", "show", m[1], "--json")
+	if code != 0 || !strings.Contains(out, `"status": "open"`) && !strings.Contains(out, `"status":"open"`) {
+		t.Fatalf("the case after the refusals: exit %d %s", code, out)
+	}
+}

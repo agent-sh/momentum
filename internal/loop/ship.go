@@ -1609,11 +1609,19 @@ func (s *Ship) rollbackReceipt(ctx context.Context, p Package, why string) error
 	if err != nil {
 		return err
 	}
+	if p.Undo != nil && p.Undo.Why != "" {
+		why = p.Undo.Why
+	}
+	if p.Kind == KindConfig && c.Status != store.CaseDeployed && c.Status != store.CaseMeasuring {
+		// the owner's rollback of a change whose case never deployed it, or ended or went into another one: the case
+		// stays as it is, and its log says what was rolled back (a landing rolled back logs itself, with no Undo)
+		if p.Undo == nil {
+			return nil
+		}
+		return s.runner().caseNoteOnce(ctx, p.Case, "rolled back", why)
+	}
 	if c.Status == store.CaseTesting {
 		return nil
-	}
-	if p.Undo != nil {
-		why = p.Undo.Why
 	}
 	keep := "revert the revert on the default branch"
 	if p.Kind == KindConfig {

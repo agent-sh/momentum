@@ -472,6 +472,10 @@ func caseSignature(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return err
 	}
 	defer st.Close()
+	// a signature another case holds merges this case into that one
+	if err := inTransit(args[0]); err != nil {
+		return err
+	}
 	c, merged, err := st.AddCaseSignature(ctx, args[0], args[1], caseActor())
 	if err != nil {
 		return caseErr(err)
@@ -481,6 +485,16 @@ func caseSignature(ctx context.Context, args []string, stdout, stderr io.Writer)
 		what = fmt.Sprintf("%s went into this case, which holds the signature: work on here", args[0])
 	}
 	printCase(stdout, c, what)
+	return nil
+}
+
+// inTransit refuses to close or merge a case whose configuration change is landing or rolling back.
+func inTransit(id string) error {
+	if err := (&loop.Ship{Dir: loopDir()}).InTransit(id); errors.Is(err, loop.ErrRefused) {
+		return usageError{err.Error()}
+	} else if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -506,6 +520,9 @@ func caseClose(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	}
 	if *fix != "" && (store.CloseReason(*reason) != store.Solved || *into != "") {
 		return usageError{"--fix names what fixed a component-health case closed as already-solved, with no --into"}
+	}
+	if err := inTransit(id); err != nil {
+		return err
 	}
 	st, err := store.Open(paths.DB())
 	if err != nil {

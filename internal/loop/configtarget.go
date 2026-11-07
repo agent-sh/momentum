@@ -443,6 +443,13 @@ func (d *targetDir) state() (ConfigState, error) {
 	if reason := targetText(got.Content); reason != "" {
 		return ConfigState{}, refused("%s is no configuration text: %s", d.name, reason)
 	}
+	// a file mounted on its name (a bind mount on the same device) cannot be exchanged, and is not the directory's
+	var fst, dst unix.Statx_t
+	if unix.Statx(d.fd, d.base, unix.AT_SYMLINK_NOFOLLOW, unix.STATX_MNT_ID, &fst) == nil &&
+		unix.Statx(d.fd, "", unix.AT_EMPTY_PATH, unix.STATX_MNT_ID, &dst) == nil &&
+		fst.Mask&dst.Mask&unix.STATX_MNT_ID != 0 && fst.Mnt_id != dst.Mnt_id {
+		return ConfigState{}, refused("%s is a mount point: a configuration change cannot replace it", d.name)
+	}
 	// by identity too: a name that reaches the loop's own file or directory another way (a bind mount, a
 	// case-folding directory) is that file
 	self := fileID{uint64(st.Dev), st.Ino}
@@ -504,14 +511,15 @@ func (d *targetDir) sync() error { return unix.Fsync(d.fd) }
 // settle clears what an interrupted write left beside the target, before a step reads the target. The scratch file
 // is the step's own, whole or cut short, and was never exchanged: it goes. At the swap name, the content the step
 // writes or the content it displaces is the loop's, and journaled: it goes. Anything else there came from an exchange
-// over the owner's edit, and none of it goes unkept: it goes back into the file when the file holds the step's own
-// content or was written before it, and what is left at the swap name then, unless it is the loop's, is kept by keep
-// before it goes. The step then decides by what the file holds.
+// over the owner's edit, and none of it goes unkept. Only an exchange puts a file at the swap name, and it leaves the
+// step's own content in the file: a file that holds it still gets the displaced edit back, and a file that holds
+// anything else holds what came after the exchange, so it stays and the other content is kept by keep. The step then
+// decides by what the file holds.
 func (d *targetDir) settle(swap, ours, expected string, keep func(ConfigState) error) error {
 	if err := d.clearScratch(swap); err != nil {
 		return err
 	}
-	left, lst, ok, err := d.read(swap)
+	left, _, ok, err := d.read(swap)
 	if err != nil {
 		return refused("an interrupted write left %s beside %s, which the loop cannot read: the owner decides: %v", swap, d.name, err)
 	}
@@ -519,14 +527,14 @@ func (d *targetDir) settle(swap, ours, expected string, keep func(ConfigState) e
 		return nil
 	}
 	if left.SHA256 != ours && left.SHA256 != expected {
-		cur, cst, curOK, err := d.read(d.base)
+		cur, _, curOK, err := d.read(d.base)
 		if err != nil {
 			return refused("%s cannot be read beside what an interrupted write left at %s: the owner decides: %v", d.name, swap, err)
 		}
-		if curOK && (cur.SHA256 == ours || newer(lst, cst)) {
-			// the owner's edit was displaced by the step's own write, or is newer than what the file holds: it goes back
-			if err := exchange(d.fd, swap, d.fd, d.base, unix.RENAME_EXCHANGE); err != nil {
-				return fmt.Errorf("%s: the exchange back failed, the journal stays: %w", d.name, err)
+		if curOK && cur.SHA256 == ours {
+			// the owner's edit was displaced by the step's own write: it goes back
+			if err := d.exchange(swap); err != nil {
+				return writeErr(d, fmt.Errorf("%s: the exchange back failed, the journal stays: %w", d.name, err))
 			}
 			if err := d.sync(); err != nil {
 				return err
@@ -542,21 +550,76 @@ func (d *targetDir) settle(swap, ours, expected string, keep func(ConfigState) e
 	return d.unlinkIf(swap, left.SHA256)
 }
 
-// newer says whether a file was last written after another.
-func newer(a, b unix.Stat_t) bool {
-	return a.Mtim.Sec > b.Mtim.Sec || a.Mtim.Sec == b.Mtim.Sec && a.Mtim.Nsec > b.Mtim.Nsec
-}
-
 // scratchName is where a write puts its new file together, before the file is whole at the swap name.
 func scratchName(swap string) string { return swap + ".new" }
 
 // clearScratch removes what an interrupted write left at the scratch name, whatever it holds: only a write of the
 // loop's puts a file there, and none was exchanged.
 func (d *targetDir) clearScratch(swap string) error {
-	if err := unix.Unlinkat(d.fd, scratchName(swap), 0); err != nil && err != unix.ENOENT {
-		return err
+	if err := d.unlink(scratchName(swap)); err != nil && err != unix.ENOENT {
+		return writeErr(d, err)
 	}
 	return nil
+}
+
+// writable checks, before a landing journals anything, that the target's directory takes a new file: a write the
+// file system or its permissions refuse is a hold, and the package stays proposed.
+func (d *targetDir) writable(swap string) error {
+	if err := d.clearScratch(swap); err != nil {
+		return err
+	}
+	fd, err := d.create(scratchName(swap))
+	if err != nil {
+		return writeErr(d, err)
+	}
+	unix.Close(fd)
+	return d.clearScratch(swap)
+}
+
+// persistentErrors stay until the owner changes something (permissions, a read-only file system, a mount, a full
+// disk): a write that meets one is refused, so a landing goes back to proposed and holds and a rollback holds, rather
+// than waiting as an interrupted write does.
+var persistentErrors = []error{unix.EACCES, unix.EPERM, unix.EROFS, unix.EBUSY, unix.ENOSPC, unix.EDQUOT}
+
+// writeErr makes a persistent write error a refusal that names it.
+func writeErr(d *targetDir, err error) error {
+	for _, p := range persistentErrors {
+		if errors.Is(err, p) {
+			return errors.Join(refused("%s cannot be written now (%v): the owner's permissions or file system refuse it", d.name, p), err)
+		}
+	}
+	return err
+}
+
+// The target directory's writes, each after the test hook for "op NAME" (Ship.ConfigStage), which can fail it as
+// the system would.
+func (d *targetDir) create(name string) (int, error) {
+	if err := d.at("op create"); err != nil {
+		return -1, err
+	}
+	return unix.Openat(d.fd, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+}
+
+func (d *targetDir) unlink(name string) error {
+	if err := d.at("op unlink"); err != nil {
+		return err
+	}
+	return unix.Unlinkat(d.fd, name, 0)
+}
+
+func (d *targetDir) rename(from, to string, flags uint) error {
+	if err := d.at("op rename"); err != nil {
+		return err
+	}
+	return unix.Renameat2(d.fd, from, d.fd, to, flags)
+}
+
+// exchange swaps the swap name and the target's.
+func (d *targetDir) exchange(swap string) error {
+	if err := d.at("op exchange"); err != nil {
+		return err
+	}
+	return unix.Renameat2(d.fd, swap, d.fd, d.base, unix.RENAME_EXCHANGE)
 }
 
 // errTargetDrift marks a refusal because the target is not what the step read.
@@ -575,7 +638,10 @@ func (d *targetDir) unlinkIf(swap, hash string) error {
 	if err != nil || left.SHA256 != hash {
 		return fmt.Errorf("%s beside %s does not hold what the step put there: it is left for the owner", swap, d.name)
 	}
-	return errors.Join(unix.Unlinkat(d.fd, swap, 0), d.sync())
+	if err := d.unlink(swap); err != nil {
+		return writeErr(d, err)
+	}
+	return d.sync()
 }
 
 // replace puts content in place of the target atomically, in the mode, owner and group expect has, only while the
@@ -588,9 +654,9 @@ func (d *targetDir) replace(swap string, content []byte, expect ConfigState) err
 		return err
 	}
 	scratch := scratchName(swap)
-	fd, err := unix.Openat(d.fd, scratch, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+	fd, err := d.create(scratch)
 	if err != nil {
-		return err
+		return writeErr(d, err)
 	}
 	f := os.NewFile(uintptr(fd), scratch)
 	half := len(content) / 2
@@ -609,11 +675,11 @@ func (d *targetDir) replace(swap string, content []byte, expect ConfigState) err
 	}
 	err = errors.Join(err, f.Sync(), f.Close())
 	if err == nil {
-		err = unix.Renameat2(d.fd, scratch, d.fd, swap, unix.RENAME_NOREPLACE)
+		err = d.rename(scratch, swap, unix.RENAME_NOREPLACE)
 	}
 	if err != nil {
-		unix.Unlinkat(d.fd, scratch, 0) // created exclusively by this step and never exchanged
-		return err
+		d.unlink(scratch) // created exclusively by this step and never exchanged
+		return writeErr(d, err)
 	}
 	if err := d.sync(); err != nil {
 		return err
@@ -622,7 +688,7 @@ func (d *targetDir) replace(swap string, content []byte, expect ConfigState) err
 		return err
 	}
 	ours := hashOf(content)
-	if err := exchange(d.fd, swap, d.fd, d.base, unix.RENAME_EXCHANGE); err != nil {
+	if err := d.exchange(swap); err != nil {
 		cleanup := d.unlinkIf(swap, ours)
 		switch err {
 		case unix.ENOENT:
@@ -630,17 +696,17 @@ func (d *targetDir) replace(swap string, content []byte, expect ConfigState) err
 		case unix.EINVAL:
 			return errors.Join(refused("the file system of %s cannot exchange files atomically", d.name), cleanup)
 		}
-		return errors.Join(err, cleanup)
+		return errors.Join(writeErr(d, err), cleanup)
 	}
 	if err := d.at("exchanged"); err != nil {
 		return err
 	}
 	displaced, ok, err := d.peek(swap)
 	if err != nil || !ok || !displaced.sameFile(expect) {
-		if back := exchange(d.fd, swap, d.fd, d.base, unix.RENAME_EXCHANGE); back != nil {
+		if back := d.exchange(swap); back != nil {
 			// not a refusal: the file holds the change, and what it held sits at the swap name for the next step's
 			// settle to put back
-			return fmt.Errorf("%s changed while it was written, and the exchange back failed (%v): the next step puts it back", d.name, back)
+			return writeErr(d, fmt.Errorf("%s changed while it was written, and the exchange back failed (%w): the next step puts it back", d.name, back))
 		}
 		if err := d.at("exchanged back"); err != nil {
 			return err
@@ -657,9 +723,6 @@ func (d *targetDir) replace(swap string, content []byte, expect ConfigState) err
 var swapXattrs = func(fd int) (int, error) { return unix.Flistxattr(fd, nil) }
 
 func swapName(caseID string) string { return ".momentum-" + caseID + ".swap" }
-
-// exchange is renameat2; a test injects a failure.
-var exchange = unix.Renameat2
 
 // ConfigJournal is a configuration landing's record, written before the file is: what the file held (its content,
 // hash, mode, owner and group) and what the change puts there.
@@ -715,6 +778,26 @@ func writeDurable(dir, name string, v any) error {
 		return err
 	}
 	return errors.Join(d.Sync(), d.Close())
+}
+
+// syncedDir makes dir, under root, and syncs it and each directory up to root, so a record written into it after a
+// power loss is still reached from root.
+func syncedDir(root, dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	for d := dir; ; d = filepath.Dir(d) {
+		f, err := os.Open(d)
+		if err != nil {
+			return err
+		}
+		if err := errors.Join(f.Sync(), f.Close()); err != nil {
+			return err
+		}
+		if d == root || !under(d, root) || d == filepath.Dir(d) {
+			return nil
+		}
+	}
 }
 
 func readRecord(dir, name string, v any) (bool, error) {
@@ -828,7 +911,7 @@ func (s *Ship) PrepareConfig(ctx context.Context, caseID, target, copied string)
 	if other, err := s.targetBusy(ctx, c.ID, d.name, base.SHA256); err != nil {
 		return Package{}, err
 	} else if other != "" {
-		return Package{}, &shipHold{err: refused("%s is the target of case %s's change, which is not done: the loop leaves it alone", d.name, other)}
+		return Package{}, busyHold(d.name, other)
 	}
 	clean, err := RedactAll(ctx, []string{d.name, string(base.Content)})
 	if err != nil {
@@ -858,6 +941,9 @@ func (s *Ship) PrepareConfig(ctx context.Context, caseID, target, copied string)
 	p := Package{Case: c.ID, Kind: KindConfig, Target: d.name, TargetBase: base.bare(), Branch: branch, Work: work, Host: host,
 		State: Prepared, Created: s.now()}
 	p.Records = filepath.Join("config", p.Created.UTC().Format("20060102T150405Z")+"-"+hex.EncodeToString(id[:]))
+	if err := syncedDir(s.Dir, s.records(p)); err != nil {
+		return Package{}, err
+	}
 	if had && old.State == Withdrawn {
 		p.ClosedProposals = old.ClosedProposals // a closed hand landing proposal counts toward the case's two
 	}
@@ -1006,7 +1092,12 @@ func (s *Ship) landConfig(ctx context.Context, p Package) (Package, error) {
 	if other, err := s.targetBusy(ctx, p.Case, p.Target, cur.SHA256); err != nil {
 		return p, err
 	} else if other != "" {
-		return p, &shipHold{err: refused("%s is the target of case %s's change, which is not done: no landing", p.Target, other)}
+		return p, busyHold(p.Target, other)
+	}
+	if err := d.writable(swapName(p.Case)); errors.Is(err, ErrRefused) {
+		return p, &shipHold{err: err} // nothing is journaled: the package stays proposed
+	} else if err != nil {
+		return p, err
 	}
 	j := ConfigJournal{Target: p.Target, Old: cur, New: ConfigState{SHA256: hashOf(content), Content: content}, Head: p.Head}
 	if err := s.assignedAuthority(ctx); err != nil {
@@ -1087,7 +1178,7 @@ func (s *Ship) refreshConfigBase(ctx context.Context, p Package, cur ConfigState
 	if other, err := s.targetBusy(ctx, p.Case, p.Target, cur.SHA256); err != nil {
 		return p, err
 	} else if other != "" {
-		return p, &shipHold{err: refused("%s is the target of case %s's change, which is not done: the loop leaves it alone", p.Target, other)}
+		return p, busyHold(p.Target, other)
 	}
 	clean, err := RedactAll(ctx, []string{string(cur.Content)})
 	if err != nil {
@@ -1126,17 +1217,25 @@ func (s *Ship) resumeConfigLanding(ctx context.Context, p Package) (Package, err
 	if err != nil {
 		return p, err
 	}
-	if !ok || j.Target != p.Target || j.Head != p.LandingHead {
-		// the step stopped before its journal: nothing was written
-		p.State, p.LandingHead = Proposed, ""
-		if err := s.saveAuthorized(ctx, &p); err != nil {
-			return p, err
-		}
-		return s.landConfig(ctx, p)
-	}
 	d, err := s.configTarget(p.Target, false)
-	if err != nil {
+	if errors.Is(err, errTargetGone) {
+		return s.setAside(ctx, p)
+	} else if err != nil {
 		return p, err
+	}
+	if !ok || j.Target != p.Target || j.Head != p.LandingHead {
+		cur, err := d.state()
+		d.Close()
+		if err == nil && p.TargetBase != nil && cur.SHA256 == p.TargetBase.SHA256 {
+			// the step stopped before its journal, and the file holds what it was proposed on: nothing was written
+			p.State, p.LandingHead = Proposed, ""
+			if err := s.saveAuthorized(ctx, &p); err != nil {
+				return p, err
+			}
+			return s.landConfig(ctx, p)
+		}
+		// the change may be in the file and its record of the content before it is gone: the owner decides
+		return p, s.landingHeld(ctx, p, refused("%s's landing journal is missing and the file does not hold what the change was proposed on", p.Target))
 	}
 	defer d.Close()
 	unlockTarget, err := s.lockTarget(p.Target)
@@ -1192,7 +1291,7 @@ func (s *Ship) keepDisplaced(ctx context.Context, p Package) func(ConfigState) e
 			return err
 		}
 		return s.Store.CaseNote(cleanedNote(ctx), p.Case, "displaced content kept",
-			fmt.Sprintf("an interrupted write left an earlier content of %s beside it, which is kept in %s", p.Target, filepath.Join(s.records(p), name)), s.Actor)
+			fmt.Sprintf("an interrupted write left another content of %s beside it, which is kept in %s", p.Target, filepath.Join(s.records(p), name)), s.Actor)
 	}
 }
 
@@ -1213,12 +1312,22 @@ func (s *Ship) setAside(ctx context.Context, p Package) (Package, error) {
 
 // abandonConfigLanding is the owner's rollback of an interrupted landing: the file gets its journaled content back
 // when it holds the change, and is left when it holds its old content or neither (his edit, or no file, kept, with the
-// journal named in the case log). The package is then rolled back and the case, still in testing, builds again.
+// journal named in the case log). The package is then rolled back and the case, still in testing, builds again. It
+// runs whatever became of the case, merged into another one included: it only restores journaled content, and it is
+// what frees the file.
 func (s *Ship) abandonConfigLanding(ctx context.Context, p Package, why string) (Package, error) {
 	var j ConfigJournal
 	ok, err := readRecord(s.records(p), configJournal, &j)
 	if err != nil {
 		return p, err
+	}
+	if !ok {
+		// the journal is gone: the host repository still holds what the change was proposed on and the change
+		if j, ok = s.journalFromHost(ctx, p); ok {
+			if err := writeDurable(s.records(p), configJournal, j); err != nil {
+				return p, err
+			}
+		}
 	}
 	var rb ConfigRollback
 	if p.State == RollingBack {
@@ -1228,15 +1337,19 @@ func (s *Ship) abandonConfigLanding(ctx context.Context, p Package, why string) 
 			return p, refused("case %s's rollback journal is missing", p.Case)
 		}
 	}
-	if ok && j.Target == p.Target && j.Head == p.LandingHead {
-		d, err := s.openTarget(p.Target, true)
-		if err != nil {
-			if errors.Is(err, ErrRefused) {
-				return p, &shipHold{err: err}
-			}
-			return p, err
-		}
+	d, err := s.openTarget(p.Target, true)
+	switch {
+	case errors.Is(err, errTargetGone):
+		why += "; " + s.keptOwners(p)
+		ok = false
+	case errors.Is(err, ErrRefused):
+		return p, &shipHold{err: err}
+	case err != nil:
+		return p, err
+	default:
 		defer d.Close()
+	}
+	if ok && j.Target == p.Target && j.Head == p.LandingHead {
 		unlockTarget, err := s.lockTarget(p.Target)
 		if err != nil {
 			return p, err
@@ -1262,9 +1375,6 @@ func (s *Ship) abandonConfigLanding(ctx context.Context, p Package, why string) 
 			if p.State != RollingBack {
 				// the rollback's own record and state before the write: a crash after it never lands the change again
 				rb = ConfigRollback{From: *cur.bare(), To: j.Old.SHA256, Why: why, Landing: true}
-				if err := s.assignedAuthority(ctx); err != nil {
-					return p, err
-				}
 				if err := writeDurable(s.records(p), configRollback, rb); err != nil {
 					return p, err
 				}
@@ -1272,7 +1382,7 @@ func (s *Ship) abandonConfigLanding(ctx context.Context, p Package, why string) 
 					return p, err
 				}
 				p.State, p.Undo = RollingBack, &RollbackJournal{Head: j.Old.SHA256, Why: why}
-				if err := s.saveAuthorized(ctx, &p); err != nil {
+				if err := s.save(&p); err != nil {
 					return p, err
 				}
 				if err := s.configStage("rollback journaled"); err != nil {
@@ -1290,11 +1400,30 @@ func (s *Ship) abandonConfigLanding(ctx context.Context, p Package, why string) 
 			}
 		}
 	}
-	p.State, p.LandingHead = RolledBack, ""
-	if err := s.saveAuthorized(ctx, &p); err != nil {
+	p.State, p.LandingHead, p.Undo = RolledBack, "", nil // its line in the case log is its record
+	if err := s.save(&p); err != nil {
 		return p, err
 	}
 	return p, s.Store.CaseNote(cleanedNote(ctx), p.Case, "landing rolled back", why, s.Actor)
+}
+
+// journalFromHost is a landing's journal as the package's host repository holds it, for a journal that is gone: the
+// target's content at the base commit, which must be what the package was proposed on, and at the landing's head.
+func (s *Ship) journalFromHost(ctx context.Context, p Package) (ConfigJournal, bool) {
+	if p.TargetBase == nil || p.BaseCommit == "" || p.LandingHead == "" {
+		return ConfigJournal{}, false
+	}
+	ctx = s.gitContext(shipContext(ctx, p.Case))
+	old, err := s.configContent(ctx, p, p.BaseCommit)
+	if err != nil || hashOf(old) != p.TargetBase.SHA256 {
+		return ConfigJournal{}, false
+	}
+	content, err := s.configContent(ctx, p, p.LandingHead)
+	if err != nil {
+		return ConfigJournal{}, false
+	}
+	return ConfigJournal{Target: p.Target, Old: ConfigState{SHA256: hashOf(old), Content: old}, New: ConfigState{SHA256: hashOf(content), Content: content},
+		Head: p.LandingHead}, true
 }
 
 func (s *Ship) finishConfigLanding(ctx context.Context, p Package, j ConfigJournal) (Package, error) {
@@ -1339,7 +1468,7 @@ func (s *Ship) rollBackConfig(ctx context.Context, p Package, why string, owner 
 	if err != nil {
 		return p, err
 	}
-	if c.Status != store.CaseDeployed && c.Status != store.CaseMeasuring {
+	if !owner && c.Status != store.CaseDeployed && c.Status != store.CaseMeasuring {
 		return p, refused("only a deployed or measuring case has a change to roll back")
 	}
 	var j ConfigJournal
@@ -1350,9 +1479,15 @@ func (s *Ship) rollBackConfig(ctx context.Context, p Package, why string, owner 
 	if !ok || j.Target != p.Target || p.TargetLanded == "" || j.New.SHA256 != p.TargetLanded {
 		return p, refused("the landing's journal of %s is missing or does not match its package: restore it by hand", p.Target)
 	}
+	// the owner's rollback runs whatever became of the case, merged into another included: it only restores
+	// journaled content, and it is what frees the file
+	save := s.saveAuthorized
+	if owner {
+		save = func(_ context.Context, p *Package) error { return s.save(p) }
+	}
 	d, err := s.openTarget(p.Target, owner)
 	if errors.Is(err, errTargetGone) {
-		return s.keepRolledBack(ctx, p, why)
+		return s.keepRolledBack(ctx, p, why, save)
 	} else if err != nil {
 		if errors.Is(err, ErrRefused) {
 			return p, &shipHold{err: err}
@@ -1385,7 +1520,7 @@ func (s *Ship) rollBackConfig(ctx context.Context, p Package, why string, owner 
 	}
 	cur, err := d.state()
 	if errors.Is(err, errTargetGone) {
-		return s.keepRolledBack(ctx, p, why)
+		return s.keepRolledBack(ctx, p, why, save)
 	} else if err != nil {
 		return p, &shipHold{err: err}
 	}
@@ -1394,8 +1529,10 @@ func (s *Ship) rollBackConfig(ctx context.Context, p Package, why string, owner 
 	case p.State == Landed && cur.SHA256 == j.New.SHA256 || p.State == RollingBack && cur.SHA256 == rb.From.SHA256:
 		if p.State == Landed {
 			rb = ConfigRollback{From: *cur.bare(), To: j.Old.SHA256, Why: why}
-			if err := s.assignedAuthority(ctx); err != nil {
-				return p, err
+			if !owner {
+				if err := s.assignedAuthority(ctx); err != nil {
+					return p, err
+				}
 			}
 			if err := writeDurable(s.records(p), configRollback, rb); err != nil {
 				return p, err
@@ -1404,7 +1541,7 @@ func (s *Ship) rollBackConfig(ctx context.Context, p Package, why string, owner 
 				return p, err
 			}
 			p.State, p.Undo = RollingBack, &RollbackJournal{Head: j.Old.SHA256, Why: why}
-			if err := s.saveAuthorized(ctx, &p); err != nil {
+			if err := save(ctx, &p); err != nil {
 				return p, err
 			}
 			if err := s.configStage("rollback journaled"); err != nil {
@@ -1412,20 +1549,20 @@ func (s *Ship) rollBackConfig(ctx context.Context, p Package, why string, owner 
 			}
 		}
 		if err := d.replace(swapName(p.Case), j.Old.Content, cur); errors.Is(err, errTargetDrift) {
-			return s.keepRolledBack(ctx, p, why) // his edit came while it was written, and is back in the file
+			return s.keepRolledBack(ctx, p, why, save) // his edit came while it was written, and is back in the file
 		} else if errors.Is(err, ErrRefused) {
 			return p, &shipHold{err: err}
 		} else if err != nil {
 			return p, err
 		}
 	default:
-		return s.keepRolledBack(ctx, p, why)
+		return s.keepRolledBack(ctx, p, why, save)
 	}
 	if err := s.configStage("rolled back"); err != nil {
 		return p, err
 	}
 	p.State = RolledBack
-	if err := s.saveAuthorized(ctx, &p); err != nil {
+	if err := save(ctx, &p); err != nil {
 		return p, err
 	}
 	if err := s.configStage("rollback saved"); err != nil {
@@ -1437,7 +1574,7 @@ func (s *Ship) rollBackConfig(ctx context.Context, p Package, why string, owner 
 // keepRolledBack ends a rollback that finds the owner's content in its file, or no file: nothing is written over it.
 // The package is rolled back with its journal kept and named in the case log, which frees the file, and its case goes
 // back to testing, where the loop builds again on the file as it is.
-func (s *Ship) keepRolledBack(ctx context.Context, p Package, why string) (Package, error) {
+func (s *Ship) keepRolledBack(ctx context.Context, p Package, why string, save func(context.Context, *Package) error) (Package, error) {
 	if p.Undo == nil {
 		p.Undo = &RollbackJournal{}
 	}
@@ -1446,7 +1583,7 @@ func (s *Ship) keepRolledBack(ctx context.Context, p Package, why string) (Packa
 	}
 	why += "; " + s.keptOwners(p)
 	p.State, p.Undo.Why = RolledBack, why
-	if err := s.saveAuthorized(ctx, &p); err != nil {
+	if err := save(ctx, &p); err != nil {
 		return p, err
 	}
 	if err := s.configStage("rollback saved"); err != nil {
@@ -1536,6 +1673,25 @@ func (s *Ship) targetBusy(ctx context.Context, self, target, cur string) (string
 		}
 	}
 	return "", nil
+}
+
+// InTransit refuses to end a case, by a close or a merge, while its configuration change is landing or rolling back:
+// momentum case rollback finishes that first, and it is what frees the file.
+func (s *Ship) InTransit(caseID string) error {
+	p, ok, err := s.Load(caseID)
+	if err != nil || !ok {
+		return err
+	}
+	if p.Kind == KindConfig && (p.State == Landing || p.State == RollingBack) {
+		return refused("case %s's configuration change to %s is %s: momentum case rollback %s --why ... finishes it first", caseID, p.Target, p.State, caseID)
+	}
+	return nil
+}
+
+// busyHold is the hold of a step on a file another case's change is not done with, and how that case ends.
+func busyHold(target, other string) error {
+	return &shipHold{err: refused("%s is the target of case %s's change, which is not done: the loop leaves it alone until "+
+		"momentum case rollback %s undoes a change of it in place, or %s's case ends", target, other, other, other)}
 }
 
 // lockTarget serializes the steps of one file's packages: a busy check and the write or the package it allows are

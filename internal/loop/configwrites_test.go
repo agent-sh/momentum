@@ -27,7 +27,8 @@ const (
 
 var errCrash = errors.New("marker-c0ffee crash")
 
-// writeWorld is one configuration case on a fake home, and the owner's last content of its target.
+// writeWorld is one configuration case on a fake home, the owner's last content of its target, and what the test
+// does to the case and the file system around the loop's steps.
 type writeWorld struct {
 	t      *testing.T
 	st     *store.Store
@@ -38,12 +39,21 @@ type writeWorld struct {
 	last   string // the owner's last content, "" while he wrote none
 	passes int
 	trail  []string // what happened, for a failure's message
+
+	in        injection // the write's injection, while it runs
+	acting    bool
+	exchanges int
+	fault     unix.Errno // what every write of the target's directory meets, while it persists
+	persist   string     // a persistent condition in place: a permission, a fault or the directory moved away
+	moved     bool
 }
 
 func newWriteWorld(t *testing.T) *writeWorld {
 	t.Helper()
 	st := testStore(t)
 	home := fakeHome(t)
+	dir := filepath.Join(home, filepath.Dir(ruleTarget))
+	t.Cleanup(func() { os.Chmod(dir, 0o700) }) // before the temporary directory goes
 	r := localRunner(t, st)
 	r.Ship = configShip(t, st, home)
 	r.Ship.Dir = r.Dir
@@ -52,7 +62,9 @@ func newWriteWorld(t *testing.T) *writeWorld {
 	if err := st.CaseNote(context.Background(), c.ID, repoAction, string(raw), "fixture"); err != nil {
 		t.Fatal(err)
 	}
-	return &writeWorld{t: t, st: st, s: r.Ship, r: r, c: c, home: home}
+	w := &writeWorld{t: t, st: st, s: r.Ship, r: r, c: c, home: home}
+	w.s.ConfigStage = w.stage
+	return w
 }
 
 func (w *writeWorld) note(format string, args ...any) {
@@ -64,7 +76,15 @@ func (w *writeWorld) fail(format string, args ...any) {
 	w.t.Fatalf("%s\ntrail:\n  %s", fmt.Sprintf(format, args...), strings.Join(w.trail, "\n  "))
 }
 
-func (w *writeWorld) target() string { return filepath.Join(w.home, ruleTarget) }
+func (w *writeWorld) dir() string { return filepath.Join(w.home, filepath.Dir(ruleTarget)) }
+
+// target is where the owner's file is: its path, or where its directory was moved.
+func (w *writeWorld) target() string {
+	if w.moved {
+		return filepath.Join(w.dir()+"-away", filepath.Base(ruleTarget))
+	}
+	return filepath.Join(w.home, ruleTarget)
+}
 
 // reviewed brings the case's package to a clean posted review on its proposed head. It skips the sandbox check: the
 // steps under test are the landing's and the rollback's.
@@ -100,10 +120,12 @@ func (w *writeWorld) edit(text string) {
 }
 
 // injection is what happens during one write: the owner saves the file at a step (and again at a later one), the
-// write stops at a step as a crash would, and the exchange that would put an edit back fails.
+// write stops at a step as a crash would, the exchange that would put an edit back fails, and at a step something
+// happens to the case or to the file system (what), which a file system condition keeps until the test clears it.
 type injection struct {
 	edit, edit2, crash string
 	failBack           bool
+	at, what           string
 }
 
 func (in injection) String() string {
@@ -117,45 +139,123 @@ func (in injection) String() string {
 	if in.failBack {
 		parts = append(parts, "failed exchange back")
 	}
+	if in.what != "" {
+		parts = append(parts, in.what+"@"+in.at)
+	}
 	if in.crash != "" {
 		parts = append(parts, "crash@"+in.crash)
 	}
 	return strings.Join(parts, ",")
 }
 
-// act runs one write with an injection. The step "before" is the state itself, before the write begins, and "after"
-// is the moment the write returns.
-func (w *writeWorld) act(name string, in injection, action func() error) {
-	stage := func(step string) error {
-		if step == in.edit {
-			w.edit(ownerEdit)
+// stage is the ship's hook between a write's steps and before each write of the target's directory ("op NAME").
+func (w *writeWorld) stage(step string) error {
+	if strings.HasPrefix(step, "op ") {
+		if w.acting && w.in.failBack && step == "op exchange" {
+			if w.exchanges++; w.exchanges == 2 {
+				return unix.EIO
+			}
 		}
-		if step == in.edit2 {
-			w.edit(ownerEdit2)
-		}
-		if step == in.crash {
-			w.note("crash at %s", step)
-			return errCrash
+		if w.fault != 0 {
+			return w.fault
 		}
 		return nil
 	}
-	if stage("before") != nil {
+	if !w.acting {
+		return nil
+	}
+	if step == w.in.edit {
+		w.edit(ownerEdit)
+	}
+	if step == w.in.edit2 {
+		w.edit(ownerEdit2)
+	}
+	if step == w.in.at {
+		w.happen(w.in.what)
+	}
+	if step == w.in.crash {
+		w.note("crash at %s", step)
+		return errCrash
+	}
+	return nil
+}
+
+// happen is what an injection does to the case or to the file system.
+func (w *writeWorld) happen(what string) {
+	ctx := context.Background()
+	var err error
+	switch what {
+	case "closed":
+		_, err = w.st.CloseCase(ctx, w.c.ID, store.NotWorthIt, "", "the owner closes it", "test")
+	case "reopened":
+		if _, err = w.st.CloseCase(ctx, w.c.ID, store.NotWorthIt, "", "the owner closes it", "test"); err == nil {
+			_, err = w.st.ReopenCase(ctx, w.c.ID, nil, "the owner reopens it", "test")
+		}
+	case "duplicate":
+		_, err = w.st.CloseCase(ctx, w.c.ID, store.Duplicate, w.other().ID, "the same cause", "test")
+	case "merged":
+		// a signature another case holds, added to this one, merges this one into it
+		_, _, err = w.st.AddCaseSignature(ctx, w.c.ID, w.other().Signatures[0], "test")
+	case "EACCES":
+		err = os.Chmod(w.dir(), 0o555)
+		w.persist = what
+	case "EROFS", "EPERM":
+		w.fault = map[string]unix.Errno{"EROFS": unix.EROFS, "EPERM": unix.EPERM}[what]
+		w.persist = what
+	case "removed":
+		err = os.Rename(w.dir(), w.dir()+"-away")
+		w.moved, w.persist = err == nil, what
+	}
+	w.note("%s: %v", what, err)
+}
+
+// clear ends a persistent condition: the directory's permission back, the fault gone, the directory back where it was.
+func (w *writeWorld) clear() {
+	switch w.persist {
+	case "EACCES":
+		os.Chmod(w.dir(), 0o700)
+	case "EROFS", "EPERM":
+		w.fault = 0
+	case "removed":
+		if _, err := os.Lstat(w.dir()); !errors.Is(err, fs.ErrNotExist) {
+			w.fail("the target's directory was made again while it was away: %v", err)
+		}
+		if err := os.Rename(w.dir()+"-away", w.dir()); err != nil {
+			w.fail("restore: %v", err)
+		}
+		w.moved = false
+	}
+	w.note("%s cleared", w.persist)
+	w.persist = ""
+}
+
+// other is the case this one goes into when it is merged.
+func (w *writeWorld) other() store.Case {
+	ctx := context.Background()
+	c, _, err := w.st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: "failures/v1:zz-merge", Title: "the same cause",
+		Evidence: []store.Evidence{{Ref: "file:/t/zz-merge", At: time.Now().Add(-time.Hour)}}}, "test")
+	if err != nil {
+		w.fail("the other case: %v", err)
+	}
+	if c.Status == store.CaseOpen {
+		mech, next := "the same cause", "the same fix"
+		if c, err = w.st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mech, NextTest: &next}, "test"); err != nil {
+			w.fail("the other case: %v", err)
+		}
+	}
+	return c
+}
+
+// act runs one write with an injection. The step "before" is the state itself, before the write begins, and "after"
+// is the moment the write returns.
+func (w *writeWorld) act(name string, in injection, action func() error) {
+	w.in, w.acting, w.exchanges = in, true, 0
+	defer func() { w.in, w.acting = injection{}, false }()
+	if w.stage("before") != nil {
 		return
 	}
-	w.s.ConfigStage = stage
-	defer func() { w.s.ConfigStage = nil }()
-	if in.failBack {
-		calls, real := 0, exchange
-		exchange = func(fromDir int, from string, toDir int, to string, flags uint) error {
-			if calls++; calls == 2 {
-				return unix.EIO
-			}
-			return real(fromDir, from, toDir, to, flags)
-		}
-		defer func() { exchange = real }()
-	}
 	w.note("%s: %v", name, action())
-	stage("after")
+	w.stage("after")
 }
 
 // land is the loop's landing, or its resume.
@@ -182,7 +282,7 @@ func (w *writeWorld) nextPass() {
 	ctx := context.Background()
 	w.passes++
 	w.r.pass = &passInputs{}
-	if b, err := os.ReadFile(w.target()); err == nil {
+	if b, err := os.ReadFile(w.target()); err == nil && !w.moved {
 		w.r.pass.manifest.Configuration.Files = []ConfigFile{{Path: ruleTarget, Root: ".config/agents", SHA256: hashOf(b)}}
 	}
 	c, step, _, err := w.r.pick(ctx, "failures", w.c.ID, false)
@@ -249,42 +349,70 @@ func (w *writeWorld) clean(when string) {
 // loggedPaths are the files the case log names.
 var loggedPaths = regexp.MustCompile(`/[^\s,;:()"]+\.json`)
 
-// settled: the package is where an existing step takes it on (a build on the file as it is, or a landed change being
-// measured), every file the case log names is there, and nothing but the target is under the home.
+// settled: the package is where an existing step takes it on (a build on the file as it is, a landed change being
+// measured, or an inert package of a case that is not in testing), every file the case log names is there, and
+// nothing but the target is under the home.
 func (w *writeWorld) settled(when string) {
 	ctx := context.Background()
+	w.contentIn(when, true)
 	p, ok, err := w.s.Load(w.c.ID)
 	c, cerr := w.st.CaseByID(ctx, w.c.ID)
 	if err != nil || !ok || cerr != nil {
 		w.fail("%s: %v %v %v", when, ok, err, cerr)
 	}
-	w.contentIn(when, true)
 	b, _ := os.ReadFile(w.target())
 	switch {
-	case p.State == Prepared && c.Status == store.CaseTesting:
-		if p.TargetBase == nil || p.TargetBase.SHA256 != hashOf(b) {
-			w.fail("%s: the next build is not on the file as it is", when)
+	case p.State == Landing || p.State == RollingBack:
+		w.fail("%s: the package is still %s with its case %s", when, p.State, c.Status)
+	case c.Status == store.CaseDeployed || c.Status == store.CaseMeasuring:
+		if p.State != Landed {
+			w.fail("%s: the package is %s with its case %s", when, p.State, c.Status)
 		}
-	case p.State == Landed && c.Status == store.CaseDeployed:
-	default:
-		w.fail("%s: the package is %s with its case %s", when, p.State, c.Status)
+	case p.State == Landed:
+		w.fail("%s: a landed change with its case %s", when, c.Status)
+	case c.Status == store.CaseTesting:
+		if p.State != Prepared || p.TargetBase == nil || p.TargetBase.SHA256 != hashOf(b) {
+			w.fail("%s: the package is %s, not a build on the file as it is", when, p.State)
+		}
 	}
-	log, err := w.st.CaseLog(ctx, w.c.ID)
-	if err != nil {
-		w.fail("%s: %v", when, err)
+	ids := []string{w.c.ID}
+	if c.Into != "" {
+		ids = append(ids, c.Into)
 	}
-	for _, e := range log {
-		for _, path := range loggedPaths.FindAllString(e.Detail, -1) {
-			if _, err := os.Stat(path); err != nil {
-				w.fail("%s: the case log's %q names %s, which is gone: %v", when, e.Action, path, err)
+	for _, id := range ids {
+		log, err := w.st.CaseLog(ctx, id)
+		if err != nil {
+			w.fail("%s: %v", when, err)
+		}
+		for _, e := range log {
+			for _, path := range loggedPaths.FindAllString(e.Detail, -1) {
+				if _, err := os.Stat(path); err != nil {
+					w.fail("%s: the case log's %q names %s, which is gone: %v", when, e.Action, path, err)
+				}
 			}
 		}
 	}
 	w.clean(when)
 }
 
-// done: the first case ends (a change in place is rolled back by the owner, then the case is closed), and a second
-// case prepares on the file as it is.
+// secondCase is another case in testing.
+func secondCase(t *testing.T, st *store.Store) store.Case {
+	t.Helper()
+	ctx := context.Background()
+	c, _, err := st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: "failures/v1:zz-later", Title: "a later case",
+		Evidence: []store.Evidence{{Ref: "file:/t/zz-later", At: time.Now().Add(-time.Hour)}}}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mech, next := "Answer is off by one", "assert Answer() == 42"
+	if c, err = st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mech, NextTest: &next}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// done: the first case ends (a change in place is rolled back by the owner, then a case still open is closed), and a
+// second case prepares on the file as it is.
 func (w *writeWorld) done() {
 	ctx := context.Background()
 	c, _ := w.st.CaseByID(ctx, w.c.ID)
@@ -294,10 +422,12 @@ func (w *writeWorld) done() {
 		}
 		w.contentIn("after the owner's last rollback", true)
 	}
-	if _, err := w.st.CloseCase(ctx, w.c.ID, store.NotWorthIt, "", "the owner ends it", "test"); err != nil {
-		w.fail("close: %v", err)
+	if c, _ = w.st.CaseByID(ctx, w.c.ID); c.Status != store.CaseClosed {
+		if _, err := w.st.CloseCase(ctx, w.c.ID, store.NotWorthIt, "", "the owner ends it", "test"); err != nil {
+			w.fail("close: %v", err)
+		}
 	}
-	second := sameEvidenceCase(w.t, w.st, w.c)
+	second := secondCase(w.t, w.st)
 	q, err := w.s.PrepareConfig(ctx, second.ID, ruleTarget, "")
 	b, _ := os.ReadFile(w.target())
 	if err != nil || q.TargetBase == nil || q.TargetBase.SHA256 != hashOf(b) {
@@ -356,9 +486,15 @@ func writeActions() []writeAction {
 	}
 }
 
+// writeHappenings are what may happen to the case or the file system at a step: the case closed by hand, reopened,
+// closed as a duplicate or merged into another; a permission, a read-only file system or a refused operation that
+// stays; the target's directory moved away and later back.
+var writeHappenings = []string{"closed", "reopened", "duplicate", "merged", "EACCES", "EROFS", "EPERM", "removed"}
+
 func writeInjections(steps []string) []injection {
 	var out []injection
-	for _, step := range append([]string{"before"}, steps...) {
+	all := append([]string{"before"}, steps...)
+	for _, step := range all {
 		out = append(out, injection{crash: step}, injection{edit: step}, injection{edit: step, crash: step})
 	}
 	if slices.Contains(steps, "swap written") {
@@ -366,17 +502,26 @@ func writeInjections(steps []string) []injection {
 		const back = "exchanged back"
 		out = append(out, injection{edit: "swap written", crash: back}, injection{edit: "swap written", edit2: back},
 			injection{edit: "swap written", edit2: back, crash: back}, injection{edit: "swap written", failBack: true},
-			// his edit sits at the swap name when he saves the file again: the file's is the newer, and the other is kept
+			// his edit sits at the swap name when he saves the file again
 			injection{edit: "swap written", failBack: true, edit2: "after"})
+	}
+	for _, step := range all {
+		for _, what := range writeHappenings {
+			out = append(out, injection{at: step, what: what})
+		}
 	}
 	return out
 }
 
-// Every write of a configuration package, from every state, meets a crash at each of its steps, the owner's edit at
-// each, and both; then the loop's next passes and the owner's case rollback run, in both orders. The owner's last
-// content is never lost, the package ends where an existing step takes it on, no step needs a copy by hand, every
-// file the case log names is there, nothing but the target is written under the home, and once the case is done a
-// second case prepares on the file.
+// writeSlots bounds the scenarios that run at once.
+var writeSlots = make(chan struct{}, 8)
+
+// Every write of a configuration package, from every state, meets at each of its steps a crash, the owner's edit,
+// both, the case closed, reopened, merged or closed as a duplicate, a write error that stays, and the target's
+// directory moved away; then the loop's next passes and the owner's case rollback run, in both orders, and a condition
+// that stays is cleared before the case is taken on again. The owner's last content is never lost, the package ends
+// where an existing step takes it on, no step needs a copy by hand, every file the case log names is there, nothing
+// but the target is written under the home, and once the case is done a second case prepares on the file.
 func TestConfigurationWritesSurviveEveryCrashAndEdit(t *testing.T) {
 	for _, a := range writeActions() {
 		for _, in := range writeInjections(a.steps) {
@@ -386,6 +531,9 @@ func TestConfigurationWritesSurviveEveryCrashAndEdit(t *testing.T) {
 					order = "then the owner's rollback"
 				}
 				t.Run(fmt.Sprintf("%s/%s/%s/%s", a.start, a.name, in, order), func(t *testing.T) {
+					t.Parallel()
+					writeSlots <- struct{}{}
+					defer func() { <-writeSlots }()
 					w := newWriteWorld(t)
 					a.setup(w)
 					w.state("at the start")
@@ -397,6 +545,11 @@ func TestConfigurationWritesSurviveEveryCrashAndEdit(t *testing.T) {
 						w.nextPass()
 					} else {
 						w.nextPass()
+						w.note("the owner's rollback: %v", w.ownerRollBack())
+						w.state("after the owner's rollback")
+					}
+					if w.persist != "" {
+						w.clear()
 						w.note("the owner's rollback: %v", w.ownerRollBack())
 						w.state("after the owner's rollback")
 					}
@@ -439,40 +592,183 @@ func TestTheJournalTheCaseLogNamesStaysWhereItSays(t *testing.T) {
 	w.content("at the end")
 }
 
-// An edit an interrupted write displaced that is newer than what the file holds goes back into the file, and the
-// older one is kept in the package's records and named in the case log: nothing of the owner's is removed unkept.
-func TestADisplacedEditNewerThanTheFileGoesBack(t *testing.T) {
+// What an interrupted write left at the swap name, when the file holds anything but the step's own content, stays
+// out of the file: the file's content came after the exchange, whatever its time says (a restore from a backup keeps
+// an old one). The other content is kept in the package's records and named in the case log.
+func TestTheFileWinsOverWhatAnExchangeDisplaced(t *testing.T) {
+	for name, back := range map[string]time.Duration{"a later time": time.Second, "an earlier time": -24 * time.Hour} {
+		t.Run(name, func(t *testing.T) {
+			w := newWriteWorld(t)
+			ctx := context.Background()
+			w.reviewed()
+			w.act("land", injection{edit: "swap written", failBack: true}, w.land)
+			w.edit(ownerEdit2) // he saves the file again, over the change, or restores it from a backup
+			if err := os.Chtimes(w.target(), time.Now().Add(back), time.Now().Add(back)); err != nil {
+				t.Fatal(err)
+			}
+			w.note("land: %v", w.land())
+			w.contentIn("after the landing", true)
+			swap := filepath.Join(filepath.Dir(w.target()), swapName(w.c.ID))
+			if _, err := os.Lstat(swap); !errors.Is(err, os.ErrNotExist) {
+				w.fail("left at the swap name: %v", err)
+			}
+			kept := "displaced-" + hashOf([]byte(ownerEdit))[:16] + ".json"
+			var c ConfigState
+			if ok, err := readRecord(recordsOf(t, w.s, w.c.ID), kept, &c); !ok || err != nil || string(c.Content) != ownerEdit {
+				w.fail("the other content is not kept: %v %v", ok, err)
+			}
+			log, _ := w.st.CaseLog(ctx, w.c.ID)
+			found := false
+			for _, e := range log {
+				found = found || e.Action == "displaced content kept" && strings.Contains(e.Detail, kept) && strings.Contains(e.Detail, "another content")
+			}
+			if !found {
+				w.fail("the case log does not name the kept content")
+			}
+			w.nextPass()
+			w.nextPass()
+			w.settled("settled")
+			w.done()
+		})
+	}
+}
+
+// A case merged into another while its landing is interrupted: the owner's case rollback finishes the landing, and the
+// file is free for the case it went into.
+func TestTheOwnersRollbackFinishesTheLandingOfAMergedCase(t *testing.T) {
+	for _, what := range []string{"duplicate", "merged"} {
+		t.Run(what, func(t *testing.T) {
+			w := newWriteWorld(t)
+			ctx := context.Background()
+			w.reviewed()
+			w.act("land", injection{crash: "written"}, w.land)
+			w.happen(what)
+			if c, _ := w.st.CaseByID(ctx, w.c.ID); c.Into == "" {
+				w.fail("the case was not merged")
+			}
+			if err := w.ownerRollBack(); err != nil {
+				w.fail("the owner's rollback of a merged case's landing: %v", err)
+			}
+			if p, _, _ := w.s.Load(w.c.ID); p.State != RolledBack {
+				w.fail("the package: %s", p.State)
+			}
+			w.contentIn("after the rollback", true)
+			if b, _ := os.ReadFile(w.target()); string(b) != oldRule {
+				w.fail("the rollback left %q", b)
+			}
+			if _, err := w.s.PrepareConfig(ctx, w.other().ID, ruleTarget, ""); err != nil {
+				w.fail("the case it went into, on the file: %v", err)
+			}
+		})
+	}
+}
+
+// A landed change whose case never deployed it, then was closed: the owner's case rollback restores the file, and the
+// case log says so.
+func TestTheOwnerRollsBackALandedChangeWhoseCaseNeverDeployedIt(t *testing.T) {
 	w := newWriteWorld(t)
 	ctx := context.Background()
 	w.reviewed()
-	w.act("land", injection{crash: "written"}, w.land)
-	w.edit(ownerEdit)
-	swap := filepath.Join(filepath.Dir(w.target()), swapName(w.c.ID))
-	write(t, swap, ownerEdit2) // his later edit, displaced to the swap name in the file's mode
-	if err := os.Chmod(swap, 0o640); err != nil {
-		t.Fatal(err)
+	w.act("land", injection{crash: "landed"}, w.land)
+	w.happen("closed")
+	if err := w.ownerRollBack(); err != nil {
+		w.fail("the owner's rollback: %v", err)
 	}
-	// written after the file's edit, beyond the file system's clock tick
-	if err := os.Chtimes(swap, time.Now().Add(time.Second), time.Now().Add(time.Second)); err != nil {
-		t.Fatal(err)
+	if b, _ := os.ReadFile(w.target()); string(b) != oldRule {
+		w.fail("the rollback left %q", b)
 	}
-	w.last = ownerEdit2
-	w.note("land: %v", w.land())
-	w.content("after the landing")
-	if _, err := os.Lstat(swap); !errors.Is(err, os.ErrNotExist) {
-		w.fail("left at the swap name: %v", err)
-	}
-	var kept ConfigState
-	if ok, err := readRecord(recordsOf(t, w.s, w.c.ID), "displaced-"+hashOf([]byte(ownerEdit))[:16]+".json", &kept); !ok || err != nil || string(kept.Content) != ownerEdit {
-		w.fail("the older edit is not kept: %v %v", ok, err)
-	}
+	c, _ := w.st.CaseByID(ctx, w.c.ID)
 	log, _ := w.st.CaseLog(ctx, w.c.ID)
-	found := false
-	for _, e := range log {
-		found = found || e.Action == "displaced content kept" && strings.Contains(e.Detail, "displaced-"+hashOf([]byte(ownerEdit))[:16])
+	if last := log[len(log)-1]; c.Status != store.CaseClosed || last.Action != "rolled back" {
+		w.fail("the case %s, its last line %+v", c.Status, last)
 	}
-	if !found {
-		w.fail("the case log does not name the kept edit")
+}
+
+// A landing the file system refuses to write holds before it journals anything: the package stays proposed and lands
+// once the owner gives the directory back.
+func TestALandingTheFileSystemRefusesHoldsProposed(t *testing.T) {
+	for _, what := range []string{"EACCES", "EROFS"} {
+		t.Run(what, func(t *testing.T) {
+			w := newWriteWorld(t)
+			w.reviewed()
+			w.happen(what)
+			for i := 0; i < 2; i++ {
+				if err := w.land(); !held(err) || !strings.Contains(err.Error(), "cannot be written") {
+					w.fail("land %d: %v", i, err)
+				}
+				if p, _, _ := w.s.Load(w.c.ID); p.State != Proposed {
+					w.fail("land %d: the package is %s", i, p.State)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(recordsOf(t, w.s, w.c.ID), configJournal)); !errors.Is(err, os.ErrNotExist) {
+				w.fail("journaled: %v", err)
+			}
+			w.clear()
+			if err := w.land(); err != nil {
+				w.fail("land once the directory takes a file: %v", err)
+			}
+			w.contentIn("landed", true)
+		})
+	}
+}
+
+// An interrupted landing whose target's directory the owner moved away is set aside by the loop, and the owner's case
+// rollback of one is finished, with the journal named.
+func TestALandingWhoseDirectoryIsGoneIsSetAside(t *testing.T) {
+	for _, owner := range []bool{false, true} {
+		t.Run(fmt.Sprint("owner ", owner), func(t *testing.T) {
+			w := newWriteWorld(t)
+			w.reviewed()
+			w.act("land", injection{crash: "written"}, w.land)
+			w.happen("removed")
+			step := w.land
+			if owner {
+				step = w.ownerRollBack
+			}
+			w.note("step: %v", step())
+			if p, _, _ := w.s.Load(w.c.ID); p.State != RolledBack {
+				w.fail("the package: %s", p.State)
+			}
+			w.clear()
+			w.nextPass()
+			w.nextPass()
+			w.settled("settled")
+			w.done()
+		})
+	}
+}
+
+// A busy file's hold names the command that frees it.
+func TestABusyFilesHoldNamesCaseRollback(t *testing.T) {
+	w := newWriteWorld(t)
+	w.reviewed()
+	w.act("land", injection{crash: "written"}, w.land)
+	second := secondCase(t, w.st)
+	if _, err := w.s.PrepareConfig(context.Background(), second.ID, ruleTarget, ""); !held(err) || !strings.Contains(err.Error(), "momentum case rollback "+w.c.ID) {
+		w.fail("the busy hold: %v", err)
+	}
+}
+
+// A landing whose journal is gone while its file holds the change is held for the owner, not built again over the
+// change, and the owner's case rollback restores the file from what the package's host repository holds.
+func TestALandingWithoutItsJournalIsHeld(t *testing.T) {
+	w := newWriteWorld(t)
+	w.reviewed()
+	w.act("land", injection{crash: "written"}, w.land)
+	if err := os.Remove(filepath.Join(recordsOf(t, w.s, w.c.ID), configJournal)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.land(); !held(err) || !strings.Contains(err.Error(), "momentum case rollback") {
+		w.fail("the landing without its journal: %v", err)
+	}
+	if p, _, _ := w.s.Load(w.c.ID); p.State != Landing {
+		w.fail("the package: %s", p.State)
+	}
+	if err := w.ownerRollBack(); err != nil {
+		w.fail("the owner's rollback: %v", err)
+	}
+	if b, _ := os.ReadFile(w.target()); string(b) != oldRule {
+		w.fail("the rollback left %q", b)
 	}
 	w.nextPass()
 	w.nextPass()
