@@ -89,15 +89,13 @@ func TestABuildIsToldItsPathsUpFront(t *testing.T) {
 // A review run is given the paths its build was given. A fix in a path no change may touch is a low finding for a
 // person, it lowers no other finding, and a change not worth landing without it is a high one.
 func TestAReviewIsToldTheBuildsPaths(t *testing.T) {
-	for _, repo := range []string{"", SelfRepo} {
-		t.Run("repo "+repo, func(t *testing.T) {
+	for _, repo := range []string{"agent-sh/fake", SelfRepo} {
+		t.Run(repo, func(t *testing.T) {
 			ctx := context.Background()
 			r, c, p := reviewFixture(t)
-			if repo != "" {
-				p.Repo = repo
-				if err := r.Ship.save(&p); err != nil {
-					t.Fatal(err)
-				}
+			p.Repo = repo
+			if err := r.Ship.save(&p); err != nil {
+				t.Fatal(err)
 			}
 			if err := r.prepareInputs(ctx); err != nil {
 				t.Fatal(err)

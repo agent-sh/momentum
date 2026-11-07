@@ -407,8 +407,8 @@ func buildScope(repo string) string {
 
 // reviewPrompt is a review's task. It carries the paths the build was given (buildScope), so a reviewer knows what the
 // build could change. A cause whose fix needs a path no change may touch is a low finding whose where names that path,
-// kept with the package's reviews for a person; it lowers no other finding, and a change that is not worth landing
-// without that fix is a high one. A fix a hand landing may make is the build's to make.
+// a follow-up for a person; it lowers no other finding, and a change that is not worth landing without that fix is a
+// high one. In the loop's own repository, a fix a hand landing may make is the build's to make.
 func reviewPrompt(c store.Case, p Package) string {
 	return fmt.Sprintf("Review case %s (%s): %s. Read /run/input/case.json, /run/input/change.patch and /run/input/package.json. "+
 		"The proposed tree is read-only at /ro/change with no .git. /ro holds the shared pass inputs. "+
@@ -417,8 +417,8 @@ func reviewPrompt(c store.Case, p Package) string {
 		"A cause whose fix needs a path no change may touch, as named above, or anything outside this repository, is a "+
 		"follow-up for a person: file it as a low finding whose where names it and whose fix is the change a person makes "+
 		"there. The follow-up lowers no finding on what "+
-		"this change does. When this change is not worth landing without that fix, because it only hides the case's signal "+
-		"or it is wrong on its own, file a high finding that says so.", c.ID, c.Family, p.Title, buildScope(p.Repo)) + handReach(p.Repo)
+		"this change does. When this change is not worth landing without that fix, for example because it changes nothing of "+
+		"the case's problem, only hides its signal, or is wrong on its own, file a high finding that says so.", c.ID, c.Family, p.Title, buildScope(p.Repo)) + handReach(p.Repo)
 }
 
 // handReach is the review's sentence on the paths only a hand landing may change, which only the loop's own
