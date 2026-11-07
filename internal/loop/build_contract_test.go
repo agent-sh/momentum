@@ -86,9 +86,9 @@ func TestABuildIsToldItsPathsUpFront(t *testing.T) {
 	}
 }
 
-// A review run is given the paths its build was given. A fix in a path no change may touch, or outside the repository, is
-// a low finding for a person named without a host path, it lowers no other finding, and a change not worth landing
-// without it is a high one; in the loop's own repository only, a fix a hand landing may make is the build's to make.
+// A review run is given the paths its build was given. A fix in a path no change may touch, or outside the repository,
+// is a low finding for a person, which names no host path; it lowers no other finding, and a change not worth landing
+// without it is a high one. In the loop's own repository only, a fix a hand landing may make is the build's to make.
 func TestAReviewIsToldTheBuildsPaths(t *testing.T) {
 	for _, repo := range []string{"agent-sh/fake", SelfRepo} {
 		t.Run(repo, func(t *testing.T) {
@@ -114,7 +114,7 @@ func TestAReviewIsToldTheBuildsPaths(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, want := range []string{"reviewed_files", buildScope(p.Repo), "follow-up for a person: file it as a low finding",
-				"or anything outside this repository", "never a host path", "The follow-up lowers no finding on what this change does", "file a high finding"} {
+				"or anything outside this repository", "names that path in this repository, or the thing outside it by its kind", "no part of the finding names a host path", "The follow-up lowers no finding on what this change does", "file a high finding"} {
 				if !strings.Contains(prompt, want) {
 					t.Fatalf("the prepared review prompt for %q lacks %q: %s", p.Repo, want, prompt)
 				}
