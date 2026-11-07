@@ -83,9 +83,7 @@ func measuredCaseWithRead(t *testing.T, read bool) *measured {
 	run(t, t.TempDir(), "git", "init", "-q", "-b", "main", m.repo)
 	write(t, filepath.Join(m.repo, "a.txt"), "a\n")
 	run(t, m.repo, "git", "add", "-A")
-	// the change is committed on the case's clock, before its plan, so HEAD's reflog reaches back to the builds the
-	// tests date around its landing
-	datedGitIn(t, m.repo, m.deployed.Add(-2*time.Hour), "commit", "-q", "-m", "the change")
+	run(t, m.repo, "git", "commit", "-q", "-m", "the change")
 	head := strings.TrimSpace(run(t, m.repo, "git", "rev-parse", "HEAD"))
 	f := store.Finding{Family: "failures", Signature: "failures/v1:mm", Title: "the thing breaks"}
 	for _, e := range before[:6] {
@@ -509,13 +507,12 @@ func TestAnInstalledFileMustFollowTheCheckoutChange(t *testing.T) {
 	p, _, _ := m.r.Ship.Load(m.c.ID)
 	bin := filepath.Join(t.TempDir(), "tool")
 	write(t, bin, "old build")
-	// the checkout's moves are dated on the case's clock, as its builds are
-	datedGitIn(t, m.repo, m.deployed, "checkout", "-q", "-b", "change")
+	run(t, m.repo, "git", "checkout", "-q", "-b", "change")
 	write(t, filepath.Join(m.repo, "b.txt"), "the change")
 	run(t, m.repo, "git", "add", "b.txt")
-	datedGitIn(t, m.repo, m.deployed, "commit", "-q", "-m", "the landed change")
+	run(t, m.repo, "git", "commit", "-q", "-m", "the landed change")
 	p.Landed = []string{strings.TrimSpace(run(t, m.repo, "git", "rev-parse", "HEAD"))}
-	datedGitIn(t, m.repo, m.deployed, "checkout", "-q", "main")
+	run(t, m.repo, "git", "checkout", "-q", "main")
 	p.Plan.Installed, p.Changed = bin, []string{"a.txt", "b.txt", "deleted.txt"}
 	checkoutAt := m.deployed.Add(time.Hour)
 	if err := os.Chtimes(bin, m.deployed.Add(time.Minute), m.deployed.Add(time.Minute)); err != nil {
@@ -527,7 +524,7 @@ func TestAnInstalledFileMustFollowTheCheckoutChange(t *testing.T) {
 	if got := m.measure(t, Options{}); got.Status != "waiting" {
 		t.Fatalf("checkout without change: %+v", got)
 	}
-	datedGitIn(t, m.repo, checkoutAt, "merge", "-q", "--ff-only", "change")
+	run(t, m.repo, "git", "merge", "-q", "--ff-only", "change")
 	if err := os.Chtimes(filepath.Join(m.repo, "a.txt"), m.deployed, m.deployed); err != nil {
 		t.Fatal(err)
 	}
