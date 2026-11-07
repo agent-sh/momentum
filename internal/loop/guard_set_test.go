@@ -354,7 +354,7 @@ const (
 // sign-in) takes codex_apps as a whole, whose exposure counts every connector's tools (224 of each of three, and the
 // failures' 6). So do tools Codex serves with no connector, mcp__codex_apps__TOOL, which are of codex_apps alone
 // (#109). A history of codex_apps's tools beside another server's has no server, and its refusal counts codex_apps
-// once, with its connectors, or says its tools are of no connector.
+// once, with its connectors and any tools of none, or says its tools are of no connector.
 func TestACodexAppsConnectorIsAGuardsServer(t *testing.T) {
 	now := time.Now().Truncate(time.Hour)
 	t.Run("its unit is the connector", func(t *testing.T) {
@@ -399,6 +399,14 @@ func TestACodexAppsConnectorIsAGuardsServer(t *testing.T) {
 		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, serverSignal, 7*aDay, "", now)
 		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), "(2 tools, 2 of them in fewer than two of its 1 incidents; in 6 directories; of 2 MCP servers, codex_apps's tools of no connector: a tool") {
 			t.Fatalf("a tool of no connector and another server's: %+v %v", g, err)
+		}
+	})
+	t.Run("a connector and no connector beside another server", func(t *testing.T) {
+		st := testStore(t)
+		c := oneIncidentOf(t, st, now, now, [3]string{gmailSearch, gmailLabel, calendarList}, func(j int) string { return []string{gmailSearch, appsSearch, serverA}[j%3] })
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, serverSignal, 7*aDay, "", now)
+		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), "(3 tools, 3 of them in fewer than two of its 1 incidents; in 6 directories; of 2 MCP servers, codex_apps's tools of 1 connector and some of none: a tool") {
+			t.Fatalf("a connector's tool, one of no connector and another server's: %+v %v", g, err)
 		}
 	})
 	t.Run("codex_apps beside another server", func(t *testing.T) {
@@ -465,8 +473,9 @@ func TestAToolFoundByItsEventsNeedsTwoIncidents(t *testing.T) {
 // evidence over what span. Only the evidence in the 30 days before the proposal counts, the store's case retention,
 // whatever the window makes the history (#109): an Edit failure 29 days before, outside a one-week window's 28-day
 // history, refuses Bash under a window of one week as of two, and one 35 days before, inside a two-week window's 56-day
-// history, leaves Bash admitted under both. An event of the evidence the store no longer holds is of no tool, so Bash is
-// refused.
+// history, leaves Bash admitted under both. Evidence with no event in those 30 days leaves only the plan's word, so Bash
+// is refused: failures 40 days before under a two-week window, with an Edit failure a day before them or without one.
+// An event of the evidence the store no longer holds is of no tool, so Bash is refused.
 func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
 	now := time.Now().Truncate(time.Hour)
 	bash := serverSignal
@@ -483,7 +492,7 @@ func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
 		c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" }, edits...)
 		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 7*aDay, "", now)
 		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), "(1 tool in one incident alone; in 6 directories; of no MCP server") ||
-			!strings.Contains(err.Error(), "the signal's own too unless every event of the case's evidence in the 30d before is of it;") {
+			!strings.Contains(err.Error(), "the signal's own too unless the case's evidence in the 30d before holds an event and every one is of it;") {
 			t.Fatalf("a named tool over evidence of two tools: %+v %v", g, err)
 		}
 	})
@@ -515,6 +524,26 @@ func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
 				}
 			})
 		}
+	}
+	for _, withEdit := range []bool{true, false} {
+		t.Run(fmt.Sprint("no evidence in the 30 days before, an Edit failure beside it: ", withEdit), func(t *testing.T) {
+			st := testStore(t)
+			var extra []store.Event
+			if withEdit {
+				edit := toolResult("edit-before", now.Add(-41*aDay), "edit-before", true)
+				edit.Tool, edit.Cwd = "Edit", "/work/e"
+				extra = append(extra, edit)
+			}
+			// the failures 40 days before the proposal, the source read through it
+			c := oneIncidentOf(t, st, now.Add(-25*aDay), now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" }, extra...)
+			if err := st.MarkRead(t.Context(), toolSignal.Source, now); err != nil {
+				t.Fatal(err)
+			}
+			plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 14*aDay, "", now)
+			if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), "(1 tool in one incident alone; in 6 directories; of no MCP server") {
+				t.Fatalf("a named tool over evidence with none in the case retention: %+v %v", g, err)
+			}
+		})
 	}
 	t.Run("evidence the store no longer holds", func(t *testing.T) {
 		st, path := testStoreAt(t)
