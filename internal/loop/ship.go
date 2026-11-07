@@ -227,10 +227,6 @@ type Guard struct {
 	Cwds      []string `json:"-"`
 	Incidents int      `json:"incidents"` // in the history
 	Exposure  int      `json:"exposure"`  // units of exposure in the history
-	// Filed is the newest filing (store.Evidence.Added) of the case's evidence the count's rule has read: the count's,
-	// then each pass's of the watch (guardJudged), which judges by that rule what the detector filed since and dated
-	// before the landing. A package from before it was kept holds none, and its first pass judges all of its history.
-	Filed time.Time `json:"filed,omitzero"`
 }
 
 // guardFields is a Guard without its JSON methods.

@@ -312,13 +312,6 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 	case p.Plan.At.IsZero() || p.Plan.Units == "":
 		return r.legacyPlan(ctx, c, dry)
 	}
-	if p.Plan.Guard != nil && (c.Status == store.CaseDeployed || c.Status == store.CaseMeasuring) {
-		// the case's evidence the detector filed since the last pass and dated before the landing is history: the
-		// count's rule judges it, and may leave the change to be measured by hand, never as a recurrence
-		if handed, done := r.guardByHand(ctx, c, &p, m, dry); done {
-			return handed
-		}
-	}
 	if p.Plan.Guard != nil && c.Status == store.CaseMeasuring {
 		// a guard's recurrence counts, from the plan the proposal recorded, before any wait for a source or for its
 		// change to be in effect: its signal's events from the watch's first start, and the case's evidence dated from

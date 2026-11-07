@@ -93,15 +93,12 @@ func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead e
 	// under a shorter one, and a span would lose, at a later recount (a hand landing's), the evidence the proposal saw.
 	// The case's evidence is history dated before the change's landing and a recurrence from it on (guardLanded): the
 	// proposal's count, before the landing, reads history alone, and a hand landing's recount runs on a later pass, as
-	// of the landing. What the detector files after the count and dates before the landing the watch judges by this
-	// rule on every pass (guardJudged), from the newest filing the count read (Guard.Filed). A case with no event of the
-	// store gets no guard (events, below). An event the store no longer holds is of no tool.
-	events, in, hit, own, filed := 0, 0, 0, sig.Tool, time.Time{}
+	// of the landing. The count judges the history filed by the time it runs, once: a piece dated before the landing
+	// and filed after it is judged by no later rule, and never brings a recurrence (SPEC, Exposure, a known limit). A
+	// case with no event of the store gets no guard (events, below). An event the store no longer holds is of no tool.
+	events, in, hit, own := 0, 0, 0, sig.Tool
 	for _, e := range evidence {
 		events++
-		if e.Added.After(filed) {
-			filed = e.Added
-		}
 		if own != "" && e.At.Before(countedAt) && (!e.Found || e.Event.Tool != own) {
 			own = ""
 		}
@@ -144,7 +141,7 @@ func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead e
 	var bestC guardCandidate
 	var bestH measure.GuardHistory
 	for _, cand := range cands {
-		g.Guard = &Guard{Instead: why, Gap: measure.GuardGap, Units: units, Unit: cand.unit, Tools: cand.tools, Server: cand.server, Cwds: cand.cwds, Begun: since, Anchored: anchored, Filed: filed}
+		g.Guard = &Guard{Instead: why, Gap: measure.GuardGap, Units: units, Unit: cand.unit, Tools: cand.tools, Server: cand.server, Cwds: cand.cwds, Begun: since, Anchored: anchored}
 		h, err := guardHistoryOf(ctx, s.Store, g, hits, since, at, s.Dir, anchored)
 		if err != nil {
 			return Plan{}, err
@@ -464,10 +461,11 @@ func (r *Runner) guardRecurrences(ctx context.Context, c store.Case, p *Package,
 }
 
 // guardLanded is the one instant that sorts a guard's case's evidence: its change's landing (Package.LandedAt), which
-// never moves. Dated before it, a piece is history, judged by the count's rule (guardPlan at the count, guardJudged on
-// every pass of the watch for what is filed later), never a recurrence. Dated from it on, it is a recurrence, the
-// watch's, under the out-of-effect rule until the watch's start (from): it counts, and its hours are no exposure
-// watched (guardWatched). A package with no landing time reads from the watch's start.
+// never moves. Dated before it, a piece is history, which the count's rule judges when the count runs (guardPlan),
+// never a recurrence. Dated from it on, it is a recurrence, the watch's (guardRecurrences, guardBack, guardLost),
+// under the out-of-effect rule until the watch's start (from): it counts, and its hours are no exposure watched
+// (guardWatched). Its date is the evidence's own, which a rewritten event cannot move across the landing. A package
+// with no landing time reads from the watch's start.
 func guardLanded(p *Package, start time.Time) time.Time {
 	if p == nil || p.LandedAt.IsZero() {
 		return start
@@ -475,79 +473,12 @@ func guardLanded(p *Package, start time.Time) time.Time {
 	return earlier(p.LandedAt, start)
 }
 
-// guardJudged applies a guard's count rule again, on a pass of its watch, to the case's evidence the detector filed
-// since the rule last read it (Guard.Filed) and dated before the change's landing (guardLanded): history, whenever it
-// was filed, so never a recurrence. Where the guard's unit is its signal's own tool, which stood on the exemption (in
-// fewer than two incidents, guardCandidates), a piece of another tool, or one the store no longer holds, ends it as a
-// refused count would: why says so. filed is the newest filing it read.
-func guardJudged(ctx context.Context, st *store.Store, c store.Case, p *Package, dir string) (why string, filed time.Time, err error) {
-	g := p.Plan.Guard
-	evidence, err := caseEvents(ctx, st, c.ID, dir)
-	if err != nil {
-		return "", time.Time{}, err
-	}
-	own := p.Plan.Signal.Tool
-	exempt := own != "" && slices.Equal(g.Tools, []string{own}) && g.Incidents < 2
-	filed = g.Filed
-	for _, e := range evidence {
-		if !e.Added.After(g.Filed) {
-			continue
-		}
-		if e.Added.After(filed) {
-			filed = e.Added
-		}
-		if !exempt || why != "" || !p.LandedAt.IsZero() && !e.At.Before(p.LandedAt) {
-			continue // no exemption to break, broken already, or a recurrence, the watch's
-		}
-		at := e.At.UTC().Format(time.DateTime)
-		switch {
-		case !e.Found:
-			why = fmt.Sprintf("an event of the case's evidence dated %s, before the landing and filed after its count, is no longer in the store", at)
-		case e.Event.Tool != own:
-			why = fmt.Sprintf("the case's evidence holds an event of %s dated %s, before the landing and filed after its count", firstOf(e.Event.Tool, "no tool"), at)
-		}
-	}
-	return why, filed, nil
-}
-
-// guardByHand is the measure step's judgment, on every pass of a guard's watch, of the case's evidence filed late
-// (guardJudged): when the count's rule no longer admits the guard, the change is left to be measured by hand, as a
-// refused count leaves it (landHand), never as a recurrence, never with a rollback; the case goes back to deployed from
-// its landing, its guard's columns gone. Else the rule's filing cursor moves on. done says the pass ends here.
-func (r *Runner) guardByHand(ctx context.Context, c store.Case, p *Package, m Measured, dry bool) (Measured, bool) {
-	failed := func(err error) (Measured, bool) { m.Status, m.Why = "failed", err.Error(); return m, true }
-	why, filed, err := guardJudged(ctx, r.Store, c, p, r.Dir)
-	if err != nil {
-		return failed(err)
-	}
-	if why == "" {
-		if !dry && filed.After(p.Plan.Guard.Filed) {
-			p.Plan.Guard.Filed = filed
-			if err := r.Ship.save(p); err != nil {
-				return failed(err)
-			}
-		}
-		return m, false
-	}
-	why = "its guard's own-tool exemption no longer holds, as a count now would refuse it: " + why
-	m.Status, m.Why = "held", why+"; it is measured by hand"
-	if dry {
-		return m, true
-	}
-	if _, err := r.Store.MeasureByHand(ctx, c.ID, p.LandedAt, why, "loop:measure"); err != nil {
-		return failed(err)
-	}
-	p.Plan.Units, p.Plan.Guard = "", nil
-	if err := r.Ship.save(p); err != nil {
-		return failed(err)
-	}
-	return m, true
-}
-
 // guardEvidence adds to back the events of the case's own evidence dated from from (guardLanded: the detector may file
-// the problem by the case's signature in a form the signal does not count), but those back holds and the loop's own. An event the store no longer holds is passed over: the watch cannot tell it from the loop's own, and a
-// recurrence rolls a landed change back, where the count, for which a refusal costs only the guard, takes it as of no
-// tool.
+// the problem by the case's signature in a form the signal does not count), but those back holds and the loop's own.
+// The evidence's own date decides, never the event's time now: a rewritten event cannot cross the landing. An event
+// the store no longer holds is passed over: the watch cannot tell it from the loop's own, and a recurrence rolls a
+// landed change back, where the count, for which a refusal costs only the guard, takes it as of no tool. A guarded
+// close names such pieces (guardUnread).
 func (r *Runner) guardEvidence(ctx context.Context, c store.Case, from time.Time, back []store.Event) ([]store.Event, error) {
 	evidence, err := r.Store.CaseEvidence(ctx, c.ID, 0)
 	if err != nil {
@@ -566,13 +497,38 @@ func (r *Runner) guardEvidence(ctx context.Context, c store.Case, from time.Time
 		if err != nil {
 			return nil, err
 		}
-		if !found || e.TS.Before(from) || store.InDir(e.Cwd, r.Dir) {
+		if !found || store.InDir(e.Cwd, r.Dir) {
 			continue
 		}
 		seen[id] = true
 		back = append(back, e)
 	}
 	return back, nil
+}
+
+// guardUnread names, for a guarded close's log line, the case's own evidence dated from from (guardLanded) whose
+// event the store no longer holds: pieces the watch passed over (guardEvidence), which no other record names.
+func (r *Runner) guardUnread(ctx context.Context, c store.Case, from time.Time) (string, error) {
+	evidence, err := r.Store.CaseEvidence(ctx, c.ID, 0)
+	if err != nil {
+		return "", err
+	}
+	var refs []string
+	for _, ev := range evidence {
+		id, ok := strings.CutPrefix(ev.Ref, "ev:")
+		if !ok || ev.At.Before(from) {
+			continue
+		}
+		if _, found, err := r.Store.EventByID(ctx, id); err != nil {
+			return "", err
+		} else if !found {
+			refs = append(refs, ev.Ref)
+		}
+	}
+	if len(refs) == 0 {
+		return "", nil
+	}
+	return "the case's evidence dated from the landing whose events the store no longer holds, which the watch could not read: " + strings.Join(refs, ", "), nil
 }
 
 // guardWatched is a guard's exposure watched over a span: its exposure, less the units in the stretches its change
@@ -912,7 +868,13 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 		Effect: res.Effect, Links: prLinks(p.PR)}); err != nil {
 		return failed(fmt.Errorf("the note: %w", err))
 	}
-	if _, err := r.Store.CloseGuarded(ctx, c.ID, g.Incidents, g.Exposure, len(watched), res.Recur, res.Effect, guardOutText(plan, out), "loop:measure"); err != nil {
+	left := guardOutText(plan, out)
+	if unread, err := r.guardUnread(ctx, c, guardLanded(p, from)); err != nil {
+		return failed(err)
+	} else if unread != "" {
+		left = strings.Join(slices.DeleteFunc([]string{left, unread}, func(s string) bool { return s == "" }), "; ")
+	}
+	if _, err := r.Store.CloseGuarded(ctx, c.ID, g.Incidents, g.Exposure, len(watched), res.Recur, res.Effect, left, "loop:measure"); err != nil {
 		return failed(err)
 	}
 	kept, err := r.Ship.keepLocked(c.ID, res)

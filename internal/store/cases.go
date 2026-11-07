@@ -1592,47 +1592,6 @@ func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, 
 	return c, tx.Commit()
 }
 
-// MeasureByHand is the measure tool's: a deployed or measuring case whose guard no longer stands (evidence filed after
-// its count and dated before its landing breaks the count's rule) is left to be measured by hand, as a refused count
-// leaves one: a measuring one goes back to deployed, from its landing (landed, or its deployed time when none), with no
-// measurement or guard column, since they were its guard's; a deployed one keeps its columns, of a change before it.
-// Its log line says why, under "measured by hand".
-func (s *Store) MeasureByHand(ctx context.Context, id string, landed time.Time, why, actor string) (Case, error) {
-	why, err := cleanText(ctx, why)
-	if err != nil {
-		return Case{}, err
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return Case{}, err
-	}
-	defer tx.Rollback()
-	c, err := getCase(ctx, tx, id)
-	if err != nil {
-		return Case{}, err
-	}
-	if c.Status != CaseDeployed && c.Status != CaseMeasuring {
-		return Case{}, badCase("case %s is %s: only a deployed or measuring case is left to be measured by hand", c.ID, c.Status)
-	}
-	now := time.Now()
-	if c.Status == CaseMeasuring {
-		if landed.IsZero() {
-			landed = c.Deployed
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, deployed = ?, `+clearMeasurement+`, updated = ? WHERE id = ?`,
-			CaseDeployed, landed.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
-			return Case{}, err
-		}
-	}
-	if err := caseLogCleaned(ctx, tx, c.ID, actor, "measured by hand", why, now); err != nil {
-		return Case{}, err
-	}
-	if c, err = getCase(ctx, tx, c.ID); err != nil {
-		return Case{}, err
-	}
-	return c, tx.Commit()
-}
-
 // StartMeasuring is the measure tool's: a deployed case goes to measuring once its change is in effect, from, with
 // its measurement's window and the signal's count over the window before its change, which the window after it is
 // compared with. The window after counts from then: the case's deployed time becomes it.
@@ -1778,7 +1737,8 @@ const clearMeasurement = `guard_exposure = 0, guard_watched = 0, guard_recur = 0
 // out of effect), with its history's incidents and exposure as counted through the watch's start, the units of
 // exposure watched, the predictive probability that the problem, had it kept happening, would have recurred within
 // them (0 when the history gives no rate or nothing was watched), and the watch in words. Its log line adds sources,
-// when given: the sources it left out of its counts, which no other record names. The case store leaves its evidence
+// when given: what the watch left out, which no other record names (the sources it left out of its counts, and its
+// evidence dated from the landing whose events are gone). The case store leaves its evidence
 // to the measure step: the watch after the close brings it back (RegressCase) at the first event of its signal from
 // the watch's start, or of its own evidence dated from its change's landing.
 func (s *Store) CloseGuarded(ctx context.Context, id string, incidents, exposure, watched int, recur float64, effect, sources, actor string) (Case, error) {
