@@ -222,6 +222,7 @@ func (s *Store) ThreadParentMeta(ctx context.Context, session string) (string, e
 type ThreadRead struct {
 	Writers, Shells []string
 	CallMarks       []string
+	CutMark         string // when set, also the shells' calls whose text ends with it: the store cut them
 }
 
 // ThreadEvents passes a session's transcript events that read selects, its subagents' among them, oldest first,
@@ -238,12 +239,17 @@ func (s *Store) ThreadEvents(ctx context.Context, session string, read ThreadRea
 	if len(read.CallMarks) > 0 {
 		marks = "(" + strings.TrimSuffix(strings.Repeat("instr(summary, ?) > 0 OR ", len(read.CallMarks)), " OR ") + ")"
 	}
+	callArgs := anys(read.CallMarks)
+	if read.CutMark != "" && len(read.CallMarks) > 0 {
+		marks = "(" + marks + " OR substr(summary, -length(?)) = ?)"
+		callArgs = append(callArgs, read.CutMark, read.CutMark)
+	}
 	const toolID = `CASE WHEN json_valid(meta) THEN json_extract(meta, '$.tool_id') END`
 	shellCall := `kind = 'tool_call' AND lower(tool) IN ` + in(read.Shells) + ` AND ` + marks
 	var args []any
-	args = append(append(append(args, session, Transcripts), anys(read.Shells)...), anys(read.CallMarks)...)
+	args = append(append(append(args, session, Transcripts), anys(read.Shells)...), callArgs...)
 	args = append(append(args, session, Transcripts), anys(read.Writers)...)
-	args = append(append(args, anys(read.Shells)...), anys(read.CallMarks)...)
+	args = append(append(args, anys(read.Shells)...), callArgs...)
 	args = append(args, anys(read.Shells)...)
 	rows, err := s.db.QueryContext(ctx, `WITH calls(id) AS (SELECT `+toolID+` FROM events INDEXED BY events_session
 	    WHERE session = ? AND source = ? AND `+shellCall+`)

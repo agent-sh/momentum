@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent-sh/tacit/client/pkg/evidence"
+
 	"github.com/agent-sh/momentum/internal/store"
 	"github.com/agent-sh/momentum/internal/supervise"
 )
@@ -95,6 +97,10 @@ type Request struct {
 	Why      string // what the state rests on
 	Open     string // the open step; empty when nothing records one
 	Last     time.Time
+	// CutGone and CutUnread count its calls the store cut that were read as the store holds them: their transcript
+	// is gone, or no reader of their harness is here or their text could not be redacted
+	CutGone, CutUnread int
+	pending            []pair
 }
 
 // start is when the request began: its opening, else the time its id names.
@@ -137,9 +143,11 @@ func (r *Request) CheckIDs() []string {
 }
 
 // Options are the rules' configuration: the prefixes of the turns the machine's programs type
-// (detect.program_prefixes).
+// (detect.program_prefixes), and what masks secrets in text read whole from a transcript (default tacit's
+// redaction, scrump's text profile).
 type Options struct {
 	Prefixes []string
+	Redact   func(context.Context, []string) ([]string, error)
 }
 
 // Rules' spans.
@@ -285,6 +293,7 @@ type thread struct {
 	turns   []*turn
 	segs    []seg
 	items   []item
+	pending []pair // calls the store cut: read whole when a request holds them (whole)
 	replies []item
 	calls   map[string]store.Event // calls waiting for their results
 }
@@ -348,6 +357,10 @@ func (t *thread) add(e store.Event) {
 			return
 		}
 		delete(t.calls, m.ToolID)
+		if storeCut(call, e) {
+			t.pending = append(t.pending, pair{call: call, res: e})
+			return
+		}
 		for _, r := range Artifacts(call, e) {
 			r.Thread = t.id
 			t.items = append(t.items, item{r: r, agent: e.Agent})
@@ -408,11 +421,24 @@ type reader struct {
 	children map[string][]string
 	markers  map[string][]string // the sessions whose turns name an id, by the id's time part
 	markIDs  map[string][]string // the ids of a time part the markers name
+	records  map[string]recordRead
+	hermes   map[string]*evidence.HermesDB
+	resolved map[string]resolvedPair // a cut call's artifacts, read whole once per run
 }
 
 func newReader(st *store.Store, opt Options) *reader {
 	return &reader{st: st, opt: opt, threads: map[string]*thread{}, openings: map[string][]ref{}, single: map[string]bool{},
-		children: map[string][]string{}, markers: map[string][]string{}, markIDs: map[string][]string{}}
+		children: map[string][]string{}, markers: map[string][]string{}, markIDs: map[string][]string{},
+		records: map[string]recordRead{}, hermes: map[string]*evidence.HermesDB{}, resolved: map[string]resolvedPair{}}
+}
+
+// close lets go of the Hermes stores a run opened.
+func (r *reader) close() {
+	for _, db := range r.hermes {
+		if db != nil {
+			db.Close()
+		}
+	}
 }
 
 func (r *reader) enqueue(id string) {
@@ -426,8 +452,9 @@ func (r *reader) enqueue(id string) {
 }
 
 // read is what a thread's read selects: the main thread's text, the file writers' calls and results, and the
-// shells' calls that may run git or gh with every shell result (a quiet command's may hold nothing).
-var read = store.ThreadRead{Writers: sortedKeys(writers), Shells: shells(), CallMarks: []string{"git", "gh"}}
+// shells' calls that may run git or gh, or that the store cut (their git may be past the cut), with their results
+// (a quiet command's may hold nothing).
+var read = store.ThreadRead{Writers: sortedKeys(writers), Shells: shells(), CallMarks: []string{"git", "gh"}, CutMark: "…"}
 
 func sortedKeys(m map[string]bool) []string {
 	var out []string
@@ -729,6 +756,12 @@ func (r *reader) settle(ctx context.Context, since time.Time, match func(*Reques
 			}
 		}
 		if !start.Before(from) {
+			if err := r.resolve(ctx, out); err != nil {
+				return nil, err
+			}
+			for _, rq := range out {
+				fold(rq)
+			}
 			return out, r.finish(ctx, out)
 		}
 		from = start

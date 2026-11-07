@@ -115,6 +115,7 @@ func Find(ctx context.Context, st *store.Store, id string, opt Options) (*Reques
 				}
 			}
 		}
+		defer r.close()
 		if len(r.queue) > 0 {
 			reqs, err := r.settle(ctx, at, func(rq *Request) bool { return r.idOf(ctx, rq, id) })
 			if err != nil {
@@ -140,6 +141,7 @@ func Find(ctx context.Context, st *store.Store, id string, opt Options) (*Reques
 		return nil, err
 	}
 	r := newReader(st, opt)
+	defer r.close()
 	r.enqueue(threads[0])
 	reqs, err := r.settle(ctx, first, func(rq *Request) bool {
 		for _, th := range rq.Threads {
@@ -179,6 +181,7 @@ func List(ctx context.Context, st *store.Store, since time.Time, opt Options) ([
 		return nil, err
 	}
 	r := newReader(st, opt)
+	defer r.close()
 	for _, s := range seeds {
 		r.enqueue(s)
 	}

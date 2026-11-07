@@ -85,6 +85,12 @@ func Handoff(rq *Request) string {
 		line("- %s %s", x.At.Local().Format(timeFormat), text)
 		cite(x.Event)
 	}
+	if rq.CutGone > 0 {
+		line("- details cut, transcript gone: %d of its calls the store cut could not be read whole; what they made may be missing", rq.CutGone)
+	}
+	if rq.CutUnread > 0 {
+		line("- details cut: %d of its calls the store cut were not read whole here (no reader of their harness, or no redaction)", rq.CutUnread)
+	}
 	if rq.Report != nil {
 		line("Claimed (the agent's last reply, %s, not checked): %s", rq.Report.At.Local().Format(timeFormat), rq.Report.Text)
 		cite(rq.Report.Event)
