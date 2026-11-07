@@ -481,6 +481,7 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 		if err := r.releaseHolds(ctx, cs); err != nil {
 			r.logf("hold notes: %v", err)
 		}
+		r.withdrawStale(ctx, cs, only)
 	}
 	for _, c := range cs {
 		if only != "" && c.ID != only {
@@ -577,6 +578,33 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 					} // still in testing, with what it holds now newer than the request: it builds a new package
 				}
 			}
+			if p, ok, err := r.Ship.Load(c.ID); !dry && err == nil && ok && p.Kind == KindConfig {
+				// a configuration proposal waits for its review, and then for a person: the case's close ends it. Every
+				// configuration package is settled here, with its note (configNote).
+				p, err := r.Ship.reconcileConfig(ctx, c.ID)
+				switch {
+				case err != nil:
+					passed = append(passed, c.ID+" configuration proposal: "+err.Error())
+					r.pickSkipped(c, "config", err)
+					continue
+				case p.State == Proposed && p.Filed.IsZero() && roundsUsed(p):
+					r.liftHold(ctx, c, dry)
+					passed = append(passed, c.ID+" used its review rounds")
+					continue
+				case p.State == Proposed && p.Filed.IsZero():
+					r.liftHold(ctx, c, dry)
+					what := "its review"
+					if p.Clean() {
+						what = "its filing" // reviewed clean: the pass's review step files it
+					}
+					passed = append(passed, c.ID+"'s configuration proposal waits for "+what)
+					continue
+				case p.State == Proposed:
+					r.liftHold(ctx, c, dry)
+					passed = append(passed, c.ID+" is "+store.ConfigStage+": an agent applies it by hand and closes the case, or declines it")
+					continue
+				} // withdrawn, it builds again on the file as it is; any other state goes on as a package does
+			}
 			if p, ok, err := r.Ship.Load(c.ID); err != nil {
 				if noteErr := r.packageProblem(ctx, c, err, dry); noteErr != nil {
 					return store.Case{}, "", "", noteErr
@@ -624,15 +652,20 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 					continue
 				}
 			}
-			if repo, err := r.caseRepo(ctx, c); err != nil {
-				return store.Case{}, "", "", err
-			} else if repo == "" {
+			if repo, target, err := r.caseTarget(ctx, c); err != nil {
+				// a record that cannot be read holds its case alone: the pass goes on
+				if !dry {
+					r.keepHold(ctx, c, "its investigation's record of where the fix belongs cannot be read: "+err.Error(), false)
+				}
+				passed = append(passed, c.ID+" held: its investigation's record cannot be read")
+				continue
+			} else if repo == "" && target == "" {
 				if !dry {
 					r.keepHold(ctx, c, "waits for a repository: the investigation named none", true)
 				}
 				passed = append(passed, c.ID+" waits for a repository")
 				continue
-			} else if why, known := r.heldBuild(ctx, repo); why != "" {
+			} else if why, known := r.heldTarget(ctx, repo, target); why != "" {
 				// a hold of the configuration takes no slot: the family's next workable case runs instead
 				if known && !dry {
 					r.keepHold(ctx, c, why, false)
@@ -967,6 +1000,9 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 func (r *Runner) keepFindings(ctx context.Context, run store.LoopRun, f finding, reported bool, undecided string) error {
 	if reported && f.Repo != "" && !repoName.MatchString(f.Repo) {
 		return fmt.Errorf("invalid investigation repository name")
+	}
+	if r.Ship == nil || !r.Ship.ConfigTargets.Enabled {
+		f.Config = "" // configuration targets are off: a report's config names nothing, and its repo stands
 	}
 	own, recorded, err := recordFindings(ctx, r.Store, run.Case, run.CaseEpisode, f, reported, undecided, "loop:"+run.ID)
 

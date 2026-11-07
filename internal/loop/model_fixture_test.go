@@ -45,7 +45,7 @@ for i in range(int(sys.argv[2])):
             if retry == 39: sys.exit(1)
             time.sleep(.025)
 PYFIXTURE
-printf '%%s\n' %s`, shellQuote(string(body)), max(1, r.Turns), shellQuote(result))
+printf '%%s\n' %s`, ShellQuote(string(body)), max(1, r.Turns), ShellQuote(result))
 }
 func fixtureCharge(turns int) float64 {
 	var sum float64

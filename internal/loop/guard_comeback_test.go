@@ -388,7 +388,8 @@ func TestAGuardsRecountWithNoExposureInTheSourcesItKeptSaysSo(t *testing.T) {
 	c := m.theCase(t)
 	if s := shown(t, c); c.Status != store.CaseClosed || c.Reason != guardedReason || c.Measurement.Exposure != 0 || c.Measurement.Watched != 125 ||
 		evidenceview.StatusLine(c) != "closed: guarded, 125 watched, no rate to compare: the history holds no exposure in the sources kept at the watch's end; or it stopped by itself" ||
-		!strings.Contains(s, "  guarded:") || strings.Contains(s, "  measured:") || strings.Contains(s, "last measured") || strings.Contains(s, "132") {
+		!strings.Contains(s, "  guarded:") || strings.Contains(s, "  measured:") || strings.Contains(s, "last measured") ||
+		strings.Contains(strings.ReplaceAll(s, m.r.Ship.Dir, ""), "132") { // its package's path is the test's, whose digits may hold 132
 		t.Fatalf("the case closed with no exposure: %+v %q\n%s", c.Measurement, evidenceview.StatusLine(c), shown(t, c))
 	}
 	said := false
