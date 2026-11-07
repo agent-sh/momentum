@@ -180,7 +180,7 @@ func TestArtifactsComeOnlyFromTheCallThatMadeThem(t *testing.T) {
 		{"a push that failed", "Bash", `{"command":"git push"}`, push, true, ""},
 		{"gh pr create", "Bash", `{"command":"gh pr create --fill"}`, pr, false, "pr pull request " + pr},
 		{"gh pr view", "Bash", `{"command":"gh pr view 7"}`, pr, false, ""},
-		{"gh pr create's text in an echo", "Bash", `{"command":"echo run gh pr view"}`, pr, false, ""},
+		{"gh pr create's text in an echo", "Bash", `{"command":"echo run gh pr create"}`, pr, false, ""},
 		{"a commit's text echoed", "Bash", `{"command":"echo 'git commit'"}`, commit, false, ""},
 		{"git's name as an argument", "Bash", `{"command":"echo git commit done"}`, commit, false, ""},
 		{"a push's words as an argument", "Bash", `{"command":"grep -rn git push docs"}`, push, false, ""},

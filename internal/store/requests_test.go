@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A request's checks are found by their index, by its id and by the start of its id: the table is never read whole.
@@ -49,5 +50,34 @@ func TestASessionsSpansAreReadByItsIndex(t *testing.T) {
 	}
 	if p := strings.Join(plan, " / "); !strings.Contains(p, "USING INDEX events_session") {
 		t.Fatalf("plan: %s", p)
+	}
+}
+
+// An uncheck undoes every check of the request that stands, so two made at once by an older build leave none.
+func TestAnUncheckUndoesEveryStandingCheck(t *testing.T) {
+	st, _ := open(t)
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if err := st.PutRequestCheck(ctx, RequestCheck{Request: "rabc12345678", Result: "commit:1a2b3c4", At: time.UnixMilli(int64(1000 + i))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.UndoRequestCheck(ctx, []string{"rabc12345678"}, time.UnixMilli(2000)); err != nil {
+		t.Fatal(err)
+	}
+	checks, err := st.RequestChecks(ctx, []string{"rabc12345678"}, nil, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range checks {
+		if c.Undone.IsZero() {
+			t.Fatalf("a check stands: %+v", checks)
+		}
+	}
+	if ok, err := st.CheckOnce(ctx, RequestCheck{Request: "rabc12345678", Result: "commit:1a2b3c4", At: time.UnixMilli(3000)}, nil); err != nil || !ok {
+		t.Fatalf("check again: %v %v", ok, err)
+	}
+	if ok, _ := st.CheckOnce(ctx, RequestCheck{Request: "rabc12345678", Result: "commit:1a2b3c4", At: time.UnixMilli(3001)}, nil); ok {
+		t.Fatal("a second check of the same result was recorded")
 	}
 }

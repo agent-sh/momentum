@@ -190,7 +190,8 @@ func Group(ctx context.Context, st *store.Store, since time.Time, opt Options) (
 	return List(ctx, st, since, opt)
 }
 
-// Check records the owner's check of a request's newest result; it reports false when that check stands already.
+// Check records the owner's check of a request's newest result; it reports false when that check stands already,
+// also when another check recorded it since the request was read.
 func Check(ctx context.Context, st *store.Store, rq *Request, at time.Time) (bool, error) {
 	n := rq.Newest()
 	if n == nil {
@@ -199,7 +200,7 @@ func Check(ctx context.Context, st *store.Store, rq *Request, at time.Time) (boo
 	if _, standing, holds := rq.Standing(); standing && holds {
 		return false, nil
 	}
-	return true, st.PutRequestCheck(ctx, store.RequestCheck{Request: rq.ID, Result: n.Key, At: at})
+	return st.CheckOnce(ctx, store.RequestCheck{Request: rq.ID, Result: n.Key, At: at}, rq.CheckIDs())
 }
 
 // Uncheck undoes the request's standing check, whichever of its ids it is stored under.

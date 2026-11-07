@@ -1,11 +1,8 @@
 package request
 
 import (
-	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/agent-sh/momentum/internal/store"
@@ -19,34 +16,26 @@ var writers = map[string]bool{"write": true, "edit": true, "multiedit": true, "n
 // shells are the harnesses' shell tools (toolresult).
 func shells() []string { return toolresult.Shells() }
 
+// The texts an artifact is read from, matched in the decoded output, where a line ends at a newline (a harness
+// that keeps the text as JSON) or the store joined the lines with spaces (one that keeps it plain). A match starts
+// at the text's start or after whitespace.
 var (
 	// git's commit line: [BRANCH HASH] SUBJECT, the branch maybe "detached HEAD", a first commit "(root-commit)"
-	commitRe = regexp.MustCompile(`\[([^\[\]]+?)(?: \(root-commit\))? ([0-9a-f]{7,40})\] (.+?)(?: \d+ files? changed|$)`)
-	// git push's ref updates after its To line: OLD..NEW SRC -> DST, or [new branch] SRC -> DST
-	pushToRe  = regexp.MustCompile(`\bTo (\S+)`)
-	pushRefRe = regexp.MustCompile(`(?:\b([0-9a-f]{7,40})\.\.\.?([0-9a-f]{7,40})|\[new branch\])\s+(\S+) -> (\S+)`)
-	prRe      = regexp.MustCompile(`https?://\S+/pull/\d+`)
-	pathRe    = regexp.MustCompile(`"(?:file_path|filePath|notebook_path|path)":("(?:[^"\\]|\\.)*")`)
-	patchRe   = regexp.MustCompile(`\*\*\* (?:Add|Update|Delete) File: (\S+)`)
-	// a shell command's separators: one command runs after another, or into it
-	sepRe = regexp.MustCompile(`&&|\|\||[;|&\n]`)
-	// a field the call's input names its command by
-	cmdRe = regexp.MustCompile(`"(?:command|cmd)":\s*"((?:[^"\\]|\\.)*)`)
+	commitRe = regexp.MustCompile(`(?m)(?:^|\s)\[([^\[\]\n]+?)(?: \(root-commit\))? ([0-9a-f]{7,40})\] ([^\n]+?)(?: \d+ files? changed|$)`)
+	// git push's To line, and the ref updates after it: OLD..NEW SRC -> DST, or [new branch] SRC -> DST
+	pushToRe  = regexp.MustCompile(`(?m)(?:^|\s)To (\S+)`)
+	pushRefRe = regexp.MustCompile(`(?m)(?:^|\s)(?:\+ )?(?:([0-9a-f]{7,40})\.\.\.?([0-9a-f]{7,40})|\* \[new branch\]|\[new branch\])\s+(\S+) -> (\S+)`)
+	prRe      = regexp.MustCompile(`https?://[^\s"']+/pull/\d+`)
+	patchRe   = regexp.MustCompile(`\*\*\* (?:Add|Update|Delete) File: ([^\s"]+)`)
 )
 
-// makes is what a shell command's git and gh invocations make.
-type makes struct {
-	commits, pushes, prs bool
-}
-
-// commitCommands are git's commands that make commits.
-var commitCommands = map[string]bool{"commit": true, "cherry-pick": true, "revert": true, "merge": true, "am": true, "rebase": true}
-
-// Artifacts are what a call made, read off its result, and nothing else: a failed result made nothing. A
-// file-writing call made the files its input names. A shell call made commits when its command ran a git command
-// that makes them (the commit lines its result printed), pushes when it ran git push and no dry run (the ref
-// updates after its To line), and a pull request when it ran gh pr create (the address it printed). What any
-// other tool printed (an agent's report, a read, a search, a fetched page) is no artifact.
+// Artifacts are what a call made, read off its result, and nothing else: a failed result made nothing. Both are
+// decoded first, as the harness keeps them (Decode). A file-writing call made the files its input names. A shell
+// call made commits when its command runs a git command that makes them (the commit lines its output printed),
+// pushes when it runs git push and no push of it is a dry run (the ref updates after the To line, or, with no To
+// line, those of a call that ran no fetch or pull), and a pull request when it runs gh pr create without --dry-run
+// (the address it printed, not one it says already exists).
+// What any other tool printed (an agent's report, a read, a search, a fetched page) is no artifact.
 func Artifacts(call, res store.Event) []Result {
 	if metaOf(res.Meta).IsError || res.Summary == "" {
 		return nil
@@ -60,8 +49,9 @@ func Artifacts(call, res store.Event) []Result {
 		out = append(out, r)
 	}
 	tool := strings.ToLower(call.Tool)
+	harness := call.Harness
 	if writers[tool] {
-		for _, p := range writtenPaths(call.Summary) {
+		for _, p := range Decode(harness, tool, call.Summary, "").Paths {
 			add(Result{Kind: KindFile, Key: KindFile + ":" + p + "@" + moment(call.TS), Text: p, Event: call.ID()})
 		}
 		return out
@@ -69,141 +59,45 @@ func Artifacts(call, res store.Event) []Result {
 	if !toolresult.IsShell(tool) {
 		return nil
 	}
-	mk := made(command(call.Summary))
+	d := Decode(harness, tool, call.Summary, res.Summary)
+	mk := made(d.Commands)
+	text := strings.TrimSuffix(d.Output, "…")
 	if mk.commits {
-		for _, c := range commitRe.FindAllStringSubmatch(res.Summary, -1) {
-			add(Result{Kind: KindCommit, Key: KindCommit + ":" + c[2], Text: fmt.Sprintf("commit %s on %s: %s", c[2], c[1], strings.TrimSuffix(c[3], "…"))})
+		for _, c := range commitRe.FindAllStringSubmatch(text, -1) {
+			add(Result{Kind: KindCommit, Key: KindCommit + ":" + c[2], Text: fmt.Sprintf("commit %s on %s: %s", c[2], c[1], strings.TrimSpace(c[3]))})
 		}
 	}
 	if mk.pushes {
-		if to := pushToRe.FindStringSubmatchIndex(res.Summary); to != nil {
-			remote := res.Summary[to[2]:to[3]]
-			for _, p := range pushRefRe.FindAllStringSubmatch(res.Summary[to[1]:], -1) {
-				if p[2] != "" {
-					add(Result{Kind: KindPush, Key: KindPush + ":" + remote + " " + p[4] + "@" + p[2],
-						Text: fmt.Sprintf("pushed %s -> %s (%s..%s) to %s", p[3], p[4], p[1], p[2], remote)})
-				} else {
-					add(Result{Kind: KindPush, Key: KindPush + ":" + remote + " " + p[4] + "@new@" + moment(res.TS),
-						Text: fmt.Sprintf("pushed new branch %s -> %s to %s", p[3], p[4], remote)})
-				}
+		// The ref updates after git's To line; with no To line (a tail kept only the last line), every ref update
+		// of a call that ran nothing else that prints them, its remote the push's own.
+		refs, remote := "", mk.remote
+		if to := pushToRe.FindStringSubmatchIndex(text); to != nil {
+			refs, remote = text[to[1]:], text[to[2]:to[3]]
+		} else if !mk.fetches {
+			refs = text
+		}
+		if remote == "" {
+			remote = "origin"
+		}
+		for _, p := range pushRefRe.FindAllStringSubmatch(refs, -1) {
+			if p[2] != "" {
+				add(Result{Kind: KindPush, Key: KindPush + ":" + remote + " " + p[4] + "@" + p[2],
+					Text: fmt.Sprintf("pushed %s -> %s (%s..%s) to %s", p[3], p[4], p[1], p[2], remote)})
+			} else {
+				add(Result{Kind: KindPush, Key: KindPush + ":" + remote + " " + p[4] + "@new@" + moment(res.TS),
+					Text: fmt.Sprintf("pushed new branch %s -> %s to %s", p[3], p[4], remote)})
 			}
 		}
 	}
 	if mk.prs {
-		if u := prRe.FindString(res.Summary); u != "" {
-			add(Result{Kind: KindPR, Key: KindPR + ":" + u, Text: "pull request " + u})
-		}
-	}
-	return out
-}
-
-// command is the command a shell call's input names: its command or cmd field (an array's words joined), or, when
-// the store cut the input inside it, what is left of it.
-func command(input string) string {
-	var m map[string]json.RawMessage
-	if json.Unmarshal([]byte(input), &m) == nil {
-		for _, k := range []string{"command", "cmd"} {
-			raw, ok := m[k]
-			if !ok {
+		for _, loc := range prRe.FindAllStringIndex(text, -1) {
+			if strings.Contains(text[max(0, loc[0]-200):loc[0]], "already exists") {
 				continue
 			}
-			var s string
-			if json.Unmarshal(raw, &s) == nil {
-				return s
-			}
-			var words []string
-			if json.Unmarshal(raw, &words) == nil {
-				return strings.Join(words, " ")
-			}
+			u := text[loc[0]:loc[1]]
+			add(Result{Kind: KindPR, Key: KindPR + ":" + u, Text: "pull request " + u})
+			break
 		}
-		return ""
-	}
-	if c := cmdRe.FindStringSubmatch(input); c != nil {
-		if s, err := strconv.Unquote(`"` + c[1] + `"`); err == nil {
-			return s
-		}
-		return c[1]
-	}
-	return ""
-}
-
-// wrappers run the command after them.
-var wrappers = map[string]bool{"sudo": true, "env": true, "time": true, "nohup": true, "command": true, "exec": true, "nice": true}
-
-// made reads what a command's git and gh invocations make: each command of the line, by the program it runs.
-func made(cmd string) makes {
-	var mk makes
-	for _, part := range sepRe.Split(cmd, -1) {
-		f := strings.Fields(part)
-		i := 0
-		for i < len(f) && (wrappers[f[i]] || strings.Contains(f[i], "=") && !strings.HasPrefix(f[i], "-")) {
-			i++
-		}
-		if i >= len(f) {
-			continue
-		}
-		switch prog := filepath.Base(f[i]); {
-		case prog == "bash" || prog == "sh" || prog == "zsh":
-			if i+2 <= len(f)-1 && strings.HasPrefix(f[i+1], "-") && strings.Contains(f[i+1], "c") {
-				in := made(strings.Trim(strings.Join(f[i+2:], " "), `"'`))
-				mk.commits, mk.pushes, mk.prs = mk.commits || in.commits, mk.pushes || in.pushes, mk.prs || in.prs
-			}
-		case prog == "git":
-			sub, args := gitCommand(f[i+1:])
-			switch {
-			case commitCommands[sub]:
-				mk.commits = true
-			case sub == "push" && !dryRun(args):
-				mk.pushes = true
-			}
-		case prog == "gh":
-			for j := i + 1; j+1 < len(f); j++ {
-				if f[j] == "pr" && f[j+1] == "create" {
-					mk.prs = true
-				}
-			}
-		}
-	}
-	return mk
-}
-
-// gitCommand is the command a git invocation runs, past git's own options, and its arguments.
-func gitCommand(args []string) (string, []string) {
-	for i := 0; i < len(args); i++ {
-		switch a := args[i]; {
-		case a == "-C" || a == "-c":
-			i++
-		case strings.HasPrefix(a, "-"):
-		default:
-			return a, args[i+1:]
-		}
-	}
-	return "", nil
-}
-
-// dryRun reports a push that pushes nothing: -n, --dry-run, or -n among short options.
-func dryRun(args []string) bool {
-	for _, a := range args {
-		if a == "--dry-run" || strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.Contains(a[1:], "n") {
-			return true
-		}
-	}
-	return false
-}
-
-// writtenPaths are the files a file-writing call names: its path field, or a patch's files.
-func writtenPaths(input string) []string {
-	var out []string
-	for _, m := range pathRe.FindAllStringSubmatch(input, -1) {
-		if p, err := strconv.Unquote(m[1]); err == nil && p != "" {
-			out = append(out, p)
-		}
-	}
-	if len(out) > 0 {
-		return out[:1]
-	}
-	for _, m := range patchRe.FindAllStringSubmatch(input, -1) {
-		out = append(out, m[1])
 	}
 	return out
 }

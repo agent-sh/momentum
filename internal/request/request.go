@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/store"
+	"github.com/agent-sh/momentum/internal/supervise"
 )
 
 // States of a request, the first that holds (SPEC, Requests, State).
@@ -278,6 +279,7 @@ type thread struct {
 	first   time.Time
 	last    time.Time
 	parent  string
+	namedBy string               // the session that names it as one of its agents, when it has no main thread of its own
 	agents  map[string]time.Time // a subagent's first event
 	turns   []*turn
 	segs    []seg
@@ -458,6 +460,17 @@ func (r *reader) load(ctx context.Context, id string) error {
 	if len(spans) == 0 {
 		return nil
 	}
+	main := false
+	for _, sp := range spans {
+		main = main || sp.Agent == "" || sp.Agent == id
+	}
+	if !main {
+		// A session that holds only its subagents' events (a Codex subagent's own subagents): the session that
+		// names it as an agent holds its own work.
+		if t.namedBy, err = r.st.AgentParent(ctx, id, t.last); err != nil {
+			return err
+		}
+	}
 	pm, err := r.st.ThreadParentMeta(ctx, id)
 	if err != nil {
 		return err
@@ -488,6 +501,7 @@ func (r *reader) follow(ctx context.Context, t *thread) error {
 		return nil
 	}
 	r.enqueue(t.parent)
+	r.enqueue(t.namedBy)
 	for a := range t.agents {
 		r.enqueue(a)
 	}
@@ -566,6 +580,9 @@ func (r *reader) alone(ctx context.Context, id string) (bool, error) {
 // prefix opens as a program's. A program's turn has no copies: what it typed into two sessions joins nothing.
 func (r *reader) near(ctx context.Context, t *thread, tn *turn) error {
 	w := strings.TrimSpace(tn.ev.Summary)
+	if strings.HasPrefix(w, supervise.Marker) {
+		tn.program = true // momentum's own message, typed into the session
+	}
 	for _, p := range r.opt.Prefixes {
 		if p != "" && strings.HasPrefix(w, p) {
 			tn.program = true

@@ -42,7 +42,23 @@ func (s *Store) PutRequestCheck(ctx context.Context, c RequestCheck) error {
 	return err
 }
 
-// UndoRequestCheck undoes the newest check of any of ids that stands, and returns it.
+// CheckOnce records a check unless one under any of ids stands on the same result, in one statement, so two checks
+// made at once leave one; it reports whether it recorded one.
+func (s *Store) CheckOnce(ctx context.Context, c RequestCheck, ids []string) (bool, error) {
+	if len(ids) == 0 {
+		ids = []string{c.Request}
+	}
+	r, err := s.db.ExecContext(ctx, `INSERT INTO request_checks (request, result, at) SELECT ?, ?, ? WHERE NOT EXISTS (
+	  SELECT 1 FROM request_checks WHERE undone = 0 AND result = ? AND request IN (?`+strings.Repeat(",?", len(ids)-1)+`))`,
+		append([]any{c.Request, c.Result, c.At.UnixMilli(), c.Result}, anys(ids)...)...)
+	if err != nil {
+		return false, err
+	}
+	n, err := r.RowsAffected()
+	return n > 0, err
+}
+
+// UndoRequestCheck undoes every check of any of ids that stands, and returns the newest of them.
 func (s *Store) UndoRequestCheck(ctx context.Context, ids []string, at time.Time) (RequestCheck, error) {
 	if len(ids) == 0 {
 		return RequestCheck{}, ErrNoCheck
@@ -63,7 +79,8 @@ func (s *Store) UndoRequestCheck(ctx context.Context, ids []string, at time.Time
 	if err != nil {
 		return RequestCheck{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE request_checks SET undone = ? WHERE id = ?`, at.UnixMilli(), row); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE request_checks SET undone = ? WHERE undone = 0 AND request IN (?`+
+		strings.Repeat(",?", len(ids)-1)+`)`, append([]any{at.UnixMilli()}, anys(ids)...)...); err != nil {
 		return RequestCheck{}, err
 	}
 	c.At, c.Undone = time.UnixMilli(ms), at
@@ -268,6 +285,18 @@ func (s *Store) TextsHolding(ctx context.Context, since time.Time, text string) 
 	  tool, summary, meta, ref, heuristic, experiment FROM events WHERE kind IN ('owner_text', 'agent_text') AND ts >= ?
 	  AND source = ? AND (agent = '' OR agent = session) AND instr(summary, ?) > 0 ORDER BY ts, source_key`,
 		since.UnixMilli(), Transcripts, text))
+}
+
+// AgentParent is the session that names a session as one of its agents, by the newest agent text of that agent up
+// to before; "" when none does. The kind's index serves it: a subagent writes text of its own.
+func (s *Store) AgentParent(ctx context.Context, agent string, before time.Time) (string, error) {
+	var session string
+	err := s.db.QueryRowContext(ctx, `SELECT session FROM events WHERE kind = 'agent_text' AND ts <= ? AND source = ? AND agent = ?
+	  AND session != agent ORDER BY ts DESC LIMIT 1`, before.UnixMilli(), Transcripts, agent).Scan(&session)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return session, err
 }
 
 // ChildMeta is a session whose main-thread text since a time names a parent session, with the meta of one such

@@ -7,6 +7,7 @@ require (
 	github.com/klauspost/compress v1.20.3
 	golang.org/x/sys v0.49.0
 	modernc.org/sqlite v1.61.0
+	mvdan.cc/sh/v3 v3.12.0
 )
 
 require (

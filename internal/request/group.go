@@ -319,22 +319,21 @@ func fold(rq *Request) {
 
 // finish reads the requests' threads' phases, their checks, and their state.
 func (r *reader) finish(ctx context.Context, reqs []*Request) error {
-	var from time.Time
+	current := false
 	for _, rq := range reqs {
 		for i := range rq.Threads {
 			if th := &rq.Threads[i]; th.Current {
 				if th.turn.IsZero() {
 					th.turn = th.First
 				}
-				if from.IsZero() || th.First.Before(from) {
-					from = th.First
-				}
+				current = true
 			}
 		}
 	}
+	// Each thread's newest phase, whenever it was seen: what a read finds does not depend on where it began.
 	phases := map[string]store.Event{}
-	if !from.IsZero() {
-		evs, err := r.st.PhasesSince(ctx, from)
+	if current {
+		evs, err := r.st.PhasesSince(ctx, time.Time{})
 		if err != nil {
 			return err
 		}
