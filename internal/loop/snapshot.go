@@ -72,7 +72,7 @@ type RepoInput struct {
 	mirror, identity, class string
 }
 
-// HistoryManifest says what the commit log gave a run: the commits, its size, and how many entries the scrubber changed.
+// HistoryManifest says what the commit log gave a run: its commits, its size and how many entries the scrubber changed.
 type HistoryManifest struct {
 	Commits   int    `json:"commits"`
 	Bytes     int64  `json:"bytes,omitempty"`
@@ -109,8 +109,9 @@ type SnapshotOptions struct {
 // SnapshotRepos makes the scrubbed snapshot of each distinct source for /ro/repos/NAME and its log for
 // /ro/history/repos/NAME.log, at its origin's default branch as the host fetches it now (repofetch.go), or, with the
 // reason, as its mirror last fetched it or at the checkout's own default branch when it cannot. Mirrors that no source
-// of the pass reads and nothing has used for a week are removed (pruneMirrors). A source that cannot be read
-// (missing, no work tree, a link, inside loop storage, no default branch) is a result with its reason, not a failure. Only a scrubber that does not run stops the pass.
+// of the pass reads and nothing has used for a week are removed (pruneMirrors). A source that cannot be read (missing,
+// no work tree, a link, inside loop storage, no default branch) is a result with its reason, not a failure. Only a
+// scrubber that does not run stops the pass.
 func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) {
 	if err := CheckScrubber(ctx); err != nil {
 		return nil, err
@@ -678,8 +679,8 @@ func EvidencePaths(repos []RepoInput, texts []string) map[string][]string {
 }
 
 // SnapshotDiffs writes, per repository, the diffs of the recent commits that touched the paths the case's texts name,
-// scrubbed, as dst/NAME/NNN-COMMIT.diff (newest first). A diff over DiffMax is cut. The host reads the source's Git objects with
-// the program pins; the run gets only these files.
+// scrubbed, as dst/NAME/NNN-COMMIT.diff (newest first). A diff over DiffMax is cut. The host reads the source's Git
+// objects with the program pins; the run gets only these files.
 func SnapshotDiffs(ctx context.Context, repos []RepoInput, texts []string, dst string, since time.Time, cache *ScrubCache) (m DiffsManifest, err error) {
 	if err = os.MkdirAll(dst, 0o755); err != nil {
 		return m, err

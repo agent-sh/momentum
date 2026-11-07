@@ -334,8 +334,8 @@ func TestAnEndedBaseNoteThatStandsIsResolved(t *testing.T) {
 	}
 }
 
-// A build's host clone stands at its base, the commit the pass's snapshot read, though the mirror's branch moved past it
-// since: the branch is made at that commit, not at the mirror's tip.
+// A build's host clone stands at its base, the commit the pass's snapshot read, though the mirror's branch moved past
+// it since: the branch is made at that commit, not at the mirror's tip.
 func TestAPreparedCloneStandsAtItsBase(t *testing.T) {
 	ctx := context.Background()
 	r, c, f := buildCase(t)

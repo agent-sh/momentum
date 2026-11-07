@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -490,7 +491,7 @@ func makeMirror(ctx context.Context, dir string, old *os.File) (*os.File, error)
 	if _, err := hostInputGit(ctx, "", "-c", "init.defaultRefFormat=files", "init", "--quiet", "--bare", "--template=", tmp); err != nil {
 		return drop(err)
 	}
-	unlock, err := lockMakers(ctx, mirrors)
+	unlock, err := lockMakers(ctx, mirrors, makersWait)
 	if err != nil {
 		return drop(err)
 	}
@@ -540,14 +541,15 @@ func makeMirror(ctx context.Context, dir string, old *os.File) (*os.File, error)
 	return lock, nil
 }
 
-// lockMakers takes the makers' lock (makersLockFile), waiting at most makersWait or until ctx ends: one maker swaps a
-// mirror at a time. A maker that cannot take it in time finds the mirror busy (errFetchRunning).
-func lockMakers(ctx context.Context, mirrors string) (func(), error) {
+// lockMakers takes the makers' lock (makersLockFile), waiting at most wait or until ctx ends: one maker swaps a mirror
+// at a time (makeMirror waits makersWait). A maker that cannot take it in time finds the mirror busy
+// (errFetchRunning); with no wait, the lock is tried once.
+func lockMakers(ctx context.Context, mirrors string, wait time.Duration) (func(), error) {
 	f, err := os.OpenFile(filepath.Join(mirrors, makersLockFile), os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	for end := time.Now().Add(makersWait); ; time.Sleep(20 * time.Millisecond) {
+	for end := time.Now().Add(wait); ; time.Sleep(20 * time.Millisecond) {
 		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 		switch {
 		case err == nil:
@@ -568,9 +570,10 @@ func lockMakers(ctx context.Context, mirrors string) (func(), error) {
 // lockMirror takes the mirror's lock: a flock on mirrorLockFile, held on a descriptor every Git call that writes the
 // mirror inherits (fetchGit, mirrorGit). The lock lasts as long as any process holds that descriptor: a fetch's process
 // group that outlives the pass that started it (the loop's own lock goes with its process) still holds it, and git
-// never removes the file. A lock a group has held past orphanAfter is taken from it (takeOrphan); errFetchRunning is
-// one another holds: a fetch, or the owner's preparation, until its package is saved. A dir that is no directory has no lock to take (ENOTDIR), and neither has a link where the lock
-// is (ELOOP).
+// never removes the file. The lock's file names its taker, this process (writeLockRecord). A lock whose taker is gone
+// and that a group has held past orphanAfter is taken from that group (takeOrphan); errFetchRunning is one another
+// holds: a fetch, or the owner's preparation, until its package is saved. A dir that is no directory has no lock to
+// take (ENOTDIR), and neither has a link where the lock is (ELOOP).
 func lockMirror(dir string) (*os.File, error) {
 	info, err := os.Lstat(dir)
 	if err != nil {
@@ -597,6 +600,7 @@ func lockMirror(dir string) (*os.File, error) {
 		}
 		return nil, err
 	}
+	writeLockRecord(f, lockRecord{taker: thisTaker()}) // a previous holder's record goes
 	return f, nil
 }
 
@@ -611,34 +615,110 @@ func sameLock(f *os.File, dir string) bool {
 	return err == nil && os.SameFile(held, at)
 }
 
-// orphanAfter is how long one Git call's process group may hold a mirror's lock before a pass takes the lock from it:
-// the longest a call of a live pass lasts (a first fetch, then SIGTERM and the wait for its output). A group that holds
-// it longer is one whose pass is gone (the loop's lock went with it), which nothing else ends. A test shortens it.
+// orphanAfter is how long one Git call's process group may hold a mirror's lock before a pass takes the lock from it,
+// once the lock's taker is gone: the longest a call of a live pass lasts (a first fetch, then SIGTERM and the wait for
+// its output). A group whose taker is gone and that holds it longer is one nothing else ends: its deadline was the
+// taker's. A test shortens it.
 var orphanAfter = firstFetchLimit + 2*gitWaitDelay
 
+// lockHolder is a process a mirror's lock record names: its number and its start time (procStat). The zero one names
+// none.
+type lockHolder struct {
+	pid   int
+	start uint64
+}
+
+// lockRecord is what a mirror's lock file says of who holds the lock: its taker, the process that took it (lockMirror),
+// and the process group of the last Git call that inherited it, by its leader (recordHolder).
+type lockRecord struct{ taker, group lockHolder }
+
+// thisTaker is this process as a lock's taker, read once from /proc: the zero one when it cannot be read, and a lock
+// whose record names no taker is never taken from its group (takeOrphan).
+var thisTaker = sync.OnceValue(func() lockHolder {
+	pid := os.Getpid()
+	if _, start, err := procStat(pid); err == nil {
+		return lockHolder{pid, start}
+	}
+	return lockHolder{}
+})
+
+// writeLockRecord writes r over the lock file's record, as one line per holder it names (`taker PID START`, then
+// `group PID START`). The text is written first and the file then cut to its length, never emptied first: the taker's
+// line, which comes first, stands unchanged while the taker records each of its calls.
+func writeLockRecord(lock *os.File, r lockRecord) {
+	var text strings.Builder
+	for _, h := range []struct {
+		name string
+		lockHolder
+	}{{"taker", r.taker}, {"group", r.group}} {
+		if h.pid > 0 {
+			fmt.Fprintf(&text, "%s %d %d\n", h.name, h.pid, h.start)
+		}
+	}
+	if _, err := lock.WriteAt([]byte(text.String()), 0); err == nil {
+		_ = lock.Truncate(int64(text.Len()))
+	}
+}
+
+// readLockRecord is the lock file's record; a line it cannot read names no holder.
+func readLockRecord(lock *os.File) lockRecord {
+	raw := make([]byte, 128)
+	n, _ := lock.ReadAt(raw, 0)
+	var r lockRecord
+	for _, line := range strings.Split(string(raw[:n]), "\n") {
+		var h lockHolder
+		var name string
+		if _, err := fmt.Sscanf(line, "%s %d %d", &name, &h.pid, &h.start); err != nil || h.pid <= 0 {
+			continue
+		}
+		switch name {
+		case "taker":
+			r.taker = h
+		case "group":
+			r.group = h
+		}
+	}
+	return r
+}
+
 // recordHolder writes into the mirror's lock file the process group of a Git call that inherited the lock: its number
-// and its leader's start time (procStat), for takeOrphan. A call that already ended leaves the record as it was.
+// and its leader's start time (procStat), beside this process as the lock's taker, for takeOrphan. A call that already
+// ended leaves the record as it was.
 func recordHolder(lock *os.File, pid int) {
 	_, start, err := procStat(pid)
 	if err != nil {
 		return
 	}
-	if lock.Truncate(0) == nil {
-		_, _ = lock.WriteAt([]byte(fmt.Sprintf("%d %d\n", pid, start)), 0)
-	}
+	writeLockRecord(lock, lockRecord{taker: thisTaker(), group: lockHolder{pid, start}})
 }
 
-// takeOrphan ends the process group the lock's record names and takes the lock, when that group has held it past
-// orphanAfter. The record's leader must still run, lead its group and have the start time the record gives, so a
-// number another process took since is never signalled; a group whose leader is gone is left alone. The group gets
-// SIGTERM, then SIGKILL after gitWaitDelay, as a deadline ends a call (endWithContext). It says whether f holds the
-// lock now.
+// gone says whether the process h names has ended: no process has its number, the one that has it started at another
+// time, or it has ended and waits for its parent (a zombie, which holds no file). One whose status cannot be read for
+// another reason, and the zero holder, count as running.
+func (h lockHolder) gone() bool {
+	if h.pid <= 0 {
+		return false
+	}
+	p, err := readProc(h.pid)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return true
+	case err != nil:
+		return false
+	}
+	return p.start != h.start || p.state == 'Z' || p.state == 'X'
+}
+
+// takeOrphan ends the process group the lock's record names and takes the lock, when the record's taker is gone and
+// that group has held it past orphanAfter. A group whose taker still runs is never ended, however old: its taker's
+// deadline still bounds it, and the start times count from boot, so a suspend ages a live call past orphanAfter. The
+// record's leader must still run, lead its group and have the start time the record gives, so a number another
+// process took since is never signalled; a group whose leader is gone is left alone. The group gets SIGTERM, then
+// SIGKILL after gitWaitDelay, as a deadline ends a call (endWithContext). It says whether f holds the lock now.
 func takeOrphan(f *os.File) bool {
-	raw := make([]byte, 64)
-	n, _ := f.ReadAt(raw, 0)
-	var pgid int
-	var start uint64
-	if _, err := fmt.Sscanf(string(raw[:n]), "%d %d", &pgid, &start); err != nil || pgid <= 1 {
+	r := readLockRecord(f)
+	pgid, start := r.group.pid, r.group.start
+	if pgid <= 1 || !r.taker.gone() {
 		return false
 	}
 	group, started, err := procStat(pgid)
@@ -665,27 +745,44 @@ func takeOrphan(f *os.File) bool {
 	return false
 }
 
-// procStat is a process's group and its start time, in clock ticks after boot: fields 5 and 22 of /proc/PID/stat,
-// counted after the command's name, which can hold spaces and parentheses.
+// procStat is a process's group and its start time, in clock ticks after boot (readProc).
 func procStat(pid int) (int, uint64, error) {
+	p, err := readProc(pid)
+	return p.group, p.start, err
+}
+
+// procStatus is what /proc/PID/stat says of a process: its state, its group and its start time, in clock ticks after
+// boot.
+type procStatus struct {
+	state byte
+	group int
+	start uint64
+}
+
+// readProc reads fields 3, 5 and 22 of /proc/PID/stat, counted after the command's name, which can hold spaces and
+// parentheses.
+func readProc(pid int) (procStatus, error) {
 	raw, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if err != nil {
-		return 0, 0, err
+		return procStatus{}, err
 	}
 	i := bytes.LastIndexByte(raw, ')')
 	if i < 0 {
-		return 0, 0, errors.New("unreadable process status")
+		return procStatus{}, errors.New("unreadable process status")
 	}
 	fields := strings.Fields(string(raw[i+1:])) // from field 3
-	if len(fields) < 20 {
-		return 0, 0, errors.New("unreadable process status")
+	if len(fields) < 20 || len(fields[0]) != 1 {
+		return procStatus{}, errors.New("unreadable process status")
 	}
 	group, err := strconv.Atoi(fields[2])
 	if err != nil {
-		return 0, 0, err
+		return procStatus{}, err
 	}
 	start, err := strconv.ParseUint(fields[19], 10, 64)
-	return group, start, err
+	if err != nil {
+		return procStatus{}, err
+	}
+	return procStatus{state: fields[0][0], group: group, start: start}, nil
 }
 
 // userHZ is the clock tick /proc counts in (USER_HZ): 100 on Linux, whatever the kernel's own rate.
@@ -708,37 +805,42 @@ func procAge(start uint64) (time.Duration, error) {
 	return time.Duration((up - float64(start)/userHZ) * float64(time.Second)), nil
 }
 
-// lockForRemoval takes the mirror's lock for its removal (pruneMirrors), without making the lock and without waiting,
-// but from an orphaned fetch as a fetch takes it (takeOrphan): ok is false while anything else holds it, a fetch's
-// process group (a pass's, or one an earlier pass started and that has not held it past orphanAfter) or the owner's
-// preparation, from its fetch until its package is saved, and when the lock file taken is no longer the one at the
-// mirror's path (sameLock). A directory without a lock file has none to take, and
-// neither has one whose lock is a link (ELOOP); a lock file that cannot be opened for another reason (no access) counts
-// as held, and the next pass looks again.
+// lockForRemoval takes the mirror's lock for its removal (pruneMirrors) as a fetch takes it (lockMirror), without
+// waiting: a missing lock file is made, and a lock an orphaned fetch holds is taken from it (takeOrphan). ok is false
+// while anything else holds it, a fetch's process group (one whose taker runs, or one an earlier pass started that has
+// not held it past orphanAfter) or the owner's preparation, from its fetch until its package is saved; when the lock
+// file taken is no longer the one at the mirror's path (sameLock); when nothing, or no directory, is at dir; and when
+// the lock file cannot be opened for another reason (no access): the next pass looks again. A link where the lock is
+// has no lock to take. A mirror there is one only a maker touches, to make it again (openMirror), and a maker swaps
+// only under the makers' lock, so a prune holds that lock instead, without waiting, and looks at the mirror's lock
+// again under it.
 func lockForRemoval(dir string) (release func(), ok bool) {
-	f, err := os.OpenFile(filepath.Join(dir, mirrorLockFile), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.ELOOP) {
-		return func() {}, true
+	lock, err := lockMirror(dir)
+	if err == nil {
+		return func() { lock.Close() }, true
 	}
+	if !errors.Is(err, syscall.ELOOP) {
+		return nil, false
+	}
+	unlock, err := lockMakers(context.Background(), filepath.Dir(dir), 0)
 	if err != nil {
 		return nil, false
 	}
-	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-	if errors.Is(err, syscall.EWOULDBLOCK) && takeOrphan(f) {
-		err = nil // a fetch's group that held it longer than any call of a live pass lasts, ended
+	switch lock, err := lockMirror(dir); {
+	case err == nil: // a maker swapped a mirror in before the prune took the makers' lock
+		return func() { lock.Close(); unlock() }, true
+	case errors.Is(err, syscall.ELOOP):
+		return unlock, true
 	}
-	if err != nil || !sameLock(f, dir) {
-		f.Close()
-		return nil, false
-	}
-	return func() { f.Close() }, true
+	unlock()
+	return nil, false
 }
 
 // clearStale removes the lock files, temporary files and keep files a fetch or a repack leaves when it is killed before
 // it can remove them itself (SIGTERM lets git remove its lock files, never index-pack's temporary pack or its keep
-// file, a loose object half written or a repack's new pack). It runs only under the mirror's lock (openMirror), so no call that could still
-// write them runs: not this pass's (the loop runs one pass at a time), and not one an earlier pass started whose
-// process group outlived it.
+// file, a loose object half written or a repack's new pack). It runs only under the mirror's lock (openMirror), so no
+// call that could still write them runs: not this pass's (the loop runs one pass at a time), and not one an earlier
+// pass started whose process group outlived it.
 func clearStale(dir string) error {
 	var stale []string
 	for _, name := range []string{"HEAD.lock", "config.lock", "packed-refs.lock", "shallow.lock", "FETCH_HEAD.lock"} {
@@ -898,10 +1000,10 @@ const (
 	mirrorLooseLimit = 6700
 )
 
-// repackLimit bounds a mirror's repack. A geometric repack (packMirror) rewrites only the packs and loose objects it rolls
-// up, never the largest pack while the others stay under half its size, so it costs about what came since the last
-// one. 10 minutes would still move the 1 GiB a first fetch is sized for (firstFetchLimit) at under 2 MiB/s each way,
-// far below any disk's rate, and it stays under orphanAfter, so a pass never takes the lock from a live repack.
+// repackLimit bounds a mirror's repack. A geometric repack (packMirror) rewrites only the packs and loose objects it
+// rolls up, never the largest pack while the others stay under half its size, so it costs about what came since the
+// last one. 10 minutes would still move the 1 GiB a first fetch is sized for (firstFetchLimit) at under 2 MiB/s each
+// way, far below any disk's rate, and it stays under orphanAfter, so a pass never takes the lock from a live repack.
 const repackLimit = 10 * time.Minute
 
 var looseObject = regexp.MustCompile(`^[0-9a-f]{38}([0-9a-f]{24})?$`)
@@ -1033,11 +1135,12 @@ func updateMirrorMeta(mirror string, change func(*mirrorMeta)) error {
 // whose records say so too) nor the owner's preparation, each of which records the time in the mirror's record under
 // its lock (recordSource). A use in the future (a clock set back) is written as now. Only a mirror's name (mirrorPath)
 // or a mirror being made (.new-, whose maker holds its lock while it runs, and one without a lock file yet only once it
-// is older than orphanAfter) is removed, never one whose lock is held (lockForRemoval), and nothing when the path to
-// mirrors holds a link. A mirror's last use is read once its lock is taken, so a preparation that used it while the pass ran is
-// seen. Under its lock a mirror is renamed to a tombstone (mirrorTombstone) and only then removed, so a prune stopped
-// midway leaves no half mirror at the mirror's name; a tombstone left is removed. A file or a link at a mirror's name
-// is no mirror: it is unlinked, never what a link names.
+// is older than orphanAfter) is removed, only under its lock, taken as a fetch takes it, or the makers' lock where a
+// link stands at its lock (lockForRemoval), never one whose lock another holds, and nothing when the path to mirrors
+// holds a link. A mirror's last use is read once its lock is taken, so a preparation that used it while the pass ran
+// is seen. Under its lock a mirror is renamed to a tombstone (mirrorTombstone) and only then removed, so a prune
+// stopped midway leaves no half mirror at the mirror's name; a tombstone left is removed. A file or a link at a
+// mirror's name is no mirror: it is unlinked, never what a link names.
 func pruneMirrors(mirrors string, used map[string]bool) {
 	if noInputLinks(mirrors) != nil {
 		return // none yet, or not the loop's own: the next pass looks again
@@ -1173,8 +1276,8 @@ type remoteError struct{ text, class, line string }
 func (e *remoteError) Error() string { return e.text }
 
 // transportCauses are the transport's own failures, as git, curl (OpenSSL or GnuTLS) and ssh word them, each with the
-// fixed text the host gives for it: an ssh server gone silent (remoteSSH), a server that cannot be reached, a connection
-// that broke off, a server that failed.
+// fixed text the host gives for it: an ssh server gone silent (remoteSSH), a server that cannot be reached, a
+// connection that broke off, a server that failed.
 var transportCauses = []struct {
 	words []string
 	cause string

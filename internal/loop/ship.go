@@ -1805,8 +1805,8 @@ func (s *Ship) gitInput(ctx context.Context, dir string, input []byte, args ...s
 
 // baseOutage is a build whose base cannot be fetched now, or whose proposal branch cannot be read now (proposal), held
 // for the pass (shipHold): its repository and its class, which its note names, and, for a proposal read, the line of
-// Git's diagnostics that shows it (holdClass), which only the pass's log gets, scrubbed. A mirror's fetch logged its own
-// line at the pass. It is a refusal to the ship tool's callers, as every hold is.
+// Git's diagnostics that shows it (holdClass), which only the pass's log gets, scrubbed. A mirror's fetch logged its
+// own line at the pass. It is a refusal to the ship tool's callers, as every hold is.
 type baseOutage struct {
 	repo, class, line string
 	proposal          bool

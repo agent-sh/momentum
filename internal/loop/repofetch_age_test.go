@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -148,61 +147,68 @@ func TestAPruneUnlinksAFileOrALinkAtAMirrorsName(t *testing.T) {
 }
 
 // A lock taken from an orphaned fetch is the mirror's only while its file is still the one at the mirror's path: once
-// the mirror moved while the lock was being taken, the lock is another's, and the mirror counts as busy.
+// the mirror moved while the lock was being taken, the lock is another's, and the mirror counts as busy, to a fetch and
+// to a prune alike.
 func TestALockTakenFromAMovedMirrorIsBusy(t *testing.T) {
-	f := newRepo(t, nil)
-	mirror := filepath.Join(t.TempDir(), "mirrors", "0123456789abcdef.git")
-	lock, err := openMirror(context.Background(), mirror, f.main)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// a fetch's process group that outlived its pass and outlasts SIGTERM, so taking its lock lasts gitWaitDelay; its
-	// trap says when the SIGTERM came, once the lock's file was open
-	termed := filepath.Join(t.TempDir(), "termed")
-	holder := exec.Command("sh", "-c", "trap ': > \""+termed+"\"' TERM; while :; do sleep 1; done")
-	holder.ExtraFiles = []*os.File{lock}
-	holder.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := holder.Start(); err != nil {
-		t.Fatal(err)
-	}
-	pid := holder.Process.Pid
-	t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL); _ = holder.Wait() })
-	_, start, err := procStat(pid)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := lock.Truncate(0); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := lock.WriteAt([]byte(fmt.Sprintf("%d %d\n", pid, start)), 0); err != nil {
-		t.Fatal(err)
-	}
-	lock.Close()
-	if !comesTrue(5*time.Second, func() bool { age, err := procAge(start); return err == nil && age > 0 }) {
-		t.Fatal("the holder's age cannot be read")
-	}
-	was := orphanAfter
-	t.Cleanup(func() { orphanAfter = was })
-	orphanAfter = 0
-	taken := make(chan error, 1)
-	go func() {
-		l, err := lockMirror(mirror)
-		if l != nil {
-			l.Close()
-		}
-		taken <- err
-	}()
-	if !comesTrue(time.Minute, func() bool { _, err := os.Stat(termed); return err == nil }) {
-		t.Fatal("the holder was never sent SIGTERM")
-	}
-	if err := os.Rename(mirror, mirror+".moved"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(mirror, 0o700); err != nil { // another mirror at its name
-		t.Fatal(err)
-	}
-	if err := <-taken; !errors.Is(err, errFetchRunning) {
-		t.Fatalf("a lock taken from a mirror that moved meanwhile: %v", err)
+	for _, by := range []string{"a fetch", "a prune"} {
+		t.Run(by, func(t *testing.T) {
+			f := newRepo(t, nil)
+			mirror := filepath.Join(t.TempDir(), "mirrors", "0123456789abcdef.git")
+			lock, err := openMirror(context.Background(), mirror, f.main)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// a fetch's process group that outlived its pass and outlasts SIGTERM, so taking its lock lasts
+			// gitWaitDelay; its trap says when the SIGTERM came, once the lock's file was open
+			termed := filepath.Join(t.TempDir(), "termed")
+			holder := exec.Command("sh", "-c", "trap ': > \""+termed+"\"' TERM; while :; do sleep 1; done")
+			holder.ExtraFiles = []*os.File{lock}
+			holder.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			if err := holder.Start(); err != nil {
+				t.Fatal(err)
+			}
+			pid := holder.Process.Pid
+			t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL); _ = holder.Wait() })
+			start := recordOrphan(t, lock, pid)
+			lock.Close()
+			if !comesTrue(5*time.Second, func() bool { age, err := procAge(start); return err == nil && age > 0 }) {
+				t.Fatal("the holder's age cannot be read")
+			}
+			was := orphanAfter
+			t.Cleanup(func() { orphanAfter = was })
+			orphanAfter = 0
+			taken := make(chan error, 1)
+			go func() {
+				switch by {
+				case "a fetch":
+					l, err := lockMirror(mirror)
+					if l != nil {
+						l.Close()
+					}
+					taken <- err
+				case "a prune":
+					release, ok := lockForRemoval(mirror)
+					if ok {
+						release()
+						taken <- nil
+						return
+					}
+					taken <- errFetchRunning
+				}
+			}()
+			if !comesTrue(time.Minute, func() bool { _, err := os.Stat(termed); return err == nil }) {
+				t.Fatal("the holder was never sent SIGTERM")
+			}
+			if err := os.Rename(mirror, mirror+".moved"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(mirror, 0o700); err != nil { // another mirror at its name
+				t.Fatal(err)
+			}
+			if err := <-taken; !errors.Is(err, errFetchRunning) {
+				t.Fatalf("a lock taken from a mirror that moved meanwhile: %v", err)
+			}
+		})
 	}
 }
 

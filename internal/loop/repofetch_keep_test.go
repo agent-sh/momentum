@@ -3,12 +3,14 @@ package loop
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -77,6 +79,81 @@ func TestAMirrorWhoseLockCannotBeOpenedStays(t *testing.T) {
 	newPass(t, r)
 	if _, err := os.Stat(mirror); err != nil {
 		t.Fatalf("a prune removed a mirror whose lock it could not open: %v", err)
+	}
+}
+
+// A prune removes a mirror only while it holds a lock no maker or fetch can take meanwhile. A mirror without a lock
+// file gets one, held, as a fetch makes it. A link where the lock is has no lock to take: the prune holds the makers'
+// lock, which every swap of a mirror holds, and leaves what the link names as it was. Nothing at the mirror's name, or
+// a file there, has no lock the prune could hold.
+func TestAPruneHoldsALockForAMirrorWithoutOne(t *testing.T) {
+	for _, kind := range []string{"no lock file", "a link where the lock is", "nothing at its name", "a file at its name"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newRepo(t, nil)
+			mirrors := filepath.Join(t.TempDir(), "mirrors")
+			mirror := filepath.Join(mirrors, "0123456789abcdef.git")
+			if _, why := fetchTip(context.Background(), f.main, mirror, f.origin, ""); why != "" {
+				t.Fatal(why)
+			}
+			lockPath := filepath.Join(mirror, mirrorLockFile)
+			target := filepath.Join(t.TempDir(), "target")
+			write(t, target, "keep\n")
+			switch kind {
+			case "no lock file":
+				if err := os.Remove(lockPath); err != nil {
+					t.Fatal(err)
+				}
+			case "a link where the lock is":
+				if err := os.Remove(lockPath); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, lockPath); err != nil {
+					t.Fatal(err)
+				}
+			case "nothing at its name", "a file at its name":
+				if err := os.RemoveAll(mirror); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "a file at its name" {
+					write(t, mirror, "not a mirror\n")
+				}
+			}
+			release, ok := lockForRemoval(mirror)
+			if ok {
+				defer release()
+			}
+			switch kind {
+			case "nothing at its name", "a file at its name":
+				if ok {
+					t.Fatal("a prune took a lock where no mirror stands")
+				}
+				return
+			}
+			if !ok {
+				t.Fatal("the prune took no lock")
+			}
+			switch kind {
+			case "no lock file":
+				if l, err := lockMirror(mirror); !errors.Is(err, errFetchRunning) {
+					if l != nil {
+						l.Close()
+					}
+					t.Fatalf("a fetch took the lock of a mirror a prune was removing: %v", err)
+				}
+			case "a link where the lock is":
+				makers, err := os.OpenFile(filepath.Join(mirrors, makersLockFile), os.O_RDWR|os.O_CREATE, 0o600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer makers.Close()
+				if err := syscall.Flock(int(makers.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) {
+					t.Fatalf("a maker could swap the mirror a prune was removing: %v", err)
+				}
+				if raw, err := os.ReadFile(target); err != nil || string(raw) != "keep\n" {
+					t.Fatalf("a prune changed what the lock's link named: %q %v", raw, err)
+				}
+			}
+		})
 	}
 }
 

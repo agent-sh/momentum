@@ -3,7 +3,6 @@ package loop
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,8 +12,9 @@ import (
 	"time"
 )
 
-// Two openers that both find no mirror make one between them: one makes it and holds its lock, and the other gets the
-// mirror it made or finds its lock held, never a mirror the first one moved away.
+// Two openers that both find no mirror make one between them: one makes it and holds its lock, and the other finds that
+// lock held and drops its own, never moving away the mirror the first made. A maker that finds a usable mirror another
+// made and let go is TestAMakerUsesTheMirrorAnotherMadeAndLetGo's.
 func TestTwoOpenersOfAMissingMirrorMakeOne(t *testing.T) {
 	real, err := exec.LookPath("git")
 	if err != nil {
@@ -80,6 +80,49 @@ exec '`+real+`' "$@"`)
 	}
 	if left, _ := filepath.Glob(filepath.Join(filepath.Dir(mirror), ".new-*")); len(left) != 0 {
 		t.Fatalf("a maker left its mirror being made: %v", left)
+	}
+}
+
+// A maker that finds, under the makers' lock, a usable mirror at its name that another maker made and let go uses it:
+// it holds that mirror's lock, leaves the mirror where it stands and drops the one it made.
+func TestAMakerUsesTheMirrorAnotherMadeAndLetGo(t *testing.T) {
+	ctx := context.Background()
+	mirrors := filepath.Join(t.TempDir(), "mirrors")
+	mirror := filepath.Join(mirrors, "0123456789abcdef.git")
+	if err := os.MkdirAll(mirrors, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	first, err := makeMirror(ctx, mirror, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	made, err := os.Lstat(mirror)
+	first.Close() // the first maker lets it go
+	if err != nil {
+		t.Fatal(err)
+	}
+	// the second found nothing at the mirror's name when it looked first (no old lock), as openMirror does
+	second, err := makeMirror(ctx, mirror, nil)
+	if err != nil {
+		t.Fatalf("the second maker: %v", err)
+	}
+	defer second.Close()
+	if now, err := os.Lstat(mirror); err != nil || !os.SameFile(made, now) {
+		t.Fatalf("the second maker replaced the mirror the first made: %v", err)
+	}
+	if !sameLock(second, mirror) {
+		t.Fatal("the second maker's lock is not the mirror's")
+	}
+	if l, err := lockMirror(mirror); !errors.Is(err, errFetchRunning) {
+		if l != nil {
+			l.Close()
+		}
+		t.Fatalf("the mirror's lock was free while the second maker held it: %v", err)
+	}
+	for _, pattern := range []string{".new-*", mirrorTombstone + "*"} {
+		if left, _ := filepath.Glob(filepath.Join(mirrors, pattern)); len(left) != 0 {
+			t.Fatalf("the second maker left %v", left)
+		}
 	}
 }
 
@@ -170,17 +213,8 @@ func TestAPruneTakesAMirrorFromAnOrphanedFetch(t *testing.T) {
 	t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL) })
 	ended := make(chan error, 1)
 	go func() { ended <- holder.Wait() }()
-	_, start, err := procStat(pid)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := lock.Truncate(0); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := lock.WriteAt([]byte(fmt.Sprintf("%d %d\n", pid, start)), 0); err != nil {
-		t.Fatal(err)
-	}
-	lock.Close() // the pass that started it is gone; its group holds the lock
+	start := recordOrphan(t, lock, pid) // the record's taker, the pass, is gone; its group holds the lock
+	lock.Close()
 	if !comesTrue(5*time.Second, func() bool { age, err := procAge(start); return err == nil && age > 0 }) {
 		t.Fatal("the holder's age cannot be read")
 	}

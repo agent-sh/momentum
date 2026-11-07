@@ -3,7 +3,6 @@ package loop
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,9 +56,9 @@ func TestARemoteFailureIsNamedByItsClass(t *testing.T) {
 	}
 }
 
-// A pass takes a mirror's lock from a process group that has held it past orphanAfter only when the lock's record still
-// names that group: its leader runs, with the start time the record gives. A record whose number another process has
-// now is never signalled.
+// A pass takes a mirror's lock from a process group whose taker is gone and that has held it past orphanAfter only when
+// the lock's record still names that group: its leader runs, with the start time the record gives. A record whose
+// number another process has now is never signalled.
 func TestAPassTakesALockOnlyFromTheGroupItsRecordNames(t *testing.T) {
 	for _, c := range []struct {
 		name  string
@@ -85,13 +84,9 @@ func TestAPassTakesALockOnlyFromTheGroupItsRecordNames(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := lock.Truncate(0); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := lock.WriteAt([]byte(fmt.Sprintf("%d %d\n", pid, start+c.shift)), 0); err != nil {
-				t.Fatal(err)
-			}
-			lock.Close() // the pass that started it is gone; its group holds the lock
+			// the record's taker, the pass that took the lock, is gone; its group holds the lock
+			writeLockRecord(lock, lockRecord{taker: endedProcess(t), group: lockHolder{pid, start + c.shift}})
+			lock.Close()
 			// /proc counts in hundredths of a second: the holder is older than orphanAfter once it is any age at all
 			if !comesTrue(5*time.Second, func() bool { age, err := procAge(start); return err == nil && age > 0 }) {
 				t.Fatal("the holder's age cannot be read")
@@ -117,8 +112,92 @@ func TestAPassTakesALockOnlyFromTheGroupItsRecordNames(t *testing.T) {
 			if !errors.Is(err, errFetchRunning) {
 				t.Fatalf("a lock whose record names another process: %v", err)
 			}
-			if syscall.Kill(pid, 0) != nil {
+			if p, err := readProc(pid); err != nil || p.state == 'Z' {
 				t.Fatal("a process the record does not name was signalled")
+			}
+		})
+	}
+}
+
+// endedProcess is a process that ran and has ended, by its number and its start time: the taker of a lock whose pass
+// is gone.
+func endedProcess(t *testing.T) lockHolder {
+	t.Helper()
+	p := exec.Command("sleep", "60")
+	if err := p.Start(); err != nil {
+		t.Fatal(err)
+	}
+	_, start, err := procStat(p.Process.Pid)
+	_ = p.Process.Kill()
+	_ = p.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return lockHolder{p.Process.Pid, start}
+}
+
+// recordOrphan writes into the lock's file the record of a fetch whose pass is gone: a taker that has ended, and the
+// process group pid leads. It returns the leader's start time.
+func recordOrphan(t *testing.T, lock *os.File, pid int) uint64 {
+	t.Helper()
+	_, start, err := procStat(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeLockRecord(lock, lockRecord{taker: endedProcess(t), group: lockHolder{pid, start}})
+	return start
+}
+
+// A fetch whose lock's taker still runs is never ended, however long its group has held the lock by the boot clock,
+// which counts a suspend: the owner's preparation that took the lock still waits for its fetch. orphanAfter 0 stands
+// for a group that clock aged past orphanAfter; this process is the taker, and holds its lock as a preparation does.
+func TestAFetchWhoseTakerRunsIsNeverEnded(t *testing.T) {
+	for _, by := range []string{"a fetch", "a prune"} {
+		t.Run(by, func(t *testing.T) {
+			f := newRepo(t, nil)
+			mirror := filepath.Join(t.TempDir(), "mirrors", "0123456789abcdef.git")
+			lock, err := openMirror(context.Background(), mirror, f.main)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lock.Close()
+			// the taker's fetch: its trap says whether a signal came
+			termed := filepath.Join(t.TempDir(), "termed")
+			holder := exec.Command("sh", "-c", "trap ': > \""+termed+"\"' TERM; while :; do sleep 1; done")
+			holder.ExtraFiles = []*os.File{lock}
+			holder.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			if err := holder.Start(); err != nil {
+				t.Fatal(err)
+			}
+			pid := holder.Process.Pid
+			t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL); _ = holder.Wait() })
+			recordHolder(lock, pid) // as a fetch's call records its group
+			_, start, err := procStat(pid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !comesTrue(5*time.Second, func() bool { age, err := procAge(start); return err == nil && age > 0 }) {
+				t.Fatal("the holder's age cannot be read")
+			}
+			was := orphanAfter
+			t.Cleanup(func() { orphanAfter = was })
+			orphanAfter = 0
+			switch by {
+			case "a fetch":
+				if l, err := lockMirror(mirror); !errors.Is(err, errFetchRunning) {
+					if l != nil {
+						l.Close()
+					}
+					t.Fatalf("a fetch beside a live taker's fetch: %v", err)
+				}
+			case "a prune":
+				if release, ok := lockForRemoval(mirror); ok {
+					release()
+					t.Fatal("a prune took the lock of a live taker's fetch")
+				}
+			}
+			if _, err := os.Stat(termed); err == nil {
+				t.Fatal("the fetch of a taker that still runs was signalled")
 			}
 		})
 	}
