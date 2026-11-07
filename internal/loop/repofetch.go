@@ -81,6 +81,13 @@ const mirrorMetaFile = "momentum-mirror.json"
 // mirrorLockFile, in a mirror, is the lock of the fetch that writes it (lockMirror).
 const mirrorLockFile = "momentum-mirror.lock"
 
+// makersLockFile, beside the mirrors, serializes the makers of mirrors (makeMirror): no name a prune removes.
+const makersLockFile = ".make.lock"
+
+// makersWait bounds how long a maker waits for another to finish its swap (lockMakers): a swap is a lock, a check and
+// two renames.
+const makersWait = time.Minute
+
 // mirrorTombstone begins the name a prune or a remake gives a mirror it removes (pruneMirrors, makeMirror): renamed
 // under its lock, the mirror is out of every reader's way before any of it goes, and one stopped midway leaves only a
 // tombstone, which the next prune removes.
@@ -455,14 +462,18 @@ func lastUsed(dir string) time.Time {
 // is (clearStale and the record read refs as files). The format is set by init.defaultRefFormat, which a Git before
 // 2.45, that has no other format and no --ref-format option, ignores. The new mirror is made under a name of its own,
 // locked before Git initializes it, so a prune never takes it for one nothing holds (lockForRemoval), and takes dir's
-// place only once it exists, so an init that fails leaves dir as it was. The old mirror's lock (old, nil when there is
-// none) stays held until the swap: dir goes to a tombstone, the new mirror takes its name, and only then is the
-// tombstone removed. makeMirror closes old.
+// place only once it exists, so an init that fails leaves dir as it was. The swap runs under the makers' lock
+// (lockMakers), so two makers never both swap: once it holds that lock, a maker looks at dir again. A mirror another
+// holds there (another maker made it meanwhile, or a fetch runs) leaves the new one dropped and errFetchRunning; a
+// usable one, which another maker made and let go, is the one used. Otherwise dir goes to a tombstone, the new mirror
+// takes its name, and only then is the tombstone removed. The old mirror's lock (old, nil when there is none) stays
+// held until that swap; makeMirror closes old.
 func makeMirror(ctx context.Context, dir string, old *os.File) (*os.File, error) {
 	if old != nil {
 		defer old.Close()
 	}
-	tmp, err := os.MkdirTemp(filepath.Dir(dir), ".new-")
+	mirrors := filepath.Dir(dir)
+	tmp, err := os.MkdirTemp(mirrors, ".new-")
 	if err != nil {
 		return nil, err
 	}
@@ -471,27 +482,87 @@ func makeMirror(ctx context.Context, dir string, old *os.File) (*os.File, error)
 		_ = removeAll(tmp)
 		return nil, err
 	}
-	fail := func(err error) (*os.File, error) {
+	drop := func(err error) (*os.File, error) {
 		lock.Close()
 		_ = removeAll(tmp)
 		return nil, err
 	}
 	if _, err := hostInputGit(ctx, "", "-c", "init.defaultRefFormat=files", "init", "--quiet", "--bare", "--template=", tmp); err != nil {
-		return fail(err)
+		return drop(err)
 	}
-	tomb := tombstone(filepath.Dir(dir))
+	unlock, err := lockMakers(ctx, mirrors)
+	if err != nil {
+		return drop(err)
+	}
+	held := old // the lock of what stands at dir now, held until the swap
+	if held == nil || !sameLock(held, dir) {
+		held = nil
+		there, err := lockMirror(dir)
+		switch {
+		case err == nil:
+			usable, err := usableMirror(ctx, dir)
+			if err == nil && usable {
+				err = clearStale(dir)
+			}
+			if err != nil || usable {
+				unlock()
+				if err != nil {
+					there.Close()
+					return drop(err)
+				}
+				lock.Close()
+				_ = removeAll(tmp)
+				return there, nil // another maker's mirror, which it let go
+			}
+			held = there
+			defer there.Close()
+		case errors.Is(err, fs.ErrNotExist), errors.Is(err, syscall.ENOTDIR), errors.Is(err, syscall.ELOOP):
+		default: // errFetchRunning: another maker made it and holds it, or a fetch runs there
+			unlock()
+			return drop(err)
+		}
+	}
+	tomb := tombstone(mirrors)
 	if err := os.Rename(dir, tomb); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fail(err)
+		unlock()
+		return drop(err)
 	}
 	if err := os.Rename(tmp, dir); err != nil {
 		_ = os.Rename(tomb, dir) // the old one back at its name; a prune removes a tombstone left
-		return fail(err)
+		unlock()
+		return drop(err)
 	}
-	if old != nil {
-		old.Close()
+	unlock()
+	if held != nil {
+		held.Close()
 	}
 	_ = removeAll(tomb) // what cannot be removed now the next prune removes
 	return lock, nil
+}
+
+// lockMakers takes the makers' lock (makersLockFile), waiting at most makersWait or until ctx ends: one maker swaps a
+// mirror at a time. A maker that cannot take it in time finds the mirror busy (errFetchRunning).
+func lockMakers(ctx context.Context, mirrors string) (func(), error) {
+	f, err := os.OpenFile(filepath.Join(mirrors, makersLockFile), os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	for end := time.Now().Add(makersWait); ; time.Sleep(20 * time.Millisecond) {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		switch {
+		case err == nil:
+			return func() { f.Close() }, nil
+		case !errors.Is(err, syscall.EWOULDBLOCK):
+			f.Close()
+			return nil, err
+		case ctx.Err() != nil:
+			f.Close()
+			return nil, ctx.Err()
+		case time.Now().After(end):
+			f.Close()
+			return nil, errFetchRunning
+		}
+	}
 }
 
 // lockMirror takes the mirror's lock: a flock on mirrorLockFile, held on a descriptor every Git call that writes the
@@ -637,10 +708,11 @@ func procAge(start uint64) (time.Duration, error) {
 	return time.Duration((up - float64(start)/userHZ) * float64(time.Second)), nil
 }
 
-// lockForRemoval takes the mirror's lock for its removal (pruneMirrors), without making the lock, without waiting, and
-// never from an orphaned fetch: ok is false while anything else holds it, a fetch's process group (a pass's, or one an
-// earlier pass started) or the owner's preparation, from its fetch until its package is saved, and when the lock file
-// taken is no longer the one at the mirror's path (sameLock). A directory without a lock file has none to take, and
+// lockForRemoval takes the mirror's lock for its removal (pruneMirrors), without making the lock and without waiting,
+// but from an orphaned fetch as a fetch takes it (takeOrphan): ok is false while anything else holds it, a fetch's
+// process group (a pass's, or one an earlier pass started and that has not held it past orphanAfter) or the owner's
+// preparation, from its fetch until its package is saved, and when the lock file taken is no longer the one at the
+// mirror's path (sameLock). A directory without a lock file has none to take, and
 // neither has one whose lock is a link (ELOOP); a lock file that cannot be opened for another reason (no access) counts
 // as held, and the next pass looks again.
 func lockForRemoval(dir string) (release func(), ok bool) {
@@ -651,7 +723,11 @@ func lockForRemoval(dir string) (release func(), ok bool) {
 	if err != nil {
 		return nil, false
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil || !sameLock(f, dir) {
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if errors.Is(err, syscall.EWOULDBLOCK) && takeOrphan(f) {
+		err = nil // a fetch's group that held it longer than any call of a live pass lasts, ended
+	}
+	if err != nil || !sameLock(f, dir) {
 		f.Close()
 		return nil, false
 	}
@@ -678,6 +754,10 @@ func clearStale(dir string) error {
 		return err
 	}); err != nil {
 		return err
+	}
+	// a record's temporary file a writer killed before its rename left (updateMirrorMeta)
+	if found, err := filepath.Glob(filepath.Join(dir, "."+mirrorMetaFile+".*")); err == nil {
+		stale = append(stale, found...)
 	}
 	// index-pack's temporary pack, a repack's new pack before its rename, a loose object before its rename
 	for _, pattern := range []string{filepath.Join("pack", "tmp_*"), filepath.Join("pack", ".tmp-*"), filepath.Join("[0-9a-f][0-9a-f]", "tmp_obj_*")} {
@@ -921,7 +1001,7 @@ func readMirrorMeta(mirror string) (mirrorMeta, error) {
 	return m, json.Unmarshal(raw, &m)
 }
 
-// updateMirrorMeta changes the mirror's record in one rename.
+// updateMirrorMeta changes the mirror's record in one rename, from a temporary file of its own.
 func updateMirrorMeta(mirror string, change func(*mirrorMeta)) error {
 	m, err := readMirrorMeta(mirror)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -932,18 +1012,29 @@ func updateMirrorMeta(mirror string, change func(*mirrorMeta)) error {
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(mirror, "."+mirrorMetaFile+".new")
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	tmp, err := os.CreateTemp(mirror, "."+mirrorMetaFile+".*") // a name of this writer's own
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(mirror, mirrorMetaFile))
+	_, err = tmp.Write(raw)
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp.Name(), filepath.Join(mirror, mirrorMetaFile))
+	}
+	if err != nil {
+		_ = os.Remove(tmp.Name())
+	}
+	return err
 }
 
 // pruneMirrors removes the mirrors nothing has used for mirrorUnused: neither a pass (used: the mirrors this pass read,
 // whose records say so too) nor the owner's preparation, each of which records the time in the mirror's record under
-// its lock (recordSource). Only a mirror's name (mirrorPath) or a mirror being made (.new-, whose maker holds its lock
-// while it runs) is removed, never one whose lock is held (lockForRemoval), and nothing when the path to mirrors holds
-// a link. A mirror's last use is read once its lock is taken, so a preparation that used it while the pass ran is
+// its lock (recordSource). A use in the future (a clock set back) is written as now. Only a mirror's name (mirrorPath)
+// or a mirror being made (.new-, whose maker holds its lock while it runs, and one without a lock file yet only once it
+// is older than orphanAfter) is removed, never one whose lock is held (lockForRemoval), and nothing when the path to
+// mirrors holds a link. A mirror's last use is read once its lock is taken, so a preparation that used it while the pass ran is
 // seen. Under its lock a mirror is renamed to a tombstone (mirrorTombstone) and only then removed, so a prune stopped
 // midway leaves no half mirror at the mirror's name; a tombstone left is removed. A file or a link at a mirror's name
 // is no mirror: it is unlinked, never what a link names.
@@ -969,13 +1060,26 @@ func pruneMirrors(mirrors string, used map[string]bool) {
 			_ = os.Remove(dir) // a file or a link: the link itself goes
 			continue
 		}
+		if made {
+			// one with no lock file yet is its maker's, which is about to lock it, unless no maker lasts so long
+			_, err := os.Lstat(filepath.Join(dir, mirrorLockFile))
+			if info, ierr := e.Info(); errors.Is(err, fs.ErrNotExist) && (ierr != nil || time.Since(info.ModTime()) < orphanAfter) {
+				continue
+			}
+		}
 		release, ok := lockForRemoval(dir)
 		if !ok {
 			continue // a fetch or a preparation still holds it: the next pass looks again
 		}
-		if !made && time.Since(lastUsed(dir)) < mirrorUnused {
-			release()
-			continue
+		if !made {
+			used := lastUsed(dir)
+			if used.After(time.Now()) { // a clock set back since: it was used now, and ages from now
+				_ = updateMirrorMeta(dir, func(m *mirrorMeta) { m.Used = time.Now() })
+			}
+			if time.Since(used) < mirrorUnused {
+				release()
+				continue
+			}
 		}
 		tomb := tombstone(mirrors)
 		err := os.Rename(dir, tomb)

@@ -88,7 +88,11 @@ func TestAPreparationDuringAPassKeepsItsMirror(t *testing.T) {
 	}
 	ctx := context.Background()
 	r, c, f := buildCase(t)
-	g := newRepo(t, nil) // a repository outside loop.read_dirs
+	g := newRepo(t, nil) // a repository outside loop.read_dirs, whose mirror nothing used for a week
+	if _, why := fetchTip(ctx, g.main, identityMirror(r, "url:"+g.origin), g.origin, ""); why != "" {
+		t.Fatal(why)
+	}
+	ageMirror(t, identityMirror(r, "url:"+g.origin), 8*24*time.Hour)
 	bin := t.TempDir()
 	paused, resume := filepath.Join(bin, "paused"), filepath.Join(bin, "resume")
 	// the pass's fetch of its own repository waits until the preparation is done
@@ -152,8 +156,10 @@ func TestALockTakenFromAMovedMirrorIsBusy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// a fetch's process group that outlived its pass and ignores SIGTERM, so taking its lock lasts gitWaitDelay
-	holder := exec.Command("sh", "-c", "trap '' TERM; exec sleep 60")
+	// a fetch's process group that outlived its pass and outlasts SIGTERM, so taking its lock lasts gitWaitDelay; its
+	// trap says when the SIGTERM came, once the lock's file was open
+	termed := filepath.Join(t.TempDir(), "termed")
+	holder := exec.Command("sh", "-c", "trap ': > \""+termed+"\"' TERM; while :; do sleep 1; done")
 	holder.ExtraFiles = []*os.File{lock}
 	holder.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := holder.Start(); err != nil {
@@ -186,7 +192,9 @@ func TestALockTakenFromAMovedMirrorIsBusy(t *testing.T) {
 		}
 		taken <- err
 	}()
-	time.Sleep(time.Second) // the lock's file is open, and its holder has ignored the SIGTERM
+	if !comesTrue(time.Minute, func() bool { _, err := os.Stat(termed); return err == nil }) {
+		t.Fatal("the holder was never sent SIGTERM")
+	}
 	if err := os.Rename(mirror, mirror+".moved"); err != nil {
 		t.Fatal(err)
 	}

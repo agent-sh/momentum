@@ -187,7 +187,9 @@ if [ "$n" = 2 ]; then echo $$ > '`+pidFile+`'; sh -c "$last" | { dd bs=1024 coun
 	if !strings.Contains(why, "another fetch, or the owner's preparation, holds the mirror") {
 		t.Fatalf("the next pass fetched beside a live fetch: %q", why)
 	}
-	// nor does a pass that no longer reads the repository remove the mirror under it
+	// nor does a pass that no longer reads the repository remove the mirror under it, though nothing used it for a week:
+	// the live fetch holds its lock
+	ageMirror(t, mirror, 8*24*time.Hour)
 	pruneMirrors(filepath.Dir(mirror), nil)
 	if _, err := os.Stat(live[0]); err != nil {
 		t.Fatalf("a pass pruned the mirror of a live fetch: %v", err)

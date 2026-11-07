@@ -481,9 +481,25 @@ func TestAGitHubOriginIsFetchedOverHTTPSByItsName(t *testing.T) {
 	if _, err := os.Stat(calls); !os.IsNotExist(err) {
 		t.Fatal("the fetch ran ssh")
 	}
-	if entries, err := os.ReadDir(filepath.Join(r.Dir, "mirrors")); err != nil || len(entries) != 1 {
-		t.Fatalf("one repository has %d mirrors (%v)", len(entries), err)
+	if n := mirrorEntries(t, filepath.Join(r.Dir, "mirrors")); n != 1 {
+		t.Fatalf("one repository has %d mirrors", n)
 	}
+}
+
+// mirrorEntries counts what stands beside the mirrors' makers' lock under mirrors.
+func mirrorEntries(t *testing.T, mirrors string) int {
+	t.Helper()
+	entries, err := os.ReadDir(mirrors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range entries {
+		if e.Name() != makersLockFile {
+			n++
+		}
+	}
+	return n
 }
 
 // identityMirror is where the mirror of a repository by its identity lies, as the test reads it.
@@ -534,13 +550,7 @@ func TestAMirrorThatIsNotAsTheHostMadeItIsMadeAgain(t *testing.T) {
 func TestMirrorsOfRepositoriesNoLongerReadAreRemoved(t *testing.T) {
 	r, _ := inputRunner(t)
 	a, b := newRepo(t, nil), newRepo(t, nil)
-	mirrors := func() int {
-		entries, err := os.ReadDir(filepath.Join(r.Dir, "mirrors"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return len(entries)
-	}
+	mirrors := func() int { return mirrorEntries(t, filepath.Join(r.Dir, "mirrors")) }
 	r.Inputs.ReadDirs = []string{a.main, b.main}
 	newPass(t, r)
 	if n := mirrors(); n != 2 {
@@ -552,10 +562,17 @@ func TestMirrorsOfRepositoriesNoLongerReadAreRemoved(t *testing.T) {
 	if _, err := os.Stat(identityMirror(r, "url:"+a.origin)); err != nil || mirrors() != 1 {
 		t.Fatalf("the mirror of a repository no longer read remains, or the one still read went: %d %v", mirrors(), err)
 	}
+	// a checkout whose origin cannot be read does not use its mirror: the mirror stays while it was used within a week,
+	// and goes once it was not
 	run(t, a.main, "git", "config", "url.https://example.com/.insteadOf", "https://example.org/")
 	newPass(t, r)
 	if _, err := os.Stat(identityMirror(r, "url:"+a.origin)); err != nil {
-		t.Fatalf("the mirror of a checkout still read went with its unreadable origin: %v", err)
+		t.Fatalf("the mirror of a checkout whose origin went unreadable today was removed: %v", err)
+	}
+	ageMirror(t, identityMirror(r, "url:"+a.origin), 8*24*time.Hour)
+	newPass(t, r)
+	if _, err := os.Stat(identityMirror(r, "url:"+a.origin)); !os.IsNotExist(err) {
+		t.Fatalf("a pass kept the mirror of an unreadable origin nothing used for a week: %v", err)
 	}
 }
 

@@ -142,8 +142,8 @@ func TestAPruneStoppedMidwayLeavesNoHalfMirror(t *testing.T) {
 		t.Fatalf("a prune stopped midway left a half mirror at the mirror's name: %v", err)
 	}
 	pruneMirrors(mirrors, nil)
-	if entries, err := os.ReadDir(mirrors); err != nil || len(entries) != 0 {
-		t.Fatalf("the next prune left %d entries (%v)", len(entries), err)
+	if n := mirrorEntries(t, mirrors); n != 0 {
+		t.Fatalf("the next prune left %d entries", n)
 	}
 }
 
