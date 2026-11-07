@@ -89,28 +89,84 @@ func TestABuildIsToldItsPathsUpFront(t *testing.T) {
 // A review run is given the paths its build was given. A fix in a path no change may touch is a low finding for a
 // person, it lowers no other finding, and a change not worth landing without it is a high one.
 func TestAReviewIsToldTheBuildsPaths(t *testing.T) {
+	for _, repo := range []string{"", SelfRepo} {
+		t.Run("repo "+repo, func(t *testing.T) {
+			ctx := context.Background()
+			r, c, p := reviewFixture(t)
+			if repo != "" {
+				p.Repo = repo
+				if err := r.Ship.save(&p); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := r.prepareInputs(ctx); err != nil {
+				t.Fatal(err)
+			}
+			run, err := r.prepareRun(ctx, c, c.Family, StepReview)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := readHostInput(HostDir(run.Dir), "prompt.json")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var prompt string
+			if err := json.Unmarshal(raw, &prompt); err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{"reviewed_files", buildScope(p.Repo), "follow-up for a person: file it as a low finding",
+				"It lowers no finding on what this change does", "file a high finding"} {
+				if !strings.Contains(prompt, want) {
+					t.Fatalf("the prepared review prompt for %q lacks %q: %s", p.Repo, want, prompt)
+				}
+			}
+			if hand := strings.Contains(prompt, "a hand landing may change is the build's to make"); hand != strings.EqualFold(p.Repo, SelfRepo) {
+				t.Fatalf("the prompt for %q names hand landing paths: %v", p.Repo, hand)
+			}
+		})
+	}
+}
+
+// A review's low finding whose fix needs a path no change of the loop's may touch reaches a person as a note; one in
+// a path the loop may change does not.
+func TestAnOutOfReachFollowUpBecomesANote(t *testing.T) {
+	for _, c := range []struct {
+		repo, where string
+		want        []string
+	}{
+		{SelfRepo, "sessions/codex/tracker.go:118-123", []string{"sessions/codex/tracker.go"}},
+		{SelfRepo, "`internal/supervise/history.go` timeline", []string{"internal/supervise/history.go"}},
+		{SelfRepo, "internal/supervise/rules.go:40", nil},
+		{SelfRepo, "README.md", nil}, // a hand landing may change it
+		{"agent-sh/fake", ".github/workflows/ci.yml:3", []string{".github/workflows/ci.yml"}},
+		{"agent-sh/fake", "sessions/codex/tracker.go:118", nil},
+		{"agent-sh/fake", "../x and /etc/passwd", nil},
+	} {
+		if got := outOfReach(c.repo, c.where); !slices.Equal(got, c.want) {
+			t.Fatalf("outOfReach(%q, %q) = %q, want %q", c.repo, c.where, got, c.want)
+		}
+	}
 	ctx := context.Background()
 	r, c, p := reviewFixture(t)
-	if err := r.prepareInputs(ctx); err != nil {
+	review := Review{Head: p.Head, Text: "Checked.", Comment: "https://example.invalid/c/1", Findings: []Finding{
+		{Severity: "low", Where: ".github/workflows/ci.yml:3", Problem: "The cause is in CI.", Fix: "Change the job."},
+		{Severity: "low", Where: "x.go:1", Problem: "A name.", Fix: "Rename it."},
+	}}
+	if _, err := r.Ship.Reviewed(ctx, c.ID, review); err != nil {
 		t.Fatal(err)
 	}
-	run, err := r.prepareRun(ctx, c, c.Family, StepReview)
+	notes, err := r.Store.Notes(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := readHostInput(HostDir(run.Dir), "prompt.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var prompt string
-	if err := json.Unmarshal(raw, &prompt); err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{"reviewed_files", buildScope(p.Repo), "follow-up for a person: file it as a low finding",
-		"It lowers no finding on what this change does", "file a high finding", "is the build's to make"} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("the prepared review prompt lacks %q: %s", want, prompt)
+	var found *store.Note
+	for i := range notes {
+		if notes[i].ID == reachPrefix+store.IDPart(c.ID) {
+			found = &notes[i]
 		}
+	}
+	if found == nil || !strings.Contains(found.Detail, ".github/workflows/ci.yml:3: The cause is in CI. Fix: Change the job.") || strings.Contains(found.Detail, "x.go") {
+		t.Fatalf("the follow-up note: %+v (of %d notes)", found, len(notes))
 	}
 }
 

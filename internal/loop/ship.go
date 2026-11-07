@@ -1266,6 +1266,9 @@ func (s *Ship) Reviewed(ctx context.Context, caseID string, r Review) (Package, 
 	if err != nil {
 		return p, err
 	}
+	if err := s.reachNote(ctx, caseID, p.Repo, r.Findings); err != nil {
+		return p, err
+	}
 	p.Reviews = append(p.Reviews, r)
 	if r.Comment != "" && (r.High > 0 || r.Medium > 0) && len(p.Reviews) < MaxRounds {
 		p.State = Revising

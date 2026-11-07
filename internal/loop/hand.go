@@ -465,3 +465,61 @@ func (s *Ship) holdsFiles(ctx context.Context, p Package, head string) (string, 
 	}
 	return fields[0], at, true, nil
 }
+
+// reachPrefix starts the id of the note that names a case's causes whose fix needs a path no change of the loop's may
+// touch: a follow-up only a person can make.
+const reachPrefix = "loop-reach:"
+
+// outOfReach returns the paths a finding names that no change of the loop's may touch in repo (PathScope refuses
+// them): its CI configuration, and in the loop's own repository the paths its measurement and scanners rest on.
+func outOfReach(repo, where string) []string {
+	var out []string
+	for _, w := range strings.Fields(where) {
+		w = strings.Trim(w, "`'\"()[],;")
+		if i := strings.IndexByte(w, ':'); i >= 0 {
+			w = w[:i]
+		}
+		w = strings.TrimPrefix(w, "./")
+		if w == "" || strings.HasPrefix(w, "/") || strings.Contains(w, "..") {
+			continue
+		}
+		if _, err := PathScope(Target{Repo: repo}, []string{w}); err != nil && errors.Is(err, ErrRefused) {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// reachNote opens, or brings up to date, the note that lists a review's low findings whose fix needs a path no
+// change of the loop's may touch, so the follow-up reaches a person whether or not the change lands. The same list
+// stays as its reader left it.
+func (s *Ship) reachNote(ctx context.Context, caseID, repo string, fs []Finding) error {
+	var lines []string
+	for _, f := range fs {
+		if !strings.EqualFold(f.Severity, "low") {
+			continue
+		}
+		if paths := outOfReach(repo, f.Where); len(paths) > 0 {
+			lines = append(lines, fmt.Sprintf("- %s: %s Fix: %s", f.Where, f.Problem, f.Fix))
+		}
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+	detail := "A review of the loop's change found a cause whose fix needs a path no change of the loop's may touch, " +
+		"so a person makes it:\n" + strings.Join(lines, "\n")
+	id := reachPrefix + store.IDPart(caseID)
+	notes, err := s.Store.Notes(ctx)
+	if err != nil {
+		return err
+	}
+	for _, n := range notes {
+		if n.ID == id && n.Detail == detail {
+			return nil
+		}
+	}
+	_, err = s.Store.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Importance: store.ImportanceLow, Source: "momentum",
+		At: s.now(), Title: plainClip("Case "+caseID+" has a cause only a person can fix, in a path the loop never changes", store.TitleMax),
+		Detail: detail})
+	return err
+}

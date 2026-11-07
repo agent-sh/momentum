@@ -417,8 +417,16 @@ func reviewPrompt(c store.Case, p Package) string {
 		"A cause whose fix needs a path no change may touch, as named above, is a follow-up for a person: file it as a low "+
 		"finding that names the path and the fix. It lowers no finding on what this change does. When this change is not "+
 		"worth landing without that fix, because it only hides the case's signal or is wrong without it, file a high finding "+
-		"that says so. A fix in a path a hand landing may change is the build's to make: a change that leaves it out gets "+
-		"the finding it would get anyway.", c.ID, c.Family, p.Title, buildScope(p.Repo))
+		"that says so.", c.ID, c.Family, p.Title, buildScope(p.Repo)) + handReach(p.Repo)
+}
+
+// handReach is the review's sentence on the paths only a hand landing may change, which only the loop's own
+// repository has.
+func handReach(repo string) string {
+	if !strings.EqualFold(repo, SelfRepo) {
+		return ""
+	}
+	return " A fix in a path a hand landing may change is the build's to make: a change that leaves it out gets the finding it would get anyway."
 }
 
 // refusalKeys are the build stages whose failure is the run's own output: its report, its patch, its check or its
