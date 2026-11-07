@@ -758,9 +758,10 @@ const reflogPage = 1000
 // days by default) removes every entry older than that. gc.reflogExpireUnreachable (30 days by default) removes older
 // entries that move to or from a commit no ref reaches (in a branch's own reflog, one the branch does not reach), the
 // newest one too, and the entry read is then an earlier move. Git 2.50.0 through 2.56.0 swap the two defaults, so
-// on those releases every entry older than 30 days goes unless gc.reflogExpire (or a gc.<pattern>.reflogExpire that
-// matches the ref) is set. found is false when no entry is
-// dated then (an empty reflog, one expired or cut by a new clone): HEAD as it stands is all there is.
+// on those releases every entry older than 30 days goes unless gc.reflogExpire is set, or a gc.<pattern>.reflogExpire*
+// entry whose pattern matches the reflog read (HEAD for HEAD's own reflog; the branch only when git falls back to
+// it); a matching pattern entry sets both limits, and the one it leaves unset never expires. found is false when no
+// entry is dated then (an empty reflog, one expired or cut by a new clone): HEAD as it stands is all there is.
 func (s *Ship) headAt(ctx context.Context, dir string, at time.Time) (commit string, found bool, err error) {
 	second := at.Unix()
 	for skip := 0; ; skip += reflogPage {
