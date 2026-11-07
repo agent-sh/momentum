@@ -612,6 +612,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		// input: the turn it opens is the one the input opened
 		input := r == "owner" || r == "self" || r == "momentum"
 		merged := input && queued[e.SourceKey] && (prevRole == "owner" || prevRole == "self" || prevRole == "momentum")
+		opens := input && !merged && harness == "codex" && codexOpens(m, carried)
 		if e.Harness == "codex" && m["prior"] == "turn_aborted" {
 			pending = map[string]bool{} // the abort ended the turn and its calls, whatever record the store marked it on
 			if r == "" {
@@ -839,7 +840,12 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			}
 			lastMainUser = true
 		case "agent":
-			words, pending, resumed = e.Summary, map[string]bool{}, time.Time{}
+			if harness != "codex" || why == "" || why == "assistant" {
+				// Codex's live tracker reads the agent's own messages alone: a subagent's message to the session, or an
+				// agent's text in the owner's turn, is not its words
+				words = e.Summary
+			}
+			pending, resumed = map[string]bool{}, time.Time{}
 			lastMainUser = false
 		case "apierr":
 			words = e.Summary
@@ -865,11 +871,9 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		}
 		if input && !merged {
 			turnBegan = e.TS // an input opens the turn the next stop ends
-			// Codex starts a turn with no last words of its own, as its live tracker reads task_started; an input
-			// steered into the running turn (queued) opens none
-			if ik, _ := m["input_kind"].(string); harness == "codex" && ik != "queued" {
-				words = ""
-			}
+		}
+		if opens {
+			words = "" // a Codex turn its input opens starts with no last words of its own, as its live tracker reads it
 		}
 		switch {
 		case merged: // the model owes its reply from the input it came with
@@ -1099,6 +1103,19 @@ func priorOf(m map[string]any, carried string) string {
 		return carried
 	}
 	return prior
+}
+
+// codexOpens reports whether a Codex input opens a turn, as Codex's live tracker reads its rollout: any but one
+// steered into the running turn, which the store marks queued, or marks an answer while the turn before it was not
+// over.
+func codexOpens(m map[string]any, carried string) bool {
+	switch ik, _ := m["input_kind"].(string); ik {
+	case "queued":
+		return false
+	case "answer":
+		return turnOver("codex", priorOf(m, carried))
+	}
+	return true
 }
 
 // turnOver reports the harness's record that a turn ended, as the store keeps the record before an input.

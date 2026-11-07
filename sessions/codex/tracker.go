@@ -41,7 +41,10 @@ type track struct {
 	// TurnBegan and TurnEnd are when the last turn began (task_started) and ended (task_complete or turn_aborted).
 	TurnBegan time.Time `json:"turn_began,omitzero"`
 	TurnEnd   time.Time `json:"turn_end,omitzero"`
-	log       sessions.Log
+	// Fresh says the open turn has had no agent activity yet: no agent message, call or call output. A user message
+	// typed then opens the turn; one typed after is steered into it, as the store reads it (input kind queued).
+	Fresh bool `json:"fresh,omitempty"`
+	log   sessions.Log
 }
 
 // NewTracker follows the rollout at path.
@@ -116,11 +119,9 @@ func (t *Tracker) line(e xLine, at time.Time) {
 	st, p := &t.st, e.Payload
 	switch e.Type + "/" + p.Type {
 	case "event_msg/task_started":
-		// A turn starts with no last words of its own: a turn Codex closes with no agent message did not end on the
-		// words an earlier turn ended on, a question its input answered among them.
-		st.Open, st.TurnBegan = true, at
+		st.Open, st.TurnBegan, st.Fresh = true, at, true
 		st.Calls, st.Order = map[string]*call{}, nil
-		st.Ask, st.LastText = "", ""
+		st.Ask = ""
 	case "event_msg/task_complete":
 		st.Open, st.TurnEnd = false, at
 		if p.LastAgentMessage != "" {
@@ -139,6 +140,12 @@ func (t *Tracker) line(e xLine, at time.Time) {
 		} else if p.Role == "user" && !strings.HasPrefix(strings.TrimSpace(msg), "<") && !strings.HasPrefix(msg, "# AGENTS.md") {
 			st.log.Add(sessions.Entry{Role: sessions.RoleUser, Text: text.OneLine(msg, 1200)})
 			st.UserAt = at
+			if !st.Open || st.Fresh {
+				// The message opens a turn, which starts with no last words of its own: a turn Codex closes with no
+				// agent message did not end on the words an earlier turn ended on, a question the message answered
+				// among them. A turn a subagent's message opens keeps them: nothing of the owner's answered them.
+				st.LastText = ""
+			}
 		}
 	case "response_item/function_call", "response_item/custom_tool_call":
 		desc := describe(p.Name, p.Arguments+p.Input)
@@ -160,7 +167,15 @@ func (t *Tracker) line(e xLine, at time.Time) {
 		}
 		st.log.Add(sessions.Entry{Role: sessions.RoleOut, Text: text.OneLine(out, 160)})
 	}
+	if e.Type == "response_item" && (agentActivity[p.Type] || p.Type == "message" && p.Role == "assistant") {
+		st.Fresh = false
+	}
 }
+
+// agentActivity are the items of a turn the agent made: a call and its output. A user message after one of them, or
+// after an agent message, is steered into the running turn.
+var agentActivity = map[string]bool{"function_call": true, "custom_tool_call": true, "tool_search_call": true, "local_shell_call": true,
+	"web_search_call": true, "function_call_output": true, "custom_tool_call_output": true, "tool_search_output": true}
 
 // describe returns the readable part of a Codex tool call's arguments.
 func describe(name, args string) string {
