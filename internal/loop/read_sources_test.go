@@ -689,29 +689,102 @@ func TestAPlanRechecksPartialReadsAtItsNewBoundary(t *testing.T) {
 	}
 }
 
-// A build first seen without the change stays rejected when the checkout moves back, until the file changes.
+// A build first seen without the change stays rejected when the checkout moves back, until the file changes. The test
+// keeps a clock of its own, with each build seconds after the move before it: the reflog dates a move to the second
+// (TestAnInstalledFileWrittenInTheSecondItsCheckoutMoved).
 func TestARejectedFirstBuildNeedsAnotherFileChange(t *testing.T) {
 	m := measuredCase(t)
 	p, _, _ := m.r.Ship.Load(m.c.ID)
 	p.Plan.Installed = filepath.Join(t.TempDir(), "tool")
-	write(t, p.Plan.Installed, "old build")
-	run(t, m.repo, "git", "checkout", "-q", "--orphan", "before")
-	run(t, m.repo, "git", "commit", "-qm", "before the change")
+	base := time.Now().Add(-3 * time.Hour).Truncate(time.Second)
+	datedGitIn(t, m.repo, base, "checkout", "-q", "--orphan", "before")
+	datedGitIn(t, m.repo, base, "commit", "-qm", "before the change")
+	writeDated(t, p.Plan.Installed, "old build", base.Add(2500*time.Millisecond))
 	ctx := context.Background()
 	if _, why, err := m.r.Ship.InEffect(ctx, &p); err != nil || why == "" {
 		t.Fatalf("first absent build: %s %v", why, err)
 	}
-	run(t, m.repo, "git", "checkout", "-q", p.Landed[0])
+	datedGitIn(t, m.repo, base.Add(5*time.Second), "checkout", "-q", p.Landed[0])
 	if _, why, err := m.r.Ship.InEffect(ctx, &p); err != nil || why == "" {
 		t.Fatalf("checkout alone accepted the old build: %s %v", why, err)
 	}
 	if p.CheckoutAt.IsZero() {
 		t.Fatal("waiting build lost the first checkout time")
 	}
-	write(t, p.Plan.Installed, "new build")
+	writeDated(t, p.Plan.Installed, "new build", base.Add(7500*time.Millisecond))
 	if _, why, err := m.r.Ship.InEffect(ctx, &p); err != nil || why != "" {
 		t.Fatalf("new build: %s %v", why, err)
 	}
+}
+
+// An installed file written in the second its checkout moved between a commit with the change and one without it is
+// not ordered against the move by the reflog, which dates the move to the second while the file's time is finer. The
+// change's own files order them at the file's resolution, since the move writes each that differs: the file holds the
+// change when none of them is newer and they match the commit that holds it.
+func TestAnInstalledFileWrittenInTheSecondItsCheckoutMoved(t *testing.T) {
+	ms := time.Millisecond
+	for _, tc := range []struct {
+		name    string
+		onto    bool          // the move is onto the change, else off it
+		same    bool          // the commit without the change has the change's file as the change has it
+		noFiles bool          // the change names no file
+		built   time.Duration // the installed file's time, into the move's second
+		wrote   time.Duration // the change's file's time, into the move's second
+		why     string        // a part of the reason it is out of effect; empty when in effect
+	}{
+		{name: "built before a move onto the change", onto: true, built: 300 * ms, wrote: 600 * ms, why: "a file of the change was modified after it"},
+		{name: "built after a move onto the change", onto: true, built: 600 * ms, wrote: 300 * ms},
+		{name: "built before a move off the change that writes no file", same: true, built: 300 * ms, wrote: -time.Hour},
+		{name: "built after a move off the change", built: 600 * ms, wrote: 300 * ms, why: "the change's own files do not match it"},
+		{name: "built in that second by a change that names no file", same: true, noFiles: true, built: 300 * ms, wrote: -time.Hour,
+			why: "no file of the change is there"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := measuredCase(t)
+			p, _, _ := m.r.Ship.Load(m.c.ID)
+			landed := p.Landed[0]
+			p.Plan.Installed, p.Changed = filepath.Join(t.TempDir(), "tool"), []string{"a.txt"}
+			if tc.noFiles {
+				p.Changed = nil
+			}
+			p.CheckoutAt = p.LandedAt // an earlier run saw the checkout hold the change
+			base := time.Now().Add(-3 * time.Hour).Truncate(time.Second)
+			second := base.Add(time.Hour)
+			datedGitIn(t, m.repo, base, "checkout", "-q", "--orphan", "without")
+			if !tc.same {
+				write(t, filepath.Join(m.repo, "a.txt"), "a, before the change\n")
+			}
+			datedGitIn(t, m.repo, base, "commit", "-qam", "a tree without the change")
+			without := strings.TrimSpace(run(t, m.repo, "git", "rev-parse", "HEAD"))
+			if tc.onto {
+				datedGitIn(t, m.repo, second, "checkout", "-q", landed)
+			} else {
+				datedGitIn(t, m.repo, base.Add(time.Minute), "checkout", "-q", landed)
+				datedGitIn(t, m.repo, second, "checkout", "-q", without)
+			}
+			dated(t, filepath.Join(m.repo, "a.txt"), second.Add(tc.wrote))
+			writeDated(t, p.Plan.Installed, "a build", second.Add(tc.built))
+			_, why, err := m.r.Ship.InEffect(context.Background(), &p)
+			if err != nil || (why == "") != (tc.why == "") || !strings.Contains(why, tc.why) {
+				t.Fatalf("in effect %v, want %v: %q %v", why == "", tc.why == "", why, err)
+			}
+		})
+	}
+}
+
+// dated sets a file's modification time.
+func dated(t *testing.T, path string, at time.Time) {
+	t.Helper()
+	if err := os.Chtimes(path, at, at); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeDated writes a file with a modification time.
+func writeDated(t *testing.T, path, text string, at time.Time) {
+	t.Helper()
+	write(t, path, text)
+	dated(t, path, at)
 }
 
 // goTool is a Go tool in a measured case's repository: its landed commit fixes main.go, and the case's package holds it.

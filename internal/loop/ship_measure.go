@@ -559,41 +559,53 @@ func (s *Ship) InEffect(ctx context.Context, p *Package) (time.Time, string, err
 	}
 	if p.Plan.Installed == "" || p.CheckoutAt.IsZero() || changed {
 		last := p.Landed[len(p.Landed)-1]
-		// a changed installed file is checked against the checkout as it stood when the file was written (the commit
+		// a changed installed file is checked against the checkout as it stood when the file was written (the commits
 		// its HEAD's reflog names then), not as it stands now: a build from an older tree does not count once the
-		// checkout is back on the change. The reflog's commit is all that is read: a build from uncommitted edits, or
+		// checkout is back on the change. The reflog's commits are all that is read: a build from uncommitted edits, or
 		// from another work tree or clone, is not checked.
-		head := "HEAD"
+		heads, reflog := []string{"HEAD"}, false
 		if changed {
-			if at, ok := s.headAt(ctx, p.Dir, installedAt); ok {
-				head = at
+			if at, ok := s.headsAt(ctx, p.Dir, installedAt); ok {
+				heads, reflog = at, true
 			}
 		}
-		if _, err := s.git(ctx, p.Dir, "merge-base", "--is-ancestor", last, head); err != nil {
+		var held []string
+		for _, head := range heads {
+			_, err := s.git(ctx, p.Dir, "merge-base", "--is-ancestor", last, head)
 			var exit *exec.ExitError
-			if errors.As(err, &exit) && exit.ExitCode() == 1 {
-				// A definite rejection stands until the next build. A transient checkout error records no decision.
-				p.InstalledAt, p.InstalledHash, p.InstalledOK, p.InstalledGo, p.InstalledWhy = installedAt, installedHash, false, false, ""
-				if head != "HEAD" {
-					return time.Time{}, fmt.Sprintf("the checkout the installed file was built from did not hold %.12s", last), nil
-				}
-				return time.Time{}, fmt.Sprintf("the repository's checkout does not hold %.12s yet", last), nil
+			switch {
+			case err == nil:
+				held = append(held, head)
+			case !errors.As(err, &exit) || exit.ExitCode() != 1:
+				return time.Time{}, fmt.Sprintf("cannot check the repository's checkout: %v", err), nil
 			}
-			return time.Time{}, fmt.Sprintf("cannot check the repository's checkout: %v", err), nil
 		}
-		checkoutAt := p.LandedAt
-		var newest time.Time
-		for _, path := range p.Changed {
-			st, err := os.Stat(filepath.Join(p.Dir, path))
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
+		why := ""
+		switch {
+		case len(held) == 0 && reflog:
+			why = fmt.Sprintf("the checkout the installed file was built from did not hold %.12s", last)
+		case len(held) == 0:
+			why = fmt.Sprintf("the repository's checkout does not hold %.12s yet", last)
+		case len(held) < len(heads):
+			// the checkout moved between a commit with the change and one without it in the second the file was written
+			w, decided, err := s.changeFilesHeld(ctx, p, last, held, installedAt)
 			if err != nil {
 				return time.Time{}, "", err
 			}
-			if st.ModTime().After(newest) {
-				newest = st.ModTime()
+			if !decided {
+				return time.Time{}, w, nil
 			}
+			why = w
+		}
+		if why != "" {
+			// A definite rejection stands until the next build. A transient checkout error records no decision.
+			p.InstalledAt, p.InstalledHash, p.InstalledOK, p.InstalledGo, p.InstalledWhy = installedAt, installedHash, false, false, ""
+			return time.Time{}, why, nil
+		}
+		checkoutAt := p.LandedAt
+		newest, err := newestChange(p)
+		if err != nil {
+			return time.Time{}, "", err
 		}
 		if !newest.IsZero() {
 			checkoutAt = newest
@@ -688,37 +700,95 @@ func (s *Ship) goBuildHolds(ctx context.Context, p *Package, bin io.ReaderAt, bu
 	if len(p.Changed) == 0 {
 		return false, "the installed Go binary was built from a tree whose change's own files are modified", true, true, nil
 	}
-	for _, name := range p.Changed {
-		st, serr := os.Stat(filepath.Join(p.Dir, name))
-		if errors.Is(serr, os.ErrNotExist) {
-			continue
-		}
-		if serr != nil {
-			return false, "", false, true, serr
-		}
-		if st.ModTime().After(builtAt) {
-			return false, "a file of the change was modified after the installed Go binary was built from a modified tree", true, true, nil
-		}
+	if newest, serr := newestChange(p); serr != nil {
+		return false, "", false, true, serr
+	} else if newest.After(builtAt) {
+		return false, "a file of the change was modified after the installed Go binary was built from a modified tree", true, true, nil
 	}
-	// the names are the change's own, chosen by its author: literal, never a pathspec (":(exclude)x" is a file name)
-	args := append([]string{"--literal-pathspecs", "diff", "--quiet", revision, "--"}, p.Changed...)
-	if _, gerr := s.git(ctx, p.Dir, args...); gerr != nil {
-		var exit *exec.ExitError
-		if errors.As(gerr, &exit) && exit.ExitCode() == 1 {
-			return false, "the installed Go binary was built from a tree whose change's own files are modified", true, true, nil
-		}
+	if match, gerr := s.changeFilesMatch(ctx, p, revision); gerr != nil {
 		return false, "cannot check the installed Go binary's tree: " + gerr.Error(), false, true, nil
+	} else if !match {
+		return false, "the installed Go binary was built from a tree whose change's own files are modified", true, true, nil
 	}
 	return true, "", true, true, nil
 }
 
-// headAt is the commit a checkout's HEAD named at a moment, by its reflog, and false when the reflog does not reach
-// back to it.
-func (s *Ship) headAt(ctx context.Context, dir string, at time.Time) (string, bool) {
+// newestChange is the newest modification time among the change's own files in its checkout, and zero when none of
+// them is there.
+func newestChange(p *Package) (time.Time, error) {
+	var newest time.Time
+	for _, name := range p.Changed {
+		st, err := os.Stat(filepath.Join(p.Dir, name))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return time.Time{}, err
+		}
+		if st.ModTime().After(newest) {
+			newest = st.ModTime()
+		}
+	}
+	return newest, nil
+}
+
+// changeFilesMatch says whether the change's own files, as the working tree has them, match a revision's. A change
+// that names no file matches nothing.
+func (s *Ship) changeFilesMatch(ctx context.Context, p *Package, revision string) (bool, error) {
+	if len(p.Changed) == 0 {
+		return false, nil
+	}
+	// the names are the change's own, chosen by its author: literal, never a pathspec (":(exclude)x" is a file name)
+	args := append([]string{"--literal-pathspecs", "diff", "--quiet", revision, "--"}, p.Changed...)
+	if _, err := s.git(ctx, p.Dir, args...); err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() == 1 {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// changeFilesHeld decides whether an installed file written at writtenAt came from a tree that held the change, when
+// its checkout moved in that second between a commit that holds the change (one of held) and one that does not. The
+// reflog cannot order the move and the file then; the change's own files can, at the file's resolution: a move between
+// the two writes each file that differs. The tree held the change when one of them is there, none was modified after
+// the installed file, and they match a commit of held. why is empty then; decided is false when git could not tell.
+func (s *Ship) changeFilesHeld(ctx context.Context, p *Package, last string, held []string, writtenAt time.Time) (why string, decided bool, err error) {
+	moved := fmt.Sprintf("the checkout moved to or from %.12s in the second the installed file was written", last)
+	newest, err := newestChange(p)
+	switch {
+	case err != nil:
+		return "", false, err
+	case newest.IsZero():
+		return moved + ", and no file of the change is there to say which came first", true, nil
+	case newest.After(writtenAt):
+		return moved + ", and a file of the change was modified after it", true, nil
+	}
+	for _, head := range held {
+		match, gerr := s.changeFilesMatch(ctx, p, head)
+		if gerr != nil {
+			return fmt.Sprintf("cannot check the repository's checkout: %v", gerr), false, nil
+		}
+		if match {
+			return "", true, nil
+		}
+	}
+	return moved + ", and the change's own files do not match it", true, nil
+}
+
+// headsAt is the commits a checkout's HEAD may have named at a moment, by its reflog, and false when the reflog does
+// not reach back to it. The reflog dates a move to the whole second and the moment is finer, so a move in the
+// moment's own second may have come before it or after it: the commits are the one HEAD named before that second,
+// when the reflog reaches back that far, and each it moved to within it.
+func (s *Ship) headsAt(ctx context.Context, dir string, at time.Time) ([]string, bool) {
 	out, err := s.git(ctx, dir, "reflog", "show", "--format=%H %gd", "--date=unix", "HEAD")
 	if err != nil {
-		return "", false
+		return nil, false
 	}
+	second := at.Unix()
+	var heads []string
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") { // newest first
 		commit, place, ok := strings.Cut(line, " ")
 		if !ok {
@@ -726,14 +796,17 @@ func (s *Ship) headAt(ctx context.Context, dir string, at time.Time) (string, bo
 		}
 		stamp := strings.TrimSuffix(strings.TrimPrefix(place, "HEAD@{"), "}")
 		secs, err := strconv.ParseInt(stamp, 10, 64)
-		if err != nil {
+		if err != nil || secs > second {
 			continue
 		}
-		if !time.Unix(secs, 0).After(at) {
-			return commit, true
+		if !slices.Contains(heads, commit) {
+			heads = append(heads, commit)
+		}
+		if secs < second {
+			break
 		}
 	}
-	return "", false
+	return heads, len(heads) > 0
 }
 
 // Keep records that a change's measurement kept it: its case closed as improved with the result.
