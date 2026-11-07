@@ -84,6 +84,94 @@ func TestTheLoopDirectoryIsExcludedThroughItsSymlink(t *testing.T) {
 	}
 }
 
+// An MCP tool's server is what comes between the first two separators of mcp__SERVER__TOOL; a name with no server or
+// no tool there, or not of that form, is of none.
+func TestAnMCPToolsServerIsBetweenItsFirstTwoSeparators(t *testing.T) {
+	for tool, want := range map[string]string{
+		"mcp__s__t":    "s",
+		"mcp__a_b__x":  "a_b",
+		"mcp__s__a__b": "s",
+		"mcp____x":     "",
+		"mcp__s__":     "",
+		"mcp__s":       "",
+		"mcp_s_t":      "",
+		"Bash":         "",
+	} {
+		if got := MCPServer(tool); got != want {
+			t.Errorf("MCPServer(%q) = %q, want %q", tool, got, want)
+		}
+	}
+}
+
+// A server's exposure holds the hours of its own tools only, by its name as written: an underscore in it is no
+// wildcard, as LIKE would read it, so mcp__aXb__x is not of a_b; and a tool named only the server's prefix, mcp__a_b__,
+// is of none (MCPServer), so its exposure leaves it out too.
+func TestAServersExposureReadsItsNameLiterally(t *testing.T) {
+	st, _ := open(t)
+	ctx := context.Background()
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	evs := []Event{
+		{Source: Transcripts, Kind: "tool_result", Actor: ActorTool, SourceKey: "own", Session: "own", TS: start, Tool: "mcp__a_b__x"},
+		{Source: Transcripts, Kind: "tool_result", Actor: ActorTool, SourceKey: "other", Session: "other", TS: start.Add(time.Hour), Tool: "mcp__aXb__x"},
+		{Source: Transcripts, Kind: "tool_result", Actor: ActorTool, SourceKey: "bare", Session: "bare", TS: start.Add(2 * time.Hour), Tool: "mcp__a_b__"},
+	}
+	if _, err := st.Put(ctx, evs); err != nil {
+		t.Fatal(err)
+	}
+	base, err := st.Activity(ctx, ActivityQuery{Since: start, Until: start.Add(24 * time.Hour), BySession: true, Server: "a_b"})
+	if err != nil || len(base) != 1 || !base[UnitOf(evs[0], true)] {
+		t.Fatalf("a_b's exposure: %+v %v", base, err)
+	}
+}
+
+// Codex serves every app connector from one server, codex_apps, and names a connector's tool
+// mcp__codex_apps__CONNECTOR__TOOL, its TOOL beginning with _ where Codex cut the connector's name from the tool's: each
+// connector is a server of its own, codex_apps__CONNECTOR, the field before the first __ after codex_apps__ (#101), in
+// both forms; a connector whose own name holds __ is cut at it. A connector's exposure holds the hours of exactly the
+// tools MCPServer gives it (OfServer): of both forms, never another connector's, nor one named only its prefix. The
+// exposure of codex_apps as a whole holds every tool named from mcp__codex_apps__, and codex_apps holds each connector.
+func TestACodexAppsConnectorIsAServerOfItsOwn(t *testing.T) {
+	for tool, want := range map[string]string{
+		"mcp__codex_apps__gmail___search_emails":      "codex_apps__gmail",
+		"mcp__codex_apps__google_drive___search":      "codex_apps__google_drive",
+		"mcp__codex_apps__gmail____x":                 "codex_apps__gmail",
+		"mcp__codex_apps__gmail__capture_file_upload": "codex_apps__gmail",
+		"mcp__codex_apps__foo__bar___x":               "codex_apps__foo",
+		"mcp__codex_apps_____x":                       "",
+		"mcp__codex_apps__gmail__":                    "",
+	} {
+		if got := MCPServer(tool); got != want {
+			t.Errorf("MCPServer(%q) = %q, want %q", tool, got, want)
+		}
+	}
+	st, _ := open(t)
+	ctx := context.Background()
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var evs []Event
+	for i, tool := range []string{"mcp__codex_apps__gmail___search", "mcp__codex_apps__gmail___send", "mcp__codex_apps__calendar___list",
+		"mcp__codex_apps__gmail__capture_file_upload", "mcp__codex_apps__gmail_x___y", "mcp__codex_apps__gmail__", "mcp__zz__x"} {
+		key := fmt.Sprint("e-", i)
+		evs = append(evs, Event{Source: Transcripts, Kind: "tool_result", Actor: ActorTool, SourceKey: key, Session: key, TS: start.Add(time.Duration(i) * time.Hour), Tool: tool})
+	}
+	if _, err := st.Put(ctx, evs); err != nil {
+		t.Fatal(err)
+	}
+	for server, n := range map[string]int{"codex_apps__gmail": 3, CodexApps: 6} {
+		base, err := st.Activity(ctx, ActivityQuery{Since: start, Until: start.Add(24 * time.Hour), BySession: true, Server: server})
+		if err != nil || len(base) != n {
+			t.Fatalf("%s's exposure: %+v %v", server, base, err)
+		}
+		for _, e := range evs {
+			if base[UnitOf(e, true)] != OfServer(e.Tool, server) || server != CodexApps && OfServer(e.Tool, server) != (MCPServer(e.Tool) == server) {
+				t.Errorf("%s's exposure and %s: %v", server, e.Tool, base)
+			}
+		}
+	}
+	if !HoldsServer(CodexApps, "codex_apps__gmail") || HoldsServer("codex_apps__gmail", CodexApps) || HoldsServer("codex_apps__gmail", "codex_apps__gmail_x") {
+		t.Error("codex_apps holds each of its connectors, and a connector neither it nor another")
+	}
+}
+
 // Readiness uses successful run starts, not event times or write times. An equal boundary is not past it,
 // a quiet successful read is sufficient, and a different source's activity has its own requirement.
 func TestWindowReadinessUsesEverySourcesSuccessfulRead(t *testing.T) {

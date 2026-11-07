@@ -40,7 +40,7 @@ type ActivityQuery struct {
 	Harness      string   // when set, only that harness's events
 	Actor        Actor    // when set, only the hours in which it did something (the owner's turns, say)
 	Tools        []string // when set, only the hours in which one of these tools was called or answered: a guard's exposure
-	// Server, when set, keeps only the hours in which a tool of this MCP server (MCPServer) was called or answered,
+	// Server, when set, keeps only the hours in which a tool of this MCP server (OfServer) was called or answered,
 	// whichever of its tools: a guard's exposure.
 	Server string
 	// Cwds, when set, keeps only the hours of events in one of these directories or below it: a guard's exposure. Each
@@ -83,6 +83,12 @@ func (s *Store) Activity(ctx context.Context, q ActivityQuery) (map[Unit]bool, e
 // MCPServer is the MCP server a tool is of, by the harness's name for an MCP tool, mcp__SERVER__TOOL, as Claude Code
 // names one: its server is what comes between the first two separators. A tool named otherwise (Bash, Read, any other
 // built-in) is of none, and gives "".
+//
+// Codex serves every ChatGPT app connector from one server, codex_apps, under a namespace of the connector's own,
+// codex_apps__CONNECTOR, so its tools are mcp__codex_apps__CONNECTOR__TOOL; where a tool's name began with its
+// connector's, Codex cut that off, and TOOL begins with _ (mcp__codex_apps__gmail___search). A tool of codex_apps is
+// of its connector, codex_apps__CONNECTOR, the field before the first __ of what follows the server: the whole server
+// would count every connector's hours as the problem's unit in use. It is still of codex_apps as a whole (OfServer).
 func MCPServer(tool string) string {
 	rest, ok := strings.CutPrefix(tool, "mcp__")
 	if !ok {
@@ -92,10 +98,35 @@ func MCPServer(tool string) string {
 	if !ok || server == "" || name == "" {
 		return ""
 	}
+	if server == CodexApps {
+		connector, name, ok := strings.Cut(name, "__")
+		if !ok || connector == "" || name == "" {
+			return ""
+		}
+		return CodexApps + "__" + connector
+	}
 	return server
 }
 
-// mcpPrefix is what every tool of an MCP server is named from (MCPServer).
+// CodexApps is the server Codex serves its app connectors from (MCPServer).
+const CodexApps = "codex_apps"
+
+// OfServer says whether a tool is of a server as its exposure counts it (ActivityQuery.Server): named from the server's
+// prefix (mcpPrefix), with a name after it. A server MCPServer gives has as its tools exactly those MCPServer gives it;
+// codex_apps as a whole has every tool named from mcp__codex_apps__, a connector's or not.
+func OfServer(tool, server string) bool {
+	prefix := mcpPrefix(server)
+	return server != "" && len(tool) > len(prefix) && strings.HasPrefix(tool, prefix)
+}
+
+// HoldsServer says whether every tool of other is of server (OfServer), by their names alone: a server holds itself,
+// and codex_apps holds each of its connectors.
+func HoldsServer(server, other string) bool {
+	return server != "" && other != "" && strings.HasPrefix(mcpPrefix(other), mcpPrefix(server))
+}
+
+// mcpPrefix is what every tool of an MCP server is named from (MCPServer), a codex_apps connector's in either of
+// Codex's forms: its name and __.
 func mcpPrefix(server string) string {
 	return "mcp__" + server + "__"
 }
@@ -135,8 +166,10 @@ func activityWhere(q ActivityQuery) ([]string, []any, string) {
 		where = append(where, "tool IN ("+strings.Join(marks, ",")+")")
 	}
 	if q.Server != "" {
-		// instr, not LIKE: a server's name may hold an underscore, which LIKE reads as any character
-		where, args = append(where, "instr(tool, ?) = 1"), append(args, mcpPrefix(q.Server))
+		// instr, not LIKE: a server's name may hold an underscore, which LIKE reads as any character; and a name after
+		// the prefix, as OfServer and MCPServer want one
+		prefix := mcpPrefix(q.Server)
+		where, args = append(where, "instr(tool, ?) = 1 AND length(tool) > length(?)"), append(args, prefix, prefix)
 	}
 	if q.Sources != nil {
 		marks := make([]string, len(q.Sources))

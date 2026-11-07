@@ -88,9 +88,13 @@ func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead e
 	for _, e := range hits {
 		counted["ev:"+e.ID()] = true
 	}
-	events, in, hit := 0, 0, 0
+	// own is the signal's tool when every event of the case's evidence in the history is of it: its detector filed
+	// them, and no plan words them, so naming a tool in the signal takes no tool past the two incidents
+	// (guardCandidates). An event the store no longer holds is of no tool.
+	events, in, hit, own := 0, 0, 0, sig.Tool
 	for _, e := range evidence {
-		if !strings.HasPrefix(e.Ref, "ev:") {
+		id, ok := strings.CutPrefix(e.Ref, "ev:")
+		if !ok {
 			continue
 		}
 		events++
@@ -100,6 +104,15 @@ func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead e
 		in++
 		if counted[e.Ref] {
 			hit++
+		}
+		if own != "" {
+			ev, found, err := s.Store.EventByID(ctx, id)
+			if err != nil {
+				return Plan{}, err
+			}
+			if !found || ev.Tool != own {
+				own = ""
+			}
 		}
 	}
 	switch {
@@ -118,9 +131,9 @@ func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead e
 	}
 	cut := measure.GuardCount(measure.Incidents(times, measure.GuardGap), nil, since, measure.GuardGap, anchored).Since
 	later := slices.DeleteFunc(slices.Clone(hits), func(e store.Event) bool { return e.TS.Before(cut) })
-	cands, none := guardCandidates(units, sig.Tool, later)
+	cands, none := guardCandidates(units, own, later)
 	if len(later) == 0 {
-		cands, none = guardCandidates(units, sig.Tool, hits)
+		cands, none = guardCandidates(units, own, hits)
 	}
 	if len(cands) == 0 {
 		return refuse("%s", none)
@@ -164,12 +177,13 @@ type guardCandidate struct {
 }
 
 // holds says whether every hour a candidate's exposure could count, another's counts too, by how the two are defined
-// and whatever the store holds: a set holds a tool or a set of its members, a server any tool unit of its own tools, a
-// directory any unit within it, and a unit with no tool or no directory holds any as far as that part goes.
+// and whatever the store holds: a set holds a tool or a set of its members, a server any tool unit of its own tools
+// and any server within it (codex_apps its connectors), a directory any unit within it, and a unit with no tool or no
+// directory holds any as far as that part goes.
 func (c guardCandidate) holds(o guardCandidate) bool {
 	switch {
 	case c.server != "":
-		if o.server != c.server && (len(o.tools) == 0 || slices.ContainsFunc(o.tools, func(t string) bool { return store.MCPServer(t) != c.server })) {
+		if !store.HoldsServer(c.server, o.server) && (len(o.tools) == 0 || slices.ContainsFunc(o.tools, func(t string) bool { return !store.OfServer(t, c.server) })) {
 			return false
 		}
 	case len(c.tools) > 0:
@@ -182,18 +196,22 @@ func (c guardCandidate) holds(o guardCandidate) bool {
 
 // guardCandidates are the units that hold every one of a history's events, which guardPlan picks the one of least
 // exposure from: the one tool every event was of; the set of the tools they were of, when every one was of a tool;
-// the MCP server every event's tool was of (store.MCPServer), any of its tools; the one directory every event ran in;
-// and each of those tool units within that directory. The owner's hours take no tool: his turns are of none. A
-// directory is compared as the store keeps it now (store.CleanCwd), since a row stored before the store cleaned
-// working directories keeps its form until its source is read again; it is a unit only when it is every event's own,
-// and there is no set of directories, since one directory can be another's parent and cover nearly all work.
+// the MCP server every event's tool was of (store.MCPServer), any of its tools, or codex_apps as a whole when every
+// event's tool was of it and no one connector holds them all (a problem across connectors, an expired sign-in say);
+// the one directory every event ran in; and each of those tool units within that directory. The owner's hours take
+// no tool: his turns are of none. A directory is compared as the store keeps it now (store.CleanCwd), since a row
+// stored before the store cleaned working directories keeps its form until its source is read again; it is a unit
+// only when it is every event's own, and there is no set of directories, since one directory can be another's parent
+// and cover nearly all work.
 //
 // A tool found by its events, alone or in a set, must be in two or more of the history's incidents, but the signal's
-// own (own), which every event is of by the signal's definition: the incidents are the history's independent draws,
-// events of one incident share a cause (measure.Incidents), so a tool one incident alone holds may be where that cause
-// happened to surface, and its hours would count activity in general as the problem's unit in use. A server takes no
-// such bound: it is defined by the server, not by which of its tools failed, and holds no built-in tool. none says why
-// there is no candidate, when there is none: then every activity would count as the problem's unit in use.
+// own (own), which every event is of by the signal's definition, and which guardPlan passes only when every event of
+// the case's evidence is of it too: the plan's word alone would take any tool past. The incidents are the history's
+// independent draws: events of one incident share a cause (measure.Incidents), so a tool one incident alone holds may
+// be where that cause happened to surface, and its hours would count activity in general as the problem's unit in
+// use. A server takes no such bound: it is defined by the server, not by which of its tools failed, and holds no
+// built-in tool. none says why there is no candidate, when there is none: then every activity would count as the
+// problem's unit in use.
 func guardCandidates(units, own string, hits []store.Event) (cands []guardCandidate, none string) {
 	// of is the members events are of, and the incidents each is in, or nil when one event is of none
 	times := make([]time.Time, len(hits))
@@ -242,14 +260,25 @@ func guardCandidates(units, own string, hits []store.Event) (cands []guardCandid
 	case len(tools) > 1 && thin == 0:
 		toolUnits = append(toolUnits, guardCandidate{unit: "tools", tools: tools})
 	}
-	servers := map[string]bool{} // the MCP servers the tools are of, "" for a tool of none
+	servers := map[string]bool{}    // the MCP servers the tools are of (store.MCPServer), "" for a tool of none
+	fields := map[string]bool{}     // the servers they are named of, codex_apps for any of its tools
+	connectors := map[string]bool{} // codex_apps's connectors its tools are of, "" for one of none
 	for _, tool := range tools {
-		servers[store.MCPServer(tool)] = true
+		server := store.MCPServer(tool)
+		servers[server] = true
+		if !store.OfServer(tool, store.CodexApps) {
+			fields[server] = true
+			continue
+		}
+		fields[store.CodexApps], connectors[server] = true, true
 	}
-	if len(servers) == 1 && !servers[""] {
+	switch {
+	case len(servers) == 1 && !servers[""]:
 		for server := range servers {
 			toolUnits = append(toolUnits, guardCandidate{unit: "server", server: server})
 		}
+	case len(fields) == 1 && fields[store.CodexApps]:
+		toolUnits = append(toolUnits, guardCandidate{unit: "server", server: store.CodexApps})
 	}
 	cands = append(cands, toolUnits...)
 	if len(cwds) == 1 {
@@ -263,7 +292,7 @@ func guardCandidates(units, own string, hits []store.Event) (cands []guardCandid
 	}
 	whys := []string{fmt.Sprintf("%d tools, %d of them in fewer than two of its %d incidents", len(tools), thin, len(incidents))}
 	if len(tools) == 1 {
-		whys[0] = "1 tool, not the signal's own, in one incident alone"
+		whys[0] = "1 tool in one incident alone"
 	}
 	switch {
 	case units == OwnerHours:
@@ -277,15 +306,30 @@ func guardCandidates(units, own string, hits []store.Event) (cands []guardCandid
 	}
 	switch {
 	case tools == nil:
-	case len(servers) == 1:
+	case len(fields) == 1 && fields[""]:
 		whys = append(whys, "of no MCP server")
-	case servers[""]:
+	case fields[""]:
 		whys = append(whys, "some of no MCP server")
+	case fields[store.CodexApps]:
+		named := len(connectors)
+		w := fmt.Sprintf("of %d MCP servers, %s's tools of %d connector%s", len(fields), store.CodexApps, named, plural(named))
+		if connectors[""] {
+			w = fmt.Sprintf("of %d MCP servers, %s's tools of %d connector%s and some of none", len(fields), store.CodexApps, named-1, plural(named-1))
+		}
+		whys = append(whys, w)
 	default:
-		whys = append(whys, fmt.Sprintf("of %d MCP servers", len(servers)))
+		whys = append(whys, fmt.Sprintf("of %d MCP servers", len(fields)))
 	}
-	return nil, fmt.Sprintf("no unit holds all its events (%s: a tool the signal does not name, or a set of tools, holds each in two incidents or more; a directory is every event's own; an MCP server is the one every event's tool is of), so absence cannot be counted only while the problem's unit was in use",
+	return nil, fmt.Sprintf("no unit holds all its events (%s: a tool, alone or in a set, is in two incidents or more, the signal's own too unless every event of the case's evidence is of it; a directory is every event's own; an MCP server is the one every event's tool is of, a connector of codex_apps where one holds them all), so absence cannot be counted only while the problem's unit was in use",
 		strings.Join(whys, "; "))
+}
+
+// plural is "s" but for one.
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 // guardUnitText says what a guard's exposure is narrowed to, for its proposal: the tools and the server by name, the

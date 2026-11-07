@@ -1,6 +1,7 @@
 package loop
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -232,9 +233,16 @@ func TestAGuardsSetReadsBackFromItsJSON(t *testing.T) {
 // testing whose evidence is every failure.
 func oneIncident(t *testing.T, st *store.Store, at, useUntil time.Time, tool func(j int) string) store.Case {
 	t.Helper()
-	evs := []store.Event{serverUse("began", at.Add(-60*aDay), serverA)}
+	return oneIncidentOf(t, st, at, useUntil, [3]string{serverA, serverB, serverC}, tool)
+}
+
+// oneIncidentOf is oneIncident with the three tools that answer in turn named by uses, and extra events stored beside
+// the failures and filed with them as the case's evidence.
+func oneIncidentOf(t *testing.T, st *store.Store, at, useUntil time.Time, uses [3]string, tool func(j int) string, extra ...store.Event) store.Case {
+	t.Helper()
+	evs := []store.Event{serverUse("began", at.Add(-60*aDay), uses[0])}
 	for i, u := 0, at.Add(-28*aDay); u.Before(useUntil); i, u = i+1, u.Add(time.Hour) {
-		evs = append(evs, serverUse(fmt.Sprint("use-", i), u, []string{serverA, serverB, serverC}[i%3]), serverUse(fmt.Sprint("read-", i), u.Add(10*time.Minute), "Read"))
+		evs = append(evs, serverUse(fmt.Sprint("use-", i), u, uses[i%3]), serverUse(fmt.Sprint("read-", i), u.Add(10*time.Minute), "Read"))
 	}
 	var failures []store.Event
 	for j := 0; j < 6; j++ {
@@ -243,6 +251,7 @@ func oneIncident(t *testing.T, st *store.Store, at, useUntil time.Time, tool fun
 		e.Tool, e.Cwd = tool(j), fmt.Sprint("/work/d", j)
 		failures = append(failures, e)
 	}
+	failures = append(failures, extra...)
 	put(t, st, append(evs, failures...))
 	if err := st.MarkRead(t.Context(), toolSignal.Source, at); err != nil {
 		t.Fatal(err)
@@ -323,6 +332,88 @@ func TestAGuardOverAnMCPServer(t *testing.T) {
 	}
 }
 
+// Two tools of Codex's gmail connector that fail, a third of it that never does, one Codex named whole (its name did
+// not begin with the connector's), and another connector's tool.
+const (
+	gmailSearch  = "mcp__codex_apps__gmail___search"
+	gmailSend    = "mcp__codex_apps__gmail___send"
+	gmailLabel   = "mcp__codex_apps__gmail___label"
+	gmailCapture = "mcp__codex_apps__gmail__capture_file_upload"
+	calendarList = "mcp__codex_apps__calendar___list"
+)
+
+// Codex serves every app connector from one server, codex_apps, so the whole server would count every connector's hours
+// as the problem's unit in use (#101): each connector is a server of its own. One incident across two tools of the
+// gmail connector, from six directories, takes the connector, and its exposure counts the hours of its tools (224 of
+// the one that failed and of the one that never did, and the failures' own 6), never the calendar connector's or
+// Read's. One incident across a tool Codex cut the connector's name from and one it named whole takes the connector,
+// whose exposure counts both forms (224 of each, and the failures' 6). A problem across connectors (an expired
+// sign-in) takes codex_apps as a whole, whose exposure counts every connector's tools (224 of each of three, and the
+// failures' 6). A history of codex_apps's tools beside another server's has no server, and its refusal counts
+// codex_apps once, with its connectors.
+func TestACodexAppsConnectorIsAGuardsServer(t *testing.T) {
+	now := time.Now().Truncate(time.Hour)
+	t.Run("its unit is the connector", func(t *testing.T) {
+		st := testStore(t)
+		c := oneIncidentOf(t, st, now, now, [3]string{gmailSearch, gmailLabel, calendarList}, func(j int) string { return []string{gmailSearch, gmailSend}[j%2] })
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, serverSignal, 7*aDay, "", now)
+		g, _ := guardOf(t, plan)
+		if err != nil || g == nil || g.Unit != "server" || g.Server != "codex_apps__gmail" || g.Incidents != 1 || g.Exposure != 2*224+6 {
+			t.Fatalf("one incident across a connector's two tools: %+v %v", g, err)
+		}
+		if text := (&Ship{}).packageText(c, Package{Plan: &plan, Check: &Check{}}); !strings.Contains(text, "in which any tool of the MCP server codex_apps__gmail was used") {
+			t.Fatalf("the proposal does not name the guard's connector: %s", text)
+		}
+	})
+	t.Run("both of Codex's name forms take the connector", func(t *testing.T) {
+		st := testStore(t)
+		c := oneIncidentOf(t, st, now, now, [3]string{gmailSearch, gmailCapture, calendarList}, func(j int) string { return []string{gmailSearch, gmailCapture}[j%2] })
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, serverSignal, 7*aDay, "", now)
+		if g, _ := guardOf(t, plan); err != nil || g == nil || g.Unit != "server" || g.Server != "codex_apps__gmail" || g.Exposure != 2*224+6 {
+			t.Fatalf("a connector's tools in both forms: %+v %v", g, err)
+		}
+	})
+	t.Run("two connectors take codex_apps", func(t *testing.T) {
+		st := testStore(t)
+		c := oneIncidentOf(t, st, now, now, [3]string{gmailSearch, gmailLabel, calendarList}, func(j int) string { return []string{gmailSearch, calendarList}[j%2] })
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, serverSignal, 7*aDay, "", now)
+		if g, _ := guardOf(t, plan); err != nil || g == nil || g.Unit != "server" || g.Server != "codex_apps" || g.Exposure != 3*224+6 {
+			t.Fatalf("two connectors: %+v %v", g, err)
+		}
+	})
+	t.Run("codex_apps beside another server", func(t *testing.T) {
+		st := testStore(t)
+		c := oneIncidentOf(t, st, now, now, [3]string{gmailSearch, gmailLabel, calendarList}, func(j int) string { return []string{gmailSearch, calendarList, serverA}[j%3] })
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, serverSignal, 7*aDay, "", now)
+		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), "(3 tools, 3 of them in fewer than two of its 1 incidents; in 6 directories; of 2 MCP servers, codex_apps's tools of 2 connectors") {
+			t.Fatalf("codex_apps's tools and another server's: %+v %v", g, err)
+		}
+	})
+}
+
+// codex_apps holds each of its connectors and any tools of it, so on a tie a connector or a set of its tools is the
+// narrower; a connector holds neither codex_apps nor another connector.
+func TestCodexAppsHoldsItsConnectors(t *testing.T) {
+	apps, gmail := guardCandidate{unit: "server", server: "codex_apps"}, guardCandidate{unit: "server", server: "codex_apps__gmail"}
+	for _, tc := range []struct {
+		c, o guardCandidate
+		want bool
+	}{
+		{apps, gmail, true},
+		{apps, guardCandidate{unit: "tools", tools: []string{gmailSearch, calendarList}}, true},
+		{apps, guardCandidate{unit: "tools in its directory", tools: []string{gmailSearch, calendarList}, cwds: []string{"/work/a"}}, true},
+		{apps, guardCandidate{unit: "tools", tools: []string{gmailSearch, "Bash"}}, false},
+		{gmail, apps, false},
+		{gmail, guardCandidate{unit: "server", server: "codex_apps__calendar"}, false},
+		{gmail, guardCandidate{unit: "tool", tools: []string{gmailSearch}}, true},
+		{gmail, guardCandidate{unit: "tool", tools: []string{calendarList}}, false},
+	} {
+		if got := tc.c.holds(tc.o); got != tc.want {
+			t.Errorf("%+v holds %+v: %v", tc.c, tc.o, got)
+		}
+	}
+}
+
 // A tool found by its events, not named by the signal, is a unit only in two incidents or more, as a set's member is
 // (#98): one incident's cause may surface in any tool. A built-in tool in one incident from six directories leaves no
 // unit; an MCP server's one tool there leaves its server. The signal's own tool keeps its exemption: every event is of
@@ -333,7 +424,7 @@ func TestAToolFoundByItsEventsNeedsTwoIncidents(t *testing.T) {
 		st := testStore(t)
 		c := oneIncident(t, st, now, now, func(int) string { return "Edit" })
 		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, serverSignal, 7*aDay, "", now)
-		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), "(1 tool, not the signal's own, in one incident alone; in 6 directories; of no MCP server") {
+		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), "(1 tool in one incident alone; in 6 directories; of no MCP server") {
 			t.Fatalf("a built-in tool in one incident: %+v %v", g, err)
 		}
 	})
@@ -343,6 +434,69 @@ func TestAToolFoundByItsEventsNeedsTwoIncidents(t *testing.T) {
 		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, serverSignal, 7*aDay, "", now)
 		if g, _ := guardOf(t, plan); err != nil || g == nil || g.Unit != "server" || g.Server != "zz_server" || g.Tool != "" || g.Exposure != 3*224+6 {
 			t.Fatalf("an MCP tool in one incident: %+v %v", g, err)
+		}
+	})
+}
+
+// The signal's own tool is exempt from the two incidents only on the case's evidence, which its detector filed, never
+// on the plan's word, which a build writes (#101). A signal that names Bash, over one incident of Bash failures from six
+// directories, is refused where the case's evidence holds Edit failures beside them, and admitted with Bash as its unit
+// (224 hours of its use, and the failures' own 6) where every event of the evidence is of Bash. Only the evidence in
+// the history counts: an Edit failure before it leaves Bash admitted. An event of the evidence the store no longer holds
+// is of no tool, so Bash is refused.
+func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
+	now := time.Now().Truncate(time.Hour)
+	bash := serverSignal
+	bash.Tool = "Bash"
+	t.Run("evidence of another tool beside it", func(t *testing.T) {
+		st := testStore(t)
+		var edits []store.Event
+		for j := 0; j < 2; j++ {
+			key := fmt.Sprint("edit-", j)
+			e := toolResult(key, now.Add(-15*aDay+time.Duration(j)*time.Hour+40*time.Minute), key, true)
+			e.Tool, e.Cwd = "Edit", fmt.Sprint("/work/e", j)
+			edits = append(edits, e)
+		}
+		c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" }, edits...)
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 7*aDay, "", now)
+		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), "(1 tool in one incident alone; in 6 directories; of no MCP server") {
+			t.Fatalf("a named tool over evidence of two tools: %+v %v", g, err)
+		}
+	})
+	t.Run("evidence all of it", func(t *testing.T) {
+		st := testStore(t)
+		c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" })
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 7*aDay, "", now)
+		if g, _ := guardOf(t, plan); err != nil || g == nil || g.Unit != "tool" || g.Tool != "Bash" || g.Incidents != 1 || g.Exposure != 224+6 {
+			t.Fatalf("a named tool over evidence all of it: %+v %v", g, err)
+		}
+	})
+	t.Run("evidence of another tool before the history", func(t *testing.T) {
+		st := testStore(t)
+		edit := toolResult("edit-before", now.Add(-35*aDay), "edit-before", true)
+		edit.Tool, edit.Cwd = "Edit", "/work/e"
+		c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" }, edit)
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 7*aDay, "", now)
+		if g, _ := guardOf(t, plan); err != nil || g == nil || g.Unit != "tool" || g.Tool != "Bash" || g.Exposure != 224+6 {
+			t.Fatalf("a named tool over evidence of another tool before its history: %+v %v", g, err)
+		}
+	})
+	t.Run("evidence the store no longer holds", func(t *testing.T) {
+		st, path := testStoreAt(t)
+		c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" })
+		db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(10000)")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if res, err := db.Exec(`DELETE FROM events WHERE source = ? AND source_key = 'f-0'`, toolSignal.Source); err != nil {
+			t.Fatal(err)
+		} else if n, _ := res.RowsAffected(); n != 1 {
+			t.Fatalf("deleted %d events", n)
+		}
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 7*aDay, "", now)
+		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), "(1 tool in one incident alone; in 5 directories; of no MCP server") {
+			t.Fatalf("a named tool over evidence the store lost: %+v %v", g, err)
 		}
 	})
 }
