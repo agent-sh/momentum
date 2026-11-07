@@ -38,7 +38,10 @@ type track struct {
 	AskCall  string           `json:"ask_call"`
 	AskAsync bool             `json:"ask_async"`
 	UserAt   time.Time        `json:"user_at,omitzero"` // when a user message last arrived
-	log      sessions.Log
+	// TurnBegan and TurnEnd are when the last turn began (task_started) and ended (task_complete or turn_aborted).
+	TurnBegan time.Time `json:"turn_began,omitzero"`
+	TurnEnd   time.Time `json:"turn_end,omitzero"`
+	log       sessions.Log
 }
 
 // NewTracker follows the rollout at path.
@@ -113,16 +116,18 @@ func (t *Tracker) line(e xLine, at time.Time) {
 	st, p := &t.st, e.Payload
 	switch e.Type + "/" + p.Type {
 	case "event_msg/task_started":
-		st.Open = true
+		// A turn starts with no last words of its own: a turn Codex closes with no agent message did not end on the
+		// words an earlier turn ended on, a question its input answered among them.
+		st.Open, st.TurnBegan = true, at
 		st.Calls, st.Order = map[string]*call{}, nil
-		st.Ask = ""
+		st.Ask, st.LastText = "", ""
 	case "event_msg/task_complete":
-		st.Open = false
+		st.Open, st.TurnEnd = false, at
 		if p.LastAgentMessage != "" {
 			st.LastText = p.LastAgentMessage
 		}
 	case "event_msg/turn_aborted":
-		st.Open = false
+		st.Open, st.TurnEnd = false, at
 	case "response_item/message":
 		msg := text.BlocksText(p.Content)
 		if p.Role == "user" {
@@ -210,6 +215,7 @@ func (t *Tracker) Facts(s *sessions.Session, now time.Time) {
 	s.Log = &t.st.log
 	s.LastText = strings.TrimSpace(t.st.LastText)
 	s.UserAt = t.st.UserAt
+	s.TurnBegan, s.IdleSince = t.st.TurnBegan, t.st.TurnEnd
 	if c := t.pending(); c != nil {
 		s.Now, s.NowSince = text.OneLine(c.Name+": "+c.Desc, 140), c.At
 	}

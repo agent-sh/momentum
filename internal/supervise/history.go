@@ -865,6 +865,11 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		}
 		if input && !merged {
 			turnBegan = e.TS // an input opens the turn the next stop ends
+			// Codex starts a turn with no last words of its own, as its live tracker reads task_started; an input
+			// steered into the running turn (queued) opens none
+			if ik, _ := m["input_kind"].(string); harness == "codex" && ik != "queued" {
+				words = ""
+			}
 		}
 		switch {
 		case merged: // the model owes its reply from the input it came with
