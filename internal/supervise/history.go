@@ -17,6 +17,7 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 	"github.com/agent-sh/momentum/sessions"
 	"github.com/agent-sh/momentum/sessions/claude"
+	"github.com/agent-sh/momentum/sessions/codex"
 )
 
 // Point is a session at one stop in the store's history, and what came next.
@@ -597,6 +598,11 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			harness = e.Harness
 		}
 		r := role(e, m)
+		if why, _ := m["why"].(string); harness == "codex" && r == "agent" && why != "" && why != "assistant" {
+			// a subagent's message to the session, or an agent's text in the owner's turn: Codex's live tracker reads
+			// only the agent's own messages, and passes over the rest
+			r = ""
+		}
 		if enqueued[e.SourceKey] {
 			// a notification at the time it was queued, delivered as an input later: it closes its task now, as the
 			// live tracker reads the queue
@@ -612,7 +618,8 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		// input: the turn it opens is the one the input opened
 		input := r == "owner" || r == "self" || r == "momentum"
 		merged := input && queued[e.SourceKey] && (prevRole == "owner" || prevRole == "self" || prevRole == "momentum")
-		opens := input && !merged && harness == "codex" && codexOpens(m, carried)
+		// the owner's input that opens a Codex turn clears its words, read as the live tracker reads its message
+		opens := r == "owner" && !merged && harness == "codex" && codexOpens(m, carried) && codex.OpensTurn(e.Summary)
 		if e.Harness == "codex" && m["prior"] == "turn_aborted" {
 			pending = map[string]bool{} // the abort ended the turn and its calls, whatever record the store marked it on
 			if r == "" {
@@ -840,12 +847,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			}
 			lastMainUser = true
 		case "agent":
-			if harness != "codex" || why == "" || why == "assistant" {
-				// Codex's live tracker reads the agent's own messages alone: a subagent's message to the session, or an
-				// agent's text in the owner's turn, is not its words
-				words = e.Summary
-			}
-			pending, resumed = map[string]bool{}, time.Time{}
+			words, pending, resumed = e.Summary, map[string]bool{}, time.Time{}
 			lastMainUser = false
 		case "apierr":
 			words = e.Summary
@@ -1105,9 +1107,9 @@ func priorOf(m map[string]any, carried string) string {
 	return prior
 }
 
-// codexOpens reports whether a Codex input opens a turn, as Codex's live tracker reads its rollout: any but one
-// steered into the running turn, which the store marks queued, or marks an answer while the turn before it was not
-// over.
+// codexOpens reports whether a Codex input opens a turn by the store's marks, as Codex's live tracker reads its
+// rollout: any but one steered into the running turn, which the store marks queued, or marks an answer while the
+// turn before it was not over.
 func codexOpens(m map[string]any, carried string) bool {
 	switch ik, _ := m["input_kind"].(string); ik {
 	case "queued":

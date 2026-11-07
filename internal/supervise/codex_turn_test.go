@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -282,5 +283,164 @@ func TestASteeredCodexAnswerKeepsTheTurnsOwnWords(t *testing.T) {
 	}
 	if got := replayed(t, st, "codex-answer-after", overNudge); got.Point.Stop.Words != "" {
 		t.Fatalf("an answer that opened a turn kept the turn before's words: %q (%s)", got.Point.Stop.Words, Why(got))
+	}
+}
+
+// scanned is the live session the tracker reads from the rollout at now, as a scan hands it to supervision.
+func scanned(path string, since, now time.Time) *sessions.Session {
+	s := &sessions.Session{Key: codexTurnID, Tool: "codex", Name: "audio", Where: "work:1.1", Pane: "%7", PID: 42, Since: since,
+		Tasks: []sessions.Task{}}
+	tr := codex.NewTracker(path)
+	tr.Facts(s, now)
+	s.TurnOpen = tr.Open()
+	sessions.Decide(s, now)
+	if s.Log != nil {
+		s.Seq = s.Log.Seq()
+	}
+	return s
+}
+
+const codexPromise = "The soak is running. I'll report when it finishes."
+
+// momentum's own resync opens no turn of its user's: a turn Codex closes after it with no agent message keeps the
+// words the resync quoted, so the promise rule tries again, and after its second try a case opens.
+func TestALiveCodexResyncThatGetsNoReplyIsTriedAgainThenACase(t *testing.T) {
+	if codex.Marker != Marker {
+		t.Fatalf("the tracker knows momentum's messages by %q, momentum types %q", codex.Marker, Marker)
+	}
+	for _, withCall := range []bool{false, true} {
+		r := newCodexRollout(t, t.TempDir())
+		r.meta()
+		r.started(time.Second)
+		r.user(0, "run the soak")
+		r.agent(time.Minute, codexPromise)
+		ended := r.completed(0, codexPromise)
+		st := testStore(t)
+		f := &fakeSender{}
+		now := ended.Add(20 * time.Minute)
+		sv := supervisor(st, f, &now)
+		sv.Live = map[string]bool{RulePromise: true}
+		run(t, sv, scanned(r.path, ended, now))
+		for try := 1; try <= 2; try++ {
+			if len(f.sent) != try {
+				t.Fatalf("with a call %v, try %d: sent %q", withCall, try, f.sent)
+			}
+			r.at = now.Add(time.Second)
+			r.started(0)
+			r.user(0, strings.TrimPrefix(f.sent[try-1], "%7 ")) // Codex records the resync as its user's message
+			if withCall {
+				r.call(5*time.Second, "c1")
+			}
+			ended = r.completed(2*time.Second, "")
+			now = ended.Add(20 * time.Minute)
+			run(t, sv, scanned(r.path, ended, now))
+		}
+		cases := events(t, st, KindCase)
+		if len(f.sent) != 2 || len(cases) != 1 || metaMap(cases[0])["rule"] != RulePromise {
+			t.Fatalf("with a call %v: sent %d, cases %d", withCall, len(f.sent), len(cases))
+		}
+	}
+}
+
+// The replay reads momentum's message as live: it opens no turn of the owner's, so the silent turn after it keeps
+// the promise its resync quoted, and so does a turn of his that opens with the marker (a paste of it that stayed).
+func TestTheReplayOfAResyncThatGetsNoReplyKeepsItsWords(t *testing.T) {
+	st := testStore(t)
+	resync := newTimeline(t, "codex-resync").owner(0, "run the soak", "").say(time.Minute, codexPromise).
+		add(20*time.Minute, "harness_text", store.ActorHarness, "", Marker+" Your last turn ended with a promise.",
+			`{"input_kind":"typed","prior":"task_complete","why":"momentum supervise"}`)
+	resync.owner(40*time.Minute, "status?", "task_complete")
+	next := resync.at
+	resync.codex().put(st)
+	pasted := newTimeline(t, "codex-pasted-marker").owner(0, "run the soak", "").say(time.Minute, codexPromise).
+		owner(20*time.Minute, Marker+" Your last turn ended with a promise. also run the linter", "task_complete")
+	pasted.owner(40*time.Minute, "status?", "task_complete")
+	pastedNext := pasted.at
+	pasted.codex().put(st)
+	for session, at := range map[string]time.Time{"codex-resync": next, "codex-pasted-marker": pastedNext} {
+		if got := replayed(t, st, session, at); got.Point.Stop.Words != codexPromise || got.Decision.Rule != RulePromise {
+			t.Fatalf("%s: the stop after the silent turn reads %q, rule %q", session, got.Point.Stop.Words, got.Decision.Rule)
+		}
+	}
+}
+
+// Only the owner's input opens a Codex turn in the replay, and only one the live tracker reads as typed: not the
+// session's own input (a notification), and not a message that opens with "<", which the live tracker reads as
+// Codex's own markup.
+func TestACodexInputTheLiveTrackerDoesNotReadAsTypedOpensNoTurn(t *testing.T) {
+	st := testStore(t)
+	const asked = "I switched the sink. Can you hear it now?"
+	self := newTimeline(t, "codex-self").owner(0, "fix the sound output", "").say(time.Minute, asked).
+		add(20*time.Minute, "harness_text", store.ActorHarness, "", "scheduled check", `{"input_kind":"typed","prior":"scheduled_task_fire"}`)
+	self.owner(40*time.Minute, "status?", "task_complete")
+	selfNext := self.at
+	self.codex().put(st)
+	angle := newTimeline(t, "codex-angle").owner(0, "fix the sound output", "").say(time.Minute, asked).
+		owner(20*time.Minute, "<= 5 retries is enough, keep going", "task_complete")
+	angle.owner(40*time.Minute, "status?", "task_complete")
+	angleNext := angle.at
+	angle.codex().put(st)
+	for session, at := range map[string]time.Time{"codex-self": selfNext, "codex-angle": angleNext} {
+		if got := replayed(t, st, session, at); got.Point.Stop.Words != asked {
+			t.Fatalf("%s: the stop after the silent turn reads %q (%s)", session, got.Point.Stop.Words, Why(got))
+		}
+	}
+}
+
+// A message Codex wrote before the task_started of the turn it opens opens that turn, live and in the replay.
+func TestACodexMessageTypedBeforeItsTurnStartsOpensIt(t *testing.T) {
+	home := codexHome(t)
+	r := newCodexRollout(t, home)
+	r.asked()
+	r.user(5*time.Minute, "it still fails, remove the sandbox and let me try")
+	r.started(0)
+	ended := r.completed(2*time.Second, "")
+	_, stop, _ := live(t, r.path, ended)
+	r.started(30 * time.Minute)
+	nudge := r.user(0, ".")
+	got := replayed(t, ingested(t, home), codexTurnID, nudge)
+	if stop.Words != "" || got.Point.Stop.Words != "" {
+		t.Fatalf("live %q, replay %q (%s)", stop.Words, got.Point.Stop.Words, Why(got))
+	}
+}
+
+// In a turn a subagent's message opened, the agent's calls make a message the owner types after them a steer: the
+// turn keeps its words, live and in the replay.
+func TestASteerAfterCallsInATurnASubagentOpenedKeepsTheWords(t *testing.T) {
+	home := codexHome(t)
+	r := newCodexRollout(t, home)
+	r.asked()
+	r.fromSubagent(5*time.Minute, "The worker finished the build.")
+	r.call(time.Second, "c1")
+	r.user(10*time.Second, "also check the bluetooth profile")
+	ended := r.completed(5*time.Second, "")
+	_, stop, _ := live(t, r.path, ended)
+	r.started(30 * time.Minute)
+	nudge := r.user(0, ".")
+	got := replayed(t, ingested(t, home), codexTurnID, nudge)
+	if stop.Words != Words(codexAsked) || got.Point.Stop.Words != stop.Words {
+		t.Fatalf("live %q, replay %q (%s)", stop.Words, got.Point.Stop.Words, Why(got))
+	}
+}
+
+// A subagent's message that comes while a call runs is passed over in the replay, as the live tracker passes over
+// it: the stop is the call still running, live and replayed.
+func TestASubagentsMessageDuringACallIsPassedOver(t *testing.T) {
+	home := codexHome(t)
+	r := newCodexRollout(t, home)
+	r.meta()
+	r.started(time.Second)
+	r.user(0, "wait for the worker")
+	called := r.line(5*time.Second, "response_item", map[string]any{"type": "function_call", "name": "wait_agent", "call_id": "w1", "arguments": `{"agent":"worker"}`})
+	r.line(time.Minute, "response_item", map[string]any{"type": "agent_message", "id": "m1", "author": "worker", "recipient": "main",
+		"content": []any{map[string]any{"type": "input_text", "text": "The worker finished the build."}}})
+	now := r.at.Add(time.Minute)
+	s := scanned(r.path, called, now)
+	liveRes := Result{Point: Point{Stop: StopOf(s, s.UserAt)}}
+	liveRes.Decision = Plan(liveRes.Point.Stop, Tries{}, DefaultParams, probeAt(time.Time{}))
+	nudge := r.user(time.Minute, ".")
+	got := replayed(t, ingested(t, home), codexTurnID, nudge)
+	if Why(liveRes) != "working: a tool call was running" || Why(got) != Why(liveRes) || !got.Point.Stop.At.Equal(called) {
+		t.Fatalf("live %q, replay %q at %v (the call at %v)", Why(liveRes), Why(got), got.Point.Stop.At, called)
 	}
 }

@@ -137,10 +137,10 @@ func (t *Tracker) line(e xLine, at time.Time) {
 		if p.Role == "assistant" && strings.TrimSpace(msg) != "" {
 			st.LastText = msg
 			st.log.Add(sessions.Entry{Role: sessions.RoleAssistant, Text: text.OneLine(msg, 900)})
-		} else if p.Role == "user" && !strings.HasPrefix(strings.TrimSpace(msg), "<") && !strings.HasPrefix(msg, "# AGENTS.md") {
+		} else if p.Role == "user" && Typed(msg) {
 			st.log.Add(sessions.Entry{Role: sessions.RoleUser, Text: text.OneLine(msg, 1200)})
 			st.UserAt = at
-			if !st.Open || st.Fresh {
+			if (!st.Open || st.Fresh) && OpensTurn(msg) {
 				// The message opens a turn, which starts with no last words of its own: a turn Codex closes with no
 				// agent message did not end on the words an earlier turn ended on, a question the message answered
 				// among them. A turn a subagent's message opens keeps them: nothing of the owner's answered them.
@@ -170,6 +170,22 @@ func (t *Tracker) line(e xLine, at time.Time) {
 	if e.Type == "response_item" && (agentActivity[p.Type] || p.Type == "message" && p.Role == "assistant") {
 		st.Fresh = false
 	}
+}
+
+// Typed reports a user-role message the tracker reads as typed by its user: not text Codex writes in its user's
+// role, which opens with "<" (its markup) or is its AGENTS.md instructions.
+func Typed(msg string) bool {
+	return !strings.HasPrefix(strings.TrimSpace(msg), "<") && !strings.HasPrefix(msg, "# AGENTS.md")
+}
+
+// Marker opens every message momentum types into a session (supervise.Marker).
+const Marker = "[momentum]"
+
+// OpensTurn reports a typed message that opens a turn of its user's when the agent did nothing in the turn before
+// it: any but momentum's own, which opens with its Marker. A resync answers nothing, so the turn after it keeps the
+// words the resync quoted, and its rule reads them again.
+func OpensTurn(msg string) bool {
+	return Typed(msg) && !strings.HasPrefix(strings.TrimSpace(msg), Marker)
 }
 
 // agentActivity are the items of a turn the agent made: a call and its output. A user message after one of them, or
