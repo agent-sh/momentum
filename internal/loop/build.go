@@ -291,6 +291,18 @@ func (s *Ship) returnWork(ctx context.Context, caseID, runDir string) (stays boo
 		return false, nil
 	}
 	work, named := s.workDir(caseID), p.Work
+	if _, err := os.Lstat(named); errors.Is(err, fs.ErrNotExist) {
+		// no tree is in runDir: an earlier move put it in the work directory and could not save the package, which then
+		// is all that is left to do, or it is gone (the next build makes it again, freshRunClone)
+		if _, err := os.Lstat(work); err != nil {
+			return false, nil
+		}
+		p.Work = work
+		if err := s.saveAuthorized(ctx, &p); err != nil {
+			return false, fmt.Errorf("its tree is in %s, but its package, which names %s, was not saved: %w", work, named, err)
+		}
+		return false, nil
+	}
 	if err := os.MkdirAll(filepath.Dir(work), 0o700); err != nil {
 		return true, fmt.Errorf("its tree stays in %s: %w", named, err)
 	}

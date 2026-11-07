@@ -11,6 +11,7 @@ import (
 
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 
 	"sort"
@@ -403,10 +404,16 @@ func (r *Runner) removeRunDirs(ctx context.Context, caseID, dir string, build bo
 	}
 }
 
-// sweepRuns removes the run directories that neither a run nor a hold's receipt names (store.LoopRunKnown), which a
-// pass that ended between a build's preparation and its reservation (a crash) leaves: a build tree a package names in one goes back to its case first, and a directory
-// whose tree cannot go back stays. A pass sweeps when it starts, under the loop's lock, before it prepares any run of
-// its own, so every run directory then is an earlier pass's.
+// runIDForm is the form of a run's id (newRunID): a run directory has it, and its host directory is the id between
+// "." and "-host" (HostDir).
+var runIDForm = regexp.MustCompile(`^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$`)
+
+// sweepRuns removes the run directories that neither a run naming its directory nor a hold's receipt names
+// (store.KnownLoopRunDirs), which a pass that ended between a build's preparation and its reservation (a crash) leaves:
+// a build tree a package names in one goes back to its case first, and a directory whose tree cannot go back stays. It
+// looks only at entries in a run id's form, and removes nothing when the store cannot say which runs it knows. A pass
+// sweeps when it starts, under the loop's lock, before it prepares any run of its own, so every run directory then is
+// an earlier pass's.
 func (r *Runner) sweepRuns(ctx context.Context) {
 	runs := filepath.Join(r.Dir, "runs")
 	entries, err := os.ReadDir(runs)
@@ -421,11 +428,21 @@ func (r *Runner) sweepRuns(ctx context.Context) {
 				continue
 			}
 		}
-		ids[id] = true
+		if runIDForm.MatchString(id) {
+			ids[id] = true
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	known, err := r.Store.KnownLoopRunDirs(ctx)
+	if err != nil {
+		r.logf("run directories: the store cannot say which runs it knows: %v", err)
+		return
 	}
 	for id := range ids {
-		if known, err := r.Store.LoopRunKnown(ctx, id); known || err != nil {
-			continue // a run or a hold's receipt names it, or the store cannot say
+		if known[id] {
+			continue
 		}
 		dir := filepath.Join(runs, id)
 		if r.Ship != nil {
@@ -1067,7 +1084,8 @@ func (r *Runner) reservePrepared(ctx context.Context, run store.LoopRun) (store.
 	run.Started = r.now()
 	why, err := r.affordable(ctx)
 	if err != nil || why != "" {
-		run.Status, run.Failure, run.Ended = store.RunRefused, firstOf(why, fmt.Sprint(err)), r.now()
+		// a refusal names no directory, so what its preparation left is the sweep's to remove (sweepRuns)
+		run.Status, run.Failure, run.Ended, run.Dir = store.RunRefused, firstOf(why, fmt.Sprint(err)), r.now(), ""
 		r.Store.PutLoopRun(ctx, run)
 		return run, run.Failure
 	}

@@ -310,13 +310,24 @@ func (s *Store) HoldLoopRun(ctx context.Context, r LoopRun) error {
 	return tx.Commit()
 }
 
-// LoopRunKnown says whether the store keeps a record of a run by its id: its row, or the receipt a hold left in its
-// stead (HoldLoopRun).
-func (s *Store) LoopRunKnown(ctx context.Context, id string) (bool, error) {
-	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM loop_runs WHERE id = ?) +
- (SELECT COUNT(*) FROM case_log WHERE action = ? AND actor = ?)`, id, loopHoldAction, "loop:"+id).Scan(&n)
-	return n > 0, err
+// KnownLoopRunDirs are the ids of the runs whose directories the store keeps a record of, read at once: a run whose
+// row names its directory, and a run whose row a hold left a receipt in place of (HoldLoopRun).
+func (s *Store) KnownLoopRunDirs(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM loop_runs WHERE dir <> ''
+ UNION SELECT substr(actor, 6) FROM case_log WHERE action = ? AND actor LIKE 'loop:%'`, loopHoldAction)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	known := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		known[id] = true
+	}
+	return known, rows.Err()
 }
 
 // FinishLoopRun ends a reservation and charges its canonical case in one transaction, exactly once.

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -140,14 +141,18 @@ func TestAHeldBuildPassesThePassBuildToTheNextFamily(t *testing.T) {
 	}
 }
 
-// A tight budget gives the build and another family's investigation turns: with room for one run a pass, the family
-// that builds and the family that investigates alternate, so neither waits behind the other for good.
-func TestATightBudgetAlternatesTheBuildAndAnInvestigation(t *testing.T) {
+// A tight budget gives its one run to the build while a case builds: with room for one run a pass, the family whose
+// case builds takes it each pass, and the other family investigates in a pass that builds nothing (here, the build is
+// held in the third).
+func TestATightBudgetGivesItsRoomToTheBuild(t *testing.T) {
 	r, cs := turnRunner(t, "owner-burden")
 	open := openCase(t, r.Store, "sessions", "marker-7f3a-open", 1)
 	r.Families = []string{"owner-burden", "sessions"}
 	r.Budgets.Day = 1.5 * r.Budgets.Run
-	for pass, build := range []bool{true, false, true} { // a third build would meet the stop rule
+	for pass, build := range []bool{true, true, false} {
+		if !build {
+			r.Ship.Gate.Busy = func(context.Context, string) (string, error) { return "marker-7f3a busy", nil }
+		}
 		done, err := r.Once(context.Background(), Options{})
 		if err != nil {
 			t.Fatal(err)
@@ -156,6 +161,67 @@ func TestATightBudgetAlternatesTheBuildAndAnInvestigation(t *testing.T) {
 		ran, _ := turnStep(done, open.ID, StepInvestigate)
 		if built != build || ran == build {
 			t.Fatalf("pass %d: built %v, investigated %v; want the build %v: %+v", pass+1, built, ran, build, done)
+		}
+	}
+}
+
+// The family whose turn it is to build takes the first place whatever the room, so a room that shrinks from pass to
+// pass (3, 2, then 1 run) still passes the build from the family that built and failed to the family that waits.
+func TestTheBuildTurnsFamilyBuildsWhateverTheRoom(t *testing.T) {
+	r, cs := turnRunner(t, "owner-burden", "sessions")
+	ctx := context.Background()
+	openCase(t, r.Store, "manual-work", "marker-7f3a-mw", 1)
+	openCase(t, r.Store, "blind-spots", "marker-7f3a-bs", 1)
+	r.Families = []string{"owner-burden", "sessions", "manual-work", "blind-spots"}
+	for _, kind := range []string{turnBuild, turnRun} {
+		if err := r.Store.SetLoopTurn(ctx, kind, "sessions", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	builders := []store.Case{cs[0], cs[1], cs[0]}
+	for pass, room := range []int{3, 2, 1} {
+		spent, err := r.Store.LoopSpend(ctx, time.Now().Add(-24*time.Hour), r.Budgets.Run)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Budgets.Day = spent + (float64(room)+0.5)*r.Budgets.Run
+		if got, _, err := r.room(ctx, 4); err != nil || got != room {
+			t.Fatalf("pass %d: the room is %d, want %d: %v", pass+1, got, room, err)
+		}
+		done, err := r.Once(ctx, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, other := builders[pass], cs[0]
+		if want.ID == cs[0].ID {
+			other = cs[1]
+		}
+		if built, why := turnStep(done, want.ID, StepBuild); !built {
+			t.Fatalf("pass %d (room %d): %s (%s) did not build: %q", pass+1, room, want.ID, want.Family, why)
+		}
+		if built, why := turnStep(done, other.ID, StepBuild); built || why != anotherBuild {
+			t.Fatalf("pass %d (room %d): %s (%s) built %v (%q) while the other built", pass+1, room, other.ID, other.Family, built, why)
+		}
+	}
+}
+
+// A family named twice, in the configuration or in the pass's options, is picked once.
+func TestAFamilyNamedTwiceIsPickedOnce(t *testing.T) {
+	r, _ := turnRunner(t)
+	for _, o := range []Options{{}, {Families: []string{"outside", "outside"}}} {
+		r.Families = []string{"outside", "outside"}
+		done, err := r.Once(context.Background(), o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		picked := 0
+		for _, d := range done {
+			if d.Family == "outside" {
+				picked++
+			}
+		}
+		if picked != 1 {
+			t.Fatalf("options %+v: the family named twice has %d steps, want 1: %+v", o, picked, done)
 		}
 	}
 }
@@ -295,6 +361,7 @@ func TestAFamilyWhoseBuildIsHeldInvestigatesInThePass(t *testing.T) {
 // are counted among the pass's steps.
 func TestAnUnreadableTurnLeavesThePassInConfiguredOrder(t *testing.T) {
 	r, cs := turnRunner(t, "owner-burden", "sessions")
+	openCase(t, r.Store, "sessions", "marker-7f3a-open", 1) // sessions investigates while its build waits: both turns move
 	db, err := sql.Open("sqlite", r.Store.Path())
 	if err != nil {
 		t.Fatal(err)
@@ -471,13 +538,30 @@ func runDirs(t *testing.T, r *Runner) []string {
 	return out
 }
 
-// A build whose place the budgets' room cannot reach is not prepared: it waits, with the budget that binds, and leaves
-// no run and nothing on disk.
-func TestABuildPastTheBudgetsRoomIsNotPrepared(t *testing.T) {
+// With room for one run, the build takes the first place: another family's investigation, ahead of it in the run
+// turn's order, is refused by the budget.
+func TestTheBuildTakesTheFirstPlace(t *testing.T) {
 	r, cs := turnRunner(t, "owner-burden")
 	open := openCase(t, r.Store, "sessions", "marker-7f3a-open", 1)
 	r.Families = []string{"sessions", "owner-burden"}
 	r.Budgets.Day = 1.5 * r.Budgets.Run
+	done, err := r.Once(context.Background(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	built, whyBuild := turnStep(done, cs[0].ID, StepBuild)
+	ran, why := turnStep(done, open.ID, StepInvestigate)
+	if !built || ran || !strings.Contains(why, "day budget") {
+		t.Fatalf("built %v (%q), investigated %v (%q): %+v", built, whyBuild, ran, why, done)
+	}
+}
+
+// A build with no room is not prepared: it waits, with the budget that binds, and leaves no run and nothing on disk.
+func TestABuildWithNoRoomIsNotPrepared(t *testing.T) {
+	r, cs := turnRunner(t, "owner-burden")
+	open := openCase(t, r.Store, "sessions", "marker-7f3a-open", 1)
+	r.Families = []string{"sessions", "owner-burden"}
+	r.Budgets.Day = 0.5 * r.Budgets.Run
 	ctx := context.Background()
 	done, err := r.Once(ctx, Options{})
 	if err != nil {
@@ -485,7 +569,7 @@ func TestABuildPastTheBudgetsRoomIsNotPrepared(t *testing.T) {
 	}
 	ran, _ := turnStep(done, open.ID, StepInvestigate)
 	built, why := turnStep(done, cs[0].ID, StepBuild)
-	if !ran || built || !strings.Contains(why, noRoom) || !strings.Contains(why, "day budget") {
+	if ran || built || !strings.Contains(why, noRoom) || !strings.Contains(why, "day budget") {
 		t.Fatalf("investigated %v, built %v (%q): %+v", ran, built, why, done)
 	}
 	live := ""

@@ -249,3 +249,23 @@ func TestAReservationWhoseReadFailsEndsItsRun(t *testing.T) {
 		t.Fatalf("the failed reservation left %v on disk", left)
 	}
 }
+
+// The pass's one clock reading for its budgets ends with the pass: a budget check after it counts back from the clock.
+func TestABudgetCheckAfterAPassCountsFromTheClock(t *testing.T) {
+	r, _ := turnRunner(t)
+	ctx := context.Background()
+	start := time.Now()
+	r.Now = func() time.Time { return start }
+	if _, err := r.Once(ctx, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	c := openCase(t, r.Store, "sessions", "marker-7f3a", 1)
+	if err := r.Store.PutLoopRun(ctx, store.LoopRun{ID: "marker-7f3a-spend", Case: c.ID, Family: c.Family, Step: StepInvestigate,
+		Started: start.Add(-time.Hour), Ended: start.Add(-time.Hour), Status: store.RunOK, USD: r.Budgets.Day}); err != nil {
+		t.Fatal(err)
+	}
+	r.Now = func() time.Time { return start.Add(25 * time.Hour) } // the day's spend left the window
+	if why, err := r.affordable(ctx); err != nil || why != "" {
+		t.Fatalf("a check a day after the pass counted from the pass's start: %q %v", why, err)
+	}
+}

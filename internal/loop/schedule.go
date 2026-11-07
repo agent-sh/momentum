@@ -7,7 +7,7 @@ type outcome int
 
 const (
 	runReserved outcome = iota // a run was reserved: it starts with the pass
-	runReady                   // a build was prepared: it is reserved in its family's place
+	runReady                   // a build was prepared: it is reserved first
 	runRecorded                // a run was recorded and ended unstarted (a refusal of the budgets, a failed preparation, an unreadable reservation)
 	// no run was recorded (a hold, inputs that could not be made, a pass that stops): the family's next case may run,
 	// but none after its ready build
@@ -17,7 +17,7 @@ const (
 // Why a family's build waits.
 const (
 	anotherBuild = "another case builds in this pass"   // the pass's one build is another family's
-	noRoom       = "no room for its build in this pass" // the families before it take the room the budgets leave
+	noRoom       = "no room for its build in this pass" // the budgets leave the pass no room
 )
 
 // planned is one step of a pass's plan: a family's case and what came of it, or why it waited.
@@ -33,32 +33,23 @@ type planned struct {
 // candidates come best first. turns name, by turnBuild and turnRun, the families after which the pass's build and its
 // runs take their turn. room is how many runs the budgets leave the pass.
 //
-// It is round-robin. Each family runs one case in its own place, in the run turn's order, so a pass with room for
-// fewer runs than families starts after the family whose run the last pass reserved first. Before any run is reserved,
-// the families whose best case builds, and whose place the room reaches, prepare their builds in the build turn's
-// order until one is ready; a family whose build is held tries its next build. A family whose place the room may not
-// reach prepares nothing then: in its place, if no build is ready and room is left, it prepares its builds there. A
-// family whose build waits for another's, or whose builds came to no run (a hold), runs its best case that builds
-// nothing instead, and its next one when that comes to no run. A family whose ready build is not reserved runs nothing
-// else, and no other case builds in the pass. No case is reserved twice, no ready build is left unreserved while room
-// is left, and a family named twice is one family.
+// It is round-robin. Before any run is reserved, the families whose best case builds prepare their builds in the build
+// turn's order until one is ready; a family whose build is held tries its next build. The family whose build is ready
+// takes the first place, so any room reaches it, and the others wait for it. Then each other family runs one case in
+// its own place, in the run turn's order, so a pass with room for fewer runs than families starts after the family
+// whose run (other than the build) the last pass reserved first. A family whose build waits for another's, or whose
+// builds came to no run (a hold), runs its best case that builds nothing instead, and its next one when that comes to
+// no run. With no room, no build is prepared. A family whose ready build is not reserved runs nothing else, and no
+// other case builds in the pass. No case is reserved twice, no ready build is left unreserved while room is left, and
+// a family named twice is one family.
 //
-// With the same room each pass and every ready build reserved, a family with a buildable case goes at most b-1 passes
-// without its build when the room reaches all m families with a case, b being the families with a buildable case, and
-// at most the larger of m-1 and 2(b-1) when it does not: a family the room does not reach when the build turn comes
-// to it loses that turn to the next family's build (TestPassPlansAreFairOverRandomFamilies).
+// With room for a run each pass and every ready build reserved, a family with a buildable case goes at most b-1 passes
+// without its build, b being the families with a buildable case (TestPassPlansAreFairOverRandomFamilies).
 //
 // It returns the steps, in the order taken, and the turns after the pass.
 func schedule(families []string, cands map[string][]candidate, turns map[string]string, room int, prepare, reserve func(fam string, c candidate) outcome) ([]planned, map[string]string) {
 	families = uniqueFamilies(families)
 	next := map[string]string{turnBuild: turns[turnBuild], turnRun: turns[turnRun]}
-	order := inTurn(families, turns[turnRun])
-	place := map[string]int{} // how many families before it in the run turn's order have a case to run
-	for _, fam := range order {
-		if len(cands[fam]) > 0 {
-			place[fam] = len(place)
-		}
-	}
 	builds, others := map[string][]candidate{}, map[string][]candidate{}
 	for _, fam := range families {
 		for _, c := range cands[fam] {
@@ -83,27 +74,26 @@ func schedule(families []string, cands map[string][]candidate, turns map[string]
 		return candidate{}, runNone
 	}
 	const (
-		famBuild    = iota + 1 // its build is ready: it is reserved in its place
-		famDone                // its build recorded a run: it runs nothing else
-		famInstead             // it runs its other cases
-		famDeferred            // its place the room may not reach: it prepares its builds there, if it may
+		famBuild   = iota + 1 // its build is ready: it is reserved first
+		famDone               // its build recorded a run: it runs nothing else
+		famInstead            // it runs its other cases
 	)
 	state := map[string]int{}
-	ready := map[string]candidate{}
-	built := false // a build is ready
+	building, ready := "", candidate{} // the family whose build is ready, and the build
 	for _, fam := range inTurn(families, turns[turnBuild]) {
 		switch {
 		case !builder(fam):
-		case built:
+		case building != "":
 			steps = append(steps, planned{fam: fam, cand: builds[fam][0], skipped: anotherBuild})
 			state[fam] = famInstead
-		case place[fam] >= room:
-			state[fam] = famDeferred
+		case room < 1:
+			steps = append(steps, planned{fam: fam, cand: builds[fam][0], skipped: noRoom})
+			state[fam] = famInstead
 		default:
 			c, out := prepareBuilds(fam)
 			switch out {
 			case runReady:
-				built, ready[fam], state[fam] = true, c, famBuild
+				building, ready, state[fam] = fam, c, famBuild
 			case runNone:
 				state[fam] = famInstead
 			default:
@@ -111,48 +101,27 @@ func schedule(families []string, cands map[string][]candidate, turns map[string]
 			}
 		}
 	}
-	first, reserved := "", 0
+	order := inTurn(families, turns[turnRun])
+	if building != "" {
+		order = append([]string{building}, slices.DeleteFunc(slices.Clone(order), func(fam string) bool { return fam == building })...)
+	}
+	first := "" // the first family to reserve a run other than the build: the run turn moves to it
 	tryOne := func(fam string, c candidate) outcome {
 		out := reserve(fam, c)
 		steps = append(steps, planned{fam: fam, cand: c, out: out})
-		if out == runReserved {
-			reserved++
-			if first == "" {
-				first = fam
-			}
-			if c.step == StepBuild {
-				next[turnBuild] = fam
-			}
+		switch {
+		case out != runReserved:
+		case c.step == StepBuild:
+			next[turnBuild] = fam
+		case first == "":
+			first = fam
 		}
 		return out
 	}
 	for _, fam := range order {
-		if len(cands[fam]) == 0 {
-			continue
-		}
-		if state[fam] == famDeferred {
-			switch {
-			case built:
-				steps = append(steps, planned{fam: fam, cand: builds[fam][0], skipped: anotherBuild})
-				state[fam] = famInstead
-			case reserved >= room:
-				steps = append(steps, planned{fam: fam, cand: builds[fam][0], skipped: noRoom})
-				state[fam] = famInstead
-			default:
-				c, out := prepareBuilds(fam)
-				switch out {
-				case runReady:
-					built, ready[fam], state[fam] = true, c, famBuild
-				case runNone:
-					state[fam] = famInstead
-				default:
-					state[fam] = famDone
-				}
-			}
-		}
 		switch state[fam] {
 		case famBuild:
-			tryOne(fam, ready[fam])
+			tryOne(fam, ready)
 		case famDone:
 		default:
 			for _, c := range others[fam] {
