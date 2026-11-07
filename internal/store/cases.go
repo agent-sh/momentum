@@ -1288,8 +1288,13 @@ func (s *Store) ResumeLate(ctx context.Context, id, signature string, first time
 
 // ResumedAt is when a case last resumed (its newest resumed line), or zero when it never did.
 func (s *Store) ResumedAt(ctx context.Context, id string) (time.Time, error) {
+	return s.LastActionAt(ctx, id, ActionResumed)
+}
+
+// LastActionAt is the time of a case's newest log line of one action, or zero when it has none.
+func (s *Store) LastActionAt(ctx context.Context, id, action string) (time.Time, error) {
 	var at sql.NullInt64
-	if err := s.db.QueryRowContext(ctx, `SELECT MAX(at) FROM case_log WHERE case_id = ? AND action = ?`, id, ActionResumed).Scan(&at); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT MAX(at) FROM case_log WHERE case_id = ? AND action = ?`, id, action).Scan(&at); err != nil {
 		return time.Time{}, err
 	}
 	if !at.Valid {

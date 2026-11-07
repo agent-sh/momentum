@@ -394,6 +394,11 @@ func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Re
 	inv.Binds, inv.Env = append(inv.Binds, binds...), env
 	res, err := r.Agent.RunOrFallback(ctx, inv)
 	res.InputSummary = manifest.Summary()
+	if errors.Is(err, ErrNoBedrock) {
+		// no Bedrock route (the broker's env file cannot be read, its relay cannot listen): the broker's, which the
+		// stop rule does not count, whatever a build would do
+		return stageFailure(res, "broker", err)
+	}
 	if err != nil {
 		return stageFailure(res, "build run", err)
 	}
@@ -592,8 +597,58 @@ func refusalStop(run store.LoopRun) bool {
 // build reads past them to the last refusal of its output.
 var hostStages = []string{"build prepare", "build inputs", "build toolchains", "build run", "build package", "build authority"}
 
-// lastBuildRefusal is why the host refused the case's newest build of this episode, for the next build's inputs
-// (refusal.md), or "" when the newest build was not refused for its own output.
+// actionPrepared is the case log line a package's preparation writes (Ship.prepare): it starts the package.
+const actionPrepared = "prepared"
+
+// buildSpan is the build runs a case's next build answers for, out of runs (newest first): those of its episode since
+// its current package was prepared, back to the newest that passed every stage, which ends it. A build that passed
+// every stage was proposed, so what was refused before it is behind the case, and a package this one replaced (a
+// withdrawn hand landing, a rolled-back change) was another change. The next build's refusal.md (lastBuildRefusal)
+// and the stop rule's match of a refusal (stopRuns) read only this span, so the two cannot drift apart.
+func buildSpan(ctx context.Context, st *store.Store, c store.Case, runs []store.LoopRun) ([]store.LoopRun, error) {
+	start, err := st.LastActionAt(ctx, c.ID, actionPrepared)
+	if err != nil {
+		return nil, err
+	}
+	var span []store.LoopRun
+	for _, run := range runs {
+		if run.Step != StepBuild || run.Status == store.RunRunning {
+			continue
+		}
+		if run.CaseEpisode != c.Episode || runAt(run).Before(start) || run.Status == store.RunOK {
+			break
+		}
+		span = append(span, run)
+	}
+	return span, nil
+}
+
+// stageText is the text a build's failure at its stage gave, from the stage's key on, or "" when its summary holds none.
+func stageText(run store.LoopRun) string {
+	i := strings.Index(run.Summary, run.Failure+": ")
+	if i < 0 {
+		return ""
+	}
+	return run.Summary[i:]
+}
+
+// hostFailure says a build failed at the host's hand, which tells it nothing of what it wrote: at a host stage, or
+// with a host error at a refusal stage (hostCause, which stageCause decided; a run kept before causes were tells by
+// its text, a refusal's starting with "refused").
+func hostFailure(run store.LoopRun) bool {
+	switch {
+	case slices.Contains(hostStages, run.Failure), run.Cause == hostCause:
+		return true
+	case run.Cause != "" || run.Failure == "build report" || !slices.Contains(refusalKeys, run.Failure):
+		return false
+	}
+	text := stageText(run)
+	return text != "" && !strings.HasPrefix(text[len(run.Failure)+2:], "refused")
+}
+
+// lastBuildRefusal is why the host refused the case's newest build that it answers for (buildSpan) for its own
+// output, for the next build's inputs (refusal.md), reading past the builds the host failed (hostFailure), or ""
+// when that build was not refused for its own output.
 func (r *Runner) lastBuildRefusal(ctx context.Context, c store.Case) (string, error) {
 	// only runs that ran and ended on their own: a reservation the budgets refused, or a run the host ended, says
 	// nothing of a build's output
@@ -601,31 +656,16 @@ func (r *Runner) lastBuildRefusal(ctx context.Context, c store.Case) (string, er
 	if err != nil {
 		return "", err
 	}
-	var since time.Time // a refusal of a package this one replaced (a withdrawn hand landing) tells it nothing
-	if r.Ship != nil {
-		if p, ok, err := r.Ship.Load(c.ID); err == nil && ok {
-			since = p.Created
-		}
+	span, err := buildSpan(ctx, r.Store, c, runs)
+	if err != nil {
+		return "", err
 	}
-	for _, run := range runs { // newest first
-		if run.Step != StepBuild || run.Status == store.RunRunning {
-			continue
+	for _, run := range span { // newest first
+		if hostFailure(run) {
+			continue // the host failed it: it says nothing of what the build wrote
 		}
-		if run.CaseEpisode == c.Episode && !run.Started.Before(since) && slices.Contains(hostStages, run.Failure) {
-			continue // the host's own stage failed: it says nothing of what the build wrote
-		}
-		if run.CaseEpisode != c.Episode || run.Started.Before(since) || run.Status != store.RunFailed || !slices.Contains(refusalKeys, run.Failure) {
-			return "", nil
-		}
-		text := run.Summary
-		i := strings.Index(text, run.Failure+": ")
-		if i < 0 {
-			return "", nil
-		}
-		text = text[i:]
-		// a host error of the stage (a network, a git or a gh failure) is no refusal of the build's output: the run's
-		// cause says so (stageCause), and a run kept before causes were tells by its text
-		if run.Cause == hostCause || run.Cause == "" && run.Failure != "build report" && !strings.HasPrefix(text[len(run.Failure)+2:], "refused") {
+		text := stageText(run)
+		if run.Status != store.RunFailed || !slices.Contains(refusalKeys, run.Failure) || text == "" {
 			return "", nil
 		}
 		for _, tail := range []string{" (relay: ", " (the relay refused ", " (untrusted harness diagnostics"} {

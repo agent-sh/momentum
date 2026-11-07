@@ -576,7 +576,7 @@ func (s *Ship) prepare(ctx context.Context, caseID, repoDir string, tip *repoTip
 		return Package{}, err
 	}
 	release()
-	return p, s.Store.CaseNote(cleanedNote(ctx), c.ID, "prepared", note, s.Actor)
+	return p, s.Store.CaseNote(cleanedNote(ctx), c.ID, actionPrepared, note, s.Actor)
 }
 
 // freshRunClone is used only before a run starts. No later host operation inspects this clone. It is a build tree

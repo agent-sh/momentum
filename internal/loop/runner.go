@@ -1050,8 +1050,9 @@ func (r *Runner) caseNoteOnce(ctx context.Context, id, action, detail string) er
 // resumed after a fix of its stop, when both failed the same way in the same step. A build refused for its own output
 // at a refusal stage fails the same way only for the same cause: each refusal's reason reaches the next build
 // (refusal.md), so refusals for different causes are a build making progress. The newest such refusal stops the case
-// on any earlier one there for its cause in that span, however many for other causes came between, so causes that
-// take turns stop too. A run kept before causes were has none, and a missing cause matches nothing, so such a run
+// on any earlier one there for its cause that its build answered for (buildSpan: of the current package, since the
+// newest build that passed every stage), however many for other causes came between, so causes that take turns stop
+// too. A run kept before causes were has none, and a missing cause matches nothing, so such a run
 // never starts a stop. A host stage, and a host error at a refusal stage (hostCause), stops on its key alone. The
 // runs are the newest and the earlier one it matched; ok is false when the rule does not hold.
 func stopRuns(ctx context.Context, st *store.Store, c store.Case) (runs []store.LoopRun, ok bool, err error) {
@@ -1087,8 +1088,12 @@ func stopRuns(ctx context.Context, st *store.Store, c store.Case) (runs []store.
 		if a.Cause == "" {
 			return nil, false, nil
 		}
-		for _, e := range runs[1:] {
-			if e.Step == a.Step && e.Failure == a.Failure && e.Cause == a.Cause {
+		span, err := buildSpan(ctx, st, c, runs)
+		if err != nil || len(span) == 0 || span[0].ID != a.ID {
+			return nil, false, err // a refusal of a package the case builds no more
+		}
+		for _, e := range span[1:] {
+			if e.Failure == a.Failure && e.Cause == a.Cause {
 				return []store.LoopRun{a, e}, true, nil
 			}
 		}
