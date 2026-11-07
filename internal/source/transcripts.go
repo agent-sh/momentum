@@ -19,6 +19,7 @@ import (
 
 	"github.com/agent-sh/momentum/internal/store"
 	"github.com/agent-sh/momentum/internal/toolresult"
+	"github.com/agent-sh/momentum/sessions"
 )
 
 // Transcripts reuses tacit's Claude Code, Codex, pi and Hermes readers and native
@@ -79,10 +80,6 @@ const (
 	headChars  = 160
 	tailChars  = 80
 )
-
-// Marker opens every message `momentum supervise` types into a session (supervise.Marker): on top of tacit's
-// attribution, a turn that is such a message, as momentum recorded sending it, is not the owner's.
-const Marker = "[momentum]"
 
 // skipWhy are the items not stored, by tacit's reason, with why: Codex's "[Recorded tool history]" message
 // replays calls and results that are already events of their own.
@@ -658,7 +655,7 @@ func (w *writer) events(ctx context.Context, parts []part) ([][]store.Event, int
 // texts this ingest read at its start is looked up again: a message typed while it runs.
 func (w *writer) ours(ctx context.Context, e evidence.Event, raw string) bool {
 	raw = strings.Join(strings.Fields(raw), " ")
-	if e.Kind != evidence.KindOwnerText || !strings.HasPrefix(raw, Marker) {
+	if e.Kind != evidence.KindOwnerText || !strings.HasPrefix(raw, sessions.Marker) {
 		return false
 	}
 	w.sentMu.Lock()

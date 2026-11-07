@@ -408,6 +408,57 @@ func abortedBy(from, to string, after, latest time.Time) time.Time {
 	}
 }
 
+// codexTurnEnd is how the turn that a Codex session's last record (from) belongs to ended, read forward in the
+// rollout after that record while the transcript is there: task_complete or turn_aborted with its time, when the
+// last of Codex's turn events up to until closed the turn, as its live tracker reads them; "" when the transcript is
+// gone, or the turn is still open by then (none came, or a task_started after it opened another).
+func codexTurnEnd(from string, after, until time.Time) (string, time.Time) {
+	path, off, ok := refPlace(from)
+	if !ok {
+		return "", time.Time{}
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", time.Time{}
+	}
+	defer f.Close()
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
+		return "", time.Time{}
+	}
+	rd := bufio.NewReaderSize(io.LimitReader(f, requestLimit), 1<<16)
+	if _, err := rd.ReadBytes('\n'); err != nil { // the record itself
+		return "", time.Time{}
+	}
+	end, endAt := "", time.Time{}
+	for {
+		raw, err := rd.ReadBytes('\n')
+		if len(raw) > 0 && strings.Contains(string(raw), `"event_msg"`) {
+			var e struct {
+				Timestamp string `json:"timestamp"`
+				Type      string `json:"type"`
+				Payload   struct {
+					Type string `json:"type"`
+				} `json:"payload"`
+			}
+			uerr := json.Unmarshal(raw, &e)
+			at, perr := time.Parse(time.RFC3339Nano, e.Timestamp)
+			switch {
+			case uerr != nil || e.Type != "event_msg":
+			case perr != nil || at.Before(after):
+			case !at.Before(until):
+				return end, endAt
+			case e.Payload.Type == "task_complete", e.Payload.Type == "turn_aborted":
+				end, endAt = e.Payload.Type, at
+			case e.Payload.Type == "task_started":
+				end, endAt = "", time.Time{}
+			}
+		}
+		if err != nil {
+			return end, endAt
+		}
+	}
+}
+
 // replayWake is a self-paced loop's pending wakeup, as the session layer reads it.
 type replayWake struct {
 	at, set time.Time
@@ -520,6 +571,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 	var owes time.Time           // the model owes its reply since: an input, or the result of a turn's last call
 	var owesRef string           // where the transcript is read from for its request: the event before the one that owes
 	var lastRef string           // the place of the event before this one
+	var lastSeen string          // the place of the last event read, one passed over among them
 	pending := map[string]bool{} // calls without a result yet
 	lastMainUser := false
 	stopOf := func(at time.Time, nextRef string) Stop {
@@ -597,6 +649,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		if harness == "" {
 			harness = e.Harness
 		}
+		lastSeen = e.Ref
 		r := role(e, m)
 		if why, _ := m["why"].(string); harness == "codex" && r == "agent" && why != "" && why != "assistant" {
 			// a subagent's message to the session, or an agent's text in the owner's turn: Codex's live tracker reads
@@ -888,6 +941,17 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		lastRef = e.Ref
 	}
 	if !prevAt.IsZero() {
+		owed := prevRole == "result" || prevRole == "owner" || prevRole == "self" || prevRole == "compaction" || prevRole == "momentum"
+		if carried == "" && harness == "codex" && (owed || prevRole == "call" && len(pending) > 0) {
+			// the store marks a Codex turn's end on the record after it, and none came after the last record: the
+			// rollout's own end of the turn after it, while the transcript is there, as the live tracker reads it
+			if end, at := codexTurnEnd(lastSeen, prevAt, until); end != "" {
+				carried, pending = end, map[string]bool{}
+				if end == "turn_aborted" && !aborted {
+					prevAt = at // the live tracker keeps the turn open until its abort
+				}
+			}
+		}
 		if carried != "" {
 			prevPrior = carried // a record passed over after the last stop said its turn was over
 		}

@@ -3,6 +3,7 @@ package supervise
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -305,9 +306,6 @@ const codexPromise = "The soak is running. I'll report when it finishes."
 // momentum's own resync opens no turn of its user's: a turn Codex closes after it with no agent message keeps the
 // words the resync quoted, so the promise rule tries again, and after its second try a case opens.
 func TestALiveCodexResyncThatGetsNoReplyIsTriedAgainThenACase(t *testing.T) {
-	if codex.Marker != Marker {
-		t.Fatalf("the tracker knows momentum's messages by %q, momentum types %q", codex.Marker, Marker)
-	}
 	for _, withCall := range []bool{false, true} {
 		r := newCodexRollout(t, t.TempDir())
 		r.meta()
@@ -365,8 +363,8 @@ func TestTheReplayOfAResyncThatGetsNoReplyKeepsItsWords(t *testing.T) {
 }
 
 // Only the owner's input opens a Codex turn in the replay, and only one the live tracker reads as typed: not the
-// session's own input (a notification), and not a message that opens with "<", which the live tracker reads as
-// Codex's own markup.
+// session's own input (a notification), and not a message that opens with a tag, which the live tracker reads as
+// Codex's own markup. One of his that opens with "<" and no tag is typed, and opens the turn.
 func TestACodexInputTheLiveTrackerDoesNotReadAsTypedOpensNoTurn(t *testing.T) {
 	st := testStore(t)
 	const asked = "I switched the sink. Can you hear it now?"
@@ -375,14 +373,23 @@ func TestACodexInputTheLiveTrackerDoesNotReadAsTypedOpensNoTurn(t *testing.T) {
 	self.owner(40*time.Minute, "status?", "task_complete")
 	selfNext := self.at
 	self.codex().put(st)
+	tagged := newTimeline(t, "codex-tag").owner(0, "fix the sound output", "").say(time.Minute, asked).
+		owner(20*time.Minute, tag("environment_context")+"cwd /w/audio"+closing("environment_context"), "task_complete")
+	tagged.owner(40*time.Minute, "status?", "task_complete")
+	taggedNext := tagged.at
+	tagged.codex().put(st)
 	angle := newTimeline(t, "codex-angle").owner(0, "fix the sound output", "").say(time.Minute, asked).
 		owner(20*time.Minute, "<= 5 retries is enough, keep going", "task_complete")
 	angle.owner(40*time.Minute, "status?", "task_complete")
 	angleNext := angle.at
 	angle.codex().put(st)
-	for session, at := range map[string]time.Time{"codex-self": selfNext, "codex-angle": angleNext} {
-		if got := replayed(t, st, session, at); got.Point.Stop.Words != asked {
-			t.Fatalf("%s: the stop after the silent turn reads %q (%s)", session, got.Point.Stop.Words, Why(got))
+	for session, at := range map[string]time.Time{"codex-self": selfNext, "codex-tag": taggedNext, "codex-angle": angleNext} {
+		want := asked
+		if session == "codex-angle" {
+			want = ""
+		}
+		if got := replayed(t, st, session, at); got.Point.Stop.Words != want {
+			t.Fatalf("%s: the stop after the silent turn reads %q, want %q (%s)", session, got.Point.Stop.Words, want, Why(got))
 		}
 	}
 }
@@ -442,5 +449,115 @@ func TestASubagentsMessageDuringACallIsPassedOver(t *testing.T) {
 	got := replayed(t, ingested(t, home), codexTurnID, nudge)
 	if Why(liveRes) != "working: a tool call was running" || Why(got) != Why(liveRes) || !got.Point.Stop.At.Equal(called) {
 		t.Fatalf("live %q, replay %q at %v (the call at %v)", Why(liveRes), Why(got), got.Point.Stop.At, called)
+	}
+}
+
+// lastStop is a session's last replayed stop, the one nothing came after in the window.
+func lastStop(t *testing.T, st *store.Store, session string) Result {
+	t.Helper()
+	_, rs := replayAll(t, st)
+	for _, r := range rs {
+		if r.Point.Session == session && r.Point.Next.Kind == "none" {
+			return r
+		}
+	}
+	t.Fatalf("no last stop of %s", session)
+	return Result{}
+}
+
+// A Codex session's last records are a call's output, maybe a subagent's message after it, then Codex closes the
+// turn with no agent message; or its user aborts the turn while the call runs. The store marks a turn's end on the
+// record after it, and none came: the replay reads the end from the rollout, so its last stop is over, as the live
+// tracker reads it. A turn closed by Codex stops at its last record; an aborted one at the abort.
+func TestTheLastCodexTurnReadsOverWhenNoRecordCameAfterItsEnd(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		end  func(r *codexRollout) (stopAt, ended time.Time)
+	}{
+		{"a subagent's message after the output", func(r *codexRollout) (time.Time, time.Time) {
+			out := r.call(time.Minute, "c1")
+			r.line(time.Second, "response_item", map[string]any{"type": "agent_message", "id": "m1", "author": "worker", "recipient": "main",
+				"content": []any{map[string]any{"type": "input_text", "text": "The worker finished the build."}}})
+			return out, r.completed(time.Second, "")
+		}},
+		{"the output last", func(r *codexRollout) (time.Time, time.Time) {
+			out := r.call(time.Minute, "c1")
+			return out, r.completed(time.Second, "")
+		}},
+		{"an abort while the call runs", func(r *codexRollout) (time.Time, time.Time) {
+			r.line(time.Minute, "response_item", map[string]any{"type": "function_call", "name": "exec_command", "call_id": "c1", "arguments": `{"cmd":"sleep 600"}`})
+			at := r.line(time.Minute, "event_msg", map[string]any{"type": "turn_aborted", "reason": "interrupted"})
+			return at, at
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			home := codexHome(t)
+			r := newCodexRollout(t, home)
+			r.meta()
+			r.started(time.Second)
+			r.user(0, "run the soak")
+			stopAt, ended := c.end(r)
+			_, stop, res := live(t, r.path, ended)
+			got := lastStop(t, ingested(t, home), codexTurnID)
+			if s := got.Point.Stop; s.Working || s.Phase != sessions.Idle || !s.At.Equal(stopAt) || stop.Working {
+				t.Fatalf("replay %s (working %v) at %v, want idle at %v: %q; live %q", s.Phase, s.Working, s.At, stopAt, Why(got), Why(res))
+			}
+		})
+	}
+}
+
+// Agent text the store cuts from the owner's own Codex message (an agent's words he pasted, beside his own) sits
+// next to his text in that record. The replay passes over it, as the live tracker reads his message whole: the turn
+// he opened has no words of its own when Codex closes it with no agent message.
+func TestAgentTextBesideTheOwnersCodexTextIsPassedOver(t *testing.T) {
+	st := testStore(t)
+	next := map[string]time.Time{}
+	for i, why := range []string{"agent text in the owner's turn", "cut from the owner's turn"} {
+		session := fmt.Sprintf("codex-beside-%d", i)
+		b := newTimeline(t, session).owner(0, "fix the sound output", "").say(time.Minute, codexAsked).
+			owner(5*time.Minute, "the log says this, fix it", "task_complete").
+			add(0, "agent_text", store.ActorAgent, "", "Error: the device is busy.", fmt.Sprintf(`{"input_kind":"typed","prior":"task_complete","why":%q}`, why))
+		b.owner(5*time.Minute, ".", "task_complete")
+		next[session] = b.at
+		b.codex().put(st)
+	}
+	for session, at := range next {
+		if got := replayed(t, st, session, at); got.Point.Stop.Words != "" {
+			t.Fatalf("%s: the turn the owner opened ends on %q (%s)", session, got.Point.Stop.Words, Why(got))
+		}
+	}
+}
+
+// tag is an opening tag of Codex's markup by its name, and closing its closing tag, built at run time.
+func tag(name string) string     { return "<" + name + ">" }
+func closing(name string) string { return "</" + name + ">" }
+
+// Only a tag's shape is Codex's markup. A message its user types that opens with "<" and no tag is typed: it opens
+// the turn, which Codex closes with no agent message, so the stop is not the question before it, and it shows him at
+// the session. A message that opens with a tag is Codex's: the question stays, and so does his last time there.
+func TestOnlyATagIsCodexMarkup(t *testing.T) {
+	for _, c := range []struct {
+		msg   string
+		typed bool
+	}{
+		{"<= 5 retries is enough, keep going", true},
+		{"<-- that one, revert it", true},
+		{tag("environment_context") + "cwd /w/audio" + closing("environment_context"), false},
+		{"\n" + tag("image name=[Image #1]") + closing("image"), false},
+	} {
+		r := newCodexRollout(t, t.TempDir())
+		r.asked()
+		asked := r.at
+		r.started(5 * time.Minute)
+		at := r.user(0, c.msg)
+		ended := r.completed(2*time.Second, "")
+		s, stop, _ := live(t, r.path, ended)
+		want, wantAt := Words(codexAsked), asked.Add(-time.Minute)
+		if c.typed {
+			want, wantAt = "", at
+		}
+		if stop.Words != want || !s.UserAt.Equal(wantAt) {
+			t.Fatalf("%q: the stop reads %q and he was last there at %v, want %q and %v", c.msg, stop.Words, s.UserAt, want, wantAt)
+		}
 	}
 }

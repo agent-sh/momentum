@@ -6,6 +6,7 @@ package codex
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -173,19 +174,21 @@ func (t *Tracker) line(e xLine, at time.Time) {
 }
 
 // Typed reports a user-role message the tracker reads as typed by its user: not text Codex writes in its user's
-// role, which opens with "<" (its markup) or is its AGENTS.md instructions.
+// role, which opens with a tag of its markup or is its AGENTS.md instructions. A message its user typed may open
+// with "<" too ("<= 5 retries"): only a tag's shape is markup, a name after the "<" and the ">" that closes it on
+// the same line.
 func Typed(msg string) bool {
-	return !strings.HasPrefix(strings.TrimSpace(msg), "<") && !strings.HasPrefix(msg, "# AGENTS.md")
+	return !markupTag.MatchString(msg) && !strings.HasPrefix(msg, "# AGENTS.md")
 }
 
-// Marker opens every message momentum types into a session (supervise.Marker).
-const Marker = "[momentum]"
+// markupTag is an opening tag at the start of a message: "<", a name, maybe attributes, then ">".
+var markupTag = regexp.MustCompile(`^\s*<[A-Za-z][\w.:-]*(\s[^<>\n]*)?>`)
 
 // OpensTurn reports a typed message that opens a turn of its user's when the agent did nothing in the turn before
-// it: any but momentum's own, which opens with its Marker. A resync answers nothing, so the turn after it keeps the
-// words the resync quoted, and its rule reads them again.
+// it: any but momentum's own, which opens with its marker (sessions.Marker). A resync answers nothing, so the turn
+// after it keeps the words the resync quoted, and its rule reads them again.
 func OpensTurn(msg string) bool {
-	return Typed(msg) && !strings.HasPrefix(strings.TrimSpace(msg), Marker)
+	return Typed(msg) && !strings.HasPrefix(strings.TrimSpace(msg), sessions.Marker)
 }
 
 // agentActivity are the items of a turn the agent made: a call and its output. A user message after one of them, or

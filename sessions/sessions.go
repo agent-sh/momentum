@@ -40,6 +40,10 @@ const (
 // Order is the order a board lists phases in: what needs its owner first.
 var Order = map[Phase]int{NeedsYou: 0, Idle: 1, Working: 2, Background: 3, Scheduled: 4, Done: 5}
 
+// Marker opens every message `momentum supervise` types into a session. It is the one copy: supervision types it,
+// the transcripts source knows momentum's turns by it, and a harness's tracker passes over a turn it opens.
+const Marker = "[momentum]"
+
 // AskKind says what a pending ask is.
 type AskKind string
 

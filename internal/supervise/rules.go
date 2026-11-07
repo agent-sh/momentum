@@ -38,7 +38,7 @@ const (
 )
 
 // Marker opens every message momentum types, so the session, the owner and the evidence can tell it from his.
-const Marker = "[momentum]"
+const Marker = sessions.Marker
 
 // Stop is a session at a point where it stopped, with the facts the rules read.
 type Stop struct {
