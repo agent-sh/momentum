@@ -151,7 +151,7 @@ func TestAnOrphanIsTakenOnlyWhenItsRecordsTakerIsGone(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				recorded = lockHolder{other.Process.Pid, started + 1} // the taker that had the number started earlier
+				recorded = lockHolder{other.Process.Pid, started - 1} // the taker that had the number started earlier
 			case "a taker not yet reaped":
 				ended := exec.Command("sleep", "0")
 				if err := ended.Start(); err != nil {
@@ -208,9 +208,9 @@ func TestAnOrphanIsTakenOnlyWhenItsRecordsTakerIsGone(t *testing.T) {
 // takerChild marks the process of its own that TestATakerReadsItsStatusAgainAfterAFailedRead runs in.
 const takerChild = "MOMENTUM_TEST_TAKER_CHILD"
 
-// A taker whose read of its own status failed (no descriptor was free) reads it again at the next lock it takes: a
-// failed read is never kept, so a lock taken once /proc can be read names its taker. The check runs in a process of its
-// own, whose first read is the one that fails.
+// A taker whose read of its own status failed (no descriptor was free) reads it again at the next lock it takes or call
+// it records: a failed read is never kept, so a lock taken once /proc can be read names its taker. The check runs in a
+// process of its own, whose first read is the one that fails.
 func TestATakerReadsItsStatusAgainAfterAFailedRead(t *testing.T) {
 	if os.Getenv(takerChild) == "" {
 		child := exec.Command(os.Args[0], "-test.run=^TestATakerReadsItsStatusAgainAfterAFailedRead$", "-test.v")

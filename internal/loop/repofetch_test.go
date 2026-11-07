@@ -299,6 +299,27 @@ func comesTrue(d time.Duration, ok func() bool) bool {
 	return ok()
 }
 
+// noHTTPS says why Git cannot make an https call here, or "" when it can: Git has no https helper, or the helper has no
+// CA certificates to load, as in the loop's build sandbox, which mounts no /etc/ssl. Either fails at once, before the
+// call reaches a server. Only those two failures count, each by the words Git or curl prints for it: any other failure
+// is the test's to report.
+func noHTTPS(t *testing.T) string {
+	t.Helper()
+	port, _ := stalledListener(t, 0) // a server that closes each connection at once, so a call that can start ends
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "ls-remote", fmt.Sprintf("https://127.0.0.1:%d/x.git", port), "HEAD")
+	cmd.Dir, cmd.Env = t.TempDir(), GitEnv()
+	out, _ := cmd.CombinedOutput()
+	switch {
+	case strings.Contains(string(out), "'remote-https' is not a git command"):
+		return "Git has no https helper here"
+	case strings.Contains(string(out), "Problem with the SSL CA cert"): // curl's words for CURLE_SSL_CACERT_BADFILE
+		return "Git's https helper has no CA certificates to load here"
+	}
+	return ""
+}
+
 // A remote call ends at its deadline, though its ssh or https helper waits on a server that never answers, or ignores
 // SIGTERM: the whole process group goes, the helper with it, and the error says which deadline ended the call.
 func TestARemoteCallEndsAtItsDeadline(t *testing.T) {
@@ -318,6 +339,9 @@ func TestARemoteCallEndsAtItsDeadline(t *testing.T) {
 			pidFile := filepath.Join(t.TempDir(), "pid")
 			switch name {
 			case "https fetch":
+				if why := noHTTPS(t); why != "" {
+					t.Skip(why)
+				}
 				url = fmt.Sprintf("https://127.0.0.1:%d/x.git", port)
 			case "an ssh that ignores SIGTERM":
 				bin := t.TempDir()

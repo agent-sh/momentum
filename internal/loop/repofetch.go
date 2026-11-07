@@ -637,7 +637,7 @@ var taker atomic.Pointer[lockHolder]
 
 // thisTaker is this process as a lock's taker, from /proc: the zero one while it cannot be read, and a lock whose
 // record names no taker is never taken from its group (takeOrphan). Only a read that succeeds is kept: one that fails
-// (no descriptor free, say) is tried again at the next lock taken.
+// (no descriptor free, say) is tried again at the next lock taken or call recorded (recordHolder).
 func thisTaker() lockHolder {
 	if h := taker.Load(); h != nil {
 		return *h
