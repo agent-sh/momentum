@@ -17,6 +17,13 @@ CREATE TABLE IF NOT EXISTS request_checks (id INTEGER PRIMARY KEY, request TEXT 
 
 var requestTableNames = []string{"request_checks"}
 
+// requestIndexes find a request's checks by its id, or by the start of its id.
+const requestIndexes = `
+CREATE INDEX IF NOT EXISTS request_checks_request ON request_checks(request);
+`
+
+var requestIndexNames = []string{"request_checks_request"}
+
 // RequestCheck is the owner's check of one result of a request. Undone is when he undid it; zero while it stands.
 type RequestCheck struct {
 	Request string
@@ -45,15 +52,11 @@ func (s *Store) UndoRequestCheck(ctx context.Context, ids []string, at time.Time
 		return RequestCheck{}, err
 	}
 	defer tx.Rollback()
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		args[i] = id
-	}
 	var row int64
 	var c RequestCheck
 	var ms int64
 	err = tx.QueryRowContext(ctx, `SELECT id, request, result, at FROM request_checks WHERE undone = 0 AND request IN (?`+
-		strings.Repeat(",?", len(ids)-1)+`) ORDER BY at DESC, id DESC LIMIT 1`, args...).Scan(&row, &c.Request, &c.Result, &ms)
+		strings.Repeat(",?", len(ids)-1)+`) ORDER BY at DESC, id DESC LIMIT 1`, anys(ids)...).Scan(&row, &c.Request, &c.Result, &ms)
 	if errors.Is(err, sql.ErrNoRows) {
 		return RequestCheck{}, ErrNoCheck
 	}
@@ -67,17 +70,23 @@ func (s *Store) UndoRequestCheck(ctx context.Context, ids []string, at time.Time
 	return c, tx.Commit()
 }
 
-// RequestChecks are the checks of any of ids, oldest first.
-func (s *Store) RequestChecks(ctx context.Context, ids []string) ([]RequestCheck, error) {
-	if len(ids) == 0 {
+// RequestChecks are the checks of any of ids, and of every id that starts with one of prefixes and is n bytes
+// longer, oldest first.
+func (s *Store) RequestChecks(ctx context.Context, ids, prefixes []string, n int) ([]RequestCheck, error) {
+	var where []string
+	var args []any
+	if len(ids) > 0 {
+		where, args = append(where, `request IN (?`+strings.Repeat(",?", len(ids)-1)+`)`), anys(ids)
+	}
+	for _, p := range prefixes {
+		where = append(where, `(request >= ? AND request < ? AND length(request) = ?)`)
+		args = append(args, p, p+"~", len(p)+n)
+	}
+	if len(where) == 0 {
 		return nil, nil
 	}
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		args[i] = id
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT request, result, at, undone FROM request_checks WHERE request IN (?`+
-		strings.Repeat(",?", len(ids)-1)+`) ORDER BY at, id`, args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT request, result, at, undone FROM request_checks WHERE `+strings.Join(where, " OR ")+
+		` ORDER BY at, id`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -98,63 +107,131 @@ func (s *Store) RequestChecks(ctx context.Context, ids []string) ([]RequestCheck
 	return out, rows.Err()
 }
 
-// ThreadsSince are the sessions with transcript events since a time.
-func (s *Store) ThreadsSince(ctx context.Context, since time.Time) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT session FROM events WHERE ts >= ? AND source = ? AND session != ''
-	  ORDER BY session`, since.UnixMilli(), Transcripts)
+func anys(ss []string) []any {
+	out := make([]any, len(ss))
+	for i, s := range ss {
+		out[i] = s
+	}
+	return out
+}
+
+// strings1 reads a query's one text column.
+func strings1(rows *sql.Rows, err error) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []string
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var v string
+		if err := rows.Scan(&v); err != nil {
 			return nil, err
 		}
-		out = append(out, id)
+		out = append(out, v)
 	}
 	return out, rows.Err()
 }
 
-// ThreadsByPrefix are the sessions with transcript events whose id is prefix or starts with it, at most two.
+// ThreadsSince are the sessions with transcript events since a time. The time's index serves it (+source keeps
+// the planner off the source's, which reads every event of the source).
+func (s *Store) ThreadsSince(ctx context.Context, since time.Time) ([]string, error) {
+	return strings1(s.db.QueryContext(ctx, `SELECT DISTINCT session FROM events WHERE ts >= ? AND +source = ? AND session != ''
+	  ORDER BY session`, since.UnixMilli(), Transcripts))
+}
+
+// ThreadsByPrefix are the sessions with transcript events whose id is prefix or starts with it, at most two. The
+// session's index serves it.
 func (s *Store) ThreadsByPrefix(ctx context.Context, prefix string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT session FROM events WHERE session >= ? AND session < ? AND source = ?
-	  ORDER BY session LIMIT 2`, prefix, prefix+"\uffff", Transcripts)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		out = append(out, id)
-	}
-	return out, rows.Err()
+	return strings1(s.db.QueryContext(ctx, `SELECT DISTINCT session FROM events WHERE session >= ? AND session < ? AND +source = ?
+	  ORDER BY session LIMIT 2`, prefix, prefix+"\uffff", Transcripts))
 }
 
 // ThreadFirst is when a session's first transcript event happened; ok is false for a session with none.
 func (s *Store) ThreadFirst(ctx context.Context, session string) (time.Time, bool, error) {
 	var ms sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT MIN(ts) FROM events WHERE session = ? AND source = ?`, session, Transcripts).Scan(&ms)
+	err := s.db.QueryRowContext(ctx, `SELECT MIN(ts) FROM events INDEXED BY events_session WHERE session = ? AND source = ?`, session, Transcripts).Scan(&ms)
 	if err != nil || !ms.Valid {
 		return time.Time{}, false, err
 	}
 	return time.UnixMilli(ms.Int64), true, nil
 }
 
-// requestKinds are the kinds a request is read from: the turns, the replies, the calls and their results.
-var requestKinds = []string{"owner_text", "agent_text", "tool_call", "tool_result"}
+// Span is when an agent of a session (its main thread: "") did its first and last thing there.
+type Span struct {
+	Agent       string
+	First, Last time.Time
+}
 
-// ThreadEvents passes a session's transcript events of the kinds a request reads, its subagents' among them,
-// oldest first, to fn, one at a time: a long session is never held whole.
-func (s *Store) ThreadEvents(ctx context.Context, session string, fn func(Event) error) error {
+const threadSpansSQL = `SELECT agent, MIN(ts), MAX(ts) FROM events INDEXED BY events_session WHERE session = ? AND source = ?
+  GROUP BY agent ORDER BY agent`
+
+// ThreadSpans are a session's agents' spans in its transcript events, its main thread's among them. The reads of
+// one session name the session's index: for a GROUP BY, SQLite would otherwise read every transcript event by
+// the source's.
+func (s *Store) ThreadSpans(ctx context.Context, session string) ([]Span, error) {
+	rows, err := s.db.QueryContext(ctx, threadSpansSQL, session, Transcripts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Span
+	for rows.Next() {
+		var sp Span
+		var first, last int64
+		if err := rows.Scan(&sp.Agent, &first, &last); err != nil {
+			return nil, err
+		}
+		sp.First, sp.Last = time.UnixMilli(first), time.UnixMilli(last)
+		out = append(out, sp)
+	}
+	return out, rows.Err()
+}
+
+// ThreadParentMeta is the meta of a session's first main-thread event that names a parent session; "" for none.
+func (s *Store) ThreadParentMeta(ctx context.Context, session string) (string, error) {
+	var meta string
+	err := s.db.QueryRowContext(ctx, `SELECT meta FROM events INDEXED BY events_session WHERE session = ? AND source = ? AND agent = ''
+	  AND instr(meta, '"parent":"') > 0 ORDER BY ts LIMIT 1`, session, Transcripts).Scan(&meta)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return meta, err
+}
+
+// ThreadRead is what a request reads of a session's transcript events: its main thread's text (the turns, the
+// replies, what was cut from a turn), every call and result of the Writers, and the calls of the Shells whose text
+// holds one of CallMarks with their results that hold one of ResultMarks. Tool names are compared in lower case.
+type ThreadRead struct {
+	Writers, Shells        []string
+	CallMarks, ResultMarks []string
+}
+
+// ThreadEvents passes a session's transcript events that read selects, its subagents' among them, oldest first,
+// to fn, one at a time: a long session is never held whole, and what no request reads stays in the database.
+func (s *Store) ThreadEvents(ctx context.Context, session string, read ThreadRead, fn func(Event) error) error {
+	in := func(names []string) string {
+		if len(names) == 0 {
+			return "('')"
+		}
+		return "(?" + strings.Repeat(",?", len(names)-1) + ")"
+	}
+	marks := func(ms []string) string {
+		if len(ms) == 0 {
+			return "0"
+		}
+		return "(" + strings.TrimSuffix(strings.Repeat("instr(summary, ?) > 0 OR ", len(ms)), " OR ") + ")"
+	}
+	args := []any{session, Transcripts}
+	args = append(args, anys(read.Writers)...)
+	args = append(append(args, anys(read.Shells)...), anys(read.CallMarks)...)
+	args = append(append(args, anys(read.Shells)...), anys(read.ResultMarks)...)
 	rows, err := s.db.QueryContext(ctx, `SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
-	  tool, summary, meta, ref, heuristic, experiment FROM events WHERE session = ? AND source = ? AND kind IN (?,?,?,?)
-	  ORDER BY ts, source_key`, session, Transcripts, requestKinds[0], requestKinds[1], requestKinds[2], requestKinds[3])
+	  tool, summary, meta, ref, heuristic, experiment FROM events INDEXED BY events_session WHERE session = ? AND source = ? AND (
+	    (kind IN ('owner_text', 'agent_text') AND (agent = '' OR agent = session))
+	    OR (kind IN ('tool_call', 'tool_result') AND lower(tool) IN `+in(read.Writers)+`)
+	    OR (kind = 'tool_call' AND lower(tool) IN `+in(read.Shells)+` AND `+marks(read.CallMarks)+`)
+	    OR (kind = 'tool_result' AND lower(tool) IN `+in(read.Shells)+` AND `+marks(read.ResultMarks)+`))
+	  ORDER BY ts, source_key`, args...)
 	if err != nil {
 		return err
 	}
@@ -184,14 +261,44 @@ func (s *Store) OwnerTurnsBetween(ctx context.Context, from, through time.Time) 
 		string(ActorOwner)))
 }
 
-// LastPhase is a session's newest event of source sessions: the last change a sessions run saw. ok is false when
-// none saw it.
-func (s *Store) LastPhase(ctx context.Context, session string) (Event, bool, error) {
-	evs, err := scanEvents(s.db.QueryContext(ctx, `SELECT source, source_key, ts, session, agent, harness, model, cwd, actor,
-	  kind, tool, summary, meta, ref, heuristic, experiment FROM events WHERE session = ? AND source = ?
-	  ORDER BY ts DESC, source_key DESC LIMIT 1`, session, Sessions))
-	if err != nil || len(evs) == 0 {
-		return Event{}, false, err
+// TextsHolding are the main-thread texts of the transcripts since a time that hold a text (a handoff's line),
+// oldest first. The kind's index serves it.
+func (s *Store) TextsHolding(ctx context.Context, since time.Time, text string) ([]Event, error) {
+	return scanEvents(s.db.QueryContext(ctx, `SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
+	  tool, summary, meta, ref, heuristic, experiment FROM events WHERE kind IN ('owner_text', 'agent_text') AND ts >= ?
+	  AND source = ? AND (agent = '' OR agent = session) AND instr(summary, ?) > 0 ORDER BY ts, source_key`,
+		since.UnixMilli(), Transcripts, text))
+}
+
+// ChildMeta is a session whose main-thread text since a time names a parent session, with the meta of one such
+// text: a session continued from another.
+type ChildMeta struct {
+	Session, Meta string
+}
+
+// Children are the sessions whose main-thread text since a time names a parent session. The kind's index serves
+// it: a session that continues another holds text of its own.
+func (s *Store) Children(ctx context.Context, since time.Time) ([]ChildMeta, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT session, MIN(meta) FROM events WHERE kind IN ('owner_text', 'agent_text') AND ts >= ?
+	  AND source = ? AND agent = '' AND instr(meta, '"parent":"') > 0 GROUP BY session ORDER BY session`, since.UnixMilli(), Transcripts)
+	if err != nil {
+		return nil, err
 	}
-	return evs[0], true, nil
+	defer rows.Close()
+	var out []ChildMeta
+	for rows.Next() {
+		var c ChildMeta
+		if err := rows.Scan(&c.Session, &c.Meta); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// PhasesSince are the events of source sessions since a time, oldest first: what the sessions runs saw.
+func (s *Store) PhasesSince(ctx context.Context, since time.Time) ([]Event, error) {
+	return scanEvents(s.db.QueryContext(ctx, `SELECT source, source_key, ts, session, agent, harness, model, cwd, actor,
+	  kind, tool, summary, meta, ref, heuristic, experiment FROM events WHERE source = ? AND ts >= ? ORDER BY ts, source_key`,
+		Sessions, since.UnixMilli()))
 }

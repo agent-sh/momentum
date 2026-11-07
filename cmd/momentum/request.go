@@ -172,21 +172,21 @@ func requestOne(ctx context.Context, cmd string, args []string, stdout, stderr i
 		return err
 	case "check":
 		n := rq.Newest()
-		if n == nil {
-			return usageError{fmt.Sprintf("nothing of %s to check: no result and no reply of it is recorded", rq.ID)}
-		}
-		if _, standing, holds := rq.Standing(); standing && holds {
+		added, err := request.Check(ctx, st, rq, time.Now())
+		switch {
+		case errors.Is(err, request.ErrNoRequest):
+			return usageError{err.Error()}
+		case err != nil:
+			return err
+		case !added:
 			fmt.Fprintf(stdout, "%s: checked already: %s\n", rq.ID, plain.Clip(plain.Line(n.Text), 120))
 			return nil
-		}
-		if err := st.PutRequestCheck(ctx, store.RequestCheck{Request: rq.ID, Result: n.Key, At: time.Now()}); err != nil {
-			return err
 		}
 		fmt.Fprintf(stdout, "%s: checked %s (a newer result reopens it; request uncheck %s undoes it)\n", rq.ID,
 			plain.Clip(plain.Line(n.Text), 120), rq.ID)
 		return nil
 	}
-	c, err := st.UndoRequestCheck(ctx, append([]string{rq.ID}, rq.Aliases...), time.Now())
+	c, err := request.Uncheck(ctx, st, rq, time.Now())
 	if errors.Is(err, store.ErrNoCheck) {
 		return usageError{fmt.Sprintf("%s: %v", rq.ID, err)}
 	}

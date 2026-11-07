@@ -17,6 +17,7 @@ import (
 	"github.com/agent-sh/momentum/sessions"
 	"github.com/agent-sh/momentum/sessions/act"
 	"github.com/agent-sh/momentum/sessions/claude"
+	"github.com/agent-sh/momentum/sessions/pi"
 )
 
 // Dry is the experiment tag of what a rule that runs dry would have sent: recorded, never typed.
@@ -919,15 +920,27 @@ func StopOf(s *sessions.Session, presence time.Time) Stop {
 }
 
 // StoreSession is the session's id in the store's events: a Claude Code transcript's name, a Codex thread, a
-// Hermes conversation.
-func StoreSession(s *sessions.Session) string {
+// Hermes conversation, an opencode session, a pi session.
+func StoreSession(s *sessions.Session) string { return StoreSessionOf(s.Tool, s.Key, s.Transcript) }
+
+// StoreSessionOf is that id from what a sessions run records of a session in its events: its harness, its key
+// and its transcript (empty when it knew none). A Claude Code session is its transcript's name (a background job
+// is keyed by its job), Hermes and opencode drop their key's prefix, pi is the session id its transcript's name
+// ends with; any other key is the id.
+func StoreSessionOf(tool, key, transcript string) string {
 	switch {
-	case s.Tool == "claude" && s.Transcript != "":
-		return strings.TrimSuffix(filepath.Base(s.Transcript), ".jsonl")
-	case s.Tool == "hermes":
-		return strings.TrimPrefix(s.Key, "hermes:")
+	case tool == "claude" && transcript != "":
+		return strings.TrimSuffix(filepath.Base(transcript), ".jsonl")
+	case tool == "hermes":
+		return strings.TrimPrefix(key, "hermes:")
+	case tool == "opencode":
+		return strings.TrimPrefix(key, "opencode:")
+	case tool == "pi" && transcript != "":
+		return pi.ID(transcript)
+	case tool == "pi" && strings.HasPrefix(key, "pi:"):
+		return pi.ID(strings.TrimPrefix(key, "pi:") + ".jsonl")
 	}
-	return s.Key
+	return key
 }
 
 // credentials adds to a probe that the owner logged in again: Claude Code rewrote its credentials after a login

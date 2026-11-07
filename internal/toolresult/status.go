@@ -136,3 +136,17 @@ func IsShell(tool string) bool {
 	}
 	return false
 }
+
+// Shells are every harness's shell tools, in lower case, sorted: the names IsShell knows.
+func Shells() []string {
+	var out []string
+	for _, rules := range harnessTools {
+		for _, s := range rules.shells {
+			if !slices.Contains(out, s) {
+				out = append(out, s)
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
+}

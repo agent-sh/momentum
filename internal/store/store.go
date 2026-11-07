@@ -180,7 +180,8 @@ CREATE INDEX IF NOT EXISTS events_session ON events(session, ts);
 CREATE INDEX IF NOT EXISTS events_key ON events(source, source_key);
 `
 
-var keptIndexNames = slices.Concat([]string{"events_seq", "events_ts", "events_kind", "events_session", "events_key"}, caseIndexNames, loopIndexNames)
+var keptIndexNames = slices.Concat([]string{"events_seq", "events_ts", "events_kind", "events_session", "events_key"}, caseIndexNames, loopIndexNames,
+	requestIndexNames)
 
 // keptTriggers give Claude Code its one name as an event is written, by whatever build writes it: a build from
 // before the events were kept writes claude-code, also while this build has the store open.
@@ -501,7 +502,7 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
-	if _, err := tx.Exec(keptIndexes + caseIndexes + loopIndexes + keptTriggers); err != nil {
+	if _, err := tx.Exec(keptIndexes + caseIndexes + loopIndexes + requestIndexes + keptTriggers); err != nil {
 		return err
 	}
 	var pending []step

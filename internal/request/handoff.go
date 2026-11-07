@@ -98,6 +98,9 @@ func Handoff(rq *Request) string {
 		phase := "phase unknown"
 		if th.Phase != "" {
 			phase = fmt.Sprintf("last seen %s at %s", th.Phase, th.PhaseAt.Local().Format(timeFormat))
+			if !th.Trusted {
+				phase += ", before the last turn in it"
+			}
 		}
 		if !th.Current {
 			phase = "since moved on to another request"
@@ -117,24 +120,4 @@ func Handoff(rq *Request) string {
 }
 
 // stateLine says the state and what it rests on.
-func stateLine(rq *Request) string {
-	c, standing, holds := rq.Standing()
-	switch rq.State {
-	case NeedsYou:
-		return NeedsYou + " - a session of it was last seen waiting on the owner"
-	case Working:
-		return Working + " - a session of it was last seen working"
-	case Checked:
-		return Checked + " - the owner checked its newest result at " + c.At.Local().Format(timeFormat) + "; that he checked it does not make it right"
-	case Unknown:
-		return Unknown + " - no sessions run recorded the latest session's phase, so whether it still runs is not known"
-	}
-	s := rq.State + " - nothing came after the last turn"
-	if rq.State == Ready {
-		s = rq.State + " - a result came after the last turn"
-	}
-	if standing && !holds {
-		s += "; the check of " + c.At.Local().Format(timeFormat) + " is reopened by a newer result"
-	}
-	return s
-}
+func stateLine(rq *Request) string { return rq.State + " - " + rq.Why }
