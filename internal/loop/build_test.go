@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -251,14 +252,35 @@ func TestBuildPreparationFailuresUseStageKeyAndStopRule(t *testing.T) {
 		if err != nil || len(done) != 1 || done[0].Run.Status != store.RunFailed || done[0].Run.Failure != "build prepare" || done[0].Run.USD != 0 {
 			t.Fatalf("preparation lost its zero-cost stage failure: steps=%d error=%v", len(done), err)
 		}
-	}
-	done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
-	if err != nil || len(done) != 1 || !strings.Contains(done[0].Skipped, "stopped") {
-		t.Fatalf("two preparation failures did not stop the case: steps=%d error=%v", len(done), err)
+		if i > 0 {
+			continue
+		}
+		// the second preparation fails at another obstruction, with another text: a host stage stops on its key alone
+		if err := os.Remove(filepath.Join(r.Dir, "host")); err != nil {
+			t.Fatal(err)
+		}
+		r.Ship.Gate.Busy = func(context.Context, string) (string, error) {
+			if err := os.Symlink(filepath.Join(r.Dir, "absent"), filepath.Join(r.Dir, "host")); err != nil && !os.IsExist(err) {
+				t.Fatal(err)
+			}
+			return "", nil
+		}
 	}
 	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID})
-	if err != nil || len(runs) != 2 {
+	if err != nil || len(runs) != 2 || runs[0].Summary == runs[1].Summary || runs[0].Cause != "" || runs[1].Cause != "" {
+		t.Fatalf("the preparation failures: %+v %v", runs, err)
+	}
+	done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
+	if err != nil || len(done) != 1 || !strings.Contains(done[0].Skipped, "stopped: its last two build runs failed the same way: build prepare)") {
+		t.Fatalf("two preparation failures did not stop the case: %+v %v", done, err)
+	}
+	if runs, err = r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID}); err != nil || len(runs) != 2 {
 		t.Fatalf("stopped preparation started another run: %d %v", len(runs), err)
+	}
+	cs, err := r.Store.Cases(ctx, store.CaseFilter{Family: store.HealthFamily})
+	if err != nil || len(cs) != 1 || !slices.Equal(cs[0].Signatures, []string{"component-health/v1:loop:build:build-prepare"}) ||
+		cs[0].Title != "The loop fails the same way twice: build prepare" {
+		t.Fatalf("a host stage's stop names more than its stage: %+v %v", cs, err)
 	}
 }
 

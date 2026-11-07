@@ -112,6 +112,61 @@ func TestALoopRunKeepsItsTokensByKind(t *testing.T) {
 	}
 }
 
+// A refused build's cause is kept with its run, when it is put and when it ends. A loop_runs table from before the
+// cause gains its column at the next open and keeps its rows, which hold no cause; until then the read-only open
+// refuses the store.
+func TestALoopRunKeepsItsCauseAndAnOlderTableGainsIt(t *testing.T) {
+	ctx := context.Background()
+	st, path := open(t)
+	c, _, err := st.ObserveCase(ctx, Finding{Family: "failures", Signature: "a", Title: "a"}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.UnixMilli(1_700_000_000_000)
+	if err := st.PutLoopRun(ctx, LoopRun{ID: "old", Case: c.ID, Family: "failures", Step: "build", Started: t0, Ended: t0.Add(time.Second),
+		Status: RunFailed, Failure: "build propose", Summary: "build propose: refused: an older reason"}); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`ALTER TABLE loop_runs DROP COLUMN cause`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if _, err := OpenReadOnly(path); !errors.Is(err, ErrNotCurrent) {
+		t.Fatalf("a store without the cause read as current: %v", err)
+	}
+	if st, err = Open(path); err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if r, err := st.LoopRunByID(ctx, "old"); err != nil || r.Failure != "build propose" || r.Cause != "" || r.Summary != "build propose: refused: an older reason" {
+		t.Fatalf("the run from before the cause: %+v %v", r, err)
+	}
+	cause := "refused: the patch holds Q"
+	if err := st.PutLoopRun(ctx, LoopRun{ID: "put", Case: c.ID, Family: "failures", Step: "build", Started: t0, Ended: t0.Add(time.Second),
+		Status: RunFailed, Failure: "build propose", Cause: cause}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutLoopRun(ctx, LoopRun{ID: "finished", Case: c.ID, Family: "failures", Step: "build", Started: t0, Status: RunRunning, USD: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FinishLoopRun(ctx, LoopRun{ID: "finished", Ended: t0.Add(time.Minute), Status: RunFailed, Failure: "build check", Cause: cause, USD: 1}); err != nil {
+		t.Fatal(err)
+	}
+	rs, err := st.LoopRuns(ctx, RunFilter{Case: c.ID})
+	got := map[string]string{}
+	for _, r := range rs {
+		got[r.ID] = r.Cause
+	}
+	if err != nil || len(rs) != 3 || got["old"] != "" || got["put"] != cause || got["finished"] != cause {
+		t.Fatalf("the causes kept: %v %v", got, err)
+	}
+}
+
 // A loop_runs table from before the tokens by kind gains their columns and keeps its rows: the columns are the
 // table's next ones in keptColumns, not in the CREATE TABLE.
 func TestALoopRunsTableFromBeforeTheTokensByKindGainsThem(t *testing.T) {

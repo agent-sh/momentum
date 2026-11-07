@@ -81,6 +81,9 @@ type Result struct {
 	Refused                                   []string
 	RelayUSD                                  float64
 	RelayAdmitted, RelayRefused, RelayCharged int
+	// Cause is what a build's refusal stage gave as its error (refusalKeys), as it gave it: the run keeps it cleaned and
+	// masked (refusalCause), and the stop rule compares it there with Failure.
+	Cause string
 }
 
 // HarnessDiagnostics never determines a charge, limit, fallback or recorded outcome.

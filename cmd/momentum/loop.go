@@ -321,8 +321,8 @@ func loopRuns(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	enc := json.NewEncoder(stdout)
 	for _, r := range runs {
 		// Older rows can predate summary cleaning. Clean the display copy only;
-		// the stored failure key remains the stop rule's own.
-		for _, text := range []*string{&r.Summary, &r.Failure} {
+		// the stored failure key and cause remain the stop rule's own.
+		for _, text := range []*string{&r.Summary, &r.Failure, &r.Cause} {
 			clean, err := loop.Redact(ctx, *text)
 			if err != nil {
 				return err

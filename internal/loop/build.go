@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/agent-sh/momentum/internal/detect"
 	"github.com/agent-sh/momentum/internal/sandbox"
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -366,6 +367,9 @@ func stageFailure(res Result, key string, err error) (Result, error) {
 	}
 	res.Status, res.Failure = store.RunFailed, key
 	res.Text = key + ": " + err.Error()
+	if slices.Contains(refusalKeys, key) {
+		res.Cause = err.Error()
+	}
 	return res, nil
 }
 
@@ -529,6 +533,19 @@ func handReach(repo string) string {
 // refusalKeys are the build stages whose failure is the run's own output: its report, its patch, its check or its
 // proposal. Preparation, inputs, toolchains and authority are the host's and tell a build nothing to change.
 var refusalKeys = []string{"build report", "build patch", "build check", "build propose"}
+
+// causeMax is how many characters of a refusal's cause a run keeps: its stop's signature names the cause too.
+const causeMax = 200
+
+// refusalCause is the cause a run refused at a refusal stage keeps for the stop rule: the stage's error text, with
+// what varies between two sightings of one cause masked as the detectors mask it (numbers, paths, hashes, quoted
+// values), so two refusals for one cause compare equal and two for different causes do not.
+func refusalCause(text string) string { return detect.Norm(text, causeMax) }
+
+// refusalStop says a run failed at a refusal stage: the stop rule holds it only when the cause is the same too.
+func refusalStop(run store.LoopRun) bool {
+	return run.Step == StepBuild && slices.Contains(refusalKeys, run.Failure)
+}
 
 // hostStages are the build stages whose failure is the host's or the harness's, not the build's output: the next
 // build reads past them to the last refusal of its output.

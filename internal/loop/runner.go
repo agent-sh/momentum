@@ -1047,8 +1047,11 @@ func (r *Runner) caseNoteOnce(ctx context.Context, id, action, detail string) er
 
 // stopRuns reads the stop rule for a case: its last two live runs that ran (a refusal of the budgets is no run, and a
 // run the host ended, stopped or killed, says nothing of the agent), since it last came back after a close or
-// resumed after a fix of its stop, when both failed the same way in the same step. ok is false when the rule does
-// not hold.
+// resumed after a fix of its stop, when both failed the same way in the same step. Two builds refused for their own
+// output at one refusal stage failed the same way only for the same cause: each refusal's reason reaches the next
+// build (refusal.md), so two for different causes are a build making progress. A run kept before causes were has
+// none, and a missing cause matches nothing, so such a run never starts a stop. A host stage stops on its key alone.
+// ok is false when the rule does not hold.
 func stopRuns(ctx context.Context, st *store.Store, c store.Case) (runs []store.LoopRun, ok bool, err error) {
 	live := ""
 	since := c.Back
@@ -1070,12 +1073,29 @@ func stopRuns(ctx context.Context, st *store.Store, c store.Case) (runs []store.
 	if a.Status == store.RunOK || b.Status == store.RunOK || a.Failure == "" || a.Failure != b.Failure || a.Step != b.Step {
 		return nil, false, nil
 	}
+	if refusalStop(a) && (a.Cause == "" || a.Cause != b.Cause) {
+		return nil, false, nil
+	}
 	return runs, true, nil
 }
 
-// stopSignature is the signature of the component-health case a stop files: by its step and its failure.
-func stopSignature(step, failure string) string {
-	return store.HealthFamily + "/" + detect.Versions[store.HealthFamily] + ":loop:" + step + ":" + slugOf(failure)
+// stopSignature is the signature of the component-health case a stop files: by its step and its failure, and for a
+// refusal stage by its cause too, so the case names the refusal that repeated. A host stage's is its key alone, as
+// every stop's was before causes were kept, so a case filed then still holds the stops it names.
+func stopSignature(run store.LoopRun) string {
+	sig := store.HealthFamily + "/" + detect.Versions[store.HealthFamily] + ":loop:" + run.Step + ":" + slugOf(run.Failure)
+	if refusalStop(run) {
+		sig += ":" + causeSlug(run.Cause)
+	}
+	return sig
+}
+
+// stopFailure is how a stop's runs failed, as its why and its case's title say it: the failure, and a refusal's cause.
+func stopFailure(run store.LoopRun) string {
+	if refusalStop(run) {
+		return run.Failure + ": " + run.Cause
+	}
+	return run.Failure
 }
 
 // StoppedOn lists the cases the stop rule holds now on one of a component-health case's signatures: the working
@@ -1094,7 +1114,7 @@ func StoppedOn(ctx context.Context, st *store.Store, health store.Case) ([]strin
 		if err != nil {
 			return nil, err
 		}
-		if ok && slices.Contains(health.Signatures, stopSignature(runs[0].Step, runs[0].Failure)) {
+		if ok && slices.Contains(health.Signatures, stopSignature(runs[0])) {
 			out = append(out, c.ID)
 		}
 	}
@@ -1110,21 +1130,21 @@ func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, e
 	if err != nil || !ok {
 		return "", err
 	}
-	a, sig := runs[0], stopSignature(runs[0].Step, runs[0].Failure)
+	a, sig := runs[0], stopSignature(runs[0])
+	why := fmt.Sprintf("its last two %s runs failed the same way: %s", a.Step, stopFailure(a))
 	// a stop whose older run began before its component-health case closed as fixed came too late for the close:
 	// the case resumes as the close would have resumed it
 	if dry {
 		if _, _, late, err := r.Store.FixedStop(ctx, sig, runs[1].Started); err != nil || late {
 			return "", err
 		}
-		return fmt.Sprintf("its last two %s runs failed the same way: %s", a.Step, a.Failure), nil
+		return why, nil
 	}
 	if late, err := r.Store.ResumeLate(ctx, c.ID, sig, runs[1].Started, "loop"); err != nil || late {
 		return "", err
 	}
-	why := fmt.Sprintf("its last two %s runs failed the same way: %s", a.Step, a.Failure)
 	f := store.Finding{Family: store.HealthFamily, Signature: sig,
-		Title: plainClip("The loop fails the same way twice: "+a.Failure, store.TitleMax)}
+		Title: plainClip("The loop fails the same way twice: "+stopFailure(a), store.TitleMax)}
 	for _, run := range runs {
 		ref := "file:" + filepath.Join(r.Dir, "runs", run.ID)
 		if run.Dir != "" {
@@ -1133,7 +1153,7 @@ func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, e
 				ref = "file:" + filepath.Join(HostDir(run.Dir), "transcript.fallback.jsonl")
 			}
 		}
-		f.Evidence = append(f.Evidence, store.Evidence{Ref: ref, At: run.Started, Kind: "loop-run", Summary: run.Step + " " + run.Case + ": " + run.Failure})
+		f.Evidence = append(f.Evidence, store.Evidence{Ref: ref, At: run.Started, Kind: "loop-run", Summary: run.Step + " " + run.Case + ": " + stopFailure(run)})
 	}
 	if _, _, err := r.Store.ObserveCase(ctx, f, "loop"); err != nil {
 		return "", err
@@ -1237,6 +1257,10 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 	case !res.CostKnown:
 		run.USD = reserved // what it spent is unknown: its whole budget
 	}
+	cause := ""
+	if err == nil && slices.Contains(refusalKeys, run.Failure) {
+		cause = res.Cause
+	}
 	run.Summary = strings.TrimSpace(res.InputSummary + "\n" + run.Summary)
 	for _, claims := range append(res.PriorHarness, res.Harness) {
 		if claims.USD != nil || claims.Turns != nil {
@@ -1247,12 +1271,17 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 	run.USD = max(run.USD, res.RelayUSD)
 	// Summaries and printable diagnostics are generated text. Failure is a
 	// normalized key, kept separate so cleaning cannot change the stop rule.
+	// A refusal's cause is text too: it is cleaned, then masked into the key
+	// the stop rule compares beside the failure.
 	clean, cleanErr := Redact(ctx, run.Summary)
+	if cleanErr == nil {
+		cause, cleanErr = Redact(ctx, cause)
+	}
 	if cleanErr != nil {
 		run.Summary = "(summary withheld: the cleaner failed)"
-		run.Status, run.Failure = store.RunFailed, "scrub"
+		run.Status, run.Failure, run.Cause = store.RunFailed, "scrub", ""
 	} else {
-		run.Summary = clean
+		run.Summary, run.Cause = clean, refusalCause(cause)
 	}
 	if run.Step == StepInvestigate && res.Started && cleanErr == nil {
 		why := undecided(res, err)
@@ -1381,11 +1410,19 @@ func newRunID(now time.Time) string {
 }
 
 func slugOf(s string) string {
-	w := strings.FieldsFunc(strings.ToLower(s), func(r rune) bool { return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9') })
+	w := slugWords(s)
 	if len(w) > 8 {
 		w = w[:8]
 	}
 	return strings.Join(w, "-")
+}
+
+// causeSlug is a refusal's cause as its stop's signature names it: all its words, lower case, joined by dashes. A
+// kept cause is at most causeMax characters, so its slug fits a signature with its step and failure.
+func causeSlug(cause string) string { return strings.Join(slugWords(cause), "-") }
+
+func slugWords(s string) []string {
+	return strings.FieldsFunc(strings.ToLower(s), func(r rune) bool { return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9') })
 }
 
 func plainClip(s string, n int) string {
