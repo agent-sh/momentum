@@ -334,7 +334,7 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 	// guard stands in for a measured plan refused as too new, too rare or with no recent event, at the same boundary:
 	// the sources it counts are those this plan's would be, for the units its history counts in.
 	guard := func(why error) (Plan, error) {
-		return s.guardPlan(ctx, c, plan, why, func(units string) ([]string, []string, error) {
+		return s.guardPlan(ctx, c, plan, why, now, func(units string) ([]string, []string, error) {
 			found, err := live(units, at)
 			if err != nil {
 				return found, nil, err
