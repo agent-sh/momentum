@@ -23,10 +23,11 @@ const (
 	RuleStalled   = "stalled"   // a Claude Code turn waits on a model request that never got its reply
 	RuleOverdue   = "overdue"   // a wakeup or a loop run the session set came due long ago and did not fire
 	RulePromise   = "promise"   // the turn ended on a promise or a step it announced, and nothing will wake it
+	RuleNoReply   = "noreply"   // a Codex turn an input opened ended with no reply: its last words are an older turn's
 )
 
 // Rules lists them in order.
-var Rules = []string{RuleTransient, RuleAccess, RuleCutoff, RuleReopened, RuleStalled, RuleOverdue, RulePromise}
+var Rules = []string{RuleTransient, RuleAccess, RuleCutoff, RuleReopened, RuleStalled, RuleNoReply, RuleOverdue, RulePromise}
 
 // Verdicts.
 const (
@@ -97,6 +98,7 @@ type Params struct {
 	ReopenWait   time.Duration
 	StalledWait  time.Duration // stalled: past the longest a reply legitimately takes to begin
 	StalledTries int
+	NoReplyWait  time.Duration // noreply: after the turn Codex closed with no reply; its tries are the stalled rule's
 	OverdueSlack time.Duration // overdue: past the latest a wakeup or a loop run that fired came
 	OverdueTries int
 	PromiseWait  time.Duration
@@ -116,6 +118,7 @@ var DefaultParams = Params{
 	ReopenWait:   2 * time.Minute,
 	StalledWait:  30 * time.Minute,
 	StalledTries: 2,
+	NoReplyWait:  2 * time.Minute,
 	OverdueSlack: 10 * time.Minute,
 	OverdueTries: 2,
 	PromiseWait:  17 * time.Minute,
@@ -173,7 +176,7 @@ func Plan(s Stop, tries Tries, p Params, probe Probe) Decision {
 
 // ruleFuncs are the rules, in Rules order.
 var ruleFuncs = map[string]func(Stop, Tries, Params, Probe) (Decision, bool){RuleTransient: transient, RuleAccess: access,
-	RuleCutoff: cutoff, RuleReopened: reopened, RuleStalled: stalled, RuleOverdue: overdue, RulePromise: promise}
+	RuleCutoff: cutoff, RuleReopened: reopened, RuleStalled: stalled, RuleNoReply: noReply, RuleOverdue: overdue, RulePromise: promise}
 
 // planRules is the first rule that applies to a stop, past the guards, with the time it acts, held while the
 // owner typed into the session recently.
@@ -346,6 +349,26 @@ func stalled(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
 		at, why = idle, why+"; its screen showed no turn running at "+s.ScreenIdle.Local().Format("15:04")+", which may be its owner's Escape"
 	}
 	return wait(RuleStalled, at, n+1, StalledText, why), true
+}
+
+// noReply: Codex closed the turn an input opened (task_complete) and nothing came after the input: no reply, no
+// call, no error. The words the stop carries are then an older turn's, kept across the input, so a question in
+// them was already answered by the input itself and no guard on them applies: the session asks nothing, it got no
+// reply. Only a stop whose turn began where it ended reads so (TurnBegan, IdleAt); a session layer that does not
+// say when its turn began leaves the rule off. The harness says the turn is over, so the wait is a short one, like
+// cutoff's, and the owner window holds it while he is at the session. The message and the tries are the stalled
+// rule's: a request that got no reply.
+func noReply(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
+	if s.Tool != "codex" || s.Working || s.Busy || s.Error != "" || s.Tasks > 0 || priorProcess(s) ||
+		s.TurnBegan.IsZero() || s.IdleAt.After(s.TurnBegan) || !s.ResumedAt.IsZero() {
+		return Decision{}, false
+	}
+	n := tries[RuleNoReply]
+	if n >= p.StalledTries {
+		return used(RuleNoReply, n), true
+	}
+	return wait(RuleNoReply, s.IdleAt.Add(p.NoReplyWait), n+1, StalledText,
+		"the turn that began at "+s.TurnBegan.Local().Format("15:04")+" ended with no reply"), true
 }
 
 // afterSleep counts a rule's wait, which began at from, from the machine's wake instead when the machine slept
