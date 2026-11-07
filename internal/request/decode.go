@@ -13,6 +13,7 @@ type Decoded struct {
 	Commands []string
 	Output   string
 	Paths    []string
+	Workdir  string // the directory a shell call names its own (Codex's and Hermes's workdir)
 }
 
 // Keys of the stored inputs and outputs, every harness's.
@@ -21,6 +22,7 @@ var (
 	pathKeys    = map[string]bool{"file_path": true, "filePath": true, "notebook_path": true, "path": true}
 	patchKeys   = map[string]bool{"patch": true, "patchText": true, "input": true}
 	outputKeys  = map[string]bool{"output": true, "stdout": true, "stderr": true}
+	workdirKeys = map[string]bool{"workdir": true, "cwd": true, "working_directory": true}
 )
 
 // Decode reads a call's stored input and its result's stored output as the harness stores them. Claude Code, pi,
@@ -63,6 +65,9 @@ func Decode(harness, tool, input, output string) Decoded {
 		}
 	default:
 		for _, f := range in {
+			if workdirKeys[f.key] && !f.list && len(f.values) > 0 && d.Workdir == "" {
+				d.Workdir = f.values[0]
+			}
 			if !commandKeys[f.key] {
 				continue
 			}

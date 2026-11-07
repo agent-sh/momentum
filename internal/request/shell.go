@@ -12,59 +12,233 @@ import (
 var shellProgs = map[string]bool{"bash": true, "sh": true, "zsh": true, "dash": true, "ksh": true}
 
 // invocation is a simple command: the program it runs and its arguments, past assignments and the wrappers that
-// run the command after them.
+// run the command after them. proven is true when the whole call's success proves this command succeeded; dir is
+// the directory it runs in, when the line says (a cd before it, git -C).
 type invocation struct {
-	prog string
-	args []string
+	prog   string
+	args   []string
+	proven bool
+	dir    string
 }
 
 // invocations are every simple command a shell script runs, parsed as a shell parses it: in lists, pipelines,
 // subshells, loops' and conditions' bodies, command substitutions, and the scripts a shell's -c runs. A script the
 // store cut is parsed as far as it goes: with the quotes or parentheses it leaves open closed, else to the last
-// whole command before the cut.
+// whole command before the cut; then no command of it is proven, since what the cut took may have run after.
 func invocations(script string, depth int) []invocation {
 	if depth > 4 {
 		return nil
 	}
-	f := parseCut(strings.TrimSuffix(script, "…"))
+	cut := strings.HasSuffix(script, "…")
+	f, whole := parseCut(strings.TrimSuffix(script, "…"))
 	if f == nil {
 		return nil
 	}
-	var out []invocation
-	syntax.Walk(f, func(n syntax.Node) bool {
-		ce, ok := n.(*syntax.CallExpr)
-		if !ok || len(ce.Args) == 0 {
-			return true
+	w := &walker{depth: depth}
+	w.stmts(f.Stmts, !cut && whole)
+	return w.out
+}
+
+// walker reads a parsed script's simple commands in order, and which of them the script's success proves: the
+// exit of a list is its last statement's, of a && its two sides' (the second runs only after the first succeeded),
+// of a pipeline its last command's. Nothing after ||, in a condition or a loop, in a substitution, run in the
+// background or negated is proven.
+type walker struct {
+	out   []invocation
+	dir   string
+	depth int
+}
+
+func (w *walker) stmts(list []*syntax.Stmt, proven bool) {
+	for i, st := range list {
+		w.stmt(st, proven && i == len(list)-1)
+	}
+}
+
+func (w *walker) stmt(st *syntax.Stmt, proven bool) {
+	if st == nil {
+		return
+	}
+	if st.Negated || st.Background || st.Coprocess {
+		proven = false
+	}
+	w.cmd(st.Cmd, proven)
+	for _, r := range st.Redirs {
+		w.words(false, r.Word, r.Hdoc)
+	}
+}
+
+func (w *walker) cmd(c syntax.Command, proven bool) {
+	switch c := c.(type) {
+	case *syntax.CallExpr:
+		w.call(c, proven)
+	case *syntax.BinaryCmd:
+		switch c.Op {
+		case syntax.AndStmt:
+			w.stmt(c.X, proven)
+			w.stmt(c.Y, proven)
+		case syntax.OrStmt:
+			w.stmt(c.X, false)
+			w.stmt(c.Y, false)
+		default: // a pipeline: its last command's exit
+			w.stmt(c.X, false)
+			w.stmt(c.Y, proven)
 		}
-		args := make([]string, len(ce.Args))
-		for i, w := range ce.Args {
-			args[i] = wordText(w)
+	case *syntax.Subshell:
+		dir := w.dir
+		w.stmts(c.Stmts, proven)
+		w.dir = dir
+	case *syntax.Block:
+		w.stmts(c.Stmts, proven)
+	case *syntax.IfClause:
+		for ic := c; ic != nil; ic = ic.Else {
+			w.stmts(ic.Cond, false)
+			w.stmts(ic.Then, false)
 		}
-		if inv, ok := unwrap(args); ok {
-			if shellProgs[inv.prog] {
-				if s, ok := shellScript(inv.args); ok {
-					out = append(out, invocations(s, depth+1)...)
+	case *syntax.WhileClause:
+		w.stmts(c.Cond, false)
+		w.stmts(c.Do, false)
+	case *syntax.ForClause:
+		w.stmts(c.Do, false)
+	case *syntax.CaseClause:
+		for _, it := range c.Items {
+			w.stmts(it.Stmts, false)
+		}
+	case *syntax.TimeClause:
+		w.stmt(c.Stmt, proven)
+	case *syntax.FuncDecl:
+		w.stmt(c.Body, false)
+	case *syntax.DeclClause:
+		for _, a := range c.Args {
+			w.words(false, a.Value)
+		}
+	}
+}
+
+// call reads a simple command, then the commands its words substitute. A command of assignments alone exits as
+// its last substitution did, so that one is proven with it (N=$(gh pr create ...)).
+func (w *walker) call(c *syntax.CallExpr, proven bool) {
+	if len(c.Args) == 0 {
+		var last *syntax.CmdSubst
+		for _, a := range c.Assigns {
+			if a.Value != nil {
+				syntax.Walk(a.Value, func(n syntax.Node) bool {
+					if cs, ok := n.(*syntax.CmdSubst); ok {
+						last = cs
+						return false
+					}
 					return true
-				}
+				})
 			}
-			out = append(out, inv)
 		}
-		return true
-	})
-	return out
+		for _, a := range c.Assigns {
+			if a.Value == nil {
+				continue
+			}
+			syntax.Walk(a.Value, func(n syntax.Node) bool {
+				switch n := n.(type) {
+				case *syntax.CmdSubst:
+					w.stmts(n.Stmts, proven && n == last)
+					return false
+				case *syntax.ProcSubst:
+					w.stmts(n.Stmts, false)
+					return false
+				}
+				return true
+			})
+		}
+		return
+	}
+	args := make([]string, len(c.Args))
+	for i, wd := range c.Args {
+		args[i] = wordText(wd)
+	}
+	if inv, ok := unwrap(args); ok {
+		if shellProgs[inv.prog] {
+			if s, ok := shellScript(inv.args); ok {
+				in := invocations(s, w.depth+1)
+				for i := range in {
+					in[i].proven = in[i].proven && proven
+					if in[i].dir == "" {
+						in[i].dir = w.dir
+					}
+				}
+				w.out = append(w.out, in...)
+				return
+			}
+		}
+		inv.proven, inv.dir = proven, w.dir
+		switch inv.prog {
+		case "cd":
+			if d := firstArg(inv.args); d != "" && !strings.ContainsRune(d, 0) {
+				w.dir = joinDir(w.dir, d)
+			}
+		case "git":
+			if d := gitDir(inv.args); d != "" {
+				inv.dir = joinDir(w.dir, d)
+			}
+		}
+		w.out = append(w.out, inv)
+	}
+	for _, a := range c.Assigns {
+		w.words(false, a.Value)
+	}
+	w.words(false, c.Args...)
+}
+
+// words reads the commands the words substitute.
+func (w *walker) words(proven bool, ws ...*syntax.Word) {
+	for _, wd := range ws {
+		if wd == nil {
+			continue
+		}
+		syntax.Walk(wd, func(n syntax.Node) bool {
+			switch n := n.(type) {
+			case *syntax.CmdSubst:
+				w.stmts(n.Stmts, proven)
+				return false
+			case *syntax.ProcSubst:
+				w.stmts(n.Stmts, false)
+				return false
+			}
+			return true
+		})
+	}
+}
+
+// joinDir is dir d taken from dir: an absolute or home-relative d as it is, a relative one under dir.
+func joinDir(dir, d string) string {
+	if dir == "" || strings.HasPrefix(d, "/") || strings.HasPrefix(d, "~") {
+		return d
+	}
+	return filepath.Join(dir, d)
+}
+
+// gitDir is the directory a git invocation's -C option names.
+func gitDir(args []string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-C" {
+			return args[i+1]
+		}
+		if !strings.HasPrefix(args[i], "-") {
+			break
+		}
+	}
+	return ""
 }
 
 // closers end what a cut script leaves open.
 var closers = []string{"", "'", `"`, "`", `"'`, `'"`, ")", "')", `")`, "))", "'))", `"))`, "\n}", "\nfi", "\ndone"}
 
 // parseCut parses a script, closing what its cut leaves open, or else the part of it before the cut that parses.
-func parseCut(script string) *syntax.File {
+// whole is false when it took anything but the script as it is.
+func parseCut(script string) (f *syntax.File, whole bool) {
 	parse := func(s string) (*syntax.File, error) {
 		return syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(s), "")
 	}
-	for _, c := range closers {
+	for i, c := range closers {
 		if f, err := parse(script + c); err == nil {
-			return f
+			return f, i == 0
 		}
 	}
 	s := script
@@ -80,15 +254,15 @@ func parseCut(script string) *syntax.File {
 		}
 		cut := strings.LastIndexAny(s[:end], ";&|\n")
 		if cut <= 0 {
-			return nil
+			return nil, false
 		}
 		s = strings.TrimRight(s[:cut], ";&| \n")
 	}
 	if s == "" {
-		return nil
+		return nil, false
 	}
-	f, _ := parse(s)
-	return f
+	f, _ = parse(s)
+	return f, false
 }
 
 // wordText is a word's text as the program gets it, where the shell can tell without running anything: its
@@ -208,12 +382,17 @@ type makes struct {
 	// quiet); remote is the first push's remote argument
 	fetches bool
 	remote  string
+	// madeCommit, madePush and madePR are a commit, push or pull request the call's success proves it made, whatever
+	// its output shows; commitDir is where the commit was made, when the line says
+	madeCommit, madePush, madePR bool
+	commitDir                    string
 }
 
 // commitCommands are git's commands that make commits.
 var commitCommands = map[string]bool{"commit": true, "cherry-pick": true, "revert": true, "merge": true, "am": true, "rebase": true}
 
-// made reads what a call's commands make, by every program they run: commits when one runs a git command that
+// made reads what a call's commands make, by every program they run (and which of them the call's success proves
+// made something): commits when one runs a git command that
 // makes them (no dry run, no --no-commit, no --abort), pushes when one runs git push and none of its pushes is a
 // dry run (whose ref lines would be read as pushed), and a pull request when one runs gh pr create without
 // --dry-run.
@@ -228,12 +407,16 @@ func made(commands []string) makes {
 				switch {
 				case commitCommands[sub] && !makesNoCommit(sub, args):
 					mk.commits = true
+					if inv.proven && !mk.madeCommit {
+						mk.madeCommit, mk.commitDir = true, inv.dir
+					}
 				case sub == "push":
 					mk.pushes = true
 					dry = dry || dryRun(args)
 					if mk.remote == "" {
 						mk.remote = firstArg(args)
 					}
+					mk.madePush = mk.madePush || inv.proven
 				case (sub == "fetch" || sub == "pull" || sub == "remote") && !quiet(args):
 					mk.fetches = true
 				}
@@ -241,12 +424,14 @@ func made(commands []string) makes {
 				for j := 0; j+1 < len(inv.args); j++ {
 					if inv.args[j] == "pr" && inv.args[j+1] == "create" && !hasFlag(inv.args[j+2:], "--dry-run") {
 						mk.prs = true
+						mk.madePR = mk.madePR || inv.proven
 					}
 				}
 			}
 		}
 	}
 	mk.pushes = mk.pushes && !dry
+	mk.madePush = mk.madePush && mk.pushes
 	return mk
 }
 

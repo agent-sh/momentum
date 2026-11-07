@@ -58,7 +58,8 @@ type Result struct {
 	At     time.Time
 	Thread string
 	Event  string
-	Writes int // a file's writes in the request
+	Writes int  // a file's writes in the request
+	Hidden bool // made, its details not shown: a quiet command's commit or push, an address kept in a variable
 }
 
 // Thread is a session of a request: when its events in the request ran, and its last observed phase. Phase is
@@ -425,9 +426,8 @@ func (r *reader) enqueue(id string) {
 }
 
 // read is what a thread's read selects: the main thread's text, the file writers' calls and results, and the
-// shells' calls that may run git or gh with the results that may hold an artifact (Artifacts).
-var read = store.ThreadRead{Writers: sortedKeys(writers), Shells: shells(), CallMarks: []string{"git", "gh"},
-	ResultMarks: []string{"] ", " -> ", "/pull/"}}
+// shells' calls that may run git or gh with every shell result (a quiet command's may hold nothing).
+var read = store.ThreadRead{Writers: sortedKeys(writers), Shells: shells(), CallMarks: []string{"git", "gh"}}
 
 func sortedKeys(m map[string]bool) []string {
 	var out []string

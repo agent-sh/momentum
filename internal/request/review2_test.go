@@ -240,7 +240,7 @@ func TestWhatAMergeOrAPushPrints(t *testing.T) {
 		{"a push a tail cut to its ref line", `{"command":"git push origin HEAD:main 2>&1 | tail -n 1"}`, "1675ef4..710d01a HEAD -> main",
 			"push pushed HEAD -> main (1675ef4..710d01a) to origin"},
 		{"a fetch's ref line beside a quiet push", `{"command":"git fetch origin && git push -q origin main"}`,
-			"From github.com:example/x 1111111..2222222 main -> origin/main", ""},
+			"From github.com:example/x 1111111..2222222 main -> origin/main", "push push (refs not shown) to origin"},
 		{"a quiet fetch beside a push a tail cut", `{"command":"git fetch -q origin && git push origin HEAD:main 2>&1 | tail -n 1"}`,
 			"20f6298..f5127b7 HEAD -> main", "push pushed HEAD -> main (20f6298..f5127b7) to origin"},
 	}

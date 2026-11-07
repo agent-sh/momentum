@@ -73,6 +73,9 @@ func Handoff(rq *Request) string {
 			break
 		}
 		text := x.Text
+		if x.Hidden {
+			text += ": made, details not shown"
+		}
 		if x.Kind == KindFile {
 			text = "wrote " + x.Text
 			if x.Writes > 1 {

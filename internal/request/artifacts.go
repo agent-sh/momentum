@@ -34,10 +34,12 @@ var (
 // call made commits when its command runs a git command that makes them (the commit lines its output printed),
 // pushes when it runs git push and no push of it is a dry run (the ref updates after the To line, or, with no To
 // line, those of a call that ran no fetch or pull), and a pull request when it runs gh pr create without --dry-run
-// (the address it printed, not one it says already exists).
-// What any other tool printed (an agent's report, a read, a search, a fetched page) is no artifact.
+// (the address it printed, not one it says already exists). A commit, push or pull request the call's success
+// proves it made (Shell, proven) is one even when its output shows nothing of it (a quiet -q, an address kept in
+// a variable): an artifact with what is known, made but its details not shown, unless a line of the output shows
+// it. What any other tool printed (an agent's report, a read, a search, a fetched page) is no artifact.
 func Artifacts(call, res store.Event) []Result {
-	if metaOf(res.Meta).IsError || res.Summary == "" {
+	if metaOf(res.Meta).IsError {
 		return nil
 	}
 	var out []Result
@@ -62,9 +64,11 @@ func Artifacts(call, res store.Event) []Result {
 	d := Decode(harness, tool, call.Summary, res.Summary)
 	mk := made(d.Commands)
 	text := strings.TrimSuffix(d.Output, "…")
+	shown := map[string]bool{}
 	if mk.commits {
 		for _, c := range commitRe.FindAllStringSubmatch(text, -1) {
 			add(Result{Kind: KindCommit, Key: KindCommit + ":" + c[2], Text: fmt.Sprintf("commit %s on %s: %s", c[2], c[1], strings.TrimSpace(c[3]))})
+			shown[KindCommit] = true
 		}
 	}
 	if mk.pushes {
@@ -80,6 +84,7 @@ func Artifacts(call, res store.Event) []Result {
 			remote = "origin"
 		}
 		for _, p := range pushRefRe.FindAllStringSubmatch(refs, -1) {
+			shown[KindPush] = true
 			if p[2] != "" {
 				add(Result{Kind: KindPush, Key: KindPush + ":" + remote + " " + p[4] + "@" + p[2],
 					Text: fmt.Sprintf("pushed %s -> %s (%s..%s) to %s", p[3], p[4], p[1], p[2], remote)})
@@ -96,8 +101,32 @@ func Artifacts(call, res store.Event) []Result {
 			}
 			u := text[loc[0]:loc[1]]
 			add(Result{Kind: KindPR, Key: KindPR + ":" + u, Text: "pull request " + u})
+			shown[KindPR] = true
 			break
 		}
 	}
+	// Made, its details not shown: keyed by the call's time, which a fork shares.
+	at := moment(res.TS)
+	if mk.madeCommit && !shown[KindCommit] && !strings.Contains(text, "nothing to commit") && !strings.Contains(text, "up to date") {
+		dir := firstText(mk.commitDir, d.Workdir, call.Cwd)
+		add(Result{Kind: KindCommit, Key: KindCommit + ":?" + dir + "@" + at, Text: strings.TrimSuffix("commit (hash not shown) in "+dir, " in "),
+			Hidden: true})
+	}
+	if mk.madePush && !shown[KindPush] && !strings.Contains(text, "Everything up-to-date") {
+		add(Result{Kind: KindPush, Key: KindPush + ":?" + mk.remote + "@" + at, Text: strings.TrimSuffix("push (refs not shown) to "+mk.remote, " to "),
+			Hidden: true})
+	}
+	if mk.madePR && !shown[KindPR] && !strings.Contains(text, "already exists") {
+		add(Result{Kind: KindPR, Key: KindPR + ":?@" + at, Text: "pull request (address not shown)", Hidden: true})
+	}
 	return out
+}
+
+func firstText(xs ...string) string {
+	for _, x := range xs {
+		if x != "" {
+			return x
+		}
+	}
+	return ""
 }

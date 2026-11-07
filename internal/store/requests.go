@@ -217,14 +217,16 @@ func (s *Store) ThreadParentMeta(ctx context.Context, session string) (string, e
 
 // ThreadRead is what a request reads of a session's transcript events: its main thread's text (the turns, the
 // replies, what was cut from a turn), every call and result of the Writers, and the calls of the Shells whose text
-// holds one of CallMarks with their results that hold one of ResultMarks. Tool names are compared in lower case.
+// holds one of CallMarks with their results, whatever these hold (a quiet command's may hold nothing). Tool names
+// are compared in lower case.
 type ThreadRead struct {
-	Writers, Shells        []string
-	CallMarks, ResultMarks []string
+	Writers, Shells []string
+	CallMarks       []string
 }
 
 // ThreadEvents passes a session's transcript events that read selects, its subagents' among them, oldest first,
-// to fn, one at a time: a long session is never held whole, and what no request reads stays in the database.
+// to fn, one at a time: a long session is never held whole, and what no request reads stays in the database. A
+// shell's result is selected by its call's tool id, inside the database.
 func (s *Store) ThreadEvents(ctx context.Context, session string, read ThreadRead, fn func(Event) error) error {
 	in := func(names []string) string {
 		if len(names) == 0 {
@@ -232,22 +234,25 @@ func (s *Store) ThreadEvents(ctx context.Context, session string, read ThreadRea
 		}
 		return "(?" + strings.Repeat(",?", len(names)-1) + ")"
 	}
-	marks := func(ms []string) string {
-		if len(ms) == 0 {
-			return "0"
-		}
-		return "(" + strings.TrimSuffix(strings.Repeat("instr(summary, ?) > 0 OR ", len(ms)), " OR ") + ")"
+	marks := "1"
+	if len(read.CallMarks) > 0 {
+		marks = "(" + strings.TrimSuffix(strings.Repeat("instr(summary, ?) > 0 OR ", len(read.CallMarks)), " OR ") + ")"
 	}
-	args := []any{session, Transcripts}
-	args = append(args, anys(read.Writers)...)
+	const toolID = `CASE WHEN json_valid(meta) THEN json_extract(meta, '$.tool_id') END`
+	shellCall := `kind = 'tool_call' AND lower(tool) IN ` + in(read.Shells) + ` AND ` + marks
+	var args []any
+	args = append(append(append(args, session, Transcripts), anys(read.Shells)...), anys(read.CallMarks)...)
+	args = append(append(args, session, Transcripts), anys(read.Writers)...)
 	args = append(append(args, anys(read.Shells)...), anys(read.CallMarks)...)
-	args = append(append(args, anys(read.Shells)...), anys(read.ResultMarks)...)
-	rows, err := s.db.QueryContext(ctx, `SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
+	args = append(args, anys(read.Shells)...)
+	rows, err := s.db.QueryContext(ctx, `WITH calls(id) AS (SELECT `+toolID+` FROM events INDEXED BY events_session
+	    WHERE session = ? AND source = ? AND `+shellCall+`)
+	  SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
 	  tool, summary, meta, ref, heuristic, experiment FROM events INDEXED BY events_session WHERE session = ? AND source = ? AND (
 	    (kind IN ('owner_text', 'agent_text') AND (agent = '' OR agent = session))
 	    OR (kind IN ('tool_call', 'tool_result') AND lower(tool) IN `+in(read.Writers)+`)
-	    OR (kind = 'tool_call' AND lower(tool) IN `+in(read.Shells)+` AND `+marks(read.CallMarks)+`)
-	    OR (kind = 'tool_result' AND lower(tool) IN `+in(read.Shells)+` AND `+marks(read.ResultMarks)+`))
+	    OR (`+shellCall+`)
+	    OR (kind = 'tool_result' AND lower(tool) IN `+in(read.Shells)+` AND `+toolID+` IN (SELECT id FROM calls)))
 	  ORDER BY ts, source_key`, args...)
 	if err != nil {
 		return err
