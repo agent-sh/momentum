@@ -1345,7 +1345,7 @@ printf 'username=fixture\npassword=synthetic\n'`)
 	t.Setenv("GIT_CONFIG_PARAMETERS", "'credential.helper=untrusted'")
 	for _, cli := range []string{gh, ""} {
 		s.GH = cli
-		for key, want := range map[string]string{"credential.helper": "\n", "credential.https://github.com.helper": "!" + shellQuote(firstOf(cli, "gh")) + " auth git-credential\n"} {
+		for key, want := range map[string]string{"credential.helper": "\n", "credential.https://github.com.helper": "!" + ShellQuote(firstOf(cli, "gh")) + " auth git-credential\n"} {
 			out, err := s.git(ctx, f.main, "config", "--get-all", key)
 			if err != nil || out != want {
 				t.Fatalf("%s: %q, want %q: %v", key, out, want, err)

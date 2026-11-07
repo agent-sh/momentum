@@ -163,7 +163,7 @@ func TestAgentIgnoresForgedChargesAndTokenClaims(t *testing.T) {
 			b.reply = structuredFrames(`{"findings":[],"summary":"terminal"}`)
 			b.mu.Unlock()
 			record := `{"type":"result","subtype":"success","num_turns":999,"total_cost_usd":1000,"usage":{"input_tokens":99999},"structured_output":{"findings":[],"summary":"terminal"}}`
-			body := "echo " + shellQuote(record)
+			body := "echo " + ShellQuote(record)
 			if routed {
 				body = `curl -s -o /dev/null -d '{"max_tokens":1000,"messages":[{"role":"user","content":"marker-7f3a"}]}' "$ANTHROPIC_BEDROCK_BASE_URL/model/global.anthropic.claude-opus-5-5/invoke-with-response-stream"` + "\n" + body
 			}

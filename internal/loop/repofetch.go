@@ -1243,7 +1243,7 @@ func fetchGit(ctx context.Context, call mirrorCall, args ...string) ([]byte, err
 	pins := append([]string{"--git-dir=" + call.mirror}, GitSafety()...)
 	pins = append(pins, "-c", "uploadpack.packObjectsHook=",
 		"-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always", "-c", "protocol.file.allow=always",
-		"-c", "credential.helper=", "-c", "credential.https://github.com.helper=!"+shellQuote(firstOf(call.gh, "gh"))+" auth git-credential")
+		"-c", "credential.helper=", "-c", "credential.https://github.com.helper=!"+ShellQuote(firstOf(call.gh, "gh"))+" auth git-credential")
 	pins = append(pins, remotePins()...)
 	cmd := exec.CommandContext(ctx, "git", append(pins, args...)...)
 	for _, kv := range GitEnv() {

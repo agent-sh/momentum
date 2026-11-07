@@ -12,10 +12,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/config"
 	"github.com/agent-sh/momentum/internal/loop"
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/store"
@@ -538,5 +540,18 @@ func TestFirstTextIsAPlainLine(t *testing.T) {
 	got := firstText("\x1b[2J\x1b]0;forged title\x07a plain summary\nsecond line")
 	if strings.ContainsAny(got, "\x1b\x07\n") || !strings.Contains(got, "a plain summary") {
 		t.Fatalf("control characters reached the terminal: %q", got)
+	}
+}
+
+// A dry pass reads the configuration targets' switch and list as a live one does, with the loop's own files refused.
+func TestADryPassReadsTheConfigurationTargets(t *testing.T) {
+	c := config.Loop{ConfigTargets: config.ConfigTargets{Enabled: true, Allow: []string{".config/agents/RULES.md"}}, Rules: []string{"~/.config/agents/SHARED.md"}}
+	r := selectionRunner(nil, c)
+	if !r.Ship.ConfigTargets.Enabled || len(r.Ship.ConfigTargets.Allow) != 1 || r.Ship.ConfigTargets.Home == "" ||
+		!slices.Contains(r.Ship.ConfigTargets.Own, filepath.Join(paths.Home(), ".config/agents/SHARED.md")) || !slices.Contains(r.Ship.ConfigTargets.Own, paths.Config()) {
+		t.Fatalf("dry ship: %+v", r.Ship.ConfigTargets)
+	}
+	if r = selectionRunner(nil, config.Loop{}); r.Ship.ConfigTargets.Enabled {
+		t.Fatalf("off: %+v", r.Ship.ConfigTargets)
 	}
 }

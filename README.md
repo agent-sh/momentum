@@ -230,6 +230,12 @@ Host `evidence show` scrubs all headers and whole records in one batch, then cli
 
 `loop.owners`, `loop.exclude`, `loop.repo_guard`, `loop.sandbox_read`, `loop.capacity_gate` and `loop.live` control host builds and landing. A missing repository guard refuses writes. Run the pass from its own oneshot user unit after ingest.
 
+`loop.config_targets` lets the loop propose a change to a configuration file. It is off by default and admits only the existing files `allow` names exactly; an empty list admits none. The proposal is advice: momentum checks the change on a copy, keeps the proposal and its patch under its own directory, reviews it in a clean context, and files a clean one as a low problem note. It never writes the file and never measures the change. An agent applies the patch with its own tools and closes the case with `momentum case close CASE --reason already-solved --fix config:~/PATH@SHA256 --why ...`, or declines it with `--reason not-worth-it`. If the problem comes back, new evidence reopens the case. The loop's own rules, policy and configuration, harness settings, credential files, `bin` directories, databases, programs and links are refused in code, whatever the list says:
+
+```json
+{"loop": {"config_targets": {"enabled": true, "allow": ["~/.config/agents/procedures/example.md"]}}}
+```
+
 ## The ship tool
 
 The owner's CLI controls the same host package lifecycle:

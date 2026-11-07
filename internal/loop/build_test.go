@@ -39,11 +39,11 @@ func TestInvestigationRepositoryAndEpisode(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, _ = st.CaseByID(ctx, c.ID)
-	if name, err := r.caseRepo(ctx, c); err != nil || name != "main" || c.Status != store.CaseTesting {
+	if name, _, err := r.caseTarget(ctx, c); err != nil || name != "main" || c.Status != store.CaseTesting {
 		t.Fatalf("repository was not recorded: %s %s %v", name, c.Status, err)
 	}
 	c.Episode++
-	if name, err := r.caseRepo(ctx, c); err != nil || name != "" {
+	if name, _, err := r.caseTarget(ctx, c); err != nil || name != "" {
 		t.Fatalf("old episode selected a repository: %s %v", name, err)
 	}
 }
