@@ -16,10 +16,20 @@ func (r *Runner) reviews(ctx context.Context, only string, families ...string) [
 		return nil
 	}
 	var out []Done
-	cs, err := r.Store.Cases(ctx, store.CaseFilter{Statuses: []store.CaseStatus{store.CaseTesting}})
-	if err != nil {
-		r.logf("reviews: %v", err)
-		return nil
+	// each family's cases are read on their own, so a row of one that cannot be read keeps no other family's reviews
+	var cs []store.Case
+	reads := []string{""} // no families: every family's at once
+	if len(families) > 0 {
+		reads = families
+	}
+	for _, fam := range reads {
+		fcs, err := r.Store.Cases(ctx, store.CaseFilter{Family: fam, Statuses: []store.CaseStatus{store.CaseTesting}})
+		if err != nil {
+			r.logf("reviews %s: %v", fam, err)
+			out = append(out, Done{Family: fam, Step: StepReview, Skipped: "cannot read the cases in testing: " + err.Error()})
+			continue
+		}
+		cs = append(cs, fcs...)
 	}
 	for _, c := range cs {
 		if len(families) > 0 && !slices.Contains(families, c.Family) {

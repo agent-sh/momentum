@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 
 	"os"
 	"path/filepath"
@@ -28,6 +29,13 @@ const (
 	StepBuild       = "build"
 	StepReview      = "review"
 	StepMeasure     = "measure"
+)
+
+// The pass's turns, as the store keeps them (LoopTurn): turnBuild names the family whose build a pass reserved last,
+// turnRun the family in whose place a pass reserved its first run.
+const (
+	turnBuild = StepBuild
+	turnRun   = "run"
 )
 
 // Budgets are the loop's limits, in US dollars and time. The defaults come from the Phase 0 baseline: what the
@@ -98,6 +106,7 @@ func (r *Runner) logf(format string, args ...any) {
 // nothing, ends no run and files no finding.
 func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 	r.handUnread = nil
+	o.Families = uniqueFamilies(o.Families) // a family named twice is one family
 	if !o.Dry {
 		if err := sandbox.Available(true); err != nil {
 			return nil, err
@@ -136,12 +145,22 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 	if err != nil {
 		return nil, err
 	}
-	families := r.Families
+	families := uniqueFamilies(r.Families)
 	if len(o.Families) > 0 {
 		families = o.Families
 	}
+	// the turns: a turn the store cannot read leaves its order as configured
+	turns := map[string]string{}
+	for _, kind := range []string{turnBuild, turnRun} {
+		turn, err := r.Store.LoopTurn(ctx, kind)
+		if err != nil {
+			r.logf("the loop's %s turn: %v; the pass takes the families in their configured order", kind, err)
+			continue
+		}
+		turns[kind] = turn
+	}
 	// every family's run is reserved before any starts, so the budgets count each in flight at its whole budget
-	// whatever the others spend meanwhile; a pick that fails stops the reserving, and the runs reserved still run
+	// whatever the others spend meanwhile
 	type reserved struct {
 		fam, step string
 		c         store.Case
@@ -150,7 +169,8 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 	var (
 		done   []Done
 		starts []reserved
-		picked error
+		picked error    // the first family's pick that failed: the pass returns it after the others' runs
+		clean  []string // the families picked without an error
 	)
 	for _, m := range measured {
 		did := m.Status
@@ -162,73 +182,163 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		}
 		done = append(done, Done{Case: m.Case, Step: StepMeasure, Did: did})
 	}
-	building := false
+	cands := map[string][]candidate{}
 	for _, fam := range families {
 		if ctx.Err() != nil { // the pass was told to stop (a signal): no run starts
 			done = append(done, Done{Family: fam, Skipped: "stopped: " + ctx.Err().Error()})
 			continue
 		}
-		c, step, why, err := r.pick(ctx, fam, o.Case, o.Dry)
+		cs, why, err := r.candidates(ctx, fam, o.Case, o.Dry)
 		done = append(done, r.pickedSkips...)
-		if err != nil {
-			picked = err
-			break
-		}
 		switch {
-		case c.ID == "":
+		case err != nil:
+			if picked == nil {
+				picked = err
+			}
+			done = append(done, Done{Family: fam, Skipped: "pick: " + err.Error()})
+			continue
+		case len(cs) == 0:
 			done = append(done, Done{Family: fam, Skipped: why})
-			continue
-		case o.Dry:
-			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Skipped: "dry: " + why})
-			continue
+		default:
+			cands[fam] = cs
 		}
-		if step == StepBuild && building {
-			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Skipped: "another case builds in this pass"})
-			continue
+		clean = append(clean, fam)
+	}
+	// prepareStep prepares one family's run without reserving it, and says what came of it: ready, or a run recorded
+	// (the budgets refuse it, its preparation failed), or none (a hold, inputs that could not be made)
+	prepared := map[string]store.LoopRun{} // by case: a build prepared and not yet reserved
+	prepareStep := func(fam string, c store.Case, step string) (store.LoopRun, outcome) {
+		if ctx.Err() != nil {
+			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Skipped: "stopped: " + ctx.Err().Error()})
+			return store.LoopRun{}, runNone
 		}
 		if why, err := r.affordable(ctx); why != "" || err != nil {
 			run, refusal := r.reserve(ctx, fam, c.ID, step)
 			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Run: run, Skipped: refusal})
-			continue
+			return store.LoopRun{}, runRecorded
 		}
 		if err := r.prepareInputs(ctx); err != nil {
 			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Skipped: "inputs: " + err.Error()})
-			continue
+			return store.LoopRun{}, runNone
 		}
 		run, inputErr := r.prepareRun(ctx, c, fam, step)
-		if inputErr != nil {
-			if step == StepBuild && held(inputErr) {
-				done = append(done, r.buildSkipped(ctx, c, "prepare", inputErr))
-				continue
-			}
-			if step == StepBuild {
-				run, refusal := r.reservePrepared(ctx, run)
-				if refusal != "" {
-					done = append(done, Done{Family: fam, Case: c.ID, Step: step, Run: run, Skipped: refusal})
-					continue
-				}
-				key := "build inputs"
-				var staged *buildStageError
-				if errors.As(inputErr, &staged) {
-					key = staged.key
-				}
-				res := Result{Started: true, CostKnown: true, Status: store.RunFailed, Failure: key, Text: inputErr.Error()}
-				r.finish(context.WithoutCancel(ctx), c, &run, res, nil)
-				done = append(done, Done{Family: fam, Case: c.ID, Step: step, Run: run})
-			} else {
-				done = append(done, Done{Family: fam, Case: c.ID, Step: step, Skipped: "inputs: " + inputErr.Error()})
-			}
-			continue
+		switch {
+		case inputErr == nil:
+			return run, runReady
+		case step == StepBuild && held(inputErr):
+			done = append(done, r.buildSkipped(ctx, c, "prepare", inputErr))
+			return store.LoopRun{}, runNone
+		case step != StepBuild:
+			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Skipped: "inputs: " + inputErr.Error()})
+			return store.LoopRun{}, runNone
 		}
 		run, refusal := r.reservePrepared(ctx, run)
 		if refusal != "" {
 			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Run: run, Skipped: refusal})
-			continue
+			return store.LoopRun{}, runRecorded
 		}
-		if step == StepBuild {
-			building = true
+		key := "build inputs"
+		var staged *buildStageError
+		if errors.As(inputErr, &staged) {
+			key = staged.key
+		}
+		res := Result{Started: true, CostKnown: true, Status: store.RunFailed, Failure: key, Text: inputErr.Error()}
+		r.finish(context.WithoutCancel(ctx), c, &run, res, nil)
+		done = append(done, Done{Family: fam, Case: c.ID, Step: step, Run: run})
+		return store.LoopRun{}, runRecorded
+	}
+	// reserveReady reserves a prepared run
+	reserveReady := func(fam string, c store.Case, step string, run store.LoopRun) outcome {
+		if ctx.Err() != nil {
+			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Skipped: "stopped: " + ctx.Err().Error()})
+			return runNone
+		}
+		run, refusal := r.reservePrepared(ctx, run)
+		if refusal != "" {
+			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Run: run, Skipped: refusal})
+			return runRecorded
 		}
 		starts = append(starts, reserved{fam, step, c, run})
+		return runReserved
+	}
+	// unready removes what a prepared build left on the host when it ends unreserved (refused, or the pass stopped)
+	unready := func(id string) {
+		if run, ok := prepared[id]; ok {
+			delete(prepared, id)
+			removeInputTree(HostDir(run.Dir))
+			removeInputTree(run.Dir)
+		}
+	}
+	prepare := func(fam string, c candidate) outcome {
+		if o.Dry {
+			return runReady
+		}
+		run, out := prepareStep(fam, c.c, c.step)
+		if out == runReady {
+			prepared[c.c.ID] = run
+		}
+		return out
+	}
+	reserve := func(fam string, c candidate) outcome {
+		if o.Dry { // as a live pass would reserve it, with nothing prepared, reserved or written
+			done = append(done, Done{Family: fam, Case: c.c.ID, Step: c.step, Skipped: "dry: " + c.why()})
+			return runReserved
+		}
+		run, ok := prepared[c.c.ID]
+		if !ok {
+			var out outcome
+			if run, out = prepareStep(fam, c.c, c.step); out != runReady {
+				return out
+			}
+		}
+		out := reserveReady(fam, c.c, c.step, run)
+		if out == runReserved {
+			delete(prepared, c.c.ID)
+		} else {
+			unready(c.c.ID)
+		}
+		return out
+	}
+	// the room the budgets leave: a dry pass ignores the budgets, and one that cannot read them prepares as if
+	// they had room, so affordable refuses what they do not
+	room, roomWhy := len(families), ""
+	if !o.Dry {
+		var err error
+		if room, roomWhy, err = r.room(ctx); err != nil {
+			r.logf("the loop's budgets: %v", err)
+			room, roomWhy = len(families), ""
+		}
+	}
+	steps, next := schedule(families, cands, turns, room, prepare, reserve)
+	for id := range prepared { // cannot happen: schedule reserves every build it readies
+		unready(id)
+	}
+	for _, s := range steps {
+		switch {
+		case s.skipped == noRoom:
+			done = append(done, Done{Family: s.fam, Case: s.cand.c.ID, Step: s.cand.step, Skipped: s.skipped + " (" + roomWhy + ")"})
+		case s.skipped != "":
+			done = append(done, Done{Family: s.fam, Case: s.cand.c.ID, Step: s.cand.step, Skipped: s.skipped})
+		}
+	}
+	if !o.Dry {
+		// a turn the store cannot write keeps its old family: the pass counts it among its steps
+		failed, changed := 0, 0
+		var writeErr error
+		for _, kind := range []string{turnBuild, turnRun} {
+			if next[kind] == turns[kind] {
+				continue
+			}
+			changed++
+			if err := r.Store.SetLoopTurn(ctx, kind, next[kind], r.now()); err != nil {
+				failed++
+				writeErr = err
+				r.logf("the loop's %s turn of %s: %v", kind, next[kind], err)
+			}
+		}
+		if failed > 0 {
+			done = append(done, Done{Step: "turn", Skipped: fmt.Sprintf("%d of %d turns not recorded: %v", failed, changed, writeErr)})
+		}
 	}
 	var (
 		mu sync.Mutex
@@ -245,20 +355,29 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		}(s)
 	}
 	wg.Wait()
-	if picked != nil {
-		return done, picked
-	}
-	if !o.Dry {
-		done = append(done, r.reviews(ctx, o.Case, families...)...)
+	// a family whose pick failed stops no other family's reviews, landings or lessons
+	if !o.Dry && (len(clean) > 0 || len(families) == 0) {
+		done = append(done, r.reviews(ctx, o.Case, clean...)...)
 		if err := r.noteWaiting(ctx); err != nil {
 			r.logf("waiting packages: %v", err)
 		}
-		if err := r.lessons(ctx, o.Case, families); err != nil {
-			return done, err
+		if err := r.lessons(ctx, o.Case, clean); err != nil && picked == nil {
+			picked = err
 		}
 	}
 	sort.Slice(done, func(i, j int) bool { return done[i].Family+done[i].Step < done[j].Family+done[j].Step })
-	return done, nil
+	return done, picked
+}
+
+// inTurn is a turn's order of the families: as given, starting after the family the turn names (schedule), so the one
+// build of a pass, and the room the budgets leave, go to each family in turn. A family not among them, or none, keeps
+// the order as given.
+func inTurn(families []string, last string) []string {
+	i := slices.Index(families, last)
+	if i < 0 {
+		return families
+	}
+	return slices.Concat(families[i+1:], families[:i+1])
 }
 
 func (r *Runner) buildSkipped(ctx context.Context, c store.Case, stage string, cause error) Done {
@@ -465,17 +584,32 @@ func (r *Runner) endStale(ctx context.Context) error {
 
 // pick takes investigating cases before open cases, subject to reservations and budgets.
 func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store.Case, string, string, error) {
+	cands, why, err := r.candidates(ctx, family, only, dry)
+	if err != nil || len(cands) == 0 {
+		return store.Case{}, "", why, err
+	}
+	return cands[0].c, cands[0].step, cands[0].why(), nil
+}
+
+// candidate is a case a family's pick may run, with its step.
+type candidate struct {
+	c    store.Case
+	step string
+	rank int
+}
+
+func (c candidate) why() string {
+	return fmt.Sprintf("%s %s (%s, %d evidence)", c.step, c.c.ID, c.c.Status, c.c.Evidence)
+}
+
+// candidates are the family's workable cases, best first (pick takes the first), or none and why.
+func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) ([]candidate, string, error) {
 	r.pickedSkips = nil
 	cs, err := r.Store.Cases(ctx, store.CaseFilter{Family: family, All: true})
 	if err != nil {
-		return store.Case{}, "", "", err
+		return nil, "", err
 	}
-	type cand struct {
-		c    store.Case
-		step string
-		rank int
-	}
-	var cands []cand
+	var cands []candidate
 	var passed []string
 	if !dry {
 		if err := r.releaseHolds(ctx, cs); err != nil {
@@ -488,7 +622,7 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 		}
 		spent, running, err := r.caseRoom(ctx, c)
 		if err != nil {
-			return store.Case{}, "", "", err
+			return nil, "", err
 		}
 		if running {
 			passed = append(passed, c.ID+" has a run in flight")
@@ -498,7 +632,7 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 			p, ok, err := r.Ship.Load(c.ID)
 			if err != nil {
 				if noteErr := r.packageProblem(ctx, c, err, dry); noteErr != nil {
-					return store.Case{}, "", "", noteErr
+					return nil, "", noteErr
 				}
 				passed = append(passed, c.ID+" package: "+err.Error())
 				r.pickSkipped(c, "package", err)
@@ -579,7 +713,7 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 			}
 			if p, ok, err := r.Ship.Load(c.ID); err != nil {
 				if noteErr := r.packageProblem(ctx, c, err, dry); noteErr != nil {
-					return store.Case{}, "", "", noteErr
+					return nil, "", noteErr
 				}
 				passed = append(passed, c.ID+" package: "+err.Error())
 				r.pickSkipped(c, "package", err)
@@ -624,8 +758,19 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 					continue
 				}
 			}
-			if repo, err := r.caseRepo(ctx, c); err != nil {
-				return store.Case{}, "", "", err
+			var unread recordError
+			if repo, err := r.caseRepo(ctx, c); errors.As(err, &unread) {
+				// one case's record: the case waits with a low note, and its family's next case runs
+				if !dry {
+					if noteErr := r.noteBuildSkip(ctx, c, "record", err.Error()); noteErr != nil { // it ends with testing (recordNotePrefix)
+						r.logf("record note: %v", noteErr)
+					}
+				}
+				passed = append(passed, c.ID+" record: "+err.Error())
+				r.pickSkipped(c, "record", err)
+				continue
+			} else if err != nil {
+				return nil, "", err
 			} else if repo == "" {
 				if !dry {
 					r.keepHold(ctx, c, "waits for a repository: the investigation named none", true)
@@ -657,19 +802,19 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 			continue
 		}
 		if stop, err := r.stopped(ctx, c, dry); err != nil {
-			return store.Case{}, "", "", err
+			return nil, "", err
 		} else if stop != "" {
 			passed = append(passed, c.ID+" stopped: "+stop)
 			continue
 		}
-		cands = append(cands, cand{c, step, rank})
+		cands = append(cands, candidate{c, step, rank})
 	}
 	if len(cands) == 0 {
 		why := "no case to work"
 		if len(passed) > 0 {
 			why += " (" + strings.Join(passed, "; ") + ")"
 		}
-		return store.Case{}, "", why, nil
+		return nil, why, nil
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
 		a, b := cands[i], cands[j]
@@ -681,7 +826,7 @@ func (r *Runner) pick(ctx context.Context, family, only string, dry bool) (store
 		}
 		return a.c.Seen.After(b.c.Seen)
 	})
-	return cands[0].c, cands[0].step, fmt.Sprintf("%s %s (%s, %d evidence)", cands[0].step, cands[0].c.ID, cands[0].c.Status, cands[0].c.Evidence), nil
+	return cands, "", nil
 }
 
 // keepHold records a hold's change. A failure to record it holds no selection: the hold still takes no slot.
@@ -1001,6 +1146,34 @@ func (r *Runner) affordable(ctx context.Context) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+// room is how many runs the day's and the week's budgets leave now, the smaller, and the budget that binds it, as
+// affordable names it.
+func (r *Runner) room(ctx context.Context) (int, string, error) {
+	if r.Budgets.Run <= 0 { // a run reserves nothing: the budgets never refuse one (affordable)
+		return math.MaxInt, "", nil
+	}
+	now := r.now()
+	n, why := -1, ""
+	for _, lim := range []struct {
+		name  string
+		since time.Time
+		usd   float64
+	}{{"day", now.Add(-24 * time.Hour), r.Budgets.Day}, {"week", now.Add(-7 * 24 * time.Hour), r.Budgets.Week}} {
+		spent, err := r.Store.LoopSpend(ctx, lim.since, r.Budgets.Run)
+		if err != nil {
+			return 0, "", err
+		}
+		left := 0
+		if lim.usd >= spent+r.Budgets.Run {
+			left = int((lim.usd - spent) / r.Budgets.Run)
+		}
+		if n < 0 || left < n {
+			n, why = left, fmt.Sprintf("the loop's %s budget: $%.2f spent of $%.0f", lim.name, spent, lim.usd)
+		}
+	}
+	return n, why, nil
 }
 
 func (r *Runner) invoke(ctx context.Context, family string, c store.Case, step string, run store.LoopRun) (Result, error) {

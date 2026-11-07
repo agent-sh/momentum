@@ -1,0 +1,588 @@
+package loop
+
+import (
+	"context"
+	"database/sql"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/agent-sh/momentum/internal/store"
+)
+
+// turnRunner is a live runner with one testing case in each family, in that order, whose builds the host refuses
+// after their reservation (a toolchain that is absent), so each build that takes the pass's slot fails.
+func turnRunner(t *testing.T, families ...string) (*Runner, []store.Case) {
+	t.Helper()
+	fakeManager(t)
+	r, _ := inputRunner(t) // its case is in failures, open, and no family here has failures in it
+	f := newRepo(t, nil)
+	r.Ship = shipWithSandbox(r.Store, f, Sandbox{})
+	r.Ship.Dir = r.Dir
+	r.Inputs.ReadDirs = []string{f.main}
+	r.Toolchains.ReadOnly = []string{filepath.Join(t.TempDir(), "absent")}
+	r.Families = families
+	ctx := context.Background()
+	mechanism, fix := "One cause", "One test"
+	var cs []store.Case
+	for _, fam := range families {
+		c := openCase(t, r.Store, fam, "marker-7f3a-"+fam, 1)
+		c, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture")
+		if err != nil {
+			t.Fatal(err)
+		}
+		setCaseRepo(t, r.Store, c, "main")
+		cs = append(cs, c)
+	}
+	return r, cs
+}
+
+// builtIn runs one pass and returns the case whose build took its slot, and the cases another case's build skipped.
+func builtIn(t *testing.T, r *Runner) (built store.LoopRun, skipped []string) {
+	t.Helper()
+	done, err := r.Once(context.Background(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range done {
+		switch {
+		case d.Step == StepBuild && d.Run.ID != "" && d.Skipped == "": // a refused reservation has a run too
+			if built.ID != "" {
+				t.Fatalf("two builds in one pass: %+v", done)
+			}
+			built = d.Run
+		case d.Step == StepBuild && d.Skipped == "another case builds in this pass":
+			skipped = append(skipped, d.Case)
+		}
+	}
+	if built.ID == "" {
+		t.Fatalf("no case built: %+v", done)
+	}
+	return built, skipped
+}
+
+// A case that built last pass and failed yields the pass's build to another family's testing case that waits.
+func TestAFailedBuildYieldsToAnotherFamilysWaitingCase(t *testing.T) {
+	r, cs := turnRunner(t, "owner-burden", "sessions")
+	first, second := cs[0], cs[1]
+	built, skipped := builtIn(t, r)
+	if built.Case != first.ID || len(skipped) != 1 || skipped[0] != second.ID {
+		t.Fatalf("the first pass did not build the first family's case: %s, skipped %v", built.Case, skipped)
+	}
+	run, err := r.Store.LoopRunByID(context.Background(), built.ID)
+	if err != nil || run.Status != store.RunFailed {
+		t.Fatalf("the first build did not fail: %+v %v", run, err)
+	}
+	built, skipped = builtIn(t, r)
+	if built.Case != second.ID || len(skipped) != 1 || skipped[0] != first.ID {
+		t.Fatalf("the case that failed last pass built again while another family's case waited: %s, skipped %v", built.Case, skipped)
+	}
+}
+
+// Each pass's build goes to the family after the one that built last, round the families.
+func TestBuildTurnsRotateAcrossFamilies(t *testing.T) {
+	r, cs := turnRunner(t, "owner-burden", "sessions", "manual-work")
+	for pass, want := range []store.Case{cs[0], cs[1], cs[2], cs[0]} {
+		built, skipped := builtIn(t, r)
+		if built.Case != want.ID || len(skipped) != 2 {
+			t.Fatalf("pass %d built %s (%s), skipped %v; want %s (%s)", pass+1, built.Case, built.Family, skipped, want.ID, want.Family)
+		}
+	}
+	if turn, err := r.Store.LoopTurn(context.Background(), StepBuild); err != nil || turn != cs[0].Family {
+		t.Fatalf("the store names %q as the family that built last, want %q: %v", turn, cs[0].Family, err)
+	}
+}
+
+// A family alone takes the build of every pass: there is no other family's case to yield to.
+func TestASingleFamilyBuildsEveryPass(t *testing.T) {
+	r, cs := turnRunner(t, "sessions")
+	for pass := range 2 { // a third build would meet the stop rule: two builds that failed the same way
+		built, skipped := builtIn(t, r)
+		if built.Case != cs[0].ID || len(skipped) != 0 {
+			t.Fatalf("pass %d built %s, skipped %v", pass+1, built.Case, skipped)
+		}
+		if turn, err := r.Store.LoopTurn(context.Background(), StepBuild); err != nil || turn != "sessions" {
+			t.Fatalf("pass %d recorded the build turn of %q: %v", pass+1, turn, err)
+		}
+	}
+}
+
+// A build held at its preparation takes no turn: the next family's case builds in the same pass and takes it.
+func TestAHeldBuildPassesThePassBuildToTheNextFamily(t *testing.T) {
+	r, cs := turnRunner(t, "owner-burden", "sessions")
+	calls := 0
+	r.Ship.Gate.Busy = func(context.Context, string) (string, error) {
+		if calls++; calls == 1 { // the first family's preparation, in turn order
+			return "marker-7f3a busy", nil
+		}
+		return "", nil
+	}
+	done, err := r.Once(context.Background(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var built string
+	held := false
+	for _, d := range done {
+		switch {
+		case d.Step == StepBuild && d.Run.ID != "" && d.Skipped == "":
+			built = d.Case
+		case d.Case == cs[0].ID && d.Step == StepBuild && d.Run.ID == "" && strings.Contains(d.Skipped, "marker-7f3a busy"):
+			held = true
+		}
+	}
+	if !held || built != cs[1].ID {
+		t.Fatalf("the held build did not pass the pass's build on: held %v, built %s: %+v", held, built, done)
+	}
+	if turn, err := r.Store.LoopTurn(context.Background(), StepBuild); err != nil || turn != cs[1].Family {
+		t.Fatalf("the store names %q as the family that built last, want %q: %v", turn, cs[1].Family, err)
+	}
+}
+
+// A tight budget gives the build and another family's investigation turns: with room for one run a pass, the family
+// that builds and the family that investigates alternate, so neither waits behind the other for good.
+func TestATightBudgetAlternatesTheBuildAndAnInvestigation(t *testing.T) {
+	r, cs := turnRunner(t, "owner-burden")
+	open := openCase(t, r.Store, "sessions", "marker-7f3a-open", 1)
+	r.Families = []string{"owner-burden", "sessions"}
+	r.Budgets.Day = 1.5 * r.Budgets.Run
+	for pass, build := range []bool{true, false, true} { // a third build would meet the stop rule
+		done, err := r.Once(context.Background(), Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		built, _ := turnStep(done, cs[0].ID, StepBuild)
+		ran, _ := turnStep(done, open.ID, StepInvestigate)
+		if built != build || ran == build {
+			t.Fatalf("pass %d: built %v, investigated %v; want the build %v: %+v", pass+1, built, ran, build, done)
+		}
+	}
+}
+
+// turnStep finds a pass's step of a case: whether a run was reserved for it, and why not.
+func turnStep(done []Done, caseID, step string) (reserved bool, skipped string) {
+	for _, d := range done {
+		if d.Case == caseID && d.Step == step {
+			if d.Run.ID != "" && d.Run.Status != store.RunRefused && d.Skipped == "" {
+				return true, ""
+			}
+			skipped = d.Skipped
+		}
+	}
+	return false, skipped
+}
+
+// A case whose stored record cannot be read is skipped with a low note: its family's next case runs, the other
+// families' runs go on, and the pass is no failure.
+func TestAnUnreadableCaseRecordSkipsTheCaseNotThePass(t *testing.T) {
+	r, cs := turnRunner(t, "owner-burden", "sessions")
+	open := openCase(t, r.Store, "sessions", "marker-7f3a-open", 1)
+	ctx := context.Background()
+	if err := r.Store.CaseNote(ctx, cs[1].ID, repoAction, "marker-7f3a unreadable", "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	for pass := 1; pass <= 2; pass++ {
+		done, err := r.Once(ctx, Options{})
+		if err != nil {
+			t.Fatalf("pass %d failed on one case's record: %v", pass, err)
+		}
+		if built, why := turnStep(done, cs[0].ID, StepBuild); !built {
+			t.Fatalf("pass %d: owner-burden did not build: %q", pass, why)
+		}
+		if ran, why := turnStep(done, open.ID, StepInvestigate); !ran {
+			t.Fatalf("pass %d: sessions did not investigate its next case: %q", pass, why)
+		}
+	}
+	recordNotes := func() (standing, all int) {
+		t.Helper()
+		notes, err := r.Store.Notes(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, n := range notes {
+			if strings.HasPrefix(n.ID, "loop-build:"+store.IDPart(cs[1].ID)+":record:") && n.Importance == store.ImportanceLow {
+				all++
+				if n.Done.IsZero() {
+					standing++
+				}
+			}
+		}
+		return standing, all
+	}
+	if standing, all := recordNotes(); standing != 1 || all != 1 {
+		t.Fatalf("the unreadable record has %d standing low notes of %d, want 1", standing, all)
+	}
+	// the case leaves testing: the record's note ends with the build it held
+	if _, err := r.Store.UpdateCase(ctx, cs[1].ID, store.CaseUpdate{Status: store.CaseInvestigating}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Once(ctx, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if standing, all := recordNotes(); standing != 0 || all != 1 {
+		t.Fatalf("the record's note stands after its case left testing: %d standing of %d", standing, all)
+	}
+}
+
+// A family whose cases cannot be read fails the pass, but stops no other family's runs or reviews: the others are
+// picked, built and reviewed, and the pass returns the error after them.
+func TestAFamilyWhoseStoreReadFailsStopsNoOtherFamilysBuildOrReview(t *testing.T) {
+	r, cs := turnRunner(t, "owner-burden", "sessions")
+	ctx := context.Background()
+	// sessions' testing case cannot be read: its pick fails, and so would a read of every family's cases in testing
+	db, err := sql.Open("sqlite", r.Store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE cases SET alternatives = 'marker-7f3a' WHERE id = ?`, cs[1].ID); err != nil {
+		t.Fatal(err)
+	}
+	// owner-burden has a second testing case whose package cannot be read: the pass's reviews report it
+	reviewed := openCase(t, r.Store, "owner-burden", "marker-7f3a-reviewed", 1)
+	mechanism, fix := "One cause", "One test"
+	if _, err := r.Store.UpdateCase(ctx, reviewed.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(r.Ship.pkgDir(reviewed.ID), "package.json"), "marker-7f3a")
+	for pass := 1; pass <= 2; pass++ {
+		done, err := r.Once(ctx, Options{})
+		if err == nil || !strings.Contains(err.Error(), "alternatives") {
+			t.Fatalf("pass %d did not return sessions' read error: %v", pass, err)
+		}
+		if built, why := turnStep(done, cs[0].ID, StepBuild); !built {
+			t.Fatalf("pass %d: owner-burden did not build: %q", pass, why)
+		}
+		if _, why := turnStep(done, reviewed.ID, StepReview); !strings.Contains(why, "package") {
+			t.Fatalf("pass %d: owner-burden's reviews did not run: %q: %+v", pass, why, done)
+		}
+	}
+}
+
+// A family named twice is one family: its case runs once in a pass.
+func TestAFamilyListedTwiceRunsItsCaseOncePerPass(t *testing.T) {
+	fakeManager(t)
+	r, c := inputRunner(t)
+	ctx := context.Background()
+	if _, err := r.Once(ctx, Options{Families: []string{c.Family, c.Family}}); err != nil {
+		t.Fatal(err)
+	}
+	live := ""
+	if runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID, Experiment: &live}); err != nil || len(runs) != 1 {
+		t.Fatalf("a family listed twice ran its case %d times: %v", len(runs), err)
+	}
+}
+
+// A family whose build is held at its preparation runs its next case in the pass instead.
+func TestAFamilyWhoseBuildIsHeldInvestigatesInThePass(t *testing.T) {
+	r, cs := turnRunner(t, "sessions")
+	open := openCase(t, r.Store, "sessions", "marker-7f3a-open", 1)
+	r.Ship.Gate.Busy = func(context.Context, string) (string, error) { return "marker-7f3a busy", nil }
+	done, err := r.Once(context.Background(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if built, why := turnStep(done, cs[0].ID, StepBuild); built || !strings.Contains(why, "marker-7f3a busy") {
+		t.Fatalf("the build was not held: %v %q", built, why)
+	}
+	if ran, why := turnStep(done, open.ID, StepInvestigate); !ran {
+		t.Fatalf("the family whose build is held did not investigate its next case: %q", why)
+	}
+}
+
+// A turn the store cannot read leaves the pass in the configured order with all its steps, and turns it cannot write
+// are counted among the pass's steps.
+func TestAnUnreadableTurnLeavesThePassInConfiguredOrder(t *testing.T) {
+	r, cs := turnRunner(t, "owner-burden", "sessions")
+	db, err := sql.Open("sqlite", r.Store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`DROP TABLE loop_turns`); err != nil {
+		t.Fatal(err)
+	}
+	done, err := r.Once(context.Background(), Options{})
+	if err != nil {
+		t.Fatalf("an unreadable turn failed the pass: %v", err)
+	}
+	if built, why := turnStep(done, cs[0].ID, StepBuild); !built {
+		t.Fatalf("the first configured family did not build: %q", why)
+	}
+	counted := false
+	for _, d := range done {
+		if d.Step == "turn" && strings.HasPrefix(d.Skipped, "2 of 2 turns not recorded") {
+			counted = true
+		}
+	}
+	if !counted {
+		t.Fatalf("the pass did not count its unwritten turns: %+v", done)
+	}
+}
+
+// A dry pass shows the pass's one build: a later family's build waits, and its next case is the one it would run.
+// It records no turn.
+func TestADryPassShowsTheOneBuildAndTheFallbackCase(t *testing.T) {
+	r, cs := turnRunner(t, "owner-burden", "sessions")
+	open := openCase(t, r.Store, "sessions", "marker-7f3a-open", 1)
+	ctx := context.Background()
+	done, err := r.Once(ctx, Options{Dry: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{cs[0].ID + " " + StepBuild: "dry: build " + cs[0].ID, cs[1].ID + " " + StepBuild: "another case builds in this pass",
+		open.ID + " " + StepInvestigate: "dry: investigate " + open.ID}
+	for _, d := range done {
+		if w, ok := want[d.Case+" "+d.Step]; ok && strings.HasPrefix(d.Skipped, w) {
+			delete(want, d.Case+" "+d.Step)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("the dry pass lacks %v: %+v", want, done)
+	}
+	if turn, err := r.Store.LoopTurn(ctx, turnBuild); err != nil || turn != "" {
+		t.Fatalf("a dry pass recorded the build turn %q: %v", turn, err)
+	}
+}
+
+// The pass's only build held at its preparation takes no turn while another family investigates, and the next pass
+// tries the held family's build first; the investigation takes its own turn.
+func TestAHeldOnlyBuildTakesNoTurnWhileAnotherFamilyInvestigates(t *testing.T) {
+	r, cs := turnRunner(t, "owner-burden")
+	open := openCase(t, r.Store, "sessions", "marker-7f3a-open", 1)
+	r.Families = []string{"owner-burden", "sessions"}
+	ctx := context.Background()
+	busy := true
+	r.Ship.Gate.Busy = func(context.Context, string) (string, error) {
+		if busy {
+			return "marker-7f3a busy", nil
+		}
+		return "", nil
+	}
+	done, err := r.Once(ctx, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if built, why := turnStep(done, cs[0].ID, StepBuild); built || !strings.Contains(why, "marker-7f3a busy") {
+		t.Fatalf("the build was not held: %v %q", built, why)
+	}
+	if ran, why := turnStep(done, open.ID, StepInvestigate); !ran {
+		t.Fatalf("sessions did not investigate: %q", why)
+	}
+	if turn, err := r.Store.LoopTurn(ctx, StepBuild); err != nil || turn != "" {
+		t.Fatalf("the held build took the turn: %q %v", turn, err)
+	}
+	if turn, err := r.Store.LoopTurn(ctx, turnRun); err != nil || turn != "sessions" {
+		t.Fatalf("the run turn is %q, want sessions: %v", turn, err)
+	}
+	busy = false
+	done, err = r.Once(ctx, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if built, why := turnStep(done, cs[0].ID, StepBuild); !built {
+		t.Fatalf("the next pass did not build owner-burden's case: %q", why)
+	}
+	if turn, err := r.Store.LoopTurn(ctx, StepBuild); err != nil || turn != "owner-burden" {
+		t.Fatalf("the build turn after it is %q: %v", turn, err)
+	}
+}
+
+// A build the budgets refuse takes no turn: the family whose turn it was builds when the budget has room again.
+func TestABuildTheBudgetRefusesTakesNoTurn(t *testing.T) {
+	r, cs := turnRunner(t, "owner-burden", "sessions")
+	ctx := context.Background()
+	if built, _ := builtIn(t, r); built.Case != cs[0].ID {
+		t.Fatalf("the first pass built %s", built.Case)
+	}
+	day := r.Budgets.Day
+	r.Budgets.Day = r.Budgets.Run / 2
+	done, err := r.Once(ctx, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if built, why := turnStep(done, cs[1].ID, StepBuild); built || !strings.Contains(why, "day budget") {
+		t.Fatalf("sessions' build was not refused on the budget: %v %q", built, why)
+	}
+	if turn, err := r.Store.LoopTurn(ctx, StepBuild); err != nil || turn != "owner-burden" {
+		t.Fatalf("a refused build moved the turn to %q: %v", turn, err)
+	}
+	r.Budgets.Day = day
+	if built, _ := builtIn(t, r); built.Case != cs[1].ID {
+		t.Fatalf("after the refusal the pass built %s (%s), not sessions' case", built.Case, built.Family)
+	}
+}
+
+// A family whose testing case waits for another family's build investigates its next case in the same pass.
+func TestAFamilyWhoseBuildWaitsInvestigatesInThePass(t *testing.T) {
+	r, cs := turnRunner(t, "owner-burden", "sessions")
+	open := openCase(t, r.Store, "sessions", "marker-7f3a-open", 1)
+	done, err := r.Once(context.Background(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if built, why := turnStep(done, cs[0].ID, StepBuild); !built {
+		t.Fatalf("owner-burden did not build: %q", why)
+	}
+	if built, why := turnStep(done, cs[1].ID, StepBuild); built || why != "another case builds in this pass" {
+		t.Fatalf("sessions' build did not wait: %v %q", built, why)
+	}
+	if ran, why := turnStep(done, open.ID, StepInvestigate); !ran {
+		t.Fatalf("sessions did not investigate its open case while its build waited: %q", why)
+	}
+}
+
+// Investigations take turns too: with room for one run a pass, two families with only open cases alternate.
+func TestEachPassInvestigatesTheNextFamilyUnderATightBudget(t *testing.T) {
+	fakeManager(t)
+	r, first := inputRunner(t)
+	second := openCase(t, r.Store, "sessions", "marker-7f3a-sessions", 1)
+	r.Families = []string{first.Family, "sessions"}
+	r.Budgets.Day = 1.5 * r.Budgets.Run
+	for pass, want := range []store.Case{first, second, first} {
+		done, err := r.Once(context.Background(), Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		other := second
+		if want.ID == second.ID {
+			other = first
+		}
+		ran, _ := turnStep(done, want.ID, StepInvestigate)
+		_, why := turnStep(done, other.ID, StepInvestigate)
+		if !ran || !strings.Contains(why, "day budget") {
+			t.Fatalf("pass %d: %s (%s) did not investigate alone (%v), the other's: %q: %+v", pass+1, want.ID, want.Family, ran, why, done)
+		}
+	}
+}
+
+// runDirs are the run directories the pass left under the runner's storage, by the run each belongs to.
+func runDirs(t *testing.T, r *Runner) []string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(r.Dir, "runs"))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range entries {
+		out = append(out, strings.TrimSuffix(strings.TrimPrefix(e.Name(), "."), "-host"))
+	}
+	return out
+}
+
+// A build whose place the budgets' room cannot reach is not prepared: it waits, with the budget that binds, and leaves
+// no run and nothing on disk.
+func TestABuildPastTheBudgetsRoomIsNotPrepared(t *testing.T) {
+	r, cs := turnRunner(t, "owner-burden")
+	open := openCase(t, r.Store, "sessions", "marker-7f3a-open", 1)
+	r.Families = []string{"sessions", "owner-burden"}
+	r.Budgets.Day = 1.5 * r.Budgets.Run
+	ctx := context.Background()
+	done, err := r.Once(ctx, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ran, _ := turnStep(done, open.ID, StepInvestigate)
+	built, why := turnStep(done, cs[0].ID, StepBuild)
+	if !ran || built || !strings.Contains(why, noRoom) || !strings.Contains(why, "day budget") {
+		t.Fatalf("investigated %v, built %v (%q): %+v", ran, built, why, done)
+	}
+	live := ""
+	if runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: cs[0].ID, Experiment: &live}); err != nil || len(runs) != 0 {
+		t.Fatalf("the waiting build has runs: %+v %v", runs, err)
+	}
+	investigation := ""
+	for _, d := range done {
+		if d.Case == open.ID && d.Step == StepInvestigate {
+			investigation = d.Run.ID
+		}
+	}
+	for _, id := range runDirs(t, r) {
+		if id != investigation {
+			t.Fatalf("the pass left %s on disk, not the investigation's %s", id, investigation)
+		}
+	}
+}
+
+// A build prepared and then not reserved leaves nothing on disk: its host and run directories go with it.
+func TestAReadyBuildLeftUnreservedLeavesNothingOnDisk(t *testing.T) {
+	r, cs := turnRunner(t, "sessions")
+	db, err := sql.Open("sqlite", r.Store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TRIGGER refuse_reservation BEFORE INSERT ON loop_runs WHEN NEW.status = 'running'
+	  BEGIN SELECT RAISE(ABORT, 'marker-7f3a refused'); END`); err != nil {
+		t.Fatal(err)
+	}
+	done, err := r.Once(context.Background(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if built, why := turnStep(done, cs[0].ID, StepBuild); built || !strings.Contains(why, "marker-7f3a refused") {
+		t.Fatalf("the build's reservation was not refused: %v %q", built, why)
+	}
+	if left := runDirs(t, r); len(left) != 0 {
+		t.Fatalf("the unreserved build left %v on disk", left)
+	}
+}
+
+// A family whose best build is held at its preparation tries its next testing case before anything else.
+func TestAHeldBuildTriesTheFamilysNextTestingCase(t *testing.T) {
+	r, cs := turnRunner(t, "sessions")
+	ctx := context.Background()
+	best := openCase(t, r.Store, "sessions", "marker-7f3a-best", 3) // more evidence: picked first
+	mechanism, fix := "One cause", "One test"
+	best, err := r.Store.UpdateCase(ctx, best.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setCaseRepo(t, r.Store, best, "main")
+	calls := 0
+	r.Ship.Gate.Busy = func(context.Context, string) (string, error) {
+		if calls++; calls == 1 { // the best case's preparation
+			return "marker-7f3a busy", nil
+		}
+		return "", nil
+	}
+	done, err := r.Once(ctx, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if built, why := turnStep(done, best.ID, StepBuild); built || !strings.Contains(why, "marker-7f3a busy") {
+		t.Fatalf("the best build was not held: %v %q", built, why)
+	}
+	if built, why := turnStep(done, cs[0].ID, StepBuild); !built {
+		t.Fatalf("the family's next testing case did not build: %q: %+v", why, done)
+	}
+}
+
+// An investigation whose inputs cannot be made gives its family's next case the run.
+func TestAnInvestigationWhoseInputsFailTriesTheNextCaseInThePass(t *testing.T) {
+	fakeManager(t)
+	r, _ := inputRunner(t)
+	ctx := context.Background()
+	broken := openCase(t, r.Store, "sessions", "marker-7f3a-broken", 3) // more evidence: picked first
+	next := openCase(t, r.Store, "sessions", "marker-7f3a-next", 1)
+	r.Families = []string{"sessions"}
+	db, err := sql.Open("sqlite", r.Store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE case_evidence SET at = 'marker-7f3a' WHERE case_id = ?`, broken.ID); err != nil {
+		t.Fatal(err)
+	}
+	done, err := r.Once(ctx, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran, why := turnStep(done, broken.ID, StepInvestigate); ran || !strings.HasPrefix(why, "inputs: ") {
+		t.Fatalf("the broken case's inputs did not fail: %v %q", ran, why)
+	}
+	if ran, why := turnStep(done, next.ID, StepInvestigate); !ran {
+		t.Fatalf("the family's next case did not investigate: %q: %+v", why, done)
+	}
+}
