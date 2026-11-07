@@ -351,7 +351,7 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 	// The case's evidence in the gate, and how much of it the signal counts. Where the case has evidence there, a signal
 	// that counts less than half of it does not measure the case's problem as it is now (its form may have changed):
 	// that refuses a measured plan and a guard alike, so it is checked before any guard stands in.
-	evs, err := s.Store.CaseEvidence(ctx, c.ID, 0)
+	evs, err := caseEvents(ctx, s.Store, c.ID, s.Dir)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -430,6 +430,32 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 	}
 	plan.Before, plan.BeforeBase = baseline.Hits, baseline.Base
 	return plan, nil
+}
+
+// caseEvents is a case's evidence of events (ev:ID), the loop's own left out by the one rule every count of a plan
+// keeps (store.InDir): the counts never count an event of the loop's own runs, so the evidence their admission weighs
+// them against holds none either. An event the store no longer holds stays, by its evidence's time.
+func caseEvents(ctx context.Context, st *store.Store, caseID, dir string) ([]store.Evidence, error) {
+	evidence, err := st.CaseEvidence(ctx, caseID, 0)
+	if err != nil {
+		return nil, err
+	}
+	var out []store.Evidence
+	for _, ev := range evidence {
+		id, ok := strings.CutPrefix(ev.Ref, "ev:")
+		if !ok {
+			continue
+		}
+		e, found, err := st.EventByID(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if found && store.InDir(e.Cwd, dir) {
+			continue
+		}
+		out = append(out, ev)
+	}
+	return out, nil
 }
 
 // expandHome is a path with a leading ~/ made the user's home.

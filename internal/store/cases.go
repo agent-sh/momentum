@@ -414,7 +414,8 @@ func addEvidence(ctx context.Context, q querier, id string, evs []Evidence, now 
 //   - A case closed as improved does not come back on its evidence: the measure step watches its signal, in the
 //     units its measurement counted, and brings it back at its old rate (RegressCase).
 //   - Nor does one closed as guarded: the measure step's watch reads its signal and its evidence from the watch's start
-//     on every pass, by the rule the watch used, and brings it back (RegressCase).
+//     on every pass, by the rule the watch used, and brings it back (RegressCase). Only an event counts there: evidence
+//     of another kind (a note, a commit, a file, an address) brings it back only by hand (ReopenCase).
 //   - A case closed as already solved comes back on any evidence after the close, or after its fix was named when
 //     that came after the close (CloseFixed on a case closed before a close named its fix).
 //   - A dismissed case (not worth it, insufficient evidence) comes back only once the evidence after the close
@@ -426,9 +427,10 @@ func comesBack(ctx context.Context, q querier, c Case, now time.Time) (bool, str
 		return n, err
 	}
 	if c.Reason == Guarded {
-		// one rule decides a guarded case's evidence: the measure step's watch after the close, which reads it on every
-		// pass from the watch's start and leaves the loop's own out, as the watch did
-		return false, "a guarded case's evidence is the measure step's watch to read: it brings the case back", nil
+		// one rule decides a guarded case's evidence: the measure step's watch after the close, which reads its events on
+		// every pass from the watch's start and leaves the loop's own out, as the watch did; it reads no other evidence
+		return false, "a guarded case's evidence is the measure step's watch to read: an event of it from the watch's start brings the case back, " +
+			"and evidence that is no event does not (case reopen brings the case back by hand)", nil
 	}
 	from, since := c.Closed, "it closed as "+strings.ReplaceAll(string(c.Reason), "-", " ")
 	if c.Reason == Solved {
@@ -1565,7 +1567,7 @@ func (s *Store) RollBackCase(ctx context.Context, id, why, actor string) (Case, 
 	if c.Status != CaseDeployed && c.Status != CaseMeasuring {
 		return Case{}, badCase("case %s is %s: only a deployed or measuring case rolls back", c.ID, c.Status)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, deployed = 0, `+clearGuard+`, updated = ? WHERE id = ?`,
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, deployed = 0, `+clearMeasurement+`, updated = ? WHERE id = ?`,
 		CaseTesting, time.Now().UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
@@ -1620,7 +1622,10 @@ func (s *Store) startMeasuring(ctx context.Context, id string, window time.Durat
 		return Case{}, badCase("case %s's change went in %s: its measurement counts from then or later", c.ID, c.Deployed.Format(time.DateTime))
 	}
 	now := time.Now()
-	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, window_ms = ?, before_n = ?, guard_exposure = ?, deployed = ?, updated = ? WHERE id = ?`,
+	// a measurement of its own: what an earlier episode's measurement counted after its change, and said of it, a case
+	// that came back keeps until then (clearGuard), and a guard counts its recurrences in after_n
+	if _, err := tx.ExecContext(ctx, `UPDATE cases SET status = ?, window_ms = ?, before_n = ?, guard_exposure = ?, after_n = 0, effect = '', guard_watched = 0,
+	  guard_recur = 0, deployed = ?, updated = ? WHERE id = ?`,
 		CaseMeasuring, window.Milliseconds(), before, exposure, from.UnixMilli(), now.UnixMilli(), c.ID); err != nil {
 		return Case{}, err
 	}
@@ -1698,15 +1703,26 @@ func (s *Store) CloseMeasured(ctx context.Context, id string, after int, effect,
 	return c, tx.Commit()
 }
 
-// clearGuard empties a case's guard and measurement columns: a case that comes back, by regression, reopening, a close
-// by hand or a rollback, keeps no watch or measurement of its last episode to show as its own.
-const clearGuard = `guard_exposure = 0, guard_watched = 0, guard_recur = 0, window_ms = 0, before_n = 0, after_n = 0, effect = ''`
+// clearGuard empties a case's guard columns: a case that comes back, by regression, reopening or a close by hand,
+// keeps no watch of its last episode to show as a measurement. A guard keeps its incidents, recurrences, watch and
+// words in the measurement's columns too (Measurement.Exposure marks them a guard's), so those go with it; a measured
+// case keeps its last measurement, which case show still shows. SQLite reads every SET expression from the row as it
+// was, so the test of the exposure sees the guard's.
+const clearGuard = `window_ms = CASE WHEN guard_exposure > 0 THEN 0 ELSE window_ms END, before_n = CASE WHEN guard_exposure > 0 THEN 0 ELSE before_n END,
+  after_n = CASE WHEN guard_exposure > 0 THEN 0 ELSE after_n END, effect = CASE WHEN guard_exposure > 0 THEN '' ELSE effect END,
+  guard_exposure = 0, guard_watched = 0, guard_recur = 0`
 
-// CloseGuarded is the measure tool's: a measuring case whose guard's watch ended in use with no recurrence closes as
-// guarded, never as improved, with its history's incidents and exposure as counted when its change first took
-// effect, the units of exposure watched, the predictive probability that the problem, had it kept happening, would
-// have recurred within them (0 when the history gives no rate), and the watch in words. Its first recurrence, or any
-// evidence after the close, brings it back (RegressCase, ObserveCase).
+// clearMeasurement empties every measurement and guard column: a rollback takes the change away, and with it what was
+// measured of it.
+const clearMeasurement = `guard_exposure = 0, guard_watched = 0, guard_recur = 0, window_ms = 0, before_n = 0, after_n = 0, effect = ''`
+
+// CloseGuarded is the measure tool's: a measuring case whose guard's watch ended with no recurrence closes as guarded,
+// never as improved, however much of its unit the watch saw (none, when it was not used or only while the change was
+// out of effect), with its history's incidents and exposure as counted through the watch's start, the units of
+// exposure watched, the predictive probability that the problem, had it kept happening, would have recurred within
+// them (0 when the history gives no rate or nothing was watched), and the watch in words. The case store leaves its
+// evidence to the measure step: the watch after the close brings it back (RegressCase) at the first event of its
+// signal, or of its own evidence, from the watch's start.
 func (s *Store) CloseGuarded(ctx context.Context, id string, incidents, exposure, watched int, recur float64, effect, actor string) (Case, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

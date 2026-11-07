@@ -79,7 +79,7 @@ func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead e
 	if len(hits) == 0 {
 		return refuse("the signal counts no event of %s in the %s before", units, history)
 	}
-	evidence, err := s.Store.CaseEvidence(ctx, c.ID, 0)
+	evidence, err := caseEvents(ctx, s.Store, c.ID, s.Dir)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -283,15 +283,19 @@ func (r *Runner) guardEvidence(ctx context.Context, c store.Case, from time.Time
 }
 
 // guardWatched is a guard's exposure watched over a span: its exposure, less the units in the stretches its change
-// was out of effect (Package.GuardAway).
+// was out of effect (Package.GuardAway), and in the one it is out of effect now, to the span's end.
 func guardWatched(ctx context.Context, st *store.Store, p *Package, plan Plan, hits []store.Event, since, until time.Time, dir string) (map[store.Unit]bool, error) {
 	units, err := guardExposure(ctx, st, plan, hits, since, until, dir)
 	if err != nil {
 		return nil, err
 	}
+	stretches := p.GuardAway
+	if !p.OutOfEffect.IsZero() {
+		stretches = append(slices.Clone(stretches), [2]time.Time{guardAwayFrom(p), until})
+	}
 	for u := range units {
 		start := time.UnixMilli(u.Hour * 3_600_000)
-		for _, away := range p.GuardAway {
+		for _, away := range stretches {
 			if start.Before(away[1]) && start.Add(time.Hour).After(away[0]) {
 				delete(units, u)
 				break
@@ -299,6 +303,16 @@ func guardWatched(ctx context.Context, st *store.Store, p *Package, plan Plan, h
 		}
 	}
 	return units, nil
+}
+
+// guardAwayFrom is where a guard's change's stretch out of effect starts: the last pass that saw it in effect
+// (Package.GuardSeen), since it may have gone out of effect any time after that pass, while no pass ran; else, for a
+// package from before that was kept, the first pass that saw it out of effect.
+func guardAwayFrom(p *Package) time.Time {
+	if !p.GuardSeen.IsZero() && p.GuardSeen.Before(p.OutOfEffect) {
+		return p.GuardSeen
+	}
+	return p.OutOfEffect
 }
 
 // hitUnits is how many units events fall in.
@@ -361,7 +375,9 @@ func guardEffectTime(c store.Case, p *Package, seen time.Time) time.Time {
 // for an ingest source a complete read, or one that read in part with every failed file older than its start.
 //
 // An ingest source that has read only in part since the end is left out a window (the plan's) after the end, as a
-// stopped command source is (liveSources): a file it fails on for good would otherwise hold the close for good.
+// stopped command source is (liveSources): a file it fails on for good would otherwise hold the close for good. So is
+// one with no read at all since the end, but the signal's own source: a reader that no longer runs would hold it for
+// good, and the signal's source is the one whose recurrences the watch reads, so it holds the close, with its note.
 func (r *Runner) guardBehind(ctx context.Context, plan Plan, from, end, now time.Time) ([]string, error) {
 	var behind []string
 	for _, source := range plan.Sources {
@@ -377,6 +393,9 @@ func (r *Runner) guardBehind(ctx context.Context, plan Plan, from, end, now time
 				return nil, err
 			} else if !partial.IsZero() {
 				continue // it reads, in part only, past the end: left out
+			}
+			if source != plan.Signal.Source {
+				continue // no read since the end, a window after it: left out
 			}
 		}
 		behind = append(behind, source)
@@ -531,6 +550,79 @@ func (r *Runner) guardCase(ctx context.Context, c store.Case, p *Package, plan P
 	}
 	r.resolve(ctx, &kept)
 	return m
+}
+
+// guardLostTitle starts the problem note of a case closed as guarded whose guard is gone (guardLost).
+const guardLostTitle = "momentum cannot watch a guarded case's signal: "
+
+// guardLost is the watch of a case closed as guarded whose package is gone, or holds no plan or guard (a build from
+// before guards saved it, and wrote its plan back without one): with no plan its signal cannot be read, so the case's
+// own evidence alone is, from its watch's start (the case's in-effect time, where the watch started), by the rule
+// guardEvidence keeps, the loop's own left out. An event of it brings the case back regressed, with a decided note.
+// While there is none, a problem note says its signal is not watched, and that case reopen brings it back by hand.
+func (r *Runner) guardLost(ctx context.Context, c store.Case, p Package, has, dry bool) (Measured, bool) {
+	m := Measured{Case: c.ID, Title: c.Title, PR: p.PR, Guarded: true}
+	failed := func(err error) (Measured, bool) { m.Status, m.Why = "failed", err.Error(); return m, true }
+	lost := "its package is gone"
+	switch {
+	case has && p.Plan == nil:
+		lost = "its package holds no plan"
+	case has:
+		lost = "its package's plan holds no guard (a build from before guards saved it)"
+	}
+	back, err := r.guardEvidence(ctx, c, c.Deployed, nil)
+	if err != nil {
+		return failed(err)
+	}
+	if len(back) == 0 {
+		if !dry {
+			title := guardLostTitle + c.Title
+			detail := fmt.Sprintf("The case closed as guarded, and %s, so its signal is not read: only an event of the case's own evidence from its watch's start, %s, brings it back. "+
+				"To bring it back on other evidence: momentum case reopen %s --evidence REF --why WHY.", lost, c.Deployed.UTC().Format(time.DateTime), c.ID)
+			if has {
+				p.Case = c.ID
+				r.problem(ctx, &p, title, detail)
+			} else if err := r.guardLostNote(ctx, c.ID, title, detail); err != nil {
+				r.logf("note measure:%s: %v", c.ID, err)
+			}
+		}
+		return Measured{}, false
+	}
+	m.Status = "back"
+	m.Why = fmt.Sprintf("the problem it guarded against came back: %d events of the case's own evidence after its watch began, the first at %s (%s, so its signal was not read)",
+		len(back), earliest(back).UTC().Format(time.DateTime), lost)
+	if dry {
+		return m, true
+	}
+	id := fmt.Sprintf("back:%s:episode-%d", store.IDPart(c.ID), c.Episode)
+	if has && len(p.Landed) > 0 {
+		id = noteID("back", p)
+	}
+	if err := r.noteOnce(ctx, store.Note{ID: id, Kind: store.NoteDecided, Title: plainClip("momentum: a problem it guarded against is back: "+c.Title, store.TitleMax),
+		Detail: "It came back after its guard's watch closed the case (" + m.Why + "): the case is open again. Its lesson in tacit is not withdrawn.", Links: prLinks(p.PR)}); err != nil {
+		return failed(fmt.Errorf("the note: %w", err))
+	}
+	if _, err := r.Store.RegressCase(ctx, c.ID, m.Why, "loop:measure"); err != nil {
+		return failed(err)
+	}
+	return m, true
+}
+
+// guardLostNote puts the problem note (measure:CASE) of a case whose package is gone, so has no record of what its
+// note said (Package.Problem): once, unless the store holds a note under that id, done or not, whose title starts as
+// this one's does (guardLostTitle). The measure step takes it out of the report once the case leaves its close.
+func (r *Runner) guardLostNote(ctx context.Context, caseID, title, detail string) error {
+	notes, err := r.Store.Notes(ctx)
+	if err != nil {
+		return err
+	}
+	for _, n := range notes {
+		if n.ID == "measure:"+caseID && strings.HasPrefix(n.Title, guardLostTitle) {
+			return nil
+		}
+	}
+	r.note(ctx, store.Note{ID: "measure:" + caseID, Kind: store.NoteProblem, Title: plainClip(title, store.TitleMax), Detail: detail})
+	return nil
 }
 
 // guardBack is the watch of a case closed as guarded: the guard said its problem would not come back, so the first

@@ -137,10 +137,12 @@ type Package struct {
 	// whatever wait or restart came after. GuardSeq is the store's write sequence (store.Seq) the watch after a
 	// guarded close has read to: each pass reads only the rows written or rewritten since. GuardAway are the
 	// stretches its change was out of effect inside the watch, as the passes saw them: its exposure watched leaves
-	// them out.
+	// them out. GuardSeen is the last pass that saw its change in effect: a stretch out of effect starts there, since
+	// the change may have gone out of effect any time after it, while no pass ran.
 	GuardFrom time.Time      `json:"guard_from,omitzero"`
 	GuardSeq  int64          `json:"guard_seq,omitempty"`
 	GuardAway [][2]time.Time `json:"guard_away,omitempty"`
+	GuardSeen time.Time      `json:"guard_seen,omitzero"`
 }
 
 // RollbackJournal keeps the exact revert candidate before any remote write. A retry checks this head on the

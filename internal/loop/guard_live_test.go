@@ -162,7 +162,8 @@ func TestTheClosesRecountDropsTheIncidentItsSourceBeganWith(t *testing.T) {
 //   - Closes: the case never closes before each source of its plan has shown everything dated in its 30 days (a scan
 //     that read whole showed everything dated before it, the sessions scan everything a stamp's keep before it, and
 //     an ingest scan that failed only on files older than the watch's start counts as whole; a source switched off
-//     shows nothing more; a command source that stopped is left out a window after its last read), and it is closed
+//     shows nothing more; a command source that stopped is left out a window, the plan's week, after its last read;
+//     the signal's source is left out a window after the end once it has read there only in part), and it is closed
 //     by the first pass after that with its change in effect and its signal's source on;
 //   - Acts: a stored recurrence brings the case back, rolls its change back, or holds its rollback with the case
 //     marked recurred, on the first pass after it is stored;
@@ -357,7 +358,7 @@ func simulateGuard(t *testing.T, h simHistory) {
 	shown := map[string]time.Time{}
 	var pending, deferred []store.Event
 	raw, evidence := map[string]bool{}, map[string]bool{}
-	var guardFrom, end, closedAt, recurDated, recurStoreAt, recurStored, took time.Time
+	var guardFrom, end, closedAt, recurDated, recurStoreAt, recurStored, took, partialAfterEnd time.Time
 	recurRaw, deployed, effect, woke, closed := false, false, true, false, false
 	acted := "" // the case's status on the first pass after its recurrence was stored
 	// scanned records a scan of a source that read all it reads, at the time it shows everything dated before (for the
@@ -420,6 +421,7 @@ func simulateGuard(t *testing.T, h simHistory) {
 				rebuildAt = time.Time{}
 				delete(lastRead, toolSignal.Source)
 				delete(shown, toolSignal.Source) // its events must be read again
+				partialAfterEnd = time.Time{}    // and its partial runs go with its reads
 			}
 			if rng.IntN(100) < 8 { // a scan of the signal's source that read in part
 				failed := at.Add(-time.Hour)
@@ -431,6 +433,9 @@ func simulateGuard(t *testing.T, h simHistory) {
 				}
 				if !guardFrom.IsZero() && failed.Before(guardFrom) && !end.IsZero() && at.After(end) && shown[toolSignal.Source].IsZero() {
 					shown[toolSignal.Source] = at // its failed files hold nothing of the watch
+				}
+				if !end.IsZero() && at.After(end) && partialAfterEnd.IsZero() {
+					partialAfterEnd = at
 				}
 			} else {
 				markRead(toolSignal.Source, at)
@@ -456,6 +461,7 @@ func simulateGuard(t *testing.T, h simHistory) {
 			switch {
 			case source == "zz-other" && otherOff:
 			case source == store.Sessions && !sessionsStop.IsZero() && !at.Before(sessionsStop) && at.Sub(lastRead[source]) > sessionsWindow:
+			case source == toolSignal.Source && !partialAfterEnd.IsZero() && at.Sub(end) > plan.Window: // read only in part past the end, a window on
 			case shown[source].IsZero() || shown[source].After(at):
 				return false
 			}
@@ -674,13 +680,16 @@ func TestAGuardedCloseReadsAStoreWhoseSequenceWentBelowItsCursor(t *testing.T) {
 	}
 }
 
-// A guard's exposure watched leaves out the stretches its change was out of effect: out of effect for 28 of its 30
-// days, it closes as guarded with only the 25 hours it watched before that.
+// A guard's exposure watched leaves out the stretches its change was out of effect: seen in effect after its first
+// week's use, then out of effect for the rest of its 30 days, it closes as guarded with only the 25 hours it watched
+// before that.
 func TestAGuardsExposureWatchedLeavesOutItsStretchesOutOfEffect(t *testing.T) {
 	m := guarded(t, time.Hour, toolSignal.Source, nil)
 	m.pass(t, Options{})
 	start := m.clock
 	weekly(t, m.st, toolSignal.Source, "w", start)
+	m.clock = start.Add(aDay)
+	m.pass(t, Options{}) // in effect through the first week's use
 	run(t, m.repo, "git", "checkout", "-q", "HEAD~1")
 	for _, d := range []time.Duration{2 * aDay, 10 * aDay, 29 * aDay} {
 		m.clock = start.Add(d)
@@ -920,8 +929,8 @@ func TestAGuardWaitsForItsSignalsReadPastTheEndForAWindow(t *testing.T) {
 	}
 }
 
-// A recurrence stored while the change is out of effect is acted on at the next pass, still out of effect.
-func TestProbe80hRecurrenceOutOfEffectActedOnAtOnce(t *testing.T) {
+// A guard's recurrence stored while its change is out of effect is acted on at the next pass, still out of effect.
+func TestAGuardsRecurrenceWhileOutOfEffectIsActedOnAtTheNextPass(t *testing.T) {
 	m := guarded(t, time.Hour, toolSignal.Source, nil)
 	m.pass(t, Options{})
 	start := m.clock

@@ -334,6 +334,12 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 	if err != nil {
 		return failed(err.Error())
 	}
+	// a guard's stretch out of effect starts at the last pass that saw its change in effect (guardAwayFrom): this one,
+	// once a stretch that ends here is kept
+	away := guardAwayFrom(&p)
+	if why == "" && plan.Guard != nil {
+		p.GuardSeen = now
+	}
 	if !dry {
 		if err := r.Ship.save(&p); err != nil {
 			return failed(err.Error())
@@ -365,10 +371,11 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		p.GuardFrom = guardEffectTime(c, &p, since)
 	}
 	if plan.Guard != nil && c.Status == store.CaseMeasuring && !p.OutOfEffect.IsZero() {
-		// in effect again: the watch goes on from its first start, and the stretch away is left out of its exposure
+		// in effect again: the watch goes on from its first start, and the stretch away, from the last pass that saw the
+		// change in effect, is left out of its exposure (on a dry pass too, in its copy of the package)
+		p.GuardAway = append(p.GuardAway, [2]time.Time{away, since})
+		p.OutOfEffect = time.Time{}
 		if !dry {
-			p.GuardAway = append(p.GuardAway, [2]time.Time{p.OutOfEffect, since})
-			p.OutOfEffect = time.Time{}
 			if err := r.Ship.save(&p); err != nil {
 				return failed(err.Error())
 			}
@@ -596,6 +603,9 @@ func (r *Runner) watch(ctx context.Context, c store.Case, dry bool) (Measured, b
 	failed := func(err error) (Measured, bool) { m.Status, m.Why = "failed", err.Error(); return m, true }
 	if err != nil {
 		return failed(err)
+	}
+	if c.Reason == store.Guarded && (!ok || p.Plan == nil || p.Plan.Guard == nil) {
+		return r.guardLost(ctx, c, p, ok, dry)
 	}
 	if !ok || (p.State != Kept && p.State != Landed) || p.Plan == nil {
 		return Measured{}, false

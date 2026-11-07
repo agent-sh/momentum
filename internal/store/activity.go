@@ -99,11 +99,16 @@ func activityWhere(q ActivityQuery) ([]string, []any, string) {
 	return where, args, session
 }
 
-// DirPaths are the paths a directory is known by: as given, and as its links resolve. The loop's own activity is
-// what ran in its directory by either (InDir, and every count's ExcludeCwd).
+// DirPaths are the paths a directory is known by: as given, made absolute (a relative one is the process's working
+// directory's), and as its links resolve. The loop's own activity is what ran in its directory by either (InDir, and
+// every count's ExcludeCwd). Only the directory is resolved: a working directory is compared as its session recorded
+// it, cleaned at ingest, so one that reached the loop's directory through a link of its own is not told apart.
 func DirPaths(dir string) []string {
 	if dir == "" {
 		return nil
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
 	}
 	paths := []string{filepath.Clean(dir)}
 	if resolved, err := filepath.EvalSymlinks(dir); err == nil && resolved != paths[0] {
