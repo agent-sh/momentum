@@ -293,8 +293,10 @@ func TestANextBuildReadsWhyTheLastWasRefused(t *testing.T) {
 		Summary: "build propose: gh: network down", CaseEpisode: c.Episode}); err != nil {
 		t.Fatal(err)
 	}
-	if text, err := r.lastBuildRefusal(ctx, c); err != nil || text != "" {
-		t.Fatalf("a gh failure at the proposal read as the build's refusal: %q %v", text, err)
+	// a gh failure at the proposal is the host's too, here a run kept before causes were, told by its text: it is no
+	// refusal of the build's output, and the build's own last refusal still reaches the next build past it
+	if text, err := r.lastBuildRefusal(ctx, c); err != nil || !strings.Contains(text, "only a shell reads") || strings.Contains(text, "network down") {
+		t.Fatalf("a gh failure at the proposal hid or replaced the build's refusal: %q %v", text, err)
 	}
 }
 
