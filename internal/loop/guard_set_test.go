@@ -475,8 +475,10 @@ func TestAToolFoundByItsEventsNeedsTwoIncidents(t *testing.T) {
 // under a two-week window (424 hours of its use, and the failures' 6), and an Edit failure a day before them refuses
 // it. A plan counted again 15 days later, as a hand landing counts it, keeps the guard the proposal had; once the
 // detector files an Edit failure dated after the proposal (and after the later count's boundary), the later count
-// refuses it, as intended: the problem is then not Bash's alone. An event of the evidence the store no longer holds is
-// of no tool, so Bash is refused.
+// refuses it, as intended: the problem is then not Bash's alone. Evidence dated after the count's own time is not
+// weighed: a hand landing's recount at the landing keeps its guard after an Edit failure two days past the landing,
+// a recurrence the watch reads. An event of the evidence the store no longer holds is of no tool, so Bash is refused,
+// in the history or before it.
 func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
 	now := time.Now().Truncate(time.Hour)
 	bash := serverSignal
@@ -585,6 +587,53 @@ func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
 		plan, err = (&Ship{Store: st}).validPlan(t.Context(), c, bash, 14*aDay, "", now)
 		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), alone) {
 			t.Fatalf("counted again after the detector filed evidence of another tool: %+v %v", g, err)
+		}
+	})
+	t.Run("a hand landing's recount after a recurrence in another tool", func(t *testing.T) {
+		st := testStore(t)
+		proposed := now.Add(-20 * aDay)
+		landed := now.Add(-3 * aDay) // more than a window after the proposal: the landing counts the plan again at it
+		c := oneIncidentOf(t, st, proposed.Add(-5*aDay), now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" })
+		if err := st.MarkRead(t.Context(), toolSignal.Source, now); err != nil {
+			t.Fatal(err)
+		}
+		for _, at := range []time.Time{proposed, landed} {
+			plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 14*aDay, "", at)
+			if g, _ := guardOf(t, plan); err != nil || g == nil || g.Unit != "tool" || g.Tool != "Bash" {
+				t.Fatalf("counted at %s: %+v %v", at, g, err)
+			}
+		}
+		// the problem comes back in Edit a day ago, two days after the landing, and the detector files it
+		edit := toolResult("edit-after-landing", now.Add(-aDay), "edit-after-landing", true)
+		edit.Tool, edit.Cwd = "Edit", "/work/e"
+		put(t, st, []store.Event{edit})
+		f := store.Finding{Family: "failures", Signature: "failures/v2:zz-one-incident", Title: "the tool fails", Evidence: []store.Evidence{{Ref: "ev:" + edit.ID()}}}
+		if _, _, err := st.ObserveCase(t.Context(), f, "detector"); err != nil {
+			t.Fatal(err)
+		}
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 14*aDay, "", landed)
+		if g, _ := guardOf(t, plan); err != nil || g == nil || g.Unit != "tool" || g.Tool != "Bash" {
+			t.Fatalf("the landing's recount after a recurrence in Edit past it: %+v %v", g, err)
+		}
+	})
+	t.Run("evidence before the history the store no longer holds", func(t *testing.T) {
+		st, path := testStoreAt(t)
+		older := toolResult("bash-before", now.Add(-35*aDay), "bash-before", true)
+		older.Cwd = "/work/b"
+		c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" }, older)
+		db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(10000)")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if res, err := db.Exec(`DELETE FROM events WHERE source = ? AND source_key = 'bash-before'`, toolSignal.Source); err != nil {
+			t.Fatal(err)
+		} else if n, _ := res.RowsAffected(); n != 1 {
+			t.Fatalf("deleted %d events", n)
+		}
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 7*aDay, "", now)
+		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), alone) {
+			t.Fatalf("a named tool over evidence before its history the store lost: %+v %v", g, err)
 		}
 	})
 	t.Run("evidence the store no longer holds", func(t *testing.T) {
