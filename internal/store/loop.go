@@ -12,16 +12,35 @@ import (
 
 // The improvement loop's record of its own runs: one row for each run of its agent on a case, what the run was
 // for, how it ended, what it cost and where its files are. It is kept: what a run spent cannot be read again, and
-// the loop's budgets and its stop rule read it.
+// the loop's budgets and its stop rule read it. loop_turns holds the loop's turns, a row each (the family whose build a
+// pass reserved last, the family whose run it reserved first), after which the next pass's families take their turn.
 const loopTables = `
 CREATE TABLE IF NOT EXISTS loop_runs (id TEXT PRIMARY KEY, case_id TEXT NOT NULL, family TEXT NOT NULL, step TEXT NOT NULL,
   started INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, failure TEXT NOT NULL DEFAULT '',
   cost_usd REAL NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0, turns INTEGER NOT NULL DEFAULT 0,
   model TEXT NOT NULL DEFAULT '', dir TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
   experiment TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS loop_turns (step TEXT PRIMARY KEY, family TEXT NOT NULL, at INTEGER NOT NULL);
 `
 
-var loopTableNames = []string{"loop_runs"}
+var loopTableNames = []string{"loop_runs", "loop_turns"}
+
+// LoopTurn is the family a turn names, "" before any.
+func (s *Store) LoopTurn(ctx context.Context, step string) (string, error) {
+	var family string
+	err := s.db.QueryRowContext(ctx, `SELECT family FROM loop_turns WHERE step = ?`, step).Scan(&family)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return family, err
+}
+
+// SetLoopTurn records the family a turn names.
+func (s *Store) SetLoopTurn(ctx context.Context, step, family string, at time.Time) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO loop_turns (step, family, at) VALUES (?, ?, ?)
+	  ON CONFLICT(step) DO UPDATE SET family = excluded.family, at = excluded.at`, step, family, at.UnixMilli())
+	return err
+}
 
 const loopIndexes = `
 CREATE INDEX IF NOT EXISTS loop_runs_case ON loop_runs(case_id, started);

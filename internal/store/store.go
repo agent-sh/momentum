@@ -104,7 +104,7 @@ type querier interface {
 // The store's tables are of two kinds.
 //
 // Kept tables hold what cannot be read again: every event, when each live session entered its phase, the notes
-// (notes.go), what the capacity runs observed (capacity.go), the cases (cases.go), and the loop's runs (loop.go). A schema change migrates them and never drops
+// (notes.go), what the capacity runs observed (capacity.go), the cases (cases.go), and the loop's runs and its turns (loop.go). A schema change migrates them and never drops
 // them. A kept table that is missing is made with the columns it was first made with (keptTables), it gains each
 // later column it lacks (keptColumns), and its rows change only in a step or by its triggers (keptTriggers).
 //
