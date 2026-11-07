@@ -257,3 +257,54 @@ func TestATakerReadsItsStatusAgainAfterAFailedRead(t *testing.T) {
 		t.Fatalf("a lock taken after a failed read names the taker %v, want %v", got, want)
 	}
 }
+
+// A taker whose read of its own status failed as it took a lock (no descriptor was free) reads it again when it records
+// a call under that lock: the record names its taker from then on. The check runs in a process of its own, whose first
+// read is the one that fails.
+func TestATakerReadsItsStatusAgainWhenItRecordsACall(t *testing.T) {
+	if os.Getenv(takerChild) == "" {
+		child := exec.Command(os.Args[0], "-test.run=^TestATakerReadsItsStatusAgainWhenItRecordsACall$", "-test.v")
+		child.Env = append(os.Environ(), takerChild+"=1")
+		out, err := child.CombinedOutput()
+		if err != nil || !strings.Contains(string(out), "--- PASS: TestATakerReadsItsStatusAgainWhenItRecordsACall") {
+			t.Fatalf("the taker's process: %v\n%s", err, out)
+		}
+		return
+	}
+	mirror := t.TempDir()
+	var limit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lowest := probe.Fd() // the lowest descriptor free, once probe is closed
+	probe.Close()
+	one := limit
+	one.Cur = uint64(lowest) + 1 // one descriptor free: the lock file's, and none for the read of /proc
+	if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &one); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := lockMirror(mirror)
+	if rerr := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &limit); rerr != nil {
+		t.Fatal(rerr)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if got := readLockRecord(lock).taker; got != (lockHolder{}) {
+		t.Fatalf("a lock taken with no descriptor free for /proc names the taker %v", got)
+	}
+	_, start, err := procStat(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := lockHolder{os.Getpid(), start}
+	recordHolder(lock, os.Getpid())
+	if r := readLockRecord(lock); r.taker != want || r.group != want {
+		t.Fatalf("a call recorded after a failed read leaves the record %v, want the taker %v", r, want)
+	}
+}

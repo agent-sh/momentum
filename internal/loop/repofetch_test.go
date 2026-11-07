@@ -1,11 +1,19 @@
 package loop
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
+	"math/big"
 	"net"
 	"os"
 	"os/exec"
@@ -301,23 +309,98 @@ func comesTrue(d time.Duration, ok func() bool) bool {
 
 // noHTTPS says why Git cannot make an https call here, or "" when it can: Git has no https helper, or the helper has no
 // CA certificates to load, as in the loop's build sandbox, which mounts no /etc/ssl. Either fails at once, before the
-// call reaches a server. Only those two failures count, each by the words Git or curl prints for it: any other failure
-// is the test's to report.
+// server answers. Only those two failures count: any other failure is the test's to report. The missing helper is known
+// by Git's words for it. The missing certificates are known by what the call does, not by curl's words, which differ by
+// its TLS library and version: a call that ended on its own while the server was silent waits on the server once it
+// has a CA file the test makes. curl may send its TLS hello before it loads its CA certificates, so what the server
+// received says nothing.
 func noHTTPS(t *testing.T) string {
 	t.Helper()
-	port, _ := stalledListener(t, 0) // a server that closes each connection at once, so a call that can start ends
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "ls-remote", fmt.Sprintf("https://127.0.0.1:%d/x.git", port), "HEAD")
-	cmd.Dir, cmd.Env = t.TempDir(), GitEnv()
-	out, _ := cmd.CombinedOutput()
+	waited, out := httpsWaits(t)
 	switch {
-	case strings.Contains(string(out), "'remote-https' is not a git command"):
+	case waited:
+		return ""
+	case strings.Contains(out, "'remote-https' is not a git command"):
 		return "Git has no https helper here"
-	case strings.Contains(string(out), "Problem with the SSL CA cert"): // curl's words for CURLE_SSL_CACERT_BADFILE
+	}
+	ca := testCA(t)
+	if waited, _ := httpsWaits(t, "-c", "http.sslCAInfo="+ca, "-c", "http.sslCAPath="+filepath.Dir(ca)); waited {
 		return "Git's https helper has no CA certificates to load here"
 	}
 	return ""
+}
+
+// httpsWaits makes one https call through Git, with the settings given, to a server that never answers, and says
+// whether the call waited on it: it still ran 2 s after its first bytes reached the server. A call that fails on its
+// own ends before then. It returns what Git printed too.
+func httpsWaits(t *testing.T, settings ...string) (bool, string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	reached := make(chan struct{}, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+		if n, _ := conn.Read(make([]byte, 1)); n > 0 {
+			reached <- struct{}{}
+		}
+		_, _ = io.Copy(io.Discard, conn) // silent until the call goes
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	url := fmt.Sprintf("https://127.0.0.1:%d/x.git", ln.Addr().(*net.TCPAddr).Port)
+	cmd := exec.CommandContext(ctx, "git", append(append([]string(nil), settings...), "ls-remote", url, "HEAD")...)
+	// Git's words untranslated, and a deadline that ends the helper too, which holds the output
+	cmd.Dir, cmd.Env = t.TempDir(), append(GitEnv(), "LC_ALL=C")
+	endWithContext(cmd)
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(done) }()
+	waited := false
+	select {
+	case <-done:
+	case <-reached:
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			waited = true
+		}
+	}
+	cancel()
+	<-done
+	return waited, out.String()
+}
+
+// testCA writes a self-signed CA certificate, in PEM, to a file of its own and returns its path.
+func testCA(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "momentum test CA"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IsCA: true,
+		BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 // A remote call ends at its deadline, though its ssh or https helper waits on a server that never answers, or ignores
