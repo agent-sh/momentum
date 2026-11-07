@@ -74,6 +74,10 @@ func repoNoteID(caseID string) string { return "loop-repo:" + store.IDPart(caseI
 
 func holdNotePrefix(caseID string) string { return "loop-build:" + store.IDPart(caseID) + ":held:" }
 
+// recordNotePrefix begins the ids of a case's notes of a record of it the pick could not read (noteBuildSkip): they end
+// when the case leaves testing, with the build the record held.
+func recordNotePrefix(caseID string) string { return "loop-build:" + store.IDPart(caseID) + ":record:" }
+
 // markHold records a case's hold when it changes: a hold with its reason and the case's episode, or the hold's
 // end. An unchanged hold writes nothing, so a held case adds no line pass after pass, and its report note stays
 // as its reader left it. A new or changed hold puts its low problem note (a case waiting for a repository has its
@@ -209,9 +213,9 @@ func (r *Runner) releaseHolds(ctx context.Context, cs []store.Case) error {
 				return err
 			}
 		}
-		hold, repo, hand := holdNotePrefix(c.ID), repoNoteID(c.ID), handNoteID(c.ID)
+		hold, record, repo, hand := holdNotePrefix(c.ID), recordNotePrefix(c.ID), repoNoteID(c.ID), handNoteID(c.ID)
 		for _, n := range mine {
-			if n.Done.IsZero() && (strings.HasPrefix(n.ID, hold) || n.ID == repo || n.ID == hand || strings.HasPrefix(n.ID, hand+":")) {
+			if n.Done.IsZero() && (strings.HasPrefix(n.ID, hold) || strings.HasPrefix(n.ID, record) || n.ID == repo || n.ID == hand || strings.HasPrefix(n.ID, hand+":")) {
 				if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
 					return err
 				}

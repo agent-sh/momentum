@@ -118,6 +118,14 @@ const repoAction = "build repository"
 
 var repoName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
+// recordError is a case's own stored record that cannot be read: the pass skips that case, not its family.
+type recordError struct{ err error }
+
+func (e recordError) Error() string { return e.err.Error() }
+func (e recordError) Unwrap() error { return e.err }
+
+// caseRepo is the repository the case's investigation named in its episode, "" for none. A record of it that cannot
+// be read is a recordError.
 func (r *Runner) caseRepo(ctx context.Context, c store.Case) (string, error) {
 	entries, err := r.Store.CaseLog(ctx, c.ID)
 	if err != nil {
@@ -132,13 +140,13 @@ func (r *Runner) caseRepo(ctx context.Context, c store.Case) (string, error) {
 			Episode int64  `json:"episode"`
 		}
 		if err := json.Unmarshal([]byte(entries[i].Detail), &record); err != nil {
-			return "", err
+			return "", recordError{err}
 		}
 		if record.Episode != c.Episode {
 			return "", nil
 		}
 		if record.Repo != "" && !repoName.MatchString(record.Repo) {
-			return "", errors.New("invalid investigation repository name")
+			return "", recordError{errors.New("invalid investigation repository name")}
 		}
 		return record.Repo, nil
 	}
