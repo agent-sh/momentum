@@ -447,12 +447,11 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 
 // prepare is Prepare from origin's branch as the mirror holds it (tip), or as Prepare fetches it into the mirror when
 // tip is nil. The host clone is a local clone of the mirror, whose origin then names the checkout's origin, for the
-// pushes a proposal and a landing make; nothing it holds came from the network itself. Prepare holds the mirror's lock
-// from its fetch until its package is saved, and records itself in the mirror's record meanwhile (recordAttempt), so a
-// pass's prune, which leaves a mirror whose lock is held, never removes it in between, and keeps it after a preparation
-// that failed while the case is in testing (pruneMirrors); a build's mirror is its pass's, which pruned before any
-// build. A read of the proposal branch that goes through ends the notes of builds that waited for it
-// (proposalNotePrefix).
+// pushes a proposal and a landing make; nothing it holds came from the network itself. Prepare's fetch records in the
+// mirror's record that it used the mirror now (recordSource), and Prepare holds the mirror's lock from that fetch until
+// its package is saved: a pass's prune leaves a mirror whose lock is held, and one used within a week (pruneMirrors).
+// A build's mirror is its pass's, which pruned before any build. A read of the proposal branch that goes through ends
+// the notes of builds that waited for it (proposalNotePrefix).
 func (s *Ship) prepare(ctx context.Context, caseID, repoDir string, tip *repoTip) (Package, error) {
 	ctx = s.gitContext(shipContext(ctx, caseID))
 	unlock, err := s.lock(ctx, caseID)
@@ -516,9 +515,6 @@ func (s *Ship) prepare(ctx context.Context, caseID, repoDir string, tip *repoTip
 			return Package{}, err
 		}
 		tip, mirrorLock = &got, lock
-		if err := recordAttempt(tip.dir, c.ID); err != nil {
-			return Package{}, err
-		}
 	}
 	if err := sameRepository(t.Repo, origin, *tip); err != nil {
 		return Package{}, err
@@ -578,11 +574,6 @@ func (s *Ship) prepare(ctx context.Context, caseID, repoDir string, tip *repoTip
 	}
 	if err := s.saveAuthorized(ctx, &p); err != nil {
 		return Package{}, err
-	}
-	if mirrorLock != nil { // the package keeps the mirror from now on (mirrorKeep)
-		if err := endAttempt(tip.dir, c.ID); err != nil {
-			s.logf("the mirror's record of %s: %v", c.ID, err) // it keeps the mirror only while the case is in testing
-		}
 	}
 	release()
 	return p, s.Store.CaseNote(cleanedNote(ctx), c.ID, "prepared", note, s.Actor)
@@ -1903,30 +1894,6 @@ func (s *Ship) endProposalNotes(ctx context.Context, caseID string) error {
 		return err
 	}
 	return endHoldNotes(ctx, s.Store, s.now(), notes, proposalNotePrefix(caseID), proposalRead)
-}
-
-// mirrorKeep is what a pass's prune keeps for the ship tool (pruneMirrors): the checkouts of the packages that can
-// still prepare or build, whose case is in testing and which are ready for a build (Prepared, Checked, Revising) or for
-// a new preparation (RolledBack, Kept, Withdrawn), and the cases in testing, whose preparations' mirrors stay
-// (recordAttempt). A case out of testing neither prepares nor builds, so its package keeps nothing, and a package that
-// cannot be read names no checkout.
-func (s *Ship) mirrorKeep(ctx context.Context) (checkouts, testing []string, err error) {
-	cs, err := s.Store.Cases(ctx, store.CaseFilter{Statuses: []store.CaseStatus{store.CaseTesting}})
-	if err != nil {
-		return nil, nil, err
-	}
-	for _, c := range cs {
-		testing = append(testing, c.ID)
-		p, ok, err := s.Load(c.ID)
-		if err != nil || !ok || p.Dir == "" || slices.Contains(checkouts, p.Dir) {
-			continue
-		}
-		switch p.State {
-		case Prepared, Checked, Revising, RolledBack, Kept, Withdrawn:
-			checkouts = append(checkouts, p.Dir)
-		}
-	}
-	return checkouts, testing, nil
 }
 
 // mirrorBase refreshes the host clone's remote-tracking branch from origin's mirror (tip.dir), never from the network:

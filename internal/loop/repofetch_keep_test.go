@@ -15,74 +15,6 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// A package keeps its repository's mirror only while it can still prepare or build: once its case leaves testing, a
-// pass that no longer reads the repository removes the mirror.
-func TestAPassLetsGoOfAMirrorNoPackageCanBuildFrom(t *testing.T) {
-	ctx := context.Background()
-	r, c, f := buildCase(t)
-	newPass(t, r)
-	if _, err := r.prepareRun(ctx, c, c.Family, StepBuild); err != nil {
-		t.Fatal(err)
-	}
-	mirror := identityMirror(r, "url:"+f.origin)
-	r.Inputs.ReadDirs = []string{newRepo(t, nil).main} // the repository leaves loop.read_dirs
-	newPass(t, r)
-	if _, err := os.Stat(mirror); err != nil {
-		t.Fatalf("a pass removed the mirror of a package that can still build: %v", err)
-	}
-	if _, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "fixture"); err != nil {
-		t.Fatal(err)
-	}
-	newPass(t, r)
-	if _, err := os.Stat(mirror); !os.IsNotExist(err) {
-		t.Fatalf("a pass kept the mirror of a package whose case left testing: %v", err)
-	}
-}
-
-// A package keeps the mirror of its checkout's origin as the checkout names it now: once the origin names another
-// repository, a pass removes the old repository's mirror.
-func TestAPassLetsGoOfTheMirrorOfAPackagesOldOrigin(t *testing.T) {
-	ctx := context.Background()
-	r, c, f := buildCase(t)
-	newPass(t, r)
-	if _, err := r.prepareRun(ctx, c, c.Family, StepBuild); err != nil {
-		t.Fatal(err)
-	}
-	old := identityMirror(r, "url:"+f.origin)
-	r.Inputs.ReadDirs = []string{newRepo(t, nil).main} // only the package names the checkout
-	run(t, f.main, "git", "remote", "set-url", "origin", newRepo(t, nil).origin)
-	newPass(t, r)
-	if _, err := os.Stat(old); !os.IsNotExist(err) {
-		t.Fatalf("a pass kept the mirror of the origin a package's checkout named before: %v", err)
-	}
-}
-
-// A preparation that fails after its fetch keeps its mirror while its case is in testing, so the next one fetches only
-// what is new; once the case leaves testing, the mirror goes.
-func TestAFailedPreparationKeepsItsMirrorWhileItsCaseIsInTesting(t *testing.T) {
-	ctx := context.Background()
-	r, c, _ := buildCase(t)
-	g := newRepo(t, nil) // a repository outside loop.read_dirs
-	path := os.Getenv("PATH")
-	proposalReadFails(t)
-	if _, err := r.Ship.Prepare(ctx, c.ID, g.main); !held(err) || !strings.Contains(err.Error(), "the proposal branch of") {
-		t.Fatalf("an unreadable proposal branch did not hold the preparation: %v", err)
-	}
-	t.Setenv("PATH", path)
-	mirror := identityMirror(r, "url:"+g.origin)
-	newPass(t, r)
-	if _, err := os.Stat(mirror); err != nil {
-		t.Fatalf("a pass removed the mirror of a preparation whose case is in testing: %v", err)
-	}
-	if _, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "fixture"); err != nil {
-		t.Fatal(err)
-	}
-	newPass(t, r)
-	if _, err := os.Stat(mirror); !os.IsNotExist(err) {
-		t.Fatalf("a pass kept the mirror of a preparation whose case left testing: %v", err)
-	}
-}
-
 // The owner's preparation never reads a mirror whose lock another holds: it waits for the owner to run it again, and
 // clones nothing.
 func TestTheOwnersPreparationWaitsForAMirrorAnotherHolds(t *testing.T) {
@@ -137,6 +69,7 @@ func TestAMirrorWhoseLockCannotBeOpenedStays(t *testing.T) {
 	r.Inputs.ReadDirs = []string{a.main}
 	newPass(t, r)
 	mirror := identityMirror(r, "url:"+a.origin)
+	ageMirror(t, mirror, 8*24*time.Hour) // a prune's to remove, but for its lock
 	if err := os.Chmod(filepath.Join(mirror, mirrorLockFile), 0); err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +87,7 @@ func TestPruneInAnotherProcess(t *testing.T) {
 	if mirrors == "" {
 		t.Skip("the prune process of TestAPruneStoppedMidwayLeavesNoHalfMirror")
 	}
-	pruneMirrors(mirrors, nil, nil, nil)
+	pruneMirrors(mirrors, nil)
 }
 
 // A prune stopped while it removes a mirror leaves no half mirror at the mirror's name: under its lock the mirror is
@@ -165,6 +98,7 @@ func TestAPruneStoppedMidwayLeavesNoHalfMirror(t *testing.T) {
 	passRepository(t, r, f.main)
 	mirrors := filepath.Join(r.Dir, "mirrors")
 	mirror := identityMirror(r, "url:"+f.origin)
+	ageMirror(t, mirror, 8*24*time.Hour) // a prune's to remove
 	bulk := filepath.Join(mirror, "objects", "bulk")
 	if err := os.Mkdir(bulk, 0o700); err != nil {
 		t.Fatal(err)
@@ -207,7 +141,7 @@ func TestAPruneStoppedMidwayLeavesNoHalfMirror(t *testing.T) {
 	if _, err := os.Stat(mirror); !os.IsNotExist(err) {
 		t.Fatalf("a prune stopped midway left a half mirror at the mirror's name: %v", err)
 	}
-	pruneMirrors(mirrors, nil, nil, nil)
+	pruneMirrors(mirrors, nil)
 	if entries, err := os.ReadDir(mirrors); err != nil || len(entries) != 0 {
 		t.Fatalf("the next prune left %d entries (%v)", len(entries), err)
 	}

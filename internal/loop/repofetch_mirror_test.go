@@ -188,7 +188,7 @@ if [ "$n" = 2 ]; then echo $$ > '`+pidFile+`'; sh -c "$last" | { dd bs=1024 coun
 		t.Fatalf("the next pass fetched beside a live fetch: %q", why)
 	}
 	// nor does a pass that no longer reads the repository remove the mirror under it
-	pruneMirrors(filepath.Dir(mirror), nil, nil, nil)
+	pruneMirrors(filepath.Dir(mirror), nil)
 	if _, err := os.Stat(live[0]); err != nil {
 		t.Fatalf("a pass pruned the mirror of a live fetch: %v", err)
 	}

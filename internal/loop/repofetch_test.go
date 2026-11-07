@@ -546,6 +546,7 @@ func TestMirrorsOfRepositoriesNoLongerReadAreRemoved(t *testing.T) {
 	if n := mirrors(); n != 2 {
 		t.Fatalf("two repositories have %d mirrors", n)
 	}
+	ageMirror(t, identityMirror(r, "url:"+b.origin), 8*24*time.Hour) // nothing has used it for a week
 	r.Inputs.ReadDirs = []string{a.main}
 	newPass(t, r)
 	if _, err := os.Stat(identityMirror(r, "url:"+a.origin)); err != nil || mirrors() != 1 {

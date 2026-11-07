@@ -104,18 +104,12 @@ type SnapshotOptions struct {
 	Cache       *ScrubCache
 	Since       time.Time                        // the log's window starts here
 	Logf        func(format string, args ...any) // the pass's log: a mirror's repack that failed, Git's line for a fetch that did
-	// Keep are the checkouts of the packages that can still prepare or build (Ship.mirrorKeep): the mirror of each one's
-	// origin, by the identity it names now, stays though no source of the pass reads it (a repository the owner
-	// prepared outside loop.read_dirs). Testing are the cases in testing: a mirror whose record names one of them, a
-	// preparation's (recordAttempt), stays. NoPrune keeps every mirror: the pass could not read what its cases need.
-	Keep, Testing []string
-	NoPrune       bool
 }
 
 // SnapshotRepos makes the scrubbed snapshot of each distinct source for /ro/repos/NAME and its log for
 // /ro/history/repos/NAME.log, at its origin's default branch as the host fetches it now (repofetch.go), or, with the
 // reason, as its mirror last fetched it or at the checkout's own default branch when it cannot. Mirrors that no source
-// of the pass reads and nothing keeps (o.Keep, o.Testing) are removed (pruneMirrors). A source that cannot be read
+// of the pass reads and nothing has used for a week are removed (pruneMirrors). A source that cannot be read
 // (missing, no work tree, a link, inside loop storage, no default branch) is a result with its reason, not a failure. Only a scrubber that does not run stops the pass.
 func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) {
 	if err := CheckScrubber(ctx); err != nil {
@@ -156,7 +150,7 @@ func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) 
 		}
 	}
 	var results []RepoInput
-	used, unread := map[string]bool{}, []string(nil) // the mirrors this pass's sources name, and the sources it could not map
+	used := map[string]bool{} // the mirrors this pass's sources name
 	for _, source := range sources {
 		if err := ctx.Err(); err != nil {
 			return results, err // a pass told to stop leaves no refusals behind it
@@ -171,13 +165,11 @@ func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) 
 			result.Name, result.Source = cleanPaths[0], cleanPaths[1]
 			result.Error = "repository paths need scrubbing"
 			results = append(results, result)
-			unread = append(unread, source)
 			continue
 		}
 		if err := cloneSource(ctx, source, append(append([]string(nil), o.LoopDirs...), o.Destination, o.LogDir)); err != nil {
 			result.Error = reason(err)
 			results = append(results, result)
-			unread = append(unread, source)
 			continue
 		}
 		tip, mirror, err := sourceTip(ctx, source, o.Mirrors, o.GH)
@@ -189,8 +181,6 @@ func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) 
 		}
 		if mirror != "" {
 			used[mirror] = true
-		} else {
-			unread = append(unread, source)
 		}
 		if err == nil && tip.fallback != "" {
 			// the host's own text, without a URL or a path, scrubbed all the same: it reaches the run's summary
@@ -212,16 +202,7 @@ func SnapshotRepos(ctx context.Context, o SnapshotOptions) ([]RepoInput, error) 
 		}
 		results = append(results, result)
 	}
-	for _, dir := range o.Keep {
-		if org, why := readOrigin(ctx, dir); why == "" {
-			used[mirrorPath(o.Mirrors, org.identity)] = true // the repository the checkout's origin names now
-		} else {
-			unread = append(unread, dir) // its origin cannot be read now: the mirrors that record it stay
-		}
-	}
-	if !o.NoPrune {
-		pruneMirrors(o.Mirrors, used, unread, o.Testing)
-	}
+	pruneMirrors(o.Mirrors, used)
 	return results, nil
 }
 
