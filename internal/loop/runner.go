@@ -265,8 +265,8 @@ func (r *Runner) buildSkipped(ctx context.Context, c store.Case, stage string, c
 	var outage *baseOutage
 	switch {
 	case errors.As(cause, &outage):
-		if outage.first != "" {
-			r.logf("build of %s waits for its base: %s", c.ID, outage.first)
+		if outage.line != "" {
+			r.logf("build of %s waits for its base: %s", c.ID, outage.line)
 		}
 		if ctx.Err() == nil { // a pass told to stop ended the fetch: no note names the stop as the remote's
 			if err := r.noteBaseHold(ctx, c, cause.Error()); err != nil {
@@ -290,8 +290,9 @@ func baseNotePrefix(caseID string) string { return "loop-build:" + store.IDPart(
 const baseHoldRaise = 24 * time.Hour
 
 // noteBaseHold notes a build held because its base cannot be fetched now: one note per class of cause (holdClass),
-// open until a build of the case fetches its base (doneBaseNotes). Once the case's builds have waited baseHoldRaise
-// since its oldest open such note, the note is raised to normal importance.
+// open until the hold ends (endBaseNotes). Once the case's builds have waited baseHoldRaise since its oldest open such
+// note, the note is raised to normal importance. A note a person took out of the report stays out while its hold
+// lasts; one whose hold ended (it says so) opens again with the next hold of its class.
 func (r *Runner) noteBaseHold(ctx context.Context, c store.Case, why string) error {
 	detail, err := Redact(ctx, why)
 	if err != nil {
@@ -307,15 +308,21 @@ func (r *Runner) noteBaseHold(ctx context.Context, c store.Case, why string) err
 	since := r.now()
 	var current *store.Note
 	for i, n := range notes {
-		if !n.Done.IsZero() || !strings.HasPrefix(n.ID, baseNotePrefix(c.ID)) {
+		if !strings.HasPrefix(n.ID, baseNotePrefix(c.ID)) {
 			continue
-		}
-		if n.At.Before(since) {
-			since = n.At
 		}
 		if n.ID == id {
 			current = &notes[i]
 		}
+		if n.Done.IsZero() && n.At.Before(since) {
+			since = n.At
+		}
+	}
+	if current != nil && !current.Done.IsZero() {
+		if !baseNoteEnded(*current) {
+			return nil // a person took it out of the report while this hold lasts
+		}
+		current = nil // its hold ended: this is a new one
 	}
 	importance := store.ImportanceLow
 	if r.now().Sub(since) >= baseHoldRaise {
@@ -333,17 +340,40 @@ func (r *Runner) noteBaseHold(ctx context.Context, c store.Case, why string) err
 	return err
 }
 
-// doneBaseNotes resolves a case's notes of builds held for their base, once a build of it has fetched its base.
-func (r *Runner) doneBaseNotes(ctx context.Context, caseID string) error {
+// The ends of a base note's hold, which endBaseNotes adds to the note it resolves.
+const (
+	baseFetched     = "It ended: a build of the case fetched its base."
+	caseLeftTesting = "It ended: the case left testing."
+)
+
+// baseNoteEnded says whether a base note says its hold ended (endBaseNotes).
+func baseNoteEnded(n store.Note) bool {
+	return strings.HasSuffix(n.Detail, baseFetched) || strings.HasSuffix(n.Detail, caseLeftTesting)
+}
+
+// endBaseNotes ends a case's notes of builds held for their base, once their hold ended (why: a build fetched its base,
+// or the case left testing): each says so and is resolved, a note a person took out of the report too, so the next
+// hold of its class opens it again.
+func (r *Runner) endBaseNotes(ctx context.Context, caseID, why string) error {
 	notes, err := r.Store.Notes(ctx)
 	if err != nil {
 		return err
 	}
+	return r.endBaseNotesIn(ctx, notes, caseID, why)
+}
+
+// endBaseNotesIn is endBaseNotes over notes read already.
+func (r *Runner) endBaseNotesIn(ctx context.Context, notes []store.Note, caseID, why string) error {
 	for _, n := range notes {
-		if n.Done.IsZero() && strings.HasPrefix(n.ID, baseNotePrefix(caseID)) {
-			if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
-				return err
-			}
+		if !strings.HasPrefix(n.ID, baseNotePrefix(caseID)) || baseNoteEnded(n) {
+			continue
+		}
+		n.Detail = n.Detail + " " + why
+		if _, err := r.Store.PutNote(ctx, n); err != nil {
+			return err
+		}
+		if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
+			return err
 		}
 	}
 	return nil

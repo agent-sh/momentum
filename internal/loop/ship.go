@@ -419,26 +419,51 @@ func (s *Ship) Prepare(ctx context.Context, caseID, repoDir string) (Package, er
 	if err := s.authority(ctx, c.ID); err != nil {
 		return Package{}, err
 	}
-	for _, d := range []string{host, work} {
-		if err := os.MkdirAll(filepath.Dir(d), 0700); err != nil {
-			return Package{}, err
-		}
-		if err := removeAll(d); err != nil {
-			return Package{}, err
-		}
-	}
-	if err := s.cloneConfined(ctx, t.Dir, host); err != nil {
-		return Package{}, err
-	}
 	origin, err := gitOutput(ctx, t.Dir, "remote", "get-url", "origin")
 	if err != nil {
 		return Package{}, err
 	}
-	if _, err := s.git(ctx, host, "remote", "set-url", "origin", strings.TrimSpace(origin)); err != nil {
+	origin = strings.TrimSpace(origin)
+	for _, d := range []string{host, work} {
+		if err := os.MkdirAll(filepath.Dir(d), 0700); err != nil {
+			return Package{}, err
+		}
+	}
+	// A clone a held preparation of this source left is fetched into again, not made again: a hold lasts pass after
+	// pass, and each would clone the whole repository. Any other host clone (an earlier package's) goes, but only once
+	// the remote answers: an outage holds the build and leaves it.
+	marker := filepath.Join(host, ".git", heldCloneFile)
+	if kept, err := os.ReadFile(marker); err != nil || string(kept) != t.Dir {
+		if _, err := os.Lstat(filepath.Join(host, ".git")); err == nil {
+			if _, err := s.git(ctx, host, "remote", "set-url", "origin", origin); err == nil {
+				if _, err := s.baseBranch(ctx, host, t.Repo, t.Base); held(err) {
+					return Package{}, err
+				}
+			}
+		}
+		if err := removeAll(host); err != nil {
+			return Package{}, err
+		}
+		if err := s.cloneConfined(ctx, t.Dir, host); err != nil {
+			return Package{}, err
+		}
+	}
+	if err := removeAll(work); err != nil {
+		return Package{}, err
+	}
+	if _, err := s.git(ctx, host, "remote", "set-url", "origin", origin); err != nil {
 		return Package{}, err
 	}
 	defaultBranch, base, err := s.fetchBase(ctx, host, t.Repo, t.Base)
+	if held(err) {
+		// the next pass fetches into this clone (a write that fails only clones again)
+		_ = os.WriteFile(marker, []byte(t.Dir), 0o600)
+		return Package{}, err
+	}
 	if err != nil {
+		return Package{}, err
+	}
+	if err := os.Remove(marker); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return Package{}, err
 	}
 	branch := "momentum/" + c.ID
@@ -1692,10 +1717,56 @@ func (s *Ship) gitInput(ctx context.Context, dir string, input []byte, args ...s
 	return out.String(), nil
 }
 
+// baseHold is a ship Git call of a base's fetch as fetchBase returns it: a hold (baseOutage) unless the remote answered
+// or the host refused the call before it ran.
+func baseHold(err error, repo string) error {
+	var failed *shipGitError
+	if errors.As(err, &failed) && (failed.ended != "" || !remoteAnswered([]byte(failed.diag))) {
+		class, line := holdClass([]byte(failed.diag), failed.ended)
+		return &shipHold{err: &baseOutage{repo: repo, class: class, line: line}}
+	}
+	return err
+}
+
+// baseRemote is where the host clone's base is read: a GitHub origin over https by its name (githubURL), with the
+// GitHub CLI's credentials, as the mirror reads it, so no ssh agent is asked for a key; any other origin as it is.
+func (s *Ship) baseRemote(ctx context.Context, host string) (string, error) {
+	url, err := s.git(ctx, host, "config", "--get", "remote.origin.url")
+	if err != nil {
+		return "", err
+	}
+	if identity := remoteIdentity(url); !strings.HasPrefix(identity, "url:") {
+		return githubURL(identity), nil
+	}
+	return "origin", nil
+}
+
+// baseBranch is the branch the host clone's origin names as its HEAD now (ls-remote --symref), or known when it names
+// none; a failure is fetchBase's (baseHold).
+func (s *Ship) baseBranch(ctx context.Context, host, repo, known string) (string, error) {
+	remote, err := s.baseRemote(ctx, host)
+	if err != nil {
+		return "", err
+	}
+	out, err := s.git(ctx, host, "ls-remote", "--symref", remote, "HEAD")
+	if err != nil {
+		return "", baseHold(err, repo)
+	}
+	branch := firstOf(symrefBranch(out), known)
+	if _, err := hostInputGit(ctx, "", "check-ref-format", "refs/heads/"+branch); err != nil {
+		return "", refused("origin's default branch has no valid name")
+	}
+	return branch, nil
+}
+
+// heldCloneFile, in a host clone's Git directory, names the source of a preparation a hold stopped: the next
+// preparation of that source fetches into the clone.
+const heldCloneFile = "momentum-held"
+
 // baseOutage is a build whose base cannot be fetched now, held for the pass (shipHold): its repository and its class,
-// which its note names, and the first line of Git's diagnostics, which only the pass's log gets, scrubbed. It is a
-// refusal to the ship tool's callers, as every hold is.
-type baseOutage struct{ repo, class, first string }
+// which its note names, and the line of Git's diagnostics that shows it (holdClass), which only the pass's log gets,
+// scrubbed. It is a refusal to the ship tool's callers, as every hold is.
+type baseOutage struct{ repo, class, line string }
 
 func (e *baseOutage) Error() string {
 	return fmt.Sprintf("%v: the default branch of %s cannot be fetched now (%s)", ErrRefused, e.repo, e.class)
@@ -1720,34 +1791,18 @@ func (e *shipGitError) Unwrap() error { return e.err }
 // (remoteAnswered: a repository, a branch or access it does not have) fails as the build's own, and so does a refusal
 // of the host clone; any other failure, a deadline's among them, is an outage, which holds the build for the pass,
 // without a run or a charge. The hold names the failure's class (holdClass), not Git's text, so its note stays one
-// note per class whatever the network printed; the text's first line goes to the pass's log (baseOutage).
+// note per class whatever the network printed; the line that shows it goes to the pass's log (baseOutage).
 func (s *Ship) fetchBase(ctx context.Context, host, repo, known string) (string, string, error) {
-	hold := func(err error) error {
-		var failed *shipGitError
-		if errors.As(err, &failed) && (failed.ended != "" || !remoteAnswered([]byte(failed.diag))) {
-			first, _, _ := strings.Cut(strings.TrimSpace(failed.diag), "\n")
-			return &shipHold{err: &baseOutage{repo: repo, class: holdClass([]byte(failed.diag), failed.ended), first: strings.TrimSpace(first)}}
-		}
-		return err
-	}
-	url, err := s.git(ctx, host, "config", "--get", "remote.origin.url")
+	remote, err := s.baseRemote(ctx, host)
 	if err != nil {
 		return "", "", err
 	}
-	remote := "origin"
-	if identity := remoteIdentity(url); !strings.HasPrefix(identity, "url:") {
-		remote = githubURL(identity)
-	}
-	out, err := s.git(ctx, host, "ls-remote", "--symref", remote, "HEAD")
+	branch, err := s.baseBranch(ctx, host, repo, known)
 	if err != nil {
-		return "", "", hold(err)
-	}
-	branch := firstOf(symrefBranch(out), known)
-	if _, err := hostInputGit(ctx, "", "check-ref-format", "refs/heads/"+branch); err != nil {
-		return "", "", refused("origin's default branch has no valid name")
+		return "", "", err
 	}
 	if _, err := s.git(ctx, host, "fetch", "--quiet", remote, "+refs/heads/"+branch+":refs/remotes/origin/"+branch); err != nil {
-		return "", "", hold(err)
+		return "", "", baseHold(err, repo)
 	}
 	commit, err := s.git(ctx, host, "rev-parse", "--verify", "refs/remotes/origin/"+branch+"^{commit}")
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
@@ -101,6 +102,33 @@ func TestABuildBaseFollowsARenamedDefaultBranch(t *testing.T) {
 	}
 }
 
+// groupGone says whether no process of a group runs: none is left, or only zombies their parent has not reaped yet (a
+// container's first process may never reap them), by state Z in /proc.
+func groupGone(group int) bool {
+	if errors.Is(syscall.Kill(-group, 0), syscall.ESRCH) {
+		return true
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join("/proc", e.Name(), "stat"))
+		i := strings.LastIndexByte(string(raw), ')')
+		if err != nil || i < 0 {
+			continue
+		}
+		fields := strings.Fields(string(raw[i+1:])) // from field 3, the state; field 5 is the group
+		if len(fields) > 2 && fields[2] == strconv.Itoa(group) && fields[0] != "Z" {
+			return false
+		}
+	}
+	return true
+}
+
 // randomText is n random bytes as hex: text no pack compresses or deltifies.
 func randomText(t *testing.T, n int) string {
 	t.Helper()
@@ -131,14 +159,16 @@ func TestAFetchThatOutlivesItsPassKeepsItsFiles(t *testing.T) {
 		files[fmt.Sprintf("f%03d.txt", i)] = randomText(t, 200)
 	}
 	f := newRepo(t, files)
-	// an ssh that runs the origin's upload-pack here, and stalls the first fetch after 64 KiB of its pack; dd passes each
-	// byte on as it reads it, where GNU head holds what it read in its own buffer
+	// an ssh that runs the origin's upload-pack here, and stalls the first fetch after 1024 reads of at most 1 KiB: past
+	// the advertisement (a few dozen small reads), within the pack of about 2 MiB. dd passes each read on as it gets it,
+	// where GNU head holds what it read in its own buffer, and one read a byte is too slow on a busy machine.
 	bin := t.TempDir()
 	count, pidFile := filepath.Join(bin, "count"), filepath.Join(bin, "pid")
 	script(t, bin, "ssh", `for last; do :; done
 n=$(cat '`+count+`' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '`+count+`'
+echo "$n $PPID $last" >> '`+count+`.log'
 case "$last" in git-upload-pack*) ;; *) exit 255;; esac
-if [ "$n" = 2 ]; then echo $$ > '`+pidFile+`'; sh -c "$last" | { dd bs=1 count=65536 2>/dev/null; exec sleep 60; }; else exec sh -c "$last"; fi`)
+if [ "$n" = 2 ]; then echo $$ > '`+pidFile+`'; sh -c "$last" | { dd bs=1024 count=1024 2>/dev/null; exec sleep 60; }; else exec sh -c "$last"; fi`)
 	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
 	url := "ssh://git@fixture.invalid" + f.origin
 	mirror := filepath.Join(t.TempDir(), "mirrors", "0123456789abcdef.git")
@@ -162,7 +192,24 @@ if [ "$n" = 2 ]; then echo $$ > '`+pidFile+`'; sh -c "$last" | { dd bs=1 count=6
 	if !comesTrue(30*time.Second, func() bool { return len(tmpPacks()) > 0 }) {
 		calls, _ := os.ReadFile(count)
 		said, _ := os.ReadFile(passLog)
-		t.Fatalf("the pass's fetch did not start its transfer: %q ssh calls; the pass said:\n%s", strings.TrimSpace(string(calls)), said)
+		var files []string
+		_ = filepath.WalkDir(mirror, func(p string, e fs.DirEntry, err error) error {
+			if err == nil && !e.IsDir() {
+				files = append(files, strings.TrimPrefix(p, mirror))
+			}
+			return nil
+		})
+		procs, _ := exec.Command("ps", "-ww", "-o", "pid,ppid,pgid,stat,args", "-e").CombinedOutput()
+		var mine []string
+		for _, l := range strings.Split(string(procs), "\n") {
+			if strings.Contains(l, filepath.Base(filepath.Dir(filepath.Dir(mirror)))) || strings.Contains(l, "upload-pack") || strings.Contains(l, " dd ") {
+				mine = append(mine, l)
+			}
+		}
+		sshLog, _ := os.ReadFile(count + ".log")
+		procs = []byte(strings.Join(mine, "\n") + "\nssh calls:\n" + string(sshLog))
+		t.Fatalf("the pass's fetch did not start its transfer: %q ssh calls; the mirror holds %v; the pass runs\n%s\nthe pass said:\n%s",
+			strings.TrimSpace(string(calls)), files, procs, said)
 	}
 	// the pass is killed outright; its fetch's process group goes on
 	_ = pass.Process.Kill()
@@ -204,7 +251,7 @@ if [ "$n" = 2 ]; then echo $$ > '`+pidFile+`'; sh -c "$last" | { dd bs=1 count=6
 	if why != "" || tip.commit != originHead(t, f, "main") || len(tmpPacks()) != 0 {
 		t.Fatalf("the pass did not take the lock from the orphaned fetch, clear and fetch: %q %+v %v", why, tip, tmpPacks())
 	}
-	if !comesTrue(10*time.Second, func() bool { return errors.Is(syscall.Kill(-group, 0), syscall.ESRCH) }) {
+	if !comesTrue(10*time.Second, func() bool { return groupGone(group) }) {
 		t.Fatal("the orphaned fetch's process group outlived the pass that took its lock")
 	}
 }

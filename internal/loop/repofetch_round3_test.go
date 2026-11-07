@@ -182,7 +182,9 @@ func TestABaseHoldNotesItsClassAndIsRaisedAfterADay(t *testing.T) {
 	}
 	// a transport whose credentials are gone, as git says over https when gh is logged out
 	bin := t.TempDir()
-	script(t, bin, "ssh", `echo "fatal: could not read Username for 'https://github.com': terminal prompts disabled" >&2; exit 255`)
+	// after ssh's warning about its key exchange, which comes first
+	script(t, bin, "ssh", `echo "** WARNING: connection is not using a post-quantum key exchange algorithm." >&2
+echo "fatal: could not read Username for 'https://github.com': terminal prompts disabled" >&2; exit 255`)
 	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
 	run(t, p.Host, "git", "remote", "set-url", "origin", "ssh://git@fixture.invalid/fixture/fake.git")
 	baseNotes := func() []store.Note {
@@ -215,6 +217,9 @@ func TestABaseHoldNotesItsClassAndIsRaisedAfterADay(t *testing.T) {
 	found := false
 	for _, line := range logged {
 		found = found || strings.Contains(line, "could not read Username for 'https://github.com': terminal prompts disabled")
+		if strings.Contains(line, "post-quantum") {
+			t.Fatalf("the pass's log took ssh's warning for git's failure: %s", line)
+		}
 	}
 	mu.Unlock()
 	if !found {
@@ -239,22 +244,25 @@ func TestABaseHoldNotesItsClassAndIsRaisedAfterADay(t *testing.T) {
 	}
 }
 
-// A hold's class is one of a fixed few, whatever Git printed.
+// A hold's class is one of a fixed few, whatever Git printed, and its log line is the one that shows it, else Git's
+// last fatal: or error: line: warnings come first.
 func TestABaseHoldNamesItsClass(t *testing.T) {
-	for _, c := range []struct{ stderr, ended, class string }{
-		{"fatal: could not read Username for 'https://github.com': terminal prompts disabled\n", "", "no credentials"},
-		{"fatal: could not read Password for 'https://x@github.com': terminal prompts disabled\n", "", "no credentials"},
-		{"fatal: unable to access 'https://github.com/o/r.git/': server certificate verification failed. CAfile: none CRLfile: none\n", "", "a certificate or host key not trusted"},
-		{"fatal: unable to access 'https://github.com/o/r.git/': SSL certificate problem: unable to get local issuer certificate\n", "", "a certificate or host key not trusted"},
-		{"Host key verification failed.\r\nfatal: Could not read from remote repository.\n", "", "a certificate or host key not trusted"},
-		{"Connection closed by 192.0.2.1 port 22\r\nfatal: Could not read from remote repository.\n", "", "the connection broke off"},
-		{"fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com\n", "", "the server's name did not resolve"},
-		{"fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 503\n", "", "the server failed (an HTTP 5xx answer)"},
-		{"", "the git call's 2m0s limit passed", "the git call's 2m0s limit passed"},
-		{"fatal: something git has never said\n", "", "another failure"},
+	const pq = "** WARNING: connection is not using a post-quantum key exchange algorithm.\r\n** This session may be vulnerable to \"store now, decrypt later\" attacks.\r\n** The server may need to be upgraded. See https://openssh.com/pq.html\r\n"
+	for _, c := range []struct{ stderr, ended, class, line string }{
+		{"fatal: could not read Username for 'https://github.com': terminal prompts disabled\n", "", "no credentials", "fatal: could not read Username for 'https://github.com': terminal prompts disabled"},
+		{"warning: redirecting to https://github.com/o/r.git/\nfatal: could not read Password for 'https://x@github.com': terminal prompts disabled\n", "", "no credentials", "fatal: could not read Password for 'https://x@github.com': terminal prompts disabled"},
+		{"remote: Invalid username or token. Password authentication is not supported for Git operations.\nfatal: Authentication failed for 'https://github.com/o/r.git/'\n", "", "no credentials", "remote: Invalid username or token. Password authentication is not supported for Git operations."},
+		{"fatal: unable to access 'https://github.com/o/r.git/': server certificate verification failed. CAfile: none CRLfile: none\n", "", "a certificate or host key not trusted", "fatal: unable to access 'https://github.com/o/r.git/': server certificate verification failed. CAfile: none CRLfile: none"},
+		{"fatal: unable to access 'https://github.com/o/r.git/': SSL certificate problem: unable to get local issuer certificate\n", "", "a certificate or host key not trusted", "fatal: unable to access 'https://github.com/o/r.git/': SSL certificate problem: unable to get local issuer certificate"},
+		{"Host key verification failed.\r\nfatal: Could not read from remote repository.\n", "", "a certificate or host key not trusted", "Host key verification failed."},
+		{pq + "Connection closed by 192.0.2.1 port 22\r\nfatal: Could not read from remote repository.\n", "", "the connection broke off", "Connection closed by 192.0.2.1 port 22"},
+		{"fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com\n", "", "the server's name did not resolve", "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com"},
+		{"fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 503\n", "", "the server failed (an HTTP 5xx answer)", "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 503"},
+		{"", "the git call's 2m0s limit passed", "the git call's 2m0s limit passed", ""},
+		{pq + "error: something git has never said\nfatal: and then this\n", "", "another failure", "fatal: and then this"},
 	} {
-		if got := holdClass([]byte(c.stderr), c.ended); got != c.class {
-			t.Errorf("%q: class %q, want %q", c.stderr, got, c.class)
+		if class, line := holdClass([]byte(c.stderr), c.ended); class != c.class || line != c.line {
+			t.Errorf("%q: class %q, line %q; want %q, %q", c.stderr, class, line, c.class, c.line)
 		}
 	}
 }

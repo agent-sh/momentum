@@ -963,48 +963,74 @@ func transportCause(stderr []byte) string {
 	return ""
 }
 
-// holdClass is the class of a failure that holds a build, as its note names it: one of a fixed few, so a note stands
-// for a class, not for each text Git printed. A deadline is its limit (ended); credentials Git cannot get (gh logged
-// out, so it would prompt), a certificate or ssh host key it does not trust, a transport cause (transportCauses), or
-// another failure.
-func holdClass(diag []byte, ended string) string {
-	text := strings.ToLower(string(diag))
-	switch {
-	case ended != "":
-		return ended
-	case strings.Contains(text, "could not read username") || strings.Contains(text, "could not read password") ||
-		strings.Contains(text, "terminal prompts disabled"):
-		return "no credentials"
-	case strings.Contains(text, "certificate") || strings.Contains(text, "host key verification failed"):
-		return "a certificate or host key not trusted"
+// holdClass is the class of a failure that holds a build, as its note names it, and the line of Git's diagnostics
+// that shows it, for the pass's log. The class is one of a fixed few, so a note stands for a class, not for each text
+// Git printed: a deadline (ended, its limit); no credentials (none Git can get, gh logged out, so it would prompt, or
+// ones the machine's own gh helper gave that the server refused); a certificate or ssh host key it does not trust; a
+// transport cause (transportCauses); another failure. The line is the one that matched, else Git's last fatal: or
+// error: line: warnings (ssh's about its key exchange, a redirect) come before what failed.
+func holdClass(diag []byte, ended string) (string, string) {
+	var lines []string
+	for _, l := range strings.Split(string(diag), "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
 	}
-	if cause := transportCause(diag); cause != "" {
-		return cause
+	last := ""
+	for _, l := range lines {
+		if lower := strings.ToLower(l); strings.HasPrefix(lower, "fatal:") || strings.HasPrefix(lower, "error:") || last == "" {
+			last = l
+		}
 	}
-	return "another failure"
+	if ended != "" {
+		return ended, last
+	}
+	for _, class := range []struct {
+		name  string
+		match func(string) bool
+	}{
+		{"no credentials", func(l string) bool { return credentialFailure.MatchString(l) }},
+		{"a certificate or host key not trusted", func(l string) bool {
+			return strings.Contains(l, "certificate") || strings.Contains(l, "host key verification failed")
+		}},
+	} {
+		for _, l := range lines {
+			if class.match(strings.ToLower(l)) {
+				return class.name, l
+			}
+		}
+	}
+	for _, l := range lines {
+		if cause := transportCause([]byte(l)); cause != "" {
+			return cause, l
+		}
+	}
+	return "another failure", last
 }
 
-// remoteAnswers are what a remote that answered says, as git, curl and ssh word it: a repository it does not have, a
-// branch it does not hold, access it does not grant, an HTTP 4xx answer.
-var remoteAnswers = []string{"repository not found", "does not appear to be a git repository", "couldn't find remote ref",
-	"authentication failed", "permission denied", "the requested url returned error: 4"}
+// credentialFailure is Git with no credentials it can use: none it can get without a prompt, which the host never
+// allows, or ones the server refused. The only credentials a host call has are GitHub's, from the machine's own gh,
+// so a refusal of them (a token gh holds that expired) is the machine's to fix, not an answer about the repository.
+var credentialFailure = regexp.MustCompile(`could not read (username|password)|terminal prompts disabled|authentication failed|` +
+	`invalid username or (password|token)|returned error: 401`)
+
+// remoteAnswers are what a remote that answered says, as git, curl and ssh word it: a repository it does not have
+// (GitHub's "Repository not found", git's "repository 'URL' not found" for an https 404, a path that is no
+// repository), a branch it does not hold, an ssh key it refuses (ssh's "Permission denied (publickey...)"), an HTTP
+// 4xx answer.
+var remoteAnswers = regexp.MustCompile(`repository not found|repository '[^']*' not found|does not appear to be a git repository|` +
+	`couldn't find remote ref|permission denied \(publickey|the requested url returned error: 4[0-9][0-9]`)
 
 // remoteAnswered says whether Git's diagnostics are a remote's answer (remoteAnswers), which the next try would get
-// again. Anything else is a failure on the way to the remote (a network, a TLS session, a server that failed), and
-// so are a 408 and a 429, which ask the client to try again later.
+// again. Anything else is a failure on the way to the remote (a network, a TLS session, a server that failed), and so
+// are credentials the machine has not got or the server refused (credentialFailure, a 401 among them), and a 408 and a
+// 429, which ask the client to try again later.
 func remoteAnswered(stderr []byte) bool {
 	text := strings.ToLower(string(stderr))
-	for _, later := range []string{"returned error: 408", "returned error: 429"} {
-		if strings.Contains(text, later) {
-			return false
-		}
+	if credentialFailure.MatchString(text) || strings.Contains(text, "returned error: 408") || strings.Contains(text, "returned error: 429") {
+		return false
 	}
-	for _, answer := range remoteAnswers {
-		if strings.Contains(text, answer) {
-			return true
-		}
-	}
-	return false
+	return remoteAnswers.MatchString(text)
 }
 
 // endWithContext makes a Git call end with its context, whatever its children do: git starts in a process group of
