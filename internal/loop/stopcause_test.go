@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -418,5 +419,43 @@ func TestAStopTheRuleNoLongerCountsEndsTheReviewsStoppedNote(t *testing.T) {
 	review("last two review runs failed")
 	if !note().Done.IsZero() {
 		t.Fatal("a later stop did not put the review's stopped note again")
+	}
+}
+
+// A build that fails at a host stage before its agent starts (here a toolchain that is gone) is kept at no cost and
+// with no start. The stop rule counts it all the same: twice at one stage stops the case, under the stage's signature,
+// and the case is not built a third time.
+func TestABuildThatNeverStartsStopsOnItsStage(t *testing.T) {
+	fakeManager(t) // host ordering only: the build fails before any unit or model starts
+	ctx := context.Background()
+	r, c := inputRunner(t)
+	f := newRepo(t, nil)
+	r.Ship = shipWithSandbox(r.Store, f, Sandbox{})
+	r.Ship.Dir = r.Dir
+	r.Inputs.ReadDirs = []string{f.main}
+	r.Toolchains = Toolchains{GoRoot: filepath.Join(t.TempDir(), "absent")}
+	mechanism, fix := "one cause", "one fix"
+	var err error
+	if c, err = r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	setCaseRepo(t, r.Store, c, "main")
+	for i := 0; i < 2; i++ {
+		done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
+		if err != nil || len(done) != 1 || done[0].Run.Failure != "build toolchains" || done[0].Run.USD != 0 || !done[0].Run.Started.IsZero() {
+			t.Fatalf("build %d did not fail at its toolchains before it started: %+v %v", i, done, err)
+		}
+	}
+	done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
+	if err != nil || len(done) != 1 || done[0].Run.ID != "" || !strings.Contains(done[0].Skipped, "stopped: its last two build runs failed the same way: build toolchains)") {
+		t.Fatalf("two builds that never started did not stop the case: %+v %v", done, err)
+	}
+	cs, err := r.Store.Cases(ctx, store.CaseFilter{Family: store.HealthFamily})
+	if err != nil || len(cs) != 1 || !slices.Equal(cs[0].Signatures, []string{"component-health/v1:loop:build:build-toolchains"}) ||
+		cs[0].Title != "The loop fails the same way twice: build toolchains" || cs[0].Evidence != 2 {
+		t.Fatalf("the stop's component-health case: %+v %v", cs, err)
+	}
+	if runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID}); err != nil || len(runs) != 2 {
+		t.Fatalf("the stopped case built again: %d %v", len(runs), err)
 	}
 }

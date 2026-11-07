@@ -1045,8 +1045,8 @@ func (r *Runner) caseNoteOnce(ctx context.Context, id, action, detail string) er
 	return r.Store.CaseNote(cleanedNote(ctx), id, action, clean, "loop")
 }
 
-// stopRuns reads the stop rule for a case: its last two live runs that ran (a refusal of the budgets is no run, and a
-// run the host ended, stopped or killed, says nothing of the agent), since it last came back after a close or
+// stopRuns reads the stop rule for a case: its last two live runs that count (stopCounts; a run the host ended,
+// stopped or killed, says nothing of the agent), since it last came back after a close or
 // resumed after a fix of its stop, when both failed the same way in the same step. A build refused for its own output
 // at a refusal stage fails the same way only for the same cause: each refusal's reason reaches the next build
 // (refusal.md), so refusals for different causes are a build making progress. The newest such refusal stops the case
@@ -1067,9 +1067,17 @@ func stopRuns(ctx context.Context, st *store.Store, c store.Case) (runs []store.
 	if !since.IsZero() {
 		since = since.Add(time.Millisecond) // the kept clock is in milliseconds; only runs after the return count
 	}
-	runs, err = st.LoopRuns(ctx, store.RunFilter{Case: c.ID, Experiment: &live, Ran: true, Judged: true, Since: since})
-	if err != nil || len(runs) < 2 {
+	all, err := st.LoopRuns(ctx, store.RunFilter{Case: c.ID, Experiment: &live, Judged: true, Since: since})
+	if err != nil {
 		return nil, false, err
+	}
+	for _, run := range all {
+		if stopCounts(run) {
+			runs = append(runs, run)
+		}
+	}
+	if len(runs) < 2 {
+		return nil, false, nil
 	}
 	a := runs[0]
 	if a.Status == store.RunOK || a.Failure == "" {
@@ -1091,6 +1099,27 @@ func stopRuns(ctx context.Context, st *store.Store, c store.Case) (runs []store.
 		return nil, false, nil
 	}
 	return runs[:2], true, nil
+}
+
+// stopCounts says the stop rule counts a run: one that started and ended (a refusal of the budgets is no run, nor is
+// one still running), or a build that failed at a host stage before its agent started (its inputs, a toolchain that
+// is gone, a harness that does not start), which is kept at no cost and with no start, so nothing else bounds it.
+func stopCounts(run store.LoopRun) bool {
+	switch {
+	case run.Status == store.RunRefused || run.Status == store.RunRunning || run.Failure == "sandbox":
+		return false
+	case run.Started.IsZero():
+		return run.Step == StepBuild && run.Status == store.RunFailed && slices.Contains(hostStages, run.Failure)
+	}
+	return true
+}
+
+// runAt is when a run counts for the stop rule: its start, or its end for one that never started.
+func runAt(run store.LoopRun) time.Time {
+	if run.Started.IsZero() {
+		return run.Ended
+	}
+	return run.Started
 }
 
 // stopSignature is the signature of the component-health case a stop files: by its step and its failure, and for a
@@ -1153,12 +1182,12 @@ func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, e
 	// a stop whose older run began before its component-health case closed as fixed came too late for the close:
 	// the case resumes as the close would have resumed it
 	if dry {
-		if _, _, late, err := r.Store.FixedStop(ctx, sig, runs[1].Started); err != nil || late {
+		if _, _, late, err := r.Store.FixedStop(ctx, sig, runAt(runs[1])); err != nil || late {
 			return "", err
 		}
 		return why, nil
 	}
-	if late, err := r.Store.ResumeLate(ctx, c.ID, sig, runs[1].Started, "loop"); err != nil || late {
+	if late, err := r.Store.ResumeLate(ctx, c.ID, sig, runAt(runs[1]), "loop"); err != nil || late {
 		return "", err
 	}
 	f := store.Finding{Family: store.HealthFamily, Signature: sig,
@@ -1171,7 +1200,7 @@ func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, e
 				ref = "file:" + filepath.Join(HostDir(run.Dir), "transcript.fallback.jsonl")
 			}
 		}
-		f.Evidence = append(f.Evidence, store.Evidence{Ref: ref, At: run.Started, Kind: "loop-run", Summary: run.Step + " " + run.Case + ": " + stopFailure(run)})
+		f.Evidence = append(f.Evidence, store.Evidence{Ref: ref, At: runAt(run), Kind: "loop-run", Summary: run.Step + " " + run.Case + ": " + stopFailure(run)})
 	}
 	if _, _, err := r.Store.ObserveCase(ctx, f, "loop"); err != nil {
 		return "", err
