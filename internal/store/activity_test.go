@@ -128,8 +128,9 @@ func TestAServersExposureReadsItsNameLiterally(t *testing.T) {
 // mcp__codex_apps__CONNECTOR__TOOL, its TOOL beginning with _ where Codex cut the connector's name from the tool's: each
 // connector is a server of its own, codex_apps__CONNECTOR, the field before the first __ after codex_apps__ (#101), in
 // both forms; a connector whose own name holds __ is cut at it. A connector's exposure holds the hours of exactly the
-// tools MCPServer gives it (OfServer): of both forms, never another connector's, nor one named only its prefix. The
-// exposure of codex_apps as a whole holds every tool named from mcp__codex_apps__, and codex_apps holds each connector.
+// tools MCPServer gives it (OfServer): of both forms, never another connector's, nor one named only its prefix. A tool
+// Codex serves with no connector, mcp__codex_apps__TOOL, is of none (#109). The exposure of codex_apps as a whole holds
+// every tool named from mcp__codex_apps__, a tool of no connector too, and codex_apps holds each connector.
 func TestACodexAppsConnectorIsAServerOfItsOwn(t *testing.T) {
 	for tool, want := range map[string]string{
 		"mcp__codex_apps__gmail___search_emails":      "codex_apps__gmail",
@@ -137,6 +138,7 @@ func TestACodexAppsConnectorIsAServerOfItsOwn(t *testing.T) {
 		"mcp__codex_apps__gmail____x":                 "codex_apps__gmail",
 		"mcp__codex_apps__gmail__capture_file_upload": "codex_apps__gmail",
 		"mcp__codex_apps__foo__bar___x":               "codex_apps__foo",
+		"mcp__codex_apps__search":                     "",
 		"mcp__codex_apps_____x":                       "",
 		"mcp__codex_apps__gmail__":                    "",
 	} {
@@ -149,14 +151,14 @@ func TestACodexAppsConnectorIsAServerOfItsOwn(t *testing.T) {
 	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	var evs []Event
 	for i, tool := range []string{"mcp__codex_apps__gmail___search", "mcp__codex_apps__gmail___send", "mcp__codex_apps__calendar___list",
-		"mcp__codex_apps__gmail__capture_file_upload", "mcp__codex_apps__gmail_x___y", "mcp__codex_apps__gmail__", "mcp__zz__x"} {
+		"mcp__codex_apps__gmail__capture_file_upload", "mcp__codex_apps__gmail_x___y", "mcp__codex_apps__gmail__", "mcp__codex_apps__search", "mcp__zz__x"} {
 		key := fmt.Sprint("e-", i)
 		evs = append(evs, Event{Source: Transcripts, Kind: "tool_result", Actor: ActorTool, SourceKey: key, Session: key, TS: start.Add(time.Duration(i) * time.Hour), Tool: tool})
 	}
 	if _, err := st.Put(ctx, evs); err != nil {
 		t.Fatal(err)
 	}
-	for server, n := range map[string]int{"codex_apps__gmail": 3, CodexApps: 6} {
+	for server, n := range map[string]int{"codex_apps__gmail": 3, CodexApps: 7} {
 		base, err := st.Activity(ctx, ActivityQuery{Since: start, Until: start.Add(24 * time.Hour), BySession: true, Server: server})
 		if err != nil || len(base) != n {
 			t.Fatalf("%s's exposure: %+v %v", server, base, err)
