@@ -323,15 +323,13 @@ func (r *Runner) noteBaseHold(ctx context.Context, c store.Case, why string) err
 	if r.now().Sub(since) >= baseHoldRaise {
 		importance = store.ImportanceNormal
 	}
-	if current != nil && !current.Done.IsZero() {
-		switch {
-		case baseNoteEnded(*current):
-			current = nil // its hold ended: this is a new one
-		case importance <= current.Importance:
-			return nil // a person took it out of the report at this importance, while this hold lasts
-		}
-		// a dismissal covers the importance it was made at: the note comes back, once, when its importance rises
+	switch {
+	case current != nil && baseNoteEnded(*current):
+		current = nil // its hold ended (the note may still stand, if a pass stopped between its writes): this is a new one
+	case current != nil && !current.Done.IsZero() && importance <= current.Importance:
+		return nil // a person took it out of the report at this importance, while this hold lasts
 	}
+	// a dismissal covers the importance it was made at: the note comes back, once, when its importance rises
 	at := r.now()
 	if current != nil {
 		if current.Importance >= importance && current.Done.IsZero() {

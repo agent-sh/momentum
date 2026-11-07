@@ -99,6 +99,7 @@ type repoTip struct {
 	fallback            string
 	repack              string
 	class, line         string // a failed fetch's class (holdClass) and the line of Git's that shows it
+	identity            string // the repository the mirror holds (origin's identity), for a tip in the mirror
 }
 
 // origin is the repository a checkout's origin names, by its identity (OWNER/REPO on GitHub, else url: and its URL),
@@ -116,6 +117,7 @@ func sourceTip(ctx context.Context, source, mirrors, gh string) (repoTip, string
 		mirror = mirrorPath(mirrors, org.identity)
 		var tip repoTip
 		if tip, why = fetchTip(ctx, source, mirror, org.url, gh); why == "" {
+			tip.identity = org.identity
 			return tip, mirror, nil
 		}
 		class, line = tip.class, tip.line
@@ -124,7 +126,7 @@ func sourceTip(ctx context.Context, source, mirrors, gh string) (repoTip, string
 		}
 		if last, at, ok := lastFetch(ctx, mirror); ok {
 			last.fallback = fmt.Sprintf("origin's %s as fetched at %s: %s", last.branch, at.UTC().Format("2006-01-02 15:04Z"), why)
-			last.class, last.line = class, line
+			last.class, last.line, last.identity = class, line, org.identity
 			return last, mirror, nil
 		}
 	}

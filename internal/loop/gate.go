@@ -52,7 +52,6 @@ type Gate struct {
 type Target struct {
 	Repo  string // OWNER/REPO
 	Dir   string // the repository's main checkout
-	Base  string // its default branch
 	Owner string
 }
 
@@ -172,11 +171,7 @@ func (g Gate) Repository(ctx context.Context, dir string) (target Target, err er
 			return Target{}, refused("%s is in use: %s; the loop leaves it alone", repo, what)
 		}
 	}
-	base, err := defaultBranch(ctx, main)
-	if err != nil {
-		return Target{}, err
-	}
-	return Target{Repo: repo, Dir: main, Base: base, Owner: owner}, nil
+	return Target{Repo: repo, Dir: main, Owner: owner}, nil
 }
 
 // scope runs the machine's read-only scope check for scheduled repository work: a nonzero exit or a disposition
@@ -208,18 +203,6 @@ func (g Gate) scope(ctx context.Context, repo, dir string) error {
 		return refused("the scope check does not allow %s (%s %s): report only", repo, v.Disposition, why)
 	}
 	return nil
-}
-
-func defaultBranch(ctx context.Context, dir string) (string, error) {
-	if out, err := gitOutput(ctx, dir, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil {
-		return strings.TrimPrefix(strings.TrimSpace(out), "origin/"), nil
-	}
-	for _, b := range []string{"main", "master"} {
-		if _, err := gitOutput(ctx, dir, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+b); err == nil {
-			return b, nil
-		}
-	}
-	return "", refused("cannot tell %s's default branch", dir)
 }
 
 // Protected are the paths of momentum's own repository the loop never changes: what its judgment and its

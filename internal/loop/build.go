@@ -175,7 +175,15 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 	if read.mirror == "" {
 		return Package{}, mirrorHold(name, read.class, read.line)
 	}
-	tip := repoTip{dir: read.mirror, branch: read.Branch, commit: read.Commit}
+	tip := repoTip{dir: read.mirror, branch: read.Branch, commit: read.Commit, identity: read.identity}
+	// a mirror that holds this pass's fetch ends what held the case's builds for their base, whatever the build does
+	// next; a mirror's last fetch serves a private base alone (below), so it ends them only once the build goes on
+	fresh := read.Fallback == ""
+	if fresh {
+		if err := r.endBaseNotes(ctx, c.ID, baseFetched); err != nil {
+			r.logf("base notes of %s: %v", c.ID, err)
+		}
+	}
 	p, had, err := r.Ship.Load(c.ID)
 	if err != nil {
 		return p, err
@@ -206,9 +214,6 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 	if p, err = r.Ship.buildBase(r.Ship.gitContext(shipContext(ctx, p.Case)), p, tip); err != nil {
 		return p, err
 	}
-	if err := r.endBaseNotes(ctx, c.ID, baseFetched); err != nil { // the base was fetched: what held it is over
-		r.logf("base notes of %s: %v", c.ID, err)
-	}
 	// The build tree holds the base commit's tree and one commit, no history. A public repository's base commit is
 	// the default branch its remote serves to anyone, so the scrubber has nothing to keep from the run there, and
 	// masking would break the build. Any other tree (its objects, refs and configuration) is scanned before it is
@@ -217,6 +222,17 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 	if err != nil {
 		removeInputTree(p.Work)
 		return p, err
+	}
+	// The public rule rests on the branch as the remote serves it now: only this pass's fetch says that. With the
+	// mirror's last fetch alone, a public base (one a force-push may have purged since) waits for the pass.
+	if public && !fresh {
+		removeInputTree(p.Work)
+		return p, mirrorHold(name, read.class, read.line)
+	}
+	if !fresh {
+		if err := r.endBaseNotes(ctx, c.ID, baseFetched); err != nil {
+			r.logf("base notes of %s: %v", c.ID, err)
+		}
 	}
 	if !public {
 		if err = checkCloneObjects(ctx, p.Work); err != nil {
