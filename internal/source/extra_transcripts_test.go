@@ -592,6 +592,11 @@ func TestKimiInlineSkillIsGeneratedInput(t *testing.T) {
 		// the skill's body is generated in both.
 		{"skill only in a program's run", headless, only, body, nil},
 		{"skill only with no metadata", "", only, body, nil},
+		// Media alone stores nothing there either: neither is his turn.
+		{"media only in a program's run", headless, kimiRecord("turn.prompt", map[string]any{"origin": map[string]any{"kind": "user"}, "input": []any{image}}),
+			map[string]string{}, nil},
+		{"media only with no metadata", "", kimiRecord("turn.prompt", map[string]any{"origin": map[string]any{"kind": "user"}, "input": []any{image}}),
+			map[string]string{}, nil},
 		{"inline skill with no metadata", "", inline,
 			map[string]string{"marker-7f3a skill body": "harness harness_text", "marker-7f3a typed": "unknown harness_text"}, nil},
 		// A wire from before Kimi marked a skill's part holds the body as the prompt's first unmarked text part.
