@@ -3,6 +3,7 @@ package detect
 import (
 	"encoding/json"
 	"path"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -13,11 +14,14 @@ import (
 // minutes later, well inside it.
 const readSettle = time.Hour
 
-// writtenPaths are the files a call that did not fail wrote, as it names them: a file tool's path, or the files a
-// shell's command line writes (shellWrites), a relative one read in the directory the call ran in (shellDir).
-func writtenPaths(harness, tool, call, cwd string) []string {
+// writtenPaths are the files a call that did not fail wrote, as it names them: a file tool's path, or the one file a
+// shell call writes in a form the whitelist holds (shellWrite), its result's text read too.
+func writtenPaths(harness, tool, call, result, cwd string) []string {
 	if isShell(tool) {
-		return shellWrites(call, shellDir(harness, call, cwd))
+		if p := shellWrite(harness, call, result, shellDir(harness, call, cwd)); p != "" {
+			return []string{p}
+		}
+		return nil
 	}
 	if p, _, _ := callField(call, pathKeys); p != "" {
 		return []string{p}
@@ -29,14 +33,14 @@ func writtenPaths(harness, tool, call, cwd string) []string {
 // reads them.
 var workdirKeys = map[string]bool{"workdir": true, "cwd": true, "working_directory": true, "workingDirectory": true, "dir": true, "directory": true}
 
-// workdirShells are the harnesses whose shell call can name its directory (Codex's and OpenCode's workdir, Kimi's
-// cwd): a call of theirs the store cut before such a field may have named one.
-var workdirShells = map[string]bool{"codex": true, "opencode": true, "kimi": true}
+// workdirShells are the harnesses whose shell call can name its directory (Codex's, OpenCode's and pi's workdir,
+// Kimi's cwd): a call of theirs the store cut before such a field may have named one.
+var workdirShells = map[string]bool{"codex": true, "opencode": true, "kimi": true, "pi": true}
 
 // shellDir is the directory a shell call runs its command in, as far as the store says, or "" when it does not say:
 // the workdir the call names, when that is a whole path; else the directory its session was in when it made the
 // call. Hermes's terminal keeps a directory of its own from call to call, which its record does not hold, so only
-// a workdir or a cd on the line says where it is.
+// a workdir or a leading cd says where it is.
 func shellDir(harness, call, cwd string) string {
 	w, named, absent := callField(call, workdirKeys)
 	switch {
@@ -51,77 +55,115 @@ func shellDir(harness, call, cwd string) string {
 	return cwd
 }
 
-// shellWrites are the files a shell call's command line writes, as the shell reads its words (quotes off, escapes
-// read): the targets of its standard output's redirections (>, >>, >|, 1>, &>, &>>, >& FILE) and tee's files. The
-// line is the command's first, continued lines joined, up to a comment. Bash reports the last line's status, so
-// the line counts only when nothing visible runs after it (nothingAfter). Of the line, only a command whose
-// success the line's own says is read: the line's last, or one joined to it by && only, with no || before it, and
-// not negated. A file is cleaned (path.Clean); a relative one is read only in the simple case (simpleDir), and a
-// file the shell expands (a variable, a command's output, a glob, a leading ~) names none.
-func shellWrites(call, dir string) []string {
+var (
+	// backgroundKeys are the fields of a shell call that launch its command in the background (Claude Code's).
+	backgroundKeys = map[string]bool{"run_in_background": true, "background": true}
+	// backgroundRe is a result that says its command went on in the background, whose success says nothing of it.
+	backgroundRe = regexp.MustCompile(`(?i)running in (?:the )?background`)
+	// exitRe is the exit code a Codex result reports once its command has ended; one still running reports none.
+	exitRe = regexp.MustCompile(`(?i)(?:process|command) exited with code -?\d+|exit code:? -?\d+`)
+	// openErrRe is an error opening a file for writing.
+	openErrRe = regexp.MustCompile(`(?i)no such file or directory|not a directory|is a directory|permission denied|read-only file system|cannot create|no space left`)
+)
+
+// shellWrite is the one file a shell call writes, or "". Only a form the whitelist holds counts, so any other line,
+// however it writes, clears nothing:
+//   - the command is one simple command, cat > FILE, cat >> FILE or tee [-a] FILE, with at most one here-document as
+//     its input and nothing after the here-document's end, after at most a single leading cd DIR && to a whole path;
+//   - FILE is a whole path, or a relative one read in DIR or else in dir, with no .. in it or in the directory;
+//   - the call is no background launch (Claude Code's run_in_background, a result that says so, a Codex result with
+//     no exit code), and its result shows no error opening FILE.
+func shellWrite(harness, call, result, dir string) string {
 	loc := callRe.FindStringSubmatchIndex(call)
 	if loc == nil {
-		return nil
+		return ""
+	}
+	if v, _, _ := callValue(call, backgroundKeys); string(v) == "true" || backgroundRe.MatchString(result) ||
+		harness == "codex" && !exitRe.MatchString(result) {
+		return ""
 	}
 	closed := loc[3] < len(call) && call[loc[3]] == '"' // the command's text is whole, whatever the cut took after it
-	line, ok := shellLine(unescapeCut(call[loc[2]:loc[3]]))
-	if !ok || !nothingAfter(line, closed) {
-		return nil
+	first, rest, ended := strings.Cut(unescapeCut(call[loc[2]:loc[3]]), "\n")
+	toks := shellWords(first)
+	if len(toks) > 3 && toks[0].word == "cd" && toks[1].op == "" && toks[2].op == "&&" {
+		if !toks[1].exact || !path.IsAbs(toks[1].word) {
+			return ""
+		}
+		dir, toks = toks[1].word, toks[3:]
 	}
-	cmds := shellCommands(line.toks)
-	var out []string
-	for i, c := range cmds {
-		if !reported(cmds[i:]) || slices.ContainsFunc(cmds[:i], func(d shellCmd) bool { return d.after == "||" }) {
-			continue
+	file, end, ok := writeForm(toks)
+	if !ok || !nothingAfter(end, rest, ended, closed) || dotdot(file) {
+		return ""
+	}
+	if !path.IsAbs(file) {
+		if dir == "" || dotdot(dir) {
+			return ""
 		}
-		prog, args := program(c.words)
-		if prog == "!" {
-			continue
-		}
-		var files []shellTok
-		for _, r := range c.redirs {
-			if r.writes() {
-				files = append(files, r.target)
-			}
-		}
-		if prog == "tee" {
-			for _, a := range args {
-				if !strings.HasPrefix(a.word, "-") {
-					files = append(files, a)
-				}
-			}
-		}
-		d := simpleDir(cmds[:i+1], dir)
-		for _, f := range files {
-			switch {
-			case !f.exact || f.word == "":
-			case path.IsAbs(f.word):
-				out = append(out, path.Clean(f.word))
-			case d != "" && !f.grouped:
-				out = append(out, path.Join(d, f.word))
-			}
+		file = path.Join(dir, file)
+	}
+	file = path.Clean(file)
+	for _, l := range strings.Split(result, "\n") {
+		if strings.Contains(l, path.Base(file)) && openErrRe.MatchString(l) {
+			return ""
 		}
 	}
-	return out
+	return file
 }
 
-// nothingAfter says nothing visible runs after a command's first line: the command is that line alone, or the line
-// opens here-documents and only their text follows. A text the store cut inside a here-document keeps the benefit
-// of the doubt; one it cut anywhere else may hide a next command.
-func nothingAfter(line shellFirst, closed bool) bool {
-	if !line.ended {
+// dotdot says a path climbs out of a directory: through a symbolic link, .. is not where its text says.
+func dotdot(p string) bool { return slices.Contains(strings.Split(p, "/"), "..") }
+
+// hereEnd is a here-document's end: its word, and whether tabs may lead its line (<<-).
+type hereEnd struct {
+	word string
+	tabs bool
+}
+
+// writeForm reads the one command a whitelisted line holds: cat with one > or >> and its file, or tee with an
+// optional -a and its file, either with at most one here-document (<< or <<- and its word) and nothing else. It
+// returns the file, as its word spells it, and the here-document's end, if there is one.
+func writeForm(toks []shellTok) (string, *hereEnd, bool) {
+	if len(toks) == 0 || toks[0].word != "cat" && toks[0].word != "tee" {
+		return "", nil, false
+	}
+	tee, option := toks[0].word == "tee", false
+	var file *shellTok
+	var end *hereEnd
+	for i := 1; i < len(toks); i++ {
+		t := toks[i]
+		next := i+1 < len(toks) && toks[i+1].op == ""
+		switch {
+		case (t.op == "<<" || t.op == "<<-") && end == nil && next:
+			end = &hereEnd{word: toks[i+1].word, tabs: t.op == "<<-"}
+			i++
+		case !tee && (t.op == ">" || t.op == ">>") && file == nil && next:
+			file = &toks[i+1]
+			i++
+		case tee && t.op == "" && t.word == "-a" && !option && file == nil:
+			option = true
+		case tee && t.op == "" && file == nil && !strings.HasPrefix(t.word, "-"):
+			file = &toks[i]
+		default:
+			return "", nil, false
+		}
+	}
+	if file == nil || !file.exact || file.word == "" {
+		return "", nil, false
+	}
+	return file.word, end, true
+}
+
+// nothingAfter says nothing runs after a command's first line: bash reports the status of the last line it runs.
+// The line is the command alone, or only its here-document's text follows, up to its end. A text the store cut
+// inside the here-document keeps the benefit of the doubt; one it cut anywhere else may hide a next command.
+func nothingAfter(end *hereEnd, rest string, ended, closed bool) bool {
+	if !ended {
 		return closed
 	}
-	lines := strings.Split(line.rest, "\n")
+	lines := strings.Split(rest, "\n")
 	i := 0
-	for k, t := range line.toks {
-		if t.op != "<<" && t.op != "<<-" || k+1 >= len(line.toks) || line.toks[k+1].op != "" {
-			continue
-		}
-		for ; i < len(lines); i++ {
-			if l := lines[i]; l == line.toks[k+1].word || t.op == "<<-" && strings.TrimLeft(l, "\t") == line.toks[k+1].word {
-				break
-			}
+	if end != nil {
+		for ; i < len(lines) && lines[i] != end.word && !(end.tabs && strings.TrimLeft(lines[i], "\t") == end.word); i++ {
 		}
 		if i == len(lines) { // the text ends inside the here-document
 			return true
@@ -136,334 +178,83 @@ func nothingAfter(line shellFirst, closed bool) bool {
 	return closed
 }
 
-// shellTok is a word of a command line, its quotes off, or one of its operators.
+// shellTok is a word of a command line, its quotes off, or one of the operators a whitelisted line can hold.
 type shellTok struct {
-	op      string // a separator, a parenthesis or a redirection; "" for a word
-	fd      string // the descriptor a redirection names before it (2 in 2>), "" for none
-	word    string
-	exact   bool // a word the shell does not expand
-	grouped bool // a subshell's or a group's parenthesis or brace comes before it on the line
+	op    string // &&, >, >>, << or <<-; "" for a word
+	word  string
+	exact bool // a word the shell does not expand: no variable, command, glob or leading ~
 }
 
-// shellRedir is a redirection of a command: its operator, its descriptor and its target.
-type shellRedir struct {
-	op, fd string
-	target shellTok
-}
+// shellOps are the operators a whitelisted line can hold, the longest first. Any other operator is no write.
+var shellOps = []string{"&&", "<<-", "<<", ">>", ">"}
 
-// writes says a redirection sends the command's standard output to its target, a file.
-func (r shellRedir) writes() bool {
-	switch r.op {
-	case ">", ">>", ">|":
-		return r.fd == "" || r.fd == "1"
-	case "&>", "&>>":
-		return true
-	case ">&": // >&N and >&- copy or close a descriptor; >& FILE writes both outputs there
-		return r.target.word != "-" && strings.Trim(r.target.word, "0123456789") != ""
-	}
-	return false
-}
+// space says a byte parts two words.
+func space(c byte) bool { return c == ' ' || c == '\t' }
 
-// shellCmd is a simple command of a line: its words and redirections, and the separator after it ("" at the line's
-// end).
-type shellCmd struct {
-	words  []shellTok
-	redirs []shellRedir
-	after  string
-}
-
-// reported says the line's success says the first of rest, a command and the ones after it, succeeded: every
-// separator from it to the line's end is &&, and the last command ends the line (or a ; does).
-func reported(rest []shellCmd) bool {
-	for i, d := range rest {
-		if i == len(rest)-1 {
-			return d.after == "" || d.after == ";"
-		}
-		if d.after != "&&" {
-			return false
-		}
-	}
-	return false
-}
-
-// simpleDir is the directory the last of cmds, a line's commands up to one, reads its relative files in, in the
-// simple case only: dir, when no command up to it changes directory, or the whole path a single leading cd enters
-// (cd DIR && ...), when every command from it to that one is joined by && or a pipe. Any other cd, pushd or popd
-// leaves it unknown ("").
-func simpleDir(cmds []shellCmd, dir string) string {
-	for k, c := range cmds {
-		prog, args := program(c.words)
-		if prog != "cd" && prog != "pushd" && prog != "popd" {
-			continue
-		}
-		if k != 0 || k == len(cmds)-1 || prog != "cd" || len(args) != 1 || !args[0].exact || !path.IsAbs(args[0].word) || c.after != "&&" {
-			return ""
-		}
-		for _, d := range cmds[1 : len(cmds)-1] {
-			if d.after != "&&" && d.after != "|" && d.after != "|&" {
-				return ""
-			}
-		}
-		dir = args[0].word
-	}
-	return dir
-}
-
-// shellCommands groups a line's tokens into its simple commands. Parentheses are no separator; each word after a
-// parenthesis or a brace on the line is marked grouped.
-func shellCommands(toks []shellTok) []shellCmd {
-	var out []shellCmd
-	var cur shellCmd
-	begun, grouped := false, false
-	finish := func(after string) {
-		if begun {
-			cur.after = after
-			out = append(out, cur)
-		}
-		cur, begun = shellCmd{}, false
-	}
-	for k := 0; k < len(toks); k++ {
-		switch t := toks[k]; {
-		case t.op == "":
-			grouped = grouped || t.word == "{" || t.word == "}"
-			t.grouped, begun = grouped, true
-			cur.words = append(cur.words, t)
-		case t.op == "(" || t.op == ")":
-			grouped = true
-		case strings.ContainsAny(t.op, "<>"):
-			begun = true
-			r := shellRedir{op: t.op, fd: t.fd}
-			if k+1 < len(toks) && toks[k+1].op == "" {
-				r.target = toks[k+1]
-				r.target.grouped = grouped
-				k++
-			}
-			cur.redirs = append(cur.redirs, r)
-		default:
-			finish(t.op)
-		}
-	}
-	finish("")
-	return out
-}
-
-// program is a command's program and its arguments: its first word past assignments and the wrappers that run
-// another program (sudo, env, timeout and the like, with their options). A negated command's program is !.
-func program(words []shellTok) (string, []shellTok) {
-	for len(words) > 0 {
-		w := words[0].word
-		switch {
-		case w == "!":
-			return "!", nil
-		case assignRe.MatchString(w):
-			words = words[1:]
-			continue
-		case wrappers[w]:
-			words = words[1:]
-			for len(words) > 0 && (strings.HasPrefix(words[0].word, "-") || countRe.MatchString(words[0].word) || assignRe.MatchString(words[0].word)) {
-				words = words[1:]
-			}
-			continue
-		}
-		break
-	}
-	if len(words) == 0 {
-		return "", nil
-	}
-	return path.Base(words[0].word), words[1:]
-}
-
-// shellOps are the shell's operators, the longest first.
-var shellOps = []string{"&>>", "<<<", "<<-", "&&", "||", "|&", "&>", ">>", ">|", ">&", "<<", "<>", "<&", ";;", ";", "&", "|", "(", ")", ">", "<"}
-
-// shellFirst is a command's first line as the shell splits it: its words and operators, and the text after it.
-type shellFirst struct {
-	toks  []shellTok
-	rest  string // the text after the line
-	ended bool   // the line ended in the text, so rest follows it
-}
-
-// shellLine splits a command's first line into words and operators as the shell does: a backslash before the
-// line's end joins the next, and a comment runs to the line's end. A test's or an arithmetic's text ([[ ]], (( )))
-// and a process substitution's (<( ), >( )) are one word each, whose > compares or runs elsewhere. It is false for
-// a text it cannot read.
-func shellLine(cmd string) (shellFirst, bool) {
+// shellWords splits a command line into words and operators as the shell does, its quotes off and its escapes read.
+// It is nil for a line it cannot read whole (an open quote, a backslash at its end) or with an operator no
+// whitelisted line holds.
+func shellWords(line string) []shellTok {
 	var toks []shellTok
-	start := true // the next word opens a command
-	for i := 0; ; {
-		for i < len(cmd) && (cmd[i] == ' ' || cmd[i] == '\t' || strings.HasPrefix(cmd[i:], "\\\n")) {
-			if cmd[i] == '\\' {
-				i++
-			}
-			i++
-		}
-		if i >= len(cmd) {
-			return shellFirst{toks: toks}, true
-		}
-		c := cmd[i]
+	for i := 0; i < len(line); {
+		c := line[i]
 		switch {
-		case c == '#':
-			k := strings.IndexByte(cmd[i:], '\n')
-			if k < 0 {
-				return shellFirst{toks: toks}, true
-			}
-			i += k
-			fallthrough
-		case c == '\n':
-			return shellFirst{toks: toks, rest: cmd[i+1:], ended: true}, true
-		case strings.HasPrefix(cmd[i:], "(("):
-			toks = append(toks, shellTok{word: "(("})
-			if i = closing(cmd, i+2, 2); i < 0 {
-				return shellFirst{toks: toks}, true
-			}
-			start = false
-			continue
-		case (c == '<' || c == '>') && strings.HasPrefix(cmd[i+1:], "("):
-			toks = append(toks, shellTok{word: cmd[i : i+1]})
-			if i = closing(cmd, i+2, 1); i < 0 {
-				return shellFirst{toks: toks}, true
-			}
-			start = false
+		case space(c):
+			i++
 			continue
 		case strings.IndexByte(";&|()<>", c) >= 0:
-			op := opAt(cmd[i:])
-			toks = append(toks, shellTok{op: op})
-			i += len(op)
-			if !strings.ContainsAny(op, "<>") {
-				start = true
-			}
-			continue
-		}
-		w, j := shellWordAt(cmd, i)
-		if j == i { // a byte no rule above reads
-			return shellFirst{}, false
-		}
-		if j < len(cmd) && (cmd[j] == '<' || cmd[j] == '>') && w.exact && w.word != "" && strings.Trim(w.word, "0123456789") == "" &&
-			!strings.ContainsAny(cmd[i:j], `'"\`) {
-			op := opAt(cmd[j:]) // the word is a descriptor's number, which the redirection after it takes
-			toks, i = append(toks, shellTok{op: op, fd: w.word}), j+len(op)
-			continue
-		}
-		if start && cmd[i:j] == "[[" {
-			k := strings.Index(cmd[j:], "]]")
+			k := slices.IndexFunc(shellOps, func(o string) bool { return strings.HasPrefix(line[i:], o) })
 			if k < 0 {
-				return shellFirst{toks: append(toks, shellTok{word: "[["})}, true
+				return nil
 			}
-			toks, i, start = append(toks, shellTok{word: "[["}), j+k+2, false
+			toks = append(toks, shellTok{op: shellOps[k]})
+			i += len(shellOps[k])
 			continue
 		}
-		toks, i, start = append(toks, w), j, w.exact && w.word == "time" // time runs the command after it
-	}
-}
-
-// opAt is the operator s opens with.
-func opAt(s string) string {
-	for _, o := range shellOps {
-		if strings.HasPrefix(s, o) {
-			return o
-		}
-	}
-	return s[:1]
-}
-
-// shellWordAt reads the word at i: its quotes off and its escapes read, and whether the shell takes it as it is (no
-// variable, command, glob or leading ~). It returns where the word ends.
-func shellWordAt(s string, i int) (shellTok, int) {
-	var b strings.Builder
-	exact := s[i] != '~'
-	for i < len(s) {
-		c := s[i]
-		switch {
-		case c == ' ' || c == '\t' || c == '\n' || strings.IndexByte(";&|()<>", c) >= 0:
-			return shellTok{word: b.String(), exact: exact}, i
-		case c == '\\':
-			if i+1 < len(s) && s[i+1] != '\n' {
-				b.WriteByte(s[i+1])
-			}
-			i = min(i+2, len(s)) // a backslash can end the text
-		case c == '\'':
-			k := strings.IndexByte(s[i+1:], '\'')
-			if k < 0 {
-				return shellTok{word: b.String() + s[i+1:]}, len(s)
-			}
-			b.WriteString(s[i+1 : i+1+k])
-			i += k + 2
-		case c == '"':
-			for i++; ; i++ {
-				if i >= len(s) {
-					return shellTok{word: b.String()}, len(s)
+		var b strings.Builder
+		exact := c != '~'
+	word:
+		for ; i < len(line); i++ {
+			switch c := line[i]; {
+			case space(c) || strings.IndexByte(";&|()<>", c) >= 0:
+				break word
+			case c == '\\':
+				if i++; i == len(line) {
+					return nil
 				}
-				if s[i] == '"' {
-					i++
-					break
+				b.WriteByte(line[i])
+			case c == '\'':
+				k := strings.IndexByte(line[i+1:], '\'')
+				if k < 0 {
+					return nil
 				}
-				if s[i] == '\\' && i+1 < len(s) && strings.IndexByte("$`\"\\\n", s[i+1]) >= 0 {
-					if s[i+1] != '\n' {
-						b.WriteByte(s[i+1])
+				b.WriteString(line[i+1 : i+1+k])
+				i += k + 1
+			case c == '"':
+				for i++; ; i++ {
+					if i == len(line) {
+						return nil
 					}
-					i++
-					continue
+					if line[i] == '"' {
+						break
+					}
+					if line[i] == '\\' && i+1 < len(line) && strings.IndexByte("$`\"\\", line[i+1]) >= 0 {
+						i++
+					} else if line[i] == '$' || line[i] == '`' {
+						exact = false
+					}
+					b.WriteByte(line[i])
 				}
-				if s[i] == '$' || s[i] == '`' {
+			default:
+				if strings.IndexByte("$`*?[{", c) >= 0 {
 					exact = false
 				}
-				b.WriteByte(s[i])
-			}
-		case c == '$' && strings.HasPrefix(s[i+1:], "("):
-			j := closing(s, i+2, 1)
-			if j < 0 {
-				return shellTok{word: b.String()}, len(s)
-			}
-			exact = false
-			b.WriteString(s[i:j])
-			i = j
-		case c == '`':
-			k := strings.IndexByte(s[i+1:], '`')
-			if k < 0 {
-				return shellTok{word: b.String()}, len(s)
-			}
-			exact = false
-			b.WriteString(s[i : i+k+2])
-			i += k + 2
-		default:
-			if strings.IndexByte("$*?[{", c) >= 0 {
-				exact = false
-			}
-			b.WriteByte(c)
-			i++
-		}
-	}
-	return shellTok{word: b.String(), exact: exact}, i
-}
-
-// closing is where parentheses open depth deep before i close: the index after the last one, or -1 when the text
-// ends first. Quoted text and escapes are passed over.
-func closing(s string, i, depth int) int {
-	for ; i < len(s); i++ {
-		switch s[i] {
-		case '\\':
-			i++
-		case '\'':
-			k := strings.IndexByte(s[i+1:], '\'')
-			if k < 0 {
-				return -1
-			}
-			i += k + 1
-		case '"':
-			for i++; i < len(s) && s[i] != '"'; i++ {
-				if s[i] == '\\' {
-					i++
-				}
-			}
-		case '(':
-			depth++
-		case ')':
-			if depth--; depth == 0 {
-				return i + 1
+				b.WriteByte(c)
 			}
 		}
+		toks = append(toks, shellTok{word: b.String(), exact: exact})
 	}
-	return -1
+	return toks
 }
 
 // unescapeCut reads a JSON string's body the store may have cut short, up to where it reads whole: a cut can end it

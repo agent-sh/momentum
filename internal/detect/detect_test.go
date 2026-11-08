@@ -584,6 +584,17 @@ func TestAReadOfAFileItsSessionThenCreatesIsNoFailure(t *testing.T) {
 				f.readMissing("s4", "/w/out/e.md", t0), f.wrote("s4", "/w/out/e.md", t0.Add(time.Minute)),
 				f.readMissing("s4", "/w/out/f.md", t0.Add(time.Hour)), f.wrote("s4", "/w/out/f.md", t0.Add(time.Hour+time.Minute)))
 		}, []string{"failures/v2:guard:read-guard:path not found in the allowlist 3"}},
+		{"another tool's not-found error", func(f *fileTools) []store.Event {
+			searched := func(session, path string, at time.Time) []store.Event {
+				return f.pair(session, "Grep", fmt.Sprintf(`{"path":%q,"pattern":"x"}`, path), "<tool_use_error>Path does not exist: "+path+"</tool_use_error>", true, at)
+			}
+			return slices.Concat(searched("s1", "/w/out/a.md", t0), f.wrote("s1", "/w/out/a.md", t0.Add(time.Minute)),
+				searched("s1", "/w/out/b.md", t0.Add(time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
+				searched("s2", "/w/out/c.md", t0), f.wrote("s2", "/w/out/c.md", t0.Add(time.Minute)),
+				f.readMissing("s3", "/w/out/d.md", t0), f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute)),
+				f.readMissing("s4", "/w/out/e.md", t0), f.wrote("s4", "/w/out/e.md", t0.Add(time.Minute)),
+				f.readMissing("s4", "/w/out/f.md", t0.Add(time.Hour)), f.wrote("s4", "/w/out/f.md", t0.Add(time.Hour+time.Minute)))
+		}, []string{"failures/v2:tool:grep:path does not exist: P 3"}},
 		{"a tool that only reads names the path", func(f *fileTools) []store.Event {
 			searched := func(session, path string, at time.Time) []store.Event {
 				return f.pair(session, "Grep", fmt.Sprintf(`{"path":%q,"pattern":"x"}`, path), "No matches found", false, at)
@@ -694,112 +705,101 @@ func kimiReadMissing(f *fileTools, session, path string, at time.Time) []store.E
 	return f.pair(session, "Read", fmt.Sprintf(`{"path":%q}`, path), fmt.Sprintf("%q does not exist.", path), true, at)
 }
 
-// A session can create the file it looked for with its shell. Each line is spelled so that one clause decides: a
-// write of the read's path, or none. Three reads in two sessions, each followed by the line in its own session, make
-// a finding only when the line writes no file there.
-func TestAShellLineWritesWhatItsCommandReports(t *testing.T) {
+// A session can create the file it looked for with its shell, but only a form the whitelist holds counts: cat > FILE,
+// cat >> FILE or tee [-a] FILE, one here-document at most, a single leading cd at most. Each line is spelled so one
+// clause decides: a write of the read's path, or none. Three reads in two sessions, each followed by the line in its
+// own session, make a finding only when the line writes no file there.
+func TestAShellLineWritesOnlyInTheWhitelistedForms(t *testing.T) {
 	body := "\n" + strings.Repeat(`{"id":1,"verdict":"keep"}`+"\n", 20) + "EOF"
 	const x = "/w/out/x.jsonl"
 	for _, tc := range []struct {
-		name, cwd, path, line string
-		failed, writes        bool
+		name, cwd, path, line, result string
+		failed, writes                bool
 	}{
-		{"a here-document", "", x, "cat > /w/out/x.jsonl <<'EOF'" + body, false, true},
-		{"an append", "", x, "cat >> /w/out/x.jsonl <<'EOF'" + body, false, true},
-		{"after the here-document's word, quoted", "", x, `cat <<'EOF' > "/w/out/x.jsonl"` + body, false, true},
-		{"single quotes", "", x, "cat > '/w/out/x.jsonl'", false, true},
-		{"an escaped letter", "", x, `cat > /w/out/x\.jsonl`, false, true},
-		{"in the call's directory", "/w/out", x, "cat >> x.jsonl <<'EOF'\n{\"id\":1}\nEOF", false, true},
-		{"in the directory the line enters", "/w", x, "cd /w/out && cat > x.jsonl", false, true},
-		{"after a subshell's own cd", "/w/out", x, "(cd /w/elsewhere && make) && cat > x.jsonl", false, false},
-		{"stdout by its number", "", x, "python3 gen.py 1> /w/out/x.jsonl", false, true},
-		{"noclobber's >|", "", x, "python3 gen.py >| /w/out/x.jsonl", false, true},
-		{"both outputs, &>", "", x, "python3 gen.py &> /w/out/x.jsonl", false, true},
-		{"both outputs, &>>", "", x, "python3 gen.py &>> /w/out/x.jsonl", false, true},
-		{"both outputs, >& a file", "", x, "python3 gen.py >& /w/out/x.jsonl", false, true},
-		{"a tab", "", x, "echo x >\t/w/out/x.jsonl", false, true},
-		{"tee", "", x, "python3 gen.py | tee -a /w/out/x.jsonl", false, true},
-		{"tee run by sudo", "", x, "python3 gen.py | sudo tee /w/out/x.jsonl", false, true},
-		{"tee's option", "/w/out", "/w/out/-a", "python3 gen.py | tee -a /w/out/other.jsonl", false, false},
-		{"a continued line", "", x, "python3 gen.py \\\n  > /w/out/x.jsonl", false, true},
-		{"a command on a continued line", "", x, "python3 gen.py && \\\n  tee /w/out/x.jsonl", false, true},
-		{"a word that ends in a digit", "", x, "echo v2> /w/out/x.jsonl", false, true},
-		{"joined by &&", "", x, "cat > /w/out/x.jsonl <<'EOF' && wc -l /w/out/x.jsonl" + body, false, true},
-		{"after a copied descriptor", "", x, "python3 gen.py 2>&1 > /w/out/x.jsonl", false, true},
-		{"a trailing ;", "", x, "python3 gen.py > /w/out/x.jsonl;", false, true},
-		{"after another command", "", x, "mkdir -p /w/out; python3 gen.py > /w/out/x.jsonl", false, true},
-		{"cut in a later field", "", x, `{"command":"python3 gen.py > /w/out/x.jsonl","description":"` + strings.Repeat("d", 200) + `…`, false, true},
-		{"cut inside an escape past the line", "", x, `{"command":"cat > /w/out/x.jsonl <<'EOF'\n{\"a\":\"b \u00…`, false, true},
-		{"a here-document and nothing after it", "", x, "cat > /w/out/x.jsonl <<'EOF'\n{\"id\":1}\nEOF\n", false, true},
-		{"a here-document whose end is indented", "", x, "cat > /w/out/x.jsonl <<-EOF\n\t{\"id\":1}\n\tEOF", false, true},
-		{"two here-documents", "", x, "cat > /w/out/x.jsonl <<A 3<<B\na\nA\nb\nB", false, true},
-		{"a comment, then nothing", "", x, "python3 gen.py > /w/out/x.jsonl # done\n", false, true},
-		{"after a subshell that only enters a directory", "/w/out", x, "(cd /w/elsewhere) && echo a > x.jsonl", false, false},
-		{"an absolute target, cleaned", "", x, "cat > /w/out//x.jsonl", false, true},
-		{"a blank line after the here-document", "", x, "cat > /w/out/x.jsonl <<'EOF'\n{\"id\":1}\nEOF\n   \n", false, true},
-		{"tee after |& in the directory the line enters", "/w", x, "cd /w/out && python3 gen.py |& tee x.jsonl", false, true},
-		{"[[ as an argument", "", x, "echo [[ > /w/out/x.jsonl", false, true},
-		{"tee in the directory the line enters", "/w", x, "cd /w/out && python3 gen.py | tee x.jsonl", false, true},
-		{"quoted digits before >", "", x, "echo a '2'> /w/out/x.jsonl", false, true},
-		{"an escaped $ in double quotes", "", "/w/out/$x.jsonl", `cat > "/w/out/\$x.jsonl"`, false, true},
+		{"cat > and a here-document", "", x, "cat > /w/out/x.jsonl <<'EOF'" + body, "", false, true},
+		{"cat >> and a here-document", "", x, "cat >> /w/out/x.jsonl <<'EOF'" + body, "", false, true},
+		{"the here-document first, the file quoted", "", x, `cat <<'EOF' > "/w/out/x.jsonl"` + body, "", false, true},
+		{"cat > alone", "", x, "cat > /w/out/x.jsonl", "", false, true},
+		{"no space before the file", "", x, "cat >/w/out/x.jsonl", "", false, true},
+		{"tee and a here-document", "", x, "tee /w/out/x.jsonl <<'EOF'" + body, "", false, true},
+		{"tee -a", "", x, "tee -a /w/out/x.jsonl <<'EOF'\n{\"id\":1}\nEOF", "", false, true},
+		{"in the directory a leading cd enters", "/w", x, "cd /w/out && cat > x.jsonl <<'EOF'\n{\"id\":1}\nEOF", "", false, true},
+		{"in the call's directory", "/w/out", x, "cat >> x.jsonl <<'EOF'\n{\"id\":1}\nEOF", "", false, true},
+		{"single quotes", "", x, "cat > '/w/out/x.jsonl'", "", false, true},
+		{"an escaped letter", "", x, `cat > /w/out/x\.jsonl`, "", false, true},
+		{"an escaped $ in double quotes", "", "/w/out/$x.jsonl", `cat > "/w/out/\$x.jsonl"`, "", false, true},
+		{"cleaned", "", x, "cat > /w/out//x.jsonl", "", false, true},
+		{"a here-document whose end is indented", "", x, "cat > /w/out/x.jsonl <<-EOF\n\t{\"id\":1}\n\tEOF", "", false, true},
+		{"a here-document and nothing after it", "", x, "cat > /w/out/x.jsonl <<'EOF'\n{\"id\":1}\nEOF\n", "", false, true},
+		{"a blank line after the here-document", "", x, "cat > /w/out/x.jsonl <<'EOF'\n{\"id\":1}\nEOF\n   \n", "", false, true},
+		{"cut in a later field", "", x, `{"command":"cat > /w/out/x.jsonl","description":"` + strings.Repeat("d", 200) + `…`, "", false, true},
+		{"cut inside an escape in the here-document", "", x, `{"command":"cat > /w/out/x.jsonl <<'EOF'\n{\"a\":\"b \u00…`, "", false, true},
+		{"another file's error in the result", "", x, "cat > /w/out/x.jsonl", "cat: other.txt: No such file or directory", false, true},
 
-		{"the command failed", "", x, "cat > /w/out/x.jsonl <<'EOF'" + body, true, false},
-		{"another descriptor", "", x, "python3 gen.py 2> /w/out/x.jsonl", false, false},
-		{"descriptor 10", "", x, "exec 10> /w/out/x.jsonl", false, false},
-		{"a quoted >", "", x, `printf '%s\n' "a > /w/out/x.jsonl b"`, false, false},
-		{"an escaped >", "", x, `echo \> /w/out/x.jsonl`, false, false},
-		{"here-document text", "", x, "cat <<'EOF'\n> /w/out/x.jsonl\nEOF", false, false},
-		{"a comment", "", x, "cat /w/out/x.jsonl # > /w/out/x.jsonl", false, false},
-		{"a variable", "", "/w/out/$x.jsonl", "cat > /w/out/$x.jsonl", false, false},
-		{"a quoted variable", "", "/w/out/$x.jsonl", `cat > "/w/out/$x.jsonl"`, false, false},
-		{"a command's output", "", "/w/out/`date`.jsonl", "cat > /w/out/`date`.jsonl", false, false},
-		{"a glob", "", "/w/out/x*.jsonl", "cat > /w/out/x*.jsonl", false, false},
-		{"home's ~", "/w", "/w/~/out/x.jsonl", "cat > ~/out/x.jsonl", false, false},
-		{"input opened read and write, <>", "", x, "cat <> /w/out/x.jsonl", false, false},
-		{"a copy of a descriptor", "/w/out", "/w/out/2", "python3 gen.py >&2", false, false},
-		{"a descriptor closed", "/w/out", "/w/out/-", "python3 gen.py >&-", false, false},
-		{"a process substitution", "", x, "python3 gen.py > >(cat > /w/out/x.jsonl)", false, false},
-		{"a test's comparison", "", x, "[[ a > /w/out/x.jsonl ]] && echo y", false, false},
-		{"an arithmetic's comparison", "/w/out", x, "(( n > /w/out/x.jsonl )) && echo y", false, false},
-		{"a command after it", "", x, "cat > /w/out/x.jsonl <<'EOF'; true" + body, false, false},
-		{"piped on", "", x, "python3 gen.py > /w/out/x.jsonl | cat", false, false},
-		{"in the background", "", x, "python3 gen.py > /w/out/x.jsonl &", false, false},
-		{"or after it", "", x, "python3 gen.py > /w/out/x.jsonl || true", false, false},
-		{"or before it", "", x, "false || python3 gen.py > /w/out/x.jsonl", false, false},
-		{"negated", "", x, "! python3 gen.py > /w/out/x.jsonl", false, false},
-		{"after a cd the line does not hold to", "/w", x, "cd /w/out; cat > x.jsonl", false, false},
-		{"after a cd elsewhere the line does not hold to", "/w/out", x, "cd /w/elsewhere; cat > x.jsonl", false, false},
-		{"after a cd and a command it does not hold to", "/w", x, "cd /w/out && true; cat > x.jsonl", false, false},
-		{"after a relative cd", "/w", "out/x.jsonl", "cd out && cat > x.jsonl", false, false},
-		{"after a cd to a variable", "/w", "/w/$d/x.jsonl", "cd /w/$d && cat > x.jsonl", false, false},
-		{"after a pushd", "/w/out", x, "pushd /w/elsewhere && cat > x.jsonl", false, false},
-		{"after a popd", "/w/out", x, "popd && cat > x.jsonl", false, false},
-		{"no directory", "", "x.jsonl", "cat > x.jsonl", false, false},
-		{"a directory that is no whole path", "w/out", "w/out/x.jsonl", "cat > x.jsonl", false, false},
-		{"a first line the store cut", "", x, `{"command":"cat > /w/out/x.jsonl && tru…`, false, false},
-		{"a cut inside an escape at the path", "", "/w/out/k", `{"command":"cat > /w/out/k\u…`, false, false},
-		{"a cut that leaves a backslash last", "", x, `{"command":"cat > /w/out/x.jsonl \u0026\u0026 \\\u00…`, false, false},
-		{"a command on the next line", "", x, "echo a > /w/out/x.jsonl\necho ok", false, false},
-		{"a command after the here-document", "", x, "cat > /w/out/x.jsonl <<'EOF'\n{\"id\":1}\nEOF\necho done", false, false},
-		{"a line the store cut after it", "", x, `{"command":"echo a > /w/out/x.jsonl\necho o…`, false, false},
-		{"a here-document's end, then the cut", "", x, `{"command":"cat > /w/out/x.jsonl <<'EOF'\nx\nEOF\nech…`, false, false},
-		{"a comment the store cut", "", x, `{"command":"python3 gen.py > /w/out/x.jsonl # a no…`, false, false},
-		{"a comment, then a command", "", x, "python3 gen.py > /w/out/x.jsonl # done\necho ok", false, false},
-		{"an indented end, then a command", "", x, "cat > /w/out/x.jsonl <<-EOF\n\t{\"id\":1}\n\tEOF\necho done", false, false},
-		{"the store cut right after the line", "", x, `{"command":"echo a > /w/out/x.jsonl\n\u00…`, false, false},
-		{"a test run by time", "", x, "time [[ a > /w/out/x.jsonl ]]", false, false},
-		{"after a cd with two words", "/w", x, "cd /w/out x && cat > x.jsonl", false, false},
-		{"a brace expansion", "", "/w/out/{a,b}.jsonl", "cat > /w/out/{a,b}.jsonl", false, false},
-		{"a ? glob", "", "/w/out/x?.jsonl", "cat > /w/out/x?.jsonl", false, false},
-		{"a command substitution's redirection", "", x, "echo $(cat > /w/out/x.jsonl)", false, false},
-		{"a subshell's cd, then its relative output", "/w", x, "(cd /w/out && make) > x.jsonl", false, false},
-		{"a group's cd, then a relative target", "/w", "/w/x.jsonl", "{ cd /w/out; } && make > x.jsonl", false, false},
-		{"a subshell, then tee to a relative file", "/w/out", x, "(true) && python3 gen.py | tee x.jsonl", false, false},
-		{"a cd after another command", "/w", x, "true && cd /w/out && cat > x.jsonl", false, false},
-		{"a leading pushd", "/w", x, "pushd /w/out && cat > x.jsonl", false, false},
-		{"a [ glob", "", "/w/out/x[1].jsonl", "cat > /w/out/x[1].jsonl", false, false},
-		{"a backtick in double quotes", "", "/w/out/`date`.jsonl", "cat > \"/w/out/`date`.jsonl\"", false, false},
-		{"a command substitution in the target", "", "/w/out/$(date).jsonl", "cat > /w/out/$(date).jsonl", false, false},
+		{"the command failed", "", x, "cat > /w/out/x.jsonl <<'EOF'" + body, "", true, false},
+		{"an error opening the file", "", x, "cat > /w/out/x.jsonl", "bash: /w/out/x.jsonl: No such file or directory", false, false},
+		{"a command on the next line", "", x, "cat > /w/out/x.jsonl\necho ok", "", false, false},
+		{"a command after the here-document", "", x, "cat > /w/out/x.jsonl <<'EOF'\n{\"id\":1}\nEOF\necho done", "", false, false},
+		{"an indented end, then a command", "", x, "cat > /w/out/x.jsonl <<-EOF\n\t{\"id\":1}\n\tEOF\necho done", "", false, false},
+		{"the store cut right after the line", "", x, `{"command":"cat > /w/out/x.jsonl\n\u00…`, "", false, false},
+		{"the store cut the line", "", x, `{"command":"cat > /w/out/x.jsonl \u00…`, "", false, false},
+		{"a here-document's end, then the cut", "", x, `{"command":"cat > /w/out/x.jsonl <<'EOF'\nx\nEOF\nech…`, "", false, false},
+		{"another program", "", x, "python3 gen.py > /w/out/x.jsonl", "", false, false},
+		{"cat reads a file", "", x, "cat in.txt > /w/out/x.jsonl", "", false, false},
+		{"a command before it", "", x, "mkdir -p /w/out && cat > /w/out/x.jsonl", "", false, false},
+		{"a command after it", "", x, "cat > /w/out/x.jsonl; true", "", false, false},
+		{"or", "", x, "cat > /w/out/x.jsonl || true", "", false, false},
+		{"in the background", "", x, "cat > /w/out/x.jsonl &", "", false, false},
+		{"a pipe into tee", "", x, "python3 gen.py | tee /w/out/x.jsonl", "", false, false},
+		{"negated", "", x, "! cat > /w/out/x.jsonl", "", false, false},
+		{"timed", "", x, "time -p cat > /w/out/x.jsonl", "", false, false},
+		{"eval", "/w", x, "eval cd /w/out && cat > x.jsonl", "", false, false},
+		{"source", "", x, "source env.sh && cat > /w/out/x.jsonl", "", false, false},
+		{"a dot", "", x, ". env.sh && cat > /w/out/x.jsonl", "", false, false},
+		{"exec", "", x, "exec cat > /w/out/x.jsonl", "", false, false},
+		{"a subshell", "", x, "(cat > /w/out/x.jsonl)", "", false, false},
+		{"a group", "", x, "{ cat > /w/out/x.jsonl; }", "", false, false},
+		{"another descriptor", "", x, "cat 2> /w/out/x.jsonl", "", false, false},
+		{"both outputs", "", x, "cat &> /w/out/x.jsonl", "", false, false},
+		{"noclobber's >|", "", x, "cat >| /w/out/x.jsonl", "", false, false},
+		{"a here-string", "", x, "cat <<< x > /w/out/x.jsonl", "", false, false},
+		{"two files", "", "/w/out/y.jsonl", "cat > /w/out/x.jsonl > /w/out/y.jsonl", "", false, false},
+		{"two here-documents", "", x, "cat > /w/out/x.jsonl <<A <<B\na\nA\nb\nB", "", false, false},
+		{"tee and two files", "", "/w/out/y.jsonl", "tee /w/out/x.jsonl /w/out/y.jsonl", "", false, false},
+		{"tee's other option", "", x, "tee -i /w/out/x.jsonl", "", false, false},
+		{"tee -a twice", "", x, "tee -a -a /w/out/x.jsonl", "", false, false},
+		{"tee with a redirection", "", x, "tee > /w/out/x.jsonl", "", false, false},
+		{"cat with no file", "", x, "cat <<'EOF'\n> /w/out/x.jsonl\nEOF", "", false, false},
+		{"a comment", "", x, "cat > /w/out/x.jsonl # note", "", false, false},
+		{"a continued line", "", x, "cat \\\n> /w/out/x.jsonl", "", false, false},
+		{"an open quote", "", x, "cat > '/w/out/x.jsonl", "", false, false},
+		{"a variable", "", "/w/out/$x.jsonl", "cat > /w/out/$x.jsonl", "", false, false},
+		{"a quoted variable", "", "/w/out/$x.jsonl", `cat > "/w/out/$x.jsonl"`, "", false, false},
+		{"a quoted command's output", "", "/w/out/`date`.jsonl", "cat > \"/w/out/`date`.jsonl\"", "", false, false},
+		{"a command's output", "", "/w/out/`date`.jsonl", "cat > /w/out/`date`.jsonl", "", false, false},
+		{"a * glob", "", "/w/out/x*.jsonl", "cat > /w/out/x*.jsonl", "", false, false},
+		{"a ? glob", "", "/w/out/x?.jsonl", "cat > /w/out/x?.jsonl", "", false, false},
+		{"a [ glob", "", "/w/out/x[1].jsonl", "cat > /w/out/x[1].jsonl", "", false, false},
+		{"a brace expansion", "", "/w/out/{a,b}.jsonl", "cat > /w/out/{a,b}.jsonl", "", false, false},
+		{"home's ~", "/w", "/w/~/out/x.jsonl", "cat > ~/out/x.jsonl", "", false, false},
+		{"an empty file name", "/w/out", "/w/out", "cat > ''", "", false, false},
+		{"a .. in the file", "", x, "cat > /w/a/../out/x.jsonl", "", false, false},
+		{"a .. in the directory", "/w", x, "cd /w/a/.. && cat > out/x.jsonl", "", false, false},
+		{"a relative cd", "/w", "out/x.jsonl", "cd out && cat > x.jsonl", "", false, false},
+		{"a cd with more words", "/w", x, "cd /w/out x cat > x.jsonl", "", false, false},
+		{"a directory that is no whole path", "w/out", "w/out/x.jsonl", "cat > x.jsonl", "", false, false},
+		{"echo", "", x, "echo > /w/out/x.jsonl", "", false, false},
+		{"a here-document with no word", "", x, "cat > /w/out/x.jsonl <<", "", false, false},
+		{"tee's -a after the file", "", x, "tee /w/out/x.jsonl -a", "", false, false},
+		{"tee's other option alone", "/w/out", "/w/out/-i", "tee -i", "", false, false},
+		{"a backslash at the line's end", "", x, "cat > /w/out/x.jsonl\\", "", false, false},
+		{"a tab", "", x, "cat >\t/w/out/x.jsonl", "", false, true},
+		{"a cd to a variable", "/w", "/w/$d/x.jsonl", "cd /w/$d && cat > x.jsonl", "", false, false},
+		{"two cds", "/w", x, "cd /w && cd /w/out && cat > x.jsonl", "", false, false},
+		{"a cd and ;", "/w", x, "cd /w/out; cat > x.jsonl", "", false, false},
+		{"a pushd", "/w", x, "pushd /w/out && cat > x.jsonl", "", false, false},
+		{"no directory", "", "x.jsonl", "cat > x.jsonl", "", false, false},
+		{"a cd with nothing after it", "/w", "/w/out", "cd /w/out &&", "", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := testStore(t)
@@ -808,7 +808,9 @@ func TestAShellLineWritesWhatItsCommandReports(t *testing.T) {
 			for i, session := range []string{"s1", "s1", "s2"} {
 				at := t0.Add(time.Duration(i) * time.Hour)
 				evs = append(evs, kimiReadMissing(&f, session, tc.path, at)...)
-				evs = append(evs, shellCall(&f, session, tc.cwd, tc.line, tc.failed, at.Add(time.Minute))...)
+				call := shellCall(&f, session, tc.cwd, tc.line, tc.failed, at.Add(time.Minute))
+				call[1].Summary = tc.result
+				evs = append(evs, call...)
 			}
 			put(t, st, evs...)
 			fs, err := Failures{}.Detect(context.Background(), st, week())
@@ -824,28 +826,34 @@ func TestAShellLineWritesWhatItsCommandReports(t *testing.T) {
 
 // A relative file is read in the directory the shell call ran in: the workdir the call names, else the directory
 // its session was in when it made the call, never the one its result reports. Hermes's terminal keeps a directory
-// of its own, so only a workdir or a cd on the line says where it is.
+// of its own, so only a workdir or a cd on the line says where it is. A background launch writes nothing.
 func TestAShellRunsInItsCallsDirectory(t *testing.T) {
 	const x = "/w/out/x.jsonl"
 	long := "cat >> x.jsonl <<'EOF'\n" + strings.Repeat(`{"id":1,"verdict":"keep"}`+"\n", 20)
 	cut, _ := json.Marshal(map[string]string{"command": long})
 	for _, tc := range []struct {
-		name, harness, tool, callCwd, resultCwd, input, path string
-		writes                                               bool
+		name, harness, tool, callCwd, resultCwd, input, result, path string
+		writes                                                       bool
 	}{
-		{"the call's directory, not the result's", "kimi", "Bash", "/w/out", "/w/elsewhere", `{"command":"cat >> x.jsonl"}`, x, true},
-		{"the result's directory is not the call's", "kimi", "Bash", "/w/elsewhere", "/w/out", `{"command":"cat >> x.jsonl"}`, x, false},
-		{"a whole workdir", "opencode", "bash", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"/w/out"}`, x, true},
-		{"a relative workdir", "opencode", "bash", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"out"}`, "out/x.jsonl", false},
-		{"a relative workdir, not the session's directory", "opencode", "bash", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"out"}`, "/w/x.jsonl", false},
-		{"a Claude call cut in its here-document", "claude", "Bash", "/w/out", "/w/out", string(cut[:240]) + "…", x, true},
-		{"Kimi's cwd", "kimi", "Bash", "/w", "/w", `{"command":"cat >> x.jsonl","cwd":"/w/out"}`, x, true},
-		{"a Kimi call cut before its cwd", "kimi", "Bash", "/w/out", "/w/out", string(cut[:240]) + "…", x, false},
-		{"Codex's workdir", "codex", "exec_command", "/w", "/w", `{"cmd":"cat >> x.jsonl","workdir":"/w/out"}`, x, true},
-		{"a cut call that may name a workdir", "opencode", "bash", "/w/out", "/w/out", string(cut[:240]) + "…", x, false},
-		{"Hermes's terminal keeps its own directory", "hermes", "terminal", "/w/out", "/w/out", `{"command":"cat >> x.jsonl"}`, x, false},
-		{"Hermes after a cd", "hermes", "terminal", "/w/elsewhere", "/w/elsewhere", `{"command":"cd /w/out && cat >> x.jsonl"}`, x, true},
-		{"Hermes's workdir", "hermes", "terminal", "/w/elsewhere", "/w/elsewhere", `{"command":"cat >> x.jsonl","workdir":"/w/out"}`, x, true},
+		{"the call's directory, not the result's", "kimi", "Bash", "/w/out", "/w/elsewhere", `{"command":"cat >> x.jsonl"}`, "", x, true},
+		{"the result's directory is not the call's", "kimi", "Bash", "/w/elsewhere", "/w/out", `{"command":"cat >> x.jsonl"}`, "", x, false},
+		{"a whole workdir", "opencode", "bash", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"/w/out"}`, "", x, true},
+		{"a relative workdir", "opencode", "bash", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"out"}`, "", "out/x.jsonl", false},
+		{"a relative workdir, not the session's directory", "opencode", "bash", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"out"}`, "", "/w/x.jsonl", false},
+		{"a workdir with a ..", "opencode", "bash", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"/w/a/../out"}`, "", x, false},
+		{"a Claude call cut in its here-document", "claude", "Bash", "/w/out", "/w/out", string(cut[:240]) + "…", "", x, true},
+		{"Claude's background launch", "claude", "Bash", "/w/out", "/w/out", `{"command":"cat >> x.jsonl","run_in_background":true}`, "", x, false},
+		{"a background launch the result tells", "claude", "Bash", "/w/out", "/w/out", string(cut[:240]) + "…", "Command running in background with ID: b1", x, false},
+		{"Kimi's cwd", "kimi", "Bash", "/w", "/w", `{"command":"cat >> x.jsonl","cwd":"/w/out"}`, "", x, true},
+		{"a Kimi call cut before its cwd", "kimi", "Bash", "/w/out", "/w/out", string(cut[:240]) + "…", "", x, false},
+		{"a pi call cut before its workdir", "pi", "bash", "/w/out", "/w/out", string(cut[:240]) + "…", "", x, false},
+		{"Codex's workdir", "codex", "exec_command", "/w", "/w", `{"cmd":"cat >> x.jsonl","workdir":"/w/out"}`, "Process exited with code 0\nOutput:\n", x, true},
+		{"a Codex command still running", "codex", "exec_command", "/w", "/w", `{"cmd":"cat >> x.jsonl","workdir":"/w/out"}`,
+			"Chunk ID: 1\nWall time: 1.0 seconds\nProcess running with session ID 7\nOutput:\n", x, false},
+		{"a cut call that may name a workdir", "opencode", "bash", "/w/out", "/w/out", string(cut[:240]) + "…", "", x, false},
+		{"Hermes's terminal keeps its own directory", "hermes", "terminal", "/w/out", "/w/out", `{"command":"cat >> x.jsonl"}`, "", x, false},
+		{"Hermes after a cd", "hermes", "terminal", "/w/elsewhere", "/w/elsewhere", `{"command":"cd /w/out && cat >> x.jsonl"}`, "", x, true},
+		{"Hermes's workdir", "hermes", "terminal", "/w/elsewhere", "/w/elsewhere", `{"command":"cat >> x.jsonl","workdir":"/w/out"}`, "", x, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := testStore(t)
@@ -855,7 +863,7 @@ func TestAShellRunsInItsCallsDirectory(t *testing.T) {
 			for i, session := range []string{"s1", "s1", "s2"} {
 				at := t0.Add(time.Duration(i) * time.Hour)
 				evs = append(evs, kimiReadMissing(&f, session, tc.path, at)...)
-				pair := w.pair(session, tc.tool, tc.input, "", false, at.Add(time.Minute))
+				pair := w.pair(session, tc.tool, tc.input, tc.result, false, at.Add(time.Minute))
 				pair[0].Cwd, pair[1].Cwd = tc.callCwd, tc.resultCwd
 				evs = append(evs, pair...)
 			}
@@ -944,6 +952,19 @@ func TestAReadAnHourBeforeTheWindowsEndStillWaits(t *testing.T) {
 	}
 	if fs, err := (Failures{}).Detect(context.Background(), st, Window{Since: edge.Since, Until: edge.Until.Add(time.Millisecond)}); err != nil || len(fs) != 1 {
 		t.Fatalf("a moment later: %v, %v", signatures(fs), err)
+	}
+}
+
+// A not-found read whose call the store does not hold has no path to clear it by, but waits its hour too.
+func TestAReadWithNoPathWaitsToo(t *testing.T) {
+	st := testStore(t)
+	put(t, st, result("s1", "Read", "r1", claudeMissing, t0), result("s1", "Read", "r2", claudeMissing, t0.Add(time.Minute)),
+		result("s2", "Read", "r3", claudeMissing, t0.Add(2*time.Minute)))
+	if fs, err := (Failures{}).Detect(context.Background(), st, Window{Since: t0.Add(-time.Hour), Until: t0.Add(30 * time.Minute)}); err != nil || len(fs) != 0 {
+		t.Fatalf("inside the hour: %v, %v", signatures(fs), err)
+	}
+	if fs, err := (Failures{}).Detect(context.Background(), st, Window{Since: t0.Add(-time.Hour), Until: t0.Add(2 * time.Hour)}); err != nil || len(fs) != 1 {
+		t.Fatalf("past it: %v, %v", signatures(fs), err)
 	}
 }
 

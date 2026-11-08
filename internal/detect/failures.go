@@ -78,7 +78,7 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 		}
 		for _, e := range writes {
 			c := calls[e.ID()]
-			for _, p := range writtenPaths(e.Harness, e.Tool, c.Input, c.Cwd) {
+			for _, p := range writtenPaths(e.Harness, e.Tool, c.Input, e.Summary, c.Cwd) {
 				k := wrote{e.Session, e.Agent, p}
 				written[k] = append(written[k], e.TS)
 			}
@@ -91,10 +91,13 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 				continue
 			}
 			// a read of a file its thread writes within the settle time found it not there yet: no failure; one younger
-			// than the settle time may have its write still to come
-			if p, ok := notFoundRead(e.Tool, e.Summary, call, k); ok && (slices.ContainsFunc(written[wrote{e.Session, e.Agent, p}],
-				func(t time.Time) bool { return t.After(e.TS) && !t.After(e.TS.Add(readSettle)) }) || settling(e.TS, w)) {
-				continue
+			// than the settle time, its path known or not, may have its write still to come
+			if notFound(e.Tool, e.Summary, k) {
+				p, _, _ := callField(call, pathKeys)
+				if settling(e.TS, w) || slices.ContainsFunc(written[wrote{e.Session, e.Agent, p}],
+					func(t time.Time) bool { return t.After(e.TS) && !t.After(e.TS.Add(readSettle)) }) {
+					continue
+				}
 			}
 			occ = append(occ, occurrence{sig: signature("failures", k.String()), title: k.Title(), ev: e})
 		}
@@ -154,17 +157,6 @@ var notFoundRe = regexp.MustCompile(`(?i)\bdoes not exist\b|\b(?:file|path) not 
 // pathKeys are the fields of a file tool's input that name its file.
 var pathKeys = map[string]bool{"file_path": true, "filePath": true, "notebook_path": true, "path": true}
 
-// notFoundRead is the path a read tool's own error says holds no file, as its call names it, and false for any
-// other failure: one of another tool, a guard's or the harness's refusal, access refused, a call whose path the
-// store's cut left out.
-func notFoundRead(tool, text, call string, k FailureKey) (string, bool) {
-	if !notFound(tool, text, k) {
-		return "", false
-	}
-	p, _, _ := callField(call, pathKeys)
-	return p, p != ""
-}
-
 // notFound says a failure keyed k is a read tool's own error that no file is at its path.
 func notFound(tool, text string, k FailureKey) bool {
 	return readTools[strings.ToLower(tool)] && k.Origin == toolOrigin(tool) && notFoundRe.MatchString(text)
@@ -177,25 +169,31 @@ func settling(ts time.Time, w Window) bool { return !ts.Before(w.Until.Add(-read
 // read up to where the store cut it: its text ("" for another value), whether the input names one before the cut,
 // and whether it names none in an input the store kept whole.
 func callField(call string, keys map[string]bool) (value string, named, absent bool) {
+	raw, named, absent := callValue(call, keys)
+	json.Unmarshal(raw, &value)
+	return value, named, absent
+}
+
+// callValue is callField's field as its JSON value.
+func callValue(call string, keys map[string]bool) (value json.RawMessage, named, absent bool) {
 	d := json.NewDecoder(strings.NewReader(call))
 	if t, err := d.Token(); err != nil || t != json.Delim('{') {
-		return "", false, false
+		return nil, false, false
 	}
 	for d.More() {
 		t, err := d.Token()
 		if err != nil {
-			return "", false, false
+			return nil, false, false
 		}
 		var v json.RawMessage
 		if err := d.Decode(&v); err != nil {
-			return "", false, false
+			return nil, false, false
 		}
 		if key, _ := t.(string); keys[key] {
-			json.Unmarshal(v, &value)
-			return value, true, false
+			return v, true, false
 		}
 	}
-	return "", false, true
+	return nil, false, true
 }
 
 // wroteFile says a write tool's result that is no failure (toolresult.Failed) did write: a JSON result that
