@@ -104,7 +104,8 @@ type querier interface {
 // The store's tables are of two kinds.
 //
 // Kept tables hold what cannot be read again: every event, when each live session entered its phase, the notes
-// (notes.go), what the capacity runs observed (capacity.go), the cases (cases.go), and the loop's runs and its turns (loop.go). A schema change migrates them and never drops
+// (notes.go), what the capacity runs observed (capacity.go), the cases (cases.go), the loop's runs and its turns (loop.go),
+// and the owner's checks of requests (requests.go). A schema change migrates them and never drops
 // them. A kept table that is missing is made with the columns it was first made with (keptTables), it gains each
 // later column it lacks (keptColumns), and its rows change only in a step, by a column's fill where the column is
 // added (columnFills), or by its triggers (keptTriggers).
@@ -128,7 +129,7 @@ CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, kind TEXT NOT NULL, title
   detail TEXT NOT NULL DEFAULT '', effect TEXT NOT NULL DEFAULT '', links TEXT NOT NULL DEFAULT '[]',
   source TEXT NOT NULL DEFAULT '', importance INTEGER NOT NULL DEFAULT 0, at INTEGER NOT NULL,
   done INTEGER NOT NULL DEFAULT 0);
-` + capacityTables + caseTables + loopTables
+` + capacityTables + caseTables + loopTables + requestTables
 
 // keptColumns are the columns each kept table gained after it was first made, in order. A table that lacks one
 // gains it and keeps its rows: SQLite's ADD COLUMN writes no row, so it costs the same on any table. The next
@@ -180,7 +181,8 @@ CREATE INDEX IF NOT EXISTS events_session ON events(session, ts);
 CREATE INDEX IF NOT EXISTS events_key ON events(source, source_key);
 `
 
-var keptIndexNames = slices.Concat([]string{"events_seq", "events_ts", "events_kind", "events_session", "events_key"}, caseIndexNames, loopIndexNames)
+var keptIndexNames = slices.Concat([]string{"events_seq", "events_ts", "events_kind", "events_session", "events_key"}, caseIndexNames, loopIndexNames,
+	requestIndexNames)
 
 // keptTriggers give Claude Code its one name as an event is written, by whatever build writes it: a build from
 // before the events were kept writes claude-code, also while this build has the store open.
@@ -439,7 +441,7 @@ func busy(err error) bool {
 
 // keptTableNames are the tables keptTables makes.
 var keptTableNames = slices.Concat([]string{"events", "session_stamps", "schema_steps", "event_seq", "notes"}, capacityTableNames, caseTableNames,
-	loopTableNames)
+	loopTableNames, requestTableNames)
 
 // checkpointColumns are the columns the schema gives the checkpoint tables. They are a cache of what transcripts
 // hold, so tables with other columns (a build before this one made them) are dropped and made again, and the next
@@ -501,7 +503,7 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
-	if _, err := tx.Exec(keptIndexes + caseIndexes + loopIndexes + keptTriggers); err != nil {
+	if _, err := tx.Exec(keptIndexes + caseIndexes + loopIndexes + requestIndexes + keptTriggers); err != nil {
 		return err
 	}
 	var pending []step

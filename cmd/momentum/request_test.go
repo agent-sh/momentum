@@ -79,11 +79,6 @@ func TestRequestHandoffAndList(t *testing.T) {
 		strings.Fields(out)[0] != id || strings.Fields(out)[1] != "ready" {
 		t.Fatalf("list: exit %d %q", code, out)
 	}
-	for _, gone := range []string{"check", "uncheck"} {
-		if code, _, errOut := momentum("request", gone, id); code != 2 || !strings.Contains(errOut, "unknown request command") {
-			t.Fatalf("request %s: exit %d %s", gone, code, errOut)
-		}
-	}
 	if code, _, errOut := momentum("request", "handoff", "no-such-session"); code != 2 || !strings.Contains(errOut, "neither a request's id nor a session's") {
 		t.Fatalf("an unknown id: exit %d %s", code, errOut)
 	}

@@ -16,17 +16,20 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// requestCmd shows the owner's requests across the sessions they ran in, and prints a request's handoff (SPEC,
-// Requests). Both read the store read-only.
+// requestCmd shows the owner's requests across the sessions they ran in, prints a request's handoff, and keeps his
+// checks of their results on his own words, which an agent relays (SPEC, Requests). list and handoff read the store
+// read-only; check and uncheck write.
 func requestCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usageError{"request needs list or handoff"}
+		return usageError{"request needs list, handoff, check or uncheck"}
 	}
 	switch args[0] {
 	case "list":
 		return requestList(ctx, args[1:], stdout, stderr)
 	case "handoff":
 		return requestHandoff(ctx, args[1:], stdout, stderr)
+	case "check", "uncheck":
+		return requestCheck(ctx, args[0], args[1:], stdout, stderr)
 	}
 	if _, ok := request.ParseID(args[0]); ok {
 		// a handoff's own id lines, run as printed: momentum request ID is its handoff, and so is its opening line,
@@ -65,6 +68,16 @@ type requestJSON struct {
 	Newest          string   `json:"newest,omitempty"`
 	Open            string   `json:"open,omitempty"`
 	Aliases         []string `json:"aliases,omitempty"`
+	// Checked is the owner's check that holds, while the state is checked
+	Checked *checkedJSON `json:"checked,omitempty"`
+}
+
+// checkedJSON is the owner's check of a request: the result it binds, and his turn it rests on, by its time and
+// its event (momentum evidence show takes it).
+type checkedJSON struct {
+	Result string `json:"result"`
+	At     string `json:"at"`
+	Proof  string `json:"proof"`
 }
 
 func requestList(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -117,6 +130,9 @@ func requestList(ctx context.Context, args []string, stdout, stderr io.Writer) e
 			for _, th := range rq.Threads {
 				j.Threads = append(j.Threads, th.ID)
 			}
+			if c, _, holds := rq.Standing(); holds && rq.State == request.Checked {
+				j.Checked = &checkedJSON{Result: c.Result, At: c.ProofAt.Local().Format(time.RFC3339), Proof: "ev:" + c.Proof}
+			}
 			out.Requests = append(out.Requests, j)
 		}
 		b, err := json.Marshal(out)
@@ -134,8 +150,12 @@ func requestList(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		if len(rq.Threads) == 1 {
 			sessions = "1 session"
 		}
-		fmt.Fprintf(stdout, "%-14s %-9s %s  %-11s %s\n", rq.ID, rq.State, rq.Last.Local().Format("2006-01-02 15:04"), sessions,
-			plain.Clip(asking(rq), 80))
+		checked := ""
+		if c, _, holds := rq.Standing(); holds && rq.State == request.Checked {
+			checked = "  (checked in his turn of " + c.ProofAt.Local().Format("2006-01-02 15:04") + ")"
+		}
+		fmt.Fprintf(stdout, "%-14s %-9s %s  %-11s %s%s\n", rq.ID, rq.State, rq.Last.Local().Format("2006-01-02 15:04"), sessions,
+			plain.Clip(asking(rq), 80), checked)
 	}
 	return nil
 }
@@ -177,4 +197,63 @@ func requestHandoff(ctx context.Context, args []string, stdout, stderr io.Writer
 	}
 	_, err = io.WriteString(stdout, request.Handoff(rq))
 	return err
+}
+
+// requestCheck records the owner's check of a request's result, or undoes it, on his own words an agent relays with
+// --proof: momentum finds them in a turn of his in the request's sessions, and refuses, saying why, when it does not.
+func requestCheck(ctx context.Context, cmd string, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("request "+cmd, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	proof := fs.String("proof", "", "the owner's own words, as he typed them in a turn of the request (at least 3), that prove it is his")
+	if err := fs.Parse(args); err != nil {
+		return usageError{err.Error()}
+	}
+	var ids []string
+	for fs.NArg() > 0 { // the flag before or after the id
+		ids = append(ids, fs.Arg(0))
+		if err := fs.Parse(fs.Args()[1:]); err != nil {
+			return usageError{err.Error()}
+		}
+	}
+	if len(ids) != 1 {
+		return usageError{fmt.Sprintf(`request %s needs one ID (a request's id, or a session's id or its start) and --proof "WORDS", the owner's own`, cmd)}
+	}
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	rq, err := request.Find(ctx, st, ids[0], requestOptions(stderr))
+	if errors.Is(err, request.ErrNoRequest) {
+		return usageError{err.Error()}
+	}
+	if err != nil {
+		return err
+	}
+	refused := func(err error) error {
+		if errors.Is(err, request.ErrNoProof) || errors.Is(err, request.ErrNoRequest) || errors.Is(err, store.ErrNoCheck) {
+			return usageError{fmt.Sprintf("%s: %s not recorded: %v", rq.ID, cmd, err)}
+		}
+		return err
+	}
+	if cmd == "uncheck" {
+		c, p, err := request.Uncheck(ctx, st, rq, *proof, time.Now())
+		if err != nil {
+			return refused(err)
+		}
+		fmt.Fprintf(stdout, "%s: undid the check of his turn of %s on %s, on his turn of %s (ev:%s)\n", rq.ID,
+			c.ProofAt.Local().Format("2006-01-02 15:04"), c.Result, p.At.Local().Format("2006-01-02 15:04"), p.Event)
+		return nil
+	}
+	c, err := request.Check(ctx, st, rq, *proof, time.Now())
+	if err != nil {
+		return refused(err)
+	}
+	if !c.Added {
+		fmt.Fprintf(stdout, "%s: checked already, on his turn of %s\n", rq.ID, c.Proof.At.Local().Format("2006-01-02 15:04"))
+		return nil
+	}
+	fmt.Fprintf(stdout, "%s: checked %s, on his turn of %s (ev:%s); a newer result or a later ask of his reopens it\n", rq.ID,
+		plain.Clip(plain.Line(c.Result.Text), 120), c.Proof.At.Local().Format("2006-01-02 15:04"), c.Proof.Event)
+	return nil
 }

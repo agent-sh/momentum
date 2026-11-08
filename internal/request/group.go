@@ -235,11 +235,18 @@ func fill(u sets, reqs map[string]*Request, t *thread) {
 		repeat := last != nil && last.words == words && last.marker == tn.marker && tn.at.Sub(last.at) <= sameTurn && !t.agentBetween(last.at, tn.at)
 		last = &seen{tn.at, words, tn.marker}
 		rq := of(t.segAt(tn.at))
+		if rq != nil && tn.owner && tn.words != "" && !tn.at.Before(rq.start()) {
+			// what a check's proof is looked for in: his words, and a program's, which it names when they alone hold it
+			rq.said = append(rq.said, spoken{at: tn.at, event: tn.ev.ID(), words: tn.words, program: tn.program, command: slashCommand(tn.words)})
+		}
 		if rq == nil || tn.program && tn.marker == "" || tn.at.Before(rq.start()) || repeat {
 			continue
 		}
 		if tn.at.After(rq.LastTurn) {
 			rq.LastTurn = tn.at
+		}
+		if tn.owner && !tn.program && words != "" && !slashCommand(words) && tn.at.After(rq.LastOwnerTurn) {
+			rq.LastOwnerTurn = tn.at // his own ask: what reopens his check; a paste with no words of his asks nothing
 		}
 		if th := thread(rq); th != nil && tn.at.After(th.turn) {
 			th.turn = tn.at
@@ -345,7 +352,7 @@ func fold(rq *Request) {
 	})
 }
 
-// finish reads the requests' threads' phases, and their state.
+// finish reads the requests' threads' phases, their checks, and their state.
 func (r *reader) finish(ctx context.Context, reqs []*Request) error {
 	current := false
 	for _, rq := range reqs {
@@ -413,12 +420,43 @@ func (r *reader) finish(ctx context.Context, reqs []*Request) error {
 				th.Phase, th.Ask, th.AskKind = m.To, m.Ask, m.AskKind
 			}
 		}
+		checks, err := r.checksOf(ctx, rq)
+		if err != nil {
+			return err
+		}
+		rq.Checks = checks
 	}
 	r.maskAsks(ctx, reqs)
 	for _, rq := range reqs {
 		state(rq)
 	}
 	return nil
+}
+
+// checksOf are a request's checks: those under its id and its aliases, and, while one opening alone has an id's
+// time, those under any id of that time (a read again may store other words for the opening). A read keeps them by
+// the request's id, which a rebuild does not change.
+func (r *reader) checksOf(ctx context.Context, rq *Request) ([]store.RequestCheck, error) {
+	if cs, ok := r.checks[rq.ID]; ok {
+		return cs, nil
+	}
+	ids := append([]string{rq.ID}, rq.Aliases...)
+	var prefixes []string
+	for _, id := range ids {
+		alone, err := r.alone(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if tp := id[:len(id)-4]; alone && !contains(prefixes, tp) {
+			prefixes = append(prefixes, tp)
+		}
+	}
+	cs, err := r.st.RequestChecks(ctx, ids, prefixes, 4)
+	if err != nil {
+		return nil, err
+	}
+	r.checks[rq.ID] = cs
+	return cs, nil
 }
 
 // maskAsks masks the questions sessions wait on the owner with, as a sessions run recorded them, before the open

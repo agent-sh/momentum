@@ -1,7 +1,7 @@
 // Package request groups the owner's work into requests across the sessions it ran in, and reads what was observed
 // of each (SPEC, Requests). It reads the store's events and decides by rules, with no model: the links tacit's
 // reader records (subagents, parents, the copies a fork or a resume carries over) and a handoff's id pasted into a
-// turn. It keeps nothing of its own.
+// turn. The one thing kept is the owner's check of a result, on his own words an agent relayed (check.go).
 package request
 
 import (
@@ -25,6 +25,7 @@ import (
 const (
 	NeedsYou = "needs_you"
 	Working  = "working"
+	Checked  = "checked"
 	Unknown  = "unknown"
 	Ready    = "ready"
 	Open     = "open"
@@ -51,7 +52,7 @@ type Ask struct {
 }
 
 // Result is what a request's tools recorded (an artifact) or the agent's last reply (its report, a claim). Key
-// names it, the same in a fork that carried it over.
+// names it for a check, the same in a fork that carried it over.
 type Result struct {
 	Kind   string
 	Key    string
@@ -87,13 +88,20 @@ type Request struct {
 	Opened   time.Time // zero when its opening is not in the store
 	Asks     []Ask     // his words, oldest first
 	LastTurn time.Time // his last turn, or the last turn that pasted its handoff
-	Threads  []Thread
-	Results  []Result // the artifacts, newest first
-	Report   *Result  // the agent's last reply: its claim
-	State    string
-	Why      string // what the state rests on
-	Open     string // the open step; empty when nothing records one
-	Last     time.Time
+	// LastOwnerTurn is his last ask: words he typed (not a brief or a program's turn that pasted the handoff, not
+	// a harness command such as /compact); only it of the turns reopens his check
+	LastOwnerTurn time.Time
+	Threads       []Thread
+	Results       []Result // the artifacts, newest first
+	Report        *Result  // the agent's last reply: its claim
+	Checks        []store.RequestCheck
+	State         string
+	Why           string // what the state rests on
+	Open          string // the open step; empty when nothing records one
+	Last          time.Time
+	// said are the owner turns of its threads, his and the ones a program typed: what a check's proof is looked
+	// for in
+	said []spoken
 	// CutGone, CutUnread and CutUnmasked count its calls the store cut that were read as the store holds them:
 	// their transcript is gone, no reader of their harness is here, or what was read whole could not be masked
 	CutGone, CutUnread, CutUnmasked int
@@ -114,6 +122,84 @@ func (r *Request) Newest() *Result {
 		return &r.Results[0]
 	}
 	return r.Report
+}
+
+// rank orders the kinds a check binds: a commit, a push or a pull request over a file write over the report.
+func rank(kind string) int {
+	switch kind {
+	case KindCommit, KindPush, KindPR:
+		return 2
+	case KindFile:
+		return 1
+	}
+	return 0
+}
+
+// Bound is the result a check binds: the newest commit, push or pull request, else the newest result (a file
+// write, else the report); nil when there is none.
+func (r *Request) Bound() *Result {
+	for i := range r.Results {
+		if rank(r.Results[i].Kind) == 2 {
+			return &r.Results[i]
+		}
+	}
+	return r.Newest()
+}
+
+// Standing is the newest check not undone, and whether it holds: no result a check would bind over the one it
+// binds came after that one, and no ask of the owner's came after his turn that proves it. A check holds while
+// its result can no longer be read (its transcript is gone, so it is not among the request's) and nothing came
+// after it.
+func (r *Request) Standing() (store.RequestCheck, bool, bool) {
+	for i := len(r.Checks) - 1; i >= 0; i-- {
+		if c := r.Checks[i]; c.Undone.IsZero() {
+			return c, true, r.newerThan(c) == nil && !r.LastOwnerTurn.After(c.ProofAt)
+		}
+	}
+	return store.RequestCheck{}, false, false
+}
+
+// newerThan is the newest result that came after the one a check binds and that a check would bind over it: of its
+// kind or of one ranked above it (a commit, a push or a pull request over a file write over the report); nil for
+// none. A result of a kind ranked below it, or one that came before it, reopens nothing.
+func (r *Request) newerThan(c store.RequestCheck) *Result {
+	kind, _, _ := strings.Cut(c.Result, ":")
+	cands := r.Results
+	if r.Report != nil {
+		cands = append(cands[:len(cands):len(cands)], *r.Report)
+	}
+	var out *Result
+	for i := range cands {
+		x := &cands[i]
+		if x.Key != c.Result && x.At.After(c.ResultAt) && rank(x.Kind) >= rank(kind) && (out == nil || x.At.After(out.At)) {
+			out = x
+		}
+	}
+	return out
+}
+
+// checked is the result a check binds as the request holds it; nil when it is no longer among them.
+func (r *Request) checked(c store.RequestCheck) *Result {
+	for i := range r.Results {
+		if r.Results[i].Key == c.Result {
+			return &r.Results[i]
+		}
+	}
+	if r.Report != nil && r.Report.Key == c.Result {
+		return r.Report
+	}
+	return nil
+}
+
+// CheckIDs are the ids its checks are stored under.
+func (r *Request) CheckIDs() []string {
+	ids := append([]string{r.ID}, r.Aliases...)
+	for _, c := range r.Checks {
+		if !contains(ids, c.Request) {
+			ids = append(ids, c.Request)
+		}
+	}
+	return ids
 }
 
 // resultAfter reports a result or a reply of the agent's after a time.
@@ -471,13 +557,15 @@ type reader struct {
 	packed   map[string]bool       // a transcript read from a compressed copy
 	opens    map[string]int        // how often a transcript file was opened in the run
 	hermes   map[string]*evidence.HermesDB
-	raws     []raw // what calls read whole made, not yet masked (mask)
+	raws     []raw                           // what calls read whole made, not yet masked (mask)
+	checks   map[string][]store.RequestCheck // a request's checks, by its id (checksOf)
 }
 
 func newReader(st *store.Store, opt Options) *reader {
 	return &reader{st: st, opt: opt, threads: map[string]*thread{}, openings: map[string][]ref{}, single: map[string]bool{},
 		children: map[string][]string{}, markers: map[string][]string{}, markIDs: map[string][]string{},
-		records: map[string]recordRead{}, packed: map[string]bool{}, opens: map[string]int{}, hermes: map[string]*evidence.HermesDB{}}
+		records: map[string]recordRead{}, packed: map[string]bool{}, opens: map[string]int{}, hermes: map[string]*evidence.HermesDB{},
+		checks: map[string][]store.RequestCheck{}}
 }
 
 // close lets go of the Hermes stores a run opened.
@@ -883,11 +971,28 @@ func (r *reader) settle(ctx context.Context, since time.Time, match func(*Reques
 			out = r.rebuild(ctx, out)
 			if !r.window.IsZero() {
 				// a request whose last turn is before the window and that nothing in it came after: its state needs to
-				// know whether a result came between its last turn and the window
+				// know whether a result came between its last turn and the window; and one whose standing check binds
+				// a result from before the window: its state needs every result since that one, which may reopen it
 				again := false
 				for _, rq := range out {
+					var from time.Time
 					if !rq.LastTurn.IsZero() && rq.LastTurn.Before(r.window) && !rq.resultAfter(rq.LastTurn) {
-						if err := load(rq, rq.LastTurn); err != nil {
+						from = rq.LastTurn
+					}
+					checks, err := r.checksOf(ctx, rq)
+					if err != nil {
+						return nil, err
+					}
+					for i := len(checks) - 1; i >= 0; i-- {
+						if c := checks[i]; c.Undone.IsZero() {
+							if c.ResultAt.Before(r.window) && (from.IsZero() || c.ResultAt.Before(from)) {
+								from = c.ResultAt
+							}
+							break
+						}
+					}
+					if !from.IsZero() {
+						if err := load(rq, from); err != nil {
 							return nil, err
 						}
 						again = true

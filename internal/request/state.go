@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -16,9 +17,10 @@ var tracked = map[string]bool{"claude": true, "codex": true, "pi": true, "openco
 var livePhases = map[string]bool{"working": true, "background": true, "scheduled": true}
 
 // state decides a request's state, what it rests on, and its open step, from what was observed, the first that
-// holds: a thread waits on the owner, a thread works, the latest thread's phase is not known (never recorded, recorded only before the last turn there, or every thread moved
-// on), a result came after his last turn, nothing did. A phase counts only when a sessions run saw it after the
-// request's last turn in the thread.
+// holds: a thread waits on the owner, a thread works, a check of his holds its result, the latest thread's phase is
+// not known (never recorded, recorded only before the last turn there, or every thread moved on), a result came
+// after his last turn, nothing did. A phase counts only when a sessions run saw it after the request's last turn
+// in the thread.
 func state(rq *Request) {
 	var latest, needs *Thread
 	working := false
@@ -43,11 +45,20 @@ func state(rq *Request) {
 		artifact = artifact || x.At.After(rq.LastTurn)
 	}
 	after := artifact || rq.Report != nil && rq.Report.At.After(rq.LastTurn)
+	c, standing, holds := rq.Standing()
 	switch {
 	case needs != nil:
 		rq.State, rq.Why = NeedsYou, "a session of it was last seen waiting on the owner"
 	case working:
 		rq.State, rq.Why = Working, "a session of it was last seen working"
+	case standing && holds:
+		rq.State = Checked
+		if x := rq.checked(c); x != nil {
+			rq.Why = "the owner checked " + plain.Clip(plain.Line(x.Text), 120) + " in his turn of " + c.ProofAt.Local().Format(timeFormat) + "; that he checked it does not make it right"
+		} else {
+			rq.Why = "the owner checked a result that can no longer be read (" + c.Result + ") in his turn of " + c.ProofAt.Local().Format(timeFormat) +
+				", and nothing came after it"
+		}
 	case latest == nil:
 		rq.State, rq.Why = Unknown, "every session of it moved on to another request, so nothing records whether it is done"
 	case latest.Phase == "" && !tracked[latest.Harness]:
@@ -63,7 +74,16 @@ func state(rq *Request) {
 	default:
 		rq.State, rq.Why = Open, "nothing came after the last turn"
 	}
+	if (rq.State == Ready || rq.State == Open) && standing && !holds {
+		by := "an ask of the owner's after it"
+		if x := rq.newerThan(c); x != nil && !rq.LastOwnerTurn.After(c.ProofAt) {
+			by = "a newer result, " + plain.Clip(plain.Line(x.Text), 120)
+		}
+		rq.Why += "; the check of his turn of " + c.ProofAt.Local().Format(timeFormat) + " is reopened by " + by
+	}
 	switch {
+	case rq.State == Checked:
+		rq.Open = "none: the owner checked it"
 	case needs != nil:
 		kind := needs.AskKind
 		if kind == "" {

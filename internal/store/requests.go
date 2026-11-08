@@ -8,6 +8,129 @@ import (
 	"time"
 )
 
+// requestTables keep the owner's checks of requests (SPEC, Requests, Checks). A check names a request by its id,
+// the result it binds by its key and its time, and the owner's turn that holds the words an agent relayed (its
+// proof) by the turn's event id and time. Nothing derives them and nothing deletes one; an undo is dated and names
+// its own proof turn. The table is new under its own name: a build of an earlier draft kept checks with no proof
+// in request_checks, which nothing reads.
+const requestTables = `
+CREATE TABLE IF NOT EXISTS request_owner_checks (id INTEGER PRIMARY KEY, request TEXT NOT NULL, result TEXT NOT NULL,
+  result_at INTEGER NOT NULL, proof TEXT NOT NULL, proof_at INTEGER NOT NULL, at INTEGER NOT NULL,
+  undone INTEGER NOT NULL DEFAULT 0, undo_proof TEXT NOT NULL DEFAULT '');
+`
+
+var requestTableNames = []string{"request_owner_checks"}
+
+// requestIndexes find a request's checks by its id, or by the start of its id.
+const requestIndexes = `
+CREATE INDEX IF NOT EXISTS request_owner_checks_request ON request_owner_checks(request);
+`
+
+var requestIndexNames = []string{"request_owner_checks_request"}
+
+// RequestCheck is the owner's check of one result of a request, on his own words: Proof is the event id of his turn
+// that holds them, ProofAt its time. At is when it was recorded. Undone is when he undid it, zero while it stands,
+// and UndoProof the event id of his turn that undid it.
+type RequestCheck struct {
+	Request   string
+	Result    string
+	ResultAt  time.Time
+	Proof     string
+	ProofAt   time.Time
+	At        time.Time
+	Undone    time.Time
+	UndoProof string
+}
+
+// ErrNoCheck is an undo with no check to undo.
+var ErrNoCheck = errors.New("no check to undo")
+
+// CheckOnce records a check unless one under any of ids stands on the same result with a proof turn no older than
+// its own, in one statement, so two checks made at once on his same words leave one; it reports whether it
+// recorded one.
+func (s *Store) CheckOnce(ctx context.Context, c RequestCheck, ids []string) (bool, error) {
+	if len(ids) == 0 {
+		ids = []string{c.Request}
+	}
+	r, err := s.db.ExecContext(ctx, `INSERT INTO request_owner_checks (request, result, result_at, proof, proof_at, at)
+	  SELECT ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM request_owner_checks WHERE undone = 0 AND result = ? AND proof_at >= ?
+	  AND request IN (?`+strings.Repeat(",?", len(ids)-1)+`))`,
+		append([]any{c.Request, c.Result, c.ResultAt.UnixMilli(), c.Proof, c.ProofAt.UnixMilli(), c.At.UnixMilli(), c.Result,
+			c.ProofAt.UnixMilli()}, anys(ids)...)...)
+	if err != nil {
+		return false, err
+	}
+	n, err := r.RowsAffected()
+	return n > 0, err
+}
+
+// UndoRequestCheck undoes every check of any of ids that stands, on the owner's turn proof, and returns the newest
+// of them.
+func (s *Store) UndoRequestCheck(ctx context.Context, ids []string, at time.Time, proof string) (RequestCheck, error) {
+	if len(ids) == 0 {
+		return RequestCheck{}, ErrNoCheck
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return RequestCheck{}, err
+	}
+	defer tx.Rollback()
+	var c RequestCheck
+	var resultAt, proofAt, checked int64
+	err = tx.QueryRowContext(ctx, `SELECT request, result, result_at, proof, proof_at, at FROM request_owner_checks WHERE undone = 0
+	  AND request IN (?`+strings.Repeat(",?", len(ids)-1)+`) ORDER BY proof_at DESC, id DESC LIMIT 1`, anys(ids)...).Scan(&c.Request,
+		&c.Result, &resultAt, &c.Proof, &proofAt, &checked)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RequestCheck{}, ErrNoCheck
+	}
+	if err != nil {
+		return RequestCheck{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE request_owner_checks SET undone = ?, undo_proof = ? WHERE undone = 0 AND request IN (?`+
+		strings.Repeat(",?", len(ids)-1)+`)`, append([]any{at.UnixMilli(), proof}, anys(ids)...)...); err != nil {
+		return RequestCheck{}, err
+	}
+	c.ResultAt, c.ProofAt, c.At, c.Undone, c.UndoProof = time.UnixMilli(resultAt), time.UnixMilli(proofAt), time.UnixMilli(checked), at, proof
+	return c, tx.Commit()
+}
+
+// RequestChecks are the checks of any of ids, and of every id that starts with one of prefixes and is n bytes
+// longer, by their proof turns, oldest first.
+func (s *Store) RequestChecks(ctx context.Context, ids, prefixes []string, n int) ([]RequestCheck, error) {
+	var where []string
+	var args []any
+	if len(ids) > 0 {
+		where, args = append(where, `request IN (?`+strings.Repeat(",?", len(ids)-1)+`)`), anys(ids)
+	}
+	for _, p := range prefixes {
+		where = append(where, `(request >= ? AND request < ? AND length(request) = ?)`)
+		args = append(args, p, p+"~", len(p)+n)
+	}
+	if len(where) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT request, result, result_at, proof, proof_at, at, undone, undo_proof FROM request_owner_checks
+	  WHERE `+strings.Join(where, " OR ")+` ORDER BY proof_at, id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RequestCheck
+	for rows.Next() {
+		var c RequestCheck
+		var resultAt, proofAt, checked, undone int64
+		if err := rows.Scan(&c.Request, &c.Result, &resultAt, &c.Proof, &proofAt, &checked, &undone, &c.UndoProof); err != nil {
+			return nil, err
+		}
+		c.ResultAt, c.ProofAt, c.At = time.UnixMilli(resultAt), time.UnixMilli(proofAt), time.UnixMilli(checked)
+		if undone != 0 {
+			c.Undone = time.UnixMilli(undone)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 func anys(ss []string) []any {
 	out := make([]any, len(ss))
 	for i, s := range ss {

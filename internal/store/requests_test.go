@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -68,5 +70,88 @@ func TestAThreadReadSelectsTheResultsThatMayShowAnArtifact(t *testing.T) {
 	want := "[main 1a2b3c4] x | To github.com:example/x.git 1111111..2222222 main -> main | https://github.com/example/x/pull/9 | hook: checking the tree…"
 	if g := strings.Join(got, " | "); g != want {
 		t.Fatalf("results:\n got %s\nwant %s", g, want)
+	}
+}
+
+// The owner's checks are a kept table: a store from before them gains it at its next open and keeps its events, the
+// read-only open refuses such a store until then, and a rebuild keeps every check, its proof and its undo's.
+func TestTheOwnersChecksAreKept(t *testing.T) {
+	ctx := context.Background()
+	st, path := open(t)
+	if _, err := st.Put(ctx, []Event{{Source: "mistakes", SourceKey: "k", TS: time.Now(), Actor: ActorTool, Kind: "tool-error"}}); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tbl := range requestTableNames {
+		if _, err := db.Exec(`DROP TABLE ` + tbl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+	if _, err := OpenReadOnly(path); !errors.Is(err, ErrNotCurrent) {
+		t.Fatalf("a store without the checks read as current: %v", err)
+	}
+	if st, err = Open(path); err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if evs, err := st.Events(ctx, Query{Source: "mistakes"}); err != nil || len(evs) != 1 {
+		t.Fatalf("the events of a store from before the checks: %d %v", len(evs), err)
+	}
+	c := RequestCheck{Request: "rabc12345678", Result: "commit:1a2b3c4", ResultAt: time.UnixMilli(900), Proof: "e1", ProofAt: time.UnixMilli(1000),
+		At: time.UnixMilli(1100)}
+	if ok, err := st.CheckOnce(ctx, c, nil); err != nil || !ok {
+		t.Fatalf("check: %v %v", ok, err)
+	}
+	// two checks of the same result on his same turn, made at once, leave one; one under an alias stands in the way
+	again := c
+	again.Request, again.At = "rold00000000", time.UnixMilli(1200)
+	if ok, err := st.CheckOnce(ctx, again, []string{"rold00000000", "rabc12345678"}); err != nil || ok {
+		t.Fatalf("a second check on the same turn: %v %v", ok, err)
+	}
+	if _, err := st.Rebuild(ctx, "mistakes", false); err != nil {
+		t.Fatal(err)
+	}
+	undone, err := st.UndoRequestCheck(ctx, []string{"rabc12345678"}, time.UnixMilli(2000), "e2")
+	if err != nil || undone.Proof != "e1" || undone.UndoProof != "e2" || !undone.ProofAt.Equal(c.ProofAt) {
+		t.Fatalf("undo: %+v %v", undone, err)
+	}
+	if _, err := st.UndoRequestCheck(ctx, []string{"rabc12345678"}, time.UnixMilli(2100), "e3"); !errors.Is(err, ErrNoCheck) {
+		t.Fatalf("an undo with none standing: %v", err)
+	}
+	checks, err := st.RequestChecks(ctx, nil, []string{"rabc1234"}, 4)
+	if err != nil || len(checks) != 1 {
+		t.Fatalf("checks: %+v %v", checks, err)
+	}
+	if got := checks[0]; got.Result != c.Result || !got.ResultAt.Equal(c.ResultAt) || got.Proof != "e1" || !got.ProofAt.Equal(c.ProofAt) ||
+		!got.At.Equal(c.At) || !got.Undone.Equal(time.UnixMilli(2000)) || got.UndoProof != "e2" {
+		t.Fatalf("the check read back: %+v", got)
+	}
+}
+
+// A request's checks are found by their index, by its id and by the start of its id: the table is never read whole.
+func TestTheOwnersChecksAreFoundByTheirIndex(t *testing.T) {
+	st, _ := open(t)
+	rows, err := st.db.QueryContext(context.Background(), `EXPLAIN QUERY PLAN SELECT request FROM request_owner_checks
+	  WHERE request IN (?) OR (request >= ? AND request < ? AND length(request) = ?) ORDER BY proof_at, id`, "rabc0000", "rabc", "rabc~", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	if p := strings.Join(plan, " / "); !strings.Contains(p, "request_owner_checks_request") || strings.Contains(p, "SCAN request_owner_checks") {
+		t.Fatalf("plan: %s", p)
 	}
 }
