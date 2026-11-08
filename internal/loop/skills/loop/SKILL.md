@@ -18,6 +18,8 @@ The case's `NextTest` is the investigation's proposed fix, in prose. Build that 
 
 The paths the loop may land are in the build prompt. Prefer a fix inside them. When the right fix needs other paths, make it there anyway: the host checks and reviews it the same way and proposes it for a person to land by hand. The paths the prompt says are never changed refuse the whole change.
 
+When the right fix needs a path no change touches, and no change in reach fixes the case, make no change. Answer `out_of_reach` with that path, from the repository's root, and the change a person makes there; the host reads only it and the summary. The host checks the path: one a change may touch refuses the build. The case then waits for a person.
+
 Choose a week, or two for a rarer problem. A window is whole weeks. The signal must hold the case's problem in at least five active hours in the gate. The host compares the three independent windows before that gate with the window after the change is in effect. When the problem has stopped, or is too new or too rare for that, the host guards the change instead: it watches for a recurrence. Give the signal of the problem's own events all the same. Name the signal's `tool` when the problem's events are of it.
 
 When the machine runs a binary or an installed configuration, return its host file as installed. It must name a regular file without links in a directory admitted by loop.read_dirs, outside run storage. The host checks its revision or rebuild before measuring. Otherwise the repository checkout is what takes effect.

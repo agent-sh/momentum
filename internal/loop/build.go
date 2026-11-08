@@ -26,12 +26,13 @@ import (
 const buildSchema = `{"type":"object","additionalProperties":false,
 "required":["summary","test_command","title","body","rollback","signal","window","lesson"],
 "properties":{"summary":{"type":"string"},
-"test_command":{"type":"array","minItems":1,"items":{"type":"string"},"description":"The program and its arguments, one word each, such as [\"go\", \"test\", \"./internal/x\", \"-run\", \"TestY\"]. The host runs it in the sandbox without a shell, on BASE with only the change's test files (it must fail) and on the change (it must pass). Not a description of the test."},
+"test_command":{"type":"array","items":{"type":"string"},"description":"The program and its arguments, one word each, such as [\"go\", \"test\", \"./internal/x\", \"-run\", \"TestY\"]. The host runs it in the sandbox without a shell, on BASE with only the change's test files (it must fail) and on the change (it must pass). Not a description of the test."},
 "title":{"type":"string"},
 "body":{"type":"string"},"rollback":{"type":"string"},"window":{"type":"string"},"lesson":{"type":"string","description":"One line of at most 300 characters: what a later agent should know from this case, or empty. A multi-line lesson is joined into one line; one longer than 300 characters is dropped."},"installed":{"type":"string"},
 "signal":{"type":"object","additionalProperties":false,"required":["source","kinds","match"],
 "properties":{"source":{"type":"string"},"kinds":{"type":"array","items":{"type":"string"}},
-"tool":{"type":"string"},"harness":{"type":"string"},"match":{"type":"array","items":{"type":"string"}}}}}}`
+"tool":{"type":"string"},"harness":{"type":"string"},"match":{"type":"array","items":{"type":"string"}}}},
+"out_of_reach":` + outOfReachSchema + `}}`
 
 type BuildReport struct {
 	Summary   string   `json:"summary"`
@@ -43,6 +44,8 @@ type BuildReport struct {
 	Lesson    string   `json:"lesson"`
 	Signal    Signal   `json:"signal"`
 	Installed string   `json:"installed,omitempty"`
+	// OutOfReach is the answer that the case's fix needs a path no change may touch, given instead of a change.
+	OutOfReach *OutOfReach `json:"out_of_reach,omitempty"`
 }
 
 func buildReport(raw []byte) (BuildReport, error) {
@@ -70,6 +73,9 @@ func buildReport(raw []byte) (BuildReport, error) {
 		if value, ok := fields[name]; !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
 			return report, errors.New("build report has a missing required field")
 		}
+	}
+	if report.OutOfReach != nil {
+		return outOfReachReport(report)
 	}
 	for _, text := range []string{report.Summary, report.Title, report.Body, report.Rollback, report.Window} {
 		if strings.TrimSpace(text) == "" {
@@ -699,6 +705,9 @@ func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Re
 	current, err := r.Store.CaseByID(ctx, c.ID)
 	if err != nil || current.Episode != run.CaseEpisode || current.Into != "" || current.Status != store.CaseTesting {
 		return stageFailureIn(ctx, res, "build authority", firstError(err, "case changed during the build"))
+	}
+	if report.OutOfReach != nil {
+		return r.outOfReach(ctx, c, run, res, p, *report.OutOfReach)
 	}
 	patch, err := r.patchUnit(ctx, run, p)
 	if err != nil {
