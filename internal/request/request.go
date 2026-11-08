@@ -88,14 +88,17 @@ type Request struct {
 	Opened   time.Time // zero when its opening is not in the store
 	Asks     []Ask     // his words, oldest first
 	LastTurn time.Time // his last turn, or the last turn that pasted its handoff
-	Threads  []Thread
-	Results  []Result // the artifacts, newest first
-	Report   *Result  // the agent's last reply: its claim
-	Checks   []store.RequestCheck
-	State    string
-	Why      string // what the state rests on
-	Open     string // the open step; empty when nothing records one
-	Last     time.Time
+	// LastOwnerTurn is his last ask: a turn he typed (not a brief that pasted the handoff, not a harness command
+	// such as /compact); only it reopens his check
+	LastOwnerTurn time.Time
+	Threads       []Thread
+	Results       []Result // the artifacts, newest first
+	Report        *Result  // the agent's last reply: its claim
+	Checks        []store.RequestCheck
+	State         string
+	Why           string // what the state rests on
+	Open          string // the open step; empty when nothing records one
+	Last          time.Time
 	// CutGone, CutUnread and CutUnmasked count its calls the store cut that were read as the store holds them:
 	// their transcript is gone, no reader of their harness is here, or what was read whole could not be masked
 	CutGone, CutUnread, CutUnmasked int
@@ -126,7 +129,7 @@ func (r *Request) Standing() (store.RequestCheck, bool, bool) {
 	for i := len(r.Checks) - 1; i >= 0; i-- {
 		if c := r.Checks[i]; c.Undone.IsZero() {
 			n := r.Newest()
-			return c, true, (n != nil && n.Key == c.Result || r.unreadable(c)) && !r.LastTurn.After(c.At)
+			return c, true, (n != nil && n.Key == c.Result || r.unreadable(c)) && !r.LastOwnerTurn.After(c.At)
 		}
 	}
 	return store.RequestCheck{}, false, false
@@ -318,6 +321,7 @@ type thread struct {
 	pending []pair // calls the store cut or joined, and Codex's, while the thread loads: read as it loads (readWhole)
 	// sessions are the Codex sessions its calls left running, each with its command, as its load reads them
 	sessions map[sessionKey]session
+	tools    bool   // its calls and results are read (loadTools)
 	lost     []lost // its calls whose record was not read whole
 	replies  []item
 	calls    map[string]store.Event // calls waiting for their results
@@ -503,8 +507,7 @@ func sortedKeys(m map[string]bool) []string {
 
 // load reads a thread, then follows its links.
 func (r *reader) load(ctx context.Context, id string) error {
-	t := &thread{id: id, agents: map[string]time.Time{}, calls: map[string]store.Event{}, done: map[string]bool{}, segs: []seg{{}},
-		sessions: map[sessionKey]session{}}
+	t := &thread{id: id, agents: map[string]time.Time{}, segs: []seg{{}}, sessions: map[sessionKey]session{}}
 	spans, err := r.st.ThreadSpans(ctx, id)
 	if err != nil {
 		return err
@@ -542,11 +545,12 @@ func (r *reader) load(ctx context.Context, id string) error {
 	if p := metaOf(pm).Parent; p != id {
 		t.parent = p
 	}
-	if err := r.st.ThreadEvents(ctx, id, read, func(e store.Event) error { t.add(e); return nil }); err != nil {
+	// its text alone: its calls and results are read only when a request a read returns holds it (loadTools)
+	text := read
+	text.Part = "text"
+	if err := r.st.ThreadEvents(ctx, id, text, func(e store.Event) error { t.add(e); return nil }); err != nil {
 		return err
 	}
-	t.calls, t.done = nil, nil
-	r.readWhole(ctx, t)
 	for _, tn := range t.turns {
 		if tn.marker != "" {
 			t.segs = append(t.segs, seg{at: tn.at, marker: tn.marker})
@@ -558,6 +562,24 @@ func (r *reader) load(ctx context.Context, id string) error {
 		}
 	}
 	return r.follow(ctx, t)
+}
+
+// loadTools reads a thread's calls and results, and reads whole what the store cut or joined of them: only for a
+// thread a request the read returns holds, so a list reads no tool event of a thread no request holds.
+func (r *reader) loadTools(ctx context.Context, t *thread) error {
+	if t == nil || t.tools || t.first.IsZero() {
+		return nil
+	}
+	t.tools = true
+	tools := read
+	tools.Part = "tools"
+	t.calls, t.done = map[string]store.Event{}, map[string]bool{}
+	if err := r.st.ThreadEvents(ctx, t.id, tools, func(e store.Event) error { t.add(e); return nil }); err != nil {
+		return err
+	}
+	t.calls, t.done = nil, nil
+	r.readWhole(ctx, t)
+	return nil
 }
 
 // follow enqueues the threads a thread's links reach.
@@ -771,7 +793,6 @@ func (r *reader) run(ctx context.Context) error {
 			return err
 		}
 	}
-	r.mask(ctx)
 	return nil
 }
 
@@ -797,6 +818,26 @@ func (r *reader) settle(ctx context.Context, since time.Time, match func(*Reques
 			}
 		}
 		if !start.Before(from) {
+			// the requests are known: their threads' calls and results are read now, and the requests built again
+			// with what those made (the threads' turns and links, which made the requests, do not change)
+			for _, rq := range out {
+				for _, th := range rq.Threads {
+					if err := r.loadTools(ctx, r.threads[th.ID]); err != nil {
+						return nil, err
+					}
+				}
+			}
+			r.mask(ctx)
+			ids := map[string]bool{}
+			for _, rq := range out {
+				ids[rq.ID] = true
+			}
+			out = out[:0]
+			for _, rq := range r.requests() {
+				if ids[rq.ID] {
+					out = append(out, rq)
+				}
+			}
 			for _, rq := range out {
 				fold(rq)
 			}

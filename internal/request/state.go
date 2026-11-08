@@ -61,7 +61,7 @@ func state(rq *Request) {
 	case latest.Phase == "" && !tracked[latest.Harness]:
 		rq.State, rq.Why = Unknown, "no sessions run reads "+latest.Harness+" sessions, so whether it still runs is not known"
 	case latest.Phase == "":
-		rq.State, rq.Why = Unknown, "no sessions run recorded the latest session's phase, so whether it still runs is not known"
+		rq.State, rq.Why = Unknown, "no sessions run recorded the latest session's phase since the request began, so whether it still runs is not known"
 	case !latest.Trusted:
 		rq.State, rq.Why = Unknown, "the latest session's last recorded phase is from before the last turn in it, so whether it still runs is not known"
 	case after:
@@ -71,7 +71,7 @@ func state(rq *Request) {
 	}
 	if (rq.State == Ready || rq.State == Open) && standing && !holds {
 		by := "a newer result"
-		if rq.LastTurn.After(c.At) {
+		if rq.LastOwnerTurn.After(c.At) {
 			by = "a turn of the owner's after it"
 		}
 		rq.Why += "; the check of " + c.At.Local().Format(timeFormat) + " is reopened by " + by
@@ -88,7 +88,7 @@ func state(rq *Request) {
 		}
 	case !after && !rq.LastTurn.IsZero():
 		for i := len(rq.Asks) - 1; i >= 0; i-- {
-			if a := rq.Asks[i]; !a.At.After(rq.LastTurn) {
+			if a := rq.Asks[i]; !a.At.After(rq.LastTurn) && !slashCommand(a.Words) { // a harness command is no ask
 				if a.Words != "" {
 					rq.Open = "the last turn has no reply recorded: " + a.Words
 				} else {
@@ -254,7 +254,7 @@ func Check(ctx context.Context, st *store.Store, rq *Request, at time.Time) (Che
 	}
 	var err error
 	// a check from before his last turn no longer holds it, though it names the same result
-	out.Added, err = st.CheckOnceSince(ctx, store.RequestCheck{Request: rq.ID, Result: n.Key, At: at, ResultAt: n.At}, rq.CheckIDs(), rq.LastTurn)
+	out.Added, err = st.CheckOnceSince(ctx, store.RequestCheck{Request: rq.ID, Result: n.Key, At: at, ResultAt: n.At}, rq.CheckIDs(), rq.LastOwnerTurn)
 	return out, err
 }
 

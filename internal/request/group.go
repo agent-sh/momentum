@@ -2,6 +2,7 @@ package request
 
 import (
 	"context"
+	"encoding/json"
 	"sort"
 	"strconv"
 	"strings"
@@ -231,6 +232,9 @@ func fill(u sets, reqs map[string]*Request, t *thread) {
 		if tn.at.After(rq.LastTurn) {
 			rq.LastTurn = tn.at
 		}
+		if tn.owner && !tn.program && !slashCommand(tn.words) && tn.at.After(rq.LastOwnerTurn) {
+			rq.LastOwnerTurn = tn.at // his own ask: what reopens his check
+		}
 		if th := thread(rq); th != nil && tn.at.After(th.turn) {
 			th.turn = tn.at
 		}
@@ -272,6 +276,24 @@ func fill(u sets, reqs map[string]*Request, t *thread) {
 			rq.Report = &rp
 		}
 	}
+}
+
+// harnessCommands are the harnesses' own commands an owner types to drive the session, not to ask for work.
+var harnessCommands = map[string]bool{"compact": true, "model": true, "exit": true, "quit": true, "login": true, "logout": true,
+	"clear": true, "resume": true, "cost": true, "status": true, "config": true, "help": true, "memory": true, "permissions": true,
+	"doctor": true, "vim": true, "theme": true, "mcp": true, "hooks": true, "ide": true, "export": true, "context": true, "usage": true,
+	"fast": true, "effort": true, "statusline": true, "upgrade": true, "approvals": true, "new": true}
+
+// slashCommand reports a turn that is a harness command (/compact, /model sonnet, /exit), not an ask: a path
+// (/home/...) is none.
+func slashCommand(words string) bool {
+	w := strings.TrimSpace(words)
+	if !strings.HasPrefix(w, "/") {
+		return false
+	}
+	name, _, _ := strings.Cut(w[1:], " ")
+	name, _, _ = strings.Cut(name, "\n")
+	return harnessCommands[strings.ToLower(name)]
 }
 
 // fold orders what a request holds: a turn a fork carried over counts once, a result once by its key, a file once,
@@ -340,27 +362,47 @@ func (r *reader) finish(ctx context.Context, reqs []*Request) error {
 			}
 		}
 	}
-	// Each thread's newest phase, whenever it was seen: what a read finds does not depend on where it began. A
+	// Each thread's newest phase since its request began: one from before says nothing of what came after a turn
+	// of it, so the read is bounded by the oldest request's start and each request takes only what came since its
+	// own, and what a read finds of a request does not depend on what else it holds. A
 	// session still in that phase was last seen in it when its stamp says (the runs that see no change write no
-	// event).
+	// event); a live session whose phase began before the bound has its stamp stand for its newest event.
 	phases := map[string]store.Event{}
 	var stamps stamp.Stamps
 	if current {
-		evs, err := r.st.PhasesSince(ctx, time.Time{})
+		var bound time.Time
+		for i, rq := range reqs {
+			if s := rq.start(); i == 0 || s.Before(bound) {
+				bound = s
+			}
+		}
+		evs, err := r.st.PhasesSince(ctx, bound)
 		if err != nil {
 			return err
 		}
-		phases = phasesBySession(evs)
 		if stamps, err = r.st.SessionStamps(ctx); err != nil {
 			return err
 		}
+		seen := map[string]bool{}
+		for _, e := range evs {
+			seen[e.Session] = true
+		}
+		var older []store.Event
+		for key, sp := range stamps {
+			if !seen[key] && sp.Since.Before(bound) {
+				meta, _ := json.Marshal(map[string]string{"to": string(sp.Phase), "ask": sp.Ask, "ask_kind": string(sp.AskKind)})
+				older = append(older, store.Event{Source: store.Sessions, SourceKey: key, TS: sp.Since, Session: key, Harness: sp.Tool,
+					Kind: "phase", Meta: string(meta)})
+			}
+		}
+		phases = phasesBySession(append(older, evs...))
 	}
 	for _, rq := range reqs {
 		for i := range rq.Threads {
 			th := &rq.Threads[i]
 			e, ok := phases[th.ID]
-			if !ok {
-				continue
+			if _, live := stamps[e.Session]; !ok || e.TS.Before(rq.start()) && !live {
+				continue // none since the request began: every read of it, whatever else it holds, finds the same
 			}
 			m := metaOf(e.Meta)
 			seen := e.TS

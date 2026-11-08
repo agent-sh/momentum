@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -23,15 +24,74 @@ type fixture struct {
 	st  *store.Store
 	n   int
 	evs []store.Event
+	dir string // the transcripts a fixture's calls are recorded in
 }
 
 func newFixture(t *testing.T) *fixture {
-	st, err := store.Open(filepath.Join(t.TempDir(), "momentum.db"))
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "momentum.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	return &fixture{t: t, st: st}
+	return &fixture{t: t, st: st, dir: dir}
+}
+
+// record appends a record to a session's transcript of a harness's shape and returns its reference, as the
+// transcripts source keeps it (path@offset#index).
+func (f *fixture) record(name, line string) string {
+	f.t.Helper()
+	path := filepath.Join(f.dir, name)
+	fh, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	defer fh.Close()
+	st, err := fh.Stat()
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	if _, err := fh.WriteString(line + "\n"); err != nil {
+		f.t.Fatal(err)
+	}
+	return fmt.Sprintf("%s@%d#0", path, st.Size())
+}
+
+// jsonInput is a call's input as a record holds it: its JSON, or a JSON string of a text that is none.
+func jsonInput(s string) string {
+	if json.Valid([]byte(s)) {
+		return s
+	}
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// recorded records a call and its result in a transcript of the harness's shape (Claude Code's, or a Codex
+// rollout), and keeps them as the store does: an output with its lines joined and both cut at 240 bytes, each with
+// its record's place, so a request reads them whole. An input or output that already ends with the store's cut
+// stands for a call whose transcript is gone: it is kept as given, with no record.
+func (f *fixture) recorded(session, harness, tool, id, input, output string, failed bool) (string, string, string, string) {
+	if strings.HasSuffix(input, "…") || strings.HasSuffix(output, "…") || harness == "hermes" {
+		return input, lined(output), "", ""
+	}
+	var callRef, resRef string
+	switch harness {
+	case "codex":
+		name := "rollout-2026-11-07T10-00-00-" + session + ".jsonl"
+		if tool == "exec" {
+			callRef = f.record(name, `{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":`+jsonString(input)+`,"call_id":`+jsonString(id)+`}}`)
+			resRef = f.record(name, `{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":`+jsonString(id)+`,"output":`+jsonString(output)+`}}`)
+		} else {
+			callRef = f.record(name, `{"type":"response_item","payload":{"type":"function_call","name":`+jsonString(tool)+`,"arguments":`+jsonString(input)+`,"call_id":`+jsonString(id)+`}}`)
+			resRef = f.record(name, `{"type":"response_item","payload":{"type":"function_call_output","call_id":`+jsonString(id)+`,"output":`+jsonString(output)+`}}`)
+		}
+	default:
+		name := session + ".jsonl"
+		callRef = f.record(name, `{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":`+jsonString(id)+`,"name":`+jsonString(tool)+`,"input":`+jsonInput(input)+`}]}}`)
+		resRef = f.record(name, fmt.Sprintf(`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":%s,"content":%s,"is_error":%v}]}}`,
+			jsonString(id), jsonString(output), failed))
+	}
+	return storedCut(input), storedCut(output), callRef, resRef
 }
 
 func metaJSON(kv map[string]any) string {
@@ -63,14 +123,15 @@ func (f *fixture) reply(session string, ts time.Time, text string) store.Event {
 func (f *fixture) tool(session, agent, tool string, ts time.Time, input, output string, failed bool) {
 	f.n++
 	id := fmt.Sprintf("call-%d", f.n)
-	f.event(session, agent, "tool_call", store.ActorAgent, ts, input, map[string]any{"tool_id": id})
-	f.evs[len(f.evs)-1].Tool = tool
+	in, out, callRef, resRef := f.recorded(session, "claude", tool, id, input, output, failed)
+	f.event(session, agent, "tool_call", store.ActorAgent, ts, in, map[string]any{"tool_id": id})
+	f.evs[len(f.evs)-1].Tool, f.evs[len(f.evs)-1].Ref = tool, callRef
 	m := map[string]any{"tool_id": id}
 	if failed {
 		m["is_error"] = true
 	}
-	f.event(session, agent, "tool_result", store.ActorTool, ts.Add(time.Second), lined(output), m)
-	f.evs[len(f.evs)-1].Tool = tool
+	f.event(session, agent, "tool_result", store.ActorTool, ts.Add(time.Second), out, m)
+	f.evs[len(f.evs)-1].Tool, f.evs[len(f.evs)-1].Ref = tool, resRef
 }
 
 // lined is a tool's output as it printed it, with its lines: a fixture's one-line text ends its line, as a

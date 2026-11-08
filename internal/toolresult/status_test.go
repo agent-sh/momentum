@@ -67,3 +67,27 @@ func TestCancelledAndPatchRefusalsAreRead(t *testing.T) {
 		t.Error("an exit of 0 with words in its output was a failure")
 	}
 }
+
+// A result wrapper that parses is read by its top-level fields alone; one the store cut is read by the same marks,
+// in its top level only.
+func TestAnEnvelopeIsReadByItsTopLevel(t *testing.T) {
+	for _, c := range []struct {
+		text   string
+		failed bool
+	}{
+		// Hermes's write_file wrote and verified the file; its lint, nested, found an error
+		{`{"bytes_written": 120, "verified": true, "lint": {"status": "error", "output": "SyntaxError"}, "resolved_path": "/work/a.py"}`, false},
+		{`{"success": false, "error": "Could not find a match"}`, true},
+		{`{"output": "done", "exit_code": 1, "error": null}`, true},
+		{`{"output": "done", "exit_code": 0, "error": null}`, false},
+		{`{"error": {"code": -32603, "message": "permission denied"}}`, true},
+		// cut: a nested object's marks are passed over, the top level's read
+		{`{"bytes_written": 120, "lint": {"status": "error", "output": "SyntaxErr…`, false},
+		{`{"success": false, "error": "Could not find a match for old_str…`, true},
+		{`{"output": "a { brace", "exit_code": 2, "out…`, true},
+	} {
+		if got := EnvelopeFailed(c.text); got != c.failed {
+			t.Errorf("%s: got %v, want %v", c.text, got, c.failed)
+		}
+	}
+}

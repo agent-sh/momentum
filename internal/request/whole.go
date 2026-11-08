@@ -260,11 +260,17 @@ func storeCut(call, res store.Event) bool {
 // its lines.
 func storeJoined(call, res store.Event) bool {
 	tool := strings.ToLower(call.Tool)
-	if writers[tool] || !toolresult.IsShell(tool) || call.Harness == "hermes" || call.Harness == "codex" && tool == "exec" {
+	if writers[tool] || !toolresult.IsShell(tool) || call.Harness == "hermes" {
 		return false
+	}
+	if call.Harness == "codex" && tool == "exec" && chunkKeyRe.MatchString(res.Summary) {
+		return false // a code-mode script's results are JSON, their lines kept; a printed output text is not
 	}
 	return !strings.Contains(res.Summary, "\n") && resultMarkRe.MatchString(res.Summary)
 }
+
+// chunkKeyRe is a code-mode result's output field.
+var chunkKeyRe = regexp.MustCompile(`"(?:output|stdout|stderr)"\s*:`)
 
 // resultMarkRe is what an output that shows an artifact's line holds: a commit line's "] ", a ref update's " -> ",
 // a pull request's "/pull/" (the store's read selects the shells' results by the same marks).

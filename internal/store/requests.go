@@ -244,6 +244,9 @@ type ThreadRead struct {
 	CallMarks, ResultMarks []string
 	YieldTools, YieldMarks []string
 	CutMark                string // when set, also the shells' calls and results whose text ends with it: the store cut them
+	// Part is what of it a read takes: "text" the main thread's text alone, "tools" the calls and results alone,
+	// "" both
+	Part string
 }
 
 // ThreadEvents passes a session's transcript events that read selects, its subagents' among them, oldest first,
@@ -279,6 +282,13 @@ func (s *Store) ThreadEvents(ctx context.Context, session string, read ThreadRea
 	if len(read.YieldMarks) > 0 {
 		yieldMarks = "(" + strings.TrimSuffix(strings.Repeat("instr(summary, ?) > 0 OR ", len(read.YieldMarks)), " OR ") + ")"
 	}
+	textPart, toolPart := "1", "1"
+	switch read.Part {
+	case "text":
+		toolPart = "0"
+	case "tools":
+		textPart = "0"
+	}
 	const toolID = `CASE WHEN json_valid(meta) THEN json_extract(meta, '$.tool_id') END`
 	shellCall := `kind = 'tool_call' AND lower(tool) IN ` + in(read.Shells) + ` AND ` + marks
 	var args []any
@@ -294,12 +304,13 @@ func (s *Store) ThreadEvents(ctx context.Context, session string, read ThreadRea
 	    WHERE session = ? AND source = ? AND kind = 'tool_result' AND lower(tool) IN `+in(read.YieldTools)+` AND `+yieldMarks+`)
 	  SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
 	  tool, summary, meta, ref, heuristic, experiment FROM events INDEXED BY events_session WHERE session = ? AND source = ? AND (
-	    (kind IN ('owner_text', 'agent_text') AND (agent = '' OR agent = session))
-	    OR (kind IN ('tool_call', 'tool_result') AND lower(tool) IN `+in(read.Writers)+`)
-	    OR (`+shellCall+`)
-	    OR (kind = 'tool_call' AND lower(tool) IN `+in(read.YieldTools)+` AND `+toolID+` IN (SELECT id FROM yields))
-	    OR (kind = 'tool_result' AND lower(tool) IN `+in(read.Shells)+` AND `+resultMarks+`
-	      AND (`+toolID+` IN (SELECT id FROM calls) OR `+toolID+` IN (SELECT id FROM yields))))
+	    (`+textPart+` AND kind IN ('owner_text', 'agent_text') AND (agent = '' OR agent = session))
+	    OR (`+toolPart+` AND (
+	      (kind IN ('tool_call', 'tool_result') AND lower(tool) IN `+in(read.Writers)+`)
+	      OR (`+shellCall+`)
+	      OR (kind = 'tool_call' AND lower(tool) IN `+in(read.YieldTools)+` AND `+toolID+` IN (SELECT id FROM yields))
+	      OR (kind = 'tool_result' AND lower(tool) IN `+in(read.Shells)+` AND `+resultMarks+`
+	        AND (`+toolID+` IN (SELECT id FROM calls) OR `+toolID+` IN (SELECT id FROM yields))))))
 	  ORDER BY ts, source_key`, args...)
 	if err != nil {
 		return err

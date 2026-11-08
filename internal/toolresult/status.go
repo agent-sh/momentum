@@ -103,38 +103,87 @@ func WriteFailed(text string, flagged bool) bool {
 	return flagged || Cancelled(text) || strings.HasPrefix(text, "<tool_use_error>") || refusal.MatchString(text) || EnvelopeFailed(text)
 }
 
-// EnvelopeFailed reads a known native result wrapper, not file or tool content.
+// EnvelopeFailed reads a known native result wrapper, not file or tool content. A wrapper that parses is read by
+// its top-level fields alone (a nested lint's "status": "error" is no failure of the call); one the store cut is
+// read by the same marks, in its top level only, with its nested objects and arrays passed over.
 func EnvelopeFailed(text string) bool {
-	if strings.HasPrefix(text, "{") {
-		var obj map[string]json.RawMessage
-		if json.Unmarshal([]byte(text), &obj) == nil {
-			for _, key := range []string{"is_error", "isError"} {
-				if string(obj[key]) == "true" {
-					return true
-				}
-			}
-			for _, key := range []string{"error", "errors"} {
-				v := string(obj[key])
-				if v != "" && v != "null" && v != `""` && v != "[]" && v != "{}" && v != "false" {
-					return true
-				}
-			}
-			if string(obj["status"]) == `"error"` || string(obj["status"]) == `"failed"` {
-				return true
-			}
-			if string(obj["success"]) == "false" || string(obj["ok"]) == "false" {
-				return true
-			}
+	if !strings.HasPrefix(text, "{") {
+		return false
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal([]byte(text), &obj) == nil {
+		return fieldsFailed(obj)
+	}
+	// A store summary can end before the JSON does.
+	top := topLevel(text)
+	if m := jsonExit.FindStringSubmatch(top); m != nil {
+		return m[1] != "0"
+	}
+	return jsonStatus.MatchString(top) || jsonFlag.MatchString(top) || jsonError.MatchString(top)
+}
+
+// fieldsFailed reads a parsed wrapper's top-level fields: an error flag, an error, a failed status, success or ok
+// false, a non-zero exit code.
+func fieldsFailed(obj map[string]json.RawMessage) bool {
+	for _, key := range []string{"is_error", "isError"} {
+		if string(obj[key]) == "true" {
+			return true
 		}
-		// A store summary can end before the JSON does.
-		if m := jsonExit.FindStringSubmatch(text); m != nil {
-			return m[1] != "0"
+	}
+	for _, key := range []string{"error", "errors"} {
+		v := string(obj[key])
+		if v != "" && v != "null" && v != `""` && v != "[]" && v != "{}" && v != "false" {
+			return true
 		}
-		if jsonStatus.MatchString(text) || jsonFlag.MatchString(text) || jsonError.MatchString(text) {
+	}
+	if string(obj["status"]) == `"error"` || string(obj["status"]) == `"failed"` {
+		return true
+	}
+	if string(obj["success"]) == "false" || string(obj["ok"]) == "false" {
+		return true
+	}
+	for _, key := range []string{"exit_code", "exitCode"} {
+		if v := string(obj[key]); v != "" && v != "0" && v != "null" {
 			return true
 		}
 	}
 	return false
+}
+
+// topLevel is a JSON object's text with what its nested objects and arrays hold left out: its own keys and
+// values, the strings read whole (a brace inside a string is no nesting).
+func topLevel(text string) string {
+	var b strings.Builder
+	depth, inString, escaped := 0, false, false
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		switch {
+		case inString:
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inString = false
+			}
+		case c == '"':
+			inString = true
+		case c == '{' || c == '[':
+			depth++
+			if depth > 1 {
+				continue
+			}
+		case c == '}' || c == ']':
+			depth--
+			if depth > 0 {
+				continue
+			}
+		}
+		if depth <= 1 {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 func IsShell(tool string) bool {

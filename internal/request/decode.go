@@ -39,6 +39,9 @@ type Chunk struct {
 	// Promise.all array ("i"), or the session a poll named ("id"); -1 when none
 	Index  int
 	Polled int64
+	// Plain is a command whose output text the script printed (text(r.output)), not its result: no exit code
+	// shows with it, so only its commit lines are read
+	Plain bool
 }
 
 // codeCall is a tool call of a code-mode script: an exec_command with its command, or a write_stdin with the
@@ -53,12 +56,55 @@ type codeCall struct {
 }
 
 var (
-	codeCallRe    = regexp.MustCompile(`(?:\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?)?\btools\.(exec_command|write_stdin)\(`)
+	codeCallRe    = regexp.MustCompile(`(?:\b(?:(?:const|let|var)\s+)?([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?)?\btools\.(exec_command|write_stdin)\(`)
 	pollSessionRe = regexp.MustCompile(`["']?session_id["']?\s*:\s*(?:(\d+)|([A-Za-z_$][\w$]*)\.session_id)`)
 	// a Codex command's plain result: still running in a session, or done with an exit code
 	runningRe = regexp.MustCompile(`Process running with session ID (\d+)`)
 	exitedRe  = regexp.MustCompile(`Process exited with code (-?\d+)`)
 )
+
+// plainPrintRe is a script's text() of a call's output text: text(r.output).
+var plainPrintRe = regexp.MustCompile(`\btext\(\s*([A-Za-z_$][\w$]*)\.output\s*\)`)
+
+// plainPrint is the one exec_command whose output text a script printed (text(r.output)), when the script printed
+// no result but that text: its index among the script's exec_command calls. The text must be of one variable, which
+// one exec_command set and nothing else did, so the printed lines are that command's alone.
+func plainPrint(script string, calls []codeCall, prints []int, chunks []Chunk) (int, bool) {
+	if len(prints) > 0 || len(chunks) > 0 {
+		return 0, false
+	}
+	ms := plainPrintRe.FindAllStringSubmatch(script, -1)
+	if len(ms) == 0 {
+		return 0, false
+	}
+	name := ms[0][1]
+	for _, m := range ms[1:] {
+		if m[1] != name {
+			return 0, false // two commands' output texts: which line is whose is not known
+		}
+	}
+	k, n, exec := 0, 0, 0
+	for _, c := range calls {
+		if !c.exec {
+			return 0, false
+		}
+		if c.assign == name {
+			k, n = exec, n+1
+		}
+		exec++
+	}
+	return k, n == 1
+}
+
+// printedText is what a code-mode script printed: its output after the "Output:" header, less the last token of a
+// text the store cut.
+func printedText(output string) string {
+	text := uncut(output, strings.HasSuffix(output, "…"))
+	if i := strings.Index(text, "Output:"); i >= 0 {
+		text = text[i+len("Output:"):]
+	}
+	return text
+}
 
 // printRe is a script's text() of a call's result: inline (text(await tools.X(...))) or by the variable the
 // result was set to (text(r)).
@@ -279,6 +325,11 @@ func Decode(harness, tool, input, output string) Decoded {
 		// a script that failed or still runs printed the results it reached
 		stopped := strings.HasPrefix(strings.TrimSpace(output), "Script failed") || strings.HasPrefix(strings.TrimSpace(output), "Script running")
 		d.Chunks, d.Polls, d.Unpaired = pairCode(chunks, calls, prints, parallel, stopped, arrayAt)
+		if k, ok := plainPrint(input, calls, prints, chunks); ok && !d.Unpaired && !parallel {
+			// the script printed its one command's output text, not its result: that text's lines are the command's
+			d.Chunks[k].Output, d.Chunks[k].Plain = printedText(output), true
+			d.Output = d.Chunks[k].Output
+		}
 	case harness == "codex" && tool == "write_stdin":
 		// Codex's write_stdin tool polls a session an earlier exec_command left running
 		d.Output = uncut(output, strings.HasSuffix(output, "…"))

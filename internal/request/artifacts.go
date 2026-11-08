@@ -122,7 +122,11 @@ func artifactsOf(call, res store.Event, d Decoded, mk makes, sessions map[sessio
 	case d.Joined || d.Unpaired:
 	case d.Chunks != nil || d.Polls != nil:
 		for _, c := range d.Chunks {
-			for _, r := range shown(c.Output, failed || c.Failed, made(Decoded{Commands: []string{c.Command}, CommandCut: c.Cut}), once) {
+			mk := made(Decoded{Commands: []string{c.Command}, CommandCut: c.Cut})
+			if c.Plain {
+				mk.pushes, mk.prs = false, false // no exit code shows: only a commit line, which git prints when it made it
+			}
+			for _, r := range shown(c.Output, failed || c.Failed, mk, once) {
 				add(r)
 			}
 		}

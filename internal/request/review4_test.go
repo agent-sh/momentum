@@ -66,10 +66,13 @@ func TestAPlainOutputIsNotDecodedAsJSON(t *testing.T) {
 // pairWithID adds a call and its result with a given tool id, as a harness that records the same call again later
 // (Hermes re-recording a call, a Codex subagent forked with its parent's context) stores them.
 func (f *fixture) pairWithID(session, agent, harness, tool, id string, ts time.Time, input, output string) {
-	f.event(session, agent, "tool_call", store.ActorAgent, ts, input, map[string]any{"tool_id": id})
-	f.evs[len(f.evs)-1].Tool, f.evs[len(f.evs)-1].Harness = tool, harness
-	f.event(session, agent, "tool_result", store.ActorTool, ts.Add(time.Second), lined(output), map[string]any{"tool_id": id})
-	f.evs[len(f.evs)-1].Tool, f.evs[len(f.evs)-1].Harness = tool, harness
+	in, out, callRef, resRef := f.recorded(session, harness, tool, id, input, output, false)
+	f.event(session, agent, "tool_call", store.ActorAgent, ts, in, map[string]any{"tool_id": id})
+	e := &f.evs[len(f.evs)-1]
+	e.Tool, e.Harness, e.Ref = tool, harness, callRef
+	f.event(session, agent, "tool_result", store.ActorTool, ts.Add(time.Second), out, map[string]any{"tool_id": id})
+	e = &f.evs[len(f.evs)-1]
+	e.Tool, e.Harness, e.Ref = tool, harness, resRef
 }
 
 // A call is one by its session and tool id: the same call recorded again later, with a new time, made nothing more,
