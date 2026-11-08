@@ -7,6 +7,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -23,15 +24,10 @@ func (r *Runner) heldBuild(ctx context.Context, repo string) (why string, known 
 	if len(g.Owners) == 0 {
 		return "builds are off (loop.owners is empty): report only", true
 	}
-	source := r.readDirSource(repo)
-	if source == "" {
+	if r.readDirSource(repo) == "" {
 		return "the investigation's repository " + repo + " is not a loop.read_dirs repository: report only", true
 	}
-	resolve := g.Resolve
-	if resolve == nil {
-		resolve = RepoOf
-	}
-	full, err := resolve(ctx, source)
+	full, err := r.repoIdentity(ctx, repo)
 	if errors.Is(err, ErrRefused) { // an origin the loop may not push to stays so until someone changes it
 		return err.Error(), true
 	} else if err != nil {
@@ -44,6 +40,16 @@ func (r *Runner) heldBuild(ctx context.Context, repo string) (why string, known 
 		return err.Error(), true
 	}
 	return "", true
+}
+
+// repoIdentity is the repository a loop.read_dirs checkout's origin names (OWNER/REPO), as the gate's resolver reads it:
+// no scope check, busy check or network call.
+func (r *Runner) repoIdentity(ctx context.Context, repo string) (string, error) {
+	resolve := r.Ship.Gate.Resolve
+	if resolve == nil {
+		resolve = RepoOf
+	}
+	return resolve(ctx, r.readDirSource(repo))
 }
 
 // readDirSource maps a repository name to its loop.read_dirs checkout, named as the snapshot names it.
@@ -103,7 +109,7 @@ func (r *Runner) markHold(ctx context.Context, c store.Case, why string, waiting
 	}
 	clean = plainClip(store.CaseNoteText(clean), holdReasonMax) // the held line's record fits a case log line
 	if clean == current {
-		return nil
+		return r.raiseHold(ctx, c, clean)
 	}
 	// the notes come first: a held line written stands as the hold, so its note must already be there
 	if err := r.doneHoldNotes(ctx, c.ID); err != nil { // a changed reason's old note goes with it
@@ -119,6 +125,24 @@ func (r *Runner) markHold(ctx context.Context, c store.Case, why string, waiting
 		return err
 	}
 	return r.Store.CaseNote(cleanedNote(ctx), c.ID, store.ActionHeld, store.HoldDetail(clean, c.Episode), "loop")
+}
+
+// raiseHold raises the note of a hold for a package of another place (unfinishedHold) once it has lasted configRaise,
+// counting from the hold's first note, as noteBaseHold raises a base's: a standing low note is raised, and one its
+// reader resolved low is put back raised, once; one resolved at normal importance stays resolved while the hold lasts.
+func (r *Runner) raiseHold(ctx context.Context, c store.Case, why string) error {
+	if !strings.HasPrefix(why, unfinishedPrefix) {
+		return nil
+	}
+	sum := sha256.Sum256([]byte(why))
+	n, ok, err := r.Store.Note(ctx, holdNotePrefix(c.ID)+hex.EncodeToString(sum[:]))
+	if err != nil || !ok || r.now().Sub(n.At) < configRaise || n.Importance >= store.ImportanceNormal {
+		return err
+	}
+	n.Importance, n.Done = store.ImportanceNormal, time.Time{}
+	n.Title = "The loop's build for case " + c.ID + " has been held a week"
+	_, err = r.Store.PutNote(ctx, n)
+	return err
 }
 
 // doneHoldNotes resolves the standing hold notes of a case.

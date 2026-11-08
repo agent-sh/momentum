@@ -130,12 +130,137 @@ type recordError struct{ err error }
 func (e recordError) Error() string { return e.err.Error() }
 func (e recordError) Unwrap() error { return e.err }
 
-// caseRepo is the repository the case's investigation named in its episode, "" for none. A record of it that cannot
-// be read is a recordError.
-func (r *Runner) caseRepo(ctx context.Context, c store.Case) (string, error) {
+// prepareBuild readies a case's package for a build of kind at source (a repository's checkout, or a configuration
+// file's name): it prepares a new one when the case has none or its package ended (mayPrepare), keeps working one of
+// the same target, and holds while one of another target has not ended. The build paths and nothing else decide it
+// here.
+//
+// A repository's place is its identity, as the gate resolves the source (a worktree or a subdirectory of a checkout is
+// its repository's), which prepareBuild returns.
+func (s *Ship) prepareBuild(ctx context.Context, c store.Case, kind, source string, tip *repoTip, copied string) (Package, string, error) {
+	p, had, err := s.Load(c.ID)
+	if err != nil {
+		return p, "", err
+	}
+	place := source
+	if kind == KindRepo {
+		t, err := s.Gate.Repository(ctx, source)
+		if err != nil {
+			return p, "", err
+		}
+		place = t.Repo
+		if had && !ended(p) && p.Kind == KindRepo && t.Dir == p.Dir && !strings.EqualFold(t.Repo, p.Repo) {
+			// the same checkout, which the gate now names as another repository: no new package rests on that
+			return p, place, refused("the case's repository changed after preparation")
+		}
+	}
+	if prepare, err := mayPrepare(c, p, had, kind, place, false); err != nil || !prepare {
+		return p, place, err
+	}
+	if kind == KindConfig {
+		p, err = s.PrepareConfig(ctx, c.ID, source, copied)
+	} else {
+		p, err = s.prepare(ctx, c.ID, source, tip, false)
+	}
+	return p, place, err
+}
+
+// wrote is a crash point after a write of a package's lifecycle transition: a test's Crash hook may stop the step
+// there, as a crash would.
+func (s *Ship) wrote(point string) error {
+	if s.Crash == nil {
+		return nil
+	}
+	return s.Crash(point)
+}
+
+// unfinished says a package has not reached a proposal a person or a merge ends: prepared, checked or revising, or a
+// configuration proposal, which its case's close ends.
+func unfinished(p Package) bool {
+	return p.State == Prepared || p.State == Checked || p.State == Revising || p.Kind == KindConfig && p.State == Proposed
+}
+
+// ended says a package's change has ended (rolled back, kept, or withdrawn): a new package may take its place, and
+// archives it. A package that has not ended is never replaced.
+func ended(p Package) bool {
+	return p.State == RolledBack || p.State == Kept || p.State == Withdrawn
+}
+
+// samePlace says a package works on kind at place: a repository's identity, or a configuration file's name.
+func samePlace(p Package, kind, place string) bool {
+	if p.Kind != kind {
+		return false
+	}
+	if kind == KindConfig {
+		return p.Target == place
+	}
+	return strings.EqualFold(p.Repo, place)
+}
+
+// mayPrepare says whether a case's package (old, had) lets a new package of kind at place be prepared: there is none,
+// or it ended. A package that has not ended is never replaced: one of the same place keeps working (a comeback
+// continues it, as the build of the same episode does; the owner's prepare refuses, as there is one), and one of
+// another place holds the case until it ends (unfinishedHold).
+func mayPrepare(c store.Case, old Package, had bool, kind, place string, owner bool) (bool, error) {
+	switch {
+	case !had:
+		return true, nil
+	case old.State == Withdrawn && old.PR != "":
+		return false, refused("case %s's hand landing withdrawal is not finished yet: the next selection finishes it", c.ID)
+	case ended(old):
+		return true, nil
+	case old.State == Landing || old.State == Landed:
+		return false, refused("case %s's change for %s is %s: its measurement ends it, or momentum ship rollback %s", c.ID, placeName(old), old.State, c.ID)
+	case !samePlace(old, kind, place):
+		return false, &shipHold{err: refused("%s", unfinishedHold(c, old, kind, place))}
+	case owner:
+		return false, refused("case %s has a package already (in %s)", c.ID, old.State)
+	}
+	return false, nil
+}
+
+// placeName is a package's place as a person names it: a repository, or a configuration file under the home.
+func placeName(p Package) string {
+	if p.Kind == KindConfig {
+		return "~/" + p.Target
+	}
+	return p.Repo
+}
+
+// unfinishedPrefix begins the reason of a hold for a package of another place than the case's fix (unfinishedHold),
+// whose note a week raises (raiseHold).
+const unfinishedPrefix = "its unfinished change for "
+
+// unfinishedHold is why a case whose package has not ended waits while its investigation names another place (kind,
+// place): a static reason, which reads nothing, and names only what ends the package in its state. A repository's
+// change ends with its owner's withdrawal (ship withdraw, once no pull request of it is open), with a person's merge of
+// a hand landing's request, or with ship land for a proposal reviewed clean; a configuration proposal ends with its
+// case's close, or the owner's withdrawal. The next pass then prepares the fix in place.
+func unfinishedHold(c store.Case, old Package, kind, place string) string {
+	next := place
+	if kind == KindConfig {
+		next = "~/" + place
+	}
+	if old.Kind == KindConfig {
+		return fmt.Sprintf("%s%s must end first, before its fix in %s: momentum ship withdraw --case %s withdraws it, and the next pass "+
+			"prepares the fix; or momentum case close %s closes the case and withdraws it", unfinishedPrefix, placeName(old), next, c.ID, c.ID)
+	}
+	ends := fmt.Sprintf("momentum ship withdraw --case %s withdraws it once no pull request of it is open, and the next pass prepares the fix", c.ID)
+	switch {
+	case len(old.Hand) > 0 && old.PR != "":
+		ends += "; or a person lands its pull request by hand, which the next pass records, and its measurement decides the case"
+	case old.State == Proposed && old.Clean():
+		ends += fmt.Sprintf("; or momentum ship land %s lands it, and its measurement decides the case", c.ID)
+	}
+	return fmt.Sprintf("%s%s must end first, before its fix in %s: %s", unfinishedPrefix, placeName(old), next, ends)
+}
+
+// caseTarget is where the investigation of the case's episode put its fix: a repository's name, or a configuration
+// file's home-relative path.
+func (r *Runner) caseTarget(ctx context.Context, c store.Case) (string, string, error) {
 	entries, err := r.Store.CaseLog(ctx, c.ID)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	for i := len(entries) - 1; i >= 0; i-- {
 		if entries[i].Action != repoAction {
@@ -143,36 +268,45 @@ func (r *Runner) caseRepo(ctx context.Context, c store.Case) (string, error) {
 		}
 		var record struct {
 			Repo    string `json:"repo"`
+			Config  string `json:"config"`
 			Episode int64  `json:"episode"`
 		}
 		if err := json.Unmarshal([]byte(entries[i].Detail), &record); err != nil {
-			return "", recordError{err}
+			return "", "", recordError{err}
 		}
 		if record.Episode != c.Episode {
-			return "", nil
+			return "", "", nil
 		}
 		if record.Repo != "" && !repoName.MatchString(record.Repo) {
-			return "", recordError{errors.New("invalid investigation repository name")}
+			return "", "", recordError{errors.New("invalid investigation repository name")}
 		}
-		return record.Repo, nil
+		if record.Config != "" {
+			if _, err := configTargetName(record.Config); err != nil || record.Repo != "" {
+				return "", "", recordError{errors.New("invalid investigation configuration path")}
+			}
+		}
+		return record.Repo, record.Config, nil
 	}
-	return "", nil
+	return "", "", nil
 }
 
 // waitingRepoNote is the report's note of a case in testing whose investigation named no repository.
 func waitingRepoNote(c store.Case, at time.Time) store.Note {
 	return store.Note{ID: repoNoteID(c.ID), Kind: store.NoteProblem, Importance: store.ImportanceLow,
 		Title:  "The loop's case " + c.ID + " waits for a repository",
-		Detail: "The investigation named no code repository. The case stays in testing without a build run.", At: at}
+		Detail: "The investigation named no code repository or configuration file. The case stays in testing without a build run.", At: at}
 }
 
 func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopRun) (Package, error) {
 	if r.Ship == nil {
 		return Package{}, errors.New("build needs the host ship tool")
 	}
-	name, err := r.caseRepo(ctx, c)
+	name, target, err := r.caseTarget(ctx, c)
 	if err != nil {
 		return Package{}, err
+	}
+	if target != "" {
+		return r.buildConfigPackage(ctx, c, run, target)
 	}
 	var source string
 	var read RepoInput
@@ -198,13 +332,7 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 			r.logf("base notes of %s: %v", c.ID, err)
 		}
 	}
-	p, had, err := r.Ship.Load(c.ID)
-	if err != nil {
-		return p, err
-	}
-	if !had || p.State == RolledBack || p.State == Kept || p.State == Withdrawn {
-		p, err = r.Ship.prepare(ctx, c.ID, source, &tip)
-	}
+	p, repo, err := r.Ship.prepareBuild(ctx, c, KindRepo, source, &tip, "")
 	if err != nil {
 		return p, err
 	}
@@ -213,14 +341,14 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 		return p, err
 	}
 	defer unlock()
-	p, had, err = r.Ship.Load(c.ID)
+	p, had, err := r.Ship.Load(c.ID)
 	if err != nil {
 		return p, err
 	}
 	if !had || (p.State != Prepared && p.State != Checked && p.State != Revising) {
 		return p, refused("the package is not ready for a build")
 	}
-	if filepath.Clean(source) != p.Dir {
+	if !strings.EqualFold(repo, p.Repo) {
 		return p, refused("the case's repository changed after preparation")
 	}
 	// The build's base is the default branch as the pass's mirror holds it, at the pass's snapshot while the branch
@@ -257,19 +385,92 @@ func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopR
 			return p, err
 		}
 	}
-	if err = os.MkdirAll(run.Dir, 0700); err != nil {
+	return r.mountBuild(ctx, c, run, p)
+}
+
+// buildConfigPackage readies a configuration package's build tree: prepared from the target as the host reads it now,
+// which must be the text the run's /ro/config copy holds, and checked again before the tree is mounted. A package not
+// yet proposed whose file changed since its preparation is built on the file as it is.
+func (r *Runner) buildConfigPackage(ctx context.Context, c store.Case, run store.LoopRun, target string) (Package, error) {
+	name, err := configTargetName(target)
+	if err != nil {
+		return Package{}, err
+	}
+	copied := ""
+	if r.pass != nil {
+		for _, f := range r.pass.manifest.Configuration.Files {
+			if f.Path == name {
+				copied = f.SHA256
+			}
+		}
+	}
+	if copied == "" {
+		// known only once the inputs are built, so selection cannot hold it: a refusal its runs count (the stop rule)
+		return Package{}, refused("the run's configuration copy left out %s: the run could not read the file it would change", name)
+	}
+	p, _, err := r.Ship.prepareBuild(ctx, c, KindConfig, name, nil, copied)
+	if err != nil {
+		return p, err
+	}
+	unlock, err := r.Ship.lock(ctx, c.ID)
+	if err != nil {
+		return p, err
+	}
+	defer unlock()
+	p, had, err := r.Ship.Load(c.ID)
+	if err != nil {
+		return p, err
+	}
+	if !had || p.Kind != KindConfig || (p.State != Prepared && p.State != Checked && p.State != Revising) {
+		return p, refused("the package is not ready for a build")
+	}
+	if name != p.Target || p.TargetBase == "" {
+		return p, refused("the case's configuration target changed after preparation")
+	}
+	// every check selection made, again (targetReady); the scrubber's comes before the copy's hash, since the run's copy
+	// of a masked file is the scrubbed text, whose hash says nothing of the file
+	d, cur, err := r.Ship.targetReady(ctx, p.Target)
+	if err != nil {
+		return p, err
+	}
+	d.Close()
+	switch {
+	case copied != cur.SHA256:
+		return p, &shipHold{err: refused("%s changed since the run's configuration copy was made: the next pass builds on it", p.Target)}
+	case cur.SHA256 != p.TargetBase:
+		// the file changed before the change was proposed: the build is on the file as it is
+		if p, err = r.Ship.refreshConfigBase(ctx, p, cur); err != nil {
+			return p, err
+		}
+	}
+	if err = r.Ship.freshRunClone(shipContext(ctx, p.Case), &p); err != nil {
+		return p, err
+	}
+	if err = checkCloneObjects(ctx, p.Work); err != nil {
+		removeInputTree(p.Work)
+		if errors.Is(err, errNeedsScrubbing) {
+			return p, &shipHold{err: refused("the configuration file %s holds text the scrubber would mask", p.Target)}
+		}
+		return p, err
+	}
+	return r.mountBuild(ctx, c, run, p)
+}
+
+// mountBuild moves a scanned run clone into the run's storage, where it is mounted at /work.
+func (r *Runner) mountBuild(ctx context.Context, c store.Case, run store.LoopRun, p Package) (Package, error) {
+	if err := os.MkdirAll(run.Dir, 0700); err != nil {
 		return p, err
 	}
 	work := filepath.Join(run.Dir, "work")
 	// run.Dir is newly generated host storage and has not been mounted.
-	if err = os.Rename(p.Work, work); err != nil {
+	if err := os.Rename(p.Work, work); err != nil {
 		return p, err
 	}
 	p.Work, p.Check, p.State = work, nil, Prepared
-	if err = r.Ship.saveAuthorized(ctx, &p); err != nil {
+	if err := r.Ship.saveAuthorized(ctx, &p); err != nil {
 		return p, err
 	}
-	_, _, err = r.Store.DoneNote(ctx, "loop-repo:"+store.IDPart(c.ID), r.now())
+	_, _, err := r.Store.DoneNote(ctx, "loop-repo:"+store.IDPart(c.ID), r.now())
 	if errors.Is(err, store.ErrNoNote) {
 		err = nil
 	}
@@ -485,12 +686,14 @@ func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Re
 	if report.Lesson == "" && lessonGiven(res.Report) {
 		r.logf("build %s: its lesson is over 300 characters, so the proposal has none", c.ID)
 	}
-	if err := r.Ship.installedReadable(report.Installed); err != nil {
-		return stageFailureIn(ctx, res, "build report", err)
-	}
 	p, ok, err := r.Ship.Load(c.ID)
 	if err != nil || !ok {
 		return stageFailureIn(ctx, res, "build package", firstError(err, "package is absent"))
+	}
+	if p.Kind == KindConfig && report.Installed != "" {
+		return stageFailureIn(ctx, res, "build report", refused("a configuration change is in effect in its own file: it names no installed file"))
+	} else if err := r.Ship.installedReadable(report.Installed); err != nil {
+		return stageFailureIn(ctx, res, "build report", err)
 	}
 	// Reject stale or merged case reports before any host side effect.
 	current, err := r.Store.CaseByID(ctx, c.ID)

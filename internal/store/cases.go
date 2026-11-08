@@ -8,10 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/agent-sh/momentum/internal/plain"
 )
@@ -1899,4 +1901,65 @@ func (s *Store) CaseNote(ctx context.Context, id, action, detail, actor string) 
 		return err
 	}
 	return caseLog(ctx, s.db, c.ID, actor, action, detail, time.Now())
+}
+
+// configFixForm is a configuration fix: config:~/ and a home-relative path, @, and the SHA-256 the change left, or
+// unchecked: and why the file could not be checked (link, missing, executable, hard-link and the like). It is a fix
+// reference, never evidence.
+var configFixForm = regexp.MustCompile(`^config:~/(\S+)@(?:[0-9a-f]{64}|unchecked:[a-z]+(?:-[a-z]+)*)$`)
+
+// CheckConfigFix refuses what is no configuration fix: the form, a configuration path (CheckConfigPath), one plain
+// line within the reference bound.
+func CheckConfigFix(fix string) error {
+	m := configFixForm.FindStringSubmatch(fix)
+	switch {
+	case plain.Line(fix) != fix || len(fix) > refMax:
+		return badCase("what fixed it: %q is not one plain line within %d bytes", fix, refMax)
+	case m == nil:
+		return badCase("what fixed it: %q is no config:~/PATH@SHA256, the file under the home and the hash the change left in it", fix)
+	}
+	if err := CheckConfigPath(m[1]); err != nil {
+		return badCase("what fixed it: %v", err)
+	}
+	return nil
+}
+
+// ConfigPathMax bounds a configuration file's home-relative path, 426 bytes, so its fix reference
+// (config:~/PATH@SHA256) fits a reference.
+const ConfigPathMax = refMax - len("config:~/@") - 64
+
+// CheckConfigPath refuses what is no configuration file's path: one form wherever a path is read (an investigation's
+// record, the targets' allow entries, the fix a close names). It is clean and under the home, with no whitespace,
+// control or format character, no backslash or pattern character, and at most ConfigPathMax bytes.
+func CheckConfigPath(p string) error {
+	odd := func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || strings.ContainsRune("\\*?[$`\"()", r)
+	}
+	switch {
+	case p == "" || len(p) > ConfigPathMax:
+		return fmt.Errorf("a configuration path is 1 to %d bytes, %q is %d", ConfigPathMax, plain.Clip(p, 80), len(p))
+	case strings.IndexFunc(p, odd) >= 0:
+		return fmt.Errorf("the configuration path %q holds whitespace, a control or format character, or one a shell or a pattern reads ($ ` \" \\ ( ) * ? [)", p)
+	case filepath.IsAbs(p) || !filepath.IsLocal(p) || filepath.Clean(p) != p:
+		return fmt.Errorf("the configuration path %q is no clean path under the home", p)
+	}
+	return nil
+}
+
+// CloseSolvedBy closes a case as already solved by a configuration proposal an agent applied by hand, named as the file
+// and the hash the change left in it (config:~/PATH@SHA256): the close's log line names it. New evidence brings the case
+// back, as any solved case's does. A component-health case names its fix through CloseFixed, which resumes the cases
+// its stop held.
+func (s *Store) CloseSolvedBy(ctx context.Context, id, fix, why, actor string) (Case, error) {
+	if err := CheckConfigFix(fix); err != nil {
+		return Case{}, err
+	}
+	c, err := s.CaseByID(ctx, id)
+	if err != nil {
+		return Case{}, err
+	}
+	if c.Family == HealthFamily {
+		return Case{}, badCase("case %s is a %s case: its fix is named so the cases its stop held resume", c.ID, HealthFamily)
+	}
+	return s.CloseCase(ctx, id, Solved, "", "fixed by "+fix+": "+why, actor)
 }

@@ -165,6 +165,12 @@ func gateSaid(out []byte) string {
 	return text
 }
 
+// configTargets is the loop's authority over configuration files as configured, with its own files refused.
+func configTargets(c config.Loop) loop.ConfigTargets {
+	own := append(expandAll(c.Own()), paths.Config(), paths.Data(), config.SourcesPath())
+	return loop.ConfigTargets{Enabled: c.ConfigTargets.Enabled, Allow: c.ConfigTargets.Allow, Home: paths.Home(), Own: own}
+}
+
 func setupShip(st *store.Store, sources config.Sources) *loop.Ship {
 	c := sources.Loop
 	home := paths.Home()
@@ -193,6 +199,10 @@ func setupShip(st *store.Store, sources config.Sources) *loop.Ship {
 	}
 	gate := configGate(c)
 	gate.Busy = func(ctx context.Context, dir string) (string, error) { return repoBusy(ctx, st, dir) }
-	return &loop.Ship{Store: st, SourceLive: sources.SourceLive, Dir: loopDir(), InstalledRoots: expandAll(c.ReadDirs), Live: c.Live, Actor: caseActor(), Identity: [2]string{gitGlobal("user.name"), gitGlobal("user.email")}, Sandbox: sb,
+	for _, why := range configTargets(c).RefusedAllow() {
+		fmt.Fprintf(os.Stderr, "momentum: loop.config_targets.allow names a file that is never a target, %s\n", why)
+	}
+	return &loop.Ship{Store: st, SourceLive: sources.SourceLive, Dir: loopDir(), InstalledRoots: expandAll(c.ReadDirs), Live: c.Live, Actor: caseActor(),
+		ConfigTargets: configTargets(c), Identity: [2]string{gitGlobal("user.name"), gitGlobal("user.email")}, Sandbox: sb,
 		Gate: gate}
 }

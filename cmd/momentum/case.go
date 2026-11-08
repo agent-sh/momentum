@@ -114,9 +114,10 @@ type listedCase struct {
 	Deployed       string   `json:"deployed,omitempty"`
 	Back           string   `json:"back,omitempty"`
 	Package        string   `json:"package,omitempty"`
-	Held           string   `json:"held,omitempty"`         // why the configuration holds its build (store.HoldOf)
-	Stage          string   `json:"stage,omitempty"`        // store.HandStage while it waits for a hand landing
-	HandLanding    string   `json:"hand_landing,omitempty"` // the pull request it waits on (store.HandOf)
+	Held           string   `json:"held,omitempty"`          // why the configuration holds its build (store.HoldOf)
+	Stage          string   `json:"stage,omitempty"`         // store.HandStage while it waits for a hand landing
+	HandLanding    string   `json:"hand_landing,omitempty"`  // the pull request it waits on (store.HandOf)
+	Configuration  string   `json:"configuration,omitempty"` // the file of the configuration proposal it waits on (store.ConfigOf)
 	Measurement    *struct {
 		WindowHours float64 `json:"window_hours"`
 		Before      int     `json:"before"`
@@ -188,8 +189,8 @@ func caseJSON(c store.Case) listedCase {
 // statusLine is a case's status for a terminal: closed ones with their reason.
 func statusLine(c store.Case) string { return evidenceview.StatusLine(c) }
 
-// caseHold is why the configuration holds a case in testing, from its log, or "", and the pull request it waits on
-// for a hand landing, or "".
+// caseHold is why the configuration holds a case in testing, from its log, or "", and what it waits on: the pull
+// request of a hand landing, or the file of a configuration proposal (store.ConfigStage), or "".
 func caseHold(ctx context.Context, st *store.Store, c store.Case) (hold, hand string, err error) {
 	if c.Status != store.CaseTesting {
 		return "", "", nil
@@ -198,13 +199,28 @@ func caseHold(ctx context.Context, st *store.Store, c store.Case) (hold, hand st
 	if err != nil {
 		return "", "", err
 	}
+	if target := store.ConfigOf(c, log); target != "" {
+		return store.HoldOf(c, log), configWait + target, nil
+	}
 	return store.HoldOf(c, log), store.HandOf(c, log), nil
+}
+
+// configWait marks what a case waits on as a configuration proposal's file, not a pull request.
+const configWait = "config:"
+
+// stage is the stage a case in testing shows while it waits on what, and what it waits on as shown.
+func stage(waits string) (string, string) {
+	if target, ok := strings.CutPrefix(waits, configWait); ok {
+		return store.ConfigStage, target
+	}
+	return store.HandStage, waits
 }
 
 func listStatus(c store.Case, hold, hand string) string {
 	switch {
 	case hand != "":
-		return store.HandStage
+		st, _ := stage(hand)
+		return st
 	case hold != "":
 		return statusLine(c) + " (held)"
 	}
@@ -264,7 +280,12 @@ func caseList(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			l := caseJSON(c)
 			l.Held = holds[i]
 			if hands[i] != "" {
-				l.Stage, l.HandLanding = store.HandStage, hands[i]
+				var waits string
+				if l.Stage, waits = stage(hands[i]); l.Stage == store.HandStage {
+					l.HandLanding = waits
+				} else {
+					l.Configuration = waits
+				}
 			}
 			if err := enc.Encode(l); err != nil {
 				return err
@@ -276,7 +297,8 @@ func caseList(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			title += "  [held: " + holds[i] + "]"
 		}
 		if hands[i] != "" {
-			title += "  [" + hands[i] + "]"
+			_, waits := stage(hands[i])
+			title += "  [" + waits + "]"
 		}
 		fmt.Fprintf(stdout, "%-9s %-16s %-*s %4d ev  $%6.2f  %s  %s\n", c.ID, c.Family, width, listStatus(c, holds[i], hands[i]), c.Evidence, c.Cost.USD,
 			c.Updated.Local().Format("01-02 15:04"), title)
@@ -353,7 +375,12 @@ func caseShow(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			return err
 		}
 		if hand != "" {
-			out.Stage, out.HandLanding = store.HandStage, hand
+			var waits string
+			if out.Stage, waits = stage(hand); out.Stage == store.HandStage {
+				out.HandLanding = waits
+			} else {
+				out.Configuration = waits
+			}
 		}
 		for _, e := range evs {
 			out.Recent = append(out.Recent, shownEvidence{Ref: e.Ref, At: rfc3339(e.At), Kind: e.Kind, Summary: e.Summary})
@@ -518,7 +545,7 @@ func caseClose(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	fs.SetOutput(stderr)
 	reason := fs.String("reason", "", "not-worth-it, insufficient-evidence, already-solved or duplicate (improved and guarded are the measure tool's)")
 	into := fs.String("into", "", "for a duplicate: the case with the same root cause")
-	fix := fs.String("fix", "", "for a component-health case closed as already-solved, now or before a close named its fix: what fixed it, its commit (git:OWNER/REPO@SHA) or another reference; the cases its stop held resume")
+	fix := fs.String("fix", "", "with already-solved: what fixed it. A component-health case names its commit (git:OWNER/REPO@SHA) or another reference, now or after its close, and the cases its stop held resume; any case names a configuration proposal applied by hand as config:~/PATH@SHA256")
 	why := fs.String("why", "", "why, in a short line")
 	if err := fs.Parse(rest); err != nil {
 		return usageError{err.Error()}
@@ -530,20 +557,43 @@ func caseClose(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		return usageError{"case close needs --why"}
 	}
 	if *fix != "" && (store.CloseReason(*reason) != store.Solved || *into != "") {
-		return usageError{"--fix names what fixed a component-health case closed as already-solved, with no --into"}
+		return usageError{"--fix names what fixed a case closed as already-solved, with no --into"}
 	}
 	st, err := store.Open(paths.DB())
 	if err != nil {
 		return err
 	}
 	defer st.Close()
+	if store.CloseReason(*reason) == store.Solved {
+		// a case whose configuration proposal is filed closes as already solved by its file, with the hash the file holds
+		// now: the note's fix once the proposal was applied, another once the file changed and the change was made by hand
+		c, err := st.CaseByID(ctx, id)
+		if err != nil {
+			return caseErr(err)
+		}
+		if filed, ok, err := loop.FiledConfigFix(loopDir(), c); err != nil {
+			return err
+		} else if ok {
+			now, err := loop.ConfigFixNow(paths.Home(), filed)
+			if err != nil {
+				return usageError{fmt.Sprintf("case %s's configuration proposal is closed as already solved by its file with the hash it holds now, which cannot be read: %v", id, err)}
+			}
+			if *fix != now {
+				return usageError{fmt.Sprintf("case %s's configuration proposal is closed as already solved by its file with the hash it holds now: --fix %s", id, loop.ShellQuote(now))}
+			}
+		}
+	}
+	if err := loop.ClosingCase(ctx, st, id); err != nil {
+		return err
+	}
 	if *fix != "" {
-		return closeFixed(ctx, st, id, *fix, *why, stdout)
+		return closeFixed(ctx, st, id, *fix, *why, stdout, stderr)
 	}
 	c, err := st.CloseCase(ctx, id, store.CloseReason(*reason), *into, *why, caseActor())
 	if err != nil {
 		return caseErr(err)
 	}
+	settleClosed(ctx, st, id, stderr)
 	what := "closed"
 	if c.ID != id {
 		what = id + " went into this case"
@@ -552,15 +602,32 @@ func caseClose(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	return nil
 }
 
+// settleClosed withdraws a closed or merged case's configuration proposal and resolves its note there and then. One
+// that cannot be settled now is settled by the next pass: the close stands.
+func settleClosed(ctx context.Context, st *store.Store, id string, stderr io.Writer) {
+	if err := loop.SettleClosed(ctx, st, loopDir(), id, caseActor()); err != nil {
+		fmt.Fprintf(stderr, "momentum: the case is closed; its configuration proposal is settled by the next pass: %v\n", err)
+	}
+}
+
 // closeFixed closes a component-health case as already solved by what fixed it, and resumes the cases the stop rule
 // holds on its signatures: the stop rule then counts only their runs after the close. One closed as already solved
 // before a close named its fix stays closed and gets its fix named.
-func closeFixed(ctx context.Context, st *store.Store, id, fix, why string, stdout io.Writer) error {
-	if err := st.Fixable(ctx, id); err != nil {
-		return caseErr(err)
-	}
+func closeFixed(ctx context.Context, st *store.Store, id, fix, why string, stdout, stderr io.Writer) error {
 	c, err := st.CaseByID(ctx, id)
 	if err != nil {
+		return caseErr(err)
+	}
+	if c.Family != store.HealthFamily && strings.HasPrefix(fix, "config:") {
+		// a case whose configuration proposal an agent applied by hand closes as already solved by that fix
+		if c, err = st.CloseSolvedBy(ctx, id, fix, why, caseActor()); err != nil {
+			return caseErr(err)
+		}
+		settleClosed(ctx, st, id, stderr)
+		printCase(stdout, c, "closed")
+		return nil
+	}
+	if err := st.Fixable(ctx, id); err != nil {
 		return caseErr(err)
 	}
 	stopped, err := loop.StoppedOn(ctx, st, c)

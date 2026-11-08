@@ -59,6 +59,11 @@ func (r *Runner) reviews(ctx context.Context, only string, families ...string) [
 			out = append(out, Done{Family: c.Family, Case: c.ID, Step: StepReview, Skipped: "its hand landing request could not be read in this pass"})
 			continue
 		}
+		if p.Kind == KindConfig && !p.GoneSince.IsZero() {
+			// its file is gone: it waits with its one note (configNote) until the file is back, then it is reviewed
+			out = append(out, Done{Family: c.Family, Case: c.ID, Step: StepReview, Skipped: "its file is gone: it is reviewed once the file is back"})
+			continue
+		}
 		if n := len(p.Reviews); n > 0 && p.Reviews[n-1].Head == p.Head && p.Reviews[n-1].Comment == "" {
 			var err error
 			p, err = r.postReview(ctx, p)
@@ -66,6 +71,19 @@ func (r *Runner) reviews(ctx context.Context, only string, families ...string) [
 				out = append(out, Done{Family: c.Family, Case: c.ID, Step: StepReview, Skipped: err.Error()})
 				continue
 			}
+		}
+		if p.Clean() && p.Kind == KindConfig {
+			// reviewed clean, a configuration proposal is filed for an agent to apply: the loop never writes its file
+			filedP, filed, err := r.Ship.fileConfig(ctx, c.ID)
+			switch {
+			case err != nil:
+				out = append(out, Done{Family: c.Family, Case: c.ID, Step: "file", Skipped: err.Error()})
+			case filed:
+				out = append(out, Done{Family: c.Family, Case: c.ID, Step: "file"})
+			case !filedP.Filed.IsZero():
+				out = append(out, Done{Family: c.Family, Case: c.ID, Step: "land", Skipped: "a configuration proposal: an agent applies it"})
+			}
+			continue
 		}
 		if p.Clean() && len(p.Hand) > 0 {
 			// reviewed clean, it still waits for a person: the loop never lands a hand landing proposal
@@ -211,6 +229,34 @@ func (r *Runner) postReview(ctx context.Context, p Package) (Package, error) {
 	if n < 0 || p.Reviews[n].Comment != "" {
 		return p, nil
 	}
+	if p.Kind == KindConfig {
+		// a configuration proposal has no pull request: its review goes to its case's log, once its file's authority
+		// is checked again as a repository's is before a post, and whole beside its patch, since the log cuts a line
+		if err := r.Ship.packageAuthority(ctx, p); err != nil {
+			return p, err
+		}
+		text, err := Redact(ctx, p.Reviews[n].Text)
+		if err != nil {
+			return p, err
+		}
+		if err := writeFileSafe(r.Ship.proposalFile(p, ".review.md"), []byte(text+"\n")); err != nil {
+			return p, err
+		}
+		// once per round of the package: a post that stopped before its save posts again
+		line := fmt.Sprintf("round %d of the package made %s: %s", p.Reviews[n].Round, p.Created.UTC().Format(time.RFC3339Nano), text)
+		if err := r.caseNoteOnce(ctx, p.Case, "review posted", line); err != nil {
+			return p, err
+		}
+		if err := r.Ship.wrote("review: posted"); err != nil {
+			return p, err
+		}
+		p.Reviews[n].Comment = fmt.Sprintf("case log: review round %d", p.Reviews[n].Round)
+		if (p.Reviews[n].High > 0 || p.Reviews[n].Medium > 0) && len(p.Reviews) < MaxRounds {
+			p.State = Revising
+		}
+		err = r.Ship.saveAuthorized(ctx, &p)
+		return p, err
+	}
 	if r.Post == nil || p.PR == "" {
 		return p, fmt.Errorf("review posting is unavailable")
 	}
@@ -246,7 +292,8 @@ func (r *Runner) postReview(ctx context.Context, p Package) (Package, error) {
 	if (p.Reviews[n].High > 0 || p.Reviews[n].Medium > 0) && len(p.Reviews) < MaxRounds {
 		p.State = Revising
 	}
-	return p, r.Ship.saveAuthorized(ctx, &p)
+	err = r.Ship.saveAuthorized(ctx, &p)
+	return p, err
 }
 
 func (r *Runner) reviewDiff(ctx context.Context, p Package) (string, error) {
@@ -349,8 +396,8 @@ func (r *Runner) noteWaiting(ctx context.Context) error {
 			unread = append(unread, fmt.Errorf("case %s package: %w", c.ID, err))
 			continue
 		}
-		if !ok || (!roundsUsed(p) && !proposalsUsed(p)) {
-			continue
+		if !ok || !proposalsUsed(p) && (!roundsUsed(p) || p.Kind == KindConfig) {
+			continue // a configuration change whose rounds are used waits with its one note (configNote)
 		}
 		waiting[id] = true
 		at := p.Updated
@@ -367,7 +414,9 @@ func (r *Runner) noteWaiting(ctx context.Context) error {
 		if proposalsUsed(p) {
 			note.Title = fmt.Sprintf("The loop's change for case %s used its %d closed proposals and waits for a person", c.ID, MaxClosedProposals)
 			note.Detail = "Two pull requests were closed without merging. The loop builds this case no more. Propose the checked package with ship propose, or close the case."
-			if p.State == Withdrawn {
+			if p.Kind == KindConfig {
+				note.Detail = "Its configuration proposals were withdrawn three times: its file kept changing under them. The loop builds this case no more. Change the file by hand, or close the case."
+			} else if p.State == Withdrawn {
 				note.Detail = "Two pull requests were closed without merging, the last a hand landing proposal. The loop builds this case no more. Take the change over by hand, or close the case."
 			}
 		}

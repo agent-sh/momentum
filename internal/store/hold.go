@@ -96,3 +96,46 @@ func HandRecordOf(e CaseEntry) (string, int64, bool) {
 	}
 	return h.PR, h.Episode, true
 }
+
+// A configuration proposal the loop filed for a person is kept in the case's log too: a "proposed for a configuration
+// change" line with its file and the case's episode, and a "configuration proposal withdrawn" line when the loop
+// withdraws it. A case in testing waits on it while its newest such line is a proposal of its current episode; the
+// case's close, a new episode or a withdrawal ends the wait.
+const (
+	ActionConfigProposed  = "proposed for a configuration change"
+	ActionConfigWithdrawn = "configuration proposal withdrawn"
+)
+
+// ConfigStage is how a case waiting on a configuration proposal shows its stage.
+const ConfigStage = "proposed (configuration)"
+
+type configRecord struct {
+	Target  string `json:"target"`
+	Episode int64  `json:"episode"`
+}
+
+// ConfigDetail is the detail of a "proposed for a configuration change" line.
+func ConfigDetail(target string, episode int64) string {
+	raw, _ := json.Marshal(configRecord{target, episode})
+	return string(raw)
+}
+
+// ConfigOf returns the file a case in testing waits on for a configuration proposal, from its log, or "".
+func ConfigOf(c Case, log []CaseEntry) string {
+	if c.Status != CaseTesting {
+		return ""
+	}
+	for i := len(log) - 1; i >= 0; i-- {
+		switch log[i].Action {
+		case ActionConfigWithdrawn:
+			return ""
+		case ActionConfigProposed:
+			var r configRecord
+			if json.Unmarshal([]byte(log[i].Detail), &r) != nil || r.Episode != c.Episode {
+				return ""
+			}
+			return r.Target
+		}
+	}
+	return ""
+}

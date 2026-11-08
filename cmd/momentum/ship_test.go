@@ -16,6 +16,19 @@ func TestShipRequiresAnExplicitCase(t *testing.T) {
 	}
 }
 
+// The owner withdraws a case's package with ship withdraw, which says why; the help names the command.
+func TestShipWithdrawSaysWhy(t *testing.T) {
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	if code, _, text := momentum("ship", "withdraw", "--case", "c0ffee123"); code != 2 || !strings.Contains(text, "ship withdraw needs --why") {
+		t.Fatalf("ship withdraw without --why: exit %d: %s", code, text)
+	}
+	if _, out, _ := momentum("help"); !strings.Contains(out, "rollback|withdraw") {
+		t.Fatalf("the help does not name ship withdraw:\n%s", out)
+	}
+}
+
 func TestGlobalGitIdentityUsesNoRepositoryEnvironment(t *testing.T) {
 	bin := t.TempDir()
 	record := filepath.Join(bin, "names")

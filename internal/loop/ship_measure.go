@@ -22,10 +22,11 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// archive keeps the host receipt before a new package replaces it.
+// archive keeps the host receipt before a new package replaces it, under its making to the nanosecond, so two
+// packages made within one second keep two archives.
 func (s *Ship) archive(p Package) error {
 	dir := s.pkgDir(p.Case)
-	past := filepath.Join(dir, "past", p.Created.UTC().Format("20060102T150405Z"))
+	past := filepath.Join(dir, "past", archiveName(p))
 	if err := os.MkdirAll(past, 0700); err != nil {
 		return err
 	}
@@ -47,6 +48,9 @@ func (s *Ship) archive(p Package) error {
 	}
 	return nil
 }
+
+// archiveName is the directory a package's archive takes under past/: its making, in UTC, to the nanosecond.
+func archiveName(p Package) string { return p.Created.UTC().Format("20060102T150405.000000000Z") }
 
 // installedReadable confines a build report's host path to the admitted read directories.
 func (s *Ship) installedReadable(installed string) error {
@@ -843,5 +847,6 @@ func (s *Ship) keepLocked(caseID string, res measure.Result) (Package, error) {
 		return p, refused("case %s has no landed package to keep", caseID)
 	}
 	p.State, p.Result = Kept, &res
-	return p, s.save(&p)
+	err = s.save(&p)
+	return p, err
 }

@@ -115,7 +115,7 @@ const usage = `usage:
                                         native agent on the same past problems, graded by a clean-context judge
   momentum loop lesson --case ID --text TEXT
                                         publish an unverified lesson to tacit
-  momentum ship prepare|check|propose|status|land|rollback --case ID [OPTIONS]
+  momentum ship prepare|check|propose|status|land|rollback|withdraw --case ID [OPTIONS]
                                         the owner controls a host change package
   momentum version
 Sources are configured in $MOMENTUM_CONFIG/sources.json (default ~/.config/momentum/sources.json), and the

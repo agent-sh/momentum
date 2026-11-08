@@ -22,10 +22,10 @@ import (
 // shipCmd is the owner's interface to the host ship tool.
 func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usageError{"ship needs prepare, check, propose, status, land or rollback"}
+		return usageError{"ship needs prepare, check, propose, status, land, rollback or withdraw"}
 	}
 	switch args[0] {
-	case "prepare", "check", "propose", "status":
+	case "prepare", "check", "propose", "status", "withdraw":
 	case "land", "rollback":
 
 	default:
@@ -45,7 +45,7 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	window := fs.String("window", "7d", "propose: the measurement's window (whole weeks: 7d, 14d and so on)")
 	lesson := fs.String("lesson", "", "propose: the lesson the case teaches, one sentence")
 	installed := fs.String("installed", "", "propose: the binary or installed configuration the machine runs; measured after the checkout first held the change and the file was rebuilt")
-	why := fs.String("why", "", "rollback: why")
+	why := fs.String("why", "", "rollback, withdraw: why")
 	asJSON := fs.Bool("json", false, "status: the package as JSON")
 	rest := args[1:]
 	if (args[0] == "land" || args[0] == "rollback") && len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
@@ -59,6 +59,9 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	if *caseID == "" {
 		return usageError{"which case: --case ID"}
+	}
+	if args[0] == "withdraw" && strings.TrimSpace(*why) == "" {
+		return usageError{"ship withdraw needs --why"}
 	}
 	c, err := config.Load()
 	if err != nil {
@@ -124,6 +127,8 @@ func shipCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error
 			return usageError{"ship rollback needs --why"}
 		}
 		p, err = ship.RollBack(ctx, *caseID, *why)
+	case "withdraw":
+		p, err = ship.Withdraw(ctx, *caseID, *why)
 	}
 	if errors.Is(err, loop.ErrRefused) || errors.Is(err, store.ErrBadCase) || errors.Is(err, store.ErrNoCase) {
 		return usageError{err.Error()}

@@ -14,6 +14,7 @@ import (
 
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/source"
+	"github.com/agent-sh/momentum/internal/store"
 )
 
 // Sources lists the signal stores to ingest. An empty entry is not ingested.
@@ -89,6 +90,136 @@ type Loop struct {
 	// CapacityHoldExit are the gate's exit statuses that say the machine has no room now, a hold; none is [1], waitfor's
 	// deadline. Any other failure of the gate is the host's error at the check.
 	CapacityHoldExit []int `json:"capacity_hold_exit"`
+	// ConfigTargets are the configuration files the loop may propose a change to: off unless Enabled, and then only
+	// the existing files Allow names exactly (home-relative or under ~/); an empty Allow admits none. The loop never
+	// writes them: an agent applies the proposal.
+	ConfigTargets ConfigTargets `json:"config_targets"`
+}
+
+// ConfigTargets is loop.config_targets.
+type ConfigTargets struct {
+	Enabled bool     `json:"enabled"`
+	Allow   []string `json:"allow"`
+}
+
+// Own are the loop's own files as configured: its rules files (a policy its runs read among them), the programs of its
+// scope check, capacity gate and runner with every file they name as an argument (fileArg), its relay environment and
+// tacit store. No configuration target is one of them.
+func (l Loop) Own() []string {
+	own := append([]string(nil), l.Rules...)
+	for _, cmd := range [][]string{l.RepoGuard, l.CapacityGate, l.Runner} {
+		cmd = shellWords(cmd)
+		for i, arg := range cmd {
+			// the program, and every argument that names a file (a script it runs, a configuration it reads), alone or
+			// as the value of a --flag=PATH
+			if i == 0 && arg != "" || !strings.HasPrefix(arg, "-") && fileArg(arg) {
+				own = append(own, homeArg(arg))
+			} else if _, v, ok := strings.Cut(arg, "="); ok && strings.HasPrefix(arg, "-") && fileArg(v) {
+				own = append(own, homeArg(v))
+			}
+		}
+	}
+	for _, p := range []string{l.BedrockEnv, l.TacitStore} {
+		if p != "" {
+			own = append(own, p)
+		}
+	}
+	return own
+}
+
+// shellWords is a command whose shell program runs a string (sh -c 'STRING'), with the string's words in its place,
+// so the files a script line names are read as arguments too.
+func shellWords(cmd []string) []string {
+	if len(cmd) == 0 {
+		return cmd
+	}
+	switch filepath.Base(cmd[0]) {
+	case "sh", "bash", "dash", "zsh", "ksh":
+	default:
+		return cmd
+	}
+	out := []string{cmd[0]}
+	for i := 1; i < len(cmd); i++ {
+		if cmd[i] == "-c" && i+1 < len(cmd) {
+			out = append(out, splitShell(cmd[i+1])...)
+			i++
+			continue
+		}
+		out = append(out, cmd[i])
+	}
+	return out
+}
+
+// splitShell splits a shell line into its words as a shell reads them for this purpose: quotes group, a backslash
+// escapes, and blanks and the operators ; & | < > ( ) part words.
+func splitShell(line string) []string {
+	var words []string
+	var word strings.Builder
+	in, quote, escape := false, rune(0), false
+	flush := func() {
+		if in {
+			words = append(words, word.String())
+		}
+		word.Reset()
+		in = false
+	}
+	for _, r := range line {
+		switch {
+		case escape:
+			word.WriteRune(r)
+			escape, in = false, true
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			} else if r == '\\' && quote == '"' {
+				escape = true
+			} else {
+				word.WriteRune(r)
+			}
+		case r == '\\':
+			escape = true
+		case r == '\'' || r == '"':
+			quote, in = r, true
+		case strings.ContainsRune(" \t\n;&|<>()", r):
+			flush()
+		default:
+			word.WriteRune(r)
+			in = true
+		}
+	}
+	flush()
+	return words
+}
+
+// fileArg says an argument names a file: an absolute path, one under the home (~/, $HOME/ or ${HOME}/), or a relative
+// one, which holds a slash or a dot. A plain word or number does not.
+func fileArg(a string) bool {
+	return filepath.IsAbs(a) || strings.HasPrefix(homeArg(a), "~/") || a != "" && strings.ContainsAny(a, "/.")
+}
+
+// homeArg writes an argument under $HOME as one under ~/.
+func homeArg(a string) string {
+	for _, p := range []string{"$HOME/", "${HOME}/"} {
+		if rest, ok := strings.CutPrefix(a, p); ok {
+			return "~/" + rest
+		}
+	}
+	return a
+}
+
+// checkAllow refuses an allow entry that is not one exact file, relative or under ~/, in a configuration path's one
+// form (store.CheckConfigPath): no pattern, no trailing slash, nothing outside the home.
+func checkAllow(allow []string) error {
+	for _, entry := range allow {
+		n := strings.TrimSpace(entry)
+		if rest, ok := strings.CutPrefix(n, "~/"); ok {
+			n = rest
+		}
+		if err := store.CheckConfigPath(n); err != nil {
+			return fmt.Errorf("loop.config_targets.allow entry %q is not one file under the home (an exact path, no pattern or directory): %w", entry, err)
+		}
+	}
+	return nil
 }
 
 // ErrNoSources means no sources file exists yet.
@@ -122,6 +253,9 @@ func Load() (Sources, error) {
 		var l Loop
 		if err := d.Decode(&l); err != nil {
 			return s, fmt.Errorf("%s: loop: %w", SourcesPath(), err)
+		}
+		if err := checkAllow(l.ConfigTargets.Allow); err != nil {
+			return s, fmt.Errorf("%s: %w", SourcesPath(), err)
 		}
 	}
 	s.Mistakes.Path = paths.Expand(s.Mistakes.Path)

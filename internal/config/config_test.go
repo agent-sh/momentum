@@ -155,3 +155,59 @@ func TestANativeTranscriptReaderIsLiveWithoutAHarnessHome(t *testing.T) {
 		t.Fatal("a configured native reader was omitted from measurement")
 	}
 }
+
+// Configuration targets are off unless the owner turns them on, take only known keys, and an allow entry names one
+// exact file under the home: no pattern, no directory form, nothing outside the home.
+func TestConfigTargetsAreOffByDefaultAndExact(t *testing.T) {
+	cfg, home := t.TempDir(), t.TempDir()
+	t.Setenv("MOMENTUM_CONFIG", cfg)
+	t.Setenv("HOME", home)
+	write := func(s string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(cfg, "sources.json"), []byte(s), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(`{"loop": {"live": true}}`)
+	if s, err := Load(); err != nil || s.Loop.ConfigTargets.Enabled || len(s.Loop.ConfigTargets.Allow) != 0 {
+		t.Fatalf("default: %+v %v", s.Loop.ConfigTargets, err)
+	}
+	write(`{"loop": {"config_targets": {"enabled": true, "alow": []}}}`)
+	if _, err := Load(); err == nil {
+		t.Fatal("a misspelt key of config_targets was taken")
+	}
+	for _, bad := range []string{`"/etc/marker-c0ffee"`, `"../x"`, `"~/../x"`, `".config/./agents/X.md"`, `""`, `".config/agents/"`,
+		`".config/agents/*.md"`, `".config/agents/**"`, `".config/agents/zz-r?les.md"`, `".config/agents/zz-[r]ules.md"`,
+		`".config/agents/MY zz-rules.md"`, `".config/agents/` + strings.Repeat("a", 430) + `.md"`} {
+		write(`{"loop": {"config_targets": {"enabled": true, "allow": [` + bad + `]}}}`)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "config_targets.allow") {
+			t.Fatalf("allow %s: %v", bad, err)
+		}
+	}
+	write(`{"loop": {"config_targets": {"enabled": true, "allow": ["~/.config/agents/zz-rules.md", ".config/agents/zz-other.md"]}}}`)
+	if s, err := Load(); err != nil || !s.Loop.ConfigTargets.Enabled || len(s.Loop.ConfigTargets.Allow) != 2 {
+		t.Fatalf("%+v %v", s.Loop.ConfigTargets, err)
+	}
+}
+
+// The loop's own files, as configured, are what Own names: rules, programs and the files they name as arguments, the
+// relay environment and the tacit store.
+func TestTheLoopsOwnFilesAreItsConfiguredOnes(t *testing.T) {
+	l := Loop{Rules: []string{"/r/zz-rules.md"}, RepoGuard: []string{"python3", "~/g/guard.py", "x", "--policy=/p/policy.json"},
+		CapacityGate: []string{"/b/gate", "--config", "/c/gate.toml", "--rules=~/c/rules.toml", "--quiet=1"},
+		Runner:       []string{"/b/run"}, BedrockEnv: "/e/relay.env", TacitStore: "/s/store"}
+	if got := strings.Join(l.Own(), " "); got != "/r/zz-rules.md python3 ~/g/guard.py /p/policy.json /b/gate /c/gate.toml ~/c/rules.toml /b/run /e/relay.env /s/store" {
+		t.Fatalf("own: %s", got)
+	}
+	// a relative file, and one under $HOME, are the loop's own too: a word that names no file is not
+	l = Loop{RepoGuard: []string{"/b/guard", "scripts/zz-check.sh", "zz-conf.toml", "$HOME/.config/agents/zz-a.md", "${HOME}/zz-b.md",
+		"--rules=$HOME/zz-c.md", "--from=./zz-d.md", "plain", "--count=2"}}
+	if got := strings.Join(l.Own(), " "); got != "/b/guard scripts/zz-check.sh zz-conf.toml ~/.config/agents/zz-a.md ~/zz-b.md ~/zz-c.md ./zz-d.md" {
+		t.Fatalf("own, relative and under $HOME: %s", got)
+	}
+	// a shell's line names its files too
+	l = Loop{Runner: []string{"/bin/sh", "-c", "cd ~/zz-work && ./zz-run.sh --conf \"$HOME/zz-e.md\" | tee zz-log.txt; exit"}}
+	if got := strings.Join(l.Own(), " "); got != "/bin/sh ~/zz-work ./zz-run.sh ~/zz-e.md zz-log.txt" {
+		t.Fatalf("own, in a shell's line: %s", got)
+	}
+}

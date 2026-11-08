@@ -200,7 +200,7 @@ func TestAWaitingProposalIsPassedOverOnlyForWhatItWaitsOnNow(t *testing.T) {
 	if _, err := st.Put(ctx, []store.Event{ordinary("zz-gone", "a", now.Add(-60*24*time.Hour), "s1"), ordinary("zz-gone", "b", now.Add(-90*24*time.Hour), "s1")}); err != nil {
 		t.Fatal(err)
 	}
-	p := Package{Case: c.ID, Kind: "repo", Repo: "agent-sh/fake", State: Checked, ProposalAt: now.Add(-time.Hour), ReadWait: now.Add(-time.Hour), ReadUntil: now.Add(-time.Hour),
+	p := Package{Case: c.ID, Kind: "repo", Repo: "agent-sh/main", State: Checked, ProposalAt: now.Add(-time.Hour), ReadWait: now.Add(-time.Hour), ReadUntil: now.Add(-time.Hour),
 		Plan: &Plan{Signal: goodSignal, Window: 7 * 24 * time.Hour, Units: SessionHours, At: now.Add(-time.Hour), Sources: []string{store.Transcripts, "zz-gone"}}}
 	if err := r.Ship.save(&p); err != nil {
 		t.Fatal(err)

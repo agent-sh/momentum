@@ -316,7 +316,8 @@ func (s *Ship) withdrawHand(ctx context.Context, c store.Case, p Package) (Packa
 		return p, err
 	}
 	p.PR, p.Withdrew = "", pr
-	return p, s.saveAuthorized(ctx, &p)
+	err = s.saveAuthorized(ctx, &p)
+	return p, err
 }
 
 // caseNoteOnce writes a case log line unless the log holds the same one.

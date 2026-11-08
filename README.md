@@ -244,6 +244,12 @@ Host `evidence show` scrubs all headers and whole records in one batch, then cli
 
 `loop.owners`, `loop.exclude`, `loop.repo_guard`, `loop.sandbox_read`, `loop.capacity_gate`, `loop.capacity_hold_exit` (the gate's exit statuses that mean no room now, default `[1]`) and `loop.live` control host builds and landing. A missing repository guard refuses writes. Run the pass from its own oneshot user unit after ingest.
 
+`loop.config_targets` lets the loop propose a change to a configuration file. It is off by default and admits only the existing files `allow` names exactly; an empty list admits none. The proposal is advice: momentum checks the change on a copy, keeps the proposal and its patch under its own directory, reviews it in a clean context, and files a clean one as a low problem note. It never writes the file and never measures the change. An agent applies the patch with its own tools and closes the case with `momentum case close CASE --reason already-solved --fix config:~/PATH@SHA256 --why ...`, the hash the file holds then, or declines it with `--reason not-worth-it`. If the problem comes back, new evidence reopens the case. The loop's own rules (a policy its runs read among `loop.rules`) and configuration, harness settings, credential files, `bin` directories, databases, programs and links are refused in code, whatever the list says:
+
+```json
+{"loop": {"config_targets": {"enabled": true, "allow": ["~/.config/agents/RULES.md"]}}}
+```
+
 ## The ship tool
 
 The owner's CLI controls the same host package lifecycle:
@@ -255,8 +261,11 @@ momentum ship propose --case ID --title TITLE --body-file FILE --rollback TEXT -
 momentum ship status --case ID [--json]
 momentum ship land --case ID
 momentum ship rollback --case ID --why TEXT
+momentum ship withdraw --case ID --why TEXT
 momentum loop lesson --case ID --text TEXT
 ```
+
+A package that has not ended is never replaced. When a case's fix moves to another repository or file, the case waits until its old change ends: `ship withdraw` ends it once no pull request of it is open, and the next pass prepares the fix where the investigation names it.
 
 Agent runs return reports. The host calls the ship tool's methods. Patch validation, export, publication leases, landing and rollback are specified in [The ship tool](SPEC.md#the-ship-tool).
 

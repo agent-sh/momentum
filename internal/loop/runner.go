@@ -847,6 +847,7 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 		if err := r.releaseHolds(ctx, cs); err != nil {
 			r.logf("hold notes: %v", err)
 		}
+		r.withdrawStale(ctx, cs, only)
 	}
 	for _, c := range cs {
 		if only != "" && c.ID != only {
@@ -943,7 +944,36 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 					} // still in testing, with what it holds now newer than the request: it builds a new package
 				}
 			}
-			if p, ok, err := r.Ship.Load(c.ID); err != nil {
+			var settled *Package // a dry pass's settlement of a configuration package, as the live one would leave it
+			if p, ok, err := r.Ship.Load(c.ID); err == nil && ok && p.Kind == KindConfig {
+				// a configuration proposal waits for its review, and then for a person: the case's close ends it. Every
+				// configuration package is settled here, with its note (configNote); a dry pass reports the settlement a
+				// live one would make, and writes nothing (configSettled)
+				settle := func() (Package, error) { return r.Ship.reconcileConfig(ctx, c.ID) }
+				if dry {
+					settle = func() (Package, error) { return r.Ship.configSettled(ctx, c.ID, p) }
+				}
+				if p, err = settle(); err != nil {
+					passed = append(passed, c.ID+" configuration proposal: "+err.Error())
+					r.pickSkipped(c, "config", err)
+					continue
+				}
+				if dry {
+					settled = &p
+				}
+				if why := configPassed(p); why != "" {
+					r.placeHeld(ctx, c, p, dry, &passed)
+					passed = append(passed, c.ID+why)
+					continue
+				} // withdrawn, it builds again on the file as it is; any other state goes on as a package does
+			}
+			load := func() (Package, bool, error) {
+				if settled != nil {
+					return *settled, true, nil
+				}
+				return r.Ship.Load(c.ID)
+			}
+			if p, ok, err := load(); err != nil {
 				if noteErr := r.packageProblem(ctx, c, err, dry); noteErr != nil {
 					return nil, "", noteErr
 				}
@@ -981,7 +1011,7 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 				r.liftHold(ctx, c, dry)
 				continue
 			} else if ok && (p.State == Proposed || p.State == Landing) {
-				r.liftHold(ctx, c, dry)
+				r.placeHeld(ctx, c, p, dry, &passed)
 				continue // its review or its landing comes next (reviews)
 			} else if ok && p.State != Withdrawn && !p.ProposalAt.IsZero() && p.Plan != nil {
 				if wait := r.Ship.waiting(ctx, c, *p.Plan, r.now()); wait != nil {
@@ -990,8 +1020,9 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 					continue
 				}
 			}
+			pkg, had, _ := load() // the package as selection has it: a dry pass's settlement, else the one on disk
 			var unread recordError
-			if repo, err := r.caseRepo(ctx, c); errors.As(err, &unread) {
+			if repo, target, err := r.caseTarget(ctx, c); errors.As(err, &unread) {
 				// one case's record: the case waits with a low note, and its family's next case runs
 				if !dry {
 					if noteErr := r.noteBuildSkip(ctx, c, "record", err.Error()); noteErr != nil { // it ends with testing (recordNotePrefix)
@@ -1003,13 +1034,13 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 				continue
 			} else if err != nil {
 				return nil, "", err
-			} else if repo == "" {
+			} else if repo == "" && target == "" {
 				if !dry {
 					r.keepHold(ctx, c, "waits for a repository: the investigation named none", true)
 				}
 				passed = append(passed, c.ID+" waits for a repository")
 				continue
-			} else if why, known := r.heldBuild(ctx, repo); why != "" {
+			} else if why, known := r.heldTargetWith(ctx, c, repo, target, pkg, had); why != "" {
 				// a hold of the configuration takes no slot: the family's next workable case runs instead
 				if known && !dry {
 					r.keepHold(ctx, c, why, false)
@@ -1059,6 +1090,43 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 		return a.c.Seen.After(b.c.Seen)
 	})
 	return cands, "", nil
+}
+
+// placeHeld records, or lifts, the hold of a case whose package goes on to its review, its landing or a person (a
+// proposal, or a landing) while its investigation names another place: the package's review and landing go on, and
+// the hold's fixed-text reason and note tell a person the fix moved (placeHold). A dry pass records nothing.
+func (r *Runner) placeHeld(ctx context.Context, c store.Case, p Package, dry bool, passed *[]string) {
+	why := r.placeHold(ctx, c, p)
+	if why == "" {
+		r.liftHold(ctx, c, dry)
+		return
+	}
+	if !dry {
+		r.keepHold(ctx, c, why, false)
+	}
+	*passed = append(*passed, c.ID+" held: "+why)
+}
+
+// placeHold is the reason of placeHeld's hold (unfinishedHold), or "" when the package works on the place the case's
+// investigation names, or that place cannot be read now. It reads only the case's record and the checkout's identity.
+func (r *Runner) placeHold(ctx context.Context, c store.Case, p Package) string {
+	repo, target, err := r.caseTarget(ctx, c)
+	if err != nil || repo == "" && target == "" {
+		return ""
+	}
+	kind, place := KindRepo, ""
+	if target != "" {
+		if place, err = configTargetName(target); err != nil {
+			return ""
+		}
+		kind = KindConfig
+	} else if place, err = r.repoIdentity(ctx, repo); err != nil {
+		return ""
+	}
+	if samePlace(p, kind, place) {
+		return ""
+	}
+	return unfinishedHold(c, p, kind, place)
 }
 
 // keepHold records a hold's change. A failure to record it holds no selection: the hold still takes no slot.
@@ -1534,6 +1602,9 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 func (r *Runner) keepFindings(ctx context.Context, run store.LoopRun, f finding, reported bool, undecided string) error {
 	if reported && f.Repo != "" && !repoName.MatchString(f.Repo) {
 		return fmt.Errorf("invalid investigation repository name")
+	}
+	if r.Ship == nil || !r.Ship.ConfigTargets.Enabled {
+		f.Config = "" // configuration targets are off: a report's config names nothing, and its repo stands
 	}
 	own, recorded, err := recordFindings(ctx, r.Store, run.Case, run.CaseEpisode, f, reported, undecided, "loop:"+run.ID)
 
