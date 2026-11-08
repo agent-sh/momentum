@@ -27,7 +27,7 @@ func harnessOf(tool string) string {
 func artifactsAs(tool, input, output string, failed bool) string {
 	h := harnessOf(tool)
 	call := store.Event{Source: store.Transcripts, SourceKey: "c", TS: at(1), Harness: h, Tool: tool, Kind: "tool_call", Summary: input}
-	res := store.Event{Source: store.Transcripts, SourceKey: "r", TS: at(1).Add(time.Second), Harness: h, Tool: tool, Kind: "tool_result", Summary: output}
+	res := store.Event{Source: store.Transcripts, SourceKey: "r", TS: at(1).Add(time.Second), Harness: h, Tool: tool, Kind: "tool_result", Summary: lined(output)}
 	if failed {
 		res.Meta = `{"is_error":true}`
 	}

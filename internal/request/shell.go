@@ -9,7 +9,7 @@ import (
 )
 
 // shellProgs run the script their -c option names.
-var shellProgs = map[string]bool{"bash": true, "sh": true, "zsh": true, "dash": true, "ksh": true}
+var shellProgs = map[string]bool{"bash": true, "sh": true, "zsh": true, "dash": true}
 
 // invocation is a simple command: the program it runs and its arguments, past assignments and the wrappers that
 // run the command after them. silent is true when its output goes to a file (a redirect of it, or of a command
@@ -52,14 +52,15 @@ type walker struct {
 	size   int
 }
 
-// toFile reports a redirect that sends standard output to a file: >, >> or &> on it, to anything but /dev/stdout.
+// toFile reports a redirect that sends standard output to a file: >, >>, >|, &> or &>> on it, to anything but
+// /dev/stdout.
 func toFile(r *syntax.Redirect) bool {
 	switch r.Op {
-	case syntax.RdrOut, syntax.AppOut:
+	case syntax.RdrOut, syntax.AppOut, syntax.ClbOut:
 		if r.N != nil && r.N.Value != "1" {
 			return false
 		}
-	case syntax.RdrAll:
+	case syntax.RdrAll, syntax.AppAll:
 	default:
 		return false
 	}
@@ -215,9 +216,9 @@ func unwrap(args []string) (invocation, bool) {
 			return invocation{prog: prog, args: args[1:]}, true // an expansion's program (\x00) is no program read here
 		}
 		i := 1
-		for i < len(args) && strings.HasPrefix(args[i], "-") && args[i] != "-" {
+		for i < len(args) && strings.HasPrefix(args[i], "-") {
 			a := args[i]
-			if prog == "command" && (a == "-v" || a == "-V") {
+			if prog == "command" && a == "-v" {
 				return invocation{}, false
 			}
 			if valued[a] {
@@ -241,10 +242,11 @@ func unwrap(args []string) (invocation, bool) {
 // makes is what a shell call's commands make.
 type makes struct {
 	commits, pushes, prs bool
-	// fetches is a git command that prints ref updates as a push does (a fetch or pull that is not quiet); remote
-	// is the first push's remote argument
-	fetches bool
-	remote  string
+	// fetches is a git command that prints ref updates as a push does (a fetch, pull or remote update that is not
+	// quiet); quiet is a call whose every push is quiet, so it printed no ref line; remote is the first push's
+	// remote argument
+	fetches, quiet bool
+	remote         string
 }
 
 // commitCommands are git's commands that make commits.
@@ -254,15 +256,15 @@ var commitCommands = map[string]bool{"commit": true, "cherry-pick": true, "rever
 // makes them (no dry run, no --no-commit, no --abort) and prints its commit line (not quiet, its output not sent to
 // a file), so a commit line in an output where none does is another command's (a cat, a grep); pushes when one
 // runs git push and none of its pushes is a dry run (whose ref lines would be read as pushed); and pull requests
-// when one runs gh pr create without --dry-run and none runs gh pr view, gh pr list or gh api, which print
-// addresses too. A command that ends where the store cut the call's input makes nothing: the cut may have taken
+// when one runs gh pr create without --dry-run and none runs another gh command that prints addresses (gh api, gh
+// search, gh pr view, list, edit, comment, ...). A command that ends where the store cut the call's input makes nothing: the cut may have taken
 // an option that changes what it does (--dry-run, --no-commit, -n).
 func made(d Decoded) makes {
 	var mk makes
-	dry, lists := false, false
+	dry, lists, loud := false, false, false
 	for i, c := range d.Commands {
 		for _, inv := range invocationsOf(c, 0, d.CommandCut && i == len(d.Commands)-1) {
-			if inv.prog == "gh" && len(inv.args) > 0 && (inv.args[0] == "api" || len(inv.args) > 1 && inv.args[0] == "pr" && (inv.args[1] == "view" || inv.args[1] == "list")) {
+			if inv.prog == "gh" && printsAddresses(ghCommand(inv.args)) {
 				lists = true
 			}
 			if inv.cut {
@@ -277,32 +279,58 @@ func made(d Decoded) makes {
 				case sub == "push":
 					mk.pushes = true
 					dry = dry || dryRun(args)
+					loud = loud || !quiet(args)
 					if mk.remote == "" {
-						mk.remote = firstArg(args)
+						mk.remote = pushRemote(args)
 					}
-				case (sub == "fetch" || sub == "pull") && !quiet(args):
+				case (sub == "fetch" || sub == "pull" || sub == "remote" && len(args) > 0 && args[0] == "update") && !quiet(args):
 					mk.fetches = true
 				}
 			case "gh":
-				for j := 0; j+1 < len(inv.args); j++ {
-					if inv.args[j] == "pr" && inv.args[j+1] == "create" && !hasFlag(inv.args[j+2:], "--dry-run") {
-						mk.prs = true
-					}
+				if cmd := ghCommand(inv.args); len(cmd) >= 2 && cmd[0] == "pr" && cmd[1] == "create" && !hasFlag(cmd[2:], "--dry-run") {
+					mk.prs = true
 				}
 			}
 		}
 	}
 	mk.pushes = mk.pushes && !dry
+	mk.quiet = mk.pushes && !loud
 	mk.prs = mk.prs && !lists
 	return mk
 }
 
-// makesNoCommit reports a git command that makes commits run so it makes none: --no-commit (merge, cherry-pick,
-// revert; -n for the last two), or an --abort or --quit of one under way.
+// ghGlobal are gh's flags that take a value as the next word, which may come before its command.
+var ghGlobal = map[string]bool{"-R": true, "--repo": true, "--hostname": true}
+
+// ghCommand is a gh invocation's command and its arguments, past the flags before the command (gh -R o/r pr list
+// is pr list).
+func ghCommand(args []string) []string {
+	for i := 0; i < len(args); i++ {
+		switch a := args[i]; {
+		case ghGlobal[a]:
+			i++
+		case strings.HasPrefix(a, "-"):
+		default:
+			return args[i:]
+		}
+	}
+	return nil
+}
+
+// printsAddresses reports a gh command that prints pull requests' addresses other than one it made: gh api, gh
+// search, and every gh pr command but create (view, list, edit, comment, ready, ...).
+func printsAddresses(cmd []string) bool {
+	return len(cmd) > 0 && (cmd[0] == "api" || cmd[0] == "search") || len(cmd) > 1 && cmd[0] == "pr" && cmd[1] != "create"
+}
+
+// makesNoCommit reports a git command that makes commits run so it makes none: a dry run, --no-commit (merge,
+// cherry-pick, revert; -n for the last two), or an --abort or --quit of one under way.
 func makesNoCommit(sub string, args []string) bool {
 	switch {
 	case hasFlag(args, "--abort") || hasFlag(args, "--quit"):
 		return true
+	case sub == "commit":
+		return hasFlag(args, "--dry-run")
 	case sub == "merge":
 		return hasFlag(args, "--no-commit")
 	case sub == "cherry-pick" || sub == "revert":
@@ -321,10 +349,13 @@ func quiet(args []string) bool {
 	return false
 }
 
-// firstArg is the first argument that is no option.
-func firstArg(args []string) string {
-	for _, a := range args {
-		if !strings.HasPrefix(a, "-") {
+// pushRemote is a push's remote: its first argument that is no option nor an option's value (-o, --push-option).
+func pushRemote(args []string) string {
+	for i := 0; i < len(args); i++ {
+		switch a := args[i]; {
+		case a == "-o" || a == "--push-option":
+			i++
+		case !strings.HasPrefix(a, "-"):
 			return a
 		}
 	}
@@ -354,5 +385,13 @@ func hasFlag(args []string, flag string) bool {
 	return false
 }
 
-// dryRun reports a push that pushes nothing, and prints the ref lines a push does: --dry-run or -n.
-func dryRun(args []string) bool { return hasFlag(args, "--dry-run") || hasFlag(args, "-n") }
+// dryRun reports a push that pushes nothing, and prints the ref lines a push does: --dry-run, or -n alone or among
+// short options (-nv, -un, -fn).
+func dryRun(args []string) bool {
+	for _, a := range args {
+		if a == "--dry-run" || strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.Contains(a[1:], "n") {
+			return true
+		}
+	}
+	return false
+}

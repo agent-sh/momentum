@@ -375,7 +375,7 @@ func (t *thread) add(e store.Event) {
 			return
 		}
 		t.done[m.ToolID] = true
-		if storeCut(call, e) {
+		if storeCut(call, e) || storeJoined(call, e) {
 			t.pending = append(t.pending, pair{call: slim(call), res: slim(e)})
 			return
 		}

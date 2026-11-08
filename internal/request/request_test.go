@@ -69,8 +69,17 @@ func (f *fixture) tool(session, agent, tool string, ts time.Time, input, output 
 	if failed {
 		m["is_error"] = true
 	}
-	f.event(session, agent, "tool_result", store.ActorTool, ts.Add(time.Second), output, m)
+	f.event(session, agent, "tool_result", store.ActorTool, ts.Add(time.Second), lined(output), m)
 	f.evs[len(f.evs)-1].Tool = tool
+}
+
+// lined is a tool's output as it printed it, with its lines: a fixture's one-line text ends its line, as a
+// transcript keeps it. (The store joins a plain output's lines; a request reads that whole from the transcript.)
+func lined(s string) string {
+	if s == "" || strings.Contains(s, "\n") || strings.HasSuffix(s, "…") {
+		return s
+	}
+	return s + "\n"
 }
 
 func (f *fixture) phase(session string, ts time.Time, kind, to string, extra map[string]any) {
@@ -126,7 +135,7 @@ func TestAThreadIsOneRequestWithItsResults(t *testing.T) {
 	f.owner("s-alpha", at(0), "fix the date parser")
 	f.reply("s-alpha", at(1), "Looking at the parser.")
 	f.tool("s-alpha", "", "Edit", at(2), `{"file_path":"/work/s-alpha/date.go","old_string":"a","new_string":"b"}`, "The file was updated.", false)
-	f.tool("s-alpha", "", "Bash", at(3), `{"command":"git commit -am 'Fix the date parser'"}`, "[main 1a2b3c4] Fix the date parser 1 file changed, 2 insertions(+)", false)
+	f.tool("s-alpha", "", "Bash", at(3), `{"command":"git commit -am 'Fix the date parser'"}`, "[main 1a2b3c4] Fix the date parser\n 1 file changed, 2 insertions(+)", false)
 	f.owner("s-alpha", at(10), "also add a test")
 	f.tool("s-alpha", "", "Write", at(11), `{"file_path":"/work/s-alpha/date_test.go","content":"package x"}`, "File created.", false)
 	f.reply("s-alpha", at(12), "Done: the parser is fixed and tested.")
@@ -141,7 +150,7 @@ func TestAThreadIsOneRequestWithItsResults(t *testing.T) {
 	if words(rq.Asks) != "fix the date parser | also add a test" {
 		t.Fatalf("asks: %s", words(rq.Asks))
 	}
-	if got := kinds(rq.Results); got != "file /work/s-alpha/date_test.go | commit commit 1a2b3c4 on main | file /work/s-alpha/date.go" {
+	if got := kinds(rq.Results); got != "file /work/s-alpha/date_test.go | commit commit 1a2b3c4 on main: Fix the date parser | file /work/s-alpha/date.go" {
 		t.Fatalf("results: %s", got)
 	}
 	if rq.Report == nil || rq.Report.Text != "Done: the parser is fixed and tested." {
@@ -435,13 +444,13 @@ func TestResultsComeFromToolOutput(t *testing.T) {
 	f.tool("s-r", "", "Bash", at(3), `{"command":"gh pr view 7"}`, "https://github.com/example/x/pull/7", false)
 	f.tool("s-r", "", "Write", at(4), `{"file_path":"/work/s-r/a.txt"}`, "permission denied", true)
 	f.tool("s-r", "", "Bash", at(5), `{"command":"git push -u origin feat"}`,
-		"To github.com:example/x.git * [new branch] feat -> feat branch 'feat' set up to track 'origin/feat'.", false)
+		"To github.com:example/x.git\n * [new branch]      feat -> feat\nbranch 'feat' set up to track 'origin/feat'.", false)
 	f.tool("s-r", "", "Bash", at(6), `{"command":"gh pr create --fill"}`, "https://github.com/example/x/pull/8", false)
 	f.tool("s-r", "", "apply_patch", at(7), "*** Begin Patch *** Update File: src/b.go @@ *** Add File: src/c.go +x *** End Patch", "Success.", false)
-	f.tool("s-r", "", "Bash", at(8), `{"command":"git commit"}`, "[main (root-commit) 2f3a4b5] First 1 file changed", false)
+	f.tool("s-r", "", "Bash", at(8), `{"command":"git commit"}`, "[main (root-commit) 2f3a4b5] First\n 1 file changed", false)
 	f.tool("s-r", "", "Bash", at(9), `{"command":"git commit"}`, "[detached HEAD 3a4b5c6] Fix", false)
 	rq := f.group()[0]
-	want := "commit commit 3a4b5c6 on detached HEAD | commit commit 2f3a4b5 on main | file src/b.go | file src/c.go | " +
+	want := "commit commit 3a4b5c6 on detached HEAD: Fix | commit commit 2f3a4b5 on main: First | file src/b.go | file src/c.go | " +
 		"pr pull request https://github.com/example/x/pull/8 | push pushed new branch feat -> feat to github.com:example/x.git"
 	if got := kinds(rq.Results); got != want {
 		t.Fatalf("results:\n got %s\nwant %s", got, want)

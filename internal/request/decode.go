@@ -2,6 +2,7 @@ package request
 
 import (
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -15,6 +16,20 @@ type Decoded struct {
 	Output     string
 	Paths      []string
 	CommandCut bool // the store cut the last command: what it ran last may have had more arguments
+	// Joined is an output the store keeps as plain text with its lines flattened to spaces: where a line ends is
+	// not known, so nothing is read off it (a whole read gives its lines)
+	Joined bool
+	// Chunks are a Codex code-mode script's commands, each with its own output, when the script ran as many
+	// exec_command calls as its output holds results; Unpaired is a script whose results cannot be matched so
+	Chunks   []Chunk
+	Unpaired bool
+}
+
+// Chunk is one exec_command of a Codex code-mode script: its command, its own output, and whether it exited
+// non-zero.
+type Chunk struct {
+	Command, Output string
+	Failed          bool
 }
 
 // Keys of the stored inputs and outputs, every harness's.
@@ -71,13 +86,6 @@ func Decode(harness, tool, input, output string) Decoded {
 				continue
 			}
 			switch {
-			case f.list && f.cut:
-				// the last word loses its last token, as a command does: a shell's -c script keeps the rest of it
-				argv := append([]string(nil), f.values...)
-				if argv[len(argv)-1] = uncut(argv[len(argv)-1], true); argv[len(argv)-1] == "" {
-					argv = argv[:len(argv)-1]
-				}
-				d.Commands = append(d.Commands, argvScript(argv))
 			case f.list:
 				d.Commands = append(d.Commands, argvScript(f.values))
 			case len(f.values) > 0:
@@ -86,24 +94,82 @@ func Decode(harness, tool, input, output string) Decoded {
 			d.CommandCut = f.cut
 		}
 	}
-	// Codex's code mode and Hermes keep a result as JSON whose output fields are its text; every other harness keeps
-	// the text itself, which may print JSON of its own.
-	var outs []string
-	cut := false
-	if harness == "hermes" || harness == "codex" && tool == "exec" {
+	// Codex's code mode and Hermes keep a result as JSON whose output fields are its text, its lines kept; every
+	// other harness keeps the text itself, which may print JSON of its own, and the store joins its lines.
+	switch {
+	case harness == "codex" && tool == "exec":
+		chunks := codeChunks(output)
+		var outs []string
+		for _, c := range chunks {
+			outs = append(outs, c.Output)
+		}
+		d.Output = strings.Join(outs, "\n")
+		if len(chunks) == len(d.Commands) {
+			for i := range chunks {
+				chunks[i].Command = d.Commands[i]
+			}
+			d.Chunks = chunks
+		} else {
+			d.Unpaired = true
+		}
+	case harness == "hermes":
+		var outs []string
 		for _, f := range fields(output, `"`, false) {
 			if outputKeys[f.key] && !f.list && len(f.values) > 0 {
 				outs = append(outs, uncut(f.values[0], f.cut))
-				cut = cut || f.cut
 			}
 		}
-	}
-	if len(outs) > 0 {
 		d.Output = strings.Join(outs, "\n")
-	} else {
+		if len(outs) == 0 {
+			d.Output = output // a writer's result: no output field
+		}
+	default:
 		d.Output = uncut(output, strings.HasSuffix(output, "…"))
+		d.Joined = output != "" && !strings.Contains(output, "\n")
 	}
 	return d
+}
+
+// exitRe is a code-mode result's exit code.
+var exitRe = regexp.MustCompile(`"exit_code":\s*(-?\d+)`)
+
+// codeChunks are the results a Codex code-mode output holds, in order: each object's output fields (output,
+// stdout, stderr) as one text, the last token of one the cut ends dropped, and whether its exit code is not 0.
+func codeChunks(output string) []Chunk {
+	var out []Chunk
+	obj := -1
+	for i := 0; i < len(output); {
+		j := strings.IndexByte(output[i:], '"')
+		if j < 0 {
+			break
+		}
+		j += i
+		key, n, _ := literal(output[j:])
+		k := skipSpace(output, j+n)
+		if !outputKeys[key] || k >= len(output) || output[k] != ':' {
+			i = j + n
+			continue
+		}
+		v := skipSpace(output, k+1)
+		if v >= len(output) || output[v] != '"' {
+			i = v
+			continue
+		}
+		text, m, closed := literal(output[v:])
+		start := strings.LastIndexByte(output[:j], '{')
+		if start == obj && len(out) > 0 {
+			out[len(out)-1].Output += "\n" + uncut(text, !closed)
+		} else {
+			c := Chunk{Output: uncut(text, !closed)}
+			if e := exitRe.FindStringSubmatch(output[max(start, 0):j]); e != nil {
+				c.Failed = e[1] != "0"
+			}
+			out = append(out, c)
+		}
+		obj = start
+		i = v + m
+	}
+	return out
 }
 
 // uncut is a text with its cut taken into account: when the store cut it, without the ellipsis and the token the

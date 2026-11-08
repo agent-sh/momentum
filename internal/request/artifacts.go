@@ -16,21 +16,20 @@ var writers = map[string]bool{"write": true, "edit": true, "multiedit": true, "n
 // shells are the harnesses' shell tools (toolresult).
 func shells() []string { return toolresult.Shells() }
 
-// The texts an artifact is read from, matched in the decoded output, where a line ends at a newline (a text read
-// whole, or kept as JSON) or the store joined the lines with spaces (a text it keeps plain).
+// The lines an artifact is read from, in an output whose lines are kept (read whole, or kept as JSON).
 var (
 	// the head of git's commit line, [BRANCH HASH], the branch maybe "detached HEAD", a first commit "(root-commit)";
-	// its subject is the rest of the line, where the text has lines
-	commitRe = regexp.MustCompile(`(?m)(?:^|\s)\[([^\[\]\n]+?)(?: \(root-commit\))? ([0-9a-f]{7,40})\](?: |$)`)
-	// git push's To line, To REMOTE, after whitespace or at the start: in a text the store joined there is no line
-	pushToRe = regexp.MustCompile(`(?:^|\s)To (\S+)`)
+	// its subject is the rest of the line
+	commitRe = regexp.MustCompile(`(?m)^\[([^\[\]\n]+?)(?: \(root-commit\))? ([0-9a-f]{7,40})\](?: |$)`)
+	// git push's To line, To REMOTE
+	pushToRe = regexp.MustCompile(`(?m)^To (\S+)`)
 	// what ends a push's block: a fetch's From line (the next push's To line ends it too)
-	pushEndRe = regexp.MustCompile(`(?:^|\s)From \S`)
-	// a ref update of a push: OLD..NEW SRC -> DST (OLD...NEW for a forced one), or * [new branch] SRC -> DST
-	pushRefRe = regexp.MustCompile(`(?m)(?:^|\s)(?:([0-9a-f]{7,40})\.\.\.?([0-9a-f]{7,40})|\* \[new branch\])\s+(\S+) -> (\S+)`)
-	prRe      = regexp.MustCompile(`https?://[^\s"']+/pull/\d+`)
+	pushEndRe = regexp.MustCompile(`(?m)^From \S`)
+	// a ref update of a push: OLD..NEW SRC -> DST, + OLD...NEW SRC -> DST for a forced one, or * [new branch] SRC
+	// -> DST
+	pushRefRe = regexp.MustCompile(`(?m)^[ \t]*(?:\+[ \t]*)?(?:([0-9a-f]{7,40})\.\.\.?([0-9a-f]{7,40})|\* \[new branch\])[ \t]+(\S+) -> (\S+)`)
 	// a line that is a pull request's address alone, as gh pr create prints it
-	prLineRe = regexp.MustCompile(`(?m)^[ \t]*(https?://[^\s"']+/pull/\d+)[ \t\r]*$`)
+	prLineRe = regexp.MustCompile(`(?m)^(https?://[^\s"']+/pull/\d+)[ \t\r]*$`)
 	patchRe  = regexp.MustCompile(`\*\*\* (?:Add|Update|Delete) File: ([^\s"]+)`)
 	// a push's remote: a URL, an scp-like host:path, or a path
 	remoteRe = regexp.MustCompile(`[:/]`)
@@ -63,6 +62,8 @@ func Artifacts(call, res store.Event) []Result {
 }
 
 // artifactsOf reads a call's artifacts off its decoded input and output, with what its commands make, read once.
+// An output the store joined shows nothing; a Codex code-mode script's results are read each against its own
+// command, and none when they cannot be matched to its commands.
 func artifactsOf(call, res store.Event, d Decoded, mk makes) []Result {
 	failed := metaOf(res.Meta).IsError
 	once := metaOf(call.Meta).ToolID // what a call recorded again (a harness's copy of the same call) shares
@@ -74,75 +75,66 @@ func artifactsOf(call, res store.Event, d Decoded, mk makes) []Result {
 		}
 		out = append(out, r)
 	}
-	if writers[strings.ToLower(call.Tool)] {
+	switch {
+	case writers[strings.ToLower(call.Tool)]:
 		for _, p := range d.Paths {
 			add(Result{Kind: KindFile, Key: KindFile + ":" + p + "@" + once, Text: p, Event: call.ID()})
 		}
-		return out
+	case d.Joined || d.Unpaired:
+	case d.Chunks != nil:
+		for i, c := range d.Chunks {
+			cut := d.CommandCut && i == len(d.Chunks)-1
+			for _, r := range shown(c.Output, failed || c.Failed, made(Decoded{Commands: []string{c.Command}, CommandCut: cut}), once) {
+				add(r)
+			}
+		}
+	default:
+		for _, r := range shown(d.Output, failed, mk, once) {
+			add(r)
+		}
 	}
-	text := d.Output
-	lines := strings.Contains(text, "\n")
+	return out
+}
+
+// shown are the artifacts a text with its lines shows, of commands that make what mk says: the commit lines, in a
+// failed result too, the ref lines of a push's blocks and the addresses gh pr create printed.
+func shown(text string, failed bool, mk makes, once string) []Result {
+	var out []Result
 	if mk.commits {
 		for _, c := range commitRe.FindAllStringSubmatchIndex(text, -1) {
 			hash, branch := text[c[4]:c[5]], text[c[2]:c[3]]
 			r := Result{Kind: KindCommit, Key: KindCommit + ":" + hash, Text: fmt.Sprintf("commit %s on %s", hash, branch)}
-			if lines {
-				// the subject is the rest of its line
-				rest, _, _ := strings.Cut(text[c[1]:], "\n")
-				if s := strings.TrimSpace(rest); s != "" {
-					r.Text += ": " + s
-				}
+			// the subject is the rest of its line
+			rest, _, _ := strings.Cut(text[c[1]:], "\n")
+			if s := strings.TrimSpace(rest); s != "" {
+				r.Text += ": " + s
 			}
-			add(r)
+			out = append(out, r)
 		}
 	}
 	if failed {
 		return out // a failed result shows its commit lines, and nothing else it made
 	}
-
 	if mk.pushes {
 		for _, b := range pushBlocks(text, mk) {
 			for _, p := range pushRefRe.FindAllStringSubmatch(b.refs, -1) {
 				if p[2] != "" {
-					add(Result{Kind: KindPush, Key: KindPush + ":" + b.remote + " " + p[4] + "@" + p[2],
+					out = append(out, Result{Kind: KindPush, Key: KindPush + ":" + b.remote + " " + p[4] + "@" + p[2],
 						Text: fmt.Sprintf("pushed %s -> %s (%s..%s) to %s", p[3], p[4], p[1], p[2], b.remote)})
 				} else {
-					add(Result{Kind: KindPush, Key: KindPush + ":" + b.remote + " " + p[4] + "@new@" + once,
+					out = append(out, Result{Kind: KindPush, Key: KindPush + ":" + b.remote + " " + p[4] + "@new@" + once,
 						Text: fmt.Sprintf("pushed new branch %s -> %s to %s", p[3], p[4], b.remote)})
 				}
 			}
 		}
 	}
 	if mk.prs {
-		for _, u := range createdPRs(text, lines) {
-			add(Result{Kind: KindPR, Key: KindPR + ":" + u, Text: "pull request " + u})
-		}
-	}
-	return out
-}
-
-func isSpace(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
-
-// createdPRs are the addresses gh pr create printed, each once: every one on a line of its own (in a text the
-// store joined, a word of its own not after a word that ends with a colon, such as a field's url:), except the
-// address of one it says already exists (on the line after "already exists:").
-func createdPRs(text string, lines bool) []string {
-	var out []string
-	add := func(u string) { out = append(out, u) } // an address printed again is the same result: its key is the address
-	if lines {
 		for _, m := range prLineRe.FindAllStringSubmatchIndex(text, -1) {
+			// not the address of one it says already exists, on the line after the refusal
 			if !strings.HasSuffix(strings.TrimRight(text[:m[0]], " \t\r\n"), "already exists:") {
-				add(text[m[2]:m[3]])
+				u := text[m[2]:m[3]]
+				out = append(out, Result{Kind: KindPR, Key: KindPR + ":" + u, Text: "pull request " + u})
 			}
-		}
-		return out
-	}
-	for _, loc := range prRe.FindAllStringIndex(text, -1) {
-		if loc[0] > 0 && !isSpace(text[loc[0]-1]) || loc[1] < len(text) && !isSpace(text[loc[1]]) {
-			continue
-		}
-		if !strings.HasSuffix(strings.TrimRight(text[:loc[0]], " \t"), ":") {
-			add(text[loc[0]:loc[1]])
 		}
 	}
 	return out
@@ -153,9 +145,10 @@ type block struct {
 	remote, refs string
 }
 
-// pushBlocks are the blocks git push printed: each from a To word followed by a remote's shape (a URL, host:path,
-// a path) to the next From or To, or the text's end. With no To (a tail kept only the last lines), the whole text
-// of a call that ran nothing else that prints ref lines, its remote the push's own.
+// pushBlocks are the blocks git push printed: each from a To line whose remote has a remote's shape (a URL,
+// host:path, a path) to the next From or To line, or the text's end. With no To line (a tail kept only the last
+// lines), the whole text, its remote the push's own, of a call whose pushes are not all quiet and that ran nothing
+// else that prints ref lines.
 func pushBlocks(text string, mk makes) []block {
 	var tos [][]int
 	for _, t := range pushToRe.FindAllStringSubmatchIndex(text, -1) {
@@ -174,7 +167,7 @@ func pushBlocks(text string, mk makes) []block {
 		}
 		out = append(out, block{remote: text[t[2]:t[3]], refs: rest})
 	}
-	if len(tos) == 0 && !mk.fetches {
+	if len(tos) == 0 && !mk.fetches && !mk.quiet { // a quiet push printed no ref line: one there is another's
 		remote := mk.remote
 		if remote == "" {
 			remote = "origin"

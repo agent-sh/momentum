@@ -15,6 +15,7 @@ import (
 	"github.com/agent-sh/tacit/client/pkg/evidence"
 
 	"github.com/agent-sh/momentum/internal/store"
+	"github.com/agent-sh/momentum/internal/toolresult"
 )
 
 // Why a cut call was read as the store holds it.
@@ -258,6 +259,21 @@ func storeCut(call, res store.Event) bool {
 	return strings.HasSuffix(call.Summary, "…") || strings.HasSuffix(res.Summary, "…")
 }
 
+// storeJoined reports a shell call's output the store keeps with its lines flattened to spaces (every harness's
+// plain text but Hermes's and Codex code mode's JSON), when it may show an artifact's line: only a whole read gives
+// its lines.
+func storeJoined(call, res store.Event) bool {
+	tool := strings.ToLower(call.Tool)
+	if writers[tool] || !toolresult.IsShell(tool) || call.Harness == "hermes" || call.Harness == "codex" && tool == "exec" {
+		return false
+	}
+	return !strings.Contains(res.Summary, "\n") && resultMarkRe.MatchString(res.Summary)
+}
+
+// resultMarkRe is what an output that shows an artifact's line holds: a commit line's "] ", a ref update's " -> ",
+// a pull request's "/pull/" (the store's read selects the shells' results by the same marks).
+var resultMarkRe = regexp.MustCompile(`\] | -> |/pull/`)
+
 // need is a record a whole read wants from a transcript file: its offset, the tool id of its block, and whether
 // it is a result.
 type need struct {
@@ -413,6 +429,10 @@ func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 		jobs[i] = job{p: p, tool: strings.ToLower(p.call.Tool), id: metaOf(p.call.Meta).ToolID}
 	}
 	// read reads one thread's jobs whole and takes off what each made, letting go of the raw records
+	// an output read whole: one the store cut, or one it joined (only a whole read gives its lines)
+	whole := func(j *job) bool {
+		return !writers[j.tool] && (cut(j.p.res.Summary) || storeJoined(*j.p.call, *j.p.res))
+	}
 	read := func(js []job) {
 		var first, second []fetch
 		for i := range js {
@@ -420,8 +440,8 @@ func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 			if cut(j.p.call.Summary) {
 				first = append(first, fetch{*j.p.call, j.id, false})
 			}
-			// a compressed transcript is read once: its cut output in the same pass as the input
-			if path, _, ok := refPlace(j.p.res.Ref); ok && !writers[j.tool] && cut(j.p.res.Summary) && fileHarness(j.p.res.Harness) && r.compressed(path) {
+			// a compressed transcript is read once: its output in the same pass as the input
+			if path, _, ok := refPlace(j.p.res.Ref); ok && whole(j) && fileHarness(j.p.res.Harness) && r.compressed(path) {
 				first = append(first, fetch{*j.p.res, j.id, true})
 			}
 		}
@@ -446,21 +466,21 @@ func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 				continue
 			}
 			j.mk = made(Decode(j.p.call.Harness, j.tool, inputs[i], ""))
-			if (j.mk.commits || j.mk.pushes || j.mk.prs) && cut(j.p.res.Summary) {
+			if (j.mk.commits || j.mk.pushes || j.mk.prs) && whole(j) {
 				second = append(second, fetch{*j.p.res, j.id, true})
 			}
 		}
 		r.prefetch(second)
 		for i := range js {
 			j := &js[i]
-			output := j.p.res.Summary
-			if !writers[j.tool] && cut(j.p.res.Summary) {
+			output, lines := j.p.res.Summary, false
+			if whole(j) {
 				// taken whether used or not, so no raw output stays behind
 				text, ok, why := r.take(ctx, *j.p.res, j.id, true)
 				switch {
 				case j.skip || !(j.mk.commits || j.mk.pushes || j.mk.prs):
 				case ok:
-					output, j.raw = text, true
+					output, j.raw, lines = text, true, true
 				case j.why == "":
 					j.why = why
 				}
@@ -475,7 +495,9 @@ func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 					j.found = artifactsOf(call, res, Decode(call.Harness, j.tool, inputs[i], ""), makes{})
 				}
 			} else {
-				j.found = artifactsOf(call, res, Decode(call.Harness, j.tool, inputs[i], output), j.mk)
+				d := Decode(call.Harness, j.tool, inputs[i], output)
+				d.Joined = d.Joined && !lines // a text read whole has its lines, one line or many
+				j.found = artifactsOf(call, res, d, j.mk)
 			}
 		}
 	}

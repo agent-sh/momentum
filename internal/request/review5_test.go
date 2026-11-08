@@ -29,31 +29,26 @@ func TestWhatTheCutTouchesIsDropped(t *testing.T) {
 	commit := "commit commit 1a2b3c4 on main: Fix the parser"
 	push := "push pushed main -> main (1111111..2222222) to github.com:example/x.git"
 	pr := "pr pull request https://github.com/example/x/pull/12"
+	// Hermes keeps an output as JSON, its lines kept, and the store cuts it as it does any text
+	ci, pi, gi := `{"command": "git commit -am 'Fix the parser'"}`, `{"command": "git push origin main"}`, `{"command": "gh pr create --fill"}`
 	shells := []struct{ name, input, output, want string }{
-		{"a commit's hash, cut inside", `{"command":"git commit -am 'Fix the parser'"}`, "[main 1a2b…", ""},
-		{"a commit's hash, cut at its end", `{"command":"git commit -am 'Fix the parser'"}`, "[main 1a2b3c4…", ""},
-		{"a commit line, cut after it", `{"command":"git commit -am 'Fix the parser'"}`, "[main 1a2b3c4] Fix the parser\n 1 file changed, 2 insertions…", commit},
-		{"a commit line, no cut", `{"command":"git commit -am 'Fix the parser'"}`, "[main 1a2b3c4] Fix the parser\n 1 file changed", commit},
-		{"a ref line, cut inside", `{"command":"git push origin main"}`, "To github.com:example/x.git 1111111..2222222 main -> ma…", ""},
-		{"a ref line, cut at its end", `{"command":"git push origin main"}`, "To github.com:example/x.git 1111111..2222222 main -> main…", ""},
-		{"a ref line, cut after it", `{"command":"git push origin main"}`, "To github.com:example/x.git 1111111..2222222 main -> main …", push},
-		{"a ref line, no cut", `{"command":"git push origin main"}`, "To github.com:example/x.git 1111111..2222222 main -> main", push},
-		{"a branch, cut inside", `{"command":"git push origin feature/parser"}`, "To github.com:example/x.git 1111111..2222222 feature/parser -> feature/pa…", ""},
-		{"an address, cut inside", `{"command":"gh pr create --fill"}`, "Creating pull request for fix into main in example/x https://github.com/example/x/pull/1…", ""},
-		{"an address, cut at its end", `{"command":"gh pr create --fill"}`, "Creating pull request for fix into main in example/x https://github.com/example/x/pull/12…", ""},
-		{"an address, cut after it", `{"command":"gh pr create --fill"}`, "Creating pull request for fix into main in example/x https://github.com/example/x/pull/12 …", pr},
-		{"an address, no cut", `{"command":"gh pr create --fill"}`, "Creating pull request for fix into main in example/x https://github.com/example/x/pull/12", pr},
-		// Hermes keeps an output as JSON: a value the cut ends loses its last token the same way
-		{"a JSON output's address, cut at its end", "", `{"output": "https://github.com/example/x/pull/12…`, ""},
-		{"a JSON output's address, cut after it", "", `{"output": "https://github.com/example/x/pull/12\nWarning: …`, pr},
+		{"a commit's hash, cut inside", ci, `{"output": "[main 1a2b…`, ""},
+		{"a commit's hash, cut at its end", ci, `{"output": "[main 1a2b3c4…`, ""},
+		{"a commit line, cut after it", ci, `{"output": "[main 1a2b3c4] Fix the parser\n 1 file changed, 2 insertions…`, commit},
+		{"a commit line, no cut", ci, `{"output": "[main 1a2b3c4] Fix the parser\n 1 file changed"}`, commit},
+		{"a ref line, cut inside", pi, `{"output": "To github.com:example/x.git\n   1111111..2222222  main -> ma…`, ""},
+		{"a ref line, cut at its end", pi, `{"output": "To github.com:example/x.git\n   1111111..2222222  main -> main…`, ""},
+		{"a ref line, cut after it", pi, `{"output": "To github.com:example/x.git\n   1111111..2222222  main -> main\n…`, push},
+		{"a ref line, no cut", pi, `{"output": "To github.com:example/x.git\n   1111111..2222222  main -> main"}`, push},
+		{"a branch, cut inside", `{"command": "git push origin feature/parser"}`, `{"output": "To github.com:example/x.git\n   1111111..2222222  feature/parser -> feature/pa…`, ""},
+		{"an address, cut inside", gi, `{"output": "Creating pull request for fix into main in example/x\n\nhttps://github.com/example/x/pull/1…`, ""},
+		{"an address, cut at its end", gi, `{"output": "Creating pull request for fix into main in example/x\n\nhttps://github.com/example/x/pull/12…`, ""},
+		{"an address, cut after it", gi, `{"output": "Creating pull request for fix into main in example/x\n\nhttps://github.com/example/x/pull/12\n…`, pr},
+		{"an address, no cut", gi, `{"output": "Creating pull request for fix into main in example/x\n\nhttps://github.com/example/x/pull/12\n"}`, pr},
 	}
 	for _, c := range shells {
 		t.Run(c.name, func(t *testing.T) {
-			tool, input := "Bash", c.input
-			if input == "" {
-				tool, input = "terminal", `{"command": "gh pr create --fill"}`
-			}
-			if got := artifactsAs(tool, input, c.output, false); got != c.want {
+			if got := artifactsAs("terminal", c.input, c.output, false); got != c.want {
 				t.Errorf("got %q, want %q", got, c.want)
 			}
 		})
@@ -114,8 +109,6 @@ func TestThePullRequestIsTheAddressGhPrinted(t *testing.T) {
 			"a pull request for branch \"fix\" into branch \"main\" already exists: https://github.com/me/r/pull/7 title: Fix the parser -- " + body + " url: https://github.com/me/r/pull/7", ""},
 		{"two made in a loop", `{"command":"for r in a b; do gh pr create -R me/$r --fill; done"}`,
 			"https://github.com/me/a/pull/3\nhttps://github.com/me/b/pull/4\n", "pull request https://github.com/me/a/pull/3 | pull request https://github.com/me/b/pull/4"},
-		{"two made in a loop, the lines joined", `{"command":"for r in a b; do gh pr create -R me/$r --fill; done"}`,
-			"https://github.com/me/a/pull/3 https://github.com/me/b/pull/4", "pull request https://github.com/me/a/pull/3 | pull request https://github.com/me/b/pull/4"},
 		{"one made, one that exists, one made", `{"command":"for r in a b c; do gh pr create -R me/$r --fill; done"}`,
 			"https://github.com/me/a/pull/3\na pull request for branch \"fix\" into branch \"main\" already exists:\nhttps://github.com/me/b/pull/9\nhttps://github.com/me/c/pull/5\n",
 			"pull request https://github.com/me/a/pull/3 | pull request https://github.com/me/c/pull/5"},
@@ -297,7 +290,7 @@ func TestWhatAPushIsReadThrough(t *testing.T) {
 		{"nice -N", `{"command":"nice -10 git push origin main"}`, "To github.com:example/x.git 1111111..2222222 main -> main",
 			"push pushed main -> main (1111111..2222222) to github.com:example/x.git"},
 		// in a text the store joined, a To word is a push's only when a remote's shape follows it
-		{"a To word that names no remote", `{"command":"git push origin HEAD:main 2>&1 | tail -n 1"}`, "Note To self 1111111..2222222 HEAD -> main",
+		{"a To line that names no remote", `{"command":"git push origin HEAD:main 2>&1 | tail -n 2"}`, "To self\n1111111..2222222 HEAD -> main",
 			"push pushed HEAD -> main (1111111..2222222) to origin"},
 	}
 	for _, c := range cases {

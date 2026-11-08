@@ -68,7 +68,7 @@ func TestAPlainOutputIsNotDecodedAsJSON(t *testing.T) {
 func (f *fixture) pairWithID(session, agent, harness, tool, id string, ts time.Time, input, output string) {
 	f.event(session, agent, "tool_call", store.ActorAgent, ts, input, map[string]any{"tool_id": id})
 	f.evs[len(f.evs)-1].Tool, f.evs[len(f.evs)-1].Harness = tool, harness
-	f.event(session, agent, "tool_result", store.ActorTool, ts.Add(time.Second), output, map[string]any{"tool_id": id})
+	f.event(session, agent, "tool_result", store.ActorTool, ts.Add(time.Second), lined(output), map[string]any{"tool_id": id})
 	f.evs[len(f.evs)-1].Tool, f.evs[len(f.evs)-1].Harness = tool, harness
 }
 

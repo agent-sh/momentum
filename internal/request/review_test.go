@@ -149,8 +149,8 @@ func TestADryRunIsNoPush(t *testing.T) {
 // from a file-writing call. Every tool kind against every command kind.
 func TestArtifactsComeOnlyFromTheCallThatMadeThem(t *testing.T) {
 	commit := "[main 1a2b3c4] Fix it\n 1 file changed"
-	push := "To github.com:example/x.git 1111111..2222222 main -> main"
-	pr := "https://github.com/example/x/pull/7"
+	push := "To github.com:example/x.git\n   1111111..2222222  main -> main"
+	pr := "https://github.com/example/x/pull/7\n"
 	cases := []struct {
 		name, tool, input, output string
 		failed                    bool
@@ -178,7 +178,7 @@ func TestArtifactsComeOnlyFromTheCallThatMadeThem(t *testing.T) {
 		{"git push --dry-run", "Bash", `{"command":"git push --dry-run"}`, push, false, ""},
 		{"git fetch", "Bash", `{"command":"git fetch origin"}`, "From github.com:example/x 1111111..2222222 main -> origin/main", false, ""},
 		{"a push that failed", "Bash", `{"command":"git push"}`, push, true, ""},
-		{"gh pr create", "Bash", `{"command":"gh pr create --fill"}`, pr, false, "pr pull request " + pr},
+		{"gh pr create", "Bash", `{"command":"gh pr create --fill"}`, pr, false, "pr pull request https://github.com/example/x/pull/7"},
 		{"gh pr view", "Bash", `{"command":"gh pr view 7"}`, pr, false, ""},
 		{"gh pr create's text in an echo", "Bash", `{"command":"echo run gh pr create"}`, pr, false, ""},
 		{"a commit's text echoed", "Bash", `{"command":"echo 'git commit'"}`, commit, false, ""},
@@ -459,7 +459,7 @@ func TestFindReachesASessionThatContinuesIt(t *testing.T) {
 	f.event("s-child", "", "agent_text", store.ActorAgent, at(30), "Continuing after the compression.", map[string]any{"parent": "s-parent"})
 	f.event("s-child", "", "tool_call", store.ActorAgent, at(31), `{"command":"git commit -m importer"}`, map[string]any{"parent": "s-parent", "tool_id": "c-child"})
 	f.evs[len(f.evs)-1].Tool = "terminal"
-	f.event("s-child", "", "tool_result", store.ActorTool, at(32), "[main 8a8a8a8] Rewrite the importer", map[string]any{"parent": "s-parent", "tool_id": "c-child"})
+	f.event("s-child", "", "tool_result", store.ActorTool, at(32), "[main 8a8a8a8] Rewrite the importer\n", map[string]any{"parent": "s-parent", "tool_id": "c-child"})
 	f.evs[len(f.evs)-1].Tool = "terminal"
 	f.put()
 	rq, err := Find(context.Background(), f.st, ID(at(0), "rewrite the importer"), Options{})

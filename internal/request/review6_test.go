@@ -31,14 +31,32 @@ func TestAPullRequestBesideAListingIsNotKnown(t *testing.T) {
 	}
 }
 
-// In a text the store joined, a commit line is its [BRANCH HASH] alone: where its subject ends is not known, so
-// the push and the pull request after it are read.
-func TestAJoinedCommitLineIsItsHeadAlone(t *testing.T) {
-	got := artifactsAs("Bash", `{"command":"git commit --allow-empty -m 'Trigger CI' && git push origin feat && gh pr create --fill"}`,
-		"[feat 1a2b3c4] Trigger CI To github.com:example/x.git 1111111..1a2b3c4 feat -> feat https://github.com/example/x/pull/12", false)
-	want := "commit commit 1a2b3c4 on feat | push pushed feat -> feat (1111111..1a2b3c4) to github.com:example/x.git | pr pull request https://github.com/example/x/pull/12"
-	if got != want {
-		t.Errorf("got %q\nwant %q", got, want)
+// The store keeps a plain output with its lines flattened to spaces, where no line ends: nothing is read off it.
+// It is read whole from the transcript, which keeps the lines; with the transcript gone it shows nothing, and the
+// call is counted as cut.
+func TestAJoinedOutputIsReadWholeOrNotAtAll(t *testing.T) {
+	command := "git commit --allow-empty -m 'Trigger CI' && git push -u origin feat 2>&1 | tail -n 3 && gh pr create --fill"
+	output := "[feat 1a2b3c4] Trigger CI\nTo github.com:example/x.git\n   1111111..1a2b3c4  feat -> feat\nremote: \nhttps://github.com/example/x/pull/12\n"
+	call := store.Event{Source: store.Transcripts, SourceKey: "c", TS: at(1), Harness: "claude", Tool: "Bash", Kind: "tool_call", Summary: `{"command":"x"}`}
+	res := store.Event{Source: store.Transcripts, SourceKey: "r", TS: at(2), Harness: "claude", Tool: "Bash", Kind: "tool_result", Summary: storedCut(output)}
+	call.Summary = `{"command":` + jsonString(command) + `}`
+	if got := kinds(Artifacts(call, res)); got != "" {
+		t.Errorf("read off the joined text: %q", got)
+	}
+	want := "commit commit 1a2b3c4 on feat: Trigger CI | push pushed feat -> feat (1111111..1a2b3c4) to github.com:example/x.git | pr pull request https://github.com/example/x/pull/12"
+	for _, gone := range []bool{false, true} {
+		f := newFixture(t)
+		path := claudeCall(t, f, t.TempDir(), "s-joined", command, output)
+		if gone {
+			removeFile(t, path)
+		}
+		rq := f.groupWith(Options{Redact: fakeRedact})[0]
+		switch got := kinds(rq.Results); {
+		case !gone && got != want:
+			t.Errorf("read whole: %q", got)
+		case gone && (got != "" || rq.CutGone != 1):
+			t.Errorf("transcript gone: %q, cut and gone %d", got, rq.CutGone)
+		}
 	}
 }
 
