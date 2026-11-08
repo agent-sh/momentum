@@ -558,6 +558,16 @@ func TestAReadOfAFileItsSessionThenCreatesIsNoFailure(t *testing.T) {
 				f.readMissing("s4", "/w/out/e.md", t0), f.wrote("s4", "/w/out/e.md", t0.Add(time.Minute)),
 				f.readMissing("s4", "/w/out/f.md", t0.Add(time.Hour)), f.wrote("s4", "/w/out/f.md", t0.Add(time.Hour+time.Minute)))
 		}, []string{"failures/v2:tool:read:eacces: permission denied, open Q 3"}},
+		{"the owner declines the write", func(f *fileTools) []store.Event {
+			declined := func(session, path string, at time.Time) []store.Event {
+				return f.pair(session, "Write", fmt.Sprintf(`{"file_path":%q,"content":"x"}`, path),
+					"The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file).", true, at)
+			}
+			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), declined("s1", "/w/out/a.md", t0.Add(time.Minute)),
+				f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)), declined("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
+				f.readMissing("s2", "/w/out/c.md", t0), declined("s2", "/w/out/c.md", t0.Add(time.Minute)),
+				f.readMissing("s3", "/w/out/d.md", t0), f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute)))
+		}, []string{missing + " 3"}},
 		{"the write fails", func(f *fileTools) []store.Event {
 			refused := func(session, path string, at time.Time) []store.Event {
 				return f.pair(session, "Write", fmt.Sprintf(`{"file_path":%q,"content":"x"}`, path), "<tool_use_error>EACCES: permission denied, open '"+path+"'</tool_use_error>", true, at)
@@ -735,9 +745,24 @@ func TestAShellLineWritesOnlyInTheWhitelistedForms(t *testing.T) {
 		{"cut in a later field", "", x, `{"command":"cat > /w/out/x.jsonl","description":"` + strings.Repeat("d", 200) + `…`, "", false, true},
 		{"cut inside an escape in the here-document", "", x, `{"command":"cat > /w/out/x.jsonl <<'EOF'\n{\"a\":\"b \u00…`, "", false, true},
 		{"another file's error in the result", "", x, "cat > /w/out/x.jsonl", "cat: other.txt: No such file or directory", false, true},
+		{"a tab-led end does not end a << here-document", "", x, "cat > /w/out/x.jsonl <<EOF\n{\"id\":1}\n\tEOF\necho done", "", false, true},
+		{"an escaped quote in double quotes", "", `/w/out/a"b.jsonl`, `cat > "/w/out/a\"b.jsonl"`, "", false, true},
+		{"an escaped backslash in double quotes", "", `/w/out/a\b.jsonl`, `cat > "/w/out/a\\b.jsonl"`, "", false, true},
+		{"an escaped backtick in double quotes", "", "/w/out/a`b.jsonl", "cat > \"/w/out/a\\`b.jsonl\"", "", false, true},
+		{"a plain backslash in double quotes", "", `/w/out/a\b.jsonl`, `cat > "/w/out/a\b.jsonl"`, "", false, true},
 
 		{"the command failed", "", x, "cat > /w/out/x.jsonl <<'EOF'" + body, "", true, false},
 		{"an error opening the file", "", x, "cat > /w/out/x.jsonl", "bash: /w/out/x.jsonl: No such file or directory", false, false},
+		{"a read-only file system", "", x, "cat > /w/out/x.jsonl", "bash: /w/out/x.jsonl: Read-only file system", false, false},
+		{"not a directory", "", x, "cat > /w/out/x.jsonl", "bash: /w/out/x.jsonl: Not a directory", false, false},
+		{"a directory", "", x, "cat > /w/out/x.jsonl", "bash: /w/out/x.jsonl: Is a directory", false, false},
+		{"permission denied", "", x, "cat > /w/out/x.jsonl", "bash: /w/out/x.jsonl: Permission denied", false, false},
+		{"cannot create", "", x, "cat > /w/out/x.jsonl", "sh: 1: cannot create /w/out/x.jsonl: Directory nonexistent", false, false},
+		{"no space left", "", x, "tee /w/out/x.jsonl <<'EOF'\nx\nEOF", "tee: /w/out/x.jsonl: No space left on device", false, false},
+		{"cancelled beside a failed call", "", x, "cat > /w/out/x.jsonl", "Cancelled: parallel tool call Bash(ls) errored", true, false},
+		{"cancelled with no flag", "", x, "cat > /w/out/x.jsonl", "Tool execution cancelled by user", false, false},
+		{"a comment word", "/w", "/w/#x", "tee #x", "", false, false},
+		{"a comment after a cd", "/w", "/w/out/#c", "cd /w/out && tee #c", "", false, false},
 		{"a command on the next line", "", x, "cat > /w/out/x.jsonl\necho ok", "", false, false},
 		{"a command after the here-document", "", x, "cat > /w/out/x.jsonl <<'EOF'\n{\"id\":1}\nEOF\necho done", "", false, false},
 		{"an indented end, then a command", "", x, "cat > /w/out/x.jsonl <<-EOF\n\t{\"id\":1}\n\tEOF\necho done", "", false, false},
@@ -854,6 +879,12 @@ func TestAShellRunsInItsCallsDirectory(t *testing.T) {
 		{"Hermes's terminal keeps its own directory", "hermes", "terminal", "/w/out", "/w/out", `{"command":"cat >> x.jsonl"}`, "", x, false},
 		{"Hermes after a cd", "hermes", "terminal", "/w/elsewhere", "/w/elsewhere", `{"command":"cd /w/out && cat >> x.jsonl"}`, "", x, true},
 		{"Hermes's workdir", "hermes", "terminal", "/w/elsewhere", "/w/elsewhere", `{"command":"cat >> x.jsonl","workdir":"/w/out"}`, "", x, true},
+		{"Hermes's background launch", "hermes", "terminal", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"/w/out","background":true}`, "", x, false},
+		{"Grok's terminal keeps its own directory", "grok", "run_terminal_command", "/w/out", "/w/out", `{"command":"cat >> x.jsonl"}`, "", x, false},
+		{"Grok after a cd", "grok", "run_terminal_command", "/w/elsewhere", "/w/elsewhere", `{"command":"cd /w/out && cat >> x.jsonl"}`, "", x, true},
+		{"Grok's working_directory", "grok", "run_terminal_command", "/w/elsewhere", "/w/elsewhere", `{"command":"cat >> x.jsonl","working_directory":"/w/out"}`, "", x, true},
+		{"Codex's older exit code", "codex", "exec_command", "/w", "/w", `{"cmd":"cat >> x.jsonl","workdir":"/w/out"}`, "Exit code: 0\nWall time: 0.1 seconds\nOutput:\n", x, true},
+		{"PowerShell is not bash", "claude", "PowerShell", "/w/out", "/w/out", `{"command":"cat > x.jsonl"}`, "", x, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := testStore(t)

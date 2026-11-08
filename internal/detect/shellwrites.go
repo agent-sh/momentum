@@ -17,7 +17,7 @@ const readSettle = time.Hour
 // writtenPaths are the files a call that did not fail wrote, as it names them: a file tool's path, or the one file a
 // shell call writes in a form the whitelist holds (shellWrite), its result's text read too.
 func writtenPaths(harness, tool, call, result, cwd string) []string {
-	if isShell(tool) {
+	if bashShell(tool) {
 		if p := shellWrite(harness, call, result, shellDir(harness, call, cwd)); p != "" {
 			return []string{p}
 		}
@@ -29,6 +29,10 @@ func writtenPaths(harness, tool, call, result, cwd string) []string {
 	return nil
 }
 
+// bashShell says a shell tool runs its command in bash or a shell like it, whose words the whitelist reads: not
+// PowerShell.
+func bashShell(tool string) bool { return isShell(tool) && !strings.EqualFold(tool, "powershell") }
+
 // workdirKeys are the fields of a shell call's input that name the directory it runs its command in, as capacity
 // reads them.
 var workdirKeys = map[string]bool{"workdir": true, "cwd": true, "working_directory": true, "workingDirectory": true, "dir": true, "directory": true}
@@ -39,8 +43,8 @@ var workdirShells = map[string]bool{"codex": true, "opencode": true, "kimi": tru
 
 // shellDir is the directory a shell call runs its command in, as far as the store says, or "" when it does not say:
 // the workdir the call names, when that is a whole path; else the directory its session was in when it made the
-// call. Hermes's terminal keeps a directory of its own from call to call, which its record does not hold, so only
-// a workdir or a leading cd says where it is.
+// call. Hermes's and Grok's terminals keep a directory of their own from call to call, which their record does not
+// hold, so only a workdir or a leading cd says where theirs is.
 func shellDir(harness, call, cwd string) string {
 	w, named, absent := callField(call, workdirKeys)
 	switch {
@@ -49,14 +53,15 @@ func shellDir(harness, call, cwd string) string {
 			return w
 		}
 		return ""
-	case harness == "hermes", !absent && workdirShells[harness], !path.IsAbs(cwd):
+	case harness == "hermes", harness == "grok", !absent && workdirShells[harness], !path.IsAbs(cwd):
 		return ""
 	}
 	return cwd
 }
 
 var (
-	// backgroundKeys are the fields of a shell call that launch its command in the background (Claude Code's).
+	// backgroundKeys are the fields of a shell call that launch its command in the background (Claude Code's,
+	// Hermes's).
 	backgroundKeys = map[string]bool{"run_in_background": true, "background": true}
 	// backgroundRe is a result that says its command went on in the background, whose success says nothing of it.
 	backgroundRe = regexp.MustCompile(`(?i)running in (?:the )?background`)
@@ -192,8 +197,8 @@ var shellOps = []string{"&&", "<<-", "<<", ">>", ">"}
 func space(c byte) bool { return c == ' ' || c == '\t' }
 
 // shellWords splits a command line into words and operators as the shell does, its quotes off and its escapes read.
-// It is nil for a line it cannot read whole (an open quote, a backslash at its end) or with an operator no
-// whitelisted line holds.
+// It is nil for a line it cannot read whole (an open quote, a backslash at its end), with an operator no whitelisted
+// line holds, or with a comment.
 func shellWords(line string) []shellTok {
 	var toks []shellTok
 	for i := 0; i < len(line); {
@@ -210,6 +215,9 @@ func shellWords(line string) []shellTok {
 			toks = append(toks, shellTok{op: shellOps[k]})
 			i += len(shellOps[k])
 			continue
+		}
+		if c == '#' { // a comment: what follows names no file
+			return nil
 		}
 		var b strings.Builder
 		exact := c != '~'

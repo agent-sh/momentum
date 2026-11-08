@@ -68,7 +68,8 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 			json.Unmarshal([]byte(e.Meta), &m)
 			if toolresult.Failed(e.Harness, e.Tool, e.Summary, m.IsError) {
 				candidates = append(candidates, e)
-			} else if isShell(e.Tool) || writeTools[strings.ToLower(e.Tool)] && wroteFile(e.Summary) {
+			} else if !toolresult.Cancelled(e.Summary) && (bashShell(e.Tool) || writeTools[strings.ToLower(e.Tool)] && wroteFile(e.Summary)) {
+				// a write the owner declined or the harness cancelled did not write: Failed leaves those out, flagged or not
 				writes = append(writes, e)
 			}
 		}
