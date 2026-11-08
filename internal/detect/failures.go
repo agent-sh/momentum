@@ -153,7 +153,7 @@ var readTools = map[string]bool{"read": true, "read_file": true}
 var fileWrites = map[string]*regexp.Regexp{
 	"claude/write":         claudeWrote,
 	"claude/edit":          claudeWrote,
-	"kimi/write":           regexp.MustCompile(`^Wrote \d+ bytes to `),
+	"kimi/write":           regexp.MustCompile(`^(?:Wrote|Appended) \d+ bytes to `),
 	"kimi/edit":            regexp.MustCompile(`^Replaced \d+ occurrences? in `),
 	"hermes/write_file":    regexp.MustCompile(`^\{"bytes_written": ?\d+[,}]`),
 	"hermes/patch":         regexp.MustCompile(`^\{"success": ?true[,}]`),
@@ -161,8 +161,8 @@ var fileWrites = map[string]*regexp.Regexp{
 	"opencode/edit":        regexp.MustCompile(`^(?:Edit applied successfully\.|Edited \S.* \(\d+ replacements?\))`),
 	"opencode/apply_patch": patchApplied,
 	"opencode/patch":       patchApplied,
-	"pi/write":             regexp.MustCompile(`^Successfully wrote \d+ bytes to `),
-	"pi/edit":              regexp.MustCompile(`^Successfully replaced text in `),
+	"pi/write":             regexp.MustCompile(`^Successfully wrote (?:\d+ bytes )?to `),
+	"pi/edit":              regexp.MustCompile(`^Successfully replaced (?:text|\d+ block\(s\)) in `),
 	"grok/write":           grokWrote,
 	"grok/search_replace":  grokWrote,
 	"codex/apply_patch":    regexp.MustCompile(`^(?:Exit code: 0|Process exited with code 0)\b.*\bSuccess\. Updated the following files:`),
@@ -175,14 +175,18 @@ var (
 	patchApplied = regexp.MustCompile(`^Success\. Updated the following files:`)
 	// grokWrote is Grok's write and search_replace: the edits it applied, by the file's whole path.
 	grokWrote = regexp.MustCompile(`^\{"EditsApplied":\{"absolute_path":`)
+	// hermesErrorRe is a Hermes result's error that holds something: Hermes itself counts no write with one, though its
+	// result may still open with bytes_written.
+	hermesErrorRe = regexp.MustCompile(`"error": ?(?:"[^"]|\{ *"|\[ *[^\] ]|true|[1-9])`)
 	// patchFileRe is a file a patch adds or updates, as the store keeps its call: up to a space, an escape or a quote.
 	patchFileRe = regexp.MustCompile(`\*\*\* (?:Add|Update) File: ([^\s\\"]+)`)
 )
 
-// fileWrote says a file tool's result is its harness's own word for a write that landed (fileWrites).
+// fileWrote says a file tool's result is its harness's own word for a write that landed (fileWrites), and, for
+// Hermes, holds no error.
 func fileWrote(harness, tool, result string) bool {
 	re := fileWrites[harness+"/"+strings.ToLower(tool)]
-	return re != nil && re.MatchString(result)
+	return re != nil && re.MatchString(result) && !(harness == "hermes" && hermesErrorRe.MatchString(result))
 }
 
 // notFoundRe is a read tool's error that no file is at its path: Claude Code's "File does not exist", Kimi's "PATH

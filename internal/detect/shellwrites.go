@@ -37,15 +37,18 @@ func writtenPaths(harness, tool, call, result, cwd string) []string {
 }
 
 // bashShell says a shell tool runs its command in bash or a shell like it, whose words the whitelist reads: not
-// PowerShell.
-func bashShell(tool string) bool { return isShell(tool) && !strings.EqualFold(tool, "powershell") }
+// PowerShell, nor exec, Codex's JavaScript, which can make several calls or branch (no other harness has an exec).
+func bashShell(tool string) bool {
+	return isShell(tool) && !strings.EqualFold(tool, "powershell") && !strings.EqualFold(tool, "exec")
+}
 
 // workdirKeys are the fields of a shell call's input that name the directory it runs its command in, as capacity
 // reads them.
 var workdirKeys = map[string]bool{"workdir": true, "cwd": true, "working_directory": true, "workingDirectory": true, "dir": true, "directory": true}
 
-// workdirShells are the harnesses whose shell call can name its directory (Codex's, OpenCode's and pi's workdir,
-// Kimi's cwd): a call of theirs the store cut before such a field may have named one.
+// workdirShells are the harnesses whose shell call can name its directory (Codex's and OpenCode's workdir, Kimi's
+// cwd, and a cwd an extension adds to pi's bash, which itself takes only command and timeout): a call of theirs the
+// store cut before such a field may have named one.
 var workdirShells = map[string]bool{"codex": true, "opencode": true, "kimi": true, "pi": true}
 
 // shellDir is the directory a shell call runs its command in, as far as the store says, or "" when it does not say:
@@ -71,9 +74,11 @@ var (
 	// Hermes's).
 	backgroundKeys = map[string]bool{"run_in_background": true, "background": true}
 	// backgroundRe is a result that says its command went on in the background, whose success says nothing of it:
-	// Claude Code's running, moved there after a timeout or backgrounded by hand; Hermes's started, yielded or tracked.
-	backgroundRe = regexp.MustCompile(`(?i)running in (?:the )?background|moved to the background|manually backgrounded|` +
-		`background process started|yielded_to_background|tracked background process`)
+	// Claude Code's running, moved there after a timeout or backgrounded by hand; Hermes's started, yielded or
+	// tracked; Kimi's task still running there; Grok's moved there, still running.
+	backgroundRe = regexp.MustCompile(`(?i)running in (?:the )?background|moved to (?:the )?background|manually backgrounded|` +
+		`background process started|yielded_to_background|tracked background process|runs in the background|` +
+		`\bstatus: running\b|process is still running`)
 	// exitRe is the exit code a Codex result reports once its command has ended; one still running reports none.
 	exitRe = regexp.MustCompile(`(?i)(?:process|command) exited with code -?\d+|exit code:? -?\d+`)
 	// openErrRe is an error opening a file for writing.

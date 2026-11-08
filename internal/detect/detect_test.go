@@ -563,6 +563,14 @@ func TestAReadOfAFileItsSessionThenCreatesIsNoFailure(t *testing.T) {
 				f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour)),
 				f.readMissing("s2", "/w/out/c.md", t0), f.wrote("s2", "/w/out/c.md", t0))
 		}, []string{missing + " 3"}},
+		{"a read call that is no object", func(f *fileTools) []store.Event {
+			listed := func(session, path string, at time.Time) []store.Event {
+				return f.pair(session, "Read", fmt.Sprintf(`["file_path",%q]`, path), claudeMissing, true, at)
+			}
+			return slices.Concat(listed("s1", "/w/out/a.md", t0), f.wrote("s1", "/w/out/a.md", t0.Add(time.Minute)),
+				listed("s1", "/w/out/b.md", t0.Add(time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
+				listed("s2", "/w/out/c.md", t0), f.wrote("s2", "/w/out/c.md", t0.Add(time.Minute)))
+		}, []string{missing + " 3"}},
 		{"a cut read and a cut write", func(f *fileTools) []store.Event {
 			long := strings.Repeat("x", 240)
 			cutRead := func(session string, at time.Time) []store.Event {
@@ -664,6 +672,9 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 		{"opencode", "read", "write", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"filePath":"/w/@","content":"x"}`, "Created file successfully: /w/@"},
 		{"pi", "read", "write", `{"path":"/w/@"}`, "ENOENT: no such file or directory, access '/w/@'", `{"path":"/w/@","content":"x"}`, "Successfully wrote 1 bytes to /w/@"},
 		{"pi", "read", "edit", `{"path":"/w/@"}`, "ENOENT: '/w/@'", `{"path":"/w/@","oldText":"","newText":"x"}`, "Successfully replaced text in /w/@"},
+		{"pi", "read", "write", `{"path":"/w/@"}`, "ENOENT: no such file or directory, access '/w/@'", `{"path":"/w/@","content":"x"}`, "Successfully wrote to /w/@"},
+		{"pi", "read", "edit", `{"path":"/w/@"}`, "ENOENT: no such file or directory, access '/w/@'", `{"path":"/w/@","edits":[]}`, "Successfully replaced 2 block(s) in /w/@."},
+		{"kimi", "Read", "Write", `{"path":"/w/@"}`, `"/w/@" does not exist.`, `{"path":"/w/@","content":"x","mode":"append"}`, "Appended 5 bytes to /w/@"},
 		{"hermes", "read_file", "write_file", `{"path":"/w/@"}`, `{"error": "[Errno 2] No such file or directory: '/w/@'"}`, `{"path":"/w/@","content":"x"}`, `{"bytes_written": 1}`},
 		{"claude", "Read", "Write", `{"file_path":"/w/@"}`, claudeMissing, `{"file_path":"/w/@","content":"x"}`, "The file /w/@ has been updated successfully. (file state is current in your context)"},
 		{"claude", "Read", "Edit", `{"file_path":"/w/@"}`, claudeMissing, `{"replace_all":true,"file_path":"/w/@"}`, "The file /w/@ has been updated. All occurrences were replaced."},
@@ -676,6 +687,7 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 		{"codex", "read_file", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Add File: /w/@ +x *** End Patch", "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
 		{"grok", "read_file", "search_replace", `{"target_file":"/w/@"}`, "Error: /w/@ does not exist.", `{"file_path":"/w/@","new_string":"x"}`, `{"EditsApplied":{"absolute_path":"/w/@","edits":[]}}`},
 		{"grok", "read_file", "write", `{"target_file":"/w/@"}`, "Error: /w/@ does not exist.", `{"file_path":"/w/@","content":"x"}`, `{"EditsApplied":{"absolute_path":"/w/@","edits":[]}}`},
+		{"grok", "read_file", "search_replace", `{"target_file":"/w/@"}`, "Error: /w/@ does not exist.", `{"file_path":"/w/@","new_string":"x"}`, `{"EditsApplied":{"absolute_path":"/w/@","edits":[],"details":{"error": "a warning only Hermes would read"}}}`},
 	} {
 		t.Run(tc.harness+"/"+tc.write, func(t *testing.T) {
 			st := testStore(t)
@@ -725,6 +737,19 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 		{"codex", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Add File: /w/@ +x *** End Patch", "Exit code: 1 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
 		{"codex", "Write", `{"path":"/w/@"}`, "File not found: /w/@", `{"file_path":"/w/@","content":"x"}`, "File created successfully at: /w/@"},
 		{"codex", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Add File: /w/@ +x *** End Patch", "Exit code: 0 Wall time: 0.1 seconds Output: patch left unapplied"},
+		{"hermes", "write_file", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"path":"/w/@","content":"x"}`, `{"bytes_written": 0, "dirs_created": false, "error": "Refusing to write internal read_file display text as file content"}`},
+		{"hermes", "patch", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"path":"/w/@"}`, `{"success": true, "error": "the patch left the file unchanged"}`},
+		{"hermes", "write_file", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"path":"/w/@","content":"x"}`, `Refused: {"bytes_written": 1, "dirs_created": true}`},
+		{"hermes", "patch", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"path":"/w/@"}`, `Not applied: {"success": true, "diff": ""}`},
+		{"grok", "write", `{"target_file":"/w/@"}`, "Error: /w/@ does not exist.", `{"file_path":"/w/@","content":"x"}`, `Error: could not save {"EditsApplied":{"absolute_path":"/w/@","edits":[]}}`},
+		{"kimi", "Write", `{"path":"/w/@"}`, `"/w/@" does not exist.`, `{"path":"/w/@","content":"x"}`, "Not saved: Wrote 3 bytes to /w/@"},
+		{"kimi", "Edit", `{"path":"/w/@"}`, `"/w/@" does not exist.`, `{"path":"/w/@","old":"a","new":"b"}`, "Not saved: Replaced 1 occurrence in /w/@"},
+		{"opencode", "write", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"filePath":"/w/@","content":"x"}`, "Rolled back: Wrote file successfully."},
+		{"opencode", "edit", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"filePath":"/w/@","newString":"x"}`, "Rolled back: Edit applied successfully."},
+		{"opencode", "patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Add File: /w/@\n+x\n*** End Patch"}`, "Rolled back: Success. Updated the following files: A /w/@"},
+		{"pi", "write", `{"path":"/w/@"}`, "ENOENT: no such file or directory, access '/w/@'", `{"path":"/w/@","content":"x"}`, "Rolled back: Successfully wrote to /w/@"},
+		{"pi", "edit", `{"path":"/w/@"}`, "ENOENT: no such file or directory, access '/w/@'", `{"path":"/w/@","edits":[]}`, "Rolled back: Successfully replaced 1 block(s) in /w/@."},
+		{"codex", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Add File: /w/@ +x *** End Patch", "Note: Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
 		{"opencode", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Add File: /w/@\n+x\n*** End Patch"}`, "patch verification failed: Failed to find expected lines in /w/@"},
 		{"claude", "Edit", `{"file_path":"/w/@"}`, claudeMissing, `{"file_path":"/w/@","old_string":"a","new_string":"b"}`, "A hook said: The file /w/@ has been updated successfully. Then it reverted it."},
 	} {
@@ -751,7 +776,7 @@ func readToolOf(harness string) string {
 	switch harness {
 	case "hermes", "grok", "codex":
 		return "read_file"
-	case "opencode":
+	case "opencode", "pi":
 		return "read"
 	}
 	return "Read"
@@ -927,6 +952,7 @@ func TestAShellRunsInItsCallsDirectory(t *testing.T) {
 	const x = "/w/out/x.jsonl"
 	long := "cat >> x.jsonl <<'EOF'\n" + strings.Repeat(`{"id":1,"verdict":"keep"}`+"\n", 20)
 	cut, _ := json.Marshal(map[string]string{"command": long})
+	cutCmd, _ := json.Marshal(map[string]string{"cmd": long})
 	for _, tc := range []struct {
 		name, harness, tool, callCwd, resultCwd, input, result, path string
 		writes                                                       bool
@@ -949,6 +975,12 @@ func TestAShellRunsInItsCallsDirectory(t *testing.T) {
 			`{"output": "", "yielded_to_background": true, "session_id": "proc_1", "exit_code": 0, "error": null}`, x, false},
 		{"Hermes's tracked background process", "hermes", "terminal", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"/w/out"}`,
 			`{"output": "Started a tracked background process proc_1", "exit_code": 0, "error": null}`, x, false},
+		{"Kimi's task still running", "kimi", "Bash", "/w", "/w", `{"command":"cat >> x.jsonl","cwd":"/w/out"}`, "task_id: t1 status: running", x, false},
+		{"Kimi's task in the background", "kimi", "Bash", "/w", "/w", `{"command":"cat >> x.jsonl","cwd":"/w/out"}`, "next_step: The task now runs in the background.", x, false},
+		{"Grok's command moved to the background", "grok", "run_terminal_command", "/w", "/w", `{"command":"cd /w/out && cat >> x.jsonl"}`, "Command was automatically moved to background.", x, false},
+		{"Grok's process still running", "grok", "run_terminal_command", "/w", "/w", `{"command":"cd /w/out && cat >> x.jsonl"}`, "Process is still running.", x, false},
+		{"Codex's JavaScript exec", "codex", "exec", "/w", "/w", `{"cmd":"cat >> x.jsonl","workdir":"/w/out"}`, "Process exited with code 0\nOutput:\n", x, false},
+		{"a Codex call cut before its workdir", "codex", "exec_command", "/w/out", "/w/out", string(cutCmd[:240]) + "…", "Process exited with code 0\nOutput:\n", x, false},
 		{"Kimi's cwd", "kimi", "Bash", "/w", "/w", `{"command":"cat >> x.jsonl","cwd":"/w/out"}`, "", x, true},
 		{"a Kimi call cut before its cwd", "kimi", "Bash", "/w/out", "/w/out", string(cut[:240]) + "…", "", x, false},
 		{"a pi call cut before its workdir", "pi", "bash", "/w/out", "/w/out", string(cut[:240]) + "…", "", x, false},
