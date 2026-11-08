@@ -477,7 +477,8 @@ func (r *reader) readWhole(ctx context.Context, t *thread) {
 			continue
 		}
 		j.poll = polls(*j.p.call, j.tool, inputs[i])
-		if !namesGit(inputs[i]) && !j.poll {
+		// a Codex call that names no git is read too: a session it left running replaces one of the same id
+		if !namesGit(inputs[i]) && !j.poll && !codexCommand(*j.p.call) {
 			// it makes nothing this reads, whether or not its record is there
 			j.skip, j.why = true, ""
 			continue
@@ -519,15 +520,21 @@ func (r *reader) readWhole(ctx context.Context, t *thread) {
 		call, res := *j.p.call, *j.p.res
 		call.Summary, res.Summary = inputs[i], output
 		if writers[j.tool] {
-			if !metaOf(res.Meta).IsError {
+			if !toolresult.WriteFailed(res.Summary, metaOf(res.Meta).IsError) {
 				j.found = artifactsOf(call, res, Decode(call.Harness, j.tool, inputs[i], ""), makes{}, nil)
 			}
 		} else {
 			d := Decode(call.Harness, j.tool, inputs[i], output)
 			d.Joined = d.Joined && !lines // a text read whole has its lines, one line or many
 			j.found = artifactsOf(call, res, d, j.mk, t.sessions)
+			agent := agentOf(call)
+			for _, p := range d.Polls {
+				if !p.Running {
+					delete(t.sessions, sessionKey{agent, p.Session}) // the process exited: its id may be reused
+				}
+			}
 			for n, sess := range yielded(call, d) {
-				t.sessions[n] = sess // a later call's poll of it reads its output against this command
+				t.sessions[sessionKey{agent, n}] = sess // a later call's poll of it reads its output against this command
 			}
 		}
 		if len(j.found) == 0 {

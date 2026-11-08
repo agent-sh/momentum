@@ -70,7 +70,11 @@ func state(rq *Request) {
 		rq.State, rq.Why = Open, "nothing came after the last turn"
 	}
 	if (rq.State == Ready || rq.State == Open) && standing && !holds {
-		rq.Why += "; the check of " + c.At.Local().Format(timeFormat) + " is reopened by a newer result"
+		by := "a newer result"
+		if rq.LastTurn.After(c.At) {
+			by = "a turn of the owner's after it"
+		}
+		rq.Why += "; the check of " + c.At.Local().Format(timeFormat) + " is reopened by " + by
 	}
 	switch {
 	case needs != nil:
@@ -249,7 +253,8 @@ func Check(ctx context.Context, st *store.Store, rq *Request, at time.Time) (Che
 		out.Lost = c
 	}
 	var err error
-	out.Added, err = st.CheckOnce(ctx, store.RequestCheck{Request: rq.ID, Result: n.Key, At: at, ResultAt: n.At}, rq.CheckIDs())
+	// a check from before his last turn no longer holds it, though it names the same result
+	out.Added, err = st.CheckOnceSince(ctx, store.RequestCheck{Request: rq.ID, Result: n.Key, At: at, ResultAt: n.At}, rq.CheckIDs(), rq.LastTurn)
 	return out, err
 }
 

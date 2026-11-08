@@ -49,7 +49,7 @@ var (
 func Artifacts(call, res store.Event) []Result {
 	tool := strings.ToLower(call.Tool)
 	if writers[tool] {
-		if metaOf(res.Meta).IsError {
+		if toolresult.WriteFailed(res.Summary, metaOf(res.Meta).IsError) {
 			return nil
 		}
 		return artifactsOf(call, res, Decode(call.Harness, tool, call.Summary, ""), makes{}, nil)
@@ -67,18 +67,33 @@ type session struct {
 	cut bool
 }
 
+// sessionKey is a Codex session as a thread knows it: each agent of the thread (its main thread "", a subagent)
+// numbers its own.
+type sessionKey struct {
+	agent string
+	id    int64
+}
+
+// agentOf is the agent of a thread an event is of: "" for its main thread.
+func agentOf(e store.Event) string {
+	if e.Agent == e.Session {
+		return ""
+	}
+	return e.Agent
+}
+
 // yielded are the sessions a Codex call left running, each with the command it runs: a code-mode script's
 // exec_command calls still running when it ended, and the command of Codex's exec_command tool when it yielded.
 func yielded(call store.Event, d Decoded) map[int64]session {
 	out := map[int64]session{}
 	for _, c := range d.Chunks {
-		if c.Running && c.Session > 0 {
+		if c.Running {
 			out[c.Session] = session{c.Command, c.Cut}
 		}
 	}
-	if call.Harness == "codex" && strings.ToLower(call.Tool) == "exec_command" && len(d.Commands) == 1 {
-		if c := plainChunk(d.Output, 0); c.Running && c.Session > 0 {
-			out[c.Session] = session{d.Commands[0], d.CommandCut}
+	if strings.ToLower(call.Tool) == "exec_command" {
+		if c := plainChunk(d.Output, 0); c.Running {
+			out[c.Session] = session{strings.Join(d.Commands, "\n"), d.CommandCut}
 		}
 	}
 	return out
@@ -88,7 +103,7 @@ func yielded(call store.Event, d Decoded) map[int64]session {
 // An output the store joined shows nothing; a Codex code-mode script's results are read each against its own
 // command, and none when they cannot be matched to its calls; a poll's result against the command of the session
 // it polls, among sessions (those its thread's earlier calls left running), and as nothing when none is known.
-func artifactsOf(call, res store.Event, d Decoded, mk makes, sessions map[int64]session) []Result {
+func artifactsOf(call, res store.Event, d Decoded, mk makes, sessions map[sessionKey]session) []Result {
 	failed := metaOf(res.Meta).IsError
 	once := metaOf(call.Meta).ToolID // what a call recorded again (a harness's copy of the same call) shares
 	var out []Result
@@ -112,7 +127,7 @@ func artifactsOf(call, res store.Event, d Decoded, mk makes, sessions map[int64]
 			}
 		}
 		for _, p := range d.Polls {
-			if s, ok := sessions[p.Session]; ok {
+			if s, ok := sessions[sessionKey{agentOf(call), p.Session}]; ok {
 				for _, r := range shown(p.Output, failed || p.Failed, made(Decoded{Commands: []string{s.cmd}, CommandCut: s.cut}), once) {
 					add(r)
 				}

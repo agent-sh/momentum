@@ -268,6 +268,10 @@ func made(d Decoded) makes {
 				lists = true
 			}
 			if inv.cut {
+				// it makes nothing, and a push the cut ends may hide a --dry-run: its ref lines would read as pushed
+				if sub, _ := gitCommand(inv.args); inv.prog == "git" && sub == "push" {
+					dry = true
+				}
 				continue
 			}
 			switch inv.prog {
@@ -318,14 +322,17 @@ func ghCommand(args []string) []string {
 }
 
 // printsAddresses reports a gh command that prints a pull request's address on a line of its own, other than one
-// it made: gh api, gh search, gh pr view, list and edit (which prints the address it edited), and gh pr create
-// --json. gh pr review, checks, comment, merge and ready print none so.
+// it made: gh api, gh search, gh pr view, list and edit (which prints the address it edited), gh pr create --json,
+// and gh issue, repo and release view, whose body may hold one. gh pr review, checks, comment, merge and ready
+// print none so.
 func printsAddresses(cmd []string) bool {
 	switch {
 	case len(cmd) > 0 && (cmd[0] == "api" || cmd[0] == "search"):
 		return true
 	case len(cmd) > 1 && cmd[0] == "pr":
 		return cmd[1] == "view" || cmd[1] == "list" || cmd[1] == "edit" || cmd[1] == "create" && hasFlag(cmd[2:], "--json")
+	case len(cmd) > 1 && (cmd[0] == "issue" || cmd[0] == "repo" || cmd[0] == "release"):
+		return cmd[1] == "view"
 	}
 	return false
 }

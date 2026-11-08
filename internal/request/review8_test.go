@@ -53,8 +53,8 @@ func TestALostCheckIsNotReopenedByAReply(t *testing.T) {
 	if _, err := Check(context.Background(), f.st, rq, at(10)); err != nil {
 		t.Fatal(err)
 	}
-	f.owner(s, at(11), "thanks, is the old parser still used anywhere?")
-	f.reply(s, at(12), "No, nothing imports it.")
+	// a reply after the check, with no turn of the owner's after it (a turn would reopen the check)
+	f.reply(s, at(12), "Also: nothing imports the old parser.")
 	f.phase(s, at(13), "phase", "idle", nil)
 	f.put()
 	reqs, err := Group(context.Background(), f.st, t0.Add(-time.Hour), Options{Redact: fakeRedact})

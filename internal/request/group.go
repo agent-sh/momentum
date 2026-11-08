@@ -359,12 +359,12 @@ func (r *reader) finish(ctx context.Context, reqs []*Request) error {
 		for i := range rq.Threads {
 			th := &rq.Threads[i]
 			e, ok := phases[th.ID]
-			if !th.Current || !ok {
+			if !ok {
 				continue
 			}
 			m := metaOf(e.Meta)
 			seen := e.TS
-			if sp, ok := stamps[e.Session]; ok && e.Kind != "vanished" && string(sp.Phase) == m.To && sp.Since.UnixMilli() == e.TS.UnixMilli() && sp.Seen.After(seen) {
+			if sp, ok := stamps[e.Session]; ok && string(sp.Phase) == m.To && sp.Since.UnixMilli() == e.TS.UnixMilli() && sp.Seen.After(seen) {
 				seen = sp.Seen // the same stretch, seen since
 			}
 			th.PhaseAt, th.Trusted = e.TS, seen.After(th.turn) // seen after the last turn there

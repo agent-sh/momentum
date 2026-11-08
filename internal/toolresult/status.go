@@ -24,7 +24,7 @@ var (
 		`sandbox(?:denied|error):|patch rejected:|approval policy is |` +
 		`the (?:command|tool call|action) (?:was |is )?(?:rejected|denied|blocked) by (?:the )?(?:sandbox|policy|hook)|` +
 		`tool (?:execution|call) timed out|command timed out|execution timed out|` +
-		`error:|tool error:|tool call error:|apply_patch verification failed:|` +
+		`error:|error \[[^\]\n]*\]:|tool error:|tool call error:|apply_patch verification failed:|` +
 		`failed to (?:find expected lines|read file to update)|invalid patch:|error parsing function call:|` +
 		`unsupported custom tool call|script failed\b)`)
 	cancelled = regexp.MustCompile(`(?i)^(?:<tool_use_error>)?(?:` +
@@ -92,6 +92,15 @@ func Failed(harness, tool, text string, flagged bool) bool {
 		return n != 0
 	}
 	return refusal.MatchString(text)
+}
+
+// WriteFailed reads a file writer's result: its native error flag, a cancellation, a refusal (an `Error:` or
+// `Error [CODE]:` prefix, a tool_use_error, the refusals Failed reads), or a JSON envelope that says it failed
+// (success false, an error field). A writer whose harness records no flag for a refusal (pi's
+// NOT_READ_THIS_SESSION, Hermes's patch) wrote nothing.
+func WriteFailed(text string, flagged bool) bool {
+	text = strings.TrimSpace(text)
+	return flagged || Cancelled(text) || strings.HasPrefix(text, "<tool_use_error>") || refusal.MatchString(text) || EnvelopeFailed(text)
 }
 
 // EnvelopeFailed reads a known native result wrapper, not file or tool content.

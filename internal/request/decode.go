@@ -35,6 +35,9 @@ type Chunk struct {
 	Failed, Running bool
 	Session         int64
 	Cut             bool
+	// Index and Polled are what the script printed with the result, when it did: its call's place in a
+	// Promise.all array ("i"), or the session a poll named ("id"); -1 when none
+	Index, Polled int64
 }
 
 // codeCall is a tool call of a code-mode script: an exec_command with its command, or a write_stdin with the
@@ -56,10 +59,26 @@ var (
 	exitedRe  = regexp.MustCompile(`Process exited with code (-?\d+)`)
 )
 
-// codeCalls are a code-mode script's exec_command and write_stdin calls, in order.
-func codeCalls(script string) []codeCall {
+// printRe is a script's text() of a call's result: inline (text(await tools.X(...))) or by the variable the
+// result was set to (text(r)).
+var printRe = regexp.MustCompile(`\btext\(\s*(?:await\s+(tools)\.(?:exec_command|write_stdin)\(|([A-Za-z_$][\w$]*)\s*\))`)
+
+// codeCalls are a code-mode script's exec_command and write_stdin calls, in order, and the calls its text() calls
+// print, in the order it prints them (-1 for a variable no call's result was set to). parallel is true when the
+// script runs calls side by side (Promise.all, a call not awaited), so its results' order says nothing of whose
+// they are; arrayAt is the first call after a Promise.all, whose array the results' places ("i") index (-1 when
+// none).
+func codeCalls(script string) (calls []codeCall, prints []int, parallel bool, arrayAt int) {
 	locs := codeCallRe.FindAllStringSubmatchIndex(script, -1)
-	var out []codeCall
+	at := map[int]int{}                          // a call's "tools." offset: its index
+	promise := strings.Index(script, "Promise.") // a call in its array is not awaited on its own: parallel
+	arrayAt = -1                                 // the first call of a Promise.all array
+	for k, l := range locs {
+		if promise >= 0 && l[0] > promise {
+			arrayAt = k
+			break
+		}
+	}
 	for k, l := range locs {
 		end := len(script)
 		if k+1 < len(locs) {
@@ -69,6 +88,11 @@ func codeCalls(script string) []codeCall {
 		c := codeCall{exec: script[l[4]:l[5]] == "exec_command"}
 		if l[2] >= 0 {
 			c.assign = script[l[2]:l[3]]
+		}
+		toolsAt := l[4] - len("tools.")
+		at[toolsAt] = k
+		if !strings.HasSuffix(strings.TrimRight(script[:toolsAt], " \t\r\n"), "await") {
+			parallel = true
 		}
 		if c.exec {
 			for _, f := range fields(arg, `"'`+"`", true) {
@@ -84,22 +108,62 @@ func codeCalls(script string) []codeCall {
 				c.ref = m[2]
 			}
 		}
-		out = append(out, c)
+		calls = append(calls, c)
 	}
-	return out
+	for _, m := range printRe.FindAllStringSubmatchIndex(script, -1) {
+		if m[2] >= 0 {
+			if k, ok := at[m[2]]; ok {
+				prints = append(prints, k)
+			}
+			continue
+		}
+		name, k := script[m[4]:m[5]], -1
+		for i, l := range locs {
+			if l[0] < m[0] && calls[i].assign == name {
+				k = i // the latest call whose result the variable was set to before the print
+			}
+		}
+		prints = append(prints, k)
+	}
+	return calls, prints, parallel, arrayAt
 }
 
-// pairCode matches a code-mode script's results to its calls, one each in order, and each poll's result to the
-// command whose session it names: one of the script's (by the variable its result was set to, or the session it
-// yielded), else a session an earlier call left running (Polls). A poll by a variable the script did not set
-// from an exec_command is read as nothing. Unpaired is true when the results are not one per call.
-func pairCode(chunks []Chunk, calls []codeCall) (own, polls []Chunk, unpaired bool) {
-	if len(chunks) != len(calls) {
-		return nil, nil, true
+// pairCode matches a code-mode script's results to its calls, and each poll's result to the command whose session
+// it names: one of the script's (by the variable its result was set to, or the session it yielded), else a session
+// an earlier call left running (Polls). A result is its call's by what the script printed with it when it printed
+// one (its place in a Promise.all array, the session a poll named), else by the order the script prints results.
+// A poll by a variable the script did not set from an exec_command is read as nothing. Unpaired is true when the
+// script runs calls side by side and its results carry no place, or its results are not one for each print (of
+// the prints it reached, when it failed or still runs).
+func pairCode(chunks []Chunk, calls []codeCall, prints []int, parallel bool, stopped bool, arrayAt int) (own, polls []Chunk, unpaired bool) {
+	result := map[int]Chunk{}
+	var rest []Chunk
+	for _, ch := range chunks {
+		switch {
+		case ch.Index >= 0 && arrayAt >= 0 && arrayAt+int(ch.Index) < len(calls):
+			result[arrayAt+int(ch.Index)] = ch
+		case ch.Polled > 0:
+			ch.Session = ch.Polled // a poll in a loop: the session it named
+			polls = append(polls, ch)
+		default:
+			rest = append(rest, ch)
+		}
+	}
+	if len(rest) > 0 {
+		if parallel || len(rest) > len(prints) || len(rest) < len(prints) && !stopped {
+			return nil, nil, true
+		}
+		for k, ch := range rest {
+			if i := prints[k]; i >= 0 {
+				if _, ok := result[i]; !ok {
+					result[i] = ch
+				}
+			}
+		}
 	}
 	vars, sessions := map[string]int{}, map[int64]int{}
 	for i, c := range calls {
-		ch := chunks[i]
+		ch, printed := result[i]
 		if c.exec {
 			ch.Command, ch.Cut = c.cmd, c.cut
 			own = append(own, ch)
@@ -107,9 +171,12 @@ func pairCode(chunks []Chunk, calls []codeCall) (own, polls []Chunk, unpaired bo
 			if c.assign != "" {
 				vars[c.assign] = k
 			}
-			if ch.Running && ch.Session > 0 {
+			if ch.Running {
 				sessions[ch.Session] = k
 			}
+			continue
+		}
+		if !printed {
 			continue
 		}
 		k, ok := vars[c.ref]
@@ -201,14 +268,16 @@ func Decode(harness, tool, input, output string) Decoded {
 			outs = append(outs, c.Output)
 		}
 		d.Output = strings.Join(outs, "\n")
-		calls := codeCalls(input)
+		calls, prints, parallel, arrayAt := codeCalls(input)
 		d.Commands, d.CommandCut = nil, false
 		for _, c := range calls {
 			if c.exec {
 				d.Commands, d.CommandCut = append(d.Commands, c.cmd), c.cut
 			}
 		}
-		d.Chunks, d.Polls, d.Unpaired = pairCode(chunks, calls)
+		// a script that failed or still runs printed the results it reached
+		stopped := strings.HasPrefix(strings.TrimSpace(output), "Script failed") || strings.HasPrefix(strings.TrimSpace(output), "Script running")
+		d.Chunks, d.Polls, d.Unpaired = pairCode(chunks, calls, prints, parallel, stopped, arrayAt)
 	case harness == "codex" && tool == "write_stdin":
 		// Codex's write_stdin tool polls a session an earlier exec_command left running
 		d.Output = uncut(output, strings.HasSuffix(output, "…"))
@@ -260,7 +329,7 @@ func plainChunk(output string, session int64) Chunk {
 // stdout, stderr) as one text, the last token of one the cut ends dropped, and whether its exit code is not 0.
 func codeChunks(output string) []Chunk {
 	var out []Chunk
-	obj := -1
+	obj, last := -1, 0
 	for i := 0; i < len(output); {
 		j := strings.IndexByte(output[i:], '"')
 		if j < 0 {
@@ -283,7 +352,16 @@ func codeChunks(output string) []Chunk {
 		if start == obj && len(out) > 0 {
 			out[len(out)-1].Output += "\n" + uncut(text, !closed)
 		} else {
-			c := Chunk{Output: uncut(text, !closed)}
+			c := Chunk{Output: uncut(text, !closed), Index: -1, Polled: -1}
+			// what the script printed with the result, from the previous result to this one's output
+			for _, m := range carriedRe.FindAllStringSubmatch(output[last:j], -1) {
+				n, _ := strconv.ParseInt(m[2], 10, 64)
+				if m[1] == "i" {
+					c.Index = n
+				} else {
+					c.Polled = n
+				}
+			}
 			if e := exitRe.FindStringSubmatch(output[max(start, 0):j]); e != nil {
 				c.Failed = e[1] != "0"
 			} else if m := sessionRe.FindStringSubmatch(output[max(start, 0):j]); m != nil {
@@ -294,9 +372,14 @@ func codeChunks(output string) []Chunk {
 		}
 		obj = start
 		i = v + m
+		last = i
 	}
 	return out
 }
+
+// carriedRe is a key a script printed with a result: "i", its call's place in a Promise.all array, or "id", the
+// session a poll named.
+var carriedRe = regexp.MustCompile(`"(i|id)":\s*(\d+)`)
 
 // uncut is a text with its cut taken into account: when the store cut it, without the ellipsis and the token the
 // cut ends (one the cut may have shortened). A text cut just after a space keeps every token.

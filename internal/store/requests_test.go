@@ -122,3 +122,21 @@ func TestAThreadReadSelectsTheResultsThatMayShowAnArtifact(t *testing.T) {
 		t.Fatalf("results:\n got %s\nwant %s", g, want)
 	}
 }
+
+// A check under one of a request's ids stands in the way of a check of the same result under another of them (an
+// alias), and only one made after since does.
+func TestACheckUnderAnAliasStandsInTheWay(t *testing.T) {
+	st, _ := open(t)
+	ctx := context.Background()
+	if err := st.PutRequestCheck(ctx, RequestCheck{Request: "rold00000000", Result: "commit:1a2b3c4", At: time.UnixMilli(1000)}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := st.CheckOnce(ctx, RequestCheck{Request: "rnew00000000", Result: "commit:1a2b3c4", At: time.UnixMilli(2000)},
+		[]string{"rnew00000000", "rold00000000"}); err != nil || ok {
+		t.Fatalf("a check under the alias did not stand in the way: %v %v", ok, err)
+	}
+	if ok, err := st.CheckOnceSince(ctx, RequestCheck{Request: "rnew00000000", Result: "commit:1a2b3c4", At: time.UnixMilli(3000)},
+		[]string{"rnew00000000", "rold00000000"}, time.UnixMilli(1500)); err != nil || !ok {
+		t.Fatalf("a check from before since stood in the way: %v %v", ok, err)
+	}
+}

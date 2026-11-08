@@ -121,11 +121,12 @@ func (r *Request) Newest() *Result {
 // Standing is the newest check not undone, and whether it holds the newest result.
 // A check whose result can no longer be read (its transcript is gone, so the result it named is not among what the
 // store holds) and that nothing came after still holds: nothing reopened it.
+// A turn of the owner's after the check reopens it: he asked for more than the result he checked.
 func (r *Request) Standing() (store.RequestCheck, bool, bool) {
 	for i := len(r.Checks) - 1; i >= 0; i-- {
 		if c := r.Checks[i]; c.Undone.IsZero() {
 			n := r.Newest()
-			return c, true, n != nil && n.Key == c.Result || r.unreadable(c)
+			return c, true, (n != nil && n.Key == c.Result || r.unreadable(c)) && !r.LastTurn.After(c.At)
 		}
 	}
 	return store.RequestCheck{}, false, false
@@ -316,7 +317,7 @@ type thread struct {
 	items   []item
 	pending []pair // calls the store cut or joined, and Codex's, while the thread loads: read as it loads (readWhole)
 	// sessions are the Codex sessions its calls left running, each with its command, as its load reads them
-	sessions map[int64]session
+	sessions map[sessionKey]session
 	lost     []lost // its calls whose record was not read whole
 	replies  []item
 	calls    map[string]store.Event // calls waiting for their results
@@ -484,10 +485,12 @@ func (r *reader) enqueue(id string) {
 // read is what a thread's read selects: the main thread's text, the file writers' calls and results, and the
 // shells' calls that may run git or gh, poll a session (Codex's write_stdin names its "session_id"), or that the store cut (their git may
 // be past the cut), with their results that may show an artifact's line (a commit's "] ", a ref update's " -> ",
-// a pull request's "/pull/"), that left a Codex session running ("session_id", "Process running"), or that the
-// store cut.
+// a pull request's "/pull/"), that left a Codex session running ("session_id", "Process running") or say its
+// process exited ("Process exited", "exit_code": a poll's result ends the session), or that the store cut; and every Codex command whose result left a session running, whatever it ran, so a reused session id
+// replaces the command it named before.
 var read = store.ThreadRead{Writers: sortedKeys(writers), Shells: shells(), CallMarks: []string{"git", "gh", "session_id"},
-	ResultMarks: []string{"] ", " -> ", "/pull/", "session_id", "Process running"}, CutMark: "…"}
+	ResultMarks: []string{"] ", " -> ", "/pull/", "session_id", "Process running", "Process exited", `"exit_code"`}, CutMark: "…",
+	YieldTools: []string{"exec", "exec_command"}, YieldMarks: []string{`"session_id"`, "Process running"}}
 
 func sortedKeys(m map[string]bool) []string {
 	var out []string
@@ -501,7 +504,7 @@ func sortedKeys(m map[string]bool) []string {
 // load reads a thread, then follows its links.
 func (r *reader) load(ctx context.Context, id string) error {
 	t := &thread{id: id, agents: map[string]time.Time{}, calls: map[string]store.Event{}, done: map[string]bool{}, segs: []seg{{}},
-		sessions: map[int64]session{}}
+		sessions: map[sessionKey]session{}}
 	spans, err := r.st.ThreadSpans(ctx, id)
 	if err != nil {
 		return err

@@ -55,12 +55,18 @@ func (s *Store) PutRequestCheck(ctx context.Context, c RequestCheck) error {
 // CheckOnce records a check unless one under any of ids stands on the same result, in one statement, so two checks
 // made at once leave one; it reports whether it recorded one.
 func (s *Store) CheckOnce(ctx context.Context, c RequestCheck, ids []string) (bool, error) {
+	return s.CheckOnceSince(ctx, c, ids, time.Time{})
+}
+
+// CheckOnceSince is CheckOnce, where only a standing check made after since stands in the way: one from before a
+// turn the owner added since no longer holds the request.
+func (s *Store) CheckOnceSince(ctx context.Context, c RequestCheck, ids []string, since time.Time) (bool, error) {
 	if len(ids) == 0 {
 		ids = []string{c.Request}
 	}
 	r, err := s.db.ExecContext(ctx, `INSERT INTO request_checks (request, result, at, result_at) SELECT ?, ?, ?, ? WHERE NOT EXISTS (
-	  SELECT 1 FROM request_checks WHERE undone = 0 AND result = ? AND request IN (?`+strings.Repeat(",?", len(ids)-1)+`))`,
-		append([]any{c.Request, c.Result, c.At.UnixMilli(), ms(c.ResultAt), c.Result}, anys(ids)...)...)
+	  SELECT 1 FROM request_checks WHERE undone = 0 AND result = ? AND at > ? AND request IN (?`+strings.Repeat(",?", len(ids)-1)+`))`,
+		append([]any{c.Request, c.Result, c.At.UnixMilli(), ms(c.ResultAt), c.Result, ms(since)}, anys(ids)...)...)
 	if err != nil {
 		return false, err
 	}
@@ -230,10 +236,13 @@ func (s *Store) ThreadParentMeta(ctx context.Context, session string) (string, e
 
 // ThreadRead is what a request reads of a session's transcript events: its main thread's text (the turns, the
 // replies, what was cut from a turn), every call and result of the Writers, and the calls of the Shells whose text
-// holds one of CallMarks with their results that hold one of ResultMarks. Tool names are compared in lower case.
+// holds one of CallMarks with their results that hold one of ResultMarks, and the calls of the YieldTools whose
+// result holds one of YieldMarks (a Codex command left running), whatever the call's text, with those results.
+// Tool names are compared in lower case.
 type ThreadRead struct {
 	Writers, Shells        []string
 	CallMarks, ResultMarks []string
+	YieldTools, YieldMarks []string
 	CutMark                string // when set, also the shells' calls and results whose text ends with it: the store cut them
 }
 
@@ -266,21 +275,31 @@ func (s *Store) ThreadEvents(ctx context.Context, session string, read ThreadRea
 		}
 		resultMarks = "(" + resultMarks + ")"
 	}
+	yieldMarks := "0"
+	if len(read.YieldMarks) > 0 {
+		yieldMarks = "(" + strings.TrimSuffix(strings.Repeat("instr(summary, ?) > 0 OR ", len(read.YieldMarks)), " OR ") + ")"
+	}
 	const toolID = `CASE WHEN json_valid(meta) THEN json_extract(meta, '$.tool_id') END`
 	shellCall := `kind = 'tool_call' AND lower(tool) IN ` + in(read.Shells) + ` AND ` + marks
 	var args []any
 	args = append(append(append(args, session, Transcripts), anys(read.Shells)...), callArgs...)
+	args = append(append(append(args, session, Transcripts), anys(read.YieldTools)...), anys(read.YieldMarks)...)
 	args = append(append(args, session, Transcripts), anys(read.Writers)...)
 	args = append(append(args, anys(read.Shells)...), callArgs...)
+	args = append(args, anys(read.YieldTools)...)
 	args = append(append(args, anys(read.Shells)...), resultArgs...)
 	rows, err := s.db.QueryContext(ctx, `WITH calls(id) AS (SELECT `+toolID+` FROM events INDEXED BY events_session
-	    WHERE session = ? AND source = ? AND `+shellCall+`)
+	    WHERE session = ? AND source = ? AND `+shellCall+`),
+	  yields(id) AS (SELECT `+toolID+` FROM events INDEXED BY events_session
+	    WHERE session = ? AND source = ? AND kind = 'tool_result' AND lower(tool) IN `+in(read.YieldTools)+` AND `+yieldMarks+`)
 	  SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
 	  tool, summary, meta, ref, heuristic, experiment FROM events INDEXED BY events_session WHERE session = ? AND source = ? AND (
 	    (kind IN ('owner_text', 'agent_text') AND (agent = '' OR agent = session))
 	    OR (kind IN ('tool_call', 'tool_result') AND lower(tool) IN `+in(read.Writers)+`)
 	    OR (`+shellCall+`)
-	    OR (kind = 'tool_result' AND lower(tool) IN `+in(read.Shells)+` AND `+resultMarks+` AND `+toolID+` IN (SELECT id FROM calls)))
+	    OR (kind = 'tool_call' AND lower(tool) IN `+in(read.YieldTools)+` AND `+toolID+` IN (SELECT id FROM yields))
+	    OR (kind = 'tool_result' AND lower(tool) IN `+in(read.Shells)+` AND `+resultMarks+`
+	      AND (`+toolID+` IN (SELECT id FROM calls) OR `+toolID+` IN (SELECT id FROM yields))))
 	  ORDER BY ts, source_key`, args...)
 	if err != nil {
 		return err
