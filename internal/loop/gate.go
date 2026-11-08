@@ -174,8 +174,17 @@ func (g Gate) Repository(ctx context.Context, dir string) (target Target, err er
 	return Target{Repo: repo, Dir: main, Owner: owner}, nil
 }
 
-// scope runs the machine's read-only scope check for scheduled repository work: a nonzero exit or a disposition
-// of report only is no write.
+// undecidedRe is a scope check's reason that says it could not decide: what it needed to know about the repository
+// (its activity, its provenance, its identity, who works in it) is unknown, unavailable, uncertain or inaccessible, or
+// could not be verified or established.
+var undecidedRe = regexp.MustCompile(`(?i)\b(?:unknown|unavailable|uncertain|inaccessible)\b|\b(?:could not|cannot|can't|unable to) (?:verify|determine|establish|tell)\b`)
+
+// scope runs the machine's read-only scope check for scheduled repository work. Its decision is the write's: an
+// exit of 0 that allows it, or a refusal, which a disposition of report only is. An answer that decides nothing holds
+// the build for this pass, as a repository in use does (Repository): no decision to read (an output that is none, or
+// no allowed in it), an allow with an exit other than 0, or report only for reasons that each say the check could not
+// tell (undecidedRe), such as activity it could not read. That is the host's condition, which the next pass asks
+// again; a report only for any other reason (excluded, inactive, another's) is decided, and refuses the write.
 func (g Gate) scope(ctx context.Context, repo, dir string) error {
 	if err := CheckGitConfig(ctx, dir); err != nil {
 		return err
@@ -191,18 +200,27 @@ func (g Gate) scope(ctx context.Context, repo, dir string) error {
 		return refused("scope output exceeds the whole-stream limit")
 	}
 	var v struct {
-		Allowed     bool     `json:"allowed"`
+		Allowed     *bool    `json:"allowed"`
 		Disposition string   `json:"disposition"`
 		Reasons     []string `json:"reasons"`
 	}
-	if jerr := json.Unmarshal(out.Bytes(), &v); err != nil || jerr != nil || !v.Allowed || v.Disposition == "report_only" {
-		why := strings.Join(v.Reasons, "; ")
+	jerr := json.Unmarshal(out.Bytes(), &v)
+	why := strings.Join(v.Reasons, "; ")
+	switch {
+	case jerr != nil || v.Allowed == nil || *v.Allowed && err != nil:
 		if why == "" && err != nil {
 			why = err.Error()
 		}
-		return refused("the scope check does not allow %s (%s %s): report only", repo, v.Disposition, why)
+		if why == "" {
+			why = "no decision in its output"
+		}
+		return &shipHold{err: refused("the scope check gave no decision for %s (%s): the build waits for the next pass", repo, why)}
+	case *v.Allowed && v.Disposition != "report_only":
+		return nil
+	case len(v.Reasons) > 0 && !slices.ContainsFunc(v.Reasons, func(r string) bool { return !undecidedRe.MatchString(r) }):
+		return &shipHold{err: refused("the scope check could not decide for %s (%s): the build waits for the next pass", repo, why)}
 	}
-	return nil
+	return refused("the scope check does not allow %s (%s %s): report only", repo, v.Disposition, why)
 }
 
 // Protected are the paths of momentum's own repository the loop never changes: what its judgment and its
