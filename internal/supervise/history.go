@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/agent-sh/tacit/client/pkg/evidence"
 
 	"github.com/agent-sh/momentum/internal/store"
 	"github.com/agent-sh/momentum/sessions"
@@ -379,11 +379,11 @@ func abortedBy(from, to string, after, latest time.Time) time.Time {
 	if !ok || !ok2 || p2 != path || end < off {
 		return latest
 	}
-	f, done, ok := rolloutAt(path, off)
-	if !ok {
+	f, err := evidence.OpenAt(path, off) // the file, or the copy Codex compressed it into
+	if err != nil {
 		return latest
 	}
-	defer done()
+	defer f.Close()
 	rd := bufio.NewReaderSize(io.LimitReader(f, min(end-off, requestLimit)), 1<<16)
 	for {
 		raw, err := rd.ReadBytes('\n')
@@ -408,79 +408,56 @@ func abortedBy(from, to string, after, latest time.Time) time.Time {
 }
 
 // codexTurnEnd is how the turn that a Codex session's last record (from) belongs to ended, read forward in the
-// rollout after that record while the transcript is there: task_complete or turn_aborted with its time, when the
-// last of Codex's turn events up to until closed the turn, as its live tracker reads them; "" when the transcript is
-// gone, or the turn is still open by then (none came, or a task_started after it opened another).
-func codexTurnEnd(from string, after, until time.Time) (string, time.Time) {
+// rollout after that record while the transcript is there, its compressed copy among them: the first task_complete
+// or turn_aborted after it, with its time, in the rollout's order, as the live tracker reads it. "" when the
+// transcript is gone, or the turn is still open by the store's records: another turn's task_started, or a message or
+// call the store has not read yet (an ingest behind the rollout), comes first, or the end is at or after until.
+func codexTurnEnd(from string, until time.Time) (string, time.Time) {
 	path, off, ok := refPlace(from)
 	if !ok {
 		return "", time.Time{}
 	}
-	f, done, ok := rolloutAt(path, off)
-	if !ok {
+	f, err := evidence.OpenAt(path, off)
+	if err != nil {
 		return "", time.Time{}
 	}
-	defer done()
+	defer f.Close()
 	rd := bufio.NewReaderSize(io.LimitReader(f, requestLimit), 1<<16)
 	if _, err := rd.ReadBytes('\n'); err != nil { // the record itself
 		return "", time.Time{}
 	}
-	end, endAt := "", time.Time{}
 	for {
 		raw, err := rd.ReadBytes('\n')
-		if len(raw) > 0 && strings.Contains(string(raw), `"event_msg"`) {
-			var e struct {
-				Timestamp string `json:"timestamp"`
-				Type      string `json:"type"`
-				Payload   struct {
-					Type string `json:"type"`
-				} `json:"payload"`
-			}
-			uerr := json.Unmarshal(raw, &e)
-			at, perr := time.Parse(time.RFC3339Nano, e.Timestamp)
+		var e struct {
+			Timestamp string `json:"timestamp"`
+			Type      string `json:"type"`
+			Payload   struct {
+				Type string `json:"type"`
+			} `json:"payload"`
+		}
+		if len(raw) > 0 && json.Unmarshal(raw, &e) == nil {
 			switch {
-			case uerr != nil || e.Type != "event_msg":
-			case perr != nil || at.Before(after):
-			case !at.Before(until):
-				return end, endAt
-			case e.Payload.Type == "task_complete", e.Payload.Type == "turn_aborted":
-				end, endAt = e.Payload.Type, at
-			case e.Payload.Type == "task_started":
-				end, endAt = "", time.Time{}
+			case e.Type == "response_item" && codexItems[e.Payload.Type]:
+				return "", time.Time{} // a record of the turn the store has not read: its records decide
+			case e.Type == "event_msg" && e.Payload.Type == "task_started":
+				return "", time.Time{}
+			case e.Type == "event_msg" && (e.Payload.Type == "task_complete" || e.Payload.Type == "turn_aborted"):
+				if at, perr := time.Parse(time.RFC3339Nano, e.Timestamp); perr == nil && at.Before(until) {
+					return e.Payload.Type, at
+				}
+				return "", time.Time{}
 			}
 		}
 		if err != nil {
-			return end, endAt
+			return "", time.Time{}
 		}
 	}
 }
 
-// rolloutAt is a Codex rollout read from an offset: the file, or the copy Codex compressed it into in place
-// (PATH.zst), whose offsets tacit names in the decompressed bytes; false when neither is there. done closes it.
-func rolloutAt(path string, off int64) (io.Reader, func(), bool) {
-	if f, err := os.Open(path); err == nil {
-		if _, err := f.Seek(off, io.SeekStart); err != nil {
-			f.Close()
-			return nil, nil, false
-		}
-		return f, func() { f.Close() }, true
-	}
-	f, err := os.Open(path + ".zst")
-	if err != nil {
-		return nil, nil, false
-	}
-	dec, err := zstd.NewReader(f, zstd.WithDecoderConcurrency(1))
-	if err != nil {
-		f.Close()
-		return nil, nil, false
-	}
-	done := func() { dec.Close(); f.Close() }
-	if _, err := io.CopyN(io.Discard, dec, off); err != nil {
-		done()
-		return nil, nil, false
-	}
-	return dec, done, true
-}
+// codexItems are the rollout's response items the store keeps as events: a message, and a call or its output.
+var codexItems = map[string]bool{"message": true, "agent_message": true, "function_call": true, "custom_tool_call": true,
+	"tool_search_call": true, "local_shell_call": true, "web_search_call": true, "function_call_output": true,
+	"custom_tool_call_output": true, "tool_search_output": true}
 
 // replayWake is a self-paced loop's pending wakeup, as the session layer reads it.
 type replayWake struct {
@@ -968,7 +945,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		if carried == "" && harness == "codex" && (owed || prevRole == "call" && len(pending) > 0) {
 			// the store marks a Codex turn's end on the record after it, and none came after the last record: the
 			// rollout's own end of the turn after it, while the transcript is there, as the live tracker reads it
-			if end, at := codexTurnEnd(lastSeen, prevAt, until); end != "" {
+			if end, at := codexTurnEnd(lastSeen, until); end != "" {
 				carried, pending = end, map[string]bool{}
 				if end == "turn_aborted" && !aborted {
 					prevAt = at // the live tracker keeps the turn open until its abort

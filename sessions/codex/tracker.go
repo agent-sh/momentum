@@ -182,7 +182,7 @@ func Typed(msg string) bool {
 }
 
 // markupTag is an opening tag at the start of a message: "<", a name, maybe attributes, then ">".
-var markupTag = regexp.MustCompile(`^\s*<[A-Za-z][\w.:-]*(\s[^<>\n]*)?>`)
+var markupTag = regexp.MustCompile(`^\s*<[A-Za-z][\w.:-]*([ \t][^<>\n]*)?>`)
 
 // OpensTurn reports a typed message that opens a turn of its user's when the agent did nothing in the turn before
 // it: any but momentum's own, which opens with its marker (sessions.Marker). A resync answers nothing, so the turn

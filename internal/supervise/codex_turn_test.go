@@ -365,7 +365,7 @@ func TestTheReplayOfAResyncThatGetsNoReplyKeepsItsWords(t *testing.T) {
 
 // Only the owner's input opens a Codex turn in the replay, and only one the live tracker reads as typed: not the
 // session's own input (a notification), and not a message that opens with a tag, which the live tracker reads as
-// Codex's own markup. One of his that opens with "<" and no tag is typed, and opens the turn.
+// Codex's own markup.
 func TestACodexInputTheLiveTrackerDoesNotReadAsTypedOpensNoTurn(t *testing.T) {
 	st := testStore(t)
 	const asked = "I switched the sink. Can you hear it now?"
@@ -379,19 +379,29 @@ func TestACodexInputTheLiveTrackerDoesNotReadAsTypedOpensNoTurn(t *testing.T) {
 	tagged.owner(40*time.Minute, "status?", "task_complete")
 	taggedNext := tagged.at
 	tagged.codex().put(st)
-	angle := newTimeline(t, "codex-angle").owner(0, "fix the sound output", "").say(time.Minute, asked).
-		owner(20*time.Minute, "<= 5 retries is enough, keep going", "task_complete")
-	angle.owner(40*time.Minute, "status?", "task_complete")
-	angleNext := angle.at
-	angle.codex().put(st)
-	for session, at := range map[string]time.Time{"codex-self": selfNext, "codex-tag": taggedNext, "codex-angle": angleNext} {
-		want := asked
-		if session == "codex-angle" {
-			want = ""
+	for session, at := range map[string]time.Time{"codex-self": selfNext, "codex-tag": taggedNext} {
+		if got := replayed(t, st, session, at); got.Point.Stop.Words != asked {
+			t.Fatalf("%s: the stop after the silent turn reads %q, want %q (%s)", session, got.Point.Stop.Words, asked, Why(got))
 		}
-		if got := replayed(t, st, session, at); got.Point.Stop.Words != want {
-			t.Fatalf("%s: the stop after the silent turn reads %q, want %q (%s)", session, got.Point.Stop.Words, want, Why(got))
-		}
+	}
+}
+
+// A message of the owner's that opens with "<" and no tag is typed live: it opens the turn, so the silent turn after
+// it has no words of its own. The store keeps it as harness text, so the replay passes over it and keeps the
+// question before it: a way a live run differs from the replay.
+func TestAnAngleWithNoTagIsTypedLiveAndPassedOverInTheReplay(t *testing.T) {
+	home := codexHome(t)
+	r := newCodexRollout(t, home)
+	r.asked()
+	r.started(5 * time.Minute)
+	r.user(0, "<= 5 retries is enough, keep going")
+	ended := r.completed(2*time.Second, "")
+	_, stop, _ := live(t, r.path, ended)
+	r.started(20 * time.Minute)
+	nudge := r.user(0, "status?")
+	got := replayed(t, ingested(t, home), codexTurnID, nudge)
+	if stop.Words != "" || got.Point.Stop.Words != Words(codexAsked) {
+		t.Fatalf("live %q, replay %q (%s)", stop.Words, got.Point.Stop.Words, Why(got))
 	}
 }
 
@@ -466,29 +476,95 @@ func lastStop(t *testing.T, st *store.Store, session string) Result {
 	return Result{}
 }
 
-// A Codex session's last records are a call's output, maybe a subagent's message after it, then Codex closes the
-// turn with no agent message; or its user aborts the turn while the call runs. The store marks a turn's end on the
-// record after it, and none came: the replay reads the end from the rollout, so its last stop is over, as the live
-// tracker reads it. A turn closed by Codex stops at its last record; an aborted one at the abort.
+// A Codex session's last records are a call's output, maybe a subagent's message after it, or the owner's input,
+// then Codex closes the turn with no agent message; or its user aborts the turn while the call runs. The store marks
+// a turn's end on the record after it, and none came: the replay reads the end from the rollout, so its last stop is
+// over, as the live tracker reads it. A turn closed by Codex stops at its last record; an aborted one at the abort.
+// The rollout's order decides, as in the live tracker, not an end's time before the record's; an end at or after
+// the window's end leaves the turn open in it.
 func TestTheLastCodexTurnReadsOverWhenNoRecordCameAfterItsEnd(t *testing.T) {
 	for _, c := range []struct {
-		name string
-		end  func(r *codexRollout) (stopAt, ended time.Time)
+		name    string
+		working bool
+		end     func(r *codexRollout, input time.Time) (stopAt, ended time.Time)
 	}{
-		{"a subagent's message after the output", func(r *codexRollout) (time.Time, time.Time) {
+		{"a subagent's message after the output", false, func(r *codexRollout, _ time.Time) (time.Time, time.Time) {
 			out := r.call(time.Minute, "c1")
 			r.line(time.Second, "response_item", map[string]any{"type": "agent_message", "id": "m1", "author": "worker", "recipient": "main",
 				"content": []any{map[string]any{"type": "input_text", "text": "The worker finished the build."}}})
 			return out, r.completed(time.Second, "")
 		}},
-		{"the output last", func(r *codexRollout) (time.Time, time.Time) {
+		{"the output last", false, func(r *codexRollout, _ time.Time) (time.Time, time.Time) {
 			out := r.call(time.Minute, "c1")
 			return out, r.completed(time.Second, "")
 		}},
-		{"an abort while the call runs", func(r *codexRollout) (time.Time, time.Time) {
+		{"the owner's input last", false, func(r *codexRollout, input time.Time) (time.Time, time.Time) {
+			return input, r.completed(time.Minute, "")
+		}},
+		{"an abort while the call runs", false, func(r *codexRollout, _ time.Time) (time.Time, time.Time) {
 			r.line(time.Minute, "response_item", map[string]any{"type": "function_call", "name": "exec_command", "call_id": "c1", "arguments": `{"cmd":"sleep 600"}`})
 			at := r.line(time.Minute, "event_msg", map[string]any{"type": "turn_aborted", "reason": "interrupted"})
 			return at, at
+		}},
+		{"an end stamped before the output", false, func(r *codexRollout, _ time.Time) (time.Time, time.Time) {
+			out := r.call(time.Minute, "c1")
+			return out, r.completed(-30*time.Second, "")
+		}},
+		{"the end after the window", true, func(r *codexRollout, _ time.Time) (time.Time, time.Time) {
+			out := r.call(time.Minute, "c1")
+			return out, r.completed(6*time.Hour, "") // replayAll's window ends 6 hours after the session began
+		}},
+	} {
+		for _, compressed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s, compressed %v", c.name, compressed), func(t *testing.T) {
+				home := codexHome(t)
+				r := newCodexRollout(t, home)
+				r.meta()
+				r.started(time.Second)
+				input := r.user(0, "run the soak")
+				stopAt, ended := c.end(r, input)
+				_, stop, res := live(t, r.path, ended)
+				st := ingested(t, home)
+				if compressed {
+					compressInPlace(t, r.path)
+				}
+				got := lastStop(t, st, codexTurnID)
+				want := sessions.Idle
+				if c.working {
+					want = sessions.Working
+				}
+				if s := got.Point.Stop; s.Working != c.working || s.Phase != want || !s.At.Equal(stopAt) || stop.Working {
+					t.Fatalf("replay %s (working %v) at %v, want %s at %v: %q; live %q", s.Phase, s.Working, s.At, want, stopAt, Why(got), Why(res))
+				}
+			})
+		}
+	}
+}
+
+// The store can be behind the rollout: an ingest reads it every few minutes, and a replay's window ends now by
+// default. A record the store has not read yet, or another turn's start, comes before the end the rollout reads on
+// to, so the last stop is what the store's records say, and a later turn never decides it: the turn of the last
+// record ends at its own end, the first after the record.
+func TestTheLastCodexStopIsNotALaterTurnsWhenTheStoreIsBehind(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		working bool
+		later   func(r *codexRollout)
+	}{
+		{"its turn's end, then a later turn's abort", false, func(r *codexRollout) {
+			r.completed(time.Second, "")
+			r.started(30 * time.Minute)
+			r.user(0, "now the other one")
+			r.line(time.Minute, "response_item", map[string]any{"type": "function_call", "name": "exec_command", "call_id": "c2", "arguments": `{"cmd":"sleep 600"}`})
+			r.line(time.Minute, "event_msg", map[string]any{"type": "turn_aborted", "reason": "interrupted"})
+		}},
+		{"an agent message the store has not read, then the end", true, func(r *codexRollout) {
+			r.agent(time.Second, "The soak passed.")
+			r.completed(0, "The soak passed.")
+		}},
+		{"another turn's start before an end of its own", true, func(r *codexRollout) {
+			r.started(30 * time.Minute)
+			r.line(time.Minute, "event_msg", map[string]any{"type": "turn_aborted", "reason": "interrupted"})
 		}},
 	} {
 		for _, compressed := range []bool{false, true} {
@@ -498,15 +574,15 @@ func TestTheLastCodexTurnReadsOverWhenNoRecordCameAfterItsEnd(t *testing.T) {
 				r.meta()
 				r.started(time.Second)
 				r.user(0, "run the soak")
-				stopAt, ended := c.end(r)
-				_, stop, res := live(t, r.path, ended)
+				out := r.call(time.Minute, "c1")
 				st := ingested(t, home)
+				c.later(r)
 				if compressed {
 					compressInPlace(t, r.path)
 				}
 				got := lastStop(t, st, codexTurnID)
-				if s := got.Point.Stop; s.Working || s.Phase != sessions.Idle || !s.At.Equal(stopAt) || stop.Working {
-					t.Fatalf("replay %s (working %v) at %v, want idle at %v: %q; live %q", s.Phase, s.Working, s.At, stopAt, Why(got), Why(res))
+				if s := got.Point.Stop; s.Working != c.working || !s.At.Equal(out) {
+					t.Fatalf("replay %s (working %v) at %v, want working %v at the output, %v: %q", s.Phase, s.Working, s.At, c.working, out, Why(got))
 				}
 			})
 		}
@@ -569,6 +645,7 @@ func TestOnlyATagIsCodexMarkup(t *testing.T) {
 	}{
 		{"<= 5 retries is enough, keep going", true},
 		{"<-- that one, revert it", true},
+		{"<x\n> is not a tag: the name's line ends before the >", true},
 		{tag("environment_context") + "cwd /w/audio" + closing("environment_context"), false},
 		{"\n" + tag("image name=[Image #1]") + closing("image"), false},
 	} {
