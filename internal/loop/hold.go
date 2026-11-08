@@ -230,8 +230,8 @@ func (r *Runner) releaseHolds(ctx context.Context, cs []store.Case) error {
 					return err
 				}
 			}
-			if _, ok := personHoldOf(as, log); ok { // a return to testing builds again
-				if err := r.Store.CaseNote(cleanedNote(ctx), c.ID, actionPersonEnded, "the case left testing", "loop"); err != nil {
+			if _, ok := store.LastPersonHold(log); ok { // a return to testing builds again
+				if err := r.Store.CaseNote(cleanedNote(ctx), c.ID, store.ActionPersonEnded, "the case left testing", "loop"); err != nil {
 					return err
 				}
 			}
@@ -245,7 +245,7 @@ func (r *Runner) releaseHolds(ctx context.Context, cs []store.Case) error {
 		hold, record, repo, hand := holdNotePrefix(c.ID), recordNotePrefix(c.ID), repoNoteID(c.ID), handNoteID(c.ID)
 		for _, n := range mine {
 			if n.Done.IsZero() && (strings.HasPrefix(n.ID, hold) || strings.HasPrefix(n.ID, record) || n.ID == repo || n.ID == hand || strings.HasPrefix(n.ID, hand+":") ||
-				n.ID == personNoteID(c.ID)) {
+				strings.HasPrefix(n.ID, personNotePrefix(c.ID))) {
 				if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
 					return err
 				}

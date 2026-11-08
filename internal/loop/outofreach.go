@@ -1,10 +1,12 @@
 package loop
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -15,12 +17,14 @@ import (
 )
 
 // A build whose case's fix needs a path no change of the loop's may touch answers so instead of making a change: the
-// path and the change a person makes there (out_of_reach). The host checks the path with PathScope. A path it refuses
-// holds the case for a person: a raised problem note names the path and the fix, and a "held for a person" line in the
-// case's log keeps the hold with the case's episode and the evidence it held. The build's run ends as any answered run
-// does, so the stop rule counts no failure and files no component-health case, and a held case takes no build slot. The
-// hold ends when the case holds evidence it did not hold then, or leaves testing (a person closes it, or sends it back
-// to its investigation): the case builds again. A path a change may touch is the build's own refusal at its report.
+// path and the change a person makes there (out_of_reach). The host checks the path against BASE and sorts it: one no
+// change may touch (PathScope refuses it, or the patch check would: Git's own directory, a path through a symlink or a
+// submodule of BASE) holds the case for a person, with a "held for a person" line in its log and a raised problem note
+// that names the path and the fix. The run keeps its own outcome (store.RunOutOfReach), which the stop rule neither
+// counts nor stops at, and a held case takes no build slot. The hold stands until the case starts a new episode,
+// leaves testing, or a person changes its status, mechanism or fix (store.PersonHoldOf); new evidence alone does not
+// end it. A path a change may touch, and one that is no path of the repository at BASE, are the build's refusals at
+// its report.
 
 // OutOfReach is a build report's answer that the case's fix is out of the loop's reach: the path, from the
 // repository's root, and the change a person makes there.
@@ -30,38 +34,30 @@ type OutOfReach struct {
 }
 
 const outOfReachSchema = `{"type":"object","additionalProperties":false,"required":["path","fix"],` +
-	`"description":"Only when the case's fix needs a path no change may touch (the build prompt names them) and no change in reach fixes the case: make no change and give this instead. The host reads only summary and this answer, checks the path, and the case waits for a person. A path a change may touch refuses the build.",` +
-	`"properties":{"path":{"type":"string","description":"The path from the repository's root, such as .github/workflows/ci.yml."},` +
+	`"description":"Only when the case's fix needs a path no change may touch (the build prompt names them) and no change in reach fixes the case: make no change and give this instead. The host reads only summary and this answer, checks the path against BASE, and the case waits for a person. A path a change may touch, or one BASE does not hold, refuses the build.",` +
+	`"properties":{"path":{"type":"string","description":"The path from the repository's root, such as .github/workflows/ci.yml: one BASE holds, or a new file in a directory BASE holds."},` +
 	`"fix":{"type":"string","description":"The change a person makes there, in short sentences."}}}`
 
 // outOfReachBrief tells a build it may answer that its fix is out of reach.
 const outOfReachBrief = "When the case's fix needs a path no change may touch and nothing in reach fixes the case, make no change and answer out_of_reach: " +
-	"the path from the repository's root and the change a person makes there. The host checks the path, and the case waits for a person. " +
-	"A path a change may touch refuses the build."
+	"the path from the repository's root, one BASE holds or a new file in a directory it holds, and the change a person makes there. " +
+	"The host checks the path, and the case waits for a person. A path a change may touch, or one BASE does not hold, refuses the build."
 
-// The case log lines of a hold for a person: its start, with its record, and its end, with why.
+// outOfReachPathMax bounds an answer's path, which the report refuses past it; outOfReachFixMax and
+// outOfReachReasonMax clip the fix and the reason the hold keeps, so its record stays one readable case log line.
 const (
-	actionPersonHeld  = "held for a person"
-	actionPersonEnded = "person hold ended"
+	outOfReachPathMax   = 200
+	outOfReachFixMax    = 400
+	outOfReachReasonMax = 300
 )
 
-// outOfReachPathMax and outOfReachFixMax bound an answer's path, which the report refuses past it, and its fix, which
-// the hold's note and record clip, so the record stays one readable case log line.
-const (
-	outOfReachPathMax = 200
-	outOfReachFixMax  = 600
-)
+// personNotePrefix begins the ids of a case's notes of its holds for a person, one per path.
+func personNotePrefix(caseID string) string { return "loop-build:" + store.IDPart(caseID) + ":person:" }
 
-// personRecord is the detail of a "held for a person" line.
-type personRecord struct {
-	Path     string `json:"path"`
-	Fix      string `json:"fix"`
-	Episode  int64  `json:"episode"`
-	Evidence int    `json:"evidence"` // how many evidence refs the case held at the build that answered
+func personNoteID(caseID, where string) string {
+	sum := sha256.Sum256([]byte(where))
+	return personNotePrefix(caseID) + hex.EncodeToString(sum[:])
 }
-
-// personNoteID is the note of a case held for a person.
-func personNoteID(caseID string) string { return "loop-build:" + store.IDPart(caseID) + ":person" }
 
 // outOfReachReport checks a report that answers its fix is out of reach: its summary and the answer are what the
 // host reads, and the change's fields are not.
@@ -83,97 +79,181 @@ func outOfReachReport(report BuildReport) (BuildReport, error) {
 	return report, nil
 }
 
-// outOfReach is a build's out-of-reach answer, after its authority check: a path PathScope refuses holds the case for
-// a person (holdForPerson) and the run ends as answered; one a change may touch is the build's refusal at its report.
-// A hold the store cannot record is the host's error at the proposal.
+// outOfReach is a build's out-of-reach answer, after its authority check: a path no change may touch holds the case
+// for a person (holdForPerson) and the run keeps its own outcome; one a change may touch, or one BASE does not hold, is
+// the build's refusal at its report. BASE that cannot be read is the host's error at the check, and a hold the store
+// cannot record the host's error at the proposal.
 func (r *Runner) outOfReach(ctx context.Context, c store.Case, run store.LoopRun, res Result, p Package, o OutOfReach) (Result, error) {
-	_, scope := PathScope(Target{Repo: p.Repo}, []string{o.Path})
-	if scope == nil {
+	why, refusal, err := r.unreachable(ctx, p, o.Path)
+	switch {
+	case err != nil:
+		return stageFailureIn(ctx, res, "build check", err)
+	case refusal != nil:
+		return stageFailureIn(ctx, res, "build report", refusal)
+	case why == nil:
 		return stageFailureIn(ctx, res, "build report", refused("the out-of-reach path %s is one a change may touch: make the fix there", o.Path))
 	}
-	if err := r.holdForPerson(ctx, c, run.CaseEpisode, o, scope); err != nil {
+	if err := r.holdForPerson(ctx, c, run.CaseEpisode, o, why); err != nil {
 		return stageFailureIn(ctx, res, "build propose", err)
 	}
 	r.logf("build %s: its fix needs %s, which no change may touch: the case waits for a person", c.ID, o.Path)
+	res.Status = store.RunOutOfReach
 	return res, nil
 }
 
-// holdForPerson holds a case for a person: its raised problem note first, naming the path and the fix, then the case
-// log's "held for a person" line, which stands as the hold. c is the case as the build was picked, so evidence that came
-// in during the build ends the hold.
+// unreachable sorts an out-of-reach answer's path, name. why says why no change of the loop's may touch it: PathScope
+// refuses it, or the patch check would (a component that is Git's own directory, a path through a symlink or a
+// submodule of BASE, which the patch check refuses: checkBasePaths, patchPath); it is nil when a change may. refusal
+// says name is no path of the repository at BASE: BASE holds no such file or directory, it is no new file in a
+// directory BASE holds, and it is under no symlink or submodule there; a path in Git's own directory is read in the
+// checkout's. err is the host's error reading BASE.
+func (r *Runner) unreachable(ctx context.Context, p Package, name string) (why, refusal, err error) {
+	if p.Host == "" || p.BaseCommit == "" {
+		return nil, nil, errors.New("the package has no host clone and base commit; prepare it again")
+	}
+	base, err := r.Ship.treeEntries(r.Ship.gitContext(shipContext(ctx, p.Case)), p, p.BaseCommit)
+	if err != nil {
+		return nil, nil, fmt.Errorf("the base tree cannot be read: %v", err) // the host's, never a refusal of the build
+	}
+	parts := strings.Split(name, "/")
+	gitDir := false
+	for _, part := range parts {
+		gitDir = gitDir || strings.EqualFold(part, ".git")
+	}
+	if !inBase(base, name) && !(strings.EqualFold(parts[0], ".git") && inCheckout(p.Dir, name)) {
+		return nil, refused("the out-of-reach path %s is no path of the repository at BASE, nor a new file in a directory BASE holds: name the path the fix needs", name), nil
+	}
+	if _, scope := PathScope(Target{Repo: p.Repo}, []string{name}); scope != nil {
+		return scope, nil, nil
+	}
+	if gitDir {
+		return refused("%s is in Git's own directory, which no change touches", name), nil, nil
+	}
+	if checkBasePaths(base, []string{name}) != nil {
+		return refused("%s is a symlink or a submodule of the repository, or a path through one, which no change touches", name), nil, nil
+	}
+	return nil, nil, nil
+}
+
+// inBase says whether BASE's entries (Ship.treeEntries: its files, symlinks and submodules) hold name: as an entry, as
+// a directory, as a new file in a directory they hold (the root among them), or under a symlink or a submodule, whose
+// content BASE does not list.
+func inBase(base map[string]treeEntry, name string) bool {
+	if _, ok := base[name]; ok {
+		return true
+	}
+	parts := strings.Split(name, "/")
+	for i := 1; i < len(parts); i++ {
+		if e, ok := base[strings.Join(parts[:i], "/")]; ok && (e.mode == "120000" || e.mode == "160000") {
+			return true
+		}
+	}
+	parent := path.Dir(name)
+	for entry := range base {
+		if strings.HasPrefix(entry, name+"/") || parent != "." && strings.HasPrefix(entry, parent+"/") {
+			return true
+		}
+	}
+	return parent == "."
+}
+
+// inCheckout says whether the checkout at dir holds name as BASE's rule reads it (inBase): every directory above it
+// is a directory there, not a link, so name is an entry of that directory or a new file in it.
+func inCheckout(dir, name string) bool {
+	if dir == "" {
+		return false
+	}
+	parts := strings.Split(name, "/")
+	cur := dir
+	for _, part := range parts[:len(parts)-1] {
+		cur = filepath.Join(cur, part)
+		if fi, err := os.Lstat(cur); err != nil || !fi.IsDir() {
+			return false
+		}
+	}
+	return true
+}
+
+// holdForPerson holds a case for a person: the case log's "held for a person" line first, which stands as the hold,
+// then its raised problem note, naming the path and the fix. A note that cannot be put is logged: the next pass puts
+// a standing hold's note when it has none (heldForPerson).
 func (r *Runner) holdForPerson(ctx context.Context, c store.Case, episode int64, o OutOfReach, why error) error {
 	texts, err := RedactAll(ctx, []string{o.Path, o.Fix, strings.TrimPrefix(why.Error(), ErrRefused.Error()+": ")})
 	if err != nil {
 		return err
 	}
-	where, fix, reason := plain.Line(texts[0]), plainClip(plain.Line(texts[1]), outOfReachFixMax), plain.Line(texts[2])
-	n := store.Note{ID: personNoteID(c.ID), Kind: store.NoteProblem, Importance: store.ImportanceNormal, At: r.now(),
-		Title: "The loop's build for case " + c.ID + " needs a person: " + where,
-		Detail: "Its fix is out of the loop's reach: " + reason + ". The change to make in " + where + ": " + sentence(fix) +
-			" Make it and close the case. New evidence, or sending the case back to its investigation, ends the hold."}
-	if _, err := r.Store.PutNote(ctx, n); err != nil {
+	h := store.PersonHold{Path: plainClip(plain.Line(texts[0]), outOfReachPathMax), Fix: plainClip(plain.Line(texts[1]), outOfReachFixMax),
+		Reason: plainClip(plain.Line(texts[2]), outOfReachReasonMax), Episode: episode}
+	if err := r.Store.CaseNote(cleanedNote(ctx), c.ID, store.ActionPersonHeld, store.PersonDetail(h), "loop"); err != nil {
 		return err
 	}
-	var detail bytes.Buffer
-	enc := json.NewEncoder(&detail)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(personRecord{Path: where, Fix: fix, Episode: episode, Evidence: c.Evidence}); err != nil {
-		return err
+	if err := r.putPersonNote(ctx, c.ID, h); err != nil {
+		r.logf("the person hold note of %s: %v; the next pass puts it", c.ID, err)
 	}
-	return r.Store.CaseNote(cleanedNote(ctx), c.ID, actionPersonHeld, strings.TrimSpace(detail.String()), "loop")
+	return nil
 }
 
-// personHoldOf is the hold for a person of a case in testing, from its log: its newest "held for a person" line of the
-// case's current episode with no end after it.
-func personHoldOf(c store.Case, log []store.CaseEntry) (personRecord, bool) {
-	if c.Status != store.CaseTesting {
-		return personRecord{}, false
-	}
-	for i := len(log) - 1; i >= 0; i-- {
-		switch log[i].Action {
-		case actionPersonEnded:
-			return personRecord{}, false
-		case actionPersonHeld:
-			var h personRecord
-			if json.Unmarshal([]byte(log[i].Detail), &h) != nil || h.Episode != c.Episode || h.Path == "" {
-				return personRecord{}, false
-			}
-			return h, true
-		}
-	}
-	return personRecord{}, false
+// putPersonNote puts the raised problem note of a case's hold for a person.
+func (r *Runner) putPersonNote(ctx context.Context, caseID string, h store.PersonHold) error {
+	_, err := r.Store.PutNote(ctx, store.Note{ID: personNoteID(caseID, h.Path), Kind: store.NoteProblem, Importance: store.ImportanceNormal,
+		At: r.now(), Title: "The loop's build for case " + caseID + " needs a person: " + h.Path,
+		Detail: "Its fix is out of the loop's reach: " + sentence(h.Reason) + " The change to make in " + h.Path + ": " + sentence(h.Fix) +
+			" Make it and close the case, or change the case's mechanism or fix, or send it back to its investigation: new evidence alone does not end the hold."})
+	return err
 }
 
-// heldForPerson is the path a case in testing waits on a person for, or "", and the error of a log it cannot read. A
-// hold the case's new evidence ended gets its end, and its note is resolved; one whose end cannot be written is logged
-// and ends all the same, and the next pass writes it. A dry pass writes nothing.
+// heldForPerson is the path a case in testing waits on a person for (store.PersonHoldOf), or "", and the error of a
+// log it cannot read. A standing hold whose note was never put gets it. A hold that no longer stands (a new episode, a
+// person's change of the case) gets its end, and its notes are resolved, before the case builds again; one whose end
+// cannot be written is logged and ends all the same, and the next pass writes it. A dry pass writes nothing.
 func (r *Runner) heldForPerson(ctx context.Context, c store.Case, dry bool) (string, error) {
 	log, err := r.Store.CaseLog(ctx, c.ID)
 	if err != nil {
 		return "", err
 	}
-	h, ok := personHoldOf(c, log)
-	switch {
-	case !ok:
-		return "", nil
-	case c.Evidence <= h.Evidence:
-		return h.Path, nil
-	case dry:
+	last, open := store.LastPersonHold(log)
+	if !open {
 		return "", nil
 	}
-	// the note goes first: the hold's line stands until its end is written
-	if err := r.endPersonHold(ctx, c.ID, "new evidence came in"); err != nil {
+	if h, ok := store.PersonHoldOf(c, log); ok {
+		if !dry {
+			if _, had, err := r.Store.Note(ctx, personNoteID(c.ID, h.Path)); err != nil {
+				r.logf("the person hold note of %s: %v", c.ID, err)
+			} else if !had {
+				if err := r.putPersonNote(ctx, c.ID, h); err != nil {
+					r.logf("the person hold note of %s: %v", c.ID, err)
+				}
+			}
+		}
+		return h.Path, nil
+	}
+	if dry {
+		return "", nil
+	}
+	why := "a person changed the case's status, mechanism or fix"
+	if last.Episode != c.Episode {
+		why = "the case is in a new episode"
+	}
+	if err := r.endPersonHold(ctx, c.ID, why); err != nil {
 		r.logf("the person hold of %s: %v", c.ID, err)
 	}
 	return "", nil
 }
 
-// endPersonHold resolves a case's note of its hold for a person, then writes the hold's end with why.
+// endPersonHold resolves a case's standing notes of its holds for a person, then writes the hold's end with why.
 func (r *Runner) endPersonHold(ctx context.Context, caseID, why string) error {
-	if _, _, err := r.Store.DoneNote(ctx, personNoteID(caseID), r.now()); err != nil && !errors.Is(err, store.ErrNoNote) {
+	notes, err := r.Store.Notes(ctx)
+	if err != nil {
 		return err
 	}
-	return r.Store.CaseNote(cleanedNote(ctx), caseID, actionPersonEnded, why, "loop")
+	for _, n := range notes {
+		if n.Done.IsZero() && strings.HasPrefix(n.ID, personNotePrefix(caseID)) {
+			if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
+				return err
+			}
+		}
+	}
+	return r.Store.CaseNote(cleanedNote(ctx), caseID, store.ActionPersonEnded, why, "loop")
 }
 
 // sentence is text that ends as a sentence does.

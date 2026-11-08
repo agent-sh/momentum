@@ -344,6 +344,44 @@ func TestCaseListShowsAHeldCase(t *testing.T) {
 	}
 }
 
+// A case a build held for a person shows the hold, with the path its fix needs, in case list and case show --json.
+func TestCaseListShowsAPersonHold(t *testing.T) {
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	ctx := context.Background()
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: "person", Title: "a case for a person",
+		Evidence: []store.Evidence{{Ref: "file:/a@1", At: time.Now()}}}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mechanism, fix := "one cause", "one fix"
+	if _, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CaseNote(ctx, c.ID, "held for a person", `{"path":".github/workflows/ci.yml","fix":"Run the tests.","reason":"CI configuration","episode":1,"evidence":1}`, "loop"); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	want := "for a person: its fix needs .github/workflows/ci.yml"
+	if code, out, _ := momentum("case", "list"); code != 0 || !strings.Contains(out, "testing (held)") || !strings.Contains(out, "[held: "+want+"]") {
+		t.Fatalf("list: exit %d %q", code, out)
+	}
+	var shown struct {
+		Held string `json:"held"`
+	}
+	code, out, _ := momentum("case", "show", c.ID, "--json")
+	if err := json.Unmarshal([]byte(out), &shown); code != 0 || err != nil || shown.Held != want {
+		t.Fatalf("show: exit %d %q %v", code, out, err)
+	}
+	if code, out, _ := momentum("case", "list", "--json"); code != 0 || !strings.Contains(out, `"held":"`+want+`"`) {
+		t.Fatalf("list --json: exit %d %q", code, out)
+	}
+}
+
 // A case whose change waits for a hand landing shows that stage and its pull request in case list and show --json.
 func TestCaseListShowsAHandLanding(t *testing.T) {
 	t.Setenv("MOMENTUM_HOME", t.TempDir())

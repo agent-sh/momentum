@@ -1271,12 +1271,13 @@ func stopRuns(ctx context.Context, st *store.Store, c store.Case) (runs []store.
 }
 
 // stopCounts says the stop rule counts a run: one that started and ended (a refusal of the budgets is no run, nor is
-// one still running), or one that failed at the host's hand before its agent started, which is kept at no cost and
-// with no start, so nothing else bounds it: a build at a host stage (its inputs, a toolchain that is gone, a harness
-// that does not start), or an investigation whose harness never started (run).
+// one still running, nor a build that answered its fix is out of reach, whose case waits for a person), or one that
+// failed at the host's hand before its agent started, which is kept at no cost and with no start, so nothing else
+// bounds it: a build at a host stage (its inputs, a toolchain that is gone, a harness that does not start), or an
+// investigation whose harness never started (run).
 func stopCounts(run store.LoopRun) bool {
 	switch {
-	case run.Status == store.RunRefused || run.Status == store.RunRunning || run.Failure == "sandbox":
+	case run.Status == store.RunRefused || run.Status == store.RunRunning || run.Failure == "sandbox" || run.Status == store.RunOutOfReach:
 		return false
 	case run.Started.IsZero() && oldBrokerOutage(run):
 		return false

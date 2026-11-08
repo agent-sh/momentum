@@ -189,8 +189,9 @@ func caseJSON(c store.Case) listedCase {
 // statusLine is a case's status for a terminal: closed ones with their reason.
 func statusLine(c store.Case) string { return evidenceview.StatusLine(c) }
 
-// caseHold is why the configuration holds a case in testing, from its log, or "", and what it waits on: the pull
-// request of a hand landing, or the file of a configuration proposal (store.ConfigStage), or "".
+// caseHold is why the configuration, or a person (store.PersonHoldOf), holds a case in testing, from its log, or "",
+// and what it waits on: the pull request of a hand landing, or the file of a configuration proposal
+// (store.ConfigStage), or "".
 func caseHold(ctx context.Context, st *store.Store, c store.Case) (hold, hand string, err error) {
 	if c.Status != store.CaseTesting {
 		return "", "", nil
@@ -199,10 +200,14 @@ func caseHold(ctx context.Context, st *store.Store, c store.Case) (hold, hand st
 	if err != nil {
 		return "", "", err
 	}
-	if target := store.ConfigOf(c, log); target != "" {
-		return store.HoldOf(c, log), configWait + target, nil
+	hold = store.HoldOf(c, log)
+	if h, ok := store.PersonHoldOf(c, log); ok {
+		hold = h.Why()
 	}
-	return store.HoldOf(c, log), store.HandOf(c, log), nil
+	if target := store.ConfigOf(c, log); target != "" {
+		return hold, configWait + target, nil
+	}
+	return hold, store.HandOf(c, log), nil
 }
 
 // configWait marks what a case waits on as a configuration proposal's file, not a pull request.

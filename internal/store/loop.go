@@ -72,6 +72,9 @@ const (
 	RunTurns   = "turns"   // it reached its turns
 	RunTimeout = "timeout" // it ran out of its time and was stopped
 	RunRefused = "refused" // a gate refused to start it (no budget left, a case blocked)
+	// RunOutOfReach is a build that answered its case's fix needs a path no change may touch: the case waits for a
+	// person. The stop rule neither counts it nor stops at it.
+	RunOutOfReach = "out-of-reach"
 )
 
 // Usage is what a run's model calls took, by the kind of token Bedrock prices: input, output, cache reads and cache

@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,33 +17,71 @@ import (
 // outOfReachFix is the change the fixture's builds say a person makes.
 const outOfReachFix = "Run go test ./... in the workflow's test step."
 
-// outOfReachRunner is a runner whose builds answer that the fix needs where, which no change of theirs may touch, and
-// change nothing, over a case in testing (testingCase). It returns the file that counts the builds.
-func outOfReachRunner(t *testing.T, where string) (*Runner, store.Case, string) {
+// ciFiles are the fixture repository's CI workflows: paths no change may touch, which BASE holds.
+var ciFiles = map[string]string{".github/workflows/ci.yml": "name: ci\n", ".github/workflows/release.yml": "name: release\n"}
+
+// outOfReachAnswer is a build's step that changes nothing and answers its fix needs where.
+func outOfReachAnswer(t *testing.T, where string) string {
 	t.Helper()
-	if err := sandbox.Available(true); err != nil {
-		t.Skip(err)
-	}
-	st := testStore(t)
-	f := newRepo(t, nil)
-	c := testingCase(t, st)
 	raw, err := json.Marshal(map[string]any{"summary": "The fix is the workflow's: its test step runs no test.", "test_command": []string{},
 		"title": "", "body": "", "rollback": "", "window": "", "lesson": "", "signal": map[string]any{"source": "", "kinds": []string{}, "match": []string{}},
 		"out_of_reach": map[string]string{"path": where, "fix": outOfReachFix}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	return fixtureResult(`{"type":"result","subtype":"success","structured_output":` + string(raw) + `}`)
+}
+
+// refusedWindow is a build's step that makes the checked change and reports a window the host cannot read, which it
+// refuses at build propose; it keeps the refusal.md the build was given, if any, as refusal-N.
+func refusedWindow(t *testing.T) string {
+	t.Helper()
+	raw, err := json.Marshal(BuildReport{Summary: "The answer is corrected.", Test: []string{"go", "test", "./..."}, Title: "Correct the answer",
+		Body:     "Fix one cause with a discriminating test. Prior art needs a network search, which this run cannot perform.",
+		Rollback: "Revert the change.", Window: "fortnight", Lesson: "Test the answer at its boundary.", Signal: goodSignal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return `if [ -e /run/input/refusal.md ]; then cp /run/input/refusal.md "/opt/fixture/refusal-$n"; fi
+sed -i 's/return 41/return 42/' /work/fake.go
+cat > /work/answer_test.go <<'TEST'
+` + answerTest + `TEST
+` + fixtureResult(`{"type":"result","subtype":"success","structured_output":`+string(raw)+`}`)
+}
+
+// stepsRunner is a runner over a case in testing (testingCase) of a repository with files, whose n-th build runs
+// steps[n-1], and the last step after them. It returns the runner, the case and the directory where the builds count.
+func stepsRunner(t *testing.T, files map[string]string, steps ...string) (*Runner, store.Case, string) {
+	t.Helper()
+	if err := sandbox.Available(true); err != nil {
+		t.Skip(err)
+	}
+	st := testStore(t)
+	f := newRepo(t, files)
+	c := testingCase(t, st)
+	body := "n=$(cat /opt/fixture/builds 2>/dev/null || echo 0)\nn=$((n+1))\necho \"$n\" > /opt/fixture/builds\ncase \"$n\" in\n"
+	for i, step := range steps {
+		label := "*"
+		if i < len(steps)-1 {
+			label = string(rune('1' + i))
+		}
+		body += label + ")\n" + step + "\n;;\n"
+	}
 	dir := t.TempDir()
-	harness := script(t, dir, "harness", `n=$(cat /opt/fixture/builds 2>/dev/null || echo 0)
-echo "$((n+1))" > /opt/fixture/builds
-`+fixtureResult(`{"type":"result","subtype":"success","structured_output":`+string(raw)+`}`))
+	harness := script(t, dir, "harness", body+"esac")
 	r := runnerFor(t, st, []string{harness})
 	r.Ship = shipFor(t, st, f)
 	r.Ship.Dir = r.Dir
 	r.Ship.Live = false
 	r.Toolchains = Toolchains{ReadOnly: r.Ship.Sandbox.ReadOnly, Path: r.Ship.Sandbox.Path}
 	r.Inputs.ReadDirs = []string{f.main}
-	return r, c, filepath.Join(dir, "builds")
+	return r, c, dir
+}
+
+// outOfReachRunner is stepsRunner whose every build answers its fix needs where, in a repository with ciFiles.
+func outOfReachRunner(t *testing.T, where string) (*Runner, store.Case, string) {
+	t.Helper()
+	return stepsRunner(t, ciFiles, outOfReachAnswer(t, where))
 }
 
 // onePass runs a pass over the case's family and returns what it did.
@@ -56,9 +95,9 @@ func onePass(t *testing.T, r *Runner, c store.Case) Done {
 }
 
 // builds is how many builds the fixture's harness ran.
-func builds(t *testing.T, counter string) string {
+func builds(t *testing.T, dir string) string {
 	t.Helper()
-	b, err := os.ReadFile(counter)
+	b, err := os.ReadFile(filepath.Join(dir, "builds"))
 	if os.IsNotExist(err) {
 		return "0"
 	}
@@ -68,7 +107,22 @@ func builds(t *testing.T, counter string) string {
 	return strings.TrimSpace(string(b))
 }
 
-// heldFor checks that a pass's build answered and held its case for a person: the run ended as answered, with no
+// personNote is the case's note of its hold for a person on where.
+func personNote(t *testing.T, r *Runner, c store.Case, where string) (store.Note, bool) {
+	t.Helper()
+	notes, err := r.Store.Notes(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range notes {
+		if strings.HasPrefix(n.ID, "loop-build:"+store.IDPart(c.ID)+":person") && strings.Contains(n.Title, where) {
+			return n, true
+		}
+	}
+	return store.Note{}, false
+}
+
+// heldFor checks that a pass's build answered and held its case for a person: the run kept its own outcome, with no
 // failure, the case is still in testing with no stop, a standing raised note names the path and the fix, and no
 // component-health case is filed.
 func heldFor(t *testing.T, r *Runner, c store.Case, d Done, where string) {
@@ -78,13 +132,13 @@ func heldFor(t *testing.T, r *Runner, c store.Case, d Done, where string) {
 		t.Fatalf("the build did not run: %+v", d)
 	}
 	run, err := r.Store.LoopRunByID(ctx, d.Run.ID)
-	if err != nil || run.Status != store.RunOK || run.Failure != "" || run.Cause != "" {
-		t.Fatalf("an out-of-reach answer failed its build: %+v %v", run, err)
+	if err != nil || run.Status != "out-of-reach" || run.Failure != "" || run.Cause != "" {
+		t.Fatalf("an out-of-reach answer did not keep its own outcome: %+v %v", run, err)
 	}
-	n, ok, err := r.Store.Note(ctx, "loop-build:"+store.IDPart(c.ID)+":person")
-	if err != nil || !ok || !n.Done.IsZero() || n.Kind != store.NoteProblem || n.Importance != store.ImportanceNormal ||
-		!strings.Contains(n.Title, where) || !strings.Contains(n.Detail, where) || !strings.Contains(n.Detail, outOfReachFix) {
-		t.Fatalf("the hold's note: %+v %v %v", n, ok, err)
+	n, ok := personNote(t, r, c, where)
+	if !ok || !n.Done.IsZero() || n.Kind != store.NoteProblem || n.Importance != store.ImportanceNormal ||
+		!strings.Contains(n.Detail, where) || !strings.Contains(n.Detail, outOfReachFix) {
+		t.Fatalf("the hold's note: %+v %v", n, ok)
 	}
 	now, err := r.Store.CaseByID(ctx, c.ID)
 	if err != nil || now.Status != store.CaseTesting {
@@ -95,6 +149,17 @@ func heldFor(t *testing.T, r *Runner, c store.Case, d Done, where string) {
 	}
 	if cs, err := r.Store.Cases(ctx, store.CaseFilter{Family: store.HealthFamily, All: true}); err != nil || len(cs) != 0 {
 		t.Fatalf("an out-of-reach answer filed a component-health case: %+v %v", cs, err)
+	}
+}
+
+// stillHeld checks that a pass built nothing and named the case's hold for a person on where.
+func stillHeld(t *testing.T, r *Runner, c store.Case, dir, count, where string) {
+	t.Helper()
+	if d := onePass(t, r, c); d.Run.ID != "" || !strings.Contains(d.Skipped, c.ID+" held for a person: its fix needs "+where) || builds(t, dir) != count {
+		t.Fatalf("a pass built a held case: %+v, %s builds", d, builds(t, dir))
+	}
+	if n, ok := personNote(t, r, c, where); !ok || !n.Done.IsZero() {
+		t.Fatalf("the held case's note does not stand: %+v %v", n, ok)
 	}
 }
 
@@ -122,7 +187,7 @@ func TestAnOutOfReachFixHoldsTheCaseForAPerson(t *testing.T) {
 func TestACaseHeldForAPersonIsNotBuiltAgain(t *testing.T) {
 	ctx := context.Background()
 	where := ".github/workflows/ci.yml"
-	r, c, counter := outOfReachRunner(t, where)
+	r, c, dir := outOfReachRunner(t, where)
 	other := openCase(t, r.Store, c.Family, "out-of-reach-other", 1)
 	mech, next := "the workflow runs no test", "run the tests in the workflow"
 	other, err := r.Store.UpdateCase(ctx, other.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mech, NextTest: &next}, "test")
@@ -134,54 +199,117 @@ func TestACaseHeldForAPersonIsNotBuiltAgain(t *testing.T) {
 		t.Fatalf("the first pass did not build the case with the most evidence: %+v", d)
 	}
 	d := onePass(t, r, c)
-	if d.Case != other.ID || d.Run.ID == "" || builds(t, counter) != "2" {
-		t.Fatalf("the held case took the family's slot: %+v, %s builds", d, builds(t, counter))
+	if d.Case != other.ID || d.Run.ID == "" || builds(t, dir) != "2" {
+		t.Fatalf("the held case took the family's slot: %+v, %s builds", d, builds(t, dir))
 	}
 	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID})
 	if err != nil || len(runs) != 1 {
 		t.Fatalf("the held case was built again: %+v %v", runs, err)
 	}
-	if d := onePass(t, r, c); d.Run.ID != "" || !strings.Contains(d.Skipped, c.ID+" held for a person: its fix needs "+where) || builds(t, counter) != "2" {
-		t.Fatalf("a pass built a held case: %+v, %s builds", d, builds(t, counter))
+	if d := onePass(t, r, c); d.Run.ID != "" || !strings.Contains(d.Skipped, c.ID+" held for a person: its fix needs "+where) || builds(t, dir) != "2" {
+		t.Fatalf("a pass built a held case: %+v, %s builds", d, builds(t, dir))
 	}
 }
 
-// A case held for a person builds again once it holds new evidence: the hold ends, and its note with it. A build that
-// answers the same again holds it again, and two such answers stop nothing.
-func TestAHeldCaseBuildsAgainOnNewEvidence(t *testing.T) {
+// New evidence does not end a hold for a person: the problem recurring is no fix, and a case that built again on it
+// would pay a build each time.
+func TestNewEvidenceKeepsAHold(t *testing.T) {
 	ctx := context.Background()
 	where := ".github/workflows/ci.yml"
-	r, c, counter := outOfReachRunner(t, where)
+	r, c, dir := outOfReachRunner(t, where)
 	heldFor(t, r, c, onePass(t, r, c), where)
-	if d := onePass(t, r, c); d.Run.ID != "" || builds(t, counter) != "1" {
-		t.Fatalf("a pass built a held case: %+v", d)
+	for i := 0; i < 2; i++ {
+		if _, _, err := r.Store.AddCaseEvidence(ctx, c.ID, []store.Evidence{{Ref: "file:/t/out-of-reach-again-" + string(rune('a'+i)), At: time.Now()}}, "test"); err != nil {
+			t.Fatal(err)
+		}
+		stillHeld(t, r, c, dir, "1", where)
 	}
-	if _, _, err := r.Store.AddCaseEvidence(ctx, c.ID, []store.Evidence{{Ref: "file:/t/out-of-reach-again", At: time.Now()}}, "test"); err != nil {
-		t.Fatal(err)
-	}
+}
+
+// A hold for a person between two refusals for one cause keeps their count: the stop rule reads past it, so the
+// second refusal stops the case, and the build after the hold is given the refusal before it.
+func TestAHoldBetweenTwoRefusalsKeepsTheirCount(t *testing.T) {
+	ctx := context.Background()
+	where := ".github/workflows/ci.yml"
+	r, c, dir := stepsRunner(t, ciFiles, refusedWindow(t), outOfReachAnswer(t, where), refusedWindow(t))
 	d := onePass(t, r, c)
-	if builds(t, counter) != "2" {
-		t.Fatalf("new evidence did not build the held case again: %+v", d)
+	if run, err := r.Store.LoopRunByID(ctx, d.Run.ID); err != nil || run.Failure != "build propose" || !strings.Contains(run.Summary, `"fortnight"`) {
+		t.Fatalf("the first build was not refused for its window: %+v %v", run, err)
 	}
-	heldFor(t, r, c, d, where)
-	log, err := r.Store.CaseLog(ctx, c.ID)
-	if err != nil {
+	heldFor(t, r, c, onePass(t, r, c), where)
+	// a person sends the case on (it ends the hold), and the problem recurs
+	next := "assert Answer() == 42 at its boundary"
+	if _, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{NextTest: &next}, "test"); err != nil {
 		t.Fatal(err)
 	}
-	ended := false
-	for _, e := range log {
-		ended = ended || e.Action == "person hold ended" && e.Detail == "new evidence came in"
+	if _, _, err := r.Store.AddCaseEvidence(ctx, c.ID, []store.Evidence{{Ref: "file:/t/out-of-reach-recurs", At: time.Now()}}, "test"); err != nil {
+		t.Fatal(err)
 	}
-	if !ended {
-		t.Fatalf("the case's log keeps no end of its hold: %+v", log)
+	d = onePass(t, r, c)
+	if run, err := r.Store.LoopRunByID(ctx, d.Run.ID); err != nil || run.Failure != "build propose" || builds(t, dir) != "3" {
+		t.Fatalf("the third build was not refused for its window: %+v %v", run, err)
 	}
+	given, err := os.ReadFile(filepath.Join(dir, "refusal-3"))
+	if err != nil || !strings.Contains(string(given), `invalid measurement window "fortnight"`) {
+		t.Fatalf("the build after the hold was not given the refusal before it: %q %v", given, err)
+	}
+	if d := onePass(t, r, c); d.Run.ID != "" || !strings.Contains(d.Skipped, "stopped: two of its build runs were refused for one cause") || builds(t, dir) != "3" {
+		t.Fatalf("two refusals for one cause around a hold did not stop the case: %+v", d)
+	}
+}
+
+// A person's change of the case's fix ends its hold: its note is resolved before the case builds again, and a build
+// that names another path holds it on that one. A change of the case's status, even one undone before the next pass,
+// ends it too; a change of its title alone does not.
+func TestAPersonsChangeEndsAHold(t *testing.T) {
+	ctx := context.Background()
+	where, other := ".github/workflows/ci.yml", ".github/workflows/release.yml"
+	t.Run("fix", func(t *testing.T) {
+		r, c, dir := stepsRunner(t, ciFiles, outOfReachAnswer(t, where), outOfReachAnswer(t, other))
+		heldFor(t, r, c, onePass(t, r, c), where)
+		next := "assert Answer() == 42 at its boundary"
+		if _, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{NextTest: &next}, "test"); err != nil {
+			t.Fatal(err)
+		}
+		heldFor(t, r, c, onePass(t, r, c), other)
+		if builds(t, dir) != "2" {
+			t.Fatalf("the changed case did not build again: %s builds", builds(t, dir))
+		}
+		if n, ok := personNote(t, r, c, where); !ok || n.Done.IsZero() {
+			t.Fatalf("the ended hold's note stands: %+v %v", n, ok)
+		}
+		stillHeld(t, r, c, dir, "2", other)
+	})
+	t.Run("status", func(t *testing.T) {
+		r, c, dir := outOfReachRunner(t, where)
+		heldFor(t, r, c, onePass(t, r, c), where)
+		mech, next := "Answer is off by one", "assert Answer() == 42"
+		for _, status := range []store.CaseStatus{store.CaseInvestigating, store.CaseTesting} {
+			if _, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: status, Mechanism: &mech, NextTest: &next}, "test"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		heldFor(t, r, c, onePass(t, r, c), where)
+		if builds(t, dir) != "2" {
+			t.Fatalf("the case sent back and returned did not build again: %s builds", builds(t, dir))
+		}
+	})
+	t.Run("title", func(t *testing.T) {
+		r, c, dir := outOfReachRunner(t, where)
+		heldFor(t, r, c, onePass(t, r, c), where)
+		title := "the thing breaks in CI"
+		if _, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Title: &title}, "test"); err != nil {
+			t.Fatal(err)
+		}
+		stillHeld(t, r, c, dir, "1", where)
+	})
 }
 
 // An out-of-reach answer whose path a change may touch is the build's own refusal, as a build that changes nothing was
 // before: no hold, and two for that cause stop the case.
 func TestAnOutOfReachPathInReachIsTheBuildsRefusal(t *testing.T) {
 	ctx := context.Background()
-	r, c, counter := outOfReachRunner(t, "fake.go")
+	r, c, dir := outOfReachRunner(t, "fake.go")
 	for i := 1; i <= 2; i++ {
 		d := onePass(t, r, c)
 		run, err := r.Store.LoopRunByID(ctx, d.Run.ID)
@@ -190,16 +318,125 @@ func TestAnOutOfReachPathInReachIsTheBuildsRefusal(t *testing.T) {
 			t.Fatalf("build %d of an in-reach path was not refused for it: %+v %v", i, run, err)
 		}
 	}
-	if _, ok, err := r.Store.Note(ctx, "loop-build:"+store.IDPart(c.ID)+":person"); err != nil || ok {
-		t.Fatalf("an in-reach path held its case: %v %v", ok, err)
+	if _, ok := personNote(t, r, c, "fake.go"); ok {
+		t.Fatal("an in-reach path held its case")
 	}
-	if d := onePass(t, r, c); d.Run.ID != "" || !strings.Contains(d.Skipped, "stopped: two of its build runs were refused for one cause") || builds(t, counter) != "2" {
+	if d := onePass(t, r, c); d.Run.ID != "" || !strings.Contains(d.Skipped, "stopped: two of its build runs were refused for one cause") || builds(t, dir) != "2" {
 		t.Fatalf("two refusals of an in-reach path did not stop the case: %+v", d)
 	}
 }
 
-// A person ends a hold: closing the case resolves its note, and the case, reopened, builds again; a case sent back to
-// its investigation and returned to testing in the same episode builds again too.
+// A path BASE does not hold, in a directory it does not hold, is the build's refusal, though no change may touch it
+// either: a made-up path gets no hold. A new file in a directory BASE holds is a path the fix may need.
+func TestAMadeUpPathIsTheBuildsRefusal(t *testing.T) {
+	ctx := context.Background()
+	t.Run("made up", func(t *testing.T) {
+		where := ".github/made-up/x.yml"
+		r, c, _ := outOfReachRunner(t, where)
+		d := onePass(t, r, c)
+		run, err := r.Store.LoopRunByID(ctx, d.Run.ID)
+		if err != nil || run.Failure != "build report" || run.Cause == hostCause ||
+			!strings.Contains(run.Summary, "build report: refused: the out-of-reach path "+where+" is no path of the repository at BASE") {
+			t.Fatalf("a made-up path was not refused: %+v %v", run, err)
+		}
+		if _, ok := personNote(t, r, c, where); ok {
+			t.Fatal("a made-up path held its case")
+		}
+	})
+	t.Run("new file", func(t *testing.T) {
+		where := ".github/workflows/test.yml"
+		r, c, _ := outOfReachRunner(t, where)
+		heldFor(t, r, c, onePass(t, r, c), where)
+	})
+}
+
+// A path PathScope allows but no change can touch, since the patch check refuses it, is out of reach too: one in Git's
+// own directory, a submodule or a symlink of BASE, and a path through either.
+func TestPathsThePatchCheckRefusesAreOutOfReach(t *testing.T) {
+	for _, where := range []string{".git/config", "vendor/lib", "vendor/lib/x.go", "link", "link/x"} {
+		t.Run(where, func(t *testing.T) {
+			r, c, _ := outOfReachRunner(t, where)
+			main := r.Inputs.ReadDirs[0]
+			// a submodule and a symlink in BASE: the submodule's directory is in the checkout, uninitialized
+			if err := os.MkdirAll(filepath.Join(main, "vendor", "lib"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			run(t, main, "git", "update-index", "--add", "--cacheinfo", "160000,0123456789abcdef0123456789abcdef01234567,vendor/lib")
+			if err := os.Symlink("fake.go", filepath.Join(main, "link")); err != nil {
+				t.Fatal(err)
+			}
+			run(t, main, "git", "add", "link")
+			run(t, main, "git", "commit", "-q", "-m", "a submodule and a symlink")
+			run(t, main, "git", "push", "-q", "origin", "HEAD:main")
+			heldFor(t, r, c, onePass(t, r, c), where)
+		})
+	}
+}
+
+// A standing hold whose note was never put (its line went in and its note failed) gets its note at the next pick,
+// and the case still takes no slot.
+func TestAHoldWithNoNoteGetsItsNote(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	f := newRepo(t, ciFiles)
+	r.Ship = shipWithSandbox(st, f, Sandbox{})
+	r.Ship.Dir = r.Dir
+	r.Inputs.ReadDirs = []string{f.main}
+	c := openCase(t, st, "failures", "out-of-reach-unnoted", 1)
+	mech, next := "the workflow runs no test", "run the tests in the workflow"
+	c, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mech, NextTest: &next}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setCaseRepo(t, st, c, "main")
+	where := ".github/workflows/ci.yml"
+	raw, err := json.Marshal(map[string]any{"path": where, "fix": outOfReachFix, "reason": where + " is CI configuration", "episode": c.Episode, "evidence": c.Evidence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CaseNote(ctx, c.ID, "held for a person", string(raw), "loop"); err != nil {
+		t.Fatal(err)
+	}
+	cands, why, err := r.candidates(ctx, c.Family, "", false)
+	if err != nil || len(cands) != 0 || !strings.Contains(why, c.ID+" held for a person: its fix needs "+where) {
+		t.Fatalf("the held case is a candidate: %+v %q %v", cands, why, err)
+	}
+	if n, ok := personNote(t, r, c, where); !ok || !n.Done.IsZero() || !strings.Contains(n.Detail, outOfReachFix) {
+		t.Fatalf("the hold's missing note was not put: %+v %v", n, ok)
+	}
+}
+
+// An out-of-reach answer names a path of the repository and a fix: one with no fix, or a path that leaves the
+// repository or is not clean, is the build's refusal at its report.
+func TestAnOutOfReachAnswerNamesAPathAndAFix(t *testing.T) {
+	report := func(where, fix string) []byte {
+		raw, err := json.Marshal(map[string]any{"summary": "out of reach", "test_command": []string{}, "title": "", "body": "", "rollback": "",
+			"window": "", "lesson": "", "signal": map[string]any{"source": "", "kinds": []string{}, "match": []string{}},
+			"out_of_reach": map[string]string{"path": where, "fix": fix}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	for _, fix := range []string{"", "  \t "} {
+		if _, err := buildReport(report(".github/workflows/ci.yml", fix)); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "has no fix") {
+			t.Fatalf("an answer with the fix %q: %v", fix, err)
+		}
+	}
+	for _, where := range []string{"", "../x", "a/../../x", "/etc/passwd", "./ci.yml", "a//b", `a\b`, "a\nb"} {
+		if _, err := buildReport(report(where, outOfReachFix)); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "is no path of the repository") {
+			t.Fatalf("an answer with the path %q: %v", where, err)
+		}
+	}
+	got, err := buildReport(report(".github/workflows/", outOfReachFix))
+	if err != nil || got.OutOfReach == nil || got.OutOfReach.Path != ".github/workflows" {
+		t.Fatalf("a directory's path: %+v %v", got.OutOfReach, err)
+	}
+}
+
+// A person ends a hold by leaving testing: closing the case resolves its note, and the case, reopened, builds again;
+// a case sent back to its investigation has its hold ended as the pass begins, and builds again back in testing.
 func TestAPersonEndsAHold(t *testing.T) {
 	where := ".github/workflows/ci.yml"
 	backToTesting := func(t *testing.T, r *Runner, c store.Case) store.Case {
@@ -213,14 +450,14 @@ func TestAPersonEndsAHold(t *testing.T) {
 	}
 	t.Run("closed", func(t *testing.T) {
 		ctx := context.Background()
-		r, c, counter := outOfReachRunner(t, where)
+		r, c, dir := outOfReachRunner(t, where)
 		heldFor(t, r, c, onePass(t, r, c), where)
 		if _, err := r.Store.CloseCase(ctx, c.ID, store.Solved, "", "the workflow runs its tests now", "test"); err != nil {
 			t.Fatal(err)
 		}
 		onePass(t, r, c)
-		if n, ok, err := r.Store.Note(ctx, "loop-build:"+store.IDPart(c.ID)+":person"); err != nil || !ok || n.Done.IsZero() {
-			t.Fatalf("the close did not resolve the hold's note: %+v %v %v", n, ok, err)
+		if n, ok := personNote(t, r, c, where); !ok || n.Done.IsZero() {
+			t.Fatalf("the close did not resolve the hold's note: %+v %v", n, ok)
 		}
 		c, err := r.Store.ReopenCase(ctx, c.ID, []store.Evidence{{Ref: "file:/t/out-of-reach-back", At: time.Now()}}, "it came back", "test")
 		if err != nil {
@@ -229,16 +466,15 @@ func TestAPersonEndsAHold(t *testing.T) {
 		c = backToTesting(t, r, c)
 		setCaseRepo(t, r.Store, c, "main")
 		heldFor(t, r, c, onePass(t, r, c), where)
-		if builds(t, counter) != "2" {
-			t.Fatalf("the reopened case did not build: %s builds", builds(t, counter))
+		if builds(t, dir) != "2" {
+			t.Fatalf("the reopened case did not build: %s builds", builds(t, dir))
 		}
 	})
 	t.Run("investigating", func(t *testing.T) {
 		ctx := context.Background()
-		r, c, counter := outOfReachRunner(t, where)
+		r, c, dir := outOfReachRunner(t, where)
 		heldFor(t, r, c, onePass(t, r, c), where)
-		investigating := store.CaseInvestigating
-		c, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: investigating}, "test")
+		c, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "test")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -246,13 +482,17 @@ func TestAPersonEndsAHold(t *testing.T) {
 		if err := r.releaseHolds(ctx, []store.Case{c}); err != nil {
 			t.Fatal(err)
 		}
-		if n, ok, err := r.Store.Note(ctx, "loop-build:"+store.IDPart(c.ID)+":person"); err != nil || !ok || n.Done.IsZero() {
-			t.Fatalf("leaving testing did not resolve the hold's note: %+v %v %v", n, ok, err)
+		if n, ok := personNote(t, r, c, where); !ok || n.Done.IsZero() {
+			t.Fatalf("leaving testing did not resolve the hold's note: %+v %v", n, ok)
+		}
+		log, err := r.Store.CaseLog(ctx, c.ID)
+		if err != nil || log[len(log)-1].Action != "person hold ended" || log[len(log)-1].Detail != "the case left testing" {
+			t.Fatalf("leaving testing did not end the hold: %+v %v", log, err)
 		}
 		c = backToTesting(t, r, c)
 		heldFor(t, r, c, onePass(t, r, c), where)
-		if builds(t, counter) != "2" {
-			t.Fatalf("the case back in testing did not build: %s builds", builds(t, counter))
+		if builds(t, dir) != "2" {
+			t.Fatalf("the case back in testing did not build: %s builds", builds(t, dir))
 		}
 	})
 }

@@ -1,6 +1,9 @@
 package store
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // The loop keeps a case's policy hold in the case's log: a "build held" line with its reason and the case's
 // episode when the configuration holds the case's next step (builds off, an owner it may not write to, no
@@ -40,6 +43,89 @@ func HoldOf(c Case, log []CaseEntry) string {
 		}
 	}
 	return ""
+}
+
+// A build whose fix needs a path no change of the loop's may touch holds its case for a person: a "held for a person"
+// line with the path, the fix, why no change may touch the path and the case's episode, and a "person hold ended" line
+// when the hold ends. A case in testing is held for a person while its newest such line is a hold of its current
+// episode and no later "set" line changed its status, mechanism or fix: new evidence alone does not end it.
+const (
+	ActionPersonHeld  = "held for a person"
+	ActionPersonEnded = "person hold ended"
+)
+
+// PersonHold is a hold for a person: the path the case's fix needs, the change a person makes there, why no change
+// of the loop's may touch the path, and the episode of the build that answered.
+type PersonHold struct {
+	Path    string `json:"path"`
+	Fix     string `json:"fix"`
+	Reason  string `json:"reason"`
+	Episode int64  `json:"episode"`
+}
+
+// Why is the hold's reason as a case's held mark shows it.
+func (h PersonHold) Why() string { return "for a person: its fix needs " + h.Path }
+
+// PersonDetail is the detail of a "held for a person" line.
+func PersonDetail(h PersonHold) string {
+	var b strings.Builder
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(h)
+	return strings.TrimSpace(b.String())
+}
+
+// LastPersonHold is a case's newest hold for a person whose end its log does not hold yet, whatever the case's
+// status or episode now: one that no longer stands (PersonHoldOf) is still to be ended.
+func LastPersonHold(log []CaseEntry) (PersonHold, bool) {
+	for i := len(log) - 1; i >= 0; i-- {
+		switch log[i].Action {
+		case ActionPersonEnded:
+			return PersonHold{}, false
+		case ActionPersonHeld:
+			var h PersonHold
+			if json.Unmarshal([]byte(log[i].Detail), &h) != nil || h.Path == "" {
+				return PersonHold{}, false
+			}
+			return h, true
+		}
+	}
+	return PersonHold{}, false
+}
+
+// PersonHoldOf is the hold for a person a case in testing stands on, from its log: its newest such hold of its
+// current episode, with no end and no later "set" line that changed the case's status, mechanism or fix.
+func PersonHoldOf(c Case, log []CaseEntry) (PersonHold, bool) {
+	if c.Status != CaseTesting {
+		return PersonHold{}, false
+	}
+	for i := len(log) - 1; i >= 0; i-- {
+		switch log[i].Action {
+		case ActionPersonEnded:
+			return PersonHold{}, false
+		case "set":
+			if personChange(log[i].Detail) {
+				return PersonHold{}, false
+			}
+		case ActionPersonHeld:
+			h, ok := LastPersonHold(log[:i+1])
+			if !ok || h.Episode != c.Episode {
+				return PersonHold{}, false
+			}
+			return h, true
+		}
+	}
+	return PersonHold{}, false
+}
+
+// personChange says a "set" line's detail (updateCase) changed the case's status, mechanism or fix.
+func personChange(detail string) bool {
+	for _, part := range strings.Split(detail, "; ") {
+		if strings.HasPrefix(part, "status ") || strings.HasPrefix(part, "mechanism: ") || strings.HasPrefix(part, "fix: ") {
+			return true
+		}
+	}
+	return false
 }
 
 // A proposal for a hand landing is kept in the case's log too: a "proposed for a hand landing" line with its pull
