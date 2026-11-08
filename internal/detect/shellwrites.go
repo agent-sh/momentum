@@ -26,9 +26,18 @@ func writtenPaths(harness, tool, call, result, cwd string) []string {
 	if strings.EqualFold(tool, "apply_patch") || strings.EqualFold(tool, "patch") && harness == "opencode" {
 		var out []string
 		for _, m := range patchFileRe.FindAllStringSubmatch(call, -1) {
-			out = append(out, m[1])
+			if m[1] == "Update" && m[3] != "" { // a file moved: written under its new name
+				out = append(out, m[3])
+			} else {
+				out = append(out, m[2])
+			}
 		}
 		return out
+	}
+	if strings.EqualFold(tool, "patch") { // Hermes's: OpenCode's is read above
+		if mode, _, _ := callField(call, modeKeys); mode == "patch" { // its files are only in its patch text
+			return nil
+		}
 	}
 	if p, _, _ := callField(call, pathKeys); p != "" {
 		return []string{p}
@@ -70,15 +79,29 @@ func shellDir(harness, call, cwd string) string {
 }
 
 var (
-	// backgroundKeys are the fields of a shell call that launch its command in the background (Claude Code's,
-	// Hermes's).
-	backgroundKeys = map[string]bool{"run_in_background": true, "background": true}
-	// backgroundRe is a result that says its command went on in the background, whose success says nothing of it:
-	// Claude Code's running, moved there after a timeout or backgrounded by hand; Hermes's started, yielded or
-	// tracked; Kimi's task still running there; Grok's moved there, still running.
-	backgroundRe = regexp.MustCompile(`(?i)running in (?:the )?background|moved to (?:the )?background|manually backgrounded|` +
-		`background process started|yielded_to_background|tracked background process|runs in the background|` +
-		`\bstatus: running\b|process is still running`)
+	// backgroundKeys are each harness's shell call fields that launch its command in the background, as its source
+	// names them: Claude Code's and Kimi's run_in_background, Hermes's and OpenCode's background, Grok's
+	// is_background. Codex has none (its command goes on when the call yields, and its result has no exit code),
+	// nor has pi's bash.
+	backgroundKeys = map[string]map[string]bool{
+		"claude":   {"run_in_background": true},
+		"kimi":     {"run_in_background": true},
+		"hermes":   {"background": true},
+		"opencode": {"background": true},
+		"grok":     {"is_background": true},
+	}
+	// backgroundWords are each harness's words for a launch it did not wait for, as its source writes them, whose
+	// success says nothing of the command.
+	backgroundWords = map[string]*regexp.Regexp{
+		"claude": regexp.MustCompile(`Command running in background with ID: |was moved to the background \(ID: |` +
+			`manually backgrounded by user with ID: `),
+		"hermes":   regexp.MustCompile(`Background process started|"status": ?"yielded_to_background"|tracked background process`),
+		"kimi":     regexp.MustCompile(`^task_id: |automatic_notification: true`),
+		"grok":     regexp.MustCompile(`Background command started successfully\.|automatically moved to background|Process is still running`),
+		"opencode": regexp.MustCompile(`Command moved to the background \(shell ID: `),
+	}
+	// blockKeys are Grok's field for how long its shell waits: 0 starts the command in the background.
+	blockKeys = map[string]bool{"block_until_ms": true}
 	// exitRe is the exit code a Codex result reports once its command has ended; one still running reports none.
 	exitRe = regexp.MustCompile(`(?i)(?:process|command) exited with code -?\d+|exit code:? -?\d+`)
 	// openErrRe is an error opening a file for writing.
@@ -97,8 +120,7 @@ func shellWrite(harness, call, result, dir string) string {
 	if loc == nil {
 		return ""
 	}
-	if v, _, _ := callValue(call, backgroundKeys); string(v) == "true" || backgroundRe.MatchString(result) ||
-		harness == "codex" && !exitRe.MatchString(result) {
+	if background(harness, call, result) {
 		return ""
 	}
 	closed := loc[3] < len(call) && call[loc[3]] == '"' // the command's text is whole, whatever the cut took after it
@@ -127,6 +149,24 @@ func shellWrite(harness, call, result, dir string) string {
 		}
 	}
 	return file
+}
+
+// background says a shell call launched its command in the background, by its harness's own signals (backgroundKeys,
+// backgroundWords, Grok's block_until_ms of 0, a Codex result with no exit code): its result says nothing of the
+// command's end.
+func background(harness, call, result string) bool {
+	if keys := backgroundKeys[harness]; keys != nil {
+		if v, _, _ := callValue(call, keys); string(v) == "true" {
+			return true
+		}
+	}
+	if re := backgroundWords[harness]; re != nil && re.MatchString(result) {
+		return true
+	}
+	if v, _, _ := callValue(call, blockKeys); harness == "grok" && string(v) == "0" {
+		return true
+	}
+	return harness == "codex" && !exitRe.MatchString(result)
 }
 
 // dotdot says a path climbs out of a directory: through a symbolic link, .. is not where its text says.

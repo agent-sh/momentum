@@ -175,19 +175,37 @@ var (
 	patchApplied = regexp.MustCompile(`^Success\. Updated the following files:`)
 	// grokWrote is Grok's write and search_replace: the edits it applied, by the file's whole path.
 	grokWrote = regexp.MustCompile(`^\{"EditsApplied":\{"absolute_path":`)
-	// hermesErrorRe is a Hermes result's error that holds something: Hermes itself counts no write with one, though its
-	// result may still open with bytes_written.
-	hermesErrorRe = regexp.MustCompile(`"error": ?(?:"[^"]|\{ *"|\[ *[^\] ]|true|[1-9])`)
-	// patchFileRe is a file a patch adds or updates, as the store keeps its call: up to a space, an escape or a quote.
-	patchFileRe = regexp.MustCompile(`\*\*\* (?:Add|Update) File: ([^\s\\"]+)`)
+	// hermesErrorKeyRe is a Hermes result's error field, its value after it; hermesNoChangeRe a patch that wrote
+	// nothing.
+	hermesErrorKeyRe = regexp.MustCompile(`"error": ?`)
+	hermesNoChangeRe = regexp.MustCompile(`"no_change": ?true`)
+	// patchFileRe is a patch's header for a file it adds or updates, at a line's start (the text's start, a line break,
+	// an escaped one inside JSON, or right after the patch's opening line in a text the store folded onto one line),
+	// with the new name an Update's Move to gives: each path up to a space, an escape or a quote. A Delete File
+	// header writes nothing.
+	patchFileRe = regexp.MustCompile(`(?:^|\n|\\n|\*\*\* Begin Patch )\*\*\* (Add|Update) File: ([^\s\\"]+)` +
+		`(?:(?:\\n|\n| )\*\*\* Move to: ([^\s\\"]+))?`)
 )
 
 // fileWrote says a file tool's result is its harness's own word for a write that landed (fileWrites), and, for
-// Hermes, holds no error.
+// Hermes, as Hermes reads it: no error that is anything but null, false or empty, and no patch that changed nothing.
 func fileWrote(harness, tool, result string) bool {
 	re := fileWrites[harness+"/"+strings.ToLower(tool)]
-	return re != nil && re.MatchString(result) && !(harness == "hermes" && hermesErrorRe.MatchString(result))
+	return re != nil && re.MatchString(result) && !(harness == "hermes" && (hermesError(result) || hermesNoChangeRe.MatchString(result)))
 }
+
+// hermesError says a Hermes result's error field holds anything but null, false or an empty string.
+func hermesError(result string) bool {
+	for _, m := range hermesErrorKeyRe.FindAllStringIndex(result, -1) {
+		if v := result[m[1]:]; !strings.HasPrefix(v, "null") && !strings.HasPrefix(v, "false") && !strings.HasPrefix(v, `""`) {
+			return true
+		}
+	}
+	return false
+}
+
+// modeKeys are Hermes's patch field that says how it patches.
+var modeKeys = map[string]bool{"mode": true}
 
 // notFoundRe is a read tool's error that no file is at its path: Claude Code's "File does not exist", Kimi's "PATH
 // does not exist", a file not found (OpenCode's, Hermes's), the system's ENOENT. Access refused is none of them.
