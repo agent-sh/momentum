@@ -86,6 +86,31 @@ func promptActors(t *testing.T, st *store.Store) map[string]string {
 	return out
 }
 
+// kimiOldRule makes every saved cursor of src look as a build before the Kimi rule saved it: no Rule in its state.
+// It returns the cursors.
+func kimiOldRule(t *testing.T, st *store.Store, src Transcripts) map[string]store.FileCursor {
+	t.Helper()
+	ctx := context.Background()
+	cursors, err := st.FileCursors(ctx, src.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var old []store.FileWrite
+	for _, cur := range cursors {
+		var state map[string]any
+		if err := json.Unmarshal(cur.State, &state); err != nil {
+			t.Fatal(err)
+		}
+		delete(state, "Rule")
+		cur.State, _ = json.Marshal(state)
+		old = append(old, store.FileWrite{Cursor: cur})
+	}
+	if _, _, err := st.PutFiles(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	return cursors
+}
+
 // `kimi -p` gives its prompt a user origin, as a person's typing has, and records no lastPrompt in the session's
 // metadata. The prompt that started such a run is a program's; a session whose metadata cannot be read credits it
 // to no one.
@@ -151,23 +176,8 @@ func TestKimiCursorFromBeforeTheRuleReadsAgain(t *testing.T) {
 	st := openStore(t)
 	src := transcripts(home)
 	ingest(t, src, st)
-	ctx := context.Background()
-	cursors, err := st.FileCursors(ctx, src.Name())
-	if err != nil || len(cursors) != 2 {
-		t.Fatalf("cursors %d, %v", len(cursors), err)
-	}
-	var old []store.FileWrite
-	for _, cur := range cursors {
-		var state map[string]any
-		if err := json.Unmarshal(cur.State, &state); err != nil {
-			t.Fatal(err)
-		}
-		delete(state, "Rule")
-		cur.State, _ = json.Marshal(state)
-		old = append(old, store.FileWrite{Cursor: cur})
-	}
-	if _, _, err := st.PutFiles(ctx, old); err != nil {
-		t.Fatal(err)
+	if cursors := kimiOldRule(t, st, src); len(cursors) != 2 {
+		t.Fatalf("cursors %d, want 2", len(cursors))
 	}
 	kimiState(t, run, `{"version":2}`)
 	// The files read again are counted, as a file read again for any other reason is.
@@ -401,26 +411,14 @@ func TestKimiCursorThatReadNothingIsNotCounted(t *testing.T) {
 	st := openStore(t)
 	src := transcripts(home)
 	ingest(t, src, st)
-	ctx := context.Background()
-	cursors, err := st.FileCursors(ctx, src.Name())
-	if err != nil || len(cursors) != 1 {
-		t.Fatalf("cursors %d, %v", len(cursors), err)
+	cursors := kimiOldRule(t, st, src)
+	if len(cursors) != 1 {
+		t.Fatalf("cursors %d, want 1", len(cursors))
 	}
-	var old []store.FileWrite
 	for _, cur := range cursors {
 		if cur.Offset != 0 {
 			t.Fatalf("a partial first line moved the cursor to %d", cur.Offset)
 		}
-		var state map[string]any
-		if err := json.Unmarshal(cur.State, &state); err != nil {
-			t.Fatal(err)
-		}
-		delete(state, "Rule")
-		cur.State, _ = json.Marshal(state)
-		old = append(old, store.FileWrite{Cursor: cur})
-	}
-	if _, _, err := st.PutFiles(ctx, old); err != nil {
-		t.Fatal(err)
 	}
 	if err := os.WriteFile(path, append(raw, '\n'), 0600); err != nil {
 		t.Fatal(err)
@@ -428,6 +426,77 @@ func TestKimiCursorThatReadNothingIsNotCounted(t *testing.T) {
 	r := ingest(t, src, st)
 	if r.New != 1 || len(r.Notes) != 0 {
 		t.Fatalf("a first read of the completed line: %+v", r)
+	}
+}
+
+// A file that cannot be opened is not read, so it is not counted as read again, though its cursor is from before
+// the rule.
+func TestKimiFileThatCannotOpenIsNotCountedAsReadAgain(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root opens a file of any mode")
+	}
+	home := t.TempDir()
+	path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed", "agents", "main", "wire.jsonl")
+	writeJSONLines(t, path, kimiPrompt("marker-7f3a typed"), kimiRecord("turn.ended", map[string]any{}))
+	kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a typed"}`)
+	st := openStore(t)
+	src := transcripts(home)
+	ingest(t, src, st)
+	kimiOldRule(t, st, src)
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(path, 0600) })
+	r, err := src.Ingest(context.Background(), st)
+	if err == nil {
+		t.Fatal("a wire that cannot be opened did not fail the ingest")
+	}
+	for _, n := range r.Notes {
+		if strings.Contains(n, "read again from the start") {
+			t.Fatalf("a wire that was not read counted as read again: %q", r.Notes)
+		}
+	}
+}
+
+// An unchanged compressed wire is not read again: its final cursor keeps no state, so the rule's check leaves it
+// alone.
+func TestKimiCompressedWireIsNotReadAgain(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "run", "agents", "main", "wire.jsonl")
+	writeJSONLines(t, path, kimiPrompt("marker-7f3a launcher"), kimiRecord("turn.ended", map[string]any{}))
+	kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a launcher"}`)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".zst", enc.EncodeAll(raw, nil), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	st := openStore(t)
+	src := transcripts(home)
+	ingest(t, src, st)
+	if r := ingest(t, src, st); r.Read != 0 || len(r.Notes) != 0 {
+		t.Fatalf("an unchanged compressed wire read again: %+v", r)
+	}
+}
+
+// A state.json that holds JSON null is no metadata: the session's provenance is unknown.
+func TestKimiNullStateIsUnknown(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "run", "agents", "main", "wire.jsonl")
+	writeJSONLines(t, path, kimiPrompt("marker-7f3a launcher"), kimiRecord("turn.ended", map[string]any{}))
+	kimiState(t, path, `null`)
+	st := openStore(t)
+	ingest(t, transcripts(home), st)
+	if got := promptActors(t, st); len(got) != 1 || got["marker-7f3a launcher"] != "unknown harness_text" {
+		t.Fatalf("a prompt of a session whose state.json is null stored as %v", got)
 	}
 }
 

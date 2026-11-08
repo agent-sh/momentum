@@ -195,12 +195,6 @@ func (s Transcripts) readNativeJob(ctx context.Context, j *job, t *tally, add fu
 			offset = j.cur.Offset
 		}
 	}
-	if offset == 0 && (j.native.stale || j.ok && j.cur.Offset > 0) {
-		// A file replaced, cut or read under an older rule is read from its start: counted, as tacit's are.
-		t.Lock()
-		t.restarts++
-		t.Unlock()
-	}
 	if harness == "grok" {
 		// Session kind is provenance. Headless prompts are generated input.
 		// Current metadata wins over the saved cursor. Missing provenance
@@ -234,6 +228,13 @@ func (s Transcripts) readNativeJob(ctx context.Context, j *job, t *tally, add fu
 		return
 	}
 	defer reader.Close()
+	if offset == 0 && (j.native.stale || j.ok && j.cur.Offset > 0) {
+		// A file replaced, cut or read under an older rule is read from its start: counted, as tacit's are, once
+		// it is open, so a file that cannot be opened is not counted as read again.
+		t.Lock()
+		t.restarts++
+		t.Unlock()
+	}
 	rd := bufio.NewReaderSize(reader, 64<<10)
 	p := part{j: j}
 	start := offset
