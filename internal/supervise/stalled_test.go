@@ -1,6 +1,7 @@
 package supervise
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -53,11 +54,14 @@ func TestStalledInterruptsATurnWaitingOnARequestWithNoReply(t *testing.T) {
 	}
 }
 
-// transcript writes a synthetic Claude Code transcript, a line per call, each a second after the one before.
+// transcript writes a synthetic Claude Code transcript, a line per call, each a second after the one before. Raw
+// writes markup as Claude Code does, unescaped, for a reader that looks at a line's bytes (the live tracker's
+// notification check); json.Marshal escapes "<" and ">".
 type transcript struct {
 	t    *testing.T
 	path string
 	at   time.Time
+	raw  bool
 }
 
 func (x *transcript) add(line map[string]any) *transcript {
@@ -70,6 +74,13 @@ func (x *transcript) add(line map[string]any) *transcript {
 		line["version"] = "2.1.316" // a Claude Code that records scheduled runs
 	}
 	b, err := json.Marshal(line)
+	if x.raw {
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
+		enc.SetEscapeHTML(false)
+		err = enc.Encode(line)
+		b = bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
+	}
 	if err != nil {
 		x.t.Fatal(err)
 	}

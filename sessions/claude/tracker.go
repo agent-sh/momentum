@@ -270,16 +270,23 @@ func (t *Tracker) line(raw []byte) {
 	}()
 	t.answered(e, at)
 	if e.Message == nil {
-		// Notifications that arrive mid-turn are queued: recorded as queue operations and attachments.
+		// Notifications that arrive mid-turn are queued: recorded as queue operations and attachments. Another
+		// session's message queued so is no notice of this session's tasks, whatever it quotes.
 		if (e.Type == "queue-operation" || e.Type == "attachment") && bytes.Contains(raw, []byte("<task-notification>")) {
 			var q struct {
 				Content    string `json:"content"`
 				Attachment struct {
 					Prompt string `json:"prompt"`
+					Origin struct {
+						Kind string `json:"kind"`
+					} `json:"origin"`
 				} `json:"attachment"`
 			}
 			json.Unmarshal(raw, &q)
-			t.notified(text.FirstNonEmpty(q.Content, q.Attachment.Prompt), at)
+			s := text.FirstNonEmpty(q.Content, q.Attachment.Prompt)
+			if e.origin() != "peer" && q.Attachment.Origin.Kind != "peer" && !PeerMessage(s) {
+				t.notified(s, at)
+			}
 		}
 		switch e.Type {
 		case "api-request":
@@ -660,6 +667,13 @@ func (t *Tracker) user(e line, at time.Time, open bool) {
 // a reopening as this tracker does.
 func Orphaned(s string) bool { return reOrphan.MatchString(s) }
 
+// PeerMessage reports another session's message by its text, as Claude Code writes it into the session: in one of
+// its tags, or after the words it opens one with. The replay reads another session's message as this tracker does.
+func PeerMessage(s string) bool {
+	return strings.HasPrefix(s, "<agent-message from=") || strings.HasPrefix(s, "<cross-session-message from=") ||
+		strings.HasPrefix(s, "Another Claude session sent a message")
+}
+
 // originLabel is Claude Code's own record of where user-role text came from: the origin kind (human, peer, ...)
 // and the prompt source (typed, queued, sdk, ...). A program typing into the terminal also records as typed, so
 // this labels the text; it does not attribute it.
@@ -676,20 +690,21 @@ func originLabel(kind, source string) string {
 // userText reads a user record's text; open is whether a turn was open before the record.
 func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin string, open bool) {
 	st := &t.st
+	// Another session's message is logged as such, never as user text, nor read as a notice of this session's tasks
+	// or of its reopening, whatever it quotes. Claude Code marks it meta, which does not open a turn; the reply that
+	// follows does.
+	if kind == "peer" || PeerMessage(s) {
+		st.log.Add(sessions.Entry{Role: sessions.RolePeer, Text: text.OneLine(reSystemTag.ReplaceAllString(s, ""), 400)})
+		if !meta {
+			st.LastMain, st.QueuedPrompt = "user", time.Time{}
+		}
+		return
+	}
 	if strings.Contains(s, "<task-notification>") {
 		t.notified(s, at)
 		st.LastMain, st.QueuedPrompt = "user", time.Time{}
 		if reOrphan.MatchString(s) {
 			st.Resumed = at
-		}
-		return
-	}
-	// Another session's message is logged as such, never as user text. Claude Code marks it meta, which does not
-	// open a turn; the reply that follows does.
-	if kind == "peer" || strings.HasPrefix(s, "Another Claude session sent a message") {
-		st.log.Add(sessions.Entry{Role: sessions.RolePeer, Text: text.OneLine(reSystemTag.ReplaceAllString(s, ""), 400)})
-		if !meta {
-			st.LastMain, st.QueuedPrompt = "user", time.Time{}
 		}
 		return
 	}

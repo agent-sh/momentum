@@ -180,10 +180,12 @@ func role(e store.Event, m map[string]any) string {
 	case "owner_text":
 		return "owner"
 	case "agent_text":
-		if why == "origin peer" || why == "harness line" && peerMessage(e.Summary) {
+		if why == "origin peer" || why == "harness line" {
 			// another session's message, which tacit credits to an agent when it does not know the tag: an input of the
-			// session's own that the model answers, not the model's words. The store marks it a harness line when Claude
-			// Code queued it as meta, else by its origin (origin peer), which the live tracker reads too.
+			// session's own that the model answers, not the model's words. The store marks it by its origin (origin
+			// peer), which the live tracker reads too, or a harness line when Claude Code queued it as meta, whatever
+			// tag it opens with. tacit gives that mark only to a line the harness wrote (a meta line, a meta queued
+			// command, a line shown in the transcript only), never to the model's words.
 			return "self"
 		}
 		return "agent"
@@ -207,7 +209,7 @@ func role(e store.Event, m map[string]any) string {
 		return "self"
 	case strings.HasPrefix(s, "# Autonomous loop tick"), m["prior"] == "scheduled_task_fire":
 		return "self"
-	case peerMessage(s), why == "origin peer":
+	case claude.PeerMessage(s), why == "origin peer":
 		return "self"
 	case strings.HasPrefix(why, "hermes notice "):
 		if strings.Contains(why, "steer") {
@@ -244,17 +246,12 @@ func role(e store.Event, m map[string]any) string {
 	return ""
 }
 
-// peerMessage reports another session's message, as Claude Code writes it into the session.
-func peerMessage(s string) bool {
-	return strings.HasPrefix(s, "<agent-message from=") || strings.HasPrefix(s, "<cross-session-message from=") ||
-		strings.HasPrefix(s, "Another Claude session sent a message")
-}
-
-// fromPeer reports an event of another session's message: by its text, or by the store's mark of a record Claude
-// Code says came from a peer (tacit's origin peer).
+// fromPeer reports an event of another session's message: by its text, by the store's mark of a record Claude Code
+// says came from a peer (tacit's origin peer), or as an agent's text the store marks a harness line, a message
+// another session sent that Claude Code queued as meta, whatever tag it opens with.
 func fromPeer(e store.Event, m map[string]any) bool {
 	why, _ := m["why"].(string)
-	return why == "origin peer" || peerMessage(e.Summary)
+	return why == "origin peer" || e.Kind == "agent_text" && why == "harness line" || claude.PeerMessage(e.Summary)
 }
 
 type replayTask struct {
@@ -1121,14 +1118,16 @@ func requestBetween(from, to string, until time.Time) time.Time {
 }
 
 // queuedCommand reports what Claude Code queued while a turn ran and delivered into the turn later, not its user's: a
-// task's notification, which the store marks by its command mode, and another session's message, which the store
-// marks a harness line when it is meta, else by its origin (origin peer), as the harness's text or an agent's, as
-// tacit's digest reads a queued command (meta before its mode). Either mark can also be on a record of another
-// kind (a harness line on a record shown in the transcript only, origin peer on a user record), so while the
-// transcript is there its record says: a queued command is an attachment of type queued_command. Without the
-// transcript the store's mark stands: a record of another kind is dated where it sits, so reading it there moves
-// nothing. A message its user typed meanwhile is queued too, but its record's time is when he typed it, which his
-// labelled steps and his turns are found by.
+// task's notification, which the store marks by its command mode, or a harness line when it is meta, and another
+// session's message, which the store marks a harness line when it is meta, else by its origin (origin peer), as the
+// harness's text or an agent's, as tacit's digest reads a queued command (meta before its mode). Either mark can
+// also be on a record of another kind (a harness line on a record shown in the transcript only, origin peer on a
+// user record), so while the transcript is there its record says: a queued command is an attachment of type
+// queued_command. Without the transcript the store's mark stands, and tacit marks both kinds of record alike (the
+// same why, no input kind), so a record of another kind reads as queued: dated where it sits, it is not moved, but
+// right after an input it is read as part of that input, and after a call or its result it begins no turn. That is
+// a limit of the store (SPEC). A message its user typed meanwhile is queued too, but its record's time is when he
+// typed it, which his labelled steps and his turns are found by.
 func queuedCommand(e store.Event) bool {
 	if e.Harness != "claude" || e.Kind != "harness_text" && e.Kind != "agent_text" {
 		return false
@@ -1163,17 +1162,15 @@ func queuedCommand(e store.Event) bool {
 // before it: each is already placed where it was delivered, so a run of them is read at the record they followed,
 // and one queued after that record was written keeps its own time, before which nothing after it was delivered. A
 // prompt its user typed meanwhile keeps the time he typed it, so what follows it is delivered with it. Events are
-// read in the store's order: by time, then the transcript's name, offset and index. What its queueing did stays at
-// its own time, as the live tracker reads the queue: a copy there, under its key with enqueuedKey after it and read
-// after an event of its place and time, closes the task a notification reports. It returns the events in that
-// order, the queued commands and the copies, by source key.
+// read in the store's order: by time, then source key. What its queueing did stays at its own time, as the live
+// tracker reads the queue: a copy there, under its key with enqueuedKey after it, so in the store's order where the
+// queued command itself sat, closes the task a notification reports. It returns the events in that order, the
+// queued commands and the copies, by source key.
 func placeQueued(evs []store.Event) ([]store.Event, map[string]bool, map[string]bool) {
 	type place struct {
 		path string
 		off  int64
 		idx  int
-		ok   bool
-		copy bool
 	}
 	before := func(a, b place) bool {
 		if a.path != b.path {
@@ -1189,13 +1186,12 @@ func placeQueued(evs []store.Event) ([]store.Event, map[string]bool, map[string]
 	var order []int // the events with a place, in transcript order
 	for i, e := range out {
 		if path, off, ok := refPlace(e.Ref); ok && e.Harness == "claude" {
-			places[i], order = place{path: path, off: off, idx: blockIndex(e.Ref), ok: true}, append(order, i)
+			places[i], order = place{path: path, off: off, idx: blockIndex(e.Ref)}, append(order, i)
 		}
 	}
 	sort.SliceStable(order, func(a, b int) bool { return before(places[order[a]], places[order[b]]) })
 	queued, enqueued := map[string]bool{}, map[string]bool{}
 	var copies []store.Event
-	var copyPlaces []place
 	for k, i := range order {
 		if !queuedCommand(out[i]) {
 			continue
@@ -1204,10 +1200,9 @@ func placeQueued(evs []store.Event) ([]store.Event, map[string]bool, map[string]
 		if k > 0 && places[order[k-1]].path == places[i].path {
 			// the event before it as placed: a queued command before it was delivered at its own anchor
 			if prev := out[order[k-1]].TS; prev.After(out[i].TS) {
-				c, p := out[i], places[i]
+				c := out[i]
 				c.SourceKey += enqueuedKey
-				p.copy = true
-				copies, copyPlaces, enqueued[c.SourceKey] = append(copies, c), append(copyPlaces, p), true
+				copies, enqueued[c.SourceKey] = append(copies, c), true
 				out[i].TS = prev
 			}
 		}
@@ -1215,42 +1210,17 @@ func placeQueued(evs []store.Event) ([]store.Event, map[string]bool, map[string]
 	if len(copies) == 0 {
 		return evs, queued, enqueued
 	}
-	out, places = append(out, copies...), append(places, copyPlaces...)
-	idx := make([]int, len(out))
-	for i := range idx {
-		idx[i] = i
-	}
-	// the store's order (time, then source key, which is the transcript's name, the record's offset and the item's
-	// index), so that a moved event never lands before its anchor and the rest stay as the store reads them: an event
-	// with no place first among its time, the copy after the event of its place, then the source key
-	sort.SliceStable(idx, func(a, b int) bool {
-		ea, eb := out[idx[a]], out[idx[b]]
-		if !ea.TS.Equal(eb.TS) {
-			return ea.TS.Before(eb.TS)
+	// The store's order, by construction (Store.Timeline): time, then source key, which starts with the transcript's
+	// name and holds the record's offset and the item's index at fixed widths. A moved event shares its anchor's time
+	// and follows it in their transcript, so it never lands before it, and the rest stay as the store reads them.
+	out = append(out, copies...)
+	sort.SliceStable(out, func(a, b int) bool {
+		if !out[a].TS.Equal(out[b].TS) {
+			return out[a].TS.Before(out[b].TS)
 		}
-		pa, pb := places[idx[a]], places[idx[b]]
-		if pa.ok != pb.ok {
-			return pb.ok
-		}
-		if na, nb := evidence.Name(pa.path), evidence.Name(pb.path); na != nb {
-			return na < nb
-		}
-		if pa.off != pb.off {
-			return pa.off < pb.off
-		}
-		if pa.idx != pb.idx {
-			return pa.idx < pb.idx
-		}
-		if pa.copy != pb.copy {
-			return pb.copy
-		}
-		return ea.SourceKey < eb.SourceKey
+		return out[a].SourceKey < out[b].SourceKey
 	})
-	sorted := make([]store.Event, len(out))
-	for k, i := range idx {
-		sorted[k] = out[i]
-	}
-	return sorted, queued, enqueued
+	return out, queued, enqueued
 }
 
 // enqueuedKey marks the copy of a queued command at the time it was queued (placeQueued).

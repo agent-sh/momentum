@@ -482,3 +482,61 @@ func TestAnInterruptionIsNotAReopening(t *testing.T) {
 		t.Fatalf("resumed %v", s.ResumedAt)
 	}
 }
+
+// tag and closing build a tag of Claude Code's markup from its name, so no fixture holds one whole.
+func tag(name string) string     { return "<" + name + ">" }
+func closing(name string) string { return "</" + name + ">" }
+
+// Another session's message is no notice of the session's tasks or of its reopening, whatever it quotes, and no
+// user text of the session's: one that quotes a whole task notification for the running command leaves it running,
+// and one that quotes Claude Code's words for a reopening reopens nothing. So for each way Claude Code writes such a
+// message: a user record marked by its origin (meta or not), the words it opens an older one with, its tags with no
+// origin, a queued command's attachment (by the attachment's origin or by its tag) and the queue's enqueue. The
+// replay reads it so (supervise.TestAPeerMessageIsNoNoticeOfTheSessionsTasks).
+func TestAPeerMessageIsNoNoticeOfTheSessionsTasks(t *testing.T) {
+	done := tag("task-notification") + tag("task-id") + "b9" + closing("task-id") + tag("status") + "completed" + closing("status") +
+		tag("summary") + "Background command finished" + closing("summary") + closing("task-notification")
+	gone := tag("task-notification") + tag("task-id") + "__orphan_summary__" + closing("task-id") + tag("summary") +
+		"1 background task didn't finish " + "before the previous session ended" + closing("summary") + closing("task-notification")
+	peerTag := `cross-session-message from="s2" from-name="reviewer" from-mode="default"`
+	userRec := func(text string, meta bool, origin string) map[string]any {
+		r := map[string]any{"type": "user", "isMeta": meta, "message": map[string]any{"role": "user", "content": text}}
+		if origin != "" {
+			r["origin"] = map[string]any{"kind": origin}
+		}
+		return r
+	}
+	queuedRec := func(text, origin string) map[string]any {
+		a := map[string]any{"type": "queued_command", "commandMode": "prompt", "isMeta": true, "prompt": text}
+		if origin != "" {
+			a["origin"] = map[string]any{"kind": origin}
+		}
+		return map[string]any{"type": "attachment", "attachment": a}
+	}
+	rows := map[string][]map[string]any{
+		"origin":        {userRec("Mine finished: "+done, false, "peer")},
+		"origin-meta":   {userRec("Mine finished: "+done, true, "peer")},
+		"older":         {userRec("Another Claude session sent a message:\n"+done, true, "")},
+		"agent-message": {userRec(tag(`agent-message from="worker"`)+done+closing("agent-message"), false, "")},
+		"cross-session": {userRec(tag(peerTag)+done+closing("cross-session-message"), false, "")},
+		"queued-origin": {queuedRec(tag(`team-message from="lead"`)+done+closing("team-message"), "peer")},
+		"queued-tag":    {queuedRec(tag(peerTag)+done+closing("cross-session-message"), "")},
+		"enqueue": {{"type": "queue-operation", "operation": "enqueue", "content": tag(peerTag) + done + closing("cross-session-message")},
+			queuedRec(tag(peerTag)+done+closing("cross-session-message"), "peer")},
+		"reopening": {userRec("Your log says: "+gone, false, "peer")},
+	}
+	for name, recs := range rows {
+		x := newScript(t).user("run the suite in the background")
+		typed := x.at
+		x.call("tu1", "Bash", map[string]any{"command": "make test", "run_in_background": true}).
+			result("tu1", "Command running in background with ID: b9. Output is being written to: /work/b9.output").
+			say("The suite runs in the background.")
+		for _, r := range recs {
+			x.add(r)
+		}
+		s := x.facts(NewTracker(x.path), x.at)
+		if taskIDs(s) != "bash:b9" || !s.ResumedAt.IsZero() || !s.UserAt.Equal(typed) {
+			t.Errorf("%s: tasks %q, reopened at %v, user text at %v (typed at %v)", name, taskIDs(s), s.ResumedAt, s.UserAt, typed)
+		}
+	}
+}

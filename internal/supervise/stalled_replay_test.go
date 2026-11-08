@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,9 +52,16 @@ func (r *recorded) line(after time.Duration, v map[string]any) (int64, time.Time
 	return off, r.at
 }
 
+// storeKey is an event's source key as the store writes it (source.Transcripts): its transcript's file name less
+// .jsonl, then the record's offset and the item's index at fixed widths. The store reads a session's events by time
+// and then this key.
+func storeKey(path string, off int64, idx int) string {
+	return fmt.Sprintf("%s@%012d#%03d", strings.TrimSuffix(filepath.Base(path), ".jsonl"), off, idx)
+}
+
 func (r *recorded) event(after time.Duration, v map[string]any, kind string, actor store.Actor, tool, summary, meta string) *recorded {
 	off, at := r.line(after, v)
-	r.evs = append(r.evs, store.Event{Source: store.Transcripts, SourceKey: fmt.Sprintf("%s@%d", r.session, off), TS: at, Session: r.session,
+	r.evs = append(r.evs, store.Event{Source: store.Transcripts, SourceKey: storeKey(r.path, off, 0), TS: at, Session: r.session,
 		Harness: "claude", Actor: actor, Kind: kind, Tool: tool, Summary: summary, Meta: meta, Ref: fmt.Sprintf("%s@%d#0", r.path, off)})
 	return r
 }
@@ -112,7 +120,7 @@ func TestReplayFindsTheRequestATurnWaitedOn(t *testing.T) {
 	carried := late.at
 	off, _ := late.line(0, map[string]any{"type": "user", "timestamp": carried.Add(-50 * time.Millisecond).Format(time.RFC3339Nano),
 		"message": map[string]any{"content": "<task-notification> done"}})
-	late.evs = append(late.evs, store.Event{Source: store.Transcripts, SourceKey: fmt.Sprintf("late@%d", off), TS: carried.Add(-50 * time.Millisecond),
+	late.evs = append(late.evs, store.Event{Source: store.Transcripts, SourceKey: storeKey(late.path, off, 0), TS: carried.Add(-50 * time.Millisecond),
 		Session: "late", Harness: "claude", Actor: store.ActorHarness, Kind: "harness_text",
 		Summary: "<task-notification> <task-id>b2</task-id> <status>completed</status> </task-notification>", Meta: `{"why":"origin task-notification"}`,
 		Ref: fmt.Sprintf("%s@%d#0", late.path, off)})
