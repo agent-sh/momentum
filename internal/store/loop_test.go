@@ -141,3 +141,29 @@ func TestALoopRunsTableFromBeforeTheTokensByKindGainsThem(t *testing.T) {
 		t.Fatalf("the old run: %+v %v", r, err)
 	}
 }
+
+// The turns a pass moved are written together or not at all: a row the store refuses leaves the others as they were.
+func TestSetLoopTurnsWritesAllOrNone(t *testing.T) {
+	ctx := context.Background()
+	st, path := open(t)
+	if err := st.SetLoopTurns(ctx, map[string]string{"build": "a", "run": "a"}); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TRIGGER refuse_single BEFORE INSERT ON loop_turns WHEN NEW.step = 'single'
+	  BEGIN SELECT RAISE(ABORT, 'marker-7f3a'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetLoopTurns(ctx, map[string]string{"build": "b", "run": "b", "single": "build"}); err == nil {
+		t.Fatal("the refused row was written")
+	}
+	for _, step := range []string{"build", "run"} {
+		if got, err := st.LoopTurn(ctx, step); err != nil || got != "a" {
+			t.Errorf("the %s turn is %q after a refused write, want %q: %v", step, got, "a", err)
+		}
+	}
+}

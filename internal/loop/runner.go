@@ -365,16 +365,11 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		case took[turnRun] && !took[turnBuild]:
 			write[turnSingle] = turnRun
 		}
-		for _, kind := range []string{turnBuild, turnRun, turnSingle} {
-			value, ok := write[kind]
-			if !ok {
-				continue
-			}
-			changed++
-			if err := r.Store.SetLoopTurn(ctx, kind, value, r.now()); err != nil {
-				failed++
-				writeErr = err
-				r.logf("the loop's %s turn of %s: %v", kind, value, err)
+		if len(write) > 0 { // in one transaction: the turns and the single row move together, or none does
+			changed = len(write)
+			if err := r.Store.SetLoopTurns(ctx, write); err != nil {
+				failed, writeErr = changed, err
+				r.logf("the loop's turns %v: %v", write, err)
 			}
 		}
 		if failed > 0 {
@@ -431,9 +426,11 @@ func (r *Runner) removeRunDirs(ctx context.Context, caseID, dir string, build bo
 var runIDForm = regexp.MustCompile(`^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$`)
 
 // sweepRuns removes the run directories that neither a run naming its directory nor a hold's receipt names
-// (store.KnownLoopRunDirs), which a pass that ended between a build's preparation and its reservation (a crash) leaves:
-// a build tree a package names in one goes back to its case first, and a directory whose tree cannot go back stays. It
-// looks only at entries in a run id's form, and removes nothing when the store cannot say which runs it knows. A pass
+// (store.KnownLoopRunDirs) and whose agent never started, which a pass that ended between a build's preparation and
+// its reservation (a crash) leaves: a build tree a package names in one goes back to its case first, and a directory
+// whose tree cannot go back stays. One whose agent started (agentRan: a store restored, or made anew, lost its row)
+// stays, logged once. It looks only at entries in a run id's form, and removes nothing when the store cannot say which
+// runs it knows. A pass
 // sweeps when it starts, under the loop's lock, before it prepares any run of its own, so every run directory then is
 // an earlier pass's.
 func (r *Runner) sweepRuns(ctx context.Context) {
@@ -467,6 +464,10 @@ func (r *Runner) sweepRuns(ctx context.Context) {
 			continue
 		}
 		dir := filepath.Join(runs, id)
+		if agentRan(dir) {
+			r.keepUnknownRun(id, dir)
+			continue
+		}
 		if r.Ship != nil {
 			if err := r.Ship.returnTrees(ctx, dir); err != nil {
 				r.logf("run directory %s, which no run names: %v", id, err)
@@ -476,6 +477,38 @@ func (r *Runner) sweepRuns(ctx context.Context) {
 		removeInputTree(HostDir(dir))
 		removeInputTree(dir)
 		r.logf("removed run directory %s, which no run names", id)
+	}
+}
+
+// agentRan says whether a run directory holds what only a started agent leaves: a transcript or an error log in its
+// host directory, or its output. No agent starts before its run is reserved, so a run prepared and never reserved has
+// none of these.
+func agentRan(dir string) bool {
+	for _, pattern := range []string{"transcript*.jsonl", "stderr*"} {
+		if found, _ := filepath.Glob(filepath.Join(HostDir(dir), pattern)); len(found) > 0 {
+			return true
+		}
+	}
+	_, err := os.Lstat(filepath.Join(dir, "out"))
+	return err == nil
+}
+
+// keptMark is the file a run directory no run names, whose agent started, is marked with once its keeping is logged.
+const keptMark = ".kept"
+
+// keepUnknownRun keeps a run directory no run names whose agent started, and logs it the first time.
+func (r *Runner) keepUnknownRun(id, dir string) {
+	mark := HostDir(dir)
+	if _, err := os.Lstat(mark); err != nil {
+		mark = dir
+	}
+	mark = filepath.Join(mark, keptMark)
+	if _, err := os.Lstat(mark); err == nil {
+		return
+	}
+	r.logf("kept run directory %s: no run names it, and its agent ran (its row may be in an older copy of the store)", id)
+	if err := os.WriteFile(mark, nil, 0o600); err != nil {
+		r.logf("run directory %s: %v", id, err)
 	}
 }
 

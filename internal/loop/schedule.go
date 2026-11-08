@@ -48,9 +48,10 @@ type planned struct {
 // reserved runs nothing else, and no other case builds in the pass. No case is reserved twice, no ready build is left
 // unreserved while room is left, and a family named twice is one family.
 //
-// With room for two runs or more each pass and every ready build reserved, a family with a buildable case goes at most
-// b-1 passes without its build, b being the families with a buildable case; with room for one, at most 2b-1
-// (TestPassPlansAreFairOverRandomFamilies).
+// While the store reads and writes the turns and every ready build is reserved, a family with a buildable case goes at
+// most b-1 passes without its build with room for two runs or more each pass, b being the families with a buildable
+// case, and at most 2b-1 with room for one (TestPassPlansAreFairOverRandomFamilies). A store that cannot keep the turns
+// takes the families in configured order every pass and, with room for one run, serves the run turn every pass.
 //
 // It returns the steps, in the order taken, the turns after the pass, and which of them a reserved run took.
 func schedule(families []string, cands map[string][]candidate, turns map[string]string, room int, runsFirst bool,

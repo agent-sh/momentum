@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
+	"slices"
 	"strings"
 	"time"
 )
@@ -22,7 +24,7 @@ CREATE TABLE IF NOT EXISTS loop_runs (id TEXT PRIMARY KEY, case_id TEXT NOT NULL
   cost_usd REAL NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0, turns INTEGER NOT NULL DEFAULT 0,
   model TEXT NOT NULL DEFAULT '', dir TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
   experiment TEXT NOT NULL DEFAULT '');
-CREATE TABLE IF NOT EXISTS loop_turns (step TEXT PRIMARY KEY, family TEXT NOT NULL, at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS loop_turns (step TEXT PRIMARY KEY, family TEXT NOT NULL);
 `
 
 var loopTableNames = []string{"loop_runs", "loop_turns"}
@@ -37,11 +39,21 @@ func (s *Store) LoopTurn(ctx context.Context, step string) (string, error) {
 	return family, err
 }
 
-// SetLoopTurn records the family a turn names.
-func (s *Store) SetLoopTurn(ctx context.Context, step, family string, at time.Time) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO loop_turns (step, family, at) VALUES (?, ?, ?)
-	  ON CONFLICT(step) DO UPDATE SET family = excluded.family, at = excluded.at`, step, family, at.UnixMilli())
-	return err
+// SetLoopTurns records the turns a pass moved, each by its step and what it names, in one transaction: all of them,
+// or none.
+func (s *Store) SetLoopTurns(ctx context.Context, turns map[string]string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, step := range slices.Sorted(maps.Keys(turns)) {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO loop_turns (step, family) VALUES (?, ?)
+	  ON CONFLICT(step) DO UPDATE SET family = excluded.family`, step, turns[step]); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 const loopIndexes = `

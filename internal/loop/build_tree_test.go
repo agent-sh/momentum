@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -552,5 +553,71 @@ func TestTheSweepKeepsARunningRunsDirectory(t *testing.T) {
 		if _, err := os.Stat(dir); err != nil {
 			t.Errorf("the sweep removed %s of a run in flight: %v", filepath.Base(dir), err)
 		}
+	}
+}
+
+// A run directory no run names whose agent ran stays through the sweep, logged once: a transcript or an error log in
+// its host directory, or its output, says the agent started, and a store restored or made anew may have lost its row.
+func TestTheSweepKeepsARunWhoseAgentRan(t *testing.T) {
+	for _, left := range []string{"transcript.jsonl", "stderr.log", "out"} {
+		r, _, in, _ := sweepFixture(t)
+		var logged []string
+		r.Log = func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
+		id := newRunID(time.Now())
+		dir := in(id)
+		for _, d := range []string{dir, HostDir(dir)} {
+			if err := os.MkdirAll(d, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		kept := filepath.Join(HostDir(dir), left)
+		if left == "out" {
+			kept = filepath.Join(dir, "out")
+			if err := os.Mkdir(kept, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := os.WriteFile(kept, []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		r.sweepRuns(context.Background())
+		r.sweepRuns(context.Background())
+		if _, err := os.Stat(kept); err != nil {
+			t.Errorf("%s: the sweep removed a run whose agent ran: %v", left, err)
+		}
+		times := 0
+		for _, line := range logged {
+			if strings.Contains(line, id) {
+				times++
+			}
+		}
+		if times != 1 {
+			t.Errorf("%s: the kept run was logged %d times over two sweeps, want once: %q", left, times, logged)
+		}
+	}
+}
+
+// returnWork moves the tree back onto a work directory an earlier tree left: the stale one goes, and the package names
+// the tree from the run directory.
+func TestReturnWorkReplacesAStaleWorkDirectory(t *testing.T) {
+	r, cs := turnRunner(t, "sessions")
+	ctx := context.Background()
+	id := cs[0].ID
+	runDir := filepath.Join(r.Dir, "runs", newRunID(time.Now()))
+	treeIn(t, r, id, runDir)
+	stale := r.Ship.workDir(id)
+	if err := os.MkdirAll(stale, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stale, "stale-marker"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if stays, err := r.Ship.returnWork(ctx, id, runDir); stays || err != nil {
+		t.Fatalf("returnWork onto a stale work directory: stays %v, %v", stays, err)
+	}
+	if _, err := os.Stat(filepath.Join(stale, "marker-7f3a")); err != nil {
+		t.Fatalf("the tree from the run directory is not in the work directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stale, "stale-marker")); !os.IsNotExist(err) {
+		t.Fatalf("the stale tree stayed: %v", err)
 	}
 }

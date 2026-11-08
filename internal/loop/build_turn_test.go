@@ -213,12 +213,8 @@ func TestTheBuildTurnsFamilyBuildsWhateverTheRoom(t *testing.T) {
 	openCase(t, r.Store, "manual-work", "marker-7f3a-mw", 1)
 	openCase(t, r.Store, "blind-spots", "marker-7f3a-bs", 1)
 	r.Families = []string{"owner-burden", "sessions", "manual-work", "blind-spots"}
-	for _, kind := range []string{turnBuild, turnRun} {
-		if err := r.Store.SetLoopTurn(ctx, kind, "sessions", time.Now()); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := r.Store.SetLoopTurn(ctx, turnSingle, turnRun, time.Now()); err != nil { // room for one run serves the build
+	// room for one run serves the build
+	if err := r.Store.SetLoopTurns(ctx, map[string]string{turnBuild: "sessions", turnRun: "sessions", turnSingle: turnRun}); err != nil {
 		t.Fatal(err)
 	}
 	builders := []store.Case{cs[0], cs[1], cs[0]}
@@ -588,7 +584,7 @@ func TestTheBuildTakesTheFirstPlace(t *testing.T) {
 	open := openCase(t, r.Store, "sessions", "marker-7f3a-open", 1)
 	r.Families = []string{"sessions", "owner-burden"}
 	r.Budgets.Day = 1.5 * r.Budgets.Run
-	if err := r.Store.SetLoopTurn(context.Background(), turnSingle, turnRun, time.Now()); err != nil { // the pass serves the build
+	if err := r.Store.SetLoopTurns(context.Background(), map[string]string{turnSingle: turnRun}); err != nil { // the pass serves the build
 		t.Fatal(err)
 	}
 	done, err := r.Once(context.Background(), Options{})
@@ -937,7 +933,7 @@ func TestARoomForOneRunAnswersTheLastSingleTurn(t *testing.T) {
 		m := openCase(t, r.Store, "manual-work", "marker-7f3a-m", 1)
 		r.Families = []string{"owner-burden", "sessions", "manual-work"}
 		if first == turnBuild {
-			if err := r.Store.SetLoopTurn(ctx, turnSingle, turnRun, time.Now()); err != nil {
+			if err := r.Store.SetLoopTurns(ctx, map[string]string{turnSingle: turnRun}); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -961,7 +957,8 @@ func TestARoomForOneRunAnswersTheLastSingleTurn(t *testing.T) {
 	}
 }
 
-// With room for one run, a pass whose store cannot say which turn the last single pass took serves the run turn.
+// With room for one run, a pass whose store cannot keep the turns serves the run turn, pass after pass: the bounds hold
+// only while the store reads and writes them.
 func TestARoomForOneRunServesTheRunTurnWhenTheTurnsCannotBeRead(t *testing.T) {
 	r, cs := turnRunner(t, "owner-burden")
 	open := openCase(t, r.Store, "sessions", "marker-7f3a-open", 1)
@@ -975,14 +972,17 @@ func TestARoomForOneRunServesTheRunTurnWhenTheTurnsCannotBeRead(t *testing.T) {
 	if _, err := db.Exec(`DROP TABLE loop_turns`); err != nil {
 		t.Fatal(err)
 	}
-	done, err := r.Once(context.Background(), Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	built, whyBuild := turnStep(done, cs[0].ID, StepBuild)
-	ran, why := turnStep(done, open.ID, StepInvestigate)
-	if built || !ran || whyBuild != runsTurn {
-		t.Fatalf("built %v (%q), investigated %v (%q); want the run turn served", built, whyBuild, ran, why)
+	for pass := range 4 {
+		setRoom(t, r, 1)
+		done, err := r.Once(context.Background(), Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		built, whyBuild := turnStep(done, cs[0].ID, StepBuild)
+		ran, why := turnStep(done, open.ID, StepInvestigate)
+		if built || !ran || whyBuild != runsTurn {
+			t.Fatalf("pass %d: built %v (%q), investigated %v (%q); want the run turn served", pass+1, built, whyBuild, ran, why)
+		}
 	}
 }
 
@@ -1012,4 +1012,115 @@ func TestLessonsKeepToThePassesCase(t *testing.T) {
 	if r.published(context.Background(), other.ID) {
 		t.Error("a lesson of a case the pass does not name was published")
 	}
+}
+
+// A pass with room for more runs that takes exactly one turn writes the single row too: here only the run turn's (the
+// build is held), so the next pass with room for one run serves the build.
+func TestAPassWithRoomForMoreThatTakesOneTurnWritesTheSingleRow(t *testing.T) {
+	r, cs := turnRunner(t, "owner-burden")
+	open := openCase(t, r.Store, "sessions", "marker-7f3a-open", 1)
+	r.Families = []string{"owner-burden", "sessions"}
+	ctx := context.Background()
+	r.Ship.Gate.Busy = func(context.Context, string) (string, error) { return "marker-7f3a busy", nil }
+	setRoom(t, r, 3)
+	done, err := r.Once(ctx, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran, why := turnStep(done, open.ID, StepInvestigate); !ran {
+		t.Fatalf("the first pass did not investigate: %q", why)
+	}
+	r.Ship.Gate.Busy = func(context.Context, string) (string, error) { return "", nil }
+	setRoom(t, r, 1)
+	if done, err = r.Once(ctx, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if built, why := turnStep(done, cs[0].ID, StepBuild); !built {
+		t.Fatalf("the pass with room for one run after a run-turn-only pass did not build: %q", why)
+	}
+}
+
+// When every family's pick fails, the pass runs no reviews: with no family to read, they would read every family's
+// cases at once.
+func TestNoReviewsRunWhenEveryPickFails(t *testing.T) {
+	r, _ := turnRunner(t, "sessions")
+	db, err := sql.Open("sqlite", r.Store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	bad := openCase(t, r.Store, "sessions", "marker-7f3a-bad", 1)
+	if _, err := db.Exec("UPDATE cases SET status = ?, alternatives = 'marker-7f3a' WHERE id = ?", store.CaseTesting, bad.ID); err != nil {
+		t.Fatal(err)
+	}
+	done, err := r.Once(context.Background(), Options{})
+	if err == nil {
+		t.Fatal("the pass did not return the pick's error")
+	}
+	for _, d := range done {
+		if d.Step == StepReview {
+			t.Fatalf("the pass ran reviews though every pick failed: %+v", d)
+		}
+	}
+}
+
+// A family whose cases in testing cannot be read stops no later family's reviews.
+func TestAFamilyWhoseTestingCasesCannotBeReadStopsNoOtherFamilysReviews(t *testing.T) {
+	r, cs := turnRunner(t, "sessions", "owner-burden")
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", r.Store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("UPDATE cases SET alternatives = 'marker-7f3a' WHERE id = ?", cs[0].ID); err != nil { // sessions' case
+		t.Fatal(err)
+	}
+	// owner-burden's case has a run in flight: its review says so
+	running := store.LoopRun{ID: newRunID(time.Now()), Case: cs[1].ID, Family: cs[1].Family, Step: StepBuild, Started: time.Now(),
+		Status: store.RunRunning, USD: r.Budgets.Run}
+	if err := r.Store.PutLoopRun(ctx, running); err != nil {
+		t.Fatal(err)
+	}
+	done := r.reviews(ctx, "", "sessions", "owner-burden")
+	unread, inFlight := false, false
+	for _, d := range done {
+		unread = unread || d.Family == "sessions" && strings.HasPrefix(d.Skipped, "cannot read the cases in testing")
+		inFlight = inFlight || d.Case == cs[1].ID && d.Skipped == "a run is in flight"
+	}
+	if !unread || !inFlight {
+		t.Fatalf("sessions unreadable %v, owner-burden's review reached %v: %+v", unread, inFlight, done)
+	}
+}
+
+// A build whose run directory went, and the case's work directories with it, gets its tree made again: the parent the
+// work directory needs is made too.
+func TestABuildWhoseWorkDirectoriesWentPrepares(t *testing.T) {
+	r, cs := turnRunner(t, "sessions")
+	ctx := context.Background()
+	if _, err := r.Once(ctx, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	p, ok, err := r.Ship.Load(cs[0].ID)
+	if err != nil || !ok {
+		t.Fatalf("the package: %v %v", ok, err)
+	}
+	for _, dir := range []string{filepath.Dir(p.Work), filepath.Join(r.Ship.Dir, "work")} {
+		if err := removeAll(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done, err := r.Once(ctx, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range done {
+		if d.Case == cs[0].ID && d.Step == StepBuild && d.Run.ID != "" {
+			if d.Run.Failure == "build prepare" {
+				t.Fatalf("the build failed to prepare: %s", d.Run.Summary)
+			}
+			return
+		}
+	}
+	t.Fatalf("the second pass did not build: %+v", done)
 }
