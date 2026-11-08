@@ -1377,7 +1377,7 @@ func TestOwnerBurdenIsFoundInHisOwnWords(t *testing.T) {
 	}
 }
 
-// A turn of his with none of his words (a compressed image or an attached resource he sent alone) answers the
+// A turn of his with none of his words (an image or an attached resource he sent alone) answers the
 // agent's last words as any turn does: the next turn's look back starts at it, so what the agent asked before it is
 // not read again. It is never classed itself.
 func TestAnEmptyOwnerTurnBoundsTheLookBack(t *testing.T) {

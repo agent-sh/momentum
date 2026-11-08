@@ -239,8 +239,8 @@ func (s Transcripts) readNativeJob(ctx context.Context, j *job, t *tally, add fu
 	}
 	defer reader.Close()
 	if offset == 0 && (j.native.stale || j.ok && j.cur.Offset > 0) {
-		// A file replaced, cut or read under an older rule is read from its start: counted, as tacit's are, once
-		// it is open, so a file that cannot be opened is not counted as read again.
+		// A file replaced, cut, rewritten or read under an older rule is read from its start: counted, as tacit's
+		// are, once it is open, so a file that cannot be opened is not counted as read again.
 		t.Lock()
 		t.restarts++
 		t.Unlock()
@@ -560,9 +560,10 @@ func (s *nativeState) kimi(o map[string]any) []evidence.Event {
 		s.Prior = prior
 		owner := typed && s.Owner
 		rest := s.user("kimi", words, owner, typed && !s.Known, at, input)
-		if owner && generated != "" && strings.TrimSpace(words) == "" {
-			// A prompt he sent is his turn though what was generated into it left none of his words: it holds empty
-			// text. Words tacit's own rules take from him are read as on main, with no turn added.
+		if owner && strings.TrimSpace(words) == "" {
+			// A prompt he sent is his turn though it holds none of his words, because what was generated into it left
+			// none or because it holds no text at all (an image alone): it holds empty text. Words tacit's own rules
+			// take from him are read as on main, with no turn added.
 			e := s.event("kimi", evidence.KindOwnerText, "", at)
 			e.Who, e.Prior, e.InputKind = evidence.Owner, prior, input
 			rest = append(rest, e)
@@ -777,11 +778,12 @@ func kimiWhole(t string) bool {
 }
 
 // kimiProvenance reads whether a person's client ever prompted the session. Kimi's clients (its TUI, web UI and
-// ACP server) record the session's lastPrompt in its metadata before each prompt's turn begins; `kimi -p` hands
-// its prompt to the agent loop and records none. A session whose metadata holds no lastPrompt is a program's run,
-// and one with no readable metadata has unknown provenance. So does one whose wire holds an undo: undoing every
-// prompt takes its lastPrompt away. It is read once per read, at the first user prompt of the main agent, after
-// that prompt's line: the lastPrompt of a prompt the reader holds was written before it.
+// ACP server) record the session's lastPrompt in its metadata before each user-origin prompt's turn begins (none
+// for a prompt with no display text); `kimi -p` hands its prompt to the agent loop and records none. A session
+// whose metadata holds no lastPrompt is a program's run, and one with no readable metadata has unknown provenance.
+// So does one whose wire holds an undo: undoing every prompt takes its lastPrompt away. It is read once per read, at
+// the first user-origin prompt of the main agent, after that prompt's line: the lastPrompt of a prompt the reader
+// holds was written before it.
 func (s *nativeState) kimiProvenance() {
 	if s.read || s.dir == "" {
 		return

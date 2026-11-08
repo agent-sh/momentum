@@ -297,15 +297,15 @@ func TestKimiCompressedWireIsCheckedForUndo(t *testing.T) {
 	}
 }
 
-// A native file replaced or cut since its cursor is read from its start, and the ingest counts it, as it counts
-// tacit's.
+// A native file replaced, cut or rewritten since its cursor is read from its start, and the ingest counts it, as it
+// counts tacit's.
 func TestNativeRestartIsCounted(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		rows []map[string]any
 	}{
 		{"cut", []map[string]any{kimiPrompt("marker-7f3a typed")}},
-		{"replaced", []map[string]any{kimiPrompt("marker-7f3a other"), kimiRecord("turn.ended", map[string]any{})}},
+		{"rewritten", []map[string]any{kimiPrompt("marker-7f3a other"), kimiRecord("turn.ended", map[string]any{})}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -389,6 +389,41 @@ func TestKimiProvenanceIsReadOncePerRead(t *testing.T) {
 	})
 	if want := []evidence.Kind{evidence.KindHarnessText, evidence.KindHarnessText}; !slices.Equal(kinds, want) || len(tally.failed) != 0 {
 		t.Fatalf("prompts read as %v, want %v (%v)", kinds, want, tally.failed)
+	}
+}
+
+// The metadata is read after the line of the read's first user-origin prompt, not as the read starts: a client
+// records a prompt's lastPrompt before it writes the prompt, so a person who types while a read runs is credited
+// with the prompt the read then reaches.
+func TestKimiProvenanceIsReadAfterThePromptsLine(t *testing.T) {
+	old := chunkBytes
+	chunkBytes = 1 // a part a line, so the person types after the read has started
+	defer func() { chunkBytes = old }()
+	home := t.TempDir()
+	path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed", "agents", "main", "wire.jsonl")
+	writeJSONLines(t, path, kimiRecord("profile.bind", map[string]any{"modelAlias": "neutral"}))
+	kimiState(t, path, `{"version":2}`)
+	j, ok := fileJob(path, evidence.Claude, nil)
+	if !ok {
+		t.Fatal("no job for the wire")
+	}
+	j.native = &nativeJob{harness: "kimi"}
+	var kinds []evidence.Kind
+	typed := false
+	tally := &tally{failed: map[string]bool{}}
+	transcripts("").readNativeJob(context.Background(), j, tally, func(p part) bool {
+		for _, it := range p.items {
+			kinds = append(kinds, it.e.Kind)
+		}
+		if !typed {
+			typed = true
+			kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a typed"}`)
+			appendJSONLines(t, path, kimiPrompt("marker-7f3a typed"))
+		}
+		return true
+	})
+	if want := []evidence.Kind{evidence.KindOwnerText}; !slices.Equal(kinds, want) || len(tally.failed) != 0 {
+		t.Fatalf("the prompt typed during the read read as %v, want %v (%v)", kinds, want, tally.failed)
 	}
 }
 
@@ -530,7 +565,8 @@ func ownerTexts(t *testing.T, st *store.Store) []string {
 // skills field) renders its body into the prompt's input, ahead of what was typed. The body is generated input, as
 // a slash command's activation is, whoever sent the prompt; only the rest is the prompt's words, credited as before.
 // A prompt of the owner's that the skill leaves none of his words is still his turn, with empty text, and his turns
-// keep the marker of the turn before them. A prompt with nothing generated in it is read as before.
+// keep the marker of the turn before them. A prompt with nothing generated in it is read as before, but one that
+// holds no text at all (an image alone) is his turn with empty text too.
 func TestKimiInlineSkillIsGeneratedInput(t *testing.T) {
 	text := func(s string) map[string]any { return map[string]any{"type": "text", "text": s} }
 	image := map[string]any{"type": "image_url", "imageUrl": map[string]any{"url": "file:///neutral.png"}}
@@ -574,9 +610,11 @@ func TestKimiInlineSkillIsGeneratedInput(t *testing.T) {
 		// The older-wire fallback reads a list of parts: input that is not one is his words.
 		{"input that is not a list", typed, kimiRecord("turn.prompt", map[string]any{"origin": kimiSkillOrigin(map[string]any{}),
 			"input": "marker-7f3a typed"}), map[string]string{"marker-7f3a typed": "owner owner_text"}, []string{"marker-7f3a typed"}},
-		// Nothing generated and no words: no turn, as before (#148).
+		// Nothing generated and no text at all: his turn still, with empty text.
 		{"media only", typed, kimiRecord("turn.prompt", map[string]any{"origin": map[string]any{"kind": "user"}, "input": []any{image}}),
-			map[string]string{}, nil},
+			map[string]string{}, []string{""}},
+		{"media only, steered", typed, kimiRecord("turn.steer", map[string]any{"origin": map[string]any{"kind": "user", "inTurn": true}, "input": []any{image}}),
+			map[string]string{}, []string{""}},
 		{"plain prompt", typed, kimiPrompt("marker-7f3a typed"), map[string]string{"marker-7f3a typed": "owner owner_text"}, []string{"marker-7f3a typed"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
