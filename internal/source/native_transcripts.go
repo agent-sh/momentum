@@ -166,11 +166,17 @@ func (s Transcripts) nativeJobs(ctx context.Context, cursors map[string]store.Fi
 				continue
 			}
 			seen[path] = true
-			saved := cursors
-			if src.Harness == "kimi" && kimiStale(cursors, path) {
+			saved, stale := cursors, src.Harness == "kimi" && kimiStale(cursors, path)
+			if stale {
 				saved = nil
 			}
 			if j, ok := fileJob(path, evidence.Claude, saved); ok {
+				if stale {
+					// counted with the files read again from the start, so the one read again is not silent
+					t.Lock()
+					t.restarts++
+					t.Unlock()
+				}
 				j.native = &nativeJob{harness: src.Harness}
 				jobs = append(jobs, j)
 			}

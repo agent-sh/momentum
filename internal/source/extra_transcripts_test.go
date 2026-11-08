@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -166,7 +167,10 @@ func TestKimiCursorFromBeforeTheRuleReadsAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 	kimiState(t, run, `{"version":2}`)
-	ingest(t, src, st)
+	// The files read again are counted, as a file read again for any other reason is.
+	if r := ingest(t, src, st); !slices.Contains(r.Notes, "files read again from the start (replaced, cut, rewritten or read under an older rule): 2") {
+		t.Fatalf("the read again is silent: %q", r.Notes)
+	}
 	want := map[string]string{"marker-7f3a launcher": "harness harness_text", "marker-7f3a typed": "owner owner_text"}
 	if got := promptActors(t, st); !maps.Equal(got, want) {
 		t.Fatalf("prompts stored as %v, want %v", got, want)
@@ -195,6 +199,21 @@ func TestKimiUndoneSessionIsUnknown(t *testing.T) {
 				t.Fatalf("an undone session's prompt stored as %v", got)
 			}
 		})
+	}
+}
+
+// A wire the undo check cannot read may hold an undo: it is not taken for a wire without one. Only a race (the
+// file gone or replaced between the read of its prompt and the check) gets here, so the check is tested alone.
+func TestKimiUnreadableWireIsNotNoUndo(t *testing.T) {
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "plain.jsonl")
+	writeJSONLines(t, plain, kimiPrompt("marker-7f3a"), kimiRecord("turn.ended", map[string]any{}))
+	undone := filepath.Join(dir, "undone.jsonl")
+	writeJSONLines(t, undone, kimiPrompt("marker-7f3a"), kimiRecord("context.undo", map[string]any{"agentId": "main", "count": 1}))
+	for path, want := range map[string]bool{plain: false, undone: true, filepath.Join(dir, "gone.jsonl"): true, dir: true} {
+		if got := kimiUndone(path); got != want {
+			t.Fatalf("%s: undone %v, want %v", filepath.Base(path), got, want)
+		}
 	}
 }
 

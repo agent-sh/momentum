@@ -276,7 +276,7 @@ func (s Transcripts) Ingest(ctx context.Context, st *store.Store) (Result, error
 		t.res.Notes = append(t.res.Notes, fmt.Sprintf("items no rule credits to anyone (actor unknown): %d", t.unknown))
 	}
 	if t.restarts > 0 {
-		t.res.Notes = append(t.res.Notes, fmt.Sprintf("files read again from the start (replaced, cut or rewritten): %d", t.restarts))
+		t.res.Notes = append(t.res.Notes, fmt.Sprintf("files read again from the start (replaced, cut, rewritten or read under an older rule): %d", t.restarts))
 	}
 	if t.dropped > 0 {
 		t.res.Notes = append(t.res.Notes, fmt.Sprintf("events of records read again that this reading does not give, dropped: %d", t.dropped))
