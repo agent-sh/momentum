@@ -660,6 +660,27 @@ func TestAReadOfAFileItsSessionThenCreatesIsNoFailure(t *testing.T) {
 	}
 }
 
+// A patch text the store folded onto one line names its first header's file up to a chunk's @@ too, as up to the
+// patch's other next lines (TestAReadBeforeACreateAcrossHarnesses, whose rows spell a path with @).
+func TestAFoldedPatchNamesItsFileUpToAChunk(t *testing.T) {
+	for _, text := range []string{"*** Begin Patch *** Update File: %s @@ a +b *** End Patch", "*** Begin Patch *** Update File: /w/old *** Move to: %s @@ +x *** End Patch"} {
+		st := testStore(t)
+		f := fileTools{harness: "codex"}
+		var evs []store.Event
+		for i, session := range []string{"s1", "s1", "s2"} {
+			p := fmt.Sprintf("/w/out/%d.md", i)
+			at := t0.Add(time.Duration(i) * time.Hour)
+			evs = append(evs, f.pair(session, "read_file", fmt.Sprintf(`{"path":%q}`, p), "File not found: "+p, true, at)...)
+			evs = append(evs, f.pair(session, "apply_patch", fmt.Sprintf(text, p), "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: M "+p,
+				false, at.Add(time.Minute))...)
+		}
+		put(t, st, evs...)
+		if fs, err := (Failures{}).Detect(context.Background(), st, week()); err != nil || len(fs) != 0 {
+			t.Fatalf("%q: found %v, %v", text, signatures(fs), err)
+		}
+	}
+}
+
 // Each harness's file tools: its read's own not-found error, of a path its session then writes, is no failure.
 func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 	for _, tc := range []struct {
@@ -681,6 +702,8 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 		{"hermes", "read_file", "write_file", `{"path":"/w/@"}`, `{"error": "[Errno 2] No such file or directory: '/w/@'"}`, `{"path":"/w/@","content":"x"}`, `{"bytes_written": 1}`},
 		{"claude", "Read", "Write", `{"file_path":"/w/@"}`, claudeMissing, `{"file_path":"/w/@","content":"x"}`, "The file /w/@ has been updated successfully. (file state is current in your context)"},
 		{"claude", "Read", "Edit", `{"file_path":"/w/@"}`, claudeMissing, `{"replace_all":true,"file_path":"/w/@"}`, "The file /w/@ has been updated. All occurrences were replaced."},
+		{"claude", "Read", "Edit", `{"file_path":"/w/@"}`, claudeMissing, `{"file_path":"/w/@","new_string":"x"}`,
+			"The file /w/@ has been updated. Here's the result of running `cat -n` on a snippet of the edited file: 1\t{\"error\": \"none\", \"no_change\": true}"},
 		{"kimi", "Read", "Edit", `{"path":"/w/@"}`, `"/w/@" does not exist.`, `{"path":"/w/@","old":"a","new":"b"}`, "Replaced 2 occurrences in /w/@"},
 		{"opencode", "read", "edit", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"filePath":"/w/@","newString":"x"}`, "Edit applied successfully."},
 		{"opencode", "read", "edit", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"filePath":"/w/@","newString":"x"}`, "Edited /w/@ (1 replacement)"},
@@ -691,11 +714,22 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 		{"codex", "read_file", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Add File: /w/@ +x *** End Patch", "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
 		{"codex", "read_file", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch\n*** Add File: /w/other\n+x\n*** Add File: /w/@\n+y\n*** End Patch",
 			"Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/other A /w/@"},
+		{"codex", "read_file", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch\n*** Update File: /w/old\n*** Move to: /w/@\n@@\n+x\n*** End Patch",
+			"Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: M /w/@"},
+		{"codex", "read_file", "apply_patch", `{"path":"/w/@/my file.txt"}`, "File not found: /w/@/my file.txt", "*** Begin Patch *** Add File: /w/@/my file.txt +x *** End Patch",
+			"Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@/my file.txt"},
+		{"codex", "read_file", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Add File: /w/@ *** End Patch", "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
+		{"codex", "read_file", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Update File: /w/@ -a +b *** End Patch", "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: M /w/@"},
+		{"codex", "read_file", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Update File: /w/old *** Move to: /w/@ -a +x *** End Patch",
+			"Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: M /w/@"},
+		{"opencode", "read", "apply_patch", `{"filePath":"/w/@/my file.txt"}`, "File not found: /w/@/my file.txt", `{"patchText":"*** Begin Patch\n*** Add File: /w/@/my file.txt\n+x\n*** End Patch"}`,
+			"Success. Updated the following files: A /w/@/my file.txt"},
+		{"opencode", "read", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Add File:  /w/@ \n+x\n*** End Patch"}`, "Success. Updated the following files: A /w/@"},
+		{"opencode", "read", "apply_patch", `{"filePath":"/w/@/my file.txt"}`, "File not found: /w/@/my file.txt",
+			`{"patchText":"*** Begin Patch\n*** Update File: /w/old\n*** Move to:  /w/@/my file.txt \n@@\n+x\n*** End Patch"}`, "Success. Updated the following files: M /w/@/my file.txt"},
+		{"pi", "read", "write", `{"path":"@"}`, "ENOENT: no such file or directory, access '@'", `{"path":"@","content":"x"}`, "Successfully wrote 1 bytes to @"},
 		{"codex", "read_file", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Add File: /w/@ +x", "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
 		{"opencode", "read", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Add File: /w/@\n*** Move to: /w/x\n+x\n*** End Patch"}`, "Success. Updated the following files: A /w/@"},
-		{"grok", "read_file", "search_replace", `{"target_file":"/w/@"}`, "Error: /w/@ does not exist.", `{"file_path":"/w/@","new_string":"x"}`, `{"EditsApplied":{"absolute_path":"/w/@","edits":[]}}`},
-		{"grok", "read_file", "write", `{"target_file":"/w/@"}`, "Error: /w/@ does not exist.", `{"file_path":"/w/@","content":"x"}`, `{"EditsApplied":{"absolute_path":"/w/@","edits":[]}}`},
-		{"grok", "read_file", "search_replace", `{"target_file":"/w/@"}`, "Error: /w/@ does not exist.", `{"file_path":"/w/@","new_string":"x"}`, `{"EditsApplied":{"absolute_path":"/w/@","edits":[],"details":{"error": "a warning only Hermes would read"}}}`},
 	} {
 		t.Run(tc.harness+"/"+tc.write, func(t *testing.T) {
 			st := testStore(t)
@@ -755,7 +789,8 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 		{"codex", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Add File: /w/other +x *** Add File: /w/@ +y *** End Patch", "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/other A /w/@"}, {"hermes", "patch", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"path":"/w/@"}`, `{"success": true, "error": "the patch left the file unchanged"}`},
 		{"hermes", "write_file", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"path":"/w/@","content":"x"}`, `Refused: {"bytes_written": 1, "dirs_created": true}`},
 		{"hermes", "patch", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"path":"/w/@"}`, `Not applied: {"success": true, "diff": ""}`},
-		{"grok", "write", `{"target_file":"/w/@"}`, "Error: /w/@ does not exist.", `{"file_path":"/w/@","content":"x"}`, `Error: could not save {"EditsApplied":{"absolute_path":"/w/@","edits":[]}}`},
+		{"grok", "write", `{"path":"/w/@"}`, "Error: /w/@ does not exist.", `{"file_path":"/w/@","content":"x"}`, `{"EditsApplied":{"absolute_path":"/w/@","edits":[]}}`},
+		{"hermes", "write_file", `{"path":"@"}`, `{"error": "File not found: @"}`, `{"path":"@","content":"x"}`, `{"bytes_written": 1}`},
 		{"kimi", "Write", `{"path":"/w/@"}`, `"/w/@" does not exist.`, `{"path":"/w/@","content":"x"}`, "Not saved: Wrote 3 bytes to /w/@"},
 		{"kimi", "Edit", `{"path":"/w/@"}`, `"/w/@" does not exist.`, `{"path":"/w/@","old":"a","new":"b"}`, "Not saved: Replaced 1 occurrence in /w/@"},
 		{"opencode", "write", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"filePath":"/w/@","content":"x"}`, "Rolled back: Wrote file successfully."},
@@ -865,6 +900,11 @@ func TestAShellLineWritesOnlyInTheWhitelistedForms(t *testing.T) {
 		{"permission denied", "", x, "cat > /w/out/x.jsonl", "bash: /w/out/x.jsonl: Permission denied", false, false},
 		{"cannot create", "", x, "cat > /w/out/x.jsonl", "sh: 1: cannot create /w/out/x.jsonl: Directory nonexistent", false, false},
 		{"no space left", "", x, "tee /w/out/x.jsonl <<'EOF'\nx\nEOF", "tee: /w/out/x.jsonl: No space left on device", false, false},
+		{"operation not permitted", "", x, "cat > /w/out/x.jsonl", "bash: /w/out/x.jsonl: Operation not permitted", false, false},
+		{"disk quota exceeded", "", x, "tee /w/out/x.jsonl <<'EOF'\nx\nEOF", "tee: /w/out/x.jsonl: Disk quota exceeded", false, false},
+		{"a file name too long", "", x, "cat > /w/out/x.jsonl", "bash: /w/out/x.jsonl: File name too long", false, false},
+		{"a symbolic link loop", "", x, "cat > /w/out/x.jsonl", "bash: /w/out/x.jsonl: Too many levels of symbolic links", false, false},
+		{"noclobber", "", x, "cat > /w/out/x.jsonl", "bash: /w/out/x.jsonl: cannot overwrite existing file", false, false},
 		{"cancelled beside a failed call", "", x, "cat > /w/out/x.jsonl", "Cancelled: parallel tool call Bash(ls) errored", true, false},
 		{"cancelled with no flag", "", x, "cat > /w/out/x.jsonl", "Tool execution cancelled by user", false, false},
 		{"a comment word", "/w", "/w/#x", "tee #x", "", false, false},
@@ -908,6 +948,8 @@ func TestAShellLineWritesOnlyInTheWhitelistedForms(t *testing.T) {
 		{"a comment", "", x, "cat > /w/out/x.jsonl # note", "", false, false},
 		{"a continued line", "", x, "cat \\\n> /w/out/x.jsonl", "", false, false},
 		{"an open quote", "", x, "cat > '/w/out/x.jsonl", "", false, false},
+		{"an open double quote", "", x, `cat > "/w/out/x.jsonl`, "", false, false},
+		{"a > with nothing after it", "", x, "cat >", "", false, false},
 		{"a variable", "", "/w/out/$x.jsonl", "cat > /w/out/$x.jsonl", "", false, false},
 		{"a quoted variable", "", "/w/out/$x.jsonl", `cat > "/w/out/$x.jsonl"`, "", false, false},
 		{"a quoted command's output", "", "/w/out/`date`.jsonl", "cat > \"/w/out/`date`.jsonl\"", "", false, false},
@@ -999,17 +1041,9 @@ func TestAShellRunsInItsCallsDirectory(t *testing.T) {
 		{"a Kimi call cut before its run_in_background", "kimi", "Bash", "/w", "/w", kimiCut,
 			"task_id: t1 pid: 9 description: write status: completed automatic_notification: true", x, false},
 		{"a Kimi call cut in its here-document", "kimi", "Bash", "/w", "/w", kimiCut, "Command executed successfully.", x, true},
-		{"Grok's background command", "grok", "bash", "/w", "/w", "{\"command\":\"cat > /w/out/x.md <<'EOF'\\nx\\nEOF\",\"is_background\":true}",
-			"Background command started successfully.", "/w/out/x.md", false},
-		{"Grok's is_background", "grok", "run_terminal_command", "/w", "/w", `{"command":"cd /w/out && cat >> x.jsonl","is_background":true}`, "", x, false},
-		{"Grok's background start", "grok", "run_terminal_command", "/w", "/w", `{"command":"cd /w/out && cat >> x.jsonl"}`, "Background command started successfully.", x, false},
-		{"Grok's wait of 0", "grok", "run_terminal_command", "/w", "/w", `{"command":"cd /w/out && cat >> x.jsonl","block_until_ms":0}`, "", x, false},
-		{"Grok's wait", "grok", "run_terminal_command", "/w", "/w", `{"command":"cd /w/out && cat >> x.jsonl","block_until_ms":5000}`, "", x, true},
 		{"OpenCode's background", "opencode", "bash", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"/w/out","background":true}`, "", x, false},
 		{"OpenCode's move to the background", "opencode", "bash", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"/w/out"}`, "Command moved to the background (shell ID: s1).", x, false},
 		{"another harness's background words", "kimi", "Bash", "/w", "/w", `{"command":"cat >> x.jsonl","cwd":"/w/out"}`, "Command moved to the background (shell ID: s1).", x, true},
-		{"Grok's command moved to the background", "grok", "run_terminal_command", "/w", "/w", `{"command":"cd /w/out && cat >> x.jsonl"}`, "Command was automatically moved to background.", x, false},
-		{"Grok's process still running", "grok", "run_terminal_command", "/w", "/w", `{"command":"cd /w/out && cat >> x.jsonl"}`, "Process is still running.", x, false},
 		{"Codex's JavaScript exec", "codex", "exec", "/w", "/w", `{"cmd":"cat >> x.jsonl","workdir":"/w/out"}`, "Process exited with code 0\nOutput:\n", x, false},
 		{"a Codex call cut before its workdir", "codex", "exec_command", "/w/out", "/w/out", string(cutCmd[:240]) + "…", "Process exited with code 0\nOutput:\n", x, false},
 		{"Kimi's cwd", "kimi", "Bash", "/w", "/w", `{"command":"cat >> x.jsonl","cwd":"/w/out"}`, "", x, true},
@@ -1023,9 +1057,10 @@ func TestAShellRunsInItsCallsDirectory(t *testing.T) {
 		{"Hermes after a cd", "hermes", "terminal", "/w/elsewhere", "/w/elsewhere", `{"command":"cd /w/out && cat >> x.jsonl"}`, "", x, true},
 		{"Hermes's workdir", "hermes", "terminal", "/w/elsewhere", "/w/elsewhere", `{"command":"cat >> x.jsonl","workdir":"/w/out"}`, "", x, true},
 		{"Hermes's background launch", "hermes", "terminal", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"/w/out","background":true}`, "", x, false},
-		{"Grok's terminal keeps its own directory", "grok", "run_terminal_command", "/w/out", "/w/out", `{"command":"cat >> x.jsonl"}`, "", x, false},
-		{"Grok after a cd", "grok", "run_terminal_command", "/w/elsewhere", "/w/elsewhere", `{"command":"cd /w/out && cat >> x.jsonl"}`, "", x, true},
-		{"Grok's working_directory", "grok", "run_terminal_command", "/w/elsewhere", "/w/elsewhere", `{"command":"cat >> x.jsonl","working_directory":"/w/out"}`, "", x, true},
+		{"a Grok foreground here-document", "grok", "bash", "/w", "/w", "{\"command\":\"cat > /w/out/x.jsonl <<'EOF'\\nx\\nEOF\"}", "", x, false},
+		{"Claude's run_in_background false", "claude", "Bash", "/w/out", "/w/out", `{"command":"cat >> x.jsonl","run_in_background":false}`, "", x, true},
+		{"a Codex command still running whose output names an exit code", "codex", "exec_command", "/w", "/w", `{"cmd":"tee x.jsonl","workdir":"/w/out"}`,
+			"Chunk ID: 1\nWall time: 10.0 seconds\nProcess running with session ID 7\nOutput:\nexit code 0", x, false},
 		{"Codex's older exit code", "codex", "exec_command", "/w", "/w", `{"cmd":"cat >> x.jsonl","workdir":"/w/out"}`, "Exit code: 0\nWall time: 0.1 seconds\nOutput:\n", x, true},
 		{"PowerShell is not bash", "claude", "PowerShell", "/w/out", "/w/out", `{"command":"cat > x.jsonl"}`, "", x, false},
 	} {
@@ -1129,23 +1164,6 @@ func TestAReadAnHourBeforeTheWindowsEndStillWaits(t *testing.T) {
 	}
 	if fs, err := (Failures{}).Detect(context.Background(), st, Window{Since: edge.Since, Until: edge.Until.Add(time.Millisecond)}); err != nil || len(fs) != 1 {
 		t.Fatalf("a moment later: %v, %v", signatures(fs), err)
-	}
-}
-
-// Grok's read_file names its file as target_file: its thread's whitelisted write of the path clears it.
-func TestGrokReadsItsTargetFile(t *testing.T) {
-	st := testStore(t)
-	g := fileTools{harness: "grok"}
-	var evs []store.Event
-	for i, session := range []string{"s1", "s1", "s2"} {
-		p := fmt.Sprintf("/w/out/%d.md", i)
-		at := t0.Add(time.Duration(i) * time.Hour)
-		evs = append(evs, g.pair(session, "read_file", fmt.Sprintf(`{"target_file":%q}`, p), "Error: "+p+" does not exist. Note: your current working directory is /w.", true, at)...)
-		evs = append(evs, g.pair(session, "run_terminal_command", fmt.Sprintf(`{"command":"cd /w/out && cat > %d.md"}`, i), "", false, at.Add(time.Minute))...)
-	}
-	put(t, st, evs...)
-	if fs, err := (Failures{}).Detect(context.Background(), st, week()); err != nil || len(fs) != 0 {
-		t.Fatalf("found %v, %v", signatures(fs), err)
 	}
 }
 

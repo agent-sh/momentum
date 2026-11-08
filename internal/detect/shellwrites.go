@@ -15,8 +15,12 @@ import (
 const readSettle = time.Hour
 
 // writtenPaths are the files a call that did not fail wrote, as it names them: a file tool's path, or the one file a
-// shell call writes in a form the whitelist holds (shellWrite), its result's text read too.
+// shell call writes in a form the whitelist holds (shellWrite), its result's text read too. A Grok call writes none:
+// Grok is closed source, so there is no source to check its background forms and its success words against.
 func writtenPaths(harness, tool, call, result, cwd string) []string {
+	if harness == "grok" {
+		return nil
+	}
 	if bashShell(tool) {
 		if p := shellWrite(harness, call, result, shellDir(harness, call, cwd)); p != "" {
 			return []string{p}
@@ -24,25 +28,39 @@ func writtenPaths(harness, tool, call, result, cwd string) []string {
 		return nil
 	}
 	if strings.EqualFold(tool, "apply_patch") || strings.EqualFold(tool, "patch") && harness == "opencode" {
-		var out []string
-		for _, m := range patchFileRe.FindAllStringSubmatch(call, -1) {
-			if m[1] == "Update" && m[3] != "" { // a file moved: written under its new name
-				out = append(out, m[3])
-			} else {
-				out = append(out, m[2])
-			}
-		}
-		return out
+		return patchFiles(call)
 	}
 	if strings.EqualFold(tool, "patch") { // Hermes's: OpenCode's is read above
 		if mode, _, _ := callField(call, modeKeys); mode == "patch" { // its files are only in its patch text
 			return nil
 		}
 	}
-	if p, _, _ := callField(call, pathKeys); p != "" {
+	// Hermes resolves a relative path in its terminal's directory, which a cd moves: only a whole one names its file
+	if p, _, _ := callField(call, pathKeys); p != "" && (harness != "hermes" || path.IsAbs(p)) {
 		return []string{p}
 	}
 	return nil
+}
+
+// patchFiles are the files a patch's text adds or updates, by its headers at a line's start, each path to its line's
+// end and trimmed, as Codex's and OpenCode's parsers read it: an Update's Move to gives the file's new name, and a
+// Delete File writes nothing. A JSON call keeps its text's line breaks as escapes. The store folds a raw text onto
+// one line, so there only its first header is read, right after the patch's opening line, and its path ends where the
+// patch's next line begins (patchFoldedRe).
+func patchFiles(call string) []string {
+	text, re := strings.ReplaceAll(call, `\n`, "\n"), patchLineRe
+	if !strings.Contains(text, "\n") {
+		re = patchFoldedRe
+	}
+	var out []string
+	for _, m := range re.FindAllStringSubmatch(text, -1) {
+		p := m[2]
+		if m[1] == "Update" && m[3] != "" { // a file moved: written under its new name
+			p = m[3]
+		}
+		out = append(out, strings.TrimSpace(p))
+	}
+	return out
 }
 
 // bashShell says a shell tool runs its command in bash or a shell like it, whose words the whitelist reads: not
@@ -52,8 +70,8 @@ func bashShell(tool string) bool {
 }
 
 // workdirKeys are the fields of a shell call's input that name the directory it runs its command in, as capacity
-// reads them.
-var workdirKeys = map[string]bool{"workdir": true, "cwd": true, "working_directory": true, "workingDirectory": true, "dir": true, "directory": true}
+// reads them, but Grok's working_directory: a Grok call writes nothing.
+var workdirKeys = map[string]bool{"workdir": true, "cwd": true, "workingDirectory": true, "dir": true, "directory": true}
 
 // workdirShells are the harnesses whose shell call can name its directory (Codex's and OpenCode's workdir, Kimi's
 // cwd, and a cwd an extension adds to pi's bash, which itself takes only command and timeout): a call of theirs the
@@ -62,8 +80,8 @@ var workdirShells = map[string]bool{"codex": true, "opencode": true, "kimi": tru
 
 // shellDir is the directory a shell call runs its command in, as far as the store says, or "" when it does not say:
 // the workdir the call names, when that is a whole path; else the directory its session was in when it made the
-// call. Hermes's and Grok's terminals keep a directory of their own from call to call, which their record does not
-// hold, so only a workdir or a leading cd says where theirs is.
+// call. Hermes's terminal keeps a directory of its own from call to call, which its record does not hold, so only a
+// workdir or a leading cd says where it is.
 func shellDir(harness, call, cwd string) string {
 	w, named, absent := callField(call, workdirKeys)
 	switch {
@@ -72,7 +90,7 @@ func shellDir(harness, call, cwd string) string {
 			return w
 		}
 		return ""
-	case harness == "hermes", harness == "grok", !absent && workdirShells[harness], !path.IsAbs(cwd):
+	case harness == "hermes", !absent && workdirShells[harness], !path.IsAbs(cwd):
 		return ""
 	}
 	return cwd
@@ -80,15 +98,13 @@ func shellDir(harness, call, cwd string) string {
 
 var (
 	// backgroundKeys are each harness's shell call fields that launch its command in the background, as its source
-	// names them: Claude Code's and Kimi's run_in_background, Hermes's and OpenCode's background, Grok's
-	// is_background. Codex has none (its command goes on when the call yields, and its result has no exit code),
-	// nor has pi's bash.
+	// names them: Claude Code's and Kimi's run_in_background, Hermes's and OpenCode's background. Codex has none (its
+	// command goes on when the call yields, and its result has no exit code), nor has pi's bash.
 	backgroundKeys = map[string]map[string]bool{
 		"claude":   {"run_in_background": true},
 		"kimi":     {"run_in_background": true},
 		"hermes":   {"background": true},
 		"opencode": {"background": true},
-		"grok":     {"is_background": true},
 	}
 	// backgroundWords are each harness's words for a launch it did not wait for, as its source writes them, whose
 	// success says nothing of the command.
@@ -97,15 +113,15 @@ var (
 			`manually backgrounded by user with ID: `),
 		"hermes":   regexp.MustCompile(`Background process started|"status": ?"yielded_to_background"|tracked background process`),
 		"kimi":     regexp.MustCompile(`^task_id: |automatic_notification: true`),
-		"grok":     regexp.MustCompile(`Background command started successfully\.|automatically moved to background|Process is still running`),
 		"opencode": regexp.MustCompile(`Command moved to the background \(shell ID: `),
 	}
-	// blockKeys are Grok's field for how long its shell waits: 0 starts the command in the background.
-	blockKeys = map[string]bool{"block_until_ms": true}
-	// exitRe is the exit code a Codex result reports once its command has ended; one still running reports none.
+	// exitRe is the exit code a Codex result reports in its header once its command has ended; one still running
+	// reports none.
 	exitRe = regexp.MustCompile(`(?i)(?:process|command) exited with code -?\d+|exit code:? -?\d+`)
-	// openErrRe is an error opening a file for writing.
-	openErrRe = regexp.MustCompile(`(?i)no such file or directory|not a directory|is a directory|permission denied|read-only file system|cannot create|no space left`)
+	// openErrRe is an error opening a file for writing, noclobber's refusal too.
+	openErrRe = regexp.MustCompile(`(?i)no such file or directory|not a directory|is a directory|permission denied|read-only file system|` +
+		`cannot create|no space left|operation not permitted|disk quota exceeded|file name too long|too many levels of symbolic links|` +
+		`cannot overwrite existing file`)
 )
 
 // shellWrite is the one file a shell call writes, or "". Only a form the whitelist holds counts, so any other line,
@@ -152,8 +168,8 @@ func shellWrite(harness, call, result, dir string) string {
 }
 
 // background says a shell call launched its command in the background, by its harness's own signals (backgroundKeys,
-// backgroundWords, Grok's block_until_ms of 0, a Codex result with no exit code): its result says nothing of the
-// command's end.
+// backgroundWords, a Codex result with no exit code in its header, before Output, as toolresult reads it: the
+// command's own output may print one): its result says nothing of the command's end.
 func background(harness, call, result string) bool {
 	if keys := backgroundKeys[harness]; keys != nil {
 		if v, _, _ := callValue(call, keys); string(v) == "true" {
@@ -163,10 +179,8 @@ func background(harness, call, result string) bool {
 	if re := backgroundWords[harness]; re != nil && re.MatchString(result) {
 		return true
 	}
-	if v, _, _ := callValue(call, blockKeys); harness == "grok" && string(v) == "0" {
-		return true
-	}
-	return harness == "codex" && !exitRe.MatchString(result)
+	header, _, _ := strings.Cut(result, "Output:")
+	return harness == "codex" && !exitRe.MatchString(header)
 }
 
 // dotdot says a path climbs out of a directory: through a symbolic link, .. is not where its text says.

@@ -163,8 +163,6 @@ var fileWrites = map[string]*regexp.Regexp{
 	"opencode/patch":       patchApplied,
 	"pi/write":             regexp.MustCompile(`^Successfully wrote (?:\d+ bytes )?to `),
 	"pi/edit":              regexp.MustCompile(`^Successfully replaced (?:text|\d+ block\(s\)) in `),
-	"grok/write":           grokWrote,
-	"grok/search_replace":  grokWrote,
 	"codex/apply_patch":    regexp.MustCompile(`^(?:Exit code: 0|Process exited with code 0)\b.*\bSuccess\. Updated the following files:`),
 }
 
@@ -173,18 +171,16 @@ var (
 	claudeWrote = regexp.MustCompile(`^(?:File created successfully at: |The file \S.* has been updated(?: successfully)?\.)`)
 	// patchApplied is a patch that applied: OpenCode's apply_patch and patch.
 	patchApplied = regexp.MustCompile(`^Success\. Updated the following files:`)
-	// grokWrote is Grok's write and search_replace: the edits it applied, by the file's whole path.
-	grokWrote = regexp.MustCompile(`^\{"EditsApplied":\{"absolute_path":`)
 	// hermesErrorKeyRe is a Hermes result's error field, its value after it; hermesNoChangeRe a patch that wrote
 	// nothing.
 	hermesErrorKeyRe = regexp.MustCompile(`"error": ?`)
 	hermesNoChangeRe = regexp.MustCompile(`"no_change": ?true`)
-	// patchFileRe is a patch's header for a file it adds or updates, at a line's start (the text's start, a line break,
-	// an escaped one inside JSON, or right after the patch's opening line in a text the store folded onto one line),
-	// with the new name an Update's Move to gives: each path up to a space, an escape or a quote. A Delete File
-	// header writes nothing.
-	patchFileRe = regexp.MustCompile(`(?:^|\n|\\n|\*\*\* Begin Patch )\*\*\* (Add|Update) File: ([^\s\\"]+)` +
-		`(?:(?:\\n|\n| )\*\*\* Move to: ([^\s\\"]+))?`)
+	// patchLineRe is a patch's header for a file it adds or updates, at a line's start, with the Move to line after
+	// it, each path to its line's end; patchFoldedRe the same at the start of a text the store folded onto one line,
+	// after its opening line, each path up to where the patch's next line begins (another header or its end, a line it
+	// adds or removes, a chunk's @@).
+	patchLineRe   = regexp.MustCompile(`(?m)^\*\*\* (Add|Update) File: *(\S.*)$(?:\n\*\*\* Move to: *(\S.*)$)?`)
+	patchFoldedRe = regexp.MustCompile(`^(?:\*\*\* Begin Patch )?\*\*\* (Add|Update) File: (\S.*?)(?: \*\*\* Move to: (\S.*?))?(?: \*\*\*| \+| -| @@)`)
 )
 
 // fileWrote says a file tool's result is its harness's own word for a write that landed (fileWrites), and, for
@@ -212,7 +208,7 @@ var modeKeys = map[string]bool{"mode": true}
 var notFoundRe = regexp.MustCompile(`(?i)\bdoes not exist\b|\b(?:file|path) not found\b|no such file or directory|\benoent\b`)
 
 // pathKeys are the fields of a file tool's input that name its file.
-var pathKeys = map[string]bool{"file_path": true, "filePath": true, "path": true, "target_file": true}
+var pathKeys = map[string]bool{"file_path": true, "filePath": true, "path": true}
 
 // notFound says a failure keyed k is a read tool's own error that no file is at its path.
 func notFound(tool, text string, k FailureKey) bool {
