@@ -1176,9 +1176,10 @@ func stopRuns(ctx context.Context, st *store.Store, c store.Case) (runs []store.
 		return nil, false, nil
 	}
 	// an agent's failure, or another step's, compares with the newest run before it that started: a build that failed
-	// at a host stage before its agent (which the rule counts on its own stage) says nothing of the agent
+	// at a host stage before its agent (which the rule counts on its own stage) says nothing of the agent. An
+	// investigation whose harness never started compares with the newest run before it, started or not.
 	for _, b := range runs[1:] {
-		if b.Started.IsZero() {
+		if b.Started.IsZero() && !a.Started.IsZero() {
 			continue
 		}
 		if b.Status == store.RunOK || a.Failure != b.Failure || a.Step != b.Step {
@@ -1190,8 +1191,9 @@ func stopRuns(ctx context.Context, st *store.Store, c store.Case) (runs []store.
 }
 
 // stopCounts says the stop rule counts a run: one that started and ended (a refusal of the budgets is no run, nor is
-// one still running), or a build that failed at a host stage before its agent started (its inputs, a toolchain that
-// is gone, a harness that does not start), which is kept at no cost and with no start, so nothing else bounds it.
+// one still running), or one that failed at the host's hand before its agent started, which is kept at no cost and
+// with no start, so nothing else bounds it: a build at a host stage (its inputs, a toolchain that is gone, a harness
+// that does not start), or an investigation whose harness never started (run).
 func stopCounts(run store.LoopRun) bool {
 	switch {
 	case run.Status == store.RunRefused || run.Status == store.RunRunning || run.Failure == "sandbox":
@@ -1200,21 +1202,23 @@ func stopCounts(run store.LoopRun) bool {
 		return false
 	case run.Started.IsZero():
 		// a build that never started counts at a host stage, or for a host error at a refusal stage (a capacity gate
-		// that cannot run, before the agent)
-		return run.Step == StepBuild && run.Status == store.RunFailed && (slices.Contains(hostStages, run.Failure) || run.Cause == hostCause)
+		// that cannot run, before the agent); an investigation for the error that kept its harness from starting
+		return run.Status == store.RunFailed && (run.Step == StepBuild && (slices.Contains(hostStages, run.Failure) || run.Cause == hostCause) ||
+			run.Step == StepInvestigate && run.Failure == "run")
 	}
 	return true
 }
 
-// oldBrokerText is how a build kept before the broker's outage had its own key (broker) told a broker env file that
-// could not be read, at build run.
-var oldBrokerText = regexp.MustCompile(`build run: no Bedrock route: the broker's env file (?:\S+ )?cannot be read`)
+// oldBrokerText is how a run kept before the broker's outage had its own key (broker) told a broker env file that
+// could not be read: a build's at build run, an investigation's as its error.
+var oldBrokerText = regexp.MustCompile(`no Bedrock route: the broker's env file (?:\S+ )?cannot be read`)
 
-// oldBrokerOutage says a build that never started was kept, before the broker's outage had its own key, for a broker
-// env file that could not be read: this build keeps such a run as the broker's, which the stop rule does not count,
-// so it does not count the old ones either.
+// oldBrokerOutage says a run that never started was kept, before the broker's outage had its own key, for a broker
+// env file that could not be read: a build at build run, an investigation as run. This build keeps such a run as the
+// broker's, which the stop rule does not count, so it does not count the old ones either.
 func oldBrokerOutage(run store.LoopRun) bool {
-	return run.Step == StepBuild && run.Failure == "build run" && run.Cause == "" && oldBrokerText.MatchString(run.Summary)
+	kept := run.Step == StepBuild && run.Failure == "build run" && run.Cause == "" || run.Step == StepInvestigate && run.Failure == "run"
+	return kept && oldBrokerText.MatchString(run.Summary)
 }
 
 // runAt is when a run counts for the stop rule: its start, or its end for one that never started.

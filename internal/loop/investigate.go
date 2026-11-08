@@ -105,6 +105,11 @@ func (r *Runner) investigate(ctx context.Context, c store.Case, run store.LoopRu
 		MaxTurns: r.Budgets.MaxTurns, BudgetUSD: r.Budgets.Run, Timeout: r.Budgets.RunTime, Binds: binds}
 	res, err := r.Agent.RunOrFallback(ctx, inv)
 	res.InputSummary = manifest.Summary()
+	if brokerOutage(res, err) {
+		// the broker could not be reached before the run started: the broker's, which the stop rule does not count
+		res.Status, res.Failure, res.Text = store.RunFailed, "broker", "broker: "+err.Error()
+		return res, nil
+	}
 	return res, err
 }
 

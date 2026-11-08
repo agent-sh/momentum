@@ -2000,3 +2000,77 @@ sleep 3
 		t.Fatalf("the investigation beside the released build: %+v, cost %+v, %v", runs, got.Cost, err)
 	}
 }
+
+// An investigation whose harness never starts (here its route is wrong) is kept at no cost and with no start, so
+// nothing else bounds it: two of them stop the case on their key alone, as two builds that never started do.
+func TestAnInvestigationThatNeverStartsStops(t *testing.T) {
+	fakeManager(t) // host ordering only: the run ends before its harness or a unit starts
+	ctx := context.Background()
+	r, c := inputRunner(t)
+	wrong := filepath.Join(t.TempDir(), "bedrock.env")
+	write(t, wrong, "CLAUDE_CODE_USE_BEDROCK=\"0\"\n")
+	r.Agent = Agent{Runner: []string{script(t, t.TempDir(), "harness", "exit 9")}, Model: "global.anthropic.claude-opus-5-5", Bedrock: &Bedrock{File: wrong}}
+	for i := 0; i < 2; i++ {
+		done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
+		if err != nil || len(done) != 1 || done[0].Run.Step != StepInvestigate || done[0].Run.Failure != "run" || done[0].Run.USD != 0 || !done[0].Run.Started.IsZero() {
+			t.Fatalf("investigation %d did not fail before its harness started: %+v %v", i, done, err)
+		}
+	}
+	done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
+	if err != nil || len(done) != 1 || done[0].Run.ID != "" || !strings.Contains(done[0].Skipped, "stopped: its last two investigate runs failed the same way: run") {
+		t.Fatalf("two investigations that never started did not stop the case: %+v %v", done, err)
+	}
+	cs, err := r.Store.Cases(ctx, store.CaseFilter{Family: store.HealthFamily})
+	if err != nil || len(cs) != 1 || !slices.Equal(cs[0].Signatures, []string{"component-health/v1:loop:investigate:run"}) || cs[0].Evidence != 2 {
+		t.Fatalf("the stop's component-health case: %+v %v", cs, err)
+	}
+}
+
+// An investigation whose broker cannot be reached before it starts is the broker's, which the stop rule does not
+// count, and so is one kept before that had its key, as run with that text: the case is investigated again.
+func TestAnInvestigationWithNoBrokerIsTheBrokers(t *testing.T) {
+	fakeManager(t) // host ordering only: the run ends before its harness or a unit starts
+	ctx := context.Background()
+	r, c := inputRunner(t)
+	r.Agent = Agent{Runner: []string{script(t, t.TempDir(), "harness", "exit 9")}, Model: "global.anthropic.claude-opus-5-5",
+		Bedrock: &Bedrock{File: filepath.Join(t.TempDir(), "absent.env")}}
+	for i := 0; i < 3; i++ {
+		done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
+		if err != nil || len(done) != 1 || done[0].Skipped != "" || done[0].Run.Step != StepInvestigate || done[0].Run.Failure != "broker" || done[0].Run.USD != 0 {
+			t.Fatalf("investigation %d with no broker: %+v %v", i, done, err)
+		}
+	}
+	if cs, err := r.Store.Cases(ctx, store.CaseFilter{Family: store.HealthFamily}); err != nil || len(cs) != 0 {
+		t.Fatalf("investigations with no broker filed a stop: %+v %v", cs, err)
+	}
+	old := openCase(t, r.Store, "failures", "old broker", 1)
+	base := time.Now().Add(-time.Hour)
+	for i := 0; i < 2; i++ {
+		if err := r.Store.PutLoopRun(ctx, store.LoopRun{ID: fmt.Sprint("ob", i), Case: old.ID, Family: old.Family, Step: StepInvestigate,
+			Ended: base.Add(time.Duration(i) * time.Minute), Status: store.RunFailed, Failure: "run",
+			Summary: "inputs: 1 file\nno Bedrock route: the broker's env file /x/bedrock.env cannot be read (no such file or directory)"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if why, err := r.stopped(ctx, old, true); err != nil || why != "" {
+		t.Fatalf("two old broker outages of an investigation stopped the case: %q %v", why, err)
+	}
+}
+
+// An investigation that never started says nothing of the agent: two agent failures around it still stop the case.
+func TestAnInvestigationThatNeverStartedDoesNotSplitTwoAgentFailures(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "turns", 1)
+	base := time.Now().Add(-time.Hour)
+	putBuild(t, st, c, "i1", StepInvestigate, store.RunTurns, "turns", "", "turns", base)
+	if err := st.PutLoopRun(ctx, store.LoopRun{ID: "i2", Case: c.ID, Family: c.Family, Step: StepInvestigate, Ended: base.Add(time.Minute),
+		Status: store.RunFailed, Failure: "run", Summary: "no runner: set loop.runner in sources.json"}); err != nil {
+		t.Fatal(err)
+	}
+	putBuild(t, st, c, "i3", StepInvestigate, store.RunTurns, "turns", "", "turns", base.Add(2*time.Minute))
+	if why, err := r.stopped(ctx, c, true); err != nil || why != "its last two investigate runs failed the same way: turns" {
+		t.Fatalf("two agent failures with an investigation that never started between: %q %v", why, err)
+	}
+}
