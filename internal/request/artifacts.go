@@ -126,19 +126,19 @@ func artifactsOf(call, res store.Event, d Decoded, mk makes, sessions map[sessio
 			if c.Plain {
 				mk.pushes, mk.prs = false, false // no exit code shows: only a commit line, which git prints when it made it
 			}
-			for _, r := range shown(c.Output, failed || c.Failed, mk, once) {
+			for _, r := range shown(c.Output, c.OutputCut, failed || c.Failed, mk, once) {
 				add(r)
 			}
 		}
 		for _, p := range d.Polls {
 			if s, ok := sessions[sessionKey{agentOf(call), p.Session}]; ok {
-				for _, r := range shown(p.Output, failed || p.Failed, made(Decoded{Commands: []string{s.cmd}, CommandCut: s.cut}), once) {
+				for _, r := range shown(p.Output, p.OutputCut, failed || p.Failed, made(Decoded{Commands: []string{s.cmd}, CommandCut: s.cut}), once) {
 					add(r)
 				}
 			}
 		}
 	default:
-		for _, r := range shown(d.Output, failed, mk, once) {
+		for _, r := range shown(d.Output, d.OutputCut, failed, mk, once) {
 			add(r)
 		}
 	}
@@ -146,16 +146,18 @@ func artifactsOf(call, res store.Event, d Decoded, mk makes, sessions map[sessio
 }
 
 // shown are the artifacts a text with its lines shows, of commands that make what mk says: the commit lines, in a
-// failed result too, the ref lines of a push's blocks and the addresses gh pr create printed.
-func shown(text string, failed bool, mk makes, once string) []Result {
+// failed result too, the ref lines of a push's blocks and the addresses gh pr create printed. cut is a text the
+// store cut where it ends.
+func shown(text string, cut, failed bool, mk makes, once string) []Result {
 	var out []Result
 	if mk.commits {
 		for _, c := range commitRe.FindAllStringSubmatchIndex(text, -1) {
 			hash, branch := text[c[4]:c[5]], text[c[2]:c[3]]
 			r := Result{Kind: KindCommit, Key: KindCommit + ":" + hash, Text: fmt.Sprintf("commit %s on %s", hash, branch)}
-			// the subject is the rest of its line
-			rest, _, _ := strings.Cut(text[c[1]:], "\n")
-			if s := strings.TrimSpace(rest); s != "" {
+			// the subject is the rest of its line, left out when the line runs to the end of a text the store cut:
+			// what is left of it is shortened
+			rest, _, ended := strings.Cut(text[c[1]:], "\n")
+			if s := strings.TrimSpace(rest); s != "" && (ended || !cut) {
 				r.Text += ": " + s
 			}
 			out = append(out, r)

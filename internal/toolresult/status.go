@@ -104,14 +104,19 @@ func WriteFailed(text string, flagged bool) bool {
 }
 
 // EnvelopeFailed reads a known native result wrapper, not file or tool content. A wrapper that parses is read by
-// its top-level fields alone (a nested lint's "status": "error" is no failure of the call); one the store cut is
-// read by the same marks, in its top level only, with its nested objects and arrays passed over.
+// its top-level fields alone (a nested lint's "status": "error" is no failure of the call), and by the exit code
+// in its own metadata object, where Codex's exec_command keeps it; one the store cut is read by the same marks, in
+// its top level and its metadata only, with its other nested objects and arrays passed over.
 func EnvelopeFailed(text string) bool {
 	if !strings.HasPrefix(text, "{") {
 		return false
 	}
 	var obj map[string]json.RawMessage
 	if json.Unmarshal([]byte(text), &obj) == nil {
+		var meta map[string]json.RawMessage
+		if json.Unmarshal(obj["metadata"], &meta) == nil && exitFailed(meta) {
+			return true
+		}
 		return fieldsFailed(obj)
 	}
 	// A store summary can end before the JSON does.
@@ -119,7 +124,20 @@ func EnvelopeFailed(text string) bool {
 	if m := jsonExit.FindStringSubmatch(top); m != nil {
 		return m[1] != "0"
 	}
+	if m := jsonExit.FindStringSubmatch(topLevel(member(text, "metadata"))); m != nil {
+		return m[1] != "0"
+	}
 	return jsonStatus.MatchString(top) || jsonFlag.MatchString(top) || jsonError.MatchString(top)
+}
+
+// exitFailed reports a non-zero exit code among a parsed object's fields.
+func exitFailed(obj map[string]json.RawMessage) bool {
+	for _, key := range []string{"exit_code", "exitCode"} {
+		if v := string(obj[key]); v != "" && v != "0" && v != "null" {
+			return true
+		}
+	}
+	return false
 }
 
 // fieldsFailed reads a parsed wrapper's top-level fields: an error flag, an error, a failed status, success or ok
@@ -142,12 +160,7 @@ func fieldsFailed(obj map[string]json.RawMessage) bool {
 	if string(obj["success"]) == "false" || string(obj["ok"]) == "false" {
 		return true
 	}
-	for _, key := range []string{"exit_code", "exitCode"} {
-		if v := string(obj[key]); v != "" && v != "0" && v != "null" {
-			return true
-		}
-	}
-	return false
+	return exitFailed(obj)
 }
 
 // topLevel is a JSON object's text with what its nested objects and arrays hold left out: its own keys and
@@ -184,6 +197,47 @@ func topLevel(text string) string {
 		}
 	}
 	return b.String()
+}
+
+// member is the text of a JSON object's top-level member key whose value is an object, to its end or to the end of
+// a text cut inside it; "" when there is none.
+func member(text, key string) string {
+	depth, inString, escaped := 0, false, false
+	last, name, start := 0, "", -1
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		switch {
+		case inString:
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inString = false
+				if depth == 1 {
+					name = text[last+1 : i]
+				}
+			}
+		case c == '"':
+			inString, last = true, i
+		case c == ',' && depth == 1:
+			name = ""
+		case c == '{' || c == '[':
+			depth++
+			if depth == 2 && c == '{' && name == key {
+				start = i
+			}
+		case c == '}' || c == ']':
+			depth--
+			if depth == 1 && start >= 0 {
+				return text[start : i+1]
+			}
+		}
+	}
+	if start >= 0 {
+		return text[start:]
+	}
+	return ""
 }
 
 func IsShell(tool string) bool {

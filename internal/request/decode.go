@@ -16,6 +16,9 @@ type Decoded struct {
 	Output     string
 	Paths      []string
 	CommandCut bool // the store cut the last command: what it ran last may have had more arguments
+	// OutputCut is an output whose text the store cut where it ends, its last line perhaps shortened: one it keeps
+	// as JSON (Hermes); a plain text the store keeps has its lines joined, so nothing is read off it anyway
+	OutputCut bool
 	// Joined is an output the store keeps as plain text with its lines flattened to spaces: where a line ends is
 	// not known, so nothing is read off it (a whole read gives its lines)
 	Joined bool
@@ -35,6 +38,7 @@ type Chunk struct {
 	Failed, Running bool
 	Session         int64
 	Cut             bool
+	OutputCut       bool // the store cut its output where its text ends (a code-mode result's JSON)
 	// Index and Polled are what the script printed with the result, when it did: its call's place in a
 	// Promise.all array ("i"), or the session a poll named ("id"); -1 when none
 	Index  int
@@ -345,6 +349,7 @@ func Decode(harness, tool, input, output string) Decoded {
 		for _, f := range fields(output, `"`, false) {
 			if outputKeys[f.key] && !f.list && len(f.values) > 0 {
 				outs = append(outs, uncut(f.values[0], f.cut))
+				d.OutputCut = f.cut // a field the cut ends is the last the store kept
 			}
 		}
 		d.Output = strings.Join(outs, "\n")
@@ -403,8 +408,9 @@ func codeChunks(output string) []Chunk {
 		start := strings.LastIndexByte(output[:j], '{')
 		if start == obj && len(out) > 0 {
 			out[len(out)-1].Output += "\n" + uncut(text, !closed)
+			out[len(out)-1].OutputCut = !closed
 		} else {
-			c := Chunk{Output: uncut(text, !closed), Index: -1, Polled: -1}
+			c := Chunk{Output: uncut(text, !closed), OutputCut: !closed, Index: -1, Polled: -1}
 			// what the script printed with the result, from the previous result to this one's output
 			for _, m := range carriedRe.FindAllStringSubmatch(output[last:j], -1) {
 				if m[1] == "i" {

@@ -180,10 +180,14 @@ const (
 	sameTurn = 2 * time.Minute // the same words again in a thread this soon, nothing of the agent's between: one turn recorded twice
 )
 
-// markerRe finds a handoff's id line, `momentum request ID`; idRe is an id alone.
+// openRe and lastRe find a handoff's own id lines: its opening line, `momentum request ID - a handoff of the
+// owner's request`, which survives the store's cut of a long paste, and its last line, `momentum request ID` at the
+// end of the text. An id the owner's prose names (`see the momentum request ID thread`) is neither. idRe is an id
+// alone.
 var (
-	markerRe = regexp.MustCompile(`\bmomentum request (r[0-9a-z]{6,12}[0-9a-f]{4})\b`)
-	idRe     = regexp.MustCompile(`^r[0-9a-z]{6,12}[0-9a-f]{4}$`)
+	openRe = regexp.MustCompile(`\bmomentum request (r[0-9a-z]{6,12}[0-9a-f]{4}) - a handoff of the owner's request\b`)
+	lastRe = regexp.MustCompile(`\bmomentum request (r[0-9a-z]{6,12}[0-9a-f]{4})\s*$`)
+	idRe   = regexp.MustCompile(`^r[0-9a-z]{6,12}[0-9a-f]{4}$`)
 )
 
 // ID is a request's id for an opening turn at at with words: r, the time in milliseconds in base 36, and four hex
@@ -212,7 +216,10 @@ func ParseID(id string) (time.Time, bool) {
 // the first id line to the end of the last, or to the end of a text the store cut (it ends with an ellipsis) when
 // only one line is left.
 func marker(text string) (id, rest string) {
-	locs := markerRe.FindAllStringSubmatchIndex(text, -1)
+	locs := openRe.FindAllStringSubmatchIndex(text, -1)
+	if l := lastRe.FindStringSubmatchIndex(text); l != nil {
+		locs = append(locs, l)
+	}
 	for _, l := range locs {
 		if c := text[l[2]:l[3]]; validID(c) {
 			id = c

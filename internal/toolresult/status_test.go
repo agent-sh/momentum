@@ -81,6 +81,12 @@ func TestAnEnvelopeIsReadByItsTopLevel(t *testing.T) {
 		{`{"output": "done", "exit_code": 1, "error": null}`, true},
 		{`{"output": "done", "exit_code": 0, "error": null}`, false},
 		{`{"error": {"code": -32603, "message": "permission denied"}}`, true},
+		// Codex's exec_command keeps its exit code in its own metadata; another nested object's is the program's
+		{`{"output": "cat: x: No such file", "metadata": {"exit_code": 1, "duration_seconds": 0.1}}`, true},
+		{`{"output": "ok", "metadata": {"exit_code": 0}}`, false},
+		{`{"output": "ok", "result": {"exit_code": 1}}`, false},
+		{`{"output": "cat: x: No such file", "metadata": {"exit_code": 1, "durat…`, true},
+		{`{"output": "a \"metadata\": {\"exit_code\": 1}", "metadata": {"exit_code": 0, "dur…`, false},
 		// cut: a nested object's marks are passed over, the top level's read
 		{`{"bytes_written": 120, "lint": {"status": "error", "output": "SyntaxErr…`, false},
 		{`{"success": false, "error": "Could not find a match for old_str…`, true},

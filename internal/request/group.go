@@ -229,6 +229,15 @@ func fill(u sets, reqs map[string]*Request, t *thread) {
 		if rq == nil || tn.program && tn.marker == "" || tn.at.Before(rq.start()) {
 			continue
 		}
+		words := tn.words
+		if tn.program {
+			words = "" // a program's words are not his, though the handoff it pasted links
+		}
+		// The same words again soon, with no reply between, are one turn the transcript holds twice: the copy is no
+		// later turn of the request's.
+		if prev != nil && prev.Words == words && prev.Handoff == tn.marker && tn.at.Sub(prev.At) <= sameTurn && !t.repliedBetween(prev.At, tn.at) {
+			continue
+		}
 		if tn.at.After(rq.LastTurn) {
 			rq.LastTurn = tn.at
 		}
@@ -238,15 +247,7 @@ func fill(u sets, reqs map[string]*Request, t *thread) {
 		if th := thread(rq); th != nil && tn.at.After(th.turn) {
 			th.turn = tn.at
 		}
-		words := tn.words
-		if tn.program {
-			words = "" // a program's words are not his, though the handoff it pasted links
-		}
 		if words == "" && tn.marker == "" {
-			continue
-		}
-		// The same words again soon, with no reply between, are one turn the transcript holds twice.
-		if prev != nil && prev.Words == words && prev.Handoff == tn.marker && tn.at.Sub(prev.At) <= sameTurn && !t.repliedBetween(prev.At, tn.at) {
 			continue
 		}
 		rq.Asks = append(rq.Asks, Ask{At: tn.at, Thread: t.id, Harness: t.harness, Words: words, Event: tn.ev.ID(), Handoff: tn.marker})

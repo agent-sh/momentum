@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/store"
+	"github.com/agent-sh/momentum/internal/supervise"
 	"github.com/agent-sh/momentum/sessions"
 	stamp "github.com/agent-sh/momentum/sessions/state"
 )
@@ -37,6 +38,9 @@ func TestOnlyHisOwnAskReopensHisCheck(t *testing.T) {
 		{"a brief that pastes the handoff", func(f *fixture, id string) {
 			f.event("s2", "", "agent_text", store.ActorAgent, at(4), Line(id)+" - a handoff of the owner's request\nAsked: fix the parser", map[string]any{"why": "agent cwd"})
 			f.phase("s2", at(5), "phase", "idle", nil)
+		}},
+		{"a program's turn that pastes the handoff", func(f *fixture, id string) {
+			f.owner("s1", at(4), supervise.Marker+" "+Line(id)+" - a handoff of the owner's request Asked: fix the parser "+Line(id))
 		}},
 		{"a harness command", func(f *fixture, id string) { f.owner("s1", at(4), "/compact") }},
 		{"a harness command with arguments", func(f *fixture, id string) { f.owner("s1", at(4), "/model sonnet") }},
