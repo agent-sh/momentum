@@ -181,7 +181,7 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 			"exec:fatal: unable to access Q: could not resolve host: x"},
 		{"codex", "shell", "Exit code: 1 Wall time: 0.2 seconds Output: connection refused", "exec:connection refused"},
 		{"codex", "exec_command", "Chunk ID: 1a Wall time: 0.1 seconds Process exited with code 1 Original token count: 3 Output: connection refused", "exec:connection refused"},
-		{"pi", "bash_output", "ls: cannot access 'a.txt': No such file or directory", "exec:ls: cannot access Q: no such file or directory"},
+		{"pi", "bash_output", "ls: cannot access '/w/a.txt': No such file or directory", "miss:exec:/w/a.txt"},
 		{"codex", "write_stdin", "Chunk ID: 1a Wall time: 1.0 seconds Process exited with code 1 Original token count: 3 Output: cat: a.txt: No such file or directory",
 			"exec:cat: P: no such file or directory"},
 		{"codex", "exec_command", "bash: rgg: command not found", "exec:rgg: command not found"},
@@ -191,17 +191,17 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		{"hermes", "terminal", "bash: rgg: command not found", "exec:rgg: command not found"},
 		// pi's shell, whose results have no header
 		{"pi", "bash", "--- FAIL: TestX (0.00s) x_test.go:9: got 1, want 2 FAIL", ""},
-		{"pi", "bash", "ls: cannot access 'a.txt': No such file or directory", "exec:ls: cannot access Q: no such file or directory"},
+		{"pi", "bash", "ls: cannot access '/w/a.txt': No such file or directory", "miss:exec:/w/a.txt"},
 		// Claude Code's commands, its header off
-		{"claude", "Bash", "Exit code 2 ls: cannot access 'a.txt': No such file or directory", "exec:ls: cannot access Q: no such file or directory"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access '/w/a.txt': No such file or directory", "miss:exec:/w/a.txt"},
 		{"claude", "Bash", "Exit code 7 connection refused", "exec:connection refused"},
 		{"claude", "Bash", "Exit code 1 tail: option used in invalid context -- 2", "exec:tail: option used in invalid context"},
 		{"claude", "Bash", "Exit code 1 === RUN TestX --- PASS (0.00s) dial tcp: connection refused", "exec:tcp: connection refused"},
 		{"claude", "Bash", "Exit code 1 cat: /x/y.txt: No such file or directory", "exec:cat: P: no such file or directory"},
 		{"claude", "Bash", "Exit code 128 fatal: Unable to create '/r/.git/index.lock': File exists.", "exec:fatal: unable to create Q: file exists"},
 		// Node's error code and its message, a mark in a quoted value, a usage line in colour and none
-		{"claude", "Bash", "Exit code 1 Error: ENOENT: no such file or directory, open '/srv/app/a.json'", "exec:error: enoent: no such file or directory"},
-		{"claude", "Bash", "Exit code 2 grep: 'connection refused': No such file or directory", "exec:grep: Q: no such file or directory"},
+		{"claude", "Bash", "Exit code 1 Error: ENOENT: no such file or directory, open '/srv/app/a.json'", "miss:exec:/srv/app/a.json"},
+		{"claude", "Bash", "Exit code 2 grep: '/w/connection refused': No such file or directory", "miss:exec:/w/connection refused"},
 		{"claude", "Bash", "Exit code 1 Traceback (most recent call last): File \"x.py\", line 9, in <module> if \"no module named\" in err: raise", ""},
 		{"claude", "Bash", "Exit code 2 usage: \x1b[1mx-tool\x1b[0m [-h] --repo REPO", "exec:usage: x-tool"},
 		{"claude", "Bash", "Exit code 1 CPU usage: 12.5% memory usage: 40% check failed", ""},
@@ -237,19 +237,19 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 // the call ran (curl's and psql's messages hold more words that end in a colon), else at the name closest before
 // the mark, and ends at the mark with the word after its colon; two programs' messages key apart.
 func TestACommandsFailureIsKeyedByItsMessage(t *testing.T) {
-	ls := "Exit code 2 ls: cannot access 'a.txt': No such file or directory"
+	ls := "Exit code 2 ls: cannot access '/w/a.txt': No such file or directory"
 	for _, set := range []struct {
 		call, want string
 		outs       []string
 	}{
-		{`{"command":"ls -la a.txt"}`, "exec:ls: cannot access Q: no such file or directory", []string{ls,
-			ls + " ls: cannot access 'b.txt': No such file or directory", ls + " /home/u/x",
-			"Exit code 2 ls: cannot access '/home/u/projects/some-project/a-long-directory-name/sub/file.txt': No such file or directory",
-			"Exit code 2 building x step 3: done ls: cannot access 'a.txt': No such file or directory"}},
-		{`{"command":"python3 run.py"}`, "exec:filenotfounderror: [errno N] no such file or directory: Q", []string{
-			"Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: 'data/in.csv'",
-			"Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: 'config'",
-			"Exit code 1 Traceback (most recent call last): File \"run.py\", line 3, in <module> open('config') FileNotFoundError: [Errno 2] No such file or directory: 'config'"}},
+		{`{"command":"ls -la /w/a.txt"}`, "miss:exec:/w/a.txt", []string{ls,
+			ls + " ls: cannot access '/w/b.txt': No such file or directory", ls + " /home/u/x",
+			"Exit code 2 building x step 3: done ls: cannot access '/w/a.txt': No such file or directory"}},
+		{`{"command":"cat a.txt"}`, "exec:cat: P: no such file or directory", []string{"Exit code 1 cat: a.txt: No such file or directory",
+			"Exit code 1 cat: /home/u/projects/some-project/a-long-directory-name/sub/file.txt: No such file or directory"}},
+		{`{"command":"python3 run.py"}`, "miss:exec:/w/config", []string{
+			"Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '/w/config'",
+			"Exit code 1 Traceback (most recent call last): File \"run.py\", line 3, in <module> open('/w/config') FileNotFoundError: [Errno 2] No such file or directory: '/w/config'"}},
 		{`{"command":"curl -s http://localhost:8080/health"}`, "exec:curl: (N) failed to connect to localhost port N after N ms: connection refused", []string{
 			"Exit code 7 curl: (7) Failed to connect to localhost port 8080 after 0 ms: Connection refused",
 			"Exit code 7 curl: (7) Failed to connect to localhost port 9090 after 2 ms: Connection refused"}},
