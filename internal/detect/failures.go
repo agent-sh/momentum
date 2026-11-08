@@ -77,7 +77,7 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 			return gather("failures", occ, r), err
 		}
 		for _, e := range writes {
-			for _, p := range writtenPaths(e.Tool, calls[e.ID()]) {
+			for _, p := range writtenPaths(e.Tool, calls[e.ID()], e.Cwd) {
 				if k := (wrote{e.Session, p}); e.TS.After(written[k]) {
 					written[k] = e.TS
 				}
@@ -89,8 +89,10 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 			if !ok {
 				continue
 			}
-			// a read of a file the session goes on to write found it not there yet: no failure
-			if p, ok := notFoundRead(e.Tool, e.Summary, calls[e.ID()], k); ok && written[wrote{e.Session, p}].After(e.TS) {
+			// a read of a file the session goes on to write found it not there yet: no failure; one younger than the
+			// settle time may have its write still to come
+			if p, ok := notFoundRead(e.Tool, e.Summary, calls[e.ID()], k); ok &&
+				(written[wrote{e.Session, p}].After(e.TS) || e.TS.After(w.Until.Add(-readSettle))) {
 				continue
 			}
 			occ = append(occ, occurrence{sig: signature("failures", k.String()), title: k.Title(), ev: e})
@@ -187,124 +189,6 @@ func callPath(call string) string {
 // wroteFile says a write tool's result that is no failure (toolresult.Failed) did write: a JSON result that
 // says it failed did not.
 func wroteFile(text string) bool { return !toolresult.EnvelopeFailed(strings.TrimSpace(text)) }
-
-// writtenPaths are the files a call that did not fail wrote, as it spells them: a file tool's path, or the files a
-// shell's command sends its output to.
-func writtenPaths(tool, call string) []string {
-	if isShell(tool) {
-		return redirectTargets(call)
-	}
-	if p := callPath(call); p != "" {
-		return []string{p}
-	}
-	return nil
-}
-
-// redirectTargets are the files a shell call's command line sends its output to (> or >>, outside a quoted value),
-// as the line spells them. The line is the command's first, since a here-document's text follows it. A target the
-// shell expands (a variable, a glob, ~) or the store's cut reached is not known, nor is another descriptor's
-// redirect (2>, &>) or a copy of one (>&N) the command's output.
-func redirectTargets(call string) []string {
-	m := callRe.FindStringSubmatch(call)
-	if m == nil {
-		return nil
-	}
-	line, _, whole := strings.Cut(unescapeCut(m[1]), "\n")
-	whole = whole || !strings.HasSuffix(call, "…") // the store marks a cut so
-	var out []string
-	var quote byte
-	for i := 0; i < len(line); i++ {
-		c := line[i]
-		switch {
-		case quote != 0:
-			if c == quote {
-				quote = 0
-			} else if c == '\\' && quote == '"' {
-				i++
-			}
-			continue
-		case c == '\\':
-			i++
-			continue
-		case c == '\'' || c == '"':
-			quote = c
-			continue
-		case c != '>':
-			continue
-		}
-		j := i + 1
-		if j < len(line) && line[j] == '>' {
-			j++
-		}
-		if i > 0 && (line[i-1] == '&' || line[i-1] == '<' || line[i-1] >= '0' && line[i-1] <= '9' && line[i-1] != '1') ||
-			j < len(line) && (line[j] == '&' || line[j] == '(') {
-			i = j - 1
-			continue
-		}
-		if j < len(line) && line[j] == '|' {
-			j++
-		}
-		for j < len(line) && line[j] == ' ' {
-			j++
-		}
-		target, end, ok := shellWord(line, j)
-		i = end - 1
-		if ok && target != "" && (end < len(line) || whole) {
-			out = append(out, target)
-		}
-	}
-	return out
-}
-
-// shellWord is the word of a command line at i, its quotes taken off, where it ends, and false for a word the shell
-// expands: a variable, a command's output, a glob, a leading ~.
-func shellWord(line string, i int) (string, int, bool) {
-	var b strings.Builder
-	ok := i < len(line) && line[i] != '~'
-	for ; i < len(line); i++ {
-		switch c := line[i]; {
-		case c == ' ' || strings.IndexByte(";&|<>()", c) >= 0:
-			return b.String(), i, ok
-		case c == '\'':
-			k := strings.IndexByte(line[i+1:], '\'')
-			if k < 0 {
-				return b.String(), len(line), false
-			}
-			b.WriteString(line[i+1 : i+1+k])
-			i += k + 1
-		case c == '"':
-			k := strings.IndexByte(line[i+1:], '"')
-			if k < 0 {
-				return b.String(), len(line), false
-			}
-			inner := line[i+1 : i+1+k]
-			ok = ok && !strings.ContainsAny(inner, "$`\\")
-			b.WriteString(inner)
-			i += k + 1
-		case c == '\\':
-			if i+1 < len(line) {
-				i++
-				b.WriteByte(line[i])
-			}
-		default:
-			ok = ok && !strings.ContainsRune("$`*?[{", rune(c))
-			b.WriteByte(c)
-		}
-	}
-	return b.String(), len(line), ok
-}
-
-// unescapeCut reads a JSON string's body the store may have cut short, up to where it reads whole: a cut can end it
-// inside an escape.
-func unescapeCut(s string) string {
-	for cut := 0; cut < 8 && cut <= len(s); cut++ {
-		var out string
-		if json.Unmarshal([]byte(`"`+s[:len(s)-cut]+`"`), &out) == nil {
-			return out
-		}
-	}
-	return ""
-}
 
 // callReach is how long before its result a call may have started: a command runs for minutes, a background one for
 // hours.

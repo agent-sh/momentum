@@ -549,6 +549,26 @@ func TestAReadOfAFileItsSessionThenCreatesIsNoFailure(t *testing.T) {
 				f.wrote("s2", "/w/out/c.md", t0), f.readMissing("s2", "/w/out/c.md", t0.Add(time.Minute)),
 				f.readMissing("s3", "/w/out/d.md", t0), f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute)))
 		}, []string{missing + " 3"}},
+		{"a guard refuses the read", func(f *fileTools) []store.Event {
+			refused := func(session, path string, at time.Time) []store.Event {
+				return f.pair(session, "Read", fmt.Sprintf(`{"file_path":%q}`, path), "<tool_use_error>read-guard: path not found in the allowlist</tool_use_error>", true, at)
+			}
+			return slices.Concat(refused("s1", "/w/out/a.md", t0), f.wrote("s1", "/w/out/a.md", t0.Add(time.Minute)),
+				refused("s1", "/w/out/b.md", t0.Add(time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
+				refused("s2", "/w/out/c.md", t0), f.wrote("s2", "/w/out/c.md", t0.Add(time.Minute)),
+				f.readMissing("s3", "/w/out/d.md", t0), f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute)),
+				f.readMissing("s4", "/w/out/e.md", t0), f.wrote("s4", "/w/out/e.md", t0.Add(time.Minute)),
+				f.readMissing("s4", "/w/out/f.md", t0.Add(time.Hour)), f.wrote("s4", "/w/out/f.md", t0.Add(time.Hour+time.Minute)))
+		}, []string{"failures/v2:guard:read-guard:path not found in the allowlist 3"}},
+		{"a tool that only reads names the path", func(f *fileTools) []store.Event {
+			searched := func(session, path string, at time.Time) []store.Event {
+				return f.pair(session, "Grep", fmt.Sprintf(`{"path":%q,"pattern":"x"}`, path), "No matches found", false, at)
+			}
+			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), searched("s1", "/w/out/a.md", t0.Add(time.Minute)),
+				f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)), searched("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
+				f.readMissing("s2", "/w/out/c.md", t0), searched("s2", "/w/out/c.md", t0.Add(time.Minute)),
+				f.readMissing("s3", "/w/out/d.md", t0), f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute)))
+		}, []string{missing + " 3"}},
 		{"another path", func(f *fileTools) []store.Event {
 			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.wrote("s1", "/w/out/./a.md", t0.Add(time.Minute)),
 				f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)), f.wrote("s1", "/w/out/b.md.tmp", t0.Add(time.Hour+time.Minute)),
@@ -623,60 +643,173 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 	}
 }
 
-// A session can create the file it looked for with its shell: a command whose first line sends its output to that
-// path, and did not fail, is its write. What only names the path, writes another descriptor there or does not say
-// which file it writes is none.
-func TestAReadBeforeAShellCreatesTheFile(t *testing.T) {
-	f := fileTools{harness: "kimi"}
-	read := func(session, path string, at time.Time) []store.Event {
-		return f.pair(session, "Read", fmt.Sprintf(`{"path":%q}`, path), fmt.Sprintf("%q does not exist.", path), true, at)
-	}
-	// shell is a Bash call as the store keeps it: JSON with > escaped, cut to 240 bytes and marked so
-	shell := func(session, command string, failed bool, at time.Time) []store.Event {
-		in, _ := json.Marshal(map[string]string{"command": command})
-		if len(in) > 240 {
-			in = append(in[:240], "…"...)
+// shellCall is a Bash call of Kimi's and its result as the store keeps them, in cwd: the input JSON with > escaped,
+// cut to 240 bytes and marked so. An input that is already JSON is kept as it is.
+func shellCall(f *fileTools, session, cwd, command string, failed bool, at time.Time) []store.Event {
+	in := command
+	if !strings.HasPrefix(command, "{") {
+		b, _ := json.Marshal(map[string]string{"command": command})
+		if len(b) > 240 {
+			b = append(b[:240], "…"...)
 		}
-		return f.pair(session, "Bash", string(in), "", failed, at)
+		in = string(b)
 	}
+	evs := f.pair(session, "Bash", in, "", failed, at)
+	for i := range evs {
+		evs[i].Cwd = cwd
+	}
+	return evs
+}
+
+// kimiReadMissing is Kimi's Read of a file that is not there.
+func kimiReadMissing(f *fileTools, session, path string, at time.Time) []store.Event {
+	return f.pair(session, "Read", fmt.Sprintf(`{"path":%q}`, path), fmt.Sprintf("%q does not exist.", path), true, at)
+}
+
+// A session can create the file it looked for with its shell. Each line is spelled so that one clause decides: a
+// write of the read's path, or none. Three reads in two sessions, each followed by the line in its own session, make
+// a finding only when the line writes no file there.
+func TestAShellLineWritesWhatItsCommandReports(t *testing.T) {
 	body := "\n" + strings.Repeat(`{"id":1,"verdict":"keep"}`+"\n", 20) + "EOF"
-	missing := "failures/v2:tool:read:Q does not exist"
+	const x = "/w/out/x.jsonl"
+	for _, tc := range []struct {
+		name, cwd, path, line string
+		failed, writes        bool
+	}{
+		{"a here-document", "", x, "cat > /w/out/x.jsonl <<'EOF'" + body, false, true},
+		{"an append", "", x, "cat >> /w/out/x.jsonl <<'EOF'" + body, false, true},
+		{"after the here-document's word, quoted", "", x, `cat <<'EOF' > "/w/out/x.jsonl"` + body, false, true},
+		{"single quotes", "", x, "cat > '/w/out/x.jsonl'", false, true},
+		{"an escaped letter", "", x, `cat > /w/out/x\.jsonl`, false, true},
+		{"in the call's directory", "/w/out", x, "cat >> x.jsonl <<'EOF'" + body, false, true},
+		{"in the directory the line enters", "/w", x, "cd /w/out && cat > x.jsonl", false, true},
+		{"after a subshell's own cd", "/w/out", x, "(cd /w/elsewhere && make) && cat > x.jsonl", false, true},
+		{"stdout by its number", "", x, "python3 gen.py 1> /w/out/x.jsonl", false, true},
+		{"noclobber's >|", "", x, "python3 gen.py >| /w/out/x.jsonl", false, true},
+		{"both outputs, &>", "", x, "python3 gen.py &> /w/out/x.jsonl", false, true},
+		{"both outputs, &>>", "", x, "python3 gen.py &>> /w/out/x.jsonl", false, true},
+		{"both outputs, >& a file", "", x, "python3 gen.py >& /w/out/x.jsonl", false, true},
+		{"a tab", "", x, "echo x >\t/w/out/x.jsonl", false, true},
+		{"tee", "", x, "python3 gen.py | tee -a /w/out/x.jsonl", false, true},
+		{"tee run by sudo", "", x, "python3 gen.py | sudo tee /w/out/x.jsonl", false, true},
+		{"tee's option", "/w/out", "/w/out/-a", "python3 gen.py | tee -a /w/out/other.jsonl", false, false},
+		{"a continued line", "", x, "python3 gen.py \\\n  > /w/out/x.jsonl", false, true},
+		{"a command on a continued line", "", x, "python3 gen.py && \\\n  tee /w/out/x.jsonl", false, true},
+		{"a word that ends in a digit", "", x, "echo v2> /w/out/x.jsonl", false, true},
+		{"joined by &&", "", x, "cat > /w/out/x.jsonl <<'EOF' && wc -l /w/out/x.jsonl" + body, false, true},
+		{"after a copied descriptor", "", x, "python3 gen.py 2>&1 > /w/out/x.jsonl", false, true},
+		{"a trailing ;", "", x, "python3 gen.py > /w/out/x.jsonl;", false, true},
+		{"after another command", "", x, "mkdir -p /w/out; python3 gen.py > /w/out/x.jsonl", false, true},
+		{"cut in a later field", "", x, `{"command":"python3 gen.py > /w/out/x.jsonl","description":"` + strings.Repeat("d", 200) + `…`, false, true},
+		{"cut inside an escape past the line", "", x, `{"command":"cat > /w/out/x.jsonl <<'EOF'\n{\"a\":\"b \u00…`, false, true},
 
-	st := testStore(t)
-	put(t, st, slices.Concat(
-		read("s1", "/w/out/a.jsonl", t0), shell("s1", "cat > /w/out/a.jsonl <<'EOF'"+body, false, t0.Add(time.Minute)),
-		read("s1", "/w/out/b.jsonl", t0.Add(time.Hour)), shell("s1", "cat >> /w/out/b.jsonl <<'EOF'"+body, false, t0.Add(time.Hour+time.Minute)),
-		read("s2", "/w/out/c.jsonl", t0), shell("s2", `cat <<'EOF' > "/w/out/c.jsonl"`+body, false, t0.Add(time.Minute)))...)
-	if fs, err := (Failures{}).Detect(context.Background(), st, week()); err != nil || len(fs) != 0 {
-		t.Fatalf("created by the shell: %v, %v", signatures(fs), err)
-	}
-
-	st = testStore(t)
-	put(t, st, slices.Concat(
-		read("s1", "/w/out/d.jsonl", t0), shell("s1", "cat > /w/out/d.jsonl <<'EOF'"+body, true, t0.Add(time.Minute)),
-		read("s1", "/w/out/e.jsonl", t0.Add(time.Hour)), shell("s1", "python3 gen.py 2> /w/out/e.jsonl", false, t0.Add(time.Hour+time.Minute)),
-		read("s2", "/w/out/f.jsonl", t0), shell("s2", `echo "> /w/out/f.jsonl"`, false, t0.Add(time.Minute)),
-		read("s2", "/w/out/h.jsonl", t0.Add(time.Hour)), shell("s2", "cat <<'EOF'\n> /w/out/h.jsonl\nEOF", false, t0.Add(time.Hour+time.Minute)),
-		read("s2", "/w/out/i.jsonl", t0.Add(2*time.Hour)), shell("s2", "cat > $OUT/i.jsonl", false, t0.Add(2*time.Hour+time.Minute)),
-		read("s2", "/w/out/j.jsonl", t0.Add(3*time.Hour)), shell("s2", "cd /w/out && cat > j.jsonl", false, t0.Add(3*time.Hour+time.Minute)),
-		// the store cut the call inside an escape: what reads whole of it ends before the path does
-		read("s2", "/w/out/k", t0.Add(4*time.Hour)),
-		f.pair("s2", "Bash", `{"command":"cat > /w/out/k\u…`, "", false, t0.Add(4*time.Hour+time.Minute)),
-		read("s3", "/w/out/g.jsonl", t0), shell("s3", "cat > /w/out/g.jsonl <<'EOF'"+body, false, t0.Add(time.Minute)))...)
-	fs, err := Failures{}.Detect(context.Background(), st, week())
-	if got, want := signatures(fs), []string{missing + " 7"}; err != nil || !slices.Equal(got, want) {
-		t.Fatalf("found %v, %v, want %v", got, err, want)
+		{"the command failed", "", x, "cat > /w/out/x.jsonl <<'EOF'" + body, true, false},
+		{"another descriptor", "", x, "python3 gen.py 2> /w/out/x.jsonl", false, false},
+		{"descriptor 10", "", x, "exec 10> /w/out/x.jsonl", false, false},
+		{"a quoted >", "", x, `printf '%s\n' "a > /w/out/x.jsonl b"`, false, false},
+		{"an escaped >", "", x, `echo \> /w/out/x.jsonl`, false, false},
+		{"here-document text", "", x, "cat <<'EOF'\n> /w/out/x.jsonl\nEOF", false, false},
+		{"a comment", "", x, "cat /w/out/x.jsonl # > /w/out/x.jsonl", false, false},
+		{"a variable", "", "/w/out/$x.jsonl", "cat > /w/out/$x.jsonl", false, false},
+		{"a quoted variable", "", "/w/out/$x.jsonl", `cat > "/w/out/$x.jsonl"`, false, false},
+		{"a command's output", "", "/w/out/`date`.jsonl", "cat > /w/out/`date`.jsonl", false, false},
+		{"a glob", "", "/w/out/x*.jsonl", "cat > /w/out/x*.jsonl", false, false},
+		{"home's ~", "/w", "/w/~/out/x.jsonl", "cat > ~/out/x.jsonl", false, false},
+		{"input opened read and write, <>", "", x, "cat <> /w/out/x.jsonl", false, false},
+		{"a copy of a descriptor", "/w/out", "/w/out/2", "python3 gen.py >&2", false, false},
+		{"a descriptor closed", "/w/out", "/w/out/-", "python3 gen.py >&-", false, false},
+		{"a process substitution", "", x, "python3 gen.py > >(cat > /w/out/x.jsonl)", false, false},
+		{"a test's comparison", "", x, "[[ a > /w/out/x.jsonl ]] && echo y", false, false},
+		{"an arithmetic's comparison", "/w/out", "/w/out/0", "(( n > 0 )) && echo y", false, false},
+		{"a command after it", "", x, "cat > /w/out/x.jsonl <<'EOF'; true" + body, false, false},
+		{"piped on", "", x, "python3 gen.py > /w/out/x.jsonl | cat", false, false},
+		{"in the background", "", x, "python3 gen.py > /w/out/x.jsonl &", false, false},
+		{"or after it", "", x, "python3 gen.py > /w/out/x.jsonl || true", false, false},
+		{"or before it", "", x, "false || python3 gen.py > /w/out/x.jsonl", false, false},
+		{"negated", "", x, "! python3 gen.py > /w/out/x.jsonl", false, false},
+		{"after a cd the line does not hold to", "/w", x, "cd /w/out; cat > x.jsonl", false, false},
+		{"after a cd elsewhere the line does not hold to", "/w/out", x, "cd /w/elsewhere; cat > x.jsonl", false, false},
+		{"after a cd and a command it does not hold to", "/w", x, "cd /w/out && true; cat > x.jsonl", false, false},
+		{"after a relative cd", "/w", "out/x.jsonl", "cd out && cat > x.jsonl", false, false},
+		{"after a cd to a variable", "/w", "/w/$d/x.jsonl", "cd /w/$d && cat > x.jsonl", false, false},
+		{"after a pushd", "/w/out", x, "pushd /w/elsewhere && cat > x.jsonl", false, false},
+		{"after a popd", "/w/out", x, "popd && cat > x.jsonl", false, false},
+		{"no directory", "", "x.jsonl", "cat > x.jsonl", false, false},
+		{"a directory that is no whole path", "w/out", "w/out/x.jsonl", "cat > x.jsonl", false, false},
+		{"a first line the store cut", "", x, `{"command":"cat > /w/out/x.jsonl && tru…`, false, false},
+		{"a cut inside an escape at the path", "", "/w/out/k", `{"command":"cat > /w/out/k\u…`, false, false},
+		{"a cut that leaves a backslash last", "", x, `{"command":"cat > /w/out/x.jsonl \u0026\u0026 \\\u00…`, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testStore(t)
+			f := fileTools{harness: "kimi"}
+			var evs []store.Event
+			for i, session := range []string{"s1", "s1", "s2"} {
+				at := t0.Add(time.Duration(i) * time.Hour)
+				evs = append(evs, kimiReadMissing(&f, session, tc.path, at)...)
+				evs = append(evs, shellCall(&f, session, tc.cwd, tc.line, tc.failed, at.Add(time.Minute))...)
+			}
+			put(t, st, evs...)
+			fs, err := Failures{}.Detect(context.Background(), st, week())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.writes && len(fs) != 0 || !tc.writes && (len(fs) != 1 || len(fs[0].Evidence) != 3) {
+				t.Fatalf("writes %v, found %v", tc.writes, signatures(fs))
+			}
+		})
 	}
 }
 
-// Later is up to the window's end: a write the store does not hold yet, or one past the window, leaves the read a
-// failure, and the first run whose window holds the write no longer counts it.
+// The batch's own shape: each session appends to its file by its name alone, in the directory its call ran in.
+func TestARelativeWriteIsReadInItsCallsDirectory(t *testing.T) {
+	st := testStore(t)
+	f := fileTools{harness: "kimi"}
+	var evs []store.Event
+	for i, session := range []string{"s1", "s2", "s3"} {
+		dir := fmt.Sprintf("/w/b%d", i)
+		at := t0.Add(time.Duration(i) * time.Hour)
+		read := kimiReadMissing(&f, session, dir+"/out.jsonl", at)
+		for k := range read {
+			read[k].Cwd = dir
+		}
+		evs = append(evs, read...)
+		evs = append(evs, shellCall(&f, session, dir, "cat >> out.jsonl <<'EOF'\n{\"id\":1}\nEOF", false, at.Add(2*time.Minute))...)
+	}
+	put(t, st, evs...)
+	if fs, err := (Failures{}).Detect(context.Background(), st, week()); err != nil || len(fs) != 0 {
+		t.Fatalf("found %v, %v", signatures(fs), err)
+	}
+}
+
+// A read that found no file waits an hour before it counts: a run whose window ends between the read and its
+// session's write files nothing, so the case store holds no sighting the write would clear.
+func TestAReadWaitsForItsWriteBeforeItCounts(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	f := claudeFiles
+	put(t, st, slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)),
+		f.readMissing("s2", "/w/out/c.md", t0.Add(2*time.Hour)))...)
+	outs, _, err := Run(ctx, st, []Detector{Failures{}}, Window{Since: t0.Add(-24 * time.Hour), Until: t0.Add(2*time.Hour + 30*time.Minute)}, "test", false)
+	if err != nil || len(outs) != 1 || len(outs[0].Filed) != 0 {
+		t.Fatalf("a run before the last read settled: %+v, %v", outs, err)
+	}
+	put(t, st, slices.Concat(f.wrote("s1", "/w/out/a.md", t0.Add(3*time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(3*time.Hour)),
+		f.wrote("s2", "/w/out/c.md", t0.Add(3*time.Hour)))...)
+	outs, _, err = Run(ctx, st, []Detector{Failures{}}, Window{Since: t0.Add(-24 * time.Hour), Until: t0.Add(4 * time.Hour)}, "test", false)
+	if err != nil || len(outs) != 1 || len(outs[0].Filed) != 0 {
+		t.Fatalf("a run that holds the writes: %+v, %v", outs, err)
+	}
+}
+
+// Later is up to the window's end: a write the store does not hold yet, or one past the window, leaves a settled read
+// a failure, and the first run whose window holds the write no longer counts it.
 func TestAReadCountsUntilTheWindowHoldsItsWrite(t *testing.T) {
 	st := testStore(t)
 	f := claudeFiles
 	put(t, st, slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)),
 		f.readMissing("s2", "/w/out/c.md", t0.Add(2*time.Hour)))...)
-	early := Window{Since: t0.Add(-time.Hour), Until: t0.Add(3 * time.Hour)}
+	early := Window{Since: t0.Add(-time.Hour), Until: t0.Add(3*time.Hour + 2*time.Second)}
 	if fs, err := (Failures{}).Detect(context.Background(), st, early); err != nil || len(fs) != 1 || len(fs[0].Evidence) != 3 {
 		t.Fatalf("before the writes: %v, %v", signatures(fs), err)
 	}
