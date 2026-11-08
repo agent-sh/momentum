@@ -37,7 +37,8 @@ type Chunk struct {
 	Cut             bool
 	// Index and Polled are what the script printed with the result, when it did: its call's place in a
 	// Promise.all array ("i"), or the session a poll named ("id"); -1 when none
-	Index, Polled int64
+	Index  int
+	Polled int64
 }
 
 // codeCall is a tool call of a code-mode script: an exec_command with its command, or a write_stdin with the
@@ -140,8 +141,8 @@ func pairCode(chunks []Chunk, calls []codeCall, prints []int, parallel bool, sto
 	var rest []Chunk
 	for _, ch := range chunks {
 		switch {
-		case ch.Index >= 0 && arrayAt >= 0 && arrayAt+int(ch.Index) < len(calls):
-			result[arrayAt+int(ch.Index)] = ch
+		case ch.Index >= 0 && arrayAt >= 0 && arrayAt+ch.Index < len(calls):
+			result[arrayAt+ch.Index] = ch
 		case ch.Polled > 0:
 			ch.Session = ch.Polled // a poll in a loop: the session it named
 			polls = append(polls, ch)
@@ -355,11 +356,12 @@ func codeChunks(output string) []Chunk {
 			c := Chunk{Output: uncut(text, !closed), Index: -1, Polled: -1}
 			// what the script printed with the result, from the previous result to this one's output
 			for _, m := range carriedRe.FindAllStringSubmatch(output[last:j], -1) {
-				n, _ := strconv.ParseInt(m[2], 10, 64)
 				if m[1] == "i" {
-					c.Index = n
+					if n, err := strconv.Atoi(m[2]); err == nil {
+						c.Index = n
+					}
 				} else {
-					c.Polled = n
+					c.Polled, _ = strconv.ParseInt(m[2], 10, 64)
 				}
 			}
 			if e := exitRe.FindStringSubmatch(output[max(start, 0):j]); e != nil {
