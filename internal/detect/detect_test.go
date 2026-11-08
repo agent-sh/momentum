@@ -3,6 +3,7 @@ package detect
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -786,6 +787,122 @@ func TestSessionsWaitResolvedOnFirstTryIsNotACase(t *testing.T) {
 	}
 	if len(fs) != 1 {
 		t.Fatalf("found %d findings, want the one for b and c", len(fs))
+	}
+}
+
+// accessWait is the access rule's wait event for a stop as the last supervise run that held the stop, at seen, left
+// it: every run rewrites the one event of a stop and try. at is when the rule resumes the stop.
+func accessWait(session, errText string, stopAt, at, seen time.Time) store.Event {
+	m, _ := json.Marshal(map[string]any{"rule": "access", "try": 1, "why": "x", "stop_at": stopAt.UnixMilli(), "at": at.UnixMilli(),
+		"error": errText})
+	return store.Event{Source: store.Supervise, SourceKey: fmt.Sprintf("%s@%d#%s#%s#%d", session, stopAt.UnixMilli(), "access", "wait", 1),
+		TS: seen, Session: session, Harness: "claude", Actor: store.ActorDetector, Kind: "wait", Summary: "x", Meta: string(m)}
+}
+
+// needsYou is the phase event that saw a session's wait on its owner end: in needs_you, asking kind, from start to
+// end, and then in phase to.
+func needsYou(session, kind, to string, start, end time.Time) store.Event {
+	return ev(store.Sessions, session, "phase", store.ActorHarness, "", "x",
+		fmt.Sprintf(`{"from":"needs_you","to":%q,"for_ms":%d,"from_ask_kind":%q}`, to, end.Sub(start).Milliseconds(), kind), end)
+}
+
+// limitHit is the error of a usage limit that states when it resets.
+func limitHit(reset time.Time) string {
+	return "You've hit your weekly limit · resets " + reset.UTC().Format("Jan 2, 3:04pm") + " (UTC)"
+}
+
+// heldStops are n stops of a session on a usage limit that each wakeup of its loop meets again, every half hour
+// from start: each a piece in needs_you of its own, and the access wait the last run before the next stop left.
+func heldStops(session, limit string, start time.Time, n int, at time.Time) []store.Event {
+	var evs []store.Event
+	for i := range n {
+		stop := start.Add(time.Duration(i) * 30 * time.Minute)
+		next := stop.Add(30 * time.Minute)
+		evs = append(evs, needsYou(session, "error", "needs_you", stop, next), accessWait(session, limit, stop, at, next.Add(-time.Minute)))
+	}
+	return evs
+}
+
+// A usage limit that states a reset four days away stops two sessions, every wakeup of their loops meets it again,
+// and the access rule holds each stop for the reset with no message: nothing waits on the owner, before a restart
+// ends the last stop or after it.
+func TestSessionsStopHeldForAStatedResetIsNotACase(t *testing.T) {
+	st := testStore(t)
+	reset := t0.Add(4 * 24 * time.Hour)
+	limit, at := limitHit(reset), reset.Add(time.Minute)
+	const n = 8
+	last := t0.Add(n * 30 * time.Minute) // the stop the restart ends
+	for _, s := range []string{"a", "b"} {
+		put(t, st, heldStops(s, limit, t0, n, at)...)
+		put(t, st, accessWait(s, limit, last, at, last.Add(10*time.Minute)))
+	}
+	none := func(when string) {
+		t.Helper()
+		fs, err := Sessions{}.Detect(context.Background(), st, week())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(fs) > 0 {
+			t.Fatalf("%s: found %v, want nothing", when, signatures(fs))
+		}
+	}
+	none("before the restart")
+	restart := last.Add(20 * time.Minute)
+	for _, s := range []string{"a", "b"} {
+		put(t, st, accessWait(s, limit, last, at, restart.Add(-time.Minute)), needsYou(s, "error", "working", last, restart))
+	}
+	none("after the restart")
+}
+
+// What a hold does not cover still counts, and only that: a stop still held when the reset came and still stopped
+// past it with no message (a, b), one whose message at the reset failed again (c) or did not land (d), a stop on
+// another error after a restart ended the held one, before the reset (e), and a login's wait whose time a new login
+// set (f). The held pieces before them are not evidence.
+func TestSessionsWaitPastAHoldStillCounts(t *testing.T) {
+	st := testStore(t)
+	reset := t0.Add(3 * time.Hour)
+	limit, at := limitHit(reset), reset.Add(time.Minute)
+	last := t0.Add(5 * 30 * time.Minute) // the stop the reset comes in
+	var want []string
+	counted := func(e store.Event) store.Event {
+		want = append(want, "ev:"+e.ID())
+		return e
+	}
+	for _, s := range []string{"a", "b", "c", "d"} {
+		put(t, st, heldStops(s, limit, t0, 5, at)...)
+		put(t, st, accessWait(s, limit, last, at, at.Add(-time.Minute)))
+	}
+	for _, s := range []string{"a", "b"} {
+		put(t, st, counted(needsYou(s, "error", "working", last, at.Add(2*time.Hour))))
+	}
+	sent := at.Add(time.Minute)
+	for s, result := range map[string]string{"c": "failed again", "d": "not delivered"} {
+		a := ev(store.Supervise, s, "act", store.ActorAgent, "", "x", fmt.Sprintf(`{"rule":"access","try":1,"stop_at":%d}`, last.UnixMilli()), sent)
+		put(t, st, a, ev(store.Supervise, s, "outcome", store.ActorDetector, "", "x", fmt.Sprintf(`{"of":%q,"rule":"access","result":%q}`, a.SourceKey, result),
+			sent.Add(3*time.Minute)), counted(needsYou(s, "error", "working", last, sent.Add(time.Minute))))
+	}
+	restart := t0.Add(70 * time.Minute)
+	put(t, st, heldStops("e", limit, t0, 2, at)...)
+	put(t, st, accessWait("e", limit, t0.Add(time.Hour), at, restart.Add(-time.Minute)), needsYou("e", "error", "working", t0.Add(time.Hour), restart),
+		counted(needsYou("e", "error", "working", restart.Add(10*time.Minute), restart.Add(70*time.Minute))))
+	login := t0.Add(2 * time.Hour)
+	put(t, st, accessWait("f", "OAuth token has expired · Please run /login", t0, login.Add(15*time.Minute), login.Add(5*time.Minute)),
+		counted(needsYou("f", "error", "working", t0, login.Add(6*time.Minute))))
+	fs, err := Sessions{}.Detect(context.Background(), st, week())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fs) != 1 || fs[0].Signature != "sessions/v1:waited:error" {
+		t.Fatalf("found %v, want the waits past the holds", signatures(fs))
+	}
+	var got []string
+	for _, e := range fs[0].Evidence {
+		got = append(got, e.Ref)
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("evidence %d events, want %d: %v, want %v", len(got), len(want), got, want)
 	}
 }
 
