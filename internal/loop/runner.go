@@ -643,7 +643,7 @@ const (
 	baseFetched     = "It ended: a build of the case fetched its base."
 	proposalRead    = "It ended: its proposal branch was read."
 	caseLeftTesting = "It ended: the case left testing."
-	roomFound       = "It ended: the machine had room for the build's check."
+	roomFound       = "It ended: a later build of the case went on to its agent."
 )
 
 // holdNoteEnded says whether a base, proposal or capacity note says its hold ended (endHoldNotes).
@@ -1163,11 +1163,18 @@ func stopRuns(ctx context.Context, st *store.Store, c store.Case) (runs []store.
 		}
 		return nil, false, nil
 	}
-	b := runs[1]
-	if b.Status == store.RunOK || a.Failure != b.Failure || a.Step != b.Step {
-		return nil, false, nil
+	// an agent's failure, or another step's, compares with the newest run before it that started: a build that failed
+	// at a host stage before its agent (which the rule counts on its own stage) says nothing of the agent
+	for _, b := range runs[1:] {
+		if b.Started.IsZero() {
+			continue
+		}
+		if b.Status == store.RunOK || a.Failure != b.Failure || a.Step != b.Step {
+			return nil, false, nil
+		}
+		return []store.LoopRun{a, b}, true, nil
 	}
-	return runs[:2], true, nil
+	return nil, false, nil
 }
 
 // stopCounts says the stop rule counts a run: one that started and ended (a refusal of the budgets is no run, nor is
@@ -1177,7 +1184,7 @@ func stopCounts(run store.LoopRun) bool {
 	switch {
 	case run.Status == store.RunRefused || run.Status == store.RunRunning || run.Failure == "sandbox":
 		return false
-	case run.Started.IsZero() && oldBrokerOutage(run), oldBusyCheck(run):
+	case run.Started.IsZero() && oldBrokerOutage(run):
 		return false
 	case run.Started.IsZero():
 		// a build that never started counts at a host stage, or for a host error at a refusal stage (a capacity gate
@@ -1185,15 +1192,6 @@ func stopCounts(run store.LoopRun) bool {
 		return run.Step == StepBuild && run.Status == store.RunFailed && (slices.Contains(hostStages, run.Failure) || run.Cause == hostCause)
 	}
 	return true
-}
-
-// oldBusyText is how a build kept before a busy machine was a hold told the capacity gate's refusal, at build check.
-var oldBusyText = regexp.MustCompile(`build check: the machine has no room for the test now`)
-
-// oldBusyCheck says a build was kept, before a machine with no room for its check was a hold, for the capacity gate's
-// refusal: this build holds such a pass and keeps no run, so the stop rule does not count the old ones either.
-func oldBusyCheck(run store.LoopRun) bool {
-	return run.Step == StepBuild && run.Failure == "build check" && run.Cause == "" && oldBusyText.MatchString(run.Summary)
 }
 
 // oldBrokerText is how a build kept before the broker's outage had its own key (broker) told a broker env file that
@@ -1277,7 +1275,7 @@ func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, e
 	switch {
 	case refusalStop(a):
 		why = fmt.Sprintf("two of its %s runs were refused for one cause: %s", a.Step, stopText(a))
-	case a.Step == StepBuild:
+	case a.Step == StepBuild && hostFailure(a): // the host's, matched on its stage in the span, not only the last two
 		why = fmt.Sprintf("two of its %s runs failed the same way: %s", a.Step, stopText(a))
 	}
 	// a stop whose older run began before its component-health case closed as fixed came too late for the close:

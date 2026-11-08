@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -146,8 +147,9 @@ func busyIn(ctx context.Context, st *store.Store, dir string, ss map[int]capacit
 	return "", nil
 }
 
-// gateTimeout bounds one wait at the capacity gate, and gateWaitDelay how long its output may stay open after: a gate
-// whose children outlive it (a shell that started a waiter) ends then too.
+// gateTimeout bounds one wait at the capacity gate. The gate runs in a process group of its own, which its deadline
+// kills whole, so its children (a shell's waiter) end with it; gateWaitDelay bounds how long its output may stay open
+// after.
 var (
 	gateTimeout   = 10 * time.Minute
 	gateWaitDelay = 5 * time.Second
@@ -177,6 +179,8 @@ func setupShip(st *store.Store, sources config.Sources) *loop.Ship {
 			defer cancel()
 			cmd := exec.CommandContext(cctx, c.CapacityGate[0], c.CapacityGate[1:]...)
 			cmd.Env = loop.CleanEnv(nil)
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 			cmd.WaitDelay = gateWaitDelay
 			out, err := commandOutput(cmd, true)
 			if err == nil {

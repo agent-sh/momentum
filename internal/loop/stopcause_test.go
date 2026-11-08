@@ -646,6 +646,10 @@ func TestBuildsThatNeverStartedAreDatedByTheirEnd(t *testing.T) {
 	if at, err := st.ResumedAt(ctx, late.ID); err != nil || at.IsZero() {
 		t.Fatalf("the late stop did not resume its case: %v %v", at, err)
 	}
+	// a dry check dates the stop by its older build's end too: both ended after the fix, so it is a stop
+	if why, err := r.stopped(ctx, after, true); err != nil || why != "two of its build runs failed the same way: build toolchains" {
+		t.Fatalf("a dry check of two builds that never started, both after the fix: %q %v", why, err)
+	}
 	if why, err := r.stopped(ctx, after, false); err != nil || why != "two of its build runs failed the same way: build toolchains" {
 		t.Fatalf("two builds that never started, both after the fix: %q %v", why, err)
 	}
@@ -850,7 +854,7 @@ func TestABrokenGateIsTheHostsErrorAtTheCheck(t *testing.T) {
 	r := localRunner(t, st)
 	c := openCase(t, st, "failures", "gate", 1)
 	broken := Sandbox{Gate: func(ctx context.Context) error {
-		if err := exec.CommandContext(ctx, "momentum-test-absent-gate", "--capacity", "20,8").Run(); err != nil {
+		if err := exec.CommandContext(ctx, "momentum-test-absent-gate", "--capacity", "4,1").Run(); err != nil {
 			return fmt.Errorf("the machine has no room for the test now: %w", err)
 		}
 		return nil
@@ -893,6 +897,8 @@ func TestABusyMachineHoldsTheBuildBeforeItsAgent(t *testing.T) {
 	}})
 	r.Ship.Dir = r.Dir
 	r.Inputs.ReadDirs = []string{f.main}
+	var logged []string
+	r.Log = func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
 	mechanism, fix := "one cause", "one fix"
 	var err error
 	if c, err = r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture"); err != nil {
@@ -912,6 +918,11 @@ func TestABusyMachineHoldsTheBuildBeforeItsAgent(t *testing.T) {
 	}
 	if n, ok, err := r.Store.Note(ctx, capacityNoteID(c.ID)); err != nil || !ok || !n.Done.IsZero() {
 		t.Fatalf("the hold's note: %+v %v %v", n, ok, err)
+	}
+	for _, line := range logged {
+		if strings.Contains(line, "the capacity gate failed before its agent") {
+			t.Fatalf("a hold was logged as a failed gate: %q", line)
+		}
 	}
 	// the next pass finds room: the build goes on past the gate, and the hold's note ends
 	busy = false
@@ -1167,7 +1178,7 @@ func TestAGateThatFailsOtherwiseFailsTheBuildBeforeItsAgent(t *testing.T) {
 	}{
 		{"a usage error", shellGate("echo 'waitfor: unknown argument: --capacty' >&2; exit 4")},
 		{"a program that is gone", func(ctx context.Context) error {
-			if err := exec.CommandContext(ctx, "momentum-test-absent-gate", "--capacity", "20,8").Run(); err != nil {
+			if err := exec.CommandContext(ctx, "momentum-test-absent-gate", "--capacity", "4,1").Run(); err != nil {
 				return fmt.Errorf("the capacity gate: %w", err)
 			}
 			return nil
@@ -1265,22 +1276,22 @@ func TestACapacityHoldIsNotedAndRaisedAfterADay(t *testing.T) {
 		}
 		return n
 	}
-	hold("load 31")
-	if n := note(); n.Importance != store.ImportanceLow || !strings.Contains(n.Detail, "load 31") {
+	hold("load 5")
+	if n := note(); n.Importance != store.ImportanceLow || !strings.Contains(n.Detail, "load 5") {
 		t.Fatalf("a new hold's note: %+v", n)
 	}
 	if _, _, err := st.DoneNote(ctx, capacityNoteID(c.ID), now); err != nil {
 		t.Fatal(err)
 	}
 	now = now.Add(time.Hour)
-	hold("load 29")
+	hold("load 6")
 	if n := note(); n.Done.IsZero() {
 		t.Fatalf("a note taken out of the report came back at the same importance: %+v", n)
 	}
 	now = now.Add(24 * time.Hour)
-	hold("load 30")
+	hold("load 7")
 	first := note()
-	if first.Importance != store.ImportanceNormal || !first.Done.IsZero() || !strings.Contains(first.Detail, "load 30") {
+	if first.Importance != store.ImportanceNormal || !first.Done.IsZero() || !strings.Contains(first.Detail, "load 7") {
 		t.Fatalf("a hold a day old: %+v", first)
 	}
 	if err := r.endCapacityNote(ctx, c.ID); err != nil {
@@ -1290,26 +1301,55 @@ func TestACapacityHoldIsNotedAndRaisedAfterADay(t *testing.T) {
 		t.Fatalf("a build found room but the note stands: %+v", n)
 	}
 	now = now.Add(time.Hour)
-	hold("load 40")
+	hold("load 8")
 	if n := note(); n.Importance != store.ImportanceLow || !n.Done.IsZero() || n.At.UnixMilli() != now.UnixMilli() {
 		t.Fatalf("the next hold's note: %+v", n)
 	}
 }
 
-// Builds kept before a machine with no room for the check was a hold (build check, no cause, the gate's text) stop
-// nothing after the upgrade: this build holds such a pass.
-func TestOldBusyChecksDoNotCount(t *testing.T) {
+// Builds kept before this change at build check with the gate's text ran their gate at the check, after their agent:
+// they are paid busy checks, which this change counts as the host's error at build check too. An old one and a new one
+// stop the case on the stage, and so do two old ones.
+func TestOldBusyChecksCountAsTheHosts(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	r := localRunner(t, st)
-	c := openCase(t, st, "failures", "old-busy", 1)
 	base := time.Now().Add(-time.Hour)
-	for i, tail := range []string{"exit status 1", "signal: killed"} {
-		putBuild(t, st, c, fmt.Sprint("ob", i), StepBuild, store.RunFailed, "build check", "",
-			"store copy 30 days\nbuild check: the machine has no room for the test now: "+tail, base.Add(time.Duration(i)*time.Minute))
+	old := func(c store.Case, id, tail string, at time.Time) {
+		putBuild(t, st, c, id, StepBuild, store.RunFailed, "build check", "",
+			"store copy 30 days\nbuild check: the machine has no room for the test now: "+tail, at)
 	}
-	if why, err := r.stopped(ctx, c, true); err != nil || why != "" {
-		t.Fatalf("two old busy checks stopped the case: %q %v", why, err)
+	mixed := openCase(t, st, "failures", "old-and-new", 1)
+	old(mixed, "m1", "exit status 1", base)
+	putBuild(t, st, mixed, "m2", StepBuild, store.RunFailed, "build check", hostCause,
+		"build check: the machine has no room for the test now: the capacity gate waitfor: exit status 1", base.Add(time.Minute))
+	if why, err := r.stopped(ctx, mixed, true); err != nil || why != "two of its build runs failed the same way: build check" {
+		t.Fatalf("an old and a new paid busy check: %q %v", why, err)
+	}
+	both := openCase(t, st, "failures", "old-busy", 1)
+	old(both, "b1", "exit status 1", base)
+	old(both, "b2", "signal: killed", base.Add(time.Minute))
+	if why, err := r.stopped(ctx, both, true); err != nil || why != "two of its build runs failed the same way: build check" {
+		t.Fatalf("two old paid busy checks: %q %v", why, err)
+	}
+}
+
+// An agent's failure compares with the newest run before it that started: a build that failed at a host stage before
+// its agent, between two builds that ran out of turns, does not keep them apart.
+func TestABuildThatNeverStartedDoesNotSplitTwoAgentFailures(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "turns", 1)
+	base := time.Now().Add(-time.Hour)
+	putBuild(t, st, c, "t1", StepBuild, store.RunTurns, "turns", "", "turns", base)
+	if err := st.PutLoopRun(ctx, store.LoopRun{ID: "t2", Case: c.ID, Family: c.Family, Step: StepBuild, Ended: base.Add(time.Minute),
+		Status: store.RunFailed, Failure: "build inputs", Summary: "build inputs: the store copy failed"}); err != nil {
+		t.Fatal(err)
+	}
+	putBuild(t, st, c, "t3", StepBuild, store.RunTurns, "turns", "", "turns", base.Add(2*time.Minute))
+	if why, err := r.stopped(ctx, c, true); err != nil || why != "its last two build runs failed the same way: turns" {
+		t.Fatalf("two agent failures with a build that never started between: %q %v", why, err)
 	}
 }
 
