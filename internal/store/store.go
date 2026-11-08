@@ -133,7 +133,9 @@ CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, kind TEXT NOT NULL, title
 // gains it and keeps its rows: SQLite's ADD COLUMN writes no row, so it costs the same on any table. The next
 // column is one more entry here. A NOT NULL column needs a default other than NULL, and an added column cannot be
 // a key. The events from before it hold its default; for the sources to fill it in the events whose transcripts
-// are still there, add a step that reads again as well.
+// are still there, add a step that reads again as well. A column an older build can ignore safely takes no step,
+// since an older build refuses a store at a step it does not know: what it derives from the rows already there is its
+// fill (columnFills), run where it is added.
 var keptColumns = []struct {
 	table   string
 	columns [][2]string
@@ -149,7 +151,19 @@ var keptColumns = []struct {
 	{"cases", [][2]string{{"episode", "INTEGER NOT NULL DEFAULT 1"}, {"guard_exposure", "INTEGER NOT NULL DEFAULT 0"}, {"guard_watched", "INTEGER NOT NULL DEFAULT 0"},
 		{"guard_recur", "REAL NOT NULL DEFAULT 0"}}},
 	{"capacity_runs", [][2]string{{"blind", "INTEGER NOT NULL DEFAULT 0"}}},
-	{"case_evidence", [][2]string{{"tool", "TEXT NOT NULL DEFAULT ''"}}},
+	{"case_evidence", [][2]string{{"tool", "TEXT NOT NULL DEFAULT ''"}, {"cwd", "TEXT NOT NULL DEFAULT ''"}}},
+}
+
+// columnFills fill a kept column from the rows already there, in the transaction that adds it, and only then: a
+// column an older build can ignore safely takes no step (keptColumns), so the fill is not a step's and never runs again.
+// A case's evidence records its event's tool and working directory as it is filed (resolveEvidence), so the guard can
+// judge an event the store has lost since; the evidence filed before takes them from its event where the store holds
+// it, and the rest keep none. Each fill touches only the rows whose event the store holds.
+var columnFills = map[string]string{
+	"case_evidence.tool": `UPDATE case_evidence SET tool = COALESCE(e.tool, '') FROM events e
+	  WHERE e.id = substr(case_evidence.ref, 4) AND substr(case_evidence.ref, 1, 3) = 'ev:'`,
+	"case_evidence.cwd": `UPDATE case_evidence SET cwd = COALESCE(e.cwd, '') FROM events e
+	  WHERE e.id = substr(case_evidence.ref, 4) AND substr(case_evidence.ref, 1, 3) = 'ev:'`,
 }
 
 // keptIndexes are the events' indexes. events_key finds a record's events by the prefix of their keys (PutFiles)
@@ -236,15 +250,7 @@ var steps = []step{
 	{version: 4, sql: `UPDATE events SET harness = 'claude' WHERE harness = 'claude-code'`},
 	// Infer failure signals before clipping tool output. Kept events remain.
 	{version: 5, reread: true},
-	// A case's evidence records its event's tool as it is filed (case_evidence.tool), so the guard can judge an event
-	// the store has lost since. The evidence filed before takes the tool of its event where the store still holds it;
-	// the rest keep none. Nothing is read again.
-	{version: 6, sql: evidenceToolStep},
 }
-
-// evidenceToolStep gives the evidence of an event its event's tool, where the store holds the event.
-const evidenceToolStep = `UPDATE case_evidence SET tool = (SELECT COALESCE(e.tool, '') FROM events e WHERE e.id = substr(case_evidence.ref, 4))
-  WHERE substr(ref, 1, 3) = 'ev:' AND EXISTS (SELECT 1 FROM events e WHERE e.id = substr(case_evidence.ref, 4))`
 
 // repairs run in every migration, after the steps. They put right what a build from before the events were kept
 // does to a store migrated since: it makes events_source again, an index no build since reads, which costs every
@@ -599,7 +605,7 @@ func columns(q querier, table string) ([]string, error) {
 	return out, rows.Err()
 }
 
-// addColumns adds to a kept table the columns it lacks.
+// addColumns adds to a kept table the columns it lacks, each with its fill (columnFills) where it has one.
 func addColumns(tx *sql.Tx, table string, want [][2]string) error {
 	have, err := columns(tx, table)
 	if err != nil {
@@ -609,6 +615,11 @@ func addColumns(tx *sql.Tx, table string, want [][2]string) error {
 		if !slices.Contains(have, c[0]) {
 			if _, err := tx.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + c[0] + ` ` + c[1]); err != nil {
 				return err
+			}
+			if fill := columnFills[table+"."+c[0]]; fill != "" {
+				if _, err := tx.Exec(fill); err != nil {
+					return fmt.Errorf("filling %s.%s: %w", table, c[0], err)
+				}
 			}
 		}
 	}

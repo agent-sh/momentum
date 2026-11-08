@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -480,7 +481,8 @@ func TestAToolFoundByItsEventsNeedsTwoIncidents(t *testing.T) {
 // a recurrence the watch reads. An event of the evidence the store no longer holds, in the history or before it, is of
 // the tool its evidence recorded when it was filed (#118): Bash is admitted where that is Bash, and refused where the
 // evidence recorded no tool (filed before evidence recorded tools, its event gone by the step that filled them in) or
-// another. An event the store still holds is of its own tool, whatever its evidence recorded.
+// another. An event the store still holds is of its own tool, whatever its evidence recorded. An Edit failure of the
+// loop's own is left out, held or lost: a lost one by the directory its evidence recorded.
 func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
 	now := time.Now().Truncate(time.Hour)
 	bash := serverSignal
@@ -666,6 +668,22 @@ func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
 				t.Fatalf("a named tool over evidence the store lost, filed as Bash: %+v %v", g, err)
 			case recorded != "Bash" && (err == nil || !strings.Contains(err.Error(), "(1 tool in one incident alone; in 5 directories; of no MCP server")):
 				t.Fatalf("a named tool over evidence the store lost, filed as %q: %+v %v", recorded, g, err)
+			}
+		})
+	}
+	for _, lost := range []bool{false, true} {
+		t.Run(fmt.Sprint("an Edit failure of the loop's own, lost: ", lost), func(t *testing.T) {
+			st, path := testStoreAt(t)
+			dir := t.TempDir()
+			own := toolResult("loop-own", now.Add(-35*aDay), "loop-own", true)
+			own.Tool, own.Cwd = "Edit", filepath.Join(dir, "runs", "r1")
+			c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" }, own)
+			if lost {
+				lose(t, path, c, "loop-own", "Edit")
+			}
+			plan, err := (&Ship{Store: st, Dir: dir}).validPlan(t.Context(), c, bash, 7*aDay, "", now)
+			if g, _ := guardOf(t, plan); err != nil || g == nil || g.Unit != "tool" || g.Tool != "Bash" || g.Exposure != 224+6 {
+				t.Fatalf("a named tool beside an Edit failure of the loop's own: %+v %v", g, err)
 			}
 		})
 	}

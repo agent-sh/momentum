@@ -164,14 +164,16 @@ type Measurement struct {
 func (m Measurement) Guarded() bool { return m.Exposure > 0 || m.closedGuard }
 
 // Evidence is one reference behind a case: an event (ev:ID), a note (note:ID), a commit (git:OWNER/REPO@SHA), a
-// file (file:PATH, with @OFFSET), or an address. At is when it happened. Tool is an event's tool as it was filed
-// (resolveEvidence), which judges the event once the store no longer holds it; any other reference has none.
+// file (file:PATH, with @OFFSET), or an address. At is when it happened. Tool and Cwd are an event's tool and
+// working directory as it was filed (resolveEvidence), which judge the event once the store no longer holds it; any
+// other reference has neither.
 type Evidence struct {
 	Ref     string
 	At      time.Time
 	Kind    string
 	Summary string
 	Tool    string
+	Cwd     string
 	Added   time.Time
 }
 
@@ -352,32 +354,32 @@ func caseLogCleaned(ctx context.Context, q querier, id, actor, action, detail st
 func CaseNoteText(text string) string { return caseText(text, caseTextMax) }
 
 // resolveEvidence checks a piece of evidence and fills it in. An event's reference (ev:ID) always takes the
-// event's own time, kind, summary and tool, whatever the caller gave, and a note's (note:ID) the note's time, kind and
-// title: an event or a note the store does not hold is an error. Another reference without a time is dated now. Only
-// an event's has a tool.
+// event's own time, kind, summary, tool and working directory, whatever the caller gave, and a note's (note:ID) the
+// note's time, kind and title: an event or a note the store does not hold is an error. Another reference without a
+// time is dated now. Only an event's has a tool and a directory.
 func resolveEvidence(ctx context.Context, q querier, e Evidence, now time.Time) (Evidence, error) {
 	if err := checkRef(e.Ref); err != nil {
 		return Evidence{}, err
 	}
 	var row *sql.Row
-	e.Tool = ""
+	e.Tool, e.Cwd = "", ""
 	switch {
 	case strings.HasPrefix(e.Ref, "ev:"):
-		row = q.QueryRowContext(ctx, `SELECT ts, kind, summary, COALESCE(tool, '') FROM events WHERE id = ?`, e.Ref[len("ev:"):])
+		row = q.QueryRowContext(ctx, `SELECT ts, kind, summary, COALESCE(tool, ''), COALESCE(cwd, '') FROM events WHERE id = ?`, e.Ref[len("ev:"):])
 	case strings.HasPrefix(e.Ref, "note:"):
-		row = q.QueryRowContext(ctx, `SELECT at, 'note:' || kind, title, '' FROM notes WHERE id = ?`, e.Ref[len("note:"):])
+		row = q.QueryRowContext(ctx, `SELECT at, 'note:' || kind, title, '', '' FROM notes WHERE id = ?`, e.Ref[len("note:"):])
 	}
 	if row != nil {
 		var ts int64
-		var kind, summary, tool string
-		err := row.Scan(&ts, &kind, &summary, &tool)
+		var kind, summary, tool, cwd string
+		err := row.Scan(&ts, &kind, &summary, &tool, &cwd)
 		if errors.Is(err, sql.ErrNoRows) {
 			return Evidence{}, badCase("the store holds nothing by %q", e.Ref)
 		}
 		if err != nil {
 			return Evidence{}, err
 		}
-		e.At, e.Kind, e.Summary, e.Tool = time.UnixMilli(ts), kind, summary, tool
+		e.At, e.Kind, e.Summary, e.Tool, e.Cwd = time.UnixMilli(ts), kind, summary, tool, cwd
 	}
 	if e.At.IsZero() {
 		e.At = now
@@ -393,7 +395,8 @@ func resolveEvidence(ctx context.Context, q querier, e Evidence, now time.Time) 
 const clockSkew = time.Minute
 
 // addEvidence stores the evidence a case does not hold yet, and returns how many were new and the newest time
-// among them.
+// among them. Evidence it holds already gains the tool and directory it lacks (filed by an older build, or before its
+// column was added while its event was gone), which makes it no new evidence.
 func addEvidence(ctx context.Context, q querier, id string, evs []Evidence, now time.Time) (int, time.Time, error) {
 	added, newest := 0, time.Time{}
 	for _, e := range evs {
@@ -401,13 +404,19 @@ func addEvidence(ctx context.Context, q querier, id string, evs []Evidence, now 
 		if err != nil {
 			return 0, time.Time{}, err
 		}
-		res, err := q.ExecContext(ctx, `INSERT OR IGNORE INTO case_evidence (case_id, ref, at, kind, summary, tool, added)
-		  VALUES (?,?,?,?,?,?,?)`, id, e.Ref, e.At.UnixMilli(), e.Kind, e.Summary, e.Tool, now.UnixMilli())
+		res, err := q.ExecContext(ctx, `INSERT OR IGNORE INTO case_evidence (case_id, ref, at, kind, summary, tool, cwd, added)
+		  VALUES (?,?,?,?,?,?,?,?)`, id, e.Ref, e.At.UnixMilli(), e.Kind, e.Summary, e.Tool, e.Cwd, now.UnixMilli())
 		if err != nil {
 			return 0, time.Time{}, err
 		}
 		if n, err := res.RowsAffected(); err != nil {
 			return 0, time.Time{}, err
+		} else if n == 0 && (e.Tool != "" || e.Cwd != "") {
+			if _, err := q.ExecContext(ctx, `UPDATE case_evidence SET tool = CASE WHEN tool = '' THEN ? ELSE tool END,
+			  cwd = CASE WHEN cwd = '' THEN ? ELSE cwd END WHERE case_id = ? AND ref = ? AND (tool = '' OR cwd = '')`,
+				e.Tool, e.Cwd, id, e.Ref); err != nil {
+				return 0, time.Time{}, err
+			}
 		} else if n > 0 {
 			added++
 			if e.At.After(newest) {
@@ -683,7 +692,7 @@ func (s *Store) Cases(ctx context.Context, f CaseFilter) ([]Case, error) {
 
 // CaseEvidence lists a case's evidence, newest first, at most limit of it (0: all).
 func (s *Store) CaseEvidence(ctx context.Context, id string, limit int) ([]Evidence, error) {
-	q := `SELECT ref, at, kind, summary, tool, added FROM case_evidence WHERE case_id = ? ORDER BY at DESC, ref`
+	q := `SELECT ref, at, kind, summary, tool, cwd, added FROM case_evidence WHERE case_id = ? ORDER BY at DESC, ref`
 	args := []any{id}
 	if limit > 0 {
 		q, args = q+` LIMIT ?`, append(args, limit)
@@ -697,7 +706,7 @@ func (s *Store) CaseEvidence(ctx context.Context, id string, limit int) ([]Evide
 	for rows.Next() {
 		var e Evidence
 		var at, added int64
-		if err := rows.Scan(&e.Ref, &at, &e.Kind, &e.Summary, &e.Tool, &added); err != nil {
+		if err := rows.Scan(&e.Ref, &at, &e.Kind, &e.Summary, &e.Tool, &e.Cwd, &added); err != nil {
 			return nil, err
 		}
 		e.At, e.Added = time.UnixMilli(at), time.UnixMilli(added)
@@ -1309,8 +1318,13 @@ func merge(ctx context.Context, q querier, c Case, into, why, actor string, now 
 		return Case{}, err
 	}
 	for _, stmt := range []string{
-		`INSERT OR IGNORE INTO case_evidence (case_id, ref, at, kind, summary, tool, added)
-		   SELECT ?, ref, at, kind, summary, tool, added FROM case_evidence WHERE case_id = ?`,
+		`INSERT OR IGNORE INTO case_evidence (case_id, ref, at, kind, summary, tool, cwd, added)
+		   SELECT ?, ref, at, kind, summary, tool, cwd, added FROM case_evidence WHERE case_id = ?`,
+		// evidence both hold keeps the target's, and gains the tool and directory it lacks from the duplicate's
+		`UPDATE case_evidence AS t SET tool = CASE WHEN t.tool = '' THEN s.tool ELSE t.tool END,
+		   cwd = CASE WHEN t.cwd = '' THEN s.cwd ELSE t.cwd END
+		   FROM case_evidence AS s WHERE t.case_id = ?1 AND s.case_id = ?2 AND s.ref = t.ref
+		   AND (t.tool = '' AND s.tool != '' OR t.cwd = '' AND s.cwd != '')`,
 		`UPDATE case_signatures SET case_id = ? WHERE case_id = ?`,
 	} {
 		if _, err := q.ExecContext(ctx, stmt, dst.ID, c.ID); err != nil {

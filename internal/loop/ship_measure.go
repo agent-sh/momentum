@@ -442,11 +442,28 @@ type caseEvent struct {
 	Found bool
 }
 
+// tool is the event's tool: the store's event's while the store holds it, else the one its evidence recorded when it
+// was filed (none, for evidence filed before evidence recorded tools whose event was gone when the column was added).
+// Where both are there they agree, but a record read again may give the event another, and then the store's decides.
+func (e caseEvent) tool() string {
+	if e.Found {
+		return e.Event.Tool
+	}
+	return e.Evidence.Tool
+}
+
+// cwd is the event's working directory, by the same rule as its tool.
+func (e caseEvent) cwd() string {
+	if e.Found {
+		return e.Event.Cwd
+	}
+	return e.Evidence.Cwd
+}
+
 // caseEvents is a case's evidence of events (ev:ID), each with the event it resolved to, the loop's own left out by the
 // one rule every count of a plan keeps (store.InDir): the counts never count an event of the loop's own runs, so the
 // evidence their admission weighs them against holds none either. An event the store no longer holds stays, by its
-// evidence's time and the tool its evidence recorded at filing, not Found: with no directory left to read, the loop's
-// own rule cannot leave it out.
+// evidence's time and what its evidence recorded at filing, not Found, and is the loop's own by its recorded directory.
 func caseEvents(ctx context.Context, st *store.Store, caseID, dir string) ([]caseEvent, error) {
 	evidence, err := st.CaseEvidence(ctx, caseID, 0)
 	if err != nil {
@@ -462,10 +479,11 @@ func caseEvents(ctx context.Context, st *store.Store, caseID, dir string) ([]cas
 		if err != nil {
 			return nil, err
 		}
-		if found && store.InDir(e.Cwd, dir) {
+		ce := caseEvent{Evidence: ev, Event: e, Found: found}
+		if store.InDir(ce.cwd(), dir) {
 			continue
 		}
-		out = append(out, caseEvent{Evidence: ev, Event: e, Found: found})
+		out = append(out, ce)
 	}
 	return out, nil
 }

@@ -291,15 +291,30 @@ func TestTheNextColumnIsOneEntryAndAStep(t *testing.T) {
 	}
 }
 
-// Evidence filed before the evidence recorded its event's tool gains the column at the next open, and step 6 gives it
-// its event's tool where the store still holds the event (#118). Evidence whose event is gone, and evidence that is
-// no event, keep none; nothing is read again, and the next open has nothing to do.
+// evidenceTools is a case's evidence by reference: each one's recorded tool and directory.
+func evidenceTools(t *testing.T, st *Store, id string) map[string][2]string {
+	t.Helper()
+	evs, err := st.CaseEvidence(context.Background(), id, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string][2]string{}
+	for _, e := range evs {
+		out[e.Ref] = [2]string{e.Tool, e.Cwd}
+	}
+	return out
+}
+
+// Evidence filed before the evidence recorded its event's tool and directory gains both columns at the next open,
+// filled where they are added (#118): the evidence whose event the store still holds takes the event's, and evidence
+// whose event is gone, and evidence that is no event, keep none. The columns take no step, so a build from before them
+// still opens the store; nothing is read again, and the next open has nothing to do.
 func TestAMigratedStoreRecordsTheToolOfTheEvidenceWhoseEventItHolds(t *testing.T) {
 	ctx := context.Background()
 	st, path := open(t)
 	at := time.UnixMilli(1_700_000_000_000)
-	bash := Event{Source: "mistakes", SourceKey: "k1", TS: at, Actor: ActorTool, Kind: "tool-error", Tool: "Bash", Summary: "exit 2"}
-	gone := Event{Source: "mistakes", SourceKey: "k2", TS: at, Actor: ActorTool, Kind: "tool-error", Tool: "Edit", Summary: "no match"}
+	bash := Event{Source: "mistakes", SourceKey: "k1", TS: at, Actor: ActorTool, Kind: "tool-error", Tool: "Bash", Cwd: "/w/a", Summary: "exit 2"}
+	gone := Event{Source: "mistakes", SourceKey: "k2", TS: at, Actor: ActorTool, Kind: "tool-error", Tool: "Edit", Cwd: "/w/b", Summary: "no match"}
 	words := Event{Source: Transcripts, SourceKey: "a@000000000000#000", TS: at, Actor: ActorOwner, Kind: "owner_text", Summary: "why"}
 	if _, _, err := st.PutFiles(ctx, []FileWrite{{Events: []Event{words}, Cursor: FileCursor{Source: Transcripts, Path: "/s/a.jsonl", Offset: 10}}}); err != nil {
 		t.Fatal(err)
@@ -313,12 +328,14 @@ func TestAMigratedStoreRecordsTheToolOfTheEvidenceWhoseEventItHolds(t *testing.T
 		t.Fatal(err)
 	}
 	st.Close()
-	// The store as the build before left it: its evidence has no tool and step 6 has not run. One event is gone since.
+	var stepsBefore int
+	rawQuery(t, path, `SELECT MAX(version) FROM schema_steps`, &stepsBefore)
+	// The store as a build from before the columns left it: its evidence has neither. One event is gone since.
 	db, err := sql.Open("sqlite", "file:"+path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`ALTER TABLE case_evidence DROP COLUMN tool; DELETE FROM schema_steps WHERE version = 6;
+	if _, err := db.Exec(`ALTER TABLE case_evidence DROP COLUMN tool; ALTER TABLE case_evidence DROP COLUMN cwd;
 	  DELETE FROM events WHERE id = ?`, gone.ID()); err != nil {
 		t.Fatal(err)
 	}
@@ -328,23 +345,54 @@ func TestAMigratedStoreRecordsTheToolOfTheEvidenceWhoseEventItHolds(t *testing.T
 		t.Fatal(err)
 	}
 	defer st.Close()
-	evs, err := st.CaseEvidence(ctx, c.ID, 0)
+	want := map[string][2]string{"ev:" + bash.ID(): {"Bash", "/w/a"}, "ev:" + gone.ID(): {}, "ev:" + words.ID(): {}, "file:/t/a": {}}
+	if got := evidenceTools(t, st, c.ID); !maps.Equal(got, want) {
+		t.Fatalf("the evidence after the columns were added: %v, want %v", got, want)
+	}
+	var stepsAfter int
+	rawQuery(t, path, `SELECT MAX(version) FROM schema_steps`, &stepsAfter)
+	if stepsAfter != stepsBefore || stepsAfter != latest() {
+		t.Fatalf("the columns took a step: %d before, %d after, this build's %d", stepsBefore, stepsAfter, latest())
+	}
+	if cs, _ := st.FileCursors(ctx, Transcripts); len(cs) != 1 {
+		t.Fatalf("the columns read again: %+v", cs)
+	}
+	if ok, err := current(st.db); err != nil || !ok {
+		t.Fatalf("after the columns the store is not current: %v", err)
+	}
+}
+
+// The fill runs where its column is added, and never again: a store a build from before version 3 visited runs every
+// step again, after that build dropped every event but the sessions', and the evidence keeps what it recorded.
+func TestTheEvidencesToolIsNotFilledAgain(t *testing.T) {
+	ctx := context.Background()
+	st, path := open(t)
+	at := time.UnixMilli(1_700_000_000_000)
+	bash := Event{Source: "mistakes", SourceKey: "k1", TS: at, Actor: ActorTool, Kind: "tool-error", Tool: "Bash", Cwd: "/w/a", Summary: "exit 2"}
+	if _, err := st.Put(ctx, []Event{bash}); err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := st.ObserveCase(ctx, Finding{Family: "failures", Signature: "s", Title: "t", Evidence: []Evidence{{Ref: "ev:" + bash.ID()}}}, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := map[string]string{}
-	for _, e := range evs {
-		got[e.Ref] = e.Tool
+	st.Close()
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	want := map[string]string{"ev:" + bash.ID(): "Bash", "ev:" + gone.ID(): "", "ev:" + words.ID(): "", "file:/t/a": ""}
-	if !maps.Equal(got, want) {
-		t.Fatalf("the evidence's tools after the step: %v, want %v", got, want)
+	if _, err := db.Exec(`DELETE FROM events WHERE source != 'sessions'; PRAGMA user_version = 2`); err != nil { // its visit
+		t.Fatal(err)
 	}
-	if cs, _ := st.FileCursors(ctx, Transcripts); len(cs) != 1 {
-		t.Fatalf("the step read again: %+v", cs)
+	db.Close()
+	st, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if ok, err := current(st.db); err != nil || !ok {
-		t.Fatalf("after the step the store is not current: %v", err)
+	defer st.Close()
+	want := map[string][2]string{"ev:" + bash.ID(): {"Bash", "/w/a"}}
+	if got := evidenceTools(t, st, c.ID); !maps.Equal(got, want) {
+		t.Fatalf("after a visit of a build from before version 3 and the steps run again: %v, want %v", got, want)
 	}
 }
 

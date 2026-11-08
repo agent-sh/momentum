@@ -571,44 +571,76 @@ func TestAnEventsReferenceTakesTheEventsOwn(t *testing.T) {
 	}
 }
 
-// An event's evidence records the event's tool as it is filed, whatever the caller gave, and keeps it once the store
-// no longer holds the event (#118); evidence that is no event has none. A merge moves the tool with the evidence.
+// An event's evidence records the event's tool and working directory as it is filed, whatever the caller gave, and
+// keeps them once the store no longer holds the event (#118); evidence that is no event has neither. A merge moves them
+// with the evidence.
 func TestAnEventsEvidenceKeepsItsToolPastTheEvent(t *testing.T) {
 	st := caseStore(t)
 	ctx := context.Background()
 	at := time.Now().Add(-time.Hour)
-	e := Event{Source: "mistakes", SourceKey: "k", TS: at, Actor: ActorTool, Kind: "tool-error", Tool: "Bash", Summary: "exit 2"}
+	e := Event{Source: "mistakes", SourceKey: "k", TS: at, Actor: ActorTool, Kind: "tool-error", Tool: "Bash", Cwd: "/w/a", Summary: "exit 2"}
 	if _, err := st.Put(ctx, []Event{e}); err != nil {
 		t.Fatal(err)
 	}
-	c, _ := observeOK(t, st, Finding{Family: "failures", Signature: "s", Title: "t", Evidence: []Evidence{{Ref: "ev:" + e.ID(), Tool: "Edit"},
-		{Ref: "file:/t/a", At: at, Tool: "Edit"}}})
+	c, _ := observeOK(t, st, Finding{Family: "failures", Signature: "s", Title: "t", Evidence: []Evidence{{Ref: "ev:" + e.ID(), Tool: "Edit", Cwd: "/x"},
+		{Ref: "file:/t/a", At: at, Tool: "Edit", Cwd: "/x"}}})
 	if _, err := st.db.ExecContext(ctx, `DELETE FROM events WHERE id = ?`, e.ID()); err != nil {
 		t.Fatal(err)
 	}
-	tools := func(id string) map[string]string {
-		t.Helper()
-		evs, err := st.CaseEvidence(ctx, id, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		out := map[string]string{}
-		for _, ev := range evs {
-			out[ev.Ref] = ev.Tool
-		}
-		return out
-	}
-	want := map[string]string{"ev:" + e.ID(): "Bash", "file:/t/a": ""}
-	if got := tools(c.ID); !maps.Equal(got, want) {
-		t.Fatalf("the evidence's tools once the event is gone: %v, want %v", got, want)
+	want := map[string][2]string{"ev:" + e.ID(): {"Bash", "/w/a"}, "file:/t/a": {}}
+	if got := evidenceTools(t, st, c.ID); !maps.Equal(got, want) {
+		t.Fatalf("the evidence once the event is gone: %v, want %v", got, want)
 	}
 	into, _ := observeOK(t, st, Finding{Family: "failures", Signature: "s2", Title: "t2", Evidence: refsAt("b", 1, at)})
 	if _, err := st.CloseCase(ctx, c.ID, Duplicate, into.ID, "same", "agent"); err != nil {
 		t.Fatal(err)
 	}
-	want["file:/t/b-0"] = ""
-	if got := tools(into.ID); !maps.Equal(got, want) {
-		t.Fatalf("the merged evidence's tools: %v, want %v", got, want)
+	want["file:/t/b-0"] = [2]string{}
+	if got := evidenceTools(t, st, into.ID); !maps.Equal(got, want) {
+		t.Fatalf("the merged evidence: %v, want %v", got, want)
+	}
+}
+
+// Evidence a case holds with no tool or directory (an older build filed it, or its event was gone when the columns were
+// added) gains them when it is filed again, as no new evidence, and when a merge brings the same evidence with them.
+// What it recorded stays: filing again fills only what it lacks.
+func TestEvidenceThatLacksItsToolGainsItWhenFiledAgain(t *testing.T) {
+	st := caseStore(t)
+	ctx := context.Background()
+	at := time.Now().Add(-time.Hour)
+	bash := Event{Source: "mistakes", SourceKey: "k1", TS: at, Actor: ActorTool, Kind: "tool-error", Tool: "Bash", Cwd: "/w/a", Summary: "exit 2"}
+	edit := Event{Source: "mistakes", SourceKey: "k2", TS: at, Actor: ActorTool, Kind: "tool-error", Tool: "Edit", Cwd: "/w/b", Summary: "no match"}
+	if _, err := st.Put(ctx, []Event{bash, edit}); err != nil {
+		t.Fatal(err)
+	}
+	f := Finding{Family: "failures", Signature: "s", Title: "t", Evidence: []Evidence{{Ref: "ev:" + bash.ID()}, {Ref: "ev:" + edit.ID()}}}
+	c, _ := observeOK(t, st, f)
+	if _, err := st.db.ExecContext(ctx, `UPDATE case_evidence SET tool = '', cwd = '' WHERE ref = ?`, "ev:"+bash.ID()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE case_evidence SET tool = 'Read', cwd = '' WHERE ref = ?`, "ev:"+edit.ID()); err != nil {
+		t.Fatal(err)
+	}
+	got, obs, err := st.ObserveCase(ctx, f, "test")
+	if err != nil || obs != Unchanged || got.Evidence != 2 {
+		t.Fatalf("the same evidence again: %s, %d pieces, %v", obs, got.Evidence, err)
+	}
+	want := map[string][2]string{"ev:" + bash.ID(): {"Bash", "/w/a"}, "ev:" + edit.ID(): {"Read", "/w/b"}}
+	if got := evidenceTools(t, st, c.ID); !maps.Equal(got, want) {
+		t.Fatalf("the evidence filed again: %v, want %v", got, want)
+	}
+	// a merge into a case that holds the same event with no tool
+	a, _ := observeOK(t, st, Finding{Family: "failures", Signature: "a", Title: "a", Evidence: []Evidence{{Ref: "ev:" + bash.ID()}}})
+	b, _ := observeOK(t, st, Finding{Family: "failures", Signature: "b", Title: "b", Evidence: []Evidence{{Ref: "ev:" + bash.ID()}}})
+	if _, err := st.db.ExecContext(ctx, `UPDATE case_evidence SET tool = '', cwd = '' WHERE case_id = ?`, b.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CloseCase(ctx, a.ID, Duplicate, b.ID, "same", "agent"); err != nil {
+		t.Fatal(err)
+	}
+	want = map[string][2]string{"ev:" + bash.ID(): {"Bash", "/w/a"}}
+	if got := evidenceTools(t, st, b.ID); !maps.Equal(got, want) {
+		t.Fatalf("the target's evidence after the merge: %v, want %v", got, want)
 	}
 }
 
