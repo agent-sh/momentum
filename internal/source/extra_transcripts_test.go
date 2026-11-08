@@ -5,10 +5,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/agent-sh/momentum/internal/store"
 )
 
 func writeJSONLines(t *testing.T, path string, rows ...map[string]any) {
@@ -41,6 +44,139 @@ func kimiRecord(kind string, fields map[string]any) map[string]any {
 	return fields
 }
 
+// kimiState writes the state.json of the Kimi session that holds the agent wire at path.
+func kimiState(t *testing.T, wire, state string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(wire))), "state.json"), []byte(state), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func kimiPrompt(text string) map[string]any {
+	return kimiRecord("turn.prompt", map[string]any{"origin": map[string]any{"kind": "user"}, "input": []any{map[string]any{"type": "text", "text": text}}})
+}
+
+func appendJSONLines(t *testing.T, path string, rows ...map[string]any) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	for _, row := range rows {
+		if err := json.NewEncoder(f).Encode(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// promptActors maps each user prompt's text to the actor and kind it was stored with.
+func promptActors(t *testing.T, st *store.Store) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, e := range all(t, st, "transcripts") {
+		if strings.HasPrefix(e.Summary, "marker-7f3a") {
+			out[e.Summary] = string(e.Actor) + " " + e.Kind
+		}
+	}
+	return out
+}
+
+// `kimi -p` gives its prompt a user origin, as a person's typing has, and records no lastPrompt in the session's
+// metadata. The prompt that started such a run is a program's; a session whose metadata cannot be read credits it
+// to no one.
+func TestKimiHeadlessPromptIsNotTheOwners(t *testing.T) {
+	for _, tc := range []struct {
+		name, state, want string
+	}{
+		{"headless", `{"version":2,"cwd":"/w"}`, "harness harness_text"},
+		{"no metadata", "", "unknown harness_text"},
+		{"unreadable metadata", "{", "unknown harness_text"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "run", "agents", "main", "wire.jsonl")
+			writeJSONLines(t, path, kimiPrompt("marker-7f3a review"), kimiRecord("turn.ended", map[string]any{}))
+			if tc.state != "" {
+				kimiState(t, path, tc.state)
+			}
+			st := openStore(t)
+			ingest(t, transcripts(home), st)
+			if got := promptActors(t, st); len(got) != 1 || got["marker-7f3a review"] != tc.want {
+				t.Fatalf("launcher prompt stored as %v, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A person who resumes a program's run in Kimi's TUI types into it: his prompts from then on are his, and the
+// prompt that started the run stays the program's.
+func TestKimiInteractivePromptsStayTheOwners(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "run", "agents", "main", "wire.jsonl")
+	writeJSONLines(t, path, kimiPrompt("marker-7f3a launcher"), kimiRecord("turn.ended", map[string]any{}))
+	kimiState(t, path, `{"version":2}`)
+	st := openStore(t)
+	src := transcripts(home)
+	ingest(t, src, st)
+	appendJSONLines(t, path, kimiPrompt("marker-7f3a typed"),
+		kimiRecord("turn.steer", map[string]any{"origin": map[string]any{"kind": "user", "inTurn": true}, "input": []any{map[string]any{"type": "text", "text": "marker-7f3a steered"}}}),
+		kimiRecord("turn.ended", map[string]any{}))
+	kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a typed"}`)
+	ingest(t, src, st)
+	want := map[string]string{"marker-7f3a launcher": "harness harness_text", "marker-7f3a typed": "owner owner_text",
+		"marker-7f3a steered": "owner owner_text"}
+	if got := promptActors(t, st); !maps.Equal(got, want) {
+		t.Fatalf("prompts stored as %v, want %v", got, want)
+	}
+}
+
+// A cursor saved before the rule holds a run's launcher prompt as the owner's: the file is read again once, its
+// records replaced, and an interactive session keeps its one owner turn.
+func TestKimiCursorFromBeforeTheRuleReadsAgain(t *testing.T) {
+	home := t.TempDir()
+	run := filepath.Join(home, ".kimi-code", "sessions", "neutral", "run", "agents", "main", "wire.jsonl")
+	typed := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed", "agents", "main", "wire.jsonl")
+	writeJSONLines(t, run, kimiPrompt("marker-7f3a launcher"), kimiRecord("turn.ended", map[string]any{}))
+	writeJSONLines(t, typed, kimiPrompt("marker-7f3a typed"), kimiRecord("turn.ended", map[string]any{}))
+	kimiState(t, typed, `{"version":2,"lastPrompt":"marker-7f3a typed"}`)
+	// What the reader before the rule stored: the launcher prompt as the owner's, under a cursor with no rule.
+	kimiState(t, run, `{"version":2,"lastPrompt":"marker-7f3a launcher"}`)
+	st := openStore(t)
+	src := transcripts(home)
+	ingest(t, src, st)
+	ctx := context.Background()
+	cursors, err := st.FileCursors(ctx, src.Name())
+	if err != nil || len(cursors) != 2 {
+		t.Fatalf("cursors %d, %v", len(cursors), err)
+	}
+	var old []store.FileWrite
+	for _, cur := range cursors {
+		var state map[string]any
+		if err := json.Unmarshal(cur.State, &state); err != nil {
+			t.Fatal(err)
+		}
+		delete(state, "Rule")
+		cur.State, _ = json.Marshal(state)
+		old = append(old, store.FileWrite{Cursor: cur})
+	}
+	if _, _, err := st.PutFiles(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	kimiState(t, run, `{"version":2}`)
+	ingest(t, src, st)
+	want := map[string]string{"marker-7f3a launcher": "harness harness_text", "marker-7f3a typed": "owner owner_text"}
+	if got := promptActors(t, st); !maps.Equal(got, want) {
+		t.Fatalf("prompts stored as %v, want %v", got, want)
+	}
+	if n := len(all(t, st, "transcripts")); n != 4 {
+		t.Fatalf("reading again stored %d events, want 4", n)
+	}
+	if r := ingest(t, src, st); r.Read != 0 {
+		t.Fatalf("a cursor under the rule read again: %+v", r)
+	}
+}
+
 func TestGrokAndKimiTranscripts(t *testing.T) {
 	for _, harness := range []string{"grok", "kimi"} {
 		t.Run(harness, func(t *testing.T) {
@@ -65,6 +201,7 @@ func TestGrokAndKimiTranscripts(t *testing.T) {
 					kimiRecord("context.append_loop_event", map[string]any{"event": map[string]any{"type": "tool.call", "toolCallId": "call-1", "name": "Shell", "args": map[string]any{"command": "cat neutral.txt"}}}),
 					kimiRecord("context.append_loop_event", map[string]any{"event": map[string]any{"type": "tool.result", "toolCallId": "call-1", "result": map[string]any{"isError": true, "output": "cat: neutral.txt: No such file or directory"}}}),
 					kimiRecord("turn.ended", map[string]any{}))
+				kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a"}`)
 			}
 			st := openStore(t)
 			src := transcripts(home)

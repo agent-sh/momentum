@@ -70,6 +70,27 @@ type nativeState struct {
 	Calls    map[string]string
 	Owner    bool
 	Known    bool
+	// Rule is the Kimi attribution rule the events before the cursor were credited by (kimiRule).
+	Rule int `json:",omitempty"`
+	// meta is a Kimi session's state.json, and read says this read has read it (kimiProvenance).
+	meta string
+	read bool
+}
+
+// kimiRule is the version of the Kimi attribution rule. A cursor saved under an older one holds owner turns
+// credited by a prompt's origin alone, a `kimi -p` run's among them: its file is read again from its start, once,
+// and each record holds what the new reading credits (PutFiles).
+const kimiRule = 1
+
+// kimiStale reports a Kimi cursor saved under an older rule. A compressed file's final cursor keeps no state, so
+// it is not read again for that; Kimi does not compress its wire files.
+func kimiStale(cursors map[string]store.FileCursor, path string) bool {
+	cur, ok := cursors[path]
+	if !ok || cur.Compressed {
+		return false
+	}
+	var st nativeState
+	return json.Unmarshal(cur.State, &st) != nil || st.Rule < kimiRule
 }
 
 func (s Transcripts) nativeSources() []TranscriptSource {
@@ -142,7 +163,11 @@ func (s Transcripts) nativeJobs(ctx context.Context, cursors map[string]store.Fi
 				continue
 			}
 			seen[path] = true
-			if j, ok := fileJob(path, evidence.Claude, cursors); ok {
+			saved := cursors
+			if src.Harness == "kimi" && kimiStale(cursors, path) {
+				saved = nil
+			}
+			if j, ok := fileJob(path, evidence.Claude, saved); ok {
 				j.native = &nativeJob{harness: src.Harness}
 				jobs = append(jobs, j)
 			}
@@ -182,6 +207,11 @@ func (s Transcripts) readNativeJob(ctx context.Context, j *job, t *tally, add fu
 			state.Known = summary.Kind != ""
 			state.Model, state.Cwd = summary.Model, summary.Info.Cwd
 		}
+	}
+	if harness == "kimi" {
+		// The session's metadata is provenance, read at the first prompt that needs it (kimiProvenance).
+		// Current metadata wins over the saved cursor.
+		state.Owner, state.Known, state.Rule = false, false, kimiRule
 	}
 	if state.Calls == nil {
 		state.Calls = map[string]string{}
@@ -267,6 +297,7 @@ func nativeIdentity(path, harness string) nativeState {
 	st := nativeState{Calls: map[string]string{}}
 	if harness == "kimi" {
 		st.Session = filepath.Base(filepath.Dir(filepath.Dir(dir)))
+		st.meta = filepath.Join(filepath.Dir(filepath.Dir(dir)), "state.json")
 		agent := filepath.Base(dir)
 		if agent != "main" {
 			st.Subagent = agent
@@ -293,7 +324,9 @@ func (s *nativeState) event(harness string, kind evidence.Kind, text string, at 
 // user uses tacit's piece attribution rather than copying its frame/paste rules.
 // Only explicit user origins in a main thread can be owner turns. Grok lacks
 // an input-origin field; its main user updates remain subject to detector filters.
-func (s *nativeState) user(harness, text string, owner bool, at time.Time, input evidence.InputKind) []evidence.Event {
+// unknown says the session's provenance could not be read: a main thread's
+// input that is not the owner's is then credited to no one.
+func (s *nativeState) user(harness, text string, owner, unknown bool, at time.Time, input evidence.InputKind) []evidence.Event {
 	var out []evidence.Event
 	for _, piece := range evidence.TurnPieces(text) {
 		kind, who := evidence.KindHarnessText, piece.Who
@@ -301,7 +334,7 @@ func (s *nativeState) user(harness, text string, owner bool, at time.Time, input
 			kind = evidence.KindOwnerText
 		} else if who == evidence.Owner {
 			who = evidence.Agent
-			if (harness == "grok" || harness == "opencode") && !s.Known && s.Subagent == "" {
+			if unknown && s.Subagent == "" {
 				who = evidence.Unknown
 			}
 		}
@@ -420,7 +453,7 @@ func (s *nativeState) grok(o map[string]any) []evidence.Event {
 	}
 	switch typ {
 	case "user_message_chunk":
-		return s.user("grok", nativeText(u["content"]), s.Owner, at, evidence.InputTyped)
+		return s.user("grok", nativeText(u["content"]), s.Owner, !s.Known, at, evidence.InputTyped)
 	case "agent_message_chunk":
 		return []evidence.Event{s.event("grok", evidence.KindAgentText, nativeText(u["content"]), at)}
 	case "tool_call", "tool_call_update":
@@ -474,12 +507,17 @@ func (s *nativeState) kimi(o map[string]any) []evidence.Event {
 	case "llm.request":
 		s.Model = str(o, "model")
 	case "turn.prompt", "turn.steer":
-		origin := str(object(o["origin"]), "kind")
 		input := evidence.InputTyped
 		if str(o, "type") == "turn.steer" {
 			input = evidence.InputQueued
 		}
-		return s.user("kimi", nativeText(o["input"]), origin == "user", at, input)
+		// A user origin says a prompt came in from outside the agent, not who sent it: `kimi -p` gives its
+		// prompt the same origin as a person typing. The session's metadata says which (kimiProvenance).
+		typed := str(object(o["origin"]), "kind") == "user" && s.Subagent == ""
+		if typed {
+			s.kimiProvenance()
+		}
+		return s.user("kimi", nativeText(o["input"]), typed && s.Owner, typed && !s.Known, at, input)
 	case "context.append_loop_event":
 		event := object(o["event"])
 		switch str(event, "type") {
@@ -513,6 +551,27 @@ func (s *nativeState) kimi(o map[string]any) []evidence.Event {
 		return []evidence.Event{s.event("kimi", evidence.KindCompaction, firstOf(str(o, "summary"), str(o, "contextSummary")), at)}
 	}
 	return nil
+}
+
+// kimiProvenance reads whether a person's client ever prompted the session. Kimi's clients (its TUI, web UI and
+// ACP server) record the session's lastPrompt in its state.json before each prompt's turn begins; `kimi -p`
+// hands its prompt to the agent loop and records none. A session whose state.json holds no lastPrompt is a
+// program's run, and one with no readable state.json has unknown provenance. It is read once per read, at the
+// first user prompt of the main agent, after that prompt's line: the lastPrompt of a prompt the reader holds was
+// written before it.
+func (s *nativeState) kimiProvenance() {
+	if s.read || s.meta == "" {
+		return
+	}
+	s.read = true
+	raw, err := os.ReadFile(s.meta)
+	var meta struct {
+		LastPrompt *string `json:"lastPrompt"`
+	}
+	if err != nil || json.Unmarshal(raw, &meta) != nil {
+		return
+	}
+	s.Owner, s.Known = meta.LastPrompt != nil, true
 }
 
 // Native paths end in shared filenames such as wire.jsonl. Their source keys

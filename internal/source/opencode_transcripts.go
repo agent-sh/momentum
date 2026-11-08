@@ -241,11 +241,11 @@ func (s *nativeState) openCode(typ string, msg map[string]any, at time.Time, v2 
 			blocks, _ := msg["content"].([]any)
 			for _, block := range blocks {
 				b := object(block)
-				out = append(out, s.user(harness, nativeText(b), owner && b["synthetic"] != true, at, evidence.InputTyped)...)
+				out = append(out, s.user(harness, nativeText(b), owner && b["synthetic"] != true, !s.Known, at, evidence.InputTyped)...)
 			}
 			return out
 		}
-		return s.user(harness, text, owner, at, evidence.InputTyped)
+		return s.user(harness, text, owner, !s.Known, at, evidence.InputTyped)
 	case "system", "synthetic":
 		return []evidence.Event{s.event(harness, evidence.KindHarnessText, str(msg, "text"), at)}
 	case "compaction":
