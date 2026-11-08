@@ -116,6 +116,35 @@ func (r *Request) Newest() *Result {
 	return r.Report
 }
 
+// resultAfter reports a result or a reply of the agent's after a time.
+func (r *Request) resultAfter(at time.Time) bool {
+	for _, x := range r.Results {
+		if x.At.After(at) {
+			return true
+		}
+	}
+	return r.Report != nil && r.Report.At.After(at)
+}
+
+// rebuild builds the requests out names again from what the threads hold now, masked, each folded.
+func (r *reader) rebuild(ctx context.Context, out []*Request) []*Request {
+	r.mask(ctx)
+	ids := map[string]bool{}
+	for _, rq := range out {
+		ids[rq.ID] = true
+	}
+	out = out[:0]
+	for _, rq := range r.requests() {
+		if ids[rq.ID] {
+			out = append(out, rq)
+		}
+	}
+	for _, rq := range out {
+		fold(rq)
+	}
+	return out
+}
+
 // Options are the rules' configuration: the prefixes of the turns the machine's programs type
 // (detect.program_prefixes), and what masks secrets in text read whole from a transcript (default tacit's
 // redaction, scrump's text profile).
@@ -131,12 +160,13 @@ const (
 )
 
 // openRe and lastRe find a handoff's own id lines: its opening line, `momentum request ID - a handoff of the
-// owner's request`, which survives the store's cut of a long paste, and its last line, `momentum request ID` at the
-// end of the text. An id the owner's prose names (`see the momentum request ID thread`) is neither. idRe is an id
-// alone.
+// owner's request`, which survives the store's cut of a long paste, and its last line at the end of the text,
+// `momentum request ID` right after its last sentence or that sentence's tail ("to the request.", which the last
+// 80 bytes the store keeps of a brief hold). An id the owner's prose names (`see the momentum request ID thread`,
+// `the same bug as momentum request ID`) is neither. idRe is an id alone.
 var (
 	openRe = regexp.MustCompile(`\bmomentum request (r[0-9a-z]{6,12}[0-9a-f]{4}) - a handoff of the owner's request\b`)
-	lastRe = regexp.MustCompile(`\bmomentum request (r[0-9a-z]{6,12}[0-9a-f]{4})\s*$`)
+	lastRe = regexp.MustCompile(`(?:` + regexp.QuoteMeta(pasteLine) + `|\bto the request\.)\s+momentum request (r[0-9a-z]{6,12}[0-9a-f]{4})\s*$`)
 	idRe   = regexp.MustCompile(`^r[0-9a-z]{6,12}[0-9a-f]{4}$`)
 )
 
@@ -290,12 +320,14 @@ type thread struct {
 	items   []item
 	pending []pair // calls the store cut or joined, and Codex's, while the thread loads: read as it loads (readWhole)
 	// sessions are the Codex sessions its calls left running, each with its command, as its load reads them
-	sessions map[sessionKey]session
-	tools    bool   // its calls and results are read (loadTools)
-	lost     []lost // its calls whose record was not read whole
-	replies  []item
-	calls    map[string]store.Event // calls waiting for their results
-	done     map[string]bool        // the tool ids of the calls read, each once
+	sessions  map[sessionKey]session
+	busy      map[[2]int64]bool // two turns the same, soon apart: whether the agent did anything between (load)
+	tools     bool              // its calls and results are read (loadTools), from toolsFrom on (zero: all of them)
+	toolsFrom time.Time
+	lost      []lost // its calls whose record was not read whole
+	replies   []item
+	calls     map[string]store.Event // calls waiting for their results
+	done      map[string]bool        // the tool ids of the calls read, each once
 }
 
 // segAt is the segment of an event at at, by its own time, whichever agent of the thread recorded it.
@@ -307,6 +339,15 @@ func (t *thread) segAt(at time.Time) int {
 		}
 	}
 	return k
+}
+
+// agentBetween reports anything of the agent's (a call, a result, a reply) between two of the thread's turns that
+// load found the same, and a reply for any other two.
+func (t *thread) agentBetween(from, to time.Time) bool {
+	if busy, ok := t.busy[[2]int64{from.UnixMilli(), to.UnixMilli()}]; ok {
+		return busy
+	}
+	return t.repliedBetween(from, to)
 }
 
 // repliedBetween reports a reply of the agent's in the thread after from and up to to.
@@ -421,6 +462,8 @@ type reader struct {
 	openings map[string][]ref // an id's opening turns
 	single   map[string]bool  // a time part one opening has, alone
 	indexed  time.Time        // the index holds what came since
+	// window is where a list's reads of calls and results begin (zero: a request's whole history, as a handoff reads)
+	window   time.Time
 	children map[string][]string
 	markers  map[string][]string   // the sessions whose turns name an id, by the id's time part
 	markIDs  map[string][]string   // the ids of a time part the markers name
@@ -521,6 +564,18 @@ func (r *reader) load(ctx context.Context, id string) error {
 	if err := r.st.ThreadEvents(ctx, id, text, func(e store.Event) error { t.add(e); return nil }); err != nil {
 		return err
 	}
+	// a turn the same as the one before it, soon after: whether the agent did anything between, a call or a reply
+	t.busy = map[[2]int64]bool{}
+	for i := 1; i < len(t.turns); i++ {
+		a, b := t.turns[i-1], t.turns[i]
+		if a.words == b.words && a.marker == b.marker && b.at.Sub(a.at) <= sameTurn {
+			busy, err := r.st.AgentEventBetween(ctx, id, a.at, b.at)
+			if err != nil {
+				return err
+			}
+			t.busy[[2]int64{a.at.UnixMilli(), b.at.UnixMilli()}] = busy
+		}
+	}
 	for _, tn := range t.turns {
 		if tn.marker != "" {
 			t.segs = append(t.segs, seg{at: tn.at, marker: tn.marker})
@@ -534,15 +589,22 @@ func (r *reader) load(ctx context.Context, id string) error {
 	return r.follow(ctx, t)
 }
 
-// loadTools reads a thread's calls and results, and reads whole what the store cut or joined of them: only for a
-// thread a request the read returns holds, so a list reads no tool event of a thread no request holds.
-func (r *reader) loadTools(ctx context.Context, t *thread) error {
-	if t == nil || t.tools || t.first.IsZero() {
+// loadTools reads a thread's calls and results from from on (zero: all of them), and reads whole what the store
+// cut or joined of them: only for a thread a request the read returns holds, so a list reads no tool event of a
+// thread no request holds. A later read from an earlier time reads only the part before what was read.
+func (r *reader) loadTools(ctx context.Context, t *thread, from time.Time) error {
+	if t == nil || t.first.IsZero() {
 		return nil
 	}
-	t.tools = true
+	if t.tools && (t.toolsFrom.IsZero() || !from.IsZero() && !from.Before(t.toolsFrom)) {
+		return nil
+	}
 	tools := read
-	tools.Part = "tools"
+	tools.Part, tools.Since = "tools", from
+	if t.tools {
+		tools.Until = t.toolsFrom
+	}
+	t.tools, t.toolsFrom = true, from
 	t.calls, t.done = map[string]store.Event{}, map[string]bool{}
 	if err := r.st.ThreadEvents(ctx, t.id, tools, func(e store.Event) error { t.add(e); return nil }); err != nil {
 		return err
@@ -788,28 +850,38 @@ func (r *reader) settle(ctx context.Context, since time.Time, match func(*Reques
 			}
 		}
 		if !start.Before(from) {
-			// the requests are known: their threads' calls and results are read now, and the requests built again
-			// with what those made (the threads' turns and links, which made the requests, do not change)
-			for _, rq := range out {
+			// the requests are known: their threads' calls and results are read now (a list's from its window on), and
+			// the requests built again with what those made (the threads' turns and links, which made the requests, do
+			// not change)
+			load := func(rq *Request, from time.Time) error {
 				for _, th := range rq.Threads {
-					if err := r.loadTools(ctx, r.threads[th.ID]); err != nil {
-						return nil, err
+					if err := r.loadTools(ctx, r.threads[th.ID], from); err != nil {
+						return err
 					}
 				}
+				return nil
 			}
-			r.mask(ctx)
-			ids := map[string]bool{}
 			for _, rq := range out {
-				ids[rq.ID] = true
-			}
-			out = out[:0]
-			for _, rq := range r.requests() {
-				if ids[rq.ID] {
-					out = append(out, rq)
+				if err := load(rq, r.window); err != nil {
+					return nil, err
 				}
 			}
-			for _, rq := range out {
-				fold(rq)
+			out = r.rebuild(ctx, out)
+			if !r.window.IsZero() {
+				// a request whose last turn is before the window and that nothing in it came after: its state needs to
+				// know whether a result came between its last turn and the window
+				again := false
+				for _, rq := range out {
+					if !rq.LastTurn.IsZero() && rq.LastTurn.Before(r.window) && !rq.resultAfter(rq.LastTurn) {
+						if err := load(rq, rq.LastTurn); err != nil {
+							return nil, err
+						}
+						again = true
+					}
+				}
+				if again {
+					out = r.rebuild(ctx, out)
+				}
 			}
 			return out, r.finish(ctx, out)
 		}

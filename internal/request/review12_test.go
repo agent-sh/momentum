@@ -37,14 +37,14 @@ func TestACutSubjectIsLeftOut(t *testing.T) {
 	}
 }
 
-// The same ask recorded again soon after, with no reply between, is one turn: it moves none of the request's turn
-// times, so the commit still came after the last turn.
+// The same ask recorded again soon after, with nothing of the agent's between, is one turn: it moves none of the
+// request's turn times.
 func TestATurnRecordedTwiceMovesNoTurnTime(t *testing.T) {
 	sec := func(n int) time.Time { return t0.Add(time.Duration(n) * time.Second) }
 	f := newFixture(t)
 	f.owner("s1", sec(0), "fix the parser")
-	f.tool("s1", "", "Bash", sec(10), `{"command":"git commit -am Fix"}`, "[main 1a2b3c4] Fix\n 1 file changed", false)
 	f.owner("s1", sec(60), "fix the parser")
+	f.tool("s1", "", "Bash", sec(65), `{"command":"git commit -am Fix"}`, "[main 1a2b3c4] Fix\n 1 file changed", false)
 	f.phase("s1", sec(70), "phase", "idle", nil)
 	got := f.group()[0]
 	if got.State != Ready || !got.LastTurn.Equal(sec(0)) || !got.Threads[0].turn.Equal(sec(0)) {
@@ -63,7 +63,7 @@ func TestAnIDInHisProseIsNoHandoff(t *testing.T) {
 	}
 	for _, c := range []struct{ name, text string }{
 		{"its opening line, the store's cut", "%s - a handoff of the owner's request Asked (the owner's words, oldest first): - fix the par…"},
-		{"its last line", "carry on ... %s"},
+		{"its last line", "carry on ... to the request. %s"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			f := newFixture(t)

@@ -484,6 +484,10 @@ var (
 // non-zero, and the session it still runs in (or the one it polled).
 func plainChunk(output string, session int64) Chunk {
 	c := Chunk{Session: session}
+	// only the header before Output: is Codex's; what follows is the command's own, which may print these words
+	if i := strings.Index(output, "Output:"); i >= 0 {
+		output = output[:i]
+	}
 	if m := exitedRe.FindStringSubmatch(output); m != nil {
 		c.Failed = m[1] != "0"
 	} else if m := runningRe.FindStringSubmatch(output); m != nil {

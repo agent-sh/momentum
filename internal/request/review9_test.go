@@ -125,7 +125,7 @@ func TestEachLinkingReasonLinks(t *testing.T) {
 			f := newFixture(t)
 			f.owner("s-src", at(0), "index the archive")
 			src := f.group()[0]
-			f.event("s-next", "", "agent_text", store.ActorAgent, at(10), "Continue this. "+Line(src.ID)+" ... "+Line(src.ID), map[string]any{"why": c.why})
+			f.event("s-next", "", "agent_text", store.ActorAgent, at(10), "Continue this. "+pasted(src.ID, "..."), map[string]any{"why": c.why})
 			f.tool("s-next", "", "Bash", at(11), `{"command":"git commit -m index"}`, "[main 7c7c7c7] Index the archive", false)
 			linked := false
 			for _, rq := range f.group() {

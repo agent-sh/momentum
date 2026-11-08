@@ -92,7 +92,7 @@ func TestARequestWhoseSessionsMovedOnSaysSo(t *testing.T) {
 	f.owner("s-moved", at(0), "write the migration")
 	first := f.group()[0]
 	other := ID(at(-600), "an older request")
-	f.owner("s-moved", at(10), Line(other)+" - a handoff ... "+Line(other))
+	f.owner("s-moved", at(10), pasted(other, "..."))
 	f.phase("s-moved", at(11), "phase", "idle", nil)
 	for _, rq := range f.group() {
 		if rq.ID == first.ID {
@@ -249,7 +249,7 @@ func TestItsIDAndItsSessionNameTheSameRequest(t *testing.T) {
 }
 
 // The same request in a list whose window holds only the third session: the list and the handoff must agree on
-// it.
+// its turns, its sessions and its state (the list reads the results of its window only).
 func TestListAndHandoffAgreeOnARequestFromBefore(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
@@ -271,9 +271,8 @@ func TestListAndHandoffAgreeOnARequestFromBefore(t *testing.T) {
 	if err != nil || len(list) != 1 {
 		t.Fatalf("list: %v %d", err, len(list))
 	}
-	if list[0].State != full.State || Handoff(list[0]) != Handoff(full) {
-		t.Fatalf("handoff says %s, list says %s; the list's newest is %s, the handoff's %s", full.State, list[0].State,
-			list[0].Newest().Key, full.Newest().Key)
+	if list[0].State != full.State || words(list[0].Asks) != words(full.Asks) || len(list[0].Threads) != len(full.Threads) {
+		t.Fatalf("handoff says %s with %d sessions, list says %s with %d", full.State, len(full.Threads), list[0].State, len(list[0].Threads))
 	}
 }
 
@@ -284,7 +283,7 @@ func TestACodexSubagentsReportDoesNotLink(t *testing.T) {
 	f.owner("s-old", at(0), "write the backup script")
 	other := f.group()[0]
 	f.owner("s-codex", at(10), "check the disk alerts")
-	f.event("s-codex", "", "agent_text", store.ActorAgent, at(11), "Report: I printed it. "+Line(other.ID)+" - a handoff ... "+Line(other.ID),
+	f.event("s-codex", "", "agent_text", store.ActorAgent, at(11), "Report: I printed it. "+pasted(other.ID, "..."),
 		map[string]any{"why": "message from another agent"})
 	f.owner("s-codex", at(12), "now tune the alert thresholds")
 	reqs := f.group()
@@ -300,7 +299,7 @@ func TestABriefLinks(t *testing.T) {
 	f := newFixture(t)
 	f.owner("s-src", at(0), "index the archive")
 	src := f.group()[0]
-	f.event("s-headless", "", "agent_text", store.ActorAgent, at(10), "Continue this. "+Line(src.ID)+" ... "+Line(src.ID),
+	f.event("s-headless", "", "agent_text", store.ActorAgent, at(10), "Continue this. "+pasted(src.ID, "..."),
 		map[string]any{"why": "entrypoint sdk-cli"})
 	f.tool("s-headless", "", "Bash", at(11), `{"command":"git commit -m index"}`, "[main 7c7c7c7] Index the archive", false)
 	rq := f.group()[0]
@@ -336,7 +335,7 @@ func TestAReadAgainKeepsTheLinks(t *testing.T) {
 	f := newFixture(t)
 	e := f.owner("s-re", at(0), "fix the importer")
 	rq := f.group()[0]
-	f.owner("s-cont", at(20), Line(rq.ID)+" - a handoff ... "+Line(rq.ID))
+	f.owner("s-cont", at(20), pasted(rq.ID, "..."))
 	f.tool("s-cont", "", "Bash", at(21), `{"command":"git commit"}`, "[main 4444ddd] Import the rest", false)
 	e.Summary = "fix the importer [the paste it cut before]"
 	f.evs = append(f.evs, e)
@@ -430,7 +429,7 @@ func TestAProgramsPastedHandoffLinks(t *testing.T) {
 	f := newFixture(t)
 	f.owner("s-src", at(0), "tune the cache")
 	src := f.groupWith(Options{Prefixes: []string{"[relay]"}, Redact: fakeRedact})[0]
-	f.owner("s-relayed", at(10), "[relay] "+Line(src.ID)+" - a handoff ... "+Line(src.ID))
+	f.owner("s-relayed", at(10), "[relay] "+pasted(src.ID, "..."))
 	f.tool("s-relayed", "", "Bash", at(11), `{"command":"git commit -m tune"}`, "[main 5d5d5d5] Tune the cache", false)
 	reqs := f.groupWith(Options{Prefixes: []string{"[relay]"}, Redact: fakeRedact})
 	if len(reqs) != 1 || !strings.Contains(kinds(reqs[0].Results), "5d5d5d5") {

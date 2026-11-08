@@ -2,8 +2,10 @@ package request
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
+	"github.com/agent-sh/momentum/internal/evidenceview"
 	"github.com/agent-sh/momentum/internal/plain"
 )
 
@@ -133,11 +135,43 @@ func Handoff(rq *Request) string {
 		line("- %s %s%s, %s to %s, %s", th.Harness, th.ID, where, th.First.Local().Format(timeFormat), th.Last.Local().Format(timeFormat), phase)
 	}
 	if len(evidence) > 0 {
-		line("Evidence (momentum evidence show ID): %s", strings.Join(evidence, " "))
+		// each line a command evidence show takes: at most ShowMost ids
+		line("Evidence:")
+		for i := 0; i < len(evidence); i += evidenceview.ShowMost {
+			line("- momentum evidence show %s", strings.Join(evidence[i:min(i+evidenceview.ShowMost, len(evidence))], " "))
+		}
 	}
 	line("%s", pasteLine)
 	line("%s", Line(rq.ID))
-	return b.String()
+	return foldHome(b.String())
+}
+
+// foldHome writes the home directory as ~ wherever a text names it as a path's start: a handoff is pasted on this
+// machine, so its working directories and files read the same, and the home's name stays out of the paste.
+func foldHome(text string) string {
+	home, err := os.UserHomeDir()
+	home = strings.TrimRight(home, "/")
+	if err != nil || home == "" {
+		return text
+	}
+	pathByte := func(c byte) bool {
+		return c == '/' || c == '.' || c == '_' || c == '-' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+	}
+	var b strings.Builder
+	for {
+		i := strings.Index(text, home)
+		if i < 0 {
+			b.WriteString(text)
+			return b.String()
+		}
+		end := i + len(home)
+		if (i == 0 || !pathByte(text[i-1])) && (end == len(text) || text[end] == '/' || !pathByte(text[end])) {
+			b.WriteString(text[:i] + "~")
+		} else {
+			b.WriteString(text[:end])
+		}
+		text = text[end:]
+	}
 }
 
 // stateLine says the state and what it rests on.

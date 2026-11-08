@@ -112,6 +112,8 @@ type ThreadRead struct {
 	// Part is what of it a read takes: "text" the main thread's text alone, "tools" the calls and results alone,
 	// "" both
 	Part string
+	// Since and Until bound the events read, Since included and Until not; zero for no bound
+	Since, Until time.Time
 }
 
 // ThreadEvents passes a session's transcript events that read selects, its subagents' among them, oldest first,
@@ -155,20 +157,31 @@ func (s *Store) ThreadEvents(ctx context.Context, session string, read ThreadRea
 		textPart = "0"
 	}
 	const toolID = `CASE WHEN json_valid(meta) THEN json_extract(meta, '$.tool_id') END`
+	// the bound on each read of the session's events: its index's range
+	span := ""
+	var spanArgs []any
+	if !read.Since.IsZero() {
+		span += ` AND ts >= ?`
+		spanArgs = append(spanArgs, read.Since.UnixMilli())
+	}
+	if !read.Until.IsZero() {
+		span += ` AND ts < ?`
+		spanArgs = append(spanArgs, read.Until.UnixMilli())
+	}
 	shellCall := `kind = 'tool_call' AND lower(tool) IN ` + in(read.Shells) + ` AND ` + marks
 	var args []any
-	args = append(append(append(args, session, Transcripts), anys(read.Shells)...), callArgs...)
-	args = append(append(append(args, session, Transcripts), anys(read.YieldTools)...), anys(read.YieldMarks)...)
-	args = append(append(args, session, Transcripts), anys(read.Writers)...)
+	args = append(append(append(append(args, session, Transcripts), spanArgs...), anys(read.Shells)...), callArgs...)
+	args = append(append(append(append(args, session, Transcripts), spanArgs...), anys(read.YieldTools)...), anys(read.YieldMarks)...)
+	args = append(append(append(args, session, Transcripts), spanArgs...), anys(read.Writers)...)
 	args = append(append(args, anys(read.Shells)...), callArgs...)
 	args = append(args, anys(read.YieldTools)...)
 	args = append(append(args, anys(read.Shells)...), resultArgs...)
 	rows, err := s.db.QueryContext(ctx, `WITH calls(id) AS (SELECT `+toolID+` FROM events INDEXED BY events_session
-	    WHERE session = ? AND source = ? AND `+shellCall+`),
+	    WHERE session = ? AND source = ?`+span+` AND `+shellCall+`),
 	  yields(id) AS (SELECT `+toolID+` FROM events INDEXED BY events_session
-	    WHERE session = ? AND source = ? AND kind = 'tool_result' AND lower(tool) IN `+in(read.YieldTools)+` AND `+yieldMarks+`)
+	    WHERE session = ? AND source = ?`+span+` AND kind = 'tool_result' AND lower(tool) IN `+in(read.YieldTools)+` AND `+yieldMarks+`)
 	  SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
-	  tool, summary, meta, ref, heuristic, experiment FROM events INDEXED BY events_session WHERE session = ? AND source = ? AND (
+	  tool, summary, meta, ref, heuristic, experiment FROM events INDEXED BY events_session WHERE session = ? AND source = ?`+span+` AND (
 	    (`+textPart+` AND kind IN ('owner_text', 'agent_text') AND (agent = '' OR agent = session))
 	    OR (`+toolPart+` AND (
 	      (kind IN ('tool_call', 'tool_result') AND lower(tool) IN `+in(read.Writers)+`)
@@ -195,6 +208,15 @@ func (s *Store) ThreadEvents(ctx context.Context, session string, read ThreadRea
 		}
 	}
 	return rows.Err()
+}
+
+// AgentEventBetween reports a transcript event of an agent's (a call, its result, a reply) in a session after from
+// and before to, any of its agents'.
+func (s *Store) AgentEventBetween(ctx context.Context, session string, from, to time.Time) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM (SELECT 1 FROM events INDEXED BY events_session WHERE session = ? AND source = ?
+	  AND ts > ? AND ts < ? AND actor IN (?, ?) LIMIT 1)`, session, Transcripts, from.UnixMilli(), to.UnixMilli(), string(ActorAgent), string(ActorTool)).Scan(&n)
+	return n > 0, err
 }
 
 // OwnerTurnsBetween are the main-thread owner turns of the transcripts from from to through, both included,

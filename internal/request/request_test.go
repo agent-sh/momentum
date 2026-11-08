@@ -182,6 +182,12 @@ func kinds(rs []Result) string {
 	return strings.Join(out, " | ")
 }
 
+// pasted is a handoff of id pasted as the store keeps it, its lines joined: its opening line, a body, its last
+// sentence and its closing line.
+func pasted(id, body string) string {
+	return Line(id) + " - a handoff of the owner's request " + body + " " + pasteLine + " " + Line(id)
+}
+
 func words(as []Ask) string {
 	var out []string
 	for _, a := range as {

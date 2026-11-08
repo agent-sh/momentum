@@ -233,9 +233,9 @@ func fill(u sets, reqs map[string]*Request, t *thread) {
 		if tn.program {
 			words = "" // a program's words are not his, though the handoff it pasted links
 		}
-		// The same words again soon, with no reply between, are one turn the transcript holds twice: the copy is no
-		// later turn of the request's.
-		if prev != nil && prev.Words == words && prev.Handoff == tn.marker && tn.at.Sub(prev.At) <= sameTurn && !t.repliedBetween(prev.At, tn.at) {
+		// The same words again soon, with nothing of the agent's between (a call, a result, a reply), are one turn the
+		// transcript holds twice: the copy is no later turn of the request's.
+		if prev != nil && prev.Words == words && prev.Handoff == tn.marker && tn.at.Sub(prev.At) <= sameTurn && !t.agentBetween(prev.At, tn.at) {
 			continue
 		}
 		if tn.at.After(rq.LastTurn) {

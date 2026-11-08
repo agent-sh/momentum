@@ -178,7 +178,9 @@ func (r *reader) idOf(ctx context.Context, rq *Request, id string) bool {
 
 // List is the requests with events since a time, newest first. It reads the threads with events since then, and
 // every thread a link reaches from them, with the links that name them since the earliest of those requests
-// began: each holds what it holds when found by its id.
+// began. It reads only what it shows: the results whose calls came since that time, and, for a request whose
+// last turn is before it and that nothing since came after, the results between that turn and it, which its state
+// needs. Its requests' turns, links and states are those its handoff finds; their results are those of the window.
 func List(ctx context.Context, st *store.Store, since time.Time, opt Options) ([]*Request, error) {
 	seeds, err := st.ThreadsSince(ctx, since)
 	if err != nil {
@@ -186,6 +188,7 @@ func List(ctx context.Context, st *store.Store, since time.Time, opt Options) ([
 	}
 	r := newReader(st, opt)
 	defer r.close()
+	r.window = since
 	for _, s := range seeds {
 		r.enqueue(s)
 	}

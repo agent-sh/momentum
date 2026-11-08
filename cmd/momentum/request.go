@@ -51,10 +51,11 @@ type requestJSON struct {
 	Asking  string   `json:"asking"`
 	Asks    int      `json:"asks"`
 	Threads []string `json:"threads"`
-	Results int      `json:"results"`
-	Newest  string   `json:"newest,omitempty"`
-	Open    string   `json:"open,omitempty"`
-	Aliases []string `json:"aliases,omitempty"`
+	// ResultsInWindow counts its results whose calls came in the list's window (since): a list reads only those
+	ResultsInWindow int      `json:"results_in_window"`
+	Newest          string   `json:"newest,omitempty"`
+	Open            string   `json:"open,omitempty"`
+	Aliases         []string `json:"aliases,omitempty"`
 }
 
 func requestList(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -86,11 +87,18 @@ func requestList(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		out := struct {
 			Version     int           `json:"version"`
 			GeneratedAt string        `json:"generated_at"`
+			Since       string        `json:"since"` // the window: a request's results_in_window counts those since
 			Requests    []requestJSON `json:"requests"`
-		}{Version: 1, GeneratedAt: time.Now().Format(time.RFC3339), Requests: []requestJSON{}}
+		}{Version: 1, GeneratedAt: time.Now().Format(time.RFC3339), Since: from.Local().Format(time.RFC3339), Requests: []requestJSON{}}
 		for _, rq := range reqs {
+			n := 0
+			for _, x := range rq.Results {
+				if !x.At.Before(from) {
+					n++
+				}
+			}
 			j := requestJSON{ID: rq.ID, State: rq.State, Last: rq.Last.Local().Format(time.RFC3339), Asking: asking(rq), Asks: len(rq.Asks),
-				Threads: []string{}, Results: len(rq.Results), Open: plain.Line(rq.Open), Aliases: rq.Aliases}
+				Threads: []string{}, ResultsInWindow: n, Open: plain.Line(rq.Open), Aliases: rq.Aliases}
 			if !rq.Opened.IsZero() {
 				j.Opened = rq.Opened.Local().Format(time.RFC3339)
 			}

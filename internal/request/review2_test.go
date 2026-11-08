@@ -97,7 +97,7 @@ func TestListAndHandoffAgreeOnAPhaseFromBefore(t *testing.T) {
 	if b == nil {
 		t.Fatal("no request b")
 	}
-	f.owner("s-a", at(20), "carry on\n"+Line(b.ID)+"\n...\n"+Line(b.ID))
+	f.owner("s-a", at(20), "carry on\n"+pasted(b.ID, "..."))
 	reqs = f.group()
 	for _, rq := range reqs {
 		if rq.ID == b.ID {

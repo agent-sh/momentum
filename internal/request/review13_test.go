@@ -78,7 +78,8 @@ func TestHisWordsAfterAPastedHandoff(t *testing.T) {
 func TestASingleIDLineInAnUncutText(t *testing.T) {
 	for _, c := range []struct{ name, text, want string }{
 		{"the opening line", "%s - a handoff of the owner's request\nand fix the flaky test", "and fix the flaky test"},
-		{"the last line", "carry on with it %s", "carry on with it"},
+		{"the last line", "carry on with it " + pasteLine + " %s", "carry on with it"},
+		{"the last sentence's tail", "carry on with it ... to the request. %s", "carry on with it ..."},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			f := newFixture(t)
