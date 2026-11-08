@@ -481,6 +481,9 @@ var claudeFiles = fileTools{harness: "claude", read: "Read", write: "Write"}
 
 const claudeMissing = "<tool_use_error>File does not exist. Note: your current working directory is /w.</tool_use_error>"
 
+// codexMissing is Codex's read_file of a file that is not there, which names no path.
+const codexMissing = "failed to read file: No such file or directory (os error 2)"
+
 // readMissing is Claude Code's Read of a file that is not there; wrote, its Write of one.
 func (f *fileTools) readMissing(session, path string, at time.Time) []store.Event {
 	return f.pair(session, f.read, fmt.Sprintf(`{"file_path":%q}`, path), claudeMissing, true, at)
@@ -495,7 +498,7 @@ func (f *fileTools) wrote(session, path string, at time.Time) []store.Event {
 // without the rule it finds more: the reads miss one path, which a not-found read is keyed by.
 func TestAReadOfAFileItsSessionThenCreatesIsNoFailure(t *testing.T) {
 	const x = "/w/out/x.md"
-	missing := "failures/v2:tool:read:file not found: " + x
+	missing := "failures/v2:miss:read:" + x
 	for _, tc := range []struct {
 		name   string
 		events func(f *fileTools) []store.Event
@@ -672,7 +675,7 @@ func TestAFoldedPatchNamesItsFileUpToAChunk(t *testing.T) {
 		for i, session := range []string{"s1", "s1", "s2"} {
 			p := "/w/out/x.md"
 			at := t0.Add(time.Duration(i) * time.Hour)
-			evs = append(evs, f.pair(session, "read_file", fmt.Sprintf(`{"path":%q}`, p), "File not found: "+p, true, at)...)
+			evs = append(evs, f.pair(session, "read_file", fmt.Sprintf(`{"file_path":%q}`, p), codexMissing, true, at)...)
 			evs = append(evs, f.pair(session, "apply_patch", fmt.Sprintf(text, p), "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: M "+p,
 				false, at.Add(time.Minute))...)
 		}
@@ -697,7 +700,7 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 		{"hermes", "read_file", "patch", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"mode":"replace","path":"/w/@"}`, `{"success": true, "diff": "x"}`},
 		{"opencode", "read", "write", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"filePath":"/w/@","content":"x"}`, "Created file successfully: /w/@"},
 		{"pi", "read", "write", `{"path":"/w/@"}`, "ENOENT: no such file or directory, access '/w/@'", `{"path":"/w/@","content":"x"}`, "Successfully wrote 1 bytes to /w/@"},
-		{"pi", "read", "edit", `{"path":"/w/@"}`, "ENOENT: '/w/@'", `{"path":"/w/@","oldText":"","newText":"x"}`, "Successfully replaced text in /w/@"},
+		{"pi", "read", "edit", `{"path":"/w/@"}`, "ENOENT: no such file or directory, access '/w/@'", `{"path":"/w/@","oldText":"","newText":"x"}`, "Successfully replaced text in /w/@"},
 		{"pi", "read", "write", `{"path":"/w/@"}`, "ENOENT: no such file or directory, access '/w/@'", `{"path":"/w/@","content":"x"}`, "Successfully wrote to /w/@"},
 		{"pi", "read", "edit", `{"path":"/w/@"}`, "ENOENT: no such file or directory, access '/w/@'", `{"path":"/w/@","edits":[]}`, "Successfully replaced 2 block(s) in /w/@."},
 		{"kimi", "Read", "Write", `{"path":"/w/@"}`, `"/w/@" does not exist.`, `{"path":"/w/@","content":"x","mode":"append"}`, "Appended 5 bytes to /w/@"},
@@ -713,16 +716,16 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 		{"opencode", "read", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Add File: /w/@\n+x\n*** End Patch"}`, "Success. Updated the following files: A /w/@"},
 		{"opencode", "read", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Update File: /w/old\n*** Move to: /w/@\n@@\n+x\n*** End Patch"}`, "Success. Updated the following files: M /w/@"},
 		{"opencode", "read", "patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Update File: /w/@\n@@\n+x\n*** End Patch"}`, "Success. Updated the following files: M /w/@"},
-		{"codex", "read_file", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Add File: /w/@ +x *** End Patch", "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
-		{"codex", "read_file", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch\n*** Add File: /w/other\n+x\n*** Add File: /w/@\n+y\n*** End Patch",
+		{"codex", "read_file", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, "*** Begin Patch *** Add File: /w/@ +x *** End Patch", "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
+		{"codex", "read_file", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, "*** Begin Patch\n*** Add File: /w/other\n+x\n*** Add File: /w/@\n+y\n*** End Patch",
 			"Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/other A /w/@"},
-		{"codex", "read_file", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch\n*** Update File: /w/old\n*** Move to: /w/@\n@@\n+x\n*** End Patch",
+		{"codex", "read_file", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, "*** Begin Patch\n*** Update File: /w/old\n*** Move to: /w/@\n@@\n+x\n*** End Patch",
 			"Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: M /w/@"},
-		{"codex", "read_file", "apply_patch", `{"path":"/w/@/my file.txt"}`, "File not found: /w/@/my file.txt", "*** Begin Patch *** Add File: /w/@/my file.txt +x *** End Patch",
+		{"codex", "read_file", "apply_patch", `{"file_path":"/w/@/my file.txt"}`, codexMissing, "*** Begin Patch *** Add File: /w/@/my file.txt +x *** End Patch",
 			"Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@/my file.txt"},
-		{"codex", "read_file", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Add File: /w/@ *** End Patch", "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
-		{"codex", "read_file", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Update File: /w/@ -a +b *** End Patch", "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: M /w/@"},
-		{"codex", "read_file", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Update File: /w/old *** Move to: /w/@ -a +x *** End Patch",
+		{"codex", "read_file", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, "*** Begin Patch *** Add File: /w/@ *** End Patch", "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
+		{"codex", "read_file", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, "*** Begin Patch *** Update File: /w/@ -a +b *** End Patch", "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: M /w/@"},
+		{"codex", "read_file", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, "*** Begin Patch *** Update File: /w/old *** Move to: /w/@ -a +x *** End Patch",
 			"Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: M /w/@"},
 		{"opencode", "read", "apply_patch", `{"filePath":"/w/@/my file.txt"}`, "File not found: /w/@/my file.txt", `{"patchText":"*** Begin Patch\n*** Add File: /w/@/my file.txt\n+x\n*** End Patch"}`,
 			"Success. Updated the following files: A /w/@/my file.txt"},
@@ -730,7 +733,7 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 		{"opencode", "read", "apply_patch", `{"filePath":"/w/@/my file.txt"}`, "File not found: /w/@/my file.txt",
 			`{"patchText":"*** Begin Patch\n*** Update File: /w/old\n*** Move to:  /w/@/my file.txt \n@@\n+x\n*** End Patch"}`, "Success. Updated the following files: M /w/@/my file.txt"},
 		{"pi", "read", "write", `{"path":"@"}`, "ENOENT: no such file or directory, access '@'", `{"path":"@","content":"x"}`, "Successfully wrote 1 bytes to @"},
-		{"codex", "read_file", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Add File: /w/@ +x", "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
+		{"codex", "read_file", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, "*** Add File: /w/@ +x", "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
 		{"opencode", "read", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Add File: /w/@\n*** Move to: /w/x\n+x\n*** End Patch"}`, "Success. Updated the following files: A /w/@"},
 	} {
 		t.Run(tc.harness+"/"+tc.write, func(t *testing.T) {
@@ -778,9 +781,9 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 		{"claude", "Write", `{"file_path":"/w/@"}`, claudeMissing, `{"file_path":"/w/@","content":"x"}`, "<tool_use_error>File has been modified since read, either by the user or by a linter.</tool_use_error>"},
 		{"claude", "MultiEdit", `{"file_path":"/w/@"}`, claudeMissing, `{"file_path":"/w/@","edits":[]}`, "Applied 1 edit to /w/@"},
 		{"hermes", "patch", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"path":"/w/@"}`, "[patch] replace in /w/@ (120 chars result)"},
-		{"codex", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Add File: /w/@ +x *** End Patch", "Exit code: 1 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
-		{"codex", "Write", `{"path":"/w/@"}`, "File not found: /w/@", `{"file_path":"/w/@","content":"x"}`, "File created successfully at: /w/@"},
-		{"codex", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Add File: /w/@ +x *** End Patch", "Exit code: 0 Wall time: 0.1 seconds Output: patch left unapplied"},
+		{"codex", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, "*** Begin Patch *** Add File: /w/@ +x *** End Patch", "Exit code: 1 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
+		{"codex", "Write", `{"file_path":"/w/@"}`, codexMissing, `{"file_path":"/w/@","content":"x"}`, "File created successfully at: /w/@"},
+		{"codex", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, "*** Begin Patch *** Add File: /w/@ +x *** End Patch", "Exit code: 0 Wall time: 0.1 seconds Output: patch left unapplied"},
 		{"hermes", "write_file", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"path":"/w/@","content":"x"}`, `{"bytes_written": 0, "dirs_created": false, "error": "Refusing to write internal read_file display text as file content"}`},
 		{"hermes", "write_file", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"path":"/w/@","content":"x"}`, `{"bytes_written": 0, "error": {"code": 1}}`},
 		{"hermes", "patch", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"mode":"replace","path":"/w/@"}`, `{"success": true, "no_change": true, "note": "Non-exact match, No write performed"}`},
@@ -788,7 +791,7 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 		{"opencode", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Delete File: /w/@\n*** End Patch"}`, "Success. Updated the following files: D /w/@"},
 		{"opencode", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Add File: /w/other\n+text *** Add File: /w/@\n*** End Patch"}`, "Success. Updated the following files: A /w/other"},
 		{"opencode", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Update File: /w/@\n*** Move to: /w/elsewhere\n@@\n+x\n*** End Patch"}`, "Success. Updated the following files: M /w/elsewhere"},
-		{"codex", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Add File: /w/other +x *** Add File: /w/@ +y *** End Patch", "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/other A /w/@"}, {"hermes", "patch", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"path":"/w/@"}`, `{"success": true, "error": "the patch left the file unchanged"}`},
+		{"codex", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, "*** Begin Patch *** Add File: /w/other +x *** Add File: /w/@ +y *** End Patch", "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/other A /w/@"}, {"hermes", "patch", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"path":"/w/@"}`, `{"success": true, "error": "the patch left the file unchanged"}`},
 		{"hermes", "write_file", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"path":"/w/@","content":"x"}`, `Refused: {"bytes_written": 1, "dirs_created": true}`},
 		{"hermes", "patch", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"path":"/w/@"}`, `Not applied: {"success": true, "diff": ""}`},
 		{"grok", "write", `{"path":"/w/@"}`, "Error: /w/@ does not exist.", `{"file_path":"/w/@","content":"x"}`, `{"EditsApplied":{"absolute_path":"/w/@","edits":[]}}`},
@@ -800,7 +803,7 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 		{"opencode", "patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Add File: /w/@\n+x\n*** End Patch"}`, "Rolled back: Success. Updated the following files: A /w/@"},
 		{"pi", "write", `{"path":"/w/@"}`, "ENOENT: no such file or directory, access '/w/@'", `{"path":"/w/@","content":"x"}`, "Rolled back: Successfully wrote to /w/@"},
 		{"pi", "edit", `{"path":"/w/@"}`, "ENOENT: no such file or directory, access '/w/@'", `{"path":"/w/@","edits":[]}`, "Rolled back: Successfully replaced 1 block(s) in /w/@."},
-		{"codex", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Add File: /w/@ +x *** End Patch", "Note: Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
+		{"codex", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, "*** Begin Patch *** Add File: /w/@ +x *** End Patch", "Note: Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
 		{"opencode", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Add File: /w/@\n+x\n*** End Patch"}`, "patch verification failed: Failed to find expected lines in /w/@"},
 		{"claude", "Edit", `{"file_path":"/w/@"}`, claudeMissing, `{"file_path":"/w/@","old_string":"a","new_string":"b"}`, "A hook said: The file /w/@ has been updated successfully. Then it reverted it."},
 	} {
@@ -1146,7 +1149,7 @@ func TestAReadClearsOnlyOnAWriteWithinTheHour(t *testing.T) {
 		f.wrote("s3", x, t0.Add(-10*time.Minute)), f.readMissing("s3", x, t0), f.wrote("s3", x, t0.Add(30*time.Minute)),
 		f.readMissing("s3", x, t0), f.wrote("s3", x, t0.Add(3*time.Hour)))...)
 	fs, err := Failures{}.Detect(context.Background(), st, week())
-	if got, want := signatures(fs), []string{"failures/v2:tool:read:file not found: " + x + " 3"}; err != nil || !slices.Equal(got, want) {
+	if got, want := signatures(fs), []string{"failures/v2:miss:read:" + x + " 3"}; err != nil || !slices.Equal(got, want) {
 		t.Fatalf("found %v, %v, want %v", got, err, want)
 	}
 }

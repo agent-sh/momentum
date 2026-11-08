@@ -89,15 +89,16 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 		}
 		for _, e := range candidates {
 			failed = append(failed, seen{e.Session, e.Tool, e.TS})
-			call := calls[e.ID()].Input
-			k, ok := FailureOf(e.Harness, e.Tool, e.Summary, call)
+			call := calls[e.ID()]
+			k, ok := failureKey(e.Harness, e.Tool, e.Summary, call)
 			if !ok {
 				continue
 			}
 			// a read of a file its thread writes within the settle time found it not there yet: no failure; one younger
-			// than the settle time may have its write still to come
-			if notFound(e.Tool, e.Summary, k) {
-				p, _, _ := callField(call, pathKeys)
+			// than the settle time may have its write still to come. The read names its file as its call spells it,
+			// as a write does, not as its key holds it.
+			if k.missed() {
+				p, _, _ := callField(call.Input, pathKeys)
 				if settling(e.TS, w) || slices.ContainsFunc(written[wrote{e.Session, e.Agent, p}],
 					func(t time.Time) bool { return t.After(e.TS) && !t.After(e.TS.Add(readSettle)) }) {
 					continue
@@ -130,8 +131,8 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 		if e.Tool != "" && same(e.Session, e.Tool, e.TS) {
 			continue
 		}
-		// MistakeKey keys no read that found no file, which the transcript does not hold: the log keeps no call to
-		// name its path
+		// MistakeKey keys no read that found no file, which the transcript does not hold: the store keeps none of the
+		// log's input for a tool error, so no call names its path
 		k, ok := MistakeKey(e.Kind, e.Tool, e.Summary)
 		if !ok {
 			continue
@@ -144,7 +145,7 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 }
 
 // readTools are the harnesses' file tools that read a file, by their names in lower case: Claude Code's, pi's,
-// OpenCode's and Kimi's Read, Hermes's and Grok's read_file.
+// OpenCode's and Kimi's Read, Hermes's, Grok's and Codex's read_file.
 var readTools = map[string]bool{"read": true, "read_file": true}
 
 // fileWrites are the file tools' own words for a write that landed, per harness and tool (in lower case), as each
@@ -203,14 +204,20 @@ func hermesError(result string) bool {
 // modeKeys are Hermes's patch field that says how it patches.
 var modeKeys = map[string]bool{"mode": true}
 
-// notFoundRe is a read tool's error that no file is at its path: Claude Code's "File does not exist", Kimi's and
-// Grok's "PATH does not exist", a file not found (OpenCode's, Codex's, Hermes's, which says "not_found": true after
-// it), the system's ENOENT (pi's). Access refused is none of them; nor is a tool that does not exist (toolGoneRe,
-// Hermes's words for a tool it does not offer).
-var (
-	notFoundRe = regexp.MustCompile(`(?i)\bdoes not exist\b|\b(?:file|path) not found\b|no such file or directory|\benoent\b`)
-	toolGoneRe = regexp.MustCompile(`(?i)^tool '[^']*' does not exist\b`)
-)
+// missForms are each harness's read tool's own words for a file that is not there, at its error's start, as its
+// source writes them: Claude Code's Read, Kimi's Read (the path in quotes), Grok's read_file (after its envelope's
+// "Error: "), OpenCode's read, Hermes's read_file (its JSON's error field, its missing file's or Python's), pi's read
+// (Node's error for the access it makes first), Codex's read_file. Access refused, a guard's or the harness's refusal,
+// and any other error that says something does not exist (Hermes's terminal directory gone) are none of them.
+var missForms = map[string]*regexp.Regexp{
+	"claude":   regexp.MustCompile(`^File does not exist\.`),
+	"kimi":     regexp.MustCompile(`^".*" does not exist\.`),
+	"grok":     regexp.MustCompile(`^Error: .* does not exist\.`),
+	"opencode": regexp.MustCompile(`^File not found: `),
+	"hermes":   regexp.MustCompile(`^(?:File not found: |\[Errno 2\] No such file or directory)`),
+	"pi":       regexp.MustCompile(`^ENOENT: no such file or directory`),
+	"codex":    regexp.MustCompile(`^failed to read file: No such file or directory`),
+}
 
 // pathKeys are the fields of a file tool's input that name its file; readPathKeys, a read tool's, Grok's
 // target_file too.
@@ -219,10 +226,27 @@ var (
 	readPathKeys = map[string]bool{"file_path": true, "filePath": true, "path": true, "target_file": true}
 )
 
-// notFound says a failure keyed k is a read tool's own error that no file is at its path.
-func notFound(tool, text string, k FailureKey) bool {
-	return readTools[strings.ToLower(tool)] && k.Origin == toolOrigin(tool) && notFoundRe.MatchString(text) &&
-		!toolGoneRe.MatchString(strings.TrimSpace(text))
+// notFound says a failed result is a read tool's own error that no file is at its path, in its harness's words
+// (missForms): Claude Code's in its tool_use_error or not, Hermes's in its JSON's error field.
+func notFound(harness, tool, text string) bool {
+	re := missForms[harness]
+	if re == nil || !readTools[strings.ToLower(tool)] {
+		return false
+	}
+	text = strings.TrimSpace(text)
+	if harness == "hermes" { // its error field, in a result the store cut after it too
+		var r struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal([]byte(text), &r) == nil {
+			text = r.Error
+		} else if m := hermesErrRe.FindStringSubmatch(text); m != nil {
+			text = unescape(m[1])
+		} else {
+			return false
+		}
+	}
+	return re.MatchString(strings.TrimPrefix(text, "<tool_use_error>"))
 }
 
 // missedPath is the path a read found no file at as its key holds it: cleaned (no . or .. left in it) and the home
@@ -353,13 +377,17 @@ const (
 )
 
 // FailureKey is what a failure is known by: where it came from (a guard or a hook, the harness, a tool, an MCP
-// server, a command, the model) and its text with what varies taken out.
+// server, a command, the model) and its text with what varies taken out; a read that found no file, by the read
+// tool and the path it missed.
 type FailureKey struct {
-	Origin string // guard:NAME, harness:HARNESS, turn:HARNESS, tool:TOOL, mcp:SERVER, exec, model:refusal
+	Origin string // guard:NAME, harness:HARNESS, turn:HARNESS, tool:TOOL, mcp:SERVER, exec, model:refusal, miss:TOOL
 	Text   string
 }
 
 func (k FailureKey) String() string { return k.Origin + ":" + k.Text }
+
+// missed says the key is a read's that found no file: its text is the path it missed.
+func (k FailureKey) missed() bool { return strings.HasPrefix(k.Origin, "miss:") }
 
 // Title is the case's title for a failure of this key, its origin in words.
 func (k FailureKey) Title() string {
@@ -380,6 +408,8 @@ func (k FailureKey) Title() string {
 		return harnessName(name) + "'s turns keep failing: " + k.Text
 	case "mcp":
 		return "The " + name + " MCP server keeps failing: " + k.Text
+	case "miss":
+		return "The same path keeps missing: " + k.Text
 	}
 	return "The " + name + " tool keeps failing: " + k.Text
 }
@@ -466,20 +496,31 @@ var (
 // setup's failure or says nothing to key it by: the owner's own no, and a call the harness cancelled because
 // another one beside it failed.
 //
-// A read tool's own error that no file is at its path is keyed by the tool and the path its call names (missedPath),
-// not by its words, which would merge every path into one: only the same path missed again recurs. A read whose call
-// names no path (a call unknown, cut before its path, or none at all, as the mistakes log keeps) says nothing to key it
-// by.
+// A read tool's own error that no file is at its path (notFound) is keyed miss:TOOL by the path its call names
+// (missedPath), not by its words, which would merge every path into one: only the same path missed again recurs. No
+// key of a failure's words opens with miss:, so the two never meet. A read whose call names no path (a call unknown,
+// cut before its path, or none at all, as for the mistakes log, whose input the store does not keep for a tool error)
+// says nothing to key it by.
 func FailureOf(harness, tool, text, call string) (FailureKey, bool) {
-	k, ok := failureOf(harness, tool, text, call)
-	if !ok || !notFound(tool, text, k) {
+	return failureKey(harness, tool, text, store.Call{Input: call})
+}
+
+// failureKey is FailureOf's key for a result with its call as the store keeps it: a relative path a read missed is
+// read in the directory the call was made in, when that is a whole path, but for Hermes, whose read_file resolves it
+// in its terminal's directory, which a cd moves. A path that opens with ~ is the home's.
+func failureKey(harness, tool, text string, c store.Call) (FailureKey, bool) {
+	k, ok := failureOf(harness, tool, text, c.Input)
+	if !ok || !notFound(harness, tool, text) {
 		return k, ok
 	}
-	p, _, _ := callField(call, readPathKeys)
+	p, _, _ := callField(c.Input, readPathKeys)
 	if p == "" {
 		return FailureKey{}, false
 	}
-	return FailureKey{Origin: k.Origin, Text: "file not found: " + missedPath(p)}, true
+	if home := p == "~" || strings.HasPrefix(p, "~/"); !path.IsAbs(p) && !home && harness != "hermes" && path.IsAbs(c.Cwd) {
+		p = path.Join(c.Cwd, p)
+	}
+	return FailureKey{Origin: "miss:" + slug(tool, 30), Text: missedPath(p)}, true
 }
 
 // failureOf is FailureOf's key by the failure's words alone.
@@ -634,7 +675,7 @@ func toolOrigin(tool string) string {
 // MistakeKey keys a row of the mistakes log as FailureOf keys a result: its summary is the tool, a colon and the
 // error's first line. A deny or a hold is a guard's, as a tool_use_error of Claude Code's is; a model's refusal is
 // keyed by what it said; a turn's error by the harness; a row that says no more than an exit code is not keyed, nor a
-// read that found no file, whose path the log does not keep.
+// read that found no file: the store keeps none of the log's input for a tool error, so no call names its path.
 func MistakeKey(kind, tool, summary string) (FailureKey, bool) {
 	text := strings.TrimSpace(strings.TrimPrefix(summary, tool+":"))
 	switch kind {
@@ -653,7 +694,7 @@ func MistakeKey(kind, tool, summary string) (FailureKey, bool) {
 			text = "<tool_use_error>" + text
 		}
 	}
-	return FailureOf("claude", tool, text, "") // the log is Claude Code's, and keeps no call
+	return FailureOf("claude", tool, text, "") // the log is Claude Code's, and the store keeps no call of its
 }
 
 // reach is how far before its mark, in the masked output, a failed command's message may start: a program's name
