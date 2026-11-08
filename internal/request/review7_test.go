@@ -31,12 +31,16 @@ func TestTheGuardsHold(t *testing.T) {
 	}
 }
 
-// A quiet push prints no ref line: with no To line, the ref lines another command printed are not its.
+// A quiet push prints no ref line: with no To line, the ref lines another command printed are not its. The rows
+// hold no From line, so the quiet push's guard holds them alone.
 func TestAQuietPushPrintsNoRefLine(t *testing.T) {
-	got := artifactsAs("Bash", `{"command":"git submodule update --remote && git push -q"}`,
-		"From github.com:o/sub\n   1111111..2222222  main -> origin/main\nSubmodule path 'sub': checked out '2222222'", false)
-	if got != "" {
-		t.Errorf("got %q", got)
+	for _, c := range []struct{ input, output string }{
+		{`{"command":"git submodule update --remote && git push -q"}`, "   1111111..2222222  main -> origin/main\nSubmodule path 'sub': checked out '2222222'"},
+		{`{"command":"git submodule update --remote 2>&1 | grep -- '->'; git push -q origin main"}`, "   1111111..2222222  main -> origin/main"},
+	} {
+		if got := artifactsAs("Bash", c.input, c.output, false); got != "" {
+			t.Errorf("%s: got %q", c.input, got)
+		}
 	}
 }
 
@@ -60,12 +64,23 @@ func TestGhCommandsThatPrintAddresses(t *testing.T) {
 		"gh pr create --fill && gh -R o/r pr list --json url -q '.[].url'",
 		"gh pr create --fill; gh --repo o/r pr view 5 --json url -q .url",
 		"gh pr create --fill && gh pr edit 5 --add-label x",
-		"gh pr create --fill && gh pr comment 5 --body ok",
-		"gh pr create --fill && gh pr ready 5",
 		"gh pr create --fill && gh search prs --author @me --json url --jq '.[].url'",
+		"gh pr create --fill && gh api repos/o/r/pulls/5 -q .html_url",
 	} {
 		if got := artifactsAs("Bash", `{"command":`+jsonString(cmd)+`}`, out, false); got != "" {
 			t.Errorf("%s: got %q", cmd, got)
+		}
+	}
+	// gh pr review, checks, comment, merge and ready print no address on a line of its own: they block nothing
+	for _, c := range []struct{ cmd, out string }{
+		{"gh pr create --fill && gh pr comment 8 --body ok", "https://github.com/o/r/pull/8\nhttps://github.com/o/r/pull/8#issuecomment-1\n"},
+		{"gh pr create --fill && gh pr ready 8", "https://github.com/o/r/pull/8\n✓ Pull request o/r#8 is marked as \"ready for review\"\n"},
+		{"gh pr create --fill && gh pr merge 8 --squash", "https://github.com/o/r/pull/8\n✓ Squashed and merged pull request o/r#8\n"},
+		{"gh pr create --fill && gh pr review 8 --approve", "https://github.com/o/r/pull/8\n✓ Approved pull request o/r#8\n"},
+		{"gh pr create --fill && gh pr checks 8", "https://github.com/o/r/pull/8\nbuild\tpass\t19s\thttps://github.com/o/r/actions/runs/1\n"},
+	} {
+		if got := artifactsAs("Bash", `{"command":`+jsonString(c.cmd)+`}`, c.out, false); got != "pr pull request https://github.com/o/r/pull/8" {
+			t.Errorf("%s: got %q", c.cmd, got)
 		}
 	}
 	if got := artifactsAs("Bash", `{"command":"gh -R o/r pr create --fill"}`, "https://github.com/o/r/pull/8\n", false); got != "pr pull request https://github.com/o/r/pull/8" {
@@ -87,8 +102,12 @@ func TestACodeModeResultIsReadAgainstItsOwnCommand(t *testing.T) {
 			`text(await tools.exec_command({cmd:"git commit -am Fix"})); text(await tools.exec_command({cmd:"git push origin main"}))`,
 			`Script completed Output: {"exit_code":0,"output":"[main 1a2b3c4] Fix\n 1 file changed\n"} {"exit_code":1,"output":"To github.com:o/r.git\n   1111111..2222222  main -> main\n ! [rejected]        topic -> topic (fetch first)\n"}`,
 			"commit commit 1a2b3c4 on main: Fix"},
-		{"more results than commands",
+		{"a poll of a session no call here left running is read as nothing",
 			`text(await tools.exec_command({cmd:"gh pr create --fill"})); text(await tools.write_stdin({session_id:5,chars:""}))`,
+			`Script completed Output: {"exit_code":0,"output":"https://github.com/o/r/pull/9\n"} {"exit_code":0,"output":"https://github.com/o/r/pull/3\n"}`,
+			"pr pull request https://github.com/o/r/pull/9"},
+		{"more results than calls",
+			`text(await tools.exec_command({cmd:"gh pr create --fill"}))`,
 			`Script completed Output: {"exit_code":0,"output":"https://github.com/o/r/pull/9\n"} {"exit_code":0,"output":"https://github.com/o/r/pull/3\n"}`, ""},
 	}
 	for _, c := range cases {

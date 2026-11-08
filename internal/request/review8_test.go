@@ -223,7 +223,7 @@ func TestALostCheckIsReopenedByANewerArtifact(t *testing.T) {
 	f.tool("s1", "", "Bash", at(4), `{"command":"git commit -am two"}`, "[main 2222222] two\n 1 file changed", false)
 	f.phase("s1", at(5), "phase", "idle", nil)
 	f.put()
-	reqs, err := Group(ctx, f.st, t0.Add(-time.Hour), Options{})
+	reqs, err := Group(ctx, f.st, t0.Add(-time.Hour), Options{Redact: fakeRedact})
 	if err != nil {
 		t.Fatal(err)
 	}

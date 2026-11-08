@@ -12,7 +12,7 @@ import (
 // result it checked by its key. Nothing derives them and nothing deletes one; an undo is dated.
 const requestTables = `
 CREATE TABLE IF NOT EXISTS request_checks (id INTEGER PRIMARY KEY, request TEXT NOT NULL, result TEXT NOT NULL,
-  at INTEGER NOT NULL, undone INTEGER NOT NULL DEFAULT 0);
+  at INTEGER NOT NULL, undone INTEGER NOT NULL DEFAULT 0, result_at INTEGER NOT NULL DEFAULT 0);
 `
 
 var requestTableNames = []string{"request_checks"}
@@ -29,7 +29,17 @@ type RequestCheck struct {
 	Request string
 	Result  string
 	At      time.Time
-	Undone  time.Time
+	// ResultAt is when the checked result came (zero for a check stored before it was kept): a result after it
+	// reopens a check whose result can no longer be read, though it was read only after the check
+	ResultAt time.Time
+	Undone   time.Time
+}
+
+func ms(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixMilli()
 }
 
 // ErrNoCheck is an undo with no check to undo.
@@ -37,8 +47,8 @@ var ErrNoCheck = errors.New("no check to undo")
 
 // PutRequestCheck records a check.
 func (s *Store) PutRequestCheck(ctx context.Context, c RequestCheck) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO request_checks (request, result, at) VALUES (?,?,?)`, c.Request, c.Result,
-		c.At.UnixMilli())
+	_, err := s.db.ExecContext(ctx, `INSERT INTO request_checks (request, result, at, result_at) VALUES (?,?,?,?)`, c.Request, c.Result,
+		c.At.UnixMilli(), ms(c.ResultAt))
 	return err
 }
 
@@ -48,9 +58,9 @@ func (s *Store) CheckOnce(ctx context.Context, c RequestCheck, ids []string) (bo
 	if len(ids) == 0 {
 		ids = []string{c.Request}
 	}
-	r, err := s.db.ExecContext(ctx, `INSERT INTO request_checks (request, result, at) SELECT ?, ?, ? WHERE NOT EXISTS (
+	r, err := s.db.ExecContext(ctx, `INSERT INTO request_checks (request, result, at, result_at) SELECT ?, ?, ?, ? WHERE NOT EXISTS (
 	  SELECT 1 FROM request_checks WHERE undone = 0 AND result = ? AND request IN (?`+strings.Repeat(",?", len(ids)-1)+`))`,
-		append([]any{c.Request, c.Result, c.At.UnixMilli(), c.Result}, anys(ids)...)...)
+		append([]any{c.Request, c.Result, c.At.UnixMilli(), ms(c.ResultAt), c.Result}, anys(ids)...)...)
 	if err != nil {
 		return false, err
 	}
@@ -102,7 +112,7 @@ func (s *Store) RequestChecks(ctx context.Context, ids, prefixes []string, n int
 	if len(where) == 0 {
 		return nil, nil
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT request, result, at, undone FROM request_checks WHERE `+strings.Join(where, " OR ")+
+	rows, err := s.db.QueryContext(ctx, `SELECT request, result, at, result_at, undone FROM request_checks WHERE `+strings.Join(where, " OR ")+
 		` ORDER BY at, id`, args...)
 	if err != nil {
 		return nil, err
@@ -111,11 +121,14 @@ func (s *Store) RequestChecks(ctx context.Context, ids, prefixes []string, n int
 	var out []RequestCheck
 	for rows.Next() {
 		var c RequestCheck
-		var at, undone int64
-		if err := rows.Scan(&c.Request, &c.Result, &at, &undone); err != nil {
+		var at, resultAt, undone int64
+		if err := rows.Scan(&c.Request, &c.Result, &at, &resultAt, &undone); err != nil {
 			return nil, err
 		}
 		c.At = time.UnixMilli(at)
+		if resultAt != 0 {
+			c.ResultAt = time.UnixMilli(resultAt)
+		}
 		if undone != 0 {
 			c.Undone = time.UnixMilli(undone)
 		}

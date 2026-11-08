@@ -359,11 +359,11 @@ func TestAFullSessionIdIsNeverAmbiguous(t *testing.T) {
 	f.owner("s-abc", at(0), "fix the parser")
 	f.owner("s-abcd", at(1), "write the notes")
 	f.put()
-	rq, err := Find(context.Background(), f.st, "s-abc", Options{})
+	rq, err := Find(context.Background(), f.st, "s-abc", Options{Redact: fakeRedact})
 	if err != nil || words(rq.Asks) != "fix the parser" {
 		t.Fatalf("find: %v %+v", err, rq)
 	}
-	if _, err := Find(context.Background(), f.st, "s-ab", Options{}); err == nil {
+	if _, err := Find(context.Background(), f.st, "s-ab", Options{Redact: fakeRedact}); err == nil {
 		t.Fatal("a start two sessions share named one")
 	}
 }

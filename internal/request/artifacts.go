@@ -52,19 +52,43 @@ func Artifacts(call, res store.Event) []Result {
 		if metaOf(res.Meta).IsError {
 			return nil
 		}
-		return artifactsOf(call, res, Decode(call.Harness, tool, call.Summary, ""), makes{})
+		return artifactsOf(call, res, Decode(call.Harness, tool, call.Summary, ""), makes{}, nil)
 	}
 	if !toolresult.IsShell(tool) {
 		return nil
 	}
 	d := Decode(call.Harness, tool, call.Summary, res.Summary)
-	return artifactsOf(call, res, d, made(d))
+	return artifactsOf(call, res, d, made(d), nil)
+}
+
+// session is the command a Codex session runs, as the call that left it running named it.
+type session struct {
+	cmd string
+	cut bool
+}
+
+// yielded are the sessions a Codex call left running, each with the command it runs: a code-mode script's
+// exec_command calls still running when it ended, and the command of Codex's exec_command tool when it yielded.
+func yielded(call store.Event, d Decoded) map[int64]session {
+	out := map[int64]session{}
+	for _, c := range d.Chunks {
+		if c.Running && c.Session > 0 {
+			out[c.Session] = session{c.Command, c.Cut}
+		}
+	}
+	if call.Harness == "codex" && strings.ToLower(call.Tool) == "exec_command" && len(d.Commands) == 1 {
+		if c := plainChunk(d.Output, 0); c.Running && c.Session > 0 {
+			out[c.Session] = session{d.Commands[0], d.CommandCut}
+		}
+	}
+	return out
 }
 
 // artifactsOf reads a call's artifacts off its decoded input and output, with what its commands make, read once.
 // An output the store joined shows nothing; a Codex code-mode script's results are read each against its own
-// command, and none when they cannot be matched to its commands.
-func artifactsOf(call, res store.Event, d Decoded, mk makes) []Result {
+// command, and none when they cannot be matched to its calls; a poll's result against the command of the session
+// it polls, among sessions (those its thread's earlier calls left running), and as nothing when none is known.
+func artifactsOf(call, res store.Event, d Decoded, mk makes, sessions map[int64]session) []Result {
 	failed := metaOf(res.Meta).IsError
 	once := metaOf(call.Meta).ToolID // what a call recorded again (a harness's copy of the same call) shares
 	var out []Result
@@ -81,11 +105,17 @@ func artifactsOf(call, res store.Event, d Decoded, mk makes) []Result {
 			add(Result{Kind: KindFile, Key: KindFile + ":" + p + "@" + once, Text: p, Event: call.ID()})
 		}
 	case d.Joined || d.Unpaired:
-	case d.Chunks != nil:
-		for i, c := range d.Chunks {
-			cut := d.CommandCut && i == len(d.Chunks)-1
-			for _, r := range shown(c.Output, failed || c.Failed, made(Decoded{Commands: []string{c.Command}, CommandCut: cut}), once) {
+	case d.Chunks != nil || d.Polls != nil:
+		for _, c := range d.Chunks {
+			for _, r := range shown(c.Output, failed || c.Failed, made(Decoded{Commands: []string{c.Command}, CommandCut: c.Cut}), once) {
 				add(r)
+			}
+		}
+		for _, p := range d.Polls {
+			if s, ok := sessions[p.Session]; ok {
+				for _, r := range shown(p.Output, failed || p.Failed, made(Decoded{Commands: []string{s.cmd}, CommandCut: s.cut}), once) {
+					add(r)
+				}
 			}
 		}
 	default:

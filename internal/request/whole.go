@@ -385,8 +385,40 @@ func (r *reader) readFile(path string, ns []need) {
 	}
 }
 
-// gitWordRe is git or gh as a word of a command: not the gh of "high".
-var gitWordRe = regexp.MustCompile(`\b(?:git|gh)\b`)
+// namesGit reports git or gh as a word of a command (not the gh of "high"), by a scan of the text.
+func namesGit(s string) bool {
+	word := func(c byte) bool {
+		return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+	}
+	for i := 0; i+1 < len(s); i++ {
+		if s[i] != 'g' || i > 0 && word(s[i-1]) {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(s[i:], "git") && (i+3 == len(s) || !word(s[i+3])):
+			return true
+		case s[i+1] == 'h' && (i+2 == len(s) || !word(s[i+2])):
+			return true
+		}
+	}
+	return false
+}
+
+// polls reports a Codex call that polls a session an earlier call left running: a code-mode script's write_stdin,
+// or Codex's write_stdin tool. Its output is another command's: it names no git of its own.
+func polls(call store.Event, tool, input string) bool {
+	return call.Harness == "codex" && (tool == "write_stdin" || tool == "exec" && strings.Contains(input, "write_stdin("))
+}
+
+// codexCommand reports a Codex shell call whose results a session ties to others: a code-mode script, Codex's
+// exec_command and write_stdin tools. Its thread reads them in order, so a poll finds the session it polls.
+func codexCommand(call store.Event) bool {
+	switch strings.ToLower(call.Tool) {
+	case "exec", "exec_command", "write_stdin":
+		return call.Harness == "codex"
+	}
+	return false
+}
 
 // readWhole reads whole, as its thread loads, the calls of the thread the store cut or joined, so what is held
 // raw is one thread's records at most and no call is held past its thread's load. It reads a call's input where
@@ -405,6 +437,7 @@ func (r *reader) readWhole(ctx context.Context, t *thread) {
 		raw   bool // a text read whole
 		why   string
 		skip  bool // a command that names neither git nor gh: it makes nothing this reads
+		poll  bool // it polls a session an earlier call left running: its output may be that command's
 		mk    makes
 		found []Result
 	}
@@ -443,7 +476,8 @@ func (r *reader) readWhole(ctx context.Context, t *thread) {
 		if writers[j.tool] {
 			continue
 		}
-		if !gitWordRe.MatchString(inputs[i]) {
+		j.poll = polls(*j.p.call, j.tool, inputs[i])
+		if !namesGit(inputs[i]) && !j.poll {
 			// it makes nothing this reads, whether or not its record is there
 			j.skip, j.why = true, ""
 			continue
@@ -457,7 +491,7 @@ func (r *reader) readWhole(ctx context.Context, t *thread) {
 				j.mk.commits, j.mk.pushes, j.mk.prs = j.mk.commits || m.commits, j.mk.pushes || m.pushes, j.mk.prs || m.prs
 			}
 		}
-		if (j.mk.commits || j.mk.pushes || j.mk.prs) && whole(j) {
+		if (j.mk.commits || j.mk.pushes || j.mk.prs || j.poll) && whole(j) {
 			second = append(second, fetch{*j.p.res, j.id, true})
 		}
 	}
@@ -469,7 +503,7 @@ func (r *reader) readWhole(ctx context.Context, t *thread) {
 			// taken whether used or not, so no raw output stays behind
 			text, ok, why := r.take(ctx, *j.p.res, j.id, true)
 			switch {
-			case j.skip || !(j.mk.commits || j.mk.pushes || j.mk.prs):
+			case j.skip || !(j.mk.commits || j.mk.pushes || j.mk.prs || j.poll):
 			case ok:
 				output, j.raw, lines = text, true, true
 			case j.why == "":
@@ -486,12 +520,15 @@ func (r *reader) readWhole(ctx context.Context, t *thread) {
 		call.Summary, res.Summary = inputs[i], output
 		if writers[j.tool] {
 			if !metaOf(res.Meta).IsError {
-				j.found = artifactsOf(call, res, Decode(call.Harness, j.tool, inputs[i], ""), makes{})
+				j.found = artifactsOf(call, res, Decode(call.Harness, j.tool, inputs[i], ""), makes{}, nil)
 			}
 		} else {
 			d := Decode(call.Harness, j.tool, inputs[i], output)
 			d.Joined = d.Joined && !lines // a text read whole has its lines, one line or many
-			j.found = artifactsOf(call, res, d, j.mk)
+			j.found = artifactsOf(call, res, d, j.mk, t.sessions)
+			for n, sess := range yielded(call, d) {
+				t.sessions[n] = sess // a later call's poll of it reads its output against this command
+			}
 		}
 		if len(j.found) == 0 {
 			continue

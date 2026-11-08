@@ -317,10 +317,17 @@ func ghCommand(args []string) []string {
 	return nil
 }
 
-// printsAddresses reports a gh command that prints pull requests' addresses other than one it made: gh api, gh
-// search, and every gh pr command but create (view, list, edit, comment, ready, ...).
+// printsAddresses reports a gh command that prints a pull request's address on a line of its own, other than one
+// it made: gh api, gh search, gh pr view, list and edit (which prints the address it edited), and gh pr create
+// --json. gh pr review, checks, comment, merge and ready print none so.
 func printsAddresses(cmd []string) bool {
-	return len(cmd) > 0 && (cmd[0] == "api" || cmd[0] == "search") || len(cmd) > 1 && cmd[0] == "pr" && cmd[1] != "create"
+	switch {
+	case len(cmd) > 0 && (cmd[0] == "api" || cmd[0] == "search"):
+		return true
+	case len(cmd) > 1 && cmd[0] == "pr":
+		return cmd[1] == "view" || cmd[1] == "list" || cmd[1] == "edit" || cmd[1] == "create" && hasFlag(cmd[2:], "--json")
+	}
+	return false
 }
 
 // makesNoCommit reports a git command that makes commits run so it makes none: a dry run, --no-commit (merge,

@@ -19,49 +19,114 @@ type Decoded struct {
 	// Joined is an output the store keeps as plain text with its lines flattened to spaces: where a line ends is
 	// not known, so nothing is read off it (a whole read gives its lines)
 	Joined bool
-	// Chunks are a Codex code-mode script's commands, each with its own output, when the script ran as many
-	// exec_command calls as its output holds results; Unpaired is a script whose results cannot be matched so
+	// Chunks are a Codex code-mode script's exec_command calls, each with its own result and the results of the
+	// polls (write_stdin) of its session in the script; Polls are the results of the polls of a session no command
+	// of the script yielded (one an earlier call left running), and of Codex's write_stdin tool. Unpaired is a
+	// script whose results cannot be matched one to one to its calls.
 	Chunks   []Chunk
+	Polls    []Chunk
 	Unpaired bool
 }
 
-// Chunk is one exec_command of a Codex code-mode script: its command, its own output, whether it exited
-// non-zero, and whether it still ran when it yielded (a session id, no exit code).
+// Chunk is one result of a Codex command: the command, its output, whether it exited non-zero, whether it still
+// ran when it yielded (no exit code) and the session it runs in then, and whether the store cut the command.
 type Chunk struct {
 	Command, Output string
 	Failed, Running bool
+	Session         int64
+	Cut             bool
 }
 
-// pairChunks matches a code-mode script's results to its exec_command calls, in order: one result each, or, for
-// a command still running at its yield, its result and those the script's write_stdin calls read after it, up to
-// one with an exit code, as one. Unpaired is true when the results cannot be matched so.
-func pairChunks(chunks []Chunk, cmds []string, stdin int) (paired []Chunk, unpaired bool) {
-	if len(chunks) == len(cmds) {
-		for i := range chunks {
-			chunks[i].Command = cmds[i]
+// codeCall is a tool call of a code-mode script: an exec_command with its command, or a write_stdin with the
+// session it polls, by its id or by the variable an exec_command's result was set to.
+type codeCall struct {
+	exec    bool
+	cmd     string
+	cut     bool
+	assign  string
+	session int64
+	ref     string
+}
+
+var (
+	codeCallRe    = regexp.MustCompile(`(?:\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?)?\btools\.(exec_command|write_stdin)\(`)
+	pollSessionRe = regexp.MustCompile(`["']?session_id["']?\s*:\s*(?:(\d+)|([A-Za-z_$][\w$]*)\.session_id)`)
+	// a Codex command's plain result: still running in a session, or done with an exit code
+	runningRe = regexp.MustCompile(`Process running with session ID (\d+)`)
+	exitedRe  = regexp.MustCompile(`Process exited with code (-?\d+)`)
+)
+
+// codeCalls are a code-mode script's exec_command and write_stdin calls, in order.
+func codeCalls(script string) []codeCall {
+	locs := codeCallRe.FindAllStringSubmatchIndex(script, -1)
+	var out []codeCall
+	for k, l := range locs {
+		end := len(script)
+		if k+1 < len(locs) {
+			end = locs[k+1][0]
 		}
-		return chunks, false
-	}
-	if len(chunks) != len(cmds)+stdin {
-		return nil, true
-	}
-	k := 0
-	for _, cmd := range cmds {
-		c := chunks[k]
-		k++
-		c.Command = cmd
-		for c.Running && k < len(chunks) && stdin > 0 {
-			n := chunks[k]
-			k, stdin = k+1, stdin-1
-			c.Output += "\n" + n.Output
-			c.Failed, c.Running = n.Failed, n.Running
+		arg := script[l[1]:end]
+		c := codeCall{exec: script[l[4]:l[5]] == "exec_command"}
+		if l[2] >= 0 {
+			c.assign = script[l[2]:l[3]]
 		}
-		paired = append(paired, c)
+		if c.exec {
+			for _, f := range fields(arg, `"'`+"`", true) {
+				if commandKeys[f.key] && !f.list && len(f.values) > 0 {
+					c.cmd, c.cut = uncut(f.values[0], f.cut), f.cut
+					break
+				}
+			}
+		} else if m := pollSessionRe.FindStringSubmatch(arg); m != nil {
+			if m[1] != "" {
+				c.session, _ = strconv.ParseInt(m[1], 10, 64)
+			} else {
+				c.ref = m[2]
+			}
+		}
+		out = append(out, c)
 	}
-	if k != len(chunks) || stdin != 0 {
-		return nil, true
+	return out
+}
+
+// pairCode matches a code-mode script's results to its calls, one each in order, and each poll's result to the
+// command whose session it names: one of the script's (by the variable its result was set to, or the session it
+// yielded), else a session an earlier call left running (Polls). A poll by a variable the script did not set
+// from an exec_command is read as nothing. Unpaired is true when the results are not one per call.
+func pairCode(chunks []Chunk, calls []codeCall) (own, polls []Chunk, unpaired bool) {
+	if len(chunks) != len(calls) {
+		return nil, nil, true
 	}
-	return paired, false
+	vars, sessions := map[string]int{}, map[int64]int{}
+	for i, c := range calls {
+		ch := chunks[i]
+		if c.exec {
+			ch.Command, ch.Cut = c.cmd, c.cut
+			own = append(own, ch)
+			k := len(own) - 1
+			if c.assign != "" {
+				vars[c.assign] = k
+			}
+			if ch.Running && ch.Session > 0 {
+				sessions[ch.Session] = k
+			}
+			continue
+		}
+		k, ok := vars[c.ref]
+		if c.ref == "" {
+			k, ok = sessions[c.session]
+		}
+		switch {
+		case ok:
+			o := &own[k]
+			o.Output += "\n" + ch.Output
+			o.Failed, o.Running = ch.Failed, ch.Running
+		case c.ref == "" && c.session > 0:
+			ch.Session = c.session
+			polls = append(polls, ch)
+		}
+	}
+	return own, polls, false
 }
 
 // Keys of the stored inputs and outputs, every harness's.
@@ -136,7 +201,24 @@ func Decode(harness, tool, input, output string) Decoded {
 			outs = append(outs, c.Output)
 		}
 		d.Output = strings.Join(outs, "\n")
-		d.Chunks, d.Unpaired = pairChunks(chunks, d.Commands, strings.Count(input, "tools.write_stdin("))
+		calls := codeCalls(input)
+		d.Commands, d.CommandCut = nil, false
+		for _, c := range calls {
+			if c.exec {
+				d.Commands, d.CommandCut = append(d.Commands, c.cmd), c.cut
+			}
+		}
+		d.Chunks, d.Polls, d.Unpaired = pairCode(chunks, calls)
+	case harness == "codex" && tool == "write_stdin":
+		// Codex's write_stdin tool polls a session an earlier exec_command left running
+		d.Output = uncut(output, strings.HasSuffix(output, "…"))
+		d.Joined = output != "" && !strings.Contains(output, "\n")
+		if m := pollSessionRe.FindStringSubmatch(input); m != nil && m[1] != "" {
+			n, _ := strconv.ParseInt(m[1], 10, 64)
+			c := plainChunk(output, n)
+			c.Output = d.Output
+			d.Polls = []Chunk{c}
+		}
 	case harness == "hermes":
 		var outs []string
 		for _, f := range fields(output, `"`, false) {
@@ -155,8 +237,24 @@ func Decode(harness, tool, input, output string) Decoded {
 	return d
 }
 
-// exitRe is a code-mode result's exit code.
-var exitRe = regexp.MustCompile(`"exit_code":\s*(-?\d+)`)
+// exitRe is a code-mode result's exit code; sessionRe the session a running one yielded.
+var (
+	exitRe    = regexp.MustCompile(`"exit_code":\s*(-?\d+)`)
+	sessionRe = regexp.MustCompile(`"session_id":\s*(\d+)`)
+)
+
+// plainChunk is a Codex command's plain result (Codex's exec_command and write_stdin tools): whether it exited
+// non-zero, and the session it still runs in (or the one it polled).
+func plainChunk(output string, session int64) Chunk {
+	c := Chunk{Session: session}
+	if m := exitedRe.FindStringSubmatch(output); m != nil {
+		c.Failed = m[1] != "0"
+	} else if m := runningRe.FindStringSubmatch(output); m != nil {
+		c.Running = true
+		c.Session, _ = strconv.ParseInt(m[1], 10, 64)
+	}
+	return c
+}
 
 // codeChunks are the results a Codex code-mode output holds, in order: each object's output fields (output,
 // stdout, stderr) as one text, the last token of one the cut ends dropped, and whether its exit code is not 0.
@@ -188,8 +286,9 @@ func codeChunks(output string) []Chunk {
 			c := Chunk{Output: uncut(text, !closed)}
 			if e := exitRe.FindStringSubmatch(output[max(start, 0):j]); e != nil {
 				c.Failed = e[1] != "0"
-			} else {
-				c.Running = strings.Contains(output[max(start, 0):j], `"session_id"`)
+			} else if m := sessionRe.FindStringSubmatch(output[max(start, 0):j]); m != nil {
+				c.Running = true
+				c.Session, _ = strconv.ParseInt(m[1], 10, 64)
 			}
 			out = append(out, c)
 		}
@@ -341,7 +440,7 @@ func literal(text string) (string, int, bool) {
 			case 'u':
 				if i+1 < len(text) && text[i+1] == '{' {
 					if end := strings.IndexByte(text[i:], '}'); end > 0 {
-						if r, err := strconv.ParseUint(text[i+2:i+end], 16, 32); err == nil {
+						if r, err := strconv.ParseUint(text[i+2:i+end], 16, 32); err == nil && r <= utf8.MaxRune {
 							b.WriteRune(rune(r))
 							i += end
 							break
@@ -349,7 +448,7 @@ func literal(text string) (string, int, bool) {
 					}
 				}
 				if i+4 < len(text) {
-					if r, err := strconv.ParseUint(text[i+1:i+5], 16, 32); err == nil {
+					if r, err := strconv.ParseUint(text[i+1:i+5], 16, 32); err == nil && r <= utf8.MaxRune {
 						r1 := rune(r)
 						i += 4
 						if r1 >= 0xd800 && r1 < 0xdc00 && i+6 < len(text) && text[i+1] == '\\' && text[i+2] == 'u' {

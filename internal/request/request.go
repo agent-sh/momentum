@@ -133,13 +133,19 @@ func (r *Request) Standing() (store.RequestCheck, bool, bool) {
 
 // unreadable reports a check whose result is no longer among the request's and that no result came after.
 func (r *Request) unreadable(c store.RequestCheck) bool {
+	// what came after the checked result, though read only after the check, reopens it; a check stored before
+	// its result's time was kept goes by the check's time
+	since := c.ResultAt
+	if since.IsZero() {
+		since = c.At
+	}
 	for _, x := range r.Results {
-		if x.Key == c.Result || x.At.After(c.At) {
+		if x.Key == c.Result || x.At.After(since) {
 			return false
 		}
 	}
 	// a newer reply reopens only a check of a reply (a request with no artifact)
-	if r.Report != nil && (r.Report.Key == c.Result || strings.HasPrefix(c.Result, KindReport+":") && r.Report.At.After(c.At)) {
+	if r.Report != nil && (r.Report.Key == c.Result || strings.HasPrefix(c.Result, KindReport+":") && r.Report.At.After(since)) {
 		return false
 	}
 	return true
@@ -308,11 +314,13 @@ type thread struct {
 	turns   []*turn
 	segs    []seg
 	items   []item
-	pending []pair // calls the store cut or joined, while the thread loads: read whole as it loads (readWhole)
-	lost    []lost // its calls whose record was not read whole
-	replies []item
-	calls   map[string]store.Event // calls waiting for their results
-	done    map[string]bool        // the tool ids of the calls read, each once
+	pending []pair // calls the store cut or joined, and Codex's, while the thread loads: read as it loads (readWhole)
+	// sessions are the Codex sessions its calls left running, each with its command, as its load reads them
+	sessions map[int64]session
+	lost     []lost // its calls whose record was not read whole
+	replies  []item
+	calls    map[string]store.Event // calls waiting for their results
+	done     map[string]bool        // the tool ids of the calls read, each once
 }
 
 // segAt is the segment of an event at at, by its own time, whichever agent of the thread recorded it.
@@ -377,7 +385,7 @@ func (t *thread) add(e store.Event) {
 			return
 		}
 		t.done[m.ToolID] = true
-		if storeCut(call, e) || storeJoined(call, e) {
+		if storeCut(call, e) || storeJoined(call, e) || codexCommand(call) {
 			t.pending = append(t.pending, pair{call: slim(call), res: slim(e)})
 			return
 		}
@@ -474,11 +482,12 @@ func (r *reader) enqueue(id string) {
 }
 
 // read is what a thread's read selects: the main thread's text, the file writers' calls and results, and the
-// shells' calls that may run git or gh, or that the store cut (their git may be past the cut), with their results
-// that may show an artifact's line (a commit's "] ", a ref update's " -> ", a pull request's "/pull/") or that the
+// shells' calls that may run git or gh, poll a session (Codex's write_stdin names its "session_id"), or that the store cut (their git may
+// be past the cut), with their results that may show an artifact's line (a commit's "] ", a ref update's " -> ",
+// a pull request's "/pull/"), that left a Codex session running ("session_id", "Process running"), or that the
 // store cut.
-var read = store.ThreadRead{Writers: sortedKeys(writers), Shells: shells(), CallMarks: []string{"git", "gh"},
-	ResultMarks: []string{"] ", " -> ", "/pull/"}, CutMark: "…"}
+var read = store.ThreadRead{Writers: sortedKeys(writers), Shells: shells(), CallMarks: []string{"git", "gh", "session_id"},
+	ResultMarks: []string{"] ", " -> ", "/pull/", "session_id", "Process running"}, CutMark: "…"}
 
 func sortedKeys(m map[string]bool) []string {
 	var out []string
@@ -491,7 +500,8 @@ func sortedKeys(m map[string]bool) []string {
 
 // load reads a thread, then follows its links.
 func (r *reader) load(ctx context.Context, id string) error {
-	t := &thread{id: id, agents: map[string]time.Time{}, calls: map[string]store.Event{}, done: map[string]bool{}, segs: []seg{{}}}
+	t := &thread{id: id, agents: map[string]time.Time{}, calls: map[string]store.Event{}, done: map[string]bool{}, segs: []seg{{}},
+		sessions: map[int64]session{}}
 	spans, err := r.st.ThreadSpans(ctx, id)
 	if err != nil {
 		return err
@@ -555,7 +565,9 @@ func (r *reader) follow(ctx context.Context, t *thread) error {
 	r.enqueue(t.parent)
 	r.enqueue(t.namedBy)
 	for a := range t.agents {
-		r.enqueue(a)
+		if t.harness != "claude" { // a Claude Code subagent's id is never a session's
+			r.enqueue(a)
+		}
 	}
 	for _, c := range r.children[t.id] {
 		r.enqueue(c)

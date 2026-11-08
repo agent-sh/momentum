@@ -220,7 +220,7 @@ func TestItsIDAndItsSessionNameTheSameRequest(t *testing.T) {
 	f.tool("s-one", "", "Bash", at(1), `{"command":"git commit"}`, "[main 1111aaa] Port the scheduler", false)
 	f.phase("s-one", at(2), "phase", "idle", nil)
 	f.put()
-	rq, err := Find(ctx, f.st, "s-one", Options{})
+	rq, err := Find(ctx, f.st, "s-one", Options{Redact: fakeRedact})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,11 +234,11 @@ func TestItsIDAndItsSessionNameTheSameRequest(t *testing.T) {
 	f.reply("s-three", at(301), "Reading it.")
 	f.phase("s-three", at(302), "phase", "idle", nil)
 	f.put()
-	byID, err := Find(ctx, f.st, rq.ID, Options{})
+	byID, err := Find(ctx, f.st, rq.ID, Options{Redact: fakeRedact})
 	if err != nil {
 		t.Fatal(err)
 	}
-	bySession, err := Find(ctx, f.st, "s-three", Options{})
+	bySession, err := Find(ctx, f.st, "s-three", Options{Redact: fakeRedact})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,21 +257,21 @@ func TestListAndHandoffAgreeOnACheck(t *testing.T) {
 	f.tool("s-one", "", "Bash", at(1), `{"command":"git commit"}`, "[main 1111aaa] Port the scheduler", false)
 	f.phase("s-one", at(2), "phase", "idle", nil)
 	f.put()
-	rq, _ := Find(ctx, f.st, "s-one", Options{})
+	rq, _ := Find(ctx, f.st, "s-one", Options{Redact: fakeRedact})
 	text := Handoff(rq)
 	f.owner("s-two", at(100), "continue: "+text)
 	f.tool("s-two", "", "Bash", at(101), `{"command":"git commit"}`, "[main 2222bbb] Port the timers", false)
 	f.phase("s-two", at(102), "phase", "idle", nil)
 	f.put()
-	full, _ := Find(ctx, f.st, rq.ID, Options{})
+	full, _ := Find(ctx, f.st, rq.ID, Options{Redact: fakeRedact})
 	if err := f.st.PutRequestCheck(ctx, store.RequestCheck{Request: full.ID, Result: full.Newest().Key, At: at(103)}); err != nil {
 		t.Fatal(err)
 	}
 	f.owner("s-three", at(300), "pick this up: "+text)
 	f.phase("s-three", at(302), "phase", "idle", nil)
 	f.put()
-	full, _ = Find(ctx, f.st, rq.ID, Options{})
-	list, err := List(ctx, f.st, at(200), Options{})
+	full, _ = Find(ctx, f.st, rq.ID, Options{Redact: fakeRedact})
+	list, err := List(ctx, f.st, at(200), Options{Redact: fakeRedact})
 	if err != nil || len(list) != 1 {
 		t.Fatalf("list: %v %d", err, len(list))
 	}
@@ -331,7 +331,7 @@ func TestAReadAgainKeepsTheCheck(t *testing.T) {
 	if again.ID == rq.ID || again.State != Checked {
 		t.Fatalf("after a read again the id is %s (was %s) and the state %s", again.ID, rq.ID, again.State)
 	}
-	found, err := Find(ctx, f.st, rq.ID, Options{})
+	found, err := Find(ctx, f.st, rq.ID, Options{Redact: fakeRedact})
 	if err != nil || found.ID != again.ID {
 		t.Fatalf("the old id finds %+v, %v", found, err)
 	}
@@ -423,10 +423,10 @@ func TestAProgramPrefixOpensNothing(t *testing.T) {
 	f := newFixture(t)
 	f.owner("s-wake", at(0), "[wake] continue the loop")
 	f.reply("s-wake", at(1), "Continuing.")
-	if reqs := f.groupWith(Options{Prefixes: []string{"[wake]"}}); len(reqs) != 0 {
+	if reqs := f.groupWith(Options{Prefixes: []string{"[wake]"}, Redact: fakeRedact}); len(reqs) != 0 {
 		t.Fatalf("a program's turn opened %d requests", len(reqs))
 	}
-	if reqs := f.groupWith(Options{}); len(reqs) != 1 {
+	if reqs := f.groupWith(Options{Redact: fakeRedact}); len(reqs) != 1 {
 		t.Fatalf("without the prefix it is his: %d requests", len(reqs))
 	}
 }
@@ -435,10 +435,10 @@ func TestAProgramPrefixOpensNothing(t *testing.T) {
 func TestAProgramsPastedHandoffLinks(t *testing.T) {
 	f := newFixture(t)
 	f.owner("s-src", at(0), "tune the cache")
-	src := f.groupWith(Options{Prefixes: []string{"[relay]"}})[0]
+	src := f.groupWith(Options{Prefixes: []string{"[relay]"}, Redact: fakeRedact})[0]
 	f.owner("s-relayed", at(10), "[relay] "+Line(src.ID)+" - a handoff ... "+Line(src.ID))
 	f.tool("s-relayed", "", "Bash", at(11), `{"command":"git commit -m tune"}`, "[main 5d5d5d5] Tune the cache", false)
-	reqs := f.groupWith(Options{Prefixes: []string{"[relay]"}})
+	reqs := f.groupWith(Options{Prefixes: []string{"[relay]"}, Redact: fakeRedact})
 	if len(reqs) != 1 || !strings.Contains(kinds(reqs[0].Results), "5d5d5d5") {
 		t.Fatalf("the program's paste did not link: %d requests", len(reqs))
 	}
@@ -462,7 +462,7 @@ func TestFindReachesASessionThatContinuesIt(t *testing.T) {
 	f.event("s-child", "", "tool_result", store.ActorTool, at(32), "[main 8a8a8a8] Rewrite the importer\n", map[string]any{"parent": "s-parent", "tool_id": "c-child"})
 	f.evs[len(f.evs)-1].Tool = "terminal"
 	f.put()
-	rq, err := Find(context.Background(), f.st, ID(at(0), "rewrite the importer"), Options{})
+	rq, err := Find(context.Background(), f.st, ID(at(0), "rewrite the importer"), Options{Redact: fakeRedact})
 	if err != nil || !strings.Contains(kinds(rq.Results), "8a8a8a8") {
 		t.Fatalf("the continuation's commit: %v %+v", err, rq)
 	}
@@ -552,10 +552,10 @@ func TestAnAmbiguousSessionPrefixIsRefused(t *testing.T) {
 	f.owner("s-dup-1", at(0), "one thing")
 	f.owner("s-dup-2", at(1), "another thing")
 	f.put()
-	if _, err := Find(context.Background(), f.st, "s-dup", Options{}); err == nil || !strings.Contains(err.Error(), "more than one") {
+	if _, err := Find(context.Background(), f.st, "s-dup", Options{Redact: fakeRedact}); err == nil || !strings.Contains(err.Error(), "more than one") {
 		t.Fatalf("an ambiguous start: %v", err)
 	}
-	if rq, err := Find(context.Background(), f.st, "s-dup-2", Options{}); err != nil || rq.ID != ID(at(1), "another thing") {
+	if rq, err := Find(context.Background(), f.st, "s-dup-2", Options{Redact: fakeRedact}); err != nil || rq.ID != ID(at(1), "another thing") {
 		t.Fatalf("a whole id: %v", err)
 	}
 }

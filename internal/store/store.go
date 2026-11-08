@@ -155,6 +155,7 @@ var keptColumns = []struct {
 	// NULL is not recorded (a build from before them stores neither, and evidence that is no event records neither);
 	// '' is recorded as none
 	{"case_evidence", [][2]string{{"tool", "TEXT"}, {"cwd", "TEXT"}}},
+	{"request_checks", [][2]string{{"result_at", "INTEGER NOT NULL DEFAULT 0"}}},
 }
 
 // columnFills fill a kept column from the rows already there, in the transaction that adds it, and only then: a

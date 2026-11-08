@@ -106,7 +106,7 @@ func (f *fixture) put() {
 func (f *fixture) group() []*Request {
 	f.t.Helper()
 	f.put()
-	reqs, err := Group(context.Background(), f.st, t0.Add(-time.Hour), Options{})
+	reqs, err := Group(context.Background(), f.st, t0.Add(-time.Hour), Options{Redact: fakeRedact})
 	if err != nil {
 		f.t.Fatal(err)
 	}

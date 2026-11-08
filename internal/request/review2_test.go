@@ -67,7 +67,7 @@ func TestAHandoffByASubagentsSessionAgreesWithTheList(t *testing.T) {
 	if !inList {
 		t.Fatalf("the list does not hold t-child: %+v", reqs[0].Threads)
 	}
-	rq, err := Find(context.Background(), f.st, "t-child", Options{})
+	rq, err := Find(context.Background(), f.st, "t-child", Options{Redact: fakeRedact})
 	if err != nil {
 		t.Fatalf("handoff t-child: %v (the list holds it in %s)", err, reqs[0].ID)
 	}
@@ -85,25 +85,25 @@ func TestTwoChecksAtOnceAndOneUncheck(t *testing.T) {
 	f.put()
 	ctx := context.Background()
 	id := ID(at(0), "tidy the readme")
-	a, err := Find(ctx, f.st, id, Options{})
+	a, err := Find(ctx, f.st, id, Options{Redact: fakeRedact})
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, _ := Find(ctx, f.st, id, Options{})
+	b, _ := Find(ctx, f.st, id, Options{Redact: fakeRedact})
 	if _, err := Check(ctx, f.st, a, at(5)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Check(ctx, f.st, b, at(5)); err != nil {
 		t.Fatal(err)
 	}
-	c, _ := Find(ctx, f.st, id, Options{})
+	c, _ := Find(ctx, f.st, id, Options{Redact: fakeRedact})
 	if len(c.Checks) != 1 {
 		t.Fatalf("two checks at once left %d", len(c.Checks))
 	}
 	if _, err := Uncheck(ctx, f.st, c, at(6)); err != nil {
 		t.Fatal(err)
 	}
-	d, _ := Find(ctx, f.st, id, Options{})
+	d, _ := Find(ctx, f.st, id, Options{Redact: fakeRedact})
 	if d.State == Checked {
 		t.Fatalf("one uncheck after two concurrent checks leaves it %s: %s", d.State, stateLine(d))
 	}
@@ -137,7 +137,7 @@ func TestListAndHandoffAgreeOnAPhaseFromBefore(t *testing.T) {
 			b = rq
 		}
 	}
-	h, err := Find(context.Background(), f.st, b.ID, Options{})
+	h, err := Find(context.Background(), f.st, b.ID, Options{Redact: fakeRedact})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,12 +167,12 @@ func TestLinksThatFormCyclesSettle(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		f.put()
-		_, err := List(context.Background(), f.st, t0.Add(-time.Hour), Options{})
+		_, err := List(context.Background(), f.st, t0.Add(-time.Hour), Options{Redact: fakeRedact})
 		if err == nil {
-			_, err = Find(context.Background(), f.st, a, Options{})
+			_, err = Find(context.Background(), f.st, a, Options{Redact: fakeRedact})
 		}
 		if err == nil {
-			_, err = Find(context.Background(), f.st, "s-2", Options{})
+			_, err = Find(context.Background(), f.st, "s-2", Options{Redact: fakeRedact})
 		}
 		done <- err
 	}()

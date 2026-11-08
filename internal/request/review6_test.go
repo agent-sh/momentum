@@ -91,7 +91,7 @@ func TestASessionSeenWorkingAfterAFollowUpWorks(t *testing.T) {
 	if err := f.st.SaveSessionStamps(context.Background(), st); err != nil {
 		t.Fatal(err)
 	}
-	rq := f.groupWith(Options{})[0]
+	rq := f.groupWith(Options{Redact: fakeRedact})[0]
 	if rq.State != Working {
 		t.Errorf("state %s (%s)", rq.State, rq.Why)
 	}
@@ -100,7 +100,7 @@ func TestASessionSeenWorkingAfterAFollowUpWorks(t *testing.T) {
 // A cut call whose stored part names neither git nor gh as a word makes nothing this reads: with its record gone,
 // it is not counted as cut, and "high" holds no gh.
 func TestACutCallThatNamesNoGitIsNotCounted(t *testing.T) {
-	for _, words := range []string{"echo high", "echo hi"} {
+	for _, words := range []string{"echo high", "echo hi", "echo ghost", "echo gitlab"} {
 		t.Run(words, func(t *testing.T) {
 			f := newFixture(t)
 			f.owner("s-nogit", at(0), "check the tree")
@@ -127,14 +127,14 @@ func TestACheckOverOneWhoseResultIsLost(t *testing.T) {
 	if _, err := f.st.CheckOnce(ctx, store.RequestCheck{Request: rq.ID, Result: "push:origin gone@2222222", At: at(10)}, nil); err != nil {
 		t.Fatal(err)
 	}
-	reqs, err := Group(ctx, f.st, t0.Add(-time.Hour), Options{})
+	reqs, err := Group(ctx, f.st, t0.Add(-time.Hour), Options{Redact: fakeRedact})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Check(ctx, f.st, reqs[0], at(11)); err != nil {
 		t.Fatal(err)
 	}
-	if reqs, err = Group(ctx, f.st, t0.Add(-time.Hour), Options{}); err != nil {
+	if reqs, err = Group(ctx, f.st, t0.Add(-time.Hour), Options{Redact: fakeRedact}); err != nil {
 		t.Fatal(err)
 	}
 	if rq = reqs[0]; rq.State != Checked || !strings.Contains(rq.Why, "checked its newest result") {

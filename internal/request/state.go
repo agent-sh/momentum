@@ -249,7 +249,7 @@ func Check(ctx context.Context, st *store.Store, rq *Request, at time.Time) (Che
 		out.Lost = c
 	}
 	var err error
-	out.Added, err = st.CheckOnce(ctx, store.RequestCheck{Request: rq.ID, Result: n.Key, At: at}, rq.CheckIDs())
+	out.Added, err = st.CheckOnce(ctx, store.RequestCheck{Request: rq.ID, Result: n.Key, At: at, ResultAt: n.At}, rq.CheckIDs())
 	return out, err
 }
 
