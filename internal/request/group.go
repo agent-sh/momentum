@@ -250,13 +250,20 @@ func fill(u sets, reqs map[string]*Request, t *thread) {
 		prev = &a
 	}
 	for _, it := range t.items {
-		if rq := of(t.segAt(it.r.At)); rq != nil && !it.r.At.Before(rq.start()) {
+		if rq := of(t.segAt(it.r.At)); rq != nil && !it.gone && !it.r.At.Before(rq.start()) {
 			rq.Results = append(rq.Results, it.r)
 		}
 	}
-	for _, p := range t.pending {
-		if rq := of(t.segAt(p.res.TS)); rq != nil && !p.res.TS.Before(rq.start()) {
-			rq.pending = append(rq.pending, p)
+	for _, l := range t.lost {
+		if rq := of(t.segAt(l.at)); rq != nil && !l.at.Before(rq.start()) {
+			switch l.why {
+			case cutGone:
+				rq.CutGone++
+			case cutUnread:
+				rq.CutUnread++
+			case cutUnmasked:
+				rq.CutUnmasked++
+			}
 		}
 	}
 	for _, it := range t.replies {

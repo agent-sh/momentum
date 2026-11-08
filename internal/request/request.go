@@ -99,7 +99,6 @@ type Request struct {
 	// CutGone, CutUnread and CutUnmasked count its calls the store cut that were read as the store holds them:
 	// their transcript is gone, no reader of their harness is here, or what was read whole could not be masked
 	CutGone, CutUnread, CutUnmasked int
-	pending                         []pair
 }
 
 // start is when the request began: its opening, else the time its id names.
@@ -139,7 +138,8 @@ func (r *Request) unreadable(c store.RequestCheck) bool {
 			return false
 		}
 	}
-	if r.Report != nil && (r.Report.Key == c.Result || r.Report.At.After(c.At)) {
+	// a newer reply reopens only a check of a reply (a request with no artifact)
+	if r.Report != nil && (r.Report.Key == c.Result || strings.HasPrefix(c.Result, KindReport+":") && r.Report.At.After(c.At)) {
 		return false
 	}
 	return true
@@ -291,7 +291,8 @@ type seg struct {
 // item is a result or a reply, placed in a segment by when it happened: a subagent's, a fork's or a resume's too,
 // whose copies of earlier events keep their times.
 type item struct {
-	r Result
+	r    Result
+	gone bool // read whole but not masked: the call's stored artifacts stand for it
 }
 
 // thread is what one session holds for requests.
@@ -307,7 +308,8 @@ type thread struct {
 	turns   []*turn
 	segs    []seg
 	items   []item
-	pending []pair // calls the store cut: read whole when a request holds them (whole)
+	pending []pair // calls the store cut or joined, while the thread loads: read whole as it loads (readWhole)
+	lost    []lost // its calls whose record was not read whole
 	replies []item
 	calls   map[string]store.Event // calls waiting for their results
 	done    map[string]bool        // the tool ids of the calls read, each once
@@ -443,14 +445,13 @@ type reader struct {
 	packed   map[string]bool       // a transcript read from a compressed copy
 	opens    map[string]int        // how often a transcript file was opened in the run
 	hermes   map[string]*evidence.HermesDB
-	resolved map[string]resolvedPair // a cut call's artifacts, read whole once per run
+	raws     []raw // what calls read whole made, not yet masked (mask)
 }
 
 func newReader(st *store.Store, opt Options) *reader {
 	return &reader{st: st, opt: opt, threads: map[string]*thread{}, openings: map[string][]ref{}, single: map[string]bool{},
 		children: map[string][]string{}, markers: map[string][]string{}, markIDs: map[string][]string{},
-		records: map[string]recordRead{}, packed: map[string]bool{}, opens: map[string]int{}, hermes: map[string]*evidence.HermesDB{},
-		resolved: map[string]resolvedPair{}}
+		records: map[string]recordRead{}, packed: map[string]bool{}, opens: map[string]int{}, hermes: map[string]*evidence.HermesDB{}}
 }
 
 // close lets go of the Hermes stores a run opened.
@@ -532,6 +533,7 @@ func (r *reader) load(ctx context.Context, id string) error {
 		return err
 	}
 	t.calls, t.done = nil, nil
+	r.readWhole(ctx, t)
 	for _, tn := range t.turns {
 		if tn.marker != "" {
 			t.segs = append(t.segs, seg{at: tn.at, marker: tn.marker})
@@ -754,6 +756,7 @@ func (r *reader) run(ctx context.Context) error {
 			return err
 		}
 	}
+	r.mask(ctx)
 	return nil
 }
 
@@ -779,14 +782,8 @@ func (r *reader) settle(ctx context.Context, since time.Time, match func(*Reques
 			}
 		}
 		if !start.Before(from) {
-			if err := r.resolve(ctx, out); err != nil {
-				return nil, err
-			}
 			for _, rq := range out {
 				fold(rq)
-			}
-			for _, t := range r.threads {
-				t.pending = nil // read: what it made is the requests'
 			}
 			return out, r.finish(ctx, out)
 		}

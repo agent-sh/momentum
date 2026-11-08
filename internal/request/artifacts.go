@@ -147,8 +147,8 @@ type block struct {
 
 // pushBlocks are the blocks git push printed: each from a To line whose remote has a remote's shape (a URL,
 // host:path, a path) to the next From or To line, or the text's end. With no To line (a tail kept only the last
-// lines), the whole text, its remote the push's own, of a call whose pushes are not all quiet and that ran nothing
-// else that prints ref lines.
+// lines), the whole text, its remote the push's own, of a call whose pushes are not all quiet, that ran nothing
+// else that prints ref lines and whose output holds no fetch's From line.
 func pushBlocks(text string, mk makes) []block {
 	var tos [][]int
 	for _, t := range pushToRe.FindAllStringSubmatchIndex(text, -1) {
@@ -167,7 +167,9 @@ func pushBlocks(text string, mk makes) []block {
 		}
 		out = append(out, block{remote: text[t[2]:t[3]], refs: rest})
 	}
-	if len(tos) == 0 && !mk.fetches && !mk.quiet { // a quiet push printed no ref line: one there is another's
+	// a quiet push printed no ref line, and a From line is a fetch's (one the call ran where its parse cannot see,
+	// as over ssh or in a script): the ref lines are another's
+	if len(tos) == 0 && !mk.fetches && !mk.quiet && !pushEndRe.MatchString(text) {
 		remote := mk.remote
 		if remote == "" {
 			remote = "origin"

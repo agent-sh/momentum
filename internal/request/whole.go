@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/agent-sh/tacit/client/pkg/evidence"
 
@@ -243,18 +244,13 @@ func slim(e store.Event) *store.Event {
 		Harness: e.Harness, Kind: e.Kind, Tool: e.Tool, Summary: e.Summary, Meta: e.Meta, Ref: e.Ref}
 }
 
-// resolvedPair is what a cut call made, read whole, and why it was not when it was not.
-type resolvedPair struct {
-	results []Result
-	why     string
-}
-
 // storeCut reports a call or its result the store cut where what a request reads of it may lie past the cut: a
 // shell call's command or output, a writer's input that names no path.
 func storeCut(call, res store.Event) bool {
 	tool := strings.ToLower(call.Tool)
 	if writers[tool] {
-		return strings.HasSuffix(call.Summary, "…") && len(Decode(call.Harness, tool, call.Summary, "").Paths) == 0
+		// a cut patch may name more files past the cut than its stored part does
+		return strings.HasSuffix(call.Summary, "…") && (len(Decode(call.Harness, tool, call.Summary, "").Paths) == 0 || patchRe.MatchString(call.Summary))
 	}
 	return strings.HasSuffix(call.Summary, "…") || strings.HasSuffix(res.Summary, "…")
 }
@@ -392,28 +388,16 @@ func (r *reader) readFile(path string, ns []need) {
 // gitWordRe is git or gh as a word of a command: not the gh of "high".
 var gitWordRe = regexp.MustCompile(`\b(?:git|gh)\b`)
 
-// resolve reads whole the calls the store cut that the requests hold, each once per run, one thread at a time, so
-// what is held raw is one thread's records at most. It reads a call's input where the store cut it, and its output
-// where the store cut it and the command makes something (a commit, a push, a pull request): in a compressed
-// transcript in the same pass as the input, in a plain one by a seek after it. A command that names neither git
-// nor gh is not parsed and its output not read; a writer's input is read alone. What each made is taken off the
-// text read, and each raw record is let go of as its thread's read ends; only what was taken off (each artifact's
-// text and key) is masked, with tacit's redaction in one call, before it is kept. A call whose record is not read,
-// or whose artifacts cannot be masked, is read as the store holds it, and counted on its request by why.
-func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
-	// a call is one by its session and tool id
-	key := func(p pair) string { return p.call.Session + "\x00" + metaOf(p.call.Meta).ToolID }
+// readWhole reads whole, as its thread loads, the calls of the thread the store cut or joined, so what is held
+// raw is one thread's records at most and no call is held past its thread's load. It reads a call's input where
+// the store cut it, and its output where the store cut or joined it and the command makes something (a commit, a
+// push, a pull request): in a compressed transcript in the same pass as the input, in a plain one by a seek after
+// it. A command that names neither git nor gh is not parsed and its output not read; a writer's input is read
+// alone. What each made is taken off the text read, and each raw record is let go of as the thread's read ends;
+// what was taken off is masked at the end of the run (mask). A call whose record is not read is read as the store
+// holds it, and noted by why (lost), for its request to count.
+func (r *reader) readWhole(ctx context.Context, t *thread) {
 	cut := func(s string) bool { return strings.HasSuffix(s, "…") }
-	var todo []pair
-	for _, rq := range reqs {
-		for _, p := range rq.pending {
-			if _, ok := r.resolved[key(p)]; !ok {
-				r.resolved[key(p)] = resolvedPair{} // claimed: a pair two requests hold is read once
-				todo = append(todo, p)
-			}
-		}
-	}
-	sort.SliceStable(todo, func(a, b int) bool { return todo[a].call.Session < todo[b].call.Session })
 	type job struct {
 		p     pair
 		tool  string
@@ -424,141 +408,158 @@ func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 		mk    makes
 		found []Result
 	}
-	jobs := make([]job, len(todo))
-	for i, p := range todo {
-		jobs[i] = job{p: p, tool: strings.ToLower(p.call.Tool), id: metaOf(p.call.Meta).ToolID}
+	js := make([]job, len(t.pending))
+	for i, p := range t.pending {
+		js[i] = job{p: p, tool: strings.ToLower(p.call.Tool), id: metaOf(p.call.Meta).ToolID}
 	}
-	// read reads one thread's jobs whole and takes off what each made, letting go of the raw records
+	t.pending = nil
 	// an output read whole: one the store cut, or one it joined (only a whole read gives its lines)
 	whole := func(j *job) bool {
 		return !writers[j.tool] && (cut(j.p.res.Summary) || storeJoined(*j.p.call, *j.p.res))
 	}
-	read := func(js []job) {
-		var first, second []fetch
-		for i := range js {
-			j := &js[i]
-			if cut(j.p.call.Summary) {
-				first = append(first, fetch{*j.p.call, j.id, false})
-			}
-			// a compressed transcript is read once: its output in the same pass as the input
-			if path, _, ok := refPlace(j.p.res.Ref); ok && whole(j) && fileHarness(j.p.res.Harness) && r.compressed(path) {
-				first = append(first, fetch{*j.p.res, j.id, true})
-			}
+	var first, second []fetch
+	for i := range js {
+		j := &js[i]
+		if cut(j.p.call.Summary) {
+			first = append(first, fetch{*j.p.call, j.id, false})
 		}
-		r.prefetch(first)
-		inputs := make([]string, len(js))
-		for i := range js {
-			j := &js[i]
-			inputs[i] = j.p.call.Summary
-			if cut(j.p.call.Summary) {
-				if text, ok, why := r.take(ctx, *j.p.call, j.id, false); ok {
-					inputs[i], j.raw = text, true
-				} else {
-					j.why = why
-				}
-			}
-			if writers[j.tool] {
-				continue
-			}
-			if !gitWordRe.MatchString(inputs[i]) {
-				// it makes nothing this reads, whether or not its record is there
-				j.skip, j.why = true, ""
-				continue
-			}
-			j.mk = made(Decode(j.p.call.Harness, j.tool, inputs[i], ""))
-			if (j.mk.commits || j.mk.pushes || j.mk.prs) && whole(j) {
-				second = append(second, fetch{*j.p.res, j.id, true})
-			}
-		}
-		r.prefetch(second)
-		for i := range js {
-			j := &js[i]
-			output, lines := j.p.res.Summary, false
-			if whole(j) {
-				// taken whether used or not, so no raw output stays behind
-				text, ok, why := r.take(ctx, *j.p.res, j.id, true)
-				switch {
-				case j.skip || !(j.mk.commits || j.mk.pushes || j.mk.prs):
-				case ok:
-					output, j.raw, lines = text, true, true
-				case j.why == "":
-					j.why = why
-				}
-			}
-			if j.skip {
-				continue
-			}
-			call, res := *j.p.call, *j.p.res
-			call.Summary, res.Summary = inputs[i], output
-			if writers[j.tool] {
-				if !metaOf(res.Meta).IsError {
-					j.found = artifactsOf(call, res, Decode(call.Harness, j.tool, inputs[i], ""), makes{})
-				}
-			} else {
-				d := Decode(call.Harness, j.tool, inputs[i], output)
-				d.Joined = d.Joined && !lines // a text read whole has its lines, one line or many
-				j.found = artifactsOf(call, res, d, j.mk)
-			}
+		// a compressed transcript is read once: its output in the same pass as the input
+		if path, _, ok := refPlace(j.p.res.Ref); ok && whole(j) && fileHarness(j.p.res.Harness) && r.compressed(path) {
+			first = append(first, fetch{*j.p.res, j.id, true})
 		}
 	}
-	for a := 0; a < len(jobs); {
-		b := a + 1
-		for b < len(jobs) && jobs[b].p.call.Session == jobs[a].p.call.Session {
-			b++
+	r.prefetch(first)
+	inputs := make([]string, len(js))
+	for i := range js {
+		j := &js[i]
+		inputs[i] = j.p.call.Summary
+		if cut(j.p.call.Summary) {
+			if text, ok, why := r.take(ctx, *j.p.call, j.id, false); ok {
+				inputs[i], j.raw = text, true
+			} else {
+				j.why = why
+			}
 		}
-		read(jobs[a:b])
-		a = b
+		if writers[j.tool] {
+			continue
+		}
+		if !gitWordRe.MatchString(inputs[i]) {
+			// it makes nothing this reads, whether or not its record is there
+			j.skip, j.why = true, ""
+			continue
+		}
+		d := Decode(j.p.call.Harness, j.tool, inputs[i], "")
+		j.mk = made(d)
+		if j.p.call.Harness == "codex" && j.tool == "exec" {
+			// a code-mode script's results are read each against its own command: what any one makes
+			for k, c := range d.Commands {
+				m := made(Decoded{Commands: []string{c}, CommandCut: d.CommandCut && k == len(d.Commands)-1})
+				j.mk.commits, j.mk.pushes, j.mk.prs = j.mk.commits || m.commits, j.mk.pushes || m.pushes, j.mk.prs || m.prs
+			}
+		}
+		if (j.mk.commits || j.mk.pushes || j.mk.prs) && whole(j) {
+			second = append(second, fetch{*j.p.res, j.id, true})
+		}
+	}
+	r.prefetch(second)
+	for i := range js {
+		j := &js[i]
+		output, lines := j.p.res.Summary, false
+		if whole(j) {
+			// taken whether used or not, so no raw output stays behind
+			text, ok, why := r.take(ctx, *j.p.res, j.id, true)
+			switch {
+			case j.skip || !(j.mk.commits || j.mk.pushes || j.mk.prs):
+			case ok:
+				output, j.raw, lines = text, true, true
+			case j.why == "":
+				j.why = why
+			}
+		}
+		if j.why != "" {
+			t.lost = append(t.lost, lost{at: j.p.res.TS, why: j.why})
+		}
+		if j.skip {
+			continue
+		}
+		call, res := *j.p.call, *j.p.res
+		call.Summary, res.Summary = inputs[i], output
+		if writers[j.tool] {
+			if !metaOf(res.Meta).IsError {
+				j.found = artifactsOf(call, res, Decode(call.Harness, j.tool, inputs[i], ""), makes{})
+			}
+		} else {
+			d := Decode(call.Harness, j.tool, inputs[i], output)
+			d.Joined = d.Joined && !lines // a text read whole has its lines, one line or many
+			j.found = artifactsOf(call, res, d, j.mk)
+		}
+		if len(j.found) == 0 {
+			continue
+		}
+		from := len(t.items)
+		for _, x := range j.found {
+			x.Thread = t.id
+			t.items = append(t.items, item{r: x})
+		}
+		if j.raw {
+			// kept unmasked until the run's end masks it: else the call as the store holds it
+			var fallback []Result
+			for _, x := range Artifacts(*j.p.call, *j.p.res) {
+				x.Thread = t.id
+				fallback = append(fallback, x)
+			}
+			r.raws = append(r.raws, raw{t: t, from: from, to: len(t.items), fallback: fallback, at: j.p.res.TS})
+		}
+	}
+}
+
+// lost is a call of a thread whose record was not read whole, and why: its request counts it.
+type lost struct {
+	at  time.Time
+	why string
+}
+
+// raw is what a call read whole made, in its thread's items from from to to, not yet masked, and what the call
+// made as the store holds it.
+type raw struct {
+	t        *thread
+	from, to int
+	fallback []Result
+	at       time.Time
+}
+
+// mask masks, with tacit's redaction in one call, each artifact's text and key read off raw text in the run. When
+// masking fails, nothing read off the raw text is kept: those calls are read as the store holds them, and noted
+// unmasked.
+func (r *reader) mask(ctx context.Context) {
+	if len(r.raws) == 0 {
+		return
 	}
 	var texts []string
-	for i := range jobs {
-		if jobs[i].raw {
-			for _, x := range jobs[i].found {
-				texts = append(texts, x.Text, x.Key)
-			}
+	for _, w := range r.raws {
+		for _, it := range w.t.items[w.from:w.to] {
+			texts = append(texts, it.r.Text, it.r.Key)
 		}
 	}
-	var masked []string
-	if len(texts) > 0 {
-		var err error
-		if masked, err = r.redact()(ctx, texts); err != nil || len(masked) != len(texts) {
-			masked = nil
-		}
-	}
+	masked, err := r.redact()(ctx, texts)
 	k := 0
-	for i := range jobs {
-		j := &jobs[i]
-		if j.raw && !j.skip && len(j.found) > 0 {
-			if masked == nil {
-				// nothing read off the raw text is kept unmasked: the call is read as the store holds it
-				j.found, j.why = Artifacts(*j.p.call, *j.p.res), cutUnmasked
-			} else {
-				for x := range j.found {
-					j.found[x].Text, j.found[x].Key = masked[k], masked[k+1]
-					k += 2
-				}
+	for _, w := range r.raws {
+		if err != nil || len(masked) != len(texts) {
+			for i := w.from; i < w.to; i++ {
+				w.t.items[i].gone = true
 			}
-		}
-		for x := range j.found {
-			j.found[x].Thread = j.p.res.Session
-		}
-		r.resolved[key(j.p)] = resolvedPair{results: j.found, why: j.why}
-	}
-	for _, rq := range reqs {
-		for _, p := range rq.pending {
-			rp := r.resolved[key(p)]
-			rq.Results = append(rq.Results, rp.results...)
-			switch rp.why {
-			case cutGone:
-				rq.CutGone++
-			case cutUnread:
-				rq.CutUnread++
-			case cutUnmasked:
-				rq.CutUnmasked++
+			for _, x := range w.fallback {
+				w.t.items = append(w.t.items, item{r: x})
 			}
+			w.t.lost = append(w.t.lost, lost{at: w.at, why: cutUnmasked})
+			continue
 		}
-		rq.pending = nil
+		for i := w.from; i < w.to; i++ {
+			w.t.items[i].r.Text, w.t.items[i].r.Key = masked[k], masked[k+1]
+			k += 2
+		}
 	}
-	return nil
+	r.raws = nil
 }
 
 // redact is what masks secrets in text this read keeps from outside the store: the option's, else tacit's redaction.

@@ -25,11 +25,43 @@ type Decoded struct {
 	Unpaired bool
 }
 
-// Chunk is one exec_command of a Codex code-mode script: its command, its own output, and whether it exited
-// non-zero.
+// Chunk is one exec_command of a Codex code-mode script: its command, its own output, whether it exited
+// non-zero, and whether it still ran when it yielded (a session id, no exit code).
 type Chunk struct {
 	Command, Output string
-	Failed          bool
+	Failed, Running bool
+}
+
+// pairChunks matches a code-mode script's results to its exec_command calls, in order: one result each, or, for
+// a command still running at its yield, its result and those the script's write_stdin calls read after it, up to
+// one with an exit code, as one. Unpaired is true when the results cannot be matched so.
+func pairChunks(chunks []Chunk, cmds []string, stdin int) (paired []Chunk, unpaired bool) {
+	if len(chunks) == len(cmds) {
+		for i := range chunks {
+			chunks[i].Command = cmds[i]
+		}
+		return chunks, false
+	}
+	if len(chunks) != len(cmds)+stdin {
+		return nil, true
+	}
+	k := 0
+	for _, cmd := range cmds {
+		c := chunks[k]
+		k++
+		c.Command = cmd
+		for c.Running && k < len(chunks) && stdin > 0 {
+			n := chunks[k]
+			k, stdin = k+1, stdin-1
+			c.Output += "\n" + n.Output
+			c.Failed, c.Running = n.Failed, n.Running
+		}
+		paired = append(paired, c)
+	}
+	if k != len(chunks) || stdin != 0 {
+		return nil, true
+	}
+	return paired, false
 }
 
 // Keys of the stored inputs and outputs, every harness's.
@@ -104,14 +136,7 @@ func Decode(harness, tool, input, output string) Decoded {
 			outs = append(outs, c.Output)
 		}
 		d.Output = strings.Join(outs, "\n")
-		if len(chunks) == len(d.Commands) {
-			for i := range chunks {
-				chunks[i].Command = d.Commands[i]
-			}
-			d.Chunks = chunks
-		} else {
-			d.Unpaired = true
-		}
+		d.Chunks, d.Unpaired = pairChunks(chunks, d.Commands, strings.Count(input, "tools.write_stdin("))
 	case harness == "hermes":
 		var outs []string
 		for _, f := range fields(output, `"`, false) {
@@ -163,6 +188,8 @@ func codeChunks(output string) []Chunk {
 			c := Chunk{Output: uncut(text, !closed)}
 			if e := exitRe.FindStringSubmatch(output[max(start, 0):j]); e != nil {
 				c.Failed = e[1] != "0"
+			} else {
+				c.Running = strings.Contains(output[max(start, 0):j], `"session_id"`)
 			}
 			out = append(out, c)
 		}
