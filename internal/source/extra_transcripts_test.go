@@ -90,6 +90,13 @@ func promptActors(t *testing.T, st *store.Store) map[string]string {
 // It returns the cursors.
 func kimiOldRule(t *testing.T, st *store.Store, src Transcripts) map[string]store.FileCursor {
 	t.Helper()
+	return kimiSavedRule(t, st, src, 0)
+}
+
+// kimiSavedRule makes every saved cursor of src look as a build under Kimi rule saved it, none for 0. It returns
+// the cursors.
+func kimiSavedRule(t *testing.T, st *store.Store, src Transcripts, rule int) map[string]store.FileCursor {
+	t.Helper()
 	ctx := context.Background()
 	cursors, err := st.FileCursors(ctx, src.Name())
 	if err != nil {
@@ -102,6 +109,9 @@ func kimiOldRule(t *testing.T, st *store.Store, src Transcripts) map[string]stor
 			t.Fatal(err)
 		}
 		delete(state, "Rule")
+		if rule != 0 {
+			state["Rule"] = rule
+		}
 		cur.State, _ = json.Marshal(state)
 		old = append(old, store.FileWrite{Cursor: cur})
 	}
@@ -497,6 +507,104 @@ func TestKimiNullStateIsUnknown(t *testing.T) {
 	ingest(t, transcripts(home), st)
 	if got := promptActors(t, st); len(got) != 1 || got["marker-7f3a launcher"] != "unknown harness_text" {
 		t.Fatalf("a prompt of a session whose state.json is null stored as %v", got)
+	}
+}
+
+// kimiSkillPart is a skill's rendered body as Kimi's promptWithSkills puts it in a prompt's input: a text part
+// marked with meta.source "skill activation".
+func kimiSkillPart(text string) map[string]any {
+	return map[string]any{"type": "text", "text": text, "meta": map[string]any{"source": "skill activation", "activationId": "activation-1"}}
+}
+
+// kimiSkillOrigin is the user origin of a prompt that bundles one skill activation.
+func kimiSkillOrigin(fields map[string]any) map[string]any {
+	fields["kind"] = "user"
+	fields["skillActivations"] = []any{map[string]any{"activationId": "activation-1", "skillName": "review"}}
+	return fields
+}
+
+// ownerTexts are the texts of the owner turns stored, sorted.
+func ownerTexts(t *testing.T, st *store.Store) []string {
+	t.Helper()
+	var out []string
+	for _, e := range all(t, st, "transcripts") {
+		if e.Kind == "owner_text" {
+			out = append(out, e.Summary)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// A skill a client sends inline with a prompt (Kimi's promptWithSkills: the TUI's inline skill mention, the web UI's
+// skills field) renders its body into the prompt's input, ahead of what was typed. The body is generated input, as
+// a slash command's activation is; only the rest is the owner's. A prompt the skill leaves none of his words is
+// still his turn, with empty text. A prompt with no skill is read as before.
+func TestKimiInlineSkillIsGeneratedInput(t *testing.T) {
+	text := func(s string) map[string]any { return map[string]any{"type": "text", "text": s} }
+	image := map[string]any{"type": "image_url", "imageUrl": map[string]any{"url": "file:///neutral.png"}}
+	split := map[string]string{"marker-7f3a skill body": "harness harness_text", "marker-7f3a typed": "owner owner_text"}
+	for _, tc := range []struct {
+		name   string
+		record map[string]any
+		want   map[string]string
+		owner  []string
+	}{
+		{"inline skill", kimiRecord("turn.prompt", map[string]any{"origin": kimiSkillOrigin(map[string]any{}),
+			"input": []any{kimiSkillPart("marker-7f3a skill body"), text("marker-7f3a typed")}}), split, []string{"marker-7f3a typed"}},
+		{"steered with a skill", kimiRecord("turn.steer", map[string]any{"origin": kimiSkillOrigin(map[string]any{"inTurn": true}),
+			"input": []any{kimiSkillPart("marker-7f3a skill body"), text("marker-7f3a typed")}}), split, []string{"marker-7f3a typed"}},
+		{"skill only", kimiRecord("turn.prompt", map[string]any{"origin": kimiSkillOrigin(map[string]any{}),
+			"input": []any{kimiSkillPart("marker-7f3a skill body"), image}}),
+			map[string]string{"marker-7f3a skill body": "harness harness_text"}, []string{""}},
+		// A wire from before Kimi marked a skill's part holds the body as the prompt's first unmarked text part.
+		{"unmarked skill of an older wire", kimiRecord("turn.prompt", map[string]any{"origin": kimiSkillOrigin(map[string]any{}),
+			"input": []any{text("marker-7f3a skill body"), text("marker-7f3a typed")}}), split, []string{"marker-7f3a typed"}},
+		{"plain prompt", kimiPrompt("marker-7f3a typed"), map[string]string{"marker-7f3a typed": "owner owner_text"}, []string{"marker-7f3a typed"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed", "agents", "main", "wire.jsonl")
+			writeJSONLines(t, path, tc.record, kimiRecord("turn.ended", map[string]any{}))
+			kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a typed"}`)
+			st := openStore(t)
+			ingest(t, transcripts(home), st)
+			if got := promptActors(t, st); !maps.Equal(got, tc.want) {
+				t.Fatalf("prompt stored as %v, want %v", got, tc.want)
+			}
+			if got := ownerTexts(t, st); !slices.Equal(got, tc.owner) {
+				t.Fatalf("owner turns %q, want %q", got, tc.owner)
+			}
+			for _, e := range all(t, st, "transcripts") {
+				if e.Summary == "marker-7f3a skill body" && !strings.Contains(e.Meta, `"why":"generated input"`) {
+					t.Fatalf("the skill's body stored without its reason: %q", e.Meta)
+				}
+			}
+		})
+	}
+}
+
+// A cursor saved under the rule before inline skills holds a skill's body as the owner's words: its file is read
+// again once, and the body is generated input.
+func TestKimiCursorFromBeforeInlineSkillsReadsAgain(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed", "agents", "main", "wire.jsonl")
+	writeJSONLines(t, path, kimiRecord("turn.prompt", map[string]any{"origin": kimiSkillOrigin(map[string]any{}),
+		"input": []any{kimiSkillPart("marker-7f3a skill body"), map[string]any{"type": "text", "text": "marker-7f3a typed"}}}),
+		kimiRecord("turn.ended", map[string]any{}))
+	kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a typed"}`)
+	st := openStore(t)
+	src := transcripts(home)
+	ingest(t, src, st)
+	if cursors := kimiSavedRule(t, st, src, 1); len(cursors) != 1 {
+		t.Fatalf("cursors %d, want 1", len(cursors))
+	}
+	if r := ingest(t, src, st); !slices.Contains(r.Notes, "files read again from the start (replaced, cut, rewritten or read under an older rule): 1") {
+		t.Fatalf("a cursor from before inline skills was not read again: %q", r.Notes)
+	}
+	want := map[string]string{"marker-7f3a skill body": "harness harness_text", "marker-7f3a typed": "owner owner_text"}
+	if got := promptActors(t, st); !maps.Equal(got, want) {
+		t.Fatalf("prompt stored as %v, want %v", got, want)
 	}
 }
 

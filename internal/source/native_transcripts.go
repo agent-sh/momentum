@@ -83,9 +83,10 @@ type nativeState struct {
 }
 
 // kimiRule is the version of the Kimi attribution rule. A cursor saved under an older one holds owner turns
-// credited by a prompt's origin alone, a `kimi -p` run's among them: its file is read again from its start, once,
-// and each record holds what the new reading credits (PutFiles).
-const kimiRule = 1
+// credited by a prompt's origin alone, a `kimi -p` run's among them (before 1), or an inline skill's rendered body
+// as the owner's words (before 2): its file is read again from its start, once, and each record holds what the new
+// reading credits (PutFiles).
+const kimiRule = 2
 
 // kimiStale reports a Kimi cursor saved under an older rule. A compressed file's final cursor keeps no state, so
 // it is not read again for that; Kimi does not compress its wire files. A cursor that read nothing credited
@@ -526,11 +527,26 @@ func (s *nativeState) kimi(o map[string]any) []evidence.Event {
 		}
 		// A user origin says a prompt came in from outside the agent, not who sent it: `kimi -p` gives its
 		// prompt the same origin as a person typing. The session's metadata says which (kimiProvenance).
-		typed := str(object(o["origin"]), "kind") == "user" && s.Subagent == ""
+		origin := object(o["origin"])
+		typed := str(origin, "kind") == "user" && s.Subagent == ""
 		if typed {
 			s.kimiProvenance()
 		}
-		return s.user("kimi", nativeText(o["input"]), typed && s.Owner, typed && !s.Known, at, input)
+		// A skill a client sends inline with a prompt renders its body into the prompt's input: generated input, as
+		// a slash command's activation is. Only the rest of the input is the prompt's words (kimiInput).
+		skill, words := kimiInput(o["input"], origin)
+		prior := s.Prior
+		out := s.user("kimi", skill, false, false, at, input)
+		s.Prior = prior
+		owner := typed && s.Owner
+		rest := s.user("kimi", words, owner, typed && !s.Known, at, input)
+		if owner && skill != "" && !slices.ContainsFunc(rest, func(e evidence.Event) bool { return e.Kind == evidence.KindOwnerText }) {
+			// A prompt he sent is his turn though the skill left it none of his words: it holds empty text.
+			e := s.event("kimi", evidence.KindOwnerText, "", at)
+			e.Who, e.Prior, e.InputKind = evidence.Owner, prior, input
+			rest = append(rest, e)
+		}
+		return append(out, rest...)
 	case "context.append_loop_event":
 		event := object(o["event"])
 		switch str(event, "type") {
@@ -564,6 +580,43 @@ func (s *nativeState) kimi(o map[string]any) []evidence.Event {
 		return []evidence.Event{s.event("kimi", evidence.KindCompaction, firstOf(str(o, "summary"), str(o, "contextSummary")), at)}
 	}
 	return nil
+}
+
+// kimiSkillSource is the meta.source Kimi gives the text part a skill's rendered body takes in a prompt.
+const kimiSkillSource = "skill activation"
+
+// kimiInput splits a prompt's input into the text of the skills Kimi rendered into it and the rest, as Kimi reads
+// them: a text part whose meta.source is "skill activation" is a skill's. A wire from before Kimi marked those
+// parts holds, in a user-origin prompt with no part marked, one leading unmarked text part (no meta.source) per
+// activation its origin.skillActivations bundles. Only text counts, as in nativeText.
+func kimiInput(input any, origin map[string]any) (skill, rest string) {
+	parts, ok := input.([]any)
+	if !ok {
+		return "", nativeText(input)
+	}
+	marked := func(p map[string]any) bool {
+		return str(p, "type") == "text" && str(object(p["meta"]), "source") == kimiSkillSource
+	}
+	bundled := 0
+	if activations, ok := origin["skillActivations"].([]any); ok && str(origin, "kind") == "user" &&
+		!slices.ContainsFunc(parts, func(b any) bool { return marked(object(b)) }) {
+		bundled = len(activations)
+	}
+	var skills, others []any
+	for _, b := range parts {
+		p := object(b)
+		_, sourced := object(p["meta"])["source"]
+		switch {
+		case marked(p):
+			skills = append(skills, b)
+		case bundled > 0 && str(p, "type") == "text" && !sourced:
+			bundled--
+			skills = append(skills, b)
+		default:
+			others = append(others, b)
+		}
+	}
+	return nativeText(skills), nativeText(others)
 }
 
 // kimiProvenance reads whether a person's client ever prompted the session. Kimi's clients (its TUI, web UI and
