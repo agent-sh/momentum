@@ -445,7 +445,8 @@ type caseEvent struct {
 // caseEvents is a case's evidence of events (ev:ID), each with the event it resolved to, the loop's own left out by the
 // one rule every count of a plan keeps (store.InDir): the counts never count an event of the loop's own runs, so the
 // evidence their admission weighs them against holds none either. An event the store no longer holds stays, by its
-// evidence's time, not Found.
+// evidence's time and the tool its evidence recorded at filing, not Found: with no directory left to read, the loop's
+// own rule cannot leave it out.
 func caseEvents(ctx context.Context, st *store.Store, caseID, dir string) ([]caseEvent, error) {
 	evidence, err := st.CaseEvidence(ctx, caseID, 0)
 	if err != nil {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -567,6 +568,47 @@ func TestAnEventsReferenceTakesTheEventsOwn(t *testing.T) {
 	}
 	if _, _, err := st.AddCaseEvidence(ctx, c.ID, []Evidence{{Ref: "file:/t/future", At: time.Now().Add(time.Hour)}}, "agent"); !errors.Is(err, ErrBadCase) {
 		t.Errorf("evidence from the future: %v", err)
+	}
+}
+
+// An event's evidence records the event's tool as it is filed, whatever the caller gave, and keeps it once the store
+// no longer holds the event (#118); evidence that is no event has none. A merge moves the tool with the evidence.
+func TestAnEventsEvidenceKeepsItsToolPastTheEvent(t *testing.T) {
+	st := caseStore(t)
+	ctx := context.Background()
+	at := time.Now().Add(-time.Hour)
+	e := Event{Source: "mistakes", SourceKey: "k", TS: at, Actor: ActorTool, Kind: "tool-error", Tool: "Bash", Summary: "exit 2"}
+	if _, err := st.Put(ctx, []Event{e}); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := observeOK(t, st, Finding{Family: "failures", Signature: "s", Title: "t", Evidence: []Evidence{{Ref: "ev:" + e.ID(), Tool: "Edit"},
+		{Ref: "file:/t/a", At: at, Tool: "Edit"}}})
+	if _, err := st.db.ExecContext(ctx, `DELETE FROM events WHERE id = ?`, e.ID()); err != nil {
+		t.Fatal(err)
+	}
+	tools := func(id string) map[string]string {
+		t.Helper()
+		evs, err := st.CaseEvidence(ctx, id, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]string{}
+		for _, ev := range evs {
+			out[ev.Ref] = ev.Tool
+		}
+		return out
+	}
+	want := map[string]string{"ev:" + e.ID(): "Bash", "file:/t/a": ""}
+	if got := tools(c.ID); !maps.Equal(got, want) {
+		t.Fatalf("the evidence's tools once the event is gone: %v, want %v", got, want)
+	}
+	into, _ := observeOK(t, st, Finding{Family: "failures", Signature: "s2", Title: "t2", Evidence: refsAt("b", 1, at)})
+	if _, err := st.CloseCase(ctx, c.ID, Duplicate, into.ID, "same", "agent"); err != nil {
+		t.Fatal(err)
+	}
+	want["file:/t/b-0"] = ""
+	if got := tools(into.ID); !maps.Equal(got, want) {
+		t.Fatalf("the merged evidence's tools: %v, want %v", got, want)
 	}
 }
 

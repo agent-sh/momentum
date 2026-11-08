@@ -86,19 +86,25 @@ func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead e
 	for _, e := range hits {
 		counted["ev:"+e.ID()] = true
 	}
-	// own is the signal's tool when every event of the case's evidence dated before the count (countedAt) is still in
-	// the store and of it, the loop's own left out (caseEvents): its detector filed them, and no plan words them, so
+	// own is the signal's tool when every event of the case's evidence dated before the count (countedAt) is of it, the
+	// loop's own left out (caseEvents): its detector filed them, and no plan words them, so
 	// naming a tool in the signal takes no tool past the two incidents (guardCandidates). It is read over no span back
 	// from the count: the history is four of the build's windows, so evidence of another tool outside it would drop out
 	// under a shorter one, and a span would lose, at a later recount (a hand landing's, which runs on a later pass, as
 	// of the landing), the evidence the proposal saw. Evidence dated from the count on is not read here; the watch reads
 	// the case's evidence from its own start, so a piece dated between the two is weighed by neither (SPEC, Exposure, a
-	// known limit; #140). A case with no event of the store gets no guard (events, below). An event the store no longer
-	// holds is of no tool.
+	// known limit; #140). A case with no event of the store gets no guard (events, below). An event the store still
+	// holds is of its own tool; one it no longer holds (a rebuild, a stale row dropped) is of the tool its evidence
+	// recorded when it was filed, and of none when it recorded none (filed before evidence recorded tools, its event
+	// gone by the step that filled them in).
 	events, in, hit, own := 0, 0, 0, sig.Tool
 	for _, e := range evidence {
 		events++
-		if own != "" && e.At.Before(countedAt) && (!e.Found || e.Event.Tool != own) {
+		tool := e.Event.Tool
+		if !e.Found {
+			tool = e.Evidence.Tool
+		}
+		if own != "" && e.At.Before(countedAt) && tool != own {
 			own = ""
 		}
 		if e.At.Before(since) || !e.At.Before(at) {
@@ -200,9 +206,10 @@ func (c guardCandidate) holds(o guardCandidate) bool {
 //
 // A tool found by its events, alone or in a set, must be in two or more of the history's incidents, but the signal's
 // own (own), which every event is of by the signal's definition, and which guardPlan passes only when every event of
-// the case's evidence dated before the count is still in the store and of it too: the plan's word alone would take any
-// tool past. The incidents are the history's independent draws: events of one incident share a cause
-// (measure.Incidents), so a tool one incident alone holds may be where that cause happened to surface, and its hours
+// the case's evidence dated before the count is of it too, by the store's event or, for one the store lost, by the tool
+// recorded when it was filed: the plan's word alone would take any tool past. The incidents are the history's
+// independent draws: events of one incident share a cause (measure.Incidents), so a tool one incident alone holds may
+// be where that cause happened to surface, and its hours
 // would count activity in general as the problem's unit in use. A server takes no such bound: it is defined by the
 // server, not by which of its tools failed, and holds no built-in tool. none says why there is no candidate, when
 // there is none: then every activity would count as the problem's unit in use.
@@ -317,7 +324,7 @@ func guardCandidates(units, own string, hits []store.Event) (cands []guardCandid
 	default:
 		whys = append(whys, fmt.Sprintf("of %d MCP servers", len(fields)))
 	}
-	return nil, fmt.Sprintf("no unit holds all its events (%s: a tool, alone or in a set, is in two incidents or more, the signal's own too unless every event of the case's evidence dated before the count is still in the store and of it; a directory is every event's own; an MCP server is the one every event's tool is of, a connector of codex_apps where one holds them all), so absence cannot be counted only while the problem's unit was in use",
+	return nil, fmt.Sprintf("no unit holds all its events (%s: a tool, alone or in a set, is in two incidents or more, the signal's own too unless every event of the case's evidence dated before the count is of it, as the store holds it or, where the store lost it, as it was filed; a directory is every event's own; an MCP server is the one every event's tool is of, a connector of codex_apps where one holds them all), so absence cannot be counted only while the problem's unit was in use",
 		strings.Join(whys, "; "))
 }
 

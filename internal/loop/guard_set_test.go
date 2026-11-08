@@ -477,8 +477,10 @@ func TestAToolFoundByItsEventsNeedsTwoIncidents(t *testing.T) {
 // detector files an Edit failure dated after the proposal (and after the later count's boundary), the later count
 // refuses it, as intended: the problem is then not Bash's alone. Evidence dated after the count's own time is not
 // weighed: a hand landing's recount at the landing keeps its guard after an Edit failure two days past the landing,
-// a recurrence the watch reads. An event of the evidence the store no longer holds is of no tool, so Bash is refused,
-// in the history or before it.
+// a recurrence the watch reads. An event of the evidence the store no longer holds, in the history or before it, is of
+// the tool its evidence recorded when it was filed (#118): Bash is admitted where that is Bash, and refused where the
+// evidence recorded no tool (filed before evidence recorded tools, its event gone by the step that filled them in) or
+// another. An event the store still holds is of its own tool, whatever its evidence recorded.
 func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
 	now := time.Now().Truncate(time.Hour)
 	bash := serverSignal
@@ -496,7 +498,7 @@ func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
 		c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" }, edits...)
 		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 7*aDay, "", now)
 		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), alone) ||
-			!strings.Contains(err.Error(), "the signal's own too unless every event of the case's evidence dated before the count is still in the store and of it;") {
+			!strings.Contains(err.Error(), "the signal's own too unless every event of the case's evidence dated before the count is of it, as the store holds it or, where the store lost it, as it was filed;") {
 			t.Fatalf("a named tool over evidence of two tools: %+v %v", g, err)
 		}
 	})
@@ -616,42 +618,84 @@ func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
 			t.Fatalf("the landing's recount after a recurrence in Edit past it: %+v %v", g, err)
 		}
 	})
-	t.Run("evidence before the history the store no longer holds", func(t *testing.T) {
-		st, path := testStoreAt(t)
-		older := toolResult("bash-before", now.Add(-35*aDay), "bash-before", true)
-		older.Cwd = "/work/b"
-		c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" }, older)
+	// lose deletes the event of the failure stored under key, as a rebuild or a stale row's drop does, and gives its
+	// evidence the tool recorded: "" for evidence filed before it recorded one.
+	lose := func(t *testing.T, path string, c store.Case, key, recorded string) {
+		t.Helper()
 		db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(10000)")
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer db.Close()
-		if res, err := db.Exec(`DELETE FROM events WHERE source = ? AND source_key = 'bash-before'`, toolSignal.Source); err != nil {
+		id := store.Event{Source: toolSignal.Source, SourceKey: key}.ID()
+		if res, err := db.Exec(`DELETE FROM events WHERE id = ?`, id); err != nil {
 			t.Fatal(err)
 		} else if n, _ := res.RowsAffected(); n != 1 {
 			t.Fatalf("deleted %d events", n)
 		}
-		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 7*aDay, "", now)
-		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), alone) {
-			t.Fatalf("a named tool over evidence before its history the store lost: %+v %v", g, err)
+		if recorded != "Bash" {
+			if _, err := db.Exec(`UPDATE case_evidence SET tool = ? WHERE case_id = ? AND ref = ?`, recorded, c.ID, "ev:"+id); err != nil {
+				t.Fatal(err)
+			}
 		}
-	})
-	t.Run("evidence the store no longer holds", func(t *testing.T) {
-		st, path := testStoreAt(t)
-		c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" })
-		db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(10000)")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer db.Close()
-		if res, err := db.Exec(`DELETE FROM events WHERE source = ? AND source_key = 'f-0'`, toolSignal.Source); err != nil {
-			t.Fatal(err)
-		} else if n, _ := res.RowsAffected(); n != 1 {
-			t.Fatalf("deleted %d events", n)
-		}
-		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 7*aDay, "", now)
-		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), "(1 tool in one incident alone; in 5 directories; of no MCP server") {
-			t.Fatalf("a named tool over evidence the store lost: %+v %v", g, err)
-		}
-	})
+	}
+	for _, recorded := range []string{"Bash", "", "Edit"} {
+		t.Run(fmt.Sprintf("evidence before the history the store no longer holds, recorded as %q", recorded), func(t *testing.T) {
+			st, path := testStoreAt(t)
+			older := toolResult("bash-before", now.Add(-35*aDay), "bash-before", true)
+			older.Tool, older.Cwd = "Bash", "/work/b"
+			c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" }, older)
+			lose(t, path, c, "bash-before", recorded)
+			plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 7*aDay, "", now)
+			g, _ := guardOf(t, plan)
+			switch {
+			case recorded == "Bash" && (err != nil || g == nil || g.Unit != "tool" || g.Tool != "Bash" || g.Incidents != 1 || g.Exposure != 224+6):
+				t.Fatalf("a named tool over evidence before its history the store lost, filed as Bash: %+v %v", g, err)
+			case recorded != "Bash" && (err == nil || !strings.Contains(err.Error(), alone)):
+				t.Fatalf("a named tool over evidence before its history the store lost, filed as %q: %+v %v", recorded, g, err)
+			}
+		})
+		t.Run(fmt.Sprintf("evidence the store no longer holds, recorded as %q", recorded), func(t *testing.T) {
+			st, path := testStoreAt(t)
+			c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" })
+			lose(t, path, c, "f-0", recorded)
+			plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 7*aDay, "", now)
+			g, _ := guardOf(t, plan)
+			switch {
+			case recorded == "Bash" && (err != nil || g == nil || g.Unit != "tool" || g.Tool != "Bash" || g.Incidents != 1 || g.Exposure != 224+5):
+				t.Fatalf("a named tool over evidence the store lost, filed as Bash: %+v %v", g, err)
+			case recorded != "Bash" && (err == nil || !strings.Contains(err.Error(), "(1 tool in one incident alone; in 5 directories; of no MCP server")):
+				t.Fatalf("a named tool over evidence the store lost, filed as %q: %+v %v", recorded, g, err)
+			}
+		})
+	}
+	// An event the store still holds is of its own tool, whatever its evidence recorded: a record read again may give
+	// it another.
+	for _, held := range []string{"Bash", "Edit"} {
+		t.Run(fmt.Sprintf("evidence the store holds as %s, recorded as the other", held), func(t *testing.T) {
+			st, path := testStoreAt(t)
+			older := toolResult("held-before", now.Add(-35*aDay), "held-before", true)
+			older.Tool, older.Cwd = held, "/work/b"
+			c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" }, older)
+			other := map[string]string{"Bash": "Edit", "Edit": "Bash"}[held]
+			db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(10000)")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if res, err := db.Exec(`UPDATE case_evidence SET tool = ? WHERE case_id = ? AND ref = ?`, other, c.ID, "ev:"+older.ID()); err != nil {
+				t.Fatal(err)
+			} else if n, _ := res.RowsAffected(); n != 1 {
+				t.Fatalf("rewrote %d rows", n)
+			}
+			plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 7*aDay, "", now)
+			g, _ := guardOf(t, plan)
+			switch {
+			case held == "Bash" && (err != nil || g == nil || g.Unit != "tool" || g.Tool != "Bash"):
+				t.Fatalf("evidence of Bash in the store, recorded as Edit: %+v %v", g, err)
+			case held == "Edit" && (err == nil || !strings.Contains(err.Error(), alone)):
+				t.Fatalf("evidence of Edit in the store, recorded as Bash: %+v %v", g, err)
+			}
+		})
+	}
 }
