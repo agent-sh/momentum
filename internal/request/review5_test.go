@@ -315,44 +315,6 @@ func TestAWriterCutAfterItsPathIsNotReadWhole(t *testing.T) {
 	}
 }
 
-// A checked result that can no longer be read says why: its transcript is gone, or what was read whole could not
-// be masked.
-func TestALostResultSaysWhy(t *testing.T) {
-	failing := func(context.Context, []string) ([]string, error) { return nil, fmt.Errorf("no scrubber") }
-	for _, c := range []struct {
-		name   string
-		remove bool
-		redact func(context.Context, []string) ([]string, error)
-		want   string
-	}{
-		{"the transcript is gone", true, fakeRedact, "the transcript it was read from is gone"},
-		{"the masking failed", false, failing, "what it was read from could not be masked"},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			f := newFixture(t)
-			command := "git -C " + longDir + " commit -m 'Fix the parser'"
-			output := hookText + "[main 1a2b3c4] Fix the parser\n 1 file changed"
-			path := claudeCall(t, f, t.TempDir(), "s-lost", command, output)
-			f.reply("s-lost", at(3), "Committed the parser fix.")
-			f.phase("s-lost", at(4), "phase", "idle", nil)
-			rq := f.groupWith(Options{Redact: fakeRedact})[0]
-			if _, err := Check(context.Background(), f.st, rq, at(10)); err != nil {
-				t.Fatal(err)
-			}
-			if c.remove {
-				removeFile(t, path)
-			}
-			reqs, err := Group(context.Background(), f.st, t0.Add(-time.Hour), Options{Redact: c.redact})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if rq = reqs[0]; rq.State != Checked || !strings.Contains(rq.Why, c.want) {
-				t.Errorf("state %s (%s)", rq.State, rq.Why)
-			}
-		})
-	}
-}
-
 // A session's full id names it, though it starts another session's id.
 func TestAFullSessionIdIsNeverAmbiguous(t *testing.T) {
 	f := newFixture(t)

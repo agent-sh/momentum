@@ -1,7 +1,7 @@
 // Package request groups the owner's work into requests across the sessions it ran in, and reads what was observed
 // of each (SPEC, Requests). It reads the store's events and decides by rules, with no model: the links tacit's
 // reader records (subagents, parents, the copies a fork or a resume carries over) and a handoff's id pasted into a
-// turn. The one thing kept is the owner's check of a result.
+// turn. It keeps nothing of its own.
 package request
 
 import (
@@ -25,7 +25,6 @@ import (
 const (
 	NeedsYou = "needs_you"
 	Working  = "working"
-	Checked  = "checked"
 	Unknown  = "unknown"
 	Ready    = "ready"
 	Open     = "open"
@@ -52,7 +51,7 @@ type Ask struct {
 }
 
 // Result is what a request's tools recorded (an artifact) or the agent's last reply (its report, a claim). Key
-// names it for a check, the same in a fork that carried it over.
+// names it, the same in a fork that carried it over.
 type Result struct {
 	Kind   string
 	Key    string
@@ -88,17 +87,13 @@ type Request struct {
 	Opened   time.Time // zero when its opening is not in the store
 	Asks     []Ask     // his words, oldest first
 	LastTurn time.Time // his last turn, or the last turn that pasted its handoff
-	// LastOwnerTurn is his last ask: a turn he typed (not a brief that pasted the handoff, not a harness command
-	// such as /compact); only it reopens his check
-	LastOwnerTurn time.Time
-	Threads       []Thread
-	Results       []Result // the artifacts, newest first
-	Report        *Result  // the agent's last reply: its claim
-	Checks        []store.RequestCheck
-	State         string
-	Why           string // what the state rests on
-	Open          string // the open step; empty when nothing records one
-	Last          time.Time
+	Threads  []Thread
+	Results  []Result // the artifacts, newest first
+	Report   *Result  // the agent's last reply: its claim
+	State    string
+	Why      string // what the state rests on
+	Open     string // the open step; empty when nothing records one
+	Last     time.Time
 	// CutGone, CutUnread and CutUnmasked count its calls the store cut that were read as the store holds them:
 	// their transcript is gone, no reader of their harness is here, or what was read whole could not be masked
 	CutGone, CutUnread, CutUnmasked int
@@ -113,57 +108,12 @@ func (r *Request) start() time.Time {
 	return at
 }
 
-// Newest is the result a check binds: the newest artifact, else the report; nil when there is neither.
+// Newest is its newest result: the newest artifact, else the report; nil when there is neither.
 func (r *Request) Newest() *Result {
 	if len(r.Results) > 0 {
 		return &r.Results[0]
 	}
 	return r.Report
-}
-
-// Standing is the newest check not undone, and whether it holds the newest result.
-// A check whose result can no longer be read (its transcript is gone, so the result it named is not among what the
-// store holds) and that nothing came after still holds: nothing reopened it.
-// A turn of the owner's after the check reopens it: he asked for more than the result he checked.
-func (r *Request) Standing() (store.RequestCheck, bool, bool) {
-	for i := len(r.Checks) - 1; i >= 0; i-- {
-		if c := r.Checks[i]; c.Undone.IsZero() {
-			n := r.Newest()
-			return c, true, (n != nil && n.Key == c.Result || r.unreadable(c)) && !r.LastOwnerTurn.After(c.At)
-		}
-	}
-	return store.RequestCheck{}, false, false
-}
-
-// unreadable reports a check whose result is no longer among the request's and that no result came after.
-func (r *Request) unreadable(c store.RequestCheck) bool {
-	// what came after the checked result, though read only after the check, reopens it; a check stored before
-	// its result's time was kept goes by the check's time
-	since := c.ResultAt
-	if since.IsZero() {
-		since = c.At
-	}
-	for _, x := range r.Results {
-		if x.Key == c.Result || x.At.After(since) {
-			return false
-		}
-	}
-	// a newer reply reopens only a check of a reply (a request with no artifact)
-	if r.Report != nil && (r.Report.Key == c.Result || strings.HasPrefix(c.Result, KindReport+":") && r.Report.At.After(since)) {
-		return false
-	}
-	return true
-}
-
-// CheckIDs are the ids its checks are stored under.
-func (r *Request) CheckIDs() []string {
-	ids := []string{r.ID}
-	for _, c := range r.Checks {
-		if !contains(ids, c.Request) {
-			ids = append(ids, c.Request)
-		}
-	}
-	return ids
 }
 
 // Options are the rules' configuration: the prefixes of the turns the machine's programs type

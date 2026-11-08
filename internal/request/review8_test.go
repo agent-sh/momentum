@@ -4,17 +4,12 @@ package request
 // own probes.
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
-
-	"github.com/agent-sh/momentum/internal/store"
 )
 
 // A push that printed no To line (nothing new to push) beside a fetch the parser cannot see (over ssh, inside
@@ -31,50 +26,6 @@ func TestAToLessPushTakesNoFetchsRefLines(t *testing.T) {
 		if got != "" {
 			t.Errorf("FALSE PUSH from %q: %q", c.cmd, got)
 		}
-	}
-}
-
-// A check of an artifact whose transcript went: a reply after the check (a follow-up's answer) reopens it,
-// though with the transcript there the same reply does not (a newer report reopens only a request with no
-// artifact), and SPEC says the read losing a result reopens nothing.
-func TestALostCheckIsNotReopenedByAReply(t *testing.T) {
-	f := newFixture(t)
-	s := "s-claude-lost"
-	f.tool(s, "", "Write", at(0).Add(20*time.Second), `{"file_path":"/work/x/a.go","content":"package x"}`, "File created successfully", false)
-	command := "cd " + longDir + " && git commit -m 'Fix the parser'"
-	output := hookText + "[main 1a2b3c4] Fix the parser\n 1 file changed"
-	path := claudeCall(t, f, t.TempDir(), s, command, output)
-	f.reply(s, at(3), "Committed the parser fix.")
-	f.phase(s, at(4), "phase", "idle", nil)
-	rq := f.groupWith(Options{Redact: fakeRedact})[0]
-	if n := rq.Newest(); n == nil || !strings.Contains(n.Key, "1a2b3c4") {
-		t.Fatalf("newest before: %+v", rq.Newest())
-	}
-	if _, err := Check(context.Background(), f.st, rq, at(10)); err != nil {
-		t.Fatal(err)
-	}
-	// a reply after the check, with no turn of the owner's after it (a turn would reopen the check)
-	f.reply(s, at(12), "Also: nothing imports the old parser.")
-	f.phase(s, at(13), "phase", "idle", nil)
-	f.put()
-	reqs, err := Group(context.Background(), f.st, t0.Add(-time.Hour), Options{Redact: fakeRedact})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("with the transcript: %s (%s), newest %s", reqs[0].State, reqs[0].Why, reqs[0].Newest().Key)
-	if reqs[0].State != Checked {
-		t.Fatalf("with the transcript: %s", reqs[0].State)
-	}
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	reqs, err = Group(context.Background(), f.st, t0.Add(-time.Hour), Options{Redact: fakeRedact})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("transcript gone: %s (%s), newest %s", reqs[0].State, reqs[0].Why, reqs[0].Newest().Key)
-	if reqs[0].State != Checked {
-		t.Errorf("REOPENED by the lost read: %s (%s)", reqs[0].State, reqs[0].Why)
 	}
 }
 
@@ -206,29 +157,6 @@ func TestAPhaseFromBeforeTheTurnIsNotTrusted(t *testing.T) {
 		if rq.State != Unknown {
 			t.Errorf("%s from before the turn: state %s (%s)", phase, rq.State, rq.Why)
 		}
-	}
-}
-
-// A check whose result can no longer be read is reopened by an artifact that came after it.
-func TestALostCheckIsReopenedByANewerArtifact(t *testing.T) {
-	ctx := context.Background()
-	f := newFixture(t)
-	f.owner("s1", at(0), "fix the parser")
-	f.tool("s1", "", "Bash", at(1), `{"command":"git commit -am one"}`, "[main 1111111] one\n 1 file changed", false)
-	f.phase("s1", at(2), "phase", "idle", nil)
-	rq := f.group()[0]
-	if _, err := f.st.CheckOnce(ctx, store.RequestCheck{Request: rq.ID, Result: "push:origin gone@2222222", At: at(3)}, nil); err != nil {
-		t.Fatal(err)
-	}
-	f.tool("s1", "", "Bash", at(4), `{"command":"git commit -am two"}`, "[main 2222222] two\n 1 file changed", false)
-	f.phase("s1", at(5), "phase", "idle", nil)
-	f.put()
-	reqs, err := Group(ctx, f.st, t0.Add(-time.Hour), Options{Redact: fakeRedact})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rq = reqs[0]; rq.State == Checked {
-		t.Errorf("state %s (%s)", rq.State, rq.Why)
 	}
 }
 

@@ -241,9 +241,6 @@ func fill(u sets, reqs map[string]*Request, t *thread) {
 		if tn.at.After(rq.LastTurn) {
 			rq.LastTurn = tn.at
 		}
-		if tn.owner && !tn.program && !slashCommand(tn.words) && tn.at.After(rq.LastOwnerTurn) {
-			rq.LastOwnerTurn = tn.at // his own ask: what reopens his check
-		}
 		if th := thread(rq); th != nil && tn.at.After(th.turn) {
 			th.turn = tn.at
 		}
@@ -350,7 +347,7 @@ func fold(rq *Request) {
 	})
 }
 
-// finish reads the requests' threads' phases, their checks, and their state.
+// finish reads the requests' threads' phases, and their state.
 func (r *reader) finish(ctx context.Context, reqs []*Request) error {
 	current := false
 	for _, rq := range reqs {
@@ -418,22 +415,6 @@ func (r *reader) finish(ctx context.Context, reqs []*Request) error {
 				th.Phase, th.Ask, th.AskKind = m.To, m.Ask, m.AskKind
 			}
 		}
-		ids := append([]string{rq.ID}, rq.Aliases...)
-		var prefixes []string
-		for _, id := range ids {
-			alone, err := r.alone(ctx, id)
-			if err != nil {
-				return err
-			}
-			if tp := id[:len(id)-4]; alone && !contains(prefixes, tp) {
-				prefixes = append(prefixes, tp)
-			}
-		}
-		checks, err := r.st.RequestChecks(ctx, ids, prefixes, 4)
-		if err != nil {
-			return err
-		}
-		rq.Checks = checks
 	}
 	r.maskAsks(ctx, reqs)
 	for _, rq := range reqs {

@@ -126,34 +126,6 @@ func TestAForkCarriesNoCommitIntoAPastedRequest(t *testing.T) {
 	}
 }
 
-// A check binds the key a whole read gave. When the transcript is later gone, the result can no longer be read:
-// the check stands, and says so, since nothing new came.
-func TestACheckStandsWhenItsResultCanNoLongerBeRead(t *testing.T) {
-	f := newFixture(t)
-	command := "cd " + longDir + " && git commit -m 'Fix the parser'"
-	output := hookText + "[main 1a2b3c4] Fix the parser\n 1 file changed"
-	path := claudeCall(t, f, t.TempDir(), "s-claude-check", command, output)
-	f.reply("s-claude-check", at(3), "Committed the parser fix.")
-	f.phase("s-claude-check", at(4), "phase", "idle", nil)
-	rq := f.groupWith(Options{Redact: fakeRedact})[0]
-	if n := rq.Newest(); n == nil || !strings.Contains(n.Key, "1a2b3c4") {
-		t.Fatalf("newest before: %+v", rq.Newest())
-	}
-	if _, err := Check(context.Background(), f.st, rq, at(10)); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	reqs, err := Group(context.Background(), f.st, t0.Add(-time.Hour), Options{Redact: fakeRedact})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rq = reqs[0]; rq.State != Checked || !strings.Contains(rq.Why, "can no longer be read") {
-		t.Errorf("after the transcript went: state %s (%s), newest %+v", rq.State, rq.Why, rq.Newest())
-	}
-}
-
 // What a whole read took off a transcript is kept only parsed and masked: no raw record stays in the reader after
 // its job, and no unmasked token is in what a request keeps, its keys included.
 func TestARawRecordIsLetGoAfterItsJob(t *testing.T) {

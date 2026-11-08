@@ -436,65 +436,6 @@ func TestStateFromObservedPhases(t *testing.T) {
 	}
 }
 
-// A check binds the newest result. A newer artifact reopens it, and the owner can undo it.
-func TestACheckIsReopenedByANewerResultAndUndone(t *testing.T) {
-	ctx := context.Background()
-	f := newFixture(t)
-	f.owner("s-c", at(0), "bump the version")
-	f.tool("s-c", "", "Bash", at(1), `{"command":"git commit"}`, "[main 9c0d1e2] Bump the version", false)
-	f.reply("s-c", at(2), "Bumped.")
-	f.phase("s-c", at(3), "phase", "idle", nil)
-	rq := f.group()[0]
-	if rq.State != Ready || rq.Newest().Key != "commit:9c0d1e2" {
-		t.Fatalf("state %s newest %+v", rq.State, rq.Newest())
-	}
-	if err := f.st.PutRequestCheck(ctx, store.RequestCheck{Request: rq.ID, Result: rq.Newest().Key, At: at(4)}); err != nil {
-		t.Fatal(err)
-	}
-	if rq = f.group()[0]; rq.State != Checked {
-		t.Fatalf("checked: %s", rq.State)
-	}
-	// a newer report alone does not reopen a request with an artifact
-	f.reply("s-c", at(5), "Anything else?")
-	if rq = f.group()[0]; rq.State != Checked {
-		t.Fatalf("a reply reopened it: %s", rq.State)
-	}
-	f.tool("s-c", "", "Bash", at(6), `{"command":"git commit --amend"}`, "[main 0d1e2f3] Bump the version to 2", false)
-	if rq = f.group()[0]; rq.State != Ready || !strings.Contains(Handoff(rq), "is reopened by a newer result") {
-		t.Fatalf("reopened: %s\n%s", rq.State, Handoff(rq))
-	}
-	c, err := f.st.UndoRequestCheck(ctx, []string{rq.ID}, at(7))
-	if err != nil || c.Result != "commit:9c0d1e2" {
-		t.Fatalf("undo: %+v %v", c, err)
-	}
-	if _, standing, _ := f.group()[0].Standing(); standing {
-		t.Fatal("the undone check still stands")
-	}
-	if _, err := f.st.UndoRequestCheck(ctx, []string{rq.ID}, at(8)); err != store.ErrNoCheck {
-		t.Fatalf("undo with none standing: %v", err)
-	}
-}
-
-// A request with no artifact has its report as its result: a newer report reopens its check.
-func TestAReportIsTheResultOfARequestWithNoArtifact(t *testing.T) {
-	ctx := context.Background()
-	f := newFixture(t)
-	f.owner("s-q", at(0), "why is the build slow")
-	f.reply("s-q", at(1), "The cache is cold.")
-	f.phase("s-q", at(2), "phase", "idle", nil)
-	rq := f.group()[0]
-	if n := rq.Newest(); n == nil || n.Kind != KindReport {
-		t.Fatalf("newest: %+v", n)
-	}
-	if err := f.st.PutRequestCheck(ctx, store.RequestCheck{Request: rq.ID, Result: rq.Newest().Key, At: at(3)}); err != nil {
-		t.Fatal(err)
-	}
-	f.reply("s-q", at(4), "Also the linker is slow.")
-	if rq = f.group()[0]; rq.State != Ready {
-		t.Fatalf("a newer report reopens it: %s", rq.State)
-	}
-}
-
 // Results are what the tools printed: a failed call's push, a failed write, a fetch's ref lines and a pull request
 // only viewed are none.
 func TestResultsComeFromToolOutput(t *testing.T) {

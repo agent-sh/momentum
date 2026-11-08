@@ -5,7 +5,6 @@ package request
 import (
 	"context"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -111,34 +110,6 @@ func TestACutCallThatNamesNoGitIsNotCounted(t *testing.T) {
 				t.Errorf("cut and gone %d", rq.CutGone)
 			}
 		})
-	}
-}
-
-// A check whose result can no longer be read does not stand in the way of a check of the newest result.
-func TestACheckOverOneWhoseResultIsLost(t *testing.T) {
-	ctx := context.Background()
-	f := newFixture(t)
-	f.owner("s1", at(0), "fix the parser")
-	f.tool("s1", "", "Bash", at(1), `{"command":"git commit -am one"}`, "[main 1111111] one\n 1 file changed", false)
-	f.reply("s1", at(2), "Done.")
-	f.phase("s1", at(3), "phase", "idle", nil)
-	rq := f.group()[0]
-	// a check stored on a result this read no longer finds, after every result here
-	if _, err := f.st.CheckOnce(ctx, store.RequestCheck{Request: rq.ID, Result: "push:origin gone@2222222", At: at(10)}, nil); err != nil {
-		t.Fatal(err)
-	}
-	reqs, err := Group(ctx, f.st, t0.Add(-time.Hour), Options{Redact: fakeRedact})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Check(ctx, f.st, reqs[0], at(11)); err != nil {
-		t.Fatal(err)
-	}
-	if reqs, err = Group(ctx, f.st, t0.Add(-time.Hour), Options{Redact: fakeRedact}); err != nil {
-		t.Fatal(err)
-	}
-	if rq = reqs[0]; rq.State != Checked || !strings.Contains(rq.Why, "checked its newest result") {
-		t.Errorf("state %s (%s)", rq.State, rq.Why)
 	}
 }
 

@@ -5,7 +5,6 @@ package request
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
@@ -193,32 +192,6 @@ func TestAViewBesideCreateBlocks(t *testing.T) {
 		if got := artifactsAs("Bash", `{"command":`+jsonString(cmd)+`}`, out, false); got != "" {
 			t.Errorf("%s: got %q", cmd, got)
 		}
-	}
-}
-
-// A turn of the owner's after his check reopens it: he asked for more. A check of the newest result after the
-// turn holds it again.
-func TestATurnAfterTheCheckReopensIt(t *testing.T) {
-	ctx := context.Background()
-	f := newFixture(t)
-	f.owner("s1", at(0), "fix the parser")
-	f.tool("s1", "", "Bash", at(1), `{"command":"git commit -am Fix"}`, "[main 1a2b3c4] Fix\n 1 file changed", false)
-	f.phase("s1", at(2), "phase", "idle", nil)
-	rq := f.group()[0]
-	if _, err := Check(ctx, f.st, rq, at(3)); err != nil {
-		t.Fatal(err)
-	}
-	f.owner("s1", at(4), "and the tests too")
-	f.phase("s1", at(5), "phase", "idle", nil)
-	rq = f.group()[0]
-	if rq.State == Checked || !strings.Contains(rq.Why, "reopened by a turn of the owner's after it") || !strings.Contains(rq.Open, "and the tests too") {
-		t.Fatalf("state %s (%s), open %q", rq.State, rq.Why, rq.Open)
-	}
-	if c, err := Check(ctx, f.st, rq, at(6)); err != nil || !c.Added {
-		t.Fatalf("check again: %+v %v", c, err)
-	}
-	if rq = f.group()[0]; rq.State != Checked {
-		t.Errorf("after the check again: %s (%s)", rq.State, rq.Why)
 	}
 }
 

@@ -4,7 +4,6 @@ package request
 // probes.
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"path/filepath"
@@ -101,44 +100,6 @@ func TestCodexsWriteStdinToolPollsItsSession(t *testing.T) {
 func TestAnEscapePastTheLastCodePointIsKept(t *testing.T) {
 	if s, _, _ := literal(`"a\u{110000}b"`); s != `a\u{110000}b` {
 		t.Errorf("got %q", s)
-	}
-}
-
-// A check whose result is lost is reopened by a result that came after the checked result, though it was read only
-// after the check (ingest lag, a whole read that failed then).
-func TestALostCheckIsReopenedByALaterResultReadAfterIt(t *testing.T) {
-	ctx := context.Background()
-	f := newFixture(t)
-	f.owner("s1", at(0), "fix the parser")
-	f.tool("s1", "", "Bash", at(3), `{"command":"git commit -am two"}`, "[main 2222222] two\n 1 file changed", false)
-	f.phase("s1", at(4), "phase", "idle", nil)
-	rq := f.group()[0]
-	// checked at(5) when the newest it read was commit 1111111 of at(1), whose record is gone since
-	if _, err := f.st.CheckOnce(ctx, store.RequestCheck{Request: rq.ID, Result: "commit:1111111", At: at(5), ResultAt: at(1)}, nil); err != nil {
-		t.Fatal(err)
-	}
-	reqs, err := Group(ctx, f.st, t0.Add(-time.Hour), Options{Redact: fakeRedact})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rq = reqs[0]; rq.State == Checked {
-		t.Errorf("state %s (%s), though commit 2222222 came after the checked result", rq.State, rq.Why)
-	}
-}
-
-// A check keeps the time of the result it checked.
-func TestACheckKeepsItsResultsTime(t *testing.T) {
-	ctx := context.Background()
-	f := newFixture(t)
-	f.owner("s1", at(0), "fix the parser")
-	f.tool("s1", "", "Bash", at(3), `{"command":"git commit -am two"}`, "[main 2222222] two\n 1 file changed", false)
-	rq := f.group()[0]
-	if _, err := Check(ctx, f.st, rq, at(10)); err != nil {
-		t.Fatal(err)
-	}
-	cs, err := f.st.RequestChecks(ctx, []string{rq.ID}, nil, 4)
-	if err != nil || len(cs) != 1 || !cs[0].ResultAt.Equal(rq.Newest().At) {
-		t.Fatalf("checks %+v, newest at %v (%v)", cs, rq.Newest().At, err)
 	}
 }
 

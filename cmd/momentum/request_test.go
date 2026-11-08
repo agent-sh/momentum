@@ -39,8 +39,8 @@ func putRequestEvents(t *testing.T, base time.Time) {
 	}
 }
 
-// From a session's id to a handoff, a check, its undo and the list, end to end.
-func TestRequestHandoffCheckAndList(t *testing.T) {
+// From a session's id to a handoff and the list, end to end.
+func TestRequestHandoffAndList(t *testing.T) {
 	t.Setenv("MOMENTUM_HOME", t.TempDir())
 	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
 	putRequestEvents(t, time.Now().Add(-time.Hour).Truncate(time.Millisecond))
@@ -66,29 +66,22 @@ func TestRequestHandoffCheckAndList(t *testing.T) {
 		t.Fatalf("by its id: exit %d\n%s", code, again)
 	}
 
-	if code, out, errOut := momentum("request", "check", id); code != 0 || !strings.Contains(out, "checked commit 4b5c6d7") {
-		t.Fatalf("check: exit %d %q %s", code, out, errOut)
-	}
-	if code, out, _ := momentum("request", "check", id); code != 0 || !strings.Contains(out, "checked already") {
-		t.Fatalf("check again: exit %d %q", code, out)
-	}
 	code, out, errOut = momentum("request", "list", "--since", "1d", "--json")
 	var list struct {
 		Requests []requestJSON `json:"requests"`
 	}
 	if code != 0 || json.Unmarshal([]byte(out), &list) != nil || len(list.Requests) != 1 || list.Requests[0].ID != id ||
-		list.Requests[0].State != "checked" || list.Requests[0].Newest != "commit:4b5c6d7" {
+		list.Requests[0].State != "ready" || list.Requests[0].Newest != "commit:4b5c6d7" {
 		t.Fatalf("list: exit %d %q %s", code, out, errOut)
-	}
-	if code, out, _ := momentum("request", "uncheck", id); code != 0 || !strings.Contains(out, "undid the check") {
-		t.Fatalf("uncheck: exit %d %q", code, out)
-	}
-	if code, _, errOut := momentum("request", "uncheck", id); code != 2 || !strings.Contains(errOut, "no check to undo") {
-		t.Fatalf("uncheck with none standing: exit %d %s", code, errOut)
 	}
 	if code, out, _ := momentum("request", "list", "--since", "1d"); code != 0 || len(strings.Fields(out)) < 2 ||
 		strings.Fields(out)[0] != id || strings.Fields(out)[1] != "ready" {
-		t.Fatalf("list after the undo: exit %d %q", code, out)
+		t.Fatalf("list: exit %d %q", code, out)
+	}
+	for _, gone := range []string{"check", "uncheck"} {
+		if code, _, errOut := momentum("request", gone, id); code != 2 || !strings.Contains(errOut, "unknown request command") {
+			t.Fatalf("request %s: exit %d %s", gone, code, errOut)
+		}
 	}
 	if code, _, errOut := momentum("request", "handoff", "no-such-session"); code != 2 || !strings.Contains(errOut, "neither a request's id nor a session's") {
 		t.Fatalf("an unknown id: exit %d %s", code, errOut)

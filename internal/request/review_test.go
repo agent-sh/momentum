@@ -249,8 +249,8 @@ func TestItsIDAndItsSessionNameTheSameRequest(t *testing.T) {
 }
 
 // The same request in a list whose window holds only the third session: the list and the handoff must agree on
-// its state once the owner checked its newest result.
-func TestListAndHandoffAgreeOnACheck(t *testing.T) {
+// it.
+func TestListAndHandoffAgreeOnARequestFromBefore(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
 	f.owner("s-one", at(0), "port the scheduler")
@@ -263,20 +263,16 @@ func TestListAndHandoffAgreeOnACheck(t *testing.T) {
 	f.tool("s-two", "", "Bash", at(101), `{"command":"git commit"}`, "[main 2222bbb] Port the timers", false)
 	f.phase("s-two", at(102), "phase", "idle", nil)
 	f.put()
-	full, _ := Find(ctx, f.st, rq.ID, Options{Redact: fakeRedact})
-	if err := f.st.PutRequestCheck(ctx, store.RequestCheck{Request: full.ID, Result: full.Newest().Key, At: at(103)}); err != nil {
-		t.Fatal(err)
-	}
 	f.owner("s-three", at(300), "pick this up: "+text)
 	f.phase("s-three", at(302), "phase", "idle", nil)
 	f.put()
-	full, _ = Find(ctx, f.st, rq.ID, Options{Redact: fakeRedact})
+	full, _ := Find(ctx, f.st, rq.ID, Options{Redact: fakeRedact})
 	list, err := List(ctx, f.st, at(200), Options{Redact: fakeRedact})
 	if err != nil || len(list) != 1 {
 		t.Fatalf("list: %v %d", err, len(list))
 	}
 	if list[0].State != full.State || Handoff(list[0]) != Handoff(full) {
-		t.Fatalf("handoff says %s, list says %s; the list's newest is %s, the check holds %s", full.State, list[0].State,
+		t.Fatalf("handoff says %s, list says %s; the list's newest is %s, the handoff's %s", full.State, list[0].State,
 			list[0].Newest().Key, full.Newest().Key)
 	}
 }
@@ -314,22 +310,20 @@ func TestABriefLinks(t *testing.T) {
 }
 
 // The id hashes the stored words of the opening. A read again that stores other words for it (tacit's cut of a
-// paste reads the prompt history at read time) keeps the owner's check, by the time alone while one opening has it.
-func TestAReadAgainKeepsTheCheck(t *testing.T) {
+// paste reads the prompt history at read time) still finds the request by its old id, by the time alone while one
+// opening has it.
+func TestAReadAgainKeepsTheOldID(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
 	e := f.owner("s-re", at(0), "fix the importer")
 	f.tool("s-re", "", "Bash", at(1), `{"command":"git commit"}`, "[main 3333ccc] Fix the importer", false)
 	f.phase("s-re", at(2), "phase", "idle", nil)
 	rq := f.group()[0]
-	if err := f.st.PutRequestCheck(ctx, store.RequestCheck{Request: rq.ID, Result: rq.Newest().Key, At: at(3)}); err != nil {
-		t.Fatal(err)
-	}
 	e.Summary = "fix the importer [the paste it cut before]"
 	f.evs = append(f.evs, e)
 	again := f.group()[0]
-	if again.ID == rq.ID || again.State != Checked {
-		t.Fatalf("after a read again the id is %s (was %s) and the state %s", again.ID, rq.ID, again.State)
+	if again.ID == rq.ID {
+		t.Fatalf("after a read again the id is %s (was %s)", again.ID, rq.ID)
 	}
 	found, err := Find(ctx, f.st, rq.ID, Options{Redact: fakeRedact})
 	if err != nil || found.ID != again.ID {
@@ -504,48 +498,6 @@ func TestAPastedHandoffOverTwoThousandBytesLinks(t *testing.T) {
 	}
 }
 
-// A check stored under an id that resolves to the request (an opening joined into it) counts for it.
-func TestACheckUnderAnAliasCounts(t *testing.T) {
-	ctx := context.Background()
-	f := newFixture(t)
-	f.owner("s-main", at(0), "ship the exporter")
-	f.event("s-next", "", "tool_call", store.ActorAgent, at(19), "{}", map[string]any{"parent": "s-main"})
-	f.owner("s-next", at(20), "now write the release notes")
-	f.tool("s-next", "", "Bash", at(21), `{"command":"git commit"}`, "[main 3c4d5e6] Release notes", false)
-	f.phase("s-next", at(22), "phase", "idle", nil)
-	rq := f.group()[0]
-	if len(rq.Aliases) != 1 {
-		t.Fatalf("aliases: %v", rq.Aliases)
-	}
-	if err := f.st.PutRequestCheck(ctx, store.RequestCheck{Request: rq.Aliases[0], Result: rq.Newest().Key, At: at(23)}); err != nil {
-		t.Fatal(err)
-	}
-	if rq = f.group()[0]; rq.State != Checked {
-		t.Fatalf("a check under its alias: %s", rq.State)
-	}
-}
-
-// A session seen waiting on him or working comes before a check.
-func TestALiveSessionComesBeforeACheck(t *testing.T) {
-	ctx := context.Background()
-	f := newFixture(t)
-	f.owner("s-live", at(0), "bump the version")
-	f.tool("s-live", "", "Bash", at(1), `{"command":"git commit"}`, "[main 9c0d1e2] Bump the version", false)
-	f.phase("s-live", at(2), "phase", "idle", nil)
-	rq := f.group()[0]
-	if err := f.st.PutRequestCheck(ctx, store.RequestCheck{Request: rq.ID, Result: rq.Newest().Key, At: at(3)}); err != nil {
-		t.Fatal(err)
-	}
-	f.phase("s-live", at(4), "phase", "working", nil)
-	if rq = f.group()[0]; rq.State != Working {
-		t.Fatalf("working after a check: %s", rq.State)
-	}
-	f.phase("s-live", at(5), "phase", "needs_you", map[string]any{"ask": "Tag it?"})
-	if rq = f.group()[0]; rq.State != NeedsYou {
-		t.Fatalf("waiting after a check: %s", rq.State)
-	}
-}
-
 // A start of two sessions' ids names neither.
 func TestAnAmbiguousSessionPrefixIsRefused(t *testing.T) {
 	f := newFixture(t)
@@ -557,27 +509,6 @@ func TestAnAmbiguousSessionPrefixIsRefused(t *testing.T) {
 	}
 	if rq, err := Find(context.Background(), f.st, "s-dup-2", Options{Redact: fakeRedact}); err != nil || rq.ID != ID(at(1), "another thing") {
 		t.Fatalf("a whole id: %v", err)
-	}
-}
-
-// Uncheck undoes a check stored under an id that resolves to the request.
-func TestUncheckUndoesACheckUnderAnAlias(t *testing.T) {
-	ctx := context.Background()
-	f := newFixture(t)
-	f.owner("s-main", at(0), "ship the exporter")
-	f.event("s-next", "", "tool_call", store.ActorAgent, at(19), "{}", map[string]any{"parent": "s-main"})
-	f.owner("s-next", at(20), "now write the release notes")
-	f.tool("s-next", "", "Bash", at(21), `{"command":"git commit"}`, "[main 3c4d5e6] Release notes", false)
-	rq := f.group()[0]
-	if err := f.st.PutRequestCheck(ctx, store.RequestCheck{Request: rq.Aliases[0], Result: rq.Newest().Key, At: at(23)}); err != nil {
-		t.Fatal(err)
-	}
-	c, err := Uncheck(ctx, f.st, f.group()[0], at(24))
-	if err != nil || c.Request != rq.Aliases[0] {
-		t.Fatalf("uncheck: %+v %v", c, err)
-	}
-	if _, standing, _ := f.group()[0].Standing(); standing {
-		t.Fatal("the check under the alias still stands")
 	}
 }
 

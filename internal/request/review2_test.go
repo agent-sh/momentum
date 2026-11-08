@@ -76,39 +76,6 @@ func TestAHandoffByASubagentsSessionAgreesWithTheList(t *testing.T) {
 	}
 }
 
-// Two checks that both read before either wrote (two check commands at once) leave two standing rows; one uncheck
-// must leave the request unchecked.
-func TestTwoChecksAtOnceAndOneUncheck(t *testing.T) {
-	f := newFixture(t)
-	f.owner("s-c", at(0), "tidy the readme")
-	f.tool("s-c", "", "Bash", at(1), `{"command":"git commit -m readme"}`, "[main 5e5e5e5] Tidy the readme", false)
-	f.put()
-	ctx := context.Background()
-	id := ID(at(0), "tidy the readme")
-	a, err := Find(ctx, f.st, id, Options{Redact: fakeRedact})
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, _ := Find(ctx, f.st, id, Options{Redact: fakeRedact})
-	if _, err := Check(ctx, f.st, a, at(5)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Check(ctx, f.st, b, at(5)); err != nil {
-		t.Fatal(err)
-	}
-	c, _ := Find(ctx, f.st, id, Options{Redact: fakeRedact})
-	if len(c.Checks) != 1 {
-		t.Fatalf("two checks at once left %d", len(c.Checks))
-	}
-	if _, err := Uncheck(ctx, f.st, c, at(6)); err != nil {
-		t.Fatal(err)
-	}
-	d, _ := Find(ctx, f.st, id, Options{Redact: fakeRedact})
-	if d.State == Checked {
-		t.Fatalf("one uncheck after two concurrent checks leaves it %s: %s", d.State, stateLine(d))
-	}
-}
-
 // A list and a handoff of one request must say the same of its sessions' phases. s-a's last phase was seen before it
 // pasted B's handoff; a list that also holds an older request reads that phase, a handoff of B reads phases only from
 // B's own first thread on.

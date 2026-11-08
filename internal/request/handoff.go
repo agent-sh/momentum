@@ -92,7 +92,7 @@ func Handoff(rq *Request) string {
 		line("- details cut, not masked: %d of its calls the store cut or joined were read whole, but what they made could not be masked, so it is not kept", rq.CutUnmasked)
 	}
 	if rq.Report != nil {
-		line("Claimed (the agent's last reply, %s, not checked): %s", rq.Report.At.Local().Format(timeFormat), rq.Report.Text)
+		line("Claimed (the agent's last reply, %s, not verified): %s", rq.Report.At.Local().Format(timeFormat), rq.Report.Text)
 		cite(rq.Report.Event)
 	} else {
 		line("Claimed: unknown, no reply of the agent's is recorded")

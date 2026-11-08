@@ -16,8 +16,7 @@ var tracked = map[string]bool{"claude": true, "codex": true, "pi": true, "openco
 var livePhases = map[string]bool{"working": true, "background": true, "scheduled": true}
 
 // state decides a request's state, what it rests on, and its open step, from what was observed, the first that
-// holds: a thread waits on the owner, a thread works, a standing check holds the newest result, the latest
-// thread's phase is not known (never recorded, recorded only before the last turn there, or every thread moved
+// holds: a thread waits on the owner, a thread works, the latest thread's phase is not known (never recorded, recorded only before the last turn there, or every thread moved
 // on), a result came after his last turn, nothing did. A phase counts only when a sessions run saw it after the
 // request's last turn in the thread.
 func state(rq *Request) {
@@ -46,16 +45,11 @@ func state(rq *Request) {
 	if rq.Report != nil && rq.Report.At.After(rq.LastTurn) {
 		after = true
 	}
-	c, standing, holds := rq.Standing()
 	switch {
 	case needs != nil:
 		rq.State, rq.Why = NeedsYou, "a session of it was last seen waiting on the owner"
 	case working:
 		rq.State, rq.Why = Working, "a session of it was last seen working"
-	case standing && holds && rq.unreadable(c):
-		rq.State, rq.Why = Checked, "the owner checked it at "+c.At.Local().Format(timeFormat)+"; its result can no longer be read ("+rq.lostWhy()+"), and nothing came after"
-	case standing && holds:
-		rq.State, rq.Why = Checked, "the owner checked its newest result at "+c.At.Local().Format(timeFormat)+"; that he checked it does not make it right"
 	case latest == nil:
 		rq.State, rq.Why = Unknown, "every session of it moved on to another request, so nothing records whether it is done"
 	case latest.Phase == "" && !tracked[latest.Harness]:
@@ -68,13 +62,6 @@ func state(rq *Request) {
 		rq.State, rq.Why = Ready, "a result came after the last turn"
 	default:
 		rq.State, rq.Why = Open, "nothing came after the last turn"
-	}
-	if (rq.State == Ready || rq.State == Open) && standing && !holds {
-		by := "a newer result"
-		if rq.LastOwnerTurn.After(c.At) {
-			by = "a turn of the owner's after it"
-		}
-		rq.Why += "; the check of " + c.At.Local().Format(timeFormat) + " is reopened by " + by
 	}
 	switch {
 	case needs != nil:
@@ -98,22 +85,6 @@ func state(rq *Request) {
 			}
 		}
 	}
-}
-
-// lostWhy is why a request's result can no longer be read: the transcript it was read from is gone, or what was
-// read whole could not be masked.
-func (rq *Request) lostWhy() string {
-	switch {
-	case rq.CutGone > 0 && rq.CutUnmasked > 0:
-		return "a transcript it was read from is gone, and what another call made could not be masked"
-	case rq.CutGone > 0:
-		return "the transcript it was read from is gone"
-	case rq.CutUnmasked > 0:
-		return "what it was read from could not be masked"
-	case rq.CutUnread > 0:
-		return "its harness is not read whole here"
-	}
-	return "it is no longer among the request's"
 }
 
 // ErrNoRequest is an id that names no request in the store.
@@ -224,43 +195,6 @@ func List(ctx context.Context, st *store.Store, since time.Time, opt Options) ([
 // Group is List: the requests the threads with events since a time hold.
 func Group(ctx context.Context, st *store.Store, since time.Time, opt Options) ([]*Request, error) {
 	return List(ctx, st, since, opt)
-}
-
-// CheckOutcome is what a check did: whether it recorded one, the result it names (the newest, which a standing
-// check holds already when it recorded none), and the standing check it was made over because that check's result
-// can no longer be read (zero when there was none).
-type CheckOutcome struct {
-	Added  bool
-	Result Result
-	Lost   store.RequestCheck
-}
-
-// Check records the owner's check of a request's newest result. It records none when a standing check holds it
-// already, also when another check recorded it since the request was read. A standing check whose result can no
-// longer be read does not stand in the way: the newest is checked over it.
-func Check(ctx context.Context, st *store.Store, rq *Request, at time.Time) (CheckOutcome, error) {
-	n := rq.Newest()
-	if n == nil {
-		return CheckOutcome{}, fmt.Errorf("%w: nothing of %s to check: no result and no reply of it is recorded", ErrNoRequest, rq.ID)
-	}
-	c, standing, holds := rq.Standing()
-	out := CheckOutcome{Result: *n}
-	if standing && holds {
-		if !rq.unreadable(c) {
-			return out, nil // it holds the newest result already
-		}
-		// the result it holds can no longer be read: the newest is checked over it, with no uncheck first
-		out.Lost = c
-	}
-	var err error
-	// a check from before his last turn no longer holds it, though it names the same result
-	out.Added, err = st.CheckOnceSince(ctx, store.RequestCheck{Request: rq.ID, Result: n.Key, At: at, ResultAt: n.At}, rq.CheckIDs(), rq.LastOwnerTurn)
-	return out, err
-}
-
-// Uncheck undoes the request's standing check, whichever of its ids it is stored under.
-func Uncheck(ctx context.Context, st *store.Store, rq *Request, at time.Time) (store.RequestCheck, error) {
-	return st.UndoRequestCheck(ctx, rq.CheckIDs(), at)
 }
 
 func short(id string) string {

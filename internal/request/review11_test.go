@@ -10,8 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-sh/momentum/internal/store"
-	"github.com/agent-sh/momentum/internal/supervise"
 	"github.com/agent-sh/momentum/sessions"
 	stamp "github.com/agent-sh/momentum/sessions/state"
 )
@@ -26,43 +24,6 @@ func TestAWriteWhoseLintFailedIsAWrite(t *testing.T) {
 	f.pairWithID(s, "", "hermes", "write_file", "call_w1", at(1), `{"path": "/work/a.py", "content": "print(1"}`, res)
 	if got := kinds(f.group()[0].Results); !strings.Contains(got, "file /work/a.py") {
 		t.Errorf("the verified write is not a result: %q", got)
-	}
-}
-
-// Only his own ask reopens his check: not a brief that pastes the handoff, not a harness command.
-func TestOnlyHisOwnAskReopensHisCheck(t *testing.T) {
-	for _, c := range []struct {
-		name string
-		add  func(f *fixture, id string)
-	}{
-		{"a brief that pastes the handoff", func(f *fixture, id string) {
-			f.event("s2", "", "agent_text", store.ActorAgent, at(4), Line(id)+" - a handoff of the owner's request\nAsked: fix the parser", map[string]any{"why": "agent cwd"})
-			f.phase("s2", at(5), "phase", "idle", nil)
-		}},
-		{"a program's turn that pastes the handoff", func(f *fixture, id string) {
-			f.owner("s1", at(4), supervise.Marker+" "+Line(id)+" - a handoff of the owner's request Asked: fix the parser "+Line(id))
-		}},
-		{"a harness command", func(f *fixture, id string) { f.owner("s1", at(4), "/compact") }},
-		{"a harness command with arguments", func(f *fixture, id string) { f.owner("s1", at(4), "/model sonnet") }},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			ctx := context.Background()
-			f := newFixture(t)
-			f.owner("s1", at(0), "fix the parser")
-			f.tool("s1", "", "Bash", at(1), `{"command":"git commit -am Fix"}`, "[main 1a2b3c4] Fix\n 1 file changed", false)
-			f.phase("s1", at(2), "phase", "idle", nil)
-			rq := f.group()[0]
-			if _, err := Check(ctx, f.st, rq, at(3)); err != nil {
-				t.Fatal(err)
-			}
-			c.add(f, rq.ID)
-			f.phase("s1", at(6), "phase", "idle", nil)
-			for _, r := range f.group() {
-				if r.ID == rq.ID && r.State != Checked {
-					t.Errorf("reopened: %s (%s)", r.State, r.Why)
-				}
-			}
-		})
 	}
 }
 

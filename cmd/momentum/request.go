@@ -16,17 +16,17 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// requestCmd shows the owner's requests across the sessions they ran in, prints a request's handoff, and keeps his
-// checks of their results (SPEC, Requests). list and handoff read the store read-only; check and uncheck write.
+// requestCmd shows the owner's requests across the sessions they ran in, and prints a request's handoff (SPEC,
+// Requests). Both read the store read-only.
 func requestCmd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usageError{"request needs list, handoff, check or uncheck"}
+		return usageError{"request needs list or handoff"}
 	}
 	switch args[0] {
 	case "list":
 		return requestList(ctx, args[1:], stdout, stderr)
-	case "handoff", "check", "uncheck":
-		return requestOne(ctx, args[0], args[1:], stdout, stderr)
+	case "handoff":
+		return requestHandoff(ctx, args[1:], stdout, stderr)
 	}
 	return usageError{fmt.Sprintf("unknown request command %q", args[0])}
 }
@@ -136,66 +136,28 @@ func asking(rq *request.Request) string {
 	return ""
 }
 
-// requestOne prints a request's handoff, checks its newest result, or undoes the check.
-func requestOne(ctx context.Context, cmd string, args []string, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("request "+cmd, flag.ContinueOnError)
+// requestHandoff prints a request's handoff.
+func requestHandoff(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("request handoff", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
 	}
 	if fs.NArg() != 1 {
-		return usageError{fmt.Sprintf("request %s needs one ID: a request's id, or a session's id or its start", cmd)}
+		return usageError{"request handoff needs one ID: a request's id, or a session's id or its start"}
 	}
-	id := fs.Arg(0)
-	opt := requestOptions(stderr)
-	var st *store.Store
-	var err error
-	if cmd == "handoff" {
-		st, err = store.OpenReadOnly(paths.DB())
-	} else {
-		st, err = store.Open(paths.DB())
-	}
+	st, err := store.OpenReadOnly(paths.DB())
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	rq, err := request.Find(ctx, st, id, opt)
+	rq, err := request.Find(ctx, st, fs.Arg(0), requestOptions(stderr))
 	if errors.Is(err, request.ErrNoRequest) {
 		return usageError{err.Error()}
 	}
 	if err != nil {
 		return err
 	}
-	switch cmd {
-	case "handoff":
-		_, err := io.WriteString(stdout, request.Handoff(rq))
-		return err
-	case "check":
-		c, err := request.Check(ctx, st, rq, time.Now())
-		switch {
-		case errors.Is(err, request.ErrNoRequest):
-			return usageError{err.Error()}
-		case err != nil:
-			return err
-		case !c.Added:
-			fmt.Fprintf(stdout, "%s: checked already: %s\n", rq.ID, plain.Clip(plain.Line(c.Result.Text), 120))
-			return nil
-		}
-		if !c.Lost.At.IsZero() {
-			fmt.Fprintf(stdout, "%s: the check of %s held %s, which can no longer be read\n", rq.ID,
-				c.Lost.At.Local().Format("2006-01-02 15:04"), plain.Clip(c.Lost.Result, 120))
-		}
-		fmt.Fprintf(stdout, "%s: checked %s (a newer result reopens it; request uncheck %s undoes it)\n", rq.ID,
-			plain.Clip(plain.Line(c.Result.Text), 120), rq.ID)
-		return nil
-	}
-	c, err := request.Uncheck(ctx, st, rq, time.Now())
-	if errors.Is(err, store.ErrNoCheck) {
-		return usageError{fmt.Sprintf("%s: %v", rq.ID, err)}
-	}
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(stdout, "%s: undid the check of %s on %s\n", rq.ID, c.At.Local().Format("2006-01-02 15:04"), c.Result)
-	return nil
+	_, err = io.WriteString(stdout, request.Handoff(rq))
+	return err
 }

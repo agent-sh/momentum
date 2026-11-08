@@ -3,7 +3,6 @@ package request
 // Tests from the twelfth review of the requests change. Synthetic data only.
 
 import (
-	"context"
 	"strings"
 	"testing"
 	"time"
@@ -39,23 +38,17 @@ func TestACutSubjectIsLeftOut(t *testing.T) {
 }
 
 // The same ask recorded again soon after, with no reply between, is one turn: it moves none of the request's turn
-// times, so the check stands.
-func TestATurnRecordedTwiceReopensNothing(t *testing.T) {
-	ctx := context.Background()
+// times, so the commit still came after the last turn.
+func TestATurnRecordedTwiceMovesNoTurnTime(t *testing.T) {
 	sec := func(n int) time.Time { return t0.Add(time.Duration(n) * time.Second) }
 	f := newFixture(t)
 	f.owner("s1", sec(0), "fix the parser")
 	f.tool("s1", "", "Bash", sec(10), `{"command":"git commit -am Fix"}`, "[main 1a2b3c4] Fix\n 1 file changed", false)
-	f.phase("s1", sec(20), "phase", "idle", nil)
-	rq := f.group()[0]
-	if _, err := Check(ctx, f.st, rq, sec(40)); err != nil {
-		t.Fatal(err)
-	}
 	f.owner("s1", sec(60), "fix the parser")
 	f.phase("s1", sec(70), "phase", "idle", nil)
 	got := f.group()[0]
-	if got.State != Checked || !got.LastTurn.Equal(sec(0)) || !got.LastOwnerTurn.Equal(sec(0)) || !got.Threads[0].turn.Equal(sec(0)) {
-		t.Errorf("state %s (%s), last turn %v, his %v, the thread's %v", got.State, got.Why, got.LastTurn, got.LastOwnerTurn, got.Threads[0].turn)
+	if got.State != Ready || !got.LastTurn.Equal(sec(0)) || !got.Threads[0].turn.Equal(sec(0)) {
+		t.Errorf("state %s (%s), last turn %v, the thread's %v", got.State, got.Why, got.LastTurn, got.Threads[0].turn)
 	}
 }
 
