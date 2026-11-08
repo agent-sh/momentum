@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/klauspost/compress/zstd"
+
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -217,22 +219,99 @@ func TestKimiUnreadableWireIsNotNoUndo(t *testing.T) {
 	}
 }
 
-// Kimi reads an older session's metadata from its session-meta directory when the session has no state.json.
+// Kimi keeps an older session's metadata in its session-meta directory. Its lastPrompt counts when the session has
+// no state.json, and when its state.json holds none.
 func TestKimiLegacySessionMetaIsRead(t *testing.T) {
-	home := t.TempDir()
-	session := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed")
-	path := filepath.Join(session, "agents", "main", "wire.jsonl")
-	writeJSONLines(t, path, kimiPrompt("marker-7f3a typed"), kimiRecord("turn.ended", map[string]any{}))
-	if err := os.MkdirAll(filepath.Join(session, "session-meta"), 0700); err != nil {
-		t.Fatal(err)
+	for _, state := range []string{"", `{"version":2}`} {
+		t.Run(fmt.Sprintf("state.json %q", state), func(t *testing.T) {
+			home := t.TempDir()
+			session := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed")
+			path := filepath.Join(session, "agents", "main", "wire.jsonl")
+			writeJSONLines(t, path, kimiPrompt("marker-7f3a typed"), kimiRecord("turn.ended", map[string]any{}))
+			if state != "" {
+				kimiState(t, path, state)
+			}
+			if err := os.MkdirAll(filepath.Join(session, "session-meta"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(session, "session-meta", "state.json"), []byte(`{"version":1,"lastPrompt":"marker-7f3a typed"}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			st := openStore(t)
+			ingest(t, transcripts(home), st)
+			if got := promptActors(t, st); len(got) != 1 || got["marker-7f3a typed"] != "owner owner_text" {
+				t.Fatalf("a prompt of a session with older metadata stored as %v", got)
+			}
+		})
 	}
-	if err := os.WriteFile(filepath.Join(session, "session-meta", "state.json"), []byte(`{"version":1,"lastPrompt":"marker-7f3a typed"}`), 0600); err != nil {
-		t.Fatal(err)
+}
+
+// The undo check reads a wire held only by its compressed copy: a program's run stays the program's, and an undone
+// session is still unknown.
+func TestKimiCompressedWireIsCheckedForUndo(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		undo bool
+		want string
+	}{{"headless", false, "harness harness_text"}, {"undone", true, "unknown harness_text"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "run", "agents", "main", "wire.jsonl")
+			rows := []map[string]any{kimiPrompt("marker-7f3a launcher"), kimiRecord("turn.ended", map[string]any{})}
+			if tc.undo {
+				rows = append(rows, kimiRecord("context.undo", map[string]any{"agentId": "main", "count": 1}))
+			}
+			writeJSONLines(t, path, rows...)
+			kimiState(t, path, `{"version":2}`)
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			enc, err := zstd.NewWriter(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path+".zst", enc.EncodeAll(raw, nil), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			st := openStore(t)
+			ingest(t, transcripts(home), st)
+			if got := promptActors(t, st); len(got) != 1 || got["marker-7f3a launcher"] != tc.want {
+				t.Fatalf("a compressed wire's launcher prompt stored as %v, want %q", got, tc.want)
+			}
+		})
 	}
-	st := openStore(t)
-	ingest(t, transcripts(home), st)
-	if got := promptActors(t, st); len(got) != 1 || got["marker-7f3a typed"] != "owner owner_text" {
-		t.Fatalf("a prompt of a session with older metadata stored as %v", got)
+}
+
+// A native file replaced or cut since its cursor is read from its start, and the ingest counts it, as it counts
+// tacit's.
+func TestNativeRestartIsCounted(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rows []map[string]any
+	}{
+		{"cut", []map[string]any{kimiPrompt("marker-7f3a typed")}},
+		{"replaced", []map[string]any{kimiPrompt("marker-7f3a other"), kimiRecord("turn.ended", map[string]any{})}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed", "agents", "main", "wire.jsonl")
+			writeJSONLines(t, path, kimiPrompt("marker-7f3a typed"), kimiRecord("turn.ended", map[string]any{}),
+				kimiRecord("context.append_loop_event", map[string]any{"event": map[string]any{"type": "content.part", "part": map[string]any{"type": "text", "text": "marker-7f3a done"}}}))
+			kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a typed"}`)
+			st := openStore(t)
+			src := transcripts(home)
+			if r := ingest(t, src, st); len(r.Notes) != 0 {
+				t.Fatalf("a first read noted %q", r.Notes)
+			}
+			writeJSONLines(t, path, tc.rows...)
+			if r := ingest(t, src, st); !slices.Contains(r.Notes, "files read again from the start (replaced, cut, rewritten or read under an older rule): 1") {
+				t.Fatalf("a file %s since its cursor was read again silently: %q", tc.name, r.Notes)
+			}
+		})
 	}
 }
 

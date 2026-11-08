@@ -57,6 +57,8 @@ type nativeJob struct {
 	harness string
 	db      *openCodeDB
 	session openCodeSession
+	// stale says the file's cursor was saved under an older Kimi rule, so it is read from its start (kimiStale).
+	stale bool
 }
 
 // nativeState is private reader state, saved atomically with its events. It holds
@@ -171,13 +173,7 @@ func (s Transcripts) nativeJobs(ctx context.Context, cursors map[string]store.Fi
 				saved = nil
 			}
 			if j, ok := fileJob(path, evidence.Claude, saved); ok {
-				if stale {
-					// counted with the files read again from the start, so the one read again is not silent
-					t.Lock()
-					t.restarts++
-					t.Unlock()
-				}
-				j.native = &nativeJob{harness: src.Harness}
+				j.native = &nativeJob{harness: src.Harness, stale: stale}
 				jobs = append(jobs, j)
 			}
 		}
@@ -197,6 +193,12 @@ func (s Transcripts) readNativeJob(ctx context.Context, j *job, t *tally, add fu
 		if json.Unmarshal(j.cur.State, &state) == nil {
 			offset = j.cur.Offset
 		}
+	}
+	if offset == 0 && (j.native.stale || j.ok && j.cur.Offset > 0) {
+		// A file replaced, cut or read under an older rule is read from its start: counted, as tacit's are.
+		t.Lock()
+		t.restarts++
+		t.Unlock()
 	}
 	if harness == "grok" {
 		// Session kind is provenance. Headless prompts are generated input.
@@ -573,33 +575,37 @@ func (s *nativeState) kimiProvenance() {
 		return
 	}
 	s.read = true
-	meta, ok := kimiMeta(s.dir)
-	if !ok {
+	owner, known := kimiMeta(s.dir)
+	if !known {
 		return
 	}
-	// Kimi reads a lastPrompt that is not a string as none.
-	last := bytes.TrimSpace(meta["lastPrompt"])
-	s.Owner = len(last) > 0 && last[0] == '"'
-	s.Known = s.Owner || !kimiUndone(s.wire)
+	s.Owner = owner
+	s.Known = owner || !kimiUndone(s.wire)
 }
 
-// kimiMeta reads a session's metadata where Kimi reads it: its state.json, else the state.json of its older
-// session-meta directory. A file that is missing, or not one JSON object, is not read.
-func kimiMeta(dir string) (map[string]json.RawMessage, bool) {
+// kimiMeta reads a session's metadata where Kimi keeps it: its state.json and the state.json of its older
+// session-meta directory. owner says one of them holds a lastPrompt (Kimi reads one that is not a string as
+// none), and known that one of them could be read: a file that is missing, or not one JSON object, is not.
+func kimiMeta(dir string) (owner, known bool) {
 	for _, path := range []string{filepath.Join(dir, "state.json"), filepath.Join(dir, "session-meta", "state.json")} {
 		raw, err := os.ReadFile(path)
 		var meta map[string]json.RawMessage
-		if err == nil && json.Unmarshal(raw, &meta) == nil && meta != nil {
-			return meta, true
+		if err != nil || json.Unmarshal(raw, &meta) != nil || meta == nil {
+			continue
+		}
+		known = true
+		if last := bytes.TrimSpace(meta["lastPrompt"]); len(last) > 0 && last[0] == '"' {
+			return true, true
 		}
 	}
-	return nil, false
+	return false, known
 }
 
-// kimiUndone reports a wire that holds an undo of its context (a context.undo or context.undone record). A wire
-// that cannot be read reports one: what it holds is not known.
+// kimiUndone reports a wire that holds an undo of its context (a context.undo or context.undone record), read
+// from whichever file holds it, a compressed copy too. A wire that cannot be read reports one: what it holds is
+// not known.
 func kimiUndone(path string) bool {
-	f, err := os.Open(path)
+	f, err := evidence.Open(path)
 	if err != nil {
 		return true
 	}
