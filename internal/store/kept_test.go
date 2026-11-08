@@ -305,6 +305,10 @@ func evidenceTools(t *testing.T, st *Store, id string) map[string][2]string {
 	return out
 }
 
+// columnsAt is the last step of a store when the evidence's tool and directory came: they took none, so a build at it
+// opens a store this build opened.
+const columnsAt = 5
+
 // Evidence filed before the evidence recorded its event's tool and directory gains both columns at the next open,
 // filled where they are added (#118): the evidence whose event the store still holds takes the event's, and evidence
 // whose event is gone, and evidence that is no event, keep none. The columns take no step, so a build from before them
@@ -328,20 +332,23 @@ func TestAMigratedStoreRecordsTheToolOfTheEvidenceWhoseEventItHolds(t *testing.T
 		t.Fatal(err)
 	}
 	st.Close()
-	// The store as the build before the columns (version 5) left it: its evidence has neither, nor the triggers and
-	// the index that read them, and its last step is 5. One event is gone since.
+	// The store as the build before the columns (columnsAt) left it: its evidence has neither, nor the triggers and
+	// the index that read them. One event is gone since.
 	db, err := sql.Open("sqlite", "file:"+path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`DROP TRIGGER case_evidence_filed; DROP TRIGGER case_evidence_deleted; DROP INDEX case_evidence_ref;
 	  ALTER TABLE case_evidence DROP COLUMN tool; ALTER TABLE case_evidence DROP COLUMN cwd;
-	  DELETE FROM schema_steps WHERE version > 5; DELETE FROM events WHERE id = ?`, gone.ID()); err != nil {
+	  DELETE FROM events WHERE id = ?`, gone.ID()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM schema_steps WHERE version > ?`, columnsAt); err != nil {
 		t.Fatal(err)
 	}
 	var stepsBefore int
-	if err := db.QueryRow(`SELECT MAX(version) FROM schema_steps`).Scan(&stepsBefore); err != nil || stepsBefore != 5 {
-		t.Fatalf("the store before the columns is at step %d, want 5: %v", stepsBefore, err)
+	if err := db.QueryRow(`SELECT MAX(version) FROM schema_steps`).Scan(&stepsBefore); err != nil || stepsBefore != columnsAt {
+		t.Fatalf("the store before the columns is at step %d, want %d: %v", stepsBefore, columnsAt, err)
 	}
 	db.Close()
 	st, err = Open(path)
@@ -355,8 +362,8 @@ func TestAMigratedStoreRecordsTheToolOfTheEvidenceWhoseEventItHolds(t *testing.T
 	}
 	var stepsAfter int
 	rawQuery(t, path, `SELECT MAX(version) FROM schema_steps`, &stepsAfter)
-	if stepsAfter != 5 || latest() != 5 {
-		t.Fatalf("the columns took a step: %d after the open, this build's %d; a build at 5 must still open the store", stepsAfter, latest())
+	if stepsAfter != latest() {
+		t.Fatalf("the store is at step %d after the open, this build's is %d", stepsAfter, latest())
 	}
 	if cs, _ := st.FileCursors(ctx, Transcripts); len(cs) != 1 {
 		t.Fatalf("the columns read again: %+v", cs)

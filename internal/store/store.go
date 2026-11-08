@@ -191,7 +191,8 @@ var keptIndexNames = slices.Concat([]string{"events_seq", "events_ts", "events_k
 // evidence in its target, then deletes the duplicate's, the only delete of evidence: case_evidence_deleted, after the
 // delete, hands what a deleted row recorded to every case's evidence of the same event that recorded neither (a
 // trigger cannot tell the merge's target, and the record is a real one of that event). So that merge keeps what the
-// duplicate recorded once its event is gone, whether the target held the event before or took it from the duplicate.
+// duplicate recorded once its event is gone, where the target took the event from the duplicate or held it with
+// neither value; a target that recorded one keeps what it recorded. This build's merge leaves the same rows.
 // A trigger's body is fixed once a store holds it (IF NOT EXISTS keeps the old one), so a change to it is a step.
 const keptTriggers = `
 CREATE TRIGGER IF NOT EXISTS events_harness_insert AFTER INSERT ON events WHEN NEW.harness = 'claude-code'

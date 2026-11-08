@@ -1325,18 +1325,14 @@ func merge(ctx context.Context, q querier, c Case, into, why, actor string, now 
 		return Case{}, err
 	}
 	for _, stmt := range []string{
-		// the duplicate's evidence moves with its event's tool and directory as the store holds them now, where it holds
-		// the event, else as the duplicate recorded them: what an older build's merge stores too (case_evidence_filed)
+		// The duplicate's evidence moves with its event's tool and directory as the store holds them now, where it holds
+		// the event, else as the duplicate recorded them: what an older build's merge stores too (case_evidence_filed,
+		// then case_evidence_deleted). Evidence the target holds already keeps what it recorded, and where it recorded
+		// neither the delete below gives it the duplicate's record (case_evidence_deleted), for both builds alike.
 		`INSERT OR IGNORE INTO case_evidence (case_id, ref, at, kind, summary, tool, cwd, added)
 		   SELECT ?, s.ref, s.at, s.kind, s.summary, ` + heldOr("tool") + `, ` + heldOr("cwd") + `, s.added
 		   FROM case_evidence AS s LEFT JOIN events AS e ON substr(s.ref, 1, 3) = 'ev:' AND e.id = substr(s.ref, 4)
 		   WHERE s.case_id = ?`,
-		// evidence both hold keeps the target's, and gains the tool and directory it lacks, by the same rule
-		`UPDATE case_evidence AS t SET tool = CASE WHEN t.tool = '' THEN v.tool ELSE t.tool END,
-		   cwd = CASE WHEN t.cwd = '' THEN v.cwd ELSE t.cwd END
-		   FROM (SELECT s.ref, ` + heldOr("tool") + ` AS tool, ` + heldOr("cwd") + ` AS cwd FROM case_evidence AS s
-		     LEFT JOIN events AS e ON substr(s.ref, 1, 3) = 'ev:' AND e.id = substr(s.ref, 4) WHERE s.case_id = ?2) AS v
-		   WHERE t.case_id = ?1 AND v.ref = t.ref AND (t.tool = '' AND v.tool != '' OR t.cwd = '' AND v.cwd != '')`,
 		`UPDATE case_signatures SET case_id = ? WHERE case_id = ?`,
 	} {
 		if _, err := q.ExecContext(ctx, stmt, dst.ID, c.ID); err != nil {
