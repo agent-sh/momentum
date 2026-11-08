@@ -152,14 +152,15 @@ var keptColumns = []struct {
 	{"cases", [][2]string{{"episode", "INTEGER NOT NULL DEFAULT 1"}, {"guard_exposure", "INTEGER NOT NULL DEFAULT 0"}, {"guard_watched", "INTEGER NOT NULL DEFAULT 0"},
 		{"guard_recur", "REAL NOT NULL DEFAULT 0"}}},
 	{"capacity_runs", [][2]string{{"blind", "INTEGER NOT NULL DEFAULT 0"}}},
-	{"case_evidence", [][2]string{{"tool", "TEXT NOT NULL DEFAULT ''"}, {"cwd", "TEXT NOT NULL DEFAULT ''"}}},
+	// NULL is not recorded (a build from before them stores neither); '' is recorded as none
+	{"case_evidence", [][2]string{{"tool", "TEXT"}, {"cwd", "TEXT"}}},
 }
 
 // columnFills fill a kept column from the rows already there, in the transaction that adds it, and only then: a
 // column an older build can ignore safely takes no step (keptColumns), so the fill is not a step's and never runs again.
 // A case's evidence records its event's tool and working directory as it is filed (resolveEvidence), so the guard can
 // judge an event the store has lost since; the evidence filed before takes them from its event where the store holds
-// it, and the rest keep none. Each fill touches only the rows whose event the store holds.
+// it, and the rest are left not recorded (NULL). Each fill touches only the rows whose event the store holds.
 var columnFills = map[string]string{
 	"case_evidence.tool": `UPDATE case_evidence SET tool = COALESCE(e.tool, '') FROM events e
 	  WHERE e.id = substr(case_evidence.ref, 4) AND substr(case_evidence.ref, 1, 3) = 'ev:'`,
@@ -186,13 +187,14 @@ var keptIndexNames = slices.Concat([]string{"events_seq", "events_ts", "events_k
 // The seq triggers stamp a write sequence (Seq) on a row a write stored or rewrote without one: a build from before the
 // sequence writes none, and its rewrite of a row keeps the row's old one.
 //
-// A build from before the evidence's tool and directory writes neither. case_evidence_filed gives event evidence
-// stored with neither its event's, where the store holds the event. Such a build's merge stores the duplicate's
-// evidence in its target, then deletes the duplicate's, the only delete of evidence: case_evidence_deleted, after the
-// delete, hands what a deleted row recorded to every case's evidence of the same event that recorded neither (a
-// trigger cannot tell the merge's target, and the record is a real one of that event). So that merge keeps what the
-// duplicate recorded once its event is gone, where the target took the event from the duplicate or held it with
-// neither value; a target that recorded one keeps what it recorded. This build's merge leaves the same rows.
+// A build from before the evidence's tool and directory stores neither: they are NULL, not recorded, where this build
+// always records them (an empty value for none). case_evidence_filed gives event evidence stored with neither recorded its
+// event's, where the store holds the event. A merge, this build's as an older build's (the same statement), stores
+// the duplicate's evidence in its target without them, then deletes the duplicate's, the only delete of evidence:
+// case_evidence_deleted, after the delete, hands what a deleted row recorded to every case's evidence of the same event
+// that recorded nothing (a trigger cannot tell the merge's target, and the record is a real one of that event). So a
+// merge keeps what the duplicate recorded once its event is gone, where the target took the event from the duplicate
+// or held it with nothing recorded; a target that recorded anything, none included, keeps what it recorded.
 // A trigger's body is fixed once a store holds it (IF NOT EXISTS keeps the old one), so a change to it is a step.
 const keptTriggers = `
 CREATE TRIGGER IF NOT EXISTS events_harness_insert AFTER INSERT ON events WHEN NEW.harness = 'claude-code'
@@ -205,14 +207,14 @@ BEGIN ` + bumpSeq + ` UPDATE events SET seq = (SELECT n FROM event_seq WHERE id 
 CREATE TRIGGER IF NOT EXISTS events_seq_update AFTER UPDATE ON events WHEN NEW.seq = OLD.seq
 BEGIN ` + bumpSeq + ` UPDATE events SET seq = (SELECT n FROM event_seq WHERE id = 1) WHERE rowid = NEW.rowid; END;
 CREATE TRIGGER IF NOT EXISTS case_evidence_filed AFTER INSERT ON case_evidence
-WHEN NEW.tool = '' AND NEW.cwd = '' AND substr(NEW.ref, 1, 3) = 'ev:'
+WHEN NEW.tool IS NULL AND NEW.cwd IS NULL AND substr(NEW.ref, 1, 3) = 'ev:'
 BEGIN UPDATE case_evidence SET tool = (SELECT COALESCE(tool, '') FROM events WHERE id = substr(NEW.ref, 4)),
   cwd = (SELECT COALESCE(cwd, '') FROM events WHERE id = substr(NEW.ref, 4))
   WHERE case_id = NEW.case_id AND ref = NEW.ref AND EXISTS (SELECT 1 FROM events WHERE id = substr(NEW.ref, 4)); END;
 CREATE TRIGGER IF NOT EXISTS case_evidence_deleted AFTER DELETE ON case_evidence
-WHEN substr(OLD.ref, 1, 3) = 'ev:' AND (OLD.tool != '' OR OLD.cwd != '')
+WHEN substr(OLD.ref, 1, 3) = 'ev:' AND (OLD.tool IS NOT NULL OR OLD.cwd IS NOT NULL)
 BEGIN UPDATE case_evidence SET tool = OLD.tool, cwd = OLD.cwd
-  WHERE ref = OLD.ref AND case_id != OLD.case_id AND tool = '' AND cwd = ''; END;
+  WHERE ref = OLD.ref AND case_id != OLD.case_id AND tool IS NULL AND cwd IS NULL; END;
 `
 
 // bumpSeq moves the write sequence one past the higher of its counter and the events' highest: it never goes down, a

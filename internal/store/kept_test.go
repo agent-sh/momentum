@@ -305,14 +305,39 @@ func evidenceTools(t *testing.T, st *Store, id string) map[string][2]string {
 	return out
 }
 
+// recorded is a case's evidence by reference as the store holds it: each one's tool and directory as SQL quotes them,
+// NULL for not recorded.
+func recorded(t *testing.T, st *Store, id string) map[string][2]string {
+	t.Helper()
+	rows, err := st.db.QueryContext(context.Background(), `SELECT ref, quote(tool), quote(cwd) FROM case_evidence WHERE case_id = ?`, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	out := map[string][2]string{}
+	for rows.Next() {
+		var ref string
+		var v [2]string
+		if err := rows.Scan(&ref, &v[0], &v[1]); err != nil {
+			t.Fatal(err)
+		}
+		out[ref] = v
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
 // columnsAt is the last step of a store when the evidence's tool and directory came: they took none, so a build at it
 // opens a store this build opened.
 const columnsAt = 5
 
 // Evidence filed before the evidence recorded its event's tool and directory gains both columns at the next open,
-// filled where they are added (#118): the evidence whose event the store still holds takes the event's, and evidence
-// whose event is gone, and evidence that is no event, keep none. The columns take no step, so a build from before them
-// still opens the store; nothing is read again, and the next open has nothing to do.
+// filled where they are added (#118): the evidence whose event the store still holds takes the event's, none included,
+// and evidence whose event is gone, and evidence that is no event, are left not recorded (NULL). The columns take no
+// step: a build whose steps end where they came opens the store, adds and fills them, makes the triggers and the
+// index, and leaves the store current at that step. Nothing is read again.
 func TestAMigratedStoreRecordsTheToolOfTheEvidenceWhoseEventItHolds(t *testing.T) {
 	ctx := context.Background()
 	st, path := open(t)
@@ -346,24 +371,30 @@ func TestAMigratedStoreRecordsTheToolOfTheEvidenceWhoseEventItHolds(t *testing.T
 	if _, err := db.Exec(`DELETE FROM schema_steps WHERE version > ?`, columnsAt); err != nil {
 		t.Fatal(err)
 	}
-	var stepsBefore int
-	if err := db.QueryRow(`SELECT MAX(version) FROM schema_steps`).Scan(&stepsBefore); err != nil || stepsBefore != columnsAt {
-		t.Fatalf("the store before the columns is at step %d, want %d: %v", stepsBefore, columnsAt, err)
-	}
 	db.Close()
+	// A build whose steps end where the columns came opens it.
+	was := steps
+	t.Cleanup(func() { steps = was })
+	k := slices.IndexFunc(steps, func(s step) bool { return s.version == columnsAt })
+	if k < 0 {
+		t.Fatalf("no step %d", columnsAt)
+	}
+	steps = slices.Clone(steps[:k+1])
 	st, err = Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	want := map[string][2]string{"ev:" + bash.ID(): {"Bash", "/w/a"}, "ev:" + gone.ID(): {}, "ev:" + words.ID(): {}, "file:/t/a": {}}
-	if got := evidenceTools(t, st, c.ID); !maps.Equal(got, want) {
+	want := map[string][2]string{"ev:" + bash.ID(): {"'Bash'", "'/w/a'"}, "ev:" + gone.ID(): {"NULL", "NULL"}, "ev:" + words.ID(): {"''", "''"},
+		"file:/t/a": {"NULL", "NULL"}}
+	if got := recorded(t, st, c.ID); !maps.Equal(got, want) {
 		t.Fatalf("the evidence after the columns were added: %v, want %v", got, want)
 	}
-	var stepsAfter int
+	var stepsAfter, made int
 	rawQuery(t, path, `SELECT MAX(version) FROM schema_steps`, &stepsAfter)
-	if stepsAfter != latest() {
-		t.Fatalf("the store is at step %d after the open, this build's is %d", stepsAfter, latest())
+	rawQuery(t, path, `SELECT COUNT(*) FROM sqlite_master WHERE name IN ('case_evidence_filed', 'case_evidence_deleted', 'case_evidence_ref')`, &made)
+	if stepsAfter != columnsAt || made != 3 {
+		t.Fatalf("the store is at step %d after the open, want %d; %d of the 2 triggers and the index made", stepsAfter, columnsAt, made)
 	}
 	if cs, _ := st.FileCursors(ctx, Transcripts); len(cs) != 1 {
 		t.Fatalf("the columns read again: %+v", cs)

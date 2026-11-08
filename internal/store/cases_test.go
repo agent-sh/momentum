@@ -622,7 +622,7 @@ func TestEvidenceThatLacksItsToolGainsItWhenFiledAgain(t *testing.T) {
 		}
 	}
 	// bash's evidence recorded nothing (an older build filed it); edit's recorded a tool its event no longer has
-	exec(`UPDATE case_evidence SET tool = '', cwd = '' WHERE ref = ?`, "ev:"+bash.ID())
+	exec(`UPDATE case_evidence SET tool = NULL, cwd = NULL WHERE ref = ?`, "ev:"+bash.ID())
 	exec(`UPDATE case_evidence SET tool = 'Read', cwd = '' WHERE ref = ?`, "ev:"+edit.ID())
 	refile := func(want map[string][2]string) {
 		t.Helper()
@@ -647,10 +647,10 @@ func TestEvidenceThatLacksItsToolGainsItWhenFiledAgain(t *testing.T) {
 		t.Fatalf("a refile that changed nothing wrote %d rows: %v", written, err)
 	}
 	exec(`DROP TRIGGER zz_written_update`)
-	// a merge into a case that holds the same event with no tool
+	// a merge into a case that holds the same event with nothing recorded
 	a, _ := observeOK(t, st, Finding{Family: "failures", Signature: "a", Title: "a", Evidence: []Evidence{{Ref: "ev:" + bash.ID()}}})
 	b, _ := observeOK(t, st, Finding{Family: "failures", Signature: "b", Title: "b", Evidence: []Evidence{{Ref: "ev:" + bash.ID()}}})
-	exec(`UPDATE case_evidence SET tool = '', cwd = '' WHERE case_id = ?`, b.ID)
+	exec(`UPDATE case_evidence SET tool = NULL, cwd = NULL WHERE case_id = ?`, b.ID)
 	if _, err := st.CloseCase(ctx, a.ID, Duplicate, b.ID, "same", "agent"); err != nil {
 		t.Fatal(err)
 	}
@@ -663,6 +663,16 @@ func TestEvidenceThatLacksItsToolGainsItWhenFiledAgain(t *testing.T) {
 // recordAs sets what a case's evidence of ref recorded, and when it was filed.
 func recordAs(t *testing.T, st *Store, caseID, ref, tool, cwd string, added time.Time) {
 	t.Helper()
+	record(t, st, caseID, ref, &[2]string{tool, cwd}, added)
+}
+
+// record sets what a case's evidence of ref recorded (nil: nothing, as an older build stores it), and when it was filed.
+func record(t *testing.T, st *Store, caseID, ref string, v *[2]string, added time.Time) {
+	t.Helper()
+	var tool, cwd any
+	if v != nil {
+		tool, cwd = v[0], v[1]
+	}
 	if _, err := st.db.ExecContext(context.Background(), `UPDATE case_evidence SET tool = ?, cwd = ?, added = ? WHERE case_id = ? AND ref = ?`,
 		tool, cwd, added.UnixMilli(), caseID, ref); err != nil {
 		t.Fatal(err)
@@ -673,10 +683,10 @@ func recordAs(t *testing.T, st *Store, caseID, ref, tool, cwd string, added time
 // them, and its merge stores the duplicate's evidence in the target, then deletes the duplicate's. Evidence it files
 // takes its event's tool and directory where the store holds the event. Its merge keeps what the duplicate recorded of
 // an event that is gone, not what a third case recorded of it first, whether the target took the event from the
-// duplicate or held it already with neither. The delete hands that record to every case's evidence of the event that
-// recorded neither, a bystander's too; a case that recorded one of the two keeps what it recorded, and the third case
-// its own. Evidence of an event already gone, filed with neither, is stored with neither; evidence that is no event
-// keeps none.
+// duplicate or held it already with nothing recorded. The delete hands that record to every case's evidence of the
+// event that recorded nothing, a bystander's too; a case that recorded anything keeps it (one value, or none for both,
+// which a read again that cleared the event's values leaves), and the third case its own. Evidence of an event already
+// gone, filed without the columns, stays not recorded; evidence that is no event records nothing.
 func TestAnOlderBuildsMergeKeepsWhatTheDuplicateRecorded(t *testing.T) {
 	st := caseStore(t)
 	ctx := context.Background()
@@ -702,13 +712,15 @@ func TestAnOlderBuildsMergeKeepsWhatTheDuplicateRecorded(t *testing.T) {
 	intoHeld, _ := observeOK(t, st, Finding{Family: "failures", Signature: "b2", Title: "b2", Evidence: refs(held)})
 	bystander, _ := observeOK(t, st, Finding{Family: "failures", Signature: "c1", Title: "c1", Evidence: refs(took)})
 	partial, _ := observeOK(t, st, Finding{Family: "failures", Signature: "c2", Title: "c2", Evidence: refs(took)})
-	recordAs(t, st, bystander.ID, "ev:"+took.ID(), "", "", at)
+	empty, _ := observeOK(t, st, Finding{Family: "failures", Signature: "c3", Title: "c3", Evidence: refs(took)})
+	record(t, st, bystander.ID, "ev:"+took.ID(), nil, at)
 	recordAs(t, st, partial.ID, "ev:"+took.ID(), "Edit", "", at)
+	recordAs(t, st, empty.ID, "ev:"+took.ID(), "", "", at)
 	// the third case filed both first and recorded other values; the target of the second recorded neither
 	recordAs(t, st, third.ID, "ev:"+took.ID(), "Read", "/w/c", at.Add(-time.Hour))
 	recordAs(t, st, third.ID, "ev:"+held.ID(), "Read", "/w/c", at.Add(-time.Hour))
 	recordAs(t, st, dupHeld.ID, "ev:"+held.ID(), "Write", "/w/e", at)
-	recordAs(t, st, intoHeld.ID, "ev:"+held.ID(), "", "", at)
+	record(t, st, intoHeld.ID, "ev:"+held.ID(), nil, at)
 	exec := func(q string, args ...any) {
 		t.Helper()
 		if _, err := st.db.ExecContext(ctx, q, args...); err != nil {
@@ -733,14 +745,15 @@ func TestAnOlderBuildsMergeKeepsWhatTheDuplicateRecorded(t *testing.T) {
 		id   string
 		want map[string][2]string
 	}{
-		{intoTook.ID, map[string][2]string{"ev:" + took.ID(): {"Bash", "/w/a"}, "ev:" + kept.ID(): {"Edit", "/w/b"}, "ev:" + lost.ID(): {},
-			"file:/t/b1-0": {}, "file:/t/old": {}}},
-		{intoHeld.ID, map[string][2]string{"ev:" + held.ID(): {"Write", "/w/e"}}},
-		{third.ID, map[string][2]string{"ev:" + took.ID(): {"Read", "/w/c"}, "ev:" + held.ID(): {"Read", "/w/c"}}},
-		{bystander.ID, map[string][2]string{"ev:" + took.ID(): {"Bash", "/w/a"}}},
-		{partial.ID, map[string][2]string{"ev:" + took.ID(): {"Edit", ""}}},
+		{intoTook.ID, map[string][2]string{"ev:" + took.ID(): {"'Bash'", "'/w/a'"}, "ev:" + kept.ID(): {"'Edit'", "'/w/b'"},
+			"ev:" + lost.ID(): {"NULL", "NULL"}, "file:/t/b1-0": {"''", "''"}, "file:/t/old": {"NULL", "NULL"}}},
+		{intoHeld.ID, map[string][2]string{"ev:" + held.ID(): {"'Write'", "'/w/e'"}}},
+		{third.ID, map[string][2]string{"ev:" + took.ID(): {"'Read'", "'/w/c'"}, "ev:" + held.ID(): {"'Read'", "'/w/c'"}}},
+		{bystander.ID, map[string][2]string{"ev:" + took.ID(): {"'Bash'", "'/w/a'"}}},
+		{partial.ID, map[string][2]string{"ev:" + took.ID(): {"'Edit'", "''"}}},
+		{empty.ID, map[string][2]string{"ev:" + took.ID(): {"''", "''"}}},
 	} {
-		if got := evidenceTools(t, st, c.id); !maps.Equal(got, c.want) {
+		if got := recorded(t, st, c.id); !maps.Equal(got, c.want) {
 			t.Errorf("case %s after an older build's merges: %v, want %v", c.id, got, c.want)
 		}
 	}
@@ -810,67 +823,164 @@ func olderMerge(t *testing.T, st *Store, into, dup string) {
 	}
 }
 
-// This build's merge and an older build's leave the target the same rows, whatever the target and the duplicate
-// recorded of an event and whether the store still holds it or holds it read again: one rule for both builds, so a
-// guard's answer does not depend on which build merged.
-func TestBothBuildsMergesLeaveTheSameRows(t *testing.T) {
-	type scenario struct {
-		name   string
-		lose   bool      // the event is gone before the merge
-		reread [2]string // the event's tool and cwd after a read again, when it is held ("" "" keeps them)
-		held   bool      // the target holds the event already
-		target [2]string // what the target recorded of it, when it holds it
-		dup    [2]string // what the duplicate recorded
+// dumpEvidence is every case's evidence as the store holds it, by case title: SQL quotes its tool and directory,
+// NULL for not recorded.
+func dumpEvidence(t *testing.T, st *Store) []string {
+	t.Helper()
+	rows, err := st.db.QueryContext(context.Background(), `SELECT c.title, e.ref, quote(e.tool), quote(e.cwd) FROM case_evidence e
+	  JOIN cases c ON c.id = e.case_id ORDER BY c.title, e.ref`)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, sc := range []scenario{
-		{name: "held, read again, the target recorded neither", reread: [2]string{"Write", "/w/new"}, held: true, dup: [2]string{"Bash", "/w/a"}},
-		{name: "lost, the target recorded a tool alone", lose: true, held: true, target: [2]string{"Edit", ""}, dup: [2]string{"Edit", "/loop/runs/r1"}},
-		{name: "held, its directory read again, the target recorded a tool alone", reread: [2]string{"Edit", "/w/new"}, held: true,
-			target: [2]string{"Edit", ""}, dup: [2]string{"Edit", "/w/a"}},
-		{name: "lost, the target recorded neither", lose: true, held: true, dup: [2]string{"Bash", "/w/a"}},
-		{name: "held, read again, the target takes it", reread: [2]string{"Write", "/w/new"}, dup: [2]string{"Bash", "/w/a"}},
-		{name: "lost, the target takes it", lose: true, dup: [2]string{"Bash", "/w/a"}},
-	} {
-		t.Run(sc.name, func(t *testing.T) {
-			got := map[bool][2]string{}
-			for _, older := range []bool{false, true} {
-				st := caseStore(t)
-				ctx := context.Background()
-				at := time.Now().Add(-time.Hour)
-				ev := Event{Source: "mistakes", SourceKey: "k1", TS: at, Actor: ActorTool, Kind: "tool-error", Tool: "Bash", Cwd: "/w/a", Summary: "k1"}
-				if _, err := st.Put(ctx, []Event{ev}); err != nil {
-					t.Fatal(err)
-				}
-				ref := "ev:" + ev.ID()
-				dup, _ := observeOK(t, st, Finding{Family: "failures", Signature: "a", Title: "a", Evidence: []Evidence{{Ref: ref}}})
-				into, _ := observeOK(t, st, Finding{Family: "failures", Signature: "b", Title: "b", Evidence: refsAt("b", 1, at)})
-				recordAs(t, st, dup.ID, ref, sc.dup[0], sc.dup[1], at)
-				if sc.held {
-					if _, _, err := st.AddCaseEvidence(ctx, into.ID, []Evidence{{Ref: ref}}, "test"); err != nil {
-						t.Fatal(err)
-					}
-					recordAs(t, st, into.ID, ref, sc.target[0], sc.target[1], at)
-				}
-				if sc.lose {
-					if _, err := st.db.ExecContext(ctx, `DELETE FROM events WHERE id = ?`, ev.ID()); err != nil {
-						t.Fatal(err)
-					}
-				} else if sc.reread != [2]string{} {
-					if _, err := st.db.ExecContext(ctx, `UPDATE events SET tool = ?, cwd = ? WHERE id = ?`, sc.reread[0], sc.reread[1], ev.ID()); err != nil {
-						t.Fatal(err)
-					}
-				}
-				if older {
-					olderMerge(t, st, into.ID, dup.ID)
-				} else if _, err := st.CloseCase(ctx, dup.ID, Duplicate, into.ID, "same", "agent"); err != nil {
-					t.Fatal(err)
-				}
-				got[older] = evidenceTools(t, st, into.ID)[ref]
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var title, ref, tool, cwd string
+		if err := rows.Scan(&title, &ref, &tool, &cwd); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, title+" "+ref+" "+tool+" "+cwd)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// sqlQuote is a recorded pair as SQL quotes it (nil: NULL, not recorded).
+func sqlQuote(v *[2]string) [2]string {
+	if v == nil {
+		return [2]string{"NULL", "NULL"}
+	}
+	return [2]string{"'" + v[0] + "'", "'" + v[1] + "'"}
+}
+
+// Every merge leaves the whole table as an older build's merge leaves it, and as SPEC states it (#146's round 6 probe):
+// every pair the duplicate recorded or nothing, every state of the target (not holding the event, holding it with
+// nothing recorded, or with each pair), the event gone, held as filed, or read again to each pair, with three
+// bystanders (nothing recorded, none recorded, a tool alone) and a file reference. The target's evidence moves with
+// the event as the store holds it, else with the duplicate's record; held already, it keeps what it recorded, or takes
+// the duplicate's record where it recorded nothing; so does a bystander, and the others keep theirs.
+func TestBothBuildsMergesLeaveTheSameRows(t *testing.T) {
+	pairs := func(tool, cwd string) []*[2]string {
+		var out []*[2]string
+		for _, b := range [][2]bool{{false, false}, {true, false}, {false, true}, {true, true}} {
+			v := [2]string{}
+			if b[0] {
+				v[0] = tool
 			}
-			if got[false] != got[true] {
-				t.Errorf("the builds' merges disagree: this build %q, an older build %q", got[false], got[true])
+			if b[1] {
+				v[1] = cwd
 			}
-		})
+			out = append(out, &v)
+		}
+		return out
+	}
+	type state struct {
+		name   string
+		lose   bool
+		reread *[2]string
+	}
+	states := []state{{name: "lost", lose: true}, {name: "held"}}
+	for _, v := range pairs("W", "/w/new") {
+		states = append(states, state{name: fmt.Sprintf("read again to %q", *v), reread: v})
+	}
+	dups := append([]*[2]string{nil}, pairs("D", "/d")...)
+	type target struct {
+		holds bool
+		v     *[2]string
+	}
+	targets := []target{{}, {holds: true}}
+	for _, v := range pairs("T", "/t") {
+		targets = append(targets, target{holds: true, v: v})
+	}
+	n := 0
+	for _, es := range states {
+		for _, dupRec := range dups {
+			for _, tgt := range targets {
+				name := fmt.Sprintf("%s, the duplicate %v, the target %v %v", es.name, sqlQuote(dupRec), tgt.holds, sqlQuote(tgt.v))
+				dumps := map[bool][]string{}
+				for _, older := range []bool{false, true} {
+					st := caseStore(t)
+					ctx := context.Background()
+					at := time.Now().Add(-time.Hour)
+					ev := Event{Source: "mistakes", SourceKey: "k1", TS: at, Actor: ActorTool, Kind: "tool-error", Tool: "Bash", Cwd: "/w/a", Summary: "k1"}
+					if _, err := st.Put(ctx, []Event{ev}); err != nil {
+						t.Fatal(err)
+					}
+					ref := "ev:" + ev.ID()
+					dup, _ := observeOK(t, st, Finding{Family: "failures", Signature: "a", Title: "dup", Evidence: []Evidence{{Ref: ref}, {Ref: "file:/t/dup", At: at}}})
+					into, _ := observeOK(t, st, Finding{Family: "failures", Signature: "b", Title: "into", Evidence: refsAt("b", 1, at)})
+					byNothing, _ := observeOK(t, st, Finding{Family: "failures", Signature: "c0", Title: "by-nothing", Evidence: []Evidence{{Ref: ref}}})
+					byNone, _ := observeOK(t, st, Finding{Family: "failures", Signature: "c1", Title: "by-none", Evidence: []Evidence{{Ref: ref}}})
+					byTool, _ := observeOK(t, st, Finding{Family: "failures", Signature: "c2", Title: "by-tool", Evidence: []Evidence{{Ref: ref}}})
+					record(t, st, dup.ID, ref, dupRec, at)
+					record(t, st, byNothing.ID, ref, nil, at)
+					recordAs(t, st, byNone.ID, ref, "", "", at)
+					recordAs(t, st, byTool.ID, ref, "B", "", at)
+					if tgt.holds {
+						if _, _, err := st.AddCaseEvidence(ctx, into.ID, []Evidence{{Ref: ref}}, "test"); err != nil {
+							t.Fatal(err)
+						}
+						record(t, st, into.ID, ref, tgt.v, at)
+					}
+					if es.lose {
+						if _, err := st.db.ExecContext(ctx, `DELETE FROM events WHERE id = ?`, ev.ID()); err != nil {
+							t.Fatal(err)
+						}
+					} else if es.reread != nil {
+						if _, err := st.db.ExecContext(ctx, `UPDATE events SET tool = ?, cwd = ? WHERE id = ?`, es.reread[0], es.reread[1], ev.ID()); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if older {
+						olderMerge(t, st, into.ID, dup.ID)
+					} else if _, err := st.CloseCase(ctx, dup.ID, Duplicate, into.ID, "same", "agent"); err != nil {
+						t.Fatal(err)
+					}
+					dumps[older] = dumpEvidence(t, st)
+					if older {
+						continue
+					}
+					now := &[2]string{"Bash", "/w/a"}
+					if es.reread != nil {
+						now = es.reread
+					}
+					var want [2]string
+					switch {
+					case !tgt.holds && !es.lose:
+						want = sqlQuote(now)
+					case !tgt.holds, tgt.v == nil:
+						want = sqlQuote(dupRec)
+					default:
+						want = sqlQuote(tgt.v)
+					}
+					got := recorded(t, st, into.ID)
+					for _, c := range []struct {
+						what string
+						got  [2]string
+						want [2]string
+					}{
+						{"the target", got[ref], want},
+						{"the file", got["file:/t/dup"], [2]string{"NULL", "NULL"}},
+						{"a bystander that recorded nothing", recorded(t, st, byNothing.ID)[ref], sqlQuote(dupRec)},
+						{"a bystander that recorded none", recorded(t, st, byNone.ID)[ref], [2]string{"''", "''"}},
+						{"a bystander that recorded a tool", recorded(t, st, byTool.ID)[ref], [2]string{"'B'", "''"}},
+					} {
+						if c.got != c.want {
+							t.Errorf("%s: %s holds %v, want %v", name, c.what, c.got, c.want)
+						}
+					}
+				}
+				n++
+				if !slices.Equal(dumps[false], dumps[true]) {
+					t.Errorf("%s: the builds' merges disagree:\n this build %v\n an older build %v", name, dumps[false], dumps[true])
+				}
+			}
+		}
+	}
+	if n != 6*5*6 {
+		t.Fatalf("%d cases, want %d", n, 6*5*6)
 	}
 }
 

@@ -167,8 +167,12 @@ func (m Measurement) Guarded() bool { return m.Exposure > 0 || m.closedGuard }
 
 // Evidence is one reference behind a case: an event (ev:ID), a note (note:ID), a commit (git:OWNER/REPO@SHA), a
 // file (file:PATH, with @OFFSET), or an address. At is when it happened. Tool and Cwd are an event's tool and
-// working directory as it was filed (resolveEvidence), which judge the event once the store no longer holds it; any
-// other reference has neither.
+// working directory as its evidence recorded them, which judge the event once the store no longer holds it: at its
+// filing or a refile (resolveEvidence, the event as the store held it then), at a merge (the event as the store held
+// it, else the duplicate's record, handed on where the target had none: case_evidence_filed, case_evidence_deleted),
+// or by the fill where the columns were added (columnFills). Evidence that never recorded them (an older build filed
+// it while its event was gone, or its event was gone when the columns were added) reads as none, as does any other
+// reference.
 type Evidence struct {
 	Ref     string
 	At      time.Time
@@ -415,7 +419,7 @@ func addEvidence(ctx context.Context, q querier, id string, evs []Evidence, now 
 			return 0, time.Time{}, err
 		} else if n == 0 && strings.HasPrefix(e.Ref, "ev:") {
 			if _, err := q.ExecContext(ctx, `UPDATE case_evidence SET tool = ?1, cwd = ?2 WHERE case_id = ?3 AND ref = ?4
-			  AND (tool != ?1 OR cwd != ?2)`, e.Tool, e.Cwd, id, e.Ref); err != nil {
+			  AND (tool IS NOT ?1 OR cwd IS NOT ?2)`, e.Tool, e.Cwd, id, e.Ref); err != nil {
 				return 0, time.Time{}, err
 			}
 		} else if n > 0 {
@@ -691,15 +695,9 @@ func (s *Store) Cases(ctx context.Context, f CaseFilter) ([]Case, error) {
 	return out, nil
 }
 
-// heldOr is a merge's value of an evidence column (s, the duplicate's evidence, joined to its event e): the event's
-// as the store holds it now, where it holds the event, else what the evidence recorded.
-func heldOr(col string) string {
-	return "CASE WHEN e.id IS NULL THEN s." + col + " ELSE COALESCE(e." + col + ", '') END"
-}
-
 // CaseEvidence lists a case's evidence, newest first, at most limit of it (0: all).
 func (s *Store) CaseEvidence(ctx context.Context, id string, limit int) ([]Evidence, error) {
-	q := `SELECT ref, at, kind, summary, tool, cwd, added FROM case_evidence WHERE case_id = ? ORDER BY at DESC, ref`
+	q := `SELECT ref, at, kind, summary, COALESCE(tool, ''), COALESCE(cwd, ''), added FROM case_evidence WHERE case_id = ? ORDER BY at DESC, ref`
 	args := []any{id}
 	if limit > 0 {
 		q, args = q+` LIMIT ?`, append(args, limit)
@@ -1325,14 +1323,12 @@ func merge(ctx context.Context, q querier, c Case, into, why, actor string, now 
 		return Case{}, err
 	}
 	for _, stmt := range []string{
-		// The duplicate's evidence moves with its event's tool and directory as the store holds them now, where it holds
-		// the event, else as the duplicate recorded them: what an older build's merge stores too (case_evidence_filed,
-		// then case_evidence_deleted). Evidence the target holds already keeps what it recorded, and where it recorded
-		// neither the delete below gives it the duplicate's record (case_evidence_deleted), for both builds alike.
-		`INSERT OR IGNORE INTO case_evidence (case_id, ref, at, kind, summary, tool, cwd, added)
-		   SELECT ?, s.ref, s.at, s.kind, s.summary, ` + heldOr("tool") + `, ` + heldOr("cwd") + `, s.added
-		   FROM case_evidence AS s LEFT JOIN events AS e ON substr(s.ref, 1, 3) = 'ev:' AND e.id = substr(s.ref, 4)
-		   WHERE s.case_id = ?`,
+		// An older build's statement, so the triggers decide for both builds: the duplicate's evidence moves with
+		// nothing recorded, case_evidence_filed gives it its event's tool and directory where the store holds the event,
+		// and the delete below hands the duplicate's record to the evidence of the event that recorded nothing
+		// (case_evidence_deleted), the target's included; evidence the target recorded keeps what it recorded.
+		`INSERT OR IGNORE INTO case_evidence (case_id, ref, at, kind, summary, added)
+		   SELECT ?, ref, at, kind, summary, added FROM case_evidence WHERE case_id = ?`,
 		`UPDATE case_signatures SET case_id = ? WHERE case_id = ?`,
 	} {
 		if _, err := q.ExecContext(ctx, stmt, dst.ID, c.ID); err != nil {
