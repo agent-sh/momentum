@@ -691,6 +691,12 @@ func (s *Store) Cases(ctx context.Context, f CaseFilter) ([]Case, error) {
 	return out, nil
 }
 
+// heldOr is a merge's value of an evidence column (s, the duplicate's evidence, joined to its event e): the event's
+// as the store holds it now, where it holds the event, else what the evidence recorded.
+func heldOr(col string) string {
+	return "CASE WHEN e.id IS NULL THEN s." + col + " ELSE COALESCE(e." + col + ", '') END"
+}
+
 // CaseEvidence lists a case's evidence, newest first, at most limit of it (0: all).
 func (s *Store) CaseEvidence(ctx context.Context, id string, limit int) ([]Evidence, error) {
 	q := `SELECT ref, at, kind, summary, tool, cwd, added FROM case_evidence WHERE case_id = ? ORDER BY at DESC, ref`
@@ -1319,13 +1325,18 @@ func merge(ctx context.Context, q querier, c Case, into, why, actor string, now 
 		return Case{}, err
 	}
 	for _, stmt := range []string{
+		// the duplicate's evidence moves with its event's tool and directory as the store holds them now, where it holds
+		// the event, else as the duplicate recorded them: what an older build's merge stores too (case_evidence_filed)
 		`INSERT OR IGNORE INTO case_evidence (case_id, ref, at, kind, summary, tool, cwd, added)
-		   SELECT ?, ref, at, kind, summary, tool, cwd, added FROM case_evidence WHERE case_id = ?`,
-		// evidence both hold keeps the target's, and gains the tool and directory it lacks from the duplicate's
-		`UPDATE case_evidence AS t SET tool = CASE WHEN t.tool = '' THEN s.tool ELSE t.tool END,
-		   cwd = CASE WHEN t.cwd = '' THEN s.cwd ELSE t.cwd END
-		   FROM case_evidence AS s WHERE t.case_id = ?1 AND s.case_id = ?2 AND s.ref = t.ref
-		   AND (t.tool = '' AND s.tool != '' OR t.cwd = '' AND s.cwd != '')`,
+		   SELECT ?, s.ref, s.at, s.kind, s.summary, ` + heldOr("tool") + `, ` + heldOr("cwd") + `, s.added
+		   FROM case_evidence AS s LEFT JOIN events AS e ON substr(s.ref, 1, 3) = 'ev:' AND e.id = substr(s.ref, 4)
+		   WHERE s.case_id = ?`,
+		// evidence both hold keeps the target's, and gains the tool and directory it lacks, by the same rule
+		`UPDATE case_evidence AS t SET tool = CASE WHEN t.tool = '' THEN v.tool ELSE t.tool END,
+		   cwd = CASE WHEN t.cwd = '' THEN v.cwd ELSE t.cwd END
+		   FROM (SELECT s.ref, ` + heldOr("tool") + ` AS tool, ` + heldOr("cwd") + ` AS cwd FROM case_evidence AS s
+		     LEFT JOIN events AS e ON substr(s.ref, 1, 3) = 'ev:' AND e.id = substr(s.ref, 4) WHERE s.case_id = ?2) AS v
+		   WHERE t.case_id = ?1 AND v.ref = t.ref AND (t.tool = '' AND v.tool != '' OR t.cwd = '' AND v.cwd != '')`,
 		`UPDATE case_signatures SET case_id = ? WHERE case_id = ?`,
 	} {
 		if _, err := q.ExecContext(ctx, stmt, dst.ID, c.ID); err != nil {
