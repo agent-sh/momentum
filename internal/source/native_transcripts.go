@@ -88,10 +88,11 @@ type nativeState struct {
 const kimiRule = 1
 
 // kimiStale reports a Kimi cursor saved under an older rule. A compressed file's final cursor keeps no state, so
-// it is not read again for that; Kimi does not compress its wire files.
+// it is not read again for that; Kimi does not compress its wire files. A cursor that read nothing credited
+// nothing: its file is read from its start anyway, and not counted as read again.
 func kimiStale(cursors map[string]store.FileCursor, path string) bool {
 	cur, ok := cursors[path]
-	if !ok || cur.Compressed {
+	if !ok || cur.Compressed || cur.Offset == 0 {
 		return false
 	}
 	var st nativeState

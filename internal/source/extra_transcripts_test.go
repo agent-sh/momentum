@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/agent-sh/tacit/client/pkg/evidence"
 	"github.com/klauspost/compress/zstd"
 
 	"github.com/agent-sh/momentum/internal/store"
@@ -349,6 +350,84 @@ func TestKimiProvenanceIsReadAgainEachRead(t *testing.T) {
 	want := map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a later": "unknown harness_text"}
 	if got := promptActors(t, st); !maps.Equal(got, want) {
 		t.Fatalf("prompts stored as %v, want %v", got, want)
+	}
+}
+
+// The verdict is fixed at a read's first user-origin prompt: a session whose metadata gains a lastPrompt while it is
+// read (a person resumed a kimi -p run) is the program's for the rest of that read.
+func TestKimiProvenanceIsReadOncePerRead(t *testing.T) {
+	old := chunkBytes
+	chunkBytes = 1 // a part a line, so the metadata changes between the two prompts
+	defer func() { chunkBytes = old }()
+	home := t.TempDir()
+	path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "run", "agents", "main", "wire.jsonl")
+	writeJSONLines(t, path, kimiPrompt("marker-7f3a launcher"), kimiPrompt("marker-7f3a typed"))
+	kimiState(t, path, `{"version":2}`)
+	j, ok := fileJob(path, evidence.Claude, nil)
+	if !ok {
+		t.Fatal("no job for the wire")
+	}
+	j.native = &nativeJob{harness: "kimi"}
+	var kinds []evidence.Kind
+	tally := &tally{failed: map[string]bool{}}
+	transcripts("").readNativeJob(context.Background(), j, tally, func(p part) bool {
+		for _, it := range p.items {
+			kinds = append(kinds, it.e.Kind)
+		}
+		kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a typed"}`)
+		return true
+	})
+	if want := []evidence.Kind{evidence.KindHarnessText, evidence.KindHarnessText}; !slices.Equal(kinds, want) || len(tally.failed) != 0 {
+		t.Fatalf("prompts read as %v, want %v (%v)", kinds, want, tally.failed)
+	}
+}
+
+// A cursor that read nothing (a first line still being written) credited nothing: completing the line under the new
+// rule is a first read, not one counted as read again.
+func TestKimiCursorThatReadNothingIsNotCounted(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed", "agents", "main", "wire.jsonl")
+	raw, err := json.Marshal(kimiPrompt("marker-7f3a typed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw[:len(raw)/2], 0600); err != nil {
+		t.Fatal(err)
+	}
+	kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a typed"}`)
+	st := openStore(t)
+	src := transcripts(home)
+	ingest(t, src, st)
+	ctx := context.Background()
+	cursors, err := st.FileCursors(ctx, src.Name())
+	if err != nil || len(cursors) != 1 {
+		t.Fatalf("cursors %d, %v", len(cursors), err)
+	}
+	var old []store.FileWrite
+	for _, cur := range cursors {
+		if cur.Offset != 0 {
+			t.Fatalf("a partial first line moved the cursor to %d", cur.Offset)
+		}
+		var state map[string]any
+		if err := json.Unmarshal(cur.State, &state); err != nil {
+			t.Fatal(err)
+		}
+		delete(state, "Rule")
+		cur.State, _ = json.Marshal(state)
+		old = append(old, store.FileWrite{Cursor: cur})
+	}
+	if _, _, err := st.PutFiles(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(raw, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+	r := ingest(t, src, st)
+	if r.New != 1 || len(r.Notes) != 0 {
+		t.Fatalf("a first read of the completed line: %+v", r)
 	}
 }
 
