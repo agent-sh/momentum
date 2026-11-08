@@ -96,11 +96,12 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 			}
 			// a read of a file its thread writes within the settle time found it not there yet: no failure; one younger
 			// than the settle time may have its write still to come. The read names its file as its call spells it,
-			// as a write does, not as its key holds it.
+			// as a write does, not as its key holds it, and a relative one also in its call's directory (readAs).
 			if k.missed() {
-				p, _, _ := callField(call.Input, pathKeys)
-				if settling(e.TS, w) || slices.ContainsFunc(written[wrote{e.Session, e.Agent, p}],
-					func(t time.Time) bool { return t.After(e.TS) && !t.After(e.TS.Add(readSettle)) }) {
+				soon := func(t time.Time) bool { return t.After(e.TS) && !t.After(e.TS.Add(readSettle)) }
+				if settling(e.TS, w) || slices.ContainsFunc(readAs(e.Harness, call), func(p string) bool {
+					return slices.ContainsFunc(written[wrote{e.Session, e.Agent, p}], soon)
+				}) {
 					continue
 				}
 			}
@@ -176,8 +177,8 @@ var (
 	// nothing.
 	hermesErrorKeyRe = regexp.MustCompile(`"error": ?`)
 	hermesNoChangeRe = regexp.MustCompile(`"no_change": ?true`)
-	// patchLineRe is a patch's header for a file it adds or updates, at a line's start, with the Move to line after
-	// it, each path to its line's end; patchFoldedRe the same at the start of a text the store folded onto one line,
+	// patchLineRe is a patch's header for a file it adds or updates, at column 0, with the Move to line after it,
+	// each path to its line's end; patchFoldedRe the same at the start of a text the store folded onto one line,
 	// after its opening line, each path up to where the patch's next line begins (another header or its end, a line it
 	// adds or removes, a chunk's @@).
 	patchLineRe   = regexp.MustCompile(`(?m)^\*\*\* (Add|Update) File: *(\S.*)$(?:\n\*\*\* Move to: *(\S.*)$)?`)
@@ -298,7 +299,7 @@ func missOf(harness, tool, text string, c store.Call) (string, bool) {
 }
 
 // names says the file an error names is a read's path p: the same path, ~ read as the home, or, for a relative p, that
-// path in some directory.
+// path in some directory, its leading .. segments off (the directory they climb to is not known).
 func names(named, p string) bool {
 	if named == "" || p == "" {
 		return false
@@ -307,7 +308,28 @@ func names(named, p string) bool {
 		p = paths.Home() + p[1:]
 	}
 	named, p = path.Clean(named), path.Clean(p)
-	return named == p || !path.IsAbs(p) && strings.HasSuffix(named, "/"+p)
+	if named == p {
+		return true
+	}
+	if path.IsAbs(p) {
+		return false
+	}
+	for strings.HasPrefix(p, "../") {
+		p = p[len("../"):]
+	}
+	return strings.HasSuffix(named, "/"+p)
+}
+
+// readAs are the paths a read names its file by, for its thread's write to clear it: its call's path as spelled, and
+// a relative one (not the home's) also in its call's directory, when that is a whole path, as missOf reads it, but for
+// Hermes, whose read_file resolves it in its terminal's directory, which a cd moves.
+func readAs(harness string, c store.Call) []string {
+	p, _, _ := callField(c.Input, pathKeys)
+	out := []string{p}
+	if p != "" && !path.IsAbs(p) && p != "~" && !strings.HasPrefix(p, "~/") && harness != "hermes" && path.IsAbs(c.Cwd) {
+		out = append(out, path.Join(c.Cwd, p))
+	}
+	return out
 }
 
 // missedPath is the path a read found no file at as its key holds it: cleaned (no . or .. left in it) and the home

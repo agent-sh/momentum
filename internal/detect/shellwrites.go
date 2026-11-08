@@ -28,28 +28,45 @@ func writtenPaths(harness, tool, call, result, cwd string) []string {
 		return nil
 	}
 	if strings.EqualFold(tool, "apply_patch") || strings.EqualFold(tool, "patch") && harness == "opencode" {
-		return patchFiles(call)
+		return patchFiles(call, result)
 	}
 	if strings.EqualFold(tool, "patch") { // Hermes's: OpenCode's is read above
 		if mode, _, _ := callField(call, modeKeys); mode == "patch" { // its files are only in its patch text
 			return nil
 		}
 	}
-	// Hermes resolves a relative path in its terminal's directory, which a cd moves: only a whole one names its file
-	if p, _, _ := callField(call, pathKeys); p != "" && (harness != "hermes" || path.IsAbs(p)) {
+	// Hermes resolves a relative path in its terminal's directory, which a cd moves: only a whole one names its file,
+	// or one under the home, which Hermes expands itself
+	if p, _, _ := callField(call, pathKeys); p != "" && (harness != "hermes" || path.IsAbs(p) || strings.HasPrefix(p, "~/")) {
 		return []string{p}
 	}
 	return nil
 }
 
-// patchFiles are the files a patch's text adds or updates, by its headers at a line's start, each path to its line's
-// end and trimmed, as Codex's and OpenCode's parsers read it: an Update's Move to gives the file's new name, and a
-// Delete File writes nothing. A JSON call keeps its text's line breaks as escapes. The store folds a raw text onto
-// one line, so there only its first header is read, right after the patch's opening line, and its path ends where the
-// patch's next line begins (patchFoldedRe).
-func patchFiles(call string) []string {
-	text, re := strings.ReplaceAll(call, `\n`, "\n"), patchLineRe
-	if !strings.Contains(text, "\n") {
+// patchTextRe is the field of a patch call's JSON input that holds its text, in an input the store may have cut
+// short: OpenCode's patchText, and the input of Codex's apply_patch as a JSON function's.
+var patchTextRe = regexp.MustCompile(`"(?:patchText|input)"\s*:\s*"((?:[^"\\]|\\.)*)`)
+
+// patchFiles are the files a patch's text adds or updates, by its headers at column 0 (the parsers also accept an
+// indented one), each path to its line's end and trimmed, as Codex's and OpenCode's parsers read it: an Update's Move
+// to gives the file's new name, and a Delete File writes nothing. A JSON call's text is its field's value, decoded,
+// so an escaped backslash before an n is no line break. The store folds a raw text onto one line, so there only its
+// first header is read, right after the patch's opening line, and its path ends where the patch's next line begins
+// (patchFoldedRe). Such a path, which a name with one of those ends in it cuts short, and which is a moved file's old
+// name when the store cut its Move to's, counts only when the result's own list of the files it updated names it
+// whole (patchListed).
+func patchFiles(call, result string) []string {
+	text := call
+	if strings.HasPrefix(strings.TrimSpace(call), "{") {
+		m := patchTextRe.FindStringSubmatch(call)
+		if m == nil {
+			return nil
+		}
+		text = unescapeCut(m[1])
+	}
+	folded := !strings.Contains(text, "\n")
+	re := patchLineRe
+	if folded {
 		re = patchFoldedRe
 	}
 	var out []string
@@ -58,9 +75,19 @@ func patchFiles(call string) []string {
 		if m[1] == "Update" && m[3] != "" { // a file moved: written under its new name
 			p = m[3]
 		}
-		out = append(out, strings.TrimSpace(p))
+		if p = strings.TrimSpace(p); !folded || patchListed(result, p) {
+			out = append(out, p)
+		}
 	}
 	return out
+}
+
+// patchListed says a patch's result names p as a whole entry of its list of the files it updated, whose lines (a
+// status letter, a space and the path) the store may fold onto one: from an entry's start up to the next entry's
+// or the list's end.
+func patchListed(result, p string) bool {
+	_, list, ok := strings.Cut(result, "Updated the following files:")
+	return ok && regexp.MustCompile(`\s[AMD] `+regexp.QuoteMeta(p)+`(?:\s+[AMD] |\s*$)`).MatchString(list)
 }
 
 // bashShell says a shell tool runs its command in bash or a shell like it, whose words the whitelist reads: not

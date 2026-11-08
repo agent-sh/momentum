@@ -32,6 +32,9 @@ func TestANotFoundReadIsKeyedByThePathItMissed(t *testing.T) {
 		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory: '/w/a.md'"}`, `{"path":"/w/a.md"}`, "miss:read-file:/w/a.md"},
 		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory: '/home/u/p/a.md'"}`, `{"path":"~/p/a.md"}`, "miss:read-file:~/p/a.md"},
 		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory: \"/w/it's.md\""}`, `{"path":"/w/./it's.md"}`, "miss:read-file:/w/it's.md"},
+		// a relative path's leading .. segments climb to a directory that is not known: the rest is the read's own
+		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory: '/w/a.md'"}`, `{"path":"../a.md"}`, "miss:read-file:/w/a.md"},
+		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory: '/w/a.md'"}`, `{"path":"../x/../../a.md"}`, "miss:read-file:/w/a.md"},
 		{"opencode", "read", "Error: File not found: /w/a.md", `{"filePath":"/w/a.md"}`, "miss:read:/w/a.md"},
 		{"pi", "read", "ENOENT: no such file or directory, access '/w/docs/x.md'", `{"path":"@/w/docs/x.md"}`, "miss:read:/w/docs/x.md"},
 		{"opencode", "read", "File not found: /w/a.md Did you mean one of these? /w/b.md", `{"filePath":"/w/a.md"}`, "miss:read:/w/a.md"},
@@ -75,6 +78,7 @@ func TestANotFoundReadIsKeyedByThePathItMissed(t *testing.T) {
 		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory: '/w/gone'"}`, `{"path":"a.md"}`, "tool:read-file:[errno N] no such file or directory: Q"},
 		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory"}`, `{"path":"/w/a.md"}`, "tool:read-file:[errno N] no such file or directory"},
 		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory: '/w/xa.md'"}`, `{"path":"a.md"}`, "tool:read-file:[errno N] no such file or directory: Q"},
+		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory: '/w/c/a.md'"}`, `{"path":"../b/a.md"}`, "tool:read-file:[errno N] no such file or directory: Q"},
 		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory: '/w/a.md'"}`, "", "tool:read-file:[errno N] no such file or directory: Q"},
 		{"opencode", "read", "Error: Error: File not found: /w/a.md", `{"filePath":"/w/a.md"}`, "tool:read:error: error: file not found: P"},
 		{"pi", "read", "EACCES: permission denied, access '/w/a.md'", `{"path":"/w/a.md"}`, "tool:read:eacces: permission denied, access Q"},
@@ -118,6 +122,9 @@ func TestARelativeMissIsReadInItsCallsDirectory(t *testing.T) {
 		{"hermes", "read_file", hermesMissing("AGENTS.md"), `{"path":"AGENTS.md"}`, "/w/a", "miss:read-file:AGENTS.md"},
 		{"opencode", "read", "File not found: /w/o/x.md Did you mean one of these? /w/o/y.md", `{"filePath":"x.md"}`, "", "miss:read:/w/o/x.md"},
 		{"opencode", "read", "Error: File not found: /w/o/x.md\n\nDid you mean one of these?\n/w/o/y.md", `{"filePath":"x.md"}`, "", "miss:read:/w/o/x.md"},
+		// OpenCode 2.x names the path as its call spells it, in its field path, and may name the folder it found missing
+		{"opencode", "read", "File not found: x.md\n\nThe folder /w/o does not exist. The nearest folder that does is /w.", `{"path":"x.md"}`, "", "miss:read:x.md"},
+		{"opencode", "read", "File not found: x.md The folder /w/o does not exist. The nearest folder that does is /w. Did you mean one of these? /w/x.md", `{"path":"x.md"}`, "", "miss:read:x.md"},
 		{"grok", "read_file", "Error: /w/g/x.md does not exist. Note: your current working directory is /w/g", `{"target_file":"x.md"}`, "", "miss:read-file:/w/g/x.md"},
 		{"pi", "read", "ENOENT: no such file or directory, access '/w/p/x.md'", `{"path":"x.md"}`, "", "miss:read:/w/p/x.md"},
 		{"pi", "read", "ENOENT: no such file or directory, access '/w/a/docs/x.md'", `{"path":"@docs/x.md"}`, "/w/a", "miss:read:/w/a/docs/x.md"},
@@ -237,6 +244,45 @@ func TestAMissUnderTheHomeClearsByItsCallsPath(t *testing.T) {
 		f.readMissing("s2", x, t0), f.wrote("s2", x, t0.Add(time.Minute)))...)
 	if fs, err := (Failures{}).Detect(context.Background(), st, week()); err != nil || len(fs) != 0 {
 		t.Fatalf("found %v, %v", signatures(fs), err)
+	}
+}
+
+// A relative read is cleared by its thread's write of that path in the directory its call was made in, when that is a
+// whole path, as by a write of the path as its call spells it: by a file tool's whole path or by the shell's. Not for
+// Hermes, whose read_file resolves it in its terminal's directory, nor for a path under the home or a whole one, nor in
+// a directory that is no whole path.
+func TestARelativeReadClearsByItsWriteInItsCallsDirectory(t *testing.T) {
+	t.Setenv("HOME", "/home/u")
+	for _, tc := range []struct {
+		name, harness, read, cwd, readIn, missing, write, writeIn, wrote string
+		cleared                                                          bool
+	}{
+		{"kimi", "kimi", "Read", "/w", `{"path":"out/x.md"}`, `"out/x.md" does not exist.`, "Write", `{"path":"/w/out/x.md","content":"x"}`, "Wrote 1 bytes to /w/out/x.md", true},
+		{"opencode", "opencode", "read", "/w", `{"filePath":"./out/x.md"}`, "File not found: /w/out/x.md", "write", `{"filePath":"/w/out/x.md","content":"x"}`, "Wrote file successfully.", true},
+		{"the shell", "kimi", "Read", "/w", `{"path":"out/x.md"}`, `"out/x.md" does not exist.`, "Bash", `{"command":"cat > out/x.md <<'EOF'\nx\nEOF"}`, "", true},
+		{"hermes", "hermes", "read_file", "/w", `{"path":"out/x.md"}`, `{"error": "File not found: /w/out/x.md"}`, "write_file", `{"path":"/w/out/x.md","content":"x"}`, `{"bytes_written": 1}`, false},
+		{"a directory that is no whole path", "kimi", "Read", "w", `{"path":"out/x.md"}`, `"out/x.md" does not exist.`, "Write", `{"path":"w/out/x.md","content":"x"}`, "Wrote 1 bytes to w/out/x.md", false},
+		{"a path under the home", "kimi", "Read", "/w", `{"path":"~/out/x.md"}`, `"~/out/x.md" does not exist.`, "Write", `{"path":"/w/~/out/x.md","content":"x"}`, "Wrote 1 bytes to /w/~/out/x.md", false},
+		{"a whole path", "kimi", "Read", "/w", `{"path":"/v/out/x.md"}`, `"/v/out/x.md" does not exist.`, "Write", `{"path":"/w/v/out/x.md","content":"x"}`, "Wrote 1 bytes to /w/v/out/x.md", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testStore(t)
+			f := fileTools{harness: tc.harness}
+			var evs []store.Event
+			for i, session := range []string{"s1", "s1", "s2"} {
+				at := t0.Add(time.Duration(i) * time.Hour)
+				pair := slices.Concat(f.pair(session, tc.read, tc.readIn, tc.missing, true, at), f.pair(session, tc.write, tc.writeIn, tc.wrote, false, at.Add(time.Minute)))
+				for k := range pair {
+					pair[k].Cwd = tc.cwd
+				}
+				evs = append(evs, pair...)
+			}
+			put(t, st, evs...)
+			fs, err := Failures{}.Detect(context.Background(), st, week())
+			if err != nil || tc.cleared && len(fs) != 0 || !tc.cleared && (len(fs) != 1 || len(fs[0].Evidence) != 3) {
+				t.Fatalf("found %v, %v, cleared %v", signatures(fs), err, tc.cleared)
+			}
+		})
 	}
 }
 

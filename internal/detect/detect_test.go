@@ -736,6 +736,24 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 		{"pi", "read", "write", `{"path":"@"}`, "ENOENT: no such file or directory, access '@'", `{"path":"@","content":"x"}`, "Successfully wrote 1 bytes to @"},
 		{"codex", "read_file", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, "*** Add File: /w/@ +x", "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
 		{"opencode", "read", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Add File: /w/@\n*** Move to: /w/x\n+x\n*** End Patch"}`, "Success. Updated the following files: A /w/@"},
+		// a JSON call's patch text is its field's value decoded: one with no line break in it is the folded form, one the
+		// store cut is read up to the cut, and Codex's JSON function names it input
+		{"opencode", "read", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch *** Add File: /w/@ +x *** End Patch"}`, "Success. Updated the following files: A /w/@"},
+		{"opencode", "read", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Add File: /w/@\n+x…`, "Success. Updated the following files: A /w/@"},
+		// a path to its line's end needs no list: the store may cut the result's
+		{"opencode", "read", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Add File: /w/@\n+x\n*** End Patch"}`, "Success. Updated the following files: A /w/o…"},
+		{"codex", "read_file", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, `{"input":"*** Begin Patch\n*** Add File: /w/@\n+x\n*** End Patch"}`,
+			"Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
+		// a raw text's backslash before an n is its content, no line break
+		{"codex", "read_file", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, `*** Begin Patch *** Add File: /w/@ +print("\n") *** End Patch`,
+			"Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
+		// a folded path is a whole entry of the result's list, the next entry after it
+		{"codex", "read_file", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, "*** Begin Patch *** Add File: /w/@ +x *** Add File: /w/other +y *** End Patch",
+			"Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@ A /w/other"},
+		{"codex", "read_file", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, "*** Begin Patch *** Update File: /w/@ -a +b *** Delete File: /w/gone *** End Patch",
+			"Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: M /w/@ D /w/gone"},
+		// Hermes expands a leading ~ itself: a path under the home names one file whatever its terminal's directory
+		{"hermes", "read_file", "write_file", `{"path":"~/@"}`, `{"error": "File not found: /home/u/@"}`, `{"path":"~/@","content":"x"}`, `{"bytes_written": 1}`},
 	} {
 		t.Run(tc.harness+"/"+tc.write, func(t *testing.T) {
 			st := testStore(t)
@@ -807,6 +825,23 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 		{"codex", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, "*** Begin Patch *** Add File: /w/@ +x *** End Patch", "Note: Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
 		{"opencode", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Add File: /w/@\n+x\n*** End Patch"}`, "patch verification failed: Failed to find expected lines in /w/@"},
 		{"claude", "Edit", `{"file_path":"/w/@"}`, claudeMissing, `{"file_path":"/w/@","old_string":"a","new_string":"b"}`, "A hook said: The file /w/@ has been updated successfully. Then it reverted it."},
+		// an escaped backslash before an n in a JSON call's patch text is no line break: the header after it is content
+		{"opencode", "patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Add File: /w/other\n+a\\n*** Add File: /w/@\n*** End Patch"}`,
+			"Success. Updated the following files: A /w/other"},
+		{"opencode", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Add File: /w/other\n+a\\n*** Add File: /w/@\n+b…`,
+			"Success. Updated the following files: A /w/other"},
+		{"codex", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, `{"input":"*** Begin Patch\n*** Add File: /w/other\n+a\\n*** Add File: /w/@\n*** End Patch"}`,
+			"Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/other"},
+		// a folded path cut short by a name that holds one of its ends: the result lists the whole name
+		{"codex", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, "*** Begin Patch *** Add File: /w/@ -y.md +z *** End Patch",
+			"Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@ -y.md"},
+		{"codex", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, "*** Begin Patch *** Update File: /w/@ -a +b *** End Patch",
+			"Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: M /w/@x"},
+		// the store cut the Move to's path: the result lists the new name, not the old one
+		{"codex", "apply_patch", `{"file_path":"/w/@"}`, codexMissing, "*** Begin Patch *** Update File: /w/@ *** Move to: /w/moved/x…",
+			"Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: M /w/moved/x.md"},
+		// ~ and a name is that user's home, not the owner's
+		{"hermes", "write_file", `{"path":"~@"}`, `{"error": "File not found: ~@"}`, `{"path":"~@","content":"x"}`, `{"bytes_written": 1}`},
 	} {
 		t.Run(tc.harness+"/"+tc.tool+"/failed in its words", func(t *testing.T) {
 			st := testStore(t)
