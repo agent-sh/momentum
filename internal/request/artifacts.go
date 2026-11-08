@@ -30,20 +30,23 @@ var (
 	// a ref update of a push: OLD..NEW SRC -> DST, or [new branch] SRC -> DST
 	pushRefRe = regexp.MustCompile(`(?m)(?:^|\s)(?:\+ )?(?:([0-9a-f]{7,40})\.\.\.?([0-9a-f]{7,40})|\* \[new branch\]|\[new branch\])\s+(\S+) -> (\S+)`)
 	prRe      = regexp.MustCompile(`https?://[^\s"']+/pull/\d+`)
-	patchRe   = regexp.MustCompile(`\*\*\* (?:Add|Update|Delete) File: ([^\s"]+)`)
+	// a line that is a pull request's address alone, as gh pr create prints it
+	prLineRe = regexp.MustCompile(`(?m)^[ \t]*(https?://[^\s"']+/pull/\d+)[ \t\r]*$`)
+	patchRe  = regexp.MustCompile(`\*\*\* (?:Add|Update|Delete) File: ([^\s"]+)`)
 	// a push's remote: a URL, an scp-like host:path, or a path
 	remoteRe = regexp.MustCompile(`[:/]`)
 )
 
 // Artifacts are what a call made, as a line of its output shows it, and nothing else. Both are decoded first, as
-// the harness keeps them (Decode). A file-writing call made the files its input names, when its result succeeded.
-// A shell call made the commits its output's commit lines show, when its command runs a git command that makes
-// them: git prints the line only when the commit was made, so a failed result's line counts too. It made the
-// pushes its successful output's ref lines show inside a push's own block (from its To line to the next From or
-// To line), when it runs git push and no push of it is a dry run, and the pull request whose address a successful
-// gh pr create printed. A command that shows nothing (a quiet -q, an address kept in a variable, a command still
-// running in the background) made nothing this can see. What any other tool printed (an agent's report, a read, a
-// search, a fetched page) is no artifact.
+// the harness keeps them (Decode), what the store's cut touches dropped. A file-writing call made the files its
+// input names, when its result succeeded. A shell call made the commits its output's commit lines show, when its
+// command runs a git command that makes them and prints them (not quiet, its output not sent to a file): git
+// prints the line only when the commit was made, so a failed result's line counts too. It made the pushes its
+// successful output's ref lines show inside a push's own block (from its To line to the next From or To line),
+// when it runs git push and no push of it is a dry run, and the pull request whose address a successful gh pr
+// create printed on a line of its own. A command that shows nothing (a quiet -q, an address kept in a
+// variable, a command still running in the background) made nothing this can see. What any other tool printed (an
+// agent's report, a read, a search, a fetched page) is no artifact.
 func Artifacts(call, res store.Event) []Result {
 	tool := strings.ToLower(call.Tool)
 	if writers[tool] {
@@ -62,11 +65,7 @@ func Artifacts(call, res store.Event) []Result {
 // artifactsOf reads a call's artifacts off its decoded input and output, with what its commands make, read once.
 func artifactsOf(call, res store.Event, d Decoded, mk makes) []Result {
 	failed := metaOf(res.Meta).IsError
-	id := metaOf(call.Meta).ToolID
-	once := id // what a call recorded again (a harness's copy of the same call) shares
-	if once == "" {
-		once = moment(call.TS)
-	}
+	once := metaOf(call.Meta).ToolID // what a call recorded again (a harness's copy of the same call) shares
 	var out []Result
 	add := func(r Result) {
 		r.At = res.TS
@@ -81,19 +80,25 @@ func artifactsOf(call, res store.Event, d Decoded, mk makes) []Result {
 		}
 		return out
 	}
-	text := strings.TrimSuffix(d.Output, "…")
+	text := d.Output
 	lines := strings.Contains(text, "\n")
 	var commits [][]int
-	if mk.commits {
-		for _, c := range commitRe.FindAllStringSubmatchIndex(text, -1) {
-			commits = append(commits, c)
-			add(Result{Kind: KindCommit, Key: KindCommit + ":" + text[c[4]:c[5]],
-				Text: fmt.Sprintf("commit %s on %s: %s", text[c[4]:c[5]], text[c[2]:c[3]], strings.TrimSpace(text[c[6]:c[7]]))})
+	for _, c := range commitRe.FindAllStringSubmatchIndex(text, -1) {
+		commits = append(commits, c) // a commit line is no other artifact's line, whoever printed it
+		if !mk.commits {
+			continue
 		}
+		hash, branch := text[c[4]:c[5]], text[c[2]:c[3]]
+		r := Result{Kind: KindCommit, Key: KindCommit + ":" + hash, Text: fmt.Sprintf("commit %s on %s", hash, branch)}
+		if !(d.Cut && c[7] == len(text)) { // a subject the cut ends is not known
+			r.Text += ": " + strings.TrimSpace(text[c[6]:c[7]])
+		}
+		add(r)
 	}
 	if failed {
 		return out // a failed result shows its commit lines, and nothing else it made
 	}
+
 	if mk.pushes {
 		for _, b := range pushBlocks(text, lines, commits, mk) {
 			for _, p := range pushRefRe.FindAllStringSubmatch(b.refs, -1) {
@@ -108,16 +113,50 @@ func artifactsOf(call, res store.Event, d Decoded, mk makes) []Result {
 		}
 	}
 	if mk.prs {
-		for _, loc := range prRe.FindAllStringIndex(text, -1) {
-			if strings.Contains(text[max(0, loc[0]-200):loc[0]], "already exists") {
-				continue
-			}
-			u := text[loc[0]:loc[1]]
+		if u := createdPR(text, lines, commits); u != "" {
 			add(Result{Kind: KindPR, Key: KindPR + ":" + u, Text: "pull request " + u})
-			break
 		}
 	}
 	return out
+}
+
+// inSpans reports a place inside one of spans (commit lines).
+func inSpans(spans [][]int, at int) bool {
+	for _, c := range spans {
+		if at >= c[0] && at < c[1] {
+			return true
+		}
+	}
+	return false
+}
+
+func isSpace(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
+
+// createdPR is the address gh pr create printed: the last one on a line of its own (in a text the store joined, a
+// word of its own not after a field's name, such as gh pr view's url:), outside the commit lines, and not the
+// address of one it says already exists (the line before it ends "already exists:").
+func createdPR(text string, lines bool, commits [][]int) string {
+	u := ""
+	if lines {
+		for _, m := range prLineRe.FindAllStringSubmatchIndex(text, -1) {
+			before := strings.TrimRight(text[:m[0]], " \t\r\n")
+			if strings.HasSuffix(before, "already exists:") { // a line of its own is never inside a commit line
+				continue
+			}
+			u = text[m[2]:m[3]]
+		}
+		return u
+	}
+	for _, loc := range prRe.FindAllStringIndex(text, -1) {
+		if inSpans(commits, loc[0]) || loc[0] > 0 && !isSpace(text[loc[0]-1]) || loc[1] < len(text) && !isSpace(text[loc[1]]) {
+			continue
+		}
+		if before := strings.TrimRight(text[:loc[0]], " \t"); strings.HasSuffix(before, ":") {
+			continue // a field's value (url:), or the address of one that already exists (already exists:)
+		}
+		u = text[loc[0]:loc[1]]
+	}
+	return u
 }
 
 // block is a push's part of an output: its remote and the text its ref lines are in.
@@ -130,14 +169,7 @@ type block struct {
 // line (a tail kept only the last lines), the whole text of a call that ran nothing else that prints ref lines,
 // its remote the push's own.
 func pushBlocks(text string, lines bool, commits [][]int, mk makes) []block {
-	inCommit := func(at int) bool {
-		for _, c := range commits {
-			if at >= c[0] && at < c[1] {
-				return true
-			}
-		}
-		return false
-	}
+	inCommit := func(at int) bool { return inSpans(commits, at) }
 	var tos [][]int
 	re, end := pushToWordRe, pushEndWordRe
 	if lines {

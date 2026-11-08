@@ -96,10 +96,10 @@ type Request struct {
 	Why      string // what the state rests on
 	Open     string // the open step; empty when nothing records one
 	Last     time.Time
-	// CutGone and CutUnread count its calls the store cut that were read as the store holds them: their transcript
-	// is gone, or no reader of their harness is here or their text could not be redacted
-	CutGone, CutUnread int
-	pending            []pair
+	// CutGone, CutUnread and CutUnmasked count its calls the store cut that were read as the store holds them:
+	// their transcript is gone, no reader of their harness is here, or what was read whole could not be masked
+	CutGone, CutUnread, CutUnmasked int
+	pending                         []pair
 }
 
 // start is when the request began: its opening, else the time its id names.
@@ -288,10 +288,10 @@ type seg struct {
 	marker string
 }
 
-// item is a result or a reply, placed in a segment by when it happened, or by its subagent's first event.
+// item is a result or a reply, placed in a segment by when it happened: a subagent's, a fork's or a resume's too,
+// whose copies of earlier events keep their times.
 type item struct {
-	r     Result
-	agent string
+	r Result
 }
 
 // thread is what one session holds for requests.
@@ -313,11 +313,8 @@ type thread struct {
 	done    map[string]bool        // the tool ids of the calls read, each once
 }
 
-// segAt is the segment of an event at at, of agent (empty for the main thread).
-func (t *thread) segAt(at time.Time, agent string) int {
-	if a, ok := t.agents[agent]; ok && agent != "" {
-		at = a
-	}
+// segAt is the segment of an event at at, by its own time, whichever agent of the thread recorded it.
+func (t *thread) segAt(at time.Time) int {
 	k := 0
 	for i := 1; i < len(t.segs); i++ {
 		if !t.segs[i].at.After(at) {
@@ -384,7 +381,7 @@ func (t *thread) add(e store.Event) {
 		}
 		for _, r := range Artifacts(call, e) {
 			r.Thread = t.id
-			t.items = append(t.items, item{r: r, agent: e.Agent})
+			t.items = append(t.items, item{r: r})
 		}
 	}
 }

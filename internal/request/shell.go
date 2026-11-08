@@ -12,10 +12,12 @@ import (
 var shellProgs = map[string]bool{"bash": true, "sh": true, "zsh": true, "dash": true, "ksh": true}
 
 // invocation is a simple command: the program it runs and its arguments, past assignments and the wrappers that
-// run the command after them.
+// run the command after them. silent is true when its output goes to a file (a redirect of it, or of a command
+// around it), so none of it is in the call's output.
 type invocation struct {
-	prog string
-	args []string
+	prog   string
+	args   []string
+	silent bool
 }
 
 // invocations are every simple command a shell script runs, parsed as a shell parses it: in lists, pipelines,
@@ -37,11 +39,37 @@ func invocations(script string, depth int) []invocation {
 
 // walker collects a parsed script's simple commands in order.
 type walker struct {
-	out   []invocation
-	depth int
+	out    []invocation
+	depth  int
+	silent bool
+}
+
+// toFile reports a redirect that sends standard output to a file: >, >>, >|, &> or &>> on it.
+func toFile(r *syntax.Redirect) bool {
+	switch r.Op {
+	case syntax.RdrOut, syntax.AppOut, syntax.ClbOut:
+		if r.N != nil && r.N.Value != "1" {
+			return false
+		}
+	case syntax.RdrAll, syntax.AppAll:
+	default:
+		return false
+	}
+	w := wordText(r.Word)
+	return w != "/dev/stdout" && w != "/dev/stderr"
 }
 
 func (w *walker) visit(n syntax.Node) bool {
+	if st, ok := n.(*syntax.Stmt); ok && !w.silent && st.Cmd != nil {
+		for _, r := range st.Redirs {
+			if toFile(r) {
+				in := &walker{depth: w.depth, silent: true}
+				syntax.Walk(st.Cmd, in.visit)
+				w.out = append(w.out, in.out...)
+				return false
+			}
+		}
+	}
 	ce, ok := n.(*syntax.CallExpr)
 	if !ok || len(ce.Args) == 0 {
 		return true
@@ -53,10 +81,14 @@ func (w *walker) visit(n syntax.Node) bool {
 	if inv, ok := unwrap(args); ok {
 		if shellProgs[inv.prog] {
 			if s, ok := shellScript(inv.args); ok {
-				w.out = append(w.out, invocations(s, w.depth+1)...)
+				for _, in := range invocations(s, w.depth+1) {
+					in.silent = in.silent || w.silent
+					w.out = append(w.out, in)
+				}
 				return true
 			}
 		}
+		inv.silent = w.silent
 		w.out = append(w.out, inv)
 	}
 	return true
@@ -188,10 +220,6 @@ func unwrap(args []string) (invocation, bool) {
 			if prog == "command" && (a == "-v" || a == "-V") {
 				return invocation{}, false
 			}
-			if prog == "nice" && len(a) > 1 && a[1] >= '0' && a[1] <= '9' {
-				i++
-				continue
-			}
 			if valued[a] {
 				i++
 			}
@@ -223,7 +251,8 @@ type makes struct {
 var commitCommands = map[string]bool{"commit": true, "cherry-pick": true, "revert": true, "merge": true, "am": true, "rebase": true}
 
 // made reads what a call's commands make, by every program they run: commits when one runs a git command that
-// makes them (no dry run, no --no-commit, no --abort), pushes when one runs git push and none of its pushes is a
+// makes them (no dry run, no --no-commit, no --abort) and prints its commit line (not quiet, its output not sent to
+// a file), so a commit line in an output where none does is another command's (a cat, a grep), pushes when one runs git push and none of its pushes is a
 // dry run (whose ref lines would be read as pushed), and a pull request when one runs gh pr create without
 // --dry-run.
 func made(commands []string) makes {
@@ -236,7 +265,7 @@ func made(commands []string) makes {
 				sub, args := gitCommand(inv.args)
 				switch {
 				case commitCommands[sub] && !makesNoCommit(sub, args):
-					mk.commits = true
+					mk.commits = mk.commits || !quiet(args) && !inv.silent
 				case sub == "push":
 					mk.pushes = true
 					dry = dry || dryRun(args)

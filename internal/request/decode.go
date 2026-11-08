@@ -8,11 +8,13 @@ import (
 )
 
 // Decoded is what a call's stored input and its result's stored output hold, in the harness's own format: the
-// shell commands the input runs, the output's text, and the files a writer's input names.
+// shell commands the input runs, the output's text, and the files a writer's input names. Cut is true when the store cut the output: its last token is dropped, and
+// a match that runs to its end ran into the cut.
 type Decoded struct {
 	Commands []string
 	Output   string
 	Paths    []string
+	Cut      bool
 }
 
 // Keys of the stored inputs and outputs, every harness's.
@@ -25,52 +27,56 @@ var (
 
 // Decode reads a call's stored input and its result's stored output as the harness stores them. Claude Code, pi,
 // opencode and Kimi keep a call's input as JSON, Hermes as Python's JSON (a space after each colon), Codex an
-// exec_command's as JSON and a code-mode exec's as a JavaScript script, whose tool calls name their command in a
-// cmd or command field, quoted key or not. Codex's code mode and Hermes keep a result as JSON whose output fields
-// hold the text, its newlines escaped. The store keeps each text's first bytes only (240 for an input), so a value
-// the cut ends is read as far as it goes.
+// exec_command's as JSON, an apply_patch's as the patch itself, and a code-mode exec's as a JavaScript script,
+// whose tool calls name their command in a cmd or command field, quoted key or not. Codex's code mode and Hermes keep a result as JSON whose output fields hold the text, its
+// newlines escaped.
+//
+// The store keeps each text's first bytes only (240 for an input), and every value goes through one rule for its
+// cut: what touches the cut is not known, so it is dropped, never read shorter. A path value the cut ends is no
+// path; a command, a patch or an output the cut ends loses its last token (the one the cut may have shortened)
+// before anything is matched in it.
 func Decode(harness, tool, input, output string) Decoded {
 	var d Decoded
-	in := fields(input, `"'`+"`", true)
 	tool = strings.ToLower(tool)
+	addPatch := func(t string) {
+		for _, m := range patchRe.FindAllStringSubmatch(t, -1) {
+			if !contains(d.Paths, m[1]) {
+				d.Paths = append(d.Paths, m[1])
+			}
+		}
+	}
 	switch {
+	case writers[tool] && !strings.HasPrefix(strings.TrimSpace(input), "{"):
+		// a patch that is the whole input (Codex's apply_patch): only its file headers name files
+		addPatch(uncut(input, strings.HasSuffix(input, "…")))
 	case writers[tool]:
+		in := fields(input, `"'`+"`", true)
 		for _, f := range in {
-			if pathKeys[f.key] && len(f.values) > 0 && f.values[0] != "" {
+			if pathKeys[f.key] && len(f.values) > 0 && f.values[0] != "" && !f.cut {
 				d.Paths = append(d.Paths, f.values[0])
 				break
 			}
 		}
 		if len(d.Paths) == 0 {
-			// A patch in a field (Hermes, opencode) is read decoded; a patch that is the whole input (Codex's
-			// apply_patch) as it is.
-			var texts []string
+			// a patch in a field (Hermes, opencode)
 			for _, f := range in {
-				if patchKeys[f.key] {
-					texts = append(texts, f.values...)
-				}
-			}
-			if len(texts) == 0 {
-				texts = []string{input}
-			}
-			for _, t := range texts {
-				for _, m := range patchRe.FindAllStringSubmatch(t, -1) {
-					if !contains(d.Paths, m[1]) {
-						d.Paths = append(d.Paths, m[1])
-					}
+				if patchKeys[f.key] && !f.list && len(f.values) > 0 {
+					addPatch(uncut(f.values[0], f.cut))
 				}
 			}
 		}
 	default:
-		for _, f := range in {
+		for _, f := range fields(input, `"'`+"`", true) {
 			if !commandKeys[f.key] {
 				continue
 			}
 			switch {
+			case f.list && f.cut:
+				d.Commands = append(d.Commands, argvScript(f.values[:len(f.values)-1]))
 			case f.list:
 				d.Commands = append(d.Commands, argvScript(f.values))
 			case len(f.values) > 0:
-				d.Commands = append(d.Commands, f.values[0])
+				d.Commands = append(d.Commands, uncut(f.values[0], f.cut))
 			}
 		}
 	}
@@ -80,15 +86,31 @@ func Decode(harness, tool, input, output string) Decoded {
 	if harness == "hermes" || harness == "codex" && tool == "exec" {
 		for _, f := range fields(output, `"`, false) {
 			if outputKeys[f.key] && !f.list && len(f.values) > 0 {
-				outs = append(outs, f.values[0])
+				outs = append(outs, uncut(f.values[0], f.cut))
+				d.Cut = d.Cut || f.cut
 			}
 		}
 	}
-	d.Output = output
 	if len(outs) > 0 {
 		d.Output = strings.Join(outs, "\n")
+	} else {
+		d.Cut = strings.HasSuffix(output, "…")
+		d.Output = uncut(output, d.Cut)
 	}
 	return d
+}
+
+// uncut is a text with its cut taken into account: when the store cut it, without the ellipsis and the token the
+// cut ends (one the cut may have shortened). A text cut just after a space keeps every token.
+func uncut(s string, cut bool) string {
+	if !cut {
+		return s
+	}
+	s = strings.TrimSuffix(s, "…")
+	if i := strings.LastIndexAny(s, " \t\r\n"); i >= 0 {
+		return s[:i+1]
+	}
+	return ""
 }
 
 // argvScript is a command named as its words: a shell's -c script as it is, else the words quoted for a shell.
@@ -103,17 +125,19 @@ func argvScript(argv []string) string {
 	return strings.Join(q, " ")
 }
 
-// field is a key and its value: a string, or a list of strings.
+// field is a key and its value: a string, or a list of strings. cut is true when the text ends inside its (last)
+// value: the store cut it there.
 type field struct {
 	key    string
 	values []string
 	list   bool
+	cut    bool
 }
 
 // fields reads the keys of a text whose values are strings or lists of strings, in order: JSON, Python's JSON and
 // a JavaScript object literal alike. A string literal opens with one of quotes; with bare, a key may be a bare
 // name, as JavaScript writes one. A string that is no key's value is passed over whole, so a key inside a value
-// is never read. A value the text ends inside keeps what the text holds of it.
+// is never read. A value the text ends inside keeps what the text holds of it, marked cut.
 func fields(text, quotes string, bare bool) []field {
 	var out []field
 	i := 0
@@ -150,8 +174,8 @@ func fields(text, quotes string, bare bool) []field {
 		}
 		switch {
 		case strings.IndexByte(quotes, text[i]) >= 0:
-			s, n, _ := literal(text[i:])
-			out = append(out, field{key: key, values: []string{s}})
+			s, n, closed := literal(text[i:])
+			out = append(out, field{key: key, values: []string{s}, cut: !closed})
 			i += n
 		case text[i] == '[':
 			f := field{key: key, list: true}
@@ -168,8 +192,9 @@ func fields(text, quotes string, bare bool) []field {
 				if strings.IndexByte(quotes, text[i]) < 0 {
 					break
 				}
-				s, n, _ := literal(text[i:])
+				s, n, closed := literal(text[i:])
 				f.values = append(f.values, s)
+				f.cut = !closed
 				i += n
 			}
 			out = append(out, f)

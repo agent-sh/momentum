@@ -57,7 +57,7 @@ func (r *reader) requests() []*Request {
 		if o == nil || o.first.IsZero() {
 			return "", false
 		}
-		return node(id, o.segAt(when, "")), true
+		return node(id, o.segAt(when)), true
 	}
 	for _, id := range ids {
 		t := r.threads[id]
@@ -69,11 +69,11 @@ func (r *reader) requests() []*Request {
 		}
 		for a, first := range t.agents {
 			if c := r.threads[a]; c != nil && !c.first.IsZero() {
-				u.union(node(a, 0), node(id, t.segAt(first, "")))
+				u.union(node(a, 0), node(id, t.segAt(first)))
 			}
 		}
 		for _, tn := range t.turns {
-			k := t.segAt(tn.at, "")
+			k := t.segAt(tn.at)
 			for _, c := range tn.copies {
 				if n, ok := at(c.thread, c.at); ok {
 					u.union(node(id, k), n)
@@ -220,7 +220,7 @@ func fill(u sets, reqs map[string]*Request, t *thread) {
 	var prev *Ask
 	var prevRq *Request
 	for _, tn := range t.turns {
-		rq := of(t.segAt(tn.at, ""))
+		rq := of(t.segAt(tn.at))
 		if rq != prevRq {
 			prev, prevRq = nil, rq
 		}
@@ -249,17 +249,17 @@ func fill(u sets, reqs map[string]*Request, t *thread) {
 		prev = &a
 	}
 	for _, it := range t.items {
-		if rq := of(t.segAt(it.r.At, it.agent)); rq != nil && !it.r.At.Before(rq.start()) {
+		if rq := of(t.segAt(it.r.At)); rq != nil && !it.r.At.Before(rq.start()) {
 			rq.Results = append(rq.Results, it.r)
 		}
 	}
 	for _, p := range t.pending {
-		if rq := of(t.segAt(p.res.TS, p.res.Agent)); rq != nil && !p.res.TS.Before(rq.start()) {
+		if rq := of(t.segAt(p.res.TS)); rq != nil && !p.res.TS.Before(rq.start()) {
 			rq.pending = append(rq.pending, p)
 		}
 	}
 	for _, it := range t.replies {
-		if rq := of(t.segAt(it.r.At, "")); rq != nil && !it.r.At.Before(rq.start()) && (rq.Report == nil || !it.r.At.Before(rq.Report.At)) {
+		if rq := of(t.segAt(it.r.At)); rq != nil && !it.r.At.Before(rq.start()) && (rq.Report == nil || !it.r.At.Before(rq.Report.At)) {
 			rp := it.r
 			rq.Report = &rp
 		}

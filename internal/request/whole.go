@@ -18,8 +18,9 @@ import (
 
 // Why a cut call was read as the store holds it.
 const (
-	cutGone   = "gone"   // its transcript, or the record in it, is gone
-	cutUnread = "unread" // no reader of its harness here, or its text could not be redacted
+	cutGone     = "gone"     // its transcript, or the record in it, is gone
+	cutUnread   = "unread"   // no reader of its harness here
+	cutUnmasked = "unmasked" // read whole, but what was taken off it could not be masked
 )
 
 // recordMax is the longest record a whole read takes: a line of a transcript can hold a large tool output, and
@@ -55,17 +56,32 @@ type recordRead struct {
 	why  string
 }
 
-// readLong reads the rest of a line longer than the reader's buffer, up to recordMax.
-func readLong(br *bufio.Reader, head []byte) ([]byte, error) {
-	line := append([]byte(nil), head...)
-	for len(line) <= recordMax {
+// errTooLong is a record longer than recordMax: passed over to its end, so it alone is lost.
+var errTooLong = errors.New("record too long")
+
+// readRecord reads the record (the line) at the reader's place: its bytes and how many it took from the reader. A
+// record over recordMax is passed over to its end and read as errTooLong.
+func readRecord(br *bufio.Reader) ([]byte, int64, error) {
+	var line []byte
+	var used int64
+	long := false
+	for {
 		chunk, err := br.ReadSlice('\n')
-		line = append(line, chunk...)
-		if !errors.Is(err, bufio.ErrBufferFull) {
-			return line, err
+		used += int64(len(chunk))
+		if !long && len(line)+len(chunk) > recordMax {
+			long, line = true, nil
+		}
+		if !long {
+			line = append(line, chunk...)
+		}
+		switch {
+		case errors.Is(err, bufio.ErrBufferFull):
+		case long && (err == nil || errors.Is(err, io.EOF)):
+			return nil, used, errTooLong
+		default:
+			return line, used, err
 		}
 	}
-	return nil, errors.New("record too long")
 }
 
 // refPlace splits a reference (path@offset#index) into its file and the record's offset.
@@ -331,17 +347,15 @@ func (r *reader) readFile(path string, ns []need) {
 					return
 				}
 			}
-			l, err := br.ReadSlice('\n')
-			if errors.Is(err, bufio.ErrBufferFull) {
-				l, err = readLong(br, l)
-			} else {
-				l = append([]byte(nil), l...)
-			}
-			if err != nil && !errors.Is(err, io.EOF) || len(l) == 0 {
+			l, used, err := readRecord(br)
+			switch {
+			case errors.Is(err, errTooLong):
+				// this record alone is lost: the reader is at the next one
+			case err != nil && !errors.Is(err, io.EOF) || len(l) == 0:
 				gone(i)
 				return
 			}
-			line, lineAt, pos = l, n.off, n.off+int64(len(l))
+			line, lineAt, pos = l, n.off, n.off+used
 		}
 		if text, ok := blockOf(line, n.id, n.output); ok {
 			r.records[n.key] = recordRead{text: text, ok: true}
@@ -351,14 +365,14 @@ func (r *reader) readFile(path string, ns []need) {
 	}
 }
 
-// resolve reads whole the calls the store cut that the requests hold, each once per run. It reads a call's input
-// where the store cut it, and its output where the store cut it and the command makes something (a commit, a
-// push, a pull request): in a compressed transcript in the same pass as the input, in a plain one by a seek after
-// it. A command that names neither git nor gh is not parsed and its output not read; a writer's input is read
-// alone. What each made is taken off the text read, and only that (each artifact's text and key) is masked, with
-// tacit's redaction in one call, before it is kept; each raw record is let go of as its job ends. A call whose
-// record is not read, or whose artifacts cannot be masked, is read as the store holds it, and counted on its
-// request.
+// resolve reads whole the calls the store cut that the requests hold, each once per run, one thread at a time, so
+// what is held raw is one thread's records at most. It reads a call's input where the store cut it, and its output
+// where the store cut it and the command makes something (a commit, a push, a pull request): in a compressed
+// transcript in the same pass as the input, in a plain one by a seek after it. A command that names neither git
+// nor gh is not parsed and its output not read; a writer's input is read alone. What each made is taken off the
+// text read, and each raw record is let go of as its thread's read ends; only what was taken off (each artifact's
+// text and key) is masked, with tacit's redaction in one call, before it is kept. A call whose record is not read,
+// or whose artifacts cannot be masked, is read as the store holds it, and counted on its request by why.
 func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 	key := func(p pair) string { return p.call.Ref + "\x00" + p.res.Ref }
 	cut := func(s string) bool { return strings.HasSuffix(s, "…") }
@@ -371,86 +385,102 @@ func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 			}
 		}
 	}
+	sort.SliceStable(todo, func(a, b int) bool { return todo[a].call.Session < todo[b].call.Session })
 	type job struct {
-		p             pair
-		tool, id      string
-		input, output string
-		raw           bool // a text read whole
-		why           string
-		skip          bool // a command that names neither git nor gh: it makes nothing this reads
-		mk            makes
+		p     pair
+		tool  string
+		id    string
+		raw   bool // a text read whole
+		why   string
+		skip  bool // a command that names neither git nor gh: it makes nothing this reads
+		mk    makes
+		found []Result
 	}
 	jobs := make([]job, len(todo))
-	var first []fetch
 	for i, p := range todo {
-		j := &jobs[i]
-		*j = job{p: p, tool: strings.ToLower(p.call.Tool), id: metaOf(p.call.Meta).ToolID, input: p.call.Summary, output: p.res.Summary}
-		if cut(p.call.Summary) {
-			first = append(first, fetch{p.call, j.id, false})
-		}
-		// a compressed transcript is read once: its cut output in the same pass as the input
-		if path, _, ok := refPlace(p.res.Ref); ok && !writers[j.tool] && cut(p.res.Summary) && fileHarness(p.res.Harness) && r.compressed(path) {
-			first = append(first, fetch{p.res, j.id, true})
-		}
+		jobs[i] = job{p: p, tool: strings.ToLower(p.call.Tool), id: metaOf(p.call.Meta).ToolID}
 	}
-	r.prefetch(first)
-	var second []fetch
-	for i := range jobs {
-		j := &jobs[i]
-		if cut(j.p.call.Summary) {
-			if text, ok, why := r.take(ctx, j.p.call, j.id, false); ok {
-				j.input, j.raw = text, true
-			} else {
-				j.why = why
+	// read reads one thread's jobs whole and takes off what each made, letting go of the raw records
+	read := func(js []job) {
+		var first, second []fetch
+		for i := range js {
+			j := &js[i]
+			if cut(j.p.call.Summary) {
+				first = append(first, fetch{j.p.call, j.id, false})
+			}
+			// a compressed transcript is read once: its cut output in the same pass as the input
+			if path, _, ok := refPlace(j.p.res.Ref); ok && !writers[j.tool] && cut(j.p.res.Summary) && fileHarness(j.p.res.Harness) && r.compressed(path) {
+				first = append(first, fetch{j.p.res, j.id, true})
 			}
 		}
-		if writers[j.tool] {
-			continue
+		r.prefetch(first)
+		inputs := make([]string, len(js))
+		for i := range js {
+			j := &js[i]
+			inputs[i] = j.p.call.Summary
+			if cut(j.p.call.Summary) {
+				if text, ok, why := r.take(ctx, j.p.call, j.id, false); ok {
+					inputs[i], j.raw = text, true
+				} else {
+					j.why = why
+				}
+			}
+			if writers[j.tool] {
+				continue
+			}
+			if !strings.Contains(inputs[i], "git") && !strings.Contains(inputs[i], "gh") {
+				j.skip = true
+				continue
+			}
+			j.mk = made(Decode(j.p.call.Harness, j.tool, inputs[i], "").Commands)
+			if (j.mk.commits || j.mk.pushes || j.mk.prs) && cut(j.p.res.Summary) {
+				second = append(second, fetch{j.p.res, j.id, true})
+			}
 		}
-		if !strings.Contains(j.input, "git") && !strings.Contains(j.input, "gh") {
-			j.skip = true
-			continue
-		}
-		j.mk = made(Decode(j.p.call.Harness, j.tool, j.input, "").Commands)
-		if (j.mk.commits || j.mk.pushes || j.mk.prs) && cut(j.p.res.Summary) {
-			second = append(second, fetch{j.p.res, j.id, true})
+		r.prefetch(second)
+		for i := range js {
+			j := &js[i]
+			output := j.p.res.Summary
+			if !writers[j.tool] && cut(j.p.res.Summary) {
+				// taken whether used or not, so no raw output stays behind
+				text, ok, why := r.take(ctx, j.p.res, j.id, true)
+				switch {
+				case j.skip || !(j.mk.commits || j.mk.pushes || j.mk.prs):
+				case ok:
+					output, j.raw = text, true
+				case j.why == "":
+					j.why = why
+				}
+			}
+			if j.skip {
+				continue
+			}
+			call, res := j.p.call, j.p.res
+			call.Summary, res.Summary = inputs[i], output
+			if writers[j.tool] {
+				if !metaOf(res.Meta).IsError {
+					j.found = artifactsOf(call, res, Decode(call.Harness, j.tool, inputs[i], ""), makes{})
+				}
+			} else {
+				j.found = artifactsOf(call, res, Decode(call.Harness, j.tool, inputs[i], output), j.mk)
+			}
 		}
 	}
-	r.prefetch(second)
-	results := make([][]Result, len(jobs))
+	for a := 0; a < len(jobs); {
+		b := a + 1
+		for b < len(jobs) && jobs[b].p.call.Session == jobs[a].p.call.Session {
+			b++
+		}
+		read(jobs[a:b])
+		a = b
+	}
 	var texts []string
 	for i := range jobs {
-		j := &jobs[i]
-		if !writers[j.tool] && cut(j.p.res.Summary) {
-			// taken whether used or not, so no raw output stays behind
-			text, ok, why := r.take(ctx, j.p.res, j.id, true)
-			switch {
-			case j.skip || !(j.mk.commits || j.mk.pushes || j.mk.prs):
-			case ok:
-				j.output, j.raw = text, true
-			case j.why == "":
-				j.why = why
-			}
-		}
-		if j.skip {
-			continue
-		}
-		call, res := j.p.call, j.p.res
-		call.Summary, res.Summary = j.input, j.output
-		if writers[j.tool] {
-			results[i] = artifactsOf(call, res, Decode(call.Harness, j.tool, j.input, ""), makes{})
-			if metaOf(res.Meta).IsError {
-				results[i] = nil
-			}
-		} else {
-			results[i] = artifactsOf(call, res, Decode(call.Harness, j.tool, j.input, j.output), j.mk)
-		}
-		if j.raw {
-			for _, x := range results[i] {
+		if jobs[i].raw {
+			for _, x := range jobs[i].found {
 				texts = append(texts, x.Text, x.Key)
 			}
 		}
-		j.input, j.output = "", ""
 	}
 	var masked []string
 	if len(texts) > 0 {
@@ -462,21 +492,21 @@ func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 	k := 0
 	for i := range jobs {
 		j := &jobs[i]
-		if j.raw && !j.skip {
-			if masked == nil && len(texts) > 0 {
+		if j.raw && !j.skip && len(j.found) > 0 {
+			if masked == nil {
 				// nothing read off the raw text is kept unmasked: the call is read as the store holds it
-				results[i], j.why = Artifacts(j.p.call, j.p.res), cutUnread
+				j.found, j.why = Artifacts(j.p.call, j.p.res), cutUnmasked
 			} else {
-				for x := range results[i] {
-					results[i][x].Text, results[i][x].Key = masked[k], masked[k+1]
+				for x := range j.found {
+					j.found[x].Text, j.found[x].Key = masked[k], masked[k+1]
 					k += 2
 				}
 			}
 		}
-		for x := range results[i] {
-			results[i][x].Thread = j.p.res.Session
+		for x := range j.found {
+			j.found[x].Thread = j.p.res.Session
 		}
-		r.resolved[key(j.p)] = resolvedPair{results: results[i], why: j.why}
+		r.resolved[key(j.p)] = resolvedPair{results: j.found, why: j.why}
 	}
 	for _, rq := range reqs {
 		for _, p := range rq.pending {
@@ -487,6 +517,8 @@ func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 				rq.CutGone++
 			case cutUnread:
 				rq.CutUnread++
+			case cutUnmasked:
+				rq.CutUnmasked++
 			}
 		}
 		rq.pending = nil

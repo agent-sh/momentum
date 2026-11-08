@@ -129,7 +129,7 @@ func TestACutCallThatCannotBeRedactedIsNotReadOff(t *testing.T) {
 	claudeCall(t, f, t.TempDir(), "s-claude-raw", command, output)
 	failing := func(context.Context, []string) ([]string, error) { return nil, fmt.Errorf("no scrubber") }
 	rq := f.groupWith(Options{Redact: failing})[0]
-	if strings.Contains(kinds(rq.Results), "1a2b3c4") || !strings.Contains(Handoff(rq), "were not read whole here") {
+	if strings.Contains(kinds(rq.Results), "1a2b3c4") || !strings.Contains(Handoff(rq), "details cut, not masked: 1 of its calls") {
 		t.Fatalf("results %s\n%s", kinds(rq.Results), Handoff(rq))
 	}
 }

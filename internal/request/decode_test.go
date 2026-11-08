@@ -27,9 +27,10 @@ func TestEachHarnesssStoredShapeIsDecoded(t *testing.T) {
 			`const a = await tools.exec_command({"cmd": 'git push origin main'}); const b = await tools.exec_command({command: "gh pr create --fill"});`,
 			`Script completed Output: {"output":"To github.com:example/x.git\n   1111111..2222222  main -> main"} {"output":"https://github.com/example/x/pull/7\n"}`,
 			"git push origin main | gh pr create --fill", "To github.com:example/x.git\n   1111111..2222222  main -> main\nhttps://github.com/example/x/pull/7\n", ""},
+		// the token the cut ends is dropped: it may be shorter than it was
 		{"Codex exec code mode, cut inside the command", "codex", "exec", `text(await tools.exec_command({cmd:"git -C /work/x commit -m 'Build the port for…`,
 			`Script completed Output: {"exit_code":0,"output":"[main (root-commit) 8aebac8] Build the port\n 7 files c…`,
-			"git -C /work/x commit -m 'Build the port for", "[main (root-commit) 8aebac8] Build the port\n 7 files c", ""},
+			"git -C /work/x commit -m 'Build the port ", "[main (root-commit) 8aebac8] Build the port\n 7 files ", ""},
 		{"Hermes terminal", "hermes", "terminal", `{"command": "git push origin main", "timeout": 120}`,
 			`{"output": "ok\nTo github.com:example/x.git\n   1111111..2222222  main -> main", "exit_code": 0, "error": null}`,
 			"git push origin main", "ok\nTo github.com:example/x.git\n   1111111..2222222  main -> main", ""},

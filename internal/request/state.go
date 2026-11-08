@@ -53,7 +53,7 @@ func state(rq *Request) {
 	case working:
 		rq.State, rq.Why = Working, "a session of it was last seen working"
 	case standing && holds && rq.unreadable(c):
-		rq.State, rq.Why = Checked, "the owner checked it at "+c.At.Local().Format(timeFormat)+"; its result can no longer be read (its transcript is gone), and nothing came after"
+		rq.State, rq.Why = Checked, "the owner checked it at "+c.At.Local().Format(timeFormat)+"; its result can no longer be read ("+rq.lostWhy()+"), and nothing came after"
 	case standing && holds:
 		rq.State, rq.Why = Checked, "the owner checked its newest result at "+c.At.Local().Format(timeFormat)+"; that he checked it does not make it right"
 	case latest == nil:
@@ -94,6 +94,22 @@ func state(rq *Request) {
 			}
 		}
 	}
+}
+
+// lostWhy is why a request's result can no longer be read: the transcript it was read from is gone, or what was
+// read whole could not be masked.
+func (rq *Request) lostWhy() string {
+	switch {
+	case rq.CutGone > 0 && rq.CutUnmasked > 0:
+		return "a transcript it was read from is gone, and what another call made could not be masked"
+	case rq.CutGone > 0:
+		return "the transcript it was read from is gone"
+	case rq.CutUnmasked > 0:
+		return "what it was read from could not be masked"
+	case rq.CutUnread > 0:
+		return "its harness is not read whole here"
+	}
+	return "it is no longer among the request's"
 }
 
 // ErrNoRequest is an id that names no request in the store.
@@ -139,6 +155,9 @@ func Find(ctx context.Context, st *store.Store, id string, opt Options) (*Reques
 	threads, err := st.ThreadsByPrefix(ctx, id)
 	if err != nil {
 		return nil, err
+	}
+	if len(threads) > 0 && threads[0] == id {
+		threads = threads[:1] // a session's full id names it, though it starts another's (they sort after it)
 	}
 	switch len(threads) {
 	case 0:
