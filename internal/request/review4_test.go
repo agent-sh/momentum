@@ -117,7 +117,7 @@ func TestAForkCarriesNoCommitIntoAPastedRequest(t *testing.T) {
 	f.owner("s-other", at(-100), "the other ask")
 	f.owner(s, at(0), "fix the parser")
 	f.pairWithID(s, "", "codex", "exec_command", "call_p1", at(1), `{"cmd":"git commit -am 'Fix the parser'"}`, out)
-	f.owner(s, at(5), "momentum request "+other+" - a handoff of the owner's request\nmomentum request "+other)
+	f.owner(s, at(5), "momentum request "+other+" - a handoff of the owner request\nmomentum request "+other)
 	f.pairWithID(s, "019a0000-0000-7000-8000-00000000c1d0", "codex", "exec_command", "call_p1", at(6), `{"cmd":"git commit -am 'Fix the parser'"}`, out)
 	for _, rq := range f.group() {
 		if rq.ID == other && strings.Contains(kinds(rq.Results), "1a2b3c4") {

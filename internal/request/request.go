@@ -165,7 +165,7 @@ const (
 // 80 bytes the store keeps of a brief hold). An id the owner's prose names (`see the momentum request ID thread`,
 // `the same bug as momentum request ID`) is neither. idRe is an id alone.
 var (
-	openRe = regexp.MustCompile(`\bmomentum request (r[0-9a-z]{6,12}[0-9a-f]{4}) - a handoff of the owner's request\b`)
+	openRe = regexp.MustCompile(`\bmomentum request (r[0-9a-z]{6,12}[0-9a-f]{4}) - a handoff of the owner request\b`)
 	lastRe = regexp.MustCompile(`(?:` + regexp.QuoteMeta(pasteLine) + `|\bto the request\.)\s+momentum request (r[0-9a-z]{6,12}[0-9a-f]{4})\s*$`)
 	idRe   = regexp.MustCompile(`^r[0-9a-z]{6,12}[0-9a-f]{4}$`)
 )

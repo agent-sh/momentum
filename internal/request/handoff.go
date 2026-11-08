@@ -30,7 +30,7 @@ func Line(id string) string { return "momentum request " + id }
 func Handoff(rq *Request) string {
 	var b strings.Builder
 	line := func(format string, a ...any) { b.WriteString(plain.Line(fmt.Sprintf(format, a...)) + "\n") }
-	line("%s - a handoff of the owner's request", Line(rq.ID))
+	line("%s - a handoff of the owner request", Line(rq.ID))
 	var evidence []string
 	cite := func(id string) {
 		if id != "" && len(evidence) < evidenceIDs {

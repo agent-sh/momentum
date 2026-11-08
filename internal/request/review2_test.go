@@ -129,8 +129,8 @@ func TestLinksThatFormCyclesSettle(t *testing.T) {
 	f.event("s-2", "", "harness_text", store.ActorHarness, at(6), "y", map[string]any{"parent": "s-1"})
 	f.put()
 	a, b := ID(at(0), "first ask"), ID(at(5), "second ask")
-	f.owner("s-1", at(10), Line(b)+" - a handoff of the owner's request go")
-	f.owner("s-2", at(11), Line(a)+" - a handoff of the owner's request go")
+	f.owner("s-1", at(10), Line(b)+" - a handoff of the owner request go")
+	f.owner("s-2", at(11), Line(a)+" - a handoff of the owner request go")
 	done := make(chan error, 1)
 	go func() {
 		f.put()

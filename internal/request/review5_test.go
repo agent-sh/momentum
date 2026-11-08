@@ -62,8 +62,8 @@ func TestWhatTheCutTouchesIsDropped(t *testing.T) {
 		{"a patch's file, cut at its end", "opencode", "patch", `{"patchText":"*** Begin Patch\n*** Update File: /work/a.go…`, ""},
 		{"a patch's file, cut after it", "opencode", "patch", `{"patchText":"*** Begin Patch\n*** Update File: /work/a.go\n@@\n-a…`, "file /work/a.go"},
 		{"a patch's file, no cut", "opencode", "patch", `{"patchText":"*** Begin Patch\n*** Update File: /work/a.go\n@@\n-a\n+b\n*** End Patch"}`, "file /work/a.go"},
-		{"a raw patch's file, cut inside", "codex", "apply_patch", "*** Begin Patch *** Update File: src/a.g…", ""},
-		{"a raw patch's file, cut after it", "codex", "apply_patch", "*** Begin Patch *** Update File: src/a.go @@ -a…", "file src/a.go"},
+		{"a raw patch's file, cut inside", "codex", "apply_patch", "*** Begin Patch\n*** Update File: src/a.g…", ""},
+		{"a raw patch's file, cut after it", "codex", "apply_patch", "*** Begin Patch\n*** Update File: src/a.go\n@@\n-a…", "file src/a.go"},
 	}
 	for _, c := range writes {
 		t.Run(c.name, func(t *testing.T) {
@@ -132,9 +132,9 @@ func TestThePullRequestIsTheAddressGhPrinted(t *testing.T) {
 }
 
 // Codex's apply_patch keeps the raw patch as its input: only its file headers name files, not a path key inside
-// a patched line.
+// a patched line (the patch as its transcript holds it, its lines kept).
 func TestARawPatchNamesOnlyItsHeaders(t *testing.T) {
-	in := storedCut("*** Begin Patch\n*** Update File: src/router.js\n@@\n-  { path: '/old', component: Old },\n+  { path: '/home', component: Home },\n*** End Patch")
+	in := "*** Begin Patch\n*** Update File: src/router.js\n@@\n-  { path: '/old', component: Old },\n+  { path: '/home', component: Home },\n*** End Patch"
 	if got := writerAs("codex", "apply_patch", in); got != "file src/router.js" {
 		t.Errorf("got %q, want the patched file", got)
 	}
@@ -149,7 +149,7 @@ func TestAForksWorkAfterAHandoffIsThePastedRequests(t *testing.T) {
 	f.owner("s-other", at(-100), "the other ask")
 	f.owner(s, at(0), "fix the parser")
 	f.reply(s, at(1), "Fixed.")
-	f.owner(s, at(5), "momentum request "+other+" - a handoff of the owner's request\nmomentum request "+other)
+	f.owner(s, at(5), "momentum request "+other+" - a handoff of the owner request\nmomentum request "+other)
 	f.event(s, "afork0000000000001", "agent_text", store.ActorAgent, at(2), "context the fork copied", nil)
 	f.tool(s, "afork0000000000001", "Bash", at(8), `{"command":"git commit -am 'Port it'"}`, "[main 7a7a7a7] Port it\n 1 file changed", false)
 	for _, rq := range f.group() {
@@ -168,7 +168,7 @@ func TestAForkCopyOfACommitAfterAHandoffIsThePastedRequests(t *testing.T) {
 	other := ID(at(-100), "the other ask")
 	f.owner("s-other", at(-100), "the other ask")
 	f.owner(s, at(0), "fix the parser")
-	f.owner(s, at(5), "momentum request "+other+" - a handoff of the owner's request\nmomentum request "+other)
+	f.owner(s, at(5), "momentum request "+other+" - a handoff of the owner request\nmomentum request "+other)
 	key := func(who string, n int) string { return fmt.Sprintf("%s@%012d#000", who, n) }
 	add := func(agent, kind string, ts time.Time, sum, sk string) {
 		f.event(s, agent, kind, store.ActorAgent, ts, sum, map[string]any{"tool_id": "toolu_same"})

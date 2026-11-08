@@ -77,7 +77,7 @@ func TestHisWordsAfterAPastedHandoff(t *testing.T) {
 // a last line at the end of the text ends the paste there, so what comes before it is his.
 func TestASingleIDLineInAnUncutText(t *testing.T) {
 	for _, c := range []struct{ name, text, want string }{
-		{"the opening line", "%s - a handoff of the owner's request\nand fix the flaky test", "and fix the flaky test"},
+		{"the opening line", "%s - a handoff of the owner request\nand fix the flaky test", "and fix the flaky test"},
 		{"the last line", "carry on with it " + pasteLine + " %s", "carry on with it"},
 		{"the last sentence's tail", "carry on with it ... to the request. %s", "carry on with it ..."},
 	} {
@@ -99,7 +99,7 @@ func TestATurnBeforeTheRequestBeganIsNoAsk(t *testing.T) {
 	f := newFixture(t)
 	f.owner("s-src", at(10), "tune the cache")
 	src := f.group()[0]
-	f.owner("s-next", at(5), Line(src.ID)+" - a handoff of the owner's request Asked: tune the cache "+Line(src.ID)+" and the docs")
+	f.owner("s-next", at(5), Line(src.ID)+" - a handoff of the owner request Asked: tune the cache "+Line(src.ID)+" and the docs")
 	if reqs := f.group(); len(reqs) != 1 || len(reqs[0].Asks) != 1 {
 		t.Errorf("asks %q", words(reqs[0].Asks))
 	}

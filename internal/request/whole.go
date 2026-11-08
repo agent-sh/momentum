@@ -251,9 +251,19 @@ func storeCut(call, res store.Event) bool {
 	if writers[tool] {
 		// a cut patch may name more files past the cut than its stored part does
 		d := Decode(call.Harness, tool, call.Summary, "")
-		return strings.HasSuffix(call.Summary, "…") && (len(d.Paths) == 0 || d.Patch)
+		return strings.HasSuffix(call.Summary, "…") && (len(d.Paths) == 0 || d.Patch) || patchJoined(call)
 	}
 	return strings.HasSuffix(call.Summary, "…") || strings.HasSuffix(res.Summary, "…")
+}
+
+// patchJoined reports a writer's input that is a patch itself (Codex's apply_patch), which the store keeps with its
+// lines joined: its file headers are lines of their own, so only a whole read gives them.
+func patchJoined(call store.Event) bool {
+	if !writers[strings.ToLower(call.Tool)] {
+		return false
+	}
+	in := strings.TrimSpace(call.Summary)
+	return !strings.HasPrefix(in, "{") && !strings.Contains(in, "\n") && strings.Contains(in, "*** ")
 }
 
 // storeJoined reports a shell call's output the store keeps with its lines flattened to spaces (every harness's
@@ -473,10 +483,12 @@ func (r *reader) readWhole(ctx context.Context, t *thread) {
 	whole := func(j *job) bool {
 		return !writers[j.tool] && (cut(j.p.res.Summary) || storeJoined(*j.p.call, *j.p.res))
 	}
+	// an input read whole: one the store cut, or a raw patch it joined (its file headers are lines)
+	wholeIn := func(j *job) bool { return cut(j.p.call.Summary) || patchJoined(*j.p.call) }
 	var first, second []fetch
 	for i := range js {
 		j := &js[i]
-		if cut(j.p.call.Summary) {
+		if wholeIn(j) {
 			first = append(first, fetch{*j.p.call, j.id, false})
 		}
 		// a compressed transcript is read once: its output in the same pass as the input
@@ -489,7 +501,7 @@ func (r *reader) readWhole(ctx context.Context, t *thread) {
 	for i := range js {
 		j := &js[i]
 		inputs[i] = j.p.call.Summary
-		if cut(j.p.call.Summary) {
+		if wholeIn(j) {
 			if text, ok, why := r.take(ctx, *j.p.call, j.id, false); ok {
 				inputs[i], j.raw = text, true
 			} else {

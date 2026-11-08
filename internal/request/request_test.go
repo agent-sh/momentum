@@ -185,7 +185,7 @@ func kinds(rs []Result) string {
 // pasted is a handoff of id pasted as the store keeps it, its lines joined: its opening line, a body, its last
 // sentence and its closing line.
 func pasted(id, body string) string {
-	return Line(id) + " - a handoff of the owner's request " + body + " " + pasteLine + " " + Line(id)
+	return Line(id) + " - a handoff of the owner request " + body + " " + pasteLine + " " + Line(id)
 }
 
 func words(as []Ask) string {
@@ -371,7 +371,7 @@ func TestAPastedHandoffLinksBack(t *testing.T) {
 func TestAnIdWithNoOpeningInTheStore(t *testing.T) {
 	f := newFixture(t)
 	gone := ID(at(-600), "an opening this store never saw")
-	f.owner("s-here", at(0), Line(gone)+" - a handoff of the owner's request Asked: ... "+Line(gone))
+	f.owner("s-here", at(0), Line(gone)+" - a handoff of the owner request Asked: ... "+Line(gone))
 	f.reply("s-here", at(1), "Picking it up.")
 	reqs := f.group()
 	if len(reqs) != 1 || reqs[0].ID != gone || !reqs[0].Opened.IsZero() {
@@ -454,7 +454,7 @@ func TestResultsComeFromToolOutput(t *testing.T) {
 	f.tool("s-r", "", "Bash", at(5), `{"command":"git push -u origin feat"}`,
 		"To github.com:example/x.git\n * [new branch]      feat -> feat\nbranch 'feat' set up to track 'origin/feat'.", false)
 	f.tool("s-r", "", "Bash", at(6), `{"command":"gh pr create --fill"}`, "https://github.com/example/x/pull/8", false)
-	f.tool("s-r", "", "apply_patch", at(7), "*** Begin Patch *** Update File: src/b.go @@ *** Add File: src/c.go +x *** End Patch", "Success.", false)
+	f.pairWithID("s-r", "", "codex", "apply_patch", "call-p7", at(7), "*** Begin Patch\n*** Update File: src/b.go\n@@\n*** Add File: src/c.go\n+x\n*** End Patch", "Success.")
 	f.tool("s-r", "", "Bash", at(8), `{"command":"git commit"}`, "[main (root-commit) 2f3a4b5] First\n 1 file changed", false)
 	f.tool("s-r", "", "Bash", at(9), `{"command":"git commit"}`, "[detached HEAD 3a4b5c6] Fix", false)
 	rq := f.group()[0]

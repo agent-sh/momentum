@@ -30,7 +30,8 @@ var (
 	pushRefRe = regexp.MustCompile(`(?m)^[ \t]*(?:\+[ \t]*)?(?:([0-9a-f]{7,40})\.\.\.?([0-9a-f]{7,40})|\* \[new branch\])[ \t]+(\S+) -> (\S+)`)
 	// a line that is a pull request's address alone, as gh pr create prints it
 	prLineRe = regexp.MustCompile(`(?m)^(https?://[^\s"']+/pull/\d+)[ \t\r]*$`)
-	patchRe  = regexp.MustCompile(`\*\*\* (?:Add|Update|Delete) File: ([^\s"]+)`)
+	// a patch's file header, a line of its own: a header its content mentions (an added line, a string) is none
+	patchRe = regexp.MustCompile(`(?m)^\*\*\* (?:Add|Update|Delete) File: (.+?)[ \t\r]*$`)
 	// a push's remote: a URL, an scp-like host:path, or a path
 	remoteRe = regexp.MustCompile(`[:/]`)
 )

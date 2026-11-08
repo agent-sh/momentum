@@ -62,7 +62,7 @@ func TestAnIDInHisProseIsNoHandoff(t *testing.T) {
 		t.Errorf("%d requests: %+v", len(reqs), reqs)
 	}
 	for _, c := range []struct{ name, text string }{
-		{"its opening line, the store's cut", "%s - a handoff of the owner's request Asked (the owner's words, oldest first): - fix the par…"},
+		{"its opening line, the store's cut", "%s - a handoff of the owner request Asked (the owner's words, oldest first): - fix the par…"},
 		{"its last line", "carry on ... to the request. %s"},
 	} {
 		t.Run(c.name, func(t *testing.T) {

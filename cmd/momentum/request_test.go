@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -88,8 +89,8 @@ func TestRequestHandoffAndList(t *testing.T) {
 	}
 }
 
-// Every command line a handoff prints runs as printed: its id lines are its handoff, and its evidence lines are
-// evidence show commands the CLI takes.
+// Every command line a handoff prints runs as printed: a shell (bash) parses each into its words, and its id lines
+// are its handoff, its evidence lines evidence show commands the CLI takes.
 func TestEveryHandoffCommandLineRuns(t *testing.T) {
 	t.Setenv("MOMENTUM_HOME", t.TempDir())
 	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
@@ -103,7 +104,12 @@ func TestEveryHandoffCommandLineRuns(t *testing.T) {
 		if !strings.HasPrefix(l, "momentum ") {
 			continue
 		}
-		args := strings.Fields(l)[1:]
+		words, err := exec.Command("bash", "-c", "set -- "+l+"; printf '%s\\0' \"$@\"").Output()
+		if err != nil {
+			t.Errorf("a shell cannot run %q: %v", l, err)
+			continue
+		}
+		args := strings.Split(strings.TrimSuffix(string(words), "\x00"), "\x00")[1:]
 		code, got, errOut := momentum(args...)
 		if code == 2 {
 			t.Errorf("%q: a usage error: %s", l, errOut)

@@ -59,7 +59,8 @@ type requestJSON struct {
 	Asking  string   `json:"asking"`
 	Asks    int      `json:"asks"`
 	Threads []string `json:"threads"`
-	// ResultsInWindow counts its results whose calls came in the list's window (since): a list reads only those
+	// ResultsInWindow counts its results since the list's window start (since), by each result's time; the list also
+	// reads back to the request's last turn when its state needs it (SPEC, Requests, Reads)
 	ResultsInWindow int      `json:"results_in_window"`
 	Newest          string   `json:"newest,omitempty"`
 	Open            string   `json:"open,omitempty"`

@@ -45,7 +45,7 @@ func TestEachHarnesssStoredShapeIsDecoded(t *testing.T) {
 			"To github.com:example/x.git 1111111..2222222 main -> main", ""},
 		{"Kimi Write", "kimi", "Write", `{"path":"/work/g.py","content":"x = 1"}`, "Wrote 5 bytes.", "", "Wrote 5 bytes.", "/work/g.py"},
 		{"a writer cut before its path", "kimi", "Edit", `{"new_string":"a long text the store cut before the path…`, "Edited.", "", "Edited.", ""},
-		{"Codex apply_patch, raw", "codex", "apply_patch", "*** Begin Patch *** Update File: src/h.go @@ -a +b *** End Patch", "Success.", "", "Success.", "src/h.go"},
+		{"Codex apply_patch, raw", "codex", "apply_patch", "*** Begin Patch\n*** Update File: src/h.go\n@@\n-a\n+b\n*** End Patch", "Success.", "", "Success.", "src/h.go"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
