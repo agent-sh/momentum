@@ -638,6 +638,47 @@ func TestAnEmptyOwnerTurnBoundsTheLookBack(t *testing.T) {
 	}
 }
 
+// A message another session sent into a session is stored as agent text, a harness line or by its origin, but it is
+// not the agent's words. His turn after one is read with the agent's reply before it, however many came between,
+// and a message alone since his turn before leaves nothing to read it with: its own words handing him a step are
+// not the agent's.
+func TestAPeerMessageIsNotTheAgentsLastWords(t *testing.T) {
+	ask := "The build is ready. Should I deploy it now?"
+	peer := func(session, text, why string, at time.Time) store.Event {
+		return ev(store.Transcripts, session, "agent_text", store.ActorAgent, "", text, fmt.Sprintf(`{"why":%q}`, why), at)
+	}
+	tag := func(name string) string { return "<" + name + " from=\"neutral\">" } // built from parts: the file holds no tag
+	msgs := []struct{ text, why string }{
+		{tag("cross-session-message") + "the review is posted", "harness line"},
+		{tag("agent-message") + "the review is posted", "harness line"},
+		{"Another Claude session sent a message: the review is posted", "harness line"},
+		{"the review is posted", "origin peer"},
+	}
+	st := testStore(t)
+	for i, s := range []string{"a", "b", "c", "d"} {
+		at := t0.Add(time.Duration(i) * time.Hour)
+		put(t, st, agentSays(s, ask, at), peer(s, msgs[i].text, msgs[i].why, at.Add(time.Minute)), ownerTurn(s, "up to you, why ask", at.Add(2*time.Minute)))
+	}
+	at := t0.Add(5 * time.Hour)
+	put(t, st, agentSays("e", ask, at), ownerTurn("e", "up to you, why ask", at.Add(time.Minute)))
+	for j := range 10 { // more than one read of the newest
+		put(t, st, peer("e", msgs[0].text, msgs[0].why, at.Add(time.Duration(j+1)*time.Second)))
+	}
+	if fs, err := (OwnerBurden{}).Detect(context.Background(), st, week()); err != nil || !slices.Equal(signatures(fs), []string{"owner-burden/v1:handback 5"}) {
+		t.Errorf("his answers to the agent's asks: %v %v", signatures(fs), err)
+	}
+	st2 := testStore(t)
+	for i, s := range []string{"x", "y", "z"} {
+		at := t0.Add(time.Duration(i) * time.Hour)
+		put(t, st2, ownerTurn(s, "tag the release", at), agentSays(s, "Tagging it.", at.Add(time.Minute)),
+			peer(s, tag("cross-session-message")+"Should I take the release notes too?", "harness line", at.Add(2*time.Minute)),
+			ownerTurn(s, "why ask me, you decide", at.Add(3*time.Minute)))
+	}
+	if fs, err := (OwnerBurden{}).Detect(context.Background(), st2, week()); err != nil || len(fs) != 0 {
+		t.Fatalf("a message's own words read as the agent's: %v %v", signatures(fs), err)
+	}
+}
+
 // A turn is read with the agent's last words since his turn before it, within 6 hours: words he answered once are
 // not read again, and words from longer ago are not what he answers. Three turns of one kind in one session are no
 // finding; a turn he repeats a day later is read against what he said that day.

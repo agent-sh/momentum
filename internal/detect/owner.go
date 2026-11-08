@@ -2,6 +2,7 @@ package detect
 
 import (
 	"context"
+	"encoding/json"
 	"regexp"
 	"strings"
 	"time"
@@ -20,7 +21,8 @@ import (
 //   - repeat: he said again what he had said in the session that day.
 //
 // A turn is read with the agent's last words since his turn before it: words he answered once are not read again.
-// A push back with none of those before it is not keyed: the words alone do not say what made him step in.
+// A message another session sent into the session is no words of the agent's (peerMessage). A push back with no
+// words of the agent's before it is not keyed: his words alone do not say what made him step in.
 type OwnerBurden struct {
 	Recur    Recur // default OwnerRecur
 	Programs Programs
@@ -189,13 +191,9 @@ func (o OwnerBurden) Detect(ctx context.Context, st *store.Store, w Window) ([]s
 		if prevAt.After(after) {
 			after = prevAt // what he answered already is not read again
 		}
-		prior, err := st.Before(ctx, t.Session, []string{"agent_text"}, after, t.TS, 1)
+		agent, err := agentWords(ctx, st, t.Session, after, t.TS)
 		if err != nil {
 			return gather("owner-burden", occ, r), err
-		}
-		agent := ""
-		if len(prior) > 0 {
-			agent = prior[0].Summary
 		}
 		class := OwnerClass(strings.TrimSpace(t.Summary), agent, before)
 		if class == "" {
@@ -204,4 +202,50 @@ func (o OwnerBurden) Detect(ctx context.Context, st *store.Store, w Window) ([]s
 		occ = append(occ, occurrence{sig: signature("owner-burden", class), title: ownerTitles[class], ev: t})
 	}
 	return gather("owner-burden", occ, r), nil
+}
+
+// agentWords are the agent's last words in a session from after up to before: its newest agent text that is not a
+// message another session sent into it; "" for none.
+func agentWords(ctx context.Context, st *store.Store, session string, after, before time.Time) (string, error) {
+	for n := 1; ; n *= 8 {
+		evs, err := st.Before(ctx, session, []string{"agent_text"}, after, before, n)
+		if err != nil {
+			return "", err
+		}
+		for _, e := range evs {
+			if !peerMessage(e) {
+				return e.Summary, nil
+			}
+		}
+		if len(evs) < n {
+			return "", nil
+		}
+	}
+}
+
+// peerOpenings are how Claude Code opens another session's message in the session it reaches. The tags are built
+// from parts so this file holds none.
+var peerOpenings = []string{"<" + "agent-message from=", "<" + "cross-session-message from=", "Another Claude session sent a message"}
+
+// peerMessage reports an agent text that is another session's message, not the model's words. tacit credits it to
+// an agent when it does not know the tag, and the store marks it a harness line when Claude Code queued it as meta,
+// else by its origin (origin peer). It is the check #84 gives the supervise replay's reading of an agent text,
+// mirrored here: supervise does not export it.
+func peerMessage(e store.Event) bool {
+	var m struct{ Why string }
+	if json.Unmarshal([]byte(e.Meta), &m) != nil {
+		return false
+	}
+	if m.Why == "origin peer" {
+		return true
+	}
+	if m.Why != "harness line" {
+		return false
+	}
+	for _, p := range peerOpenings {
+		if strings.HasPrefix(e.Summary, p) {
+			return true
+		}
+	}
+	return false
 }
