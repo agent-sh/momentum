@@ -80,6 +80,8 @@ func TestAnEnvelopeIsReadByItsTopLevel(t *testing.T) {
 		{`{"success": false, "error": "Could not find a match"}`, true},
 		{`{"output": "done", "exit_code": 1, "error": null}`, true},
 		{`{"output": "done", "exit_code": 0, "error": null}`, false},
+		{`{"output": "done", "exit_code": null}`, false},
+		{`{"output": "done", "metadata": {"exit_code": null}}`, false},
 		{`{"error": {"code": -32603, "message": "permission denied"}}`, true},
 		// Codex's exec_command keeps its exit code in its own metadata; another nested object's is the program's
 		{`{"output": "cat: x: No such file", "metadata": {"exit_code": 1, "duration_seconds": 0.1}}`, true},

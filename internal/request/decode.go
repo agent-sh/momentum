@@ -1,6 +1,7 @@
 package request
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -15,6 +16,7 @@ type Decoded struct {
 	Commands   []string
 	Output     string
 	Paths      []string
+	Patch      bool // a writer's input is a patch, whose file headers name its files
 	CommandCut bool // the store cut the last command: what it ran last may have had more arguments
 	// OutputCut is an output whose text the store cut where it ends, its last line perhaps shortened: one it keeps
 	// as JSON (Hermes); a plain text the store keeps has its lines joined, so nothing is read off it anyway
@@ -269,6 +271,7 @@ func Decode(harness, tool, input, output string) Decoded {
 	var d Decoded
 	tool = strings.ToLower(tool)
 	addPatch := func(t string) {
+		d.Patch = d.Patch || patchRe.MatchString(t)
 		for _, m := range patchRe.FindAllStringSubmatch(t, -1) {
 			if !contains(d.Paths, m[1]) {
 				d.Paths = append(d.Paths, m[1])
@@ -338,8 +341,7 @@ func Decode(harness, tool, input, output string) Decoded {
 		// Codex's write_stdin tool polls a session an earlier exec_command left running
 		d.Output = uncut(output, strings.HasSuffix(output, "…"))
 		d.Joined = output != "" && !strings.Contains(output, "\n")
-		if m := pollSessionRe.FindStringSubmatch(input); m != nil && m[1] != "" {
-			n, _ := strconv.ParseInt(m[1], 10, 64)
+		if n, ok := inputSession(input); ok {
 			c := plainChunk(output, n)
 			c.Output = d.Output
 			d.Polls = []Chunk{c}
@@ -363,6 +365,19 @@ func Decode(harness, tool, input, output string) Decoded {
 	return d
 }
 
+// inputSession is the session a Codex write_stdin tool's input names: its JSON's session_id, read as JSON. A cut
+// input names none.
+func inputSession(input string) (int64, bool) {
+	var in struct {
+		Session json.Number `json:"session_id"`
+	}
+	if json.Unmarshal([]byte(input), &in) != nil || in.Session == "" {
+		return 0, false
+	}
+	n, err := in.Session.Int64()
+	return n, err == nil
+}
+
 // exitRe is a code-mode result's exit code; sessionRe the session a running one yielded.
 var (
 	exitRe    = regexp.MustCompile(`"exit_code":\s*(-?\d+)`)
@@ -383,62 +398,102 @@ func plainChunk(output string, session int64) Chunk {
 }
 
 // codeChunks are the results a Codex code-mode output holds, in order: each object's output fields (output,
-// stdout, stderr) as one text, the last token of one the cut ends dropped, and whether its exit code is not 0.
+// stdout, stderr) as one text, the last token of one the cut ends dropped, whether its exit code is not 0, and what
+// the script printed with the result in that object (carried): "i", its call's place in a Promise.all array, and
+// "id", the session a poll named. A key of another object (another tool's structuredContent id) is not its.
 func codeChunks(output string) []Chunk {
+	// a frame is an object being read: the chunk its own output fields make, the chunks it and the objects inside
+	// it made, and the keys it carries, which go to those chunks that carry none of an object nearer them. A key of
+	// an object beside the result's (another tool's structuredContent) reaches no chunk of it.
+	type frame struct {
+		start, chunk int
+		made         []int
+		index        int
+		polled       int64
+	}
 	var out []Chunk
-	obj, last := -1, 0
+	var stack []frame
+	pop := func() {
+		f := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, k := range f.made {
+			if out[k].Index < 0 && f.index >= 0 {
+				out[k].Index = f.index
+			}
+			if out[k].Polled < 0 && f.polled > 0 {
+				out[k].Polled = f.polled
+			}
+		}
+		if len(stack) > 0 {
+			stack[len(stack)-1].made = append(stack[len(stack)-1].made, f.made...)
+		}
+	}
 	for i := 0; i < len(output); {
-		j := strings.IndexByte(output[i:], '"')
-		if j < 0 {
-			break
-		}
-		j += i
-		key, n, _ := literal(output[j:])
-		k := skipSpace(output, j+n)
-		if !outputKeys[key] || k >= len(output) || output[k] != ':' {
-			i = j + n
+		switch output[i] {
+		case '{':
+			stack = append(stack, frame{start: i, chunk: -1, index: -1})
+			i++
+			continue
+		case '}':
+			if len(stack) > 0 {
+				pop()
+			}
+			i++
+			continue
+		case '"':
+		default:
+			i++
 			continue
 		}
+		key, n, _ := literal(output[i:])
+		k := skipSpace(output, i+n)
+		if len(stack) == 0 || k >= len(output) || output[k] != ':' {
+			i += n // a string that is no key of an object
+			continue
+		}
+		top := &stack[len(stack)-1]
 		v := skipSpace(output, k+1)
-		if v >= len(output) || output[v] != '"' {
-			i = v
-			continue
-		}
-		text, m, closed := literal(output[v:])
-		start := strings.LastIndexByte(output[:j], '{')
-		if start == obj && len(out) > 0 {
-			out[len(out)-1].Output += "\n" + uncut(text, !closed)
-			out[len(out)-1].OutputCut = !closed
-		} else {
-			c := Chunk{Output: uncut(text, !closed), OutputCut: !closed, Index: -1, Polled: -1}
-			// what the script printed with the result, from the previous result to this one's output
-			for _, m := range carriedRe.FindAllStringSubmatch(output[last:j], -1) {
-				if m[1] == "i" {
-					if n, err := strconv.Atoi(m[2]); err == nil {
-						c.Index = n
-					}
-				} else {
-					c.Polled, _ = strconv.ParseInt(m[2], 10, 64)
+		switch {
+		case outputKeys[key] && v < len(output) && output[v] == '"':
+			text, m, closed := literal(output[v:])
+			if top.chunk >= 0 {
+				out[top.chunk].Output += "\n" + uncut(text, !closed)
+				out[top.chunk].OutputCut = !closed
+			} else {
+				c := Chunk{Output: uncut(text, !closed), OutputCut: !closed, Index: -1, Polled: -1}
+				if e := exitRe.FindStringSubmatch(output[top.start:i]); e != nil {
+					c.Failed = e[1] != "0"
+				} else if m := sessionRe.FindStringSubmatch(output[top.start:i]); m != nil {
+					c.Running = true
+					c.Session, _ = strconv.ParseInt(m[1], 10, 64)
 				}
+				top.chunk = len(out)
+				top.made = append(top.made, len(out))
+				out = append(out, c)
 			}
-			if e := exitRe.FindStringSubmatch(output[max(start, 0):j]); e != nil {
-				c.Failed = e[1] != "0"
-			} else if m := sessionRe.FindStringSubmatch(output[max(start, 0):j]); m != nil {
-				c.Running = true
-				c.Session, _ = strconv.ParseInt(m[1], 10, 64)
+			i = v + m
+		case key == "i" || key == "id":
+			e := v
+			for e < len(output) && output[e] >= '0' && output[e] <= '9' {
+				e++
 			}
-			out = append(out, c)
+			if e > v && key == "i" {
+				if n, err := strconv.Atoi(output[v:e]); err == nil {
+					top.index = n
+				}
+			} else if e > v {
+				top.polled, _ = strconv.ParseInt(output[v:e], 10, 64)
+			}
+			i = max(e, v)
+		default:
+			i = k + 1
 		}
-		obj = start
-		i = v + m
-		last = i
+	}
+	for len(stack) > 0 { // objects the cut ends
+		pop()
 	}
 	return out
 }
-
-// carriedRe is a key a script printed with a result: "i", its call's place in a Promise.all array, or "id", the
-// session a poll named.
-var carriedRe = regexp.MustCompile(`"(i|id)":\s*(\d+)`)
 
 // uncut is a text with its cut taken into account: when the store cut it, without the ellipsis and the token the
 // cut ends (one the cut may have shortened). A text cut just after a space keeps every token.

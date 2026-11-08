@@ -78,9 +78,31 @@ func (w *walker) visit(n syntax.Node) bool {
 			}
 		}
 	}
+	var assigns []*syntax.Assign
+	switch x := n.(type) {
+	case *syntax.DeclClause:
+		assigns = x.Args
+	case *syntax.CallExpr:
+		assigns = x.Assigns
+	}
+	// an assignment's command substitution keeps its output in the variable: none of it is in the call's output
+	for _, a := range assigns {
+		in := &walker{depth: w.depth, silent: true, cut: w.cut, size: w.size}
+		if a.Value != nil {
+			syntax.Walk(a.Value, in.visit)
+		}
+		if a.Array != nil {
+			syntax.Walk(a.Array, in.visit)
+		}
+		w.out = append(w.out, in.out...)
+	}
 	ce, ok := n.(*syntax.CallExpr)
-	if !ok || len(ce.Args) == 0 {
-		return true
+	if !ok {
+		_, decl := n.(*syntax.DeclClause)
+		return !decl
+	}
+	if len(ce.Args) == 0 {
+		return false
 	}
 	args := make([]string, len(ce.Args))
 	for i, wd := range ce.Args {
@@ -94,13 +116,17 @@ func (w *walker) visit(n syntax.Node) bool {
 					in.silent = in.silent || w.silent
 					w.out = append(w.out, in)
 				}
-				return true
 			}
+		} else {
+			inv.silent, inv.cut = w.silent, cut
+			w.out = append(w.out, inv)
 		}
-		inv.silent, inv.cut = w.silent, cut
-		w.out = append(w.out, inv)
 	}
-	return true
+	// the command substitutions in its words
+	for _, wd := range ce.Args {
+		syntax.Walk(wd, w.visit)
+	}
+	return false
 }
 
 // closers end what a cut script leaves open.
@@ -264,7 +290,7 @@ func made(d Decoded) makes {
 	dry, lists, loud := false, false, false
 	for i, c := range d.Commands {
 		for _, inv := range invocationsOf(c, 0, d.CommandCut && i == len(d.Commands)-1) {
-			if inv.prog == "gh" && printsAddresses(ghCommand(inv.args)) {
+			if inv.prog == "gh" && !inv.silent && printsAddresses(ghCommand(inv.args)) {
 				lists = true
 			}
 			if inv.cut {

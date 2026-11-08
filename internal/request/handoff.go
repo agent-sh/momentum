@@ -12,7 +12,7 @@ const timeFormat = "2006-01-02 15:04"
 // Handoff limits: how much of a request the text holds.
 const (
 	followUps   = 5   // the latest follow-ups after the opening
-	artifacts   = 12  // the newest artifacts
+	artifacts   = 12  // the artifacts shown: commits, pushes and pull requests first, then files
 	evidenceIDs = 12  // the events it names
 	wordsChars  = 400 // an ask's words
 )
@@ -67,9 +67,18 @@ func Handoff(rq *Request) string {
 	if len(rq.Results) == 0 {
 		line("- nothing: no commit, push, pull request or file write was observed")
 	}
-	for i, x := range rq.Results {
+	// commits, pushes and pull requests before files, each newest first: files never push them out of the shown
+	var listed []Result
+	for _, files := range []bool{false, true} {
+		for _, x := range rq.Results {
+			if (x.Kind == KindFile) == files {
+				listed = append(listed, x)
+			}
+		}
+	}
+	for i, x := range listed {
 		if i == artifacts {
-			line("- (%d more)", len(rq.Results)-artifacts)
+			line("- (%d more)", len(listed)-artifacts)
 			break
 		}
 		text := x.Text

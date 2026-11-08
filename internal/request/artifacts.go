@@ -61,10 +61,14 @@ func Artifacts(call, res store.Event) []Result {
 	return artifactsOf(call, res, d, made(d), nil)
 }
 
-// session is the command a Codex session runs, as the call that left it running named it.
+// session is the command a Codex session runs, as the call that left it running named it, and what it printed
+// while it ran, kept for a command that pushes or opens pull requests: its ref lines and addresses count once a
+// poll shows it ended successfully.
 type session struct {
-	cmd string
-	cut bool
+	cmd    string
+	cut    bool
+	keep   bool // it pushes or opens pull requests: what it prints while it runs is kept
+	output string
 }
 
 // sessionKey is a Codex session as a thread knows it: each agent of the thread (its main thread "", a subagent)
@@ -88,15 +92,25 @@ func yielded(call store.Event, d Decoded) map[int64]session {
 	out := map[int64]session{}
 	for _, c := range d.Chunks {
 		if c.Running {
-			out[c.Session] = session{c.Command, c.Cut}
+			out[c.Session] = running(c.Command, c.Cut, c.Output)
 		}
 	}
 	if strings.ToLower(call.Tool) == "exec_command" {
 		if c := plainChunk(d.Output, 0); c.Running {
-			out[c.Session] = session{strings.Join(d.Commands, "\n"), d.CommandCut}
+			out[c.Session] = running(strings.Join(d.Commands, "\n"), d.CommandCut, d.Output)
 		}
 	}
 	return out
+}
+
+// running is the session of a command still running, with what it printed so far when it pushes or opens pull
+// requests.
+func running(cmd string, cut bool, output string) session {
+	s := session{cmd: cmd, cut: cut}
+	if mk := made(Decoded{Commands: []string{cmd}, CommandCut: cut}); mk.pushes || mk.prs {
+		s.keep, s.output = true, output
+	}
+	return s
 }
 
 // artifactsOf reads a call's artifacts off its decoded input and output, with what its commands make, read once.
@@ -119,12 +133,14 @@ func artifactsOf(call, res store.Event, d Decoded, mk makes, sessions map[sessio
 		for _, p := range d.Paths {
 			add(Result{Kind: KindFile, Key: KindFile + ":" + p + "@" + once, Text: p, Event: call.ID()})
 		}
-	case d.Joined || d.Unpaired:
+	case d.Unpaired || d.Joined && d.Polls == nil:
 	case d.Chunks != nil || d.Polls != nil:
 		for _, c := range d.Chunks {
 			mk := made(Decoded{Commands: []string{c.Command}, CommandCut: c.Cut})
-			if c.Plain {
-				mk.pushes, mk.prs = false, false // no exit code shows: only a commit line, which git prints when it made it
+			if c.Plain || c.Running {
+				// no exit code shows, or the command still runs: only a commit line, which git prints when it made
+				// it; ref lines and addresses count once a result shows the command ended successfully
+				mk.pushes, mk.prs = false, false
 			}
 			for _, r := range shown(c.Output, c.OutputCut, failed || c.Failed, mk, once) {
 				add(r)
@@ -132,12 +148,22 @@ func artifactsOf(call, res store.Event, d Decoded, mk makes, sessions map[sessio
 		}
 		for _, p := range d.Polls {
 			if s, ok := sessions[sessionKey{agentOf(call), p.Session}]; ok {
-				for _, r := range shown(p.Output, p.OutputCut, failed || p.Failed, made(Decoded{Commands: []string{s.cmd}, CommandCut: s.cut}), once) {
+				mk := made(Decoded{Commands: []string{s.cmd}, CommandCut: s.cut})
+				text := p.Output // joined by the store, it shows no line: only its header, how the command ended, is read
+				if p.Running {
+					mk.pushes, mk.prs = false, false
+				} else {
+					text = s.output + "\n" + p.Output // what it printed while it ran, read now that it ended
+				}
+				for _, r := range shown(text, p.OutputCut, failed || p.Failed, mk, once) {
 					add(r)
 				}
 			}
 		}
 	default:
+		if call.Harness == "codex" && strings.ToLower(call.Tool) == "exec_command" && plainChunk(d.Output, 0).Running {
+			mk.pushes, mk.prs = false, false // it still runs: what it printed is read when a poll shows it ended
+		}
 		for _, r := range shown(d.Output, d.OutputCut, failed, mk, once) {
 			add(r)
 		}

@@ -250,7 +250,8 @@ func storeCut(call, res store.Event) bool {
 	tool := strings.ToLower(call.Tool)
 	if writers[tool] {
 		// a cut patch may name more files past the cut than its stored part does
-		return strings.HasSuffix(call.Summary, "…") && (len(Decode(call.Harness, tool, call.Summary, "").Paths) == 0 || patchRe.MatchString(call.Summary))
+		d := Decode(call.Harness, tool, call.Summary, "")
+		return strings.HasSuffix(call.Summary, "…") && (len(d.Paths) == 0 || d.Patch)
 	}
 	return strings.HasSuffix(call.Summary, "…") || strings.HasSuffix(res.Summary, "…")
 }
@@ -391,7 +392,7 @@ func (r *reader) readFile(path string, ns []need) {
 	}
 }
 
-// namesGit reports git or gh as a word of a command (not the gh of "high"), by a scan of the text.
+// namesGit reports git or gh as a word of a decoded command (not the gh of "high"), by a scan of the text.
 func namesGit(s string) bool {
 	word := func(c byte) bool {
 		return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
@@ -410,10 +411,26 @@ func namesGit(s string) bool {
 	return false
 }
 
-// polls reports a Codex call that polls a session an earlier call left running: a code-mode script's write_stdin,
-// or Codex's write_stdin tool. Its output is another command's: it names no git of its own.
+// polls reports a Codex call that polls a session an earlier call left running: a code-mode script's write_stdin
+// call, as the script's parse finds it, or Codex's write_stdin tool. Its output is another command's: it names no
+// git of its own.
 func polls(call store.Event, tool, input string) bool {
-	return call.Harness == "codex" && (tool == "write_stdin" || tool == "exec" && strings.Contains(input, "write_stdin("))
+	if call.Harness != "codex" {
+		return false
+	}
+	if tool == "write_stdin" {
+		return true
+	}
+	if tool != "exec" {
+		return false
+	}
+	calls, _, _, _ := codeCalls(input)
+	for _, c := range calls {
+		if !c.exec {
+			return true
+		}
+	}
+	return false
 }
 
 // codexCommand reports a Codex shell call whose results a session ties to others: a code-mode script, Codex's
@@ -482,14 +499,16 @@ func (r *reader) readWhole(ctx context.Context, t *thread) {
 		if writers[j.tool] {
 			continue
 		}
+		// every check reads the decoded commands, the text the shell parser sees, never the stored JSON, whose
+		// escapes (a newline before git) hide a word
+		d := Decode(j.p.call.Harness, j.tool, inputs[i], "")
 		j.poll = polls(*j.p.call, j.tool, inputs[i])
 		// a Codex call that names no git is read too: a session it left running replaces one of the same id
-		if !namesGit(inputs[i]) && !j.poll && !codexCommand(*j.p.call) {
+		if !namesGit(strings.Join(d.Commands, "\n")) && !j.poll && !codexCommand(*j.p.call) {
 			// it makes nothing this reads, whether or not its record is there
 			j.skip, j.why = true, ""
 			continue
 		}
-		d := Decode(j.p.call.Harness, j.tool, inputs[i], "")
 		j.mk = made(d)
 		if j.p.call.Harness == "codex" && j.tool == "exec" {
 			// a code-mode script's results are read each against its own command: what any one makes
@@ -535,8 +554,13 @@ func (r *reader) readWhole(ctx context.Context, t *thread) {
 			j.found = artifactsOf(call, res, d, j.mk, t.sessions)
 			agent := agentOf(call)
 			for _, p := range d.Polls {
-				if !p.Running {
-					delete(t.sessions, sessionKey{agent, p.Session}) // the process exited: its id may be reused
+				k := sessionKey{agent, p.Session}
+				switch s, ok := t.sessions[k]; {
+				case !p.Running:
+					delete(t.sessions, k) // the process exited: its id may be reused
+				case ok && s.keep:
+					s.output += "\n" + p.Output // it still runs: what it printed is read when it ends
+					t.sessions[k] = s
 				}
 			}
 			for n, sess := range yielded(call, d) {

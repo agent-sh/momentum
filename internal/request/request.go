@@ -162,28 +162,51 @@ func ParseID(id string) (time.Time, bool) {
 	return time.UnixMilli(ms), true
 }
 
-// marker is the request id a text names in a handoff's line, and the text with the pasted handoff taken out: from
-// the first id line to the end of the last, or to the end of a text the store cut (it ends with an ellipsis) when
-// only one line is left.
+// marker is the request id a text names in a handoff's own lines, and the text with the pasted handoff taken out:
+// his words before its opening line and after its closing line, `momentum request ID` on a line of its own after
+// the opening (in the store's text, whose lines are joined by spaces, the next `momentum request ID`). With no
+// closing line, a handoff the store cut runs to the cut, and in an uncut text the opening line alone is the paste.
+// A last line alone at the end of the text is a paste that ends there.
 func marker(text string) (id, rest string) {
-	locs := openRe.FindAllStringSubmatchIndex(text, -1)
-	if l := lastRe.FindStringSubmatchIndex(text); l != nil {
-		locs = append(locs, l)
-	}
-	for _, l := range locs {
-		if c := text[l[2]:l[3]]; validID(c) {
-			id = c
-			break
+	for _, o := range openRe.FindAllStringSubmatchIndex(text, -1) {
+		if id = text[o[2]:o[3]]; !validID(id) {
+			continue
 		}
+		end := o[1]
+		switch c := closing(text[o[1]:], id); {
+		case c >= 0:
+			end = o[1] + c
+		case strings.HasSuffix(text, "…"):
+			end = len(text)
+		}
+		return id, strings.TrimSpace(strings.TrimSpace(text[:o[0]]) + " " + strings.TrimSpace(text[end:]))
 	}
-	if id == "" {
-		return "", text
+	if l := lastRe.FindStringSubmatchIndex(text); l != nil && validID(text[l[2]:l[3]]) {
+		return text[l[2]:l[3]], strings.TrimSpace(text[:l[0]])
 	}
-	start, end := locs[0][0], locs[len(locs)-1][1]
-	if len(locs) == 1 && strings.HasSuffix(text, "…") {
-		end = len(text)
+	return "", text
+}
+
+// closing is the end of a handoff's closing line in the text after its opening line, -1 when there is none.
+func closing(after, id string) int {
+	line := "momentum request " + id
+	if strings.Contains(after, "\n") {
+		if l := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(line) + `[ \t\r]*$`).FindStringIndex(after); l != nil {
+			return l[1]
+		}
+		return -1
 	}
-	return id, strings.TrimSpace(strings.TrimSpace(text[:start]) + " " + strings.TrimSpace(text[end:]))
+	for k := 0; ; {
+		i := strings.Index(after[k:], line)
+		if i < 0 {
+			return -1
+		}
+		end := k + i + len(line)
+		if end == len(after) || after[end] == ' ' || after[end] == '\t' {
+			return end
+		}
+		k = end
+	}
 }
 
 func validID(id string) bool {
