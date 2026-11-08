@@ -770,7 +770,8 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 			if err != nil || len(fs) != 0 {
 				t.Fatalf("found %v, %v", signatures(fs), err)
 			}
-			// the same reads, the write saying it failed or the store's cut leaving out its path: a failure each
+			// the same reads, the write saying it failed or the store's cut leaving out its path: a failure each. A cut
+			// call's result that names its file (OpenCode's write) names another one here.
 			st = testStore(t)
 			evs = evs[:0]
 			for i, session := range []string{"s1", "s1", "s2"} {
@@ -778,7 +779,7 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 				at := t0.Add(time.Duration(i) * time.Hour)
 				in, out := strings.ReplaceAll(tc.writeIn, "@", p), strings.ReplaceAll(tc.wrote, "@", p)
 				if i == 0 {
-					in = `{"content":"` + strings.Repeat("x", 240) + `…`
+					in, out = `{"content":"`+strings.Repeat("x", 240)+`…`, strings.ReplaceAll(tc.wrote, "@", "out/y.md")
 				} else if strings.HasPrefix(out, "{") {
 					out = `{"success": false, "error": "Could not find a match"}`
 				} else {

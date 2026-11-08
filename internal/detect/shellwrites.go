@@ -15,8 +15,10 @@ import (
 const readSettle = time.Hour
 
 // writtenPaths are the files a call that did not fail wrote, as it names them: a file tool's path, or the one file a
-// shell call writes in a form the whitelist holds (shellWrite), its result's text read too. A Grok call writes none:
-// Grok is closed source, so there is no source to check its background forms and its success words against.
+// shell call writes in a form the whitelist holds (shellWrite), its result's text read too. A file tool's call the
+// store cut before its path ends, or does not hold, names its file by its result where the harness names it there
+// (resultPath). A Grok call writes none: Grok is closed source, so there is no source to check its background forms
+// and its success words against.
 func writtenPaths(harness, tool, call, result, cwd string) []string {
 	if harness == "grok" {
 		return nil
@@ -35,12 +37,51 @@ func writtenPaths(harness, tool, call, result, cwd string) []string {
 			return nil
 		}
 	}
+	p, named, absent := callField(call, pathKeys)
+	if !named && !absent {
+		p = resultPath(harness, tool, result, cwd)
+	}
 	// Hermes resolves a relative path in its terminal's directory, which a cd moves: only a whole one names its file,
 	// or one under the home, which Hermes expands itself
-	if p, _, _ := callField(call, pathKeys); p != "" && (harness != "hermes" || path.IsAbs(p) || strings.HasPrefix(p, "~/")) {
+	if p != "" && (harness != "hermes" || path.IsAbs(p) || strings.HasPrefix(p, "~/")) {
 		return []string{p}
 	}
 	return nil
+}
+
+var (
+	// opencodeWroteRe is OpenCode's write's result that names its file (2.x): its resource, relative to the session's
+	// directory for a file inside it or its project, else the whole path, to the line's end. Its 1.x result,
+	// "Wrote file successfully.", names none.
+	opencodeWroteRe = regexp.MustCompile(`^(?:Wrote|Created) file successfully: (\S.*)$`)
+	// resolvedKeys are Hermes's write_file result's field that names the whole path it wrote.
+	resolvedKeys = map[string]bool{"resolved_path": true}
+)
+
+// resultPath is the file a file tool's result names as the one it wrote, or "", read only where the store kept that
+// name whole. The caller reads only a result fileWrote reads as a write that landed.
+//   - OpenCode's write: its line (opencodeWroteRe), when the store did not cut it; a relative resource is read in the
+//     call's directory, as OpenCode resolves it, when that is a whole path.
+//   - Hermes's write_file: its resolved_path field, read up to the store's cut, as callField reads a call. Its error
+//     field comes before it, so a result that shows it shows any error too.
+func resultPath(harness, tool, result, cwd string) string {
+	switch harness + "/" + strings.ToLower(tool) {
+	case "opencode/write":
+		m := opencodeWroteRe.FindStringSubmatch(result)
+		if m == nil || strings.HasSuffix(result, "…") {
+			return ""
+		}
+		switch p := m[1]; {
+		case path.IsAbs(p):
+			return p
+		case path.IsAbs(cwd):
+			return path.Join(cwd, p)
+		}
+	case "hermes/write_file":
+		p, _, _ := callField(result, resolvedKeys)
+		return p
+	}
+	return ""
 }
 
 // patchTextRe is the field of a patch call's JSON input that holds its text, in an input the store may have cut

@@ -286,6 +286,57 @@ func TestARelativeReadClearsByItsWriteInItsCallsDirectory(t *testing.T) {
 	}
 }
 
+// OpenCode's write and Hermes's write_file put their content before their path, so the store's cut of the call often
+// leaves out the path. Such a write names its file by its result where the harness names it there: OpenCode's line (its
+// resource, relative to the call's directory, or whole), Hermes's resolved_path. A result that names no path, or one
+// the store cut before the path ends, still clears nothing.
+func TestACutWriteClearsByThePathItsResultNames(t *testing.T) {
+	const x = "/w/out/x.md"
+	cut := `{"content":"` + strings.Repeat("x", 240) + `…`
+	for _, tc := range []struct {
+		name, harness, cwd, call, wrote string
+		cleared                         bool
+	}{
+		{"opencode whole", "opencode", "/v", cut, "Created file successfully: " + x, true},
+		{"opencode relative", "opencode", "/w", cut, "Wrote file successfully: out/x.md", true},
+		{"opencode in its project", "opencode", "/w/sub", cut, "Created file successfully: ../out/x.md", true},
+		{"opencode cut inside its path", "opencode", "/w", `{"content":"x","path":"/w/ou…`, "Created file successfully: out/x.md", true},
+		{"hermes", "hermes", "/v", cut, `{"bytes_written": 1, "dirs_created": true, "verified": true, "lint": {"status": "ok", "output": ""}, "resolved_path": "` + x + `", "files_modified": ["` + x + `"]}`, true},
+		{"hermes result cut after its path", "hermes", "", `{"content":"x","path":"/w/ou…`, `{"bytes_written": 1, "dirs_created": true, "resolved_path": "` + x + `", "files_modi…`, true},
+		{"opencode 1.x names no path", "opencode", "/w", cut, "Wrote file successfully.", false},
+		{"opencode result cut", "opencode", "/w", cut, "Created file successfully: out/x.md…", false},
+		{"opencode relative in no whole directory", "opencode", "w", cut, "Created file successfully: out/x.md", false},
+		{"hermes result cut before its path", "hermes", "/w", cut, `{"bytes_written": 1, "dirs_created": true, "lint": {"status": "error", "output": "` + x + `: lin…`, false},
+		{"hermes path in a nested field", "hermes", "/w", cut, `{"bytes_written": 1, "lint": {"resolved_path": "` + x + `"}, "hint": "x…`, false},
+		{"hermes error", "hermes", "/w", cut, `{"bytes_written": 0, "dirs_created": false, "error": "Failed to write file: x", "resolved_path": "` + x + `"}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testStore(t)
+			f := fileTools{harness: tc.harness}
+			read, missing := "read", "File not found: "+x
+			if tc.harness == "hermes" {
+				read, missing = "read_file", hermesMissing(x)
+			}
+			write := map[string]string{"opencode": "write", "hermes": "write_file"}[tc.harness]
+			var evs []store.Event
+			for i, session := range []string{"s1", "s1", "s2"} {
+				at := t0.Add(time.Duration(i) * time.Hour)
+				pair := slices.Concat(f.pair(session, read, fmt.Sprintf(`{"path":%q}`, x), missing, true, at),
+					f.pair(session, write, tc.call, tc.wrote, false, at.Add(time.Minute)))
+				for k := range pair {
+					pair[k].Cwd = tc.cwd
+				}
+				evs = append(evs, pair...)
+			}
+			put(t, st, evs...)
+			fs, err := Failures{}.Detect(context.Background(), st, week())
+			if err != nil || tc.cleared && len(fs) != 0 || !tc.cleared && (len(fs) != 1 || len(fs[0].Evidence) != 3) {
+				t.Fatalf("found %v, %v, cleared %v", signatures(fs), err, tc.cleared)
+			}
+		})
+	}
+}
+
 // Each harness's read: the same path missed three times in two sessions is one finding by that path, and a miss of
 // another path beside them is not in it.
 func TestEachHarnesssMissIsKeyedByItsPath(t *testing.T) {
