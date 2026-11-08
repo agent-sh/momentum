@@ -90,13 +90,6 @@ func promptActors(t *testing.T, st *store.Store) map[string]string {
 // It returns the cursors.
 func kimiOldRule(t *testing.T, st *store.Store, src Transcripts) map[string]store.FileCursor {
 	t.Helper()
-	return kimiSavedRule(t, st, src, 0)
-}
-
-// kimiSavedRule makes every saved cursor of src look as a build under Kimi rule number rule saved it, or one
-// before the rule (no Rule in its state) for 0. It returns the cursors.
-func kimiSavedRule(t *testing.T, st *store.Store, src Transcripts, rule int) map[string]store.FileCursor {
-	t.Helper()
 	ctx := context.Background()
 	cursors, err := st.FileCursors(ctx, src.Name())
 	if err != nil {
@@ -109,9 +102,6 @@ func kimiSavedRule(t *testing.T, st *store.Store, src Transcripts, rule int) map
 			t.Fatal(err)
 		}
 		delete(state, "Rule")
-		if rule != 0 {
-			state["Rule"] = rule
-		}
 		cur.State, _ = json.Marshal(state)
 		old = append(old, store.FileWrite{Cursor: cur})
 	}
@@ -686,11 +676,12 @@ func TestKimiHookOutputIsGeneratedInput(t *testing.T) {
 	}
 }
 
-// Kimi's clients write two blocks for the model into a person's prompt text, tagged system: the image compression
-// note, a text part of its own before its image, and VS Code's editor context, at the start of his first text part
-// or, for a prompt of text only, at its end. They are generated input; the rest of the part is his. Any other system
-// block, and a known one in the middle of his words, is text he typed or pasted and stays his. A prompt the blocks
-// leave none of his words is still his turn, with empty text. The tags are built from parts so this file holds none.
+// Kimi's clients write two blocks for the model into a person's prompt, tagged system: the image compression note, a
+// text part of its own before its image, and VS Code's editor context, at the start of a list prompt's first text
+// part or at the end of a string prompt, which reaches the wire as one text part. Where they write them they are
+// generated input; the rest of the part is his. Any other system block, and a known one anywhere else, is text he
+// typed or pasted and stays his. A prompt the blocks leave none of his words is still his turn, with empty text.
+// The tags are built from parts so this file holds none.
 func TestKimiSystemBlocksAreGeneratedInput(t *testing.T) {
 	open, end := "<"+"system>", "</"+"system>"
 	text := func(s string) map[string]any { return map[string]any{"type": "text", "text": s} }
@@ -712,20 +703,29 @@ func TestKimiSystemBlocksAreGeneratedInput(t *testing.T) {
 		{"image note only", []any{note, image}, map[string]string{"marker-7f3a note": "harness harness_text"}, []string{""}},
 		{"editor context at the start of a part", []any{text(context + "marker-7f3a typed")}, split, []string{"marker-7f3a typed"}},
 		{"editor context at the end of a part", []any{text("marker-7f3a typed\n" + context)}, split, []string{"marker-7f3a typed"}},
-		{"two blocks with his words between them", []any{text(noteText + "marker-7f3a typed " + context)},
-			map[string]string{"marker-7f3a note": "harness harness_text", "marker-7f3a context": "harness harness_text",
-				"marker-7f3a typed": "owner owner_text"}, []string{"marker-7f3a typed"}},
-		{"two blocks at the start", []any{text(noteText + context + "marker-7f3a typed")},
-			map[string]string{"marker-7f3a note": "harness harness_text", "marker-7f3a context": "harness harness_text",
-				"marker-7f3a typed": "owner owner_text"}, []string{"marker-7f3a typed"}},
-		{"two blocks at the end", []any{text("marker-7f3a typed\n" + noteText + context)},
-			map[string]string{"marker-7f3a note": "harness harness_text", "marker-7f3a context": "harness harness_text",
-				"marker-7f3a typed": "owner owner_text"}, []string{"marker-7f3a typed"}},
-		// A known opening whose closing tag is on the next line is no block of a client's: they write theirs on one.
-		{"a known opening closed on the next line", []any{text("marker-7f3a typed"),
-			text(open + "Image compressed to fit model limits: marker-7f3a note\n" + end + " marker-7f3a after")},
+		// A block runs to the next closing tag: a later one on the line is his.
+		{"his words with a closing tag after an editor context", []any{text(open + "Editor context (use only if relevant to user's query): marker-7f3a context.go:12." +
+			end + "marker-7f3a typed " + end)}, split, []string{"marker-7f3a typed " + end}},
+		{"a pasted note at the end of his part", []any{text("marker-7f3a typed " + noteText)},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a note": "owner owner_text"}, []string{"marker-7f3a typed " + noteText}},
+		{"an editor context opening his second part", []any{text("marker-7f3a typed"), text(context + "marker-7f3a after")},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a context": "owner owner_text", "marker-7f3a after": "owner owner_text"},
+			[]string{"marker-7f3a typed " + strings.TrimSpace(context) + " marker-7f3a after"}},
+		{"a note opening his second part", []any{text("marker-7f3a typed"), text(noteText + " marker-7f3a after")},
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a note": "owner owner_text", "marker-7f3a after": "owner owner_text"},
-			[]string{"marker-7f3a typed " + open + "Image compressed to fit model limits: marker-7f3a note " + end + " marker-7f3a after"}},
+			[]string{"marker-7f3a typed " + noteText + " marker-7f3a after"}},
+		// A list prompt gets the editor context at its start, so one closing a part of a list is his.
+		{"an editor context closing a part of a list prompt", []any{text("marker-7f3a typed\n" + context), image},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a context": "owner owner_text"},
+			[]string{"marker-7f3a typed " + strings.TrimSpace(context)}},
+		// A string prompt is the input's one part with no meta.source: a hook's part beside it does not count.
+		{"an editor context closing a string prompt with a hook's part", []any{map[string]any{"type": "text", "text": "hook output",
+			"meta": map[string]any{"source": "user prompt submit hook"}}, text("marker-7f3a typed\n" + context)}, split, []string{"marker-7f3a typed"}},
+		// A note part whose closing tag is on the next line is no note of a client's: they write theirs on one.
+		{"a note part closed on the next line", []any{text("marker-7f3a typed"),
+			text(open + "Image compressed to fit model limits: marker-7f3a note\n" + end)},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a note": "owner owner_text"},
+			[]string{"marker-7f3a typed " + open + "Image compressed to fit model limits: marker-7f3a note " + end}},
 		{"a system block he typed or pasted", []any{text("marker-7f3a typed " + pasted)},
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a pasted": "owner owner_text"}, []string{"marker-7f3a typed " + pasted}},
 		// A paste that is a block alone is left to tacit, as on main: its rule makes a turn that opens with a tag the
@@ -767,7 +767,9 @@ func TestKimiClientNoticesAreGeneratedInput(t *testing.T) {
 		"PNG, JPEG, GIF, and WebP \u2014 convert it to PNG or JPEG and try again.]"
 	malformed := "[Image omitted: \"data:image/png;base64,marker-7f3a bad\u2026\" is not a valid data URL (its header or payload could not be parsed). " +
 		"Re-encode the image as PNG or JPEG and try again.]"
-	labels := []string{"marker-7f3a typed", "marker-7f3a a.txt", "marker-7f3a shot", "marker-7f3a bad", "marker-7f3a mine"}
+	unknownPart := "[unsupported content: {\"type\":\"marker-7f3a widget\",\"data\":[1,2]}]"
+	labels := []string{"marker-7f3a typed", "marker-7f3a a.txt", "marker-7f3a shot", "marker-7f3a bad", "marker-7f3a mine",
+		"[image expired]", "[video missing url]", "marker-7f3a widget"}
 	for _, tc := range []struct {
 		name   string
 		origin map[string]any
@@ -786,6 +788,18 @@ func TestKimiClientNoticesAreGeneratedInput(t *testing.T) {
 		{"words that look like a notice", plain, []any{text("marker-7f3a typed"), text("[Image omitted: marker-7f3a mine]")},
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a mine": "owner owner_text"},
 			[]string{"marker-7f3a typed [Image omitted: marker-7f3a mine]"}},
+		{"an image-omitted notice after his words", plain, []any{text("marker-7f3a typed " + unsupported)},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a shot": "owner owner_text"}, []string{"marker-7f3a typed " + unsupported}},
+		// Kimi's migration of an older session writes a marker part where it could not carry content over.
+		{"a migration's media markers", plain, []any{text("marker-7f3a typed"), text("[image expired]"), text("[video missing url]")},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "[image expired]": "harness harness_text", "[video missing url]": "harness harness_text"},
+			[]string{"marker-7f3a typed"}},
+		{"a migration's unsupported part", plain, []any{text("marker-7f3a typed"), text(unknownPart)},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a widget": "harness harness_text"}, []string{"marker-7f3a typed"}},
+		{"a marker after his words", plain, []any{text("marker-7f3a typed [image expired]")},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "[image expired]": "owner owner_text"}, []string{"marker-7f3a typed [image expired]"}},
+		{"an unsupported marker after his words", plain, []any{text("marker-7f3a typed " + unknownPart)},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a widget": "owner owner_text"}, []string{"marker-7f3a typed " + unknownPart}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -825,6 +839,12 @@ func TestKimiACPResourcesAreGeneratedInput(t *testing.T) {
 				"marker-7f3a link": "harness harness_text", "marker-7f3a-linked.go": "owner owner_text"},
 			[]string{"marker-7f3a typed /neutral/marker-7f3a-linked.go:3-9"}},
 		{"a resource alone", []any{resource}, map[string]string{"marker-7f3a file body": "harness harness_text"}, []string{""}},
+		{"a resource element after his words", []any{text("marker-7f3a typed <resource uri=\"file:///neutral/a.go\">marker-7f3a file body</resource>")},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a file body": "owner owner_text"},
+			[]string{"marker-7f3a typed <resource uri=\"file:///neutral/a.go\">marker-7f3a file body</resource>"}},
+		{"a resource link after his words", []any{text("marker-7f3a typed <resource_link uri=\"https://neutral.example/doc\" name=\"marker-7f3a link\" />")},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a link": "owner owner_text"},
+			[]string{"marker-7f3a typed <resource_link uri=\"https://neutral.example/doc\" name=\"marker-7f3a link\" />"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -844,20 +864,23 @@ func TestKimiACPResourcesAreGeneratedInput(t *testing.T) {
 	}
 }
 
-// A cursor saved under the rule before inline skills holds a skill's body as the owner's words: its file is read
-// again once, and the body is generated input.
-func TestKimiCursorFromBeforeInlineSkillsReadsAgain(t *testing.T) {
+// How a prompt's generated text is split from his words is no new rule: a record read before the split keeps what it
+// was stored with, and its file is not read again, since a read from the start would decide its provenance again from
+// the current metadata. New records get the new split.
+func TestKimiSplitIsNoNewRule(t *testing.T) {
 	home := t.TempDir()
 	path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed", "agents", "main", "wire.jsonl")
-	writeJSONLines(t, path, kimiRecord("turn.prompt", map[string]any{"origin": kimiSkillOrigin(map[string]any{}),
-		"input": []any{kimiSkillPart("marker-7f3a skill body"), map[string]any{"type": "text", "text": "marker-7f3a typed"}}}),
-		kimiRecord("turn.ended", map[string]any{}))
+	skilled := func(typed string) map[string]any {
+		return kimiRecord("turn.prompt", map[string]any{"origin": kimiSkillOrigin(map[string]any{}),
+			"input": []any{kimiSkillPart("marker-7f3a skill body"), map[string]any{"type": "text", "text": typed}}})
+	}
+	writeJSONLines(t, path, skilled("marker-7f3a typed"), kimiRecord("turn.ended", map[string]any{}))
 	kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a typed"}`)
 	st := openStore(t)
 	src := transcripts(home)
 	ingest(t, src, st)
-	// What the reader under rule 1 stored: the record's one event, the body and the typed words joined as the
-	// owner's, at the record's first key, under a cursor saved under rule 1.
+	// What a reader before the split stored: the record's one event, the body and the typed words joined as the
+	// owner's, at the record's first key, under a cursor of the current rule.
 	var turn store.Event
 	for _, e := range all(t, st, "transcripts") {
 		if e.Summary == "marker-7f3a typed" {
@@ -870,28 +893,32 @@ func TestKimiCursorFromBeforeInlineSkillsReadsAgain(t *testing.T) {
 	place := turn.SourceKey[:len(turn.SourceKey)-3]
 	old := turn
 	old.SourceKey, old.Summary = place+"000", "marker-7f3a skill body marker-7f3a typed"
-	cursors := kimiSavedRule(t, st, src, 1)
-	if len(cursors) != 1 {
-		t.Fatalf("cursors %d, want 1", len(cursors))
+	cursors, err := st.FileCursors(context.Background(), src.Name())
+	if err != nil || len(cursors) != 1 {
+		t.Fatalf("cursors %d %v, want 1", len(cursors), err)
 	}
 	for _, cur := range cursors {
-		saved, err := st.FileCursors(context.Background(), src.Name())
-		if err != nil {
+		var state map[string]any
+		if err := json.Unmarshal(cur.State, &state); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := st.PutFiles(context.Background(), []store.FileWrite{{Events: []store.Event{old}, Cursor: saved[cur.Path], Places: []string{place}}}); err != nil {
+		state["Rule"] = 1 // the rule the cursors before the split were saved under
+		cur.State, _ = json.Marshal(state)
+		if _, _, err := st.PutFiles(context.Background(), []store.FileWrite{{Events: []store.Event{old}, Cursor: cur, Places: []string{place}}}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if got := promptActors(t, st); !maps.Equal(got, map[string]string{"marker-7f3a skill body marker-7f3a typed": "owner owner_text"}) {
-		t.Fatalf("the old reading stored as %v", got)
+	appendJSONLines(t, path, skilled("marker-7f3a later"), kimiRecord("turn.ended", map[string]any{}))
+	r := ingest(t, src, st)
+	for _, n := range r.Notes {
+		if strings.Contains(n, "read again from the start") {
+			t.Fatalf("a record read before the split was read again: %q", r.Notes)
+		}
 	}
-	if r := ingest(t, src, st); !slices.Contains(r.Notes, "files read again from the start (replaced, cut, rewritten or read under an older rule): 1") {
-		t.Fatalf("a cursor from before inline skills was not read again: %q", r.Notes)
-	}
-	want := map[string]string{"marker-7f3a skill body": "harness harness_text", "marker-7f3a typed": "owner owner_text"}
+	want := map[string]string{"marker-7f3a skill body marker-7f3a typed": "owner owner_text", "marker-7f3a skill body": "harness harness_text",
+		"marker-7f3a later": "owner owner_text"}
 	if got := promptActors(t, st); !maps.Equal(got, want) {
-		t.Fatalf("prompt stored as %v, want %v", got, want)
+		t.Fatalf("prompts stored as %v, want %v", got, want)
 	}
 }
 
