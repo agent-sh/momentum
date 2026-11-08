@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -80,12 +81,15 @@ type nativeState struct {
 	dir  string
 	wire string
 	read bool
+	// sources counts the prompt text parts read with a meta.source Kimi is not known to write (kimiInput), until the
+	// reader takes them into its tally.
+	sources int
 }
 
 // kimiRule is the version of the Kimi attribution rule. A cursor saved under an older one holds owner turns
-// credited by a prompt's origin alone, a `kimi -p` run's among them (before 1), or text Kimi generated into a
-// prompt, an inline skill's body or a hook's output, as the owner's words (before 2): its file is read again from
-// its start, once, and each record holds what the new reading credits (PutFiles).
+// credited by a prompt's origin alone, a `kimi -p` run's among them (before 1), or text generated into a prompt
+// (an inline skill's body, a hook's output, a client's system block) as the owner's words (before 2): its file is
+// read again from its start, once, and each record holds what the new reading credits (PutFiles).
 const kimiRule = 2
 
 // kimiStale reports a Kimi cursor saved under an older rule. A compressed file's final cursor keeps no state, so
@@ -285,6 +289,12 @@ func (s Transcripts) readNativeJob(ctx context.Context, j *job, t *tally, add fu
 			evs = state.grok(record)
 		} else {
 			evs = state.kimi(record)
+			if state.sources > 0 {
+				t.Lock()
+				t.sources += state.sources
+				t.Unlock()
+				state.sources = 0
+			}
 		}
 		next := offset + int64(len(line))
 		for index, e := range evs {
@@ -534,7 +544,8 @@ func (s *nativeState) kimi(o map[string]any) []evidence.Event {
 		}
 		// The text parts Kimi generated into a prompt (an inline skill's body, a hook's output) are generated input,
 		// as a slash command's activation is. Only the rest of the input is the prompt's words (kimiInput).
-		generated, words := kimiInput(o["input"], origin)
+		generated, words, unknown := kimiInput(o["input"], origin)
+		s.sources += unknown
 		prior := s.Prior
 		out := s.user("kimi", generated, false, false, at, input)
 		s.Prior = prior
@@ -583,20 +594,31 @@ func (s *nativeState) kimi(o map[string]any) []evidence.Event {
 	return nil
 }
 
-// kimiSkillSource is the meta.source Kimi gives the text part a skill's rendered body takes in a prompt.
-const kimiSkillSource = "skill activation"
+// The meta.source values Kimi gives the text parts it generates into a prompt: a skill's rendered body and a
+// UserPromptSubmit hook's output.
+const (
+	kimiSkillSource = "skill activation"
+	kimiHookSource  = "user prompt submit hook"
+)
 
-// kimiInput splits a prompt's input into the text Kimi generated into it and the rest, the prompt's words. Kimi
-// marks each text part of a prompt that does not come from the person with a meta.source: a skill's rendered body
-// ("skill activation") and a UserPromptSubmit hook's output ("user prompt submit hook"). Its clients send the
-// person's text with none. So a text part with any meta.source is generated. A wire from before Kimi marked skill
-// parts holds, in a user-origin prompt with no part marked "skill activation", one leading text part with no
-// meta.source per activation its origin.skillActivations bundles: Kimi reads those as the skill's, and so does
-// this. Only text counts, as in nativeText.
-func kimiInput(input any, origin map[string]any) (generated, words string) {
+// kimiSystem is a block a Kimi client writes into a prompt's text for the model: the TUI's (and the web and ACP
+// servers') image compression note, as a text part of its own, and VS Code's editor context, at the start of the
+// person's first text part. The tag is built from parts so this file holds none.
+var kimiSystem = regexp.MustCompile(`(?s)<` + `system>.*?</` + `system>`)
+
+// kimiInput splits a prompt's input into the text Kimi generated into it and the rest, the prompt's words. Three
+// things are generated: a text part with any meta.source (Kimi marks a skill's rendered body and a hook's output
+// so, and its clients send the person's text with none); on a wire from before Kimi marked skill parts, in a
+// user-origin prompt with no part marked "skill activation", one leading text part with no meta.source per
+// activation its origin.skillActivations bundles, which Kimi reads as the skill's; and a system block in any other
+// text part (kimiSystem). The notices a client writes with no tag (the web server's attached-file notice, the
+// "[Image omitted: ...]" one for an image the model cannot take) cannot be told from his words and stay in them.
+// unknown counts the parts whose meta.source is not one Kimi is known to write; they are generated all the same.
+// Only text counts, as in nativeText.
+func kimiInput(input any, origin map[string]any) (generated, words string, unknown int) {
 	parts, ok := input.([]any)
 	if !ok {
-		return "", nativeText(input)
+		parts = []any{map[string]any{"type": "text", "text": nativeText(input)}}
 	}
 	skill := func(b any) bool {
 		p := object(b)
@@ -609,19 +631,28 @@ func kimiInput(input any, origin map[string]any) (generated, words string) {
 	var gen, own []any
 	for _, b := range parts {
 		p := object(b)
-		_, sourced := object(p["meta"])["source"]
+		source, sourced := object(p["meta"])["source"]
 		text := str(p, "type") == "text"
 		switch {
 		case text && sourced:
+			if source != kimiSkillSource && source != kimiHookSource {
+				unknown++
+			}
 			gen = append(gen, b)
 		case text && bundled > 0:
 			bundled--
 			gen = append(gen, b)
+		case text:
+			rest := kimiSystem.ReplaceAllStringFunc(str(p, "text"), func(block string) string {
+				gen = append(gen, map[string]any{"type": "text", "text": block})
+				return "\n"
+			})
+			own = append(own, map[string]any{"type": "text", "text": rest})
 		default:
 			own = append(own, b)
 		}
 	}
-	return nativeText(gen), nativeText(own)
+	return nativeText(gen), nativeText(own), unknown
 }
 
 // kimiProvenance reads whether a person's client ever prompted the session. Kimi's clients (its TUI, web UI and
