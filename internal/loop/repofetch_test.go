@@ -437,16 +437,19 @@ func TestARemoteCallEndsAtItsDeadline(t *testing.T) {
 			} else {
 				_, err = fetchGit(ctx, mirrorCall{mirror: mirror}, "ls-remote", url, "HEAD")
 			}
-			if name == "https fetch" && (err == nil || !strings.Contains(err.Error(), "the caller's deadline passed")) {
-				// the call ended before its deadline: the probe, run only then, says whether Git can make one here
+			took := time.Since(start)
+			if took > bound {
+				t.Fatalf("the call returned %s after its %s deadline", took.Round(time.Second), deadline)
+			}
+			atDeadline := err != nil && strings.Contains(err.Error(), "the caller's deadline passed")
+			if name == "https fetch" && !atDeadline {
+				// the error names no deadline: the call ended on its own, or its deadline was misnamed; the probe, run
+				// only then, says whether Git can make an https call here
 				if why := noHTTPS(t); why != "" {
 					t.Skip(why)
 				}
 			}
-			if took := time.Since(start); took > bound {
-				t.Fatalf("the call returned %s after its %s deadline", took.Round(time.Second), deadline)
-			}
-			if err == nil || !strings.Contains(err.Error(), "the caller's deadline passed") {
+			if !atDeadline {
 				t.Fatalf("the error does not say which deadline ended it: %v", err)
 			}
 			if name == "an ssh that ignores SIGTERM" {
