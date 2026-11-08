@@ -181,7 +181,7 @@ type Sandbox struct {
 	Path              []string
 	GoRoot, GoModules string
 	Timeout           time.Duration
-	Gate              func(context.Context) error
+	Gate              func(context.Context) error // waits for room for a test; an error is no room now, a hold
 }
 
 const DefaultTestTimeout = 20 * time.Minute
@@ -211,7 +211,8 @@ func (s Sandbox) spec(dir, scratch string, words, extra []string) (sandbox.Spec,
 func (s Sandbox) Run(ctx context.Context, dir string, words []string, extra []string) (outcome Outcome, runErr error) {
 	if s.Gate != nil {
 		if err := s.Gate(ctx); err != nil {
-			return Outcome{}, err
+			// a machine with no room for the test now is a hold, not a failure of the check: the next pass checks again
+			return Outcome{}, &shipHold{err: err}
 		}
 	}
 	base := firstOf(s.Scratch, filepath.Dir(dir))

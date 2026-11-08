@@ -271,7 +271,7 @@ func TestBuildPreparationFailuresUseStageKeyAndStopRule(t *testing.T) {
 		t.Fatalf("the preparation failures: %+v %v", runs, err)
 	}
 	done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
-	if err != nil || len(done) != 1 || !strings.Contains(done[0].Skipped, "stopped: its last two build runs failed the same way: build prepare)") {
+	if err != nil || len(done) != 1 || !strings.Contains(done[0].Skipped, "stopped: two of its build runs failed the same way: build prepare)") {
 		t.Fatalf("two preparation failures did not stop the case: %+v %v", done, err)
 	}
 	if runs, err = r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID}); err != nil || len(runs) != 2 {

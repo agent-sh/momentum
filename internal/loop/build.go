@@ -394,9 +394,7 @@ func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Re
 	inv.Binds, inv.Env = append(inv.Binds, binds...), env
 	res, err := r.Agent.RunOrFallback(ctx, inv)
 	res.InputSummary = manifest.Summary()
-	if errors.Is(err, ErrNoBedrock) {
-		// no Bedrock route (the broker's env file cannot be read, its relay cannot listen): the broker's, which the
-		// stop rule does not count, whatever a build would do
+	if brokerOutage(res, err) {
 		return stageFailure(res, "broker", err)
 	}
 	if err != nil {
@@ -646,9 +644,9 @@ func hostFailure(run store.LoopRun) bool {
 	return text != "" && !strings.HasPrefix(text[len(run.Failure)+2:], "refused")
 }
 
-// lastBuildRefusal is why the host refused the case's newest build that it answers for (buildSpan) for its own
-// output, for the next build's inputs (refusal.md), reading past the builds the host failed (hostFailure), or ""
-// when that build was not refused for its own output.
+// lastBuildRefusal is why the host refused the case's newest build refused for its own output that the next build
+// answers for (buildSpan), for the next build's inputs (refusal.md), reading past the builds that left no refusal of
+// their output (the host's failures, hostFailure, and agent runs that ended without output), or "" when there is none.
 func (r *Runner) lastBuildRefusal(ctx context.Context, c store.Case) (string, error) {
 	// only runs that ran and ended on their own: a reservation the budgets refused, or a run the host ended, says
 	// nothing of a build's output
@@ -661,20 +659,27 @@ func (r *Runner) lastBuildRefusal(ctx context.Context, c store.Case) (string, er
 		return "", err
 	}
 	for _, run := range span { // newest first
-		if hostFailure(run) {
-			continue // the host failed it: it says nothing of what the build wrote
+		if hostFailure(run) || run.Status != store.RunFailed || !slices.Contains(refusalKeys, run.Failure) {
+			continue // no refusal of its output: the host's failure, or an agent run that left none (turns, a timeout)
 		}
-		text := stageText(run)
-		if run.Status != store.RunFailed || !slices.Contains(refusalKeys, run.Failure) || text == "" {
+		text := refusalText(run)
+		if text == "" {
 			return "", nil
 		}
-		for _, tail := range []string{" (relay: ", " (the relay refused ", " (untrusted harness diagnostics"} {
-			if i := strings.Index(text, tail); i >= 0 {
-				text = text[:i]
-			}
-		}
 		return "# Why the host refused this case's last build\n\nRun " + run.ID + " failed at " + run.Failure + ":\n\n" +
-			strings.TrimSpace(text) + "\n\nFix that cause in this build.\n", nil
+			text + "\n\nFix that cause in this build.\n", nil
 	}
 	return "", nil
+}
+
+// refusalText is a refusal's cleaned text from its stage on, without the relay's accounting or the harness's claims
+// the summary adds after it, or "" when its summary holds none.
+func refusalText(run store.LoopRun) string {
+	text := stageText(run)
+	for _, tail := range []string{" (relay: ", " (the relay refused ", " (untrusted harness diagnostics"} {
+		if i := strings.Index(text, tail); i >= 0 {
+			text = text[:i]
+		}
+	}
+	return strings.TrimSpace(text)
 }

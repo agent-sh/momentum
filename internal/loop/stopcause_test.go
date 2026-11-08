@@ -87,7 +87,9 @@ esac`)
 	}
 	// the third build runs, and is refused for the first's cause, with another window in its text
 	build(unreadable, `"a month"`)
-	if d := pass(); d.Run.ID != "" || !strings.Contains(d.Skipped, "stopped: two of its build runs were refused for one cause: build propose: "+unreadable) {
+	// the stop names the newest refusal as it was given, the signature its masked cause
+	newest := `build propose: refused: invalid measurement window "a month": give whole weeks, such as 7d or 14d`
+	if d := pass(); d.Run.ID != "" || !strings.Contains(d.Skipped, "stopped: two of its build runs were refused for one cause: "+newest) {
 		t.Fatalf("two refusals for one cause did not stop the case: %+v", d)
 	}
 	cs, err := st.Cases(ctx, store.CaseFilter{Family: store.HealthFamily})
@@ -95,7 +97,7 @@ esac`)
 		t.Fatalf("the stop's component-health case: %+v %v", cs, err)
 	}
 	sig := regexp.MustCompile(`^component-health/v1:loop:build:build-propose:refused-invalid-measurement-window-q-give-whole-weeks-such-as-h-or-h~[0-9a-f]{8}$`)
-	if !sig.MatchString(cs[0].Signatures[0]) || !strings.HasPrefix(cs[0].Title, "The loop fails the same way twice: build propose: refused: invalid measurement window Q") || cs[0].Evidence != 2 {
+	if !sig.MatchString(cs[0].Signatures[0]) || !strings.HasPrefix(cs[0].Title, `The loop fails the same way twice: build propose: refused: invalid measurement window "a month"`) || cs[0].Evidence != 2 {
 		t.Fatalf("the stop's case does not name its cause: %q %v %d", cs[0].Title, cs[0].Signatures, cs[0].Evidence)
 	}
 	if held, err := StoppedOn(ctx, st, cs[0]); err != nil || len(held) != 1 || held[0] != c.ID {
@@ -160,7 +162,7 @@ func TestAStoreFromBeforeCausesStopsOnNoOldRefusal(t *testing.T) {
 		t.Fatalf("an old refusal and a new one stopped their case: %s", why)
 	}
 	put(st, mixed, "mixed-3", "build propose", cause, time.Minute)
-	if why := stopped(mixed); why != "two of its build runs were refused for one cause: build propose: "+cause {
+	if why := stopped(mixed); why != "two of its build runs were refused for one cause: build propose: refused: the same text" {
 		t.Fatalf("two new refusals for one cause: %q", why)
 	}
 	put(st, outage, "outage-2", "build propose", hostCause, 2*time.Minute)
@@ -168,10 +170,10 @@ func TestAStoreFromBeforeCausesStopsOnNoOldRefusal(t *testing.T) {
 		t.Fatalf("an old refusal and a new host error stopped their case: %s", why)
 	}
 	put(st, outage, "outage-3", "build propose", hostCause, time.Minute)
-	if why := stopped(outage); why != "its last two build runs failed the same way: build propose" {
+	if why := stopped(outage); why != "two of its build runs failed the same way: build propose" {
 		t.Fatalf("two new host errors at a refusal stage: %q", why)
 	}
-	if why := stopped(host); why != "its last two build runs failed the same way: build prepare" {
+	if why := stopped(host); why != "two of its build runs failed the same way: build prepare" {
 		t.Fatalf("two old host-stage failures: %q", why)
 	}
 }
@@ -311,7 +313,7 @@ func TestHostErrorsAtARefusalStageStopOnTheStage(t *testing.T) {
 		if refusal, err := r.lastBuildRefusal(ctx, step.c); err != nil || refusal != "" {
 			t.Fatalf("%s: a host error at build propose reached the next build: %q %v", step.c.ID, refusal, err)
 		}
-		if why, err := r.stopped(ctx, step.c, false); err != nil || why != "its last two build runs failed the same way: build propose" {
+		if why, err := r.stopped(ctx, step.c, false); err != nil || why != "two of its build runs failed the same way: build propose" {
 			t.Fatalf("%s: two host errors at build propose: %q %v", step.c.ID, why, err)
 		}
 		base = base.Add(3 * time.Minute)
@@ -447,7 +449,7 @@ func TestABuildThatNeverStartsStopsOnItsStage(t *testing.T) {
 		}
 	}
 	done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
-	if err != nil || len(done) != 1 || done[0].Run.ID != "" || !strings.Contains(done[0].Skipped, "stopped: its last two build runs failed the same way: build toolchains)") {
+	if err != nil || len(done) != 1 || done[0].Run.ID != "" || !strings.Contains(done[0].Skipped, "stopped: two of its build runs failed the same way: build toolchains)") {
 		t.Fatalf("two builds that never started did not stop the case: %+v %v", done, err)
 	}
 	cs, err := r.Store.Cases(ctx, store.CaseFilter{Family: store.HealthFamily})
@@ -531,6 +533,18 @@ func TestARefusalStopsOnlyOnOneItsBuildAnswersFor(t *testing.T) {
 	if why := stopped(replaced); why == "" {
 		t.Fatal("two refusals for one cause of the new package did not stop the case")
 	}
+	// an investigation and a review between two refusals of one package end nothing: the span is the builds'
+	reviewed := openCase(t, st, "failures", "reviewed", 1)
+	putBuild(t, st, reviewed, "r1", StepBuild, store.RunFailed, "build check", cause, text(1), base)
+	putBuild(t, st, reviewed, "r2", StepInvestigate, store.RunTurns, "turns", "", "turns", base.Add(10*time.Minute))
+	putBuild(t, st, reviewed, "r3", StepReview, store.RunOK, "", "", "two findings", base.Add(20*time.Minute))
+	if refusal := md(reviewed); !strings.Contains(refusal, "Run r1 failed at build check") {
+		t.Fatalf("an investigation or a review hid the refusal before it: %q", refusal)
+	}
+	putBuild(t, st, reviewed, "r4", StepBuild, store.RunFailed, "build check", cause, text(2), base.Add(30*time.Minute))
+	if why := stopped(reviewed); why == "" {
+		t.Fatal("an investigation and a review between two refusals for one cause ended the span")
+	}
 }
 
 // A host error between two refusals hides neither: the next build reads past it to the refusal before it, as past a
@@ -606,7 +620,7 @@ func TestBuildsThatNeverStartedAreDatedByTheirEnd(t *testing.T) {
 	if at, err := st.ResumedAt(ctx, late.ID); err != nil || at.IsZero() {
 		t.Fatalf("the late stop did not resume its case: %v %v", at, err)
 	}
-	if why, err := r.stopped(ctx, after, false); err != nil || why != "its last two build runs failed the same way: build toolchains" {
+	if why, err := r.stopped(ctx, after, false); err != nil || why != "two of its build runs failed the same way: build toolchains" {
 		t.Fatalf("two builds that never started, both after the fix: %q %v", why, err)
 	}
 	if back, err := st.CaseByID(ctx, h.ID); err != nil || back.Status != store.CaseOpen {
@@ -640,5 +654,128 @@ func TestABuildWithNoBedrockRouteIsTheBrokers(t *testing.T) {
 	}
 	if cs, err := r.Store.Cases(ctx, store.CaseFilter{Family: store.HealthFamily}); err != nil || len(cs) != 0 {
 		t.Fatalf("builds with no Bedrock route filed a stop: %+v %v", cs, err)
+	}
+}
+
+// A build that left no refusal of its output (an agent run that ran out of turns or time, exited, wrote no report,
+// met the model's safeguards, or whose summary the cleaner could not clean) hides nothing: the next build reads past
+// it to the refusal before it, so a build that repeats that cause read it, and the repeat stops the case.
+func TestARunWithNoOutputDoesNotHideTheRefusalBeforeIt(t *testing.T) {
+	ctx := context.Background()
+	refusal := "refused: the test passes without the change too (exit 0 on the base with the test's files): it does not discriminate the change"
+	for _, mid := range []struct{ status, failure string }{
+		{store.RunTimeout, "timeout"}, {store.RunTurns, "turns"}, {store.RunFailed, "exit 1"}, {store.RunFailed, "report"},
+		{store.RunFailed, "stream"}, {store.RunFailed, "the model's safeguards"}, {store.RunFailed, "scrub"},
+	} {
+		st := testStore(t)
+		r := localRunner(t, st)
+		c := openCase(t, st, "failures", "no-output", 1)
+		base := time.Now().Add(-time.Hour)
+		putBuild(t, st, c, "a1", StepBuild, store.RunFailed, "build check", refusalCause(refusal), "build check: "+refusal, base)
+		putBuild(t, st, c, "a2", StepBuild, mid.status, mid.failure, "", "(summary withheld: the cleaner failed)", base.Add(10*time.Minute))
+		if md, err := r.lastBuildRefusal(ctx, c); err != nil || !strings.Contains(md, "Run a1 failed at build check") {
+			t.Fatalf("%s: the build after it lost the refusal before it: %q %v", mid.failure, md, err)
+		}
+		putBuild(t, st, c, "a3", StepBuild, store.RunFailed, "build check", refusalCause(refusal), "build check: "+refusal, base.Add(20*time.Minute))
+		if why, err := r.stopped(ctx, c, true); err != nil || why == "" {
+			t.Fatalf("%s: a refusal its build read did not stop the case: %q %v", mid.failure, why, err)
+		}
+	}
+}
+
+// A host error stops on any earlier one at its stage that its build answered for, not only on the one just before
+// it: host errors that take turns between two stages stop, and so do builds that never started, taking turns.
+func TestHostErrorsThatTakeTurnsStop(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	base := time.Now().Add(-time.Hour)
+	turns := openCase(t, st, "failures", "turns", 1)
+	for i, key := range []string{"build check", "build propose"} {
+		putBuild(t, st, turns, fmt.Sprint("h", i), StepBuild, store.RunFailed, key, hostCause, key+": a host error", base.Add(time.Duration(i)*time.Minute))
+	}
+	if why, err := r.stopped(ctx, turns, true); err != nil || why != "" {
+		t.Fatalf("two host errors at two stages: %q %v", why, err)
+	}
+	putBuild(t, st, turns, "h2", StepBuild, store.RunFailed, "build check", hostCause, "build check: another host error", base.Add(2*time.Minute))
+	if why, err := r.stopped(ctx, turns, true); err != nil || why != "two of its build runs failed the same way: build check" {
+		t.Fatalf("host errors that take turns: %q %v", why, err)
+	}
+	never := openCase(t, st, "failures", "never", 1)
+	for i, key := range []string{"build inputs", "build toolchains", "build inputs"} {
+		if err := st.PutLoopRun(ctx, store.LoopRun{ID: fmt.Sprint("n", i), Case: never.ID, Family: never.Family, Step: StepBuild,
+			Ended: base.Add(time.Duration(i) * time.Minute), Status: store.RunFailed, Failure: key, Summary: key + ": gone"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if why, err := r.stopped(ctx, never, true); err != nil || why != "two of its build runs failed the same way: build inputs" {
+		t.Fatalf("builds that never started, taking turns: %q %v", why, err)
+	}
+}
+
+// A machine with no room for the test at build check is a hold, not a failure of the check: the build is held for the
+// pass with no run kept, and two such passes stop nothing.
+func TestABusyMachineAtTheCheckIsAHold(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "busy", 1)
+	busy := Sandbox{Gate: func(context.Context) error { return errors.New("the machine has no room for the test now: load 30") }}
+	for i := 0; i < 2; i++ {
+		_, err := busy.Run(ctx, t.TempDir(), []string{"go", "test", "./..."}, nil)
+		if !held(err) {
+			t.Fatalf("a busy machine is no hold: %v", err)
+		}
+		run, why := r.reserve(ctx, c.Family, c.ID, StepBuild)
+		if why != "" {
+			t.Fatal(why)
+		}
+		res, serr := stageFailure(Result{Started: true, CostKnown: true, Status: store.RunOK}, "build check", err)
+		if done := r.completeStep(ctx, c, run, res, serr); done.Run.ID != "" || !strings.Contains(done.Skipped, "no room for the test") {
+			t.Fatalf("a busy check became a failed build: %+v", done)
+		}
+	}
+	if runs, err := st.LoopRuns(ctx, store.RunFilter{Case: c.ID}); err != nil || len(runs) != 0 {
+		t.Fatalf("held checks kept runs: %+v %v", runs, err)
+	}
+	if why, err := r.stopped(ctx, c, true); err != nil || why != "" {
+		t.Fatalf("two busy checks stopped the case: %q %v", why, err)
+	}
+}
+
+// Only a broker that cannot be reached is the broker's: an env file that says the wrong things is the run's own
+// failure, which counts, so two builds on it stop the case; and a fallback that found no route after its first attempt
+// ran and was charged is no outage either.
+func TestOnlyAnUnreachableBrokerIsTheBrokers(t *testing.T) {
+	fakeManager(t) // host ordering only: the run ends before its harness or a unit starts
+	ctx := context.Background()
+	r, c := inputRunner(t)
+	f := newRepo(t, nil)
+	r.Ship = shipWithSandbox(r.Store, f, Sandbox{})
+	r.Ship.Dir = r.Dir
+	r.Inputs.ReadDirs = []string{f.main}
+	wrong := filepath.Join(t.TempDir(), "bedrock.env")
+	write(t, wrong, "CLAUDE_CODE_USE_BEDROCK=\"0\"\n")
+	r.Agent = Agent{Runner: []string{script(t, t.TempDir(), "harness", "exit 9")}, Model: "global.anthropic.claude-opus-5-5", Bedrock: &Bedrock{File: wrong}}
+	mechanism, fix := "one cause", "one fix"
+	var err error
+	if c, err = r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	setCaseRepo(t, r.Store, c, "main")
+	for i := 0; i < 2; i++ {
+		done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
+		if err != nil || len(done) != 1 || done[0].Run.Failure != "build run" {
+			t.Fatalf("build %d on a wrong route: %+v %v", i, done, err)
+		}
+	}
+	done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
+	if err != nil || len(done) != 1 || done[0].Run.ID != "" || !strings.Contains(done[0].Skipped, "stopped: two of its build runs failed the same way: build run") {
+		t.Fatalf("two builds on a wrong route did not stop the case: %+v %v", done, err)
+	}
+	unread := &unreachable{fmt.Errorf("%w: the broker's env file cannot be read", ErrNoBedrock)}
+	if !brokerOutage(Result{}, unread) || brokerOutage(Result{Started: true, USD: 0.5}, unread) ||
+		brokerOutage(Result{}, fmt.Errorf("%w: every headless run is on Bedrock", ErrNoBedrock)) {
+		t.Fatal("the broker's outage is told wrong")
 	}
 }

@@ -41,6 +41,22 @@ type Bedrock struct {
 // ErrNoBedrock is a run that did not start because it had no Bedrock route.
 var ErrNoBedrock = errors.New("no Bedrock route")
 
+// unreachable is a run with no Bedrock route because the broker cannot be reached now: its env file cannot be read
+// (the broker rewrites it when it restarts), or the run's relay cannot listen. Unlike a file that says the wrong
+// things, or no route configured at all, it is the broker's outage.
+type unreachable struct{ err error }
+
+func (e *unreachable) Error() string { return e.err.Error() }
+func (e *unreachable) Unwrap() error { return e.err }
+
+// brokerOutage says a run never started because the broker could not be reached (unreachable): the stop rule counts
+// it as the broker's (broker), as a run the broker never answered. A route that is wrong or missing, and a fallback
+// that found no route after its first attempt ran and was charged, are the run's own failure.
+func brokerOutage(res Result, err error) bool {
+	var outage *unreachable
+	return errors.As(err, &outage) && !res.Started
+}
+
 // bedrockKeys are the variables a run takes from the broker's file: the switch to Bedrock, the broker's URL, the
 // broker's own auth, and the model pins.
 var bedrockKeys = []string{"CLAUDE_CODE_USE_BEDROCK", "ANTHROPIC_BEDROCK_BASE_URL", "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
@@ -62,7 +78,7 @@ func (b *Bedrock) path() string {
 func (b *Bedrock) read() (map[string]string, error) {
 	f, err := os.Open(b.path())
 	if err != nil {
-		return nil, fmt.Errorf("%w: the broker's env file %s cannot be read (%s)", ErrNoBedrock, b.path(), errors.Unwrap(err))
+		return nil, &unreachable{fmt.Errorf("%w: the broker's env file %s cannot be read (%s)", ErrNoBedrock, b.path(), errors.Unwrap(err))}
 	}
 	defer f.Close()
 	vars := map[string]string{}
@@ -81,7 +97,7 @@ func (b *Bedrock) read() (map[string]string, error) {
 		vars[k] = v
 	}
 	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("%w: the broker's env file cannot be read", ErrNoBedrock)
+		return nil, &unreachable{fmt.Errorf("%w: the broker's env file cannot be read", ErrNoBedrock)}
 	}
 	switch {
 	case vars["CLAUDE_CODE_USE_BEDROCK"] != "1":
@@ -177,7 +193,7 @@ func (b *Bedrock) open(socket string, budget float64, turns ...int) (*relay, []s
 	}
 	ln, err := listenRelaySocket(socket)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: the run's relay cannot listen: %v", ErrNoBedrock, err)
+		return nil, nil, &unreachable{fmt.Errorf("%w: the run's relay cannot listen: %v", ErrNoBedrock, err)}
 	}
 	if err := os.Chmod(socket, 0o600); err != nil {
 		ln.Close()

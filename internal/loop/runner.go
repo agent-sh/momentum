@@ -1084,13 +1084,15 @@ func stopRuns(ctx context.Context, st *store.Store, c store.Case) (runs []store.
 	if a.Status == store.RunOK || a.Failure == "" {
 		return nil, false, nil
 	}
-	if refusalStop(a) {
-		if a.Cause == "" {
-			return nil, false, nil
+	if refusalStop(a) || a.Step == StepBuild && hostFailure(a) {
+		if a.Cause == "" && slices.Contains(refusalKeys, a.Failure) {
+			return nil, false, nil // a refusal-stage run kept before causes were: its cause is unknown
 		}
+		// the newest build stops on an earlier one its build answered for that failed at its stage for its cause: a
+		// refusal's, or the host's (hostCause, or none at a host stage), whatever came between
 		span, err := buildSpan(ctx, st, c, runs)
-		if err != nil || len(span) == 0 || span[0].ID != a.ID {
-			return nil, false, err // a refusal of a package the case builds no more
+		if err != nil || len(span) == 0 {
+			return nil, false, err
 		}
 		for _, e := range span[1:] {
 			if e.Failure == a.Failure && e.Cause == a.Cause {
@@ -1100,7 +1102,7 @@ func stopRuns(ctx context.Context, st *store.Store, c store.Case) (runs []store.
 		return nil, false, nil
 	}
 	b := runs[1]
-	if b.Status == store.RunOK || a.Failure != b.Failure || a.Step != b.Step || a.Cause != b.Cause {
+	if b.Status == store.RunOK || a.Failure != b.Failure || a.Step != b.Step {
 		return nil, false, nil
 	}
 	return runs[:2], true, nil
@@ -1139,12 +1141,17 @@ func stopSignature(run store.LoopRun) string {
 	return sig
 }
 
-// stopFailure is how a stop's runs failed, as its why and its case's title say it: the failure, and a refusal's cause.
-func stopFailure(run store.LoopRun) string {
-	if refusalStop(run) {
-		return run.Failure + ": " + run.Cause
+// stopText is how a stop's run failed, as the stop's why, its case's title and its evidence say it: a refusal's own
+// cleaned text from its stage on, on one line, or its failure. The masked cause serves the signature and the match
+// only.
+func stopText(run store.LoopRun) string {
+	if !refusalStop(run) {
+		return run.Failure
 	}
-	return run.Failure
+	if text := strings.Join(strings.Fields(refusalText(run)), " "); text != "" {
+		return text
+	}
+	return run.Failure + ": " + run.Cause
 }
 
 // StoppedOn lists the cases the stop rule holds now on one of a component-health case's signatures: the working
@@ -1180,9 +1187,12 @@ func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, e
 		return "", err
 	}
 	a, sig := runs[0], stopSignature(runs[0])
-	why := fmt.Sprintf("its last two %s runs failed the same way: %s", a.Step, stopFailure(a))
-	if refusalStop(a) {
-		why = fmt.Sprintf("two of its %s runs were refused for one cause: %s", a.Step, stopFailure(a))
+	why := fmt.Sprintf("its last two %s runs failed the same way: %s", a.Step, stopText(a))
+	switch {
+	case refusalStop(a):
+		why = fmt.Sprintf("two of its %s runs were refused for one cause: %s", a.Step, stopText(a))
+	case a.Step == StepBuild:
+		why = fmt.Sprintf("two of its %s runs failed the same way: %s", a.Step, stopText(a))
 	}
 	// a stop whose older run began before its component-health case closed as fixed came too late for the close:
 	// the case resumes as the close would have resumed it
@@ -1196,7 +1206,7 @@ func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, e
 		return "", err
 	}
 	f := store.Finding{Family: store.HealthFamily, Signature: sig,
-		Title: plainClip("The loop fails the same way twice: "+stopFailure(a), store.TitleMax)}
+		Title: plainClip("The loop fails the same way twice: "+stopText(a), store.TitleMax)}
 	for _, run := range runs {
 		ref := "file:" + filepath.Join(r.Dir, "runs", run.ID)
 		if run.Dir != "" {
@@ -1205,7 +1215,7 @@ func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, e
 				ref = "file:" + filepath.Join(HostDir(run.Dir), "transcript.fallback.jsonl")
 			}
 		}
-		f.Evidence = append(f.Evidence, store.Evidence{Ref: ref, At: runAt(run), Kind: "loop-run", Summary: run.Step + " " + run.Case + ": " + stopFailure(run)})
+		f.Evidence = append(f.Evidence, store.Evidence{Ref: ref, At: runAt(run), Kind: "loop-run", Summary: run.Step + " " + run.Case + ": " + stopText(run)})
 	}
 	if _, _, err := r.Store.ObserveCase(ctx, f, "loop"); err != nil {
 		return "", err
