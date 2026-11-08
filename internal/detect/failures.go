@@ -2,6 +2,8 @@ package detect
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"path"
 	"regexp"
@@ -11,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
 	"github.com/agent-sh/momentum/internal/toolresult"
@@ -92,7 +95,7 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 				continue
 			}
 			// a read of a file its thread writes within the settle time found it not there yet: no failure; one younger
-			// than the settle time, its path known or not, may have its write still to come
+			// than the settle time may have its write still to come
 			if notFound(e.Tool, e.Summary, k) {
 				p, _, _ := callField(call, pathKeys)
 				if settling(e.TS, w) || slices.ContainsFunc(written[wrote{e.Session, e.Agent, p}],
@@ -127,13 +130,10 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 		if e.Tool != "" && same(e.Session, e.Tool, e.TS) {
 			continue
 		}
+		// MistakeKey keys no read that found no file, which the transcript does not hold: the log keeps no call to
+		// name its path
 		k, ok := MistakeKey(e.Kind, e.Tool, e.Summary)
 		if !ok {
-			continue
-		}
-		// a read that found no file, which the transcript does not hold: the log keeps no path to clear it by, but it
-		// waits for its write as the transcript's read does
-		if notFound(e.Tool, e.Summary, k) && settling(e.TS, w) {
 			continue
 		}
 		occ = append(occ, occurrence{sig: signature("failures", k.String()), title: k.Title(), ev: e})
@@ -203,16 +203,50 @@ func hermesError(result string) bool {
 // modeKeys are Hermes's patch field that says how it patches.
 var modeKeys = map[string]bool{"mode": true}
 
-// notFoundRe is a read tool's error that no file is at its path: Claude Code's "File does not exist", Kimi's "PATH
-// does not exist", a file not found (OpenCode's, Hermes's), the system's ENOENT. Access refused is none of them.
-var notFoundRe = regexp.MustCompile(`(?i)\bdoes not exist\b|\b(?:file|path) not found\b|no such file or directory|\benoent\b`)
+// notFoundRe is a read tool's error that no file is at its path: Claude Code's "File does not exist", Kimi's and
+// Grok's "PATH does not exist", a file not found (OpenCode's, Codex's, Hermes's, which says "not_found": true after
+// it), the system's ENOENT (pi's). Access refused is none of them; nor is a tool that does not exist (toolGoneRe,
+// Hermes's words for a tool it does not offer).
+var (
+	notFoundRe = regexp.MustCompile(`(?i)\bdoes not exist\b|\b(?:file|path) not found\b|no such file or directory|\benoent\b`)
+	toolGoneRe = regexp.MustCompile(`(?i)^tool '[^']*' does not exist\b`)
+)
 
-// pathKeys are the fields of a file tool's input that name its file.
-var pathKeys = map[string]bool{"file_path": true, "filePath": true, "path": true}
+// pathKeys are the fields of a file tool's input that name its file; readPathKeys, a read tool's, Grok's
+// target_file too.
+var (
+	pathKeys     = map[string]bool{"file_path": true, "filePath": true, "path": true}
+	readPathKeys = map[string]bool{"file_path": true, "filePath": true, "path": true, "target_file": true}
+)
 
 // notFound says a failure keyed k is a read tool's own error that no file is at its path.
 func notFound(tool, text string, k FailureKey) bool {
-	return readTools[strings.ToLower(tool)] && k.Origin == toolOrigin(tool) && notFoundRe.MatchString(text)
+	return readTools[strings.ToLower(tool)] && k.Origin == toolOrigin(tool) && notFoundRe.MatchString(text) &&
+		!toolGoneRe.MatchString(strings.TrimSpace(text))
+}
+
+// missedPath is the path a read found no file at as its key holds it: cleaned (no . or .. left in it) and the home
+// folded to ~, no more. A path longer than keyChars characters, or one that is not plain text on one line, is kept as
+// its end and a short hash of the whole, so two such paths stay two.
+func missedPath(p string) string {
+	p = path.Clean(p)
+	if h := path.Clean(paths.Home()); path.IsAbs(h) && h != "/" {
+		if p == h {
+			p = "~"
+		} else if rest, ok := strings.CutPrefix(p, h+"/"); ok {
+			p = "~/" + rest
+		}
+	}
+	if utf8.RuneCountInString(p) <= keyChars && plain.Line(p) == p {
+		return p
+	}
+	sum := sha256.Sum256([]byte(p))
+	tag := " #" + hex.EncodeToString(sum[:4])
+	end, cut := []rune(plain.Line(p)), ""
+	if n := keyChars - len(tag) - 1; len(end) > n {
+		end, cut = end[len(end)-n:], "…"
+	}
+	return cut + string(end) + tag
 }
 
 // settling says a read at ts is still inside its hour at the window's end, as the store reads it (to the millisecond):
@@ -311,8 +345,8 @@ func incidentSightings(ctx context.Context, st *store.Store, w Window) ([]occurr
 // sameSighting is how far apart the mistakes log and the transcript may date one failure.
 const sameSighting = 5 * time.Second
 
-// keyChars is how much of a failure's text its key keeps, in characters; execChars, of a failed command's
-// message, which reach bounds already.
+// keyChars is how much of a failure's text its key keeps, in characters, and of a missed path (missedPath);
+// execChars, of a failed command's message, which reach bounds already.
 const (
 	keyChars  = 80
 	execChars = 200
@@ -431,7 +465,25 @@ var (
 // setup failing (execKey), and never when its output shows the work failing (workRe). ok is false for what is no
 // setup's failure or says nothing to key it by: the owner's own no, and a call the harness cancelled because
 // another one beside it failed.
+//
+// A read tool's own error that no file is at its path is keyed by the tool and the path its call names (missedPath),
+// not by its words, which would merge every path into one: only the same path missed again recurs. A read whose call
+// names no path (a call unknown, cut before its path, or none at all, as the mistakes log keeps) says nothing to key it
+// by.
 func FailureOf(harness, tool, text, call string) (FailureKey, bool) {
+	k, ok := failureOf(harness, tool, text, call)
+	if !ok || !notFound(tool, text, k) {
+		return k, ok
+	}
+	p, _, _ := callField(call, readPathKeys)
+	if p == "" {
+		return FailureKey{}, false
+	}
+	return FailureKey{Origin: k.Origin, Text: "file not found: " + missedPath(p)}, true
+}
+
+// failureOf is FailureOf's key by the failure's words alone.
+func failureOf(harness, tool, text, call string) (FailureKey, bool) {
 	text = strings.TrimSpace(ansiRe.ReplaceAllString(text, ""))
 	// Native command results can carry their output in JSON rather than a
 	// textual header. Read the output, not quoted JSON values as log words.
@@ -581,7 +633,8 @@ func toolOrigin(tool string) string {
 
 // MistakeKey keys a row of the mistakes log as FailureOf keys a result: its summary is the tool, a colon and the
 // error's first line. A deny or a hold is a guard's, as a tool_use_error of Claude Code's is; a model's refusal is
-// keyed by what it said; a turn's error by the harness; a row that says no more than an exit code is not keyed.
+// keyed by what it said; a turn's error by the harness; a row that says no more than an exit code is not keyed, nor a
+// read that found no file, whose path the log does not keep.
 func MistakeKey(kind, tool, summary string) (FailureKey, bool) {
 	text := strings.TrimSpace(strings.TrimPrefix(summary, tool+":"))
 	switch kind {

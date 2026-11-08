@@ -211,7 +211,8 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		{"claude", "Bash", "Exit code 1 x: failed(connection refused)", "exec:x: failed(connection refused"},
 		{"claude", "Bash", "Exit code 127 zsh: command not found: rgg.", "exec:zsh: command not found: rgg"},
 		{"claude", "Bash", "Exit code 127 zsh: command not found: " + strings.Repeat("x", 45), "exec:zsh: command not found: " + strings.Repeat("x", 40)},
-		{"claude", "Read", "File does not exist. Note: your current working directory is /home/u.", "tool:read:file does not exist. note: your current working directory is P"},
+		// a read that found no file, its call unknown: no path to key it by (TestANotFoundReadIsKeyedByThePathItMissed)
+		{"claude", "Read", "File does not exist. Note: your current working directory is /home/u.", ""},
 		{"claude", "Bash", "<tool_use_error>Cancelled: parallel tool call Bash(go test) errored", ""},
 		{"claude", "Edit", "<tool_use_error>Cancelled: parallel tool call Bash(go test) errored", ""},
 		{"claude", "Bash", "The user doesn't want to take this action right now. STOP what you are doing", ""},
@@ -491,31 +492,32 @@ func (f *fileTools) wrote(session, path string, at time.Time) []store.Event {
 
 // A batch's sessions each read the file they are about to create: a read that found no file, of a path its own
 // session then writes with success, is no failure. Each case holds such reads beside what must still count, so
-// without the rule it finds more.
+// without the rule it finds more: the reads miss one path, which a not-found read is keyed by.
 func TestAReadOfAFileItsSessionThenCreatesIsNoFailure(t *testing.T) {
-	missing := "failures/v2:tool:read:file does not exist. note: your current working directory is P"
+	const x = "/w/out/x.md"
+	missing := "failures/v2:tool:read:file not found: " + x
 	for _, tc := range []struct {
 		name   string
 		events func(f *fileTools) []store.Event
 		want   []string
 	}{
 		{"its own session writes it", func(f *fileTools) []store.Event {
-			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.wrote("s1", "/w/out/a.md", t0.Add(5*time.Minute)),
-				f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)), f.readMissing("s2", "/w/out/c.md", t0.Add(2*time.Hour)))
+			return slices.Concat(f.readMissing("s1", x, t0), f.wrote("s1", x, t0.Add(5*time.Minute)),
+				f.readMissing("s1", x, t0.Add(time.Hour)), f.readMissing("s2", x, t0.Add(2*time.Hour)))
 		}, nil},
-		{"two sessions each write their own", func(f *fileTools) []store.Event {
-			return slices.Concat(f.readMissing("s1", "/w/out/s1.md", t0), f.readMissing("s1", "/w/out/s1.md", t0.Add(time.Minute)),
-				f.wrote("s1", "/w/out/s1.md", t0.Add(5*time.Minute)),
-				f.readMissing("s2", "/w/out/s2.md", t0), f.wrote("s2", "/w/out/s2.md", t0.Add(4*time.Minute)))
+		{"two sessions each write it", func(f *fileTools) []store.Event {
+			return slices.Concat(f.readMissing("s1", x, t0), f.readMissing("s1", x, t0.Add(time.Minute)),
+				f.wrote("s1", x, t0.Add(5*time.Minute)),
+				f.readMissing("s2", x, t0), f.wrote("s2", x, t0.Add(4*time.Minute)))
 		}, nil},
 		{"the mistakes log keeps the reads too", func(f *fileTools) []store.Event {
 			logged := func(session string, at time.Time) store.Event {
 				return ev("mistakes", session, "tool-error", store.ActorHarness, "Read", "Read: "+claudeMissing, "", at.Add(3*time.Second))
 			}
-			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), []store.Event{logged("s1", t0)}, f.wrote("s1", "/w/out/a.md", t0.Add(time.Minute)),
-				f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)), []store.Event{logged("s1", t0.Add(time.Hour))},
-				f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
-				f.readMissing("s2", "/w/out/c.md", t0), []store.Event{logged("s2", t0)}, f.wrote("s2", "/w/out/c.md", t0.Add(time.Minute)))
+			return slices.Concat(f.readMissing("s1", x, t0), []store.Event{logged("s1", t0)}, f.wrote("s1", x, t0.Add(time.Minute)),
+				f.readMissing("s1", x, t0.Add(time.Hour)), []store.Event{logged("s1", t0.Add(time.Hour))},
+				f.wrote("s1", x, t0.Add(time.Hour+time.Minute)),
+				f.readMissing("s2", x, t0), []store.Event{logged("s2", t0)}, f.wrote("s2", x, t0.Add(time.Minute)))
 		}, nil},
 		{"a sibling subagent writes it", func(f *fileTools) []store.Event {
 			as := func(agent string, evs []store.Event) []store.Event {
@@ -524,10 +526,10 @@ func TestAReadOfAFileItsSessionThenCreatesIsNoFailure(t *testing.T) {
 				}
 				return evs
 			}
-			return slices.Concat(as("a1", f.readMissing("s1", "/w/out/a.md", t0)), as("a2", f.wrote("s1", "/w/out/a.md", t0.Add(time.Minute))),
-				as("a1", f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour))), as("a2", f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute))),
-				as("a1", f.readMissing("s2", "/w/out/c.md", t0)), as("a2", f.wrote("s2", "/w/out/c.md", t0.Add(time.Minute))),
-				as("a3", f.readMissing("s3", "/w/out/d.md", t0)), as("a3", f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute))))
+			return slices.Concat(as("a1", f.readMissing("s1", x, t0)), as("a2", f.wrote("s1", x, t0.Add(time.Minute))),
+				as("a1", f.readMissing("s1", x, t0.Add(time.Hour))), as("a2", f.wrote("s1", x, t0.Add(time.Hour+time.Minute))),
+				as("a1", f.readMissing("s2", x, t0)), as("a2", f.wrote("s2", x, t0.Add(time.Minute))),
+				as("a3", f.readMissing("s3", x, t0)), as("a3", f.wrote("s3", x, t0.Add(time.Minute))))
 		}, []string{missing + " 3"}},
 		{"the parent writes its subagent's read", func(f *fileTools) []store.Event {
 			as := func(agent string, evs []store.Event) []store.Event {
@@ -536,17 +538,15 @@ func TestAReadOfAFileItsSessionThenCreatesIsNoFailure(t *testing.T) {
 				}
 				return evs
 			}
-			return slices.Concat(as("a1", f.readMissing("s1", "/w/out/a.md", t0)), f.wrote("s1", "/w/out/a.md", t0.Add(time.Minute)),
-				as("a1", f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour))), f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
-				as("a1", f.readMissing("s2", "/w/out/c.md", t0)), f.wrote("s2", "/w/out/c.md", t0.Add(time.Minute)),
-				as("a3", f.readMissing("s3", "/w/out/d.md", t0)), as("a3", f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute))))
+			return slices.Concat(as("a1", f.readMissing("s1", x, t0)), f.wrote("s1", x, t0.Add(time.Minute)),
+				as("a1", f.readMissing("s1", x, t0.Add(time.Hour))), f.wrote("s1", x, t0.Add(time.Hour+time.Minute)),
+				as("a1", f.readMissing("s2", x, t0)), f.wrote("s2", x, t0.Add(time.Minute)),
+				as("a3", f.readMissing("s3", x, t0)), as("a3", f.wrote("s3", x, t0.Add(time.Minute))))
 		}, []string{missing + " 3"}},
 		{"another session writes it", func(f *fileTools) []store.Event {
-			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)),
-				f.readMissing("s2", "/w/out/c.md", t0.Add(2*time.Hour)),
-				f.wrote("s3", "/w/out/a.md", t0.Add(3*time.Hour)), f.wrote("s3", "/w/out/b.md", t0.Add(3*time.Hour)),
-				f.wrote("s3", "/w/out/c.md", t0.Add(3*time.Hour)),
-				f.readMissing("s3", "/w/out/d.md", t0.Add(4*time.Hour)), f.wrote("s3", "/w/out/d.md", t0.Add(5*time.Hour)))
+			return slices.Concat(f.readMissing("s1", x, t0), f.readMissing("s1", x, t0.Add(time.Hour)),
+				f.readMissing("s2", x, t0.Add(2*time.Hour)), f.wrote("s3", x, t0.Add(150*time.Minute)),
+				f.readMissing("s3", x, t0.Add(4*time.Hour)), f.wrote("s3", x, t0.Add(5*time.Hour)))
 		}, []string{missing + " 3"}},
 		{"access refused", func(f *fileTools) []store.Event {
 			denied := func(session, path string, at time.Time) []store.Event {
@@ -555,23 +555,24 @@ func TestAReadOfAFileItsSessionThenCreatesIsNoFailure(t *testing.T) {
 			return slices.Concat(denied("s1", "/w/out/a.md", t0), f.wrote("s1", "/w/out/a.md", t0.Add(time.Minute)),
 				denied("s1", "/w/out/b.md", t0.Add(time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
 				denied("s2", "/w/out/c.md", t0), f.wrote("s2", "/w/out/c.md", t0.Add(time.Minute)),
-				f.readMissing("s3", "/w/out/d.md", t0), f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute)),
-				f.readMissing("s4", "/w/out/e.md", t0), f.wrote("s4", "/w/out/e.md", t0.Add(time.Minute)),
-				f.readMissing("s4", "/w/out/f.md", t0.Add(time.Hour)), f.wrote("s4", "/w/out/f.md", t0.Add(time.Hour+time.Minute)))
+				f.readMissing("s3", x, t0), f.wrote("s3", x, t0.Add(time.Minute)),
+				f.readMissing("s4", x, t0), f.wrote("s4", x, t0.Add(time.Minute)),
+				f.readMissing("s4", x, t0.Add(time.Hour)), f.wrote("s4", x, t0.Add(time.Hour+time.Minute)))
 		}, []string{"failures/v2:tool:read:eacces: permission denied, open Q 3"}},
 		{"a write at the read's own millisecond", func(f *fileTools) []store.Event {
-			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.wrote("s1", "/w/out/a.md", t0),
-				f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour)),
-				f.readMissing("s2", "/w/out/c.md", t0), f.wrote("s2", "/w/out/c.md", t0))
+			return slices.Concat(f.readMissing("s1", x, t0), f.wrote("s1", x, t0),
+				f.readMissing("s1", x, t0.Add(2*time.Hour)), f.wrote("s1", x, t0.Add(2*time.Hour)),
+				f.readMissing("s2", x, t0), f.wrote("s2", x, t0))
 		}, []string{missing + " 3"}},
+		// a call that names no path: the read keys nothing, whatever is written
 		{"a read call that is no object", func(f *fileTools) []store.Event {
 			listed := func(session, path string, at time.Time) []store.Event {
 				return f.pair(session, "Read", fmt.Sprintf(`["file_path",%q]`, path), claudeMissing, true, at)
 			}
-			return slices.Concat(listed("s1", "/w/out/a.md", t0), f.wrote("s1", "/w/out/a.md", t0.Add(time.Minute)),
-				listed("s1", "/w/out/b.md", t0.Add(time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
-				listed("s2", "/w/out/c.md", t0), f.wrote("s2", "/w/out/c.md", t0.Add(time.Minute)))
-		}, []string{missing + " 3"}},
+			return slices.Concat(listed("s1", x, t0), f.wrote("s1", x, t0.Add(time.Minute)),
+				listed("s1", x, t0.Add(time.Hour)), f.wrote("s1", x, t0.Add(time.Hour+time.Minute)),
+				listed("s2", x, t0), f.wrote("s2", x, t0.Add(time.Minute)), listed("s2", x, t0.Add(2*time.Hour)))
+		}, nil},
 		{"a cut read and a cut write", func(f *fileTools) []store.Event {
 			long := strings.Repeat("x", 240)
 			cutRead := func(session string, at time.Time) []store.Event {
@@ -581,32 +582,32 @@ func TestAReadOfAFileItsSessionThenCreatesIsNoFailure(t *testing.T) {
 				return f.pair(session, "Write", `{"file_path":"/w/out/`+long+`…`, "File created successfully at: /w/out/"+long, false, at)
 			}
 			return slices.Concat(cutRead("s1", t0), cutWrite("s1", t0.Add(time.Minute)), cutRead("s1", t0.Add(time.Hour)),
-				cutWrite("s1", t0.Add(time.Hour+time.Minute)), cutRead("s2", t0), cutWrite("s2", t0.Add(time.Minute)))
-		}, []string{missing + " 3"}},
+				cutWrite("s1", t0.Add(time.Hour+time.Minute)), cutRead("s2", t0), cutWrite("s2", t0.Add(time.Minute)), cutRead("s2", t0.Add(2*time.Hour)))
+		}, nil},
 		{"the owner declines the write", func(f *fileTools) []store.Event {
 			declined := func(session, path string, at time.Time) []store.Event {
 				return f.pair(session, "Write", fmt.Sprintf(`{"file_path":%q,"content":"x"}`, path),
 					"The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file).", true, at)
 			}
-			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), declined("s1", "/w/out/a.md", t0.Add(time.Minute)),
-				f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)), declined("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
-				f.readMissing("s2", "/w/out/c.md", t0), declined("s2", "/w/out/c.md", t0.Add(time.Minute)),
-				f.readMissing("s3", "/w/out/d.md", t0), f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute)))
+			return slices.Concat(f.readMissing("s1", x, t0), declined("s1", x, t0.Add(time.Minute)),
+				f.readMissing("s1", x, t0.Add(time.Hour)), declined("s1", x, t0.Add(time.Hour+time.Minute)),
+				f.readMissing("s2", x, t0), declined("s2", x, t0.Add(time.Minute)),
+				f.readMissing("s3", x, t0), f.wrote("s3", x, t0.Add(time.Minute)))
 		}, []string{missing + " 3"}},
 		{"the write fails", func(f *fileTools) []store.Event {
 			refused := func(session, path string, at time.Time) []store.Event {
 				return f.pair(session, "Write", fmt.Sprintf(`{"file_path":%q,"content":"x"}`, path), "<tool_use_error>EACCES: permission denied, open '"+path+"'</tool_use_error>", true, at)
 			}
-			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), refused("s1", "/w/out/a.md", t0.Add(time.Minute)),
-				f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)), refused("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
-				f.readMissing("s2", "/w/out/c.md", t0), refused("s2", "/w/out/c.md", t0.Add(time.Minute)),
-				f.readMissing("s3", "/w/out/d.md", t0), f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute)))
+			return slices.Concat(f.readMissing("s1", x, t0), refused("s1", x, t0.Add(time.Minute)),
+				f.readMissing("s1", x, t0.Add(time.Hour)), refused("s1", x, t0.Add(time.Hour+time.Minute)),
+				f.readMissing("s2", x, t0), refused("s2", x, t0.Add(time.Minute)),
+				f.readMissing("s3", x, t0), f.wrote("s3", x, t0.Add(time.Minute)))
 		}, []string{missing + " 3", "failures/v2:tool:write:eacces: permission denied, open Q 3"}},
 		{"the write came first", func(f *fileTools) []store.Event {
-			return slices.Concat(f.wrote("s1", "/w/out/a.md", t0), f.readMissing("s1", "/w/out/a.md", t0.Add(time.Minute)),
-				f.wrote("s1", "/w/out/b.md", t0), f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)),
-				f.wrote("s2", "/w/out/c.md", t0), f.readMissing("s2", "/w/out/c.md", t0.Add(time.Minute)),
-				f.readMissing("s3", "/w/out/d.md", t0), f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute)))
+			return slices.Concat(f.wrote("s1", x, t0), f.readMissing("s1", x, t0.Add(time.Minute)),
+				f.readMissing("s1", x, t0.Add(time.Hour)),
+				f.wrote("s2", x, t0), f.readMissing("s2", x, t0.Add(time.Minute)),
+				f.readMissing("s3", x, t0), f.wrote("s3", x, t0.Add(time.Minute)))
 		}, []string{missing + " 3"}},
 		{"a guard refuses the read", func(f *fileTools) []store.Event {
 			refused := func(session, path string, at time.Time) []store.Event {
@@ -615,9 +616,9 @@ func TestAReadOfAFileItsSessionThenCreatesIsNoFailure(t *testing.T) {
 			return slices.Concat(refused("s1", "/w/out/a.md", t0), f.wrote("s1", "/w/out/a.md", t0.Add(time.Minute)),
 				refused("s1", "/w/out/b.md", t0.Add(time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
 				refused("s2", "/w/out/c.md", t0), f.wrote("s2", "/w/out/c.md", t0.Add(time.Minute)),
-				f.readMissing("s3", "/w/out/d.md", t0), f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute)),
-				f.readMissing("s4", "/w/out/e.md", t0), f.wrote("s4", "/w/out/e.md", t0.Add(time.Minute)),
-				f.readMissing("s4", "/w/out/f.md", t0.Add(time.Hour)), f.wrote("s4", "/w/out/f.md", t0.Add(time.Hour+time.Minute)))
+				f.readMissing("s3", x, t0), f.wrote("s3", x, t0.Add(time.Minute)),
+				f.readMissing("s4", x, t0), f.wrote("s4", x, t0.Add(time.Minute)),
+				f.readMissing("s4", x, t0.Add(time.Hour)), f.wrote("s4", x, t0.Add(time.Hour+time.Minute)))
 		}, []string{"failures/v2:guard:read-guard:path not found in the allowlist 3"}},
 		{"another tool's not-found error", func(f *fileTools) []store.Event {
 			searched := func(session, path string, at time.Time) []store.Event {
@@ -626,24 +627,24 @@ func TestAReadOfAFileItsSessionThenCreatesIsNoFailure(t *testing.T) {
 			return slices.Concat(searched("s1", "/w/out/a.md", t0), f.wrote("s1", "/w/out/a.md", t0.Add(time.Minute)),
 				searched("s1", "/w/out/b.md", t0.Add(time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
 				searched("s2", "/w/out/c.md", t0), f.wrote("s2", "/w/out/c.md", t0.Add(time.Minute)),
-				f.readMissing("s3", "/w/out/d.md", t0), f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute)),
-				f.readMissing("s4", "/w/out/e.md", t0), f.wrote("s4", "/w/out/e.md", t0.Add(time.Minute)),
-				f.readMissing("s4", "/w/out/f.md", t0.Add(time.Hour)), f.wrote("s4", "/w/out/f.md", t0.Add(time.Hour+time.Minute)))
+				f.readMissing("s3", x, t0), f.wrote("s3", x, t0.Add(time.Minute)),
+				f.readMissing("s4", x, t0), f.wrote("s4", x, t0.Add(time.Minute)),
+				f.readMissing("s4", x, t0.Add(time.Hour)), f.wrote("s4", x, t0.Add(time.Hour+time.Minute)))
 		}, []string{"failures/v2:tool:grep:path does not exist: P 3"}},
 		{"a tool that only reads names the path", func(f *fileTools) []store.Event {
 			searched := func(session, path string, at time.Time) []store.Event {
 				return f.pair(session, "Grep", fmt.Sprintf(`{"path":%q,"pattern":"x"}`, path), "No matches found", false, at)
 			}
-			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), searched("s1", "/w/out/a.md", t0.Add(time.Minute)),
-				f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)), searched("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
-				f.readMissing("s2", "/w/out/c.md", t0), searched("s2", "/w/out/c.md", t0.Add(time.Minute)),
-				f.readMissing("s3", "/w/out/d.md", t0), f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute)))
+			return slices.Concat(f.readMissing("s1", x, t0), searched("s1", x, t0.Add(time.Minute)),
+				f.readMissing("s1", x, t0.Add(time.Hour)), searched("s1", x, t0.Add(time.Hour+time.Minute)),
+				f.readMissing("s2", x, t0), searched("s2", x, t0.Add(time.Minute)),
+				f.readMissing("s3", x, t0), f.wrote("s3", x, t0.Add(time.Minute)))
 		}, []string{missing + " 3"}},
 		{"another path", func(f *fileTools) []store.Event {
-			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.wrote("s1", "/w/out/./a.md", t0.Add(time.Minute)),
-				f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)), f.wrote("s1", "/w/out/b.md.tmp", t0.Add(time.Hour+time.Minute)),
-				f.readMissing("s2", "/w/out/c.md", t0), f.wrote("s2", "/w/out", t0.Add(time.Minute)),
-				f.readMissing("s3", "/w/out/d.md", t0), f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute)))
+			return slices.Concat(f.readMissing("s1", x, t0), f.wrote("s1", "/w/out/./x.md", t0.Add(time.Minute)),
+				f.readMissing("s1", x, t0.Add(time.Hour)), f.wrote("s1", x+".tmp", t0.Add(time.Hour+time.Minute)),
+				f.readMissing("s2", x, t0), f.wrote("s2", "/w/out", t0.Add(time.Minute)),
+				f.readMissing("s3", x, t0), f.wrote("s3", x, t0.Add(time.Minute)))
 		}, []string{missing + " 3"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -669,7 +670,7 @@ func TestAFoldedPatchNamesItsFileUpToAChunk(t *testing.T) {
 		f := fileTools{harness: "codex"}
 		var evs []store.Event
 		for i, session := range []string{"s1", "s1", "s2"} {
-			p := fmt.Sprintf("/w/out/%d.md", i)
+			p := "/w/out/x.md"
 			at := t0.Add(time.Duration(i) * time.Hour)
 			evs = append(evs, f.pair(session, "read_file", fmt.Sprintf(`{"path":%q}`, p), "File not found: "+p, true, at)...)
 			evs = append(evs, f.pair(session, "apply_patch", fmt.Sprintf(text, p), "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: M "+p,
@@ -737,7 +738,7 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 			f := fileTools{harness: tc.harness}
 			var evs []store.Event
 			for i, session := range []string{"s1", "s1", "s2"} {
-				p := fmt.Sprintf("out/%d.md", i)
+				p := "out/x.md"
 				at := t0.Add(time.Duration(i) * time.Hour)
 				evs = append(evs, f.pair(session, tc.read, strings.ReplaceAll(tc.readIn, "@", p), strings.ReplaceAll(tc.missing, "@", p), true, at)...)
 				evs = append(evs, f.pair(session, tc.write, strings.ReplaceAll(tc.writeIn, "@", p), strings.ReplaceAll(tc.wrote, "@", p), false, at.Add(time.Minute))...)
@@ -751,7 +752,7 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 			st = testStore(t)
 			evs = evs[:0]
 			for i, session := range []string{"s1", "s1", "s2"} {
-				p := fmt.Sprintf("out/%d.md", i)
+				p := "out/x.md"
 				at := t0.Add(time.Duration(i) * time.Hour)
 				in, out := strings.ReplaceAll(tc.writeIn, "@", p), strings.ReplaceAll(tc.wrote, "@", p)
 				if i == 0 {
@@ -808,7 +809,7 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 			f := fileTools{harness: tc.harness}
 			var evs []store.Event
 			for i, session := range []string{"s1", "s1", "s2"} {
-				p := fmt.Sprintf("out/%d.md", i)
+				p := "out/x.md"
 				at := t0.Add(time.Duration(i) * time.Hour)
 				evs = append(evs, f.pair(session, readToolOf(tc.harness), strings.ReplaceAll(tc.readIn, "@", p), strings.ReplaceAll(tc.missing, "@", p), true, at)...)
 				evs = append(evs, f.pair(session, tc.tool, strings.ReplaceAll(tc.writeIn, "@", p), strings.ReplaceAll(tc.wrote, "@", p), false, at.Add(time.Minute))...)
@@ -1089,13 +1090,13 @@ func TestAShellRunsInItsCallsDirectory(t *testing.T) {
 	}
 }
 
-// The batch's own shape: each session appends to its file by its name alone, in the directory its call ran in.
+// The batch's own shape: each session appends to the file by its name alone, in the directory its call ran in.
 func TestARelativeWriteIsReadInItsCallsDirectory(t *testing.T) {
 	st := testStore(t)
 	f := fileTools{harness: "kimi"}
 	var evs []store.Event
 	for i, session := range []string{"s1", "s2", "s3"} {
-		dir := fmt.Sprintf("/w/b%d", i)
+		dir := "/w/b"
 		at := t0.Add(time.Duration(i) * time.Hour)
 		read := kimiReadMissing(&f, session, dir+"/out.jsonl", at)
 		for k := range read {
@@ -1116,14 +1117,14 @@ func TestAReadWaitsForItsWriteBeforeItCounts(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	f := claudeFiles
-	put(t, st, slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)),
-		f.readMissing("s2", "/w/out/c.md", t0.Add(2*time.Hour)))...)
+	const x = "/w/out/x.md"
+	put(t, st, slices.Concat(f.readMissing("s1", x, t0), f.readMissing("s1", x, t0.Add(time.Hour)), f.readMissing("s2", x, t0.Add(2*time.Hour)))...)
 	outs, _, err := Run(ctx, st, []Detector{Failures{}}, Window{Since: t0.Add(-24 * time.Hour), Until: t0.Add(2*time.Hour + 30*time.Minute)}, "test", false)
 	if err != nil || len(outs) != 1 || len(outs[0].Filed) != 0 {
 		t.Fatalf("a run before the last read settled: %+v, %v", outs, err)
 	}
-	put(t, st, slices.Concat(f.wrote("s1", "/w/out/a.md", t0.Add(10*time.Minute)), f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+10*time.Minute)),
-		f.wrote("s2", "/w/out/c.md", t0.Add(2*time.Hour+10*time.Minute)))...)
+	put(t, st, slices.Concat(f.wrote("s1", x, t0.Add(10*time.Minute)), f.wrote("s1", x, t0.Add(time.Hour+10*time.Minute)),
+		f.wrote("s2", x, t0.Add(2*time.Hour+10*time.Minute)))...)
 	outs, _, err = Run(ctx, st, []Detector{Failures{}}, Window{Since: t0.Add(-24 * time.Hour), Until: t0.Add(4 * time.Hour)}, "test", false)
 	if err != nil || len(outs) != 1 || len(outs[0].Filed) != 0 {
 		t.Fatalf("a run that holds the writes: %+v, %v", outs, err)
@@ -1135,16 +1136,17 @@ func TestAReadWaitsForItsWriteBeforeItCounts(t *testing.T) {
 func TestAReadClearsOnlyOnAWriteWithinTheHour(t *testing.T) {
 	st := testStore(t)
 	f := claudeFiles
+	const x = "/w/out/x.md"
 	put(t, st, slices.Concat(
-		f.readMissing("s1", "/w/out/a.md", t0), f.wrote("s1", "/w/out/a.md", t0.Add(time.Hour)),
-		f.readMissing("s1", "/w/out/b.md", t0.Add(2*time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(3*time.Hour+time.Minute)),
-		f.readMissing("s2", "/w/out/c.md", t0), f.wrote("s2", "/w/out/c.md", t0.Add(61*time.Minute)),
-		f.readMissing("s2", "/w/out/d.md", t0.Add(4*time.Hour)), f.wrote("s2", "/w/out/d.md", t0.Add(6*time.Hour)),
+		f.readMissing("s1", x, t0), f.wrote("s1", x, t0.Add(time.Hour)),
+		f.readMissing("s1", x, t0.Add(2*time.Hour)), f.wrote("s1", x, t0.Add(3*time.Hour+time.Minute)),
+		f.readMissing("s2", x, t0), f.wrote("s2", x, t0.Add(61*time.Minute)),
+		f.readMissing("s2", x, t0.Add(4*time.Hour)), f.wrote("s2", x, t0.Add(6*time.Hour)),
 		// a write before the read and one within the hour; one within the hour and one long after
-		f.wrote("s3", "/w/out/e.md", t0.Add(-10*time.Minute)), f.readMissing("s3", "/w/out/e.md", t0), f.wrote("s3", "/w/out/e.md", t0.Add(30*time.Minute)),
-		f.readMissing("s3", "/w/out/g.md", t0), f.wrote("s3", "/w/out/g.md", t0.Add(30*time.Minute)), f.wrote("s3", "/w/out/g.md", t0.Add(3*time.Hour)))...)
+		f.wrote("s3", x, t0.Add(-10*time.Minute)), f.readMissing("s3", x, t0), f.wrote("s3", x, t0.Add(30*time.Minute)),
+		f.readMissing("s3", x, t0), f.wrote("s3", x, t0.Add(3*time.Hour)))...)
 	fs, err := Failures{}.Detect(context.Background(), st, week())
-	if got, want := signatures(fs), []string{"failures/v2:tool:read:file does not exist. note: your current working directory is P 3"}; err != nil || !slices.Equal(got, want) {
+	if got, want := signatures(fs), []string{"failures/v2:tool:read:file not found: " + x + " 3"}; err != nil || !slices.Equal(got, want) {
 		t.Fatalf("found %v, %v, want %v", got, err, want)
 	}
 }
@@ -1154,8 +1156,8 @@ func TestAReadClearsOnlyOnAWriteWithinTheHour(t *testing.T) {
 func TestAReadAnHourBeforeTheWindowsEndStillWaits(t *testing.T) {
 	st := testStore(t)
 	f := claudeFiles
-	put(t, st, slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.readMissing("s1", "/w/out/b.md", t0),
-		f.readMissing("s2", "/w/out/c.md", t0))...)
+	put(t, st, slices.Concat(f.readMissing("s1", "/w/out/x.md", t0), f.readMissing("s1", "/w/out/x.md", t0),
+		f.readMissing("s2", "/w/out/x.md", t0))...)
 	edge := Window{Since: t0.Add(-time.Hour), Until: t0.Add(time.Hour + time.Second)}
 	if fs, err := (Failures{}).Detect(context.Background(), st, edge); err != nil || len(fs) != 0 {
 		t.Fatalf("at the hour's end: %v, %v", signatures(fs), err)
@@ -1168,22 +1170,22 @@ func TestAReadAnHourBeforeTheWindowsEndStillWaits(t *testing.T) {
 	}
 }
 
-// A not-found read whose call the store does not hold has no path to clear it by, but waits its hour too.
-func TestAReadWithNoPathWaitsToo(t *testing.T) {
+// A not-found read whose call the store does not hold names no path, which is its key: it keys nothing, inside its
+// hour or past it, so unrelated misses do not merge into one.
+func TestAReadWithNoPathKeysNothing(t *testing.T) {
 	st := testStore(t)
 	put(t, st, result("s1", "Read", "r1", claudeMissing, t0), result("s1", "Read", "r2", claudeMissing, t0.Add(time.Minute)),
 		result("s2", "Read", "r3", claudeMissing, t0.Add(2*time.Minute)))
-	if fs, err := (Failures{}).Detect(context.Background(), st, Window{Since: t0.Add(-time.Hour), Until: t0.Add(30 * time.Minute)}); err != nil || len(fs) != 0 {
-		t.Fatalf("inside the hour: %v, %v", signatures(fs), err)
-	}
-	if fs, err := (Failures{}).Detect(context.Background(), st, Window{Since: t0.Add(-time.Hour), Until: t0.Add(2 * time.Hour)}); err != nil || len(fs) != 1 {
-		t.Fatalf("past it: %v, %v", signatures(fs), err)
+	for _, until := range []time.Duration{30 * time.Minute, 2 * time.Hour} {
+		if fs, err := (Failures{Recur: Recur{Events: 1}}).Detect(context.Background(), st, Window{Since: t0.Add(-time.Hour), Until: t0.Add(until)}); err != nil || len(fs) != 0 {
+			t.Fatalf("until %v: %v, %v", until, signatures(fs), err)
+		}
 	}
 }
 
-// The mistakes log's own not-found read, which no transcript result holds, waits its hour as well: the log keeps no
-// path its write could clear, but a run inside the hour does not count it yet.
-func TestALoggedReadWaitsToo(t *testing.T) {
+// The mistakes log's own not-found read, which no transcript result holds, names no path: the log keeps no call, so
+// it keys nothing, inside its hour or past it, while another of the log's rows counts at once.
+func TestALoggedReadKeysNothing(t *testing.T) {
 	st := testStore(t)
 	logged := func(session string, at time.Time) store.Event {
 		return ev("mistakes", session, "tool-error", store.ActorHarness, "Read", "Read: "+claudeMissing, "", at)
@@ -1193,13 +1195,11 @@ func TestALoggedReadWaitsToo(t *testing.T) {
 	}
 	put(t, st, logged("s1", t0), logged("s1", t0.Add(time.Minute)), logged("s2", t0.Add(2*time.Minute)),
 		denied("s1", t0), denied("s1", t0.Add(time.Minute)), denied("s2", t0.Add(2*time.Minute)))
-	// only the reads wait: another of the log's rows counts at once
-	fs, err := Failures{}.Detect(context.Background(), st, Window{Since: t0.Add(-time.Hour), Until: t0.Add(30 * time.Minute)})
-	if got, want := signatures(fs), []string{"failures/v2:guard:ledger:this note names no source 3"}; err != nil || !slices.Equal(got, want) {
-		t.Fatalf("inside the hour: %v, %v, want %v", got, err, want)
-	}
-	if fs, err := (Failures{}).Detect(context.Background(), st, Window{Since: t0.Add(-time.Hour), Until: t0.Add(2 * time.Hour)}); err != nil || len(fs) != 2 {
-		t.Fatalf("past it: %v, %v", signatures(fs), err)
+	for _, until := range []time.Duration{30 * time.Minute, 2 * time.Hour} {
+		fs, err := Failures{Recur: Recur{Events: 1}}.Detect(context.Background(), st, Window{Since: t0.Add(-time.Hour), Until: t0.Add(until)})
+		if got, want := signatures(fs), []string{"failures/v2:guard:ledger:this note names no source 3"}; err != nil || !slices.Equal(got, want) {
+			t.Fatalf("until %v: %v, %v, want %v", until, got, err, want)
+		}
 	}
 }
 
@@ -1208,14 +1208,14 @@ func TestALoggedReadWaitsToo(t *testing.T) {
 func TestALateStoredWriteClearsASettledRead(t *testing.T) {
 	st := testStore(t)
 	f := claudeFiles
-	put(t, st, slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)),
-		f.readMissing("s2", "/w/out/c.md", t0.Add(2*time.Hour)))...)
+	const x = "/w/out/x.md"
+	put(t, st, slices.Concat(f.readMissing("s1", x, t0), f.readMissing("s1", x, t0.Add(time.Hour)), f.readMissing("s2", x, t0.Add(2*time.Hour)))...)
 	early := Window{Since: t0.Add(-time.Hour), Until: t0.Add(3*time.Hour + 2*time.Second)}
 	if fs, err := (Failures{}).Detect(context.Background(), st, early); err != nil || len(fs) != 1 || len(fs[0].Evidence) != 3 {
 		t.Fatalf("before the writes are stored: %v, %v", signatures(fs), err)
 	}
-	put(t, st, slices.Concat(f.wrote("s1", "/w/out/a.md", t0.Add(30*time.Minute)), f.wrote("s1", "/w/out/b.md", t0.Add(90*time.Minute)),
-		f.wrote("s2", "/w/out/c.md", t0.Add(150*time.Minute)))...)
+	put(t, st, slices.Concat(f.wrote("s1", x, t0.Add(30*time.Minute)), f.wrote("s1", x, t0.Add(90*time.Minute)),
+		f.wrote("s2", x, t0.Add(150*time.Minute)))...)
 	if fs, err := (Failures{}).Detect(context.Background(), st, early); err != nil || len(fs) != 0 {
 		t.Fatalf("once they are: %v, %v", signatures(fs), err)
 	}
