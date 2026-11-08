@@ -88,6 +88,20 @@ func (r *codexRollout) meta() {
 		"originator": "codex-tui", "cli_version": "0.162.1", "source": "cli", "thread_source": "user", "model_provider": "p"})
 }
 
+// developer is a developer-role message, which Codex writes at a turn's start, after its task_started.
+func (r *codexRollout) developer(after time.Duration, text string) time.Time {
+	return r.line(after, "response_item", map[string]any{"type": "message", "role": "developer",
+		"content": []any{map[string]any{"type": "input_text", "text": text}}})
+}
+
+// filler is n bytes or more of reasoning items, which the store keeps no event of.
+func (r *codexRollout) filler(n int) {
+	block := strings.Repeat("A", 16<<10)
+	for written := 0; written < n; written += len(block) {
+		r.line(0, "response_item", map[string]any{"type": "reasoning", "summary": []any{}, "encrypted_content": block})
+	}
+}
+
 // call is a tool call and its output, a second apart.
 func (r *codexRollout) call(after time.Duration, id string) time.Time {
 	r.line(after, "response_item", map[string]any{"type": "function_call", "name": "exec_command", "call_id": id, "arguments": `{"cmd":"ls"}`})
@@ -486,8 +500,9 @@ const codexResync = Marker + " Your last turn ended with a promise. Report what 
 // one at the abort. The rollout's order decides, as in the live tracker, not an end's time before the record's; an
 // end at or after the window's end leaves the turn open in it. An agent message the store keeps no event of (blank,
 // or Codex's recorded tool history) is read past, and so is the start of the turn an input opened when Codex wrote
-// it after the input; another turn's start after an input of a started turn, or one steered into it, is not. An end
-// the store marked on a record passed over decides, not a second end after it.
+// it after the input, only that first start; another turn's start after an input of a started turn (a developer
+// message or the input's other blocks between them change nothing), after one steered into it, or after a stretch
+// too long to read, is not. An end the store marked on a record passed over decides, not a second end after it.
 func TestTheLastCodexTurnReadsOverWhenNoRecordCameAfterItsEnd(t *testing.T) {
 	aborted := map[string]any{"type": "turn_aborted", "reason": "interrupted"}
 	for _, c := range []struct {
@@ -555,6 +570,58 @@ func TestTheLastCodexTurnReadsOverWhenNoRecordCameAfterItsEnd(t *testing.T) {
 			r.started(30 * time.Minute)
 			return at, r.line(time.Minute, "event_msg", aborted)
 		}},
+		{"a developer message before the input after its turn's start, then another turn's", true, "", func(r *codexRollout, _ time.Time) (time.Time, time.Time) {
+			r.agent(time.Minute, "Done.")
+			r.completed(0, "Done.")
+			r.started(5 * time.Minute)
+			r.developer(0, "Approval policy is now on-request.")
+			at := r.user(0, "now the other one")
+			r.started(30 * time.Minute)
+			return at, r.line(time.Minute, "event_msg", aborted)
+		}},
+		{"the owner's input with an image after its turn's start, then another turn's", true, "", func(r *codexRollout, _ time.Time) (time.Time, time.Time) {
+			r.agent(time.Minute, "Done.")
+			r.completed(0, "Done.")
+			r.started(5 * time.Minute)
+			at := r.line(0, "response_item", map[string]any{"type": "message", "role": "user", "content": []any{
+				map[string]any{"type": "input_text", "text": tag("image name=[Image #1]")},
+				map[string]any{"type": "input_text", "text": closing("image")},
+				map[string]any{"type": "input_text", "text": "now the other one"}}})
+			r.started(30 * time.Minute)
+			return at, r.line(time.Minute, "event_msg", aborted)
+		}},
+		{"the owner's input before its turn's start, its turn unended, then another turn's", true, "", func(r *codexRollout, _ time.Time) (time.Time, time.Time) {
+			r.agent(time.Minute, "Done.")
+			r.completed(0, "Done.")
+			at := r.user(5*time.Minute, "now the other one")
+			r.started(0)
+			r.started(30 * time.Minute)
+			return at, r.line(time.Minute, "event_msg", aborted)
+		}},
+		{"the owner's input before its turn's start, a developer message after it, its turn unended, then another turn's", true, "", func(r *codexRollout, _ time.Time) (time.Time, time.Time) {
+			r.agent(time.Minute, "Done.")
+			r.completed(0, "Done.")
+			at := r.user(5*time.Minute, "now the other one")
+			r.started(0)
+			r.developer(0, "Approval policy is now on-request.")
+			r.started(30 * time.Minute)
+			return at, r.line(time.Minute, "event_msg", aborted)
+		}},
+		{"a start too far before the input to read, then another turn's", true, "", func(r *codexRollout, _ time.Time) (time.Time, time.Time) {
+			r.agent(time.Minute, "Done.")
+			r.completed(0, "Done.")
+			r.started(5 * time.Minute)
+			r.filler(9 << 20) // past what the replay reads between two events
+			at := r.user(time.Second, "now the other one")
+			r.started(30 * time.Minute)
+			return at, r.line(time.Minute, "event_msg", aborted)
+		}},
+		{"a whitespace-only agent message before the end", false, "", func(r *codexRollout, _ time.Time) (time.Time, time.Time) {
+			out := r.call(time.Minute, "c1")
+			r.line(time.Second, "response_item", map[string]any{"type": "message", "role": "assistant",
+				"content": []any{map[string]any{"type": "output_text", "text": " \n\t"}}})
+			return out, r.completed(0, "")
+		}},
 		{"the owner's input steered into the turn, then another turn's", true, "", func(r *codexRollout, _ time.Time) (time.Time, time.Time) {
 			r.call(time.Minute, "c1")
 			at := r.user(10*time.Second, "also check the logs")
@@ -604,6 +671,27 @@ func TestTheLastCodexTurnReadsOverWhenNoRecordCameAfterItsEnd(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// Codex's "[Recorded tool history]" message is agent text to the live tracker, the turn's last words when it is the
+// last before the end, and the store keeps no event of it: the replay reads the turn over as live does, with the
+// words from before it, a way a live run differs from the replay.
+func TestARecordedToolHistoryMessageIsTheLastWordsOnlyLive(t *testing.T) {
+	const recorded = "[Recorded tool history]\nexec_command ls: exit 0"
+	home := codexHome(t)
+	r := newCodexRollout(t, home)
+	r.meta()
+	r.started(time.Second)
+	r.user(0, "run the soak")
+	r.agent(time.Minute, codexPromise)
+	r.call(time.Second, "c1")
+	r.agent(time.Second, recorded)
+	ended := r.completed(0, recorded)
+	_, stop, _ := live(t, r.path, ended)
+	got := lastStop(t, ingested(t, home), codexTurnID)
+	if s := got.Point.Stop; stop.Words != Words(recorded) || s.Words != codexPromise || s.Working {
+		t.Fatalf("live %q, replay %q (working %v): %q", stop.Words, s.Words, s.Working, Why(got))
 	}
 }
 

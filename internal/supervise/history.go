@@ -637,7 +637,8 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 	var lastSeen string          // the place of the last event read, one passed over among them
 	pending := map[string]bool{} // calls without a result yet
 	lastMainUser := false
-	// the input that opened the last turn when its record says the turn before it was over, and the event before it
+	// the input that opened the last turn when its record says the turn before it was over, and the event the replay
+	// read before it
 	var openRef, openFrom string
 	stopOf := func(at time.Time, nextRef string) Stop {
 		s := Stop{Key: id, Tool: harness, At: prevAt, Words: words, OwnerAt: ownerAt, ResumedAt: resumed}
@@ -714,7 +715,6 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		if harness == "" {
 			harness = e.Harness
 		}
-		seenBefore := lastSeen
 		lastSeen = e.Ref
 		r := role(e, m)
 		if why, _ := m["why"].(string); harness == "codex" && r == "agent" && why != "" && why != "assistant" {
@@ -995,7 +995,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			// its own record says the turn before it was over: Codex may write its turn's task_started after it
 			openRef, openFrom = "", ""
 			if prior, _ := m["prior"].(string); turnOver(harness, prior) {
-				openRef, openFrom = e.Ref, seenBefore
+				openRef, openFrom = e.Ref, lastRef
 			}
 		}
 		if opens {
@@ -1017,9 +1017,11 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			// the store marks a Codex turn's end on the record after it, and none came after the last record: the
 			// rollout's own end of the turn after it, while the transcript is there, as the live tracker reads it.
 			// With nothing carried, no abort since the last record dated this stop. An input that opened its turn
-			// after the turn before it was over, with no task_started before it since the event before it, has its
-			// turn's start still to come.
-			opened := inputLast && openRef != "" && !codexStartedBetween(openFrom, openRef)
+			// after the turn before it was over has its turn's start still to come when no task_started came between
+			// the event the replay read before it (a record passed over, as a developer message or another block of
+			// the input's own record, is not one) and the input, nor between the input and the last record read.
+			opened := inputLast && openRef != "" && !codexStartedBetween(openFrom, openRef) &&
+				(lastSeen == openRef || !codexStartedBetween(openRef, lastSeen))
 			if end, at := codexTurnEnd(lastSeen, opened, until); end != "" {
 				carried, pending = end, map[string]bool{}
 				if end == "turn_aborted" {
