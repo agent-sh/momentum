@@ -74,8 +74,8 @@ func (d Sessions) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 
 // nudged replays the rules over the window and keeps the stops the owner ended with a nudge that no rule would
 // have acted on first, each keyed by why none would. His own restart step is none: his input at a stop an /exit
-// ended, and his input within the owner window after he reopened a session that ended mid-task, with nothing since:
-// no turn opened after the reopening, and the stop does not end on an API error.
+// ended, and his input within the owner window after a session that ended mid-task was reopened, whoever reopened
+// it, with nothing since: no turn opened after the reopening, and the stop does not end on an API error.
 func (d Sessions) nudged(ctx context.Context, st *store.Store, w Window) ([]occurrence, error) {
 	points, err := supervise.History(ctx, st, w.Since, w.Until)
 	if err != nil {
@@ -111,11 +111,14 @@ func (d Sessions) nudged(ctx context.Context, st *store.Store, w Window) ([]occu
 		next := res.Point.Next
 		s := res.Point.Stop
 		// At a reopening after the session ended mid-task (a crash, a restart, a usage limit), his input within the
-		// owner window is his restart step: he reopened it, and supervision holds every rule that long for a process
-		// he started, so his input comes before any rule's time. That holds only while nothing has happened since the
-		// reopening: ResumedAt clears on his input, momentum's message, a call or the agent's words; no other input (a
-		// loop's prompt, another session's message, a task's notification) opened a turn after it; and the stop does
-		// not end on an API error: one since the reopening shows the session ran a turn again, whatever rule reads it.
+		// owner window is his restart step: whoever reopened it, supervision holds every rule that long after a process
+		// starts, so his input comes before any rule's time. That holds only while nothing has happened since the
+		// reopening: ResumedAt clears on a prompt of his, momentum's message, a call or the agent's words, while a
+		// local command of his (/login) or an Escape keeps it and the skip; no other input (a loop's prompt, another
+		// session's message, a task's notification) opened a turn after it; and the stop does not end on an API error:
+		// one since the reopening shows the session ran a turn again, whatever rule reads it. A limit: the error is
+		// read from the stop's last record only, so his input within the window after an API error and then an
+		// Escape, a tool's result or a synthetic reply is still skipped, though the session ran a turn again.
 		restartStep := !s.ResumedAt.IsZero() && !s.TurnBegan.After(s.ResumedAt) && s.Error == "" &&
 			next.At.Sub(s.ResumedAt) <= supervise.DefaultParams.OwnerWindow
 		if next.Kind != "owner" || !supervise.Nudge(next.Text) || res.Fired || s.Exited || s.Reopened || restartStep {

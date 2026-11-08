@@ -2071,6 +2071,18 @@ func reopenedMidTask(t *testing.T, st *store.Store, session, words string, at, r
 			`{"why":"origin task-notification"}`, reopen.Add(time.Second)))
 }
 
+// reopenedOnACutCall puts a session whose process died while a call ran, and Claude Code's records as it was
+// reopened at the time given: the call's result that says the end interrupted it, and the synthetic reply that closes
+// the turn. No input opens a turn there.
+func reopenedOnACutCall(t *testing.T, st *store.Store, session, words string, at, reopen time.Time) {
+	t.Helper()
+	put(t, st, ownerTurn(session, "run the soak", at), agentSays(session, words, at.Add(10*time.Second)),
+		call(session, "Bash", "tc1", `{"command":"go test ./soak"}`, at.Add(20*time.Second)),
+		ev(store.Transcripts, session, "tool_result", store.ActorTool, "Bash", "[Tool call interrupted: the session ended before this call's result was recorded]",
+			`{"tool_id":"tc1","is_error":true}`, reopen),
+		ev(store.Transcripts, session, "harness_text", store.ActorHarness, "", "No response requested.", `{"why":"synthetic message"}`, reopen.Add(time.Second)))
+}
+
 // soakAsks are last words that ask the owner, which keep the reopened rule off.
 const soakAsks = "The soak runs in the background. Do you want me to publish the release when it passes?"
 
@@ -2093,22 +2105,31 @@ func nudgedAt(t *testing.T, st *store.Store) map[int64]bool {
 }
 
 // A session reopened after it ended mid-task (a crash, a restart, a usage limit) has a stop nothing has happened
-// since: the owner who reopened it types to resume the work, before any rule's time, and that input is no nudge a
-// rule could have spared him, whoever reopened it. So too when the agent's last words before the end asked him,
-// which keep the reopened rule off, up to the end of the owner window.
+// since: the owner types to resume the work, before any rule's time, and that input is no nudge a rule could have
+// spared him, whoever reopened it. So too on a reopening by a call the end interrupted, which opens no turn, and when
+// the agent's last words before the end asked him, which keep the reopened rule off, up to the owner window's end
+// after the reopening's last notice.
 func TestTheInputThatResumesAReopenedSessionIsNoNudge(t *testing.T) {
 	reopen := t0.Add(40 * time.Minute)
 	for _, row := range []struct {
 		name, words string
 		after       time.Duration
+		cut         bool // reopened on a call the end interrupted, not on the notices
 	}{
-		{"10 seconds on", "Starting the soak.", 10 * time.Second},
-		{"10 seconds on, its words asked him", soakAsks, 10 * time.Second},
-		{"14 minutes on, its words asked him", soakAsks, 14 * time.Minute},
+		{"10 seconds on", "Starting the soak.", 10 * time.Second, false},
+		{"10 seconds on, its words asked him", soakAsks, 10 * time.Second, false},
+		{"14 minutes on, its words asked him", soakAsks, 14 * time.Minute, false},
+		{"5 seconds on, reopened on an interrupted call", "Starting the soak.", 5 * time.Second, true},
+		// the reopening's last notice is a second after reopen
+		{"at the owner window's end, its words asked him", soakAsks, time.Second + supervise.DefaultParams.OwnerWindow, false},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			st := testStore(t)
-			reopenedMidTask(t, st, "o", row.words, t0, reopen)
+			if row.cut {
+				reopenedOnACutCall(t, st, "o", row.words, t0, reopen)
+			} else {
+				reopenedMidTask(t, st, "o", row.words, t0, reopen)
+			}
 			put(t, st, ownerTurn("o", "continue", reopen.Add(row.after)))
 			if at := nudgedAt(t, st); len(at) > 0 {
 				t.Fatalf("the input that resumes a reopened session read as a nudge: %v", at)
@@ -2118,10 +2139,11 @@ func TestTheInputThatResumesAReopenedSessionIsNoNudge(t *testing.T) {
 }
 
 // His input at a reopening is his restart step only while nothing has happened since and his window has not passed.
-// A nudge still counts after the session worked again: after his own input or supervision's message, the agent
+// A nudge still counts after the session worked again: after a prompt of his or supervision's message, the agent
 // working and stopping on asking him; after another input opened a turn (a loop's tick, another session's message,
-// a task's notification after an API error); after an API error, which shows the session ran a turn again; and
-// past the owner window after a reopened stop whose last words asked him.
+// a task's notification after an API error); after an API error, which shows the session ran a turn again, with no
+// other input since; and past the owner window after a reopened stop whose last words asked him, from a second past
+// it.
 func TestANudgeAfterAReopeningStillCounts(t *testing.T) {
 	reopen := t0.Add(40 * time.Minute)
 	tick := func(at time.Time) store.Event {
@@ -2151,9 +2173,12 @@ func TestANudgeAfterAReopeningStillCounts(t *testing.T) {
 			ev(store.Transcripts, "w", "harness_text", store.ActorHarness, "", taskNotice("b2", "completed", "Background command finished"), `{"why":"origin task-notification"}`,
 				reopen.Add(40*time.Second))}, reopen.Add(time.Minute)},
 		{"after a loop tick", "Starting the soak.", []store.Event{tick(reopen.Add(20 * time.Second))}, reopen.Add(time.Minute)},
+		{"after an API error", "Starting the soak.", []store.Event{apiErr(reopen.Add(30 * time.Second))}, reopen.Add(time.Minute)},
 		{"after another session's message", "Starting the soak.", []store.Event{ev(store.Transcripts, "w", "agent_text", store.ActorAgent, "",
 			peerTag("cross-session-message")+"the review is posted", `{"why":"harness line"}`, reopen.Add(20*time.Second))}, reopen.Add(time.Minute)},
 		{"16 minutes on, its words asked him", soakAsks, nil, reopen.Add(16 * time.Minute)},
+		// the reopening's last notice is a second after reopen
+		{"a second past the owner window, its words asked him", soakAsks, nil, reopen.Add(2*time.Second + supervise.DefaultParams.OwnerWindow)},
 		{"3 hours on, its words asked him", soakAsks, nil, reopen.Add(3 * time.Hour)},
 	} {
 		t.Run(row.name, func(t *testing.T) {
