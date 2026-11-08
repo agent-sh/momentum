@@ -986,9 +986,13 @@ func (s *Store) Rebuild(ctx context.Context, source string, force bool) (int, er
 	return int(n), tx.Commit()
 }
 
+// Call is a tool call as the store keeps it: its text (the input's first bytes) and the directory its session was
+// in when it made the call.
+type Call struct{ Input, Cwd string }
+
 // CallsOf reads the calls the transcripts' results answer: for each result with a tool id, the tool call of its
-// session with that id, at most reach before it. It returns each call's text by its result's id.
-func (s *Store) CallsOf(ctx context.Context, results []Event, reach time.Duration) (map[string]string, error) {
+// session with that id, at most reach before it. It returns each call by its result's id.
+func (s *Store) CallsOf(ctx context.Context, results []Event, reach time.Duration) (map[string]Call, error) {
 	type key struct{ session, id string }
 	type result struct {
 		id string
@@ -1017,22 +1021,22 @@ func (s *Store) CallsOf(ctx context.Context, results []Event, reach time.Duratio
 	for t := range tools {
 		args = append(args, t)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT session, ts, meta, summary FROM events WHERE kind = 'tool_call' AND source = ? AND ts >= ?
+	rows, err := s.db.QueryContext(ctx, `SELECT session, ts, meta, summary, cwd FROM events WHERE kind = 'tool_call' AND source = ? AND ts >= ?
 	  AND ts <= ? AND tool IN (?`+strings.Repeat(",?", len(tools)-1)+`)`, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := map[string]string{}
+	out := map[string]Call{}
 	for rows.Next() {
-		var session, meta, summary string
+		var session, meta, summary, cwd string
 		var ts int64
-		if err := rows.Scan(&session, &ts, &meta, &summary); err != nil {
+		if err := rows.Scan(&session, &ts, &meta, &summary, &cwd); err != nil {
 			return nil, err
 		}
 		for _, r := range want[key{session, toolID(meta)}] {
 			if ts <= r.ts && ts >= r.ts-reach.Milliseconds() {
-				out[r.id] = summary
+				out[r.id] = Call{Input: summary, Cwd: cwd}
 			}
 		}
 	}

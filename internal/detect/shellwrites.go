@@ -8,41 +8,68 @@ import (
 	"time"
 )
 
-// readSettle is how long a read that found no file waits before it counts: its session's write of the file may not
-// be in the store yet. A session writes the file it looked for minutes later, well inside it.
+// readSettle is how long after a read that found no file its session's write of the file clears it, and so how long
+// the read waits before it counts: its write may not be in the store yet. A session writes the file it looked for
+// minutes later, well inside it.
 const readSettle = time.Hour
 
 // writtenPaths are the files a call that did not fail wrote, as it names them: a file tool's path, or the files a
-// shell's command line writes (shellWrites), a relative one read in cwd, the directory its result was in.
-func writtenPaths(tool, call, cwd string) []string {
+// shell's command line writes (shellWrites), a relative one read in the directory the call ran in (shellDir).
+func writtenPaths(harness, tool, call, cwd string) []string {
 	if isShell(tool) {
-		return shellWrites(call, cwd)
+		return shellWrites(call, shellDir(harness, call, cwd))
 	}
-	if p := callPath(call); p != "" {
+	if p, _, _ := callField(call, pathKeys); p != "" {
 		return []string{p}
 	}
 	return nil
 }
 
+// workdirKeys are the fields of a shell call's input that name the directory it runs its command in, as capacity
+// reads them.
+var workdirKeys = map[string]bool{"workdir": true, "cwd": true, "working_directory": true, "workingDirectory": true, "dir": true, "directory": true}
+
+// workdirShells are the harnesses whose shell call can name its directory (Codex's and OpenCode's workdir): a call
+// of theirs the store cut before such a field may have named one.
+var workdirShells = map[string]bool{"codex": true, "opencode": true}
+
+// shellDir is the directory a shell call runs its command in, as far as the store says, or "" when it does not say:
+// the workdir the call names, when that is a whole path; else the directory its session was in when it made the
+// call. Hermes's terminal keeps a directory of its own from call to call, which its record does not hold, so only
+// a workdir or a cd on the line says where it is.
+func shellDir(harness, call, cwd string) string {
+	w, named, absent := callField(call, workdirKeys)
+	switch {
+	case named:
+		if path.IsAbs(w) {
+			return w
+		}
+		return ""
+	case harness == "hermes", !absent && workdirShells[harness], !path.IsAbs(cwd):
+		return ""
+	}
+	return cwd
+}
+
 // shellWrites are the files a shell call's command line writes, as the shell reads its words (quotes off, escapes
 // read): the targets of its standard output's redirections (>, >>, >|, 1>, &>, &>>, >& FILE) and tee's files. The
-// line is the command's first, continued lines joined, up to a comment, since a here-document's text and the next
-// commands follow it. Only a command whose success the line's own says is read: the line's last, or one joined to
-// it by && only, with no || before it, and not negated. A relative file is read in cwd, or in the directory a cd to
-// a whole path just before it entered (cd DIR && ...); after another cd, a pushd or a popd it is not known, and
-// nor is a file the shell expands (a variable, a command's output, a glob, a leading ~) or a line the store's cut
-// reached.
-func shellWrites(call, cwd string) []string {
+// line is the command's first, continued lines joined, up to a comment. Bash reports the last line's status, so
+// the line counts only when nothing visible runs after it (nothingAfter). Of the line, only a command whose
+// success the line's own says is read: the line's last, or one joined to it by && only, with no || before it, and
+// not negated. A relative file is read in dir, or in the directory a cd to a whole path just before it entered (cd
+// DIR && ...); after another cd, a pushd or a popd it is not known, and nor is a file the shell expands (a
+// variable, a command's output, a glob, a leading ~).
+func shellWrites(call, dir string) []string {
 	loc := callRe.FindStringSubmatchIndex(call)
 	if loc == nil {
 		return nil
 	}
-	closed := loc[3] < len(call) && call[loc[3]] == '"'
-	toks, ended := shellLine(unescapeCut(call[loc[2]:loc[3]]))
-	if !ended && !closed { // the store cut the line
+	closed := loc[3] < len(call) && call[loc[3]] == '"' // the command's text is whole, whatever the cut took after it
+	line, ok := shellLine(unescapeCut(call[loc[2]:loc[3]]))
+	if !ok || !nothingAfter(line, closed) {
 		return nil
 	}
-	cmds := shellCommands(toks, cwd)
+	cmds := shellCommands(line.toks, dir)
 	var out []string
 	for i, c := range cmds {
 		if !reported(cmds[i:]) || slices.ContainsFunc(cmds[:i], func(d shellCmd) bool { return d.after == "||" }) {
@@ -76,6 +103,37 @@ func shellWrites(call, cwd string) []string {
 		}
 	}
 	return out
+}
+
+// nothingAfter says nothing visible runs after a command's first line: the command is that line alone, or the line
+// opens here-documents and only their text follows. A text the store cut inside a here-document keeps the benefit
+// of the doubt; one it cut anywhere else may hide a next command.
+func nothingAfter(line shellFirst, closed bool) bool {
+	if !line.ended {
+		return closed
+	}
+	lines := strings.Split(line.rest, "\n")
+	i := 0
+	for k, t := range line.toks {
+		if t.op != "<<" && t.op != "<<-" || k+1 >= len(line.toks) || line.toks[k+1].op != "" {
+			continue
+		}
+		for ; i < len(lines); i++ {
+			if l := lines[i]; l == line.toks[k+1].word || t.op == "<<-" && strings.TrimLeft(l, "\t") == line.toks[k+1].word {
+				break
+			}
+		}
+		if i == len(lines) { // the text ends inside the here-document
+			return true
+		}
+		i++
+	}
+	for ; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) != "" {
+			return false
+		}
+	}
+	return closed
 }
 
 // shellTok is a word of a command line, its quotes off, or one of its operators.
@@ -128,19 +186,23 @@ func reported(rest []shellCmd) bool {
 	return false
 }
 
-// shellCommands groups a line's tokens into its simple commands, each with the directory it runs in: cwd, then
-// the one a cd to a whole path enters for the commands joined to it by &&; another cd, a pushd or a popd leaves it
-// unknown. A subshell's (parentheses) directory ends with it; the parentheses are no separator.
-func shellCommands(toks []shellTok, cwd string) []shellCmd {
+// shellCommands groups a line's tokens into its simple commands, each with the directory it runs in: dir, then the
+// one a cd to a whole path enters for the commands joined to it by && (and a pipe on from them); another cd, a
+// pushd or a popd leaves it unknown. A subshell's (parentheses) directory ends with its last command; the
+// parentheses are no separator.
+func shellCommands(toks []shellTok, dir string) []shellCmd {
 	type state struct {
 		dir     string
 		chained bool // dir is a cd's, which the commands since it held by &&
 	}
-	at := state{}
-	if path.IsAbs(cwd) {
-		at.dir = cwd
-	}
+	at := state{dir: dir}
 	var stack []state
+	pops := 0 // the subshells that close on the command in progress
+	pop := func() {
+		if len(stack) > 0 {
+			at, stack = stack[len(stack)-1], stack[:len(stack)-1]
+		}
+	}
 	var out []shellCmd
 	var cur shellCmd
 	begun := false
@@ -159,16 +221,19 @@ func shellCommands(toks []shellTok, cwd string) []shellCmd {
 		switch prog {
 		case "cd":
 			if len(args) == 1 && args[0].exact && path.IsAbs(args[0].word) && after == "&&" {
-				at = state{dir: path.Clean(args[0].word), chained: true}
+				at = state{dir: args[0].word, chained: true}
 			} else {
 				at = state{}
 			}
 		case "pushd", "popd":
 			at = state{}
 		default:
-			if at.chained && after != "&&" {
+			if at.chained && after != "&&" && after != "|" && after != "|&" {
 				at = state{}
 			}
+		}
+		for ; pops > 0; pops-- {
+			pop()
 		}
 		cur, begun = shellCmd{}, false
 	}
@@ -180,8 +245,10 @@ func shellCommands(toks []shellTok, cwd string) []shellCmd {
 		case t.op == "(":
 			stack = append(stack, at)
 		case t.op == ")":
-			if len(stack) > 0 {
-				at, stack = stack[len(stack)-1], stack[:len(stack)-1]
+			if begun {
+				pops++
+			} else {
+				pop()
 			}
 		case strings.ContainsAny(t.op, "<>"):
 			begin()
@@ -228,11 +295,22 @@ func program(words []shellTok) (string, []shellTok) {
 // shellOps are the shell's operators, the longest first.
 var shellOps = []string{"&>>", "<<<", "<<-", "&&", "||", "|&", "&>", ">>", ">|", ">&", "<<", "<>", "<&", ";;", ";", "&", "|", "(", ")", ">", "<"}
 
-// shellLine splits a command's first line into words and operators as the shell does, and says whether the line
-// ended in the text: a backslash before the line's end joins the next, and a comment or the line's end stops it.
-// A test's or an arithmetic's text ([[ ]], (( ))) and a process substitution's (<( ), >( )) are one word each,
-// whose > compares or runs elsewhere.
-func shellLine(cmd string) (toks []shellTok, ended bool) {
+// openers are the words after which the next word still opens a command: a test or an arithmetic may follow them.
+var openers = map[string]bool{"time": true, "!": true, "if": true, "then": true, "else": true, "elif": true, "do": true, "while": true, "until": true}
+
+// shellFirst is a command's first line as the shell splits it: its words and operators, and the text after it.
+type shellFirst struct {
+	toks  []shellTok
+	rest  string // the text after the line
+	ended bool   // the line ended in the text, so rest follows it
+}
+
+// shellLine splits a command's first line into words and operators as the shell does: a backslash before the
+// line's end joins the next, and a comment runs to the line's end. A test's or an arithmetic's text ([[ ]], (( )))
+// and a process substitution's (<( ), >( )) are one word each, whose > compares or runs elsewhere. It is false for
+// a text it cannot read.
+func shellLine(cmd string) (shellFirst, bool) {
+	var toks []shellTok
 	start := true // the next word opens a command
 	for i := 0; ; {
 		for i < len(cmd) && (cmd[i] == ' ' || cmd[i] == '\t' || strings.HasPrefix(cmd[i:], "\\\n")) {
@@ -242,23 +320,30 @@ func shellLine(cmd string) (toks []shellTok, ended bool) {
 			i++
 		}
 		if i >= len(cmd) {
-			return toks, false
+			return shellFirst{toks: toks}, true
 		}
 		c := cmd[i]
 		switch {
-		case c == '\n' || c == '#':
-			return toks, true
+		case c == '#':
+			k := strings.IndexByte(cmd[i:], '\n')
+			if k < 0 {
+				return shellFirst{toks: toks}, true
+			}
+			i += k
+			fallthrough
+		case c == '\n':
+			return shellFirst{toks: toks, rest: cmd[i+1:], ended: true}, true
 		case start && strings.HasPrefix(cmd[i:], "(("):
 			toks = append(toks, shellTok{word: "(("})
 			if i = closing(cmd, i+2, 2); i < 0 {
-				return toks, false
+				return shellFirst{toks: toks}, true
 			}
 			start = false
 			continue
 		case (c == '<' || c == '>') && strings.HasPrefix(cmd[i+1:], "("):
 			toks = append(toks, shellTok{word: cmd[i : i+1]})
 			if i = closing(cmd, i+2, 1); i < 0 {
-				return toks, false
+				return shellFirst{toks: toks}, true
 			}
 			start = false
 			continue
@@ -272,6 +357,9 @@ func shellLine(cmd string) (toks []shellTok, ended bool) {
 			continue
 		}
 		w, j := shellWordAt(cmd, i)
+		if j == i { // a byte no rule above reads
+			return shellFirst{}, false
+		}
 		if j < len(cmd) && (cmd[j] == '<' || cmd[j] == '>') && w.exact && w.word != "" && strings.Trim(w.word, "0123456789") == "" &&
 			!strings.ContainsAny(cmd[i:j], `'"\`) {
 			op := opAt(cmd[j:]) // the word is a descriptor's number, which the redirection after it takes
@@ -281,12 +369,12 @@ func shellLine(cmd string) (toks []shellTok, ended bool) {
 		if start && cmd[i:j] == "[[" {
 			k := strings.Index(cmd[j:], "]]")
 			if k < 0 {
-				return append(toks, shellTok{word: "[["}), false
+				return shellFirst{toks: append(toks, shellTok{word: "[["})}, true
 			}
 			toks, i, start = append(toks, shellTok{word: "[["}), j+k+2, false
 			continue
 		}
-		toks, i, start = append(toks, w), j, false
+		toks, i, start = append(toks, w), j, w.exact && openers[w.word]
 	}
 }
 

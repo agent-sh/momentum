@@ -48,10 +48,10 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 		at            time.Time
 	}
 	var failed []seen
-	// the latest write of each path by each session that succeeded, from the results read so far: the pages run
-	// newest first, so every write after a result is in its page or in one before it
-	type wrote struct{ session, path string }
-	written := map[wrote]time.Time{}
+	// when each thread (a session, or a subagent of it) wrote each path with success, from the results read so far:
+	// the pages run newest first, so every write after a result is in its page or in one before it
+	type wrote struct{ session, agent, path string }
+	written := map[wrote][]time.Time{}
 	// Successful results must not displace older unflagged failures at maxRows.
 	var before *store.Event
 	for {
@@ -77,22 +77,23 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 			return gather("failures", occ, r), err
 		}
 		for _, e := range writes {
-			for _, p := range writtenPaths(e.Tool, calls[e.ID()], e.Cwd) {
-				if k := (wrote{e.Session, p}); e.TS.After(written[k]) {
-					written[k] = e.TS
-				}
+			c := calls[e.ID()]
+			for _, p := range writtenPaths(e.Harness, e.Tool, c.Input, c.Cwd) {
+				k := wrote{e.Session, e.Agent, p}
+				written[k] = append(written[k], e.TS)
 			}
 		}
 		for _, e := range candidates {
 			failed = append(failed, seen{e.Session, e.Tool, e.TS})
-			k, ok := FailureOf(e.Harness, e.Tool, e.Summary, calls[e.ID()])
+			call := calls[e.ID()].Input
+			k, ok := FailureOf(e.Harness, e.Tool, e.Summary, call)
 			if !ok {
 				continue
 			}
-			// a read of a file the session goes on to write found it not there yet: no failure; one younger than the
-			// settle time may have its write still to come
-			if p, ok := notFoundRead(e.Tool, e.Summary, calls[e.ID()], k); ok &&
-				(written[wrote{e.Session, p}].After(e.TS) || e.TS.After(w.Until.Add(-readSettle))) {
+			// a read of a file its thread writes within the settle time found it not there yet: no failure; one younger
+			// than the settle time may have its write still to come
+			if p, ok := notFoundRead(e.Tool, e.Summary, call, k); ok && (slices.ContainsFunc(written[wrote{e.Session, e.Agent, p}],
+				func(t time.Time) bool { return t.After(e.TS) && !t.After(e.TS.Add(readSettle)) }) || e.TS.After(w.Until.Add(-readSettle))) {
 				continue
 			}
 			occ = append(occ, occurrence{sig: signature("failures", k.String()), title: k.Title(), ev: e})
@@ -146,7 +147,7 @@ var (
 var notFoundRe = regexp.MustCompile(`(?i)\bdoes not exist\b|\b(?:file|path) not found\b|no such file or directory|\benoent\b`)
 
 // pathKeys are the fields of a file tool's input that name its file.
-var pathKeys = map[string]bool{"file_path": true, "filePath": true, "notebook_path": true, "path": true, "filename": true}
+var pathKeys = map[string]bool{"file_path": true, "filePath": true, "notebook_path": true, "path": true}
 
 // notFoundRead is the path a read tool's own error says holds no file, as its call names it, and false for any
 // other failure: one of another tool, a guard's or the harness's refusal, access refused, a call whose path the
@@ -155,35 +156,34 @@ func notFoundRead(tool, text, call string, k FailureKey) (string, bool) {
 	if !readTools[strings.ToLower(tool)] || k.Origin != toolOrigin(tool) || !notFoundRe.MatchString(text) {
 		return "", false
 	}
-	p := callPath(call)
+	p, _, _ := callField(call, pathKeys)
 	return p, p != ""
 }
 
-// callPath is the path a file tool's call names, as the store keeps the call (its first bytes), or "" when the
-// call names none whole: its input's first field that names a file, read up to where the store cut it.
-func callPath(call string) string {
+// callField is the first field of keys a tool call's input names, as the store keeps the call (its first bytes),
+// read up to where the store cut it: its text ("" for another value), whether the input names one before the cut,
+// and whether it names none in an input the store kept whole.
+func callField(call string, keys map[string]bool) (value string, named, absent bool) {
 	d := json.NewDecoder(strings.NewReader(call))
 	if t, err := d.Token(); err != nil || t != json.Delim('{') {
-		return ""
+		return "", false, false
 	}
 	for d.More() {
 		t, err := d.Token()
 		if err != nil {
-			return ""
+			return "", false, false
 		}
 		var v json.RawMessage
 		if err := d.Decode(&v); err != nil {
-			return ""
+			return "", false, false
 		}
-		if key, _ := t.(string); pathKeys[key] {
-			var p string
-			if json.Unmarshal(v, &p) != nil {
-				return ""
-			}
-			return p
+		if key, _ := t.(string); keys[key] {
+			json.Unmarshal(v, &value)
+			return value, true, false
 		}
 	}
-	return ""
+	_, err := d.Token() // the input's closing brace
+	return "", false, err == nil
 }
 
 // wroteFile says a write tool's result that is no failure (toolresult.Failed) did write: a JSON result that

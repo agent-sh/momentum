@@ -516,6 +516,18 @@ func TestAReadOfAFileItsSessionThenCreatesIsNoFailure(t *testing.T) {
 				f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
 				f.readMissing("s2", "/w/out/c.md", t0), []store.Event{logged("s2", t0)}, f.wrote("s2", "/w/out/c.md", t0.Add(time.Minute)))
 		}, nil},
+		{"a sibling subagent writes it", func(f *fileTools) []store.Event {
+			as := func(agent string, evs []store.Event) []store.Event {
+				for i := range evs {
+					evs[i].Agent = agent
+				}
+				return evs
+			}
+			return slices.Concat(as("a1", f.readMissing("s1", "/w/out/a.md", t0)), as("a2", f.wrote("s1", "/w/out/a.md", t0.Add(time.Minute))),
+				as("a1", f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour))), as("a2", f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute))),
+				as("a1", f.readMissing("s2", "/w/out/c.md", t0)), as("a2", f.wrote("s2", "/w/out/c.md", t0.Add(time.Minute))),
+				as("a3", f.readMissing("s3", "/w/out/d.md", t0)), as("a3", f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute))))
+		}, []string{missing + " 3"}},
 		{"another session writes it", func(f *fileTools) []store.Event {
 			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)),
 				f.readMissing("s2", "/w/out/c.md", t0.Add(2*time.Hour)),
@@ -602,6 +614,10 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 		{"hermes", "read_file", "patch", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"mode":"replace","path":"/w/@"}`, `{"success": true, "diff": "x"}`},
 		{"opencode", "read", "write", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"filePath":"/w/@","content":"x"}`, "Created file successfully: /w/@"},
 		{"pi", "read", "write", `{"path":"/w/@"}`, "ENOENT: no such file or directory, access '/w/@'", `{"path":"/w/@","content":"x"}`, "Successfully wrote 1 bytes to /w/@"},
+		{"pi", "read", "edit", `{"path":"/w/@"}`, "ENOENT: '/w/@'", `{"path":"/w/@","oldText":"","newText":"x"}`, "Successfully replaced text in /w/@"},
+		{"hermes", "read_file", "write_file", `{"path":"/w/@"}`, `{"error": "[Errno 2] No such file or directory: '/w/@'"}`, `{"path":"/w/@","content":"x"}`, `{"bytes_written": 1}`},
+		{"claude", "Read", "NotebookEdit", `{"file_path":"/w/@"}`, claudeMissing, `{"notebook_path":"/w/@","new_source":"x","edit_mode":"insert"}`, "Inserted cell"},
+		{"claude", "Read", "MultiEdit", `{"file_path":"/w/@"}`, claudeMissing, `{"file_path":"/w/@","edits":[{"old_string":"","new_string":"x"}]}`, "Applied 1 edit to /w/@"},
 	} {
 		t.Run(tc.harness+"/"+tc.write, func(t *testing.T) {
 			st := testStore(t)
@@ -702,6 +718,14 @@ func TestAShellLineWritesWhatItsCommandReports(t *testing.T) {
 		{"after another command", "", x, "mkdir -p /w/out; python3 gen.py > /w/out/x.jsonl", false, true},
 		{"cut in a later field", "", x, `{"command":"python3 gen.py > /w/out/x.jsonl","description":"` + strings.Repeat("d", 200) + `…`, false, true},
 		{"cut inside an escape past the line", "", x, `{"command":"cat > /w/out/x.jsonl <<'EOF'\n{\"a\":\"b \u00…`, false, true},
+		{"a here-document and nothing after it", "", x, "cat > /w/out/x.jsonl <<'EOF'\n{\"id\":1}\nEOF\n", false, true},
+		{"a here-document whose end is indented", "", x, "cat > /w/out/x.jsonl <<-EOF\n\t{\"id\":1}\n\tEOF", false, true},
+		{"two here-documents", "", x, "cat > /w/out/x.jsonl <<A 3<<B\na\nA\nb\nB", false, true},
+		{"a comment, then nothing", "", x, "python3 gen.py > /w/out/x.jsonl # done\n", false, true},
+		{"after a subshell that only enters a directory", "/w/out", x, "(cd /w/elsewhere) && echo a > x.jsonl", false, true},
+		{"tee in the directory the line enters", "/w", x, "cd /w/out && python3 gen.py | tee x.jsonl", false, true},
+		{"quoted digits before >", "", x, "echo a '2'> /w/out/x.jsonl", false, true},
+		{"an escaped $ in double quotes", "", "/w/out/$x.jsonl", `cat > "/w/out/\$x.jsonl"`, false, true},
 
 		{"the command failed", "", x, "cat > /w/out/x.jsonl <<'EOF'" + body, true, false},
 		{"another descriptor", "", x, "python3 gen.py 2> /w/out/x.jsonl", false, false},
@@ -739,6 +763,19 @@ func TestAShellLineWritesWhatItsCommandReports(t *testing.T) {
 		{"a first line the store cut", "", x, `{"command":"cat > /w/out/x.jsonl && tru…`, false, false},
 		{"a cut inside an escape at the path", "", "/w/out/k", `{"command":"cat > /w/out/k\u…`, false, false},
 		{"a cut that leaves a backslash last", "", x, `{"command":"cat > /w/out/x.jsonl \u0026\u0026 \\\u00…`, false, false},
+		{"a command on the next line", "", x, "echo a > /w/out/x.jsonl\necho ok", false, false},
+		{"a command after the here-document", "", x, "cat > /w/out/x.jsonl <<'EOF'\n{\"id\":1}\nEOF\necho done", false, false},
+		{"a line the store cut after it", "", x, `{"command":"echo a > /w/out/x.jsonl\necho o…`, false, false},
+		{"a here-document's end, then the cut", "", x, `{"command":"cat > /w/out/x.jsonl <<'EOF'\nx\nEOF\nech…`, false, false},
+		{"a comment the store cut", "", x, `{"command":"python3 gen.py > /w/out/x.jsonl # a no…`, false, false},
+		{"a comment, then a command", "", x, "python3 gen.py > /w/out/x.jsonl # done\necho ok", false, false},
+		{"an indented end, then a command", "", x, "cat > /w/out/x.jsonl <<-EOF\n\t{\"id\":1}\n\tEOF\necho done", false, false},
+		{"the store cut right after the line", "", x, `{"command":"echo a > /w/out/x.jsonl\n\u00…`, false, false},
+		{"a test run by time", "", x, "time [[ a > /w/out/x.jsonl ]]", false, false},
+		{"after a cd with two words", "/w", x, "cd /w/out x && cat > x.jsonl", false, false},
+		{"a brace expansion", "", "/w/out/{a,b}.jsonl", "cat > /w/out/{a,b}.jsonl", false, false},
+		{"a ? glob", "", "/w/out/x?.jsonl", "cat > /w/out/x?.jsonl", false, false},
+		{"a command substitution's redirection", "", x, "echo $(cat > /w/out/x.jsonl)", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := testStore(t)
@@ -748,6 +785,51 @@ func TestAShellLineWritesWhatItsCommandReports(t *testing.T) {
 				at := t0.Add(time.Duration(i) * time.Hour)
 				evs = append(evs, kimiReadMissing(&f, session, tc.path, at)...)
 				evs = append(evs, shellCall(&f, session, tc.cwd, tc.line, tc.failed, at.Add(time.Minute))...)
+			}
+			put(t, st, evs...)
+			fs, err := Failures{}.Detect(context.Background(), st, week())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.writes && len(fs) != 0 || !tc.writes && (len(fs) != 1 || len(fs[0].Evidence) != 3) {
+				t.Fatalf("writes %v, found %v", tc.writes, signatures(fs))
+			}
+		})
+	}
+}
+
+// A relative file is read in the directory the shell call ran in: the workdir the call names, else the directory
+// its session was in when it made the call, never the one its result reports. Hermes's terminal keeps a directory
+// of its own, so only a workdir or a cd on the line says where it is.
+func TestAShellRunsInItsCallsDirectory(t *testing.T) {
+	const x = "/w/out/x.jsonl"
+	long := "cat >> x.jsonl <<'EOF'\n" + strings.Repeat(`{"id":1,"verdict":"keep"}`+"\n", 20)
+	cut, _ := json.Marshal(map[string]string{"command": long})
+	for _, tc := range []struct {
+		name, harness, tool, callCwd, resultCwd, input, path string
+		writes                                               bool
+	}{
+		{"the call's directory, not the result's", "kimi", "Bash", "/w/out", "/w/elsewhere", `{"command":"cat >> x.jsonl"}`, x, true},
+		{"the result's directory is not the call's", "kimi", "Bash", "/w/elsewhere", "/w/out", `{"command":"cat >> x.jsonl"}`, x, false},
+		{"a whole workdir", "opencode", "bash", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"/w/out"}`, x, true},
+		{"a relative workdir", "opencode", "bash", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"out"}`, "/w/x.jsonl", false},
+		{"Codex's workdir", "codex", "exec_command", "/w", "/w", `{"cmd":"cat >> x.jsonl","workdir":"/w/out"}`, x, true},
+		{"a cut call that may name a workdir", "opencode", "bash", "/w/out", "/w/out", string(cut[:240]) + "…", x, false},
+		{"Hermes's terminal keeps its own directory", "hermes", "terminal", "/w/out", "/w/out", `{"command":"cat >> x.jsonl"}`, x, false},
+		{"Hermes after a cd", "hermes", "terminal", "/w/elsewhere", "/w/elsewhere", `{"command":"cd /w/out && cat >> x.jsonl"}`, x, true},
+		{"Hermes's workdir", "hermes", "terminal", "/w/elsewhere", "/w/elsewhere", `{"command":"cat >> x.jsonl","workdir":"/w/out"}`, x, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testStore(t)
+			f := fileTools{harness: "kimi"}
+			w := fileTools{harness: tc.harness}
+			var evs []store.Event
+			for i, session := range []string{"s1", "s1", "s2"} {
+				at := t0.Add(time.Duration(i) * time.Hour)
+				evs = append(evs, kimiReadMissing(&f, session, tc.path, at)...)
+				pair := w.pair(session, tc.tool, tc.input, "", false, at.Add(time.Minute))
+				pair[0].Cwd, pair[1].Cwd = tc.callCwd, tc.resultCwd
+				evs = append(evs, pair...)
 			}
 			put(t, st, evs...)
 			fs, err := Failures{}.Detect(context.Background(), st, week())
@@ -794,32 +876,48 @@ func TestAReadWaitsForItsWriteBeforeItCounts(t *testing.T) {
 	if err != nil || len(outs) != 1 || len(outs[0].Filed) != 0 {
 		t.Fatalf("a run before the last read settled: %+v, %v", outs, err)
 	}
-	put(t, st, slices.Concat(f.wrote("s1", "/w/out/a.md", t0.Add(3*time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(3*time.Hour)),
-		f.wrote("s2", "/w/out/c.md", t0.Add(3*time.Hour)))...)
+	put(t, st, slices.Concat(f.wrote("s1", "/w/out/a.md", t0.Add(10*time.Minute)), f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+10*time.Minute)),
+		f.wrote("s2", "/w/out/c.md", t0.Add(2*time.Hour+10*time.Minute)))...)
 	outs, _, err = Run(ctx, st, []Detector{Failures{}}, Window{Since: t0.Add(-24 * time.Hour), Until: t0.Add(4 * time.Hour)}, "test", false)
 	if err != nil || len(outs) != 1 || len(outs[0].Filed) != 0 {
 		t.Fatalf("a run that holds the writes: %+v, %v", outs, err)
 	}
 }
 
-// Later is up to the window's end: a write the store does not hold yet, or one past the window, leaves a settled read
-// a failure, and the first run whose window holds the write no longer counts it.
-func TestAReadCountsUntilTheWindowHoldsItsWrite(t *testing.T) {
+// A read is cleared only by its thread's write within the hour after it, so the verdict of a settled read is final:
+// a write later than that clears nothing, and one before the read neither.
+func TestAReadClearsOnlyOnAWriteWithinTheHour(t *testing.T) {
+	st := testStore(t)
+	f := claudeFiles
+	put(t, st, slices.Concat(
+		f.readMissing("s1", "/w/out/a.md", t0), f.wrote("s1", "/w/out/a.md", t0.Add(time.Hour)),
+		f.readMissing("s1", "/w/out/b.md", t0.Add(2*time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(3*time.Hour+time.Minute)),
+		f.readMissing("s2", "/w/out/c.md", t0), f.wrote("s2", "/w/out/c.md", t0.Add(61*time.Minute)),
+		f.readMissing("s2", "/w/out/d.md", t0.Add(4*time.Hour)), f.wrote("s2", "/w/out/d.md", t0.Add(6*time.Hour)),
+		// a write before the read and one within the hour; one within the hour and one long after
+		f.wrote("s3", "/w/out/e.md", t0.Add(-10*time.Minute)), f.readMissing("s3", "/w/out/e.md", t0), f.wrote("s3", "/w/out/e.md", t0.Add(30*time.Minute)),
+		f.readMissing("s3", "/w/out/g.md", t0), f.wrote("s3", "/w/out/g.md", t0.Add(30*time.Minute)), f.wrote("s3", "/w/out/g.md", t0.Add(3*time.Hour)))...)
+	fs, err := Failures{}.Detect(context.Background(), st, week())
+	if got, want := signatures(fs), []string{"failures/v2:tool:read:file does not exist. note: your current working directory is P 3"}; err != nil || !slices.Equal(got, want) {
+		t.Fatalf("found %v, %v, want %v", got, err, want)
+	}
+}
+
+// A write within the hour that the store holds late leaves a settled read a failure on the runs before it is
+// stored, and the first run that holds it no longer counts the read.
+func TestALateStoredWriteClearsASettledRead(t *testing.T) {
 	st := testStore(t)
 	f := claudeFiles
 	put(t, st, slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)),
 		f.readMissing("s2", "/w/out/c.md", t0.Add(2*time.Hour)))...)
 	early := Window{Since: t0.Add(-time.Hour), Until: t0.Add(3*time.Hour + 2*time.Second)}
 	if fs, err := (Failures{}).Detect(context.Background(), st, early); err != nil || len(fs) != 1 || len(fs[0].Evidence) != 3 {
-		t.Fatalf("before the writes: %v, %v", signatures(fs), err)
+		t.Fatalf("before the writes are stored: %v, %v", signatures(fs), err)
 	}
-	put(t, st, slices.Concat(f.wrote("s1", "/w/out/a.md", t0.Add(4*time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(4*time.Hour)),
-		f.wrote("s2", "/w/out/c.md", t0.Add(4*time.Hour)))...)
-	if fs, err := (Failures{}).Detect(context.Background(), st, early); err != nil || len(fs) != 1 || len(fs[0].Evidence) != 3 {
-		t.Fatalf("the writes past the window: %v, %v", signatures(fs), err)
-	}
-	if fs, err := (Failures{}).Detect(context.Background(), st, week()); err != nil || len(fs) != 0 {
-		t.Fatalf("a window that holds the writes: %v, %v", signatures(fs), err)
+	put(t, st, slices.Concat(f.wrote("s1", "/w/out/a.md", t0.Add(30*time.Minute)), f.wrote("s1", "/w/out/b.md", t0.Add(90*time.Minute)),
+		f.wrote("s2", "/w/out/c.md", t0.Add(150*time.Minute)))...)
+	if fs, err := (Failures{}).Detect(context.Background(), st, early); err != nil || len(fs) != 0 {
+		t.Fatalf("once they are: %v, %v", signatures(fs), err)
 	}
 }
 
