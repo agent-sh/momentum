@@ -103,7 +103,7 @@ func TestTheOwnersChecksAreKept(t *testing.T) {
 		t.Fatalf("the events of a store from before the checks: %d %v", len(evs), err)
 	}
 	c := RequestCheck{Request: "rabc12345678", Result: "commit:1a2b3c4", ResultAt: time.UnixMilli(900), Proof: "e1", ProofAt: time.UnixMilli(1000),
-		At: time.UnixMilli(1100)}
+		Words: "the rename reads right to me", At: time.UnixMilli(1100)}
 	if ok, err := st.CheckOnce(ctx, c, nil); err != nil || !ok {
 		t.Fatalf("check: %v %v", ok, err)
 	}
@@ -116,11 +116,12 @@ func TestTheOwnersChecksAreKept(t *testing.T) {
 	if _, err := st.Rebuild(ctx, "mistakes", false); err != nil {
 		t.Fatal(err)
 	}
-	undone, err := st.UndoRequestCheck(ctx, []string{"rabc12345678"}, time.UnixMilli(2000), "e2")
-	if err != nil || undone.Proof != "e1" || undone.UndoProof != "e2" || !undone.ProofAt.Equal(c.ProofAt) {
+	u := RequestUndo{Proof: "e2", ProofAt: time.UnixMilli(1900), Words: "take my check back please"}
+	undone, err := st.UndoRequestCheck(ctx, []string{"rabc12345678"}, time.UnixMilli(2000), u)
+	if err != nil || undone.Proof != "e1" || undone.Words != c.Words || undone.Undo != u || !undone.ProofAt.Equal(c.ProofAt) {
 		t.Fatalf("undo: %+v %v", undone, err)
 	}
-	if _, err := st.UndoRequestCheck(ctx, []string{"rabc12345678"}, time.UnixMilli(2100), "e3"); !errors.Is(err, ErrNoCheck) {
+	if _, err := st.UndoRequestCheck(ctx, []string{"rabc12345678"}, time.UnixMilli(2100), RequestUndo{Proof: "e3"}); !errors.Is(err, ErrNoCheck) {
 		t.Fatalf("an undo with none standing: %v", err)
 	}
 	checks, err := st.RequestChecks(ctx, nil, []string{"rabc1234"}, 4)
@@ -128,8 +129,31 @@ func TestTheOwnersChecksAreKept(t *testing.T) {
 		t.Fatalf("checks: %+v %v", checks, err)
 	}
 	if got := checks[0]; got.Result != c.Result || !got.ResultAt.Equal(c.ResultAt) || got.Proof != "e1" || !got.ProofAt.Equal(c.ProofAt) ||
-		!got.At.Equal(c.At) || !got.Undone.Equal(time.UnixMilli(2000)) || got.UndoProof != "e2" {
+		got.Words != c.Words || !got.At.Equal(c.At) || !got.Undone.Equal(time.UnixMilli(2000)) || got.Undo.Proof != "e2" ||
+		!got.Undo.ProofAt.Equal(u.ProofAt) || got.Undo.Words != u.Words {
 		t.Fatalf("the check read back: %+v", got)
+	}
+}
+
+// Only a standing check of the same result on a proof turn no older than the new one's stands in the way: a check on
+// a later turn of his records, one on an older turn does not.
+func TestACheckOnALaterTurnIsNotHeldBack(t *testing.T) {
+	st, _ := open(t)
+	ctx := context.Background()
+	c := RequestCheck{Request: "rabc12345678", Result: "commit:1a2b3c4", ResultAt: time.UnixMilli(900), Proof: "e1", ProofAt: time.UnixMilli(1000),
+		Words: "the rename reads right to me", At: time.UnixMilli(1100)}
+	if ok, err := st.CheckOnce(ctx, c, nil); err != nil || !ok {
+		t.Fatalf("check: %v %v", ok, err)
+	}
+	older := c
+	older.Proof, older.ProofAt = "e0", time.UnixMilli(500)
+	if ok, err := st.CheckOnce(ctx, older, nil); err != nil || ok {
+		t.Fatalf("a check on an older turn: %v %v", ok, err)
+	}
+	later := c
+	later.Proof, later.ProofAt = "e2", time.UnixMilli(2000)
+	if ok, err := st.CheckOnce(ctx, later, nil); err != nil || !ok {
+		t.Fatalf("a check on a later turn: %v %v", ok, err)
 	}
 }
 

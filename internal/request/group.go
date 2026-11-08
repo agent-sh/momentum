@@ -235,9 +235,9 @@ func fill(u sets, reqs map[string]*Request, t *thread) {
 		repeat := last != nil && last.words == words && last.marker == tn.marker && tn.at.Sub(last.at) <= sameTurn && !t.agentBetween(last.at, tn.at)
 		last = &seen{tn.at, words, tn.marker}
 		rq := of(t.segAt(tn.at))
-		if rq != nil && tn.owner && tn.words != "" && !tn.at.Before(rq.start()) {
-			// what a check's proof is looked for in: his words, and a program's, which it names when they alone hold it
-			rq.said = append(rq.said, spoken{at: tn.at, event: tn.ev.ID(), words: tn.words, program: tn.program, command: slashCommand(tn.words)})
+		if rq != nil && tn.owner && tn.own != "" && !tn.at.Before(rq.start()) {
+			// what a check's proof is looked for in: his words, and a program's, which it names when they alone are it
+			rq.said = append(rq.said, spoken{at: tn.at, event: tn.ev.ID(), words: tn.own, program: tn.program, command: slashCommand(tn.own)})
 		}
 		if rq == nil || tn.program && tn.marker == "" || tn.at.Before(rq.start()) || repeat {
 			continue
@@ -245,7 +245,7 @@ func fill(u sets, reqs map[string]*Request, t *thread) {
 		if tn.at.After(rq.LastTurn) {
 			rq.LastTurn = tn.at
 		}
-		if tn.owner && !tn.program && words != "" && !slashCommand(words) && tn.at.After(rq.LastOwnerTurn) {
+		if tn.owner && !tn.program && tn.own != "" && !slashCommand(tn.own) && tn.at.After(rq.LastOwnerTurn) {
 			rq.LastOwnerTurn = tn.at // his own ask: what reopens his check; a paste with no words of his asks nothing
 		}
 		if th := thread(rq); th != nil && tn.at.After(th.turn) {
@@ -274,7 +274,12 @@ func fill(u sets, reqs map[string]*Request, t *thread) {
 		}
 	}
 	for _, it := range t.replies {
-		if rq := of(t.segAt(it.r.At)); rq != nil && !it.r.At.Before(rq.start()) && (rq.Report == nil || !it.r.At.Before(rq.Report.At)) {
+		rq := of(t.segAt(it.r.At))
+		if rq == nil || it.r.At.Before(rq.start()) {
+			continue
+		}
+		rq.replies = append(rq.replies, it.r)
+		if rq.Report == nil || !it.r.At.Before(rq.Report.At) {
 			rp := it.r
 			rq.Report = &rp
 		}
@@ -285,7 +290,8 @@ func fill(u sets, reqs map[string]*Request, t *thread) {
 var harnessCommands = map[string]bool{"compact": true, "model": true, "exit": true, "quit": true, "login": true, "logout": true,
 	"clear": true, "resume": true, "cost": true, "status": true, "config": true, "help": true, "memory": true, "permissions": true,
 	"doctor": true, "vim": true, "theme": true, "mcp": true, "hooks": true, "ide": true, "export": true, "context": true, "usage": true,
-	"fast": true, "effort": true, "statusline": true, "upgrade": true, "approvals": true, "new": true}
+	"fast": true, "effort": true, "statusline": true, "upgrade": true, "approvals": true, "new": true, "rc": true, "reset": true,
+	"sethome": true, "goal": true, "mod": true, "curator": true, "rules": true}
 
 // slashCommand reports a turn that is a harness command (/compact, /model sonnet, /exit), not an ask: a path
 // (/home/...) is none.
@@ -316,6 +322,16 @@ func fold(rq *Request) {
 		}
 	}
 	rq.Asks = asks
+	sort.SliceStable(rq.replies, func(i, j int) bool { return rq.replies[i].At.Before(rq.replies[j].At) })
+	var replies []Result
+	seenReply := map[string]bool{}
+	for _, x := range rq.replies {
+		if !seenReply[x.Key] { // a fork's copy counts once
+			seenReply[x.Key] = true
+			replies = append(replies, x)
+		}
+	}
+	rq.replies = replies
 	sort.SliceStable(rq.Results, func(i, j int) bool { return rq.Results[i].At.Before(rq.Results[j].At) })
 	keys := map[string]bool{}
 	writes := map[string]int{}

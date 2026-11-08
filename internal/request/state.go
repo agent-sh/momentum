@@ -53,11 +53,14 @@ func state(rq *Request) {
 		rq.State, rq.Why = Working, "a session of it was last seen working"
 	case standing && holds:
 		rq.State = Checked
-		if x := rq.checked(c); x != nil {
-			rq.Why = "the owner checked " + plain.Clip(plain.Line(x.Text), 120) + " in his turn of " + c.ProofAt.Local().Format(timeFormat) + "; that he checked it does not make it right"
-		} else {
-			rq.Why = "the owner checked a result that can no longer be read (" + c.Result + ") in his turn of " + c.ProofAt.Local().Format(timeFormat) +
-				", and nothing came after it"
+		said := " in his turn of " + c.ProofAt.Local().Format(timeFormat) + ", relayed as \"" + plain.Clip(c.Words, 160) + "\""
+		switch x := rq.checked(c); {
+		case x != nil && x.Kind == KindReport:
+			rq.Why = "the owner checked the agent's reply of " + x.At.Local().Format(timeFormat) + said + "; that he checked it does not make it right"
+		case x != nil:
+			rq.Why = "the owner checked " + plain.Clip(plain.Line(x.Text), 120) + said + "; that he checked it does not make it right"
+		default:
+			rq.Why = "the owner checked a result that can no longer be read (" + c.Result + ")" + said + ", and nothing came after it"
 		}
 	case latest == nil:
 		rq.State, rq.Why = Unknown, "every session of it moved on to another request, so nothing records whether it is done"

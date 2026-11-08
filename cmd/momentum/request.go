@@ -13,6 +13,7 @@ import (
 	"github.com/agent-sh/momentum/internal/paths"
 	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/request"
+	"github.com/agent-sh/momentum/internal/source"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -72,12 +73,13 @@ type requestJSON struct {
 	Checked *checkedJSON `json:"checked,omitempty"`
 }
 
-// checkedJSON is the owner's check of a request: the result it binds, and his turn it rests on, by its time and
-// its event (momentum evidence show takes it).
+// checkedJSON is the owner's check of a request: the result it binds, and his turn it rests on, by its time, its
+// event (momentum evidence show takes it) and the words relayed, so a wrong relay shows.
 type checkedJSON struct {
 	Result string `json:"result"`
 	At     string `json:"at"`
 	Proof  string `json:"proof"`
+	Words  string `json:"words"`
 }
 
 func requestList(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -131,7 +133,7 @@ func requestList(ctx context.Context, args []string, stdout, stderr io.Writer) e
 				j.Threads = append(j.Threads, th.ID)
 			}
 			if c, _, holds := rq.Standing(); holds && rq.State == request.Checked {
-				j.Checked = &checkedJSON{Result: c.Result, At: c.ProofAt.Local().Format(time.RFC3339), Proof: "ev:" + c.Proof}
+				j.Checked = &checkedJSON{Result: c.Result, At: c.ProofAt.Local().Format(time.RFC3339), Proof: "ev:" + c.Proof, Words: c.Words}
 			}
 			out.Requests = append(out.Requests, j)
 		}
@@ -152,7 +154,7 @@ func requestList(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		}
 		checked := ""
 		if c, _, holds := rq.Standing(); holds && rq.State == request.Checked {
-			checked = "  (checked in his turn of " + c.ProofAt.Local().Format("2006-01-02 15:04") + ")"
+			checked = "  (checked in his turn of " + c.ProofAt.Local().Format("2006-01-02 15:04") + ": \"" + plain.Clip(c.Words, 80) + "\")"
 		}
 		fmt.Fprintf(stdout, "%-14s %-9s %s  %-11s %s%s\n", rq.ID, rq.State, rq.Last.Local().Format("2006-01-02 15:04"), sessions,
 			plain.Clip(asking(rq), 80), checked)
@@ -199,12 +201,13 @@ func requestHandoff(ctx context.Context, args []string, stdout, stderr io.Writer
 	return err
 }
 
-// requestCheck records the owner's check of a request's result, or undoes it, on his own words an agent relays with
-// --proof: momentum finds them in a turn of his in the request's sessions, and refuses, saying why, when it does not.
+// requestCheck records the owner's check of a request's result, or undoes it, on his own turn an agent relays with
+// --proof: momentum finds it among his turns in the request's sessions, after reading what is new in the transcripts,
+// and refuses, saying why, when it does not.
 func requestCheck(ctx context.Context, cmd string, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("request "+cmd, flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	proof := fs.String("proof", "", "the owner's own words, as he typed them in a turn of the request (at least 3), that prove it is his")
+	proof := fs.String("proof", "", "the owner's own turn where he says it, whole, as he typed it")
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
 	}
@@ -218,11 +221,15 @@ func requestCheck(ctx context.Context, cmd string, args []string, stdout, stderr
 	if len(ids) != 1 {
 		return usageError{fmt.Sprintf(`request %s needs one ID (a request's id, or a session's id or its start) and --proof "WORDS", the owner's own`, cmd)}
 	}
+	if err := request.ProofShape(*proof); err != nil {
+		return usageError{fmt.Sprintf("%s %s not recorded: %v", ids[0], cmd, err)}
+	}
 	st, err := store.Open(paths.DB())
 	if err != nil {
 		return err
 	}
 	defer st.Close()
+	caught := catchUp(ctx, st)
 	rq, err := request.Find(ctx, st, ids[0], requestOptions(stderr))
 	if errors.Is(err, request.ErrNoRequest) {
 		return usageError{err.Error()}
@@ -231,18 +238,32 @@ func requestCheck(ctx context.Context, cmd string, args []string, stdout, stderr
 		return err
 	}
 	refused := func(err error) error {
-		if errors.Is(err, request.ErrNoProof) || errors.Is(err, request.ErrNoRequest) || errors.Is(err, store.ErrNoCheck) {
-			return usageError{fmt.Sprintf("%s: %s not recorded: %v", rq.ID, cmd, err)}
+		if !errors.Is(err, request.ErrNoProof) && !errors.Is(err, request.ErrNoRequest) && !errors.Is(err, store.ErrNoCheck) {
+			return err
 		}
-		return err
+		msg := fmt.Sprintf("%s: %s not recorded: %v", rq.ID, cmd, err)
+		if errors.Is(err, request.ErrNoTurn) {
+			// the store lags his turns: say how far it reaches, never that he did not say it
+			through, rerr := st.ReadThrough(ctx, store.Transcripts)
+			reach := "has read no transcripts yet"
+			if rerr == nil && !through.IsZero() {
+				reach = "holds the transcripts as read up to " + through.Local().Format("2006-01-02 15:04")
+			}
+			msg += "; the store " + reach
+			if caught != nil {
+				msg += ", and the ingest this command runs first could not read them (" + caught.Error() + ")"
+			}
+			msg += ", so a turn of his after that is not in it yet: retry after the next ingest"
+		}
+		return usageError{msg}
 	}
 	if cmd == "uncheck" {
 		c, p, err := request.Uncheck(ctx, st, rq, *proof, time.Now())
 		if err != nil {
 			return refused(err)
 		}
-		fmt.Fprintf(stdout, "%s: undid the check of his turn of %s on %s, on his turn of %s (ev:%s)\n", rq.ID,
-			c.ProofAt.Local().Format("2006-01-02 15:04"), c.Result, p.At.Local().Format("2006-01-02 15:04"), p.Event)
+		fmt.Fprintf(stdout, "%s: undid the check of his turn of %s on %s, on his turn of %s, relayed as %q (ev:%s)\n", rq.ID,
+			c.ProofAt.Local().Format("2006-01-02 15:04"), c.Result, p.At.Local().Format("2006-01-02 15:04"), p.Words, p.Event)
 		return nil
 	}
 	c, err := request.Check(ctx, st, rq, *proof, time.Now())
@@ -253,7 +274,52 @@ func requestCheck(ctx context.Context, cmd string, args []string, stdout, stderr
 		fmt.Fprintf(stdout, "%s: checked already, on his turn of %s\n", rq.ID, c.Proof.At.Local().Format("2006-01-02 15:04"))
 		return nil
 	}
-	fmt.Fprintf(stdout, "%s: checked %s, on his turn of %s (ev:%s); a newer result or a later ask of his reopens it\n", rq.ID,
-		plain.Clip(plain.Line(c.Result.Text), 120), c.Proof.At.Local().Format("2006-01-02 15:04"), c.Proof.Event)
+	fmt.Fprintf(stdout, "%s: checked %s, on his turn of %s, relayed as %q (ev:%s); a newer artifact or a later ask of his reopens it\n", rq.ID,
+		plain.Clip(plain.Line(c.Result.Text), 120), c.Proof.At.Local().Format("2006-01-02 15:04"), c.Proof.Words, c.Proof.Event)
+	return nil
+}
+
+// catchUpFor bounds the ingest a check runs first: the store lags his turns by up to an ingest timer's period.
+const catchUpFor = 2 * time.Minute
+
+// catchUp reads what is new in the transcripts into the store, as the ingest timer does and under its lock, for at
+// most catchUpFor, so his newest turn is there when a check looks for it. It waits while another ingest holds the
+// lock. It returns why it could not read them.
+func catchUp(ctx context.Context, st *store.Store) error {
+	sources, err := configured()
+	if err != nil {
+		return err
+	}
+	var tr []source.Source
+	for _, s := range sources {
+		if s.Name() == store.Transcripts {
+			tr = append(tr, s)
+		}
+	}
+	if len(tr) == 0 {
+		return errors.New("no transcripts source is configured")
+	}
+	ctx, cancel := context.WithTimeout(ctx, catchUpFor)
+	defer cancel()
+	for {
+		unlock, err := st.LockIngest()
+		if err == nil {
+			defer unlock()
+			break
+		}
+		if !errors.Is(err, store.ErrIngestHeld) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%v for %s", err, catchUpFor)
+		case <-time.After(time.Second):
+		}
+	}
+	for _, o := range source.RunAll(ctx, st, tr) {
+		if o.Err != nil {
+			return o.Err
+		}
+	}
 	return nil
 }

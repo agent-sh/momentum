@@ -27,7 +27,7 @@ func TestListAndHandoffAgreeOnACheckFromBefore(t *testing.T) {
 			f.owner("s-one", at(3), "the port looks right to me")
 			f.phase("s-one", at(4), "phase", "idle", nil)
 			rq := f.group()[0]
-			if c, err := Check(ctx, f.st, rq, "the port looks right", at(5)); err != nil || !c.Added || c.Result.Key != "commit:1111aaa" {
+			if c, err := Check(ctx, f.st, rq, "the port looks right to me", at(5)); err != nil || !c.Added || c.Result.Key != "commit:1111aaa" {
 				t.Fatalf("check: %+v %v", c, err)
 			}
 			if newer {
@@ -70,14 +70,14 @@ func TestACheckUnderAnAliasCounts(t *testing.T) {
 		t.Fatalf("aliases: %v", rq.Aliases)
 	}
 	if ok, err := f.st.CheckOnce(ctx, store.RequestCheck{Request: rq.Aliases[0], Result: "commit:3c4d5e6", ResultAt: at(21).Add(1e9),
-		Proof: his.ID(), ProofAt: at(22), At: at(24)}, nil); err != nil || !ok {
+		Proof: his.ID(), ProofAt: at(22), Words: "the notes read well, done", At: at(24)}, nil); err != nil || !ok {
 		t.Fatalf("store the check: %v %v", ok, err)
 	}
 	got := f.group()[0]
 	if got.State != Checked {
 		t.Fatalf("a check under its alias: %s (%s)", got.State, got.Why)
 	}
-	if _, _, err := Uncheck(ctx, f.st, got, "the notes read well", at(25)); !errors.Is(err, ErrNoProof) {
+	if _, _, err := Uncheck(ctx, f.st, got, "the notes read well, done", at(25)); !errors.Is(err, ErrNoProof) {
 		t.Fatalf("an undo on the check's own turn: %v", err)
 	}
 }
@@ -92,7 +92,7 @@ func TestAReadAgainKeepsTheCheck(t *testing.T) {
 	f.owner("s-re", at(2), "the importer fix looks right")
 	f.phase("s-re", at(3), "phase", "idle", nil)
 	rq := f.group()[0]
-	if c, err := Check(ctx, f.st, rq, "importer fix looks right", at(4)); err != nil || !c.Added {
+	if c, err := Check(ctx, f.st, rq, "the importer fix looks right", at(4)); err != nil || !c.Added {
 		t.Fatalf("check: %+v %v", c, err)
 	}
 	opening.Summary = "fix the importer [the paste it cut before]"

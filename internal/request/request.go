@@ -100,8 +100,9 @@ type Request struct {
 	Open          string // the open step; empty when nothing records one
 	Last          time.Time
 	// said are the owner turns of its threads, his and the ones a program typed: what a check's proof is looked
-	// for in
-	said []spoken
+	// for in; replies are the agent's replies, oldest first: a request with no artifact binds one
+	said    []spoken
+	replies []Result
 	// CutGone, CutUnread and CutUnmasked count its calls the store cut that were read as the store holds them:
 	// their transcript is gone, no reader of their harness is here, or what was read whole could not be masked
 	CutGone, CutUnread, CutUnmasked int
@@ -124,7 +125,7 @@ func (r *Request) Newest() *Result {
 	return r.Report
 }
 
-// rank orders the kinds a check binds: a commit, a push or a pull request over a file write over the report.
+// rank orders the kinds a check binds: a commit, a push or a pull request over a file write over the agent's reply.
 func rank(kind string) int {
 	switch kind {
 	case KindCommit, KindPush, KindPR:
@@ -135,21 +136,34 @@ func rank(kind string) int {
 	return 0
 }
 
-// Bound is the result a check binds: the newest commit, push or pull request, else the newest result (a file
-// write, else the report); nil when there is none.
+// Bound is the artifact a check binds: the newest commit, push or pull request, else the newest file write; nil
+// when there is none, and then a check binds the agent's newest reply before the owner's turn it rests on (Check).
 func (r *Request) Bound() *Result {
 	for i := range r.Results {
 		if rank(r.Results[i].Kind) == 2 {
 			return &r.Results[i]
 		}
 	}
-	return r.Newest()
+	if len(r.Results) > 0 {
+		return &r.Results[0]
+	}
+	return nil
 }
 
-// Standing is the newest check not undone, and whether it holds: no result a check would bind over the one it
-// binds came after that one, and no ask of the owner's came after his turn that proves it. A check holds while
-// its result can no longer be read (its transcript is gone, so it is not among the request's) and nothing came
-// after it.
+// replyBefore is the agent's newest reply at or before a time; nil when there is none.
+func (r *Request) replyBefore(at time.Time) *Result {
+	for i := len(r.replies) - 1; i >= 0; i-- {
+		if !r.replies[i].At.After(at) {
+			return &r.replies[i]
+		}
+	}
+	return nil
+}
+
+// Standing is the newest check not undone, and whether it holds: no artifact a check would bind over the one it
+// binds came after that one, and no ask of the owner's came after his turn that proves it. A reply reopens
+// nothing. A check holds while its result can no longer be read (its transcript is gone, so it is not among the
+// request's) and nothing came after it.
 func (r *Request) Standing() (store.RequestCheck, bool, bool) {
 	for i := len(r.Checks) - 1; i >= 0; i-- {
 		if c := r.Checks[i]; c.Undone.IsZero() {
@@ -159,18 +173,14 @@ func (r *Request) Standing() (store.RequestCheck, bool, bool) {
 	return store.RequestCheck{}, false, false
 }
 
-// newerThan is the newest result that came after the one a check binds and that a check would bind over it: of its
-// kind or of one ranked above it (a commit, a push or a pull request over a file write over the report); nil for
-// none. A result of a kind ranked below it, or one that came before it, reopens nothing.
+// newerThan is the newest artifact that came after the one a check binds and that a check would bind over it: of
+// its kind or of one ranked above it (a commit, a push or a pull request over a file write over a reply); nil for
+// none. An artifact of a kind ranked below it, one that came before it, and a reply reopen nothing.
 func (r *Request) newerThan(c store.RequestCheck) *Result {
 	kind, _, _ := strings.Cut(c.Result, ":")
-	cands := r.Results
-	if r.Report != nil {
-		cands = append(cands[:len(cands):len(cands)], *r.Report)
-	}
 	var out *Result
-	for i := range cands {
-		x := &cands[i]
+	for i := range r.Results {
+		x := &r.Results[i]
 		if x.Key != c.Result && x.At.After(c.ResultAt) && rank(x.Kind) >= rank(kind) && (out == nil || x.At.After(out.At)) {
 			out = x
 		}
@@ -185,8 +195,10 @@ func (r *Request) checked(c store.RequestCheck) *Result {
 			return &r.Results[i]
 		}
 	}
-	if r.Report != nil && r.Report.Key == c.Result {
-		return r.Report
+	for i := range r.replies {
+		if r.replies[i].Key == c.Result {
+			return &r.replies[i]
+		}
 	}
 	return nil
 }
@@ -302,6 +314,32 @@ func marker(text string) (id, rest string) {
 	return "", text
 }
 
+// ownWords are his words in a text for what rests on his words alone (a check's proof, the ask that reopens his
+// check): marker's, less what may be a handoff's body. The text after an opening line with no closing line, and
+// the text before a closing line with no opening line, are the paste's; after a closing line, another handoff is
+// taken out the same way, so two pasted in one turn leave only his words.
+func ownWords(text string) string {
+	for _, o := range openRe.FindAllStringSubmatchIndex(text, -1) {
+		id := text[o[2]:o[3]]
+		if !validID(id) {
+			continue
+		}
+		before := strings.TrimSpace(text[:o[0]])
+		if l := lastRe.FindStringSubmatchIndex(before); l != nil && validID(before[l[2]:l[3]]) {
+			before = "" // another handoff's tail, its opening line cut off
+		}
+		c := closing(text[o[1]:], id)
+		if c < 0 {
+			return before // what follows may be the handoff's body
+		}
+		return strings.TrimSpace(before + " " + ownWords(text[o[1]+c:]))
+	}
+	if l := lastRe.FindStringSubmatchIndex(text); l != nil && validID(text[l[2]:l[3]]) {
+		return "" // what comes before a lone closing line may be the handoff's body
+	}
+	return strings.TrimSpace(text)
+}
+
 // closing is the end of a handoff's closing line in the text after its opening line, -1 when there is none: the
 // `momentum request ID` that directly follows the handoff's fixed last sentence (pasteLine), on the next line or,
 // in the store's text whose lines it joins, after a space, and ends at a space or the end of the text. An id its
@@ -365,6 +403,7 @@ type turn struct {
 	ev      store.Event
 	at      time.Time
 	words   string // his words, outside a pasted handoff
+	own     string // his words outside anything that may be a handoff's body (ownWords)
 	owner   bool
 	marker  string
 	program bool
@@ -508,13 +547,13 @@ func (t *thread) addTurn(e store.Event, owner bool) {
 			p.marker = id
 		}
 		if owner && !p.owner {
-			p.owner, p.words, p.ev = true, words, e
+			p.owner, p.words, p.own, p.ev = true, words, ownWords(e.Summary), e
 		}
 		return
 	}
 	tn := &turn{ev: e, at: e.TS, owner: owner, marker: id}
 	if owner {
-		tn.words = words
+		tn.words, tn.own = words, ownWords(e.Summary)
 	}
 	t.turns = append(t.turns, tn)
 }

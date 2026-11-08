@@ -559,10 +559,13 @@ func (s *Store) MarkPartialRead(ctx context.Context, source string, started, fai
 	return err
 }
 
+// ErrIngestHeld is an ingest lock another ingest or a rebuild holds.
+var ErrIngestHeld = errors.New("holds the store")
+
 // LockIngest takes the lock that keeps an ingest and a rebuild of a source from running together: a rebuild drops what
 // a source contributed with the records of its reads, and an ingest that finished after it would record a read of
-// events the rebuild took away. It fails at once, naming the process that holds it. unlock releases it; so does the
-// end of the process.
+// events the rebuild took away. It fails at once, naming the process that holds it (ErrIngestHeld). unlock releases
+// it; so does the end of the process.
 func (s *Store) LockIngest() (unlock func(), err error) {
 	path := s.path + ".ingest-lock"
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
@@ -573,7 +576,7 @@ func (s *Store) LockIngest() (unlock func(), err error) {
 		f.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) {
 			holder, _ := os.ReadFile(path)
-			return nil, fmt.Errorf("an ingest or a rebuild (pid %s) holds the store", strings.TrimSpace(string(holder)))
+			return nil, fmt.Errorf("an ingest or a rebuild (pid %s) %w", strings.TrimSpace(string(holder)), ErrIngestHeld)
 		}
 		return nil, fmt.Errorf("ingest lock: %w", err)
 	}
