@@ -58,7 +58,7 @@ Native readers also discover OpenCode's `opencode/opencode.db` under `XDG_DATA_H
 }
 ```
 
-Source harnesses are `opencode`, `grok` and `kimi`. OpenCode requires `db` only; Grok and Kimi require `glob` only. Configuration load refuses other harnesses and missing or wrong location fields. A leading `~` is expanded. OpenCode prefers V2 over its migrated legacy copy and rereads changed sessions. Grok and Kimi resume by offset and count malformed complete lines as skipped. Unknown input provenance stays unknown. A Kimi session's `state.json`, beside its `agents` directory, says whether a person prompted it: a prompt that started a `kimi -p` run is the program's, and a copied session without its `state.json` credits its prompts to no one.
+Source harnesses are `opencode`, `grok` and `kimi`. OpenCode requires `db` only; Grok and Kimi require `glob` only. Configuration load refuses other harnesses and missing or wrong location fields. A leading `~` is expanded. OpenCode prefers V2 over its migrated legacy copy and rereads changed sessions. Grok and Kimi resume by offset and count malformed complete lines as skipped. Unknown input provenance stays unknown. A Kimi session's `state.json`, beside its `agents` directory, says whether a person's client prompted it: the prompts of a session only `kimi -p` ran are the program's. A copied session without its `state.json` credits its main user-origin prompts to no one; its tasks' and child agents' prompts stay generated.
 
 ## Sessions
 

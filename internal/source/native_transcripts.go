@@ -2,6 +2,7 @@ package source
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -72,8 +73,10 @@ type nativeState struct {
 	Known    bool
 	// Rule is the Kimi attribution rule the events before the cursor were credited by (kimiRule).
 	Rule int `json:",omitempty"`
-	// meta is a Kimi session's state.json, and read says this read has read it (kimiProvenance).
-	meta string
+	// dir is a Kimi session's directory and wire its agent's file; read says this read has read the session's
+	// metadata (kimiProvenance).
+	dir  string
+	wire string
 	read bool
 }
 
@@ -297,7 +300,7 @@ func nativeIdentity(path, harness string) nativeState {
 	st := nativeState{Calls: map[string]string{}}
 	if harness == "kimi" {
 		st.Session = filepath.Base(filepath.Dir(filepath.Dir(dir)))
-		st.meta = filepath.Join(filepath.Dir(filepath.Dir(dir)), "state.json")
+		st.dir, st.wire = filepath.Dir(filepath.Dir(dir)), evidence.Plain(path)
 		agent := filepath.Base(dir)
 		if agent != "main" {
 			st.Subagent = agent
@@ -554,24 +557,62 @@ func (s *nativeState) kimi(o map[string]any) []evidence.Event {
 }
 
 // kimiProvenance reads whether a person's client ever prompted the session. Kimi's clients (its TUI, web UI and
-// ACP server) record the session's lastPrompt in its state.json before each prompt's turn begins; `kimi -p`
-// hands its prompt to the agent loop and records none. A session whose state.json holds no lastPrompt is a
-// program's run, and one with no readable state.json has unknown provenance. It is read once per read, at the
-// first user prompt of the main agent, after that prompt's line: the lastPrompt of a prompt the reader holds was
-// written before it.
+// ACP server) record the session's lastPrompt in its metadata before each prompt's turn begins; `kimi -p` hands
+// its prompt to the agent loop and records none. A session whose metadata holds no lastPrompt is a program's run,
+// and one with no readable metadata has unknown provenance. So does one whose wire holds an undo: undoing every
+// prompt takes its lastPrompt away. It is read once per read, at the first user prompt of the main agent, after
+// that prompt's line: the lastPrompt of a prompt the reader holds was written before it.
 func (s *nativeState) kimiProvenance() {
-	if s.read || s.meta == "" {
+	if s.read || s.dir == "" {
 		return
 	}
 	s.read = true
-	raw, err := os.ReadFile(s.meta)
-	var meta struct {
-		LastPrompt *string `json:"lastPrompt"`
-	}
-	if err != nil || json.Unmarshal(raw, &meta) != nil {
+	meta, ok := kimiMeta(s.dir)
+	if !ok {
 		return
 	}
-	s.Owner, s.Known = meta.LastPrompt != nil, true
+	// Kimi reads a lastPrompt that is not a string as none.
+	last := bytes.TrimSpace(meta["lastPrompt"])
+	s.Owner = len(last) > 0 && last[0] == '"'
+	s.Known = s.Owner || !kimiUndone(s.wire)
+}
+
+// kimiMeta reads a session's metadata where Kimi reads it: its state.json, else the state.json of its older
+// session-meta directory. A file that is missing, or not one JSON object, is not read.
+func kimiMeta(dir string) (map[string]json.RawMessage, bool) {
+	for _, path := range []string{filepath.Join(dir, "state.json"), filepath.Join(dir, "session-meta", "state.json")} {
+		raw, err := os.ReadFile(path)
+		var meta map[string]json.RawMessage
+		if err == nil && json.Unmarshal(raw, &meta) == nil && meta != nil {
+			return meta, true
+		}
+	}
+	return nil, false
+}
+
+// kimiUndone reports a wire that holds an undo of its context (a context.undo or context.undone record). A wire
+// that cannot be read reports one: what it holds is not known.
+func kimiUndone(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return true
+	}
+	defer f.Close()
+	rd := bufio.NewReaderSize(f, 64<<10)
+	for {
+		line, err := rd.ReadBytes('\n')
+		if bytes.Contains(line, []byte(`"context.undo`)) {
+			var record struct {
+				Type string `json:"type"`
+			}
+			if json.Unmarshal(line, &record) == nil && (record.Type == "context.undo" || record.Type == "context.undone") {
+				return true
+			}
+		}
+		if err != nil {
+			return !errors.Is(err, io.EOF)
+		}
+	}
 }
 
 // Native paths end in shared filenames such as wire.jsonl. Their source keys

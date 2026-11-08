@@ -92,6 +92,8 @@ func TestKimiHeadlessPromptIsNotTheOwners(t *testing.T) {
 		{"headless", `{"version":2,"cwd":"/w"}`, "harness harness_text"},
 		{"no metadata", "", "unknown harness_text"},
 		{"unreadable metadata", "{", "unknown harness_text"},
+		// Kimi reads a lastPrompt that is not a string as none.
+		{"lastPrompt not a string", `{"version":2,"lastPrompt":7}`, "harness harness_text"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -174,6 +176,81 @@ func TestKimiCursorFromBeforeTheRuleReadsAgain(t *testing.T) {
 	}
 	if r := ingest(t, src, st); r.Read != 0 {
 		t.Fatalf("a cursor under the rule read again: %+v", r)
+	}
+}
+
+// Undoing every prompt takes a session's lastPrompt away. A session with none whose wire holds an undo may be a
+// person's, so its prompts are credited to no one.
+func TestKimiUndoneSessionIsUnknown(t *testing.T) {
+	for _, undo := range []string{"context.undo", "context.undone"} {
+		t.Run(undo, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed", "agents", "main", "wire.jsonl")
+			writeJSONLines(t, path, kimiPrompt("marker-7f3a typed"), kimiRecord("turn.ended", map[string]any{}),
+				kimiRecord(undo, map[string]any{"agentId": "main", "count": 1}))
+			kimiState(t, path, `{"version":2}`)
+			st := openStore(t)
+			ingest(t, transcripts(home), st)
+			if got := promptActors(t, st); len(got) != 1 || got["marker-7f3a typed"] != "unknown harness_text" {
+				t.Fatalf("an undone session's prompt stored as %v", got)
+			}
+		})
+	}
+}
+
+// Kimi reads an older session's metadata from its session-meta directory when the session has no state.json.
+func TestKimiLegacySessionMetaIsRead(t *testing.T) {
+	home := t.TempDir()
+	session := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed")
+	path := filepath.Join(session, "agents", "main", "wire.jsonl")
+	writeJSONLines(t, path, kimiPrompt("marker-7f3a typed"), kimiRecord("turn.ended", map[string]any{}))
+	if err := os.MkdirAll(filepath.Join(session, "session-meta"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(session, "session-meta", "state.json"), []byte(`{"version":1,"lastPrompt":"marker-7f3a typed"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	st := openStore(t)
+	ingest(t, transcripts(home), st)
+	if got := promptActors(t, st); len(got) != 1 || got["marker-7f3a typed"] != "owner owner_text" {
+		t.Fatalf("a prompt of a session with older metadata stored as %v", got)
+	}
+}
+
+// Without metadata a user-origin prompt is credited to no one; a task's notice is the agent's own input still.
+func TestKimiTaskPromptStaysGeneratedWithoutMetadata(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "run", "agents", "main", "wire.jsonl")
+	writeJSONLines(t, path, kimiPrompt("marker-7f3a launcher"),
+		kimiRecord("turn.prompt", map[string]any{"origin": map[string]any{"kind": "task", "taskId": "task-1"},
+			"input": []any{map[string]any{"type": "text", "text": "marker-7f3a task"}}}),
+		kimiRecord("turn.ended", map[string]any{}))
+	st := openStore(t)
+	ingest(t, transcripts(home), st)
+	want := map[string]string{"marker-7f3a launcher": "unknown harness_text", "marker-7f3a task": "harness harness_text"}
+	if got := promptActors(t, st); !maps.Equal(got, want) {
+		t.Fatalf("prompts stored as %v, want %v", got, want)
+	}
+}
+
+// Each read reads the metadata again: once a session's state.json is gone, a prompt read later is credited to no
+// one, though an earlier read credited the owner.
+func TestKimiProvenanceIsReadAgainEachRead(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed", "agents", "main", "wire.jsonl")
+	writeJSONLines(t, path, kimiPrompt("marker-7f3a typed"), kimiRecord("turn.ended", map[string]any{}))
+	kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a typed"}`)
+	st := openStore(t)
+	src := transcripts(home)
+	ingest(t, src, st)
+	if err := os.Remove(filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(path))), "state.json")); err != nil {
+		t.Fatal(err)
+	}
+	appendJSONLines(t, path, kimiPrompt("marker-7f3a later"), kimiRecord("turn.ended", map[string]any{}))
+	ingest(t, src, st)
+	want := map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a later": "unknown harness_text"}
+	if got := promptActors(t, st); !maps.Equal(got, want) {
+		t.Fatalf("prompts stored as %v, want %v", got, want)
 	}
 }
 
