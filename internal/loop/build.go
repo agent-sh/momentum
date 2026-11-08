@@ -386,6 +386,18 @@ func stageFailureIn(ctx context.Context, res Result, key string, err error) (Res
 	return res, nil
 }
 
+// paidCheck is a check's error after the build's agent ran and was paid for. A machine with no room for the test then
+// is no hold: a hold keeps no run, drops the report and the patch, and the next pass pays for another agent run, until
+// the case's budget is gone with nothing counted. It is the host's error at the check, which the stop rule counts on
+// the stage, so two stop the case. Holds happen only at the gate before the agent.
+func paidCheck(err error) error {
+	var busy *busyMachine
+	if held(err) && errors.As(err, &busy) {
+		return busy
+	}
+	return err
+}
+
 type buildStageError struct {
 	key string
 	err error
@@ -460,7 +472,7 @@ func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Re
 	}
 	snapshot := Patch{data: data}
 	if _, err := r.Ship.CheckArgs(ctx, c.ID, report.Test, nil, snapshot); err != nil {
-		return stageFailureIn(ctx, res, "build check", err)
+		return stageFailureIn(ctx, res, "build check", paidCheck(err))
 	}
 	window, err := planWindow(report.Window)
 	if err != nil {

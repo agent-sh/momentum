@@ -146,8 +146,12 @@ func busyIn(ctx context.Context, st *store.Store, dir string, ss map[int]capacit
 	return "", nil
 }
 
-// gateTimeout bounds one wait at the capacity gate.
-var gateTimeout = 10 * time.Minute
+// gateTimeout bounds one wait at the capacity gate, and gateWaitDelay how long its output may stay open after: a gate
+// whose children outlive it (a shell that started a waiter) ends then too.
+var (
+	gateTimeout   = 10 * time.Minute
+	gateWaitDelay = 5 * time.Second
+)
 
 // gateSaid is the end of what the capacity gate printed, on one line, for the loop's note of the hold or failure.
 func gateSaid(out []byte) string {
@@ -173,6 +177,7 @@ func setupShip(st *store.Store, sources config.Sources) *loop.Ship {
 			defer cancel()
 			cmd := exec.CommandContext(cctx, c.CapacityGate[0], c.CapacityGate[1:]...)
 			cmd.Env = loop.CleanEnv(nil)
+			cmd.WaitDelay = gateWaitDelay
 			out, err := commandOutput(cmd, true)
 			if err == nil {
 				return nil

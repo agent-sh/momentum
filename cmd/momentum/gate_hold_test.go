@@ -42,10 +42,15 @@ func TestTheRealGateHoldsOnItsHoldExitsAndItsDeadline(t *testing.T) {
 	if err := run([]int{4}, "exit 4"); !isHold(err) {
 		t.Fatalf("exit 4 configured to hold: %T %v", err, err)
 	}
-	old := gateTimeout
-	gateTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { gateTimeout = old })
-	if err := run([]int{4}, "sleep 5"); !isHold(err) || !strings.Contains(err.Error(), "its wait passed") {
+	oldTimeout, oldDelay := gateTimeout, gateWaitDelay
+	gateTimeout, gateWaitDelay = 200*time.Millisecond, 300*time.Millisecond
+	t.Cleanup(func() { gateTimeout, gateWaitDelay = oldTimeout, oldDelay })
+	// a gate whose shell has a child that outlives it (sleep, then another command) ends at the deadline too
+	start := time.Now()
+	if err := run([]int{4}, "sleep 5; true"); !isHold(err) || !strings.Contains(err.Error(), "its wait passed") {
 		t.Fatalf("a gate its own deadline ended: %T %v", err, err)
+	}
+	if took := time.Since(start); took >= time.Second {
+		t.Fatalf("a gate past its deadline held the check %v", took)
 	}
 }

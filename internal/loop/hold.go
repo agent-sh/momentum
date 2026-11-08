@@ -208,7 +208,7 @@ func (r *Runner) releaseHolds(ctx context.Context, cs []store.Case) error {
 			}
 		}
 		mine := held[c.ID]
-		for _, prefix := range []string{baseNotePrefix(c.ID), proposalNotePrefix(c.ID)} {
+		for _, prefix := range []string{baseNotePrefix(c.ID), proposalNotePrefix(c.ID), capacityNoteID(c.ID)} {
 			if err := endHoldNotes(ctx, r.Store, r.now(), mine, prefix, caseLeftTesting); err != nil {
 				return err
 			}

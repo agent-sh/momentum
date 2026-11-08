@@ -14,6 +14,19 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
+// relayPost defines post, which sends one model request to the run's relay and tries again while the relay does not
+// listen yet (curl exits 7): the sandbox starts the relay's forwarder beside the harness, so the harness can ask
+// before it listens. Any other answer is the request's.
+const relayPost = `post() {
+ for i in $(seq 50); do
+  curl -s -o /dev/null -X POST -d '{}' "$1"; rc=$?
+  [ "$rc" -ne 7 ] && return "$rc"
+  sleep 0.1
+ done
+ return "$rc"
+}
+`
+
 // A run the model's safeguards refuse falls back to the fallback model whatever its relay refused before: what the
 // relay refused is a field of the result, and the failure the fallback compares stays "the model's safeguards".
 func TestASafeguardsRefusalAfterARelayRefusalStillFallsBack(t *testing.T) {
@@ -23,7 +36,7 @@ func TestASafeguardsRefusalAfterARelayRefusalStillFallsBack(t *testing.T) {
 	b := fakeBroker(t)
 	dir := t.TempDir()
 	refused := `{"type":"result","subtype":"success","is_error":true,"num_turns":1,"total_cost_usd":0.25,"result":"the safeguards blocked it"}`
-	harness := script(t, dir, "harness", `curl -s -o /dev/null -X POST -d '{}' "$ANTHROPIC_BEDROCK_BASE_URL/model/us.anthropic.claude-haiku-4-5-20251001-v1:0/invoke"
+	harness := script(t, dir, "harness", relayPost+`post "$ANTHROPIC_BEDROCK_BASE_URL/model/us.anthropic.claude-haiku-4-5-20251001-v1:0/invoke"
 case "$*" in *"--model model-a"*) `+fixtureResult(refused)+` ;; *) `+fixtureResult(okResult)+` ;; esac`)
 	a := testSandboxAgent(t, Agent{Runner: []string{harness}, Model: "model-a", Fallback: "model-b", Bedrock: b.Bedrock})
 	res, err := a.RunOrFallback(context.Background(), Invocation{Dir: filepath.Join(shortScratch(t), "run"), Schema: investigationSchema, MaxTurns: 3, BudgetUSD: 1, Timeout: time.Minute})
@@ -46,7 +59,7 @@ func TestTwoRunsThatFailedAlikeStopACaseWhateverTheirRelayRefused(t *testing.T) 
 	b := fakeBroker(t)
 	dir := t.TempDir()
 	harness := script(t, dir, "harness", `n=$(cat '`+filepath.Join(dir, "count")+`' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '`+filepath.Join(dir, "count")+`'
-curl -s -o /dev/null -X POST -d '{}' "$ANTHROPIC_BEDROCK_BASE_URL/model/us.anthropic.claude-haiku-$n/invoke"
+`+relayPost+`post "$ANTHROPIC_BEDROCK_BASE_URL/model/us.anthropic.claude-haiku-$n/invoke"
 `+fixtureResult(`{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":91,"total_cost_usd":1.5}`)+``)
 	r := runnerFor(t, st, []string{harness})
 	r.Agent.Bedrock = b.Bedrock

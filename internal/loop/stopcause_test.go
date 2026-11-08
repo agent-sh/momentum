@@ -104,6 +104,16 @@ esac`)
 	if held, err := StoppedOn(ctx, st, cs[0]); err != nil || len(held) != 1 || held[0] != c.ID {
 		t.Fatalf("the cases the stop holds: %v %v", held, err)
 	}
+	// each piece of evidence names its run's refusal as it was given
+	evs, err := st.CaseEvidence(ctx, cs[0].ID, 0)
+	if err != nil || len(evs) != 2 {
+		t.Fatalf("the stop's evidence: %+v %v", evs, err)
+	}
+	for _, e := range evs {
+		if !strings.Contains(e.Summary, "build propose: refused: invalid measurement window") || !strings.Contains(e.Summary, `"`) {
+			t.Fatalf("evidence that does not name its refusal: %q", e.Summary)
+		}
+	}
 }
 
 // A store from before causes were kept migrates in place, and its old runs have none: two old refusals at one stage
@@ -729,9 +739,10 @@ func TestHostErrorsThatTakeTurnsStop(t *testing.T) {
 	}
 }
 
-// A machine with no room for the test at build check is a hold, not a failure of the check: the build is held for the
-// pass with no run kept, and two such passes stop nothing.
-func TestABusyMachineAtTheCheckIsAHold(t *testing.T) {
+// The gate holds at the check (Sandbox.Run gives a hold), but a build that meets it there has run its agent and been
+// paid for: the build keeps the check as the host's error at build check (paidCheck), a counted run, so two paid builds
+// busy at the check stop the case, and the case pays for no more than those two runs.
+func TestABusyMachineAfterAPaidBuildIsTheHostsErrorAtTheCheck(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	r := localRunner(t, st)
@@ -739,29 +750,35 @@ func TestABusyMachineAtTheCheckIsAHold(t *testing.T) {
 	// the gate ran and found no room: it exited unsuccessfully, as cmd/momentum's gate program does
 	busy := Sandbox{Gate: func(ctx context.Context) error {
 		if err := exec.CommandContext(ctx, "false").Run(); err != nil {
-			return fmt.Errorf("the machine has no room for the test now: %w", err)
+			return fmt.Errorf("the capacity gate: %w", err)
 		}
 		return nil
 	}}
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 5; i++ {
+		if why, err := r.stopped(ctx, c, true); err != nil || why != "" {
+			if i != 2 || why != "two of its build runs failed the same way: build check" {
+				t.Fatalf("pass %d: %q %v", i, why, err)
+			}
+			break
+		}
 		_, err := busy.Run(ctx, t.TempDir(), []string{"go", "test", "./..."}, nil)
 		if !held(err) {
-			t.Fatalf("a busy machine is no hold: %v", err)
+			t.Fatalf("a busy machine at the sandbox is no hold: %v", err)
 		}
 		run, why := r.reserve(ctx, c.Family, c.ID, StepBuild)
 		if why != "" {
 			t.Fatal(why)
 		}
-		res, serr := stageFailure(Result{Started: true, CostKnown: true, Status: store.RunOK}, "build check", err)
-		if done := r.completeStep(ctx, c, run, res, serr); done.Run.ID != "" || !strings.Contains(done.Skipped, "no room for the test") {
-			t.Fatalf("a busy check became a failed build: %+v", done)
+		res, serr := stageFailure(Result{Started: true, CostKnown: true, Status: store.RunOK, RelayAdmitted: 40, RelayCharged: 40, RelayUSD: 3.5},
+			"build check", paidCheck(err))
+		if done := r.completeStep(ctx, c, run, res, serr); done.Run.Failure != "build check" || done.Run.Cause != hostCause {
+			t.Fatalf("a paid build busy at the check: %+v", done)
 		}
 	}
-	if runs, err := st.LoopRuns(ctx, store.RunFilter{Case: c.ID}); err != nil || len(runs) != 0 {
-		t.Fatalf("held checks kept runs: %+v %v", runs, err)
-	}
-	if why, err := r.stopped(ctx, c, true); err != nil || why != "" {
-		t.Fatalf("two busy checks stopped the case: %q %v", why, err)
+	runs, err := st.LoopRuns(ctx, store.RunFilter{Case: c.ID})
+	got, _ := st.CaseByID(ctx, c.ID)
+	if err != nil || len(runs) != 2 || got.Cost.USD > 2*3.5+0.001 {
+		t.Fatalf("paid builds busy at the check: %d runs, $%.2f, %v", len(runs), got.Cost.USD, err)
 	}
 }
 
@@ -864,9 +881,13 @@ func TestABusyMachineHoldsTheBuildBeforeItsAgent(t *testing.T) {
 	ctx := context.Background()
 	r, c := inputRunner(t)
 	f := newRepo(t, nil)
+	busy := true
 	r.Ship = shipWithSandbox(r.Store, f, Sandbox{Gate: func(ctx context.Context) error {
+		if !busy {
+			return nil
+		}
 		if err := exec.CommandContext(ctx, "false").Run(); err != nil {
-			return fmt.Errorf("the machine has no room for the test now: %w", err)
+			return fmt.Errorf("the capacity gate: %w", err)
 		}
 		return nil
 	}})
@@ -888,6 +909,48 @@ func TestABusyMachineHoldsTheBuildBeforeItsAgent(t *testing.T) {
 	got, _ := r.Store.CaseByID(ctx, c.ID)
 	if err != nil || len(runs) != 0 || got.Cost.USD != 0 || got.Cost.Runs != 0 {
 		t.Fatalf("a busy machine kept runs or spent: %+v %+v %v", runs, got.Cost, err)
+	}
+	if n, ok, err := r.Store.Note(ctx, capacityNoteID(c.ID)); err != nil || !ok || !n.Done.IsZero() {
+		t.Fatalf("the hold's note: %+v %v %v", n, ok, err)
+	}
+	// the next pass finds room: the build goes on past the gate, and the hold's note ends
+	busy = false
+	if done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID}); err != nil || len(done) != 1 || done[0].Run.ID == "" {
+		t.Fatalf("the pass with room: %+v %v", done, err)
+	}
+	if n, ok, err := r.Store.Note(ctx, capacityNoteID(c.ID)); err != nil || !ok || n.Done.IsZero() || !strings.HasSuffix(n.Detail, roomFound) {
+		t.Fatalf("a build found room, but its hold's note: %+v %v %v", n, ok, err)
+	}
+}
+
+// A case that leaves testing ends its capacity note, as its base and proposal notes.
+func TestACapacityNoteEndsWhenItsCaseLeavesTesting(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "busy-leaves", 1)
+	mechanism, fix := "one cause", "one fix"
+	var err error
+	if c, err = st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	cause := &buildStageError{key: "build check", err: &shipHold{err: &busyMachine{err: errors.New("the capacity gate: exit status 1 (it said: TIMEOUT)")}}}
+	r.buildSkipped(ctx, c, "check", cause)
+	if n, ok, err := st.Note(ctx, capacityNoteID(c.ID)); err != nil || !ok || !n.Done.IsZero() {
+		t.Fatalf("no open capacity note: %+v %v %v", n, ok, err)
+	}
+	if _, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	cs, err := st.Cases(ctx, store.CaseFilter{All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.releaseHolds(ctx, cs); err != nil {
+		t.Fatal(err)
+	}
+	if n, _, _ := st.Note(ctx, capacityNoteID(c.ID)); n.Done.IsZero() || !strings.HasSuffix(n.Detail, caseLeftTesting) {
+		t.Fatalf("the case left testing and its capacity note stands: %+v", n)
 	}
 }
 
@@ -1343,5 +1406,66 @@ func TestBuildsThatNeverStartedRespectThePreparedLine(t *testing.T) {
 	never("n2", time.Now())
 	if why, err := r.stopped(ctx, c, true); err != nil || why != "" {
 		t.Fatalf("a build that never started paired with one of the package before: %q %v", why, err)
+	}
+}
+
+// A build whose agent ran and was paid for, and whose check then finds the machine busy, is the host's error at build
+// check, a counted run, not a hold: holds happen only at the gate before the agent. Two such builds stop the case under
+// the check's signature, and the case pays for those two runs and no more.
+func TestPaidBuildsBusyAtTheCheckStopTheCase(t *testing.T) {
+	if err := sandbox.Available(true); err != nil {
+		t.Skip(err)
+	}
+	ctx := context.Background()
+	st := testStore(t)
+	f := newRepo(t, nil)
+	c := testingCase(t, st)
+	raw, err := json.Marshal(BuildReport{Summary: "The answer is corrected.", Test: []string{"go", "test", "./..."}, Title: "Correct the answer",
+		Body:     "Fix one cause with a discriminating test. Prior art needs a network search, which this run cannot perform.",
+		Rollback: "Revert the change.", Window: "7d", Lesson: "Test the answer at its boundary.", Signal: goodSignal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := script(t, t.TempDir(), "harness", `sed -i 's/return 41/return 42/' /work/fake.go
+cat > /work/answer_test.go <<'TEST'
+`+answerTest+`
+TEST
+`+fixtureResult(`{"type":"result","subtype":"success","structured_output":`+string(raw)+`}`))
+	r := runnerFor(t, st, []string{harness})
+	r.Ship = shipFor(t, st, f)
+	r.Ship.Dir = r.Dir
+	r.Ship.Live = false
+	r.Toolchains = Toolchains{ReadOnly: r.Ship.Sandbox.ReadOnly, Path: r.Ship.Sandbox.Path}
+	r.Inputs.ReadDirs = []string{f.main}
+	// the gate has room before each build's agent, and none at its check
+	calls := 0
+	r.Ship.Sandbox.Gate = func(ctx context.Context) error {
+		calls++
+		if calls%2 == 1 {
+			return nil
+		}
+		if err := exec.CommandContext(ctx, "false").Run(); err != nil {
+			return fmt.Errorf("the capacity gate: %w", err)
+		}
+		return nil
+	}
+	for i := 0; i < 2; i++ {
+		done, err := r.Once(ctx, Options{Families: []string{c.Family}})
+		if err != nil || len(done) != 1 || done[0].Run.Failure != "build check" || done[0].Run.Cause != hostCause || done[0].Run.Started.IsZero() {
+			t.Fatalf("paid build %d busy at the check: %+v %v", i, done, err)
+		}
+	}
+	done, err := r.Once(ctx, Options{Families: []string{c.Family}})
+	if err != nil || len(done) != 1 || done[0].Run.ID != "" || !strings.Contains(done[0].Skipped, "stopped: two of its build runs failed the same way: build check") {
+		t.Fatalf("two paid builds busy at the check did not stop the case: %+v %v", done, err)
+	}
+	runs, err := st.LoopRuns(ctx, store.RunFilter{Case: c.ID})
+	got, _ := st.CaseByID(ctx, c.ID)
+	if err != nil || len(runs) != 2 || got.Cost.Runs != 2 || got.Cost.USD > 2*r.Budgets.Run {
+		t.Fatalf("paid builds busy at the check: %d runs, %+v, %v", len(runs), got.Cost, err)
+	}
+	cs, err := st.Cases(ctx, store.CaseFilter{Family: store.HealthFamily})
+	if err != nil || len(cs) != 1 || !slices.Equal(cs[0].Signatures, []string{"component-health/v1:loop:build:build-check"}) {
+		t.Fatalf("the stop's case: %+v %v", cs, err)
 	}
 }
