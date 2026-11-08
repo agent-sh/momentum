@@ -87,8 +87,9 @@ func TestABuildIsToldItsPathsUpFront(t *testing.T) {
 }
 
 // A review run is given the paths its build was given. A fix in a path no change may touch, or outside the repository,
-// is a low finding for a person, which names no host path; it lowers no other finding, and a change not worth landing
-// without it is a high one. In the loop's own repository only, a fix a hand landing may make is the build's to make.
+// is a low finding for a person whose fix is the change a person makes there; neither the finding nor the summary names
+// a host path. It lowers no other finding, and a change not worth landing without it is a high one. In the loop's own
+// repository only, a fix a hand landing may make is the build's to make.
 func TestAReviewIsToldTheBuildsPaths(t *testing.T) {
 	for _, repo := range []string{"agent-sh/fake", SelfRepo} {
 		t.Run(repo, func(t *testing.T) {

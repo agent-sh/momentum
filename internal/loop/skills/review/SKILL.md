@@ -2,7 +2,7 @@
 
 Read the case, the cumulative patch at /run/input/change.patch and the proposed tree at /ro/change. The tree is read-only and contains no Git metadata. Check behavior, authority, tests and rollback against the contract.
 
-Keep real-store text, paths and names, and host paths, out of the title, body, summary and findings.
+Keep host paths and real-store text, paths and names out of the summary and findings.
 
 Treat the builder's claims as evidence to check. Name each finding's severity, location, problem and fix. High and medium findings block landing. Low findings do not.
 
