@@ -2,6 +2,8 @@ package loop
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -260,7 +262,7 @@ func TestAHoldBetweenTwoRefusalsKeepsTheirCount(t *testing.T) {
 
 // A person's change of the case's fix ends its hold: its note is resolved before the case builds again, and a build
 // that names another path holds it on that one. A change of the case's status, even one undone before the next pass,
-// ends it too; a change of its title alone does not.
+// ends it too; a change of its title or benefit alone does not, whatever their text reads as.
 func TestAPersonsChangeEndsAHold(t *testing.T) {
 	ctx := context.Background()
 	where, other := ".github/workflows/ci.yml", ".github/workflows/release.yml"
@@ -297,8 +299,9 @@ func TestAPersonsChangeEndsAHold(t *testing.T) {
 	t.Run("title", func(t *testing.T) {
 		r, c, dir := outOfReachRunner(t, where)
 		heldFor(t, r, c, onePass(t, r, c), where)
-		title := "the thing breaks in CI"
-		if _, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Title: &title}, "test"); err != nil {
+		// a title and a benefit whose text reads as a change of the fix and of the mechanism change neither
+		title, benefit := "the thing breaks; fix: in CI", "fewer breaks; mechanism: none"
+		if _, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Title: &title, Benefit: &benefit}, "test"); err != nil {
 			t.Fatal(err)
 		}
 		stillHeld(t, r, c, dir, "1", where)
@@ -348,6 +351,11 @@ func TestAMadeUpPathIsTheBuildsRefusal(t *testing.T) {
 		r, c, _ := outOfReachRunner(t, where)
 		heldFor(t, r, c, onePass(t, r, c), where)
 	})
+	t.Run("new root file", func(t *testing.T) {
+		where := "Jenkinsfile" // CI configuration a host runs, which BASE does not hold yet, at the repository's root
+		r, c, _ := outOfReachRunner(t, where)
+		heldFor(t, r, c, onePass(t, r, c), where)
+	})
 }
 
 // A path PathScope allows but no change can touch, since the patch check refuses it, is out of reach too: one in Git's
@@ -391,7 +399,8 @@ func TestAHoldWithNoNoteGetsItsNote(t *testing.T) {
 	}
 	setCaseRepo(t, st, c, "main")
 	where := ".github/workflows/ci.yml"
-	raw, err := json.Marshal(map[string]any{"path": where, "fix": outOfReachFix, "reason": where + " is CI configuration", "episode": c.Episode, "evidence": c.Evidence})
+	raw, err := json.Marshal(map[string]any{"path": where, "fix": outOfReachFix, "reason": where + " is CI configuration", "episode": c.Episode,
+		"mechanism_sum": hexSum(mech), "fix_sum": hexSum(next)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,6 +442,16 @@ func TestAnOutOfReachAnswerNamesAPathAndAFix(t *testing.T) {
 	if err != nil || got.OutOfReach == nil || got.OutOfReach.Path != ".github/workflows" {
 		t.Fatalf("a directory's path: %+v %v", got.OutOfReach, err)
 	}
+	got, err = buildReport(report("Jenkinsfile", outOfReachFix))
+	if err != nil || got.OutOfReach == nil || got.OutOfReach.Path != "Jenkinsfile" {
+		t.Fatalf("a root file's path: %+v %v", got.OutOfReach, err)
+	}
+}
+
+// hexSum is the hex SHA-256 of text, as a hold keeps the sums of its case's mechanism and fix.
+func hexSum(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:])
 }
 
 // A person ends a hold by leaving testing: closing the case resolves its note, and the case, reopened, builds again;
@@ -495,4 +514,74 @@ func TestAPersonEndsAHold(t *testing.T) {
 			t.Fatalf("the case back in testing did not build: %s builds", builds(t, dir))
 		}
 	})
+}
+
+// A person who resolves the hold's note is done waiting: the next pass ends the hold and builds the case again, where a
+// pass before it built nothing.
+func TestAPersonWhoResolvesTheNoteEndsTheHold(t *testing.T) {
+	ctx := context.Background()
+	where := ".github/workflows/ci.yml"
+	r, c, dir := outOfReachRunner(t, where)
+	heldFor(t, r, c, onePass(t, r, c), where)
+	stillHeld(t, r, c, dir, "1", where)
+	n, _ := personNote(t, r, c, where)
+	if _, _, err := r.Store.DoneNote(ctx, n.ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	heldFor(t, r, c, onePass(t, r, c), where)
+	if builds(t, dir) != "2" {
+		t.Fatalf("a resolved note did not end the hold: %s builds", builds(t, dir))
+	}
+	log, err := r.Store.CaseLog(ctx, c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ended := false
+	for _, e := range log {
+		ended = ended || e.Action == "person hold ended" && e.Detail == "a person resolved its note"
+	}
+	if !ended {
+		t.Fatalf("the case's log keeps no end of its hold: %+v", log)
+	}
+}
+
+// A path in Git's own directory is read where Git keeps it: in a linked worktree, whose .git is a file, the
+// worktree's git directory or the repository's common one. One in neither is no path of the repository.
+func TestAGitPathInALinkedWorktreeIsOutOfReach(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	f := newRepo(t, ciFiles)
+	r.Ship = shipWithSandbox(st, f, Sandbox{})
+	r.Ship.Dir = r.Dir
+	wt := filepath.Join(t.TempDir(), "main")
+	run(t, f.main, "git", "worktree", "add", "-q", "--detach", wt, "HEAD")
+	if fi, err := os.Lstat(filepath.Join(wt, ".git")); err != nil || !fi.Mode().IsRegular() {
+		t.Fatalf("the worktree's .git is no file: %v %v", fi, err)
+	}
+	p := Package{Case: openCase(t, st, "failures", "out-of-reach-worktree", 1).ID, Repo: "agent-sh/fake", Dir: wt, Host: f.main, BaseCommit: strings.TrimSpace(run(t, f.main, "git", "rev-parse", "HEAD"))}
+	for _, where := range []string{".git/config", ".git/refs/heads/fix"} {
+		if why, refusal, err := r.unreachable(ctx, p, where); err != nil || refusal != nil || why == nil || !strings.Contains(why.Error(), "Git's own directory") {
+			t.Fatalf("%s in a linked worktree: %v %v %v", where, why, refusal, err)
+		}
+	}
+	if why, refusal, err := r.unreachable(ctx, p, ".git/made-up/x"); err != nil || why != nil || refusal == nil {
+		t.Fatalf("a made-up path in Git's directory: %v %v %v", why, refusal, err)
+	}
+}
+
+// The stop rule does not count a build that answered its fix is out of reach: an agent's failure on either side of
+// one stops the case as two in a row do.
+func TestAnOutOfReachBuildDoesNotSplitTwoAgentFailures(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "out-of-reach-turns", 1)
+	at := time.Now().Add(-time.Hour)
+	putBuild(t, st, c, "20261109-000001-00000001", StepBuild, store.RunTurns, "turns", "", "build run: it reached its turns", at)
+	putBuild(t, st, c, "20261109-000002-00000002", StepBuild, store.RunOutOfReach, "", "", "The fix is the workflow's.", at.Add(time.Minute))
+	putBuild(t, st, c, "20261109-000003-00000003", StepBuild, store.RunTurns, "turns", "", "build run: it reached its turns", at.Add(2*time.Minute))
+	if why, err := r.stopped(ctx, c, true); err != nil || why != "its last two build runs failed the same way: turns" {
+		t.Fatalf("turns, out of reach, turns did not stop the case: %q %v", why, err)
+	}
 }

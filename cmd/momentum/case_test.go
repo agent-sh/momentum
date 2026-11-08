@@ -359,10 +359,11 @@ func TestCaseListShowsAPersonHold(t *testing.T) {
 		t.Fatal(err)
 	}
 	mechanism, fix := "one cause", "one fix"
-	if _, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "test"); err != nil {
+	held, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "test")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.CaseNote(ctx, c.ID, "held for a person", `{"path":".github/workflows/ci.yml","fix":"Run the tests.","reason":"CI configuration","episode":1,"evidence":1}`, "loop"); err != nil {
+	if err := st.CaseNote(ctx, c.ID, store.ActionPersonHeld, store.PersonDetail(store.NewPersonHold(held, ".github/workflows/ci.yml", "Run the tests.", "CI configuration")), "loop"); err != nil {
 		t.Fatal(err)
 	}
 	st.Close()

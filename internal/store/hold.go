@@ -1,6 +1,8 @@
 package store
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 )
@@ -46,21 +48,36 @@ func HoldOf(c Case, log []CaseEntry) string {
 }
 
 // A build whose fix needs a path no change of the loop's may touch holds its case for a person: a "held for a person"
-// line with the path, the fix, why no change may touch the path and the case's episode, and a "person hold ended" line
-// when the hold ends. A case in testing is held for a person while its newest such line is a hold of its current
-// episode and no later "set" line changed its status, mechanism or fix: new evidence alone does not end it.
+// line with the path, the fix, why no change may touch the path, the case's episode and what its mechanism and fix
+// were, and a "person hold ended" line when the hold ends. A case in testing is held for a person while its newest
+// such line is a hold of its current episode, its mechanism and fix are what they were, and no later "set" line changed
+// its status: new evidence alone does not end it.
 const (
 	ActionPersonHeld  = "held for a person"
 	ActionPersonEnded = "person hold ended"
 )
 
 // PersonHold is a hold for a person: the path the case's fix needs, the change a person makes there, why no change
-// of the loop's may touch the path, and the episode of the build that answered.
+// of the loop's may touch the path, the episode of the build that answered, and the sums of the case's mechanism and
+// fix (its next test) the build worked from.
 type PersonHold struct {
-	Path    string `json:"path"`
-	Fix     string `json:"fix"`
-	Reason  string `json:"reason"`
-	Episode int64  `json:"episode"`
+	Path         string `json:"path"`
+	Fix          string `json:"fix"`
+	Reason       string `json:"reason"`
+	Episode      int64  `json:"episode"`
+	MechanismSum string `json:"mechanism_sum"`
+	FixSum       string `json:"fix_sum"`
+}
+
+// NewPersonHold is the hold for a person a build of c answered: its episode and the sums of its mechanism and fix.
+func NewPersonHold(c Case, path, fix, reason string) PersonHold {
+	return PersonHold{Path: path, Fix: fix, Reason: reason, Episode: c.Episode, MechanismSum: textSum(c.Mechanism), FixSum: textSum(c.NextTest)}
+}
+
+// textSum is the hex SHA-256 of a case's text.
+func textSum(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:])
 }
 
 // Why is the hold's reason as a case's held mark shows it.
@@ -94,7 +111,8 @@ func LastPersonHold(log []CaseEntry) (PersonHold, bool) {
 }
 
 // PersonHoldOf is the hold for a person a case in testing stands on, from its log: its newest such hold of its
-// current episode, with no end and no later "set" line that changed the case's status, mechanism or fix.
+// current episode, with no end, the case's mechanism and fix as they were at it, and no later "set" line that changed
+// the case's status (updateCase names a status change first, so no title or other text it holds reads as one).
 func PersonHoldOf(c Case, log []CaseEntry) (PersonHold, bool) {
 	if c.Status != CaseTesting {
 		return PersonHold{}, false
@@ -104,28 +122,18 @@ func PersonHoldOf(c Case, log []CaseEntry) (PersonHold, bool) {
 		case ActionPersonEnded:
 			return PersonHold{}, false
 		case "set":
-			if personChange(log[i].Detail) {
+			if strings.HasPrefix(log[i].Detail, "status ") {
 				return PersonHold{}, false
 			}
 		case ActionPersonHeld:
 			h, ok := LastPersonHold(log[:i+1])
-			if !ok || h.Episode != c.Episode {
+			if !ok || h.Episode != c.Episode || h.MechanismSum != textSum(c.Mechanism) || h.FixSum != textSum(c.NextTest) {
 				return PersonHold{}, false
 			}
 			return h, true
 		}
 	}
 	return PersonHold{}, false
-}
-
-// personChange says a "set" line's detail (updateCase) changed the case's status, mechanism or fix.
-func personChange(detail string) bool {
-	for _, part := range strings.Split(detail, "; ") {
-		if strings.HasPrefix(part, "status ") || strings.HasPrefix(part, "mechanism: ") || strings.HasPrefix(part, "fix: ") {
-			return true
-		}
-	}
-	return false
 }
 
 // A proposal for a hand landing is kept in the case's log too: a "proposed for a hand landing" line with its pull

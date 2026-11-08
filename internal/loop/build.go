@@ -907,8 +907,7 @@ func buildSpan(ctx context.Context, st *store.Store, c store.Case, runs []store.
 	}
 	var span []store.LoopRun
 	for _, run := range runs {
-		// a build that answered its fix is out of reach changed nothing and was refused nothing: the span reads past it
-		if run.Step != StepBuild || run.Status == store.RunRunning || run.Status == store.RunOutOfReach {
+		if run.Step != StepBuild || run.Status == store.RunRunning {
 			continue
 		}
 		if run.CaseEpisode != c.Episode || runAt(run).Before(start) || run.Status == store.RunOK {

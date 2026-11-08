@@ -22,8 +22,8 @@ import (
 // submodule of BASE) holds the case for a person, with a "held for a person" line in its log and a raised problem note
 // that names the path and the fix. The run keeps its own outcome (store.RunOutOfReach), which the stop rule neither
 // counts nor stops at, and a held case takes no build slot. The hold stands until the case starts a new episode,
-// leaves testing, or a person changes its status, mechanism or fix (store.PersonHoldOf); new evidence alone does not
-// end it. A path a change may touch, and one that is no path of the repository at BASE, are the build's refusals at
+// leaves testing, or a person changes its status, mechanism or fix (store.PersonHoldOf) or resolves its note; new
+// evidence alone does not end it. A path a change may touch, and one that is no path of the repository at BASE, are the build's refusals at
 // its report.
 
 // OutOfReach is a build report's answer that the case's fix is out of the loop's reach: the path, from the
@@ -47,7 +47,7 @@ const outOfReachBrief = "When the case's fix needs a path no change may touch an
 // outOfReachReasonMax clip the fix and the reason the hold keeps, so its record stays one readable case log line.
 const (
 	outOfReachPathMax   = 200
-	outOfReachFixMax    = 400
+	outOfReachFixMax    = 350
 	outOfReachReasonMax = 300
 )
 
@@ -120,7 +120,13 @@ func (r *Runner) unreachable(ctx context.Context, p Package, name string) (why, 
 	for _, part := range parts {
 		gitDir = gitDir || strings.EqualFold(part, ".git")
 	}
-	if !inBase(base, name) && !(strings.EqualFold(parts[0], ".git") && inCheckout(p.Dir, name)) {
+	held := inBase(base, name)
+	if !held && strings.EqualFold(parts[0], ".git") {
+		if held, err = inGitDir(ctx, p.Dir, name); err != nil {
+			return nil, nil, err
+		}
+	}
+	if !held {
 		return nil, refused("the out-of-reach path %s is no path of the repository at BASE, nor a new file in a directory BASE holds: name the path the fix needs", name), nil
 	}
 	if _, scope := PathScope(Target{Repo: p.Repo}, []string{name}); scope != nil {
@@ -157,14 +163,42 @@ func inBase(base map[string]treeEntry, name string) bool {
 	return parent == "."
 }
 
-// inCheckout says whether the checkout at dir holds name as BASE's rule reads it (inBase): every directory above it
-// is a directory there, not a link, so name is an entry of that directory or a new file in it.
-func inCheckout(dir, name string) bool {
+// inGitDir says whether the checkout at dir holds name, a path in Git's own directory (its first part is .git), as
+// BASE's rule reads it (inBase): every directory above it is a directory there, not a link, so name is an entry of that
+// directory or a new file in it. Git's directory is the one git rev-parse names for the checkout (--git-dir), or the
+// repository's common one (--git-common-dir), which a linked worktree's .git file points past. err is the host's
+// error asking Git.
+func inGitDir(ctx context.Context, dir, name string) (bool, error) {
 	if dir == "" {
-		return false
+		return false, nil
 	}
+	out, err := hostInputGit(ctx, dir, "rev-parse", "--git-dir", "--git-common-dir")
+	if err != nil {
+		return false, fmt.Errorf("the checkout's git directory cannot be read: %v", err)
+	}
+	_, rest, inside := strings.Cut(name, "/")
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		gitDir := strings.TrimSpace(line)
+		if gitDir == "" {
+			continue
+		}
+		if !filepath.IsAbs(gitDir) {
+			gitDir = filepath.Join(dir, gitDir)
+		}
+		if fi, err := os.Lstat(gitDir); err != nil || !fi.IsDir() {
+			continue
+		}
+		if !inside || dirsAbove(gitDir, rest) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// dirsAbove says whether every directory above name, under root, is a directory there and not a link.
+func dirsAbove(root, name string) bool {
 	parts := strings.Split(name, "/")
-	cur := dir
+	cur := root
 	for _, part := range parts[:len(parts)-1] {
 		cur = filepath.Join(cur, part)
 		if fi, err := os.Lstat(cur); err != nil || !fi.IsDir() {
@@ -182,8 +216,9 @@ func (r *Runner) holdForPerson(ctx context.Context, c store.Case, episode int64,
 	if err != nil {
 		return err
 	}
-	h := store.PersonHold{Path: plainClip(plain.Line(texts[0]), outOfReachPathMax), Fix: plainClip(plain.Line(texts[1]), outOfReachFixMax),
-		Reason: plainClip(plain.Line(texts[2]), outOfReachReasonMax), Episode: episode}
+	h := store.NewPersonHold(c, plainClip(plain.Line(texts[0]), outOfReachPathMax), plainClip(plain.Line(texts[1]), outOfReachFixMax),
+		plainClip(plain.Line(texts[2]), outOfReachReasonMax))
+	h.Episode = episode
 	if err := r.Store.CaseNote(cleanedNote(ctx), c.ID, store.ActionPersonHeld, store.PersonDetail(h), "loop"); err != nil {
 		return err
 	}
@@ -198,14 +233,15 @@ func (r *Runner) putPersonNote(ctx context.Context, caseID string, h store.Perso
 	_, err := r.Store.PutNote(ctx, store.Note{ID: personNoteID(caseID, h.Path), Kind: store.NoteProblem, Importance: store.ImportanceNormal,
 		At: r.now(), Title: "The loop's build for case " + caseID + " needs a person: " + h.Path,
 		Detail: "Its fix is out of the loop's reach: " + sentence(h.Reason) + " The change to make in " + h.Path + ": " + sentence(h.Fix) +
-			" Make it and close the case, or change the case's mechanism or fix, or send it back to its investigation: new evidence alone does not end the hold."})
+			" Make it and close the case. Resolving this note, changing the case's mechanism or fix, or sending it back to its investigation also ends the hold, and the case builds again; new evidence alone does not."})
 	return err
 }
 
 // heldForPerson is the path a case in testing waits on a person for (store.PersonHoldOf), or "", and the error of a
 // log it cannot read. A standing hold whose note was never put gets it. A hold that no longer stands (a new episode, a
-// person's change of the case) gets its end, and its notes are resolved, before the case builds again; one whose end
-// cannot be written is logged and ends all the same, and the next pass writes it. A dry pass writes nothing.
+// person's change of the case), and one whose note a person resolved, get their end, and their notes are resolved,
+// before the case builds again; one whose end cannot be written is logged and ends all the same, and the next pass
+// writes it. A dry pass writes nothing.
 func (r *Runner) heldForPerson(ctx context.Context, c store.Case, dry bool) (string, error) {
 	log, err := r.Store.CaseLog(ctx, c.ID)
 	if err != nil {
@@ -216,13 +252,21 @@ func (r *Runner) heldForPerson(ctx context.Context, c store.Case, dry bool) (str
 		return "", nil
 	}
 	if h, ok := store.PersonHoldOf(c, log); ok {
-		if !dry {
-			if _, had, err := r.Store.Note(ctx, personNoteID(c.ID, h.Path)); err != nil {
-				r.logf("the person hold note of %s: %v", c.ID, err)
-			} else if !had {
-				if err := r.putPersonNote(ctx, c.ID, h); err != nil {
-					r.logf("the person hold note of %s: %v", c.ID, err)
+		n, had, err := r.Store.Note(ctx, personNoteID(c.ID, h.Path))
+		switch {
+		case err != nil:
+			r.logf("the person hold note of %s: %v", c.ID, err)
+		case had && !n.Done.IsZero():
+			// a person who resolves the note is done waiting: the hold ends, and the case builds again
+			if !dry {
+				if err := r.endPersonHold(ctx, c.ID, "a person resolved its note"); err != nil {
+					r.logf("the person hold of %s: %v", c.ID, err)
 				}
+			}
+			return "", nil
+		case !had && !dry:
+			if err := r.putPersonNote(ctx, c.ID, h); err != nil {
+				r.logf("the person hold note of %s: %v", c.ID, err)
 			}
 		}
 		return h.Path, nil
