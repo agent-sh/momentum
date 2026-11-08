@@ -458,8 +458,19 @@ func TestABuildThatNeverStartsStopsOnItsStage(t *testing.T) {
 		cs[0].Title != "The loop fails the same way twice: build toolchains" || cs[0].Evidence != 2 {
 		t.Fatalf("the stop's component-health case: %+v %v", cs, err)
 	}
-	if runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID}); err != nil || len(runs) != 2 {
+	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID})
+	if err != nil || len(runs) != 2 {
 		t.Fatalf("the stopped case built again: %d %v", len(runs), err)
+	}
+	// each piece of evidence is dated by its build's end, as the stop rule dates a build that never started
+	evs, err := r.Store.CaseEvidence(ctx, cs[0].ID, 0)
+	if err != nil || len(evs) != 2 {
+		t.Fatalf("the stop's evidence: %+v %v", evs, err)
+	}
+	for _, e := range evs {
+		if e.At.UnixMilli() != runs[0].Ended.UnixMilli() && e.At.UnixMilli() != runs[1].Ended.UnixMilli() {
+			t.Fatalf("evidence dated %v, by neither build's end (%v, %v)", e.At, runs[0].Ended, runs[1].Ended)
+		}
 	}
 }
 
