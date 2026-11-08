@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -1277,8 +1278,16 @@ func TestACapacityHoldIsNotedAndRaisedAfterADay(t *testing.T) {
 		return n
 	}
 	hold("load 5")
-	if n := note(); n.Importance != store.ImportanceLow || !strings.Contains(n.Detail, "load 5") {
-		t.Fatalf("a new hold's note: %+v", n)
+	began := note()
+	if began.Importance != store.ImportanceLow || !strings.Contains(began.Detail, "load 5") {
+		t.Fatalf("a new hold's note: %+v", began)
+	}
+	// the same hold again, still low and standing: the note says what the gate printed last, and keeps its start
+	now = now.Add(10 * time.Minute)
+	hold("load 4")
+	if n := note(); n.Importance != store.ImportanceLow || !n.Done.IsZero() || !strings.Contains(n.Detail, "load 4") || strings.Contains(n.Detail, "load 5") ||
+		n.At.UnixMilli() != began.At.UnixMilli() {
+		t.Fatalf("a standing note was not refreshed: %+v", n)
 	}
 	if _, _, err := st.DoneNote(ctx, capacityNoteID(c.ID), now); err != nil {
 		t.Fatal(err)
@@ -1507,5 +1516,149 @@ TEST
 	cs, err := st.Cases(ctx, store.CaseFilter{Family: store.HealthFamily})
 	if err != nil || len(cs) != 1 || !slices.Equal(cs[0].Signatures, []string{"component-health/v1:loop:build:build-check"}) {
 		t.Fatalf("the stop's case: %+v %v", cs, err)
+	}
+}
+
+// A build held at the capacity gate before its agent leaves nothing behind, pass after pass: no run or host directory,
+// no reservation and no receipt, and its build tree back with its case. The next run's case file carries no charge
+// receipt of a held build either.
+func TestACapacityHoldLeavesNothingBehind(t *testing.T) {
+	fakeManager(t) // host ordering only: no unit or model starts
+	ctx := context.Background()
+	r, c := inputRunner(t)
+	f := newRepo(t, nil)
+	busy := true
+	marked := 0 // the gate waits that found the build's wait marker in its host directory
+	r.Ship = shipWithSandbox(r.Store, f, Sandbox{Gate: func(ctx context.Context) error {
+		if m, _ := filepath.Glob(filepath.Join(r.Dir, "runs", ".*-host", gateWaitMarker)); len(m) == 1 {
+			marked++
+		}
+		if !busy {
+			return nil
+		}
+		if err := exec.CommandContext(ctx, "false").Run(); err != nil {
+			return fmt.Errorf("the capacity gate: %w", err)
+		}
+		return nil
+	}})
+	r.Ship.Dir = r.Dir
+	r.Inputs.ReadDirs = []string{f.main}
+	mechanism, fix := "one cause", "one fix"
+	var err error
+	if c, err = r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	setCaseRepo(t, r.Store, c, "main")
+	for i := 0; i < 4; i++ {
+		done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
+		if err != nil || len(done) != 1 || done[0].Run.ID != "" || !strings.HasPrefix(done[0].Skipped, "build check: the machine has no room") {
+			t.Fatalf("held pass %d: %+v %v", i, done, err)
+		}
+	}
+	if marked != 4 {
+		t.Fatalf("the build's wait marker stood at %d of 4 gate waits", marked)
+	}
+	if entries, err := os.ReadDir(filepath.Join(r.Dir, "runs")); err == nil && len(entries) != 0 {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("held builds left run or host directories: %v", names)
+	}
+	if runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID}); err != nil || len(runs) != 0 {
+		t.Fatalf("held builds left reservations: %+v %v", runs, err)
+	}
+	log, err := r.Store.CaseLog(ctx, c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range log {
+		if e.Action == store.ActionLoopHold {
+			t.Fatalf("a held build left a receipt: %+v", e)
+		}
+	}
+	if p, ok, err := r.Ship.Load(c.ID); err != nil || !ok || strings.HasPrefix(p.Work, filepath.Join(r.Dir, "runs")) {
+		t.Fatalf("the build tree did not go back to its case: %+v %v", p.Work, err)
+	}
+	// a paid hold's receipt (another kind of hold, after an agent) stays out of the next run's case file
+	paid, why := r.reserve(ctx, c.Family, c.ID, StepBuild)
+	if why != "" {
+		t.Fatal(why)
+	}
+	paid.Ended, paid.USD = time.Now(), 1.5
+	if err := r.Store.HoldLoopRun(ctx, paid); err != nil {
+		t.Fatal(err)
+	}
+	busy = false
+	done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
+	if err != nil || len(done) != 1 || done[0].Run.Dir == "" {
+		t.Fatalf("the pass with room: %+v %v", done, err)
+	}
+	if _, err := os.Lstat(filepath.Join(HostDir(done[0].Run.Dir), gateWaitMarker)); !os.IsNotExist(err) {
+		t.Fatalf("the wait marker outlived the gate: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(HostDir(done[0].Run.Dir), "input", "case.json"))
+	if err != nil || strings.Contains(string(raw), store.ActionLoopHold) {
+		t.Fatalf("the next run's case file carries a hold's receipt: %v %s", err, raw)
+	}
+}
+
+// A build reserved and waiting at the capacity gate when its process dies has spent nothing: the next pass ends it at
+// no cost and with no start, by the marker in its host directory. One that died after the gate counts its whole budget.
+func TestABuildKilledAtTheGateEndsAtNoCost(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "killed", 1)
+	now := time.Now()
+	r.Now = func() time.Time { return now }
+	waiting, why := r.reserve(ctx, c.Family, c.ID, StepBuild)
+	if why != "" {
+		t.Fatal(why)
+	}
+	write(t, filepath.Join(HostDir(waiting.Dir), gateWaitMarker), "")
+	past, why := r.reserve(ctx, c.Family, c.ID, StepBuild)
+	if why != "" {
+		t.Fatal(why)
+	}
+	r.Now = func() time.Time { return now.Add(r.Budgets.RunTime + time.Minute) }
+	if err := r.endStale(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.LoopRunByID(ctx, waiting.ID)
+	if err != nil || got.Failure != "killed" || got.USD != 0 || !got.Started.IsZero() {
+		t.Fatalf("a build killed at the gate: %+v %v", got, err)
+	}
+	if other, err := st.LoopRunByID(ctx, past.ID); err != nil || other.USD != r.Budgets.Run {
+		t.Fatalf("a build killed past the gate: %+v %v", other, err)
+	}
+	if cs, err := st.CaseByID(ctx, c.ID); err != nil || cs.Cost.USD != r.Budgets.Run || cs.Cost.Runs != 1 {
+		t.Fatalf("the case's cost: %+v %v", cs.Cost, err)
+	}
+}
+
+// Refusals A, B, A recorded as a build records them (stageFailure, then finish: the scrubber and the mask), with run ids
+// and quoted values that differ between the two A's: the third stops the case on the first, with no sandbox.
+func TestRefusalsThatTakeTurnsStopThroughFinish(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "aba", 1)
+	base := time.Now().Add(-time.Hour)
+	a := func(id, value string) error {
+		return refused("the patch's unit momentum-run-loop-patch-%s holds %q, which no change may touch", id, value)
+	}
+	recordBuild(t, r, c, base, "build propose", a("20261107-223927-a1b2c3d4", "cmd/x.go"))
+	recordBuild(t, r, c, base.Add(time.Minute), "build propose", refused("a proposal needs its rollback: how the change is undone"))
+	if why, err := r.stopped(ctx, c, true); err != nil || why != "" {
+		t.Fatalf("A, B: %q %v", why, err)
+	}
+	third := recordBuild(t, r, c, base.Add(2*time.Minute), "build propose", a("20261108-101500-12345678", "internal/y.go"))
+	first, _ := st.LoopRuns(ctx, store.RunFilter{Case: c.ID})
+	if len(first) != 3 || first[2].Cause != third.Cause {
+		t.Fatalf("the two A's do not mask to one cause: %+v", first)
+	}
+	if why, err := r.stopped(ctx, c, true); err != nil || !strings.HasPrefix(why, "two of its build runs were refused for one cause: build propose: refused: the patch's unit") {
+		t.Fatalf("A, B, A: %q %v", why, err)
 	}
 }

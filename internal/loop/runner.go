@@ -776,6 +776,13 @@ func (r *Runner) endStale(ctx context.Context) error {
 			if run.USD == 0 {
 				run.USD = r.Budgets.Run
 			}
+			if run.Step == StepBuild && run.Dir != "" {
+				if _, err := os.Lstat(filepath.Join(HostDir(run.Dir), gateWaitMarker)); err == nil {
+					// killed while it waited at the capacity gate: its agent never started, so it spent nothing
+					run.USD, run.Started = 0, time.Time{}
+					run.Summary = strings.TrimSpace(run.Summary + "\nkilled while it waited at the capacity gate, before its agent")
+				}
+			}
 			// a killed investigation leaves its findings file: the case keeps what it found, still investigating,
 			// recorded before the run ends, as the runner records a run's
 			if run.Step == StepInvestigate && run.Dir != "" {
@@ -1364,7 +1371,13 @@ func (r *Runner) completeStep(ctx context.Context, c store.Case, run store.LoopR
 		if errors.As(err, &staged) {
 			stage = strings.TrimPrefix(staged.key, "build ")
 		}
-		return r.buildSkipped(ctx, c, stage, err)
+		done := r.buildSkipped(ctx, c, stage, err)
+		if heldBeforeAgent(res, err) {
+			// a build held at the capacity gate before its agent leaves nothing: its tree goes back to the case, and its
+			// run's directories go, as an unreserved build's do
+			r.removeRunDirs(ctx, c.ID, run.Dir, true)
+		}
+		return done
 	}
 	return Done{Family: c.Family, Case: c.ID, Step: run.Step, Run: run, Refused: res.Refused}
 }
@@ -1442,9 +1455,12 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 	}
 
 	var recordErr error
-	if run.Step == StepBuild && held(err) {
+	switch {
+	case run.Step == StepBuild && heldBeforeAgent(res, err):
+		recordErr = r.Store.ReleaseLoopRun(ctx, run.ID)
+	case run.Step == StepBuild && held(err):
 		recordErr = r.Store.HoldLoopRun(ctx, *run)
-	} else {
+	default:
 		recordErr = r.Store.FinishLoopRun(ctx, *run)
 	}
 	if recordErr != nil {

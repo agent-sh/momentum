@@ -228,6 +228,18 @@ func inside(dir, path string) bool {
 
 // prepareRun creates the case and records before charging a reservation. These
 // files are host-owned. A failed preparation returns a skipped step.
+// runLog is a case's log as a run reads it in case.json: without the charge receipts of held builds (loop hold), which
+// are the budgets' accounting, not the case's history.
+func runLog(log []store.CaseEntry) []store.CaseEntry {
+	out := make([]store.CaseEntry, 0, len(log))
+	for _, e := range log {
+		if e.Action != store.ActionLoopHold {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step string) (run store.LoopRun, err error) {
 	defer func() {
 		if err != nil && step == StepBuild {
@@ -261,6 +273,7 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 	if err != nil {
 		return run, err
 	}
+	log = runLog(log)
 	raw, err := json.Marshal(struct {
 		Case     store.Case        `json:"case"`
 		Evidence []store.Evidence  `json:"evidence"`

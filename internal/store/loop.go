@@ -273,7 +273,17 @@ func AddMicros(a, b int64) int64 {
 	return min(max(a+b, -1<<60), 1<<60)
 }
 
-const loopHoldAction = "loop hold"
+// ActionLoopHold is the case log line a held build's reservation leaves: its charge receipt, which the budgets read.
+const ActionLoopHold = "loop hold"
+
+const loopHoldAction = ActionLoopHold
+
+// ReleaseLoopRun ends a reservation whose run never started and spent nothing (a build held at the capacity gate before
+// its agent): the row goes, with no charge and no receipt, as if it was never reserved.
+func (s *Store) ReleaseLoopRun(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM loop_runs WHERE id = ? AND status = ?`, id, RunRunning)
+	return err
+}
 
 // HoldLoopRun removes a held build's reservation without counting an agent run.
 // Any model work already done remains a charge receipt in the case log. The

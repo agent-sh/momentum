@@ -386,6 +386,16 @@ func stageFailureIn(ctx context.Context, res Result, key string, err error) (Res
 	return res, nil
 }
 
+// gateWaitMarker is the file in a build's host directory while the build waits at the capacity gate before its agent.
+const gateWaitMarker = "gate-wait"
+
+// heldBeforeAgent says a build was held at the capacity gate before its agent started, having spent nothing: its
+// reservation is released with no receipt, and its run's directories go once its build tree is back (completeStep).
+func heldBeforeAgent(res Result, err error) bool {
+	var busy *busyMachine
+	return held(err) && errors.As(err, &busy) && !res.Started && res.USD == 0 && res.RelayAdmitted == 0
+}
+
 // paidCheck is a check's error after the build's agent ran and was paid for. A machine with no room for the test then
 // is no hold: a hold keeps no run, drops the report and the patch, and the next pass pays for another agent run, until
 // the case's budget is gone with nothing counted. It is the host's error at the check, which the stop rule counts on
@@ -422,7 +432,15 @@ func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Re
 	if r.Ship == nil {
 		return stageFailureIn(ctx, Result{}, "build package", errors.New("build needs the host ship tool"))
 	}
-	if err := r.Ship.Sandbox.room(ctx); err != nil {
+	// the gate waits in the build's own turn, beside the other families' runs, so its wait holds no other run; while
+	// it waits, a marker in the host directory tells endStale the agent never started, if the process dies there
+	waiting := filepath.Join(HostDir(run.Dir), gateWaitMarker)
+	if err := writeOwn(waiting, nil); err != nil {
+		r.logf("build %s: the gate's wait marker: %v", c.ID, err)
+	}
+	err = r.Ship.Sandbox.room(ctx)
+	os.Remove(waiting)
+	if err != nil {
 		if !held(err) && ctx.Err() == nil {
 			r.logf("build %s: the capacity gate failed before its agent: %v", c.ID, err)
 		}

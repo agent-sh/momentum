@@ -322,6 +322,7 @@ func (e *Eval) trialInvocation(ctx context.Context, in *taskInputs, t GoldenTask
 	if err != nil {
 		return Invocation{}, err
 	}
+	log = runLog(log)
 	raw, err := json.Marshal(struct {
 		Case     store.Case        `json:"case"`
 		Evidence []store.Evidence  `json:"evidence"`
