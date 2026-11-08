@@ -206,7 +206,7 @@ var modeKeys = map[string]bool{"mode": true}
 
 // missForms are each harness's read tool's own words for a file that is not there, at its error's start, as its
 // source writes them: Claude Code's Read, Kimi's Read (the path in quotes), Grok's read_file (after its envelope's
-// "Error: "), OpenCode's read (after "Error: " as 1.2.0 to 1.2.27 stored it), Hermes's read_file (its JSON's error
+// "Error: "), OpenCode's read (after "Error: " as releases up to 1.2.27 stored it), Hermes's read_file (its JSON's error
 // field, its missing file's or Python's), pi's read (Node's error for the access it makes first), Codex's read_file.
 // Access refused, a guard's or the harness's refusal, and any other error that says something does not exist (Hermes's
 // terminal directory gone) are none of them.
