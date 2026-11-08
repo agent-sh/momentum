@@ -227,6 +227,23 @@ func GuardNotWatched(effect string) string {
 	return GuardUnused
 }
 
+// GuardedBack is Guarded for a watch its problem came back in, its recurrences counted in units: before, those before
+// the watch's start (after the change reached its base and before it took effect, hours no exposure watched holds),
+// and during, those in the watch. Its effect says where they came, so it never counts more recurrences than hours
+// watched without saying why.
+func GuardedBack(incidents, exposure, before, during, watched int, units string) Result {
+	r := Guarded(incidents, exposure, before+during, watched, units)
+	switch {
+	case before > 0 && during == 0:
+		r.Effect = fmt.Sprintf("guarded: its problem came back after the change reached its base and before it took effect (%d %s); %d incidents in %d %s before it",
+			before, units, incidents, exposure, units)
+	case before > 0:
+		r.Effect = fmt.Sprintf("guarded: its problem came back after the change (%d of %d %s watched, and %d %s before the watch's start); %d incidents in %d %s before it",
+			during, watched, units, before, units, incidents, exposure, units)
+	}
+	return r
+}
+
 // Guarded is a guard's watch as a result: incidents in a history of exposure units before the change, recurrences in
 // watched units after it, counted in units. It is never improved: a guard makes no claim, and its p stays 0. With no
 // recurrence its effect says it was guarded, with the exposure watched and P (Recur), had the problem kept happening,

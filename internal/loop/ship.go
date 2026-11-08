@@ -92,35 +92,40 @@ const MaxClosedProposals = 2
 
 // Package is a case's change: where it goes, what checks it, how it is measured and undone, and where it stands.
 type Package struct {
-	Case            string           `json:"case"`
-	Kind            string           `json:"kind"` // repo
-	Repo            string           `json:"repo,omitempty"`
-	Base            string           `json:"base,omitempty"`
-	Branch          string           `json:"branch,omitempty"`
-	Dir             string           `json:"dir"`                 // the repository's main checkout
-	Work            string           `json:"work"`                // the run's build tree, never read by host steps
-	Host            string           `json:"host"`                // host-only independent clone
-	BaseCommit      string           `json:"base_commit"`         // immutable patch base
-	WorkBase        string           `json:"work_base,omitempty"` // the run clone's one commit, of BaseCommit's tree
-	PublishedHead   string           `json:"published_head,omitempty"`
-	RefreshBase     bool             `json:"refresh_base,omitempty"`
-	State           string           `json:"state"`
-	Check           *Check           `json:"check,omitempty"`
-	Plan            *Plan            `json:"plan,omitempty"`
-	Rollback        string           `json:"rollback,omitempty"`
-	Title           string           `json:"title,omitempty"`
-	Body            string           `json:"body,omitempty"`
-	Lesson          string           `json:"lesson,omitempty"`
-	PR              string           `json:"pr,omitempty"`
-	LandingHead     string           `json:"landing_head,omitempty"`
-	Cleanup         string           `json:"cleanup,omitempty"`
-	Head            string           `json:"head,omitempty"` // the commit proposed
-	Reviews         []Review         `json:"reviews,omitempty"`
-	ClosedProposals int              `json:"closed_proposals,omitempty"`
-	Landed          []string         `json:"landed,omitempty"` // the commits that went in
-	LandedAt        time.Time        `json:"landed_at,omitempty"`
-	Undo            *RollbackJournal `json:"undo,omitempty"`
-	Changed         []string         `json:"changed,omitempty"` // the paths the change touches
+	Case            string    `json:"case"`
+	Kind            string    `json:"kind"` // repo
+	Repo            string    `json:"repo,omitempty"`
+	Base            string    `json:"base,omitempty"`
+	Branch          string    `json:"branch,omitempty"`
+	Dir             string    `json:"dir"`                 // the repository's main checkout
+	Work            string    `json:"work"`                // the run's build tree, never read by host steps
+	Host            string    `json:"host"`                // host-only independent clone
+	BaseCommit      string    `json:"base_commit"`         // immutable patch base
+	WorkBase        string    `json:"work_base,omitempty"` // the run clone's one commit, of BaseCommit's tree
+	PublishedHead   string    `json:"published_head,omitempty"`
+	RefreshBase     bool      `json:"refresh_base,omitempty"`
+	State           string    `json:"state"`
+	Check           *Check    `json:"check,omitempty"`
+	Plan            *Plan     `json:"plan,omitempty"`
+	Rollback        string    `json:"rollback,omitempty"`
+	Title           string    `json:"title,omitempty"`
+	Body            string    `json:"body,omitempty"`
+	Lesson          string    `json:"lesson,omitempty"`
+	PR              string    `json:"pr,omitempty"`
+	LandingHead     string    `json:"landing_head,omitempty"`
+	Cleanup         string    `json:"cleanup,omitempty"`
+	Head            string    `json:"head,omitempty"` // the commit proposed
+	Reviews         []Review  `json:"reviews,omitempty"`
+	ClosedProposals int       `json:"closed_proposals,omitempty"`
+	Landed          []string  `json:"landed,omitempty"` // the commits that went in
+	LandedAt        time.Time `json:"landed_at,omitempty"`
+	// ReachedAt is when the loop first saw the change on its base branch: the one instant that sorts its guard's case's
+	// problem into history and recurrence (guardReached). It is LandedAt where the loop pushed the change or a request
+	// was merged into the base; for a request merged into another branch, or a change landed by content, the pass that
+	// saw it on the base, since LandedAt (the merge, a commit's date) can come before the change reached it.
+	ReachedAt time.Time        `json:"reached_at,omitzero"`
+	Undo      *RollbackJournal `json:"undo,omitempty"`
+	Changed   []string         `json:"changed,omitempty"` // the paths the change touches
 	// Hand names the changed paths the loop may not land itself (PathScope): the change is proposed for a person to
 	// land by hand, and the loop never lands it.
 	Hand []string `json:"hand,omitempty"`
@@ -1523,6 +1528,12 @@ func (s *Ship) finishLanding(ctx context.Context, p Package) (Package, error) {
 	p.Head, p.State = p.LandingHead, Landed
 	if p.LandedAt.IsZero() {
 		p.LandedAt = s.now()
+	}
+	if p.ReachedAt.IsZero() {
+		p.ReachedAt = p.LandedAt // the loop pushed it to its base
+	}
+	if err := s.judgeReached(ctx, &p); err != nil {
+		return p, err
 	}
 	// Deployment can fail or be interrupted. Keep deletion intent with the landing.
 	p.Cleanup = "proposal branch cleanup pending"

@@ -972,7 +972,7 @@ func TestALateRecountThatCannotReadTheStoreDecidesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Store.Close()
-	if err := s.landHand(ctx, c, &p, p.Head, time.Now()); err == nil || errors.Is(err, ErrRefused) {
+	if err := s.landHand(ctx, c, &p, p.Head, time.Now(), time.Now()); err == nil || errors.Is(err, ErrRefused) {
 		t.Fatalf("a recount over a closed store: %v", err)
 	}
 	if got, _, _ := s.Load(c.ID); got.State != Proposed || got.Plan.Units == "" {

@@ -230,7 +230,11 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 		if at.IsZero() {
 			at = s.now()
 		}
-		return p, s.landHand(ctx, c, &p, pr.MergeCommit.OID, at)
+		reached := at // merged into the base, it reached it then
+		if pr.Base != "" && pr.Base != p.Base {
+			reached = later(at, s.now()) // merged elsewhere, it reached the base by this pass, which sees it there
+		}
+		return p, s.landHand(ctx, c, &p, pr.MergeCommit.OID, at, reached)
 	case "CLOSED":
 		// a person who lands a rebased head by a push to the default branch and then closes the request landed it all
 		// the same: the change's files on the default branch as the proposal has them say so
@@ -240,7 +244,7 @@ func (s *Ship) reconcileHand(ctx context.Context, caseID string) (Package, error
 			if err := s.caseNoteOnce(ctx, caseID, "landed by content", fmt.Sprintf("%s was closed, and %s holds its change's files as proposed at %s", p.PR, p.Base, commit)); err != nil {
 				return p, err
 			}
-			return p, s.landHand(ctx, c, &p, commit, at)
+			return p, s.landHand(ctx, c, &p, commit, at, later(at, s.now())) // its commit's date may come before it reached the base
 		}
 		p.State = Withdrawn
 		p.ClosedProposals++
@@ -338,16 +342,18 @@ func (s *Ship) caseNoteOnce(ctx context.Context, id, action, detail string) erro
 	return s.Store.CaseNote(cleanedNote(ctx), id, action, detail, s.Actor)
 }
 
-// landHand records a hand landing at commit, a commit of the default branch, landed at at. A plan counted more than a
-// window before the landing no longer stands for the windows before the change: it is counted again as of the
-// landing. A count that waits on a reader holds the landing for the next pass; one refused leaves the change to be
-// measured by hand (a plan without units), with a case log line that says why.
-func (s *Ship) landHand(ctx context.Context, c store.Case, p *Package, commit string, at time.Time) error {
-	if p.Plan != nil && at.Sub(p.Plan.At) > p.Plan.Window {
-		plan, err := s.validPlan(ctx, c, p.Plan.Signal, p.Plan.Window, p.Plan.Installed, at)
+// landHand records a hand landing at commit, a commit of the default branch, landed at at, which the loop first saw on
+// its base at reached (Package.ReachedAt): the instant that sorts its guard's case's problem. A plan counted more than
+// a window before that instant no longer stands for the windows before the change: it is counted again as of it. A
+// count that waits on a reader holds the landing for the next pass; one refused leaves the change to be measured by
+// hand (a plan without units), with a case log line that says why. A guard that stands takes its own-tool judgment
+// once more at that instant (judgeReached), within a window too.
+func (s *Ship) landHand(ctx context.Context, c store.Case, p *Package, commit string, at, reached time.Time) error {
+	if p.Plan != nil && reached.Sub(p.Plan.At) > p.Plan.Window {
+		plan, err := s.validPlan(ctx, c, p.Plan.Signal, p.Plan.Window, p.Plan.Installed, reached)
 		var wait *waitingPlan
 		switch {
-		case errors.As(err, &wait) && s.now().Sub(at) < p.Plan.Window:
+		case errors.As(err, &wait) && s.now().Sub(reached) < p.Plan.Window:
 			return &shipHold{err: fmt.Errorf("the hand landing's plan is counted again at its landing, which waits: %w", err)}
 		case errors.As(err, &wait):
 			// a window after the landing the count still waits (an incomplete run inside its span never clears, and a
@@ -366,21 +372,41 @@ func (s *Ship) landHand(ctx context.Context, c store.Case, p *Package, commit st
 		default:
 			p.Plan = &plan
 			detail := fmt.Sprintf("landed by hand more than a window after its plan: counted again at %s, %d of %d in the baseline, gate %d of %d",
-				at.UTC().Format(time.RFC3339), plan.Before, plan.BeforeBase, plan.Gate, plan.GateBase)
+				reached.UTC().Format(time.RFC3339), plan.Before, plan.BeforeBase, plan.Gate, plan.GateBase)
 			if g := plan.Guard; g != nil {
 				detail = fmt.Sprintf("landed by hand more than a window after its plan: counted again at %s as a guard, %d incidents in %d %s of exposure, a watch of %s",
-					at.UTC().Format(time.RFC3339), g.Incidents, g.Exposure, plan.Units, days(guardRetention))
+					reached.UTC().Format(time.RFC3339), g.Incidents, g.Exposure, plan.Units, days(guardRetention))
 			}
 			if err := s.caseNoteOnce(ctx, c.ID, "plan counted again", detail); err != nil {
 				return err
 			}
 		}
 	}
+	p.ReachedAt = reached
+	if err := s.judgeReached(ctx, p); err != nil {
+		return err
+	}
 	p.State, p.LandingHead, p.Landed, p.Cleanup, p.LandedAt = Landed, commit, []string{commit}, "", at
 	if err := s.saveAuthorized(ctx, p); err != nil {
 		return err
 	}
 	return s.finishHand(ctx, *p)
+}
+
+// judgeReached is a guard's own-tool judgment once more as its change lands, at the instant it reached its base
+// (Package.ReachedAt, guardOwnAt): a refusal leaves the change to be measured by hand, as a refused recount does, with
+// a case log line that says why. It runs once, before the watch starts, so it can hide no recurrence; after it, no
+// judgment of history runs again (SPEC, Guards, The time model).
+func (s *Ship) judgeReached(ctx context.Context, p *Package) error {
+	if p.Plan == nil || p.Plan.Guard == nil {
+		return nil
+	}
+	why, err := guardOwnAt(ctx, s.Store, p.Case, *p.Plan, p.ReachedAt, s.Dir)
+	if err != nil || why == "" {
+		return err
+	}
+	p.Plan.Units, p.Plan.Guard = "", nil
+	return s.caseNoteOnce(ctx, p.Case, "measured by hand", "its guard's own-tool exemption does not hold at the instant its change reached its base: "+why)
 }
 
 // landedByContent says whether the fetched default branch holds every file the change touches as the proposal's head

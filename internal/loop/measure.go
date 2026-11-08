@@ -314,10 +314,10 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 	}
 	if p.Plan.Guard != nil && c.Status == store.CaseMeasuring {
 		// a guard's recurrence counts, from the plan the proposal recorded, before any wait for a source or for its
-		// change to be in effect: its signal's events from the watch's first start, and the case's evidence dated from
-		// the landing (guardLanded); it needs only the signal and the case
+		// change to be in effect: its signal's events and the case's evidence from the instant its change reached its
+		// base (guardReached); it needs only the signal and the case
 		from := guardStart(c, &p)
-		if back, err := r.guardRecurrences(ctx, c, &p, *p.Plan, from); err != nil {
+		if back, err := r.guardRecurrences(ctx, c, &p, *p.Plan); err != nil {
 			return failed(err.Error())
 		} else if len(back) > 0 {
 			return r.guardRegressed(ctx, c, &p, *p.Plan, m, back, from, now, dry)
@@ -409,7 +409,7 @@ func (r *Runner) measureCase(ctx context.Context, c store.Case, dry bool) Measur
 		}
 		if plan.Guard != nil {
 			// the watch may start before this pass (its change's file dates it): a recurrence from then is acted on now
-			if back, err := r.guardRecurrences(ctx, c, &p, plan, p.GuardFrom); err != nil {
+			if back, err := r.guardRecurrences(ctx, c, &p, plan); err != nil {
 				return failed(err.Error())
 			} else if len(back) > 0 {
 				return r.guardRegressed(ctx, c, &p, plan, m, back, p.GuardFrom, now, dry)

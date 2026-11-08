@@ -321,7 +321,7 @@ func simulateGuard(t *testing.T, h simHistory) {
 		signalStored = append(signalStored, historyLate)
 	}
 	pkg := Package{Case: c.ID, Kind: "repo", Repo: "agent-sh/fake", Base: "main", Dir: repo, Host: host, BaseCommit: base, PR: "https://github.com/agent-sh/fake/pull/7",
-		State: Landed, Landed: []string{head}, LandedAt: landed, Changed: []string{"a.txt"}, Plan: &plan}
+		State: Landed, Landed: []string{head}, LandedAt: landed, ReachedAt: landed, Changed: []string{"a.txt"}, Plan: &plan} // the loop pushed it
 	if err := ship.save(&pkg); err != nil {
 		t.Fatal(err)
 	}

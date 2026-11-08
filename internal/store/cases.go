@@ -346,6 +346,9 @@ func caseLogCleaned(ctx context.Context, q querier, id, actor, action, detail st
 	return err
 }
 
+// CaseNoteMax is the longest a case note is stored (CaseNoteText): a line that must stay whole fits in it.
+const CaseNoteMax = caseTextMax
+
 // CaseNoteText is the stored form of a case note after its caller cleans it.
 func CaseNoteText(text string) string { return caseText(text, caseTextMax) }
 
@@ -417,10 +420,10 @@ func addEvidence(ctx context.Context, q querier, id string, evs []Evidence, now 
 // comesBack decides whether a closed case comes back on the evidence it holds now, and says why either way.
 //   - A case closed as improved does not come back on its evidence: the measure step watches its signal, in the
 //     units its measurement counted, and brings it back at its old rate (RegressCase).
-//   - Nor does one closed as guarded: the measure step's watch reads its signal from the watch's start and its
-//     evidence dated from its change's landing on every pass, by the rule the watch used, and brings it back
-//     (RegressCase); its evidence dated before the landing is history, never a recurrence. Only an event counts there: evidence
-//     of another kind (a note, a commit, a file, an address) brings it back only by hand (ReopenCase).
+//   - Nor does one closed as guarded: the measure step's watch reads its signal and its evidence from the instant its
+//     change reached its base on every pass, by the rule the watch used, and brings it back (RegressCase); what came
+//     before that instant is history, never a recurrence. Only an event counts there: evidence of another kind (a note,
+//     a commit, a file, an address) brings it back only by hand (ReopenCase).
 //   - A case closed as already solved comes back on any evidence after the close, or after its fix was named when
 //     that came after the close (CloseFixed on a case closed before a close named its fix).
 //   - A dismissed case (not worth it, insufficient evidence) comes back only once the evidence after the close
@@ -433,9 +436,9 @@ func comesBack(ctx context.Context, q querier, c Case, now time.Time) (bool, str
 	}
 	if c.Reason == Guarded {
 		// one rule decides a guarded case's evidence: the measure step's watch after the close, which reads its events
-		// dated from the change's landing on every pass and leaves the loop's own out, as the watch did; it reads no other
-		// evidence, and an event dated before the landing is history
-		return false, "a guarded case's evidence is the measure step's watch to read: an event of it dated from its change's landing brings the case back, " +
+		// dated from when the change reached its base on every pass and leaves the loop's own out, as the watch did; it
+		// reads no other evidence, and an event dated before that is history
+		return false, "a guarded case's evidence is the measure step's watch to read: an event of it dated from when its change reached its base brings the case back, " +
 			"and evidence that is no event does not (case reopen brings the case back by hand)", nil
 	}
 	from, since := c.Closed, "it closed as "+strings.ReplaceAll(string(c.Reason), "-", " ")
@@ -1734,13 +1737,13 @@ const clearMeasurement = `guard_exposure = 0, guard_watched = 0, guard_recur = 0
 
 // CloseGuarded is the measure tool's: a measuring case whose guard's watch ended with no recurrence closes as guarded,
 // never as improved, however much of its unit the watch saw (none, when it was not used or only while the change was
-// out of effect), with its history's incidents and exposure as counted through the watch's start, the units of
-// exposure watched, the predictive probability that the problem, had it kept happening, would have recurred within
-// them (0 when the history gives no rate or nothing was watched), and the watch in words. Its log line adds sources,
-// when given: what the watch left out, which no other record names (the sources it left out of its counts, and its
-// evidence dated from the landing whose events are gone). The case store leaves its evidence
-// to the measure step: the watch after the close brings it back (RegressCase) at the first event of its signal from
-// the watch's start, or of its own evidence dated from its change's landing.
+// out of effect), with its history's incidents and exposure as counted through the instant its change reached its base,
+// the units of exposure watched, the predictive probability that the problem, had it kept happening, would have
+// recurred within them (0 when the history gives no rate or nothing was watched), and the watch in words. Its log line
+// adds sources, when given: what the watch left out, which no other record names (the sources it left out of its
+// counts, and its evidence dated from that instant whose events are gone). The case store leaves its evidence to the
+// measure step: the watch after the close brings it back (RegressCase) at the first event of its signal, or of its own
+// evidence, from that instant.
 func (s *Store) CloseGuarded(ctx context.Context, id string, incidents, exposure, watched int, recur float64, effect, sources, actor string) (Case, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
