@@ -255,6 +255,13 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 	if err = hostDir(host); err != nil {
 		return run, err
 	}
+	if step == StepBuild {
+		// the build's agent has not started, from before its reservation until build removes this: a process that
+		// dies in between leaves it, and endStale ends the run at no cost
+		if err = writeOwn(filepath.Join(host, notStartedMarker), nil); err != nil {
+			return run, err
+		}
+	}
 	complete := false
 	defer func() {
 		if !complete {

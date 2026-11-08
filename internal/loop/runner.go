@@ -646,13 +646,14 @@ const (
 	proposalRead    = "It ended: its proposal branch was read."
 	caseLeftTesting = "It ended: the case left testing."
 	roomFound       = "It ended: a later build of the case went on to its agent."
+	caseStopped     = "It ended: the stop rule stopped the case."
 	gateBroke       = "It ended: the capacity gate failed, which counts as the host's error at the check."
 )
 
 // holdNoteEnded says whether a base, proposal or capacity note says its hold ended (endHoldNotes).
 func holdNoteEnded(n store.Note) bool {
 	return strings.HasSuffix(n.Detail, baseFetched) || strings.HasSuffix(n.Detail, proposalRead) || strings.HasSuffix(n.Detail, caseLeftTesting) ||
-		strings.HasSuffix(n.Detail, roomFound) || strings.HasSuffix(n.Detail, gateBroke)
+		strings.HasSuffix(n.Detail, roomFound) || strings.HasSuffix(n.Detail, gateBroke) || strings.HasSuffix(n.Detail, caseStopped)
 }
 
 // capacityNoteID is the note of a case's builds held because the machine has no room for their check.
@@ -781,10 +782,10 @@ func (r *Runner) endStale(ctx context.Context) error {
 				run.USD = r.Budgets.Run
 			}
 			if run.Step == StepBuild && run.Dir != "" {
-				if _, err := os.Lstat(filepath.Join(HostDir(run.Dir), gateWaitMarker)); err == nil {
-					// killed while it waited at the capacity gate: its agent never started, so it spent nothing
+				if _, err := os.Lstat(filepath.Join(HostDir(run.Dir), notStartedMarker)); err == nil {
+					// killed before its agent started (its marker says so): it spent nothing
 					run.USD, run.Started = 0, time.Time{}
-					run.Summary = strings.TrimSpace(run.Summary + "\nkilled while it waited at the capacity gate, before its agent")
+					run.Summary = strings.TrimSpace(run.Summary + "\nkilled before its agent started")
 				}
 			}
 			// a killed investigation leaves its findings file: the case keeps what it found, still investigating,
@@ -1299,6 +1300,10 @@ func (r *Runner) stopped(ctx context.Context, c store.Case, dry bool) (string, e
 	}
 	if late, err := r.Store.ResumeLate(ctx, c.ID, sig, runAt(runs[1]), "loop"); err != nil || late {
 		return "", err
+	}
+	// a stopped case waits for no room: its capacity note, if any, ends
+	if err := r.endCapacityNote(ctx, c.ID, caseStopped); err != nil {
+		r.logf("capacity note of %s: %v", c.ID, err)
 	}
 	f := store.Finding{Family: store.HealthFamily, Signature: sig,
 		Title: plainClip("The loop fails the same way twice: "+stopText(a), store.TitleMax)}

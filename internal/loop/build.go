@@ -386,8 +386,9 @@ func stageFailureIn(ctx context.Context, res Result, key string, err error) (Res
 	return res, nil
 }
 
-// gateWaitMarker is the file in a build's host directory while the build waits at the capacity gate before its agent.
-const gateWaitMarker = "gate-wait"
+// notStartedMarker is the file in a build's host directory from its preparation (prepareRun, before its reservation)
+// until its agent is about to start: a process that dies in between leaves it, and endStale ends that run at no cost.
+const notStartedMarker = "agent-not-started"
 
 // heldBeforeAgent says a build was held at the capacity gate before its agent started, having spent nothing: its
 // reservation is released with no receipt, and its run's directories go once its build tree is back (completeStep).
@@ -432,22 +433,23 @@ func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Re
 	if r.Ship == nil {
 		return stageFailureIn(ctx, Result{}, "build package", errors.New("build needs the host ship tool"))
 	}
-	// the gate waits in the build's own turn, beside the other families' runs, so its wait holds no other run; while
-	// it waits, a marker in the host directory tells endStale the agent never started, if the process dies there
-	// The marker stays until the agent is about to start; a hold's goes with the run's directories once its reservation
-	// is released (completeStep), so a process that dies anywhere before the agent ends the run at no cost.
-	waiting := filepath.Join(HostDir(run.Dir), gateWaitMarker)
-	unmark := func() {
+	// The gate waits in the build's own turn, beside the other families' builds and investigations, so its wait holds
+	// none of them. The marker prepareRun wrote stays until the agent is about to start; a hold's goes with the run's
+	// directories once its reservation is released (completeStep), so a process that dies anywhere before the agent
+	// ends the run at no cost.
+	waiting := filepath.Join(HostDir(run.Dir), notStartedMarker)
+	unmark := func() error {
 		if err := os.Remove(waiting); err != nil && !os.IsNotExist(err) {
-			r.logf("build %s: the gate's wait marker: %v", c.ID, err)
+			return fmt.Errorf("the agent-not-started marker cannot be removed: %w", err)
 		}
-	}
-	if err := writeOwn(waiting, nil); err != nil {
-		r.logf("build %s: the gate's wait marker: %v", c.ID, err)
+		return nil
 	}
 	if err := r.Ship.Sandbox.room(ctx); err != nil {
 		if !held(err) {
-			unmark() // no hold: the run ends now, at no cost and with no start
+			// no hold: the run ends now, at no cost and with no start
+			if err := unmark(); err != nil {
+				r.logf("build %s: %v", c.ID, err)
+			}
 			if ctx.Err() == nil {
 				r.logf("build %s: the capacity gate failed before its agent: %v%s", c.ID, err, gateWords(err))
 				if err := r.endCapacityNote(ctx, c.ID, gateBroke); err != nil {
@@ -460,7 +462,11 @@ func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Re
 	if err := r.endCapacityNote(ctx, c.ID, roomFound); err != nil {
 		r.logf("capacity note of %s: %v", c.ID, err)
 	}
-	unmark()
+	// with the marker in place, a kill during the agent would end its paid run at no cost: a marker that cannot go
+	// fails the build here, before the agent, as the host's error at no cost
+	if err := unmark(); err != nil {
+		return stageFailureIn(ctx, Result{}, "build run", err)
+	}
 	res, err := r.Agent.RunOrFallback(ctx, inv)
 	res.InputSummary = manifest.Summary()
 	if brokerOutage(res, err) {

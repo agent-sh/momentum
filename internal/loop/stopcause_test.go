@@ -1530,7 +1530,7 @@ func TestACapacityHoldLeavesNothingBehind(t *testing.T) {
 	busy := true
 	marked := 0 // the gate waits that found the build's wait marker in its host directory
 	r.Ship = shipWithSandbox(r.Store, f, Sandbox{Gate: func(ctx context.Context) error {
-		if m, _ := filepath.Glob(filepath.Join(r.Dir, "runs", ".*-host", gateWaitMarker)); len(m) == 1 {
+		if m, _ := filepath.Glob(filepath.Join(r.Dir, "runs", ".*-host", notStartedMarker)); len(m) == 1 {
 			marked++
 		}
 		if !busy {
@@ -1594,7 +1594,7 @@ func TestACapacityHoldLeavesNothingBehind(t *testing.T) {
 	if err != nil || len(done) != 1 || done[0].Run.Dir == "" {
 		t.Fatalf("the pass with room: %+v %v", done, err)
 	}
-	if _, err := os.Lstat(filepath.Join(HostDir(done[0].Run.Dir), gateWaitMarker)); !os.IsNotExist(err) {
+	if _, err := os.Lstat(filepath.Join(HostDir(done[0].Run.Dir), notStartedMarker)); !os.IsNotExist(err) {
 		t.Fatalf("the wait marker outlived the gate: %v", err)
 	}
 	raw, err := os.ReadFile(filepath.Join(HostDir(done[0].Run.Dir), "input", "case.json"))
@@ -1616,7 +1616,7 @@ func TestABuildKilledAtTheGateEndsAtNoCost(t *testing.T) {
 	if why != "" {
 		t.Fatal(why)
 	}
-	write(t, filepath.Join(HostDir(waiting.Dir), gateWaitMarker), "")
+	write(t, filepath.Join(HostDir(waiting.Dir), notStartedMarker), "")
 	past, why := r.reserve(ctx, c.Family, c.ID, StepBuild)
 	if why != "" {
 		t.Fatal(why)
@@ -1723,7 +1723,7 @@ func TestAHoldWhoseReleaseFailsIsChargedNothing(t *testing.T) {
 	if err != nil || len(runs) != 1 || runs[0].Status != store.RunRunning {
 		t.Fatalf("the reservation the store would not release: %+v %v", runs, err)
 	}
-	if _, err := os.Lstat(filepath.Join(HostDir(runs[0].Dir), gateWaitMarker)); err != nil {
+	if _, err := os.Lstat(filepath.Join(HostDir(runs[0].Dir), notStartedMarker)); err != nil {
 		t.Fatalf("a hold whose release failed lost its directories or its wait marker: %v", err)
 	}
 	if _, err := os.Lstat(runs[0].Dir); err != nil {
@@ -1856,5 +1856,147 @@ func TestAPaidHoldKeepsItsDirectories(t *testing.T) {
 	}
 	if cs, err := st.CaseByID(ctx, c.ID); err != nil || cs.Cost.USD != 1.5 {
 		t.Fatalf("a paid hold's charge: %+v %v", cs.Cost, err)
+	}
+}
+
+// A build reserved as the pass reserves it (prepared, then reserved) whose process dies before build() runs is charged
+// nothing: its preparation wrote the marker before the reservation, and endStale ends the run at no cost.
+func TestABuildKilledBeforeItsBuildStepEndsAtNoCost(t *testing.T) {
+	ctx := context.Background()
+	busy := false
+	r, c, _ := busyRunner(t, &busy, nil)
+	r.pass = &passInputs{}
+	t.Cleanup(r.pass.close)
+	if err := r.prepareInputs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	run, err := r.prepareRun(ctx, c, c.Family, StepBuild)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, why := r.reservePrepared(ctx, run)
+	if why != "" {
+		t.Fatal(why)
+	}
+	// the process dies here, before build(); the next pass past the run's time ends it
+	r.Now = func() time.Time { return time.Now().Add(r.Budgets.RunTime + time.Minute) }
+	if err := r.endStale(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.Store.LoopRunByID(ctx, run.ID)
+	cs, _ := r.Store.CaseByID(ctx, c.ID)
+	if err != nil || got.Failure != "killed" || got.USD != 0 || !got.Started.IsZero() || cs.Cost.USD != 0 {
+		t.Fatalf("a build killed before its build step: %+v, case %+v, %v", got, cs.Cost, err)
+	}
+}
+
+// A marker that cannot be removed before the agent fails the build there, at no cost and with no start, as the host's
+// error: a kill during the agent with the marker in place would end a paid run at no cost.
+func TestAMarkerThatCannotGoFailsTheBuildBeforeItsAgent(t *testing.T) {
+	ctx := context.Background()
+	busy := false
+	r, c, _ := busyRunner(t, &busy, nil)
+	gate := r.Ship.Sandbox.Gate
+	r.Ship.Sandbox.Gate = func(ctx context.Context) error {
+		// the marker becomes a directory with an entry, which os.Remove cannot remove
+		for _, m := range mustGlob(t, filepath.Join(r.Dir, "runs", ".*-host", notStartedMarker)) {
+			if err := os.Remove(m); err != nil {
+				t.Fatal(err)
+			}
+			write(t, filepath.Join(m, "entry"), "x")
+		}
+		return gate(ctx)
+	}
+	done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
+	if err != nil || len(done) != 1 || done[0].Run.Failure != "build run" || done[0].Run.USD != 0 || !done[0].Run.Started.IsZero() ||
+		!strings.Contains(done[0].Run.Summary, "marker cannot be removed") {
+		t.Fatalf("a build whose marker could not go: %+v %v", done, err)
+	}
+}
+
+func mustGlob(t *testing.T, pattern string) []string {
+	t.Helper()
+	m, err := filepath.Glob(pattern)
+	if err != nil || len(m) == 0 {
+		t.Fatalf("no match for %s: %v", pattern, err)
+	}
+	return m
+}
+
+// A case stopped for another reason (two builds that failed at their toolchains, before the gate) ends its capacity
+// note: a stopped case waits for no room.
+func TestAStoppedCaseEndsItsCapacityNote(t *testing.T) {
+	ctx := context.Background()
+	busy := true
+	r, c, _ := busyRunner(t, &busy, nil)
+	if done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID}); err != nil || len(done) != 1 || done[0].Run.ID != "" {
+		t.Fatalf("the held pass: %+v %v", done, err)
+	}
+	r.Toolchains = Toolchains{GoRoot: filepath.Join(t.TempDir(), "absent")}
+	for i := 0; i < 2; i++ {
+		if done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID}); err != nil || len(done) != 1 || done[0].Run.Failure != "build toolchains" {
+			t.Fatalf("toolchains %d: %+v %v", i, done, err)
+		}
+	}
+	if done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID}); err != nil || len(done) != 1 || !strings.Contains(done[0].Skipped, "stopped") {
+		t.Fatalf("the stopped pass: %+v %v", done, err)
+	}
+	n, ok, err := r.Store.Note(ctx, capacityNoteID(c.ID))
+	if err != nil || !ok || n.Done.IsZero() || !strings.HasSuffix(n.Detail, caseStopped) {
+		t.Fatalf("the capacity note of a stopped case: %+v %v %v", n, ok, err)
+	}
+}
+
+// A hold releases only its own reservation: one pass holds a build at the gate while another family's investigation
+// runs, and the investigation's row survives the release and is charged.
+func TestAHoldReleasesOnlyItsOwnReservation(t *testing.T) {
+	if err := sandbox.Available(true); err != nil {
+		t.Skip(err)
+	}
+	ctx := context.Background()
+	st := testStore(t)
+	f := newRepo(t, nil)
+	build := testingCase(t, st)
+	inv := openCase(t, st, "owner-burden", "investigated", 1)
+	dir := t.TempDir()
+	agent := script(t, dir, "agent", `: > `+filepath.Join(dir, "started")+`
+sleep 3
+`+fixtureResult(okResult))
+	r := runnerFor(t, st, []string{agent})
+	r.Families = []string{build.Family, inv.Family}
+	r.Ship = shipFor(t, st, f)
+	r.Ship.Dir = r.Dir
+	r.Ship.Live = false
+	r.Toolchains = Toolchains{ReadOnly: r.Ship.Sandbox.ReadOnly, Path: r.Ship.Sandbox.Path}
+	r.Inputs.ReadDirs = []string{f.main}
+	// the gate answers no room once the investigation's agent runs, so the build is released while it does
+	r.Ship.Sandbox.Gate = func(ctx context.Context) error {
+		for i := 0; i < 300; i++ {
+			if _, err := os.Lstat(filepath.Join(dir, "started")); err == nil {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if err := exec.CommandContext(ctx, "false").Run(); err != nil {
+			return fmt.Errorf("the capacity gate: %w", err)
+		}
+		return nil
+	}
+	done, err := r.Once(ctx, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wasHeld, ran bool
+	for _, d := range done {
+		wasHeld = wasHeld || d.Case == build.ID && strings.HasPrefix(d.Skipped, "build check: the machine has no room")
+		ran = ran || d.Case == inv.ID && d.Step == StepInvestigate && d.Run.ID != ""
+	}
+	if !wasHeld || !ran {
+		t.Fatalf("the pass did not hold the build and run the investigation: %+v", done)
+	}
+	runs, err := st.LoopRuns(ctx, store.RunFilter{Case: inv.ID})
+	got, _ := st.CaseByID(ctx, inv.ID)
+	if err != nil || len(runs) != 1 || runs[0].Status == store.RunRunning || got.Cost.USD <= 0 || got.Cost.Runs != 1 {
+		t.Fatalf("the investigation beside the released build: %+v, cost %+v, %v", runs, got.Cost, err)
 	}
 }

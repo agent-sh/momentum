@@ -63,6 +63,15 @@ func TestTheRealGateHoldsOnItsHoldExitsAndItsDeadline(t *testing.T) {
 	if left := processesWith(t, "6.789"); len(left) > 0 {
 		t.Fatalf("the gate's child outlived its deadline: %v", left)
 	}
+	// a gate that exits at once, leaving a child in a session of its own that holds its output: the wait for the
+	// output ends at the wait delay, and the hold comes then
+	start = time.Now()
+	if err := run(nil, "setsid sleep 7.654 & exit 1"); !isHold(err) {
+		t.Fatalf("a gate whose child keeps its output: %T %v", err, err)
+	}
+	if took := time.Since(start); took >= 3*time.Second {
+		t.Fatalf("a gate whose child keeps its output held the check %v", took)
+	}
 }
 
 // processesWith lists the processes whose command line holds word, from /proc, after a moment for a killed group's
