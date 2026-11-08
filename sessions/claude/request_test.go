@@ -260,3 +260,19 @@ func TestTheQueueCountsWhatItsUserTyped(t *testing.T) {
 		t.Fatalf("an item with no text: queued %d", s.Queued)
 	}
 }
+
+// The queue tells a notification by its tag anywhere in its text, not only at its start: a loop's prompt, which
+// Claude Code queues with its text, can quote the tag, and is not typed. The limit this leaves: a message its user
+// typed while the turn ran that quotes the tag is not counted either.
+func TestAQueuedTextThatQuotesTheTagIsNotTyped(t *testing.T) {
+	notice := tag("task-notification") + tag("task-id") + "b1" + closing("task-id") + closing("task-notification")
+	for name, content := range map[string]string{
+		"a loop's prompt":          "# Autonomous loop tick\nRead each " + notice + " as it comes.",
+		"a message its user typed": "What does a " + notice + " hold?",
+	} {
+		x := newScript(t).user("long job").request().queue("enqueue", content)
+		if s := x.facts(NewTracker(x.path), x.at); s.Queued != 0 {
+			t.Errorf("%s: queued %d, want 0", name, s.Queued)
+		}
+	}
+}

@@ -1409,6 +1409,46 @@ func TestAQueuedNotificationClosesItsTaskHoweverTheStoreMarksIt(t *testing.T) {
 	}
 }
 
+// A loop's prompt Claude Code queued as meta during a call, which quotes a notification for the running task, closes
+// nothing, when it was queued or when it is delivered: it only quotes one. So however the store marks it, as harness
+// text marked a harness line (which no other session's message is) or as an agent's text so marked, with its
+// transcript or without.
+func TestAQueuedPromptThatQuotesANotificationClosesNothing(t *testing.T) {
+	st := testStore(t)
+	text := "# Autonomous loop tick\nRead each notice as it comes, as this one: " + taskDone("b0", "completed", "Background command finished")
+	var names []string
+	for kind, actor := range map[string]store.Actor{"harness_text": store.ActorHarness, "agent_text": store.ActorAgent} {
+		for _, gone := range []bool{false, true} {
+			session := kind
+			if gone {
+				session += "-gone"
+			}
+			b := newRecorded(t, session).owner(0, "lint it in the background").background(time.Second, "b0")
+			b.say(5*time.Second, "Linting in the background.").owner(time.Minute, "and run the suite").call(time.Second, "t1")
+			queuedAt := b.at.Add(30 * time.Second)
+			b.result(time.Minute, "t1")
+			off, _ := b.line(0, map[string]any{"type": "attachment", "timestamp": queuedAt.Format(time.RFC3339Nano),
+				"attachment": map[string]any{"type": "queued_command", "commandMode": "prompt", "isMeta": true, "prompt": text}})
+			b.evs = append(b.evs, store.Event{Source: store.Transcripts, SourceKey: storeKey(b.path, off, 0), TS: queuedAt, Session: session,
+				Harness: "claude", Actor: actor, Kind: kind, Summary: storeCut(text), Meta: `{"why":"harness line"}`, Ref: fmt.Sprintf("%s@%d#0", b.path, off)})
+			b.say(5*time.Second, "Both done.")
+			if gone {
+				if err := os.Remove(b.path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			b.put(st)
+			names = append(names, session)
+		}
+	}
+	points, _ := replayAll(t, st)
+	for _, session := range names {
+		if p, ok := lastPoint(points, session); !ok || p.Stop.Tasks != 1 || p.Stop.Phase != sessions.Background {
+			t.Errorf("%s: the last stop (found %v): %d tasks, phase %s", session, ok, p.Stop.Tasks, p.Stop.Phase)
+		}
+	}
+}
+
 // Claude Code's words for a reopening are its own: background tasks that did not finish before the previous session
 // ended. A task's notification that a command did not finish before its timeout is no reopening: the session's
 // other background command still runs, and nothing reopened it.
@@ -1555,8 +1595,9 @@ func ownerLine(session string, line map[string]any) map[string]any {
 // user record by its origin, the words Claude Code opens one with, a meta record that only its origin marks (a user
 // record, or a queued command's attachment), a queued command's attachment in a tag the store's reader knows or one
 // it does not, with the queue's enqueue before it. A loop's prompt that quotes the notification leaves it running
-// too. A task's own notification closes the command in both, as a user record or as the attachment that delivers a
-// queued one with no enqueue before it, and one that a command timed out reopens nothing in either.
+// too, and one that quotes Claude Code's words for a reopening reopens nothing. A task's own notification closes the
+// command in both, as a user record or as the attachment that delivers a queued one with no enqueue before it, with
+// blank space before its tag or none, and one that a command timed out reopens nothing in either.
 func TestTheTrackerAndTheReplayReadAPeerMessageAlike(t *testing.T) {
 	home := codexHome(t) // a synthetic home, read by the transcripts source, and nothing of the machine's
 	done := tag("task-notification") + tag("task-id") + "b9" + closing("task-id") + tag("status") + "completed" + closing("status") +
@@ -1582,10 +1623,15 @@ func TestTheTrackerAndTheReplayReadAPeerMessageAlike(t *testing.T) {
 		last    bool           // nothing follows it
 		tasks   string
 	}
-	tick := map[string]any{"type": "user", "isMeta": true, "promptSource": "system", "message": map[string]any{"role": "user",
-		"content": "# Autonomous loop tick\nRead each notice as it comes, as this one: " + done}}
+	// tickOf is a loop's prompt as its meta line, quoting notice.
+	tickOf := func(notice string) map[string]any {
+		return map[string]any{"type": "user", "isMeta": true, "promptSource": "system", "message": map[string]any{"role": "user",
+			"content": "# Autonomous loop tick\nRead each notice as it comes, as this one: " + notice}}
+	}
+	tick := tickOf(done)
 	rows := map[string]row{
 		"notification":  {user: user(done, false, "task-notification")},
+		"spaced":        {user: user("\n "+done, false, "task-notification")},
 		"timed-out":     {user: user(timedOut, false, "task-notification"), tasks: "bash:b9"},
 		"origin":        {user: user("Mine finished: "+done, false, "peer"), tasks: "bash:b9"},
 		"cross-session": {user: user(cross(done), false, "peer"), tasks: "bash:b9"},
@@ -1593,8 +1639,11 @@ func TestTheTrackerAndTheReplayReadAPeerMessageAlike(t *testing.T) {
 		"words-alone":   {user: user("Another Claude session sent a message:\n"+done, true, ""), tasks: "bash:b9"},
 		"meta-origin":   {user: user(done, true, "peer"), tasks: "bash:b9"},
 		"loop-prompt":   {user: tick, tasks: "bash:b9"},
+		"loop-reopen":   {user: tickOf(gone), tasks: "bash:b9"},
 		"queued-notice": {notice: map[string]any{"type": "queued_command", "commandMode": "task-notification",
 			"origin": map[string]any{"kind": "task-notification"}, "prompt": done}},
+		"queued-spaced": {notice: map[string]any{"type": "queued_command", "commandMode": "task-notification",
+			"origin": map[string]any{"kind": "task-notification"}, "prompt": "\n" + done}},
 		"queued":        {queued: cross(done), enqueue: true, tasks: "bash:b9"},
 		"queued-origin": {queued: done, tasks: "bash:b9"},
 		"agent-message": {queued: tag(`agent-message from="worker"`) + done + closing("agent-message"), tasks: "bash:b9"},

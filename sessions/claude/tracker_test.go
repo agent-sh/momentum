@@ -120,38 +120,68 @@ func TestAQueuedNotificationClosesItsTask(t *testing.T) {
 }
 
 // A task's notification closes its task by any record of it: the attachment that delivers a queued one closes it with
-// no enqueue before it, whatever origin the attachment names but another session's. A record that only quotes a
-// notification for the task closes nothing: a loop's prompt, queued or as its meta line, a headless run's user
-// text, a prompt typed while the turn ran, or a snapshot of the prompt.
+// no enqueue before it, whatever origin the attachment names but another session's, and blank space before its tag
+// changes nothing, in a user record or in the attachment. A record that only quotes a notification for the task
+// closes nothing: a loop's prompt, queued or as its meta line, a headless run's user text, a prompt typed while the
+// turn ran, or a snapshot of the prompt. A prompt that quotes it is read as any other: a headless run's opens a turn
+// as user text (UserAt, a user entry in the log), and a loop's meta line opens none.
 func TestOnlyANotificationClosesItsTask(t *testing.T) {
 	failed := tag("task-notification") + tag("task-id") + "q7" + closing("task-id") + tag("status") + "failed" + closing("status") +
 		closing("task-notification")
 	quoted := "# Autonomous loop tick\nRead each " + failed + " as it comes."
+	asked := "Why did this fail? " + failed
 	queued := func(mode, origin, prompt string) map[string]any {
 		return map[string]any{"type": "attachment", "attachment": map[string]any{"type": "queued_command", "commandMode": mode,
 			"origin": map[string]any{"kind": origin}, "prompt": prompt}}
 	}
+	// userText is the headless prompt read as user text: it opened the turn at its own record, and the log holds it.
+	userText := func(t *testing.T, s *sessions.Session, at, _ time.Time) {
+		items, _ := s.Log.Since(0)
+		last := sessions.Entry{}
+		if len(items) > 0 {
+			last = items[len(items)-1]
+		}
+		if !s.UserAt.Equal(at) || !s.TurnOpen || last.Role != sessions.RoleUser || last.Text != asked {
+			t.Errorf("the headless prompt: UserAt %v (want %v), turn open %v, last log entry %s %q", s.UserAt, at, s.TurnOpen, last.Role, last.Text)
+		}
+	}
+	// noTurn is the loop's meta line read as any other: it opened no turn, and the turn's start stayed.
+	noTurn := func(t *testing.T, s *sessions.Session, _, began time.Time) {
+		if s.TurnOpen || !s.TurnBegan.Equal(began) {
+			t.Errorf("the loop's meta line: turn open %v, began %v (want %v)", s.TurnOpen, s.TurnBegan, began)
+		}
+	}
 	for name, c := range map[string]struct {
 		line  map[string]any
 		tasks string
+		check func(t *testing.T, s *sessions.Session, at, began time.Time)
 	}{
-		"a queued command's notification": {queued("task-notification", "task-notification", failed), ""},
-		"a loop's prompt, queued":         {map[string]any{"type": "queue-operation", "operation": "enqueue", "content": quoted}, "bash:q7"},
+		"a queued command's notification":                    {queued("task-notification", "task-notification", failed), "", nil},
+		"a queued command's notification after a line break": {queued("task-notification", "task-notification", "\n"+failed), "", nil},
+		"a notification after blank space": {map[string]any{"type": "user", "origin": map[string]any{"kind": "task-notification"},
+			"message": map[string]any{"content": " \n\t" + failed}}, "", nil},
+		"a loop's prompt, queued": {map[string]any{"type": "queue-operation", "operation": "enqueue", "content": quoted}, "bash:q7", nil},
 		"a loop's prompt as its meta line": {map[string]any{"type": "user", "isMeta": true, "promptSource": "system",
-			"message": map[string]any{"content": quoted}}, "bash:q7"},
+			"message": map[string]any{"content": quoted}}, "bash:q7", noTurn},
 		"a headless run's prompt": {map[string]any{"type": "user", "promptSource": "sdk", "entrypoint": "sdk-cli",
-			"message": map[string]any{"role": "user", "content": "Why did this fail? " + failed}}, "bash:q7"},
-		"a prompt typed meanwhile": {queued("prompt", "human", "Why did this fail? "+failed), "bash:q7"},
+			"message": map[string]any{"role": "user", "content": asked}}, "bash:q7", userText},
+		"a prompt typed meanwhile": {queued("prompt", "human", asked), "bash:q7", nil},
 		"a prompt snapshot": {map[string]any{"type": "attachment", "attachment": map[string]any{"type": "prompt_snapshot",
-			"tools": []any{map[string]any{"name": "Monitor", "description": "Each event arrives as " + failed + "."}}}}, "bash:q7"},
+			"tools": []any{map[string]any{"name": "Monitor", "description": "Each event arrives as " + failed + "."}}}}, "bash:q7", nil},
 	} {
 		x := newScript(t).
 			call("tu1", "Bash", map[string]any{"command": "sleep 99", "run_in_background": true}).
 			result("tu1", "Command running in background with ID: q7").
-			say("waiting").
-			add(c.line)
-		if s := x.facts(NewTracker(x.path), x.at); taskIDs(s) != c.tasks {
+			say("waiting")
+		tr := NewTracker(x.path)
+		began := x.facts(tr, x.at).TurnBegan
+		x.add(c.line)
+		s := x.facts(tr, x.at)
+		if taskIDs(s) != c.tasks {
 			t.Errorf("%s: tasks %q, want %q", name, taskIDs(s), c.tasks)
+		}
+		if c.check != nil {
+			c.check(t, s, x.at, began)
 		}
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/agent-sh/momentum/sessions"
 	"github.com/agent-sh/momentum/sessions/internal/jsonl"
@@ -301,9 +302,11 @@ func (t *Tracker) line(raw []byte) {
 // whose text is a notification. Any other attachment can quote the tag (a snapshot of the prompt, whose tools'
 // descriptions may, or a skill's text), and so can a prompt Claude Code queued (a loop's, a headless run's), and none
 // of them is a notice. Another session's message queued so is no notice of this session's tasks either, whatever it
-// quotes: by the attachment's origin; its text opens with its own tag or words, never as a notification does.
+// quotes, by the attachment's origin. Its enqueue carries no origin, so there only its text tells: one whose text
+// opens as a notification does is read as one at its enqueue, where the replay reads it by its attachment's origin
+// as another session's message (SPEC names the gap).
 func queuedNotice(kind string, raw []byte) (string, bool) {
-	if kind != "queue-operation" && kind != "attachment" || !bytes.Contains(raw, []byte("<task-notification>")) {
+	if kind != "queue-operation" && kind != "attachment" || !bytes.Contains(raw, []byte(notificationTag)) {
 		return "", false
 	}
 	var q struct {
@@ -563,9 +566,11 @@ func (t *Tracker) queued(e line) {
 // queueKey is how the queue keeps an item: a message its user typed by its text, folded and cut; anything else
 // Claude Code queues as "": a task's notification, and an item recorded without its text, which is nearly always a
 // scheduled run's prompt, another session's message or a notification (the screen's queue hint tells the rare
-// command typed meanwhile).
+// command typed meanwhile). An item is a notification here when its text holds the tag anywhere, not only when it
+// opens with it (Notification): a loop's prompt, which Claude Code queues with its text, can quote the tag, and would
+// count as typed. The limit: a message its user typed while the turn ran that quotes the tag is not counted either.
 func queueKey(content string) string {
-	if strings.TrimSpace(content) == "" || strings.Contains(content, "<task-notification>") {
+	if strings.TrimSpace(content) == "" || strings.Contains(content, notificationTag) {
 		return ""
 	}
 	return text.OneLine(content, 200)
@@ -683,9 +688,16 @@ func (t *Tracker) user(e line, at time.Time, open bool) {
 // a reopening as this tracker does.
 func Orphaned(s string) bool { return reOrphan.MatchString(s) }
 
-// Notification reports a task's notification by its text, as Claude Code writes one: it opens with its tag. A prompt
-// or a skill's text that only quotes the tag is none. The replay reads a notification as this tracker does.
-func Notification(s string) bool { return strings.HasPrefix(s, "<task-notification>") }
+// notificationTag opens a task's notification, as Claude Code writes one. It is built from parts so this file holds
+// none.
+const notificationTag = "<" + "task-notification>"
+
+// Notification reports a task's notification by its text, as Claude Code writes one: it opens with its tag, after any
+// blank space. A prompt or a skill's text that only quotes the tag is none. The replay reads a notification as this
+// tracker does: the store keeps a text with its blank space folded and trimmed, so the space is passed over here too.
+func Notification(s string) bool {
+	return strings.HasPrefix(strings.TrimLeftFunc(s, unicode.IsSpace), notificationTag)
+}
 
 // PeerMessage reports another session's message by its text, as Claude Code writes it into the session: in one of
 // its tags, or after the words it opens one with. The replay reads another session's message as this tracker does.
