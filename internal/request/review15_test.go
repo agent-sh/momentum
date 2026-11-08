@@ -25,7 +25,7 @@ func TestEachEvidenceLineRuns(t *testing.T) {
 	h := Handoff(f.group()[0])
 	ids := 0
 	for _, l := range strings.Split(h, "\n") {
-		cmd, ok := strings.CutPrefix(l, "- momentum evidence show ")
+		cmd, ok := strings.CutPrefix(l, "momentum evidence show ")
 		if !ok {
 			continue
 		}

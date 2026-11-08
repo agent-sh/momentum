@@ -28,6 +28,14 @@ func requestCmd(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	case "handoff":
 		return requestHandoff(ctx, args[1:], stdout, stderr)
 	}
+	if _, ok := request.ParseID(args[0]); ok {
+		// a handoff's own id lines, run as printed: momentum request ID is its handoff, and so is its opening line,
+		// whose words after " - " say what it is
+		if len(args) > 1 && args[1] == "-" {
+			args = args[:1]
+		}
+		return requestHandoff(ctx, args, stdout, stderr)
+	}
 	return usageError{fmt.Sprintf("unknown request command %q", args[0])}
 }
 

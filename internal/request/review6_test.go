@@ -96,18 +96,18 @@ func TestASessionSeenWorkingAfterAFollowUpWorks(t *testing.T) {
 	}
 }
 
-// A cut call whose stored part names neither git nor gh as a word makes nothing this reads: with its record gone,
-// it is not counted as cut, and "high" holds no gh.
-func TestACutCallThatNamesNoGitIsNotCounted(t *testing.T) {
-	for _, words := range []string{"echo high", "echo hi", "echo ghost", "echo gitlab"} {
+// A cut call whose stored part names neither git nor gh as a word makes nothing this reads; with its record gone it
+// is counted as cut, since its git may lie past the cut.
+func TestACutCallWhoseRecordIsGoneIsCounted(t *testing.T) {
+	for _, words := range []string{"echo high", "echo hi", "echo ghost", "echo gitlab", "git push origin main"} {
 		t.Run(words, func(t *testing.T) {
 			f := newFixture(t)
 			f.owner("s-nogit", at(0), "check the tree")
 			gone := filepath.Join(t.TempDir(), "s-nogit.jsonl")
-			input := `{"command":"` + words + ` && cd ` + longDir + ` && make test"}`
+			input := `{"command":"cd ` + longDir + ` && ` + words + ` && make test"}`
 			f.cutPair("s-nogit", "claude", "Bash", "toolu_n1", at(1), input, hookText+"ok", gone+"@0#0", gone+"@100#0")
-			if rq := f.groupWith(Options{Redact: fakeRedact})[0]; rq.CutGone != 0 {
-				t.Errorf("cut and gone %d", rq.CutGone)
+			if rq := f.groupWith(Options{Redact: fakeRedact})[0]; rq.CutGone != 1 || len(rq.Results) != 0 {
+				t.Errorf("cut and gone %d, results %q", rq.CutGone, kinds(rq.Results))
 			}
 		})
 	}

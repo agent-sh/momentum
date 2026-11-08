@@ -157,39 +157,70 @@ func (s *Store) ThreadEvents(ctx context.Context, session string, read ThreadRea
 		textPart = "0"
 	}
 	const toolID = `CASE WHEN json_valid(meta) THEN json_extract(meta, '$.tool_id') END`
-	// the bound on each read of the session's events: its index's range
-	span := ""
-	var spanArgs []any
-	if !read.Since.IsZero() {
-		span += ` AND ts >= ?`
-		spanArgs = append(spanArgs, read.Since.UnixMilli())
-	}
-	if !read.Until.IsZero() {
-		span += ` AND ts < ?`
-		spanArgs = append(spanArgs, read.Until.UnixMilli())
-	}
-	shellCall := `kind = 'tool_call' AND lower(tool) IN ` + in(read.Shells) + ` AND ` + marks
+	// The query, built left to right with its arguments. Until bounds every part; Since bounds what is selected, not
+	// the calls and yields that select results: a result in the range whose call came before it is read with that
+	// call, and so are the yields before it of the sessions the range's polls may poll.
+	var q strings.Builder
 	var args []any
-	args = append(append(append(append(args, session, Transcripts), spanArgs...), anys(read.Shells)...), callArgs...)
-	args = append(append(append(append(args, session, Transcripts), spanArgs...), anys(read.YieldTools)...), anys(read.YieldMarks)...)
-	args = append(append(append(args, session, Transcripts), spanArgs...), anys(read.Writers)...)
-	args = append(append(args, anys(read.Shells)...), callArgs...)
-	args = append(args, anys(read.YieldTools)...)
-	args = append(append(args, anys(read.Shells)...), resultArgs...)
-	rows, err := s.db.QueryContext(ctx, `WITH calls(id) AS (SELECT `+toolID+` FROM events INDEXED BY events_session
-	    WHERE session = ? AND source = ?`+span+` AND `+shellCall+`),
-	  yields(id) AS (SELECT `+toolID+` FROM events INDEXED BY events_session
-	    WHERE session = ? AND source = ?`+span+` AND kind = 'tool_result' AND lower(tool) IN `+in(read.YieldTools)+` AND `+yieldMarks+`)
-	  SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
-	  tool, summary, meta, ref, heuristic, experiment FROM events INDEXED BY events_session WHERE session = ? AND source = ?`+span+` AND (
-	    (`+textPart+` AND kind IN ('owner_text', 'agent_text') AND (agent = '' OR agent = session))
-	    OR (`+toolPart+` AND (
-	      (kind IN ('tool_call', 'tool_result') AND lower(tool) IN `+in(read.Writers)+`)
-	      OR (`+shellCall+`)
-	      OR (kind = 'tool_call' AND lower(tool) IN `+in(read.YieldTools)+` AND `+toolID+` IN (SELECT id FROM yields))
-	      OR (kind = 'tool_result' AND lower(tool) IN `+in(read.Shells)+` AND `+resultMarks+`
-	        AND (`+toolID+` IN (SELECT id FROM calls) OR `+toolID+` IN (SELECT id FROM yields))))))
-	  ORDER BY ts, source_key`, args...)
+	put := func(sql string, a ...any) { q.WriteString(sql); args = append(args, a...) }
+	until := func() {
+		if !read.Until.IsZero() {
+			put(` AND ts < ?`, read.Until.UnixMilli())
+		}
+	}
+	session1 := func() { put(`session = ? AND source = ?`, session, Transcripts); until() }
+	shellCall := func() {
+		put(`kind = 'tool_call' AND lower(tool) IN `+in(read.Shells), anys(read.Shells)...)
+		put(` AND `+marks, callArgs...)
+	}
+	resultOf := func() { // a shell's result that may show an artifact, of a call or a yield the read takes
+		put(`kind = 'tool_result' AND lower(tool) IN `+in(read.Shells), anys(read.Shells)...)
+		put(` AND `+resultMarks, resultArgs...)
+		put(` AND (` + toolID + ` IN (SELECT id FROM calls) OR ` + toolID + ` IN (SELECT id FROM yields))`)
+	}
+	windowed := !read.Since.IsZero() && read.Part != "text"
+	put(`WITH calls(id) AS (SELECT ` + toolID + ` FROM events INDEXED BY events_session WHERE `)
+	session1()
+	put(` AND `)
+	shellCall()
+	put(`), yields(id) AS (SELECT ` + toolID + ` FROM events INDEXED BY events_session WHERE `)
+	session1()
+	put(` AND kind = 'tool_result' AND lower(tool) IN `+in(read.YieldTools), anys(read.YieldTools)...)
+	put(` AND `+yieldMarks+`)`, anys(read.YieldMarks)...)
+	if windowed {
+		// the results the range takes, by tool id, and whether a call in it polls a session
+		put(`, taken(id) AS (SELECT ` + toolID + ` FROM events INDEXED BY events_session WHERE `)
+		session1()
+		put(` AND ts >= ? AND ((kind = 'tool_result' AND lower(tool) IN `+in(read.Writers)+`) OR (`, append([]any{read.Since.UnixMilli()}, anys(read.Writers)...)...)
+		resultOf()
+		put(`))), polled(n) AS (SELECT COUNT(*) FROM events INDEXED BY events_session WHERE `)
+		session1()
+		put(` AND ts >= ? AND kind = 'tool_call' AND (lower(tool) = 'write_stdin' OR instr(summary, 'write_stdin(') > 0))`, read.Since.UnixMilli())
+	}
+	put(` SELECT source, source_key, ts, session, agent, harness, model, cwd, actor, kind,
+	  tool, summary, meta, ref, heuristic, experiment FROM events INDEXED BY events_session WHERE `)
+	session1()
+	put(` AND ((`)
+	if !read.Since.IsZero() {
+		put(`ts >= ? AND (`, read.Since.UnixMilli())
+	} else {
+		put(`(`)
+	}
+	put(`(` + textPart + ` AND kind IN ('owner_text', 'agent_text') AND (agent = '' OR agent = session))`)
+	put(` OR (`+toolPart+` AND ((kind IN ('tool_call', 'tool_result') AND lower(tool) IN `+in(read.Writers)+`)`, anys(read.Writers)...)
+	put(` OR (`)
+	shellCall()
+	put(`) OR (kind = 'tool_call' AND lower(tool) IN `+in(read.YieldTools)+` AND `+toolID+` IN (SELECT id FROM yields)) OR (`, anys(read.YieldTools)...)
+	resultOf()
+	put(`)))))`)
+	if windowed {
+		// before the range: the calls of the results it takes, and the yields of the sessions its polls may poll
+		put(` OR (ts < ? AND ((kind = 'tool_call' AND `+toolID+` IN (SELECT id FROM taken))`, read.Since.UnixMilli())
+		put(` OR ((SELECT n FROM polled) > 0 AND kind IN ('tool_call', 'tool_result') AND lower(tool) IN `+in(read.YieldTools)+
+			` AND `+toolID+` IN (SELECT id FROM yields))))`, anys(read.YieldTools)...)
+	}
+	put(`) ORDER BY ts, source_key`)
+	rows, err := s.db.QueryContext(ctx, q.String(), args...)
 	if err != nil {
 		return err
 	}
@@ -208,6 +239,24 @@ func (s *Store) ThreadEvents(ctx context.Context, session string, read ThreadRea
 		}
 	}
 	return rows.Err()
+}
+
+// EarlierResults are the tool ids of a session's calls in [since, until) (until zero: no end) whose results the
+// session recorded before since: calls a harness recorded again, which made nothing more. One query, on the ids of
+// the range's calls.
+func (s *Store) EarlierResults(ctx context.Context, session string, since, until time.Time) ([]string, error) {
+	const toolID = `CASE WHEN json_valid(meta) THEN json_extract(meta, '$.tool_id') END`
+	end := ""
+	args := []any{session, Transcripts, since.UnixMilli()}
+	if !until.IsZero() {
+		end = ` AND ts < ?`
+		args = append(args, until.UnixMilli())
+	}
+	args = append(args, session, Transcripts, since.UnixMilli())
+	return strings1(s.db.QueryContext(ctx, `WITH ids(id) AS (SELECT DISTINCT `+toolID+` FROM events INDEXED BY events_session
+	    WHERE session = ? AND source = ? AND ts >= ?`+end+` AND kind = 'tool_call')
+	  SELECT DISTINCT `+toolID+` FROM events INDEXED BY events_session WHERE session = ? AND source = ? AND ts < ?
+	    AND kind = 'tool_result' AND `+toolID+` IN (SELECT id FROM ids WHERE id IS NOT NULL)`, args...))
 }
 
 // AgentEventBetween reports a transcript event of an agent's (a call, its result, a reply) in a session after from

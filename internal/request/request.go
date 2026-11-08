@@ -606,6 +606,16 @@ func (r *reader) loadTools(ctx context.Context, t *thread, from time.Time) error
 	}
 	t.tools, t.toolsFrom = true, from
 	t.calls, t.done = map[string]store.Event{}, map[string]bool{}
+	if !from.IsZero() && recordsAgain[t.harness] {
+		// a call of the range the harness recorded again after its result came before the range made nothing more
+		ids, err := r.st.EarlierResults(ctx, t.id, from, tools.Until)
+		if err != nil {
+			return err
+		}
+		for _, id := range ids {
+			t.done[id] = true
+		}
+	}
 	if err := r.st.ThreadEvents(ctx, t.id, tools, func(e store.Event) error { t.add(e); return nil }); err != nil {
 		return err
 	}
@@ -613,6 +623,10 @@ func (r *reader) loadTools(ctx context.Context, t *thread, from time.Time) error
 	r.readWhole(ctx, t)
 	return nil
 }
+
+// recordsAgain are the harnesses that record a call again later under its tool id (Hermes, a Codex subagent forked
+// with its parent's context): a windowed read looks before its window only for theirs.
+var recordsAgain = map[string]bool{"hermes": true, "codex": true}
 
 // follow enqueues the threads a thread's links reach.
 func (r *reader) follow(ctx context.Context, t *thread) error {

@@ -87,3 +87,33 @@ func TestRequestHandoffAndList(t *testing.T) {
 		t.Fatalf("an unknown id: exit %d %s", code, errOut)
 	}
 }
+
+// Every command line a handoff prints runs as printed: its id lines are its handoff, and its evidence lines are
+// evidence show commands the CLI takes.
+func TestEveryHandoffCommandLineRuns(t *testing.T) {
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	putRequestEvents(t, time.Now().Add(-time.Hour).Truncate(time.Millisecond))
+	code, out, errOut := momentum("request", "handoff", "s-cli")
+	if code != 0 {
+		t.Fatalf("handoff: exit %d: %s", code, errOut)
+	}
+	ran := 0
+	for _, l := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(l, "momentum ") {
+			continue
+		}
+		args := strings.Fields(l)[1:]
+		code, got, errOut := momentum(args...)
+		if code == 2 {
+			t.Errorf("%q: a usage error: %s", l, errOut)
+		}
+		if args[0] == "request" && (code != 0 || got != out) {
+			t.Errorf("%q: exit %d, not the handoff:\n%s", l, code, got)
+		}
+		ran++
+	}
+	if ran < 3 {
+		t.Errorf("%d command lines in:\n%s", ran, out)
+	}
+}

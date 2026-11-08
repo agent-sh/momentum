@@ -192,7 +192,7 @@ func shown(text string, cut, failed bool, mk makes, once string) []Result {
 	if failed {
 		return out // a failed result shows its commit lines, and nothing else it made
 	}
-	if mk.pushes {
+	if mk.pushes && !mk.quiet { // every push quiet (-q prints no ref line): a To block is another program's
 		for _, b := range pushBlocks(text, mk) {
 			for _, p := range pushRefRe.FindAllStringSubmatch(b.refs, -1) {
 				if p[2] != "" {
@@ -222,10 +222,10 @@ type block struct {
 	remote, refs string
 }
 
-// pushBlocks are the blocks git push printed: each from a To line whose remote has a remote's shape (a URL,
-// host:path, a path) to the next From or To line, or the text's end. With no To line (a tail kept only the last
-// lines), the whole text, its remote the push's own, of a call whose pushes are not all quiet, that ran nothing
-// else that prints ref lines and whose output holds no fetch's From line.
+// pushBlocks are the blocks git push printed, for a call whose pushes are not all quiet (shown): each from a To line
+// whose remote has a remote's shape (a URL, host:path, a path) to the next From or To line, or the text's end. With
+// no To line (a tail kept only the last lines), the whole text, its remote the push's own, of a call that ran
+// nothing else that prints ref lines and whose output holds no fetch's From line.
 func pushBlocks(text string, mk makes) []block {
 	var tos [][]int
 	for _, t := range pushToRe.FindAllStringSubmatchIndex(text, -1) {
@@ -246,7 +246,7 @@ func pushBlocks(text string, mk makes) []block {
 	}
 	// a quiet push printed no ref line, and a From line is a fetch's (one the call ran where its parse cannot see,
 	// as over ssh or in a script): the ref lines are another's
-	if len(tos) == 0 && !mk.fetches && !mk.quiet && !pushEndRe.MatchString(text) {
+	if len(tos) == 0 && !mk.fetches && !pushEndRe.MatchString(text) {
 		remote := mk.remote
 		if remote == "" {
 			remote = "origin"

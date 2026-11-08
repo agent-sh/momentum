@@ -509,7 +509,8 @@ func (r *reader) readWhole(ctx context.Context, t *thread) {
 		// a Codex call that names no git is read too: a session it left running replaces one of the same id
 		if !namesGit(strings.Join(d.Commands, "\n")) && !j.poll && !codexCommand(*j.p.call) {
 			// it makes nothing this reads, whether or not its record is there
-			j.skip, j.why = true, ""
+			// a command the store cut and whose record is gone keeps its why: its git may lie past the cut
+			j.skip = true
 			continue
 		}
 		j.mk = made(d)

@@ -138,7 +138,7 @@ func Handoff(rq *Request) string {
 		// each line a command evidence show takes: at most ShowMost ids
 		line("Evidence:")
 		for i := 0; i < len(evidence); i += evidenceview.ShowMost {
-			line("- momentum evidence show %s", strings.Join(evidence[i:min(i+evidenceview.ShowMost, len(evidence))], " "))
+			line("momentum evidence show %s", strings.Join(evidence[i:min(i+evidenceview.ShowMost, len(evidence))], " "))
 		}
 	}
 	line("%s", pasteLine)

@@ -219,23 +219,23 @@ func fill(u sets, reqs map[string]*Request, t *thread) {
 		}
 		return nil
 	}
-	var prev *Ask
-	var prevRq *Request
+	// the thread's turn before this one, kept or not: a repeat is decided against it
+	type seen struct {
+		at            time.Time
+		words, marker string
+	}
+	var last *seen
 	for _, tn := range t.turns {
-		rq := of(t.segAt(tn.at))
-		if rq != prevRq {
-			prev, prevRq = nil, rq
-		}
-		if rq == nil || tn.program && tn.marker == "" || tn.at.Before(rq.start()) {
-			continue
-		}
 		words := tn.words
 		if tn.program {
 			words = "" // a program's words are not his, though the handoff it pasted links
 		}
-		// The same words again soon, with nothing of the agent's between (a call, a result, a reply), are one turn the
-		// transcript holds twice: the copy is no later turn of the request's.
-		if prev != nil && prev.Words == words && prev.Handoff == tn.marker && tn.at.Sub(prev.At) <= sameTurn && !t.agentBetween(prev.At, tn.at) {
+		// The same words again soon after the turn before, with nothing of the agent's between (a call, a result, a
+		// reply), are one turn the transcript holds twice: the copy is no later turn of the request's.
+		repeat := last != nil && last.words == words && last.marker == tn.marker && tn.at.Sub(last.at) <= sameTurn && !t.agentBetween(last.at, tn.at)
+		last = &seen{tn.at, words, tn.marker}
+		rq := of(t.segAt(tn.at))
+		if rq == nil || tn.program && tn.marker == "" || tn.at.Before(rq.start()) || repeat {
 			continue
 		}
 		if tn.at.After(rq.LastTurn) {
@@ -248,8 +248,6 @@ func fill(u sets, reqs map[string]*Request, t *thread) {
 			continue
 		}
 		rq.Asks = append(rq.Asks, Ask{At: tn.at, Thread: t.id, Harness: t.harness, Words: words, Event: tn.ev.ID(), Handoff: tn.marker})
-		a := rq.Asks[len(rq.Asks)-1]
-		prev = &a
 	}
 	for _, it := range t.items {
 		if rq := of(t.segAt(it.r.At)); rq != nil && !it.gone && !it.r.At.Before(rq.start()) {

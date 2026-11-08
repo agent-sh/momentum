@@ -128,6 +128,7 @@ Four sections are notes: needs you (each title is the question, or what momentum
 ```
 momentum request list [--since WHEN] [--json]   the owner's requests with events since WHEN (default 7d), newest first
 momentum request handoff ID                     the text to paste into another session to continue a request
+momentum request ID                             the same, for a request's id (a handoff's id line, run as printed)
 ```
 
 A request is a piece of work the owner asked for, across the sessions it ran in. momentum groups it from the store's events by rules, with no model: the owner's turn opens it, his later turns in the same conversation follow it up, and links join other sessions to it: a subagent, a session that names it as its parent, a fork or resume that carries its turns over (the same words at the same millisecond), and a handoff's id pasted into a turn. One conversation is one request until a pasted handoff names another; splitting the asks inside one conversation would need a model's guess, which this version does not make.

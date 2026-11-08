@@ -56,6 +56,7 @@ const usage = `usage:
                                         state from what was observed; changes nothing
   momentum request handoff ID           the text to paste into another session to continue a request; ID is a
                                         request's id, or a session's id or its start; changes nothing
+  momentum request ID                   the same, for a request's id: a handoff's id line runs as printed
   momentum supervise [--dry] [--json]   scan the sessions, then continue the ones that stopped where a rule says
                                         it may: every decision is an event of source supervise
   momentum supervise replay [--since WHEN] [--until WHEN] [--labels FILE] [--anchor] [--points FILE]
