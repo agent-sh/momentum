@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,52 +26,33 @@ const (
 // the reader holds one at a time.
 const recordMax = 16 << 20
 
-// record is one event's text in its record: a call's input or a result's output.
-func (r *reader) record(ctx context.Context, e store.Event, id string, output bool) (string, bool, string) {
+// take is one event's text in its record, and lets go of it: a transcript file's record as prefetch read it, a
+// Hermes row read here. The raw text is kept no longer than the job that reads it.
+func (r *reader) take(ctx context.Context, e store.Event, id string, output bool) (string, bool, string) {
 	key := e.Ref + "\x00" + id
 	if v, ok := r.records[key]; ok {
+		delete(r.records, key)
 		return v.text, v.ok, v.why
 	}
-	text, ok, why := r.readRecord(ctx, e, id, output)
-	r.records[key] = recordRead{text, ok, why}
-	return text, ok, why
+	path, off, ok := refPlace(e.Ref)
+	switch {
+	case !ok || id == "":
+		return "", false, cutUnread
+	case e.Harness == "hermes":
+		return r.hermesRecord(ctx, e, path, off, id, output)
+	case fileHarness(e.Harness):
+		return "", false, cutGone // prefetch reads every record it is asked for: one it has not is not there
+	}
+	return "", false, cutUnread
 }
+
+// fileHarness reports a harness whose records are lines of a transcript file tacit's reader opens.
+func fileHarness(h string) bool { return h == "claude" || h == "codex" || h == "pi" }
 
 type recordRead struct {
 	text string
 	ok   bool
 	why  string
-}
-
-func (r *reader) readRecord(ctx context.Context, e store.Event, id string, output bool) (string, bool, string) {
-	path, off, ok := refPlace(e.Ref)
-	if !ok || id == "" {
-		return "", false, cutUnread
-	}
-	if e.Harness == "hermes" {
-		return r.hermesRecord(ctx, e, path, off, id, output)
-	}
-	if e.Harness != "claude" && e.Harness != "codex" && e.Harness != "pi" {
-		return "", false, cutUnread
-	}
-	f, err := evidence.OpenAt(path, off)
-	if err != nil {
-		return "", false, cutGone
-	}
-	defer f.Close()
-	br := bufio.NewReaderSize(f, 1<<16)
-	line, err := br.ReadSlice('\n')
-	if errors.Is(err, bufio.ErrBufferFull) {
-		line, err = readLong(br, line)
-	}
-	if err != nil && !errors.Is(err, io.EOF) || len(line) == 0 {
-		return "", false, cutGone
-	}
-	text, ok := blockOf(line, id, output)
-	if !ok {
-		return "", false, cutGone // the record at the place is no longer the call's: the transcript was rewritten
-	}
-	return text, true, ""
 }
 
 // readLong reads the rest of a line longer than the reader's buffer, up to recordMax.
@@ -289,8 +271,20 @@ func (r *reader) prefetch(fs []fetch) {
 	}
 }
 
-// readFile reads a file's wanted records in offset order, through tacit's reader.
+// compressed reports a transcript tacit's reader opens from a compressed copy (a rollout Codex compressed).
+func (r *reader) compressed(path string) bool {
+	if v, ok := r.packed[path]; ok {
+		return v
+	}
+	v := evidence.Resolve(path) != path
+	r.packed[path] = v
+	return v
+}
+
+// readFile reads a file's wanted records in offset order, the file opened once: a plain file by seeking to each
+// record, a compressed copy in one pass forward, so it is decompressed once.
 func (r *reader) readFile(path string, ns []need) {
+	r.opens[path]++
 	gone := func(from int) {
 		for _, n := range ns[from:] {
 			if _, ok := r.records[n.key]; !ok {
@@ -298,7 +292,16 @@ func (r *reader) readFile(path string, ns []need) {
 			}
 		}
 	}
-	f, err := evidence.OpenAt(path, ns[0].off)
+	var f io.ReadCloser
+	var seeker io.Seeker
+	var err error
+	if r.compressed(path) {
+		f, err = evidence.OpenAt(path, ns[0].off)
+	} else {
+		var pf *os.File
+		pf, err = os.Open(path)
+		f, seeker = pf, pf
+	}
 	if err != nil {
 		gone(0)
 		return
@@ -306,17 +309,27 @@ func (r *reader) readFile(path string, ns []need) {
 	defer f.Close()
 	br := bufio.NewReaderSize(f, 1<<16)
 	pos := ns[0].off
+	if seeker != nil {
+		pos = -1
+	}
 	var line []byte
 	lineAt := int64(-1)
 	for i, n := range ns {
 		if n.off != lineAt {
-			if n.off < pos {
-				gone(i) // overlapping places: the transcript is not as the store read it
-				return
-			}
-			if _, err := br.Discard(int(n.off - pos)); err != nil {
-				gone(i)
-				return
+			switch {
+			case seeker != nil:
+				if _, err := seeker.Seek(n.off, io.SeekStart); err != nil {
+					gone(i)
+					return
+				}
+				br.Reset(f)
+			default:
+				// a place inside the record before it (the transcript is not as the store read it) is a negative
+				// count, which Discard refuses
+				if _, err := br.Discard(int(n.off - pos)); err != nil {
+					gone(i)
+					return
+				}
 			}
 			l, err := br.ReadSlice('\n')
 			if errors.Is(err, bufio.ErrBufferFull) {
@@ -339,11 +352,13 @@ func (r *reader) readFile(path string, ns []need) {
 }
 
 // resolve reads whole the calls the store cut that the requests hold, each once per run. It reads a call's input
-// where the store cut it, then its output where the store cut it and the command makes something (a commit, a
-// push, a pull request); a writer's input only. What each made is taken off the text read, and only that (each
-// artifact's text and key) is masked, with tacit's redaction in one call, before it is kept: the raw text is read
-// for its artifacts and dropped. A call whose record is not read, or whose artifacts cannot be masked, is read as
-// the store holds it, and counted on its request.
+// where the store cut it, and its output where the store cut it and the command makes something (a commit, a
+// push, a pull request): in a compressed transcript in the same pass as the input, in a plain one by a seek after
+// it. A command that names neither git nor gh is not parsed and its output not read; a writer's input is read
+// alone. What each made is taken off the text read, and only that (each artifact's text and key) is masked, with
+// tacit's redaction in one call, before it is kept; each raw record is let go of as its job ends. A call whose
+// record is not read, or whose artifacts cannot be masked, is read as the store holds it, and counted on its
+// request.
 func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 	key := func(p pair) string { return p.call.Ref + "\x00" + p.res.Ref }
 	cut := func(s string) bool { return strings.HasSuffix(s, "…") }
@@ -358,78 +373,96 @@ func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 	}
 	type job struct {
 		p             pair
+		tool, id      string
 		input, output string
 		raw           bool // a text read whole
 		why           string
+		skip          bool // a command that names neither git nor gh: it makes nothing this reads
+		mk            makes
 	}
 	jobs := make([]job, len(todo))
-	var ins []fetch
+	var first []fetch
 	for i, p := range todo {
-		jobs[i] = job{p: p, input: p.call.Summary, output: p.res.Summary}
+		j := &jobs[i]
+		*j = job{p: p, tool: strings.ToLower(p.call.Tool), id: metaOf(p.call.Meta).ToolID, input: p.call.Summary, output: p.res.Summary}
 		if cut(p.call.Summary) {
-			ins = append(ins, fetch{p.call, metaOf(p.call.Meta).ToolID, false})
+			first = append(first, fetch{p.call, j.id, false})
+		}
+		// a compressed transcript is read once: its cut output in the same pass as the input
+		if path, _, ok := refPlace(p.res.Ref); ok && !writers[j.tool] && cut(p.res.Summary) && fileHarness(p.res.Harness) && r.compressed(path) {
+			first = append(first, fetch{p.res, j.id, true})
 		}
 	}
-	r.prefetch(ins)
-	var outs []fetch
+	r.prefetch(first)
+	var second []fetch
 	for i := range jobs {
 		j := &jobs[i]
-		id := metaOf(j.p.call.Meta).ToolID
 		if cut(j.p.call.Summary) {
-			if text, ok, why := r.record(ctx, j.p.call, id, false); ok {
+			if text, ok, why := r.take(ctx, j.p.call, j.id, false); ok {
 				j.input, j.raw = text, true
 			} else {
 				j.why = why
 			}
 		}
-		tool := strings.ToLower(j.p.call.Tool)
-		if writers[tool] || !cut(j.p.res.Summary) {
+		if writers[j.tool] {
 			continue
 		}
-		if mk := made(Decode(j.p.call.Harness, tool, j.input, "").Commands); mk.commits || mk.pushes || mk.prs {
-			outs = append(outs, fetch{j.p.res, id, true})
+		if !strings.Contains(j.input, "git") && !strings.Contains(j.input, "gh") {
+			j.skip = true
+			continue
+		}
+		j.mk = made(Decode(j.p.call.Harness, j.tool, j.input, "").Commands)
+		if (j.mk.commits || j.mk.pushes || j.mk.prs) && cut(j.p.res.Summary) {
+			second = append(second, fetch{j.p.res, j.id, true})
 		}
 	}
-	r.prefetch(outs)
-	wanted := map[string]bool{}
-	for _, f := range outs {
-		wanted[f.e.Ref] = true
-	}
+	r.prefetch(second)
 	results := make([][]Result, len(jobs))
 	var texts []string
 	for i := range jobs {
 		j := &jobs[i]
-		if wanted[j.p.res.Ref] {
-			if text, ok, why := r.record(ctx, j.p.res, metaOf(j.p.call.Meta).ToolID, true); ok {
+		if !writers[j.tool] && cut(j.p.res.Summary) {
+			// taken whether used or not, so no raw output stays behind
+			text, ok, why := r.take(ctx, j.p.res, j.id, true)
+			switch {
+			case j.skip || !(j.mk.commits || j.mk.pushes || j.mk.prs):
+			case ok:
 				j.output, j.raw = text, true
-			} else if j.why == "" {
+			case j.why == "":
 				j.why = why
 			}
 		}
+		if j.skip {
+			continue
+		}
 		call, res := j.p.call, j.p.res
 		call.Summary, res.Summary = j.input, j.output
-		results[i] = Artifacts(call, res)
+		if writers[j.tool] {
+			results[i] = artifactsOf(call, res, Decode(call.Harness, j.tool, j.input, ""), makes{})
+			if metaOf(res.Meta).IsError {
+				results[i] = nil
+			}
+		} else {
+			results[i] = artifactsOf(call, res, Decode(call.Harness, j.tool, j.input, j.output), j.mk)
+		}
 		if j.raw {
 			for _, x := range results[i] {
 				texts = append(texts, x.Text, x.Key)
 			}
 		}
-	}
-	redact := r.opt.Redact
-	if redact == nil {
-		redact = evidence.RedactAllContext
+		j.input, j.output = "", ""
 	}
 	var masked []string
 	if len(texts) > 0 {
 		var err error
-		if masked, err = redact(ctx, texts); err != nil || len(masked) != len(texts) {
+		if masked, err = r.redact()(ctx, texts); err != nil || len(masked) != len(texts) {
 			masked = nil
 		}
 	}
 	k := 0
 	for i := range jobs {
 		j := &jobs[i]
-		if j.raw {
+		if j.raw && !j.skip {
 			if masked == nil && len(texts) > 0 {
 				// nothing read off the raw text is kept unmasked: the call is read as the store holds it
 				results[i], j.why = Artifacts(j.p.call, j.p.res), cutUnread
@@ -459,4 +492,12 @@ func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 		rq.pending = nil
 	}
 	return nil
+}
+
+// redact is what masks secrets in text this read keeps from outside the store: the option's, else tacit's redaction.
+func (r *reader) redact() func(context.Context, []string) ([]string, error) {
+	if r.opt.Redact != nil {
+		return r.opt.Redact
+	}
+	return evidence.RedactAllContext
 }

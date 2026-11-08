@@ -60,8 +60,7 @@ type Result struct {
 	At     time.Time
 	Thread string
 	Event  string
-	Writes int  // a file's writes in the request
-	Hidden bool // made, its details not shown: a quiet command's commit or push, an address kept in a variable
+	Writes int // a file's writes in the request
 }
 
 // Thread is a session of a request: when its events in the request ran, and its last observed phase. Phase is
@@ -121,14 +120,29 @@ func (r *Request) Newest() *Result {
 }
 
 // Standing is the newest check not undone, and whether it holds the newest result.
+// A check whose result can no longer be read (its transcript is gone, so the result it named is not among what the
+// store holds) and that nothing came after still holds: nothing reopened it.
 func (r *Request) Standing() (store.RequestCheck, bool, bool) {
 	for i := len(r.Checks) - 1; i >= 0; i-- {
 		if c := r.Checks[i]; c.Undone.IsZero() {
 			n := r.Newest()
-			return c, true, n != nil && n.Key == c.Result
+			return c, true, n != nil && n.Key == c.Result || r.unreadable(c)
 		}
 	}
 	return store.RequestCheck{}, false, false
+}
+
+// unreadable reports a check whose result is no longer among the request's and that no result came after.
+func (r *Request) unreadable(c store.RequestCheck) bool {
+	for _, x := range r.Results {
+		if x.Key == c.Result || x.At.After(c.At) {
+			return false
+		}
+	}
+	if r.Report != nil && (r.Report.Key == c.Result || r.Report.At.After(c.At)) {
+		return false
+	}
+	return true
 }
 
 // CheckIDs are the ids its checks are stored under.
@@ -296,6 +310,7 @@ type thread struct {
 	pending []pair // calls the store cut: read whole when a request holds them (whole)
 	replies []item
 	calls   map[string]store.Event // calls waiting for their results
+	done    map[string]bool        // the tool ids of the calls read, each once
 }
 
 // segAt is the segment of an event at at, of agent (empty for the main thread).
@@ -357,6 +372,12 @@ func (t *thread) add(e store.Event) {
 			return
 		}
 		delete(t.calls, m.ToolID)
+		// A call is one by its session and tool id: a harness that records it again later (Hermes, a Codex
+		// subagent forked with its parent's context) made nothing more, and not in the segment of the copy.
+		if t.done[m.ToolID] {
+			return
+		}
+		t.done[m.ToolID] = true
 		if storeCut(call, e) {
 			t.pending = append(t.pending, pair{call: call, res: e})
 			return
@@ -419,9 +440,11 @@ type reader struct {
 	single   map[string]bool  // a time part one opening has, alone
 	indexed  time.Time        // the index holds what came since
 	children map[string][]string
-	markers  map[string][]string // the sessions whose turns name an id, by the id's time part
-	markIDs  map[string][]string // the ids of a time part the markers name
-	records  map[string]recordRead
+	markers  map[string][]string   // the sessions whose turns name an id, by the id's time part
+	markIDs  map[string][]string   // the ids of a time part the markers name
+	records  map[string]recordRead // raw records a batch read, each let go of by the job that takes it
+	packed   map[string]bool       // a transcript read from a compressed copy
+	opens    map[string]int        // how often a transcript file was opened in the run
 	hermes   map[string]*evidence.HermesDB
 	resolved map[string]resolvedPair // a cut call's artifacts, read whole once per run
 }
@@ -429,7 +452,8 @@ type reader struct {
 func newReader(st *store.Store, opt Options) *reader {
 	return &reader{st: st, opt: opt, threads: map[string]*thread{}, openings: map[string][]ref{}, single: map[string]bool{},
 		children: map[string][]string{}, markers: map[string][]string{}, markIDs: map[string][]string{},
-		records: map[string]recordRead{}, hermes: map[string]*evidence.HermesDB{}, resolved: map[string]resolvedPair{}}
+		records: map[string]recordRead{}, packed: map[string]bool{}, opens: map[string]int{}, hermes: map[string]*evidence.HermesDB{},
+		resolved: map[string]resolvedPair{}}
 }
 
 // close lets go of the Hermes stores a run opened.
@@ -453,8 +477,10 @@ func (r *reader) enqueue(id string) {
 
 // read is what a thread's read selects: the main thread's text, the file writers' calls and results, and the
 // shells' calls that may run git or gh, or that the store cut (their git may be past the cut), with their results
-// (a quiet command's may hold nothing).
-var read = store.ThreadRead{Writers: sortedKeys(writers), Shells: shells(), CallMarks: []string{"git", "gh"}, CutMark: "…"}
+// that may show an artifact's line (a commit's "] ", a ref update's " -> ", a pull request's "/pull/") or that the
+// store cut.
+var read = store.ThreadRead{Writers: sortedKeys(writers), Shells: shells(), CallMarks: []string{"git", "gh"},
+	ResultMarks: []string{"] ", " -> ", "/pull/"}, CutMark: "…"}
 
 func sortedKeys(m map[string]bool) []string {
 	var out []string
@@ -467,7 +493,7 @@ func sortedKeys(m map[string]bool) []string {
 
 // load reads a thread, then follows its links.
 func (r *reader) load(ctx context.Context, id string) error {
-	t := &thread{id: id, agents: map[string]time.Time{}, calls: map[string]store.Event{}, segs: []seg{{}}}
+	t := &thread{id: id, agents: map[string]time.Time{}, calls: map[string]store.Event{}, done: map[string]bool{}, segs: []seg{{}}}
 	spans, err := r.st.ThreadSpans(ctx, id)
 	if err != nil {
 		return err
@@ -508,7 +534,7 @@ func (r *reader) load(ctx context.Context, id string) error {
 	if err := r.st.ThreadEvents(ctx, id, read, func(e store.Event) error { t.add(e); return nil }); err != nil {
 		return err
 	}
-	t.calls = nil
+	t.calls, t.done = nil, nil
 	for _, tn := range t.turns {
 		if tn.marker != "" {
 			t.segs = append(t.segs, seg{at: tn.at, marker: tn.marker})

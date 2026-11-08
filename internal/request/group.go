@@ -349,7 +349,7 @@ func (r *reader) finish(ctx context.Context, reqs []*Request) error {
 				continue
 			}
 			m := metaOf(e.Meta)
-			th.PhaseAt, th.Trusted = e.TS, !e.TS.Before(th.turn)
+			th.PhaseAt, th.Trusted = e.TS, e.TS.After(th.turn) // seen after the last turn there
 			switch {
 			case e.Kind == "vanished":
 				th.Phase = "gone"
@@ -373,9 +373,37 @@ func (r *reader) finish(ctx context.Context, reqs []*Request) error {
 			return err
 		}
 		rq.Checks = checks
+	}
+	r.maskAsks(ctx, reqs)
+	for _, rq := range reqs {
 		state(rq)
 	}
 	return nil
+}
+
+// maskAsks masks the questions sessions wait on the owner with, as a sessions run recorded them, before the open
+// step quotes one; one that cannot be masked is left out.
+func (r *reader) maskAsks(ctx context.Context, reqs []*Request) {
+	var asks []*string
+	var texts []string
+	for _, rq := range reqs {
+		for i := range rq.Threads {
+			if th := &rq.Threads[i]; th.Ask != "" {
+				asks, texts = append(asks, &th.Ask), append(texts, th.Ask)
+			}
+		}
+	}
+	if len(texts) == 0 {
+		return
+	}
+	masked, err := r.redact()(ctx, texts)
+	for i, a := range asks {
+		if err != nil || len(masked) != len(texts) {
+			*a = ""
+		} else {
+			*a = masked[i]
+		}
+	}
 }
 
 // phasesBySession is each session's newest event of the sessions runs, by the id the transcripts give it: a

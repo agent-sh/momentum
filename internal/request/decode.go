@@ -13,7 +13,6 @@ type Decoded struct {
 	Commands []string
 	Output   string
 	Paths    []string
-	Workdir  string // the directory a shell call names its own (Codex's and Hermes's workdir)
 }
 
 // Keys of the stored inputs and outputs, every harness's.
@@ -22,7 +21,6 @@ var (
 	pathKeys    = map[string]bool{"file_path": true, "filePath": true, "notebook_path": true, "path": true}
 	patchKeys   = map[string]bool{"patch": true, "patchText": true, "input": true}
 	outputKeys  = map[string]bool{"output": true, "stdout": true, "stderr": true}
-	workdirKeys = map[string]bool{"workdir": true, "cwd": true, "working_directory": true}
 )
 
 // Decode reads a call's stored input and its result's stored output as the harness stores them. Claude Code, pi,
@@ -65,9 +63,6 @@ func Decode(harness, tool, input, output string) Decoded {
 		}
 	default:
 		for _, f := range in {
-			if workdirKeys[f.key] && !f.list && len(f.values) > 0 && d.Workdir == "" {
-				d.Workdir = f.values[0]
-			}
 			if !commandKeys[f.key] {
 				continue
 			}
@@ -79,10 +74,14 @@ func Decode(harness, tool, input, output string) Decoded {
 			}
 		}
 	}
+	// Codex's code mode and Hermes keep a result as JSON whose output fields are its text; every other harness keeps
+	// the text itself, which may print JSON of its own.
 	var outs []string
-	for _, f := range fields(output, `"`, false) {
-		if outputKeys[f.key] && !f.list && len(f.values) > 0 {
-			outs = append(outs, f.values[0])
+	if harness == "hermes" || harness == "codex" && tool == "exec" {
+		for _, f := range fields(output, `"`, false) {
+			if outputKeys[f.key] && !f.list && len(f.values) > 0 {
+				outs = append(outs, f.values[0])
+			}
 		}
 	}
 	d.Output = output

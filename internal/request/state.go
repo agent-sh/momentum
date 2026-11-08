@@ -9,6 +9,9 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
+// tracked are the harnesses the sessions layer scans (Live session layer): only their sessions have phases.
+var tracked = map[string]bool{"claude": true, "codex": true, "pi": true, "opencode": true, "hermes": true}
+
 // live phases: a thread in one runs.
 var livePhases = map[string]bool{"working": true, "background": true, "scheduled": true}
 
@@ -49,10 +52,14 @@ func state(rq *Request) {
 		rq.State, rq.Why = NeedsYou, "a session of it was last seen waiting on the owner"
 	case working:
 		rq.State, rq.Why = Working, "a session of it was last seen working"
+	case standing && holds && rq.unreadable(c):
+		rq.State, rq.Why = Checked, "the owner checked it at "+c.At.Local().Format(timeFormat)+"; its result can no longer be read (its transcript is gone), and nothing came after"
 	case standing && holds:
 		rq.State, rq.Why = Checked, "the owner checked its newest result at "+c.At.Local().Format(timeFormat)+"; that he checked it does not make it right"
 	case latest == nil:
 		rq.State, rq.Why = Unknown, "every session of it moved on to another request, so nothing records whether it is done"
+	case latest.Phase == "" && !tracked[latest.Harness]:
+		rq.State, rq.Why = Unknown, "no sessions run reads "+latest.Harness+" sessions, so whether it still runs is not known"
 	case latest.Phase == "":
 		rq.State, rq.Why = Unknown, "no sessions run recorded the latest session's phase, so whether it still runs is not known"
 	case !latest.Trusted:
@@ -71,7 +78,10 @@ func state(rq *Request) {
 		if kind == "" {
 			kind = "a question"
 		}
-		rq.Open = fmt.Sprintf("session %s waits on the owner (%s): %s", short(needs.ID), kind, needs.Ask)
+		rq.Open = fmt.Sprintf("session %s waits on the owner (%s)", short(needs.ID), kind)
+		if needs.Ask != "" {
+			rq.Open += ": " + needs.Ask
+		}
 	case !after && !rq.LastTurn.IsZero():
 		for i := len(rq.Asks) - 1; i >= 0; i-- {
 			if a := rq.Asks[i]; !a.At.After(rq.LastTurn) {

@@ -11,12 +11,6 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-func artifactsOf(tool, input, output string) string {
-	call := store.Event{Source: store.Transcripts, SourceKey: "c", TS: at(1), Tool: tool, Kind: "tool_call", Summary: input}
-	res := store.Event{Source: store.Transcripts, SourceKey: "r", TS: at(1).Add(time.Second), Tool: tool, Kind: "tool_result", Summary: output}
-	return kinds(Artifacts(call, res))
-}
-
 func TestArtifactsOfEachHarnesssShapes(t *testing.T) {
 	cases := []struct{ name, tool, input, output, want string }{
 		// Codex's code-mode exec: the call's input is a script, its command in an unquoted cmd key.
@@ -46,7 +40,7 @@ func TestArtifactsOfEachHarnesssShapes(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := artifactsOf(c.tool, c.input, c.output); got != c.want {
+			if got := artifactsAs(c.tool, c.input, c.output, false); got != c.want {
 				t.Errorf("got %q, want %q", got, c.want)
 			}
 		})
@@ -223,7 +217,7 @@ func TestDryRunsAndExistingPullRequestsMakeNothing(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := artifactsOf("Bash", c.input, c.output); got != c.want {
+			if got := artifactsAs("Bash", c.input, c.output, false); got != c.want {
 				t.Errorf("got %q, want %q", got, c.want)
 			}
 		})
@@ -240,13 +234,13 @@ func TestWhatAMergeOrAPushPrints(t *testing.T) {
 		{"a push a tail cut to its ref line", `{"command":"git push origin HEAD:main 2>&1 | tail -n 1"}`, "1675ef4..710d01a HEAD -> main",
 			"push pushed HEAD -> main (1675ef4..710d01a) to origin"},
 		{"a fetch's ref line beside a quiet push", `{"command":"git fetch origin && git push -q origin main"}`,
-			"From github.com:example/x 1111111..2222222 main -> origin/main", "push push (refs not shown) to origin"},
+			"From github.com:example/x 1111111..2222222 main -> origin/main", ""},
 		{"a quiet fetch beside a push a tail cut", `{"command":"git fetch -q origin && git push origin HEAD:main 2>&1 | tail -n 1"}`,
 			"20f6298..f5127b7 HEAD -> main", "push pushed HEAD -> main (20f6298..f5127b7) to origin"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := artifactsOf("Bash", c.input, c.output); got != c.want {
+			if got := artifactsAs("Bash", c.input, c.output, false); got != c.want {
 				t.Errorf("got %q, want %q", got, c.want)
 			}
 		})

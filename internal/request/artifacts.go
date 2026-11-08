@@ -16,31 +16,56 @@ var writers = map[string]bool{"write": true, "edit": true, "multiedit": true, "n
 // shells are the harnesses' shell tools (toolresult).
 func shells() []string { return toolresult.Shells() }
 
-// The texts an artifact is read from, matched in the decoded output, where a line ends at a newline (a harness
-// that keeps the text as JSON) or the store joined the lines with spaces (one that keeps it plain). A match starts
-// at the text's start or after whitespace.
+// The texts an artifact is read from, matched in the decoded output, where a line ends at a newline (a text read
+// whole, or kept as JSON) or the store joined the lines with spaces (a text it keeps plain).
 var (
 	// git's commit line: [BRANCH HASH] SUBJECT, the branch maybe "detached HEAD", a first commit "(root-commit)"
 	commitRe = regexp.MustCompile(`(?m)(?:^|\s)\[([^\[\]\n]+?)(?: \(root-commit\))? ([0-9a-f]{7,40})\] ([^\n]+?)(?: \d+ files? changed|$)`)
-	// git push's To line, and the ref updates after it: OLD..NEW SRC -> DST, or [new branch] SRC -> DST
-	pushToRe  = regexp.MustCompile(`(?m)(?:^|\s)To (\S+)`)
+	// git push's To line: at a line's start in a text with lines, after whitespace in one the store joined
+	pushToLineRe = regexp.MustCompile(`(?m)^To (\S+)`)
+	pushToWordRe = regexp.MustCompile(`(?:^|\s)To (\S+)`)
+	// what ends a push's block: a fetch's From line, or the next push's To line
+	pushEndLineRe = regexp.MustCompile(`(?m)^(?:From|To) \S`)
+	pushEndWordRe = regexp.MustCompile(`(?:^|\s)From \S`)
+	// a ref update of a push: OLD..NEW SRC -> DST, or [new branch] SRC -> DST
 	pushRefRe = regexp.MustCompile(`(?m)(?:^|\s)(?:\+ )?(?:([0-9a-f]{7,40})\.\.\.?([0-9a-f]{7,40})|\* \[new branch\]|\[new branch\])\s+(\S+) -> (\S+)`)
 	prRe      = regexp.MustCompile(`https?://[^\s"']+/pull/\d+`)
 	patchRe   = regexp.MustCompile(`\*\*\* (?:Add|Update|Delete) File: ([^\s"]+)`)
+	// a push's remote: a URL, an scp-like host:path, or a path
+	remoteRe = regexp.MustCompile(`[:/]`)
 )
 
-// Artifacts are what a call made, read off its result, and nothing else: a failed result made nothing. Both are
-// decoded first, as the harness keeps them (Decode). A file-writing call made the files its input names. A shell
-// call made commits when its command runs a git command that makes them (the commit lines its output printed),
-// pushes when it runs git push and no push of it is a dry run (the ref updates after the To line, or, with no To
-// line, those of a call that ran no fetch or pull), and a pull request when it runs gh pr create without --dry-run
-// (the address it printed, not one it says already exists). A commit, push or pull request the call's success
-// proves it made (Shell, proven) is one even when its output shows nothing of it (a quiet -q, an address kept in
-// a variable): an artifact with what is known, made but its details not shown, unless a line of the output shows
-// it. What any other tool printed (an agent's report, a read, a search, a fetched page) is no artifact.
+// Artifacts are what a call made, as a line of its output shows it, and nothing else. Both are decoded first, as
+// the harness keeps them (Decode). A file-writing call made the files its input names, when its result succeeded.
+// A shell call made the commits its output's commit lines show, when its command runs a git command that makes
+// them: git prints the line only when the commit was made, so a failed result's line counts too. It made the
+// pushes its successful output's ref lines show inside a push's own block (from its To line to the next From or
+// To line), when it runs git push and no push of it is a dry run, and the pull request whose address a successful
+// gh pr create printed. A command that shows nothing (a quiet -q, an address kept in a variable, a command still
+// running in the background) made nothing this can see. What any other tool printed (an agent's report, a read, a
+// search, a fetched page) is no artifact.
 func Artifacts(call, res store.Event) []Result {
-	if metaOf(res.Meta).IsError {
+	tool := strings.ToLower(call.Tool)
+	if writers[tool] {
+		if metaOf(res.Meta).IsError {
+			return nil
+		}
+		return artifactsOf(call, res, Decode(call.Harness, tool, call.Summary, ""), makes{})
+	}
+	if !toolresult.IsShell(tool) {
 		return nil
+	}
+	d := Decode(call.Harness, tool, call.Summary, res.Summary)
+	return artifactsOf(call, res, d, made(d.Commands))
+}
+
+// artifactsOf reads a call's artifacts off its decoded input and output, with what its commands make, read once.
+func artifactsOf(call, res store.Event, d Decoded, mk makes) []Result {
+	failed := metaOf(res.Meta).IsError
+	id := metaOf(call.Meta).ToolID
+	once := id // what a call recorded again (a harness's copy of the same call) shares
+	if once == "" {
+		once = moment(call.TS)
 	}
 	var out []Result
 	add := func(r Result) {
@@ -50,47 +75,35 @@ func Artifacts(call, res store.Event) []Result {
 		}
 		out = append(out, r)
 	}
-	tool := strings.ToLower(call.Tool)
-	harness := call.Harness
-	if writers[tool] {
-		for _, p := range Decode(harness, tool, call.Summary, "").Paths {
-			add(Result{Kind: KindFile, Key: KindFile + ":" + p + "@" + moment(call.TS), Text: p, Event: call.ID()})
+	if writers[strings.ToLower(call.Tool)] {
+		for _, p := range d.Paths {
+			add(Result{Kind: KindFile, Key: KindFile + ":" + p + "@" + once, Text: p, Event: call.ID()})
 		}
 		return out
 	}
-	if !toolresult.IsShell(tool) {
-		return nil
-	}
-	d := Decode(harness, tool, call.Summary, res.Summary)
-	mk := made(d.Commands)
 	text := strings.TrimSuffix(d.Output, "…")
-	shown := map[string]bool{}
+	lines := strings.Contains(text, "\n")
+	var commits [][]int
 	if mk.commits {
-		for _, c := range commitRe.FindAllStringSubmatch(text, -1) {
-			add(Result{Kind: KindCommit, Key: KindCommit + ":" + c[2], Text: fmt.Sprintf("commit %s on %s: %s", c[2], c[1], strings.TrimSpace(c[3]))})
-			shown[KindCommit] = true
+		for _, c := range commitRe.FindAllStringSubmatchIndex(text, -1) {
+			commits = append(commits, c)
+			add(Result{Kind: KindCommit, Key: KindCommit + ":" + text[c[4]:c[5]],
+				Text: fmt.Sprintf("commit %s on %s: %s", text[c[4]:c[5]], text[c[2]:c[3]], strings.TrimSpace(text[c[6]:c[7]]))})
 		}
+	}
+	if failed {
+		return out // a failed result shows its commit lines, and nothing else it made
 	}
 	if mk.pushes {
-		// The ref updates after git's To line; with no To line (a tail kept only the last line), every ref update
-		// of a call that ran nothing else that prints them, its remote the push's own.
-		refs, remote := "", mk.remote
-		if to := pushToRe.FindStringSubmatchIndex(text); to != nil {
-			refs, remote = text[to[1]:], text[to[2]:to[3]]
-		} else if !mk.fetches {
-			refs = text
-		}
-		if remote == "" {
-			remote = "origin"
-		}
-		for _, p := range pushRefRe.FindAllStringSubmatch(refs, -1) {
-			shown[KindPush] = true
-			if p[2] != "" {
-				add(Result{Kind: KindPush, Key: KindPush + ":" + remote + " " + p[4] + "@" + p[2],
-					Text: fmt.Sprintf("pushed %s -> %s (%s..%s) to %s", p[3], p[4], p[1], p[2], remote)})
-			} else {
-				add(Result{Kind: KindPush, Key: KindPush + ":" + remote + " " + p[4] + "@new@" + moment(res.TS),
-					Text: fmt.Sprintf("pushed new branch %s -> %s to %s", p[3], p[4], remote)})
+		for _, b := range pushBlocks(text, lines, commits, mk) {
+			for _, p := range pushRefRe.FindAllStringSubmatch(b.refs, -1) {
+				if p[2] != "" {
+					add(Result{Kind: KindPush, Key: KindPush + ":" + b.remote + " " + p[4] + "@" + p[2],
+						Text: fmt.Sprintf("pushed %s -> %s (%s..%s) to %s", p[3], p[4], p[1], p[2], b.remote)})
+				} else {
+					add(Result{Kind: KindPush, Key: KindPush + ":" + b.remote + " " + p[4] + "@new@" + once,
+						Text: fmt.Sprintf("pushed new branch %s -> %s to %s", p[3], p[4], b.remote)})
+				}
 			}
 		}
 	}
@@ -101,32 +114,57 @@ func Artifacts(call, res store.Event) []Result {
 			}
 			u := text[loc[0]:loc[1]]
 			add(Result{Kind: KindPR, Key: KindPR + ":" + u, Text: "pull request " + u})
-			shown[KindPR] = true
 			break
 		}
-	}
-	// Made, its details not shown: keyed by the call's time, which a fork shares.
-	at := moment(res.TS)
-	if mk.madeCommit && !shown[KindCommit] && !strings.Contains(text, "nothing to commit") && !strings.Contains(text, "up to date") {
-		dir := firstText(mk.commitDir, d.Workdir, call.Cwd)
-		add(Result{Kind: KindCommit, Key: KindCommit + ":?" + dir + "@" + at, Text: strings.TrimSuffix("commit (hash not shown) in "+dir, " in "),
-			Hidden: true})
-	}
-	if mk.madePush && !shown[KindPush] && !strings.Contains(text, "Everything up-to-date") {
-		add(Result{Kind: KindPush, Key: KindPush + ":?" + mk.remote + "@" + at, Text: strings.TrimSuffix("push (refs not shown) to "+mk.remote, " to "),
-			Hidden: true})
-	}
-	if mk.madePR && !shown[KindPR] && !strings.Contains(text, "already exists") {
-		add(Result{Kind: KindPR, Key: KindPR + ":?@" + at, Text: "pull request (address not shown)", Hidden: true})
 	}
 	return out
 }
 
-func firstText(xs ...string) string {
-	for _, x := range xs {
-		if x != "" {
-			return x
+// block is a push's part of an output: its remote and the text its ref lines are in.
+type block struct {
+	remote, refs string
+}
+
+// pushBlocks are the blocks git push printed: each from a To line (at a line's start, or in a text the store joined
+// a word with a remote's shape outside a commit line) to the next From or To line, or the text's end. With no To
+// line (a tail kept only the last lines), the whole text of a call that ran nothing else that prints ref lines,
+// its remote the push's own.
+func pushBlocks(text string, lines bool, commits [][]int, mk makes) []block {
+	inCommit := func(at int) bool {
+		for _, c := range commits {
+			if at >= c[0] && at < c[1] {
+				return true
+			}
+		}
+		return false
+	}
+	var tos [][]int
+	re, end := pushToWordRe, pushEndWordRe
+	if lines {
+		re, end = pushToLineRe, pushEndLineRe
+	}
+	for _, t := range re.FindAllStringSubmatchIndex(text, -1) {
+		if remote := text[t[2]:t[3]]; !inCommit(t[0]) && (lines || remoteRe.MatchString(remote)) {
+			tos = append(tos, t)
 		}
 	}
-	return ""
+	var out []block
+	for i, t := range tos {
+		rest := text[t[1]:]
+		if i+1 < len(tos) {
+			rest = text[t[1]:tos[i+1][0]]
+		}
+		if e := end.FindStringIndex(rest); e != nil {
+			rest = rest[:e[0]]
+		}
+		out = append(out, block{remote: text[t[2]:t[3]], refs: rest})
+	}
+	if len(tos) == 0 && !mk.fetches {
+		remote := mk.remote
+		if remote == "" {
+			remote = "origin"
+		}
+		out = append(out, block{remote: remote, refs: text})
+	}
+	return out
 }

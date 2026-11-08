@@ -340,6 +340,10 @@ func TestStateFromObservedPhases(t *testing.T) {
 			f.phase("s-x", at(9), "phase", "needs_you", map[string]any{"ask": "Run the migration on prod?", "ask_kind": "question"})
 		}, true, NeedsYou, "waits on the owner (question): Run the migration on prod?"},
 		{"working", func(f *fixture) { f.phase("s-x", at(9), "phase", "working", nil) }, true, Working, ""},
+		{"a background job runs", func(f *fixture) { f.phase("s-x", at(9), "phase", "background", nil) }, true, Working, ""},
+		{"a run is scheduled", func(f *fixture) { f.phase("s-x", at(9), "phase", "scheduled", nil) }, true, Working, ""},
+		// a phase seen at the last turn's time is not seen after it
+		{"idle at the last turn's time", func(f *fixture) { f.phase("s-x", at(5), "phase", "idle", nil) }, true, Unknown, ""},
 		{"idle after a result", func(f *fixture) { f.phase("s-x", at(9), "phase", "idle", nil) }, true, Ready, ""},
 		{"gone with no reply", func(f *fixture) { f.phase("s-x", at(9), "vanished", "", map[string]any{"from": "idle"}) }, false, Open,
 			"the last turn has no reply recorded: and the summary"},
@@ -421,11 +425,12 @@ func TestAReportIsTheResultOfARequestWithNoArtifact(t *testing.T) {
 	}
 }
 
-// Results are what the tools printed: a failed call, a fetch's ref lines and a pull request only viewed are none.
+// Results are what the tools printed: a failed call's push, a failed write, a fetch's ref lines and a pull request
+// only viewed are none.
 func TestResultsComeFromToolOutput(t *testing.T) {
 	f := newFixture(t)
 	f.owner("s-r", at(0), "open the pull request")
-	f.tool("s-r", "", "Bash", at(1), `{"command":"git commit"}`, "[main 1e2f3a4] Done", true)
+	f.tool("s-r", "", "Bash", at(1), `{"command":"git push"}`, "To github.com:example/x.git 1e2f3a4..2e2f3a4 main -> main error: hook declined", true)
 	f.tool("s-r", "", "Bash", at(2), `{"command":"git fetch"}`, "From github.com:example/x 2222222..3333333 main -> origin/main", false)
 	f.tool("s-r", "", "Bash", at(3), `{"command":"gh pr view 7"}`, "https://github.com/example/x/pull/7", false)
 	f.tool("s-r", "", "Write", at(4), `{"file_path":"/work/s-r/a.txt"}`, "permission denied", true)

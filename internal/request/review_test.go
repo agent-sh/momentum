@@ -163,7 +163,8 @@ func TestArtifactsComeOnlyFromTheCallThatMadeThem(t *testing.T) {
 		{"git merge in pi", "bash", `{"command":"git merge --no-ff topic"}`, commit, false, "commit commit 1a2b3c4 on main: Fix it"},
 		{"git am", "Bash", `{"command":"git am fix.patch"}`, commit, false, "commit commit 1a2b3c4 on main: Fix it"},
 		{"git rebase", "Bash", `{"command":"git rebase -i HEAD~2"}`, commit, false, "commit commit 1a2b3c4 on main: Fix it"},
-		{"a commit that failed", "Bash", `{"command":"git commit -m x"}`, commit, true, ""},
+		// git prints the line only when the commit was made, whatever the call's status after it
+		{"a commit whose call failed", "Bash", `{"command":"git commit -m x && false"}`, commit, true, "commit commit 1a2b3c4 on main: Fix it"},
 		{"git log printing a commit line", "Bash", `{"command":"git log -1"}`, commit, false, ""},
 		{"git show", "Bash", `{"command":"git show HEAD"}`, commit, false, ""},
 		{"cat of a file", "Bash", `{"command":"cat notes.txt"}`, commit, false, ""},
@@ -378,14 +379,14 @@ func TestATurnRecordedTwiceIsOneAndTheOpenStep(t *testing.T) {
 	}
 }
 
-// A fork carries the source's history over: a file written once must count one write, a new branch pushed once
-// one push.
+// A fork carries the source's history over, its calls with their tool ids: a file written once must count one
+// write, a new branch pushed once one push.
 func TestAForkDoesNotDoubleResults(t *testing.T) {
 	f := newFixture(t)
 	for _, s := range []string{"s-src", "s-forked"} {
 		f.owner(s, at(0), "add the cache")
-		f.tool(s, "", "Write", at(1), `{"file_path":"/work/cache.go"}`, "File created.", false)
-		f.tool(s, "", "Bash", at(2), `{"command":"git push -u origin cache"}`, "To github.com:example/x.git * [new branch] cache -> cache", false)
+		f.pairWithID(s, "", "claude", "Write", "toolu_w1", at(1), `{"file_path":"/work/cache.go"}`, "File created.")
+		f.pairWithID(s, "", "claude", "Bash", "toolu_p1", at(2), `{"command":"git push -u origin cache"}`, "To github.com:example/x.git * [new branch] cache -> cache")
 	}
 	rq := f.group()[0]
 	pushes := 0

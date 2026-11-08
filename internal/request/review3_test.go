@@ -1,6 +1,7 @@
 package request
 
-// Tests from the third review of the requests change: what a call's success proves it made. Synthetic data only.
+// Tests from the third review of the requests change: an artifact is only what a line of a call's output shows.
+// Synthetic data only.
 
 import (
 	"strings"
@@ -10,52 +11,67 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// artifactsAs is Artifacts on a call of tool and its result, failed or not.
+// harnessOf is the harness whose tool a test's call is: Codex's exec tools, Hermes's terminal and writers, else
+// Claude Code's.
+func harnessOf(tool string) string {
+	switch tool {
+	case "exec", "exec_command":
+		return "codex"
+	case "terminal", "write_file", "patch":
+		return "hermes"
+	}
+	return "claude"
+}
+
+// artifactsAs is Artifacts on a call of tool and its result, failed or not, as its harness keeps them.
 func artifactsAs(tool, input, output string, failed bool) string {
-	call := store.Event{Source: store.Transcripts, SourceKey: "c", TS: at(1), Tool: tool, Kind: "tool_call", Summary: input}
-	res := store.Event{Source: store.Transcripts, SourceKey: "r", TS: at(1).Add(time.Second), Tool: tool, Kind: "tool_result", Summary: output}
+	h := harnessOf(tool)
+	call := store.Event{Source: store.Transcripts, SourceKey: "c", TS: at(1), Harness: h, Tool: tool, Kind: "tool_call", Summary: input}
+	res := store.Event{Source: store.Transcripts, SourceKey: "r", TS: at(1).Add(time.Second), Harness: h, Tool: tool, Kind: "tool_result", Summary: output}
 	if failed {
 		res.Meta = `{"is_error":true}`
 	}
 	return kinds(Artifacts(call, res))
 }
 
-// A commit, push or pull request a successful call's command made is observed done work, whatever its output shows:
-// when the whole call's success proves that command succeeded. A && chain proves every command of it, a list or a
-// pipeline only its last, || and what runs in the background, a condition or a cut command nothing.
-func TestWhatACallsSuccessProvesItMade(t *testing.T) {
-	commit, push, pr := "commit commit (hash not shown)", "push push (refs not shown) to origin", "pr pull request (address not shown)"
+// A command that shows nothing made nothing this can see, whatever its success seems to prove: git and gh print
+// nothing for a quiet commit or push, and a successful call proves little of each command it ran (a merge already
+// up to date, an exit before the commit, an EXIT trap, a script's inner command, a command still running).
+func TestOnlyAShownLineIsAnArtifact(t *testing.T) {
 	cases := []struct {
 		name, tool, input, output string
 		failed                    bool
 		want                      string
 	}{
-		{"a quiet commit, plain", "Bash", `{"command":"git commit -qm x"}`, "", false, commit},
-		{"a quiet push, plain", "Bash", `{"command":"git push -q origin main"}`, "", false, push},
-		{"in a && chain", "Bash", `{"command":"cd /work/x && git add -A && git commit -qm x && git push -q origin main"}`, "", false,
-			commit + " in /work/x | " + push},
-		{"in a ; list, the last proven", "Bash", `{"command":"git commit -qm x; git push -q origin main"}`, "", false, push},
-		{"in a ; list, not last", "Bash", `{"command":"git commit -qm x; echo done"}`, "done", false, ""},
-		{"after ||", "Bash", `{"command":"git push -q origin main || git commit -qm x"}`, "", false, ""},
-		{"|| then &&", "Bash", `{"command":"false || true && git commit -qm x"}`, "", false, commit},
-		{"a failed result", "Bash", `{"command":"git commit -qm x && git push -q origin main"}`, "", true, ""},
-		{"a pipeline's first command", "Bash", `{"command":"git commit -qm x | cat"}`, "", false, ""},
-		{"in the background", "Bash", `{"command":"git push -q origin main &"}`, "", false, ""},
-		{"in a condition", "Bash", `{"command":"if true; then git commit -qm x; fi"}`, "", false, ""},
-		{"a cut command", "Bash", `{"command":"git commit -qm 'a long message the store cut…`, "", false, ""},
-		{"in a subshell, last", "Bash", `{"command":"(cd /work/z && git commit -qm x)"}`, "", false, commit + " in /work/z"},
-		{"git -C", "Bash", `{"command":"git -C /work/y commit -qm x"}`, "", false, commit + " in /work/y"},
-		{"Codex's workdir", "exec_command", `{"cmd":"git commit -qm x","workdir":"/work/w"}`, "Process exited with code 0", false, commit + " in /work/w"},
-		{"a shell's -c script", "Bash", `{"command":"bash -lc 'git push -q origin main'"}`, "", false, push},
-		{"a line that shows it supersedes", "Bash", `{"command":"git commit -m x && git push origin main"}`, "[main 1a2b3c4] x", false,
-			"commit commit 1a2b3c4 on main: x | " + push},
-		{"an address kept in a variable", "Bash", `{"command":"N=$(gh pr create --fill) && echo ok"}`, "ok", false, pr},
-		{"an address kept in a variable, in a ; list", "Bash", `{"command":"N=$(gh pr create --fill); echo made"}`, "made", false, ""},
-		{"a pull request that already exists", "Bash", `{"command":"gh pr create --fill"}`,
-			`a pull request for branch "topic" into branch "main" already exists: https://github.com/example/x/pull/3`, false, ""},
-		{"a dry run", "Bash", `{"command":"gh pr create --dry-run --fill && git push -q --dry-run"}`, "", false, ""},
+		{"a quiet commit", "Bash", `{"command":"git commit -qm x"}`, "", false, ""},
+		{"a quiet push", "Bash", `{"command":"git push -q origin main"}`, "", false, ""},
+		{"a quiet && chain", "Bash", `{"command":"cd /work/x && git add -A && git commit -qm x && git push -q origin main"}`, "", false, ""},
+		{"a shell's -c script", "Bash", `{"command":"bash -lc 'git push -q origin main'"}`, "", false, ""},
+		{"Codex's workdir", "exec_command", `{"cmd":"git commit -qm x","workdir":"/work/w"}`, "Process exited with code 0", false, ""},
+		{"an address kept in a variable", "Bash", `{"command":"N=$(gh pr create --fill) && echo ok"}`, "ok", false, ""},
+		{"merge -q, already up to date", "Bash", `{"command":"git merge -q origin/main"}`, "", false, ""},
+		{"rebase -q, up to date", "Bash", `{"command":"git fetch -q origin && git rebase -q origin/main"}`, "", false, ""},
+		{"merge --ff-only, a fast-forward", "Bash", `{"command":"git merge --ff-only topic"}`,
+			"Updating 1a2b3c4..5d6e7f8 Fast-forward b | 1 + 1 file changed, 1 insertion(+) create mode 100644 b", false, ""},
+		{"merge --squash", "Bash", `{"command":"git merge --squash topic"}`,
+			"Updating 1a2b3c4..5d6e7f8 Fast-forward Squash commit -- not updating HEAD b | 1 + 1 file changed", false, ""},
+		{"exit before the commit", "Bash", `{"command":"[ -z \"$(git status --porcelain)\" ] && exit 0; git commit -qm x"}`, "", false, ""},
+		{"exit in a branch before the push", "Bash", `{"command":"if git diff --quiet origin/main; then exit 0; fi; git push -q origin main"}`, "", false, ""},
+		{"an EXIT trap", "Bash", `{"command":"trap 'exit 0' EXIT; git push -q origin main"}`,
+			"! [rejected] main -> main (fetch first) error: failed to push some refs to 'github.com:example/x.git'", false, ""},
+		{"Codex code mode, an inner push failed", "exec",
+			`const a = await tools.exec_command({cmd: "git push -q origin main"}); text(a)`,
+			`Script completed Wall time 1.1 seconds Output: {"chunk_id":"1a","exit_code":1,"output":"error: failed to push some refs to 'github.com:example/x.git'"}`,
+			false, ""},
+		{"Claude Code, run in the background", "Bash", `{"command":"git push -q origin main","run_in_background":true}`,
+			"Command running in background with ID: b1a2c3d. Output is being written to: /work/tasks/b1a2c3d.output", false, ""},
+		{"Claude Code, moved to the background", "Bash", `{"command":"git commit -qm 'Fix the parser'"}`,
+			"Command was moved to the background (ID: b4e5f6a) after running for 180s. Output is being written to: /work/tasks/b4e5f6a.output", false, ""},
+		{"Codex, still running at the yield", "exec_command", `{"cmd":"git push -q origin main","yield_time_ms":10000}`,
+			"Chunk ID: 2a Wall time: 10.0 seconds Process running with session ID 4242 Output: running the pre-push checks", false, ""},
 		{"everything up to date", "Bash", `{"command":"git push origin main"}`, "Everything up-to-date", false, ""},
-		{"a merge already up to date", "Bash", `{"command":"git merge -q topic"}`, "Already up to date.", false, ""},
+		{"a shown commit line", "Bash", `{"command":"git commit -m x && git push -q origin main"}`, "[main 1a2b3c4] x", false,
+			"commit commit 1a2b3c4 on main: x"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -66,16 +82,16 @@ func TestWhatACallsSuccessProvesItMade(t *testing.T) {
 	}
 }
 
-// The handoff shows a commit the call made but did not show as made, details not shown, in the session's directory.
-func TestAHandoffShowsWhatWasMadeButNotShown(t *testing.T) {
+// A request whose only call made a quiet commit holds no result: its handoff names no commit.
+func TestAQuietCommitIsNoResult(t *testing.T) {
 	f := newFixture(t)
 	f.owner("s-quiet", at(0), "commit the docs")
 	f.tool("s-quiet", "", "Bash", at(1), `{"command":"git add -A && git commit -qm docs"}`, "", false)
 	rq := f.group()[0]
-	if n := rq.Newest(); n == nil || n.Kind != KindCommit || !strings.Contains(n.Text, "hash not shown") {
-		t.Fatalf("newest: %+v", n)
+	if len(rq.Results) != 0 {
+		t.Fatalf("results: %s", kinds(rq.Results))
 	}
-	if h := Handoff(rq); !strings.Contains(h, "commit (hash not shown) in /work/s-quiet: made, details not shown") {
+	if h := Handoff(rq); strings.Contains(h, "not shown") {
 		t.Fatalf("handoff:\n%s", h)
 	}
 }
