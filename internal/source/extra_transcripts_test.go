@@ -690,6 +690,7 @@ func TestKimiSystemBlocksAreGeneratedInput(t *testing.T) {
 	note := text(noteText)
 	context := open + "Editor context (use only if relevant to user's query): marker-7f3a context.go:12." + end + "\n"
 	pasted := open + "You are marker-7f3a pasted." + end
+	pastedContext := open + "Editor context (use only if relevant to user's query): marker-7f3a pasted.go:3." + end + "\n"
 	labels := []string{"marker-7f3a note", "marker-7f3a context", "marker-7f3a typed", "marker-7f3a pasted", "marker-7f3a after"}
 	note2 := map[string]string{"marker-7f3a note": "harness harness_text", "marker-7f3a typed": "owner owner_text"}
 	split := map[string]string{"marker-7f3a context": "harness harness_text", "marker-7f3a typed": "owner owner_text"}
@@ -703,7 +704,8 @@ func TestKimiSystemBlocksAreGeneratedInput(t *testing.T) {
 	}{
 		{"image note part", []any{text("marker-7f3a typed"), note, image}, note2, []string{"marker-7f3a typed"}},
 		{"image note only", []any{note, image}, map[string]string{"marker-7f3a note": "harness harness_text"}, []string{""}},
-		{"editor context at the start of a part", []any{text(context + "marker-7f3a typed")}, split, []string{"marker-7f3a typed"}},
+		// VS Code sends a list only with media attached, and puts the editor context at the start of its first text part.
+		{"editor context at the start of a part", []any{text(context + "marker-7f3a typed"), image}, split, []string{"marker-7f3a typed"}},
 		{"editor context at the end of a part", []any{text("marker-7f3a typed\n" + context)}, split, []string{"marker-7f3a typed"}},
 		// A hook's part ahead of a list prompt does not move the editor context off its first text part.
 		{"editor context after a hook's part", []any{hook, text(context + "marker-7f3a typed"), image}, split, []string{"marker-7f3a typed"}},
@@ -714,7 +716,14 @@ func TestKimiSystemBlocksAreGeneratedInput(t *testing.T) {
 		{"a note opening his first part before an image", []any{text(noteText + " marker-7f3a after"), image}, pastedNote, nil},
 		// A block runs to the next closing tag: a later one on the line is his.
 		{"his words with a closing tag after an editor context", []any{text(open + "Editor context (use only if relevant to user's query): marker-7f3a context.go:12." +
-			end + "marker-7f3a typed " + end)}, split, []string{"marker-7f3a typed " + end}},
+			end + "marker-7f3a typed " + end), image}, split, []string{"marker-7f3a typed " + end}},
+		// A string prompt gets the editor context only at its end: one at its start is his paste. It is not split off, and
+		// is left to tacit as any block opening his first part is. VS Code's own at the end is still generated.
+		{"an editor context pasted at the start of a string prompt", []any{text(pastedContext + "marker-7f3a typed")},
+			map[string]string{"marker-7f3a pasted": "harness harness_text", "marker-7f3a typed": "harness harness_text"}, nil},
+		{"a pasted editor context and VS Code's closing a string prompt", []any{text(pastedContext + "marker-7f3a typed\n" + context)},
+			map[string]string{"marker-7f3a pasted": "harness harness_text", "marker-7f3a typed": "harness harness_text",
+				"marker-7f3a context": "harness harness_text"}, nil},
 		{"a pasted note at the end of his part", []any{text("marker-7f3a typed " + noteText)},
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a note": "owner owner_text"}, []string{"marker-7f3a typed " + noteText}},
 		{"an editor context opening his second part", []any{text("marker-7f3a typed"), text(context + "marker-7f3a after")},
@@ -833,7 +842,13 @@ func TestKimiClientNoticesAreGeneratedInput(t *testing.T) {
 	// The engine names no file for a data URL's image, the main path for the TUI, ACP and VS Code.
 	unnamed := "[Image omitted: unsupported image format image/heic. The current model provider accepts only PNG, JPEG, GIF, and WebP " +
 		"\u2014 convert it to PNG or JPEG and try again.]"
-	labels := []string{"marker-7f3a typed", "marker-7f3a a.txt", "marker-7f3a shot", "marker-7f3a bad", "marker-7f3a mine", "Image omitted: unsupported"}
+	// Kimi writes the image's type as declared, a space in it too.
+	spaced := "[Image omitted: \"marker-7f3a shot.svg\" uses unsupported image format image/svg+xml; charset=utf-8. The current model provider " +
+		"accepts only PNG, JPEG, GIF, and WebP \u2014 convert it to PNG or JPEG and try again.]"
+	spacedUnnamed := "[Image omitted: unsupported image format image/svg+xml; charset=utf-8. The current model provider accepts only PNG, JPEG, " +
+		"GIF, and WebP \u2014 convert it to PNG or JPEG and try again.]"
+	labels := []string{"marker-7f3a typed", "marker-7f3a a.txt", "marker-7f3a shot", "marker-7f3a bad", "marker-7f3a mine", "Image omitted: unsupported",
+		"marker-7f3a after"}
 	for _, tc := range []struct {
 		name   string
 		origin map[string]any
@@ -856,6 +871,13 @@ func TestKimiClientNoticesAreGeneratedInput(t *testing.T) {
 			[]string{"marker-7f3a typed [Image omitted: marker-7f3a mine]"}},
 		{"an image-omitted notice after his words", plain, []any{text("marker-7f3a typed " + unsupported)},
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a shot": "owner owner_text"}, []string{"marker-7f3a typed " + unsupported}},
+		{"an image-omitted notice before his words", plain, []any{text("marker-7f3a typed"), text(unsupported + " marker-7f3a after")},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a shot": "owner owner_text", "marker-7f3a after": "owner owner_text"},
+			[]string{"marker-7f3a typed " + unsupported + " marker-7f3a after"}},
+		{"an unsupported image notice whose type holds a space", plain, []any{text("marker-7f3a typed"), text(spaced)},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a shot": "harness harness_text"}, []string{"marker-7f3a typed"}},
+		{"an unsupported image notice with no name whose type holds a space", plain, []any{text("marker-7f3a typed"), text(spacedUnnamed)},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "Image omitted: unsupported": "harness harness_text"}, []string{"marker-7f3a typed"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -894,7 +916,7 @@ func TestKimiMigrationMarkersAreGeneratedInput(t *testing.T) {
 	notJSON := "[unsupported content: marker-7f3a mine]"
 	typed := `{"version":2,"lastPrompt":"marker-7f3a typed"}`
 	imported := `{"version":2,"lastPrompt":"marker-7f3a typed","custom":{"imported_from_kimi_cli":true}}`
-	labels := []string{"marker-7f3a typed", "[image expired]", "[video missing url]", "marker-7f3a widget", "marker-7f3a mine"}
+	labels := []string{"marker-7f3a typed", "[image expired]", "[video missing url]", "marker-7f3a widget", "marker-7f3a mine", "marker-7f3a after"}
 	his := map[string]string{"[image expired]": "owner owner_text"}
 	for _, tc := range []struct {
 		name   string
@@ -914,6 +936,12 @@ func TestKimiMigrationMarkersAreGeneratedInput(t *testing.T) {
 			map[string]string{"marker-7f3a typed": "owner owner_text", "[image expired]": "owner owner_text"}, []string{"marker-7f3a typed [image expired]"}},
 		{"an unsupported marker after his words", imported, prompt("turn.prompt", false, text("marker-7f3a typed "+unknownPart)),
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a widget": "owner owner_text"}, []string{"marker-7f3a typed " + unknownPart}},
+		{"a marker before his words", imported, prompt("turn.prompt", false, text("marker-7f3a typed"), text("[image expired] marker-7f3a after")),
+			map[string]string{"marker-7f3a typed": "owner owner_text", "[image expired]": "owner owner_text", "marker-7f3a after": "owner owner_text"},
+			[]string{"marker-7f3a typed [image expired] marker-7f3a after"}},
+		{"an unsupported marker before his words", imported, prompt("turn.prompt", false, text("marker-7f3a typed"), text(unknownPart+" marker-7f3a after")),
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a widget": "owner owner_text", "marker-7f3a after": "owner owner_text"},
+			[]string{"marker-7f3a typed " + unknownPart + " marker-7f3a after"}},
 		{"words that are no JSON in an unsupported marker", imported, prompt("turn.prompt", false, text("marker-7f3a typed"), text(notJSON)),
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a mine": "owner owner_text"}, []string{"marker-7f3a typed " + notJSON}},
 		{"a marker he typed", typed, prompt("turn.prompt", true, text("[image expired]")), his, []string{"[image expired]"}},
@@ -948,7 +976,7 @@ func TestKimiACPResourcesAreGeneratedInput(t *testing.T) {
 	text := func(s string) map[string]any { return map[string]any{"type": "text", "text": s} }
 	resource := text("<resource uri=\"file:///neutral/a.go\">marker-7f3a file body\nline two</resource>")
 	link := text("<resource_link uri=\"https://neutral.example/doc\" name=\"marker-7f3a link\" />")
-	labels := []string{"marker-7f3a typed", "marker-7f3a file body", "marker-7f3a link", "marker-7f3a-linked.go"}
+	labels := []string{"marker-7f3a typed", "marker-7f3a file body", "marker-7f3a link", "marker-7f3a-linked.go", "marker-7f3a after"}
 	for _, tc := range []struct {
 		name  string
 		input []any
@@ -966,6 +994,14 @@ func TestKimiACPResourcesAreGeneratedInput(t *testing.T) {
 		{"a resource link after his words", []any{text("marker-7f3a typed <resource_link uri=\"https://neutral.example/doc\" name=\"marker-7f3a link\" />")},
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a link": "owner owner_text"},
 			[]string{"marker-7f3a typed <resource_link uri=\"https://neutral.example/doc\" name=\"marker-7f3a link\" />"}},
+		{"a resource element before his words", []any{text("marker-7f3a typed"),
+			text("<resource uri=\"file:///neutral/a.go\">marker-7f3a file body</resource> marker-7f3a after")},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a file body": "owner owner_text", "marker-7f3a after": "owner owner_text"},
+			[]string{"marker-7f3a typed <resource uri=\"file:///neutral/a.go\">marker-7f3a file body</resource> marker-7f3a after"}},
+		{"a resource link before his words", []any{text("marker-7f3a typed"),
+			text("<resource_link uri=\"https://neutral.example/doc\" name=\"marker-7f3a link\" /> marker-7f3a after")},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a link": "owner owner_text", "marker-7f3a after": "owner owner_text"},
+			[]string{"marker-7f3a typed <resource_link uri=\"https://neutral.example/doc\" name=\"marker-7f3a link\" /> marker-7f3a after"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()

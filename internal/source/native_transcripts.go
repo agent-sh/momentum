@@ -634,8 +634,8 @@ var (
 
 // kimiImageOmitted is the whole text part Kimi's engine and its web server write in place of an image the model
 // cannot take: an unsupported format (named or not, with the provider's accepted formats) or a data URL that cannot
-// be parsed, each in its fixed words.
-var kimiImageOmitted = regexp.MustCompile(`\A\[Image omitted: (?:(?:unsupported image format \S+|".*" uses unsupported image format \S+)\. ` +
+// be parsed, each in its fixed words. The format is the image's type as declared, which may hold a space.
+var kimiImageOmitted = regexp.MustCompile(`\A\[Image omitted: (?:(?:unsupported image format .+?|".*" uses unsupported image format .+?)\. ` +
 	`The current model provider accepts only (?:[^,\n]+(?:, [^,\n]+)*)?, and [^,\n]+ \x{2014} convert it to PNG or JPEG and try again\.|` +
 	`".*" is not a valid data URL \(its header or payload could not be parsed\)\. Re-encode the image as PNG or JPEG and try again\.)\]\z`)
 
@@ -684,10 +684,11 @@ func kimiAttached(origin map[string]any) map[string]bool {
 // origin.skillActivations bundles, which Kimi reads as the skill's; a whole text part a client or Kimi writes in
 // its fixed form (kimiWhole, kimiAttached), and in a prompt the migration from Kimi's older CLI wrote (migrated), a
 // marker it writes there (kimiMigrated); an image note that is the whole text part right before an image part,
-// or the block that ends it; and VS Code's editor context at the start of the first text part, or at the end of a
-// string prompt, which reaches the wire as one text part. What cannot be rebuilt exactly where Kimi
-// writes it, such as an attached-file notice its origin does not list, a known block elsewhere in his words or the
-// ACP server's bare file paths, stays in his words. unknown counts the parts whose meta.source is not one Kimi is
+// or the block that ends it; and VS Code's editor context at the start of the first text part of a list prompt (a
+// prompt of more than one unmarked part), or at the end of a string prompt, which reaches the wire as one text part.
+// What cannot be rebuilt exactly where Kimi writes it, such as an attached-file notice its origin does not list, a
+// known block elsewhere in his words (an editor context at the start of a string prompt is a paste) or the ACP
+// server's bare file paths, stays in his words. unknown counts the parts whose meta.source is not one Kimi is
 // known to write; they are generated all the same. Only text counts, as in nativeText.
 func kimiInput(input any, origin map[string]any, migrated bool) (generated, words string, unknown int) {
 	parts, listed := input.([]any)
@@ -707,7 +708,8 @@ func kimiInput(input any, origin map[string]any, migrated bool) (generated, word
 		bundled = len(activations)
 	}
 	attached := kimiAttached(origin)
-	// A string prompt is the input's one unmarked part.
+	// A string prompt is the input's one unmarked part. VS Code sends a list only with media attached, so a prompt of
+	// one unmarked part is its string prompt, which gets the editor context only at its end.
 	single := !listed || len(slices.DeleteFunc(slices.Clone(parts), func(b any) bool { return !unmarked(b) })) == 1
 	first := true
 	var gen, own []any
@@ -736,12 +738,12 @@ func kimiInput(input any, origin map[string]any, migrated bool) (generated, word
 			beforeImage := i+1 < len(parts) && str(object(parts[i+1]), "type") == "image_url"
 			lo, hi := 0, len(t)
 			blocks := kimiBlock.FindAllStringIndex(t, -1)
-			if opens && len(blocks) > 0 && blocks[0][0] == 0 && strings.HasPrefix(t, kimiContextOpen) {
+			if opens && !single && len(blocks) > 0 && blocks[0][0] == 0 && strings.HasPrefix(t, kimiContextOpen) {
 				lo = blocks[0][1]
 			}
 			if n := len(blocks); n > 0 && blocks[n-1][1] == len(t) && blocks[n-1][0] >= lo {
 				last := t[blocks[n-1][0]:]
-				if beforeImage && strings.HasPrefix(last, kimiNoteOpen) || single && lo == 0 && strings.HasPrefix(last, kimiContextOpen) {
+				if beforeImage && strings.HasPrefix(last, kimiNoteOpen) || single && strings.HasPrefix(last, kimiContextOpen) {
 					hi = blocks[n-1][0]
 				}
 			}
