@@ -739,6 +739,8 @@ func TestKimiSystemBlocksAreGeneratedInput(t *testing.T) {
 		{"a note opening his part before an image", []any{text("marker-7f3a typed"), text(noteText + " marker-7f3a after"), image},
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a note": "owner owner_text", "marker-7f3a after": "owner owner_text"},
 			[]string{"marker-7f3a typed " + noteText + " marker-7f3a after"}},
+		{"a note part before a video", []any{text("marker-7f3a typed"), note, map[string]any{"type": "video_url", "videoUrl": map[string]any{"url": "file:///neutral.mp4"}}},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a note": "owner owner_text"}, []string{"marker-7f3a typed " + noteText}},
 		{"a note part after his image", []any{text("marker-7f3a typed"), image, note},
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a note": "owner owner_text"}, []string{"marker-7f3a typed " + noteText}},
 		// A note part whose closing tag is on the next line is no note of a client's: they write theirs on one.
@@ -783,12 +785,18 @@ func TestKimiSteeredNoteIsGeneratedInput(t *testing.T) {
 	note := open + "Image compressed to fit model limits: marker-7f3a note, original 4000x3000 -> sent 2000x1500. Fine detail may be lost." + end
 	labels := []string{"marker-7f3a note", "marker-7f3a typed"}
 	want := map[string]string{"marker-7f3a note": "harness harness_text", "marker-7f3a typed": "owner owner_text"}
+	notes := map[string]string{"marker-7f3a note": "harness harness_text"}
+	words := []string{"marker-7f3a typed"}
 	for _, tc := range []struct {
 		name  string
 		input []any
+		want  map[string]string
+		owner []string
 	}{
-		{"his words and the note joined before its image", []any{text("marker-7f3a typed " + note), image}},
-		{"two items joined, the second's note before its image", []any{text("marker-7f3a typed\n\n" + note), image}},
+		{"his words and the note joined before its image", []any{text("marker-7f3a typed " + note), image}, want, words},
+		{"two items joined, the second's note before its image", []any{text("marker-7f3a typed\n\n" + note), image}, want, words},
+		// Two image-only items joined: the separator lands in the second note's part, and only whitespace is left.
+		{"two image-only items joined", []any{text(note), image, text("\n\n" + note), image}, notes, []string{""}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -798,11 +806,11 @@ func TestKimiSteeredNoteIsGeneratedInput(t *testing.T) {
 			kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a typed"}`)
 			st := openStore(t)
 			ingest(t, transcripts(home), st)
-			if got := actorsOf(t, st, labels...); !maps.Equal(got, want) {
-				t.Fatalf("steer stored as %v, want %v", got, want)
+			if got := actorsOf(t, st, labels...); !maps.Equal(got, tc.want) {
+				t.Fatalf("steer stored as %v, want %v", got, tc.want)
 			}
-			if got := ownerTexts(t, st); !slices.Equal(got, []string{"marker-7f3a typed"}) {
-				t.Fatalf("owner turns %q, want only his words", got)
+			if got := ownerTexts(t, st); !slices.Equal(got, tc.owner) {
+				t.Fatalf("owner turns %q, want %q", got, tc.owner)
 			}
 		})
 	}
@@ -822,7 +830,10 @@ func TestKimiClientNoticesAreGeneratedInput(t *testing.T) {
 		"PNG, JPEG, GIF, and WebP \u2014 convert it to PNG or JPEG and try again.]"
 	malformed := "[Image omitted: \"data:image/png;base64,marker-7f3a bad\u2026\" is not a valid data URL (its header or payload could not be parsed). " +
 		"Re-encode the image as PNG or JPEG and try again.]"
-	labels := []string{"marker-7f3a typed", "marker-7f3a a.txt", "marker-7f3a shot", "marker-7f3a bad", "marker-7f3a mine"}
+	// The engine names no file for a data URL's image, the main path for the TUI, ACP and VS Code.
+	unnamed := "[Image omitted: unsupported image format image/heic. The current model provider accepts only PNG, JPEG, GIF, and WebP " +
+		"\u2014 convert it to PNG or JPEG and try again.]"
+	labels := []string{"marker-7f3a typed", "marker-7f3a a.txt", "marker-7f3a shot", "marker-7f3a bad", "marker-7f3a mine", "Image omitted: unsupported"}
 	for _, tc := range []struct {
 		name   string
 		origin map[string]any
@@ -836,6 +847,8 @@ func TestKimiClientNoticesAreGeneratedInput(t *testing.T) {
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a a.txt": "owner owner_text"}, []string{"marker-7f3a typed " + notice}},
 		{"an unsupported image notice", plain, []any{text("marker-7f3a typed"), text(unsupported)},
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a shot": "harness harness_text"}, []string{"marker-7f3a typed"}},
+		{"an unsupported image notice with no name", plain, []any{text("marker-7f3a typed"), text(unnamed)},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "Image omitted: unsupported": "harness harness_text"}, []string{"marker-7f3a typed"}},
 		{"a malformed image notice", plain, []any{text("marker-7f3a typed"), text(malformed)},
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a bad": "harness harness_text"}, []string{"marker-7f3a typed"}},
 		{"words that look like a notice", plain, []any{text("marker-7f3a typed"), text("[Image omitted: marker-7f3a mine]")},
