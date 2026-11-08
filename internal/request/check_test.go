@@ -102,3 +102,22 @@ func TestAReadAgainKeepsTheCheck(t *testing.T) {
 		t.Fatalf("after a read again: id %s (was %s), %s (%s)", again.ID, rq.ID, again.State, again.Why)
 	}
 }
+
+// A check the first draft of the table recorded keeps no words: it rests on a fragment of any turn, so it stands for
+// nothing.
+func TestAFirstDraftCheckStandsForNothing(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	f.owner("s-old", at(0), "fix the importer")
+	f.tool("s-old", "", "Bash", at(1), `{"command":"git commit"}`, "[main 3333ccc] Fix the importer", false)
+	his := f.owner("s-old", at(2), "now do the exporter too")
+	f.phase("s-old", at(3), "phase", "idle", nil)
+	rq := f.group()[0]
+	if ok, err := f.st.CheckOnce(ctx, store.RequestCheck{Request: rq.ID, Result: "commit:3333ccc", ResultAt: at(1).Add(1e9), Proof: his.ID(),
+		ProofAt: at(2), At: at(4)}, nil); err != nil || !ok {
+		t.Fatalf("store the check: %v %v", ok, err)
+	}
+	if got := f.group()[0]; got.State == Checked {
+		t.Fatalf("a check with no words: %s (%s)", got.State, got.Why)
+	}
+}

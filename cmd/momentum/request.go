@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strconv"
 	"time"
 
 	"github.com/agent-sh/momentum/internal/config"
@@ -221,7 +222,7 @@ func requestCheck(ctx context.Context, cmd string, args []string, stdout, stderr
 	if len(ids) != 1 {
 		return usageError{fmt.Sprintf(`request %s needs one ID (a request's id, or a session's id or its start) and --proof "WORDS", the owner's own`, cmd)}
 	}
-	if err := request.ProofShape(*proof); err != nil {
+	if err := request.ProofShape(*proof, cmd == "check"); err != nil {
 		return usageError{fmt.Sprintf("%s %s not recorded: %v", ids[0], cmd, err)}
 	}
 	st, err := store.Open(paths.DB())
@@ -243,17 +244,19 @@ func requestCheck(ctx context.Context, cmd string, args []string, stdout, stderr
 		}
 		msg := fmt.Sprintf("%s: %s not recorded: %v", rq.ID, cmd, err)
 		if errors.Is(err, request.ErrNoTurn) {
-			// the store lags his turns: say how far it reaches, never that he did not say it
+			// say what the store holds, never that he did not say it
 			through, rerr := st.ReadThrough(ctx, store.Transcripts)
 			reach := "has read no transcripts yet"
 			if rerr == nil && !through.IsZero() {
 				reach = "holds the transcripts as read up to " + through.Local().Format("2006-01-02 15:04")
 			}
-			msg += "; the store " + reach
-			if caught != nil {
-				msg += ", and the ingest this command runs first could not read them (" + caught.Error() + ")"
+			if caught == nil {
+				msg += "; the store is current (it " + reach + "), and a turn it holds is only his typed words: what he pasted is cut from it, " +
+					"and a long turn is cut at its first " + strconv.Itoa(source.OwnerTurnBytes) + " bytes"
+			} else {
+				msg += "; the store " + reach + ", and the ingest this command runs first could not read them (" + caught.Error() +
+					"), so a turn of his after that is not in it yet: retry after the next ingest"
 			}
-			msg += ", so a turn of his after that is not in it yet: retry after the next ingest"
 		}
 		return usageError{msg}
 	}
@@ -280,7 +283,7 @@ func requestCheck(ctx context.Context, cmd string, args []string, stdout, stderr
 }
 
 // catchUpFor bounds the ingest a check runs first: the store lags his turns by up to an ingest timer's period.
-const catchUpFor = 2 * time.Minute
+var catchUpFor = 2 * time.Minute
 
 // catchUp reads what is new in the transcripts into the store, as the ingest timer does and under its lock, for at
 // most catchUpFor, so his newest turn is there when a check looks for it. It waits while another ingest holds the

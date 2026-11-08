@@ -160,32 +160,57 @@ func (r *Request) replyBefore(at time.Time) *Result {
 	return nil
 }
 
-// Standing is the newest check not undone, and whether it holds: no artifact a check would bind over the one it
-// binds came after that one, and no ask of the owner's came after his turn that proves it. A reply reopens
-// nothing. A check holds while its result can no longer be read (its transcript is gone, so it is not among the
-// request's) and nothing came after it.
+// Standing is the newest check not undone, and whether it holds: no artifact that reopens it came after the one it
+// binds (newerThan), and no ask of the owner's came after his turn that proves it. A reply reopens nothing. A check
+// holds while its result can no longer be read (its transcript is gone, so it is not among the request's) and
+// nothing came after it.
 func (r *Request) Standing() (store.RequestCheck, bool, bool) {
-	for i := len(r.Checks) - 1; i >= 0; i-- {
-		if c := r.Checks[i]; c.Undone.IsZero() {
-			return c, true, r.newerThan(c) == nil && !r.LastOwnerTurn.After(c.ProofAt)
-		}
+	if c, ok := standing(r.Checks); ok {
+		return c, true, r.newerThan(c) == nil && !r.LastOwnerTurn.After(c.ProofAt)
 	}
 	return store.RequestCheck{}, false, false
 }
 
-// newerThan is the newest artifact that came after the one a check binds and that a check would bind over it: of
-// its kind or of one ranked above it (a commit, a push or a pull request over a file write over a reply); nil for
-// none. An artifact of a kind ranked below it, one that came before it, and a reply reopen nothing.
+// standing is the newest of checks not undone. A check the first draft recorded keeps no words: it rests on a
+// fragment of any turn, which this build does not take, so it stands for nothing.
+func standing(checks []store.RequestCheck) (store.RequestCheck, bool) {
+	for i := len(checks) - 1; i >= 0; i-- {
+		if c := checks[i]; c.Undone.IsZero() && c.Words != "" {
+			return c, true
+		}
+	}
+	return store.RequestCheck{}, false
+}
+
+// newerThan is the newest artifact that reopens a check: one after the owner's turn the check rests on, whatever its
+// kind (work after his verdict); and one between the result the check binds and that turn that a check would bind
+// over it, of its kind or of one ranked above it (a commit, a push or a pull request over a file write over a
+// reply). Nil for none. An artifact of a kind ranked below it before his turn, one that came before the checked
+// result, a reply, and a push of the checked commit (the push a "ship it" asks for) reopen nothing.
 func (r *Request) newerThan(c store.RequestCheck) *Result {
-	kind, _, _ := strings.Cut(c.Result, ":")
+	kind, hash, _ := strings.Cut(c.Result, ":")
 	var out *Result
 	for i := range r.Results {
 		x := &r.Results[i]
-		if x.Key != c.Result && x.At.After(c.ResultAt) && rank(x.Kind) >= rank(kind) && (out == nil || x.At.After(out.At)) {
+		if x.Key == c.Result || !x.At.After(c.ResultAt) || kind == KindCommit && pushes(*x, hash) {
+			continue
+		}
+		if (x.At.After(c.ProofAt) || rank(x.Kind) >= rank(kind)) && (out == nil || x.At.After(out.At)) {
 			out = x
 		}
 	}
 	return out
+}
+
+// pushes reports a push whose new hash is a commit's (either one's abbreviation of the other): a push of a new
+// branch prints none, so it is never one.
+func pushes(x Result, commit string) bool {
+	if x.Kind != KindPush || strings.Contains(x.Key, "@new@") {
+		return false
+	}
+	at := strings.LastIndexByte(x.Key, '@')
+	h := x.Key[at+1:]
+	return len(h) >= 7 && len(commit) >= 7 && (strings.HasPrefix(h, commit) || strings.HasPrefix(commit, h))
 }
 
 // checked is the result a check binds as the request holds it; nil when it is no longer among them.
@@ -1022,13 +1047,8 @@ func (r *reader) settle(ctx context.Context, since time.Time, match func(*Reques
 					if err != nil {
 						return nil, err
 					}
-					for i := len(checks) - 1; i >= 0; i-- {
-						if c := checks[i]; c.Undone.IsZero() {
-							if c.ResultAt.Before(r.window) && (from.IsZero() || c.ResultAt.Before(from)) {
-								from = c.ResultAt
-							}
-							break
-						}
+					if c, ok := standing(checks); ok && c.ResultAt.Before(r.window) && (from.IsZero() || c.ResultAt.Before(from)) {
+						from = c.ResultAt
 					}
 					if !from.IsZero() {
 						if err := load(rq, from); err != nil {

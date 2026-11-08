@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -13,16 +14,30 @@ import (
 
 // A check is the owner's. He does not run tools: an agent relays the turn where he says he checked it, as tacit's
 // relays do (`tacit questions close --proof words`), and a check is recorded only when the relayed words are that
-// whole turn of his in the request's sessions, after the result it binds, and the turn is no question and no
-// instruction about a check. An agent's word alone records nothing (SPEC, Requests, Checks).
+// whole turn of his in the request's sessions, after the result it binds, and the turn says a verdict: one of the
+// verdict phrases, not negated, with no question and no instruction about a check. An agent's word alone records
+// nothing (SPEC, Requests, Checks).
 
-// ProofWords is the fewest words a proof holds: a shorter turn says too little to be a verdict.
+// ProofWords is the fewest words an undo's proof holds, and a check's that is not a verdict phrase alone: a shorter
+// turn says too little.
 const ProofWords = 3
+
+// verdicts are the phrases that say he checked a result: a check's turn holds one, on word boundaries, in any case.
+var verdicts = [][]string{{"checked"}, {"lgtm"}, {"looks", "good"}, {"looks", "right"}, {"reads", "right"}, {"approved"},
+	{"ship", "it"}, {"verified"}, {"good", "to", "go"}, {"all", "good"}}
+
+// negations are the words that, near a verdict phrase, take it back: "not checked", "isn't approved", "no, ship it
+// later". A word that ends in n't is one too.
+var negations = map[string]bool{"not": true, "never": true, "cannot": true, "isnt": true, "doesnt": true, "dont": true, "didnt": true,
+	"wasnt": true, "arent": true, "wont": true, "cant": true, "hasnt": true, "havent": true, "shouldnt": true, "wouldnt": true}
+
+// near is how many words on either side of a verdict phrase a negation takes it back from.
+const near = 3
 
 var (
 	// ErrNoProof is a check or an undo the owner's own turn does not prove.
 	ErrNoProof = errors.New("not on the owner's words")
-	// ErrNoTurn is a proof that is no turn of his the store holds; the store may not hold his newest turns yet.
+	// ErrNoTurn is a proof that is no turn of his the store holds.
 	ErrNoTurn = errors.New("no turn of the owner's in the request's sessions, as the store holds them, is these words whole")
 )
 
@@ -47,10 +62,8 @@ type Proof struct {
 // collapse is a text with its whitespace collapsed to single spaces.
 func collapse(s string) string { return strings.Join(strings.Fields(s), " ") }
 
-// question reports a turn that asks: it ends in a question mark (before closing quotes or brackets).
-func question(words string) bool {
-	return strings.HasSuffix(strings.TrimRight(collapse(words), `"')]`+"`"), "?")
-}
+// question reports a turn that asks something: a question mark anywhere in it.
+func question(words string) bool { return strings.Contains(words, "?") }
 
 // instruction reports a turn that names the check command or a request's id: it tells an agent what to do about a
 // check, which is no verdict of his.
@@ -69,27 +82,106 @@ func instruction(words string) bool {
 	return false
 }
 
-// ProofShape refuses a proof that is no words, or fewer than ProofWords.
-func ProofShape(words string) error {
-	switch n := len(strings.Fields(words)); {
+// token is a word of a turn in lower case, with its apostrophes (raw) and without them (word), and whether a comma
+// ends it.
+type token struct {
+	word, raw string
+	comma     bool
+}
+
+var tokenRe = regexp.MustCompile(`[\p{L}\p{N}]+(?:['’][\p{L}]+)*(,?)`)
+
+func tokens(words string) []token {
+	var out []token
+	for _, m := range tokenRe.FindAllStringSubmatch(strings.ToLower(words), -1) {
+		w := strings.TrimSuffix(m[0], ",")
+		out = append(out, token{word: strings.NewReplacer("'", "", "’", "").Replace(w), raw: w, comma: m[1] != ""})
+	}
+	return out
+}
+
+// negation reports a word that takes a verdict back: one of negations, a word that ends in n't, or "no," with its
+// comma.
+func negation(t token) bool {
+	return negations[t.word] || strings.HasSuffix(t.raw, "n't") || strings.HasSuffix(t.raw, "n’t") || t.word == "no" && t.comma
+}
+
+// verdict reports a turn that says he checked it: under ProofWords words, a verdict phrase alone (approved, lgtm,
+// ship it); else one it holds, on word boundaries, with no negation within near words of any it holds. negated
+// reports a phrase a negation took back.
+func verdict(words string) (ok, negated bool) {
+	ts := tokens(words)
+	at := func(i int, ph []string) bool {
+		if i+len(ph) > len(ts) {
+			return false
+		}
+		for k, w := range ph {
+			if ts[i+k].word != w {
+				return false
+			}
+		}
+		return true
+	}
+	if len(strings.Fields(words)) < ProofWords {
+		for _, ph := range verdicts {
+			if len(ts) == len(ph) && at(0, ph) {
+				return true, false
+			}
+		}
+		return false, false
+	}
+	for i := range ts {
+		for _, ph := range verdicts {
+			if !at(i, ph) {
+				continue
+			}
+			ok = true
+			for k := max(0, i-near); k < min(len(ts), i+len(ph)+near); k++ {
+				if (k < i || k >= i+len(ph)) && negation(ts[k]) {
+					return false, true
+				}
+			}
+		}
+	}
+	return ok, false
+}
+
+// ProofShape refuses a proof by its words alone, before any turn is looked for: no words; for a check (verdict),
+// a question, an instruction about a check, a verdict phrase a negation takes back, or no verdict at all; for an
+// undo, fewer than ProofWords words, a question or an instruction. A proof is a whole turn of his, so what its words
+// say, his turn says.
+func ProofShape(words string, check bool) error {
+	n := len(strings.Fields(words))
+	switch {
 	case n == 0:
 		return fmt.Errorf("%w: no proof; a check rests only on the owner's own turn where he says he checked it, relayed whole as he typed it: an agent's word alone records nothing",
 			ErrNoProof)
-	case n < ProofWords:
-		return fmt.Errorf("%w: %q is fewer than %d words, too short to say he checked it", ErrNoProof, words, ProofWords)
+	case question(words):
+		return fmt.Errorf("%w: these words ask a question, which is no verdict", ErrNoProof)
+	case instruction(words):
+		return fmt.Errorf("%w: these words name the check command or a request's id: an instruction about a check is no verdict", ErrNoProof)
+	case !check && n < ProofWords:
+		return fmt.Errorf("%w: %q is fewer than %d words, too short to take a check back", ErrNoProof, words, ProofWords)
+	case !check:
+		return nil
+	}
+	switch ok, negated := verdict(words); {
+	case negated:
+		return fmt.Errorf("%w: these words take back what they say of it, which is no verdict", ErrNoProof)
+	case !ok:
+		return fmt.Errorf("%w: these words say no verdict that he checked it", ErrNoProof)
 	}
 	return nil
 }
 
 // prove is the owner's newest turn of the request whose words, whitespace collapsed, are words whole, after from (at
-// or after it unless strictly), that asks no question and gives no instruction about a check. With none, it says
-// why: no turn is them, only a program's or a harness command is, or only a turn of his from before (early says
-// what of), a question or an instruction.
+// or after it unless strictly). With none, it says why: no turn is them, only a program's or a harness command is,
+// or only a turn of his from before (early says what of).
 func (r *Request) prove(words string, from time.Time, strictly bool, early string) (Proof, error) {
 	want := collapse(words)
 	var found *spoken
 	var program, command bool
-	var before, asks, tells time.Time
+	var before time.Time
 	for i := range r.said {
 		s := &r.said[i]
 		if collapse(s.words) != want {
@@ -104,24 +196,15 @@ func (r *Request) prove(words string, from time.Time, strictly bool, early strin
 			if s.at.After(before) {
 				before = s.at
 			}
-		case question(s.words):
-			asks = s.at
-		case instruction(s.words):
-			tells = s.at
 		case found == nil || s.at.After(found.at) || s.at.Equal(found.at) && s.event < found.event:
 			found = s
 		}
 	}
-	turn := func(at time.Time) string { return "his turn of " + at.Local().Format(timeFormat) + " is these words" }
 	switch {
 	case found != nil:
 		return Proof{Event: found.event, At: found.at, Words: want}, nil
-	case !asks.IsZero():
-		return Proof{}, fmt.Errorf("%w: %s, and it asks a question, which is no verdict", ErrNoProof, turn(asks))
-	case !tells.IsZero():
-		return Proof{}, fmt.Errorf("%w: %s, and it names the check command or a request's id: an instruction about a check is no verdict", ErrNoProof, turn(tells))
 	case !before.IsZero():
-		return Proof{}, fmt.Errorf("%w: %s, but %s", ErrNoProof, turn(before), early)
+		return Proof{}, fmt.Errorf("%w: his turn of %s is these words, but %s", ErrNoProof, before.Local().Format(timeFormat), early)
 	case program:
 		return Proof{}, fmt.Errorf("%w: only a turn a program typed is these words (momentum's own message, a configured prefix, or the same words sent to another session), not one of his",
 			ErrNoProof)
@@ -151,12 +234,12 @@ type CheckOutcome struct {
 }
 
 // Check records the owner's check of the result a request binds, on his turn: the relayed words must be a whole
-// turn of his after that result and after his last undo, no question and no instruction, with no ask of his after
+// turn of his after that result and after his last undo that says a verdict (ProofShape), with no ask of his after
 // it, which would reopen it. A request with no artifact binds the agent's newest reply before that turn. It
 // records none when a check of that result on the same turn of his stands, also one another check recorded since
 // the request was read: a check that holds rests on his last ask, the one turn it can rest on.
 func Check(ctx context.Context, st *store.Store, rq *Request, words string, at time.Time) (CheckOutcome, error) {
-	if err := ProofShape(words); err != nil {
+	if err := ProofShape(words, true); err != nil {
 		return CheckOutcome{}, err
 	}
 	b := rq.Bound()
@@ -197,7 +280,7 @@ func Check(ctx context.Context, st *store.Store, rq *Request, words string, at t
 // Uncheck undoes the request's standing check, whichever of its ids it is stored under, on the owner's turn: the
 // relayed words must be a whole turn of his after the one the check rests on, no question and no instruction.
 func Uncheck(ctx context.Context, st *store.Store, rq *Request, words string, at time.Time) (store.RequestCheck, Proof, error) {
-	if err := ProofShape(words); err != nil {
+	if err := ProofShape(words, false); err != nil {
 		return store.RequestCheck{}, Proof{}, err
 	}
 	c, standing, _ := rq.Standing()

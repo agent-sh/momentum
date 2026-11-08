@@ -98,7 +98,7 @@ func state(rq *Request) {
 		}
 	case !after && !rq.LastTurn.IsZero():
 		for i := len(rq.Asks) - 1; i >= 0; i-- {
-			if a := rq.Asks[i]; !a.At.After(rq.LastTurn) && !slashCommand(a.Words) { // a harness command is no ask
+			if a := rq.Asks[i]; !a.At.After(rq.LastTurn) && !harnessOnly(a.Words) { // a harness command is no ask, but /goal with words
 				if a.Words != "" {
 					rq.Open = "the last turn has no reply recorded: " + a.Words
 				} else {

@@ -245,7 +245,7 @@ func fill(u sets, reqs map[string]*Request, t *thread) {
 		if tn.at.After(rq.LastTurn) {
 			rq.LastTurn = tn.at
 		}
-		if tn.owner && !tn.program && tn.own != "" && !slashCommand(tn.own) && tn.at.After(rq.LastOwnerTurn) {
+		if tn.owner && !tn.program && tn.own != "" && !harnessOnly(tn.own) && tn.at.After(rq.LastOwnerTurn) {
 			rq.LastOwnerTurn = tn.at // his own ask: what reopens his check; a paste with no words of his asks nothing
 		}
 		if th := thread(rq); th != nil && tn.at.After(th.turn) {
@@ -303,6 +303,16 @@ func slashCommand(words string) bool {
 	name, _, _ := strings.Cut(w[1:], " ")
 	name, _, _ = strings.Cut(name, "\n")
 	return harnessCommands[strings.ToLower(name)]
+}
+
+// harnessOnly reports a harness command that asks the agent nothing: every one but /goal with words, which sets the
+// goal the agent works to, an ask. A check's proof refuses both (slashCommand).
+func harnessOnly(words string) bool {
+	if !slashCommand(words) {
+		return false
+	}
+	f := strings.Fields(words)
+	return !(strings.EqualFold(f[0], "/goal") && len(f) > 1)
 }
 
 // fold orders what a request holds: a turn a fork carried over counts once, a result once by its key, a file once,

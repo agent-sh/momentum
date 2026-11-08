@@ -179,3 +179,40 @@ func TestTheOwnersChecksAreFoundByTheirIndex(t *testing.T) {
 		t.Fatalf("plan: %s", p)
 	}
 }
+
+// A store whose checks table is the first draft's (no words, no undo's turn time or words) gains those columns at
+// its next writable open and keeps its rows, which keep no words; the read-only open refuses it until then.
+func TestAFirstDraftChecksTableIsUpgraded(t *testing.T) {
+	ctx := context.Background()
+	st, path := open(t)
+	st.Close()
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{`DROP TABLE request_owner_checks`, `CREATE TABLE request_owner_checks (id INTEGER PRIMARY KEY, request TEXT NOT NULL,
+	  result TEXT NOT NULL, result_at INTEGER NOT NULL, proof TEXT NOT NULL, proof_at INTEGER NOT NULL, at INTEGER NOT NULL,
+	  undone INTEGER NOT NULL DEFAULT 0, undo_proof TEXT NOT NULL DEFAULT '')`,
+		`CREATE INDEX request_owner_checks_request ON request_owner_checks(request)`,
+		`INSERT INTO request_owner_checks (request, result, result_at, proof, proof_at, at) VALUES ('rabc12345678', 'commit:1a2b3c4', 900, 'e1', 1000, 1100)`} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+	if _, err := OpenReadOnly(path); !errors.Is(err, ErrNotCurrent) {
+		t.Fatalf("a store with the first draft's table read as current: %v", err)
+	}
+	if st, err = Open(path); err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	checks, err := st.RequestChecks(ctx, []string{"rabc12345678"}, nil, 4)
+	if err != nil || len(checks) != 1 || checks[0].Proof != "e1" || checks[0].Words != "" || !checks[0].Undo.ProofAt.IsZero() {
+		t.Fatalf("the first draft's check: %+v %v", checks, err)
+	}
+	if ok, err := st.CheckOnce(ctx, RequestCheck{Request: "rabc12345678", Result: "commit:1a2b3c4", ResultAt: time.UnixMilli(900), Proof: "e2",
+		ProofAt: time.UnixMilli(2000), Words: "looks good to me", At: time.UnixMilli(2100)}, nil); err != nil || !ok {
+		t.Fatalf("a check on the upgraded table: %v %v", ok, err)
+	}
+}

@@ -61,6 +61,15 @@ func (c *checkEvents) commit(session string, at time.Time, hash, subject string)
 	c.put(call, res)
 }
 
+func (c *checkEvents) push(session string, at time.Time, old, new string) {
+	id := fmt.Sprintf("p%d", c.n)
+	call := c.ev(session, "tool_call", store.ActorAgent, at, `{"command":"git push origin main"}`, `{"tool_id":"`+id+`"}`)
+	res := c.ev(session, "tool_result", store.ActorTool, at.Add(time.Second), "To github.com:example/cli.git\n   "+old+".."+new+"  main -> main\n",
+		`{"tool_id":"`+id+`"}`)
+	call.Tool, res.Tool = "Bash", "Bash"
+	c.put(call, res)
+}
+
 func (c *checkEvents) write(session string, at time.Time, path string) {
 	id := fmt.Sprintf("w%d", c.n)
 	call := c.ev(session, "tool_call", store.ActorAgent, at, `{"file_path":"`+path+`","content":"x"}`, `{"tool_id":"`+id+`"}`)
@@ -147,7 +156,7 @@ func handoffText(t *testing.T, id string) string {
 	return strings.Join(strings.Fields(handoffOf(t, id)), " ")
 }
 
-// An agent's check with no proof, or one too short to be a verdict of his, is refused and records nothing.
+// An agent's check with no proof is refused and records nothing; so is an undo on fewer than 3 words.
 func TestACheckWithNoProofIsRefused(t *testing.T) {
 	checkable(t)
 	for _, args := range [][]string{
@@ -160,62 +169,121 @@ func TestACheckWithNoProofIsRefused(t *testing.T) {
 			t.Errorf("%q: exit %d %s", args, code, errOut)
 		}
 	}
-	if code, _, errOut := momentum("request", "check", "s-cli", "--proof", "rename is"); code != 2 || !strings.Contains(errOut, "fewer than 3 words") {
-		t.Errorf("two words: exit %d %s", code, errOut)
+	if code, _, errOut := momentum("request", "uncheck", "s-cli", "--proof", "undo it"); code != 2 || !strings.Contains(errOut, "fewer than 3 words") {
+		t.Errorf("an undo on two words: exit %d %s", code, errOut)
 	}
 	if got := listOne(t); got.State == "checked" || got.Checked != nil {
 		t.Fatalf("a refused check was recorded: %+v", got)
 	}
 }
 
-// A proof must be a whole turn of his, after the result the check binds, that asks nothing and names no check
-// command or request id. A fragment, a program's turn, a harness command, a turn from before the result, a
-// question, an instruction, the body of a handoff he pasted, and words no turn is are each refused with why, and
-// record nothing.
+// A check needs his verdict: his whole turn, after the result, that holds a verdict phrase no negation near it takes
+// back, with no question mark and no instruction about a check, or, under 3 words, is a verdict phrase alone. Each
+// turn here is his last after the commit, and each is refused with why; nothing is recorded.
+func TestACheckNeedsHisVerdict(t *testing.T) {
+	for _, row := range []struct{ turn, why string }{
+		{"now update the changelog", "say no verdict"},
+		{"check the momentum request for the rename", "say no verdict"},
+		{"did you run the tests? fix them if not", "ask a question"},
+		{"Rebase onto current origin/main, run the tests on the dev desk, then update the PR body and tell me when CI is green.", "say no verdict"},
+		{"ok", "say no verdict"},
+		{"yes", "say no verdict"},
+		{"go ahead", "say no verdict"},
+		{"continue", "say no verdict"},
+		{"done", "say no verdict"},
+		{"lgtm thanks", "say no verdict"}, // under 3 words, a verdict phrase alone
+		{"not checked yet, the docs are next", "take back what they say"},
+		{"the rename isn't approved", "take back what they say"},
+		{"no, ship it after the docs land", "take back what they say"},
+		{"don't ship it yet please", "take back what they say"},
+		{"the docs couldn't be approved today", "take back what they say"}, // a word that ends in n't
+		{"the rename is still unchecked", "say no verdict"},                // a phrase on word boundaries only
+		{`you said "it looks good?"`, "ask a question"},                    // a question mark before a closing quote
+		{"checked, relay it with --proof", "an instruction about a check"}, // the flag named
+		{"looks good, run momentum request check on it", "an instruction about a check"},
+	} {
+		t.Run(row.turn, func(t *testing.T) {
+			c, _ := checkable(t)
+			c.owner("s-cli-0001", c.at(6), row.turn)
+			c.idle("s-cli-0001", c.at(7))
+			code, _, errOut := momentum("request", "check", "s-cli", "--proof", row.turn)
+			if code != 2 || !strings.Contains(errOut, "not recorded") || !strings.Contains(errOut, row.why) {
+				t.Fatalf("exit %d %s", code, errOut)
+			}
+			if got := listOne(t); got.State == "checked" || got.Checked != nil {
+				t.Fatalf("recorded: %+v", got)
+			}
+		})
+	}
+	// an instruction that names this request's own id
+	c, _ := checkable(t)
+	id := listOne(t).ID
+	turn := "looks good, close request " + id
+	c.owner("s-cli-0001", c.at(6), turn)
+	if code, _, errOut := momentum("request", "check", "s-cli", "--proof", turn); code != 2 || !strings.Contains(errOut, "an instruction about a check") {
+		t.Fatalf("a turn naming the id: exit %d %s", code, errOut)
+	}
+}
+
+// A verdict of his records the check: a verdict phrase alone, in any case, or a turn that holds one.
+func TestHisVerdictRecordsTheCheck(t *testing.T) {
+	for _, turn := range []string{"approved", "lgtm", "LGTM!", "ship it", "Looks good.", "looks good, ship it", "all good, merge it when CI is green"} {
+		t.Run(turn, func(t *testing.T) {
+			c, _ := checkable(t)
+			e := c.owner("s-cli-0001", c.at(6), turn)
+			c.idle("s-cli-0001", c.at(7))
+			if code, out, errOut := momentum("request", "check", "s-cli", "--proof", turn); code != 0 || !strings.Contains(out, "ev:"+e.ID()) {
+				t.Fatalf("exit %d %q %s", code, out, errOut)
+			}
+			if got := listOne(t); got.State != "checked" || got.Checked == nil || got.Checked.Words != turn {
+				t.Fatalf("list: %+v", got)
+			}
+		})
+	}
+}
+
+// A proof must be a whole turn of his after the result the check binds. A fragment, a program's turn, a harness
+// command, a turn from before the result, his words in another case, the body of a handoff he pasted, and words no
+// turn is are each refused with why, and record nothing.
 func TestAProofOutsideHisVerdictIsRefused(t *testing.T) {
 	c, _ := checkable(t)
 	id := listOne(t).ID
 	h := handoffText(t, id)
 	opening := request.Line(id) + " - a handoff of the owner request"
 	other := request.Line(request.ID(c.at(0).Add(-time.Hour), "an older ask"))
+	c.owner("s-cli-0001", c.at(0).Add(10*time.Second), "the plan looks right, start")
 	// momentum's own message, and the same words typed into two sessions 300 ms apart (a program sent them)
-	c.owner("s-cli-0001", c.at(6), supervise.Marker+" the owner said ship the renamed flag now")
+	c.owner("s-cli-0001", c.at(6), supervise.Marker+" the owner said ship it now")
 	twin := c.at(7)
-	c.owner("s-cli-0001", twin, "please merge the renamed flag today")
-	c.owner("s-other-0001", twin.Add(300*time.Millisecond), "please merge the renamed flag today")
-	c.owner("s-cli-0001", c.at(8), "/compact keep the rename notes")
-	c.owner("s-cli-0001", c.at(9), "is the rename pushed to origin yet?")
-	c.owner("s-cli-0001", c.at(10), "check request "+id+" and tell me where it stands")
-	c.owner("s-cli-0001", c.at(11), "run momentum request check on the rename")
+	c.owner("s-cli-0001", twin, "please merge, it all looks good today")
+	c.owner("s-other-0001", twin.Add(300*time.Millisecond), "please merge, it all looks good today")
+	c.owner("s-cli-0001", c.at(8), "/compact looks good")
+	c.owner("s-cli-0001", c.at(9), "/goal ship it once the docs land")
 	// his pastes of the handoff: its opening line and body with no closing line, its body and closing line with no
 	// opening line, and two handoffs in one turn, the second after the first's closing line
-	c.owner("s-cli-0001", c.at(12), opening+" the flag rename is shipped and fine")
-	c.owner("s-cli-0001", c.at(13), "the flag rename is done and fine. "+request.Line(id)[:0]+"To continue it in another session, paste all of this there: its first and last lines link that session to the request. "+request.Line(id))
-	c.owner("s-cli-0001", c.at(14), h+" "+other+" - a handoff of the owner request the docs rename is fine too. To continue it in another session, paste all of this there: its first and last lines link that session to the request. "+other)
+	c.owner("s-cli-0001", c.at(12), opening+" the flag rename is shipped and looks good")
+	c.owner("s-cli-0001", c.at(13), "the flag rename looks good and is done. To continue it in another session, paste all of this there: its first and last lines link that session to the request. "+request.Line(id))
+	c.owner("s-cli-0001", c.at(14), h+" "+other+" - a handoff of the owner request the docs rename looks good too. To continue it in another session, paste all of this there: its first and last lines link that session to the request. "+other)
 	c.idle("s-cli-0001", c.at(15))
 	for _, row := range []struct{ proof, why string }{
-		{"rename the flag to --dry-run", "is not after the result a check binds"},
-		{supervise.Marker + " the owner said ship the renamed flag now", "only a turn a program typed is these words"},
-		{"please merge the renamed flag today", "only a turn a program typed is these words"},
-		{"/compact keep the rename notes", "only a harness command of his is these words"},
-		{"is the rename pushed to origin yet?", "it asks a question"},
-		{"check request " + id + " and tell me where it stands", "names the check command or a request's id"},
-		{"run momentum request check on the rename", "names the check command or a request's id"},
-		{"The rename is good", "is these words whole"},                    // a fragment of his turn
-		{"is the rename pushed", "is these words whole"},                  // a fragment of his question
-		{"check request " + id, "is these words whole"},                   // a fragment of his instruction
-		{"looks right to me. the rename is good", "is these words whole"}, // his words are case-sensitive
-		{"the flag rename is shipped and fine", "is these words whole"},   // a handoff's body after its lone opening line
-		{"the flag rename is done and fine.", "is these words whole"},     // a handoff's body before its lone closing line
-		{"the docs rename is fine too.", "is these words whole"},          // the body of a second handoff in his turn
+		{"the plan looks right, start", "is not after the result a check binds"},
+		{supervise.Marker + " the owner said ship it now", "only a turn a program typed is these words"},
+		{"please merge, it all looks good today", "only a turn a program typed is these words"},
+		{"/compact looks good", "only a harness command of his is these words"},
+		{"/goal ship it once the docs land", "only a harness command of his is these words"}, // an ask, and no proof
+		{"Looks right to me.", "is these words whole"},                                       // a fragment of his turn
+		{"looks right to me. the rename is good", "is these words whole"},                    // his words are case-sensitive
+		{"the flag rename is shipped and looks good", "is these words whole"},                // a handoff's body after its lone opening line
+		{"the flag rename looks good and is done.", "is these words whole"},                  // a handoff's body before its lone closing line
+		{"the docs rename looks good too.", "is these words whole"},                          // the body of a second handoff in his turn
 	} {
 		code, _, errOut := momentum("request", "check", "s-cli", "--proof", row.proof)
 		if code != 2 || !strings.Contains(errOut, "not recorded") || !strings.Contains(errOut, row.why) {
 			t.Errorf("proof %q: exit %d %s", row.proof, code, errOut)
 		}
 	}
-	// a proof no turn is says how far the store reaches, and never that he did not say it
-	if _, _, errOut := momentum("request", "check", "s-cli", "--proof", "the rename is right"); !strings.Contains(errOut, "the store has read no transcripts yet") ||
+	// a proof no turn is, with no ingest to run first, says how far the store reaches, and never that he did not say it
+	if _, _, errOut := momentum("request", "check", "s-cli", "--proof", "the rename is approved now"); !strings.Contains(errOut, "the store has read no transcripts yet") ||
 		!strings.Contains(errOut, "retry after the next ingest") {
 		t.Errorf("no turn: %s", errOut)
 	}
@@ -307,23 +375,25 @@ func TestUncheckTakesTheSameProof(t *testing.T) {
 			t.Errorf("uncheck on %q: exit %d %s", row.proof, code, errOut)
 		}
 	}
-	later := c.owner("s-cli-0001", c.at(7), "undo my check")
+	// a turn that undoes it and holds a verdict phrase all the same, so only the undo's bound refuses a check on it
+	const undo = "undo my check, the build is verified only on linux"
+	later := c.owner("s-cli-0001", c.at(7), undo)
 	c.idle("s-cli-0001", c.at(8))
 	id := listOne(t).ID
 	if h := handoffOf(t, id); !strings.Contains(h, "is reopened by an ask of the owner's after it") {
 		t.Fatalf("his later turn does not reopen it:\n%s", h)
 	}
-	code, out, errOut := momentum("request", "uncheck", "s-cli", "--proof", "undo my check")
-	if code != 0 || !strings.Contains(out, "undid the check") || !strings.Contains(out, "ev:"+later.ID()) || !strings.Contains(out, `relayed as "undo my check"`) {
+	code, out, errOut := momentum("request", "uncheck", "s-cli", "--proof", undo)
+	if code != 0 || !strings.Contains(out, "undid the check") || !strings.Contains(out, "ev:"+later.ID()) || !strings.Contains(out, `relayed as "`+undo+`"`) {
 		t.Fatalf("uncheck: exit %d %q %s", code, out, errOut)
 	}
 	if h := handoffOf(t, id); strings.Contains(h, "State: checked") || strings.Contains(h, "is reopened") {
 		t.Fatalf("after the undo:\n%s", h)
 	}
-	if code, _, errOut := momentum("request", "check", "s-cli", "--proof", "undo my check"); code != 2 || !strings.Contains(errOut, "that undid his last check") {
+	if code, _, errOut := momentum("request", "check", "s-cli", "--proof", undo); code != 2 || !strings.Contains(errOut, "that undid his last check") {
 		t.Fatalf("a check on the turn that undid it: exit %d %s", code, errOut)
 	}
-	if code, _, errOut := momentum("request", "uncheck", "s-cli", "--proof", "undo my check"); code != 2 || !strings.Contains(errOut, "no check to undo") {
+	if code, _, errOut := momentum("request", "uncheck", "s-cli", "--proof", undo); code != 2 || !strings.Contains(errOut, "no check to undo") {
 		t.Fatalf("uncheck with none standing: exit %d %s", code, errOut)
 	}
 }
@@ -336,10 +406,10 @@ func TestACheckOfAReplyStands(t *testing.T) {
 	c := &checkEvents{t: t, base: time.Now().Add(-2 * time.Hour).Truncate(time.Millisecond)}
 	c.owner("s-q-0001", c.at(0), "why is the build slow")
 	c.reply("s-q-0001", c.at(1), "The cache is cold.")
-	c.owner("s-q-0001", c.at(2), "That explains it, thanks")
+	c.owner("s-q-0001", c.at(2), "That explains it, all good")
 	c.reply("s-q-0001", c.at(3), "Glad it helps.")
 	c.idle("s-q-0001", c.at(4))
-	if code, out, errOut := momentum("request", "check", "s-q", "--proof", "That explains it, thanks"); code != 0 {
+	if code, out, errOut := momentum("request", "check", "s-q", "--proof", "That explains it, all good"); code != 0 {
 		t.Fatalf("check: exit %d %q %s", code, out, errOut)
 	}
 	reply := "the agent's reply of " + c.at(1).Local().Format("2006-01-02 15:04")
@@ -358,9 +428,9 @@ func TestACheckOfAReplyStands(t *testing.T) {
 	}
 }
 
-// Only his own later ask, or a newer artifact a check would bind over the checked one, reopens his check: a brief
-// or a program's turn that pastes the handoff, his paste with no words of his (whole, cut at either end, or two in
-// one turn), a harness command, a reply or a file written after a commit do not.
+// His later ask, /goal with words, and any artifact after his verdict reopen his check, but for a push of the
+// checked commit; a brief or a program's turn that pastes the handoff, his paste with no words of his (whole, cut at
+// either end, or two in one turn), a harness command and a reply do not.
 func TestOnlyHisLaterAskReopensTheCheck(t *testing.T) {
 	other := func(c *checkEvents) string { return request.Line(request.ID(c.at(0).Add(-time.Hour), "an older ask")) }
 	const last = "To continue it in another session, paste all of this there: its first and last lines link that session to the request. "
@@ -373,8 +443,16 @@ func TestOnlyHisLaterAskReopensTheCheck(t *testing.T) {
 	}{
 		{"his later ask", func(c *checkEvents, _, _ string) { c.owner("s-cli-0001", c.at(8), "now rename the env var as well") },
 			"open", "is reopened by an ask of the owner's after it", ""},
+		{"/goal with words", func(c *checkEvents, _, _ string) { c.owner("s-cli-0001", c.at(8), "/goal finish the rename") },
+			"open", "is reopened by an ask of the owner's after it", ""},
 		{"a newer commit", func(c *checkEvents, _, _ string) { c.commit("s-cli-0001", c.at(8), "5c6d7e8", "Rename the env var") },
 			"ready", "is reopened by a newer result, commit 5c6d7e8", ""},
+		{"a file written after his turn", func(c *checkEvents, _, _ string) { c.write("s-cli-0001", c.at(8), "/work/cli/CHANGES.md") },
+			"ready", "is reopened by a newer result, /work/cli/CHANGES.md", ""},
+		{"a push of another commit", func(c *checkEvents, _, _ string) { c.push("s-cli-0001", c.at(8), "4b5c6d7", "6d7e8f9") },
+			"ready", "is reopened by a newer result, pushed main -> main (4b5c6d7..6d7e8f9)", ""},
+		{"a push of the checked commit", func(c *checkEvents, _, _ string) { c.push("s-cli-0001", c.at(8), "1a2b3c4", "4b5c6d7e9") }, // a longer abbreviation
+			"checked", "", ""},
 		{"a brief that pastes the handoff", func(c *checkEvents, _, h string) {
 			c.put(c.ev("s-brief-0001", "agent_text", store.ActorAgent, c.at(8), h, `{"why":"agent cwd"}`))
 			c.idle("s-brief-0001", c.at(9))
@@ -401,9 +479,8 @@ func TestOnlyHisLaterAskReopensTheCheck(t *testing.T) {
 			c.idle("s-two-0001", c.at(9))
 		}, "checked", "", "s-two-0001"},
 		{"a harness command", func(c *checkEvents, _, _ string) { c.owner("s-cli-0001", c.at(8), "/compact") }, "checked", "", ""},
-		{"a harness command with words", func(c *checkEvents, _, _ string) { c.owner("s-cli-0001", c.at(8), "/goal finish the rename") }, "checked", "", ""},
+		{"a new harness command", func(c *checkEvents, _, _ string) { c.owner("s-cli-0001", c.at(8), "/rules") }, "checked", "", ""},
 		{"a reply", func(c *checkEvents, _, _ string) { c.reply("s-cli-0001", c.at(8), "Anything else?") }, "checked", "", ""},
-		{"a file written after it", func(c *checkEvents, _, _ string) { c.write("s-cli-0001", c.at(8), "/work/cli/CHANGES.md") }, "checked", "", ""},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			c, _ := checked(t)
@@ -420,12 +497,10 @@ func TestOnlyHisLaterAskReopensTheCheck(t *testing.T) {
 	}
 }
 
-// A check reads what is new in the transcripts first, as the ingest timer does: his turn the store did not hold yet
-// proves it. Words no turn is say how far the store reaches.
-func TestACheckReadsHisNewestTurnInFirst(t *testing.T) {
-	if _, err := exec.LookPath("scrump"); err != nil {
-		t.Skip("needs scrump with its text profile")
-	}
+// transcriptHome makes a Claude Code home with one synthetic session (his ask and the agent's reply) and the
+// transcripts source in sources.json, and ingests it; it returns the transcript's path and its line maker.
+func transcriptHome(t *testing.T) (string, func(time.Duration, string) string) {
+	t.Helper()
 	home, cfg, user := t.TempDir(), t.TempDir(), t.TempDir()
 	t.Setenv("MOMENTUM_HOME", home)
 	t.Setenv("MOMENTUM_CONFIG", cfg)
@@ -452,20 +527,104 @@ func TestACheckReadsHisNewestTurnInFirst(t *testing.T) {
 	if code, out, errOut := momentum("evidence", "ingest"); code != 0 {
 		t.Fatalf("ingest: exit %d %s %s", code, out, errOut)
 	}
-	// his verdict, after the last ingest
+	return path, line
+}
+
+// appendLine appends a record to a transcript.
+func appendLine(t *testing.T, path, line string) {
+	t.Helper()
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.WriteString(line(time.Minute, `"type":"user","uuid":"u2","promptSource":"typed","origin":{"kind":"human"},"message":{"role":"user","content":"That explains it, thanks"}`)); err != nil {
+	defer f.Close()
+	if _, err := f.WriteString(line); err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
-	if code, _, errOut := momentum("request", "check", "7a1b2c3d", "--proof", "the build is fast now"); code != 2 ||
-		!strings.Contains(errOut, "the store holds the transcripts as read up to") || !strings.Contains(errOut, "retry after the next ingest") {
+}
+
+const verdictLine = `"type":"user","uuid":"u2","promptSource":"typed","origin":{"kind":"human"},"message":{"role":"user","content":"That explains it, all good"}`
+
+// A check reads what is new in the transcripts first, as the ingest timer does: his turn the store did not hold yet
+// proves it. Once that ingest ran, words no turn is say the store is current and holds only his typed words, with no
+// retry to wait for.
+func TestACheckReadsHisNewestTurnInFirst(t *testing.T) {
+	if _, err := exec.LookPath("scrump"); err != nil {
+		t.Skip("needs scrump with its text profile")
+	}
+	path, line := transcriptHome(t)
+	appendLine(t, path, line(time.Minute, verdictLine)) // his verdict, after the last ingest
+	if code, _, errOut := momentum("request", "check", "7a1b2c3d", "--proof", "the build is all good now"); code != 2 ||
+		!strings.Contains(errOut, "the store is current") || !strings.Contains(errOut, "only his typed words") ||
+		!strings.Contains(errOut, "cut at its first 2000 bytes") || strings.Contains(errOut, "retry") {
 		t.Fatalf("words no turn is: exit %d %s", code, errOut)
 	}
-	if code, out, errOut := momentum("request", "check", "7a1b2c3d", "--proof", "That explains it, thanks"); code != 0 || !strings.Contains(out, "checked ") {
+	if code, out, errOut := momentum("request", "check", "7a1b2c3d", "--proof", "That explains it, all good"); code != 0 || !strings.Contains(out, "checked ") {
 		t.Fatalf("check on his turn the store did not hold: exit %d %q %s", code, out, errOut)
+	}
+}
+
+// The ingest a check runs first waits while another holds the ingest lock, and reads his newest turn in once it is
+// free.
+func TestACheckWaitsForAHeldIngest(t *testing.T) {
+	if _, err := exec.LookPath("scrump"); err != nil {
+		t.Skip("needs scrump with its text profile")
+	}
+	path, line := transcriptHome(t)
+	appendLine(t, path, line(time.Minute, verdictLine))
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	unlock, err := st.LockIngest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { time.Sleep(1500 * time.Millisecond); unlock() }()
+	start := time.Now()
+	if code, out, errOut := momentum("request", "check", "7a1b2c3d", "--proof", "That explains it, all good"); code != 0 || !strings.Contains(out, "checked ") {
+		t.Fatalf("check while an ingest held the lock: exit %d %q %s", code, out, errOut)
+	}
+	if waited := time.Since(start); waited < time.Second {
+		t.Fatalf("it did not wait for the lock: %s", waited)
+	}
+}
+
+// The ingest a check runs first is bounded, at 2 minutes: a lock held past the bound ends the wait, and the refusal
+// says the ingest could not run and to retry after the next one.
+func TestTheIngestBeforeACheckIsBounded(t *testing.T) {
+	if catchUpFor != 2*time.Minute {
+		t.Fatalf("the bound is %s", catchUpFor)
+	}
+	checkable(t)
+	cfg := os.Getenv("MOMENTUM_CONFIG")
+	if err := os.WriteFile(filepath.Join(cfg, "sources.json"), []byte(`{"transcripts": {"homes": ["`+t.TempDir()+`"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	unlock, err := st.LockIngest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	catchUpFor = 300 * time.Millisecond
+	t.Cleanup(func() { catchUpFor = 2 * time.Minute })
+	done := make(chan string, 1)
+	go func() {
+		_, _, errOut := momentum("request", "check", "s-cli", "--proof", "the rename is approved now")
+		done <- errOut
+	}()
+	select {
+	case errOut := <-done:
+		if !strings.Contains(errOut, "holds the store for 300ms") || !strings.Contains(errOut, "retry after the next ingest") {
+			t.Fatalf("refusal: %s", errOut)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the ingest's wait was not bounded")
 	}
 }

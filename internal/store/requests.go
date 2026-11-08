@@ -12,13 +12,18 @@ import (
 // the result it binds by its key and its time, the owner's turn an agent relayed (its proof) by the turn's event
 // id and time, and the words relayed, so a wrong relay shows. Nothing derives them and nothing deletes one; an undo
 // is dated and keeps its own proof turn, its time and its words. The table is new under its own name: a build of an
-// earlier draft kept checks with no proof in request_checks, which nothing reads.
+// earlier draft kept checks with no proof in request_checks, which nothing reads. It is made as it was first made;
+// the words and the undo's turn time and words came after (requestColumns), so a store the first build of this table
+// made gains them, and its checks keep no words.
 const requestTables = `
 CREATE TABLE IF NOT EXISTS request_owner_checks (id INTEGER PRIMARY KEY, request TEXT NOT NULL, result TEXT NOT NULL,
-  result_at INTEGER NOT NULL, proof TEXT NOT NULL, proof_at INTEGER NOT NULL, words TEXT NOT NULL, at INTEGER NOT NULL,
-  undone INTEGER NOT NULL DEFAULT 0, undo_proof TEXT NOT NULL DEFAULT '', undo_proof_at INTEGER NOT NULL DEFAULT 0,
-  undo_words TEXT NOT NULL DEFAULT '');
+  result_at INTEGER NOT NULL, proof TEXT NOT NULL, proof_at INTEGER NOT NULL, at INTEGER NOT NULL,
+  undone INTEGER NOT NULL DEFAULT 0, undo_proof TEXT NOT NULL DEFAULT '');
 `
+
+// requestColumns are the columns request_owner_checks gained after it was first made (keptColumns).
+var requestColumns = [][2]string{{"words", "TEXT NOT NULL DEFAULT ''"}, {"undo_proof_at", "INTEGER NOT NULL DEFAULT 0"},
+	{"undo_words", "TEXT NOT NULL DEFAULT ''"}}
 
 var requestTableNames = []string{"request_owner_checks"}
 

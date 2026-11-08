@@ -81,6 +81,9 @@ const (
 	tailChars  = 80
 )
 
+// OwnerTurnBytes is how much of an owner's turn the store keeps: what a check's proof can be matched against.
+const OwnerTurnBytes = ownerChars
+
 // skipWhy are the items not stored, by tacit's reason, with why: Codex's "[Recorded tool history]" message
 // replays calls and results that are already events of their own.
 var skipWhy = map[string]bool{"recorded tool history": true}
