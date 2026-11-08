@@ -29,9 +29,9 @@ func writtenPaths(harness, tool, call, cwd string) []string {
 // reads them.
 var workdirKeys = map[string]bool{"workdir": true, "cwd": true, "working_directory": true, "workingDirectory": true, "dir": true, "directory": true}
 
-// workdirShells are the harnesses whose shell call can name its directory (Codex's and OpenCode's workdir): a call
-// of theirs the store cut before such a field may have named one.
-var workdirShells = map[string]bool{"codex": true, "opencode": true}
+// workdirShells are the harnesses whose shell call can name its directory (Codex's and OpenCode's workdir, Kimi's
+// cwd): a call of theirs the store cut before such a field may have named one.
+var workdirShells = map[string]bool{"codex": true, "opencode": true, "kimi": true}
 
 // shellDir is the directory a shell call runs its command in, as far as the store says, or "" when it does not say:
 // the workdir the call names, when that is a whole path; else the directory its session was in when it made the
@@ -56,9 +56,8 @@ func shellDir(harness, call, cwd string) string {
 // line is the command's first, continued lines joined, up to a comment. Bash reports the last line's status, so
 // the line counts only when nothing visible runs after it (nothingAfter). Of the line, only a command whose
 // success the line's own says is read: the line's last, or one joined to it by && only, with no || before it, and
-// not negated. A relative file is read in dir, or in the directory a cd to a whole path just before it entered (cd
-// DIR && ...); after another cd, a pushd or a popd it is not known, and nor is a file the shell expands (a
-// variable, a command's output, a glob, a leading ~).
+// not negated. A file is cleaned (path.Clean); a relative one is read only in the simple case (simpleDir), and a
+// file the shell expands (a variable, a command's output, a glob, a leading ~) names none.
 func shellWrites(call, dir string) []string {
 	loc := callRe.FindStringSubmatchIndex(call)
 	if loc == nil {
@@ -69,7 +68,7 @@ func shellWrites(call, dir string) []string {
 	if !ok || !nothingAfter(line, closed) {
 		return nil
 	}
-	cmds := shellCommands(line.toks, dir)
+	cmds := shellCommands(line.toks)
 	var out []string
 	for i, c := range cmds {
 		if !reported(cmds[i:]) || slices.ContainsFunc(cmds[:i], func(d shellCmd) bool { return d.after == "||" }) {
@@ -92,13 +91,14 @@ func shellWrites(call, dir string) []string {
 				}
 			}
 		}
+		d := simpleDir(cmds[:i+1], dir)
 		for _, f := range files {
 			switch {
 			case !f.exact || f.word == "":
 			case path.IsAbs(f.word):
-				out = append(out, f.word)
-			case c.dir != "":
-				out = append(out, path.Join(c.dir, f.word))
+				out = append(out, path.Clean(f.word))
+			case d != "" && !f.grouped:
+				out = append(out, path.Join(d, f.word))
 			}
 		}
 	}
@@ -138,10 +138,11 @@ func nothingAfter(line shellFirst, closed bool) bool {
 
 // shellTok is a word of a command line, its quotes off, or one of its operators.
 type shellTok struct {
-	op    string // a separator, a parenthesis or a redirection; "" for a word
-	fd    string // the descriptor a redirection names before it (2 in 2>), "" for none
-	word  string
-	exact bool // a word the shell does not expand
+	op      string // a separator, a parenthesis or a redirection; "" for a word
+	fd      string // the descriptor a redirection names before it (2 in 2>), "" for none
+	word    string
+	exact   bool // a word the shell does not expand
+	grouped bool // a subshell's or a group's parenthesis or brace comes before it on the line
 }
 
 // shellRedir is a redirection of a command: its operator, its descriptor and its target.
@@ -156,20 +157,19 @@ func (r shellRedir) writes() bool {
 	case ">", ">>", ">|":
 		return r.fd == "" || r.fd == "1"
 	case "&>", "&>>":
-		return r.fd == ""
+		return true
 	case ">&": // >&N and >&- copy or close a descriptor; >& FILE writes both outputs there
-		return (r.fd == "" || r.fd == "1") && r.target.word != "-" && strings.Trim(r.target.word, "0123456789") != ""
+		return r.target.word != "-" && strings.Trim(r.target.word, "0123456789") != ""
 	}
 	return false
 }
 
-// shellCmd is a simple command of a line: its words and redirections, the separator after it ("" at the line's
-// end) and the directory it runs in ("" when not known).
+// shellCmd is a simple command of a line: its words and redirections, and the separator after it ("" at the line's
+// end).
 type shellCmd struct {
 	words  []shellTok
 	redirs []shellRedir
 	after  string
-	dir    string
 }
 
 // reported says the line's success says the first of rest, a command and the ones after it, succeeded: every
@@ -186,75 +186,56 @@ func reported(rest []shellCmd) bool {
 	return false
 }
 
-// shellCommands groups a line's tokens into its simple commands, each with the directory it runs in: dir, then the
-// one a cd to a whole path enters for the commands joined to it by && (and a pipe on from them); another cd, a
-// pushd or a popd leaves it unknown. A subshell's (parentheses) directory ends with its last command; the
-// parentheses are no separator.
-func shellCommands(toks []shellTok, dir string) []shellCmd {
-	type state struct {
-		dir     string
-		chained bool // dir is a cd's, which the commands since it held by &&
-	}
-	at := state{dir: dir}
-	var stack []state
-	pops := 0 // the subshells that close on the command in progress
-	pop := func() {
-		if len(stack) > 0 {
-			at, stack = stack[len(stack)-1], stack[:len(stack)-1]
+// simpleDir is the directory the last of cmds, a line's commands up to one, reads its relative files in, in the
+// simple case only: dir, when no command up to it changes directory, or the whole path a single leading cd enters
+// (cd DIR && ...), when every command from it to that one is joined by && or a pipe. Any other cd, pushd or popd
+// leaves it unknown ("").
+func simpleDir(cmds []shellCmd, dir string) string {
+	for k, c := range cmds {
+		prog, args := program(c.words)
+		if prog != "cd" && prog != "pushd" && prog != "popd" {
+			continue
 		}
+		if k != 0 || k == len(cmds)-1 || prog != "cd" || len(args) != 1 || !args[0].exact || !path.IsAbs(args[0].word) || c.after != "&&" {
+			return ""
+		}
+		for _, d := range cmds[1 : len(cmds)-1] {
+			if d.after != "&&" && d.after != "|" && d.after != "|&" {
+				return ""
+			}
+		}
+		dir = args[0].word
 	}
+	return dir
+}
+
+// shellCommands groups a line's tokens into its simple commands. Parentheses are no separator; each word after a
+// parenthesis or a brace on the line is marked grouped.
+func shellCommands(toks []shellTok) []shellCmd {
 	var out []shellCmd
 	var cur shellCmd
-	begun := false
-	begin := func() {
-		if !begun {
-			cur.dir, begun = at.dir, true
-		}
-	}
+	begun, grouped := false, false
 	finish := func(after string) {
-		if !begun {
-			return
-		}
-		cur.after = after
-		out = append(out, cur)
-		prog, args := program(cur.words)
-		switch prog {
-		case "cd":
-			if len(args) == 1 && args[0].exact && path.IsAbs(args[0].word) && after == "&&" {
-				at = state{dir: args[0].word, chained: true}
-			} else {
-				at = state{}
-			}
-		case "pushd", "popd":
-			at = state{}
-		default:
-			if at.chained && after != "&&" && after != "|" && after != "|&" {
-				at = state{}
-			}
-		}
-		for ; pops > 0; pops-- {
-			pop()
+		if begun {
+			cur.after = after
+			out = append(out, cur)
 		}
 		cur, begun = shellCmd{}, false
 	}
 	for k := 0; k < len(toks); k++ {
 		switch t := toks[k]; {
 		case t.op == "":
-			begin()
+			grouped = grouped || t.word == "{" || t.word == "}"
+			t.grouped, begun = grouped, true
 			cur.words = append(cur.words, t)
-		case t.op == "(":
-			stack = append(stack, at)
-		case t.op == ")":
-			if begun {
-				pops++
-			} else {
-				pop()
-			}
+		case t.op == "(" || t.op == ")":
+			grouped = true
 		case strings.ContainsAny(t.op, "<>"):
-			begin()
+			begun = true
 			r := shellRedir{op: t.op, fd: t.fd}
 			if k+1 < len(toks) && toks[k+1].op == "" {
 				r.target = toks[k+1]
+				r.target.grouped = grouped
 				k++
 			}
 			cur.redirs = append(cur.redirs, r)
@@ -295,9 +276,6 @@ func program(words []shellTok) (string, []shellTok) {
 // shellOps are the shell's operators, the longest first.
 var shellOps = []string{"&>>", "<<<", "<<-", "&&", "||", "|&", "&>", ">>", ">|", ">&", "<<", "<>", "<&", ";;", ";", "&", "|", "(", ")", ">", "<"}
 
-// openers are the words after which the next word still opens a command: a test or an arithmetic may follow them.
-var openers = map[string]bool{"time": true, "!": true, "if": true, "then": true, "else": true, "elif": true, "do": true, "while": true, "until": true}
-
 // shellFirst is a command's first line as the shell splits it: its words and operators, and the text after it.
 type shellFirst struct {
 	toks  []shellTok
@@ -333,7 +311,7 @@ func shellLine(cmd string) (shellFirst, bool) {
 			fallthrough
 		case c == '\n':
 			return shellFirst{toks: toks, rest: cmd[i+1:], ended: true}, true
-		case start && strings.HasPrefix(cmd[i:], "(("):
+		case strings.HasPrefix(cmd[i:], "(("):
 			toks = append(toks, shellTok{word: "(("})
 			if i = closing(cmd, i+2, 2); i < 0 {
 				return shellFirst{toks: toks}, true
@@ -374,7 +352,7 @@ func shellLine(cmd string) (shellFirst, bool) {
 			toks, i, start = append(toks, shellTok{word: "[["}), j+k+2, false
 			continue
 		}
-		toks, i, start = append(toks, w), j, w.exact && openers[w.word]
+		toks, i, start = append(toks, w), j, w.exact && w.word == "time" // time runs the command after it
 	}
 }
 

@@ -528,6 +528,18 @@ func TestAReadOfAFileItsSessionThenCreatesIsNoFailure(t *testing.T) {
 				as("a1", f.readMissing("s2", "/w/out/c.md", t0)), as("a2", f.wrote("s2", "/w/out/c.md", t0.Add(time.Minute))),
 				as("a3", f.readMissing("s3", "/w/out/d.md", t0)), as("a3", f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute))))
 		}, []string{missing + " 3"}},
+		{"the parent writes its subagent's read", func(f *fileTools) []store.Event {
+			as := func(agent string, evs []store.Event) []store.Event {
+				for i := range evs {
+					evs[i].Agent = agent
+				}
+				return evs
+			}
+			return slices.Concat(as("a1", f.readMissing("s1", "/w/out/a.md", t0)), f.wrote("s1", "/w/out/a.md", t0.Add(time.Minute)),
+				as("a1", f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour))), f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
+				as("a1", f.readMissing("s2", "/w/out/c.md", t0)), f.wrote("s2", "/w/out/c.md", t0.Add(time.Minute)),
+				as("a3", f.readMissing("s3", "/w/out/d.md", t0)), as("a3", f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute))))
+		}, []string{missing + " 3"}},
 		{"another session writes it", func(f *fileTools) []store.Event {
 			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)),
 				f.readMissing("s2", "/w/out/c.md", t0.Add(2*time.Hour)),
@@ -660,10 +672,10 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 }
 
 // shellCall is a Bash call of Kimi's and its result as the store keeps them, in cwd: the input JSON with > escaped,
-// cut to 240 bytes and marked so. An input that is already JSON is kept as it is.
+// cut to 240 bytes and marked so. An input that is already JSON (it opens with {") is kept as it is.
 func shellCall(f *fileTools, session, cwd, command string, failed bool, at time.Time) []store.Event {
 	in := command
-	if !strings.HasPrefix(command, "{") {
+	if !strings.HasPrefix(command, `{"`) {
 		b, _ := json.Marshal(map[string]string{"command": command})
 		if len(b) > 240 {
 			b = append(b[:240], "…"...)
@@ -697,9 +709,9 @@ func TestAShellLineWritesWhatItsCommandReports(t *testing.T) {
 		{"after the here-document's word, quoted", "", x, `cat <<'EOF' > "/w/out/x.jsonl"` + body, false, true},
 		{"single quotes", "", x, "cat > '/w/out/x.jsonl'", false, true},
 		{"an escaped letter", "", x, `cat > /w/out/x\.jsonl`, false, true},
-		{"in the call's directory", "/w/out", x, "cat >> x.jsonl <<'EOF'" + body, false, true},
+		{"in the call's directory", "/w/out", x, "cat >> x.jsonl <<'EOF'\n{\"id\":1}\nEOF", false, true},
 		{"in the directory the line enters", "/w", x, "cd /w/out && cat > x.jsonl", false, true},
-		{"after a subshell's own cd", "/w/out", x, "(cd /w/elsewhere && make) && cat > x.jsonl", false, true},
+		{"after a subshell's own cd", "/w/out", x, "(cd /w/elsewhere && make) && cat > x.jsonl", false, false},
 		{"stdout by its number", "", x, "python3 gen.py 1> /w/out/x.jsonl", false, true},
 		{"noclobber's >|", "", x, "python3 gen.py >| /w/out/x.jsonl", false, true},
 		{"both outputs, &>", "", x, "python3 gen.py &> /w/out/x.jsonl", false, true},
@@ -722,7 +734,11 @@ func TestAShellLineWritesWhatItsCommandReports(t *testing.T) {
 		{"a here-document whose end is indented", "", x, "cat > /w/out/x.jsonl <<-EOF\n\t{\"id\":1}\n\tEOF", false, true},
 		{"two here-documents", "", x, "cat > /w/out/x.jsonl <<A 3<<B\na\nA\nb\nB", false, true},
 		{"a comment, then nothing", "", x, "python3 gen.py > /w/out/x.jsonl # done\n", false, true},
-		{"after a subshell that only enters a directory", "/w/out", x, "(cd /w/elsewhere) && echo a > x.jsonl", false, true},
+		{"after a subshell that only enters a directory", "/w/out", x, "(cd /w/elsewhere) && echo a > x.jsonl", false, false},
+		{"an absolute target, cleaned", "", x, "cat > /w/out//x.jsonl", false, true},
+		{"a blank line after the here-document", "", x, "cat > /w/out/x.jsonl <<'EOF'\n{\"id\":1}\nEOF\n   \n", false, true},
+		{"tee after |& in the directory the line enters", "/w", x, "cd /w/out && python3 gen.py |& tee x.jsonl", false, true},
+		{"[[ as an argument", "", x, "echo [[ > /w/out/x.jsonl", false, true},
 		{"tee in the directory the line enters", "/w", x, "cd /w/out && python3 gen.py | tee x.jsonl", false, true},
 		{"quoted digits before >", "", x, "echo a '2'> /w/out/x.jsonl", false, true},
 		{"an escaped $ in double quotes", "", "/w/out/$x.jsonl", `cat > "/w/out/\$x.jsonl"`, false, true},
@@ -744,7 +760,7 @@ func TestAShellLineWritesWhatItsCommandReports(t *testing.T) {
 		{"a descriptor closed", "/w/out", "/w/out/-", "python3 gen.py >&-", false, false},
 		{"a process substitution", "", x, "python3 gen.py > >(cat > /w/out/x.jsonl)", false, false},
 		{"a test's comparison", "", x, "[[ a > /w/out/x.jsonl ]] && echo y", false, false},
-		{"an arithmetic's comparison", "/w/out", "/w/out/0", "(( n > 0 )) && echo y", false, false},
+		{"an arithmetic's comparison", "/w/out", x, "(( n > /w/out/x.jsonl )) && echo y", false, false},
 		{"a command after it", "", x, "cat > /w/out/x.jsonl <<'EOF'; true" + body, false, false},
 		{"piped on", "", x, "python3 gen.py > /w/out/x.jsonl | cat", false, false},
 		{"in the background", "", x, "python3 gen.py > /w/out/x.jsonl &", false, false},
@@ -776,6 +792,14 @@ func TestAShellLineWritesWhatItsCommandReports(t *testing.T) {
 		{"a brace expansion", "", "/w/out/{a,b}.jsonl", "cat > /w/out/{a,b}.jsonl", false, false},
 		{"a ? glob", "", "/w/out/x?.jsonl", "cat > /w/out/x?.jsonl", false, false},
 		{"a command substitution's redirection", "", x, "echo $(cat > /w/out/x.jsonl)", false, false},
+		{"a subshell's cd, then its relative output", "/w", x, "(cd /w/out && make) > x.jsonl", false, false},
+		{"a group's cd, then a relative target", "/w", "/w/x.jsonl", "{ cd /w/out; } && make > x.jsonl", false, false},
+		{"a subshell, then tee to a relative file", "/w/out", x, "(true) && python3 gen.py | tee x.jsonl", false, false},
+		{"a cd after another command", "/w", x, "true && cd /w/out && cat > x.jsonl", false, false},
+		{"a leading pushd", "/w", x, "pushd /w/out && cat > x.jsonl", false, false},
+		{"a [ glob", "", "/w/out/x[1].jsonl", "cat > /w/out/x[1].jsonl", false, false},
+		{"a backtick in double quotes", "", "/w/out/`date`.jsonl", "cat > \"/w/out/`date`.jsonl\"", false, false},
+		{"a command substitution in the target", "", "/w/out/$(date).jsonl", "cat > /w/out/$(date).jsonl", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := testStore(t)
@@ -812,7 +836,11 @@ func TestAShellRunsInItsCallsDirectory(t *testing.T) {
 		{"the call's directory, not the result's", "kimi", "Bash", "/w/out", "/w/elsewhere", `{"command":"cat >> x.jsonl"}`, x, true},
 		{"the result's directory is not the call's", "kimi", "Bash", "/w/elsewhere", "/w/out", `{"command":"cat >> x.jsonl"}`, x, false},
 		{"a whole workdir", "opencode", "bash", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"/w/out"}`, x, true},
-		{"a relative workdir", "opencode", "bash", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"out"}`, "/w/x.jsonl", false},
+		{"a relative workdir", "opencode", "bash", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"out"}`, "out/x.jsonl", false},
+		{"a relative workdir, not the session's directory", "opencode", "bash", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"out"}`, "/w/x.jsonl", false},
+		{"a Claude call cut in its here-document", "claude", "Bash", "/w/out", "/w/out", string(cut[:240]) + "…", x, true},
+		{"Kimi's cwd", "kimi", "Bash", "/w", "/w", `{"command":"cat >> x.jsonl","cwd":"/w/out"}`, x, true},
+		{"a Kimi call cut before its cwd", "kimi", "Bash", "/w/out", "/w/out", string(cut[:240]) + "…", x, false},
 		{"Codex's workdir", "codex", "exec_command", "/w", "/w", `{"cmd":"cat >> x.jsonl","workdir":"/w/out"}`, x, true},
 		{"a cut call that may name a workdir", "opencode", "bash", "/w/out", "/w/out", string(cut[:240]) + "…", x, false},
 		{"Hermes's terminal keeps its own directory", "hermes", "terminal", "/w/out", "/w/out", `{"command":"cat >> x.jsonl"}`, x, false},
@@ -900,6 +928,44 @@ func TestAReadClearsOnlyOnAWriteWithinTheHour(t *testing.T) {
 	fs, err := Failures{}.Detect(context.Background(), st, week())
 	if got, want := signatures(fs), []string{"failures/v2:tool:read:file does not exist. note: your current working directory is P 3"}; err != nil || !slices.Equal(got, want) {
 		t.Fatalf("found %v, %v, want %v", got, err, want)
+	}
+}
+
+// A read exactly an hour before the window's end still waits: its write at the hour's end would be the window's
+// end, which the window does not hold.
+func TestAReadAnHourBeforeTheWindowsEndStillWaits(t *testing.T) {
+	st := testStore(t)
+	f := claudeFiles
+	put(t, st, slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.readMissing("s1", "/w/out/b.md", t0),
+		f.readMissing("s2", "/w/out/c.md", t0))...)
+	edge := Window{Since: t0.Add(-time.Hour), Until: t0.Add(time.Hour + time.Second)}
+	if fs, err := (Failures{}).Detect(context.Background(), st, edge); err != nil || len(fs) != 0 {
+		t.Fatalf("at the hour's end: %v, %v", signatures(fs), err)
+	}
+	if fs, err := (Failures{}).Detect(context.Background(), st, Window{Since: edge.Since, Until: edge.Until.Add(time.Millisecond)}); err != nil || len(fs) != 1 {
+		t.Fatalf("a moment later: %v, %v", signatures(fs), err)
+	}
+}
+
+// The mistakes log's own not-found read, which no transcript result holds, waits its hour as well: the log keeps no
+// path its write could clear, but a run inside the hour does not count it yet.
+func TestALoggedReadWaitsToo(t *testing.T) {
+	st := testStore(t)
+	logged := func(session string, at time.Time) store.Event {
+		return ev("mistakes", session, "tool-error", store.ActorHarness, "Read", "Read: "+claudeMissing, "", at)
+	}
+	denied := func(session string, at time.Time) store.Event {
+		return ev("mistakes", session, "deny", store.ActorHarness, "Write", "Write: ledger: this note names no source", "", at)
+	}
+	put(t, st, logged("s1", t0), logged("s1", t0.Add(time.Minute)), logged("s2", t0.Add(2*time.Minute)),
+		denied("s1", t0), denied("s1", t0.Add(time.Minute)), denied("s2", t0.Add(2*time.Minute)))
+	// only the reads wait: another of the log's rows counts at once
+	fs, err := Failures{}.Detect(context.Background(), st, Window{Since: t0.Add(-time.Hour), Until: t0.Add(30 * time.Minute)})
+	if got, want := signatures(fs), []string{"failures/v2:guard:ledger:this note names no source 3"}; err != nil || !slices.Equal(got, want) {
+		t.Fatalf("inside the hour: %v, %v, want %v", got, err, want)
+	}
+	if fs, err := (Failures{}).Detect(context.Background(), st, Window{Since: t0.Add(-time.Hour), Until: t0.Add(2 * time.Hour)}); err != nil || len(fs) != 2 {
+		t.Fatalf("past it: %v, %v", signatures(fs), err)
 	}
 }
 

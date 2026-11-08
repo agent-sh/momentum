@@ -93,7 +93,7 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 			// a read of a file its thread writes within the settle time found it not there yet: no failure; one younger
 			// than the settle time may have its write still to come
 			if p, ok := notFoundRead(e.Tool, e.Summary, call, k); ok && (slices.ContainsFunc(written[wrote{e.Session, e.Agent, p}],
-				func(t time.Time) bool { return t.After(e.TS) && !t.After(e.TS.Add(readSettle)) }) || e.TS.After(w.Until.Add(-readSettle))) {
+				func(t time.Time) bool { return t.After(e.TS) && !t.After(e.TS.Add(readSettle)) }) || settling(e.TS, w)) {
 				continue
 			}
 			occ = append(occ, occurrence{sig: signature("failures", k.String()), title: k.Title(), ev: e})
@@ -127,6 +127,11 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 		if !ok {
 			continue
 		}
+		// a read that found no file, which the transcript does not hold: the log keeps no path to clear it by, but it
+		// waits for its write as the transcript's read does
+		if notFound(e.Tool, e.Summary, k) && settling(e.TS, w) {
+			continue
+		}
 		occ = append(occ, occurrence{sig: signature("failures", k.String()), title: k.Title(), ev: e})
 	}
 	out := gather("failures", occ, r)
@@ -153,12 +158,20 @@ var pathKeys = map[string]bool{"file_path": true, "filePath": true, "notebook_pa
 // other failure: one of another tool, a guard's or the harness's refusal, access refused, a call whose path the
 // store's cut left out.
 func notFoundRead(tool, text, call string, k FailureKey) (string, bool) {
-	if !readTools[strings.ToLower(tool)] || k.Origin != toolOrigin(tool) || !notFoundRe.MatchString(text) {
+	if !notFound(tool, text, k) {
 		return "", false
 	}
 	p, _, _ := callField(call, pathKeys)
 	return p, p != ""
 }
+
+// notFound says a failure keyed k is a read tool's own error that no file is at its path.
+func notFound(tool, text string, k FailureKey) bool {
+	return readTools[strings.ToLower(tool)] && k.Origin == toolOrigin(tool) && notFoundRe.MatchString(text)
+}
+
+// settling says a read at ts is still inside its hour at the window's end: its write may yet come.
+func settling(ts time.Time, w Window) bool { return !ts.Before(w.Until.Add(-readSettle)) }
 
 // callField is the first field of keys a tool call's input names, as the store keeps the call (its first bytes),
 // read up to where the store cut it: its text ("" for another value), whether the input names one before the cut,
@@ -182,8 +195,7 @@ func callField(call string, keys map[string]bool) (value string, named, absent b
 			return value, true, false
 		}
 	}
-	_, err := d.Token() // the input's closing brace
-	return "", false, err == nil
+	return "", false, true
 }
 
 // wroteFile says a write tool's result that is no failure (toolresult.Failed) did write: a JSON result that
