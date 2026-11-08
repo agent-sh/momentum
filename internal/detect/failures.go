@@ -68,7 +68,7 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 			json.Unmarshal([]byte(e.Meta), &m)
 			if toolresult.Failed(e.Harness, e.Tool, e.Summary, m.IsError) {
 				candidates = append(candidates, e)
-			} else if !toolresult.Cancelled(e.Summary) && (bashShell(e.Tool) || writeTools[strings.ToLower(e.Tool)] && wroteFile(e.Summary)) {
+			} else if !toolresult.Cancelled(e.Summary) && (bashShell(e.Tool) || fileWrote(e.Harness, e.Tool, e.Summary)) {
 				// a write the owner declined or the harness cancelled did not write: Failed leaves those out, flagged or not
 				writes = append(writes, e)
 			}
@@ -143,28 +143,65 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 	return append(out, gather("failures", inc, IncidentRecur)...), err
 }
 
-// readTools and writeTools are the harnesses' file tools, by their names in lower case: the ones that read a file
-// (Claude Code's, pi's, OpenCode's and Kimi's Read, Hermes's read_file), and the ones that write, create or edit
-// one (their Write and Edit, Claude Code's MultiEdit and NotebookEdit, Hermes's write_file and patch).
+// readTools are the harnesses' file tools that read a file, by their names in lower case: Claude Code's, pi's,
+// OpenCode's and Kimi's Read, Hermes's and Grok's read_file.
+var readTools = map[string]bool{"read": true, "read_file": true}
+
+// fileWrites are the file tools' own words for a write that landed, per harness and tool (in lower case), as each
+// harness writes them: only a result in one of them wrote its file. A refusal, a failure in the tool's own words, a
+// compaction's summary or another tool's result is none (SPEC, Failures).
+var fileWrites = map[string]*regexp.Regexp{
+	"claude/write":         claudeWrote,
+	"claude/edit":          claudeWrote,
+	"kimi/write":           regexp.MustCompile(`^Wrote \d+ bytes to `),
+	"kimi/edit":            regexp.MustCompile(`^Replaced \d+ occurrences? in `),
+	"hermes/write_file":    regexp.MustCompile(`^\{"bytes_written": ?\d+[,}]`),
+	"hermes/patch":         regexp.MustCompile(`^\{"success": ?true[,}]`),
+	"opencode/write":       regexp.MustCompile(`^(?:Wrote|Created) file successfully\b`),
+	"opencode/edit":        regexp.MustCompile(`^(?:Edit applied successfully\.|Edited \S.* \(\d+ replacements?\))`),
+	"opencode/apply_patch": patchApplied,
+	"opencode/patch":       patchApplied,
+	"pi/write":             regexp.MustCompile(`^Successfully wrote \d+ bytes to `),
+	"pi/edit":              regexp.MustCompile(`^Successfully replaced text in `),
+	"grok/write":           grokWrote,
+	"grok/search_replace":  grokWrote,
+	"codex/apply_patch":    regexp.MustCompile(`^(?:Exit code: 0|Process exited with code 0)\b.*\bSuccess\. Updated the following files:`),
+}
+
 var (
-	readTools  = map[string]bool{"read": true, "read_file": true}
-	writeTools = map[string]bool{"write": true, "edit": true, "multiedit": true, "notebookedit": true, "write_file": true, "patch": true}
+	// claudeWrote is Claude Code's Write and Edit: a file created, or one updated.
+	claudeWrote = regexp.MustCompile(`^(?:File created successfully at: |The file \S.* has been updated(?: successfully)?\.)`)
+	// patchApplied is a patch that applied: OpenCode's apply_patch and patch.
+	patchApplied = regexp.MustCompile(`^Success\. Updated the following files:`)
+	// grokWrote is Grok's write and search_replace: the edits it applied, by the file's whole path.
+	grokWrote = regexp.MustCompile(`^\{"EditsApplied":\{"absolute_path":`)
+	// patchFileRe is a file a patch adds or updates, as the store keeps its call: up to a space, an escape or a quote.
+	patchFileRe = regexp.MustCompile(`\*\*\* (?:Add|Update) File: ([^\s\\"]+)`)
 )
+
+// fileWrote says a file tool's result is its harness's own word for a write that landed (fileWrites).
+func fileWrote(harness, tool, result string) bool {
+	re := fileWrites[harness+"/"+strings.ToLower(tool)]
+	return re != nil && re.MatchString(result)
+}
 
 // notFoundRe is a read tool's error that no file is at its path: Claude Code's "File does not exist", Kimi's "PATH
 // does not exist", a file not found (OpenCode's, Hermes's), the system's ENOENT. Access refused is none of them.
 var notFoundRe = regexp.MustCompile(`(?i)\bdoes not exist\b|\b(?:file|path) not found\b|no such file or directory|\benoent\b`)
 
 // pathKeys are the fields of a file tool's input that name its file.
-var pathKeys = map[string]bool{"file_path": true, "filePath": true, "notebook_path": true, "path": true}
+var pathKeys = map[string]bool{"file_path": true, "filePath": true, "path": true, "target_file": true}
 
 // notFound says a failure keyed k is a read tool's own error that no file is at its path.
 func notFound(tool, text string, k FailureKey) bool {
 	return readTools[strings.ToLower(tool)] && k.Origin == toolOrigin(tool) && notFoundRe.MatchString(text)
 }
 
-// settling says a read at ts is still inside its hour at the window's end: its write may yet come.
-func settling(ts time.Time, w Window) bool { return !ts.Before(w.Until.Add(-readSettle)) }
+// settling says a read at ts is still inside its hour at the window's end, as the store reads it (to the millisecond):
+// its write may yet come.
+func settling(ts time.Time, w Window) bool {
+	return !ts.Before(w.Until.Truncate(time.Millisecond).Add(-readSettle))
+}
 
 // callField is the first field of keys a tool call's input names, as the store keeps the call (its first bytes),
 // read up to where the store cut it: its text ("" for another value), whether the input names one before the cut,
@@ -196,10 +233,6 @@ func callValue(call string, keys map[string]bool) (value json.RawMessage, named,
 	}
 	return nil, false, true
 }
-
-// wroteFile says a write tool's result that is no failure (toolresult.Failed) did write: a JSON result that
-// says it failed did not.
-func wroteFile(text string) bool { return !toolresult.EnvelopeFailed(strings.TrimSpace(text)) }
 
 // callReach is how long before its result a call may have started: a command runs for minutes, a background one for
 // hours.

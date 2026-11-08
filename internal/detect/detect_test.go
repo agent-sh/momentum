@@ -558,6 +558,22 @@ func TestAReadOfAFileItsSessionThenCreatesIsNoFailure(t *testing.T) {
 				f.readMissing("s4", "/w/out/e.md", t0), f.wrote("s4", "/w/out/e.md", t0.Add(time.Minute)),
 				f.readMissing("s4", "/w/out/f.md", t0.Add(time.Hour)), f.wrote("s4", "/w/out/f.md", t0.Add(time.Hour+time.Minute)))
 		}, []string{"failures/v2:tool:read:eacces: permission denied, open Q 3"}},
+		{"a write at the read's own millisecond", func(f *fileTools) []store.Event {
+			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.wrote("s1", "/w/out/a.md", t0),
+				f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour)),
+				f.readMissing("s2", "/w/out/c.md", t0), f.wrote("s2", "/w/out/c.md", t0))
+		}, []string{missing + " 3"}},
+		{"a cut read and a cut write", func(f *fileTools) []store.Event {
+			long := strings.Repeat("x", 240)
+			cutRead := func(session string, at time.Time) []store.Event {
+				return f.pair(session, "Read", `{"file_path":"/w/out/`+long+`…`, claudeMissing, true, at)
+			}
+			cutWrite := func(session string, at time.Time) []store.Event {
+				return f.pair(session, "Write", `{"file_path":"/w/out/`+long+`…`, "File created successfully at: /w/out/"+long, false, at)
+			}
+			return slices.Concat(cutRead("s1", t0), cutWrite("s1", t0.Add(time.Minute)), cutRead("s1", t0.Add(time.Hour)),
+				cutWrite("s1", t0.Add(time.Hour+time.Minute)), cutRead("s2", t0), cutWrite("s2", t0.Add(time.Minute)))
+		}, []string{missing + " 3"}},
 		{"the owner declines the write", func(f *fileTools) []store.Event {
 			declined := func(session, path string, at time.Time) []store.Event {
 				return f.pair(session, "Write", fmt.Sprintf(`{"file_path":%q,"content":"x"}`, path),
@@ -649,8 +665,17 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 		{"pi", "read", "write", `{"path":"/w/@"}`, "ENOENT: no such file or directory, access '/w/@'", `{"path":"/w/@","content":"x"}`, "Successfully wrote 1 bytes to /w/@"},
 		{"pi", "read", "edit", `{"path":"/w/@"}`, "ENOENT: '/w/@'", `{"path":"/w/@","oldText":"","newText":"x"}`, "Successfully replaced text in /w/@"},
 		{"hermes", "read_file", "write_file", `{"path":"/w/@"}`, `{"error": "[Errno 2] No such file or directory: '/w/@'"}`, `{"path":"/w/@","content":"x"}`, `{"bytes_written": 1}`},
-		{"claude", "Read", "NotebookEdit", `{"file_path":"/w/@"}`, claudeMissing, `{"notebook_path":"/w/@","new_source":"x","edit_mode":"insert"}`, "Inserted cell"},
-		{"claude", "Read", "MultiEdit", `{"file_path":"/w/@"}`, claudeMissing, `{"file_path":"/w/@","edits":[{"old_string":"","new_string":"x"}]}`, "Applied 1 edit to /w/@"},
+		{"claude", "Read", "Write", `{"file_path":"/w/@"}`, claudeMissing, `{"file_path":"/w/@","content":"x"}`, "The file /w/@ has been updated successfully. (file state is current in your context)"},
+		{"claude", "Read", "Edit", `{"file_path":"/w/@"}`, claudeMissing, `{"replace_all":true,"file_path":"/w/@"}`, "The file /w/@ has been updated. All occurrences were replaced."},
+		{"kimi", "Read", "Edit", `{"path":"/w/@"}`, `"/w/@" does not exist.`, `{"path":"/w/@","old":"a","new":"b"}`, "Replaced 2 occurrences in /w/@"},
+		{"opencode", "read", "edit", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"filePath":"/w/@","newString":"x"}`, "Edit applied successfully."},
+		{"opencode", "read", "edit", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"filePath":"/w/@","newString":"x"}`, "Edited /w/@ (1 replacement)"},
+		{"opencode", "read", "write", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"filePath":"/w/@","content":"x"}`, "Wrote file successfully."},
+		{"opencode", "read", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Add File: /w/@\n+x\n*** End Patch"}`, "Success. Updated the following files: A /w/@"},
+		{"opencode", "read", "patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Update File: /w/@\n@@\n+x\n*** End Patch"}`, "Success. Updated the following files: M /w/@"},
+		{"codex", "read_file", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Add File: /w/@ +x *** End Patch", "Exit code: 0 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
+		{"grok", "read_file", "search_replace", `{"target_file":"/w/@"}`, "Error: /w/@ does not exist.", `{"file_path":"/w/@","new_string":"x"}`, `{"EditsApplied":{"absolute_path":"/w/@","edits":[]}}`},
+		{"grok", "read_file", "write", `{"target_file":"/w/@"}`, "Error: /w/@ does not exist.", `{"file_path":"/w/@","content":"x"}`, `{"EditsApplied":{"absolute_path":"/w/@","edits":[]}}`},
 	} {
 		t.Run(tc.harness+"/"+tc.write, func(t *testing.T) {
 			st := testStore(t)
@@ -690,6 +715,46 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 			}
 		})
 	}
+	// a write that failed in its own words, unflagged: only a harness's own success wording writes
+	for _, tc := range []struct{ harness, tool, readIn, missing, writeIn, wrote string }{
+		{"hermes", "write_file", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"path":"/w/@","content":"x"}`, "Tool 'write_file' does not exist. Available tools: read_file, terminal"},
+		{"hermes", "write_file", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"path":"/w/@","content":"x"}`, "[write_file] /w/@ (120 chars result) FAILED: Permission denied"},
+		{"claude", "Write", `{"file_path":"/w/@"}`, claudeMissing, `{"file_path":"/w/@","content":"x"}`, "<tool_use_error>File has been modified since read, either by the user or by a linter.</tool_use_error>"},
+		{"claude", "MultiEdit", `{"file_path":"/w/@"}`, claudeMissing, `{"file_path":"/w/@","edits":[]}`, "Applied 1 edit to /w/@"},
+		{"hermes", "patch", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"path":"/w/@"}`, "[patch] replace in /w/@ (120 chars result)"},
+		{"codex", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Add File: /w/@ +x *** End Patch", "Exit code: 1 Wall time: 0.1 seconds Output: Success. Updated the following files: A /w/@"},
+		{"codex", "Write", `{"path":"/w/@"}`, "File not found: /w/@", `{"file_path":"/w/@","content":"x"}`, "File created successfully at: /w/@"},
+		{"codex", "apply_patch", `{"path":"/w/@"}`, "File not found: /w/@", "*** Begin Patch *** Add File: /w/@ +x *** End Patch", "Exit code: 0 Wall time: 0.1 seconds Output: patch left unapplied"},
+		{"opencode", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Add File: /w/@\n+x\n*** End Patch"}`, "patch verification failed: Failed to find expected lines in /w/@"},
+		{"claude", "Edit", `{"file_path":"/w/@"}`, claudeMissing, `{"file_path":"/w/@","old_string":"a","new_string":"b"}`, "A hook said: The file /w/@ has been updated successfully. Then it reverted it."},
+	} {
+		t.Run(tc.harness+"/"+tc.tool+"/failed in its words", func(t *testing.T) {
+			st := testStore(t)
+			f := fileTools{harness: tc.harness}
+			var evs []store.Event
+			for i, session := range []string{"s1", "s1", "s2"} {
+				p := fmt.Sprintf("out/%d.md", i)
+				at := t0.Add(time.Duration(i) * time.Hour)
+				evs = append(evs, f.pair(session, readToolOf(tc.harness), strings.ReplaceAll(tc.readIn, "@", p), strings.ReplaceAll(tc.missing, "@", p), true, at)...)
+				evs = append(evs, f.pair(session, tc.tool, strings.ReplaceAll(tc.writeIn, "@", p), strings.ReplaceAll(tc.wrote, "@", p), false, at.Add(time.Minute))...)
+			}
+			put(t, st, evs...)
+			if fs, err := (Failures{}).Detect(context.Background(), st, week()); err != nil || len(fs) != 1 || len(fs[0].Evidence) != 3 {
+				t.Fatalf("found %v, %v", signatures(fs), err)
+			}
+		})
+	}
+}
+
+// readToolOf is a harness's read tool.
+func readToolOf(harness string) string {
+	switch harness {
+	case "hermes", "grok", "codex":
+		return "read_file"
+	case "opencode":
+		return "read"
+	}
+	return "Read"
 }
 
 // shellCall is a Bash call of Kimi's and its result as the store keeps them, in cwd: the input JSON with > escaped,
@@ -746,6 +811,8 @@ func TestAShellLineWritesOnlyInTheWhitelistedForms(t *testing.T) {
 		{"cut inside an escape in the here-document", "", x, `{"command":"cat > /w/out/x.jsonl <<'EOF'\n{\"a\":\"b \u00…`, "", false, true},
 		{"another file's error in the result", "", x, "cat > /w/out/x.jsonl", "cat: other.txt: No such file or directory", false, true},
 		{"a tab-led end does not end a << here-document", "", x, "cat > /w/out/x.jsonl <<EOF\n{\"id\":1}\n\tEOF\necho done", "", false, true},
+		{"a backslash joins the end to the line before", "", x, "cat > /w/out/x.jsonl <<EOF\n{\"id\":1}\\\nEOF\necho done", "", false, true},
+		{"an end with a space after it is no end", "", x, "cat > /w/out/x.jsonl <<EOF\n{\"id\":1}\nEOF \necho done", "", false, true},
 		{"an escaped quote in double quotes", "", `/w/out/a"b.jsonl`, `cat > "/w/out/a\"b.jsonl"`, "", false, true},
 		{"an escaped backslash in double quotes", "", `/w/out/a\b.jsonl`, `cat > "/w/out/a\\b.jsonl"`, "", false, true},
 		{"an escaped backtick in double quotes", "", "/w/out/a`b.jsonl", "cat > \"/w/out/a\\`b.jsonl\"", "", false, true},
@@ -765,6 +832,10 @@ func TestAShellLineWritesOnlyInTheWhitelistedForms(t *testing.T) {
 		{"a comment after a cd", "/w", "/w/out/#c", "cd /w/out && tee #c", "", false, false},
 		{"a command on the next line", "", x, "cat > /w/out/x.jsonl\necho ok", "", false, false},
 		{"a command after the here-document", "", x, "cat > /w/out/x.jsonl <<'EOF'\n{\"id\":1}\nEOF\necho done", "", false, false},
+		{"a quoted end joins no line", "", x, "cat > /w/out/x.jsonl <<'EOF'\n{\"id\":1}\\\nEOF\necho done", "", false, false},
+		{"an escaped backslash joins no line", "", x, "cat > /w/out/x.jsonl <<EOF\n{\"id\":1}\\\\\nEOF\necho done", "", false, false},
+		{"an end quoted by a backslash joins no line", "", x, "cat > /w/out/x.jsonl <<\\EOF\n{\"id\":1}\\\nEOF\necho done", "", false, false},
+		{"an end in double quotes joins no line", "", x, "cat > /w/out/x.jsonl <<\"EOF\"\n{\"id\":1}\\\nEOF\necho done", "", false, false},
 		{"an indented end, then a command", "", x, "cat > /w/out/x.jsonl <<-EOF\n\t{\"id\":1}\n\tEOF\necho done", "", false, false},
 		{"the store cut right after the line", "", x, `{"command":"cat > /w/out/x.jsonl\n\u00…`, "", false, false},
 		{"the store cut the line", "", x, `{"command":"cat > /w/out/x.jsonl \u00…`, "", false, false},
@@ -868,7 +939,16 @@ func TestAShellRunsInItsCallsDirectory(t *testing.T) {
 		{"a workdir with a ..", "opencode", "bash", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"/w/a/../out"}`, "", x, false},
 		{"a Claude call cut in its here-document", "claude", "Bash", "/w/out", "/w/out", string(cut[:240]) + "…", "", x, true},
 		{"Claude's background launch", "claude", "Bash", "/w/out", "/w/out", `{"command":"cat >> x.jsonl","run_in_background":true}`, "", x, false},
-		{"a background launch the result tells", "claude", "Bash", "/w/out", "/w/out", string(cut[:240]) + "…", "Command running in background with ID: b1", x, false},
+		{"a background launch the result tells", "claude", "Bash", "/w/out", "/w/out", `{"command":"cat >> x.jsonl"}`, "Command running in background with ID: b1", x, false},
+		{"moved to the background after a timeout", "claude", "Bash", "/w/out", "/w/out", `{"command":"cat >> x.jsonl"}`,
+			"Command did not complete within its 120s timeout and was moved to the background (ID: b1). Output is being written to: /w/t/b1.output.", x, false},
+		{"backgrounded by hand", "claude", "Bash", "/w/out", "/w/out", `{"command":"cat >> x.jsonl"}`, "Command was manually backgrounded by user with ID: b1", x, false},
+		{"Hermes's background start", "hermes", "terminal", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"/w/out"}`,
+			`{"output": "Background process started", "session_id": "proc_1", "pid": 1, "exit_code": 0, "error": null}`, x, false},
+		{"Hermes's yield to the background", "hermes", "terminal", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"/w/out"}`,
+			`{"output": "", "yielded_to_background": true, "session_id": "proc_1", "exit_code": 0, "error": null}`, x, false},
+		{"Hermes's tracked background process", "hermes", "terminal", "/w", "/w", `{"command":"cat >> x.jsonl","workdir":"/w/out"}`,
+			`{"output": "Started a tracked background process proc_1", "exit_code": 0, "error": null}`, x, false},
 		{"Kimi's cwd", "kimi", "Bash", "/w", "/w", `{"command":"cat >> x.jsonl","cwd":"/w/out"}`, "", x, true},
 		{"a Kimi call cut before its cwd", "kimi", "Bash", "/w/out", "/w/out", string(cut[:240]) + "…", "", x, false},
 		{"a pi call cut before its workdir", "pi", "bash", "/w/out", "/w/out", string(cut[:240]) + "…", "", x, false},
@@ -981,8 +1061,28 @@ func TestAReadAnHourBeforeTheWindowsEndStillWaits(t *testing.T) {
 	if fs, err := (Failures{}).Detect(context.Background(), st, edge); err != nil || len(fs) != 0 {
 		t.Fatalf("at the hour's end: %v, %v", signatures(fs), err)
 	}
+	if fs, err := (Failures{}).Detect(context.Background(), st, Window{Since: edge.Since, Until: edge.Until.Add(500 * time.Microsecond)}); err != nil || len(fs) != 0 {
+		t.Fatalf("under a millisecond later, which the store does not tell: %v, %v", signatures(fs), err)
+	}
 	if fs, err := (Failures{}).Detect(context.Background(), st, Window{Since: edge.Since, Until: edge.Until.Add(time.Millisecond)}); err != nil || len(fs) != 1 {
 		t.Fatalf("a moment later: %v, %v", signatures(fs), err)
+	}
+}
+
+// Grok's read_file names its file as target_file: its thread's whitelisted write of the path clears it.
+func TestGrokReadsItsTargetFile(t *testing.T) {
+	st := testStore(t)
+	g := fileTools{harness: "grok"}
+	var evs []store.Event
+	for i, session := range []string{"s1", "s1", "s2"} {
+		p := fmt.Sprintf("/w/out/%d.md", i)
+		at := t0.Add(time.Duration(i) * time.Hour)
+		evs = append(evs, g.pair(session, "read_file", fmt.Sprintf(`{"target_file":%q}`, p), "Error: "+p+" does not exist. Note: your current working directory is /w.", true, at)...)
+		evs = append(evs, g.pair(session, "run_terminal_command", fmt.Sprintf(`{"command":"cd /w/out && cat > %d.md"}`, i), "", false, at.Add(time.Minute))...)
+	}
+	put(t, st, evs...)
+	if fs, err := (Failures{}).Detect(context.Background(), st, week()); err != nil || len(fs) != 0 {
+		t.Fatalf("found %v, %v", signatures(fs), err)
 	}
 }
 

@@ -23,6 +23,13 @@ func writtenPaths(harness, tool, call, result, cwd string) []string {
 		}
 		return nil
 	}
+	if strings.EqualFold(tool, "apply_patch") || strings.EqualFold(tool, "patch") && harness == "opencode" {
+		var out []string
+		for _, m := range patchFileRe.FindAllStringSubmatch(call, -1) {
+			out = append(out, m[1])
+		}
+		return out
+	}
 	if p, _, _ := callField(call, pathKeys); p != "" {
 		return []string{p}
 	}
@@ -63,8 +70,10 @@ var (
 	// backgroundKeys are the fields of a shell call that launch its command in the background (Claude Code's,
 	// Hermes's).
 	backgroundKeys = map[string]bool{"run_in_background": true, "background": true}
-	// backgroundRe is a result that says its command went on in the background, whose success says nothing of it.
-	backgroundRe = regexp.MustCompile(`(?i)running in (?:the )?background`)
+	// backgroundRe is a result that says its command went on in the background, whose success says nothing of it:
+	// Claude Code's running, moved there after a timeout or backgrounded by hand; Hermes's started, yielded or tracked.
+	backgroundRe = regexp.MustCompile(`(?i)running in (?:the )?background|moved to the background|manually backgrounded|` +
+		`background process started|yielded_to_background|tracked background process`)
 	// exitRe is the exit code a Codex result reports once its command has ended; one still running reports none.
 	exitRe = regexp.MustCompile(`(?i)(?:process|command) exited with code -?\d+|exit code:? -?\d+`)
 	// openErrRe is an error opening a file for writing.
@@ -118,10 +127,11 @@ func shellWrite(harness, call, result, dir string) string {
 // dotdot says a path climbs out of a directory: through a symbolic link, .. is not where its text says.
 func dotdot(p string) bool { return slices.Contains(strings.Split(p, "/"), "..") }
 
-// hereEnd is a here-document's end: its word, and whether tabs may lead its line (<<-).
+// hereEnd is a here-document's end: its word, whether tabs may lead its line (<<-), and whether its word was quoted,
+// which keeps the shell from joining the text's lines that end in a backslash.
 type hereEnd struct {
-	word string
-	tabs bool
+	word         string
+	tabs, quoted bool
 }
 
 // writeForm reads the one command a whitelisted line holds: cat with one > or >> and its file, or tee with an
@@ -139,7 +149,7 @@ func writeForm(toks []shellTok) (string, *hereEnd, bool) {
 		next := i+1 < len(toks) && toks[i+1].op == ""
 		switch {
 		case (t.op == "<<" || t.op == "<<-") && end == nil && next:
-			end = &hereEnd{word: toks[i+1].word, tabs: t.op == "<<-"}
+			end = &hereEnd{word: toks[i+1].word, tabs: t.op == "<<-", quoted: toks[i+1].quoted}
 			i++
 		case !tee && (t.op == ">" || t.op == ">>") && file == nil && next:
 			file = &toks[i+1]
@@ -166,6 +176,9 @@ func nothingAfter(end *hereEnd, rest string, ended, closed bool) bool {
 		return closed
 	}
 	lines := strings.Split(rest, "\n")
+	if end != nil && !end.quoted {
+		lines = joinContinued(lines)
+	}
 	i := 0
 	if end != nil {
 		for ; i < len(lines) && lines[i] != end.word && !(end.tabs && strings.TrimLeft(lines[i], "\t") == end.word); i++ {
@@ -183,11 +196,27 @@ func nothingAfter(end *hereEnd, rest string, ended, closed bool) bool {
 	return closed
 }
 
+// joinContinued joins each line that ends in an odd run of backslashes to the next, as the shell reads an unquoted
+// here-document's text.
+func joinContinued(lines []string) []string {
+	var out []string
+	for i := 0; i < len(lines); i++ {
+		l := lines[i]
+		for i+1 < len(lines) && (len(l)-len(strings.TrimRight(l, "\\")))%2 == 1 {
+			i++
+			l = l[:len(l)-1] + lines[i]
+		}
+		out = append(out, l)
+	}
+	return out
+}
+
 // shellTok is a word of a command line, its quotes off, or one of the operators a whitelisted line can hold.
 type shellTok struct {
-	op    string // &&, >, >>, << or <<-; "" for a word
-	word  string
-	exact bool // a word the shell does not expand: no variable, command, glob or leading ~
+	op     string // &&, >, >>, << or <<-; "" for a word
+	word   string
+	exact  bool // a word the shell does not expand: no variable, command, glob or leading ~
+	quoted bool // the word holds a quote or a backslash
 }
 
 // shellOps are the operators a whitelisted line can hold, the longest first. Any other operator is no write.
@@ -220,7 +249,7 @@ func shellWords(line string) []shellTok {
 			return nil
 		}
 		var b strings.Builder
-		exact := c != '~'
+		exact, quoted := c != '~', false
 	word:
 		for ; i < len(line); i++ {
 			switch c := line[i]; {
@@ -231,6 +260,7 @@ func shellWords(line string) []shellTok {
 					return nil
 				}
 				b.WriteByte(line[i])
+				quoted = true
 			case c == '\'':
 				k := strings.IndexByte(line[i+1:], '\'')
 				if k < 0 {
@@ -238,7 +268,9 @@ func shellWords(line string) []shellTok {
 				}
 				b.WriteString(line[i+1 : i+1+k])
 				i += k + 1
+				quoted = true
 			case c == '"':
+				quoted = true
 				for i++; ; i++ {
 					if i == len(line) {
 						return nil
@@ -260,7 +292,7 @@ func shellWords(line string) []shellTok {
 				b.WriteByte(c)
 			}
 		}
-		toks = append(toks, shellTok{word: b.String(), exact: exact})
+		toks = append(toks, shellTok{word: b.String(), exact: exact, quoted: quoted})
 	}
 	return toks
 }
