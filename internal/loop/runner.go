@@ -151,7 +151,11 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 			}
 			r.logf("detector %s: %d findings, %d new or back, %d refused", out.Family, len(out.Filed), opened, out.Refused())
 		}
-		for _, c := range swept {
+		health, err := r.sweepHealth(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range append(swept, health...) {
 			r.logf("swept %s: %s", c.ID, c.Title)
 		}
 	}
@@ -1275,6 +1279,26 @@ func StoppedOn(ctx context.Context, st *store.Store, health store.Case) ([]strin
 		}
 	}
 	return out, nil
+}
+
+// sweepHealth closes the component-health cases unseen past their retention, which no detector's sweep reaches (the
+// loop files them), but not one whose stop still holds a case (StoppedOn): closing it would never resume what it holds.
+func (r *Runner) sweepHealth(ctx context.Context) ([]store.Case, error) {
+	cs, err := r.Store.Cases(ctx, store.CaseFilter{Family: store.HealthFamily, Statuses: []store.CaseStatus{store.CaseOpen, store.CaseInvestigating, store.CaseTesting}})
+	if err != nil {
+		return nil, err
+	}
+	var holding []string
+	for _, c := range cs {
+		held, err := StoppedOn(ctx, r.Store, c)
+		if err != nil {
+			return nil, err
+		}
+		if len(held) > 0 {
+			holding = append(holding, c.ID)
+		}
+	}
+	return r.Store.SweepHealth(ctx, r.now(), store.CaseRetention, "loop:detect", holding)
 }
 
 // stopped applies the stop rule (stopRuns): a case whose last two runs failed the same way, in the same step, or whose

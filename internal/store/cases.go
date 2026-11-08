@@ -1500,6 +1500,17 @@ func (s *Store) AddCaseCost(ctx context.Context, id string, c Cost, actor string
 // measuring case is its measurement's. Only the families named are swept (none named: every family), since a
 // family nothing looked at says nothing stopped. It returns the cases it closed.
 func (s *Store) SweepCases(ctx context.Context, now time.Time, retention time.Duration, actor string, families ...string) ([]Case, error) {
+	return s.sweepCases(ctx, now, retention, actor, families, nil)
+}
+
+// SweepHealth sweeps the component-health cases as SweepCases sweeps a detector's family: the loop files them, so no
+// detector's sweep reaches them. A case named in holding stays open: its stop still holds a case, and only its close as
+// fixed resumes what it holds (CloseFixed).
+func (s *Store) SweepHealth(ctx context.Context, now time.Time, retention time.Duration, actor string, holding []string) ([]Case, error) {
+	return s.sweepCases(ctx, now, retention, actor, []string{HealthFamily}, holding)
+}
+
+func (s *Store) sweepCases(ctx context.Context, now time.Time, retention time.Duration, actor string, families, keep []string) ([]Case, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -1511,6 +1522,12 @@ func (s *Store) SweepCases(ctx context.Context, now time.Time, retention time.Du
 		q += ` AND family IN (?` + strings.Repeat(",?", len(families)-1) + `)`
 		for _, f := range families {
 			args = append(args, f)
+		}
+	}
+	if len(keep) > 0 {
+		q += ` AND id NOT IN (?` + strings.Repeat(",?", len(keep)-1) + `)`
+		for _, id := range keep {
+			args = append(args, id)
 		}
 	}
 	rows, err := tx.QueryContext(ctx, q, args...)

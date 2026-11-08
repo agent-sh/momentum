@@ -409,3 +409,46 @@ func TestAStopNoteInTheResumesMillisecondStandsAgain(t *testing.T) {
 		t.Fatalf("a stop after a resume in its note's millisecond left the note done: %+v", n)
 	}
 }
+
+// A component-health case unseen past its retention closes at the next pass, as a detector's case does, though no
+// detector looks at its family. One whose stop still holds a case stays open: closing it would never resume what it
+// holds, which only its close as fixed does.
+func TestAPassSweepsAQuietHealthCaseThatHoldsNothing(t *testing.T) {
+	fakeManager(t) // host ordering only: the pass runs no model
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	held := openCase(t, st, "failures", "held", 1)
+	at := time.Now().Add(-time.Hour)
+	for i := 0; i < 2; i++ {
+		putBuild(t, st, held, fmt.Sprint("h", i), StepInvestigate, store.RunTurns, "turns", "", "turns", at.Add(time.Duration(i)*time.Minute))
+	}
+	if why, err := r.stopped(ctx, held, false); err != nil || why == "" {
+		t.Fatalf("two investigations out of turns did not stop the case: %q %v", why, err)
+	}
+	quiet, _, err := st.ObserveCase(ctx, store.Finding{Family: store.HealthFamily, Signature: "component-health/v1:loop:build:build-toolchains",
+		Title: "The loop fails the same way twice: build toolchains", Evidence: []store.Evidence{{Ref: "file:/runs/old", At: at}}}, "loop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Now = func() time.Time { return time.Now().Add(store.CaseRetention + time.Hour) }
+	if _, err := r.Once(ctx, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	health, err := st.Cases(ctx, store.CaseFilter{Family: store.HealthFamily, All: true})
+	if err != nil || len(health) != 2 {
+		t.Fatalf("the loop's own cases: %+v %v", health, err)
+	}
+	for _, h := range health {
+		switch {
+		case h.ID == quiet.ID && (h.Status != store.CaseClosed || h.Reason != store.Insufficient):
+			t.Fatalf("a quiet component-health case that holds nothing stayed open: %+v", h)
+		case h.ID != quiet.ID && h.Status == store.CaseClosed:
+			t.Fatalf("a quiet component-health case whose stop holds a case was swept: %+v", h)
+		case h.ID != quiet.ID:
+			if stopped, err := StoppedOn(ctx, st, h); err != nil || !slices.Equal(stopped, []string{held.ID}) {
+				t.Fatalf("the stop no longer holds its case: %v %v", stopped, err)
+			}
+		}
+	}
+}
