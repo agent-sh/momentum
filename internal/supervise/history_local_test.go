@@ -1742,3 +1742,92 @@ func TestTheTrackerAndTheReplayReadAPeerMessageAlike(t *testing.T) {
 		}
 	}
 }
+
+// Claude Code's queue is its process's, the subagents' included, and it takes a notification off the queue (a
+// remove) as it absorbs it into a running turn. The live tracker reads the notification at its enqueue, before the
+// remove, whatever thread absorbs it; the store keeps no queue operation, so the replay reads it only where the
+// session's transcript delivers it. Delivered into the session's own thread by its attachment, before the remove, it
+// closes the session's command in both. One that names a subagent's command, which the session's own thread never
+// launched, closes nothing in either. One that names the session's own command and is taken off with no record of it
+// in the session's transcript (a subagent absorbed it) closes the command live at its enqueue, while the replay's
+// command runs on: a difference SPEC names.
+func TestTheTrackerAndTheReplayReadARemovedNotification(t *testing.T) {
+	home := codexHome(t) // a synthetic home, read by the transcripts source, and nothing of the machine's
+	done := func(id string) string {
+		return tag("task-notification") + tag("task-id") + id + closing("task-id") + tag("status") + "completed" + closing("status") +
+			tag("summary") + "Background command finished" + closing("summary") + closing("task-notification")
+	}
+	type row struct {
+		text      string // the notification queued while a call ran, then taken off the queue
+		delivered bool   // its attachment delivers it into the session's own thread before the remove
+		enqueued  string // the tracker's tasks right after the enqueue
+		tracker   string // the tracker's tasks at the end
+		phase     sessions.Phase
+		replay    int // the replay's tasks at the end
+		replayed  sessions.Phase
+	}
+	rows := map[string]row{
+		"delivered": {text: done("b9"), delivered: true, phase: sessions.Idle, replayed: sessions.Idle},
+		"a subagent's task": {text: done("b7"), enqueued: "bash:b9", tracker: "bash:b9", phase: sessions.Background, replay: 1,
+			replayed: sessions.Background},
+		"removed": {text: done("b9"), phase: sessions.Idle, replay: 1, replayed: sessions.Background},
+	}
+	paths, trackers := map[string]string{}, map[string]*claude.Tracker{}
+	taskIDs := func(tr *claude.Tracker, session string, now time.Time) (string, sessions.Phase) {
+		s := &sessions.Session{Key: session, Tool: "claude", Started: t0, Tasks: []sessions.Task{}}
+		tr.Facts(s, now)
+		s.TurnOpen = tr.TurnOpen()
+		sessions.Decide(s, now)
+		var ids []string
+		for _, k := range s.Tasks {
+			ids = append(ids, k.Kind+":"+k.ID)
+		}
+		return strings.Join(ids, ","), s.Phase
+	}
+	n := 0
+	for name, r := range rows {
+		n++
+		session := fmt.Sprintf("6e2d3c4b-0000-4000-8000-%012d", n)
+		x := &transcript{t: t, path: filepath.Join(home, ".claude", "projects", "-home-u-projects-shop", session+".jsonl"), at: t0, raw: true}
+		if err := os.MkdirAll(filepath.Dir(x.path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		add := func(line map[string]any) { x.add(ownerLine(session, line)) }
+		add(map[string]any{"type": "user", "origin": map[string]any{"kind": "human"}, "promptSource": "typed",
+			"message": map[string]any{"role": "user", "content": "run the suite in the background"}})
+		add(map[string]any{"type": "assistant", "message": map[string]any{"model": "claude-test-1", "content": []any{map[string]any{"type": "tool_use",
+			"id": "t1", "name": "Bash", "input": map[string]any{"command": "make test", "run_in_background": true}}}}})
+		add(map[string]any{"type": "user", "message": map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result",
+			"tool_use_id": "t1", "content": "Command running in background with ID: b9. Output is being written to: /work/b9.output"}}}})
+		add(map[string]any{"type": "assistant", "message": map[string]any{"model": "claude-test-1", "content": []any{map[string]any{"type": "tool_use",
+			"id": "t2", "name": "Bash", "input": map[string]any{"command": "make lint"}}}}})
+		queuedAt := x.at.Add(500 * time.Millisecond)
+		add(map[string]any{"type": "queue-operation", "operation": "enqueue", "content": r.text, "timestamp": queuedAt.Format(time.RFC3339Nano)})
+		trackers[name] = claude.NewTracker(x.path)
+		if got, _ := taskIDs(trackers[name], session, x.at); got != r.enqueued {
+			t.Errorf("%s: right after the enqueue the tracker reads tasks %q, want %q", name, got, r.enqueued)
+		}
+		add(map[string]any{"type": "user", "message": map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result",
+			"tool_use_id": "t2", "content": "lint passed"}}}})
+		if r.delivered {
+			add(map[string]any{"type": "attachment", "timestamp": queuedAt.Format(time.RFC3339Nano), "attachment": map[string]any{
+				"type": "queued_command", "commandMode": "task-notification", "origin": map[string]any{"kind": "task-notification"}, "prompt": r.text}})
+		}
+		add(map[string]any{"type": "queue-operation", "operation": "remove", "content": r.text, "reason": "absorbed_mid_turn"})
+		add(map[string]any{"type": "assistant", "message": map[string]any{"model": "claude-test-1", "content": []any{map[string]any{"type": "text",
+			"text": "The lint passed; the suite runs on."}}}})
+		add(map[string]any{"type": "system", "subtype": "turn_duration"})
+		paths[name] = x.path
+	}
+	st := ingested(t, home)
+	points, _ := replayAll(t, st)
+	for name, r := range rows {
+		session := strings.TrimSuffix(filepath.Base(paths[name]), ".jsonl")
+		got, phase := taskIDs(trackers[name], session, t0.Add(time.Hour)) // read on from the enqueue
+		p, ok := lastPoint(points, session)
+		if got != r.tracker || phase != r.phase || !ok || p.Stop.Tasks != r.replay || p.Stop.Phase != r.replayed {
+			t.Errorf("%s: the tracker reads tasks %q (want %q), phase %s (want %s); the replay (found %v) %d tasks (want %d), phase %s (want %s)",
+				name, got, r.tracker, phase, r.phase, ok, p.Stop.Tasks, r.replay, p.Stop.Phase, r.replayed)
+		}
+	}
+}
