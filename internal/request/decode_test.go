@@ -70,7 +70,7 @@ func TestEveryProgramALineRunsIsRead(t *testing.T) {
 		{"git commit -m x", "git commit -m x"},
 		{"cd /x && git add -A && git commit -m 'a b; c'", "cd /x | git add -A | git commit -m a b; c"},
 		{"FOO=1 timeout 120 nice -n 5 env -u HOME BAR=2 nohup git push origin main", "git push origin main"},
-		{"timeout -s KILL 30s sudo -u bot command git push", "git push"},
+		{"timeout -s KILL 30s sudo command git push", "git push"},
 		{"for r in a b; do gh pr create -R example/$r --fill; done", "gh pr create -R example/\x00 --fill"},
 		{"if git diff --quiet; then echo same; else git commit -am x; fi", "git diff --quiet | echo same | git commit -am x"},
 		{"echo $(git rev-parse HEAD) | tee out.txt", "echo \x00 | git rev-parse HEAD | tee out.txt"},

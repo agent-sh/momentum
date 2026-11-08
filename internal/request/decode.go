@@ -8,20 +8,20 @@ import (
 )
 
 // Decoded is what a call's stored input and its result's stored output hold, in the harness's own format: the
-// shell commands the input runs, the output's text, and the files a writer's input names. Cut is true when the store cut the output: its last token is dropped, and
-// a match that runs to its end ran into the cut.
+// shell commands the input runs, the output's text (its last token dropped when the store cut it), and the files a
+// writer's input names.
 type Decoded struct {
-	Commands []string
-	Output   string
-	Paths    []string
-	Cut      bool
+	Commands   []string
+	Output     string
+	Paths      []string
+	CommandCut bool // the store cut the last command: what it ran last may have had more arguments
 }
 
 // Keys of the stored inputs and outputs, every harness's.
 var (
 	commandKeys = map[string]bool{"command": true, "cmd": true}
-	pathKeys    = map[string]bool{"file_path": true, "filePath": true, "notebook_path": true, "path": true}
-	patchKeys   = map[string]bool{"patch": true, "patchText": true, "input": true}
+	pathKeys    = map[string]bool{"file_path": true, "filePath": true, "path": true}
+	patchKeys   = map[string]bool{"patch": true, "patchText": true}
 	outputKeys  = map[string]bool{"output": true, "stdout": true, "stderr": true}
 )
 
@@ -72,30 +72,36 @@ func Decode(harness, tool, input, output string) Decoded {
 			}
 			switch {
 			case f.list && f.cut:
-				d.Commands = append(d.Commands, argvScript(f.values[:len(f.values)-1]))
+				// the last word loses its last token, as a command does: a shell's -c script keeps the rest of it
+				argv := append([]string(nil), f.values...)
+				if argv[len(argv)-1] = uncut(argv[len(argv)-1], true); argv[len(argv)-1] == "" {
+					argv = argv[:len(argv)-1]
+				}
+				d.Commands = append(d.Commands, argvScript(argv))
 			case f.list:
 				d.Commands = append(d.Commands, argvScript(f.values))
 			case len(f.values) > 0:
 				d.Commands = append(d.Commands, uncut(f.values[0], f.cut))
 			}
+			d.CommandCut = f.cut
 		}
 	}
 	// Codex's code mode and Hermes keep a result as JSON whose output fields are its text; every other harness keeps
 	// the text itself, which may print JSON of its own.
 	var outs []string
+	cut := false
 	if harness == "hermes" || harness == "codex" && tool == "exec" {
 		for _, f := range fields(output, `"`, false) {
 			if outputKeys[f.key] && !f.list && len(f.values) > 0 {
 				outs = append(outs, uncut(f.values[0], f.cut))
-				d.Cut = d.Cut || f.cut
+				cut = cut || f.cut
 			}
 		}
 	}
 	if len(outs) > 0 {
 		d.Output = strings.Join(outs, "\n")
 	} else {
-		d.Cut = strings.HasSuffix(output, "…")
-		d.Output = uncut(output, d.Cut)
+		d.Output = uncut(output, strings.HasSuffix(output, "…"))
 	}
 	return d
 }
@@ -272,7 +278,7 @@ func literal(text string) (string, int, bool) {
 						break
 					}
 				}
-				b.WriteString(`\x`)
+				b.WriteByte(e)
 			default:
 				b.WriteByte(e) // \" \' \\ \/ \`
 			}

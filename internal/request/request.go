@@ -376,7 +376,7 @@ func (t *thread) add(e store.Event) {
 		}
 		t.done[m.ToolID] = true
 		if storeCut(call, e) {
-			t.pending = append(t.pending, pair{call: call, res: e})
+			t.pending = append(t.pending, pair{call: slim(call), res: slim(e)})
 			return
 		}
 		for _, r := range Artifacts(call, e) {
@@ -784,6 +784,9 @@ func (r *reader) settle(ctx context.Context, since time.Time, match func(*Reques
 			}
 			for _, rq := range out {
 				fold(rq)
+			}
+			for _, t := range r.threads {
+				t.pending = nil // read: what it made is the requests'
 			}
 			return out, r.finish(ctx, out)
 		}

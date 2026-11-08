@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -229,9 +230,16 @@ func (r *reader) hermesRecord(ctx context.Context, e store.Event, path string, m
 	return "", false, cutGone
 }
 
-// pair is a call and its result, as the store holds them.
+// pair is a call and its result, as the store holds them, with only the fields a whole read and the artifacts
+// read: a thread holds one for each call the store cut, until the read ends.
 type pair struct {
-	call, res store.Event
+	call, res *store.Event
+}
+
+// slim is an event with only what a pair needs of it.
+func slim(e store.Event) *store.Event {
+	return &store.Event{Source: e.Source, SourceKey: e.SourceKey, TS: e.TS, Session: e.Session, Agent: e.Agent,
+		Harness: e.Harness, Kind: e.Kind, Tool: e.Tool, Summary: e.Summary, Meta: e.Meta, Ref: e.Ref}
 }
 
 // resolvedPair is what a cut call made, read whole, and why it was not when it was not.
@@ -365,6 +373,9 @@ func (r *reader) readFile(path string, ns []need) {
 	}
 }
 
+// gitWordRe is git or gh as a word of a command: not the gh of "high".
+var gitWordRe = regexp.MustCompile(`\b(?:git|gh)\b`)
+
 // resolve reads whole the calls the store cut that the requests hold, each once per run, one thread at a time, so
 // what is held raw is one thread's records at most. It reads a call's input where the store cut it, and its output
 // where the store cut it and the command makes something (a commit, a push, a pull request): in a compressed
@@ -374,7 +385,8 @@ func (r *reader) readFile(path string, ns []need) {
 // text and key) is masked, with tacit's redaction in one call, before it is kept. A call whose record is not read,
 // or whose artifacts cannot be masked, is read as the store holds it, and counted on its request by why.
 func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
-	key := func(p pair) string { return p.call.Ref + "\x00" + p.res.Ref }
+	// a call is one by its session and tool id
+	key := func(p pair) string { return p.call.Session + "\x00" + metaOf(p.call.Meta).ToolID }
 	cut := func(s string) bool { return strings.HasSuffix(s, "…") }
 	var todo []pair
 	for _, rq := range reqs {
@@ -406,11 +418,11 @@ func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 		for i := range js {
 			j := &js[i]
 			if cut(j.p.call.Summary) {
-				first = append(first, fetch{j.p.call, j.id, false})
+				first = append(first, fetch{*j.p.call, j.id, false})
 			}
 			// a compressed transcript is read once: its cut output in the same pass as the input
 			if path, _, ok := refPlace(j.p.res.Ref); ok && !writers[j.tool] && cut(j.p.res.Summary) && fileHarness(j.p.res.Harness) && r.compressed(path) {
-				first = append(first, fetch{j.p.res, j.id, true})
+				first = append(first, fetch{*j.p.res, j.id, true})
 			}
 		}
 		r.prefetch(first)
@@ -419,7 +431,7 @@ func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 			j := &js[i]
 			inputs[i] = j.p.call.Summary
 			if cut(j.p.call.Summary) {
-				if text, ok, why := r.take(ctx, j.p.call, j.id, false); ok {
+				if text, ok, why := r.take(ctx, *j.p.call, j.id, false); ok {
 					inputs[i], j.raw = text, true
 				} else {
 					j.why = why
@@ -428,13 +440,14 @@ func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 			if writers[j.tool] {
 				continue
 			}
-			if !strings.Contains(inputs[i], "git") && !strings.Contains(inputs[i], "gh") {
-				j.skip = true
+			if !gitWordRe.MatchString(inputs[i]) {
+				// it makes nothing this reads, whether or not its record is there
+				j.skip, j.why = true, ""
 				continue
 			}
-			j.mk = made(Decode(j.p.call.Harness, j.tool, inputs[i], "").Commands)
+			j.mk = made(Decode(j.p.call.Harness, j.tool, inputs[i], ""))
 			if (j.mk.commits || j.mk.pushes || j.mk.prs) && cut(j.p.res.Summary) {
-				second = append(second, fetch{j.p.res, j.id, true})
+				second = append(second, fetch{*j.p.res, j.id, true})
 			}
 		}
 		r.prefetch(second)
@@ -443,7 +456,7 @@ func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 			output := j.p.res.Summary
 			if !writers[j.tool] && cut(j.p.res.Summary) {
 				// taken whether used or not, so no raw output stays behind
-				text, ok, why := r.take(ctx, j.p.res, j.id, true)
+				text, ok, why := r.take(ctx, *j.p.res, j.id, true)
 				switch {
 				case j.skip || !(j.mk.commits || j.mk.pushes || j.mk.prs):
 				case ok:
@@ -455,7 +468,7 @@ func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 			if j.skip {
 				continue
 			}
-			call, res := j.p.call, j.p.res
+			call, res := *j.p.call, *j.p.res
 			call.Summary, res.Summary = inputs[i], output
 			if writers[j.tool] {
 				if !metaOf(res.Meta).IsError {
@@ -495,7 +508,7 @@ func (r *reader) resolve(ctx context.Context, reqs []*Request) error {
 		if j.raw && !j.skip && len(j.found) > 0 {
 			if masked == nil {
 				// nothing read off the raw text is kept unmasked: the call is read as the store holds it
-				j.found, j.why = Artifacts(j.p.call, j.p.res), cutUnmasked
+				j.found, j.why = Artifacts(*j.p.call, *j.p.res), cutUnmasked
 			} else {
 				for x := range j.found {
 					j.found[x].Text, j.found[x].Key = masked[k], masked[k+1]

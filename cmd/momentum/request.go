@@ -171,19 +171,22 @@ func requestOne(ctx context.Context, cmd string, args []string, stdout, stderr i
 		_, err := io.WriteString(stdout, request.Handoff(rq))
 		return err
 	case "check":
-		n := rq.Newest()
-		added, err := request.Check(ctx, st, rq, time.Now())
+		c, err := request.Check(ctx, st, rq, time.Now())
 		switch {
 		case errors.Is(err, request.ErrNoRequest):
 			return usageError{err.Error()}
 		case err != nil:
 			return err
-		case !added:
-			fmt.Fprintf(stdout, "%s: checked already: %s\n", rq.ID, plain.Clip(plain.Line(n.Text), 120))
+		case !c.Added:
+			fmt.Fprintf(stdout, "%s: checked already: %s\n", rq.ID, plain.Clip(plain.Line(c.Result.Text), 120))
 			return nil
 		}
+		if !c.Lost.At.IsZero() {
+			fmt.Fprintf(stdout, "%s: the check of %s held %s, which can no longer be read\n", rq.ID,
+				c.Lost.At.Local().Format("2006-01-02 15:04"), plain.Clip(c.Lost.Result, 120))
+		}
 		fmt.Fprintf(stdout, "%s: checked %s (a newer result reopens it; request uncheck %s undoes it)\n", rq.ID,
-			plain.Clip(plain.Line(n.Text), 120), rq.ID)
+			plain.Clip(plain.Line(c.Result.Text), 120), rq.ID)
 		return nil
 	}
 	c, err := request.Uncheck(ctx, st, rq, time.Now())

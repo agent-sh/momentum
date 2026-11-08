@@ -9,6 +9,7 @@ import (
 
 	"github.com/agent-sh/momentum/internal/store"
 	"github.com/agent-sh/momentum/internal/supervise"
+	stamp "github.com/agent-sh/momentum/sessions/state"
 )
 
 // union-find over segments ("THREAD#K") and handoff ids ("id:ID").
@@ -332,14 +333,20 @@ func (r *reader) finish(ctx context.Context, reqs []*Request) error {
 			}
 		}
 	}
-	// Each thread's newest phase, whenever it was seen: what a read finds does not depend on where it began.
+	// Each thread's newest phase, whenever it was seen: what a read finds does not depend on where it began. A
+	// session still in that phase was last seen in it when its stamp says (the runs that see no change write no
+	// event).
 	phases := map[string]store.Event{}
+	var stamps stamp.Stamps
 	if current {
 		evs, err := r.st.PhasesSince(ctx, time.Time{})
 		if err != nil {
 			return err
 		}
 		phases = phasesBySession(evs)
+		if stamps, err = r.st.SessionStamps(ctx); err != nil {
+			return err
+		}
 	}
 	for _, rq := range reqs {
 		for i := range rq.Threads {
@@ -349,7 +356,11 @@ func (r *reader) finish(ctx context.Context, reqs []*Request) error {
 				continue
 			}
 			m := metaOf(e.Meta)
-			th.PhaseAt, th.Trusted = e.TS, e.TS.After(th.turn) // seen after the last turn there
+			seen := e.TS
+			if sp, ok := stamps[e.Session]; ok && e.Kind != "vanished" && string(sp.Phase) == m.To && sp.Since.UnixMilli() == e.TS.UnixMilli() && sp.Seen.After(seen) {
+				seen = sp.Seen // the same stretch, seen since
+			}
+			th.PhaseAt, th.Trusted = e.TS, seen.After(th.turn) // seen after the last turn there
 			switch {
 			case e.Kind == "vanished":
 				th.Phase = "gone"

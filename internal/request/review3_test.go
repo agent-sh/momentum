@@ -70,7 +70,7 @@ func TestOnlyAShownLineIsAnArtifact(t *testing.T) {
 		{"Codex, still running at the yield", "exec_command", `{"cmd":"git push -q origin main","yield_time_ms":10000}`,
 			"Chunk ID: 2a Wall time: 10.0 seconds Process running with session ID 4242 Output: running the pre-push checks", false, ""},
 		{"everything up to date", "Bash", `{"command":"git push origin main"}`, "Everything up-to-date", false, ""},
-		{"a shown commit line", "Bash", `{"command":"git commit -m x && git push -q origin main"}`, "[main 1a2b3c4] x", false,
+		{"a shown commit line", "Bash", `{"command":"git commit -m x && git push -q origin main"}`, "[main 1a2b3c4] x\n 1 file changed", false,
 			"commit commit 1a2b3c4 on main: x"},
 	}
 	for _, c := range cases {

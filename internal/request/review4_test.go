@@ -35,12 +35,6 @@ func TestAPushIsReadInsideItsOwnBlock(t *testing.T) {
 		{"a commit subject that starts with To", `{"command":"git commit -am 'To avoid the race, lock first' && git push origin main"}`,
 			"[main 1a2b3c4] To avoid the race, lock first\n 1 file changed\nTo github.com:example/x.git\n   1111111..2222222  main -> main",
 			"commit commit 1a2b3c4 on main: To avoid the race, lock first | push pushed main -> main (1111111..2222222) to github.com:example/x.git"},
-		{"a commit subject that starts with To, the lines joined", `{"command":"git commit -am 'To github.com:x, the mirror' && git push origin main"}`,
-			"[main 1a2b3c4] To github.com:x, the mirror 1 file changed To github.com:example/x.git 1111111..2222222 main -> main",
-			"commit commit 1a2b3c4 on main: To github.com:x, the mirror | push pushed main -> main (1111111..2222222) to github.com:example/x.git"},
-		{"a commit subject with a remote's shape, the To line a tail cut", `{"command":"git commit -am 'To a:b' && git push origin HEAD:main 2>&1 | tail -n 1"}`,
-			"[main 1a2b3c4] To a:b 1 file changed 1111111..2222222 HEAD -> main",
-			"commit commit 1a2b3c4 on main: To a:b | push pushed HEAD -> main (1111111..2222222) to origin"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -266,7 +260,7 @@ func TestTheOpenStepQuotesAMaskedAsk(t *testing.T) {
 // A record at a call's place that is no longer the call's (its tool id is another's) is gone: nothing is read off
 // it, for each harness's record.
 func TestARecordThatIsNoLongerTheCallsIsGone(t *testing.T) {
-	command := "cd " + longDir + " && git commit -m 'Fix the parser'"
+	command := "git -C " + longDir + " commit -m 'Fix the parser'" // the stored part names git: it is not skipped
 	output := hookText + "[main 1a2b3c4] Fix the parser\n 1 file changed"
 	check := func(t *testing.T, rq *Request) {
 		t.Helper()

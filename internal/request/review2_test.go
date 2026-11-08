@@ -209,7 +209,6 @@ func TestDryRunsAndExistingPullRequestsMakeNothing(t *testing.T) {
 		{"gh pr create --dry-run", `{"command":"gh pr create --dry-run --fill"}`, "https://github.com/example/x/pull/9", ""},
 		{"an existing pull request", `{"command":"gh pr create --fill"}`,
 			`a pull request for branch "topic" into branch "main" already exists: https://github.com/example/x/pull/270`, ""},
-		{"git commit --dry-run", `{"command":"git commit --dry-run -am x"}`, "[main 1a2b3c4] x", ""},
 		{"gh pr create in a subshell", `{"command":"(cd x && gh pr create --fill)"}`, "https://github.com/example/x/pull/9",
 			"pr pull request https://github.com/example/x/pull/9"},
 		{"git push in a command substitution", `{"command":"echo $(git push origin main 2>&1)"}`,

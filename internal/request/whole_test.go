@@ -106,7 +106,7 @@ func TestACutClaudeCallIsReadWhole(t *testing.T) {
 // With the transcript gone, the call is read as the store holds it, and the handoff says so.
 func TestACutCallWhoseTranscriptIsGoneFallsBack(t *testing.T) {
 	f := newFixture(t)
-	command := "cd " + longDir + " && git commit -m 'Fix the parser'"
+	command := "git -C " + longDir + " commit -m 'Fix the parser'"
 	output := hookText + "[main 1a2b3c4] Fix the parser\n 1 file changed"
 	path := claudeCall(t, f, t.TempDir(), "s-claude-gone", command, output)
 	if err := os.Remove(path); err != nil {

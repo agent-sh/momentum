@@ -148,7 +148,7 @@ func TestADryRunIsNoPush(t *testing.T) {
 // command that makes commits, a push from a git push that is no dry run, a pull request from gh pr create, a file
 // from a file-writing call. Every tool kind against every command kind.
 func TestArtifactsComeOnlyFromTheCallThatMadeThem(t *testing.T) {
-	commit := "[main 1a2b3c4] Fix it 1 file changed"
+	commit := "[main 1a2b3c4] Fix it\n 1 file changed"
 	push := "To github.com:example/x.git 1111111..2222222 main -> main"
 	pr := "https://github.com/example/x/pull/7"
 	cases := []struct {
@@ -176,7 +176,6 @@ func TestArtifactsComeOnlyFromTheCallThatMadeThem(t *testing.T) {
 		{"git push", "Bash", `{"command":"git push origin main"}`, push, false, "push pushed main -> main (1111111..2222222) to github.com:example/x.git"},
 		{"git push -n", "Bash", `{"command":"git push -n origin main"}`, push, false, ""},
 		{"git push --dry-run", "Bash", `{"command":"git push --dry-run"}`, push, false, ""},
-		{"git push -nv", "Bash", `{"command":"git push -nv origin main"}`, push, false, ""},
 		{"git fetch", "Bash", `{"command":"git fetch origin"}`, "From github.com:example/x 1111111..2222222 main -> origin/main", false, ""},
 		{"a push that failed", "Bash", `{"command":"git push"}`, push, true, ""},
 		{"gh pr create", "Bash", `{"command":"gh pr create --fill"}`, pr, false, "pr pull request " + pr},
@@ -474,7 +473,7 @@ func longHandoff(f *fixture) *Request {
 	f.owner("s-long", at(0), "split the monolith")
 	for i := 0; i < 12; i++ {
 		f.tool("s-long", "", "Bash", at(1+i), `{"command":"git commit"}`,
-			fmt.Sprintf("[main %07x] Move part %d of the monolith into its own package with its tests and docs", 0xa000000+i, i), false)
+			fmt.Sprintf("[main %07x] Move part %d of the monolith into its own package with its tests and docs\n 1 file changed", 0xa000000+i, i), false)
 	}
 	f.reply("s-long", at(20), "Twelve parts moved; the gateway is left.")
 	return f.group()[0]

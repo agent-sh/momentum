@@ -29,7 +29,7 @@ func putRequestEvents(t *testing.T, base time.Time) {
 	evs := []store.Event{
 		ev(1, "owner_text", store.ActorOwner, base, "rename the flag", `{"input_kind":"typed"}`),
 		shell(ev(2, "tool_call", store.ActorAgent, base.Add(time.Minute), `{"command":"git commit -am rename"}`, `{"tool_id":"c1"}`)),
-		shell(ev(3, "tool_result", store.ActorTool, base.Add(time.Minute+time.Second), "[main 4b5c6d7] Rename the flag", `{"tool_id":"c1"}`)),
+		shell(ev(3, "tool_result", store.ActorTool, base.Add(time.Minute+time.Second), "[main 4b5c6d7] Rename the flag\n 1 file changed", `{"tool_id":"c1"}`)),
 		ev(4, "agent_text", store.ActorAgent, base.Add(2*time.Minute), "Renamed, and the tests pass.", ""),
 		{Source: store.Sessions, SourceKey: "s-cli-0001@1", TS: base.Add(3 * time.Minute), Session: "s-cli-0001", Harness: "claude",
 			Actor: store.ActorHarness, Kind: "phase", Meta: `{"from":"working","to":"idle"}`},

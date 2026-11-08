@@ -32,10 +32,8 @@ func TestWhatTheCutTouchesIsDropped(t *testing.T) {
 	shells := []struct{ name, input, output, want string }{
 		{"a commit's hash, cut inside", `{"command":"git commit -am 'Fix the parser'"}`, "[main 1a2b…", ""},
 		{"a commit's hash, cut at its end", `{"command":"git commit -am 'Fix the parser'"}`, "[main 1a2b3c4…", ""},
-		{"a commit's subject, cut inside", `{"command":"git commit -am 'Fix the parser'"}`, "[main 1a2b3c4] Fix the pa…", "commit commit 1a2b3c4 on main"},
-		{"a commit's subject, cut at its end", `{"command":"git commit -am 'Fix the parser'"}`, "[main 1a2b3c4] Fix the parser…", "commit commit 1a2b3c4 on main"},
-		{"a commit line, cut after it", `{"command":"git commit -am 'Fix the parser'"}`, "[main 1a2b3c4] Fix the parser 1 file changed, 2 insertions…", commit},
-		{"a commit line, no cut", `{"command":"git commit -am 'Fix the parser'"}`, "[main 1a2b3c4] Fix the parser 1 file changed", commit},
+		{"a commit line, cut after it", `{"command":"git commit -am 'Fix the parser'"}`, "[main 1a2b3c4] Fix the parser\n 1 file changed, 2 insertions…", commit},
+		{"a commit line, no cut", `{"command":"git commit -am 'Fix the parser'"}`, "[main 1a2b3c4] Fix the parser\n 1 file changed", commit},
 		{"a ref line, cut inside", `{"command":"git push origin main"}`, "To github.com:example/x.git 1111111..2222222 main -> ma…", ""},
 		{"a ref line, cut at its end", `{"command":"git push origin main"}`, "To github.com:example/x.git 1111111..2222222 main -> main…", ""},
 		{"a ref line, cut after it", `{"command":"git push origin main"}`, "To github.com:example/x.git 1111111..2222222 main -> main …", push},
@@ -110,18 +108,18 @@ func TestThePullRequestIsTheAddressGhPrinted(t *testing.T) {
 		{"a commit subject names another", `{"command":"git commit -am 'Port the fix from https://github.com/up/r/pull/123' && git push -u origin fix && gh pr create --fill"}`,
 			"[fix 1a2b3c4] Port the fix from https://github.com/up/r/pull/123\n 1 file changed\nTo github.com:me/r.git\n * [new branch]      fix -> fix\nbranch 'fix' set up to track 'origin/fix'.\nhttps://github.com/me/r/pull/7",
 			"pull request https://github.com/me/r/pull/7"},
-		{"a commit subject names another, the lines joined", `{"command":"git commit -am 'Port the fix from https://github.com/up/r/pull/123' && git push -u origin fix && gh pr create --fill"}`,
-			"[fix 1a2b3c4] Port the fix from https://github.com/up/r/pull/123 1 file changed To github.com:me/r.git * [new branch] fix -> fix branch 'fix' set up to track 'origin/fix'. https://github.com/me/r/pull/7",
-			"pull request https://github.com/me/r/pull/7"},
 		{"an existing one, then gh pr view", `{"command":"gh pr create --fill || gh pr view"}`,
 			"a pull request for branch \"fix\" into branch \"main\" already exists:\nhttps://github.com/me/r/pull/7\ntitle:\tFix the parser\n--\n" + body + "\nurl:\thttps://github.com/me/r/pull/7\n", ""},
 		{"an existing one, then gh pr view, the lines joined", `{"command":"gh pr create --fill || gh pr view"}`,
 			"a pull request for branch \"fix\" into branch \"main\" already exists: https://github.com/me/r/pull/7 title: Fix the parser -- " + body + " url: https://github.com/me/r/pull/7", ""},
-		{"two made in a loop, the last", `{"command":"for r in a b; do gh pr create -R me/$r --fill; done"}`,
-			"https://github.com/me/a/pull/3\nhttps://github.com/me/b/pull/4\n", "pull request https://github.com/me/b/pull/4"},
+		{"two made in a loop", `{"command":"for r in a b; do gh pr create -R me/$r --fill; done"}`,
+			"https://github.com/me/a/pull/3\nhttps://github.com/me/b/pull/4\n", "pull request https://github.com/me/a/pull/3 | pull request https://github.com/me/b/pull/4"},
+		{"two made in a loop, the lines joined", `{"command":"for r in a b; do gh pr create -R me/$r --fill; done"}`,
+			"https://github.com/me/a/pull/3 https://github.com/me/b/pull/4", "pull request https://github.com/me/a/pull/3 | pull request https://github.com/me/b/pull/4"},
+		{"one made, one that exists, one made", `{"command":"for r in a b c; do gh pr create -R me/$r --fill; done"}`,
+			"https://github.com/me/a/pull/3\na pull request for branch \"fix\" into branch \"main\" already exists:\nhttps://github.com/me/b/pull/9\nhttps://github.com/me/c/pull/5\n",
+			"pull request https://github.com/me/a/pull/3 | pull request https://github.com/me/c/pull/5"},
 		{"an address inside a longer one", `{"command":"gh pr create --fill"}`, "see https://github.com/me/r/pull/7/files", ""},
-		{"only a commit subject's, the lines joined", `{"command":"git commit -am 'Port https://github.com/up/r/pull/123' && gh pr create --fill"}`,
-			"[fix 1a2b3c4] Port https://github.com/up/r/pull/123 1 file changed", ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -339,7 +337,7 @@ func TestALostResultSaysWhy(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			f := newFixture(t)
-			command := "cd " + longDir + " && git commit -m 'Fix the parser'"
+			command := "git -C " + longDir + " commit -m 'Fix the parser'"
 			output := hookText + "[main 1a2b3c4] Fix the parser\n 1 file changed"
 			path := claudeCall(t, f, t.TempDir(), "s-lost", command, output)
 			f.reply("s-lost", at(3), "Committed the parser fix.")

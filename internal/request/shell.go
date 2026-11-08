@@ -13,26 +13,32 @@ var shellProgs = map[string]bool{"bash": true, "sh": true, "zsh": true, "dash": 
 
 // invocation is a simple command: the program it runs and its arguments, past assignments and the wrappers that
 // run the command after them. silent is true when its output goes to a file (a redirect of it, or of a command
-// around it), so none of it is in the call's output.
+// around it), so none of it is in the call's output. cut is true when it ends where the store cut the script: what
+// the cut took may have been more of its arguments.
 type invocation struct {
 	prog   string
 	args   []string
 	silent bool
+	cut    bool
 }
 
 // invocations are every simple command a shell script runs, parsed as a shell parses it: in lists, pipelines,
 // subshells, loops' and conditions' bodies, functions, command substitutions, and the scripts a shell's -c runs. A
 // script the store cut is parsed as far as it goes: with the quotes or parentheses it leaves open closed, else to
 // the last whole command before the cut.
-func invocations(script string, depth int) []invocation {
+func invocations(script string, depth int) []invocation { return invocationsOf(script, depth, false) }
+
+// invocationsOf are a script's invocations, those that end where the store cut it marked cut when cut is true.
+func invocationsOf(script string, depth int, cut bool) []invocation {
 	if depth > 4 {
 		return nil
 	}
-	f, _ := parseCut(strings.TrimSuffix(script, "…"))
+	script = strings.TrimSuffix(script, "…")
+	f, _ := parseCut(script)
 	if f == nil {
 		return nil
 	}
-	w := &walker{depth: depth}
+	w := &walker{depth: depth, cut: cut, size: len(strings.TrimRight(script, " \t\n"))}
 	syntax.Walk(f, w.visit)
 	return w.out
 }
@@ -42,28 +48,29 @@ type walker struct {
 	out    []invocation
 	depth  int
 	silent bool
+	cut    bool // the store cut the script at size
+	size   int
 }
 
-// toFile reports a redirect that sends standard output to a file: >, >>, >|, &> or &>> on it.
+// toFile reports a redirect that sends standard output to a file: >, >> or &> on it, to anything but /dev/stdout.
 func toFile(r *syntax.Redirect) bool {
 	switch r.Op {
-	case syntax.RdrOut, syntax.AppOut, syntax.ClbOut:
+	case syntax.RdrOut, syntax.AppOut:
 		if r.N != nil && r.N.Value != "1" {
 			return false
 		}
-	case syntax.RdrAll, syntax.AppAll:
+	case syntax.RdrAll:
 	default:
 		return false
 	}
-	w := wordText(r.Word)
-	return w != "/dev/stdout" && w != "/dev/stderr"
+	return wordText(r.Word) != "/dev/stdout"
 }
 
 func (w *walker) visit(n syntax.Node) bool {
 	if st, ok := n.(*syntax.Stmt); ok && !w.silent && st.Cmd != nil {
 		for _, r := range st.Redirs {
 			if toFile(r) {
-				in := &walker{depth: w.depth, silent: true}
+				in := &walker{depth: w.depth, silent: true, cut: w.cut, size: w.size}
 				syntax.Walk(st.Cmd, in.visit)
 				w.out = append(w.out, in.out...)
 				return false
@@ -78,24 +85,25 @@ func (w *walker) visit(n syntax.Node) bool {
 	for i, wd := range ce.Args {
 		args[i] = wordText(wd)
 	}
+	cut := w.cut && int(ce.End().Offset()) >= w.size
 	if inv, ok := unwrap(args); ok {
 		if shellProgs[inv.prog] {
 			if s, ok := shellScript(inv.args); ok {
-				for _, in := range invocations(s, w.depth+1) {
+				for _, in := range invocationsOf(s, w.depth+1, cut) {
 					in.silent = in.silent || w.silent
 					w.out = append(w.out, in)
 				}
 				return true
 			}
 		}
-		inv.silent = w.silent
+		inv.silent, inv.cut = w.silent, cut
 		w.out = append(w.out, inv)
 	}
 	return true
 }
 
 // closers end what a cut script leaves open.
-var closers = []string{"", "'", `"`, "`", `"'`, `'"`, ")", "')", `")`, "))", "'))", `"))`, "\n}", "\nfi", "\ndone"}
+var closers = []string{"", "'", `"`, ")", "\n}", "\ndone"}
 
 // parseCut parses a script, closing what its cut leaves open, or else the part of it before the cut that parses.
 // whole is false when it took anything but the script as it is.
@@ -185,38 +193,30 @@ func shellScript(args []string) (string, bool) {
 
 // wrapperOptions are each wrapper's options that take a value as the next word.
 var wrapperOptions = map[string]map[string]bool{
-	"timeout": {"-s": true, "--signal": true, "-k": true, "--kill-after": true},
-	"env":     {"-u": true, "--unset": true, "-C": true, "--chdir": true, "-S": true, "--split-string": true},
-	"nice":    {"-n": true, "--adjustment": true},
+	"timeout": {"-s": true, "-k": true},
+	"env":     {"-u": true},
+	"nice":    {"-n": true},
 	"nohup":   {},
 	"command": {},
 	"exec":    {"-a": true},
-	"time":    {"-f": true, "--format": true, "-o": true, "--output": true},
-	"sudo":    {"-u": true, "--user": true, "-g": true, "--group": true, "-C": true, "-D": true, "--chdir": true, "-h": true, "-p": true, "--prompt": true, "-r": true, "-t": true, "-U": true, "-T": true},
-	"stdbuf":  {"-i": true, "-o": true, "-e": true},
+	"time":    {"-f": true, "-o": true},
+	"sudo":    {},
+	"stdbuf":  {},
 }
 
 // unwrap is the program a command runs past the wrappers that run the command after them (timeout and its
 // duration, env and its assignments, nice, nohup, command, exec, time, sudo, stdbuf), with its arguments. ok is false
-// for a command that runs no program by name: an expansion, or a wrapper with nothing after it, or command -v's
-// lookup.
+// for a wrapper with nothing after it, or command -v's lookup.
 func unwrap(args []string) (invocation, bool) {
 	for len(args) > 0 {
 		prog := filepath.Base(args[0])
 		valued, isWrapper := wrapperOptions[prog]
 		if !isWrapper {
-			if strings.ContainsRune(args[0], 0) {
-				return invocation{}, false
-			}
-			return invocation{prog: prog, args: args[1:]}, true
+			return invocation{prog: prog, args: args[1:]}, true // an expansion's program (\x00) is no program read here
 		}
 		i := 1
 		for i < len(args) && strings.HasPrefix(args[i], "-") && args[i] != "-" {
 			a := args[i]
-			if a == "--" {
-				i++
-				break
-			}
 			if prog == "command" && (a == "-v" || a == "-V") {
 				return invocation{}, false
 			}
@@ -241,8 +241,8 @@ func unwrap(args []string) (invocation, bool) {
 // makes is what a shell call's commands make.
 type makes struct {
 	commits, pushes, prs bool
-	// fetches is a git command that prints ref updates as a push does (a fetch, pull or remote update that is not
-	// quiet); remote is the first push's remote argument
+	// fetches is a git command that prints ref updates as a push does (a fetch or pull that is not quiet); remote
+	// is the first push's remote argument
 	fetches bool
 	remote  string
 }
@@ -252,14 +252,22 @@ var commitCommands = map[string]bool{"commit": true, "cherry-pick": true, "rever
 
 // made reads what a call's commands make, by every program they run: commits when one runs a git command that
 // makes them (no dry run, no --no-commit, no --abort) and prints its commit line (not quiet, its output not sent to
-// a file), so a commit line in an output where none does is another command's (a cat, a grep), pushes when one runs git push and none of its pushes is a
-// dry run (whose ref lines would be read as pushed), and a pull request when one runs gh pr create without
-// --dry-run.
-func made(commands []string) makes {
+// a file), so a commit line in an output where none does is another command's (a cat, a grep); pushes when one
+// runs git push and none of its pushes is a dry run (whose ref lines would be read as pushed); and pull requests
+// when one runs gh pr create without --dry-run and none runs gh pr view, gh pr list or gh api, which print
+// addresses too. A command that ends where the store cut the call's input makes nothing: the cut may have taken
+// an option that changes what it does (--dry-run, --no-commit, -n).
+func made(d Decoded) makes {
 	var mk makes
-	dry := false
-	for _, c := range commands {
-		for _, inv := range invocations(c, 0) {
+	dry, lists := false, false
+	for i, c := range d.Commands {
+		for _, inv := range invocationsOf(c, 0, d.CommandCut && i == len(d.Commands)-1) {
+			if inv.prog == "gh" && len(inv.args) > 0 && (inv.args[0] == "api" || len(inv.args) > 1 && inv.args[0] == "pr" && (inv.args[1] == "view" || inv.args[1] == "list")) {
+				lists = true
+			}
+			if inv.cut {
+				continue
+			}
 			switch inv.prog {
 			case "git":
 				sub, args := gitCommand(inv.args)
@@ -272,7 +280,7 @@ func made(commands []string) makes {
 					if mk.remote == "" {
 						mk.remote = firstArg(args)
 					}
-				case (sub == "fetch" || sub == "pull" || sub == "remote") && !quiet(args):
+				case (sub == "fetch" || sub == "pull") && !quiet(args):
 					mk.fetches = true
 				}
 			case "gh":
@@ -285,17 +293,16 @@ func made(commands []string) makes {
 		}
 	}
 	mk.pushes = mk.pushes && !dry
+	mk.prs = mk.prs && !lists
 	return mk
 }
 
-// makesNoCommit reports a git command that makes commits run so it makes none: a dry run, --no-commit (merge,
-// cherry-pick, revert; -n for the last two), or an --abort or --quit of one under way.
+// makesNoCommit reports a git command that makes commits run so it makes none: --no-commit (merge, cherry-pick,
+// revert; -n for the last two), or an --abort or --quit of one under way.
 func makesNoCommit(sub string, args []string) bool {
 	switch {
 	case hasFlag(args, "--abort") || hasFlag(args, "--quit"):
 		return true
-	case sub == "commit":
-		return hasFlag(args, "--dry-run")
 	case sub == "merge":
 		return hasFlag(args, "--no-commit")
 	case sub == "cherry-pick" || sub == "revert":
@@ -328,7 +335,7 @@ func firstArg(args []string) string {
 func gitCommand(args []string) (string, []string) {
 	for i := 0; i < len(args); i++ {
 		switch a := args[i]; {
-		case a == "-C" || a == "-c" || a == "--git-dir" || a == "--work-tree" || a == "--namespace":
+		case a == "-C" || a == "-c" || a == "--git-dir":
 			i++
 		case strings.HasPrefix(a, "-"):
 		default:
@@ -347,12 +354,5 @@ func hasFlag(args []string, flag string) bool {
 	return false
 }
 
-// dryRun reports a push that pushes nothing: -n, --dry-run, or -n among short options.
-func dryRun(args []string) bool {
-	for _, a := range args {
-		if a == "--dry-run" || strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.Contains(a[1:], "n") {
-			return true
-		}
-	}
-	return false
-}
+// dryRun reports a push that pushes nothing, and prints the ref lines a push does: --dry-run or -n.
+func dryRun(args []string) bool { return hasFlag(args, "--dry-run") || hasFlag(args, "-n") }

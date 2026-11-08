@@ -141,7 +141,7 @@ func TestAThreadIsOneRequestWithItsResults(t *testing.T) {
 	if words(rq.Asks) != "fix the date parser | also add a test" {
 		t.Fatalf("asks: %s", words(rq.Asks))
 	}
-	if got := kinds(rq.Results); got != "file /work/s-alpha/date_test.go | commit commit 1a2b3c4 on main: Fix the date parser | file /work/s-alpha/date.go" {
+	if got := kinds(rq.Results); got != "file /work/s-alpha/date_test.go | commit commit 1a2b3c4 on main | file /work/s-alpha/date.go" {
 		t.Fatalf("results: %s", got)
 	}
 	if rq.Report == nil || rq.Report.Text != "Done: the parser is fixed and tested." {
@@ -441,7 +441,7 @@ func TestResultsComeFromToolOutput(t *testing.T) {
 	f.tool("s-r", "", "Bash", at(8), `{"command":"git commit"}`, "[main (root-commit) 2f3a4b5] First 1 file changed", false)
 	f.tool("s-r", "", "Bash", at(9), `{"command":"git commit"}`, "[detached HEAD 3a4b5c6] Fix", false)
 	rq := f.group()[0]
-	want := "commit commit 3a4b5c6 on detached HEAD: Fix | commit commit 2f3a4b5 on main: First | file src/b.go | file src/c.go | " +
+	want := "commit commit 3a4b5c6 on detached HEAD | commit commit 2f3a4b5 on main | file src/b.go | file src/c.go | " +
 		"pr pull request https://github.com/example/x/pull/8 | push pushed new branch feat -> feat to github.com:example/x.git"
 	if got := kinds(rq.Results); got != want {
 		t.Fatalf("results:\n got %s\nwant %s", got, want)
