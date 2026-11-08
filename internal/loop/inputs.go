@@ -226,8 +226,6 @@ func inside(dir, path string) bool {
 	return err != nil || rel == "." || filepath.IsLocal(rel)
 }
 
-// prepareRun creates the case and records before charging a reservation. These
-// files are host-owned. A failed preparation returns a skipped step.
 // runLog is a case's log as a run reads it in case.json: without the charge receipts of held builds (loop hold), which
 // are the budgets' accounting, not the case's history.
 func runLog(log []store.CaseEntry) []store.CaseEntry {
@@ -240,6 +238,8 @@ func runLog(log []store.CaseEntry) []store.CaseEntry {
 	return out
 }
 
+// prepareRun creates the case and records before charging a reservation. These
+// files are host-owned. A failed preparation returns a skipped step.
 func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step string) (run store.LoopRun, err error) {
 	defer func() {
 		if err != nil && step == StepBuild {

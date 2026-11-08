@@ -147,9 +147,9 @@ func busyIn(ctx context.Context, st *store.Store, dir string, ss map[int]capacit
 	return "", nil
 }
 
-// gateTimeout bounds one wait at the capacity gate. The gate runs in a process group of its own, which its deadline
-// kills whole, so its children (a shell's waiter) end with it; gateWaitDelay bounds how long its output may stay open
-// after.
+// gateTimeout bounds one wait at the capacity gate. The gate runs in a process group of its own, which is killed whole
+// when the gate ends, at its deadline or on its own, so its children (a shell's waiter) end with it; gateWaitDelay
+// bounds how long its output may stay open after.
 var (
 	gateTimeout   = 10 * time.Minute
 	gateWaitDelay = 5 * time.Second
@@ -187,6 +187,15 @@ func setupShip(st *store.Store, sources config.Sources) *loop.Ship {
 			cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 			cmd.WaitDelay = gateWaitDelay
 			out, err := commandOutput(cmd, true)
+			if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+				err = nil // the gate exited 0, room, though a child it left held its output past the wait delay
+			}
+			// the gate's children end with it when it exits on its own too; a group with no process left is no error
+			if cmd.Process != nil {
+				if kill := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); kill != nil && !errors.Is(kill, syscall.ESRCH) {
+					err = errors.Join(err, fmt.Errorf("its process group cannot be ended: %w", kill))
+				}
+			}
 			if err == nil {
 				return nil
 			}

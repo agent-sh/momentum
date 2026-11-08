@@ -126,8 +126,13 @@ func TestVisibilityMustBeKnownBeforePublishingText(t *testing.T) {
 "pr list") echo '[]';;
 *) echo called >> '`+filepath.Join(f.dir, "posted")+`';;
 esac`)
-			if _, err := proposePatch(t, s, context.Background(), c.ID, pr); err == nil {
+			_, err := proposePatch(t, s, context.Background(), c.ID, pr)
+			if err == nil {
 				t.Fatal("unknown visibility authorized public text")
+			}
+			// gh's answer that does not parse is the host's condition, no refusal of the build's output
+			if errors.Is(err, ErrRefused) || stageCause("build propose", err) != hostCause {
+				t.Fatalf("unknown visibility is the build's refusal: %v", err)
 			}
 			if _, err := os.Stat(filepath.Join(f.dir, "posted")); !os.IsNotExist(err) {
 				t.Fatal("posted without visibility")

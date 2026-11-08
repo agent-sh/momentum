@@ -993,25 +993,29 @@ func TestOldHostErrorsAtARefusalStageStillHold(t *testing.T) {
 }
 
 // A build kept before the broker's outage had its own key, for a broker env file that could not be read (build run,
-// no start), is the broker's after the upgrade too: two such old runs stop nothing.
+// no start), is the broker's after the upgrade too, and so is an investigation kept as run: two such old runs stop
+// nothing.
 func TestOldBrokerOutagesDoNotCount(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	r := localRunner(t, st)
 	base := time.Now().Add(-time.Hour)
-	// each form the older binary wrote: with the file's path (it could not be opened), and without (it could not be read
-	// through)
+	// each form the older binary wrote: with the file's path (it could not be opened), one that holds a space, and
+	// without (it could not be read through)
 	for _, text := range []string{"no Bedrock route: the broker's env file /x/bedrock.env cannot be read (no such file or directory)",
+		"no Bedrock route: the broker's env file /x/my config/bedrock.env cannot be read (no such file or directory)",
 		"no Bedrock route: the broker's env file cannot be read"} {
-		c := openCase(t, st, "failures", text, 1)
-		for i := 0; i < 2; i++ {
-			if err := st.PutLoopRun(ctx, store.LoopRun{ID: fmt.Sprint(c.ID, "-", i), Case: c.ID, Family: c.Family, Step: StepBuild,
-				Ended: base.Add(time.Duration(i) * time.Minute), Status: store.RunFailed, Failure: "build run", Summary: "build run: " + text}); err != nil {
-				t.Fatal(err)
+		for _, step := range []struct{ name, failure, prefix string }{{StepBuild, "build run", "build run: "}, {StepInvestigate, "run", ""}} {
+			c := openCase(t, st, "failures", step.name+" "+text, 1)
+			for i := 0; i < 2; i++ {
+				if err := st.PutLoopRun(ctx, store.LoopRun{ID: fmt.Sprint(c.ID, "-", i), Case: c.ID, Family: c.Family, Step: step.name,
+					Ended: base.Add(time.Duration(i) * time.Minute), Status: store.RunFailed, Failure: step.failure, Summary: "inputs: 1 file\n" + step.prefix + text}); err != nil {
+					t.Fatal(err)
+				}
 			}
-		}
-		if why, err := r.stopped(ctx, c, true); err != nil || why != "" {
-			t.Fatalf("two old broker outages (%s) stopped the case: %q %v", text, why, err)
+			if why, err := r.stopped(ctx, c, true); err != nil || why != "" {
+				t.Fatalf("two old broker outages of a %s (%s) stopped the case: %q %v", step.name, text, why, err)
+			}
 		}
 	}
 }
@@ -2164,6 +2168,105 @@ func TestOnlyAnExitBeforeTheStartIsAHarnessThatDoesNotStart(t *testing.T) {
 	} {
 		if exitedBeforeStart(res) {
 			t.Errorf("%s: read as a harness that does not start", name)
+		}
+	}
+}
+
+// The agent-not-started marker is gone when the build's agent starts: with it in place, a kill during the paid agent
+// run would end that run at no cost. The fake user manager records, as the agent's unit starts, whether the marker
+// stood then.
+func TestTheMarkerIsGoneWhenTheAgentStarts(t *testing.T) {
+	fakeManager(t)
+	ctx := context.Background()
+	r, c := inputRunner(t)
+	r.Dir = shortScratch(t) // the run's relay socket fits Unix's bound
+	seen := filepath.Join(t.TempDir(), "seen")
+	bin := t.TempDir()
+	script(t, bin, "systemd-run", `case "$*" in *momentum-harness-*)
+  for host in '`+filepath.Join(r.Dir, "runs")+`'/.*-host; do
+    if [ -e "$host/`+notStartedMarker+`" ]; then echo marked >> '`+seen+`'; else echo unmarked >> '`+seen+`'; fi
+  done
+  exit 9;;
+esac`)
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	f := newRepo(t, nil)
+	r.Ship = shipWithSandbox(r.Store, f, Sandbox{})
+	r.Ship.Dir = r.Dir
+	r.Inputs.ReadDirs = []string{f.main}
+	r.Agent = Agent{Runner: []string{script(t, t.TempDir(), "harness", "exit 3")}, Model: "global.anthropic.claude-opus-5-5", Bedrock: testBedrock(t)}
+	mechanism, fix := "one cause", "one fix"
+	var err error
+	if c, err = r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	setCaseRepo(t, r.Store, c, "main")
+	if done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID}); err != nil || len(done) != 1 || done[0].Run.Step != StepBuild {
+		t.Fatalf("the build: %+v %v", done, err)
+	}
+	if got, err := os.ReadFile(seen); err != nil || string(got) != "unmarked\n" {
+		t.Fatalf("what the agent's start saw of the marker: %q %v", got, err)
+	}
+}
+
+// A stopped note its reader dismissed while the stop held keeps the stop's why. Once the stop holds the case no more,
+// the review pass says so in the note, so a later stop with the same why puts it again.
+func TestADismissedStoppedNoteDoesNotHideALaterStop(t *testing.T) {
+	s, _, c, p := b4Reviewed(t)
+	p.Reviews = nil
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	r := &Runner{Store: s.Store, Ship: s, Dir: s.Dir, Budgets: DefaultBudgets,
+		pass: &passInputs{attempted: true, err: errors.New("inputs reached")}}
+	id := store.ReviewNoteID(c.ID, "stopped")
+	same := "its last two review runs failed the same way: marker-7f3a"
+	if _, err := s.Store.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Importance: store.ImportanceLow, At: time.Now().Add(-time.Minute),
+		Title: "The loop's review for case " + c.ID + " waits: stopped", Detail: same}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Store.DoneNote(ctx, id, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if done := r.reviews(ctx, c.ID); len(done) != 1 || !strings.Contains(done[0].Skipped, "inputs reached") {
+		t.Fatalf("the review once the stop held no more: %+v", done)
+	}
+	if n, _, _ := s.Store.Note(ctx, id); n.Done.IsZero() || n.Detail != "the stop rule no longer holds the case" {
+		t.Fatalf("the dismissed note once the stop held no more: %+v", n)
+	}
+	for i := 0; i < 2; i++ {
+		at := time.Now()
+		if err := s.Store.PutLoopRun(ctx, store.LoopRun{ID: fmt.Sprint("review-", i), Case: c.ID, Step: StepReview, Family: c.Family,
+			Started: at, Ended: at.Add(time.Millisecond), Status: store.RunFailed, Failure: "marker-7f3a"}); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if done := r.reviews(ctx, c.ID); len(done) != 1 || !strings.Contains(done[0].Skipped, same) {
+		t.Fatalf("the later stop: %+v", done)
+	}
+	if n, _, _ := s.Store.Note(ctx, id); !n.Done.IsZero() || n.Detail != same {
+		t.Fatalf("a later stop with the dismissed note's why left the note done: %+v", n)
+	}
+}
+
+// Only a run as an investigation's harness never started counts with no start: other failures of an investigation
+// that never started (a summary the cleaner could not clean, a reservation that could not be read) do not.
+func TestOtherInvestigationsThatNeverStartedDoNotCount(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	base := time.Now().Add(-time.Hour)
+	for _, failure := range []string{"scrub", "reservation: database is locked"} {
+		c := openCase(t, st, "failures", failure, 1)
+		for i := 0; i < 2; i++ {
+			if err := st.PutLoopRun(ctx, store.LoopRun{ID: fmt.Sprint(c.ID, "-", i), Case: c.ID, Family: c.Family, Step: StepInvestigate,
+				Ended: base.Add(time.Duration(i) * time.Minute), Status: store.RunFailed, Failure: failure, Summary: "(summary withheld: the cleaner failed)"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if why, err := r.stopped(ctx, c, true); err != nil || why != "" {
+			t.Fatalf("two investigations that never started, failed as %s, stopped the case: %q %v", failure, why, err)
 		}
 	}
 }

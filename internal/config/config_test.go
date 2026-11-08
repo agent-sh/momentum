@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -53,7 +54,7 @@ func TestLoopAcceptsWholeConfigurationAndExpandsTacitStore(t *testing.T) {
 	cfg, home := t.TempDir(), t.TempDir()
 	t.Setenv("MOMENTUM_CONFIG", cfg)
 	t.Setenv("HOME", home)
-	raw := `{"loop":{"runner":["/fixture/claude"],"owners":["fixture"],"exclude":["fixture/other"],"repo_guard":["/fixture/guard"],"sandbox_read":["~/runtime"],"capacity_gate":["/fixture/capacity"],"live":true,"fallback_model":"global.anthropic.claude-sonnet-5-5","tacit_store":"~/facts","read_dirs":["~/repo"]}}`
+	raw := `{"loop":{"runner":["/fixture/claude"],"owners":["fixture"],"exclude":["fixture/other"],"repo_guard":["/fixture/guard"],"sandbox_read":["~/runtime"],"capacity_gate":["/fixture/capacity"],"capacity_hold_exit":[1,4],"live":true,"fallback_model":"global.anthropic.claude-sonnet-5-5","tacit_store":"~/facts","read_dirs":["~/repo"]}}`
 	if err := os.WriteFile(filepath.Join(cfg, "sources.json"), []byte(raw), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +62,7 @@ func TestLoopAcceptsWholeConfigurationAndExpandsTacitStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Loop.TacitStore != filepath.Join(home, "facts") || got.Loop.ReadDirs[0] != filepath.Join(home, "repo") || !got.Loop.Live || len(got.Loop.Owners) != 1 || len(got.Loop.Exclude) != 1 || len(got.Loop.RepoGuard) != 1 || len(got.Loop.CapacityGate) != 1 || len(got.Loop.SandboxRead) != 1 || got.Loop.FallbackModel == "" {
+	if got.Loop.TacitStore != filepath.Join(home, "facts") || got.Loop.ReadDirs[0] != filepath.Join(home, "repo") || !got.Loop.Live || len(got.Loop.Owners) != 1 || len(got.Loop.Exclude) != 1 || len(got.Loop.RepoGuard) != 1 || len(got.Loop.CapacityGate) != 1 || !slices.Equal(got.Loop.CapacityHoldExit, []int{1, 4}) || len(got.Loop.SandboxRead) != 1 || got.Loop.FallbackModel == "" {
 		t.Fatal("loop configuration was lost or not expanded")
 	}
 }

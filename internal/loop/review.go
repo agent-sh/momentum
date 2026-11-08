@@ -351,16 +351,21 @@ func (r *Runner) noteReviewSkip(ctx context.Context, c store.Case, cause, why st
 	return err
 }
 
-// endStoppedNote marks done a standing stopped note of a case's review once the stop rule holds the case no more
-// without a resume (a new episode, or a stop the rule no longer counts, such as two refusals a build kept before
-// causes were). Its detail says so first, so a later stop, whatever its why, puts the note again (noteReviewSkip).
+// stopEnded is the detail of a review's stopped note whose stop the rule holds no more (endStoppedNote).
+const stopEnded = "the stop rule no longer holds the case"
+
+// endStoppedNote marks done a stopped note of a case's review once the stop rule holds the case no more without a
+// resume (a new episode, or a stop the rule no longer counts, such as two refusals a build kept before causes were).
+// Its detail says so first, so a later stop, whatever its why, puts the note again (noteReviewSkip). A note done
+// already is skipped only when its detail says so: one its reader dismissed while the stop held keeps the stop's why,
+// which would hide a later stop for the same why.
 func (r *Runner) endStoppedNote(ctx context.Context, c store.Case) error {
 	id := store.ReviewNoteID(c.ID, "stopped")
 	n, ok, err := r.Store.Note(ctx, id)
-	if err != nil || !ok || !n.Done.IsZero() {
+	if err != nil || !ok || !n.Done.IsZero() && n.Detail == stopEnded {
 		return err
 	}
-	n.Detail = "the stop rule no longer holds the case"
+	n.Detail = stopEnded
 	if _, err := r.Store.PutNote(ctx, n); err != nil {
 		return err
 	}

@@ -165,6 +165,16 @@ func TestALoopRunKeepsItsCauseAndAnOlderTableGainsIt(t *testing.T) {
 	if err != nil || len(rs) != 3 || got["old"] != "" || got["put"] != cause || got["finished"] != cause {
 		t.Fatalf("the causes kept: %v %v", got, err)
 	}
+	// a run put again keeps the cause it is put with, another or none
+	for _, again := range []string{"refused: another reason", ""} {
+		if err := st.PutLoopRun(ctx, LoopRun{ID: "put", Case: c.ID, Family: "failures", Step: "build", Started: t0, Ended: t0.Add(time.Second),
+			Status: RunFailed, Failure: "build propose", Cause: again}); err != nil {
+			t.Fatal(err)
+		}
+		if r, err := st.LoopRunByID(ctx, "put"); err != nil || r.Cause != again {
+			t.Fatalf("a run put again with the cause %q: %+v %v", again, r, err)
+		}
+	}
 }
 
 // A loop_runs table from before the tokens by kind gains their columns and keeps its rows: the columns are the

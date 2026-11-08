@@ -2087,7 +2087,8 @@ func (s *Ship) repositoryPrivate(ctx context.Context, p Package) (bool, error) {
 		Private *bool `json:"isPrivate"`
 	}
 	if json.Unmarshal([]byte(raw), &visibility) != nil || visibility.Private == nil {
-		return false, refused("repository visibility is unknown")
+		// gh's answer does not parse: the host's condition, no refusal of the build's output
+		return false, errors.New("repository visibility is unknown")
 	}
 	return *visibility.Private, nil
 }

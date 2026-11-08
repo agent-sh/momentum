@@ -1293,8 +1293,9 @@ func stopCounts(run store.LoopRun) bool {
 }
 
 // oldBrokerText is how a run kept before the broker's outage had its own key (broker) told a broker env file that
-// could not be read: a build's at build run, an investigation's as its error.
-var oldBrokerText = regexp.MustCompile(`no Bedrock route: the broker's env file (?:\S+ )?cannot be read`)
+// could not be read: a build's at build run, an investigation's as its error. The file's path, when it names one, may
+// hold spaces.
+var oldBrokerText = regexp.MustCompile(`no Bedrock route: the broker's env file (?:.* )?cannot be read`)
 
 // oldBrokerOutage says a run that never started was kept, before the broker's outage had its own key, for a broker
 // env file that could not be read: a build at build run, an investigation as run. This build keeps such a run as the
