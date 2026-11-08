@@ -228,7 +228,7 @@ Host `evidence show` scrubs all headers and whole records in one batch, then cli
 }}
 ```
 
-`loop.owners`, `loop.exclude`, `loop.repo_guard`, `loop.sandbox_read`, `loop.capacity_gate` and `loop.live` control host builds and landing. A missing repository guard refuses writes. Run the pass from its own oneshot user unit after ingest.
+`loop.owners`, `loop.exclude`, `loop.repo_guard`, `loop.sandbox_read`, `loop.capacity_gate`, `loop.capacity_hold_exit` (the gate's exit statuses that mean no room now, default `[1]`) and `loop.live` control host builds and landing. A missing repository guard refuses writes. Run the pass from its own oneshot user unit after ingest.
 
 ## The ship tool
 

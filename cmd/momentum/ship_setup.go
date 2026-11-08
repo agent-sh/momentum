@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/agent-sh/momentum/internal/capacity"
 	"github.com/agent-sh/momentum/internal/config"
@@ -145,21 +146,42 @@ func busyIn(ctx context.Context, st *store.Store, dir string, ss map[int]capacit
 	return "", nil
 }
 
+// gateTimeout bounds one wait at the capacity gate.
+var gateTimeout = 10 * time.Minute
+
+// gateSaid is the end of what the capacity gate printed, on one line, for the loop's note of the hold or failure.
+func gateSaid(out []byte) string {
+	text := strings.Join(strings.Fields(string(out)), " ")
+	if text == "" {
+		return ""
+	}
+	if r := []rune(text); len(r) > 300 {
+		text = "..." + string(r[len(r)-300:])
+	}
+	return " (it said: " + text + ")"
+}
+
 func setupShip(st *store.Store, sources config.Sources) *loop.Ship {
 	c := sources.Loop
 	home := paths.Home()
 	ro, toolPath, goRoot, goModules := toolchains(home)
 	sb := loop.Sandbox{ReadOnly: append(ro, expandAll(c.SandboxRead)...), Cache: filepath.Join(loopDir(), "cache"), Scratch: filepath.Join(loopDir(), "tmp"), Path: toolPath, GoRoot: goRoot, GoModules: goModules}
 	if len(c.CapacityGate) > 0 {
+		sb.HoldExits = c.CapacityHoldExit
 		sb.Gate = func(ctx context.Context) error {
-			cctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+			cctx, cancel := context.WithTimeout(ctx, gateTimeout)
 			defer cancel()
 			cmd := exec.CommandContext(cctx, c.CapacityGate[0], c.CapacityGate[1:]...)
 			cmd.Env = loop.CleanEnv(nil)
-			if _, err := commandOutput(cmd, true); err != nil {
-				return fmt.Errorf("the machine has no room for the test now: %w", err)
+			out, err := commandOutput(cmd, true)
+			if err == nil {
+				return nil
 			}
-			return nil
+			if ctx.Err() == nil && errors.Is(cctx.Err(), context.DeadlineExceeded) {
+				// its own deadline ended the wait: the machine had no room all that time, which the loop holds on
+				err = fmt.Errorf("its wait passed %s: %w", gateTimeout, context.DeadlineExceeded)
+			}
+			return fmt.Errorf("the capacity gate %s: %w%s", filepath.Base(c.CapacityGate[0]), err, gateSaid(out))
 		}
 	}
 	gate := configGate(c)

@@ -86,6 +86,9 @@ type Loop struct {
 	Constraints []string `json:"constraints"`
 	// CapacityGate is a command that waits until the machine has room for a check's test and exits 0, or fails.
 	CapacityGate []string `json:"capacity_gate"`
+	// CapacityHoldExit are the gate's exit statuses that say the machine has no room now, a hold; none is [1], waitfor's
+	// deadline. Any other failure of the gate is the host's error at the check.
+	CapacityHoldExit []int `json:"capacity_hold_exit"`
 }
 
 // ErrNoSources means no sources file exists yet.

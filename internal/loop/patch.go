@@ -3,6 +3,7 @@ package loop
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -57,7 +58,8 @@ func readPatch(p Patch) ([]byte, error) {
 // applyPatch consumes the run's file once. Every later operation takes these bytes or host-owned objects.
 func (s *Ship) applyPatch(ctx context.Context, p Package, inputs []Patch) (string, []string, error) {
 	if p.Host == "" || p.BaseCommit == "" {
-		return "", nil, refused("the package has no host clone and base commit; prepare it again")
+		// the package's state, not the build's output: no refusal
+		return "", nil, errors.New("the package has no host clone and base commit; prepare it again")
 	}
 	in := Patch{}
 	if len(inputs) > 1 {

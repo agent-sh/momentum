@@ -539,7 +539,14 @@ func inTurn(families []string, last string) []string {
 
 func (r *Runner) buildSkipped(ctx context.Context, c store.Case, stage string, cause error) Done {
 	var outage *baseOutage
+	var busy *busyMachine
 	switch {
+	case errors.As(cause, &busy):
+		if ctx.Err() == nil {
+			if err := r.noteCapacityHold(ctx, c, cause.Error()); err != nil {
+				r.logf("build waiting note: %v", err)
+			}
+		}
 	case errors.As(cause, &outage):
 		// a mirror's hold has Git's line in the pass's log already, from the pass's fetch; a proposal read's is new
 		if outage.proposal && outage.line != "" {
@@ -631,16 +638,67 @@ func (r *Runner) noteBaseHold(ctx context.Context, c store.Case, why string, pro
 	return err
 }
 
-// The ends of a base or proposal note's hold, which endHoldNotes adds to the note it resolves.
+// The ends of a base, proposal or capacity note's hold, which endHoldNotes adds to the note it resolves.
 const (
 	baseFetched     = "It ended: a build of the case fetched its base."
 	proposalRead    = "It ended: its proposal branch was read."
 	caseLeftTesting = "It ended: the case left testing."
+	roomFound       = "It ended: the machine had room for the build's check."
 )
 
-// holdNoteEnded says whether a base or proposal note says its hold ended (endHoldNotes).
+// holdNoteEnded says whether a base, proposal or capacity note says its hold ended (endHoldNotes).
 func holdNoteEnded(n store.Note) bool {
-	return strings.HasSuffix(n.Detail, baseFetched) || strings.HasSuffix(n.Detail, proposalRead) || strings.HasSuffix(n.Detail, caseLeftTesting)
+	return strings.HasSuffix(n.Detail, baseFetched) || strings.HasSuffix(n.Detail, proposalRead) || strings.HasSuffix(n.Detail, caseLeftTesting) ||
+		strings.HasSuffix(n.Detail, roomFound)
+}
+
+// capacityNoteID is the note of a case's builds held because the machine has no room for their check.
+func capacityNoteID(caseID string) string { return "loop-build:" + store.IDPart(caseID) + ":capacity" }
+
+// noteCapacityHold notes a build held because the capacity gate said the machine has no room for its check: one note a
+// case, with what the gate said last, open until a build of the case finds room (endCapacityNote). Once the case's
+// builds have waited baseHoldRaise since the hold began, the note is raised to normal importance, as a base hold's is:
+// a gate that keeps saying no is a machine that never has room, or a gate that says no for another reason. A note a
+// person took out of the report stays out while its hold lasts at the importance it was taken out at, and comes back
+// once when that rises.
+func (r *Runner) noteCapacityHold(ctx context.Context, c store.Case, why string) error {
+	detail, err := Redact(ctx, why)
+	if err != nil {
+		return err
+	}
+	detail = store.CaseNoteText(detail)
+	id := capacityNoteID(c.ID)
+	n, ok, err := r.Store.Note(ctx, id)
+	if err != nil {
+		return err
+	}
+	going := ok && !holdNoteEnded(n) // the hold this note began goes on
+	since := r.now()
+	if going {
+		since = n.At
+	}
+	importance := store.ImportanceLow
+	if r.now().Sub(since) >= baseHoldRaise {
+		importance = store.ImportanceNormal
+	}
+	switch {
+	case going && !n.Done.IsZero() && importance <= n.Importance:
+		return nil // a person took it out of the report at this importance, while this hold lasts
+	case going && n.Done.IsZero() && importance <= n.Importance && n.Detail == detail:
+		return nil
+	}
+	_, err = r.Store.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Importance: importance, At: since,
+		Title: "The loop's build for case " + c.ID + " waits for room for its check", Detail: detail})
+	return err
+}
+
+// endCapacityNote ends a case's capacity note once a build of the case found room for its check.
+func (r *Runner) endCapacityNote(ctx context.Context, caseID string) error {
+	n, ok, err := r.Store.Note(ctx, capacityNoteID(caseID))
+	if err != nil || !ok {
+		return err
+	}
+	return endHoldNotes(ctx, r.Store, r.now(), []store.Note{n}, n.ID, roomFound)
 }
 
 // endBaseNotes ends a case's notes of builds held for their base, once their hold ended (why: a build fetched its
@@ -1119,12 +1177,23 @@ func stopCounts(run store.LoopRun) bool {
 	switch {
 	case run.Status == store.RunRefused || run.Status == store.RunRunning || run.Failure == "sandbox":
 		return false
-	case run.Started.IsZero() && oldBrokerOutage(run):
+	case run.Started.IsZero() && oldBrokerOutage(run), oldBusyCheck(run):
 		return false
 	case run.Started.IsZero():
-		return run.Step == StepBuild && run.Status == store.RunFailed && slices.Contains(hostStages, run.Failure)
+		// a build that never started counts at a host stage, or for a host error at a refusal stage (a capacity gate
+		// that cannot run, before the agent)
+		return run.Step == StepBuild && run.Status == store.RunFailed && (slices.Contains(hostStages, run.Failure) || run.Cause == hostCause)
 	}
 	return true
+}
+
+// oldBusyText is how a build kept before a busy machine was a hold told the capacity gate's refusal, at build check.
+var oldBusyText = regexp.MustCompile(`build check: the machine has no room for the test now`)
+
+// oldBusyCheck says a build was kept, before a machine with no room for its check was a hold, for the capacity gate's
+// refusal: this build holds such a pass and keeps no run, so the stop rule does not count the old ones either.
+func oldBusyCheck(run store.LoopRun) bool {
+	return run.Step == StepBuild && run.Failure == "build check" && run.Cause == "" && oldBusyText.MatchString(run.Summary)
 }
 
 // oldBrokerText is how a build kept before the broker's outage had its own key (broker) told a broker env file that

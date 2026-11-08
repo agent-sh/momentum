@@ -404,13 +404,20 @@ func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Re
 		return stageFailureIn(ctx, Result{}, "build toolchains", err)
 	}
 	inv.Binds, inv.Env = append(inv.Binds, binds...), env
-	// a machine with no room for the build's check holds the build before its agent spends anything; a gate that
-	// cannot run is left to the check, which counts it
+	// the build's check needs room: a machine with none holds the build before its agent spends anything, and a gate
+	// that cannot run fails it there, at no cost, as the host's error at the check, which the stop rule counts; a pass
+	// told to stop meanwhile ends the build there, stopped
 	if r.Ship == nil {
 		return stageFailureIn(ctx, Result{}, "build package", errors.New("build needs the host ship tool"))
 	}
-	if err := r.Ship.Sandbox.room(ctx); held(err) {
+	if err := r.Ship.Sandbox.room(ctx); err != nil {
+		if !held(err) && ctx.Err() == nil {
+			r.logf("build %s: the capacity gate failed before its agent: %v", c.ID, err)
+		}
 		return stageFailureIn(ctx, Result{}, "build check", err)
+	}
+	if err := r.endCapacityNote(ctx, c.ID); err != nil {
+		r.logf("capacity note of %s: %v", c.ID, err)
 	}
 	res, err := r.Agent.RunOrFallback(ctx, inv)
 	res.InputSummary = manifest.Summary()

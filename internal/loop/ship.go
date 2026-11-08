@@ -1730,7 +1730,8 @@ func (s *Ship) rollbackReceipt(ctx context.Context, p Package, why string) error
 // commitTree commits the exact validated object and advances only the expected branch head.
 func (s *Ship) commitTree(ctx context.Context, p Package, tree, parent, msg string) error {
 	if s.Identity[0] == "" || s.Identity[1] == "" {
-		return refused("no git identity: set user.name and user.email in the global git configuration")
+		// the host's configuration, not the build's output: no refusal
+		return errors.New("no git identity: set user.name and user.email in the global git configuration")
 	}
 	head, err := s.git(ctx, p.Host, "commit-tree", tree, "-p", parent, "-m", msg)
 	if err != nil {

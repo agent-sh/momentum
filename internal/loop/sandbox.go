@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -183,7 +184,19 @@ type Sandbox struct {
 	GoRoot, GoModules string
 	Timeout           time.Duration
 	Gate              func(context.Context) error // waits for room for a test (room)
+	// HoldExits are the gate's exit statuses that say the machine has no room now (room); none configured is [1],
+	// waitfor's deadline.
+	HoldExits []int
 }
+
+// busyMachine is a gate that ran and said the machine has no room for a test now: the build holds (a shipHold), and its
+// note says so (Runner.noteCapacityHold).
+type busyMachine struct{ err error }
+
+func (e *busyMachine) Error() string {
+	return "the machine has no room for the test now: " + e.err.Error()
+}
+func (e *busyMachine) Unwrap() error { return e.err }
 
 const DefaultTestTimeout = 20 * time.Minute
 
@@ -209,9 +222,10 @@ func (s Sandbox) spec(dir, scratch string, words, extra []string) (sandbox.Spec,
 		Limits: sandbox.Limits{RuntimeSec: int(timeout.Seconds()) + 60}, Argv: words}, nil
 }
 
-// room waits at the capacity gate for room for a test. A gate that ran and found none (it exited unsuccessfully, or its
-// own deadline ended it) is a hold, not a failure of the check: the next pass checks again. A gate that cannot run (its
-// program is gone) is the host's error at the check, which counts, and a pass told to stop is neither.
+// room waits at the capacity gate for room for a test. A gate that ran and said there is none (it exited with one of
+// HoldExits, or its own deadline ended it) is a hold, not a failure of the check: the next pass checks again. Any other
+// exit (a usage error, a flag the gate no longer knows) and a gate that cannot run (its program is gone) are the host's
+// error at the check, which counts, and a pass told to stop is neither.
 func (s Sandbox) room(ctx context.Context) error {
 	if s.Gate == nil {
 		return nil
@@ -220,9 +234,13 @@ func (s Sandbox) room(ctx context.Context) error {
 	if err == nil || ctx.Err() != nil {
 		return err
 	}
+	holds := s.HoldExits
+	if len(holds) == 0 {
+		holds = []int{1}
+	}
 	var exit *exec.ExitError
-	if errors.As(err, &exit) || errors.Is(err, context.DeadlineExceeded) {
-		return &shipHold{err: err}
+	if errors.As(err, &exit) && slices.Contains(holds, exit.ExitCode()) || errors.Is(err, context.DeadlineExceeded) {
+		return &shipHold{err: &busyMachine{err: err}}
 	}
 	return err
 }
