@@ -442,9 +442,10 @@ type caseEvent struct {
 	Found bool
 }
 
-// tool is the event's tool: the store's event's while the store holds it, else the one its evidence recorded when it
-// was filed (none, for evidence filed before evidence recorded tools whose event was gone when the column was added).
-// Where both are there they agree, but a record read again may give the event another, and then the store's decides.
+// tool is the event's tool: the store's event's while the store holds it, else the one its evidence recorded at its
+// last filing or a merge gave it (none, for evidence filed before evidence recorded tools whose event was gone when
+// the column was added). Where both are there they agree, but a record read again may give the event another, and
+// then the store's decides.
 func (e caseEvent) tool() string {
 	if e.Found {
 		return e.Event.Tool

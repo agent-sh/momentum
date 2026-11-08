@@ -482,7 +482,8 @@ func TestAToolFoundByItsEventsNeedsTwoIncidents(t *testing.T) {
 // the tool its evidence recorded when it was filed (#118): Bash is admitted where that is Bash, and refused where the
 // evidence recorded no tool (filed before evidence recorded tools, its event gone by the step that filled them in) or
 // another. An event the store still holds is of its own tool, whatever its evidence recorded. An Edit failure of the
-// loop's own is left out, held or lost: a lost one by the directory its evidence recorded.
+// loop's own is left out, held or lost: a lost one by the directory its evidence recorded, a held one by the
+// directory the store holds, whatever its evidence recorded.
 func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
 	now := time.Now().Truncate(time.Hour)
 	bash := serverSignal
@@ -684,6 +685,37 @@ func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
 			plan, err := (&Ship{Store: st, Dir: dir}).validPlan(t.Context(), c, bash, 7*aDay, "", now)
 			if g, _ := guardOf(t, plan); err != nil || g == nil || g.Unit != "tool" || g.Tool != "Bash" || g.Exposure != 224+6 {
 				t.Fatalf("a named tool beside an Edit failure of the loop's own: %+v %v", g, err)
+			}
+		})
+	}
+	for _, storedOwn := range []bool{false, true} {
+		t.Run(fmt.Sprint("a held Edit failure, the loop's own in the store: ", storedOwn, ", in its evidence: ", !storedOwn), func(t *testing.T) {
+			st, path := testStoreAt(t)
+			dir := t.TempDir()
+			stored, recorded := "/work/e", filepath.Join(dir, "runs", "r1")
+			if storedOwn {
+				stored, recorded = recorded, stored
+			}
+			edit := toolResult("edit-held", now.Add(-35*aDay), "edit-held", true)
+			edit.Tool, edit.Cwd = "Edit", stored
+			c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" }, edit)
+			db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(10000)")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if res, err := db.Exec(`UPDATE case_evidence SET cwd = ? WHERE case_id = ? AND ref = ?`, recorded, c.ID, "ev:"+edit.ID()); err != nil {
+				t.Fatal(err)
+			} else if n, _ := res.RowsAffected(); n != 1 {
+				t.Fatalf("rewrote %d rows", n)
+			}
+			plan, err := (&Ship{Store: st, Dir: dir}).validPlan(t.Context(), c, bash, 7*aDay, "", now)
+			g, _ := guardOf(t, plan)
+			switch {
+			case storedOwn && (err != nil || g == nil || g.Unit != "tool" || g.Tool != "Bash" || g.Exposure != 224+6):
+				t.Fatalf("an Edit failure the store holds as the loop's own: %+v %v", g, err)
+			case !storedOwn && (err == nil || !strings.Contains(err.Error(), alone)):
+				t.Fatalf("an Edit failure the store holds outside the loop's directory: %+v %v", g, err)
 			}
 		})
 	}

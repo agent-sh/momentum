@@ -95,7 +95,7 @@ func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead e
 	// the case's evidence from its own start, so a piece dated between the two is weighed by neither (SPEC, Exposure, a
 	// known limit; #140). A case with no event of the store gets no guard (events, below). An event is of its tool by
 	// caseEvent.tool: the store's event's, or for one the store lost (a rebuild, a stale row dropped) the tool its
-	// evidence recorded when it was filed, and none when it recorded none.
+	// evidence recorded at its last filing (or a merge), and none when it recorded none.
 	events, in, hit, own := 0, 0, 0, sig.Tool
 	for _, e := range evidence {
 		events++

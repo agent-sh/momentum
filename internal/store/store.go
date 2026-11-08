@@ -186,10 +186,12 @@ var keptIndexNames = slices.Concat([]string{"events_seq", "events_ts", "events_k
 // The seq triggers stamp a write sequence (Seq) on a row a write stored or rewrote without one: a build from before the
 // sequence writes none, and its rewrite of a row keeps the row's old one.
 //
-// case_evidence_recorded gives event evidence stored with no tool and no directory (a build from before them writes
-// neither) its event's, where the store holds the event; else another case's evidence of the same event, since such a
-// build's merge stores the duplicate's evidence in its target before it deletes the duplicate's: without it the merge
-// would drop what the duplicate recorded, for good once the event is gone. Both values come from one source.
+// A build from before the evidence's tool and directory writes neither. case_evidence_filed gives event evidence
+// stored with neither its event's, where the store holds the event. Such a build's merge stores the duplicate's
+// evidence in its target, then deletes the duplicate's, the only delete of evidence: case_evidence_deleted hands what
+// a deleted row recorded to the rows of the same event that recorded neither, so that merge keeps what the duplicate
+// recorded once its event is gone, whether the target held the event before or took it from the duplicate. A trigger's
+// body is fixed once a store holds it (IF NOT EXISTS keeps the old one), so a change to it is a step.
 const keptTriggers = `
 CREATE TRIGGER IF NOT EXISTS events_harness_insert AFTER INSERT ON events WHEN NEW.harness = 'claude-code'
 BEGIN UPDATE events SET harness = 'claude' WHERE rowid = NEW.rowid; END;
@@ -200,14 +202,15 @@ CREATE TRIGGER IF NOT EXISTS events_seq_insert AFTER INSERT ON events WHEN NEW.s
 BEGIN ` + bumpSeq + ` UPDATE events SET seq = (SELECT n FROM event_seq WHERE id = 1) WHERE rowid = NEW.rowid; END;
 CREATE TRIGGER IF NOT EXISTS events_seq_update AFTER UPDATE ON events WHEN NEW.seq = OLD.seq
 BEGIN ` + bumpSeq + ` UPDATE events SET seq = (SELECT n FROM event_seq WHERE id = 1) WHERE rowid = NEW.rowid; END;
-CREATE TRIGGER IF NOT EXISTS case_evidence_recorded AFTER INSERT ON case_evidence
+CREATE TRIGGER IF NOT EXISTS case_evidence_filed AFTER INSERT ON case_evidence
 WHEN NEW.tool = '' AND NEW.cwd = '' AND substr(NEW.ref, 1, 3) = 'ev:'
-BEGIN UPDATE case_evidence SET
-  tool = COALESCE((SELECT COALESCE(tool, '') FROM events WHERE id = substr(NEW.ref, 4)),
-    (SELECT tool FROM case_evidence WHERE ref = NEW.ref AND case_id != NEW.case_id AND (tool != '' OR cwd != '') ORDER BY added, case_id LIMIT 1), ''),
-  cwd = COALESCE((SELECT COALESCE(cwd, '') FROM events WHERE id = substr(NEW.ref, 4)),
-    (SELECT cwd FROM case_evidence WHERE ref = NEW.ref AND case_id != NEW.case_id AND (tool != '' OR cwd != '') ORDER BY added, case_id LIMIT 1), '')
-  WHERE case_id = NEW.case_id AND ref = NEW.ref; END;
+BEGIN UPDATE case_evidence SET tool = (SELECT COALESCE(tool, '') FROM events WHERE id = substr(NEW.ref, 4)),
+  cwd = (SELECT COALESCE(cwd, '') FROM events WHERE id = substr(NEW.ref, 4))
+  WHERE case_id = NEW.case_id AND ref = NEW.ref AND EXISTS (SELECT 1 FROM events WHERE id = substr(NEW.ref, 4)); END;
+CREATE TRIGGER IF NOT EXISTS case_evidence_deleted BEFORE DELETE ON case_evidence
+WHEN substr(OLD.ref, 1, 3) = 'ev:' AND (OLD.tool != '' OR OLD.cwd != '')
+BEGIN UPDATE case_evidence SET tool = OLD.tool, cwd = OLD.cwd
+  WHERE ref = OLD.ref AND case_id != OLD.case_id AND tool = '' AND cwd = ''; END;
 `
 
 // bumpSeq moves the write sequence one past the higher of its counter and the events' highest: it never goes down, a
@@ -217,7 +220,7 @@ const bumpSeq = `INSERT INTO event_seq (id, n) VALUES (1, COALESCE((SELECT MAX(s
   ON CONFLICT(id) DO UPDATE SET n = MAX(n, COALESCE((SELECT MAX(seq) FROM events), 0)) + 1;`
 
 var keptTriggerNames = []string{"events_harness_insert", "events_harness_update", "events_seq_insert", "events_seq_update",
-	"case_evidence_recorded"}
+	"case_evidence_filed", "case_evidence_deleted"}
 
 // derivedSchema makes the derived tables that are missing.
 const derivedSchema = `

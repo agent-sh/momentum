@@ -45,13 +45,15 @@ CREATE TABLE IF NOT EXISTS case_log (case_id TEXT NOT NULL, seq INTEGER NOT NULL
 // caseTableNames are the tables caseTables makes.
 var caseTableNames = []string{"cases", "case_signatures", "case_evidence", "case_log"}
 
-// caseIndexes find a case's signatures and its newest evidence.
+// caseIndexes find a case's signatures, its newest evidence, and the evidence of one reference in every case (the
+// triggers that keep what evidence recorded, keptTriggers).
 const caseIndexes = `
 CREATE INDEX IF NOT EXISTS case_signatures_case ON case_signatures(case_id);
 CREATE INDEX IF NOT EXISTS case_evidence_at ON case_evidence(case_id, at);
+CREATE INDEX IF NOT EXISTS case_evidence_ref ON case_evidence(ref);
 `
 
-var caseIndexNames = []string{"case_signatures_case", "case_evidence_at"}
+var caseIndexNames = []string{"case_signatures_case", "case_evidence_at", "case_evidence_ref"}
 
 // Families are the standing questions a case answers (SPEC, The questions it keeps asking).
 var Families = []string{"owner-burden", "blind-spots", "manual-work", "sessions", "pressure", "capacity",
