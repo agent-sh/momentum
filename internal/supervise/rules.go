@@ -23,10 +23,11 @@ const (
 	RuleStalled   = "stalled"   // a Claude Code turn waits on a model request that never got its reply
 	RuleOverdue   = "overdue"   // a wakeup or a loop run the session set came due long ago and did not fire
 	RulePromise   = "promise"   // the turn ended on a promise or a step it announced, and nothing will wake it
+	RuleNoReply   = "noreply"   // a Codex turn ended with no reply: no words of its own, nothing in flight
 )
 
 // Rules lists them in order.
-var Rules = []string{RuleTransient, RuleAccess, RuleCutoff, RuleReopened, RuleStalled, RuleOverdue, RulePromise}
+var Rules = []string{RuleTransient, RuleAccess, RuleCutoff, RuleReopened, RuleStalled, RuleNoReply, RuleOverdue, RulePromise}
 
 // Verdicts.
 const (
@@ -97,6 +98,7 @@ type Params struct {
 	ReopenWait   time.Duration
 	StalledWait  time.Duration // stalled: past the longest a reply legitimately takes to begin
 	StalledTries int
+	NoReplyWait  time.Duration // noreply: after the turn Codex closed with no reply; its tries are the stalled rule's
 	OverdueSlack time.Duration // overdue: past the latest a wakeup or a loop run that fired came
 	OverdueTries int
 	PromiseWait  time.Duration
@@ -116,6 +118,7 @@ var DefaultParams = Params{
 	ReopenWait:   2 * time.Minute,
 	StalledWait:  30 * time.Minute,
 	StalledTries: 2,
+	NoReplyWait:  2 * time.Minute,
 	OverdueSlack: 10 * time.Minute,
 	OverdueTries: 2,
 	PromiseWait:  17 * time.Minute,
@@ -126,7 +129,8 @@ var DefaultParams = Params{
 // Live are the rules that act by default; the others run dry, recording what they would have sent. A rule is live
 // when its replay acts unasked no more often than the owner's own nudges go to a session that would have gone on
 // by itself, or when the owner made it live over its replay, as he did stalled (SPEC.md, Supervision).
-var Live = map[string]bool{RuleTransient: true, RuleAccess: true, RuleStalled: true}
+// noreply is live as stalled is: a request that got no reply, which the owner otherwise answers himself.
+var Live = map[string]bool{RuleTransient: true, RuleAccess: true, RuleStalled: true, RuleNoReply: true}
 
 // Decision is what supervision does about one session now.
 type Decision struct {
@@ -173,7 +177,7 @@ func Plan(s Stop, tries Tries, p Params, probe Probe) Decision {
 
 // ruleFuncs are the rules, in Rules order.
 var ruleFuncs = map[string]func(Stop, Tries, Params, Probe) (Decision, bool){RuleTransient: transient, RuleAccess: access,
-	RuleCutoff: cutoff, RuleReopened: reopened, RuleStalled: stalled, RuleOverdue: overdue, RulePromise: promise}
+	RuleCutoff: cutoff, RuleReopened: reopened, RuleStalled: stalled, RuleNoReply: noReply, RuleOverdue: overdue, RulePromise: promise}
 
 // planRules is the first rule that applies to a stop, past the guards, with the time it acts, held while the
 // owner typed into the session recently.
@@ -346,6 +350,32 @@ func stalled(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
 		at, why = idle, why+"; its screen showed no turn running at "+s.ScreenIdle.Local().Format("15:04")+", which may be its owner's Escape"
 	}
 	return wait(RuleStalled, at, n+1, StalledText, why), true
+}
+
+// noReply: a Codex turn is over and has no words of its own: the input that opened it cleared the turn before's
+// (the session layer and the replay both start such a turn with none), and Codex closed it (task_complete) with no
+// agent message after. Nothing is in flight: no call, no background work, no error, no reopening. The session
+// asks nothing, it got no reply, and the owner would otherwise type "." himself. A turn that a subagent's message
+// or momentum's own message opened keeps the words before it, so a question there stays guarded by AsksOwner's
+// readers, and a promise stays the promise rule's. The harness says the turn is over, so the wait is a short one,
+// like cutoff's, counted from the turn's end, and the owner window holds it while he is at the session. The
+// message and the tries are the stalled rule's: a request that got no reply. A session layer that does not say
+// when its turn began leaves the rule off.
+func noReply(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
+	if s.Tool != "codex" || s.Working || s.Busy || s.Error != "" || s.Tasks > 0 || priorProcess(s) ||
+		s.TurnBegan.IsZero() || !s.ResumedAt.IsZero() || !s.WakeAt.IsZero() || s.Loop != "" || strings.TrimSpace(s.Words) != "" {
+		return Decision{}, false
+	}
+	n := tries[RuleNoReply]
+	if n >= p.StalledTries {
+		return used(RuleNoReply, n), true
+	}
+	end := s.IdleAt
+	if end.IsZero() || end.Before(s.TurnBegan) {
+		end = s.At
+	}
+	return wait(RuleNoReply, end.Add(p.NoReplyWait), n+1, StalledText,
+		"the turn that began at "+s.TurnBegan.Local().Format("15:04")+" ended with no reply"), true
 }
 
 // afterSleep counts a rule's wait, which began at from, from the machine's wake instead when the machine slept
