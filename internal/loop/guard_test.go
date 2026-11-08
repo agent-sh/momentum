@@ -629,6 +629,20 @@ func shown(t *testing.T, c store.Case) string {
 	return b.String()
 }
 
+// shownFigures is what `case show` prints of a case less its id and its package's path, the text a check for a figure
+// it must not give reads. Both hold digits that change from run to run (the id is random, the path a temporary
+// directory's random name), so a figure's digits found in them are no figure the case gives.
+func shownFigures(t *testing.T, c store.Case) string {
+	t.Helper()
+	s := shown(t, c)
+	for _, v := range []string{c.Package, c.ID} { // the package's path ends in the id: it goes first
+		if v != "" {
+			s = strings.ReplaceAll(s, v, "")
+		}
+	}
+	return s
+}
+
 // closeGuarded runs a guarded case's watch to its end, the tool in use every week, and returns the pass that closed it.
 func closeGuarded(t *testing.T, m *measured) Measured {
 	t.Helper()
