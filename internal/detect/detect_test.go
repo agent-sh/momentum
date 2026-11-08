@@ -713,6 +713,7 @@ func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
 		{"opencode", "read", "edit", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"filePath":"/w/@","newString":"x"}`, "Edit applied successfully."},
 		{"opencode", "read", "edit", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"filePath":"/w/@","newString":"x"}`, "Edited /w/@ (1 replacement)"},
 		{"opencode", "read", "write", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"filePath":"/w/@","content":"x"}`, "Wrote file successfully."},
+		{"opencode", "read", "write", `{"filePath":"/w/@"}`, "Error: File not found: /w/@", `{"filePath":"/w/@","content":"x"}`, "Wrote file successfully."},
 		{"opencode", "read", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Add File: /w/@\n+x\n*** End Patch"}`, "Success. Updated the following files: A /w/@"},
 		{"opencode", "read", "apply_patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Update File: /w/old\n*** Move to: /w/@\n@@\n+x\n*** End Patch"}`, "Success. Updated the following files: M /w/@"},
 		{"opencode", "read", "patch", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"patchText":"*** Begin Patch\n*** Update File: /w/@\n@@\n+x\n*** End Patch"}`, "Success. Updated the following files: M /w/@"},

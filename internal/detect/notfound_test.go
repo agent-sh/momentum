@@ -30,6 +30,10 @@ func TestANotFoundReadIsKeyedByThePathItMissed(t *testing.T) {
 		{"kimi", "Read", `"/w/a.md" does not exist.`, `{"line_offset":1,"path":"/w/a.md"}`, "miss:read:/w/a.md"},
 		{"hermes", "read_file", hermesMissing("/w/a.md"), `{"path":"/w/a.md","limit":200}`, "miss:read-file:/w/a.md"},
 		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory: '/w/a.md'"}`, `{"path":"/w/a.md"}`, "miss:read-file:/w/a.md"},
+		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory: '/home/u/p/a.md'"}`, `{"path":"~/p/a.md"}`, "miss:read-file:~/p/a.md"},
+		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory: \"/w/it's.md\""}`, `{"path":"/w/./it's.md"}`, "miss:read-file:/w/it's.md"},
+		{"opencode", "read", "Error: File not found: /w/a.md", `{"filePath":"/w/a.md"}`, "miss:read:/w/a.md"},
+		{"pi", "read", "ENOENT: no such file or directory, access '/w/docs/x.md'", `{"path":"@/w/docs/x.md"}`, "miss:read:/w/docs/x.md"},
 		{"opencode", "read", "File not found: /w/a.md Did you mean one of these? /w/b.md", `{"filePath":"/w/a.md"}`, "miss:read:/w/a.md"},
 		{"pi", "read", "ENOENT: no such file or directory, access '/w/a.md'", `{"path":"/w/a.md"}`, "miss:read:/w/a.md"},
 		{"grok", "read_file", "Error: /w/a.md does not exist. Note: your current working directory is /w", `{"limit":40,"target_file":"/w/a.md"}`, "miss:read-file:/w/a.md"},
@@ -66,7 +70,13 @@ func TestANotFoundReadIsKeyedByThePathItMissed(t *testing.T) {
 		{"kimi", "Read", `"/w/a" is not a file.`, `{"path":"/w/a"}`, "tool:read:Q is not a file"},
 		{"kimi", "Read", `Failed: "/w/a.md" does not exist.`, `{"path":"/w/a.md"}`, "tool:read:failed: Q does not exist"},
 		{"grok", "read_file", "Error: /w/a is a directory, not a file.", `{"target_file":"/w/a"}`, "tool:read-file:error: P is a directory, not a file"},
-		{"opencode", "read", "Error: File not found: /w/a.md", `{"filePath":"/w/a.md"}`, "tool:read:error: file not found: P"},
+		// Python's errno for a file that is not the read's: a terminal whose directory is gone names it for any read
+		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory: '/w/gone'"}`, `{"path":"/w/a.md"}`, "tool:read-file:[errno N] no such file or directory: Q"},
+		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory: '/w/gone'"}`, `{"path":"a.md"}`, "tool:read-file:[errno N] no such file or directory: Q"},
+		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory"}`, `{"path":"/w/a.md"}`, "tool:read-file:[errno N] no such file or directory"},
+		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory: '/w/xa.md'"}`, `{"path":"a.md"}`, "tool:read-file:[errno N] no such file or directory: Q"},
+		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory: '/w/a.md'"}`, "", "tool:read-file:[errno N] no such file or directory: Q"},
+		{"opencode", "read", "Error: Error: File not found: /w/a.md", `{"filePath":"/w/a.md"}`, "tool:read:error: error: file not found: P"},
 		{"pi", "read", "EACCES: permission denied, access '/w/a.md'", `{"path":"/w/a.md"}`, "tool:read:eacces: permission denied, access Q"},
 		{"codex", "read_file", "failed to read file: Permission denied (os error 13)", `{"file_path":"/w/a.md"}`, "tool:read-file:failed to read file: permission denied (os error N)"},
 		{"codex", "read_file", "File not found: /w/a.md", `{"file_path":"/w/a.md"}`, "tool:read-file:file not found: P"},
@@ -100,8 +110,20 @@ func TestARelativeMissIsReadInItsCallsDirectory(t *testing.T) {
 		{"kimi", "Read", `"../AGENTS.md" does not exist.`, `{"path":"../AGENTS.md"}`, "/w/a", "miss:read:/w/AGENTS.md"},
 		{"kimi", "Read", `"~/AGENTS.md" does not exist.`, `{"path":"~/AGENTS.md"}`, "/w/a", "miss:read:~/AGENTS.md"},
 		{"kimi", "Read", `"/w/b/AGENTS.md" does not exist.`, `{"path":"/w/b/AGENTS.md"}`, "/w/a", "miss:read:/w/b/AGENTS.md"},
-		{"hermes", "read_file", hermesMissing("/w/a/AGENTS.md"), `{"path":"AGENTS.md"}`, "/w/a", "miss:read-file:AGENTS.md"},
+		// Hermes's directory, or one the store does not know: the whole path its error names, else the path as spelled
+		{"hermes", "read_file", hermesMissing("/w/a/AGENTS.md"), `{"path":"AGENTS.md"}`, "/w/x", "miss:read-file:/w/a/AGENTS.md"},
+		{"hermes", "read_file", hermesMissing("/w/b/AGENTS.md"), `{"path":"AGENTS.md"}`, "/w/x", "miss:read-file:/w/b/AGENTS.md"},
+		{"hermes", "read_file", hermesMissing("/w/c/AGENTS.md"), `{"path":"AGENTS.md"}`, "/w/x", "miss:read-file:/w/c/AGENTS.md"},
+		{"hermes", "read_file", `{"error": "[Errno 2] No such file or directory: '/w/t/x.md'"}`, `{"path":"x.md"}`, "", "miss:read-file:/w/t/x.md"},
+		{"hermes", "read_file", hermesMissing("AGENTS.md"), `{"path":"AGENTS.md"}`, "/w/a", "miss:read-file:AGENTS.md"},
+		{"opencode", "read", "File not found: /w/o/x.md Did you mean one of these? /w/o/y.md", `{"filePath":"x.md"}`, "", "miss:read:/w/o/x.md"},
+		{"opencode", "read", "Error: File not found: /w/o/x.md\n\nDid you mean one of these?\n/w/o/y.md", `{"filePath":"x.md"}`, "", "miss:read:/w/o/x.md"},
+		{"grok", "read_file", "Error: /w/g/x.md does not exist. Note: your current working directory is /w/g", `{"target_file":"x.md"}`, "", "miss:read-file:/w/g/x.md"},
+		{"pi", "read", "ENOENT: no such file or directory, access '/w/p/x.md'", `{"path":"x.md"}`, "", "miss:read:/w/p/x.md"},
+		{"pi", "read", "ENOENT: no such file or directory, access '/w/a/docs/x.md'", `{"path":"@docs/x.md"}`, "/w/a", "miss:read:/w/a/docs/x.md"},
 		{"kimi", "Read", `"AGENTS.md" does not exist.`, `{"path":"AGENTS.md"}`, "", "miss:read:AGENTS.md"},
+		{"kimi", "Read", `"~" does not exist.`, `{"path":"~"}`, "/w/a", "miss:read:~"},
+		{"kimi", "Read", `"@a.md" does not exist.`, `{"path":"@a.md"}`, "", "miss:read:@a.md"},
 		{"kimi", "Read", `"AGENTS.md" does not exist.`, `{"path":"AGENTS.md"}`, "w/a", "miss:read:AGENTS.md"},
 	} {
 		k, ok := failureKey(c.harness, c.tool, c.text, store.Call{Input: c.call, Cwd: c.cwd})
@@ -159,6 +181,9 @@ func TestALongMissedPathIsHashed(t *testing.T) {
 	if tab := key("/w/a\tb.md"); tab == odd {
 		t.Fatalf("a tab and a line break share a key: %q", tab)
 	}
+	if wide := "/w/" + strings.Repeat("é", keyChars-3); key(wide) != wide {
+		t.Fatalf("a path of %d characters in %d bytes is kept whole: %q", keyChars, len(wide), key(wide))
+	}
 	if short := key("/w/" + strings.Repeat("e", keyChars-3)); utf8.RuneCountInString(short) != keyChars || strings.Contains(short, "#") {
 		t.Fatalf("a path of %d characters is kept whole: %q", keyChars, short)
 	}
@@ -192,7 +217,7 @@ func TestANotFoundReadRecursOnlyByItsPath(t *testing.T) {
 		t.Fatalf("one path: %+v, %v", outs, err)
 	}
 	c := outs[0].Filed[0].Case
-	if !slices.Equal(c.Signatures, []string{"failures/v2:miss:read:~/p/AGENTS.md"}) || c.Evidence != 3 || c.Title != "The same path keeps missing: ~/p/AGENTS.md" {
+	if !slices.Equal(c.Signatures, []string{"failures/v2:miss:read:~/p/AGENTS.md"}) || c.Evidence != 3 || c.Title != "The same path keeps missing through read: ~/p/AGENTS.md" {
 		t.Fatalf("case %+v", c)
 	}
 	if cs, err := st.Cases(ctx, store.CaseFilter{All: true}); err != nil || len(cs) != 1 {
@@ -241,5 +266,19 @@ func TestEachHarnesssMissIsKeyedByItsPath(t *testing.T) {
 				t.Fatalf("found %v, %v, want %v", got, err, want)
 			}
 		})
+	}
+}
+
+// Hermes's terminal whose directory is gone fails every read with Python's errno for that directory: the reads of
+// different paths are one failure, which recurs.
+func TestAGoneTerminalDirectoryRecursAsOneFailure(t *testing.T) {
+	st := testStore(t)
+	f := fileTools{harness: "hermes"}
+	gone := `{"error": "[Errno 2] No such file or directory: '/w/gone'"}`
+	put(t, st, slices.Concat(f.pair("s1", "read_file", `{"path":"/w/a.md"}`, gone, true, t0), f.pair("s1", "read_file", `{"path":"/w/b.md"}`, gone, true, t0.Add(time.Minute)),
+		f.pair("s2", "read_file", `{"path":"c.md"}`, gone, true, t0.Add(2*time.Minute)))...)
+	fs, err := Failures{}.Detect(context.Background(), st, week())
+	if got, want := signatures(fs), []string{"failures/v2:tool:read-file:[errno N] no such file or directory: Q 3"}; err != nil || !slices.Equal(got, want) {
+		t.Fatalf("found %v, %v, want %v", got, err, want)
 	}
 }

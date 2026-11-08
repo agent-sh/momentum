@@ -206,17 +206,29 @@ var modeKeys = map[string]bool{"mode": true}
 
 // missForms are each harness's read tool's own words for a file that is not there, at its error's start, as its
 // source writes them: Claude Code's Read, Kimi's Read (the path in quotes), Grok's read_file (after its envelope's
-// "Error: "), OpenCode's read, Hermes's read_file (its JSON's error field, its missing file's or Python's), pi's read
-// (Node's error for the access it makes first), Codex's read_file. Access refused, a guard's or the harness's refusal,
-// and any other error that says something does not exist (Hermes's terminal directory gone) are none of them.
+// "Error: "), OpenCode's read (after "Error: " as 1.2.0 to 1.2.27 stored it), Hermes's read_file (its JSON's error
+// field, its missing file's or Python's), pi's read (Node's error for the access it makes first), Codex's read_file.
+// Access refused, a guard's or the harness's refusal, and any other error that says something does not exist (Hermes's
+// terminal directory gone) are none of them.
 var missForms = map[string]*regexp.Regexp{
 	"claude":   regexp.MustCompile(`^File does not exist\.`),
 	"kimi":     regexp.MustCompile(`^".*" does not exist\.`),
 	"grok":     regexp.MustCompile(`^Error: .* does not exist\.`),
-	"opencode": regexp.MustCompile(`^File not found: `),
+	"opencode": regexp.MustCompile(`^(?:Error: )?File not found: `),
 	"hermes":   regexp.MustCompile(`^(?:File not found: |\[Errno 2\] No such file or directory)`),
 	"pi":       regexp.MustCompile(`^ENOENT: no such file or directory`),
 	"codex":    regexp.MustCompile(`^failed to read file: No such file or directory`),
+}
+
+// missNames are the file a harness's words for a miss name (the first group that matched): Kimi's as its call spelled
+// it; Grok's, OpenCode's, Hermes's and pi's as the tool resolved it; Python's errno's the file it could not open, which
+// need not be the read's. Claude Code's and Codex's name none.
+var missNames = map[string]*regexp.Regexp{
+	"kimi":     regexp.MustCompile(`^"(.*)" does not exist\.`),
+	"grok":     regexp.MustCompile(`^Error: (.*?) does not exist\.`),
+	"opencode": regexp.MustCompile(`(?s)^(?:Error: )?File not found: (.*?)(?:\s+Did you mean one of these\?.*)?$`),
+	"hermes":   regexp.MustCompile(`^(?:File not found: (.*)|\[Errno 2\] No such file or directory: (?:'(.*)'|"(.*)"))$`),
+	"pi":       regexp.MustCompile(`^ENOENT: no such file or directory, access '(.*)'`),
 }
 
 // pathKeys are the fields of a file tool's input that name its file; readPathKeys, a read tool's, Grok's
@@ -226,12 +238,12 @@ var (
 	readPathKeys = map[string]bool{"file_path": true, "filePath": true, "path": true, "target_file": true}
 )
 
-// notFound says a failed result is a read tool's own error that no file is at its path, in its harness's words
-// (missForms): Claude Code's in its tool_use_error or not, Hermes's in its JSON's error field.
-func notFound(harness, tool, text string) bool {
+// missWords are a failed result's words when they are a read tool's own error that no file is at its path, in its
+// harness's words (missForms): Claude Code's in its tool_use_error or not, Hermes's in its JSON's error field.
+func missWords(harness, tool, text string) (string, bool) {
 	re := missForms[harness]
 	if re == nil || !readTools[strings.ToLower(tool)] {
-		return false
+		return "", false
 	}
 	text = strings.TrimSpace(text)
 	if harness == "hermes" { // its error field, in a result the store cut after it too
@@ -243,10 +255,59 @@ func notFound(harness, tool, text string) bool {
 		} else if m := hermesErrRe.FindStringSubmatch(text); m != nil {
 			text = unescape(m[1])
 		} else {
-			return false
+			return "", false
 		}
 	}
-	return re.MatchString(strings.TrimPrefix(text, "<tool_use_error>"))
+	text = strings.TrimPrefix(text, "<tool_use_error>")
+	return text, re.MatchString(text)
+}
+
+// missOf is the path a read tool's failed result missed, before missedPath, and whether the result is a miss: its
+// harness's words for one (missWords), and for Python's errno a name that is the read's own path, since Hermes passes
+// on the errno of a terminal whose directory is gone, which names that directory for any read. The path is the call's
+// (pi's without the leading @ it strips); a relative one is read in the call's directory when that is a whole path, but
+// for Hermes, whose read_file resolves it in its terminal's directory, which a cd moves; else it is the whole path the
+// error names, if it names one; else it stays as spelled. A path that opens with ~ is the home's. A miss whose call
+// names no path has none.
+func missOf(harness, tool, text string, c store.Call) (string, bool) {
+	words, ok := missWords(harness, tool, text)
+	if !ok {
+		return "", false
+	}
+	named := ""
+	if re := missNames[harness]; re != nil {
+		if m := re.FindStringSubmatch(words); m != nil {
+			named = firstOf(m[1:]...)
+		}
+	}
+	p, _, _ := callField(c.Input, readPathKeys)
+	if harness == "pi" {
+		p = strings.TrimPrefix(p, "@")
+	}
+	if harness == "hermes" && strings.HasPrefix(words, "[Errno 2]") && !names(named, p) {
+		return "", false
+	}
+	switch {
+	case p == "", path.IsAbs(p), p == "~", strings.HasPrefix(p, "~/"):
+	case harness != "hermes" && path.IsAbs(c.Cwd):
+		p = path.Join(c.Cwd, p)
+	case path.IsAbs(named):
+		p = named
+	}
+	return p, true
+}
+
+// names says the file an error names is a read's path p: the same path, ~ read as the home, or, for a relative p, that
+// path in some directory.
+func names(named, p string) bool {
+	if named == "" || p == "" {
+		return false
+	}
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		p = paths.Home() + p[1:]
+	}
+	named, p = path.Clean(named), path.Clean(p)
+	return named == p || !path.IsAbs(p) && strings.HasSuffix(named, "/"+p)
 }
 
 // missedPath is the path a read found no file at as its key holds it: cleaned (no . or .. left in it) and the home
@@ -409,7 +470,7 @@ func (k FailureKey) Title() string {
 	case "mcp":
 		return "The " + name + " MCP server keeps failing: " + k.Text
 	case "miss":
-		return "The same path keeps missing: " + k.Text
+		return "The same path keeps missing through " + name + ": " + k.Text
 	}
 	return "The " + name + " tool keeps failing: " + k.Text
 }
@@ -496,7 +557,7 @@ var (
 // setup's failure or says nothing to key it by: the owner's own no, and a call the harness cancelled because
 // another one beside it failed.
 //
-// A read tool's own error that no file is at its path (notFound) is keyed miss:TOOL by the path its call names
+// A read tool's own error that no file is at its path (missOf) is keyed miss:TOOL by the path its call names
 // (missedPath), not by its words, which would merge every path into one: only the same path missed again recurs. No
 // key of a failure's words opens with miss:, so the two never meet. A read whose call names no path (a call unknown,
 // cut before its path, or none at all, as for the mistakes log, whose input the store does not keep for a tool error)
@@ -505,20 +566,19 @@ func FailureOf(harness, tool, text, call string) (FailureKey, bool) {
 	return failureKey(harness, tool, text, store.Call{Input: call})
 }
 
-// failureKey is FailureOf's key for a result with its call as the store keeps it: a relative path a read missed is
-// read in the directory the call was made in, when that is a whole path, but for Hermes, whose read_file resolves it
-// in its terminal's directory, which a cd moves. A path that opens with ~ is the home's.
+// failureKey is FailureOf's key for a result with its call as the store keeps it, its directory too, which a relative
+// path a read missed is read in (missOf).
 func failureKey(harness, tool, text string, c store.Call) (FailureKey, bool) {
 	k, ok := failureOf(harness, tool, text, c.Input)
-	if !ok || !notFound(harness, tool, text) {
+	if !ok {
 		return k, ok
 	}
-	p, _, _ := callField(c.Input, readPathKeys)
-	if p == "" {
+	p, miss := missOf(harness, tool, text, c)
+	switch {
+	case !miss:
+		return k, ok
+	case p == "":
 		return FailureKey{}, false
-	}
-	if home := p == "~" || strings.HasPrefix(p, "~/"); !path.IsAbs(p) && !home && harness != "hermes" && path.IsAbs(c.Cwd) {
-		p = path.Join(c.Cwd, p)
 	}
 	return FailureKey{Origin: "miss:" + slug(tool, 30), Text: missedPath(p)}, true
 }
