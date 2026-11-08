@@ -571,6 +571,16 @@ func TestKimiInlineSkillIsGeneratedInput(t *testing.T) {
 		// A wire from before Kimi marked a skill's part holds the body as the prompt's first unmarked text part.
 		{"unmarked skill of an older wire", typed, kimiRecord("turn.prompt", map[string]any{"origin": kimiSkillOrigin(map[string]any{}),
 			"input": []any{text("marker-7f3a skill body"), text("marker-7f3a typed")}}), split, []string{"marker-7f3a typed"}},
+		// The fallback takes the first unmarked text parts, after any image or marked part before them.
+		{"unmarked skill after an image", typed, kimiRecord("turn.prompt", map[string]any{"origin": kimiSkillOrigin(map[string]any{}),
+			"input": []any{image, text("marker-7f3a skill body"), text("marker-7f3a typed")}}), split, []string{"marker-7f3a typed"}},
+		{"unmarked skill after a marked hook", typed, kimiRecord("turn.prompt", map[string]any{"origin": kimiSkillOrigin(map[string]any{}),
+			"input": []any{map[string]any{"type": "text", "text": "hook output", "meta": map[string]any{"source": "user prompt submit hook"}},
+				text("marker-7f3a skill body"), text("marker-7f3a typed")}}), split, []string{"marker-7f3a typed"}},
+		// Words tacit's own rule takes from him (a turn that opens with a tag is the harness's) are read as on main:
+		// the skill does not add an empty turn of his for them.
+		{"skill and words tacit takes", typed, kimiRecord("turn.prompt", map[string]any{"origin": kimiSkillOrigin(map[string]any{}),
+			"input": []any{kimiSkillPart("marker-7f3a skill body"), text("<neutral>marker-7f3a tagged</neutral>")}}), body, nil},
 		// The older-wire fallback reads a list of parts: input that is not one is his words.
 		{"input that is not a list", typed, kimiRecord("turn.prompt", map[string]any{"origin": kimiSkillOrigin(map[string]any{}),
 			"input": "marker-7f3a typed"}), map[string]string{"marker-7f3a typed": "owner owner_text"}, []string{"marker-7f3a typed"}},
@@ -588,7 +598,7 @@ func TestKimiInlineSkillIsGeneratedInput(t *testing.T) {
 			}
 			st := openStore(t)
 			ingest(t, transcripts(home), st)
-			if got := promptActors(t, st); !maps.Equal(got, tc.want) {
+			if got := actorsOf(t, st, "marker-7f3a skill body", "marker-7f3a typed"); !maps.Equal(got, tc.want) {
 				t.Fatalf("prompt stored as %v, want %v", got, tc.want)
 			}
 			if got := ownerTexts(t, st); !slices.Equal(got, tc.owner) {
@@ -705,6 +715,17 @@ func TestKimiSystemBlocksAreGeneratedInput(t *testing.T) {
 		{"two blocks with his words between them", []any{text(noteText + "marker-7f3a typed " + context)},
 			map[string]string{"marker-7f3a note": "harness harness_text", "marker-7f3a context": "harness harness_text",
 				"marker-7f3a typed": "owner owner_text"}, []string{"marker-7f3a typed"}},
+		{"two blocks at the start", []any{text(noteText + context + "marker-7f3a typed")},
+			map[string]string{"marker-7f3a note": "harness harness_text", "marker-7f3a context": "harness harness_text",
+				"marker-7f3a typed": "owner owner_text"}, []string{"marker-7f3a typed"}},
+		{"two blocks at the end", []any{text("marker-7f3a typed\n" + noteText + context)},
+			map[string]string{"marker-7f3a note": "harness harness_text", "marker-7f3a context": "harness harness_text",
+				"marker-7f3a typed": "owner owner_text"}, []string{"marker-7f3a typed"}},
+		// A known opening whose closing tag is on the next line is no block of a client's: they write theirs on one.
+		{"a known opening closed on the next line", []any{text("marker-7f3a typed"),
+			text(open + "Image compressed to fit model limits: marker-7f3a note\n" + end + " marker-7f3a after")},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a note": "owner owner_text", "marker-7f3a after": "owner owner_text"},
+			[]string{"marker-7f3a typed " + open + "Image compressed to fit model limits: marker-7f3a note " + end + " marker-7f3a after"}},
 		{"a system block he typed or pasted", []any{text("marker-7f3a typed " + pasted)},
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a pasted": "owner owner_text"}, []string{"marker-7f3a typed " + pasted}},
 		// A paste that is a block alone is left to tacit, as on main: its rule makes a turn that opens with a tag the
@@ -718,6 +739,58 @@ func TestKimiSystemBlocksAreGeneratedInput(t *testing.T) {
 			home := t.TempDir()
 			path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed", "agents", "main", "wire.jsonl")
 			writeJSONLines(t, path, kimiRecord("turn.prompt", map[string]any{"origin": map[string]any{"kind": "user"}, "input": tc.input}),
+				kimiRecord("turn.ended", map[string]any{}))
+			kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a typed"}`)
+			st := openStore(t)
+			ingest(t, transcripts(home), st)
+			if got := actorsOf(t, st, labels...); !maps.Equal(got, tc.want) {
+				t.Fatalf("prompt stored as %v, want %v", got, tc.want)
+			}
+			if got := ownerTexts(t, st); !slices.Equal(got, tc.owner) {
+				t.Fatalf("owner turns %q, want %q", got, tc.owner)
+			}
+		})
+	}
+}
+
+// Kimi's web server writes a notice for each file a prompt attaches, a whole text part built from the name, type, size
+// and path its origin's attachments keep, and Kimi writes a fixed notice in place of an image the model cannot take.
+// Both are generated input when they can be rebuilt exactly; a notice its origin does not list, and words that only
+// look like one, stay his.
+func TestKimiClientNoticesAreGeneratedInput(t *testing.T) {
+	text := func(s string) map[string]any { return map[string]any{"type": "text", "text": s} }
+	notice := "Attached file \"marker-7f3a a.txt\" (text/plain, 12 bytes): /neutral/a.txt \u2014 open it with the Read tool"
+	listed := map[string]any{"kind": "user", "attachments": []any{map[string]any{"name": "marker-7f3a a.txt", "mediaType": "text/plain", "size": 12,
+		"path": "/neutral/a.txt"}}}
+	plain := map[string]any{"kind": "user"}
+	unsupported := "[Image omitted: \"marker-7f3a shot.heic\" uses unsupported image format image/heic. The current model provider accepts only " +
+		"PNG, JPEG, GIF, and WebP \u2014 convert it to PNG or JPEG and try again.]"
+	malformed := "[Image omitted: \"data:image/png;base64,marker-7f3a bad\u2026\" is not a valid data URL (its header or payload could not be parsed). " +
+		"Re-encode the image as PNG or JPEG and try again.]"
+	labels := []string{"marker-7f3a typed", "marker-7f3a a.txt", "marker-7f3a shot", "marker-7f3a bad", "marker-7f3a mine"}
+	for _, tc := range []struct {
+		name   string
+		origin map[string]any
+		input  []any
+		want   map[string]string
+		owner  []string
+	}{
+		{"an attached-file notice its origin lists", listed, []any{text("marker-7f3a typed"), text(notice)},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a a.txt": "harness harness_text"}, []string{"marker-7f3a typed"}},
+		{"an attached-file notice its origin does not list", plain, []any{text("marker-7f3a typed"), text(notice)},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a a.txt": "owner owner_text"}, []string{"marker-7f3a typed " + notice}},
+		{"an unsupported image notice", plain, []any{text("marker-7f3a typed"), text(unsupported)},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a shot": "harness harness_text"}, []string{"marker-7f3a typed"}},
+		{"a malformed image notice", plain, []any{text("marker-7f3a typed"), text(malformed)},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a bad": "harness harness_text"}, []string{"marker-7f3a typed"}},
+		{"words that look like a notice", plain, []any{text("marker-7f3a typed"), text("[Image omitted: marker-7f3a mine]")},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a mine": "owner owner_text"},
+			[]string{"marker-7f3a typed [Image omitted: marker-7f3a mine]"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed", "agents", "main", "wire.jsonl")
+			writeJSONLines(t, path, kimiRecord("turn.prompt", map[string]any{"origin": tc.origin, "input": tc.input}),
 				kimiRecord("turn.ended", map[string]any{}))
 			kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a typed"}`)
 			st := openStore(t)

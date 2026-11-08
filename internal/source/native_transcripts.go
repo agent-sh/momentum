@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -542,8 +543,9 @@ func (s *nativeState) kimi(o map[string]any) []evidence.Event {
 		if typed {
 			s.kimiProvenance()
 		}
-		// The text parts Kimi generated into a prompt (an inline skill's body, a hook's output) are generated input,
-		// as a slash command's activation is. Only the rest of the input is the prompt's words (kimiInput).
+		// The text Kimi and its clients generated into a prompt (an inline skill's body, a hook's output, a client's
+		// notice) is generated input, as a slash command's activation is. Only the rest is the prompt's words
+		// (kimiInput).
 		generated, words, unknown := kimiInput(o["input"], origin)
 		s.sources += unknown
 		prior := s.Prior
@@ -551,9 +553,9 @@ func (s *nativeState) kimi(o map[string]any) []evidence.Event {
 		s.Prior = prior
 		owner := typed && s.Owner
 		rest := s.user("kimi", words, owner, typed && !s.Known, at, input)
-		if owner && generated != "" && !slices.ContainsFunc(rest, func(e evidence.Event) bool { return e.Kind == evidence.KindOwnerText }) {
-			// A prompt he sent is his turn though what Kimi generated into it left none of his words: it holds
-			// empty text.
+		if owner && generated != "" && strings.TrimSpace(words) == "" {
+			// A prompt he sent is his turn though what was generated into it left none of his words: it holds empty
+			// text. Words tacit's own rules take from him are read as on main, with no turn added.
 			e := s.event("kimi", evidence.KindOwnerText, "", at)
 			e.Who, e.Prior, e.InputKind = evidence.Owner, prior, input
 			rest = append(rest, e)
@@ -603,9 +605,9 @@ const (
 
 // kimiBlock is one of the two system blocks Kimi's clients write for the model into a person's text: the image
 // compression note (the TUI, the web and ACP servers), a text part of its own, and VS Code's editor context, at
-// the start of his first text part or, for a prompt of text only, at its end. Each opens with its own words, runs
-// to the next closing tag on its line and takes a newline after it. Any other system block is text he may have
-// typed or pasted. The tag is built from parts so this file holds none.
+// the start of the first text part of a list prompt, or appended to a string prompt. Each opens with its own
+// words, runs to the next closing tag on its line and takes a newline after it. Any other system block is text he
+// may have typed or pasted. The tag is built from parts so this file holds none.
 var kimiBlock = regexp.MustCompile(`<` + `system>(?:Image compressed to fit model limits:|Editor context \(use only if relevant to user's query\): ).*?</` + `system>\n?`)
 
 // kimiResource and kimiResourceLink are a whole text part the ACP server writes for a resource a client attached:
@@ -616,16 +618,43 @@ var (
 	kimiResourceLink = regexp.MustCompile(`\A<resource_link uri="[^"]*" name="[^"]*" />\z`)
 )
 
+// kimiImageOmitted is the whole text part Kimi's engine and its web server write in place of an image the model
+// cannot take: an unsupported format (named or not, with the provider's accepted formats) or a data URL that cannot
+// be parsed, each in its fixed words.
+var kimiImageOmitted = regexp.MustCompile(`\A\[Image omitted: (?:(?:unsupported image format \S+|".*" uses unsupported image format \S+)\. ` +
+	`The current model provider accepts only (?:[^,\n]+(?:, [^,\n]+)*)?, and [^,\n]+ \x{2014} convert it to PNG or JPEG and try again\.|` +
+	`".*" is not a valid data URL \(its header or payload could not be parsed\)\. Re-encode the image as PNG or JPEG and try again\.)\]\z`)
+
+// kimiAttached are the notices Kimi's web server writes, each a whole text part, for the files a user-origin prompt
+// attaches: rebuilt from the name, type, size and path its origin.attachments keeps for each.
+func kimiAttached(origin map[string]any) map[string]bool {
+	list, _ := origin["attachments"].([]any)
+	if str(origin, "kind") != "user" || len(list) == 0 {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, a := range list {
+		m := object(a)
+		size, ok := m["size"].(float64)
+		if !ok {
+			continue
+		}
+		out["Attached file \""+str(m, "name")+"\" ("+str(m, "mediaType")+", "+strconv.FormatFloat(size, 'f', -1, 64)+" bytes): "+
+			str(m, "path")+" \u2014 open it with the Read tool"] = true
+	}
+	return out
+}
+
 // kimiInput splits a prompt's input into the text Kimi generated into it and the rest, the prompt's words. These
 // are generated: a text part with any meta.source (Kimi marks a skill's rendered body and a hook's output so, and
 // its clients send the person's text with none); on a wire from before Kimi marked skill parts, in a user-origin
 // prompt with no part marked "skill activation", the first text parts with no meta.source, one per activation its
-// origin.skillActivations bundles, which Kimi reads as the skill's; a whole ACP resource part (kimiResource); and a
-// known system block at the start or the end of any other text part (kimiBlock). The notices a client writes with
-// no tag (the web server's attached-file notice, the "[Image omitted: ...]" one for an image the model cannot
-// take) and the ACP server's bare file paths cannot be told from his words and stay in them. unknown counts the
-// parts whose meta.source is not one Kimi is known to write; they are generated all the same. Only text counts, as
-// in nativeText.
+// origin.skillActivations bundles, which Kimi reads as the skill's; a whole ACP resource part (kimiResource); a
+// whole notice part that can be rebuilt exactly (kimiAttached, kimiImageOmitted); and the known system blocks at the
+// start or the end of any other text part (kimiBlock). What cannot be rebuilt exactly, such as an attached-file
+// notice its origin does not list or the ACP server's bare file paths, stays in his words. unknown counts the parts
+// whose meta.source is not one Kimi is known to write; they are generated all the same. Only text counts, as in
+// nativeText.
 func kimiInput(input any, origin map[string]any) (generated, words string, unknown int) {
 	parts, listed := input.([]any)
 	if !listed {
@@ -639,6 +668,7 @@ func kimiInput(input any, origin map[string]any) (generated, words string, unkno
 	if activations, ok := origin["skillActivations"].([]any); ok && listed && str(origin, "kind") == "user" && !slices.ContainsFunc(parts, skill) {
 		bundled = len(activations)
 	}
+	attached := kimiAttached(origin)
 	var gen, own []any
 	for _, b := range parts {
 		p := object(b)
@@ -655,16 +685,24 @@ func kimiInput(input any, origin map[string]any) (generated, words string, unkno
 			gen = append(gen, b)
 		case text && (kimiResource.MatchString(str(p, "text")) || kimiResourceLink.MatchString(str(p, "text"))):
 			gen = append(gen, b)
+		case text && (attached[str(p, "text")] || kimiImageOmitted.MatchString(str(p, "text"))):
+			gen = append(gen, b)
 		case text:
+			// The known blocks that open the part, one after another, and those that close it.
 			t := str(p, "text")
 			lo, hi := 0, len(t)
 			blocks := kimiBlock.FindAllStringIndex(t, -1)
-			if len(blocks) > 0 && blocks[0][0] == 0 {
-				lo = blocks[0][1]
+			i := 0
+			for ; i < len(blocks) && blocks[i][0] == lo; i++ {
+				lo = blocks[i][1]
+			}
+			for j := len(blocks) - 1; j >= i && blocks[j][1] == hi; j-- {
+				hi = blocks[j][0]
+			}
+			if lo > 0 {
 				gen = append(gen, map[string]any{"type": "text", "text": t[:lo]})
 			}
-			if n := len(blocks); n > 0 && blocks[n-1][1] == len(t) && blocks[n-1][0] >= lo {
-				hi = blocks[n-1][0]
+			if hi < len(t) {
 				gen = append(gen, map[string]any{"type": "text", "text": t[hi:]})
 			}
 			own = append(own, map[string]any{"type": "text", "text": t[lo:hi]})
