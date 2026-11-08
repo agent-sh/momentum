@@ -184,8 +184,8 @@ func role(e store.Event, m map[string]any) string {
 			// another session's message, which tacit credits to an agent when it does not know the tag: an input of the
 			// session's own that the model answers, not the model's words. The store marks it by its origin (origin
 			// peer), which the live tracker reads too, or a harness line when Claude Code queued it as meta, whatever
-			// tag it opens with. tacit gives that mark only to a line the harness wrote (a meta line, a meta queued
-			// command, a line shown in the transcript only), never to the model's words.
+			// tag it opens with. tacit gives that mark only to a line the harness wrote (a meta queued command, a line
+			// shown in the transcript only; a meta line it marks a meta line), never to the model's words.
 			return "self"
 		}
 		return "agent"
@@ -205,11 +205,11 @@ func role(e store.Event, m map[string]any) string {
 		return "synthetic"
 	case why == "momentum supervise":
 		return "momentum"
-	case strings.HasPrefix(s, "<task-notification>"):
+	case claude.Notification(s):
 		return "self"
 	case strings.HasPrefix(s, "# Autonomous loop tick"), m["prior"] == "scheduled_task_fire":
 		return "self"
-	case claude.PeerMessage(s), why == "origin peer":
+	case claude.PeerMessage(s), why == "origin peer", peerOrigin(e, why):
 		return "self"
 	case strings.HasPrefix(why, "hermes notice "):
 		if strings.Contains(why, "steer") {
@@ -247,11 +247,36 @@ func role(e store.Event, m map[string]any) string {
 }
 
 // fromPeer reports an event of another session's message: by its text, by the store's mark of a record Claude Code
-// says came from a peer (tacit's origin peer), or as an agent's text the store marks a harness line, a message
-// another session sent that Claude Code queued as meta, whatever tag it opens with.
+// says came from a peer (tacit's origin peer), as an agent's text the store marks a harness line, a message another
+// session sent that Claude Code queued as meta, whatever tag it opens with, or by the origin of a meta record's
+// line in its transcript (peerOrigin).
 func fromPeer(e store.Event, m map[string]any) bool {
 	why, _ := m["why"].(string)
-	return why == "origin peer" || e.Kind == "agent_text" && why == "harness line" || claude.PeerMessage(e.Summary)
+	return why == "origin peer" || e.Kind == "agent_text" && why == "harness line" || claude.PeerMessage(e.Summary) || peerOrigin(e, why)
+}
+
+// peerOrigin reports a Claude Code meta record that came from another session, as the live tracker reads it: its
+// origin, peer, read from its line in the transcript while the transcript is there (a user record's origin, a queued
+// command's attachment's). tacit marks a meta line (meta line) and a meta queued command (harness line) before it
+// reads the origin, so the store does not keep it; without the transcript such a record is read by its text alone.
+func peerOrigin(e store.Event, why string) bool {
+	if e.Harness != "claude" || why != "meta line" && why != "harness line" {
+		return false
+	}
+	line := recordAt(e.Ref)
+	if line == nil {
+		return false
+	}
+	type origin struct {
+		Kind string `json:"kind"`
+	}
+	var r struct {
+		Origin     origin `json:"origin"`
+		Attachment struct {
+			Origin origin `json:"origin"`
+		} `json:"attachment"`
+	}
+	return json.Unmarshal(line, &r) == nil && (r.Origin.Kind == "peer" || r.Attachment.Origin.Kind == "peer")
 }
 
 type replayTask struct {
@@ -696,12 +721,10 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 	// notified follows a task's notification: a wakeup it says was lost, a sign for a pending one, the tasks it
 	// closes
 	notified := func(summary string, at time.Time) {
-		if strings.HasPrefix(summary, "<task-notification>") {
-			if hWakeGone.MatchString(summary) {
-				wake = replayWake{}
-			} else {
-				waitedThrough("a task's notification came in while it waited", at)
-			}
+		if hWakeGone.MatchString(summary) {
+			wake = replayWake{}
+		} else {
+			waitedThrough("a task's notification came in while it waited", at)
 		}
 		st := hStatus.FindStringSubmatch(summary)
 		for _, tm := range hTaskID.FindAllStringSubmatch(summary, -1) {
@@ -732,9 +755,10 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		}
 		if enqueued[e.SourceKey] {
 			// a notification at the time it was queued, delivered as an input later: it closes its task now, as the
-			// live tracker reads the queue
-			if r == "self" && !fromPeer(e, m) { // another session's message is no notification of its own tasks
-				if strings.HasPrefix(e.Summary, "<task-notification>") && !strings.Contains(e.Summary, "</task-notification>") {
+			// live tracker reads the queue. Another session's message is no notification of its own tasks, and an input
+			// that only quotes one is none.
+			if r == "self" && !fromPeer(e, m) && claude.Notification(e.Summary) {
+				if !strings.Contains(e.Summary, "</task-notification>") {
 					e.Summary = whole(e)
 				}
 				notified(e.Summary, e.TS)
@@ -909,9 +933,9 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 					wake = replayWake{}
 				}
 			}
-			// another session's message is an input, not a notice of this session's tasks or of its reopening, as the
-			// live tracker reads it
-			if !fromPeer(e, m) {
+			// another session's message is an input, not a notice of this session's tasks or of its reopening, and
+			// neither is an input that only quotes a notification (a loop's prompt), as the live tracker reads them
+			if !fromPeer(e, m) && claude.Notification(e.Summary) {
 				notified(e.Summary, e.TS)
 				if claude.Orphaned(e.Summary) { // reopened: what ran died with the process
 					reopened(e.TS)

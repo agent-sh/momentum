@@ -190,6 +190,50 @@ func TestWhatCameWhileAWakeupWaitedIsASignItWasLost(t *testing.T) {
 	}
 }
 
+// Only a task's notification is a sign that a pending wakeup may be lost: the attachment that delivers a queued one
+// (type queued_command) is, with no enqueue before it. Any other attachment that quotes the tag is not (a snapshot of
+// the prompt, whose tools' descriptions do, a skill's text, or one that carries a notification as its prompt), and
+// neither is a prompt that only quotes it: a loop's, queued or as the meta line it runs as, a headless run's, queued
+// and as its user text, or one its user typed while the turn ran.
+func TestOnlyANotificationIsASignToAWakeup(t *testing.T) {
+	notice := tag("task-notification") + tag("task-id") + "bt1" + closing("task-id") + tag("status") + "completed" + closing("status") +
+		closing("task-notification")
+	tick := "# Autonomous loop tick\nRead each " + notice + " as it comes."
+	asked := "Explain what a " + notice + " record holds."
+	attachment := func(a map[string]any) func(x *script) {
+		return func(x *script) { x.add(map[string]any{"type": "attachment", "attachment": a}) }
+	}
+	const sign = "a task's notification came in while it waited"
+	for name, c := range map[string]struct {
+		came func(x *script)
+		sign string
+	}{
+		"a queued command's notification": {attachment(map[string]any{"type": "queued_command", "commandMode": "task-notification",
+			"origin": map[string]any{"kind": "task-notification"}, "prompt": notice}), sign},
+		"a prompt snapshot": {attachment(map[string]any{"type": "prompt_snapshot", "tools": []any{map[string]any{"name": "Monitor",
+			"description": "Each event arrives as " + notice + "."}}}), ""},
+		"a skill's text": {attachment(map[string]any{"type": "invoked_skills", "skills": []any{map[string]any{"name": "loop",
+			"content": "Wait for the " + notice + " before you go on."}}}), ""},
+		"another attachment with a notification for its prompt": {attachment(map[string]any{"type": "invoked_skills", "prompt": notice}), ""},
+		"a loop's prompt, queued":                               {func(x *script) { x.queue("enqueue", tick) }, ""},
+		"a loop's prompt as its meta line": {func(x *script) {
+			x.add(map[string]any{"type": "user", "isMeta": true, "promptSource": "system", "message": map[string]any{"content": tick}})
+		}, ""},
+		"a headless run's prompt": {func(x *script) {
+			x.queue("enqueue", asked).add(map[string]any{"type": "user", "promptSource": "sdk", "entrypoint": "sdk-cli",
+				"message": map[string]any{"role": "user", "content": asked}})
+		}, ""},
+		"a prompt typed meanwhile": {attachment(map[string]any{"type": "queued_command", "commandMode": "prompt",
+			"origin": map[string]any{"kind": "human"}, "prompt": asked}), ""},
+	} {
+		x, _ := soak(t)
+		c.came(x)
+		if s := x.facts(NewTracker(x.path), x.at); first(s).Sign != c.sign {
+			t.Errorf("%s: sign %q, want %q", name, first(s).Sign, c.sign)
+		}
+	}
+}
+
 func TestALoopsNextRunIsDueWithItsDelay(t *testing.T) {
 	inUTC(t)
 	// Recent versions write the schedule in words: the expression is the call's.

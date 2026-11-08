@@ -270,23 +270,8 @@ func (t *Tracker) line(raw []byte) {
 	}()
 	t.answered(e, at)
 	if e.Message == nil {
-		// Notifications that arrive mid-turn are queued: recorded as queue operations and attachments. Another
-		// session's message queued so is no notice of this session's tasks, whatever it quotes.
-		if (e.Type == "queue-operation" || e.Type == "attachment") && bytes.Contains(raw, []byte("<task-notification>")) {
-			var q struct {
-				Content    string `json:"content"`
-				Attachment struct {
-					Prompt string `json:"prompt"`
-					Origin struct {
-						Kind string `json:"kind"`
-					} `json:"origin"`
-				} `json:"attachment"`
-			}
-			json.Unmarshal(raw, &q)
-			s := text.FirstNonEmpty(q.Content, q.Attachment.Prompt)
-			if e.origin() != "peer" && q.Attachment.Origin.Kind != "peer" && !PeerMessage(s) {
-				t.notified(s, at)
-			}
+		if s, ok := queuedNotice(e.Type, raw); ok {
+			t.notified(s, at)
 		}
 		switch e.Type {
 		case "api-request":
@@ -309,6 +294,37 @@ func (t *Tracker) line(raw []byte) {
 	case "user":
 		t.user(e, at, open)
 	}
+}
+
+// queuedNotice is a task's notification that Claude Code queued while a turn ran, and its text: the record of its
+// queueing (an operation of the queue, which names it) or of its delivery (an attachment of type queued_command),
+// whose text is a notification. Any other attachment can quote the tag (a snapshot of the prompt, whose tools'
+// descriptions may, or a skill's text), and so can a prompt Claude Code queued (a loop's, a headless run's), and none
+// of them is a notice. Another session's message queued so is no notice of this session's tasks either, whatever it
+// quotes: by the attachment's origin; its text opens with its own tag or words, never as a notification does.
+func queuedNotice(kind string, raw []byte) (string, bool) {
+	if kind != "queue-operation" && kind != "attachment" || !bytes.Contains(raw, []byte("<task-notification>")) {
+		return "", false
+	}
+	var q struct {
+		Content    string `json:"content"`
+		Attachment struct {
+			Type   string `json:"type"`
+			Prompt string `json:"prompt"`
+			Origin struct {
+				Kind string `json:"kind"`
+			} `json:"origin"`
+		} `json:"attachment"`
+	}
+	json.Unmarshal(raw, &q)
+	s := q.Content
+	if kind == "attachment" {
+		if q.Attachment.Type != "queued_command" || q.Attachment.Origin.Kind == "peer" {
+			return "", false
+		}
+		s = q.Attachment.Prompt
+	}
+	return s, Notification(s)
 }
 
 // answered clears the request the turn waits on when a record of the conversation follows it: a reply or an
@@ -667,6 +683,10 @@ func (t *Tracker) user(e line, at time.Time, open bool) {
 // a reopening as this tracker does.
 func Orphaned(s string) bool { return reOrphan.MatchString(s) }
 
+// Notification reports a task's notification by its text, as Claude Code writes one: it opens with its tag. A prompt
+// or a skill's text that only quotes the tag is none. The replay reads a notification as this tracker does.
+func Notification(s string) bool { return strings.HasPrefix(s, "<task-notification>") }
+
 // PeerMessage reports another session's message by its text, as Claude Code writes it into the session: in one of
 // its tags, or after the words it opens one with. The replay reads another session's message as this tracker does.
 func PeerMessage(s string) bool {
@@ -700,7 +720,7 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 		}
 		return
 	}
-	if strings.Contains(s, "<task-notification>") {
+	if Notification(s) { // a prompt that only quotes the tag (a loop's, a headless run's) is read as any other
 		t.notified(s, at)
 		st.LastMain, st.QueuedPrompt = "user", time.Time{}
 		if reOrphan.MatchString(s) {

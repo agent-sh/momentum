@@ -941,14 +941,17 @@ func taskDone(id, status, summary string) string {
 }
 
 // queuedInputs are what Claude Code queues while a turn runs and delivers into it after the record it waited for,
-// dating each record when it was queued: a task's notification, which the store marks by its command mode, and
-// another session's message (from a peer), which the store keeps as a harness line when it is meta, as the
-// harness's text or, for a tag tacit does not know, an agent's, and by its origin when it is not.
+// dating each record when it was queued: a task's notification, which the store marks by its command mode, or a
+// harness line when it is meta, and another session's message (from a peer), which the store keeps as a harness line
+// when it is meta, as the harness's text or, for a tag tacit does not know, an agent's, and by its origin when it is
+// not.
 var queuedInputs = []struct {
 	name, kind, text, why string
 	actor                 store.Actor
 }{
 	{"notification", "harness_text", taskDone("b0", "completed", `Background command "lint" completed (exit code 0)`), "", store.ActorHarness},
+	{"meta-notification", "harness_text", taskDone("b0", "completed", `Background command "lint" completed (exit code 0)`), "harness line",
+		store.ActorHarness},
 	{"agent-message", "harness_text", tag(`agent-message from="worker"`) + "The build is green." + closing("agent-message"), "harness line", store.ActorHarness},
 	{"cross-session", "agent_text", peerText("Review done, two nits."), "harness line", store.ActorAgent},
 	{"unknown-tag", "agent_text", tag(`team-message from="lead"`) + "Review done, two nits." + closing("team-message"), "harness line", store.ActorAgent},
@@ -963,10 +966,24 @@ func (r *recorded) queuedInput(after time.Duration, queuedAt time.Time, name str
 			continue
 		case name == "notification":
 			return r.queued(after, queuedAt, q.text)
+		case name == "meta-notification":
+			return r.queuedMeta(after, queuedAt, q.text)
 		}
 		return r.queuedPeer(after, queuedAt, q.kind, q.actor, q.why, "prompt", q.text)
 	}
 	r.t.Fatalf("no queued input %q", name)
+	return r
+}
+
+// queuedMeta is a task's notification Claude Code queued at queuedAt as meta and delivered after the records before
+// it: the store marks it a harness line, before it reads its command mode.
+func (r *recorded) queuedMeta(after time.Duration, queuedAt time.Time, text string) *recorded {
+	off, _ := r.line(after, map[string]any{"type": "attachment", "timestamp": queuedAt.Format(time.RFC3339Nano),
+		"attachment": map[string]any{"type": "queued_command", "commandMode": "task-notification", "isMeta": true,
+			"origin": map[string]any{"kind": "task-notification"}, "prompt": text}})
+	r.evs = append(r.evs, store.Event{Source: store.Transcripts, SourceKey: storeKey(r.path, off, 0), TS: queuedAt, Session: r.session,
+		Harness: "claude", Actor: store.ActorHarness, Kind: "harness_text", Summary: storeCut(text), Meta: `{"why":"harness line"}`,
+		Ref: fmt.Sprintf("%s@%d#0", r.path, off)})
 	return r
 }
 
@@ -1025,7 +1042,10 @@ func TestAQueuedPeerMessageIsReadAfterTheResultItFollows(t *testing.T) {
 	st := testStore(t)
 	results := map[string]time.Time{}
 	texts := map[string]string{}
-	for _, q := range queuedInputs[1:] {
+	for _, q := range queuedInputs {
+		if strings.HasPrefix(q.text, tag("task-notification")) {
+			continue // a notification: this reads the peer messages
+		}
 		for _, shape := range []string{"", "-gone", "-no-mode"} {
 			session, gone, mode := q.name+shape, shape == "-gone", "prompt"
 			if shape == "-no-mode" {
@@ -1214,13 +1234,17 @@ func (r *recorded) background(after time.Duration, id string) *recorded {
 }
 
 // peerRecord is another session's message Claude Code wrote as a user record when it came, as the store keeps it:
-// by its origin (why origin peer), or as a meta line (why meta line), an older version's, with no origin.
-func (r *recorded) peerRecord(after time.Duration, kind string, actor store.Actor, why, text string) *recorded {
+// by its origin (why origin peer), or as a meta line (why meta line), which the store keeps without the origin its
+// record carries (none when origin is empty).
+func (r *recorded) peerRecord(after time.Duration, kind string, actor store.Actor, why, origin, text string) *recorded {
 	rec := map[string]any{"type": "user", "message": map[string]any{"role": "user", "content": text}}
-	switch why {
-	case "origin peer":
-		rec["origin"] = map[string]any{"kind": "peer"}
-	case "meta line":
+	if why == "origin peer" {
+		origin = "peer"
+	}
+	if origin != "" {
+		rec["origin"] = map[string]any{"kind": origin}
+	}
+	if why == "meta line" {
 		rec["isMeta"] = true
 	}
 	return r.event(after, rec, kind, actor, "", storeCut(text), `{"why":"`+why+`"}`)
@@ -1238,9 +1262,11 @@ func (r *recorded) thought(after time.Duration) *recorded {
 // words for a reopening, and one that quotes a task's id with a completed status leave the session's background
 // command running. So do both of the first and the last, one queued during a call and delivered after its result,
 // one the store marks by its origin rather than as meta, one Claude Code queued as meta in a tag tacit does not
-// know (an agent's text the store marks a harness line), and the shapes a user record takes: the words an older
-// version opens one with (a meta line), and one marked by its origin whose text opens with a tag of the harness's
-// (harness text).
+// know (an agent's text the store marks a harness line), one queued as meta that opens as a task's notification, which
+// only the origin on its attachment in the transcript tells, and the shapes a user record takes: a meta line in the
+// words Claude Code opens one with, with the origin its record carries or with none, a meta line in other words,
+// or that opens as a task's notification, which only the origin on its record in the transcript tells (the store
+// does not keep it), and one marked by its origin whose text opens with a tag of the harness's (harness text).
 func TestAPeerMessageIsNoNoticeOfTheSessionsTasks(t *testing.T) {
 	st := testStore(t)
 	timeout := "The suite didn't finish before the 10 minute timeout here."
@@ -1251,6 +1277,7 @@ func TestAPeerMessageIsNoNoticeOfTheSessionsTasks(t *testing.T) {
 		why, text string
 		kind      string // the store's kind: an agent's text unless set
 		record    bool   // a user record, not a queued command's attachment
+		origin    string // the origin a meta line's record carries
 	}
 	meta := func(body string) message { return message{why: "harness line", text: peerText(body)} }
 	rows := map[string]struct {
@@ -1265,8 +1292,15 @@ func TestAPeerMessageIsNoNoticeOfTheSessionsTasks(t *testing.T) {
 		"origin":            {msgs: []message{{why: "origin peer", text: status}}},
 		"unknown-tag":       {msgs: []message{{why: "harness line", text: unknown(status)}, {why: "harness line", text: unknown(reopening)}}},
 		"unknown-tag-queue": {msgs: []message{{why: "harness line", text: unknown(status)}}, queued: true},
-		"older": {msgs: []message{{why: "meta line", text: "Another Claude session sent a message:\n" + status, kind: "harness_text",
+		"queued-origin-notice": {msgs: []message{{why: "harness line", text: taskDone("b9", "completed", "Background command finished"),
+			kind: "harness_text"}}, queued: true},
+		"words": {msgs: []message{{why: "meta line", text: "Another Claude session sent a message:\n" + status, kind: "harness_text",
+			record: true, origin: "peer"}}},
+		"words-alone": {msgs: []message{{why: "meta line", text: "Another Claude session sent a message:\n" + status, kind: "harness_text",
 			record: true}}},
+		"meta-origin": {msgs: []message{{why: "meta line", text: status, kind: "harness_text", record: true, origin: "peer"}}},
+		"meta-origin-notice": {msgs: []message{{why: "meta line", text: taskDone("b9", "completed", "Background command finished"),
+			kind: "harness_text", record: true, origin: "peer"}}},
 		"origin-harness": {msgs: []message{{why: "origin peer", text: tag("system-reminder") + "From the reviewer." + closing("system-reminder") +
 			" " + status, kind: "harness_text", record: true}}},
 	}
@@ -1282,7 +1316,7 @@ func TestAPeerMessageIsNoNoticeOfTheSessionsTasks(t *testing.T) {
 			}
 			switch {
 			case msg.record:
-				b.peerRecord(10*time.Minute, kind, actor, msg.why, msg.text)
+				b.peerRecord(10*time.Minute, kind, actor, msg.why, msg.origin, msg.text)
 			case row.queued:
 				b.owner(time.Minute, "lint it meanwhile").call(time.Second, "t2")
 				called := b.at
@@ -1339,6 +1373,42 @@ func TestAQueuedInputIntoAnOpenTurnBeginsNoTurn(t *testing.T) {
 	}
 }
 
+// A task's notification Claude Code queued during a call closes its task however the store marks it: by its command
+// mode, or a harness line when it is meta (the harness's text, not an agent's, so no other session's message), with
+// its transcript or without.
+func TestAQueuedNotificationClosesItsTaskHoweverTheStoreMarksIt(t *testing.T) {
+	st := testStore(t)
+	var names []string
+	for _, q := range queuedInputs {
+		if !strings.HasPrefix(q.text, tag("task-notification")) {
+			continue
+		}
+		for _, gone := range []bool{false, true} {
+			session := q.name
+			if gone {
+				session += "-gone"
+			}
+			b := newRecorded(t, session).owner(0, "lint it in the background").background(time.Second, "b0")
+			b.say(5*time.Second, "Linting in the background.").owner(time.Minute, "and run the suite").call(time.Second, "t1")
+			called := b.at
+			b.result(time.Minute, "t1").queuedInput(0, called.Add(30*time.Second), q.name).say(5*time.Second, "Both done.")
+			if gone {
+				if err := os.Remove(b.path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			b.put(st)
+			names = append(names, session)
+		}
+	}
+	points, _ := replayAll(t, st)
+	for _, session := range names {
+		if p, ok := lastPoint(points, session); !ok || p.Stop.Tasks != 0 || p.Stop.Phase == sessions.Background {
+			t.Errorf("%s: the last stop (found %v): %d tasks, phase %s", session, ok, p.Stop.Tasks, p.Stop.Phase)
+		}
+	}
+}
+
 // Claude Code's words for a reopening are its own: background tasks that did not finish before the previous session
 // ended. A task's notification that a command did not finish before its timeout is no reopening: the session's
 // other background command still runs, and nothing reopened it.
@@ -1369,7 +1439,7 @@ func TestAnInputThatWasNotQueuedIsReadWhereItWasWritten(t *testing.T) {
 	st := testStore(t)
 	text := "Two nits on the diff."
 	input := newRecorded(t, "after-input").owner(0, "review the diff").thought(time.Second)
-	input.peerRecord(time.Second, "agent_text", store.ActorAgent, "origin peer", text)
+	input.peerRecord(time.Second, "agent_text", store.ActorAgent, "origin peer", "", text)
 	inputAt := input.at
 	input.say(5*time.Second, "Fixing them.").put(st)
 	began := map[string]time.Time{"after-input": inputAt}
@@ -1377,7 +1447,7 @@ func TestAnInputThatWasNotQueuedIsReadWhereItWasWritten(t *testing.T) {
 		b := newRecorded(t, name).owner(0, "run the suite").call(time.Second, "t1").result(time.Minute, "t1").thought(2 * time.Second)
 		b.line(time.Second, map[string]any{"type": "system", "subtype": "turn_duration"})
 		if name == "after-result" {
-			b.peerRecord(10*time.Minute, "agent_text", store.ActorAgent, "origin peer", text)
+			b.peerRecord(10*time.Minute, "agent_text", store.ActorAgent, "origin peer", "", text)
 		} else {
 			b.event(10*time.Minute, map[string]any{"type": "user", "origin": map[string]any{"kind": "human"}, "message": map[string]any{"content": "and the docs"}},
 				"owner_text", store.ActorOwner, "", "and the docs", `{"input_kind":"typed","prior":"turn_duration"}`)
@@ -1482,9 +1552,11 @@ func ownerLine(session string, line map[string]any) map[string]any {
 // and, through the transcripts source, by the replay, leaves the same background work and phase at its end, and
 // neither reads a reopening. A peer's message that quotes a whole task notification for the running command, or
 // Claude Code's words for a reopening, leaves the command running in both, in each way Claude Code writes one: a
-// user record by its origin, the words an older version opens one with, a queued command's attachment in a tag the
-// store's reader knows or one it does not, with the queue's enqueue before it. A task's own notification closes the
-// command in both, and one that a command timed out reopens nothing in either.
+// user record by its origin, the words Claude Code opens one with, a meta record that only its origin marks (a user
+// record, or a queued command's attachment), a queued command's attachment in a tag the store's reader knows or one
+// it does not, with the queue's enqueue before it. A loop's prompt that quotes the notification leaves it running
+// too. A task's own notification closes the command in both, as a user record or as the attachment that delivers a
+// queued one with no enqueue before it, and one that a command timed out reopens nothing in either.
 func TestTheTrackerAndTheReplayReadAPeerMessageAlike(t *testing.T) {
 	home := codexHome(t) // a synthetic home, read by the transcripts source, and nothing of the machine's
 	done := tag("task-notification") + tag("task-id") + "b9" + closing("task-id") + tag("status") + "completed" + closing("status") +
@@ -1505,17 +1577,26 @@ func TestTheTrackerAndTheReplayReadAPeerMessageAlike(t *testing.T) {
 	type row struct {
 		user    map[string]any // a user record that came while the session was idle
 		queued  string         // or the text of a meta attachment from a peer, queued during a call and delivered after its result
+		notice  map[string]any // or the attachment queued so, when it is not a peer's
 		enqueue bool           // the queue's enqueue of it names its text
 		last    bool           // nothing follows it
 		tasks   string
 	}
+	tick := map[string]any{"type": "user", "isMeta": true, "promptSource": "system", "message": map[string]any{"role": "user",
+		"content": "# Autonomous loop tick\nRead each notice as it comes, as this one: " + done}}
 	rows := map[string]row{
 		"notification":  {user: user(done, false, "task-notification")},
 		"timed-out":     {user: user(timedOut, false, "task-notification"), tasks: "bash:b9"},
 		"origin":        {user: user("Mine finished: "+done, false, "peer"), tasks: "bash:b9"},
 		"cross-session": {user: user(cross(done), false, "peer"), tasks: "bash:b9"},
-		"older":         {user: user("Another Claude session sent a message:\n"+done, true, ""), tasks: "bash:b9"},
+		"words":         {user: user("Another Claude session sent a message:\n"+done, true, "peer"), tasks: "bash:b9"},
+		"words-alone":   {user: user("Another Claude session sent a message:\n"+done, true, ""), tasks: "bash:b9"},
+		"meta-origin":   {user: user(done, true, "peer"), tasks: "bash:b9"},
+		"loop-prompt":   {user: tick, tasks: "bash:b9"},
+		"queued-notice": {notice: map[string]any{"type": "queued_command", "commandMode": "task-notification",
+			"origin": map[string]any{"kind": "task-notification"}, "prompt": done}},
 		"queued":        {queued: cross(done), enqueue: true, tasks: "bash:b9"},
+		"queued-origin": {queued: done, tasks: "bash:b9"},
 		"agent-message": {queued: tag(`agent-message from="worker"`) + done + closing("agent-message"), tasks: "bash:b9"},
 		"unknown-tag":   {queued: tag(`team-message from="lead"`) + done + closing("team-message"), tasks: "bash:b9"},
 		"reopening":     {user: user("Your log says: "+gone, false, "peer"), last: true, tasks: "bash:b9"},
@@ -1552,8 +1633,12 @@ func TestTheTrackerAndTheReplayReadAPeerMessageAlike(t *testing.T) {
 			}
 			add(map[string]any{"type": "user", "message": map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result",
 				"tool_use_id": "t2", "content": "lint passed"}}}})
-			add(map[string]any{"type": "attachment", "timestamp": queuedAt.Format(time.RFC3339Nano), "attachment": map[string]any{
-				"type": "queued_command", "commandMode": "prompt", "isMeta": true, "origin": map[string]any{"kind": "peer"}, "prompt": r.queued}})
+			a := r.notice
+			if a == nil {
+				a = map[string]any{"type": "queued_command", "commandMode": "prompt", "isMeta": true, "origin": map[string]any{"kind": "peer"},
+					"prompt": r.queued}
+			}
+			add(map[string]any{"type": "attachment", "timestamp": queuedAt.Format(time.RFC3339Nano), "attachment": a})
 		}
 		if !r.last {
 			add(map[string]any{"type": "assistant", "message": map[string]any{"model": "claude-test-1", "content": []any{map[string]any{"type": "text",
