@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
+
 	"github.com/agent-sh/momentum/internal/store"
 	"github.com/agent-sh/momentum/sessions"
 	"github.com/agent-sh/momentum/sessions/claude"
@@ -377,14 +379,11 @@ func abortedBy(from, to string, after, latest time.Time) time.Time {
 	if !ok || !ok2 || p2 != path || end < off {
 		return latest
 	}
-	f, err := os.Open(path)
-	if err != nil {
+	f, done, ok := rolloutAt(path, off)
+	if !ok {
 		return latest
 	}
-	defer f.Close()
-	if _, err := f.Seek(off, io.SeekStart); err != nil {
-		return latest
-	}
+	defer done()
 	rd := bufio.NewReaderSize(io.LimitReader(f, min(end-off, requestLimit)), 1<<16)
 	for {
 		raw, err := rd.ReadBytes('\n')
@@ -417,14 +416,11 @@ func codexTurnEnd(from string, after, until time.Time) (string, time.Time) {
 	if !ok {
 		return "", time.Time{}
 	}
-	f, err := os.Open(path)
-	if err != nil {
+	f, done, ok := rolloutAt(path, off)
+	if !ok {
 		return "", time.Time{}
 	}
-	defer f.Close()
-	if _, err := f.Seek(off, io.SeekStart); err != nil {
-		return "", time.Time{}
-	}
+	defer done()
 	rd := bufio.NewReaderSize(io.LimitReader(f, requestLimit), 1<<16)
 	if _, err := rd.ReadBytes('\n'); err != nil { // the record itself
 		return "", time.Time{}
@@ -457,6 +453,33 @@ func codexTurnEnd(from string, after, until time.Time) (string, time.Time) {
 			return end, endAt
 		}
 	}
+}
+
+// rolloutAt is a Codex rollout read from an offset: the file, or the copy Codex compressed it into in place
+// (PATH.zst), whose offsets tacit names in the decompressed bytes; false when neither is there. done closes it.
+func rolloutAt(path string, off int64) (io.Reader, func(), bool) {
+	if f, err := os.Open(path); err == nil {
+		if _, err := f.Seek(off, io.SeekStart); err != nil {
+			f.Close()
+			return nil, nil, false
+		}
+		return f, func() { f.Close() }, true
+	}
+	f, err := os.Open(path + ".zst")
+	if err != nil {
+		return nil, nil, false
+	}
+	dec, err := zstd.NewReader(f, zstd.WithDecoderConcurrency(1))
+	if err != nil {
+		f.Close()
+		return nil, nil, false
+	}
+	done := func() { dec.Close(); f.Close() }
+	if _, err := io.CopyN(io.Discard, dec, off); err != nil {
+		done()
+		return nil, nil, false
+	}
+	return dec, done, true
 }
 
 // replayWake is a self-paced loop's pending wakeup, as the session layer reads it.

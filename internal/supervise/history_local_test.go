@@ -909,19 +909,24 @@ func TestASkillsEchoIsNoLocalCommand(t *testing.T) {
 // An older Codex rollout writes no turn_aborted record, only its event: the stop starts at that event, read from
 // the rollout while it is there, not at the later record the store marked.
 func TestAnOlderCodexAbortIsDatedByItsEvent(t *testing.T) {
-	st := testStore(t)
-	r := newRecorded(t, "old-abort").owner(0, "run the suite").say(5*time.Second, "I'll run the suite and report when it finishes.")
-	r.line(10*time.Minute, map[string]any{"type": "event_msg", "payload": map[string]any{"type": "turn_aborted", "reason": "interrupted"}})
-	abortAt := r.at
-	r.event(20*time.Minute, map[string]any{"type": "response_item", "payload": map[string]any{"type": "message"}}, "harness_text", store.ActorHarness, "",
-		"# AGENTS.md instructions", `{"input_kind":"typed","prior":"turn_aborted","why":"harness text"}`)
-	r.owner(time.Second, ".")
-	next := r.at
-	for i := range r.evs {
-		r.evs[i].Harness = "codex"
-	}
-	r.put(st)
-	if res := replayed(t, st, "old-abort", next); !res.Point.Stop.At.Equal(abortAt) {
-		t.Fatalf("the stop at %v, not at the abort event at %v", res.Point.Stop.At, abortAt)
+	for _, compressed := range []bool{false, true} { // a rollout Codex archived is read from its compressed copy
+		st := testStore(t)
+		r := newRecorded(t, "old-abort").owner(0, "run the suite").say(5*time.Second, "I'll run the suite and report when it finishes.")
+		r.line(10*time.Minute, map[string]any{"type": "event_msg", "payload": map[string]any{"type": "turn_aborted", "reason": "interrupted"}})
+		abortAt := r.at
+		r.event(20*time.Minute, map[string]any{"type": "response_item", "payload": map[string]any{"type": "message"}}, "harness_text", store.ActorHarness, "",
+			"# AGENTS.md instructions", `{"input_kind":"typed","prior":"turn_aborted","why":"harness text"}`)
+		r.owner(time.Second, ".")
+		next := r.at
+		for i := range r.evs {
+			r.evs[i].Harness = "codex"
+		}
+		r.put(st)
+		if compressed {
+			compressInPlace(t, r.path)
+		}
+		if res := replayed(t, st, "old-abort", next); !res.Point.Stop.At.Equal(abortAt) {
+			t.Fatalf("compressed %v: the stop at %v, not at the abort event at %v", compressed, res.Point.Stop.At, abortAt)
+		}
 	}
 }

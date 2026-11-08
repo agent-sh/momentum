@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/tacit/client/pkg/evidence"
+	"github.com/klauspost/compress/zstd"
 
 	"github.com/agent-sh/momentum/internal/source"
 	"github.com/agent-sh/momentum/internal/store"
@@ -490,19 +491,45 @@ func TestTheLastCodexTurnReadsOverWhenNoRecordCameAfterItsEnd(t *testing.T) {
 			return at, at
 		}},
 	} {
-		t.Run(c.name, func(t *testing.T) {
-			home := codexHome(t)
-			r := newCodexRollout(t, home)
-			r.meta()
-			r.started(time.Second)
-			r.user(0, "run the soak")
-			stopAt, ended := c.end(r)
-			_, stop, res := live(t, r.path, ended)
-			got := lastStop(t, ingested(t, home), codexTurnID)
-			if s := got.Point.Stop; s.Working || s.Phase != sessions.Idle || !s.At.Equal(stopAt) || stop.Working {
-				t.Fatalf("replay %s (working %v) at %v, want idle at %v: %q; live %q", s.Phase, s.Working, s.At, stopAt, Why(got), Why(res))
-			}
-		})
+		for _, compressed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s, compressed %v", c.name, compressed), func(t *testing.T) {
+				home := codexHome(t)
+				r := newCodexRollout(t, home)
+				r.meta()
+				r.started(time.Second)
+				r.user(0, "run the soak")
+				stopAt, ended := c.end(r)
+				_, stop, res := live(t, r.path, ended)
+				st := ingested(t, home)
+				if compressed {
+					compressInPlace(t, r.path)
+				}
+				got := lastStop(t, st, codexTurnID)
+				if s := got.Point.Stop; s.Working || s.Phase != sessions.Idle || !s.At.Equal(stopAt) || stop.Working {
+					t.Fatalf("replay %s (working %v) at %v, want idle at %v: %q; live %q", s.Phase, s.Working, s.At, stopAt, Why(got), Why(res))
+				}
+			})
+		}
+	}
+}
+
+// compressInPlace does what Codex does to a rollout it archives: it writes PATH.zst and removes the file.
+func compressInPlace(t *testing.T, path string) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer enc.Close()
+	if err := os.WriteFile(path+".zst", enc.EncodeAll(raw, nil), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
 	}
 }
 
