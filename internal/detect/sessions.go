@@ -73,7 +73,9 @@ func (d Sessions) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 }
 
 // nudged replays the rules over the window and keeps the stops the owner ended with a nudge that no rule would
-// have acted on first, each keyed by why none would.
+// have acted on first, each keyed by why none would. His own restart step is none: his input at a stop an /exit
+// ended, and his input within the owner window after he reopened a session that ended mid-task, with nothing since:
+// no turn opened after the reopening, and the stop does not end on an API error.
 func (d Sessions) nudged(ctx context.Context, st *store.Store, w Window) ([]occurrence, error) {
 	points, err := supervise.History(ctx, st, w.Since, w.Until)
 	if err != nil {
@@ -107,7 +109,16 @@ func (d Sessions) nudged(ctx context.Context, st *store.Store, w Window) ([]occu
 	var occ []occurrence
 	for _, res := range supervise.Replay(points, nil, supervise.DefaultParams, probe, w.Until) {
 		next := res.Point.Next
-		if next.Kind != "owner" || !supervise.Nudge(next.Text) || res.Fired || res.Point.Stop.Exited || res.Point.Stop.Reopened {
+		s := res.Point.Stop
+		// At a reopening after the session ended mid-task (a crash, a restart, a usage limit), his input within the
+		// owner window is his restart step: he reopened it, and supervision holds every rule that long for a process
+		// he started, so his input comes before any rule's time. That holds only while nothing has happened since the
+		// reopening: ResumedAt clears on his input, momentum's message, a call or the agent's words; no other input (a
+		// loop's prompt, another session's message, a task's notification) opened a turn after it; and the stop does
+		// not end on an API error: one since the reopening shows the session ran a turn again, whatever rule reads it.
+		restartStep := !s.ResumedAt.IsZero() && !s.TurnBegan.After(s.ResumedAt) && s.Error == "" &&
+			next.At.Sub(s.ResumedAt) <= supervise.DefaultParams.OwnerWindow
+		if next.Kind != "owner" || !supervise.Nudge(next.Text) || res.Fired || s.Exited || s.Reopened || restartStep {
 			continue // an exited stop is one no rule can continue: the owner's input reopens it, after a command or not
 		}
 		why := supervise.Why(res)
