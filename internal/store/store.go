@@ -152,7 +152,8 @@ var keptColumns = []struct {
 	{"cases", [][2]string{{"episode", "INTEGER NOT NULL DEFAULT 1"}, {"guard_exposure", "INTEGER NOT NULL DEFAULT 0"}, {"guard_watched", "INTEGER NOT NULL DEFAULT 0"},
 		{"guard_recur", "REAL NOT NULL DEFAULT 0"}}},
 	{"capacity_runs", [][2]string{{"blind", "INTEGER NOT NULL DEFAULT 0"}}},
-	// NULL is not recorded (a build from before them stores neither); '' is recorded as none
+	// NULL is not recorded (a build from before them stores neither, and evidence that is no event records neither);
+	// '' is recorded as none
 	{"case_evidence", [][2]string{{"tool", "TEXT"}, {"cwd", "TEXT"}}},
 }
 
@@ -188,8 +189,9 @@ var keptIndexNames = slices.Concat([]string{"events_seq", "events_ts", "events_k
 // sequence writes none, and its rewrite of a row keeps the row's old one.
 //
 // A build from before the evidence's tool and directory stores neither: they are NULL, not recorded, where this build
-// always records them (an empty value for none). case_evidence_filed gives event evidence stored with neither recorded its
-// event's, where the store holds the event. A merge, this build's as an older build's (the same statement), stores
+// always records them for an event's evidence (an empty value for none) and never for other evidence.
+// case_evidence_filed gives event evidence stored with neither recorded its event's, where the store holds the
+// event. A merge, this build's as an older build's (the same statement), stores
 // the duplicate's evidence in its target without them, then deletes the duplicate's, the only delete of evidence:
 // case_evidence_deleted, after the delete, hands what a deleted row recorded to every case's evidence of the same event
 // that recorded nothing (a trigger cannot tell the merge's target, and the record is a real one of that event). So a

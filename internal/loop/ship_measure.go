@@ -363,15 +363,15 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 	}
 	events, in, hit := 0, 0, 0
 	for _, e := range evs {
-		if !strings.HasPrefix(e.Ref, "ev:") {
+		if !strings.HasPrefix(e.Evidence.Ref, "ev:") {
 			continue
 		}
 		events++
-		if e.At.Before(at.Add(-window)) || !e.At.Before(at) {
+		if e.Evidence.At.Before(at.Add(-window)) || !e.Evidence.At.Before(at) {
 			continue
 		}
 		in++
-		if counted[e.Ref] {
+		if counted[e.Evidence.Ref] {
 			hit++
 		}
 	}
@@ -435,17 +435,18 @@ func (s *Ship) validPlan(ctx context.Context, c store.Case, sig Signal, window t
 }
 
 // caseEvent is a piece of a case's evidence of an event (ev:ID), with the event the store holds for it, when it still
-// holds one (Found).
+// holds one (Found). Evidence is a named field, not embedded, so its recorded tool and directory are never read for
+// the event's by mistake: tool and cwd give the event's.
 type caseEvent struct {
-	store.Evidence
-	Event store.Event
-	Found bool
+	Evidence store.Evidence
+	Event    store.Event
+	Found    bool
 }
 
 // tool is the event's tool: the store's event's while the store holds it, else the one its evidence recorded at its
-// last filing or a merge gave it (none, for evidence filed before evidence recorded tools whose event was gone when
-// the column was added). Where both are there they agree, but a record read again may give the event another, and
-// then the store's decides.
+// last filing or refile, by the fill where the column was added, or that a merge gave it (none where it recorded
+// none, and where it never recorded one: its event was gone when the column was added). Where both are there they
+// agree, but a record read again may give the event another, and then the store's decides.
 func (e caseEvent) tool() string {
 	if e.Found {
 		return e.Event.Tool

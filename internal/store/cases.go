@@ -170,9 +170,9 @@ func (m Measurement) Guarded() bool { return m.Exposure > 0 || m.closedGuard }
 // working directory as its evidence recorded them, which judge the event once the store no longer holds it: at its
 // filing or a refile (resolveEvidence, the event as the store held it then), at a merge (the event as the store held
 // it, else the duplicate's record, handed on where the target had none: case_evidence_filed, case_evidence_deleted),
-// or by the fill where the columns were added (columnFills). Evidence that never recorded them (an older build filed
-// it while its event was gone, or its event was gone when the columns were added) reads as none, as does any other
-// reference.
+// or by the fill where the columns were added (columnFills). Event evidence that never recorded them (its event was
+// gone when the columns were added, or a merge took it from evidence that never recorded them) reads as none, and so
+// does any other reference, which records neither.
 type Evidence struct {
 	Ref     string
 	At      time.Time
@@ -410,8 +410,14 @@ func addEvidence(ctx context.Context, q querier, id string, evs []Evidence, now 
 		if err != nil {
 			return 0, time.Time{}, err
 		}
+		// Only an event's evidence records a tool and a directory (none included); any other stays not recorded
+		// (NULL), as a merge and the fill leave it.
+		var tool, cwd any
+		if strings.HasPrefix(e.Ref, "ev:") {
+			tool, cwd = e.Tool, e.Cwd
+		}
 		res, err := q.ExecContext(ctx, `INSERT OR IGNORE INTO case_evidence (case_id, ref, at, kind, summary, tool, cwd, added)
-		  VALUES (?,?,?,?,?,?,?,?)`, id, e.Ref, e.At.UnixMilli(), e.Kind, e.Summary, e.Tool, e.Cwd, now.UnixMilli())
+		  VALUES (?,?,?,?,?,?,?,?)`, id, e.Ref, e.At.UnixMilli(), e.Kind, e.Summary, tool, cwd, now.UnixMilli())
 		if err != nil {
 			return 0, time.Time{}, err
 		}

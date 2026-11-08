@@ -686,7 +686,8 @@ func record(t *testing.T, st *Store, caseID, ref string, v *[2]string, added tim
 // duplicate or held it already with nothing recorded. The delete hands that record to every case's evidence of the
 // event that recorded nothing, a bystander's too; a case that recorded anything keeps it (one value, or none for both,
 // which a read again that cleared the event's values leaves), and the third case its own. Evidence of an event already
-// gone, filed without the columns, stays not recorded; evidence that is no event records nothing.
+// gone, filed without the columns, stays not recorded; evidence that is no event, a file or a note, records nothing,
+// whichever build filed it.
 func TestAnOlderBuildsMergeKeepsWhatTheDuplicateRecorded(t *testing.T) {
 	st := caseStore(t)
 	ctx := context.Background()
@@ -708,7 +709,10 @@ func TestAnOlderBuildsMergeKeepsWhatTheDuplicateRecorded(t *testing.T) {
 	third, _ := observeOK(t, st, Finding{Family: "failures", Signature: "third", Title: "third", Evidence: refs(took, held)})
 	dupTook, _ := observeOK(t, st, Finding{Family: "failures", Signature: "a1", Title: "a1", Evidence: refs(took)})
 	dupHeld, _ := observeOK(t, st, Finding{Family: "failures", Signature: "a2", Title: "a2", Evidence: refs(held)})
-	intoTook, _ := observeOK(t, st, Finding{Family: "failures", Signature: "b1", Title: "b1", Evidence: refsAt("b1", 1, at)})
+	if _, err := st.PutNote(ctx, Note{ID: "n-1", Kind: NoteProblem, Title: "a disk fills", At: at}); err != nil {
+		t.Fatal(err)
+	}
+	intoTook, _ := observeOK(t, st, Finding{Family: "failures", Signature: "b1", Title: "b1", Evidence: append(refsAt("b1", 1, at), Evidence{Ref: "note:n-1"})})
 	intoHeld, _ := observeOK(t, st, Finding{Family: "failures", Signature: "b2", Title: "b2", Evidence: refs(held)})
 	bystander, _ := observeOK(t, st, Finding{Family: "failures", Signature: "c1", Title: "c1", Evidence: refs(took)})
 	partial, _ := observeOK(t, st, Finding{Family: "failures", Signature: "c2", Title: "c2", Evidence: refs(took)})
@@ -746,7 +750,7 @@ func TestAnOlderBuildsMergeKeepsWhatTheDuplicateRecorded(t *testing.T) {
 		want map[string][2]string
 	}{
 		{intoTook.ID, map[string][2]string{"ev:" + took.ID(): {"'Bash'", "'/w/a'"}, "ev:" + kept.ID(): {"'Edit'", "'/w/b'"},
-			"ev:" + lost.ID(): {"NULL", "NULL"}, "file:/t/b1-0": {"''", "''"}, "file:/t/old": {"NULL", "NULL"}}},
+			"ev:" + lost.ID(): {"NULL", "NULL"}, "file:/t/b1-0": {"NULL", "NULL"}, "note:n-1": {"NULL", "NULL"}, "file:/t/old": {"NULL", "NULL"}}},
 		{intoHeld.ID, map[string][2]string{"ev:" + held.ID(): {"'Write'", "'/w/e'"}}},
 		{third.ID, map[string][2]string{"ev:" + took.ID(): {"'Read'", "'/w/c'"}, "ev:" + held.ID(): {"'Read'", "'/w/c'"}}},
 		{bystander.ID, map[string][2]string{"ev:" + took.ID(): {"'Bash'", "'/w/a'"}}},

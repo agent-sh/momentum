@@ -99,14 +99,14 @@ func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead e
 	events, in, hit, own := 0, 0, 0, sig.Tool
 	for _, e := range evidence {
 		events++
-		if own != "" && e.At.Before(countedAt) && e.tool() != own {
+		if own != "" && e.Evidence.At.Before(countedAt) && e.tool() != own {
 			own = ""
 		}
-		if e.At.Before(since) || !e.At.Before(at) {
+		if e.Evidence.At.Before(since) || !e.Evidence.At.Before(at) {
 			continue
 		}
 		in++
-		if counted[e.Ref] {
+		if counted[e.Evidence.Ref] {
 			hit++
 		}
 	}
