@@ -168,7 +168,7 @@ type resolution struct{ stopAt, sentAt time.Time }
 // supervise run that finds the stop still held rewrites the stop's wait event (one per stop and try), so seen, the
 // event's time, is the last run that held it: just before the stop ended, by the rule's message at the reset or
 // another way (a restart, a new login, another account), or when supervision stopped looking at it. No run rewrites
-// it once the reset comes: the rule acts then, so seen is before it.
+// it once the rule's time (the reset plus its grace) comes: the rule acts then, so seen is before that time.
 type hold struct{ stopAt, seen time.Time }
 
 // supervised is supervision's own record of the stops it took on, by session.

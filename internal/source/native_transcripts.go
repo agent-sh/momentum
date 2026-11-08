@@ -634,10 +634,20 @@ var (
 
 // kimiImageOmitted is the whole text part Kimi's engine and its web server write in place of an image the model
 // cannot take: an unsupported format (named or not, with the provider's accepted formats) or a data URL that cannot
-// be parsed, each in its fixed words. The format is the image's type as declared, which may hold a space.
-var kimiImageOmitted = regexp.MustCompile(`\A\[Image omitted: (?:(?:unsupported image format .+?|".*" uses unsupported image format .+?)\. ` +
-	`The current model provider accepts only (?:[^,\n]+(?:, [^,\n]+)*)?, and [^,\n]+ \x{2014} convert it to PNG or JPEG and try again\.|` +
-	`".*" is not a valid data URL \(its header or payload could not be parsed\)\. Re-encode the image as PNG or JPEG and try again\.)\]\z`)
+// be parsed, each in its fixed words. The format is the image's type as declared, which may hold a space. No part
+// Kimi fills in may hold the words that follow it, so a notice cannot run on across his words to a copy of its own
+// fixed words: the type holds no period and space (kimiMime), a name no quote and space (kimiQuoted), and each
+// accepted format, a label or a type, no comma and no space (kimiFormat).
+var kimiImageOmitted = regexp.MustCompile(`\A\[Image omitted: (?:(?:unsupported image format ` + kimiMime + `|` + kimiQuoted +
+	` uses unsupported image format ` + kimiMime + `)\. The current model provider accepts only (?:` + kimiFormat + `(?:, ` + kimiFormat +
+	`)*)?, and ` + kimiFormat + ` \x{2014} convert it to PNG or JPEG and try again\.|` + kimiQuoted +
+	` is not a valid data URL \(its header or payload could not be parsed\)\. Re-encode the image as PNG or JPEG and try again\.)\]\z`)
+
+const (
+	kimiMime   = `(?:[^.\n]|\.[^ \n])+`
+	kimiQuoted = `"(?:[^"\n]|"[^ \n])*"`
+	kimiFormat = `[^,\s]+`
+)
 
 // kimiMediaMarker and kimiUnsupported are the whole text parts Kimi's migration of a session from its older CLI
 // writes into a prompt in place of what it could not carry over: a media part with no url or whose local file is

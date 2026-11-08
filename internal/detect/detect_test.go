@@ -641,7 +641,7 @@ func TestAnEmptyOwnerTurnBoundsTheLookBack(t *testing.T) {
 // A message another session sent into a session is stored as agent text, a harness line or by its origin, but it is
 // not the agent's words. His turn after one is read with the agent's reply before it, however many came between,
 // and a message alone since his turn before leaves nothing to read it with: its own words handing him a step are
-// not the agent's.
+// not the agent's. A reply of the model's that opens as a peer message does is the agent's words.
 func TestAPeerMessageIsNotTheAgentsLastWords(t *testing.T) {
 	ask := "The build is ready. Should I deploy it now?"
 	peer := func(session, text, why string, at time.Time) store.Event {
@@ -676,6 +676,28 @@ func TestAPeerMessageIsNotTheAgentsLastWords(t *testing.T) {
 	}
 	if fs, err := (OwnerBurden{}).Detect(context.Background(), st2, week()); err != nil || len(fs) != 0 {
 		t.Fatalf("a message's own words read as the agent's: %v %v", signatures(fs), err)
+	}
+	// With no reply of the agent's since his turn before, the message is all there is, and it is still not the agent's.
+	st3 := testStore(t)
+	for i, s := range []string{"x", "y", "z"} {
+		at := t0.Add(time.Duration(i) * time.Hour)
+		put(t, st3, ownerTurn(s, "tag the release", at),
+			peer(s, tag("cross-session-message")+"Should I take the release notes too?", "harness line", at.Add(time.Minute)),
+			ownerTurn(s, "why ask me, you decide", at.Add(2*time.Minute)))
+	}
+	if fs, err := (OwnerBurden{}).Detect(context.Background(), st3, week()); err != nil || len(fs) != 0 {
+		t.Fatalf("a message alone since his turn before read as the agent's: %v %v", signatures(fs), err)
+	}
+	// Only a harness line in a peer message's form is one. The model's own reply that opens the same way is its words,
+	// with no meta as the store keeps a reply or with meta of its own, as it keeps a failed turn's.
+	st4 := testStore(t)
+	relayed := "Another Claude session sent a message, and the build is ready. Should I deploy it now?"
+	for i, meta := range []string{"", `{"is_error":true}`, `{"is_error":true}`} {
+		s, at := string(rune('a'+i)), t0.Add(time.Duration(i)*time.Hour)
+		put(t, st4, ev(store.Transcripts, s, "agent_text", store.ActorAgent, "", relayed, meta, at), ownerTurn(s, "up to you, why ask", at.Add(time.Minute)))
+	}
+	if fs, err := (OwnerBurden{}).Detect(context.Background(), st4, week()); err != nil || !slices.Equal(signatures(fs), []string{"owner-burden/v1:handback 3"}) {
+		t.Fatalf("the model's reply in a peer message's form: %v %v", signatures(fs), err)
 	}
 }
 

@@ -847,6 +847,13 @@ func TestKimiClientNoticesAreGeneratedInput(t *testing.T) {
 		"accepts only PNG, JPEG, GIF, and WebP \u2014 convert it to PNG or JPEG and try again.]"
 	spacedUnnamed := "[Image omitted: unsupported image format image/svg+xml; charset=utf-8. The current model provider accepts only PNG, JPEG, " +
 		"GIF, and WebP \u2014 convert it to PNG or JPEG and try again.]"
+	// A notice, his words, then a copy of the notice's own fixed words after what Kimi fills in: the type, the name or
+	// an accepted format would have to hold his words for the part to be one notice.
+	tail := ". The current model provider accepts only PNG, JPEG, GIF, and WebP \u2014 convert it to PNG or JPEG and try again.]"
+	typeRunOn := unnamed + " marker-7f3a after" + tail
+	nameRunOn := unsupported + " marker-7f3a after \"marker-7f3a mine.heic\" uses unsupported image format image/heic" + tail
+	urlRunOn := malformed + " marker-7f3a after \"data:image/png;base64,marker-7f3a mine\" is not a valid data URL (its header or payload could " +
+		"not be parsed). Re-encode the image as PNG or JPEG and try again.]"
 	labels := []string{"marker-7f3a typed", "marker-7f3a a.txt", "marker-7f3a shot", "marker-7f3a bad", "marker-7f3a mine", "Image omitted: unsupported",
 		"marker-7f3a after"}
 	for _, tc := range []struct {
@@ -878,6 +885,15 @@ func TestKimiClientNoticesAreGeneratedInput(t *testing.T) {
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a shot": "harness harness_text"}, []string{"marker-7f3a typed"}},
 		{"an unsupported image notice with no name whose type holds a space", plain, []any{text("marker-7f3a typed"), text(spacedUnnamed)},
 			map[string]string{"marker-7f3a typed": "owner owner_text", "Image omitted: unsupported": "harness harness_text"}, []string{"marker-7f3a typed"}},
+		{"a notice, his words and its fixed words after the type again", plain, []any{text("marker-7f3a typed"), text(typeRunOn)},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "Image omitted: unsupported": "owner owner_text", "marker-7f3a after": "owner owner_text"},
+			[]string{"marker-7f3a typed " + typeRunOn}},
+		{"a named notice, his words and its fixed words after the name again", plain, []any{text("marker-7f3a typed"), text(nameRunOn)},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a shot": "owner owner_text", "marker-7f3a after": "owner owner_text",
+				"marker-7f3a mine": "owner owner_text"}, []string{"marker-7f3a typed " + nameRunOn}},
+		{"a malformed image notice, his words and its fixed words after the url again", plain, []any{text("marker-7f3a typed"), text(urlRunOn)},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a bad": "owner owner_text", "marker-7f3a after": "owner owner_text",
+				"marker-7f3a mine": "owner owner_text"}, []string{"marker-7f3a typed " + urlRunOn}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
