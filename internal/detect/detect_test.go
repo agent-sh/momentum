@@ -818,9 +818,14 @@ func TestSessionsWaitResolvedOnFirstTryIsNotACase(t *testing.T) {
 // accessWait is the access rule's wait event for a stop as the last supervise run that held the stop, at seen, left
 // it: every run rewrites the one event of a stop and try. at is when the rule resumes the stop.
 func accessWait(session, errText string, stopAt, at, seen time.Time) store.Event {
-	m, _ := json.Marshal(map[string]any{"rule": "access", "try": 1, "why": "x", "stop_at": stopAt.UnixMilli(), "at": at.UnixMilli(),
+	return accessWaitTry(session, errText, 1, stopAt, at, seen)
+}
+
+// accessWaitTry is accessWait for the stop of a later try.
+func accessWaitTry(session, errText string, try int, stopAt, at, seen time.Time) store.Event {
+	m, _ := json.Marshal(map[string]any{"rule": "access", "try": try, "why": "x", "stop_at": stopAt.UnixMilli(), "at": at.UnixMilli(),
 		"error": errText})
-	return store.Event{Source: store.Supervise, SourceKey: fmt.Sprintf("%s@%d#%s#%s#%d", session, stopAt.UnixMilli(), "access", "wait", 1),
+	return store.Event{Source: store.Supervise, SourceKey: fmt.Sprintf("%s@%d#%s#%s#%d", session, stopAt.UnixMilli(), "access", "wait", try),
 		TS: seen, Session: session, Harness: "claude", Actor: store.ActorDetector, Kind: "wait", Summary: "x", Meta: string(m)}
 }
 
@@ -882,15 +887,24 @@ func TestSessionsStopHeldForAStatedResetIsNotACase(t *testing.T) {
 // What a hold does not cover still counts, and only that: a stop still held when the reset came and still stopped
 // past it with no message (a, b), one whose message at the reset failed again (c) or did not land (d), a stop on
 // another error after a restart ended the held one, before the reset (e), and a login's wait whose time a new login
-// set (f). The held pieces before them are not evidence.
+// set (f). A hold begins at its stop: a question that waited on the owner before a wakeup met a limit days out (g),
+// and the stop whose message failed again before a later try's held stop (h), still count. An access wait on a
+// limit that states no reset, with a time a probe gave (i), or on an organization block whose text names a reset
+// time (j), holds nothing. The held pieces before them are not evidence.
 func TestSessionsWaitPastAHoldStillCounts(t *testing.T) {
 	st := testStore(t)
 	reset := t0.Add(3 * time.Hour)
 	limit, at := limitHit(reset), reset.Add(time.Minute)
 	last := t0.Add(5 * 30 * time.Minute) // the stop the reset comes in
 	var want []string
+	names := map[string]string{} // a counted piece's session, for the message
 	counted := func(e store.Event) store.Event {
-		want = append(want, "ev:"+e.ID())
+		var m struct {
+			Kind string `json:"from_ask_kind"`
+		}
+		_ = json.Unmarshal([]byte(e.Meta), &m)
+		want = append(want, m.Kind+" ev:"+e.ID())
+		names[m.Kind+" ev:"+e.ID()] = e.Session
 		return e
 	}
 	for _, s := range []string{"a", "b", "c", "d"} {
@@ -913,21 +927,56 @@ func TestSessionsWaitPastAHoldStillCounts(t *testing.T) {
 	login := t0.Add(2 * time.Hour)
 	put(t, st, accessWait("f", "OAuth token has expired · Please run /login", t0, login.Add(15*time.Minute), login.Add(5*time.Minute)),
 		counted(needsYou("f", "error", "working", t0, login.Add(6*time.Minute))))
-	fs, err := Sessions{}.Detect(context.Background(), st, week())
+	far := t0.Add(4 * 24 * time.Hour)
+	farLimit, farAt := limitHit(far), far.Add(time.Minute)
+	wake := t0.Add(2 * time.Hour)
+	put(t, st, counted(needsYou("g", "question", "needs_you", t0, wake)), accessWait("g", farLimit, wake, farAt, wake.Add(30*time.Minute)),
+		needsYou("g", "error", "working", wake, wake.Add(31*time.Minute)))
+	a := ev(store.Supervise, "h", "act", store.ActorAgent, "", "x", fmt.Sprintf(`{"rule":"access","try":1,"stop_at":%d}`, t0.UnixMilli()), sent)
+	again := sent.Add(2 * time.Minute) // the turn the message opened meets a limit again
+	put(t, st, accessWait("h", limit, t0, at, at.Add(-time.Minute)), a,
+		ev(store.Supervise, "h", "outcome", store.ActorDetector, "", "x", fmt.Sprintf(`{"of":%q,"rule":"access","result":"failed again"}`, a.SourceKey),
+			sent.Add(3*time.Minute)), counted(needsYou("h", "error", "working", t0, sent.Add(time.Minute))),
+		accessWaitTry("h", farLimit, 2, again, farAt, again.Add(29*time.Minute)), needsYou("h", "error", "working", again, again.Add(30*time.Minute)))
+	back := t0.Add(2 * time.Hour) // when a probe saw access work again
+	org := "Your organization has disabled Claude subscription access for Claude Code · resets " + reset.UTC().Format("Jan 2, 3:04pm") + " (UTC)"
+	for s, errText := range map[string]string{"i": "You've hit your usage limit", "j": org} {
+		put(t, st, accessWait(s, errText, t0, back, back.Add(-time.Minute)), counted(needsYou(s, "error", "working", t0, back.Add(time.Minute))))
+	}
+	// every occurrence is a finding here, one alone too: the test is which pieces count, not how often
+	fs, err := Sessions{Recur: Recur{Events: 1, Sessions: 1}}.Detect(context.Background(), st, week())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(fs) != 1 || fs[0].Signature != "sessions/v1:waited:error" {
-		t.Fatalf("found %v, want the waits past the holds", signatures(fs))
+	var got, others []string
+	for _, f := range fs {
+		kind, ok := strings.CutPrefix(f.Signature, "sessions/v1:waited:")
+		if !ok {
+			others = append(others, f.Signature)
+			continue
+		}
+		for _, e := range f.Evidence {
+			got = append(got, kind+" "+e.Ref)
+		}
 	}
-	var got []string
-	for _, e := range fs[0].Evidence {
-		got = append(got, e.Ref)
+	if want := []string{"sessions/v1:outcome:access:failed-again", "sessions/v1:outcome:access:not-delivered"}; !slices.Equal(others, want) {
+		t.Fatalf("found %v beside the waits, want the outcomes %v", others, want)
 	}
 	slices.Sort(got)
 	slices.Sort(want)
 	if !slices.Equal(got, want) {
-		t.Fatalf("evidence %d events, want %d: %v, want %v", len(got), len(want), got, want)
+		var missing, extra []string
+		for _, w := range want {
+			if !slices.Contains(got, w) {
+				missing = append(missing, names[w]+": "+w)
+			}
+		}
+		for _, g := range got {
+			if !slices.Contains(want, g) {
+				extra = append(extra, g)
+			}
+		}
+		t.Fatalf("evidence %d events, want %d: missing %v, extra %v", len(got), len(want), missing, extra)
 	}
 }
 

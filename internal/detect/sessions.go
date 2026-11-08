@@ -148,7 +148,7 @@ func waits(ctx context.Context, st *store.Store, w Window) ([]occurrence, error)
 			continue
 		}
 		if sup.covers(e.Session, e.TS.Add(-time.Duration(m.ForMS)*time.Millisecond), e.TS) {
-			continue // a live supervise rule held this stop for a stated reset, or resolved it on its first try: nothing waited on him
+			continue // the access rule held this stop for a stated reset, or a supervise rule resolved it on its first try: nothing waited on him
 		}
 		kind := m.FromAskKind
 		if kind == "" {
@@ -164,12 +164,12 @@ func waits(ctx context.Context, st *store.Store, w Window) ([]occurrence, error)
 // The stop lasted from stopAt to sentAt, when the message was typed.
 type resolution struct{ stopAt, sentAt time.Time }
 
-// hold is one stop the access rule held for the reset its usage limit states: the stop began at stopAt, and the
-// rule resumes it at at. Every supervise run that finds the stop still held rewrites the stop's wait event (one per
-// stop and try), so seen, the event's time, is the last run that held it: just before the stop ended, by the rule's
-// message at the reset or another way (a restart, a new login, another account), or when supervision stopped
-// looking at it.
-type hold struct{ stopAt, at, seen time.Time }
+// hold is one stop the access rule held for the reset its usage limit states: the stop began at stopAt. Every
+// supervise run that finds the stop still held rewrites the stop's wait event (one per stop and try), so seen, the
+// event's time, is the last run that held it: just before the stop ended, by the rule's message at the reset or
+// another way (a restart, a new login, another account), or when supervision stopped looking at it. No run rewrites
+// it once the reset comes: the rule acts then, so seen is before it.
+type hold struct{ stopAt, seen time.Time }
 
 // supervised is supervision's own record of the stops it took on, by session.
 type supervised struct {
@@ -185,11 +185,11 @@ const resolveSlack = 5 * time.Minute
 // supervisedStops reads supervision's own record of the stops it took on. A resolution is an act of try 1 whose
 // outcome says the turn it opened worked; later tries are not resolutions. A hold is an access wait for a usage
 // limit that states its reset: the rule's time was known from the stop's first moment, so the stop waited on the
-// reset, not on the owner. A wait with no time (a login, an organization block, a limit that states no reset) is
-// no hold, and neither is a login's whose time a new login set: the event keeps only its last time, and the stop
-// waited on him until then. A session that meets the limit again on every wakeup is a new stop each time, with its
-// own wait event and stop_at. A stop one of whose messages did not land or failed again is neither: its outcome is
-// a finding of its own, and its wait counts.
+// reset, not on the owner. An access wait on a login, an organization block or a limit that states no reset holds
+// nothing, whatever its time: that time comes from a sign that access works again, such as a new login, after the
+// stop had waited on him, and the event keeps only its last time. A session that meets the limit again on every
+// wakeup is a new stop each time, with its own wait event and stop_at. A stop one of whose messages did not land or
+// failed again is neither: its outcome is a finding of its own, and its wait counts.
 func supervisedStops(ctx context.Context, st *store.Store, w Window) (supervised, error) {
 	evs, err := st.Events(ctx, store.Query{Since: w.Since.Add(-historyLead), Until: w.Until.Add(historyLead), Source: store.Supervise,
 		Kinds: []string{supervise.KindAct, supervise.KindOutcome, supervise.KindWait}, Limit: maxRows})
@@ -249,16 +249,15 @@ func supervisedStops(ctx context.Context, st *store.Store, w Window) (supervised
 		var m struct {
 			Rule, Error string
 			StopAt      int64 `json:"stop_at"`
-			At          int64
 		}
-		if json.Unmarshal([]byte(e.Meta), &m) != nil || m.Rule != supervise.RuleAccess || m.StopAt == 0 || m.At == 0 || failed[stop{e.Session, m.StopAt}] {
+		if json.Unmarshal([]byte(e.Meta), &m) != nil || m.Rule != supervise.RuleAccess || m.StopAt == 0 || failed[stop{e.Session, m.StopAt}] {
 			continue
 		}
 		stopAt := time.UnixMilli(m.StopAt)
 		if _, stated := supervise.ResetAt(m.Error, stopAt); !stated || supervise.ErrorClass(m.Error) != supervise.Limit {
 			continue
 		}
-		out.held[e.Session] = append(out.held[e.Session], hold{stopAt, time.UnixMilli(m.At), e.TS})
+		out.held[e.Session] = append(out.held[e.Session], hold{stopAt, e.TS})
 	}
 	return out, nil
 }
@@ -268,7 +267,7 @@ func supervisedStops(ctx context.Context, st *store.Store, w Window) (supervised
 const historyLead = 24 * time.Hour
 
 // covers reports whether the wait from start to end lies within a stop supervision took on: one it resolved on its
-// first try, or one an access wait held, from the stop to the last run that held it and no later than the reset.
+// first try, or one an access wait held, from the stop to the last run that held it.
 func (s supervised) covers(session string, start, end time.Time) bool {
 	for _, x := range s.resolved[session] {
 		if !start.Before(x.stopAt.Add(-resolveSlack)) && start.Before(x.sentAt) && !end.After(x.sentAt.Add(resolveSlack)) {
@@ -276,11 +275,7 @@ func (s supervised) covers(session string, start, end time.Time) bool {
 		}
 	}
 	for _, x := range s.held[session] {
-		last := x.seen
-		if x.at.Before(last) {
-			last = x.at
-		}
-		if !start.Before(x.stopAt.Add(-resolveSlack)) && !end.After(last.Add(resolveSlack)) {
+		if !start.Before(x.stopAt.Add(-resolveSlack)) && !end.After(x.seen.Add(resolveSlack)) {
 			return true
 		}
 	}
