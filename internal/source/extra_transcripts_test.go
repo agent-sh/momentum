@@ -890,6 +890,18 @@ func TestKimiClientNoticesAreGeneratedInput(t *testing.T) {
 		"accepts only PNG, JPEG, GIF, and WebP \u2014 convert it to PNG or JPEG and try again.]"
 	spacedUnnamed := "[Image omitted: unsupported image format image/svg+xml; charset=utf-8. The current model provider accepts only PNG, JPEG, " +
 		"GIF, and WebP \u2014 convert it to PNG or JPEG and try again.]"
+	// What Kimi fills in may end in a period or a quote, hold a period or a quote inside, and the provider may take
+	// more formats than four: its own list has seven.
+	named := func(name, mime, formats string) string {
+		return "[Image omitted: \"" + name + "\" uses unsupported image format " + mime + ". The current model provider accepts only " + formats +
+			" \u2014 convert it to PNG or JPEG and try again.]"
+	}
+	four := "PNG, JPEG, GIF, and WebP"
+	endsInQuote := named("marker-7f3a ends\"", "image/heic", four)
+	endsInPeriod := named("marker-7f3a dot.foo", "image/foo.", four)
+	periods := named("marker-7f3a icon.ico", "image/vnd.microsoft.icon", four)
+	quoteInside := named("marker-7f3a q\"b.heic", "image/heic", four)
+	seven := named("marker-7f3a seven.avif", "image/avif", "PNG, JPEG, GIF, WebP, BMP, HEIC, and HEIF")
 	// A notice, his words, then a copy of the notice's own fixed words after what Kimi fills in: the type, the name or
 	// an accepted format would have to hold his words for the part to be one notice.
 	tail := ". The current model provider accepts only PNG, JPEG, GIF, and WebP \u2014 convert it to PNG or JPEG and try again.]"
@@ -897,8 +909,15 @@ func TestKimiClientNoticesAreGeneratedInput(t *testing.T) {
 	nameRunOn := unsupported + " marker-7f3a after \"marker-7f3a mine.heic\" uses unsupported image format image/heic" + tail
 	urlRunOn := malformed + " marker-7f3a after \"data:image/png;base64,marker-7f3a mine\" is not a valid data URL (its header or payload could " +
 		"not be parsed). Re-encode the image as PNG or JPEG and try again.]"
+	// The same after a type that ends in a period, or a name that ends in a quote: a run of them is followed by no
+	// space inside what Kimi fills in.
+	periodRunOn := endsInPeriod + " marker-7f3a after" + tail
+	quoteRunOn := endsInQuote + " marker-7f3a after \"marker-7f3a mine.heic\" uses unsupported image format image/heic" + tail
 	labels := []string{"marker-7f3a typed", "marker-7f3a a.txt", "marker-7f3a shot", "marker-7f3a bad", "marker-7f3a mine", "Image omitted: unsupported",
-		"marker-7f3a after"}
+		"marker-7f3a after", "marker-7f3a ends", "marker-7f3a dot", "marker-7f3a icon", "marker-7f3a q", "marker-7f3a seven"}
+	generated := func(label string) map[string]string {
+		return map[string]string{"marker-7f3a typed": "owner owner_text", label: "harness harness_text"}
+	}
 	for _, tc := range []struct {
 		name   string
 		origin map[string]any
@@ -937,6 +956,23 @@ func TestKimiClientNoticesAreGeneratedInput(t *testing.T) {
 		{"a malformed image notice, his words and its fixed words after the url again", plain, []any{text("marker-7f3a typed"), text(urlRunOn)},
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a bad": "owner owner_text", "marker-7f3a after": "owner owner_text",
 				"marker-7f3a mine": "owner owner_text"}, []string{"marker-7f3a typed " + urlRunOn}},
+		{"a named notice whose name ends in a quote", plain, []any{text("marker-7f3a typed"), text(endsInQuote)}, generated("marker-7f3a ends"),
+			[]string{"marker-7f3a typed"}},
+		{"a named notice whose type ends in a period", plain, []any{text("marker-7f3a typed"), text(endsInPeriod)}, generated("marker-7f3a dot"),
+			[]string{"marker-7f3a typed"}},
+		{"a named notice whose type holds periods", plain, []any{text("marker-7f3a typed"), text(periods)}, generated("marker-7f3a icon"),
+			[]string{"marker-7f3a typed"}},
+		{"a named notice whose name holds a quote", plain, []any{text("marker-7f3a typed"), text(quoteInside)}, generated("marker-7f3a q"),
+			[]string{"marker-7f3a typed"}},
+		{"a named notice with seven accepted formats", plain, []any{text("marker-7f3a typed"), text(seven)}, generated("marker-7f3a seven"),
+			[]string{"marker-7f3a typed"}},
+		{"a notice whose type ends in a period, his words and its fixed words again", plain, []any{text("marker-7f3a typed"), text(periodRunOn)},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a dot": "owner owner_text", "marker-7f3a after": "owner owner_text"},
+			[]string{"marker-7f3a typed " + periodRunOn}},
+		{"a notice whose name ends in a quote, his words and its fixed words after the name again", plain,
+			[]any{text("marker-7f3a typed"), text(quoteRunOn)},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a ends": "owner owner_text", "marker-7f3a after": "owner owner_text",
+				"marker-7f3a mine": "owner owner_text"}, []string{"marker-7f3a typed " + quoteRunOn}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()

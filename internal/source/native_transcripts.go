@@ -638,15 +638,17 @@ var (
 // be parsed, each in its fixed words. The format is the image's type as declared, which may hold a space. No part
 // Kimi fills in may hold the words that follow it, so a notice cannot run on across his words to a copy of its own
 // fixed words: the type holds no period and space (kimiMime), a name no quote and space (kimiQuoted), and each
-// accepted format, a label or a type, no comma and no space (kimiFormat).
+// accepted format, a label or a type, no comma and no space (kimiFormat). In the type a run of periods is followed by
+// a character that is no space, or ends it, so a type may end in a period; in a name a run of quotes is, so a name
+// may end in a quote.
 var kimiImageOmitted = regexp.MustCompile(`\A\[Image omitted: (?:(?:unsupported image format ` + kimiMime + `|` + kimiQuoted +
 	` uses unsupported image format ` + kimiMime + `)\. The current model provider accepts only (?:` + kimiFormat + `(?:, ` + kimiFormat +
 	`)*)?, and ` + kimiFormat + ` \x{2014} convert it to PNG or JPEG and try again\.|` + kimiQuoted +
 	` is not a valid data URL \(its header or payload could not be parsed\)\. Re-encode the image as PNG or JPEG and try again\.)\]\z`)
 
 const (
-	kimiMime   = `(?:[^.\n]|\.[^ \n])+`
-	kimiQuoted = `"(?:[^"\n]|"[^ \n])*"`
+	kimiMime   = `(?:[^.\n]|\.+[^. \n])+\.*`
+	kimiQuoted = `"(?:[^"\n]|"+[^" \n])*"+`
 	kimiFormat = `[^,\s]+`
 )
 
