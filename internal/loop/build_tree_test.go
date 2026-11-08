@@ -341,7 +341,8 @@ func sweepFixture(t *testing.T) (*Runner, store.LoopRun, func(string) string, st
 // The sweep looks only at entries in a run id's form: one named ".-host" or "..-host" names no run, and removing the
 // run it seems to name would remove the runs directory.
 func TestTheSweepLooksOnlyAtRunIDs(t *testing.T) {
-	for _, odd := range []string{".-host", "..-host", "marker-7f3a", ".marker-7f3a-host"} {
+	for _, odd := range []string{".-host", "..-host", "marker-7f3a", ".marker-7f3a-host", "marker-20261107-000000-0a1b2c3d",
+		".20261107-000000-0a1b2c3d-marker-host", "20261107-000000-0a1b2c3d0"} {
 		r, known, in, _ := sweepFixture(t)
 		if err := os.MkdirAll(in(odd), 0o700); err != nil {
 			t.Fatal(err)
@@ -529,5 +530,27 @@ func TestTheSweepPassesOverHiddenPackageEntries(t *testing.T) {
 	}
 	if p, _, _ := r.Ship.Load(id); p.Work != r.Ship.workDir(id) {
 		t.Fatalf("the package names %s, not the case's work directory", p.Work)
+	}
+}
+
+// A running run's directory stays through the sweep: its row names it while the run is in flight.
+func TestTheSweepKeepsARunningRunsDirectory(t *testing.T) {
+	r, _, _, id := sweepFixture(t)
+	running := store.LoopRun{ID: newRunID(time.Now()), Case: id, Family: "sessions", Step: StepInvestigate, Started: time.Now(),
+		Status: store.RunRunning, USD: r.Budgets.Run}
+	running.Dir = filepath.Join(r.Dir, "runs", running.ID)
+	if err := r.Store.PutLoopRun(context.Background(), running); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{running.Dir, HostDir(running.Dir)} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.sweepRuns(context.Background())
+	for _, dir := range []string{running.Dir, HostDir(running.Dir)} {
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("the sweep removed %s of a run in flight: %v", filepath.Base(dir), err)
+		}
 	}
 }

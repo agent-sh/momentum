@@ -32,8 +32,9 @@ type planned struct {
 // schedule plans a pass's runs, with no effect of its own. prepare readies a build without reserving it; reserve
 // reserves a run (a build prepare readied, or any other case whole); each says what came of it. Each family's
 // candidates come best first. turns name, by turnBuild and turnRun, the families after which the pass's build and its
-// runs take their turn. room is whether the budgets leave the pass no run (0), one (1) or more (2). runsFirst says the
-// last pass that took one turn and not the other took the build's.
+// runs take their turn. room is whether the budgets leave the pass no run (0), one (1) or more (2). runsFirst says a
+// pass with room for one run serves the run turn first (the last pass that took exactly one turn took the build's,
+// or no such pass is known).
 //
 // It is round-robin. Before any run is reserved, the families whose best case builds prepare their builds in the build
 // turn's order until one is ready; a family whose build is held tries its next build. The family whose build is ready
@@ -144,7 +145,7 @@ func schedule(families []string, cands map[string][]candidate, turns map[string]
 		}
 		if reservedAny {
 			for _, fam := range inTurn(families, turns[turnBuild]) {
-				if builder(fam) && state[fam] != famDone {
+				if builder(fam) {
 					steps = append(steps, planned{fam: fam, cand: builds[fam][0], skipped: runsTurn})
 				}
 			}

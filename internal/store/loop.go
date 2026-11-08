@@ -14,7 +14,8 @@ import (
 // The improvement loop's record of its own runs: one row for each run of its agent on a case, what the run was
 // for, how it ended, what it cost and where its files are. It is kept: what a run spent cannot be read again, and
 // the loop's budgets and its stop rule read it. loop_turns holds the loop's turns, a row each (the family whose build a
-// pass reserved last, the family whose run it reserved first), after which the next pass's families take their turn.
+// pass reserved last, the family whose run it reserved first), after which the next pass's families take their turn,
+// and a row naming which of the two the last pass that took exactly one took.
 const loopTables = `
 CREATE TABLE IF NOT EXISTS loop_runs (id TEXT PRIMARY KEY, case_id TEXT NOT NULL, family TEXT NOT NULL, step TEXT NOT NULL,
   started INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, failure TEXT NOT NULL DEFAULT '',
@@ -28,25 +29,15 @@ var loopTableNames = []string{"loop_runs", "loop_turns"}
 
 // LoopTurn is the family a turn names, "" before any.
 func (s *Store) LoopTurn(ctx context.Context, step string) (string, error) {
-	family, _, err := s.LoopTurnAt(ctx, step)
+	var family string
+	err := s.db.QueryRowContext(ctx, `SELECT family FROM loop_turns WHERE step = ?`, step).Scan(&family)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
 	return family, err
 }
 
-// LoopTurnAt is the family a turn names and when a pass last took it, "" and the zero time before any.
-func (s *Store) LoopTurnAt(ctx context.Context, step string) (string, time.Time, error) {
-	var family string
-	var at int64
-	err := s.db.QueryRowContext(ctx, `SELECT family, at FROM loop_turns WHERE step = ?`, step).Scan(&family, &at)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", time.Time{}, nil
-	}
-	if err != nil {
-		return "", time.Time{}, err
-	}
-	return family, time.UnixMilli(at), nil
-}
-
-// SetLoopTurn records the family a turn names and when a pass took it.
+// SetLoopTurn records the family a turn names.
 func (s *Store) SetLoopTurn(ctx context.Context, step, family string, at time.Time) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO loop_turns (step, family, at) VALUES (?, ?, ?)
 	  ON CONFLICT(step) DO UPDATE SET family = excluded.family, at = excluded.at`, step, family, at.UnixMilli())

@@ -175,8 +175,8 @@ func TestPassPlansAreFairOverRandomFamilies(t *testing.T) {
 		if room == 1 && b > 0 {
 			gap, runGap = 2*b-1, 2*n
 		}
-		clock, tookAt := 0, map[string]int{} // when a pass last took each turn
-		turns := map[string]string{}         // the turns a store with none starts at, or any two families'
+		single := [...]string{"", turnBuild, turnRun}[rng.IntN(3)] // the turn the last pass that took exactly one took, if any
+		turns := map[string]string{}                               // the turns a store with none starts at, or any two families'
 		if rng.IntN(2) == 0 {
 			turns = map[string]string{turnBuild: names[rng.IntN(n)], turnRun: names[rng.IntN(n)]}
 		}
@@ -260,17 +260,17 @@ func TestPassPlansAreFairOverRandomFamilies(t *testing.T) {
 				}
 				return runReserved
 			}
-			runsFirst := tookAt[turnBuild] > tookAt[turnRun]
+			runsFirst := single != turnRun // as the runner reads the row
 			steps, after, took := schedule(names, cands, turns, room, runsFirst,
 				func(fam string, c candidate) outcome { return once(fam, prepare(fam, c)) },
 				func(fam string, c candidate) outcome { return once(fam, reserve(fam, c)) })
 			history = append(history, fmt.Sprintf("pass %d (turns %v, runs first %v): %s", pass, turns, runsFirst, plan(steps)))
 			turns = after
-			for _, kind := range []string{turnBuild, turnRun} { // as the runner writes them, the build's first
-				if took[kind] {
-					clock++
-					tookAt[kind] = clock
-				}
+			switch { // as the runner writes the row: only a pass that took exactly one turn
+			case took[turnBuild] && !took[turnRun]:
+				single = turnBuild
+			case took[turnRun] && !took[turnBuild]:
+				single = turnRun
 			}
 			if builds > 1 || builds > 0 && len(refused) > 0 {
 				fail("%d builds, %d ready builds refused", builds, len(refused))
@@ -392,4 +392,26 @@ func TestAFailedBuildYieldsWhateverTheRoom(t *testing.T) {
 			last, turns = builder, after
 		}
 	}
+}
+
+// With room for one run and the run turn served first, a builder family whose other case the budgets refused still
+// says why its build waits.
+func TestARefusedBuilderGetsTheRunsTurnNote(t *testing.T) {
+	cands := map[string][]candidate{"A": probeCands("A", StepBuild, StepInvestigate), "B": probeCands("B", StepInvestigate)}
+	left := 1
+	reserve := func(fam string, c candidate) outcome {
+		if left == 0 {
+			return runRecorded // refused
+		}
+		left--
+		return runReserved
+	}
+	steps, _, _ := schedule([]string{"A", "B"}, cands, map[string]string{turnRun: "A"}, 1, true,
+		func(string, candidate) outcome { return runReady }, reserve)
+	for _, s := range steps {
+		if s.fam == "A" && s.cand.step == StepBuild && s.skipped == runsTurn {
+			return
+		}
+	}
+	t.Errorf("A's build has no %q step: %s", runsTurn, plan(steps))
 }

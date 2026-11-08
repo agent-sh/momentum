@@ -32,10 +32,12 @@ const (
 )
 
 // The pass's turns, as the store keeps them (LoopTurn): turnBuild names the family whose build a pass reserved last,
-// turnRun the family in whose place a pass reserved its first run.
+// turnRun the family in whose place a pass reserved its first run, and turnSingle, in place of a family, the turn
+// (turnBuild or turnRun) that the last pass that took exactly one of the two took.
 const (
-	turnBuild = StepBuild
-	turnRun   = "run"
+	turnBuild  = StepBuild
+	turnRun    = "run"
+	turnSingle = "single"
 )
 
 // Budgets are the loop's limits, in US dollars and time. The defaults come from the Phase 0 baseline: what the
@@ -161,14 +163,21 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		families = o.Families
 	}
 	// the turns: a turn the store cannot read leaves its order as configured
-	turns, taken := map[string]string{}, map[string]time.Time{}
+	turns := map[string]string{}
 	for _, kind := range []string{turnBuild, turnRun} {
-		turn, at, err := r.Store.LoopTurnAt(ctx, kind)
+		turn, err := r.Store.LoopTurn(ctx, kind)
 		if err != nil {
 			r.logf("the loop's %s turn: %v; the pass takes the families in their configured order", kind, err)
 			continue
 		}
-		turns[kind], taken[kind] = turn, at
+		turns[kind] = turn
+	}
+	// with room for one run, the build and the run turn take the passes in turn: a pass serves the run turn first when
+	// the last pass that took exactly one turn took the build's, and when the store names no such pass or cannot be
+	// read, so the side that can wait longest is served
+	single, err := r.Store.LoopTurn(ctx, turnSingle)
+	if err != nil {
+		r.logf("the loop's last single turn: %v; a pass with room for one run serves the run turn first", err)
 	}
 	// every family's run is reserved before any starts, so the budgets count each in flight at its whole budget
 	// whatever the others spend meanwhile
@@ -328,9 +337,7 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 			room, roomWhy = 2, ""
 		}
 	}
-	// with room for one run, the build and the run turn take the pass in turn: the run turn's when the last pass that
-	// took one turn and not the other took the build's
-	steps, next, took := schedule(families, cands, turns, room, taken[turnBuild].After(taken[turnRun]), prepare, reserve)
+	steps, next, took := schedule(families, cands, turns, room, single != turnRun, prepare, reserve)
 	for id := range prepared { // cannot happen: schedule reserves every build it readies
 		unready(id)
 	}
@@ -346,15 +353,28 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		// a turn the store cannot write keeps its old family: the pass counts it among its steps
 		failed, changed := 0, 0
 		var writeErr error
-		for _, kind := range []string{turnBuild, turnRun} { // a turn a run took is written again, so its time says so
-			if !took[kind] {
+		write := map[string]string{}
+		for _, kind := range []string{turnBuild, turnRun} {
+			if next[kind] != turns[kind] {
+				write[kind] = next[kind]
+			}
+		}
+		switch { // a pass that took exactly one turn is the one the next pass with room for one run answers
+		case took[turnBuild] && !took[turnRun]:
+			write[turnSingle] = turnBuild
+		case took[turnRun] && !took[turnBuild]:
+			write[turnSingle] = turnRun
+		}
+		for _, kind := range []string{turnBuild, turnRun, turnSingle} {
+			value, ok := write[kind]
+			if !ok {
 				continue
 			}
 			changed++
-			if err := r.Store.SetLoopTurn(ctx, kind, next[kind], r.now()); err != nil {
+			if err := r.Store.SetLoopTurn(ctx, kind, value, r.now()); err != nil {
 				failed++
 				writeErr = err
-				r.logf("the loop's %s turn of %s: %v", kind, next[kind], err)
+				r.logf("the loop's %s turn of %s: %v", kind, value, err)
 			}
 		}
 		if failed > 0 {
@@ -382,11 +402,8 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		if err := r.noteWaiting(ctx); err != nil {
 			r.logf("waiting packages: %v", err)
 		}
-		if err := r.lessons(ctx, o.Case, clean); err != nil {
-			r.logf("lessons: %v", err)
-			if picked == nil {
-				picked = err
-			}
+		if err := r.lessons(ctx, o.Case, clean); err != nil && picked == nil { // lessons logs each family's error
+			picked = err
 		}
 	}
 	sort.Slice(done, func(i, j int) bool { return done[i].Family+done[i].Step < done[j].Family+done[j].Step })

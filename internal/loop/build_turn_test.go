@@ -143,13 +143,13 @@ func TestAHeldBuildPassesThePassBuildToTheNextFamily(t *testing.T) {
 
 // With room for one run a pass, the build and the run turn take the passes in turn, though every build fails before
 // its agent starts (an absent toolchain: a run recorded unstarted at no cost, which the stop rule does not count): the
-// other family's investigation runs every other pass.
+// other family's investigation runs every other pass. A store with no single turn yet serves the run turn first.
 func TestARoomForOneRunAlternatesTheBuildAndTheRunTurn(t *testing.T) {
 	r, cs := turnRunner(t, "owner-burden")
 	open := openCase(t, r.Store, "sessions", "marker-7f3a-open", 1)
 	r.Families = []string{"owner-burden", "sessions"}
 	r.Budgets.Day = 1.5 * r.Budgets.Run
-	for pass, build := range []bool{true, false, true, false} {
+	for pass, build := range []bool{false, true, false, true} {
 		done, err := r.Once(context.Background(), Options{})
 		if err != nil {
 			t.Fatal(err)
@@ -217,6 +217,9 @@ func TestTheBuildTurnsFamilyBuildsWhateverTheRoom(t *testing.T) {
 		if err := r.Store.SetLoopTurn(ctx, kind, "sessions", time.Now()); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := r.Store.SetLoopTurn(ctx, turnSingle, turnRun, time.Now()); err != nil { // room for one run serves the build
+		t.Fatal(err)
 	}
 	builders := []store.Case{cs[0], cs[1], cs[0]}
 	for pass, room := range []int{3, 2, 1} {
@@ -585,6 +588,9 @@ func TestTheBuildTakesTheFirstPlace(t *testing.T) {
 	open := openCase(t, r.Store, "sessions", "marker-7f3a-open", 1)
 	r.Families = []string{"sessions", "owner-burden"}
 	r.Budgets.Day = 1.5 * r.Budgets.Run
+	if err := r.Store.SetLoopTurn(context.Background(), turnSingle, turnRun, time.Now()); err != nil { // the pass serves the build
+		t.Fatal(err)
+	}
 	done, err := r.Once(context.Background(), Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -903,5 +909,107 @@ func TestARoomForMoreRunsBuildsAndRunsTheRestEachPass(t *testing.T) {
 	}
 	if ran, why := turnStep(done, open.ID, StepInvestigate); !ran {
 		t.Fatalf("the second pass did not investigate: %q", why)
+	}
+}
+
+// setRoom sets the day's budget to leave room for want runs.
+func setRoom(t *testing.T, r *Runner, want int) {
+	t.Helper()
+	ctx := context.Background()
+	spent, err := r.Store.LoopSpend(ctx, time.Now().Add(-24*time.Hour), r.Budgets.Run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Budgets.Day = spent + (float64(want)+0.5)*r.Budgets.Run
+	if got, _, err := r.room(ctx, 4); err != nil || got != want {
+		t.Fatalf("the room is %d, want %d: %v", got, want, err)
+	}
+}
+
+// With room for one run, a pass answers the last pass that took exactly one turn, though a pass with room for more
+// took both in between (rooms 1, 3, 1): after a pass that took only the build's turn the run turn is served, and after
+// one that took only the run turn's the build. A store with no single turn serves the run turn.
+func TestARoomForOneRunAnswersTheLastSingleTurn(t *testing.T) {
+	for _, first := range []string{turnBuild, ""} { // the turn the first pass takes: the build's, or (no row) the run turn's
+		r, cs := turnRunner(t, "owner-burden")
+		ctx := context.Background()
+		s := openCase(t, r.Store, "sessions", "marker-7f3a-s", 1)
+		m := openCase(t, r.Store, "manual-work", "marker-7f3a-m", 1)
+		r.Families = []string{"owner-burden", "sessions", "manual-work"}
+		if first == turnBuild {
+			if err := r.Store.SetLoopTurn(ctx, turnSingle, turnRun, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for pass, room := range []int{1, 3, 1} {
+			setRoom(t, r, room)
+			done, err := r.Once(ctx, Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			built, whyBuild := turnStep(done, cs[0].ID, StepBuild)
+			ranS, _ := turnStep(done, s.ID, StepInvestigate)
+			ranM, _ := turnStep(done, m.ID, StepInvestigate)
+			investigated := ranS || ranM
+			wantBuild := (pass == 1) || (pass == 0) == (first == turnBuild)
+			wantRuns := pass == 1 || !wantBuild
+			if built != wantBuild || investigated != wantRuns || !built && whyBuild != runsTurn {
+				t.Fatalf("first %q, pass %d (room %d): built %v (%q), investigated %v; want the build %v, runs %v", first, pass+1, room,
+					built, whyBuild, investigated, wantBuild, wantRuns)
+			}
+		}
+	}
+}
+
+// With room for one run, a pass whose store cannot say which turn the last single pass took serves the run turn.
+func TestARoomForOneRunServesTheRunTurnWhenTheTurnsCannotBeRead(t *testing.T) {
+	r, cs := turnRunner(t, "owner-burden")
+	open := openCase(t, r.Store, "sessions", "marker-7f3a-open", 1)
+	r.Families = []string{"owner-burden", "sessions"}
+	r.Budgets.Day = 1.5 * r.Budgets.Run
+	db, err := sql.Open("sqlite", r.Store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`DROP TABLE loop_turns`); err != nil {
+		t.Fatal(err)
+	}
+	done, err := r.Once(context.Background(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	built, whyBuild := turnStep(done, cs[0].ID, StepBuild)
+	ran, why := turnStep(done, open.ID, StepInvestigate)
+	if built || !ran || whyBuild != runsTurn {
+		t.Fatalf("built %v (%q), investigated %v (%q); want the run turn served", built, whyBuild, ran, why)
+	}
+}
+
+// A pass's lessons keep to its case: with --case naming one closed case, only that case's lesson is published.
+func TestLessonsKeepToThePassesCase(t *testing.T) {
+	r, _ := turnRunner(t, "owner-burden")
+	r.Tacit = script(t, t.TempDir(), "tacit", "exit 0")
+	db, err := sql.Open("sqlite", r.Store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	one, onePublished := lessonFixture(t, r, db, "owner-burden")
+	other := openCase(t, r.Store, "owner-burden", "marker-7f3a-other", 1)
+	if _, err := db.Exec("UPDATE cases SET status = ?, reason = ? WHERE id = ?", store.CaseClosed, store.Improved, other.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Ship.save(&Package{Case: other.ID, State: Landed, Lesson: "Name the other fixture."}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Once(context.Background(), Options{Case: one.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if !onePublished() {
+		t.Error("the pass's case's lesson was not published")
+	}
+	if r.published(context.Background(), other.ID) {
+		t.Error("a lesson of a case the pass does not name was published")
 	}
 }
