@@ -167,8 +167,8 @@ func (o OwnerBurden) Detect(ctx context.Context, st *store.Store, w Window) ([]s
 	earlier := map[string][]store.Event{}
 	var occ []occurrence
 	for i, t := range turns {
-		// A turn that holds none of his words (an inline skill sent alone) is still his answer to what the agent
-		// said before it: it bounds the next turn's look back, and it is never classed.
+		// A turn that holds none of his words (a compressed image or an attached resource sent alone) is still his
+		// answer to what the agent said before it: it bounds the next turn's look back, and it is never classed.
 		empty := strings.TrimSpace(t.Summary) == ""
 		if program[i] && !empty {
 			continue

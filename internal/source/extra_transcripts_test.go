@@ -693,6 +693,8 @@ func TestKimiSystemBlocksAreGeneratedInput(t *testing.T) {
 	labels := []string{"marker-7f3a note", "marker-7f3a context", "marker-7f3a typed", "marker-7f3a pasted", "marker-7f3a after"}
 	note2 := map[string]string{"marker-7f3a note": "harness harness_text", "marker-7f3a typed": "owner owner_text"}
 	split := map[string]string{"marker-7f3a context": "harness harness_text", "marker-7f3a typed": "owner owner_text"}
+	hook := map[string]any{"type": "text", "text": "hook output", "meta": map[string]any{"source": "user prompt submit hook"}}
+	pastedNote := map[string]string{"marker-7f3a note": "harness harness_text", "marker-7f3a after": "harness harness_text"}
 	for _, tc := range []struct {
 		name  string
 		input []any
@@ -703,6 +705,13 @@ func TestKimiSystemBlocksAreGeneratedInput(t *testing.T) {
 		{"image note only", []any{note, image}, map[string]string{"marker-7f3a note": "harness harness_text"}, []string{""}},
 		{"editor context at the start of a part", []any{text(context + "marker-7f3a typed")}, split, []string{"marker-7f3a typed"}},
 		{"editor context at the end of a part", []any{text("marker-7f3a typed\n" + context)}, split, []string{"marker-7f3a typed"}},
+		// A hook's part ahead of a list prompt does not move the editor context off its first text part.
+		{"editor context after a hook's part", []any{hook, text(context + "marker-7f3a typed"), image}, split, []string{"marker-7f3a typed"}},
+		// Only the editor context is split off the start of the first text part: a note there is no client's, so the
+		// part is not split and is left to tacit, as on main, whose rule makes a turn that opens with a tag the
+		// harness's whole. Split, the words after the note would be an owner turn.
+		{"a note opening his first part", []any{text(noteText + " marker-7f3a after")}, pastedNote, nil},
+		{"a note opening his first part before an image", []any{text(noteText + " marker-7f3a after"), image}, pastedNote, nil},
 		// A block runs to the next closing tag: a later one on the line is his.
 		{"his words with a closing tag after an editor context", []any{text(open + "Editor context (use only if relevant to user's query): marker-7f3a context.go:12." +
 			end + "marker-7f3a typed " + end)}, split, []string{"marker-7f3a typed " + end}},
@@ -813,9 +822,7 @@ func TestKimiClientNoticesAreGeneratedInput(t *testing.T) {
 		"PNG, JPEG, GIF, and WebP \u2014 convert it to PNG or JPEG and try again.]"
 	malformed := "[Image omitted: \"data:image/png;base64,marker-7f3a bad\u2026\" is not a valid data URL (its header or payload could not be parsed). " +
 		"Re-encode the image as PNG or JPEG and try again.]"
-	unknownPart := "[unsupported content: {\"type\":\"marker-7f3a widget\",\"data\":[1,2]}]"
-	labels := []string{"marker-7f3a typed", "marker-7f3a a.txt", "marker-7f3a shot", "marker-7f3a bad", "marker-7f3a mine",
-		"[image expired]", "[video missing url]", "marker-7f3a widget"}
+	labels := []string{"marker-7f3a typed", "marker-7f3a a.txt", "marker-7f3a shot", "marker-7f3a bad", "marker-7f3a mine"}
 	for _, tc := range []struct {
 		name   string
 		origin map[string]any
@@ -836,16 +843,6 @@ func TestKimiClientNoticesAreGeneratedInput(t *testing.T) {
 			[]string{"marker-7f3a typed [Image omitted: marker-7f3a mine]"}},
 		{"an image-omitted notice after his words", plain, []any{text("marker-7f3a typed " + unsupported)},
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a shot": "owner owner_text"}, []string{"marker-7f3a typed " + unsupported}},
-		// Kimi's migration of an older session writes a marker part where it could not carry content over.
-		{"a migration's media markers", plain, []any{text("marker-7f3a typed"), text("[image expired]"), text("[video missing url]")},
-			map[string]string{"marker-7f3a typed": "owner owner_text", "[image expired]": "harness harness_text", "[video missing url]": "harness harness_text"},
-			[]string{"marker-7f3a typed"}},
-		{"a migration's unsupported part", plain, []any{text("marker-7f3a typed"), text(unknownPart)},
-			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a widget": "harness harness_text"}, []string{"marker-7f3a typed"}},
-		{"a marker after his words", plain, []any{text("marker-7f3a typed [image expired]")},
-			map[string]string{"marker-7f3a typed": "owner owner_text", "[image expired]": "owner owner_text"}, []string{"marker-7f3a typed [image expired]"}},
-		{"an unsupported marker after his words", plain, []any{text("marker-7f3a typed " + unknownPart)},
-			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a widget": "owner owner_text"}, []string{"marker-7f3a typed " + unknownPart}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -853,6 +850,71 @@ func TestKimiClientNoticesAreGeneratedInput(t *testing.T) {
 			writeJSONLines(t, path, kimiRecord("turn.prompt", map[string]any{"origin": tc.origin, "input": tc.input}),
 				kimiRecord("turn.ended", map[string]any{}))
 			kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a typed"}`)
+			st := openStore(t)
+			ingest(t, transcripts(home), st)
+			if got := actorsOf(t, st, labels...); !maps.Equal(got, tc.want) {
+				t.Fatalf("prompt stored as %v, want %v", got, tc.want)
+			}
+			if got := ownerTexts(t, st); !slices.Equal(got, tc.owner) {
+				t.Fatalf("owner turns %q, want %q", got, tc.owner)
+			}
+		})
+	}
+}
+
+// Kimi's migration of a session from its older CLI writes a marker part where it could not carry content over: a
+// media part with no url or whose local file is gone, and a part of a kind it does not know, as that part's JSON. It
+// writes them only into the prompts it synthesizes, which carry no turnId, in a session whose metadata it marks as
+// imported. There they are generated input, and a prompt they leave none of his words is still his turn, with empty
+// text. The same words in a prompt Kimi took itself, which carries a turnId, in a steer, or in a session no migration
+// made, are his, and so are words in the unsupported marker's brackets that are no JSON.
+func TestKimiMigrationMarkersAreGeneratedInput(t *testing.T) {
+	text := func(s string) map[string]any { return map[string]any{"type": "text", "text": s} }
+	prompt := func(kind string, numbered bool, input ...any) map[string]any {
+		r := kimiRecord(kind, map[string]any{"origin": map[string]any{"kind": "user"}, "input": input})
+		if numbered {
+			r["turnId"] = 3
+		}
+		return r
+	}
+	unknownPart := "[unsupported content: {\"type\":\"marker-7f3a widget\",\"data\":[1,2]}]"
+	notJSON := "[unsupported content: marker-7f3a mine]"
+	typed := `{"version":2,"lastPrompt":"marker-7f3a typed"}`
+	imported := `{"version":2,"lastPrompt":"marker-7f3a typed","custom":{"imported_from_kimi_cli":true}}`
+	labels := []string{"marker-7f3a typed", "[image expired]", "[video missing url]", "marker-7f3a widget", "marker-7f3a mine"}
+	his := map[string]string{"[image expired]": "owner owner_text"}
+	for _, tc := range []struct {
+		name   string
+		state  string
+		record map[string]any
+		want   map[string]string
+		owner  []string
+	}{
+		{"a migration's media markers", imported, prompt("turn.prompt", false, text("marker-7f3a typed"), text("[image expired]"), text("[video missing url]")),
+			map[string]string{"marker-7f3a typed": "owner owner_text", "[image expired]": "harness harness_text", "[video missing url]": "harness harness_text"},
+			[]string{"marker-7f3a typed"}},
+		{"a migration's unsupported part", imported, prompt("turn.prompt", false, text("marker-7f3a typed"), text(unknownPart)),
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a widget": "harness harness_text"}, []string{"marker-7f3a typed"}},
+		{"a migrated prompt of a marker alone", imported, prompt("turn.prompt", false, text("[image expired]")),
+			map[string]string{"[image expired]": "harness harness_text"}, []string{""}},
+		{"a marker after his words", imported, prompt("turn.prompt", false, text("marker-7f3a typed [image expired]")),
+			map[string]string{"marker-7f3a typed": "owner owner_text", "[image expired]": "owner owner_text"}, []string{"marker-7f3a typed [image expired]"}},
+		{"an unsupported marker after his words", imported, prompt("turn.prompt", false, text("marker-7f3a typed "+unknownPart)),
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a widget": "owner owner_text"}, []string{"marker-7f3a typed " + unknownPart}},
+		{"words that are no JSON in an unsupported marker", imported, prompt("turn.prompt", false, text("marker-7f3a typed"), text(notJSON)),
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a mine": "owner owner_text"}, []string{"marker-7f3a typed " + notJSON}},
+		{"a marker he typed", typed, prompt("turn.prompt", true, text("[image expired]")), his, []string{"[image expired]"}},
+		{"an unsupported marker he typed", typed, prompt("turn.prompt", true, text(unknownPart)),
+			map[string]string{"marker-7f3a widget": "owner owner_text"}, []string{unknownPart}},
+		{"a marker he typed into a migrated session", imported, prompt("turn.prompt", true, text("[image expired]")), his, []string{"[image expired]"}},
+		{"a marker he steered into a migrated session", imported, prompt("turn.steer", false, text("[image expired]")), his, []string{"[image expired]"}},
+		{"a prompt with no turnId in a session no migration made", typed, prompt("turn.prompt", false, text("[image expired]")), his, []string{"[image expired]"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed", "agents", "main", "wire.jsonl")
+			writeJSONLines(t, path, tc.record, kimiRecord("turn.ended", map[string]any{}))
+			kimiState(t, path, tc.state)
 			st := openStore(t)
 			ingest(t, transcripts(home), st)
 			if got := actorsOf(t, st, labels...); !maps.Equal(got, tc.want) {

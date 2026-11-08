@@ -78,10 +78,12 @@ type nativeState struct {
 	// Rule is the Kimi attribution rule the events before the cursor were credited by (kimiRule).
 	Rule int `json:",omitempty"`
 	// dir is a Kimi session's directory and wire its agent's file; read says this read has read the session's
-	// metadata (kimiProvenance).
-	dir  string
-	wire string
-	read bool
+	// metadata (kimiProvenance), and imported that the metadata says Kimi's migration from its older CLI made the
+	// session.
+	dir      string
+	wire     string
+	read     bool
+	imported bool
 	// sources counts the prompt text parts read with a meta.source Kimi is not known to write (kimiInput), until the
 	// reader takes them into its tally.
 	sources int
@@ -547,8 +549,11 @@ func (s *nativeState) kimi(o map[string]any) []evidence.Event {
 		}
 		// The text Kimi and its clients generated into a prompt (an inline skill's body, a hook's output, a client's
 		// notice) is generated input, as a slash command's activation is. Only the rest is the prompt's words
-		// (kimiInput).
-		generated, words, unknown := kimiInput(o["input"], origin)
+		// (kimiInput). Kimi's migration of a session from its older CLI synthesizes a prompt per imported turn with
+		// no turnId, in a session whose metadata it marks as imported; each prompt Kimi Code takes itself carries one.
+		_, numbered := o["turnId"]
+		migrated := typed && s.imported && str(o, "type") == "turn.prompt" && !numbered
+		generated, words, unknown := kimiInput(o["input"], origin, migrated)
 		s.sources += unknown
 		prior := s.Prior
 		out := s.user("kimi", generated, false, false, at, input)
@@ -636,11 +641,21 @@ var kimiImageOmitted = regexp.MustCompile(`\A\[Image omitted: (?:(?:unsupported 
 
 // kimiMediaMarker and kimiUnsupported are the whole text parts Kimi's migration of a session from its older CLI
 // writes into a prompt in place of what it could not carry over: a media part with no url or whose local file is
-// gone, and a part of a kind it does not know, as JSON.
+// gone, and a part of a kind it does not know, as JSON (JSON.stringify of the part, any JSON value; kimiMigrated).
 var (
 	kimiMediaMarker = regexp.MustCompile(`\A\[(?:image|audio|video) (?:missing url|expired)\]\z`)
-	kimiUnsupported = regexp.MustCompile(`(?s)\A\[unsupported content: .*\]\z`)
+	kimiUnsupported = regexp.MustCompile(`(?s)\A\[unsupported content: (.*)\]\z`)
 )
+
+// kimiMigrated reports a whole text part the migration writes: a media marker, or an unsupported part's marker
+// whose brackets hold valid JSON. Other words in those brackets are his.
+func kimiMigrated(t string) bool {
+	if kimiMediaMarker.MatchString(t) {
+		return true
+	}
+	m := kimiUnsupported.FindStringSubmatch(t)
+	return m != nil && json.Valid([]byte(m[1]))
+}
 
 // kimiAttached are the notices Kimi's web server writes, each a whole text part, for the files a user-origin prompt
 // attaches: rebuilt from the name, type, size and path its origin.attachments keeps for each.
@@ -667,13 +682,14 @@ func kimiAttached(origin map[string]any) map[string]bool {
 // its clients send the person's text with none); on a wire from before Kimi marked skill parts, in a user-origin
 // prompt with no part marked "skill activation", the first text parts with no meta.source, one per activation its
 // origin.skillActivations bundles, which Kimi reads as the skill's; a whole text part a client or Kimi writes in
-// its fixed form (kimiWhole, kimiAttached); an image note that is the whole text part right before an image part,
+// its fixed form (kimiWhole, kimiAttached), and in a prompt the migration from Kimi's older CLI wrote (migrated), a
+// marker it writes there (kimiMigrated); an image note that is the whole text part right before an image part,
 // or the block that ends it; and VS Code's editor context at the start of the first text part, or at the end of a
 // string prompt, which reaches the wire as one text part. What cannot be rebuilt exactly where Kimi
 // writes it, such as an attached-file notice its origin does not list, a known block elsewhere in his words or the
 // ACP server's bare file paths, stays in his words. unknown counts the parts whose meta.source is not one Kimi is
 // known to write; they are generated all the same. Only text counts, as in nativeText.
-func kimiInput(input any, origin map[string]any) (generated, words string, unknown int) {
+func kimiInput(input any, origin map[string]any, migrated bool) (generated, words string, unknown int) {
 	parts, listed := input.([]any)
 	if !listed {
 		parts = []any{map[string]any{"type": "text", "text": nativeText(input)}}
@@ -713,7 +729,7 @@ func kimiInput(input any, origin map[string]any) (generated, words string, unkno
 			t := str(p, "text")
 			opens := first
 			first = false
-			if kimiWhole(t) || attached[t] {
+			if kimiWhole(t) || attached[t] || migrated && kimiMigrated(t) {
 				gen = append(gen, b)
 				continue
 			}
@@ -742,11 +758,10 @@ func kimiInput(input any, origin map[string]any) (generated, words string, unkno
 }
 
 // kimiWhole reports a whole text part Kimi or a client writes in a fixed form: the ACP server's resource elements
-// (kimiResource), an image-omitted notice (kimiImageOmitted) and a migration's marker (kimiMediaMarker,
-// kimiUnsupported).
+// (kimiResource) and an image-omitted notice (kimiImageOmitted). A migration's marker is one only in a prompt the
+// migration wrote (kimiMigrated).
 func kimiWhole(t string) bool {
-	return kimiResource.MatchString(t) || kimiResourceLink.MatchString(t) || kimiImageOmitted.MatchString(t) ||
-		kimiMediaMarker.MatchString(t) || kimiUnsupported.MatchString(t)
+	return kimiResource.MatchString(t) || kimiResourceLink.MatchString(t) || kimiImageOmitted.MatchString(t)
 }
 
 // kimiProvenance reads whether a person's client ever prompted the session. Kimi's clients (its TUI, web UI and
@@ -760,7 +775,8 @@ func (s *nativeState) kimiProvenance() {
 		return
 	}
 	s.read = true
-	owner, known := kimiMeta(s.dir)
+	owner, known, imported := kimiMeta(s.dir)
+	s.imported = imported
 	if !known {
 		return
 	}
@@ -771,7 +787,9 @@ func (s *nativeState) kimiProvenance() {
 // kimiMeta reads a session's metadata where Kimi keeps it: its state.json and the state.json of its older
 // session-meta directory. owner says one of them holds a lastPrompt (Kimi reads one that is not a string as
 // none), and known that one of them could be read: a file that is missing, or not one JSON object, is not.
-func kimiMeta(dir string) (owner, known bool) {
+// imported says one of them marks the session as made by Kimi's migration from its older CLI
+// (custom.imported_from_kimi_cli, which the migration writes and Kimi keeps, into a fork's metadata too).
+func kimiMeta(dir string) (owner, known, imported bool) {
 	for _, path := range []string{filepath.Join(dir, "state.json"), filepath.Join(dir, "session-meta", "state.json")} {
 		raw, err := os.ReadFile(path)
 		var meta map[string]json.RawMessage
@@ -779,11 +797,16 @@ func kimiMeta(dir string) (owner, known bool) {
 			continue
 		}
 		known = true
+		var custom map[string]json.RawMessage
+		if json.Unmarshal(meta["custom"], &custom) == nil &&
+			string(bytes.TrimSpace(custom["imported_from_kimi_cli"])) == "true" {
+			imported = true
+		}
 		if last := bytes.TrimSpace(meta["lastPrompt"]); len(last) > 0 && last[0] == '"' {
-			return true, true
+			return true, true, imported
 		}
 	}
-	return false, known
+	return false, known, imported
 }
 
 // kimiUndone reports a wire that holds an undo of its context (a context.undo or context.undone record), read
