@@ -112,7 +112,7 @@ var (
 		"claude": regexp.MustCompile(`Command running in background with ID: |was moved to the background \(ID: |` +
 			`manually backgrounded by user with ID: `),
 		"hermes":   regexp.MustCompile(`Background process started|"status": ?"yielded_to_background"|tracked background process`),
-		"kimi":     regexp.MustCompile(`^task_id: |automatic_notification: true`),
+		"kimi":     regexp.MustCompile(`(?s)\A(?:task_id: |.*automatic_notification: true)`),
 		"opencode": regexp.MustCompile(`Command moved to the background \(shell ID: `),
 	}
 	// exitRe is the exit code a Codex result reports in its header once its command has ended; one still running
