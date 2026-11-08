@@ -2074,3 +2074,96 @@ func TestAnInvestigationThatNeverStartedDoesNotSplitTwoAgentFailures(t *testing.
 		t.Fatalf("two agent failures with an investigation that never started between: %q %v", why, err)
 	}
 }
+
+// exitBeforeStart puts a fake user manager first on PATH whose harness unit exits 9 at once: the sandbox launches,
+// and the harness never prints its start marker or reaches the relay. Other units (the pass's probe) succeed.
+func exitBeforeStart(t *testing.T) {
+	t.Helper()
+	fakeManager(t)
+	bin := t.TempDir()
+	script(t, bin, "systemd-run", `case "$*" in *momentum-harness-*) exit 9;; esac`)
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+}
+
+// A build whose sandbox exits before its harness starts (exit 9, no start marker, nothing at the relay) is a harness
+// that does not start: it is kept at build run at no cost and with no start, so two of them stop the case on the
+// stage alone, as any build that never started at a host stage does.
+func TestABuildWhoseSandboxExitsBeforeItsHarnessStops(t *testing.T) {
+	exitBeforeStart(t)
+	ctx := context.Background()
+	r, c := inputRunner(t)
+	r.Dir = shortScratch(t) // the run's relay socket fits Unix's bound
+	f := newRepo(t, nil)
+	r.Ship = shipWithSandbox(r.Store, f, Sandbox{})
+	r.Ship.Dir = r.Dir
+	r.Inputs.ReadDirs = []string{f.main}
+	r.Agent = Agent{Runner: []string{script(t, t.TempDir(), "harness", "exit 3")}, Model: "global.anthropic.claude-opus-5-5", Bedrock: testBedrock(t)}
+	mechanism, fix := "one cause", "one fix"
+	var err error
+	if c, err = r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	setCaseRepo(t, r.Store, c, "main")
+	for i := 0; i < 2; i++ {
+		done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
+		if err != nil || len(done) != 1 || done[0].Run.Failure != "build run" || done[0].Run.USD != 0 || !done[0].Run.Started.IsZero() ||
+			!strings.Contains(done[0].Run.Summary, "build run: the harness never started: its sandbox ended with exit 9") {
+			t.Fatalf("build %d whose sandbox exited before its harness: %+v %v", i, done, err)
+		}
+	}
+	done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
+	if err != nil || len(done) != 1 || done[0].Run.ID != "" || !strings.Contains(done[0].Skipped, "stopped: two of its build runs failed the same way: build run)") {
+		t.Fatalf("two builds whose harness never started did not stop the case: %+v %v", done, err)
+	}
+	cs, err := r.Store.Cases(ctx, store.CaseFilter{Family: store.HealthFamily})
+	if err != nil || len(cs) != 1 || !slices.Equal(cs[0].Signatures, []string{"component-health/v1:loop:build:build-run"}) || cs[0].Evidence != 2 {
+		t.Fatalf("the stop's component-health case: %+v %v", cs, err)
+	}
+}
+
+// An investigation whose sandbox exits before its harness starts is kept as run, as the error that keeps a harness
+// from starting is: two of them stop the case on the step and the failure alone.
+func TestAnInvestigationWhoseSandboxExitsBeforeItsHarnessStops(t *testing.T) {
+	exitBeforeStart(t)
+	ctx := context.Background()
+	r, c := inputRunner(t)
+	r.Dir = shortScratch(t) // the run's relay socket fits Unix's bound
+	r.Agent = Agent{Runner: []string{script(t, t.TempDir(), "harness", "exit 3")}, Model: "global.anthropic.claude-opus-5-5", Bedrock: testBedrock(t)}
+	for i := 0; i < 2; i++ {
+		done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
+		if err != nil || len(done) != 1 || done[0].Run.Step != StepInvestigate || done[0].Run.Failure != "run" || done[0].Run.USD != 0 ||
+			!done[0].Run.Started.IsZero() || !strings.Contains(done[0].Run.Summary, "the harness never started: its sandbox ended with exit 9") {
+			t.Fatalf("investigation %d whose sandbox exited before its harness: %+v %v", i, done, err)
+		}
+	}
+	done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
+	if err != nil || len(done) != 1 || done[0].Run.ID != "" || !strings.Contains(done[0].Skipped, "stopped: its last two investigate runs failed the same way: run") {
+		t.Fatalf("two investigations whose harness never started did not stop the case: %+v %v", done, err)
+	}
+	cs, err := r.Store.Cases(ctx, store.CaseFilter{Family: store.HealthFamily})
+	if err != nil || len(cs) != 1 || !slices.Equal(cs[0].Signatures, []string{"component-health/v1:loop:investigate:run"}) || cs[0].Evidence != 2 {
+		t.Fatalf("the stop's component-health case: %+v %v", cs, err)
+	}
+}
+
+// Only an exit with no start and nothing at the relay is a harness that does not start: a run that started, one the
+// relay saw, and the broker's or a timeout's keep their own keys.
+func TestOnlyAnExitBeforeTheStartIsAHarnessThatDoesNotStart(t *testing.T) {
+	never := Result{Status: store.RunFailed, Failure: "exit 9"}
+	if !exitedBeforeStart(never) || !exitedBeforeStart(Result{Status: store.RunFailed, Failure: "exit failure"}) {
+		t.Fatal("an exit before the harness started is not a harness that does not start")
+	}
+	for name, res := range map[string]Result{
+		"started":  {Started: true, Status: store.RunFailed, Failure: "exit 9"},
+		"admitted": {Status: store.RunFailed, Failure: "exit 9", RelayAdmitted: 1},
+		"refused":  {Status: store.RunFailed, Failure: "exit 9", RelayRefused: 1},
+		"charged":  {Status: store.RunFailed, Failure: "exit 9", RelayCharged: 1},
+		"broker":   {Status: store.RunFailed, Failure: "broker"},
+		"timeout":  {Status: store.RunTimeout, Failure: "timeout"},
+		"stopped":  {Status: store.RunFailed, Failure: "stopped"},
+	} {
+		if exitedBeforeStart(res) {
+			t.Errorf("%s: read as a harness that does not start", name)
+		}
+	}
+}

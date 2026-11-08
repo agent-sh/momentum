@@ -682,6 +682,11 @@ func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Re
 	if err != nil {
 		return stageFailureIn(ctx, res, "build run", err)
 	}
+	if exitedBeforeStart(res) {
+		// a harness that does not start: the host's at build run, at no cost and with no start, which the stop rule
+		// counts on the stage
+		return stageFailureIn(ctx, res, "build run", neverStarted(res))
+	}
 	if res.Status != store.RunOK {
 		return res, nil
 	}

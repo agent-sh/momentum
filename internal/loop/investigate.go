@@ -139,6 +139,12 @@ func (r *Runner) investigate(ctx context.Context, c store.Case, run store.LoopRu
 		res.Status, res.Failure, res.Text = store.RunFailed, "broker", "broker: "+err.Error()
 		return res, nil
 	}
+	if err == nil && exitedBeforeStart(res) {
+		// a harness that does not start: kept as run, as the error that keeps a harness from starting is, which the
+		// stop rule counts
+		res.Status, res.Failure, res.Text = store.RunFailed, "run", neverStarted(res).Error()
+		return res, nil
+	}
 	return res, err
 }
 

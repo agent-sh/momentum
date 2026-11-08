@@ -1274,7 +1274,9 @@ func stopRuns(ctx context.Context, st *store.Store, c store.Case) (runs []store.
 // one still running, nor a build that answered its fix is out of reach, whose case waits for a person), or one that
 // failed at the host's hand before its agent started, which is kept at no cost and with no start, so nothing else
 // bounds it: a build at a host stage (its inputs, a toolchain that is gone, a harness that does not start), or an
-// investigation whose harness never started (run).
+// investigation whose harness never started (run). A sandbox that exits before its harness starts, with nothing at
+// the relay, is a harness that does not start (exitedBeforeStart): a build keeps it at build run, an investigation as
+// run, so it stops on the stage alone, whatever its exit.
 func stopCounts(run store.LoopRun) bool {
 	switch {
 	case run.Status == store.RunRefused || run.Status == store.RunRunning || run.Failure == "sandbox" || run.Status == store.RunOutOfReach:
