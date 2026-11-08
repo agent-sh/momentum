@@ -48,6 +48,10 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 		at            time.Time
 	}
 	var failed []seen
+	// the latest write of each path by each session that succeeded, from the results read so far: the pages run
+	// newest first, so every write after a result is in its page or in one before it
+	type wrote struct{ session, path string }
+	written := map[wrote]time.Time{}
 	// Successful results must not displace older unflagged failures at maxRows.
 	var before *store.Event
 	for {
@@ -56,7 +60,7 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 		if err != nil {
 			return gather("failures", occ, r), err
 		}
-		var candidates []store.Event
+		var candidates, writes []store.Event
 		for _, e := range results {
 			var m struct {
 				IsError bool `json:"is_error"`
@@ -64,17 +68,32 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 			json.Unmarshal([]byte(e.Meta), &m)
 			if toolresult.Failed(e.Harness, e.Tool, e.Summary, m.IsError) {
 				candidates = append(candidates, e)
+			} else if isShell(e.Tool) || writeTools[strings.ToLower(e.Tool)] && wroteFile(e.Summary) {
+				writes = append(writes, e)
 			}
 		}
-		calls, err := st.CallsOf(ctx, candidates, callReach)
+		calls, err := st.CallsOf(ctx, slices.Concat(candidates, writes), callReach)
 		if err != nil {
 			return gather("failures", occ, r), err
 		}
+		for _, e := range writes {
+			for _, p := range writtenPaths(e.Tool, calls[e.ID()]) {
+				if k := (wrote{e.Session, p}); e.TS.After(written[k]) {
+					written[k] = e.TS
+				}
+			}
+		}
 		for _, e := range candidates {
 			failed = append(failed, seen{e.Session, e.Tool, e.TS})
-			if k, ok := FailureOf(e.Harness, e.Tool, e.Summary, calls[e.ID()]); ok {
-				occ = append(occ, occurrence{sig: signature("failures", k.String()), title: k.Title(), ev: e})
+			k, ok := FailureOf(e.Harness, e.Tool, e.Summary, calls[e.ID()])
+			if !ok {
+				continue
 			}
+			// a read of a file the session goes on to write found it not there yet: no failure
+			if p, ok := notFoundRead(e.Tool, e.Summary, calls[e.ID()], k); ok && written[wrote{e.Session, p}].After(e.TS) {
+				continue
+			}
+			occ = append(occ, occurrence{sig: signature("failures", k.String()), title: k.Title(), ev: e})
 		}
 		if len(results) < resultPage {
 			break
@@ -110,6 +129,181 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 	out := gather("failures", occ, r)
 	inc, err := incidentSightings(ctx, st, w)
 	return append(out, gather("failures", inc, IncidentRecur)...), err
+}
+
+// readTools and writeTools are the harnesses' file tools, by their names in lower case: the ones that read a file
+// (Claude Code's, pi's, OpenCode's and Kimi's Read, Hermes's read_file), and the ones that write, create or edit
+// one (their Write and Edit, Claude Code's MultiEdit and NotebookEdit, Hermes's write_file and patch).
+var (
+	readTools  = map[string]bool{"read": true, "read_file": true}
+	writeTools = map[string]bool{"write": true, "edit": true, "multiedit": true, "notebookedit": true, "write_file": true, "patch": true}
+)
+
+// notFoundRe is a read tool's error that no file is at its path: Claude Code's "File does not exist", Kimi's "PATH
+// does not exist", a file not found (OpenCode's, Hermes's), the system's ENOENT. Access refused is none of them.
+var notFoundRe = regexp.MustCompile(`(?i)\bdoes not exist\b|\b(?:file|path) not found\b|no such file or directory|\benoent\b`)
+
+// pathKeys are the fields of a file tool's input that name its file.
+var pathKeys = map[string]bool{"file_path": true, "filePath": true, "notebook_path": true, "path": true, "filename": true}
+
+// notFoundRead is the path a read tool's own error says holds no file, as its call names it, and false for any
+// other failure: one of another tool, a guard's or the harness's refusal, access refused, a call whose path the
+// store's cut left out.
+func notFoundRead(tool, text, call string, k FailureKey) (string, bool) {
+	if !readTools[strings.ToLower(tool)] || k.Origin != toolOrigin(tool) || !notFoundRe.MatchString(text) {
+		return "", false
+	}
+	p := callPath(call)
+	return p, p != ""
+}
+
+// callPath is the path a file tool's call names, as the store keeps the call (its first bytes), or "" when the
+// call names none whole: its input's first field that names a file, read up to where the store cut it.
+func callPath(call string) string {
+	d := json.NewDecoder(strings.NewReader(call))
+	if t, err := d.Token(); err != nil || t != json.Delim('{') {
+		return ""
+	}
+	for d.More() {
+		t, err := d.Token()
+		if err != nil {
+			return ""
+		}
+		var v json.RawMessage
+		if err := d.Decode(&v); err != nil {
+			return ""
+		}
+		if key, _ := t.(string); pathKeys[key] {
+			var p string
+			if json.Unmarshal(v, &p) != nil {
+				return ""
+			}
+			return p
+		}
+	}
+	return ""
+}
+
+// wroteFile says a write tool's result that is no failure (toolresult.Failed) did write: a JSON result that
+// says it failed did not.
+func wroteFile(text string) bool { return !toolresult.EnvelopeFailed(strings.TrimSpace(text)) }
+
+// writtenPaths are the files a call that did not fail wrote, as it spells them: a file tool's path, or the files a
+// shell's command sends its output to.
+func writtenPaths(tool, call string) []string {
+	if isShell(tool) {
+		return redirectTargets(call)
+	}
+	if p := callPath(call); p != "" {
+		return []string{p}
+	}
+	return nil
+}
+
+// redirectTargets are the files a shell call's command line sends its output to (> or >>, outside a quoted value),
+// as the line spells them. The line is the command's first, since a here-document's text follows it. A target the
+// shell expands (a variable, a glob, ~) or the store's cut reached is not known, nor is another descriptor's
+// redirect (2>, &>) or a copy of one (>&N) the command's output.
+func redirectTargets(call string) []string {
+	m := callRe.FindStringSubmatch(call)
+	if m == nil {
+		return nil
+	}
+	line, _, whole := strings.Cut(unescapeCut(m[1]), "\n")
+	whole = whole || !strings.HasSuffix(call, "…") // the store marks a cut so
+	var out []string
+	var quote byte
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		switch {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			} else if c == '\\' && quote == '"' {
+				i++
+			}
+			continue
+		case c == '\\':
+			i++
+			continue
+		case c == '\'' || c == '"':
+			quote = c
+			continue
+		case c != '>':
+			continue
+		}
+		j := i + 1
+		if j < len(line) && line[j] == '>' {
+			j++
+		}
+		if i > 0 && (line[i-1] == '&' || line[i-1] == '<' || line[i-1] >= '0' && line[i-1] <= '9' && line[i-1] != '1') ||
+			j < len(line) && (line[j] == '&' || line[j] == '(') {
+			i = j - 1
+			continue
+		}
+		if j < len(line) && line[j] == '|' {
+			j++
+		}
+		for j < len(line) && line[j] == ' ' {
+			j++
+		}
+		target, end, ok := shellWord(line, j)
+		i = end - 1
+		if ok && target != "" && (end < len(line) || whole) {
+			out = append(out, target)
+		}
+	}
+	return out
+}
+
+// shellWord is the word of a command line at i, its quotes taken off, where it ends, and false for a word the shell
+// expands: a variable, a command's output, a glob, a leading ~.
+func shellWord(line string, i int) (string, int, bool) {
+	var b strings.Builder
+	ok := i < len(line) && line[i] != '~'
+	for ; i < len(line); i++ {
+		switch c := line[i]; {
+		case c == ' ' || strings.IndexByte(";&|<>()", c) >= 0:
+			return b.String(), i, ok
+		case c == '\'':
+			k := strings.IndexByte(line[i+1:], '\'')
+			if k < 0 {
+				return b.String(), len(line), false
+			}
+			b.WriteString(line[i+1 : i+1+k])
+			i += k + 1
+		case c == '"':
+			k := strings.IndexByte(line[i+1:], '"')
+			if k < 0 {
+				return b.String(), len(line), false
+			}
+			inner := line[i+1 : i+1+k]
+			ok = ok && !strings.ContainsAny(inner, "$`\\")
+			b.WriteString(inner)
+			i += k + 1
+		case c == '\\':
+			if i+1 < len(line) {
+				i++
+				b.WriteByte(line[i])
+			}
+		default:
+			ok = ok && !strings.ContainsRune("$`*?[{", rune(c))
+			b.WriteByte(c)
+		}
+	}
+	return b.String(), len(line), ok
+}
+
+// unescapeCut reads a JSON string's body the store may have cut short, up to where it reads whole: a cut can end it
+// inside an escape.
+func unescapeCut(s string) string {
+	for cut := 0; cut < 8 && cut <= len(s); cut++ {
+		var out string
+		if json.Unmarshal([]byte(`"`+s[:len(s)-cut]+`"`), &out) == nil {
+			return out
+		}
+	}
+	return ""
 }
 
 // callReach is how long before its result a call may have started: a command runs for minutes, a background one for

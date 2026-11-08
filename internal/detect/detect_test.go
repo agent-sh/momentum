@@ -456,6 +456,240 @@ func TestFailuresAreFoundWhenTheyRecur(t *testing.T) {
 	}
 }
 
+// fileTools makes a file tool's calls and their results as the transcripts keep them, each call with an id of its
+// own.
+type fileTools struct {
+	harness, read, write string
+	n                    int
+}
+
+func (f *fileTools) pair(session, tool, input, text string, failed bool, at time.Time) []store.Event {
+	f.n++
+	id := fmt.Sprintf("%s-%d", tool, f.n)
+	c, r := call(session, tool, id, input, at), result(session, tool, id, text, at.Add(time.Second))
+	if !failed {
+		r.Meta = fmt.Sprintf(`{"tool_id":%q}`, id)
+	}
+	c.Harness, r.Harness = f.harness, f.harness
+	return []store.Event{c, r}
+}
+
+// claudeFiles are Claude Code's Read and Write.
+var claudeFiles = fileTools{harness: "claude", read: "Read", write: "Write"}
+
+const claudeMissing = "<tool_use_error>File does not exist. Note: your current working directory is /w.</tool_use_error>"
+
+// readMissing is Claude Code's Read of a file that is not there; wrote, its Write of one.
+func (f *fileTools) readMissing(session, path string, at time.Time) []store.Event {
+	return f.pair(session, f.read, fmt.Sprintf(`{"file_path":%q}`, path), claudeMissing, true, at)
+}
+
+func (f *fileTools) wrote(session, path string, at time.Time) []store.Event {
+	return f.pair(session, f.write, fmt.Sprintf(`{"file_path":%q,"content":"x"}`, path), "File created successfully at: "+path, false, at)
+}
+
+// A batch's sessions each read the file they are about to create: a read that found no file, of a path its own
+// session then writes with success, is no failure. Each case holds such reads beside what must still count, so
+// without the rule it finds more.
+func TestAReadOfAFileItsSessionThenCreatesIsNoFailure(t *testing.T) {
+	missing := "failures/v2:tool:read:file does not exist. note: your current working directory is P"
+	for _, tc := range []struct {
+		name   string
+		events func(f *fileTools) []store.Event
+		want   []string
+	}{
+		{"its own session writes it", func(f *fileTools) []store.Event {
+			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.wrote("s1", "/w/out/a.md", t0.Add(5*time.Minute)),
+				f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)), f.readMissing("s2", "/w/out/c.md", t0.Add(2*time.Hour)))
+		}, nil},
+		{"two sessions each write their own", func(f *fileTools) []store.Event {
+			return slices.Concat(f.readMissing("s1", "/w/out/s1.md", t0), f.readMissing("s1", "/w/out/s1.md", t0.Add(time.Minute)),
+				f.wrote("s1", "/w/out/s1.md", t0.Add(5*time.Minute)),
+				f.readMissing("s2", "/w/out/s2.md", t0), f.wrote("s2", "/w/out/s2.md", t0.Add(4*time.Minute)))
+		}, nil},
+		{"the mistakes log keeps the reads too", func(f *fileTools) []store.Event {
+			logged := func(session string, at time.Time) store.Event {
+				return ev("mistakes", session, "tool-error", store.ActorHarness, "Read", "Read: "+claudeMissing, "", at.Add(3*time.Second))
+			}
+			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), []store.Event{logged("s1", t0)}, f.wrote("s1", "/w/out/a.md", t0.Add(time.Minute)),
+				f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)), []store.Event{logged("s1", t0.Add(time.Hour))},
+				f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
+				f.readMissing("s2", "/w/out/c.md", t0), []store.Event{logged("s2", t0)}, f.wrote("s2", "/w/out/c.md", t0.Add(time.Minute)))
+		}, nil},
+		{"another session writes it", func(f *fileTools) []store.Event {
+			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)),
+				f.readMissing("s2", "/w/out/c.md", t0.Add(2*time.Hour)),
+				f.wrote("s3", "/w/out/a.md", t0.Add(3*time.Hour)), f.wrote("s3", "/w/out/b.md", t0.Add(3*time.Hour)),
+				f.wrote("s3", "/w/out/c.md", t0.Add(3*time.Hour)),
+				f.readMissing("s3", "/w/out/d.md", t0.Add(4*time.Hour)), f.wrote("s3", "/w/out/d.md", t0.Add(5*time.Hour)))
+		}, []string{missing + " 3"}},
+		{"access refused", func(f *fileTools) []store.Event {
+			denied := func(session, path string, at time.Time) []store.Event {
+				return f.pair(session, "Read", fmt.Sprintf(`{"file_path":%q}`, path), "<tool_use_error>EACCES: permission denied, open '"+path+"'</tool_use_error>", true, at)
+			}
+			return slices.Concat(denied("s1", "/w/out/a.md", t0), f.wrote("s1", "/w/out/a.md", t0.Add(time.Minute)),
+				denied("s1", "/w/out/b.md", t0.Add(time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
+				denied("s2", "/w/out/c.md", t0), f.wrote("s2", "/w/out/c.md", t0.Add(time.Minute)),
+				f.readMissing("s3", "/w/out/d.md", t0), f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute)),
+				f.readMissing("s4", "/w/out/e.md", t0), f.wrote("s4", "/w/out/e.md", t0.Add(time.Minute)),
+				f.readMissing("s4", "/w/out/f.md", t0.Add(time.Hour)), f.wrote("s4", "/w/out/f.md", t0.Add(time.Hour+time.Minute)))
+		}, []string{"failures/v2:tool:read:eacces: permission denied, open Q 3"}},
+		{"the write fails", func(f *fileTools) []store.Event {
+			refused := func(session, path string, at time.Time) []store.Event {
+				return f.pair(session, "Write", fmt.Sprintf(`{"file_path":%q,"content":"x"}`, path), "<tool_use_error>EACCES: permission denied, open '"+path+"'</tool_use_error>", true, at)
+			}
+			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), refused("s1", "/w/out/a.md", t0.Add(time.Minute)),
+				f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)), refused("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
+				f.readMissing("s2", "/w/out/c.md", t0), refused("s2", "/w/out/c.md", t0.Add(time.Minute)),
+				f.readMissing("s3", "/w/out/d.md", t0), f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute)))
+		}, []string{missing + " 3", "failures/v2:tool:write:eacces: permission denied, open Q 3"}},
+		{"the write came first", func(f *fileTools) []store.Event {
+			return slices.Concat(f.wrote("s1", "/w/out/a.md", t0), f.readMissing("s1", "/w/out/a.md", t0.Add(time.Minute)),
+				f.wrote("s1", "/w/out/b.md", t0), f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)),
+				f.wrote("s2", "/w/out/c.md", t0), f.readMissing("s2", "/w/out/c.md", t0.Add(time.Minute)),
+				f.readMissing("s3", "/w/out/d.md", t0), f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute)))
+		}, []string{missing + " 3"}},
+		{"another path", func(f *fileTools) []store.Event {
+			return slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.wrote("s1", "/w/out/./a.md", t0.Add(time.Minute)),
+				f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)), f.wrote("s1", "/w/out/b.md.tmp", t0.Add(time.Hour+time.Minute)),
+				f.readMissing("s2", "/w/out/c.md", t0), f.wrote("s2", "/w/out", t0.Add(time.Minute)),
+				f.readMissing("s3", "/w/out/d.md", t0), f.wrote("s3", "/w/out/d.md", t0.Add(time.Minute)))
+		}, []string{missing + " 3"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testStore(t)
+			f := claudeFiles
+			put(t, st, tc.events(&f)...)
+			fs, err := Failures{}.Detect(context.Background(), st, week())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := signatures(fs); !slices.Equal(got, tc.want) {
+				t.Fatalf("found\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(tc.want, "\n"))
+			}
+		})
+	}
+}
+
+// Each harness's file tools: its read's own not-found error, of a path its session then writes, is no failure.
+func TestAReadBeforeACreateAcrossHarnesses(t *testing.T) {
+	for _, tc := range []struct {
+		harness, read, write, readIn, missing, writeIn, wrote string
+	}{
+		{"claude", "Read", "Edit", `{"file_path":"/w/@"}`, claudeMissing, `{"replace_all":false,"file_path":"/w/@","old_string":"","new_string":"x"}`, "The file /w/@ has been updated successfully."},
+		{"kimi", "Read", "Write", `{"path":"/w/@"}`, `"/w/@" does not exist.`, `{"content":"x","path":"/w/@"}`, "Wrote 1 bytes to /w/@"},
+		{"hermes", "read_file", "write_file", `{"limit":200,"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"path":"/w/@","content":"x"}`, `{"bytes_written": 1, "dirs_created": true}`},
+		{"hermes", "read_file", "patch", `{"path":"/w/@"}`, `{"error": "File not found: /w/@"}`, `{"mode":"replace","path":"/w/@"}`, `{"success": true, "diff": "x"}`},
+		{"opencode", "read", "write", `{"filePath":"/w/@"}`, "File not found: /w/@", `{"filePath":"/w/@","content":"x"}`, "Created file successfully: /w/@"},
+		{"pi", "read", "write", `{"path":"/w/@"}`, "ENOENT: no such file or directory, access '/w/@'", `{"path":"/w/@","content":"x"}`, "Successfully wrote 1 bytes to /w/@"},
+	} {
+		t.Run(tc.harness+"/"+tc.write, func(t *testing.T) {
+			st := testStore(t)
+			f := fileTools{harness: tc.harness}
+			var evs []store.Event
+			for i, session := range []string{"s1", "s1", "s2"} {
+				p := fmt.Sprintf("out/%d.md", i)
+				at := t0.Add(time.Duration(i) * time.Hour)
+				evs = append(evs, f.pair(session, tc.read, strings.ReplaceAll(tc.readIn, "@", p), strings.ReplaceAll(tc.missing, "@", p), true, at)...)
+				evs = append(evs, f.pair(session, tc.write, strings.ReplaceAll(tc.writeIn, "@", p), strings.ReplaceAll(tc.wrote, "@", p), false, at.Add(time.Minute))...)
+			}
+			put(t, st, evs...)
+			fs, err := Failures{}.Detect(context.Background(), st, week())
+			if err != nil || len(fs) != 0 {
+				t.Fatalf("found %v, %v", signatures(fs), err)
+			}
+			// the same reads, the write saying it failed or the store's cut leaving out its path: a failure each
+			st = testStore(t)
+			evs = evs[:0]
+			for i, session := range []string{"s1", "s1", "s2"} {
+				p := fmt.Sprintf("out/%d.md", i)
+				at := t0.Add(time.Duration(i) * time.Hour)
+				in, out := strings.ReplaceAll(tc.writeIn, "@", p), strings.ReplaceAll(tc.wrote, "@", p)
+				if i == 0 {
+					in = `{"content":"` + strings.Repeat("x", 240) + `…`
+				} else if strings.HasPrefix(out, "{") {
+					out = `{"success": false, "error": "Could not find a match"}`
+				} else {
+					in = `{"command":"x"}`
+				}
+				evs = append(evs, f.pair(session, tc.read, strings.ReplaceAll(tc.readIn, "@", p), strings.ReplaceAll(tc.missing, "@", p), true, at)...)
+				evs = append(evs, f.pair(session, tc.write, in, out, false, at.Add(time.Minute))...)
+			}
+			put(t, st, evs...)
+			if fs, err := (Failures{}).Detect(context.Background(), st, week()); err != nil || len(fs) != 1 || len(fs[0].Evidence) != 3 {
+				t.Fatalf("found %v, %v", signatures(fs), err)
+			}
+		})
+	}
+}
+
+// A session can create the file it looked for with its shell: a command whose first line sends its output to that
+// path, and did not fail, is its write. What only names the path, writes another descriptor there or does not say
+// which file it writes is none.
+func TestAReadBeforeAShellCreatesTheFile(t *testing.T) {
+	f := fileTools{harness: "kimi"}
+	read := func(session, path string, at time.Time) []store.Event {
+		return f.pair(session, "Read", fmt.Sprintf(`{"path":%q}`, path), fmt.Sprintf("%q does not exist.", path), true, at)
+	}
+	// shell is a Bash call as the store keeps it: JSON with > escaped, cut to 240 bytes and marked so
+	shell := func(session, command string, failed bool, at time.Time) []store.Event {
+		in, _ := json.Marshal(map[string]string{"command": command})
+		if len(in) > 240 {
+			in = append(in[:240], "…"...)
+		}
+		return f.pair(session, "Bash", string(in), "", failed, at)
+	}
+	body := "\n" + strings.Repeat(`{"id":1,"verdict":"keep"}`+"\n", 20) + "EOF"
+	missing := "failures/v2:tool:read:Q does not exist"
+
+	st := testStore(t)
+	put(t, st, slices.Concat(
+		read("s1", "/w/out/a.jsonl", t0), shell("s1", "cat > /w/out/a.jsonl <<'EOF'"+body, false, t0.Add(time.Minute)),
+		read("s1", "/w/out/b.jsonl", t0.Add(time.Hour)), shell("s1", "cat >> /w/out/b.jsonl <<'EOF'"+body, false, t0.Add(time.Hour+time.Minute)),
+		read("s2", "/w/out/c.jsonl", t0), shell("s2", `cat <<'EOF' > "/w/out/c.jsonl"`+body, false, t0.Add(time.Minute)))...)
+	if fs, err := (Failures{}).Detect(context.Background(), st, week()); err != nil || len(fs) != 0 {
+		t.Fatalf("created by the shell: %v, %v", signatures(fs), err)
+	}
+
+	st = testStore(t)
+	put(t, st, slices.Concat(
+		read("s1", "/w/out/d.jsonl", t0), shell("s1", "cat > /w/out/d.jsonl <<'EOF'"+body, true, t0.Add(time.Minute)),
+		read("s1", "/w/out/e.jsonl", t0.Add(time.Hour)), shell("s1", "python3 gen.py 2> /w/out/e.jsonl", false, t0.Add(time.Hour+time.Minute)),
+		read("s2", "/w/out/f.jsonl", t0), shell("s2", `echo "> /w/out/f.jsonl"`, false, t0.Add(time.Minute)),
+		read("s2", "/w/out/h.jsonl", t0.Add(time.Hour)), shell("s2", "cat <<'EOF'\n> /w/out/h.jsonl\nEOF", false, t0.Add(time.Hour+time.Minute)),
+		read("s2", "/w/out/i.jsonl", t0.Add(2*time.Hour)), shell("s2", "cat > $OUT/i.jsonl", false, t0.Add(2*time.Hour+time.Minute)),
+		read("s2", "/w/out/j.jsonl", t0.Add(3*time.Hour)), shell("s2", "cd /w/out && cat > j.jsonl", false, t0.Add(3*time.Hour+time.Minute)),
+		// the store cut the call inside an escape: what reads whole of it ends before the path does
+		read("s2", "/w/out/k", t0.Add(4*time.Hour)),
+		f.pair("s2", "Bash", `{"command":"cat > /w/out/k\u…`, "", false, t0.Add(4*time.Hour+time.Minute)),
+		read("s3", "/w/out/g.jsonl", t0), shell("s3", "cat > /w/out/g.jsonl <<'EOF'"+body, false, t0.Add(time.Minute)))...)
+	fs, err := Failures{}.Detect(context.Background(), st, week())
+	if got, want := signatures(fs), []string{missing + " 7"}; err != nil || !slices.Equal(got, want) {
+		t.Fatalf("found %v, %v, want %v", got, err, want)
+	}
+}
+
+// Later is up to the window's end: a write the store does not hold yet, or one past the window, leaves the read a
+// failure, and the first run whose window holds the write no longer counts it.
+func TestAReadCountsUntilTheWindowHoldsItsWrite(t *testing.T) {
+	st := testStore(t)
+	f := claudeFiles
+	put(t, st, slices.Concat(f.readMissing("s1", "/w/out/a.md", t0), f.readMissing("s1", "/w/out/b.md", t0.Add(time.Hour)),
+		f.readMissing("s2", "/w/out/c.md", t0.Add(2*time.Hour)))...)
+	early := Window{Since: t0.Add(-time.Hour), Until: t0.Add(3 * time.Hour)}
+	if fs, err := (Failures{}).Detect(context.Background(), st, early); err != nil || len(fs) != 1 || len(fs[0].Evidence) != 3 {
+		t.Fatalf("before the writes: %v, %v", signatures(fs), err)
+	}
+	put(t, st, slices.Concat(f.wrote("s1", "/w/out/a.md", t0.Add(4*time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(4*time.Hour)),
+		f.wrote("s2", "/w/out/c.md", t0.Add(4*time.Hour)))...)
+	if fs, err := (Failures{}).Detect(context.Background(), st, early); err != nil || len(fs) != 1 || len(fs[0].Evidence) != 3 {
+		t.Fatalf("the writes past the window: %v, %v", signatures(fs), err)
+	}
+	if fs, err := (Failures{}).Detect(context.Background(), st, week()); err != nil || len(fs) != 0 {
+		t.Fatalf("a window that holds the writes: %v, %v", signatures(fs), err)
+	}
+}
+
 // sighting is an incident-seen event as the incidents source writes it.
 func sighting(incident, text string, fresh int, first bool, firstSeen time.Time, at time.Time) store.Event {
 	seq++
