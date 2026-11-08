@@ -2,7 +2,7 @@
 
 ## Overview
 
-Design stage. SPEC.md is the contract: a change in behavior changes SPEC.md in the same change.
+SPEC.md describes the design. Keep it roughly in step with the code when a change alters behavior, but it is not a contract: a gap between its wording and the code is a follow-up, never a reason to hold a change. README.md is the user-facing doc.
 
 ## Conventions
 
