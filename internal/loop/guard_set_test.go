@@ -496,7 +496,7 @@ func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
 		c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" }, edits...)
 		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 7*aDay, "", now)
 		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), alone) ||
-			!strings.Contains(err.Error(), "the signal's own too unless every event of the case's evidence is of it;") {
+			!strings.Contains(err.Error(), "the signal's own too unless every event of the case's evidence dated before the count is still in the store and of it;") {
 			t.Fatalf("a named tool over evidence of two tools: %+v %v", g, err)
 		}
 	})
