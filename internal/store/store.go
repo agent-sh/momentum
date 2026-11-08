@@ -106,7 +106,8 @@ type querier interface {
 // Kept tables hold what cannot be read again: every event, when each live session entered its phase, the notes
 // (notes.go), what the capacity runs observed (capacity.go), the cases (cases.go), and the loop's runs and its turns (loop.go). A schema change migrates them and never drops
 // them. A kept table that is missing is made with the columns it was first made with (keptTables), it gains each
-// later column it lacks (keptColumns), and its rows change only in a step or by its triggers (keptTriggers).
+// later column it lacks (keptColumns), and its rows change only in a step, by a column's fill where the column is
+// added (columnFills), or by its triggers (keptTriggers).
 //
 // Derived tables hold what the sources and the session trackers derived from what they read: where each source
 // stopped (with tacit's saved reader state), the files it parsed, what it could not parse, and the trackers'
@@ -184,6 +185,11 @@ var keptIndexNames = slices.Concat([]string{"events_seq", "events_ts", "events_k
 //
 // The seq triggers stamp a write sequence (Seq) on a row a write stored or rewrote without one: a build from before the
 // sequence writes none, and its rewrite of a row keeps the row's old one.
+//
+// case_evidence_recorded gives event evidence stored with no tool and no directory (a build from before them writes
+// neither) its event's, where the store holds the event; else another case's evidence of the same event, since such a
+// build's merge stores the duplicate's evidence in its target before it deletes the duplicate's: without it the merge
+// would drop what the duplicate recorded, for good once the event is gone. Both values come from one source.
 const keptTriggers = `
 CREATE TRIGGER IF NOT EXISTS events_harness_insert AFTER INSERT ON events WHEN NEW.harness = 'claude-code'
 BEGIN UPDATE events SET harness = 'claude' WHERE rowid = NEW.rowid; END;
@@ -194,6 +200,14 @@ CREATE TRIGGER IF NOT EXISTS events_seq_insert AFTER INSERT ON events WHEN NEW.s
 BEGIN ` + bumpSeq + ` UPDATE events SET seq = (SELECT n FROM event_seq WHERE id = 1) WHERE rowid = NEW.rowid; END;
 CREATE TRIGGER IF NOT EXISTS events_seq_update AFTER UPDATE ON events WHEN NEW.seq = OLD.seq
 BEGIN ` + bumpSeq + ` UPDATE events SET seq = (SELECT n FROM event_seq WHERE id = 1) WHERE rowid = NEW.rowid; END;
+CREATE TRIGGER IF NOT EXISTS case_evidence_recorded AFTER INSERT ON case_evidence
+WHEN NEW.tool = '' AND NEW.cwd = '' AND substr(NEW.ref, 1, 3) = 'ev:'
+BEGIN UPDATE case_evidence SET
+  tool = COALESCE((SELECT COALESCE(tool, '') FROM events WHERE id = substr(NEW.ref, 4)),
+    (SELECT tool FROM case_evidence WHERE ref = NEW.ref AND case_id != NEW.case_id AND (tool != '' OR cwd != '') ORDER BY added, case_id LIMIT 1), ''),
+  cwd = COALESCE((SELECT COALESCE(cwd, '') FROM events WHERE id = substr(NEW.ref, 4)),
+    (SELECT cwd FROM case_evidence WHERE ref = NEW.ref AND case_id != NEW.case_id AND (tool != '' OR cwd != '') ORDER BY added, case_id LIMIT 1), '')
+  WHERE case_id = NEW.case_id AND ref = NEW.ref; END;
 `
 
 // bumpSeq moves the write sequence one past the higher of its counter and the events' highest: it never goes down, a
@@ -202,7 +216,8 @@ BEGIN ` + bumpSeq + ` UPDATE events SET seq = (SELECT n FROM event_seq WHERE id 
 const bumpSeq = `INSERT INTO event_seq (id, n) VALUES (1, COALESCE((SELECT MAX(seq) FROM events), 0) + 1)
   ON CONFLICT(id) DO UPDATE SET n = MAX(n, COALESCE((SELECT MAX(seq) FROM events), 0)) + 1;`
 
-var keptTriggerNames = []string{"events_harness_insert", "events_harness_update", "events_seq_insert", "events_seq_update"}
+var keptTriggerNames = []string{"events_harness_insert", "events_harness_update", "events_seq_insert", "events_seq_update",
+	"case_evidence_recorded"}
 
 // derivedSchema makes the derived tables that are missing.
 const derivedSchema = `

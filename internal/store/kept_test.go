@@ -330,13 +330,14 @@ func TestAMigratedStoreRecordsTheToolOfTheEvidenceWhoseEventItHolds(t *testing.T
 	st.Close()
 	var stepsBefore int
 	rawQuery(t, path, `SELECT MAX(version) FROM schema_steps`, &stepsBefore)
-	// The store as a build from before the columns left it: its evidence has neither. One event is gone since.
+	// The store as a build from before the columns left it: its evidence has neither, nor the trigger that reads them.
+	// One event is gone since.
 	db, err := sql.Open("sqlite", "file:"+path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`ALTER TABLE case_evidence DROP COLUMN tool; ALTER TABLE case_evidence DROP COLUMN cwd;
-	  DELETE FROM events WHERE id = ?`, gone.ID()); err != nil {
+	if _, err := db.Exec(`DROP TRIGGER case_evidence_recorded; ALTER TABLE case_evidence DROP COLUMN tool;
+	  ALTER TABLE case_evidence DROP COLUMN cwd; DELETE FROM events WHERE id = ?`, gone.ID()); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()
@@ -363,22 +364,28 @@ func TestAMigratedStoreRecordsTheToolOfTheEvidenceWhoseEventItHolds(t *testing.T
 }
 
 // The fill runs where its column is added, and never again: a store a build from before version 3 visited runs every
-// step again, after that build dropped every event but the sessions', and the evidence keeps what it recorded.
+// step again, after that build dropped every event but the sessions', and the evidence keeps what it recorded, of an
+// event that build dropped and of one it kept whose record was read again with another tool and directory.
 func TestTheEvidencesToolIsNotFilledAgain(t *testing.T) {
 	ctx := context.Background()
 	st, path := open(t)
 	at := time.UnixMilli(1_700_000_000_000)
 	bash := Event{Source: "mistakes", SourceKey: "k1", TS: at, Actor: ActorTool, Kind: "tool-error", Tool: "Bash", Cwd: "/w/a", Summary: "exit 2"}
-	if _, err := st.Put(ctx, []Event{bash}); err != nil {
+	kept := Event{Source: Sessions, SourceKey: "s@1", TS: at, Actor: ActorHarness, Kind: "phase", Tool: "Bash", Cwd: "/w/s"}
+	if _, err := st.Put(ctx, []Event{bash, kept}); err != nil {
 		t.Fatal(err)
 	}
-	c, _, err := st.ObserveCase(ctx, Finding{Family: "failures", Signature: "s", Title: "t", Evidence: []Evidence{{Ref: "ev:" + bash.ID()}}}, "test")
+	c, _, err := st.ObserveCase(ctx, Finding{Family: "failures", Signature: "s", Title: "t", Evidence: []Evidence{{Ref: "ev:" + bash.ID()},
+		{Ref: "ev:" + kept.ID()}}}, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	st.Close()
 	db, err := sql.Open("sqlite", "file:"+path)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE events SET tool = 'Edit', cwd = '/w/z' WHERE id = ?`, kept.ID()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`DELETE FROM events WHERE source != 'sessions'; PRAGMA user_version = 2`); err != nil { // its visit
@@ -390,7 +397,7 @@ func TestTheEvidencesToolIsNotFilledAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	want := map[string][2]string{"ev:" + bash.ID(): {"Bash", "/w/a"}}
+	want := map[string][2]string{"ev:" + bash.ID(): {"Bash", "/w/a"}, "ev:" + kept.ID(): {"Bash", "/w/s"}}
 	if got := evidenceTools(t, st, c.ID); !maps.Equal(got, want) {
 		t.Fatalf("after a visit of a build from before version 3 and the steps run again: %v, want %v", got, want)
 	}

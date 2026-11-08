@@ -395,8 +395,8 @@ func resolveEvidence(ctx context.Context, q querier, e Evidence, now time.Time) 
 const clockSkew = time.Minute
 
 // addEvidence stores the evidence a case does not hold yet, and returns how many were new and the newest time
-// among them. Evidence it holds already gains the tool and directory it lacks (filed by an older build, or before its
-// column was added while its event was gone), which makes it no new evidence.
+// among them. An event's evidence it holds already takes the event's tool and directory as the store holds them now,
+// which makes it no new evidence; a row they would not change is not written.
 func addEvidence(ctx context.Context, q querier, id string, evs []Evidence, now time.Time) (int, time.Time, error) {
 	added, newest := 0, time.Time{}
 	for _, e := range evs {
@@ -411,10 +411,9 @@ func addEvidence(ctx context.Context, q querier, id string, evs []Evidence, now 
 		}
 		if n, err := res.RowsAffected(); err != nil {
 			return 0, time.Time{}, err
-		} else if n == 0 && (e.Tool != "" || e.Cwd != "") {
-			if _, err := q.ExecContext(ctx, `UPDATE case_evidence SET tool = CASE WHEN tool = '' THEN ? ELSE tool END,
-			  cwd = CASE WHEN cwd = '' THEN ? ELSE cwd END WHERE case_id = ? AND ref = ? AND (tool = '' OR cwd = '')`,
-				e.Tool, e.Cwd, id, e.Ref); err != nil {
+		} else if n == 0 && strings.HasPrefix(e.Ref, "ev:") {
+			if _, err := q.ExecContext(ctx, `UPDATE case_evidence SET tool = ?1, cwd = ?2 WHERE case_id = ?3 AND ref = ?4
+			  AND (tool != ?1 OR cwd != ?2)`, e.Tool, e.Cwd, id, e.Ref); err != nil {
 				return 0, time.Time{}, err
 			}
 		} else if n > 0 {

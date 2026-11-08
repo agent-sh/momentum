@@ -601,9 +601,9 @@ func TestAnEventsEvidenceKeepsItsToolPastTheEvent(t *testing.T) {
 	}
 }
 
-// Evidence a case holds with no tool or directory (an older build filed it, or its event was gone when the columns were
-// added) gains them when it is filed again, as no new evidence, and when a merge brings the same evidence with them.
-// What it recorded stays: filing again fills only what it lacks.
+// An event's evidence filed again takes the event's tool and directory as the store holds them now, as no new evidence,
+// and a refile that would change nothing writes nothing. A merge gives evidence the target holds the tool and directory
+// it lacks from the duplicate's.
 func TestEvidenceThatLacksItsToolGainsItWhenFiledAgain(t *testing.T) {
 	st := caseStore(t)
 	ctx := context.Background()
@@ -615,32 +615,86 @@ func TestEvidenceThatLacksItsToolGainsItWhenFiledAgain(t *testing.T) {
 	}
 	f := Finding{Family: "failures", Signature: "s", Title: "t", Evidence: []Evidence{{Ref: "ev:" + bash.ID()}, {Ref: "ev:" + edit.ID()}}}
 	c, _ := observeOK(t, st, f)
-	if _, err := st.db.ExecContext(ctx, `UPDATE case_evidence SET tool = '', cwd = '' WHERE ref = ?`, "ev:"+bash.ID()); err != nil {
-		t.Fatal(err)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := st.db.ExecContext(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if _, err := st.db.ExecContext(ctx, `UPDATE case_evidence SET tool = 'Read', cwd = '' WHERE ref = ?`, "ev:"+edit.ID()); err != nil {
-		t.Fatal(err)
+	// bash's evidence recorded nothing (an older build filed it); edit's recorded a tool its event no longer has
+	exec(`UPDATE case_evidence SET tool = '', cwd = '' WHERE ref = ?`, "ev:"+bash.ID())
+	exec(`UPDATE case_evidence SET tool = 'Read', cwd = '' WHERE ref = ?`, "ev:"+edit.ID())
+	refile := func(want map[string][2]string) {
+		t.Helper()
+		got, obs, err := st.ObserveCase(ctx, f, "test")
+		if err != nil || obs != Unchanged || got.Evidence != 2 {
+			t.Fatalf("the same evidence again: %s, %d pieces, %v", obs, got.Evidence, err)
+		}
+		if got := evidenceTools(t, st, c.ID); !maps.Equal(got, want) {
+			t.Fatalf("the evidence filed again: %v, want %v", got, want)
+		}
 	}
-	got, obs, err := st.ObserveCase(ctx, f, "test")
-	if err != nil || obs != Unchanged || got.Evidence != 2 {
-		t.Fatalf("the same evidence again: %s, %d pieces, %v", obs, got.Evidence, err)
+	refile(map[string][2]string{"ev:" + bash.ID(): {"Bash", "/w/a"}, "ev:" + edit.ID(): {"Edit", "/w/b"}})
+	// a record read again gives edit's event another tool
+	exec(`UPDATE events SET tool = 'Write' WHERE id = ?`, edit.ID())
+	refile(map[string][2]string{"ev:" + bash.ID(): {"Bash", "/w/a"}, "ev:" + edit.ID(): {"Write", "/w/b"}})
+	// filed again with nothing to change, no row is written
+	exec(`CREATE TABLE zz_written (ref TEXT NOT NULL)`)
+	exec(`CREATE TRIGGER zz_written_update AFTER UPDATE ON case_evidence BEGIN INSERT INTO zz_written VALUES (NEW.ref); END`)
+	refile(map[string][2]string{"ev:" + bash.ID(): {"Bash", "/w/a"}, "ev:" + edit.ID(): {"Write", "/w/b"}})
+	var written int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM zz_written`).Scan(&written); err != nil || written != 0 {
+		t.Fatalf("a refile that changed nothing wrote %d rows: %v", written, err)
 	}
-	want := map[string][2]string{"ev:" + bash.ID(): {"Bash", "/w/a"}, "ev:" + edit.ID(): {"Read", "/w/b"}}
-	if got := evidenceTools(t, st, c.ID); !maps.Equal(got, want) {
-		t.Fatalf("the evidence filed again: %v, want %v", got, want)
-	}
+	exec(`DROP TRIGGER zz_written_update`)
 	// a merge into a case that holds the same event with no tool
 	a, _ := observeOK(t, st, Finding{Family: "failures", Signature: "a", Title: "a", Evidence: []Evidence{{Ref: "ev:" + bash.ID()}}})
 	b, _ := observeOK(t, st, Finding{Family: "failures", Signature: "b", Title: "b", Evidence: []Evidence{{Ref: "ev:" + bash.ID()}}})
-	if _, err := st.db.ExecContext(ctx, `UPDATE case_evidence SET tool = '', cwd = '' WHERE case_id = ?`, b.ID); err != nil {
-		t.Fatal(err)
-	}
+	exec(`UPDATE case_evidence SET tool = '', cwd = '' WHERE case_id = ?`, b.ID)
 	if _, err := st.CloseCase(ctx, a.ID, Duplicate, b.ID, "same", "agent"); err != nil {
 		t.Fatal(err)
 	}
-	want = map[string][2]string{"ev:" + bash.ID(): {"Bash", "/w/a"}}
+	want := map[string][2]string{"ev:" + bash.ID(): {"Bash", "/w/a"}}
 	if got := evidenceTools(t, st, b.ID); !maps.Equal(got, want) {
 		t.Fatalf("the target's evidence after the merge: %v, want %v", got, want)
+	}
+}
+
+// A build from before the tool and directory, run on a store this build opened, stores a case's evidence without them,
+// and its merge stores the duplicate's evidence in the target before it deletes the duplicate's. The store's trigger
+// gives such evidence of an event its event's tool and directory where the store holds the event, else what another
+// case's evidence of it recorded, so that merge keeps what the duplicate recorded once its event is gone. Evidence that
+// is no event keeps none.
+func TestAnOlderBuildsMergeKeepsWhatTheDuplicateRecorded(t *testing.T) {
+	st := caseStore(t)
+	ctx := context.Background()
+	at := time.Now().Add(-time.Hour)
+	gone := Event{Source: "mistakes", SourceKey: "k1", TS: at, Actor: ActorTool, Kind: "tool-error", Tool: "Bash", Cwd: "/w/a", Summary: "exit 2"}
+	held := Event{Source: "mistakes", SourceKey: "k2", TS: at, Actor: ActorTool, Kind: "tool-error", Tool: "Edit", Cwd: "/w/b", Summary: "no match"}
+	if _, err := st.Put(ctx, []Event{gone, held}); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := observeOK(t, st, Finding{Family: "failures", Signature: "a", Title: "a", Evidence: []Evidence{{Ref: "ev:" + gone.ID()}}})
+	b, _ := observeOK(t, st, Finding{Family: "failures", Signature: "b", Title: "b", Evidence: refsAt("b", 1, at)})
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := st.db.ExecContext(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`DELETE FROM events WHERE id = ?`, gone.ID())
+	// the older build files held's event into b, and a file into a, as it stores evidence: without the columns
+	exec(`INSERT INTO case_evidence (case_id, ref, at, kind, summary, added) VALUES (?, ?, ?, 'tool-error', 'no match', ?)`,
+		b.ID, "ev:"+held.ID(), at.UnixMilli(), at.UnixMilli())
+	exec(`INSERT INTO case_evidence (case_id, ref, at, kind, summary, added) VALUES (?, 'file:/t/old', ?, 'k', 's', ?)`,
+		a.ID, at.UnixMilli(), at.UnixMilli())
+	// then merges a into b as it does: the duplicate's evidence into the target, then the duplicate's deleted
+	exec(`INSERT OR IGNORE INTO case_evidence (case_id, ref, at, kind, summary, added)
+	  SELECT ?, ref, at, kind, summary, added FROM case_evidence WHERE case_id = ?`, b.ID, a.ID)
+	exec(`DELETE FROM case_evidence WHERE case_id = ?`, a.ID)
+	want := map[string][2]string{"ev:" + gone.ID(): {"Bash", "/w/a"}, "ev:" + held.ID(): {"Edit", "/w/b"}, "file:/t/b-0": {}, "file:/t/old": {}}
+	if got := evidenceTools(t, st, b.ID); !maps.Equal(got, want) {
+		t.Fatalf("the target's evidence after an older build's merge: %v, want %v", got, want)
 	}
 }
 
