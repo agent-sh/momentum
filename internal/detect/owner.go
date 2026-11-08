@@ -167,7 +167,10 @@ func (o OwnerBurden) Detect(ctx context.Context, st *store.Store, w Window) ([]s
 	earlier := map[string][]store.Event{}
 	var occ []occurrence
 	for i, t := range turns {
-		if program[i] {
+		// A turn that holds none of his words (an inline skill sent alone) is still his answer to what the agent
+		// said before it: it bounds the next turn's look back, and it is never classed.
+		empty := strings.TrimSpace(t.Summary) == ""
+		if program[i] && !empty {
 			continue
 		}
 		var before []string
@@ -179,8 +182,8 @@ func (o OwnerBurden) Detect(ctx context.Context, st *store.Store, w Window) ([]s
 			prevAt = e.TS
 		}
 		earlier[t.Session] = append(earlier[t.Session], t)
-		if t.TS.Before(w.Since) {
-			continue // read only for what he repeats
+		if t.TS.Before(w.Since) || empty {
+			continue // read only for what he repeats, or for where his next turn's look back starts
 		}
 		after := t.TS.Add(-lookBack)
 		if prevAt.After(after) {

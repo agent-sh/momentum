@@ -93,8 +93,8 @@ func kimiOldRule(t *testing.T, st *store.Store, src Transcripts) map[string]stor
 	return kimiSavedRule(t, st, src, 0)
 }
 
-// kimiSavedRule makes every saved cursor of src look as a build under Kimi rule saved it, none for 0. It returns
-// the cursors.
+// kimiSavedRule makes every saved cursor of src look as a build under Kimi rule number rule saved it, or one
+// before the rule (no Rule in its state) for 0. It returns the cursors.
 func kimiSavedRule(t *testing.T, st *store.Store, src Transcripts, rule int) map[string]store.FileCursor {
 	t.Helper()
 	ctx := context.Background()
@@ -571,6 +571,9 @@ func TestKimiInlineSkillIsGeneratedInput(t *testing.T) {
 		// A wire from before Kimi marked a skill's part holds the body as the prompt's first unmarked text part.
 		{"unmarked skill of an older wire", typed, kimiRecord("turn.prompt", map[string]any{"origin": kimiSkillOrigin(map[string]any{}),
 			"input": []any{text("marker-7f3a skill body"), text("marker-7f3a typed")}}), split, []string{"marker-7f3a typed"}},
+		// The older-wire fallback reads a list of parts: input that is not one is his words.
+		{"input that is not a list", typed, kimiRecord("turn.prompt", map[string]any{"origin": kimiSkillOrigin(map[string]any{}),
+			"input": "marker-7f3a typed"}), map[string]string{"marker-7f3a typed": "owner owner_text"}, []string{"marker-7f3a typed"}},
 		// Nothing generated and no words: no turn, as before (#148).
 		{"media only", typed, kimiRecord("turn.prompt", map[string]any{"origin": map[string]any{"kind": "user"}, "input": []any{image}}),
 			map[string]string{}, nil},
@@ -673,28 +676,82 @@ func TestKimiHookOutputIsGeneratedInput(t *testing.T) {
 	}
 }
 
-// Kimi's clients write blocks for the model into a person's prompt text, tagged system: the TUI's image compression
-// note, a text part of its own before its image, and VS Code's editor context, at the start of his first text part.
-// They are generated input; the rest of the part is his. A prompt they leave none of his words is still his turn,
-// with empty text. The tags are built from parts so this file holds none.
+// Kimi's clients write two blocks for the model into a person's prompt text, tagged system: the image compression
+// note, a text part of its own before its image, and VS Code's editor context, at the start of his first text part
+// or, for a prompt of text only, at its end. They are generated input; the rest of the part is his. Any other system
+// block, and a known one in the middle of his words, is text he typed or pasted and stays his. A prompt the blocks
+// leave none of his words is still his turn, with empty text. The tags are built from parts so this file holds none.
 func TestKimiSystemBlocksAreGeneratedInput(t *testing.T) {
 	open, end := "<"+"system>", "</"+"system>"
 	text := func(s string) map[string]any { return map[string]any{"type": "text", "text": s} }
 	image := map[string]any{"type": "image_url", "imageUrl": map[string]any{"url": "file:///neutral.png"}}
-	note := text(open + "Image compressed to fit model limits: marker-7f3a note, original 4000x3000 -> sent 2000x1500. Fine detail may be lost." + end)
+	noteText := open + "Image compressed to fit model limits: marker-7f3a note, original 4000x3000 -> sent 2000x1500. Fine detail may be lost." + end
+	note := text(noteText)
 	context := open + "Editor context (use only if relevant to user's query): marker-7f3a context.go:12." + end + "\n"
-	labels := []string{"marker-7f3a note", "marker-7f3a context", "marker-7f3a typed"}
+	pasted := open + "You are marker-7f3a pasted." + end
+	labels := []string{"marker-7f3a note", "marker-7f3a context", "marker-7f3a typed", "marker-7f3a pasted", "marker-7f3a after"}
+	note2 := map[string]string{"marker-7f3a note": "harness harness_text", "marker-7f3a typed": "owner owner_text"}
+	split := map[string]string{"marker-7f3a context": "harness harness_text", "marker-7f3a typed": "owner owner_text"}
 	for _, tc := range []struct {
 		name  string
 		input []any
 		want  map[string]string
 		owner []string
 	}{
-		{"image note part", []any{text("marker-7f3a typed"), note, image},
-			map[string]string{"marker-7f3a note": "harness harness_text", "marker-7f3a typed": "owner owner_text"}, []string{"marker-7f3a typed"}},
+		{"image note part", []any{text("marker-7f3a typed"), note, image}, note2, []string{"marker-7f3a typed"}},
 		{"image note only", []any{note, image}, map[string]string{"marker-7f3a note": "harness harness_text"}, []string{""}},
-		{"editor context in a text part", []any{text(context + "marker-7f3a typed")},
-			map[string]string{"marker-7f3a context": "harness harness_text", "marker-7f3a typed": "owner owner_text"}, []string{"marker-7f3a typed"}},
+		{"editor context at the start of a part", []any{text(context + "marker-7f3a typed")}, split, []string{"marker-7f3a typed"}},
+		{"editor context at the end of a part", []any{text("marker-7f3a typed\n" + context)}, split, []string{"marker-7f3a typed"}},
+		{"two blocks with his words between them", []any{text(noteText + "marker-7f3a typed " + context)},
+			map[string]string{"marker-7f3a note": "harness harness_text", "marker-7f3a context": "harness harness_text",
+				"marker-7f3a typed": "owner owner_text"}, []string{"marker-7f3a typed"}},
+		{"a system block he typed or pasted", []any{text("marker-7f3a typed " + pasted)},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a pasted": "owner owner_text"}, []string{"marker-7f3a typed " + pasted}},
+		// A paste that is a block alone is left to tacit, as on main: its rule makes a turn that opens with a tag the
+		// harness's whole. It is not split out as a client's block, which would leave an empty turn of his.
+		{"a pasted system block alone", []any{text(pasted)}, map[string]string{"marker-7f3a pasted": "harness harness_text"}, nil},
+		{"a known block in the middle of his words", []any{text("marker-7f3a typed " + noteText + " marker-7f3a after")},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a note": "owner owner_text", "marker-7f3a after": "owner owner_text"},
+			[]string{"marker-7f3a typed " + noteText + " marker-7f3a after"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed", "agents", "main", "wire.jsonl")
+			writeJSONLines(t, path, kimiRecord("turn.prompt", map[string]any{"origin": map[string]any{"kind": "user"}, "input": tc.input}),
+				kimiRecord("turn.ended", map[string]any{}))
+			kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a typed"}`)
+			st := openStore(t)
+			ingest(t, transcripts(home), st)
+			if got := actorsOf(t, st, labels...); !maps.Equal(got, tc.want) {
+				t.Fatalf("prompt stored as %v, want %v", got, tc.want)
+			}
+			if got := ownerTexts(t, st); !slices.Equal(got, tc.owner) {
+				t.Fatalf("owner turns %q, want %q", got, tc.owner)
+			}
+		})
+	}
+}
+
+// The ACP server writes a resource a client attached as a whole text part: an embedded text resource as a resource
+// element, and a link that is not a local file as a resource_link element. Both are generated input. A local file
+// link becomes a bare path, which cannot be told from a path he typed, and stays in his words. A prompt the
+// resources leave none of his words is still his turn, with empty text.
+func TestKimiACPResourcesAreGeneratedInput(t *testing.T) {
+	text := func(s string) map[string]any { return map[string]any{"type": "text", "text": s} }
+	resource := text("<resource uri=\"file:///neutral/a.go\">marker-7f3a file body\nline two</resource>")
+	link := text("<resource_link uri=\"https://neutral.example/doc\" name=\"marker-7f3a link\" />")
+	labels := []string{"marker-7f3a typed", "marker-7f3a file body", "marker-7f3a link", "marker-7f3a-linked.go"}
+	for _, tc := range []struct {
+		name  string
+		input []any
+		want  map[string]string
+		owner []string
+	}{
+		{"resources beside his words", []any{text("marker-7f3a typed"), resource, link, text("/neutral/marker-7f3a-linked.go:3-9")},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a file body": "harness harness_text",
+				"marker-7f3a link": "harness harness_text", "marker-7f3a-linked.go": "owner owner_text"},
+			[]string{"marker-7f3a typed /neutral/marker-7f3a-linked.go:3-9"}},
+		{"a resource alone", []any{resource}, map[string]string{"marker-7f3a file body": "harness harness_text"}, []string{""}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()

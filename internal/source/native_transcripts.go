@@ -88,7 +88,7 @@ type nativeState struct {
 
 // kimiRule is the version of the Kimi attribution rule. A cursor saved under an older one holds owner turns
 // credited by a prompt's origin alone, a `kimi -p` run's among them (before 1), or text generated into a prompt
-// (an inline skill's body, a hook's output, a client's system block) as the owner's words (before 2): its file is
+// (an inline skill's body, a hook's output, a client's system block or attached resource) as the owner's words (before 2): its file is
 // read again from its start, once, and each record holds what the new reading credits (PutFiles).
 const kimiRule = 2
 
@@ -601,23 +601,34 @@ const (
 	kimiHookSource  = "user prompt submit hook"
 )
 
-// kimiSystem is a block a Kimi client writes into a prompt's text for the model: the TUI's (and the web and ACP
-// servers') image compression note, as a text part of its own, and VS Code's editor context, at the start of the
-// person's first text part. The tag is built from parts so this file holds none.
-var kimiSystem = regexp.MustCompile(`(?s)<` + `system>.*?</` + `system>`)
+// kimiBlock is one of the two system blocks Kimi's clients write for the model into a person's text: the image
+// compression note (the TUI, the web and ACP servers), a text part of its own, and VS Code's editor context, at
+// the start of his first text part or, for a prompt of text only, at its end. Each opens with its own words, runs
+// to the next closing tag on its line and takes a newline after it. Any other system block is text he may have
+// typed or pasted. The tag is built from parts so this file holds none.
+var kimiBlock = regexp.MustCompile(`<` + `system>(?:Image compressed to fit model limits:|Editor context \(use only if relevant to user's query\): ).*?</` + `system>\n?`)
 
-// kimiInput splits a prompt's input into the text Kimi generated into it and the rest, the prompt's words. Three
-// things are generated: a text part with any meta.source (Kimi marks a skill's rendered body and a hook's output
-// so, and its clients send the person's text with none); on a wire from before Kimi marked skill parts, in a
-// user-origin prompt with no part marked "skill activation", one leading text part with no meta.source per
-// activation its origin.skillActivations bundles, which Kimi reads as the skill's; and a system block in any other
-// text part (kimiSystem). The notices a client writes with no tag (the web server's attached-file notice, the
-// "[Image omitted: ...]" one for an image the model cannot take) cannot be told from his words and stay in them.
-// unknown counts the parts whose meta.source is not one Kimi is known to write; they are generated all the same.
-// Only text counts, as in nativeText.
+// kimiResource and kimiResourceLink are a whole text part the ACP server writes for a resource a client attached:
+// an embedded text resource, and a link that is not a local file. A local file link becomes a bare path, which
+// cannot be told from a path he typed.
+var (
+	kimiResource     = regexp.MustCompile(`(?s)\A<resource uri="[^"]*">.*</resource>\z`)
+	kimiResourceLink = regexp.MustCompile(`\A<resource_link uri="[^"]*" name="[^"]*" />\z`)
+)
+
+// kimiInput splits a prompt's input into the text Kimi generated into it and the rest, the prompt's words. These
+// are generated: a text part with any meta.source (Kimi marks a skill's rendered body and a hook's output so, and
+// its clients send the person's text with none); on a wire from before Kimi marked skill parts, in a user-origin
+// prompt with no part marked "skill activation", the first text parts with no meta.source, one per activation its
+// origin.skillActivations bundles, which Kimi reads as the skill's; a whole ACP resource part (kimiResource); and a
+// known system block at the start or the end of any other text part (kimiBlock). The notices a client writes with
+// no tag (the web server's attached-file notice, the "[Image omitted: ...]" one for an image the model cannot
+// take) and the ACP server's bare file paths cannot be told from his words and stay in them. unknown counts the
+// parts whose meta.source is not one Kimi is known to write; they are generated all the same. Only text counts, as
+// in nativeText.
 func kimiInput(input any, origin map[string]any) (generated, words string, unknown int) {
-	parts, ok := input.([]any)
-	if !ok {
+	parts, listed := input.([]any)
+	if !listed {
 		parts = []any{map[string]any{"type": "text", "text": nativeText(input)}}
 	}
 	skill := func(b any) bool {
@@ -625,7 +636,7 @@ func kimiInput(input any, origin map[string]any) (generated, words string, unkno
 		return str(p, "type") == "text" && str(object(p["meta"]), "source") == kimiSkillSource
 	}
 	bundled := 0
-	if activations, ok := origin["skillActivations"].([]any); ok && str(origin, "kind") == "user" && !slices.ContainsFunc(parts, skill) {
+	if activations, ok := origin["skillActivations"].([]any); ok && listed && str(origin, "kind") == "user" && !slices.ContainsFunc(parts, skill) {
 		bundled = len(activations)
 	}
 	var gen, own []any
@@ -642,12 +653,21 @@ func kimiInput(input any, origin map[string]any) (generated, words string, unkno
 		case text && bundled > 0:
 			bundled--
 			gen = append(gen, b)
+		case text && (kimiResource.MatchString(str(p, "text")) || kimiResourceLink.MatchString(str(p, "text"))):
+			gen = append(gen, b)
 		case text:
-			rest := kimiSystem.ReplaceAllStringFunc(str(p, "text"), func(block string) string {
-				gen = append(gen, map[string]any{"type": "text", "text": block})
-				return "\n"
-			})
-			own = append(own, map[string]any{"type": "text", "text": rest})
+			t := str(p, "text")
+			lo, hi := 0, len(t)
+			blocks := kimiBlock.FindAllStringIndex(t, -1)
+			if len(blocks) > 0 && blocks[0][0] == 0 {
+				lo = blocks[0][1]
+				gen = append(gen, map[string]any{"type": "text", "text": t[:lo]})
+			}
+			if n := len(blocks); n > 0 && blocks[n-1][1] == len(t) && blocks[n-1][0] >= lo {
+				hi = blocks[n-1][0]
+				gen = append(gen, map[string]any{"type": "text", "text": t[hi:]})
+			}
+			own = append(own, map[string]any{"type": "text", "text": t[lo:hi]})
 		default:
 			own = append(own, b)
 		}

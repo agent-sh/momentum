@@ -613,6 +613,31 @@ func TestOwnerBurdenIsFoundInHisOwnWords(t *testing.T) {
 	}
 }
 
+// A turn of his with none of his words (an inline skill he sent alone) answers the agent's last words as any turn
+// does: the next turn's look back starts at it, so what the agent asked before it is not read again. It is never
+// classed itself.
+func TestAnEmptyOwnerTurnBoundsTheLookBack(t *testing.T) {
+	ask := "The build is ready. Should I deploy it now?"
+	for _, empty := range []bool{false, true} {
+		st := testStore(t)
+		for i, s := range []string{"a", "b", "c"} {
+			at := t0.Add(time.Duration(i) * time.Hour)
+			put(t, st, agentSays(s, ask, at))
+			if empty {
+				put(t, st, ownerTurn(s, "", at.Add(time.Minute)))
+			}
+			put(t, st, ownerTurn(s, "up to you, why ask", at.Add(2*time.Minute)))
+		}
+		var want []string
+		if !empty {
+			want = []string{"owner-burden/v1:handback 3"}
+		}
+		if fs, err := (OwnerBurden{}).Detect(context.Background(), st, week()); err != nil || !slices.Equal(signatures(fs), want) {
+			t.Fatalf("with an empty turn before his answer %v: %v %v, want %v", empty, signatures(fs), err, want)
+		}
+	}
+}
+
 // A turn is read with the agent's last words since his turn before it, within 6 hours: words he answered once are
 // not read again, and words from longer ago are not what he answers. Three turns of one kind in one session are no
 // finding; a turn he repeats a day later is read against what he said that day.
