@@ -17,7 +17,7 @@ func TestEvidenceRecordsNeverReadWritableClonesCachesOrExports(t *testing.T) {
 		if err := os.WriteFile(file, []byte("marker-7f3a"), 0600); err != nil {
 			t.Fatal(err)
 		}
-		if f, err := openRecord(file); err == nil {
+		if f, _, err := openRecord(file); err == nil {
 			f.Close()
 			t.Fatal("evidence read a writable clone, cache or export")
 		}
@@ -37,7 +37,7 @@ func TestRecordsOfAnEarlierRunRemainRootConfined(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(dir, "parent")); err != nil {
 		t.Fatal(err)
 	}
-	if f, err := openRecord(filepath.Join(dir, "parent", "record")); err == nil {
+	if f, _, err := openRecord(filepath.Join(dir, "parent", "record")); err == nil {
 		f.Close()
 		t.Fatal("an earlier run's intermediate link escaped its root")
 	}

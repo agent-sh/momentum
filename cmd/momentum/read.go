@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +20,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	tacit "github.com/agent-sh/tacit/client/pkg/evidence"
 
 	"github.com/agent-sh/momentum/internal/evidenceview"
 	"github.com/agent-sh/momentum/internal/loop"
@@ -42,9 +45,9 @@ func scrubbed(ctx context.Context, w io.Writer, text string) error {
 	return err
 }
 
-// evidenceShow accepts up to ten live events. Each full referenced record is
-// scrubbed before --bytes selects its prefix. An as-of child withholds later
-// records and every Hermes row, whose earlier version cannot be reconstructed.
+// evidenceShow accepts up to ten live events. Each full referenced record (a transcript's line, read from its
+// compressed copy once the harness compressed it, or a Hermes row) is scrubbed before --bytes selects its prefix.
+// An as-of child withholds later records and every Hermes row, whose earlier version cannot be reconstructed.
 // The loop's records pass adds --separate: the events are then separated by the record separator (U+001E), which no
 // scrubbed text holds, and an event that cannot be shown is an empty one, so one child serves up to ten records.
 func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -104,22 +107,39 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 
 var errWritableRecord = errors.New("record lies where a run can write")
 
-// A host event's reference does not authenticate a run-written file.
-// Refuse both its spelling and its resolved target before opening it.
-func openRecord(path string) (*os.File, error) {
+// openRecord opens the file that holds a host event's record: the file its reference names or, once the harness
+// compressed it (a Codex rollout), its compressed copy (evidence.Resolve), whose name it also returns ("" for the
+// named file). A reference does not authenticate a run-written file: the spelling and the resolved target of the
+// named file and of the copy are refused inside a run-writable root before either is opened.
+func openRecord(path string) (*os.File, string, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	path = abs
+	if runWritable(abs) {
+		return nil, "", errWritableRecord
+	}
+	holder, packed := abs, ""
+	if zst := tacit.Resolve(abs); zst != abs {
+		if runWritable(zst) {
+			return nil, "", errWritableRecord
+		}
+		holder, packed = zst, zst
+	}
+	f, err := os.OpenFile(holder, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	return f, packed, err
+}
+
+// runWritable reports a path whose spelling or resolved target lies in a root a run can write.
+func runWritable(path string) bool {
 	real := resolved(path)
 	for _, name := range []string{"runs", "work", "cache", "exports", "tmp"} {
 		root := filepath.Join(loopDir(), name)
 		if within(path, root) || within(real, resolved(root)) {
-			return nil, errWritableRecord
+			return true
 		}
 	}
-	return os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	return false
 }
 
 // placeOf splits a reference (path@offset, with #index) into its file and the offset of its record.
@@ -233,19 +253,22 @@ func showEvent(ctx context.Context, st *store.Store, id string) (eventText, erro
 	if !ok {
 		return eventText{header: output.String()}, nil
 	}
+	if e.Source == store.Transcripts && e.Harness == "hermes" {
+		// tacit's reader keeps a Hermes event's place as its store and its row's id, not as bytes of a file
+		record, note := hermesRow(ctx, e, path, off)
+		output.WriteString(note)
+		return eventText{header: output.String(), record: record}, nil
+	}
 	// opened without waiting on a writer, and read only when it is a regular file: a reference may now name a pipe or
 	// a device, which would hold the run
-	f, err := openRecord(path)
+	f, packed, err := openRecord(path)
 	if err != nil {
-		if errors.Is(err, errWritableRecord) {
-			output.WriteString("  (record withheld: it lies where a run can write)\n")
-		} else {
-			output.WriteString("  (its record is gone)\n")
-		}
+		output.WriteString(unopened(err))
 		return eventText{header: output.String()}, nil
 	}
 	defer f.Close()
-	if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() {
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
 		output.WriteString("  (its record is not a regular file)\n")
 		return eventText{header: output.String()}, nil
 	}
@@ -257,18 +280,48 @@ func showEvent(ctx context.Context, st *store.Store, id string) (eventText, erro
 	if off < 0 {
 		return eventText{}, usageError{"negative record offset"}
 	}
-	if off > 0 {
-		var prev [1]byte
-		if _, err := f.ReadAt(prev[:], off-1); err != nil || prev[0] != '\n' {
-			return eventText{}, usageError{"offset is not a record boundary"}
+	var br *bufio.Reader
+	if packed == "" {
+		if off > 0 {
+			var prev [1]byte
+			if _, err := f.ReadAt(prev[:], off-1); err != nil || prev[0] != '\n' {
+				return eventText{}, usageError{"offset is not a record boundary"}
+			}
+		}
+		if _, err := f.Seek(off, io.SeekStart); err != nil {
+			return eventText{}, err
+		}
+		br = bufio.NewReaderSize(f, readMax+1)
+	} else {
+		// The harness compressed the transcript after it was read: tacit's reader decompresses the copy and passes over
+		// its JSONL bytes up to the byte before the record, which must end the record before it. It opens the copy by
+		// name, so the name must still be the file checked above.
+		start := max(off-1, 0)
+		zr, err := tacit.OpenAt(packed, start)
+		if err != nil {
+			if _, size, serr := tacit.Stat(packed); serr == nil && start > size {
+				return eventText{}, usageError{"offset is not a record boundary"}
+			}
+			output.WriteString(packedUnread)
+			return eventText{header: output.String()}, nil
+		}
+		defer zr.Close()
+		if again, err := os.Lstat(packed); err != nil || !os.SameFile(again, fi) {
+			output.WriteString("  (its record is gone)\n")
+			return eventText{header: output.String()}, nil
+		}
+		br = bufio.NewReaderSize(zr, readMax+1)
+		if off > 0 {
+			if prev, err := br.ReadByte(); err != nil || prev != '\n' {
+				return eventText{}, usageError{"offset is not a record boundary"}
+			}
 		}
 	}
-	if _, err := f.Seek(off, io.SeekStart); err != nil {
-		return eventText{}, err
-	}
-	line, err := bufio.NewReaderSize(f, readMax+1).ReadSlice('\n')
+	line, err := br.ReadSlice('\n')
 	if err == bufio.ErrBufferFull || len(line) > readMax {
 		output.WriteString("  (oversized record withheld)\n")
+	} else if err != nil && err != io.EOF && packed != "" {
+		output.WriteString(packedUnread)
 	} else if err != nil && err != io.EOF {
 		return eventText{}, err
 	} else {
@@ -297,6 +350,85 @@ func showEvent(ctx context.Context, st *store.Store, id string) (eventText, erro
 		return eventText{header: output.String(), record: string(line)}, nil
 	}
 	return eventText{header: output.String()}, nil
+}
+
+// packedUnread is the note for a compressed copy that holds a transcript but cannot be read to its record.
+const packedUnread = "  (record withheld: its compressed copy cannot be read)\n"
+
+// unopened is the note for a record openRecord refused or could not open.
+func unopened(err error) string {
+	if errors.Is(err, errWritableRecord) {
+		return "  (record withheld: it lies where a run can write)\n"
+	}
+	return "  (its record is gone)\n"
+}
+
+// hermesRow is a Hermes event's record: its row in the Hermes store whose path its reference names, by the row's
+// id, read with tacit's Hermes reader in the session that holds the row (a delegation's own), as the request reader
+// reads it. It returns the row as one JSON line, or a note on why there is none. The store is opened read-only,
+// only when it is a regular file outside the roots a run can write, and a row over the record bound is withheld.
+func hermesRow(ctx context.Context, e store.Event, path string, msg int64) (string, string) {
+	f, _, err := openRecord(path)
+	if err != nil {
+		return "", unopened(err)
+	}
+	fi, err := f.Stat()
+	f.Close()
+	if err != nil || !fi.Mode().IsRegular() {
+		return "", "  (its record is not a regular file)\n"
+	}
+	if msg <= 0 {
+		return "", "  (its record is gone)\n"
+	}
+	db, err := tacit.OpenHermes(path)
+	if err != nil {
+		return "", "  (its record is gone)\n"
+	}
+	defer db.Close()
+	// SQLite opens the store by name, so the name must still be the file checked above
+	if again, err := os.Lstat(db.Path); err != nil || !os.SameFile(again, fi) {
+		return "", "  (its record is gone)\n"
+	}
+	sid := e.Session
+	if e.Agent != "" && e.Agent != e.Session {
+		sid = e.Agent
+	}
+	rows, err := db.Messages(ctx, sid, msg-1, 1) // the row itself: Messages reads at least one, here no more
+	if err != nil || len(rows) == 0 || rows[0].ID != msg {
+		return "", "  (its record is gone)\n"
+	}
+	m := rows[0]
+	row := hermesLine{ID: m.ID, Timestamp: time.UnixMicro(int64(math.Round(m.Timestamp * 1e6))).UTC().Format(time.RFC3339Nano),
+		Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallID, ToolName: m.ToolName, Finish: m.Finish,
+		DisplayKind: m.DisplayKind, Summary: m.Summary}
+	if m.ToolCalls != "" {
+		row.ToolCalls = json.RawMessage(m.ToolCalls)
+		if !json.Valid(row.ToolCalls) {
+			row.ToolCalls, _ = json.Marshal(m.ToolCalls)
+		}
+	}
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(row); err != nil || b.Len() > readMax {
+		return "", "  (oversized record withheld)\n"
+	}
+	return b.String(), ""
+}
+
+// hermesLine is a Hermes row as evidence show prints it: one JSON line of its columns, its time in RFC 3339 as a
+// transcript line's, and its tool calls as the JSON Hermes stored.
+type hermesLine struct {
+	ID          int64           `json:"id"`
+	Timestamp   string          `json:"timestamp"`
+	Role        string          `json:"role"`
+	Content     string          `json:"content,omitempty"`
+	ToolCalls   json.RawMessage `json:"tool_calls,omitempty"`
+	ToolCallID  string          `json:"tool_call_id,omitempty"`
+	ToolName    string          `json:"tool_name,omitempty"`
+	Finish      string          `json:"finish_reason,omitempty"`
+	DisplayKind string          `json:"display_kind,omitempty"`
+	Summary     bool            `json:"compressed_summary,omitempty"`
 }
 
 func evidenceEnd() (time.Time, error) {

@@ -212,7 +212,7 @@ The agent has `momentum-ro` on PATH at `/opt/momentum/momentum-ro`, bound read-o
 
 The basename from `os.Executable()` selects this mode, never argv[0]. All other commands exit 2: "momentum-ro reads the run's copies and changes nothing". It opens only the run's SQLite copy in read-only immutable mode, reads no configuration, writes nothing, uses no network and runs no other program. Renaming a copy to `momentum` restores the host parser; the sandbox still has no host store, host configuration or host network. This reader is no door.
 
-Host `evidence show` scrubs all headers and whole records in one batch, then clips records. `evidence unit` scrubs once too. The records pass publishes those captures without another scrub. The sandbox reads already-scrubbed records without starting a scrubber.
+Host `evidence show` scrubs all headers and whole records in one batch, then clips records. It reads a Codex rollout from its compressed copy and a Hermes event's row from the Hermes store, with the same guards and bounds as any record. `evidence unit` scrubs once too. The records pass publishes those captures without another scrub. The sandbox reads already-scrubbed records without starting a scrubber.
 
 
 `internal/sandbox` runs the whole harness under a transient systemd user service. The Bedrock relay is its only network route. The relay enforces model policy, spend reservations and request turns, observes token usage and authenticates the terminal report. Model refusal can use the fallback within the primary's remaining budget and time. Session persistence is disabled; the host archive is the transcript.
