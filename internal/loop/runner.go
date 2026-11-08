@@ -1085,17 +1085,21 @@ func stopRuns(ctx context.Context, st *store.Store, c store.Case) (runs []store.
 		return nil, false, nil
 	}
 	if refusalStop(a) || a.Step == StepBuild && hostFailure(a) {
-		if a.Cause == "" && slices.Contains(refusalKeys, a.Failure) {
+		if stopCause(a) == "" && slices.Contains(refusalKeys, a.Failure) {
 			return nil, false, nil // a refusal-stage run kept before causes were: its cause is unknown
 		}
 		// the newest build stops on an earlier one its build answered for that failed at its stage for its cause: a
-		// refusal's, or the host's (hostCause, or none at a host stage), whatever came between
+		// refusal's, whatever came between, or the host's (hostCause, or none at a host stage), unless a refusal came
+		// between: a build refused for its output since was making progress, and the host errors around it are apart
 		span, err := buildSpan(ctx, st, c, runs)
 		if err != nil || len(span) == 0 {
 			return nil, false, err
 		}
 		for _, e := range span[1:] {
-			if e.Failure == a.Failure && e.Cause == a.Cause {
+			if !refusalStop(a) && refusalStop(e) {
+				break
+			}
+			if e.Failure == a.Failure && stopCause(e) == stopCause(a) {
 				return []store.LoopRun{a, e}, true, nil
 			}
 		}
@@ -1115,10 +1119,23 @@ func stopCounts(run store.LoopRun) bool {
 	switch {
 	case run.Status == store.RunRefused || run.Status == store.RunRunning || run.Failure == "sandbox":
 		return false
+	case run.Started.IsZero() && oldBrokerOutage(run):
+		return false
 	case run.Started.IsZero():
 		return run.Step == StepBuild && run.Status == store.RunFailed && slices.Contains(hostStages, run.Failure)
 	}
 	return true
+}
+
+// oldBrokerText is how a build kept before the broker's outage had its own key (broker) told a broker env file that
+// could not be read, at build run.
+var oldBrokerText = regexp.MustCompile(`build run: no Bedrock route: the broker's env file (?:\S+ )?cannot be read`)
+
+// oldBrokerOutage says a build that never started was kept, before the broker's outage had its own key, for a broker
+// env file that could not be read: this build keeps such a run as the broker's, which the stop rule does not count,
+// so it does not count the old ones either.
+func oldBrokerOutage(run store.LoopRun) bool {
+	return run.Step == StepBuild && run.Failure == "build run" && run.Cause == "" && oldBrokerText.MatchString(run.Summary)
 }
 
 // runAt is when a run counts for the stop rule: its start, or its end for one that never started.

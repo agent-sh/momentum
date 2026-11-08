@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/agent-sh/momentum/internal/sandbox"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -181,7 +182,7 @@ type Sandbox struct {
 	Path              []string
 	GoRoot, GoModules string
 	Timeout           time.Duration
-	Gate              func(context.Context) error // waits for room for a test; an error is no room now, a hold
+	Gate              func(context.Context) error // waits for room for a test (room)
 }
 
 const DefaultTestTimeout = 20 * time.Minute
@@ -208,12 +209,27 @@ func (s Sandbox) spec(dir, scratch string, words, extra []string) (sandbox.Spec,
 		Limits: sandbox.Limits{RuntimeSec: int(timeout.Seconds()) + 60}, Argv: words}, nil
 }
 
+// room waits at the capacity gate for room for a test. A gate that ran and found none (it exited unsuccessfully, or its
+// own deadline ended it) is a hold, not a failure of the check: the next pass checks again. A gate that cannot run (its
+// program is gone) is the host's error at the check, which counts, and a pass told to stop is neither.
+func (s Sandbox) room(ctx context.Context) error {
+	if s.Gate == nil {
+		return nil
+	}
+	err := s.Gate(ctx)
+	if err == nil || ctx.Err() != nil {
+		return err
+	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) || errors.Is(err, context.DeadlineExceeded) {
+		return &shipHold{err: err}
+	}
+	return err
+}
+
 func (s Sandbox) Run(ctx context.Context, dir string, words []string, extra []string) (outcome Outcome, runErr error) {
-	if s.Gate != nil {
-		if err := s.Gate(ctx); err != nil {
-			// a machine with no room for the test now is a hold, not a failure of the check: the next pass checks again
-			return Outcome{}, &shipHold{err: err}
-		}
+	if err := s.room(ctx); err != nil {
+		return Outcome{}, err
 	}
 	base := firstOf(s.Scratch, filepath.Dir(dir))
 	if err := os.MkdirAll(base, 0700); err != nil {

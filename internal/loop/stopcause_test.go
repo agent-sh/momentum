@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -614,6 +615,10 @@ func TestBuildsThatNeverStartedAreDatedByTheirEnd(t *testing.T) {
 	never(after, "a1", time.Now())
 	never(after, "a2", time.Now().Add(time.Second))
 	never(late, "l2", time.Now().Add(time.Second))
+	// a dry check dates the late stop by its older build too, and holds nothing
+	if why, err := r.stopped(ctx, late, true); err != nil || why != "" {
+		t.Fatalf("a dry check held a stop whose older build ended before the fix: %q %v", why, err)
+	}
 	if why, err := r.stopped(ctx, late, false); err != nil || why != "" {
 		t.Fatalf("a stop whose older build ended before the fix held its case: %q %v", why, err)
 	}
@@ -720,7 +725,13 @@ func TestABusyMachineAtTheCheckIsAHold(t *testing.T) {
 	st := testStore(t)
 	r := localRunner(t, st)
 	c := openCase(t, st, "failures", "busy", 1)
-	busy := Sandbox{Gate: func(context.Context) error { return errors.New("the machine has no room for the test now: load 30") }}
+	// the gate ran and found no room: it exited unsuccessfully, as cmd/momentum's gate program does
+	busy := Sandbox{Gate: func(ctx context.Context) error {
+		if err := exec.CommandContext(ctx, "false").Run(); err != nil {
+			return fmt.Errorf("the machine has no room for the test now: %w", err)
+		}
+		return nil
+	}}
 	for i := 0; i < 2; i++ {
 		_, err := busy.Run(ctx, t.TempDir(), []string{"go", "test", "./..."}, nil)
 		if !held(err) {
@@ -777,5 +788,255 @@ func TestOnlyAnUnreachableBrokerIsTheBrokers(t *testing.T) {
 	if !brokerOutage(Result{}, unread) || brokerOutage(Result{Started: true, USD: 0.5}, unread) ||
 		brokerOutage(Result{}, fmt.Errorf("%w: every headless run is on Bedrock", ErrNoBedrock)) {
 		t.Fatal("the broker's outage is told wrong")
+	}
+}
+
+// Two host errors at one stage with a refusal of the build's output between them are apart: the build was making
+// progress, so they stop nothing. Host errors that take turns with each other still stop.
+func TestHostErrorsApartDoNotStopAProgressingCase(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "progress", 1)
+	base := time.Now().Add(-time.Hour)
+	steps := []struct{ failure, cause, text string }{
+		{"build propose", hostCause, "build propose: publication uncertain: the push failed (Could not resolve host: github.com)"},
+		{"build check", refusalCause("refused: the test passes without the change too"), "build check: refused: the test passes without the change too"},
+		{"build report", refusalCause("build report has a missing required field"), "build report: build report has a missing required field"},
+		{"build check", refusalCause("refused: the test fails with the change (exit 1)"), "build check: refused: the test fails with the change (exit 1)"},
+		{"build propose", hostCause, "build propose: publication uncertain: the push failed (Connection reset by peer)"},
+	}
+	for i, s := range steps {
+		putBuild(t, st, c, fmt.Sprint("p", i), StepBuild, store.RunFailed, s.failure, s.cause, s.text, base.Add(time.Duration(i)*10*time.Minute))
+		if why, err := r.stopped(ctx, c, true); err != nil || why != "" {
+			t.Fatalf("build %d of a progressing case stopped it: %q %v", i, why, err)
+		}
+	}
+}
+
+// A capacity gate that cannot run (its program is gone) is no machine without room: the check fails as the host's
+// error at build check, which counts, so two such builds stop the case instead of charging it every pass.
+func TestABrokenGateIsTheHostsErrorAtTheCheck(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "gate", 1)
+	broken := Sandbox{Gate: func(ctx context.Context) error {
+		if err := exec.CommandContext(ctx, "momentum-test-absent-gate", "--capacity", "20,8").Run(); err != nil {
+			return fmt.Errorf("the machine has no room for the test now: %w", err)
+		}
+		return nil
+	}}
+	for i := 0; i < 2; i++ {
+		_, err := broken.Run(ctx, t.TempDir(), []string{"go", "test", "./..."}, nil)
+		if err == nil || held(err) {
+			t.Fatalf("a gate that cannot run: %v", err)
+		}
+		run, why := r.reserve(ctx, c.Family, c.ID, StepBuild)
+		if why != "" {
+			t.Fatal(why)
+		}
+		res, serr := stageFailure(Result{Started: true, CostKnown: true, Status: store.RunOK, USD: 4}, "build check", err)
+		if done := r.completeStep(ctx, c, run, res, serr); done.Run.Failure != "build check" || done.Run.Cause != hostCause {
+			t.Fatalf("a gate that cannot run is not the host's error at the check: %+v", done)
+		}
+	}
+	if why, err := r.stopped(ctx, c, true); err != nil || why != "two of its build runs failed the same way: build check" {
+		t.Fatalf("two builds whose gate cannot run: %q %v", why, err)
+	}
+}
+
+// A machine with no room for the check holds the build before its agent starts, so a busy pass spends nothing and
+// keeps no run.
+func TestABusyMachineHoldsTheBuildBeforeItsAgent(t *testing.T) {
+	fakeManager(t) // host ordering only: no unit or model starts
+	ctx := context.Background()
+	r, c := inputRunner(t)
+	f := newRepo(t, nil)
+	r.Ship = shipWithSandbox(r.Store, f, Sandbox{Gate: func(ctx context.Context) error {
+		if err := exec.CommandContext(ctx, "false").Run(); err != nil {
+			return fmt.Errorf("the machine has no room for the test now: %w", err)
+		}
+		return nil
+	}})
+	r.Ship.Dir = r.Dir
+	r.Inputs.ReadDirs = []string{f.main}
+	mechanism, fix := "one cause", "one fix"
+	var err error
+	if c, err = r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	setCaseRepo(t, r.Store, c, "main")
+	for i := 0; i < 2; i++ {
+		done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
+		if err != nil || len(done) != 1 || done[0].Run.ID != "" || !strings.Contains(done[0].Skipped, "no room for the test") {
+			t.Fatalf("pass %d on a busy machine: %+v %v", i, done, err)
+		}
+	}
+	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID})
+	got, _ := r.Store.CaseByID(ctx, c.ID)
+	if err != nil || len(runs) != 0 || got.Cost.USD != 0 || got.Cost.Runs != 0 {
+		t.Fatalf("a busy machine kept runs or spent: %+v %+v %v", runs, got.Cost, err)
+	}
+}
+
+// Old host errors at a refusal stage (no cause; a text that is no refusal, which hostFailure tells) count as the
+// host's on both sides: two stop their case under the stage's signature, and a component-health case filed for that
+// stage before causes were kept holds the stop.
+func TestOldHostErrorsAtARefusalStageStillHold(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "old-host", 1)
+	base := time.Now().Add(-time.Hour)
+	for i := 0; i < 2; i++ {
+		putBuild(t, st, c, fmt.Sprint("oh", i), StepBuild, store.RunFailed, "build propose", "",
+			"build propose: publication uncertain: the push failed (Could not resolve host: github.com)", base.Add(time.Duration(i)*time.Minute))
+	}
+	old, _, err := st.ObserveCase(ctx, store.Finding{Family: store.HealthFamily, Signature: "component-health/v1:loop:build:build-propose",
+		Title: "The loop fails the same way twice: build propose", Evidence: []store.Evidence{{Ref: "file:/runs/oh1", At: base.Add(time.Minute)}}}, "loop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held, err := StoppedOn(ctx, st, old); err != nil || len(held) != 1 || held[0] != c.ID {
+		t.Fatalf("the stage's old case does not hold its old host errors: %v %v", held, err)
+	}
+	if why, err := r.stopped(ctx, c, true); err != nil || why != "two of its build runs failed the same way: build propose" {
+		t.Fatalf("two old host errors at build propose: %q %v", why, err)
+	}
+}
+
+// A build kept before the broker's outage had its own key, for a broker env file that could not be read (build run,
+// no start), is the broker's after the upgrade too: two such old runs stop nothing.
+func TestOldBrokerOutagesDoNotCount(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "upgrade", 1)
+	base := time.Now().Add(-time.Hour)
+	for i, text := range []string{"no Bedrock route: the broker's env file /x/bedrock.env cannot be read (no such file or directory)",
+		"no Bedrock route: the broker's env file cannot be read"} {
+		if err := st.PutLoopRun(ctx, store.LoopRun{ID: fmt.Sprint("o", i), Case: c.ID, Family: c.Family, Step: StepBuild,
+			Ended: base.Add(time.Duration(i) * time.Minute), Status: store.RunFailed, Failure: "build run", Summary: "build run: " + text}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if why, err := r.stopped(ctx, c, true); err != nil || why != "" {
+		t.Fatalf("two old broker outages stopped the case: %q %v", why, err)
+	}
+}
+
+// Only an env file that cannot be read is the broker's outage: one the scanner cannot read through is, and a relay
+// that cannot listen on the run's own socket (the host's storage) is not.
+func TestOnlyAnUnreadableEnvFileIsTheBrokers(t *testing.T) {
+	long := filepath.Join(t.TempDir(), "bedrock.env")
+	write(t, long, "CLAUDE_CODE_USE_BEDROCK=1\nPAD="+strings.Repeat("x", 70<<10)+"\n")
+	_, err := (&Bedrock{File: long}).read()
+	if !brokerOutage(Result{}, err) {
+		t.Fatalf("an env file the scanner cannot read through is not the broker's: %v", err)
+	}
+	env := filepath.Join(t.TempDir(), "bedrock.env")
+	write(t, env, "CLAUDE_CODE_USE_BEDROCK=1\nCLAUDE_CODE_SKIP_BEDROCK_AUTH=1\nANTHROPIC_BEDROCK_BASE_URL=http://127.0.0.1:9/x\n")
+	_, _, err = (&Bedrock{File: env}).open(filepath.Join(t.TempDir(), "gone", "relay.sock"), 1)
+	if err == nil || !errors.Is(err, ErrNoBedrock) || brokerOutage(Result{}, err) {
+		t.Fatalf("a relay that cannot listen on its own socket is the broker's: %v", err)
+	}
+}
+
+// A build report a build kept before causes were, unreadable, is the build's refusal by its key, not the host's by its
+// text: it reaches the next build, and two of them do not stop the case, since their causes are unknown.
+func TestAnOldUnreadableReportIsTheBuildsRefusal(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "old-report", 1)
+	base := time.Now().Add(-time.Hour)
+	for i := 0; i < 2; i++ {
+		putBuild(t, st, c, fmt.Sprint("r", i), StepBuild, store.RunFailed, "build report", "", "build report: build report has a missing required field",
+			base.Add(time.Duration(i)*time.Minute))
+	}
+	if md, err := r.lastBuildRefusal(ctx, c); err != nil || !strings.Contains(md, "Run r1 failed at build report") {
+		t.Fatalf("an old unreadable report did not reach the next build: %q %v", md, err)
+	}
+	if why, err := r.stopped(ctx, c, true); err != nil || why != "" {
+		t.Fatalf("two old unreadable reports stopped the case: %q %v", why, err)
+	}
+}
+
+// A build stage that fails while the pass is told to stop is stopped, not the host's failure at that stage: it says
+// nothing of the host, and the stop rule does not count it. The build's own refusal, and a hold, stay what they are.
+func TestAStageThatFailsAsThePassStopsIsStopped(t *testing.T) {
+	stopping, cancel := context.WithCancel(context.Background())
+	cancel()
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "stopping", 1)
+	res, err := r.build(stopping, c, store.LoopRun{ID: "20261108-000000-0000aaaa", Case: c.ID, Step: StepBuild})
+	if err != nil || res.Failure != "stopped" || res.Cause != "" {
+		t.Fatalf("a build input that failed as the pass stopped: %+v %v", res, err)
+	}
+	for _, s := range []struct {
+		key  string
+		err  error
+		want string
+	}{
+		{"build toolchains", errors.New("the toolchain is gone"), "stopped"},
+		{"build propose", errors.New("git push: signal: killed"), "stopped"},
+		{"build propose", refused("a proposal needs its rollback"), "build propose"},
+	} {
+		if got, _ := stageFailureIn(stopping, Result{}, s.key, s.err); got.Failure != s.want {
+			t.Errorf("%s %v as the pass stopped: %q, want %q", s.key, s.err, got.Failure, s.want)
+		}
+	}
+	if _, err := stageFailureIn(stopping, Result{}, "build check", &shipHold{err: errors.New("no room")}); !held(err) {
+		t.Fatalf("a hold as the pass stopped: %v", err)
+	}
+	// a gate ended as the pass stops is no machine without room: the stopped check holds nothing
+	refusedRoom := exec.Command("false").Run()
+	gate := Sandbox{Gate: func(context.Context) error { return refusedRoom }}
+	if err := gate.room(context.Background()); !held(err) {
+		t.Fatalf("a gate that refused is no hold: %v", err)
+	}
+	if err := gate.room(stopping); err == nil || held(err) {
+		t.Fatalf("a gate ended as the pass stopped: %v", err)
+	}
+}
+
+// A later stop of a review with the same why as the stopped note that was done puts the note again: the note's detail
+// was rewritten as it was done.
+func TestALaterStopWithTheSameWhyPutsTheNoteAgain(t *testing.T) {
+	s, _, c, p := b4Reviewed(t)
+	p.Reviews = nil
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	r := &Runner{Store: s.Store, Ship: s, Dir: s.Dir, Budgets: DefaultBudgets,
+		pass: &passInputs{attempted: true, err: errors.New("inputs reached")}}
+	id := store.ReviewNoteID(c.ID, "stopped")
+	same := "its last two review runs failed the same way: marker-7f3a"
+	if _, err := s.Store.PutNote(ctx, store.Note{ID: id, Kind: store.NoteProblem, Importance: store.ImportanceLow, At: time.Now().Add(-time.Minute),
+		Title: "The loop's review for case " + c.ID + " waits: stopped", Detail: same}); err != nil {
+		t.Fatal(err)
+	}
+	if done := r.reviews(ctx, c.ID); len(done) != 1 || !strings.Contains(done[0].Skipped, "inputs reached") {
+		t.Fatalf("the first review: %+v", done)
+	}
+	if n, _, _ := s.Store.Note(ctx, id); n.Done.IsZero() {
+		t.Fatal("the stale note is still standing")
+	}
+	for i := 0; i < 2; i++ {
+		at := time.Now()
+		if err := s.Store.PutLoopRun(ctx, store.LoopRun{ID: fmt.Sprint("review-", i), Case: c.ID, Step: StepReview, Family: c.Family,
+			Started: at, Ended: at.Add(time.Millisecond), Status: store.RunFailed, Failure: "marker-7f3a"}); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if done := r.reviews(ctx, c.ID); len(done) != 1 || !strings.Contains(done[0].Skipped, same) {
+		t.Fatalf("the later stop: %+v", done)
+	}
+	if n, _, _ := s.Store.Note(ctx, id); !n.Done.IsZero() {
+		t.Fatalf("a later stop with the same why left the note done: %+v", n)
 	}
 }

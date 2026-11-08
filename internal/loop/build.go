@@ -374,6 +374,18 @@ func stageFailure(res Result, key string, err error) (Result, error) {
 	return res, nil
 }
 
+// stageFailureIn is a build stage's failure as stageFailure keeps it, unless the pass was told to stop meanwhile and the
+// failure is the host's (a host stage's, or a host error at a refusal stage): the run is then stopped, which says
+// nothing of the host or the build. A hold and the build's own refusal stay what they are.
+func stageFailureIn(ctx context.Context, res Result, key string, err error) (Result, error) {
+	if ctx.Err() == nil || held(err) || !slices.Contains(hostStages, key) && stageCause(key, err) != hostCause {
+		return stageFailure(res, key, err)
+	}
+	res.Status, res.Failure, res.Cause = store.RunFailed, "stopped", ""
+	res.Text = key + ": the pass was told to stop: " + err.Error()
+	return res, nil
+}
+
 type buildStageError struct {
 	key string
 	err error
@@ -385,64 +397,72 @@ func (e *buildStageError) Unwrap() error { return e.err }
 func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Result, error) {
 	inv, manifest, err := r.preparedInvocation(run, buildSchema)
 	if err != nil {
-		return stageFailure(Result{}, "build inputs", err)
+		return stageFailureIn(ctx, Result{}, "build inputs", err)
 	}
 	binds, env, err := r.Toolchains.inputs()
 	if err != nil {
-		return stageFailure(Result{}, "build toolchains", err)
+		return stageFailureIn(ctx, Result{}, "build toolchains", err)
 	}
 	inv.Binds, inv.Env = append(inv.Binds, binds...), env
+	// a machine with no room for the build's check holds the build before its agent spends anything; a gate that
+	// cannot run is left to the check, which counts it
+	if r.Ship == nil {
+		return stageFailureIn(ctx, Result{}, "build package", errors.New("build needs the host ship tool"))
+	}
+	if err := r.Ship.Sandbox.room(ctx); held(err) {
+		return stageFailureIn(ctx, Result{}, "build check", err)
+	}
 	res, err := r.Agent.RunOrFallback(ctx, inv)
 	res.InputSummary = manifest.Summary()
 	if brokerOutage(res, err) {
-		return stageFailure(res, "broker", err)
+		return stageFailureIn(ctx, res, "broker", err)
 	}
 	if err != nil {
-		return stageFailure(res, "build run", err)
+		return stageFailureIn(ctx, res, "build run", err)
 	}
 	if res.Status != store.RunOK {
 		return res, nil
 	}
 	report, err := buildReport(res.Report)
 	if err != nil {
-		return stageFailure(res, "build report", err)
+		return stageFailureIn(ctx, res, "build report", err)
 	}
 	if report.Lesson == "" && lessonGiven(res.Report) {
 		r.logf("build %s: its lesson is over 300 characters, so the proposal has none", c.ID)
 	}
 	if err := r.Ship.installedReadable(report.Installed); err != nil {
-		return stageFailure(res, "build report", err)
+		return stageFailureIn(ctx, res, "build report", err)
 	}
 	p, ok, err := r.Ship.Load(c.ID)
 	if err != nil || !ok {
-		return stageFailure(res, "build package", firstError(err, "package is absent"))
+		return stageFailureIn(ctx, res, "build package", firstError(err, "package is absent"))
 	}
 	// Reject stale or merged case reports before any host side effect.
 	current, err := r.Store.CaseByID(ctx, c.ID)
 	if err != nil || current.Episode != run.CaseEpisode || current.Into != "" || current.Status != store.CaseTesting {
-		return stageFailure(res, "build authority", firstError(err, "case changed during the build"))
+		return stageFailureIn(ctx, res, "build authority", firstError(err, "case changed during the build"))
 	}
 	patch, err := r.patchUnit(ctx, run, p)
 	if err != nil {
-		return stageFailure(res, "build patch", err)
+		return stageFailureIn(ctx, res, "build patch", err)
 	}
 	// One confined read. Check and Propose share its immutable byte snapshot.
 	data, err := readPatch(patch)
 	if err != nil {
-		return stageFailure(res, "build patch", err)
+		return stageFailureIn(ctx, res, "build patch", err)
 	}
 	snapshot := Patch{data: data}
 	if _, err := r.Ship.CheckArgs(ctx, c.ID, report.Test, nil, snapshot); err != nil {
-		return stageFailure(res, "build check", err)
+		return stageFailureIn(ctx, res, "build check", err)
 	}
 	window, err := planWindow(report.Window)
 	if err != nil {
-		return stageFailure(res, "build propose", err)
+		return stageFailureIn(ctx, res, "build propose", err)
 	}
 	_, err = r.Ship.Propose(ctx, c.ID, Proposal{Title: report.Title, Body: report.Body, Rollback: report.Rollback,
 		Lesson: report.Lesson, Signal: report.Signal, Window: window, Installed: report.Installed}, snapshot)
 	if err != nil {
-		return stageFailure(res, "build propose", err)
+		return stageFailureIn(ctx, res, "build propose", err)
 	}
 	return res, nil
 }
@@ -588,7 +608,17 @@ func refusalCause(text string) string {
 // refusalStop says a run's build was refused for its own output at a refusal stage: the stop rule holds it only on
 // an earlier refusal there for the same cause. A host error there (hostCause) is not one.
 func refusalStop(run store.LoopRun) bool {
-	return run.Step == StepBuild && slices.Contains(refusalKeys, run.Failure) && run.Cause != hostCause
+	return run.Step == StepBuild && slices.Contains(refusalKeys, run.Failure) && stopCause(run) != hostCause
+}
+
+// stopCause is the cause the stop rule compares for a run: its own, or hostCause for a refusal-stage run kept before
+// causes were that its text tells as the host's (hostFailure), so the old host errors of a stage still hold as the
+// new ones do, under the stage's signature.
+func stopCause(run store.LoopRun) string {
+	if run.Cause == "" && slices.Contains(refusalKeys, run.Failure) && hostFailure(run) {
+		return hostCause
+	}
+	return run.Cause
 }
 
 // hostStages are the build stages whose failure is the host's or the harness's, not the build's output: the next

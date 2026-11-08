@@ -42,8 +42,8 @@ type Bedrock struct {
 var ErrNoBedrock = errors.New("no Bedrock route")
 
 // unreachable is a run with no Bedrock route because the broker cannot be reached now: its env file cannot be read
-// (the broker rewrites it when it restarts), or the run's relay cannot listen. Unlike a file that says the wrong
-// things, or no route configured at all, it is the broker's outage.
+// (the broker rewrites it when it restarts). Unlike a file that says the wrong things, no route configured at all, or
+// a relay that cannot listen on the run's own socket (the host's storage), it is the broker's outage.
 type unreachable struct{ err error }
 
 func (e *unreachable) Error() string { return e.err.Error() }
@@ -193,7 +193,7 @@ func (b *Bedrock) open(socket string, budget float64, turns ...int) (*relay, []s
 	}
 	ln, err := listenRelaySocket(socket)
 	if err != nil {
-		return nil, nil, &unreachable{fmt.Errorf("%w: the run's relay cannot listen: %v", ErrNoBedrock, err)}
+		return nil, nil, fmt.Errorf("%w: the run's relay cannot listen: %v", ErrNoBedrock, err)
 	}
 	if err := os.Chmod(socket, 0o600); err != nil {
 		ln.Close()
