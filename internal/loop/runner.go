@@ -153,7 +153,8 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		}
 		health, err := r.sweepHealth(ctx)
 		if err != nil {
-			return nil, err
+			// a case the sweep cannot read closes nothing this pass, and holds none of the pass's other steps
+			r.logf("the component-health sweep closes nothing this pass: %v", err)
 		}
 		for _, c := range append(swept, health...) {
 			r.logf("swept %s: %s", c.ID, c.Title)
@@ -1261,44 +1262,66 @@ func stopText(run store.LoopRun) string {
 // StoppedOn lists the cases the stop rule holds now on one of a component-health case's signatures: the working
 // cases whose stop that case filed. Closing it as fixed resumes them (store.CloseFixed).
 func StoppedOn(ctx context.Context, st *store.Store, health store.Case) ([]string, error) {
+	stops, err := heldStops(ctx, st)
+	if err != nil {
+		return nil, err
+	}
+	return stoppedOn(stops, health), nil
+}
+
+// heldStop is a working case the stop rule holds now, and the signature of its stop (stopSignature).
+type heldStop struct{ caseID, signature string }
+
+// heldStops reads the stop rule once for every working case: the ones it holds now, most recently changed first.
+func heldStops(ctx context.Context, st *store.Store) ([]heldStop, error) {
 	cs, err := st.Cases(ctx, store.CaseFilter{Statuses: []store.CaseStatus{store.CaseOpen, store.CaseInvestigating, store.CaseTesting}})
 	if err != nil {
 		return nil, err
 	}
-	var out []string
+	var out []heldStop
 	for _, c := range cs {
-		if c.ID == health.ID {
-			continue
-		}
 		runs, ok, err := stopRuns(ctx, st, c)
 		if err != nil {
 			return nil, err
 		}
-		if ok && slices.Contains(health.Signatures, stopSignature(runs[0])) {
-			out = append(out, c.ID)
+		if ok {
+			out = append(out, heldStop{c.ID, stopSignature(runs[0])})
 		}
 	}
 	return out, nil
 }
 
+// stoppedOn lists, of the stops held now, the cases a component-health case holds on one of its signatures, other than itself.
+func stoppedOn(stops []heldStop, health store.Case) []string {
+	var out []string
+	for _, s := range stops {
+		if s.caseID != health.ID && slices.Contains(health.Signatures, s.signature) {
+			out = append(out, s.caseID)
+		}
+	}
+	return out
+}
+
 // sweepHealth closes the component-health cases unseen past their retention, which no detector's sweep reaches (the
 // loop files them), but not one whose stop still holds a case (StoppedOn): closing it would never resume what it holds.
+// It reads the stops only when a case is past its retention, and once for them all.
 func (r *Runner) sweepHealth(ctx context.Context) ([]store.Case, error) {
-	cs, err := r.Store.Cases(ctx, store.CaseFilter{Family: store.HealthFamily, Statuses: []store.CaseStatus{store.CaseOpen, store.CaseInvestigating, store.CaseTesting}})
+	now := r.now()
+	quiet, err := r.Store.QuietCases(ctx, now, store.CaseRetention, store.HealthFamily)
+	if err != nil || len(quiet) == 0 {
+		return nil, err
+	}
+	stops, err := heldStops(ctx, r.Store)
 	if err != nil {
 		return nil, err
 	}
-	var holding []string
-	for _, c := range cs {
-		held, err := StoppedOn(ctx, r.Store, c)
-		if err != nil {
-			return nil, err
-		}
-		if len(held) > 0 {
-			holding = append(holding, c.ID)
+	var free []string
+	for _, h := range quiet {
+		if len(stoppedOn(stops, h)) == 0 {
+			free = append(free, h.ID)
 		}
 	}
-	return r.Store.SweepHealth(ctx, r.now(), store.CaseRetention, "loop:detect", holding)
+	return r.Store.SweepHealth(ctx, now, store.CaseRetention, "loop:detect", free)
 }
 
 // stopped applies the stop rule (stopRuns): a case whose last two runs failed the same way, in the same step, or whose

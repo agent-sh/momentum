@@ -3,8 +3,10 @@ package loop
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -364,6 +366,46 @@ func TestAFamilyWhoseStoreReadFailsStopsNoOtherFamilysBuildOrReview(t *testing.T
 		if _, why := turnStep(done, reviewed.ID, StepReview); !strings.Contains(why, "package") {
 			t.Fatalf("pass %d: owner-burden's reviews did not run: %q: %+v", pass, why, done)
 		}
+	}
+}
+
+// A component-health sweep that cannot read the stops (a case's stored row is unreadable) closes nothing that pass,
+// says so in the log, and holds none of the pass's other steps: the other family still builds, and the pass returns
+// the read error of the family whose case it is, as before.
+func TestAHealthSweepThatCannotReadTheStopsHoldsNoBuild(t *testing.T) {
+	r, cs := turnRunner(t, "owner-burden", "sessions")
+	ctx := context.Background()
+	var logged []string
+	r.Log = func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
+	quiet, _, err := r.Store.ObserveCase(ctx, store.Finding{Family: store.HealthFamily, Signature: "component-health/v1:loop:build:build-toolchains",
+		Title: "The loop fails the same way twice: build toolchains", Evidence: []store.Evidence{{Ref: "file:/runs/old", At: time.Now().Add(-time.Hour)}}}, "loop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", r.Store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	old := time.Now().Add(-store.CaseRetention - 24*time.Hour).UnixMilli()
+	if _, err := db.Exec(`UPDATE cases SET opened = ?, seen = ? WHERE id = ?`, old, old, quiet.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE cases SET alternatives = 'marker-7f3a' WHERE id = ?`, cs[1].ID); err != nil {
+		t.Fatal(err)
+	}
+	done, err := r.Once(ctx, Options{})
+	if err == nil || !strings.Contains(err.Error(), "alternatives") {
+		t.Fatalf("the pass did not return sessions' read error: %v", err)
+	}
+	if built, why := turnStep(done, cs[0].ID, StepBuild); !built {
+		t.Fatalf("owner-burden did not build: %q: %+v", why, done)
+	}
+	if got, err := r.Store.CaseByID(ctx, quiet.ID); err != nil || got.Status == store.CaseClosed {
+		t.Fatalf("a sweep that could not read the stops closed a case: %+v %v", got, err)
+	}
+	if !slices.ContainsFunc(logged, func(l string) bool { return strings.Contains(l, "component-health sweep closes nothing") }) {
+		t.Fatalf("the sweep's error is not logged: %q", logged)
 	}
 }
 

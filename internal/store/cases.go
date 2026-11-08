@@ -1503,19 +1503,38 @@ func (s *Store) SweepCases(ctx context.Context, now time.Time, retention time.Du
 	return s.sweepCases(ctx, now, retention, actor, families, nil)
 }
 
-// SweepHealth sweeps the component-health cases as SweepCases sweeps a detector's family: the loop files them, so no
-// detector's sweep reaches them. A case named in holding stays open: its stop still holds a case, and only its close as
-// fixed resumes what it holds (CloseFixed).
-func (s *Store) SweepHealth(ctx context.Context, now time.Time, retention time.Duration, actor string, holding []string) ([]Case, error) {
-	return s.sweepCases(ctx, now, retention, actor, []string{HealthFamily}, holding)
-}
-
-func (s *Store) sweepCases(ctx context.Context, now time.Time, retention time.Duration, actor string, families, keep []string) ([]Case, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+// QuietCases lists the cases of a family that a sweep at now would close (SweepCases): unseen past the retention, and
+// open as long since they opened or last came back.
+func (s *Store) QuietCases(ctx context.Context, now time.Time, retention time.Duration, family string) ([]Case, error) {
+	ids, err := quietIDs(ctx, s.db, now, retention, []string{family}, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	var out []Case
+	for _, id := range ids {
+		c, err := getCase(ctx, s.db, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// SweepHealth closes, as SweepCases closes a detector's family, the component-health cases named that are still
+// quiet at now: the loop files them, so no detector's sweep reaches them, and the loop names only the ones whose stop
+// holds no case, since only a close as fixed resumes what a stop holds (CloseFixed). None named closes none.
+func (s *Store) SweepHealth(ctx context.Context, now time.Time, retention time.Duration, actor string, ids []string) ([]Case, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return s.sweepCases(ctx, now, retention, actor, []string{HealthFamily}, ids)
+}
+
+// quietIDs lists the cases a sweep at now closes: open, investigating or testing, unseen past the retention and open
+// as long since they opened or last came back, of the families named (none named: every family), and of the ids in
+// only when it is not nil.
+func quietIDs(ctx context.Context, db querier, now time.Time, retention time.Duration, families, only []string) ([]string, error) {
 	cut := now.Add(-retention).UnixMilli()
 	q, args := `SELECT id FROM cases WHERE status IN (?,?,?) AND seen < ? AND MAX(opened, back) < ?`, []any{CaseOpen, CaseInvestigating, CaseTesting, cut, cut}
 	if len(families) > 0 {
@@ -1524,27 +1543,39 @@ func (s *Store) sweepCases(ctx context.Context, now time.Time, retention time.Du
 			args = append(args, f)
 		}
 	}
-	if len(keep) > 0 {
-		q += ` AND id NOT IN (?` + strings.Repeat(",?", len(keep)-1) + `)`
-		for _, id := range keep {
+	if only != nil {
+		if len(only) == 0 {
+			return nil, nil
+		}
+		q += ` AND id IN (?` + strings.Repeat(",?", len(only)-1) + `)`
+		for _, id := range only {
 			args = append(args, id)
 		}
 	}
-	rows, err := tx.QueryContext(ctx, q, args...)
+	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			rows.Close()
 			return nil, err
 		}
 		ids = append(ids, id)
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	return ids, rows.Err()
+}
+
+func (s *Store) sweepCases(ctx context.Context, now time.Time, retention time.Duration, actor string, families, only []string) ([]Case, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	ids, err := quietIDs(ctx, tx, now, retention, families, only)
+	if err != nil {
 		return nil, err
 	}
 	var out []Case

@@ -390,6 +390,38 @@ func TestTheSweepClosesACaseUnseenPastItsRetention(t *testing.T) {
 	}
 }
 
+// The component-health sweep closes only the quiet cases the loop names: none named closes none, and a named case
+// that is not past its retention stays open.
+func TestTheHealthSweepClosesOnlyTheQuietCasesNamed(t *testing.T) {
+	st := caseStore(t)
+	ctx := context.Background()
+	old := time.Now().Add(-40 * 24 * time.Hour)
+	var quiet []Case
+	for _, sig := range []string{"a", "b"} {
+		c, _ := observeOK(t, st, Finding{Family: HealthFamily, Signature: sig, Title: sig, Evidence: refsAt(sig, 1, old)})
+		quiet = append(quiet, c)
+	}
+	fresh, _ := observeOK(t, st, Finding{Family: HealthFamily, Signature: "fresh", Title: "fresh", Evidence: refsAt("f", 1, time.Now())})
+	if _, err := st.db.ExecContext(ctx, `UPDATE cases SET opened = ? WHERE id IN (?, ?)`, old.UnixMilli(), quiet[0].ID, quiet[1].ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := st.QuietCases(ctx, time.Now(), CaseRetention, HealthFamily); err != nil || len(got) != 2 {
+		t.Fatalf("the quiet component-health cases: %+v %v", got, err)
+	}
+	if swept, err := st.SweepHealth(ctx, time.Now(), CaseRetention, "loop:test", nil); err != nil || len(swept) != 0 {
+		t.Fatalf("a sweep that named no case closed %+v %v", swept, err)
+	}
+	swept, err := st.SweepHealth(ctx, time.Now(), CaseRetention, "loop:test", []string{quiet[0].ID, fresh.ID})
+	if err != nil || len(swept) != 1 || swept[0].ID != quiet[0].ID || swept[0].Reason != Insufficient {
+		t.Fatalf("swept %+v %v", swept, err)
+	}
+	for _, id := range []string{quiet[1].ID, fresh.ID} {
+		if c, _ := st.CaseByID(ctx, id); c.Status == CaseClosed {
+			t.Errorf("%s swept", c.Title)
+		}
+	}
+}
+
 // A case brought back has its retention from then, not from when it first opened: brought back on old evidence,
 // the next sweep leaves it.
 func TestACaseBroughtBackHasItsRetentionFromThen(t *testing.T) {
