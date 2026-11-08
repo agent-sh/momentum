@@ -913,8 +913,16 @@ func TestKimiClientNoticesAreGeneratedInput(t *testing.T) {
 	// space inside what Kimi fills in.
 	periodRunOn := endsInPeriod + " marker-7f3a after" + tail
 	quoteRunOn := endsInQuote + " marker-7f3a after \"marker-7f3a mine.heic\" uses unsupported image format image/heic" + tail
+	// A run of periods or quotes may come inside what Kimi fills in or at its end, and a type may be periods alone: a
+	// data URL such as data:..;base64,QUJD has no known magic bytes, so its declared type stays.
+	typeRun := named("marker-7f3a run.foo", "image/a..b", four)
+	typeEndsInRun := named("marker-7f3a twice.foo", "image/foo..", four)
+	nameRun := named("marker-7f3a pair\"\"b.heic", "image/heic", four)
+	nameEndsInRun := named("marker-7f3a closes\"\"", "image/heic", four)
+	onlyPeriods := "[Image omitted: unsupported image format .." + tail
 	labels := []string{"marker-7f3a typed", "marker-7f3a a.txt", "marker-7f3a shot", "marker-7f3a bad", "marker-7f3a mine", "Image omitted: unsupported",
-		"marker-7f3a after", "marker-7f3a ends", "marker-7f3a dot", "marker-7f3a icon", "marker-7f3a q", "marker-7f3a seven"}
+		"marker-7f3a after", "marker-7f3a ends", "marker-7f3a dot", "marker-7f3a icon", "marker-7f3a q", "marker-7f3a seven", "marker-7f3a run",
+		"marker-7f3a twice", "marker-7f3a pair", "marker-7f3a closes"}
 	generated := func(label string) map[string]string {
 		return map[string]string{"marker-7f3a typed": "owner owner_text", label: "harness harness_text"}
 	}
@@ -966,6 +974,16 @@ func TestKimiClientNoticesAreGeneratedInput(t *testing.T) {
 			[]string{"marker-7f3a typed"}},
 		{"a named notice with seven accepted formats", plain, []any{text("marker-7f3a typed"), text(seven)}, generated("marker-7f3a seven"),
 			[]string{"marker-7f3a typed"}},
+		{"a named notice whose type holds a run of periods", plain, []any{text("marker-7f3a typed"), text(typeRun)}, generated("marker-7f3a run"),
+			[]string{"marker-7f3a typed"}},
+		{"a named notice whose type ends in a run of periods", plain, []any{text("marker-7f3a typed"), text(typeEndsInRun)},
+			generated("marker-7f3a twice"), []string{"marker-7f3a typed"}},
+		{"a named notice whose name holds a run of quotes", plain, []any{text("marker-7f3a typed"), text(nameRun)}, generated("marker-7f3a pair"),
+			[]string{"marker-7f3a typed"}},
+		{"a named notice whose name ends in a run of quotes", plain, []any{text("marker-7f3a typed"), text(nameEndsInRun)},
+			generated("marker-7f3a closes"), []string{"marker-7f3a typed"}},
+		{"an unsupported image notice with no name whose type is periods alone", plain, []any{text("marker-7f3a typed"), text(onlyPeriods)},
+			generated("Image omitted: unsupported"), []string{"marker-7f3a typed"}},
 		{"a notice whose type ends in a period, his words and its fixed words again", plain, []any{text("marker-7f3a typed"), text(periodRunOn)},
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a dot": "owner owner_text", "marker-7f3a after": "owner owner_text"},
 			[]string{"marker-7f3a typed " + periodRunOn}},
