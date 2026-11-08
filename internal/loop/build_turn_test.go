@@ -12,8 +12,9 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// turnRunner is a live runner with one testing case in each family, in that order, whose builds the host refuses
-// after their reservation (a toolchain that is absent), so each build that takes the pass's slot fails.
+// turnRunner is a live runner with one testing case in each family, in that order, whose builds fail after their
+// reservation, before their agent starts, as the broker's (its env file cannot be read): each build that takes the
+// pass's slot fails at no cost, and the stop rule never counts it, so a case builds pass after pass.
 func turnRunner(t *testing.T, families ...string) (*Runner, []store.Case) {
 	t.Helper()
 	fakeManager(t)
@@ -22,7 +23,8 @@ func turnRunner(t *testing.T, families ...string) (*Runner, []store.Case) {
 	r.Ship = shipWithSandbox(r.Store, f, Sandbox{})
 	r.Ship.Dir = r.Dir
 	r.Inputs.ReadDirs = []string{f.main}
-	r.Toolchains.ReadOnly = []string{filepath.Join(t.TempDir(), "absent")}
+	r.Agent = Agent{Runner: []string{script(t, t.TempDir(), "harness", "exit 9")}, Model: "global.anthropic.claude-opus-5-5",
+		Bedrock: &Bedrock{File: filepath.Join(t.TempDir(), "absent.env")}}
 	r.Families = families
 	ctx := context.Background()
 	mechanism, fix := "One cause", "One test"
@@ -142,8 +144,8 @@ func TestAHeldBuildPassesThePassBuildToTheNextFamily(t *testing.T) {
 }
 
 // With room for one run a pass, the build and the run turn take the passes in turn, though every build fails before
-// its agent starts (an absent toolchain: a run recorded unstarted at no cost, which the stop rule does not count): the
-// other family's investigation runs every other pass. A store with no single turn yet serves the run turn first.
+// its agent starts (the broker's: a run recorded unstarted at no cost, which the stop rule does not count): the other
+// family's investigation runs every other pass. A store with no single turn yet serves the run turn first.
 func TestARoomForOneRunAlternatesTheBuildAndTheRunTurn(t *testing.T) {
 	r, cs := turnRunner(t, "owner-burden")
 	open := openCase(t, r.Store, "sessions", "marker-7f3a-open", 1)
