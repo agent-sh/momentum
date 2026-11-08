@@ -434,21 +434,33 @@ func (r *Runner) build(ctx context.Context, c store.Case, run store.LoopRun) (Re
 	}
 	// the gate waits in the build's own turn, beside the other families' runs, so its wait holds no other run; while
 	// it waits, a marker in the host directory tells endStale the agent never started, if the process dies there
+	// The marker stays until the agent is about to start; a hold's goes with the run's directories once its reservation
+	// is released (completeStep), so a process that dies anywhere before the agent ends the run at no cost.
 	waiting := filepath.Join(HostDir(run.Dir), gateWaitMarker)
+	unmark := func() {
+		if err := os.Remove(waiting); err != nil && !os.IsNotExist(err) {
+			r.logf("build %s: the gate's wait marker: %v", c.ID, err)
+		}
+	}
 	if err := writeOwn(waiting, nil); err != nil {
 		r.logf("build %s: the gate's wait marker: %v", c.ID, err)
 	}
-	err = r.Ship.Sandbox.room(ctx)
-	os.Remove(waiting)
-	if err != nil {
-		if !held(err) && ctx.Err() == nil {
-			r.logf("build %s: the capacity gate failed before its agent: %v", c.ID, err)
+	if err := r.Ship.Sandbox.room(ctx); err != nil {
+		if !held(err) {
+			unmark() // no hold: the run ends now, at no cost and with no start
+			if ctx.Err() == nil {
+				r.logf("build %s: the capacity gate failed before its agent: %v%s", c.ID, err, gateWords(err))
+				if err := r.endCapacityNote(ctx, c.ID, gateBroke); err != nil {
+					r.logf("capacity note of %s: %v", c.ID, err)
+				}
+			}
 		}
 		return stageFailureIn(ctx, Result{}, "build check", err)
 	}
-	if err := r.endCapacityNote(ctx, c.ID); err != nil {
+	if err := r.endCapacityNote(ctx, c.ID, roomFound); err != nil {
 		r.logf("capacity note of %s: %v", c.ID, err)
 	}
+	unmark()
 	res, err := r.Agent.RunOrFallback(ctx, inv)
 	res.InputSummary = manifest.Summary()
 	if brokerOutage(res, err) {

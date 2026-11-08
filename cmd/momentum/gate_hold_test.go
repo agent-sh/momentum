@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/config"
+	"github.com/agent-sh/momentum/internal/loop"
 )
 
 // The loop's capacity gate (setupShip) on a gate program that is not there is no hold: a check that waits at it fails
@@ -36,7 +37,10 @@ func TestTheRealGateHoldsOnItsHoldExitsAndItsDeadline(t *testing.T) {
 		return err
 	}
 	isHold := func(err error) bool { return fmt.Sprintf("%T", err) == "*loop.shipHold" }
-	if err := run(nil, "echo 'load 9 of 4' >&2; exit 1"); !isHold(err) || !strings.Contains(err.Error(), "it said: load 9 of 4") {
+	// what the gate printed is the loop's to log and note, never in the error's text, which becomes case lines
+	err := run(nil, "echo 'load 9 of 4' >&2; exit 1")
+	var said *loop.GateSaid
+	if !isHold(err) || !errors.As(err, &said) || said.Said != "load 9 of 4" || strings.Contains(err.Error(), "load 9") {
 		t.Fatalf("exit 1 with no hold exits configured: %T %v", err, err)
 	}
 	if err := run(nil, "exit 4"); err == nil || isHold(err) {

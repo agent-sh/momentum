@@ -239,3 +239,26 @@ func TestNoComparedTasksHaveUndefinedPassRatesAndKeepErrors(t *testing.T) {
 		t.Fatal("undefined pass rate did not serialize as null")
 	}
 }
+
+// A trial's case file leaves out the charge receipts of held builds, as a live run's does.
+func TestATrialsCaseFileLeavesOutHoldReceipts(t *testing.T) {
+	e, task, in := preparedEval(t)
+	st := testStore(t)
+	ctx := context.Background()
+	c, _, err := st.ObserveCase(ctx, store.Finding{Family: task.Family, Signature: "fixture", Title: task.CaseTitle,
+		Evidence: []store.Evidence{{Ref: "file:/t/fixture", At: in.end.Add(-time.Minute)}}}, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CaseNote(ctx, c.ID, store.ActionLoopHold, `{"usd":1.5}`, "loop:fixture"); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "run")
+	if _, err := e.trialInvocation(ctx, in, task, c, st, dir, e.arms()[0]); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(HostDir(dir), "input", "case.json"))
+	if err != nil || strings.Contains(string(raw), store.ActionLoopHold) {
+		t.Fatalf("a trial's case file carries a hold receipt: %v %s", err, raw)
+	}
+}

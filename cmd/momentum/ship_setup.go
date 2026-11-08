@@ -155,16 +155,14 @@ var (
 	gateWaitDelay = 5 * time.Second
 )
 
-// gateSaid is the end of what the capacity gate printed, on one line, for the loop's note of the hold or failure.
+// gateSaid is the end of what the capacity gate printed, on one line, for the loop's log and capacity note
+// (loop.GateSaid): never in the error's text, which becomes case lines.
 func gateSaid(out []byte) string {
 	text := strings.Join(strings.Fields(string(out)), " ")
-	if text == "" {
-		return ""
-	}
 	if r := []rune(text); len(r) > 300 {
 		text = "..." + string(r[len(r)-300:])
 	}
-	return " (it said: " + text + ")"
+	return text
 }
 
 func setupShip(st *store.Store, sources config.Sources) *loop.Ship {
@@ -190,7 +188,7 @@ func setupShip(st *store.Store, sources config.Sources) *loop.Ship {
 				// its own deadline ended the wait: the machine had no room all that time, which the loop holds on
 				err = fmt.Errorf("its wait passed %s: %w", gateTimeout, context.DeadlineExceeded)
 			}
-			return fmt.Errorf("the capacity gate %s: %w%s", filepath.Base(c.CapacityGate[0]), err, gateSaid(out))
+			return &loop.GateSaid{Err: fmt.Errorf("the capacity gate %s: %w", filepath.Base(c.CapacityGate[0]), err), Said: gateSaid(out)}
 		}
 	}
 	gate := configGate(c)

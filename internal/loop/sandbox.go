@@ -189,6 +189,26 @@ type Sandbox struct {
 	HoldExits []int
 }
 
+// GateSaid is a capacity gate's error with what the gate printed. The printed words stay out of the error's text, which
+// becomes case lines (a landing's "not landed") whose dedupe a gate's changing numbers would defeat; they go to the
+// log and the capacity note only (gateWords).
+type GateSaid struct {
+	Err  error
+	Said string // what the gate printed, on one line, clipped
+}
+
+func (e *GateSaid) Error() string { return e.Err.Error() }
+func (e *GateSaid) Unwrap() error { return e.Err }
+
+// gateWords is what a capacity gate printed, as " (it said: ...)", or "" when it printed nothing or err is no gate's.
+func gateWords(err error) string {
+	var said *GateSaid
+	if errors.As(err, &said) && said.Said != "" {
+		return " (it said: " + said.Said + ")"
+	}
+	return ""
+}
+
 // busyMachine is a gate that ran and said the machine has no room for a test now: the build holds (a shipHold), and its
 // note says so (Runner.noteCapacityHold).
 type busyMachine struct{ err error }

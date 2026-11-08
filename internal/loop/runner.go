@@ -543,7 +543,9 @@ func (r *Runner) buildSkipped(ctx context.Context, c store.Case, stage string, c
 	switch {
 	case errors.As(cause, &busy):
 		if ctx.Err() == nil {
-			if err := r.noteCapacityHold(ctx, c, cause.Error()); err != nil {
+			why := cause.Error() + gateWords(cause)
+			r.logf("build of %s waits for room for its check: %s", c.ID, why)
+			if err := r.noteCapacityHold(ctx, c, why); err != nil {
 				r.logf("build waiting note: %v", err)
 			}
 		}
@@ -644,12 +646,13 @@ const (
 	proposalRead    = "It ended: its proposal branch was read."
 	caseLeftTesting = "It ended: the case left testing."
 	roomFound       = "It ended: a later build of the case went on to its agent."
+	gateBroke       = "It ended: the capacity gate failed, which counts as the host's error at the check."
 )
 
 // holdNoteEnded says whether a base, proposal or capacity note says its hold ended (endHoldNotes).
 func holdNoteEnded(n store.Note) bool {
 	return strings.HasSuffix(n.Detail, baseFetched) || strings.HasSuffix(n.Detail, proposalRead) || strings.HasSuffix(n.Detail, caseLeftTesting) ||
-		strings.HasSuffix(n.Detail, roomFound)
+		strings.HasSuffix(n.Detail, roomFound) || strings.HasSuffix(n.Detail, gateBroke)
 }
 
 // capacityNoteID is the note of a case's builds held because the machine has no room for their check.
@@ -692,13 +695,14 @@ func (r *Runner) noteCapacityHold(ctx context.Context, c store.Case, why string)
 	return err
 }
 
-// endCapacityNote ends a case's capacity note once a build of the case found room for its check.
-func (r *Runner) endCapacityNote(ctx context.Context, caseID string) error {
+// endCapacityNote ends a case's capacity note, as why says: a later build of the case went on to its agent, or the
+// gate failed (a failure the stop rule counts, which no longer waits for room).
+func (r *Runner) endCapacityNote(ctx context.Context, caseID, why string) error {
 	n, ok, err := r.Store.Note(ctx, capacityNoteID(caseID))
 	if err != nil || !ok {
 		return err
 	}
-	return endHoldNotes(ctx, r.Store, r.now(), []store.Note{n}, n.ID, roomFound)
+	return endHoldNotes(ctx, r.Store, r.now(), []store.Note{n}, n.ID, why)
 }
 
 // endBaseNotes ends a case's notes of builds held for their base, once their hold ended (why: a build fetched its
@@ -1364,7 +1368,7 @@ func (r *Runner) completeStep(ctx context.Context, c store.Case, run store.LoopR
 	if res.InputSummary == "" {
 		res.InputSummary = run.Summary
 	}
-	r.finish(ctx, c, &run, res, err)
+	recordErr := r.finish(ctx, c, &run, res, err)
 	if run.Step == StepBuild && held(err) {
 		stage := "ship"
 		var staged *buildStageError
@@ -1372,9 +1376,10 @@ func (r *Runner) completeStep(ctx context.Context, c store.Case, run store.LoopR
 			stage = strings.TrimPrefix(staged.key, "build ")
 		}
 		done := r.buildSkipped(ctx, c, stage, err)
-		if heldBeforeAgent(res, err) {
-			// a build held at the capacity gate before its agent leaves nothing: its tree goes back to the case, and its
-			// run's directories go, as an unreserved build's do
+		if heldBeforeAgent(res, err) && recordErr == nil {
+			// a build held at the capacity gate before its agent leaves nothing once its reservation is released: its
+			// tree goes back to the case, and its run's directories go, as an unreserved build's do. A release that
+			// failed keeps them, the gate's wait marker among them, so endStale ends the reservation at no cost.
 			r.removeRunDirs(ctx, c.ID, run.Dir, true)
 		}
 		return done
@@ -1382,8 +1387,8 @@ func (r *Runner) completeStep(ctx context.Context, c store.Case, run store.LoopR
 	return Done{Family: c.Family, Case: c.ID, Step: run.Step, Run: run, Refused: res.Refused}
 }
 
-// finish records how a run ended, on the run and on its case.
-func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, res Result, err error) {
+// finish records how a run ended, on the run and on its case, and returns the store's error when it could not.
+func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, res Result, err error) error {
 	reserved := run.USD
 	if reserved == 0 {
 		reserved = r.Budgets.Run
@@ -1465,8 +1470,8 @@ func (r *Runner) finish(ctx context.Context, c store.Case, run *store.LoopRun, r
 	}
 	if recordErr != nil {
 		r.logf("record run %s: %v", run.ID, recordErr)
-		return
 	}
+	return recordErr
 }
 
 // keepFindings records an investigation's findings into its case, and logs why when it records nothing.

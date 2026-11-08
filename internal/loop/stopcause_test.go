@@ -1303,7 +1303,7 @@ func TestACapacityHoldIsNotedAndRaisedAfterADay(t *testing.T) {
 	if first.Importance != store.ImportanceNormal || !first.Done.IsZero() || !strings.Contains(first.Detail, "load 7") {
 		t.Fatalf("a hold a day old: %+v", first)
 	}
-	if err := r.endCapacityNote(ctx, c.ID); err != nil {
+	if err := r.endCapacityNote(ctx, c.ID, roomFound); err != nil {
 		t.Fatal(err)
 	}
 	if n := note(); n.Done.IsZero() || !strings.HasSuffix(n.Detail, roomFound) {
@@ -1660,5 +1660,201 @@ func TestRefusalsThatTakeTurnsStopThroughFinish(t *testing.T) {
 	}
 	if why, err := r.stopped(ctx, c, true); err != nil || !strings.HasPrefix(why, "two of its build runs were refused for one cause: build propose: refused: the patch's unit") {
 		t.Fatalf("A, B, A: %q %v", why, err)
+	}
+}
+
+// busyRunner is inputRunner's case in testing with a repository, on its own store file (path), whose capacity gate says
+// the machine has no room while *busy holds, or exits with code otherwise when it is not 0.
+func busyRunner(t *testing.T, busy *bool, code *int) (*Runner, store.Case, string) {
+	t.Helper()
+	fakeManager(t) // host ordering only: no unit or model starts
+	goodInputScrubber(t)
+	st, path := testStoreAt(t)
+	r := localRunner(t, st)
+	r.Inputs = InputOptions{Home: t.TempDir(), TacitStore: inputRepo(t, t.TempDir(), "facts"), Momentum: script(t, t.TempDir(), "records", "printf 'marker-7f3a record\\n'")}
+	c := openCase(t, st, "failures", "marker-7f3a", 1)
+	f := newRepo(t, nil)
+	r.Ship = shipWithSandbox(r.Store, f, Sandbox{Gate: func(ctx context.Context) error {
+		exit := 0
+		switch {
+		case *busy:
+			exit = 1
+		case code != nil:
+			exit = *code
+		}
+		if exit == 0 {
+			return nil
+		}
+		if err := exec.CommandContext(ctx, "sh", "-c", fmt.Sprint("exit ", exit)).Run(); err != nil {
+			return fmt.Errorf("the capacity gate: %w", err)
+		}
+		return nil
+	}})
+	r.Ship.Dir = r.Dir
+	r.Inputs.ReadDirs = []string{f.main}
+	mechanism, fix := "one cause", "one fix"
+	var err error
+	if c, err = r.Store.UpdateCase(context.Background(), c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	setCaseRepo(t, r.Store, c, "main")
+	return r, c, path
+}
+
+// A build held at the gate whose reservation the store will not release is charged nothing: its directories stay,
+// the gate's wait marker among them, and the next pass past the run's time ends its reservation at no cost.
+func TestAHoldWhoseReleaseFailsIsChargedNothing(t *testing.T) {
+	ctx := context.Background()
+	busy := true
+	r, c, path := busyRunner(t, &busy, nil)
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TRIGGER refuse_release BEFORE DELETE ON loop_runs BEGIN SELECT RAISE(ABORT, 'the release fails'); END`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID})
+	if err != nil || len(done) == 0 || !strings.HasPrefix(done[0].Skipped, "build check: the machine has no room") {
+		t.Fatalf("the held pass: %+v %v", done, err)
+	}
+	runs, err := r.Store.LoopRuns(ctx, store.RunFilter{Case: c.ID})
+	if err != nil || len(runs) != 1 || runs[0].Status != store.RunRunning {
+		t.Fatalf("the reservation the store would not release: %+v %v", runs, err)
+	}
+	if _, err := os.Lstat(filepath.Join(HostDir(runs[0].Dir), gateWaitMarker)); err != nil {
+		t.Fatalf("a hold whose release failed lost its directories or its wait marker: %v", err)
+	}
+	if _, err := os.Lstat(runs[0].Dir); err != nil {
+		t.Fatalf("a hold whose release failed lost its run directory: %v", err)
+	}
+	r.Now = func() time.Time { return time.Now().Add(r.Budgets.RunTime + time.Minute) }
+	if err := r.endStale(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.Store.LoopRunByID(ctx, runs[0].ID)
+	cs, _ := r.Store.CaseByID(ctx, c.ID)
+	if err != nil || got.Failure != "killed" || got.USD != 0 || cs.Cost.USD != 0 || cs.Cost.Runs != 0 {
+		t.Fatalf("a hold whose release failed was charged: %+v, case %+v, %v", got, cs.Cost, err)
+	}
+}
+
+// A case whose gate breaks while it waited for room ends its capacity note when the gate fails, as the host's error the
+// stop rule counts: once stopped on its broken gate, it no longer says it waits for room.
+func TestABrokenGateEndsTheCapacityNote(t *testing.T) {
+	ctx := context.Background()
+	busy, broken := true, 4
+	r, c, _ := busyRunner(t, &busy, &broken)
+	if done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID}); err != nil || len(done) != 1 || done[0].Run.ID != "" {
+		t.Fatalf("the held pass: %+v %v", done, err)
+	}
+	busy = false
+	for i := 0; i < 2; i++ {
+		if done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID}); err != nil || len(done) != 1 || done[0].Run.Failure != "build check" {
+			t.Fatalf("broken gate %d: %+v %v", i, done, err)
+		}
+	}
+	if done, err := r.Once(ctx, Options{Families: []string{c.Family}, Case: c.ID}); err != nil || len(done) != 1 || !strings.Contains(done[0].Skipped, "stopped") {
+		t.Fatalf("the stopped pass: %+v %v", done, err)
+	}
+	n, ok, err := r.Store.Note(ctx, capacityNoteID(c.ID))
+	if err != nil || !ok || n.Done.IsZero() || !strings.HasSuffix(n.Detail, gateBroke) || !holdNoteEnded(n) {
+		t.Fatalf("the capacity note of a case stopped on its broken gate: %+v %v %v", n, ok, err)
+	}
+}
+
+// What a capacity gate printed stays out of its error's text, which becomes case lines (a landing's "not landed"):
+// two busy passes whose gate printed different numbers give one text, so the line is written once. The words go to the
+// capacity note.
+func TestTheGatesWordsStayOutOfItsError(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "words", 1)
+	said := ""
+	gate := Sandbox{Gate: func(ctx context.Context) error {
+		if err := exec.CommandContext(ctx, "false").Run(); err != nil {
+			return &GateSaid{Err: fmt.Errorf("the capacity gate: %w", err), Said: said}
+		}
+		return nil
+	}}
+	var texts []string
+	for _, words := range []string{"load 5 of 4", "load 6 of 4"} {
+		said = words
+		_, err := gate.Run(ctx, t.TempDir(), []string{"go", "test", "./..."}, nil)
+		if !held(err) || strings.Contains(err.Error(), "load") {
+			t.Fatalf("a busy gate's error: %v", err)
+		}
+		texts = append(texts, err.Error())
+		if err := r.caseNoteOnce(ctx, c.ID, "not landed", err.Error()); err != nil {
+			t.Fatal(err)
+		}
+		r.buildSkipped(ctx, c, "check", &buildStageError{key: "build check", err: err})
+	}
+	if texts[0] != texts[1] {
+		t.Fatalf("two busy passes gave two texts: %q", texts)
+	}
+	log, err := st.CaseLog(ctx, c.ID)
+	lines := 0
+	for _, e := range log {
+		if e.Action == "not landed" {
+			lines++
+		}
+	}
+	if err != nil || lines != 1 {
+		t.Fatalf("%d not landed lines: %v", lines, err)
+	}
+	if n, ok, err := st.Note(ctx, capacityNoteID(c.ID)); err != nil || !ok || !strings.Contains(n.Detail, "it said: load 6 of 4") {
+		t.Fatalf("the capacity note lost the gate's words: %+v %v %v", n, ok, err)
+	}
+}
+
+// A run that never started and is no host failure (a reservation that could not be read) is no run for the stop
+// rule: two agent failures around it stop the case.
+func TestARunThatNeverStartedDoesNotHideAgentFailures(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "locked", 1)
+	base := time.Now().Add(-time.Hour)
+	putBuild(t, st, c, "u1", StepBuild, store.RunTurns, "turns", "", "turns", base)
+	putBuild(t, st, c, "u2", StepBuild, store.RunTurns, "turns", "", "turns", base.Add(time.Minute))
+	if err := st.PutLoopRun(ctx, store.LoopRun{ID: "u3", Case: c.ID, Family: c.Family, Step: StepBuild, Ended: base.Add(2 * time.Minute),
+		Status: store.RunFailed, Failure: "reservation: database is locked"}); err != nil {
+		t.Fatal(err)
+	}
+	if why, err := r.stopped(ctx, c, true); err != nil || why != "its last two build runs failed the same way: turns" {
+		t.Fatalf("two agent failures under a run that never started: %q %v", why, err)
+	}
+}
+
+// A paid hold after the agent (here its ship lock, at propose) keeps its run's directories, the transcript among them:
+// only a hold before the agent, which spent nothing, removes them.
+func TestAPaidHoldKeepsItsDirectories(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	c := openCase(t, st, "failures", "paid-hold", 1)
+	run, why := r.reserve(ctx, c.Family, c.ID, StepBuild)
+	if why != "" {
+		t.Fatal(why)
+	}
+	transcript := filepath.Join(HostDir(run.Dir), "transcript.jsonl")
+	write(t, transcript, "{}\n")
+	write(t, filepath.Join(run.Dir, "out", "report.json"), "{}")
+	res := Result{Started: true, CostKnown: true, Status: store.RunOK, RelayAdmitted: 3, RelayCharged: 3, RelayUSD: 1.5}
+	lock := &buildStageError{key: "build propose", err: &shipHold{err: errors.New("the case's ship lock is held")}}
+	if done := r.completeStep(ctx, c, run, res, lock); done.Run.ID != "" || done.Skipped == "" {
+		t.Fatalf("the paid hold: %+v", done)
+	}
+	if _, err := os.Lstat(transcript); err != nil {
+		t.Fatalf("a paid hold lost its transcript: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(run.Dir, "out", "report.json")); err != nil {
+		t.Fatalf("a paid hold lost its run directory: %v", err)
+	}
+	if cs, err := st.CaseByID(ctx, c.ID); err != nil || cs.Cost.USD != 1.5 {
+		t.Fatalf("a paid hold's charge: %+v %v", cs.Cost, err)
 	}
 }
