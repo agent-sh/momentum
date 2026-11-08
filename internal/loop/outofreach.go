@@ -81,9 +81,12 @@ func outOfReachReport(report BuildReport) (BuildReport, error) {
 
 // outOfReach is a build's out-of-reach answer, after its authority check: a path no change may touch holds the case
 // for a person (holdForPerson) and the run keeps its own outcome; one a change may touch, or one BASE does not hold, is
-// the build's refusal at its report. BASE that cannot be read is the host's error at the check, and a hold the store
+// the build's refusal at its report, as is any answer of a configuration build, which changes its one file. BASE that cannot be read is the host's error at the check, and a hold the store
 // cannot record the host's error at the proposal.
 func (r *Runner) outOfReach(ctx context.Context, c store.Case, run store.LoopRun, res Result, p Package, o OutOfReach) (Result, error) {
+	if p.Kind == KindConfig {
+		return stageFailureIn(ctx, res, "build report", refused("a configuration build changes its file and answers no out-of-reach path"))
+	}
 	why, refusal, err := r.unreachable(ctx, p, o.Path)
 	switch {
 	case err != nil:

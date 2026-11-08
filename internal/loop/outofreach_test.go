@@ -585,3 +585,14 @@ func TestAnOutOfReachBuildDoesNotSplitTwoAgentFailures(t *testing.T) {
 		t.Fatalf("turns, out of reach, turns did not stop the case: %q %v", why, err)
 	}
 }
+
+// A configuration build changes its one file: an out-of-reach answer from one is its refusal at its report, before
+// the host reads anything.
+func TestAConfigurationBuildAnswersNoOutOfReachPath(t *testing.T) {
+	r := &Runner{}
+	res, err := r.outOfReach(context.Background(), store.Case{ID: "c00000000"}, store.LoopRun{}, Result{Status: store.RunOK},
+		Package{Kind: KindConfig}, OutOfReach{Path: ".github/workflows/ci.yml", Fix: outOfReachFix})
+	if err != nil || res.Status != store.RunFailed || res.Failure != "build report" || !strings.Contains(res.Text, "a configuration build changes its file") {
+		t.Fatalf("a configuration build's out-of-reach answer: %+v %v", res, err)
+	}
+}

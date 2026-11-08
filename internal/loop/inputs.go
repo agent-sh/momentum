@@ -321,7 +321,9 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 		}
 		prompt = strings.ReplaceAll(prompt, "/work is empty scratch and the working directory.", "/work is the build tree at BASE and the working directory.")
 		prompt = strings.ReplaceAll(prompt, "Return a report with mechanism, alternatives ruled out, fix and summary. Build no change.", "Return summary, test_command, title, body, rollback, signal, window and lesson. test_command is the program and its arguments, such as [\"go\", \"test\", \"./...\"], which the host runs in the sandbox. window is a duration, such as 7d. signal names source, kinds, match and optional tool and harness.")
-		prompt += "\n" + outOfReachBrief
+		if p.Kind != KindConfig { // a configuration build changes its one file: it has no path out of reach
+			prompt += "\n" + outOfReachBrief
+		}
 		if n := len(p.Reviews); n > 0 {
 			extra["review.md"] = p.Reviews[n-1].Text
 		}
