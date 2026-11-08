@@ -721,9 +721,20 @@ func TestKimiSystemBlocksAreGeneratedInput(t *testing.T) {
 		// A string prompt is the input's one part with no meta.source: a hook's part beside it does not count.
 		{"an editor context closing a string prompt with a hook's part", []any{map[string]any{"type": "text", "text": "hook output",
 			"meta": map[string]any{"source": "user prompt submit hook"}}, text("marker-7f3a typed\n" + context)}, split, []string{"marker-7f3a typed"}},
+		// A note is a client's only right before its image.
+		{"a note part with no image after it", []any{text("marker-7f3a typed"), note},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a note": "owner owner_text"}, []string{"marker-7f3a typed " + noteText}},
+		{"a note part before his words", []any{text("marker-7f3a typed"), note, text("marker-7f3a after")},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a note": "owner owner_text", "marker-7f3a after": "owner owner_text"},
+			[]string{"marker-7f3a typed " + noteText + " marker-7f3a after"}},
+		{"a note opening his part before an image", []any{text("marker-7f3a typed"), text(noteText + " marker-7f3a after"), image},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a note": "owner owner_text", "marker-7f3a after": "owner owner_text"},
+			[]string{"marker-7f3a typed " + noteText + " marker-7f3a after"}},
+		{"a note part after his image", []any{text("marker-7f3a typed"), image, note},
+			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a note": "owner owner_text"}, []string{"marker-7f3a typed " + noteText}},
 		// A note part whose closing tag is on the next line is no note of a client's: they write theirs on one.
 		{"a note part closed on the next line", []any{text("marker-7f3a typed"),
-			text(open + "Image compressed to fit model limits: marker-7f3a note\n" + end)},
+			text(open + "Image compressed to fit model limits: marker-7f3a note\n" + end), image},
 			map[string]string{"marker-7f3a typed": "owner owner_text", "marker-7f3a note": "owner owner_text"},
 			[]string{"marker-7f3a typed " + open + "Image compressed to fit model limits: marker-7f3a note " + end}},
 		{"a system block he typed or pasted", []any{text("marker-7f3a typed " + pasted)},
@@ -753,14 +764,49 @@ func TestKimiSystemBlocksAreGeneratedInput(t *testing.T) {
 	}
 }
 
+// The TUI joins the text parts of a steered or queued prompt (combineSteerInput): an image's note, written as a text
+// part of its own right before the image, then ends the text part before it, after his words. It is generated input
+// there too.
+func TestKimiSteeredNoteIsGeneratedInput(t *testing.T) {
+	open, end := "<"+"system>", "</"+"system>"
+	text := func(s string) map[string]any { return map[string]any{"type": "text", "text": s} }
+	image := map[string]any{"type": "image_url", "imageUrl": map[string]any{"url": "file:///neutral.png"}}
+	note := open + "Image compressed to fit model limits: marker-7f3a note, original 4000x3000 -> sent 2000x1500. Fine detail may be lost." + end
+	labels := []string{"marker-7f3a note", "marker-7f3a typed"}
+	want := map[string]string{"marker-7f3a note": "harness harness_text", "marker-7f3a typed": "owner owner_text"}
+	for _, tc := range []struct {
+		name  string
+		input []any
+	}{
+		{"his words and the note joined before its image", []any{text("marker-7f3a typed " + note), image}},
+		{"two items joined, the second's note before its image", []any{text("marker-7f3a typed\n\n" + note), image}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed", "agents", "main", "wire.jsonl")
+			writeJSONLines(t, path, kimiRecord("turn.steer", map[string]any{"origin": map[string]any{"kind": "user", "inTurn": true}, "input": tc.input}),
+				kimiRecord("turn.ended", map[string]any{}))
+			kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a typed"}`)
+			st := openStore(t)
+			ingest(t, transcripts(home), st)
+			if got := actorsOf(t, st, labels...); !maps.Equal(got, want) {
+				t.Fatalf("steer stored as %v, want %v", got, want)
+			}
+			if got := ownerTexts(t, st); !slices.Equal(got, []string{"marker-7f3a typed"}) {
+				t.Fatalf("owner turns %q, want only his words", got)
+			}
+		})
+	}
+}
+
 // Kimi's web server writes a notice for each file a prompt attaches, a whole text part built from the name, type, size
 // and path its origin's attachments keep, and Kimi writes a fixed notice in place of an image the model cannot take.
 // Both are generated input when they can be rebuilt exactly; a notice its origin does not list, and words that only
 // look like one, stay his.
 func TestKimiClientNoticesAreGeneratedInput(t *testing.T) {
 	text := func(s string) map[string]any { return map[string]any{"type": "text", "text": s} }
-	notice := "Attached file \"marker-7f3a a.txt\" (text/plain, 12 bytes): /neutral/a.txt \u2014 open it with the Read tool"
-	listed := map[string]any{"kind": "user", "attachments": []any{map[string]any{"name": "marker-7f3a a.txt", "mediaType": "text/plain", "size": 12,
+	notice := "Attached file \"marker-7f3a a.txt\" (text/plain, 2097152 bytes): /neutral/a.txt \u2014 open it with the Read tool"
+	listed := map[string]any{"kind": "user", "attachments": []any{map[string]any{"name": "marker-7f3a a.txt", "mediaType": "text/plain", "size": 2097152,
 		"path": "/neutral/a.txt"}}}
 	plain := map[string]any{"kind": "user"}
 	unsupported := "[Image omitted: \"marker-7f3a shot.heic\" uses unsupported image format image/heic. The current model provider accepts only " +
