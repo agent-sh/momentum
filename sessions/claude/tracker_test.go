@@ -121,10 +121,10 @@ func TestAQueuedNotificationClosesItsTask(t *testing.T) {
 
 // A task's notification closes its task by any record of it: the attachment that delivers a queued one closes it with
 // no enqueue before it, whatever origin the attachment names but another session's, and blank space before its tag
-// changes nothing, in a user record or in the attachment. A record that only quotes a notification for the task
-// closes nothing: a loop's prompt, queued or as its meta line, a headless run's user text, a prompt typed while the
-// turn ran, or a snapshot of the prompt. A prompt that quotes it is read as any other: a headless run's opens a turn
-// as user text (UserAt, a user entry in the log), and a loop's meta line opens none.
+// changes nothing, in a user record, in the attachment or in the enqueue. A record that only quotes a notification
+// for the task closes nothing: a loop's prompt, queued or as its meta line, a headless run's user text, a prompt
+// typed while the turn ran, or a snapshot of the prompt. A prompt that quotes it is read as any other: a headless
+// run's opens a turn as user text (UserAt, a user entry in the log), and a loop's meta line opens none.
 func TestOnlyANotificationClosesItsTask(t *testing.T) {
 	failed := tag("task-notification") + tag("task-id") + "q7" + closing("task-id") + tag("status") + "failed" + closing("status") +
 		closing("task-notification")
@@ -158,6 +158,8 @@ func TestOnlyANotificationClosesItsTask(t *testing.T) {
 	}{
 		"a queued command's notification":                    {queued("task-notification", "task-notification", failed), "", nil},
 		"a queued command's notification after a line break": {queued("task-notification", "task-notification", "\n"+failed), "", nil},
+		"a queued notification's enqueue after a line break": {map[string]any{"type": "queue-operation", "operation": "enqueue",
+			"content": "\n" + failed}, "", nil},
 		"a notification after blank space": {map[string]any{"type": "user", "origin": map[string]any{"kind": "task-notification"},
 			"message": map[string]any{"content": " \n\t" + failed}}, "", nil},
 		"a loop's prompt, queued": {map[string]any{"type": "queue-operation", "operation": "enqueue", "content": quoted}, "bash:q7", nil},

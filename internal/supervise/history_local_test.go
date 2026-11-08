@@ -1598,9 +1598,11 @@ func ownerLine(session string, line map[string]any) map[string]any {
 // too, and one that quotes Claude Code's words for a reopening reopens nothing. A task's own notification closes the
 // command in both, as a user record or as the attachment that delivers a queued one with no enqueue before it, with
 // blank space before its tag or none, and one that a command timed out reopens nothing in either. The space is any
-// in a meta line or a queued command's attachment, and ASCII blank space in a user record: after other space (a
-// no-break space, a vertical tab, U+0085) a user record is a notification to the tracker only, a difference SPEC
-// names, and the replay's command runs on.
+// Unicode white space in a meta line, a queued command's attachment and a user record the store reads as a person's
+// (a typed one), and ASCII blank space in a user record the store reads as no person's (a notification's origin):
+// when the blank space before the tag holds other space there (a no-break space, a vertical tab, U+0085, after a
+// line break too), such a record is a notification to the tracker only, a difference SPEC names, and the replay's
+// command runs on.
 func TestTheTrackerAndTheReplayReadAPeerMessageAlike(t *testing.T) {
 	home := codexHome(t) // a synthetic home, read by the transcripts source, and nothing of the machine's
 	done := tag("task-notification") + tag("task-id") + "b9" + closing("task-id") + tag("status") + "completed" + closing("status") +
@@ -1625,9 +1627,9 @@ func TestTheTrackerAndTheReplayReadAPeerMessageAlike(t *testing.T) {
 		enqueue bool           // the queue's enqueue of it names its text
 		last    bool           // nothing follows it
 		tasks   string
-		// apart is a difference SPEC names: the store's reader takes harness text by a pattern that passes over ASCII
-		// blank space only, so a notification after other space is kept as an agent's text, and the replay's
-		// command runs on where the tracker closes it
+		// apart is a difference SPEC names: the store's reader takes a record it reads as no person's for harness text
+		// by a pattern that passes over ASCII blank space only, so a notification after other space is kept as an
+		// agent's text, and the replay's command runs on where the tracker closes it
 		apart bool
 	}
 	// tickOf is a loop's prompt as its meta line, quoting notice.
@@ -1653,10 +1655,16 @@ func TestTheTrackerAndTheReplayReadAPeerMessageAlike(t *testing.T) {
 			"origin": map[string]any{"kind": "task-notification"}, "prompt": "\n" + done}},
 		"queued-nbsp": {notice: map[string]any{"type": "queued_command", "commandMode": "task-notification",
 			"origin": map[string]any{"kind": "task-notification"}, "prompt": "\u00a0" + done}},
-		"meta-nbsp":     {user: user("\u00a0"+done, true, "")},
+		"queued-ideo": {notice: map[string]any{"type": "queued_command", "commandMode": "task-notification",
+			"origin": map[string]any{"kind": "task-notification"}, "prompt": "\u3000" + done}},
+		"meta-nbsp": {user: user("\u00a0"+done, true, "")},
+		"meta-ideo": {user: user("\u3000"+done, true, "")},
+		"typed-nbsp": {user: map[string]any{"type": "user", "origin": map[string]any{"kind": "human"}, "promptSource": "typed",
+			"message": map[string]any{"role": "user", "content": "\u00a0" + done}}},
 		"nbsp-apart":    {user: user("\u00a0"+done, false, "task-notification"), apart: true},
 		"vtab-apart":    {user: user("\v"+done, false, "task-notification"), apart: true},
 		"nel-apart":     {user: user("\u0085"+done, false, "task-notification"), apart: true},
+		"mixed-apart":   {user: user("\n\u00a0"+done, false, "task-notification"), apart: true},
 		"queued":        {queued: cross(done), enqueue: true, tasks: "bash:b9"},
 		"queued-origin": {queued: done, tasks: "bash:b9"},
 		"agent-message": {queued: tag(`agent-message from="worker"`) + done + closing("agent-message"), tasks: "bash:b9"},

@@ -693,12 +693,14 @@ func Orphaned(s string) bool { return reOrphan.MatchString(s) }
 const notificationTag = "<" + "task-notification>"
 
 // Notification reports a task's notification by its text, as Claude Code writes one: it opens with its tag, after any
-// blank space (unicode.IsSpace, the space the store folds out of a summary). A prompt or a skill's text that only
-// quotes the tag is none. The replay reads a notification as this tracker does in a meta line or a queued command's
-// attachment after any space, and in a user record after ASCII blank space (a tab, a line break, a form feed, a
-// carriage return, a space). The store's reader takes a user record's text for harness text only after that space,
-// so one that opens with other space before the tag (a vertical tab, U+0085, a no-break space) is stored as text
-// that is not the harness's, and the replay reads no notification there. SPEC names the difference.
+// Unicode white space (unicode.IsSpace, the space the store folds out of a summary). A prompt or a skill's text that
+// only quotes the tag is none. The replay reads a notification as this tracker does after any such space in a meta
+// line, a queued command's attachment and a user record the store reads as a person's (typed, or with no origin and
+// no prompt source). In a user record the store reads as no person's (Claude Code's notification origin, a headless
+// run's prompt) it does so only after ASCII blank space (a tab, a line break, a form feed, a carriage return, a
+// space): the store's reader takes such a record's text for harness text only after that space, so one whose blank
+// space before the tag holds any other space (a vertical tab, U+0085, a no-break space) is stored as text that is not
+// the harness's, and the replay reads no notification there. SPEC names the difference.
 func Notification(s string) bool {
 	return strings.HasPrefix(strings.TrimLeftFunc(s, unicode.IsSpace), notificationTag)
 }
