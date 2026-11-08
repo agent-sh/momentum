@@ -319,15 +319,16 @@ func (s *Ship) returnWork(ctx context.Context, caseID, runDir string) (stays boo
 	return false, nil
 }
 
-// returnTrees gives back, with returnWork, every case's build tree that is in dir. It fails when a package cannot be
-// read, or a tree cannot go back, so dir stays.
-func (s *Ship) returnTrees(ctx context.Context, dir string) error {
+// returnTrees gives back, with returnWork, every case's build tree that is in dir. It passes over a package that
+// cannot be read, and says which with why (a build tree it names is made again at its next build, freshRunClone); it
+// fails when the packages cannot be listed, or a tree cannot go back, so dir stays.
+func (s *Ship) returnTrees(ctx context.Context, dir string) (unread map[string]string, err error) {
 	entries, err := os.ReadDir(filepath.Join(s.Dir, "packages"))
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil
+		return nil, nil
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, e := range entries {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
@@ -335,20 +336,24 @@ func (s *Ship) returnTrees(ctx context.Context, dir string) error {
 		}
 		p, had, err := s.Load(e.Name())
 		if err != nil {
-			return err
+			if unread == nil {
+				unread = map[string]string{}
+			}
+			unread[e.Name()] = err.Error()
+			continue
 		}
 		if !had || p.Work == "" || !within(dir, p.Work) {
 			continue
 		}
 		stays, err := s.returnWork(ctx, p.Case, dir)
 		if stays {
-			return err
+			return unread, err
 		}
 		if err != nil {
 			s.logf("build tree of %s: %v", p.Case, err)
 		}
 	}
-	return nil
+	return unread, nil
 }
 
 func stageFailure(res Result, key string, err error) (Result, error) {

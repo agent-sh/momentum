@@ -520,6 +520,8 @@ func TestReturnWorkNamesNoTreeThatIsNotThere(t *testing.T) {
 // the run directory.
 func TestTheSweepPassesOverHiddenPackageEntries(t *testing.T) {
 	r, _, in, id := sweepFixture(t)
+	var logs []string
+	r.Log = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
 	if err := os.MkdirAll(filepath.Join(r.Ship.Dir, "packages", ".marker-7f3a"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -531,6 +533,48 @@ func TestTheSweepPassesOverHiddenPackageEntries(t *testing.T) {
 	}
 	if p, _, _ := r.Ship.Load(id); p.Work != r.Ship.workDir(id) {
 		t.Fatalf("the package names %s, not the case's work directory", p.Work)
+	}
+	for _, line := range logs {
+		if strings.Contains(line, "cannot be read") {
+			t.Fatalf("the sweep read a hidden entry as a package: %s", line)
+		}
+	}
+}
+
+// A package that cannot be read keeps no run directory no run names: one without a build tree goes with no package
+// read, one with a tree no readable package names goes too, and the unreadable package is logged once in the sweep.
+func TestAnUnreadablePackageKeepsNoOrphan(t *testing.T) {
+	r, _, in, _ := sweepFixture(t)
+	var logs []string
+	r.Log = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
+	broken := filepath.Join(r.Ship.Dir, "packages", "marker-7f3a-broken")
+	if err := os.MkdirAll(broken, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(broken, "package.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bare := in(newRunID(time.Now()))  // an investigation's leftover: a host directory with its input, no tree
+	treed := in(newRunID(time.Now())) // a build's leftover whose package cannot be read
+	for _, dir := range []string{filepath.Join(HostDir(bare), "input"), bare, filepath.Join(treed, "work"), HostDir(treed)} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.sweepRuns(context.Background())
+	for _, dir := range []string{bare, HostDir(bare), treed, HostDir(treed)} {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("the sweep kept %s, which no run names: %v", filepath.Base(dir), err)
+		}
+	}
+	unread := 0
+	for _, line := range logs {
+		if strings.Contains(line, "-broken") && strings.Contains(line, "cannot be read") {
+			unread++
+		}
+	}
+	if unread != 1 {
+		t.Errorf("the unreadable package was logged %d times in the sweep, want once: %q", unread, logs)
 	}
 }
 

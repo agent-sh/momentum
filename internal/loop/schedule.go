@@ -40,7 +40,7 @@ type planned struct {
 // turn's order until one is ready; a family whose build is held tries its next build. The family whose build is ready
 // takes the first place, so any room reaches it, and the others wait for it. Then each other family runs one case in
 // its own place, in the run turn's order, so a pass with room for fewer runs than families starts after the family
-// whose run (other than the build) the last pass reserved first. A family whose build waits for another's, or whose
+// that reserved the first run, other than the build, in the last pass that reserved one. A family whose build waits for another's, or whose
 // builds came to no run (a hold), runs its best case that builds nothing instead, and its next one when that comes to
 // no run. With no room, no build is prepared. With room for one run, the build and the run turn take the pass in
 // turn: when runsFirst, the families run their cases that build nothing first, in the run turn's order, and the builds
@@ -50,8 +50,9 @@ type planned struct {
 //
 // While the store reads and writes the turns and every ready build is reserved, a family with a buildable case goes at
 // most b-1 passes without its build with room for two runs or more each pass, b being the families with a buildable
-// case, and at most 2b-1 with room for one (TestPassPlansAreFairOverRandomFamilies). A store that cannot keep the turns
-// takes the families in configured order every pass and, with room for one run, serves the run turn every pass.
+// case, and at most 2b-1 with room for one (TestPassPlansAreFairOverRandomFamilies). A store that cannot read the turns
+// takes the families in configured order every pass and, with room for one run, serves the run turn every pass; turns
+// that read but cannot be written hold the order, and the side room for one run serves, at the stored rows.
 //
 // It returns the steps, in the order taken, the turns after the pass, and which of them a reserved run took.
 func schedule(families []string, cands map[string][]candidate, turns map[string]string, room int, runsFirst bool,

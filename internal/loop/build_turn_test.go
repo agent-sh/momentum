@@ -1124,3 +1124,46 @@ func TestABuildWhoseWorkDirectoriesWentPrepares(t *testing.T) {
 	}
 	t.Fatalf("the second pass did not build: %+v", done)
 }
+
+// A pass whose pick fails returns the pick's error, though a lesson fails too.
+func TestAPickErrorOutranksALessonError(t *testing.T) {
+	r, _ := turnRunner(t, "owner-burden")
+	r.Tacit = script(t, t.TempDir(), "tacit", "exit 0")
+	r.Families = []string{"owner-burden", "sessions"}
+	db, err := sql.Open("sqlite", r.Store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	owner, _ := lessonFixture(t, r, db, "owner-burden")
+	if _, err := db.Exec(`INSERT INTO case_log (case_id, seq, at, actor, action, detail) VALUES (?, 9999, 'marker-7f3a', 'fixture', 'note', '')`,
+		owner.ID); err != nil { // owner-burden's lesson cannot read its receipts
+		t.Fatal(err)
+	}
+	bad := openCase(t, r.Store, "sessions", "marker-7f3a-bad", 1) // sessions' pick cannot read this row
+	if _, err := db.Exec("UPDATE cases SET alternatives = 'marker-7f3a' WHERE id = ?", bad.ID); err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.Once(context.Background(), Options{})
+	if err == nil || !strings.Contains(err.Error(), "alternatives") {
+		t.Fatalf("the pass returned %v, want the pick's error", err)
+	}
+}
+
+// A testing case whose investigation names a repository in no valid form is skipped like one whose record cannot be
+// read: the pass is no failure, and the family's next case runs.
+func TestAnInvalidRepositoryNameSkipsTheCaseNotThePass(t *testing.T) {
+	r, cs := turnRunner(t, "owner-burden", "sessions")
+	open := openCase(t, r.Store, "sessions", "marker-7f3a-open", 1)
+	setCaseRepo(t, r.Store, cs[1], "../marker-7f3a")
+	done, err := r.Once(context.Background(), Options{})
+	if err != nil {
+		t.Fatalf("the pass failed on one case's repository name: %v", err)
+	}
+	if built, why := turnStep(done, cs[0].ID, StepBuild); !built {
+		t.Fatalf("owner-burden did not build: %q", why)
+	}
+	if ran, why := turnStep(done, open.ID, StepInvestigate); !ran {
+		t.Fatalf("sessions did not investigate its next case: %q", why)
+	}
+}

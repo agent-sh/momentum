@@ -213,6 +213,37 @@ func TestABudgetReadFailurePreparesAsIfThereWereRoom(t *testing.T) {
 	}
 }
 
+// A reservation whose row is written and cannot be read back, and whose end cannot be written either, keeps its
+// directories: the running row still names them.
+func TestAReservationWhoseReadAndEndFailKeepsItsDirectories(t *testing.T) {
+	r, cs := turnRunner(t, "sessions")
+	db, err := sql.Open("sqlite", r.Store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, trigger := range []string{
+		`CREATE TRIGGER unreadable_reservation AFTER INSERT ON loop_runs WHEN NEW.status = 'running'
+	  BEGIN UPDATE loop_runs SET started = 'marker-7f3a' WHERE id = NEW.id; END`,
+		`CREATE TRIGGER unendable_reservation BEFORE UPDATE ON loop_runs WHEN NEW.status = 'failed'
+	  BEGIN SELECT RAISE(ABORT, 'marker-7f3a unendable'); END`,
+	} {
+		if _, err := db.Exec(trigger); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done, err := r.Once(context.Background(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if built, why := turnStep(done, cs[0].ID, StepBuild); built || !strings.Contains(why, "reservation") {
+		t.Fatalf("the build's reservation did not fail on its read: %v %q", built, why)
+	}
+	if left := runDirs(t, r); len(left) != 2 {
+		t.Fatalf("the reservation whose row still names its directories left %v on disk, want its run and host directories", left)
+	}
+}
+
 // A reservation whose row is written and cannot be read back ends that row, unstarted, uncharged and naming no
 // directory, before the pass removes what it prepared: no running row stays charged to the budgets.
 func TestAReservationWhoseReadFailsEndsItsRun(t *testing.T) {

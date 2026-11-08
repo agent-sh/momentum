@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 
 	"os"
 	"path/filepath"
@@ -227,6 +228,7 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 	// prepareStep prepares one family's run without reserving it, and says what came of it: ready, or a run recorded
 	// (the budgets refuse it, its preparation failed), or none (a hold, inputs that could not be made)
 	prepared := map[string]store.LoopRun{} // by case: a build prepared and not yet reserved
+	named := map[string]bool{}             // by case: a refused reservation whose row still names its directory
 	prepareStep := func(fam string, c store.Case, step string) (store.LoopRun, outcome) {
 		if ctx.Err() != nil {
 			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Skipped: "stopped: " + ctx.Err().Error()})
@@ -275,6 +277,9 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		}
 		run, refusal := r.reservePrepared(ctx, run)
 		if refusal != "" {
+			if run.Dir != "" { // a row still names the run's directory: it stays
+				named[c.ID] = true
+			}
 			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Run: run, Skipped: refusal})
 			return runRecorded
 		}
@@ -316,7 +321,7 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 		}
 		out := reserveReady(fam, c.c, c.step, run)
 		switch {
-		case out == runReserved:
+		case out == runReserved || named[c.c.ID]: // reserved, or a refusal whose row still names the directory
 			delete(prepared, c.c.ID)
 		case ok:
 			unready(c.c.ID)
@@ -428,11 +433,11 @@ var runIDForm = regexp.MustCompile(`^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$`)
 // sweepRuns removes the run directories that neither a run naming its directory nor a hold's receipt names
 // (store.KnownLoopRunDirs) and whose agent never started, which a pass that ended between a build's preparation and
 // its reservation (a crash) leaves: a build tree a package names in one goes back to its case first, and a directory
-// whose tree cannot go back stays. One whose agent started (agentRan: a store restored, or made anew, lost its row)
-// stays, logged once. It looks only at entries in a run id's form, and removes nothing when the store cannot say which
-// runs it knows. A pass
-// sweeps when it starts, under the loop's lock, before it prepares any run of its own, so every run directory then is
-// an earlier pass's.
+// whose tree cannot go back stays. A build tree is only ever a run directory's work, so one without it goes with no
+// package read, and a package that cannot be read is passed over, logged once a sweep. One whose agent started
+// (agentRan: a store restored, or made anew, lost its row) stays, logged once. It looks only at entries in a run id's
+// form, and removes nothing when the store cannot say which runs it knows. A pass sweeps when it starts, under the
+// loop's lock, before it prepares any run of its own, so every run directory then is an earlier pass's.
 func (r *Runner) sweepRuns(ctx context.Context) {
 	runs := filepath.Join(r.Dir, "runs")
 	entries, err := os.ReadDir(runs)
@@ -459,6 +464,13 @@ func (r *Runner) sweepRuns(ctx context.Context) {
 		r.logf("run directories: the store cannot say which runs it knows: %v", err)
 		return
 	}
+	unread := map[string]string{} // the packages that cannot be read, logged once the sweep is done
+	defer func() {
+		for _, name := range slices.Sorted(maps.Keys(unread)) {
+			r.logf("package %s cannot be read: the sweep passed over it, and its case's next build makes its tree again: %s", name,
+				unread[name])
+		}
+	}()
 	for id := range ids {
 		if known[id] {
 			continue
@@ -468,8 +480,10 @@ func (r *Runner) sweepRuns(ctx context.Context) {
 			r.keepUnknownRun(id, dir)
 			continue
 		}
-		if r.Ship != nil {
-			if err := r.Ship.returnTrees(ctx, dir); err != nil {
+		if _, err := os.Lstat(filepath.Join(dir, "work")); err == nil && r.Ship != nil { // a build tree is only ever there
+			bad, err := r.Ship.returnTrees(ctx, dir)
+			maps.Copy(unread, bad)
+			if err != nil {
 				r.logf("run directory %s, which no run names: %v", id, err)
 				continue
 			}
@@ -1144,9 +1158,12 @@ func (r *Runner) reservePrepared(ctx context.Context, run store.LoopRun) (store.
 		r.Store.PutLoopRun(ctx, run)
 		return run, run.Failure
 	}
+	// a refusal returns the run with the directory its row still names, if any: the caller keeps that one
 	run.Dir, run.Status, run.USD = filepath.Join(r.Dir, "runs", run.ID), store.RunRunning, r.Budgets.Run
 	if err := r.Store.PutLoopRun(ctx, run); err != nil {
-		return run, err.Error()
+		unwritten := run
+		unwritten.Dir = ""
+		return unwritten, err.Error()
 	}
 	stored, err := r.Store.LoopRunByID(ctx, run.ID)
 	if err != nil {
@@ -1156,7 +1173,8 @@ func (r *Runner) reservePrepared(ctx context.Context, run store.LoopRun) (store.
 		ended.Started, ended.Ended, ended.Status, ended.Failure, ended.USD, ended.Dir = time.Time{}, r.now(), store.RunFailed,
 			"reservation: "+err.Error(), 0, ""
 		if endErr := r.Store.PutLoopRun(context.WithoutCancel(ctx), ended); endErr != nil {
-			r.logf("run %s: its reservation could not be read (%v) or ended: %v", run.ID, err, endErr)
+			r.logf("run %s: its reservation could not be read (%v) or ended, so its directory stays: %v", run.ID, err, endErr)
+			ended.Dir = run.Dir // the running row still names it
 		}
 		return ended, ended.Failure
 	}
