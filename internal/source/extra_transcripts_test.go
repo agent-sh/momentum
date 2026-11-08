@@ -584,6 +584,63 @@ func TestKimiInlineSkillIsGeneratedInput(t *testing.T) {
 	}
 }
 
+// actorsOf maps each label to the actor and kind of the stored event whose text holds it.
+func actorsOf(t *testing.T, st *store.Store, labels ...string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, e := range all(t, st, "transcripts") {
+		for _, label := range labels {
+			if strings.Contains(e.Summary, label) {
+				out[label] = string(e.Actor) + " " + e.Kind
+			}
+		}
+	}
+	return out
+}
+
+// Kimi marks each text part of a prompt that does not come from the person with a meta.source. A UserPromptSubmit
+// hook's output is one, at the input's start ("user prompt submit hook"): generated input, as a skill's body is, and
+// so is a part with a meta.source Kimi may add later. Only the parts with none are the owner's.
+func TestKimiHookOutputIsGeneratedInput(t *testing.T) {
+	text := func(s string) map[string]any { return map[string]any{"type": "text", "text": s} }
+	sourced := func(s, source string) map[string]any {
+		return map[string]any{"type": "text", "text": s, "meta": map[string]any{"source": source}}
+	}
+	hook := map[string]any{"type": "text", "text": "<hook_result hook_event=\"UserPromptSubmit\">\nmarker-7f3a hook output\n</hook_result>",
+		"meta": map[string]any{"contentType": "text/xml", "source": "user prompt submit hook"}}
+	labels := []string{"marker-7f3a hook output", "marker-7f3a skill body", "marker-7f3a other", "marker-7f3a typed"}
+	for _, tc := range []struct {
+		name   string
+		origin map[string]any
+		input  []any
+		want   map[string]string
+	}{
+		{"hook output", map[string]any{"kind": "user"}, []any{hook, text("marker-7f3a typed")},
+			map[string]string{"marker-7f3a hook output": "harness harness_text", "marker-7f3a typed": "owner owner_text"}},
+		{"hook output and an inline skill", kimiSkillOrigin(map[string]any{}), []any{hook, kimiSkillPart("marker-7f3a skill body"), text("marker-7f3a typed")},
+			map[string]string{"marker-7f3a hook output": "harness harness_text", "marker-7f3a skill body": "harness harness_text",
+				"marker-7f3a typed": "owner owner_text"}},
+		{"another meta.source", map[string]any{"kind": "user"}, []any{sourced("marker-7f3a other", "a later source"), text("marker-7f3a typed")},
+			map[string]string{"marker-7f3a other": "harness harness_text", "marker-7f3a typed": "owner owner_text"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, ".kimi-code", "sessions", "neutral", "typed", "agents", "main", "wire.jsonl")
+			writeJSONLines(t, path, kimiRecord("turn.prompt", map[string]any{"origin": tc.origin, "input": tc.input}),
+				kimiRecord("turn.ended", map[string]any{}))
+			kimiState(t, path, `{"version":2,"lastPrompt":"marker-7f3a typed"}`)
+			st := openStore(t)
+			ingest(t, transcripts(home), st)
+			if got := actorsOf(t, st, labels...); !maps.Equal(got, tc.want) {
+				t.Fatalf("prompt stored as %v, want %v", got, tc.want)
+			}
+			if got := ownerTexts(t, st); !slices.Equal(got, []string{"marker-7f3a typed"}) {
+				t.Fatalf("owner turns %q, want only the typed words", got)
+			}
+		})
+	}
+}
+
 // A cursor saved under the rule before inline skills holds a skill's body as the owner's words: its file is read
 // again once, and the body is generated input.
 func TestKimiCursorFromBeforeInlineSkillsReadsAgain(t *testing.T) {
