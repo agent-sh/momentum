@@ -38,13 +38,11 @@ func state(rq *Request) {
 		}
 		working = working || livePhases[th.Phase]
 	}
-	after := false
+	artifact := false
 	for _, x := range rq.Results {
-		after = after || x.At.After(rq.LastTurn)
+		artifact = artifact || x.At.After(rq.LastTurn)
 	}
-	if rq.Report != nil && rq.Report.At.After(rq.LastTurn) {
-		after = true
-	}
+	after := artifact || rq.Report != nil && rq.Report.At.After(rq.LastTurn)
 	switch {
 	case needs != nil:
 		rq.State, rq.Why = NeedsYou, "a session of it was last seen waiting on the owner"
@@ -58,8 +56,10 @@ func state(rq *Request) {
 		rq.State, rq.Why = Unknown, "no sessions run recorded the latest session's phase since the request began, so whether it still runs is not known"
 	case !latest.Trusted:
 		rq.State, rq.Why = Unknown, "the latest session's last recorded phase is from before the last turn in it, so whether it still runs is not known"
-	case after:
+	case artifact:
 		rq.State, rq.Why = Ready, "a result came after the last turn"
+	case after:
+		rq.State, rq.Why = Ready, "only the agent's reply came after the last turn: it rests on that reply alone, a claim"
 	default:
 		rq.State, rq.Why = Open, "nothing came after the last turn"
 	}

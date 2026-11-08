@@ -9,6 +9,9 @@ import (
 
 const timeFormat = "2006-01-02 15:04"
 
+// pasteLine is the handoff's last sentence, before its closing id line: where a pasted handoff ends (closing).
+const pasteLine = "To continue it in another session, paste all of this there: its first and last lines link that session to the request."
+
 // Handoff limits: how much of a request the text holds.
 const (
 	followUps   = 5   // the latest follow-ups after the opening
@@ -132,7 +135,7 @@ func Handoff(rq *Request) string {
 	if len(evidence) > 0 {
 		line("Evidence (momentum evidence show ID): %s", strings.Join(evidence, " "))
 	}
-	line("To continue it in another session, paste all of this there: its first and last lines link that session to the request.")
+	line("%s", pasteLine)
 	line("%s", Line(rq.ID))
 	return b.String()
 }

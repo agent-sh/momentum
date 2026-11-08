@@ -414,18 +414,17 @@ func namesGit(s string) bool {
 // polls reports a Codex call that polls a session an earlier call left running: a code-mode script's write_stdin
 // call, as the script's parse finds it, or Codex's write_stdin tool. Its output is another command's: it names no
 // git of its own.
-func polls(call store.Event, tool, input string) bool {
+func polls(call store.Event, tool string, sc *script) bool {
 	if call.Harness != "codex" {
 		return false
 	}
 	if tool == "write_stdin" {
 		return true
 	}
-	if tool != "exec" {
+	if tool != "exec" || sc == nil {
 		return false
 	}
-	calls, _, _, _ := codeCalls(input)
-	for _, c := range calls {
+	for _, c := range sc.calls {
 		if !c.exec {
 			return true
 		}
@@ -462,6 +461,7 @@ func (r *reader) readWhole(ctx context.Context, t *thread) {
 		skip  bool // a command that names neither git nor gh: it makes nothing this reads
 		poll  bool // it polls a session an earlier call left running: its output may be that command's
 		mk    makes
+		sc    *script // a code-mode script, parsed once
 		found []Result
 	}
 	js := make([]job, len(t.pending))
@@ -501,8 +501,11 @@ func (r *reader) readWhole(ctx context.Context, t *thread) {
 		}
 		// every check reads the decoded commands, the text the shell parser sees, never the stored JSON, whose
 		// escapes (a newline before git) hide a word
-		d := Decode(j.p.call.Harness, j.tool, inputs[i], "")
-		j.poll = polls(*j.p.call, j.tool, inputs[i])
+		if j.p.call.Harness == "codex" && j.tool == "exec" {
+			j.sc = parseScript(inputs[i])
+		}
+		d := decode(j.p.call.Harness, j.tool, inputs[i], "", j.sc)
+		j.poll = polls(*j.p.call, j.tool, j.sc)
 		// a Codex call that names no git is read too: a session it left running replaces one of the same id
 		if !namesGit(strings.Join(d.Commands, "\n")) && !j.poll && !codexCommand(*j.p.call) {
 			// it makes nothing this reads, whether or not its record is there
@@ -525,11 +528,15 @@ func (r *reader) readWhole(ctx context.Context, t *thread) {
 	for i := range js {
 		j := &js[i]
 		output, lines := j.p.res.Summary, false
-		if whole(j) {
-			// taken whether used or not, so no raw output stays behind
+		switch {
+		case !whole(j):
+		case j.skip || !(j.mk.commits || j.mk.pushes || j.mk.prs || j.poll):
+			// not wanted: a record a pass read already is let go of, so no raw output stays behind, and none is read
+			// for it (a Hermes row is read only when asked)
+			delete(r.records, j.p.res.Ref+"\x00"+j.id)
+		default:
 			text, ok, why := r.take(ctx, *j.p.res, j.id, true)
 			switch {
-			case j.skip || !(j.mk.commits || j.mk.pushes || j.mk.prs || j.poll):
 			case ok:
 				output, j.raw, lines = text, true, true
 			case j.why == "":
@@ -549,7 +556,7 @@ func (r *reader) readWhole(ctx context.Context, t *thread) {
 				j.found = artifactsOf(call, res, Decode(call.Harness, j.tool, inputs[i], ""), makes{}, nil)
 			}
 		} else {
-			d := Decode(call.Harness, j.tool, inputs[i], output)
+			d := decode(call.Harness, j.tool, inputs[i], output, j.sc)
 			d.Joined = d.Joined && !lines // a text read whole has its lines, one line or many
 			j.found = artifactsOf(call, res, d, j.mk, t.sessions)
 			agent := agentOf(call)

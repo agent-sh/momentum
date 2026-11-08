@@ -62,7 +62,6 @@ type codeCall struct {
 }
 
 var (
-	codeCallRe    = regexp.MustCompile(`(?:\b(?:(?:const|let|var)\s+)?([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?)?\btools\.(exec_command|write_stdin)\(`)
 	pollSessionRe = regexp.MustCompile(`["']?session_id["']?\s*:\s*(?:(\d+)|([A-Za-z_$][\w$]*)\.session_id)`)
 	// a Codex command's plain result: still running in a session, or done with an exit code
 	runningRe = regexp.MustCompile(`Process running with session ID (\d+)`)
@@ -116,13 +115,102 @@ func printedText(output string) string {
 // result was set to (text(r)).
 var printRe = regexp.MustCompile(`\btext\(\s*(?:await\s+(tools)\.(?:exec_command|write_stdin)\(|([A-Za-z_$][\w$]*)\s*\))`)
 
+// script is a code-mode script parsed once: its calls, its prints, and how it runs them (codeCalls).
+type script struct {
+	calls    []codeCall
+	prints   []int
+	parallel bool
+	arrayAt  int
+}
+
+func parseScript(s string) *script {
+	sc := &script{}
+	sc.calls, sc.prints, sc.parallel, sc.arrayAt = codeCalls(s)
+	return sc
+}
+
+// codeCallLocs are a script's tools.exec_command( and tools.write_stdin( calls, each as [start, end, the start and
+// end of the variable its result is set to (-1 for none), the start and end of the tool's name]: from "tools."
+// found by a scan, back over an assignment before it (const|let|var NAME = await), so no byte but those is tried.
+func codeCallLocs(s string) [][]int {
+	var out [][]int
+	lo := 0
+	for k := 0; ; {
+		i := strings.Index(s[k:], "tools.")
+		if i < 0 {
+			return out
+		}
+		at := k + i
+		k = at + len("tools.")
+		if at > 0 && nameByte(s[at-1]) {
+			continue
+		}
+		name := ""
+		for _, n := range []string{"exec_command", "write_stdin"} {
+			if strings.HasPrefix(s[k:], n+"(") {
+				name = n
+			}
+		}
+		if name == "" {
+			continue
+		}
+		loc := []int{at, k + len(name) + 1, -1, -1, k, k + len(name)}
+		if start, a, b, ok := assignBefore(s, at, lo); ok {
+			loc[0], loc[2], loc[3] = start, a, b
+		}
+		out = append(out, loc)
+		k, lo = loc[1], loc[1]
+	}
+}
+
+// assignBefore is the assignment that sets a variable to the call at at, read back from it but not past lo: the
+// statement's start, the variable's start and end, and false when none is there.
+func assignBefore(s string, at, lo int) (start, a, b int, ok bool) {
+	space := func(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
+	j := at
+	for j > lo && space(s[j-1]) {
+		j--
+	}
+	if j < at && j-5 >= lo && s[j-5:j] == "await" && (j-5 == 0 || !nameByte(s[j-6])) {
+		j -= 5
+		for j > lo && space(s[j-1]) {
+			j--
+		}
+	}
+	if j <= lo || s[j-1] != '=' {
+		return 0, 0, 0, false
+	}
+	j--
+	for j > lo && space(s[j-1]) {
+		j--
+	}
+	b = j
+	for j > lo && (nameByte(s[j-1]) || s[j-1] == '$') {
+		j--
+	}
+	if j == b || s[j] >= '0' && s[j] <= '9' {
+		return 0, 0, 0, false
+	}
+	a, start = j, j
+	k := j
+	for k > lo && space(s[k-1]) {
+		k--
+	}
+	for _, kw := range []string{"const", "let", "var"} {
+		if k < j && k-len(kw) >= lo && s[k-len(kw):k] == kw && (k-len(kw) == 0 || !nameByte(s[k-len(kw)-1])) {
+			start = k - len(kw)
+		}
+	}
+	return start, a, b, true
+}
+
 // codeCalls are a code-mode script's exec_command and write_stdin calls, in order, and the calls its text() calls
 // print, in the order it prints them (-1 for a variable no call's result was set to). parallel is true when the
 // script runs calls side by side (Promise.all, a call not awaited), so its results' order says nothing of whose
 // they are; arrayAt is the first call after a Promise.all, whose array the results' places ("i") index (-1 when
 // none).
 func codeCalls(script string) (calls []codeCall, prints []int, parallel bool, arrayAt int) {
-	locs := codeCallRe.FindAllStringSubmatchIndex(script, -1)
+	locs := codeCallLocs(script)
 	at := map[int]int{}                          // a call's "tools." offset: its index
 	promise := strings.Index(script, "Promise.") // a call in its array is not awaited on its own: parallel
 	arrayAt = -1                                 // the first call of a Promise.all array
@@ -268,6 +356,11 @@ var (
 // path; a command, a patch or an output the cut ends loses its last token (the one the cut may have shortened)
 // before anything is matched in it.
 func Decode(harness, tool, input, output string) Decoded {
+	return decode(harness, tool, input, output, nil)
+}
+
+// decode is Decode with a code-mode script parsed already (nil to parse it here), so a call's script is parsed once.
+func decode(harness, tool, input, output string, sc *script) Decoded {
 	var d Decoded
 	tool = strings.ToLower(tool)
 	addPatch := func(t string) {
@@ -322,7 +415,10 @@ func Decode(harness, tool, input, output string) Decoded {
 			outs = append(outs, c.Output)
 		}
 		d.Output = strings.Join(outs, "\n")
-		calls, prints, parallel, arrayAt := codeCalls(input)
+		if sc == nil {
+			sc = parseScript(input)
+		}
+		calls, prints, parallel, arrayAt := sc.calls, sc.prints, sc.parallel, sc.arrayAt
 		d.Commands, d.CommandCut = nil, false
 		for _, c := range calls {
 			if c.exec {

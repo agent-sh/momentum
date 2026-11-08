@@ -163,9 +163,8 @@ func ParseID(id string) (time.Time, bool) {
 }
 
 // marker is the request id a text names in a handoff's own lines, and the text with the pasted handoff taken out:
-// his words before its opening line and after its closing line, `momentum request ID` on a line of its own after
-// the opening (in the store's text, whose lines are joined by spaces, the next `momentum request ID`). With no
-// closing line, a handoff the store cut runs to the cut, and in an uncut text the opening line alone is the paste.
+// his words before its opening line and after its closing line (closing). With no closing line, a handoff the
+// store cut runs to the cut, and in an uncut text the opening line alone is the paste.
 // A last line alone at the end of the text is a paste that ends there.
 func marker(text string) (id, rest string) {
 	for _, o := range openRe.FindAllStringSubmatchIndex(text, -1) {
@@ -187,26 +186,17 @@ func marker(text string) (id, rest string) {
 	return "", text
 }
 
-// closing is the end of a handoff's closing line in the text after its opening line, -1 when there is none.
+// closing is the end of a handoff's closing line in the text after its opening line, -1 when there is none: the
+// `momentum request ID` that directly follows the handoff's fixed last sentence (pasteLine), on the next line or,
+// in the store's text whose lines it joins, after a space, and ends at a space or the end of the text. An id its
+// body names (an ask, a reply that quotes it) is no closing line.
 func closing(after, id string) int {
-	line := "momentum request " + id
-	if strings.Contains(after, "\n") {
-		if l := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(line) + `[ \t\r]*$`).FindStringIndex(after); l != nil {
-			return l[1]
-		}
+	re := regexp.MustCompile(regexp.QuoteMeta(pasteLine) + `\s+` + regexp.QuoteMeta("momentum request "+id) + `(?:\s|$)`)
+	l := re.FindStringIndex(after)
+	if l == nil {
 		return -1
 	}
-	for k := 0; ; {
-		i := strings.Index(after[k:], line)
-		if i < 0 {
-			return -1
-		}
-		end := k + i + len(line)
-		if end == len(after) || after[end] == ' ' || after[end] == '\t' {
-			return end
-		}
-		k = end
-	}
+	return len(strings.TrimRight(after[:l[1]], " \t\r\n"))
 }
 
 func validID(id string) bool {

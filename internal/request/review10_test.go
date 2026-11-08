@@ -29,7 +29,7 @@ func TestARefusedWriteWithNoErrorFlagWroteNothing(t *testing.T) {
 			"Error [NOT_READ_THIS_SESSION]: Write refuses to overwrite a file that has not been Read in this session: /work/package.json"},
 		{"an Error: prefix", "claude", "Edit", `{"file_path":"/work/a.go","old_string":"a","new_string":"b"}`, "Error: String to replace not found in file."},
 		{"a tool_use_error", "claude", "Write", `{"file_path":"/work/a.go","content":"x"}`,
-			"<tool_use_error>File has not been read yet. Read it first before writing to it.</tool_use_error>"},
+			"<" + "tool_use_error>File has not been read yet. Read it first before writing to it.</" + "tool_use_error>"},
 		{"Hermes's success false", "hermes", "patch", `{"mode": "replace", "path": "/work/d.md", "old_string": "a", "new_string": "b"}`,
 			`{"success": false, "error": "Could not find a match for old_string in the file"}`},
 		{"an error field", "hermes", "write_file", `{"path": "/work/e.md", "content": "x"}`, `{"error": "Permission denied: /work/e.md"}`},

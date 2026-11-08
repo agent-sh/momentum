@@ -109,7 +109,8 @@ func (w *walker) visit(n syntax.Node) bool {
 		args[i] = wordText(wd)
 	}
 	cut := w.cut && int(ce.End().Offset()) >= w.size
-	if inv, ok := unwrap(args); ok {
+	inv, ok := unwrap(args)
+	if ok {
 		if shellProgs[inv.prog] {
 			if s, ok := shellScript(inv.args); ok {
 				for _, in := range invocationsOf(s, w.depth+1, cut) {
@@ -122,9 +123,16 @@ func (w *walker) visit(n syntax.Node) bool {
 			w.out = append(w.out, inv)
 		}
 	}
-	// the command substitutions in its words
+	// the command substitutions in its words: their output is its argument, printed only by echo or printf
+	in := w
+	if !ok || inv.prog != "echo" && inv.prog != "printf" {
+		in = &walker{depth: w.depth, silent: true, cut: w.cut, size: w.size}
+	}
 	for _, wd := range ce.Args {
-		syntax.Walk(wd, w.visit)
+		syntax.Walk(wd, in.visit)
+	}
+	if in != w {
+		w.out = append(w.out, in.out...)
 	}
 	return false
 }

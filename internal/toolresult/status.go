@@ -94,13 +94,16 @@ func Failed(harness, tool, text string, flagged bool) bool {
 	return refusal.MatchString(text)
 }
 
+// toolUseError opens Claude Code's tool_use_error, built from its parts.
+const toolUseError = "<" + "tool_use_error" + ">"
+
 // WriteFailed reads a file writer's result: its native error flag, a cancellation, a refusal (an `Error:` or
 // `Error [CODE]:` prefix, a tool_use_error, the refusals Failed reads), or a JSON envelope that says it failed
 // (success false, an error field). A writer whose harness records no flag for a refusal (pi's
 // NOT_READ_THIS_SESSION, Hermes's patch) wrote nothing.
 func WriteFailed(text string, flagged bool) bool {
 	text = strings.TrimSpace(text)
-	return flagged || Cancelled(text) || strings.HasPrefix(text, "<tool_use_error>") || refusal.MatchString(text) || EnvelopeFailed(text)
+	return flagged || Cancelled(text) || strings.HasPrefix(text, toolUseError) || refusal.MatchString(text) || EnvelopeFailed(text)
 }
 
 // EnvelopeFailed reads a known native result wrapper, not file or tool content. A wrapper that parses is read by
