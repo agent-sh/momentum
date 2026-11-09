@@ -731,8 +731,10 @@ var (
 
 // The options that take a value, in their word or the next.
 const (
-	sshValued = "pioJlFEbcDLRWwmOQS"
-	scpValued = "cDFiJloPSX"
+	sshValued = "pioJlFEbcDLRWwmOQSBeIP"
+	// rsyncValued are the short options of rsync that take a value in the next word: -e, -f, -T, -B and -M
+	rsyncValued = "efTBM"
+	scpValued   = "cDFiJloPSX"
 )
 
 // remoteHost is the host whose path a plain command line's message names, as written (its user@ off, never
@@ -782,7 +784,10 @@ func remoteHost(text, before string) string {
 		}
 		return h
 	case "rsync":
-		args := operands(words[1:], "")
+		args, late := operandsLate(words[1:], rsyncValued)
+		if late { // rsync reads options anywhere, and a long one's value after the operands (--exclude X) reads as one
+			return ""
+		}
 		h, at := operandHost(args)
 		m := rsyncRoleRe.FindAllStringSubmatchIndex(before, -1)
 		if h == "" || len(args) < 2 || m == nil || len(mask(before[m[len(m)-1][0]:])) > reach {
@@ -800,13 +805,19 @@ func remoteHost(text, before string) string {
 // operands are a command's words that are no option nor the value an option of valued takes after it in its word
 // or as the next.
 func operands(args []string, valued string) []string {
-	var out []string
+	out, _ := operandsLate(args, valued)
+	return out
+}
+
+// operandsLate is operands, and whether an option comes after the first operand.
+func operandsLate(args []string, valued string) (out []string, late bool) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if !strings.HasPrefix(a, "-") || a == "-" {
 			out = append(out, a)
 			continue
 		}
+		late = late || len(out) > 0
 		for j := 1; j < len(a) && !strings.HasPrefix(a, "--"); j++ {
 			if strings.IndexByte(valued, a[j]) >= 0 {
 				if j == len(a)-1 {
@@ -816,7 +827,7 @@ func operands(args []string, valued string) []string {
 			}
 		}
 	}
-	return out
+	return out, late
 }
 
 // operandHost is the host scp's or rsync's host:path operands name, and which of them name it; "" when none does or

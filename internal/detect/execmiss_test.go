@@ -187,6 +187,9 @@ func TestARemoteMissIsKeyedByItsHostAndPath(t *testing.T) {
 		{"claude", "Bash", `Exit code 11 rsync: [Receiver] mkdir "/root/x" failed: No such file or directory (2)`, `{"command":"rsync -a -e $S /w/x box:path/"}`, "miss:exec:box:/root/x"},
 		{"claude", "Bash", `Exit code 23 rsync: [generator] recv_generator: mkdir "/r/x" failed: No such file or directory (2)`, `{"command":"rsync -a --exclude c /w/x u@box:/r/"}`, "miss:exec:box:/r/x"},
 		{"claude", "Bash", `Exit code 23 rsync: [sender] change_dir "/r/src" failed: No such file or directory (2)`, `{"command":"rsync -a box:/r/src /w/dst"}`, "miss:exec:box:/r/src"},
+		// an ssh option that takes a value is skipped, and so is a value rsync's short options take
+		{"claude", "Bash", ls, `{"command":"ssh -e none box ls /w/a"}`, "miss:exec:box:/w/a"},
+		{"claude", "Bash", `Exit code 11 rsync: [Receiver] mkdir "/r/x" failed: No such file or directory (2)`, `{"command":"rsync -e ssh -avz /w/x box:/r/"}`, "miss:exec:box:/r/x"},
 		// words: a host from a variable, a here-document or a file on ssh's stdin, a pipe, a second command, ssh in a
 		// script, an ssh with no command, one whose command goes on to a third host
 		{"claude", "Bash", ls, `{"command":"ssh $H 'ls /w/a'"}`, words},
@@ -211,6 +214,9 @@ func TestARemoteMissIsKeyedByItsHostAndPath(t *testing.T) {
 			"exec:rsync: [receiver] mkdir Q failed: no such file or directory"},
 		{"claude", "Bash", `Exit code 23 rsync: change_dir "/r/src" failed: No such file or directory (2)`, `{"command":"rsync -a box:/r/src /w/dst"}`,
 			"exec:rsync: change_dir Q failed: no such file or directory"},
+		// words: an option after rsync's operands, whose value would read as one, leaves the sides unknown
+		{"claude", "Bash", `Exit code 23 rsync: [sender] link_stat "/w/x" failed: No such file or directory (2)`, `{"command":"rsync -a /w/x box:/r/ --exclude .git"}`,
+			"exec:rsync: [sender] link_stat Q failed: no such file or directory"},
 	} {
 		k, ok := failureKey(c.harness, c.tool, c.text, store.Call{Input: c.call, Cwd: "/w"})
 		got := ""
