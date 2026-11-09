@@ -1831,3 +1831,51 @@ func TestTheTrackerAndTheReplayReadARemovedNotification(t *testing.T) {
 		}
 	}
 }
+
+// A stop with several jobs shows the loop the live tracker shows: the newest job's, the larger id when two came at
+// once. Every replay of one store gives every stop the same loop.
+func TestAStopsLoopIsItsNewestJobInEveryReplay(t *testing.T) {
+	st := testStore(t)
+	b := newTimeline(t, "jobs").owner(0, "watch the deploy, the checks and the queue", "turn_duration").
+		call(time.Second, "CronCreate", "tc1", `{"cron":"*/10 * * * *","prompt":"check the deploy"}`).
+		result(time.Second, "CronCreate", "tc1", "Scheduled recurring job j1 (Every 10 minutes). Next run: 10:10.").
+		call(time.Second, "CronCreate", "tc2", `{"cron":"*/30 * * * *","prompt":"check the checks"}`).
+		call(0, "CronCreate", "tc3", `{"cron":"0 * * * *","prompt":"check the queue"}`).
+		result(time.Second, "CronCreate", "tc3", "Scheduled recurring job j3 (Every hour). Next run: 11:00.").
+		result(0, "CronCreate", "tc2", "Scheduled recurring job j2 (Every 30 minutes). Next run: 10:30.").
+		say(time.Second, "Watching.")
+	b.owner(5*time.Minute, "status?", "turn_duration").say(10*time.Second, "All green.")
+	b.owner(5*time.Minute, "and now?", "turn_duration").say(10*time.Second, "Still green.")
+	b.put(st)
+	var first []Point
+	for i := range 20 {
+		points, err := History(context.Background(), st, t0.Add(-time.Hour), t0.Add(6*time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			first = points
+			continue
+		}
+		if len(points) != len(first) {
+			t.Fatalf("replay %d: %d points, the first had %d", i, len(points), len(first))
+		}
+		for k, p := range points {
+			if p.Stop.Loop != first[k].Stop.Loop {
+				t.Fatalf("replay %d: the stop at %v shows loop %q, the first replay %q", i, p.Stop.At, p.Stop.Loop, first[k].Stop.Loop)
+			}
+		}
+	}
+	looped := 0
+	for _, p := range first {
+		if p.Stop.Loop != "" {
+			looped++
+			if p.Stop.Loop != "0 * * * *" {
+				t.Errorf("the stop at %v shows loop %q, want the newest job's, j3 over j2 at a tie", p.Stop.At, p.Stop.Loop)
+			}
+		}
+	}
+	if looped < 2 {
+		t.Fatalf("%d stops show a loop, want the stops after the jobs", looped)
+	}
+}

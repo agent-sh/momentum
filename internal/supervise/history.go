@@ -709,8 +709,13 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		}
 		s.TurnBegan, s.IdleAt, s.Exited, s.Reopened = turnBegan, prevAt, prevRole == "exit", prevRole == "reopened"
 		if !s.Exited { // nothing runs while the process is gone: an exited stop has no schedule
-			for _, c := range crons {
-				s.Loop = c.expr
+			// the newest job's, the larger id at a tie: the live tracker's rule (claude.Tracker.Facts)
+			var newest time.Time
+			newestID := ""
+			for id, c := range crons {
+				if c.at.After(newest) || c.at.Equal(newest) && id > newestID {
+					newest, newestID, s.Loop = c.at, id, c.expr
+				}
 			}
 			// Its own runs its harness should start, as the session layer lists them, a reopening for a restart.
 			if !wake.at.IsZero() && wake.seen {
