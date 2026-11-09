@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,12 +17,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	tacit "github.com/agent-sh/tacit/client/pkg/evidence"
+	"github.com/klauspost/compress/zstd"
 
 	"github.com/agent-sh/momentum/internal/evidenceview"
 	"github.com/agent-sh/momentum/internal/loop"
@@ -50,6 +53,8 @@ func scrubbed(ctx context.Context, w io.Writer, text string) error {
 // An as-of child withholds later records and every Hermes row, whose earlier version cannot be reconstructed.
 // The loop's records pass adds --separate: the events are then separated by the record separator (U+001E), which no
 // scrubbed text holds, and an event that cannot be shown is an empty one, so one child serves up to ten records.
+// The events are read in the order of their records' places and printed in the order given, so the events of one
+// compressed copy are read from one stream (copyReader).
 func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if _, err := evidenceEnd(); err != nil {
 		return err
@@ -63,10 +68,13 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		return err
 	}
 	defer st.Close()
-	var texts []string
+	var copies copyReader
+	defer copies.close()
+	texts := make([]string, 2*len(ids))
 	shown := 0
-	for _, raw := range ids {
-		text, err := showEvent(ctx, st, strings.TrimPrefix(raw, "ev:"))
+	for _, i := range byPlace(ctx, st, ids) {
+		raw := ids[i]
+		text, err := showEvent(ctx, st, strings.TrimPrefix(raw, "ev:"), &copies)
 		var ue usageError
 		switch {
 		case err == nil:
@@ -78,7 +86,7 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		default:
 			return err
 		}
-		texts = append(texts, text.header, text.record)
+		texts[2*i], texts[2*i+1] = text.header, text.record
 	}
 	// All full records and headers fit in one bounded scrub batch (ten records).
 	clean, err := loop.RedactAll(ctx, texts)
@@ -103,6 +111,92 @@ func evidenceShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		return usageError{"none of them could be shown"}
 	}
 	return nil
+}
+
+// byPlace is the order to read the events of ids in: by the file their references name and, in one file, by offset.
+func byPlace(ctx context.Context, st *store.Store, ids []string) []int {
+	type place struct {
+		path string
+		off  int64
+	}
+	at := make([]place, len(ids))
+	order := make([]int, len(ids))
+	for i, raw := range ids {
+		order[i] = i
+		if e, ok, err := st.EventByID(ctx, strings.TrimPrefix(raw, "ev:")); err == nil && ok {
+			at[i].path, at[i].off, _ = placeOf(e.Ref)
+		}
+	}
+	slices.SortStableFunc(order, func(a, b int) int {
+		return cmp.Or(strings.Compare(at[a].path, at[b].path), cmp.Compare(at[a].off, at[b].off))
+	})
+	return order
+}
+
+// copyReader reads the compressed copies of one show invocation. It decompresses a copy from the file openRecord
+// opened and checked, never by its name again, and keeps that stream for the next event: the events of one copy,
+// read in ascending offset order, pass over its bytes once instead of each from its start.
+type copyReader struct {
+	f   *os.File
+	fi  os.FileInfo
+	dec *zstd.Decoder
+	in  *countingReader
+	br  *bufio.Reader
+}
+
+var errPastEnd = errors.New("offset is past the copy's end")
+
+// at is the copy's JSONL bytes from start, read from f, a regular file openRecord opened (fi). It takes f: it keeps
+// it for a new stream, or closes it when the stream it kept reads the same file and has not passed start. A stream
+// that met an error or its end is not kept. An offset past the copy's end is errPastEnd.
+func (c *copyReader) at(f *os.File, fi os.FileInfo, start int64) (*bufio.Reader, error) {
+	if c.dec != nil && c.in.err == nil && os.SameFile(c.fi, fi) && c.pos() <= start {
+		f.Close()
+	} else {
+		c.close()
+		// as tacit's reader decodes a copy: one goroutine, little memory and at most a 128 MiB window
+		dec, err := zstd.NewReader(bufio.NewReaderSize(f, 256<<10),
+			zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true), zstd.WithDecoderMaxWindow(128<<20))
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
+		in := &countingReader{r: dec}
+		*c = copyReader{f: f, fi: fi, dec: dec, in: in, br: bufio.NewReaderSize(in, readMax+1)}
+	}
+	if _, err := c.br.Discard(int(start - c.pos())); err == io.EOF {
+		return nil, errPastEnd
+	} else if err != nil {
+		return nil, err
+	}
+	return c.br, nil
+}
+
+// pos is how many of the copy's JSONL bytes the stream has passed.
+func (c *copyReader) pos() int64 { return c.in.n - int64(c.br.Buffered()) }
+
+func (c *copyReader) close() {
+	if c.dec != nil {
+		c.dec.Close()
+		c.f.Close()
+	}
+	*c = copyReader{}
+}
+
+// countingReader reads r, counting its bytes and keeping its first error.
+type countingReader struct {
+	r   io.Reader
+	n   int64
+	err error
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	if c.err == nil {
+		c.err = err
+	}
+	return n, err
 }
 
 var errWritableRecord = errors.New("record lies where a run can write")
@@ -228,7 +322,7 @@ func evidenceUnit(ctx context.Context, args []string, stdout, stderr io.Writer) 
 
 type eventText struct{ header, record string }
 
-func showEvent(ctx context.Context, st *store.Store, id string) (eventText, error) {
+func showEvent(ctx context.Context, st *store.Store, id string, copies *copyReader) (eventText, error) {
 	end, err := evidenceEnd()
 	if err != nil {
 		return eventText{}, err
@@ -266,7 +360,11 @@ func showEvent(ctx context.Context, st *store.Store, id string) (eventText, erro
 		output.WriteString(unopened(err))
 		return eventText{header: output.String()}, nil
 	}
-	defer f.Close()
+	defer func() {
+		if f != nil { // copies takes a compressed copy's file
+			f.Close()
+		}
+	}()
 	fi, err := f.Stat()
 	if err != nil || !fi.Mode().IsRegular() {
 		output.WriteString("  (its record is not a regular file)\n")
@@ -293,24 +391,19 @@ func showEvent(ctx context.Context, st *store.Store, id string) (eventText, erro
 		}
 		br = bufio.NewReaderSize(f, readMax+1)
 	} else {
-		// The harness compressed the transcript after it was read: tacit's reader decompresses the copy and passes over
-		// its JSONL bytes up to the byte before the record, which must end the record before it. It opens the copy by
-		// name, so the name must still be the file checked above.
-		start := max(off-1, 0)
-		zr, err := tacit.OpenAt(packed, start)
+		// The harness compressed the transcript after it was read: the copy is decompressed from the file checked
+		// above, and its JSONL bytes are passed over up to the byte before the record, which must end the record
+		// before it.
+		r, err := copies.at(f, fi, max(off-1, 0))
+		f = nil
+		if errors.Is(err, errPastEnd) {
+			return eventText{}, usageError{"offset is not a record boundary"}
+		}
 		if err != nil {
-			if _, size, serr := tacit.Stat(packed); serr == nil && start > size {
-				return eventText{}, usageError{"offset is not a record boundary"}
-			}
 			output.WriteString(packedUnread)
 			return eventText{header: output.String()}, nil
 		}
-		defer zr.Close()
-		if again, err := os.Lstat(packed); err != nil || !os.SameFile(again, fi) {
-			output.WriteString("  (its record is gone)\n")
-			return eventText{header: output.String()}, nil
-		}
-		br = bufio.NewReaderSize(zr, readMax+1)
+		br = r
 		if off > 0 {
 			if prev, err := br.ReadByte(); err != nil || prev != '\n' {
 				return eventText{}, usageError{"offset is not a record boundary"}
@@ -352,8 +445,12 @@ func showEvent(ctx context.Context, st *store.Store, id string) (eventText, erro
 	return eventText{header: output.String()}, nil
 }
 
-// packedUnread is the note for a compressed copy that holds a transcript but cannot be read to its record.
-const packedUnread = "  (record withheld: its compressed copy cannot be read)\n"
+// packedUnread is the note for a compressed copy that holds a transcript but cannot be read to its record, and
+// hermesUnread for a Hermes store that cannot be opened or read as one.
+const (
+	packedUnread = "  (record withheld: its compressed copy cannot be read)\n"
+	hermesUnread = "  (record withheld: its Hermes store cannot be read)\n"
+)
 
 // unopened is the note for a record openRecord refused or could not open.
 func unopened(err error) string {
@@ -382,10 +479,12 @@ func hermesRow(ctx context.Context, e store.Event, path string, msg int64) (stri
 	}
 	db, err := tacit.OpenHermes(path)
 	if err != nil {
-		return "", "  (its record is gone)\n"
+		return "", hermesUnread
 	}
 	defer db.Close()
-	// SQLite opens the store by name, so the name must still be the file checked above
+	// SQLite opens the store by name: a name that no longer holds the file checked above is refused. A swap there
+	// and back between the check and SQLite's open would pass, but a run cannot write where the store lies
+	// (openRecord), so it cannot make one.
 	if again, err := os.Lstat(db.Path); err != nil || !os.SameFile(again, fi) {
 		return "", "  (its record is gone)\n"
 	}
@@ -394,7 +493,10 @@ func hermesRow(ctx context.Context, e store.Event, path string, msg int64) (stri
 		sid = e.Agent
 	}
 	rows, err := db.Messages(ctx, sid, msg-1, 1) // the row itself: Messages reads at least one, here no more
-	if err != nil || len(rows) == 0 || rows[0].ID != msg {
+	if err != nil {
+		return "", hermesUnread
+	}
+	if len(rows) == 0 || rows[0].ID != msg {
 		return "", "  (its record is gone)\n"
 	}
 	m := rows[0]
