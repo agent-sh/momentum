@@ -53,8 +53,8 @@ if [ -n "${EXPECT_NO_VSOCK:-}" ]; then
 fi
 
 same interfaces "$(awk -F: 'NR>2 {gsub(/ /, "", $1); print $1}' /proc/net/dev | tr '\n' ' ')" "lo "
-# Run starts socat. Retry only the connection while that child starts listening.
-code=$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --retry 5 --retry-delay 1 --retry-connrefused --max-time 2 --retry-max-time 8 http://127.0.0.1:8787/route-probe)
+# The relay command starts this script only once socat listens: one request, no retry.
+code=$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:8787/route-probe)
 same route-answers "$code" "503"
 refuse other-loopback-port curl --noproxy '*' -s --max-time 2 "http://127.0.0.1:$OTHER_HOST_PORT/"
 # A second host-only loopback address stands for an address outside this namespace.

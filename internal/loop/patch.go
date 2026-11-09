@@ -55,11 +55,14 @@ func readPatch(p Patch) ([]byte, error) {
 	return b, nil
 }
 
+// errNoHostClone is a package with no host clone or base commit, which a package prepared before both were kept has:
+// the package's state, not the build's output, so no refusal. The check and the patch's application both say it.
+var errNoHostClone = errors.New("the package has no host clone and base commit; prepare it again")
+
 // applyPatch consumes the run's file once. Every later operation takes these bytes or host-owned objects.
 func (s *Ship) applyPatch(ctx context.Context, p Package, inputs []Patch) (string, []string, error) {
 	if p.Host == "" || p.BaseCommit == "" {
-		// the package's state, not the build's output: no refusal
-		return "", nil, errors.New("the package has no host clone and base commit; prepare it again")
+		return "", nil, errNoHostClone
 	}
 	in := Patch{}
 	if len(inputs) > 1 {

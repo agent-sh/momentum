@@ -76,7 +76,11 @@ func TestCommandGolden(t *testing.T) {
 		"--setenv", "LANG", "C.UTF-8", "--setenv", "TMPDIR", "/tmp",
 		"--setenv", "ALPHA", "marker-7f3a", "--setenv", "ZETA", "marker-7f3a",
 		"/bin/sh", "-c",
-		`socat TCP-LISTEN:8787,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:/run/relay.sock & exec "$@"`,
+		`socat TCP-LISTEN:8787,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:/run/relay.sock & i=0; ` +
+			`until grep -qs ':2253 [0-9A-F]*:0000 0A ' /proc/net/tcp /proc/net/tcp6; do ` +
+			`kill -0 $! 2>/dev/null || { echo 'sandbox: the relay forwarder exited before it listened' >&2; exit 125; }; ` +
+			`i=$((i+1)); [ $i -lt 200 ] || { echo 'sandbox: the relay forwarder did not listen in 200 probes 50 ms apart' >&2; exit 125; }; ` +
+			`sleep 0.05; done; exec "$@"`,
 		"sh", "/bin/sh", "-c", "exit 7", "arg with spaces", "${UNCHANGED}",
 	}
 	assertArgv(t, cmd.Args, want)

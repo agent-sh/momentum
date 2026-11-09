@@ -14,17 +14,9 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// relayPost defines post, which sends one model request to the run's relay and tries again while the relay does not
-// listen yet (curl exits 7): the sandbox starts the relay's forwarder beside the harness, so the harness can ask
-// before it listens. Any other answer is the request's.
-const relayPost = `post() {
- for i in $(seq 50); do
-  curl -s -o /dev/null -X POST -d '{}' "$1"; rc=$?
-  [ "$rc" -ne 7 ] && return "$rc"
-  sleep 0.1
- done
- return "$rc"
-}
+// relayPost defines post, which sends one model request to the run's relay. The sandbox starts the harness only once
+// the relay's forwarder listens, so the first request needs no retry.
+const relayPost = `post() { curl -s -o /dev/null -X POST -d '{}' "$1"; }
 `
 
 // A run the model's safeguards refuse falls back to the fallback model whatever its relay refused before: what the

@@ -762,7 +762,7 @@ func (s *Ship) check(ctx context.Context, caseID string, test testCommand, testF
 		return p, refused("case %s has no package to check (prepare it first; a proposed one is reviewed, not checked again)", caseID)
 	}
 	if p.Host == "" || p.BaseCommit == "" {
-		return p, refused("legacy package has no host clone and patch base; prepare a fresh package")
+		return p, errNoHostClone // `ship check` reaches it; a build fails at build prepare first (buildBase)
 	}
 	if err := s.packageAuthority(ctx, p); err != nil {
 		return p, err

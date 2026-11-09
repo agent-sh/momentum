@@ -1378,6 +1378,48 @@ func TestAMissingIdentityOrCloneIsNoRefusal(t *testing.T) {
 	}
 }
 
+// A package with no host clone is the package's state at the check too, which `ship check` reaches: no refusal.
+func TestCheckingAPackageWithNoHostCloneIsNoRefusal(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	c := testingCase(t, st)
+	s := &Ship{Store: st, Dir: t.TempDir()}
+	if err := s.save(&Package{Case: c.ID, State: Prepared}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Check(ctx, c.ID, "go test ./...", nil); err == nil || errors.Is(err, ErrRefused) || stageCause("build check", err) != hostCause {
+		t.Fatalf("no host clone at the check: %v", err)
+	}
+}
+
+// A test that runs past the check's time limit, or prints past its output limit, is the build's refusal at the check,
+// which the next build reads in refusal.md, not the host's error.
+func TestATestPastTheCheckLimitsIsTheBuildsRefusal(t *testing.T) {
+	for _, c := range []struct{ name, test, why string }{
+		{"time", "import time\ntime.sleep(60)\n", "the test ran past the check's time limit (3s)"},
+		{"output", "import sys\nsys.stdout.write('x' * (9 << 20))\nsys.exit(1)\n", "the test printed past the check's output limit (8 MiB)"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := testStore(t)
+			f := newRepo(t, nil)
+			s := shipFor(t, st, f)
+			s.Sandbox.Timeout = 3 * time.Second
+			cs := testingCase(t, st)
+			p, err := s.Prepare(ctx, cs.ID, f.main)
+			if err != nil {
+				t.Fatal(err)
+			}
+			write(t, filepath.Join(p.Work, "fake.go"), strings.Replace(fakeGo, "return 41", "return 42", 1))
+			write(t, filepath.Join(p.Work, "limit_test.py"), c.test)
+			_, err = s.Check(ctx, cs.ID, "python3 limit_test.py", nil, fixturePatch(t, s, p.Case))
+			if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), c.why) || stageCause("build check", err) == hostCause {
+				t.Fatalf("a test past the check's %s limit: %v", c.name, err)
+			}
+		})
+	}
+}
+
 // The host stages are the host's at the stop rule too: host errors at build authority, or at build package, with a host
 // error at another stage between them stop on the stage, as any host stage's do.
 func TestEveryHostStageStopsOnItsStage(t *testing.T) {

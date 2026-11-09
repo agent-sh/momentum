@@ -285,6 +285,62 @@ func TestInsideChecks(t *testing.T) {
 	}
 }
 
+// forwarder puts the test's own socat first on the run's PATH, where the relay command finds its forwarder.
+func forwarder(t *testing.T, f *fixture, body string) {
+	t.Helper()
+	i := slices.IndexFunc(f.spec.Binds, func(b Bind) bool { return b.Dst == "/opt/tools" })
+	if err := os.WriteFile(filepath.Join(f.spec.Binds[i].Src, "socat"), []byte("#!/bin/sh\n"+body+"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	f.spec.Env["PATH"] = "/opt/tools:/usr/bin:/bin"
+}
+
+// A relay run starts its program only once the relay's forwarder listens: a first request with no retry reaches the
+// relay even from a forwarder that is slow to start.
+func TestTheProgramStartsOnceTheRelayListens(t *testing.T) {
+	needSandbox(t, true)
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("no curl")
+	}
+	f := standardLayout(t)
+	forwarder(t, f, `sleep 0.5; exec /usr/bin/socat "$@"`)
+	f.spec.Argv = []string{"/bin/sh", "-c", `curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8787/first-request`}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	r, err := f.spec.Run(ctx, &stdout, &stderr)
+	if err != nil || r.Failed || r.Code != 0 || stdout.String() != "503" {
+		t.Fatalf("the first request answered %q: exit %d, launcher failure %v, error %v", stdout.String(), r.Code, r.Failed, err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !slices.Equal(f.requests, []string{"GET /first-request"}) {
+		t.Fatalf("the relay received %q", f.requests)
+	}
+}
+
+// A relay whose forwarder exits, or never listens, ends the run before its program, with its own exit status and why.
+func TestARelayThatNeverListensEndsTheRunBeforeItsProgram(t *testing.T) {
+	needSandbox(t, true)
+	for _, c := range []struct{ name, body, why string }{
+		{"exits", "exit 1", "the relay forwarder exited before it listened"},
+		{"never listens", "exec sleep 60", "the relay forwarder did not listen in 200 probes 50 ms apart"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := standardLayout(t)
+			forwarder(t, f, c.body)
+			f.spec.Argv = []string{"/bin/sh", "-c", "echo the program ran"}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			var stdout, stderr bytes.Buffer
+			r, err := f.spec.Run(ctx, &stdout, &stderr)
+			if err != nil || r.Failed || r.Code != relayNotListening || stdout.Len() != 0 || !strings.Contains(stderr.String(), c.why) {
+				t.Fatalf("exit %d, launcher failure %v, error %v, stdout %q, stderr %q", r.Code, r.Failed, err, stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
 func removeArg(args []string, target string) []string {
 	i := slices.Index(args, target)
 	if i < 0 {

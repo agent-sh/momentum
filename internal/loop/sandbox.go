@@ -298,14 +298,20 @@ func (s Sandbox) Run(ctx context.Context, dir string, words []string, extra []st
 	out := Capture{Limit: MaxStream}
 	start := time.Now()
 	result, err := spec.Run(cctx, &out, &out)
+	// A test that runs past the check's time limit or prints past its output limit is the change's to fix, not the
+	// host's: the check refuses it, so the build sees why. A pass that ends, or a sandbox that cannot stop the test,
+	// is still the host's.
+	if err != nil && ctx.Err() == nil && errors.Is(cctx.Err(), context.DeadlineExceeded) && !result.Failed {
+		return Outcome{}, refused("the test ran past the check's time limit (%s): a test must end, failing or passing, within it", timeout)
+	}
 	if err != nil {
 		return Outcome{}, err
 	}
+	if out.Over() {
+		return Outcome{}, refused("the test printed past the check's output limit (%d MiB): a test must print less", MaxStream>>20)
+	}
 	if result.Failed {
 		return Outcome{}, errors.New("test launcher failed")
-	}
-	if out.Over() {
-		return Outcome{}, errors.New("test output exceeds the whole-stream limit")
 	}
 	clean, err := Redact(ctx, out.String())
 	if err != nil {

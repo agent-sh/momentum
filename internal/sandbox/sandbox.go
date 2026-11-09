@@ -27,7 +27,19 @@ const (
 	DefaultTasks      = 512
 	DefaultRuntimeSec = 1800
 
-	relayCommand = `socat TCP-LISTEN:8787,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:/run/relay.sock & exec "$@"`
+	// relayCommand starts the relay's forwarder and runs the program only once it listens, so a harness's first request
+	// never meets a forwarder still starting. The probe reads the sandbox's own socket table (8787 is 2253 in hex, 0A
+	// is LISTEN) and opens no connection to the relay. It gives up when the forwarder has exited, or after 200 probes
+	// 50 ms apart (about 10 s): the run then ends before the program, with relayNotListening and the reason on stderr.
+	// socat listens within a probe or two; the bound is for a host too loaded to start it, and still ends a broken
+	// forwarder long before a run's own limits.
+	relayCommand = `socat TCP-LISTEN:8787,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:/run/relay.sock & i=0; ` +
+		`until grep -qs ':2253 [0-9A-F]*:0000 0A ' /proc/net/tcp /proc/net/tcp6; do ` +
+		`kill -0 $! 2>/dev/null || { echo 'sandbox: the relay forwarder exited before it listened' >&2; exit 125; }; ` +
+		`i=$((i+1)); [ $i -lt 200 ] || { echo 'sandbox: the relay forwarder did not listen in 200 probes 50 ms apart' >&2; exit 125; }; ` +
+		`sleep 0.05; done; exec "$@"`
+	// relayNotListening is the exit status of a relay run whose forwarder never listened: the program did not run.
+	relayNotListening = 125
 	// A stop normally completes at once. Allow systemd's default 90-second
 	// stop timeout and some time for the client to observe unit deactivation.
 	stopTimeout = 2 * time.Minute
