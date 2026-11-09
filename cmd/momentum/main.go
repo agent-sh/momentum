@@ -40,8 +40,8 @@ const usage = `usage:
                                         drop what SOURCE contributed; the next ingest reads it from the start
                                         (not sessions; transcripts keep their events without --force, and every
                                         transcript still there is read again; with it, it says how many have no
-                                        source left; incidents only with --force: their sightings are history
-                                        their files do not keep)
+                                        source left; not while a case's change is deployed or measured; incidents
+                                        only with --force: their sightings are history their files do not keep)
   momentum sessions [--json] [--all]    the live agent sessions and their phases, read without a model;
                                         each phase change is kept as an event of source sessions
   momentum report [--json]              what needs the owner, what was decided and shipped in the last 12 hours,
@@ -343,7 +343,8 @@ func status(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 // harness deleted, and the incidents' sightings are all there is of what each incident did over time, so they go
 // only with --force, which counts first how many transcript events have no source left; without it the transcripts'
 // events stay, and the next ingest reads every transcript still there again, which fills what this build records of
-// them. The flag may come before or after the source's name.
+// them. Neither runs while a case's change is deployed or measured (store.ErrMeasuring). The flag may come before or
+// after the source's name.
 func rebuild(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("rebuild", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -391,7 +392,7 @@ func rebuild(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	n, err := st.Rebuild(ctx, name, *force)
 	switch {
-	case errors.Is(err, store.ErrObserved):
+	case errors.Is(err, store.ErrObserved), errors.Is(err, store.ErrMeasuring):
 		return usageError{err.Error()}
 	case errors.Is(err, store.ErrKept):
 		return usageError{err.Error() + "; --force drops them all the same"}

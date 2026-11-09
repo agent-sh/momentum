@@ -1122,6 +1122,42 @@ func TestARebuildDoesNotHideARecurrenceAfterAGuardedClose(t *testing.T) {
 	}
 }
 
+// A watch that reads by the write sequence is handed no row it has read: a rebuild of the transcripts and an ingest
+// of the same transcripts store each event as it was, so none is written again, and its next read counts nothing.
+func TestAReadAgainOfUnchangedTranscriptsHandsAWatchNoRecurrence(t *testing.T) {
+	ctx := context.Background()
+	st, _ := testStoreAt(t)
+	sig := toolSignal
+	sig.Source = store.Transcripts
+	plan := Plan{Signal: sig, Units: SessionHours}
+	start := time.Now().Add(-48 * time.Hour).Truncate(time.Hour)
+	var evs []store.Event
+	for i, failed := range []bool{true, false, true} {
+		e := toolResult(fmt.Sprintf("s.jsonl@%012d#000", i), start.Add(time.Duration(i+1)*time.Hour), "s", failed)
+		e.Source = store.Transcripts
+		evs = append(evs, e)
+	}
+	put(t, st, evs)
+	read, err := st.Seq(ctx) // the watch's last read
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back, err := recurrencesWritten(ctx, st, plan, start, time.Time{}, "", 0, read); err != nil || len(back) != 2 {
+		t.Fatalf("the watch's first read: %d %v", len(back), err)
+	}
+	if _, err := st.Rebuild(ctx, store.Transcripts, false); err != nil {
+		t.Fatal(err)
+	}
+	put(t, st, evs) // the ingest after it, of transcripts that did not change
+	seq, err := st.Seq(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back, err := recurrencesWritten(ctx, st, plan, start, time.Time{}, "", read, seq); err != nil || len(back) != 0 {
+		t.Fatalf("after a rebuild and an ingest of unchanged transcripts the watch counted %d recurrences it had read (%v)", len(back), err)
+	}
+}
+
 // A recurrence a build from before the write sequence writes, with none of its own, is still read after a guarded
 // close.
 func TestARecurrenceAnOlderBuildWroteBringsAGuardedCaseBack(t *testing.T) {

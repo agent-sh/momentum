@@ -86,6 +86,10 @@ const Transcripts = "transcripts"
 // ErrKept means a source's events may be all that is left of what it read: Rebuild drops them only when forced.
 var ErrKept = errors.New("its events are kept")
 
+// ErrMeasuring means a case's change is deployed or measured (a measured plan's window, a guard's watch): Rebuild
+// refuses the transcripts until it closes or rolls back, forced or not.
+var ErrMeasuring = errors.New("a change is deployed or measured")
+
 // Incidents is the source of an incident detector's incidents and their sightings (source.Incidents).
 const Incidents = "incidents"
 
@@ -659,7 +663,8 @@ func (s *Store) Close() error {
 	return err
 }
 
-// Put inserts events, or refreshes every derived column of an event already stored, in one transaction.
+// Put inserts events, or refreshes every derived column of an event already stored, in one transaction: an event
+// stored again whose columns all stay as they are is left untouched, its write sequence with it (putUpdate).
 // It returns how many were new.
 func (s *Store) Put(ctx context.Context, evs []Event) (int, error) {
 	if len(evs) == 0 {
@@ -694,16 +699,10 @@ func put(ctx context.Context, tx querier, evs []Event) (int, error) {
 	if err := tx.QueryRowContext(ctx, `SELECT n FROM event_seq WHERE id = 1`).Scan(&seq); err != nil {
 		return 0, err
 	}
-	// A row stored again keeps the model it was stored with, when it has one: a stored model is what was seen at the
-	// time, and a read again knows only the present (Hermes stamps every row with its session's model now).
 	putStmt, err := tx.PrepareContext(ctx, `INSERT INTO events (id, source, source_key, ts, session, agent, harness, model,
 	  cwd, actor, kind, tool, summary, meta, ref, heuristic, experiment, ingested, seq)
 	  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-	  ON CONFLICT(id) DO UPDATE SET ts=excluded.ts, session=excluded.session, agent=excluded.agent,
-	    harness=excluded.harness, model=CASE WHEN COALESCE(events.model, '') != '' THEN events.model ELSE excluded.model END,
-	    cwd=excluded.cwd, actor=excluded.actor, kind=excluded.kind,
-	    tool=excluded.tool, summary=excluded.summary, meta=excluded.meta, ref=excluded.ref,
-	    heuristic=excluded.heuristic, experiment=excluded.experiment, seq=excluded.seq`)
+	  ON CONFLICT(id) DO UPDATE SET `+putUpdate)
 	if err != nil {
 		return 0, err
 	}
@@ -729,6 +728,27 @@ func put(ctx context.Context, tx querier, evs []Event) (int, error) {
 	}
 	return added, nil
 }
+
+// putColumns are the columns a row stored again takes from its read, each with the value it takes. A row stored again
+// keeps the model it was stored with, when it has one: a stored model is what was seen at the time, and a read again
+// knows only the present (Hermes stamps every row with its session's model now).
+var putColumns = [][2]string{{"ts", "excluded.ts"}, {"session", "excluded.session"}, {"agent", "excluded.agent"},
+	{"harness", "excluded.harness"}, {"model", "CASE WHEN COALESCE(events.model, '') != '' THEN events.model ELSE excluded.model END"},
+	{"cwd", "excluded.cwd"}, {"actor", "excluded.actor"}, {"kind", "excluded.kind"}, {"tool", "excluded.tool"},
+	{"summary", "excluded.summary"}, {"meta", "excluded.meta"}, {"ref", "excluded.ref"}, {"heuristic", "excluded.heuristic"},
+	{"experiment", "excluded.experiment"}}
+
+// putUpdate is the upsert's update of a row stored again: its columns and the write's sequence, only where a column
+// would change (IS NOT, which compares NULL too). A read again that finds the same event writes nothing, so the row
+// keeps its sequence, and a watch that reads by it (Seq) is handed no row it has read already.
+var putUpdate = func() string {
+	var set, differ []string
+	for _, c := range putColumns {
+		set = append(set, c[0]+" = "+c[1])
+		differ = append(differ, "events."+c[0]+" IS NOT ("+c[1]+")")
+	}
+	return strings.Join(set, ", ") + ", seq = excluded.seq WHERE " + strings.Join(differ, " OR ")
+}()
 
 // CleanCwd is a working directory as the store keeps it: cleaned (filepath.Clean), so the counts' SQL compares the
 // form InDir compares, and an empty one stays empty.
@@ -953,7 +973,8 @@ func (s *Store) Skipped(ctx context.Context, source string) (int, error) {
 // transcript still there again from its start and stores its events again as it reads them now (what a newer build
 // records of them, such as GitKey), and the events of a transcript gone stay as they are. The incidents' sightings
 // are all there is of what an incident did over time (its file keeps only its running count), so without force
-// Rebuild refuses them with ErrKept.
+// Rebuild refuses them with ErrKept. While a case's change is deployed or measured, Rebuild refuses the transcripts
+// with ErrMeasuring, naming the cases (measuring).
 func (s *Store) Rebuild(ctx context.Context, source string, force bool) (int, error) {
 	switch {
 	case source == Sessions, source == Supervise, source == Capacity:
@@ -966,6 +987,14 @@ func (s *Store) Rebuild(ctx context.Context, source string, force bool) (int, er
 		return 0, err
 	}
 	defer tx.Rollback()
+	if source == Transcripts {
+		if held, err := measuring(ctx, tx); err != nil {
+			return 0, err
+		} else if len(held) > 0 {
+			return 0, fmt.Errorf("%s: %w: %s; a read again rewrites old events into today's form, which their measurement "+
+				"or watch counts, so rebuild once they close or roll back", source, ErrMeasuring, strings.Join(held, ", "))
+		}
+	}
 	like := source + "-%"
 	var n int64
 	if source != Transcripts || force {
@@ -992,6 +1021,33 @@ func (s *Store) Rebuild(ctx context.Context, source string, force bool) (int, er
 		}
 	}
 	return int(n), tx.Commit()
+}
+
+// measuring names the cases whose change is deployed or measured, each with where it stands: its measure step counts
+// the transcripts' events, and judges the change on them (a rollback, a close). A forced rebuild drops them and the
+// next ingest stores them anew, so it is refused too. A closed case's watch is not: it goes on for good, so it would
+// refuse every rebuild, and it rolls nothing back. A guarded close's reads only the rows a write changed (putUpdate),
+// and an improved close's reads each window once.
+func measuring(ctx context.Context, q querier) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `SELECT id, status, guard_exposure FROM cases WHERE status IN (?, ?) ORDER BY id`,
+		CaseDeployed, CaseMeasuring)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id, status string
+		var exposure int
+		if err := rows.Scan(&id, &status, &exposure); err != nil {
+			return nil, err
+		}
+		if status == string(CaseMeasuring) && exposure > 0 {
+			status = "watched by its guard"
+		}
+		out = append(out, id+" ("+status+")")
+	}
+	return out, rows.Err()
 }
 
 // Call is a tool call as the store keeps it: its text (the input's first bytes) and the directory its session was

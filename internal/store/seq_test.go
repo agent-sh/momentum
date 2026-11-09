@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -74,6 +76,65 @@ func TestTheWriteSequenceNeverGoesDown(t *testing.T) {
 	}
 	if seq, _ := st.Seq(ctx); seq != seqOf(next.ID()) {
 		t.Fatalf("the sequence %d is not the last write's %d", seq, seqOf(next.ID()))
+	}
+}
+
+// An event stored again with every field as it was is not written: it keeps its write sequence, and a watch that read
+// the sequence sees no row of it. That holds for a stored model a read again would replace, which the row keeps; a
+// field that changes, a model filled where none was stored among them, takes the write's sequence.
+func TestAnIdenticalReadAgainKeepsTheWriteSequence(t *testing.T) {
+	ctx := context.Background()
+	st, _ := open(t)
+	at := time.Date(2026, 1, 5, 9, 0, 0, 0, time.UTC)
+	ev := func(key, model, summary string) Event {
+		return Event{Source: Transcripts, SourceKey: key, TS: at, Session: "s", Harness: "hermes", Model: model, Cwd: "/w/",
+			Actor: ActorTool, Kind: "tool_result", Tool: "Bash", Summary: summary, Meta: `{"is_error":true}`, Ref: "/s@0#0", Heuristic: true}
+	}
+	seqOf := func(e Event) int64 {
+		t.Helper()
+		var seq int64
+		if err := st.db.QueryRowContext(ctx, `SELECT seq FROM events WHERE id = ?`, e.ID()).Scan(&seq); err != nil {
+			t.Fatal(err)
+		}
+		return seq
+	}
+	same, kept, filled, changed := ev("1", "", "failed"), ev("2", "model-a", "failed"), ev("3", "", "failed"), ev("4", "", "failed")
+	if _, err := st.Put(ctx, []Event{same, kept, filled, changed}); err != nil {
+		t.Fatal(err)
+	}
+	read, err := st.Seq(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	was := map[string]int64{}
+	for _, e := range []Event{same, kept, filled, changed} {
+		was[e.ID()] = seqOf(e)
+	}
+	again := []Event{same, ev("2", "model-b", "failed"), ev("3", "model-c", "failed"), ev("4", "", "failed again")}
+	if n, err := st.Put(ctx, again); err != nil || n != 0 {
+		t.Fatalf("stored again: %d new, %v", n, err)
+	}
+	for _, e := range []Event{same, kept} {
+		if got := seqOf(e); got != was[e.ID()] {
+			t.Errorf("event %s stored again unchanged moved from %d to %d", e.SourceKey, was[e.ID()], got)
+		}
+	}
+	for _, e := range []Event{filled, changed} {
+		if got := seqOf(e); got <= read {
+			t.Errorf("event %s stored again changed kept %d, at or below the %d a watch read", e.SourceKey, got, read)
+		}
+	}
+	evs, err := st.Events(ctx, Query{Since: at, SeqAfter: read, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var written []string
+	for _, e := range evs {
+		written = append(written, e.SourceKey+"="+e.Model+":"+e.Summary)
+	}
+	slices.Sort(written)
+	if got := strings.Join(written, " "); got != "3=model-c:failed 4=:failed again" {
+		t.Fatalf("written since the watch's read: %s", got)
 	}
 }
 

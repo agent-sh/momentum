@@ -110,6 +110,66 @@ func TestARebuildOfTheTranscriptsKeepsThemWithoutForceAndCountsWhatIsGone(t *tes
 	}
 }
 
+// A rebuild of the transcripts, forced or not, is refused while a case's change is deployed or watched, and names the
+// case: a read again rewrites the events its measure step judges the change on. It keeps every event and every cursor.
+// Once the watch closes, the rebuild runs.
+func TestARebuildOfTheTranscriptsIsRefusedWhileACaseIsWatched(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	at := time.Now().Add(-time.Hour)
+	e := store.Event{Source: store.Transcripts, SourceKey: "s.jsonl@000000000000#000", TS: at, Harness: "claude", Actor: store.ActorTool,
+		Kind: "tool_result", Tool: "Bash", Summary: "Exit code 1 it broke"}
+	putEvents(t, e)
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, _, err := st.PutFiles(ctx, []store.FileWrite{{Cursor: store.FileCursor{Source: store.Transcripts, Path: "/s.jsonl", Offset: 3}}}); err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: "failures/v2:zz", Title: "it breaks",
+		Evidence: []store.Evidence{{Ref: "ev:" + e.ID()}}}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mech, next := "m", "n"
+	if _, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mech, NextTest: &next}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DeployCase(ctx, c.ID, t.TempDir(), at, "landed", "test"); err != nil {
+		t.Fatal(err)
+	}
+	refused := func(stage string) {
+		t.Helper()
+		for _, args := range [][]string{{"evidence", "rebuild", "transcripts"}, {"evidence", "rebuild", "transcripts", "--force"}} {
+			var out, errOut bytes.Buffer
+			if code := run(ctx, args, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), c.ID+" ("+stage+")") {
+				t.Fatalf("%v while %s: exit %d\n%s%s", args, stage, code, out.String(), errOut.String())
+			}
+		}
+		if n := countEvents(t, store.Transcripts); n != 1 {
+			t.Fatalf("a refused rebuild left %d events", n)
+		}
+		if cursors, err := st.FileCursors(ctx, store.Transcripts); err != nil || len(cursors) != 1 {
+			t.Fatalf("a refused rebuild dropped where the ingest stopped: %v %v", cursors, err)
+		}
+	}
+	refused("deployed")
+	if _, err := st.StartGuarding(ctx, c.ID, 30*24*time.Hour, 4, 684, at, "a guard", "test"); err != nil {
+		t.Fatal(err)
+	}
+	refused("watched by its guard")
+	if _, err := st.CloseGuarded(ctx, c.ID, 4, 684, 100, 0.5, "no recurrence", "", "test"); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if code := run(ctx, []string{"evidence", "rebuild", "transcripts"}, &out, &errOut); code != 0 || !strings.Contains(out.String(), "kept every event") {
+		t.Fatalf("after the guarded close: exit %d\n%s%s", code, out.String(), errOut.String())
+	}
+}
+
 // The incidents' sightings are kept too: what each incident did over time is not in its file. A rebuild of them is
 // refused without --force, and with it says the sightings are gone.
 func TestARebuildOfTheIncidentsNeedsForce(t *testing.T) {
