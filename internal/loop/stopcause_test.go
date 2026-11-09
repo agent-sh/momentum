@@ -2150,6 +2150,29 @@ func TestAnInvestigationWhoseSandboxExitsBeforeItsHarnessStops(t *testing.T) {
 	}
 }
 
+// A review whose sandbox exits before its harness starts is kept as review run: two of them stop the case on the step
+// and the failure alone, where each pass would review it again at no cost.
+func TestAReviewWhoseSandboxExitsBeforeItsHarnessStops(t *testing.T) {
+	exitBeforeStart(t)
+	ctx := context.Background()
+	r, c, _ := reviewFixture(t)
+	for i := 0; i < 2; i++ {
+		done := r.reviews(ctx, c.ID)
+		if len(done) != 1 || done[0].Run.Step != StepReview || done[0].Run.Failure != "review run" || done[0].Run.USD != 0 ||
+			!done[0].Run.Started.IsZero() || !strings.Contains(done[0].Run.Summary, "the harness never started: its sandbox ended with exit 9") {
+			t.Fatalf("review %d whose sandbox exited before its harness: %+v", i, done)
+		}
+	}
+	done := r.reviews(ctx, c.ID)
+	if len(done) != 1 || done[0].Run.ID != "" || !strings.Contains(done[0].Skipped, "its last two review runs failed the same way: review run") {
+		t.Fatalf("two reviews whose harness never started did not stop the case: %+v", done)
+	}
+	cs, err := r.Store.Cases(ctx, store.CaseFilter{Family: store.HealthFamily})
+	if err != nil || len(cs) != 1 || !slices.Equal(cs[0].Signatures, []string{"component-health/v1:loop:review:review-run"}) || cs[0].Evidence != 2 {
+		t.Fatalf("the stop's component-health case: %+v %v", cs, err)
+	}
+}
+
 // Only an exit with no start and nothing at the relay is a harness that does not start: a run that started, one the
 // relay saw, and the broker's or a timeout's keep their own keys.
 func TestOnlyAnExitBeforeTheStartIsAHarnessThatDoesNotStart(t *testing.T) {
@@ -2231,8 +2254,17 @@ func TestADismissedStoppedNoteDoesNotHideALaterStop(t *testing.T) {
 	if done := r.reviews(ctx, c.ID); len(done) != 1 || !strings.Contains(done[0].Skipped, "inputs reached") {
 		t.Fatalf("the review once the stop held no more: %+v", done)
 	}
-	if n, _, _ := s.Store.Note(ctx, id); n.Done.IsZero() || n.Detail != "the stop rule no longer holds the case" {
-		t.Fatalf("the dismissed note once the stop held no more: %+v", n)
+	ended, _, _ := s.Store.Note(ctx, id)
+	if ended.Done.IsZero() || ended.Detail != "the stop rule no longer holds the case" {
+		t.Fatalf("the dismissed note once the stop held no more: %+v", ended)
+	}
+	// a note that says so already is skipped: the next pass neither reopens nor closes it again
+	time.Sleep(5 * time.Millisecond)
+	if done := r.reviews(ctx, c.ID); len(done) != 1 || !strings.Contains(done[0].Skipped, "inputs reached") {
+		t.Fatalf("the next review: %+v", done)
+	}
+	if n, _, _ := s.Store.Note(ctx, id); !n.Done.Equal(ended.Done) || n.Detail != ended.Detail {
+		t.Fatalf("the next pass touched a note that says the stop no longer holds: %+v, was %+v", n, ended)
 	}
 	for i := 0; i < 2; i++ {
 		at := time.Now()

@@ -142,6 +142,9 @@ func TestGateSaidKeepsTheEndOfWhatTheGatePrinted(t *testing.T) {
 	if got := gateSaid([]byte(whole)); got != whole {
 		t.Fatalf("a line of 300 characters was clipped: %q", got)
 	}
+	if got := gateSaid([]byte("a" + whole)); got != "..."+whole {
+		t.Fatalf("a line of 301 characters: %q", got)
+	}
 	long := []byte("load 9 of 4\n" + strings.Repeat("ü", 296) + "  end\n")
 	want := "..." + string([]rune("load 9 of 4 " + strings.Repeat("ü", 296) + " end")[12:])
 	if got := gateSaid(long); got != want || !utf8.ValidString(got) || utf8.RuneCountInString(got) != 303 {

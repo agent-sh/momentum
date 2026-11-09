@@ -153,6 +153,11 @@ func (r *Runner) reviews(ctx context.Context, only string, families ...string) [
 func (r *Runner) review(ctx context.Context, c store.Case, p Package, run store.LoopRun) Done {
 	d := Done{Family: c.Family, Case: c.ID, Step: StepReview}
 	res, err := r.invokeReview(ctx, c, p, run)
+	if err == nil && exitedBeforeStart(res) {
+		// a harness that does not start: kept as review run, which the stop rule counts. A review's other errors before
+		// its harness stay run, which it does not count: a broker that cannot be reached is one of them
+		res.Status, res.Failure, res.Text = store.RunFailed, "review run", neverStarted(res).Error()
+	}
 	if err == nil && res.Status == store.RunOK {
 		current, e := r.Store.CaseByID(ctx, c.ID)
 		if e != nil || current.Into != "" || current.Episode != run.CaseEpisode || current.Status != store.CaseTesting {
