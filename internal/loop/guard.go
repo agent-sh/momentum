@@ -91,9 +91,9 @@ func (s *Ship) guardPlan(ctx context.Context, c store.Case, plan Plan, instead e
 	// naming a tool in the signal takes no tool past the two incidents (guardCandidates). It is read over no span back
 	// from the count: the history is four of the build's windows, so evidence of another tool outside it would drop out
 	// under a shorter one, and a span would lose, at a later recount (a hand landing's, which runs on a later pass, as
-	// of the landing), the evidence the proposal saw. Evidence dated from the count on is not read here; the watch reads
-	// the case's evidence from its own start, so a piece dated between the two is weighed by neither (SPEC, Exposure, a
-	// known limit; #140). A case with no event of the store gets no guard (events, below). An event is of its tool by
+	// of the landing), the evidence the proposal saw. Evidence dated from the count's own time on is not read here; the
+	// watch reads the case's evidence from its own start, so a piece dated from the count's own time to the watch's start
+	// is weighed by neither (SPEC, Exposure, a known limit; #140). A case with no event of the store gets no guard (events, below). An event is of its tool by
 	// caseEvent.tool: the store's event's, or for one the store lost (a rebuild, a stale row dropped) the tool its
 	// evidence recorded at its last filing (or a merge), and none when it recorded none.
 	events, in, hit, own := 0, 0, 0, sig.Tool
@@ -299,24 +299,27 @@ func guardCandidates(units, own string, hits []store.Event) (cands []guardCandid
 	if cwds == nil {
 		whys[1] = "some in no directory"
 	}
+	// apps counts codex_apps's connectors, beside a built-in tool or another server's, so a refusal says which of its
+	// tools are of no connector
+	apps := ""
+	if fields[store.CodexApps] {
+		named := len(connectors)
+		if connectors[""] {
+			named--
+		}
+		apps = fmt.Sprintf(", %s's tools of %s", store.CodexApps, connectorsText(named))
+		if connectors[""] && named > 0 {
+			apps += " and some of none"
+		}
+	}
 	switch {
 	case tools == nil:
 	case len(fields) == 1 && fields[""]:
 		whys = append(whys, "of no MCP server")
 	case fields[""]:
-		whys = append(whys, "some of no MCP server")
-	case fields[store.CodexApps]:
-		named := len(connectors)
-		if connectors[""] {
-			named--
-		}
-		w := fmt.Sprintf("of %d MCP servers, %s's tools of %s", len(fields), store.CodexApps, connectorsText(named))
-		if connectors[""] && named > 0 {
-			w += " and some of none"
-		}
-		whys = append(whys, w)
+		whys = append(whys, "some of no MCP server"+apps)
 	default:
-		whys = append(whys, fmt.Sprintf("of %d MCP servers", len(fields)))
+		whys = append(whys, fmt.Sprintf("of %d MCP servers", len(fields))+apps)
 	}
 	return nil, fmt.Sprintf("no unit holds all its events (%s: a tool, alone or in a set, is in two incidents or more, the signal's own too unless every event of the case's evidence dated before the count is of it, as the store holds it or, where the store lost it, as its evidence recorded it; a directory is every event's own; an MCP server is the one every event's tool is of, a connector of codex_apps where one holds them all), so absence cannot be counted only while the problem's unit was in use",
 		strings.Join(whys, "; "))

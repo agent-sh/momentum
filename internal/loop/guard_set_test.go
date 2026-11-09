@@ -354,8 +354,8 @@ const (
 // whose exposure counts both forms (224 of each, and the failures' 6). A problem across connectors (an expired
 // sign-in) takes codex_apps as a whole, whose exposure counts every connector's tools (224 of each of three, and the
 // failures' 6). So do tools Codex serves with no connector, mcp__codex_apps__TOOL, which are of codex_apps alone
-// (#109). A history of codex_apps's tools beside another server's has no server, and its refusal counts codex_apps
-// once, with its connectors and any tools of none, or says its tools are of no connector.
+// (#109). A history of codex_apps's tools beside another server's or a built-in tool has no server, and its refusal
+// counts codex_apps once, with its connectors and any tools of none, or says its tools are of no connector (#145).
 func TestACodexAppsConnectorIsAGuardsServer(t *testing.T) {
 	now := time.Now().Truncate(time.Hour)
 	t.Run("its unit is the connector", func(t *testing.T) {
@@ -400,6 +400,14 @@ func TestACodexAppsConnectorIsAGuardsServer(t *testing.T) {
 		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, serverSignal, 7*aDay, "", now)
 		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), "(2 tools, 2 of them in fewer than two of its 1 incidents; in 6 directories; of 2 MCP servers, codex_apps's tools of no connector: a tool") {
 			t.Fatalf("a tool of no connector and another server's: %+v %v", g, err)
+		}
+	})
+	t.Run("no connector beside a built-in tool", func(t *testing.T) {
+		st := testStore(t)
+		c := oneIncidentOf(t, st, now, now, [3]string{appsSearch, gmailLabel, calendarList}, func(j int) string { return []string{appsSearch, "Bash"}[j%2] })
+		plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, serverSignal, 7*aDay, "", now)
+		if g, _ := guardOf(t, plan); err == nil || !strings.Contains(err.Error(), "(2 tools, 2 of them in fewer than two of its 1 incidents; in 6 directories; some of no MCP server, codex_apps's tools of no connector: a tool") {
+			t.Fatalf("a tool of no connector and a built-in tool: %+v %v", g, err)
 		}
 	})
 	t.Run("a connector and no connector beside another server", func(t *testing.T) {
@@ -471,14 +479,15 @@ func TestAToolFoundByItsEventsNeedsTwoIncidents(t *testing.T) {
 // on the plan's word, which a build writes (#101). A signal that names Bash, over one incident of Bash failures from six
 // directories, is refused where the case's evidence holds Edit failures beside them, and admitted with Bash as its unit
 // (224 hours of its use, and the failures' own 6) where every event of the evidence is of Bash; the refusal says so.
-// The evidence is read whole, whenever dated, so no window decides (#109): an Edit failure 35 or 70 days before
-// refuses Bash under a window of one week (a 28-day history) as of two (56 days). Failures 40 days before admit Bash
-// under a two-week window (424 hours of its use, and the failures' 6), and an Edit failure a day before them refuses
-// it. A plan counted again 15 days later, as a hand landing counts it, keeps the guard the proposal had; once the
-// detector files an Edit failure dated after the proposal (and after the later count's boundary), the later count
-// refuses it, as intended: the problem is then not Bash's alone. Evidence dated after the count's own time is not
-// weighed: a hand landing's recount at the landing keeps its guard after an Edit failure two days past the landing,
-// a recurrence the watch reads. An event of the evidence the store no longer holds, in the history or before it, is of
+// Evidence dated before the count's own time is read, however old, so no window decides (#109): an Edit failure 35 or
+// 70 days before refuses Bash under a window of one week (a 28-day history) as of two (56 days). Failures 40 days
+// before admit Bash under a two-week window (424 hours of its use, and the failures' 6), and an Edit failure a day
+// before them refuses it. A plan counted again 15 days later, as a hand landing counts it, keeps the guard the proposal
+// had; once the detector files an Edit failure dated after the proposal (and after the later count's boundary), the
+// later count refuses it, as intended: the problem is then not Bash's alone. Evidence dated from the count's own time
+// on is not weighed: an Edit failure dated at it keeps the guard, and one a millisecond before refuses it (#145); a
+// hand landing's recount at the landing keeps its guard after an Edit failure two days past the landing, a recurrence
+// the watch reads. An event of the evidence the store no longer holds, in the history or before it, is of
 // the tool its evidence recorded when it was filed (#118): Bash is admitted where that is Bash, and refused where the
 // evidence recorded no tool (filed before evidence recorded tools, its event gone by the step that filled them in) or
 // another. An event the store still holds is of its own tool, whatever its evidence recorded. An Edit failure of the
@@ -594,6 +603,23 @@ func TestTheSignalsToolIsExemptOnlyOnTheCasesEvidence(t *testing.T) {
 			t.Fatalf("counted again after the detector filed evidence of another tool: %+v %v", g, err)
 		}
 	})
+	// the boundary instant: an Edit failure dated at the count's own time is not weighed, one a millisecond before it is
+	for _, before := range []time.Duration{0, time.Millisecond} {
+		t.Run(fmt.Sprintf("evidence of another tool %s before the count's own time", before), func(t *testing.T) {
+			st := testStore(t)
+			edit := toolResult("edit-at-count", now.Add(-before), "edit-at-count", true)
+			edit.Tool, edit.Cwd = "Edit", "/work/e"
+			c := oneIncidentOf(t, st, now, now, [3]string{"Bash", serverB, serverC}, func(int) string { return "Bash" }, edit)
+			plan, err := (&Ship{Store: st}).validPlan(t.Context(), c, bash, 7*aDay, "", now)
+			g, _ := guardOf(t, plan)
+			switch {
+			case before == 0 && (err != nil || g == nil || g.Unit != "tool" || g.Tool != "Bash" || g.Exposure != 224+6):
+				t.Fatalf("a named tool beside an Edit failure at the count's own time: %+v %v", g, err)
+			case before > 0 && (err == nil || !strings.Contains(err.Error(), alone)):
+				t.Fatalf("a named tool beside an Edit failure just before the count: %+v %v", g, err)
+			}
+		})
+	}
 	t.Run("a hand landing's recount after a recurrence in another tool", func(t *testing.T) {
 		st := testStore(t)
 		proposed := now.Add(-20 * aDay)
