@@ -157,10 +157,11 @@ func TestACommandsMissIsKeyedByThePathItNames(t *testing.T) {
 
 // A program that names the path it found no file at unquoted, "PROG: PATH: No such file or directory", is keyed by
 // that path as a quoted one is: rg (ripgrep 15's IO error too), cat, wc, grep, cut, sha256sum, sed's "can't read",
-// ugrep's "warning", jq's "Could not open file", the shell's cd, bash's script and its line's redirection, with the
-// same directory, remote and cut rules. What is no path keeps its words: an option or a glob in its place, a path
-// with a space, an assignment bash ran as a command, the program bash could not run by its name, and a setup
-// failure's message: a bad interpreter, a wrapper's own, a deleted working directory, two paths.
+// ugrep's "warning", jq's "Could not open file", the shell's cd, bash's script and its line's redirection, and zsh's
+// word after its mark, with the same directory, remote and cut rules. What is no path keeps its words: an option or
+// a glob in its place, a path with a space, an assignment bash ran as a command, the program bash could not run by
+// its name, a command line zsh ran as one word, and a setup failure's message: a bad interpreter, a wrapper's own, a
+// deleted working directory, two paths.
 func TestACommandsUnquotedMissIsKeyedByItsPath(t *testing.T) {
 	t.Setenv("HOME", "/home/u")
 	for _, c := range []struct{ harness, tool, text, call, cwd, want string }{
@@ -186,6 +187,17 @@ func TestACommandsUnquotedMissIsKeyedByItsPath(t *testing.T) {
 		{"claude", "Bash", "Exit code 127 bash: run.sh: No such file or directory", `{"command":"bash run.sh"}`, "/w", "miss:exec:run.sh"},
 		{"claude", "Bash", "Exit code 1 /bin/bash: line 3: /x/out/a.log: No such file or directory", `{"command":"run > /x/out/a.log"}`, "/w", "miss:exec:/x/out/a.log"},
 		{"claude", "Bash", "Exit code 1 bash: line 1: in.txt: No such file or directory", `{"command":"wc -l < in.txt"}`, "/w", "miss:exec:in.txt"},
+		// zsh, by the word after its mark: a script, a redirection, cd, source and . under Claude Code's eval and Codex's zsh
+		{"claude", "Bash", "Exit code 127 (eval):1: no such file or directory: ./tools/check.sh", `{"command":"./tools/check.sh"}`, "/w", "miss:exec:tools/check.sh"},
+		{"codex", "exec_command", "Process exited with code 1 Output: zsh:1: no such file or directory: out/a.log", `{"cmd":"run > out/a.log"}`, "/w", "miss:exec:out/a.log"},
+		{"codex", "exec_command", "Process exited with code 1 Output: zsh:cd:1: no such file or directory: review-1", `{"cmd":"cd review-1 && ls"}`, "/w", "miss:exec:review-1"},
+		{"claude", "Bash", "Exit code 1 (eval):cd:2: no such file or directory: /x/agent", `{"command":"ls; cd /x/agent"}`, "/w", "miss:exec:/x/agent"},
+		{"codex", "exec_command", "Process exited with code 127 Output: zsh:source:2: no such file or directory: .env curl: (3) URL rejected", `{"cmd":"source .env\ncurl $U"}`, "/w",
+			"miss:exec:.env"},
+		{"claude", "Bash", "Exit code 1 (eval):.:1: no such file or directory: /x/a.env", `{"command":". /x/a.env; run"}`, "/w", "miss:exec:/x/a.env"},
+		// two messages of sed's, by the first: the apostrophes of two can'ts quote nothing between them
+		{"claude", "Bash", "Exit code 2 sed: can't read a.md: No such file or directory sed: can't read b.md: No such file or directory", `{"command":"sed -n 1p a.md b.md"}`, "/w",
+			"miss:exec:a.md"},
 		// the quoted form's rules: the call's directory stripped, the home folded, a command the store cut, the mistakes
 		// log's, a host
 		{"claude", "Bash", "Exit code 1 cat: /w/wt1/scripts/c.py: No such file or directory", `{"command":"cat scripts/c.py"}`, "/w/wt1", "miss:exec:scripts/c.py"},
@@ -194,6 +206,11 @@ func TestACommandsUnquotedMissIsKeyedByItsPath(t *testing.T) {
 		{"claude", "Bash", "Exit code 1 cat: /x/a.txt: No such file or directory", "", "", "miss:exec:/x/a.txt"},
 		{"claude", "Bash", "Exit code 1 cat: /r/a: No such file or directory", `{"command":"ssh box cat /r/a"}`, "/w", "miss:exec:box:/r/a"},
 		{"claude", "Bash", "Exit code 1 scp: /r/x.log: No such file or directory", `{"command":"scp box:/r/x.log /w/"}`, "/w", "miss:exec:box:/r/x.log"},
+		// and zsh's: the call's directory stripped, the home folded, a host, a path the store cut
+		{"claude", "Bash", "Exit code 1 (eval):cd:1: no such file or directory: /w/wt1/sub", `{"command":"cd /w/wt1/sub"}`, "/w/wt1", "miss:exec:sub"},
+		{"claude", "Bash", "Exit code 127 (eval):1: no such file or directory: /home/u/p/run.sh", `{"command":"~/p/run.sh"}`, "/w", "miss:exec:~/p/run.sh"},
+		{"codex", "exec_command", "Process exited with code 1 Output: zsh:cd:1: no such file or directory: /r/x", `{"cmd":"ssh box 'cd /r/x && ls'"}`, "/w", "miss:exec:box:/r/x"},
+		{"claude", "Bash", "Exit code 1 (eval):1: no such file or directory: /x/out/a-long-na…", `{"command":"run > /x/out/a-long-name.log"}`, "/w", ""},
 		// words: a host the command line does not name, two scp hosts
 		{"claude", "Bash", "Exit code 1 cat: /r/a: No such file or directory", `{"command":"ssh $H cat /r/a"}`, "/w", "exec:cat: P: no such file or directory"},
 		{"claude", "Bash", "Exit code 1 scp: /r/x.log: No such file or directory", `{"command":"scp a:/r/x.log b:/r/"}`, "/w", "exec:scp: P: no such file or directory"},
@@ -208,6 +225,10 @@ func TestACommandsUnquotedMissIsKeyedByItsPath(t *testing.T) {
 		// words: an assignment bash ran as a command, from a variable's expansion
 		{"hermes", "terminal", `{"output": "/usr/bin/bash: line 5: PYTHONPATH=/x/y: No such file or directory", "exit_code": 127, "error": null}`,
 			`{"command":"GS=\"PYTHONPATH=/x/y python3 -m x\"; $GS --check"}`, "/w", "exec:no such file or directory"},
+		// words: a command line zsh ran as one word from a variable, by its assignment or its program's name
+		{"claude", "Bash", "Exit code 127 (eval):1: no such file or directory: PYTHONPATH=/x/y python3 -m x", `{"command":"GS=\"PYTHONPATH=/x/y python3 -m x\"; $GS"}`, "/w",
+			"exec:no such file or directory: pythonpath=P"},
+		{"claude", "Bash", "Exit code 127 (eval):1: no such file or directory: git -C /x log", `{"command":"G=\"git -C /x\"; $G log"}`, "/w", "exec:no such file or directory: git"},
 		// words: a setup failure's message, a bad interpreter, a wrapper's own, a deleted working directory, two paths
 		{"claude", "Bash", "Exit code 126 bash: ./x: /bin/foo: bad interpreter: No such file or directory", `{"command":"./x"}`, "/w", "exec:interpreter: no such file or directory"},
 		{"claude", "Bash", "Exit code 127 env: foo: No such file or directory", `{"command":"env foo"}`, "/w", "exec:foo: no such file or directory"},

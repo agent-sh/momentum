@@ -203,6 +203,11 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		{"claude", "Bash", "Exit code 1 Error: ENOENT: no such file or directory, open '/srv/app/a.json'", "miss:exec:/srv/app/a.json"},
 		{"claude", "Bash", "Exit code 2 grep: '/w/connection refused': No such file or directory", "miss:exec:/w/connection refused"},
 		{"claude", "Bash", "Exit code 1 Traceback (most recent call last): File \"x.py\", line 9, in <module> if \"no module named\" in err: raise", ""},
+		// a word's apostrophe opens no quoted value, but a string's prefix does
+		{"claude", "Bash", "Exit code 1 x: can't open cfg: Permission denied x: can't bind :80: Address already in use", "exec:cfg: permission denied"},
+		{"claude", "Bash", "Exit code 1 your project's requirements are unsatisfiable. Traceback (most recent call last): ModuleNotFoundError: No module named 'torch'",
+			"exec:modulenotfounderror: no module named"},
+		{"claude", "Bash", "Exit code 1 475- f'got {name!r}' Traceback (most recent call last): ModuleNotFoundError: No module named 'xllm'", "exec:modulenotfounderror: no module named"},
 		{"claude", "Bash", "Exit code 2 usage: \x1b[1mx-tool\x1b[0m [-h] --repo REPO", "exec:usage: x-tool"},
 		{"claude", "Bash", "Exit code 1 CPU usage: 12.5% memory usage: 40% check failed", ""},
 		{"claude", "Bash", "Exit code 1 httpx.ConnectError: [Errno -3] Temporary failure in name resolution", "exec:httpx.connecterror: [errno -N] temporary failure in name resolution"},

@@ -1111,10 +1111,10 @@ var tailRe = regexp.MustCompile(`^:\s+([^\s,;]{1,40})`)
 // output alone does not say that it named one. An output that shows the work failing has no key.
 //
 // The programs are the call's (callPrograms). A message that says no file is at a path it names in quotes
-// (quotedMiss), or unquoted after its program's name (unquotedMiss), is no message of words: its key is execMiss,
-// its text that path as the message names it, which failureKey keys as commandMissed says. A call that may have run
-// on another host (remote) is keyed by that host and the path when its command line names the host, else by its
-// words.
+// (quotedMiss), or unquoted after its program's name or zsh's mark (unquotedMiss), is no message of words: its key
+// is execMiss, its text that path as the message names it, which failureKey keys as commandMissed says. A call that
+// may have run on another host (remote) is keyed by that host and the path when its command line names the host,
+// else by its words.
 func execKey(out, call string) (FailureKey, bool) {
 	programs := callPrograms(call)
 	out = strings.Join(strings.Fields(out), " ")
@@ -1185,12 +1185,22 @@ func execKey(out, call string) (FailureKey, bool) {
 var exceptionRe = regexp.MustCompile(`^(?:[\w.]+\.)?[A-Z][A-Za-z0-9]*(?:Error|Exception)$`)
 
 // quotedRe are the quoted values of an output, inside which a mark is a value's word (a file named after an
-// error, a line of code), not what the command said.
-var quotedRe = regexp.MustCompile("'[^'\n]*'|\"[^\"\n]*\"|`[^`\n]*`|‘[^’\n]*’|“[^”\n]*”")
+// error, a line of code), not what the command said: the first group's or the second's. A single quote opens one
+// only with no letter or digit before it, as in mask, or after a string's prefix (Python's f, b, r or u): a word's
+// apostrophe opens none, so two can'ts quote nothing between them, and one does not pair with a path's quote
+// ("can't open file 'PATH'").
+var quotedRe = regexp.MustCompile("(\"[^\"\n]*\"|`[^`\n]*`|‘[^’\n]*’|“[^”\n]*”)|(?:^|[^\\pL\\pN])(?i:[bfru]{1,2})?('[^'\n]*')")
 
 // firstMark is where the first mark of the setup failing outside a quoted value is in out, or nil.
 func firstMark(out string) []int {
-	quoted := quotedRe.FindAllStringIndex(out, -1)
+	var quoted [][2]int
+	for _, q := range quotedRe.FindAllStringSubmatchIndex(out, -1) {
+		if q[2] >= 0 {
+			quoted = append(quoted, [2]int{q[2], q[3]})
+		} else {
+			quoted = append(quoted, [2]int{q[4], q[5]})
+		}
+	}
 	for _, m := range infraRe.FindAllStringIndex(out, -1) {
 		in := false
 		for _, q := range quoted {
@@ -1275,32 +1285,55 @@ func quotedMiss(out string, loc []int) (string, bool) {
 var unquotedMissRe = regexp.MustCompile(`(?:^|\s)(?:[^\s:]*/)?(?:(?:rg|cat|wc|grep|cut|sha256sum|scp|cd): |rg: \S+: IO error for operation on |sed: can't read |` +
 	`ugrep: warning: |jq: error: Could not open file |(bash)(?:: line \d+)?: )(\S+): $`)
 
+// zshMissRe is zsh's message of a missing file up to its mark, after which zsh names the path: zsh by its name or
+// its path, or eval's under Claude Code, the builtin that found no file (cd, source, .) and the line's number, as in
+// "zsh:1: no such file or directory: PATH" and "(eval):cd:1: no such file or directory: PATH".
+var zshMissRe = regexp.MustCompile(`(?:^|\s)(?:[^\s:]*/)?(?:zsh|\(eval\))(:(?:cd|source|\.))?(?::\d+)?: $`)
+
+// zshPathRe is the word after zsh's mark.
+var zshPathRe = regexp.MustCompile(`^: (\S+)`)
+
 // unquotedMiss is the path a command's message says no file is at when it names it unquoted, and whether it names
-// one: "PROG: PATH: No such file or directory" for a program of unquotedMissRe's. The path is one word that opens
-// with /, ~/ or a name's letter, digit, _ or . (./ and ../ too), so an option ("rg: -g: ") or a glob the shell did
-// not expand names none, nor does an assignment ("PYTHONPATH=/x: "), which bash ran as a command from a variable's
-// expansion. Nor does bash's message when it names a program by a name with no slash, one of the call's programs or
-// of a call that names none: that is the command the shell could not run, which recurs under one key, not an
-// argument. Nor does a setup failure's message: a wrapper's own (env, timeout, nohup), whose program is none of
-// these, and a bad interpreter ("bash: ./x: /bin/foo: bad interpreter: "), a deleted working directory ("getcwd:
-// cannot access parent directories: ") or two paths, whose words stand between the program and the mark.
+// one: "PROG: PATH: No such file or directory" for a program of unquotedMissRe's, and zsh's "no such file or
+// directory: PATH" (zshMissRe), its word after the mark. The path is one word that opens with /, ~/ or a name's
+// letter, digit, _ or . (./ and ../ too), so an option ("rg: -g: ") or a glob the shell did not expand names none,
+// nor does an assignment ("PYTHONPATH=/x: "), which bash ran as a command from a variable's expansion. Nor does
+// bash's message when it names a program by a name with no slash, one of the call's programs or of a call that
+// names none: that is the command the shell could not run, which recurs under one key, not an argument. Nor does
+// zsh's own message (not its cd's, source's or .'s) when its word has no slash: zsh says "command not found" for a
+// name it does not find, so that word opens a command line it ran as one word, a variable's value it does not split.
+// Nor does a setup failure's message: a wrapper's own (env, timeout, nohup), whose program is none of these, and a
+// bad interpreter ("bash: ./x: /bin/foo: bad interpreter: "), a deleted working directory ("getcwd: cannot access
+// parent directories: ") or two paths, whose words stand between the program and the mark. A word of zsh's that the
+// store's cut ends names a path cut short: "", which keys nothing.
 func unquotedMiss(out string, loc []int, programs map[string]bool) (string, bool) {
 	if !strings.EqualFold(out[loc[0]:loc[1]], "no such file or directory") {
 		return "", false
 	}
-	m := unquotedMissRe.FindStringSubmatch(out[:loc[0]])
-	if m == nil {
+	var p string
+	ran, cut := false, false // the message may name the command the shell could not run; the store cut its path
+	if m := unquotedMissRe.FindStringSubmatch(out[:loc[0]]); m != nil {
+		p, ran = m[2], m[1] != ""
+	} else if z := zshMissRe.FindStringSubmatch(out[:loc[0]]); z != nil {
+		w := zshPathRe.FindStringSubmatch(out[loc[1]:])
+		if w == nil || z[1] == "" && !strings.Contains(w[1], "/") {
+			return "", false
+		}
+		p, cut = w[1], loc[1]+len(w[0]) == len(out) && strings.HasSuffix(w[1], "…")
+	} else {
 		return "", false
 	}
-	p := m[2]
 	if r, _ := utf8.DecodeRuneInString(p); !(r == '/' || strings.HasPrefix(p, "~/") || r == '_' || r == '.' || unicode.IsLetter(r) || unicode.IsDigit(r)) {
 		return "", false
 	}
 	if assignRe.MatchString(p) {
 		return "", false
 	}
-	if m[1] != "" && !strings.Contains(p, "/") && (len(programs) == 0 || programs[strings.ToLower(p)]) {
+	if ran && !strings.Contains(p, "/") && (len(programs) == 0 || programs[strings.ToLower(p)]) {
 		return "", false
+	}
+	if cut {
+		return "", true
 	}
 	return p, true
 }
