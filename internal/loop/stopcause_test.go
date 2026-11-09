@@ -1395,16 +1395,20 @@ func TestCheckingAPackageWithNoHostCloneIsNoRefusal(t *testing.T) {
 // A test that runs past the check's time limit, or prints past its output limit, is the build's refusal at the check,
 // which the next build reads in refusal.md, not the host's error.
 func TestATestPastTheCheckLimitsIsTheBuildsRefusal(t *testing.T) {
-	for _, c := range []struct{ name, test, why string }{
-		{"time", "import time\ntime.sleep(60)\n", "the test ran past the check's time limit (3s)"},
-		{"output", "import sys\nsys.stdout.write('x' * (9 << 20))\nsys.exit(1)\n", "the test printed past the check's output limit (8 MiB)"},
+	for _, c := range []struct {
+		name, test, why string
+		limit           time.Duration
+	}{
+		{"time", "import time\ntime.sleep(60)\n", "the test ran past the check's time limit (3s)", 3 * time.Second},
+		// a limit of its own, far from the output's few seconds, so a slow sandbox start never reads as the time limit
+		{"output", "import sys\nsys.stdout.write('x' * (9 << 20))\nsys.exit(1)\n", "the test printed past the check's output limit (8 MiB)", time.Minute},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			ctx := context.Background()
 			st := testStore(t)
 			f := newRepo(t, nil)
 			s := shipFor(t, st, f)
-			s.Sandbox.Timeout = 3 * time.Second
+			s.Sandbox.Timeout = c.limit
 			cs := testingCase(t, st)
 			p, err := s.Prepare(ctx, cs.ID, f.main)
 			if err != nil {
@@ -1417,6 +1421,30 @@ func TestATestPastTheCheckLimitsIsTheBuildsRefusal(t *testing.T) {
 				t.Fatalf("a test past the check's %s limit: %v", c.name, err)
 			}
 		})
+	}
+}
+
+// A pass whose own deadline ends while the test runs is the host's error, not the build's refusal: the check's time
+// limit did not end the test.
+func TestAPassThatEndsDuringTheCheckIsNoRefusal(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	f := newRepo(t, nil)
+	s := shipFor(t, st, f)
+	s.Sandbox.Timeout = time.Minute
+	cs := testingCase(t, st)
+	p, err := s.Prepare(ctx, cs.ID, f.main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(p.Work, "fake.go"), strings.Replace(fakeGo, "return 41", "return 42", 1))
+	write(t, filepath.Join(p.Work, "limit_test.py"), "import time\ntime.sleep(60)\n")
+	patch := fixturePatch(t, s, p.Case)
+	pass, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	_, err = s.Check(pass, cs.ID, "python3 limit_test.py", nil, patch)
+	if err == nil || errors.Is(err, ErrRefused) || !errors.Is(pass.Err(), context.DeadlineExceeded) {
+		t.Fatalf("a pass that ended during the check: %v", err)
 	}
 }
 
