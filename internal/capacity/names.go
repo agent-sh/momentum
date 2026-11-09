@@ -12,23 +12,28 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/pelletier/go-toml/v2"
 )
 
 // A path that a systemd unit (enabled, loaded in any state, or started by an enabled timer, path or socket), a
 // crontab line, an enabled Hermes job or an MCP server a harness starts names is never deleted: the job would fail
 // the next time it runs. Nor is what an installed command's symlink points into. An MCP server names what its
-// configuration says (its command, arguments, working directory and environment) and, one level deep, what the
-// script it runs says: a server that starts a short-lived program for each call is never seen by the sampler. A unit names what its files say (its fragment and drop-ins)
+// configuration says (its command and arguments, its working directory, its environment's values; not its request
+// headers) and, one level deep, what its command and arguments are: a server that starts a short-lived program for
+// each call is never seen by the sampler. A unit names what its files say (its fragment and drop-ins)
 // and what systemd expands from them (its commands, environment and working directory), and what it hands its
 // program, one level deep: its EnvironmentFiles, and a script its commands run. A word relative to a unit's
 // working directory, or to a `cd` before it on a crontab line, names the path it resolves to. A file of the user's
-// own jobs (a user unit's, a crontab script, a Hermes job's script) that cannot be read makes the names incomplete,
-// and the caller deletes nothing. A system unit's file the user cannot read (root's configuration) is a warning:
+// own jobs (a user unit's, a crontab script, a Hermes job's script, an MCP configuration, a server's command and
+// the script it runs) that cannot be read makes the names incomplete, and the caller deletes nothing. A system
+// unit's file the user cannot read (root's configuration) is a warning:
 // root's processes are as unreadable to the sampler, which is a limit of an unprivileged run. A script in a
 // repository that no job runs names nothing: the owner ruled that models are downloaded again when work on them
 // resumes.
@@ -87,7 +92,10 @@ func LoadNamed(ctx context.Context, jobs Jobs, cfg NamesConfig, m *Mounts) (*Nam
 			}
 		}
 	}
-	addText := func(job, text, dir string, follow bool) {
+	// paths names the paths and repository ids a job's text says, and returns the paths, each once
+	paths := func(job, text, dir string) []string {
+		var out []string
+		seen := map[string]bool{}
 		for _, w := range words(text) {
 			switch {
 			case filepath.IsAbs(w):
@@ -105,23 +113,35 @@ func LoadNamed(ctx context.Context, jobs Jobs, cfg NamesConfig, m *Mounts) (*Nam
 			default:
 				continue
 			}
-			addPath(job, w)
-			if !follow {
-				continue
+			if !seen[w] { // a quoted word is a word as well as its parts
+				seen[w] = true
+				addPath(job, w)
+				out = append(out, w)
 			}
-			b, ok, err := smallText(w)
-			if err != nil {
-				errs = append(errs, job+": "+err.Error())
+		}
+		return out
+	}
+	// follow names what the script at w says, one level deep; an error is a file that is there and cannot be read
+	follow := func(job, w string) error {
+		b, ok, err := smallText(w)
+		if !ok {
+			return err
+		}
+		for _, w2 := range words(b) {
+			switch {
+			case filepath.IsAbs(w2):
+				addPath(job+" (via "+filepath.Base(w)+")", w2)
+			case isRepoID(w2) && n.RepoIDs[w2] == "":
+				n.RepoIDs[w2] = job + " (via " + filepath.Base(w) + ")"
 			}
-			if !ok {
-				continue
-			}
-			for _, w2 := range words(b) {
-				switch {
-				case filepath.IsAbs(w2):
-					addPath(job+" (via "+filepath.Base(w)+")", w2)
-				case isRepoID(w2) && n.RepoIDs[w2] == "":
-					n.RepoIDs[w2] = job + " (via " + filepath.Base(w) + ")"
+		}
+		return nil
+	}
+	addText := func(job, text, dir string, follows bool) {
+		for _, w := range paths(job, text, dir) {
+			if follows {
+				if err := follow(job, w); err != nil {
+					errs = append(errs, job+": "+err.Error())
 				}
 			}
 		}
@@ -186,12 +206,31 @@ func LoadNamed(ctx context.Context, jobs Jobs, cfg NamesConfig, m *Mounts) (*Nam
 			errs = append(errs, "mcp "+f+": "+err.Error())
 		}
 		for _, s := range servers {
-			// a server is a job a harness starts: its command, and the script it runs, one level deep
-			addText("mcp "+s.Name, s.Text, s.Dir, true)
+			// A server is a job a harness starts: its command and arguments name paths and are read one level
+			// deep. Only its command and the script it runs (its first argument that is no option) hold the run
+			// when they cannot be read; another argument names itself. Its other strings (its environment's
+			// values) name and are never read: a value may be a secret. So an error names the server and errno.
+			job := "mcp " + s.Name
+			for _, v := range s.Other {
+				paths(job, strconv.Quote(v), s.Dir)
+			}
+			script := 1 + slices.IndexFunc(s.Args, func(a string) bool { return !strings.HasPrefix(a, "-") })
+			for i, v := range append([]string{s.Command}, s.Args...) {
+				for _, w := range paths(job, strconv.Quote(v), s.Dir) {
+					if err := follow(job, w); err != nil && (i == 0 || i == script) {
+						what := "script"
+						if i == 0 {
+							what = "command"
+						}
+						errs = append(errs, job+": its "+what+" cannot be read: "+errnoOf(err))
+					}
+				}
+			}
 		}
 	}
 	if len(errs) > 0 {
 		sort.Strings(errs)
+		errs = slices.Compact(errs)
 		return n, fmt.Errorf("%s", strings.Join(errs[:min(len(errs), 5)], "; "))
 	}
 	return n, nil
@@ -226,12 +265,22 @@ func expandHome(p string) string {
 	return p
 }
 
+// errnoOf is an error's errno without the path it names.
+func errnoOf(err error) string {
+	var e syscall.Errno
+	if errors.As(err, &e) {
+		return e.Error()
+	}
+	return "not an errno"
+}
+
 // smallText is a file's text when it is a regular file of at most 1 MiB that holds no NUL byte: a script or an
-// environment file, not a program. A file that exists but cannot be read is an error.
+// environment file, not a program. A file that exists but cannot be read is an error; a word too long for a path
+// is no file.
 func smallText(p string) (string, bool, error) {
 	st, err := os.Stat(p)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.ENAMETOOLONG) {
 			return "", false, nil
 		}
 		return "", false, err
@@ -315,12 +364,19 @@ func hermesJobs(path, scripts string) ([]JobText, error) {
 	return out, nil
 }
 
-// mcpServers is the text of each MCP server a harness's configuration file starts: its command, arguments, working
-// directory and environment, each string on a line of its own, quoted, so a path keeps its spaces. A JSON file holds
-// mcpServers at its top and in each of its projects (Claude Code's ~/.claude.json), and each project's .mcp.json
-// holds more; a TOML file holds [mcp_servers.NAME] tables (Codex); a YAML file an mcp_servers map (Hermes). A
-// missing file is no servers.
-func mcpServers(path string) ([]JobText, error) {
+// mcpServer is what a harness's configuration says of an MCP server it starts: its command and arguments, the
+// directory it runs in, and its other strings (its environment's values, its working directory), which only name.
+// A request's headers are not read: they carry tokens, and name no path.
+type mcpServer struct {
+	Name, Command, Dir string
+	Args, Other        []string
+}
+
+// mcpServers is each MCP server a harness's configuration file starts. A JSON file holds mcpServers at its top and
+// in each of its projects (Claude Code's ~/.claude.json), and each such project's .mcp.json holds more, which run in
+// the project; a TOML file holds an mcp_servers table (Codex); a YAML file an mcp_servers map (Hermes). A missing
+// file is no servers.
+func mcpServers(path string) ([]mcpServer, error) {
 	b, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
@@ -330,9 +386,15 @@ func mcpServers(path string) ([]JobText, error) {
 	}
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".toml":
-		return mcpSections(string(b), tomlServer), nil
+		var f struct {
+			Servers map[string]any `toml:"mcp_servers"`
+		}
+		if err := toml.Unmarshal(b, &f); err != nil {
+			return nil, err
+		}
+		return serversOf(f.Servers, ""), nil
 	case ".yaml", ".yml":
-		return mcpSections(string(b), yamlServer()), nil
+		return serversOf(yamlMCP(string(b)), ""), nil
 	}
 	var f struct {
 		Servers  map[string]any `json:"mcpServers"`
@@ -343,28 +405,25 @@ func mcpServers(path string) ([]JobText, error) {
 	if err := json.Unmarshal(b, &f); err != nil {
 		return nil, err
 	}
-	out := jsonServers(f.Servers, "")
+	out := serversOf(f.Servers, "")
 	var errs []string
-	projects := make([]string, 0, len(f.Projects))
-	for p := range f.Projects {
-		projects = append(projects, p)
-	}
-	sort.Strings(projects)
-	for _, p := range projects {
-		out = append(out, jsonServers(f.Projects[p].Servers, p)...)
-		if !filepath.IsAbs(p) || filepath.Clean(p) == filepath.Clean(filepath.Dir(path)) {
+	for _, p := range sortedKeys(f.Projects) {
+		out = append(out, serversOf(f.Projects[p].Servers, p)...)
+		if !filepath.IsAbs(p) {
 			continue
 		}
-		more, err := mcpServers(filepath.Join(p, ".mcp.json"))
-		if err != nil && !errors.Is(err, syscall.ENOTDIR) {
+		// a project's .mcp.json is read for its servers only: its projects, if it lists any, are not Claude Code's
+		var m struct {
+			Servers map[string]any `json:"mcpServers"`
+		}
+		b, err := os.ReadFile(filepath.Join(p, ".mcp.json"))
+		if err == nil {
+			err = json.Unmarshal(b, &m)
+		}
+		if err != nil && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
 			errs = append(errs, p+"/.mcp.json: "+err.Error())
 		}
-		for _, s := range more {
-			if s.Dir == "" {
-				s.Dir = p
-			}
-			out = append(out, s)
-		}
+		out = append(out, serversOf(m.Servers, p)...)
 	}
 	if len(errs) > 0 {
 		return out, fmt.Errorf("%s", strings.Join(errs[:min(len(errs), 5)], "; "))
@@ -372,126 +431,262 @@ func mcpServers(path string) ([]JobText, error) {
 	return out, nil
 }
 
-// jsonServers is the text of each server of a JSON mcpServers object; a server runs in its cwd, else in dir.
-func jsonServers(servers map[string]any, dir string) []JobText {
-	names := make([]string, 0, len(servers))
-	for k := range servers {
-		names = append(names, k)
-	}
-	sort.Strings(names)
-	var out []JobText
-	for _, name := range names {
-		var text strings.Builder
-		var strs func(v any)
-		strs = func(v any) {
-			switch x := v.(type) {
-			case string:
-				text.WriteString(strconv.Quote(x) + "\n")
-			case []any:
-				for _, e := range x {
-					strs(e)
-				}
-			case map[string]any:
-				for _, e := range x {
-					strs(e)
-				}
-			}
-		}
-		strs(servers[name])
-		d := dir
-		if m, ok := servers[name].(map[string]any); ok {
-			if c, ok := m["cwd"].(string); ok && filepath.IsAbs(expandHome(c)) {
-				d = expandHome(c)
-			}
-		}
-		out = append(out, JobText{Name: name, Text: text.String(), Dir: d})
-	}
-	return out
-}
-
-// mcpSections splits a configuration file's text into its MCP servers' texts: server says, for each line, the
-// server it begins (a name), whether it is the server's (in), or whether it ends the servers' part (out).
-func mcpSections(text string, server func(line string) (name string, in bool)) []JobText {
-	var out []JobText
-	at := map[string]int{}
-	cur := ""
-	for _, l := range strings.Split(text, "\n") {
-		name, in := server(l)
-		switch {
-		case name != "":
-			cur = name
-			if _, ok := at[cur]; !ok {
-				at[cur] = len(out)
-				out = append(out, JobText{Name: cur})
-			}
-		case !in:
-			cur = ""
-		}
-		if cur == "" {
+// serversOf is each server of a mcpServers or mcp_servers map; a server runs in its cwd, else in dir.
+func serversOf(servers map[string]any, dir string) []mcpServer {
+	var out []mcpServer
+	for _, name := range sortedKeys(servers) {
+		m, ok := servers[name].(map[string]any)
+		if !ok {
 			continue
 		}
-		j := &out[at[cur]]
-		j.Text += l + "\n"
-		for _, sep := range []string{"=", ":"} {
-			if k, v, ok := strings.Cut(strings.TrimSpace(l), sep); ok && strings.TrimSpace(k) == "cwd" {
-				if d := expandHome(strings.Trim(strings.TrimSpace(v), `"'`)); filepath.IsAbs(d) {
-					j.Dir = d
-				}
+		s := mcpServer{Name: name, Dir: dir}
+		if c, ok := m["cwd"].(string); ok && filepath.IsAbs(expandHome(c)) {
+			s.Dir = expandHome(c)
+		}
+		for _, k := range sortedKeys(m) {
+			switch k {
+			case "command":
+				s.Command, _ = m[k].(string)
+			case "args":
+				s.Args = stringsOf(m[k])
+			default:
+				s.Other = append(s.Other, stringsOf(m[k])...)
 			}
 		}
+		out = append(out, s)
 	}
 	return out
 }
 
-// tomlServer reads a TOML line: a table header [mcp_servers.NAME] or [mcp_servers.NAME.sub] begins or continues
-// NAME, any other header ends it, and every other line is the current table's.
-func tomlServer(l string) (string, bool) {
-	t := strings.TrimSpace(l)
-	if !strings.HasPrefix(t, "[") {
-		return "", true
-	}
-	h := strings.TrimSpace(strings.Trim(t, "[] "))
-	rest, ok := strings.CutPrefix(h, "mcp_servers.")
-	if !ok {
-		return "", false
-	}
-	if strings.HasPrefix(rest, `"`) {
-		if name, _, ok := strings.Cut(rest[1:], `"`); ok {
-			return name, true
+// stringsOf is every string in a decoded value, but a request's headers.
+func stringsOf(v any) []string {
+	switch x := v.(type) {
+	case string:
+		return []string{x}
+	case []any:
+		var out []string
+		for _, e := range x {
+			out = append(out, stringsOf(e)...)
 		}
-	}
-	name, _, _ := strings.Cut(rest, ".")
-	return strings.TrimSpace(name), true
-}
-
-// yamlServer reads a YAML file's lines: the keys of the top-level mcp_servers map begin its servers, the lines
-// indented under one are that server's, and the next top-level key ends them.
-func yamlServer() func(string) (string, bool) {
-	inMap, indent := false, -1
-	return func(l string) (string, bool) {
-		t := strings.TrimSpace(l)
-		if t == "" || strings.HasPrefix(t, "#") {
-			return "", true
-		}
-		lead := len(l) - len(strings.TrimLeft(l, " \t"))
-		if lead == 0 {
-			inMap = strings.HasPrefix(t, "mcp_servers:")
-			indent = -1
-			return "", false
-		}
-		if !inMap {
-			return "", false
-		}
-		if indent < 0 {
-			indent = lead
-		}
-		if lead == indent {
-			if k, _, ok := strings.Cut(t, ":"); ok {
-				return strings.Trim(strings.TrimSpace(k), `"'`), true
+		return out
+	case map[string]any:
+		var out []string
+		for _, k := range sortedKeys(x) {
+			switch k {
+			case "headers", "http_headers", "env_http_headers":
+			default:
+				out = append(out, stringsOf(x[k])...)
 			}
 		}
-		return "", true
+		return out
 	}
+	return nil
+}
+
+// yamlMCP is a YAML file's top-level mcp_servers map, read with the part of YAML a harness's configuration uses:
+// maps and lists in block form (by indentation) and in flow form ({...}, [...]), and plain and quoted scalars.
+func yamlMCP(text string) map[string]any {
+	var ls []yamlLine
+	for _, l := range strings.Split(text, "\n") {
+		t := strings.TrimSpace(l)
+		if i := yamlFind(t, func(i int) bool { return t[i] == '#' && (i == 0 || t[i-1] == ' ' || t[i-1] == '\t') }); i >= 0 {
+			t = strings.TrimSpace(t[:i]) // a comment
+		}
+		if t != "" {
+			ls = append(ls, yamlLine{len(l) - len(strings.TrimLeft(l, " \t")), t})
+		}
+	}
+	for i := 0; i < len(ls); i++ {
+		if k, v, ok := yamlKey(ls[i].t); ok && ls[i].ind == 0 && k == "mcp_servers" {
+			i++
+			var m any
+			if v != "" {
+				m = yamlValue(v, ls, &i)
+			} else if i < len(ls) && ls[i].ind > 0 {
+				m = yamlBlock(ls, &i, ls[i].ind)
+			}
+			out, _ := m.(map[string]any)
+			return out
+		}
+	}
+	return nil
+}
+
+// yamlLine is a YAML line without its comment, and its indentation.
+type yamlLine struct {
+	ind int
+	t   string
+}
+
+// yamlBlock reads the block at indentation ind from ls[*i]: a list when its first line is an item, else a map. A
+// line it does not know (a plain scalar's continuation) is skipped.
+func yamlBlock(ls []yamlLine, i *int, ind int) any {
+	item := func(t string) bool { return t == "-" || strings.HasPrefix(t, "- ") }
+	if item(ls[*i].t) {
+		var out []any
+		for *i < len(ls) && ls[*i].ind >= ind {
+			if t := ls[*i].t; ls[*i].ind == ind && item(t) {
+				*i++
+				out = append(out, yamlValue(strings.TrimSpace(t[1:]), ls, i))
+			} else {
+				*i++
+			}
+		}
+		return out
+	}
+	m := map[string]any{}
+	for *i < len(ls) && ls[*i].ind >= ind {
+		k, v, ok := yamlKey(ls[*i].t)
+		*i++
+		switch {
+		case ls[*i-1].ind > ind || !ok:
+		case v == "" && *i < len(ls) && (ls[*i].ind > ind || ls[*i].ind == ind && item(ls[*i].t)):
+			m[k] = yamlBlock(ls, i, ls[*i].ind)
+		case strings.HasPrefix(v, "|") || strings.HasPrefix(v, ">"): // a block scalar: the lines indented under it
+			var b []string
+			for ; *i < len(ls) && ls[*i].ind > ind; *i++ {
+				b = append(b, ls[*i].t)
+			}
+			m[k] = strings.Join(b, "\n")
+		default:
+			m[k] = yamlValue(v, ls, i)
+		}
+	}
+	return m
+}
+
+// yamlValue is a value on a line: a flow collection, with the lines it continues on (which it consumes), or a
+// scalar.
+func yamlValue(v string, ls []yamlLine, i *int) any {
+	if !strings.HasPrefix(v, "{") && !strings.HasPrefix(v, "[") {
+		return yamlUnquote(v)
+	}
+	depth := func(t string) int {
+		d := 0
+		yamlFind(t, func(i int) bool {
+			d += strings.Count("{[", t[i:i+1]) - strings.Count("}]", t[i:i+1])
+			return false
+		})
+		return d
+	}
+	for d := depth(v); d > 0 && *i < len(ls); *i++ {
+		v += " " + ls[*i].t
+		d += depth(ls[*i].t)
+	}
+	p := yamlFlow{s: v}
+	return p.value()
+}
+
+// yamlFind is the index of the first byte of t outside quotes that f accepts, or -1.
+func yamlFind(t string, f func(i int) bool) int {
+	var q byte
+	for i := 0; i < len(t); i++ {
+		switch c := t[i]; {
+		case q != 0:
+			if c == q {
+				q = 0
+			}
+		case c == '"' || c == '\'':
+			q = c
+		case f(i):
+			return i
+		}
+	}
+	return -1
+}
+
+// yamlKey splits a map's line at the colon that ends its key: one outside quotes followed by a space or the end.
+func yamlKey(t string) (string, string, bool) {
+	i := yamlFind(t, func(i int) bool { return t[i] == ':' && (i+1 == len(t) || t[i+1] == ' ' || t[i+1] == '\t') })
+	if i < 0 {
+		return "", "", false
+	}
+	return yamlUnquote(strings.TrimSpace(t[:i])), strings.TrimSpace(t[i+1:]), true
+}
+
+// yamlUnquote is a scalar without its quotes.
+func yamlUnquote(v string) string {
+	if len(v) < 2 || v[0] != v[len(v)-1] {
+		return v
+	}
+	switch v[0] {
+	case '"':
+		if u, err := strconv.Unquote(v); err == nil {
+			return u
+		}
+		return v[1 : len(v)-1]
+	case '\'':
+		return strings.ReplaceAll(v[1:len(v)-1], "''", "'")
+	}
+	return v
+}
+
+// yamlFlow reads a flow collection.
+type yamlFlow struct {
+	s string
+	i int
+}
+
+// value reads a map, a list or a scalar, and steps past the comma after it.
+func (p *yamlFlow) value() any {
+	for p.i < len(p.s) && p.s[p.i] == ' ' {
+		p.i++
+	}
+	var v any
+	switch {
+	case p.i < len(p.s) && (p.s[p.i] == '{' || p.s[p.i] == '['):
+		open := p.s[p.i]
+		p.i++
+		m, l := map[string]any{}, []any{}
+		for p.i < len(p.s) && !p.end() {
+			at := p.i
+			e := p.value()
+			if k, ok := e.(string); ok && open == '{' && p.i < len(p.s) && p.s[p.i] == ':' {
+				p.i++
+				e = p.value()
+				m[k] = e
+			} else if open == '{' {
+				m[fmt.Sprint(e)] = ""
+			} else {
+				l = append(l, e)
+			}
+			if p.i == at { // a stray colon
+				p.i++
+			}
+		}
+		p.i++ // its } or ]
+		v = l
+		if open == '{' {
+			v = m
+		}
+	default:
+		// a scalar: quoted, or plain up to a comma, a collection's end or a key's colon
+		end := yamlFind(p.s[p.i:], func(j int) bool {
+			t := p.s[p.i:]
+			return strings.ContainsRune(",}]", rune(t[j])) ||
+				t[j] == ':' && (j+1 == len(t) || strings.ContainsRune(" ,}]", rune(t[j+1])) || j > 0 && (t[j-1] == '"' || t[j-1] == '\''))
+		})
+		if end < 0 {
+			end = len(p.s) - p.i
+		}
+		v = yamlUnquote(strings.TrimSpace(p.s[p.i : p.i+end]))
+		p.i += end
+	}
+	for p.i < len(p.s) && p.s[p.i] == ' ' {
+		p.i++
+	}
+	if p.i < len(p.s) && p.s[p.i] == ',' {
+		p.i++
+	}
+	return v
+}
+
+// end reports whether the reader is at a collection's end, past the spaces before it.
+func (p *yamlFlow) end() bool {
+	for p.i < len(p.s) && p.s[p.i] == ' ' {
+		p.i++
+	}
+	return p.i < len(p.s) && (p.s[p.i] == '}' || p.s[p.i] == ']')
 }
 
 // SystemJobs reads the machine's jobs with systemctl and crontab.
