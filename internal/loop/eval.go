@@ -253,9 +253,9 @@ func (e *Eval) provenance() Provenance {
 // judge that fails (an API error, an answer off its schema) is tried once more. The relay reserves the largest charge
 // a request could cost (its output ceiling and a token for every byte of a body that holds both investigations), and
 // refuses a request that does not fit the run's allowance of 1.5 times its budget: a judge needs room for that, not
-// the 1 USD an answer costs a few cents of.
+// the 1 USD an answer costs a few cents of. Both the run and the judge budgets are sized for the default model's rates.
 const (
-	judgeBudget   = 3.0
+	judgeBudget   = 6.0
 	judgeAttempts = 2
 )
 

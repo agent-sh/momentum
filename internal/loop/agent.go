@@ -451,7 +451,7 @@ func sandboxEnv(route []string, extra ...map[string]string) map[string]string {
 }
 
 // RunOrFallback runs the agent, and when the model's safeguards refuse the run, runs it once more on the
-// fallback model: Opus first, Sonnet when Opus fails. The result says which model ran (Model) and counts both
+// fallback model: the configured model first, the fallback when it fails. The result says which model ran (Model) and counts both
 // runs' cost.
 func (a Agent) RunOrFallback(ctx context.Context, inv Invocation) (Result, error) {
 	deadline, cancel := context.WithTimeout(ctx, inv.Timeout)

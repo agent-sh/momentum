@@ -50,8 +50,8 @@ type Budgets struct {
 	MaxTurns             int
 }
 
-// DefaultBudgets: a run $4 and 30 minutes, at most 120 turns; a case $20; a day $40; a week $200.
-var DefaultBudgets = Budgets{Run: 4, Case: 20, Day: 40, Week: 200, RunTime: 30 * time.Minute, MaxTurns: 120}
+// DefaultBudgets: a run $8 and 30 minutes, at most 120 turns; a case $20; a day $40; a week $200.
+var DefaultBudgets = Budgets{Run: 8, Case: 20, Day: 40, Week: 200, RunTime: 30 * time.Minute, MaxTurns: 120}
 
 // Runner owns case changes and the pass's host inputs.
 type Runner struct {
