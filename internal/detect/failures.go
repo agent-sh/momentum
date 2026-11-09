@@ -466,6 +466,7 @@ const (
 type FailureKey struct {
 	Origin string // guard:NAME, harness:HARNESS, turn:HARNESS, tool:TOOL, mcp:SERVER, exec, model:refusal, miss:TOOL, miss:exec
 	Text   string
+	host   string // a command's miss on another host, the host its command line names (remoteHost), till failureKey keys it
 }
 
 func (k FailureKey) String() string { return k.Origin + ":" + k.Text }
@@ -597,7 +598,8 @@ var (
 // says nothing to key it by.
 //
 // A failed command whose message says no file is at a path it names in quotes (quotedMiss) is keyed miss:exec by that
-// path (commandMissed, missedPath), for the same reason. One whose path is empty or cut short says nothing to key it by.
+// path (commandMissed, missedPath), for the same reason, and one of a command that ran on another host by that host
+// and path (remote). One whose path is empty or cut short says nothing to key it by.
 func FailureOf(harness, tool, text, call string) (FailureKey, bool) {
 	return failureKey(harness, tool, text, store.Call{Input: call})
 }
@@ -612,6 +614,11 @@ func failureKey(harness, tool, text string, c store.Call) (FailureKey, bool) {
 	}
 	p, miss := missOf(harness, tool, text, c)
 	switch {
+	case !miss && k.host != "": // another host's path: no directory of this host's is stripped from it
+		if k.Text == "" {
+			return FailureKey{}, false
+		}
+		return FailureKey{Origin: execMiss, Text: k.host + ":" + missedPath(k.Text)}, true
 	case !miss && k.Origin == execMiss: // its text is the path as the message names it
 		if p = commandMissed(harness, k.Text, c); p == "" {
 			return FailureKey{}, false
@@ -670,21 +677,31 @@ var (
 	hostPathRe = regexp.MustCompile(`^(?:rsync://|[\w.@${}-]+:)`)
 )
 
-// remote says a path a shell call's output names may be another host's, so its message keeps its words:
+// remote says a path a shell call's output names may be another host's (far), and that host when its command line
+// names it (remoteHost), so its message is keyed by that host and path; one far with no host keeps its words. Far:
 //   - its command's text (its command line as the store keeps it, else its whole input, as Codex's exec script)
-//     names a program that works on another host (hostRe), in any line, a here-document's too;
-//   - it runs rsync with -e or --rsh, or with an operand that names a host (hostPathRe);
+//     reaches another host (hops);
 //   - its input names no command: a write to a running command's stdin or a poll of its output (Codex's
 //     write_stdin, Claude Code's bash_output), whose event does not say which host printed it.
 //
-// A call the store does not hold is read as local: the mistakes log's are Claude Code's own commands.
-func remote(call string) bool {
+// before is the output before the message's mark. A call the store does not hold is read as local: the mistakes
+// log's are Claude Code's own commands.
+func remote(call, before string) (host string, far bool) {
 	text := call
 	if m := callRe.FindStringSubmatch(call); m != nil {
 		text = unescape(m[1])
 	} else if strings.HasPrefix(strings.TrimSpace(call), "{") && !commandKeyRe.MatchString(call) {
-		return true
+		return "", true
 	}
+	if hops(text) {
+		return remoteHost(text, before), true
+	}
+	return "", false
+}
+
+// hops says a command's text names a program that works on another host (hostRe), in any line, a here-document's
+// too, or runs rsync with -e or --rsh, or with an operand that names a host (hostPathRe).
+func hops(text string) bool {
 	if hostRe.MatchString(text) {
 		return true
 	}
@@ -700,6 +717,187 @@ func remote(call string) bool {
 		}
 	}
 	return false
+}
+
+var (
+	// hostNameRe is a host as a command line names it, its user@ off: a name or an address, no variable or port.
+	hostNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	// hostOperandRe is scp's or rsync's [user@]host:path operand, by its host; rsync's daemon (host::module,
+	// rsync://) and scp's scp:// are none.
+	hostOperandRe = regexp.MustCompile(`^(?:[^@/:]+@)?([A-Za-z0-9][A-Za-z0-9._-]*):(?:$|[^:/]|/$|/[^/])`)
+	// rsyncRoleRe is rsync's message, by the role of the side that printed it: sender, receiver or generator.
+	rsyncRoleRe = regexp.MustCompile(`(?i)rsync: \[(sender|receiver|generator)\] `)
+)
+
+// The options that take a value, in their word or the next.
+const (
+	sshValued = "pioJlFEbcDLRWwmOQS"
+	scpValued = "cDFiJloPSX"
+)
+
+// remoteHost is the host whose path a plain command line's message names, as written (its user@ off, never
+// resolved), or "" when it does not say. Plain is one command (commandWords), past its assignments and wrappers
+// (as commandPrograms reads them), that is:
+//   - ssh [options] HOST CMD: the first word past its options and their values, when CMD reaches no further host
+//     (hops), whose path it may print;
+//   - scp or rsync with [user@]host:path operands of one host, when its message is that host's: scp's that does not
+//     say local ("stat local"), rsync's sender's when a source names the host and its receiver's or generator's when
+//     its destination (its last operand) does. A message with no side is no host's.
+//
+// Anything else says no host: a host from a variable, a here-document or a file on ssh's stdin, a pipe or a second
+// command, ssh inside a script. A command line the store cut is read up to the cut.
+func remoteHost(text, before string) string {
+	words, plain := commandWords(text)
+	if !plain {
+		return ""
+	}
+	for len(words) > 0 && assignRe.MatchString(words[0]) {
+		words = words[1:]
+	}
+	for len(words) > 0 && wrappers[words[0]] {
+		words = words[1:]
+		for len(words) > 0 && (strings.HasPrefix(words[0], "-") || countRe.MatchString(words[0]) || assignRe.MatchString(words[0])) {
+			words = words[1:]
+		}
+	}
+	if len(words) == 0 {
+		return ""
+	}
+	switch path.Base(words[0]) {
+	case "ssh":
+		args := operands(words[1:], sshValued)
+		if len(args) < 2 { // a host and a command
+			return ""
+		}
+		h := args[0][strings.LastIndexByte(args[0], '@')+1:]
+		if !hostNameRe.MatchString(h) || hops(strings.Join(words[slices.Index(words, args[0])+1:], " ")) { // a command that goes on to a third host
+			return ""
+		}
+		return h
+	case "scp":
+		h, _ := operandHost(operands(words[1:], scpValued))
+		i := strings.LastIndex(before, "scp: ")
+		if i < 0 || len(mask(before[i:])) > reach || slices.Contains(strings.Fields(mask(before[i:])), "local") {
+			return ""
+		}
+		return h
+	case "rsync":
+		args := operands(words[1:], "")
+		h, at := operandHost(args)
+		m := rsyncRoleRe.FindAllStringSubmatchIndex(before, -1)
+		if h == "" || len(args) < 2 || m == nil || len(mask(before[m[len(m)-1][0]:])) > reach {
+			return ""
+		}
+		sender := strings.EqualFold(before[m[len(m)-1][2]:m[len(m)-1][3]], "sender")
+		if sender == at[len(args)-1] { // the sender is the sources' side, the receiver and generator the destination's
+			return ""
+		}
+		return h
+	}
+	return ""
+}
+
+// operands are a command's words that are no option nor the value an option of valued takes after it in its word
+// or as the next.
+func operands(args []string, valued string) []string {
+	var out []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			out = append(out, a)
+			continue
+		}
+		for j := 1; j < len(a) && !strings.HasPrefix(a, "--"); j++ {
+			if strings.IndexByte(valued, a[j]) >= 0 {
+				if j == len(a)-1 {
+					i++
+				}
+				break
+			}
+		}
+	}
+	return out
+}
+
+// operandHost is the host scp's or rsync's host:path operands name, and which of them name it; "" when none does or
+// two hosts are named.
+func operandHost(args []string) (string, []bool) {
+	host, at := "", make([]bool, len(args))
+	for i, a := range args {
+		m := hostOperandRe.FindStringSubmatch(a)
+		if m == nil {
+			continue
+		}
+		if host != "" && m[1] != host {
+			return "", at
+		}
+		host, at[i] = m[1], true
+	}
+	return host, at
+}
+
+// commandWords are a command line's first command's words as the shell splits them, quotes off, and whether the
+// line holds no more than it: no other command (a list, a pipe, a background job, a subshell, a second line, a
+// command substitution outside quotes), no input (a here-document, a file on its stdin), only output redirections,
+// which it drops. A quote the store's cut left open ends the line.
+func commandWords(line string) (words []string, plain bool) {
+	var b strings.Builder
+	open, quoted, target := false, false, false
+	end := func() {
+		if open && !target {
+			words = append(words, b.String())
+		}
+		if open {
+			target = false
+		}
+		b.Reset()
+		open, quoted = false, false
+	}
+	line = strings.TrimSpace(line)
+	for i := 0; i < len(line); i++ {
+		switch c := line[i]; {
+		case c == ' ' || c == '\t':
+			end()
+		case c == '\'':
+			k := strings.IndexByte(line[i+1:], '\'')
+			if k < 0 {
+				k = len(line) - i - 1
+			}
+			b.WriteString(line[i+1 : i+1+k])
+			i += k + 1
+			open, quoted = true, true
+		case c == '"':
+			open, quoted = true, true
+			for i++; i < len(line) && line[i] != '"'; i++ {
+				if line[i] == '\\' && i+1 < len(line) && strings.IndexByte("$`\"\\", line[i+1]) >= 0 {
+					i++
+				}
+				b.WriteByte(line[i])
+			}
+		case c == '\\':
+			if i++; i < len(line) && line[i] != '\n' { // a backslash before a newline joins two lines
+				b.WriteByte(line[i])
+				open, quoted = true, true
+			}
+		case c == '>': // an output redirection: its descriptor (2>), what it writes to (>&1, > FILE)
+			if open && !quoted && strings.Trim(b.String(), "0123456789") == "" {
+				b.Reset()
+				open = false
+			}
+			end()
+			for i+1 < len(line) && strings.IndexByte(">&|", line[i+1]) >= 0 {
+				i++
+			}
+			target = true
+		case strings.IndexByte(";&|<()`\n", c) >= 0:
+			return words, false
+		default:
+			b.WriteByte(c)
+			open = true
+		}
+	}
+	end()
+	return words, true
 }
 
 // failureOf is FailureOf's key by the failure's words alone.
@@ -902,7 +1100,8 @@ var tailRe = regexp.MustCompile(`^:\s+([^\s,;]{1,40})`)
 //
 // The programs are the call's (callPrograms). A message that says no file is at a path it names in quotes
 // (quotedMiss) is no message of words: its key is execMiss, its text that path as the message names it, which
-// failureKey keys as commandMissed says; but for a call that runs ssh (remote), whose path may be another host's.
+// failureKey keys as commandMissed says. A call that may have run on another host (remote) is keyed by that host
+// and the path when its command line names the host, else by its words.
 func execKey(out, call string) (FailureKey, bool) {
 	programs := callPrograms(call)
 	out = strings.Join(strings.Fields(out), " ")
@@ -913,8 +1112,13 @@ func execKey(out, call string) (FailureKey, bool) {
 	if loc == nil {
 		return FailureKey{}, false
 	}
-	if p, ok := quotedMiss(out, loc); ok && !remote(call) {
-		return FailureKey{Origin: execMiss, Text: p}, true
+	if p, ok := quotedMiss(out, loc); ok {
+		switch host, far := remote(call, out[:loc[0]]); {
+		case !far:
+			return FailureKey{Origin: execMiss, Text: p}, true
+		case host != "":
+			return FailureKey{Origin: execMiss, Text: p, host: host}, true
+		}
 	}
 	before, mark, after := out[:loc[0]], markText(out[loc[0]:loc[1]]), out[loc[1]:]
 	if u, ok := strings.CutPrefix(strings.ToLower(out[loc[0]:loc[1]]), "usage: "); ok { // a usage message names its program first, by its path or its name
