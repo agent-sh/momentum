@@ -288,6 +288,7 @@ type replayTask struct {
 // what it runs, and whether its harness records its runs.
 type replayCron struct {
 	expr      string
+	label     string // what its result calls it, which the live tracker shows as a stop's loop
 	at, fired time.Time
 	oneShot   bool
 	what      string
@@ -654,6 +655,22 @@ func versionsOf(path string) []versionChange {
 	return vs
 }
 
+// newestFirst is the jobs' ids, the newest first and the larger id at a tie: the order the live tracker picks a stop's
+// loop by (claude.Tracker.Facts).
+func newestFirst(crons map[string]replayCron) []string {
+	ids := make([]string, 0, len(crons))
+	for id := range crons {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		if a, b := crons[ids[i]].at, crons[ids[j]].at; !a.Equal(b) {
+			return a.After(b)
+		}
+		return ids[i] > ids[j]
+	})
+	return ids
+}
+
 // timeline turns one session's events into its points: one for each input, with the stop before it, and one
 // for the last stop, whose Next is none.
 func timeline(id string, evs []store.Event, until time.Time) []Point {
@@ -709,13 +726,9 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		}
 		s.TurnBegan, s.IdleAt, s.Exited, s.Reopened = turnBegan, prevAt, prevRole == "exit", prevRole == "reopened"
 		if !s.Exited { // nothing runs while the process is gone: an exited stop has no schedule
-			// the newest job's, the larger id at a tie: the live tracker's rule (claude.Tracker.Facts)
-			var newest time.Time
-			newestID := ""
-			for id, c := range crons {
-				if c.at.After(newest) || c.at.Equal(newest) && id > newestID {
-					newest, newestID, s.Loop = c.at, id, c.expr
-				}
+			// the newest job's label, as the live tracker shows it (claude.Tracker.Facts), its expression where it has none
+			if ids := newestFirst(crons); len(ids) > 0 {
+				s.Loop = firstNonEmpty(crons[ids[0]].label, crons[ids[0]].expr)
 			}
 			// Its own runs its harness should start, as the session layer lists them, a reopening for a restart.
 			if !wake.at.IsZero() && wake.seen {
@@ -942,10 +955,11 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			if prior, _ := m["prior"].(string); prior == "scheduled_task_fire" { // a scheduled run started
 				firesSeen = true
 				f, ok := fireBetween(lastRef, e.Ref)
-				if !ok { // the transcript is gone: the run whose prompt this is
-					for k, c := range crons {
-						if c.what != "" && strings.HasPrefix(strings.TrimSpace(e.Summary), strings.TrimSpace(c.what)) {
+				if !ok { // the transcript is gone: the run whose prompt this is, the newest job's where two prompts start it
+					for _, k := range newestFirst(crons) {
+						if c := crons[k]; c.what != "" && strings.HasPrefix(strings.TrimSpace(e.Summary), strings.TrimSpace(c.what)) {
 							f.TaskID = k
+							break
 						}
 					}
 					if f.TaskID == "" {
@@ -1030,7 +1044,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 				}
 				if g := hCron.FindStringSubmatch(s); g != nil && e.Tool == "CronCreate" {
 					c := calls[id]
-					crons[g[2]] = replayCron{expr: firstNonEmpty(c.cron, g[3]), at: e.TS, oneShot: g[1] == "one-shot", what: c.what, seen: recordsRunsAt(e, firesSeen)}
+					crons[g[2]] = replayCron{expr: firstNonEmpty(c.cron, g[3]), label: g[3], at: e.TS, oneShot: g[1] == "one-shot", what: c.what, seen: recordsRunsAt(e, firesSeen)}
 				}
 			}
 			lastMainUser = true

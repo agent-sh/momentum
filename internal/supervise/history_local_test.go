@@ -1832,8 +1832,8 @@ func TestTheTrackerAndTheReplayReadARemovedNotification(t *testing.T) {
 	}
 }
 
-// A stop with several jobs shows the loop the live tracker shows: the newest job's, the larger id when two came at
-// once. Every replay of one store gives every stop the same loop.
+// A stop with several jobs shows the loop the live tracker shows: the newest job's label, the larger id when two
+// came at once. Every replay of one store gives every stop the same loop.
 func TestAStopsLoopIsItsNewestJobInEveryReplay(t *testing.T) {
 	st := testStore(t)
 	b := newTimeline(t, "jobs").owner(0, "watch the deploy, the checks and the queue", "turn_duration").
@@ -1870,8 +1870,8 @@ func TestAStopsLoopIsItsNewestJobInEveryReplay(t *testing.T) {
 	for _, p := range first {
 		if p.Stop.Loop != "" {
 			looped++
-			if p.Stop.Loop != "0 * * * *" {
-				t.Errorf("the stop at %v shows loop %q, want the newest job's, j3 over j2 at a tie", p.Stop.At, p.Stop.Loop)
+			if p.Stop.Loop != "Every hour" {
+				t.Errorf("the stop at %v shows loop %q, want the newest job's label, j3 over j2 at a tie", p.Stop.At, p.Stop.Loop)
 			}
 		}
 	}

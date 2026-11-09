@@ -136,6 +136,53 @@ func TestReplayCreditsARunByItsPromptWhenTheTranscriptIsGone(t *testing.T) {
 	}
 }
 
+// Two jobs' prompts both start a run whose transcript is gone: the run is the newest job's, the larger id when the
+// two came at once, as a stop's loop is.
+func TestAGoneRunIsCreditedToTheNewestJobItsPromptStarts(t *testing.T) {
+	inUTCHere(t)
+	st := testStore(t)
+	fired := map[string]time.Time{}
+	for _, shape := range []struct {
+		session string
+		results []string      // the jobs, in the order their results came
+		apart   time.Duration // between the two results
+	}{
+		{"apart", []string{"j1", "j2"}, time.Second},
+		{"at-once", []string{"j2", "j1"}, 0},
+	} {
+		b := newTimeline(t, shape.session).owner(0, "check the deploy, and the queue with it", "turn_duration").
+			call(time.Second, "CronCreate", "j1", `{"cron":"*/30 * * * *","prompt":"check the deploy"}`).
+			call(0, "CronCreate", "j2", `{"cron":"*/30 * * * *","prompt":"check the deploy and the queue"}`)
+		for i, j := range shape.results {
+			b.result([]time.Duration{time.Second, shape.apart}[i], "CronCreate", j, "Scheduled recurring job "+j+" (Every 30 minutes). Next run: 10:30.")
+		}
+		b.say(time.Second, "Checking.").
+			add(30*time.Minute, "harness_text", store.ActorHarness, "", "check the deploy and the queue", `{"prior":"scheduled_task_fire","why":"meta line"}`)
+		fired[shape.session] = b.at
+		b.say(time.Second, "Checked.").owner(10*time.Minute, "status?", "turn_duration")
+		b.put(st)
+	}
+	points, _ := replayAll(t, st)
+	checked := map[string]int{}
+	for _, p := range points {
+		at, ok := fired[p.Session]
+		if !ok || !p.Stop.At.After(at) {
+			continue
+		}
+		for _, r := range p.Stop.Runs {
+			checked[p.Session]++
+			if want := strings.HasPrefix(r.Key, "job:j2@"); r.Ran.Equal(at) != want {
+				t.Errorf("%s: the stop at %v: run %s last ran %v, want the run at %v credited to j2 only", p.Session, p.Stop.At, r.Key, r.Ran, at)
+			}
+		}
+	}
+	for session := range fired {
+		if checked[session] == 0 {
+			t.Errorf("%s: no stop after the run lists the jobs' runs", session)
+		}
+	}
+}
+
 func TestReplayDropsAWakeupARestartLost(t *testing.T) {
 	st := testStore(t)
 	for name, end := range map[string]string{
