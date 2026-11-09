@@ -576,6 +576,8 @@ func TestAStallsNeedsNoteNeverStandsBesideItsCase(t *testing.T) {
 	f.checkInterrupt, f.interrupt = nil, act.ErrUnstable
 	now = now.Add(time.Minute)
 	run(t, sv, s)
+	now = now.Add(time.Minute)
+	run(t, sv, s) // the next run's look finds no message left on the line: the case
 	now = t0.Add(30*time.Minute + DefaultParams.Stale + DefaultParams.OwnerWindow + time.Minute)
 	run(t, sv, s)
 	if n, ok := note(t, st, AskNote+s.Key); ok || len(events(t, st, KindCase)) != 1 {
@@ -591,6 +593,8 @@ func TestAStallsNeedsNoteNeverStandsBesideItsCase(t *testing.T) {
 	f.checkInterrupt, f.interrupt = nil, act.ErrUnstable
 	now = now.Add(time.Minute)
 	run(t, sv, s)
+	now = now.Add(time.Minute)
+	run(t, sv, s) // the case, once the next run's look finds no message left
 	if n, ok := note(t, st, AskNote+s.Key); !ok || n.Done.IsZero() || len(events(t, st, KindCase)) != 1 {
 		t.Fatalf("needs note %+v %v, cases %+v", n, ok, events(t, st, KindCase))
 	}
@@ -858,6 +862,8 @@ func TestAStalledCasesProblemNoteStandsThroughARetry(t *testing.T) {
 	sv := unread(liveStalled(st, f, &now))
 	s := waitingSession("sess-retry-after-case")
 	run(t, sv, s)
+	now = now.Add(time.Minute)
+	run(t, sv, s) // the next run's look finds no message left on the line
 	if n, ok := note(t, st, ProblemNote+s.Key); !ok || !n.Done.IsZero() {
 		t.Fatalf("problem note %+v %v", n, ok)
 	}
@@ -935,6 +941,69 @@ func TestARequestAnsweredAfterTheScanIsLeftAlone(t *testing.T) {
 	run(t, sv, waitingSession("sess-late"))
 	if len(f.sent) != 0 || len(events(t, st, KindCase)) != 0 {
 		t.Fatalf("sent %q, cases %+v", f.sent, events(t, st, KindCase))
+	}
+}
+
+// lagging is a pane whose interface draws the paste after Interrupt stopped reading for it: the message sits on
+// the input line unsent. Leftover finds it there and sends it on, or clears it, as act's does.
+type lagging struct {
+	fakeSender
+	line string
+	keys []string
+}
+
+func (f *lagging) Interrupt(_ context.Context, _ act.Target, text string, _ func() error) (act.Path, error) {
+	f.line = text
+	return act.Tmux, fmt.Errorf("%w: not drawn in time: the input line is empty", act.ErrUnstable)
+}
+
+func (f *lagging) Leftover(_ context.Context, _ act.Target, text string, still func() error) (act.Path, error) {
+	if f.line != text {
+		return act.Tmux, act.ErrNotLeft
+	}
+	f.line = ""
+	if err := still(); err != nil {
+		f.keys = append(f.keys, "C-e", "C-u")
+		return act.Tmux, fmt.Errorf("%w: %w", act.ErrCleared, err)
+	}
+	f.keys = append(f.keys, "Enter", "Escape")
+	return act.Tmux, nil
+}
+
+func TestAMessageLeftOnTheInputLineIsSentOrClearedByTheNextRun(t *testing.T) {
+	for _, answered := range []bool{false, true} {
+		st := testStore(t)
+		f := &lagging{}
+		now := t0.Add(31 * time.Minute)
+		sv := unread(liveStalled(st, f, &now))
+		sv.Prompted = func(context.Context, *sessions.Session, string) (bool, time.Time, error) { return true, now, nil }
+		s := waitingSession("sess-lagging")
+		run(t, sv, s)
+		if f.line != StalledText || len(events(t, st, KindCase)) != 0 {
+			t.Fatalf("answered %v, the paste's run: line %q, cases %+v", answered, f.line, events(t, st, KindCase))
+		}
+		if answered {
+			s.RequestAt = time.Time{} // its reply came: the turn went on by itself
+		}
+		now = now.Add(time.Minute)
+		run(t, sv, s)
+		acts := events(t, st, KindAct)
+		want, keys := "sent", "Enter Escape"
+		if answered {
+			want, keys = "cleared", "C-e C-u"
+		}
+		if f.line != "" || strings.Join(f.keys, " ") != keys || len(acts) != 1 || metaMap(acts[0])["late"] != want ||
+			(metaMap(acts[0])["sent"] == true) == answered || len(events(t, st, KindCase)) != 0 {
+			t.Fatalf("answered %v, the next run: line %q keys %q acts %+v cases %+v", answered, f.line, f.keys, acts, events(t, st, KindCase))
+		}
+		if _, ok := note(t, st, fmt.Sprintf("%s%s@%d", ResumedNote, s.Key, t0.UnixMilli())); ok == answered {
+			t.Fatalf("answered %v: resumed note %v", answered, ok)
+		}
+		now = now.Add(time.Minute)
+		run(t, sv, s)
+		if strings.Join(f.keys, " ") != keys || len(events(t, st, KindCase)) != 0 {
+			t.Fatalf("answered %v, the run after: keys %q cases %+v", answered, f.keys, events(t, st, KindCase))
+		}
 	}
 }
 

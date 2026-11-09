@@ -201,6 +201,7 @@ func TestSendRefusesWhenTheSessionIsNotWaitingForInput(t *testing.T) {
 }
 
 func TestSendDoesNotPressEnterUnlessTheInputLineHoldsTheMessageAlone(t *testing.T) {
+	shortSettle(t) // the input line that went away is read until the wait ends
 	msg := "[momentum] continue"
 	cases := map[string]struct{ after, later string }{
 		"someone else's words":             {emptyInputWith("someone else's words"), ""},
@@ -236,12 +237,12 @@ func TestSendDoesNotPressEnterUnlessTheInputLineHoldsTheMessageAlone(t *testing.
 		t.Fatalf("wrapped: %v", err)
 	}
 	// A terminal that draws the paste a moment late gets the time to: Enter once the input line holds it.
-	f = &fakeTmux{screen: emptyInput, mode: "0", slow: settleReads - 1}
+	f = &fakeTmux{screen: emptyInput, mode: "0", slow: 3}
 	s, tgt = pane(t, f, agent)
 	if _, err := s.Send(context.Background(), tgt, msg); err != nil || f.cmds[len(f.cmds)-1] != "tmux send-keys -t %3 Enter" {
 		t.Fatalf("drawn late: %v %q", err, f.cmds)
 	}
-	f = &fakeTmux{screen: emptyInput, mode: "0", slow: settleReads}
+	f = &fakeTmux{screen: emptyInput, mode: "0", slow: 1 << 30}
 	s, tgt = pane(t, f, agent)
 	if _, err := s.Send(context.Background(), tgt, msg); !errors.Is(err, ErrUnstable) || strings.HasPrefix(f.cmds[len(f.cmds)-1], "tmux send-keys") {
 		t.Fatalf("never drawn: %v %q", err, f.cmds)

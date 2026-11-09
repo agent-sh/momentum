@@ -400,36 +400,64 @@ func ready(styled, tool string, empty bool) error {
 	return nil
 }
 
-// settleReads is how many times the screen is read after the paste for the message to show on the input line: a
-// busy terminal can draw it a moment late.
-const settleReads = 4
+// settleWait is how long the screen is read, a pause apart, after a paste or a key, for the interface to draw it.
+// It must cover a Claude Code that is slow to redraw: a busy or loaded session can draw a paste later than the
+// second that four reads gave, and a paste drawn after the reads stopped sits on the input line unsent. Five
+// seconds is twenty reads at the default pause. A redraw later than that is the next supervise run's to find (its
+// look at a message left on the line, Leftover), so the wait need not cover every stall. It stays well under
+// Timeout, and a run's other sessions wait behind it.
+var settleWait = 5 * time.Second
 
-// settled reads the screen after the paste, a pause apart, until the input line holds the message alone, at most
-// settleReads times. A screen caught mid-redraw, without its input line yet, is read again; any other check that
-// fails on the way (a dialog, a turn running, a mode, another process in front) ends it at once.
-func (s *Sender) settled(read func() (string, error), tool, text string) error {
-	var err error
-	for range settleReads {
-		s.pause()
-		var screen string
-		if screen, err = read(); err != nil && !errors.Is(err, ErrNoInput) {
-			return fmt.Errorf("%w: %v", ErrUnstable, err)
-		}
-		if err == nil && holds(screen, tool, text) {
-			return nil
-		}
-		if err == nil {
-			err = errors.New("the input line does not hold the message alone")
-		}
+// errNotYet is a screen the interface has not drawn the paste or the key on yet: no input line (a redraw caught
+// midway), or an input line as it was before, or the start of the message only.
+var errNotYet = errors.New("not drawn in time")
+
+// shown is what an input line holds, for an error.
+func shown(typed string) string {
+	if typed == "" {
+		return "the input line is empty"
 	}
-	return fmt.Errorf("%w: %v", ErrUnstable, err)
+	return fmt.Sprintf("the input line holds %q", typed)
 }
 
-// holds reports whether the input line on a styled screen holds the message and nothing else. A long message
-// wraps across lines, so the two compare without their whitespace.
-func holds(styled, tool, text string) bool {
+// onLine checks the input line on a styled screen after the paste: nil when it holds the message alone; errNotYet
+// while it is missing, empty or holds the message's start; and what it holds otherwise. A long message wraps across
+// lines, so the two compare without their whitespace.
+func onLine(styled, tool, text string) error {
 	typed, ok := Draft(styled, tool)
-	return ok && squeeze(typed) == squeeze(text)
+	switch {
+	case !ok:
+		return fmt.Errorf("%w: no input line on the screen", errNotYet)
+	case squeeze(typed) == squeeze(text):
+		return nil
+	case strings.HasPrefix(squeeze(text), squeeze(typed)):
+		return fmt.Errorf("%w: %s", errNotYet, shown(typed))
+	}
+	return fmt.Errorf("%s, not the message alone", shown(typed))
+}
+
+// settled reads the screen after the paste, a pause apart, until the input line holds the message alone, for
+// settleWait at most. A screen not drawn yet (errNotYet) is read again; any other check that fails on the way (a
+// dialog, a turn running, a mode, another process in front, other text on the input line) ends it at once.
+func (s *Sender) settled(read func() (string, error), tool, text string) error {
+	end := time.Now().Add(settleWait)
+	for {
+		s.pause()
+		screen, err := read()
+		switch {
+		case errors.Is(err, ErrNoInput):
+			err = fmt.Errorf("%w: no input line on the screen", errNotYet)
+		case err != nil:
+			return fmt.Errorf("%w: %v", ErrUnstable, err)
+		default:
+			if err = onLine(screen, tool, text); err == nil {
+				return nil
+			}
+		}
+		if !errors.Is(err, errNotYet) || !time.Now().Before(end) {
+			return fmt.Errorf("%w: %v", ErrUnstable, err)
+		}
+	}
 }
 
 func (s *Sender) sendTmux(ctx context.Context, t Target, text string) error {

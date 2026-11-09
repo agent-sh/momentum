@@ -60,6 +60,9 @@ type Sender interface {
 	// Interrupt types the message into a turn that runs, which holds it in its queue, and ends the turn, which
 	// sends it: a turn stalled on a request with no reply. still is asked before the paste and before the Escape.
 	Interrupt(ctx context.Context, t act.Target, text string, still func() error) (act.Path, error)
+	// Leftover sends on, or clears, a message an Interrupt may have left on the input line: act.ErrNotLeft when the
+	// line does not hold it, act.ErrCleared when it cleared it.
+	Leftover(ctx context.Context, t act.Target, text string, still func() error) (act.Path, error)
 }
 
 // errAnswered is a stalled request that something answered since the scan: the turn went on by itself.
@@ -176,6 +179,15 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 		stop := StopOf(s, presence)
 		if !stop.RequestAt.IsZero() {
 			stop.ScreenIdle = h.idleAt[stop.RequestAt.UnixMilli()]
+		}
+		if h.left != nil { // its last message may sit on its input line: that comes first
+			line, err := sv.leftover(ctx, s, stop, *h.left, starts)
+			if err != nil {
+				return lines, err
+			}
+			lines = append(lines, line)
+			seen[s.Key] = nil
+			continue
 		}
 		if !stop.RequestAt.IsZero() || len(stop.Runs) > 0 && stop.Runs[0].Due.Before(now) {
 			if sleep == nil {
@@ -450,8 +462,11 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 		return err // nothing typed
 	}
 	evs = nil
+	left := false
 	if interrupt {
 		path, err = sv.Sender.Interrupt(ctx, t, d.Text, func() error { return sv.unanswered(s, stop.RequestAt) })
+		// the interface may draw the paste after act stopped reading for it: the next run looks again (leftover)
+		left = errors.Is(err, act.ErrUnstable)
 	} else {
 		path, err = sv.Sender.Send(ctx, t, d.Text)
 	}
@@ -468,7 +483,11 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 			// the paste may sit on the input line, or have gone in: type nothing more at this stop
 			m["unstable"] = true
 		}
-		evs = sv.cannot(ctx, s, stop, d, err)
+		if left {
+			m["left"] = true // its case waits for the next run's look
+		} else {
+			evs = sv.cannot(ctx, s, stop, d, err)
+		}
 	} else {
 		m["sent"], line.Sent = true, true
 		e.Summary = oneLine(fmt.Sprintf("%s: sent %q (try %d) by %s", d.Rule, d.Text, d.Try, path))
@@ -480,6 +499,52 @@ func (sv *Supervisor) send(ctx context.Context, s *sessions.Session, stop Stop, 
 	}
 	e.Meta = meta(m)
 	return sv.put(ctx, append([]store.Event{e}, evs...))
+}
+
+// leftover is the next run's look at a stalled turn whose Interrupt may have left its message on the input line
+// (act.ErrUnstable): an interface slow to redraw can draw the paste after act stopped reading for it, and the message
+// sits there unsent until its owner's next keys join it. act's Leftover sends it on while the turn runs and the
+// request it was for is still unanswered, or clears the line once the request was answered. Only when this look
+// fails too does the case open. e is the send's event, which takes what came of it.
+func (sv *Supervisor) leftover(ctx context.Context, s *sessions.Session, stop Stop, e store.Event, starts map[int]uint64) (Line, error) {
+	var m map[string]any
+	json.Unmarshal([]byte(e.Meta), &m)
+	delete(m, "left")
+	text, asked := str(m["text"]), int64(num(m["request_at"]))
+	line := Line{Session: s.Key, Name: s.Name, Rule: RuleStalled, Verdict: Act, Text: text, Why: "its last message may sit on its input line"}
+	still := func() error {
+		if stop.RequestAt.UnixMilli() != asked {
+			return errAnswered // the scan no longer shows the turn waiting on that request
+		}
+		return sv.unanswered(s, stop.RequestAt)
+	}
+	path, err := sv.Sender.Leftover(ctx, act.TargetOf(s, starts[s.PID]), text, still)
+	if err == nil {
+		err = sv.prompted(ctx, s, text, m, true)
+	}
+	first := str(m["refused"])
+	m["path"], e.TS = string(path), sv.now()
+	var evs []store.Event
+	switch {
+	case err == nil:
+		delete(m, "unstable")
+		delete(m, "refused")
+		m["sent"], m["late"], line.Sent = true, "sent", true
+		e.Summary = oneLine(fmt.Sprintf("%s: sent %q (try %d) by %s, drawn late", RuleStalled, text, num(m["try"]), path))
+		if _, err := sv.Store.PutNote(ctx, resumed(s, stop, text, true, sv.now())); err != nil {
+			m["note"] = err.Error()
+		}
+	case errors.Is(err, act.ErrCleared) && errors.Is(err, errAnswered):
+		m["late"], line.Err = "cleared", err.Error()
+		e.Summary = oneLine(fmt.Sprintf("%s: cleared %q off its input line: %v", RuleStalled, text, err))
+	default:
+		m["late"], line.Err = err.Error(), err.Error()
+		e.Summary = oneLine(fmt.Sprintf("%s: not sent (%s; then %v): %q", RuleStalled, first, err, text))
+		c := Stop{At: time.UnixMilli(int64(num(m["stop_at"]))), Error: str(m["error"])}
+		evs = append(evs, sv.openCase(ctx, s, c, RuleStalled, "pasted, not known to be submitted: "+first+"; then: "+err.Error(), num(m["try"]), sv.now()))
+	}
+	e.Meta = meta(m)
+	return line, sv.put(ctx, append([]store.Event{e}, evs...))
 }
 
 // cannot is the case a refusal opens, if it is one that will not pass by itself: a paste that may sit on the input
@@ -593,6 +658,7 @@ type past struct {
 	dryWakes  map[string]bool     // the wakeups and runs the overdue rule, dry, recorded a resync for
 	refused   map[string]refusal  // a stalled turn's last look, by key: one per stop, try and request
 	idleAt    map[int64]time.Time // by request (ms), the first look that found a stalled turn's screen idle
+	left      *store.Event        // a stalled turn's interrupt that may have left its message on the input line, unlooked at
 }
 
 // refusal is the last look at a stalled turn for the request it waits on: refused, and why, or let through.
@@ -624,6 +690,9 @@ func history(evs []store.Event) past {
 		case KindAct:
 			if strings.Contains(e.SourceKey, "#refused@") {
 				h.refused[e.SourceKey] = refusal{why: str(m["refused"]), noPath: m["no_path"] == true, passed: m["passed"] == true}
+			}
+			if m["left"] == true {
+				h.left = &e
 			}
 			if e.Experiment != "" {
 				if k := str(m["wake_key"]); k != "" {

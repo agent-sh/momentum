@@ -186,7 +186,7 @@ func (s *Sender) keys(ctx context.Context, t Target) (Path, keys, error) {
 			screen: func() (string, error) { return s.tmuxScreen(ctx, t) },
 			paste:  func(text string) error { return s.pasteTmux(ctx, t, text) },
 			press: func(key string) error {
-				_, err := s.tmux(ctx, "", "send-keys", "-t", t.Pane, map[string]string{"enter": "Enter", "escape": "Escape"}[key])
+				_, err := s.tmux(ctx, "", "send-keys", "-t", t.Pane, map[string]string{"enter": "Enter", "escape": "Escape", "ctrl+e": "C-e", "ctrl+u": "C-u"}[key])
 				return err
 			},
 		}, nil
@@ -222,13 +222,19 @@ func (s *Sender) interrupt(term keys, tool, text string, still func() error) err
 	if err := s.until(term.screen, func(screen string) error { return holding(screen, tool, text) }); err != nil {
 		return err
 	}
+	return s.queue(term, tool, text, still)
+}
+
+// queue sends the message on the input line of a running turn through the harness's queue: Enter, once still
+// passes, then Escape once the message waits in the queue and still passes again.
+func (s *Sender) queue(term keys, tool, text string, still func() error) error {
 	if err := still(); err != nil {
 		return fmt.Errorf("%w: %v", ErrUnstable, err)
 	}
 	if err := term.press("enter"); err != nil {
 		return fmt.Errorf("%w: enter: %v", ErrUnstable, err)
 	}
-	if err := s.until(term.screen, func(screen string) error { return waiting(screen, tool) }); err != nil {
+	if err := s.until(term.screen, func(screen string) error { return waiting(screen, tool, text) }); err != nil {
 		return err
 	}
 	if err := still(); err != nil {
@@ -236,6 +242,88 @@ func (s *Sender) interrupt(term keys, tool, text string, still func() error) err
 	}
 	if err := term.press("escape"); err != nil {
 		return fmt.Errorf("%w: escape: %v", ErrUnstable, err)
+	}
+	return nil
+}
+
+// ErrNotLeft is Leftover's refusal before it types anything: the input line does not hold the message alone.
+var ErrNotLeft = errors.New("its input line does not hold the message")
+
+// ErrCleared is Leftover clearing the message off the input line, unsent, and why it did not send it: still's
+// error, or ErrIdle.
+var ErrCleared = errors.New("the message was cleared off its input line, unsent")
+
+// Leftover finishes, or clears, a message an Interrupt may have left on t's input line (ErrUnstable): an interface
+// slow to redraw can draw the paste after Interrupt stopped reading for it. It types only when the input line holds
+// the message alone (ErrNotLeft otherwise), with no dialog. While the turn runs and still passes, it sends the
+// message as Interrupt does, Enter and then Escape. Otherwise it clears the line, so the next keys its owner types
+// do not join the message, and returns ErrCleared with why. A check that fails once a key went is ErrUnstable.
+func (s *Sender) Leftover(ctx context.Context, t Target, text string, still func() error) (Path, error) {
+	text = SafeText(text)
+	path, term, err := s.keys(ctx, t)
+	if err != nil {
+		return path, err
+	}
+	if still == nil {
+		still = func() error { return nil }
+	}
+	screen, err := term.screen()
+	if err != nil {
+		return path, err
+	}
+	if d := Dialog(Plain(screen)); d != "" {
+		return path, fmt.Errorf("%w: %s", ErrDialog, d)
+	}
+	typed, ok := Draft(screen, t.Tool)
+	switch {
+	case !ok:
+		return path, ErrNoInput
+	case squeeze(typed) != squeeze(text):
+		return path, fmt.Errorf("%w: %s", ErrNotLeft, shown(typed))
+	}
+	why := ErrIdle
+	if TurnRuns(screen, t.Tool) {
+		why = still()
+	}
+	if why == nil {
+		return path, s.queue(term, t.Tool, text, still)
+	}
+	if err := s.clear(term, t.Tool, text); err != nil {
+		return path, err
+	}
+	return path, fmt.Errorf("%w: %w", ErrCleared, why)
+}
+
+// clear deletes the message, alone on the input line, as its owner would at the keyboard: Ctrl+E moves to the end
+// of the line and Ctrl+U deletes back to the start of the row, so a message that wraps takes a press per row. Claude
+// Code's prompt binds both as readline does, and Escape would end the turn. The screen is read after each press,
+// and anything on the line but the start of the message ends it.
+func (s *Sender) clear(term keys, tool, text string) error {
+	if err := term.press("ctrl+e"); err != nil {
+		return fmt.Errorf("%w: ctrl+e: %v", ErrUnstable, err)
+	}
+	for left := squeeze(text); left != ""; {
+		if err := term.press("ctrl+u"); err != nil {
+			return fmt.Errorf("%w: ctrl+u: %v", ErrUnstable, err)
+		}
+		if err := s.until(term.screen, func(screen string) error {
+			if d := Dialog(Plain(screen)); d != "" {
+				return fmt.Errorf("%w: %s", ErrDialog, d)
+			}
+			typed, ok := Draft(screen, tool)
+			switch now := squeeze(typed); {
+			case !ok:
+				return fmt.Errorf("%w: no input line on the screen", errNotYet)
+			case now == left:
+				return fmt.Errorf("%w: %s", errNotYet, shown(typed))
+			case strings.HasPrefix(left, now):
+				left = now // a row went; an empty line is done
+				return nil
+			}
+			return fmt.Errorf("%s, not the start of the message", shown(typed))
+		}); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -263,35 +351,37 @@ func running(styled, tool string) error {
 }
 
 // holding checks a styled screen after the paste: no dialog, the turn still running by its running row, and an
-// input line that holds the message and nothing else. A turn that ended meanwhile would take the message as its
-// prompt at Enter, and Escape would end the turn it opened.
+// input line that holds the message and nothing else (onLine). A turn that ended meanwhile would take the message as
+// its prompt at Enter, and Escape would end the turn it opened.
 func holding(styled, tool, text string) error {
 	if d := Dialog(Plain(styled)); d != "" {
 		return fmt.Errorf("%w: %s", ErrDialog, d)
 	}
-	if !holds(styled, tool, text) {
-		return errors.New("the input line does not hold the message alone")
-	}
-	if !TurnRuns(styled, tool) {
+	if _, ok := Draft(styled, tool); ok && !TurnRuns(styled, tool) {
 		return ErrIdle
 	}
-	return nil
+	return onLine(styled, tool, text)
 }
 
 // waiting checks a styled screen after Enter put the message in the queue: the turn still runs, no dialog, the
-// input line is empty again and says that a message waits in the queue.
-func waiting(styled, tool string) error {
+// input line is empty again and says that a message waits in the queue. A line that still holds the message, or is
+// empty with no word of the queue yet, is not drawn yet (errNotYet).
+func waiting(styled, tool, text string) error {
 	if d := Dialog(Plain(styled)); d != "" {
 		return fmt.Errorf("%w: %s", ErrDialog, d)
 	}
-	if !TurnRuns(styled, tool) {
+	typed, ok := Draft(styled, tool)
+	switch {
+	case !ok:
+		return fmt.Errorf("%w: no input line on the screen", errNotYet)
+	case !TurnRuns(styled, tool):
 		return ErrIdle
-	}
-	if typed, ok := Draft(styled, tool); !ok || typed != "" {
-		return errors.New("the input line does not show the message gone to the queue")
-	}
-	if !Queued(styled, tool) {
-		return errors.New("no message waits in the queue")
+	case typed != "" && squeeze(typed) == squeeze(text):
+		return fmt.Errorf("%w: %s", errNotYet, shown(typed))
+	case typed != "":
+		return fmt.Errorf("%s, not the message gone to the queue", shown(typed))
+	case !Queued(styled, tool):
+		return fmt.Errorf("%w: the input line is empty, and no message waits in the queue", errNotYet)
 	}
 	return nil
 }
@@ -326,26 +416,24 @@ func inputText(styled, tool string) (string, bool) {
 	return "", false
 }
 
-// until reads the screen, a pause apart, until check passes on it, at most settleReads times: a terminal can draw a
-// paste or a key a moment late. A screen whose terminal check fails ends it at once, and so does any failure but a
-// screen caught mid-redraw, without its input line yet, or one that has not changed yet. Every failure is
-// ErrUnstable: something was typed before it.
+// until reads the screen, a pause apart, until check passes on it, for settleWait at most: a terminal can draw a
+// paste or a key late. A screen whose terminal check fails ends it at once, and so does any failure but a screen not
+// drawn yet (errNotYet). Every failure is ErrUnstable, with what the input line held: something was typed before it.
 func (s *Sender) until(screen func() (string, error), check func(string) error) error {
-	var err error
-	for range settleReads {
+	end := time.Now().Add(settleWait)
+	for {
 		s.pause()
-		var sc string
-		if sc, err = screen(); err != nil {
+		sc, err := screen()
+		if err != nil {
 			return fmt.Errorf("%w: %v", ErrUnstable, err)
 		}
 		if err = check(sc); err == nil {
 			return nil
 		}
-		if errors.Is(err, ErrDialog) || errors.Is(err, ErrIdle) {
+		if !errors.Is(err, errNotYet) || !time.Now().Before(end) {
 			return fmt.Errorf("%w: %v", ErrUnstable, err)
 		}
 	}
-	return fmt.Errorf("%w: %v", ErrUnstable, err)
 }
 
 // pasteTmux pastes text into t's pane as one bracketed paste, through a buffer of its own that it drops. A buffer

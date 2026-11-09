@@ -39,6 +39,11 @@ func (f *fakeSender) Interrupt(_ context.Context, t act.Target, text string, sti
 	return act.Tmux, f.interrupt
 }
 
+// Leftover finds the input line without the message: nothing was left on it.
+func (f *fakeSender) Leftover(context.Context, act.Target, string, func() error) (act.Path, error) {
+	return act.Tmux, act.ErrNotLeft
+}
+
 func (f *fakeSender) Check(_ context.Context, t act.Target) (act.Path, error) {
 	f.checks++
 	return act.Tmux, f.check

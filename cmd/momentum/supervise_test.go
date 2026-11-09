@@ -24,6 +24,9 @@ func (t *typist) Interrupt(_ context.Context, _ act.Target, text string, _ func(
 	t.sent = append(t.sent, text)
 	return act.Tmux, nil
 }
+func (t *typist) Leftover(context.Context, act.Target, string, func() error) (act.Path, error) {
+	return act.Tmux, act.ErrNotLeft
+}
 func (t *typist) Send(_ context.Context, _ act.Target, text string) (act.Path, error) {
 	t.sent = append(t.sent, text)
 	return act.Tmux, nil

@@ -56,6 +56,7 @@ type fakeTurn struct {
 	ends     bool // the turn ends as the paste lands: the input line holds it, and no turn runs
 	newTurn  bool // Enter submits it as the prompt of a new turn, which runs: the input line is empty, no hint
 	late     int  // reads after the paste that still show the line empty
+	row      int  // the runes of a row the input line wraps at, for Ctrl+U; 0 is no wrap
 	keys     []string
 	commands []string
 }
@@ -96,11 +97,26 @@ func (f *fakeTurn) run(_ context.Context, stdin, name string, args ...string) ([
 	case "send-keys":
 		key := args[len(args)-1]
 		f.keys = append(f.keys, key)
-		if key == "Enter" {
+		switch key {
+		case "Enter":
 			f.entered, f.line = true, ""
+		case "C-u": // back to the start of the row: the line's last row, of row runes each
+			r := []rune(f.line)
+			n := len(r)
+			if f.row > 0 && n > f.row {
+				n = (n-1)%f.row + 1
+			}
+			f.line = string(r[:len(r)-n])
 		}
 	}
 	return nil, nil
+}
+
+// shortSettle makes a screen that never settles end its reads soon.
+func shortSettle(t *testing.T) {
+	d := settleWait
+	t.Cleanup(func() { settleWait = d })
+	settleWait = 50 * time.Millisecond
 }
 
 func turnPane(t *testing.T, f *fakeTurn) (*Sender, Target) {
@@ -109,7 +125,7 @@ func turnPane(t *testing.T, f *fakeTurn) (*Sender, Target) {
 }
 
 func TestInterruptQueuesTheMessageThenPressesEscape(t *testing.T) {
-	f := &fakeTurn{late: settleReads - 1}
+	f := &fakeTurn{late: 3}
 	s, tgt := turnPane(t, f)
 	path, err := s.Interrupt(context.Background(), tgt, "[momentum] Your last request got\nno reply.", nil)
 	if err != nil || path != Tmux {
@@ -238,7 +254,8 @@ func TestInterruptRefusesBeforeTypingAnything(t *testing.T) {
 
 func TestInterruptPressesEscapeOnlyOnceTheMessageWaitsInTheQueue(t *testing.T) {
 	// The paste never shows on the input line: no Enter.
-	f := &fakeTurn{late: settleReads}
+	shortSettle(t)
+	f := &fakeTurn{late: 1 << 30}
 	s, tgt := turnPane(t, f)
 	if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue", nil); !errors.Is(err, ErrUnstable) || len(f.keys) != 0 {
 		t.Fatalf("never drawn: %v keys %q", err, f.keys)
@@ -277,6 +294,71 @@ func TestInterruptPressesEscapeOnlyOnceTheMessageWaitsInTheQueue(t *testing.T) {
 	for name, f := range map[string]*fakeTurn{"the turn ended": {noQueue: true}, "a new turn runs it": {newTurn: true}} {
 		s, tgt = turnPane(t, f)
 		if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue", nil); !errors.Is(err, ErrUnstable) || strings.Join(f.keys, " ") != "Enter" {
+			t.Fatalf("%s: %v keys %q", name, err, f.keys)
+		}
+	}
+}
+
+func TestAPasteDrawnLateStillGoesIn(t *testing.T) {
+	// The interface draws the paste only on the ninth read: twice the reads there were, well within the wait.
+	f := &fakeTurn{late: 8}
+	s, tgt := turnPane(t, f)
+	if _, err := s.Interrupt(context.Background(), tgt, "[momentum] continue", nil); err != nil || strings.Join(f.keys, " ") != "Enter Escape" {
+		t.Fatalf("interrupt drawn late: %v keys %q", err, f.keys)
+	}
+	g := &fakeTmux{screen: emptyInput, mode: "0", slow: 8}
+	s, tgt = pane(t, g, agent)
+	if _, err := s.Send(context.Background(), tgt, "[momentum] continue"); err != nil || g.cmds[len(g.cmds)-1] != "tmux send-keys -t %3 Enter" {
+		t.Fatalf("send drawn late: %v %q", err, g.cmds)
+	}
+	// Other text on the line ends the reads at once, and the error says what the line held.
+	f = &fakeTurn{late: 1}
+	s, tgt = turnPane(t, f)
+	run := s.Run
+	s.Run = func(ctx context.Context, stdin, name string, args ...string) ([]byte, error) {
+		if args[0] == "paste-buffer" {
+			defer func() { f.line += "x" }() // its owner typed a key as it landed
+		}
+		return run(ctx, stdin, name, args...)
+	}
+	start := time.Now()
+	_, err := s.Interrupt(context.Background(), tgt, "[momentum] continue", nil)
+	if !errors.Is(err, ErrUnstable) || !strings.Contains(err.Error(), `"[momentum] continuex"`) || time.Since(start) > time.Second || len(f.keys) != 0 {
+		t.Fatalf("other text: %v after %v, keys %q", err, time.Since(start), f.keys)
+	}
+}
+
+func TestLeftoverSendsOrClearsItsOwnMessage(t *testing.T) {
+	msg := "[momentum] Your last request got no reply. Continue where you left off."
+	left := func(f *fakeTurn) *fakeTurn { f.pasted, f.line = msg, msg; return f } // drawn after Interrupt stopped reading
+	answered := errors.New("answered")
+	// The turn runs and the request still waits: Enter, then Escape, as Interrupt does.
+	f := left(&fakeTurn{})
+	s, tgt := turnPane(t, f)
+	if _, err := s.Leftover(context.Background(), tgt, msg, nil); err != nil || strings.Join(f.keys, " ") != "Enter Escape" {
+		t.Fatalf("unanswered: %v keys %q", err, f.keys)
+	}
+	// The request was answered: the line is cleared, a row per Ctrl+U when it wraps, and nothing is sent.
+	for row, keys := range map[int]string{0: "C-e C-u", 30: "C-e C-u C-u C-u"} {
+		f = left(&fakeTurn{row: row})
+		s, tgt = turnPane(t, f)
+		_, err := s.Leftover(context.Background(), tgt, msg, func() error { return answered })
+		if !errors.Is(err, ErrCleared) || !errors.Is(err, answered) || f.line != "" || strings.Join(f.keys, " ") != keys {
+			t.Fatalf("answered, row %d: %v line %q keys %q", row, err, f.line, f.keys)
+		}
+	}
+	// The turn ended: cleared too, since Enter would make it the prompt of a new turn.
+	f = left(&fakeTurn{ends: true})
+	s, tgt = turnPane(t, f)
+	if _, err := s.Leftover(context.Background(), tgt, msg, nil); !errors.Is(err, ErrCleared) || !errors.Is(err, ErrIdle) || f.line != "" {
+		t.Fatalf("ended: %v line %q", err, f.line)
+	}
+	// Anything else on the line is not momentum's to touch.
+	for name, line := range map[string]string{"empty": "", "its owner typed after it": msg + "x", "his own words": "why"} {
+		f = left(&fakeTurn{})
+		f.line = line
+		s, tgt = turnPane(t, f)
+		if _, err := s.Leftover(context.Background(), tgt, msg, nil); !errors.Is(err, ErrNotLeft) || len(f.keys) != 0 {
 			t.Fatalf("%s: %v keys %q", name, err, f.keys)
 		}
 	}
