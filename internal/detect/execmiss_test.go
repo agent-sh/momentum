@@ -9,11 +9,13 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// A failed command whose message says no file is at a path it names in quotes is keyed by that path as a whole one,
-// cleaned and with the home folded to ~, not by its words: Python's errno, ls's and the like's quoted name before the
-// mark, Node's code and its message, in any harness's shell. A relative path is read in the directory the command
-// ran in; one whose directory is not known, an empty one and one the store cut short key nothing. A message that
-// names no quoted path, two paths, or a program a wrapper could not find keeps its words.
+// A failed command whose message says no file is at a path it names in quotes is keyed by that path, not by its
+// words: Python's errno, ls's and the like's quoted name before the mark, Node's code and its message, in any
+// harness's shell. The path is cleaned; a whole one has the home folded to ~, and one under the directory the call
+// ran in (its input's workdir or cwd, else the call's own) is keyed by its part below that directory; a relative one
+// is keyed as the message spells it, whatever the command did before. An empty path and one the store cut short key
+// nothing. A message that names no quoted path, two paths, or a program that another (a wrapper, Python's
+// subprocess, strace, Deno) could not find keeps its words, and so does one from a command that runs ssh.
 func TestACommandsMissIsKeyedByThePathItNames(t *testing.T) {
 	t.Setenv("HOME", "/home/u")
 	const py = `{"command":"python3 run.py"}`
@@ -21,50 +23,67 @@ func TestACommandsMissIsKeyedByThePathItNames(t *testing.T) {
 		// each form, by the path it names
 		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '/w/data/in.csv'", py, "", "miss:exec:/w/data/in.csv"},
 		{"claude", "Bash", "Exit code 1 Traceback (most recent call last): File \"run.py\", line 3, in <module> open('config') FileNotFoundError: [Errno 2] No such file or directory: 'config'",
-			py, "/w/a", "miss:exec:/w/a/config"},
+			py, "/w/a", "miss:exec:config"},
 		{"claude", "Bash", `Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: "/w/it's.md"`, py, "", "miss:exec:/w/it's.md"},
-		{"claude", "Bash", "Exit code 2 ls: cannot access '/w/a.txt': No such file or directory", `{"command":"ls /w/a.txt"}`, "", "miss:exec:/w/a.txt"},
-		{"claude", "Bash", "Exit code 2 ls: cannot access 'a.txt': No such file or directory", `{"command":"ls a.txt"}`, "/w", "miss:exec:/w/a.txt"},
-		{"claude", "Bash", "Exit code 2 ls: cannot access ‘build’: No such file or directory", `{"command":"ls build"}`, "/w", "miss:exec:/w/build"},
-		{"claude", "Bash", "Exit code 2 ls: cannot access `build': No such file or directory", `{"command":"ls build"}`, "/w", "miss:exec:/w/build"},
-		{"claude", "Bash", "Exit code 2 python3: can't open file '/w/run.py': [Errno 2] No such file or directory", py, "/w", "miss:exec:/w/run.py"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access '/w/a.txt': No such file or directory", `{"command":"ls /w/a.txt"}`, "/x", "miss:exec:/w/a.txt"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access ‘build’: No such file or directory", `{"command":"ls build"}`, "/w", "miss:exec:build"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access `build': No such file or directory", `{"command":"ls build"}`, "/w", "miss:exec:build"},
+		{"claude", "Bash", "Exit code 2 python3: can't open file '/w/run.py': [Errno 2] No such file or directory", py, "/x", "miss:exec:/w/run.py"},
 		{"claude", "Bash", "Exit code 1 tail: cannot open '/w/x.log' for reading: No such file or directory", `{"command":"tail /w/x.log"}`, "", "miss:exec:/w/x.log"},
 		{"claude", "Bash", `Exit code 23 rsync: [sender] link_stat "/w/src" failed: No such file or directory (2)`, `{"command":"rsync -a /w/src /w/dst"}`, "", "miss:exec:/w/src"},
-		{"claude", "Bash", "Exit code 128 fatal: cannot change to 'repo': No such file or directory", `{"command":"git -C repo status"}`, "/w", "miss:exec:/w/repo"},
+		{"claude", "Bash", "Exit code 128 fatal: cannot change to 'repo': No such file or directory", `{"command":"git -C repo status"}`, "/w", "miss:exec:repo"},
 		{"claude", "Bash", "Exit code 1 Error: ENOENT: no such file or directory, open '/srv/app/a.json' at Object.openSync (node:fs:1)", `{"command":"node x.js"}`, "", "miss:exec:/srv/app/a.json"},
-		{"claude", "Bash", "Exit code 1 Error: ENOENT: no such file or directory, scandir 'out'", `{"command":"node x.js"}`, "/w", "miss:exec:/w/out"},
+		{"claude", "Bash", "Exit code 1 Error: ENOENT: no such file or directory, scandir 'out'", `{"command":"node x.js"}`, "/w", "miss:exec:out"},
 		{"claude", "Bash", `Exit code 1 "/w/target/asan": No such file or directory (os error 2)`, `{"command":"cargo x"}`, "", "miss:exec:/w/target/asan"},
-		// the path's cleaning: . and .., the home, a program's wrapper that names one by its path
+		// ls's escaped quote is read; quotes run together otherwise ($'\n') are not
+		{"claude", "Bash", `Exit code 2 ls: cannot access 'it'\''s.md': No such file or directory`, `{"command":"ls x"}`, "/w", "miss:exec:it's.md"},
+		{"claude", "Bash", `Exit code 2 ls: cannot access '/w/a'\''b'\''c': No such file or directory`, `{"command":"ls x"}`, "", "miss:exec:/w/a'b'c"},
+		{"claude", "Bash", `Exit code 2 ls: cannot access 'a'$'\n''b': No such file or directory`, `{"command":"ls x"}`, "/w", ""},
+		// the path's cleaning: . and .., the home
 		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '/w/./b/../a.txt'", py, "", "miss:exec:/w/a.txt"},
 		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '/home/u/p/x.json'", py, "", "miss:exec:~/p/x.json"},
-		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '~/p/x.json'", py, "", "miss:exec:~/p/x.json"},
-		{"claude", "Bash", "Exit code 2 ls: cannot access '../a.txt': No such file or directory", `{"command":"ls ../a.txt"}`, "/w/b", "miss:exec:/w/a.txt"},
-		{"claude", "Bash", "Exit code 127 env: './run.sh': No such file or directory", `{"command":"env ./run.sh"}`, "/w", "miss:exec:/w/run.sh"},
-		// each harness's shell, and the directory its call names
-		{"codex", "exec_command", `{"stdout":"","stderr":"ls: cannot access '/w/a': No such file or directory","exit_code":2}`, `{"cmd":"ls /w/a"}`, "", "miss:exec:/w/a"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access './a/./b.txt': No such file or directory", `{"command":"ls x"}`, "/w", "miss:exec:a/b.txt"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access '../a.txt': No such file or directory", `{"command":"ls ../a.txt"}`, "/w/b", "miss:exec:../a.txt"},
+		// a relative path as spelled, wherever the command ran: a ~ in a program's message is its directory's, since the
+		// shell expands the home's before the program sees it
+		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '~/p/x.json'", py, "/home/u/p", "miss:exec:~/p/x.json"},
+		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '~/p/x.json'", py, "/home/u", "miss:exec:~/p/x.json"},
+		{"claude", "Bash", "Exit code 127 env: './run.sh': No such file or directory", `{"command":"env ./run.sh"}`, "/w", "miss:exec:run.sh"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access 'a.txt': No such file or directory", `{"command":"ls a.txt"}`, "", "miss:exec:a.txt"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access 'a.txt': No such file or directory", `{"command":"ls a.txt"}`, "w", "miss:exec:a.txt"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access 'a.txt': No such file or directory", "", "/w", "miss:exec:a.txt"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access 'a.txt': No such file or directory", `{"command":"ls a.txt && echo a long command the store cut`, "/w", "miss:exec:a.txt"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access 'a.txt': No such file or directory", `{"command":"cd /x && ls a.txt"}`, "/w", "miss:exec:a.txt"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access 'a.txt': No such file or directory", `{"command":"(pushd /x; ls a.txt)"}`, "/w", "miss:exec:a.txt"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access 'a.txt': No such file or directory", `{"command":"popd && ls a.txt"}`, "/w", "miss:exec:a.txt"},
+		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: 'a.txt'", `{"command":"cat > x.py <<'EOF'\nopen('a.txt')\nEOF\ncd /x && python3 x.py"}`, "/w", "miss:exec:a.txt"},
+		{"claude", "Bash", "Exit code 1 cat: '.out/result.json': No such file or directory", `{"command":"cat > run.sh <<'EOF'\nset -e\nmkdir -p .out\nprintf x > .out/a`, "/w", "miss:exec:.out/result.json"},
+		{"codex", "exec_command", "Process exited with code 2 Output: ls: cannot access 'a': No such file or directory", `{"cmd":"ls a","yield_time_ms":1000,"max_out`, "/w", "miss:exec:a"},
+		{"hermes", "terminal", `{"output": "ls: cannot access 'a': No such file or directory", "exit_code": 2, "error": null}`, `{"command":"ls a"}`, "/w", "miss:exec:a"},
+		// a whole path under the directory the call ran in, by its part below it: the one its input names, else its own
+		{"claude", "Bash", "Exit code 2 ls: cannot access '/w/wt1/scripts/c.py': No such file or directory", `{"command":"ls x"}`, "/w/wt1", "miss:exec:scripts/c.py"},
+		{"codex", "exec_command", `{"stdout":"","stderr":"ls: cannot access '/w/c/a': No such file or directory","exit_code":2}`, `{"cmd":"ls /w/c/a","workdir":"/w/c"}`, "/w", "miss:exec:a"},
+		{"codex", "exec_command", `{"stdout":"","stderr":"ls: cannot access '/w/b': No such file or directory","exit_code":2}`, `{"cmd":"ls /w/b","workdir":"/w/c"}`, "/w", "miss:exec:/w/b"},
 		{"codex", "exec_command", "Chunk ID: 1a Wall time: 0.1 seconds Process exited with code 2 Original token count: 3 Output: ls: cannot access 'a': No such file or directory",
-			`{"cmd":"ls a","workdir":"/w/c"}`, "/w", "miss:exec:/w/c/a"},
-		{"codex", "exec_command", "Process exited with code 2 Output: ls: cannot access 'a': No such file or directory", `{"cmd":"ls a"}`, "/w", "miss:exec:/w/a"},
-		{"hermes", "terminal", `{"output": "ls: cannot access 'a': No such file or directory", "exit_code": 2, "error": null}`, `{"command":"ls a","workdir":"/w/h"}`, "/w", "miss:exec:/w/h/a"},
+			`{"cmd":"ls a","workdir":"/w/c"}`, "/w", "miss:exec:a"},
+		{"codex", "exec_command", "Process exited with code 2 Output: ls: cannot access '/w/a': No such file or directory", `{"cmd":"ls /w/a","yield_time_ms":1000,"max_out`, "/w", "miss:exec:a"},
+		{"opencode", "shell", "ls: cannot access '/w/o/a': No such file or directory", `{"command":"ls /w/o/a","workdir":"/w/o"}`, "/w", "miss:exec:a"},
+		{"hermes", "terminal", `{"output": "ls: cannot access '/w/h/a': No such file or directory", "exit_code": 2, "error": null}`, `{"command":"ls /w/h/a","workdir":"/w/h"}`, "/w", "miss:exec:a"},
 		{"hermes", "terminal", `{"output": "ls: cannot access '/w/a': No such file or directory", "exit_code": 2, "error": null}`, `{"command":"ls /w/a"}`, "", "miss:exec:/w/a"},
-		{"kimi", "Bash", "ls: cannot access 'a': No such file or directory", `{"command":"ls a","cwd":"/w/k"}`, "/w", "miss:exec:/w/k/a"},
-		{"pi", "bash", "ls: cannot access 'a': No such file or directory", `{"command":"ls a"}`, "/w/p", "miss:exec:/w/p/a"},
-		// no key: an empty path, one the store cut short, a relative one whose directory is not known
+		{"kimi", "Bash", "ls: cannot access '/w/k/a': No such file or directory", `{"command":"ls /w/k/a","cwd":"/w/k"}`, "/w", "miss:exec:a"},
+		{"pi", "bash", "ls: cannot access '/w/p/a': No such file or directory", `{"command":"ls /w/p/a"}`, "/w/p", "miss:exec:a"},
+		// not below it: the directory itself, a name that only starts like it, the root, the home and above it
+		{"claude", "Bash", "Exit code 128 fatal: cannot change to '/w/a': No such file or directory", `{"command":"git -C /w/a status"}`, "/w/a", "miss:exec:/w/a"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access '/w/ab/c': No such file or directory", `{"command":"ls x"}`, "/w/a", "miss:exec:/w/ab/c"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access '/w/a': No such file or directory", `{"command":"ls x"}`, "/", "miss:exec:/w/a"},
+		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '/home/u/p/x.json'", py, "/home/u", "miss:exec:~/p/x.json"},
+		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '/home/u/p/x.json'", py, "/home", "miss:exec:~/p/x.json"},
+		// no key: an empty path, one the store cut short
 		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: ''", py, "/w", ""},
 		{"claude", "Bash", "Exit code 2 ls: cannot access '': No such file or directory", `{"command":"ls \"$X\""}`, "/w", ""},
 		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '/w/a-very-long-dir/sub…", py, "/w", ""},
-		{"claude", "Bash", "Exit code 2 ls: cannot access 'a.txt': No such file or directory", `{"command":"ls a.txt"}`, "", ""},
-		{"claude", "Bash", "Exit code 2 ls: cannot access 'a.txt': No such file or directory", `{"command":"ls a.txt"}`, "w", ""},
-		{"claude", "Bash", "Exit code 2 ls: cannot access 'a.txt': No such file or directory", "", "/w", ""},
-		{"claude", "Bash", "Exit code 2 ls: cannot access 'a.txt': No such file or directory", `{"command":"ls a.txt && echo a long command the store cut`, "/w", ""},
-		{"claude", "Bash", "Exit code 2 ls: cannot access 'a.txt': No such file or directory", `{"command":"cd /x && ls a.txt"}`, "/w", ""},
-		{"claude", "Bash", "Exit code 2 ls: cannot access 'a.txt': No such file or directory", `{"command":"(pushd /x; ls a.txt)"}`, "/w", ""},
-		{"claude", "Bash", "Exit code 2 ls: cannot access 'a.txt': No such file or directory", `{"command":"ssh h 'ls a.txt'"}`, "/w", ""},
-		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: 'a.txt'", `{"command":"cat > x.py <<'EOF'\nopen('a.txt')\nEOF\ncd /x && python3 x.py"}`, "/w", ""},
-		{"codex", "exec_command", "Process exited with code 2 Output: ls: cannot access 'a': No such file or directory", `{"cmd":"ls a","yield_time_ms":1000,"max_out`, "/w", ""},
-		{"hermes", "terminal", `{"output": "ls: cannot access 'a': No such file or directory", "exit_code": 2, "error": null}`, `{"command":"ls a"}`, "/w", ""},
-		// what keeps its words: a path not quoted, two paths, a program a wrapper looked for on the PATH, a quote too far
-		// from the mark or opened in a word
+		// what keeps its words: a path not quoted, two paths, a program another program looked for on the PATH, a command
+		// that runs ssh, a quote too far from the mark or opened in a word
 		{"claude", "Bash", "Exit code 1 cat: /w/a.txt: No such file or directory", `{"command":"cat /w/a.txt"}`, "/w", "exec:cat: P: no such file or directory"},
 		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '/w/a' -> '/w/b'", py, "/w",
 			"exec:filenotfounderror: [errno N] no such file or directory: Q"},
@@ -77,6 +96,19 @@ func TestACommandsMissIsKeyedByThePathItNames(t *testing.T) {
 		{"claude", "Bash", "Exit code 127 /usr/bin/env: 'python3\r': No such file or directory", `{"command":"./run"}`, "/w", "exec:no such file or directory"},
 		{"claude", "Bash", "Exit code 127 timeout: failed to run command 'gsutil': No such file or directory", `{"command":"timeout 5 gsutil ls"}`, "/w",
 			"exec:timeout: failed to run command Q: no such file or directory"},
+		{"claude", "Bash", "Exit code 1 Traceback (most recent call last): File \"x.py\", line 2, in <module> File \"/usr/lib/python3.12/subprocess.py\", line 1955, in _execute_child " +
+			"raise child_exception_type(errno_num, err_msg, err_filename) FileNotFoundError: [Errno 2] No such file or directory: 'cargo'", py, "/w",
+			"exec:filenotfounderror: [errno N] no such file or directory: Q"},
+		{"claude", "Bash", "Exit code 1 Traceback (most recent call last): File \"/usr/lib/python3.12/subprocess.py\", line 1955, in _execute_child " +
+			"raise child_exception_type(errno_num, err_msg, err_filename) FileNotFoundError: [Errno 2] No such file or directory: './bin/tool'", py, "/w", "miss:exec:bin/tool"},
+		{"claude", "Bash", "Exit code 1 strace: Can't stat 'foo': No such file or directory", `{"command":"strace -f foo"}`, "/w", "exec:strace: can't stat Q: no such file or directory"},
+		{"claude", "Bash", "Exit code 1 error: Uncaught (in promise) NotFound: Failed to spawn 'foo': No such file or directory (os error 2)", `{"command":"deno run x.ts"}`, "/w",
+			"exec:notfound: failed to spawn Q: no such file or directory"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access '/workspace/a': No such file or directory", `{"command":"ssh box 'ls /workspace/a'"}`, "/w",
+			"exec:ls: cannot access Q: no such file or directory"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access 'a.txt': No such file or directory", `{"command":"ssh h 'ls a.txt'"}`, "/w", "exec:ls: cannot access Q: no such file or directory"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access '/workspace/a': No such file or directory", `{"command":"cat > x <<'EOF'\nls\nEOF\nssh box sh < x"}`, "/w",
+			"exec:ls: cannot access Q: no such file or directory"},
 		{"claude", "Bash", "Exit code 1 waiting for 'Allow once' clip-2.mp4: No such file or directory", `{"command":"run"}`, "/w", "exec:clip-N.mpN: no such file or directory"},
 		{"claude", "Bash", "Exit code 1 x 'a.txt' one two three four: No such file or directory", `{"command":"x"}`, "/w", "exec:four: no such file or directory"},
 		{"claude", "Bash", "Exit code 1 it can't open: No such file or directory", `{"command":"x"}`, "/w", "exec:open: no such file or directory"},
@@ -91,56 +123,72 @@ func TestACommandsMissIsKeyedByThePathItNames(t *testing.T) {
 			t.Errorf("%s %s %q, call %q in %q:\n got %q\nwant %q", c.harness, c.tool, c.text, c.call, c.cwd, got, c.want)
 		}
 	}
-	// the mistakes log keeps no call: a whole path is keyed, a relative one is not
+	// the mistakes log keeps no call: a path is keyed as its message spells it
 	if k, ok := MistakeKey("tool-error", "Bash", "Bash: Exit code 2 ls: cannot access '/w/a.txt': No such file or directory"); !ok || k.String() != "miss:exec:/w/a.txt" {
 		t.Errorf("a logged miss: %q, %v", k.String(), ok)
 	}
-	if k, ok := MistakeKey("tool-error", "Bash", "Bash: Exit code 2 ls: cannot access 'a.txt': No such file or directory"); ok {
-		t.Errorf("a logged relative miss: %q", k.String())
+	if k, ok := MistakeKey("tool-error", "Bash", "Bash: Exit code 2 ls: cannot access 'a.txt': No such file or directory"); !ok || k.String() != "miss:exec:a.txt" {
+		t.Errorf("a logged relative miss: %q, %v", k.String(), ok)
 	}
 }
 
 // Two commands that miss two paths are two failures, where their words were one; the same path missed again, in
-// another session too, recurs, under its own title.
+// another session too, recurs, under its own title: a relative one from any directory, after a cd or in a command the
+// store cut, and one script in three worktrees, by its part below each.
 func TestACommandsMissRecursOnlyByItsPath(t *testing.T) {
 	t.Setenv("HOME", "/home/u")
 	ctx := context.Background()
 	n := 0
-	missing := func(session, p, cwd string, at time.Time) []store.Event {
+	missingIn := func(session, input, p, cwd string, at time.Time) []store.Event {
 		n++
 		id := "bash-" + string(rune('a'+n))
-		c := call(session, "Bash", id, `{"command":"python3 run.py"}`, at)
+		c := call(session, "Bash", id, input, at)
 		c.Cwd = cwd
 		return []store.Event{c, result(session, "Bash", id, "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '"+p+"'", at.Add(time.Second))}
 	}
+	missing := func(session, p, cwd string, at time.Time) []store.Event {
+		return missingIn(session, `{"command":"python3 run.py"}`, p, cwd, at)
+	}
 	st := testStore(t)
-	put(t, st, slices.Concat(missing("s1", "/w/a.json", "/w", t0), missing("s1", "/w/b.json", "/w", t0.Add(time.Hour)),
-		missing("s2", "c.json", "/w", t0.Add(2*time.Hour)))...)
+	put(t, st, slices.Concat(missing("s1", "/w/a.json", "/x", t0), missing("s1", "/w/b.json", "/x", t0.Add(time.Hour)),
+		missing("s2", "c.json", "/x", t0.Add(2*time.Hour)))...)
 	if fs, err := (Failures{}).Detect(ctx, st, week()); err != nil || len(fs) != 0 {
 		t.Fatalf("three paths: %v, %v", signatures(fs), err)
 	}
 	fs, err := Failures{Recur: Recur{Events: 1}}.Detect(ctx, st, week())
-	if got, want := signatures(fs), []string{"failures/v2:miss:exec:/w/a.json 1", "failures/v2:miss:exec:/w/b.json 1", "failures/v2:miss:exec:/w/c.json 1"}; err != nil || !slices.Equal(got, want) {
+	if got, want := signatures(fs), []string{"failures/v2:miss:exec:/w/a.json 1", "failures/v2:miss:exec:/w/b.json 1", "failures/v2:miss:exec:c.json 1"}; err != nil || !slices.Equal(got, want) {
 		t.Fatalf("three paths at a bar of one: %v, %v, want %v", got, err, want)
 	}
 
-	st = testStore(t)
-	put(t, st, slices.Concat(missing("s1", "/home/u/p/x.json", "/w", t0), missing("s1", "x.json", "/home/u/p", t0.Add(time.Hour)),
-		missing("s2", "/home/u/p/./x.json", "/w", t0.Add(2*time.Hour)), missing("s3", "x.json", "/w", t0))...)
-	outs, _, err := Run(ctx, st, []Detector{Failures{}}, week(), "test", false)
-	if err != nil || len(outs) != 1 || len(outs[0].Filed) != 1 || outs[0].Filed[0].Observed != store.Opened {
-		t.Fatalf("one path: %+v, %v", outs, err)
-	}
-	if c := outs[0].Filed[0].Case; !slices.Equal(c.Signatures, []string{"failures/v2:miss:exec:~/p/x.json"}) || c.Evidence != 3 ||
-		c.Title != "A command keeps missing the same path: ~/p/x.json" {
-		t.Fatalf("case %+v", c)
+	for _, tc := range []struct {
+		name, want string
+		events     []store.Event
+	}{
+		{"the home's", "~/p/x.json", slices.Concat(missing("s1", "/home/u/p/x.json", "/x", t0), missing("s1", "/home/u/p/./x.json", "/x", t0.Add(time.Hour)),
+			missing("s2", "/home/u/p/x.json", "/w", t0.Add(2*time.Hour)), missing("s3", "x.json", "/home/u/p", t0))},
+		{"a relative one", ".out/result.json", slices.Concat(missing("s1", ".out/result.json", "/w/a", t0),
+			missingIn("s1", `{"command":"cd /w/b && python3 run.py"}`, ".out/result.json", "/w", t0.Add(time.Hour)),
+			missingIn("s2", `{"command":"cat > run.sh <<'EOF'\nset -e\nmkdir -p .out\nprintf x > .out/a`, "./.out/result.json", "", t0.Add(2*time.Hour)))},
+		{"one script in three worktrees", "scripts/c.py", slices.Concat(missing("s1", "/w/wt1/scripts/c.py", "/w/wt1", t0),
+			missing("s2", "/w/wt2/scripts/c.py", "/w/wt2", t0.Add(time.Hour)), missing("s3", "/w/wt3/scripts/./c.py", "/w/wt3", t0.Add(2*time.Hour)))},
+	} {
+		st = testStore(t)
+		put(t, st, tc.events...)
+		outs, _, err := Run(ctx, st, []Detector{Failures{}}, week(), "test", false)
+		if err != nil || len(outs) != 1 || len(outs[0].Filed) != 1 || outs[0].Filed[0].Observed != store.Opened {
+			t.Fatalf("%s: %+v, %v", tc.name, outs, err)
+		}
+		if c := outs[0].Filed[0].Case; !slices.Equal(c.Signatures, []string{"failures/v2:miss:exec:" + tc.want}) || c.Evidence != 3 ||
+			c.Title != "A command keeps missing the same path: "+tc.want {
+			t.Fatalf("%s: case %+v", tc.name, c)
+		}
 	}
 
 	// no write clears a command's miss, so none is awaited: a miss in the window's last hour counts at once
 	w := week()
 	st = testStore(t)
-	put(t, st, slices.Concat(missing("s1", "/w/a.json", "/w", t0), missing("s2", "/w/a.json", "/w", t0.Add(time.Hour)),
-		missing("s2", "/w/a.json", "/w", w.Until.Add(-10*time.Minute)))...)
+	put(t, st, slices.Concat(missing("s1", "/w/a.json", "/x", t0), missing("s2", "/w/a.json", "/x", t0.Add(time.Hour)),
+		missing("s2", "/w/a.json", "/x", w.Until.Add(-10*time.Minute)))...)
 	if fs, err := (Failures{}).Detect(ctx, st, w); err != nil || !slices.Equal(signatures(fs), []string{"failures/v2:miss:exec:/w/a.json 3"}) {
 		t.Fatalf("a miss at the window's end: %v, %v", signatures(fs), err)
 	}

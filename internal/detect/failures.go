@@ -597,14 +597,14 @@ var (
 // says nothing to key it by.
 //
 // A failed command whose message says no file is at a path it names in quotes (quotedMiss) is keyed miss:exec by that
-// path, made whole (commandMissed, missedPath), for the same reason. One whose path is empty, cut short or relative to
-// a directory that is not known says nothing to key it by.
+// path (commandMissed, missedPath), for the same reason. One whose path is empty or cut short says nothing to key it by.
 func FailureOf(harness, tool, text, call string) (FailureKey, bool) {
 	return failureKey(harness, tool, text, store.Call{Input: call})
 }
 
 // failureKey is FailureOf's key for a result with its call as the store keeps it, its directory too, which a relative
-// path a read missed is read in (missOf), and a relative path a command's message names (commandMissed).
+// path a read missed is read in (missOf), and which a whole path a command's message names is keyed below
+// (commandMissed).
 func failureKey(harness, tool, text string, c store.Call) (FailureKey, bool) {
 	k, ok := failureOf(harness, tool, text, c.Input)
 	if !ok {
@@ -631,61 +631,54 @@ var dirFields = map[string]map[string]bool{
 	"codex": {"workdir": true}, "opencode": {"workdir": true}, "hermes": {"workdir": true}, "kimi": {"cwd": true},
 }
 
-// movers are the programs after which a command line's later commands may run in another directory, or on another
-// host.
-var movers = []string{"cd", "pushd", "popd", "ssh"}
+// commandMissed is the path a command's message named as the file it found no file at (quotedMiss), as its key holds
+// it before missedPath cleans it, or "" for an empty one:
+//   - A relative one as the message spells it, with no directory joined to it: the store often cuts the command
+//     before what it ran, and a cd moves where it ran, so the directory is not known, and a name missed in each of
+//     its directories recurs as one, as a read's whose directory is not known does (missOf). A ~ in a program's
+//     message is such a name too: the shell expands the home's before the program sees it.
+//   - A whole one under the directory the call ran in, by its part below it, as a relative one: the directory the
+//     call's input names (dirFields), else the call's own as the store keeps it, when that is a whole path below
+//     the home or outside it (not /, the home or a directory above it). A per-task worktree's root is no part of
+//     what a script in it misses, so one script missed in each worktree recurs as one. The cost: one relative name
+//     in two unrelated projects is one key.
+//   - Any other whole path as it is.
+//
+// The directory is the call's: a command that runs elsewhere through what is not ssh (bash -c with a cd in it,
+// env -C, docker exec) is read as run in it.
+func commandMissed(harness, p string, c store.Call) string {
+	if p == "" || !path.IsAbs(p) {
+		return p
+	}
+	dir := c.Cwd
+	if keys := dirFields[harness]; keys != nil {
+		if w, named, _ := callField(c.Input, keys); named && path.IsAbs(w) {
+			dir = w
+		}
+	}
+	root, home := path.Clean(dir), path.Clean(paths.Home())
+	if !path.IsAbs(root) || root == "/" || root == home || strings.HasPrefix(home, root+"/") {
+		return p
+	}
+	if rest, ok := strings.CutPrefix(path.Clean(p), root+"/"); ok {
+		return rest
+	}
+	return p
+}
 
-// moves says a command line may run a command in another directory or on another host than its call's: a mover is
-// among the programs of one of its lines, a here-document's lines read as commands too, since a command after the
-// here-document is not told from its text.
-func moves(cmd string) bool {
-	for _, line := range strings.Split(cmd, "\n") {
-		programs := commandPrograms(line)
-		if slices.ContainsFunc(movers, func(m string) bool { return programs[m] }) {
+// remote says a shell call runs ssh in a line of its command as the store keeps it, a here-document's lines read as
+// commands too: a path its output names may be another host's.
+func remote(call string) bool {
+	m := callRe.FindStringSubmatch(call)
+	if m == nil {
+		return false
+	}
+	for _, line := range strings.Split(unescape(m[1]), "\n") {
+		if commandPrograms(line)["ssh"] {
 			return true
 		}
 	}
 	return false
-}
-
-// commandMissed is the whole path a command's message named as the file it found no file at (quotedMiss): a whole
-// path or the home's as it is; a relative one in the directory the command ran in, when that is known: the store
-// kept the call's command whole, it moves nowhere (moves), and the directory is a whole path: the one the call's
-// input names (dirFields), or, in an input that names none, the call's as the store keeps it, but for Hermes, whose
-// terminal's directory a cd in an earlier call moves. Else, and for an empty path, it is "".
-func commandMissed(harness, p string, c store.Call) string {
-	switch {
-	case p == "":
-		return ""
-	case path.IsAbs(p), p == "~", strings.HasPrefix(p, "~/"):
-		return p
-	}
-	cmd, whole := callCommand(c.Input)
-	if !whole || moves(cmd) {
-		return ""
-	}
-	dir := c.Cwd
-	if keys := dirFields[harness]; keys != nil {
-		switch w, named, absent := callField(c.Input, keys); {
-		case named:
-			dir = w
-		case !absent, harness == "hermes": // cut before it could name one, or Hermes's terminal
-			return ""
-		}
-	}
-	if !path.IsAbs(dir) {
-		return ""
-	}
-	return path.Join(dir, p)
-}
-
-// callCommand is a shell call's command line (callRe), and whether the store kept it whole.
-func callCommand(call string) (string, bool) {
-	m := callRe.FindStringSubmatchIndex(call)
-	if m == nil || m[3] >= len(call) || call[m[3]] != '"' {
-		return "", false
-	}
-	return unescape(call[m[2]:m[3]]), true
 }
 
 // failureOf is FailureOf's key by the failure's words alone.
@@ -752,7 +745,7 @@ func failureOf(harness, tool, text, call string) (FailureKey, bool) {
 			}
 			output := strings.TrimSpace(strings.Join([]string{result.Stdout, result.Stderr, result.Output}, "\n"))
 			if output != "" && isShell(tool) {
-				return execKey(output, callPrograms(call))
+				return execKey(output, call)
 			}
 			// a wrapper with nothing in it that says what failed is not keyed by its shape: unrelated errors would merge
 			if message == "" && (result.Type != "" || result.Exit != nil || result.Matches != nil) {
@@ -813,7 +806,7 @@ func failureOf(harness, tool, text, call string) (FailureKey, bool) {
 		// an exit of 0 is no failure; one past the store's cut is not in view, and the result is flagged an error
 		if m := hermesExit.FindStringSubmatch(text); m == nil || m[1] != "0" {
 			if o := hermesOutRe.FindStringSubmatch(text); o != nil {
-				return execKey(unescape(o[1]), callPrograms(call))
+				return execKey(unescape(o[1]), call)
 			}
 		}
 		return FailureKey{}, false
@@ -823,7 +816,7 @@ func failureOf(harness, tool, text, call string) (FailureKey, bool) {
 		}
 	}
 	if isShell(tool) || headerRe.MatchString(text) {
-		return execKey(headerRe.ReplaceAllString(text, ""), callPrograms(call))
+		return execKey(headerRe.ReplaceAllString(text, ""), call)
 	}
 	// A tool's error in its own words (a read, an edit, a write the harness refused).
 	return FailureKey{Origin: "tool:" + slug(tool, 30), Text: Norm(firstClause(text), keyChars)}, true
@@ -886,9 +879,11 @@ var tailRe = regexp.MustCompile(`^:\s+([^\s,;]{1,40})`)
 // The key holds no program of its own: where a program is known, its name opens the message, and a word of the
 // output alone does not say that it named one. An output that shows the work failing has no key.
 //
-// A message that says no file is at a path it names in quotes (quotedMiss) is no message of words: its key is
-// execMiss, its text that path as the message names it, which failureKey makes whole.
-func execKey(out string, programs map[string]bool) (FailureKey, bool) {
+// The programs are the call's (callPrograms). A message that says no file is at a path it names in quotes
+// (quotedMiss) is no message of words: its key is execMiss, its text that path as the message names it, which
+// failureKey keys as commandMissed says; but for a call that runs ssh (remote), whose path may be another host's.
+func execKey(out, call string) (FailureKey, bool) {
+	programs := callPrograms(call)
 	out = strings.Join(strings.Fields(out), " ")
 	if workRe.MatchString(out) {
 		return FailureKey{}, false
@@ -897,7 +892,7 @@ func execKey(out string, programs map[string]bool) (FailureKey, bool) {
 	if loc == nil {
 		return FailureKey{}, false
 	}
-	if p, ok := quotedMiss(out, loc); ok {
+	if p, ok := quotedMiss(out, loc); ok && !remote(call) {
 		return FailureKey{Origin: execMiss, Text: p}, true
 	}
 	before, mark, after := out[:loc[0]], markText(out[loc[0]:loc[1]]), out[loc[1]:]
@@ -976,10 +971,21 @@ var (
 	// missBeforeRe is what may stand between a quoted path and the mark of a missing file: up to three words (tail's
 	// "for reading", rsync's "failed"), the colon, and Python's errno.
 	missBeforeRe = regexp.MustCompile(`(?: [a-z]+){0,3}: (?:\[Errno -?\d+\] )?$`)
-	// runnerRe is the message of a program that runs another (wrappers), up to the quoted name of the one it could
-	// not run: "env: ", "timeout: failed to run command ".
-	runnerRe = regexp.MustCompile(`(?:^|[\s/])([\w.-]+): (?:failed to run command )?$`)
+	// runnerRe is the message of a program that runs another, up to the quoted name of the one it could not run: a
+	// wrapper's or strace's, by its name ("env: ", "timeout: failed to run command ", "strace: Can't stat "), and
+	// Deno's ("Failed to spawn ").
+	runnerRe = regexp.MustCompile(`(?i)(?:(?:^|[\s/])([\w.-]+): (?:failed to run command |can't stat )?|\bfailed to spawn )$`)
 )
+
+// runs says the message before a quoted name (runnerRe) is a program's that runs the one it names.
+func runs(opened string) bool {
+	r := runnerRe.FindStringSubmatch(opened)
+	if r == nil {
+		return false
+	}
+	name := strings.ToLower(r[1])
+	return name == "" || name == "strace" || wrappers[name]
+}
 
 // quotedMiss is the path a command's message says no file is at, as it names it in quotes around its mark (loc),
 // and whether it names one:
@@ -989,9 +995,9 @@ var (
 //   - after Node's code and its message, the call's path: "ENOENT: no such file or directory, open 'PATH'".
 //
 // A message that names two paths (a rename's "'A' -> 'B'", mv's "'A' to 'B'") does not say which is not there, so it
-// names none; nor does a program that runs another (env, timeout) name a path when it names a program without a
-// slash, which it looked for on the PATH ("env: 'cargo': "). A quote the store's cut left open names a path cut short:
-// "", which keys nothing.
+// names none. Nor does a program that runs another name a path when it names a program without a slash, which it
+// looked for on the PATH: a wrapper ("env: 'cargo': "), strace, Deno (runs), and Python's subprocess, whose traceback
+// names its _execute_child. A quote the store's cut left open names a path cut short: "", which keys nothing.
 func quotedMiss(out string, loc []int) (string, bool) {
 	before, after := out[:loc[0]], out[loc[1]:]
 	switch strings.ToLower(out[loc[0]:loc[1]]) {
@@ -1002,12 +1008,15 @@ func quotedMiss(out string, loc []int) (string, bool) {
 	case "no such file or directory":
 		if rest, ok := strings.CutPrefix(after, ": "); ok {
 			if p, ok := quotedAt(rest); ok {
+				if !strings.Contains(p, "/") && strings.Contains(out, "_execute_child") {
+					return "", false
+				}
 				return p, true
 			}
 		}
 		if m := missBeforeRe.FindStringIndex(before); m != nil {
 			p, opened, ok := quotedEnd(before[:m[0]])
-			if r := runnerRe.FindStringSubmatch(opened); ok && r != nil && wrappers[strings.ToLower(r[1])] && !strings.Contains(p, "/") {
+			if ok && runs(opened) && !strings.Contains(p, "/") {
 				return "", false
 			}
 			return p, ok
@@ -1042,7 +1051,9 @@ func quotedAt(s string) (string, bool) {
 var pairRe = regexp.MustCompile("['\"`’”] (?:->|to) $")
 
 // quotedEnd is the value of the quote s ends with, the text before it, and whether s ends with one: its quote opens
-// no word (no letter or digit before it, as for can't), and no path before it is the other of two (pairRe).
+// no word (no letter or digit before it, as for can't), and no path before it is the other of two (pairRe). GNU's
+// shell quoting is read: it spells a quote in a name as a closing quote, an escaped quote and an opening one. Quotes
+// run together otherwise, as around a $'\n' it spells a line break with, make a value not read: "".
 func quotedEnd(s string) (value, opened string, ok bool) {
 	r, n := utf8.DecodeLastRuneInString(s)
 	var opens string
@@ -1058,14 +1069,28 @@ func quotedEnd(s string) (value, opened string, ok bool) {
 	if i < 0 {
 		return "", "", false
 	}
+	_, o := utf8.DecodeRuneInString(s[i:])
+	value = s[i+o : len(s)-n]
+	if s[i] == '\'' && r == '\'' {
+		for strings.HasSuffix(s[:i], `'\'`) {
+			j := i - len(`'\'`) // the part before closes there
+			k := strings.LastIndexByte(s[:j], '\'')
+			if k < 0 {
+				return "", "", false
+			}
+			value, i = s[k+1:j]+"'"+value, k
+		}
+		if strings.HasSuffix(s[:i], "'") {
+			return "", s[:i], true
+		}
+	}
 	if b, _ := utf8.DecodeLastRuneInString(s[:i]); i > 0 && (unicode.IsLetter(b) || unicode.IsDigit(b)) {
 		return "", "", false
 	}
 	if pairRe.MatchString(s[:i]) {
 		return "", "", false
 	}
-	_, o := utf8.DecodeRuneInString(s[i:])
-	return s[i+o : len(s)-n], s[:i], true
+	return value, s[:i], true
 }
 
 // markText is a mark as a key keeps it: masked (a line's number, a lock's path), but for an HTTP status, which
