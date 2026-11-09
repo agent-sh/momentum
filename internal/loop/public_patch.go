@@ -2,6 +2,7 @@ package loop
 
 import (
 	"context"
+	"slices"
 	"strings"
 )
 
@@ -46,8 +47,9 @@ func (s *Ship) checkPublicPatch(ctx context.Context, p Package, candidate string
 }
 
 func patchText(ctx context.Context, text, part string) error {
-	if maskPersonal(text) != text {
-		return refused("patch %s contain personal content (a home path, address, IP or domain-shaped host)", part)
+	if checked := withoutStandardHomes(text); maskPersonal(checked) != checked {
+		return refused("patch %s contain personal content (a home path, address, IP or domain-shaped host; "+
+			"a test fixture names a path under its temporary directory, not the home)", part)
 	}
 	clean, err := Redact(ctx, text)
 	if err != nil {
@@ -57,4 +59,55 @@ func patchText(ctx context.Context, text, part string) error {
 		return refused("patch %s contain content the secret scrubber would mask", part)
 	}
 	return nil
+}
+
+// standardHomePaths are the harnesses' and momentum's own directories and files under the home that momentum's sources
+// and docs name, each one every install of its tool has. A patch that names one says nothing of its owner. Each is
+// admitted as it is and nothing below it: a name a user gives a hook, a mod, a script or a program is his own. Only the
+// public-patch check reads this list; evidence masks these paths as any other home path (maskPersonal).
+var standardHomePaths = []string{
+	// directories
+	"~/.claude",                  // Claude Code (CLAUDE_CONFIG_DIR)
+	"~/.codex",                   // Codex (CODEX_HOME)
+	"~/.hermes",                  // Hermes (HERMES_HOME)
+	"~/.hermes/scripts",          // Hermes's job scripts
+	"~/.pi/agent",                // pi (PI_CODING_AGENT_DIR)
+	"~/.config/opencode",         // opencode's configuration
+	"~/.local/share/opencode",    // opencode's sessions
+	"~/.grok",                    // Grok (GROK_HOME)
+	"~/.kimi-code",               // Kimi (KIMI_CODE_HOME)
+	"~/.config/momentum",         // momentum's configuration
+	"~/.local/share/momentum",    // momentum's cases and evidence
+	"~/.local/share/tacit/store", // tacit's store
+	"~/.local/share",             // XDG_DATA_HOME's default
+	"~/.local/bin",               // where the harnesses' installers put their launchers
+	"~/.cargo/bin",               // where cargo installs programs
+	"~/.config/systemd/user",     // the user's units
+	// files
+	"~/.claude.json",                      // Claude Code's user configuration
+	"~/.claude/settings.json",             // Claude Code's user settings
+	"~/.local/bin/claude",                 // Claude Code's native launcher
+	"~/.codex/config.toml",                // Codex's configuration
+	"~/.hermes/config.yaml",               // Hermes's configuration
+	"~/.hermes/cron/jobs.json",            // Hermes's scheduled jobs
+	"~/.config/momentum/sources.json",     // momentum's sources
+	"~/.local/share/momentum/momentum.db", // momentum's store
+}
+
+// standardHome says whether a home path a patch names (a homePathRe match, with what ends a sentence after it) names
+// nothing of its owner: the home itself, or an entry of standardHomePaths (a directory with or without its slash).
+func standardHome(match string) bool {
+	path := strings.TrimRight(match, ".,;:!?]}")
+	return path == "~/" || slices.Contains(standardHomePaths, strings.TrimSuffix(path, "/"))
+}
+
+// withoutStandardHomes is text with the home prefix taken off each standard home path it names, so every other home
+// path stays for the personal masks.
+func withoutStandardHomes(text string) string {
+	return homePathRe.ReplaceAllStringFunc(text, func(match string) string {
+		if standardHome(match) {
+			return strings.TrimPrefix(match, "~/")
+		}
+		return match
+	})
 }
