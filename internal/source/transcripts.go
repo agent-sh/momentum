@@ -42,6 +42,9 @@ type Transcripts struct {
 	Homes   []string           // home directories to find sessions under
 	Sources []TranscriptSource // additional locations in sources.json
 	Workers int                // files read at once; 0 is DefaultWorkers()
+	// GitFlag is what a shell call's meta records from its whole command, before the store cuts it (store.GitKey):
+	// request.GitFlag, which momentum passes here (request imports what imports this package); nil records none.
+	GitFlag func(harness, tool, input string) string
 
 	// records, redact and ready are tacit's redaction (evidence.RedactRecordsContext, evidence.RedactEvents,
 	// evidence.RedactionReady); tests replace them. A source given redact and no records has no records mode:
@@ -123,6 +126,7 @@ type pending struct {
 	e     evidence.Event
 	texts []string
 	keep  func(redacted []string) string
+	git   string // a shell call's: whether its whole command names git or gh (request.GitFlag)
 }
 
 // tally is a run's counts, shared by the workers.
@@ -458,7 +462,7 @@ func (s Transcripts) readJob(ctx context.Context, j *job, t *tally, add func(par
 			if pl := place(e); len(p.places) == 0 || p.places[len(p.places)-1] != pl {
 				p.places = append(p.places, pl)
 			}
-			if it, ok := toPending(e); ok {
+			if it, ok := toPending(e, s.GitFlag); ok {
 				p.items = append(p.items, it)
 			}
 			return nil
@@ -640,7 +644,7 @@ func (w *writer) events(ctx context.Context, parts []part) ([][]store.Event, int
 	unknown := 0
 	for _, it := range items {
 		n := len(it.texts)
-		e, unk := toEvent(w.source, it.e, it.keep(red[:n]), w.ours(ctx, it.e, it.keep(it.texts)))
+		e, unk := toEvent(w.source, it.e, it.keep(red[:n]), w.ours(ctx, it.e, it.keep(it.texts)), it.git)
 		red = red[n:]
 		if unk {
 			unknown++
@@ -807,8 +811,9 @@ func union(a, b string) string {
 	return string(u)
 }
 
-// toPending is the item to store for an event, or false for one not stored (skipWhy).
-func toPending(e evidence.Event) (pending, bool) {
+// toPending is the item to store for an event, or false for one not stored (skipWhy). gitFlag is the source's
+// GitFlag.
+func toPending(e evidence.Event, gitFlag func(harness, tool, input string) string) (pending, bool) {
 	if skipWhy[e.Why] {
 		return pending{}, false
 	}
@@ -820,6 +825,9 @@ func toPending(e evidence.Event) (pending, bool) {
 		p.texts, p.keep = cutEnds(e.Text, headChars, tailChars)
 	case evidence.KindToolCall:
 		p.texts, p.keep = cutHead(whereFirst(e.ToolInput), textChars)
+		if gitFlag != nil {
+			p.git = gitFlag(e.Harness, e.ToolName, e.ToolInput) // from the whole command, before the cut
+		}
 	case evidence.KindToolResult:
 		e.IsError = toolresult.Failed(e.Harness, e.ToolName, e.ToolOutput, e.IsError)
 		n := textChars
@@ -909,8 +917,9 @@ func place(e evidence.Event) string {
 
 // toEvent maps one item. The actor follows the kind: the owner's text is his; agent text and tool calls an
 // agent's; a tool's result the tool's; harness text and compactions the harness's. A call the owner made
-// himself (a !command he ran in pi) is his, and an item tacit credits to no one is unknown.
-func toEvent(source string, e evidence.Event, summary string, ours bool) (store.Event, bool) {
+// himself (a !command he ran in pi) is his, and an item tacit credits to no one is unknown. A shell call's meta
+// holds git, whether its whole command names git or gh.
+func toEvent(source string, e evidence.Event, summary string, ours bool, git string) (store.Event, bool) {
 	var actor store.Actor
 	switch e.Kind {
 	case evidence.KindOwnerText:
@@ -961,7 +970,7 @@ func toEvent(source string, e evidence.Event, summary string, ours bool) (store.
 		Tool:      e.ToolName,
 		Summary:   summary,
 		Meta: meta(map[string]any{"tool_id": e.ToolID, "is_error": e.IsError, "input_kind": string(e.InputKind),
-			"prior": e.Prior, "why": why, "parent": e.Parent}),
+			"prior": e.Prior, "why": why, "parent": e.Parent, store.GitKey: git}),
 		Ref: fmt.Sprintf("%s@%d#%d", e.Path, e.Offset, e.Index),
 	}, unknown
 }

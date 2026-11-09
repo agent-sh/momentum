@@ -207,7 +207,7 @@ func (s Transcripts) readOpenCodeJob(ctx context.Context, j *job, t *tally, add 
 			e.Path, e.Index = db.path+"#"+id, index
 			p.places = append(p.places, place(e))
 			p.read++
-			if it, ok := toPending(e); ok {
+			if it, ok := toPending(e, s.GitFlag); ok {
 				p.items = append(p.items, it)
 				for _, text := range it.texts {
 					size += len(text)

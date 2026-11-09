@@ -99,11 +99,16 @@ func (s *Store) ThreadParentMeta(ctx context.Context, session string) (string, e
 	return meta, err
 }
 
+// GitKey is the meta key in which the transcripts source records whether a shell call's whole command names git or
+// gh, "yes" or "no" (request.GitFlag), so a read need not open the transcript of a call the store cut to learn it.
+const GitKey = "git"
+
 // ThreadRead is what a request reads of a session's transcript events: its main thread's text (the turns, the
 // replies, what was cut from a turn), every call and result of the Writers, and the calls of the Shells whose text
 // holds one of CallMarks with their results that hold one of ResultMarks, and the calls of the YieldTools whose
-// result holds one of YieldMarks (a Codex command left running), whatever the call's text, with those results.
-// Tool names are compared in lower case.
+// result holds one of YieldMarks (a Codex command left running), whatever the call's text, with those results. A
+// shell's call whose meta holds GitKey is selected by it alone ("yes"), not by its text: an event stored before the
+// source recorded it holds none. Tool names are compared in lower case.
 type ThreadRead struct {
 	Writers, Shells        []string
 	CallMarks, ResultMarks []string
@@ -135,6 +140,9 @@ func (s *Store) ThreadEvents(ctx context.Context, session string, read ThreadRea
 		marks = "(" + marks + " OR substr(summary, -length(?)) = ?)"
 		callArgs = append(callArgs, read.CutMark, read.CutMark)
 	}
+	// the flag the source recorded from the whole command, where it did: else the stored text's marks
+	const flag = `(CASE WHEN json_valid(meta) THEN json_extract(meta, '$.` + GitKey + `') END)`
+	marks = `(CASE ` + flag + ` WHEN 'yes' THEN 1 WHEN 'no' THEN 0 ELSE ` + marks + ` END)`
 	resultMarks := "1"
 	resultArgs := anys(read.ResultMarks)
 	if len(read.ResultMarks) > 0 {

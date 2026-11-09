@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -252,8 +251,8 @@ func TestASessionReadsOldestFirst(t *testing.T) {
 	}
 }
 
-// A file cursor is stored with the events before it, read back, dropped by name, and dropped with its source,
-// which a rebuild drops only when forced.
+// A file cursor is stored with the events before it, read back, dropped by name, and dropped with its source: a
+// rebuild without force drops the transcripts' cursors and keeps their events, which a forced one drops too.
 func TestFileCursorsGoWithTheirEvents(t *testing.T) {
 	ctx := context.Background()
 	st, _ := open(t)
@@ -272,11 +271,14 @@ func TestFileCursorsGoWithTheirEvents(t *testing.T) {
 	if cs, _ := st.FileCursors(ctx, "transcripts"); len(cs) != 1 {
 		t.Fatalf("after dropping one: %+v", cs)
 	}
-	if _, err := st.Rebuild(ctx, "transcripts", false); !errors.Is(err, ErrKept) {
-		t.Fatalf("a rebuild of the transcripts without force: %v", err)
+	if n, err := st.Rebuild(ctx, "transcripts", false); err != nil || n != 0 {
+		t.Fatalf("a rebuild of the transcripts without force dropped %d, %v", n, err)
 	}
-	if cs, _ := st.FileCursors(ctx, "transcripts"); len(cs) != 1 {
-		t.Fatalf("a refused rebuild dropped the cursors: %+v", cs)
+	if cs, _ := st.FileCursors(ctx, "transcripts"); len(cs) != 0 {
+		t.Fatalf("a rebuild without force kept the cursors: %+v", cs)
+	}
+	if _, _, err := st.PutFiles(ctx, []FileWrite{{Cursor: c}}); err != nil {
+		t.Fatal(err)
 	}
 	if n, err := st.Rebuild(ctx, "transcripts", true); err != nil || n != 1 {
 		t.Fatalf("a forced rebuild dropped %d, %v", n, err)

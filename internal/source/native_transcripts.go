@@ -306,7 +306,7 @@ func (s Transcripts) readNativeJob(ctx context.Context, j *job, t *tally, add fu
 			e.Path, e.Offset, e.Next, e.Index = j.path, offset, next, index
 			p.read++
 			p.places = append(p.places, place(e))
-			if it, ok := toPending(e); ok {
+			if it, ok := toPending(e, s.GitFlag); ok {
 				p.items = append(p.items, it)
 			}
 		}

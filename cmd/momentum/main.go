@@ -20,6 +20,7 @@ import (
 	"github.com/agent-sh/momentum/internal/ro"
 
 	"github.com/agent-sh/momentum/internal/paths"
+	"github.com/agent-sh/momentum/internal/request"
 	"github.com/agent-sh/momentum/internal/source"
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -37,9 +38,10 @@ const usage = `usage:
   momentum evidence unit NAME [--lines N] [--bytes N]  a user service's state and the end of its log, scrubbed
   momentum evidence rebuild SOURCE [--force]
                                         drop what SOURCE contributed; the next ingest reads it from the start
-                                        (not sessions; transcripts and incidents only with --force: it says how
-                                        many transcript events have no source left, and incidents' sightings
-                                        are history their files do not keep)
+                                        (not sessions; transcripts keep their events without --force, and every
+                                        transcript still there is read again; with it, it says how many have no
+                                        source left; incidents only with --force: their sightings are history
+                                        their files do not keep)
   momentum sessions [--json] [--all]    the live agent sessions and their phases, read without a model;
                                         each phase change is kept as an event of source sessions
   momentum report [--json]              what needs the owner, what was decided and shipped in the last 12 hours,
@@ -243,7 +245,8 @@ func configured() ([]source.Source, error) {
 		out = append(out, source.Incidents{Dir: c.Incidents.Dir})
 	}
 	if len(c.Transcripts.Homes) > 0 || len(c.Transcripts.Sources) > 0 {
-		out = append(out, source.Transcripts{Homes: c.Transcripts.Homes, Workers: c.Transcripts.Workers, Sources: c.Transcripts.Sources})
+		out = append(out, source.Transcripts{Homes: c.Transcripts.Homes, Workers: c.Transcripts.Workers, Sources: c.Transcripts.Sources,
+			GitFlag: request.GitFlag})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("%w: %s lists none", config.ErrNoSources, config.SourcesPath())
@@ -338,8 +341,9 @@ func status(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 
 // rebuild drops what a source contributed. The transcripts' events can be all that is left of transcripts their
 // harness deleted, and the incidents' sightings are all there is of what each incident did over time, so they go
-// only with --force, which counts first how many transcript events have no source left. The flag may come before
-// or after the source's name.
+// only with --force, which counts first how many transcript events have no source left; without it the transcripts'
+// events stay, and the next ingest reads every transcript still there again, which fills what this build records of
+// them. The flag may come before or after the source's name.
 func rebuild(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("rebuild", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -399,6 +403,11 @@ func rebuild(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		fmt.Fprintf(stdout, "%s: dropped %d events; their sightings are gone for good, and the next ingest reads the files from the start\n", name, n)
 		return nil
 	case store.Transcripts:
+		if !*force {
+			fmt.Fprintf(stdout, "%s: kept every event; the next ingest reads every transcript still there again from its start and "+
+				"stores its events as this build reads them, and those of a transcript gone stay as they are\n", name)
+			return nil
+		}
 	default:
 		fmt.Fprintf(stdout, "%s: dropped %d events; the next ingest reads it from the start\n", name, n)
 		return nil

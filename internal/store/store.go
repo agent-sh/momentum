@@ -945,15 +945,16 @@ func (s *Store) Skipped(ctx context.Context, source string) (int, error) {
 // Rebuild drops everything a source contributed, so the next ingest reads it again from the start, and returns
 // how many events it dropped. Sources share one state space by name prefix: "radar" also drops "radar-feedback".
 // The observed events (Sessions, Supervise, Capacity) cannot be read again, so Rebuild refuses them with
-// ErrObserved. The transcripts' events can be all that is left of transcripts their harness deleted, and the
-// incidents' sightings are all there is of what an incident did over time (its file keeps only its running count),
-// so without force Rebuild refuses them with ErrKept.
+// ErrObserved. The transcripts' events can be all that is left of transcripts their harness deleted, so without
+// force Rebuild keeps them and drops only what the source derived (where it stopped): the next ingest reads every
+// transcript still there again from its start and stores its events again as it reads them now (what a newer build
+// records of them, such as GitKey), and the events of a transcript gone stay as they are. The incidents' sightings
+// are all there is of what an incident did over time (its file keeps only its running count), so without force
+// Rebuild refuses them with ErrKept.
 func (s *Store) Rebuild(ctx context.Context, source string, force bool) (int, error) {
 	switch {
 	case source == Sessions, source == Supervise, source == Capacity:
 		return 0, fmt.Errorf("%s: %w", source, ErrObserved)
-	case source == Transcripts && !force:
-		return 0, fmt.Errorf("%s: %w: a transcript its harness deleted since cannot be read again", source, ErrKept)
 	case source == Incidents && !force:
 		return 0, fmt.Errorf("%s: %w: its sightings are what each incident did over time, and its file keeps only its running count", source, ErrKept)
 	}
@@ -963,13 +964,15 @@ func (s *Store) Rebuild(ctx context.Context, source string, force bool) (int, er
 	}
 	defer tx.Rollback()
 	like := source + "-%"
-	res, err := tx.ExecContext(ctx, `DELETE FROM events WHERE source=? OR source LIKE ?`, source, like)
-	if err != nil {
-		return 0, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, err
+	var n int64
+	if source != Transcripts || force {
+		res, err := tx.ExecContext(ctx, `DELETE FROM events WHERE source=? OR source LIKE ?`, source, like)
+		if err != nil {
+			return 0, err
+		}
+		if n, err = res.RowsAffected(); err != nil {
+			return 0, err
+		}
 	}
 	for _, q := range []string{
 		`DELETE FROM cursors WHERE source=? OR source LIKE ? OR source = ? || ':read' OR source LIKE ? || ':read:%'`,

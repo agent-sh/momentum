@@ -421,6 +421,28 @@ func namesGit(s string) bool {
 	return false
 }
 
+// GitFlag is what the transcripts source records of a shell call at ingest, from its whole input, before the store
+// cuts it (store.GitKey): "yes" when its decoded commands name git or gh, as a whole read decides it (namesGit), "no"
+// when they do not, and "" for another tool's call or a Codex call that polls a session, whose read needs it whatever it
+// names: the session it polls ran a command of its own. The store selects a call that holds it by it alone.
+func GitFlag(harness, tool, input string) string {
+	tool = strings.ToLower(tool)
+	if writers[tool] || !toolresult.IsShell(tool) {
+		return ""
+	}
+	var sc *script
+	if harness == "codex" && tool == "exec" {
+		sc = parseScript(input)
+	}
+	if polls(store.Event{Harness: harness}, tool, sc) {
+		return ""
+	}
+	if namesGit(strings.Join(decode(harness, tool, input, "", sc).Commands, "\n")) {
+		return "yes"
+	}
+	return "no"
+}
+
 // polls reports a Codex call that polls a session an earlier call left running: a code-mode script's write_stdin
 // call, as the script's parse finds it, or Codex's write_stdin tool. Its output is another command's: it names no
 // git of its own.
@@ -518,7 +540,8 @@ func (r *reader) readWhole(ctx context.Context, t *thread) {
 		}
 		d := decode(j.p.call.Harness, j.tool, inputs[i], "", j.sc)
 		j.poll = polls(*j.p.call, j.tool, j.sc)
-		// a Codex call that names no git is read too: a session it left running replaces one of the same id
+		// a Codex call that names no git is read too: a session it left running replaces one of the same id (the
+		// store selects it by that session's result). GitFlag decides by the same words at ingest.
 		if !namesGit(strings.Join(d.Commands, "\n")) && !j.poll && !codexCommand(*j.p.call) {
 			// it makes nothing this reads, whether or not its record is there
 			// a command the store cut and whose record is gone keeps its why: its git may lie past the cut

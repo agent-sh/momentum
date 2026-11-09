@@ -43,10 +43,11 @@ func countEvents(t *testing.T, source string) int {
 	return len(evs)
 }
 
-// The transcripts' events are kept: a rebuild of them is refused without --force, and with it says how many of
-// them have no source left, as the ingest of the configured homes finds them. A transcript whose compressed copy
-// is still there is not among them; one deleted, or kept outside every home, is.
-func TestARebuildOfTheTranscriptsNeedsForceAndCountsWhatIsGone(t *testing.T) {
+// The transcripts' events are kept: a rebuild of them without --force keeps every one and drops only where the
+// ingest stopped, so it reads every transcript still there again; with it, it says how many of them have no source
+// left, as the ingest of the configured homes finds them. A transcript whose compressed copy is still there is not
+// among them; one deleted, or kept outside every home, is.
+func TestARebuildOfTheTranscriptsKeepsThemWithoutForceAndCountsWhatIsGone(t *testing.T) {
 	ctx := context.Background()
 	cfg, user := t.TempDir(), t.TempDir()
 	t.Setenv("MOMENTUM_HOME", t.TempDir())
@@ -74,12 +75,29 @@ func TestARebuildOfTheTranscriptsNeedsForceAndCountsWhatIsGone(t *testing.T) {
 			TS: time.UnixMilli(1_700_000_000_000), Harness: "claude", Actor: store.ActorAgent, Kind: "agent_text", Ref: fmt.Sprintf("%s@%d#0", p, i)})
 	}
 	putEvents(t, evs...)
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = st.PutFiles(ctx, []store.FileWrite{{Cursor: store.FileCursor{Source: store.Transcripts, Path: there, Offset: 3}}})
+	st.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
 	var out, errOut bytes.Buffer
-	if code := run(ctx, []string{"evidence", "rebuild", "transcripts"}, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "--force") {
+	if code := run(ctx, []string{"evidence", "rebuild", "transcripts"}, &out, &errOut); code != 0 || !strings.Contains(out.String(), "kept every event") {
 		t.Fatalf("exit %d, without --force:\n%s%s", code, out.String(), errOut.String())
 	}
 	if n := countEvents(t, "transcripts"); n != 4 {
-		t.Fatalf("a refused rebuild left %d events", n)
+		t.Fatalf("a rebuild without --force left %d events", n)
+	}
+	if st, err = store.OpenReadOnly(paths.DB()); err != nil {
+		t.Fatal(err)
+	}
+	cursors, err := st.FileCursors(ctx, store.Transcripts)
+	st.Close()
+	if err != nil || len(cursors) != 0 {
+		t.Fatalf("where the ingest stopped is kept: %v %v", cursors, err)
 	}
 	out.Reset()
 	errOut.Reset()

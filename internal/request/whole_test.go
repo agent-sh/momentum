@@ -195,3 +195,74 @@ func TestACutHermesCallIsReadWhole(t *testing.T) {
 		t.Fatalf("results: %s", got)
 	}
 }
+
+// A cut call is selected by the git flag the source recorded of its whole command: one that names no git opens no
+// transcript, and once its transcript is gone it is no call whose details the request lost; one whose git lies past
+// the cut is read whole.
+func TestACutCallIsReadByItsGitFlag(t *testing.T) {
+	for _, c := range []struct {
+		name, command, flag string
+		remove              bool
+		opens, gone         int
+		commit              bool
+	}{
+		{name: "no git", command: "cd " + longDir + " && make test", flag: "no"},
+		{name: "no git, transcript gone", command: "cd " + longDir + " && make test", flag: "no", remove: true},
+		{name: "git past the cut", command: "cd " + longDir + " && git commit -m 'Fix the parser'", flag: "yes", opens: 2, commit: true}, // its input, then its output
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t)
+			path := claudeCall(t, f, t.TempDir(), "s-flag", c.command, hookText+"[main 1a2b3c4] Fix the parser\n 1 file changed")
+			for i := range f.evs {
+				if e := &f.evs[i]; e.Kind == "tool_call" {
+					e.Meta = metaJSON(map[string]any{"tool_id": metaOf(e.Meta).ToolID, store.GitKey: c.flag})
+				}
+			}
+			if c.remove {
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.put()
+			r := newReader(f.st, Options{Redact: fakeRedact})
+			defer r.close()
+			r.enqueue("s-flag")
+			reqs, err := r.settle(context.Background(), t0.Add(-time.Hour), func(*Request) bool { return true })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(reqs) != 1 {
+				t.Fatalf("%d requests", len(reqs))
+			}
+			rq := reqs[0]
+			if n := r.opens[path]; n != c.opens {
+				t.Errorf("the transcript was opened %d times, want %d", n, c.opens)
+			}
+			if rq.CutGone != c.gone {
+				t.Errorf("%d calls counted cut with their transcript gone, want %d", rq.CutGone, c.gone)
+			}
+			if got := kinds(rq.Results); strings.Contains(got, "1a2b3c4") != c.commit {
+				t.Errorf("results: %s", got)
+			}
+		})
+	}
+}
+
+// The flag a source records is the whole read's decision: git or gh as a word of the decoded commands, and none for a
+// Codex call that polls a session (the session ran a command of its own) or a tool that is no shell.
+func TestGitFlagIsTheWholeReadsDecision(t *testing.T) {
+	for _, c := range []struct{ harness, tool, input, want string }{
+		{"claude", "Bash", `{"command":"cd /x &&\ngit push"}`, "yes"},
+		{"claude", "Bash", `{"command":"cat .github/ci.yml | grep high"}`, "no"},
+		{"codex", "exec_command", `{"cmd":"gh pr create --fill"}`, "yes"},
+		{"codex", "exec_command", `{"cmd":"make test"}`, "no"},
+		{"codex", "exec", `text(await tools.exec_command({cmd:"make test"}))`, "no"},
+		{"codex", "exec", `for(const id of [41,42]) text({id,...await tools.write_stdin({session_id:id,chars:""})})`, ""},
+		{"codex", "write_stdin", `{"chars":"","session_id":41}`, ""},
+		{"claude", "Write", `{"file_path":"/x/notes.txt","content":"git push"}`, ""},
+	} {
+		if got := GitFlag(c.harness, c.tool, c.input); got != c.want {
+			t.Errorf("%s %s %s: %q, want %q", c.harness, c.tool, c.input, got, c.want)
+		}
+	}
+}

@@ -18,6 +18,7 @@ import (
 	"github.com/agent-sh/tacit/client/pkg/evidence"
 	"github.com/klauspost/compress/zstd"
 
+	"github.com/agent-sh/momentum/internal/request"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -153,7 +154,7 @@ func masked(_ context.Context, evs []evidence.Event) ([]evidence.Event, error) {
 func ready() error { return nil }
 
 func transcripts(home string) Transcripts {
-	return Transcripts{Homes: []string{home}, records: recordsVia(masked), redact: masked, ready: ready}
+	return Transcripts{Homes: []string{home}, records: recordsVia(masked), redact: masked, ready: ready, GitFlag: request.GitFlag}
 }
 
 // recordsVia is a records redactor made of an events redactor: each text an event of its own.
@@ -934,6 +935,85 @@ func TestTranscriptsKnowMomentumsMessagesBeforeRedactionAndWhileTheyRun(t *testi
 	for _, x := range all(t, st, "transcripts") {
 		if x.Kind == "owner_text" {
 			t.Fatalf("momentum's message stored as the owner's: %+v", x)
+		}
+	}
+}
+
+// A shell call's meta records whether its whole command names git or gh, read before the store cuts it: a git past
+// the cut says yes, a word that only holds the letters (.github, high) says no, and a call of another tool says nothing.
+func TestTranscriptsRecordWhetherAShellCallNamesGitBeforeTheCut(t *testing.T) {
+	home := testHome(t)
+	long := "cd /work/" + strings.Repeat("deep/", 60) + "repo && "
+	call := func(m int, id, tool, input string) string {
+		return claudeLine(m, `"type":"assistant","uuid":"a`+id+`","message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"tool_use","id":"toolu_`+id+`","name":"`+tool+`","input":`+input+`}]}`)
+	}
+	command := func(s string) string { b, _ := json.Marshal(map[string]string{"command": s}); return string(b) }
+	writeLines(t, claudePath(home),
+		claudeLine(0, `"type":"user","uuid":"u0","promptId":"p0",`+typed+`,"message":{"role":"user","content":"ship the fix"}`),
+		call(1, "past", "Bash", command(long+"git push origin main")),
+		call(2, "none", "Bash", command(long+"cat .github/workflows/ci.yml | grep high")),
+		call(3, "short", "Bash", command("gh pr view 9")),
+		call(4, "write", "Write", `{"file_path":"/work/notes.txt","content":"git push"}`),
+	)
+	st := openStore(t)
+	ingest(t, transcripts(home), st)
+	want := map[string]any{"toolu_past": "yes", "toolu_none": "no", "toolu_short": "yes", "toolu_write": nil}
+	got := map[string]any{}
+	for _, e := range all(t, st, "transcripts") {
+		if e.Kind != "tool_call" {
+			continue
+		}
+		m := metaOf(t, e)
+		got[m["tool_id"].(string)] = m[store.GitKey]
+		if m["tool_id"] == "toolu_past" && (strings.Contains(e.Summary, "git") || !strings.HasSuffix(e.Summary, "…")) {
+			t.Fatalf("the fixture's git is not past the cut: %q", e.Summary)
+		}
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("git flags %v, want %v", got, want)
+	}
+}
+
+// A rebuild without force keeps the events and drops only where the source stopped: the next ingest reads every
+// transcript still there again and fills the git flag of the calls stored before the source recorded it, while a
+// call whose transcript is gone keeps what it holds.
+func TestTranscriptsReadAgainAfterARebuildFillTheGitFlag(t *testing.T) {
+	home := testHome(t)
+	writeLines(t, claudePath(home),
+		claudeLine(0, `"type":"user","uuid":"u0","promptId":"p0",`+typed+`,"message":{"role":"user","content":"ship the fix"}`),
+		claudeLine(1, `"type":"assistant","uuid":"a1","message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"tool_use","id":"toolu_p1","name":"Bash","input":{"command":"git push origin main"}}]}`),
+	)
+	st := openStore(t)
+	ctx := context.Background()
+	ingest(t, transcripts(home), st)
+	// the calls as an ingest from before the flag stored them, one of a transcript gone since
+	var old []store.Event
+	for _, e := range all(t, st, "transcripts") {
+		if e.Kind == "tool_call" {
+			e.Meta = `{"tool_id":"toolu_p1"}`
+			gone := e
+			gone.SourceKey, gone.Ref = "gone.jsonl@000000000000#000", "/nowhere/gone.jsonl@0#0"
+			old = append(old, e, gone)
+		}
+	}
+	if _, err := st.Put(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Rebuild(ctx, store.Transcripts, false); err != nil {
+		t.Fatal(err)
+	}
+	ingest(t, transcripts(home), st)
+	evs := all(t, st, "transcripts")
+	if len(evs) != 3 {
+		t.Fatalf("%d events after reading again, want the turn, the call and the gone call", len(evs))
+	}
+	for _, e := range evs {
+		switch got := metaOf(t, e)[store.GitKey]; {
+		case e.Kind != "tool_call":
+		case e.SourceKey == "gone.jsonl@000000000000#000" && got != nil:
+			t.Errorf("a call whose transcript is gone was given a flag: %v", got)
+		case e.SourceKey != "gone.jsonl@000000000000#000" && got != "yes":
+			t.Errorf("the call read again holds %v", got)
 		}
 	}
 }

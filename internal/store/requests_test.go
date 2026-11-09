@@ -70,3 +70,37 @@ func TestAThreadReadSelectsTheResultsThatMayShowAnArtifact(t *testing.T) {
 		t.Fatalf("results:\n got %s\nwant %s", g, want)
 	}
 }
+
+// A shell's call whose meta holds the git flag the source recorded is selected by it alone: one the store cut whose
+// command names no git is not read, nor one whose text holds the letters in another word, while one whose git lies
+// past the cut is. A call stored before the flag holds none and is selected by its text, as before.
+func TestAThreadReadSelectsAShellCallByItsGitFlag(t *testing.T) {
+	st, _ := open(t)
+	ctx := context.Background()
+	long := `{"command":"cd /work/deep/deep/deep/repo && …`
+	var evs []Event
+	for i, c := range []struct{ input, git string }{
+		{long, "no"}, {`{"command":"cat .github/ci.yml"}`, "no"}, {long, "yes"}, {long, ""}, {`{"command":"ls"}`, ""},
+	} {
+		meta := `{"tool_id":"call-` + string(rune('a'+i)) + `"}`
+		if c.git != "" {
+			meta = `{"` + GitKey + `":"` + c.git + `","tool_id":"call-` + string(rune('a'+i)) + `"}`
+		}
+		evs = append(evs, Event{Source: Transcripts, SourceKey: "s-x.jsonl@" + string(rune('a'+i)), TS: time.UnixMilli(int64(1000 + 10*i)),
+			Session: "s-x", Harness: "claude", Actor: ActorAgent, Kind: "tool_call", Tool: "Bash", Summary: c.input, Meta: meta})
+	}
+	if _, err := st.Put(ctx, evs); err != nil {
+		t.Fatal(err)
+	}
+	read := ThreadRead{Shells: []string{"bash"}, CallMarks: []string{"git", "gh"}, CutMark: "…"}
+	var got []string
+	if err := st.ThreadEvents(ctx, "s-x", read, func(e Event) error {
+		got = append(got, e.SourceKey)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if g := strings.Join(got, " "); g != "s-x.jsonl@c s-x.jsonl@d" {
+		t.Fatalf("calls read: %s", g)
+	}
+}
