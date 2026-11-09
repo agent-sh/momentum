@@ -442,24 +442,25 @@ func abortedBy(from, to string, after, latest time.Time) time.Time {
 
 // codexTurnEnd is how the turn that a Codex session's last record (from) belongs to ended, read forward in the
 // rollout after that record while the transcript is there, its compressed copy among them: the first task_complete
-// or turn_aborted after it, with its time, in the rollout's order, as the live tracker reads it. An agent message
-// the store keeps no event of is read past, and so is the first task_started when opened says the last record is an
-// input that opened its own turn, which Codex may start after writing the input. "" when the transcript is gone, or
-// the turn is still open by the store's records: another turn's task_started, or a message or call the store has
-// not read yet (an ingest behind the rollout), comes first, or the end is at or after until.
-func codexTurnEnd(from string, opened bool, until time.Time) (string, time.Time) {
+// or turn_aborted after it, with its time and task_complete's last_agent_message, in the rollout's order, as the
+// live tracker reads it. An agent message the store keeps no event of is read past, and so is the first task_started
+// when opened says the last record is an input that opened its own turn, which Codex may start after writing the
+// input. "" when the transcript is gone, or the turn is still open by the store's records: another turn's
+// task_started, or a message or call the store has not read yet (an ingest behind the rollout), comes first, or the
+// end is at or after until.
+func codexTurnEnd(from string, opened bool, until time.Time) (end string, at time.Time, last string) {
 	path, off, ok := refPlace(from)
 	if !ok {
-		return "", time.Time{}
+		return "", time.Time{}, ""
 	}
 	f, err := evidence.OpenAt(path, off)
 	if err != nil {
-		return "", time.Time{}
+		return "", time.Time{}, ""
 	}
 	defer f.Close()
 	rd := bufio.NewReaderSize(io.LimitReader(f, requestLimit), 1<<16)
 	if _, err := rd.ReadBytes('\n'); err != nil { // the record itself
-		return "", time.Time{}
+		return "", time.Time{}, ""
 	}
 	for {
 		raw, err := rd.ReadBytes('\n')
@@ -467,9 +468,10 @@ func codexTurnEnd(from string, opened bool, until time.Time) (string, time.Time)
 			Timestamp string `json:"timestamp"`
 			Type      string `json:"type"`
 			Payload   struct {
-				Type    string          `json:"type"`
-				Role    string          `json:"role"`
-				Content json.RawMessage `json:"content"`
+				Type             string          `json:"type"`
+				Role             string          `json:"role"`
+				Content          json.RawMessage `json:"content"`
+				LastAgentMessage string          `json:"last_agent_message"`
 			} `json:"payload"`
 		}
 		if len(raw) > 0 && json.Unmarshal(raw, &e) == nil {
@@ -477,33 +479,39 @@ func codexTurnEnd(from string, opened bool, until time.Time) (string, time.Time)
 			case e.Type == "response_item" && e.Payload.Type == "message" && e.Payload.Role == "assistant" && !codexKept(e.Payload.Content):
 				// an agent message the store keeps no event of: no record of the turn is missing from it
 			case e.Type == "response_item" && codexItems[e.Payload.Type]:
-				return "", time.Time{} // a record of the turn the store has not read: its records decide
+				return "", time.Time{}, "" // a record of the turn the store has not read: its records decide
 			case e.Type == "event_msg" && e.Payload.Type == "task_started":
 				if opened { // the start of the turn the input opened, which Codex wrote after the input
 					opened = false
 					break
 				}
-				return "", time.Time{}
+				return "", time.Time{}, ""
 			case e.Type == "event_msg" && (e.Payload.Type == "task_complete" || e.Payload.Type == "turn_aborted"):
 				if at, perr := time.Parse(time.RFC3339Nano, e.Timestamp); perr == nil && at.Before(until) {
-					return e.Payload.Type, at
+					return e.Payload.Type, at, e.Payload.LastAgentMessage
 				}
-				return "", time.Time{}
+				return "", time.Time{}, ""
 			}
 		}
 		if err != nil {
-			return "", time.Time{}
+			return "", time.Time{}, ""
 		}
 	}
 }
 
 // codexStartedBetween reports whether a Codex rollout has a task_started between two events' records (from, to),
 // read while the transcript is there, its compressed copy among them: the turn of the input at to had started before
-// it. True when that cannot be read (the transcript is gone, the two are not in one rollout in that order, or too far
-// apart), so a start after the input is not taken for its own.
+// it. With no from (the input is the window's first event), the stretch is the one before to, as far back as it is
+// read, and only a start after its last task_complete or turn_aborted counts. True when that cannot be read (the
+// transcript is gone, the two are not in one rollout in that order, too far apart, or with no from no end in that
+// stretch), so a start after the input is not taken for its own.
 func codexStartedBetween(from, to string) bool {
-	path, off, ok := refPlace(from)
 	p2, end, ok2 := refPlace(to)
+	path, off, ok := refPlace(from)
+	back := from == ""
+	if back {
+		path, off, ok = p2, max(0, end-requestLimit), ok2
+	}
 	if !ok || !ok2 || p2 != path || end < off || end-off > requestLimit {
 		return true
 	}
@@ -513,21 +521,34 @@ func codexStartedBetween(from, to string) bool {
 	}
 	defer f.Close()
 	rd := bufio.NewReaderSize(io.LimitReader(f, end-off), 1<<16)
+	if back && off > 0 {
+		rd.ReadBytes('\n') // the rest of the line the stretch starts in
+	}
+	started, ended := false, false
 	for {
 		raw, err := rd.ReadBytes('\n')
-		if len(raw) > 0 && strings.Contains(string(raw), "task_started") {
+		if len(raw) > 0 && (strings.Contains(string(raw), "task_started") || back && (strings.Contains(string(raw), "task_complete") ||
+			strings.Contains(string(raw), "turn_aborted"))) {
 			var e struct {
 				Type    string `json:"type"`
 				Payload struct {
 					Type string `json:"type"`
 				} `json:"payload"`
 			}
-			if json.Unmarshal(raw, &e) == nil && e.Type == "event_msg" && e.Payload.Type == "task_started" {
-				return true
+			if json.Unmarshal(raw, &e) == nil && e.Type == "event_msg" {
+				switch e.Payload.Type {
+				case "task_started":
+					if !back {
+						return true
+					}
+					started = true
+				case "task_complete", "turn_aborted":
+					started, ended = false, true
+				}
 			}
 		}
 		if err != nil {
-			return false
+			return started || back && !ended
 		}
 	}
 }
@@ -796,8 +817,10 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		}
 		if r == "" || r == "compaction" { // a compaction runs as a turn starts or mid-turn: no stop of its own
 			// the store puts the record of a turn's end on the first record after the turn, which may be one passed
-			// over (a local command's caveat, a meta line): the next input's point reads it
-			if prior, _ := m["prior"].(string); carried == "" && turnOver(harness, prior) {
+			// over (a local command's caveat, a meta line): the next input's point reads it. Another block of the
+			// record just read (an image's blocks after the owner's text, a paste the store cut out) carries that
+			// record's mark, which its own event read already.
+			if prior, _ := m["prior"].(string); carried == "" && turnOver(harness, prior) && !sameRecord(e.Ref, lastRef) {
 				carried = prior
 			}
 			continue
@@ -1019,6 +1042,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			}
 			lastMainUser = false
 		}
+		inputPrior := priorOf(m, carried) // an input's record of the turn before it ending, its own or one carried to it
 		prevRole, prevAt, carried, aborted, controlRef = r, e.TS, "", false, ""
 		for _, at := range controls { // the stop they came after is over: they show him at the session before the next
 			if at.After(ownerAt) {
@@ -1031,9 +1055,10 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		}
 		if input && !merged && !intoTurn {
 			turnBegan = e.TS // an input opens the turn the next stop ends
-			// its own record says the turn before it was over: Codex may write its turn's task_started after it
+			// the turn before it was over by its own record or one passed over just before it (Codex's abort record,
+			// harness text): Codex may write its turn's task_started after it
 			openRef, openFrom = "", ""
-			if prior, _ := m["prior"].(string); turnOver(harness, prior) {
+			if turnOver(harness, inputPrior) {
 				openRef, openFrom = e.Ref, lastRef
 			}
 		}
@@ -1058,13 +1083,19 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			// With nothing carried, no abort since the last record dated this stop. An input that opened its turn
 			// after the turn before it was over has its turn's start still to come when no task_started came between
 			// the event the replay read before it (a record passed over, as a developer message or another block of
-			// the input's own record, is not one) and the input, nor between the input and the last record read.
+			// the input's own record, is not one; with none in the window, the turn before's end) and the input, nor
+			// between the input and the last record read. The end's last_agent_message is the turn's last words.
 			opened := inputLast && openRef != "" && !codexStartedBetween(openFrom, openRef) &&
 				(lastSeen == openRef || !codexStartedBetween(openRef, lastSeen))
-			if end, at := codexTurnEnd(lastSeen, opened, until); end != "" {
+			if end, at, last := codexTurnEnd(lastSeen, opened, until); end != "" {
 				carried, pending = end, map[string]bool{}
 				if end == "turn_aborted" {
 					prevAt = at // the live tracker keeps the turn open until its abort
+				}
+				// a last_agent_message is the turn's last words, as the live tracker reads it, a whitespace-only one
+				// among them: the store's words stay where they say the same
+				if last != "" && Words(last) != Words(words) {
+					words = Words(last)
 				}
 			}
 		}
@@ -1249,6 +1280,13 @@ func placeQueued(evs []store.Event) ([]store.Event, map[string]bool, map[string]
 
 // enqueuedKey marks the copy of a queued command at the time it was queued (placeQueued).
 const enqueuedKey = "~enqueued"
+
+// sameRecord reports whether two events' Refs are blocks of one transcript record.
+func sameRecord(a, b string) bool {
+	pa, oa, ok := refPlace(a)
+	pb, ob, ok2 := refPlace(b)
+	return ok && ok2 && pa == pb && oa == ob
+}
 
 // refPlace splits an event's Ref (path@offset#index) into its transcript and the offset of its record.
 func refPlace(ref string) (string, int64, bool) {
