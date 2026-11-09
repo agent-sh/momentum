@@ -1337,7 +1337,8 @@ func TestAnOwnerTurnIsReadWithTheAgentsLastWords(t *testing.T) {
 		{"i never said that, why do you think so?", "Per your rule, the reviewer must be another model.", "attribution"},
 		{"you can do as you think", "I rewrote one repo. Should I rewrite the other two, or none?", "handback"},
 		{"why you need me to run it?", "It is ready… To finish, please run `make deploy` in your terminal.", "handback"},
-		{"it still doesnt work, same error", "The fix is in… Both tests pass and the page is live.", "done-claim"},
+		// a result he says does not hold is not keyed: the words of a claim name a plan or a condition as often
+		{"it still doesnt work, same error", "The fix is in… Both tests pass and the page is live.", ""},
 		{"are you off?", "The sweep runs now… I'll report when it finishes.", "stopped"},
 		{"thanks, looks good", "Both tests pass and the page is live.", ""},
 		{"why is the cache this big?", "The cache holds 40 GB of wheels.", ""},

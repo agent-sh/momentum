@@ -16,7 +16,6 @@ import (
 // of step-in is a signature of its own, keyed by what the agent's last words did:
 //   - attribution: they credited him with words or a rule, and he pushed back;
 //   - handback: their last words handed him a step or a decision, and he pushed back or handed it back;
-//   - done-claim: their last words claimed a result, and he said it does not hold;
 //   - stopped: their last words said they wait or will report, and he had to nudge;
 //   - repeat: he said again what he had said in the session that day.
 //
@@ -39,8 +38,8 @@ const lookBack = 6 * time.Hour
 // repeatSpan is how far back in a session a turn he repeats may be.
 const repeatSpan = 24 * time.Hour
 
-// The marks are plain English phrasing of a push back, a nudge, a hand-back and a claim, not any one person's
-// idiom; their precision was checked on a month of labelled turns, whose labels and counts stay on the machine.
+// The marks are plain English phrasing of a push back, a nudge and a hand-back, not any one person's idiom; their
+// precision was checked on a month of labelled turns, whose labels and counts stay on the machine.
 var (
 	// pushRe are the marks of a push back in his words: why, a doubled ? or !, what he said or asked, what the
 	// agent did not do, a what? or a wtf, what should have been, do it yourself, my rule, how many times, a turn
@@ -55,11 +54,6 @@ var (
 	// delegateRe: he hands a decision back to the agent that asked him for it.
 	delegateRe = regexp.MustCompile(`(?i)(\byou (?:can )?decide\b|\bdo (?:as|what) you think\b|\byou can do\b|\bdo it yourself\b|\bjust do\b|` +
 		`\bno need\b|\bdon'?t ask\b|\bdont ask\b|\bup to you\b|\byour call\b|\byou have (?:the )?approval\b)`)
-	// notDoneRe: he says a result does not hold.
-	notDoneRe = regexp.MustCompile(`(?i)(\bdoes?n'?t work|\bdont work|\bnot work|\bisn'?t work|\bstill (?:not|broken|fail|the same|doesn|dont|isn|no\b)|` +
-		`\bnot fixed\b|\bbroken\b|\bdidn'?t (?:work|fix|change|land)|\bdidnt (?:work|fix|change|land)|\bnothing (?:changed|happen)|` +
-		`\bi (?:dont|don'?t|cant|can'?t) see\b|\bwhere is\b|\bnot there\b|\bsame (?:issue|problem|error|bug)\b|\bfail(?:s|ed|ing)?\b|\bcrash|` +
-		`\bnot (?:done|working|live|true)\b|\bunusable\b|\bnot what i\b)`)
 	// handRe: the agent handed him a step or a decision.
 	handRe = regexp.MustCompile(`(?i)(\byour call\b|\bonly you can\b|\byou(?:'ll| will)? need to\b|\bneeds? (?:your|you to)\b|\bwaiting (?:on|for) (?:you|your)\b|` +
 		`\bsay (?:go|the word)\b|\bwhen you(?:'re| are) ready\b|\bplease run\b|\bfrom you\b|\bshould i\b|\bdo you want me to\b|\bwant me to\b|` +
@@ -67,9 +61,6 @@ var (
 	// attrRe: the agent credited him with words or a rule.
 	attrRe = regexp.MustCompile(`(?i)(\byou said\b|\byour rule\b|\bper your\b|\byou asked (?:me )?(?:to|for|not)\b|\byou told me\b|` +
 		`\byour (?:standing )?(?:instruction|ruling|order)\b|\bas you (?:said|asked|wanted)\b|\byou prefer\b|\byou wanted\b)`)
-	// doneRe: the agent claimed a result.
-	doneRe = regexp.MustCompile(`(?i)(\bdone\b|\bfixed\b|\bverified\b|\bis live\b|\bworks\b|\bworking now\b|\bcomplete[d]?\b|\bshipped\b|\bmerged\b|` +
-		`\ball green\b|\bpass(?:es|ed)\b|\blanded\b|\bready\b)`)
 	// idleRe: the agent said it waits, or will come back.
 	idleRe = regexp.MustCompile(`(?i)(\bidle\b|\bwaiting (?:for|on|until)\b|\bpaused\b|\bwill report\b|\bi'?ll (?:report|check back|ping|come back|let you know)\b|` +
 		`\bstanding by\b|\buntil you\b|\bstill running\b|\bonce (?:it|they) (?:finish|land|complete)s?\b)`)
@@ -80,7 +71,6 @@ var (
 var ownerTitles = map[string]string{
 	"attribution": "Agents credit the owner with words or rules he pushes back on",
 	"handback":    "Agents hand the owner a step or a decision, and he pushes back",
-	"done-claim":  "The owner pushes back on a result an agent claimed",
 	"stopped":     "The owner has to nudge a session that said it waits or will report",
 	"repeat":      "The owner has to say again what he said in the session",
 }
@@ -96,8 +86,6 @@ func OwnerClass(text, agentBefore string, earlier []string) string {
 		return "attribution"
 	case (push || delegateRe.MatchString(text)) && handRe.MatchString(last):
 		return "handback"
-	case notDoneRe.MatchString(text) && doneRe.MatchString(last):
-		return "done-claim"
 	case nudgeRe.MatchString(text) && idleRe.MatchString(last):
 		return "stopped"
 	}
