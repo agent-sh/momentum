@@ -580,6 +580,17 @@ func TestTheLastCodexTurnReadsOverWhenNoRecordCameAfterItsEnd(t *testing.T) {
 			r.started(0)
 			return at, r.completed(2*time.Second, "")
 		}},
+		{"an earlier input's turn aborted with nothing stored, then the owner's input written before its start", false, "", func(r *codexRollout, _ time.Time) (time.Time, time.Time) {
+			r.agent(time.Minute, "Done.")
+			r.completed(0, "Done.")
+			r.user(5*time.Minute, "first try")
+			r.started(0)
+			r.line(10*time.Second, "event_msg", aborted)
+			r.user(0, tag("turn_aborted")+"The user interrupted the previous turn."+closing("turn_aborted"))
+			at := r.user(time.Minute, "now the other one")
+			r.started(0)
+			return at, r.completed(2*time.Second, "")
+		}},
 		{"the owner's input written before its start, then a developer message, then its end", false, "", func(r *codexRollout, _ time.Time) (time.Time, time.Time) {
 			r.agent(time.Minute, "Done.")
 			r.completed(0, "Done.")
@@ -709,24 +720,39 @@ func TestTheLastCodexTurnReadsOverWhenNoRecordCameAfterItsEnd(t *testing.T) {
 }
 
 // An input that is the window's first event has no record before it in the window to read from: the replay reads
-// back from it to the turn before's end. One written before its start reads over at its end, as live does; one
-// written after its start is not read past another turn's start.
+// back from it, as far as it reads between two events, to the turn before's end. One written before its start reads
+// over at its end, as live does, also deep in a long rollout; one written after its start is not read past another
+// turn's start, and neither is one with no end in what is read back.
 func TestACodexInputThatIsTheWindowsFirstEvent(t *testing.T) {
 	for _, c := range []struct {
 		name    string
 		working bool
+		filler  func(r *codexRollout) // the turn before's records, after its owner's input
 		end     func(r *codexRollout) (input, ended time.Time)
 	}{
-		{"written before its start", false, func(r *codexRollout) (time.Time, time.Time) {
+		{"written before its start", false, nil, func(r *codexRollout) (time.Time, time.Time) {
 			at := r.user(0, "now the other one")
 			r.started(0)
 			return at, r.completed(2*time.Second, "")
 		}},
-		{"written after its start, then another turn's", true, func(r *codexRollout) (time.Time, time.Time) {
+		{"written after its start, then another turn's", true, nil, func(r *codexRollout) (time.Time, time.Time) {
 			r.started(0)
 			at := r.user(0, "now the other one")
 			r.started(30 * time.Minute)
 			return at, r.line(time.Minute, "event_msg", map[string]any{"type": "turn_aborted", "reason": "interrupted"})
+		}},
+		{"written before its start past the bound, the turn before's end within it", false, func(r *codexRollout) {
+			r.filler(9 << 20) // the rollout's start is past what the replay reads back, the end before the input is not
+		}, func(r *codexRollout) (time.Time, time.Time) {
+			at := r.user(0, "now the other one")
+			r.started(0)
+			return at, r.completed(2*time.Second, "")
+		}},
+		{"written before its start, no end within the bound before it", true, nil, func(r *codexRollout) (time.Time, time.Time) {
+			r.filler(9 << 20) // after the turn before's end: what the replay reads back holds no end
+			at := r.user(0, "now the other one")
+			r.started(0)
+			return at, r.completed(2*time.Second, "")
 		}},
 	} {
 		for _, compressed := range []bool{false, true} {
@@ -737,6 +763,9 @@ func TestACodexInputThatIsTheWindowsFirstEvent(t *testing.T) {
 				r.meta()
 				r.started(time.Second)
 				r.user(0, "run the soak")
+				if c.filler != nil {
+					c.filler(r)
+				}
 				r.agent(time.Minute, "Done.")
 				r.completed(0, "Done.")
 				r.at = t0

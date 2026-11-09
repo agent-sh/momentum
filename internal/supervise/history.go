@@ -501,14 +501,16 @@ func codexTurnEnd(from string, opened bool, until time.Time) (end string, at tim
 
 // codexStartedBetween reports whether a Codex rollout has a task_started between two events' records (from, to),
 // read while the transcript is there, its compressed copy among them: the turn of the input at to had started before
-// it. With no from (the input is the window's first event), the stretch is the one before to, as far back as it is
-// read, and only a start after its last task_complete or turn_aborted counts. True when that cannot be read (the
-// transcript is gone, the two are not in one rollout in that order, too far apart, or with no from no end in that
-// stretch), so a start after the input is not taken for its own.
-func codexStartedBetween(from, to string) bool {
+// it. With sinceEnd, only a start after the stretch's last task_complete or turn_aborted counts: one before it is a
+// turn that ended before the input (an earlier input's, aborted before the store kept anything of it). With no from
+// (the input is the window's first event), the stretch is the one before to, as far back as it is read, read so.
+// True when that cannot be read (the transcript is gone, the two are not in one rollout in that order, too far
+// apart, or with no from no end in that stretch), so a start after the input is not taken for its own.
+func codexStartedBetween(from, to string, sinceEnd bool) bool {
 	p2, end, ok2 := refPlace(to)
 	path, off, ok := refPlace(from)
 	back := from == ""
+	sinceEnd = sinceEnd || back
 	if back {
 		path, off, ok = p2, max(0, end-requestLimit), ok2
 	}
@@ -527,7 +529,7 @@ func codexStartedBetween(from, to string) bool {
 	started, ended := false, false
 	for {
 		raw, err := rd.ReadBytes('\n')
-		if len(raw) > 0 && (strings.Contains(string(raw), "task_started") || back && (strings.Contains(string(raw), "task_complete") ||
+		if len(raw) > 0 && (strings.Contains(string(raw), "task_started") || sinceEnd && (strings.Contains(string(raw), "task_complete") ||
 			strings.Contains(string(raw), "turn_aborted"))) {
 			var e struct {
 				Type    string `json:"type"`
@@ -538,7 +540,7 @@ func codexStartedBetween(from, to string) bool {
 			if json.Unmarshal(raw, &e) == nil && e.Type == "event_msg" {
 				switch e.Payload.Type {
 				case "task_started":
-					if !back {
+					if !sinceEnd {
 						return true
 					}
 					started = true
@@ -1081,12 +1083,13 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			// the store marks a Codex turn's end on the record after it, and none came after the last record: the
 			// rollout's own end of the turn after it, while the transcript is there, as the live tracker reads it.
 			// With nothing carried, no abort since the last record dated this stop. An input that opened its turn
-			// after the turn before it was over has its turn's start still to come when no task_started came between
-			// the event the replay read before it (a record passed over, as a developer message or another block of
-			// the input's own record, is not one; with none in the window, the turn before's end) and the input, nor
-			// between the input and the last record read. The end's last_agent_message is the turn's last words.
-			opened := inputLast && openRef != "" && !codexStartedBetween(openFrom, openRef) &&
-				(lastSeen == openRef || !codexStartedBetween(openRef, lastSeen))
+			// after the turn before it was over has its turn's start still to come when no task_started came after the
+			// last turn end between the event the replay read before it (a record passed over, as a developer message
+			// or another block of the input's own record, is not one; with none in the window, the turn before's end)
+			// and the input, nor any between the input and the last record read. The end's last_agent_message is the
+			// turn's last words.
+			opened := inputLast && openRef != "" && !codexStartedBetween(openFrom, openRef, true) &&
+				(lastSeen == openRef || !codexStartedBetween(openRef, lastSeen, false))
 			if end, at, last := codexTurnEnd(lastSeen, opened, until); end != "" {
 				carried, pending = end, map[string]bool{}
 				if end == "turn_aborted" {
