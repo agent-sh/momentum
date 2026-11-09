@@ -280,6 +280,9 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 	if err != nil {
 		return run, err
 	}
+	if len(log) > 0 { // what the run was given of the case: a hold for a person ends on a change after it
+		run.CaseLogSeq = log[len(log)-1].Seq
+	}
 	log = runLog(log)
 	raw, err := json.Marshal(struct {
 		Case     store.Case        `json:"case"`

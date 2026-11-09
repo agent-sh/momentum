@@ -106,6 +106,9 @@ type LoopRun struct {
 	// Cause is why a build was refused for its own output, at a refusal stage: the text after its stage, masked. The
 	// stop rule compares it with Failure there. It is empty for every other run, and for one kept before causes were.
 	Cause string
+	// CaseLogSeq is the seq of the newest line of the case's log the run's inputs hold (its case.json). It lives in
+	// memory for the run's own steps and is never stored.
+	CaseLogSeq int
 }
 
 // ErrNoRun means no run has the id.

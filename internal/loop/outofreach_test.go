@@ -602,18 +602,22 @@ func hostPackage(t *testing.T, f repoFixture, caseID string) Package {
 }
 
 // An out-of-reach path is read as BASE reads it. A submodule or a symlink of BASE is out of reach as the entry itself.
-// A path through a symlink that points inside the repository is its target's, out of reach or in reach. A path under
-// a submodule, or under a symlink out of the repository or one that never ends, and a new file at the root are no
-// path of BASE: BASE cannot tell any of them from a made-up one.
+// A path through a symlink that points inside the repository is its target's, out of reach or in reach, and out of
+// reach when the paths rule refuses any path on the way (a CI path whose directory links elsewhere). A path under a
+// submodule, or under a symlink out of the repository, one that never ends or one whose target climbs back out of a
+// directory it names, and a new root file no change may create are no path of BASE: BASE cannot tell any of them from
+// a made-up one. A new root file a change may create is in reach.
 func TestAnOutOfReachPathIsReadAsBASEReadsIt(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	r := localRunner(t, st)
-	f := newRepo(t, ciFiles)
+	f := newRepo(t, map[string]string{".github/workflows/ci.yml": "name: ci\n", ".github/workflows/release.yml": "name: release\n",
+		"tools/actions/setup/action.yml": "name: setup\n"})
 	r.Ship = shipWithSandbox(st, f, Sandbox{})
 	r.Ship.Dir = r.Dir
 	run(t, f.main, "git", "update-index", "--add", "--cacheinfo", "160000,0123456789abcdef0123456789abcdef01234567,vendor/lib")
-	for link, target := range map[string]string{"ci": ".github/workflows", "chain": "ci", "here": ".", "file": "fake.go", "out": "../elsewhere", "abs": "/etc", "loop": "loop"} {
+	for link, target := range map[string]string{"ci": ".github/workflows", "chain": "ci", "here": ".", "file": "fake.go", "out": "../elsewhere", "abs": "/etc", "loop": "loop",
+		".github/actions": "../tools/actions", "s": ".github/workflows/inner", "l": "s/.."} {
 		if err := os.Symlink(target, filepath.Join(f.main, link)); err != nil {
 			t.Fatal(err)
 		}
@@ -623,17 +627,25 @@ func TestAnOutOfReachPathIsReadAsBASEReadsIt(t *testing.T) {
 	p := hostPackage(t, f, openCase(t, st, "failures", "out-of-reach-links", 1).ID)
 	for where, reason := range map[string]string{"vendor/lib": "vendor/lib is a symlink or a submodule", "file": "file is a symlink or a submodule",
 		"ci/ci.yml": ".github/workflows/ci.yml is CI configuration", "ci/new.yml": ".github/workflows/new.yml is CI configuration",
-		"chain/release.yml": ".github/workflows/release.yml is CI configuration"} {
+		"chain/release.yml":                ".github/workflows/release.yml is CI configuration",
+		".github/actions/setup/action.yml": ".github/actions/setup/action.yml is CI configuration"} {
 		if why, refusal, err := r.unreachable(ctx, p, where); err != nil || refusal != nil || why == nil || !strings.Contains(why.Error(), reason) {
 			t.Errorf("%s is not out of reach: %v %v %v", where, why, refusal, err)
 		}
 	}
-	under, none := "is under a submodule or a symlink out of the repository at BASE", "is no path of the repository at BASE"
-	for where, reason := range map[string]string{"vendor/lib/x.go": under, "out/x": under, "abs/x": under, "loop/x": under,
+	under, none := "is under a submodule or a symlink of BASE whose content BASE does not hold", "is no path of the repository at BASE"
+	for where, reason := range map[string]string{"vendor/lib/x.go": under, "out/x": under, "abs/x": under, "loop/x": under, "l/ci.yml": under,
 		"file/x": none, "ci/made-up/x.yml": none, "Jenkinsfile": none,
-		"here/fake.go": "is fake.go through a symlink of BASE, which a change may touch"} {
+		"here/fake.go":      "is fake.go through a symlink of BASE, which a change may touch",
+		"here/CHANGELOG.md": "is CHANGELOG.md through a symlink of BASE, which a change may touch"} {
 		if why, refusal, err := r.unreachable(ctx, p, where); err != nil || why != nil || refusal == nil || !strings.Contains(refusal.Error(), where+" "+reason) {
 			t.Errorf("%s is not the build's refusal: %v %v %v", where, why, refusal, err)
+		}
+	}
+	// a new root file a change may create is in reach, as fake.go is: the build's refusal says to make the fix there
+	for _, where := range []string{"fake.go", "CHANGELOG.md"} {
+		if why, refusal, err := r.unreachable(ctx, p, where); err != nil || why != nil || refusal != nil {
+			t.Errorf("%s is not in reach: %v %v %v", where, why, refusal, err)
 		}
 	}
 }
@@ -657,43 +669,32 @@ func heldRunner(t *testing.T, sig string) (*Runner, store.Case, Package) {
 	return r, c, hostPackage(t, f, c.ID)
 }
 
-// A person who changes the case's status while its build runs ends the hold that build answers, though the hold's line
-// comes after the change: the hold keeps the build's start. A change before the build started does not end it.
-func TestAStatusChangeWhileTheBuildRanEndsItsHold(t *testing.T) {
-	ctx := context.Background()
+// A person's change of the case's status after the case and its log were read for its build ends the hold that build
+// answers, though the change is logged before the hold, and before the run's reservation when it comes while the
+// build is prepared: the hold keeps the newest line of the log the build was given. The next pass builds the case
+// again. The change that moved the case to testing, before the build, ends no hold (the other tests here).
+func TestAStatusChangeAfterTheBuildReadTheCaseEndsItsHold(t *testing.T) {
 	where := ".github/workflows/ci.yml"
-	for _, during := range []bool{true, false} {
-		r, c, p := heldRunner(t, "out-of-reach-during")
-		log, err := r.Store.CaseLog(ctx, c.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		started := log[len(log)-1].At // the build starts after the case moved to testing
-		time.Sleep(5 * time.Millisecond)
-		for _, status := range []store.CaseStatus{store.CaseInvestigating, store.CaseTesting} {
-			if _, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: status}, "test"); err != nil {
-				t.Fatal(err)
+	r, c, dir := outOfReachRunner(t, where)
+	busy, changed := r.Ship.Gate.Busy, false
+	r.Ship.Gate.Busy = func(ctx context.Context, main string) (string, error) {
+		if !changed { // the gate runs as the build is prepared, after its inputs read the case's log
+			changed = true
+			for _, status := range []store.CaseStatus{store.CaseInvestigating, store.CaseTesting} {
+				if _, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: status}, "test"); err != nil {
+					return "", err
+				}
 			}
 		}
-		if !during {
-			time.Sleep(5 * time.Millisecond)
-			started = time.Now()
-		}
-		res, err := r.outOfReach(ctx, c, store.LoopRun{CaseEpisode: c.Episode, Started: started}, Result{Status: store.RunOK}, p, OutOfReach{Path: where, Fix: outOfReachFix})
-		if err != nil || res.Status != store.RunOutOfReach {
-			t.Fatalf("the out-of-reach answer: %+v %v", res, err)
-		}
-		now, err := r.Store.CaseByID(ctx, c.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		why, err := r.heldForPerson(ctx, now, false)
-		if err != nil || during && why != "" || !during && why != "for a person: its fix needs "+where {
-			t.Fatalf("a status change (during the build: %v) left the hold %q: %v", during, why, err)
-		}
-		if n, ok := personNote(t, r, c, where); !ok || during == n.Done.IsZero() {
-			t.Fatalf("the hold's note (during the build: %v): %+v %v", during, n, ok)
-		}
+		return busy(ctx, main)
+	}
+	heldFor(t, r, c, onePass(t, r, c), where)
+	if !changed {
+		t.Fatal("the gate did not run as the build was prepared")
+	}
+	heldFor(t, r, c, onePass(t, r, c), where)
+	if builds(t, dir) != "2" {
+		t.Fatalf("a change after the build read the case did not end its hold: %s builds", builds(t, dir))
 	}
 }
 

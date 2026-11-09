@@ -49,10 +49,10 @@ func HoldOf(c Case, log []CaseEntry) string {
 
 // A build whose fix needs a path no change of the loop's may touch holds its case for a person: a "held for a person"
 // line with the path, the fix, why no change may touch the path, the case's episode, what its mechanism and fix were
-// and when the build started, and a "person hold ended" line when the hold ends. A case in testing is held for a
-// person while its newest such line is a hold of its current episode, its mechanism and fix are what they were, and no
-// "set" line dated after the build's start, or later in the log than the hold, changed its status: new evidence alone
-// does not end it. A line that cannot be read is a hold too, which any later "set" line ends.
+// and the newest line of the case's log the build was given, and a "person hold ended" line when the hold ends. A case
+// in testing is held for a person while its newest such line is a hold of its current episode, its mechanism and fix
+// are what they were, and no "set" line the build was not given changed its status: new evidence alone does not end
+// it. A line that cannot be read is a hold too, which any later "set" line ends.
 const (
 	ActionPersonHeld  = "held for a person"
 	ActionPersonEnded = "person hold ended"
@@ -60,8 +60,8 @@ const (
 
 // PersonHold is a hold for a person: the path the case's fix needs, the change a person makes there, why no change
 // of the loop's may touch the path, the episode of the build that answered, the sums of the case's mechanism and fix
-// (its next test) the build worked from, and the build's start in Unix milliseconds (0 on a line kept before
-// holds had it). Unread marks a line that cannot be read, which holds all the same with none of its fields.
+// (its next test) the build worked from, and the seq of the newest line of the case's log the build was given (0 on
+// a line kept before holds had it, which reads as the hold's own). Unread marks a line that cannot be read, which holds all the same with none of its fields.
 type PersonHold struct {
 	Path         string `json:"path"`
 	Fix          string `json:"fix"`
@@ -69,7 +69,7 @@ type PersonHold struct {
 	Episode      int64  `json:"episode"`
 	MechanismSum string `json:"mechanism_sum"`
 	FixSum       string `json:"fix_sum"`
-	Started      int64  `json:"started,omitempty"`
+	Seq          int    `json:"seq,omitempty"`
 	Unread       bool   `json:"-"`
 }
 
@@ -128,8 +128,9 @@ func lastPersonHold(log []CaseEntry) (PersonHold, int, bool) {
 
 // PersonHoldOf is the hold for a person a case in testing stands on, from its log: its newest such hold of its
 // current episode, with no end, the case's mechanism and fix as they were at it, and no "set" line that changed the
-// case's status after the hold's build started or after the hold (updateCase names a status change first, so no title
-// or other text it holds reads as one). An unread hold stands until a later "set" line of any kind.
+// case's status after the newest line its build was given, or after the hold (updateCase names a status change first,
+// so no title or other text it holds reads as one). Seqs order the lines, not their times. An unread hold stands
+// until a later "set" line of any kind.
 func PersonHoldOf(c Case, log []CaseEntry) (PersonHold, bool) {
 	if c.Status != CaseTesting {
 		return PersonHold{}, false
@@ -142,7 +143,7 @@ func PersonHoldOf(c Case, log []CaseEntry) (PersonHold, bool) {
 		if e.Action != "set" {
 			continue
 		}
-		after := i > at || h.Started != 0 && e.At.UnixMilli() > h.Started
+		after := i > at || h.Seq != 0 && e.Seq > h.Seq
 		if after && (h.Unread || strings.HasPrefix(e.Detail, "status ")) {
 			return PersonHold{}, false
 		}
