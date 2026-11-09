@@ -393,8 +393,8 @@ func authenticateReport(res *Result, reports []json.RawMessage, refusal bool) {
 	res.Status, res.Failure = store.RunFailed, "report"
 }
 
-// exitedBeforeStart says a run's sandbox ended with an exit before its harness started: the harness never printed its
-// start marker, and nothing reached the relay. It spent nothing and says nothing of the agent: it is a harness that
+// exitedBeforeStart says a run's sandbox ended with an exit before its harness started: the sandbox never reached the
+// harness (it prints the start marker just before it runs the harness), and nothing reached the relay. It spent nothing and says nothing of the agent: it is a harness that
 // does not start, the host's failure as a sandbox that did not run the program is, and a build or an investigation
 // keeps it at its run stage, which the stop rule counts. A broker that answered with errors is the broker's, which Run
 // keys as such.
@@ -405,7 +405,7 @@ func exitedBeforeStart(res Result) bool {
 
 // neverStarted is the error a run kept at its run stage gives for a sandbox that ended before its harness started.
 func neverStarted(res Result) error {
-	return fmt.Errorf("the harness never started: its sandbox ended with %s before the harness printed its start marker", res.Failure)
+	return fmt.Errorf("the harness never started: its sandbox ended with %s before it reached the harness (no start marker)", res.Failure)
 }
 
 func reconcileExit(res *Result, waitErr error) {
