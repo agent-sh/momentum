@@ -531,9 +531,10 @@ func (s *Ship) returnWork(ctx context.Context, caseID, runDir string) (stays boo
 }
 
 // returnTrees gives back, with returnWork, every case's build tree that is in dir. It passes over a package that
-// cannot be read, and says which with why (a build tree it names is made again at its next build, freshRunClone); it
-// fails when the packages cannot be listed, or a tree cannot go back, so dir stays.
-func (s *Ship) returnTrees(ctx context.Context, dir string) (unread map[string]string, err error) {
+// cannot be read or whose case the store does not know, and says which with why (a build tree it names is made again
+// at its next build, freshRunClone); it fails when the packages cannot be listed, or a tree cannot go back, so dir
+// stays.
+func (s *Ship) returnTrees(ctx context.Context, dir string) (passed map[string]string, err error) {
 	entries, err := os.ReadDir(filepath.Join(s.Dir, "packages"))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
@@ -541,30 +542,37 @@ func (s *Ship) returnTrees(ctx context.Context, dir string) (unread map[string]s
 	if err != nil {
 		return nil, err
 	}
+	pass := func(name, why string) {
+		if passed == nil {
+			passed = map[string]string{}
+		}
+		passed[name] = why
+	}
 	for _, e := range entries {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
 		p, had, err := s.Load(e.Name())
 		if err != nil {
-			if unread == nil {
-				unread = map[string]string{}
-			}
-			unread[e.Name()] = err.Error()
+			pass(e.Name(), "it cannot be read: "+err.Error())
 			continue
 		}
 		if !had || p.Work == "" || !within(dir, p.Work) {
 			continue
 		}
 		stays, err := s.returnWork(ctx, p.Case, dir)
+		if stays && errors.Is(err, store.ErrNoCase) { // returnWork takes the case's lock, which needs the case
+			pass(e.Name(), "the store knows no case "+p.Case)
+			continue
+		}
 		if stays {
-			return unread, err
+			return passed, err
 		}
 		if err != nil {
 			s.logf("build tree of %s: %v", p.Case, err)
 		}
 	}
-	return unread, nil
+	return passed, nil
 }
 
 func stageFailure(res Result, key string, err error) (Result, error) {

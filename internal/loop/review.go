@@ -140,8 +140,12 @@ func (r *Runner) reviews(ctx context.Context, only string, families ...string) [
 			out = append(out, Done{Family: c.Family, Case: c.ID, Step: StepReview, Skipped: "inputs: " + prepErr.Error()})
 			continue
 		}
+		dir := run.Dir
 		run, refusal := r.reservePrepared(ctx, run)
 		if refusal != "" {
+			if run.Dir == "" { // no row names the directory: what the preparation left goes
+				r.removeRunDirs(context.WithoutCancel(ctx), c.ID, dir, false)
+			}
 			out = append(out, Done{Family: c.Family, Case: c.ID, Step: StepReview, Run: run, Skipped: refusal})
 			continue
 		}

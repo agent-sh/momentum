@@ -259,8 +259,12 @@ func (r *Runner) Once(ctx context.Context, o Options) ([]Done, error) {
 			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Skipped: "inputs: " + inputErr.Error()})
 			return store.LoopRun{}, runNone
 		}
+		dir := run.Dir
 		run, refusal := r.reservePrepared(ctx, run)
 		if refusal != "" {
+			if run.Dir == "" { // no row names the directory: what the preparation left goes, its tree back to the case first
+				r.removeRunDirs(context.WithoutCancel(ctx), c.ID, dir, true)
+			}
 			done = append(done, Done{Family: fam, Case: c.ID, Step: step, Run: run, Skipped: refusal})
 			return store.LoopRun{}, runRecorded
 		}
@@ -439,10 +443,11 @@ var runIDForm = regexp.MustCompile(`^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$`)
 // (store.KnownLoopRunDirs) and whose agent never started, which a pass that ended between a build's preparation and
 // its reservation (a crash) leaves: a build tree a package names in one goes back to its case first, and a directory
 // whose tree cannot go back stays. A build tree is only ever a run directory's work, so one without it goes with no
-// package read, and a package that cannot be read is passed over, logged once a sweep. One whose agent started
-// (agentRan: a store restored, or made anew, lost its row) stays, logged once. It looks only at entries in a run id's
-// form, and removes nothing when the store cannot say which runs it knows. A pass sweeps when it starts, under the
-// loop's lock, before it prepares any run of its own, so every run directory then is an earlier pass's.
+// package read, and a package that cannot be read, or whose case the store does not know, is passed over, logged once
+// a sweep. One whose agent started (agentRan: a store restored, or made anew, lost its row) stays, logged once. It
+// looks only at entries in a run id's form, and removes nothing when the store cannot say which runs it knows. A pass
+// sweeps when it starts, under the loop's lock, before it prepares any run of its own, so every run directory then is
+// an earlier pass's.
 func (r *Runner) sweepRuns(ctx context.Context) {
 	runs := filepath.Join(r.Dir, "runs")
 	entries, err := os.ReadDir(runs)
@@ -469,11 +474,10 @@ func (r *Runner) sweepRuns(ctx context.Context) {
 		r.logf("run directories: the store cannot say which runs it knows: %v", err)
 		return
 	}
-	unread := map[string]string{} // the packages that cannot be read, logged once the sweep is done
+	passed := map[string]string{} // the packages passed over (returnTrees), logged once the sweep is done
 	defer func() {
-		for _, name := range slices.Sorted(maps.Keys(unread)) {
-			r.logf("package %s cannot be read: the sweep passed over it, and its case's next build makes its tree again: %s", name,
-				unread[name])
+		for _, name := range slices.Sorted(maps.Keys(passed)) {
+			r.logf("package %s: the sweep passed over it, and its case's next build makes its tree again: %s", name, passed[name])
 		}
 	}()
 	for id := range ids {
@@ -486,8 +490,8 @@ func (r *Runner) sweepRuns(ctx context.Context) {
 			continue
 		}
 		if _, err := os.Lstat(filepath.Join(dir, "work")); err == nil && r.Ship != nil { // a build tree is only ever there
-			bad, err := r.Ship.returnTrees(ctx, dir)
-			maps.Copy(unread, bad)
+			over, err := r.Ship.returnTrees(ctx, dir)
+			maps.Copy(passed, over)
 			if err != nil {
 				r.logf("run directory %s, which no run names: %v", id, err)
 				continue
