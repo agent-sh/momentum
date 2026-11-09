@@ -694,11 +694,14 @@ func put(ctx context.Context, tx querier, evs []Event) (int, error) {
 	if err := tx.QueryRowContext(ctx, `SELECT n FROM event_seq WHERE id = 1`).Scan(&seq); err != nil {
 		return 0, err
 	}
+	// A row stored again keeps the model it was stored with, when it has one: a stored model is what was seen at the
+	// time, and a read again knows only the present (Hermes stamps every row with its session's model now).
 	putStmt, err := tx.PrepareContext(ctx, `INSERT INTO events (id, source, source_key, ts, session, agent, harness, model,
 	  cwd, actor, kind, tool, summary, meta, ref, heuristic, experiment, ingested, seq)
 	  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 	  ON CONFLICT(id) DO UPDATE SET ts=excluded.ts, session=excluded.session, agent=excluded.agent,
-	    harness=excluded.harness, model=excluded.model, cwd=excluded.cwd, actor=excluded.actor, kind=excluded.kind,
+	    harness=excluded.harness, model=CASE WHEN COALESCE(events.model, '') != '' THEN events.model ELSE excluded.model END,
+	    cwd=excluded.cwd, actor=excluded.actor, kind=excluded.kind,
 	    tool=excluded.tool, summary=excluded.summary, meta=excluded.meta, ref=excluded.ref,
 	    heuristic=excluded.heuristic, experiment=excluded.experiment, seq=excluded.seq`)
 	if err != nil {

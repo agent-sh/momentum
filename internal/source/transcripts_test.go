@@ -1017,3 +1017,53 @@ func TestTranscriptsReadAgainAfterARebuildFillTheGitFlag(t *testing.T) {
 		}
 	}
 }
+
+// A Hermes row is stamped with its session's model when it is read, and a session can switch models: a rebuild
+// without force reads every row again under the model in use now, and each event keeps the model it was stored
+// with. A stored model is what was seen at the time; a read again knows only the present.
+func TestTranscriptsReadAgainKeepTheModelEachEventWasStoredWith(t *testing.T) {
+	home := testHome(t)
+	path := filepath.Join(home, ".hermes", "state.db")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TACIT_HERMES_DB", path)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(hermesSchema + `
+	  insert into sessions (id, source, created_source, model, started_at) values ('phone', 'mobile', 'mobile', 'model-a', 100);
+	  insert into messages (session_id, role, content, timestamp) values ('phone', 'user', 'prune the docker images', 101);`); err != nil {
+		t.Fatal(err)
+	}
+	st := openStore(t)
+	src := transcripts(home)
+	ctx := context.Background()
+	ingest(t, src, st)
+	if _, err := db.Exec(`update sessions set model = 'model-b' where id = 'phone';
+	  insert into messages (session_id, role, content, timestamp) values ('phone', 'user', 'and the logs', 105);`); err != nil {
+		t.Fatal(err)
+	}
+	ingest(t, src, st)
+	models := func() string {
+		var out []string
+		for _, e := range all(t, st, "transcripts") {
+			out = append(out, e.Summary+"="+e.Model)
+		}
+		slices.Sort(out)
+		return strings.Join(out, " ")
+	}
+	const want = "and the logs=model-b prune the docker images=model-a"
+	if got := models(); got != want {
+		t.Fatalf("before the rebuild: %s", got)
+	}
+	if _, err := st.Rebuild(ctx, store.Transcripts, false); err != nil {
+		t.Fatal(err)
+	}
+	ingest(t, src, st)
+	if got := models(); got != want {
+		t.Fatalf("after reading again: %s, want %s", got, want)
+	}
+}
