@@ -168,7 +168,7 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		{"hermes", "terminal", `{"output": "== x: usage: fake-repo-check [-h] --repo REPO", "exit_code": 2, "error": null}`, "exec:usage: fake-repo-check"},
 		{"claude", "Bash", "Exit code 2 usage: /opt/tools/bin/x-tool [-h] --repo REPO", "exec:usage: x-tool"},
 		{"hermes", "terminal", `{"output": "ls: cannot access 'x': No such file or directory", "exit_code": 0, "error": null}`, ""},
-		{"hermes", "terminal", `{"output": "cat: a.txt: No such file or directory and more output past the store's cut`, "exec:cat: P: no such file or directory"},
+		{"hermes", "terminal", `{"output": "cat: a.txt: No such file or directory and more output past the store's cut`, "miss:exec:a.txt"},
 		{"hermes", "execute_code", "ModuleNotFoundError: No module named 'yaml'", "exec:modulenotfounderror: no module named"},
 		{"hermes", "execute_code", `{"status": "error", "output": "Traceback (most recent call last):\n  File \"x.py\", line 3, in <module>\nModuleNotFoundError: No module named 'yaml'"}`,
 			"exec:modulenotfounderror: no module named"},
@@ -183,9 +183,9 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		{"codex", "exec_command", "Chunk ID: 1a Wall time: 0.1 seconds Process exited with code 1 Original token count: 3 Output: connection refused", "exec:connection refused"},
 		{"pi", "bash_output", "ls: cannot access '/w/a.txt': No such file or directory", "miss:exec:/w/a.txt"},
 		{"codex", "write_stdin", "Chunk ID: 1a Wall time: 1.0 seconds Process exited with code 1 Original token count: 3 Output: cat: a.txt: No such file or directory",
-			"exec:cat: P: no such file or directory"},
+			"miss:exec:a.txt"},
 		{"codex", "exec_command", "bash: rgg: command not found", "exec:rgg: command not found"},
-		{"codex", "write_stdin", "cat: a.txt: No such file or directory", "exec:cat: P: no such file or directory"},
+		{"codex", "write_stdin", "cat: a.txt: No such file or directory", "miss:exec:a.txt"},
 		{"claude", "Bash", "bash: rgg: command not found", "exec:rgg: command not found"},
 		{"codex", "local_shell", "bash: rgg: command not found", "exec:rgg: command not found"},
 		{"hermes", "terminal", "bash: rgg: command not found", "exec:rgg: command not found"},
@@ -197,7 +197,7 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		{"claude", "Bash", "Exit code 7 connection refused", "exec:connection refused"},
 		{"claude", "Bash", "Exit code 1 tail: option used in invalid context -- 2", "exec:tail: option used in invalid context"},
 		{"claude", "Bash", "Exit code 1 === RUN TestX --- PASS (0.00s) dial tcp: connection refused", "exec:tcp: connection refused"},
-		{"claude", "Bash", "Exit code 1 cat: /x/y.txt: No such file or directory", "exec:cat: P: no such file or directory"},
+		{"claude", "Bash", "Exit code 1 cat: /x/y.txt: No such file or directory", "miss:exec:/x/y.txt"},
 		{"claude", "Bash", "Exit code 128 fatal: Unable to create '/r/.git/index.lock': File exists.", "exec:fatal: unable to create Q: file exists"},
 		// Node's error code and its message, a mark in a quoted value, a usage line in colour and none
 		{"claude", "Bash", "Exit code 1 Error: ENOENT: no such file or directory, open '/srv/app/a.json'", "miss:exec:/srv/app/a.json"},
@@ -245,8 +245,8 @@ func TestACommandsFailureIsKeyedByItsMessage(t *testing.T) {
 		{`{"command":"ls -la /w/a.txt"}`, "miss:exec:/w/a.txt", []string{ls,
 			ls + " ls: cannot access '/w/b.txt': No such file or directory", ls + " /home/u/x",
 			"Exit code 2 building x step 3: done ls: cannot access '/w/a.txt': No such file or directory"}},
-		{`{"command":"cat a.txt"}`, "exec:cat: P: no such file or directory", []string{"Exit code 1 cat: a.txt: No such file or directory",
-			"Exit code 1 cat: /home/u/projects/some-project/a-long-directory-name/sub/file.txt: No such file or directory"}},
+		{`{"command":"nl a.txt"}`, "exec:nl: P: no such file or directory", []string{"Exit code 1 nl: a.txt: No such file or directory",
+			"Exit code 1 nl: /home/u/projects/some-project/a-long-directory-name/sub/file.txt: No such file or directory"}},
 		{`{"command":"python3 run.py"}`, "miss:exec:/w/config", []string{
 			"Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '/w/config'",
 			"Exit code 1 Traceback (most recent call last): File \"run.py\", line 3, in <module> open('/w/config') FileNotFoundError: [Errno 2] No such file or directory: '/w/config'"}},
@@ -262,8 +262,8 @@ func TestACommandsFailureIsKeyedByItsMessage(t *testing.T) {
 			"Exit code 128 git@github.com: Permission denied (publickey). fatal: Could not read from remote repository."}},
 		{`{"command":"rgg x"}`, "exec:rgg: command not found", []string{"Exit code 127 /bin/bash: line 1: rgg: command not found"}},
 		{`{"command":"rgg x"}`, "exec:zsh: command not found: rgg", []string{"Exit code 127 zsh: command not found: rgg"}},
-		{`{"command":"poll-ready --file x && wc -l x"}`, "exec:wc: P: no such file or directory", []string{
-			"Exit code 1 poll-ready: done after 3s wc: x/y: No such file or directory", "Exit code 1 wc: x/z: No such file or directory"}},
+		{`{"command":"poll-ready --file x && nl x"}`, "exec:nl: P: no such file or directory", []string{
+			"Exit code 1 poll-ready: done after 3s nl: x/y: No such file or directory", "Exit code 1 nl: x/z: No such file or directory"}},
 		// a program's name past the reach or a sentence's end opens another message; with no name, three words
 		{`{"command":"ls x"}`, "exec:x: no such file or directory", []string{
 			"Exit code 2 ls: " + strings.Repeat("word ", 25) + "x: No such file or directory", "Exit code 2 ls: done. x: No such file or directory"}},
@@ -287,7 +287,7 @@ func TestACommandsFailureIsKeyedByItsMessage(t *testing.T) {
 		t.Errorf("curl's without its call: %q", k.String())
 	}
 	for _, pair := range [][2]string{
-		{"Exit code 1 cat: a.txt: No such file or directory", "Exit code 1 wc: a.txt: No such file or directory"},
+		{"Exit code 1 nl: a.txt: No such file or directory", "Exit code 1 diff: a.txt: No such file or directory"},
 		{"Exit code 1 gh: Not Found (HTTP 404)", "Exit code 1 gh: Not Found (HTTP 403)"},
 	} {
 		a, _ := FailureOf("claude", "Bash", pair[0], "")

@@ -597,9 +597,10 @@ var (
 // cut before its path, or none at all, as for the mistakes log, whose input the store does not keep for a tool error)
 // says nothing to key it by.
 //
-// A failed command whose message says no file is at a path it names in quotes (quotedMiss) is keyed miss:exec by that
-// path (commandMissed, missedPath), for the same reason, and one of a command that ran on another host by that host
-// and path (remote). One whose path is empty or cut short says nothing to key it by.
+// A failed command whose message says no file is at a path it names in quotes (quotedMiss), or unquoted after its
+// program's name (unquotedMiss), is keyed miss:exec by that path (commandMissed, missedPath), for the same reason,
+// and one of a command that ran on another host by that host and path (remote). One whose path is empty or cut short
+// says nothing to key it by.
 func FailureOf(harness, tool, text, call string) (FailureKey, bool) {
 	return failureKey(harness, tool, text, store.Call{Input: call})
 }
@@ -1110,9 +1111,10 @@ var tailRe = regexp.MustCompile(`^:\s+([^\s,;]{1,40})`)
 // output alone does not say that it named one. An output that shows the work failing has no key.
 //
 // The programs are the call's (callPrograms). A message that says no file is at a path it names in quotes
-// (quotedMiss) is no message of words: its key is execMiss, its text that path as the message names it, which
-// failureKey keys as commandMissed says. A call that may have run on another host (remote) is keyed by that host
-// and the path when its command line names the host, else by its words.
+// (quotedMiss), or unquoted after its program's name (unquotedMiss), is no message of words: its key is execMiss,
+// its text that path as the message names it, which failureKey keys as commandMissed says. A call that may have run
+// on another host (remote) is keyed by that host and the path when its command line names the host, else by its
+// words.
 func execKey(out, call string) (FailureKey, bool) {
 	programs := callPrograms(call)
 	out = strings.Join(strings.Fields(out), " ")
@@ -1123,7 +1125,11 @@ func execKey(out, call string) (FailureKey, bool) {
 	if loc == nil {
 		return FailureKey{}, false
 	}
-	if p, ok := quotedMiss(out, loc); ok {
+	p, ok := quotedMiss(out, loc)
+	if !ok {
+		p, ok = unquotedMiss(out, loc, programs)
+	}
+	if ok {
 		switch host, far := remote(call, out[:loc[0]]); {
 		case !far:
 			return FailureKey{Origin: execMiss, Text: p}, true
@@ -1259,6 +1265,38 @@ func quotedMiss(out string, loc []int) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// unquotedMissRe is the message of a program that names the one path it found no file at unquoted, up to the
+// mark's colon: the program by its name or its path, the words it opens with, and the path as one word. The
+// programs are the ones whose message recurs in this form: rg, cat, wc, grep, cut, sha256sum, scp, sed's "can't
+// read", ugrep's "warning", the shell's cd, and bash's own ("bash: PATH", "bash: line N: PATH").
+var unquotedMissRe = regexp.MustCompile(`(?:^|\s)(?:[^\s:]*/)?(?:(?:rg|cat|wc|grep|cut|sha256sum|scp|cd): |sed: can't read |ugrep: warning: |(bash)(?:: line \d+)?: )(\S+): $`)
+
+// unquotedMiss is the path a command's message says no file is at when it names it unquoted, and whether it names
+// one: "PROG: PATH: No such file or directory" for a program of unquotedMissRe's. The path is one word that opens
+// with /, ~/ or a name's letter, digit, _ or . (./ and ../ too), so an option ("rg: -g: ") or a glob the shell did
+// not expand names none. Nor does bash's message when it names a program by a name with no slash, one of the
+// call's programs or of a call that names none: that is the command the shell could not run, which recurs under
+// one key, not an argument. Nor does a setup failure's message: a wrapper's own (env, timeout, nohup), whose program
+// is none of these, and a bad interpreter ("bash: ./x: /bin/foo: bad interpreter: "), a deleted working directory
+// ("getcwd: cannot access parent directories: ") or two paths, whose words stand between the program and the mark.
+func unquotedMiss(out string, loc []int, programs map[string]bool) (string, bool) {
+	if !strings.EqualFold(out[loc[0]:loc[1]], "no such file or directory") {
+		return "", false
+	}
+	m := unquotedMissRe.FindStringSubmatch(out[:loc[0]])
+	if m == nil {
+		return "", false
+	}
+	p := m[2]
+	if r, _ := utf8.DecodeRuneInString(p); !(r == '/' || strings.HasPrefix(p, "~/") || r == '_' || r == '.' || unicode.IsLetter(r) || unicode.IsDigit(r)) {
+		return "", false
+	}
+	if m[1] != "" && !strings.Contains(p, "/") && (len(programs) == 0 || programs[strings.ToLower(p)]) {
+		return "", false
+	}
+	return p, true
 }
 
 // closers are the quotes that close a value each quote opens: ASCII, GNU's `x' and curly ones.

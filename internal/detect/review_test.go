@@ -35,7 +35,7 @@ func TestEveryHarnessShellKeysOnlySetupFailures(t *testing.T) {
 		t.Run(tc.harness, func(t *testing.T) {
 			a, ok := FailureOf(tc.harness, tc.tool, `{"type":"Bash","exit_code":1,"output":"cat: notes.txt: No such file or directory"}`, `{"command":"cat notes.txt"}`)
 			b, other := FailureOf(tc.harness, tc.tool, `{"type":"Bash","exit_code":1,"output":"curl: Could not resolve host: neutral.invalid"}`, `{"command":"curl neutral.invalid"}`)
-			if !ok || !other || a.Origin != "exec" || b.Origin != "exec" || a == b {
+			if !ok || !other || a.Origin != execMiss || b.Origin != "exec" || a == b {
 				t.Fatalf("unrelated setup errors merged: %+v / %+v", a, b)
 			}
 			if _, ok := FailureOf(tc.harness, tc.tool, "--- FAIL: TestMarker (0.01s) exit status 1", `{"command":"go test"}`); ok {

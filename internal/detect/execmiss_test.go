@@ -14,9 +14,9 @@ import (
 // harness's shell. The path is cleaned; a whole one has the home folded to ~, and one under the directory the call
 // ran in (its input's workdir or cwd, else the call's own) is keyed by its part below that directory; a relative one
 // is keyed as the message spells it, whatever the command did before. An empty path and one the store cut short key
-// nothing. A message that names no quoted path, two paths, or a program that another (a wrapper, Python's
-// subprocess, strace, Deno) could not find keeps its words, and so does one from a command that may have run on
-// another host that its command line does not name.
+// nothing. A message that names two paths, or a program that another (a wrapper, Python's subprocess, strace, Deno)
+// could not find keeps its words, and so does one from a command that may have run on another host that its command
+// line does not name.
 func TestACommandsMissIsKeyedByThePathItNames(t *testing.T) {
 	t.Setenv("HOME", "/home/u")
 	const py = `{"command":"python3 run.py"}`
@@ -92,9 +92,8 @@ func TestACommandsMissIsKeyedByThePathItNames(t *testing.T) {
 		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: ''", py, "/w", ""},
 		{"claude", "Bash", "Exit code 2 ls: cannot access '': No such file or directory", `{"command":"ls \"$X\""}`, "/w", ""},
 		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '/w/a-very-long-dir/sub…", py, "/w", ""},
-		// what keeps its words: a path not quoted, two paths, a program another program looked for on the PATH, a command
-		// that may have run on a host it does not name, a quote too far from the mark or opened in a word
-		{"claude", "Bash", "Exit code 1 cat: /w/a.txt: No such file or directory", `{"command":"cat /w/a.txt"}`, "/w", "exec:cat: P: no such file or directory"},
+		// what keeps its words: two paths, a program another program looked for on the PATH, a command that may have run
+		// on a host it does not name, a quote too far from the mark or opened in a word
 		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '/w/a' -> '/w/b'", py, "/w",
 			"exec:filenotfounderror: [errno N] no such file or directory: Q"},
 		{"claude", "Bash", "Exit code 1 Error: ENOENT: no such file or directory, rename '/w/a' -> '/w/b'", `{"command":"node x.js"}`, "/w", "exec:error: enoent: no such file or directory"},
@@ -153,6 +152,76 @@ func TestACommandsMissIsKeyedByThePathItNames(t *testing.T) {
 	}
 	if k, ok := MistakeKey("tool-error", "Bash", "Bash: Exit code 2 ls: cannot access 'a.txt': No such file or directory"); !ok || k.String() != "miss:exec:a.txt" {
 		t.Errorf("a logged relative miss: %q, %v", k.String(), ok)
+	}
+}
+
+// A program that names the path it found no file at unquoted, "PROG: PATH: No such file or directory", is keyed by
+// that path as a quoted one is: rg, cat, wc, grep, cut, sha256sum, sed's "can't read", ugrep's "warning", the
+// shell's cd, bash's script and its line's redirection, with the same directory, remote and cut rules. What is no
+// path keeps its words: an option or a glob in its place, a path with a space, the program bash could not run by
+// its name, and a setup failure's message: a bad interpreter, a wrapper's own, a deleted working directory, two
+// paths.
+func TestACommandsUnquotedMissIsKeyedByItsPath(t *testing.T) {
+	t.Setenv("HOME", "/home/u")
+	for _, c := range []struct{ harness, tool, text, call, cwd, want string }{
+		// each program, by the path it names
+		{"claude", "Bash", "Exit code 2 rg: src/a.rs: No such file or directory (os error 2)", `{"command":"rg -n x src/a.rs"}`, "/w", "miss:exec:src/a.rs"},
+		{"claude", "Bash", "Exit code 1 cat: /x/a.txt: No such file or directory", `{"command":"cat /x/a.txt"}`, "/w", "miss:exec:/x/a.txt"},
+		{"claude", "Bash", "Exit code 1 wc: logs/b.log: No such file or directory", `{"command":"wc -l logs/b.log"}`, "/w", "miss:exec:logs/b.log"},
+		{"claude", "Bash", "Exit code 2 grep: ./config.json: No such file or directory", `{"command":"grep x ./config.json"}`, "/w", "miss:exec:config.json"},
+		{"claude", "Bash", "Exit code 2 /usr/bin/grep: crates/a.rs: No such file or directory", `{"command":"grep x crates/a.rs"}`, "/w", "miss:exec:crates/a.rs"},
+		{"claude", "Bash", "Exit code 1 cut: /x/d.txt: No such file or directory", `{"command":"cut -f1 /x/d.txt"}`, "/w", "miss:exec:/x/d.txt"},
+		{"claude", "Bash", "Exit code 1 sha256sum: dist/a.tar.gz: No such file or directory", `{"command":"sha256sum dist/a.tar.gz"}`, "/w", "miss:exec:dist/a.tar.gz"},
+		{"claude", "Bash", "Exit code 2 sed: can't read README.md: No such file or directory", `{"command":"sed -n 1,5p README.md"}`, "/w", "miss:exec:README.md"},
+		{"claude", "Bash", "Exit code 1 ugrep: warning: .config/x.json: No such file or directory", `{"command":"grep x .config/x.json"}`, "/w", "miss:exec:.config/x.json"},
+		{"claude", "Bash", "Exit code 1 bash: line 1: cd: review-1: No such file or directory", `{"command":"cd review-1 && ls"}`, "/w", "miss:exec:review-1"},
+		{"hermes", "terminal", `{"output": "/usr/bin/bash: line 5: cd: /x/agent: No such file or directory\n===", "exit_code": 1, "error": null}`, `{"command":"cd /x/agent; echo ==="}`, "/w",
+			"miss:exec:/x/agent"},
+		{"codex", "exec_command", "Process exited with code 127 Output: bash: scripts/check.sh: No such file or directory", `{"cmd":"bash scripts/check.sh"}`, "/w", "miss:exec:scripts/check.sh"},
+		{"claude", "Bash", "Exit code 127 bash: run.sh: No such file or directory", `{"command":"bash run.sh"}`, "/w", "miss:exec:run.sh"},
+		{"claude", "Bash", "Exit code 1 /bin/bash: line 3: /x/out/a.log: No such file or directory", `{"command":"run > /x/out/a.log"}`, "/w", "miss:exec:/x/out/a.log"},
+		{"claude", "Bash", "Exit code 1 bash: line 1: in.txt: No such file or directory", `{"command":"wc -l < in.txt"}`, "/w", "miss:exec:in.txt"},
+		// the quoted form's rules: the call's directory stripped, the home folded, a command the store cut, the mistakes
+		// log's, a host
+		{"claude", "Bash", "Exit code 1 cat: /w/wt1/scripts/c.py: No such file or directory", `{"command":"cat scripts/c.py"}`, "/w/wt1", "miss:exec:scripts/c.py"},
+		{"claude", "Bash", "Exit code 1 cat: /home/u/p/x.json: No such file or directory", `{"command":"cat ~/p/x.json"}`, "/w", "miss:exec:~/p/x.json"},
+		{"claude", "Bash", "Exit code 1 cat: a.txt: No such file or directory", `{"command":"cat a.txt && echo a long command the store cut`, "/w", "miss:exec:a.txt"},
+		{"claude", "Bash", "Exit code 1 cat: /x/a.txt: No such file or directory", "", "", "miss:exec:/x/a.txt"},
+		{"claude", "Bash", "Exit code 1 cat: /r/a: No such file or directory", `{"command":"ssh box cat /r/a"}`, "/w", "miss:exec:box:/r/a"},
+		{"claude", "Bash", "Exit code 1 scp: /r/x.log: No such file or directory", `{"command":"scp box:/r/x.log /w/"}`, "/w", "miss:exec:box:/r/x.log"},
+		// words: a host the command line does not name, two scp hosts
+		{"claude", "Bash", "Exit code 1 cat: /r/a: No such file or directory", `{"command":"ssh $H cat /r/a"}`, "/w", "exec:cat: P: no such file or directory"},
+		{"claude", "Bash", "Exit code 1 scp: /r/x.log: No such file or directory", `{"command":"scp a:/r/x.log b:/r/"}`, "/w", "exec:scp: P: no such file or directory"},
+		// words: no path in its place, a path with a space
+		{"claude", "Bash", "Exit code 2 rg: -g: No such file or directory (os error 2)", `{"command":"rg x -- -g"}`, "/w", "exec:rg: -g: no such file or directory"},
+		{"claude", "Bash", "Exit code 2 rg: *.sh: No such file or directory (os error 2)", `{"command":"rg x '*.sh'"}`, "/w", "exec:rg: *.sh: no such file or directory"},
+		{"claude", "Bash", "Exit code 2 sed: can't read my notes.md: No such file or directory", `{"command":"sed -n 1p my notes.md"}`, "/w", "exec:sed: can't read my P: no such file or directory"},
+		// words: a program bash could not run by its name, the call's or of a call that names none
+		{"claude", "Bash", "Exit code 127 bash: foo: No such file or directory", `{"command":"foo --x"}`, "/w", "exec:foo: no such file or directory"},
+		{"claude", "Bash", "Exit code 127 bash: line 1: foo: No such file or directory", `{"command":"cd /x && sudo foo"}`, "/w", "exec:foo: no such file or directory"},
+		{"claude", "Bash", "Exit code 127 bash: foo: No such file or directory", "", "/w", "exec:foo: no such file or directory"},
+		// words: a setup failure's message, a bad interpreter, a wrapper's own, a deleted working directory, two paths
+		{"claude", "Bash", "Exit code 126 bash: ./x: /bin/foo: bad interpreter: No such file or directory", `{"command":"./x"}`, "/w", "exec:interpreter: no such file or directory"},
+		{"claude", "Bash", "Exit code 127 env: foo: No such file or directory", `{"command":"env foo"}`, "/w", "exec:foo: no such file or directory"},
+		{"claude", "Bash", "Exit code 127 timeout: foo: No such file or directory", `{"command":"timeout 5 foo"}`, "/w", "exec:foo: no such file or directory"},
+		{"claude", "Bash", "Exit code 127 nohup: foo: No such file or directory", `{"command":"nohup foo"}`, "/w", "exec:foo: no such file or directory"},
+		{"claude", "Bash", "Exit code 1 shell-init: error retrieving current directory: getcwd: cannot access parent directories: No such file or directory",
+			`{"command":"ls"}`, "/w", "exec:directories: no such file or directory"},
+		{"claude", "Bash", "Exit code 1 cd: error retrieving current directory: getcwd: cannot access parent directories: No such file or directory",
+			`{"command":"cd ."}`, "/w", "exec:cd: error retrieving current directory: getcwd: cannot access parent directories: no such file or directory"},
+		{"claude", "Bash", "Exit code 1 mv: rename /x/a to /x/b: No such file or directory", `{"command":"mv /x/a /x/b"}`, "/w", "exec:mv: rename P to P: no such file or directory"},
+	} {
+		k, ok := failureKey(c.harness, c.tool, c.text, store.Call{Input: c.call, Cwd: c.cwd})
+		got := ""
+		if ok {
+			got = k.String()
+		}
+		if got != c.want {
+			t.Errorf("%s %s %q, call %q in %q:\n got %q\nwant %q", c.harness, c.tool, c.text, c.call, c.cwd, got, c.want)
+		}
+	}
+	if k, ok := MistakeKey("tool-error", "Bash", "Bash: Exit code 1 sed: can't read a.txt: No such file or directory"); !ok || k.String() != "miss:exec:a.txt" {
+		t.Errorf("a logged unquoted miss: %q, %v", k.String(), ok)
 	}
 }
 
@@ -263,6 +332,17 @@ func TestACommandsMissRecursOnlyByItsPath(t *testing.T) {
 		missingIn("s2", onOther, "/w/a.json", "/x", t0.Add(2*time.Hour)))...)
 	if fs, err := (Failures{}).Detect(ctx, st, week()); err != nil || len(fs) != 0 {
 		t.Fatalf("three remote paths: %v, %v", signatures(fs), err)
+	}
+	// three misses of three paths that cat names unquoted are three keys, where their words were one
+	st = testStore(t)
+	for i, p := range []string{"/w/a.txt", "/w/b.txt", "c.txt"} {
+		at := t0.Add(time.Duration(i) * time.Hour)
+		id := "cat-" + string(rune('a'+i))
+		put(t, st, call("s"+string(rune('1'+i%2)), "Bash", id, `{"command":"cat `+p+`"}`, at),
+			result("s"+string(rune('1'+i%2)), "Bash", id, "Exit code 1 cat: "+p+": No such file or directory", at.Add(time.Second)))
+	}
+	if fs, err := (Failures{}).Detect(ctx, st, week()); err != nil || len(fs) != 0 {
+		t.Fatalf("three unquoted paths: %v, %v", signatures(fs), err)
 	}
 
 	for _, tc := range []struct {
