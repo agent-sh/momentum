@@ -607,7 +607,8 @@ func (r *reader) loadTools(ctx context.Context, t *thread, from time.Time) error
 	t.tools, t.toolsFrom = true, from
 	t.calls, t.done = map[string]store.Event{}, map[string]bool{}
 	if !from.IsZero() && recordsAgain[t.harness] {
-		// a call of the range the harness recorded again after its result came before the range made nothing more
+		// a call the harness recorded again after its result came before the range made nothing more, the copy's call
+		// in the range or just before it with its result in it
 		ids, err := r.st.EarlierResults(ctx, t.id, from, tools.Until)
 		if err != nil {
 			return err

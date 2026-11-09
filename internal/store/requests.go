@@ -241,9 +241,9 @@ func (s *Store) ThreadEvents(ctx context.Context, session string, read ThreadRea
 	return rows.Err()
 }
 
-// EarlierResults are the tool ids of a session's calls in [since, until) (until zero: no end) whose results the
-// session recorded before since: calls a harness recorded again, which made nothing more. One query, on the ids of
-// the range's calls.
+// EarlierResults are the tool ids of a session's calls and results in [since, until) (until zero: no end) whose
+// results the session recorded before since: calls a harness recorded again, which made nothing more, the copy's
+// call in the range or before it with its result in it. One query, on the ids of the range's calls and results.
 func (s *Store) EarlierResults(ctx context.Context, session string, since, until time.Time) ([]string, error) {
 	const toolID = `CASE WHEN json_valid(meta) THEN json_extract(meta, '$.tool_id') END`
 	end := ""
@@ -254,7 +254,7 @@ func (s *Store) EarlierResults(ctx context.Context, session string, since, until
 	}
 	args = append(args, session, Transcripts, since.UnixMilli())
 	return strings1(s.db.QueryContext(ctx, `WITH ids(id) AS (SELECT DISTINCT `+toolID+` FROM events INDEXED BY events_session
-	    WHERE session = ? AND source = ? AND ts >= ?`+end+` AND kind = 'tool_call')
+	    WHERE session = ? AND source = ? AND ts >= ?`+end+` AND kind IN ('tool_call', 'tool_result'))
 	  SELECT DISTINCT `+toolID+` FROM events INDEXED BY events_session WHERE session = ? AND source = ? AND ts < ?
 	    AND kind = 'tool_result' AND `+toolID+` IN (SELECT id FROM ids WHERE id IS NOT NULL)`, args...))
 }

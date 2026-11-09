@@ -89,6 +89,47 @@ func TestRequestHandoffAndList(t *testing.T) {
 	}
 }
 
+// A request whose last turn and commit are before the window, and that only a read touched since, is ready by the
+// commit the list reads back for its state: the commit counts in no window it is not in.
+func TestResultsInWindowCountsTheWindowsOnly(t *testing.T) {
+	t.Setenv("MOMENTUM_HOME", t.TempDir())
+	t.Setenv("MOMENTUM_CONFIG", t.TempDir())
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	st, err := store.Open(paths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev := func(n int, kind string, actor store.Actor, at time.Time, tool, summary, meta string) store.Event {
+		return store.Event{Source: store.Transcripts, SourceKey: fmt.Sprintf("s-win.jsonl@%012d#000", n), TS: at, Session: "s-win-0001",
+			Harness: "claude", Cwd: "/work/win", Actor: actor, Kind: kind, Tool: tool, Summary: summary, Meta: meta}
+	}
+	evs := []store.Event{
+		ev(1, "owner_text", store.ActorOwner, base, "", "rename the flag", `{"input_kind":"typed"}`),
+		ev(2, "tool_call", store.ActorAgent, base.Add(time.Minute), "Bash", `{"command":"git commit -am rename"}`, `{"tool_id":"c1"}`),
+		ev(3, "tool_result", store.ActorTool, base.Add(time.Minute+time.Second), "Bash", "[main 4b5c6d7] Rename the flag\n 1 file changed", `{"tool_id":"c1"}`),
+		ev(4, "tool_call", store.ActorAgent, base.Add(40*time.Minute), "Read", `{"file_path":"/work/win/flag.go"}`, `{"tool_id":"c2"}`),
+		{Source: store.Sessions, SourceKey: "s-win-0001@1", TS: base.Add(41 * time.Minute), Session: "s-win-0001", Harness: "claude",
+			Actor: store.ActorHarness, Kind: "phase", Meta: `{"from":"working","to":"idle"}`},
+	}
+	if _, err := st.Put(context.Background(), evs); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	for _, c := range []struct {
+		since string
+		n     int
+	}{{base.Add(30 * time.Minute).Format(time.RFC3339), 0}, {"1d", 1}} {
+		code, out, errOut := momentum("request", "list", "--since", c.since, "--json")
+		var list struct {
+			Requests []requestJSON `json:"requests"`
+		}
+		if code != 0 || json.Unmarshal([]byte(out), &list) != nil || len(list.Requests) != 1 || list.Requests[0].State != "ready" ||
+			list.Requests[0].ResultsInWindow != c.n {
+			t.Errorf("since %s: exit %d %q %s", c.since, code, out, errOut)
+		}
+	}
+}
+
 // Every command line a handoff prints runs as printed: a shell (bash) parses each into its words, and its id lines
 // are its handoff, its evidence lines evidence show commands the CLI takes.
 func TestEveryHandoffCommandLineRuns(t *testing.T) {
