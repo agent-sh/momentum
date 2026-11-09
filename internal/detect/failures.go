@@ -466,7 +466,7 @@ const (
 type FailureKey struct {
 	Origin string // guard:NAME, harness:HARNESS, turn:HARNESS, tool:TOOL, mcp:SERVER, exec, model:refusal, miss:TOOL, miss:exec
 	Text   string
-	host   string // a command's miss on another host, the host its command line names (remoteHost), till failureKey keys it
+	host   string // a command's miss on another host, the host its command line names (remoteHost) or unknownHost, till failureKey keys it
 }
 
 func (k FailureKey) String() string { return k.Origin + ":" + k.Text }
@@ -474,6 +474,10 @@ func (k FailureKey) String() string { return k.Origin + ":" + k.Text }
 // execMiss is the origin of a command's message that says no file is at the path it names (quotedMiss). No read tool
 // is named exec (readTools), so no read's miss has it.
 const execMiss = "miss:exec"
+
+// unknownHost stands for the host of a command's miss that may have run on another host its command line does not
+// name (remote). No host's name is it (hostNameRe), so its paths never meet a named host's or this host's.
+const unknownHost = "?"
 
 // missed says the key is a read's that found no file: its text is the path it missed. A command's (execMiss) is not
 // a read's: its call names no file for a write to clear.
@@ -599,8 +603,8 @@ var (
 //
 // A failed command whose message says no file is at a path it names in quotes (quotedMiss), or unquoted after its
 // program's name (unquotedMiss), is keyed miss:exec by that path (commandMissed, missedPath), for the same reason,
-// and one of a command that ran on another host by that host and path (remote). One whose path is empty or cut short
-// says nothing to key it by.
+// and one of a command that ran on another host by that host and path (remote), or by unknownHost and the path when
+// its command line does not name the host. One whose path is empty or cut short says nothing to key it by.
 func FailureOf(harness, tool, text, call string) (FailureKey, bool) {
 	return failureKey(harness, tool, text, store.Call{Input: call})
 }
@@ -679,7 +683,7 @@ var (
 )
 
 // remote says a path a shell call's output names may be another host's (far), and that host when its command line
-// names it (remoteHost), so its message is keyed by that host and path; one far with no host keeps its words. Far:
+// names it (remoteHost), so its message is keyed by that host and path; one far with no host, by unknownHost. Far:
 //   - its command's text (its command line as the store keeps it, else its whole input, as Codex's exec script)
 //     reaches another host (hops);
 //   - its input names no command: a write to a running command's stdin or a poll of its output (Codex's
@@ -1114,7 +1118,7 @@ var tailRe = regexp.MustCompile(`^:\s+([^\s,;]{1,40})`)
 // (quotedMiss), or unquoted after its program's name or zsh's mark (unquotedMiss), is no message of words: its key
 // is execMiss, its text that path as the message names it, which failureKey keys as commandMissed says. A call that
 // may have run on another host (remote) is keyed by that host and the path when its command line names the host,
-// else by its words.
+// else by unknownHost and the path: its words would merge every path into one.
 func execKey(out, call string) (FailureKey, bool) {
 	programs := callPrograms(call)
 	out = strings.Join(strings.Fields(out), " ")
@@ -1130,12 +1134,14 @@ func execKey(out, call string) (FailureKey, bool) {
 		p, ok = unquotedMiss(out, loc, programs)
 	}
 	if ok {
-		switch host, far := remote(call, out[:loc[0]]); {
-		case !far:
+		host, far := remote(call, out[:loc[0]])
+		if !far {
 			return FailureKey{Origin: execMiss, Text: p}, true
-		case host != "":
-			return FailureKey{Origin: execMiss, Text: p, host: host}, true
 		}
+		if host == "" {
+			host = unknownHost
+		}
+		return FailureKey{Origin: execMiss, Text: p, host: host}, true
 	}
 	before, mark, after := out[:loc[0]], markText(out[loc[0]:loc[1]]), out[loc[1]:]
 	if u, ok := strings.CutPrefix(strings.ToLower(out[loc[0]:loc[1]]), "usage: "); ok { // a usage message names its program first, by its path or its name

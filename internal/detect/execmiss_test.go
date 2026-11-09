@@ -15,8 +15,8 @@ import (
 // ran in (its input's workdir or cwd, else the call's own) is keyed by its part below that directory; a relative one
 // is keyed as the message spells it, whatever the command did before. An empty path and one the store cut short key
 // nothing. A message that names two paths, or a program that another (a wrapper, Python's subprocess, strace, Deno)
-// could not find keeps its words, and so does one from a command that may have run on another host that its command
-// line does not name.
+// could not find keeps its words. One from a command that may have run on another host that its command line does
+// not name is keyed by the path under ?.
 func TestACommandsMissIsKeyedByThePathItNames(t *testing.T) {
 	t.Setenv("HOME", "/home/u")
 	const py = `{"command":"python3 run.py"}`
@@ -92,8 +92,7 @@ func TestACommandsMissIsKeyedByThePathItNames(t *testing.T) {
 		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: ''", py, "/w", ""},
 		{"claude", "Bash", "Exit code 2 ls: cannot access '': No such file or directory", `{"command":"ls \"$X\""}`, "/w", ""},
 		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '/w/a-very-long-dir/sub…", py, "/w", ""},
-		// what keeps its words: two paths, a program another program looked for on the PATH, a command that may have run
-		// on a host it does not name, a quote too far from the mark or opened in a word
+		// what keeps its words: two paths, a program another program looked for on the PATH
 		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '/w/a' -> '/w/b'", py, "/w",
 			"exec:filenotfounderror: [errno N] no such file or directory: Q"},
 		{"claude", "Bash", "Exit code 1 Error: ENOENT: no such file or directory, rename '/w/a' -> '/w/b'", `{"command":"node x.js"}`, "/w", "exec:error: enoent: no such file or directory"},
@@ -113,25 +112,18 @@ func TestACommandsMissIsKeyedByThePathItNames(t *testing.T) {
 		{"claude", "Bash", "Exit code 1 strace: Can't stat 'foo': No such file or directory", `{"command":"strace -f foo"}`, "/w", "exec:strace: can't stat Q: no such file or directory"},
 		{"claude", "Bash", "Exit code 1 error: Uncaught (in promise) NotFound: Failed to spawn 'foo': No such file or directory (os error 2)", `{"command":"deno run x.ts"}`, "/w",
 			"exec:notfound: failed to spawn Q: no such file or directory"},
-		{"claude", "Bash", `Exit code 11 rsync: [Receiver] mkdir "/root/x" failed: No such file or directory (2)`, `{"command":"rsync -az -e \"ssh -o BatchMode=yes\" /w/x /root/x"}`, "/w",
-			"exec:rsync: [receiver] mkdir Q failed: no such file or directory"},
-		{"claude", "Bash", `Exit code 11 rsync: [Receiver] mkdir "/root/x" failed: No such file or directory (2)`, `{"command":"rsync -avze sshpass /w/x /root/x"}`, "/w",
-			"exec:rsync: [receiver] mkdir Q failed: no such file or directory"},
-		{"claude", "Bash", `Exit code 11 rsync: [Receiver] mkdir "/root/x" failed: No such file or directory (2)`, `{"command":"rsync --rsh=sshpass /w/x /root/x"}`, "/w",
-			"exec:rsync: [receiver] mkdir Q failed: no such file or directory"},
-		{"claude", "Bash", `Exit code 11 rsync: [Receiver] mkdir "/root/x" failed: No such file or directory (2)`, `{"command":"cd /w && rsync -a x \"root@box:/root/x/\""}`, "/w",
-			"exec:rsync: [receiver] mkdir Q failed: no such file or directory"},
-		{"claude", "Bash", `Exit code 1 sftp: cannot access '/root/x': No such file or directory`, `{"command":"echo get /root/x | sftp -b - box"}`, "/w",
-			"exec:sftp: cannot access Q: no such file or directory"},
-		{"claude", "Bash", "Exit code 128 fatal: cannot change to '/workspace/a': No such file or directory", `{"command":"GIT_SSH_COMMAND=\"ssh -i k\" git -C /workspace/a fetch"}`, "/w",
-			"exec:fatal: cannot change to Q: no such file or directory"},
-		{"codex", "exec", "Process exited with code 2 Output: ls: cannot access '/workspace/a': No such file or directory", `text(await tools.exec_command({cmd:"ssh box ls /workspace/a"}))`, "/w",
-			"exec:ls: cannot access Q: no such file or directory"},
-		{"codex", "write_stdin", "Process exited with code 2 Output: ls: cannot access '/workspace/a': No such file or directory", `{"session_id":3,"chars":"ls /workspace/a\n"}`, "/w",
-			"exec:ls: cannot access Q: no such file or directory"},
-		{"claude", "bash_output", "ls: cannot access '/workspace/a': No such file or directory", `{"bash_id":"b1"}`, "/w", "exec:ls: cannot access Q: no such file or directory"},
-		{"claude", "Bash", "Exit code 2 ls: cannot access '/workspace/a': No such file or directory", `{"command":"cat > x <<'EOF'\nls\nEOF\nssh box sh < x"}`, "/w",
-			"exec:ls: cannot access Q: no such file or directory"},
+		// under ?, which no host's name is: a command that may have run on a host it does not name
+		{"claude", "Bash", `Exit code 11 rsync: [Receiver] mkdir "/root/x" failed: No such file or directory (2)`, `{"command":"rsync -az -e \"ssh -o BatchMode=yes\" /w/x /root/x"}`, "/w", "miss:exec:?:/root/x"},
+		{"claude", "Bash", `Exit code 11 rsync: [Receiver] mkdir "/root/x" failed: No such file or directory (2)`, `{"command":"rsync -avze sshpass /w/x /root/x"}`, "/w", "miss:exec:?:/root/x"},
+		{"claude", "Bash", `Exit code 11 rsync: [Receiver] mkdir "/root/x" failed: No such file or directory (2)`, `{"command":"rsync --rsh=sshpass /w/x /root/x"}`, "/w", "miss:exec:?:/root/x"},
+		{"claude", "Bash", `Exit code 11 rsync: [Receiver] mkdir "/root/x" failed: No such file or directory (2)`, `{"command":"cd /w && rsync -a x \"root@box:/root/x/\""}`, "/w", "miss:exec:?:/root/x"},
+		{"claude", "Bash", `Exit code 1 sftp: cannot access '/root/x': No such file or directory`, `{"command":"echo get /root/x | sftp -b - box"}`, "/w", "miss:exec:?:/root/x"},
+		{"claude", "Bash", "Exit code 128 fatal: cannot change to '/workspace/a': No such file or directory", `{"command":"GIT_SSH_COMMAND=\"ssh -i k\" git -C /workspace/a fetch"}`, "/w", "miss:exec:?:/workspace/a"},
+		{"codex", "exec", "Process exited with code 2 Output: ls: cannot access '/workspace/a': No such file or directory", `text(await tools.exec_command({cmd:"ssh box ls /workspace/a"}))`, "/w", "miss:exec:?:/workspace/a"},
+		{"codex", "write_stdin", "Process exited with code 2 Output: ls: cannot access '/workspace/a': No such file or directory", `{"session_id":3,"chars":"ls /workspace/a\n"}`, "/w", "miss:exec:?:/workspace/a"},
+		{"claude", "bash_output", "ls: cannot access '/workspace/a': No such file or directory", `{"bash_id":"b1"}`, "/w", "miss:exec:?:/workspace/a"},
+		{"claude", "Bash", "Exit code 2 ls: cannot access '/workspace/a': No such file or directory", `{"command":"cat > x <<'EOF'\nls\nEOF\nssh box sh < x"}`, "/w", "miss:exec:?:/workspace/a"},
+		// words: a quote too far from the mark or opened in a word
 		{"claude", "Bash", "Exit code 1 waiting for 'Allow once' clip-2.mp4: No such file or directory", `{"command":"run"}`, "/w", "exec:clip-N.mpN: no such file or directory"},
 		{"claude", "Bash", "Exit code 1 x 'a.txt' one two three four: No such file or directory", `{"command":"x"}`, "/w", "exec:four: no such file or directory"},
 		{"claude", "Bash", "Exit code 1 it can't open: No such file or directory", `{"command":"x"}`, "/w", "exec:open: no such file or directory"},
@@ -211,9 +203,10 @@ func TestACommandsUnquotedMissIsKeyedByItsPath(t *testing.T) {
 		{"claude", "Bash", "Exit code 127 (eval):1: no such file or directory: /home/u/p/run.sh", `{"command":"~/p/run.sh"}`, "/w", "miss:exec:~/p/run.sh"},
 		{"codex", "exec_command", "Process exited with code 1 Output: zsh:cd:1: no such file or directory: /r/x", `{"cmd":"ssh box 'cd /r/x && ls'"}`, "/w", "miss:exec:box:/r/x"},
 		{"claude", "Bash", "Exit code 1 (eval):1: no such file or directory: /x/out/a-long-na…", `{"command":"run > /x/out/a-long-name.log"}`, "/w", ""},
-		// words: a host the command line does not name, two scp hosts
-		{"claude", "Bash", "Exit code 1 cat: /r/a: No such file or directory", `{"command":"ssh $H cat /r/a"}`, "/w", "exec:cat: P: no such file or directory"},
-		{"claude", "Bash", "Exit code 1 scp: /r/x.log: No such file or directory", `{"command":"scp a:/r/x.log b:/r/"}`, "/w", "exec:scp: P: no such file or directory"},
+		// under ?: a host the command line does not name, a second command, two scp hosts
+		{"claude", "Bash", "Exit code 1 cat: /r/a: No such file or directory", `{"command":"ssh $H cat /r/a"}`, "/w", "miss:exec:?:/r/a"},
+		{"claude", "Bash", "Exit code 1 cat: /r/b: No such file or directory", `{"command":"uptime; ssh box cat /r/b"}`, "/w", "miss:exec:?:/r/b"},
+		{"claude", "Bash", "Exit code 1 scp: /r/x.log: No such file or directory", `{"command":"scp a:/r/x.log b:/r/"}`, "/w", "miss:exec:?:/r/x.log"},
 		// words: no path in its place, a path with a space
 		{"claude", "Bash", "Exit code 2 rg: -g: No such file or directory (os error 2)", `{"command":"rg x -- -g"}`, "/w", "exec:rg: -g: no such file or directory"},
 		{"claude", "Bash", "Exit code 2 rg: *.sh: No such file or directory (os error 2)", `{"command":"rg x '*.sh'"}`, "/w", "exec:rg: *.sh: no such file or directory"},
@@ -257,11 +250,11 @@ func TestACommandsUnquotedMissIsKeyedByItsPath(t *testing.T) {
 // A miss of a command that ran on another host is keyed by that host, as its command line names it, and the path: a
 // plain ssh's host past its options, scp's or rsync's host:path operand when the message is that host's side. The
 // path is cleaned, but no directory of this host's is stripped from it. A command line that does not name the host
-// keeps its words.
+// is keyed by the path under ?, which no host's name is.
 func TestARemoteMissIsKeyedByItsHostAndPath(t *testing.T) {
 	t.Setenv("HOME", "/home/u")
 	const ls = "Exit code 2 ls: cannot access '/w/a': No such file or directory"
-	const words = "exec:ls: cannot access Q: no such file or directory"
+	const unknown = "miss:exec:?:/w/a"
 	for _, c := range []struct{ harness, tool, text, call, want string }{
 		// ssh: the first word past its options and their values, its user@ off
 		{"claude", "Bash", ls, `{"command":"ssh box 'ls /w/a'"}`, "miss:exec:box:/w/a"},
@@ -288,33 +281,33 @@ func TestARemoteMissIsKeyedByItsHostAndPath(t *testing.T) {
 		// an ssh option that takes a value is skipped, and so is a value rsync's short options take
 		{"claude", "Bash", ls, `{"command":"ssh -e none box ls /w/a"}`, "miss:exec:box:/w/a"},
 		{"claude", "Bash", `Exit code 11 rsync: [Receiver] mkdir "/r/x" failed: No such file or directory (2)`, `{"command":"rsync -e ssh -avz /w/x box:/r/"}`, "miss:exec:box:/r/x"},
-		// words: a host from a variable, a here-document or a file on ssh's stdin, a pipe, a second command, ssh in a
-		// script, an ssh with no command, one whose command goes on to a third host
-		{"claude", "Bash", ls, `{"command":"ssh $H 'ls /w/a'"}`, words},
-		{"claude", "Bash", ls, `{"command":"ssh \"${H}\" 'ls /w/a'"}`, words},
-		{"claude", "Bash", ls, `{"command":"ssh box bash <<'EOF'\nls /w/a\nEOF"}`, words},
-		{"claude", "Bash", ls, `{"command":"ssh box sh < x.sh"}`, words},
-		{"claude", "Bash", ls, `{"command":"ssh box 'ls /w/a' | tail -1"}`, words},
-		{"claude", "Bash", ls, `{"command":"ssh box 'ls /w/b'; ls /w/a"}`, words},
-		{"claude", "Bash", ls, `{"command":"ssh box 'ls /w/b'\nls /w/a"}`, words},
-		{"claude", "Bash", ls, `{"command":"ssh box ls $(cat /w/list)"}`, words},
-		{"claude", "Bash", ls, `{"command":"bash -c \"ssh box ls /w/a\""}`, words},
-		{"claude", "Bash", ls, `{"command":"ssh -o BatchMode=yes box"}`, words},
-		{"claude", "Bash", `Exit code 11 rsync: [Receiver] mkdir "/w/a" failed: No such file or directory (2)`, `{"command":"ssh box 'rsync -a /w/x other:/w/a'"}`,
-			"exec:failed: no such file or directory"},
-		{"claude", "Bash", ls, `{"command":"ssh -J jump box 'ssh other ls /w/a'"}`, words},
-		// words: scp's or rsync's message of this host's side, or of no side, and two hosts
-		{"claude", "Bash", `Exit code 1 scp: stat local "/w/y": No such file or directory`, `{"command":"scp /w/y box:/r/"}`, "exec:scp: stat local Q: no such file or directory"},
-		{"claude", "Bash", `Exit code 1 scp: dest open "/y": No such file or directory`, `{"command":"scp a:/x b:/"}`, "exec:scp: dest open Q: no such file or directory"},
-		{"claude", "Bash", `Exit code 23 rsync: [sender] link_stat "/w/src" failed: No such file or directory (2)`, `{"command":"rsync -a /w/src box:/r/"}`,
-			"exec:rsync: [sender] link_stat Q failed: no such file or directory"},
-		{"claude", "Bash", `Exit code 11 rsync: [Receiver] mkdir "/w/dst" failed: No such file or directory (2)`, `{"command":"rsync -a box:/r/src /w/dst/"}`,
-			"exec:rsync: [receiver] mkdir Q failed: no such file or directory"},
-		{"claude", "Bash", `Exit code 23 rsync: change_dir "/r/src" failed: No such file or directory (2)`, `{"command":"rsync -a box:/r/src /w/dst"}`,
-			"exec:rsync: change_dir Q failed: no such file or directory"},
-		// words: an option after rsync's operands, whose value would read as one, leaves the sides unknown
-		{"claude", "Bash", `Exit code 23 rsync: [sender] link_stat "/w/x" failed: No such file or directory (2)`, `{"command":"rsync -a /w/x box:/r/ --exclude .git"}`,
-			"exec:rsync: [sender] link_stat Q failed: no such file or directory"},
+		// a host the command line does not say: from a variable, a here-document or a file on ssh's stdin, a pipe, a
+		// second command, ssh in a script, an ssh with no command, one whose command goes on to a third host
+		{"claude", "Bash", ls, `{"command":"ssh $H 'ls /w/a'"}`, unknown},
+		{"claude", "Bash", ls, `{"command":"ssh \"${H}\" 'ls /w/a'"}`, unknown},
+		{"claude", "Bash", ls, `{"command":"ssh box bash <<'EOF'\nls /w/a\nEOF"}`, unknown},
+		{"claude", "Bash", ls, `{"command":"ssh box sh < x.sh"}`, unknown},
+		{"claude", "Bash", ls, `{"command":"ssh box 'ls /w/a' | tail -1"}`, unknown},
+		{"claude", "Bash", ls, `{"command":"ssh box 'ls /w/b'; ls /w/a"}`, unknown},
+		{"claude", "Bash", ls, `{"command":"ssh box 'ls /w/b'\nls /w/a"}`, unknown},
+		{"claude", "Bash", ls, `{"command":"ssh box ls $(cat /w/list)"}`, unknown},
+		{"claude", "Bash", ls, `{"command":"bash -c \"ssh box ls /w/a\""}`, unknown},
+		{"claude", "Bash", ls, `{"command":"ssh -o BatchMode=yes box"}`, unknown},
+		{"claude", "Bash", `Exit code 11 rsync: [Receiver] mkdir "/w/a" failed: No such file or directory (2)`, `{"command":"ssh box 'rsync -a /w/x other:/w/a'"}`, unknown},
+		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '/w/a.json'", `{"command":"a.sh > /dev/null; ssh box 'python3 run.py'"}`,
+			"miss:exec:?:/w/a.json"},
+		{"claude", "Bash", "Exit code 1 FileNotFoundError: [Errno 2] No such file or directory: '/w/b.json'", `{"command":"a.sh > /dev/null; ssh box 'python3 run.py'"}`,
+			"miss:exec:?:/w/b.json"},
+		{"claude", "Bash", ls, `{"command":"ssh -J jump box 'ssh other ls /w/a'"}`, unknown},
+		// under ?: scp's or rsync's message of this host's side, or of no side, and two hosts
+		{"claude", "Bash", `Exit code 1 scp: stat local "/w/y": No such file or directory`, `{"command":"scp /w/y box:/r/"}`, "miss:exec:?:/w/y"},
+		{"claude", "Bash", `Exit code 1 scp: stat local "/w/y": No such file or directory`, `{"command":"uptime; free -g; scp /w/y box:/r/"}`, "miss:exec:?:/w/y"},
+		{"claude", "Bash", `Exit code 1 scp: dest open "/y": No such file or directory`, `{"command":"scp a:/x b:/"}`, "miss:exec:?:/y"},
+		{"claude", "Bash", `Exit code 23 rsync: [sender] link_stat "/w/src" failed: No such file or directory (2)`, `{"command":"rsync -a /w/src box:/r/"}`, "miss:exec:?:/w/src"},
+		{"claude", "Bash", `Exit code 11 rsync: [Receiver] mkdir "/w/dst" failed: No such file or directory (2)`, `{"command":"rsync -a box:/r/src /w/dst/"}`, "miss:exec:?:/w/dst"},
+		{"claude", "Bash", `Exit code 23 rsync: change_dir "/r/src" failed: No such file or directory (2)`, `{"command":"rsync -a box:/r/src /w/dst"}`, "miss:exec:?:/r/src"},
+		// under ?: an option after rsync's operands, whose value would read as one, leaves the sides unknown
+		{"claude", "Bash", `Exit code 23 rsync: [sender] link_stat "/w/x" failed: No such file or directory (2)`, `{"command":"rsync -a /w/x box:/r/ --exclude .git"}`, "miss:exec:?:/w/x"},
 	} {
 		k, ok := failureKey(c.harness, c.tool, c.text, store.Call{Input: c.call, Cwd: "/w"})
 		got := ""
@@ -329,7 +322,8 @@ func TestARemoteMissIsKeyedByItsHostAndPath(t *testing.T) {
 
 // Two commands that miss two paths are two failures, where their words were one; the same path missed again, in
 // another session too, recurs, under its own title: a relative one from any directory, after a cd or in a command the
-// store cut, one script in three worktrees, by its part below each, and one path on a host, by that host and path.
+// store cut, one script in three worktrees, by its part below each, one path on a host, by that host and path, and
+// one path on a host no command line names, by that path under ?.
 func TestACommandsMissRecursOnlyByItsPath(t *testing.T) {
 	t.Setenv("HOME", "/home/u")
 	ctx := context.Background()
@@ -362,6 +356,16 @@ func TestACommandsMissRecursOnlyByItsPath(t *testing.T) {
 	if fs, err := (Failures{}).Detect(ctx, st, week()); err != nil || len(fs) != 0 {
 		t.Fatalf("three remote paths: %v, %v", signatures(fs), err)
 	}
+	// two misses of two paths after a second command, on a host the command line does not name, and one of a path here
+	// are three keys, where the two's words were one
+	const chained = `{"command":"a.sh > /dev/null; ssh box 'python3 run.py'"}`
+	st = testStore(t)
+	put(t, st, slices.Concat(missingIn("s1", chained, "/w/a.json", "/x", t0), missingIn("s2", chained, "/w/b.json", "/x", t0.Add(time.Hour)),
+		missing("s2", "/w/a.json", "/x", t0.Add(2*time.Hour)))...)
+	fs, err = Failures{Recur: Recur{Events: 1}}.Detect(ctx, st, week())
+	if got, want := signatures(fs), []string{"failures/v2:miss:exec:/w/a.json 1", "failures/v2:miss:exec:?:/w/a.json 1", "failures/v2:miss:exec:?:/w/b.json 1"}; err != nil || !slices.Equal(got, want) {
+		t.Fatalf("two paths on a host no command line names and one here: %v, %v, want %v", got, err, want)
+	}
 	// three misses of three paths that cat names unquoted are three keys, where their words were one
 	st = testStore(t)
 	for i, p := range []string{"/w/a.txt", "/w/b.txt", "c.txt"} {
@@ -388,6 +392,9 @@ func TestACommandsMissRecursOnlyByItsPath(t *testing.T) {
 		{"one path on a host", "box:/w/a.json", slices.Concat(missingIn("s1", onBox, "/w/a.json", "/w", t0),
 			missingIn("s1", `{"command":"ssh -p 22 u@box python3 run.py"}`, "/w/./a.json", "/x", t0.Add(time.Hour)),
 			missingIn("s2", `{"command":"timeout 30 ssh -n box 'python3 run.py' 2>&1"}`, "/w/a.json", "", t0.Add(2*time.Hour)))},
+		{"one path on a host no command line names", "?:/w/a.json", slices.Concat(missingIn("s1", chained, "/w/a.json", "/w", t0),
+			missingIn("s1", `{"command":"ssh $H python3 run.py"}`, "/w/./a.json", "/x", t0.Add(time.Hour)),
+			missingIn("s2", `{"command":"cat run.py | ssh box python3 -"}`, "/w/a.json", "", t0.Add(2*time.Hour)))},
 	} {
 		st = testStore(t)
 		put(t, st, tc.events...)
