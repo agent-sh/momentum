@@ -1269,18 +1269,21 @@ func quotedMiss(out string, loc []int) (string, bool) {
 
 // unquotedMissRe is the message of a program that names the one path it found no file at unquoted, up to the
 // mark's colon: the program by its name or its path, the words it opens with, and the path as one word. The
-// programs are the ones whose message recurs in this form: rg, cat, wc, grep, cut, sha256sum, scp, sed's "can't
-// read", ugrep's "warning", the shell's cd, and bash's own ("bash: PATH", "bash: line N: PATH").
-var unquotedMissRe = regexp.MustCompile(`(?:^|\s)(?:[^\s:]*/)?(?:(?:rg|cat|wc|grep|cut|sha256sum|scp|cd): |sed: can't read |ugrep: warning: |(bash)(?:: line \d+)?: )(\S+): $`)
+// programs are the ones whose message recurs in this form: rg (ripgrep 15's "rg: PATH: IO error for operation on
+// PATH" too), cat, wc, grep, cut, sha256sum, scp, sed's "can't read", ugrep's "warning", jq's "error: Could not open
+// file", the shell's cd, and bash's own ("bash: PATH", "bash: line N: PATH").
+var unquotedMissRe = regexp.MustCompile(`(?:^|\s)(?:[^\s:]*/)?(?:(?:rg|cat|wc|grep|cut|sha256sum|scp|cd): |rg: \S+: IO error for operation on |sed: can't read |` +
+	`ugrep: warning: |jq: error: Could not open file |(bash)(?:: line \d+)?: )(\S+): $`)
 
 // unquotedMiss is the path a command's message says no file is at when it names it unquoted, and whether it names
 // one: "PROG: PATH: No such file or directory" for a program of unquotedMissRe's. The path is one word that opens
 // with /, ~/ or a name's letter, digit, _ or . (./ and ../ too), so an option ("rg: -g: ") or a glob the shell did
-// not expand names none. Nor does bash's message when it names a program by a name with no slash, one of the
-// call's programs or of a call that names none: that is the command the shell could not run, which recurs under
-// one key, not an argument. Nor does a setup failure's message: a wrapper's own (env, timeout, nohup), whose program
-// is none of these, and a bad interpreter ("bash: ./x: /bin/foo: bad interpreter: "), a deleted working directory
-// ("getcwd: cannot access parent directories: ") or two paths, whose words stand between the program and the mark.
+// not expand names none, nor does an assignment ("PYTHONPATH=/x: "), which bash ran as a command from a variable's
+// expansion. Nor does bash's message when it names a program by a name with no slash, one of the call's programs or
+// of a call that names none: that is the command the shell could not run, which recurs under one key, not an
+// argument. Nor does a setup failure's message: a wrapper's own (env, timeout, nohup), whose program is none of
+// these, and a bad interpreter ("bash: ./x: /bin/foo: bad interpreter: "), a deleted working directory ("getcwd:
+// cannot access parent directories: ") or two paths, whose words stand between the program and the mark.
 func unquotedMiss(out string, loc []int, programs map[string]bool) (string, bool) {
 	if !strings.EqualFold(out[loc[0]:loc[1]], "no such file or directory") {
 		return "", false
@@ -1291,6 +1294,9 @@ func unquotedMiss(out string, loc []int, programs map[string]bool) (string, bool
 	}
 	p := m[2]
 	if r, _ := utf8.DecodeRuneInString(p); !(r == '/' || strings.HasPrefix(p, "~/") || r == '_' || r == '.' || unicode.IsLetter(r) || unicode.IsDigit(r)) {
+		return "", false
+	}
+	if assignRe.MatchString(p) {
 		return "", false
 	}
 	if m[1] != "" && !strings.Contains(p, "/") && (len(programs) == 0 || programs[strings.ToLower(p)]) {

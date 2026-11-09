@@ -156,16 +156,21 @@ func TestACommandsMissIsKeyedByThePathItNames(t *testing.T) {
 }
 
 // A program that names the path it found no file at unquoted, "PROG: PATH: No such file or directory", is keyed by
-// that path as a quoted one is: rg, cat, wc, grep, cut, sha256sum, sed's "can't read", ugrep's "warning", the
-// shell's cd, bash's script and its line's redirection, with the same directory, remote and cut rules. What is no
-// path keeps its words: an option or a glob in its place, a path with a space, the program bash could not run by
-// its name, and a setup failure's message: a bad interpreter, a wrapper's own, a deleted working directory, two
-// paths.
+// that path as a quoted one is: rg (ripgrep 15's IO error too), cat, wc, grep, cut, sha256sum, sed's "can't read",
+// ugrep's "warning", jq's "Could not open file", the shell's cd, bash's script and its line's redirection, with the
+// same directory, remote and cut rules. What is no path keeps its words: an option or a glob in its place, a path
+// with a space, an assignment bash ran as a command, the program bash could not run by its name, and a setup
+// failure's message: a bad interpreter, a wrapper's own, a deleted working directory, two paths.
 func TestACommandsUnquotedMissIsKeyedByItsPath(t *testing.T) {
 	t.Setenv("HOME", "/home/u")
 	for _, c := range []struct{ harness, tool, text, call, cwd, want string }{
 		// each program, by the path it names
 		{"claude", "Bash", "Exit code 2 rg: src/a.rs: No such file or directory (os error 2)", `{"command":"rg -n x src/a.rs"}`, "/w", "miss:exec:src/a.rs"},
+		{"claude", "Bash", "Exit code 2 rg: nosuchfile: IO error for operation on nosuchfile: No such file or directory (os error 2)", `{"command":"rg x nosuchfile"}`, "/w",
+			"miss:exec:nosuchfile"},
+		{"codex", "exec_command", "Process exited with code 2 Output: rg: /x/src/a.rs: IO error for operation on /x/src/a.rs: No such file or directory (os error 2)",
+			`{"cmd":"rg -n x /x/src/a.rs"}`, "/w", "miss:exec:/x/src/a.rs"},
+		{"claude", "Bash", "Exit code 2 jq: error: Could not open file /x/run.json: No such file or directory", `{"command":"jq . /x/run.json"}`, "/w", "miss:exec:/x/run.json"},
 		{"claude", "Bash", "Exit code 1 cat: /x/a.txt: No such file or directory", `{"command":"cat /x/a.txt"}`, "/w", "miss:exec:/x/a.txt"},
 		{"claude", "Bash", "Exit code 1 wc: logs/b.log: No such file or directory", `{"command":"wc -l logs/b.log"}`, "/w", "miss:exec:logs/b.log"},
 		{"claude", "Bash", "Exit code 2 grep: ./config.json: No such file or directory", `{"command":"grep x ./config.json"}`, "/w", "miss:exec:config.json"},
@@ -200,6 +205,9 @@ func TestACommandsUnquotedMissIsKeyedByItsPath(t *testing.T) {
 		{"claude", "Bash", "Exit code 127 bash: foo: No such file or directory", `{"command":"foo --x"}`, "/w", "exec:foo: no such file or directory"},
 		{"claude", "Bash", "Exit code 127 bash: line 1: foo: No such file or directory", `{"command":"cd /x && sudo foo"}`, "/w", "exec:foo: no such file or directory"},
 		{"claude", "Bash", "Exit code 127 bash: foo: No such file or directory", "", "/w", "exec:foo: no such file or directory"},
+		// words: an assignment bash ran as a command, from a variable's expansion
+		{"hermes", "terminal", `{"output": "/usr/bin/bash: line 5: PYTHONPATH=/x/y: No such file or directory", "exit_code": 127, "error": null}`,
+			`{"command":"GS=\"PYTHONPATH=/x/y python3 -m x\"; $GS --check"}`, "/w", "exec:no such file or directory"},
 		// words: a setup failure's message, a bad interpreter, a wrapper's own, a deleted working directory, two paths
 		{"claude", "Bash", "Exit code 126 bash: ./x: /bin/foo: bad interpreter: No such file or directory", `{"command":"./x"}`, "/w", "exec:interpreter: no such file or directory"},
 		{"claude", "Bash", "Exit code 127 env: foo: No such file or directory", `{"command":"env foo"}`, "/w", "exec:foo: no such file or directory"},
