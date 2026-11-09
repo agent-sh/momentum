@@ -1020,11 +1020,11 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 					continue
 				}
 			}
-			if where, err := r.heldForPerson(ctx, c, dry); err != nil {
+			if why, err := r.heldForPerson(ctx, c, dry); err != nil {
 				return nil, "", err
-			} else if where != "" {
+			} else if why != "" {
 				// a hold for a person takes no slot: the family's next workable case runs instead
-				passed = append(passed, c.ID+" held for a person: its fix needs "+where)
+				passed = append(passed, c.ID+" held "+why)
 				continue
 			}
 			pkg, had, _ := load() // the package as selection has it: a dry pass's settlement, else the one on disk

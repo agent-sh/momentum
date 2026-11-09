@@ -48,18 +48,20 @@ func HoldOf(c Case, log []CaseEntry) string {
 }
 
 // A build whose fix needs a path no change of the loop's may touch holds its case for a person: a "held for a person"
-// line with the path, the fix, why no change may touch the path, the case's episode and what its mechanism and fix
-// were, and a "person hold ended" line when the hold ends. A case in testing is held for a person while its newest
-// such line is a hold of its current episode, its mechanism and fix are what they were, and no later "set" line changed
-// its status: new evidence alone does not end it.
+// line with the path, the fix, why no change may touch the path, the case's episode, what its mechanism and fix were
+// and when the build started, and a "person hold ended" line when the hold ends. A case in testing is held for a
+// person while its newest such line is a hold of its current episode, its mechanism and fix are what they were, and no
+// "set" line dated after the build's start, or later in the log than the hold, changed its status: new evidence alone
+// does not end it. A line that cannot be read is a hold too, which any later "set" line ends.
 const (
 	ActionPersonHeld  = "held for a person"
 	ActionPersonEnded = "person hold ended"
 )
 
 // PersonHold is a hold for a person: the path the case's fix needs, the change a person makes there, why no change
-// of the loop's may touch the path, the episode of the build that answered, and the sums of the case's mechanism and
-// fix (its next test) the build worked from.
+// of the loop's may touch the path, the episode of the build that answered, the sums of the case's mechanism and fix
+// (its next test) the build worked from, and the build's start in Unix milliseconds (0 on a line kept before
+// holds had it). Unread marks a line that cannot be read, which holds all the same with none of its fields.
 type PersonHold struct {
 	Path         string `json:"path"`
 	Fix          string `json:"fix"`
@@ -67,6 +69,8 @@ type PersonHold struct {
 	Episode      int64  `json:"episode"`
 	MechanismSum string `json:"mechanism_sum"`
 	FixSum       string `json:"fix_sum"`
+	Started      int64  `json:"started,omitempty"`
+	Unread       bool   `json:"-"`
 }
 
 // NewPersonHold is the hold for a person a build of c answered: its episode and the sums of its mechanism and fix.
@@ -81,7 +85,12 @@ func textSum(text string) string {
 }
 
 // Why is the hold's reason as a case's held mark shows it.
-func (h PersonHold) Why() string { return "for a person: its fix needs " + h.Path }
+func (h PersonHold) Why() string {
+	if h.Unread {
+		return "for a person: its hold line cannot be read"
+	}
+	return "for a person: its fix needs " + h.Path
+}
 
 // PersonDetail is the detail of a "held for a person" line.
 func PersonDetail(h PersonHold) string {
@@ -95,45 +104,50 @@ func PersonDetail(h PersonHold) string {
 // LastPersonHold is a case's newest hold for a person whose end its log does not hold yet, whatever the case's
 // status or episode now: one that no longer stands (PersonHoldOf) is still to be ended.
 func LastPersonHold(log []CaseEntry) (PersonHold, bool) {
+	h, _, ok := lastPersonHold(log)
+	return h, ok
+}
+
+// lastPersonHold is LastPersonHold and the index of its line. A line that cannot be read, or names no path, is a
+// hold marked Unread.
+func lastPersonHold(log []CaseEntry) (PersonHold, int, bool) {
 	for i := len(log) - 1; i >= 0; i-- {
 		switch log[i].Action {
 		case ActionPersonEnded:
-			return PersonHold{}, false
+			return PersonHold{}, 0, false
 		case ActionPersonHeld:
 			var h PersonHold
 			if json.Unmarshal([]byte(log[i].Detail), &h) != nil || h.Path == "" {
-				return PersonHold{}, false
+				return PersonHold{Unread: true}, i, true
 			}
-			return h, true
+			return h, i, true
 		}
 	}
-	return PersonHold{}, false
+	return PersonHold{}, 0, false
 }
 
 // PersonHoldOf is the hold for a person a case in testing stands on, from its log: its newest such hold of its
-// current episode, with no end, the case's mechanism and fix as they were at it, and no later "set" line that changed
-// the case's status (updateCase names a status change first, so no title or other text it holds reads as one).
+// current episode, with no end, the case's mechanism and fix as they were at it, and no "set" line that changed the
+// case's status after the hold's build started or after the hold (updateCase names a status change first, so no title
+// or other text it holds reads as one). An unread hold stands until a later "set" line of any kind.
 func PersonHoldOf(c Case, log []CaseEntry) (PersonHold, bool) {
 	if c.Status != CaseTesting {
 		return PersonHold{}, false
 	}
-	for i := len(log) - 1; i >= 0; i-- {
-		switch log[i].Action {
-		case ActionPersonEnded:
+	h, at, ok := lastPersonHold(log)
+	if !ok || !h.Unread && (h.Episode != c.Episode || h.MechanismSum != textSum(c.Mechanism) || h.FixSum != textSum(c.NextTest)) {
+		return PersonHold{}, false
+	}
+	for i, e := range log {
+		if e.Action != "set" {
+			continue
+		}
+		after := i > at || h.Started != 0 && e.At.UnixMilli() > h.Started
+		if after && (h.Unread || strings.HasPrefix(e.Detail, "status ")) {
 			return PersonHold{}, false
-		case "set":
-			if strings.HasPrefix(log[i].Detail, "status ") {
-				return PersonHold{}, false
-			}
-		case ActionPersonHeld:
-			h, ok := LastPersonHold(log[:i+1])
-			if !ok || h.Episode != c.Episode || h.MechanismSum != textSum(c.Mechanism) || h.FixSum != textSum(c.NextTest) {
-				return PersonHold{}, false
-			}
-			return h, true
 		}
 	}
-	return PersonHold{}, false
+	return h, true
 }
 
 // A proposal for a hand landing is kept in the case's log too: a "proposed for a hand landing" line with its pull

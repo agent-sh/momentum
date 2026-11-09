@@ -18,13 +18,15 @@ import (
 
 // A build whose case's fix needs a path no change of the loop's may touch answers so instead of making a change: the
 // path and the change a person makes there (out_of_reach). The host checks the path against BASE and sorts it: one no
-// change may touch (PathScope refuses it, or the patch check would: Git's own directory, a path through a symlink or a
-// submodule of BASE) holds the case for a person, with a "held for a person" line in its log and a raised problem note
+// change may touch (PathScope refuses it, or the patch check would: Git's own directory, a symlink or a submodule of
+// BASE) holds the case for a person, with a "held for a person" line in its log and a raised problem note
 // that names the path and the fix. The run keeps its own outcome (store.RunOutOfReach), which the stop rule neither
 // counts nor stops at, and a held case takes no build slot. The hold stands until the case starts a new episode,
-// leaves testing, or a person changes its status, mechanism or fix (store.PersonHoldOf) or resolves its note; new
-// evidence alone does not end it. A path a change may touch, and one that is no path of the repository at BASE, are the build's refusals at
-// its report.
+// leaves testing, or a person changes its status (after the build started), mechanism or fix (store.PersonHoldOf) or
+// resolves its note; new evidence alone does not end it. A path a change may touch, and one that is no path of the
+// repository at BASE (a made-up path, a new file at the root, one under a submodule or a symlink out of the
+// repository), are the build's refusals at its report; a path through a symlink inside the repository is read as
+// its target.
 
 // OutOfReach is a build report's answer that the case's fix is out of the loop's reach: the path, from the
 // repository's root, and the change a person makes there.
@@ -35,12 +37,12 @@ type OutOfReach struct {
 
 const outOfReachSchema = `{"type":"object","additionalProperties":false,"required":["path","fix"],` +
 	`"description":"Only when the case's fix needs a path no change may touch (the build prompt names them) and no change in reach fixes the case: make no change and give this instead. The host reads only summary and this answer, checks the path against BASE, and the case waits for a person. A path a change may touch, or one BASE does not hold, refuses the build.",` +
-	`"properties":{"path":{"type":"string","description":"The path from the repository's root, such as .github/workflows/ci.yml: one BASE holds, or a new file in a directory BASE holds."},` +
+	`"properties":{"path":{"type":"string","description":"The path from the repository's root, such as .github/workflows/ci.yml: one BASE holds, or a new file in a directory below the root BASE holds."},` +
 	`"fix":{"type":"string","description":"The change a person makes there, in short sentences."}}}`
 
 // outOfReachBrief tells a build it may answer that its fix is out of reach.
 const outOfReachBrief = "When the case's fix needs a path no change may touch and nothing in reach fixes the case, make no change and answer out_of_reach: " +
-	"the path from the repository's root, one BASE holds or a new file in a directory it holds, and the change a person makes there. " +
+	"the path from the repository's root, one BASE holds or a new file in a directory below the root it holds, and the change a person makes there. " +
 	"The host checks the path, and the case waits for a person. A path a change may touch, or one BASE does not hold, refuses the build."
 
 // outOfReachPathMax bounds an answer's path, which the report refuses past it; outOfReachFixMax and
@@ -96,7 +98,7 @@ func (r *Runner) outOfReach(ctx context.Context, c store.Case, run store.LoopRun
 	case why == nil:
 		return stageFailureIn(ctx, res, "build report", refused("the out-of-reach path %s is one a change may touch: make the fix there", o.Path))
 	}
-	if err := r.holdForPerson(ctx, c, run.CaseEpisode, o, why); err != nil {
+	if err := r.holdForPerson(ctx, c, run, o, why); err != nil {
 		return stageFailureIn(ctx, res, "build propose", err)
 	}
 	r.logf("build %s: its fix needs %s, which no change may touch: the case waits for a person", c.ID, o.Path)
@@ -104,58 +106,99 @@ func (r *Runner) outOfReach(ctx context.Context, c store.Case, run store.LoopRun
 	return res, nil
 }
 
-// unreachable sorts an out-of-reach answer's path, name. why says why no change of the loop's may touch it: PathScope
-// refuses it, or the patch check would (a component that is Git's own directory, a path through a symlink or a
-// submodule of BASE, which the patch check refuses: checkBasePaths, patchPath); it is nil when a change may. refusal
-// says name is no path of the repository at BASE: BASE holds no such file or directory, it is no new file in a
-// directory BASE holds, and it is under no symlink or submodule there; a path in Git's own directory is read in the
-// checkout's. err is the host's error reading BASE.
+// unreachable sorts an out-of-reach answer's path, name, read through BASE's symlinks that point inside the
+// repository (throughLinks). why says why no change of the loop's may touch it: PathScope refuses it, or the patch
+// check would (a component that is Git's own directory, a symlink or a submodule of BASE, which the patch check
+// refuses: checkBasePaths, patchPath); it is nil when a change may. refusal says name is no path of the repository at
+// BASE (BASE holds no such file or directory, it is no new file in a directory below the root BASE holds, or it is
+// under a submodule or a symlink out of the repository, whose content BASE does not hold), or that it reads through a
+// symlink as a path a change may touch; a path in Git's own directory is read in the checkout's. err is the host's
+// error reading BASE.
 func (r *Runner) unreachable(ctx context.Context, p Package, name string) (why, refusal, err error) {
 	if p.Host == "" || p.BaseCommit == "" {
 		return nil, nil, errors.New("the package has no host clone and base commit; prepare it again")
 	}
-	base, err := r.Ship.treeEntries(r.Ship.gitContext(shipContext(ctx, p.Case)), p, p.BaseCommit)
+	gctx := r.Ship.gitContext(shipContext(ctx, p.Case))
+	base, err := r.Ship.treeEntries(gctx, p, p.BaseCommit)
 	if err != nil {
 		return nil, nil, fmt.Errorf("the base tree cannot be read: %v", err) // the host's, never a refusal of the build
 	}
-	parts := strings.Split(name, "/")
+	real, ok, err := r.throughLinks(gctx, p, base, name)
+	if err != nil {
+		return nil, nil, fmt.Errorf("the base tree cannot be read: %v", err)
+	}
+	if !ok {
+		return nil, refused("the out-of-reach path %s is under a submodule or a symlink out of the repository at BASE, whose content BASE does not hold: name the submodule or the symlink itself", name), nil
+	}
 	gitDir := false
-	for _, part := range parts {
+	for _, part := range strings.Split(real, "/") {
 		gitDir = gitDir || strings.EqualFold(part, ".git")
 	}
-	held := inBase(base, name)
-	if !held && strings.EqualFold(parts[0], ".git") {
-		if held, err = inGitDir(ctx, p.Dir, name); err != nil {
+	held := inBase(base, real)
+	if !held && strings.EqualFold(strings.Split(real, "/")[0], ".git") {
+		if held, err = inGitDir(ctx, p.Dir, real); err != nil {
 			return nil, nil, err
 		}
 	}
 	if !held {
-		return nil, refused("the out-of-reach path %s is no path of the repository at BASE, nor a new file in a directory BASE holds: name the path the fix needs", name), nil
+		return nil, refused("the out-of-reach path %s is no path of the repository at BASE, nor a new file in a directory below the root BASE holds: name the path the fix needs", name), nil
 	}
-	if _, scope := PathScope(Target{Repo: p.Repo}, []string{name}); scope != nil {
+	if _, scope := PathScope(Target{Repo: p.Repo}, []string{real}); scope != nil {
 		return scope, nil, nil
 	}
 	if gitDir {
-		return refused("%s is in Git's own directory, which no change touches", name), nil, nil
+		return refused("%s is in Git's own directory, which no change touches", real), nil, nil
 	}
-	if checkBasePaths(base, []string{name}) != nil {
-		return refused("%s is a symlink or a submodule of the repository, or a path through one, which no change touches", name), nil, nil
+	if checkBasePaths(base, []string{real}) != nil {
+		return refused("%s is a symlink or a submodule of the repository, which no change touches", real), nil, nil
+	}
+	if real != name {
+		return nil, refused("the out-of-reach path %s is %s through a symlink of BASE, which a change may touch: make the fix there", name, real), nil
 	}
 	return nil, nil, nil
 }
 
-// inBase says whether BASE's entries (Ship.treeEntries: its files, symlinks and submodules) hold name: as an entry, as
-// a directory, as a new file in a directory they hold (the root among them), or under a symlink or a submodule, whose
-// content BASE does not list.
+// linkHops bounds the symlinks throughLinks follows for one path, as the kernel bounds a lookup's.
+const linkHops = 40
+
+// throughLinks reads name as BASE does: a directory above it that is a symlink of BASE pointing inside the
+// repository is read as its target, link after link. ok is false when a directory above it is a submodule, or a
+// symlink pointing out of the repository or past linkHops links, whose content BASE does not hold. A symlink or a
+// submodule that is name itself stays, as the entry. err is the host's error reading a symlink's target.
+func (r *Runner) throughLinks(ctx context.Context, p Package, base map[string]treeEntry, name string) (string, bool, error) {
+	for hops := 0; hops <= linkHops; hops++ {
+		parts := strings.Split(name, "/")
+		link := ""
+		for i := 1; i < len(parts) && link == ""; i++ {
+			switch above := strings.Join(parts[:i], "/"); base[above].mode {
+			case "160000":
+				return "", false, nil
+			case "120000":
+				link = above
+			}
+		}
+		if link == "" {
+			return name, true, nil
+		}
+		target, err := r.Ship.git(ctx, p.Host, "cat-file", "blob", base[link].oid)
+		if err != nil {
+			return "", false, err
+		}
+		next := path.Join(path.Dir(link), target, strings.TrimPrefix(name, link+"/"))
+		if target == "" || path.IsAbs(target) || !filepath.IsLocal(next) || strings.Contains(next, `\`) {
+			return "", false, nil
+		}
+		name = next
+	}
+	return "", false, nil
+}
+
+// inBase says whether BASE's entries (Ship.treeEntries: its files, symlinks and submodules) hold name, a path with no
+// symlink or submodule above it (throughLinks): as an entry, as a directory, or as a new file in a directory below
+// the root they hold. A new file at the root is no path of BASE: no directory there tells a fix's file from a made-up one.
 func inBase(base map[string]treeEntry, name string) bool {
 	if _, ok := base[name]; ok {
 		return true
-	}
-	parts := strings.Split(name, "/")
-	for i := 1; i < len(parts); i++ {
-		if e, ok := base[strings.Join(parts[:i], "/")]; ok && (e.mode == "120000" || e.mode == "160000") {
-			return true
-		}
 	}
 	parent := path.Dir(name)
 	for entry := range base {
@@ -163,7 +206,7 @@ func inBase(base map[string]treeEntry, name string) bool {
 			return true
 		}
 	}
-	return parent == "."
+	return false
 }
 
 // inGitDir says whether the checkout at dir holds name, a path in Git's own directory (its first part is .git), as
@@ -212,16 +255,17 @@ func dirsAbove(root, name string) bool {
 }
 
 // holdForPerson holds a case for a person: the case log's "held for a person" line first, which stands as the hold,
-// then its raised problem note, naming the path and the fix. A note that cannot be put is logged: the next pass puts
-// a standing hold's note when it has none (heldForPerson).
-func (r *Runner) holdForPerson(ctx context.Context, c store.Case, episode int64, o OutOfReach, why error) error {
+// then its raised problem note, naming the path and the fix. The hold keeps the episode and start of the build that
+// answered, run, so a person's change of the case's status while it ran ends it (store.PersonHoldOf). A note that
+// cannot be put is logged: the next pass puts a standing hold's note when it has none (heldForPerson).
+func (r *Runner) holdForPerson(ctx context.Context, c store.Case, run store.LoopRun, o OutOfReach, why error) error {
 	texts, err := RedactAll(ctx, []string{o.Path, o.Fix, strings.TrimPrefix(why.Error(), ErrRefused.Error()+": ")})
 	if err != nil {
 		return err
 	}
 	h := store.NewPersonHold(c, plainClip(plain.Line(texts[0]), outOfReachPathMax), plainClip(plain.Line(texts[1]), outOfReachFixMax),
 		plainClip(plain.Line(texts[2]), outOfReachReasonMax))
-	h.Episode = episode
+	h.Episode, h.Started = run.CaseEpisode, run.Started.UnixMilli()
 	if err := r.Store.CaseNote(cleanedNote(ctx), c.ID, store.ActionPersonHeld, store.PersonDetail(h), "loop"); err != nil {
 		return err
 	}
@@ -231,20 +275,27 @@ func (r *Runner) holdForPerson(ctx context.Context, c store.Case, episode int64,
 	return nil
 }
 
-// putPersonNote puts the raised problem note of a case's hold for a person.
+// putPersonNote puts the raised problem note of a case's hold for a person; an unread hold's says its line cannot be
+// read.
 func (r *Runner) putPersonNote(ctx context.Context, caseID string, h store.PersonHold) error {
+	title := "The loop's build for case " + caseID + " needs a person: " + h.Path
+	detail := "Its fix is out of the loop's reach: " + sentence(h.Reason) + " The change to make in " + h.Path + ": " + sentence(h.Fix) +
+		" Make it and close the case. Resolving this note, changing the case's mechanism or fix, or sending it back to its investigation also ends the hold, and the case builds again; new evidence alone does not."
+	if h.Unread {
+		title = "The loop's build for case " + caseID + " needs a person: its hold line cannot be read"
+		detail = "The case's log holds a hold for a person that the loop cannot read, so the case does not build. Read the build's answer in the case's log, make the change it names and close the case. " +
+			"Resolving this note, changing the case, or sending it back to its investigation also ends the hold, and the case builds again; new evidence alone does not."
+	}
 	_, err := r.Store.PutNote(ctx, store.Note{ID: personNoteID(caseID, h.Path), Kind: store.NoteProblem, Importance: store.ImportanceNormal,
-		At: r.now(), Title: "The loop's build for case " + caseID + " needs a person: " + h.Path,
-		Detail: "Its fix is out of the loop's reach: " + sentence(h.Reason) + " The change to make in " + h.Path + ": " + sentence(h.Fix) +
-			" Make it and close the case. Resolving this note, changing the case's mechanism or fix, or sending it back to its investigation also ends the hold, and the case builds again; new evidence alone does not."})
+		At: r.now(), Title: title, Detail: detail})
 	return err
 }
 
-// heldForPerson is the path a case in testing waits on a person for (store.PersonHoldOf), or "", and the error of a
-// log it cannot read. A standing hold whose note was never put gets it. A hold that no longer stands (a new episode, a
-// person's change of the case), and one whose note a person resolved, get their end, and their notes are resolved,
-// before the case builds again; one whose end cannot be written is logged and ends all the same, and the next pass
-// writes it. A dry pass writes nothing.
+// heldForPerson is why a case in testing waits on a person (store.PersonHoldOf, PersonHold.Why), or "", and the error
+// of a log it cannot read. A standing hold whose note was never put gets it. A hold that no longer stands (a new
+// episode, a person's change of the case), and one whose note a person resolved, get their end, and their notes are
+// resolved, before the case builds again; one whose end cannot be written is logged and ends all the same, and the
+// next pass writes it. A dry pass writes nothing.
 func (r *Runner) heldForPerson(ctx context.Context, c store.Case, dry bool) (string, error) {
 	log, err := r.Store.CaseLog(ctx, c.ID)
 	if err != nil {
@@ -272,13 +323,13 @@ func (r *Runner) heldForPerson(ctx context.Context, c store.Case, dry bool) (str
 				r.logf("the person hold note of %s: %v", c.ID, err)
 			}
 		}
-		return h.Path, nil
+		return h.Why(), nil
 	}
 	if dry {
 		return "", nil
 	}
 	why := "a person changed the case's status, mechanism or fix"
-	if last.Episode != c.Episode {
+	if !last.Unread && last.Episode != c.Episode {
 		why = "the case is in a new episode"
 	}
 	if err := r.endPersonHold(ctx, c.ID, why); err != nil {

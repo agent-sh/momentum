@@ -330,38 +330,36 @@ func TestAnOutOfReachPathInReachIsTheBuildsRefusal(t *testing.T) {
 }
 
 // A path BASE does not hold, in a directory it does not hold, is the build's refusal, though no change may touch it
-// either: a made-up path gets no hold. A new file in a directory BASE holds is a path the fix may need.
+// either: a made-up path gets no hold, and neither does a new file at the root (Jenkinsfile, CI configuration a host
+// would run), which BASE cannot tell from a made-up one. A new file in a directory below the root BASE holds is a path
+// the fix may need.
 func TestAMadeUpPathIsTheBuildsRefusal(t *testing.T) {
 	ctx := context.Background()
-	t.Run("made up", func(t *testing.T) {
-		where := ".github/made-up/x.yml"
-		r, c, _ := outOfReachRunner(t, where)
-		d := onePass(t, r, c)
-		run, err := r.Store.LoopRunByID(ctx, d.Run.ID)
-		if err != nil || run.Failure != "build report" || run.Cause == hostCause ||
-			!strings.Contains(run.Summary, "build report: refused: the out-of-reach path "+where+" is no path of the repository at BASE") {
-			t.Fatalf("a made-up path was not refused: %+v %v", run, err)
-		}
-		if _, ok := personNote(t, r, c, where); ok {
-			t.Fatal("a made-up path held its case")
-		}
-	})
+	for _, where := range []string{".github/made-up/x.yml", "Jenkinsfile"} {
+		t.Run(where, func(t *testing.T) {
+			r, c, _ := outOfReachRunner(t, where)
+			d := onePass(t, r, c)
+			run, err := r.Store.LoopRunByID(ctx, d.Run.ID)
+			if err != nil || run.Failure != "build report" || run.Cause == hostCause ||
+				!strings.Contains(run.Summary, "build report: refused: the out-of-reach path "+where+" is no path of the repository at BASE") {
+				t.Fatalf("a made-up path was not refused: %+v %v", run, err)
+			}
+			if _, ok := personNote(t, r, c, where); ok {
+				t.Fatal("a made-up path held its case")
+			}
+		})
+	}
 	t.Run("new file", func(t *testing.T) {
 		where := ".github/workflows/test.yml"
-		r, c, _ := outOfReachRunner(t, where)
-		heldFor(t, r, c, onePass(t, r, c), where)
-	})
-	t.Run("new root file", func(t *testing.T) {
-		where := "Jenkinsfile" // CI configuration a host runs, which BASE does not hold yet, at the repository's root
 		r, c, _ := outOfReachRunner(t, where)
 		heldFor(t, r, c, onePass(t, r, c), where)
 	})
 }
 
 // A path PathScope allows but no change can touch, since the patch check refuses it, is out of reach too: one in Git's
-// own directory, a submodule or a symlink of BASE, and a path through either.
+// own directory, and a submodule or a symlink of BASE (TestAnOutOfReachPathIsReadAsBASEReadsIt reads paths under them).
 func TestPathsThePatchCheckRefusesAreOutOfReach(t *testing.T) {
-	for _, where := range []string{".git/config", "vendor/lib", "vendor/lib/x.go", "link", "link/x"} {
+	for _, where := range []string{".git/config", "vendor/lib", "link"} {
 		t.Run(where, func(t *testing.T) {
 			r, c, _ := outOfReachRunner(t, where)
 			main := r.Inputs.ReadDirs[0]
@@ -594,5 +592,139 @@ func TestAConfigurationBuildAnswersNoOutOfReachPath(t *testing.T) {
 		Package{Kind: KindConfig}, OutOfReach{Path: ".github/workflows/ci.yml", Fix: outOfReachFix})
 	if err != nil || res.Status != store.RunFailed || res.Failure != "build report" || !strings.Contains(res.Text, "a configuration build changes its file") {
 		t.Fatalf("a configuration build's out-of-reach answer: %+v %v", res, err)
+	}
+}
+
+// hostPackage is a package of case caseID over the fixture's main clone as its host clone, at its HEAD.
+func hostPackage(t *testing.T, f repoFixture, caseID string) Package {
+	t.Helper()
+	return Package{Case: caseID, Repo: "agent-sh/fake", Dir: f.main, Host: f.main, BaseCommit: strings.TrimSpace(run(t, f.main, "git", "rev-parse", "HEAD"))}
+}
+
+// An out-of-reach path is read as BASE reads it. A submodule or a symlink of BASE is out of reach as the entry itself.
+// A path through a symlink that points inside the repository is its target's, out of reach or in reach. A path under
+// a submodule, or under a symlink out of the repository or one that never ends, and a new file at the root are no
+// path of BASE: BASE cannot tell any of them from a made-up one.
+func TestAnOutOfReachPathIsReadAsBASEReadsIt(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	f := newRepo(t, ciFiles)
+	r.Ship = shipWithSandbox(st, f, Sandbox{})
+	r.Ship.Dir = r.Dir
+	run(t, f.main, "git", "update-index", "--add", "--cacheinfo", "160000,0123456789abcdef0123456789abcdef01234567,vendor/lib")
+	for link, target := range map[string]string{"ci": ".github/workflows", "chain": "ci", "here": ".", "file": "fake.go", "out": "../elsewhere", "abs": "/etc", "loop": "loop"} {
+		if err := os.Symlink(target, filepath.Join(f.main, link)); err != nil {
+			t.Fatal(err)
+		}
+		run(t, f.main, "git", "add", link)
+	}
+	run(t, f.main, "git", "commit", "-q", "-m", "a submodule and symlinks")
+	p := hostPackage(t, f, openCase(t, st, "failures", "out-of-reach-links", 1).ID)
+	for where, reason := range map[string]string{"vendor/lib": "vendor/lib is a symlink or a submodule", "file": "file is a symlink or a submodule",
+		"ci/ci.yml": ".github/workflows/ci.yml is CI configuration", "ci/new.yml": ".github/workflows/new.yml is CI configuration",
+		"chain/release.yml": ".github/workflows/release.yml is CI configuration"} {
+		if why, refusal, err := r.unreachable(ctx, p, where); err != nil || refusal != nil || why == nil || !strings.Contains(why.Error(), reason) {
+			t.Errorf("%s is not out of reach: %v %v %v", where, why, refusal, err)
+		}
+	}
+	under, none := "is under a submodule or a symlink out of the repository at BASE", "is no path of the repository at BASE"
+	for where, reason := range map[string]string{"vendor/lib/x.go": under, "out/x": under, "abs/x": under, "loop/x": under,
+		"file/x": none, "ci/made-up/x.yml": none, "Jenkinsfile": none,
+		"here/fake.go": "is fake.go through a symlink of BASE, which a change may touch"} {
+		if why, refusal, err := r.unreachable(ctx, p, where); err != nil || why != nil || refusal == nil || !strings.Contains(refusal.Error(), where+" "+reason) {
+			t.Errorf("%s is not the build's refusal: %v %v %v", where, why, refusal, err)
+		}
+	}
+}
+
+// heldRunner is a runner over a host repository with ciFiles and no sandbox, with a case in testing on its main clone.
+func heldRunner(t *testing.T, sig string) (*Runner, store.Case, Package) {
+	t.Helper()
+	st := testStore(t)
+	r := localRunner(t, st)
+	f := newRepo(t, ciFiles)
+	r.Ship = shipWithSandbox(st, f, Sandbox{})
+	r.Ship.Dir = r.Dir
+	r.Inputs.ReadDirs = []string{f.main}
+	c := openCase(t, st, "failures", sig, 1)
+	mech, next := "the workflow runs no test", "run the tests in the workflow"
+	c, err := st.UpdateCase(context.Background(), c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mech, NextTest: &next}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setCaseRepo(t, st, c, "main")
+	return r, c, hostPackage(t, f, c.ID)
+}
+
+// A person who changes the case's status while its build runs ends the hold that build answers, though the hold's line
+// comes after the change: the hold keeps the build's start. A change before the build started does not end it.
+func TestAStatusChangeWhileTheBuildRanEndsItsHold(t *testing.T) {
+	ctx := context.Background()
+	where := ".github/workflows/ci.yml"
+	for _, during := range []bool{true, false} {
+		r, c, p := heldRunner(t, "out-of-reach-during")
+		log, err := r.Store.CaseLog(ctx, c.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		started := log[len(log)-1].At // the build starts after the case moved to testing
+		time.Sleep(5 * time.Millisecond)
+		for _, status := range []store.CaseStatus{store.CaseInvestigating, store.CaseTesting} {
+			if _, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: status}, "test"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !during {
+			time.Sleep(5 * time.Millisecond)
+			started = time.Now()
+		}
+		res, err := r.outOfReach(ctx, c, store.LoopRun{CaseEpisode: c.Episode, Started: started}, Result{Status: store.RunOK}, p, OutOfReach{Path: where, Fix: outOfReachFix})
+		if err != nil || res.Status != store.RunOutOfReach {
+			t.Fatalf("the out-of-reach answer: %+v %v", res, err)
+		}
+		now, err := r.Store.CaseByID(ctx, c.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		why, err := r.heldForPerson(ctx, now, false)
+		if err != nil || during && why != "" || !during && why != "for a person: its fix needs "+where {
+			t.Fatalf("a status change (during the build: %v) left the hold %q: %v", during, why, err)
+		}
+		if n, ok := personNote(t, r, c, where); !ok || during == n.Done.IsZero() {
+			t.Fatalf("the hold's note (during the build: %v): %+v %v", during, n, ok)
+		}
+	}
+}
+
+// A hold line the loop cannot read is a hold all the same: the case takes no slot and gets a note that says so, until
+// a person changes the case; new evidence does not end it.
+func TestAnUnreadableHoldLineIsAHold(t *testing.T) {
+	ctx := context.Background()
+	r, c, _ := heldRunner(t, "out-of-reach-unread")
+	if err := r.Store.CaseNote(ctx, c.ID, "held for a person", `{"path":".github/workflows/ci.yml","fix":"Run the te`, "loop"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.Store.AddCaseEvidence(ctx, c.ID, []store.Evidence{{Ref: "file:/t/out-of-reach-unread-again", At: time.Now()}}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	cands, why, err := r.candidates(ctx, c.Family, "", false)
+	if err != nil || len(cands) != 0 || !strings.Contains(why, c.ID+" held for a person: its hold line cannot be read") {
+		t.Fatalf("a case with an unreadable hold line is a candidate: %+v %q %v", cands, why, err)
+	}
+	n, ok := personNote(t, r, c, "its hold line cannot be read")
+	if !ok || !n.Done.IsZero() || !strings.Contains(n.Detail, "Read the build's answer in the case's log") {
+		t.Fatalf("the unreadable hold's note: %+v %v", n, ok)
+	}
+	title := "the workflow is wrong"
+	if _, err := r.Store.UpdateCase(ctx, c.ID, store.CaseUpdate{Title: &title}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	cands, why, err = r.candidates(ctx, c.Family, "", false)
+	if err != nil || len(cands) != 1 || strings.Contains(why, "held for a person") {
+		t.Fatalf("a person's change did not end the unreadable hold: %+v %q %v", cands, why, err)
+	}
+	if n, ok := personNote(t, r, c, "its hold line cannot be read"); !ok || n.Done.IsZero() {
+		t.Fatalf("the ended hold's note stands: %+v %v", n, ok)
 	}
 }
