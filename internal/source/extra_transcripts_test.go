@@ -644,6 +644,50 @@ func TestKimiInlineSkillIsGeneratedInput(t *testing.T) {
 				if e.Kind == "owner_text" && !strings.Contains(e.Meta, `"prior":"task_complete"`) {
 					t.Fatalf("an owner turn after a turn's end lost its marker: %q", e.Meta)
 				}
+				// supervise reads a turn's input kind: a steer's is queued, a prompt's typed
+				input := `"input_kind":"typed"`
+				if tc.record["type"] == "turn.steer" {
+					input = `"input_kind":"queued"`
+				}
+				if e.Kind == "owner_text" && !strings.Contains(e.Meta, input) {
+					t.Fatalf("an owner turn stored without its input kind %s: %q", input, e.Meta)
+				}
+			}
+		})
+	}
+}
+
+// Two copies of one session share the keys of the records both hold, so the copy read last decides who a typed
+// prompt is credited to. A record that copy gives no item keeps what it had: his media-only prompt, which the copy
+// with his lastPrompt stores as his empty turn and the program's copy stores nothing for, stays his turn whichever
+// copy is read last.
+func TestKimiTwoCopiesOfOneSessionKeepHisEmptyTurn(t *testing.T) {
+	image := map[string]any{"type": "image_url", "imageUrl": map[string]any{"url": "file:///neutral.png"}}
+	media := kimiRecord("turn.prompt", map[string]any{"origin": map[string]any{"kind": "user"}, "input": []any{image}})
+	typed, headless := `{"version":2,"lastPrompt":"marker-7f3a typed"}`, `{"version":2}`
+	for _, tc := range []struct {
+		name  string
+		order []string // each copy's metadata, in the order the copies are read
+		typed string
+		owner []string
+	}{
+		{"his copy first", []string{typed, headless}, "harness harness_text", []string{""}},
+		{"the program's copy first", []string{headless, typed}, "owner owner_text", []string{"", "marker-7f3a typed"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			st := openStore(t)
+			for i, state := range tc.order {
+				path := filepath.Join(home, ".kimi-code", "sessions", fmt.Sprintf("copy-%d", i), "shared", "agents", "main", "wire.jsonl")
+				writeJSONLines(t, path, media, kimiRecord("turn.ended", map[string]any{}), kimiPrompt("marker-7f3a typed"))
+				kimiState(t, path, state)
+				ingest(t, transcripts(home), st)
+			}
+			if got := promptActors(t, st)["marker-7f3a typed"]; got != tc.typed {
+				t.Fatalf("the typed prompt stored as %q, want %q (the copy read last)", got, tc.typed)
+			}
+			if got := ownerTexts(t, st); !slices.Equal(got, tc.owner) {
+				t.Fatalf("owner turns %q, want %q", got, tc.owner)
 			}
 		})
 	}

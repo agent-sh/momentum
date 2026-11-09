@@ -174,7 +174,8 @@ func (m Measurement) Guarded() bool { return m.Exposure > 0 || m.closedGuard }
 // it, else the duplicate's record, handed on where the target had none: case_evidence_filed, case_evidence_deleted),
 // or by the fill where the columns were added (columnFills). Event evidence that never recorded them (its event was
 // gone when the columns were added, or a merge took it from evidence that never recorded them) reads as none, and so
-// does any other reference, which records neither.
+// does any other reference: this build records neither for it, and the none an earlier build with the columns
+// recorded for it stays until a merge moves it, with neither recorded.
 type Evidence struct {
 	Ref     string
 	At      time.Time
