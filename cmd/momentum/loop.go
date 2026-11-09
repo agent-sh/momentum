@@ -25,7 +25,7 @@ import (
 // The loop's defaults that are no machine path: the harness's main agent's models (SPEC, Architecture) and the
 // families it starts with.
 const (
-	defaultModel    = "global.anthropic.claude-opus-5-5"
+	defaultModel    = "global.anthropic.claude-fable-5-2"
 	defaultFallback = "global.anthropic.claude-sonnet-5-5"
 )
 

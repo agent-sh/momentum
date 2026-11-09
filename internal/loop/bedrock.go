@@ -162,11 +162,14 @@ type relayRate struct {
 }
 
 // Bedrock global rates, per million tokens. Source: Amazon Bedrock pricing,
-// global cross-region inference, 2026-11-02. Evaluations use the relay's
-// observed accounting and keep no second pricing table.
+// global cross-region inference, 2026-11-02. Fable 5.2 is Anthropic's list
+// price of 2026-11-09 (platform.claude.com/docs/en/about-claude/pricing),
+// which the global profile has matched for each earlier Claude model.
+// Evaluations use the relay's observed accounting and keep no second pricing table.
 // The output ceiling is the models' 128K maximum:
 // https://platform.claude.com/docs/en/models/overview
 var relayRates = map[string]relayRate{
+	"global.anthropic.claude-fable-5-2":  {8, 40, .2, 10, 16, 128000},
 	"global.anthropic.claude-opus-5-5":   {4, 20, .2, 5, 8, 128000},
 	"global.anthropic.claude-sonnet-5-5": {2, 10, .1, 2.5, 4, 128000},
 }
