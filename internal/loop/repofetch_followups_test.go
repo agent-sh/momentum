@@ -251,7 +251,8 @@ func TestAGitHubMirrorMustHoldThePackagesRepository(t *testing.T) {
 }
 
 // A package's checkout that the gate now names as another repository refuses the build, though its origin's URL, and
-// so its mirror, stayed the same.
+// so its mirror, stayed the same. Selection does not hold the case for another repository's fix: the checkout is the
+// package's, and its build refuses.
 func TestABuildRefusesACheckoutThatNowNamesAnotherRepository(t *testing.T) {
 	ctx := context.Background()
 	r, c, _ := buildCase(t)
@@ -261,7 +262,11 @@ func TestABuildRefusesACheckoutThatNowNamesAnotherRepository(t *testing.T) {
 	}
 	r.Ship.Gate.Resolve = func(context.Context, string) (string, error) { return "agent-sh/other", nil }
 	newPass(t, r)
-	if _, err := r.prepareRun(ctx, c, c.Family, StepBuild); err == nil || !strings.Contains(err.Error(), "the case's repository changed after preparation") {
+	if got, step, why, err := r.pick(ctx, c.Family, c.ID, false); err != nil || got.ID != c.ID || step != StepBuild {
+		t.Fatalf("the selection of a checkout that names another repository: %q %q %q %v", got.ID, step, why, err)
+	}
+	_, err := r.prepareRun(ctx, c, c.Family, StepBuild)
+	if err == nil || held(err) || !strings.Contains(err.Error(), "the case's repository changed after preparation") {
 		t.Fatalf("a build of a checkout that names another repository: %v", err)
 	}
 }

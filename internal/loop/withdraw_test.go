@@ -110,6 +110,66 @@ func TestAWithdrawalFindsARequestOpenAtTheBranch(t *testing.T) {
 	}
 }
 
+// With no request saved, the withdrawal reads every request at the package's branch, of any state and base, and reads
+// the package's own (its commit) as it reads a saved one: one a person retargeted and left open refuses, one a person
+// merged or closed is withdrawn as such. A closed request at the branch of another commit (an earlier package's) is
+// not the package's.
+func TestAWithdrawalReadsTheBranchsRequestsOfAnyStateAndBase(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, state string
+		own         bool
+		refuses     string
+		line        string
+		closed      int
+	}{
+		{"retargeted and open", "OPEN", true, "has an open pull request", "", 0},
+		{"merged by a person", "MERGED", true, "", "was merged by a person", 0},
+		{"closed by a person", "CLOSED", true, "", "was closed without merging", 1},
+		{"an earlier package's, closed", "CLOSED", false, "", "", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newLifeWorld(t)
+			for _, e := range []string{"owner prepare", "check", "the next create's response is lost", "propose"} {
+				w.step(e, 0)
+			}
+			old, _ := w.load()
+			if old.PR != "" || old.PublishedHead == "" || old.Head == "" {
+				t.Fatalf("the fixture: PR %q, published %q, head %q", old.PR, old.PublishedHead, old.Head)
+			}
+			head := old.Head
+			if !tc.own {
+				head = strings.Repeat("c0ffee", 7)[:40]
+			}
+			url := "https://github.com/" + old.Repo + "/pull/7"
+			// GitHub as it answers once the request was retargeted, merged or closed: a list by the old base, or of open
+			// requests alone, does not hold it
+			w.s.GH = script(t, t.TempDir(), "gh", `case "$1 $2 $*" in
+"pr list"*"--base"*|"pr list"*"--state open"*) echo '[]';;
+"pr list"*) echo '[{"url":"`+url+`","state":"`+tc.state+`","headRefOid":"`+head+`"}]';;
+*) echo "gh: unexpected $*" >&2; exit 1;;
+esac`)
+			got, err := w.s.Withdraw(ctx, w.c.ID, "its fix moved")
+			if tc.refuses != "" {
+				if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), tc.refuses) {
+					t.Fatalf("the withdrawal: %v, want a refusal naming %q", err, tc.refuses)
+				}
+				if p, _ := w.load(); p.State == Withdrawn {
+					t.Fatal("withdrawn")
+				}
+				return
+			}
+			log, _ := w.st.CaseLog(ctx, w.c.ID)
+			if err != nil || got.State != Withdrawn || got.ClosedProposals != old.ClosedProposals+tc.closed {
+				t.Fatalf("the withdrawal: %+v %v", got, err)
+			}
+			if tc.line != "" && !logHas(log, ActionWithdrawn, url+" "+tc.line) || tc.line == "" && logHas(log, ActionWithdrawn, url) {
+				t.Fatalf("the withdrawal's line, want %q: %+v", tc.line, log)
+			}
+		})
+	}
+}
+
 // A package rolling back is not withdrawn: it ends with its rollback.
 func TestAPackageRollingBackIsNotWithdrawn(t *testing.T) {
 	w := newLifeWorld(t)
@@ -202,6 +262,37 @@ func TestARepositoryPackageCarriesNoConfigurationCounts(t *testing.T) {
 	next, err := s.Prepare(ctx, c.ID, f.main)
 	if err != nil || next.Kind != KindRepo || next.ClosedProposals != 0 {
 		t.Fatalf("the owner's prepare after a configuration package's withdrawal: %+v %v", next, err)
+	}
+}
+
+// A configuration package carries its withdrawn predecessor's counts within the case's episode, and starts them again
+// in a new one: a new episode is a new instance of the problem.
+func TestAConfigurationPackageCarriesItsCountsWithinItsEpisode(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	s := shipWithSandbox(st, newRepo(t, nil), Sandbox{})
+	s.ConfigTargets = ConfigTargets{Enabled: true, Allow: []string{ruleTarget}, Home: fakeHome(t)}
+	c := testingCase(t, st)
+	p, err := s.PrepareConfig(ctx, c.ID, ruleTarget, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.State, p.ClosedProposals, p.Withdrawals = Withdrawn, 1, 2 // its file moved twice
+	if err := s.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	same, err := s.PrepareConfig(ctx, c.ID, ruleTarget, "")
+	if err != nil || same.ClosedProposals != 1 || same.Withdrawals != 2 {
+		t.Fatalf("a package of the same episode: %+v %v", same, err)
+	}
+	same.State = Withdrawn
+	if err := s.save(&same); err != nil {
+		t.Fatal(err)
+	}
+	c = comeBack(t, st, c, "", ruleTarget)
+	next, err := s.PrepareConfig(ctx, c.ID, ruleTarget, "")
+	if err != nil || next.Episode != c.Episode || next.ClosedProposals != 0 || next.Withdrawals != 0 {
+		t.Fatalf("a package of a new episode: %+v %v", next, err)
 	}
 }
 

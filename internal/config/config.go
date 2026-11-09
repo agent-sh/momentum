@@ -111,11 +111,17 @@ func (l Loop) Own() []string {
 		cmd = shellWords(cmd)
 		for i, arg := range cmd {
 			// the program, and every argument that names a file (a script it runs, a configuration it reads), alone or
-			// as the value of a --flag=PATH
-			if i == 0 && arg != "" || !strings.HasPrefix(arg, "-") && fileArg(arg) {
+			// as the value of a --flag=PATH or of a NAME=VALUE assignment (a shell line's, or env's)
+			name, v, ok := strings.Cut(arg, "=")
+			switch {
+			case i == 0 && arg != "":
 				own = append(own, homeArg(arg))
-			} else if _, v, ok := strings.Cut(arg, "="); ok && strings.HasPrefix(arg, "-") && fileArg(v) {
-				own = append(own, homeArg(v))
+			case ok && (strings.HasPrefix(name, "-") || shellName(name)):
+				if fileArg(v) {
+					own = append(own, homeArg(v))
+				}
+			case !strings.HasPrefix(arg, "-") && fileArg(arg):
+				own = append(own, homeArg(arg))
 			}
 		}
 	}
@@ -195,6 +201,16 @@ func splitShell(line string) []string {
 // one, which holds a slash or a dot. A plain word or number does not.
 func fileArg(a string) bool {
 	return filepath.IsAbs(a) || strings.HasPrefix(homeArg(a), "~/") || a != "" && strings.ContainsAny(a, "/.")
+}
+
+// shellName says whether a word is a shell variable's name, as the left side of a NAME=VALUE assignment.
+func shellName(w string) bool {
+	for i, r := range w {
+		if r != '_' && !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z') && (i == 0 || r < '0' || r > '9') {
+			return false
+		}
+	}
+	return w != ""
 }
 
 // homeArg writes an argument under $HOME as one under ~/.

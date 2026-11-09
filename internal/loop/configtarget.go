@@ -400,8 +400,8 @@ type targetFile struct {
 	Content []byte
 }
 
-// homeError is a refusal of the home the targets resolve under (none, or a link in its path): it says nothing of a
-// target, so a read of a proposal's file that meets it decides nothing.
+// homeError is a refusal of the home the targets resolve under (none, a link in its path, or a part of it that cannot
+// be read): it says nothing of a target, so a read of a proposal's file that meets it decides nothing.
 type homeError struct{ err error }
 
 func (e *homeError) Error() string { return e.err.Error() }
@@ -435,8 +435,10 @@ func (ct ConfigTargets) open(name string) (*targetDir, error) {
 	if ct.Home == "" || !filepath.IsAbs(ct.Home) {
 		return nil, fileHeld(holdHome, &homeError{refused("configuration targets need the real home")})
 	}
-	if err := noInputLinks(ct.Home); err != nil {
+	if err := noInputLinks(ct.Home); errors.Is(err, errInputLink) {
 		return nil, fileHeld(holdHome, &homeError{refused("the home path holds a link")})
+	} else if err != nil {
+		return nil, fileHeld(holdHome, &homeError{refused("the home path cannot be read: %v", err)})
 	}
 	fd, err := unix.Open(ct.Home, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -1442,6 +1444,17 @@ func (s *Ship) packageAuthority(ctx context.Context, p Package) error {
 	return err
 }
 
+// samePackageCheckout says whether the read_dirs repository named repo is the checkout a repository package was
+// prepared in.
+func (r *Runner) samePackageCheckout(ctx context.Context, repo string, p Package) bool {
+	source := r.readDirSource(repo)
+	if source == "" || p.Dir == "" {
+		return false
+	}
+	dir, err := mainCheckout(ctx, source)
+	return err == nil && dir == p.Dir
+}
+
 // configPassed is why selection passes a case whose configuration proposal waits, live or dry, or "": its review
 // rounds are used, it waits for its review or its filing, or it is filed for a person.
 func configPassed(p Package) string {
@@ -1512,6 +1525,11 @@ func (r *Runner) heldTargetWith(ctx context.Context, c store.Case, repo, target 
 	if kind == KindRepo {
 		full, err := r.repoIdentity(ctx, repo)
 		if err != nil {
+			return "", true
+		}
+		if p.Kind == KindRepo && !strings.EqualFold(full, p.Repo) && r.samePackageCheckout(ctx, repo, p) {
+			// the package's own checkout, which the gate now names as another repository: no fix moved, so the case
+			// does not wait for the package to end; its build refuses (prepareBuild)
 			return "", true
 		}
 		place = full

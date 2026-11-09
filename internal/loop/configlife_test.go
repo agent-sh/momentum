@@ -469,8 +469,11 @@ func TestAConfigurationProposalThatUsedItsRoundsWaitsForAPerson(t *testing.T) {
 		t.Fatal(err)
 	}
 	agentWrites(t, home, oldRule+ownerEdit)
-	if _, step, why, err := r.pick(ctx, "failures", c.ID, false); err != nil || step == StepBuild || !strings.Contains(why, "used its review rounds") {
-		t.Fatalf("a proposal whose rounds are used, over an edited file: %q %q %v", step, why, err)
+	// the dry pass reads it as the live one does: its file is not read either
+	for _, dry := range []bool{true, false} {
+		if _, step, why, err := r.pick(ctx, "failures", c.ID, dry); err != nil || step == StepBuild || !strings.Contains(why, "used its review rounds") {
+			t.Fatalf("a proposal whose rounds are used, over an edited file (dry %v): %q %q %v", dry, step, why, err)
+		}
 	}
 	if got, _, _ := r.Ship.Load(c.ID); got.State != Proposed || got.Withdrawals != 0 {
 		t.Fatalf("the proposal: %+v", got)

@@ -143,11 +143,10 @@ func (g Gate) Repository(ctx context.Context, dir string) (target Target, err er
 	if err != nil {
 		return Target{}, err
 	}
-	top, err := gitOutput(ctx, dir, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	main, err := mainCheckout(ctx, dir)
 	if err != nil {
 		return Target{}, refused("%s is not a git checkout", dir)
 	}
-	main := filepath.Dir(strings.TrimSpace(top)) // the main checkout of a linked worktree too
 	if _, err := originRepository(ctx, dir); err != nil {
 		return Target{}, err
 	}
@@ -346,6 +345,16 @@ func proposalProtected(c string) bool {
 func under(p, dir string) bool {
 	rel, err := filepath.Rel(dir, p)
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, "../")
+}
+
+// mainCheckout is the main checkout of the checkout at dir, a linked worktree's too: the place a repository package
+// records (Package.Dir).
+func mainCheckout(ctx context.Context, dir string) (string, error) {
+	top, err := gitOutput(ctx, dir, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return "", err
+	}
+	return filepath.Dir(strings.TrimSpace(top)), nil
 }
 
 // gitOutput runs git in a directory and returns what it printed. Git runs without optional locks, hooks or a

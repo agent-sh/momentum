@@ -166,6 +166,9 @@ func TestLinksAndPathsOutsideHomeAreNeverTargets(t *testing.T) {
 		t.Fatal(err)
 	}
 	refusedTarget(t, ConfigTargets{Home: linked}, ruleTarget, "holds a link")
+	// a home that cannot be read for another reason names that reason
+	gone := filepath.Join(t.TempDir(), "gone", "home")
+	refusedTarget(t, ConfigTargets{Home: gone}, ruleTarget, "no such file or directory")
 }
 
 // An executable, a program by its name or its #! line, a file of another owner, with another hard link, or

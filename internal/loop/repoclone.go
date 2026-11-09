@@ -251,6 +251,9 @@ func hostInputGitHolding(ctx context.Context, dir string, limit int, step time.D
 	return out.Bytes(), false, nil
 }
 
+// errInputLink is noInputLinks's refusal of a path that holds a link; its other errors are the reads' own.
+var errInputLink = errors.New("path contains a link")
+
 func noInputLinks(path string) error {
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -262,7 +265,7 @@ func noInputLinks(path string) error {
 			return err
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("path contains a link")
+			return errInputLink
 		}
 		if p == filepath.Dir(p) {
 			return nil

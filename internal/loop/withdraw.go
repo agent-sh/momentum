@@ -90,62 +90,86 @@ func (s *Ship) Withdraw(ctx context.Context, caseID, why string) (Package, error
 }
 
 // requestEnded reads a repository package's pull request before its owner's withdrawal: the one it names, or, when it
-// names none but published its branch, one open at the branch (a create whose response or save was lost, found as
-// Propose finds it). closed is a request a person closed without merging; merged one a person merged, which is a
-// hand landing's landing only. An open request refuses, since the loop closes none, and so does a hand landing's
-// merged one, or its closed one whose change the default branch holds as proposed (a landing by push), which the next
-// pass records as its landing. Any failure of the read is the read's.
+// names none but published its branch, the ones at the branch (a create whose response or save was lost, found as
+// Propose finds it), of any state and base, since a person may have retargeted, merged or closed it. Any request open
+// at the branch refuses; a closed or merged one is the package's when it holds the package's commit, as Propose adopts
+// one, and is read as the saved one is (requestState). Any failure of the read is the read's.
 func (s *Ship) requestEnded(ctx context.Context, c store.Case, p Package) (closed, merged string, err error) {
-	if p.PR == "" {
-		if p.PublishedHead == "" || p.Branch == "" || p.Repo == "" {
-			return "", "", nil // nothing of the package's was ever pushed to its branch: no request is at it
-		}
-		out, err := s.gh(ctx, p.Host, "pr", "list", "--repo", p.Repo, "--head", p.Branch, "--base", p.Base, "--state", "open", "--json", "url")
+	if p.PR != "" {
+		raw, err := s.gh(ctx, p.Host, "pr", "view", p.PR, "--repo", p.Repo, "--json", "state,headRefOid")
 		if err != nil {
 			return "", "", err
 		}
-		var prs []struct {
-			URL string `json:"url"`
+		var pr struct {
+			State string `json:"state"`
+			Head  string `json:"headRefOid"`
 		}
-		if err := json.Unmarshal([]byte(out), &prs); err != nil {
-			return "", "", fmt.Errorf("read the open pull requests of %s: %w", p.Branch, err)
+		if err := json.Unmarshal([]byte(raw), &pr); err != nil {
+			return "", "", fmt.Errorf("read the pull request %s: %w", p.PR, err)
 		}
-		if len(prs) > 0 {
-			return "", "", refused("case %s's branch %s has an open pull request, %s: the loop closes no pull request, so close it, then withdraw the package", c.ID, p.Branch, prs[0].URL)
-		}
-		return "", "", nil
+		return s.requestState(ctx, c, p, p.PR, pr.State, pr.Head)
 	}
-	raw, err := s.gh(ctx, p.Host, "pr", "view", p.PR, "--repo", p.Repo, "--json", "state,headRefOid")
+	if p.PublishedHead == "" || p.Branch == "" || p.Repo == "" {
+		return "", "", nil // nothing of the package's was ever pushed to its branch: no request is at it
+	}
+	out, err := s.gh(ctx, p.Host, "pr", "list", "--repo", p.Repo, "--head", p.Branch, "--state", "all", "--json", "url,state,headRefOid")
 	if err != nil {
 		return "", "", err
 	}
-	var pr struct {
+	var prs []struct {
+		URL   string `json:"url"`
 		State string `json:"state"`
 		Head  string `json:"headRefOid"`
 	}
-	if err := json.Unmarshal([]byte(raw), &pr); err != nil {
-		return "", "", fmt.Errorf("read the pull request %s: %w", p.PR, err)
+	if err := json.Unmarshal([]byte(out), &prs); err != nil {
+		return "", "", fmt.Errorf("read the pull requests of %s: %w", p.Branch, err)
 	}
+	for _, pr := range prs {
+		if pr.State == "OPEN" {
+			return "", "", refused("case %s's branch %s has an open pull request, %s: the loop closes no pull request, so close it, then withdraw the package", c.ID, p.Branch, pr.URL)
+		}
+	}
+	for _, pr := range prs {
+		if p.Head == "" || pr.Head != p.Head {
+			continue // an earlier package's request at the case's branch
+		}
+		cl, mg, err := s.requestState(ctx, c, p, pr.URL, pr.State, pr.Head)
+		if err != nil {
+			return "", "", err
+		}
+		closed, merged = firstOf(closed, cl), firstOf(merged, mg)
+	}
+	if merged != "" {
+		return "", merged, nil // a merge is how the change ended, whatever request was closed before it
+	}
+	return closed, "", nil
+}
+
+// requestState reads a package's request (url) in state, at head. closed is a request a person closed without merging;
+// merged one a person merged, which is a hand landing's landing only. An open request refuses, since the loop closes
+// none, and so does a hand landing's merged one, or its closed one whose change the default branch holds as proposed (a
+// landing by push), which the next pass records as its landing.
+func (s *Ship) requestState(ctx context.Context, c store.Case, p Package, url, state, head string) (closed, merged string, err error) {
 	switch {
-	case pr.State == "CLOSED" && len(p.Hand) > 0:
+	case state == "CLOSED" && len(p.Hand) > 0:
 		// a person who lands a hand landing's head by a push and then closes its request landed it all the same, as
 		// reconcileHand reads it
-		if _, _, landed, err := s.landedByContent(ctx, p, pr.Head); err != nil {
+		if _, _, landed, err := s.landedByContent(ctx, p, head); err != nil {
 			return "", "", err
 		} else if landed {
-			return "", "", refused("case %s's pull request %s was closed, and %s holds its change as proposed: a hand landing, whose landing the next pass records", c.ID, p.PR, p.Base)
+			return "", "", refused("case %s's pull request %s was closed, and %s holds its change as proposed: a hand landing, whose landing the next pass records", c.ID, url, p.Base)
 		}
-		return p.PR, "", nil
-	case pr.State == "CLOSED":
-		return p.PR, "", nil
-	case pr.State == "OPEN":
-		return "", "", refused("case %s's pull request %s is open: the loop closes no pull request, so close it, then withdraw the package", c.ID, p.PR)
-	case pr.State == "MERGED" && len(p.Hand) > 0:
-		return "", "", refused("case %s's pull request %s was merged: a hand landing, whose landing the next pass records", c.ID, p.PR)
-	case pr.State == "MERGED":
-		return "", p.PR, nil
+		return url, "", nil
+	case state == "CLOSED":
+		return url, "", nil
+	case state == "OPEN":
+		return "", "", refused("case %s's pull request %s is open: the loop closes no pull request, so close it, then withdraw the package", c.ID, url)
+	case state == "MERGED" && len(p.Hand) > 0:
+		return "", "", refused("case %s's pull request %s was merged: a hand landing, whose landing the next pass records", c.ID, url)
+	case state == "MERGED":
+		return "", url, nil
 	}
-	return "", "", refused("case %s's pull request %s is %q", c.ID, p.PR, pr.State)
+	return "", "", refused("case %s's pull request %s is %q", c.ID, url, state)
 }
 
 // doneHandNotes resolves a case's hand landing notes with no case log line: a merged case's.

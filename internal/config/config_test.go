@@ -211,4 +211,9 @@ func TestTheLoopsOwnFilesAreItsConfiguredOnes(t *testing.T) {
 	if got := strings.Join(l.Own(), " "); got != "/bin/sh ~/zz-work ./zz-run.sh ~/zz-e.md zz-log.txt" {
 		t.Fatalf("own, in a shell's line: %s", got)
 	}
+	// and a NAME=VALUE assignment in it names its value, as a --flag=PATH does
+	l = Loop{RepoGuard: []string{"sh", "-c", "CONF=$HOME/.config/agents/zz-guard.md exec zz-guard"}}
+	if got := strings.Join(l.Own(), " "); got != "sh ~/.config/agents/zz-guard.md" {
+		t.Fatalf("own, an assignment in a shell's line: %s", got)
+	}
 }

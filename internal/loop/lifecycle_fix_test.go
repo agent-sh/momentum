@@ -133,6 +133,31 @@ func TestACrashInAWithdrawalLeavesNoNoteStanding(t *testing.T) {
 	}
 }
 
+// A closed case's configuration package that ended while its note still stands (a withdrawal that stopped between its
+// writes) has the note resolved by the pass's settlement of cases out of testing.
+func TestAnEndedConfigurationPackagesStandingNoteIsResolved(t *testing.T) {
+	ctx := context.Background()
+	r, c, _, p := filedConfigCase(t)
+	p.State = Withdrawn // saved, while its note was not resolved
+	if err := r.Ship.save(&p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Store.CloseCase(ctx, c.ID, store.CloseReason("not-worth-it"), "", "declined", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := noteByID(t, r.Store, configNoteID(c.ID)); !ok || !n.Done.IsZero() {
+		t.Fatalf("the fixture's note does not stand: %+v", n)
+	}
+	closed, err := r.Store.CaseByID(ctx, c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.withdrawStale(ctx, []store.Case{closed}, "")
+	if n, ok := noteByID(t, r.Store, configNoteID(c.ID)); ok && n.Done.IsZero() {
+		t.Fatalf("the ended package's note stands: %+v", n)
+	}
+}
+
 // A filed proposal's file that cannot be read as a target, for any reason the code has, still closes as already
 // solved: the reference names the reason it could not be checked.
 func TestEveryUncheckableFileHasACloseForm(t *testing.T) {
