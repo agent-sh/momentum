@@ -625,12 +625,6 @@ func failureKey(harness, tool, text string, c store.Call) (FailureKey, bool) {
 	return FailureKey{Origin: "miss:" + slug(tool, 30), Text: missedPath(p)}, true
 }
 
-// dirFields are the fields of a shell call's input that name the directory it runs in, by harness: Codex's
-// exec_command, OpenCode's shell and Hermes's terminal take a workdir, Kimi's Bash a cwd.
-var dirFields = map[string]map[string]bool{
-	"codex": {"workdir": true}, "opencode": {"workdir": true}, "hermes": {"workdir": true}, "kimi": {"cwd": true},
-}
-
 // commandMissed is the path a command's message named as the file it found no file at (quotedMiss), as its key holds
 // it before missedPath cleans it, or "" for an empty one:
 //   - A relative one as the message spells it, with no directory joined to it: the store often cuts the command
@@ -638,11 +632,12 @@ var dirFields = map[string]map[string]bool{
 //     its directories recurs as one, as a read's whose directory is not known does (missOf). A ~ in a program's
 //     message is such a name too: the shell expands the home's before the program sees it.
 //   - A whole one under the directory the call ran in, by its part below it, as a relative one: the directory the
-//     call's input names (dirFields), else the call's own as the store keeps it, when that is a whole path below
-//     the home or outside it (not /, the home or a directory above it). A per-task worktree's root is no part of
-//     what a script in it misses, so one script missed in each worktree recurs as one. The cost: one relative name
-//     in two unrelated projects is one key.
-//   - Any other whole path as it is.
+//     store says it ran in (shellDir: the workdir its input names, else the session's, but none for a call cut
+//     before its directory's field could be read, or for Hermes's terminal without one), when that is a whole path
+//     below the home or outside it (not /, the home or a directory above it). A per-task worktree's root is no part
+//     of what a script in it misses, so one script missed in each worktree recurs as one. The cost: one relative
+//     name in two unrelated projects is one key.
+//   - Any other whole path as it is, and every whole path of a call whose directory the store does not say.
 //
 // The directory is the call's: a command that runs elsewhere through what is not ssh (bash -c with a cd in it,
 // env -C, docker exec) is read as run in it.
@@ -650,14 +645,9 @@ func commandMissed(harness, p string, c store.Call) string {
 	if p == "" || !path.IsAbs(p) {
 		return p
 	}
-	dir := c.Cwd
-	if keys := dirFields[harness]; keys != nil {
-		if w, named, _ := callField(c.Input, keys); named && path.IsAbs(w) {
-			dir = w
-		}
-	}
+	dir := shellDir(harness, c.Input, c.Cwd)
 	root, home := path.Clean(dir), path.Clean(paths.Home())
-	if !path.IsAbs(root) || root == "/" || root == home || strings.HasPrefix(home, root+"/") {
+	if dir == "" || root == "/" || root == home || strings.HasPrefix(home, root+"/") {
 		return p
 	}
 	if rest, ok := strings.CutPrefix(path.Clean(p), root+"/"); ok {
@@ -666,16 +656,47 @@ func commandMissed(harness, p string, c store.Call) string {
 	return p
 }
 
-// remote says a shell call runs ssh in a line of its command as the store keeps it, a here-document's lines read as
-// commands too: a path its output names may be another host's.
+var (
+	// commandKeyRe is a field of a shell call's input that holds what it runs, a command line or code, by its name: a
+	// value the store cut still names it.
+	commandKeyRe = regexp.MustCompile(`"(?:command|cmd|code)"\s*:`)
+	// hostRe is a program that works on another host, as a word of a command's text: ssh (alone, after its path, in
+	// rsync's -e "ssh ..." or a variable's value), scp and sftp. A word goes up to a quote, a space or a shell
+	// separator; ~/.ssh and ssh-keygen are none.
+	hostRe = regexp.MustCompile("(?:^|[\\s\"'(;&|=`/\\\\])(?:ssh|scp|sftp)(?:$|[\\s\"';&|)`\\\\])")
+	// rsyncRe is rsync and its words up to the end of its command.
+	rsyncRe = regexp.MustCompile(`(?:^|[\s"'(;&|/])rsync\s+([^;&|\n]*)`)
+	// hostPathRe is an operand of rsync's that names a host: host:path, user@host:path, $HOST:path, rsync://.
+	hostPathRe = regexp.MustCompile(`^(?:rsync://|[\w.@${}-]+:)`)
+)
+
+// remote says a path a shell call's output names may be another host's, so its message keeps its words:
+//   - its command's text (its command line as the store keeps it, else its whole input, as Codex's exec script)
+//     names a program that works on another host (hostRe), in any line, a here-document's too;
+//   - it runs rsync with -e or --rsh, or with an operand that names a host (hostPathRe);
+//   - its input names no command: a write to a running command's stdin or a poll of its output (Codex's
+//     write_stdin, Claude Code's bash_output), whose event does not say which host printed it.
+//
+// A call the store does not hold is read as local: the mistakes log's are Claude Code's own commands.
 func remote(call string) bool {
-	m := callRe.FindStringSubmatch(call)
-	if m == nil {
-		return false
+	text := call
+	if m := callRe.FindStringSubmatch(call); m != nil {
+		text = unescape(m[1])
+	} else if strings.HasPrefix(strings.TrimSpace(call), "{") && !commandKeyRe.MatchString(call) {
+		return true
 	}
-	for _, line := range strings.Split(unescape(m[1]), "\n") {
-		if commandPrograms(line)["ssh"] {
-			return true
+	if hostRe.MatchString(text) {
+		return true
+	}
+	for _, m := range rsyncRe.FindAllStringSubmatch(text, -1) {
+		for _, w := range strings.Fields(m[1]) {
+			w = strings.Trim(w, `"'`)
+			switch {
+			case strings.HasPrefix(w, "--rsh"),
+				strings.HasPrefix(w, "-") && !strings.HasPrefix(w, "--") && strings.Contains(w, "e"),
+				!strings.HasPrefix(w, "-") && hostPathRe.MatchString(w):
+				return true
+			}
 		}
 	}
 	return false
