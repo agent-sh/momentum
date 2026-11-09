@@ -206,8 +206,11 @@ func readMaps(path string, f func(string)) {
 
 // words splits a command-line argument or a line of text into the words that may be paths or repository ids: at
 // spaces, quotes, and the separators of options, assignments and lists (=, :, ;, ,). A word loses systemd's
-// command prefixes (-, @, +, !), and ~/, $HOME/, ${HOME}/ and systemd's %h/ become the home directory.
+// command prefixes (-, @, +, !), and ~/, $HOME/, ${HOME}/ and systemd's %h/ become the home directory. A script's
+// template of the home directory (${HOME}, ${process.env.HOME}, ${os.homedir()}, $HOME) is expanded before the
+// split, so that a path a script builds in a template literal or a shell string is one word.
 func words(s string) []string {
+	s = expandHomeTemplates(s)
 	f := strings.FieldsFunc(s, func(r rune) bool {
 		switch r {
 		case ' ', '\t', '\n', '\r', '"', '\'', '`', '=', ':', ';', ',', '(', ')', '[', ']', '{', '}', '<', '>', '|', '&':
@@ -238,6 +241,41 @@ func words(s string) []string {
 		}
 	}
 	return f
+}
+
+// homeTemplates are the ways a script spells the home directory inside a string.
+var homeTemplates = []string{"${HOME}", "${process.env.HOME}", "${os.homedir()}", "${homedir()}"}
+
+// expandHomeTemplates writes the home directory for each template of it in s, and for each $HOME that is not the
+// start of a longer name ($HOMEDIR).
+func expandHomeTemplates(s string) string {
+	if !strings.Contains(s, "$") {
+		return s
+	}
+	home := homeDir()
+	for _, t := range homeTemplates {
+		s = strings.ReplaceAll(s, t, home)
+	}
+	var b strings.Builder
+	for {
+		i := strings.Index(s, "$HOME")
+		if i < 0 {
+			b.WriteString(s)
+			return b.String()
+		}
+		end := i + len("$HOME")
+		b.WriteString(s[:i])
+		if end < len(s) && isNameByte(s[end]) {
+			b.WriteString("$HOME")
+		} else {
+			b.WriteString(home)
+		}
+		s = s[end:]
+	}
+}
+
+func isNameByte(c byte) bool {
+	return c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 }
 
 // isRepoID reports whether w looks like a Hugging Face repository id: org/name, each part a name.

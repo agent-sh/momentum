@@ -66,12 +66,16 @@ type Exclude struct {
 	Remotes []string `json:"remotes"`
 }
 
-// NamesConfig locates Hermes's scheduled jobs (its jobs file and the directory its job scripts are in) and the
-// directories of installed commands, whose symlinks name what they run.
+// NamesConfig locates Hermes's scheduled jobs (its jobs file and the directory its job scripts are in), the
+// directories of installed commands, whose symlinks name what they run, and the harnesses' MCP server
+// configurations (a JSON file with mcpServers, as Claude Code's and a project's .mcp.json are; a TOML file with
+// mcp_servers tables, as Codex's is; a YAML file with an mcp_servers map, as Hermes's is), whose servers name what
+// they start.
 type NamesConfig struct {
 	HermesJobs    string   `json:"hermes_jobs"`
 	HermesScripts string   `json:"hermes_scripts"`
 	Links         []string `json:"links"`
+	MCP           []string `json:"mcp"`
 }
 
 // ModelsConfig is the models rule: models, datasets, model caches and run checkpoints. Each top-level item of a
@@ -213,6 +217,11 @@ const (
 	defaultDockerHours = 24
 )
 
+// defaultMCP are the harnesses' MCP configurations read when names.mcp is not set (an empty list reads none): Claude
+// Code's, Codex's and Hermes's. A missing file names nothing. Without them, a program an MCP server starts for each
+// call from a target dir is unseen and its dir is deleted.
+var defaultMCP = []string{"~/.claude.json", "~/.codex/config.toml", "~/.hermes/config.yaml"}
+
 // Normal is the configuration with its defaults filled and every path expanded.
 func (c Config) Normal() Config {
 	set := func(v *float64, d float64) {
@@ -264,6 +273,10 @@ func (c Config) Normal() Config {
 	c.Names.HermesJobs = paths.Expand(c.Names.HermesJobs)
 	c.Names.HermesScripts = paths.Expand(c.Names.HermesScripts)
 	c.Names.Links = exp(c.Names.Links)
+	if c.Names.MCP == nil {
+		c.Names.MCP = defaultMCP
+	}
+	c.Names.MCP = exp(c.Names.MCP)
 	c.UV.Path = paths.Expand(c.UV.Path)
 	c.Docker.Path = paths.Expand(c.Docker.Path)
 	return c
