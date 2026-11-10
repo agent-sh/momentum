@@ -1623,6 +1623,7 @@ func TestSessionsAreFoundInSupervisionsOwnRecord(t *testing.T) {
 	}
 	put(t, st,
 		sup("a", "case", `{"rule":"transient","why":"four tries without a turn that worked: the API stays down"}`, t0),
+		sup("b", "case", `{"rule":"transient","going":true,"why":"4 messages did not move it; it keeps trying"}`, t0), // not a give-up
 		sup("a", "outcome", `{"rule":"promise","result":"failed again"}`, t0), sup("b", "outcome", `{"rule":"promise","result":"failed again"}`, t0),
 		sup("b", "outcome", `{"rule":"promise","result":"failed again"}`, t0.Add(time.Hour)),
 		sup("c", "outcome", `{"rule":"promise","result":"worked"}`, t0), sup("d", "outcome", `{"rule":"promise","result":"worked"}`, t0),

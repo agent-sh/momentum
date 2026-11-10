@@ -34,7 +34,7 @@ const (
 	Wait = "wait" // a rule applies and acts at At; with no At, it waits for a sign (access back)
 	Hold = "hold" // a rule applies, but its owner typed into the session recently: it looks again at At
 	Skip = "skip" // never: the session asks its owner, is automated, or has no terminal to type into
-	Case = "case" // the rule used up its tries: a case opens, and nothing more is sent
+	Case = "case" // the rule used up its tries: a case opens, and nothing more is sent (transient records one and keeps trying)
 )
 
 // Marker opens every message momentum types, so the session, the owner and the evidence can tell it from his.

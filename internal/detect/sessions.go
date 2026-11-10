@@ -50,10 +50,14 @@ func (d Sessions) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 	for _, e := range sup {
 		var m struct {
 			Rule, Why, Result string
+			Going             bool
 		}
 		json.Unmarshal([]byte(e.Meta), &m)
 		switch e.Kind {
 		case supervise.KindCase:
+			if m.Going {
+				continue // its rule keeps trying: not a give-up, and the problem note shows it
+			}
 			reason := slug(strings.SplitN(m.Why, ":", 2)[0], 40)
 			gave = append(gave, occurrence{sig: signature("sessions", "gave-up:"+m.Rule+":"+reason), ev: e,
 				title: fmt.Sprintf("Supervision gives up on stopped sessions (%s: %s)", m.Rule, strings.SplitN(m.Why, ":", 2)[0])})

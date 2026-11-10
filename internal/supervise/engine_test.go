@@ -788,6 +788,67 @@ func TestATransientRuleKeepsTryingPastItsBackoffWithOneCase(t *testing.T) {
 	if c := events(t, st, KindCase); len(c) != 1 || metaMap(c[0])["tries"].(float64) != 4 || len(f.sent) != 6 {
 		t.Fatalf("cases %+v, sent %d", c, len(f.sent))
 	}
+	if n, _ := note(t, st, ProblemNote+s.Key); !strings.Contains(n.Title, "keeps trying") {
+		t.Fatalf("problem note %+v", n)
+	}
+}
+
+// failedTries is a session whose first n transient tries each landed and failed again, and the time of its last error.
+func failedTries(t *testing.T, sv *Supervisor, f *fakeSender, s *sessions.Session, now *time.Time, n int) time.Time {
+	t.Helper()
+	at := t0
+	for try := 0; try < n; try++ {
+		*now = at.Add(DefaultParams.Backoff[try])
+		run(t, sv, s)
+		lands(s, strings.TrimPrefix(f.sent[try], "%7 "), now.Add(time.Second), false)
+		at = now.Add(5 * time.Minute)
+		s.Since = at
+		*now = at.Add(time.Second)
+		run(t, sv, s)
+	}
+	return at
+}
+
+// The fourth message never shows up as a turn: that case closes the rule, so no case says it keeps trying.
+func TestAFourthMessageNotDeliveredOpensOnlyTheCaseThatCloses(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0
+	sv := supervisor(st, f, &now)
+	s := erroring()
+	at := failedTries(t, sv, f, s, &now, 3)
+	for i := 16; i < 60; i++ {
+		now = at.Add(time.Duration(i) * time.Minute)
+		run(t, sv, s)
+	}
+	c := events(t, st, KindCase)
+	if len(f.sent) != 4 || len(c) != 1 || metaMap(c[0])["going"] == true {
+		t.Fatalf("sent %d, cases %+v", len(f.sent), c)
+	}
+	if n, _ := note(t, st, ProblemNote+s.Key); strings.Contains(n.Title+n.Detail, "keeps trying") {
+		t.Fatalf("problem note %+v", n)
+	}
+}
+
+// Past the backoff, a message that lands and leaves the stop where it was does not bring the next one a scan later.
+func TestPastTheBackoffAMessageThatMovedNothingWaitsTheLastWait(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0
+	sv := supervisor(st, f, &now)
+	s := erroring()
+	at := failedTries(t, sv, f, s, &now, 4)
+	for i := 1; i <= 40; i++ { // a scan a minute; each message lands, and the stop's time stays
+		now = at.Add(time.Duration(i) * time.Minute)
+		n := len(f.sent)
+		run(t, sv, s)
+		if len(f.sent) > n {
+			lands(s, strings.TrimPrefix(f.sent[n], "%7 "), now.Add(time.Second), false)
+		}
+	}
+	if n := len(f.sent) - 4; n < 2 || n > 3 { // at 16 and 32 minutes
+		t.Fatalf("sent %d in 40 minutes past the backoff", n)
+	}
 	if _, ok := note(t, st, ProblemNote+s.Key); !ok {
 		t.Fatal("no problem note")
 	}

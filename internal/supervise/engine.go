@@ -30,7 +30,7 @@ const (
 	KindHold    = "hold"    // a rule applies, and the owner was at the session recently
 	KindSkip    = "skip"    // a rule would apply, but the session is not momentum's to act on, or the stop is stale
 	KindOutcome = "outcome" // what came of a message
-	KindCase    = "case"    // a rule used up its tries, or a message could not land: a case for the loop
+	KindCase    = "case"    // a rule used up its tries or its waits, or a message could not land: a case for the loop
 	KindPresent = "present" // its owner seen at the session's pane: a draft on its input line, a tmux mode, a line he cleared
 )
 
@@ -232,7 +232,16 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 		if d.Rule == "" {
 			continue // no rule applies, or a guard and no rule would apply anyway: nothing was decided
 		}
-		if d.Used && !h.noted(d.Rule, ownerAt) { // the waits ran out: one case for the owner, and the rule keeps trying
+		// Past its waits the rule counts from the stop, which a message that opened no turn does not move: it waits
+		// the last wait from that message, not one scan.
+		if l := h.last(); d.Used && d.Verdict == Act && l != nil && l.rule == d.Rule {
+			if next := l.at.Add(sv.Params.Backoff[len(sv.Params.Backoff)-1]); next.After(now) {
+				d.Verdict, d.At = Wait, next
+			}
+		}
+		// The waits ran out: one case for the owner, while the rule keeps trying. A rule that is closed or stale
+		// sends nothing more, so it records none.
+		if d.Used && d.Verdict != Case && d.Verdict != Skip && !h.noted(d.Rule, ownerAt) {
 			why := used(d.Rule, d.Try-1).Why + "; it keeps trying"
 			if err := sv.put(ctx, []store.Event{sv.caseEvent(ctx, s, stop, d.Rule, why, d.Try-1, now, true)}); err != nil {
 				return lines, err
@@ -613,6 +622,9 @@ func (sv *Supervisor) caseEvent(ctx context.Context, s *sessions.Session, stop S
 	}
 	if !sv.seen(ctx, e) { // a new case: one problem note, and the notice, once
 		title := fmt.Sprintf("momentum could not continue %s (%s)", sessionName(s), rule)
+		if going {
+			title = fmt.Sprintf("momentum keeps trying to continue %s (%s)", sessionName(s), rule)
+		}
 		detail := why + "."
 		if last := firstNonEmpty(stop.Error, Asked(stop.Words), stop.Words); last != "" {
 			detail += " It stopped on: " + clip(last, 160)
