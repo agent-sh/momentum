@@ -145,7 +145,7 @@ func typed(s *sessions.Session, text string, at time.Time) {
 func TestATransientErrorWaitsThenSendsThenFollowsTheOutcome(t *testing.T) {
 	st := testStore(t)
 	f := &fakeSender{}
-	now := t0.Add(5 * time.Minute)
+	now := t0.Add(30 * time.Second)
 	sv := supervisor(st, f, &now)
 	s := erroring()
 
@@ -153,7 +153,7 @@ func TestATransientErrorWaitsThenSendsThenFollowsTheOutcome(t *testing.T) {
 	if len(f.sent) != 0 || len(events(t, st, KindWait)) != 1 {
 		t.Fatalf("before its time: sent %q, events %+v", f.sent, events(t, st))
 	}
-	now = t0.Add(10 * time.Minute)
+	now = t0.Add(time.Minute)
 	run(t, sv, s)
 	if len(f.sent) != 1 || !strings.HasPrefix(f.sent[0], "%7 "+Marker) {
 		t.Fatalf("at its time: sent %q", f.sent)
@@ -171,7 +171,7 @@ func TestATransientErrorWaitsThenSendsThenFollowsTheOutcome(t *testing.T) {
 		t.Fatalf("sent again before it landed: %q", f.sent)
 	}
 	// It landed, and the turn it opened ended on the same error again.
-	lands(s, text, t0.Add(10*time.Minute+2*time.Second), false)
+	lands(s, text, t0.Add(time.Minute+2*time.Second), false)
 	s.Since = t0.Add(16 * time.Minute)
 	now = t0.Add(17 * time.Minute)
 	run(t, sv, s)
@@ -257,18 +257,20 @@ func TestNeverForAQuestionAndHoldWhileTheOwnerIsThere(t *testing.T) {
 	present := erroring()
 	present.Key = "sess-4"
 	typed(present, "and the changelog too", t0.Add(25*time.Minute))
-	opened := erroring() // he opened it again, and it stopped on the error right after
+	// he opened it again, and it stopped on the error right after: his opening came before the error, so the
+	// transient rule does not hold for it
+	opened := erroring()
 	opened.Key, opened.Started, opened.Since = "sess-6", t0.Add(24*time.Minute), t0.Add(24*time.Minute+time.Second)
 	run(t, sv, asks, auto, present, opened)
-	if len(f.sent) != 0 {
-		t.Fatalf("sent %q", f.sent)
+	if acts := events(t, st, KindAct); len(f.sent) != 1 || len(acts) != 1 || acts[0].Session != "sess-6" {
+		t.Fatalf("sent %q, acts %+v", f.sent, acts)
 	}
 	skips, holds := events(t, st, KindSkip), events(t, st, KindHold)
 	got := map[string]string{}
 	for _, e := range append(skips, holds...) {
 		got[e.Session] = e.Kind
 	}
-	if len(got) != 3 || got["sess-5"] != KindSkip || got["sess-4"] != KindHold || got["sess-6"] != KindHold {
+	if len(got) != 2 || got["sess-5"] != KindSkip || got["sess-4"] != KindHold {
 		t.Fatalf("skips %+v holds %+v", skips, holds)
 	}
 }
@@ -567,6 +569,33 @@ func TestALocalCommandOrAnAnsweredAskIsTheOwnerThere(t *testing.T) {
 	run(t, sv, ss...)
 	if len(f.sent) != 0 || len(events(t, st, KindHold)) != 4 {
 		t.Fatalf("sent %q, holds %+v", f.sent, events(t, st, KindHold))
+	}
+}
+
+// A local command after a transient error holds the continue for the owner window, whatever the phase stamp says:
+// the first scan stamps the stop at the transcript's last write, the command's echo, and a later record moves the
+// stamp again.
+func TestALocalCommandAfterTheErrorHoldsWhateverThePhaseStamp(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0.Add(2 * time.Minute)
+	sv := supervisor(st, f, &now)
+	s := erroring()
+	s.IdleSince, s.ControlAt, s.Since = t0, t0.Add(25*time.Second), t0.Add(25*time.Second+200*time.Millisecond) // he ran /model in it
+	run(t, sv, s)
+	if len(f.sent) != 0 || len(events(t, st, KindHold)) != 1 {
+		t.Fatalf("stamped at his command's echo: sent %q, holds %+v", f.sent, events(t, st, KindHold))
+	}
+	s.Since = t0.Add(5 * time.Minute)
+	now = t0.Add(7 * time.Minute)
+	run(t, sv, s)
+	if len(f.sent) != 0 {
+		t.Fatalf("stamped again: sent %q", f.sent)
+	}
+	now = s.ControlAt.Add(DefaultParams.OwnerWindow + time.Second)
+	run(t, sv, s)
+	if len(f.sent) != 1 {
+		t.Fatalf("after the window: sent %q", f.sent)
 	}
 }
 

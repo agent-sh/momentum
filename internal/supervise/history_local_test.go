@@ -164,7 +164,7 @@ func TestALocalCommandHoldsOnlyARuleThatHadNotActed(t *testing.T) {
 	lateNext := late.at
 	late.put(st)
 	early := newTimeline(t, "early").owner(0, "deploy it", "turn_duration").say(10*time.Second, "Deploying.").apiError(time.Minute, err503)
-	early.localCommand(5*time.Minute, "model", "")
+	early.localCommand(30*time.Second, "model", "")
 	command := early.at.Add(-time.Millisecond)
 	early.owner(12*time.Minute, ".", "")
 	earlyNext := early.at
@@ -428,7 +428,8 @@ func TestACodexAbortEndsTheWaitOnTheModel(t *testing.T) {
 func TestALabelledLocalCommandIsMeasuredAgainstTheRuleItDidNotMove(t *testing.T) {
 	st := testStore(t)
 	b := newTimeline(t, "early-step").owner(0, "deploy it", "turn_duration").say(10*time.Second, "Deploying.").apiError(time.Minute, err503)
-	b.localCommand(3*time.Minute, "login", "")
+	errAt := b.at
+	b.localCommand(30*time.Second, "login", "")
 	stepAt := b.at.Add(-time.Millisecond)
 	b.owner(time.Minute, "continue", "")
 	next := b.at
@@ -444,7 +445,7 @@ func TestALabelledLocalCommandIsMeasuredAgainstTheRuleItDidNotMove(t *testing.T)
 		if r.Point.Session != "early-step" || !r.Point.Next.At.Equal(next) {
 			continue
 		}
-		rule := t0.Add(DefaultParams.OwnerWindow) // held by the owner's own prompt, not by the command
+		rule := errAt.Add(DefaultParams.Backoff[0]) // the rule's own time, not the command's hold
 		if r.Label == nil || r.Outcome != OwnerFirst || !r.Measured.At.Equal(rule) || r.StepAt.Sub(r.Measured.At) != stepAt.Sub(rule) {
 			t.Fatalf("the labelled step: %v %q, rule at %v, gap %v", r.Label, r.Outcome, r.Measured.At, r.StepAt.Sub(r.Measured.At))
 		}
@@ -782,7 +783,8 @@ func TestAStepTakesItsNearestLabel(t *testing.T) {
 func TestFiredCountsEveryEarlierHold(t *testing.T) {
 	st := testStore(t)
 	b := newTimeline(t, "held").owner(0, "deploy it", "turn_duration").say(10*time.Second, "Deploying.").apiError(time.Minute, err503)
-	b.localCommand(3*time.Minute, "login", "")
+	errAt := b.at
+	b.localCommand(30*time.Second, "login", "")
 	login := b.at.Add(-time.Millisecond)
 	b.owner(12*time.Minute, "continue", "") // after the rule's own time, before the command's hold ends
 	next := b.at
@@ -795,7 +797,7 @@ func TestFiredCountsEveryEarlierHold(t *testing.T) {
 	labels := []Label{{Session: "held", At: login, Kind: "restart"}}
 	for _, r := range Replay(points, labels, DefaultParams, probeAt(time.Time{}), until) {
 		if r.Point.Session == "held" && r.Point.Next.At.Equal(next) {
-			if r.Fired || !r.Decision.At.Equal(login.Add(DefaultParams.OwnerWindow)) || !r.Measured.At.Equal(t0.Add(DefaultParams.OwnerWindow)) || r.Outcome != OwnerFirst {
+			if r.Fired || !r.Decision.At.Equal(login.Add(DefaultParams.OwnerWindow)) || !r.Measured.At.Equal(errAt.Add(DefaultParams.Backoff[0])) || r.Outcome != OwnerFirst {
 				t.Fatalf("fired %v, decision at %v, measured at %v, %q", r.Fired, r.Decision.At, r.Measured.At, r.Outcome)
 			}
 			return

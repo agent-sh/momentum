@@ -93,9 +93,8 @@ func TestReplayMeasuresEachRuleAgainstWhatCameNext(t *testing.T) {
 	rs := Replay(points, labels, DefaultParams, probeAt(time.Time{}), until)
 
 	r := outcomeOf(t, rs, "nudged", t0.Add(10*time.Second+time.Minute))
-	// It would have tried at 10 minutes, but the owner typed the turn 70 seconds before it ended: held until 15
-	// minutes after his turn.
-	if r.Outcome != Covered || r.Decision.Rule != RuleTransient || r.Decision.Verdict != Hold || r.Earlier != 16*time.Minute+10*time.Second {
+	// It tries a minute after the error: the turn the owner typed 70 seconds before it ended does not hold it.
+	if r.Outcome != Covered || r.Decision.Rule != RuleTransient || r.Decision.Verdict != Wait || r.Earlier != 29*time.Minute {
 		t.Fatalf("nudged: %+v", r)
 	}
 	if r := outcomeOf(t, rs, "woke", t0.Add(10*time.Second)); r.Decision.Rule != RulePromise || r.Fired || r.Outcome != "" {
@@ -115,10 +114,11 @@ func TestReplayMeasuresEachRuleAgainstWhatCameNext(t *testing.T) {
 	}
 }
 
-func TestAnInterruptionHoldsTheReplayToo(t *testing.T) {
+func TestAnInterruptionIsTheOwnerThereInTheReplayToo(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
-	// He interrupts a turn, and the next one stops on a 503 a minute later: he was there.
+	// He interrupts a turn, and the next one stops on a 503 a minute later: he was there at the interruption. It
+	// came before the error, so it does not hold the transient rule.
 	newTimeline(t, "esc").owner(0, "deploy it", "turn_duration").call(time.Second, "Bash", "tu1", `{"command":"deploy"}`).
 		add(5*time.Minute, "harness_text", store.ActorHarness, "", "[Request interrupted by user for tool use]", "").
 		say(time.Second, "Stopped.").apiError(time.Minute, err503).put(st)
@@ -132,8 +132,8 @@ func TestAnInterruptionHoldsTheReplayToo(t *testing.T) {
 		}
 		d := Plan(p.Stop, Tries{}, DefaultParams, nil)
 		interrupted := t0.Add(time.Second + 5*time.Minute)
-		if d.Rule != RuleTransient || d.Verdict != Hold || !d.At.Equal(interrupted.Add(DefaultParams.OwnerWindow)) {
-			t.Fatalf("%+v", d)
+		if !p.Stop.OwnerAt.Equal(interrupted) || d.Rule != RuleTransient || d.Verdict != Wait || !d.At.Equal(p.Stop.At.Add(time.Minute)) {
+			t.Fatalf("owner at %v: %+v", p.Stop.OwnerAt, d)
 		}
 		return
 	}

@@ -72,7 +72,7 @@ type Stop struct {
 	ScreenIdle      time.Time      // the first look that found its screen showing no turn running, for RequestAt
 	Queued          int            // messages its user typed while the turn ran, which the harness holds
 	Slept, Woke     time.Time      // the machine's last suspend: a wait counts from its end when it began before the wait ended
-	OwnerAt         time.Time      // when the owner was last at the session: his last turn, or his opening it
+	OwnerAt         time.Time      // when the owner was last at the session: his last turn, a local command, a draft, or his opening it
 	Started         time.Time      // when the session's process started; a stop before it is a past process's
 }
 
@@ -88,7 +88,7 @@ type Probe interface {
 
 // Params are the thresholds.
 type Params struct {
-	OwnerWindow  time.Duration   // the owner typed into the session within it: he is there, so momentum holds
+	OwnerWindow  time.Duration   // the owner was at the session within it, for transient after the failed turn: he is there, so momentum holds
 	Backoff      []time.Duration // transient: the wait after the error before each try; their count bounds the tries
 	AccessTries  int             // access: tries, one per sign that access is back
 	ResetGrace   time.Duration   // access: after the reset time a limit states
@@ -105,10 +105,11 @@ type Params struct {
 }
 
 // DefaultParams are the thresholds momentum ships with, chosen with `momentum supervise replay` over a store's
-// history; SPEC.md, Supervision, says how each one is chosen.
+// history, all but the transient rule's first wait, which is one minute; SPEC.md, Supervision, says how each one
+// is chosen.
 var DefaultParams = Params{
 	OwnerWindow:  15 * time.Minute,
-	Backoff:      []time.Duration{10 * time.Minute, 4 * time.Minute, 8 * time.Minute, 16 * time.Minute},
+	Backoff:      []time.Duration{time.Minute, 4 * time.Minute, 8 * time.Minute, 16 * time.Minute},
 	AccessTries:  3,
 	ResetGrace:   time.Minute,
 	CutoffWait:   2 * time.Minute,
@@ -125,7 +126,9 @@ var DefaultParams = Params{
 
 // Live are the rules that act by default; the others run dry, recording what they would have sent. A rule is live
 // when its replay acts unasked no more often than the owner's own nudges go to a session that would have gone on
-// by itself, or when the owner made it live over its replay, as he did stalled (SPEC.md, Supervision).
+// by itself, or when the owner made it live over its replay, as he did stalled. The transient rule is live by what
+// it sends: the continue a person types at such a stop, sent before a session that goes on by itself has shown it
+// (SPEC.md, Supervision).
 var Live = map[string]bool{RuleTransient: true, RuleAccess: true, RuleStalled: true}
 
 // Decision is what supervision does about one session now.
@@ -189,13 +192,17 @@ func PlanOnly(rule string, s Stop, tries Tries, p Params, probe Probe) Decision 
 	return planWith([]string{rule}, s, tries, p, probe)
 }
 
+// planWith is the first of rules that applies to a stop, with the time it acts. A rule whose wait ends inside the
+// owner window holds until the window ends. The transient rule holds only when the owner was at the session after
+// the failed turn ended (failedAt): his turn before the error is the turn that failed, and says nothing about him
+// handling the error; a local command or a draft after it shows him there.
 func planWith(rules []string, s Stop, tries Tries, p Params, probe Probe) Decision {
 	for _, name := range rules {
 		d, ok := ruleFuncs[name](s, tries, p, probe)
 		if !ok {
 			continue
 		}
-		if d.Verdict == Wait && !d.At.IsZero() && !s.OwnerAt.IsZero() {
+		if d.Verdict == Wait && !d.At.IsZero() && !s.OwnerAt.IsZero() && (name != RuleTransient || s.OwnerAt.After(failedAt(s))) {
 			if until := s.OwnerAt.Add(p.OwnerWindow); until.After(d.At) {
 				d.Verdict, d.At = Hold, until
 				d.Why += "; its owner typed into it at " + s.OwnerAt.Local().Format("15:04")
@@ -204,6 +211,16 @@ func planWith(rules []string, s Stop, tries Tries, p Params, probe Probe) Decisi
 		return d
 	}
 	return Decision{}
+}
+
+// failedAt is when the turn a transient stop reads ended: the error's own time. A live stop's At is its phase
+// stamp, which any record after the error moves (the echo of a local command, a summary); the turn's end stays.
+// A stop with no turn's end on record has only At.
+func failedAt(s Stop) time.Time {
+	if s.IdleAt.IsZero() {
+		return s.At
+	}
+	return s.IdleAt
 }
 
 // guard is what no rule may do: act on an automated run, answer a session's question, plan or permission, or
@@ -244,7 +261,8 @@ func usedAt(rule string, n int, at time.Time, why string) Decision {
 func priorProcess(s Stop) bool { return !s.Started.IsZero() && s.At.Before(s.Started) }
 
 // transient: the turn ended on a transient API error. It tries again after each wait of the backoff, counted from
-// the error that ended the last try, and opens a case when the waits run out.
+// the error that ended the last try, and opens a case when the waits run out. The first wait is one minute, and
+// the owner's turn before the error does not hold it (planWith).
 func transient(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
 	if s.Working || priorProcess(s) || ErrorClass(s.Error) != Transient {
 		return Decision{}, false

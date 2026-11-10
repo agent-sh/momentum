@@ -2214,7 +2214,7 @@ func TestANudgeAfterAReopeningStillCounts(t *testing.T) {
 		{"after supervision's message, the agent worked", "Starting the soak.",
 			worked(ev(store.Transcripts, "w", "harness_text", store.ActorHarness, "", supervise.Marker+" This session was reopened after it ended mid-task. Continue where you left off.",
 				`{"input_kind":"typed","why":"momentum supervise"}`, reopen.Add(2*time.Minute))), reopen.Add(10 * time.Minute)},
-		{"after a loop tick and an API error", "Starting the soak.", []store.Event{tick(reopen.Add(time.Minute)), apiErr(reopen.Add(90 * time.Second))}, reopen.Add(4 * time.Minute)},
+		{"after a loop tick and an API error", "Starting the soak.", []store.Event{tick(reopen.Add(time.Minute)), apiErr(reopen.Add(90 * time.Second))}, reopen.Add(2 * time.Minute)},
 		{"after a loop tick, an API error and a task's notification", "Starting the soak.", []store.Event{tick(reopen.Add(20 * time.Second)), apiErr(reopen.Add(30 * time.Second)),
 			ev(store.Transcripts, "w", "harness_text", store.ActorHarness, "", taskNotice("b2", "completed", "Background command finished"), `{"why":"origin task-notification"}`,
 				reopen.Add(40*time.Second))}, reopen.Add(time.Minute)},

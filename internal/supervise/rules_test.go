@@ -62,11 +62,11 @@ func check(t *testing.T, rule func(Stop, Tries, Params, Probe) (Decision, bool),
 func TestTransientTriesAgainWithABackoff(t *testing.T) {
 	errStop := stopped(func(s *Stop) { s.Phase, s.Error = sessions.NeedsYou, err503 })
 	check(t, transient, []ruleCase{
-		{"first try", errStop, Tries{}, nil, Wait, t0.Add(10 * time.Minute), 1, "Continue where you left off"},
+		{"first try", errStop, Tries{}, nil, Wait, t0.Add(time.Minute), 1, "Continue where you left off"},
 		{"second try, counted from the error that ended the first", errStop, Tries{RuleTransient: 1}, nil, Wait, t0.Add(4 * time.Minute), 2, Marker},
 		{"fourth try", errStop, Tries{RuleTransient: 3}, nil, Wait, t0.Add(16 * time.Minute), 4, ""},
 		{"tries used up", errStop, Tries{RuleTransient: 4}, nil, Case, time.Time{}, 4, ""},
-		{"background work in flight does not stop it", stopped(func(s *Stop) { s.Phase, s.Error, s.Tasks = sessions.Background, err503, 2 }), Tries{}, nil, Wait, t0.Add(10 * time.Minute), 1, ""},
+		{"background work in flight does not stop it", stopped(func(s *Stop) { s.Phase, s.Error, s.Tasks = sessions.Background, err503, 2 }), Tries{}, nil, Wait, t0.Add(time.Minute), 1, ""},
 		{"a refusal is never tried again", stopped(func(s *Stop) { s.Error = "API Error: the safeguards flagged this message" }), Tries{}, nil, "", time.Time{}, 0, ""},
 		{"a login error is not transient", stopped(func(s *Stop) { s.Error = errLogin }), Tries{}, nil, "", time.Time{}, 0, ""},
 		{"a turn running", stopped(func(s *Stop) { s.Error, s.Working = err503, true }), Tries{}, nil, "", time.Time{}, 0, ""},
@@ -160,17 +160,19 @@ func TestGuardsKeepRulesOffWhatIsNotMomentums(t *testing.T) {
 }
 
 func TestTheOwnersRecentTurnHoldsARule(t *testing.T) {
-	s := stopped(func(s *Stop) { s.Phase, s.Error, s.OwnerAt = sessions.NeedsYou, err503, t0.Add(-10*time.Minute) })
-	d := Plan(s, Tries{}, DefaultParams, nil)
-	if d.Verdict != Wait || !d.At.Equal(t0.Add(10*time.Minute)) {
+	cut := "The model's reply was cut off before it finished (it hit its output length limit), so Hermes didn't run the incomplete action. Nothing was changed. Send `continue`, ask for the work in smaller steps, or raise max_tokens for this model."
+	h := stopped(func(s *Stop) {
+		s.Tool, s.Where, s.Words, s.OwnerAt = "hermes", "cli", Words(cut), t0.Add(-14*time.Minute)
+	})
+	if d := Plan(h, Tries{}, DefaultParams, nil); d.Verdict != Wait || !d.At.Equal(t0.Add(2*time.Minute)) {
 		t.Fatalf("his window ends before the rule acts: %+v", d)
 	}
-	s.OwnerAt = t0.Add(-time.Minute) // the turn he typed ended on the error
-	if d := Plan(s, Tries{}, DefaultParams, nil); d.Verdict != Hold || !d.At.Equal(t0.Add(14*time.Minute)) {
+	h.OwnerAt = t0.Add(-3 * time.Minute) // the turn he typed ended on the cutoff
+	if d := Plan(h, Tries{}, DefaultParams, nil); d.Verdict != Hold || !d.At.Equal(t0.Add(12*time.Minute)) {
 		t.Fatalf("his window ends after: %+v", d)
 	}
-	s.OwnerAt = t0.Add(5 * time.Minute) // he typed after it stopped, and is there
-	d = Plan(s, Tries{}, DefaultParams, nil)
+	s := stopped(func(s *Stop) { s.Phase, s.Error, s.OwnerAt = sessions.NeedsYou, err503, t0.Add(5*time.Minute) }) // he typed after it stopped, and is there
+	d := Plan(s, Tries{}, DefaultParams, nil)
 	if d.Verdict != Hold || !d.At.Equal(t0.Add(20*time.Minute)) {
 		t.Fatalf("typed recently: %+v", d)
 	}
@@ -182,12 +184,53 @@ func TestTheOwnersRecentTurnHoldsARule(t *testing.T) {
 	}
 }
 
+// The owner's turn before a transient error is the turn that failed: it does not hold the continue, which goes a
+// minute after the error. Only his being at the session after the stop holds it.
+func TestTheTurnThatFailedDoesNotHoldTheTransientRule(t *testing.T) {
+	s := stopped(func(s *Stop) { s.Phase, s.Error, s.OwnerAt = sessions.NeedsYou, err503, t0.Add(-3*time.Minute) })
+	if d := Plan(s, Tries{}, DefaultParams, nil); d.Verdict != Wait || !d.At.Equal(t0.Add(time.Minute)) {
+		t.Fatalf("the turn he typed ended on the error: %+v", d)
+	}
+	if d := Decide(s, Tries{}, DefaultParams, nil, t0.Add(time.Minute)); d.Verdict != Act || d.Rule != RuleTransient {
+		t.Fatalf("a minute after the error: %+v", d)
+	}
+	s.OwnerAt = t0.Add(30 * time.Second) // a local command after the stop: he is handling it
+	if d := Plan(s, Tries{}, DefaultParams, nil); d.Verdict != Hold || !d.At.Equal(s.OwnerAt.Add(DefaultParams.OwnerWindow)) {
+		t.Fatalf("he was there after the stop: %+v", d)
+	}
+	if d := Decide(s, Tries{}, DefaultParams, nil, t0.Add(time.Minute)); d.Verdict != Hold {
+		t.Fatalf("still held a minute after the error: %+v", d)
+	}
+}
+
+// A live stop's time is its phase stamp, which a record after the error moves: the echo of the owner's local
+// command, a summary. The transient rule's hold reads the owner against the failed turn's end, which stays.
+func TestTheTransientHoldCountsFromTheFailedTurnsEnd(t *testing.T) {
+	command := t0.Add(25 * time.Second)
+	errStop := func(at, owner time.Time) Stop {
+		return stopped(func(s *Stop) { s.Phase, s.Error, s.IdleAt, s.At, s.OwnerAt = sessions.NeedsYou, err503, t0, at, owner })
+	}
+	for name, at := range map[string]time.Time{
+		"a command between the error and the first scan": command.Add(200 * time.Millisecond),
+		"the phase stamped again after his command":      t0.Add(5 * time.Minute),
+	} {
+		if d := Plan(errStop(at, command), Tries{}, DefaultParams, nil); d.Verdict != Hold || !d.At.Equal(command.Add(DefaultParams.OwnerWindow)) {
+			t.Errorf("%s: %+v", name, d)
+		}
+	}
+	// his being there as the turn ended is the turn that failed, not him handling the error
+	at := t0.Add(200 * time.Millisecond)
+	if d := Plan(errStop(at, t0), Tries{}, DefaultParams, nil); d.Verdict != Wait || !d.At.Equal(at.Add(time.Minute)) {
+		t.Errorf("the owner at the turn's end: %+v", d)
+	}
+}
+
 func TestDecideActsOnceTheWaitIsOver(t *testing.T) {
 	s := stopped(func(s *Stop) { s.Phase, s.Error = sessions.NeedsYou, err503 })
-	if d := Decide(s, Tries{}, DefaultParams, nil, t0.Add(9*time.Minute)); d.Verdict != Wait {
+	if d := Decide(s, Tries{}, DefaultParams, nil, t0.Add(59*time.Second)); d.Verdict != Wait {
 		t.Fatalf("before: %+v", d)
 	}
-	if d := Decide(s, Tries{}, DefaultParams, nil, t0.Add(10*time.Minute)); d.Verdict != Act || d.Rule != RuleTransient {
+	if d := Decide(s, Tries{}, DefaultParams, nil, t0.Add(time.Minute)); d.Verdict != Act || d.Rule != RuleTransient {
 		t.Fatalf("after: %+v", d)
 	}
 	if d := Decide(stopped(func(s *Stop) {}), Tries{}, DefaultParams, nil, t0.Add(time.Hour)); d.Rule != "" || d.Verdict != "" {
