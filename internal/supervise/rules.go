@@ -89,7 +89,7 @@ type Probe interface {
 // Params are the thresholds.
 type Params struct {
 	OwnerWindow  time.Duration   // the owner was at the session within it, for transient after the failed turn: he is there, so momentum holds
-	Backoff      []time.Duration // transient: the wait after the error before each try; their count bounds the tries
+	Backoff      []time.Duration // transient: the wait after the error before each try; the last one repeats
 	AccessTries  int             // access: tries, one per sign that access is back
 	ResetGrace   time.Duration   // access: after the reset time a limit states
 	CutoffWait   time.Duration
@@ -141,6 +141,7 @@ type Decision struct {
 	Why      string
 	Try      int  // the try a message is, from 1
 	Stale    bool // the rule's time came longer ago than Params.Stale: it does not act
+	Used     bool // the rule's waits ran out and it keeps trying at the last one: a case is recorded once
 	thenCase bool // its time opens a case, not a message: the tries are used up, and only the wait tells
 }
 
@@ -261,18 +262,21 @@ func usedAt(rule string, n int, at time.Time, why string) Decision {
 func priorProcess(s Stop) bool { return !s.Started.IsZero() && s.At.Before(s.Started) }
 
 // transient: the turn ended on a transient API error. It tries again after each wait of the backoff, counted from
-// the error that ended the last try, and opens a case when the waits run out. The first wait is one minute, and
-// the owner's turn before the error does not hold it (planWith).
+// the error that ended the last try. When the waits run out it keeps trying at the last one: a provider outage
+// ends by itself, and a try costs one failed request. The engine records a case once then (Used), so the owner
+// sees it. The first wait is one minute, and the owner's turn before the error does not hold it (planWith).
 func transient(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
 	if s.Working || priorProcess(s) || ErrorClass(s.Error) != Transient {
 		return Decision{}, false
 	}
 	n := tries[RuleTransient]
-	if n >= len(p.Backoff) {
+	if len(p.Backoff) == 0 {
 		return used(RuleTransient, n), true
 	}
 	text := Marker + " Your last turn stopped on a transient API error. Continue where you left off."
-	return wait(RuleTransient, s.At.Add(p.Backoff[n]), n+1, text, "the turn ended on a transient API error"), true
+	d := wait(RuleTransient, s.At.Add(p.Backoff[min(n, len(p.Backoff)-1)]), n+1, text, "the turn ended on a transient API error")
+	d.Used = n >= len(p.Backoff)
+	return d, true
 }
 
 // access: the turn ended on a login that expired, a usage limit or an organization block. Trying again blindly

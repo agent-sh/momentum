@@ -666,10 +666,7 @@ func TestAnOwnerTurnThatIsMomentumsDoesNotResetTheTries(t *testing.T) {
 		now = at.Add(time.Second)
 		run(t, sv, s)
 	}
-	for i := 0; i < 3; i++ {
-		now = now.Add(20 * time.Minute)
-		run(t, sv, s)
-	}
+	// the fourth try's failure is counted as the fourth: the case that tells the waits ran out is on record
 	if len(f.sent) != 4 || len(events(t, st, KindCase)) != 1 {
 		t.Fatalf("sent %d, cases %+v", len(f.sent), events(t, st, KindCase))
 	}
@@ -765,15 +762,16 @@ func TestAMessageThatOpensNoTurnOpensACaseAndAProblemNote(t *testing.T) {
 	}
 }
 
-func TestUsedUpTriesOpenOneCase(t *testing.T) {
+// An outage that outlasts the backoff: the transient rule keeps trying at the last wait, and one case tells the owner.
+func TestATransientRuleKeepsTryingPastItsBackoffWithOneCase(t *testing.T) {
 	st := testStore(t)
 	f := &fakeSender{}
 	now := t0
 	sv := supervisor(st, f, &now)
 	s := erroring()
 	at := t0
-	for try := 0; try < 4; try++ { // each try lands and fails again
-		now = at.Add(DefaultParams.Backoff[try])
+	for try := 0; try < 6; try++ { // each try lands and fails again; the fifth and sixth wait 16 minutes too
+		now = at.Add(DefaultParams.Backoff[min(try, 3)])
 		run(t, sv, s)
 		if len(f.sent) != try+1 {
 			t.Fatalf("try %d: sent %d", try+1, len(f.sent))
@@ -783,12 +781,11 @@ func TestUsedUpTriesOpenOneCase(t *testing.T) {
 		s.Since = at
 		now = at.Add(time.Second)
 		run(t, sv, s)
+		if c := events(t, st, KindCase); len(c) != min(try/3, 1) { // the case opens once the four waits are used
+			t.Fatalf("try %d: cases %+v", try+1, c)
+		}
 	}
-	for i := 0; i < 3; i++ { // later runs, hours later too, send nothing and open nothing more
-		now = now.Add(time.Hour)
-		run(t, sv, s)
-	}
-	if c := events(t, st, KindCase); len(c) != 1 || len(f.sent) != 4 {
+	if c := events(t, st, KindCase); len(c) != 1 || metaMap(c[0])["tries"].(float64) != 4 || len(f.sent) != 6 {
 		t.Fatalf("cases %+v, sent %d", c, len(f.sent))
 	}
 	if _, ok := note(t, st, ProblemNote+s.Key); !ok {

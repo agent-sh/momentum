@@ -232,6 +232,12 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 		if d.Rule == "" {
 			continue // no rule applies, or a guard and no rule would apply anyway: nothing was decided
 		}
+		if d.Used && !h.noted(d.Rule, ownerAt) { // the waits ran out: one case for the owner, and the rule keeps trying
+			why := used(d.Rule, d.Try-1).Why + "; it keeps trying"
+			if err := sv.put(ctx, []store.Event{sv.caseEvent(ctx, s, stop, d.Rule, why, d.Try-1, now, true)}); err != nil {
+				return lines, err
+			}
+		}
 		if d.Verdict == Act {
 			d.Text = act.SafeText(d.Text) // as it will be typed, and so as the session will record it
 		}
@@ -592,11 +598,19 @@ func (sv *Supervisor) event(s *sessions.Session, stop Stop, d Decision, kind str
 
 // openCase is a case about one stop of one rule, for one reason; its notice goes out once.
 func (sv *Supervisor) openCase(ctx context.Context, s *sessions.Session, stop Stop, rule, why string, tries int, now time.Time) store.Event {
+	return sv.caseEvent(ctx, s, stop, rule, why, tries, now, false)
+}
+
+// caseEvent is openCase; a going case is on record for the owner while its rule keeps sending (closed, noted).
+func (sv *Supervisor) caseEvent(ctx context.Context, s *sessions.Session, stop Stop, rule, why string, tries int, now time.Time, going bool) store.Event {
 	reason := strings.SplitN(why, ":", 2)[0]
 	e := store.Event{Source: store.Supervise, TS: now, Session: s.Key, Harness: s.Tool, Model: s.Model, Cwd: s.Cwd, Actor: store.ActorDetector,
 		Kind: KindCase, SourceKey: fmt.Sprintf("case:%s:%s:%d:%s", s.Key, rule, stop.At.UnixMilli(), reason)}
 	e.Summary = oneLine(fmt.Sprintf("%s: case: %s: %s", rule, firstNonEmpty(s.Name, s.Key), why))
 	m := map[string]any{"family": "sessions", "rule": rule, "why": why, "tries": tries, "stop_at": stop.At.UnixMilli(), "error": stop.Error}
+	if going {
+		m["going"] = true
+	}
 	if !sv.seen(ctx, e) { // a new case: one problem note, and the notice, once
 		title := fmt.Sprintf("momentum could not continue %s (%s)", sessionName(s), rule)
 		detail := why + "."
@@ -672,6 +686,7 @@ type caseRec struct {
 	at     time.Time
 	rule   string
 	stopAt time.Time
+	going  bool // its rule keeps sending: the case is on record, and does not close the rule
 }
 
 func history(evs []store.Event) past {
@@ -729,7 +744,7 @@ func history(evs []store.Event) past {
 			}
 			outcomes[of][str(m["result"])] = true
 		case KindCase:
-			h.cases = append(h.cases, caseRec{at: e.TS, rule: str(m["rule"]), stopAt: time.UnixMilli(int64(num(m["stop_at"])))})
+			h.cases = append(h.cases, caseRec{at: e.TS, rule: str(m["rule"]), stopAt: time.UnixMilli(int64(num(m["stop_at"]))), going: m["going"] == true})
 		}
 	}
 	for i := range h.sends {
@@ -794,9 +809,28 @@ func runOwner(key string) string {
 
 // closed reports a rule momentum must not send for again: a case is open for it since the owner's last turn
 // (tries used up, a message that did not land or stayed on the input line). It stays closed until he comes back.
+// A going case does not close its rule.
 func (h past) closed(rule string, ownerAt time.Time) bool {
 	for _, c := range h.cases {
-		if c.rule == rule && c.at.After(ownerAt) {
+		if c.rule == rule && c.at.After(ownerAt) && !c.going {
+			return true
+		}
+	}
+	return false
+}
+
+// noted reports a going case on record for the rule's episode: since the owner's last turn, with none of the
+// rule's messages working since. One case per episode, however many tries follow.
+func (h past) noted(rule string, ownerAt time.Time) bool {
+	for _, c := range h.cases {
+		if !c.going || c.rule != rule || !c.at.After(ownerAt) {
+			continue
+		}
+		worked := false
+		for _, s := range h.sends {
+			worked = worked || s.rule == rule && s.result[Worked] && s.at.After(c.at)
+		}
+		if !worked {
 			return true
 		}
 	}
