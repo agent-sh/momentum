@@ -18,6 +18,11 @@ func hermesMissing(path string) string {
 	return fmt.Sprintf(`{"content": "", "total_lines": 0, "file_size": 0, "truncated": false, "is_binary": false, "is_image": false, "error": "File not found: %s", "not_found": true}`, path)
 }
 
+// hermesNoPath is Hermes's search_files of a path that is not there.
+func hermesNoPath(path string) string {
+	return fmt.Sprintf(`{"total_count": 0, "error": "Path not found: %s"}`, path)
+}
+
 // A read tool's own error that no file is at its path, in its harness's words at the error's start, is keyed by the
 // read tool and the path its call names: the home folded to ~, . and .. cleaned, nothing else taken out. A read whose
 // call names no path has nothing to key it by, and what is no read's miss keeps its words.
@@ -53,6 +58,17 @@ func TestANotFoundReadIsKeyedByThePathItMissed(t *testing.T) {
 		{"claude", "Read", claudeMissing, `{"file_path":"/w/a1b2c3d4e5f6/12345.json"}`, "miss:read:/w/a1b2c3d4e5f6/12345.json"},
 		// a file named P is its own path's key, never an older key of words (tool:...:file not found: P)
 		{"hermes", "read_file", hermesMissing("P"), `{"path":"P"}`, "miss:read-file:P"},
+		// Hermes's search_files of a path that is not there, its similar paths after it or not
+		{"hermes", "search_files", hermesNoPath("/w/a"), `{"pattern":"x","path":"/w/a"}`, "miss:search-files:/w/a"},
+		{"hermes", "search_files", hermesNoPath("/w/a.sh. Similar paths: /w/a.py"), `{"pattern":"x","path":"/w/./a.sh"}`, "miss:search-files:/w/a.sh"},
+		{"hermes", "search_files", hermesNoPath("/home/u/p"), `{"pattern":"x","target":"files","path":"~/p"}`, "miss:search-files:~/p"},
+		{"hermes", "search_files", hermesNoPath("src"), `{"pattern":"x","path":"src"}`, "miss:search-files:src"},
+		{"hermes", "search_files", hermesNoPath("P"), `{"pattern":"x","path":"P"}`, "miss:search-files:P"},
+		{"hermes", "search_files", hermesNoPath("/w/a"), `{"pattern":"x"}`, ""},
+		// another tool's words for it, or another error of search_files, keep their words
+		{"hermes", "read_file", hermesNoPath("/w/a"), `{"path":"/w/a"}`, "tool:read-file:path not found: P"},
+		{"hermes", "search_files", hermesMissing("/w/a"), `{"pattern":"x","path":"/w/a"}`, "tool:search-files:file not found: P"},
+		{"hermes", "search_files", `{"total_count": 0, "error": "Search failed: Path not found: /w/a"}`, `{"pattern":"x","path":"/w/a"}`, "tool:search-files:search failed: path not found: P"},
 		// no path: nothing to key it by
 		{"claude", "Read", claudeMissing, "", ""},
 		{"claude", "Read", claudeMissing, `{"file_path":"/w/` + strings.Repeat("x", 240) + `…`, ""},
@@ -229,6 +245,22 @@ func TestANotFoundReadRecursOnlyByItsPath(t *testing.T) {
 	}
 	if cs, err := st.Cases(ctx, store.CaseFilter{All: true}); err != nil || len(cs) != 1 {
 		t.Fatalf("cases %d, %v", len(cs), err)
+	}
+}
+
+// Hermes's searches of a path that is not there recur only by their path, as reads do: two directories are two
+// signatures, one directory searched twice is one, and no key of their words merges them.
+func TestASearchOfAMissingPathRecursOnlyByItsPath(t *testing.T) {
+	f := fileTools{harness: "hermes"}
+	search := func(session, path, text string, at time.Time) []store.Event {
+		return f.pair(session, "search_files", fmt.Sprintf(`{"pattern":"x","path":%q}`, path), text, true, at)
+	}
+	st := testStore(t)
+	put(t, st, slices.Concat(search("s1", "/w/a", hermesNoPath("/w/a"), t0), search("s2", "/w/a", hermesNoPath("/w/a. Similar paths: /w/ab"), t0.Add(time.Hour)),
+		search("s3", "/w/b", hermesNoPath("/w/b"), t0.Add(2*time.Hour)))...)
+	fs, err := Failures{Recur: Recur{Events: 1}}.Detect(context.Background(), st, week())
+	if got, want := signatures(fs), []string{"failures/v2:miss:search-files:/w/a 2", "failures/v2:miss:search-files:/w/b 1"}; err != nil || !slices.Equal(got, want) {
+		t.Fatalf("got %v, %v, want %v", got, err, want)
 	}
 }
 

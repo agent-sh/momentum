@@ -315,6 +315,24 @@ var missNames = map[string]*regexp.Regexp{
 	"pi":       regexp.MustCompile(`^ENOENT: no such file or directory, access '(.*)'`),
 }
 
+// searchMisses are a search tool's own words for a path it was to search that is not there, by harness and tool (in
+// lower case), with the path they name: Hermes's search_files (its JSON's error field, then the similar paths it
+// found, if any).
+var searchMisses = map[string]*regexp.Regexp{
+	"hermes/search_files": regexp.MustCompile(`^Path not found: (.*?)(?:\. Similar paths: .*)?$`),
+}
+
+// missForm is a tool's words for a miss and the path they name (missForms and missNames for a read tool,
+// searchMisses for a search tool), or nil for a tool that has none.
+func missForm(harness, tool string) (form, name *regexp.Regexp) {
+	tool = strings.ToLower(tool)
+	if readTools[tool] {
+		return missForms[harness], missNames[harness]
+	}
+	re := searchMisses[harness+"/"+tool]
+	return re, re
+}
+
 // pathKeys are the fields of a file tool's input that name its file; readPathKeys, a read tool's, Grok's
 // target_file too.
 var (
@@ -322,11 +340,12 @@ var (
 	readPathKeys = map[string]bool{"file_path": true, "filePath": true, "path": true, "target_file": true}
 )
 
-// missWords are a failed result's words when they are a read tool's own error that no file is at its path, in its
-// harness's words (missForms): Claude Code's in its tool_use_error or not, Hermes's in its JSON's error field.
+// missWords are a failed result's words when they are a read tool's own error that no file is at its path, or a
+// search tool's that no path is, in its harness's words (missForm): Claude Code's in its tool_use_error or not,
+// Hermes's in its JSON's error field.
 func missWords(harness, tool, text string) (string, bool) {
-	re := missForms[harness]
-	if re == nil || !readTools[strings.ToLower(tool)] {
+	re, _ := missForm(harness, tool)
+	if re == nil {
 		return "", false
 	}
 	text = strings.TrimSpace(text)
@@ -346,8 +365,8 @@ func missWords(harness, tool, text string) (string, bool) {
 	return text, re.MatchString(text)
 }
 
-// missOf is the path a read tool's failed result missed, before missedPath, and whether the result is a miss: its
-// harness's words for one (missWords), and for Python's errno a name that is the read's own path, since Hermes passes
+// missOf is the path a read tool's failed result missed, or a search tool's, before missedPath, and whether the result
+// is a miss: its harness's words for one (missWords), and for Python's errno a name that is the read's own path, since Hermes passes
 // on the errno of a terminal whose directory is gone, which names that directory for any read. The path is the call's
 // (pi's without the leading @ it strips); a relative one is read in the call's directory when that is a whole path, but
 // for Hermes, whose read_file resolves it in its terminal's directory, which a cd moves; else it is the whole path the
@@ -359,7 +378,7 @@ func missOf(harness, tool, text string, c store.Call) (string, bool) {
 		return "", false
 	}
 	named := ""
-	if re := missNames[harness]; re != nil {
+	if _, re := missForm(harness, tool); re != nil {
 		if m := re.FindStringSubmatch(words); m != nil {
 			named = firstOf(m[1:]...)
 		}
@@ -695,7 +714,8 @@ var (
 // (missedPath), not by its words, which would merge every path into one: only the same path missed again recurs. No
 // key of a failure's words opens with miss:, so the two never meet. A read whose call names no path (a call unknown,
 // cut before its path, or none at all, as for the mistakes log, whose input the store does not keep for a tool error)
-// says nothing to key it by.
+// says nothing to key it by. A search tool's own error that no path is where its call names one (Hermes's
+// search_files) is keyed the same way.
 //
 // A fetch tool's error that its request got no response is keyed host:TOOL by its URL's host (unansweredHost), for
 // the same reason: only the same host failing again recurs. One whose URL names no host keeps its words.
