@@ -161,6 +161,18 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		{"claude", "Bash", "Permission to use Bash with command timeout 60 /usr/bin/curl -s x has been denied.", "harness:claude:permission to use bash with command curl has been denied"},
 		{"claude", "mcp__web-tools__fetch", "tool failed: spawn failed for /usr/bin/x: spawn /usr/bin/x ENOENT",
 			"mcp:web-tools:tool failed: spawn failed for P: spawn P enoent"},
+		// a fetch that got no response is keyed by its URL's host, lower case, its port and user info off; a URL with
+		// no host keeps the words, and so does a status the site answered with
+		{"claude", "mcp__web-tools__fetch", "error: error sending request for url (https://site-a.example/page)", "host:mcp-web-tools-fetch:site-a.example"},
+		{"claude", "mcp__web-tools__fetch", "error: error sending request for url (https://site-a.example/other?q=1): operation timed out",
+			"host:mcp-web-tools-fetch:site-a.example"},
+		{"claude", "mcp__web-tools__fetch", "error: error sending request for url (https://user:pw@Site-B.Example:8443/x)", "host:mcp-web-tools-fetch:site-b.example"},
+		{"kimi", "FetchURL", "Failed to fetch URL due to network error: https://api.site-c.example/x/1. Failed to extract meaningful content from the page.",
+			"host:fetchurl:api.site-c.example"},
+		{"claude", "mcp__web-tools__fetch", "error: error sending request for url (https://%zz/page)", "mcp:web-tools:error: error sending request for url (U"},
+		{"claude", "mcp__web-tools__fetch", "error: error sending request for url (https:///page)", "mcp:web-tools:error: error sending request for url (U"},
+		{"claude", "mcp__web-tools__fetch", "error: HTTP status client error (404 Not Found) for url (https://site-a.example/page)",
+			"mcp:web-tools:error: http status client error (N not found) for url (U"},
 		// Hermes: a tool's error, a guard inside one, a command that exits otherwise than 0, code that failed
 		{"hermes", "write_file", `{"error": "BLOCKED: write to protected agent-instruction file(s) (AGENTS.md) approval prompt timed out."}`,
 			"tool:write-file:blocked: write to protected agent-instruction file(s) (P) approval prompt timed"},
@@ -324,6 +336,10 @@ func TestACommandsFailureIsKeyedByItsMessage(t *testing.T) {
 		}
 	}
 	if k, _ := FailureOf("claude", "Bash", "Exit code 1 x: no such file or directory", ""); k.Title() != "A command keeps failing: x: no such file or directory" {
+		t.Errorf("title %q", k.Title())
+	}
+	if k, _ := FailureOf("claude", "mcp__web-tools__fetch", "error: error sending request for url (https://site-a.example/page)", ""); k.Title() !=
+		"The same host keeps failing to answer through mcp-web-tools-fetch: site-a.example" {
 		t.Errorf("title %q", k.Title())
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net/url"
 	"path"
 	"regexp"
 	"slices"
@@ -545,7 +546,7 @@ const (
 // server, a command, the model) and its text with what varies taken out; a read that found no file, by the read
 // tool and the path it missed, and a command's, by the path its message names.
 type FailureKey struct {
-	Origin string // guard:NAME, harness:HARNESS, turn:HARNESS, tool:TOOL, mcp:SERVER, exec, module, model:refusal, miss:TOOL, miss:exec
+	Origin string // guard:NAME, harness:HARNESS, turn:HARNESS, tool:TOOL, mcp:SERVER, exec, module, model:refusal, miss:TOOL, miss:exec, host:TOOL
 	Text   string
 	host   string // a command's miss on another host, the host its command line names (remoteHost) or unknownHost, till failureKey keys it
 }
@@ -602,6 +603,8 @@ func (k FailureKey) Title() string {
 			return "A command keeps missing the same path: " + k.Text
 		}
 		return "The same path keeps missing through " + name + ": " + k.Text
+	case "host":
+		return "The same host keeps failing to answer through " + name + ": " + k.Text
 	}
 	return "The " + name + " tool keeps failing: " + k.Text
 }
@@ -693,6 +696,9 @@ var (
 // key of a failure's words opens with miss:, so the two never meet. A read whose call names no path (a call unknown,
 // cut before its path, or none at all, as for the mistakes log, whose input the store does not keep for a tool error)
 // says nothing to key it by.
+//
+// A fetch tool's error that its request got no response is keyed host:TOOL by its URL's host (unansweredHost), for
+// the same reason: only the same host failing again recurs. One whose URL names no host keeps its words.
 //
 // A failed command whose message says no file is at a path it names in quotes (quotedMiss), or unquoted after its
 // program's name (unquotedMiss), is keyed miss:exec by that path (commandMissed, missedPath), for the same reason,
@@ -1062,7 +1068,7 @@ func failureOf(harness, tool, text, call string) (FailureKey, bool) {
 				if g := guardRe.FindStringSubmatch(message); g != nil {
 					return FailureKey{Origin: "guard:" + slug(g[1], 30), Text: Norm(firstClause(g[2]), keyChars)}, true
 				}
-				return toolKey(toolOrigin(tool), message)
+				return toolKey(tool, toolOrigin(tool), message)
 			}
 			code := result.Exit
 			if code == nil {
@@ -1125,14 +1131,14 @@ func failureOf(harness, tool, text, call string) (FailureKey, bool) {
 	}
 	switch {
 	case strings.HasPrefix(tool, "mcp__"):
-		return toolKey(toolOrigin(tool), text)
+		return toolKey(tool, toolOrigin(tool), text)
 	case harness == "hermes" && strings.HasPrefix(text, "{"):
 		if m := hermesErrRe.FindStringSubmatch(text); m != nil && m[1] != "" {
 			msg := unescape(m[1])
 			if g := guardRe.FindStringSubmatch(msg); g != nil {
 				return FailureKey{Origin: "guard:" + slug(g[1], 30), Text: Norm(firstClause(g[2]), keyChars)}, true
 			}
-			return toolKey("tool:"+slug(tool, 30), msg)
+			return toolKey(tool, "tool:"+slug(tool, 30), msg)
 		}
 		// an exit of 0 is no failure; one past the store's cut is not in view, and the result is flagged an error
 		if m := hermesExit.FindStringSubmatch(text); m == nil || m[1] != "0" {
@@ -1143,14 +1149,14 @@ func failureOf(harness, tool, text, call string) (FailureKey, bool) {
 		return FailureKey{}, false
 	case harness == "codex":
 		if m := codexRe.FindStringSubmatch(text); m != nil {
-			return toolKey("tool:"+slug(tool, 30), m[1])
+			return toolKey(tool, "tool:"+slug(tool, 30), m[1])
 		}
 	}
 	if isShell(tool) || headerRe.MatchString(text) {
 		return execKey(headerRe.ReplaceAllString(text, ""), call)
 	}
 	// A tool's error in its own words (a read, an edit, a write the harness refused).
-	return toolKey("tool:"+slug(tool, 30), text)
+	return toolKey(tool, "tool:"+slug(tool, 30), text)
 }
 
 // quotaRe is a provider's own word that the account's usage quota or credit ran out: xAI's spending-limit code and
@@ -1163,15 +1169,42 @@ var notRunningRe = regexp.MustCompile(`^(?:<tool_use_error>)?Task \S+ is not run
 
 // toolKey keys a tool's error by its origin and words. A quota that ran out (quotaRe) has no key: it renews by
 // itself and is no fault of the tool, so its case would hold evidence nobody can act on. Nor has a stop of a task
-// that is not running (notRunningRe): what the stop wanted already holds.
-func toolKey(origin, msg string) (FailureKey, bool) {
+// that is not running (notRunningRe): what the stop wanted already holds. A fetch that got no response
+// (unansweredHost) is keyed host:TOOL by its URL's host: its words, the URL masked, are the same for every site.
+func toolKey(tool, origin, msg string) (FailureKey, bool) {
 	if quotaRe.MatchString(msg) {
 		return FailureKey{}, false
 	}
 	if (origin == "tool:taskstop" || origin == "tool:killshell") && notRunningRe.MatchString(msg) {
 		return FailureKey{}, false
 	}
-	return FailureKey{Origin: origin, Text: Norm(firstClause(msg), keyChars)}, true
+	msg = firstClause(msg)
+	if h := unansweredHost(msg); h != "" {
+		return FailureKey{Origin: "host:" + slug(tool, 30), Text: h}, true
+	}
+	return FailureKey{Origin: origin, Text: Norm(msg, keyChars)}, true
+}
+
+// unansweredRe is a fetch tool's error that its request for a URL got no response, and that URL: reqwest's "error
+// sending request for url (URL)", whether the site refused, timed out or did not resolve, and Kimi's FetchURL's
+// "Failed to fetch URL due to network error: URL". A status the site answered with is none.
+var unansweredRe = regexp.MustCompile(`(?i)(?:\berror sending request for url \(|\bfailed to fetch url due to network error: )(https?://[^\s()]+)`)
+
+// unansweredHost is the host of the URL a fetch that got no response names (unansweredRe), lower case, its port and
+// user info off, or "" when the error is none or no host parses from its URL.
+func unansweredHost(msg string) string {
+	m := unansweredRe.FindStringSubmatch(msg)
+	if m == nil {
+		return ""
+	}
+	u, err := url.Parse(strings.TrimRight(m[1], ".,;:"))
+	if err != nil {
+		return ""
+	}
+	if h := strings.TrimSuffix(strings.ToLower(u.Hostname()), "."); hostNameRe.MatchString(h) {
+		return h
+	}
+	return ""
 }
 
 func toolOrigin(tool string) string {
