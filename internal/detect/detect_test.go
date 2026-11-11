@@ -204,6 +204,10 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		{"claude", "KillShell", "Task bx7k2q9 is not running (status: killed)", ""},
 		{"claude", "TaskStop", "<tool_use_error>No task found with ID: bx7k2q9. Running background agents: none</tool_use_error>",
 			"tool:taskstop:no task found with id: bxNkNqN"},
+		// agent-chrome-bridge's call on a tab that already closed is no failure; its other errors still are
+		{"claude", "mcp__agent-chrome-bridge__chrome_navigate", "No tab with id: 123456789.", ""},
+		{"claude", "mcp__agent-chrome-bridge__chrome_close_tab", "Error: No tab with id: 123456789.", ""},
+		{"claude", "mcp__agent-chrome-bridge__chrome_new_tab", "Chrome bridge extension is not connected", "mcp:agent-chrome-bridge:chrome bridge extension is not connected"},
 		// Codex: a script's error, its commands under either header, the stdin it writes
 		{"codex", "exec", `Script failed Wall time 0.1 seconds Output: Script error: exec_command failed: CreateProcess { message: "Rejected(rm -f)" }`,
 			"tool:exec:exec_command failed: createprocess { message: Q }"},

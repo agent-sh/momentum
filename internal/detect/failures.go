@@ -1210,9 +1210,13 @@ var quotaRe = regexp.MustCompile(`(?i)\bspending-limit\b|\brun out of credits\b`
 // finished while its notice waited behind the turn. An unknown task id is none.
 var notRunningRe = regexp.MustCompile(`^(?:<tool_use_error>)?Task \S+ is not running \(status: \w+\)`)
 
+// closedTabRe is agent-chrome-bridge's answer to a call on a tab that closed before the agent used its id again.
+var closedTabRe = regexp.MustCompile(`^(?:Error: )?No tab with id: \d+\b`)
+
 // toolKey keys a tool's error by its origin and words. A quota that ran out (quotaRe) has no key: it renews by
 // itself and is no fault of the tool, so its case would hold evidence nobody can act on. Nor has a stop of a task
-// that is not running (notRunningRe): what the stop wanted already holds. A fetch that got no response
+// that is not running (notRunningRe): what the stop wanted already holds. Nor has agent-chrome-bridge's call on a
+// tab that already closed (closedTabRe): the tab is gone and the bridge said so. A fetch that got no response
 // (unansweredHost) is keyed host:TOOL by its URL's host: its words, the URL masked, are the same for every site. A
 // fetch the site answered with an error status (answeredRe) is no failure for a 404 or a 410, a URL that is not
 // there, since the tool worked; any other status is keyed host:TOOL by the status and the host of the URL its words
@@ -1222,6 +1226,9 @@ func toolKey(tool, origin, msg, call string) (FailureKey, bool) {
 		return FailureKey{}, false
 	}
 	if (origin == "tool:taskstop" || origin == "tool:killshell") && notRunningRe.MatchString(msg) {
+		return FailureKey{}, false
+	}
+	if origin == "mcp:agent-chrome-bridge" && closedTabRe.MatchString(msg) {
 		return FailureKey{}, false
 	}
 	msg = firstClause(msg)
