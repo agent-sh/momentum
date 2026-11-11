@@ -184,6 +184,9 @@ func TestCaseDetectFilesWhatTheDetectorsFind(t *testing.T) {
 		evs = append(evs, store.Event{Source: store.Transcripts, SourceKey: fmt.Sprintf("%s@%d", s, i), TS: now.Add(time.Duration(i) * time.Minute),
 			Session: s, Harness: "claude", Actor: store.ActorTool, Kind: "tool_result", Tool: "Bash", Summary: deny, Meta: `{"is_error":true}`})
 	}
+	// a later result: the store has read past the refusals, so none still waits for its thread's next call
+	evs = append(evs, store.Event{Source: store.Transcripts, SourceKey: "s3@0", TS: now.Add(10 * time.Minute), Session: "s3", Harness: "claude",
+		Actor: store.ActorTool, Kind: "tool_result", Tool: "Read", Summary: "done"})
 	if _, err := st.Put(context.Background(), evs); err != nil {
 		t.Fatal(err)
 	}

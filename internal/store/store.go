@@ -1050,9 +1050,12 @@ func measuring(ctx context.Context, q querier) ([]string, error) {
 	return out, rows.Err()
 }
 
-// Call is a tool call as the store keeps it: its text (the input's first bytes) and the directory its session was
-// in when it made the call.
-type Call struct{ Input, Cwd string }
+// Call is a tool call as the store keeps it: its text (the input's first bytes), the directory its session was
+// in when it made the call, and when it made it.
+type Call struct {
+	Input, Cwd string
+	At         time.Time
+}
 
 // CallsOf reads the calls the transcripts' results answer: for each result with a tool id, the tool call of its
 // session with that id, at most reach before it. It returns each call by its result's id.
@@ -1100,7 +1103,7 @@ func (s *Store) CallsOf(ctx context.Context, results []Event, reach time.Duratio
 		}
 		for _, r := range want[key{session, toolID(meta)}] {
 			if ts <= r.ts && ts >= r.ts-reach.Milliseconds() {
-				out[r.id] = Call{Input: summary, Cwd: cwd}
+				out[r.id] = Call{Input: summary, Cwd: cwd, At: time.UnixMilli(ts)}
 			}
 		}
 	}

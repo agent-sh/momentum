@@ -61,6 +61,7 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 	type thread struct{ session, agent, tool string }
 	steps := map[thread][]step{}
 	var refused []occurrence
+	var newest time.Time // the newest result read: what the store holds of the transcripts reaches no later
 	// Successful results must not displace older unflagged failures at maxRows.
 	var before *store.Event
 	for {
@@ -69,8 +70,11 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 		if err != nil {
 			return gather("failures", occ, r), err
 		}
-		var candidates, writes []store.Event
+		var candidates, writes, ran []store.Event
 		for _, e := range results {
+			if e.TS.After(newest) {
+				newest = e.TS
+			}
 			var m struct {
 				IsError bool `json:"is_error"`
 			}
@@ -79,16 +83,20 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 				candidates = append(candidates, e)
 			} else if !toolresult.Cancelled(e.Summary) {
 				// a write the owner declined or the harness cancelled did not write: Failed leaves those out, flagged or not
-				th := thread{e.Session, e.Agent, e.Tool}
-				steps[th] = append(steps[th], step{at: e.TS})
 				if bashShell(e.Tool) || fileWrote(e.Harness, e.Tool, e.Summary) {
 					writes = append(writes, e)
+				} else {
+					ran = append(ran, e)
 				}
 			}
 		}
-		calls, err := st.CallsOf(ctx, slices.Concat(candidates, writes), callReach)
+		calls, err := st.CallsOf(ctx, slices.Concat(candidates, writes, ran), callReach)
 		if err != nil {
 			return gather("failures", occ, r), err
+		}
+		for _, e := range slices.Concat(writes, ran) {
+			th := thread{e.Session, e.Agent, e.Tool}
+			steps[th] = append(steps[th], step{at: e.TS, called: calls[e.ID()].At})
 		}
 		for _, e := range writes {
 			c := calls[e.ID()]
@@ -102,14 +110,17 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 			call := calls[e.ID()]
 			k, ok := failureKey(e.Harness, e.Tool, e.Summary, call)
 			o := occurrence{sig: signature("failures", k.String()), title: k.Title(), ev: e}
+			if k.Origin == declined { // the owner's no in a wrapper: no call of the thread's
+				continue
+			}
 			// a call a guard or the harness refused did not run; any other failed one did
-			st := step{at: e.TS}
+			next := step{at: e.TS, called: call.At}
 			kind, _, _ := strings.Cut(k.Origin, ":")
 			if ok && (kind == "guard" || kind == "harness") {
-				st.refusal = o.sig
+				next.refusal = o.sig
 			}
 			th := thread{e.Session, e.Agent, e.Tool}
-			steps[th] = append(steps[th], st)
+			steps[th] = append(steps[th], next)
 			if !ok {
 				continue
 			}
@@ -140,8 +151,9 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 		sort.Slice(s, func(i, j int) bool { return s[i].at.Before(s[j].at) })
 	}
 	for _, o := range refused {
-		// one younger than the span at the window's end may have its next call still to come
-		if e := o.ev; !heeded(steps[thread{e.Session, e.Agent, e.Tool}], o.sig, e.TS) && e.TS.Before(w.Until.Truncate(time.Millisecond).Add(-heedSpan)) {
+		// one younger than the span at the newest result read may have its next call still to come: the store holds the
+		// transcripts up to its last ingest, not up to the window's end
+		if e := o.ev; !heeded(steps[thread{e.Session, e.Agent, e.Tool}], o.sig, e.TS) && e.TS.Before(newest.Add(-heedSpan)) {
 			occ = append(occ, o)
 		}
 	}
@@ -182,20 +194,29 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 // other work.
 const heedSpan = 2 * time.Minute
 
-// step is what one call of a tool came to in its thread: when its result came, and the signature of the refusal
-// that stopped it, a guard's or the harness's own, or "" for a call that ran.
+// step is what one call of a tool came to in its thread: when its result came, when the call was made (zero when
+// the store holds no call for it), and the signature of the refusal that stopped it, a guard's or the harness's
+// own, or "" for a call that ran.
 type step struct {
-	at      time.Time
-	refusal string
+	at, called time.Time
+	refusal    string
 }
+
+// declined is the origin of a result that is the owner's no or a cancel, with no key: failureOf's word to its
+// reader that the call is no step of its thread's.
+const declined = "declined"
 
 // heeded says a guard's refusal at ts, of signature sig, was heeded: the first call of the same tool by the same
 // thread after it (steps, in time) that ran came within heedSpan, with no refusal of the same signature before it.
-// A call another guard or the harness refused between them neither heeds it nor counts against it. A refusal the
-// thread repeated, or one with no call after it, was not heeded.
+// A call another guard or the harness refused between them neither heeds it nor counts against it, and a call
+// made before the refusal came (one beside it, or a slow one still running) is passed over: the thread had not read
+// the refusal. A refusal the thread repeated, or one with no call after it, was not heeded.
 func heeded(steps []step, sig string, ts time.Time) bool {
 	i := sort.Search(len(steps), func(i int) bool { return steps[i].at.After(ts) })
 	for _, s := range steps[i:] {
+		if !s.called.IsZero() && !s.called.After(ts) {
+			continue
+		}
 		if s.refusal == sig || s.at.After(ts.Add(heedSpan)) {
 			return false
 		}
@@ -1021,7 +1042,7 @@ func failureOf(harness, tool, text, call string) (FailureKey, bool) {
 			}
 			if message != "" {
 				if toolresult.Cancelled(message) {
-					return FailureKey{}, false
+					return FailureKey{Origin: declined}, false
 				}
 				if isShell(tool) && workRe.MatchString(message) {
 					return FailureKey{}, false
@@ -1050,7 +1071,10 @@ func failureOf(harness, tool, text, call string) (FailureKey, bool) {
 	}
 	wrapped := strings.HasPrefix(text, "<tool_use_error>")
 	text = strings.TrimSpace(strings.TrimPrefix(text, "<tool_use_error>"))
-	if text == "" || ownerNoRe.MatchString(text) || toolresult.Cancelled(text) {
+	if ownerNoRe.MatchString(text) || toolresult.Cancelled(text) {
+		return FailureKey{Origin: declined}, false
+	}
+	if text == "" {
 		return FailureKey{}, false
 	}
 	if m := hookRe.FindStringSubmatch(text); m != nil {

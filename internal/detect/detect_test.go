@@ -622,7 +622,7 @@ func TestAReadOfAFileItsSessionThenCreatesIsNoFailure(t *testing.T) {
 				return f.pair(session, "Read", fmt.Sprintf(`{"file_path":%q}`, path), "<tool_use_error>read-guard: path not found in the allowlist</tool_use_error>", true, at)
 			}
 			return slices.Concat(refused("s1", "/w/out/a.md", t0), f.wrote("s1", "/w/out/a.md", t0.Add(time.Minute)),
-				refused("s1", "/w/out/b.md", t0.Add(time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+time.Minute)),
+				refused("s1", "/w/out/b.md", t0.Add(time.Hour)), f.wrote("s1", "/w/out/b.md", t0.Add(time.Hour+3*time.Minute)),
 				refused("s2", "/w/out/c.md", t0), f.wrote("s2", "/w/out/c.md", t0.Add(time.Minute)),
 				f.readMissing("s3", x, t0), f.wrote("s3", x, t0.Add(time.Minute)),
 				f.readMissing("s4", x, t0), f.wrote("s4", x, t0.Add(time.Minute)),
@@ -1325,7 +1325,7 @@ func TestAFindingFilesItsNewestEvidence(t *testing.T) {
 	for i := 0; i < MaxEvidence+1; i++ {
 		evs = append(evs, toolError(fmt.Sprint("s", i%2), "Bash", deny, t0.Add(time.Duration(i)*time.Minute)))
 	}
-	put(t, st, evs...)
+	put(t, st, append(evs, caughtUp(t0.Add(5*time.Hour)))...)
 	fs, err := Failures{}.Detect(context.Background(), st, week())
 	if err != nil || len(fs) != 1 || len(fs[0].Evidence) != MaxEvidence {
 		t.Fatalf("%d findings, %v", len(fs), err)
@@ -1961,7 +1961,8 @@ func TestRunFilesFindingsIntoCases(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 	deny := "<tool_use_error>fence-guard: a process match on 'x' takes its own shell too"
-	put(t, st, toolError("s1", "Bash", deny, t0), toolError("s1", "Bash", deny, t0.Add(time.Hour)), toolError("s2", "Bash", deny, t0.Add(2*time.Hour)))
+	put(t, st, toolError("s1", "Bash", deny, t0), toolError("s1", "Bash", deny, t0.Add(time.Hour)), toolError("s2", "Bash", deny, t0.Add(2*time.Hour)),
+		caughtUp(t0.Add(3*time.Hour)))
 	w := week()
 	dry, _, err := Run(ctx, st, []Detector{Failures{}}, w, "test", true)
 	if err != nil || len(dry) != 1 || len(dry[0].Filed) != 1 || dry[0].Filed[0].Observed != "" {
