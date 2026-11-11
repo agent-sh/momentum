@@ -686,7 +686,7 @@ var (
 // the tool; a failed command, once the harness's header is off it, only by the message that holds a mark of the
 // setup failing (execKey), and never when its output shows the work failing (workRe). ok is false for what is no
 // setup's failure or says nothing to key it by: the owner's own no, a call the harness cancelled because
-// another one beside it failed, and a provider's quota that ran out (toolKey).
+// another one beside it failed, a provider's quota that ran out, and a stop of a task that already ended (toolKey).
 //
 // A read tool's own error that no file is at its path (missOf) is keyed miss:TOOL by the path its call names
 // (missedPath), not by its words, which would merge every path into one: only the same path missed again recurs. No
@@ -1157,10 +1157,18 @@ func failureOf(harness, tool, text, call string) (FailureKey, bool) {
 // its "run out of credits". A capacity or rate limit (xAI's resource-exhausted, an HTTP 429, a 503) is none.
 var quotaRe = regexp.MustCompile(`(?i)\bspending-limit\b|\brun out of credits\b`)
 
+// notRunningRe is Claude Code's answer to a stop of a task that already ended, whatever its status: a task that
+// finished while its notice waited behind the turn. An unknown task id is none.
+var notRunningRe = regexp.MustCompile(`^(?:<tool_use_error>)?Task \S+ is not running \(status: \w+\)`)
+
 // toolKey keys a tool's error by its origin and words. A quota that ran out (quotaRe) has no key: it renews by
-// itself and is no fault of the tool, so its case would hold evidence nobody can act on.
+// itself and is no fault of the tool, so its case would hold evidence nobody can act on. Nor has a stop of a task
+// that is not running (notRunningRe): what the stop wanted already holds.
 func toolKey(origin, msg string) (FailureKey, bool) {
 	if quotaRe.MatchString(msg) {
+		return FailureKey{}, false
+	}
+	if (origin == "tool:taskstop" || origin == "tool:killshell") && notRunningRe.MatchString(msg) {
 		return FailureKey{}, false
 	}
 	return FailureKey{Origin: origin, Text: Norm(firstClause(msg), keyChars)}, true

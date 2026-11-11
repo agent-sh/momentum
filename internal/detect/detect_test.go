@@ -188,6 +188,12 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		{"hermes", "x_search", `{"success": false, "provider": "xai", "tool": "x_search", "error": "resource-exhausted: The model is currently at capacity due to high demand. Please try again in a few minutes.", "error_type": "HTTPError"}`,
 			"tool:x-search:resource-exhausted: the model is currently at capacity due to high demand"},
 		{"hermes", "terminal", `{"output": "RuntimeError: HTTP 429: {\"code\":\"resource-exhausted\",\"error\":\"The model is currently at capacity\"}", "exit_code": 1}`, "exec:runtimeerror: http 429: {Q:Q"},
+		// a stop of a task that already ended is no failure, whatever its status; an unknown task still is
+		{"claude", "TaskStop", "<tool_use_error>Task bx7k2q9 is not running (status: completed)</tool_use_error>", ""},
+		{"claude", "TaskStop", "<tool_use_error>Task bx7k2q9 is not running (status: failed)</tool_use_error>", ""},
+		{"claude", "KillShell", "Task bx7k2q9 is not running (status: killed)", ""},
+		{"claude", "TaskStop", "<tool_use_error>No task found with ID: bx7k2q9. Running background agents: none</tool_use_error>",
+			"tool:taskstop:no task found with id: bxNkNqN"},
 		// Codex: a script's error, its commands under either header, the stdin it writes
 		{"codex", "exec", `Script failed Wall time 0.1 seconds Output: Script error: exec_command failed: CreateProcess { message: "Rejected(rm -f)" }`,
 			"tool:exec:exec_command failed: createprocess { message: Q }"},
