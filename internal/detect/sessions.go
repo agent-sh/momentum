@@ -14,7 +14,7 @@ import (
 
 // Sessions finds what keeps sessions from moving on without the owner:
 //   - gave-up: supervision used up a rule's tries, or a message of its own did not land (its case events);
-//   - outcome: a message it sent did not land, or the turn it opened stopped the same way again;
+//   - outcome: a message it sent did not land, or the turn it opened stopped the same way again without work;
 //   - nudged: the owner had to nudge a stopped session that no rule would have continued, keyed by why none
 //     would (the replay of the rules over the store's history: its phase and what kept each rule off);
 //   - waited: a session waited on him past the owner window, keyed by what it asked (its phase events).
@@ -178,7 +178,8 @@ func waits(ctx context.Context, st *store.Store, w Window) ([]occurrence, error)
 	return occ, nil
 }
 
-// resolution is one stop a supervise rule resolved on its first try: its message (try 1) opened a turn that worked.
+// resolution is one stop a supervise rule resolved on its first try: its message (try 1) opened a turn that worked,
+// whether or not that turn later ended on the error again.
 // The stop lasted from stopAt to sentAt, when the message was typed.
 type resolution struct{ stopAt, sentAt time.Time }
 
@@ -252,7 +253,7 @@ func supervisedStops(ctx context.Context, st *store.Store, w Window) (supervised
 			continue
 		}
 		switch m.Result {
-		case supervise.Worked:
+		case supervise.Worked, supervise.WorkedThenFailed: // the message ended the stop; a later error is another stop
 			if a.try == 1 {
 				out.resolved[a.session] = append(out.resolved[a.session], resolution{time.UnixMilli(a.at), a.sentAt})
 			}

@@ -1665,7 +1665,7 @@ func TestSessionsWaitResolvedOnFirstTryIsNotACase(t *testing.T) {
 			fmt.Sprintf(`{"of":%q,"rule":"access","result":%q}`, of.SourceKey, result), at)
 	}
 	var evs []store.Event
-	for _, s := range []string{"a", "b", "c"} {
+	for _, s := range []string{"a", "b", "c", "d"} {
 		for i := 0; i < 6; i++ {
 			evs = append(evs, wait(s, stopAt.Add(time.Duration(i)*30*time.Minute), 30))
 		}
@@ -1674,6 +1674,8 @@ func TestSessionsWaitResolvedOnFirstTryIsNotACase(t *testing.T) {
 	aa, ab, ac := act("a", 1, sent), act("b", 1, sent), act("c", 2, sent)
 	evs = append(evs, aa, ab, ac, outcome(aa, "worked", sent.Add(time.Minute)), outcome(ab, "failed again", sent.Add(time.Minute)),
 		outcome(ac, "worked", sent.Add(time.Minute)))
+	ad := act("d", 1, sent) // its turn did work before it met the error again: the message ended this stop
+	evs = append(evs, ad, outcome(ad, "worked, then failed again", sent.Add(time.Minute)))
 	put(t, st, evs...)
 	fs, err := Sessions{}.Detect(context.Background(), st, week())
 	if err != nil {

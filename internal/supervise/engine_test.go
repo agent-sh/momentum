@@ -793,6 +793,48 @@ func TestATransientRuleKeepsTryingPastItsBackoffWithOneCase(t *testing.T) {
 	}
 }
 
+// A try that lands, does work and then meets a transient error again moved the session: no case, however many
+// such tries follow, and each next wait is the first of the backoff. A try that did no work still climbs.
+func TestATryThatWorkedThenFailedAgainStartsTheTriesOver(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0
+	sv := supervisor(st, f, &now)
+	s := erroring()
+	at := t0
+	for try := 0; try < 4; try++ {
+		now = at.Add(DefaultParams.Backoff[0])
+		run(t, sv, s)
+		if len(f.sent) != try+1 {
+			t.Fatalf("try %d: sent %d a minute after the error", try+1, len(f.sent))
+		}
+		lands(s, strings.TrimPrefix(f.sent[try], "%7 "), now.Add(time.Second), true)
+		at = now.Add(5 * time.Minute)
+		s.Since = at
+		now = at.Add(time.Second)
+		run(t, sv, s)
+	}
+	if r, c := results(t, st), events(t, st, KindCase); !r[WorkedThenFailed] || r[FailedAgain] || r[Worked] || len(c) != 0 {
+		t.Fatalf("outcomes %v, cases %+v", r, c)
+	}
+	// the fifth lands and meets the error with no tool call: failed again, and the next wait is the second
+	now = at.Add(DefaultParams.Backoff[0])
+	run(t, sv, s)
+	lands(s, strings.TrimPrefix(f.sent[4], "%7 "), now.Add(time.Second), false)
+	at = now.Add(5 * time.Minute)
+	s.Since = at
+	now = at.Add(DefaultParams.Backoff[0])
+	run(t, sv, s)
+	if r := results(t, st); !r[FailedAgain] || len(f.sent) != 5 {
+		t.Fatalf("outcomes %v, sent %d a minute after a try that did no work", r, len(f.sent))
+	}
+	now = at.Add(DefaultParams.Backoff[1])
+	run(t, sv, s)
+	if len(f.sent) != 6 {
+		t.Fatalf("sent %d at the second wait", len(f.sent))
+	}
+}
+
 // failedTries is a session whose first n transient tries each landed and failed again, and the time of its last error.
 func failedTries(t *testing.T, sv *Supervisor, f *fakeSender, s *sessions.Session, now *time.Time, n int) time.Time {
 	t.Helper()

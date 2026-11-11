@@ -39,8 +39,11 @@ const (
 	Delivered    = "delivered"         // a scan showed the message as a user turn of the session
 	NotDelivered = "not delivered"     // it did not show within DeliveryWait
 	Worked       = "worked"            // the turn it opened did work, tool calls, and stopped without an error
-	FailedAgain  = "failed again"      // the turn it opened stopped the same way
+	FailedAgain  = "failed again"      // the turn it opened stopped the same way, without work
 	Otherwise    = "stopped otherwise" // the turn it opened stopped another way, without work
+	// WorkedThenFailed: the turn a transient message opened did work, then ended on a transient error again. The
+	// message moved the session, so the rule's tries start again as after Worked; the error is a new stop.
+	WorkedThenFailed = "worked, then failed again"
 )
 
 // DeliveryWait is how long a message has to show up as the session's user turn, two scans of the sessions timer
@@ -769,6 +772,9 @@ func history(evs []store.Event) past {
 	return h
 }
 
+// moved reports a message whose turn did work, however that turn ended: the episode it was sent in is over.
+func (s sent) moved() bool { return s.result[Worked] || s.result[WorkedThenFailed] }
+
 func (h past) last() *sent {
 	if len(h.sends) == 0 {
 		return nil
@@ -776,14 +782,14 @@ func (h past) last() *sent {
 	return &h.sends[len(h.sends)-1]
 }
 
-// tries counts each rule's messages since the owner's last turn and since the last of the rule's messages that
-// worked: the episode still going, however long ago it began.
+// tries counts each rule's messages since the owner's last turn and since the last of the rule's messages whose
+// turn did work: the episode still going, however long ago it began.
 func (h past) tries(ownerAt time.Time) Tries {
 	t := Tries{}
 	from := map[string]time.Time{}
 	for _, s := range h.sends {
 		// a resync that worked does not start the count again: a session whose runs keep not starting is a case
-		if s.result[Worked] && s.rule != RuleOverdue && s.at.After(from[s.rule]) {
+		if s.moved() && s.rule != RuleOverdue && s.at.After(from[s.rule]) {
 			from[s.rule] = s.at
 		}
 	}
@@ -833,7 +839,7 @@ func (h past) closed(rule string, ownerAt time.Time) bool {
 }
 
 // noted reports a going case on record for the rule's episode: since the owner's last turn, with none of the
-// rule's messages working since. One case per episode, however many tries follow.
+// rule's messages moving the session since. One case per episode, however many tries follow.
 func (h past) noted(rule string, ownerAt time.Time) bool {
 	for _, c := range h.cases {
 		if !c.going || c.rule != rule || !c.at.After(ownerAt) {
@@ -841,7 +847,7 @@ func (h past) noted(rule string, ownerAt time.Time) bool {
 		}
 		worked := false
 		for _, s := range h.sends {
-			worked = worked || s.rule == rule && s.result[Worked] && s.at.After(c.at)
+			worked = worked || s.rule == rule && s.moved() && s.at.After(c.at)
 		}
 		if !worked {
 			return true
@@ -960,7 +966,7 @@ func lastUser(s *sessions.Session) string {
 
 // outcome records what came of the session's last message, once each, and reports whether it is resolved: it
 // showed up as a user turn of the session, or did not within DeliveryWait; then the turn it opened worked,
-// stopped the same way again, or stopped otherwise.
+// stopped the same way again (for the transient rule, after doing work or without any), or stopped otherwise.
 func (sv *Supervisor) outcome(ctx context.Context, s *sessions.Session, stop Stop, h *past, now time.Time, put *[]store.Event) bool {
 	l := h.last()
 	if l == nil {
@@ -972,7 +978,7 @@ func (sv *Supervisor) outcome(ctx context.Context, s *sessions.Session, stop Sto
 			SourceKey: l.key + "#outcome#" + result, Summary: oneLine(fmt.Sprintf("%s: %s, try %d", l.rule, result, l.try)),
 			Meta: meta(map[string]any{"of": l.key, "rule": l.rule, "result": result, "sent_at": l.at.UnixMilli()})}
 	}
-	if l.result[NotDelivered] || l.result[Worked] || l.result[FailedAgain] || l.result[Otherwise] {
+	if l.result[NotDelivered] || l.moved() || l.result[FailedAgain] || l.result[Otherwise] {
 		return true
 	}
 	if !l.result[Delivered] {
@@ -1004,6 +1010,8 @@ func (sv *Supervisor) outcome(ctx context.Context, s *sessions.Session, stop Sto
 		again = Promise(stop.Words) != "" && stop.Tasks == 0 && stop.WakeAt.IsZero() && stop.Loop == ""
 	}
 	switch {
+	case again && l.rule == RuleTransient && worked(s, l.seq): // a new error in a session the message did move
+		*put = append(*put, mk(WorkedThenFailed))
 	case again:
 		*put = append(*put, mk(FailedAgain))
 	case stop.Error == "" && worked(s, l.seq):
