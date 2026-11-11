@@ -56,6 +56,11 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 	// the pages run newest first, so every write after a result is in its page or in one before it
 	type wrote struct{ session, agent, path string }
 	written := map[wrote][]time.Time{}
+	// what each thread's calls of each tool came to, and the guards' refusals among them, held till every page is
+	// read: a refusal the thread then heeded is no failure (heeded)
+	type thread struct{ session, agent, tool string }
+	steps := map[thread][]step{}
+	var refused []occurrence
 	// Successful results must not displace older unflagged failures at maxRows.
 	var before *store.Event
 	for {
@@ -72,9 +77,13 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 			json.Unmarshal([]byte(e.Meta), &m)
 			if toolresult.Failed(e.Harness, e.Tool, e.Summary, m.IsError) {
 				candidates = append(candidates, e)
-			} else if !toolresult.Cancelled(e.Summary) && (bashShell(e.Tool) || fileWrote(e.Harness, e.Tool, e.Summary)) {
+			} else if !toolresult.Cancelled(e.Summary) {
 				// a write the owner declined or the harness cancelled did not write: Failed leaves those out, flagged or not
-				writes = append(writes, e)
+				th := thread{e.Session, e.Agent, e.Tool}
+				steps[th] = append(steps[th], step{at: e.TS})
+				if bashShell(e.Tool) || fileWrote(e.Harness, e.Tool, e.Summary) {
+					writes = append(writes, e)
+				}
 			}
 		}
 		calls, err := st.CallsOf(ctx, slices.Concat(candidates, writes), callReach)
@@ -92,7 +101,20 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 			failed = append(failed, seen{e.Session, e.Tool, e.TS})
 			call := calls[e.ID()]
 			k, ok := failureKey(e.Harness, e.Tool, e.Summary, call)
+			o := occurrence{sig: signature("failures", k.String()), title: k.Title(), ev: e}
+			// a call a guard or the harness refused did not run; any other failed one did
+			st := step{at: e.TS}
+			kind, _, _ := strings.Cut(k.Origin, ":")
+			if ok && (kind == "guard" || kind == "harness") {
+				st.refusal = o.sig
+			}
+			th := thread{e.Session, e.Agent, e.Tool}
+			steps[th] = append(steps[th], st)
 			if !ok {
+				continue
+			}
+			if kind == "guard" {
+				refused = append(refused, o)
 				continue
 			}
 			// a read of a file its thread writes within the settle time found it not there yet: no failure; one younger
@@ -106,13 +128,22 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 					continue
 				}
 			}
-			occ = append(occ, occurrence{sig: signature("failures", k.String()), title: k.Title(), ev: e})
+			occ = append(occ, o)
 		}
 		if len(results) < resultPage {
 			break
 		}
 		last := results[len(results)-1]
 		before = &last
+	}
+	for _, s := range steps {
+		sort.Slice(s, func(i, j int) bool { return s[i].at.Before(s[j].at) })
+	}
+	for _, o := range refused {
+		// one younger than the span at the window's end may have its next call still to come
+		if e := o.ev; !heeded(steps[thread{e.Session, e.Agent, e.Tool}], o.sig, e.TS) && e.TS.Before(w.Until.Truncate(time.Millisecond).Add(-heedSpan)) {
+			occ = append(occ, o)
+		}
 	}
 	sort.Slice(failed, func(i, j int) bool { return failed[i].at.Before(failed[j].at) })
 	same := func(session, tool string, at time.Time) bool {
@@ -144,6 +175,35 @@ func (f Failures) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 	out := gather("failures", occ, r)
 	inc, err := incidentSightings(ctx, st, w)
 	return append(out, gather("failures", inc, IncidentRecur)...), err
+}
+
+// heedSpan is how long after a guard's refusal its thread's next call of the tool heeds it. An agent that reads a
+// refusal and calls the tool again the way the guard asked does so in its next few calls; a call long after is
+// other work.
+const heedSpan = 2 * time.Minute
+
+// step is what one call of a tool came to in its thread: when its result came, and the signature of the refusal
+// that stopped it, a guard's or the harness's own, or "" for a call that ran.
+type step struct {
+	at      time.Time
+	refusal string
+}
+
+// heeded says a guard's refusal at ts, of signature sig, was heeded: the first call of the same tool by the same
+// thread after it (steps, in time) that ran came within heedSpan, with no refusal of the same signature before it.
+// A call another guard or the harness refused between them neither heeds it nor counts against it. A refusal the
+// thread repeated, or one with no call after it, was not heeded.
+func heeded(steps []step, sig string, ts time.Time) bool {
+	i := sort.Search(len(steps), func(i int) bool { return steps[i].at.After(ts) })
+	for _, s := range steps[i:] {
+		if s.refusal == sig || s.at.After(ts.Add(heedSpan)) {
+			return false
+		}
+		if s.refusal == "" {
+			return true
+		}
+	}
+	return false
 }
 
 // readTools are the harnesses' file tools that read a file, by their names in lower case: Claude Code's, pi's,
