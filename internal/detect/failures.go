@@ -685,8 +685,8 @@ var (
 // are keyed by the hook or guard and its first words; the harness's own refusal by the harness; a tool's error by
 // the tool; a failed command, once the harness's header is off it, only by the message that holds a mark of the
 // setup failing (execKey), and never when its output shows the work failing (workRe). ok is false for what is no
-// setup's failure or says nothing to key it by: the owner's own no, and a call the harness cancelled because
-// another one beside it failed.
+// setup's failure or says nothing to key it by: the owner's own no, a call the harness cancelled because
+// another one beside it failed, and a provider's quota that ran out (toolKey).
 //
 // A read tool's own error that no file is at its path (missOf) is keyed miss:TOOL by the path its call names
 // (missedPath), not by its words, which would merge every path into one: only the same path missed again recurs. No
@@ -1062,7 +1062,7 @@ func failureOf(harness, tool, text, call string) (FailureKey, bool) {
 				if g := guardRe.FindStringSubmatch(message); g != nil {
 					return FailureKey{Origin: "guard:" + slug(g[1], 30), Text: Norm(firstClause(g[2]), keyChars)}, true
 				}
-				return FailureKey{Origin: toolOrigin(tool), Text: Norm(firstClause(message), keyChars)}, true
+				return toolKey(toolOrigin(tool), message)
 			}
 			code := result.Exit
 			if code == nil {
@@ -1125,14 +1125,14 @@ func failureOf(harness, tool, text, call string) (FailureKey, bool) {
 	}
 	switch {
 	case strings.HasPrefix(tool, "mcp__"):
-		return FailureKey{Origin: toolOrigin(tool), Text: Norm(firstClause(text), keyChars)}, true
+		return toolKey(toolOrigin(tool), text)
 	case harness == "hermes" && strings.HasPrefix(text, "{"):
 		if m := hermesErrRe.FindStringSubmatch(text); m != nil && m[1] != "" {
 			msg := unescape(m[1])
 			if g := guardRe.FindStringSubmatch(msg); g != nil {
 				return FailureKey{Origin: "guard:" + slug(g[1], 30), Text: Norm(firstClause(g[2]), keyChars)}, true
 			}
-			return FailureKey{Origin: "tool:" + slug(tool, 30), Text: Norm(firstClause(msg), keyChars)}, true
+			return toolKey("tool:"+slug(tool, 30), msg)
 		}
 		// an exit of 0 is no failure; one past the store's cut is not in view, and the result is flagged an error
 		if m := hermesExit.FindStringSubmatch(text); m == nil || m[1] != "0" {
@@ -1143,14 +1143,27 @@ func failureOf(harness, tool, text, call string) (FailureKey, bool) {
 		return FailureKey{}, false
 	case harness == "codex":
 		if m := codexRe.FindStringSubmatch(text); m != nil {
-			return FailureKey{Origin: "tool:" + slug(tool, 30), Text: Norm(firstClause(m[1]), keyChars)}, true
+			return toolKey("tool:"+slug(tool, 30), m[1])
 		}
 	}
 	if isShell(tool) || headerRe.MatchString(text) {
 		return execKey(headerRe.ReplaceAllString(text, ""), call)
 	}
 	// A tool's error in its own words (a read, an edit, a write the harness refused).
-	return FailureKey{Origin: "tool:" + slug(tool, 30), Text: Norm(firstClause(text), keyChars)}, true
+	return toolKey("tool:"+slug(tool, 30), text)
+}
+
+// quotaRe is a provider's own word that the account's usage quota or credit ran out: xAI's spending-limit code and
+// its "run out of credits". A capacity or rate limit (xAI's resource-exhausted, an HTTP 429, a 503) is none.
+var quotaRe = regexp.MustCompile(`(?i)\bspending-limit\b|\brun out of credits\b`)
+
+// toolKey keys a tool's error by its origin and words. A quota that ran out (quotaRe) has no key: it renews by
+// itself and is no fault of the tool, so its case would hold evidence nobody can act on.
+func toolKey(origin, msg string) (FailureKey, bool) {
+	if quotaRe.MatchString(msg) {
+		return FailureKey{}, false
+	}
+	return FailureKey{Origin: origin, Text: Norm(firstClause(msg), keyChars)}, true
 }
 
 func toolOrigin(tool string) string {
@@ -1270,12 +1283,15 @@ func execKey(out, call string) (FailureKey, bool) {
 	if start == len(before) && len(names) > 0 && within(names[len(names)-1][0]) {
 		start = names[len(names)-1][0]
 	}
+	rest := clipBytes(after, 200)
+	if quotaRe.MatchString(before[start:] + out[loc[0]:loc[1]] + rest) { // a quota that ran out (toolKey)
+		return FailureKey{}, false
+	}
 	text := mask(before[start:])
 	if text != "" && strings.HasSuffix(before, " ") {
 		text += " "
 	}
 	text += mark
-	rest := clipBytes(after, 200)
 	if c, ok := strings.CutPrefix(rest, ": "); ok {
 		if next := firstMark(c); next != nil && next[0] == 0 { // what follows the colon is another mark
 			text += ": " + markText(c[:next[1]])

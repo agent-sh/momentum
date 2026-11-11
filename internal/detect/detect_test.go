@@ -180,6 +180,14 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		{"hermes", "execute_code", "/usr/bin/python3: No module named my-pkg", "exec:no module named"},
 		{"hermes", "execute_code", `{"status": "error", "output": "Traceback (most recent call last):\n  File \"x.py\", line 3, in <module>\nModuleNotFoundError: No module named 'yaml'"}`,
 			"module:yaml"},
+		// a provider's quota that ran out is no failure, in a tool's error, a result the store cut, a command's message;
+		// a capacity or rate limit still is
+		{"hermes", "x_search", `{"success": false, "provider": "xai", "tool": "x_search", "error": "personal-team-blocked:spending-limit: You have run out of credits or need a Grok subscription. Add credits at https://x.test/usage.", "error_type": "HTTPError"}`, ""},
+		{"hermes", "x_search", `{"success": false, "provider": "xai", "tool": "x_search", "error": "personal-team-blocked:spending-limit: You have run out of credits.", "error_ty`, ""},
+		{"hermes", "terminal", `{"output": "RuntimeError: HTTP 402: {\"code\":\"personal-team-blocked:spending-limit\",\"error\":\"You have run out of credits\"}", "exit_code": 1}`, ""},
+		{"hermes", "x_search", `{"success": false, "provider": "xai", "tool": "x_search", "error": "resource-exhausted: The model is currently at capacity due to high demand. Please try again in a few minutes.", "error_type": "HTTPError"}`,
+			"tool:x-search:resource-exhausted: the model is currently at capacity due to high demand"},
+		{"hermes", "terminal", `{"output": "RuntimeError: HTTP 429: {\"code\":\"resource-exhausted\",\"error\":\"The model is currently at capacity\"}", "exit_code": 1}`, "exec:runtimeerror: http 429: {Q:Q"},
 		// Codex: a script's error, its commands under either header, the stdin it writes
 		{"codex", "exec", `Script failed Wall time 0.1 seconds Output: Script error: exec_command failed: CreateProcess { message: "Rejected(rm -f)" }`,
 			"tool:exec:exec_command failed: createprocess { message: Q }"},
