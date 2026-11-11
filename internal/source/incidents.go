@@ -20,10 +20,10 @@ import (
 // could not read (store.MarkPartialRead, as the transcripts do), so a window that holds an incident it failed to read
 // is never read, and one that starts after those files were last modified is.
 //
-// An incident is one event, rewritten as its file changes: its status, its last sighting and its running count of
-// repeats. Each change of the last sighting or the count is also an event of its own, a sighting (kind
+// An incident is one event, rewritten as its file changes: its status, its last sighting, its running count of
+// repeats and its signature (normalized_signature, which the summary may share a long start with). Each change of the last sighting or the count is also an event of its own, a sighting (kind
 // incident-seen, keyed by the incident, its last sighting and its count), with the repeats since the sighting
-// before it: what the incident did over time, which the one event no longer says. A change of anything else (a
+// before it and the incident's signature: what the incident did over time, which the one event no longer says. A change of anything else (a
 // note, its status, its attempts) files no sighting. The sightings are kept: a rebuild drops them only when forced
 // (store.Rebuild), and then each incident's next sighting is a first one again, which holds its whole count; it
 // carries when the incident was first seen, so a count from before a window is not read as the window's.
@@ -114,7 +114,7 @@ func (i Incidents) Ingest(ctx context.Context, st *store.Store) (Result, error) 
 				Actor:     store.ActorDetector,
 				Kind:      "incident",
 				Summary:   clip(text, 240),
-				Meta:      meta(map[string]any{"status": inc.Status, "repeat": inc.Repeat, "severity": inc.Severity}),
+				Meta:      meta(map[string]any{"status": inc.Status, "repeat": inc.Repeat, "severity": inc.Severity, "signature": inc.Signature}),
 				Ref:       p,
 			}
 			prev, had, err := st.EventByKey(ctx, i.Name(), inc.ID)
@@ -137,7 +137,8 @@ func (i Incidents) Ingest(ctx context.Context, st *store.Store) (Result, error) 
 				if parseTime(first).IsZero() {
 					first = inc.CreatedAt
 				}
-				m := map[string]any{"incident": inc.ID, "status": inc.Status, "repeat": inc.Repeat, "new": max(fresh, 1), "severity": inc.Severity}
+				m := map[string]any{"incident": inc.ID, "status": inc.Status, "repeat": inc.Repeat, "new": max(fresh, 1), "severity": inc.Severity,
+					"signature": inc.Signature}
 				if !had {
 					m["first"] = true
 					if t := parseTime(first); !t.IsZero() {

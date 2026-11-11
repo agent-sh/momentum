@@ -1355,6 +1355,46 @@ func TestIncidentsCountTheirSightings(t *testing.T) {
 	}
 }
 
+// An incident's sightings are keyed by its signature, the whole of it: two whose text opens with one long log line
+// are two, and one signature seen in two incidents is one. A sighting stored before sightings kept the signature takes
+// its incident's; with none on either it keeps the key of its text.
+func TestIncidentsAreKeyedByTheirSignature(t *testing.T) {
+	st := testStore(t)
+	line := "ERROR [job-<id>] pipeline.step_runner: Step shell exited with an error after <n>s: "
+	disk, dns, refused, gone := line+"No space left on device", line+"Temporary failure in name resolution", line+"Connection refused", line+"Broken pipe"
+	signed := func(e store.Event, sig string) store.Event {
+		e.Meta = strings.TrimSuffix(e.Meta, "}") + fmt.Sprintf(`,"signature":%q}`, sig)
+		return e
+	}
+	put(t, st,
+		incident("i1", disk, "reported", t0), signed(sighting("i1", disk, 6, false, time.Time{}, t0), disk),
+		incident("i2", disk, "reported", t0), signed(sighting("i2", disk, 6, false, time.Time{}, t0.Add(time.Minute)), disk),
+		incident("i3", dns, "reported", t0), signed(sighting("i3", dns, 12, false, time.Time{}, t0), dns),
+		// a sighting from before: its incident's own event, read again since, has the signature
+		signed(incident("i4", refused, "reported", t0), refused), sighting("i4", refused, 10, false, time.Time{}, t0),
+		// neither has it
+		incident("i5", gone, "reported", t0), sighting("i5", gone, 10, false, time.Time{}, t0),
+	)
+	fs, err := Failures{}.Detect(context.Background(), st, week())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"failures/v2:incident:error [job-<id>] pipeline.step_runner: step shell exited with an error after 1", // cut at 80, as before
+		"failures/v2:incident:error [job-<id>] pipeline.step_runner: step shell exited with an error after <n>s: connection refused 1",
+		"failures/v2:incident:error [job-<id>] pipeline.step_runner: step shell exited with an error after <n>s: no space left on device 2",
+		"failures/v2:incident:error [job-<id>] pipeline.step_runner: step shell exited with an error after <n>s: temporary failure in name resolution 1",
+	}
+	if got := signatures(fs); !slices.Equal(got, want) {
+		t.Fatalf("found\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	for _, f := range fs {
+		if !strings.HasPrefix(f.Title, "An incident keeps recurring: error [job-<id>] pipeline.step_runner: step shell exited with an error") {
+			t.Errorf("title %q", f.Title)
+		}
+	}
+}
+
 // A finding files at most MaxEvidence of its newest sightings on a run.
 func TestAFindingFilesItsNewestEvidence(t *testing.T) {
 	st := testStore(t)

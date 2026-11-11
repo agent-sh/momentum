@@ -1,10 +1,12 @@
 package detect
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"math"
 	"net/url"
 	"path"
 	"regexp"
@@ -505,48 +507,62 @@ const resultPage = 4000
 // is closed or resolved by its own event (its file now), which a sighting carries only when the count or the time
 // moved too. A first sighting of an incident seen before the window counts once: its running total holds repeats
 // from before the window, which no sighting dates.
+//
+// A sighting is keyed by its incident's signature, the whole of it with what varies taken out: incidents whose text
+// opens with one long log line differ only after keyChars. A sighting stored before sightings kept it takes its
+// incident's own event's, once the incident's file has been read again; else it is keyed by its text, as before.
 func incidentSightings(ctx context.Context, st *store.Store, w Window) ([]occurrence, error) {
 	sightings, err := st.Events(ctx, store.Query{Since: w.Since, Until: w.Until, Kinds: []string{"incident-seen"}, Source: store.Incidents, Limit: maxRows})
 	if err != nil {
 		return nil, err
 	}
-	closed := map[string]bool{}
+	type current struct { // an incident as its own event says it is now
+		shut bool
+		sig  string
+	}
+	incidents := map[string]current{}
 	var out []occurrence
 	for _, e := range sightings {
 		var m struct {
-			Incident string `json:"incident"`
-			New      int    `json:"new"`
-			First    bool   `json:"first"`
-			Since    string `json:"first_seen"`
+			Incident  string `json:"incident"`
+			Signature string `json:"signature"`
+			New       int    `json:"new"`
+			First     bool   `json:"first"`
+			Since     string `json:"first_seen"`
 		}
 		json.Unmarshal([]byte(e.Meta), &m)
 		if m.Incident == "" {
 			continue
 		}
-		shut, ok := closed[m.Incident]
+		inc, ok := incidents[m.Incident]
 		if !ok {
-			now, had, err := st.EventByKey(ctx, store.Incidents, m.Incident)
+			ev, had, err := st.EventByKey(ctx, store.Incidents, m.Incident)
 			if err != nil {
 				return out, err
 			}
 			var s struct {
-				Status string `json:"status"`
+				Status    string `json:"status"`
+				Signature string `json:"signature"`
 			}
 			if had {
-				json.Unmarshal([]byte(now.Meta), &s)
+				json.Unmarshal([]byte(ev.Meta), &s)
 			}
-			shut = s.Status == "closed" || s.Status == "resolved"
-			closed[m.Incident] = shut
+			inc = current{shut: s.Status == "closed" || s.Status == "resolved", sig: s.Signature}
+			incidents[m.Incident] = inc
 		}
 		text := Norm(e.Summary, keyChars)
-		if shut || text == "" {
+		key := text
+		if sig := Norm(cmp.Or(m.Signature, inc.sig), math.MaxInt); sig != "" { // signature keeps a long key's start and a hash of the whole
+			key = sig
+		}
+		if inc.shut || key == "" {
 			continue
 		}
 		weight := max(m.New, 1)
 		if since, err := time.Parse(time.RFC3339Nano, m.Since); m.First && (err != nil || since.Before(w.Since)) {
 			weight = 1
 		}
-		out = append(out, occurrence{sig: signature("failures", "incident:"+text), title: "An incident keeps recurring: " + text, ev: e, weight: weight})
+		out = append(out, occurrence{sig: signature("failures", "incident:"+key), title: "An incident keeps recurring: " + text, ev: e, weight: weight})
 	}
 	return out, nil
 }

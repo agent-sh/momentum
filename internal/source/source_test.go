@@ -477,6 +477,32 @@ func TestRunAllKeepsGoingPastAFailingSource(t *testing.T) {
 	}
 }
 
+// An incident and its sightings keep the incident's own signature, which the detector keys them by.
+func TestAnIncidentKeepsItsSignature(t *testing.T) {
+	st := openStore(t)
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "open"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(map[string]any{"incident_id": "inc-1", "status": "reported", "summary": "a tool failed: disk full",
+		"normalized_signature": "a tool failed: disk full on <path>", "last_seen": "2026-01-02T10:00:00Z", "repeat_count": 3})
+	if err := os.WriteFile(filepath.Join(dir, "open", "inc-1.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ingest(t, Incidents{Dir: dir}, st)
+	got := all(t, st, "incidents")
+	if len(got) != 2 {
+		t.Fatalf("%d events, want the incident and its sighting", len(got))
+	}
+	for k, e := range got {
+		var m struct{ Signature string }
+		json.Unmarshal([]byte(e.Meta), &m)
+		if m.Signature != "a tool failed: disk full on <path>" || e.Summary != "a tool failed: disk full" {
+			t.Errorf("%s: %q %s", k, e.Summary, e.Meta)
+		}
+	}
+}
+
 // Each change of an incident's last sighting or count of repeats is a sighting of its own, keyed by both, with the
 // repeats since the one before: the incident's one event says only where it stands. A file read again with
 // nothing new adds none, and neither does a change of anything else, nor a time the file writes to the
