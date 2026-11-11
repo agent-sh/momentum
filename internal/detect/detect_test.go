@@ -1655,14 +1655,15 @@ func TestSessionsWaitResolvedOnFirstTryIsNotACase(t *testing.T) {
 		return ev(store.Sessions, session, "phase", store.ActorHarness, "", "x",
 			fmt.Sprintf(`{"from":"needs_you","to":"needs_you","for_ms":%d,"from_ask_kind":"error","auto":false}`, mins*60_000), start.Add(time.Duration(mins)*time.Minute))
 	}
+	rule := "access"
 	act := func(session string, try int, at time.Time) store.Event {
 		e := ev(store.Supervise, session, "act", store.ActorAgent, "", "x",
-			fmt.Sprintf(`{"rule":"access","try":%d,"stop_at":%d}`, try, stopAt.UnixMilli()), at)
+			fmt.Sprintf(`{"rule":%q,"try":%d,"stop_at":%d}`, rule, try, stopAt.UnixMilli()), at)
 		return e
 	}
 	outcome := func(of store.Event, result string, at time.Time) store.Event {
 		return ev(store.Supervise, of.Session, "outcome", store.ActorDetector, "", "x",
-			fmt.Sprintf(`{"of":%q,"rule":"access","result":%q}`, of.SourceKey, result), at)
+			fmt.Sprintf(`{"of":%q,"rule":%q,"result":%q}`, of.SourceKey, rule, result), at)
 	}
 	var evs []store.Event
 	for _, s := range []string{"a", "b", "c", "d"} {
@@ -1674,6 +1675,7 @@ func TestSessionsWaitResolvedOnFirstTryIsNotACase(t *testing.T) {
 	aa, ab, ac := act("a", 1, sent), act("b", 1, sent), act("c", 2, sent)
 	evs = append(evs, aa, ab, ac, outcome(aa, "worked", sent.Add(time.Minute)), outcome(ab, "failed again", sent.Add(time.Minute)),
 		outcome(ac, "worked", sent.Add(time.Minute)))
+	rule = "transient"      // the one rule with this outcome
 	ad := act("d", 1, sent) // its turn did work before it met the error again: the message ended this stop
 	evs = append(evs, ad, outcome(ad, "worked, then failed again", sent.Add(time.Minute)))
 	put(t, st, evs...)

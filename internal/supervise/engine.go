@@ -243,6 +243,13 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 				d.Verdict, d.At = Wait, next
 			}
 		}
+		// A try whose turn did work and then failed again starts the tries over, so nothing above bounds a provider
+		// that lets one call through per try: the next try goes no sooner than the second wait after that message.
+		if l := h.last(); d.Rule == RuleTransient && d.Verdict == Act && l != nil && l.rule == RuleTransient && l.result[WorkedThenFailed] && len(sv.Params.Backoff) > 1 {
+			if next := l.at.Add(sv.Params.Backoff[1]); next.After(now) {
+				d.Verdict, d.At = Wait, next
+			}
+		}
 		// The waits ran out: one case for the owner, while the rule keeps trying. A rule that is closed or stale
 		// sends nothing more, so it records none.
 		if d.Used && d.Verdict != Case && d.Verdict != Skip && !h.noted(d.Rule, ownerAt) {
@@ -1010,11 +1017,11 @@ func (sv *Supervisor) outcome(ctx context.Context, s *sessions.Session, stop Sto
 		again = Promise(stop.Words) != "" && stop.Tasks == 0 && stop.WakeAt.IsZero() && stop.Loop == ""
 	}
 	switch {
-	case again && l.rule == RuleTransient && worked(s, l.seq): // a new error in a session the message did move
+	case again && l.rule == RuleTransient && worked(s, l.seq, l.text): // a new error in a session the message did move
 		*put = append(*put, mk(WorkedThenFailed))
 	case again:
 		*put = append(*put, mk(FailedAgain))
-	case stop.Error == "" && worked(s, l.seq):
+	case stop.Error == "" && worked(s, l.seq, l.text):
 		*put = append(*put, mk(Worked))
 	default: // no work, or it stopped on another error
 		*put = append(*put, mk(Otherwise))
@@ -1037,15 +1044,26 @@ func landedSince(s *sessions.Session, seq int, text string) bool {
 	return false
 }
 
-// worked reports tool calls in the session's log since sequence number seq: the turn did work.
-func worked(s *sessions.Session, seq int) bool {
+// worked reports a tool call in the turn the message opened: in the session's log since sequence number seq, after
+// the message's own user entry (text folded) and before the next user or peer entry, which is another turn's. A
+// log that no longer holds the message's entry is read from its start.
+func worked(s *sessions.Session, seq int, text string) bool {
 	if s.Log == nil {
 		return false
 	}
 	items, _ := s.Log.Since(seq)
+	for i, it := range items {
+		if it.Role == sessions.RoleUser && fold(it.Text) == text {
+			items = items[i+1:]
+			break
+		}
+	}
 	for _, it := range items {
-		if it.Role == sessions.RoleTool {
+		switch it.Role {
+		case sessions.RoleTool:
 			return true
+		case sessions.RoleUser, sessions.RolePeer:
+			return false
 		}
 	}
 	return false

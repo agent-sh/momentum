@@ -835,6 +835,53 @@ func TestATryThatWorkedThenFailedAgainStartsTheTriesOver(t *testing.T) {
 	}
 }
 
+// A provider that lets one call through per try, then fails: the tries start over each time, and the rule still
+// sends no more than one message per second wait of the backoff, with no case.
+func TestTriesThatEachWorkThenFailAreSpacedByTheSecondWait(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0
+	sv := supervisor(st, f, &now)
+	s := erroring()
+	var last time.Time
+	for i := 1; i <= 20; i++ { // a scan a minute; each message lands, makes one call and fails at once
+		now = t0.Add(time.Duration(i) * time.Minute)
+		n := len(f.sent)
+		run(t, sv, s)
+		if len(f.sent) == n {
+			continue
+		}
+		if !last.IsZero() && now.Sub(last) < DefaultParams.Backoff[1] {
+			t.Fatalf("message %d came %s after the one before", n+1, now.Sub(last))
+		}
+		last = now
+		lands(s, strings.TrimPrefix(f.sent[n], "%7 "), now.Add(time.Second), true)
+		s.Since = now.Add(2 * time.Second)
+	}
+	if c := events(t, st, KindCase); len(f.sent) < 4 || len(c) != 0 {
+		t.Fatalf("sent %d in 20 minutes, cases %+v", len(f.sent), c)
+	}
+}
+
+// Work counts only in the turn the message opened: a turn something else opened after it is not the message's.
+func TestWorkInALaterTurnIsNotTheMessages(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0.Add(time.Minute)
+	sv := supervisor(st, f, &now)
+	s := erroring()
+	run(t, sv, s)
+	lands(s, strings.TrimPrefix(f.sent[0], "%7 "), now.Add(time.Second), false) // its turn fails with no call
+	s.Log.Add(sessions.Entry{Role: sessions.RoleUser, Origin: "scheduled", Text: "run the nightly check"})
+	s.Log.Add(sessions.Entry{Role: sessions.RoleTool, Name: "Bash", Text: "make check"})
+	s.UserAt, s.Seq, s.Since = now.Add(time.Minute), s.Log.Seq(), now.Add(2*time.Minute)
+	now = now.Add(3 * time.Minute)
+	run(t, sv, s)
+	if r := results(t, st); !r[FailedAgain] || r[WorkedThenFailed] || r[Worked] {
+		t.Fatalf("outcomes %v", r)
+	}
+}
+
 // failedTries is a session whose first n transient tries each landed and failed again, and the time of its last error.
 func failedTries(t *testing.T, sv *Supervisor, f *fakeSender, s *sessions.Session, now *time.Time, n int) time.Time {
 	t.Helper()
