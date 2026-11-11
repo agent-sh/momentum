@@ -82,7 +82,7 @@ func TestGrokSearchStatusAndShellOutput(t *testing.T) {
 					t.Fatalf("shell output was not extracted: %q", e.Summary)
 				}
 				k, ok := detect.FailureOf(e.Harness, e.Tool, e.Summary, `{"command":"cat notes.txt"}`)
-				if ok != tc.keyed || ok && tc.typ == "Bash" && k.Origin != "exec" {
+				if ok != tc.keyed || ok && tc.typ == "Bash" && k.Origin != "miss:exec" { // cat's missing file is keyed by its path
 					t.Fatalf("wrong key: %+v %t", k, ok)
 				}
 			}
