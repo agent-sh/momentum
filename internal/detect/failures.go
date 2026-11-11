@@ -581,7 +581,7 @@ const (
 // server, a command, the model) and its text with what varies taken out; a read that found no file, by the read
 // tool and the path it missed, and a command's, by the path its message names.
 type FailureKey struct {
-	Origin string // guard:NAME, harness:HARNESS, turn:HARNESS, tool:TOOL, mcp:SERVER, exec, module, model:refusal, miss:TOOL, miss:exec, host:TOOL
+	Origin string // guard:NAME, harness:HARNESS, turn:HARNESS, tool:TOOL, mcp:SERVER, exec, module, model:refusal, miss:TOOL, miss:exec, host:TOOL, http:PROGRAM
 	Text   string
 	host   string // a command's miss on another host, the host its command line names (remoteHost) or unknownHost, till failureKey keys it
 }
@@ -639,7 +639,12 @@ func (k FailureKey) Title() string {
 		}
 		return "The same path keeps missing through " + name + ": " + k.Text
 	case "host":
+		if strings.Contains(k.Text, " ") { // a status the host answered with, then the host
+			return "The same host keeps answering with an error through " + name + ": " + k.Text
+		}
 		return "The same host keeps failing to answer through " + name + ": " + k.Text
+	case "http":
+		return "The same HTTP call keeps failing through " + name + ": " + k.Text
 	}
 	return "The " + name + " tool keeps failing: " + k.Text
 }
@@ -734,7 +739,9 @@ var (
 // search_files) is keyed the same way.
 //
 // A fetch tool's error that its request got no response is keyed host:TOOL by its URL's host (unansweredHost), for
-// the same reason: only the same host failing again recurs. One whose URL names no host keeps its words.
+// the same reason: only the same host failing again recurs. One whose URL names no host keeps its words. A fetch the
+// site answered with an error status is no failure for a 404 or a 410, and keyed host:TOOL by the status and the
+// host otherwise (toolKey).
 //
 // A failed command whose message says no file is at a path it names in quotes (quotedMiss), or unquoted after its
 // program's name (unquotedMiss), is keyed miss:exec by that path (commandMissed, missedPath), for the same reason,
@@ -1104,7 +1111,7 @@ func failureOf(harness, tool, text, call string) (FailureKey, bool) {
 				if g := guardRe.FindStringSubmatch(message); g != nil {
 					return FailureKey{Origin: "guard:" + slug(g[1], 30), Text: Norm(firstClause(g[2]), keyChars)}, true
 				}
-				return toolKey(tool, toolOrigin(tool), message)
+				return toolKey(tool, toolOrigin(tool), message, call)
 			}
 			code := result.Exit
 			if code == nil {
@@ -1167,14 +1174,14 @@ func failureOf(harness, tool, text, call string) (FailureKey, bool) {
 	}
 	switch {
 	case strings.HasPrefix(tool, "mcp__"):
-		return toolKey(tool, toolOrigin(tool), text)
+		return toolKey(tool, toolOrigin(tool), text, call)
 	case harness == "hermes" && strings.HasPrefix(text, "{"):
 		if m := hermesErrRe.FindStringSubmatch(text); m != nil && m[1] != "" {
 			msg := unescape(m[1])
 			if g := guardRe.FindStringSubmatch(msg); g != nil {
 				return FailureKey{Origin: "guard:" + slug(g[1], 30), Text: Norm(firstClause(g[2]), keyChars)}, true
 			}
-			return toolKey(tool, "tool:"+slug(tool, 30), msg)
+			return toolKey(tool, "tool:"+slug(tool, 30), msg, call)
 		}
 		// an exit of 0 is no failure; one past the store's cut is not in view, and the result is flagged an error
 		if m := hermesExit.FindStringSubmatch(text); m == nil || m[1] != "0" {
@@ -1185,14 +1192,14 @@ func failureOf(harness, tool, text, call string) (FailureKey, bool) {
 		return FailureKey{}, false
 	case harness == "codex":
 		if m := codexRe.FindStringSubmatch(text); m != nil {
-			return toolKey(tool, "tool:"+slug(tool, 30), m[1])
+			return toolKey(tool, "tool:"+slug(tool, 30), m[1], call)
 		}
 	}
 	if isShell(tool) || headerRe.MatchString(text) {
 		return execKey(headerRe.ReplaceAllString(text, ""), call)
 	}
 	// A tool's error in its own words (a read, an edit, a write the harness refused).
-	return toolKey(tool, "tool:"+slug(tool, 30), text)
+	return toolKey(tool, "tool:"+slug(tool, 30), text, call)
 }
 
 // quotaRe is a provider's own word that the account's usage quota or credit ran out: xAI's spending-limit code and
@@ -1206,8 +1213,11 @@ var notRunningRe = regexp.MustCompile(`^(?:<tool_use_error>)?Task \S+ is not run
 // toolKey keys a tool's error by its origin and words. A quota that ran out (quotaRe) has no key: it renews by
 // itself and is no fault of the tool, so its case would hold evidence nobody can act on. Nor has a stop of a task
 // that is not running (notRunningRe): what the stop wanted already holds. A fetch that got no response
-// (unansweredHost) is keyed host:TOOL by its URL's host: its words, the URL masked, are the same for every site.
-func toolKey(tool, origin, msg string) (FailureKey, bool) {
+// (unansweredHost) is keyed host:TOOL by its URL's host: its words, the URL masked, are the same for every site. A
+// fetch the site answered with an error status (answeredRe) is no failure for a 404 or a 410, a URL that is not
+// there, since the tool worked; any other status is keyed host:TOOL by the status and the host of the URL its words
+// or its call (as the store keeps it) name, and by its words when neither names one.
+func toolKey(tool, origin, msg, call string) (FailureKey, bool) {
 	if quotaRe.MatchString(msg) {
 		return FailureKey{}, false
 	}
@@ -1218,8 +1228,37 @@ func toolKey(tool, origin, msg string) (FailureKey, bool) {
 	if h := unansweredHost(msg); h != "" {
 		return FailureKey{Origin: "host:" + slug(tool, 30), Text: h}, true
 	}
+	if m := answeredRe.FindStringSubmatch(msg); m != nil {
+		var status, u string
+		for _, g := range m[1:] {
+			if len(g) == 3 && status == "" {
+				status = g
+			} else if len(g) > 3 && u == "" {
+				u = g
+			}
+		}
+		if status == "404" || status == "410" {
+			return FailureKey{}, false
+		}
+		if u == "" {
+			u, _, _ = callField(call, map[string]bool{"url": true})
+		}
+		if h := urlHost(u); h != "" {
+			return FailureKey{Origin: "host:" + slug(tool, 30), Text: status + " " + h}, true
+		}
+	}
 	return FailureKey{Origin: origin, Text: Norm(msg, keyChars)}, true
 }
+
+// answeredRe is a fetch tool's error that the site answered its request with an error status, the status, and the
+// URL where its words name it: OpenCode's webfetch's "non 2xx status code (STATUS METHOD URL)", reqwest's "HTTP
+// status client error (STATUS ...) for url (URL)", Kimi's FetchURL's "Failed to fetch URL. Status: STATUS", Claude
+// Code's WebFetch's "The server returned HTTP STATUS", the web-search MCP server's "Failed to fetch web content:
+// Request failed with status code STATUS" and harness-web's "PDF text extraction failed: HTTP STATUS fetching".
+var answeredRe = regexp.MustCompile(`(?i)\bnon 2xx status code \(([45]\d\d) [a-z]+ (https?://[^\s()]+)\)|` +
+	`\bhttp status (?:client|server) error \(([45]\d\d)\b[^)]*\) for url \((https?://[^\s()]+)\)|` +
+	`\bfailed to fetch url\. status: ([45]\d\d)\b|\bthe server returned http ([45]\d\d)\b|` +
+	`\bfailed to fetch web content: request failed with status code ([45]\d\d)\b|\bpdf text extraction failed: http ([45]\d\d) fetching\b`)
 
 // unansweredRe is a fetch tool's error that its request for a URL got no response, and that URL: reqwest's "error
 // sending request for url (URL)", whether the site refused, timed out or did not resolve, and Kimi's FetchURL's
@@ -1233,7 +1272,12 @@ func unansweredHost(msg string) string {
 	if m == nil {
 		return ""
 	}
-	u, err := url.Parse(strings.TrimRight(m[1], ".,;:"))
+	return urlHost(m[1])
+}
+
+// urlHost is a URL's host, lower case, its port and user info off, or "" when no host parses from it.
+func urlHost(raw string) string {
+	u, err := url.Parse(strings.TrimRight(raw, ".,;:"))
 	if err != nil {
 		return ""
 	}
@@ -1304,7 +1348,9 @@ var tailRe = regexp.MustCompile(`^:\s+([^\s,;]{1,40})`)
 // (quotedMiss), or unquoted after its program's name or zsh's mark (unquotedMiss), is no message of words: its key
 // is execMiss, its text that path as the message names it, which failureKey keys as commandMissed says. A call that
 // may have run on another host (remote) is keyed by that host and the path when its command line names the host,
-// else by unknownHost and the path: its words would merge every path into one.
+// else by unknownHost and the path: its words would merge every path into one. A message whose mark is an HTTP
+// status is keyed http:PROGRAM by the status and what the call's program called (httpCall), for the same reason,
+// and by its words when the call does not show what.
 func execKey(out, call string) (FailureKey, bool) {
 	programs := callPrograms(call)
 	out = strings.Join(strings.Fields(out), " ")
@@ -1364,6 +1410,11 @@ func execKey(out, call string) (FailureKey, bool) {
 	if quotaRe.MatchString(before[start:] + out[loc[0]:loc[1]] + rest) { // a quota that ran out (toolKey)
 		return FailureKey{}, false
 	}
+	if status, ok := strings.CutPrefix(mark, "http "); ok {
+		if prog, what := httpCall(call); prog != "" {
+			return FailureKey{Origin: "http:" + prog, Text: cutWords(status+" "+what, keyChars)}, true
+		}
+	}
 	text := mask(before[start:])
 	if text != "" && strings.HasSuffix(before, " ") {
 		text += " "
@@ -1379,6 +1430,169 @@ func execKey(out, call string) (FailureKey, bool) {
 		}
 	}
 	return FailureKey{Origin: "exec", Text: cutWords(text, execChars)}, true
+}
+
+// urlClients are the programs whose call names the URL they request: curl, wget, HTTPie and xh.
+var urlClients = map[string]bool{"curl": true, "wget": true, "http": true, "https": true, "xh": true, "xhs": true}
+
+// httpCall is the program a shell call's command line ran that an HTTP status in its output is from, and what that
+// program called, or "" when the call does not show it: gh api by its method and endpoint (ghEndpoint), the
+// programs that name the URL they request (urlClients) by its host. Its commands are read up to a here-document,
+// whose text is no command. It shows none when its commands call nothing over HTTP, call two different things, or
+// make a call whose target they do not show: another gh command, a client with no URL it names or one whose host
+// does not parse.
+func httpCall(call string) (prog, what string) {
+	m := callRe.FindStringSubmatch(call)
+	if m == nil {
+		return "", ""
+	}
+	line := unescape(m[1])
+	if i := strings.Index(line, "<<"); i >= 0 {
+		line = line[:i]
+	}
+	type target struct{ prog, what string }
+	var found []target
+	for _, part := range shellParts(line) {
+		words, _ := commandWords(part)
+		for len(words) > 0 && (assignRe.MatchString(words[0]) || words[0] == "{" || words[0] == "}") {
+			words = words[1:]
+		}
+		for len(words) > 0 && wrappers[words[0]] {
+			words = words[1:]
+			for len(words) > 0 && (strings.HasPrefix(words[0], "-") || countRe.MatchString(words[0]) || assignRe.MatchString(words[0])) {
+				words = words[1:]
+			}
+		}
+		if len(words) == 0 {
+			continue
+		}
+		switch name := path.Base(words[0]); {
+		case name == "gh" && len(words) > 1 && words[1] == "api":
+			found = append(found, target{"gh-api", ghEndpoint(words[2:])})
+		case name == "gh":
+			found = append(found, target{"gh", ""})
+		case urlClients[name]:
+			n := len(found)
+			for _, w := range words[1:] {
+				if l := strings.ToLower(w); strings.HasPrefix(l, "http://") || strings.HasPrefix(l, "https://") {
+					found = append(found, target{name, urlHost(w)})
+				}
+			}
+			if len(found) == n {
+				found = append(found, target{name, ""})
+			}
+		}
+	}
+	if len(found) == 0 {
+		return "", ""
+	}
+	for _, t := range found {
+		if t.what == "" || t != found[0] {
+			return "", ""
+		}
+	}
+	return found[0].prog, found[0].what
+}
+
+// shellParts are a command line's commands: it split at a list's, a pipe's, a subshell's, a command substitution's
+// and a line's separators outside quotes.
+func shellParts(line string) []string {
+	var out []string
+	start, quote := 0, byte(0)
+	for i := 0; i < len(line); i++ {
+		switch c := line[i]; {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			} else if c == '\\' && quote == '"' {
+				i++
+			}
+		case c == '\'' || c == '"':
+			quote = c
+		case c == '\\':
+			i++
+		case strings.IndexByte(";&|\n()`", c) >= 0:
+			out = append(out, line[start:i])
+			start = i + 1
+		}
+	}
+	return append(out, line[start:])
+}
+
+// ghValued are gh api's options that take a value, in their word after = (or a short one's letter) or as the next.
+var ghValued = map[string]bool{"-X": true, "--method": true, "-F": true, "--field": true, "-f": true, "--raw-field": true,
+	"-H": true, "--header": true, "-p": true, "--preview": true, "-q": true, "--jq": true, "-t": true, "--template": true,
+	"--input": true, "--hostname": true, "--cache": true}
+
+// ownerSegs are the words of a GitHub route after which it names an owner, and in how many segments: a repository's
+// owner and name, an organization, a user.
+var ownerSegs = map[string]int{"repos": 2, "orgs": 1, "users": 1}
+
+// ghEndpoint is what gh api's words after api call: its method and its endpoint's path, or "" when no endpoint is
+// among them. The method is the one -X or --method names, else POST when a parameter (-f, -F) or a body (--input)
+// is given, else GET, as gh does. The path is the endpoint's, a URL's host and a query off, its slashes at its ends
+// trimmed, and every segment that is a value is *: one that is no word of lower-case letters, _ and - (a number, an
+// id, a shell variable, gh's {owner}, a file's name, an empty one), and the owner and repository the route names
+// (ownerSegs), so one route recurs whatever repository it was called for.
+func ghEndpoint(args []string) string {
+	method, params, endpoint := "", false, ""
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			if endpoint == "" {
+				endpoint = a
+			}
+			continue
+		}
+		name, val, inline := strings.Cut(a, "=")
+		if !strings.HasPrefix(a, "--") && len(a) > 2 {
+			name, val, inline = a[:2], strings.TrimPrefix(a[2:], "="), true
+		}
+		if !ghValued[name] {
+			continue
+		}
+		if !inline {
+			if i++; i >= len(args) {
+				break
+			}
+			val = args[i]
+		}
+		switch name {
+		case "-X", "--method":
+			method = strings.ToUpper(val)
+		case "-f", "-F", "--field", "--raw-field", "--input":
+			params = true
+		}
+	}
+	if endpoint == "" {
+		return ""
+	}
+	if method == "" {
+		method = "GET"
+		if params {
+			method = "POST"
+		}
+	}
+	if i := strings.Index(endpoint, "://"); i >= 0 {
+		_, endpoint, _ = strings.Cut(endpoint[i+3:], "/")
+	}
+	if i := strings.IndexAny(endpoint, "?#"); i >= 0 {
+		endpoint = endpoint[:i]
+	}
+	segs := strings.Split(strings.Trim(endpoint, "/"), "/")
+	for i := 0; i < len(segs); i++ {
+		if n := ownerSegs[segs[i]]; n > 0 {
+			for j := i + 1; j <= i+n && j < len(segs); j++ {
+				segs[j] = "*"
+			}
+			i += n
+			continue
+		}
+		if strings.Trim(segs[i], "abcdefghijklmnopqrstuvwxyz_-") != "" || segs[i] == "" {
+			segs[i] = "*"
+		}
+	}
+	return method + " " + strings.Join(segs, "/")
 }
 
 // exceptionRe is an exception's name: Python's, Java's, JavaScript's (ModuleNotFoundError, IOException).

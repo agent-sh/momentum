@@ -162,7 +162,7 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		{"claude", "mcp__web-tools__fetch", "tool failed: spawn failed for /usr/bin/x: spawn /usr/bin/x ENOENT",
 			"mcp:web-tools:tool failed: spawn failed for P: spawn P enoent"},
 		// a fetch that got no response is keyed by its URL's host, lower case, its port and user info off; a URL with
-		// no host keeps the words, and so does a status the site answered with
+		// no host keeps the words
 		{"claude", "mcp__web-tools__fetch", "error: error sending request for url (https://site-a.example/page)", "host:mcp-web-tools-fetch:site-a.example"},
 		{"claude", "mcp__web-tools__fetch", "error: error sending request for url (https://site-a.example/other?q=1): operation timed out",
 			"host:mcp-web-tools-fetch:site-a.example"},
@@ -171,8 +171,6 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 			"host:fetchurl:api.site-c.example"},
 		{"claude", "mcp__web-tools__fetch", "error: error sending request for url (https://%zz/page)", "mcp:web-tools:error: error sending request for url (U"},
 		{"claude", "mcp__web-tools__fetch", "error: error sending request for url (https:///page)", "mcp:web-tools:error: error sending request for url (U"},
-		{"claude", "mcp__web-tools__fetch", "error: HTTP status client error (404 Not Found) for url (https://site-a.example/page)",
-			"mcp:web-tools:error: http status client error (N not found) for url (U"},
 		// Hermes: a tool's error, a guard inside one, a command that exits otherwise than 0, code that failed
 		{"hermes", "write_file", `{"error": "BLOCKED: write to protected agent-instruction file(s) (AGENTS.md) approval prompt timed out."}`,
 			"tool:write-file:blocked: write to protected agent-instruction file(s) (P) approval prompt timed"},
@@ -340,6 +338,91 @@ func TestACommandsFailureIsKeyedByItsMessage(t *testing.T) {
 	}
 	if k, _ := FailureOf("claude", "mcp__web-tools__fetch", "error: error sending request for url (https://site-a.example/page)", ""); k.Title() !=
 		"The same host keeps failing to answer through mcp-web-tools-fetch: site-a.example" {
+		t.Errorf("title %q", k.Title())
+	}
+}
+
+// A fetch the site answered with a 404 or a 410 is no failure: the tool worked and the URL was wrong. Another status
+// is keyed by it and the host of the URL the error or its call names; with no host, by its words.
+func TestAFetchsAnsweredStatusIsKeyedByItsHost(t *testing.T) {
+	for _, c := range []struct{ harness, tool, text, call, want string }{
+		{"opencode", "webfetch", "StatusCode: non 2xx status code (404 GET https://site-a.example/x)", "", ""},
+		{"opencode", "webfetch", "StatusCode: non 2xx status code (410 GET https://site-a.example/x)", "", ""},
+		{"kimi", "FetchURL", "Failed to fetch URL. Status: 404. HTTP 404 Not Found", `{"url":"https://site-a.example/x"}`, ""},
+		{"claude", "WebFetch", "The server returned HTTP 404 Not Found. The response body was not retrieved.", `{"url":"https://site-a.example/x","prompt":"p"}`, ""},
+		{"hermes", "mcp_web_search_fetchWebContent", `{"error": "Failed to fetch web content: Request failed with status code 404"}`, `{"url":"https://site-a.example/x"}`, ""},
+		{"claude", "mcp__web-tools__fetch", "error: HTTP status client error (404 Not Found) for url (https://site-a.example/page)", "", ""},
+		{"claude", "WebFetch", "The server returned HTTP 404 Not Found.", "", ""},
+		// another status, by the host its words name, else its call's
+		{"opencode", "webfetch", "StatusCode: non 2xx status code (403 GET https://Site-A.example:8443/x/1)", "", "host:webfetch:403 site-a.example"},
+		{"opencode", "webfetch", "StatusCode: non 2xx status code (429 GET https://site-b.example/api?q=1)", "", "host:webfetch:429 site-b.example"},
+		{"kimi", "FetchURL", "Failed to fetch URL. Status: 403. HTTP 403 Forbidden", `{"url":"https://site-a.example/x"}`, "host:fetchurl:403 site-a.example"},
+		{"kimi", "FetchURL", "Failed to fetch URL. Status: 520. HTTP 520 <none>", `{"url":"https://site-c.example/y"}`, "host:fetchurl:520 site-c.example"},
+		{"claude", "WebFetch", "The server returned HTTP 403 Forbidden. The response body was not retrieved.", `{"url":"https://site-a.example/x","prompt":"p"}`,
+			"host:webfetch:403 site-a.example"},
+		{"claude", "mcp__web-tools__fetch", "error: PDF text extraction failed: HTTP 403 fetching the PDF", `{"url":"https://site-d.example/a.pdf"}`,
+			"host:mcp-web-tools-fetch:403 site-d.example"},
+		{"claude", "mcp__web-tools__fetch", "error: HTTP status server error (502 Bad Gateway) for url (https://site-a.example/page)", "",
+			"host:mcp-web-tools-fetch:502 site-a.example"},
+		// no host to key it by: the words
+		{"kimi", "FetchURL", "Failed to fetch URL. Status: 403. HTTP 403 Forbidden", "", "tool:fetchurl:failed to fetch url. status: N. http N forbidden"},
+		{"kimi", "FetchURL", "Failed to fetch URL. Status: 403. HTTP 403 Forbidden", `{"url":"https://site-a.example/a-long-pa`,
+			"tool:fetchurl:failed to fetch url. status: N. http N forbidden"},
+	} {
+		k, ok := FailureOf(c.harness, c.tool, c.text, c.call)
+		got := k.String()
+		if !ok {
+			got = ""
+		}
+		if got != c.want {
+			t.Errorf("%s %s %q:\n got %q\nwant %q", c.harness, c.tool, c.text, got, c.want)
+		}
+	}
+	if k, _ := FailureOf("kimi", "FetchURL", "Failed to fetch URL. Status: 403. HTTP 403 Forbidden", `{"url":"https://site-a.example/x"}`); k.Title() !=
+		"The same host keeps answering with an error through fetchurl: 403 site-a.example" {
+		t.Errorf("title %q", k.Title())
+	}
+}
+
+// An HTTP status a command printed is keyed by what its call called: gh api by its method and endpoint, with its
+// values and the repository masked, a URL client by the host. A call that does not show what keeps the words.
+func TestAnHTTPStatusIsKeyedByWhatTheCallCalled(t *testing.T) {
+	gh404 := `Exit code 1 {"message":"Not Found","status":"404"}gh: Not Found (HTTP 404)`
+	for _, c := range []struct{ call, out, want string }{
+		// two endpoints are two keys; one endpoint is one key whatever its ids, its repository or its query
+		{`{"command":"gh api repos/acme/widgets/issues/12 --jq .title"}`, gh404, "http:gh-api:404 GET repos/*/*/issues/*"},
+		{`{"command":"gh api repos/acme/gadgets/issues/977"}`, gh404, "http:gh-api:404 GET repos/*/*/issues/*"},
+		{`{"command":"gh api /repos/{owner}/{repo}/issues/$N?per_page=5"}`, gh404, "http:gh-api:404 GET repos/*/*/issues/*"},
+		{`{"command":"gh api repos/acme/widgets/branches/main/protection"}`, gh404, "http:gh-api:404 GET repos/*/*/branches/main/protection"},
+		{`{"command":"gh api repos/acme/widgets/check-runs/4812/rerequest --method POST"}`, gh404, "http:gh-api:404 POST repos/*/*/check-runs/*/rerequest"},
+		{`{"command":"gh api orgs/acme/teams//members"}`, gh404, "http:gh-api:404 GET orgs/*/teams/*/members"},
+		// gh's method: POST with a parameter or a body and no method, else what -X names
+		{`{"command":"gh api notifications --paginate -f all=true"}`, gh404, "http:gh-api:404 POST notifications"},
+		{`{"command":"gh api repos/acme/widgets/rulesets --input rules.json"}`, gh404, "http:gh-api:404 POST repos/*/*/rulesets"},
+		{`{"command":"gh api -X GET 'search/issues?q=x' -f q=y"}`, gh404, "http:gh-api:404 GET search/issues"},
+		{`{"command":"gh api -XPATCH repos/acme/widgets/issues/comments/9 -F body=@b.md"}`, gh404, "http:gh-api:404 PATCH repos/*/*/issues/comments/*"},
+		{`{"command":"cd /w && timeout 30 gh api repos/acme/widgets/pulls/3/comments --jq '.[] | {id: .id}' 2>&1 | head -5"}`, gh404,
+			"http:gh-api:404 GET repos/*/*/pulls/*/comments"},
+		// a URL client by its URL's host
+		{`{"command":"curl -sf -o /dev/null -w 'HTTP %{http_code}\\n' https://Site-A.example:8443/x/1"}`,
+			"Exit code 22 HTTP 404 curl: (22) The requested URL returned error: 404", "http:curl:404 site-a.example"},
+		{`{"command":"wget -q https://site-b.example/a.tgz || echo HTTP 404"}`, "Exit code 8 HTTP 404", "http:wget:404 site-b.example"},
+		// a call that does not show what was called keeps the words: none, two, or one with no target it shows
+		{`{"command":"./fetch.sh"}`, gh404, "exec:http 404"},
+		{"", "Exit code 1 gh: Not Found (HTTP 404)", "exec:gh: not found (http 404"},
+		{`{"command":"gh pr view 3 && gh api repos/acme/widgets/pulls/3/comments"}`, gh404, "exec:http 404"},
+		{`{"command":"gh api repos/acme/widgets/issues/1; gh api repos/acme/widgets/labels"}`, gh404, "exec:http 404"},
+		{`{"command":"curl -s $URL"}`, "Exit code 1 HTTP 404", "exec:http 404"},
+		{`{"command":"gh api --jq .x"}`, gh404, "exec:http 404"},
+		{`{"command":"python3 - <<'PY'\nsubprocess.run(['gh', 'api', 'repos/acme/widgets'])\nPY"}`, gh404, "exec:http 404"},
+	} {
+		k, ok := FailureOf("claude", "Bash", c.out, c.call)
+		if !ok || k.String() != c.want {
+			t.Errorf("%s:\n got %q %v\nwant %q", c.call, k.String(), ok, c.want)
+		}
+	}
+	if k, _ := FailureOf("claude", "Bash", gh404, `{"command":"gh api repos/acme/widgets/labels"}`); k.Title() !=
+		"The same HTTP call keeps failing through gh-api: 404 GET repos/*/*/labels" {
 		t.Errorf("title %q", k.Title())
 	}
 }
