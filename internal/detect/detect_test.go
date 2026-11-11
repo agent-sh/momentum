@@ -169,9 +169,17 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		{"claude", "Bash", "Exit code 2 usage: /opt/tools/bin/x-tool [-h] --repo REPO", "exec:usage: x-tool"},
 		{"hermes", "terminal", `{"output": "ls: cannot access 'x': No such file or directory", "exit_code": 0, "error": null}`, ""},
 		{"hermes", "terminal", `{"output": "cat: a.txt: No such file or directory and more output past the store's cut`, "miss:exec:a.txt"},
-		{"hermes", "execute_code", "ModuleNotFoundError: No module named 'yaml'", "exec:modulenotfounderror: no module named"},
+		{"hermes", "execute_code", "ModuleNotFoundError: No module named 'yaml'", "module:yaml"},
+		// Python's missing module is keyed by its top-level package; a name that is no identifier keeps the words
+		{"hermes", "execute_code", "ModuleNotFoundError: No module named 'yaml.nodes'", "module:yaml"},
+		{"hermes", "execute_code", "ModuleNotFoundError: No module named 'yaml.nodes'; 'yaml' is not a package", "module:yaml"},
+		{"hermes", "execute_code", "/usr/bin/python3: No module named yaml", "module:yaml"},
+		{"hermes", "execute_code", "/usr/bin/python3: No module named yaml.__main__; 'yaml' is a package and cannot be directly executed", "module:yaml"},
+		{"hermes", "execute_code", "ModuleNotFoundError: No module named 'torch'", "module:torch"},
+		{"hermes", "execute_code", "ModuleNotFoundError: No module named 'my-pkg'", "exec:modulenotfounderror: no module named"},
+		{"hermes", "execute_code", "/usr/bin/python3: No module named my-pkg", "exec:no module named"},
 		{"hermes", "execute_code", `{"status": "error", "output": "Traceback (most recent call last):\n  File \"x.py\", line 3, in <module>\nModuleNotFoundError: No module named 'yaml'"}`,
-			"exec:modulenotfounderror: no module named"},
+			"module:yaml"},
 		// Codex: a script's error, its commands under either header, the stdin it writes
 		{"codex", "exec", `Script failed Wall time 0.1 seconds Output: Script error: exec_command failed: CreateProcess { message: "Rejected(rm -f)" }`,
 			"tool:exec:exec_command failed: createprocess { message: Q }"},
@@ -206,8 +214,8 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		// a word's apostrophe opens no quoted value, but a string's prefix does
 		{"claude", "Bash", "Exit code 1 x: can't open cfg: Permission denied x: can't bind :80: Address already in use", "exec:cfg: permission denied"},
 		{"claude", "Bash", "Exit code 1 your project's requirements are unsatisfiable. Traceback (most recent call last): ModuleNotFoundError: No module named 'torch'",
-			"exec:modulenotfounderror: no module named"},
-		{"claude", "Bash", "Exit code 1 475- f'got {name!r}' Traceback (most recent call last): ModuleNotFoundError: No module named 'xllm'", "exec:modulenotfounderror: no module named"},
+			"module:torch"},
+		{"claude", "Bash", "Exit code 1 475- f'got {name!r}' Traceback (most recent call last): ModuleNotFoundError: No module named 'xllm'", "module:xllm"},
 		{"claude", "Bash", "Exit code 2 usage: \x1b[1mx-tool\x1b[0m [-h] --repo REPO", "exec:usage: x-tool"},
 		{"claude", "Bash", "Exit code 1 CPU usage: 12.5% memory usage: 40% check failed", ""},
 		{"claude", "Bash", "Exit code 1 httpx.ConnectError: [Errno -3] Temporary failure in name resolution", "exec:httpx.connecterror: [errno -N] temporary failure in name resolution"},
@@ -276,7 +284,7 @@ func TestACommandsFailureIsKeyedByItsMessage(t *testing.T) {
 			"Exit code 1 x: " + strings.Repeat("word ", 25) + "connection refused"}},
 		{`{"command":"ls x"}`, "exec:x: no such file or directory", []string{"Exit code 2 ls: done; x: No such file or directory",
 			"Exit code 2 ls: done! x: No such file or directory", "Exit code 2 ls: done? x: No such file or directory"}},
-		{`{"command":"poll-ready --file x; python3 run.py"}`, "exec:modulenotfounderror: no module named", []string{
+		{`{"command":"poll-ready --file x; python3 run.py"}`, "module:yaml", []string{
 			"Exit code 1 poll-ready: gave up after 60s ModuleNotFoundError: No module named 'yaml'", "Exit code 1 ModuleNotFoundError: No module named 'yaml'"}},
 		{`{"command":"run"}`, "exec:sh: N: rgg: not found", []string{"Exit code 127 sh: 1: rgg: not found", "Exit code 127 sh: 7: rgg: not found"}},
 	} {

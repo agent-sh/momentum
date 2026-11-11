@@ -545,7 +545,7 @@ const (
 // server, a command, the model) and its text with what varies taken out; a read that found no file, by the read
 // tool and the path it missed, and a command's, by the path its message names.
 type FailureKey struct {
-	Origin string // guard:NAME, harness:HARNESS, turn:HARNESS, tool:TOOL, mcp:SERVER, exec, model:refusal, miss:TOOL, miss:exec
+	Origin string // guard:NAME, harness:HARNESS, turn:HARNESS, tool:TOOL, mcp:SERVER, exec, module, model:refusal, miss:TOOL, miss:exec
 	Text   string
 	host   string // a command's miss on another host, the host its command line names (remoteHost) or unknownHost, till failureKey keys it
 }
@@ -555,6 +555,16 @@ func (k FailureKey) String() string { return k.Origin + ":" + k.Text }
 // execMiss is the origin of a command's message that says no file is at the path it names (quotedMiss). No read tool
 // is named exec (readTools), so no read's miss has it.
 const execMiss = "miss:exec"
+
+// execModule is the origin of a command's message that Python found no module of a name: its text is the name of
+// the module's top-level package as the message prints it, so only the same module missing again recurs. No other
+// origin is it.
+const execModule = "module"
+
+// moduleRe is the module Python names after "No module named": in quotes ('pkg', 'pkg.sub', then "; 'pkg' is not a
+// package" or nothing), or bare at the end of a sentence, as python -m prints it. Its group is the top-level
+// package, a Python identifier in ASCII. Any other name has no key of its own.
+var moduleRe = regexp.MustCompile(`^ (?:'([A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z_][A-Za-z0-9_]*)*'|([A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z_][A-Za-z0-9_]*)*(?:;|\.?(?: |$)))`)
 
 // unknownHost stands for the host of a command's miss that may have run on another host its command line does not
 // name (remote). No host's name is it (hostNameRe), so its paths never meet a named host's or this host's.
@@ -585,6 +595,8 @@ func (k FailureKey) Title() string {
 		return harnessName(name) + "'s turns keep failing: " + k.Text
 	case "mcp":
 		return "The " + name + " MCP server keeps failing: " + k.Text
+	case execModule:
+		return "A command keeps missing the same Python module: " + k.Text
 	case "miss":
 		if k.Origin == execMiss {
 			return "A command keeps missing the same path: " + k.Text
@@ -1228,6 +1240,11 @@ func execKey(out, call string) (FailureKey, bool) {
 		return FailureKey{Origin: execMiss, Text: p, host: host}, true
 	}
 	before, mark, after := out[:loc[0]], markText(out[loc[0]:loc[1]]), out[loc[1]:]
+	if mark == "no module named" {
+		if m := moduleRe.FindStringSubmatch(after); m != nil && len(m[1]+m[2]) <= keyChars {
+			return FailureKey{Origin: execModule, Text: m[1] + m[2]}, true
+		}
+	}
 	if u, ok := strings.CutPrefix(strings.ToLower(out[loc[0]:loc[1]]), "usage: "); ok { // a usage message names its program first, by its path or its name
 		prog := strings.TrimRight(path.Base(strings.Trim(strings.Fields(u)[0], "'\"`")), ".,;:")
 		return FailureKey{Origin: "exec", Text: cutWords("usage: "+strings.ToLower(plain.Line(prog)), execChars)}, true
