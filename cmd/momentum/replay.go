@@ -122,7 +122,7 @@ func writePoints(path string, rs []supervise.Result) error {
 			"resumed_at": r.Point.Stop.ResumedAt, "request_at": r.Point.Stop.RequestAt, "waiting": r.Point.Waiting,
 			"wake_due": r.Point.Stop.WakeDue, "wake_for": r.Point.Stop.WakeFor, "wake_key": r.Point.Stop.WakeKey,
 			"next": r.Point.Next, "entry": r.Point.Entry, "rule": d.Rule,
-			"verdict": d.Verdict, "at": d.At, "why": d.Why, "fired": r.Fired, "outcome": r.Outcome}
+			"verdict": d.Verdict, "at": d.At, "why": d.Why, "text": d.Text, "fired": r.Fired, "outcome": r.Outcome}
 		if r.Label != nil {
 			v["label"] = r.Label.Kind
 		}

@@ -1101,3 +1101,42 @@ func TestASupervisionRunFarFromTheOneBeforeLeavesItsStretchUnread(t *testing.T) 
 		t.Fatalf("the window over the stretch: unread %v %v", got, err)
 	}
 }
+
+// The transient message quotes the owner's request that opened the failed turn, from the store, and its delivery
+// is still read; a turn something else opened, and a session with no turn of his in the store, get the fixed text.
+func TestATransientMessageNamesTheOwnersRequest(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0.Add(time.Minute)
+	sv := supervisor(st, f, &now)
+	asked := t0.Add(-5 * time.Minute)
+	mk := func(key, pane string, began time.Time) *sessions.Session {
+		s := erroring()
+		s.Key, s.Pane, s.UserAt, s.TurnBegan = key, pane, asked, began
+		return s
+	}
+	his, job, bare := mk("sess-his", "%1", asked), mk("sess-job", "%2", asked.Add(3*time.Minute)), mk("sess-bare", "%3", asked)
+	for _, s := range []*sessions.Session{his, job} {
+		if _, err := st.Put(context.Background(), []store.Event{{Source: store.Transcripts, SourceKey: s.Key + "@1", TS: asked,
+			Session: StoreSession(s), Actor: store.ActorOwner, Kind: "owner_text", Summary: "build the release notes\nand tag the release"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run(t, sv, his, job, bare)
+	fixed := Marker + " Your last turn stopped on a transient API error. Continue where you left off."
+	quoted := Marker + ` Your turn on "build the release notes and tag the release" stopped on a transient API error before it finished. Continue that work where you left off.`
+	want := []string{"%1 " + quoted, "%2 " + fixed, "%3 " + fixed}
+	if strings.Join(f.sent, "|") != strings.Join(want, "|") {
+		t.Fatalf("sent %q, want %q", f.sent, want)
+	}
+	lands(his, quoted, now.Add(2*time.Second), true)
+	now = now.Add(time.Minute)
+	run(t, sv, his)
+	delivered := false
+	for _, e := range events(t, st, KindOutcome) {
+		delivered = delivered || e.Session == his.Key && metaMap(e)["result"] == Delivered
+	}
+	if !delivered {
+		t.Fatalf("the quoted message's delivery was not read: %+v", events(t, st, KindOutcome))
+	}
+}

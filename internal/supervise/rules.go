@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/sessions"
+	"github.com/agent-sh/momentum/sessions/act"
 )
 
 // The rules, in the order they are tried.
@@ -73,6 +74,7 @@ type Stop struct {
 	Queued          int            // messages its user typed while the turn ran, which the harness holds
 	Slept, Woke     time.Time      // the machine's last suspend: a wait counts from its end when it began before the wait ended
 	OwnerAt         time.Time      // when the owner was last at the session: his last turn, a local command, a draft, or his opening it
+	TurnFor         string         // the owner's request the last turn served: the input that opened it, when it was his
 	Started         time.Time      // when the session's process started; a stop before it is a past process's
 }
 
@@ -273,10 +275,26 @@ func transient(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
 	if len(p.Backoff) == 0 {
 		return used(RuleTransient, n), true
 	}
-	text := Marker + " Your last turn stopped on a transient API error. Continue where you left off."
-	d := wait(RuleTransient, s.At.Add(p.Backoff[min(n, len(p.Backoff)-1)]), n+1, text, "the turn ended on a transient API error")
+	d := wait(RuleTransient, s.At.Add(p.Backoff[min(n, len(p.Backoff)-1)]), n+1, TransientText(s), "the turn ended on a transient API error")
 	d.Used = n >= len(p.Backoff)
 	return d, true
+}
+
+// TransientText is the transient rule's message. It names the turn that was cut off by the owner's request that
+// opened it (TurnFor), quoted on one line and clipped, so a session with other work in mind knows which work to
+// go on with. With no such request, one that opens with the marker, or one that would make a message act will
+// not type, it is the fixed text.
+func TransientText(s Stop) string {
+	fixed := Marker + " Your last turn stopped on a transient API error. Continue where you left off."
+	what := clip(act.SafeText(s.TurnFor), 140)
+	if what == "" || strings.HasPrefix(what, Marker) {
+		return fixed
+	}
+	text := fmt.Sprintf("%s Your turn on %q stopped on a transient API error before it finished. Continue that work where you left off.", Marker, what)
+	if act.CheckText(text) != nil {
+		return fixed
+	}
+	return text
 }
 
 // access: the turn ended on a login that expired, a usage limit or an organization block. Trying again blindly

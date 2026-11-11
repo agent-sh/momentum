@@ -713,8 +713,11 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 	// the input that opened the last turn when its record says the turn before it was over, and the event the replay
 	// read before it
 	var openRef, openFrom string
+	// the owner's request the last turn served (Stop.TurnFor): his last input, until another input that is not one
+	// of momentum's messages opens a turn
+	var request string
 	stopOf := func(at time.Time, nextRef string) Stop {
-		s := Stop{Key: id, Tool: harness, At: prevAt, Words: words, OwnerAt: ownerAt, ResumedAt: resumed}
+		s := Stop{Key: id, Tool: harness, At: prevAt, Words: words, OwnerAt: ownerAt, ResumedAt: resumed, TurnFor: request}
 		for k, t := range tasks {
 			if t.kind == "monitor" && !t.until.IsZero() && t.until.Before(at) {
 				delete(tasks, k)
@@ -891,7 +894,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 				out = append(out, Point{Session: id, Stop: stopOf(e.TS, firstNonEmpty(controlRef, e.Ref)), Next: Next{At: e.TS, Kind: "owner", InputKind: "exit", Text: e.Summary},
 					Entry: entry, Controls: controls})
 			}
-			ownerAt, controls, controlRef, carried, words, resumed = e.TS, nil, "", "", "", time.Time{}
+			ownerAt, controls, controlRef, carried, words, resumed, request = e.TS, nil, "", "", "", time.Time{}, ""
 			tasks, pending, wake = map[string]replayTask{}, map[string]bool{}, replayWake{}
 			prevAt, prevRole, prevPrior, owes, owesRef, exited = e.TS, "exit", "", time.Time{}, "", true
 			// the old process's turn ended with it, as the live tracker reads the exit: a "No response requested." the
@@ -942,6 +945,9 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		switch r {
 		case "owner":
 			ownerAt = e.TS
+			if !strings.HasPrefix(strings.TrimSpace(e.Summary), Marker) { // a message of momentum's the store credited to him
+				request = e.Summary
+			}
 			if e.Kind == "owner_text" {
 				if v, ok := strings.CutPrefix(why, "entrypoint "); ok {
 					entry = v
@@ -952,6 +958,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			resumed = time.Time{} // a planned wakeup still fires after a prompt: it stays
 			lastMainUser = true
 		case "self":
+			request = ""
 			if prior, _ := m["prior"].(string); prior == "scheduled_task_fire" { // a scheduled run started
 				firesSeen = true
 				f, ok := fireBetween(lastRef, e.Ref)

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/sessions"
+	"github.com/agent-sh/momentum/sessions/act"
 )
 
 var t0 = time.Date(2026, 3, 4, 10, 0, 0, 0, time.UTC)
@@ -236,5 +237,26 @@ func TestDecideActsOnceTheWaitIsOver(t *testing.T) {
 	}
 	if d := Decide(stopped(func(s *Stop) {}), Tries{}, DefaultParams, nil, t0.Add(time.Hour)); d.Rule != "" || d.Verdict != "" {
 		t.Fatalf("no rule: %+v", d)
+	}
+}
+
+func TestTheTransientMessageQuotesTheRequestTheTurnServed(t *testing.T) {
+	fixed := Marker + " Your last turn stopped on a transient API error. Continue where you left off."
+	long := "fix the flaky upload test\nthen\tsplit the retry helper \x1b[31minto its own file " + strings.Repeat("and check the other callers ", 8)
+	for _, c := range []struct{ name, request, want string }{
+		{"no request known", "", fixed},
+		{"a request", "rename the cache flag", Marker + ` Your turn on "rename the cache flag" stopped on a transient API error before it finished. Continue that work where you left off.`},
+		{"one of momentum's messages", " " + fixed, fixed},
+		{"a request that would make the message untypable", "why does the footer say esc to interrupt", fixed},
+	} {
+		if got := TransientText(Stop{TurnFor: c.request}); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+	got := TransientText(Stop{TurnFor: long})
+	quote := `"fix the flaky upload test then split the retry helper [31minto its own file and check`
+	if !strings.Contains(got, quote) || !strings.Contains(got, `…" stopped on`) || got != act.SafeText(got) || act.CheckText(got) != nil ||
+		len([]rune(got)) > 140+120 {
+		t.Errorf("a long request with newlines and an escape: got %q", got)
 	}
 }

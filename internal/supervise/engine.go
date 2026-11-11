@@ -177,6 +177,7 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 		}
 		presence := h.presence(s, ownerAt, answered)
 		stop := StopOf(s, presence)
+		stop.TurnFor = h.turnFor(s, marks)
 		if !stop.RequestAt.IsZero() {
 			stop.ScreenIdle = h.idleAt[stop.RequestAt.UnixMilli()]
 		}
@@ -896,6 +897,11 @@ func (h past) ours(text string) bool {
 // not a turn that opens with the marker and came within DeliveryWait of a message, which the store may have
 // credited to him.
 func (h past) ownerTurn(marks []store.Mark) time.Time {
+	m, _ := h.ownerMark(marks)
+	return m.At
+}
+
+func (h past) ownerMark(marks []store.Mark) (store.Mark, bool) {
 	for _, m := range marks {
 		if h.ours(m.Summary) {
 			continue
@@ -907,9 +913,29 @@ func (h past) ownerTurn(marks []store.Mark) time.Time {
 		if near && strings.HasPrefix(strings.TrimSpace(m.Summary), Marker) {
 			continue
 		}
-		return m.At
+		return m, true
 	}
-	return time.Time{}
+	return store.Mark{}, false
+}
+
+// turnFor is the owner's request the session's last turn served, as the store keeps his words: his last turn,
+// when it opened that turn or came while it ran, or when the only input since is one of momentum's messages (a
+// continue serves the same request). Empty when something else opened the turn (a scheduled run, a notification,
+// a turn of his the store does not hold yet) or the store holds no turn of his.
+func (h past) turnFor(s *sessions.Session, marks []store.Mark) string {
+	m, ok := h.ownerMark(marks)
+	if !ok {
+		return ""
+	}
+	const skew = 2 * time.Second
+	opened := m.At
+	if s.UserAt.After(opened) && h.ours(lastUser(s)) {
+		opened = s.UserAt
+	}
+	if s.UserAt.After(opened.Add(skew)) || s.TurnBegan.After(opened.Add(skew)) {
+		return ""
+	}
+	return m.Summary
 }
 
 // lastUser is the text of the session's last user-role entry, from its activity log.
