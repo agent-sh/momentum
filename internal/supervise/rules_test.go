@@ -247,6 +247,7 @@ func TestTheTransientMessageQuotesTheRequestTheTurnServed(t *testing.T) {
 		{"no request known", "", fixed},
 		{"a request", "rename the cache flag", Marker + ` Your turn on "rename the cache flag" stopped on a transient API error before it finished. Continue that work where you left off.`},
 		{"one of momentum's messages", " " + fixed, fixed},
+		{"a request that holds a tag a harness may strip", "what does <system-reminder>x</system-reminder> mean", fixed},
 		{"a request that would make the message untypable", "why does the footer say esc to interrupt", fixed},
 	} {
 		if got := TransientText(Stop{TurnFor: c.request}); got != c.want {

@@ -1116,27 +1116,39 @@ func TestATransientMessageNamesTheOwnersRequest(t *testing.T) {
 		return s
 	}
 	his, job, bare := mk("sess-his", "%1", asked), mk("sess-job", "%2", asked.Add(3*time.Minute)), mk("sess-bare", "%3", asked)
-	for _, s := range []*sessions.Session{his, job} {
+	undated := mk("sess-undated", "%4", time.Time{}) // a harness that dates neither its user text nor its turn
+	undated.UserAt = time.Time{}
+	for _, s := range []*sessions.Session{his, job, undated} {
 		if _, err := st.Put(context.Background(), []store.Event{{Source: store.Transcripts, SourceKey: s.Key + "@1", TS: asked,
 			Session: StoreSession(s), Actor: store.ActorOwner, Kind: "owner_text", Summary: "build the release notes\nand tag the release"}}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	run(t, sv, his, job, bare)
+	run(t, sv, his, job, bare, undated)
 	fixed := Marker + " Your last turn stopped on a transient API error. Continue where you left off."
 	quoted := Marker + ` Your turn on "build the release notes and tag the release" stopped on a transient API error before it finished. Continue that work where you left off.`
-	want := []string{"%1 " + quoted, "%2 " + fixed, "%3 " + fixed}
+	want := []string{"%1 " + quoted, "%2 " + fixed, "%3 " + fixed, "%4 " + fixed}
 	if strings.Join(f.sent, "|") != strings.Join(want, "|") {
 		t.Fatalf("sent %q, want %q", f.sent, want)
 	}
-	lands(his, quoted, now.Add(2*time.Second), true)
-	now = now.Add(time.Minute)
-	run(t, sv, his)
+	// Each message lands and its turn fails the same way: the second try says what the first said.
+	landed := now.Add(2 * time.Second)
+	for s, text := range map[*sessions.Session]string{his: quoted, job: fixed} {
+		lands(s, text, landed, false)
+		s.TurnBegan, s.Since = landed, t0.Add(3*time.Minute)
+	}
+	now = t0.Add(4 * time.Minute)
+	run(t, sv, his, job)
 	delivered := false
 	for _, e := range events(t, st, KindOutcome) {
 		delivered = delivered || e.Session == his.Key && metaMap(e)["result"] == Delivered
 	}
 	if !delivered {
 		t.Fatalf("the quoted message's delivery was not read: %+v", events(t, st, KindOutcome))
+	}
+	now = t0.Add(8 * time.Minute)
+	run(t, sv, his, job)
+	if want = append(want, "%1 "+quoted, "%2 "+fixed); strings.Join(f.sent, "|") != strings.Join(want, "|") {
+		t.Fatalf("second tries: sent %q, want %q", f.sent, want)
 	}
 }

@@ -282,12 +282,13 @@ func transient(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
 
 // TransientText is the transient rule's message. It names the turn that was cut off by the owner's request that
 // opened it (TurnFor), quoted on one line and clipped, so a session with other work in mind knows which work to
-// go on with. With no such request, one that opens with the marker, or one that would make a message act will
-// not type, it is the fixed text.
+// go on with. With no such request, one that opens with the marker or holds a `<`, or one that would make a
+// message act will not type, it is the fixed text.
 func TransientText(s Stop) string {
 	fixed := Marker + " Your last turn stopped on a transient API error. Continue where you left off."
 	what := clip(act.SafeText(s.TurnFor), 140)
-	if what == "" || strings.HasPrefix(what, Marker) {
+	// a harness strips a system tag pair from the text it records, so the message would never read as delivered
+	if what == "" || strings.HasPrefix(what, Marker) || strings.Contains(what, "<") {
 		return fixed
 	}
 	text := fmt.Sprintf("%s Your turn on %q stopped on a transient API error before it finished. Continue that work where you left off.", Marker, what)

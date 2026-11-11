@@ -919,23 +919,29 @@ func (h past) ownerMark(marks []store.Mark) (store.Mark, bool) {
 }
 
 // turnFor is the owner's request the session's last turn served, as the store keeps his words: his last turn,
-// when it opened that turn or came while it ran, or when the only input since is one of momentum's messages (a
-// continue serves the same request). Empty when something else opened the turn (a scheduled run, a notification,
-// a turn of his the store does not hold yet) or the store holds no turn of his.
+// when it opened that turn or came while it ran, or when the input since is the transient message that already
+// quoted it (a retry serves the same request). Empty when something else opened the turn (a scheduled run, a
+// notification, another rule's message, a turn of his the store does not hold yet), when the harness dates
+// neither its user text nor its turn, or when the store holds no turn of his.
 func (h past) turnFor(s *sessions.Session, marks []store.Mark) string {
 	m, ok := h.ownerMark(marks)
-	if !ok {
+	if !ok || s.UserAt.IsZero() && s.TurnBegan.IsZero() {
 		return ""
 	}
 	const skew = 2 * time.Second
 	opened := m.At
-	if s.UserAt.After(opened) && h.ours(lastUser(s)) {
+	if l := h.last(); s.UserAt.After(opened) && l != nil && l.rule == RuleTransient && fold(lastUser(s)) == l.text && quotes(l.text, m.Summary) {
 		opened = s.UserAt
 	}
 	if s.UserAt.After(opened.Add(skew)) || s.TurnBegan.After(opened.Add(skew)) {
 		return ""
 	}
 	return m.Summary
+}
+
+// quotes reports whether text, folded, is the transient message that quotes request.
+func quotes(text, request string) bool {
+	return text == fold(act.SafeText(TransientText(Stop{TurnFor: request})))
 }
 
 // lastUser is the text of the session's last user-role entry, from its activity log.
