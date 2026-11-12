@@ -296,8 +296,9 @@ func TestAnAPIErrorStopsTheTurn(t *testing.T) {
 // A task's notification Claude Code delivers after the turn ended on an API error that stops access (by its kind: a
 // usage limit, a failed login, an organization's block) opens no turn until it sends the model its request: under a
 // limit it knows of it sends none, and the session still stops on the error. Once the request goes out, the turn is
-// open as a prompt's turn, and a retry's error record that answers the request leaves it open. A transient error, a
-// limit past the reset it states, and a reopening's notice open the turn at the notification, as before.
+// open as a prompt's turn, and a retry's error record that answers the request leaves it open. A transient error,
+// one whose words read as transient though Claude Code names it rate_limit (a throttle), a limit past the reset it
+// states, and a reopening's notice open the turn at the notification, as before.
 func TestANotificationAfterAnAPIErrorOpensNoTurnUntilItsRequest(t *testing.T) {
 	const limit = "You've hit your weekly limit · resets Mar 7, 9am (Europe/Lisbon)"
 	stop := func(kind, text string) *script {
@@ -330,6 +331,7 @@ func TestANotificationAfterAnAPIErrorOpensNoTurnUntilItsRequest(t *testing.T) {
 	note := tag("task-notification") + tag("task-id") + "b1" + closing("task-id") + tag("status") + "completed" + closing("status") + closing("task-notification")
 	for name, y := range map[string]*script{
 		"a transient error":                stop("server_error", "API Error: 529 overloaded").notify("b1", "completed"),
+		"a throttle named rate_limit":      stop("rate_limit", "API Error: 429 Too many requests, slow down").notify("b1", "completed"),
 		"a limit past the reset it states": stop("rate_limit", limit).add(notice(note, "2026-03-07T10:00:00Z")),
 		"a reopening's notice":             stop("rate_limit", limit).add(notice(orphan, t0.Add(time.Hour).Format(time.RFC3339Nano))),
 	} {

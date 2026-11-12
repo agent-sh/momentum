@@ -910,7 +910,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			e.Summary = whole(e) // the store cut it: read what it says from the transcript, while it is there
 		}
 		if r == "self" && prevRole == "apierr" && harness == "claude" && !fromPeer(e, m) && claude.Notification(e.Summary) &&
-			!claude.Orphaned(e.Summary) && heldBy(words, prevAt, e.TS) && unsent(lastRef, e.Ref, until) {
+			!claude.Orphaned(e.Summary) && sessions.HeldBy("", words, prevAt, e.TS) && unsent(lastRef, e.Ref, until) {
 			// A task's notification Claude Code delivered after the turn ended on an API error that stops access, and
 			// sent its model no request for, opens no turn, as the live tracker reads it: the stop on the error goes on
 			// to the next input, with its error, its words and its time, so the rule that reads the error decides as it
@@ -1214,18 +1214,6 @@ func requestBetween(from, to string, until time.Time) time.Time {
 			return req
 		}
 	}
-}
-
-// heldBy reports an API error (its words, at its time) that stops access, as the access rule reads it (a login, a
-// usage limit, an organization's block), so Claude Code sends no request for a task's notification at at: until
-// the reset a limit states, when it states one. The live tracker reads the error's kind (claude.Tracker); a
-// transient error holds nothing.
-func heldBy(words string, errAt, at time.Time) bool {
-	if c := ErrorClass(words); c != Login && c != Limit && c != Org {
-		return false
-	}
-	reset, ok := ResetAt(words, errAt)
-	return !ok || at.Before(reset)
 }
 
 // unsent reports that Claude Code sent its model no request for an input (its record's place), by the transcript

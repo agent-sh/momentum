@@ -733,20 +733,12 @@ func originLabel(kind, source string) string {
 	return source
 }
 
-// accessKinds are the kinds of API error Claude Code names for a wall it will not send a request through: a usage
-// limit, a login that failed, an organization that turned access off, billing.
-var accessKinds = map[string]bool{"rate_limit": true, "authentication_failed": true, "oauth_org_not_allowed": true, "billing_error": true}
-
-// heldBy reports that the turn ended on an API error that stops access, by its kind, so a task's notification at
-// at waits for the request Claude Code sends for it: until the reset a limit states, when it states one. A transient
-// error does not hold it: Claude Code sends that request, though it may write no record of it.
+// heldBy reports that the turn ended on an API error that stops access (sessions.HeldBy, by its kind and its
+// words), so a task's notification at at waits for the request Claude Code sends for it. A transient error does not
+// hold it: Claude Code sends that request, though it may write no record of it.
 func (t *Tracker) heldBy(at time.Time) bool {
 	st := &t.st
-	if st.ErrText == "" || !accessKinds[st.ErrKind] {
-		return false
-	}
-	reset, ok := sessions.ResetAt(st.ErrText, st.ErrAt)
-	return !ok || at.Before(reset)
+	return st.ErrText != "" && sessions.HeldBy(st.ErrKind, st.ErrText, st.ErrAt, at)
 }
 
 // userText reads a user record's text; open is whether a turn was open before the record.

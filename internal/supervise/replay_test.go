@@ -244,7 +244,8 @@ func TestAnEscapeThatKilledTheAgentsEndsTheTurn(t *testing.T) {
 // input, and the access rule reads it as it would without the notification, from the error's time. So it goes past
 // a local command's echo before the next input, for a second notification, and when the window ends before the
 // request. One whose request went out opens a turn that waits on the model; one a reply follows with no request
-// record before it, one after a transient error, and one past the reset a limit states open a turn as before.
+// record before it, one after a transient error (a throttle Claude Code names rate_limit among them), and one past
+// the reset a limit states open a turn as before.
 func TestANotificationThatSentNoRequestKeepsTheErrorStop(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -270,6 +271,7 @@ func TestANotificationThatSentNoRequestKeepsTheErrorStop(t *testing.T) {
 	cut.put(st)
 	stop("replied", limit).say(30*time.Second, "Noted: the suite passed.").owner(3*time.Hour, ".").put(st)
 	stop("transient", err503).owner(3*time.Hour, ".").put(st)
+	stop("throttle", "API Error: 429 Too many requests, slow down").owner(3*time.Hour, ".").put(st) // its record names it rate_limit
 	late := newRecorded(t, "late").owner(0, "run the soak").request(time.Second).apiError(time.Second, limit)
 	late.line(10*time.Millisecond, map[string]any{"type": "system", "subtype": "turn_duration"})
 	notify(late, 4*24*time.Hour).owner(time.Hour, ".").put(st)
@@ -303,7 +305,7 @@ func TestANotificationThatSentNoRequestKeepsTheErrorStop(t *testing.T) {
 	if s, d := nudged["sent"].Point.Stop, nudged["sent"].Decision; !s.Working || s.Error != "" || s.RequestAt.IsZero() || d.Rule != RuleStalled {
 		t.Errorf("its request went out: stop %+v, decision %+v", s, d)
 	}
-	for _, session := range []string{"sent", "replied", "transient", "late"} {
+	for _, session := range []string{"sent", "replied", "transient", "throttle", "late"} {
 		if !ended[session] {
 			t.Errorf("%s: the notification opened no turn", session)
 		}
