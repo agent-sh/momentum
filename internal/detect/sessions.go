@@ -77,9 +77,10 @@ func (d Sessions) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 }
 
 // nudged replays the rules over the window and keeps the stops the owner ended with a nudge that no rule would
-// have acted on first, each keyed by why none would. His own restart step is none: his input at a stop an /exit
-// ended, and his input within the owner window after a session that ended mid-task was reopened, whoever reopened
-// it, with nothing since: no turn opened after the reopening, and the stop does not end on an API error.
+// have acted on first, each keyed by why none would. A nudge he queued while a turn ran is none: the session was not
+// stopped (inTurn). His own restart step is none either: his input at a stop an /exit ended, and his input within
+// the owner window after a session that ended mid-task was reopened, whoever reopened it, with nothing since: no turn
+// opened after the reopening, and the stop does not end on an API error.
 func (d Sessions) nudged(ctx context.Context, st *store.Store, w Window) ([]occurrence, error) {
 	points, err := supervise.History(ctx, st, w.Since, w.Until)
 	if err != nil {
@@ -125,7 +126,7 @@ func (d Sessions) nudged(ctx context.Context, st *store.Store, w Window) ([]occu
 		// Escape, a tool's result or a synthetic reply is still skipped, though the session ran a turn again.
 		restartStep := !s.ResumedAt.IsZero() && !s.TurnBegan.After(s.ResumedAt) && s.Error == "" &&
 			next.At.Sub(s.ResumedAt) <= supervise.DefaultParams.OwnerWindow
-		if next.Kind != "owner" || !supervise.Nudge(next.Text) || res.Fired || s.Exited || s.Reopened || restartStep {
+		if next.Kind != "owner" || inTurn(next, s) || !supervise.Nudge(next.Text) || res.Fired || s.Exited || s.Reopened || restartStep {
 			continue // an exited stop is one no rule can continue: the owner's input reopens it, after a command or not
 		}
 		why := supervise.Why(res)
@@ -141,6 +142,18 @@ func (d Sessions) nudged(ctx context.Context, st *store.Store, w Window) ([]occu
 			title: "The owner nudges stopped sessions no rule continues: " + Norm(why, 60)})
 	}
 	return occ, nil
+}
+
+// queuedSkew is how soon after the stop's last record the turn's end delivers a prompt queued behind the turn: at
+// once, a few milliseconds on.
+const queuedSkew = 2 * time.Second
+
+// inTurn reports an input the owner queued while a turn ran, which the harness showed running: the stop shows the
+// turn open (a call running, or the model owing its reply, where a queued message is delivered into the turn), or
+// the turn's end delivered it at once. Claude Code also passes an input it takes while idle through its queue, and
+// marks it queued: typed at a stopped session, that one is his nudge.
+func inTurn(next supervise.Next, s supervise.Stop) bool {
+	return next.InputKind == "queued" && (s.Working || s.Busy || next.At.Sub(s.At) <= queuedSkew)
 }
 
 // waits are the stretches a session waited on its owner past LongWait, by what it asked, from the sessions events

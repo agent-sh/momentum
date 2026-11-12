@@ -740,8 +740,15 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 	}
 	if Notification(s) { // a prompt that only quotes the tag (a loop's, a headless run's) is read as any other
 		t.notified(s, at)
-		st.LastMain, st.QueuedPrompt = "user", time.Time{}
-		if reOrphan.MatchString(s) {
+		orphan := reOrphan.MatchString(s)
+		// One delivered after the turn ended on an API error opens no turn until Claude Code sends its model the request
+		// (a usage limit it knows of sends none): the session still stops on the error. A reopening's notice is a new
+		// process, which opens it as before.
+		if open || orphan || st.LastMain != "assistant" || st.ErrText == "" {
+			st.LastMain = "user"
+		}
+		st.QueuedPrompt = time.Time{}
+		if orphan {
 			st.Resumed = at
 		}
 		return

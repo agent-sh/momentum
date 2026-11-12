@@ -909,6 +909,18 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 		if r == "self" && strings.HasPrefix(e.Summary, "<task-notification>") && !strings.Contains(e.Summary, "</task-notification>") {
 			e.Summary = whole(e) // the store cut it: read what it says from the transcript, while it is there
 		}
+		if r == "self" && prevRole == "apierr" && harness == "claude" && !fromPeer(e, m) && claude.Notification(e.Summary) &&
+			!claude.Orphaned(e.Summary) && unsent(lastRef, e.Ref, until) {
+			// A task's notification Claude Code delivered after the turn ended on an API error, and sent its model no
+			// request for (a usage limit it knows of), opens no turn, as the live tracker reads it: the stop on the error
+			// goes on to the next input, with its error, its words and its time, so the rule that reads the error decides
+			// as it would without the notification. What it says of the session's tasks and its wakeup still counts.
+			notified(e.Summary, e.TS)
+			if prior, _ := m["prior"].(string); carried == "" && turnOver(harness, prior) {
+				carried = prior
+			}
+			continue
+		}
 		if r == "owner" || r == "self" || r == "interrupt" || r == "momentum" {
 			ik, _ := m["input_kind"].(string)
 			next := Next{At: e.TS, Kind: "owner", InputKind: ik, Text: e.Summary}
@@ -1204,6 +1216,93 @@ func requestBetween(from, to string, until time.Time) time.Time {
 	}
 }
 
+// unsent reports that Claude Code sent its model no request for an input (its record's place), by the transcript
+// while it is there: no api-request record after the record of the event before the input (from), up to the next
+// record of the conversation after the input's own (a reply or an error, any assistant record, or another input, a
+// user record that is not meta nor a local command's echo), the transcript's end, or the first record dated past
+// until. Claude Code may write the request before the record of the input it carries, so one between the two counts.
+// A reply with no request before it is no sign either way (a synthetic message, a request it did not record, a
+// transcript older than those records), and neither is one after a local command (a /login that let the request
+// go): the input is not taken as unsent. False when the transcript is gone, the two are not in one transcript in that
+// order, or the read runs past requestLimit.
+func unsent(from, input string, until time.Time) bool {
+	path, off, ok := refPlace(from)
+	p2, at, ok2 := refPlace(input)
+	if !ok || !ok2 || p2 != path || at < off {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
+		return false
+	}
+	rd := bufio.NewReaderSize(io.LimitReader(f, requestLimit), 1<<16)
+	own, err := rd.ReadBytes('\n') // the event's own record
+	if err != nil {
+		return false
+	}
+	pos := off + int64(len(own))
+	for {
+		start := pos
+		raw, err := rd.ReadBytes('\n')
+		pos += int64(len(raw))
+		if len(raw) > 0 {
+			var e struct {
+				Type      string `json:"type"`
+				Timestamp string `json:"timestamp"`
+				IsMeta    bool   `json:"isMeta"`
+				Sidechain bool   `json:"isSidechain"`
+			}
+			if json.Unmarshal(raw, &e) == nil && !e.Sidechain {
+				if t, perr := time.Parse(time.RFC3339Nano, e.Timestamp); perr == nil && !until.IsZero() && t.After(until) {
+					return true
+				}
+				switch {
+				case e.Type == "api-request":
+					return false
+				case start > at && e.Type == "assistant":
+					return false
+				case start > at && e.Type == "user" && !e.IsMeta && !echoLine(raw):
+					return true
+				}
+			}
+		}
+		if err != nil {
+			return err == io.EOF && pos-off < requestLimit
+		}
+	}
+}
+
+// echoLine reports a user record whose text is only the tags of a local command's echo (its name, its output, a
+// caveat, a reminder), which opens no turn: not a skill's, whose echo is its prompt's.
+func echoLine(raw []byte) bool {
+	var r struct {
+		Message struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(raw, &r) != nil {
+		return false
+	}
+	var text string
+	if json.Unmarshal(r.Message.Content, &text) != nil {
+		var blocks []struct{ Type, Text string }
+		if json.Unmarshal(r.Message.Content, &blocks) != nil {
+			return false
+		}
+		for _, b := range blocks {
+			if b.Type != "text" {
+				return false
+			}
+			text += b.Text
+		}
+	}
+	return strings.TrimSpace(text) != "" && !hSkillRunning.MatchString(text) && strings.TrimSpace(hCommandTag.ReplaceAllString(text, "")) == ""
+}
+
 // queuedCommand reports what Claude Code queued while a turn ran and delivered into the turn later, not its user's: a
 // task's notification, which the store marks by its command mode, or a harness line when it is meta, and another
 // session's message, which the store marks a harness line when it is meta, else by its origin (origin peer), as the
@@ -1387,10 +1486,13 @@ func codexOpens(m map[string]any, carried string) bool {
 	return true
 }
 
-// turnOver reports the harness's record that a turn ended, as the store keeps the record before an input.
+// turnOver reports the harness's record that a turn ended, as the store keeps the record before an input. Claude
+// Code's agents_killed says the background agents were killed, as an Escape kills them: it can come while a turn
+// goes on, but tacit keeps it as an input's prior only when no record of the conversation (a reply, a tool's result,
+// another input) came between the two, so the turn was over by then.
 func turnOver(harness, prior string) bool {
 	switch prior {
-	case "turn_duration", "stop_hook_summary", "away_summary", "task_complete", "turn_aborted", "stop":
+	case "turn_duration", "stop_hook_summary", "away_summary", "task_complete", "turn_aborted", "stop", "agents_killed":
 		return true
 	}
 	return false

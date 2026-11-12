@@ -293,6 +293,33 @@ func TestAnAPIErrorStopsTheTurn(t *testing.T) {
 	}
 }
 
+// A task's notification Claude Code delivers after the turn ended on an API error opens no turn until it sends the
+// model its request: under a usage limit it knows of it sends none, and the session still stops on the error. Once
+// the request goes out, the turn is open. A reopening's notice opens one as before.
+func TestANotificationAfterAnAPIErrorOpensNoTurnUntilItsRequest(t *testing.T) {
+	const limit = "You've hit your weekly limit · resets Mar 7, 9am (Europe/Lisbon)"
+	stop := func() *script {
+		return newScript(t).user("run the soak").request().add(map[string]any{"type": "assistant", "isApiErrorMessage": true,
+			"message": map[string]any{"model": "<synthetic>", "content": []any{map[string]any{"type": "text", "text": limit}}}}).
+			add(map[string]any{"type": "system", "subtype": "turn_duration"})
+	}
+	x := stop().notify("b1", "completed")
+	tr := NewTracker(x.path)
+	if s := x.facts(tr, x.at); s.TurnOpen || s.Phase != sessions.NeedsYou || s.AskKind != sessions.AskError || !strings.Contains(s.Ask, "weekly limit") {
+		t.Fatalf("no request: open %v, phase %s, ask %s %q", s.TurnOpen, s.Phase, s.AskKind, s.Ask)
+	}
+	x.request()
+	if s := x.facts(tr, x.at); !s.TurnOpen || s.Phase != sessions.Working || s.AskKind == sessions.AskError {
+		t.Fatalf("its request: open %v, phase %s, ask %s", s.TurnOpen, s.Phase, s.AskKind)
+	}
+	orphan := tag("task-notification") + tag("task-id") + "b2" + closing("task-id") + tag("status") + "stopped" + closing("status") +
+		tag("summary") + "Background command didn't finish before the previous session ended" + closing("summary") + closing("task-notification")
+	y := stop().add(map[string]any{"type": "user", "origin": map[string]any{"kind": "task-notification"}, "message": map[string]any{"content": orphan}})
+	if s := y.facts(NewTracker(y.path), y.at); !s.TurnOpen || s.ResumedAt.IsZero() {
+		t.Fatalf("a reopening's notice: open %v, resumed %v", s.TurnOpen, s.ResumedAt)
+	}
+}
+
 func TestAnInterruptEndsTheTurn(t *testing.T) {
 	x := newScript(t).user("go").call("tu1", "Bash", map[string]any{"command": "sleep 1000"}).
 		add(map[string]any{"type": "user", "message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "[Request interrupted by user for tool use]"}}}})

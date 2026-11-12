@@ -213,3 +213,77 @@ func TestAccessBackNeedsASessionThatWasBlocked(t *testing.T) {
 		t.Fatal("no session met an organization block")
 	}
 }
+
+// An input whose record carries Claude Code's agents_killed (an Escape killed the background agents) comes after a
+// turn that was over: the model owed no reply. Without it, the input before left the model its reply to owe.
+func TestAnEscapeThatKilledTheAgentsEndsTheTurn(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	newTimeline(t, "killed").owner(0, "what is left?", "turn_duration").owner(2*time.Minute, "resume", "agents_killed").put(st)
+	newTimeline(t, "owed").owner(0, "what is left?", "turn_duration").owner(2*time.Minute, "resume", "").put(st)
+	points, err := History(ctx, st, t0.Add(-time.Hour), t0.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stops := map[string]Stop{}
+	for _, p := range points {
+		if p.Next.Text == "resume" {
+			stops[p.Session] = p.Stop
+		}
+	}
+	if s, ok := stops["killed"]; !ok || s.Working || s.Phase == sessions.Working {
+		t.Fatalf("after the agents were killed: working %v, phase %s", s.Working, s.Phase)
+	}
+	if s := stops["owed"]; !s.Working || s.Phase != sessions.Working {
+		t.Fatalf("with no record of the turn's end: working %v, phase %s", s.Working, s.Phase)
+	}
+}
+
+// A task's notification Claude Code delivers after a turn ended on an API error, and sends its model no request for
+// (a usage limit it knows of), opens no turn: the stop on the error goes on to the owner's next input, and the access
+// rule reads it as it would without the notification, from the error's time. One whose request went out opens a turn
+// that waits on the model.
+func TestANotificationThatSentNoRequestKeepsTheErrorStop(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	const limit = "You've hit your weekly limit · resets Mar 7, 9am (Europe/Lisbon)"
+	const note = "<task-notification> <task-id>b1</task-id> <status>completed</status> </task-notification>"
+	stop := func(session string) (*recorded, time.Time) {
+		r := newRecorded(t, session).owner(0, "run the soak").request(time.Second)
+		r.event(time.Second, map[string]any{"type": "assistant", "isApiErrorMessage": true, "message": map[string]any{"model": "<synthetic>",
+			"content": []any{map[string]any{"type": "text", "text": limit}}}}, "harness_text", store.ActorHarness, "", limit, `{"is_error":true,"why":"api error"}`)
+		failed := r.at
+		r.line(10*time.Millisecond, map[string]any{"type": "system", "subtype": "turn_duration"})
+		r.event(20*time.Second, map[string]any{"type": "user", "origin": map[string]any{"kind": "task-notification"}, "message": map[string]any{"content": note}},
+			"harness_text", store.ActorHarness, "", note, `{"why":"origin task-notification","prior":"turn_duration"}`)
+		return r, failed
+	}
+	quiet, failed := stop("quiet")
+	quiet.owner(3*time.Hour, ".").put(st)
+	sent, _ := stop("sent")
+	sent.request(100*time.Millisecond).owner(3*time.Hour, ".").put(st)
+
+	until := t0.Add(5 * time.Hour)
+	points, err := History(ctx, st, t0.Add(-time.Hour), until)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nudged := map[string]Result{}
+	for _, r := range Replay(points, nil, DefaultParams, probeAt(time.Time{}), until) {
+		if r.Point.Session == "quiet" && r.Point.Next.Kind == "self" {
+			t.Fatalf("the notification that sent nothing ended the stop: %+v", r.Point)
+		}
+		if r.Point.Next.Text == "." {
+			nudged[r.Point.Session] = r
+		}
+	}
+	reset, _ := ResetAt(limit, failed)
+	q := nudged["quiet"]
+	if s, d := q.Point.Stop, q.Decision; s.Working || s.Error != limit || s.Words != limit || !s.At.Equal(failed) ||
+		d.Rule != RuleAccess || d.Verdict != Wait || !d.At.Equal(reset.Add(DefaultParams.ResetGrace)) || q.Fired {
+		t.Fatalf("no request: stop %+v, decision %+v", s, d)
+	}
+	if s, d := nudged["sent"].Point.Stop, nudged["sent"].Decision; !s.Working || s.Error != "" || s.RequestAt.IsZero() || d.Rule != RuleStalled {
+		t.Fatalf("its request went out: stop %+v, decision %+v", s, d)
+	}
+}
