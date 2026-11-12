@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -2409,41 +2410,115 @@ func TestANudgeAfterAReopeningStillCounts(t *testing.T) {
 	}
 }
 
+// transcript writes a session's records to a file, each line's place the Ref of the event it is given to.
+type transcript struct {
+	t    *testing.T
+	path string
+	off  int64
+}
+
+func newTranscript(t *testing.T, session string) *transcript {
+	return &transcript{t: t, path: filepath.Join(t.TempDir(), session+".jsonl")}
+}
+
+// line writes a record dated at and returns the event with that record's place as its Ref.
+func (x *transcript) line(e store.Event, v map[string]any) store.Event {
+	x.t.Helper()
+	v["timestamp"] = e.TS.Format(time.RFC3339Nano)
+	b, err := json.Marshal(v)
+	if err != nil {
+		x.t.Fatal(err)
+	}
+	f, err := os.OpenFile(x.path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		x.t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		x.t.Fatal(err)
+	}
+	e.Ref = fmt.Sprintf("%s@%d#0", x.path, x.off)
+	x.off += int64(len(b) + 1)
+	return e
+}
+
 // A nudge the owner queued while a turn ran is no nudge to a stopped session: the harness showed the turn running.
-// So it goes for one queued while the model owed its reply to a tool's result, and for one the turn's end delivered
-// at once, as a turn that ended on an API error sends a message queued behind its retries. Claude Code also passes
-// an input it takes while idle through its queue: queued minutes after the turn ended, at a stop whose last words
-// asked him, it is his nudge, and so are the same words typed while the model owed its reply.
+// So it goes for one queued while the model owed its reply to a tool's result, for one the turn's end delivered at
+// once, as a turn that ended on an API error sends a message queued behind its retries, for one Claude Code
+// delivered into the turn as a queued command's attachment, and for a message steered into a running Codex turn,
+// which Codex alone marks queued. Claude Code also passes an input it takes while idle through its queue: queued
+// minutes after the turn ended, at a stop whose last words asked him, it is his nudge, and so are the same words
+// typed while the model owed its reply, one queued into a turn whose request waited past StallFloor, and one he
+// queued and sent with an Escape, in either order, read with the Escape first at the stop the Escape ended.
 func TestAQueuedNudgeIsNone(t *testing.T) {
-	working := func(st *store.Store) {
-		put(t, st, ownerTurn("q", "run the soak", t0), call("q", "Bash", "tc1", `{"command":"go test ./soak"}`, t0.Add(10*time.Second)),
-			ev(store.Transcripts, "q", "tool_result", store.ActorTool, "Bash", "ok", `{"tool_id":"tc1"}`, t0.Add(time.Minute)))
+	queued := func(session, text string, at time.Time) store.Event {
+		return ev(store.Transcripts, session, "owner_text", store.ActorOwner, "", text, `{"input_kind":"queued"}`, at)
 	}
-	failed := func(st *store.Store) {
-		put(t, st, ownerTurn("q", "deploy it", t0), agentSays("q", "Deploying.", t0.Add(10*time.Second)),
-			ev(store.Transcripts, "q", "harness_text", store.ActorHarness, "", "API Error: 503 the provider is unable to process your request, a server-side issue",
-				`{"is_error":true,"why":"api error"}`, t0.Add(5*time.Minute)))
+	escape := func(at time.Time) store.Event {
+		return ev(store.Transcripts, "q", "harness_text", store.ActorHarness, "", "[Request interrupted by user]", "", at)
 	}
-	asked := func(st *store.Store) {
-		put(t, st, ownerTurn("q", "build the release", t0), agentSays("q", "The release is built. Do you want me to publish it now?", t0.Add(time.Minute)))
-	}
+	nudge := t0.Add(5 * time.Minute)
 	for _, row := range []struct {
-		name, kind string
-		stop       func(*store.Store)
-		nudge      time.Time
-		counts     bool
+		name   string
+		evs    func(t *testing.T) []store.Event
+		counts bool
 	}{
-		{"queued while the model owed its reply", "queued", working, t0.Add(5 * time.Minute), false},
-		{"queued behind a turn that ended on an API error", "queued", failed, t0.Add(5*time.Minute + 100*time.Millisecond), false},
-		{"queued at a stopped session", "queued", asked, t0.Add(time.Hour), true},
-		{"typed while the model owed its reply", "typed", working, t0.Add(5 * time.Minute), true},
+		{"queued while the model owed its reply", func(*testing.T) []store.Event {
+			return []store.Event{ownerTurn("q", "run the soak", t0), call("q", "Bash", "tc1", `{"command":"go test ./soak"}`, t0.Add(10*time.Second)),
+				ev(store.Transcripts, "q", "tool_result", store.ActorTool, "Bash", "ok", `{"tool_id":"tc1"}`, t0.Add(time.Minute)), queued("q", ".", nudge)}
+		}, false},
+		{"queued behind a turn that ended on an API error", func(*testing.T) []store.Event {
+			return []store.Event{ownerTurn("q", "deploy it", t0), agentSays("q", "Deploying.", t0.Add(10*time.Second)),
+				ev(store.Transcripts, "q", "harness_text", store.ActorHarness, "", "API Error: 503 the provider is unable to process your request, a server-side issue",
+					`{"is_error":true,"why":"api error"}`, nudge.Add(-100*time.Millisecond)), queued("q", ".", nudge)}
+		}, false},
+		{"delivered into the turn as a queued command", func(t *testing.T) []store.Event {
+			x := newTranscript(t, "q")
+			return []store.Event{x.line(ownerTurn("q", "run the soak", t0), map[string]any{"type": "user", "message": map[string]any{"content": "run the soak"}}),
+				x.line(agentSays("q", "The soak runs.", t0.Add(10*time.Second)), map[string]any{"type": "assistant", "message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "The soak runs."}}}}),
+				x.line(queued("q", ".", nudge), map[string]any{"type": "attachment", "attachment": map[string]any{"type": "queued_command", "prompt": "."}})}
+		}, false},
+		{"steered into a running Codex turn", func(*testing.T) []store.Event {
+			evs := []store.Event{ownerTurn("q", "fix the flaky test", t0), agentSays("q", "Looking at the test logs first.", t0.Add(10*time.Second)), queued("q", "continue", nudge)}
+			for i := range evs {
+				evs[i].Harness = "codex"
+			}
+			return evs
+		}, false},
+		{"queued at a stopped session", func(*testing.T) []store.Event {
+			return []store.Event{ownerTurn("q", "build the release", t0), agentSays("q", "The release is built. Do you want me to publish it now?", t0.Add(time.Minute)),
+				queued("q", ".", t0.Add(time.Hour))}
+		}, true},
+		{"typed while the model owed its reply", func(*testing.T) []store.Event {
+			return []store.Event{ownerTurn("q", "run the soak", t0), call("q", "Bash", "tc1", `{"command":"go test ./soak"}`, t0.Add(10*time.Second)),
+				ev(store.Transcripts, "q", "tool_result", store.ActorTool, "Bash", "ok", `{"tool_id":"tc1"}`, t0.Add(time.Minute)),
+				ev(store.Transcripts, "q", "owner_text", store.ActorOwner, "", ".", `{"input_kind":"typed"}`, nudge)}
+		}, true},
+		{"queued into a stalled request", func(t *testing.T) []store.Event {
+			x := newTranscript(t, "q")
+			first := x.line(ownerTurn("q", "check the lab", t0), map[string]any{"type": "user", "message": map[string]any{"content": "check the lab"}})
+			x.line(store.Event{TS: t0.Add(time.Second)}, map[string]any{"type": "api-request"})
+			return []store.Event{first, x.line(queued("q", ".", nudge), map[string]any{"type": "user", "promptSource": "queued", "message": map[string]any{"content": "."}})}
+		}, true},
+		{"queued, then an Escape", func(*testing.T) []store.Event {
+			return []store.Event{ownerTurn("q", "check the lab", t0), queued("q", ".", nudge), escape(nudge.Add(50 * time.Millisecond))}
+		}, true},
+		{"an Escape, then queued", func(*testing.T) []store.Event {
+			return []store.Event{ownerTurn("q", "check the lab", t0), escape(nudge.Add(-50 * time.Millisecond)), queued("q", ".", nudge)}
+		}, true},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			st := testStore(t)
-			row.stop(st)
-			put(t, st, ev(store.Transcripts, "q", "owner_text", store.ActorOwner, "", ".", fmt.Sprintf(`{"input_kind":%q}`, row.kind), row.nudge))
-			if got := nudgedAt(t, st)[row.nudge.UnixMilli()]; got != row.counts {
-				t.Fatalf("the nudge counted %v, want %v", got, row.counts)
+			evs := row.evs(t)
+			put(t, st, evs...)
+			var at time.Time // the nudge's
+			for _, e := range evs {
+				if e.Kind == "owner_text" && supervise.Nudge(e.Summary) {
+					at = e.TS
+				}
+			}
+			if got := nudgedAt(t, st)[at.UnixMilli()]; got != row.counts {
+				t.Fatalf("the nudge counted %v, want %v (nudges at %v)", got, row.counts, nudgedAt(t, st))
 			}
 		})
 	}

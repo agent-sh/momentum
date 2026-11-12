@@ -239,51 +239,73 @@ func TestAnEscapeThatKilledTheAgentsEndsTheTurn(t *testing.T) {
 	}
 }
 
-// A task's notification Claude Code delivers after a turn ended on an API error, and sends its model no request for
-// (a usage limit it knows of), opens no turn: the stop on the error goes on to the owner's next input, and the access
-// rule reads it as it would without the notification, from the error's time. One whose request went out opens a turn
-// that waits on the model.
+// A task's notification Claude Code delivers after a turn ended on an API error that stops access, and sends its
+// model no request for (a usage limit it knows of), opens no turn: the stop on the error goes on to the owner's next
+// input, and the access rule reads it as it would without the notification, from the error's time. So it goes past
+// a local command's echo before the next input, for a second notification, and when the window ends before the
+// request. One whose request went out opens a turn that waits on the model; one a reply follows with no request
+// record before it, one after a transient error, and one past the reset a limit states open a turn as before.
 func TestANotificationThatSentNoRequestKeepsTheErrorStop(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	const limit = "You've hit your weekly limit · resets Mar 7, 9am (Europe/Lisbon)"
 	const note = "<task-notification> <task-id>b1</task-id> <status>completed</status> </task-notification>"
-	stop := func(session string) (*recorded, time.Time) {
-		r := newRecorded(t, session).owner(0, "run the soak").request(time.Second)
-		r.event(time.Second, map[string]any{"type": "assistant", "isApiErrorMessage": true, "message": map[string]any{"model": "<synthetic>",
-			"content": []any{map[string]any{"type": "text", "text": limit}}}}, "harness_text", store.ActorHarness, "", limit, `{"is_error":true,"why":"api error"}`)
-		failed := r.at
-		r.line(10*time.Millisecond, map[string]any{"type": "system", "subtype": "turn_duration"})
-		r.event(20*time.Second, map[string]any{"type": "user", "origin": map[string]any{"kind": "task-notification"}, "message": map[string]any{"content": note}},
+	notify := func(r *recorded, after time.Duration) *recorded {
+		return r.event(after, map[string]any{"type": "user", "origin": map[string]any{"kind": "task-notification"}, "message": map[string]any{"content": note}},
 			"harness_text", store.ActorHarness, "", note, `{"why":"origin task-notification","prior":"turn_duration"}`)
-		return r, failed
 	}
-	quiet, failed := stop("quiet")
-	quiet.owner(3*time.Hour, ".").put(st)
-	sent, _ := stop("sent")
-	sent.request(100*time.Millisecond).owner(3*time.Hour, ".").put(st)
+	failed := map[string]time.Time{}
+	stop := func(session, text string) *recorded {
+		r := newRecorded(t, session).owner(0, "run the soak").request(time.Second).apiError(time.Second, text)
+		failed[session] = r.at
+		r.line(10*time.Millisecond, map[string]any{"type": "system", "subtype": "turn_duration"})
+		return notify(r, 20*time.Second)
+	}
+	stop("quiet", limit).owner(3*time.Hour, ".").put(st)
+	stop("sent", limit).request(100*time.Millisecond).owner(3*time.Hour, ".").put(st)
+	stop("echo", limit).login(time.Minute).owner(3*time.Hour, ".").put(st)
+	notify(stop("twice", limit), time.Minute).owner(3*time.Hour, ".").put(st)
+	cut := stop("cut", limit)
+	cut.line(0, map[string]any{"type": "api-request", "timestamp": t0.Add(10 * 24 * time.Hour).Format(time.RFC3339Nano)})
+	cut.put(st)
+	stop("replied", limit).say(30*time.Second, "Noted: the suite passed.").owner(3*time.Hour, ".").put(st)
+	stop("transient", err503).owner(3*time.Hour, ".").put(st)
+	late := newRecorded(t, "late").owner(0, "run the soak").request(time.Second).apiError(time.Second, limit)
+	late.line(10*time.Millisecond, map[string]any{"type": "system", "subtype": "turn_duration"})
+	notify(late, 4*24*time.Hour).owner(time.Hour, ".").put(st)
 
-	until := t0.Add(5 * time.Hour)
+	until := t0.Add(5 * 24 * time.Hour)
 	points, err := History(ctx, st, t0.Add(-time.Hour), until)
 	if err != nil {
 		t.Fatal(err)
 	}
-	nudged := map[string]Result{}
+	nudged, ended := map[string]Result{}, map[string]bool{}
 	for _, r := range Replay(points, nil, DefaultParams, probeAt(time.Time{}), until) {
-		if r.Point.Session == "quiet" && r.Point.Next.Kind == "self" {
-			t.Fatalf("the notification that sent nothing ended the stop: %+v", r.Point)
-		}
-		if r.Point.Next.Text == "." {
+		switch {
+		case r.Point.Next.Kind == "self":
+			ended[r.Point.Session] = true // a notification ended a stop
+		case r.Point.Next.Text == ".", r.Point.Session == "cut" && r.Point.Next.Kind == "none":
 			nudged[r.Point.Session] = r
 		}
 	}
-	reset, _ := ResetAt(limit, failed)
-	q := nudged["quiet"]
-	if s, d := q.Point.Stop, q.Decision; s.Working || s.Error != limit || s.Words != limit || !s.At.Equal(failed) ||
-		d.Rule != RuleAccess || d.Verdict != Wait || !d.At.Equal(reset.Add(DefaultParams.ResetGrace)) || q.Fired {
-		t.Fatalf("no request: stop %+v, decision %+v", s, d)
+	reset, _ := ResetAt(limit, failed["quiet"])
+	// the window ends after the reset: the rule acts on the stop that runs to it
+	for _, session := range []string{"quiet", "echo", "twice", "cut"} {
+		q := nudged[session]
+		if s, d := q.Point.Stop, q.Decision; ended[session] || s.Working || s.Error != limit || s.Words != limit || !s.At.Equal(failed[session]) ||
+			d.Rule != RuleAccess || d.Verdict != Wait || !d.At.Equal(reset.Add(DefaultParams.ResetGrace)) || q.Fired != (session == "cut") {
+			t.Errorf("%s: a notification ended the stop %v, stop %+v, decision %+v", session, ended[session], s, d)
+		}
+	}
+	if c := nudged["echo"].Point.Controls; len(c) != 1 {
+		t.Errorf("echo: the local command is no control of the stop: %v", c)
 	}
 	if s, d := nudged["sent"].Point.Stop, nudged["sent"].Decision; !s.Working || s.Error != "" || s.RequestAt.IsZero() || d.Rule != RuleStalled {
-		t.Fatalf("its request went out: stop %+v, decision %+v", s, d)
+		t.Errorf("its request went out: stop %+v, decision %+v", s, d)
+	}
+	for _, session := range []string{"sent", "replied", "transient", "late"} {
+		if !ended[session] {
+			t.Errorf("%s: the notification opened no turn", session)
+		}
 	}
 }

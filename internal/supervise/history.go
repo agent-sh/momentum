@@ -28,7 +28,7 @@ type Point struct {
 	Stop    Stop
 	Next    Next
 	Entry   string // where the owner's turns came from (the harness's entrypoint), when the store says
-	// Waiting marks a turn that waited on its model's reply at least stallFloor, where no input ended the wait:
+	// Waiting marks a turn that waited on its model's reply at least StallFloor, where no input ended the wait:
 	// the reply came (Next is the session going on by itself), or the session was reopened, which closed the turn
 	// (Next is its owner's restart). Only the stalled rule reads it (PlanOnly).
 	Waiting bool
@@ -38,9 +38,9 @@ type Point struct {
 	Controls []time.Time
 }
 
-// stallFloor is how long a turn must have waited on its model's reply to be a point of its own: no wait the
+// StallFloor is how long a turn must have waited on its model's reply to be a point of its own: no wait the
 // stalled rule could use is shorter, and every turn waits on its model for a moment.
-const stallFloor = time.Minute
+const StallFloor = time.Minute
 
 // Next is the input that ended a stop: the owner's (a turn, a slash command, a shell command, an interruption),
 // the session's own (a task's notification, a scheduled wakeup, another session's message), momentum's own
@@ -910,11 +910,11 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			e.Summary = whole(e) // the store cut it: read what it says from the transcript, while it is there
 		}
 		if r == "self" && prevRole == "apierr" && harness == "claude" && !fromPeer(e, m) && claude.Notification(e.Summary) &&
-			!claude.Orphaned(e.Summary) && unsent(lastRef, e.Ref, until) {
-			// A task's notification Claude Code delivered after the turn ended on an API error, and sent its model no
-			// request for (a usage limit it knows of), opens no turn, as the live tracker reads it: the stop on the error
-			// goes on to the next input, with its error, its words and its time, so the rule that reads the error decides
-			// as it would without the notification. What it says of the session's tasks and its wakeup still counts.
+			!claude.Orphaned(e.Summary) && heldBy(words, prevAt, e.TS) && unsent(lastRef, e.Ref, until) {
+			// A task's notification Claude Code delivered after the turn ended on an API error that stops access, and
+			// sent its model no request for, opens no turn, as the live tracker reads it: the stop on the error goes on
+			// to the next input, with its error, its words and its time, so the rule that reads the error decides as it
+			// would without the notification. What it says of the session's tasks and its wakeup still counts.
 			notified(e.Summary, e.TS)
 			if prior, _ := m["prior"].(string); carried == "" && turnOver(harness, prior) {
 				carried = prior
@@ -937,7 +937,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 				out = append(out, Point{Session: id, Stop: stopOf(e.TS, firstNonEmpty(controlRef, e.Ref)), Next: next, Entry: entry, Controls: controls})
 			}
 		}
-		if (r == "agent" || r == "call" || r == "apierr" || r == "synthetic") && !owes.IsZero() && e.TS.Sub(owes) >= stallFloor {
+		if (r == "agent" || r == "call" || r == "apierr" || r == "synthetic") && !owes.IsZero() && e.TS.Sub(owes) >= StallFloor {
 			// the wait ended after a long time without an input: the model's reply, or a reopening that closed the
 			// turn. What the stalled rule would have done is the point.
 			st := stopOf(e.TS, firstNonEmpty(controlRef, e.Ref))
@@ -1216,6 +1216,18 @@ func requestBetween(from, to string, until time.Time) time.Time {
 	}
 }
 
+// heldBy reports an API error (its words, at its time) that stops access, as the access rule reads it (a login, a
+// usage limit, an organization's block), so Claude Code sends no request for a task's notification at at: until
+// the reset a limit states, when it states one. The live tracker reads the error's kind (claude.Tracker); a
+// transient error holds nothing.
+func heldBy(words string, errAt, at time.Time) bool {
+	if c := ErrorClass(words); c != Login && c != Limit && c != Org {
+		return false
+	}
+	reset, ok := ResetAt(words, errAt)
+	return !ok || at.Before(reset)
+}
+
 // unsent reports that Claude Code sent its model no request for an input (its record's place), by the transcript
 // while it is there: no api-request record after the record of the event before the input (from), up to the next
 // record of the conversation after the input's own (a reply or an error, any assistant record, or another input, a
@@ -1301,6 +1313,22 @@ func echoLine(raw []byte) bool {
 		}
 	}
 	return strings.TrimSpace(text) != "" && !hSkillRunning.MatchString(text) && strings.TrimSpace(hCommandTag.ReplaceAllString(text, "")) == ""
+}
+
+// QueuedInput reports an input whose record in its transcript (Ref: path@offset#index) is a queued command's
+// attachment: Claude Code delivered it into the turn that ran when it was typed. False when the transcript is gone.
+func QueuedInput(ref string) bool {
+	line := recordAt(ref)
+	if line == nil {
+		return false
+	}
+	var r struct {
+		Type       string `json:"type"`
+		Attachment struct {
+			Type string `json:"type"`
+		} `json:"attachment"`
+	}
+	return json.Unmarshal(line, &r) == nil && r.Type == "attachment" && r.Attachment.Type == "queued_command"
 }
 
 // queuedCommand reports what Claude Code queued while a turn ran and delivered into the turn later, not its user's: a

@@ -293,17 +293,20 @@ func TestAnAPIErrorStopsTheTurn(t *testing.T) {
 	}
 }
 
-// A task's notification Claude Code delivers after the turn ended on an API error opens no turn until it sends the
-// model its request: under a usage limit it knows of it sends none, and the session still stops on the error. Once
-// the request goes out, the turn is open. A reopening's notice opens one as before.
+// A task's notification Claude Code delivers after the turn ended on an API error that stops access (by its kind: a
+// usage limit, a failed login, an organization's block) opens no turn until it sends the model its request: under a
+// limit it knows of it sends none, and the session still stops on the error. Once the request goes out, the turn is
+// open as a prompt's turn, and a retry's error record that answers the request leaves it open. A transient error, a
+// limit past the reset it states, and a reopening's notice open the turn at the notification, as before.
 func TestANotificationAfterAnAPIErrorOpensNoTurnUntilItsRequest(t *testing.T) {
 	const limit = "You've hit your weekly limit · resets Mar 7, 9am (Europe/Lisbon)"
-	stop := func() *script {
-		return newScript(t).user("run the soak").request().add(map[string]any{"type": "assistant", "isApiErrorMessage": true,
-			"message": map[string]any{"model": "<synthetic>", "content": []any{map[string]any{"type": "text", "text": limit}}}}).
+	stop := func(kind, text string) *script {
+		return newScript(t).user("run the soak").request().add(map[string]any{"type": "assistant", "isApiErrorMessage": true, "error": kind,
+			"message": map[string]any{"model": "<synthetic>", "content": []any{map[string]any{"type": "text", "text": text}}}}).
 			add(map[string]any{"type": "system", "subtype": "turn_duration"})
 	}
-	x := stop().notify("b1", "completed")
+	retry := map[string]any{"type": "system", "subtype": "api_error", "level": "error", "retryInMs": 2000, "retryAttempt": 1}
+	x := stop("rate_limit", limit).notify("b1", "completed")
 	tr := NewTracker(x.path)
 	if s := x.facts(tr, x.at); s.TurnOpen || s.Phase != sessions.NeedsYou || s.AskKind != sessions.AskError || !strings.Contains(s.Ask, "weekly limit") {
 		t.Fatalf("no request: open %v, phase %s, ask %s %q", s.TurnOpen, s.Phase, s.AskKind, s.Ask)
@@ -312,11 +315,27 @@ func TestANotificationAfterAnAPIErrorOpensNoTurnUntilItsRequest(t *testing.T) {
 	if s := x.facts(tr, x.at); !s.TurnOpen || s.Phase != sessions.Working || s.AskKind == sessions.AskError {
 		t.Fatalf("its request: open %v, phase %s, ask %s", s.TurnOpen, s.Phase, s.AskKind)
 	}
+	x.add(retry)
+	if s := x.facts(tr, x.at); !s.TurnOpen || s.Phase != sessions.Working || s.AskKind == sessions.AskError {
+		t.Errorf("a retry's error after its request: open %v, phase %s, ask %s", s.TurnOpen, s.Phase, s.AskKind)
+	}
+	if s := stop("authentication_failed", "Login expired · Please run /login").notify("b1", "completed"); s.facts(NewTracker(s.path), s.at).AskKind != sessions.AskError {
+		t.Error("a failed login: the notification opened a turn")
+	}
 	orphan := tag("task-notification") + tag("task-id") + "b2" + closing("task-id") + tag("status") + "stopped" + closing("status") +
 		tag("summary") + "Background command didn't finish before the previous session ended" + closing("summary") + closing("task-notification")
-	y := stop().add(map[string]any{"type": "user", "origin": map[string]any{"kind": "task-notification"}, "message": map[string]any{"content": orphan}})
-	if s := y.facts(NewTracker(y.path), y.at); !s.TurnOpen || s.ResumedAt.IsZero() {
-		t.Fatalf("a reopening's notice: open %v, resumed %v", s.TurnOpen, s.ResumedAt)
+	notice := func(text, at string) map[string]any {
+		return map[string]any{"type": "user", "origin": map[string]any{"kind": "task-notification"}, "message": map[string]any{"content": text}, "timestamp": at}
+	}
+	note := tag("task-notification") + tag("task-id") + "b1" + closing("task-id") + tag("status") + "completed" + closing("status") + closing("task-notification")
+	for name, y := range map[string]*script{
+		"a transient error":                stop("server_error", "API Error: 529 overloaded").notify("b1", "completed"),
+		"a limit past the reset it states": stop("rate_limit", limit).add(notice(note, "2026-03-07T10:00:00Z")),
+		"a reopening's notice":             stop("rate_limit", limit).add(notice(orphan, t0.Add(time.Hour).Format(time.RFC3339Nano))),
+	} {
+		if s := y.facts(NewTracker(y.path), y.at); !s.TurnOpen || s.Phase != sessions.Working {
+			t.Errorf("%s: open %v, phase %s", name, s.TurnOpen, s.Phase)
+		}
 	}
 }
 

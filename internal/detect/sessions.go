@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/agent-sh/momentum/internal/store"
 	"github.com/agent-sh/momentum/internal/supervise"
+	"github.com/agent-sh/momentum/sessions/claude"
 )
 
 // Sessions finds what keeps sessions from moving on without the owner:
@@ -78,9 +80,10 @@ func (d Sessions) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 
 // nudged replays the rules over the window and keeps the stops the owner ended with a nudge that no rule would
 // have acted on first, each keyed by why none would. A nudge he queued while a turn ran is none: the session was not
-// stopped (inTurn). His own restart step is none either: his input at a stop an /exit ended, and his input within
-// the owner window after a session that ended mid-task was reopened, whoever reopened it, with nothing since: no turn
-// opened after the reopening, and the stop does not end on an API error.
+// stopped (inTurn); one he queued and sent with an Escape is one (escapes). His own restart step is none either: his
+// input at a stop an /exit ended, and his input within the owner window after a session that ended mid-task was
+// reopened, whoever reopened it, with nothing since: no turn opened after the reopening, and the stop does not end on
+// an API error.
 func (d Sessions) nudged(ctx context.Context, st *store.Store, w Window) ([]occurrence, error) {
 	points, err := supervise.History(ctx, st, w.Since, w.Until)
 	if err != nil {
@@ -111,9 +114,35 @@ func (d Sessions) nudged(ctx context.Context, st *store.Store, w Window) ([]occu
 			programs[t.ID()] = true
 		}
 	}
+	rs := supervise.Replay(points, nil, supervise.DefaultParams, probe, w.Until)
+	// each session's stops in the order their inputs came, so a nudge is read with the input next to it
+	bySession := map[string][]int{}
+	for i, r := range rs {
+		bySession[r.Point.Session] = append(bySession[r.Point.Session], i)
+	}
+	place := make([]int, len(rs))
+	for _, ids := range bySession {
+		sort.SliceStable(ids, func(a, b int) bool { return inputBefore(rs[ids[a]].Point.Next, rs[ids[b]].Point.Next) })
+		for k, i := range ids {
+			place[i] = k
+		}
+	}
 	var occ []occurrence
-	for _, res := range supervise.Replay(points, nil, supervise.DefaultParams, probe, w.Until) {
+	for i, res := range rs {
 		next := res.Point.Next
+		if next.Kind != "owner" || !supervise.Nudge(next.Text) {
+			continue
+		}
+		// A nudge he queued and sent with an Escape, in either order, is his way into a stalled turn: it counts, and
+		// with the Escape first it is read at the stop the Escape ended.
+		escaped := false
+		if ids, k := bySession[res.Point.Session], place[i]; next.InputKind == "queued" {
+			if k+1 < len(ids) && escapes(rs[ids[k+1]].Point.Next, next) {
+				escaped = true
+			} else if k > 0 && escapes(rs[ids[k-1]].Point.Next, next) {
+				escaped, res = true, rs[ids[k-1]]
+			}
+		}
 		s := res.Point.Stop
 		// At a reopening after the session ended mid-task (a crash, a restart, a usage limit), his input within the
 		// owner window is his restart step: whoever reopened it, supervision holds every rule that long after a process
@@ -126,17 +155,17 @@ func (d Sessions) nudged(ctx context.Context, st *store.Store, w Window) ([]occu
 		// Escape, a tool's result or a synthetic reply is still skipped, though the session ran a turn again.
 		restartStep := !s.ResumedAt.IsZero() && !s.TurnBegan.After(s.ResumedAt) && s.Error == "" &&
 			next.At.Sub(s.ResumedAt) <= supervise.DefaultParams.OwnerWindow
-		if next.Kind != "owner" || inTurn(next, s) || !supervise.Nudge(next.Text) || res.Fired || s.Exited || s.Reopened || restartStep {
+		if res.Fired || s.Exited || s.Reopened || restartStep {
 			continue // an exited stop is one no rule can continue: the owner's input reopens it, after a command or not
 		}
-		why := supervise.Why(res)
 		turn, err := st.Before(ctx, res.Point.Session, []string{"owner_text"}, next.At.Add(-time.Second), next.At.Add(time.Second), 1)
 		if err != nil {
 			return occ, err
 		}
-		if len(turn) == 0 || programs[turn[0].ID()] {
-			continue // no turn of his in the store, or a program typed it
+		if len(turn) == 0 || programs[turn[0].ID()] || !escaped && inTurn(next, s, turn[0]) {
+			continue // no turn of his in the store, a program typed it, or he typed it into a running turn
 		}
+		why := supervise.Why(res)
 		key := slug(Norm(why, 60), 60)
 		occ = append(occ, occurrence{sig: signature("sessions", "nudged:"+key), ev: turn[0],
 			title: "The owner nudges stopped sessions no rule continues: " + Norm(why, 60)})
@@ -148,12 +177,36 @@ func (d Sessions) nudged(ctx context.Context, st *store.Store, w Window) ([]occu
 // once, a few milliseconds on.
 const queuedSkew = 2 * time.Second
 
-// inTurn reports an input the owner queued while a turn ran, which the harness showed running: the stop shows the
-// turn open (a call running, or the model owing its reply, where a queued message is delivered into the turn), or
-// the turn's end delivered it at once. Claude Code also passes an input it takes while idle through its queue, and
-// marks it queued: typed at a stopped session, that one is his nudge.
-func inTurn(next supervise.Next, s supervise.Stop) bool {
-	return next.InputKind == "queued" && (s.Working || s.Busy || next.At.Sub(s.At) <= queuedSkew)
+// inTurn reports an input the owner queued while a turn ran, which the harness showed running. Codex, pi and
+// Hermes mark queued only a message steered into a running turn. Claude Code marks queued one it delivered into the
+// turn as a queued command's attachment, one the stop shows the turn open for (a call running, or the model owing
+// its reply), and one the turn's end delivered at once; but it also passes an input it takes while idle through its
+// queue and marks it queued, and typed at a stopped session that one is his nudge. A turn that had waited on its
+// model's request at least StallFloor was stalled, not running: his input into it counts.
+func inTurn(next supervise.Next, s supervise.Stop, turn store.Event) bool {
+	switch {
+	case next.InputKind != "queued":
+		return false
+	case s.Tool != "claude":
+		return true
+	case !s.RequestAt.IsZero() && next.At.Sub(s.RequestAt) >= supervise.StallFloor:
+		return false
+	}
+	return supervise.QueuedInput(turn.Ref) || s.Working || s.Busy || next.At.Sub(s.At) <= queuedSkew
+}
+
+// escapes reports an interruption (an Escape) within claude.InterruptSkew of a queued input: Claude Code writes the
+// interruption and the prompt the Escape sends a few milliseconds apart, in either order.
+func escapes(n, queued supervise.Next) bool {
+	return n.InputKind == "interrupt" && n.At.Sub(queued.At).Abs() <= claude.InterruptSkew
+}
+
+// inputBefore orders a session's stops by the input that ended each, the stop nothing ended last.
+func inputBefore(a, b supervise.Next) bool {
+	if a.At.IsZero() || b.At.IsZero() {
+		return !a.At.IsZero() && b.At.IsZero()
+	}
+	return a.At.Before(b.At)
 }
 
 // waits are the stretches a session waited on its owner past LongWait, by what it asked, from the sessions events

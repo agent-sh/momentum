@@ -113,9 +113,14 @@ type track struct {
 	LastMain string           `json:"last_main"`
 	LastText string           `json:"last_text"`
 	ErrText  string           `json:"err_text"`
-	WakeAt   time.Time        `json:"wake_at"`
-	WakeFor  string           `json:"wake_for,omitempty"` // what the pending wakeup is for
-	WakeSet  time.Time        `json:"wake_set,omitzero"`  // when it was set
+	ErrKind  string           `json:"err_kind,omitempty"` // the API error's kind, as Claude Code names it
+	ErrAt    time.Time        `json:"err_at,omitzero"`    // when the API error came
+	// Held is when a task's notification came after the turn ended on an API error that stops access (heldBy): it
+	// opens no turn until Claude Code sends the model its request, and then opens it as a prompt's turn.
+	Held    time.Time `json:"held,omitzero"`
+	WakeAt  time.Time `json:"wake_at"`
+	WakeFor string    `json:"wake_for,omitempty"` // what the pending wakeup is for
+	WakeSet time.Time `json:"wake_set,omitzero"`  // when it was set
 	// WakeSign is why the pending wakeup may have been lost: what came while it waited that Claude Code is known to
 	// drop a wakeup for (a task's notification, a compaction).
 	WakeSign  string          `json:"wake_sign,omitempty"`
@@ -277,6 +282,9 @@ func (t *Tracker) line(raw []byte) {
 		switch e.Type {
 		case "api-request":
 			t.st.Request, t.st.QueuedPrompt = at, time.Time{}
+			if !t.st.Held.IsZero() { // the held notification's request: its turn is open, as a prompt's is
+				t.st.LastMain, t.st.Held = "user", time.Time{}
+			}
 		case "queue-operation":
 			t.queued(e)
 		case "system":
@@ -607,8 +615,8 @@ func (t *Tracker) assistant(e line, at time.Time, open bool) {
 	if st.LastMain != "assistant" {
 		st.Group = st.Group[:0]
 	}
-	st.LastMain = "assistant"
-	st.ErrText = ""
+	st.LastMain, st.Held = "assistant", time.Time{}
+	st.ErrText, st.ErrKind, st.ErrAt = "", "", time.Time{}
 	if m := e.Message.Model; m != "" && !strings.HasPrefix(m, "<") {
 		st.Model = m
 	}
@@ -620,7 +628,7 @@ func (t *Tracker) assistant(e line, at time.Time, open bool) {
 			}
 			st.LastText = b.Text
 			if e.APIError {
-				st.ErrText = text.OneLine(b.Text, 200)
+				st.ErrText, st.ErrKind, st.ErrAt = text.OneLine(b.Text, 200), e.Error, at
 				if e.Error == "rate_limit" && strings.TrimSpace(b.Text) == noResponse {
 					st.ErrText = RateLimit // the text says nothing; the kind says what stopped it
 				}
@@ -725,6 +733,22 @@ func originLabel(kind, source string) string {
 	return source
 }
 
+// accessKinds are the kinds of API error Claude Code names for a wall it will not send a request through: a usage
+// limit, a login that failed, an organization that turned access off, billing.
+var accessKinds = map[string]bool{"rate_limit": true, "authentication_failed": true, "oauth_org_not_allowed": true, "billing_error": true}
+
+// heldBy reports that the turn ended on an API error that stops access, by its kind, so a task's notification at
+// at waits for the request Claude Code sends for it: until the reset a limit states, when it states one. A transient
+// error does not hold it: Claude Code sends that request, though it may write no record of it.
+func (t *Tracker) heldBy(at time.Time) bool {
+	st := &t.st
+	if st.ErrText == "" || !accessKinds[st.ErrKind] {
+		return false
+	}
+	reset, ok := sessions.ResetAt(st.ErrText, st.ErrAt)
+	return !ok || at.Before(reset)
+}
+
 // userText reads a user record's text; open is whether a turn was open before the record.
 func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin string, open bool) {
 	st := &t.st
@@ -734,18 +758,22 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 	if kind == "peer" || PeerMessage(s) {
 		st.log.Add(sessions.Entry{Role: sessions.RolePeer, Text: text.OneLine(reSystemTag.ReplaceAllString(s, ""), 400)})
 		if !meta {
-			st.LastMain, st.QueuedPrompt = "user", time.Time{}
+			st.LastMain, st.QueuedPrompt, st.Held = "user", time.Time{}, time.Time{}
 		}
 		return
 	}
 	if Notification(s) { // a prompt that only quotes the tag (a loop's, a headless run's) is read as any other
 		t.notified(s, at)
 		orphan := reOrphan.MatchString(s)
-		// One delivered after the turn ended on an API error opens no turn until Claude Code sends its model the request
-		// (a usage limit it knows of sends none): the session still stops on the error. A reopening's notice is a new
-		// process, which opens it as before.
-		if open || orphan || st.LastMain != "assistant" || st.ErrText == "" {
-			st.LastMain = "user"
+		// One delivered after the turn ended on an API error that stops access opens no turn until Claude Code sends
+		// the model its request (heldBy): the session still stops on the error. A reopening's notice is a new process,
+		// which opens it as before.
+		if !open && !orphan && st.LastMain == "assistant" && t.heldBy(at) {
+			if st.Held.IsZero() {
+				st.Held = at
+			}
+		} else {
+			st.LastMain, st.Held = "user", time.Time{}
 		}
 		st.QueuedPrompt = time.Time{}
 		if orphan {
@@ -773,7 +801,7 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 			}
 			return
 		}
-		st.LastMain = "ended"
+		st.LastMain, st.Held = "ended", time.Time{}
 		st.Group = st.Group[:0]
 		st.Control = at // its user pressed Esc, or turned a tool call down
 		if !st.WakeAt.IsZero() && !at.Before(st.WakeSet) {
@@ -788,12 +816,12 @@ func (t *Tracker) userText(s string, at time.Time, meta bool, kind, origin strin
 		if m := reCommandName.FindStringSubmatch(s); m != nil && (m[1] == "/exit" || m[1] == "/quit") {
 			// the process ends, and the turn it ran with it: a "No response requested." the next process writes
 			// closes no turn, so it is no reopening; a reopening before the exit is over with the process it opened
-			st.LastMain, st.Group, st.Request, st.QueuedPrompt = "ended", st.Group[:0], time.Time{}, time.Time{}
+			st.LastMain, st.Group, st.Request, st.QueuedPrompt, st.Held = "ended", st.Group[:0], time.Time{}, time.Time{}, time.Time{}
 			st.Resumed = time.Time{}
 		}
 		return
 	}
-	st.LastMain = "user"
+	st.LastMain, st.Held = "user", time.Time{}
 	st.UserAt, st.Resumed = at, time.Time{} // a planned wakeup still fires after a prompt: it stays
 	st.QueuedPrompt = time.Time{}
 	// Only a queued prompt written while the turn it waited behind still ran can have the Escape that sent it
@@ -827,7 +855,7 @@ func (t *Tracker) notified(s string, at time.Time) {
 
 func (t *Tracker) result(b block, at time.Time) {
 	st := &t.st
-	st.LastMain, st.QueuedPrompt = "user", time.Time{}
+	st.LastMain, st.QueuedPrompt, st.Held = "user", time.Time{}, time.Time{}
 	c := st.Calls[b.ToolUseID]
 	delete(st.Calls, b.ToolUseID)
 	out := text.BlocksText(b.Content)
