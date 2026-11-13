@@ -16,7 +16,8 @@ import (
 
 // Sessions finds what keeps sessions from moving on without the owner:
 //   - gave-up: supervision used up a rule's tries, or a message of its own did not land (its case events);
-//   - outcome: a message it sent did not land, or the turn it opened stopped the same way again without work;
+//   - outcome: a message it sent did not land, or the turn it opened stopped the same way again without work
+//     (but the transient rule's: a provider that still fails is not supervision's defect);
 //   - nudged: the owner had to nudge a stopped session that no rule would have continued, keyed by why none
 //     would (the replay of the rules over the store's history: its phase and what kept each rule off);
 //   - waited: a session waited on him past the owner window, keyed by what it asked (its phase events).
@@ -66,6 +67,9 @@ func (d Sessions) Detect(ctx context.Context, st *store.Store, w Window) ([]stor
 		case supervise.KindOutcome:
 			if m.Result != supervise.NotDelivered && m.Result != supervise.FailedAgain {
 				continue
+			}
+			if m.Rule == supervise.RuleTransient && m.Result == supervise.FailedAgain {
+				continue // the provider is still failing: the rule keeps trying, and its going case and note show it
 			}
 			other = append(other, occurrence{sig: signature("sessions", "outcome:"+m.Rule+":"+slug(m.Result, 20)), ev: e,
 				title: fmt.Sprintf("Supervision's %s messages: %s", m.Rule, m.Result)})

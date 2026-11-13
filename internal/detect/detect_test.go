@@ -1792,6 +1792,11 @@ func TestSessionsAreFoundInSupervisionsOwnRecord(t *testing.T) {
 		sup("b", "case", `{"rule":"transient","going":true,"why":"4 messages did not move it; it keeps trying"}`, t0), // not a give-up
 		sup("a", "outcome", `{"rule":"promise","result":"failed again"}`, t0), sup("b", "outcome", `{"rule":"promise","result":"failed again"}`, t0),
 		sup("b", "outcome", `{"rule":"promise","result":"failed again"}`, t0.Add(time.Hour)),
+		// the transient rule's failed again is the provider's, not a finding; its message that did not land is one
+		sup("a", "outcome", `{"rule":"transient","result":"failed again"}`, t0), sup("b", "outcome", `{"rule":"transient","result":"failed again"}`, t0),
+		sup("b", "outcome", `{"rule":"transient","result":"failed again"}`, t0.Add(time.Hour)),
+		sup("a", "outcome", `{"rule":"transient","result":"not delivered"}`, t0), sup("b", "outcome", `{"rule":"transient","result":"not delivered"}`, t0),
+		sup("b", "outcome", `{"rule":"transient","result":"not delivered"}`, t0.Add(time.Hour)),
 		sup("c", "outcome", `{"rule":"promise","result":"worked"}`, t0), sup("d", "outcome", `{"rule":"promise","result":"worked"}`, t0),
 		sup("e", "outcome", `{"rule":"promise","result":"worked"}`, t0),
 		wait("a", "needs_you", "permission", 40, false, t0), wait("b", "needs_you", "permission", 20, false, t0),
@@ -1805,7 +1810,7 @@ func TestSessionsAreFoundInSupervisionsOwnRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{"sessions/v1:gave-up:transient:four-tries-without-a-turn-that-worked 1", "sessions/v1:outcome:promise:failed-again 3",
-		"sessions/v1:waited:permission 3"}
+		"sessions/v1:outcome:transient:not-delivered 3", "sessions/v1:waited:permission 3"}
 	if got := signatures(fs); !slices.Equal(got, want) {
 		t.Fatalf("found\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
