@@ -149,13 +149,21 @@ type Decision struct {
 
 // Decide applies the guards and the rules to a stop at now. A zero Decision means no rule applies. A rule whose
 // own time came more than Params.Stale ago does not act, held or not: momentum was not running then, or the stop
-// is old, and the owner left it as it is.
+// is old, and the owner left it as it is. A limit whose sign of access went stale still resumes at the reset it
+// states.
 func Decide(s Stop, tries Tries, p Params, probe Probe, now time.Time) Decision {
 	d := Plan(s, tries, p, probe)
 	if d.Verdict != Wait && d.Verdict != Hold {
 		return d
 	}
-	if !d.RuleAt.IsZero() && p.Stale > 0 && now.Sub(d.RuleAt) > p.Stale {
+	stale := func(d Decision) bool { return !d.RuleAt.IsZero() && p.Stale > 0 && now.Sub(d.RuleAt) > p.Stale }
+	if stale(d) && d.Rule == RuleAccess && probe != nil {
+		// a sign of access that went stale leaves the reset a limit states, which may still come
+		if r := Plan(s, tries, p, nil); r.Rule == RuleAccess && (r.Verdict == Wait || r.Verdict == Hold) && !r.RuleAt.IsZero() && !stale(r) {
+			d = r
+		}
+	}
+	if stale(d) {
 		d.Verdict, d.Stale, d.Why = Skip, true, d.Why+"; stale: its time came at "+d.RuleAt.Local().Format("Jan 2 15:04")
 		return d
 	}

@@ -97,6 +97,34 @@ func TestAccessResumesOnceAccessIsBack(t *testing.T) {
 	})
 }
 
+// A sign of access nobody acted on within the stale hour (momentum was not running) does not cancel the reset the
+// limit states: the session still resumes then. A limit that states no reset has nothing left to wait for.
+func TestAStaleSignOfAccessLeavesTheStatedReset(t *testing.T) {
+	lis, _ := time.LoadLocation("Europe/Lisbon")
+	at := time.Date(2026, 3, 4, 9, 0, 0, 0, lis)
+	limit := stopped(func(s *Stop) {
+		s.Phase, s.Error, s.At = sessions.NeedsYou, "You've hit your weekly limit · resets Mar 7, 9am (Europe/Lisbon)", at
+	})
+	sign, reset := at.Add(time.Hour), time.Date(2026, 3, 7, 9, 1, 0, 0, lis)
+	if d := Decide(limit, Tries{}, DefaultParams, probeAt(sign), sign.Add(time.Minute)); d.Verdict != Act || !d.At.Equal(sign) {
+		t.Fatalf("a fresh sign: %s at %s, want act at the sign", d.Verdict, d.At)
+	}
+	d := Decide(limit, Tries{}, DefaultParams, probeAt(sign), sign.Add(3*time.Hour))
+	if d.Verdict != Wait || !d.At.Equal(reset) || d.Stale {
+		t.Fatalf("a stale sign before the reset: %s at %s (stale %v), want wait at %s", d.Verdict, d.At, d.Stale, reset)
+	}
+	if d := Decide(limit, Tries{}, DefaultParams, probeAt(sign), reset.Add(time.Minute)); d.Verdict != Act || !d.At.Equal(reset) {
+		t.Fatalf("at the reset: %s at %s, want act at %s", d.Verdict, d.At, reset)
+	}
+	noReset := stopped(func(s *Stop) { s.Phase, s.Error, s.At = sessions.NeedsYou, "You've hit your usage limit", at })
+	if ErrorClass(noReset.Error) != Limit {
+		t.Fatalf("%q is no limit error", noReset.Error)
+	}
+	if d := Decide(noReset, Tries{}, DefaultParams, probeAt(sign), sign.Add(3*time.Hour)); d.Verdict != Skip || !d.Stale {
+		t.Fatalf("a stale sign with no reset: %s (stale %v), want a stale skip", d.Verdict, d.Stale)
+	}
+}
+
 func TestCutoffContinuesAHermesReplyCutAtItsLimit(t *testing.T) {
 	cut := "The model's reply was cut off before it finished (it hit its output length limit), so Hermes didn't run the incomplete action. Nothing was changed. Send `continue`, ask for the work in smaller steps, or raise max_tokens for this model."
 	hermes := stopped(func(s *Stop) { s.Tool, s.Where, s.Words = "hermes", "cli", Words(cut) })
