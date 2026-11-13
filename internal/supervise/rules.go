@@ -309,18 +309,23 @@ func access(s Stop, tries Tries, p Params, probe Probe) (Decision, bool) {
 	if n >= p.AccessTries {
 		return used(RuleAccess, n), true
 	}
+	why := map[string]string{Login: "the login expired", Limit: "a usage limit", Org: "the organization turned access off"}[class]
+	var back time.Time
+	backOK := false
+	if probe != nil {
+		back, backOK = probe.AccessBack(class, s.At)
+	}
 	if class == Limit {
-		if reset, ok := ResetAt(s.Error, s.At); ok {
+		// A limit resumes at the reset it states plus the grace, or once the probe shows access back, whichever
+		// comes first: the owner can restore access (credits, another plan) days before a weekly reset.
+		if reset, ok := ResetAt(s.Error, s.At); ok && (!backOK || !back.Before(reset.Add(p.ResetGrace))) {
 			text := fmt.Sprintf("%s The usage limit reset at %s. Continue where you left off.", Marker, reset.Local().Format("15:04"))
 			return wait(RuleAccess, reset.Add(p.ResetGrace), n+1, text, "a usage limit that resets at a stated time"), true
 		}
 	}
-	why := map[string]string{Login: "the login expired", Limit: "a usage limit", Org: "the organization turned access off"}[class]
-	if probe != nil {
-		if back, ok := probe.AccessBack(class, s.At); ok {
-			text := fmt.Sprintf("%s Access works again (%s before). Continue where you left off.", Marker, why)
-			return wait(RuleAccess, back, n+1, text, why+"; access works again since "+back.Local().Format("15:04")), true
-		}
+	if backOK {
+		text := fmt.Sprintf("%s Access works again (%s before). Continue where you left off.", Marker, why)
+		return wait(RuleAccess, back, n+1, text, why+"; access works again since "+back.Local().Format("15:04")), true
 	}
 	return Decision{Rule: RuleAccess, Verdict: Wait, Try: n + 1, Why: why + "; waiting for access to work again"}, true
 }
