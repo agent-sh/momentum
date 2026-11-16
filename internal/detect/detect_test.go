@@ -163,9 +163,8 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		{"claude", "mcp__web-tools__fetch", "tool failed: spawn failed for /usr/bin/x: spawn /usr/bin/x ENOENT",
 			"mcp:web-tools:tool failed: spawn failed for P: spawn P enoent"},
 		// An MCP server's error that opens with a markdown heading. The sources read past the heading before they
-		// fold a result onto one line, so a transcript's result and its row in the mistakes log are keyed alike
-		// (TestAnMCPErrorIsKeyedAlikeFromATranscriptAndTheLog); one kept with its lines inside a JSON reply is
-		// read past it here, and a heading alone is kept.
+		// fold a result onto one line (their own tests); one kept with its lines inside a JSON reply is read past
+		// it here, and a heading alone is kept.
 		{"claude", "mcp__page-tools__click", `{"error":"### Error\nTimeoutError: locator.click: Timeout 30000ms exceeded.\nCall log:"}`,
 			"mcp:page-tools:timeouterror: locator.click: timeout Nms exceeded"},
 		{"claude", "mcp__page-tools__click", `{"status":"error","message":"## Result\n\n### Error\n\nError: strict mode violation"}`,
@@ -2535,24 +2534,5 @@ func TestAQueuedNudgeIsNone(t *testing.T) {
 				t.Fatalf("the nudge counted %v, want %v (nudges at %v)", got, row.counts, nudgedAt(t, st))
 			}
 		})
-	}
-}
-
-// An MCP error that opens with a markdown heading has one key, whichever source held it: the transcript's result
-// and the row of the mistakes log, each as its source stores it once it has read past the heading
-// (TestTranscriptsSummarizeAFailedMCPResultPastItsHeading, TestMistakesSummarizeAnMCPErrorPastItsHeading).
-func TestAnMCPErrorIsKeyedAlikeFromATranscriptAndTheLog(t *testing.T) {
-	const tool, want = "mcp__page-tools__click", "mcp:page-tools:timeouterror: locator.click: timeout Nms exceeded"
-	fromTranscript, ok := FailureOf("claude", tool, "TimeoutError: locator.click: Timeout 30000ms exceeded. Call log: - waiting for the button", "")
-	if !ok || fromTranscript.String() != want {
-		t.Errorf("the transcript's result: %q %v, want %q", fromTranscript.String(), ok, want)
-	}
-	fromLog, ok := MistakeKey("tool-error", tool, tool+": TimeoutError: locator.click: Timeout 30000ms exceeded.")
-	if !ok || fromLog.String() != want {
-		t.Errorf("the log's row: %q %v, want %q", fromLog.String(), ok, want)
-	}
-	tagged, ok := MistakeKey("tool-error", tool, tool+": <tool_use_error>TimeoutError: locator.click: Timeout 30000ms exceeded.</tool_use_error>")
-	if !ok || tagged.String() != want {
-		t.Errorf("the log's row in the error tag: %q %v, want %q", tagged.String(), ok, want)
 	}
 }

@@ -833,7 +833,7 @@ func toPending(e evidence.Event, gitFlag func(harness, tool, input string) strin
 		n, out := textChars, e.ToolOutput
 		if e.IsError {
 			// an MCP server's error may open with a markdown heading that is the same for every error it has: the
-			// summary, one line, starts at what failed, as the mistakes source's row of it does
+			// summary, one line, starts at what failed
 			n, out = errorChars, toolresult.PastHeadings(e.ToolName, out)
 		}
 		p.texts, p.keep = cutHead(out, n)

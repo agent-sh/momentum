@@ -1068,8 +1068,8 @@ func TestTranscriptsReadAgainKeepTheModelEachEventWasStoredWith(t *testing.T) {
 	}
 }
 
-// A failed MCP result that opens with a markdown heading is summarized from what failed, as its row in the
-// mistakes log is, so the two are keyed alike; a result that did not fail keeps its heading.
+// A failed MCP result that opens with a markdown heading is summarized from what failed; a result that did not
+// fail keeps its heading.
 func TestTranscriptsSummarizeAFailedMCPResultPastItsHeading(t *testing.T) {
 	home := testHome(t)
 	writeLines(t, claudePath(home),

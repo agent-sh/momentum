@@ -266,14 +266,16 @@ func Shells() []string {
 	return out
 }
 
-// headingRe is a markdown heading line.
-var headingRe = regexp.MustCompile(`^#{1,6}[ \t]+\S`)
+// headingRe is a markdown line that frames a reply and says nothing of it: a heading, or a code fence's line.
+var headingRe = regexp.MustCompile("^(?:#{1,6}[ \\t]+\\S|```[\\w-]*[ \\t]*$)")
 
-// PastHeadings is an MCP tool's reply from its first line that is no markdown heading: a server that opens its
-// error with one (Playwright's "### Error") says what failed on the next line, and the heading is the same for
-// every error it has. Claude Code's error tag before the heading stays. A reply of headings only, and any other
-// tool's reply, is returned as it is: a shell's output may open with a line that starts with a number sign (a
-// compiler's package line, a comment). It reads lines, so it is for a reply before a store folds it onto one.
+// PastHeadings is an MCP tool's reply from its first line that is no markdown heading or code fence: a server
+// that opens its error with one (Playwright's "### Error") says what failed on the next line, and the heading is
+// the same for every error it has. It takes the line after as what failed; a server whose heading names the error
+// and whose next line only adds to it is read by that next line. Claude Code's error tag before the heading stays.
+// A reply of headings only, and any other tool's reply, is returned as it is: a shell's output may open with a
+// line that starts with a number sign (a compiler's package line, a comment). It reads lines, so it is for a reply
+// before a store folds it onto one.
 func PastHeadings(tool, text string) string {
 	if !strings.HasPrefix(tool, "mcp__") {
 		return text
@@ -285,7 +287,7 @@ func PastHeadings(tool, text string) string {
 	}
 	for {
 		line, after, more := strings.Cut(rest, "\n")
-		if !headingRe.MatchString(line) {
+		if !headingRe.MatchString(strings.TrimRight(line, "\r")) {
 			return tag + rest
 		}
 		if after = strings.TrimSpace(after); !more || after == "" || after == "</tool_use_error>" {
