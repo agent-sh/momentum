@@ -75,7 +75,7 @@ type Stop struct {
 	Slept, Woke     time.Time      // the machine's last suspend: a wait counts from its end when it began before the wait ended
 	OwnerAt         time.Time      // when the owner was last at the session: his last turn, a local command, a draft, or his opening it
 	TurnFor         string         // the owner's request the last turn served: the input that opened it, when it was his
-	Before          string         // when TurnFor only tells the session to go on (Nudge): the owner's last request before it that says more
+	Before          string         // when TurnFor only tells the session to go on (Nudge): the last request in the owner's own words before it
 	Started         time.Time      // when the session's process started; a stop before it is a past process's
 }
 
@@ -294,12 +294,13 @@ func transient(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
 // go on with. With no such request, one that opens with the marker or holds a `<`, or one that would make a
 // message act will not type, it is the fixed text. A request that only tells the session to go on ("." or
 // "resume", Nudge) names no work, and a session sent back to it took a look at its own state for the work: the
-// message then quotes the request before it (Before), and with none known sends the session to find it.
+// message then quotes the last request in his own words before it (Before), and says no more of it than that;
+// with none known it sends the session to find it.
 func TransientText(s Stop) string {
 	fixed := Marker + " Your last turn stopped on a transient API error. Continue where you left off."
 	if Nudge(s.TurnFor) {
 		if what := quotable(s.Before); what != "" && !Nudge(s.Before) {
-			text := fmt.Sprintf("%s Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on; the request before it was %q. Continue where you left off.", Marker, what)
+			text := fmt.Sprintf("%s Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on; the last request in their own words before it was %q. Continue where you left off.", Marker, what)
 			if act.CheckText(text) == nil {
 				return text
 			}

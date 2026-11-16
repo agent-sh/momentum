@@ -1242,9 +1242,9 @@ func TestATransientMessageNamesTheOwnersRequest(t *testing.T) {
 	}
 }
 
-// A turn the owner's nudge opened: the transient message quotes his newest request before the nudge from the
-// store, its retry serves the same turn, and a session whose store holds only the nudge is sent to find the
-// request.
+// A turn the owner's nudge opened: the transient message quotes the last request in his own words before the
+// nudge from the store, whether or not the store holds the nudge yet, its retry serves the same turn, and a
+// session whose store holds only the nudge is sent to find the request.
 func TestATransientMessageAfterANudgeNamesTheRequestBeforeIt(t *testing.T) {
 	st := testStore(t)
 	f := &fakeSender{}
@@ -1269,7 +1269,7 @@ func TestATransientMessageAfterANudgeNamesTheRequestBeforeIt(t *testing.T) {
 	put(after, 3, nudged.Add(-10*time.Minute), "resume")
 	put(after, 4, nudged, ".")
 	put(only, 1, nudged, ".")
-	// a prompt slash command between the request and the nudge is the request before it, and no turn of his words
+	// what came between the two is not looked at: a prompt slash command is no turn of his words
 	put(slash, 1, nudged.Add(-20*time.Minute), "build the release notes")
 	if _, err := st.Put(context.Background(), []store.Event{{Source: store.Transcripts, SourceKey: "sess-slash@2", TS: nudged.Add(-10 * time.Minute),
 		Session: StoreSession(slash), Actor: store.ActorHarness, Kind: "harness_text", Summary: "Summarize the digest below as facts.",
@@ -1277,24 +1277,29 @@ func TestATransientMessageAfterANudgeNamesTheRequestBeforeIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	put(slash, 3, nudged, ".")
-	run(t, sv, after, only, slash)
-	quoted := Marker + ` Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on; the request before it was "build the release notes". Continue where you left off.`
+	// the store is read every few minutes: the nudge that opened the turn is not in it yet, and the session's own
+	// last input says it
+	unheld := mk("sess-unheld", "%4")
+	put(unheld, 1, nudged.Add(-20*time.Minute), "build the release notes")
+	typed(unheld, "resume", nudged)
+	run(t, sv, after, only, slash, unheld)
+	quoted := Marker + ` Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on; the last request in their own words before it was "build the release notes". Continue where you left off.`
 	unknown := Marker + " Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on: continue the last real request before it, where you left off."
-	want := []string{"%1 " + quoted, "%2 " + unknown, "%3 " + unknown}
+	want := []string{"%1 " + quoted, "%2 " + unknown, "%3 " + quoted, "%4 " + quoted}
 	if strings.Join(f.sent, "|") != strings.Join(want, "|") {
 		t.Fatalf("sent %q, want %q", f.sent, want)
 	}
 	// Each message lands and its turn fails the same way: the second try says what the first said.
 	landed := now.Add(2 * time.Second)
-	for s, text := range map[*sessions.Session]string{after: quoted, only: unknown} {
+	for s, text := range map[*sessions.Session]string{after: quoted, only: unknown, unheld: quoted} {
 		lands(s, text, landed, false)
 		s.TurnBegan, s.Since = landed, t0.Add(3*time.Minute)
 	}
 	now = t0.Add(4 * time.Minute)
-	run(t, sv, after, only)
+	run(t, sv, after, only, unheld)
 	now = t0.Add(8 * time.Minute)
-	run(t, sv, after, only)
-	if want = append(want, "%1 "+quoted, "%2 "+unknown); strings.Join(f.sent, "|") != strings.Join(want, "|") {
+	run(t, sv, after, only, unheld)
+	if want = append(want, "%1 "+quoted, "%2 "+unknown, "%4 "+quoted); strings.Join(f.sent, "|") != strings.Join(want, "|") {
 		t.Fatalf("second tries: sent %q, want %q", f.sent, want)
 	}
 	// The store credits momentum's message to him, he nudges again and that turn fails too: the message of

@@ -298,7 +298,7 @@ func TestTheTransientMessageQuotesTheRequestTheTurnServed(t *testing.T) {
 // session read as a cue to look at its own state.
 func TestTheTransientMessageAfterANudgeQuotesTheRequestBeforeIt(t *testing.T) {
 	fixed := Marker + " Your last turn stopped on a transient API error. Continue where you left off."
-	quoted := Marker + ` Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on; the request before it was "rename the cache flag". Continue where you left off.`
+	quoted := Marker + ` Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on; the last request in their own words before it was "rename the cache flag". Continue where you left off.`
 	unknown := Marker + " Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on: continue the last real request before it, where you left off."
 	for _, nudge := range []string{".", " . ", "..", "resume", "Continue", "go on", "try again"} {
 		if got := TransientText(Stop{TurnFor: nudge, Before: "rename the cache flag"}); got != quoted {

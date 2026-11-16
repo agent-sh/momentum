@@ -156,7 +156,7 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 			}
 			continue
 		}
-		marks, err := sv.Store.OwnerTurns(ctx, StoreSession(s), 20)
+		marks, err := sv.Store.OwnerTurns(ctx, StoreSession(s), beforeTurns)
 		if err != nil {
 			return lines, err
 		}
@@ -180,13 +180,7 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 		}
 		presence := h.presence(s, ownerAt, answered)
 		stop := StopOf(s, presence)
-		before, err := sv.before(ctx, s, h, marks)
-		if err != nil {
-			return lines, err
-		}
-		if stop.TurnFor = h.turnFor(s, marks, before); stop.TurnFor != "" {
-			stop.Before = before
-		}
+		stop.TurnFor, stop.Before = h.turnFor(s, marks)
 		if !stop.RequestAt.IsZero() {
 			stop.ScreenIdle = h.idleAt[stop.RequestAt.UnixMilli()]
 		}
@@ -945,61 +939,53 @@ func (h past) his(m store.Mark) bool {
 // when it opened that turn or came while it ran, or when the input since is the transient message that already
 // quoted it (a retry serves the same request). Empty when something else opened the turn (a scheduled run, a
 // notification, another rule's message, a turn of his the store does not hold yet), when the harness dates
-// neither its user text nor its turn, or when the store holds no turn of his. before is the request before that
-// turn when it only tells the session to go on (Supervisor.before): the transient message quotes that one, and a
-// retry of it serves the same turn.
-func (h past) turnFor(s *sessions.Session, marks []store.Mark, before string) string {
+// neither its user text nor its turn, or when the store holds no turn of his.
+//
+// A turn that only tells the session to go on (Nudge) names no work, so before is then the last request in his
+// own words before it: his newest turn that says more, among the turns read (beforeTurns). Whatever else came
+// between the two is not looked at: the message says whose words it quotes and no more. The store is read every
+// few minutes and the first try comes sooner, so the nudge that opened the turn may not be in it yet: the
+// session's own last input then says so, when it is a nudge and no message of momentum's, and the store's
+// newest turn that says more is the request before it. A retry serves the same turn either way: the message for
+// a nudged turn quotes only the request before it.
+func (h past) turnFor(s *sessions.Session, marks []store.Mark) (turn, before string) {
 	m, ok := h.ownerMark(marks)
 	if !ok || s.UserAt.IsZero() && s.TurnBegan.IsZero() {
-		return ""
+		return "", ""
+	}
+	said := "" // his newest turn that says more than to go on
+	for _, b := range marks {
+		if h.his(b) && !Nudge(b.Summary) {
+			said = b.Summary
+			break
+		}
+	}
+	turn = m.Summary
+	if Nudge(turn) {
+		before = said
 	}
 	const skew = 2 * time.Second
+	const anyNudge = "." // the message for a nudged turn does not quote the nudge
 	opened := m.At
-	if l := h.last(); s.UserAt.After(opened) && l != nil && l.rule == RuleTransient && fold(lastUser(s)) == l.text && quotes(l.text, m.Summary, before) {
-		opened = s.UserAt
+	if l := h.last(); s.UserAt.After(opened) && l != nil && l.rule == RuleTransient && fold(lastUser(s)) == l.text {
+		switch {
+		case quotes(l.text, turn, before):
+			opened = s.UserAt
+		case quotes(l.text, anyNudge, said): // the retry of a turn whose nudge the store did not hold at its first try
+			return anyNudge, said
+		}
 	}
 	if s.UserAt.After(opened.Add(skew)) || s.TurnBegan.After(opened.Add(skew)) {
-		return ""
+		if u := lastUser(s); Nudge(u) && !h.ours(u) {
+			return u, said
+		}
+		return "", ""
 	}
-	return m.Summary
+	return turn, before
 }
 
 // beforeTurns is how many of the owner's last turns are read for his request before a nudge.
 const beforeTurns = 20
-
-// before is the owner's request before his last turn, when that turn only tells the session to go on (Nudge): his
-// newest turn before it that says more, among the last beforeTurns of his the store holds. Empty when his last
-// turn says more, when none of those turns does, and when another input of his came between the two that is no
-// turn of his words (a prompt slash command, a shell escape, a Hermes steer, as the replay reads them): the
-// request before the nudge is then one this layer cannot quote, and the older turn is not it.
-func (sv *Supervisor) before(ctx context.Context, s *sessions.Session, h past, marks []store.Mark) (string, error) {
-	m, ok := h.ownerMark(marks)
-	if !ok || !Nudge(m.Summary) {
-		return "", nil
-	}
-	for _, b := range marks {
-		if !b.At.Before(m.At) || !h.his(b) || Nudge(b.Summary) {
-			continue
-		}
-		const most = 2000
-		evs, err := sv.Store.Events(ctx, store.Query{Source: store.Transcripts, Session: StoreSession(s), Main: true,
-			Kinds: []string{"harness_text"}, Since: b.At, Until: m.At, Limit: most})
-		if err != nil || len(evs) >= most { // more than it reads: what came between is not known
-			return "", err
-		}
-		for _, e := range evs {
-			meta := map[string]any{}
-			if e.Meta != "" {
-				json.Unmarshal([]byte(e.Meta), &meta)
-			}
-			if role(e, meta) == "owner" {
-				return "", nil
-			}
-		}
-		return b.Summary, nil
-	}
-	return "", nil
-}
 
 // quotes reports whether text, folded, is the transient message for a turn request opened, with the request
 // before it when request is a nudge.
