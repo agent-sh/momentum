@@ -265,3 +265,27 @@ func Shells() []string {
 	slices.Sort(out)
 	return out
 }
+
+// headingRe is a markdown heading line.
+var headingRe = regexp.MustCompile(`^#{1,6}[ \t]+\S`)
+
+// PastHeadings is an MCP tool's reply from its first line that is no markdown heading: a server that opens its
+// error with one (Playwright's "### Error") says what failed on the next line, and the heading is the same for
+// every error it has. A reply of headings only, and any other tool's reply, is returned as it is: a shell's
+// output may open with a line that starts with a number sign (a compiler's package line, a comment).
+func PastHeadings(tool, text string) string {
+	if !strings.HasPrefix(tool, "mcp__") {
+		return text
+	}
+	rest := strings.TrimSpace(text)
+	for {
+		line, after, more := strings.Cut(rest, "\n")
+		if !headingRe.MatchString(line) {
+			return rest
+		}
+		if after = strings.TrimSpace(after); !more || after == "" {
+			return text
+		}
+		rest = after
+	}
+}

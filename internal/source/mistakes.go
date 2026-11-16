@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/store"
+	"github.com/agent-sh/momentum/internal/toolresult"
 )
 
 // Mistakes reads a Claude Code mistakes log: one JSON row per tool error, deny, hold, interrupt, rejection
@@ -157,7 +158,8 @@ func (m Mistakes) event(line []byte, ref string) (store.Event, string) {
 // summaries to the owner's own words. What the agent said before a correction stays in the source (Ref).
 func (m Mistakes) attribute(row mistakeRow) (store.Actor, string, map[string]any) {
 	extra := map[string]any{}
-	detail := firstLine(row.Detail)
+	// an MCP server's error may open with a markdown heading that is the same for every error it has
+	detail := firstLine(toolresult.PastHeadings(row.Tool, row.Detail))
 	toolText := func() string {
 		s := row.Tool
 		if detail != "" {

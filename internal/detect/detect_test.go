@@ -162,6 +162,13 @@ func TestAFailureIsKeyedByItsOriginAndWords(t *testing.T) {
 		{"claude", "Bash", "Permission to use Bash with command timeout 60 /usr/bin/curl -s x has been denied.", "harness:claude:permission to use bash with command curl has been denied"},
 		{"claude", "mcp__web-tools__fetch", "tool failed: spawn failed for /usr/bin/x: spawn /usr/bin/x ENOENT",
 			"mcp:web-tools:tool failed: spawn failed for P: spawn P enoent"},
+		// an MCP server's error that opens with a markdown heading is keyed by the line after it; one that is only
+		// a heading keeps it, and another tool's leading number sign is no heading
+		{"claude", "mcp__page-tools__click", "### Error\nTimeoutError: locator.click: Timeout 30000ms exceeded.",
+			"mcp:page-tools:timeouterror: locator.click: timeout Nms exceeded"},
+		{"claude", "mcp__page-tools__click", "## Result\n\n### Error\n\nError: strict mode violation", "mcp:page-tools:error: strict mode violation"},
+		{"claude", "mcp__page-tools__click", "### Error", "mcp:page-tools:### error"},
+		{"claude", "Write", "# heading\nthe note names no source", "tool:write:# heading"},
 		// a fetch that got no response is keyed by its URL's host, lower case, its port and user info off; a URL with
 		// no host keeps the words
 		{"claude", "mcp__web-tools__fetch", "error: error sending request for url (https://site-a.example/page)", "host:mcp-web-tools-fetch:site-a.example"},

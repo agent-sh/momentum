@@ -1174,7 +1174,8 @@ func failureOf(harness, tool, text, call string) (FailureKey, bool) {
 	}
 	switch {
 	case strings.HasPrefix(tool, "mcp__"):
-		return toolKey(tool, toolOrigin(tool), text, call)
+		// a server that opens its error with a markdown heading says what failed on the next line
+		return toolKey(tool, toolOrigin(tool), toolresult.PastHeadings(tool, text), call)
 	case harness == "hermes" && strings.HasPrefix(text, "{"):
 		if m := hermesErrRe.FindStringSubmatch(text); m != nil && m[1] != "" {
 			msg := unescape(m[1])

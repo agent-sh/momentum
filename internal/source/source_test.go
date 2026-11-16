@@ -672,3 +672,34 @@ func TestACompleteRadarRunRecordsTheReadOfItsFeedbackToo(t *testing.T) {
 		}
 	}
 }
+
+// An MCP server's error that opens with a markdown heading is summarized by the line after it, so its rows are
+// not all one heading; a heading alone is kept, and another tool's leading number sign is its first line.
+func TestMistakesSummarizeAnMCPErrorPastItsHeading(t *testing.T) {
+	st := openStore(t)
+	log := filepath.Join(t.TempDir(), "events.jsonl")
+	row := func(minute int, tool, detail string) string {
+		b, err := json.Marshal(map[string]string{"ts": fmt.Sprintf("2026-01-02T10:%02d:00", minute), "session": "s1", "kind": "tool-error", "tool": tool, "detail": detail})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b) + "\n"
+	}
+	appendFile(t, log, row(0, "mcp__page-tools__click", "### Error\nTimeoutError: locator.click: Timeout 30000ms exceeded.\nCall log:")+
+		row(1, "mcp__page-tools__evaluate", "### Error")+row(2, "Bash", "# example.com/pkg\n./a.go:3:1: undefined: x"))
+	ingest(t, Mistakes{Path: log, Loc: jerusalem(t)}, st)
+	want := map[string]string{
+		"mcp__page-tools__click":    "mcp__page-tools__click: TimeoutError: locator.click: Timeout 30000ms exceeded.",
+		"mcp__page-tools__evaluate": "mcp__page-tools__evaluate: ### Error",
+		"Bash":                      "Bash: # example.com/pkg",
+	}
+	got := all(t, st, "mistakes")
+	if len(got) != len(want) {
+		t.Fatalf("%d events, want %d", len(got), len(want))
+	}
+	for _, e := range got {
+		if e.Summary != want[e.Tool] {
+			t.Errorf("%s: summary %q, want %q", e.Tool, e.Summary, want[e.Tool])
+		}
+	}
+}
