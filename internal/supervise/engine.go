@@ -180,7 +180,7 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 		}
 		presence := h.presence(s, ownerAt, answered)
 		stop := StopOf(s, presence)
-		stop.TurnFor = h.turnFor(s, marks)
+		stop.TurnFor, stop.Before = h.turnFor(s, marks)
 		if !stop.RequestAt.IsZero() {
 			stop.ScreenIdle = h.idleAt[stop.RequestAt.UnixMilli()]
 		}
@@ -916,45 +916,60 @@ func (h past) ownerTurn(marks []store.Mark) time.Time {
 
 func (h past) ownerMark(marks []store.Mark) (store.Mark, bool) {
 	for _, m := range marks {
-		if h.ours(m.Summary) {
-			continue
+		if h.his(m) {
+			return m, true
 		}
-		near := false
-		for _, s := range h.sends {
-			near = near || !m.At.Before(s.at.Add(-2*time.Second)) && m.At.Before(s.at.Add(DeliveryWait))
-		}
-		if near && strings.HasPrefix(strings.TrimSpace(m.Summary), Marker) {
-			continue
-		}
-		return m, true
 	}
 	return store.Mark{}, false
+}
+
+// his reports whether a turn the store credits to the owner is his (ownerTurn).
+func (h past) his(m store.Mark) bool {
+	if h.ours(m.Summary) {
+		return false
+	}
+	near := false
+	for _, s := range h.sends {
+		near = near || !m.At.Before(s.at.Add(-2*time.Second)) && m.At.Before(s.at.Add(DeliveryWait))
+	}
+	return !near || !strings.HasPrefix(strings.TrimSpace(m.Summary), Marker)
 }
 
 // turnFor is the owner's request the session's last turn served, as the store keeps his words: his last turn,
 // when it opened that turn or came while it ran, or when the input since is the transient message that already
 // quoted it (a retry serves the same request). Empty when something else opened the turn (a scheduled run, a
 // notification, another rule's message, a turn of his the store does not hold yet), when the harness dates
-// neither its user text nor its turn, or when the store holds no turn of his.
-func (h past) turnFor(s *sessions.Session, marks []store.Mark) string {
+// neither its user text nor its turn, or when the store holds no turn of his. When that turn only tells the
+// session to go on (Nudge), before is his newest turn before it that says more, among the turns read; the
+// transient message quotes that one, and a retry of it serves the same turn.
+func (h past) turnFor(s *sessions.Session, marks []store.Mark) (turn, before string) {
 	m, ok := h.ownerMark(marks)
 	if !ok || s.UserAt.IsZero() && s.TurnBegan.IsZero() {
-		return ""
+		return "", ""
+	}
+	if Nudge(m.Summary) {
+		for _, b := range marks {
+			if b.At.Before(m.At) && h.his(b) && !Nudge(b.Summary) {
+				before = b.Summary
+				break
+			}
+		}
 	}
 	const skew = 2 * time.Second
 	opened := m.At
-	if l := h.last(); s.UserAt.After(opened) && l != nil && l.rule == RuleTransient && fold(lastUser(s)) == l.text && quotes(l.text, m.Summary) {
+	if l := h.last(); s.UserAt.After(opened) && l != nil && l.rule == RuleTransient && fold(lastUser(s)) == l.text && quotes(l.text, m.Summary, before) {
 		opened = s.UserAt
 	}
 	if s.UserAt.After(opened.Add(skew)) || s.TurnBegan.After(opened.Add(skew)) {
-		return ""
+		return "", ""
 	}
-	return m.Summary
+	return m.Summary, before
 }
 
-// quotes reports whether text, folded, is the transient message that quotes request.
-func quotes(text, request string) bool {
-	return text == fold(act.SafeText(TransientText(Stop{TurnFor: request})))
+// quotes reports whether text, folded, is the transient message for a turn request opened, with the request
+// before it when request is a nudge.
+func quotes(text, request, before string) bool {
+	return text == fold(act.SafeText(TransientText(Stop{TurnFor: request, Before: before})))
 }
 
 // lastUser is the text of the session's last user-role entry, from its activity log.

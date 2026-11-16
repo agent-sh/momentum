@@ -715,9 +715,17 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 	var openRef, openFrom string
 	// the owner's request the last turn served (Stop.TurnFor): his last input, until another input opens a turn
 	// that is not the transient message that quoted it. An exit keeps it, as the live layer keeps the store's turn.
-	var request string
+	// said is his last input that says more than to go on (Nudge): the request before a nudge (Stop.Before), which
+	// the live layer reads from the store's turns whatever came between.
+	var request, said string
+	before := func() string {
+		if Nudge(request) {
+			return said
+		}
+		return ""
+	}
 	stopOf := func(at time.Time, nextRef string) Stop {
-		s := Stop{Key: id, Tool: harness, At: prevAt, Words: words, OwnerAt: ownerAt, ResumedAt: resumed, TurnFor: request}
+		s := Stop{Key: id, Tool: harness, At: prevAt, Words: words, OwnerAt: ownerAt, ResumedAt: resumed, TurnFor: request, Before: before()}
 		for k, t := range tasks {
 			if t.kind == "monitor" && !t.until.IsZero() && t.until.Before(at) {
 				delete(tasks, k)
@@ -959,6 +967,9 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			ownerAt = e.TS
 			if !strings.HasPrefix(strings.TrimSpace(e.Summary), Marker) { // a message of momentum's the store credited to him
 				request = e.Summary
+				if !Nudge(e.Summary) {
+					said = e.Summary
+				}
 			}
 			if e.Kind == "owner_text" {
 				if v, ok := strings.CutPrefix(why, "entrypoint "); ok {
@@ -1006,7 +1017,7 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			}
 			lastMainUser = true
 		case "momentum": // a message momentum typed: it opens a turn, and is not the owner's
-			if !quotes(fold(e.Summary), request) { // only a transient retry serves the request it quoted
+			if !quotes(fold(e.Summary), request, before()) { // only a transient retry serves the request it quoted
 				request = ""
 			}
 			resumed = time.Time{}

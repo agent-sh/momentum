@@ -311,3 +311,31 @@ func TestANotificationThatSentNoRequestKeepsTheErrorStop(t *testing.T) {
 		}
 	}
 }
+
+// The replay reads the request before a nudge as the live layer does: a turn the owner's "." opened is cut off,
+// and the transient message quotes his request before it, through the retry that quoted it and through a run of
+// the session's own between the two.
+func TestTheReplayOfATurnANudgeOpenedQuotesTheRequestBeforeIt(t *testing.T) {
+	st := testStore(t)
+	quoted := Marker + ` Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on; the request before it was "deploy it". Continue where you left off.`
+	b := newTimeline(t, "nudged-turn").owner(0, "deploy it", "turn_duration").say(10*time.Second, "Deployed half of it.").
+		notify(time.Minute, "<task-notification> <task-id>b1</task-id> <status>completed</status> </task-notification>").
+		say(10*time.Second, "Nothing is waiting.").
+		owner(10*time.Minute, ".", "turn_duration").say(10*time.Second, "Going on.").apiError(time.Minute, err503)
+	first := b.at
+	b.add(time.Minute, "harness_text", store.ActorHarness, "", quoted, `{"input_kind":"typed","prior":"turn_duration","why":"momentum supervise"}`).
+		say(10*time.Second, "Going on.").apiError(time.Minute, err503)
+	second := b.at
+	b.owner(time.Hour, "thanks", "turn_duration").put(st)
+	until := t0.Add(5 * time.Hour)
+	points, err := History(context.Background(), st, t0.Add(-time.Hour), until)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := Replay(points, nil, DefaultParams, probeAt(time.Time{}), until)
+	for name, at := range map[string]time.Time{"the turn the nudge opened": first, "the retry's turn": second} {
+		if r := outcomeOf(t, rs, "nudged-turn", at); r.Decision.Rule != RuleTransient || r.Decision.Text != quoted {
+			t.Errorf("%s: %+v", name, r.Decision)
+		}
+	}
+}

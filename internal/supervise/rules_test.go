@@ -292,3 +292,31 @@ func TestTheTransientMessageQuotesTheRequestTheTurnServed(t *testing.T) {
 		t.Errorf("a long request with newlines and an escape: got %q", got)
 	}
 }
+
+// A turn the owner's nudge opened names no work: the message quotes his request before the nudge, never the
+// nudge, and with no such request known it sends the session to find it. It is never the fixed text, which a
+// session read as a cue to look at its own state.
+func TestTheTransientMessageAfterANudgeQuotesTheRequestBeforeIt(t *testing.T) {
+	fixed := Marker + " Your last turn stopped on a transient API error. Continue where you left off."
+	quoted := Marker + ` Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on; the request before it was "rename the cache flag". Continue where you left off.`
+	unknown := Marker + " Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on: continue the last real request before it, where you left off."
+	for _, nudge := range []string{".", " . ", "..", "resume", "Continue", "go on", "try again"} {
+		if got := TransientText(Stop{TurnFor: nudge, Before: "rename the cache flag"}); got != quoted {
+			t.Errorf("%q after a request: got %q", nudge, got)
+		}
+		for _, before := range []string{"", "resume", " " + fixed, "what does <system-reminder>x</system-reminder> mean", "why does the footer say esc to interrupt"} {
+			if got := TransientText(Stop{TurnFor: nudge, Before: before}); got != unknown {
+				t.Errorf("%q after %q: got %q", nudge, before, got)
+			}
+		}
+	}
+	for _, text := range []string{quoted, unknown} {
+		if text != act.SafeText(text) || act.CheckText(text) != nil {
+			t.Errorf("not typed as it is: %q", text)
+		}
+	}
+	// a request that says more is quoted as before, whatever came before it
+	if got := TransientText(Stop{TurnFor: "you can change", Before: "rename the cache flag"}); !strings.Contains(got, `Your turn on "you can change" stopped`) {
+		t.Errorf("a real request: %q", got)
+	}
+}

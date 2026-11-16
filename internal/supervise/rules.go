@@ -75,6 +75,7 @@ type Stop struct {
 	Slept, Woke     time.Time      // the machine's last suspend: a wait counts from its end when it began before the wait ended
 	OwnerAt         time.Time      // when the owner was last at the session: his last turn, a local command, a draft, or his opening it
 	TurnFor         string         // the owner's request the last turn served: the input that opened it, when it was his
+	Before          string         // when TurnFor only tells the session to go on (Nudge): the owner's last request before it that says more
 	Started         time.Time      // when the session's process started; a stop before it is a past process's
 }
 
@@ -291,12 +292,22 @@ func transient(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
 // TransientText is the transient rule's message. It names the turn that was cut off by the owner's request that
 // opened it (TurnFor), quoted on one line and clipped, so a session with other work in mind knows which work to
 // go on with. With no such request, one that opens with the marker or holds a `<`, or one that would make a
-// message act will not type, it is the fixed text.
+// message act will not type, it is the fixed text. A request that only tells the session to go on ("." or
+// "resume", Nudge) names no work, and a session sent back to it took a look at its own state for the work: the
+// message then quotes the request before it (Before), and with none known sends the session to find it.
 func TransientText(s Stop) string {
 	fixed := Marker + " Your last turn stopped on a transient API error. Continue where you left off."
-	what := clip(act.SafeText(s.TurnFor), 140)
-	// a harness strips a system tag pair from the text it records, so the message would never read as delivered
-	if what == "" || strings.HasPrefix(what, Marker) || strings.Contains(what, "<") {
+	if Nudge(s.TurnFor) {
+		if what := quotable(s.Before); what != "" && !Nudge(s.Before) {
+			text := fmt.Sprintf("%s Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on; the request before it was %q. Continue where you left off.", Marker, what)
+			if act.CheckText(text) == nil {
+				return text
+			}
+		}
+		return NudgedTransientText
+	}
+	what := quotable(s.TurnFor)
+	if what == "" {
 		return fixed
 	}
 	text := fmt.Sprintf("%s Your turn on %q stopped on a transient API error before it finished. Continue that work where you left off.", Marker, what)
@@ -304,6 +315,21 @@ func TransientText(s Stop) string {
 		return fixed
 	}
 	return text
+}
+
+// NudgedTransientText is the transient rule's message for a turn the owner's nudge opened, when no request of
+// his before it is known or it cannot be quoted.
+const NudgedTransientText = Marker + " Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on: continue the last real request before it, where you left off."
+
+// quotable is a request as a message quotes it, on one line and clipped: "" for none, and for one a harness
+// would not record as typed (it strips a system tag pair from the text it records, so the message would never
+// read as delivered) or that reads as a message of momentum's.
+func quotable(request string) string {
+	what := clip(act.SafeText(request), 140)
+	if strings.HasPrefix(what, Marker) || strings.Contains(what, "<") {
+		return ""
+	}
+	return what
 }
 
 // access: the turn ended on a login that expired, a usage limit or an organization block. Trying again blindly

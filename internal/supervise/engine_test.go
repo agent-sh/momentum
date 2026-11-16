@@ -1241,3 +1241,52 @@ func TestATransientMessageNamesTheOwnersRequest(t *testing.T) {
 		t.Fatalf("second tries: sent %q, want %q", f.sent, want)
 	}
 }
+
+// A turn the owner's nudge opened: the transient message quotes his newest request before the nudge from the
+// store, its retry serves the same turn, and a session whose store holds only the nudge is sent to find the
+// request.
+func TestATransientMessageAfterANudgeNamesTheRequestBeforeIt(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0.Add(time.Minute)
+	sv := supervisor(st, f, &now)
+	nudged := t0.Add(-5 * time.Minute)
+	mk := func(key, pane string) *sessions.Session {
+		s := erroring()
+		s.Key, s.Pane, s.UserAt, s.TurnBegan = key, pane, nudged, nudged
+		return s
+	}
+	put := func(s *sessions.Session, n int, at time.Time, text string) {
+		t.Helper()
+		if _, err := st.Put(context.Background(), []store.Event{{Source: store.Transcripts, SourceKey: fmt.Sprintf("%s@%d", s.Key, n), TS: at,
+			Session: StoreSession(s), Actor: store.ActorOwner, Kind: "owner_text", Summary: text}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after, only := mk("sess-after", "%1"), mk("sess-only", "%2")
+	put(after, 1, nudged.Add(-time.Hour), "an older request")
+	put(after, 2, nudged.Add(-20*time.Minute), "build the release notes")
+	put(after, 3, nudged.Add(-10*time.Minute), "resume")
+	put(after, 4, nudged, ".")
+	put(only, 1, nudged, ".")
+	run(t, sv, after, only)
+	quoted := Marker + ` Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on; the request before it was "build the release notes". Continue where you left off.`
+	unknown := Marker + " Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on: continue the last real request before it, where you left off."
+	want := []string{"%1 " + quoted, "%2 " + unknown}
+	if strings.Join(f.sent, "|") != strings.Join(want, "|") {
+		t.Fatalf("sent %q, want %q", f.sent, want)
+	}
+	// Each message lands and its turn fails the same way: the second try says what the first said.
+	landed := now.Add(2 * time.Second)
+	for s, text := range map[*sessions.Session]string{after: quoted, only: unknown} {
+		lands(s, text, landed, false)
+		s.TurnBegan, s.Since = landed, t0.Add(3*time.Minute)
+	}
+	now = t0.Add(4 * time.Minute)
+	run(t, sv, after, only)
+	now = t0.Add(8 * time.Minute)
+	run(t, sv, after, only)
+	if want = append(want, "%1 "+quoted, "%2 "+unknown); strings.Join(f.sent, "|") != strings.Join(want, "|") {
+		t.Fatalf("second tries: sent %q, want %q", f.sent, want)
+	}
+}
