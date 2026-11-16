@@ -19,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/agent-sh/momentum/internal/detect"
+	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/sandbox"
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -264,9 +265,16 @@ func unfinishedHold(c store.Case, old Package, kind, place string) string {
 // caseTarget is where the investigation of the case's episode put its fix: a repository's name, or a configuration
 // file's home-relative path.
 func (r *Runner) caseTarget(ctx context.Context, c store.Case) (string, string, error) {
+	repo, config, _, err := r.caseFixPlace(ctx, c)
+	return repo, config, err
+}
+
+// caseFixPlace is caseTarget with the place the investigation named for a fix that is in neither: a file outside
+// the loop's repositories, another project, a program maintained elsewhere, a setting of the owner's.
+func (r *Runner) caseFixPlace(ctx context.Context, c store.Case) (repo, config, place string, err error) {
 	entries, err := r.Store.CaseLog(ctx, c.ID)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	for i := len(entries) - 1; i >= 0; i-- {
 		if entries[i].Action != repoAction {
@@ -275,32 +283,60 @@ func (r *Runner) caseTarget(ctx context.Context, c store.Case) (string, string, 
 		var record struct {
 			Repo    string `json:"repo"`
 			Config  string `json:"config"`
+			Place   string `json:"place"`
 			Episode int64  `json:"episode"`
 		}
 		if err := json.Unmarshal([]byte(entries[i].Detail), &record); err != nil {
-			return "", "", recordError{err}
+			return "", "", "", recordError{err}
 		}
 		if record.Episode != c.Episode {
-			return "", "", nil
+			return "", "", "", nil
 		}
 		if record.Repo != "" && !repoName.MatchString(record.Repo) {
-			return "", "", recordError{errors.New("invalid investigation repository name")}
+			return "", "", "", recordError{errors.New("invalid investigation repository name")}
 		}
 		if record.Config != "" {
 			if _, err := configTargetName(record.Config); err != nil || record.Repo != "" {
-				return "", "", recordError{errors.New("invalid investigation configuration path")}
+				return "", "", "", recordError{errors.New("invalid investigation configuration path")}
 			}
 		}
-		return record.Repo, record.Config, nil
+		if record.Repo != "" || record.Config != "" {
+			record.Place = ""
+		}
+		return record.Repo, record.Config, plainClip(plain.Line(record.Place), placeMax), nil
 	}
-	return "", "", nil
+	return "", "", "", nil
 }
 
-// waitingRepoNote is the report's note of a case in testing whose investigation named no repository.
-func waitingRepoNote(c store.Case, at time.Time) store.Note {
-	return store.Note{ID: repoNoteID(c.ID), Kind: store.NoteProblem, Importance: store.ImportanceLow,
+// noRepoHold is the hold of a case in testing whose investigation named no place for its fix, and elsewherePrefix
+// opens the hold of one whose investigation named a place the loop does not build in.
+const (
+	noRepoHold      = "waits for a repository: the investigation named none"
+	elsewherePrefix = "its fix is outside the loop's repositories: "
+)
+
+// repoHold is the hold of a case in testing with no repository or configuration file to build in, by the place its
+// investigation named for the fix.
+func repoHold(place string) string {
+	if place == "" {
+		return noRepoHold
+	}
+	return elsewherePrefix + place
+}
+
+// waitingRepoNote is the report's note of a case in testing whose investigation named no repository, by its hold.
+// A fix the investigation placed elsewhere says where and what it is: an agent or the owner makes it there.
+func waitingRepoNote(c store.Case, hold string, at time.Time) store.Note {
+	n := store.Note{ID: repoNoteID(c.ID), Kind: store.NoteProblem, Importance: store.ImportanceLow,
 		Title:  "The loop's case " + c.ID + " waits for a repository",
 		Detail: "The investigation named no code repository or configuration file. The case stays in testing without a build run.", At: at}
+	if place, ok := strings.CutPrefix(hold, elsewherePrefix); ok {
+		n.Title = plainClip("The fix for case "+c.ID+" is outside the loop's reach: "+place, 120)
+		n.Detail = "The investigation found the fix and where it lives: " + place + ". The fix: " + plainClip(plain.Line(c.NextTest), 700) +
+			" The loop builds only in its own repositories, so the case stays in testing without a build run. An agent or the owner makes the change there and closes the case (momentum case close " +
+			c.ID + " --reason already-solved --why WHY), or declines it (--reason not-worth-it)."
+	}
+	return n
 }
 
 func (r *Runner) buildPackage(ctx context.Context, c store.Case, run store.LoopRun) (Package, error) {

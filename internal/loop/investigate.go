@@ -22,7 +22,8 @@ The owner's words are only what his own turns say (actor owner); never credit hi
 // investigationSchema is an investigation's report.
 const investigationSchema = `{"type":"object","additionalProperties":false,"required":["mechanism","fix","summary"],
 "properties":{"mechanism":{"type":"string"},"alternatives":{"type":"array","items":{"type":"string"}},
-"fix":{"type":"string"},"summary":{"type":"string"},"repo":{"type":"string"}}}`
+"fix":{"type":"string"},"summary":{"type":"string"},"repo":{"type":"string"},
+"place":{"type":"string"},"nothing_to_fix":{"type":"boolean"}}}`
 
 // investigationConfigSchema is an investigation's report while configuration targets are on: it may name a config.
 var investigationConfigSchema = strings.Replace(investigationSchema, `"repo":{"type":"string"}`, `"repo":{"type":"string"},"config":{"type":"string"}`, 1)
@@ -54,7 +55,7 @@ func (r *Runner) configTargetsFor(c store.Case) bool {
 const findingsInstruction = "Keep findings as you go in /out/findings.md. Use the headings ## Mechanism, ## Alternatives ruled out, ## Fix, and ## Summary. End with your report of the same fields."
 
 // liveQuestion is what a live investigation is asked.
-const liveQuestion = "Find the root cause of this problem and the fix. State the mechanism, the alternatives ruled out, the fix, and a summary. If the fix is code in a repository under /ro/repos, also report repo as its NAME. Build no change."
+const liveQuestion = "Find the root cause of this problem and the fix. State the mechanism, the alternatives ruled out, the fix, and a summary. If the fix is code in a repository under /ro/repos, also report repo as its NAME. If the fix is anywhere else (a file on the machine outside those repositories, another project's code, a program maintained elsewhere, a setting only the owner can change), report place: where it is, on one line. If nothing should be changed (the tool worked as it is meant to, a provider refused or failed by itself, the problem ended), report nothing_to_fix as true and say why in the summary. Build no change."
 
 // configQuestion is added to the live question while configuration targets are on.
 const configQuestion = " If the fix is the content of one existing configuration file under /ro/config instead, report config as its path there (such as /ro/config/.config/agents/NAME.md) and no repo. The host proposes a change only to a file the owner listed, and an agent applies it."
@@ -264,6 +265,14 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 		}
 		u.Alternatives = alternatives // nil keeps the case's
 	}
+	if reported && f.NothingToFix && mechanism != "" && f.Repo == "" && f.Config == "" {
+		// the investigation's conclusion ends the case: nothing holds it for a fix nobody will make
+		why := strings.TrimSpace(f.Report)
+		if !holdsText(why) {
+			why = mechanism
+		}
+		return st.RecordDismissed(ctx, caseID, episode, u, nothingToFix+plainClip(plain.Line(why), dismissedMax), actor)
+	}
 	if undecided != "" && u.Status != store.CaseTesting {
 		return st.RecordUndecided(ctx, caseID, episode, u, undecided, actor)
 	}
@@ -289,11 +298,18 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 			// one change has one target: a report naming both names neither, and the case waits for one
 			f.Repo, f.Config = "", ""
 		}
+		place := ""
+		if f.Repo == "" && f.Config == "" { // a fix the loop can build has no other place
+			if place = plainClip(plain.Line(strings.TrimSpace(f.Place)), placeMax); !holdsText(place) {
+				place = ""
+			}
+		}
 		raw, err := json.Marshal(struct {
 			Repo    string `json:"repo"`
 			Config  string `json:"config,omitempty"`
+			Place   string `json:"place,omitempty"`
 			Episode int64  `json:"episode"`
-		}{f.Repo, f.Config, episode})
+		}{f.Repo, f.Config, place, episode})
 		if err != nil {
 			return store.Case{}, false, err
 		}
@@ -302,10 +318,19 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 	return st.RecordFindings(ctx, caseID, episode, u, actor, notes...)
 }
 
+// nothingToFix opens the reason of a case its investigation closed: it found no change worth making anywhere.
+const nothingToFix = "the investigation found nothing to fix: "
+
+// dismissedMax and placeMax bound that reason's quote of the summary, and the place a finding names.
+const (
+	dismissedMax = 600
+	placeMax     = 160
+)
+
 // cleanFinding cleans whole fields before the case store clips them.
 func cleanFinding(ctx context.Context, f finding) (finding, error) {
 	f.Alternatives = append([]string(nil), f.Alternatives...)
-	texts := []*string{&f.Mechanism, &f.Fix, &f.Report, &f.Repo, &f.Config}
+	texts := []*string{&f.Mechanism, &f.Fix, &f.Report, &f.Repo, &f.Config, &f.Place}
 	for i := range f.Alternatives {
 		texts = append(texts, &f.Alternatives[i])
 	}
@@ -365,6 +390,11 @@ type finding struct {
 	Report       string   `json:"summary"`
 	Repo         string   `json:"repo,omitempty"`
 	Config       string   `json:"config,omitempty"`
+	// Place is where the fix lives when it is neither: a file outside the loop's repositories, another project, a
+	// program maintained elsewhere, a setting of the owner's. NothingToFix says the investigation found no change
+	// worth making anywhere.
+	Place        string `json:"place,omitempty"`
+	NothingToFix bool   `json:"nothing_to_fix,omitempty"`
 }
 
 // nativeFinding reads an investigation's report; alternatives given as one text, not the schema's list, are kept.
@@ -373,12 +403,14 @@ func nativeFinding(res Result) finding {
 		Mechanism          string
 		Alternatives       json.RawMessage
 		Fix, Summary, Repo string
-		Config             string
+		Config, Place      string
+		NothingToFix       bool `json:"nothing_to_fix"`
 	}
 	if json.Unmarshal(res.Report, &rep) != nil {
 		return finding{}
 	}
-	f := finding{Mechanism: rep.Mechanism, Fix: rep.Fix, Report: rep.Summary, Repo: rep.Repo, Config: rep.Config}
+	f := finding{Mechanism: rep.Mechanism, Fix: rep.Fix, Report: rep.Summary, Repo: rep.Repo, Config: rep.Config,
+		Place: rep.Place, NothingToFix: rep.NothingToFix}
 	if json.Unmarshal(rep.Alternatives, &f.Alternatives) != nil {
 		var one string
 		if json.Unmarshal(rep.Alternatives, &one) == nil && strings.TrimSpace(one) != "" {

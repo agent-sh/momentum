@@ -1035,7 +1035,7 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 			}
 			pkg, had, _ := load() // the package as selection has it: a dry pass's settlement, else the one on disk
 			var unread recordError
-			if repo, target, err := r.caseTarget(ctx, c); errors.As(err, &unread) {
+			if repo, target, place, err := r.caseFixPlace(ctx, c); errors.As(err, &unread) {
 				// one case's record: the case waits with a low note, and its family's next case runs
 				if !dry {
 					if noteErr := r.noteBuildSkip(ctx, c, "record", err.Error()); noteErr != nil { // it ends with testing (recordNotePrefix)
@@ -1049,7 +1049,7 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 				return nil, "", err
 			} else if repo == "" && target == "" {
 				if !dry {
-					r.keepHold(ctx, c, "waits for a repository: the investigation named none", true)
+					r.keepHold(ctx, c, repoHold(place), true)
 				}
 				passed = append(passed, c.ID+" waits for a repository")
 				continue

@@ -838,6 +838,21 @@ func (s *Store) RecordUndecided(ctx context.Context, id string, episode int64, u
 	if strings.TrimSpace(why) == "" {
 		why = "the investigation named no mechanism and fix"
 	}
+	return s.recordClosed(ctx, id, episode, u, Insufficient, why, actor)
+}
+
+// RecordDismissed is RecordFindings for an investigation that concluded nothing should be changed (a tool that
+// worked as it is meant to, a provider's own refusal, a problem that ended): its findings go into the case, which it
+// then closes as not worth it, why saying so, in the same transaction and under the same guard. Cases' rule brings
+// the case back once as much evidence again comes in, so a conclusion that was wrong is looked at again.
+func (s *Store) RecordDismissed(ctx context.Context, id string, episode int64, u CaseUpdate, why, actor string) (Case, bool, error) {
+	if strings.TrimSpace(why) == "" {
+		return Case{}, false, badCase("a close says why")
+	}
+	return s.recordClosed(ctx, id, episode, u, NotWorthIt, why, actor)
+}
+
+func (s *Store) recordClosed(ctx context.Context, id string, episode int64, u CaseUpdate, reason CloseReason, why, actor string) (Case, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Case{}, false, err
@@ -855,7 +870,7 @@ func (s *Store) RecordUndecided(ctx context.Context, id string, episode int64, u
 	if c, err = updateCase(ctx, tx, c, u, actor, now); err != nil {
 		return Case{}, false, err
 	}
-	if err := closeAs(ctx, tx, c.ID, Insufficient, why, actor, now); err != nil {
+	if err := closeAs(ctx, tx, c.ID, reason, why, actor, now); err != nil {
 		return Case{}, false, err
 	}
 	if c, err = getCase(ctx, tx, c.ID); err != nil {

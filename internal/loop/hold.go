@@ -119,7 +119,7 @@ func (r *Runner) markHold(ctx context.Context, c store.Case, why string, waiting
 	n := store.Note{ID: holdNotePrefix(c.ID) + hex.EncodeToString(sum[:]), Kind: store.NoteProblem,
 		Importance: store.ImportanceLow, At: r.now(), Title: "The loop's build for case " + c.ID + " is held", Detail: clean}
 	if waiting {
-		n = waitingRepoNote(c, r.now())
+		n = waitingRepoNote(c, clean, r.now())
 	}
 	if _, err := r.Store.PutNote(ctx, n); err != nil {
 		return err
