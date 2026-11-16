@@ -1,6 +1,7 @@
 package supervise
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -290,5 +291,23 @@ func TestTheTransientMessageQuotesTheRequestTheTurnServed(t *testing.T) {
 	if !strings.Contains(got, quote) || !strings.Contains(got, `…" stopped on`) || got != act.SafeText(got) || act.CheckText(got) != nil ||
 		len([]rune(got)) > 140+120 {
 		t.Errorf("a long request with newlines and an escape: got %q", got)
+	}
+}
+
+// A turn the owner's nudge opened ("." after a cut-off turn) names no work: the message must not quote the nudge,
+// nor fall back to the fixed text, which a session read as "check your own state" and dropped his request.
+func TestTheTransientMessageAfterANudgeSendsTheSessionToTheRequestBeforeIt(t *testing.T) {
+	fixed := Marker + " Your last turn stopped on a transient API error. Continue where you left off."
+	for _, nudge := range []string{".", " . ", "..", "resume", "Continue", "go on", "try again"} {
+		got := TransientText(Stop{TurnFor: nudge})
+		if got == fixed || strings.Contains(got, fmt.Sprintf("%q", strings.TrimSpace(nudge))) {
+			t.Errorf("%q: the message names no work: %q", nudge, got)
+		}
+		if !strings.Contains(got, "last real request before it") || got != act.SafeText(got) || act.CheckText(got) != nil {
+			t.Errorf("%q: got %q", nudge, got)
+		}
+	}
+	if got := TransientText(Stop{TurnFor: "you can change"}); !strings.Contains(got, `"you can change"`) {
+		t.Errorf("a real request is still quoted: %q", got)
 	}
 }

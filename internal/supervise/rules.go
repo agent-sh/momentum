@@ -291,9 +291,14 @@ func transient(s Stop, tries Tries, p Params, _ Probe) (Decision, bool) {
 // TransientText is the transient rule's message. It names the turn that was cut off by the owner's request that
 // opened it (TurnFor), quoted on one line and clipped, so a session with other work in mind knows which work to
 // go on with. With no such request, one that opens with the marker or holds a `<`, or one that would make a
-// message act will not type, it is the fixed text.
+// message act will not type, it is the fixed text. A request that is only a nudge ("." or "resume", Nudge) names
+// no work: quoting it, or the fixed text, let a session take a check of its own state for the work and drop the
+// owner's request. The message then sends it to his last request before the nudge.
 func TransientText(s Stop) string {
 	fixed := Marker + " Your last turn stopped on a transient API error. Continue where you left off."
+	if Nudge(s.TurnFor) {
+		return NudgedTransientText
+	}
 	what := clip(act.SafeText(s.TurnFor), 140)
 	// a harness strips a system tag pair from the text it records, so the message would never read as delivered
 	if what == "" || strings.HasPrefix(what, Marker) || strings.Contains(what, "<") {
@@ -305,6 +310,9 @@ func TransientText(s Stop) string {
 	}
 	return text
 }
+
+// NudgedTransientText is the transient rule's message when the turn it continues opened on the owner's nudge.
+const NudgedTransientText = Marker + " Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on: continue his last real request before it, where you left off, not a check of your own state."
 
 // access: the turn ended on a login that expired, a usage limit or an organization block. Trying again blindly
 // meets the same wall, so it resumes once a probe shows access works again, or at the reset time a limit states.
