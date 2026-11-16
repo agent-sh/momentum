@@ -1524,6 +1524,12 @@ func (r *Runner) completeStep(ctx context.Context, c store.Case, run store.LoopR
 		}
 		return done
 	}
+	if run.Step == StepBuild {
+		// the build ran and nothing held it: the notes of its earlier waits are over
+		if noteErr := r.endBuildWaits(ctx, c.ID); noteErr != nil {
+			r.logf("build waiting notes: %v", noteErr)
+		}
+	}
 	return Done{Family: c.Family, Case: c.ID, Step: run.Step, Run: run, Refused: res.Refused}
 }
 

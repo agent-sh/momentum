@@ -161,6 +161,37 @@ func (r *Runner) doneHoldNotes(ctx context.Context, caseID string) error {
 	return nil
 }
 
+// buildWaitNote is a note of a case's build that waited at a stage (noteBuildSkip), by its id. The notes with an end
+// of their own are not among them: a hold's, a record's, a base's, a proposal's, a person's, the capacity gate's.
+func buildWaitNote(caseID string, n store.Note) bool {
+	if !strings.HasPrefix(n.ID, "loop-build:"+store.IDPart(caseID)+":") || n.ID == capacityNoteID(caseID) {
+		return false
+	}
+	for _, own := range []string{holdNotePrefix(caseID), recordNotePrefix(caseID), baseNotePrefix(caseID), proposalNotePrefix(caseID), personNotePrefix(caseID)} {
+		if strings.HasPrefix(n.ID, own) {
+			return false
+		}
+	}
+	return true
+}
+
+// endBuildWaits resolves a case's standing notes of builds that waited at a stage: the build got past its waits (a
+// run of it ended that nothing held), so what they say is over.
+func (r *Runner) endBuildWaits(ctx context.Context, caseID string) error {
+	notes, err := r.Store.Notes(ctx)
+	if err != nil {
+		return err
+	}
+	for _, n := range notes {
+		if n.Done.IsZero() && buildWaitNote(caseID, n) {
+			if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // policyPrepareNote is a note a build's preparation left for a refusal of the configuration's policy, before the
 // runner held such builds itself: the hold's note takes its place.
 func policyPrepareNote(caseID string, n store.Note) bool {
@@ -178,7 +209,9 @@ func policyPrepareNote(caseID string, n store.Note) bool {
 // releaseHolds ends the holds of cases that are no longer in testing (closed, merged, deployed or back to
 // investigating): their hold ended with the step it held. A case not closed whose log still holds a hold gets the
 // hold's end, so a return to testing in the same episode records its hold again; every such case's standing notes
-// resolve, and its base and proposal notes end. The notes are read and scanned once, whatever the count of cases.
+// resolve, those of a build that waited at a stage among them (a case out of testing builds no more, so nothing else
+// would end them), and its base and proposal notes end. The notes are read and scanned once, whatever the count of
+// cases.
 func (r *Runner) releaseHolds(ctx context.Context, cs []store.Case) error {
 	gone := map[string]string{} // the cases out of testing, by their part of a note's id
 	for _, c := range cs {
@@ -245,7 +278,7 @@ func (r *Runner) releaseHolds(ctx context.Context, cs []store.Case) error {
 		hold, record, repo, hand := holdNotePrefix(c.ID), recordNotePrefix(c.ID), repoNoteID(c.ID), handNoteID(c.ID)
 		for _, n := range mine {
 			if n.Done.IsZero() && (strings.HasPrefix(n.ID, hold) || strings.HasPrefix(n.ID, record) || n.ID == repo || n.ID == hand || strings.HasPrefix(n.ID, hand+":") ||
-				strings.HasPrefix(n.ID, personNotePrefix(c.ID))) {
+				strings.HasPrefix(n.ID, personNotePrefix(c.ID)) || buildWaitNote(c.ID, n)) {
 				if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
 					return err
 				}
