@@ -180,7 +180,13 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 		}
 		presence := h.presence(s, ownerAt, answered)
 		stop := StopOf(s, presence)
-		stop.TurnFor, stop.Before = h.turnFor(s, marks)
+		before, err := sv.before(ctx, s, h, marks)
+		if err != nil {
+			return lines, err
+		}
+		if stop.TurnFor = h.turnFor(s, marks, before); stop.TurnFor != "" {
+			stop.Before = before
+		}
 		if !stop.RequestAt.IsZero() {
 			stop.ScreenIdle = h.idleAt[stop.RequestAt.UnixMilli()]
 		}
@@ -939,21 +945,13 @@ func (h past) his(m store.Mark) bool {
 // when it opened that turn or came while it ran, or when the input since is the transient message that already
 // quoted it (a retry serves the same request). Empty when something else opened the turn (a scheduled run, a
 // notification, another rule's message, a turn of his the store does not hold yet), when the harness dates
-// neither its user text nor its turn, or when the store holds no turn of his. When that turn only tells the
-// session to go on (Nudge), before is his newest turn before it that says more, among the turns read; the
-// transient message quotes that one, and a retry of it serves the same turn.
-func (h past) turnFor(s *sessions.Session, marks []store.Mark) (turn, before string) {
+// neither its user text nor its turn, or when the store holds no turn of his. before is the request before that
+// turn when it only tells the session to go on (Supervisor.before): the transient message quotes that one, and a
+// retry of it serves the same turn.
+func (h past) turnFor(s *sessions.Session, marks []store.Mark, before string) string {
 	m, ok := h.ownerMark(marks)
 	if !ok || s.UserAt.IsZero() && s.TurnBegan.IsZero() {
-		return "", ""
-	}
-	if Nudge(m.Summary) {
-		for _, b := range marks {
-			if b.At.Before(m.At) && h.his(b) && !Nudge(b.Summary) {
-				before = b.Summary
-				break
-			}
-		}
+		return ""
 	}
 	const skew = 2 * time.Second
 	opened := m.At
@@ -961,9 +959,46 @@ func (h past) turnFor(s *sessions.Session, marks []store.Mark) (turn, before str
 		opened = s.UserAt
 	}
 	if s.UserAt.After(opened.Add(skew)) || s.TurnBegan.After(opened.Add(skew)) {
-		return "", ""
+		return ""
 	}
-	return m.Summary, before
+	return m.Summary
+}
+
+// beforeTurns is how many of the owner's last turns are read for his request before a nudge.
+const beforeTurns = 20
+
+// before is the owner's request before his last turn, when that turn only tells the session to go on (Nudge): his
+// newest turn before it that says more, among the last beforeTurns of his the store holds. Empty when his last
+// turn says more, when none of those turns does, and when another input of his came between the two that is no
+// turn of his words (a prompt slash command, a shell escape, a Hermes steer, as the replay reads them): the
+// request before the nudge is then one this layer cannot quote, and the older turn is not it.
+func (sv *Supervisor) before(ctx context.Context, s *sessions.Session, h past, marks []store.Mark) (string, error) {
+	m, ok := h.ownerMark(marks)
+	if !ok || !Nudge(m.Summary) {
+		return "", nil
+	}
+	for _, b := range marks {
+		if !b.At.Before(m.At) || !h.his(b) || Nudge(b.Summary) {
+			continue
+		}
+		const most = 2000
+		evs, err := sv.Store.Events(ctx, store.Query{Source: store.Transcripts, Session: StoreSession(s), Main: true,
+			Kinds: []string{"harness_text"}, Since: b.At, Until: m.At, Limit: most})
+		if err != nil || len(evs) >= most { // more than it reads: what came between is not known
+			return "", err
+		}
+		for _, e := range evs {
+			meta := map[string]any{}
+			if e.Meta != "" {
+				json.Unmarshal([]byte(e.Meta), &meta)
+			}
+			if role(e, meta) == "owner" {
+				return "", nil
+			}
+		}
+		return b.Summary, nil
+	}
+	return "", nil
 }
 
 // quotes reports whether text, folded, is the transient message for a turn request opened, with the request

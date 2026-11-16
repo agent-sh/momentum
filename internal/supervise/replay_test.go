@@ -339,3 +339,35 @@ func TestTheReplayOfATurnANudgeOpenedQuotesTheRequestBeforeIt(t *testing.T) {
 		}
 	}
 }
+
+// The replay drops the request before a nudge where the live layer does: a prompt slash command came between the
+// two, which is the request before the nudge and no turn of his words; or the request is further back than the
+// turns the live layer reads.
+func TestTheReplayOfATurnANudgeOpenedQuotesNoRequestItCannotName(t *testing.T) {
+	st := testStore(t)
+	unknown := Marker + " Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on: continue the last real request before it, where you left off."
+	slash := newTimeline(t, "slash-between").owner(0, "deploy it", "turn_duration").say(10*time.Second, "Deployed.").
+		add(time.Minute, "harness_text", store.ActorHarness, "", "Summarize the digest below as facts.", `{"input_kind":"slash","why":"local command"}`).
+		say(10*time.Second, "Summarized.").
+		owner(10*time.Minute, ".", "turn_duration").say(10*time.Second, "Going on.").apiError(time.Minute, err503)
+	slashAt := slash.at
+	slash.owner(time.Hour, "thanks", "turn_duration").put(st)
+	far := newTimeline(t, "far-back").owner(0, "deploy it", "turn_duration").say(10*time.Second, "Deployed half of it.")
+	for i := 0; i < beforeTurns; i++ {
+		far.owner(time.Minute, ".", "turn_duration").say(10*time.Second, "Going on.")
+	}
+	far.apiError(time.Minute, err503)
+	farAt := far.at
+	far.owner(time.Hour, "thanks", "turn_duration").put(st)
+	until := t0.Add(5 * time.Hour)
+	points, err := History(context.Background(), st, t0.Add(-time.Hour), until)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := Replay(points, nil, DefaultParams, probeAt(time.Time{}), until)
+	for session, at := range map[string]time.Time{"slash-between": slashAt, "far-back": farAt} {
+		if r := outcomeOf(t, rs, session, at); r.Decision.Rule != RuleTransient || r.Decision.Text != unknown {
+			t.Errorf("%s: %+v", session, r.Decision)
+		}
+	}
+}

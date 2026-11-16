@@ -715,11 +715,13 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 	var openRef, openFrom string
 	// the owner's request the last turn served (Stop.TurnFor): his last input, until another input opens a turn
 	// that is not the transient message that quoted it. An exit keeps it, as the live layer keeps the store's turn.
-	// said is his last input that says more than to go on (Nudge): the request before a nudge (Stop.Before), which
-	// the live layer reads from the store's turns whatever came between.
+	// said is the request before a nudge (Stop.Before), as the live layer reads it (Supervisor.before): his last turn
+	// of his own words that says more than to go on (Nudge), among his last beforeTurns turns (saidTurns counts the
+	// turns since it), and none once another input of his came after it that is no turn of his words.
 	var request, said string
+	saidTurns := 0
 	before := func() string {
-		if Nudge(request) {
+		if Nudge(request) && saidTurns < beforeTurns {
 			return said
 		}
 		return ""
@@ -967,8 +969,13 @@ func timeline(id string, evs []store.Event, until time.Time) []Point {
 			ownerAt = e.TS
 			if !strings.HasPrefix(strings.TrimSpace(e.Summary), Marker) { // a message of momentum's the store credited to him
 				request = e.Summary
-				if !Nudge(e.Summary) {
-					said = e.Summary
+				switch {
+				case e.Kind != "owner_text": // a slash command, a shell escape, a steer: the store keeps no turn of his for it
+					said, saidTurns = "", 0
+				case !Nudge(e.Summary):
+					said, saidTurns = e.Summary, 0
+				default:
+					saidTurns++
 				}
 			}
 			if e.Kind == "owner_text" {

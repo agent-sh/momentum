@@ -1263,16 +1263,24 @@ func TestATransientMessageAfterANudgeNamesTheRequestBeforeIt(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	after, only := mk("sess-after", "%1"), mk("sess-only", "%2")
+	after, only, slash := mk("sess-after", "%1"), mk("sess-only", "%2"), mk("sess-slash", "%3")
 	put(after, 1, nudged.Add(-time.Hour), "an older request")
 	put(after, 2, nudged.Add(-20*time.Minute), "build the release notes")
 	put(after, 3, nudged.Add(-10*time.Minute), "resume")
 	put(after, 4, nudged, ".")
 	put(only, 1, nudged, ".")
-	run(t, sv, after, only)
+	// a prompt slash command between the request and the nudge is the request before it, and no turn of his words
+	put(slash, 1, nudged.Add(-20*time.Minute), "build the release notes")
+	if _, err := st.Put(context.Background(), []store.Event{{Source: store.Transcripts, SourceKey: "sess-slash@2", TS: nudged.Add(-10 * time.Minute),
+		Session: StoreSession(slash), Actor: store.ActorHarness, Kind: "harness_text", Summary: "Summarize the digest below as facts.",
+		Meta: `{"input_kind":"slash","why":"local command"}`}}); err != nil {
+		t.Fatal(err)
+	}
+	put(slash, 3, nudged, ".")
+	run(t, sv, after, only, slash)
 	quoted := Marker + ` Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on; the request before it was "build the release notes". Continue where you left off.`
 	unknown := Marker + " Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on: continue the last real request before it, where you left off."
-	want := []string{"%1 " + quoted, "%2 " + unknown}
+	want := []string{"%1 " + quoted, "%2 " + unknown, "%3 " + unknown}
 	if strings.Join(f.sent, "|") != strings.Join(want, "|") {
 		t.Fatalf("sent %q, want %q", f.sent, want)
 	}
@@ -1288,5 +1296,17 @@ func TestATransientMessageAfterANudgeNamesTheRequestBeforeIt(t *testing.T) {
 	run(t, sv, after, only)
 	if want = append(want, "%1 "+quoted, "%2 "+unknown); strings.Join(f.sent, "|") != strings.Join(want, "|") {
 		t.Fatalf("second tries: sent %q, want %q", f.sent, want)
+	}
+	// The store credits momentum's message to him, he nudges again and that turn fails too: the message of
+	// momentum's between his request and the nudge is not his request.
+	again := t0.Add(20 * time.Minute)
+	put(after, 5, landed, quoted)
+	put(after, 6, again, ".")
+	typed(after, ".", again)
+	after.TurnBegan, after.Since = again, again.Add(30*time.Second)
+	now = again.Add(2 * time.Minute)
+	lines, err := sv.Run(context.Background(), []*sessions.Session{after}, map[int]uint64{42: 9})
+	if err != nil || len(lines) != 1 || lines[0].Rule != RuleTransient || lines[0].Text != quoted {
+		t.Fatalf("a nudge after momentum's message: %+v %v", lines, err)
 	}
 }
