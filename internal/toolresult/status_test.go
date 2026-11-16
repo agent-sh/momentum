@@ -99,3 +99,27 @@ func TestAnEnvelopeIsReadByItsTopLevel(t *testing.T) {
 		}
 	}
 }
+
+func TestPastHeadingsReadsAnMCPReplyFromItsFirstLineThatIsNoHeading(t *testing.T) {
+	const mcp = "mcp__page-tools__click"
+	for _, c := range []struct{ name, tool, text, want string }{
+		{"a heading then the error", mcp, "### Error\nTimeoutError: the click timed out\nCall log:", "TimeoutError: the click timed out\nCall log:"},
+		{"two headings and blank lines", mcp, "\n## Result\n\n### Error\n\nError: strict mode violation\n", "Error: strict mode violation"},
+		{"CRLF", mcp, "### Error\r\nboom\r\n", "boom"},
+		{"the error tag before the heading", mcp, "<tool_use_error>### Error\nboom</tool_use_error>", "<tool_use_error>boom</tool_use_error>"},
+		{"no heading", mcp, " boom\nmore ", "boom\nmore"},
+		{"a heading alone", mcp, "### Error", "### Error"},
+		{"headings only", mcp, "## Result\n### Error\n\n", "## Result\n### Error\n\n"},
+		{"a heading alone in the error tag", mcp, "<tool_use_error>### Error</tool_use_error>", "<tool_use_error>### Error</tool_use_error>"},
+		{"number signs and no text", mcp, "###\nboom", "###\nboom"},
+		{"a tag, no heading", mcp, "#tag\nboom", "#tag\nboom"},
+		{"seven number signs", mcp, "####### deep\nboom", "####### deep\nboom"},
+		{"empty", mcp, "", ""},
+		{"a shell's package line", "Bash", "# example.com/pkg\n./a.go:3:1: undefined: x", "# example.com/pkg\n./a.go:3:1: undefined: x"},
+		{"another tool's heading", "Write", "### Error\nboom", "### Error\nboom"},
+	} {
+		if got := PastHeadings(c.tool, c.text); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}

@@ -686,9 +686,11 @@ func TestMistakesSummarizeAnMCPErrorPastItsHeading(t *testing.T) {
 		return string(b) + "\n"
 	}
 	appendFile(t, log, row(0, "mcp__page-tools__click", "### Error\nTimeoutError: locator.click: Timeout 30000ms exceeded.\nCall log:")+
-		row(1, "mcp__page-tools__evaluate", "### Error")+row(2, "Bash", "# example.com/pkg\n./a.go:3:1: undefined: x"))
+		row(1, "mcp__page-tools__evaluate", "### Error")+row(2, "Bash", "# example.com/pkg\n./a.go:3:1: undefined: x")+
+		row(3, "mcp__page-tools__fill", "<tool_use_error>### Error\nError: strict mode violation</tool_use_error>"))
 	ingest(t, Mistakes{Path: log, Loc: jerusalem(t)}, st)
 	want := map[string]string{
+		"mcp__page-tools__fill":     "mcp__page-tools__fill: <tool_use_error>Error: strict mode violation</tool_use_error>",
 		"mcp__page-tools__click":    "mcp__page-tools__click: TimeoutError: locator.click: Timeout 30000ms exceeded.",
 		"mcp__page-tools__evaluate": "mcp__page-tools__evaluate: ### Error",
 		"Bash":                      "Bash: # example.com/pkg",

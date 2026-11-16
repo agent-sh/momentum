@@ -1067,3 +1067,25 @@ func TestTranscriptsReadAgainKeepTheModelEachEventWasStoredWith(t *testing.T) {
 		t.Fatalf("after reading again: %s, want %s", got, want)
 	}
 }
+
+// A failed MCP result that opens with a markdown heading is summarized from what failed, as its row in the
+// mistakes log is, so the two are keyed alike; a result that did not fail keeps its heading.
+func TestTranscriptsSummarizeAFailedMCPResultPastItsHeading(t *testing.T) {
+	home := testHome(t)
+	writeLines(t, claudePath(home),
+		claudeLine(0, `"type":"user","uuid":"u0","promptId":"p0",`+typed+`,"message":{"role":"user","content":"click through the form"}`),
+		claudeLine(1, `"type":"assistant","uuid":"a1","message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"mcp__page-tools__click","input":{"target":"#go"}},{"type":"tool_use","id":"toolu_02","name":"mcp__page-tools__snapshot","input":{}}]}`),
+		claudeLine(2, `"type":"user","uuid":"u2","message":{"role":"user","content":[{"tool_use_id":"toolu_01","type":"tool_result","content":"### Error\nTimeoutError: locator.click: Timeout 30000ms exceeded.\nCall log:\n  - waiting for the button","is_error":true}]}`),
+		claudeLine(2, `"type":"user","uuid":"u3","message":{"role":"user","content":[{"tool_use_id":"toolu_02","type":"tool_result","content":"### Page\nthe form is open"}]}`),
+	)
+	st := openStore(t)
+	ingest(t, transcripts(home), st)
+	evs := all(t, st, "transcripts")
+	failed := find(t, evs, "tool_result", "locator.click")
+	if want := "TimeoutError: locator.click: Timeout 30000ms exceeded. Call log: - waiting for the button"; failed.Summary != want || metaOf(t, failed)["is_error"] != true {
+		t.Fatalf("the failed result: %q, want %q", failed.Summary, want)
+	}
+	if ok := find(t, evs, "tool_result", "the form is open"); ok.Summary != "### Page the form is open" {
+		t.Fatalf("a result that did not fail: %q", ok.Summary)
+	}
+}

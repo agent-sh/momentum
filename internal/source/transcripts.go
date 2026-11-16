@@ -830,11 +830,13 @@ func toPending(e evidence.Event, gitFlag func(harness, tool, input string) strin
 		}
 	case evidence.KindToolResult:
 		e.IsError = toolresult.Failed(e.Harness, e.ToolName, e.ToolOutput, e.IsError)
-		n := textChars
+		n, out := textChars, e.ToolOutput
 		if e.IsError {
-			n = errorChars
+			// an MCP server's error may open with a markdown heading that is the same for every error it has: the
+			// summary, one line, starts at what failed, as the mistakes source's row of it does
+			n, out = errorChars, toolresult.PastHeadings(e.ToolName, out)
 		}
-		p.texts, p.keep = cutHead(e.ToolOutput, n)
+		p.texts, p.keep = cutHead(out, n)
 	default: // harness text, a compaction's summary, and kinds tacit adds later
 		p.texts, p.keep = cutHead(e.Text, textChars)
 	}

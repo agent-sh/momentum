@@ -1174,8 +1174,7 @@ func failureOf(harness, tool, text, call string) (FailureKey, bool) {
 	}
 	switch {
 	case strings.HasPrefix(tool, "mcp__"):
-		// a server that opens its error with a markdown heading says what failed on the next line
-		return toolKey(tool, toolOrigin(tool), toolresult.PastHeadings(tool, text), call)
+		return toolKey(tool, toolOrigin(tool), text, call)
 	case harness == "hermes" && strings.HasPrefix(text, "{"):
 		if m := hermesErrRe.FindStringSubmatch(text); m != nil && m[1] != "" {
 			msg := unescape(m[1])
@@ -1232,7 +1231,10 @@ func toolKey(tool, origin, msg, call string) (FailureKey, bool) {
 	if origin == "mcp:agent-chrome-bridge" && closedTabRe.MatchString(msg) {
 		return FailureKey{}, false
 	}
-	msg = firstClause(msg)
+	// An MCP server that opens its error with a markdown heading says what failed on the next line. The sources
+	// read past it before they fold a result onto one line; an error kept with its lines (inside a JSON reply)
+	// is read past it here.
+	msg = firstClause(toolresult.PastHeadings(tool, msg))
 	if h := unansweredHost(msg); h != "" {
 		return FailureKey{Origin: "host:" + slug(tool, 30), Text: h}, true
 	}
