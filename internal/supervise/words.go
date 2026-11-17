@@ -85,17 +85,36 @@ func tail(words string) string {
 	return words
 }
 
-var reSentence = regexp.MustCompile(`[^.!?]+(?:[.!?]+|$)`)
+// reSentenceEnd is where a sentence may end: its marks, what closes a quote, a bracket or an emphasis after them,
+// and a space.
+var reSentenceEnd = regexp.MustCompile("[.!?]+[\"'”’)\\]*_`]*\\s+")
 
-// lastSentences are the last n sentences of the words' tail.
-func lastSentences(words string, n int) []string {
-	ss := reSentence.FindAllString(tail(words), -1)
+// sentences splits a text where its sentences end: at a mark that a space follows, when what comes next does not
+// begin with a small letter, and at the end. A mark inside a token ("v2.1", "config.yaml", "docs/plan.md") ends
+// nothing, and neither does an abbreviation's ("e.g. two columns"): the rest would read as a sentence of its own,
+// without what it hangs on.
+func sentences(text string) []string {
 	var out []string
-	for _, s := range ss {
+	add := func(s string) {
 		if s = strings.TrimSpace(s); s != "" {
 			out = append(out, s)
 		}
 	}
+	start := 0
+	for _, m := range reSentenceEnd.FindAllStringIndex(text, -1) {
+		if r, _ := utf8.DecodeRuneInString(text[m[1]:]); unicode.IsLower(r) {
+			continue
+		}
+		add(text[start:m[1]])
+		start = m[1]
+	}
+	add(text[start:])
+	return out
+}
+
+// lastSentences are the last n sentences of the words' tail.
+func lastSentences(words string, n int) []string {
+	out := sentences(tail(words))
 	if len(out) > n {
 		out = out[len(out)-n:]
 	}
@@ -132,13 +151,7 @@ func asking(ss []string) string {
 // Question is the sentence of a whole text, the agent's last, that asks the owner something: the last of its last
 // two sentences that does, or "". Words keep only the ends of a long text, so a question there can be cut.
 func Question(text string) string {
-	ss := reSentence.FindAllString(fold(reTrailer.ReplaceAllString(text, " ")), -1)
-	var out []string
-	for _, s := range ss {
-		if s = strings.TrimSpace(s); s != "" {
-			out = append(out, s)
-		}
-	}
+	out := sentences(fold(reTrailer.ReplaceAllString(text, " ")))
 	if len(out) > 2 {
 		out = out[len(out)-2:]
 	}
@@ -149,10 +162,9 @@ func Question(text string) string {
 // check when something finishes, a wait it says it is in, or a step it announced and did not take. "" when the
 // words end the work, ask the owner, or say nothing of the kind.
 //
-// Two sentences are never a promise. One whose start the store cut: what it hangs on may be in the part that is gone
-// ("If you approve it, I'll build the page" kept as "ve it, I'll build the page"), so it cannot be told from an offer
-// that waits for the owner. And one that waits on another session's word ("waiting for NAME's answer", "when NAME
-// says it has"): that session's message opens a turn, so something will wake it.
+// A sentence whose start the store cut is no promise: what it hangs on may be in the part that is gone ("If you
+// approve it, I'll build the page" kept as "ve it, I'll build the page"), so it cannot be told from an offer that
+// waits for the owner.
 func Promise(words string) string {
 	if AsksOwner(words) {
 		return ""
@@ -161,11 +173,11 @@ func Promise(words string) string {
 	if len(ss) > 0 && reFinal.MatchString(ss[len(ss)-1]) {
 		return ""
 	}
-	cut := cutSentence(words)
-	for i := len(ss) - 1; i >= 0; i-- {
-		if ss[i] == cut || waitsOnPeer(ss[i]) {
-			continue
-		}
+	first := 0
+	if cutInside(words) && len(sentences(tail(words))) <= len(ss) {
+		first = 1 // the first of them is the tail's first sentence, and its start is gone
+	}
+	for i := len(ss) - 1; i >= first; i-- {
 		if rePromise.MatchString(ss[i]) || reStep.MatchString(ss[i]) {
 			return ss[i]
 		}
@@ -173,35 +185,20 @@ func Promise(words string) string {
 	return ""
 }
 
-// cutSentence is the first sentence of the words' tail when the store cut the words inside it, so that the
-// sentence lacks its start: the tail begins with a small letter, a digit or a mark, as the middle of a sentence
-// does. "" for words kept whole, and for a tail that begins as a sentence does.
-func cutSentence(words string) string {
+// reWholeTail is a tail that begins with the end of the sentence before it: its first sentence is whole.
+var reWholeTail = regexp.MustCompile("^[.!]+[\"'”’)\\]*_`]*\\s")
+
+// cutInside reports words the store cut inside a sentence, so that the first sentence of their tail lacks its
+// start. A tail is known to begin where a sentence does only when it opens with the mark that ended the one before:
+// a capital letter says nothing ("…, I'll build" begins with one too), and a question mark says the sentence before
+// asked something this one may answer to. A promise whose sentence fills the tail to the byte is lost with them.
+func cutInside(words string) bool {
 	words = reTrailer.ReplaceAllString(words, " ")
-	if !strings.Contains(words, "… ") || tail(words) == strings.TrimSpace(words[:strings.LastIndex(words, "… ")]) {
-		return "" // kept whole, or the tail is the start (the end was a harness's trailer)
+	i := strings.LastIndex(words, "… ")
+	if i < 0 || tail(words) == strings.TrimSpace(words[:i]) {
+		return false // kept whole, or the tail is the start (the end was a harness's trailer)
 	}
-	// the cut may fall on the end of the sentence before: its mark and the space after it are not this one's start
-	t := strings.TrimLeft(tail(words), ".!? ")
-	if r, _ := utf8.DecodeRuneInString(t); unicode.IsUpper(r) {
-		return "" // the tail begins where a sentence does: nothing of its first sentence reads as missing
-	}
-	if ss := lastSentences(words, 1<<30); len(ss) > 0 {
-		return ss[0]
-	}
-	return ""
-}
-
-// rePeerWait is a wait on another session's word, by its name: its answer, or its saying something.
-var rePeerWait = regexp.MustCompile(`(?i)\bwaiting (?:for|on) ([\w-]+)(?:'s|’s) (?:answer|reply|response|message|word|go-ahead|ok|review)\b|\b(?:when|once|after|until) ([\w-]+) (?:says|replies|answers|confirms|responds|agrees|reports back)\b`)
-
-// notANamedPeer are the words that stand where a session's name would and name none: the work itself, the owner.
-var notANamedPeer = map[string]bool{"it": true, "they": true, "that": true, "this": true, "the": true, "he": true, "she": true, "you": true, "i": true, "we": true, "everything": true, "anyone": true, "someone": true}
-
-// waitsOnPeer reports a sentence that waits on another session's word.
-func waitsOnPeer(sentence string) bool {
-	m := rePeerWait.FindStringSubmatch(sentence)
-	return m != nil && !notANamedPeer[strings.ToLower(firstNonEmpty(m[1], m[2]))]
+	return !reWholeTail.MatchString(tail(words))
 }
 
 var (

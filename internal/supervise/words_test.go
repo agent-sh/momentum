@@ -1,6 +1,7 @@
 package supervise
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -98,11 +99,12 @@ func TestPromiseFindsWorkLeftForLater(t *testing.T) {
 		{"Once you confirm, I'll book the staging slot.", ""},
 		{"I'll pick the refactor back up when you're done with the review.", ""},
 		{"Does the new chart render on your screen now?", ""},
-		// it waits on another session's word, which opens a turn when it comes
-		{"The slot request is in. Still waiting for helper-two's answer on a 2-hour slot for the re-measure.", ""},
-		{"The branch is ready. When build-desk says it has merged, I'll rebase and take the three records.", ""},
-		// a wait on the work itself is still a promise
-		{"The upload runs. When it reports back, I'll post the link.", "When it reports back, I'll post the link."},
+		// a mark inside a token ends no sentence: the offer stays whole and is none
+		{"If you approve plan v2.1 in docs/plan.md, I'll build the page.", ""},
+		{"Say the word and after the edit to config.yaml I'll run the import.", ""},
+		{"If you prefer the short one (e.g. two columns), I'll build the page.", ""},
+		// and a promise with one is quoted whole
+		{"The import runs. I'll check config.yaml again when it ends.", "I'll check config.yaml again when it ends."},
 	}
 	for _, c := range cases {
 		if got := Promise(Words(c.words)); got != c.quote {
@@ -112,23 +114,43 @@ func TestPromiseFindsWorkLeftForLater(t *testing.T) {
 	// The store keeps a long text by its ends. A sentence whose start was cut may hang on what is gone: an offer
 	// that waits for the owner reads as a promise once "If you approve it," or "Say the word" is cut. It is none.
 	long := strings.Repeat("The report lists every table and its row count. ", 6)
-	for _, c := range []struct{ end, quote string }{
-		{"Say the word on either and I'll make the change to the staging rule and to the ads.", ""},
-		{"If you approve it, I'll build the checklist page and both of the ads in two languages.", ""},
-		// a tail that begins where a sentence does is read whole
-		{"I'll report the three row counts as soon as the import of the last table is run.", "I'll report the three row counts as soon as the import of the last table is run."},
-		// so is one whose tail begins with the mark that ended the sentence before it
-		{"I'll report the three row counts as soon as the import of the last table ends.", "I'll report the three row counts as soon as the import of the last table ends."},
+	for _, c := range []struct{ end, tail, quote string }{
+		{"Say the word on either and I'll make the change to the staging rule and to the ads.", "nd I'll make", ""},
+		{"If you approve it, I'll build the checklist page and both of the ads in two languages.", "ve it, I'll build", ""},
+		// the rest of a cut sentence is cut with it, whatever marks it holds
+		{"If you approve the plan (v2.1), I'll build the checklist page and both ads in two languages.", "v2.1), I'll build", ""},
+		{"If you want it, I can also change internal/report/table.go and then I'll run the import again.", "table.go and then I'll run", ""},
+		// a capital letter is no start of a sentence: the cut fell on "I'll" here
+		{"If you approve it, I'll build the checklist page and both of the ads in two languages, as planned.", "… I'll build", ""},
+		// a sentence that fills the tail to the byte reads the same, and is lost
+		{"I'll report the three row counts as soon as the import of the last table is run.", "… I'll report", ""},
+		// a tail that begins with the mark that ended the sentence before it is read whole
+		{"I'll report the three row counts as soon as the import of the last table ends.", "… . I'll report", "I'll report the three row counts as soon as the import of the last table ends."},
 		// a whole sentence after the cut one is read as before
-		{"The long export step that started this morning has now finished without any error at all. I'll check back at 14:10.", "I'll check back at 14:10."},
+		{"The long export step that started this morning has now finished without any error at all. I'll check back at 14:10.", "all. I'll check", "I'll check back at 14:10."},
 	} {
 		words := Words(long + c.end)
-		if !strings.Contains(words, "… ") || c.quote == "" && (strings.Contains(words, "Say the word") || strings.Contains(words, "If you")) ||
-			strings.HasSuffix(c.end, "is run.") && !strings.HasSuffix(words, "… "+c.end) || strings.HasSuffix(c.end, "table ends.") && !strings.HasSuffix(words, "… . "+c.end) {
-			t.Fatalf("setup: the words were not cut inside the sentence's opening: %q", words)
+		if !strings.Contains(words, c.tail) || strings.Contains(words, "Say the word") || strings.Contains(words, "If you") {
+			t.Fatalf("setup: the words were not cut where the case says (%q): %q", c.tail, words)
 		}
 		if got := Promise(words); got != c.quote {
 			t.Errorf("Promise(cut %q) = %q, want %q", c.end, got, c.quote)
+		}
+	}
+}
+
+// A sentence ends at a mark a space follows, when what comes next does not go on in small letters.
+func TestSentencesEndAtAMarkAndASpace(t *testing.T) {
+	for text, want := range map[string][]string{
+		"Done. Next step.":                         {"Done.", "Next step."},
+		"See v2.1 of docs/plan.md, then run it.":   {"See v2.1 of docs/plan.md, then run it."},
+		"Two shapes (e.g. a table) work. Pick one": {"Two shapes (e.g. a table) work.", "Pick one"},
+		"He said \"stop.\" Then it ran!  Really?":  {"He said \"stop.\"", "Then it ran!", "Really?"},
+		"**Landed.** `x.go` is in.":                {"**Landed.**", "`x.go` is in."},
+		"  ":                                       nil,
+	} {
+		if got := sentences(text); !slices.Equal(got, want) {
+			t.Errorf("sentences(%q) = %q, want %q", text, got, want)
 		}
 	}
 }
