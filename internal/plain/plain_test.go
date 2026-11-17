@@ -38,7 +38,7 @@ func TestClipCutsToNCharacters(t *testing.T) {
 }
 
 // A summary's end is the text's last two sentences from the mark that closed the one before, when they fit; else
-// the last one; else the last bytes. It is never shorter than those bytes.
+// the last most bytes. It is never shorter than the last least bytes.
 func TestKeptEndHoldsWholeSentences(t *testing.T) {
 	start := strings.Repeat("The report lists every table. ", 10)
 	for name, c := range map[string]struct {
@@ -46,23 +46,29 @@ func TestKeptEndHoldsWholeSentences(t *testing.T) {
 		least, most int
 		want        string
 	}{
-		"the last two sentences":                {start + "The import ran. If you approve it, I'll build the page.", 20, 100, ". The import ran. If you approve it, I'll build the page."},
-		"a mark inside a token ends nothing":    {start + "Plan v2.1 is in docs/plan.md now. I'll check config.yaml at 14:10.", 20, 100, ". Plan v2.1 is in docs/plan.md now. I'll check config.yaml at 14:10."},
-		"a question's mark opens the end":       {start + "Should I go on? The import ran. I'll check back.", 20, 100, "? The import ran. I'll check back."},
-		"two that do not fit: the last one":     {start + "The import ran on the staging copy and wrote nothing at all. I'll check back.", 10, 40, ". I'll check back."},
-		"none that fits: the last bytes":        {start + "The import ran on the staging copy and wrote nothing at all to the live tables", 20, 40, "to the live tables"[len("to the live tables")-18:]},
-		"two shorter than the least: the bytes": {start + "Done. Ok.", 20, 100, "table. Done. Ok."[len("table. Done. Ok.")-16:]},
-		"a short text whole":                    {"Done. Ok.", 20, 100, "Done. Ok."},
-		"space at the end is no sentence":       {start + "The import ran. I'll check back.  \n", 20, 100, ". The import ran. I'll check back."},
+		"the last two sentences":             {start + "The import ran. If you approve it, I'll build the page.", 20, 100, ". The import ran. If you approve it, I'll build the page."},
+		"a mark inside a token ends nothing": {start + "Plan v2.1 is in docs/plan.md now. I'll check config.yaml at 14:10.", 20, 100, ". Plan v2.1 is in docs/plan.md now. I'll check config.yaml at 14:10."},
+		"a question's mark opens the end":    {start + "Should I go on? The import ran. I'll check back.", 20, 100, "? The import ran. I'll check back."},
+		"a numbered list is one sentence":    {start + "Which one? 1. Rebase it. 2. Merge it.", 20, 100, ". The report lists every table. Which one? 1. Rebase it. 2. Merge it."},
+		"two that fit to the byte":           {start + "The import ran. I'll check back.", 20, 34, ". The import ran. I'll check back."},
+		"two that are a byte too long":       {start + "The import ran. I'll check back.", 20, 33, " The import ran. I'll check back."},
+		"two that do not fit: the last most": {start + "The import ran on the staging copy and wrote nothing at all. I'll check back.", 10, 40, "d wrote nothing at all. I'll check back."},
+		"one that does not fit":              {start + "The import ran on the staging copy and wrote nothing at all to the live tables", 20, 40, "nd wrote nothing at all to the live tables"[2:]},
+		"two shorter than the least":         {start + "Done. Ok.", 20, 100, "ery table. Done. Ok."},
+		"a short text whole":                 {"Done. Ok.", 20, 100, "Done. Ok."},
+		"one or two sentences are their own": {"The import ran on the staging copy. I'll check back.", 20, 100, "The import ran on the staging copy. I'll check back."},
+		"space at the end is no part of it":  {start + "The import ran. I'll check back.  \n", 20, 100, ". The import ran. I'll check back."},
 	} {
-		got := KeptEnd(c.text, c.least, c.most)
-		if !strings.HasSuffix(got, c.want) || len(got) > c.most || len(got) < min(c.least, len(strings.TrimSpace(c.text))) || name != "none that fits: the last bytes" && name != "two shorter than the least: the bytes" && got != c.want {
+		if got := KeptEnd(c.text, c.least, c.most); got != c.want {
 			t.Errorf("%s: KeptEnd = %q, want %q", name, got, c.want)
 		}
 	}
 	// cut at a character, not inside one
-	if got := KeptEnd(strings.Repeat("é", 100), 21, 40); len(got) != 20 || !utf8.ValidString(got) {
+	if got := KeptEnd(strings.Repeat("é", 100), 21, 39); len(got) != 38 || !utf8.ValidString(got) {
 		t.Errorf("a cut inside a character: %q", got)
+	}
+	if got := KeptEnd(" \n ", 20, 100); got != "" {
+		t.Errorf("space alone: %q", got)
 	}
 }
 
@@ -73,5 +79,10 @@ func TestSentenceEndsAreMarksBeforeASpace(t *testing.T) {
 	}
 	if got := SentenceEnds(text, true); len(got) != 3 || text[got[0][1]:got[1][0]] != "a table) work" {
 		t.Errorf("every mark and space: %v", got)
+	}
+	// a list item's number ends nothing; a number that ends a sentence in running text is read as one too
+	list := "Pick one: 1. Rebase. 2. Merge. 10. Neither... 3. Wait. Then tell me. It was v2. Done."
+	if got := SentenceEnds(list, false); len(got) != 3 || list[got[0][1]:got[1][0]] != "Then tell me" || list[got[2][1]:] != "Done." {
+		t.Errorf("a numbered list: %v", got)
 	}
 }

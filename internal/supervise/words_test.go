@@ -227,26 +227,45 @@ func byEnds(s string) string {
 }
 
 func TestWordsKeepWhatTheStoreKeeps(t *testing.T) {
-	// an end with no sentence that fits is the last bytes
-	long := strings.Repeat("start ", 40) + strings.Repeat("middle ", 60) + "and the end, I'll report back."
+	// an end whose last two sentences do not fit is the last bytes, cut at a byte count
+	long := strings.Repeat("start ", 40) + strings.Repeat("middle ", 100) + "and the end, I'll report back."
 	w := Words(long)
-	if !strings.HasPrefix(w, "start start") || !strings.HasSuffix(w, "I'll report back.") || !strings.Contains(w, "… ") ||
-		len(w) > headChars+tailChars+8 || w != byEnds(long) {
+	if !strings.HasPrefix(w, "start start") || !strings.HasSuffix(w, "middle and the end, I'll report back.") || !strings.Contains(w, "… ") ||
+		len(tail(w)) < tailMost-8 || len(tail(w)) > tailMost || !cutInside(w) || Promise(w) != "" {
 		t.Fatalf("words %q", w)
 	}
 	// the last two sentences are kept whole, from the mark that closed the one before them
-	two := strings.Repeat("The report lists every table and its row count. ", 8) + "The import ran on the staging copy and wrote nothing to the live tables. If you approve it, I'll build the checklist page."
+	start := strings.Repeat("The report lists every table and its row count. ", 8)
+	two := start + "The import ran on the staging copy and wrote nothing to the live tables. If you approve it, I'll build the checklist page."
 	if w := Words(two); !strings.HasSuffix(w, "… . The import ran on the staging copy and wrote nothing to the live tables. If you approve it, I'll build the checklist page.") {
 		t.Fatalf("the last two sentences: %q", w)
 	}
-	// when the two do not fit, the last one; and a text whose start and end meet is kept whole
-	one := strings.Repeat("The report lists every table and its row count. ", 8) + strings.Repeat("the import ran on the staging copy and ", 12) + "wrote nothing. I'll check back at 14:10."
-	if w := Words(one); !strings.HasSuffix(w, "… . I'll check back at 14:10.") && !strings.HasSuffix(w, "wrote nothing. I'll check back at 14:10.") || len(tail(w)) < tailChars-8 {
-		t.Fatalf("the last sentence: %q", w)
+	// up to the bound: two sentences of 478 bytes are kept from their mark, and of 482 are not
+	for pad, whole := range map[int]bool{0: true, 4: false} {
+		end := "The import " + strings.Repeat("of the next table and ", 18) + strings.Repeat("x", 38+pad) + " ran. I'll check back at 14:10."
+		w := Words(start + end)
+		if got := strings.HasSuffix(w, "… . "+end); got != whole || len(". "+end) != 478+pad {
+			t.Fatalf("an end of %d bytes kept from its mark: %v, want %v: %q", len(". "+end), got, whole, tail(w))
+		}
 	}
-	met := strings.Repeat("The report lists every table. ", 5) + "The import ran on the staging copy. I'll check back at 14:10."
-	if w := Words(met); strings.Contains(w, "… ") || w != met {
-		t.Fatalf("a text whose ends meet: %q", w)
+	// when the two do not fit, the last bytes still hold most of the sentence before the last: an ask there is seen
+	ask := start + "The copy can go in two orders, over " + strings.Repeat("the staging tables and ", 14) + "the live ones: let me know which you want copied first and which can wait. I'll keep watching the run on the branch and report back here once its last job is through."
+	if w := Words(ask); !AsksOwner(w) || Promise(w) != "" || !cutInside(w) {
+		t.Fatalf("an ask in a long sentence before a promise: %q", tail(w))
+	}
+	// a numbered list after a question is one sentence, not a sentence for each item
+	list := start + "Which do you prefer? 1. **Rebase** - I'll rebase the branch and push it again. 2. **Merge** - I'll merge main into the branch; no force-push is needed, but the history gets a merge commit."
+	if w := Words(list); !AsksOwner(w) || Promise(w) != "" {
+		t.Fatalf("a numbered list after a question: %q", tail(w))
+	}
+	// a kept end that opens with a question's mark asks, and is quoted with what follows the mark
+	if got := Asked("The report lists every table.… ? The import ran on the staging copy."); got != "? The import ran on the staging copy." {
+		t.Fatalf("an end after a question: %q", got)
+	}
+	// a text whose start and end meet is kept whole
+	met := strings.Repeat("The report lists every table and its row count. ", 2) + "The import ran on the staging copy and wrote nothing to the live tables or to the archive of last month. I'll check back at 14:10 and report what the next table shows."
+	if w := Words(met); len(met) < headChars+tailChars+20 || strings.Contains(w, "… ") || w != met {
+		t.Fatalf("a text of %d bytes whose ends meet: %q", len(met), w)
 	}
 	if got := Words("short  text\nhere"); got != "short text here" {
 		t.Fatalf("short %q", got)
@@ -276,6 +295,9 @@ func TestWordsAreTheStoresSummary(t *testing.T) {
 		start + "The import ran on the staging copy. If you approve it, I'll build the checklist page.",
 		start + "Plan v2.1 is in docs/plan.md now. Should I go on?\n\nI'll check config.yaml at 14:10.  ",
 		start + strings.Repeat("the import ran on the staging copy and ", 14) + "wrote nothing. I'll check back at 14:10.",
+		strings.Repeat("The report lists every table and its row count. ", 2) + "The import ran on the staging copy and wrote nothing to the live tables or to the archive of last month. I'll check back at 14:10 and report what the next table shows.",
+		strings.Repeat("The report lists every table and its row count. ", 4) + "The import ran on the staging copy and wrote nothing. I'll check back at 14:10.",
+		start + "The import " + strings.Repeat("of the next table and ", 18) + " ran. I'll check back at 14:10." + strings.Repeat(" ", 900),
 		start + strings.Repeat("no sentence ends here and ", 40) + "it goes on",
 		strings.Repeat("The report lists every table. ", 5) + "The import ran on the staging copy. I'll check back at 14:10.",
 		strings.Repeat(start, 12) + "The import ran. I'll check back at 14:10.",

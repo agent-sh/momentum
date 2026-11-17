@@ -26,12 +26,12 @@ func ErrorClass(text string) string { return sessions.ErrorClass(text) }
 func ResetAt(text string, at time.Time) (time.Time, bool) { return sessions.ResetAt(text, at) }
 
 // The agent's last words, as the store keeps an agent's text: its first headChars bytes and its end
-// (plain.KeptEnd: its last two sentences in at most tailMost bytes, else its last tailChars bytes), whitespace
+// (plain.KeptEnd: its last two sentences in at most tailMost bytes, else its last tailMost bytes), whitespace
 // folded. The rules read only this, live and in the replay alike.
 const (
-	headChars = 160
-	tailChars = 80
-	tailMost  = 480
+	headChars = plain.SummaryHead
+	tailChars = plain.SummaryEnd
+	tailMost  = plain.SummaryEndMost
 )
 
 // reTrailer is what a harness appends to an agent's text that is not the agent's words: Codex's memory
@@ -150,6 +150,9 @@ func Asked(words string) string { return asking(lastSentences(words, 2)) }
 func asking(ss []string) string {
 	for i := len(ss) - 1; i >= 0; i-- {
 		if reAsks.MatchString(ss[i]) {
+			if !strings.ContainsFunc(ss[i], unicode.IsLetter) {
+				return strings.Join(ss[i:], " ") // a kept end's opening mark: the question it closed is gone
+			}
 			return ss[i]
 		}
 	}

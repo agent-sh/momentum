@@ -80,14 +80,14 @@ const spare = 512
 // Agent text keeps its start and its end: what it set out to do and what it asks or claims. The end is its last
 // two sentences whole, from the mark that closed the one before them, when they fit in tailMost bytes
 // (plain.KeptEnd): the rules that read how a turn ended read its last two sentences, and a cut at a byte count
-// falls inside one of them more often than not. An end that does not fit is the last tailChars bytes.
+// falls inside one of them more often than not. An end that does not fit is the last tailMost bytes.
 const (
 	ownerChars = 2000
 	errorChars = 1000
 	textChars  = 240
-	headChars  = 160
-	tailChars  = 80
-	tailMost   = 480
+	headChars  = plain.SummaryHead
+	tailChars  = plain.SummaryEnd
+	tailMost   = plain.SummaryEndMost
 )
 
 // skipWhy are the items not stored, by tacit's reason, with why: Codex's "[Recorded tool history]" message
@@ -862,6 +862,7 @@ func cutHead(s string, n int) ([]string, func([]string) string) {
 // last most), each with spare until redaction, as two texts (so a quote the head leaves open is not paired with
 // one of the end's), or one when they meet. A text whose head and end meet after redaction is kept whole.
 func cutEnds(s string, head, tail, most int) ([]string, func([]string) string) {
+	s = strings.TrimRightFunc(s, unicode.IsSpace) // or space past the spare would push the end out of what is kept
 	if len(s) <= head+tail {
 		return []string{strings.Clone(s)}, func(r []string) string { return oneLine(r[0], false) }
 	}
