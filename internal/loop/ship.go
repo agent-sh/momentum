@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/agent-sh/momentum/internal/measure"
+	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
 )
 
@@ -58,6 +59,8 @@ type Ship struct {
 	Log func(format string, args ...any)
 	// ConfigTargets are the configuration files the loop may propose a change to (loop.config_targets): none by default.
 	ConfigTargets ConfigTargets
+	// Wait is a test hook for the pause between two reads of a commit's checks (waitCI): a timer when nil.
+	Wait func(ctx context.Context, d time.Duration) error
 }
 
 // logf writes a problem that does not stop a step to the ship tool's log, scrubbed; nothing when it cannot be scrubbed.
@@ -1410,6 +1413,16 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 				return p, relationErr // an uncertain read must retain the journal
 			}
 			if relationErr == nil {
+				// the head that reaches the base passes the repository's CI first, as in a landing that was not cut
+				if p.LandingHead != p.Head {
+					need, err := s.ciPassed(ctx, p, p.Head, nil)
+					if err != nil {
+						return p, err
+					}
+					if err := s.waitCI(ctx, p, p.LandingHead, need); err != nil {
+						return p, err
+					}
+				}
 				if err := s.openPR(ctx, p); err != nil {
 					if errors.Is(err, errPRClosed) {
 						return s.closedProposal(ctx, p)
@@ -1459,6 +1472,10 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 		return p, refused("the work tree holds changes besides the reviewed commit: no landing")
 	}
 	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
+		return p, err
+	}
+	ci, err := s.ciPassed(ctx, p, p.Head, nil)
+	if err != nil {
 		return p, err
 	}
 	if _, err := s.git(ctx, p.Host, "fetch", "--quiet", "origin", p.Base); err != nil {
@@ -1529,6 +1546,15 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 			}
 			return p, err
 		}
+		// The rebase made a commit the repository's CI has not read. It is on the proposal branch now, where the
+		// CI runs; the base waits for it. A wait that runs out keeps the journaled head, and the next landing
+		// resumes from it.
+		if err := s.waitCI(ctx, p, head, ci); err != nil {
+			return p, err
+		}
+		if err := s.authority(ctx, caseID); err != nil {
+			return p, err
+		}
 	}
 	if err := s.openPR(ctx, p); err != nil {
 		if errors.Is(err, errPRClosed) {
@@ -1543,6 +1569,103 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	}
 	complete = true
 	return s.finishLanding(ctx, p)
+}
+
+// ciOK are the conclusions of a check run that passed, or that its workflow chose not to run.
+var ciOK = map[string]bool{"success": true, "neutral": true, "skipped": true}
+
+// ciWaits is a refusal that only time ends: a check of the repository's CI has not finished on a commit, or has not
+// reported on it yet.
+type ciWaits struct{ error }
+
+func (e ciWaits) Unwrap() error { return e.error }
+
+// ciPassed refuses a landing unless the repository's own CI has passed on a commit: every check run of its workflows
+// (GitHub Actions) there is complete and passed, and every check named in need has one. It returns the names of the
+// checks it read. Another app's check (an advisory bot) is not waited for. A commit no workflow has reported on has
+// nothing to wait for in a repository without CI, which is why need carries the reviewed head's checks to the head a
+// rebase made: a new commit lists no check for its first seconds. The loop's own repository has CI, so there a
+// commit with no check waits.
+func (s *Ship) ciPassed(ctx context.Context, p Package, sha string, need []string) ([]string, error) {
+	raw, err := s.gh(ctx, p.Host, "api", "repos/"+p.Repo+"/commits/"+sha+"/check-runs?per_page=100")
+	if err != nil {
+		return nil, err
+	}
+	var list struct {
+		Total int `json:"total_count"`
+		Runs  []struct {
+			Name, Status, Conclusion string
+			App                      struct{ Slug string }
+		} `json:"check_runs"`
+	}
+	if err := json.Unmarshal([]byte(raw), &list); err != nil {
+		return nil, refused("case %s's checks could not be read: no landing", p.Case)
+	}
+	if list.Total > len(list.Runs) {
+		return nil, refused("case %s's commit has more checks than one read holds (%d): no landing", p.Case, list.Total)
+	}
+	var names []string
+	running := ""
+	for _, r := range list.Runs {
+		if r.App.Slug != "github-actions" {
+			continue
+		}
+		names = append(names, r.Name)
+		switch {
+		case r.Status != "completed":
+			running = r.Name
+		case !ciOK[r.Conclusion]:
+			return nil, refused("case %s's check %s did not pass on %s (%s): no landing", p.Case, plain.Line(r.Name), sha, plain.Line(r.Conclusion))
+		}
+	}
+	if running != "" {
+		return nil, ciWaits{refused("case %s's check %s has not finished on %s: no landing yet", p.Case, plain.Line(running), sha)}
+	}
+	for _, n := range need {
+		if !slices.Contains(names, n) {
+			return nil, ciWaits{refused("case %s's check %s has not reported on %s: no landing yet", p.Case, plain.Line(n), sha)}
+		}
+	}
+	if len(names) == 0 && strings.EqualFold(p.Repo, SelfRepo) {
+		return nil, ciWaits{refused("no check of the repository's CI has reported on %s: no landing yet", sha)}
+	}
+	return names, nil
+}
+
+// A landing waits ciWait for the CI of a head its rebase made, reading every ciPoll: several times what a CI of
+// format, vet and build takes. A slower one is met by the next landing, which resumes from the journaled head.
+const (
+	ciWait = 10 * time.Minute
+	ciPoll = 15 * time.Second
+)
+
+// waitCI is ciPassed for a commit pushed a moment ago: while its checks run or have not reported it reads again,
+// for ciWait at most, and then returns the refusal.
+func (s *Ship) waitCI(ctx context.Context, p Package, sha string, need []string) error {
+	end := s.now().Add(ciWait)
+	for {
+		_, err := s.ciPassed(ctx, p, sha, need)
+		if w := (ciWaits{}); !errors.As(err, &w) || !s.now().Before(end) {
+			return err
+		}
+		if err := s.wait(ctx, ciPoll); err != nil {
+			return err
+		}
+	}
+}
+
+func (s *Ship) wait(ctx context.Context, d time.Duration) error {
+	if s.Wait != nil {
+		return s.Wait(ctx, d)
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 type checkCommand struct {

@@ -78,9 +78,18 @@ if [ "$1 $2" = "repo view" ] && [ -e "`+filepath.Join(dir, "public")+`" ]; then 
 elif [ "$1 $2" = "repo view" ]; then echo '{"isPrivate":true,"visibility":"PRIVATE"}'; fi
 if [ "$1 $2" = "pr view" ]; then echo '{"state":"OPEN"}'; fi
 if [ "$2" = "list" ]; then echo '[]'; fi
-if [ "$2" = "create" ]; then echo "https://github.com/agent-sh/fake/pull/7"; fi`)
+if [ "$2" = "create" ]; then echo "https://github.com/agent-sh/fake/pull/7"; fi
+if [ "$1" = "api" ]; then sha=${2#*/commits/}; sha=${sha%%/*}
+  if [ -e "`+filepath.Join(dir, "checks-")+`$sha" ]; then cat "`+filepath.Join(dir, "checks-")+`$sha"
+  elif [ -e "`+filepath.Join(dir, "checks")+`" ]; then cat "`+filepath.Join(dir, "checks")+`"
+  else echo '`+passedChecks+`'; fi
+fi`)
 	return f
 }
+
+// passedChecks is a commit's check runs as the forge lists them, with the repository's own CI passed. The fixture's
+// forge answers with it unless the file checks-SHA (that commit's) or checks (any commit's) holds another answer.
+const passedChecks = `{"total_count":1,"check_runs":[{"name":"build","status":"completed","conclusion":"success","app":{"slug":"github-actions"}}]}`
 
 // shipFor is a ship tool over the fixture: live, its gate allowing agent-sh, its sandbox a bubblewrap one over the
 // user's home with the Go toolchain read-only and the tests' own build cache, and its posts kept as they are but

@@ -76,6 +76,7 @@ case "$1 $2" in
  "pr list") echo '[]';;
  "pr view") echo '{"state":"`+state+`"}';;
  "pr create") echo 'https://example.com/pull/7';;
+ "api "*) echo '`+passedChecks+`';;
 esac`)
 }
 
