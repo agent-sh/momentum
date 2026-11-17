@@ -379,6 +379,8 @@ func TestTheChargeIsWhatTheResponsesUsageBills(t *testing.T) {
 		"less input named at the end":          {`{"output_tokens":100,"input_tokens":10,"cache_read_input_tokens":5}`, .004 + .002 + .0004},
 		"a compaction pass beside the message": {`{"output_tokens":100,"iterations":[{"type":"compaction","input_tokens":50000,"output_tokens":2000},{"type":"message","input_tokens":1000,"output_tokens":100,"cache_read_input_tokens":2000}]}`, .2 + .04 + .004 + .002 + .0004},
 		"passes that sum to less than the top": {`{"output_tokens":100,"iterations":[{"type":"message","input_tokens":10,"output_tokens":1}]}`, .004 + .002 + .0004},
+		"a pass that wrote, with no split":     {`{"output_tokens":100,"iterations":[{"type":"compaction","input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":50000},{"type":"message","input_tokens":1000,"output_tokens":100,"cache_read_input_tokens":2000}]}`, .4 + .004 + .002 + .0004},
+		"an empty list of passes":              {`{"output_tokens":100,"iterations":[]}`, .004 + .002 + .0004},
 	} {
 		p := usageParser{stream: true}
 		p.feed(append(eventFrame([]byte(start)), eventFrame([]byte(`{"type":"message_delta","usage":`+c.delta+`}`))...))
@@ -407,14 +409,15 @@ func TestTheChargeIsWhatTheResponsesUsageBills(t *testing.T) {
 	}
 	// a pass with no counts, or a count below zero, is no usage to price: the reservation stands
 	for name, delta := range map[string]string{
-		"a pass with no counts":           `{"output_tokens":100,"iterations":[{"type":"compaction"}]}`,
-		"a count below zero":              `{"output_tokens":100,"cache_read_input_tokens":-1}`,
-		"more written per hour":           `{"output_tokens":100,"cache_creation_input_tokens":10,"cache_creation":{"ephemeral_1h_input_tokens":20}}`,
-		"an input below nothing":          `{"output_tokens":100,"input_tokens":-5}`,
-		"a write below nothing":           `{"output_tokens":100,"cache_creation_input_tokens":-1}`,
-		"an hour below nothing":           `{"output_tokens":100,"cache_creation_input_tokens":5,"cache_creation":{"ephemeral_1h_input_tokens":-1}}`,
-		"passes that are no list":         `{"output_tokens":100,"iterations":{"type":"message"}}`,
-		"more passes than a response has": `{"output_tokens":100,"iterations":[` + strings.TrimSuffix(strings.Repeat(`{"input_tokens":1,"output_tokens":1},`, maxPasses+1), ",") + `]}`,
+		"a pass with no counts":                `{"output_tokens":100,"iterations":[{"type":"compaction"}]}`,
+		"a count below zero":                   `{"output_tokens":100,"cache_read_input_tokens":-1}`,
+		"more written per hour":                `{"output_tokens":100,"cache_creation_input_tokens":10,"cache_creation":{"ephemeral_1h_input_tokens":20}}`,
+		"an input below nothing":               `{"output_tokens":100,"input_tokens":-5}`,
+		"a write below nothing":                `{"output_tokens":100,"cache_creation_input_tokens":-1}`,
+		"an hour below nothing":                `{"output_tokens":100,"cache_creation_input_tokens":5,"cache_creation":{"ephemeral_1h_input_tokens":-1}}`,
+		"passes that are no list":              `{"output_tokens":100,"iterations":{"type":"message"}}`,
+		"more passes than a response has":      `{"output_tokens":100,"iterations":[` + strings.TrimSuffix(strings.Repeat(`{"input_tokens":1,"output_tokens":1},`, maxPasses+1), ",") + `]}`,
+		"passes longer than a list of them is": `{"output_tokens":100,"iterations":[{"input_tokens":1,"output_tokens":1,"type":"` + strings.Repeat("x", maxPassBytes) + `"}]}`,
 	} {
 		p := usageParser{stream: true}
 		p.feed(append(eventFrame([]byte(start)), eventFrame([]byte(`{"type":"message_delta","usage":`+delta+`}`))...))
@@ -423,8 +426,16 @@ func TestTheChargeIsWhatTheResponsesUsageBills(t *testing.T) {
 			t.Errorf("%s: priced at %f", name, cost)
 		}
 	}
+	// passes named by the first event are read, and a later event that names none leaves them
+	p := usageParser{stream: true}
+	p.feed(append(eventFrame([]byte(`{"type":"message_start","message":{"usage":{"input_tokens":1000,"output_tokens":0,"iterations":[{"type":"compaction","input_tokens":50000,"output_tokens":2000}]}}}`)),
+		eventFrame([]byte(`{"type":"message_delta","usage":{"output_tokens":100,"iterations":[]}}`))...))
+	p.eof = true
+	if cost, ok := p.cost(rate); !ok || math.Abs(cost-(.2+.04)) > 1e-10 {
+		t.Errorf("passes in the first event: %f %v", cost, ok)
+	}
 	// the same for a response that does not stream
-	p := usageParser{}
+	p = usageParser{}
 	p.feed([]byte(`{"usage":{"input_tokens":1000,"output_tokens":100,"iterations":[{"type":"compaction","input_tokens":50000,"output_tokens":2000},{"type":"message","input_tokens":1000,"output_tokens":100}]}}`))
 	p.eof = true
 	if cost, ok := p.cost(rate); !ok || math.Abs(cost-(.2+.04+.004+.002)) > 1e-10 {

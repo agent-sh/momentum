@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"hash/crc32"
 	"io"
+	"strings"
 )
 
 // These are Smithy's event-stream payload and headers limits.
@@ -48,12 +49,21 @@ func (u relayUsage) passes() ([]relayUsage, bool) {
 	if json.Unmarshal(u.Iterations, &list) != nil || len(list) > maxPasses {
 		return nil, false
 	}
-	for _, it := range list {
+	for i, it := range list {
 		if !it.valid() {
 			return nil, false
 		}
+		if it.Cache.Hour == 0 && it.Cache.Five == 0 {
+			list[i].Cache.Hour = it.Write // a pass that names what it wrote and no split is priced at the dearer write
+		}
 	}
 	return list, true
+}
+
+// listed says a usage names its passes: a list with something in it.
+func (u relayUsage) listed() bool {
+	s := strings.TrimSpace(string(u.Iterations))
+	return s != "" && s != "null" && s != "[]"
 }
 
 // price is what a usage costs at a rate, in dollars.
@@ -238,6 +248,10 @@ func (p *usageParser) feed(b []byte) {
 				p.bad = true
 			} else {
 				p.usage, p.start = e.Message.Usage, true
+				if p.usage.listed() {
+					p.iterations = p.usage.Iterations
+				}
+				p.usage.Iterations = nil // kept once, in p.iterations
 			}
 		case "message_delta":
 			if !p.start || e.Usage.Output == nil || *e.Usage.Output < *p.usage.Output {
@@ -308,7 +322,7 @@ func (p *usageParser) grow(u relayUsage) {
 		p.usage.Write = u.Write
 	}
 	p.usage.Cache.Hour = min(hour, p.usage.Write)
-	if len(u.Iterations) > 0 && string(u.Iterations) != "null" {
+	if u.listed() { // a later event that names none leaves an earlier event's
 		p.iterations = u.Iterations
 	}
 }
