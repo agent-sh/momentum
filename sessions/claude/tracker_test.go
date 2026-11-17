@@ -250,11 +250,33 @@ func TestAWorkflowLaunchedInItsRecordIsATask(t *testing.T) {
 	if s := x.facts(tr, x.at); len(s.Tasks) != 0 {
 		t.Fatalf("its notification ends it: %s", taskIDs(s))
 	}
+	// a shell command whose record names its background task is one too, whatever its text says; and a record that
+	// holds a string or a list where a launch would be is read as any result: its text still starts a task
+	b := newScript(t).call("tu1", "Bash", map[string]any{"command": "make all"})
+	b = launched(b, "tu1", map[string]any{"stdout": "", "backgroundTaskId": "b77", "timedOutAfterMs": 120000})
+	b = b.call("tu2", "Bash", map[string]any{"command": "make docs"}).add(map[string]any{"type": "user", "toolUseResult": "a string",
+		"message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "tu2",
+			"content": "Command running in background with ID: b78. Output is being written to: /x/b78.output"}}}})
+	b = b.call("tu3", "Bash", map[string]any{"command": "make site"}).add(map[string]any{"type": "user", "toolUseResult": []any{"a", "list"},
+		"message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "tu3",
+			"content": "Command running in background with ID: b79. Output is being written to: /x/b79.output"}}}}).say("They run.")
+	if s := b.facts(NewTracker(b.path), b.at); len(s.Tasks) != 3 || !strings.Contains(taskIDs(s), "bash:b77") || !strings.Contains(taskIDs(s), "bash:b78") ||
+		!strings.Contains(taskIDs(s), "bash:b79") {
+		t.Fatalf("shell commands in the background: %s", taskIDs(s))
+	}
+	// an agent's launch in the record alone is a task, and an agent that ran to its end in the call is none
+	g := newScript(t).call("tu1", "Agent", map[string]any{"description": "look", "prompt": "look"})
+	g = launched(g, "tu1", map[string]any{"status": "async_launched", "agentId": "a77", "isAsync": true})
+	g = launched(g.call("tu2", "Agent", map[string]any{"description": "read", "prompt": "read"}), "tu2", map[string]any{"status": "completed", "agentId": "a78"}).say("It runs.")
+	if s := g.facts(NewTracker(g.path), g.at); len(s.Tasks) != 1 || !strings.Contains(taskIDs(s), "agent:a77") {
+		t.Fatalf("an agent launched in its record: %s", taskIDs(s))
+	}
 	y := newScript(t).call("tu1", "Workflow", map[string]any{"description": "fan out"})
 	y = launched(y, "tu1", map[string]any{"status": "failed", "taskId": "wf1"})
 	y = launched(y.call("tu2", "Workflow", map[string]any{"description": "again"}), "tu2", "a result that is text")
 	y = launched(y.call("tu3", "Workflow", map[string]any{"description": "again"}), "tu3", []any{"a", "list"})
 	y = launched(y.call("tu4", "Bash", map[string]any{"command": "true"}), "tu4", map[string]any{"status": "async_launched", "taskId": "b1"})
+	y = launched(y.call("tu6", "Read", map[string]any{"file_path": "/x"}), "tu6", map[string]any{"backgroundTaskId": "r1"})
 	y = launched(y.call("tu5", "Workflow", map[string]any{"description": "odd id"}), "tu5", map[string]any{"status": "async_launched", "taskId": "not an id"}).say("Done.")
 	if s := y.facts(NewTracker(y.path), y.at); len(s.Tasks) != 0 {
 		t.Fatalf("no launch, and tasks: %s", taskIDs(s))

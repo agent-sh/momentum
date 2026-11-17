@@ -240,16 +240,21 @@ type line struct {
 		Content json.RawMessage `json:"content"`
 	} `json:"message"`
 	// Launch is what a tool result's record says of a task its call started in the background, beside the result
-	// itself: a workflow's launch may leave the result's text empty and say it only here.
+	// itself. A call made inside another tool's run (a virtual record) has an empty result text and says its launch
+	// only here, and a shell command moved to the background after its time ran out names its task here whatever
+	// its text opens with.
 	Launch *launch `json:"toolUseResult"`
 }
 
-// launch is a background task's start as a tool result's record holds it.
+// launch is a background task's start as a tool result's record holds it: a workflow's (status async_launched and
+// its task's id), an agent's (the same status and the agent's id; an agent that ran to its end in the call has an id
+// and another status), or a shell command's (its background task's id).
 type launch struct {
-	Status  string `json:"status"` // async_launched
-	TaskID  string `json:"taskId"`
-	Type    string `json:"taskType"` // local_workflow
-	Summary string `json:"summary"`
+	Status     string `json:"status"`
+	TaskID     string `json:"taskId"`
+	Summary    string `json:"summary"`
+	Background string `json:"backgroundTaskId"`
+	Agent      string `json:"agentId"`
 }
 
 // UnmarshalJSON reads a launch where the record holds one: a tool's result there is often a string or a list, which
@@ -899,9 +904,15 @@ func (t *Tracker) result(b block, at time.Time, started *launch) {
 		if m := reOutFile.FindStringSubmatch(out); m != nil {
 			k.Output = m[1] + ".output"
 		}
+	case c.Name == "Bash" && started != nil && reTaskName.MatchString(started.Background):
+		// its record names the task and its text does not open as a launch's does: a command moved to the
+		// background when its time ran out, or one run inside another tool's call
+		add(started.Background, "bash")
 	case c.Name == "Agent" || c.Name == "Task":
 		if m := reAgentID.FindStringSubmatch(out); m != nil && strings.HasPrefix(out, "Async agent launched") {
 			add(m[1], "agent")
+		} else if started != nil && started.Status == "async_launched" && reTaskName.MatchString(started.Agent) {
+			add(started.Agent, "agent") // launched inside another tool's call: only its record says so
 		}
 	case c.Name == "Workflow" && reWorkflow.MatchString(out):
 		k := add(reWorkflow.FindStringSubmatch(out)[1], "workflow")
