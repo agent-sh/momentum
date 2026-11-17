@@ -849,10 +849,12 @@ func buildScope(repo string) string {
 	}
 	return "Paths: this is the loop's own repository. The loop lands a change only when every path it touches is one of " +
 		strings.Join(SelfLandable(), ", ") + ": prefer a fix inside them. A rules file lands while it was there before and its change " +
-		"adds no import, initializer or compiler directive. Its test file (" + strings.Join(SelfLandableTests(), ", ") + ") lands with it when the " +
+		"adds no import, no initializer (an init function, or a package variable whose value calls something or is a function), no " +
+		"compiler directive, no name that hides a predeclared one, and no function that sets a variable the file does not declare. " +
+		"Its test file (" + strings.Join(SelfLandableTests(), ", ") + ") lands with it when the " +
 		"change only appends whole test functions (func TestXxx(t *testing.T)) after what the file held, with no other declaration, " +
-		"import or directive. The host then runs the package's whole test suite on the change, without the tests it adds: " +
-		"they must pass as they did. A fix that needs other paths is still checked and reviewed, " +
+		"import or directive, each setting no variable but its own. The host then runs the package's whole test suite on the " +
+		"change, without the tests it adds: they must pass as they did. A fix that needs other paths is still checked and reviewed, " +
 		"then proposed for a person to land by hand; the loop never lands it. No change touches CI configuration (" + ci +
 		") or these, which the loop's measurement and its event scanners rest on: " + strings.Join(ProposalProtected(), ", ") +
 		" " + ownReachException + "."
@@ -874,23 +876,29 @@ func reviewPrompt(c store.Case, p Package) string {
 		"outside it by its kind, and whose fix is the change a person makes there; no part of the finding or the summary "+
 		"names a host path. The follow-up lowers no finding on what "+
 		"this change does. When this change is not worth landing without that fix, for example because it changes nothing of "+
-		"the case's problem, only hides its signal, or is wrong on its own, file a high finding that says so.", c.ID, c.Family, p.Title, buildScope(p.Repo)) + handReach(p.Repo)
+		"the case's problem, only hides its signal, or is wrong on its own, file a high finding that says so.", c.ID, c.Family, p.Title, buildScope(p.Repo)) + handReach(p)
 }
 
 // handReach is the review's sentence on the paths only a hand landing may change, which only the loop's own
 // repository has.
-func handReach(repo string) string {
-	if !strings.EqualFold(repo, SelfRepo) {
+func handReach(p Package) string {
+	if !strings.EqualFold(p.Repo, SelfRepo) {
 		return ""
 	}
-	return " A fix in a path a hand landing may change is the build's to make, not a follow-up: rate a change that leaves it out as any change that misses part of its fix." + selfReach
+	text := " A fix in a path a hand landing may change is the build's to make, not a follow-up: rate a change that leaves it out as any change that misses part of its fix."
+	if len(p.Hand) == 0 {
+		text += selfReach
+	}
+	return text
 }
 
-// selfReach is the review's sentence on a change the loop lands in its own repository: it may add a check or
-// tighten one, and what makes a test prove less, or widens the loop's own reach, is a person's to decide.
-const selfReach = " A change the loop lands here itself may add a check or tighten one. File a high finding when this change makes " +
-	"a test prove less than it did (a rule that tells a test run from a real one, an added test that changes what the tests " +
-	"after it see), or widens what the loop may touch, land or spend: a person lands such a change."
+// selfReach is the review's sentence on a change the loop lands in its own repository itself (no hand path): it
+// may add a check or tighten one, and what makes a test prove less, or widens the loop's own reach, is a person's
+// to decide. The host has read the change's form; what its code does is the review's.
+const selfReach = " The loop lands this change itself, with no person between. It may add a check or tighten one. File a high finding when " +
+	"it makes a test prove less than it did (a rule that tells a test run from a real one, by the clock or by anything else; an " +
+	"added test that changes what the tests after it see, through a call if not an assignment), or widens what the loop may touch, " +
+	"land or spend: a person lands such a change."
 
 // refusalKeys are the build stages whose failure is the run's own output: its report, its patch, its check or its
 // proposal. Preparation, inputs, toolchains and authority are the host's and tell a build nothing to change.

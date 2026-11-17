@@ -79,6 +79,9 @@ func TestTheLoopReadsAChangeToItsOwnFiles(t *testing.T) {
 	}{
 		"appended tests":                  {two, selfRulesTest + selfNewTest, 0o644, nil},
 		"the rules alone":                 {two, selfRulesTest, 0o644, nil},
+		"the test alone":                  {selfRules, selfRulesTest + selfNewTest, 0o644, []string{rulesTestPath}},
+		"a test that sets the limit":      {two, selfRulesTest + "\nfunc TestSets(t *testing.T) {\n\tlimit = 2\n}\n", 0o644, []string{rulesTestPath}},
+		"a variable that runs code":       {two + "\nvar _ = func() bool { limit = 9; return true }()\n", selfRulesTest + selfNewTest, 0o644, []string{rulesPath}},
 		"a line of an old test rewritten": {two, strings.Replace(selfRulesTest, "Limit() <= 0", "Limit() < -5", 1) + selfNewTest, 0o644, []string{rulesTestPath}},
 		"a skip put inside an old test":   {two, strings.Replace(selfRulesTest, "\tif Limit", "\tt.Skip()\n\tif Limit", 1) + selfNewTest, 0o644, []string{rulesTestPath}},
 		"a TestMain appended":             {two, selfRulesTest + selfNewTest + "\nfunc TestMain(m *testing.M) {}\n", 0o644, []string{rulesTestPath}},
@@ -117,7 +120,7 @@ func TestTheLoopReadsAChangeToItsOwnFiles(t *testing.T) {
 			if err != nil || !slices.Equal(hand, c.hand) {
 				t.Fatalf("hand paths %v, want %v (by name %v): %v", hand, c.hand, byName, err)
 			}
-			if want := c.test == selfRulesTest+selfNewTest && c.mode == 0o644; want != slices.Equal(added, []string{"TestLimitIsTwo"}) || !want && added != nil {
+			if want := c.test == selfRulesTest+selfNewTest && c.mode == 0o644 && c.rules != selfRules; want != slices.Equal(added, []string{"TestLimitIsTwo"}) || !want && added != nil {
 				t.Fatalf("added tests: %v", added)
 			}
 			// the landing reads the same change the same way
@@ -146,9 +149,15 @@ func TestTheRulesPackagesOwnTestsMustStillPass(t *testing.T) {
 		// the old test wants a positive limit; the build's command names only its new test
 		"an old test broken": {strings.Replace(selfRules, "limit = 1", "limit = 0", 1),
 			"\nfunc TestLimitIsZero(t *testing.T) {\n\tif Limit() != 0 {\n\t\tt.Fatal(Limit())\n\t}\n}\n", []string{"go", "test", "-run", "TestLimitIsZero", "./..."}},
-		// the later test wants at most two; the added test sets the limit back before it runs, so the whole run passes
-		"an added test that covers for a later one": {strings.Replace(selfRules, "limit = 1", "limit = 3", 1),
-			"\nfunc TestLimitIsThree(t *testing.T) {\n\tif Limit() != 3 {\n\t\tt.Fatal(Limit())\n\t}\n\tlimit = 2\n}\n", []string{"go", "test", "./..."}},
+		// the later test wants at most two; the added test has the limit set back before it runs, through a call the
+		// read of its body does not see, so the whole run passes
+		"an added test that covers for a later one": {strings.Replace(selfRules, "limit = 1", "limit = 3", 1) + "\nfunc setLimit(n int) { limit = n }\n",
+			"\nfunc TestLimitIsThree(t *testing.T) {\n\tif Limit() != 3 {\n\t\tt.Fatal(Limit())\n\t}\n\tsetLimit(2)\n}\n", []string{"go", "test", "./..."}},
+		// the build's command puts the old limit back in the tree it ran in, once its own test has passed: the suite
+		// runs on an export of its own, where the change is as it was
+		"a command that rewrites the tree it ran in": {strings.Replace(selfRules, "limit = 1", "limit = 0", 1),
+			"\nfunc TestLimitIsZero(t *testing.T) {\n\tif Limit() != 0 {\n\t\tt.Fatal(Limit())\n\t}\n}\n", []string{"go", "test", "-run", "TestLimitIsZero", "-exec",
+				`/bin/sh -c '"$@" && sed -i "s/limit = 0/limit = 1/" /work/internal/supervise/rules.go' sh`, "./internal/supervise"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, _, _, cs, p := selfFixture(t)
@@ -184,5 +193,38 @@ func TestARebasedRulesChangeIsReadAndRunAgain(t *testing.T) {
 	s.Live = true
 	if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "own tests do not pass") || originHead(t, f, "main") != base {
 		t.Fatalf("a rebased change that breaks the base's test: %v", err)
+	}
+}
+
+// The landing reads the change again, whatever the package says of its hand paths: a package saved with none over a
+// change that rewrites an old test does not land, started or resumed, and the read after a rebase refuses it too.
+func TestALandingReadsTheChangeAgain(t *testing.T) {
+	ctx := context.Background()
+	for _, state := range []string{Proposed, Landing} {
+		s, _, f, c, p := selfFixture(t)
+		write(t, filepath.Join(p.Work, rulesPath), strings.Replace(selfRules, "limit = 1", "limit = 2", 1))
+		write(t, filepath.Join(p.Work, rulesTestPath), strings.Replace(selfRulesTest, "Limit() <= 0", "Limit() < -5", 1)+selfNewTest)
+		p, err := s.CheckArgs(ctx, c.ID, []string{"go", "test", "./..."}, nil, fixturePatch(t, s, c.ID))
+		if err != nil || !slices.Equal(p.Hand, []string{rulesTestPath}) {
+			t.Fatalf("setup: a hand landing: %v %v", p.Hand, err)
+		}
+		if _, err := proposePatch(t, s, ctx, c.ID, Proposal{Title: "The limit is two", Body: "Off by one.", Rollback: "revert", Signal: goodSignal, Window: 7 * 24 * time.Hour}); err != nil {
+			t.Fatal(err)
+		}
+		if p, err = s.Reviewed(ctx, c.ID, Review{Head: currentReviewHead(t, s, c.ID), Text: "Checked every changed file.", Comment: "https://github.com/agent-sh/fake/pull/7#c1"}); err != nil || !p.Clean() {
+			t.Fatalf("setup: a clean review: %+v %v", p, err)
+		}
+		p.Hand, p.State = nil, state
+		if err := s.save(&p); err != nil {
+			t.Fatal(err)
+		}
+		s.Live = true
+		base := originHead(t, f, "main")
+		if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), rulesTestPath) || originHead(t, f, "main") != base {
+			t.Fatalf("a %s package with no hand path over a rewritten test: %v", state, err)
+		}
+		if err := s.selfLanding(ctx, p, p.Head); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), rulesTestPath) {
+			t.Fatalf("the read after a rebase: %v", err)
+		}
 	}
 }

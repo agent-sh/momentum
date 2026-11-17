@@ -306,7 +306,8 @@ func handFixture(t *testing.T) (*Ship, store.Case, repoFixture, Package) {
 	t.Helper()
 	st := testStore(t)
 	ctx := context.Background()
-	f := newRepo(t, map[string]string{"internal/capacity/names.go": "package capacity\n\n// Named is the count.\nfunc Named() int { return 41 }\n"})
+	f := newRepo(t, map[string]string{"internal/capacity/names.go": "package capacity\n\n// Named is the count.\nfunc Named() int { return 41 }\n",
+		"internal/capacity/rules.go": "package capacity\n"})
 	s := shipFor(t, st, f)
 	s.Gate.Resolve = func(context.Context, string) (string, error) { return SelfRepo, nil }
 	c := testingCase(t, st)
@@ -597,7 +598,7 @@ func TestAHandLandingRevisionStaysOne(t *testing.T) {
 	if err := os.Remove(filepath.Join(p.Work, "internal/capacity/names_test.go")); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(p.Work, "internal/capacity/rules.go"), "package capacity\n")
+	write(t, filepath.Join(p.Work, "internal/capacity/rules.go"), "package capacity\n\n// The rules.\n")
 	in := fixturePatch(t, s, c.ID)
 	p.State = Revising
 	if err := s.save(&p); err != nil {

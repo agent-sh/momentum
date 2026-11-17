@@ -871,7 +871,7 @@ func (s *Ship) check(ctx context.Context, caseID string, test testCommand, testF
 		return p, err
 	}
 	if b.Exit != 0 && a.Exit == 0 && p.Kind != KindConfig {
-		if err := s.selfSuite(ctx, p, after, paths, added); err != nil {
+		if err := s.selfSuite(ctx, p, tree, paths, added); err != nil {
 			return p, err
 		}
 	}
@@ -1536,11 +1536,6 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 		return p, errors.Join(err, s.unexport(p, tree))
 	}
 	a, err := s.Sandbox.Run(ctx, tree, command, s.Env)
-	// the rebased change is read as the reviewed one was: what it does to the loop's own files, and their suite
-	var selfErr error
-	if err == nil && a.Exit == 0 {
-		selfErr = s.selfLanding(ctx, p, head, tree)
-	}
 	err = errors.Join(err, s.unexport(p, tree))
 	if err != nil {
 		return p, err
@@ -1548,8 +1543,9 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	if a.Exit != 0 {
 		return p, refused("after the rebase the test fails (exit %d): no landing", a.Exit)
 	}
-	if selfErr != nil {
-		return p, selfErr
+	// the rebased change is read as the reviewed one was: what it does to the loop's own files, and their suite
+	if err := s.selfLanding(ctx, p, head); err != nil {
+		return p, err
 	}
 	base, err := s.git(ctx, p.Host, "rev-parse", "origin/"+p.Base)
 	if err != nil {
@@ -1631,6 +1627,8 @@ func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, chan
 		switch {
 		case plainNow && rules:
 			why = rulesKept(old, now)
+		case !slices.Contains(changed, rulesOf(c)):
+			why = "its rules file is not in the change: a test lands with the rule it tests"
 		case plainNow:
 			names, why = appendedTests(old, now)
 		}
@@ -1665,11 +1663,15 @@ func (s *Ship) landPaths(ctx context.Context, p Package, base, head string) erro
 	return refused("%s: the change does more there than the loop lands (a rule's change with no new import, initializer or directive)", strings.Join(hand, ", "))
 }
 
+// rulesOf is the rules file a rules' test file tests: the file beside it.
+func rulesOf(test string) string { return strings.TrimSuffix(test, "_test.go") + ".go" }
+
 // selfSuite runs, for a change to the loop's own rules or their tests, the whole test suite of each package it
-// touches there, in the sandbox on an export of the change, without the tests the change adds: the tests the
-// package had must pass with the change, in a run where nothing the change added to the tests has run. The change's
-// own check proves the added tests; this proves the others still hold.
-func (s *Ship) selfSuite(ctx context.Context, p Package, dir string, changed, added []string) error {
+// touches there, in the sandbox, without the tests the change adds: the tests the package had must pass with the
+// change, in a run where nothing the change added to the tests has run. The change's own check proves the added
+// tests; this proves the others still hold. It runs on an export of rev made for it: the build's own test command
+// writes where it runs, and a suite run there would prove nothing.
+func (s *Ship) selfSuite(ctx context.Context, p Package, rev string, changed, added []string) error {
 	if !strings.EqualFold(p.Repo, SelfRepo) {
 		return nil
 	}
@@ -1689,8 +1691,12 @@ func (s *Ship) selfSuite(ctx context.Context, p Package, dir string, changed, ad
 	if err := s.Sandbox.resolve(cmd[0]); err != nil {
 		return err
 	}
-	o, err := s.Sandbox.Run(ctx, dir, cmd, s.Env)
+	dir, err := s.export(ctx, p, "suite", rev)
 	if err != nil {
+		return err
+	}
+	o, err := s.Sandbox.Run(ctx, dir, cmd, s.Env)
+	if err = errors.Join(err, s.unexport(p, dir)); err != nil {
 		return err
 	}
 	if o.Exit != 0 {
@@ -1700,8 +1706,8 @@ func (s *Ship) selfSuite(ctx context.Context, p Package, dir string, changed, ad
 }
 
 // selfLanding reads a rebased change to the loop's own repository as the check read the reviewed one: against the
-// base it now stands on, no path of it is a person's, and the suite of the package it touches passes on its export.
-func (s *Ship) selfLanding(ctx context.Context, p Package, head, dir string) error {
+// base it now stands on, no path of it is a person's, and the suite of the package it touches passes.
+func (s *Ship) selfLanding(ctx context.Context, p Package, head string) error {
 	if !strings.EqualFold(p.Repo, SelfRepo) {
 		return nil
 	}
@@ -1717,7 +1723,7 @@ func (s *Ship) selfLanding(ctx context.Context, p Package, head, dir string) err
 	if err != nil {
 		return err
 	}
-	return s.selfSuite(ctx, p, dir, p.Changed, added)
+	return s.selfSuite(ctx, p, head, p.Changed, added)
 }
 
 // ciOK are the conclusions of a workflow's run that passed, or that chose not to run.
