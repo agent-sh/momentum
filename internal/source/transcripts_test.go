@@ -249,9 +249,9 @@ func TestTranscriptsMapEachItemAndKeepTheOwnersWordsApart(t *testing.T) {
 	}
 
 	reply := find(t, evs, "agent_text", "Checking the cache settings")
-	if reply.Actor != store.ActorAgent || reply.Model != "claude-opus-5-5" || !strings.HasSuffix(reply.Summary, "release build now?") ||
-		!strings.Contains(reply.Summary, "…") || len(reply.Summary) > headChars+tailChars+8 {
-		t.Fatalf("a long reply keeps its start and end: %+v", reply)
+	if reply.Actor != store.ActorAgent || reply.Model != "claude-opus-5-5" || len(reply.Summary) > headChars+tailMost+8 ||
+		!strings.HasSuffix(reply.Summary, "… . The cache key is built from the lockfile and the toolchain. Should I run the release build now?") {
+		t.Fatalf("a long reply keeps its start and its last two sentences: %+v", reply)
 	}
 	call := find(t, evs, "tool_call", "make cache-check")
 	res := find(t, evs, "tool_result", "No rule to make target")

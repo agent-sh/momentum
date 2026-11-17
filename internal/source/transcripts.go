@@ -13,10 +13,12 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/agent-sh/tacit/client/pkg/evidence"
 
+	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/internal/store"
 	"github.com/agent-sh/momentum/internal/toolresult"
 	"github.com/agent-sh/momentum/sessions"
@@ -75,13 +77,17 @@ const spare = 512
 
 // How much of each text a summary keeps. An owner's turn is what the families quote, and a typed turn is
 // seldom longer than ownerChars. An error's output holds the failure, so it keeps more than other results.
-// Agent text keeps its start and its end: what it set out to do and what it asks or claims.
+// Agent text keeps its start and its end: what it set out to do and what it asks or claims. The end is its last
+// two sentences whole, from the mark that closed the one before them, when they fit in tailMost bytes
+// (plain.KeptEnd): the rules that read how a turn ended read its last two sentences, and a cut at a byte count
+// falls inside one of them more often than not. An end that does not fit is the last tailChars bytes.
 const (
 	ownerChars = 2000
 	errorChars = 1000
 	textChars  = 240
 	headChars  = 160
 	tailChars  = 80
+	tailMost   = 480
 )
 
 // skipWhy are the items not stored, by tacit's reason, with why: Codex's "[Recorded tool history]" message
@@ -822,7 +828,7 @@ func toPending(e evidence.Event, gitFlag func(harness, tool, input string) strin
 	case evidence.KindOwnerText:
 		p.texts, p.keep = cutHead(e.Text, ownerChars)
 	case evidence.KindAgentText:
-		p.texts, p.keep = cutEnds(e.Text, headChars, tailChars)
+		p.texts, p.keep = cutEnds(e.Text, headChars, tailChars, tailMost)
 	case evidence.KindToolCall:
 		p.texts, p.keep = cutHead(whereFirst(e.ToolInput), textChars)
 		if gitFlag != nil {
@@ -852,19 +858,24 @@ func cutHead(s string, n int) ([]string, func([]string) string) {
 	return []string{strings.Clone(prefix(s, n+spare))}, func(r []string) string { return oneLine(prefix(r[0], n), cut) }
 }
 
-// cutEnds keeps the first head and the last tail bytes of s, each with spare until redaction, as two texts
-// (so a quote the head leaves open is not paired with one of the tail's), or one when they meet.
-func cutEnds(s string, head, tail int) ([]string, func([]string) string) {
+// cutEnds keeps the first head bytes of s and its end (plain.KeptEnd: at least its last tail bytes, at most its
+// last most), each with spare until redaction, as two texts (so a quote the head leaves open is not paired with
+// one of the end's), or one when they meet. A text whose head and end meet after redaction is kept whole.
+func cutEnds(s string, head, tail, most int) ([]string, func([]string) string) {
 	if len(s) <= head+tail {
 		return []string{strings.Clone(s)}, func(r []string) string { return oneLine(r[0], false) }
 	}
-	if len(s) <= head+tail+2*spare {
+	if len(s) <= head+most+2*spare {
 		return []string{strings.Clone(s)}, func(r []string) string {
-			return oneLine(prefix(r[0], head), true) + " " + oneLine(suffix(r[0], tail), false)
+			h, end := prefix(r[0], head), plain.KeptEnd(r[0], tail, most)
+			if len(h)+len(end) >= len(strings.TrimRightFunc(r[0], unicode.IsSpace)) {
+				return oneLine(r[0], false)
+			}
+			return oneLine(h, true) + " " + oneLine(end, false)
 		}
 	}
-	return []string{strings.Clone(prefix(s, head+spare)), strings.Clone(suffix(s, tail+spare))}, func(r []string) string {
-		return oneLine(prefix(r[0], head), true) + " " + oneLine(suffix(r[1], tail), false)
+	return []string{strings.Clone(prefix(s, head+spare)), strings.Clone(suffix(s, most+spare))}, func(r []string) string {
+		return oneLine(prefix(r[0], head), true) + " " + oneLine(plain.KeptEnd(r[1], tail, most), false)
 	}
 }
 
@@ -975,4 +986,11 @@ func toEvent(source string, e evidence.Event, summary string, ours bool, git str
 			"prior": e.Prior, "why": why, "parent": e.Parent, store.GitKey: git}),
 		Ref: fmt.Sprintf("%s@%d#%d", e.Path, e.Offset, e.Index),
 	}, unknown
+}
+
+// AgentSummary is what a summary keeps of an agent's text that holds nothing to redact: the rules that read an
+// agent's last words from a live session cut them the same way, and a test holds the two together.
+func AgentSummary(text string) string {
+	texts, keep := cutEnds(text, headChars, tailChars, tailMost)
+	return keep(texts)
 }

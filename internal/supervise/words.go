@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
-	"unicode/utf8"
 
+	"github.com/agent-sh/momentum/internal/plain"
 	"github.com/agent-sh/momentum/sessions"
 )
 
@@ -25,11 +25,13 @@ func ErrorClass(text string) string { return sessions.ErrorClass(text) }
 // too.
 func ResetAt(text string, at time.Time) (time.Time, bool) { return sessions.ResetAt(text, at) }
 
-// The agent's last words, as the store keeps an agent's text: its first headChars and last tailChars bytes,
-// whitespace folded. The rules read only this, live and in the replay alike.
+// The agent's last words, as the store keeps an agent's text: its first headChars bytes and its end
+// (plain.KeptEnd: its last two sentences in at most tailMost bytes, else its last tailChars bytes), whitespace
+// folded. The rules read only this, live and in the replay alike.
 const (
 	headChars = 160
 	tailChars = 80
+	tailMost  = 480
 )
 
 // reTrailer is what a harness appends to an agent's text that is not the agent's words: Codex's memory
@@ -46,7 +48,11 @@ func Words(s string) string {
 	if len(s) <= headChars+tailChars {
 		return fold(s)
 	}
-	return fold(prefix(s, headChars)) + "… " + fold(suffix(s, tailChars))
+	head, end := prefix(s, headChars), plain.KeptEnd(s, tailChars, tailMost)
+	if len(head)+len(end) >= len(strings.TrimRightFunc(s, unicode.IsSpace)) {
+		return fold(s) // they meet: the text is kept whole
+	}
+	return fold(head) + "… " + fold(end)
 }
 
 func fold(s string) string { return strings.Join(strings.Fields(s), " ") }
@@ -85,10 +91,6 @@ func tail(words string) string {
 	return words
 }
 
-// reSentenceEnd is where a sentence may end: its marks, what closes a quote, a bracket or an emphasis after them,
-// and a space.
-var reSentenceEnd = regexp.MustCompile("[.!?]+[\"'”’)\\]*_`]*\\s+")
-
 // sentences splits a text where its sentences end: at a mark that a space follows, when what comes next does not
 // begin with a small letter, and at the end. A mark with no space after it ("v2.1", "config.yaml", "docs/plan.md")
 // ends nothing, and neither does one that small letters follow ("e.g. two columns"): the rest would read as a
@@ -110,10 +112,7 @@ func split(text string, every bool) []string {
 		}
 	}
 	start := 0
-	for _, m := range reSentenceEnd.FindAllStringIndex(text, -1) {
-		if r, _ := utf8.DecodeRuneInString(text[m[1]:]); !every && unicode.IsLower(r) {
-			continue
-		}
+	for _, m := range plain.SentenceEnds(text, every) {
 		add(text[start:m[1]])
 		start = m[1]
 	}

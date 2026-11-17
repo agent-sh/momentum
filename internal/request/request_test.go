@@ -288,7 +288,8 @@ func TestCopiesJoinAndTwinsAreAProgramsTurns(t *testing.T) {
 	}
 }
 
-// cutEnds is how the store keeps an agent text: its first 160 and last 80 bytes (SPEC, Session history).
+// cutEnds is how the store keeps an agent text whose end holds no sentence that fits: its first 160 and last 80
+// bytes (SPEC, Session history).
 func cutEnds(s string) string {
 	s = strings.Join(strings.Fields(s), " ")
 	if len(s) <= 240 {

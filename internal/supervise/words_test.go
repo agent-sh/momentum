@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/agent-sh/momentum/internal/source"
 )
 
 func TestErrorClassSaysWhetherToTryAgain(t *testing.T) {
@@ -119,8 +121,9 @@ func TestPromiseFindsWorkLeftForLater(t *testing.T) {
 			t.Errorf("Promise(%q) = %q, want %q", c.words, got, c.quote)
 		}
 	}
-	// The store keeps a long text by its ends. A sentence whose start was cut may hang on what is gone: an offer
-	// that waits for the owner reads as a promise once "If you approve it," or "Say the word" is cut. It is none.
+	// The store kept a long text by its first 160 and last 80 bytes, and still keeps so an end whose last sentence
+	// does not fit (byEnds). A sentence whose start was cut may hang on what is gone: an offer that waits for the
+	// owner reads as a promise once "If you approve it," or "Say the word" is cut. It is none.
 	long := strings.Repeat("The report lists every table and its row count. ", 6)
 	for _, c := range []struct{ end, tail, quote string }{
 		{"Say the word on either and I'll make the change to the staging rule and to the ads.", "the word on either and I'll make", ""},
@@ -140,12 +143,20 @@ func TestPromiseFindsWorkLeftForLater(t *testing.T) {
 		// a question before the promise is an ask, cut or not
 		{"Was it the staging rule that you meant by the note in the plan? I'll check back on it at 14:10.", "ing rule that you meant", ""},
 	} {
-		words := Words(long + c.end)
+		words := byEnds(long + c.end)
 		if !strings.HasPrefix(tail(words), c.tail) || !strings.Contains(words, "… ") {
 			t.Fatalf("setup: the kept end does not begin %q: %q", c.tail, tail(words))
 		}
 		if got := Promise(words); got != c.quote {
 			t.Errorf("Promise(cut %q) = %q, want %q", c.end, got, c.quote)
+		}
+		// the words keep the last two sentences whole now: an offer is seen as one, and a promise is read whole
+		whole := c.end
+		if i := strings.Index(c.end, ". I'll check back"); i >= 0 {
+			whole = "I'll check back at 14:10."
+		}
+		if got, want := Promise(Words(long+c.end)), map[bool]string{true: whole}[!AsksOwner(c.end)]; got != want {
+			t.Errorf("Promise(whole %q) = %q, want %q", c.end, got, want)
 		}
 	}
 	// words whose kept end is a harness's trailer are read from their start, and nothing of that is cut
@@ -195,20 +206,47 @@ func TestQuestionIsWhatTheTurnAsksTheOwner(t *testing.T) {
 	if got := Question(long); got != q {
 		t.Fatalf("question %q", got)
 	}
-	if got := Asked(Words(long)); got == "" || len(got) >= len(q) {
-		t.Fatalf("the words keep only the end of it: %q", got)
+	if got := Asked(byEnds(long)); got == "" || len(got) >= len(q) {
+		t.Fatalf("words cut at a byte count keep only the end of it: %q", got)
+	}
+	if got := Asked(Words(long)); got != q {
+		t.Fatalf("the words keep the last two sentences whole: %q", got)
 	}
 	if got := Question("Merged and tagged. Nothing else is left."); got != "" {
 		t.Fatalf("no question: %q", got)
 	}
 }
 
+// byEnds is a text as the store kept it before it kept whole sentences, and as it keeps one whose end does not
+// fit: its first 160 and last 80 bytes.
+func byEnds(s string) string {
+	if len(s) <= headChars+tailChars {
+		return fold(s)
+	}
+	return fold(prefix(s, headChars)) + "… " + fold(suffix(s, tailChars))
+}
+
 func TestWordsKeepWhatTheStoreKeeps(t *testing.T) {
+	// an end with no sentence that fits is the last bytes
 	long := strings.Repeat("start ", 40) + strings.Repeat("middle ", 60) + "and the end, I'll report back."
 	w := Words(long)
 	if !strings.HasPrefix(w, "start start") || !strings.HasSuffix(w, "I'll report back.") || !strings.Contains(w, "… ") ||
-		len(w) > headChars+tailChars+8 {
+		len(w) > headChars+tailChars+8 || w != byEnds(long) {
 		t.Fatalf("words %q", w)
+	}
+	// the last two sentences are kept whole, from the mark that closed the one before them
+	two := strings.Repeat("The report lists every table and its row count. ", 8) + "The import ran on the staging copy and wrote nothing to the live tables. If you approve it, I'll build the checklist page."
+	if w := Words(two); !strings.HasSuffix(w, "… . The import ran on the staging copy and wrote nothing to the live tables. If you approve it, I'll build the checklist page.") {
+		t.Fatalf("the last two sentences: %q", w)
+	}
+	// when the two do not fit, the last one; and a text whose start and end meet is kept whole
+	one := strings.Repeat("The report lists every table and its row count. ", 8) + strings.Repeat("the import ran on the staging copy and ", 12) + "wrote nothing. I'll check back at 14:10."
+	if w := Words(one); !strings.HasSuffix(w, "… . I'll check back at 14:10.") && !strings.HasSuffix(w, "wrote nothing. I'll check back at 14:10.") || len(tail(w)) < tailChars-8 {
+		t.Fatalf("the last sentence: %q", w)
+	}
+	met := strings.Repeat("The report lists every table. ", 5) + "The import ran on the staging copy. I'll check back at 14:10."
+	if w := Words(met); strings.Contains(w, "… ") || w != met {
+		t.Fatalf("a text whose ends meet: %q", w)
 	}
 	if got := Words("short  text\nhere"); got != "short text here" {
 		t.Fatalf("short %q", got)
@@ -227,5 +265,24 @@ func TestHermesNotices(t *testing.T) {
 	short := "Your request was not processed. Send it again if you still want me to carry it out."
 	if !CutShort(Words(short)) || !CutShort("This turn did not complete. Some actions may already have run; verify their effects before resending.") || CutShort(cut) {
 		t.Fatal("cut short")
+	}
+}
+
+// The rules read a live session's last words as the store keeps an agent's text: the two cuts are one.
+func TestWordsAreTheStoresSummary(t *testing.T) {
+	start := strings.Repeat("The report lists every table and its row count. ", 8)
+	for _, text := range []string{
+		"short  text\nhere",
+		start + "The import ran on the staging copy. If you approve it, I'll build the checklist page.",
+		start + "Plan v2.1 is in docs/plan.md now. Should I go on?\n\nI'll check config.yaml at 14:10.  ",
+		start + strings.Repeat("the import ran on the staging copy and ", 14) + "wrote nothing. I'll check back at 14:10.",
+		start + strings.Repeat("no sentence ends here and ", 40) + "it goes on",
+		strings.Repeat("The report lists every table. ", 5) + "The import ran on the staging copy. I'll check back at 14:10.",
+		strings.Repeat(start, 12) + "The import ran. I'll check back at 14:10.",
+		strings.Repeat("é", 400) + ". The import ran. I'll check back.",
+	} {
+		if got, want := Words(text), source.AgentSummary(text); got != want {
+			t.Errorf("Words = %q, the store keeps %q", got, want)
+		}
 	}
 }
