@@ -1092,6 +1092,12 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 		if err != nil {
 			return nil, "", err
 		}
+		if unread == 0 {
+			// Nothing new, and the case is here to be worked on all the same: it was sent back (a proposal closed
+			// unmerged, a person's update), so all it holds is to be read again. Without this it would wait behind
+			// every case with one new event for as long as new cases come in.
+			unread = c.Evidence
+		}
 		cands = append(cands, candidate{c, step, rank, unread})
 	}
 	if len(cands) == 0 {

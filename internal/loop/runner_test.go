@@ -516,6 +516,44 @@ func TestThePickPrefersEvidenceNoInvestigationHasRead(t *testing.T) {
 	}
 }
 
+// A case sent back to be investigated again with nothing new is not left behind every new case: all it holds is to
+// be read again.
+func TestACaseSentBackWithNothingNewKeepsItsPlace(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	r := localRunner(t, st)
+	back := investigatedCase(t, st, "sent-back", 30)
+	if _, err := st.UpdateCase(ctx, back.ID, store.CaseUpdate{Status: store.CaseOpen}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	fresh := openCase(t, st, "failures", "one-new-event", 1)
+	if n, err := st.UnreadEvidence(ctx, back.ID, StepInvestigate); err != nil || n != 0 {
+		t.Fatalf("setup: the sent-back case has %d unread (%v), want 0", n, err)
+	}
+	picked, _, why, err := r.pick(ctx, "failures", "", false)
+	if err != nil || picked.ID != back.ID || !strings.Contains(why, "30 unread") {
+		t.Fatalf("picked %s (%q, %v), want the case sent back, %s, before %s", picked.ID, why, err, back.ID, fresh.ID)
+	}
+}
+
+// investigatedCase is a case in testing whose investigation ended well after all its evidence was filed.
+func investigatedCase(t *testing.T, st *store.Store, sig string, n int) store.Case {
+	t.Helper()
+	ctx := context.Background()
+	c := openCase(t, st, "failures", sig, n)
+	time.Sleep(2 * time.Millisecond)
+	if err := st.PutLoopRun(ctx, store.LoopRun{ID: "r-" + sig, Case: c.ID, Family: c.Family, Step: StepInvestigate,
+		Started: time.Now(), Ended: time.Now(), Status: store.RunOK}); err != nil {
+		t.Fatal(err)
+	}
+	mechanism, fix := "one cause", "one fix"
+	got, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseTesting, Mechanism: &mechanism, NextTest: &fix}, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
 // Evidence a merge brings keeps the time it was filed with the case it came from: filed before the target's last
 // finished investigation began it counts as read there, and filed after it as unread.
 func TestMergedEvidenceCountsByWhenItWasFiled(t *testing.T) {
