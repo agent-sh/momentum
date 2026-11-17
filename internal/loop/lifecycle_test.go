@@ -97,6 +97,7 @@ case "$1 $2" in
   merged='null'; [ "$st" = MERGED ] && merged='"2026-11-08T00:00:00Z"'
   echo "{\"state\":\"$st\",\"headRefOid\":\"$oid\",\"baseRefName\":\"main\",\"mergedAt\":$merged}";;
 "pr close") n=${3##*/}; read st r h by < "$state/pr-$n"; echo "CLOSED $r $h momentum" > "$state/pr-$n";;
+"api "*) echo '`+passedChecks+`';;
 esac
 exit 0`)
 	w.r = localRunner(t, w.st)
@@ -459,6 +460,9 @@ func (w *lifeWorld) event(name string) error {
 		w.s.Live = true
 		defer func() { w.s.Live = false }()
 		_, err := w.s.Land(ctx, id)
+		if err != nil && strings.Contains(err.Error(), "could not be read") {
+			t.Fatalf("the walk's forge answered the landing's read of the checks with nothing: %v", err)
+		}
 		return err
 	case "the owner withdraws the package":
 		_, err := w.s.Withdraw(ctx, id, "its fix moved")
