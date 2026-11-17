@@ -943,42 +943,28 @@ func (h past) his(m store.Mark) bool {
 //
 // A turn that only tells the session to go on (Nudge) names no work, so before is then the last request in his
 // own words before it: his newest turn that says more, among the turns read (beforeTurns). Whatever else came
-// between the two is not looked at: the message says whose words it quotes and no more. The store is read every
-// few minutes and the first try comes sooner, so the nudge that opened the turn may not be in it yet: the
-// session's own last input then says so, when it is a nudge and no message of momentum's, and the store's
-// newest turn that says more is the request before it. A retry serves the same turn either way: the message for
-// a nudged turn quotes only the request before it.
+// between the two is not looked at: the message says whose words it quotes and no more. A retry serves the same
+// turn: the message it follows quoted that request.
 func (h past) turnFor(s *sessions.Session, marks []store.Mark) (turn, before string) {
 	m, ok := h.ownerMark(marks)
 	if !ok || s.UserAt.IsZero() && s.TurnBegan.IsZero() {
 		return "", ""
 	}
-	said := "" // his newest turn that says more than to go on
-	for _, b := range marks {
-		if h.his(b) && !Nudge(b.Summary) {
-			said = b.Summary
-			break
-		}
-	}
 	turn = m.Summary
 	if Nudge(turn) {
-		before = said
+		for _, b := range marks {
+			if b.At.Before(m.At) && h.his(b) && !Nudge(b.Summary) {
+				before = b.Summary
+				break
+			}
+		}
 	}
 	const skew = 2 * time.Second
-	const anyNudge = "." // the message for a nudged turn does not quote the nudge
 	opened := m.At
-	if l := h.last(); s.UserAt.After(opened) && l != nil && l.rule == RuleTransient && fold(lastUser(s)) == l.text {
-		switch {
-		case quotes(l.text, turn, before):
-			opened = s.UserAt
-		case quotes(l.text, anyNudge, said): // the retry of a turn whose nudge the store did not hold at its first try
-			return anyNudge, said
-		}
+	if l := h.last(); s.UserAt.After(opened) && l != nil && l.rule == RuleTransient && fold(lastUser(s)) == l.text && quotes(l.text, turn, before) {
+		opened = s.UserAt
 	}
 	if s.UserAt.After(opened.Add(skew)) || s.TurnBegan.After(opened.Add(skew)) {
-		if u := lastUser(s); Nudge(u) && !h.ours(u) {
-			return u, said
-		}
 		return "", ""
 	}
 	return turn, before

@@ -321,6 +321,8 @@ func TestTheReplayOfATurnANudgeOpenedQuotesTheRequestBeforeIt(t *testing.T) {
 	b := newTimeline(t, "nudged-turn").owner(0, "deploy it", "turn_duration").say(10*time.Second, "Deployed half of it.").
 		notify(time.Minute, "<task-notification> <task-id>b1</task-id> <status>completed</status> </task-notification>").
 		say(10*time.Second, "Nothing is waiting.").
+		// a message of momentum's the store credited to him is no request of his
+		owner(time.Minute, Marker+" Your last turn ended with a promise. Go on with it.", "turn_duration").say(10*time.Second, "Nothing is waiting.").
 		owner(10*time.Minute, ".", "turn_duration").say(10*time.Second, "Going on.").apiError(time.Minute, err503)
 	first := b.at
 	b.add(time.Minute, "harness_text", store.ActorHarness, "", quoted, `{"input_kind":"typed","prior":"turn_duration","why":"momentum supervise"}`).

@@ -1243,8 +1243,8 @@ func TestATransientMessageNamesTheOwnersRequest(t *testing.T) {
 }
 
 // A turn the owner's nudge opened: the transient message quotes the last request in his own words before the
-// nudge from the store, whether or not the store holds the nudge yet, its retry serves the same turn, and a
-// session whose store holds only the nudge is sent to find the request.
+// nudge from the store, its retry serves the same turn, and a session whose store holds only the nudge is sent
+// to find the request.
 func TestATransientMessageAfterANudgeNamesTheRequestBeforeIt(t *testing.T) {
 	st := testStore(t)
 	f := &fakeSender{}
@@ -1277,29 +1277,30 @@ func TestATransientMessageAfterANudgeNamesTheRequestBeforeIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	put(slash, 3, nudged, ".")
-	// the store is read every few minutes: the nudge that opened the turn is not in it yet, and the session's own
-	// last input says it
+	// the store is read every few minutes: a nudge it does not hold yet is a turn of his it does not hold, and
+	// the message names no request, as for any such turn
 	unheld := mk("sess-unheld", "%4")
 	put(unheld, 1, nudged.Add(-20*time.Minute), "build the release notes")
 	typed(unheld, "resume", nudged)
 	run(t, sv, after, only, slash, unheld)
 	quoted := Marker + ` Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on; the last request in their own words before it was "build the release notes". Continue where you left off.`
 	unknown := Marker + " Your last turn stopped on a transient API error before it finished. Your user's last message only told you to go on: continue the last real request before it, where you left off."
-	want := []string{"%1 " + quoted, "%2 " + unknown, "%3 " + quoted, "%4 " + quoted}
+	fixed := Marker + " Your last turn stopped on a transient API error. Continue where you left off."
+	want := []string{"%1 " + quoted, "%2 " + unknown, "%3 " + quoted, "%4 " + fixed}
 	if strings.Join(f.sent, "|") != strings.Join(want, "|") {
 		t.Fatalf("sent %q, want %q", f.sent, want)
 	}
 	// Each message lands and its turn fails the same way: the second try says what the first said.
 	landed := now.Add(2 * time.Second)
-	for s, text := range map[*sessions.Session]string{after: quoted, only: unknown, unheld: quoted} {
+	for s, text := range map[*sessions.Session]string{after: quoted, only: unknown} {
 		lands(s, text, landed, false)
 		s.TurnBegan, s.Since = landed, t0.Add(3*time.Minute)
 	}
 	now = t0.Add(4 * time.Minute)
-	run(t, sv, after, only, unheld)
+	run(t, sv, after, only)
 	now = t0.Add(8 * time.Minute)
-	run(t, sv, after, only, unheld)
-	if want = append(want, "%1 "+quoted, "%2 "+unknown, "%4 "+quoted); strings.Join(f.sent, "|") != strings.Join(want, "|") {
+	run(t, sv, after, only)
+	if want = append(want, "%1 "+quoted, "%2 "+unknown); strings.Join(f.sent, "|") != strings.Join(want, "|") {
 		t.Fatalf("second tries: sent %q, want %q", f.sent, want)
 	}
 	// The store credits momentum's message to him, he nudges again and that turn fails too: the message of
