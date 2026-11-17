@@ -14,6 +14,7 @@ var t0 = time.Date(2026, 3, 4, 10, 0, 0, 0, time.UTC)
 const (
 	err503   = "API Error: 503 Bedrock is unable to process your request. This is a server-side issue, usually temporary."
 	errLogin = "Login expired · Please run /login"
+	errEdge  = "Please run /login · API Error: 403 Attention Required! | Cloudflare"
 )
 
 // probeAt says access came back at t.
@@ -71,6 +72,7 @@ func TestTransientTriesAgainWithABackoff(t *testing.T) {
 		{"background work in flight does not stop it", stopped(func(s *Stop) { s.Phase, s.Error, s.Tasks = sessions.Background, err503, 2 }), Tries{}, nil, Wait, t0.Add(time.Minute), 1, ""},
 		{"a refusal is never tried again", stopped(func(s *Stop) { s.Error = "API Error: the safeguards flagged this message" }), Tries{}, nil, "", time.Time{}, 0, ""},
 		{"a login error is not transient", stopped(func(s *Stop) { s.Error = errLogin }), Tries{}, nil, "", time.Time{}, 0, ""},
+		{"the edge's page is, though it carries the login hint", stopped(func(s *Stop) { s.Phase, s.Error = sessions.NeedsYou, errEdge }), Tries{}, nil, Wait, t0.Add(time.Minute), 1, "transient API error"},
 		{"a turn running", stopped(func(s *Stop) { s.Error, s.Working = err503, true }), Tries{}, nil, "", time.Time{}, 0, ""},
 		{"no error", stopped(func(s *Stop) {}), Tries{}, nil, "", time.Time{}, 0, ""},
 	})

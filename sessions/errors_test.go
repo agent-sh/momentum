@@ -22,6 +22,8 @@ func TestHeldByReadsTheKindAndTheWords(t *testing.T) {
 		{"a throttle named rate_limit", "rate_limit", "API Error: 429 Too many requests, slow down", soon, false},
 		{"a failed login", "authentication_failed", "Login expired · Please run /login", soon, true},
 		{"a transient error", "server_error", "API Error: 529 overloaded", soon, false},
+		{"the edge's page with a login hint", "authentication_failed", "Please run /login · API Error: 403 Attention Required! | Cloudflare", soon, false},
+		{"the edge's page, no kind", "", "Please run /login · API Error: 403 Attention Required! | Cloudflare", soon, false},
 		{"organization words on a kind that is no access kind", "model_not_found", org, soon, false},
 		{"a usage limit, no kind", "", limit, soon, true},
 		{"organization words, no kind", "", org, soon, true},

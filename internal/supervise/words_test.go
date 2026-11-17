@@ -13,9 +13,12 @@ func TestErrorClassSaysWhetherToTryAgain(t *testing.T) {
 		"API Error: Server error mid-response. The response above may be incomplete.":                               Transient,
 		"API Error: 500 The system encountered an unexpected error during processing.":                              Transient,
 		"API Error: Connection refused — a firewall or proxy may be blocking it":                                    Transient,
-		"API Error: 529 overloaded":                                                                            Transient,
-		"Login expired · Please run /login":                                                                    Login,
-		"Please run /login · API Error: 403 Attention Required! | Cloudflare":                                  Transient, // the edge's page, not the login
+		"API Error: 529 overloaded":                                           Transient,
+		"Login expired · Please run /login":                                   Login,
+		"Please run /login · API Error: 403 Attention Required! | Cloudflare": Transient, // the edge's page, not the login
+		// The harness's own words for a request the edge blocked say the network must change: not tried again blindly.
+		"API Error: Request blocked before it reached Anthropic's API (HTTP 403) · the network this request came from isn't allowed · signing in again won't change this · check your VPN or network and retry": "",
+		"Please run /login · API Error: 403 Just a moment...":                                                  Login, // another page of the edge: not known to pass by itself
 		"Not logged in · Please run /login":                                                                    Login,
 		"You've hit your weekly limit · resets Mar 7, 9am (Europe/Lisbon)":                                     Limit,
 		"5-hour limit reached ∙ resets 3pm":                                                                    Limit,

@@ -17,7 +17,9 @@ var (
 	// Never tried again: a refusal, a request too long to send, a misuse.
 	reNoRetry = regexp.MustCompile(`(?i)safeguards flagged|safety classifier|usage policy|prompt is too long|too long for|context (window|length) (exceeded|is full)|invalid[_ ]request|credit balance|capture only|tool use concurrency`)
 	// The network's edge in front of the API turned the request away with its own page (Cloudflare's "Attention
-	// Required!"). The harness prints its login hint with it, but the login is not what failed: it passes by itself.
+	// Required!"). The harness prints its login hint with it, but the login is not what failed. Where it was seen it
+	// came and went within minutes, with working calls between: it is tried again as an outage is. The edge's other
+	// pages, and the harness's own words for a blocked network, are not known to pass and keep their class.
 	reEdge  = regexp.MustCompile(`(?i)attention required!? \| cloudflare`)
 	reOrg   = regexp.MustCompile(`(?i)organization has disabled|disabled (claude )?subscription access|ask your admin to enable`)
 	reLogin = regexp.MustCompile(`(?i)login expired|not logged in|please run /login|oauth token (has )?(expired|revoked)|authentication_error|invalid api key|401 unauthorized`)
