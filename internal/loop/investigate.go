@@ -55,7 +55,7 @@ func (r *Runner) configTargetsFor(c store.Case) bool {
 const findingsInstruction = "Keep findings as you go in /out/findings.md. Use the headings ## Mechanism, ## Alternatives ruled out, ## Fix, and ## Summary. End with your report of the same fields."
 
 // liveQuestion is what a live investigation is asked.
-const liveQuestion = "Find the root cause of this problem and the fix. State the mechanism, the alternatives ruled out, the fix, and a summary. If the fix is code in a repository under /ro/repos, also report repo as its NAME. If the fix is anywhere else (a file on the machine outside those repositories, another project's code, a program maintained elsewhere, a setting only the owner can change), report place: where it is, on one line; with no such place, leave it out. Report nothing_to_fix as true only when no change anywhere would help (the tool worked as it is meant to, a provider refused or failed by itself, the problem ended), and say why in the summary: a fix that lives somewhere else is a place, not nothing to fix. Build no change."
+const liveQuestion = "Find the root cause of this problem and the fix. State the mechanism, the alternatives ruled out, the fix, and a summary. If the fix is code in a repository under /ro/repos, also report repo as its NAME. If the fix is anywhere else (a file on the machine outside those repositories, another project's code, a program maintained elsewhere, a setting only the owner can change), report place: where it is, on one line; with no such place, leave it out. Report nothing_to_fix as true only when no change anywhere would help (the tool worked as it is meant to, a provider refused or failed by itself, the problem ended); then fix says that nothing is to change, and the summary says why. A fix that lives somewhere else is a place, not nothing to fix. Build no change."
 
 // configQuestion is added to the live question while configuration targets are on.
 const configQuestion = " If the fix is the content of one existing configuration file under /ro/config instead, report config as its path there (such as /ro/config/.config/agents/NAME.md) and no repo or place. The host proposes a change only to a file the owner listed, and an agent applies it."
@@ -247,11 +247,19 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 	if !holdsText(fix) {
 		fix = ""
 	}
+	if reported && noneWord(f.Repo) {
+		f.Repo = "" // a word for none is no repository's name
+	}
 	u := store.CaseUpdate{Status: store.CaseInvestigating}
 	if reported {
 		u.Mechanism, u.NextTest, u.Alternatives = &mechanism, &fix, alternatives
 		if alternatives == nil {
 			u.Alternatives = []string{}
+		}
+		// A report that says where the fix lives and not what it is still found the cause and the place: the case
+		// waits with the place, as one with a fix does. Closed as undecided, the place would be lost.
+		if mechanism != "" && fix == "" && f.Repo == "" && f.Config == "" && placeOf(f) != "" {
+			fix = fixNotStated // a case in testing says what its fix is
 		}
 		if mechanism != "" && fix != "" {
 			u.Status = store.CaseTesting
@@ -280,6 +288,11 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 			}
 			return st.RecordDismissed(ctx, caseID, episode, u, nothingToFix+plainClip(plain.Line(why), dismissedMax), actor)
 		}
+		// it stays for its fix, whatever the report's fix says: a close here could not be resumed from
+		if fix == "" {
+			fix = fixNotStated
+		}
+		u.Status = store.CaseTesting
 	}
 	if undecided != "" && u.Status != store.CaseTesting {
 		return st.RecordUndecided(ctx, caseID, episode, u, undecided, actor)
@@ -331,14 +344,25 @@ const nothingToFix = "the investigation found nothing to fix: "
 // one, or a word that only says there is none.
 func placeOf(f finding) string {
 	place := plainClip(plain.Line(strings.TrimSpace(f.Place)), placeMax)
-	switch strings.ToLower(strings.Trim(place, " .-")) {
-	case "", "n/a", "na", "none", "nowhere", "unknown", "null":
-		return ""
-	}
-	if !holdsText(place) {
+	if noneWord(place) || !holdsText(place) {
 		return ""
 	}
 	return place
+}
+
+// fixNotStated stands for the fix of a report that named none and whose case still waits for one: it said where
+// the fix lives, or it is a component-health case that stays open for its fix.
+const fixNotStated = "(the investigation stated no fix)"
+
+// noneWord says whether a field's text only says there is none: empty, or a word a report puts where it has
+// nothing to name.
+func noneWord(s string) bool {
+	s = strings.ToLower(strings.Trim(s, " .-()?!\"'—–"))
+	switch s {
+	case "", "n/a", "na", "n.a", "none", "nowhere", "unknown", "null", "nil", "no", "not applicable", "no place", "none needed", "tbd":
+		return true
+	}
+	return strings.HasPrefix(s, "n/a ") || strings.HasPrefix(s, "none ") || strings.HasPrefix(s, "not applicable ")
 }
 
 // dismissedMax and placeMax bound that reason's quote of the summary, and the place a finding names.

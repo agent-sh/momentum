@@ -336,9 +336,12 @@ func waitingRepoNote(c store.Case, hold string, at time.Time) store.Note {
 		if c.Family == store.HealthFamily { // which closes naming what fixed it
 			done = "momentum case close " + c.ID + " --reason already-solved --fix REF --why WHY"
 		}
-		// what to do comes first: a short view keeps the start
-		n.Detail = "The loop builds only in its own repositories, so the case waits in testing. An agent or the owner makes the change and closes the case (" +
-			done + "), or declines it (--reason not-worth-it). Where: " + sentence(place) + " The fix: " + sentence(plainClip(plain.Line(c.NextTest), 350))
+		// what to do comes first, then the fix: a short view keeps the start, and the title already names the place
+		n.Detail = "The loop cannot build this fix. Make the change and close the case (" + done + "), or decline it (--reason not-worth-it)."
+		if fix := plainClip(plain.Line(c.NextTest), 350); holdsText(fix) && fix != fixNotStated {
+			n.Detail += " The fix: " + sentence(fix)
+		}
+		n.Detail += " Where: " + sentence(place)
 	}
 	return n
 }

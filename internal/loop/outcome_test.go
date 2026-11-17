@@ -2,6 +2,7 @@ package loop
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -152,5 +153,66 @@ func TestAComponentHealthCaseIsNotEndedByNothingToFix(t *testing.T) {
 	other := waitingRepoNote(store.Case{ID: "c1", Family: "failures", NextTest: strings.Repeat("long fix ", 200)}, elsewherePrefix+"a file", time.Now())
 	if strings.Contains(other.Detail, "--fix REF") || len([]rune(other.Detail)) > 700 {
 		t.Fatalf("another family's note: %d runes: %q", len([]rune(other.Detail)), other.Detail)
+	}
+}
+
+// A report with no fix text is not closed as undecided once it says where the fix lives, or once a component-health
+// case says nothing is to change: the place would be lost, and the health case could not be resumed from.
+func TestABlankFixBesideAPlaceOrAHealthCaseIsNotClosed(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	const noFix = "the investigation named a mechanism and no fix"
+	c := openCase(t, st, "failures", "place-and-no-fix", 1)
+	got, recorded, err := recordFindings(ctx, st, c.ID, c.Episode, finding{Mechanism: "the upstream tool drops the flag",
+		Place: "the upstream tool's repository (another project)", NothingToFix: true, Report: "The bug is upstream."}, true, noFix, "loop:r")
+	if err != nil || !recorded || got.Status != store.CaseTesting {
+		t.Fatalf("a place with no fix text: %+v %v %v", got, recorded, err)
+	}
+	log, _ := st.CaseLog(ctx, c.ID)
+	named := false
+	for _, e := range log {
+		named = named || strings.Contains(e.Detail, "the upstream tool's repository (another project)")
+	}
+	if !named {
+		t.Fatalf("the place is not on record: %+v", log)
+	}
+	n := waitingRepoNote(got, elsewherePrefix+"the upstream tool's repository", time.Now())
+	if strings.Contains(n.Detail, "The fix:") || !strings.Contains(n.Detail, "Where: the upstream tool's repository.") {
+		t.Fatalf("the note of a place with no fix: %q", n.Detail)
+	}
+	for i, fix := range []string{"", "  "} {
+		h := openCase(t, st, store.HealthFamily, fmt.Sprintf("health-blank-fix-%d", i), 1)
+		if got, recorded, err = recordFindings(ctx, st, h.ID, h.Episode, finding{Mechanism: "the provider failed by itself", Fix: fix,
+			NothingToFix: true, Report: "A provider outage."}, true, noFix, "loop:r"); err != nil || !recorded || got.Status == store.CaseClosed {
+			t.Fatalf("a health case with nothing to fix and fix %q: %+v %v %v", fix, got, recorded, err)
+		}
+	}
+	// with neither, a report with no fix is undecided, as before
+	u := openCase(t, st, "failures", "no-fix-no-place", 1)
+	if got, recorded, err = recordFindings(ctx, st, u.ID, u.Episode, finding{Mechanism: "one cause"}, true, noFix, "loop:r"); err != nil ||
+		!recorded || got.Status != store.CaseClosed || got.Reason == store.NotWorthIt {
+		t.Fatalf("a mechanism and nothing else: %+v %v %v", got, recorded, err)
+	}
+}
+
+// A word that only says there is none names no place and no repository.
+func TestAWordForNoneNamesNothing(t *testing.T) {
+	for _, w := range []string{"", " ", "N/A", "n/a - nothing to change", "(none)", "None.", "not applicable", "No place", "none needed", "nil", "no", "N.A.", "TBD", "?", "—", "\"\"", "-"} {
+		if !noneWord(w) {
+			t.Errorf("%q is taken to name something", w)
+		}
+	}
+	for _, w := range []string{"~/.config/tool/hook.ts", "nonesuch repository", "the owner's router", "notes"} {
+		if noneWord(w) {
+			t.Errorf("%q is taken for a word for none", w)
+		}
+	}
+	ctx := context.Background()
+	st := testStore(t)
+	c := openCase(t, st, "failures", "repo-none", 1)
+	got, recorded, err := recordFindings(ctx, st, c.ID, c.Episode, finding{Mechanism: "the tool refused a call it is meant to refuse",
+		Fix: "No change.", Repo: "n/a", NothingToFix: true, Report: "The tool worked as meant."}, true, "", "loop:r")
+	if err != nil || !recorded || got.Status != store.CaseClosed || got.Reason != store.NotWorthIt {
+		t.Fatalf("a word for none in repo beside nothing to fix: %+v %v %v", got, recorded, err)
 	}
 }
