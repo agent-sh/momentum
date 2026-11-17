@@ -387,6 +387,12 @@ func newRelay(target *url.URL, budget float64, transport http.RoundTripper, turn
 					}
 					if !ok {
 						cost = reserve
+						// A stream cut after the model said what it read: that part is known, as the provider
+						// reported it, and the output is at most what the request asked for. Still an upper bound,
+						// without pricing every byte of the body as a token written to the cache.
+						if read, known := c.parser.readCost(rate); known {
+							cost = min(reserve, read+float64(output)*rate.output/1e6)
+						}
 					}
 					r.reserved -= reserve
 					r.spent += cost

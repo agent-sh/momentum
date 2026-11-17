@@ -109,16 +109,33 @@ func TestRelayNeverRefusesANormalRunUnderBudget(t *testing.T) {
 	}
 }
 
+// A response whose usage cannot be read is charged its whole reservation. One cut after its first event, which
+// says what the model read, is charged that and the most output the request asked for: the input is known, as the
+// provider reported it, and only the output is not.
 func TestRelayChargesReservationWhenUsageIsUnparseable(t *testing.T) {
-	body := textRequestBody(10, 1000)
-	for name, wire := range map[string][]byte{"invalid": []byte("marker-7f3a"), "partial": eventFrame([]byte(`{"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0}}}`))} {
+	body := textRequestBody(1000, 1000)
+	whole := .02 + float64(len(body))*8/1e6
+	start := eventFrame([]byte(`{"type":"message_start","message":{"usage":{"input_tokens":200,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":1000}}}`))
+	twice := append(append([]byte{}, start...), start...)
+	for name, c := range map[string]struct {
+		wire []byte
+		want float64
+	}{
+		"invalid":           {[]byte("marker-7f3a"), whole},
+		"no usage at start": {eventFrame([]byte(`{"type":"message_start","message":{"usage":{}}}`)), whole},
+		"malformed after":   {twice, whole},                     // a second start: nothing of it is trusted
+		"cut after start":   {start, .02 + (200*4+1000*.2)/1e6}, // what it read, and all the output asked for
+		"cut mid-frame":     {append(append([]byte{}, start...), start[:20]...), .02 + (200*4+1000*.2)/1e6},
+	} {
 		t.Run(name, func(t *testing.T) {
-			r := budgetRelay(t, 1, func(req *http.Request) (*http.Response, error) { return brokerResponse(req, wire), nil })
+			r := budgetRelay(t, 1, func(req *http.Request) (*http.Response, error) { return brokerResponse(req, c.wire), nil })
 			relayRequest(r, strings.NewReader(body), "invoke-with-response-stream")
 			cost, _, _, charged := r.accounting()
-			want := .02 + float64(len(body))*8/1e6
-			if math.Abs(cost-want) > 1e-10 || charged != 1 {
-				t.Fatalf("uncertain request charged %f, want %f", cost, want)
+			if math.Abs(cost-c.want) > 1e-10 || charged != 1 {
+				t.Fatalf("uncertain request charged %f, want %f", cost, c.want)
+			}
+			if c.want > whole {
+				t.Fatalf("setup: the known part is over the reservation")
 			}
 		})
 	}

@@ -295,6 +295,18 @@ func (p *usageParser) cost(r relayRate) (float64, bool) {
 		float64(u.Cache.Hour)*r.write1) / 1e6, true
 }
 
+// readCost is what the model read for a streamed response, as its first event reported it: the input and cache
+// tokens, priced. It is known once that event came whole and nothing after it was malformed, whether or not the
+// stream reached its end.
+func (p *usageParser) readCost(r relayRate) (float64, bool) {
+	if !p.stream || !p.start || p.bad {
+		return 0, false
+	}
+	u := p.usage
+	return (float64(*u.Input)*r.input + float64(u.Read)*r.read + float64(u.Write-u.Cache.Hour)*r.write5 +
+		float64(u.Cache.Hour)*r.write1) / 1e6, true
+}
+
 type usageBody struct {
 	io.ReadCloser
 	parser   *usageParser
