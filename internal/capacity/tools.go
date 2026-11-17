@@ -1886,7 +1886,7 @@ func (r *runner) docker(ctx context.Context, live bool) ([]Finding, []string, er
 	over := Finding{Rule: RuleDocker, Path: "docker build cache over its size"}
 	limit := int64(r.cfg.Docker.MaxGiB * (1 << 30))
 	sized := false
-	var total int64 // the whole cache, where it could be read
+	var total int64 // the cache no image shares, where it could be read
 	if keep, err := time.ParseDuration(until); err == nil {
 		prefix := "builder prune --filter until=" + until
 		if du, err := r.tools.Docker(ctx, 2*time.Minute, "builder", "du", "--format", "json"); err != nil {
@@ -1909,7 +1909,7 @@ func (r *runner) docker(ctx context.Context, live bool) ([]Finding, []string, er
 			over.Detail = flag + ": size unknown"
 		case rest > limit:
 			over.Action, over.Bytes = ActDelete, rest-limit
-			over.Detail = fmt.Sprintf("%s: %s in use within %s, over %s", flag, gib(rest), until, gib(limit))
+			over.Detail = fmt.Sprintf("%s: %s left by the prune by age, over %s", flag, gib(rest), gib(limit))
 		}
 	}
 	images := Finding{Rule: RuleDocker, Path: "docker dangling images", Action: ActDelete, Detail: "image prune"}
@@ -2024,11 +2024,15 @@ func prunable(du string, keep time.Duration) (n int, size int64, ok bool) {
 	return n, size, true
 }
 
-// cacheSize is the size of the whole build cache, from the same records: every record once, as Docker counts it.
+// cacheSize is the size of the build cache as Docker counts it against a size: every record no image shares. A
+// shared record is the image's, which no prune of the cache removes, and Docker leaves it out of the cache's use.
 func cacheSize(du string) (size int64) {
 	for _, l := range strings.Split(du, "\n") {
-		var rec struct{ Size string }
-		if strings.TrimSpace(l) != "" && json.Unmarshal([]byte(l), &rec) == nil {
+		var rec struct {
+			Size   string
+			Shared bool
+		}
+		if strings.TrimSpace(l) != "" && json.Unmarshal([]byte(l), &rec) == nil && !rec.Shared {
 			size += parseSize(rec.Size)
 		}
 	}

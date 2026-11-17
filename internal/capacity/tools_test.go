@@ -300,17 +300,20 @@ func TestDockerPrunesOldBuildCacheAndDanglingImagesAndOnlyReportsVolumes(t *test
 	}
 }
 
-// With a size set, what the prune by age leaves goes down to it by Docker's own prune, after the prune by age; a
-// cache under its size is left, and with no size set the prune never runs.
+// With a size set, what the prune by age leaves goes down to it by Docker's own prune, after the prune by age. The
+// size is for the records no image shares, as Docker counts them: 39 GB of the fixture's 69, and 37 after the prune
+// by age. A cache under its size is left, and with no size set the prune never runs.
 func TestDockerBuildCacheOverItsSizeGoesDownToIt(t *testing.T) {
 	for _, c := range []struct {
 		maxGiB float64
 		runs   bool
-	}{{0, false}, {100, false}, {40, true}} { // the records hold 69 GB, 67 after the prune by age
+	}{{0, false}, {100, false}, {40, false}, // 40 GiB is under the 69 GB of every record: the shared ones do not count
+		{35, false}, // 37.6 GB: under the 39 GB before the prune by age, over the 37 GB it leaves
+		{30, true}} {
 		var ran []string
 		tools := fakeTools{ran: &ran, answers: map[string]string{"uv": "ERR", "docker info": "29.0.0\n", "docker builder du": duRecords,
 			"docker image ls": "", "docker system df": "[]", "docker builder prune --force --filter": "Total:\t1.9GB\n",
-			"docker builder prune --force --max-used-space": "Total:\t24GB\n"}}
+			"docker builder prune --force --max-used-space": "Total:\t4GB\n"}}
 		cfg := Config{Live: []string{RuleDocker}, Docker: DockerConfig{MaxGiB: c.maxGiB}}.Normal()
 		o := options(t, procRoot(t), time.Now(), nil)
 		o.Tools, o.Rules = tools, []string{RuleDocker}
@@ -328,13 +331,56 @@ func TestDockerBuildCacheOverItsSizeGoesDownToIt(t *testing.T) {
 			t.Fatalf("max_gib %v: the finding is there %v: %+v", c.maxGiB, ok, f)
 		}
 		if c.runs {
-			if !f.Done || f.Freed != 24e9 || f.Bytes <= 0 {
+			if !f.Done || f.Freed != 4e9 || f.Bytes <= 0 || !strings.Contains(f.Detail, "left by the prune by age") {
 				t.Fatalf("the prune by size frees what Docker says: %+v", f)
 			}
-			if strings.Index(all, "--filter until=") > strings.Index(all, "--max-used-space") {
+			if age := strings.Index(all, "--filter until="); age < 0 || age > strings.Index(all, "--max-used-space") {
 				t.Fatalf("the prune by age comes first: %v", ran)
 			}
 		}
+	}
+}
+
+// A cache whose size cannot be read is pruned to its size all the same: the prune is Docker's own and bounded by the
+// size. A prune by size that fails is the finding's error, and the prune by age stays done. A negative size is refused.
+func TestDockerPruneBySizeWithoutASizeReadAndWhenItFails(t *testing.T) {
+	var ran []string
+	answers := map[string]string{"uv": "ERR", "docker info": "29.0.0\n", "docker builder du": "ERR", "docker image ls": "",
+		"docker system df": "[]", "docker builder prune --force --filter": "Total:\t1GB\n", "docker builder prune --force --max-used-space": "Total:\t2GB\n"}
+	run := func() map[string]Finding {
+		t.Helper()
+		ran = nil
+		cfg := Config{Live: []string{RuleDocker}, Docker: DockerConfig{MaxGiB: 40}}.Normal()
+		o := options(t, procRoot(t), time.Now(), nil)
+		o.Tools, o.Rules = fakeTools{ran: &ran, answers: answers}, []string{RuleDocker}
+		res, err := Run(context.Background(), cfg, openStore(t), o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return findings(res, RuleDocker)
+	}
+	if f := run()["docker build cache over its size"]; !f.Done || f.Freed != 2e9 || !strings.Contains(strings.Join(ran, "\n"), "--max-used-space") {
+		t.Fatalf("du fails: the prune by size runs all the same: %+v %v", f, ran)
+	}
+	answers["docker builder du"] = duRecords
+	answers["docker builder prune --force --max-used-space"] = "ERR"
+	cfg := Config{Live: []string{RuleDocker}, Docker: DockerConfig{MaxGiB: 30}}.Normal()
+	o := options(t, procRoot(t), time.Now(), nil)
+	ran = nil
+	o.Tools, o.Rules = fakeTools{ran: &ran, answers: answers}, []string{RuleDocker}
+	res, err := Run(context.Background(), cfg, openStore(t), o)
+	if err != nil {
+		t.Fatalf("a prune by size that fails fails the run: %v", err)
+	}
+	got := findings(res, RuleDocker)
+	if f := got["docker build cache over its size"]; f.Done || f.Err == "" {
+		t.Fatalf("the failed prune by size carries its error: %+v", f)
+	}
+	if f := got["docker build cache"]; !f.Done {
+		t.Fatalf("the prune by age stays done: %+v", f)
+	}
+	if err := (Config{Docker: DockerConfig{MaxGiB: -1}}).check(); err == nil || !strings.Contains(err.Error(), "max_gib") {
+		t.Fatalf("a negative size: %v", err)
 	}
 }
 
