@@ -74,8 +74,8 @@ func (r *runner) targets(ctx context.Context, paths []string) ([]Finding, error)
 			if n := gone[keyPath(f)]; n > 0 {
 				if need := waitAfter(idle, n); r.now.Sub(tree.Newest) < need {
 					f.Eligible = tree.Newest.Add(need)
-					f.Action, f.Why = ActKeep, fmt.Sprintf("built again after capacity deleted it %d %s: it goes after %d days without a write",
-						n, plural("time", n), int(need.Hours()/24))
+					f.Action, f.Why = ActKeep, fmt.Sprintf("built again after capacity deleted it %d %s: it goes after %d hours without a write",
+						n, plural("time", n), int(need.Hours()))
 				}
 			}
 		}

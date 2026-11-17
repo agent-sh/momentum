@@ -265,11 +265,19 @@ func TestATargetBuiltAgainAfterItsDeletionWaitsLonger(t *testing.T) {
 		t.Fatalf("the first time it goes after the idle time: %+v", f)
 	}
 	cargoTarget(t, tgt) // built again
-	if f := at(70); f.Done || f.Action != ActKeep || !strings.Contains(f.Why, "built again after capacity deleted it 1 time") {
+	if f := at(70); f.Done || f.Action != ActKeep || !strings.Contains(f.Why, "built again after capacity deleted it 1 time: it goes after 96 hours") {
 		t.Fatalf("70 hours idle after one deletion: it waits 96: %+v", f)
 	}
 	if _, err := os.Stat(filepath.Join(tgt, "debug")); err != nil {
 		t.Fatal("it was deleted before twice the idle time")
+	}
+	// only what the rule would take waits: once its project is excluded it says that, not the wait
+	excluded := cfg
+	excluded.Exclude = Exclude{Names: []string{"app"}}
+	res, err := Run(context.Background(), excluded, st, options(t, procRoot(t), built.Add(72*time.Hour), nil)) // the rule's next scan
+	must(t, err)
+	if f := findings(res, RuleTargets)[tgt]; f.Action != ActReport || f.class != "excluded" {
+		t.Fatalf("an excluded project's build that was deleted before: %+v", f)
 	}
 	if f := at(100); !f.Done {
 		t.Fatalf("100 hours idle after one deletion: it goes: %+v", f)
@@ -302,6 +310,18 @@ func TestAnEmptyGitFileIsNoRepository(t *testing.T) {
 	}
 	if n, ok, _ := st.Note(context.Background(), "capacity:"+RuleTargets+":unreadable"); ok && n.Done.IsZero() {
 		t.Fatalf("no problem of git's: %+v", n)
+	}
+	// As for any build outside a repository, the sources it was built from decide: one in a known repository makes
+	// its project known, and the idle build goes.
+	app := filepath.Join(t.TempDir(), "projects", "app")
+	write(t, filepath.Join(app, "src", "lib.rs"), "")
+	gitT(t, app, "init", "-q")
+	known := filepath.Join(root, "sdists", "known", "target")
+	cargoTarget(t, known, filepath.Join(app, "src", "lib.rs"))
+	res, err = Run(context.Background(), cfg, st, options(t, procRoot(t), time.Now().Add(52*time.Hour), nil)) // the rule's next scan
+	must(t, err)
+	if f := findings(res, RuleTargets)[known]; !f.Done {
+		t.Fatalf("a build under the marker whose source is in a known repository goes, as one with no marker does: %+v", f)
 	}
 }
 

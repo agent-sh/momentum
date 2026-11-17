@@ -176,7 +176,9 @@ func options(t *testing.T, proc string, now time.Time, jobs Jobs) Options {
 func gitEnv(t *testing.T) {
 	t.Helper()
 	cfg := filepath.Join(t.TempDir(), "gitconfig")
-	write(t, cfg, "[init]\n\tdefaultBranch = main\n[user]\n\tname = Test\n\temail = test@example.com\n")
+	none := filepath.Join(filepath.Dir(cfg), "ignore") // the machine's own ignore file is not the test's
+	write(t, none, "")
+	write(t, cfg, "[init]\n\tdefaultBranch = main\n[user]\n\tname = Test\n\temail = test@example.com\n[core]\n\texcludesFile = "+none+"\n")
 	t.Setenv("GIT_CONFIG_GLOBAL", cfg)
 	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 }
