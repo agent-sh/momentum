@@ -174,6 +174,10 @@ var relayRates = map[string]relayRate{
 	"global.anthropic.claude-sonnet-5-5": {2, 10, .1, 2.5, 4, 128000},
 }
 
+// relayToolPrompt is the most tokens the provider's own system prompt for tool use adds to a request, by its
+// table of every model's (804 for a forced tool on an older model; the models the relay admits list 286).
+const relayToolPrompt = 804
+
 type relayCharge struct {
 	reservation float64
 	rate        relayRate
@@ -345,7 +349,9 @@ func newRelay(target *url.URL, budget float64, transport http.RoundTripper, turn
 			// Text tokenization cannot consume more tokens than encoded body bytes.
 			// Price every input token as a one-hour cache write when that costs more:
 			// the peer controls caching, so the ordinary input rate is no upper bound.
-			reserve := (float64(output)*rate.output + float64(len(body))*max(rate.input, rate.write1)) / 1e6
+			// The provider adds a system prompt of its own to a request with tools, which is in no byte of the
+			// body: relayToolPrompt tokens cover it.
+			reserve := (float64(output)*rate.output + float64(len(body)+relayToolPrompt)*max(rate.input, rate.write1)) / 1e6
 			r.mu.Lock()
 			if r.turnLimit > 0 && r.admittedN >= r.turnLimit {
 				r.turnRefused++
@@ -386,7 +392,9 @@ func newRelay(target *url.URL, budget float64, transport http.RoundTripper, turn
 						return
 					}
 					if !ok {
-						cost = reserve
+						// what could not be read to its end is charged its bound, and no less than the input its
+						// first event named plus all the output it could have made
+						cost = max(reserve, c.parser.known(rate)+float64(output)*rate.output/1e6)
 					}
 					r.reserved -= reserve
 					r.spent += cost

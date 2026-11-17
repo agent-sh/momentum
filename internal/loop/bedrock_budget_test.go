@@ -116,7 +116,7 @@ func TestRelayChargesReservationWhenUsageIsUnparseable(t *testing.T) {
 			r := budgetRelay(t, 1, func(req *http.Request) (*http.Response, error) { return brokerResponse(req, wire), nil })
 			relayRequest(r, strings.NewReader(body), "invoke-with-response-stream")
 			cost, _, _, charged := r.accounting()
-			want := .02 + float64(len(body))*8/1e6
+			want := .02 + float64(len(body)+relayToolPrompt)*8/1e6
 			if math.Abs(cost-want) > 1e-10 || charged != 1 {
 				t.Fatalf("uncertain request charged %f, want %f", cost, want)
 			}
@@ -359,5 +359,78 @@ func TestARequestWithAmbiguousMaxTokensIsRefused(t *testing.T) {
 	}
 	if rec := relayRequest(r, strings.NewReader(textRequestBody(10, 1000)), "invoke-with-response-stream"); rec.Code == 400 {
 		t.Fatalf("an honest body was refused: %d", rec.Code)
+	}
+}
+
+// A response is charged what its own usage says it is billed, whichever event says it. The counts of the last
+// event are cumulative: input the provider loaded after the first event is in them. A response that lists its
+// passes is billed their sum, which its top-level counts leave a provider-side pass out of.
+func TestTheChargeIsWhatTheResponsesUsageBills(t *testing.T) {
+	rate := relayRates["global.anthropic.claude-opus-5-5"] // $4 in, $20 out, $.2 read, $5 and $8 written
+	start := `{"type":"message_start","message":{"usage":{"input_tokens":1000,"output_tokens":0,"cache_read_input_tokens":2000,"cache_creation_input_tokens":0}}}`
+	for name, c := range map[string]struct {
+		delta string
+		want  float64
+	}{
+		"output alone, as before":              {`{"output_tokens":100}`, .004 + .002 + .0004},
+		"more input by the end":                {`{"output_tokens":100,"input_tokens":5000}`, .02 + .002 + .0004},
+		"more read and written by the end":     {`{"output_tokens":100,"cache_read_input_tokens":12000,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_1h_input_tokens":400}}`, .004 + .002 + .0024 + .003 + .0032},
+		"less input named at the end":          {`{"output_tokens":100,"input_tokens":10,"cache_read_input_tokens":5}`, .004 + .002 + .0004},
+		"a compaction pass beside the message": {`{"output_tokens":100,"iterations":[{"type":"compaction","input_tokens":50000,"output_tokens":2000},{"type":"message","input_tokens":1000,"output_tokens":100,"cache_read_input_tokens":2000}]}`, .2 + .04 + .004 + .002 + .0004},
+		"passes that sum to less than the top": {`{"output_tokens":100,"iterations":[{"type":"message","input_tokens":10,"output_tokens":1}]}`, .004 + .002 + .0004},
+	} {
+		p := usageParser{stream: true}
+		p.feed(append(eventFrame([]byte(start)), eventFrame([]byte(`{"type":"message_delta","usage":`+c.delta+`}`))...))
+		p.eof = true
+		if cost, ok := p.cost(rate); !ok || math.Abs(cost-c.want) > 1e-10 {
+			t.Errorf("%s: charged %f (%v), want %f", name, cost, ok, c.want)
+		}
+	}
+	// a pass with no counts, or a count below zero, is no usage to price: the reservation stands
+	for name, delta := range map[string]string{
+		"a pass with no counts":  `{"output_tokens":100,"iterations":[{"type":"compaction"}]}`,
+		"a count below zero":     `{"output_tokens":100,"cache_read_input_tokens":-1}`,
+		"more written per hour":  `{"output_tokens":100,"cache_creation_input_tokens":10,"cache_creation":{"ephemeral_1h_input_tokens":20}}`,
+		"an input below nothing": `{"output_tokens":100,"input_tokens":-5}`,
+	} {
+		p := usageParser{stream: true}
+		p.feed(append(eventFrame([]byte(start)), eventFrame([]byte(`{"type":"message_delta","usage":`+delta+`}`))...))
+		p.eof = true
+		if cost, ok := p.cost(rate); ok {
+			t.Errorf("%s: priced at %f", name, cost)
+		}
+	}
+	// the same for a response that does not stream
+	p := usageParser{}
+	p.feed([]byte(`{"usage":{"input_tokens":1000,"output_tokens":100,"iterations":[{"type":"compaction","input_tokens":50000,"output_tokens":2000},{"type":"message","input_tokens":1000,"output_tokens":100}]}}`))
+	p.eof = true
+	if cost, ok := p.cost(rate); !ok || math.Abs(cost-(.2+.04+.004+.002)) > 1e-10 {
+		t.Errorf("a response that does not stream: %f %v", cost, ok)
+	}
+}
+
+// The reservation covers what the provider adds to a request with tools, and a response that could not be read to
+// its end is charged no less than the input its first event named and all the output it could have made: a small
+// request over a large cached context would otherwise be charged less than it is known to cost.
+func TestAnUnreadResponseIsChargedNoLessThanItsKnownInput(t *testing.T) {
+	body := textRequestBody(10, 1000)
+	reserve := .02 + float64(len(body)+relayToolPrompt)*8/1e6
+	for name, c := range map[string]struct {
+		start string
+		want  float64
+	}{
+		"a small context: the reservation": {`{"input_tokens":50,"output_tokens":0}`, reserve},
+		"a large context read from the cache and written to it": {`{"input_tokens":50,"output_tokens":0,"cache_read_input_tokens":400000,"cache_creation_input_tokens":10000,"cache_creation":{"ephemeral_1h_input_tokens":10000}}`,
+			.0002 + .08 + .08 + .02},
+	} {
+		wire := eventFrame([]byte(`{"type":"message_start","message":{"usage":` + c.start + `}}`)) // and nothing after it
+		r := budgetRelay(t, 1, func(req *http.Request) (*http.Response, error) { return brokerResponse(req, wire), nil })
+		relayRequest(r, strings.NewReader(body), "invoke-with-response-stream")
+		if cost, _, _, charged := r.accounting(); math.Abs(cost-c.want) > 1e-10 || charged != 1 {
+			t.Errorf("%s: charged %f, want %f", name, cost, c.want)
+		}
+	}
+	if relayToolPrompt < 286 {
+		t.Errorf("the reservation's tool prompt, %d tokens, is under what the admitted models add", relayToolPrompt)
 	}
 }
