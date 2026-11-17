@@ -58,7 +58,7 @@ const findingsInstruction = "Keep findings as you go in /out/findings.md. Use th
 const liveQuestion = "Find the root cause of this problem and the fix. State the mechanism, the alternatives ruled out, the fix, and a summary. If the fix is code in a repository under /ro/repos, also report repo as its NAME. If the fix is anywhere else (a file on the machine outside those repositories, another project's code, a program maintained elsewhere, a setting only the owner can change), report place: where it is, on one line; with no such place, leave it out. Report nothing_to_fix as true only when no change anywhere would help (the tool worked as it is meant to, a provider refused or failed by itself, the problem ended); then fix says that nothing is to change, and the summary says why. A fix that lives somewhere else is a place, not nothing to fix. Build no change."
 
 // siblingQuestion is added to the live question of a case whose family holds other cases with findings (siblingsOf).
-const siblingQuestion = " /run/input/case.json lists under siblings the family's other cases that already hold a cause and a fix. If this problem has the same cause and the same fix as one of them, report duplicate_of as that case's id: the host moves this case's evidence into it. Report it only once this case's own evidence shows that cause; a like title is not enough."
+const siblingQuestion = " /run/input/case.json lists under siblings the family's other cases in testing, which already hold a cause and a fix. If this problem has the same cause and the same fix as one of them, report duplicate_of as that case's id: the host then closes this case as that case's, and that case's fix stands for both. Report it only once this case's own evidence shows that cause; a like title is not enough."
 
 // sibling is another case of the family that holds an investigation's findings, as an investigation is shown it: one
 // whose cause may be this case's too.
@@ -72,7 +72,7 @@ type sibling struct {
 // siblingMax bounds what an investigation is shown of each sibling's mechanism and fix: enough to tell a cause.
 const siblingMax = 400
 
-// siblingsOf are the cases a report on c may name as the one it duplicates: the family's other cases in testing,
+// siblingsOf are the cases a report on c may name as the one whose cause is c's: the family's other cases in testing,
 // which hold a mechanism and a fix. A component-health case has none: its stop holds cases only its own fix resumes.
 func siblingsOf(ctx context.Context, st *store.Store, c store.Case) ([]sibling, error) {
 	if c.Family == store.HealthFamily {
@@ -92,8 +92,8 @@ func siblingsOf(ctx context.Context, st *store.Store, c store.Case) ([]sibling, 
 	return out, nil
 }
 
-// duplicateOf opens the reason of a case its investigation found to be another case's.
-const duplicateOf = "the investigation found the cause of case "
+// sameCause opens the reason of a case its investigation found to have another case's cause.
+const sameCause = "the investigation found this case to have the cause and the fix of case "
 
 // configQuestion is added to the live question while configuration targets are on.
 const configQuestion = " If the fix is the content of one existing configuration file under /ro/config instead, report config as its path there (such as /ro/config/.config/agents/NAME.md) and no repo or place. The host proposes a change only to a file the owner listed, and an agent applies it."
@@ -309,8 +309,11 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 		u.Alternatives = alternatives // nil keeps the case's
 	}
 	if dup := strings.TrimSpace(f.DuplicateOf); reported && dup != "" && mechanism != "" {
-		// The case goes into the one the report names, when that is a case the run was shown as a sibling. A report
-		// that names any other case names none, and goes on as a report without it.
+		// The report names a sibling whose cause and fix are this case's: the case closes, its findings recorded and
+		// its reason naming that case, and nothing of it moves there. It closes as not worth it, so it comes back
+		// by the cases' rule once as much evidence again comes in: one report's word is a guess, and a wrong one is
+		// looked at again. A report that names any case but a sibling names none, and goes on as one without it;
+		// this comes before every other outcome of the report.
 		c, err := st.CaseByID(ctx, caseID)
 		if err != nil {
 			return store.Case{}, false, err
@@ -325,7 +328,7 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 				if !holdsText(why) {
 					why = mechanism
 				}
-				return st.RecordDuplicate(ctx, caseID, episode, s.ID, duplicateOf+s.ID+": "+plainClip(plain.Line(why), dismissedMax), actor)
+				return st.RecordDismissed(ctx, caseID, episode, u, sameCause+s.ID+": "+plainClip(plain.Line(why), dismissedMax), actor)
 			}
 		}
 	}

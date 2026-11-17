@@ -864,34 +864,6 @@ func (s *Store) RecordDismissed(ctx context.Context, id string, episode int64, u
 	return s.recordClosed(ctx, id, episode, u, NotWorthIt, why, actor)
 }
 
-// RecordDuplicate is RecordFindings for an investigation that found the case's cause to be the cause of the case
-// into names: the case goes into it as a duplicate (CloseCase), under the guard the findings are recorded under
-// (the case's episode as the run read it, not merged, open or investigating), in one transaction.
-func (s *Store) RecordDuplicate(ctx context.Context, id string, episode int64, into, why, actor string) (Case, bool, error) {
-	if strings.TrimSpace(why) == "" {
-		return Case{}, false, badCase("a close says why")
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return Case{}, false, err
-	}
-	defer tx.Rollback()
-	c, err := getCase(ctx, tx, id)
-	if err != nil {
-		return Case{}, false, err
-	}
-	if c.Episode != episode || c.Into != "" || c.Status != CaseOpen && c.Status != CaseInvestigating {
-		return c, false, nil
-	}
-	if _, err = merge(ctx, tx, c, into, why, actor, time.Now()); err != nil {
-		return Case{}, false, err
-	}
-	if c, err = getCase(ctx, tx, id); err != nil { // the case that closed, as the other outcomes return theirs
-		return Case{}, false, err
-	}
-	return c, true, tx.Commit()
-}
-
 func (s *Store) recordClosed(ctx context.Context, id string, episode int64, u CaseUpdate, reason CloseReason, why, actor string) (Case, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

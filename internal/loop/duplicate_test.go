@@ -21,8 +21,9 @@ func investigated(t *testing.T, st *store.Store, family, sig, mechanism, fix str
 	return got
 }
 
-// An investigation is shown the family's other cases that hold a cause and a fix, and a report that names one of
-// them as the case it duplicates sends its case into it: the evidence moves, and the case closes as a duplicate.
+// An investigation is shown the family's other cases in testing, which hold a cause and a fix, and a report that
+// names one of them as the case whose cause is this one's closes its case with that as the reason. Nothing moves:
+// the case keeps its evidence and findings and comes back by the cases' rule, and the sibling is untouched.
 func TestAnInvestigationCanFindItsCaseToBeAnothers(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -30,6 +31,12 @@ func TestAnInvestigationCanFindItsCaseToBeAnothers(t *testing.T) {
 	other := investigated(t, st, "failures", "other-cause", "the network filter resets the connection", "ask the owner to change the filter")
 	bare := openCase(t, st, "failures", "no-findings-yet", 3)                // open, nothing found: no sibling
 	elsewhere := investigated(t, st, "sessions", "another-family", "m", "f") // another family: no sibling
+	placed := openCase(t, st, "failures", "place-and-no-fix", 2)             // in testing with a place and no fix of its own: no sibling
+	if got, _, err := recordFindings(ctx, st, placed.ID, placed.Episode, finding{Mechanism: "a cause", Place: "another project"}, true, "", "loop:r"); err != nil ||
+		got.Status != store.CaseTesting || got.NextTest != fixNotStated {
+		t.Fatalf("setup: %+v %v", got, err)
+	}
+	long := investigated(t, st, "failures", "long-findings", strings.Repeat("a long mechanism ", 100), "a fix")
 	c := openCase(t, st, "failures", "schema-again", 4)
 	sibs, err := siblingsOf(ctx, st, c)
 	if err != nil {
@@ -39,31 +46,45 @@ func TestAnInvestigationCanFindItsCaseToBeAnothers(t *testing.T) {
 	for _, s := range sibs {
 		ids[s.ID] = s
 	}
-	if len(ids) != 2 || ids[root.ID].Mechanism == "" || ids[root.ID].Fix == "" || ids[other.ID].ID == "" {
-		t.Fatalf("the siblings shown: %+v (want %s and %s, not %s or %s)", sibs, root.ID, other.ID, bare.ID, elsewhere.ID)
+	if len(ids) != 3 || ids[root.ID].Mechanism == "" || ids[root.ID].Fix == "" || ids[other.ID].ID == "" {
+		t.Fatalf("the siblings shown: %+v (want %s, %s and %s, not %s, %s or %s)", sibs, root.ID, other.ID, long.ID, bare.ID, elsewhere.ID, placed.ID)
+	}
+	if n := len([]rune(ids[long.ID].Mechanism)); n == 0 || n > siblingMax {
+		t.Fatalf("a sibling's mechanism is shown at %d runes, over %d", n, siblingMax)
 	}
 	got, recorded, err := recordFindings(ctx, st, c.ID, c.Episode, finding{Mechanism: "the same schema field", Fix: "as the other case",
 		Report: "Same cause as the schema case.", DuplicateOf: root.ID}, true, "", "loop:r")
-	if err != nil || !recorded || got.Status != store.CaseClosed || got.Reason != store.Duplicate || got.Into != root.ID {
-		t.Fatalf("a duplicate of a sibling: %+v %v %v", got, recorded, err)
+	if err != nil || !recorded || got.Status != store.CaseClosed || got.Reason != store.NotWorthIt || got.Into != "" ||
+		got.Mechanism != "the same schema field" || got.Evidence != 4 {
+		t.Fatalf("a case with a sibling's cause closes with its own findings and evidence: %+v %v %v", got, recorded, err)
 	}
-	into, err := st.CaseByID(ctx, root.ID)
-	if err != nil || into.Evidence != 6 || into.Status != store.CaseTesting {
-		t.Fatalf("the case it went into holds both cases' evidence and stays as it was: %+v %v", into, err)
+	after, err := st.CaseByID(ctx, root.ID)
+	if err != nil || after.Evidence != root.Evidence || after.Status != store.CaseTesting || after.Cost != root.Cost {
+		t.Fatalf("the sibling is untouched: %+v %v", after, err)
 	}
 	log, _ := st.CaseLog(ctx, c.ID)
 	said := false
 	for _, e := range log {
-		said = said || strings.Contains(e.Detail, duplicateOf+root.ID+": Same cause as the schema case.")
+		said = said || e.Action == "closed" && strings.Contains(e.Detail, sameCause+root.ID+": Same cause as the schema case.")
 	}
 	if !said {
 		t.Fatalf("the close's reason: %+v", log)
 	}
+	// it wins over the report's other outcomes: nothing to fix beside it closes the same way, and no fix text is needed
+	n := openCase(t, st, "failures", "schema-third", 2)
+	if got, recorded, err = recordFindings(ctx, st, n.ID, n.Episode, finding{Mechanism: "the same schema field", NothingToFix: true,
+		Place: "somewhere", DuplicateOf: root.ID}, true, "the investigation named a mechanism and no fix", "loop:r"); err != nil || !recorded ||
+		got.Status != store.CaseClosed || got.Reason != store.NotWorthIt {
+		t.Fatalf("a sibling's cause beside other fields: %+v %v %v", got, recorded, err)
+	}
+	if log, _ = st.CaseLog(ctx, n.ID); !strings.Contains(log[len(log)-1].Detail, sameCause+root.ID) {
+		t.Fatalf("its reason names the sibling: %+v", log[len(log)-1])
+	}
 }
 
-// A report may name only a case its run was shown. Any other id names none, and the report is recorded as one
-// without it: the case itself, a case with no findings, one of another family, a closed one, an unknown id. A
-// component-health case is shown no sibling and goes into none.
+// A report may name only a sibling. Any other id names none, and the report is recorded as one without it: the
+// case itself, a case with no findings, one of another family, a closed one, an unknown id. A component-health
+// case has no sibling and is not closed this way.
 func TestADuplicateOfACaseThatWasNotShownIsNone(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -94,8 +115,8 @@ func TestADuplicateOfACaseThatWasNotShownIsNone(t *testing.T) {
 	if err != nil || !recorded || got.Status == store.CaseClosed {
 		t.Fatalf("a health case naming another: %+v %v %v", got, recorded, err)
 	}
-	if after, _ := st.CaseByID(ctx, root.ID); after.Evidence != 2 {
-		t.Fatalf("a case nobody went into gained evidence: %+v", after)
+	if after, _ := st.CaseByID(ctx, root.ID); after.Evidence != 2 || after.Status != store.CaseTesting {
+		t.Fatalf("the sibling changed: %+v", after)
 	}
 }
 
