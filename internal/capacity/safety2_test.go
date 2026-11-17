@@ -327,13 +327,11 @@ func TestASlowCreepIsNoFastFill(t *testing.T) {
 	var fs syscall.Statfs_t
 	must(t, syscall.Statfs(dir, &fs))
 	used := int64(fs.Blocks-fs.Bfree) * int64(fs.Bsize)
-	avail := int64(fs.Bavail) * int64(fs.Bsize)
-	pct := 100 * float64(used) / float64(used+avail)
 	st := openStore(t)
 	now := time.Now()
 	must(t, st.PutCapacityRun(ctx, store.CapacityRun{At: now.Add(-20 * time.Minute)},
 		[]store.DiskSample{{Disk: dir, At: now.Add(-20 * time.Minute), Used: used - 1<<26}}, nil)) // 64 MiB in 20 min
-	cfg := Config{Disks: []string{dir}, Fill: FillConfig{Full: min(pct+1, 99.9)}}.Normal() // the line is near: due in hours
+	cfg := Config{Disks: []string{dir}, Fill: lineAbove(t, dir, 1)}.Normal() // the line is 1 GiB away: due in five hours
 	o := options(t, procRoot(t), now, nil)
 	o.Rules = []string{RuleUV}
 	res, err := Run(ctx, cfg, st, o)

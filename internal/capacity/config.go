@@ -193,13 +193,16 @@ func (c Config) check() error {
 			return fmt.Errorf("docker.until: %w", err)
 		}
 	}
+	if c.Fill.Full > 100 {
+		return fmt.Errorf("fill.full_pct is %v: a disk is never more than 100%% full, so it would never be due", c.Fill.Full)
+	}
 	return nil
 }
 
 // The defaults are the owner's and the disk study's: models idle for 30 days, Rust build output idle for 48 hours,
 // tasks' folders idle for 21 days (longer than the pauses after which a task comes back to its folder),
-// the uv cache over 30 GiB or weekly, Docker's build cache older than 168 hours, and a fill faster than 20 GiB an
-// hour or one that reaches 94% within 6 hours. MinMiB leaves the small entries at the top of a cache, its markers,
+// the uv cache over 30 GiB or weekly, Docker's build cache older than 168 hours, and a fill that reaches 94%
+// within 6 hours. MinMiB leaves the small entries at the top of a cache, its markers,
 // locks and credentials, which free nothing.
 const (
 	defaultIdleDays    = 30

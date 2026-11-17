@@ -727,6 +727,52 @@ func TestAWriterCountsByWhatItWroteBetweenTheRuns(t *testing.T) {
 	}
 }
 
+// The writers rank by what they wrote over the time between the runs too: a process half a second old that wrote
+// 90 MiB does not come before one that wrote 20 GiB in those five minutes.
+func TestWritersRankByWhatTheyWroteBetweenTheRuns(t *testing.T) {
+	st, dir, now, proc := fillFixture(t)
+	train := fakeProc{pid: 50, ppid: 1, argv: []string{"train"}, cwd: dir, written: 1 << 30}
+	fillRun(t, st, dir, now.Add(-5*time.Minute), proc(1201, train), quiet)
+	train.written = 21 << 30
+	short := fakeProc{pid: 51, ppid: 1, argv: []string{"ld"}, cwd: dir, written: 90 << 20, start: 150050} // half a second old
+	d := fillRun(t, st, dir, now, proc(1501, train, short), quiet).Disks[0]
+	if len(d.Writers) != 2 || d.Writers[0].PID != 50 || d.Writers[1].PID != 51 {
+		t.Fatalf("the 20 GiB writer comes first, the short one after it: %+v", d.Writers)
+	}
+}
+
+// A fill that crosses the disk's full line is still that fill while the disk grows: it does not end at the line, with
+// a note that says it ended, to begin again when the room runs short.
+func TestAFillThatCrossesTheLineIsOneFill(t *testing.T) {
+	ctx := context.Background()
+	st, dir, now, proc := fillFixture(t)
+	if d := fillRun(t, st, dir, now, proc(1201), quiet).Disks[0]; !d.Fast {
+		t.Fatalf("setup: the fill is fast below the line: %+v", d)
+	}
+	// five minutes on the disk is past its line (a line set below its use), growing as before
+	cfg := Config{Disks: []string{dir}, Fill: lineAbove(t, dir, -1)}.Normal()
+	o := options(t, proc(1501), now.Add(5*time.Minute), nil)
+	o.Rules = []string{RuleUV}
+	o.Writes = quiet
+	res, err := Run(ctx, cfg, st, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := res.Disks[0]
+	if d.Rate < 20 {
+		t.Fatalf("setup: the disk still grows fast: %+v", d)
+	}
+	if !d.Fast {
+		t.Fatalf("past the line and growing, the open fill goes on: %+v", d)
+	}
+	if n, ok, _ := st.Note(ctx, "capacity:fill:"+dir); !ok || !n.Done.IsZero() {
+		t.Fatalf("the fill's note stands: %+v", n)
+	}
+	if n, ok, _ := st.Note(ctx, "capacity:filled:"+dir); ok {
+		t.Fatalf("no note says the fill ended: %+v", n)
+	}
+}
+
 func fillRun(t *testing.T, st *store.Store, dir string, now time.Time, proc string, writes func() map[int]int64) *Result {
 	t.Helper()
 	cfg := Config{Disks: []string{dir}, Fill: nearLine(t, dir)}.Normal()

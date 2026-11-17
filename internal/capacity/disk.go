@@ -2,6 +2,7 @@ package capacity
 
 import (
 	"context"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -55,14 +56,24 @@ func (r *runner) disk(ctx context.Context, disks []DiskState) bool {
 		// what is left to the full percent, or, for a disk already past it (which has a note of its own, recordFull),
 		// the room it still has
 		left := r.cfg.Fill.Full/100*float64(d.Used+d.Avail) - float64(d.Used)
-		if left <= 0 {
+		past := left <= 0
+		if past {
 			left = float64(d.Avail)
 		}
 		if d.Rate > 0 && left > 0 {
-			d.FullIn = time.Duration(left / (1 << 30) / d.Rate * float64(time.Hour))
+			if hours := left / (1 << 30) / d.Rate; hours < float64(math.MaxInt64/int64(time.Hour)) { // a rate near none is never
+				d.FullIn = time.Duration(hours * float64(time.Hour))
+			}
 		}
 		// A rate alone is no fill: on a disk with room, a build's churn writes fast and reaches nothing.
-		d.Fast = d.Rate >= r.cfg.Fill.MinGiBPerHour && d.FullIn > 0 && d.FullIn <= time.Duration(r.cfg.Fill.WithinHours*float64(time.Hour))
+		due := d.FullIn > 0 && d.FullIn <= time.Duration(r.cfg.Fill.WithinHours*float64(time.Hour))
+		if past && !due && d.Rate >= r.cfg.Fill.MinGiBPerHour && r.st != nil {
+			// a fill that crossed its line goes on while the disk grows: one fill, not one that ended at the line
+			// and another when the room runs short
+			open, err := r.st.Mark(ctx, "fill-open:"+d.Disk)
+			due = err == nil && !open.IsZero()
+		}
+		d.Fast = d.Rate >= r.cfg.Fill.MinGiBPerHour && due
 		if d.Fast {
 			fast = true
 			d.Writers = r.writers(ctx, d.mountPath)
@@ -112,6 +123,7 @@ func (r *runner) writers(ctx context.Context, mountPath string) []Writer {
 		span := 0.0
 		if d, ok := iv[pid]; ok {
 			w.Written, w.Over, span = d.written, d.over, d.span
+			w.Span = span
 		}
 		if w.Rate < 1 && (span <= 0 || float64(w.Written)/(1<<20)/span < slowest) {
 			continue
@@ -151,8 +163,15 @@ func (r *runner) writers(ctx context.Context, mountPath string) []Writer {
 	return out
 }
 
-// pace is the faster of a writer's rate at the look and its rate since the run before.
-func (w Writer) pace() float64 { return max(w.Rate, w.since()) }
+// pace is the faster of a writer's rate at the look and of what it wrote since the run before over the time
+// between the runs: the same measure that makes it a writer, so one that lived a moment does not rank above those
+// that wrote the fill. A writer recorded without that time ranks by its rate over its own.
+func (w Writer) pace() float64 {
+	if w.Span > 0 {
+		return max(w.Rate, float64(w.Written)/(1<<20)/w.Span)
+	}
+	return max(w.Rate, w.since())
+}
 
 // writesSnap is each process's written bytes at one look, with its parent and start from the run's sample, and
 // when the look was.

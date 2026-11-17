@@ -105,7 +105,7 @@ type DiskState struct {
 	Avail     int64         `json:"avail"`
 	Rate      float64       `json:"gib_per_hour"` // over the window; 0 without two samples far enough apart
 	Window    time.Duration `json:"-"`
-	FullIn    time.Duration `json:"-"` // until Full percent at this rate
+	FullIn    time.Duration `json:"-"` // until Full percent at this rate, or past it until no room is left
 	WindowMS  int64         `json:"window_ms"`
 	FullInMS  int64         `json:"full_in_ms,omitempty"`
 	Fast      bool          `json:"fast,omitempty"`
@@ -126,6 +126,7 @@ type Writer struct {
 	Rate    float64 `json:"mib_per_s"`
 	Written int64   `json:"written,omitempty"` // bytes it wrote, to any disk, over Over
 	Over    float64 `json:"over_s,omitempty"`  // seconds: since the run before, or since it started after it
+	Span    float64 `json:"span_s,omitempty"`  // seconds between the run before and this one, where they are of one boot
 	OnDisk  bool    `json:"on_disk"`           // its working directory is on the disk
 	Session string  `json:"session,omitempty"`
 }
