@@ -283,8 +283,8 @@ func TestATargetBuiltAgainAfterItsDeletionWaitsLonger(t *testing.T) {
 	}
 }
 
-// An empty .git file is a tool's marker that ends git's search (uv puts one in its cache), not a repository: a
-// target dir under it is in none, so it is one of an unknown project, left by design, and no problem of git's.
+// An empty .git file is a tool's marker (uv puts one in its cache), not a repository: with no repository above it,
+// a target dir under it is one of an unknown project, left by design, and no problem of git's.
 func TestAnEmptyGitFileIsNoRepository(t *testing.T) {
 	gitEnv(t)
 	root := filepath.Join(t.TempDir(), "cache")
@@ -302,5 +302,60 @@ func TestAnEmptyGitFileIsNoRepository(t *testing.T) {
 	}
 	if n, ok, _ := st.Note(context.Background(), "capacity:"+RuleTargets+":unreadable"); ok && n.Done.IsZero() {
 		t.Fatalf("no problem of git's: %+v", n)
+	}
+}
+
+// An empty .git file inside a checkout does not hide the checkout: the repository above still decides. A build
+// under the marker in an excluded project's checkout is reported as that project's, and one the checkout tracks as
+// tracked, though a source each was built from is in a known repository.
+func TestAnEmptyGitFileDoesNotHideTheRepositoryAboveIt(t *testing.T) {
+	gitEnv(t)
+	root := filepath.Join(t.TempDir(), "projects")
+	app := filepath.Join(root, "app") // a known repository: the source the builds name
+	write(t, filepath.Join(app, "src", "lib.rs"), "")
+	gitT(t, app, "init", "-q")
+	secret := filepath.Join(root, "secret") // excluded by its remote
+	write(t, filepath.Join(secret, ".gitignore"), "target/\n")
+	gitT(t, secret, "init", "-q")
+	gitT(t, secret, "remote", "add", "origin", "https://example.com/owner/secret.git")
+	write(t, filepath.Join(secret, "vendor", ".git"), "")
+	excluded := filepath.Join(secret, "vendor", "pkg", "target")
+	cargoTarget(t, excluded, filepath.Join(app, "src", "lib.rs"))
+	loose := filepath.Join(root, "loose") // no ignore rule: the build is the checkout's own files
+	write(t, filepath.Join(loose, "README"), "")
+	gitT(t, loose, "init", "-q")
+	write(t, filepath.Join(loose, "vendor", ".git"), "")
+	tracked := filepath.Join(loose, "vendor", "pkg", "target")
+	cargoTarget(t, tracked, filepath.Join(app, "src", "lib.rs"))
+	cfg := Config{Targets: TargetsConfig{Roots: []string{root}}, Exclude: Exclude{Remotes: []string{"owner/secret"}}}.Normal()
+	cfg.Live = []string{RuleTargets}
+	res, err := Run(context.Background(), cfg, openStore(t), options(t, procRoot(t), time.Now().Add(49*time.Hour), nil))
+	must(t, err)
+	got := findings(res, RuleTargets)
+	if f := got[excluded]; f.Done || f.Action != ActReport || f.class != "excluded" {
+		t.Errorf("a build under a marker in an excluded project's checkout: %+v", f)
+	}
+	if f := got[tracked]; f.Done || f.Action != ActReport || f.class != "tracked" {
+		t.Errorf("a build under a marker that its checkout does not ignore: %+v", f)
+	}
+	for _, p := range []string{excluded, tracked} {
+		if _, err := os.Stat(filepath.Join(p, "debug")); err != nil {
+			t.Errorf("%s was deleted", p)
+		}
+	}
+}
+
+// The wait doubles for each deletion and stops at the longest time there is: it never wraps into no wait.
+func TestTheWaitAfterDeletionsNeverWraps(t *testing.T) {
+	idle := 48 * time.Hour
+	for n, want := range map[int]time.Duration{0: idle, 1: 2 * idle, 3: 8 * idle} {
+		if got := waitAfter(idle, n); got != want {
+			t.Errorf("after %d deletions: %s, want %s", n, got, want)
+		}
+	}
+	for _, n := range []int{16, 19, 20, 64, 1000} {
+		if got := waitAfter(idle, n); got < waitAfter(idle, 15) {
+			t.Errorf("after %d deletions the wait is %s: shorter than after 15", n, got)
+		}
 	}
 }

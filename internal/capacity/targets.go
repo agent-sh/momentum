@@ -43,15 +43,6 @@ func (r *runner) targets(ctx context.Context, paths []string) ([]Finding, error)
 		f := Finding{Rule: RuleTargets, Path: t, canon: canon, Bytes: tree.Bytes, Newest: tree.Newest, Idle: tree.Newest,
 			Eligible: tree.Newest.Add(idle), root: filepath.Dir(t), links: tree.links}
 		f.ino, _ = inodeOf(t)
-		if n := r.targetDeletions(ctx)[keyPath(f)]; n > 0 {
-			if need := idle << min(n, 20); r.now.Sub(tree.Newest) < need {
-				f.Eligible = tree.Newest.Add(need)
-				f.Action, f.Why = ActKeep, fmt.Sprintf("built again after capacity deleted it %d %s: it goes after %s without a write",
-					n, plural("time", n), need)
-				out = append(out, f)
-				continue
-			}
-		}
 		if own, foreign := cargoEntries(t); len(foreign) > 0 {
 			// Cargo builds its own entries again, not the others (Criterion's saved baselines, a build script's
 			// downloads): those stay
@@ -72,6 +63,21 @@ func (r *runner) targets(ctx context.Context, paths []string) ([]Finding, error)
 				break
 			}
 			f.Action, f.class, f.Why = r.targetOwner(ctx, t, canon)
+			if f.Action != ActDelete {
+				break
+			}
+			// only what the rule would take waits: one it leaves for another reason says that reason
+			gone, err := r.targetDeletions(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if n := gone[keyPath(f)]; n > 0 {
+				if need := waitAfter(idle, n); r.now.Sub(tree.Newest) < need {
+					f.Eligible = tree.Newest.Add(need)
+					f.Action, f.Why = ActKeep, fmt.Sprintf("built again after capacity deleted it %d %s: it goes after %d days without a write",
+						n, plural("time", n), int(need.Hours()/24))
+				}
+			}
 		}
 		out = append(out, f)
 	}
@@ -79,28 +85,40 @@ func (r *runner) targets(ctx context.Context, paths []string) ([]Finding, error)
 	return out, nil
 }
 
+// waitAfter is the idle time a target dir goes after once the rule deleted it n times and it was built again: the
+// idle time doubled for each, up to the longest time there is.
+func waitAfter(idle time.Duration, n int) time.Duration {
+	for ; n > 0; n-- {
+		if idle > math.MaxInt64/2 {
+			return math.MaxInt64
+		}
+		idle *= 2
+	}
+	return idle
+}
+
 // targetDeletions is how many times the rule deleted each target dir, by the dir's key in its deletions' events. A
-// store that cannot be read counts none.
-func (r *runner) targetDeletions(ctx context.Context) map[string]int {
+// store that cannot be read fails the scan: a count of none would delete what should wait.
+func (r *runner) targetDeletions(ctx context.Context) (map[string]int, error) {
 	if r.targetsGone != nil {
-		return r.targetsGone
+		return r.targetsGone, nil
 	}
-	r.targetsGone = map[string]int{}
-	if r.st == nil {
-		return r.targetsGone
-	}
-	evs, err := r.st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindDelete}, Limit: math.MaxInt32})
-	if err != nil {
-		return r.targetsGone
-	}
-	prefix := KindDelete + "/" + RuleTargets + "/"
-	for _, e := range evs {
-		key, ok := strings.CutPrefix(e.SourceKey, prefix)
-		if i := strings.LastIndex(key, "/"); ok && i > 0 { // the key ends in the deletion's time
-			r.targetsGone[key[:i]]++
+	gone := map[string]int{}
+	if r.st != nil {
+		evs, err := r.st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindDelete}, Limit: math.MaxInt32})
+		if err != nil {
+			return nil, err
+		}
+		prefix := KindDelete + "/" + RuleTargets + "/"
+		for _, e := range evs {
+			key, ok := strings.CutPrefix(e.SourceKey, prefix)
+			if i := strings.LastIndex(key, "/"); ok && i > 0 { // the key ends in the deletion's time
+				gone[key[:i]]++
+			}
 		}
 	}
-	return r.targetsGone
+	r.targetsGone = gone
+	return gone, nil
 }
 
 // targetOwner decides on an idle target dir by its project.

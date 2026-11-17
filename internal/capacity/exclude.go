@@ -140,12 +140,10 @@ func (g *gitInfo) repoOf(ctx context.Context, p string) *repo {
 	for cur := p; ; {
 		gitdir := filepath.Join(cur, ".git")
 		info, err := os.Lstat(gitdir)
-		if err == nil && info.Mode().IsRegular() && info.Size() == 0 {
-			// an empty .git file is a tool's marker that ends git's search for a repository (uv puts one in its
-			// cache): git finds none from here, so there is none
-			return nil
-		}
-		empty := false
+		// An empty .git file is a tool's marker (uv puts one in its cache), not a repository: git run from under it
+		// fails on it, and the repository above, when there is one, still holds the path as its own file. So it is
+		// passed, as an empty .git directory is, and what is above decides.
+		empty := err == nil && info.Mode().IsRegular() && info.Size() == 0
 		if err == nil && info.IsDir() {
 			entries, readErr := os.ReadDir(gitdir)
 			empty = readErr == nil && len(entries) == 0
