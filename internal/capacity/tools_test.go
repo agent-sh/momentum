@@ -300,6 +300,44 @@ func TestDockerPrunesOldBuildCacheAndDanglingImagesAndOnlyReportsVolumes(t *test
 	}
 }
 
+// With a size set, what the prune by age leaves goes down to it by Docker's own prune, after the prune by age; a
+// cache under its size is left, and with no size set the prune never runs.
+func TestDockerBuildCacheOverItsSizeGoesDownToIt(t *testing.T) {
+	for _, c := range []struct {
+		maxGiB float64
+		runs   bool
+	}{{0, false}, {100, false}, {40, true}} { // the records hold 69 GB, 67 after the prune by age
+		var ran []string
+		tools := fakeTools{ran: &ran, answers: map[string]string{"uv": "ERR", "docker info": "29.0.0\n", "docker builder du": duRecords,
+			"docker image ls": "", "docker system df": "[]", "docker builder prune --force --filter": "Total:\t1.9GB\n",
+			"docker builder prune --force --max-used-space": "Total:\t24GB\n"}}
+		cfg := Config{Live: []string{RuleDocker}, Docker: DockerConfig{MaxGiB: c.maxGiB}}.Normal()
+		o := options(t, procRoot(t), time.Now(), nil)
+		o.Tools, o.Rules = tools, []string{RuleDocker}
+		res, err := Run(context.Background(), cfg, openStore(t), o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		all := strings.Join(ran, "\n")
+		want := "docker builder prune --force --max-used-space " + strconv.FormatInt(int64(c.maxGiB*(1<<30)), 10)
+		if got := strings.Contains(all, "--max-used-space"); got != c.runs || c.runs && !strings.Contains(all, want) {
+			t.Fatalf("max_gib %v: the prune by size ran %v, want %v (%s): %v", c.maxGiB, got, c.runs, want, ran)
+		}
+		f, ok := findings(res, RuleDocker)["docker build cache over its size"]
+		if ok != c.runs {
+			t.Fatalf("max_gib %v: the finding is there %v: %+v", c.maxGiB, ok, f)
+		}
+		if c.runs {
+			if !f.Done || f.Freed != 24e9 || f.Bytes <= 0 {
+				t.Fatalf("the prune by size frees what Docker says: %+v", f)
+			}
+			if strings.Index(all, "--filter until=") > strings.Index(all, "--max-used-space") {
+				t.Fatalf("the prune by age comes first: %v", ran)
+			}
+		}
+	}
+}
+
 // duRecords is `docker builder du --format json`: of the build cache, a prune limited to 168 hours removes the
 // 1.5 GB record last used 9 days ago and the 500 MB one never used, and nothing else. The old base under a child
 // used 2 hours ago stays with its child, and so does its own base.

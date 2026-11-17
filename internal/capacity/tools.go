@@ -1866,7 +1866,8 @@ func newUV(look *Sample, dir string, pid int) bool {
 }
 
 // docker prunes Docker's build cache older than the configured age and its dangling images, once per cadence.
-// Volumes are only reported: one may hold a database.
+// When a size is configured, the cache that is left goes down to it, least recently used first, by Docker's own
+// choice of records. Volumes are only reported: one may hold a database.
 func (r *runner) docker(ctx context.Context, live bool) ([]Finding, []string, error) {
 	if _, err := r.tools.Docker(ctx, 15*time.Second, "info", "--format", "{{.ServerVersion}}"); err != nil {
 		if errors.Is(err, errNoTool) {
@@ -1882,7 +1883,10 @@ func (r *runner) docker(ctx context.Context, live bool) ([]Finding, []string, er
 	// a count of every reclaimable record lists what the prune keeps. A size that cannot be read runs the prune
 	// anyway: it is Docker's own, limited by age, and says what it freed.
 	cache := Finding{Rule: RuleDocker, Path: "docker build cache", Action: ActDelete}
+	over := Finding{Rule: RuleDocker, Path: "docker build cache over its size"}
+	limit := int64(r.cfg.Docker.MaxGiB * (1 << 30))
 	sized := false
+	var total int64 // the whole cache, where it could be read
 	if keep, err := time.ParseDuration(until); err == nil {
 		prefix := "builder prune --filter until=" + until
 		if du, err := r.tools.Docker(ctx, 2*time.Minute, "builder", "du", "--format", "json"); err != nil {
@@ -1893,6 +1897,19 @@ func (r *runner) docker(ctx context.Context, live bool) ([]Finding, []string, er
 			sized = true
 			cache.Bytes = size
 			cache.Detail = fmt.Sprintf("%s: %d %s unused for %s", prefix, n, plural("record", n), until)
+			total = cacheSize(du)
+		}
+	}
+	if limit > 0 {
+		// what the prune by age leaves, against the size: Docker picks the records, so what it frees is its to say
+		flag := "builder prune --max-used-space " + strconv.FormatInt(limit, 10)
+		switch rest := total - cache.Bytes; {
+		case !sized:
+			over.Action, over.unsized = ActDelete, true
+			over.Detail = flag + ": size unknown"
+		case rest > limit:
+			over.Action, over.Bytes = ActDelete, rest-limit
+			over.Detail = fmt.Sprintf("%s: %s in use within %s, over %s", flag, gib(rest), until, gib(limit))
 		}
 	}
 	images := Finding{Rule: RuleDocker, Path: "docker dangling images", Action: ActDelete, Detail: "image prune"}
@@ -1915,13 +1932,16 @@ func (r *runner) docker(ctx context.Context, live bool) ([]Finding, []string, er
 		}
 	}
 	cache.unsized = !sized
-	for _, f := range []*Finding{&cache, &images} {
-		if f.Action == "" || (f.Bytes == 0 && (f != &cache || sized)) {
+	for _, f := range []*Finding{&cache, &over, &images} { // by age first: the size is for what that leaves
+		if f.Action == "" || (f.Bytes == 0 && !f.unsized) {
 			continue
 		}
 		if live {
 			args := []string{"builder", "prune", "--force", "--filter", "until=" + until}
-			if f == &images {
+			switch f {
+			case &over:
+				args = []string{"builder", "prune", "--force", "--max-used-space", strconv.FormatInt(limit, 10)}
+			case &images:
 				args = []string{"image", "prune", "--force"}
 			}
 			res, err := r.tools.Docker(ctx, 30*time.Minute, args...)
@@ -2002,6 +2022,17 @@ func prunable(du string, keep time.Duration) (n int, size int64, ok bool) {
 		}
 	}
 	return n, size, true
+}
+
+// cacheSize is the size of the whole build cache, from the same records: every record once, as Docker counts it.
+func cacheSize(du string) (size int64) {
+	for _, l := range strings.Split(du, "\n") {
+		var rec struct{ Size string }
+		if strings.TrimSpace(l) != "" && json.Unmarshal([]byte(l), &rec) == nil {
+			size += parseSize(rec.Size)
+		}
+	}
+	return size
 }
 
 var ageRe = regexp.MustCompile(`^(\d+) (second|minute|hour|day|week|month|year)s?$`)

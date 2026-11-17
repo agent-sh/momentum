@@ -126,10 +126,13 @@ type UVConfig struct {
 	EveryHours float64 `json:"every_hours"`
 }
 
-// DockerConfig is the docker rule: the build cache older than Until, and dangling images.
+// DockerConfig is the docker rule: the build cache older than Until, and dangling images. MaxGiB, when set, is the
+// most the build cache may hold after that: Docker removes the least recently used records down to it. It has no
+// default: a cache that is all in use within Until is as large as the work is, until its owner sets a size.
 type DockerConfig struct {
 	Path       string  `json:"path"`
 	Until      string  `json:"until"`
+	MaxGiB     float64 `json:"max_gib"`
 	EveryHours float64 `json:"every_hours"`
 }
 
@@ -195,6 +198,9 @@ func (c Config) check() error {
 	}
 	if c.Fill.Full > 100 {
 		return fmt.Errorf("fill.full_pct is %v: a disk is never more than 100%% full, so it would never be due", c.Fill.Full)
+	}
+	if c.Docker.MaxGiB < 0 {
+		return fmt.Errorf("docker.max_gib is %v: a size is not negative", c.Docker.MaxGiB)
 	}
 	return nil
 }
