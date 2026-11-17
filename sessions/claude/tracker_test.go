@@ -230,6 +230,37 @@ func TestWorkflowsAndMonitors(t *testing.T) {
 	}
 }
 
+// A workflow whose launch is only in its result's record, the result's text empty, is a task all the same, until
+// its notification says it ended. A record that holds another tool's result there, or a launch that did not start,
+// is none.
+func TestAWorkflowLaunchedInItsRecordIsATask(t *testing.T) {
+	launched := func(x *script, id string, record any) *script {
+		return x.add(map[string]any{"type": "user", "toolUseResult": record, "message": map[string]any{"content": []any{
+			map[string]any{"type": "tool_result", "tool_use_id": id, "content": ""}}}})
+	}
+	x := newScript(t).call("tu1", "Workflow", map[string]any{"description": "fan out"})
+	x = launched(x, "tu1", map[string]any{"status": "async_launched", "taskId": "wf9", "taskType": "local_workflow", "summary": "Six lanes continue from their branches"}).
+		say("It runs; I will report when it ends.")
+	tr := NewTracker(x.path)
+	s := x.facts(tr, x.at)
+	if taskIDs(s) != "workflow:wf9" || s.Tasks[0].Label != "Six lanes continue from their branches" {
+		t.Fatalf("a workflow launched in its record: %s %+v", taskIDs(s), s.Tasks)
+	}
+	x.notify("wf9", "completed").say("The run is in.")
+	if s := x.facts(tr, x.at); len(s.Tasks) != 0 {
+		t.Fatalf("its notification ends it: %s", taskIDs(s))
+	}
+	y := newScript(t).call("tu1", "Workflow", map[string]any{"description": "fan out"})
+	y = launched(y, "tu1", map[string]any{"status": "failed", "taskId": "wf1"})
+	y = launched(y.call("tu2", "Workflow", map[string]any{"description": "again"}), "tu2", "a result that is text")
+	y = launched(y.call("tu3", "Workflow", map[string]any{"description": "again"}), "tu3", []any{"a", "list"})
+	y = launched(y.call("tu4", "Bash", map[string]any{"command": "true"}), "tu4", map[string]any{"status": "async_launched", "taskId": "b1"})
+	y = launched(y.call("tu5", "Workflow", map[string]any{"description": "odd id"}), "tu5", map[string]any{"status": "async_launched", "taskId": "not an id"}).say("Done.")
+	if s := y.facts(NewTracker(y.path), y.at); len(s.Tasks) != 0 {
+		t.Fatalf("no launch, and tasks: %s", taskIDs(s))
+	}
+}
+
 func TestWakeupsAndLoopsSchedule(t *testing.T) {
 	x := newScript(t).
 		call("tu1", "ScheduleWakeup", map[string]any{"delaySeconds": 600}).

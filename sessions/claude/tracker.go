@@ -27,6 +27,8 @@ var (
 	reBgBash   = regexp.MustCompile(`running in background with ID: (\w+)`)
 	reAgentID  = regexp.MustCompile(`agentId: (\w+)`)
 	reWorkflow = regexp.MustCompile(`Workflow launched in background\. Task ID: (\w+)`)
+	// reTaskName is a task's id as a launch record names it: the form the other launches' ids have.
+	reTaskName = regexp.MustCompile(`^\w+$`)
 	reMonitor  = regexp.MustCompile(`Monitor started \(task (\w+), expires in (\d+)(m|s|h)`)
 	reWake     = regexp.MustCompile(`Next wakeup scheduled for [0-9:]+ \(in (\d+)s\)`)
 	// reCron is CronCreate's result: a recurring job, or a one-shot task (a one-shot job in older versions), its id,
@@ -237,6 +239,28 @@ type line struct {
 		Model   string          `json:"model"`
 		Content json.RawMessage `json:"content"`
 	} `json:"message"`
+	// Launch is what a tool result's record says of a task its call started in the background, beside the result
+	// itself: a workflow's launch may leave the result's text empty and say it only here.
+	Launch *launch `json:"toolUseResult"`
+}
+
+// launch is a background task's start as a tool result's record holds it.
+type launch struct {
+	Status  string `json:"status"` // async_launched
+	TaskID  string `json:"taskId"`
+	Type    string `json:"taskType"` // local_workflow
+	Summary string `json:"summary"`
+}
+
+// UnmarshalJSON reads a launch where the record holds one: a tool's result there is often a string or a list, which
+// is no launch and no error.
+func (l *launch) UnmarshalJSON(raw []byte) error {
+	type plain launch
+	var v plain
+	if json.Unmarshal(raw, &v) == nil {
+		*l = launch(v)
+	}
+	return nil
 }
 
 func (e line) origin() string {
@@ -685,7 +709,7 @@ func (t *Tracker) user(e line, at time.Time, open bool) {
 	for _, b := range bs {
 		switch b.Type {
 		case "tool_result":
-			t.result(b, at)
+			t.result(b, at, e.Launch)
 		case "text":
 			t.userText(b.Text, at, e.IsMeta, e.origin(), origin, open)
 		}
@@ -845,7 +869,7 @@ func (t *Tracker) notified(s string, at time.Time) {
 	}
 }
 
-func (t *Tracker) result(b block, at time.Time) {
+func (t *Tracker) result(b block, at time.Time, started *launch) {
 	st := &t.st
 	st.LastMain, st.QueuedPrompt, st.Held = "user", time.Time{}, time.Time{}
 	c := st.Calls[b.ToolUseID]
@@ -883,6 +907,13 @@ func (t *Tracker) result(b block, at time.Time) {
 		k := add(reWorkflow.FindStringSubmatch(out)[1], "workflow")
 		if i := strings.Index(out, "Summary: "); i >= 0 {
 			k.Label = text.OneLine(strings.SplitN(out[i+9:], "\n", 2)[0], 120)
+		}
+	case c.Name == "Workflow" && started != nil && started.Status == "async_launched" && reTaskName.MatchString(started.TaskID):
+		// the launch is in the record and the result's text is empty: without it the run is no task, and a session
+		// that waits on its workflow reads as one with nothing in flight
+		k := add(started.TaskID, "workflow")
+		if started.Summary != "" {
+			k.Label = text.OneLine(started.Summary, 120)
 		}
 	case c.Name == "Monitor" && reMonitor.MatchString(out):
 		m := reMonitor.FindStringSubmatch(out)
