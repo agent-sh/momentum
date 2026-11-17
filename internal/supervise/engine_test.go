@@ -1316,3 +1316,42 @@ func TestATransientMessageAfterANudgeNamesTheRequestBeforeIt(t *testing.T) {
 		t.Fatalf("a nudge after momentum's message: %+v %v", lines, err)
 	}
 }
+
+// A case closes its rule for the stop it was about, not for good. A session nobody types into, which its own
+// runs drive, moves on by itself: a turn of its own began after the case, and the stop after that turn is a new
+// episode. The rule sends again there, with tries of its own, and while the case kept it shut that was said once.
+func TestACaseClosesItsRuleOnlyUntilTheSessionMovesOn(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0.Add(10 * time.Minute)
+	sv := supervisor(st, f, &now)
+	s := erroring()
+	run(t, sv, s)
+	for i := 0; i < 20; i++ { // the message opens no turn: a case, and the rule is shut for this stop
+		now = now.Add(time.Minute)
+		run(t, sv, s)
+	}
+	if cases := events(t, st, KindCase); len(f.sent) != 1 || len(cases) != 1 {
+		t.Fatalf("sent %d, cases %+v", len(f.sent), cases)
+	}
+	shut := 0
+	for _, e := range events(t, st, KindSkip) {
+		if strings.Contains(e.Summary, "a case is open for this stop") {
+			shut++
+		}
+	}
+	if shut != 1 {
+		t.Fatalf("the shut rule was said %d times, want once", shut)
+	}
+	// A run of the session's own opens a turn, which ends on the same error: a new stop.
+	s.TurnBegan = now.Add(time.Minute)
+	s.Since = now.Add(2 * time.Minute)
+	now = now.Add(4 * time.Minute)
+	run(t, sv, s)
+	if len(f.sent) != 2 {
+		t.Fatalf("after the session moved on: sent %d, want a second message", len(f.sent))
+	}
+	if cases := events(t, st, KindCase); len(cases) != 1 {
+		t.Fatalf("a new episode opened a case at once: %+v", cases)
+	}
+}

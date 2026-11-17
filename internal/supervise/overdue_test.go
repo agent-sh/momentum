@@ -407,11 +407,11 @@ func TestADryRecordDoesNotHoldARuleGoneLive(t *testing.T) {
 
 func TestARunThatStartsStartsTheCountAgain(t *testing.T) {
 	h := past{sends: []sent{{at: t0, rule: RuleOverdue}, {at: t0.Add(time.Hour), rule: RuleOverdue}}}
-	if n := h.tries(time.Time{})[RuleOverdue]; n != 2 {
+	if n := h.tries(time.Time{}, nil)[RuleOverdue]; n != 2 {
 		t.Fatalf("tries %d", n)
 	}
 	// A run of its own started after both: the count starts again, as the engine reads it from the stop.
-	if n := h.tries(t0.Add(2 * time.Hour))[RuleOverdue]; n != 0 {
+	if n := h.tries(t0.Add(2*time.Hour), nil)[RuleOverdue]; n != 0 {
 		t.Fatalf("since the run: tries %d", n)
 	}
 }

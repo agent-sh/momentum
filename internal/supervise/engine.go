@@ -221,10 +221,13 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 			}
 			probe = credentials{inner: p, path: filepath.Join(sv.ClaudeDir, ".credentials.json"), hold: sv.Params.OwnerWindow}
 		}
-		tries := h.tries(ownerAt)
+		reopened := h.reopened(ownerAt, s.TurnBegan)
+		tries := h.tries(ownerAt, reopened)
 		tries[RuleOverdue] = h.overdueTries(stop, ownerAt)
 		d := Decide(stop, tries, sv.Params, probe, now)
-		if d.Rule != "" && d.Verdict != Case && d.Verdict != Skip && h.closed(d.Rule, ownerAt) {
+		shut := false // the rule would have acted, and a case of this stop keeps it from sending
+		if d.Rule != "" && d.Verdict != Case && d.Verdict != Skip && h.closed(d.Rule, ownerAt, reopened) {
+			shut = d.Verdict == Act
 			d.Verdict, d.Why = Case, "a case is open since the owner's last turn"
 		}
 		if d.Verdict == Skip && d.Rule == "" {
@@ -286,8 +289,14 @@ func (sv *Supervisor) Run(ctx context.Context, ss []*sessions.Session, starts ma
 				return lines, err
 			}
 		case Case:
-			if !h.closed(d.Rule, ownerAt) { // one case per rule until the owner comes back
+			if !h.closed(d.Rule, ownerAt, reopened) { // one case per rule until the owner comes back or the session moves on
 				if err := sv.put(ctx, []store.Event{sv.openCase(ctx, s, stop, d.Rule, d.Why, d.Try, now)}); err != nil {
+					return lines, err
+				}
+			} else if shut {
+				// said once for the stop, dated at it, so a rule a case keeps shut is not silent
+				e := sv.note(s, KindSkip, "shut:"+d.Rule, s.Since, d.Rule+": a case is open for this stop, so nothing is sent until the session moves on or its owner comes back")
+				if err := sv.put(ctx, []store.Event{e}); err != nil {
 					return lines, err
 				}
 			}
@@ -789,9 +798,10 @@ func (h past) last() *sent {
 	return &h.sends[len(h.sends)-1]
 }
 
-// tries counts each rule's messages since the owner's last turn and since the last of the rule's messages whose
-// turn did work: the episode still going, however long ago it began.
-func (h past) tries(ownerAt time.Time) Tries {
+// tries counts each rule's messages since the owner's last turn, since the last of the rule's messages whose
+// turn did work, and since a case of the rule that the session moved on from (reopened): the episode still going,
+// however long ago it began.
+func (h past) tries(ownerAt time.Time, reopened map[string]time.Time) Tries {
 	t := Tries{}
 	from := map[string]time.Time{}
 	for _, s := range h.sends {
@@ -801,7 +811,7 @@ func (h past) tries(ownerAt time.Time) Tries {
 		}
 	}
 	for _, s := range h.sends {
-		if s.at.After(ownerAt) && s.at.After(from[s.rule]) {
+		if s.at.After(ownerAt) && s.at.After(from[s.rule]) && s.at.After(reopened[s.rule]) {
 			t[s.rule]++
 		}
 	}
@@ -834,15 +844,31 @@ func runOwner(key string) string {
 }
 
 // closed reports a rule momentum must not send for again: a case is open for it since the owner's last turn
-// (tries used up, a message that did not land or stayed on the input line). It stays closed until he comes back.
-// A going case does not close its rule.
-func (h past) closed(rule string, ownerAt time.Time) bool {
+// (tries used up, a message that did not land or stayed on the input line). It stays closed until he comes back,
+// or until the session moves on from the stop the case was about (reopened): a session nobody types into, which
+// its own scheduled runs drive, would otherwise keep the rule shut for good. A going case does not close its rule.
+func (h past) closed(rule string, ownerAt time.Time, reopened map[string]time.Time) bool {
 	for _, c := range h.cases {
-		if c.rule == rule && c.at.After(ownerAt) && !c.going {
+		if c.rule == rule && c.at.After(ownerAt) && c.at.After(reopened[rule]) && !c.going {
 			return true
 		}
 	}
 	return false
+}
+
+// reopened is, by rule, when the newest case that closed it stopped holding: a turn began after the case, so the
+// session moved on from the stop the case was about, and a stop since is a new episode with tries of its own.
+// A closed rule sends nothing, so that turn is not one of its messages'. A harness that does not date its turns
+// reopens nothing, and neither does a turn for the overdue rule: its case is about one job's runs, which another
+// job's turn says nothing of, and its tries already count from that job's last run (overdueTries).
+func (h past) reopened(ownerAt, turnBegan time.Time) map[string]time.Time {
+	out := map[string]time.Time{}
+	for _, c := range h.cases {
+		if !c.going && c.rule != RuleOverdue && c.at.After(ownerAt) && turnBegan.After(c.at) && c.at.After(out[c.rule]) {
+			out[c.rule] = c.at
+		}
+	}
+	return out
 }
 
 // noted reports a going case on record for the rule's episode: since the owner's last turn, with none of the
