@@ -234,6 +234,14 @@ func Protected() []string {
 
 var selfChanges = []string{"internal/supervise/rules.go", "internal/capacity/rules.go"}
 
+// selfTests are the test files of the loop's own repository that land with its rules when their change only appends
+// tests. By their names they are hand paths still (PathScope, CheckPaths): the ship tool reads the change itself
+// (Ship.selfScope) before it lets one through, at the check and again at the landing.
+var selfTests = []string{"internal/supervise/rules_test.go"}
+
+// SelfLandableTests are the test files the loop lands with its rules when their change only appends tests.
+func SelfLandableTests() []string { return slices.Clone(selfTests) }
+
 // ciPaths are the CI configurations of the hosts the loop could push to.
 var ciPaths = []string{".github/", ".circleci/", ".buildkite/", ".gitlab-ci.yml", "Jenkinsfile", "azure-pipelines.yml", ".travis.yml"}
 

@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -784,9 +785,12 @@ func (s *Ship) check(ctx context.Context, caseID string, test testCommand, testF
 	if len(paths) == 0 {
 		return p, refused("the patch is empty: produce a cumulative diff against %s", p.BaseCommit)
 	}
-	var hand []string
+	var hand, added []string
 	if p.Kind != KindConfig {
 		if hand, err = PathScope(Target{Repo: p.Repo}, paths); err != nil {
+			return p, err
+		}
+		if hand, added, err = s.selfScope(ctx, p, p.BaseCommit, tree, paths, hand); err != nil {
 			return p, err
 		}
 		if err := handStays(p, hand); err != nil {
@@ -865,6 +869,11 @@ func (s *Ship) check(ctx context.Context, caseID string, test testCommand, testF
 	a, err := s.Sandbox.Run(ctx, after, words, s.Env)
 	if err != nil {
 		return p, err
+	}
+	if b.Exit != 0 && a.Exit == 0 && p.Kind != KindConfig {
+		if err := s.selfSuite(ctx, p, after, paths, added); err != nil {
+			return p, err
+		}
 	}
 	if err := cleanup(); err != nil {
 		return p, err
@@ -960,6 +969,8 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 			return p, refused("a configuration change is in effect in its own file: it names no installed file")
 		}
 	} else if hand, err = PathScope(Target{Repo: p.Repo}, paths); err != nil {
+		return p, err
+	} else if hand, _, err = s.selfScope(ctx, p, p.BaseCommit, tree, paths, hand); err != nil {
 		return p, err
 	} else if err := handStays(p, hand); err != nil {
 		return p, err
@@ -1375,7 +1386,7 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 		return p, refused("case %s's change is a configuration proposal: an agent applies it by hand, and the loop never writes %s", caseID, p.Target)
 	}
 	if err == nil && ok && p.State == Landing && len(p.Hand) == 0 {
-		if err := CheckPaths(Target{Repo: p.Repo}, p.Changed); err != nil {
+		if err := s.landPaths(ctx, p, p.BaseCommit, p.Head); err != nil {
 			return p, err
 		}
 		if !s.Live {
@@ -1440,7 +1451,10 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 			return p, err
 		}
 	}
-	pathErr := CheckPaths(Target{Repo: p.Repo}, p.Changed)
+	var pathErr error
+	if err == nil && ok && p.State == Proposed && len(p.Hand) == 0 {
+		pathErr = s.landPaths(ctx, p, p.BaseCommit, p.Head)
+	}
 	switch {
 	case err != nil:
 		return Package{}, err
@@ -1522,12 +1536,20 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 		return p, errors.Join(err, s.unexport(p, tree))
 	}
 	a, err := s.Sandbox.Run(ctx, tree, command, s.Env)
+	// the rebased change is read as the reviewed one was: what it does to the loop's own files, and their suite
+	var selfErr error
+	if err == nil && a.Exit == 0 {
+		selfErr = s.selfLanding(ctx, p, head, tree)
+	}
 	err = errors.Join(err, s.unexport(p, tree))
 	if err != nil {
 		return p, err
 	}
 	if a.Exit != 0 {
 		return p, refused("after the rebase the test fails (exit %d): no landing", a.Exit)
+	}
+	if selfErr != nil {
+		return p, selfErr
 	}
 	base, err := s.git(ctx, p.Host, "rev-parse", "origin/"+p.Base)
 	if err != nil {
@@ -1569,6 +1591,133 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	}
 	complete = true
 	return s.finishLanding(ctx, p)
+}
+
+// blob is a file of a commit or a tree in the host clone, when it is a plain file there (a regular blob, not
+// executable): absent, a link, a directory or an executable has no bytes and is not plain.
+func (s *Ship) blob(ctx context.Context, p Package, rev, name string) ([]byte, bool, error) {
+	entry, err := s.git(ctx, p.Host, "ls-tree", rev, "--", name)
+	if err != nil || !strings.HasPrefix(entry, "100644 blob ") {
+		return nil, false, err
+	}
+	b, err := s.git(ctx, p.Host, "show", rev+":"+name)
+	return []byte(b), err == nil, err
+}
+
+// selfScope reads the content of a change to the loop's own repository, between a base and a tree of the host
+// clone, and settles what the paths alone cannot (PathScope). A rules file whose change does more than change a rule
+// (rulesKept) becomes a hand path. A rules' test file whose change only appends tests (appendedTests) stops being
+// one: added are those tests. Elsewhere the hand paths stand as given.
+func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, changed, hand []string) (out, added []string, err error) {
+	if !strings.EqualFold(p.Repo, SelfRepo) {
+		return hand, nil, nil
+	}
+	out = slices.Clone(hand)
+	for _, c := range changed {
+		rules, test := slices.Contains(selfChanges, c), slices.Contains(selfTests, c)
+		if !rules && !test {
+			continue
+		}
+		old, _, err := s.blob(ctx, p, base, c)
+		if err != nil {
+			return nil, nil, err
+		}
+		now, plainNow, err := s.blob(ctx, p, tree, c)
+		if err != nil {
+			return nil, nil, err
+		}
+		why := "the change leaves no plain file there"
+		var names []string
+		switch {
+		case plainNow && rules:
+			why = rulesKept(old, now)
+		case plainNow:
+			names, why = appendedTests(old, now)
+		}
+		switch {
+		case why != "" && !slices.Contains(out, c):
+			out = append(out, c)
+			fallthrough
+		case why != "":
+			s.logf("case %s: %s is a person's to land: %s", p.Case, c, why)
+		case test:
+			out = slices.DeleteFunc(out, func(h string) bool { return h == c })
+			added = append(added, names...)
+		}
+	}
+	slices.Sort(out)
+	return out, added, nil
+}
+
+// landPaths is the landing's check of a package's paths: the gate's, with the content of a change to the loop's own
+// repository read between a base and a head (selfScope). No path may be left for a person.
+func (s *Ship) landPaths(ctx context.Context, p Package, base, head string) error {
+	hand, err := PathScope(Target{Repo: p.Repo}, p.Changed)
+	if err != nil {
+		return err
+	}
+	if hand, _, err = s.selfScope(ctx, p, base, head, p.Changed, hand); err != nil || len(hand) == 0 {
+		return err
+	}
+	if err := CheckPaths(Target{Repo: p.Repo}, hand); err != nil {
+		return err
+	}
+	return refused("%s: the change does more there than the loop lands (a rule's change with no new import, initializer or directive)", strings.Join(hand, ", "))
+}
+
+// selfSuite runs, for a change to the loop's own rules or their tests, the whole test suite of each package it
+// touches there, in the sandbox on an export of the change, without the tests the change adds: the tests the
+// package had must pass with the change, in a run where nothing the change added to the tests has run. The change's
+// own check proves the added tests; this proves the others still hold.
+func (s *Ship) selfSuite(ctx context.Context, p Package, dir string, changed, added []string) error {
+	if !strings.EqualFold(p.Repo, SelfRepo) {
+		return nil
+	}
+	cmd := []string{"go", "test", "-count=1"}
+	if len(added) > 0 {
+		cmd = append(cmd, "-skip", "^("+strings.Join(added, "|")+")$")
+	}
+	n := len(cmd)
+	for _, c := range changed {
+		if pkg := "./" + path.Dir(c); (slices.Contains(selfChanges, c) || slices.Contains(selfTests, c)) && !slices.Contains(cmd[n:], pkg) {
+			cmd = append(cmd, pkg)
+		}
+	}
+	if len(cmd) == n {
+		return nil
+	}
+	if err := s.Sandbox.resolve(cmd[0]); err != nil {
+		return err
+	}
+	o, err := s.Sandbox.Run(ctx, dir, cmd, s.Env)
+	if err != nil {
+		return err
+	}
+	if o.Exit != 0 {
+		return refused("the package's own tests do not pass with the change (%s: exit %d): a change keeps the tests it found passing", strings.Join(cmd, " "), o.Exit)
+	}
+	return nil
+}
+
+// selfLanding reads a rebased change to the loop's own repository as the check read the reviewed one: against the
+// base it now stands on, no path of it is a person's, and the suite of the package it touches passes on its export.
+func (s *Ship) selfLanding(ctx context.Context, p Package, head, dir string) error {
+	if !strings.EqualFold(p.Repo, SelfRepo) {
+		return nil
+	}
+	base, err := s.git(ctx, p.Host, "rev-parse", "origin/"+p.Base)
+	if err != nil {
+		return err
+	}
+	base = strings.TrimSpace(base)
+	if err := s.landPaths(ctx, p, base, head); err != nil {
+		return err
+	}
+	_, added, err := s.selfScope(ctx, p, base, head, p.Changed, nil)
+	if err != nil {
+		return err
+	}
+	return s.selfSuite(ctx, p, dir, p.Changed, added)
 }
 
 // ciOK are the conclusions of a workflow's run that passed, or that chose not to run.
