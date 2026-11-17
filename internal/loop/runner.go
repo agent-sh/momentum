@@ -657,11 +657,13 @@ const (
 	roomFound       = "It ended: a later build of the case went on to its agent."
 	caseStopped     = "It ended: the stop rule stopped the case."
 	gateBroke       = "It ended: the capacity gate failed, which counts as the host's error at the check."
+	waitsPassed     = "It ended: a run of the case's build went past its waits."
 )
 
-// holdNoteEnded says whether a base, proposal or capacity note says its hold ended (endHoldNotes).
+// holdNoteEnded says whether a base, proposal, capacity or wait note says its hold ended (endHoldNotes,
+// endWaitNote).
 func holdNoteEnded(n store.Note) bool {
-	return strings.HasSuffix(n.Detail, baseFetched) || strings.HasSuffix(n.Detail, proposalRead) || strings.HasSuffix(n.Detail, caseLeftTesting) ||
+	return strings.HasSuffix(n.Detail, waitsPassed) || strings.HasSuffix(n.Detail, baseFetched) || strings.HasSuffix(n.Detail, proposalRead) || strings.HasSuffix(n.Detail, caseLeftTesting) ||
 		strings.HasSuffix(n.Detail, roomFound) || strings.HasSuffix(n.Detail, gateBroke) || strings.HasSuffix(n.Detail, caseStopped)
 }
 

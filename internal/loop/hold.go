@@ -175,7 +175,7 @@ func buildWaitNote(caseID string, n store.Note) bool {
 	return true
 }
 
-// endBuildWaits resolves a case's standing notes of builds that waited at a stage: the build got past its waits (a
+// endBuildWaits ends a case's standing notes of builds that waited at a stage: the build got past its waits (a
 // run of it ended that nothing held), so what they say is over.
 func (r *Runner) endBuildWaits(ctx context.Context, caseID string) error {
 	notes, err := r.Store.Notes(ctx)
@@ -184,12 +184,26 @@ func (r *Runner) endBuildWaits(ctx context.Context, caseID string) error {
 	}
 	for _, n := range notes {
 		if n.Done.IsZero() && buildWaitNote(caseID, n) {
-			if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
+			if err := endWaitNote(ctx, r.Store, r.now(), n, waitsPassed); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// endWaitNote ends a standing wait note: it says why and is resolved. The text is what tells the two ends of such
+// a note apart: one the loop ended reads differently from its cause, so the same wait, when it comes back, puts
+// the note again, and one a reader resolved reads as it did and stays resolved (noteStepSkip).
+func endWaitNote(ctx context.Context, st *store.Store, now time.Time, n store.Note, why string) error {
+	if !holdNoteEnded(n) { // one that says so and stands (a pass stopped between the writes) is only resolved
+		n.Detail = n.Detail + " " + why
+		if _, err := st.PutNote(ctx, n); err != nil {
+			return err
+		}
+	}
+	_, _, err := st.DoneNote(ctx, n.ID, now)
+	return err
 }
 
 // policyPrepareNote is a note a build's preparation left for a refusal of the configuration's policy, before the
@@ -277,8 +291,14 @@ func (r *Runner) releaseHolds(ctx context.Context, cs []store.Case) error {
 		}
 		hold, record, repo, hand := holdNotePrefix(c.ID), recordNotePrefix(c.ID), repoNoteID(c.ID), handNoteID(c.ID)
 		for _, n := range mine {
+			if n.Done.IsZero() && buildWaitNote(c.ID, n) {
+				if err := endWaitNote(ctx, r.Store, r.now(), n, caseLeftTesting); err != nil {
+					return err
+				}
+				continue
+			}
 			if n.Done.IsZero() && (strings.HasPrefix(n.ID, hold) || strings.HasPrefix(n.ID, record) || n.ID == repo || n.ID == hand || strings.HasPrefix(n.ID, hand+":") ||
-				strings.HasPrefix(n.ID, personNotePrefix(c.ID)) || buildWaitNote(c.ID, n)) {
+				strings.HasPrefix(n.ID, personNotePrefix(c.ID))) {
 				if _, _, err := r.Store.DoneNote(ctx, n.ID, r.now()); err != nil {
 					return err
 				}
