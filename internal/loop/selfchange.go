@@ -6,9 +6,11 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"maps"
 	"regexp"
 	"slices"
 	"strconv"
+	"strings"
 )
 
 // reTestName is a test function's name as the go command reads one, the package's TestMain aside.
@@ -23,8 +25,8 @@ var reDirective = regexp.MustCompile(`^(//go:|//line |/\*line |//export |//\s*\+
 // parsed: what the file held is kept byte for byte, and every declaration after it is a plain
 // `func TestXxx(t *testing.T)`. No TestMain, initializer, variable, type, import or compiler directive comes with
 // them, so nothing the change adds runs before an old test or in its place. What an added test's body does is not
-// read here: the file is the loop's own and sorts last in its package (selfTests), so only tests the loop added
-// run after it, and the review reads the body.
+// read here: the file is the loop's own and its tests run last in its package (selfTests, runLast), so only tests
+// the loop added run after it, and the review reads the body.
 func appendedTests(old, changed []byte) (names []string, why string) {
 	switch {
 	case len(old) == 0:
@@ -35,6 +37,8 @@ func appendedTests(old, changed []byte) (names []string, why string) {
 		return nil, "it adds nothing"
 	case old[len(old)-1] != '\n':
 		return nil, "the file did not end with a line's end"
+	case changed[len(changed)-1] != '\n':
+		return nil, "it does not end with a line's end" // the next change could not append to it
 	}
 	fset := token.NewFileSet()
 	was, err := parser.ParseFile(fset, "", old, parser.ParseComments|parser.SkipObjectResolution)
@@ -103,7 +107,7 @@ func takesT(params *ast.FieldList) bool {
 
 // rulesKept says why a change to a rules file of the loop's own repository is a person's to land, or "": the loop
 // lands a rule's change, and these do more than change a rule. Another import. An initializer: an init function,
-// or a package variable whose value holds a call or a function, which runs before every test and at the start of
+// or a package variable whose value holds a call or a function literal, which runs before every test and at the start of
 // every process. A package-level name that hides a predeclared one (len, true, string), which changes every file of
 // the package. A comment the toolchain reads (a build constraint, a linked name). Each is refused when the change
 // brings it, not when the file held it. The file must parse before and after, and exist before: the loop adds no
@@ -222,4 +226,58 @@ func added(was, now []string) []string {
 		}
 	}
 	return out
+}
+
+// runLast says why the tests of the file own would not run after every other test of its package, or "". files are
+// the package's test files by name. The go command runs a package's tests file by file in the order of their
+// names, and a file's in the order it holds them; these change that, and are refused in the other files: a file
+// whose name sorts after own, a file of the package's external test package (run after the package's own), a
+// TestMain (it decides what runs), a fuzz test or an example (run after the tests), and a test that calls Parallel
+// (it waits for the others to end). A person's run with -shuffle or a count above one orders them otherwise; the
+// host's does not.
+func runLast(files map[string][]byte, own string) string {
+	if files[own] == nil {
+		return own + " is not among the package's test files"
+	}
+	fset := token.NewFileSet()
+	pkg := ""
+	for _, name := range slices.Sorted(maps.Keys(files)) {
+		f, err := parser.ParseFile(fset, name, files[name], parser.SkipObjectResolution)
+		if err != nil {
+			return name + " does not parse"
+		}
+		if name == own {
+			pkg = f.Name.Name
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(files)) {
+		if name == own {
+			continue
+		}
+		if name > own {
+			return name + " sorts after " + own
+		}
+		f, _ := parser.ParseFile(fset, name, files[name], parser.SkipObjectResolution)
+		if f.Name.Name != pkg {
+			return name + " is in another package (" + f.Name.Name + "): its tests run after the package's own"
+		}
+		why := ""
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch n := n.(type) {
+			case *ast.FuncDecl:
+				if n.Recv == nil && (n.Name.Name == "TestMain" || strings.HasPrefix(n.Name.Name, "Fuzz") || strings.HasPrefix(n.Name.Name, "Example")) {
+					why = name + " holds " + n.Name.Name + ", which does not run in the files' order"
+				}
+			case *ast.CallExpr:
+				if sel, ok := n.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Parallel" && len(n.Args) == 0 {
+					why = name + " holds a test that runs in parallel, after the others end"
+				}
+			}
+			return why == ""
+		})
+		if why != "" {
+			return why
+		}
+	}
+	return ""
 }

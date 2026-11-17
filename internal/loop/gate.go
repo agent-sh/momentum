@@ -239,7 +239,8 @@ var selfChanges = []string{"internal/supervise/rules.go", "internal/capacity/rul
 // appends tests, each with the rules file it lands with. The file is the loop's own, kept apart from the tests a
 // person wrote, and its name sorts last in its package: the go command runs a package's tests file by file in the
 // order of their names, so a test the loop added runs after every test it did not add, and nothing it leaves behind
-// reaches one. By their names these are hand paths still (PathScope, CheckPaths): the ship tool reads the change
+// reaches one, while the package's other test files leave that order alone (runLast, read at each step). By their
+// names these are hand paths still (PathScope, CheckPaths): the ship tool reads the change
 // itself (Ship.selfScope) before it lets one through, at the check and again at the landing.
 var selfTests = map[string]string{"internal/supervise/zz_loop_test.go": "internal/supervise/rules.go"}
 

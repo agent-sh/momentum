@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -13,18 +14,26 @@ import (
 	"github.com/agent-sh/momentum/internal/store"
 )
 
-// selfLater is a test of the rules' package in a file after the rules' own: the go command runs it after them.
+// selfOther is a test of the rules' package that a person wrote, in a file before the loop's.
 const (
-	selfLaterPath = "internal/supervise/zzz_later_test.go"
-	selfLater     = "package supervise\n\nimport \"testing\"\n\nfunc TestLimitIsAtMostTwo(t *testing.T) {\n\tif Limit() > 2 {\n\t\tt.Fatal(Limit())\n\t}\n}\n"
+	selfOtherPath = "internal/supervise/rules_test.go"
+	selfOther     = "package supervise\n\nimport \"testing\"\n\nfunc TestLimitIsAtMostTwo(t *testing.T) {\n\tif Limit() > 2 {\n\t\tt.Fatal(Limit())\n\t}\n}\n"
 )
 
 // selfFixture is a ship tool over a repository the gate names as the loop's own, holding the supervision rules,
-// their test and a later test of the package, with a package prepared for a case.
+// a person's test of them and the loop's test file, with a package prepared for a case.
 func selfFixture(t *testing.T) (*Ship, *store.Store, repoFixture, store.Case, Package) {
 	t.Helper()
+	return selfFixtureWith(t, nil)
+}
+
+// selfFixtureWith is selfFixture over a repository that holds more files.
+func selfFixtureWith(t *testing.T, more map[string]string) (*Ship, *store.Store, repoFixture, store.Case, Package) {
+	t.Helper()
 	st := testStore(t)
-	f := newRepo(t, map[string]string{rulesPath: selfRules, rulesTestPath: selfRulesTest, selfLaterPath: selfLater})
+	files := map[string]string{rulesPath: selfRules, rulesTestPath: selfRulesTest, selfOtherPath: selfOther}
+	maps.Copy(files, more)
+	f := newRepo(t, files)
 	s := shipFor(t, st, f)
 	s.Gate.Resolve = func(context.Context, string) (string, error) { return SelfRepo, nil }
 	c := testingCase(t, st)
@@ -115,12 +124,9 @@ func TestTheLoopReadsAChangeToItsOwnFiles(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			hand, added, err := s.selfScope(ctx, p, p.BaseCommit, tree, paths, byName)
+			hand, err := s.selfScope(ctx, p, p.BaseCommit, tree, paths, byName)
 			if err != nil || !slices.Equal(hand, c.hand) {
 				t.Fatalf("hand paths %v, want %v (by name %v): %v", hand, c.hand, byName, err)
-			}
-			if want := c.test == selfRulesTest+selfNewTest && c.mode == 0o644 && c.rules != selfRules; want != slices.Equal(added, []string{"TestLimitIsTwo"}) || !want && added != nil {
-				t.Fatalf("added tests: %v", added)
 			}
 			// the landing reads the same change the same way
 			p.Changed = paths
@@ -129,16 +135,35 @@ func TestTheLoopReadsAChangeToItsOwnFiles(t *testing.T) {
 			}
 			// another repository's files of the same names are not read: its hand paths stand as the gate gave them
 			p.Repo = "agent-sh/other"
-			if hand, added, err := s.selfScope(ctx, p, p.BaseCommit, tree, paths, byName); err != nil || !slices.Equal(hand, byName) || added != nil {
-				t.Fatalf("another repository: %v %v %v", hand, added, err)
+			if hand, err := s.selfScope(ctx, p, p.BaseCommit, tree, paths, byName); err != nil || !slices.Equal(hand, byName) {
+				t.Fatalf("another repository: %v %v", hand, err)
+			}
+		})
+	}
+	// The loop's tests run last only while the package's other test files leave the order alone. In a package
+	// where one does not, the loop's test file is a person's again, though its change only appends.
+	for name, more := range map[string]map[string]string{
+		"a test file that sorts after the loop's": {"internal/supervise/zzz_later_test.go": selfOther},
+		"a test that runs in parallel":            {"internal/supervise/par_test.go": "package supervise\n\nimport \"testing\"\n\nfunc TestPar(t *testing.T) { t.Parallel() }\n"},
+		"a file of the external test package":     {"internal/supervise/ext_test.go": "package supervise_test\n\nimport \"testing\"\n\nfunc TestExt(t *testing.T) {}\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, _, _, cs, p := selfFixtureWith(t, more)
+			write(t, filepath.Join(p.Work, rulesPath), two)
+			write(t, filepath.Join(p.Work, rulesTestPath), selfRulesTest+selfNewTest)
+			tree, paths, err := s.applyPatch(ctx, p, []Patch{fixturePatch(t, s, cs.ID)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if hand, err := s.selfScope(ctx, p, p.BaseCommit, tree, paths, []string{rulesTestPath}); err != nil || !slices.Equal(hand, []string{rulesTestPath}) {
+				t.Fatalf("hand paths %v: %v", hand, err)
 			}
 		})
 	}
 }
 
-// The host runs the whole suite of the rules' package on the change, without the tests the change adds. A change
-// whose own test passes and that breaks a test the package had is refused; and so is one whose added test makes a
-// later test pass by changing what it sees, since the suite runs with the added tests left out.
+// The host runs the whole suite of the rules' package on the change. A change whose own test passes and that breaks
+// a test the package had is refused, and so is one whose command rewrites the tree it ran in to hide that.
 func TestTheRulesPackagesOwnTestsMustStillPass(t *testing.T) {
 	ctx := context.Background()
 	for name, c := range map[string]struct {
@@ -148,10 +173,6 @@ func TestTheRulesPackagesOwnTestsMustStillPass(t *testing.T) {
 		// the old test wants a positive limit; the build's command names only its new test
 		"an old test broken": {strings.Replace(selfRules, "limit = 1", "limit = 0", 1),
 			"\nfunc TestLimitIsZero(t *testing.T) {\n\tif Limit() != 0 {\n\t\tt.Fatal(Limit())\n\t}\n}\n", []string{"go", "test", "-run", "TestLimitIsZero", "./..."}},
-		// a later test wants at most two (the fixture has a test file after the loop's, which the real package has
-		// not); the added test sets the limit back before it runs, so the whole run passes
-		"an added test that covers for a later one": {strings.Replace(selfRules, "limit = 1", "limit = 3", 1),
-			"\nfunc TestLimitIsThree(t *testing.T) {\n\tif Limit() != 3 {\n\t\tt.Fatal(Limit())\n\t}\n\tlimit = 2\n}\n", []string{"go", "test", "./..."}},
 		// the build's command puts the old limit back in the tree it ran in, once its own test has passed: the suite
 		// runs on an export of its own, where the change is as it was
 		"a command that rewrites the tree it ran in": {strings.Replace(selfRules, "limit = 1", "limit = 0", 1),
@@ -214,6 +235,9 @@ func TestALandingReadsTheChangeAgain(t *testing.T) {
 			t.Fatalf("setup: a clean review: %+v %v", p, err)
 		}
 		p.Hand, p.State = nil, state
+		if state == Landing { // a head journaled and published, with the base where it was: the resumed landing's push is next
+			p.LandingHead, p.PublishedHead = p.Head, p.Head
+		}
 		if err := s.save(&p); err != nil {
 			t.Fatal(err)
 		}
@@ -227,7 +251,7 @@ func TestALandingReadsTheChangeAgain(t *testing.T) {
 		if after, _ := os.ReadFile(filepath.Join(f.dir, "gh-calls")); string(after) != string(calls) {
 			t.Fatalf("a %s package reached the forge before its change was read:\n%s", state, after[len(calls):])
 		}
-		if kept, _, _ := s.Load(c.ID); kept.LandingHead != "" {
+		if kept, _, _ := s.Load(c.ID); state == Proposed && kept.LandingHead != "" {
 			t.Fatalf("a %s package journaled a head: %s", state, kept.LandingHead)
 		}
 		if err := s.selfLanding(ctx, p, p.Head); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), rulesTestPath) {

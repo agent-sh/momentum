@@ -50,6 +50,7 @@ func TestOnlyAppendedTestFunctionsAreAnAddedCheck(t *testing.T) {
 		"a file that ended inside a line": {strings.TrimSuffix(selfRulesTest, "\n"), selfRulesTest + selfNewTest, "line's end"},
 		"an import":                       {"package supervise\n\nimport \"testing\"\n", "package supervise\n\nimport \"testing\"\n\nimport \"os\"\n" + selfNewTest, "no test function"},
 		"testing under another name":      {strings.Replace(selfRulesTest, "import \"testing\"", "import testing \"fmt\"", 1), strings.Replace(selfRulesTest, "import \"testing\"", "import testing \"fmt\"", 1) + selfNewTest, "import testing"},
+		"an end inside a line":            {selfRulesTest, selfRulesTest + "\nfunc TestN(t *testing.T) {}", "line's end"},
 		"an old file that does not parse": {"package supervise\n\nfunc {\n", "package supervise\n\nfunc {\n" + selfNewTest, "did not parse"},
 	} {
 		if names, why := appendedTests([]byte(c.old), []byte(c.changed)); why == "" || !strings.Contains(why, c.why) || names != nil {
@@ -75,11 +76,20 @@ func TestTheRepositorysOwnRulesFilesMeetTheTerms(t *testing.T) {
 	if names, why := appendedTests(test, append(slices.Clone(test), "\nfunc TestOneMore(t *testing.T) {\n\tif len(Rules) == 0 {\n\t\tt.Fatal(\"no rule\")\n\t}\n}\n"...)); why != "" || !slices.Equal(names, []string{"TestOneMore"}) {
 		t.Fatalf("the rules' test file with one more test: %v %q", names, why)
 	}
-	// the loop's test file is the last of its package by name, so its tests run after every other test there
+	// the loop's tests run after every other test of the package, as the package's test files stand
 	for file, rules := range selfTests {
 		names, err := filepath.Glob("../../" + path.Dir(file) + "/*_test.go")
-		if err != nil || len(names) == 0 || filepath.Base(slices.Max(names)) != path.Base(file) {
-			t.Errorf("%s is not the last test file of its package: %v %v", file, names, err)
+		if err != nil || len(names) < 2 {
+			t.Fatalf("the test files beside %s: %v %v", file, names, err)
+		}
+		files := map[string][]byte{}
+		for _, name := range names {
+			if files[filepath.Base(name)], err = os.ReadFile(name); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if why := runLast(files, path.Base(file)); why != "" {
+			t.Errorf("the tests of %s do not run last: %s", file, why)
 		}
 		if path.Dir(rules) != path.Dir(file) || !slices.Contains(selfChanges, rules) {
 			t.Errorf("%s lands with %s, which is no rules file of its package", file, rules)
@@ -145,5 +155,36 @@ func TestARulesFileKeepsItsImportsAndHasNoInitializer(t *testing.T) {
 	// a constant runs nothing
 	if why := rulesKept([]byte(selfRules), []byte(selfRules+"\nconst grace = float64(90) * 2\n")); why != "" {
 		t.Errorf("a constant with a conversion: %q", why)
+	}
+}
+
+// The loop's tests run after every other test of their package while the other test files leave the go command's
+// order alone: none sorts after the loop's, is of the external test package, holds a TestMain, a fuzz test or an
+// example, or runs a test in parallel.
+func TestTheLoopsTestsRunLast(t *testing.T) {
+	own := "package p\n\nimport \"testing\"\n\nfunc TestOwn(t *testing.T) { t.Parallel() }\n"
+	other := "package p\n\nimport \"testing\"\n\nfunc TestOther(t *testing.T) {\n\tt.Run(\"sub\", func(t *testing.T) {})\n}\n\nfunc BenchmarkX(b *testing.B) {}\n"
+	if why := runLast(map[string][]byte{"a_test.go": []byte(other), "zz_loop_test.go": []byte(own)}, "zz_loop_test.go"); why != "" {
+		t.Fatalf("a package whose tests run in the files' order: %q", why)
+	}
+	for name, c := range map[string]struct{ file, body, why string }{
+		"a later file":                 {"zzz_test.go", other, "sorts after"},
+		"the external test package":    {"ext_test.go", strings.Replace(other, "package p", "package p_test", 1), "another package"},
+		"a TestMain":                   {"a_test.go", other + "\nfunc TestMain(m *testing.M) {}\n", "TestMain"},
+		"a fuzz test":                  {"a_test.go", other + "\nfunc FuzzX(f *testing.F) {}\n", "FuzzX"},
+		"an example":                   {"a_test.go", other + "\nfunc ExampleX() {}\n", "ExampleX"},
+		"a parallel test":              {"a_test.go", other + "\nfunc TestP(t *testing.T) { t.Parallel() }\n", "parallel"},
+		"a parallel subtest":           {"a_test.go", other + "\nfunc TestP(t *testing.T) {\n\tt.Run(\"s\", func(u *testing.T) { u.Parallel() })\n}\n", "parallel"},
+		"a file that does not parse":   {"a_test.go", "package p\n\nfunc {\n", "does not parse"},
+		"the loop's file not among it": {"zz_loop_test.go", "", "not among"},
+	} {
+		files := map[string][]byte{"a_test.go": []byte(other), "zz_loop_test.go": []byte(own)}
+		files[c.file] = []byte(c.body)
+		if c.body == "" {
+			delete(files, c.file)
+		}
+		if why := runLast(files, "zz_loop_test.go"); !strings.Contains(why, c.why) {
+			t.Errorf("%s: %q, want %q", name, why, c.why)
+		}
 	}
 }

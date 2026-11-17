@@ -853,8 +853,9 @@ func buildScope(repo string) string {
 		"compiler directive and no name that hides a predeclared one. The loop's own test file (" + strings.Join(SelfLandableTests(), ", ") +
 		") lands with the rules when the change only appends whole test functions (func TestXxx(t *testing.T)) after what the file " +
 		"held, with no other declaration, import or directive: put the test of a rule's fix there, and leave the package's other " +
-		"test files as they are. The host then runs the package's whole test suite on the change, without the tests it adds: " +
-		"they must pass as they did. A fix that needs other paths is still checked and reviewed, " +
+		"test files as they are. A test there can name the packages that file already imports (testing, strings, time, sessions, " +
+		"sessions/act) and the package's own helpers, and no other package. The host then runs the package's whole test suite " +
+		"on the change: it must pass. A fix that needs other paths is still checked and reviewed, " +
 		"then proposed for a person to land by hand; the loop never lands it. No change touches CI configuration (" + ci +
 		") or these, which the loop's measurement and its event scanners rest on: " + strings.Join(ProposalProtected(), ", ") +
 		" " + ownReachException + "."

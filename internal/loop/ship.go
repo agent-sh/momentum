@@ -785,12 +785,12 @@ func (s *Ship) check(ctx context.Context, caseID string, test testCommand, testF
 	if len(paths) == 0 {
 		return p, refused("the patch is empty: produce a cumulative diff against %s", p.BaseCommit)
 	}
-	var hand, added []string
+	var hand []string
 	if p.Kind != KindConfig {
 		if hand, err = PathScope(Target{Repo: p.Repo}, paths); err != nil {
 			return p, err
 		}
-		if hand, added, err = s.selfScope(ctx, p, p.BaseCommit, tree, paths, hand); err != nil {
+		if hand, err = s.selfScope(ctx, p, p.BaseCommit, tree, paths, hand); err != nil {
 			return p, err
 		}
 		if err := handStays(p, hand); err != nil {
@@ -871,7 +871,7 @@ func (s *Ship) check(ctx context.Context, caseID string, test testCommand, testF
 		return p, err
 	}
 	if b.Exit != 0 && a.Exit == 0 && p.Kind != KindConfig {
-		if err := s.selfSuite(ctx, p, tree, paths, added); err != nil {
+		if err := s.selfSuite(ctx, p, tree, paths); err != nil {
 			return p, err
 		}
 	}
@@ -970,7 +970,7 @@ func (s *Ship) Propose(ctx context.Context, caseID string, pr Proposal, patch ..
 		}
 	} else if hand, err = PathScope(Target{Repo: p.Repo}, paths); err != nil {
 		return p, err
-	} else if hand, _, err = s.selfScope(ctx, p, p.BaseCommit, tree, paths, hand); err != nil {
+	} else if hand, err = s.selfScope(ctx, p, p.BaseCommit, tree, paths, hand); err != nil {
 		return p, err
 	} else if err := handStays(p, hand); err != nil {
 		return p, err
@@ -1603,10 +1603,11 @@ func (s *Ship) blob(ctx context.Context, p Package, rev, name string) ([]byte, b
 // selfScope reads the content of a change to the loop's own repository, between a base and a tree of the host
 // clone, and settles what the paths alone cannot (PathScope). A rules file whose change does more than change a rule
 // (rulesKept) becomes a hand path. A rules' test file whose change only appends tests (appendedTests) stops being
-// one: added are those tests. Elsewhere the hand paths stand as given.
-func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, changed, hand []string) (out, added []string, err error) {
+// one, while the package's tests still run in the order that puts the loop's last (testsRunLast). Elsewhere the
+// hand paths stand as given.
+func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, changed, hand []string) (out []string, err error) {
 	if !strings.EqualFold(p.Repo, SelfRepo) {
-		return hand, nil, nil
+		return hand, nil
 	}
 	out = slices.Clone(hand)
 	for _, c := range changed {
@@ -1617,14 +1618,13 @@ func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, chan
 		}
 		old, _, err := s.blob(ctx, p, base, c)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		now, plainNow, err := s.blob(ctx, p, tree, c)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		why := "the change leaves no plain file there"
-		var names []string
 		switch {
 		case !plainNow:
 		case rules:
@@ -1632,7 +1632,11 @@ func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, chan
 		case !slices.Contains(changed, with):
 			why = "its rules file is not in the change: a test lands with the rule it tests"
 		default:
-			names, why = appendedTests(old, now)
+			if _, why = appendedTests(old, now); why == "" {
+				if why, err = s.testsRunLast(ctx, p, tree, c); err != nil {
+					return nil, err
+				}
+			}
 		}
 		switch {
 		case why != "" && !slices.Contains(out, c):
@@ -1642,11 +1646,34 @@ func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, chan
 			s.logf("case %s: %s is a person's to land: %s", p.Case, c, why)
 		case test:
 			out = slices.DeleteFunc(out, func(h string) bool { return h == c })
-			added = append(added, names...)
 		}
 	}
 	slices.Sort(out)
-	return out, added, nil
+	return out, nil
+}
+
+// testsRunLast reads the test files of the loop's test file's package in a tree and says why the loop's tests would
+// not run after every other test there (runLast), or "".
+func (s *Ship) testsRunLast(ctx context.Context, p Package, tree, own string) (string, error) {
+	list, err := s.git(ctx, p.Host, "ls-tree", "--name-only", tree, "--", path.Dir(own)+"/")
+	if err != nil {
+		return "", err
+	}
+	files := map[string][]byte{}
+	for _, name := range strings.Fields(list) {
+		if !strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		b, plainFile, err := s.blob(ctx, p, tree, name)
+		if err != nil {
+			return "", err
+		}
+		if !plainFile {
+			return name + " is no plain file", nil
+		}
+		files[path.Base(name)] = b
+	}
+	return runLast(files, path.Base(own)), nil
 }
 
 // landPaths is the landing's check of a package's paths: the gate's, with the content of a change to the loop's own
@@ -1656,7 +1683,7 @@ func (s *Ship) landPaths(ctx context.Context, p Package, base, head string) erro
 	if err != nil {
 		return err
 	}
-	if hand, _, err = s.selfScope(ctx, p, base, head, p.Changed, hand); err != nil || len(hand) == 0 {
+	if hand, err = s.selfScope(ctx, p, base, head, p.Changed, hand); err != nil || len(hand) == 0 {
 		return err
 	}
 	if err := CheckPaths(Target{Repo: p.Repo}, hand); err != nil {
@@ -1666,18 +1693,15 @@ func (s *Ship) landPaths(ctx context.Context, p Package, base, head string) erro
 }
 
 // selfSuite runs, for a change to the loop's own rules or their tests, the whole test suite of each package it
-// touches there, in the sandbox, without the tests the change adds: the tests the package had must pass with the
-// change, in a run where nothing the change added to the tests has run. The change's own check proves the added
-// tests; this proves the others still hold. It runs on an export of rev made for it: the build's own test command
-// writes where it runs, and a suite run there would prove nothing.
-func (s *Ship) selfSuite(ctx context.Context, p Package, rev string, changed, added []string) error {
+// touches there, in the sandbox: the build's own command may name one test, and the tests the package had must
+// pass with the change. The tests the change adds run last (runLast), so they change nothing the others see. It
+// runs on an export of rev made for it: the build's own test command writes where it runs, and a suite run there
+// would prove nothing.
+func (s *Ship) selfSuite(ctx context.Context, p Package, rev string, changed []string) error {
 	if !strings.EqualFold(p.Repo, SelfRepo) {
 		return nil
 	}
 	cmd := []string{"go", "test", "-count=1"}
-	if len(added) > 0 {
-		cmd = append(cmd, "-skip", "^("+strings.Join(added, "|")+")$")
-	}
 	n := len(cmd)
 	for _, c := range changed {
 		if pkg := "./" + path.Dir(c); (slices.Contains(selfChanges, c) || selfTests[c] != "") && !slices.Contains(cmd[n:], pkg) {
@@ -1718,11 +1742,7 @@ func (s *Ship) selfLanding(ctx context.Context, p Package, head string) error {
 	if err := s.landPaths(ctx, p, base, head); err != nil {
 		return err
 	}
-	_, added, err := s.selfScope(ctx, p, base, head, p.Changed, nil)
-	if err != nil {
-		return err
-	}
-	return s.selfSuite(ctx, p, head, p.Changed, added)
+	return s.selfSuite(ctx, p, head, p.Changed)
 }
 
 // ciOK are the conclusions of a workflow's run that passed, or that chose not to run.
