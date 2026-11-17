@@ -55,10 +55,10 @@ func (r *Runner) configTargetsFor(c store.Case) bool {
 const findingsInstruction = "Keep findings as you go in /out/findings.md. Use the headings ## Mechanism, ## Alternatives ruled out, ## Fix, and ## Summary. End with your report of the same fields."
 
 // liveQuestion is what a live investigation is asked.
-const liveQuestion = "Find the root cause of this problem and the fix. State the mechanism, the alternatives ruled out, the fix, and a summary. If the fix is code in a repository under /ro/repos, also report repo as its NAME. If the fix is anywhere else (a file on the machine outside those repositories, another project's code, a program maintained elsewhere, a setting only the owner can change), report place: where it is, on one line. If nothing should be changed (the tool worked as it is meant to, a provider refused or failed by itself, the problem ended), report nothing_to_fix as true and say why in the summary. Build no change."
+const liveQuestion = "Find the root cause of this problem and the fix. State the mechanism, the alternatives ruled out, the fix, and a summary. If the fix is code in a repository under /ro/repos, also report repo as its NAME. If the fix is anywhere else (a file on the machine outside those repositories, another project's code, a program maintained elsewhere, a setting only the owner can change), report place: where it is, on one line; with no such place, leave it out. Report nothing_to_fix as true only when no change anywhere would help (the tool worked as it is meant to, a provider refused or failed by itself, the problem ended), and say why in the summary: a fix that lives somewhere else is a place, not nothing to fix. Build no change."
 
 // configQuestion is added to the live question while configuration targets are on.
-const configQuestion = " If the fix is the content of one existing configuration file under /ro/config instead, report config as its path there (such as /ro/config/.config/agents/NAME.md) and no repo. The host proposes a change only to a file the owner listed, and an agent applies it."
+const configQuestion = " If the fix is the content of one existing configuration file under /ro/config instead, report config as its path there (such as /ro/config/.config/agents/NAME.md) and no repo or place. The host proposes a change only to a file the owner listed, and an agent applies it."
 
 // inputReference describes the host-created files. All /ro inputs are read-only.
 func inputReference(snapshots bool) string {
@@ -265,13 +265,21 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 		}
 		u.Alternatives = alternatives // nil keeps the case's
 	}
-	if reported && f.NothingToFix && mechanism != "" && f.Repo == "" && f.Config == "" {
-		// the investigation's conclusion ends the case: nothing holds it for a fix nobody will make
-		why := strings.TrimSpace(f.Report)
-		if !holdsText(why) {
-			why = mechanism
+	if reported && f.NothingToFix && mechanism != "" && f.Repo == "" && f.Config == "" && placeOf(f) == "" {
+		// The investigation's conclusion ends the case: nothing holds it for a fix nobody will make. A report that
+		// also says where a fix lives contradicts itself, and the place wins: the case waits with it. A
+		// component-health case is not ended here: its stop may hold cases that only its fix resumes.
+		c, err := st.CaseByID(ctx, caseID)
+		if err != nil {
+			return store.Case{}, false, err
 		}
-		return st.RecordDismissed(ctx, caseID, episode, u, nothingToFix+plainClip(plain.Line(why), dismissedMax), actor)
+		if c.Family != store.HealthFamily {
+			why := strings.TrimSpace(f.Report)
+			if !holdsText(why) {
+				why = mechanism
+			}
+			return st.RecordDismissed(ctx, caseID, episode, u, nothingToFix+plainClip(plain.Line(why), dismissedMax), actor)
+		}
 	}
 	if undecided != "" && u.Status != store.CaseTesting {
 		return st.RecordUndecided(ctx, caseID, episode, u, undecided, actor)
@@ -300,9 +308,7 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 		}
 		place := ""
 		if f.Repo == "" && f.Config == "" { // a fix the loop can build has no other place
-			if place = plainClip(plain.Line(strings.TrimSpace(f.Place)), placeMax); !holdsText(place) {
-				place = ""
-			}
+			place = placeOf(f)
 		}
 		raw, err := json.Marshal(struct {
 			Repo    string `json:"repo"`
@@ -320,6 +326,20 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 
 // nothingToFix opens the reason of a case its investigation closed: it found no change worth making anywhere.
 const nothingToFix = "the investigation found nothing to fix: "
+
+// placeOf is the place a finding names for its fix, on one line and clipped, or "" when it names none: an empty
+// one, or a word that only says there is none.
+func placeOf(f finding) string {
+	place := plainClip(plain.Line(strings.TrimSpace(f.Place)), placeMax)
+	switch strings.ToLower(strings.Trim(place, " .-")) {
+	case "", "n/a", "na", "none", "nowhere", "unknown", "null":
+		return ""
+	}
+	if !holdsText(place) {
+		return ""
+	}
+	return place
+}
 
 // dismissedMax and placeMax bound that reason's quote of the summary, and the place a finding names.
 const (

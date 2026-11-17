@@ -1051,7 +1051,11 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 				if !dry {
 					r.keepHold(ctx, c, repoHold(place), true)
 				}
-				passed = append(passed, c.ID+" waits for a repository")
+				if place != "" {
+					passed = append(passed, c.ID+" waits for a repository: its fix is elsewhere")
+				} else {
+					passed = append(passed, c.ID+" waits for a repository")
+				}
 				continue
 			} else if why, known := r.heldTargetWith(ctx, c, repo, target, pkg, had); why != "" {
 				// a hold of the configuration takes no slot: the family's next workable case runs instead

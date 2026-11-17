@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -90,5 +91,66 @@ func TestAFixOutsideTheLoopsRepositoriesIsNamedInItsNote(t *testing.T) {
 	both, _ = st.CaseByID(ctx, both.ID)
 	if repo, _, named, err := r.caseFixPlace(ctx, both); err != nil || repo != "momentum" || named != "" {
 		t.Fatalf("a place beside a repository: %q %q %v", repo, named, err)
+	}
+}
+
+// A report that says nothing is to be fixed and also says where a fix lives contradicts itself: the place wins, and
+// the case waits with it. A word that only says there is no place is none. A report with a fix text and no place
+// is still ended by its conclusion: the schema makes every report name a fix, if only to say there is none.
+func TestNothingToFixBesideAPlaceWaitsWithThePlace(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	c := openCase(t, st, "failures", "upstream-fix", 1)
+	got, recorded, err := recordFindings(ctx, st, c.ID, c.Episode, finding{Mechanism: "the upstream tool drops the flag",
+		Fix: "patch the upstream tool's parser to keep the flag", Place: "the upstream tool's repository (another project)", NothingToFix: true,
+		Report: "Nothing to change on this machine: the bug is upstream."}, true, "", "loop:r")
+	if err != nil || !recorded || got.Status != store.CaseTesting {
+		t.Fatalf("nothing to fix beside a place: %+v %v %v", got, recorded, err)
+	}
+	log, err := st.CaseLog(ctx, c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	named := false
+	for _, e := range log {
+		named = named || strings.Contains(e.Detail, "the upstream tool's repository (another project)")
+	}
+	if !named {
+		t.Fatalf("the place is not on record: %+v", log)
+	}
+	for _, filler := range []string{"N/A", "none.", " - ", "Unknown"} {
+		if p := placeOf(finding{Place: filler}); p != "" {
+			t.Errorf("%q is taken for a place: %q", filler, p)
+		}
+	}
+	said := openCase(t, st, "failures", "no-change-needed", 1)
+	if got, recorded, err = recordFindings(ctx, st, said.ID, said.Episode, finding{Mechanism: "the tool refused a call it is meant to refuse",
+		Fix: "No change: the refusal is the tool working.", Place: "n/a", NothingToFix: true, Report: "The tool worked as meant."}, true, "", "loop:r"); err != nil ||
+		!recorded || got.Status != store.CaseClosed || got.Reason != store.NotWorthIt {
+		t.Fatalf("nothing to fix with a fix text that says so: %+v %v %v", got, recorded, err)
+	}
+}
+
+// A component-health case is not ended by its investigation's conclusion: its stop may hold cases that only its
+// fix resumes. And the note of one whose fix lives elsewhere gives the close command its family takes.
+func TestAComponentHealthCaseIsNotEndedByNothingToFix(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	h := openCase(t, st, store.HealthFamily, "health-nothing", 1)
+	got, recorded, err := recordFindings(ctx, st, h.ID, h.Episode, finding{Mechanism: "the provider failed by itself",
+		Fix: "none", NothingToFix: true, Report: "A provider outage."}, true, "", "loop:r")
+	if err != nil || !recorded || got.Status == store.CaseClosed {
+		t.Fatalf("a health case with nothing to fix: %+v %v %v", got, recorded, err)
+	}
+	fix := "restart the relay"
+	got.NextTest = fix
+	n := waitingRepoNote(got, elsewherePrefix+"the relay's unit file", time.Now())
+	if !strings.Contains(n.Detail, "--fix REF") || !strings.Contains(n.Detail, "The fix: restart the relay.") ||
+		strings.Index(n.Detail, "momentum case close") > strings.Index(n.Detail, "The fix:") {
+		t.Fatalf("the health case's note: %q", n.Detail)
+	}
+	other := waitingRepoNote(store.Case{ID: "c1", Family: "failures", NextTest: strings.Repeat("long fix ", 200)}, elsewherePrefix+"a file", time.Now())
+	if strings.Contains(other.Detail, "--fix REF") || len([]rune(other.Detail)) > 700 {
+		t.Fatalf("another family's note: %d runes: %q", len([]rune(other.Detail)), other.Detail)
 	}
 }

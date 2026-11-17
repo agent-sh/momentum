@@ -332,9 +332,13 @@ func waitingRepoNote(c store.Case, hold string, at time.Time) store.Note {
 		Detail: "The investigation named no code repository or configuration file. The case stays in testing without a build run.", At: at}
 	if place, ok := strings.CutPrefix(hold, elsewherePrefix); ok {
 		n.Title = plainClip("The fix for case "+c.ID+" is outside the loop's reach: "+place, 120)
-		n.Detail = "The investigation found the fix and where it lives: " + place + ". The fix: " + plainClip(plain.Line(c.NextTest), 700) +
-			" The loop builds only in its own repositories, so the case stays in testing without a build run. An agent or the owner makes the change there and closes the case (momentum case close " +
-			c.ID + " --reason already-solved --why WHY), or declines it (--reason not-worth-it)."
+		done := "momentum case close " + c.ID + " --reason already-solved --why WHY"
+		if c.Family == store.HealthFamily { // which closes naming what fixed it
+			done = "momentum case close " + c.ID + " --reason already-solved --fix REF --why WHY"
+		}
+		// what to do comes first: a short view keeps the start
+		n.Detail = "The loop builds only in its own repositories, so the case waits in testing. An agent or the owner makes the change and closes the case (" +
+			done + "), or declines it (--reason not-worth-it). Where: " + sentence(place) + " The fix: " + sentence(plainClip(plain.Line(c.NextTest), 350))
 	}
 	return n
 }
