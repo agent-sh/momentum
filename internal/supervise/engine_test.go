@@ -1338,6 +1338,9 @@ func TestACaseClosesItsRuleOnlyUntilTheSessionMovesOn(t *testing.T) {
 	for _, e := range events(t, st, KindSkip) {
 		if strings.Contains(e.Summary, "a case is open for this stop") {
 			shut++
+			if !e.TS.Equal(s.Since) {
+				t.Fatalf("the shut note is dated %s, want the stop %s", e.TS, s.Since)
+			}
 		}
 	}
 	if shut != 1 {
@@ -1353,5 +1356,100 @@ func TestACaseClosesItsRuleOnlyUntilTheSessionMovesOn(t *testing.T) {
 	}
 	if cases := events(t, st, KindCase); len(cases) != 1 {
 		t.Fatalf("a new episode opened a case at once: %+v", cases)
+	}
+}
+
+// A message that lands only after its "not delivered" case opens a turn of momentum's making, not the session's:
+// the stop after it is still the one the case is about, and the rule stays shut.
+func TestAMessageLandingAfterItsCaseDoesNotReopenTheRule(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0.Add(10 * time.Minute)
+	sv := supervisor(st, f, &now)
+	s := erroring()
+	run(t, sv, s)
+	sentAt := now
+	for i := 0; i < 4; i++ { // in flight, then not delivered: a case
+		now = now.Add(time.Minute)
+		run(t, sv, s)
+	}
+	if cases := events(t, st, KindCase); len(f.sent) != 1 || len(cases) != 1 {
+		t.Fatalf("sent %d, cases %+v", len(f.sent), cases)
+	}
+	l := sentAt.Add(5 * time.Minute) // it lands late, opens a turn, and the turn ends on the same error
+	lands(s, strings.TrimPrefix(f.sent[0], "%7 "), l, false)
+	s.TurnBegan, s.Since = l, l.Add(10*time.Second)
+	now = l
+	for i := 0; i < 20; i++ {
+		now = now.Add(time.Minute)
+		run(t, sv, s)
+	}
+	if cases := events(t, st, KindCase); len(f.sent) != 1 || len(cases) != 1 {
+		t.Fatalf("after the late landing: sent %d (want 1), cases %d (want 1)", len(f.sent), len(cases))
+	}
+}
+
+// A session nothing can type into, which its own runs drive: one case, however many of its runs end on the error.
+func TestASessionNothingCanTypeIntoGetsOneCaseAcrossItsOwnRuns(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{check: act.ErrNoPath}
+	now := t0.Add(10 * time.Minute)
+	sv := supervisor(st, f, &now)
+	s := erroring()
+	for round := 0; round < 4; round++ {
+		for i := 0; i < 5; i++ {
+			run(t, sv, s)
+			now = now.Add(time.Minute)
+		}
+		s.TurnBegan, s.Since = now, now.Add(time.Minute)
+		now = now.Add(3 * time.Minute)
+	}
+	if cases := events(t, st, KindCase); len(cases) != 1 {
+		t.Fatalf("cases %d, want one: %+v", len(cases), cases)
+	}
+}
+
+// The episode after a case the session moved on from records its own going case when its waits run out: the one
+// from before that case is the old episode's.
+func TestAnEpisodeAfterAClosedCaseNotesItsOwnGoingCase(t *testing.T) {
+	st := testStore(t)
+	f := &fakeSender{}
+	now := t0
+	sv := supervisor(st, f, &now)
+	s := erroring()
+	at := failedTries(t, sv, f, s, &now, 4) // the waits ran out: a going case
+	for i := 16; i < 24; i++ {              // the fifth goes and is never delivered: a closing case
+		now = at.Add(time.Duration(i) * time.Minute)
+		run(t, sv, s)
+	}
+	going := func() (n int) {
+		for _, c := range events(t, st, KindCase) {
+			if metaMap(c)["going"] == true {
+				n++
+			}
+		}
+		return n
+	}
+	if going() != 1 {
+		t.Fatalf("going cases before the session moved on: %d, want 1", going())
+	}
+	s.TurnBegan = now.Add(time.Minute) // a run of the session's own, which ends on the same error
+	at = now.Add(2 * time.Minute)
+	s.Since = at
+	base := len(f.sent)
+	for try := 0; try < 6; try++ {
+		now = at.Add(DefaultParams.Backoff[min(try, 3)])
+		run(t, sv, s)
+		if len(f.sent) != base+try+1 {
+			t.Fatalf("new episode try %d: sent %d", try+1, len(f.sent)-base)
+		}
+		lands(s, strings.TrimPrefix(f.sent[base+try], "%7 "), now.Add(time.Second), false)
+		at = now.Add(5 * time.Minute)
+		s.Since = at
+		now = at.Add(time.Second)
+		run(t, sv, s)
+	}
+	if going() != 2 {
+		t.Fatalf("going cases after the new episode's waits ran out: %d, want 2", going())
 	}
 }
