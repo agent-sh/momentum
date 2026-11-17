@@ -2,10 +2,12 @@ package loop
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-sh/momentum/internal/store"
 )
@@ -22,8 +24,8 @@ func investigated(t *testing.T, st *store.Store, family, sig, mechanism, fix str
 }
 
 // An investigation is shown the family's other cases in testing, which hold a cause and a fix, and a report that
-// names one of them as the case whose cause is this one's closes its case with that as the reason. Nothing moves:
-// the case keeps its evidence and findings and comes back by the cases' rule, and the sibling is untouched.
+// names one of them as the case whose cause is this one's makes that case the place of this one's fix: the case
+// waits in testing with a note naming the sibling. Nothing moves or closes, and the sibling is untouched.
 func TestAnInvestigationCanFindItsCaseToBeAnothers(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -53,32 +55,41 @@ func TestAnInvestigationCanFindItsCaseToBeAnothers(t *testing.T) {
 		t.Fatalf("a sibling's mechanism is shown at %d runes, over %d", n, siblingMax)
 	}
 	got, recorded, err := recordFindings(ctx, st, c.ID, c.Episode, finding{Mechanism: "the same schema field", Fix: "as the other case",
-		Report: "Same cause as the schema case.", DuplicateOf: root.ID}, true, "", "loop:r")
-	if err != nil || !recorded || got.Status != store.CaseClosed || got.Reason != store.NotWorthIt || got.Into != "" ||
-		got.Mechanism != "the same schema field" || got.Evidence != 4 {
-		t.Fatalf("a case with a sibling's cause closes with its own findings and evidence: %+v %v %v", got, recorded, err)
+		Report: "Same cause as the schema case.", Repo: "momentum", DuplicateOf: root.ID}, true, "", "loop:r")
+	if err != nil || !recorded || got.Status != store.CaseTesting || got.Mechanism != "the same schema field" || got.Evidence != 4 {
+		t.Fatalf("a case with a sibling's cause waits in testing with its own findings and evidence: %+v %v %v", got, recorded, err)
+	}
+	r := localRunner(t, st)
+	r.Ship = &Ship{Store: st, Dir: r.Dir}
+	if repo, config, place, err := r.caseFixPlace(ctx, got); err != nil || repo != "" || config != "" || place != siblingPlace(root.ID) {
+		t.Fatalf("its fix lives with the sibling, and it names no repository of its own: %q %q %q %v", repo, config, place, err)
+	}
+	n := waitingRepoNote(got, repoHold(siblingPlace(root.ID)), time.Now())
+	if !strings.Contains(n.Title, root.ID) || !strings.Contains(n.Detail, "momentum case close "+got.ID) {
+		t.Fatalf("the note names the sibling and how to close the case: %q %q", n.Title, n.Detail)
 	}
 	after, err := st.CaseByID(ctx, root.ID)
 	if err != nil || after.Evidence != root.Evidence || after.Status != store.CaseTesting || after.Cost != root.Cost {
 		t.Fatalf("the sibling is untouched: %+v %v", after, err)
 	}
-	log, _ := st.CaseLog(ctx, c.ID)
-	said := false
-	for _, e := range log {
-		said = said || e.Action == "closed" && strings.Contains(e.Detail, sameCause+root.ID+": Same cause as the schema case.")
+	// it comes before the report's other outcomes: beside nothing to fix, and with no fix text, the case still waits
+	// with the sibling and is neither dismissed nor closed as undecided
+	for i, f := range []finding{{Mechanism: "the same schema field", NothingToFix: true, DuplicateOf: root.ID},
+		{Mechanism: "the same schema field", DuplicateOf: " " + root.ID + " "}} {
+		n := openCase(t, st, "failures", fmt.Sprintf("schema-more-%d", i), 2)
+		if got, recorded, err = recordFindings(ctx, st, n.ID, n.Episode, f, true, "the investigation named a mechanism and no fix", "loop:r"); err != nil ||
+			!recorded || got.Status != store.CaseTesting || got.NextTest != fixNotStated {
+			t.Fatalf("a sibling's cause beside %+v: %+v %v %v", f, got, recorded, err)
+		}
+		if _, _, place, _ := r.caseFixPlace(ctx, got); place != siblingPlace(root.ID) {
+			t.Fatalf("its place: %q", place)
+		}
 	}
-	if !said {
-		t.Fatalf("the close's reason: %+v", log)
-	}
-	// it wins over the report's other outcomes: nothing to fix beside it closes the same way, and no fix text is needed
-	n := openCase(t, st, "failures", "schema-third", 2)
-	if got, recorded, err = recordFindings(ctx, st, n.ID, n.Episode, finding{Mechanism: "the same schema field", NothingToFix: true,
-		Place: "somewhere", DuplicateOf: root.ID}, true, "the investigation named a mechanism and no fix", "loop:r"); err != nil || !recorded ||
-		got.Status != store.CaseClosed || got.Reason != store.NotWorthIt {
-		t.Fatalf("a sibling's cause beside other fields: %+v %v %v", got, recorded, err)
-	}
-	if log, _ = st.CaseLog(ctx, n.ID); !strings.Contains(log[len(log)-1].Detail, sameCause+root.ID) {
-		t.Fatalf("its reason names the sibling: %+v", log[len(log)-1])
+	// with no mechanism the report found no cause, a sibling's or its own: it is undecided as before
+	bad := openCase(t, st, "failures", "no-mechanism", 2)
+	if got, recorded, err = recordFindings(ctx, st, bad.ID, bad.Episode, finding{Fix: "a fix", DuplicateOf: root.ID}, true,
+		"the investigation named a fix and no mechanism", "loop:r"); err != nil || !recorded || got.Status != store.CaseClosed || got.Reason == store.NotWorthIt {
+		t.Fatalf("a sibling named with no mechanism: %+v %v %v", got, recorded, err)
 	}
 }
 
