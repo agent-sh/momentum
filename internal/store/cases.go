@@ -441,12 +441,15 @@ func addEvidence(ctx context.Context, q querier, id string, evs []Evidence, now 
 	return added, newest, nil
 }
 
-// UnseenEvidence is how many of a case's evidence refs came in after its last loop run began: what no run of it has
-// read. A case that never ran holds only such evidence. An evaluation's runs are its own and are not counted.
-func (s *Store) UnseenEvidence(ctx context.Context, id string) (int, error) {
+// UnreadEvidence is how many of a case's evidence refs were filed after its last run of the step that ended well
+// began: for the investigation, what no finished investigation of the case has read. A case with no such run holds
+// only unread evidence. A run that was refused, failed or was stopped read nothing to the end and does not count,
+// nor does an evaluation's. Evidence a merge brought keeps the time it was filed with the case it came from.
+func (s *Store) UnreadEvidence(ctx context.Context, id, step string) (int, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM case_evidence WHERE case_id = ?1 AND added >
-	  COALESCE((SELECT MAX(started) FROM loop_runs WHERE case_id = ?1 AND experiment = ''), 0)`, id).Scan(&n)
+	  COALESCE((SELECT MAX(started) FROM loop_runs WHERE case_id = ?1 AND experiment = '' AND step = ?2 AND status = ?3), 0)`,
+		id, step, RunOK).Scan(&n)
 	return n, err
 }
 

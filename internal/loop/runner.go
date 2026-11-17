@@ -834,11 +834,11 @@ type candidate struct {
 	c      store.Case
 	step   string
 	rank   int
-	unseen int // the evidence no run of it has read
+	unread int // the evidence no finished investigation of it has read
 }
 
 func (c candidate) why() string {
-	return fmt.Sprintf("%s %s (%s, %d evidence)", c.step, c.c.ID, c.c.Status, c.c.Evidence)
+	return fmt.Sprintf("%s %s (%s, %d evidence, %d unread)", c.step, c.c.ID, c.c.Status, c.c.Evidence, c.unread)
 }
 
 // candidates are the family's workable cases, best first (pick takes the first), or none and why.
@@ -1088,11 +1088,11 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 			passed = append(passed, c.ID+" stopped: "+stop)
 			continue
 		}
-		unseen, err := r.Store.UnseenEvidence(ctx, c.ID)
+		unread, err := r.Store.UnreadEvidence(ctx, c.ID, StepInvestigate)
 		if err != nil {
 			return nil, "", err
 		}
-		cands = append(cands, candidate{c, step, rank, unseen})
+		cands = append(cands, candidate{c, step, rank, unread})
 	}
 	if len(cands) == 0 {
 		why := "no case to work"
@@ -1106,10 +1106,11 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 		if a.rank != b.rank {
 			return a.rank > b.rank
 		}
-		// What no run has read comes first: a case that came back on one event after a long history does not go
-		// before one with many events nobody looked at.
-		if a.unseen != b.unseen {
-			return a.unseen > b.unseen
+		// What no finished investigation has read comes first: a case that came back on one event after a long
+		// history does not go before one with many events nobody looked at. A case whose run failed has read
+		// nothing to the end and keeps its place for the next try.
+		if a.unread != b.unread {
+			return a.unread > b.unread
 		}
 		if a.c.Evidence != b.c.Evidence {
 			return a.c.Evidence > b.c.Evidence

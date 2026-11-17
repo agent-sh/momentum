@@ -460,37 +460,86 @@ func TestARunWhoseBrokerIsUnreachableIsNotTheAgentsFailure(t *testing.T) {
 	}
 }
 
-// Among cases at the same stage the pick takes the one with the most evidence no run has read. A case that was
-// investigated, closed and came back on one new event holds more evidence in all, and goes after a case whose
-// events nobody looked at.
-func TestThePickPrefersEvidenceNoRunHasRead(t *testing.T) {
+// Among cases at the same stage the pick takes the one with the most evidence no finished investigation has read. A
+// case that was investigated, closed and came back on one new event holds more evidence in all, and goes after a
+// case whose events nobody looked at. A refused or failed run read nothing to the end, and an evaluation's run is
+// not the case's.
+func TestThePickPrefersEvidenceNoInvestigationHasRead(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
 	r := localRunner(t, st)
 	old := openCase(t, st, "failures", "long-history", 30)
-	run, why := r.reserve(ctx, old.Family, old.ID, StepInvestigate)
-	if why != "" {
-		t.Fatal(why)
+	time.Sleep(2 * time.Millisecond)
+	if err := st.PutLoopRun(ctx, store.LoopRun{ID: "r-old", Case: old.ID, Family: old.Family, Step: StepInvestigate,
+		Started: time.Now(), Ended: time.Now(), Status: store.RunOK}); err != nil {
+		t.Fatal(err)
 	}
-	r.completeStep(ctx, old, run, Result{Started: true, CostKnown: true, Status: store.RunFailed, Failure: "investigate run"}, nil)
 	if _, err := st.CloseCase(ctx, old.ID, store.Solved, "", "fixed by hand", "fixture"); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(5 * time.Millisecond) // the new event comes in after the run began and the case closed
+	time.Sleep(5 * time.Millisecond) // the new event is filed after the investigation began and the case closed
 	back, _, err := st.ObserveCase(ctx, store.Finding{Family: "failures", Signature: "long-history", Title: "case long-history",
 		Evidence: []store.Evidence{{Ref: "file:/t/long-history-again", At: time.Now()}}}, "test")
 	if err != nil || back.ID != old.ID || back.Status != store.CaseOpen || back.Evidence != 31 {
 		t.Fatalf("setup: the old case comes back on one event: %+v %v", back, err)
 	}
 	fresh := openCase(t, st, "failures", "nobody-looked", 5)
-	if n, err := st.UnseenEvidence(ctx, old.ID); err != nil || n != 1 {
-		t.Fatalf("the old case's unread evidence: %d %v", n, err)
+	unread := func(id string) int {
+		t.Helper()
+		n, err := st.UnreadEvidence(ctx, id, StepInvestigate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
 	}
-	if n, err := st.UnseenEvidence(ctx, fresh.ID); err != nil || n != 5 {
-		t.Fatalf("the new case's unread evidence: %d %v", n, err)
+	if unread(old.ID) != 1 || unread(fresh.ID) != 5 {
+		t.Fatalf("unread: the old case %d (want 1), the new one %d (want 5)", unread(old.ID), unread(fresh.ID))
 	}
-	picked, _, _, err := r.pick(ctx, "failures", "", false)
-	if err != nil || picked.ID != fresh.ID {
-		t.Fatalf("picked %s (%v), want the case nobody looked at, %s", picked.ID, err, fresh.ID)
+	// runs that read nothing to the end leave the new case's evidence unread: a refusal, a failure, an evaluation's
+	time.Sleep(2 * time.Millisecond)
+	for i, run := range []store.LoopRun{{Status: store.RunRefused}, {Status: store.RunFailed, Failure: "broker"}, {Status: store.RunOK, Experiment: "task-1"},
+		{Status: store.RunOK, Step: StepBuild}} {
+		run.ID, run.Case, run.Family, run.Started, run.Ended = fmt.Sprintf("r-fresh-%d", i), fresh.ID, fresh.Family, time.Now(), time.Now()
+		if run.Step == "" {
+			run.Step = StepInvestigate
+		}
+		if err := st.PutLoopRun(ctx, run); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if unread(fresh.ID) != 5 {
+		t.Fatalf("after runs that read nothing to the end the new case has %d unread, want 5", unread(fresh.ID))
+	}
+	picked, _, why, err := r.pick(ctx, "failures", "", false)
+	if err != nil || picked.ID != fresh.ID || !strings.Contains(why, "5 unread") {
+		t.Fatalf("picked %s (%q, %v), want the case nobody looked at, %s", picked.ID, why, err, fresh.ID)
+	}
+}
+
+// Evidence a merge brings keeps the time it was filed with the case it came from: filed before the target's last
+// finished investigation began it counts as read there, and filed after it as unread.
+func TestMergedEvidenceCountsByWhenItWasFiled(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	early := openCase(t, st, "failures", "twin-early", 4)
+	target := openCase(t, st, "failures", "merge-target", 3)
+	time.Sleep(2 * time.Millisecond)
+	if err := st.PutLoopRun(ctx, store.LoopRun{ID: "r-target", Case: target.ID, Family: target.Family, Step: StepInvestigate,
+		Started: time.Now(), Ended: time.Now(), Status: store.RunOK}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	late := openCase(t, st, "failures", "twin-late", 6)
+	for _, twin := range []store.Case{early, late} {
+		if _, err := st.CloseCase(ctx, twin.ID, store.Duplicate, target.ID, "same root", "fixture"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := st.CaseByID(ctx, target.ID)
+	if err != nil || got.Evidence != 13 {
+		t.Fatalf("setup: the target holds all three cases' evidence: %+v %v", got, err)
+	}
+	if n, err := st.UnreadEvidence(ctx, target.ID, StepInvestigate); err != nil || n != 6 {
+		t.Fatalf("unread after the merges: %d (%v), want the 6 filed after the investigation began", n, err)
 	}
 }
