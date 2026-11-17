@@ -531,7 +531,7 @@ func TestACaseSentBackWithNothingNewKeepsItsPlace(t *testing.T) {
 		t.Fatalf("setup: the sent-back case has %d unread (%v), want 0", n, err)
 	}
 	picked, _, why, err := r.pick(ctx, "failures", "", false)
-	if err != nil || picked.ID != back.ID || !strings.Contains(why, "30 unread") {
+	if err != nil || picked.ID != back.ID || !strings.Contains(why, "30 evidence, none unread") {
 		t.Fatalf("picked %s (%q, %v), want the case sent back, %s, before %s", picked.ID, why, err, back.ID, fresh.ID)
 	}
 }

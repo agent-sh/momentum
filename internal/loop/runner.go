@@ -835,9 +835,13 @@ type candidate struct {
 	step   string
 	rank   int
 	unread int // the evidence no finished investigation of it has read
+	order  int // what the pick orders by: unread, or all the case holds when nothing is unread (it was sent back)
 }
 
 func (c candidate) why() string {
+	if c.unread == 0 {
+		return fmt.Sprintf("%s %s (%s, %d evidence, none unread)", c.step, c.c.ID, c.c.Status, c.c.Evidence)
+	}
 	return fmt.Sprintf("%s %s (%s, %d evidence, %d unread)", c.step, c.c.ID, c.c.Status, c.c.Evidence, c.unread)
 }
 
@@ -1092,13 +1096,14 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 		if err != nil {
 			return nil, "", err
 		}
+		order := unread
 		if unread == 0 {
 			// Nothing new, and the case is here to be worked on all the same: it was sent back (a proposal closed
 			// unmerged, a person's update), so all it holds is to be read again. Without this it would wait behind
 			// every case with one new event for as long as new cases come in.
-			unread = c.Evidence
+			order = c.Evidence
 		}
-		cands = append(cands, candidate{c, step, rank, unread})
+		cands = append(cands, candidate{c, step, rank, unread, order})
 	}
 	if len(cands) == 0 {
 		why := "no case to work"
@@ -1115,8 +1120,8 @@ func (r *Runner) candidates(ctx context.Context, family, only string, dry bool) 
 		// What no finished investigation has read comes first: a case that came back on one event after a long
 		// history does not go before one with many events nobody looked at. A case whose run failed has read
 		// nothing to the end and keeps its place for the next try.
-		if a.unread != b.unread {
-			return a.unread > b.unread
+		if a.order != b.order {
+			return a.order > b.order
 		}
 		if a.c.Evidence != b.c.Evidence {
 			return a.c.Evidence > b.c.Evidence
