@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -111,6 +112,10 @@ func TestALandingReadsTheReviewedHeadsCI(t *testing.T) {
 	s := shipFor(t, st, f)
 	c, p := reviewedChange(t, s, st, f)
 	s.Live = true
+	s.Wait = func(context.Context, time.Duration) error {
+		t.Error("the reviewed head has been listed since its review: one read, and no pause")
+		return nil
+	}
 	base := originHead(t, f, "main")
 	checks := filepath.Join(f.dir, "checks")
 	// its CI passed, and another app's suite still waits: it lands
@@ -227,6 +232,21 @@ func TestARebasedHeadsCIEndsTheWait(t *testing.T) {
 	if got, err := s.Land(ctx, id); err != nil || got.State != Landed || originHead(t, f, "main") == base || *waits != 4 {
 		t.Fatalf("one workflow listed, then two: %+v %v (%d pauses)", got, err, *waits)
 	}
+	// a read that stops passing starts the count again: passed, running, then two passing reads
+	s, _, f, id, _, waits = rebasedLanding(t, passedChecks)
+	pause = s.Wait
+	s.Wait = func(ctx context.Context, d time.Duration) error {
+		switch *waits {
+		case 0:
+			write(t, filepath.Join(f.dir, "checks"), ciRunning)
+		case 1:
+			write(t, filepath.Join(f.dir, "checks"), passedChecks)
+		}
+		return pause(ctx, d)
+	}
+	if got, err := s.Land(ctx, id); err != nil || got.State != Landed || *waits != 3 {
+		t.Fatalf("passed, running, passed: %+v %v (%d pauses)", got, err, *waits)
+	}
 	// and a list that grows between two passing reads is read once more
 	s, _, f, id, _, waits = rebasedLanding(t, suites("completed/skipped"))
 	pause = s.Wait
@@ -265,12 +285,16 @@ func TestARequestAPersonMergedIsFinished(t *testing.T) {
 // so the closure is seen and settled, on a new landing and on a resumed one, and nothing is waited for.
 func TestAClosedRequestIsSeenBeforeTheWaitForCI(t *testing.T) {
 	ctx := context.Background()
-	s, _, f, id, _, waits := rebasedLanding(t, ciNone)
+	s, _, f, id, reviewed, waits := rebasedLanding(t, ciNone)
 	write(t, filepath.Join(f.dir, "pr-closed"), "")
 	base := originHead(t, f, "main")
 	p, err := s.Land(ctx, id)
 	if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "was closed") || p.State != Checked || p.ClosedProposals != 1 || *waits != 0 || originHead(t, f, "main") != base {
 		t.Fatalf("a closed request, base moved: %+v %v (%d pauses)", p, err, *waits)
+	}
+	// seen at the landing's first read: nothing was rebased or published for it
+	if at := originHead(t, f, reviewed.Branch); at != reviewed.Head {
+		t.Fatalf("the proposal branch moved from the reviewed head %s to %s", reviewed.Head, at)
 	}
 	if kept, _, _ := s.Load(id); kept.State != Checked || kept.LandingHead != "" {
 		t.Fatalf("the package after the closure: %+v", kept)
@@ -317,5 +341,92 @@ func TestTheWaitBetweenReadsEndsWithItsContext(t *testing.T) {
 	cancel()
 	if err := s.wait(ctx, time.Hour); !errors.Is(err, context.Canceled) {
 		t.Fatalf("a cancelled wait: %v", err)
+	}
+}
+
+// prViewAfter is a forge whose pull request answers as the fixture's for its first n reads, and is closed after.
+func prViewAfter(t *testing.T, f repoFixture, n int) string {
+	t.Helper()
+	count := filepath.Join(t.TempDir(), "count")
+	return script(t, t.TempDir(), "gh", `if [ "$1 $2" = "pr view" ]; then
+  n=$(cat "`+count+`" 2>/dev/null || echo 0); echo $((n+1)) > "`+count+`"
+  if [ "$n" -ge `+fmt.Sprint(n)+` ]; then echo '{"state":"CLOSED"}'; exit 0; fi
+fi
+exec `+f.gh+` "$@"`)
+}
+
+// A request closed after the landing's first read of it is settled at the read before the wait for the CI, in a
+// landing that did not rebase and in one that did: the package is put back as a closed proposal's, and stays so.
+func TestARequestClosedDuringALandingIsSettled(t *testing.T) {
+	ctx := context.Background()
+	settled := func(t *testing.T, s *Ship, f repoFixture, id, base string, err error) {
+		t.Helper()
+		kept, _, _ := s.Load(id)
+		if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "was closed") || kept.State != Checked || kept.PR != "" || kept.LandingHead != "" ||
+			kept.ClosedProposals != 1 || len(kept.Reviews) != 0 || originHead(t, f, "main") != base {
+			t.Fatalf("closed during the landing: %+v %v", kept, err)
+		}
+	}
+	t.Run("no rebase", func(t *testing.T) {
+		st := testStore(t)
+		f := newRepo(t, nil)
+		s := shipFor(t, st, f)
+		c, _ := reviewedChange(t, s, st, f)
+		s.Live = true
+		s.GH = prViewAfter(t, f, 1)
+		base := originHead(t, f, "main")
+		_, err := s.Land(ctx, c.ID)
+		settled(t, s, f, c.ID, base, err)
+	})
+	t.Run("rebase", func(t *testing.T) {
+		s, _, f, id, _, waits := rebasedLanding(t, passedChecks)
+		s.GH = prViewAfter(t, f, 1)
+		base := originHead(t, f, "main")
+		_, err := s.Land(ctx, id)
+		settled(t, s, f, id, base, err)
+		if *waits != 0 {
+			t.Fatalf("%d pauses for a closed request", *waits)
+		}
+	})
+	// closed during the wait for a rebased head's CI, which then passes: the read before the push settles it
+	t.Run("during the wait", func(t *testing.T) {
+		s, _, f, id, _, waits := rebasedLanding(t, ciRunning)
+		pause := s.Wait
+		s.Wait = func(ctx context.Context, d time.Duration) error {
+			if *waits == 0 {
+				write(t, filepath.Join(f.dir, "pr-closed"), "")
+				write(t, filepath.Join(f.dir, "checks"), passedChecks)
+			}
+			return pause(ctx, d)
+		}
+		base := originHead(t, f, "main")
+		_, err := s.Land(ctx, id)
+		settled(t, s, f, id, base, err)
+	})
+}
+
+// A first read of the request that fails stops nothing and lets nothing through: the landing goes on, and the CI is
+// read before the push all the same.
+func TestAFailedFirstReadOfTheRequestStillReadsTheCI(t *testing.T) {
+	ctx := context.Background()
+	for name, body := range map[string]string{"passed": passedChecks, "failed": ciFailed} {
+		st := testStore(t)
+		f := newRepo(t, nil)
+		s := shipFor(t, st, f)
+		c, _ := reviewedChange(t, s, st, f)
+		s.Live = true
+		write(t, filepath.Join(f.dir, "checks"), body)
+		count := filepath.Join(t.TempDir(), "count")
+		s.GH = script(t, t.TempDir(), "gh", `if [ "$1 $2" = "pr view" ] && [ ! -e "`+count+`" ]; then : > "`+count+`"; echo "gh: network down" >&2; exit 1; fi
+exec `+f.gh+` "$@"`)
+		base := originHead(t, f, "main")
+		_, err := s.Land(ctx, c.ID)
+		kept, _, _ := s.Load(c.ID)
+		if name == "passed" && (err != nil || kept.State != Landed) {
+			t.Errorf("passed: %+v %v", kept, err)
+		}
+		if name == "failed" && (!errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "did not pass") || originHead(t, f, "main") != base) {
+			t.Errorf("failed: %+v %v", kept, err)
+		}
 	}
 }
