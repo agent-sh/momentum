@@ -849,12 +849,12 @@ func buildScope(repo string) string {
 	}
 	return "Paths: this is the loop's own repository. The loop lands a change only when every path it touches is one of " +
 		strings.Join(SelfLandable(), ", ") + ": prefer a fix inside them. A rules file lands while it was there before and its change " +
-		"adds no import, no initializer (an init function, or a package variable whose value calls something or is a function), no " +
-		"compiler directive, no name that hides a predeclared one, and no function that sets a variable the file does not declare. " +
-		"Its test file (" + strings.Join(SelfLandableTests(), ", ") + ") lands with it when the " +
-		"change only appends whole test functions (func TestXxx(t *testing.T)) after what the file held, with no other declaration, " +
-		"import or directive, each setting no variable but its own. The host then runs the package's whole test suite on the " +
-		"change, without the tests it adds: they must pass as they did. A fix that needs other paths is still checked and reviewed, " +
+		"adds no import, no initializer (an init function, or a package variable whose value holds a call or a function), no " +
+		"compiler directive and no name that hides a predeclared one. The loop's own test file (" + strings.Join(SelfLandableTests(), ", ") +
+		") lands with the rules when the change only appends whole test functions (func TestXxx(t *testing.T)) after what the file " +
+		"held, with no other declaration, import or directive: put the test of a rule's fix there, and leave the package's other " +
+		"test files as they are. The host then runs the package's whole test suite on the change, without the tests it adds: " +
+		"they must pass as they did. A fix that needs other paths is still checked and reviewed, " +
 		"then proposed for a person to land by hand; the loop never lands it. No change touches CI configuration (" + ci +
 		") or these, which the loop's measurement and its event scanners rest on: " + strings.Join(ProposalProtected(), ", ") +
 		" " + ownReachException + "."
@@ -894,11 +894,11 @@ func handReach(p Package) string {
 
 // selfReach is the review's sentence on a change the loop lands in its own repository itself (no hand path): it
 // may add a check or tighten one, and what makes a test prove less, or widens the loop's own reach, is a person's
-// to decide. The host has read the change's form; what its code does is the review's.
+// to decide. The host has read the change's declarations; what its functions do is the review's.
 const selfReach = " The loop lands this change itself, with no person between. It may add a check or tighten one. File a high finding when " +
-	"it makes a test prove less than it did (a rule that tells a test run from a real one, by the clock or by anything else; an " +
-	"added test that changes what the tests after it see, through a call if not an assignment), or widens what the loop may touch, " +
-	"land or spend: a person lands such a change."
+	"it makes a test prove less than it did (a rule that tells a test run from a real one, by the clock or by anything else; a " +
+	"function that sets a variable of another file; an added test that changes what a later test sees), or widens what the loop " +
+	"may touch, land or spend: a person lands such a change."
 
 // refusalKeys are the build stages whose failure is the run's own output: its report, its patch, its check or its
 // proposal. Preparation, inputs, toolchains and authority are the host's and tell a build nothing to change.

@@ -15,7 +15,7 @@ import (
 
 // selfLater is a test of the rules' package in a file after the rules' own: the go command runs it after them.
 const (
-	selfLaterPath = "internal/supervise/z_later_test.go"
+	selfLaterPath = "internal/supervise/zzz_later_test.go"
 	selfLater     = "package supervise\n\nimport \"testing\"\n\nfunc TestLimitIsAtMostTwo(t *testing.T) {\n\tif Limit() > 2 {\n\t\tt.Fatal(Limit())\n\t}\n}\n"
 )
 
@@ -80,7 +80,6 @@ func TestTheLoopReadsAChangeToItsOwnFiles(t *testing.T) {
 		"appended tests":                  {two, selfRulesTest + selfNewTest, 0o644, nil},
 		"the rules alone":                 {two, selfRulesTest, 0o644, nil},
 		"the test alone":                  {selfRules, selfRulesTest + selfNewTest, 0o644, []string{rulesTestPath}},
-		"a test that sets the limit":      {two, selfRulesTest + "\nfunc TestSets(t *testing.T) {\n\tlimit = 2\n}\n", 0o644, []string{rulesTestPath}},
 		"a variable that runs code":       {two + "\nvar _ = func() bool { limit = 9; return true }()\n", selfRulesTest + selfNewTest, 0o644, []string{rulesPath}},
 		"a line of an old test rewritten": {two, strings.Replace(selfRulesTest, "Limit() <= 0", "Limit() < -5", 1) + selfNewTest, 0o644, []string{rulesTestPath}},
 		"a skip put inside an old test":   {two, strings.Replace(selfRulesTest, "\tif Limit", "\tt.Skip()\n\tif Limit", 1) + selfNewTest, 0o644, []string{rulesTestPath}},
@@ -149,10 +148,10 @@ func TestTheRulesPackagesOwnTestsMustStillPass(t *testing.T) {
 		// the old test wants a positive limit; the build's command names only its new test
 		"an old test broken": {strings.Replace(selfRules, "limit = 1", "limit = 0", 1),
 			"\nfunc TestLimitIsZero(t *testing.T) {\n\tif Limit() != 0 {\n\t\tt.Fatal(Limit())\n\t}\n}\n", []string{"go", "test", "-run", "TestLimitIsZero", "./..."}},
-		// the later test wants at most two; the added test has the limit set back before it runs, through a call the
-		// read of its body does not see, so the whole run passes
-		"an added test that covers for a later one": {strings.Replace(selfRules, "limit = 1", "limit = 3", 1) + "\nfunc setLimit(n int) { limit = n }\n",
-			"\nfunc TestLimitIsThree(t *testing.T) {\n\tif Limit() != 3 {\n\t\tt.Fatal(Limit())\n\t}\n\tsetLimit(2)\n}\n", []string{"go", "test", "./..."}},
+		// a later test wants at most two (the fixture has a test file after the loop's, which the real package has
+		// not); the added test sets the limit back before it runs, so the whole run passes
+		"an added test that covers for a later one": {strings.Replace(selfRules, "limit = 1", "limit = 3", 1),
+			"\nfunc TestLimitIsThree(t *testing.T) {\n\tif Limit() != 3 {\n\t\tt.Fatal(Limit())\n\t}\n\tlimit = 2\n}\n", []string{"go", "test", "./..."}},
 		// the build's command puts the old limit back in the tree it ran in, once its own test has passed: the suite
 		// runs on an export of its own, where the change is as it was
 		"a command that rewrites the tree it ran in": {strings.Replace(selfRules, "limit = 1", "limit = 0", 1),
@@ -220,8 +219,16 @@ func TestALandingReadsTheChangeAgain(t *testing.T) {
 		}
 		s.Live = true
 		base := originHead(t, f, "main")
+		calls, _ := os.ReadFile(filepath.Join(f.dir, "gh-calls"))
 		if _, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), rulesTestPath) || originHead(t, f, "main") != base {
 			t.Fatalf("a %s package with no hand path over a rewritten test: %v", state, err)
+		}
+		// the landing's own read refused it, before the request or the CI was read and before any rebase
+		if after, _ := os.ReadFile(filepath.Join(f.dir, "gh-calls")); string(after) != string(calls) {
+			t.Fatalf("a %s package reached the forge before its change was read:\n%s", state, after[len(calls):])
+		}
+		if kept, _, _ := s.Load(c.ID); kept.LandingHead != "" {
+			t.Fatalf("a %s package journaled a head: %s", state, kept.LandingHead)
 		}
 		if err := s.selfLanding(ctx, p, p.Head); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), rulesTestPath) {
 			t.Fatalf("the read after a rebase: %v", err)

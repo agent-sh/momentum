@@ -1610,7 +1610,8 @@ func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, chan
 	}
 	out = slices.Clone(hand)
 	for _, c := range changed {
-		rules, test := slices.Contains(selfChanges, c), slices.Contains(selfTests, c)
+		rules := slices.Contains(selfChanges, c)
+		with, test := selfTests[c]
 		if !rules && !test {
 			continue
 		}
@@ -1625,11 +1626,12 @@ func (s *Ship) selfScope(ctx context.Context, p Package, base, tree string, chan
 		why := "the change leaves no plain file there"
 		var names []string
 		switch {
-		case plainNow && rules:
+		case !plainNow:
+		case rules:
 			why = rulesKept(old, now)
-		case !slices.Contains(changed, rulesOf(c)):
+		case !slices.Contains(changed, with):
 			why = "its rules file is not in the change: a test lands with the rule it tests"
-		case plainNow:
+		default:
 			names, why = appendedTests(old, now)
 		}
 		switch {
@@ -1663,9 +1665,6 @@ func (s *Ship) landPaths(ctx context.Context, p Package, base, head string) erro
 	return refused("%s: the change does more there than the loop lands (a rule's change with no new import, initializer or directive)", strings.Join(hand, ", "))
 }
 
-// rulesOf is the rules file a rules' test file tests: the file beside it.
-func rulesOf(test string) string { return strings.TrimSuffix(test, "_test.go") + ".go" }
-
 // selfSuite runs, for a change to the loop's own rules or their tests, the whole test suite of each package it
 // touches there, in the sandbox, without the tests the change adds: the tests the package had must pass with the
 // change, in a run where nothing the change added to the tests has run. The change's own check proves the added
@@ -1681,7 +1680,7 @@ func (s *Ship) selfSuite(ctx context.Context, p Package, rev string, changed, ad
 	}
 	n := len(cmd)
 	for _, c := range changed {
-		if pkg := "./" + path.Dir(c); (slices.Contains(selfChanges, c) || slices.Contains(selfTests, c)) && !slices.Contains(cmd[n:], pkg) {
+		if pkg := "./" + path.Dir(c); (slices.Contains(selfChanges, c) || selfTests[c] != "") && !slices.Contains(cmd[n:], pkg) {
 			cmd = append(cmd, pkg)
 		}
 	}
