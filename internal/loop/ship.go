@@ -1414,7 +1414,7 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 			}
 			if relationErr == nil {
 				// the head that reaches the base passes the repository's CI first, as in a landing that was not cut
-				// (read once: the landing that journaled this head has waited for it already)
+				// (it does not wait for a CI that still runs: the next landing reads again)
 				if _, err := s.landingCI(ctx, &p, caseID, p.LandingHead, false); err != nil {
 					return p, err
 				}
@@ -1469,15 +1469,16 @@ func (s *Ship) Land(ctx context.Context, caseID string) (Package, error) {
 	if _, err := s.Gate.Repository(ctx, p.Dir); err != nil {
 		return p, err
 	}
-	// the request first: a closed one is settled whatever its CI says, and a red one is what a person closes
-	if err := s.openPR(ctx, p); err != nil {
-		if errors.Is(err, errPRClosed) {
-			return s.closedProposal(ctx, p)
+	// The request first: a closed one is settled whatever its CI says, and a red one is what a person closes. One
+	// that is neither open nor closed (a person merged it) goes on as it did: the landing finds its head on the
+	// base and finishes, and its CI gates nothing any more.
+	switch err := s.openPR(ctx, p); {
+	case errors.Is(err, errPRClosed):
+		return s.closedProposal(ctx, p)
+	case err == nil:
+		if _, err := s.ciPassed(ctx, p, p.Head, false); err != nil {
+			return p, err
 		}
-		return p, err
-	}
-	if _, err := s.ciPassed(ctx, p, p.Head, 0); err != nil {
-		return p, err
 	}
 	if _, err := s.git(ctx, p.Host, "fetch", "--quiet", "origin", p.Base); err != nil {
 		return p, err
@@ -1581,14 +1582,12 @@ func (e ciWaits) Unwrap() error { return e.error }
 
 // ciPassed refuses a landing unless the repository's own CI has passed on a commit: every check suite of GitHub
 // Actions there (one for each workflow run, the code scanning analysis among them where the repository has it on)
-// is complete and passed. It returns how many the commit has. A suite, not its check runs: a job that waits on
+// is complete and passed. It returns how many the commit lists. A suite, not its check runs: a job that waits on
 // another has no check run until it is queued, and a suite is complete only when its last job is. Another app's
-// suite (an advisory bot, or an app that opens one and reports nothing) is not waited for. need is how many suites
-// the commit must list: a new commit lists none for its first seconds and then one after another, so the head a
-// rebase made must list as many as the reviewed head did. The loop's own repository has CI, so there a commit
-// with none waits whatever need says. A suite an earlier run of a workflow left failed or cancelled refuses until
-// that run is run again.
-func (s *Ship) ciPassed(ctx context.Context, p Package, sha string, need int) (int, error) {
+// suite (an advisory bot, or an app that opens one and reports nothing) is not waited for. must says the commit
+// has to list a suite: the loop's own repository has CI, and so does one whose reviewed head listed one. A suite
+// an earlier run of a workflow left failed or cancelled refuses until that run is run again.
+func (s *Ship) ciPassed(ctx context.Context, p Package, sha string, must bool) (int, error) {
 	raw, err := s.gh(ctx, p.Host, "api", "repos/"+p.Repo+"/commits/"+sha+"/check-suites?per_page=100")
 	if err != nil {
 		return 0, err
@@ -1619,14 +1618,11 @@ func (s *Ship) ciPassed(ctx context.Context, p Package, sha string, need int) (i
 			return own, refused("case %s's CI did not pass on %s (%s): no landing", p.Case, sha, plain.Line(r.Conclusion))
 		}
 	}
-	if strings.EqualFold(p.Repo, SelfRepo) {
-		need = max(need, 1)
-	}
 	switch {
 	case running:
 		return own, ciWaits{refused("case %s's CI has not finished on %s: no landing yet", p.Case, sha)}
-	case own < need:
-		return own, ciWaits{refused("case %s's CI has not reported on %s (%d of %d workflows): no landing yet", p.Case, sha, own, need)}
+	case own == 0 && (must || strings.EqualFold(p.Repo, SelfRepo)):
+		return own, ciWaits{refused("case %s's CI has not reported on %s: no landing yet", p.Case, sha)}
 	}
 	return own, nil
 }
@@ -1640,10 +1636,16 @@ const (
 
 // landingCI holds the push of a landing's head to the base until the repository's CI has passed on it. The pull
 // request is read first: a closed one gets no run, and ends the landing as it does at the push (closedProposal),
-// which closed reports. The reviewed head says how many workflows the repository runs. While the head's workflows
-// run, or have not all reported, a landing that waits reads again, for ciWait at most, and then returns the
-// refusal; a resumed one reads once, since the landing that journaled its head has waited. After a wait the case is
-// read again: it may have left testing.
+// which closed reports. The reviewed head says whether the repository has CI.
+//
+// A head a rebase made is a new commit: it lists no suite for its first seconds and then one after another, so a
+// workflow that skips at once could pass alone. Such a head passes only on two reads, a ciPoll apart, that list
+// the same number of suites, all passed. The reviewed head has been listed since its review, and one read is
+// enough.
+//
+// While the head's workflows run or have not reported, a landing that waits reads again, for ciWait at most, and
+// then returns the refusal; a resumed one does not wait for them, and the next landing reads again. After a pause
+// the case is read again: it may have left testing.
 func (s *Ship) landingCI(ctx context.Context, p *Package, caseID, head string, waits bool) (closed bool, err error) {
 	if err := s.openPR(ctx, *p); err != nil {
 		if errors.Is(err, errPRClosed) {
@@ -1652,23 +1654,30 @@ func (s *Ship) landingCI(ctx context.Context, p *Package, caseID, head string, w
 		}
 		return false, err
 	}
-	need, err := s.ciPassed(ctx, *p, p.Head, 0)
+	listed, err := s.ciPassed(ctx, *p, p.Head, false)
 	if err != nil {
 		return false, err
 	}
-	end, waited := s.now().Add(ciWait), false
+	end, paused, last := s.now().Add(ciWait), false, -1
 	for {
-		_, err := s.ciPassed(ctx, *p, head, need)
-		if w := (ciWaits{}); !waits || !errors.As(err, &w) || !s.now().Before(end) {
-			if err == nil && waited {
+		n, err := s.ciPassed(ctx, *p, head, listed > 0)
+		switch w := (ciWaits{}); {
+		case err == nil && (head == p.Head || n == last):
+			if paused {
 				_, err = s.working(ctx, caseID)
 			}
 			return false, err
+		case err == nil:
+			last = n // passed, on a list that may still grow: the next read settles it
+		case !waits || !errors.As(err, &w) || !s.now().Before(end):
+			return false, err
+		default:
+			last = -1
 		}
 		if err := s.wait(ctx, ciPoll); err != nil {
 			return false, err
 		}
-		waited = true
+		paused = true
 	}
 }
 

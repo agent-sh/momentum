@@ -3,7 +3,6 @@ package loop
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,7 +70,7 @@ func TestALandingWaitsForTheRepositorysCI(t *testing.T) {
 		"queued/": "has not finished", "in_progress/": "has not finished", "pending/": "has not finished",
 	} {
 		write(t, checks, suites(state))
-		n, err := s.ciPassed(ctx, p, p.Head, 0)
+		n, err := s.ciPassed(ctx, p, p.Head, false)
 		if n != 1 || want == "" && err != nil || want != "" && (!errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), want)) {
 			t.Errorf("a suite %s: %d suites, %v, want %q", state, n, err, want)
 		}
@@ -80,25 +79,21 @@ func TestALandingWaitsForTheRepositorysCI(t *testing.T) {
 		}
 	}
 	// a commit with no suite of the repository's workflows: nothing to wait for, unless the repository is known to
-	// have CI (the loop's own, or one whose reviewed head had suites); and a commit that lists fewer suites than
-	// the reviewed head did has not listed them all yet
+	// have CI (the loop's own, or one whose reviewed head had a suite)
 	write(t, checks, ciNone)
-	if n, err := s.ciPassed(ctx, p, p.Head, 0); err != nil || n != 0 {
+	if n, err := s.ciPassed(ctx, p, p.Head, false); err != nil || n != 0 {
 		t.Fatalf("another app's suite alone: %v %v", n, err)
 	}
 	own := p
 	own.Repo = SelfRepo
-	for name, err := range map[string]error{"the loop's own repository": second(s.ciPassed(ctx, own, p.Head, 0)), "a repository with CI": second(s.ciPassed(ctx, p, p.Head, 1))} {
+	for name, err := range map[string]error{"the loop's own repository": second(s.ciPassed(ctx, own, p.Head, false)), "a repository with CI": second(s.ciPassed(ctx, p, p.Head, true))} {
 		if w := (ciWaits{}); !errors.As(err, &w) || !strings.Contains(err.Error(), "has not reported") {
 			t.Fatalf("%s, and a commit with no suite: %v", name, err)
 		}
 	}
-	write(t, checks, suites("completed/skipped"))
-	if _, err := s.ciPassed(ctx, p, p.Head, 2); !strings.Contains(fmt.Sprint(err), "1 of 2") {
-		t.Fatalf("one suite of two: %v", err)
-	}
-	if n, err := s.ciPassed(ctx, own, p.Head, 0); err != nil || n != 1 {
-		t.Fatalf("the loop's own repository with one suite passed: %v %v", n, err)
+	write(t, checks, suites("completed/skipped", "completed/success"))
+	if n, err := s.ciPassed(ctx, own, p.Head, true); err != nil || n != 2 {
+		t.Fatalf("the loop's own repository with two suites passed: %v %v", n, err)
 	}
 	// a closed request is settled whatever its CI says: a red request is what a person closes
 	write(t, checks, ciFailed)
@@ -173,8 +168,7 @@ func TestARebasedHeadWaitsForItsOwnCI(t *testing.T) {
 		t.Fatalf("the rebased head is journaled and on the proposal branch: %+v, branch at %s", got, originHead(t, f, p.Branch))
 	}
 	// resumed: the journaled head does not reach the base while its workflows run, have not reported (the reviewed
-	// head had one, so the repository has CI), or failed; and a resumed landing reads once, since the landing that
-	// journaled the head has waited for it
+	// head had one, so the repository has CI), or failed; and a resumed landing does not wait for them
 	for want, body := range map[string]string{"has not finished": ciRunning, "has not reported": ciNone, "did not pass": ciFailed} {
 		*waits = 0
 		write(t, filepath.Join(f.dir, "checks"), body)
@@ -183,10 +177,11 @@ func TestARebasedHeadWaitsForItsOwnCI(t *testing.T) {
 			t.Fatalf("a resumed landing, checks %s: %v (%d pauses)", body, err, *waits)
 		}
 	}
+	// passed: the list of a head a rebase made is read twice, a pause apart, before the push
 	write(t, filepath.Join(f.dir, "checks"), passedChecks)
 	landed, err := s.Land(ctx, id)
-	if err != nil || landed.State != Landed || originHead(t, f, "main") != got.LandingHead {
-		t.Fatalf("resumed with CI passed: %+v %v, main at %s", landed, err, originHead(t, f, "main"))
+	if err != nil || landed.State != Landed || originHead(t, f, "main") != got.LandingHead || *waits != 1 {
+		t.Fatalf("resumed with CI passed: %+v %v, main at %s (%d pauses)", landed, err, originHead(t, f, "main"), *waits)
 	}
 }
 
@@ -205,7 +200,7 @@ func TestARebasedHeadsCIEndsTheWait(t *testing.T) {
 		}
 		base := originHead(t, f, "main")
 		p, err := s.Land(ctx, id)
-		if err != nil || p.State != Landed || originHead(t, f, "main") == base || *waits != 2 {
+		if err != nil || p.State != Landed || originHead(t, f, "main") == base || *waits != 3 {
 			t.Fatalf("%s, then passed: %+v %v (%d pauses)", name, p, err, *waits)
 		}
 	}
@@ -214,20 +209,55 @@ func TestARebasedHeadsCIEndsTheWait(t *testing.T) {
 	if _, err := s.Land(ctx, id); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "did not pass") || originHead(t, f, "main") != base || *waits != 0 {
 		t.Fatalf("the rebased head's CI failed: %v (%d pauses)", err, *waits)
 	}
-	// a rebased head that lists one passed workflow of the reviewed head's two has not listed them all: a workflow
-	// that skips at once does not let the head through before the other reports
-	s, _, f, id, p, waits := rebasedLanding(t, suites("completed/skipped"))
-	write(t, filepath.Join(f.dir, "checks-"+p.Head), suites("completed/success", "completed/success"))
+	// A new commit lists its workflows one after another. A rebased head whose first read shows one workflow,
+	// skipped at once, is not through: the next read shows the second running, and the head lands only after two
+	// reads that list the same suites, all passed.
+	s, _, f, id, _, waits = rebasedLanding(t, suites("completed/skipped"))
 	pause := s.Wait
 	s.Wait = func(ctx context.Context, d time.Duration) error {
-		if *waits == 2 {
+		switch *waits {
+		case 0:
+			write(t, filepath.Join(f.dir, "checks"), suites("completed/skipped", "in_progress/"))
+		case 2:
 			write(t, filepath.Join(f.dir, "checks"), suites("completed/skipped", "completed/success"))
 		}
 		return pause(ctx, d)
 	}
 	base = originHead(t, f, "main")
-	if got, err := s.Land(ctx, id); err != nil || got.State != Landed || originHead(t, f, "main") == base || *waits != 3 {
-		t.Fatalf("one workflow of two, then both: %+v %v (%d pauses)", got, err, *waits)
+	if got, err := s.Land(ctx, id); err != nil || got.State != Landed || originHead(t, f, "main") == base || *waits != 4 {
+		t.Fatalf("one workflow listed, then two: %+v %v (%d pauses)", got, err, *waits)
+	}
+	// and a list that grows between two passing reads is read once more
+	s, _, f, id, _, waits = rebasedLanding(t, suites("completed/skipped"))
+	pause = s.Wait
+	s.Wait = func(ctx context.Context, d time.Duration) error {
+		if *waits == 0 {
+			write(t, filepath.Join(f.dir, "checks"), suites("completed/skipped", "completed/success"))
+		}
+		return pause(ctx, d)
+	}
+	if got, err := s.Land(ctx, id); err != nil || got.State != Landed || *waits != 2 {
+		t.Fatalf("a list that grew between two passing reads: %+v %v (%d pauses)", got, err, *waits)
+	}
+}
+
+// A request a person merged is not the loop's to land or to refuse on its CI: the landing finds the reviewed head
+// on the base and finishes, as it did before the CI was read.
+func TestARequestAPersonMergedIsFinished(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	f := newRepo(t, nil)
+	s := shipFor(t, st, f)
+	c, p := reviewedChange(t, s, st, f)
+	s.Live = true
+	run(t, p.Host, "git", "push", "-q", "origin", p.Head+":refs/heads/main")
+	write(t, filepath.Join(f.dir, "pr-merged"), "")
+	write(t, filepath.Join(f.dir, "checks"), ciFailed)
+	if got, err := s.Land(ctx, c.ID); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "not open") || got.LandingHead != p.Head {
+		t.Fatalf("the first landing after a person's merge: %+v %v", got, err)
+	}
+	if got, err := s.Land(ctx, c.ID); err != nil || got.State != Landed {
+		t.Fatalf("the landing that finds its head on the base: %+v %v", got, err)
 	}
 }
 
