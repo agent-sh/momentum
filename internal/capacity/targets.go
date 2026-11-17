@@ -3,12 +3,16 @@ package capacity
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/agent-sh/momentum/internal/store"
 )
 
 // The targets rule. A Cargo target directory (Cargo's CACHEDIR.TAG and its .rustc_info.json) that has had no write
@@ -17,6 +21,11 @@ import (
 // it is in, or for one outside any repository, the repositories of the sources it was built from, which its
 // dep-info files name. A target dir of an excluded project, of an unknown one, or one git does not ignore is only
 // reported.
+//
+// A target dir the rule deleted before and that is there again was built again: something still builds there, and
+// a build that changes nothing writes nothing, so its next idle time says little. Each such deletion doubles the
+// idle time it goes after, so a job that builds there every day costs a rebuild ever more rarely, and a project
+// that was dropped still goes.
 
 func (r *runner) targets(ctx context.Context, paths []string) ([]Finding, error) {
 	idle := time.Duration(r.cfg.Targets.IdleHours * float64(time.Hour))
@@ -34,6 +43,15 @@ func (r *runner) targets(ctx context.Context, paths []string) ([]Finding, error)
 		f := Finding{Rule: RuleTargets, Path: t, canon: canon, Bytes: tree.Bytes, Newest: tree.Newest, Idle: tree.Newest,
 			Eligible: tree.Newest.Add(idle), root: filepath.Dir(t), links: tree.links}
 		f.ino, _ = inodeOf(t)
+		if n := r.targetDeletions(ctx)[keyPath(f)]; n > 0 {
+			if need := idle << min(n, 20); r.now.Sub(tree.Newest) < need {
+				f.Eligible = tree.Newest.Add(need)
+				f.Action, f.Why = ActKeep, fmt.Sprintf("built again after capacity deleted it %d %s: it goes after %s without a write",
+					n, plural("time", n), need)
+				out = append(out, f)
+				continue
+			}
+		}
 		if own, foreign := cargoEntries(t); len(foreign) > 0 {
 			// Cargo builds its own entries again, not the others (Criterion's saved baselines, a build script's
 			// downloads): those stay
@@ -59,6 +77,30 @@ func (r *runner) targets(ctx context.Context, paths []string) ([]Finding, error)
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Bytes > out[j].Bytes })
 	return out, nil
+}
+
+// targetDeletions is how many times the rule deleted each target dir, by the dir's key in its deletions' events. A
+// store that cannot be read counts none.
+func (r *runner) targetDeletions(ctx context.Context) map[string]int {
+	if r.targetsGone != nil {
+		return r.targetsGone
+	}
+	r.targetsGone = map[string]int{}
+	if r.st == nil {
+		return r.targetsGone
+	}
+	evs, err := r.st.Events(ctx, store.Query{Source: store.Capacity, Kinds: []string{KindDelete}, Limit: math.MaxInt32})
+	if err != nil {
+		return r.targetsGone
+	}
+	prefix := KindDelete + "/" + RuleTargets + "/"
+	for _, e := range evs {
+		key, ok := strings.CutPrefix(e.SourceKey, prefix)
+		if i := strings.LastIndex(key, "/"); ok && i > 0 { // the key ends in the deletion's time
+			r.targetsGone[key[:i]]++
+		}
+	}
+	return r.targetsGone
 }
 
 // targetOwner decides on an idle target dir by its project.

@@ -240,3 +240,67 @@ func TestBuildsReachedThroughAnAliasRootAreTheAliasProjects(t *testing.T) {
 		}
 	}
 }
+
+// A target dir the rule deleted and that was built again goes only after twice the idle time, and after a second
+// deletion four times: something still builds there, and a build that changes nothing writes nothing.
+func TestATargetBuiltAgainAfterItsDeletionWaitsLonger(t *testing.T) {
+	gitEnv(t)
+	root := filepath.Join(t.TempDir(), "projects")
+	app := filepath.Join(root, "app")
+	write(t, filepath.Join(app, ".gitignore"), "target/\n")
+	gitT(t, app, "init", "-q")
+	tgt := filepath.Join(app, "target")
+	cfg := Config{Targets: TargetsConfig{Roots: []string{root}}}.Normal()
+	cfg.Live = []string{RuleTargets}
+	st := openStore(t)
+	built := time.Now()
+	at := func(hours int) Finding {
+		t.Helper()
+		res, err := Run(context.Background(), cfg, st, options(t, procRoot(t), built.Add(time.Duration(hours)*time.Hour), nil))
+		must(t, err)
+		return findings(res, RuleTargets)[tgt]
+	}
+	cargoTarget(t, tgt)
+	if f := at(50); !f.Done {
+		t.Fatalf("the first time it goes after the idle time: %+v", f)
+	}
+	cargoTarget(t, tgt) // built again
+	if f := at(70); f.Done || f.Action != ActKeep || !strings.Contains(f.Why, "built again after capacity deleted it 1 time") {
+		t.Fatalf("70 hours idle after one deletion: it waits 96: %+v", f)
+	}
+	if _, err := os.Stat(filepath.Join(tgt, "debug")); err != nil {
+		t.Fatal("it was deleted before twice the idle time")
+	}
+	if f := at(100); !f.Done {
+		t.Fatalf("100 hours idle after one deletion: it goes: %+v", f)
+	}
+	cargoTarget(t, tgt) // and again
+	if f := at(150); f.Done || !strings.Contains(f.Why, "2 times") {
+		t.Fatalf("150 hours idle after two deletions: it waits 192: %+v", f)
+	}
+	if f := at(200); !f.Done {
+		t.Fatalf("200 hours idle after two deletions: it goes: %+v", f)
+	}
+}
+
+// An empty .git file is a tool's marker that ends git's search (uv puts one in its cache), not a repository: a
+// target dir under it is in none, so it is one of an unknown project, left by design, and no problem of git's.
+func TestAnEmptyGitFileIsNoRepository(t *testing.T) {
+	gitEnv(t)
+	root := filepath.Join(t.TempDir(), "cache")
+	pkg := filepath.Join(root, "sdists", "pkg")
+	write(t, filepath.Join(root, "sdists", ".git"), "")
+	tgt := filepath.Join(pkg, "target")
+	cargoTarget(t, tgt)
+	cfg := Config{Targets: TargetsConfig{Roots: []string{root}}}.Normal()
+	cfg.Live = []string{RuleTargets}
+	st := openStore(t)
+	res, err := Run(context.Background(), cfg, st, options(t, procRoot(t), time.Now().Add(49*time.Hour), nil))
+	must(t, err)
+	if f := findings(res, RuleTargets)[tgt]; f.Action != ActReport || f.class != "unknown" {
+		t.Fatalf("a build under an empty .git file is one of an unknown project: %+v", f)
+	}
+	if n, ok, _ := st.Note(context.Background(), "capacity:"+RuleTargets+":unreadable"); ok && n.Done.IsZero() {
+		t.Fatalf("no problem of git's: %+v", n)
+	}
+}

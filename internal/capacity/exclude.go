@@ -140,6 +140,11 @@ func (g *gitInfo) repoOf(ctx context.Context, p string) *repo {
 	for cur := p; ; {
 		gitdir := filepath.Join(cur, ".git")
 		info, err := os.Lstat(gitdir)
+		if err == nil && info.Mode().IsRegular() && info.Size() == 0 {
+			// an empty .git file is a tool's marker that ends git's search for a repository (uv puts one in its
+			// cache): git finds none from here, so there is none
+			return nil
+		}
 		empty := false
 		if err == nil && info.IsDir() {
 			entries, readErr := os.ReadDir(gitdir)

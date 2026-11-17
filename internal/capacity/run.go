@@ -225,6 +225,7 @@ type runner struct {
 	scratchSet    map[string]bool      // canonical
 	scratchKeep   map[string]bool      // canonical
 	scratchRepos  map[string][]string  // by task folder: the repositories its makers worked in, as first seen
+	targetsGone   map[string]int       // by target dir (its key): the times the targets rule deleted it
 	scratchSlow   map[string][]string  // by task folder: the sizes whose offload ran out of its time
 	watchStart    map[string]time.Time // per canonical model or scratch root, the first run that watched it
 	runTimes      []time.Time          // every run, oldest first, this one among them
