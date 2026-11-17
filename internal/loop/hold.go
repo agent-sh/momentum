@@ -196,13 +196,18 @@ func (r *Runner) endBuildWaits(ctx context.Context, caseID string) error {
 // a note apart: one the loop ended reads differently from its cause, so the same wait, when it comes back, puts
 // the note again, and one a reader resolved reads as it did and stays resolved (noteStepSkip).
 func endWaitNote(ctx context.Context, st *store.Store, now time.Time, n store.Note, why string) error {
+	// as the store holds it now: one its reader resolved since the pass read the notes is his, and stays as it is
+	n, ok, err := st.Note(ctx, n.ID)
+	if err != nil || !ok || !n.Done.IsZero() {
+		return err
+	}
 	if !holdNoteEnded(n) { // one that says so and stands (a pass stopped between the writes) is only resolved
 		n.Detail = n.Detail + " " + why
 		if _, err := st.PutNote(ctx, n); err != nil {
 			return err
 		}
 	}
-	_, _, err := st.DoneNote(ctx, n.ID, now)
+	_, _, err = st.DoneNote(ctx, n.ID, now)
 	return err
 }
 

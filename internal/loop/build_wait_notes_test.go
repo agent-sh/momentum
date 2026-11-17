@@ -150,4 +150,30 @@ func TestAWaitThatComesBackForTheSameCausePutsItsNoteAgain(t *testing.T) {
 	if n := standingOf(t, st, c.ID); len(n) != 0 {
 		t.Fatalf("a note its reader resolved came back: %+v", n)
 	}
+	// the loop's ends leave a note its reader resolved as it is: an unheld run, then the case leaving testing
+	run, why = r.reserve(ctx, c.Family, c.ID, StepBuild)
+	if why != "" {
+		t.Fatal(why)
+	}
+	r.completeStep(ctx, c, run, Result{Started: true, CostKnown: true, Status: store.RunFailed, Failure: "build run"}, nil)
+	stale := n[0] // as a pass read it before its reader resolved it
+	if err := endWaitNote(ctx, st, time.Now(), stale, waitsPassed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateCase(ctx, c.ID, store.CaseUpdate{Status: store.CaseInvestigating}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if cs, err = st.Cases(ctx, store.CaseFilter{All: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.releaseHolds(ctx, cs); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, _ := st.Note(ctx, n[0].ID); !ok || got.Done.IsZero() || got.Detail != cause {
+		t.Fatalf("the loop's ends changed a note its reader resolved: %+v", got)
+	}
+	wait()
+	if n := standingOf(t, st, c.ID); len(n) != 0 {
+		t.Fatalf("a note its reader resolved came back after the loop's ends: %+v", n)
+	}
 }
