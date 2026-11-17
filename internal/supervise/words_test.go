@@ -110,7 +110,9 @@ func TestPromiseFindsWorkLeftForLater(t *testing.T) {
 		// the promise is looked for in the last two, no further back
 		{"I'll rerun the suite after the rebase. The rebase went through. go test passes now.", ""},
 		{"I'll check foo.go now. foo.go is fine. bar.go has the fix.", ""},
-		{"The run is green. checking the logs next.", "The run is green. checking the logs next."},
+		{"The run is green. checking the logs next.", "checking the logs next."},
+		{"All done. checking the logs next.", "checking the logs next."},
+		{"The report is long. I'll check the two files (e.g. config.yaml) when it ends.", "I'll check the two files (e.g. config.yaml) when it ends."},
 	}
 	for _, c := range cases {
 		if got := Promise(Words(c.words)); got != c.quote {
@@ -145,6 +147,10 @@ func TestPromiseFindsWorkLeftForLater(t *testing.T) {
 		if got := Promise(words); got != c.quote {
 			t.Errorf("Promise(cut %q) = %q, want %q", c.end, got, c.quote)
 		}
+	}
+	// words whose kept end is a harness's trailer are read from their start, and nothing of that is cut
+	if got, want := Promise("I'll check back at 14:10.… </rollout_ids>"), "I'll check back at 14:10."; got != want {
+		t.Errorf("a kept start = %q, want %q", got, want)
 	}
 	// a kept end that opens with a question's mark: the sentence before asked
 	if got := Promise("The report lists every table.… ? I'll check back at 14:10."); got != "" {

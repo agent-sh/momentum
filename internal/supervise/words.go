@@ -93,7 +93,8 @@ var reSentenceEnd = regexp.MustCompile("[.!?]+[\"'”’)\\]*_`]*\\s+")
 // begin with a small letter, and at the end. A mark with no space after it ("v2.1", "config.yaml", "docs/plan.md")
 // ends nothing, and neither does one that small letters follow ("e.g. two columns"): the rest would read as a
 // sentence of its own, without what it hangs on. A sentence that opens with a small letter (a file's or a command's
-// name) so joins the one before it, which only widens what a reader of asks sees.
+// name) so joins the one before it, which widens what a reader of asks sees and what is quoted. An abbreviation
+// before a capital or a digit ("No. 3", "Dr. Smith") still ends one.
 func sentences(text string) []string { return split(text, false) }
 
 // pieces splits a text at every mark that a space follows, whatever comes next: the sentences, with one that opens
@@ -174,12 +175,13 @@ func Question(text string) string {
 // the part that is gone ("If you approve it, I'll build the page" kept as "ve it, I'll build the page"), so it
 // cannot be told from an offer that waits for the owner. A kept end that opens with the mark that closed the
 // sentence before has that mark as its first sentence. The promise is looked for in the last two pieces of the
-// kept end and quoted as the sentence that holds it.
+// kept end and quoted from the piece that holds it to the end of its sentence. A promise in small letters right
+// after the cut sentence joins it and is lost with it.
 func Promise(words string) string {
 	if AsksOwner(words) {
 		return ""
 	}
-	if ss := lastSentences(words, 2); len(ss) > 0 && reFinal.MatchString(ss[len(ss)-1]) {
+	if ps := pieces(tail(words)); len(ps) > 0 && reFinal.MatchString(ps[len(ps)-1]) {
 		return ""
 	}
 	ss := sentences(tail(words))
@@ -191,7 +193,7 @@ func Promise(words string) string {
 		ps := pieces(ss[i])
 		for j := len(ps) - 1; j >= 0 && left > 0; j, left = j-1, left-1 {
 			if rePromise.MatchString(ps[j]) || reStep.MatchString(ps[j]) {
-				return ss[i]
+				return strings.Join(ps[j:], " ")
 			}
 		}
 	}
