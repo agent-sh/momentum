@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/agent-sh/momentum/internal/sandbox"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -43,44 +44,17 @@ func TestMain(m *testing.M) {
 	// sandbox should not be.
 	flag.Parse()
 	flag.Set("test.testlogfile", "")
-	code := m.Run()
-	if err := testLogBound(); err != nil {
-		fmt.Fprintln(os.Stderr, "FAIL:", err)
-		if code == 0 {
-			code = 1
-		}
-	}
-	os.Exit(code)
+	os.Exit(m.Run())
 }
 
-// testLogMax bounds Go's test log, should it be written after all (TestMain turns it off). When the sandbox walked
-// its sources through package os, a full run of this package wrote a log of several GB, and the go command grew
-// to tens of GB of memory. A run whose log passes the bound fails here, before the go command reads it.
-const testLogMax = 64 << 20
-
-func testLogBound() error {
-	f := flag.Lookup("test.testlogfile")
-	if f == nil || f.Value.String() == "" {
-		return nil
-	}
-	st, err := os.Stat(f.Value.String())
-	if err != nil {
-		return nil // no log was written
-	}
-	if st.Size() > testLogMax {
-		// the go command would read all of it: leave it nothing to grow on
-		if err := os.Truncate(f.Value.String(), 0); err != nil {
-			return fmt.Errorf("go's test log is %d MiB (the bound is %d) and could not be emptied: %v", st.Size()>>20, testLogMax>>20, err)
-		}
-		return fmt.Errorf("go's test log grew to %d MiB (the bound is %d): a test walks a large tree through os.Stat or os.Open, and the go command "+
-			"holds and hashes that log after the run. TestMain turns the log off: see why it was written", st.Size()>>20, testLogMax>>20)
-	}
-	return nil
-}
-
-// The suite runs with Go's test log off: the go command reads that log whole, and this suite fills it.
+// The suite runs with Go's test log off: the go command reads that log whole, and this suite fills it. The test
+// binary, started as go test starts it for a run it may cache, writes no log.
 func TestGoTestLogIsOff(t *testing.T) {
-	if f := flag.Lookup("test.testlogfile"); f != nil && f.Value.String() != "" {
-		t.Fatalf("go's test log is on (%s): TestMain turns it off, so a run of this suite leaves the go command nothing to read", f.Value)
+	log := filepath.Join(t.TempDir(), "testlog.txt")
+	if out, err := exec.Command(os.Args[0], "-test.run=^$", "-test.testlogfile="+log).CombinedOutput(); err != nil {
+		t.Fatalf("the test binary with no test to run: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(log); err == nil {
+		t.Fatal("go's test log was written: TestMain turns it off, so a run of this suite leaves the go command nothing to read")
 	}
 }

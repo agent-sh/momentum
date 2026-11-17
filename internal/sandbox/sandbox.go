@@ -586,7 +586,11 @@ func noSocket(dir string) error {
 	for _, name := range names {
 		p := filepath.Join(dir, name)
 		var st syscall.Stat_t
-		if err := syscall.Lstat(p, &st); err != nil {
+		err := syscall.Lstat(p, &st)
+		for err == syscall.EINTR { // as package os retries it
+			err = syscall.Lstat(p, &st)
+		}
+		if err != nil {
 			return fmt.Errorf("sandbox: inspect source: %w", &fs.PathError{Op: "lstat", Path: p, Err: err})
 		}
 		switch st.Mode & syscall.S_IFMT {
