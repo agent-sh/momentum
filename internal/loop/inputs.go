@@ -284,11 +284,18 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 		run.CaseLogSeq = log[len(log)-1].Seq
 	}
 	log = runLog(log)
+	var siblings []sibling
+	if step == StepInvestigate {
+		if siblings, err = siblingsOf(ctx, r.Store, c); err != nil {
+			return run, err
+		}
+	}
 	raw, err := json.Marshal(struct {
 		Case     store.Case        `json:"case"`
 		Evidence []store.Evidence  `json:"evidence"`
 		Log      []store.CaseEntry `json:"log"`
-	}{c, evidence, log})
+		Siblings []sibling         `json:"siblings,omitempty"`
+	}{c, evidence, log, siblings})
 	if err != nil {
 		return run, err
 	}
@@ -301,6 +308,9 @@ func (r *Runner) prepareRun(ctx context.Context, c store.Case, family, step stri
 		return run, err
 	}
 	question := r.investigationQuestion(c)
+	if len(siblings) > 0 {
+		question += siblingQuestion
+	}
 	prompt := fmt.Sprintf("%s\nProblem: %s\n%s%s%s%s", question, plain.Line(c.Title), evidenceText, caseHolds(c), findingsInstruction, inputReference(true))
 	schema := r.investigationSchemaFor(c)
 	extra := map[string]string{}

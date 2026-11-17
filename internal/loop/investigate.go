@@ -23,7 +23,7 @@ The owner's words are only what his own turns say (actor owner); never credit hi
 const investigationSchema = `{"type":"object","additionalProperties":false,"required":["mechanism","fix","summary"],
 "properties":{"mechanism":{"type":"string"},"alternatives":{"type":"array","items":{"type":"string"}},
 "fix":{"type":"string"},"summary":{"type":"string"},"repo":{"type":"string"},
-"place":{"type":"string"},"nothing_to_fix":{"type":"boolean"}}}`
+"place":{"type":"string"},"nothing_to_fix":{"type":"boolean"},"duplicate_of":{"type":"string"}}}`
 
 // investigationConfigSchema is an investigation's report while configuration targets are on: it may name a config.
 var investigationConfigSchema = strings.Replace(investigationSchema, `"repo":{"type":"string"}`, `"repo":{"type":"string"},"config":{"type":"string"}`, 1)
@@ -56,6 +56,44 @@ const findingsInstruction = "Keep findings as you go in /out/findings.md. Use th
 
 // liveQuestion is what a live investigation is asked.
 const liveQuestion = "Find the root cause of this problem and the fix. State the mechanism, the alternatives ruled out, the fix, and a summary. If the fix is code in a repository under /ro/repos, also report repo as its NAME. If the fix is anywhere else (a file on the machine outside those repositories, another project's code, a program maintained elsewhere, a setting only the owner can change), report place: where it is, on one line; with no such place, leave it out. Report nothing_to_fix as true only when no change anywhere would help (the tool worked as it is meant to, a provider refused or failed by itself, the problem ended); then fix says that nothing is to change, and the summary says why. A fix that lives somewhere else is a place, not nothing to fix. Build no change."
+
+// siblingQuestion is added to the live question of a case whose family holds other cases with findings (siblingsOf).
+const siblingQuestion = " /run/input/case.json lists under siblings the family's other cases that already hold a cause and a fix. If this problem has the same cause and the same fix as one of them, report duplicate_of as that case's id: the host moves this case's evidence into it. Report it only once this case's own evidence shows that cause; a like title is not enough."
+
+// sibling is another case of the family that holds an investigation's findings, as an investigation is shown it: one
+// whose cause may be this case's too.
+type sibling struct {
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Mechanism string `json:"mechanism"`
+	Fix       string `json:"fix"`
+}
+
+// siblingMax bounds what an investigation is shown of each sibling's mechanism and fix: enough to tell a cause.
+const siblingMax = 400
+
+// siblingsOf are the cases a report on c may name as the one it duplicates: the family's other cases in testing,
+// which hold a mechanism and a fix. A component-health case has none: its stop holds cases only its own fix resumes.
+func siblingsOf(ctx context.Context, st *store.Store, c store.Case) ([]sibling, error) {
+	if c.Family == store.HealthFamily {
+		return nil, nil
+	}
+	cs, err := st.Cases(ctx, store.CaseFilter{Family: c.Family, Statuses: []store.CaseStatus{store.CaseTesting}})
+	if err != nil {
+		return nil, err
+	}
+	var out []sibling
+	for _, x := range cs {
+		if x.ID != c.ID && holdsText(x.Mechanism) && holdsText(x.NextTest) && x.NextTest != fixNotStated {
+			out = append(out, sibling{ID: x.ID, Title: plain.Line(x.Title), Mechanism: plainClip(plain.Line(x.Mechanism), siblingMax),
+				Fix: plainClip(plain.Line(x.NextTest), siblingMax)})
+		}
+	}
+	return out, nil
+}
+
+// duplicateOf opens the reason of a case its investigation found to be another case's.
+const duplicateOf = "the investigation found the cause of case "
 
 // configQuestion is added to the live question while configuration targets are on.
 const configQuestion = " If the fix is the content of one existing configuration file under /ro/config instead, report config as its path there (such as /ro/config/.config/agents/NAME.md) and no repo or place. The host proposes a change only to a file the owner listed, and an agent applies it."
@@ -270,6 +308,27 @@ func recordFindings(ctx context.Context, st *store.Store, caseID string, episode
 		}
 		u.Alternatives = alternatives // nil keeps the case's
 	}
+	if dup := strings.TrimSpace(f.DuplicateOf); reported && dup != "" && mechanism != "" {
+		// The case goes into the one the report names, when that is a case the run was shown as a sibling. A report
+		// that names any other case names none, and goes on as a report without it.
+		c, err := st.CaseByID(ctx, caseID)
+		if err != nil {
+			return store.Case{}, false, err
+		}
+		sibs, err := siblingsOf(ctx, st, c)
+		if err != nil {
+			return store.Case{}, false, err
+		}
+		for _, s := range sibs {
+			if s.ID == dup {
+				why := strings.TrimSpace(f.Report)
+				if !holdsText(why) {
+					why = mechanism
+				}
+				return st.RecordDuplicate(ctx, caseID, episode, s.ID, duplicateOf+s.ID+": "+plainClip(plain.Line(why), dismissedMax), actor)
+			}
+		}
+	}
 	if reported && f.NothingToFix && mechanism != "" && f.Repo == "" && f.Config == "" && placeOf(f) == "" {
 		// The investigation's conclusion ends the case: nothing holds it for a fix nobody will make. A report that
 		// also says where a fix lives contradicts itself, and the place wins: the case waits with it. A
@@ -435,6 +494,8 @@ type finding struct {
 	// worth making anywhere.
 	Place        string `json:"place,omitempty"`
 	NothingToFix bool   `json:"nothing_to_fix,omitempty"`
+	// DuplicateOf is the sibling case whose cause and fix the investigation found to be this case's.
+	DuplicateOf string `json:"duplicate_of,omitempty"`
 }
 
 // nativeFinding reads an investigation's report; alternatives given as one text, not the schema's list, are kept.
@@ -444,13 +505,14 @@ func nativeFinding(res Result) finding {
 		Alternatives       json.RawMessage
 		Fix, Summary, Repo string
 		Config, Place      string
-		NothingToFix       bool `json:"nothing_to_fix"`
+		NothingToFix       bool   `json:"nothing_to_fix"`
+		DuplicateOf        string `json:"duplicate_of"`
 	}
 	if json.Unmarshal(res.Report, &rep) != nil {
 		return finding{}
 	}
 	f := finding{Mechanism: rep.Mechanism, Fix: rep.Fix, Report: rep.Summary, Repo: rep.Repo, Config: rep.Config,
-		Place: rep.Place, NothingToFix: rep.NothingToFix}
+		Place: rep.Place, NothingToFix: rep.NothingToFix, DuplicateOf: rep.DuplicateOf}
 	if json.Unmarshal(rep.Alternatives, &f.Alternatives) != nil {
 		var one string
 		if json.Unmarshal(rep.Alternatives, &one) == nil && strings.TrimSpace(one) != "" {
